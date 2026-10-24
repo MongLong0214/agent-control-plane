@@ -4,6 +4,9 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { nsecEncode } from "nostr-tools/nip19";
+import { getPublicKey } from "nostr-tools/pure";
+
 import { BuzzCliTransport } from "../../src/buzz/buzz-adapter.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 
@@ -59,6 +62,7 @@ const stubCli = (root: string): Stub => {
     `#!/usr/bin/env node
 const fs = require("node:fs");
 const argv = process.argv.slice(2);
+if (process.env.ACP_TEST_BUZZ_EXPECT_SIGNING_KEY && process.env.BUZZ_PRIVATE_KEY !== process.env.ACP_TEST_BUZZ_EXPECT_SIGNING_KEY) process.exit(9);
 fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(argv) + "\\n");
 
 const die = (message) => {
@@ -95,6 +99,11 @@ if (argv[0] === "channels" && argv[1] === "get") {
     die("error: channel not found: " + requested);
   }
   process.stdout.write(JSON.stringify({ ...detail, channel_id: requested }));
+  process.exit(0);
+}
+if (argv[0] === "channels" && argv[1] === "members") {
+  if (!flag("--channel")) die("channel required");
+  process.stdout.write(process.env.ACP_TEST_BUZZ_MEMBERS || "[]");
   process.exit(0);
 }
 if (argv[0] === "messages" && argv[1] === "get") {
@@ -148,6 +157,29 @@ describe("#423 BuzzCliTransport against the installed CLI surface", () => {
 
   afterEach(() => {
     delete process.env["BUZZ_PRIVATE_KEY"];
+    delete process.env["ACP_TEST_BUZZ_MEMBERS"];
+    delete process.env["ACP_TEST_BUZZ_EXPECT_SIGNING_KEY"];
+  });
+
+  it.each(["hex", "nsec"] as const)("ACP1199-02: checks the pinned %s signer against the exact room roster", async encoding => {
+    const key = "1".repeat(64);
+    process.env["BUZZ_PRIVATE_KEY"] = encoding === "hex" ? key : nsecEncode(Buffer.from(key, "hex"));
+    process.env["ACP_TEST_BUZZ_EXPECT_SIGNING_KEY"] = process.env["BUZZ_PRIVATE_KEY"];
+    const signer = getPublicKey(Buffer.from(key, "hex"));
+    const transport = new BuzzCliTransport(stub.binary);
+    // A later ambient key cannot turn readiness into a check of some other sender.
+    process.env["BUZZ_PRIVATE_KEY"] = "2".repeat(64);
+    process.env["ACP_TEST_BUZZ_MEMBERS"] = JSON.stringify([{ pubkey: OWNER, role: "owner" }]);
+    expect(await transport.signerReadiness(ceo.channel_id)).toEqual({ signer, registered: false });
+    process.env["ACP_TEST_BUZZ_MEMBERS"] = JSON.stringify([{ pubkey: signer, role: "member" }]);
+    expect(await transport.signerReadiness(ceo.channel_id)).toEqual({ signer, registered: true });
+    expect(stub.calls()).toContainEqual(["channels", "members", "--channel", ceo.channel_id]);
+    expect(stub.calls()).toContainEqual(["channels", "get", "--channel", ceo.channel_id]);
+    process.env["ACP_TEST_BUZZ_MEMBERS"] = '{"members":[]}';
+    expect(await transport.signerReadiness(ceo.channel_id)).toBeNull();
+    process.env["ACP_STUB_GET_REDIRECTS_TO"] = commitlore.channel_id;
+    try { expect(await transport.signerReadiness(ceo.channel_id)).toBeNull(); }
+    finally { delete process.env["ACP_STUB_GET_REDIRECTS_TO"]; }
   });
 
   it("lists channels without --json, which the CLI rejects", async () => {

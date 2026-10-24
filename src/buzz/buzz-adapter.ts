@@ -1,6 +1,11 @@
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 
+import { canonicalJson, digestOf } from "../core/digest.ts";
+import { HostProvisionerError, hostObservationSchema, type HostProjectProvisioner } from "../runtime/host-project-provisioner.ts";
+import { currentCanonicalCeoBuzzRoute, daemonBuzzSigner, isBuzzRecipientRefusal, isBuzzSignerRefusal, type CanonicalCeoBuzzRoute } from "../outbox/ceo-buzz-signer.ts";
+import { MessageKind } from "../outbox/envelope.ts";
+
 import type { Clock } from "../core/clock.ts";
 import { type Decision, acpError, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -8,11 +13,14 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import type { RoleBinding } from "../domain/types.ts";
 import type { OutboxMessage } from "../outbox/outbox.ts";
-import type { Outbox } from "../outbox/outbox.ts";
+import { hermesCanonicalRuntimeSql, liveDeliveryTarget, type Outbox } from "../outbox/outbox.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 
 const exec = promisify(execFile);
+// Only concurrent in-process effects wait for their receipt. Durable intents suppress joins
+// across restarts, while an independent later roster observation may settle a lost receipt.
+const activeCeoMembershipEnsures = new WeakMap<Db, Set<string>>();
 
 /**
  * What the relay says it did with one send (#760).
@@ -25,6 +33,11 @@ const exec = promisify(execFile);
 export interface BuzzSendReceipt {
   eventId: string;
   mentionPubkeys: readonly string[];
+}
+
+export interface BuzzSignerReadiness {
+  signer: string;
+  registered: boolean;
 }
 
 /** Transport seam so delivery can be exercised without a live relay. */
@@ -50,6 +63,8 @@ export interface BuzzTransport {
    * answering the easier one is how #423 shipped.
    */
   available(purpose?: string): Promise<boolean>;
+  /** Observe this transport's actual sending key in the exact room; null means unverified. */
+  signerReadiness?(channel: string): Promise<BuzzSignerReadiness | null>;
 }
 
 /**
@@ -142,6 +157,26 @@ const purposeSubject = (purpose: string): string | null => {
  * replace this class with a double.
  */
 export class BuzzCliTransport implements BuzzTransport {
+  // Pin the same credential for readback and send, including across an awaited roster read.
+  private readonly signingKey = process.env["BUZZ_PRIVATE_KEY"];
+  #environment(): NodeJS.ProcessEnv { return { ...process.env, BUZZ_PRIVATE_KEY: this.signingKey ?? "" }; }
+
+  async signerReadiness(channel: string): Promise<BuzzSignerReadiness | null> {
+    const signer = daemonBuzzSigner(this.signingKey);
+    if (!signer) return null;
+    try {
+      await this.#requireChannel(channel);
+      // Same roster read used by host-project-provisioner; no membership mutation or probe post.
+      const { stdout } = await exec(this.binary, BUZZ_CLI_INVOCATIONS.channelsMembers(channel), {
+        encoding: "utf8", timeout: 30_000, env: this.#environment(),
+      });
+      const members = parseJson(stdout, "channels members");
+      if (!Array.isArray(members) || members.some(m => !m || typeof m.pubkey !== "string" || !/^[a-f0-9]{64}$/.test(m.pubkey) ||
+        !["owner", "admin", "member"].includes(m.role))) return null;
+      return { signer, registered: members.some(m => m.pubkey === signer) };
+    } catch { return null; }
+  }
+
   constructor(
     private readonly binary = "buzz",
     private readonly defaultChannel: string | null = null,
@@ -162,7 +197,7 @@ export class BuzzCliTransport implements BuzzTransport {
    * a bound `defaultChannel` before claiming more.
    */
   async available(purpose?: string): Promise<boolean> {
-    if (!process.env["BUZZ_PRIVATE_KEY"]) return false;
+    if (!this.signingKey) return false;
     try {
       if (purpose !== undefined) {
         await this.openChannel(purpose);
@@ -217,7 +252,7 @@ export class BuzzCliTransport implements BuzzTransport {
     const { stdout } = await exec(
       this.binary,
       BUZZ_CLI_INVOCATIONS.messagesGet(channel, limit),
-      { encoding: "utf8", timeout: 30_000 },
+      { encoding: "utf8", timeout: 30_000, env: this.#environment() },
     );
     const messages = parseJson(stdout, "messages get");
     if (!Array.isArray(messages)) throw new Error("buzz messages get did not return a list");
@@ -228,7 +263,7 @@ export class BuzzCliTransport implements BuzzTransport {
     // No `--json`: the installed CLI rejects the flag and already emits JSON without it.
     const { stdout } = await exec(this.binary, BUZZ_CLI_INVOCATIONS.channelsList(), {
       encoding: "utf8",
-      timeout: 30_000,
+      timeout: 30_000, env: this.#environment(),
     });
     return asChannelList(parseJson(stdout, "channels list"), "channels list");
   }
@@ -243,7 +278,7 @@ export class BuzzCliTransport implements BuzzTransport {
   async #requireChannel(channelId: string): Promise<BuzzCliChannel> {
     const { stdout } = await exec(this.binary, BUZZ_CLI_INVOCATIONS.channelsGet(channelId), {
       encoding: "utf8",
-      timeout: 30_000,
+      timeout: 30_000, env: this.#environment(),
     });
     const channel = asChannel(parseJson(stdout, "channels get"), "channels get");
     if (channel.channel_id !== channelId) {
@@ -275,7 +310,7 @@ export class BuzzCliTransport implements BuzzTransport {
         BUZZ_CLI_INVOCATIONS.messagesSend(channel, named),
         // stdout was `ignore` here, which is where the relay's answer about who it notified
         // was being thrown away.
-        { stdio: ["pipe", "pipe", "pipe"] },
+        { stdio: ["pipe", "pipe", "pipe"], env: this.#environment() },
       );
       let settled = false;
       let stderr = "";
@@ -437,6 +472,7 @@ export class InMemoryBuzzTransport implements BuzzTransport {
  */
 export const BUZZ_CLI_INVOCATIONS = {
   channelsList: () => ["channels", "list"],
+  channelsMembers: (channelId: string) => ["channels", "members", "--channel", channelId],
   channelsGet: (channelId: string) => ["channels", "get", "--channel", channelId],
   messagesGet: (channel: string, limit: number) =>
     ["messages", "get", "--channel", channel, "--limit", String(limit)],
@@ -463,7 +499,115 @@ export class BuzzAdapter {
     private readonly bindings: BindingRegistry,
     private readonly outbox: Outbox,
     private readonly transport: BuzzTransport,
+    private readonly host: HostProjectProvisioner | null = null,
   ) {}
+
+  async #signerReadiness(channel: string): Promise<BuzzSignerReadiness | null> {
+    try { return await this.transport.signerReadiness?.(channel) ?? null; }
+    catch { return null; }
+  }
+
+  #currentCeoRoute(message: OutboxMessage, room: string, recipient: string): CanonicalCeoBuzzRoute | null {
+    const route = currentCanonicalCeoBuzzRoute(this.db);
+    return route && route.sessionId === message.targetSessionId && route.bindingGeneration === message.bindingGeneration &&
+      route.roomId === room && route.recipient === recipient ? route : null;
+  }
+
+  #membershipAudit(kind: string, evidence: Record<string, unknown>, ready: boolean): void {
+    const recorded = this.audit.record({ kind,
+      reasonCode: ready ? ReasonCode.OK : ReasonCode.BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED, evidence });
+    if (!recorded.allowed) throw new Error("CEO signer membership evidence was not recorded");
+  }
+
+  #readbackAudit(route: CanonicalCeoBuzzRoute, ready: BuzzSignerReadiness | null, phase: string): void {
+    const evidence = { route, room: route.roomId, signer: ready?.signer ?? null,
+      registered: ready?.registered ?? null, phase };
+    const observationDigest = digestOf(evidence);
+    if (this.db.get(`SELECT 1 FROM audit_events WHERE kind = 'CEO_BUZZ_SIGNER_READBACK'
+      AND json_extract(evidence_json, '$.observationDigest') = ?`, [observationDigest])) return;
+    this.#membershipAudit("CEO_BUZZ_SIGNER_READBACK", { ...evidence, observationDigest }, ready?.registered === true);
+  }
+
+  #hostGatesCeo(message: OutboxMessage): boolean {
+    return this.host !== null && !!this.db.get(`SELECT 1 WHERE ${hermesCanonicalRuntimeSql("?")}`, [message.targetSessionId]);
+  }
+
+  #validatedReceipt(receipt: unknown, route: CanonicalCeoBuzzRoute, signer: string): boolean {
+    const parsed = hostObservationSchema.safeParse({ ceoBuzzSigner: receipt });
+    return parsed.success && !!parsed.data.ceoBuzzSigner && parsed.data.ceoBuzzSigner.signer === signer &&
+      canonicalJson(parsed.data.ceoBuzzSigner.route) === canonicalJson(route);
+  }
+
+  #invalidEnsure(route: CanonicalCeoBuzzRoute | null, signer: string | null): boolean {
+    // There is one systemic CEO route. Neither a new signer nor a new binding can hide its refusal.
+    const history = this.db.all<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events
+      WHERE kind = 'CEO_BUZZ_SIGNER_ENSURE' ORDER BY rowid`);
+    let invalid = false;
+    for (const event of history) {
+      const evidence = JSON.parse(event.evidence_json);
+      if (['INVALID','REFUSED','FAILED'].includes(evidence.state)) invalid = true;
+      if (evidence.state === 'SUCCEEDED') {
+        if (route && signer && this.#validatedReceipt(evidence.receipt, route, signer)) invalid = false;
+        else if (!this.#validatedReceipt(evidence.receipt, evidence.route, evidence.signer)) invalid = true;
+      }
+    }
+    return invalid;
+  }
+
+  /** Read-only target lookup is separate from ensure-buzz's sole provisioning effect. */
+  async #ceoSignerReadiness(message: OutboxMessage, room: string, recipient: string): Promise<BuzzSignerReadiness | null> {
+    if (!this.#hostGatesCeo(message)) {
+      const ready = await this.#signerReadiness(room);
+      return this.#invalidEnsure(this.#currentCeoRoute(message, room, recipient), ready?.signer ?? null) ? null : ready;
+    }
+    const route = this.#currentCeoRoute(message, room, recipient);
+    if (!route) return null;
+    const stillCurrent = () => canonicalJson(this.#currentCeoRoute(message, room, recipient)) === canonicalJson(route);
+    const before = await this.#signerReadiness(route.roomId);
+    this.#readbackAudit(route, before, "BEFORE_ENSURE");
+    if (!stillCurrent() || !before) return null;
+    const ensureDigest = digestOf({ route, signer: before.signer });
+    const active = activeCeoMembershipEnsures.get(this.db) ?? new Set<string>();
+    activeCeoMembershipEnsures.set(this.db, active);
+    if (this.#invalidEnsure(route, before.signer) || active.size > 0) return null;
+    if (before.registered) return before;
+    // Durable intent precedes the call. A failed/lost response never schedules another join,
+    // including across overlapping sweeps, other notifications and daemon restarts.
+    const ensure = this.db.tx(() => {
+      if (!stillCurrent() || this.db.get(`SELECT 1 FROM audit_events WHERE kind = 'CEO_BUZZ_SIGNER_ENSURE'
+        AND json_extract(evidence_json, '$.ensureDigest') = ? AND json_extract(evidence_json, '$.state') = 'INTENT'`, [ensureDigest])) return false;
+      this.#membershipAudit("CEO_BUZZ_SIGNER_ENSURE", { ensureDigest, route, signer: before.signer, state: "INTENT" }, false);
+      if (!this.db.get(`SELECT 1 FROM audit_events WHERE kind = 'CEO_BUZZ_SIGNER_ENSURE'
+        AND json_extract(evidence_json, '$.ensureDigest') = ? AND json_extract(evidence_json, '$.state') = 'INTENT'`, [ensureDigest])) {
+        throw new Error("CEO membership intent did not survive audit serialization");
+      }
+      return true;
+    });
+    if (!ensure) return before;
+    active.add(ensureDigest);
+    try {
+      let state: "SUCCEEDED" | "INVALID" | "REFUSED" | "LOST" = "INVALID";
+      let receipt: unknown;
+      let refusal: { code: string; message: string } | undefined;
+      try {
+        // No await between the final target validation and invoking the host boundary.
+        if (stillCurrent()) {
+          const observed = await this.host!.invoke("ensure-buzz", { mode: "ceo-route-signer", route, signer: before.signer });
+          receipt = observed.ceoBuzzSigner;
+          state = this.#validatedReceipt(receipt, route, before.signer) && stillCurrent() ? "SUCCEEDED" : "INVALID";
+        }
+      } catch (error) {
+        if (error instanceof HostProvisionerError) { state = error.outcome; refusal = error.refusal; }
+      }
+      const after = await this.#signerReadiness(route.roomId);
+      this.#readbackAudit(route, after, "AFTER_ENSURE");
+      if (state === "SUCCEEDED" && (!stillCurrent() || (after && (!after.registered || after.signer !== before.signer)))) state = "INVALID";
+      this.#membershipAudit("CEO_BUZZ_SIGNER_ENSURE", { ensureDigest, route, signer: before.signer,
+        state, ...(receipt ? { receipt } : {}), ...(refusal ? { refusal } : {}) }, state === "SUCCEEDED");
+      if (state !== "SUCCEEDED" || !stillCurrent() || after?.signer !== before.signer) return null;
+      return after;
+    } finally { active.delete(ensureDigest); }
+  }
 
   async connect(sessionId: string, purpose: string): Promise<Decision<string>> {
     if (!(await this.transport.available(purpose))) {
@@ -522,6 +666,18 @@ export class BuzzAdapter {
     const delivered: string[] = [];
     const failed: string[] = [];
 
+    // Existing sweep/delivery triggers observe readiness; no post retry timer is scheduled.
+    // Unknown/failed readback cannot re-arm a refused row. Claims still serialize overlapping calls.
+    for (const message of this.outbox.pendingCeoBuzzSignerRoutes()) {
+      const session = this.sessions.get(message.targetSessionId);
+      if (!session?.buzzAddress || !session.buzzActorId) continue;
+      // Normalize only a proven old pre-post refusal before attempting membership repair.
+      this.outbox.resumeCeoBuzzSigner(message, { room: session.buzzAddress, recipient: session.buzzActorId }, false);
+      const ready = await this.#ceoSignerReadiness(message, session.buzzAddress, session.buzzActorId);
+      if (ready) this.outbox.resumeCeoBuzzSigner(message,
+        { room: session.buzzAddress, recipient: session.buzzActorId }, ready.registered);
+    }
+
     for (const message of this.outbox.claimDeliverable(limit)) {
       const session = this.sessions.get(message.targetSessionId);
       const channel = session?.buzzAddress;
@@ -576,8 +732,31 @@ export class BuzzAdapter {
         this.outbox.markAlreadySent(message.messageId, message.claimToken, already, destination);
         continue;
       }
-      // Where this attempt is going is on record before the transport is called.
+      // Fence this destination across the asynchronous roster read, too.
       this.outbox.recordSendInFlight(message.messageId, destination);
+      const readiness = message.kind === MessageKind.CEO_NOTIFICATION ? await this.#ceoSignerReadiness(message, channel, recipient) : null;
+      if ((readiness && !readiness.registered) || (message.kind === MessageKind.CEO_NOTIFICATION &&
+        ((this.#hostGatesCeo(message) && !readiness) ||
+          this.#invalidEnsure(this.#currentCeoRoute(message, channel, recipient), readiness?.signer ?? null)))) {
+        this.outbox.markAttemptFailed(message.messageId, message.claimToken, {
+          failureClass: "repairable", retryable: false,
+          error: readiness ? "Buzz roster does not include the daemon signer in the target room" : "CEO signer provisioning/readback is unverified",
+          signerNotRegistered: { signer: readiness?.signer ?? null, source: "READBACK",
+            reasonCode: readiness ? ReasonCode.BUZZ_SIGNER_NOT_REGISTERED : ReasonCode.BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED }, destination,
+        });
+        failed.push(message.messageId);
+        continue;
+      }
+      // A holder/room change during readback must not authorize a post to the old binding.
+      if (!this.db.get(`SELECT 1 FROM outbox o JOIN sessions s ON s.session_id = o.target_session_id
+        WHERE o.message_id = ? AND o.status = 'IN_FLIGHT' AND o.claim_token = ?
+          AND o.target_session_id = ? AND o.binding_generation = ? AND s.buzz_address = ? AND s.buzz_actor_id = ?
+          AND ${liveDeliveryTarget("o")}`,
+      [message.messageId, message.claimToken, message.targetSessionId, message.bindingGeneration, channel, recipient])) {
+        this.outbox.markAttemptFailed(message.messageId, message.claimToken,
+          { failureClass: "contract", retryable: false, error: "target changed before Buzz post", destination, routeAbsent: true });
+        continue;
+      }
       try {
         await this.transport.send(channel, render(message), [recipient]);
         // Where it landed is recorded first, whatever happens to the claim next.
@@ -592,7 +771,15 @@ export class BuzzAdapter {
         this.outbox.markAttemptFailed(
           message.messageId,
           message.claimToken,
-          { ...classifyTransportFailure(err), destination },
+          { ...classifyTransportFailure(err), destination,
+            ...(message.kind === MessageKind.CEO_NOTIFICATION ? { ceoRefusal: {
+              scope: isBuzzRecipientRefusal(err instanceof Error ? err.message : String(err)) ? "DESTINATION" as const : "SENDER" as const,
+              targetSessionId: message.targetSessionId, bindingGeneration: message.bindingGeneration, attemptNumber: message.attempts + 1,
+            } } : {}),
+            ...(message.kind === MessageKind.CEO_NOTIFICATION && readiness?.registered ? { buzzSignerReady: true as const } : {}),
+            ...(message.kind === MessageKind.CEO_NOTIFICATION &&
+              isBuzzSignerRefusal(err instanceof Error ? err.message : String(err))
+              ? { signerNotRegistered: { signer: readiness?.signer ?? null, source: "SEND_REFUSAL" as const } } : {}) },
         );
         failed.push(message.messageId);
       }

@@ -318,6 +318,7 @@ export class ControlPlane {
   readonly doctor: Doctor;
   readonly watchdog: Watchdog;
   readonly repair: RepairService;
+  readonly hostProjectProvisioner: HostProjectProvisioner | null;
   readonly residentProjects: ResidentProjectProvisioning;
   readonly bootstrap: BootstrapActivation;
   /** Issue #246 — performs a bootstrap plan's GitHub writes, then hands the result to `bootstrap`. */
@@ -685,8 +686,10 @@ export class ControlPlane {
       this.bootstrapApplications = new BootstrapApplications(this.db, this.clock, this.audit);
       const hostScript = config.residentProvisioner?.script ?? process.env["ACP_HOST_PROJECT_PROVISIONER"];
       const residentHome = config.residentProvisioner?.home ?? homedir();
+      this.hostProjectProvisioner = config.residentProvisioner?.port ?? (hostScript
+        ? new ExecFileHostProjectProvisioner(hostScript,residentHome,dirname(config.databasePath),120_000,config.databasePath) : null);
       this.residentProjects = new ResidentProjectProvisioning(this.db,this.clock,
-        config.residentProvisioner?.port ?? (hostScript ? new ExecFileHostProjectProvisioner(hostScript,residentHome,dirname(config.databasePath)) : null),residentHome,dirname(config.databasePath));
+        this.hostProjectProvisioner,residentHome,dirname(config.databasePath));
       this.bootstrap = new BootstrapActivation(
         this.db, this.clock, this.audit, this.artifacts, this.projects, this.repositories,
         this.runs, this.bindings, this.sessions, this.cto, this.doctor, this.ceo, this.outbox, this.residentProjects, !config.allowTestEvidenceWriters,

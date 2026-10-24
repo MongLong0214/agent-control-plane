@@ -1,3 +1,4 @@
+import { ceoBuzzHistoryIsPrePost, isBuzzSignerRefusal } from "./ceo-buzz-signer.ts";
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
 import { type Decision, allow, deny, fail, isAcpError } from "../core/errors.ts";
@@ -64,10 +65,12 @@ export interface OutboxMessage extends FencedEnvelope {
   createdAt: string;
 }
 
-/** A readback, never a new durable state. SENT + unknown_observed suppresses automatic resend;
- * it proves neither delivery nor completion. Only an authenticated ACK confirms completion. */
+/** A readback, never a new durable state. unknown_observed suppresses automatic resend;
+ * it proves neither delivery nor completion. Only an authenticated ACK confirms completion.
+ * delivered=false alone also covers queued/refused rows; OUTCOME_UNKNOWN and automaticResendHeld
+ * distinguish uncertainty. None of those unknown-state fields proves that nothing was posted. */
 export const outboxDeliveryReadback = (message: Pick<OutboxMessage, "status" | "failureClass">) => {
-  const held = message.status === "SENT" && message.failureClass === "unknown_observed";
+  const held = (message.status === "SENT" || message.status === "PENDING") && message.failureClass === "unknown_observed";
   return {
     status: held ? "OUTCOME_UNKNOWN" as const : message.status,
     delivery: held ? "outcome unknown / delivery unconfirmed / automatic resend held" : message.status,
@@ -149,6 +152,13 @@ export interface DeliveryFailure {
    * turn the relay's refusal into a route-absent one.
    */
   routeAbsent?: true;
+  /** Readiness was verified before this CEO Buzz attempt; delivery still needs its own receipt. */
+  buzzSignerReady?: true;
+  /** Only an explicit recipient refusal may be left behind for a genuinely different receiver. */
+  ceoRefusal?: { scope: "DESTINATION" | "SENDER"; targetSessionId: string; bindingGeneration: number; attemptNumber: number };
+  /** Exact daemon-signer membership evidence, distinct from a missing receiving route. */
+  signerNotRegistered?: { signer: string | null; source: "SEND_REFUSAL" | "READBACK";
+    reasonCode?: typeof ReasonCode.BUZZ_SIGNER_NOT_REGISTERED | typeof ReasonCode.BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED };
   /**
    * FCR-08 — the exact room and recipient key the attempt addressed, set by a transport that sent.
    * Recorded only for an outcome that may have landed (`unknown_observed`), in `outbox_sent_destinations`.
@@ -376,7 +386,7 @@ const ROUTE_ABSENT_FAILURE_CLASS = "repairable";
  * A SENT row whose receiver does not really change (`sameReceiverSql`) is not handed over at all.
  */
 const HANDED_TO_NEW_RECEIVER_SQL = `status = 'PENDING', claim_token = NULL, claimed_at = NULL,
-  failure_class = CASE WHEN status = 'SENT' OR failure_class = '${ROUTE_ABSENT_FAILURE_CLASS}' THEN NULL ELSE failure_class END`;
+  failure_class = CASE WHEN status = 'SENT' OR (kind = 'CEO_NOTIFICATION' AND failure_class = 'unknown_observed') OR (failure_class = '${ROUTE_ABSENT_FAILURE_CLASS}' AND COALESCE(reason_code, '') NOT IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED')) THEN NULL ELSE failure_class END`;
 
 /**
  * Whether handing a SENT row to `next` would send it to a receiver it was already sent to. Two
@@ -412,23 +422,29 @@ const sameReceiverSql = (alias: string): string =>
  * deferral time and a self-clearing class, so "deliverable again" for a retained kind is: no failure
  * class (`claimDeliverable` takes such a row whatever its attempt count).
  *
+ * A signer-membership refusal uses the same policy, but a receiving route change cannot clear it:
+ * only a positive readback of the transport's sending signer in that exact room may do so, after
+ * verifying the whole row's attempt history is pre-post (`resumeCeoBuzzSigner`).
+ *
  * Not re-armed by a route change: an authority refusal or a wrong target (a contract or security
  * refusal from the relay, kept on record and unsent), a deferral already on its own backoff, an
- * outcome-unknown send (SENT and flagged; see `markAttemptFailed`), and every terminal row. Only rows
+ * outcome-unknown send (flagged; see `markAttemptFailed`), and every terminal row. Only rows
  * addressed to exactly the holder the change concerns are touched, so nothing widens an item's
  * authority or recipient scope, and a stale holder's ACK is still refused.
  */
 export const rearmRetainedDeliveries = (
   db: Pick<Db, "run">,
-  scope: { sessionId: string; roleKey?: string; bindingGeneration?: number },
+  scope: { sessionId: string; roleKey?: string; bindingGeneration?: number; signerReadyMessageId?: string },
 ): number =>
   db.run(
-    `UPDATE outbox SET failure_class = NULL
+    `UPDATE outbox SET failure_class = NULL, reason_code = NULL
       WHERE status = 'PENDING' AND kind IN (${IN_BAND_KIND_SQL}, 'CEO_NOTIFICATION')
         AND failure_class = '${ROUTE_ABSENT_FAILURE_CLASS}' AND retry_eligible = 0
+        AND (COALESCE(reason_code, '') NOT IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED') OR message_id = ?)
+        AND (? IS NULL OR message_id = ?)
         AND target_session_id = ?
         AND (? IS NULL OR role_key = ?) AND (? IS NULL OR binding_generation = ?)`,
-    [scope.sessionId, scope.roleKey ?? null, scope.roleKey ?? null, scope.bindingGeneration ?? null, scope.bindingGeneration ?? null],
+    [scope.signerReadyMessageId ?? null, scope.signerReadyMessageId ?? null, scope.signerReadyMessageId ?? null, scope.sessionId, scope.roleKey ?? null, scope.roleKey ?? null, scope.bindingGeneration ?? null, scope.bindingGeneration ?? null],
   ).changes;
 
 /**
@@ -515,7 +531,7 @@ const withheldFromSweep = (outboxAlias: "o" | "outbox"): string =>
  * module constant, inlined for the reason `HOLDER_CLAIMED_KIND_SQL` gives.
  */
 const HERMES_EXECUTOR_KIND = "hermes";
-const hermesCanonicalRuntimeSql = (sessionExpr: string): string => `EXISTS (
+export const hermesCanonicalRuntimeSql = (sessionExpr: string): string => `EXISTS (
   SELECT 1 FROM conversational_actors hermes_c
     JOIN actor_target_bindings hermes_tb ON hermes_tb.target_actor_id = hermes_c.actor_id
    WHERE hermes_tb.executor_kind = '${HERMES_EXECUTOR_KIND}'
@@ -621,7 +637,7 @@ const currentRoleDeliveryTarget = (outboxAlias: "o" | "outbox"): string => `EXIS
        AND s.lifecycle IN ('READY','DRAINING')
   )`;
 
-const liveDeliveryTarget = (outboxAlias: "o" | "outbox"): string => `(
+export const liveDeliveryTarget = (outboxAlias: "o" | "outbox"): string => `(
   ${currentRoleDeliveryTarget(outboxAlias)}
   OR EXISTS (
     SELECT 1 FROM handoffs h
@@ -843,20 +859,64 @@ export const settleStoppedSessionInstructions = (
   );
 
 /**
- * `Outbox.#readdressCeoNotifications` and the CEO half of `adoptHolderMessages`: every PENDING or
- * SENT-but-unACKed CEO notification not addressed to the CEO's current holder is handed to it
- * (`HANDED_TO_NEW_RECEIVER_SQL`), keeping its message id. A SENT one whose receiver does not really
- * change (`sameReceiverSql`) is only re-addressed to the current generation: it stays SENT, with its
- * failure on record, and is not sent again.
+ * Every unsettled CEO notification follows the current holder with its sealed content and id.
+ * Restore delivery from only the selected room/recipient's ledger, independently of the previous
+ * row state. Acceptance proves SENT, never ACKED; UNKNOWN stays held. An eligible new receiver
+ * with no entry starts queued; refusal history and sender holds are preserved independently.
+ * Legacy unknown history is a separate hold, and an outstanding claim is never taken over here.
  */
 const readdressCeoNotifications = (db: Pick<Db, "run">, generation: number, sessionId: string): void => {
   const notCurrent = `kind = 'CEO_NOTIFICATION' AND role_key = 'CEO' AND (binding_generation <> ? OR target_session_id <> ?)`;
-  db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?
-      WHERE ${notCurrent} AND status = 'SENT' AND ${sameReceiverSql("outbox")}`,
-  [generation, sessionId, generation, sessionId, sessionId, sessionId]);
-  db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?, ${HANDED_TO_NEW_RECEIVER_SQL}
-      WHERE ${notCurrent} AND status IN ('PENDING','SENT')`,
+  // Legacy unknowns, unscoped older authority refusals and signer re-arm requirements are
+  // separate safety holds. Move only their holder tuple, preserving every delivery field.
+  db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ? WHERE ${notCurrent}
+      AND status IN ('PENDING','SENT') AND (
+        reason_code IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED')
+        OR (failure_class IN ('contract','security') AND NOT EXISTS (
+          SELECT 1 FROM audit_events refused WHERE refused.kind = 'CEO_NOTIFICATION_BUZZ_REFUSED'
+            AND json_extract(refused.evidence_json, '$.messageId') = outbox.message_id
+            AND json_extract(refused.evidence_json, '$.error') = outbox.last_error))
+        OR EXISTS (SELECT 1 FROM audit_events legacy WHERE legacy.kind = 'CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN'
+          AND json_extract(legacy.evidence_json, '$.messageId') = outbox.message_id)
+        OR (failure_class = 'unknown_observed' AND NOT EXISTS (
+          SELECT 1 FROM outbox_sent_destinations sent WHERE sent.message_id = outbox.message_id)))`,
   [generation, sessionId, generation, sessionId]);
+  const outcome = `(SELECT outcome FROM destination WHERE message_id = outbox.message_id)`;
+  db.run(`WITH destination AS (
+      SELECT sent.message_id, sent.outcome, sent.sent_at FROM outbox_sent_destinations sent
+        JOIN sessions next ON next.session_id = ? AND next.buzz_address = sent.room AND next.buzz_actor_id = sent.recipient
+      UNION
+      -- A changed address/key on a surviving holder, or another room for the same key,
+      -- is no verified replacement recipient.
+      -- With no exact-room evidence, hold rather than invent acceptance at the new address.
+      SELECT sent.message_id, 'UNKNOWN', NULL FROM outbox_sent_destinations sent
+        JOIN sessions next ON next.session_id = ?
+        JOIN outbox held ON held.message_id = sent.message_id
+        WHERE (next.buzz_actor_id = sent.recipient OR held.binding_generation = ?) AND NOT EXISTS (SELECT 1 FROM outbox_sent_destinations exact
+          WHERE exact.message_id = sent.message_id AND exact.room = next.buzz_address AND exact.recipient = next.buzz_actor_id)
+    ), refusal AS (
+      SELECT json_extract(e.evidence_json, '$.messageId') AS message_id,
+        json_extract(e.evidence_json, '$.failureClass') AS failure_class,
+        json_extract(e.evidence_json, '$.error') AS error,
+        ROW_NUMBER() OVER (PARTITION BY json_extract(e.evidence_json, '$.messageId') ORDER BY CASE json_extract(e.evidence_json, '$.scope') WHEN 'SENDER' THEN 0 ELSE 1 END, e.event_id DESC) AS latest
+      FROM audit_events e JOIN sessions next ON next.session_id = ?
+      WHERE e.kind = 'CEO_NOTIFICATION_BUZZ_REFUSED' AND (
+        json_extract(e.evidence_json, '$.scope') = 'SENDER' OR
+        json_extract(e.evidence_json, '$.recipient') = next.buzz_actor_id OR
+        json_extract(e.evidence_json, '$.targetSessionId') = next.session_id OR
+        EXISTS (SELECT 1 FROM assignments a WHERE a.role_key = 'CEO' AND a.status = 'ACTIVE'
+          AND a.actor_id = json_extract(e.evidence_json, '$.actorId')))
+    ) UPDATE outbox SET binding_generation = ?, target_session_id = ?,
+      status = CASE ${outcome} WHEN 'ACCEPTED' THEN 'SENT' ELSE 'PENDING' END,
+      failure_class = CASE ${outcome} WHEN 'ACCEPTED' THEN NULL WHEN 'UNKNOWN' THEN 'unknown_observed'
+        ELSE (SELECT failure_class FROM refusal WHERE message_id = outbox.message_id AND latest = 1) END,
+      sent_at = CASE ${outcome} WHEN 'ACCEPTED' THEN (SELECT sent_at FROM destination WHERE message_id = outbox.message_id) ELSE NULL END,
+      claim_token = NULL, claimed_at = NULL, retry_eligible = 0, next_attempt_at = NULL, reason_code = NULL,
+      last_error = CASE ${outcome} WHEN 'ACCEPTED' THEN NULL
+        WHEN 'UNKNOWN' THEN 'delivery unconfirmed, automatic resend held; awaiting its ACK'
+        ELSE (SELECT error FROM refusal WHERE message_id = outbox.message_id AND latest = 1) END
+      WHERE ${notCurrent} AND status IN ('PENDING','SENT')`,
+  [sessionId, sessionId, generation, sessionId, generation, sessionId, generation, sessionId]);
 };
 
 /**
@@ -1651,13 +1711,17 @@ export class Outbox {
         ? "withheld: the relay already accepted this message at this room and recipient; awaiting its ACK"
         : "withheld: a send of this message to this room and recipient has an unknown outcome and may be there; " +
           "awaiting its ACK, or a holder at another destination";
+      // PENDING with unknown_observed means delivery unconfirmed, not proof that nothing posted.
+      // Preserve old SENT records; neither representation proves completion.
+      const status = outcome === "UNKNOWN" && this.db.get(`SELECT 1 FROM outbox
+        WHERE message_id = ? AND kind = 'CEO_NOTIFICATION' AND sent_at IS NULL`, [messageId]) ? "PENDING" : "SENT";
       const changes = this.db.run(
-        `UPDATE outbox SET status = 'SENT', sent_at = COALESCE(sent_at, ?), claim_token = NULL, claimed_at = NULL,
+        `UPDATE outbox SET status = ?, sent_at = CASE WHEN ? = 'SENT' THEN COALESCE(sent_at, ?) ELSE sent_at END, claim_token = NULL, claimed_at = NULL,
                            retry_eligible = 0, next_attempt_at = NULL, last_error = ?,
                            failure_class = ?
           WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
             AND ${liveDeliveryTarget("outbox")}`,
-        [this.clock.nowIso(), reason, outcome === "ACCEPTED" ? null : "unknown_observed", messageId, claimToken],
+        [status, status, this.clock.nowIso(), reason, outcome === "ACCEPTED" ? null : "unknown_observed", messageId, claimToken],
       ).changes;
       if (changes !== 1) return this.staleClaim(messageId);
       // A send that never settled (`sentTo` answered UNKNOWN for a stale in-flight record) is settled
@@ -1674,8 +1738,72 @@ export class Outbox {
         evidence: { messageId, room: destination.room, recipient: destination.recipient, outcome, reason },
       });
       return allow(ReasonCode.OK, undefined, { messageId, alreadySent: outcome,
-        ...outboxDeliveryReadback({ status: "SENT", failureClass: outcome === "UNKNOWN" ? "unknown_observed" : null }) });
+        ...outboxDeliveryReadback({ status, failureClass: outcome === "UNKNOWN" ? "unknown_observed" : null }) });
     });
+  }
+
+  /** Read-only candidates; a roster response must still match the target when it returns. */
+  pendingCeoBuzzSignerRoutes(): OutboxMessage[] {
+    return this.db.all<RawOutbox>(`SELECT o.* FROM outbox o WHERE o.kind = 'CEO_NOTIFICATION'
+      AND o.status = 'PENDING' AND ${liveDeliveryTarget("o")} AND ${ceoBuzzRouteSql("o", this.#ceoDelivery !== null)}
+      AND (o.reason_code IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED') OR o.failure_class = 'contract')
+      ORDER BY o.created_at, o.rowid`).filter(row => (row.reason_code === ReasonCode.BUZZ_SIGNER_NOT_REGISTERED || row.reason_code === ReasonCode.BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED ||
+        isBuzzSignerRefusal(row.last_error ?? "")) && ceoBuzzHistoryIsPrePost(this.db, row)).map(hydrate);
+  }
+
+  /** Reclassify a proven old refusal, then use retained re-arm only on positive sender readback. */
+  resumeCeoBuzzSigner(message: OutboxMessage, destination: SentDestination, registered: boolean): void {
+    this.db.tx(() => {
+      const row = this.db.get<RawOutbox>(`SELECT o.* FROM outbox o JOIN sessions s ON s.session_id = o.target_session_id
+        WHERE o.message_id = ? AND o.status = 'PENDING' AND o.target_session_id = ? AND o.binding_generation = ?
+          AND o.payload_digest = ? AND s.buzz_address = ? AND s.buzz_actor_id = ? AND ${liveDeliveryTarget("o")}
+          AND (o.reason_code IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED') OR o.failure_class = 'contract')`,
+      [message.messageId, message.targetSessionId, message.bindingGeneration, message.payloadDigest, destination.room, destination.recipient]);
+      if (!row || !ceoBuzzHistoryIsPrePost(this.db, row)) return;
+      if (row.failure_class === "contract") {
+        if (!isBuzzSignerRefusal(row.last_error ?? "")) return;
+        this.#recordSignerNotReady(hydrate(row), destination, null, "LEGACY_SEND_REFUSAL", row.attempts);
+        this.db.run("UPDATE outbox SET failure_class = 'repairable', reason_code = ? WHERE message_id = ?",
+          [ReasonCode.BUZZ_SIGNER_NOT_REGISTERED, message.messageId]);
+      }
+      if (!registered) return;
+      rearmRetainedDeliveries(this.db, { sessionId: message.targetSessionId, roleKey: message.roleKey,
+        bindingGeneration: message.bindingGeneration, signerReadyMessageId: message.messageId });
+    });
+  }
+
+  #recordSignerNotReady(message: Pick<OutboxMessage, "messageId" | "targetSessionId" | "bindingGeneration" | "roleKey" | "runId">,
+    destination: SentDestination, signer: string | null, source: string, attemptNumber: number,
+    reasonCode: ReasonCode = ReasonCode.BUZZ_SIGNER_NOT_REGISTERED): void {
+    const recorded = this.audit.record({ kind: "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY",
+      reasonCode, roleKey: message.roleKey,
+      sessionId: message.targetSessionId, runId: message.runId,
+      evidence: { messageId: message.messageId, targetSessionId: message.targetSessionId,
+        bindingGeneration: message.bindingGeneration, ...destination, signer, source, attemptNumber,
+        ...(source === "READBACK" ? { registered: reasonCode === ReasonCode.BUZZ_SIGNER_NOT_REGISTERED ? false : null } :
+          { code: "mention_policy", message: "signer not registered for channel" }) } });
+    if (!recorded.allowed) throw new Error("Buzz signer refusal evidence was not recorded");
+  }
+
+  #markSignerNotReady(messageId: string, claimToken: string, failure: DeliveryFailure): Decision<void> {
+    const result = this.db.tx(() => {
+      // A precise pre-post refusal settles its destination even if a handover took the claim.
+      if (failure.destination) this.db.run(`DELETE FROM outbox_sent_destinations
+        WHERE message_id = ? AND room = ? AND recipient = ? AND outcome = 'PENDING_SEND'`,
+      [messageId, failure.destination.room, failure.destination.recipient]);
+      const row = this.db.get<RawOutbox>(`SELECT * FROM outbox WHERE message_id = ? AND kind = 'CEO_NOTIFICATION'
+        AND status = 'IN_FLIGHT' AND claim_token = ? AND ${liveDeliveryTarget("outbox")}`, [messageId, claimToken]);
+      if (!row || !failure.destination || !failure.signerNotRegistered) return null;
+      this.db.run(`UPDATE outbox SET status = 'PENDING', attempts = attempts + 1, last_error = ?,
+        failure_class = 'repairable', reason_code = ?, retry_eligible = 0, next_attempt_at = NULL,
+        claim_token = NULL, claimed_at = NULL WHERE message_id = ?`,
+      [failure.error.slice(0, 500), failure.signerNotRegistered.reasonCode ?? ReasonCode.BUZZ_SIGNER_NOT_REGISTERED, messageId]);
+      this.#recordSignerNotReady(hydrate(row), failure.destination, failure.signerNotRegistered.signer,
+        failure.signerNotRegistered.source, row.attempts + 1, failure.signerNotRegistered.reasonCode);
+      return allow(failure.signerNotRegistered.reasonCode ?? ReasonCode.BUZZ_SIGNER_NOT_REGISTERED, undefined,
+        { messageId, failureClass: "repairable", attempts: row.attempts + 1, retained: true });
+    });
+    return result ?? this.staleClaim(messageId);
   }
 
   /**
@@ -1692,7 +1820,21 @@ export class Outbox {
     claimToken: string,
     failure: DeliveryFailure | string,
   ): Decision<void> {
+    if (typeof failure === "object" && failure.signerNotRegistered &&
+      (failure.signerNotRegistered.source === "READBACK" || isBuzzSignerRefusal(failure.error))) {
+      return this.#markSignerNotReady(messageId, claimToken, failure);
+    }
     const classified = normalizeFailure(failure);
+    if (typeof failure === "object" && failure.ceoRefusal && failure.destination &&
+      !failure.routeAbsent && (classified.failureClass === "contract" || classified.failureClass === "security")) {
+      const actor = this.db.get<{ actor_id: string }>("SELECT actor_id FROM assignments WHERE role_key = 'CEO' AND binding_generation = ?",
+        [failure.ceoRefusal.bindingGeneration]);
+      const recorded = this.audit.record({ kind: "CEO_NOTIFICATION_BUZZ_REFUSED", sessionId: failure.ceoRefusal.targetSessionId,
+        evidence: { messageId, ...failure.destination, ...failure.ceoRefusal, actorId: actor?.actor_id ?? null,
+          failureClass: classified.failureClass, error: classified.error.slice(0, 500) } });
+      if (!recorded.allowed) throw new Error("Buzz refusal history was not recorded");
+    }
+
     // FCR-10, FCR-14: the in-flight send this attempt recorded settles here, whether or not this claim
     // is still held (a handover may have taken the row while the send was pending): an unknown outcome
     // stays on record as UNKNOWN, as an accepted send's ACCEPTED does (`recordAcceptedSend`), so no
@@ -1726,20 +1868,23 @@ export class Outbox {
     if (isRetainedKind(row.kind)) {
       // An unknown outcome (#451: a timed-out send may already be at the far end) is not put back in
       // the queue and is never re-sent to the same receiver on a timer: Buzz has no same-id dedupe
-      // and no receipt lookup, so the row is SENT, flagged `unknown_observed`, awaiting the holder's
-      // ACK. Only a handover to a new receiver delivers it again (`HANDED_TO_NEW_RECEIVER_SQL`).
+      // and no receipt lookup. A CEO send after verified readiness stays PENDING; older send paths
+      // retain SENT. Both are flagged `unknown_observed`, awaiting the holder's ACK. Only a handover
+      // to a new receiver delivers it again (`HANDED_TO_NEW_RECEIVER_SQL`).
       if (classified.failureClass === "unknown_observed") {
+        const status = row.kind === MessageKind.CEO_NOTIFICATION && typeof failure === "object" && failure.buzzSignerReady
+          ? "PENDING" : "SENT";
         const sent = this.db.run(
-          `UPDATE outbox SET status = 'SENT', sent_at = ?, attempts = ?, last_error = ?, failure_class = ?,
+          `UPDATE outbox SET status = ?, sent_at = CASE WHEN ? = 'SENT' THEN ? ELSE sent_at END, attempts = ?, last_error = ?, failure_class = ?,
                              retry_eligible = 0, next_attempt_at = NULL, reason_code = NULL,
                              claim_token = NULL, claimed_at = NULL
             WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
               AND ${liveDeliveryTarget("outbox")}`,
-          [this.clock.nowIso(), attempts, classified.error.slice(0, 500), classified.failureClass, messageId, claimToken],
+          [status, status, this.clock.nowIso(), attempts, classified.error.slice(0, 500), classified.failureClass, messageId, claimToken],
         ).changes;
         if (sent !== 1) return this.staleClaim(messageId);
         return allow(ReasonCode.OK, undefined, { messageId, failureClass: classified.failureClass, attempts, retained: true,
-          ...outboxDeliveryReadback({ status: "SENT", failureClass: classified.failureClass }) });
+          ...outboxDeliveryReadback({ status, failureClass: classified.failureClass }) });
       }
       // An attempt refused before sending because its target had no route (no Buzz room or no channel
       // identity — `DeliveryFailure.routeAbsent`, set at that refusal) sent nothing: it is recorded as
@@ -2329,6 +2474,8 @@ export class Outbox {
     const retargeted: string[] = [];
     const rejected: string[] = [];
     const held: string[] = [];
+
+    if (roleKey === "CEO" && toGeneration !== fromGeneration) readdressCeoNotifications(this.db, toGeneration, toSessionId);
 
     for (const row of pending) {
       const holderClaimed = HOLDER_CLAIMED_KINDS.has(row.kind as MessageKind);
@@ -3723,6 +3870,7 @@ interface RawOutbox {
   created_at: string;
   status: OutboxMessage["status"];
   attempts: number;
+  last_error?: string | null;
   failure_class?: FailureClass | null;
   retry_eligible?: number | null;
   next_attempt_at?: string | null;

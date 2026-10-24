@@ -5,6 +5,8 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, chmodSy
 import { join, resolve, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { generateSecretKey, getPublicKey } from 'nostr-tools';
+import Database from 'better-sqlite3';
+import { currentCanonicalCeoBuzzRoute, daemonBuzzSigner } from '../src/outbox/ceo-buzz-signer.ts';
 import { canonicalJson } from '../src/core/digest.ts';
 import { readProcessStartToken } from '../src/core/process-argv.ts';
 const home = process.env.HOME;
@@ -22,19 +24,35 @@ const read = p => JSON.parse(readFileSync(p,'utf8'));
 const lock = join(state ?? '/invalid','host-provisioner.lock');
 let locked = false;
 let ownLock = null;
+let ceoSigner = false;
 try {
   const req = JSON.parse(readFileSync(0,'utf8'));
   check(req.version === 1 && home && state, 'protocol');
   const a = req.allocation;
-  check(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(a.projectId), 'project id');
-  const match = /^github:([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)$/.exec(a.repositoryIdentity);
-  check(match && match[2] !== '.' && match[2] !== '..', 'repository identity');
-  const repoName = match[2];
-  check(req.operation === 'retire' ? a.clonePath.startsWith(home+'/') && resolve(a.clonePath) === a.clonePath : a.clonePath === join(home,'projects',repoName), 'clone path');
-  check(a.privateKeyFile === join(home,'.hermes','bridge','keys',`${a.identityName}.priv`) && a.identityName === `cto-${a.projectId}`, 'key path');
-  check(a.bootPacket === join(home,'.claude','watchers','fleet',`${a.fleetName}.boot.txt`) && a.fleetName === `acp-${a.projectId}`, 'fleet path');
-  check(a.socketPath === join(state,`cc-session-${a.projectId}.sock`) && a.tmuxName === `acp-${Buffer.from(a.projectId).toString("hex")}`, 'runtime path');
-  check(/^[a-f0-9-]{36}$/.test(a.sessionUuid) && /^[a-f0-9-]{36}$/.test(a.roomId) && /^[a-f0-9]{40}$/.test(a.head), 'allocation identity');
+  ceoSigner = req.operation === 'ensure-buzz' && a?.mode === 'ceo-route-signer';
+  const match = ceoSigner ? null : /^github:([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)$/.exec(a.repositoryIdentity);
+  const repoName = match?.[2];
+  let routeDb = null;
+  const currentCeo = () => {
+    check(routeDb, 'CEO database unavailable');
+    const route = currentCanonicalCeoBuzzRoute({all: (sql, params = []) => routeDb.prepare(sql).all(...params)});
+    check(route && canonicalJson(route) === canonicalJson(a.route), 'current canonical CEO binding/room mismatch');
+    return route;
+  };
+  if (ceoSigner) {
+    check(process.env.ACP_HOST_DATABASE_PATH, 'CEO database path unavailable');
+    routeDb = new Database(process.env.ACP_HOST_DATABASE_PATH, {readonly:true,fileMustExist:true});
+    currentCeo();
+    check(/^[a-f0-9-]{36}$/.test(a.route.roomId) && /^[a-f0-9]{64}$/.test(a.signer), 'CEO signer identity');
+  } else {
+    check(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(a.projectId), 'project id');
+    check(match && match[2] !== '.' && match[2] !== '..', 'repository identity');
+    check(req.operation === 'retire' ? a.clonePath.startsWith(home+'/') && resolve(a.clonePath) === a.clonePath : a.clonePath === join(home,'projects',repoName), 'clone path');
+    check(a.privateKeyFile === join(home,'.hermes','bridge','keys',`${a.identityName}.priv`) && a.identityName === `cto-${a.projectId}`, 'key path');
+    check(a.bootPacket === join(home,'.claude','watchers','fleet',`${a.fleetName}.boot.txt`) && a.fleetName === `acp-${a.projectId}`, 'fleet path');
+    check(a.socketPath === join(state,`cc-session-${a.projectId}.sock`) && a.tmuxName === `acp-${Buffer.from(a.projectId).toString("hex")}`, 'runtime path');
+    check(/^[a-f0-9-]{36}$/.test(a.sessionUuid) && /^[a-f0-9-]{36}$/.test(a.roomId) && /^[a-f0-9]{40}$/.test(a.head), 'allocation identity');
+  }
   mkdirSync(state,{recursive:true,mode:0o700});
   // The owner record is complete before its symlink is claimed; SIGKILL cannot leave an ownerless lock.
   ownLock = join(state,`.host-provisioner-${process.pid}-${randomUUID()}`);
@@ -49,8 +67,8 @@ try {
     rmSync(lock);symlinkSync(ownLock,lock);
   }
   locked = true;
-  const origin = `https://github.com/${match[1]}/${repoName}.git`;
-  const identityFile = join(a.clonePath,'.git','acp-repository.json');
+  const origin = ceoSigner ? null : `https://github.com/${match[1]}/${repoName}.git`;
+  const identityFile = ceoSigner ? null : join(a.clonePath,'.git','acp-repository.json');
   // Git's own HEAD, never the allocation's: a commit merely present proves nothing about what the CTO's
   // checkout holds. Nothing here ever resets, cleans, stashes or checks out.
   // `bootstrap` — activation's requirement until a resident of this allocation has been observed on
@@ -85,7 +103,7 @@ try {
   const buzzEnv = () => ({...process.env,BUZZ_IDENTITY:a.identityName,BUZZ_PRIVATE_KEY:readFileSync(a.privateKeyFile,'utf8').trim()});
   const buzz = args => json('buzz',args,{env:buzzEnv()});
   const pub = () => getPublicKey(Buffer.from(readFileSync(a.privateKeyFile,'utf8').trim(),'hex'));
-  const pubFile = a.privateKeyFile.replace(/\.priv$/,'.pub');
+  const pubFile = ceoSigner ? null : a.privateKeyFile.replace(/\.priv$/,'.pub');
   const rosterFile = join(home,'.hermes','bridge','required-mentions.json');
   const fleetFile = join(home,'.claude','watchers','fleet','manifest.tsv');
   const sessionFile = join(state,`resident-${a.projectId}.json`);
@@ -127,6 +145,36 @@ try {
       result = {checkout:checkout(checkoutRequirement)}; break;
     }
     case 'ensure-buzz': {
+      if (ceoSigner) {
+        // Never load a CEO/CTO key. The environment is the daemon's own sending identity.
+        const signer = daemonBuzzSigner(process.env.BUZZ_PRIVATE_KEY);
+        check(signer, 'daemon signer unavailable');
+        check(signer === a.signer, 'daemon sending signer mismatch');
+        const route = currentCeo();
+        const room = json('buzz',['channels','get','--channel',route.roomId]);
+        check(room.channel_id === route.roomId, 'CEO room identity mismatch');
+        const members = () => {
+          const value = json('buzz',['channels','members','--channel',route.roomId]);
+          check(Array.isArray(value) && value.every(m => /^[a-f0-9]{64}$/.test(m.pubkey) && ['owner','admin','member'].includes(m.role)), 'invalid CEO roster');
+          check(new Set(value.map(m => m.pubkey)).size === value.length, 'ambiguous CEO roster');
+          return value;
+        };
+        const before = members();
+        check(before.some(m => m.pubkey === route.recipient), 'bound CEO absent from room');
+        const changed = !before.some(m => m.pubkey === signer);
+        currentCeo(); // Revalidate immediately before the only possible write.
+        if (changed) run('buzz',['channels','add-member','--channel',route.roomId,'--pubkey',signer,'--role','member']);
+        const after = members();
+        const old = before.map(canonicalJson).sort();
+        const retained = after.filter(m => m.pubkey !== signer || before.some(b => b.pubkey === signer)).map(canonicalJson).sort();
+        check(canonicalJson(old) === canonicalJson(retained) && after.length === before.length + Number(changed) &&
+          after.some(m => m.pubkey === signer && (!changed || m.role === 'member')), 'CEO roster readback mismatch');
+        check(canonicalJson(room) === canonicalJson(json('buzz',['channels','get','--channel',route.roomId])), 'CEO room policy changed');
+        currentCeo();
+        result = {ceoBuzzSigner:{route,signer,changed,rosterVerified:true}};
+        routeDb.close();
+        break;
+      }
       if (!existsSync(a.privateKeyFile)) atomic(a.privateKeyFile,Buffer.from(generateSecretKey()).toString('hex')+'\n');
       check(lstatSync(a.privateKeyFile).isFile() && !lstatSync(a.privateKeyFile).isSymbolicLink(),'key must be a regular file');
       chmodSync(a.privateKeyFile,0o600); const pk = pub();
@@ -261,5 +309,19 @@ try {
     default: throw new Error('unknown operation');
   }
   process.stdout.write(JSON.stringify(result));
-} catch (error) {process.stderr.write(`host project provisioner refused operation${error instanceof ProvisionerRefusal ? ': '+error.message : ''}\n`);process.exitCode = 1;}
+} catch (error) {
+  if (ceoSigner) {
+    let failure = {outcome:'LOST',code:'host_response_unknown',message:'host provisioning outcome unknown'};
+    if (error instanceof ProvisionerRefusal) failure = {outcome:'INVALID',code:'host_verification_failed',message:error.message};
+    else {
+      try {
+        const refusal = JSON.parse(String(error.stderr).trim());
+        if (typeof refusal.error === 'string' && typeof refusal.message === 'string' && refusal.retryable === false)
+          failure = {outcome:'REFUSED',code:refusal.error,message:refusal.message};
+      } catch { /* No precise relay refusal was received. */ }
+    }
+    process.stderr.write(JSON.stringify({ceoBuzzSignerFailure:failure}));
+  } else process.stderr.write(`host project provisioner refused operation${error instanceof ProvisionerRefusal ? ': '+error.message : ''}\n`);
+  process.exitCode = 1;
+}
 finally {if (locked && readlinkSync(lock) === ownLock) rmSync(lock,{force:true});if (ownLock) rmSync(ownLock,{recursive:true,force:true});}

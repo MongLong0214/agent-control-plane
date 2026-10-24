@@ -143,7 +143,7 @@ console.log('verification ok');`,
   // transport; the fixture wires an in-memory one so "connected" means something.
   const buzz = new InMemoryBuzzTransport();
   const adapter = new BuzzAdapter(
-    cp.db, cp.clock, cp.audit, cp.sessions, cp.bindings, cp.outbox, options.buzzTransport ?? buzz,
+    cp.db, cp.clock, cp.audit, cp.sessions, cp.bindings, cp.outbox, options.buzzTransport ?? buzz, cp.hostProjectProvisioner,
   );
   cp.cto.attach({
     buzz: {

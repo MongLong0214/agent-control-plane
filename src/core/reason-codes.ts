@@ -226,6 +226,9 @@ export const ReasonCode = {
   SESSION_STOP_FAILED: "SESSION_STOP_FAILED",
 
   // --- buzz delivery -------------------------------------------------------
+  /** The daemon signing identity is absent from the exact destination room. */
+  BUZZ_SIGNER_NOT_REGISTERED: "BUZZ_SIGNER_NOT_REGISTERED",
+  BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED: "BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED",
   /**
    * An outbound Buzz message named no recipient, so nobody was addressed by it.
    *

@@ -3,6 +3,7 @@ import { afterAll, expect, it, vi } from "vitest";
 import type { BuzzSendReceipt, BuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
+import { outboxDeliveryReadback } from "../../src/outbox/outbox.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
 
@@ -95,24 +96,24 @@ it("FCR-08: changing the old session's address cannot make the timed-out recipie
   try {
     f.h.cp.sessions.setBuzzAddress(f.first.sessionId, "changed-after-send");
     const next = replaceWith(f, { room: "first-room", identity: "first-key" });
-    expect(stateOf(f.h, f.id)).toMatchObject({ status: "SENT", failure_class: "unknown_observed", target_session_id: next.sessionId });
+    expect(stateOf(f.h, f.id)).toMatchObject({ status: "PENDING", failure_class: "unknown_observed", target_session_id: next.sessionId });
     f.h.clock.advance(60 * 60_000);
     expect((await f.h.buzzAdapter.deliverPending()).delivered).not.toContain(f.id);
     expect(sendsOf(f.send, f.id)).toBe(f.sent);
   } finally { f.h.cp.close(); }
 });
 
-it("FCR-08: the old session's current address cannot suppress the first delivery to a different recipient", async () => {
+it("FCR-08: the old session's current address cannot suppress the first delivery to a verified different recipient key", async () => {
   const f = await timedOut("new-receiver-suppressed");
   try {
     f.h.cp.sessions.setBuzzAddress(f.first.sessionId, "new-room");
-    const next = replaceWith(f, { room: "new-room", identity: "first-key" });
+    const next = replaceWith(f, { room: "new-room", identity: "new-key" });
     expect(stateOf(f.h, f.id)).toMatchObject({ status: "PENDING", failure_class: null, target_session_id: next.sessionId });
     expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([f.id]);
     expect(f.send.mock.calls.filter((call) => String(call[1]).includes(f.id)).map((call) => call[0])).toEqual(["first-room", "new-room"]);
     expect(destinationsOf(f.h, f.id)).toEqual([
       { room: "first-room", recipient: "first-key", outcome: "UNKNOWN" },
-      { room: "new-room", recipient: "first-key", outcome: "ACCEPTED" },
+      { room: "new-room", recipient: "new-key", outcome: "ACCEPTED" },
     ]);
   } finally { f.h.cp.close(); }
 });
@@ -121,14 +122,17 @@ it("FCR-08: a holder with no route yet gets the row, and when its route turns ou
   const f = await timedOut("route-arrives-later");
   try {
     const next = replaceWith(f, { room: null, identity: "first-key" });
-    // Its route is not where the row was sent, so the row is handed to it; with no room it waits.
-    expect(stateOf(f.h, f.id)).toMatchObject({ status: "PENDING", failure_class: null, target_session_id: next.sessionId });
+    // The receiving key is unchanged: a missing room cannot erase its unknown send history.
+    expect(stateOf(f.h, f.id)).toMatchObject({ status: "PENDING", failure_class: "unknown_observed", target_session_id: next.sessionId });
     expect((await f.h.buzzAdapter.deliverPending()).delivered).not.toContain(f.id);
     expect(sendsOf(f.send, f.id)).toBe(f.sent);
     f.h.cp.sessions.setBuzzAddress(next.sessionId, "first-room");
     expect((await f.h.buzzAdapter.deliverPending()).delivered).not.toContain(f.id);
     expect(sendsOf(f.send, f.id)).toBe(f.sent);
-    expect(stateOf(f.h, f.id)).toMatchObject({ status: "SENT", failure_class: "unknown_observed", target_session_id: next.sessionId });
+    // A route with no accepted post has no inherited sent_at; its unknown outcome stays PENDING.
+    expect(stateOf(f.h, f.id)).toMatchObject({ status: "PENDING", failure_class: "unknown_observed", target_session_id: next.sessionId });
+    expect(outboxDeliveryReadback(f.h.cp.outbox.get(f.id)!)).toMatchObject({ status: "OUTCOME_UNKNOWN",
+      delivered: false, automaticResendHeld: true });
     const incarnation = f.h.cp.sessions.require(next.sessionId).incarnation;
     const generation = f.h.cp.bindings.active("CEO")!.bindingGeneration;
     expect(f.h.cp.outbox.acknowledge(f.id, next.sessionId, generation, incarnation).allowed).toBe(true);

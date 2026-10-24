@@ -393,3 +393,23 @@ describe("ESC-03: a PENDING ESCALATION_REPLY follows every takeover, to the run'
     });
   });
 });
+
+it("a late Buzz notification for a resolved escalation cannot execute the decision again", async () => {
+  await withBootstrapRuntime(async (f) => {
+    const { runId, escalationId } = await blocked(f);
+    const notification = f.harness.cp.outbox.listByRun(runId).find(m => m.kind === MessageKind.CEO_NOTIFICATION)!;
+    expect(notification.status).toBe("PENDING");
+    expect(await resolve(f, runId, escalationId, "before-late-notice")).toMatchObject({ ok: true });
+    const decisions = count(f, "CEO_DECISION", runId);
+    const replyIds = replies(f, runId).map(m => m.messageId);
+    // Delivery happens only after the domain decision is already committed.
+    f.harness.cp.sessions.setBuzzAddress(f.ceoSessionId, "late-ceo-room");
+    f.harness.cp.db.run("UPDATE sessions SET buzz_actor_id = 'ceo-key' WHERE session_id = ?", [f.ceoSessionId]);
+    await f.harness.buzzAdapter.deliverPending();
+    expect(f.harness.cp.outbox.get(notification.messageId)?.status).toBe("SENT");
+    expect(await resolve(f, runId, escalationId, "after-late-notice")).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
+    expect(count(f, "CEO_DECISION", runId)).toBe(decisions);
+    expect(replies(f, runId).map(m => m.messageId)).toEqual(replyIds);
+    expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
+  });
+});
