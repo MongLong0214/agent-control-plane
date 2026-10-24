@@ -2,6 +2,7 @@
 import { readBuzzSubscriberConfig } from '../buzz/buzz-mention-subscriber.ts';
 import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
 import { outboxDeliveryReadback, type OutboxMessage } from "../outbox/outbox.ts";
+import type { CeoNoticeAttempt } from "../outbox/ceo-notification-route.ts";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, realpathSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
@@ -2868,7 +2869,7 @@ export const createConfiguredHermesGatewayDaemonNoticeTarget = (
 
 /** CEO notifications use the authenticated canonical daemon-notice surface, with receipt dedupe. */
 export const createCeoNotificationSender = (resolveTarget: DaemonNoticeTargetResolver, laneSecret: string) =>
-  async (message: OutboxMessage): Promise<Decision<void>> => {
+  async (message: OutboxMessage, attempt?: CeoNoticeAttempt): Promise<Decision<void>> => {
     const target = await resolveTarget();
     if (!target) return deny(ReasonCode.CEO_CONVERSATION_UNAVAILABLE, "canonical CEO route unavailable");
     const text = JSON.stringify({ messageId: message.messageId, kind: message.kind, payload: message.payload });
@@ -2880,16 +2881,31 @@ export const createCeoNotificationSender = (resolveTarget: DaemonNoticeTargetRes
       part += character;
     }
     if (part) parts.push(part);
-    for (const [index, part] of parts.entries()) {
+    const requests = parts.map((part, index) => {
       const eventId = daemonNoticeEventId(message.messageId, message.roleKey,
         `CEO_NOTIFICATION:${digestOf(target.destination)}:${index}`);
       const canonical = daemonNoticeCanonical(daemonNoticeFields(eventId, target.destination,
         `ACP notification ${message.messageId} part ${index + 1}/${parts.length}: ${part}`));
-      const body = sealDaemonNotice(canonical, daemonNoticeKey(laneSecret));
+      return sealDaemonNotice(canonical, daemonNoticeKey(laneSecret));
+    });
+    const prepared = attempt?.prepare(target.destination, requests) ?? { route: "CANONICAL" as const, requests };
+    if (prepared.route !== "CANONICAL") return deny(ReasonCode.CEO_CONVERSATION_UNAVAILABLE, "canonical notice withheld");
+    let settledParts = 0;
+    for (const body of prepared.requests) {
       const result = await target.send(body);
+      // This exact Gateway parser error is emitted before receipt claim. A generic 400, truncated
+      // answer, timeout or canonical_event_uncertain proves nothing. A partially delivered multipart
+      // notification likewise cannot be moved to Buzz as a whole.
+      if (settledParts === 0 && result.kind === "RESPONDED" && result.status === 400 &&
+          JSON.stringify(result.body) === '{"error":{"code":"canonical_invalid_request"}}') {
+        return deny(ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED, "canonical notice protocol refused before claim",
+          { noticeOutcome: "REFUSED" });
+      }
       if (result.kind !== "RESPONDED" || !daemonNoticeSettlement(result.status, result.body, {
-        eventId, payloadDigest: body.payload_digest, destination: target.destination,
-      }).settled) return deny(ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED, "canonical CEO did not accept the notification");
+        eventId: body.event_id, payloadDigest: body.payload_digest, destination: target.destination,
+      }).settled) return deny(ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED, "canonical CEO did not accept the notification",
+        { noticeOutcome: settledParts === 0 && result.kind === "NOT_SENT" ? "NOT_SENT" : "UNKNOWN" });
+      settledParts += 1;
     }
     return allow(ReasonCode.OK, undefined);
   };

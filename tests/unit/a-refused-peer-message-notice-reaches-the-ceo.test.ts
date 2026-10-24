@@ -353,6 +353,8 @@ describe("acp-daemon-notice/v1: the daemon tells the CEO of a refused peer messa
       expect(gateway.posts[1]!.raw).toBe(gateway.posts[0]!.raw);
       expect(gateway.turns.size).toBe(1);
       expect(settledCount(h)).toBe(1);
+      expect(h.cp.audit.byKind("CEO_NOTIFICATION_PROTOCOL_SUPPORT").filter((e) => e.evidence["supportEventId"] === eventId))
+        .toMatchObject([{ evidence: { support: "SUPPORTED" } }]);
       expect(await pass(h, gateway)).toEqual({ settled: [], inDoubt: [], failed: [], waiting: [] });
       expect(settledCount(h)).toBe(1);
     } finally {

@@ -121,9 +121,16 @@ it("review: a configured pinned Hermes target without the lane secret withholds 
 
 it("a pinned Hermes target and the lane secret alone, with no Telegram consumer, establish the canonical route and drain what adoption carried", async () => {
   const sent: string[] = [];
+  const noticeSenderFactory = () => async (body: DaemonNoticeBody): Promise<DaemonNoticeSendOutcome> => {
+    sent.push(body.event_id);
+    return { kind: "RESPONDED", status: 200, body: { event_id: body.event_id, payload_digest: body.payload_digest,
+      receipt: { status: "completed", receipt_id: "receipt", session_id: LIVE, lineage_root_digest: DIGEST } } };
+  };
   const f = adoptedFixture({
-    // A notification queued for the CEO before this Gateway was adopted, with no route at the time.
+    // Journaled unsent mail queued before adoption; pre-journal mail cannot be released.
     history: (h) => {
+      expect(startConfiguredCeoNotificationRoute(h.cp, { environment: { ACP_TELEGRAM_EXTERNAL_SECRET: "lane-secret" },
+        hermesConfiguration: HERMES, ports: { ...PINNED, noticeSenderFactory } })).toEqual({ started: true });
       const earlier = h.cp.sessions.create({ provider: "scripted", model: "earlier-ceo" });
       expect(h.cp.sessions.transition(earlier.sessionId, SessionLifecycle.READY, "earlier").allowed).toBe(true);
       expect(h.cp.bindings.bind({ role: Role.CEO, sessionId: earlier.sessionId }).allowed).toBe(true);
@@ -141,20 +148,17 @@ it("a pinned Hermes target and the lane secret alone, with no Telegram consumer,
       hermesConfiguration: HERMES,
       ports: {
         ...PINNED,
-        noticeSenderFactory: () => async (body) => {
-          sent.push(body.event_id);
-          return { kind: "RESPONDED", status: 200, body: { event_id: body.event_id, payload_digest: body.payload_digest,
-            receipt: { status: "completed", receipt_id: "receipt", session_id: LIVE, lineage_root_digest: DIGEST } } };
-        },
+        noticeSenderFactory,
       },
     });
     expect(started).toEqual({ started: true });
     await cp.outbox.deliverCeoNotifications();
     expect(statusOf(f.h, queued.messageId)).toBe("ACKED");
     expect(sent).toHaveLength(1);
-    // While it had no route it was on record as unroutable, once per target, with why; never after.
+    // The journal preceded enqueue, and adoption carried this unsent row before a routeless sweep.
     expect(cp.audit.byKind("CEO_NOTIFICATION_ROUTE_UNAVAILABLE").map((row) => (row.evidence as { reason?: string }).reason))
-      .toEqual(["NO_BUZZ_ROUTE", "CANONICAL_TRANSPORT_NOT_ATTACHED"]);
+      .toEqual([]);
+    expect(cp.audit.byKind("CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN")).toHaveLength(0);
 
     // Without the secret nothing can sign a notice, and the composition says exactly that.
     const g = adoptedFixture();
@@ -293,6 +297,8 @@ describe("ACP-R1-03 closure: the canonical CEO notice route is signed, or it doe
     const hermes = hermesSide("lane-secret");
     const f = adoptedFixture({
       history: (h) => {
+        expect(startConfiguredCeoNotificationRoute(h.cp, { environment: { ACP_TELEGRAM_EXTERNAL_SECRET: "lane-secret" },
+          hermesConfiguration: HERMES, ports: { ...PINNED, noticeSenderFactory: hermes.noticeSenderFactory } })).toEqual({ started: true });
         const earlier = h.cp.sessions.create({ provider: "scripted", model: "earlier-ceo" });
         expect(h.cp.sessions.transition(earlier.sessionId, SessionLifecycle.READY, "earlier").allowed).toBe(true);
         expect(h.cp.bindings.bind({ role: Role.CEO, sessionId: earlier.sessionId }).allowed).toBe(true);

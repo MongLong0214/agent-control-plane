@@ -147,7 +147,7 @@ it("#1 delivers adopted CEO notifications over the pinned canonical surface and 
     const config = { ACP_HERMES_LINEAGE_ROOT_DIGEST: DIGEST, ACP_HERMES_EXECUTABLE: "/opt/test/hermes",
       ACP_HERMES_PROFILE: "test", ACP_HERMES_HOME: "/opt/test/home", ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY: "hermes-runtime:test",
       ACP_HERMES_GATEWAY_API_KEY: "test-key" };
-    let accepted = false;
+    let accepted = true;
     const eventIds: string[] = [];
     const parts = new Map<string, string>();
     const target = createConfiguredHermesGatewayDaemonNoticeTarget(cp, config, {
@@ -162,15 +162,21 @@ it("#1 delivers adopted CEO notifications over the pinned canonical surface and 
       },
     })!;
     const binding = cp.bindings.active("CEO")!;
+    cp.outbox.attachCeoNotificationDelivery(createCeoNotificationSender(target, "lane-secret"));
+    await cp.outbox.deliverCeoNotifications();
+    // Independently verify support before exercising the existing in-doubt receipt lookup.
+    const support = cp.outbox.enqueue({ idempotencyKey: "verify-ceo-support", roleKey: "CEO", bindingGeneration: binding.bindingGeneration,
+      targetSessionId: binding.sessionId, kind: MessageKind.CEO_NOTIFICATION, payload: { text: "verify receiver support" } });
+    if (!support.allowed) throw new Error(support.message);
+    await cp.outbox.deliverCeoNotifications();
+    expect(cp.outbox.get(support.value.messageId)?.status).toBe("ACKED");
+    eventIds.length = 0;
+    parts.clear();
+    accepted = false;
     const result = cp.outbox.enqueue({ idempotencyKey: "ceo-notice", roleKey: "CEO", bindingGeneration: binding.bindingGeneration,
       targetSessionId: binding.sessionId, kind: MessageKind.CEO_NOTIFICATION, payload: { notification: "ESCALATION", text: "decision required" } });
     if (!result.allowed) throw new Error(result.message);
-    if (typeof createCeoNotificationSender === "function") {
-      cp.outbox.attachCeoNotificationDelivery(createCeoNotificationSender(target, "lane-secret"));
-    } else {
-      await f.h.buzzAdapter.deliverPending();
-    }
-    await cp.outbox.deliverCeoNotifications?.();
+    await cp.outbox.deliverCeoNotifications();
     expect(cp.outbox.get(result.value.messageId)?.status).toBe("PENDING");
     f.h.clock.advance(31 * 60_000);
     cp.outbox.expireOverdue();
