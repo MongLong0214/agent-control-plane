@@ -42,11 +42,11 @@ async function fixture(principal: "owner" | "peer" = "owner") {
     lineage_root_digest: lineage, cron: false, delegation_depth: 0 } };
   const servers: Array<{ close(): Promise<void> }> = [];
   async function connect(kind: "cto" | "hermes", sessionId: string, provenance = true,
-    identity: "complete" | "actor-only" | "session-only" | "incarnation-only" | "unauthenticated" = "complete", plane = h.cp) {
+    identity: "complete" | "actor-only" | "session-only" | "incarnation-only" | "unauthenticated" = "complete", plane = h.cp,
+    binding?: { roleKey: string; bindingGeneration: number }) {
     const session = plane.sessions.require(sessionId);
-    const primaryBinding = kind === "cto" ? plane.bindings.activePrimaryCtos().find(b => b.sessionId === sessionId) : undefined;
     const auth = () => identity === "unauthenticated" ? deny<never>(ReasonCode.MCP_PEER_UNAUTHENTICATED, "fixture unauthenticated connection") : allow(ReasonCode.OK, { actor: sessionId,
-      ...(primaryBinding ? { binding: { roleKey: primaryBinding.roleKey, bindingGeneration: primaryBinding.bindingGeneration } } : {}),
+      ...(binding ? { binding } : {}),
       ...(identity === "complete" || identity === "session-only" ? { sessionId } : {}),
       ...(identity === "complete" || identity === "incarnation-only" ? { sessionIncarnation: session.incarnation } : {}) });
     const server = kind === "cto" ? createCtoServer(createCtoMcpPort(plane), auth)
@@ -606,7 +606,8 @@ describe("CEO-approved bootstrap PLAN input over real Hermes and CTO MCP servers
 async function stagingFixture(principal: "owner" | "peer" = "owner") {
   const f = await fixture(principal);
   const primary = seedRun({ db: f.h.cp.db, clock: f.h.clock, repoPath: f.h.repoPath, claim: false });
-  const call = await f.connect("cto", primary.sessionId);
+  const call = await f.connect("cto", primary.sessionId, true, "complete", f.h.cp,
+    { roleKey: primary.roleKey, bindingGeneration: primary.generation });
   const stage = (overrides: Args = {}) => call("bootstrap_plan_stage", { ...f.attachArgs, idempotencyKey: "stage", ...overrides });
   const state = () => ({ artifacts: f.h.cp.artifacts.list(f.run.runId), run: f.h.cp.runs.require(f.run.runId),
     candidate: f.h.cp.runs.currentCandidate(f.run.runId), application: f.h.cp.bootstrapApplications.get(f.run.runId),
@@ -617,6 +618,56 @@ async function stagingFixture(principal: "owner" | "peer" = "owner") {
 }
 
 describe("bounded PRIMARY_CTO bootstrap candidate staging", () => {
+  it("stages as the exact CTO socket binding when project and assignment enumeration orders differ", async () => {
+    const f = await fixture();
+    // Projects sort first by creation time, then id; assignments sort by assignment id.
+    const projectId = "prj_a_socket_stager";
+    const firstProjectId = "prj_z_socket_stager";
+    expect(f.h.cp.projects.register({ projectId: firstProjectId, name: "first stager" }).allowed).toBe(true);
+    expect(f.h.cp.projects.register({ projectId, name: "socket stager" }).allowed).toBe(true);
+    const session = f.h.cp.sessions.create({ provider: "claude", model: "opus" });
+    expect(f.h.cp.sessions.transition(session.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+    const bound = f.h.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: firstProjectId, sessionId: session.sessionId });
+    if (!bound.allowed) throw new Error(bound.message);
+    const first = bound.value;
+    const roleKey = `PRIMARY_CTO:${projectId}`;
+    f.h.cp.db.run(`INSERT INTO assignments
+      (assignment_id, role_key, role, project_id, actor_id, session_id, session_incarnation,
+       binding_generation, mode, status, created_at)
+      SELECT ?, ?, 'PRIMARY_CTO', ?, actor_id, session_id, session_incarnation,
+             binding_generation, mode, status, created_at FROM assignments WHERE assignment_id = ?`,
+    [first.assignmentId + "z", roleKey, projectId, first.assignmentId]);
+    expect(f.h.cp.projects.list().map(p => p.projectId)).toEqual([projectId, firstProjectId]);
+    expect(f.h.cp.bindings.activePrimaryCtos().map(b => b.roleKey)).toEqual([first.roleKey, roleKey]);
+    const binding = f.h.cp.bindings.require(roleKey);
+    expect(binding).toMatchObject({ role: Role.PRIMARY_CTO, sessionId: first.sessionId,
+      sessionIncarnation: first.sessionIncarnation, bindingGeneration: 1 });
+    const token = "bootstrap-stage-socket-token";
+    const listeners = await startLocalMcpListeners(f.h.cp, tempDir("bp-stage-"), token);
+    try {
+      if (!session.sessionSecret) throw new Error("missing socket credential");
+      const call = () => callMcpToolOverSocket(listeners.socketPaths[1]!, {
+        token, sessionId: first.sessionId, sessionSecret: session.sessionSecret!,
+      }, "bootstrap_plan_stage", { ...f.attachArgs, idempotencyKey: "stage-socket" });
+      const staged = await call();
+      expect(staged).toMatchObject({ ok: true, value: { digest: f.digest, stagedBy: roleKey } });
+      expect(await call()).toEqual(staged);
+      expect(f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF").map(a => a.content.stagedBy)).toEqual([roleKey]);
+      expect(f.h.cp.audit.byKind("BOOTSTRAP_PLAN_STAGED")).toMatchObject([{ roleKey, sessionId: first.sessionId }]);
+      expect(await f.attach({ planBody: undefined, stagedBy: roleKey })).toMatchObject({ ok: true, value: { digest: f.digest } });
+    } finally { await listeners.close(); await f.close(); }
+  });
+
+  it("refuses binding-free compatibility peers instead of selecting a PRIMARY_CTO role", async () => {
+    const f = await stagingFixture();
+    try {
+      const call = await f.connect("cto", f.primary.sessionId);
+      const before = f.state();
+      expect(await call("bootstrap_plan_stage", f.attachArgs)).toMatchObject({ ok: false, reasonCode: "MCP_PEER_UNAUTHENTICATED" });
+      expect(f.state()).toEqual(before);
+    } finally { await f.close(); }
+  });
+
   it.each(["owner", "peer"] as const)("stages inert exact bytes once, then %s-attaches, reads and submits by digest", async principal => {
     const f = await stagingFixture(principal);
     try {
@@ -897,7 +948,8 @@ async function anotherStager(f: Awaited<ReturnType<typeof stagingFixture>>, cano
   const binding = f.h.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId, sessionId: session.sessionId,
     ...(canonical ? { authenticatedTarget: { claimed, protocolVersion: SELF_CLAIM_PROTOCOL, attestationDigest: digestOf(claimed), verify: () => claimed } } : {}) });
   if (!binding.allowed) throw new Error(binding.message);
-  const call = await f.connect("cto", session.sessionId);
+  const call = await f.connect("cto", session.sessionId, true, "complete", f.h.cp,
+    { roleKey: binding.value.roleKey, bindingGeneration: binding.value.bindingGeneration });
   const body = f.body + " ";
   const digest = sha256(body);
   const stage = (overrides: Args = {}) => call("bootstrap_plan_stage", { ...f.attachArgs, idempotencyKey: "other-stage",

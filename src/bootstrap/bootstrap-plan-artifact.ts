@@ -185,8 +185,14 @@ export const bootstrapPlanStageAccess = (source: StageSource, peer: Authenticate
   if (!peer.sessionId || !peer.sessionIncarnation || session?.incarnation !== peer.sessionIncarnation || session.lifecycle !== SessionLifecycle.READY) {
     return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "staging requires a current PRIMARY_CTO session");
   }
-  const primary = source.bindings.activePrimaryCtos().find(b => b.sessionId === peer.sessionId && b.sessionIncarnation === peer.sessionIncarnation);
-  if (!primary?.projectId || primary.roleKey !== roleKeyFor(Role.PRIMARY_CTO, { projectId: primary.projectId }) || (peer.binding && (peer.binding.roleKey !== primary.roleKey || peer.binding.bindingGeneration !== primary.bindingGeneration))) {
+  if (!peer.binding) {
+    return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "staging requires an authenticated PRIMARY_CTO binding");
+  }
+  const primary = source.bindings.active(peer.binding.roleKey);
+  if (primary?.role !== Role.PRIMARY_CTO || !primary.projectId
+      || primary.roleKey !== roleKeyFor(Role.PRIMARY_CTO, { projectId: primary.projectId })
+      || primary.sessionId !== peer.sessionId || primary.sessionIncarnation !== peer.sessionIncarnation
+      || primary.bindingGeneration !== peer.binding.bindingGeneration) {
     return deny(ReasonCode.BINDING_GENERATION_STALE, "staging requires the project's current PRIMARY_CTO binding");
   }
   const stager = selectedStager(primary.roleKey);

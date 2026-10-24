@@ -381,7 +381,8 @@ describe("the adopted CEO tool socket, through the relay", () => {
       if (staged) {
         const primary = seedRun({ db: h.cp.db, clock: h.clock, repoPath: h.repoPath, claim: false });
         const before = { run: h.cp.runs.require(runId), outbox: h.cp.outbox.listByRun(runId) };
-        expect(await callCtoTool(h, { sessionId: primary.sessionId, incarnation: h.cp.sessions.require(primary.sessionId).incarnation },
+        expect(await callCtoTool(h, { sessionId: primary.sessionId, incarnation: h.cp.sessions.require(primary.sessionId).incarnation,
+          binding: { roleKey: primary.roleKey, bindingGeneration: primary.generation } },
           "bootstrap_plan_stage", { ...attach.arguments, idempotencyKey: "plan-socket-stage" })).toMatchObject({ ok: true, value: { digest } });
         expect({ run: h.cp.runs.require(runId), outbox: h.cp.outbox.listByRun(runId) }).toEqual(before);
         (attach.arguments as Record<string, unknown>)["stagedBy"] = primary.roleKey;
