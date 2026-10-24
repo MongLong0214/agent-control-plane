@@ -1,3 +1,4 @@
+import { ceoBuzzHistoryIsPrePost, isBuzzSignerRefusal } from "./ceo-buzz-signer.ts";
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
 import { type Decision, allow, deny, fail, isAcpError } from "../core/errors.ts";
@@ -149,6 +150,9 @@ export interface DeliveryFailure {
    * turn the relay's refusal into a route-absent one.
    */
   routeAbsent?: true;
+  /** Exact daemon-signer membership evidence, distinct from a missing receiving route. */
+  signerNotRegistered?: { signer: string | null; source: "SEND_REFUSAL" | "READBACK";
+    reasonCode?: typeof ReasonCode.BUZZ_SIGNER_NOT_REGISTERED | typeof ReasonCode.BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED };
   /**
    * FCR-08 — the exact room and recipient key the attempt addressed, set by a transport that sent.
    * Recorded only for an outcome that may have landed (`unknown_observed`), in `outbox_sent_destinations`.
@@ -376,7 +380,7 @@ const ROUTE_ABSENT_FAILURE_CLASS = "repairable";
  * A SENT row whose receiver does not really change (`sameReceiverSql`) is not handed over at all.
  */
 const HANDED_TO_NEW_RECEIVER_SQL = `status = 'PENDING', claim_token = NULL, claimed_at = NULL,
-  failure_class = CASE WHEN status = 'SENT' OR failure_class = '${ROUTE_ABSENT_FAILURE_CLASS}' THEN NULL ELSE failure_class END`;
+  failure_class = CASE WHEN status = 'SENT' OR (failure_class = '${ROUTE_ABSENT_FAILURE_CLASS}' AND COALESCE(reason_code, '') NOT IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED')) THEN NULL ELSE failure_class END`;
 
 /**
  * Whether handing a SENT row to `next` would send it to a receiver it was already sent to. Two
@@ -412,6 +416,10 @@ const sameReceiverSql = (alias: string): string =>
  * deferral time and a self-clearing class, so "deliverable again" for a retained kind is: no failure
  * class (`claimDeliverable` takes such a row whatever its attempt count).
  *
+ * A signer-membership refusal uses the same policy, but a receiving route change cannot clear it:
+ * only a positive readback of the transport's sending signer in that exact room may do so, after
+ * verifying the whole row's attempt history is pre-post (`resumeCeoBuzzSigner`).
+ *
  * Not re-armed by a route change: an authority refusal or a wrong target (a contract or security
  * refusal from the relay, kept on record and unsent), a deferral already on its own backoff, an
  * outcome-unknown send (SENT and flagged; see `markAttemptFailed`), and every terminal row. Only rows
@@ -420,15 +428,17 @@ const sameReceiverSql = (alias: string): string =>
  */
 export const rearmRetainedDeliveries = (
   db: Pick<Db, "run">,
-  scope: { sessionId: string; roleKey?: string; bindingGeneration?: number },
+  scope: { sessionId: string; roleKey?: string; bindingGeneration?: number; signerReadyMessageId?: string },
 ): number =>
   db.run(
-    `UPDATE outbox SET failure_class = NULL
+    `UPDATE outbox SET failure_class = NULL, reason_code = NULL
       WHERE status = 'PENDING' AND kind IN (${IN_BAND_KIND_SQL}, 'CEO_NOTIFICATION')
         AND failure_class = '${ROUTE_ABSENT_FAILURE_CLASS}' AND retry_eligible = 0
+        AND (COALESCE(reason_code, '') NOT IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED') OR message_id = ?)
+        AND (? IS NULL OR message_id = ?)
         AND target_session_id = ?
         AND (? IS NULL OR role_key = ?) AND (? IS NULL OR binding_generation = ?)`,
-    [scope.sessionId, scope.roleKey ?? null, scope.roleKey ?? null, scope.bindingGeneration ?? null, scope.bindingGeneration ?? null],
+    [scope.signerReadyMessageId ?? null, scope.signerReadyMessageId ?? null, scope.signerReadyMessageId ?? null, scope.sessionId, scope.roleKey ?? null, scope.roleKey ?? null, scope.bindingGeneration ?? null, scope.bindingGeneration ?? null],
   ).changes;
 
 /**
@@ -1678,6 +1688,70 @@ export class Outbox {
     });
   }
 
+  /** Read-only candidates; a roster response must still match the target when it returns. */
+  pendingCeoBuzzSignerRoutes(): OutboxMessage[] {
+    return this.db.all<RawOutbox>(`SELECT o.* FROM outbox o WHERE o.kind = 'CEO_NOTIFICATION'
+      AND o.status = 'PENDING' AND ${liveDeliveryTarget("o")} AND ${ceoBuzzRouteSql("o", this.#ceoDelivery !== null)}
+      AND (o.reason_code IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED') OR o.failure_class = 'contract')
+      ORDER BY o.created_at, o.rowid`).filter(row => (row.reason_code === ReasonCode.BUZZ_SIGNER_NOT_REGISTERED || row.reason_code === ReasonCode.BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED ||
+        isBuzzSignerRefusal(row.last_error ?? "")) && ceoBuzzHistoryIsPrePost(this.db, row)).map(hydrate);
+  }
+
+  /** Reclassify a proven old refusal, then use retained re-arm only on positive sender readback. */
+  resumeCeoBuzzSigner(message: OutboxMessage, destination: SentDestination, registered: boolean): void {
+    this.db.tx(() => {
+      const row = this.db.get<RawOutbox>(`SELECT o.* FROM outbox o JOIN sessions s ON s.session_id = o.target_session_id
+        WHERE o.message_id = ? AND o.status = 'PENDING' AND o.target_session_id = ? AND o.binding_generation = ?
+          AND o.payload_digest = ? AND s.buzz_address = ? AND s.buzz_actor_id = ? AND ${liveDeliveryTarget("o")}
+          AND (o.reason_code IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED') OR o.failure_class = 'contract')`,
+      [message.messageId, message.targetSessionId, message.bindingGeneration, message.payloadDigest, destination.room, destination.recipient]);
+      if (!row || !ceoBuzzHistoryIsPrePost(this.db, row)) return;
+      if (row.failure_class === "contract") {
+        if (!isBuzzSignerRefusal(row.last_error ?? "")) return;
+        this.#recordSignerNotReady(hydrate(row), destination, null, "LEGACY_SEND_REFUSAL", row.attempts);
+        this.db.run("UPDATE outbox SET failure_class = 'repairable', reason_code = ? WHERE message_id = ?",
+          [ReasonCode.BUZZ_SIGNER_NOT_REGISTERED, message.messageId]);
+      }
+      if (!registered) return;
+      rearmRetainedDeliveries(this.db, { sessionId: message.targetSessionId, roleKey: message.roleKey,
+        bindingGeneration: message.bindingGeneration, signerReadyMessageId: message.messageId });
+    });
+  }
+
+  #recordSignerNotReady(message: Pick<OutboxMessage, "messageId" | "targetSessionId" | "bindingGeneration" | "roleKey" | "runId">,
+    destination: SentDestination, signer: string | null, source: string, attemptNumber: number,
+    reasonCode: ReasonCode = ReasonCode.BUZZ_SIGNER_NOT_REGISTERED): void {
+    const recorded = this.audit.record({ kind: "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY",
+      reasonCode, roleKey: message.roleKey,
+      sessionId: message.targetSessionId, runId: message.runId,
+      evidence: { messageId: message.messageId, targetSessionId: message.targetSessionId,
+        bindingGeneration: message.bindingGeneration, ...destination, signer, source, attemptNumber,
+        ...(source === "READBACK" ? { registered: reasonCode === ReasonCode.BUZZ_SIGNER_NOT_REGISTERED ? false : null } :
+          { code: "mention_policy", message: "signer not registered for channel" }) } });
+    if (!recorded.allowed) throw new Error("Buzz signer refusal evidence was not recorded");
+  }
+
+  #markSignerNotReady(messageId: string, claimToken: string, failure: DeliveryFailure): Decision<void> {
+    const result = this.db.tx(() => {
+      // A precise pre-post refusal settles its destination even if a handover took the claim.
+      if (failure.destination) this.db.run(`DELETE FROM outbox_sent_destinations
+        WHERE message_id = ? AND room = ? AND recipient = ? AND outcome = 'PENDING_SEND'`,
+      [messageId, failure.destination.room, failure.destination.recipient]);
+      const row = this.db.get<RawOutbox>(`SELECT * FROM outbox WHERE message_id = ? AND kind = 'CEO_NOTIFICATION'
+        AND status = 'IN_FLIGHT' AND claim_token = ? AND ${liveDeliveryTarget("outbox")}`, [messageId, claimToken]);
+      if (!row || !failure.destination || !failure.signerNotRegistered) return null;
+      this.db.run(`UPDATE outbox SET status = 'PENDING', attempts = attempts + 1, last_error = ?,
+        failure_class = 'repairable', reason_code = ?, retry_eligible = 0, next_attempt_at = NULL,
+        claim_token = NULL, claimed_at = NULL WHERE message_id = ?`,
+      [failure.error.slice(0, 500), failure.signerNotRegistered.reasonCode ?? ReasonCode.BUZZ_SIGNER_NOT_REGISTERED, messageId]);
+      this.#recordSignerNotReady(hydrate(row), failure.destination, failure.signerNotRegistered.signer,
+        failure.signerNotRegistered.source, row.attempts + 1, failure.signerNotRegistered.reasonCode);
+      return allow(failure.signerNotRegistered.reasonCode ?? ReasonCode.BUZZ_SIGNER_NOT_REGISTERED, undefined,
+        { messageId, failureClass: "repairable", attempts: row.attempts + 1, retained: true });
+    });
+    return result ?? this.staleClaim(messageId);
+  }
+
   /**
    * Records a failed delivery attempt against the durable retry policy (§34.1).
    *
@@ -1692,6 +1766,10 @@ export class Outbox {
     claimToken: string,
     failure: DeliveryFailure | string,
   ): Decision<void> {
+    if (typeof failure === "object" && failure.signerNotRegistered &&
+      (failure.signerNotRegistered.source === "READBACK" || isBuzzSignerRefusal(failure.error))) {
+      return this.#markSignerNotReady(messageId, claimToken, failure);
+    }
     const classified = normalizeFailure(failure);
     // FCR-10, FCR-14: the in-flight send this attempt recorded settles here, whether or not this claim
     // is still held (a handover may have taken the row while the send was pending): an unknown outcome
@@ -3723,6 +3801,7 @@ interface RawOutbox {
   created_at: string;
   status: OutboxMessage["status"];
   attempts: number;
+  last_error?: string | null;
   failure_class?: FailureClass | null;
   retry_eligible?: number | null;
   next_attempt_at?: string | null;

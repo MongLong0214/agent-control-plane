@@ -5420,7 +5420,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     process.env["ACP_BUZZ_BINARY"] ?? "buzz",
     process.env["ACP_BUZZ_CHANNEL"] ?? null,
   );
-  const buzz = new BuzzAdapter(cp.db, cp.clock, cp.audit, cp.sessions, cp.bindings, cp.outbox, buzzTransport);
+  const buzz = new BuzzAdapter(cp.db, cp.clock, cp.audit, cp.sessions, cp.bindings, cp.outbox, buzzTransport, cp.hostProjectProvisioner);
   // A channel address only, deliberately not `BuzzAdapter.connect` (#760): that method also calls
   // `sessions.setBuzzAddress(sessionId, ...)` for an *existing* session, and the canonical
   // self-claim primitive resolves its address before the session it belongs to exists

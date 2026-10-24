@@ -1,0 +1,60 @@
+import type { Db } from "../db/database.ts";
+
+/** Only this structured pre-post refusal proves sender membership is missing. */
+export const isBuzzSignerRefusal = (message: string): boolean => {
+  const prefix = "buzz send failed: ";
+  if (!message.startsWith(prefix)) return false;
+  try {
+    const body = JSON.parse(message.slice(prefix.length));
+    return body?.error === "mention_policy" && body?.message === "signer not registered for channel";
+  } catch { return false; }
+};
+
+/** Counts never clear unknowns: every counted attempt must have pre-post evidence. The single
+ * pre-fix Buzz attempt can be recovered from its exact last_error, because attempts never reset
+ * and every possibly posted Buzz destination persists. No inference covers a second missing result.
+ */
+export const ceoBuzzHistoryIsPrePost = (db: Db, row: {
+  message_id: string; attempts: number; last_error?: string | null; failure_class?: string | null;
+  sent_at?: string | null;
+}): boolean => {
+  if (row.sent_at || db.get("SELECT 1 FROM outbox_sent_destinations WHERE message_id = ?", [row.message_id])) return false;
+  const history = db.all<{ kind: string; evidence_json: string }>(`SELECT kind, evidence_json FROM audit_events
+    WHERE kind IN ('CEO_NOTIFICATION_CANONICAL_ATTEMPT','CEO_NOTIFICATION_CANONICAL_RESULT',
+      'CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN','CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY')
+      AND json_extract(evidence_json, '$.messageId') = ? ORDER BY rowid`, [row.message_id]);
+  if (history.some(e => e.kind === "CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN")) return false;
+  const attempts = history.filter(e => e.kind === "CEO_NOTIFICATION_CANONICAL_ATTEMPT").map(e => JSON.parse(e.evidence_json));
+  const results = history.filter(e => e.kind === "CEO_NOTIFICATION_CANONICAL_RESULT").map(e => JSON.parse(e.evidence_json));
+  if (results.length !== attempts.length || new Set(attempts.map(a => a.attemptId)).size !== attempts.length) return false;
+  if (attempts.some(a => a.legacyUnknown || results.filter(r => r.attemptId === a.attemptId).length !== 1 ||
+    !results.some(r => r.attemptId === a.attemptId && (r.outcome === "REFUSED" || r.outcome === "NOT_SENT")))) return false;
+  const pauses = history.filter(e => e.kind === "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY").map(e => JSON.parse(e.evidence_json));
+  if (pauses.some(p => !Number.isSafeInteger(p.attemptNumber) || p.attemptNumber < 1 || p.attemptNumber > row.attempts ||
+    !(p.source === "READBACK" || (p.code === "mention_policy" && p.message === "signer not registered for channel")))) return false;
+  const accounted = attempts.length + new Set(pauses.map(p => p.attemptNumber)).size;
+  return row.attempts === accounted || (row.failure_class === "contract" && row.attempts === accounted + 1 &&
+    isBuzzSignerRefusal(row.last_error ?? ""));
+};
+
+/** Read-only authority for the one systemic membership target. No notification/caller room input. */
+export interface CanonicalCeoBuzzRoute {
+  assignmentId: string; bindingGeneration: number; actorId: string; sessionId: string;
+  incarnation: string; targetBindingId: string; roomId: string; recipient: string;
+}
+export const currentCanonicalCeoBuzzRoute = (db: Pick<Db, "all">): CanonicalCeoBuzzRoute | null => {
+  const rows = db.all<CanonicalCeoBuzzRoute>(`SELECT DISTINCT a.assignment_id AS assignmentId,
+    a.binding_generation AS bindingGeneration, c.actor_id AS actorId, c.current_session_id AS sessionId,
+    c.current_session_incarnation AS incarnation, b.target_binding_id AS targetBindingId,
+    s.buzz_address AS roomId, s.buzz_actor_id AS recipient
+    FROM assignments a JOIN conversational_actors c ON c.actor_id = a.actor_id
+    JOIN sessions s ON s.session_id = c.current_session_id AND s.incarnation = c.current_session_incarnation
+    JOIN actor_target_bindings b ON b.target_actor_id = c.actor_id AND b.executor_kind = 'hermes'
+    JOIN actor_target_attestations t ON t.target_binding_id = b.target_binding_id
+      AND t.assignment_id = a.assignment_id AND t.binding_generation = a.binding_generation
+      AND t.executor_session_id = c.current_session_id AND t.executor_session_incarnation = c.current_session_incarnation
+    WHERE a.role_key = 'CEO' AND a.role = 'CEO' AND a.status = 'ACTIVE' AND s.lifecycle IN ('READY','DRAINING')
+      AND t.target_bind_receipt_json IS NOT NULL AND t.target_bind_executor_runtime_identity IS NOT NULL
+      AND COALESCE(s.buzz_address, '') <> '' AND COALESCE(s.buzz_actor_id, '') <> ''`);
+  return rows.length === 1 ? rows[0]! : null;
+};
