@@ -224,7 +224,11 @@ describe("explicit bootstrap predecessor", () => {
     await retired(h);
     const manifest = cleanTreeManifest("successor");
     const before = database(h);
-    vi.spyOn(h.cp.audit, "record").mockImplementation(() => { throw new Error("audit unavailable"); });
+    const record = h.cp.audit.record.bind(h.cp.audit);
+    vi.spyOn(h.cp.audit, "record").mockImplementation((event) => {
+      if (event.kind === "PROJECT_REGISTERED") throw new Error("audit unavailable");
+      return record(event);
+    });
     expect(() => h.cp.projects.register({ projectId: manifest.projectId, name: "successor", supersedesProjectId: "freshreadme", manifest, authorization: h.cp.manifestAuthorizationForTests(manifest) }))
       .toThrow("audit unavailable");
     expect(database(h)).toEqual(before);
