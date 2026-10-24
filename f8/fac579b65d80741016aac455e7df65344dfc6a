@@ -1,0 +1,4 @@
+Limit: a signed Buzz event that carries a bind challenge is settled as a bind first and then still goes through ordinary mention admission (room, current binding, generation, signature) with storage, per-recipient delivery and wake; a refused challenge grants nothing and cannot veto an authorized mention, and a replayed event creates no second bind, outbox row or wake (CEO e0dc2730/df91fd5e; live 2026-10-23 17:53Z a CEO reply with a challenge was bound and its mention dropped).
+Warn: a CEO notification without any route is withheld PENDING with one CEO_NOTIFICATION_ROUTE_UNAVAILABLE audit instead of a delivery failure on every sweep; it stays visible to doctor and readers and is delivered under the same id once the route exists.
+Record-Id: r-d4f357f2ae6d
+Provenance: inherited cbdc8a565678acbf7d2dfae7ad6b9ff2f4f1fe3a
