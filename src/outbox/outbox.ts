@@ -855,34 +855,34 @@ export const settleStoppedSessionInstructions = (
   );
 
 /**
- * `Outbox.#readdressCeoNotifications` and the CEO half of `adoptHolderMessages`: every PENDING or
- * SENT-but-unACKed CEO notification not addressed to the CEO's current holder is handed to it
- * (`HANDED_TO_NEW_RECEIVER_SQL`), keeping its message id. A SENT or outcome-unknown one whose receiver
- * does not really change (`sameReceiverSql`) is only re-addressed to the current generation: its
- * delivery state comes from that destination's own outcome, and it is not sent again.
+ * Every unsettled CEO notification follows the current holder with its sealed content and id.
+ * Restore delivery from only the selected room/recipient's ledger, independently of the previous
+ * row state. Acceptance proves SENT, never ACKED; UNKNOWN stays held; no entry starts queued.
+ * Legacy unknown history is a separate hold, and an outstanding claim is never taken over here.
  */
 const readdressCeoNotifications = (db: Pick<Db, "run">, generation: number, sessionId: string): void => {
   const notCurrent = `kind = 'CEO_NOTIFICATION' AND role_key = 'CEO' AND (binding_generation <> ? OR target_session_id <> ?)`;
+  // Neither a destination receipt nor its absence can settle unlocated pre-journal history.
+  // Move only the holder tuple of these legacy rows, preserving every delivery field.
+  db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ? WHERE ${notCurrent}
+      AND status IN ('PENDING','SENT') AND (
+        EXISTS (SELECT 1 FROM audit_events legacy WHERE legacy.kind = 'CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN'
+          AND json_extract(legacy.evidence_json, '$.messageId') = outbox.message_id)
+        OR (failure_class = 'unknown_observed' AND NOT EXISTS (
+          SELECT 1 FROM outbox_sent_destinations sent WHERE sent.message_id = outbox.message_id)))`,
+  [generation, sessionId, generation, sessionId]);
   const outcome = `(SELECT outcome FROM destination WHERE message_id = outbox.message_id)`;
   db.run(`WITH destination AS (
       SELECT sent.message_id, sent.outcome, sent.sent_at FROM outbox_sent_destinations sent
         JOIN sessions next ON next.session_id = ? AND next.buzz_address = sent.room AND next.buzz_actor_id = sent.recipient
     ) UPDATE outbox SET binding_generation = ?, target_session_id = ?,
-      status = CASE WHEN ${outcome} = 'ACCEPTED' THEN 'SENT'
-                    WHEN ${outcome} = 'UNKNOWN' THEN CASE WHEN status = 'SENT' AND failure_class = 'unknown_observed' THEN 'SENT' ELSE 'PENDING' END
-                    ELSE status END,
-      failure_class = CASE ${outcome} WHEN 'ACCEPTED' THEN NULL WHEN 'UNKNOWN' THEN 'unknown_observed' ELSE failure_class END,
-      sent_at = CASE ${outcome} WHEN 'ACCEPTED' THEN (SELECT sent_at FROM destination WHERE message_id = outbox.message_id)
-                               WHEN 'UNKNOWN' THEN NULL ELSE sent_at END,
-      last_error = CASE ${outcome} WHEN 'ACCEPTED' THEN NULL
-        WHEN 'UNKNOWN' THEN 'withheld: this destination has an unknown send outcome; awaiting its ACK' ELSE last_error END
-      WHERE ${notCurrent} AND (status = 'SENT' OR (status = 'PENDING' AND failure_class = 'unknown_observed'))
-        AND ${sameReceiverSql("outbox")} AND COALESCE(${outcome}, '') <> 'PENDING_SEND'`,
-  [sessionId, generation, sessionId, generation, sessionId, sessionId, sessionId]);
-  db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?, ${HANDED_TO_NEW_RECEIVER_SQL}, sent_at = NULL,
-      last_error = CASE WHEN status = 'SENT' OR failure_class = 'unknown_observed' THEN NULL ELSE last_error END
+      status = CASE ${outcome} WHEN 'ACCEPTED' THEN 'SENT' ELSE 'PENDING' END,
+      failure_class = CASE ${outcome} WHEN 'UNKNOWN' THEN 'unknown_observed' ELSE NULL END,
+      sent_at = CASE ${outcome} WHEN 'ACCEPTED' THEN (SELECT sent_at FROM destination WHERE message_id = outbox.message_id) ELSE NULL END,
+      claim_token = NULL, claimed_at = NULL, retry_eligible = 0, next_attempt_at = NULL, reason_code = NULL,
+      last_error = CASE ${outcome} WHEN 'UNKNOWN' THEN 'withheld: this destination has an unknown send outcome; awaiting its ACK' ELSE NULL END
       WHERE ${notCurrent} AND status IN ('PENDING','SENT')`,
-  [generation, sessionId, generation, sessionId]);
+  [sessionId, generation, sessionId, generation, sessionId]);
 };
 
 /**
@@ -2429,6 +2429,8 @@ export class Outbox {
     const retargeted: string[] = [];
     const rejected: string[] = [];
     const held: string[] = [];
+
+    if (roleKey === "CEO" && toGeneration !== fromGeneration) readdressCeoNotifications(this.db, toGeneration, toSessionId);
 
     for (const row of pending) {
       const holderClaimed = HOLDER_CLAIMED_KINDS.has(row.kind as MessageKind);

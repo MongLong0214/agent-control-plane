@@ -96,7 +96,7 @@ it("FCR-08: changing the old session's address cannot make the timed-out recipie
   try {
     f.h.cp.sessions.setBuzzAddress(f.first.sessionId, "changed-after-send");
     const next = replaceWith(f, { room: "first-room", identity: "first-key" });
-    expect(stateOf(f.h, f.id)).toMatchObject({ status: "SENT", failure_class: "unknown_observed", target_session_id: next.sessionId });
+    expect(stateOf(f.h, f.id)).toMatchObject({ status: "PENDING", failure_class: "unknown_observed", target_session_id: next.sessionId });
     f.h.clock.advance(60 * 60_000);
     expect((await f.h.buzzAdapter.deliverPending()).delivered).not.toContain(f.id);
     expect(sendsOf(f.send, f.id)).toBe(f.sent);

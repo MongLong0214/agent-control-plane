@@ -5,6 +5,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startConfiguredCeoNotificationRoute } from "../../src/daemon/agentcpd.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
+import { outboxDeliveryReadback } from "../../src/outbox/outbox.ts";
 import type { DaemonNoticeBody, DaemonNoticeSendOutcome } from "../../src/runtime/acp-daemon-notice.ts";
 import { adoptedFixture, DIGEST, GATEWAY, LIVE, LSTART, TOKEN } from "../helpers/adopted-ceo.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
@@ -17,8 +18,8 @@ afterAll(cleanupTempDirs);
  * notifications. One whose attempt found no route (the CEO lost its room between the claim and the
  * send) is deliverable again on every authenticated route change of the CEO — an address set or
  * restored, a takeover, a rebind after a revoke, a runtime move — with its message id, and the
- * replaced CEO cannot settle it. A relay's authority refusal is not reactivated by a route change
- * (the reviewer's takeover probe, inverted by that decision); an outcome-unknown Buzz send is never
+ * replaced CEO cannot settle it. Within a binding a relay's refusal stays held; on a holder
+ * retarget, CEO 8fa870fa requires restoring only the selected destination's ledger. An unknown send is never
  * re-sent to the same CEO and is delivered once to a new CEO; the canonical Hermes route re-sends
  * only as a receipt lookup (the same event id and the same signed bytes).
  */
@@ -145,20 +146,33 @@ it("R3 probe: a CEO notification whose route was absent resumes when the same CE
   } finally { f.h.cp.close(); }
 });
 
-it.each([...CEO_HANDOVERS, ["an address change", (f: Failed) => { f.h.cp.sessions.setBuzzAddress(f.first.sessionId, "other-room"); return null; }] as const])(
-  "R3 boundary (the reviewer's takeover probe under 9b15c462): a relay's authority refusal is not reactivated by %s",
+it.each(CEO_HANDOVERS)(
+  "CEO 8fa870fa: an unseen destination inherits no relay refusal after %s",
   async (_what, change) => {
     const f = await authorityRefused();
     try {
       const sends = f.send.mock.calls.length;
-      change(f);
-      f.h.clock.advance(60 * 60_000);
+      const next = change(f)!;
+      expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([f.id]);
       expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([]);
-      expect(f.send.mock.calls.length).toBe(sends);
-      expect(stateOf(f.h, f.id)).toMatchObject({ status: "PENDING", failure_class: "contract" });
+      expect(f.send.mock.calls.length).toBe(sends + 1);
+      expect(stateOf(f.h, f.id)).toMatchObject({ status: "SENT", failure_class: null, target_session_id: next.sessionId });
+      expect(outboxDeliveryReadback(f.h.cp.outbox.get(f.id)!)).toMatchObject({ delivered: true, completed: false });
     } finally { f.h.cp.close(); }
   },
 );
+
+it("CEO 8fa870fa: an address change within the same binding does not retry a relay refusal", async () => {
+  const f = await authorityRefused();
+  try {
+    const sends = f.send.mock.calls.length;
+    f.h.cp.sessions.setBuzzAddress(f.first.sessionId, "other-room");
+    f.h.clock.advance(60 * 60_000);
+    expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([]);
+    expect(f.send.mock.calls.length).toBe(sends);
+    expect(stateOf(f.h, f.id)).toMatchObject({ status: "PENDING", failure_class: "contract" });
+  } finally { f.h.cp.close(); }
+});
 
 it("R3 boundary: an outcome-unknown Buzz send to the CEO is flagged, never re-sent to the same CEO, and delivered once to a new CEO", async () => {
   const f = await failedOnce(() => undefined);

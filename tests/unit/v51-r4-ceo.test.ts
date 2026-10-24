@@ -96,7 +96,7 @@ it("FCR-02 CEO: the same runtime rebound at a new generation is not a new receiv
     const rebound = f.h.cp.bindings.bind({ role: Role.CEO, sessionId: f.first.sessionId });
     if (!rebound.allowed) throw new Error(rebound.message);
     expect(rebound.value.bindingGeneration).toBeGreaterThan(f.firstGeneration);
-    expect(stateOf(f.h, f.id)).toMatchObject({ status: "SENT", failure_class: "unknown_observed", target_session_id: f.first.sessionId });
+    expect(stateOf(f.h, f.id)).toMatchObject({ status: "PENDING", failure_class: "unknown_observed", target_session_id: f.first.sessionId });
     f.h.clock.advance(60 * 60_000);
     expect((await f.h.buzzAdapter.deliverPending()).delivered).not.toContain(f.id);
     expect(sendsOf(f.send, f.id)).toBe(f.sent);
@@ -112,7 +112,7 @@ it("FCR-02 CEO: another session answering as the very same Buzz recipient is not
     expect(f.h.cp.sessions.transition(f.first.sessionId, SessionLifecycle.STOPPED, "replaced").allowed).toBe(true);
     const next = readyCeo(f.h, { room: "first-room", identity: "first-key" });
     expect(f.h.cp.bindings.bind({ role: Role.CEO, sessionId: next.sessionId }).allowed).toBe(true);
-    expect(stateOf(f.h, f.id)).toMatchObject({ status: "SENT", failure_class: "unknown_observed", target_session_id: next.sessionId });
+    expect(stateOf(f.h, f.id)).toMatchObject({ status: "PENDING", failure_class: "unknown_observed", target_session_id: next.sessionId });
     f.h.clock.advance(60 * 60_000);
     expect((await f.h.buzzAdapter.deliverPending()).delivered).not.toContain(f.id);
     expect(sendsOf(f.send, f.id)).toBe(f.sent);
@@ -287,4 +287,161 @@ it.each(["ACCEPTED", "UNKNOWN"] as const)("ROUND1-ESCAPE-01: returning to an in-
       automaticResendHeld: outcome === "UNKNOWN", completed: false });
     expect(sendsOf(f.send, id)).toBe(2);
   } finally { release(); await pending; f.h.cp.close(); }
+});
+
+
+it.each(["queued", "contract"] as const)("R3-PROBE: pending %s intermediate destination cannot conceal the selected ledger outcome", async intermediate => {
+  const f = buzzCeo(true);
+  try {
+    const id = notify(f.h, `pending-return-${intermediate}`);
+    const bind = (sessionId: string) => {
+      expect(f.h.cp.bindings.revoke("CEO", "pending return").allowed).toBe(true);
+      expect(f.h.cp.bindings.bind({ role: Role.CEO, sessionId }).allowed).toBe(true);
+    };
+    await f.h.buzzAdapter.deliverPending(); // A accepted.
+    const second = readyCeo(f.h, { room: "second-room", identity: "second-key" }); bind(second.sessionId);
+    f.send.mockRejectedValueOnce(new Error("send timed out after 10000ms"));
+    await f.h.buzzAdapter.deliverPending(); // B UNKNOWN.
+    const third = readyCeo(f.h, { room: "third-room", identity: "third-key" }); bind(third.sessionId);
+    if (intermediate === "contract") {
+      f.send.mockRejectedValueOnce(new Error("mention_policy: recipient not registered for channel"));
+      await f.h.buzzAdapter.deliverPending(); // C confirmed refusal.
+    }
+    const sent = sendsOf(f.send, id);
+    bind(second.sessionId);
+    expect(f.h.cp.outbox.sentTo(id, { room: "second-room", recipient: "second-key" })).toBe("UNKNOWN");
+    expect.soft(outboxDeliveryReadback(f.h.cp.outbox.get(id)!)).toMatchObject({ delivered: false, automaticResendHeld: true });
+    await f.h.buzzAdapter.deliverPending();
+    expect.soft(outboxDeliveryReadback(f.h.cp.outbox.get(id)!)).toMatchObject({ delivered: false, automaticResendHeld: true });
+    expect(sendsOf(f.send, id)).toBe(sent);
+    bind(f.first.sessionId);
+    expect.soft(outboxDeliveryReadback(f.h.cp.outbox.get(id)!)).toMatchObject({ delivered: true, automaticResendHeld: false });
+    await f.h.buzzAdapter.deliverPending();
+    expect.soft(outboxDeliveryReadback(f.h.cp.outbox.get(id)!)).toMatchObject({ delivered: true, automaticResendHeld: false });
+    expect(sendsOf(f.send, id)).toBe(sent);
+  } finally { f.h.cp.close(); }
+});
+
+const retargetStates = ["accepted", "UNKNOWN", "contract-refused", "queued"] as const;
+const selectedStates = ["accepted", "UNKNOWN", "refused", "unseen"] as const;
+it.each(retargetStates.flatMap(previous => selectedStates.flatMap(selected =>
+  (["rebind", "takeover"] as const).map(path => [previous, selected, path] as const))))(
+  "R3 matrix: previous %s → selected %s via %s restores only the selected destination ledger outcome", async (previous, selected, path) => {
+    const f = buzzCeo(true);
+    try {
+      const id = notify(f.h, `matrix-${previous}-${selected}`);
+      const sealed = f.h.cp.outbox.get(id)!;
+      const refusal = new Error("mention_policy: recipient not registered for channel");
+      if (selected !== "unseen") {
+        if (selected === "UNKNOWN") f.send.mockRejectedValueOnce(new Error("send timed out after 10000ms"));
+        if (selected === "refused") f.send.mockRejectedValueOnce(refusal);
+        await f.h.buzzAdapter.deliverPending();
+      }
+      const bind = (sessionId: string) => {
+        if (path === "takeover") {
+          expect(f.h.cp.bindings.switchTo({ role: Role.CEO, sessionId, conversation: "REPLACED", takeover: true,
+            reason: "matrix transition" }).allowed).toBe(true);
+        } else {
+          expect(f.h.cp.bindings.revoke("CEO", "matrix transition").allowed).toBe(true);
+          expect(f.h.cp.bindings.bind({ role: Role.CEO, sessionId }).allowed).toBe(true);
+        }
+      };
+      f.h.clock.advance(1_000); // Different destinations must retain their own acceptance timestamp.
+      const intermediate = readyCeo(f.h, { room: "intermediate-room", identity: "intermediate-key" }); bind(intermediate.sessionId);
+      await f.h.cp.outbox.deliverCeoNotifications(); // Establish the fixture's previous queue before the tested return.
+      if (previous !== "queued") {
+        if (previous === "UNKNOWN") f.send.mockRejectedValueOnce(new Error("send timed out after 10000ms"));
+        if (previous === "contract-refused") f.send.mockRejectedValueOnce(refusal);
+        await f.h.buzzAdapter.deliverPending();
+      }
+      const prior = stateOf(f.h, id)!;
+      expect(prior).toMatchObject({ status: previous === "accepted" ? "SENT" : "PENDING",
+        failure_class: previous === "UNKNOWN" ? "unknown_observed" : previous === "contract-refused" ? "contract" : null });
+      const sent = sendsOf(f.send, id);
+      bind(f.first.sessionId);
+      const matching = selected === "accepted" || selected === "UNKNOWN";
+      // Confirmed refusal removes PENDING_SEND: with no durable destination evidence,
+      // the selected destination starts queued and may make one new attempt.
+      if (selected === "refused") f.send.mockRejectedValueOnce(refusal);
+      const check = (sweep: number) => {
+        const delivered = selected === "accepted" || (selected === "unseen" && sweep > 0);
+        const unknown = selected === "UNKNOWN";
+        const contract = selected === "refused" && sweep > 0;
+        const row = f.h.cp.outbox.get(id)!;
+        const ledger = f.h.cp.db.get<{ outcome: string; sent_at: string | null }>(
+          "SELECT outcome, sent_at FROM outbox_sent_destinations WHERE message_id = ? AND room = ? AND recipient = ?",
+          [id, "first-room", "first-key"]);
+        expect.soft(stateOf(f.h, id)).toMatchObject({ status: delivered ? "SENT" : "PENDING",
+          failure_class: unknown ? "unknown_observed" : contract ? "contract" : null, target_session_id: f.first.sessionId });
+        const readback = outboxDeliveryReadback(row);
+        expect.soft(readback).toMatchObject({ delivered, automaticResendHeld: unknown, completed: false });
+        expect.soft(readback.delivered).toBe(ledger?.outcome === "ACCEPTED");
+        expect.soft(row.status).not.toBe("ACKED");
+        const timestamps = f.h.cp.db.get<{ sent_at: string | null; acked_at: string | null }>(
+          "SELECT sent_at, acked_at FROM outbox WHERE message_id = ?", [id])!;
+        expect.soft(timestamps.acked_at).toBeNull();
+        expect.soft(timestamps.sent_at).toBe(ledger?.outcome === "ACCEPTED" ? ledger.sent_at : null);
+        expect.soft(sendsOf(f.send, id)).toBe(sent + (!matching && sweep > 0 ? 1 : 0));
+      };
+      check(0);
+      for (const sweep of [1, 2]) { await f.h.buzzAdapter.deliverPending(); check(sweep); }
+      expect(f.h.cp.outbox.get(id)).toMatchObject({ messageId: id, payload: sealed.payload, payloadDigest: sealed.payloadDigest });
+    } finally { f.h.cp.close(); }
+  },
+);
+
+it.each(["accepted", "UNKNOWN"] as const)("R3-PENDING: selected %s evidence cancels another destination's retry deferral", async selected => {
+  const f = buzzCeo(true);
+  try {
+    const id = notify(f.h, `deferred-${selected}`);
+    if (selected === "UNKNOWN") f.send.mockRejectedValueOnce(new Error("send timed out after 10000ms"));
+    await f.h.buzzAdapter.deliverPending();
+    const bind = (sessionId: string) => {
+      expect(f.h.cp.bindings.revoke("CEO", "deferred return").allowed).toBe(true);
+      expect(f.h.cp.bindings.bind({ role: Role.CEO, sessionId }).allowed).toBe(true);
+    };
+    const intermediate = readyCeo(f.h, { room: "intermediate-room", identity: "intermediate-key" }); bind(intermediate.sessionId);
+    f.send.mockRejectedValueOnce(new Error("connect ECONNREFUSED relay"));
+    await f.h.buzzAdapter.deliverPending();
+    expect(f.h.cp.outbox.get(id)).toMatchObject({ failureClass: "transient", retryEligible: true });
+    const sent = sendsOf(f.send, id); bind(f.first.sessionId);
+    for (const sweep of [0, 1, 2]) {
+      if (sweep) await f.h.buzzAdapter.deliverPending();
+      expect.soft(outboxDeliveryReadback(f.h.cp.outbox.get(id)!)).toMatchObject({ delivered: selected === "accepted",
+        automaticResendHeld: selected === "UNKNOWN" });
+      expect.soft(f.h.cp.outbox.get(id)).toMatchObject({ retryEligible: false, nextAttemptAt: null });
+      expect(sendsOf(f.send, id)).toBe(sent);
+    }
+  } finally { f.h.cp.close(); }
+});
+
+it.each(["rebind", "takeover"] as const)("R3-LEGACY: %s with matching evidence cannot release any of the 12 legacy holds", async path => {
+  const f = buzzCeo(true);
+  try {
+    const ids = Array.from({ length: 12 }, (_, n) => notify(f.h, `legacy-${n}`));
+    await f.h.buzzAdapter.deliverPending();
+    for (const [index, id] of ids.entries()) {
+      f.h.cp.audit.record({ kind: "CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN", evidence: { messageId: id } });
+      // A known destination is not proof about the rest of this pre-journal history.
+      f.h.cp.db.run("UPDATE outbox SET status = 'PENDING', failure_class = ?, attempts = 2, sent_at = NULL WHERE message_id = ?",
+        [[null, "contract", "unknown_observed"][index % 3], id]);
+    }
+    const bind = (sessionId: string) => {
+      if (path === "takeover") {
+        expect(f.h.cp.bindings.switchTo({ role: Role.CEO, sessionId, conversation: "REPLACED", takeover: true,
+          reason: "legacy hold transition" }).allowed).toBe(true);
+      } else {
+        expect(f.h.cp.bindings.revoke("CEO", "legacy hold transition").allowed).toBe(true);
+        expect(f.h.cp.bindings.bind({ role: Role.CEO, sessionId }).allowed).toBe(true);
+      }
+    };
+    const snapshot = () => f.h.cp.db.all(`SELECT message_id, status, failure_class, attempts, sent_at, acked_at, payload_json, payload_digest
+      FROM outbox WHERE message_id IN (${ids.map(() => "?").join(",")}) ORDER BY message_id`, ids);
+    const held = snapshot();
+    const intermediate = readyCeo(f.h, { room: "intermediate-room", identity: "intermediate-key" }); bind(intermediate.sessionId);
+    bind(f.first.sessionId);
+    await f.h.buzzAdapter.deliverPending(); await f.h.buzzAdapter.deliverPending();
+    expect(snapshot()).toEqual(held); expect(snapshot()).toHaveLength(12);
+    expect(f.send).toHaveBeenCalledTimes(12);
+  } finally { f.h.cp.close(); }
 });
