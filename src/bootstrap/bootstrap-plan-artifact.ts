@@ -155,8 +155,8 @@ const readCandidate = (source: Source, run: RunRow, input: PlanBinding & { expec
   // Always run-scoped. A digest is never a global artifact lookup capability.
   const stager = selectedStager(input.stagedBy);
   if (!stager.allowed) return stager;
-  const candidates = candidatesOf(source, run.runId, stager.value);
-  const candidate = candidates.find(a => a.content.sha256 === input.expectedSha256);
+  const candidates = candidatesOf(source, run.runId, stager.value).filter(a => a.content.sha256 === input.expectedSha256);
+  const candidate = candidates[0];
   if (!candidate) return deny(ReasonCode.NOT_FOUND, "the named run/stager slot has no candidate with expectedSha256");
   const body = Buffer.from(candidate.content.bodyBase64, "base64");
   const receipt = source.audit.forRun(run.runId).some(e => e.kind === "BOOTSTRAP_PLAN_STAGED" && e.roleKey === stager.value
@@ -176,7 +176,7 @@ const readCandidate = (source: Source, run: RunRow, input: PlanBinding & { expec
 type StageSource = AttachSource & { sessions: Pick<SessionRegistry, "get"> };
 /**
  * No provenance links a PRIMARY_CTO to a project-less bootstrap run. This is a non-authoritative
- * upload into the authenticated stager's own immutable slot. Only CEO attach selects run input;
+ * upload of immutable candidates, with at most one unattached candidate per stager. Only CEO attach selects run input;
  * neither the stager's generation nor the run's owner pin is part of the candidate's identity.
  */
 export const bootstrapPlanStageAccess = (source: StageSource, peer: AuthenticatedMcpPeer, input: BootstrapPlanStageInput)
@@ -215,18 +215,34 @@ export const bootstrapPlanStageAccess = (source: StageSource, peer: Authenticate
   const checked = validateBody(run, input.planBody, input);
   if (!checked.allowed) return checked;
   const candidates = candidatesOf(source, run.runId, primary.roleKey);
-  if (candidates.length || source.audit.forRun(run.runId).some(e => e.kind === "BOOTSTRAP_PLAN_STAGED" && e.roleKey === primary.roleKey)) {
-    if (!candidates.length) return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "recorded staged PLAN candidate is missing or damaged");
-    if (candidates[0]!.content.sha256 !== input.expectedSha256) return deny(ReasonCode.CONFLICT, "this stager already has a different immutable candidate for this run");
+  const audit = source.audit.forRun(run.runId);
+  if (!candidates.length && audit.some(e => e.kind === "BOOTSTRAP_PLAN_STAGED" && e.roleKey === primary.roleKey)) {
+    return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "recorded staged PLAN candidate is missing or damaged");
+  }
+  if (candidates.some(a => a.content.sha256 === input.expectedSha256)) {
     const prior = readCandidate(source, run, { ...input, stagedBy: primary.roleKey });
     if (!prior.allowed) return prior;
     if (prior.value !== input.planBody) return deny(ReasonCode.CONFLICT, "staged PLAN candidate bytes differ");
-  }
-  if (!candidates.length) {
-    const frozen = source.bootstrapApplications.assertNotFrozen(run.runId, "plan_submit");
-    if (!frozen.allowed) return frozen;
-    if (![RunState.ACTIVE, RunState.BLOCKED].some(state => state === run.state) || source.artifacts.latest(run.runId, ArtifactKind.PLAN)) {
-      return deny(ReasonCode.CONFLICT, "this run no longer accepts initial PLAN staging");
+  } else {
+    const prior = attachmentOf(source, run.runId);
+    const attachments = attachmentsOf(source, run.runId);
+    if (candidates.length && (!prior || candidates.some(candidate => !attachments.some(a =>
+      a.content.sha256 === candidate.content.sha256 && a.content.bodyBase64 === candidate.content.bodyBase64
+      && sameBinding(a.content, candidate.content) && artifactDigestMatches(a)
+      && audit.some(e => e.kind === "BOOTSTRAP_PLAN_ATTACHED" && e.roleKey === roleKeyFor(Role.CEO)
+        && e.evidence["digest"] === a.digest && e.evidence["payloadDigest"] === candidate.content.sha256))))) {
+      return deny(ReasonCode.CONFLICT, "this stager already has a different immutable candidate for this run");
+    }
+    if (prior) {
+      // Reuse attach's current-run, frozen, lifecycle and replacement binding checks.
+      const attachable = assertBootstrapPlanAttachable(source, { ...input, replacesSha256: prior.content.sha256 });
+      if (!attachable.allowed) return attachable;
+    } else {
+      const frozen = source.bootstrapApplications.assertNotFrozen(run.runId, "plan_submit");
+      if (!frozen.allowed) return frozen;
+      if (![RunState.ACTIVE, RunState.BLOCKED].some(state => state === run.state) || source.artifacts.latest(run.runId, ArtifactKind.PLAN)) {
+        return deny(ReasonCode.CONFLICT, "this run no longer accepts initial PLAN staging");
+      }
     }
   }
   return allow(ReasonCode.OK, { run, primary, bytes: checked.value });
@@ -237,7 +253,9 @@ export const stageBootstrapPlan = (source: StageSource, peer: AuthenticatedMcpPe
   const checked = bootstrapPlanStageAccess(source, peer, input);
   if (!checked.allowed) return checked;
   const { run, primary, bytes } = checked.value;
-  if (candidatesOf(source, input.runId, primary.roleKey).length) return allow(ReasonCode.OK, { digest: input.expectedSha256, stagedBy: primary.roleKey });
+  if (candidatesOf(source, input.runId, primary.roleKey).some(a => a.content.sha256 === input.expectedSha256)) {
+    return allow(ReasonCode.OK, { digest: input.expectedSha256, stagedBy: primary.roleKey });
+  }
   const artifact = source.artifacts.put(run.runId, ArtifactKind.HANDOFF, {
     schema: BOOTSTRAP_PLAN_CANDIDATE_SCHEMA, ...bindingOf(input), sha256: input.expectedSha256,
     bodyBase64: bytes.toString("base64"), stagedBy: primary.roleKey,

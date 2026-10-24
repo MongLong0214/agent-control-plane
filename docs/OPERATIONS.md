@@ -185,8 +185,12 @@ reservation or permission to execute an external write.
    to the project-less run, and upload grants no run authority, PLAN, approval,
    execution permission or wake. The server derives `stagedBy` from the authenticated
    current PRIMARY_CTO binding and returns `{ digest, stagedBy }`; arguments cannot
-   choose another stager's identity. Each stager has its own immutable slot per run.
-   Identical bytes are idempotent; a stager cannot replace or read another slot.
+   choose another stager's identity. Candidates are immutable and append-only, with at
+   most one unattached candidate per stager per run. Different bytes may be staged as
+   a replacement only when a current attachment exists and every earlier candidate
+   of that stager was CEO-attached (current or superseded). Replacement staging uses
+   the same current-run, frozen and binding checks as replacement attach. Identical
+   bytes are idempotent; a stager cannot overwrite or read another stager's candidates.
 
    The CEO's attach is the selection for the target run. Omit `planBody` and pass
    **`stagedBy: "PRIMARY_CTO:<projectId>"`**, all binding arguments and `expectedSha256`.
