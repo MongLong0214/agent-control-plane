@@ -1,0 +1,8 @@
+Limit: a bootstrap PLAN may name a retired predecessor in supersedesProjectId; ACP accepts it only if the project exists, is retired, is not the new project and no other project row already points at it, re-checks all of that inside the registration transaction, records supersedes_project_id on the NEW project's row (new -> predecessor) and reads it back in activation and CONFIRM; a same-link retry is idempotent with no second write, and any conflict is refused with a fixed PROJECT_PREDECESSOR_* reason and nothing written (CEO 52b6e780, e60ef21c).
+Warn: the resident-cto-dedicated-buzz lifecycle guarantee only names the dedicated Buzz room verification that resident-project-provisioning already enforces before activation; it adds no execution guarantee, so changing that enforcement must update the guarantee and its census together.
+Record-Id: r-2d9c5a484a58
+Provenance: inherited 668dfd6b35ec18d21ba602a15bb59337b7d07d0f
+
+Warn: the predecessor rollback witness injects its failure only at the PROJECT_REGISTERED audit and lets every other audit event through the real recorder; a blanket audit failure throws earlier (managed-write authorization) and passes even without the registration transaction, so it proves nothing about rollback (review ACP1198-R1-01, CEO 0dac3ad4).
+Record-Id: r-b2c2a9df29fa
+Provenance: inherited 388d005b4d0da1275e05a9bdf5a092f89c077a2e
