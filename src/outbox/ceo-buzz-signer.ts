@@ -13,7 +13,23 @@ export const daemonBuzzSigner = (credential: string | undefined): string | null 
   } catch { return null; }
 };
 
-/** Only this structured pre-post refusal proves sender membership is missing. */
+/** Authority consulted by a blocked attempt; contains no copy of its rules. */
+export interface BuzzPolicyBinding {
+  routeDigest: string;
+  signer: string | null;
+  policyDigest: string | null;
+}
+
+/** A non-sending verdict from the wrapper's own evaluator, never inferred from a digest. */
+export interface BuzzPolicyReadiness {
+  verdict: "allowed" | "refused" | "undeterminable";
+  policyDigest: string | null;
+  signer: string | null;
+  recipient: string | null;
+  message?: string;
+}
+
+/** Only this structured refusal proves this attempt was blocked by local send policy. */
 export const isBuzzSignerRefusal = (message: string): boolean => {
   const prefix = "buzz send failed: ";
   if (!message.startsWith(prefix)) return false;

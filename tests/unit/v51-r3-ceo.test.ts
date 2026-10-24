@@ -300,7 +300,7 @@ it.each(["permission denied for sending credential", "mention_policy: signer not
     } finally { f.h.cp.close(); }
   });
 
-it("CEO 6bd2011d: a new room without daemon signer readiness is withheld", async () => {
+it("CEO 6bd2011d: a new room requires daemon signer and authoritative policy readiness", async () => {
   const f = await relayRefused();
   try {
     const sends = f.send.mock.calls.length;
@@ -312,6 +312,12 @@ it("CEO 6bd2011d: a new room without daemon signer readiness is withheld", async
     for (let n = 0; n < 2; n++) { await f.h.buzzAdapter.deliverPending(); expect(f.send.mock.calls.length).toBe(sends); }
     expect(f.h.cp.outbox.get(f.id)).toMatchObject({ status: "PENDING", failureClass: "repairable" });
     member = true;
+    await Promise.all([f.h.buzzAdapter.deliverPending(), f.h.buzzAdapter.deliverPending()]);
+    expect(f.send.mock.calls.length).toBe(sends); // Membership cannot stand in for missing policy authority.
+    Object.assign(f.transport, { policyReadiness: async (room: string, _body: string, recipient: string, signer: string) => {
+      expect(room).toBe("next-room");
+      return { verdict: "allowed", policyDigest: "next-room-policy", recipient, signer };
+    } });
     await Promise.all([f.h.buzzAdapter.deliverPending(), f.h.buzzAdapter.deliverPending()]);
     expect(f.send.mock.calls.length).toBe(sends + 1);
     expect(f.h.cp.outbox.get(f.id)).toMatchObject({ status: "SENT" });

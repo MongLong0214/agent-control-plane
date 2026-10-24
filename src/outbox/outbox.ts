@@ -1,4 +1,4 @@
-import { ceoBuzzHistoryIsPrePost, isBuzzSignerRefusal } from "./ceo-buzz-signer.ts";
+import { ceoBuzzHistoryIsPrePost, isBuzzSignerRefusal, type BuzzPolicyBinding, type BuzzPolicyReadiness } from "./ceo-buzz-signer.ts";
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
 import { type Decision, allow, deny, fail, isAcpError } from "../core/errors.ts";
@@ -157,8 +157,8 @@ export interface DeliveryFailure {
   /** Only an explicit recipient refusal may be left behind for a genuinely different receiver. */
   ceoRefusal?: { scope: "DESTINATION" | "SENDER"; targetSessionId: string; bindingGeneration: number; attemptNumber: number };
   /** Exact daemon-signer membership evidence, distinct from a missing receiving route. */
-  signerNotRegistered?: { signer: string | null; source: "SEND_REFUSAL" | "READBACK";
-    reasonCode?: typeof ReasonCode.BUZZ_SIGNER_NOT_REGISTERED | typeof ReasonCode.BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED };
+  signerNotRegistered?: { signer: string | null; source: "SEND_REFUSAL" | "READBACK"; policyBinding?: BuzzPolicyBinding;
+    reasonCode?: typeof ReasonCode.BUZZ_SIGNER_NOT_REGISTERED | typeof ReasonCode.BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED | typeof ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED };
   /**
    * FCR-08 — the exact room and recipient key the attempt addressed, set by a transport that sent.
    * Recorded only for an outcome that may have landed (`unknown_observed`), in `outbox_sent_destinations`.
@@ -386,7 +386,7 @@ const ROUTE_ABSENT_FAILURE_CLASS = "repairable";
  * A SENT row whose receiver does not really change (`sameReceiverSql`) is not handed over at all.
  */
 const HANDED_TO_NEW_RECEIVER_SQL = `status = 'PENDING', claim_token = NULL, claimed_at = NULL,
-  failure_class = CASE WHEN status = 'SENT' OR (kind = 'CEO_NOTIFICATION' AND failure_class = 'unknown_observed') OR (failure_class = '${ROUTE_ABSENT_FAILURE_CLASS}' AND COALESCE(reason_code, '') NOT IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED')) THEN NULL ELSE failure_class END`;
+  failure_class = CASE WHEN status = 'SENT' OR (kind = 'CEO_NOTIFICATION' AND failure_class = 'unknown_observed') OR (failure_class = '${ROUTE_ABSENT_FAILURE_CLASS}' AND COALESCE(reason_code, '') NOT IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED','BUZZ_LOCAL_SEND_POLICY_REFUSED')) THEN NULL ELSE failure_class END`;
 
 /**
  * Whether handing a SENT row to `next` would send it to a receiver it was already sent to. Two
@@ -424,7 +424,10 @@ const sameReceiverSql = (alias: string): string =>
  *
  * A signer-membership refusal uses the same policy, but a receiving route change cannot clear it:
  * only a positive readback of the transport's sending signer in that exact room may do so, after
- * verifying the whole row's attempt history is pre-post (`resumeCeoBuzzSigner`).
+ * verifying the whole row's attempt history is pre-post (`resumeCeoBuzzSigner`). A local send-policy
+ * refusal also binds that hold to the route, actual signer and opaque policy-file digest. A fresh
+ * non-sending verdict from the wrapper is required to release it; fingerprints and roster membership
+ * alone grant nothing.
  *
  * Not re-armed by a route change: an authority refusal or a wrong target (a contract or security
  * refusal from the relay, kept on record and unsent), a deferral already on its own backoff, an
@@ -440,7 +443,7 @@ export const rearmRetainedDeliveries = (
     `UPDATE outbox SET failure_class = NULL, reason_code = NULL
       WHERE status = 'PENDING' AND kind IN (${IN_BAND_KIND_SQL}, 'CEO_NOTIFICATION')
         AND failure_class = '${ROUTE_ABSENT_FAILURE_CLASS}' AND retry_eligible = 0
-        AND (COALESCE(reason_code, '') NOT IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED') OR message_id = ?)
+        AND (COALESCE(reason_code, '') NOT IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED','BUZZ_LOCAL_SEND_POLICY_REFUSED') OR message_id = ?)
         AND (? IS NULL OR message_id = ?)
         AND target_session_id = ?
         AND (? IS NULL OR role_key = ?) AND (? IS NULL OR binding_generation = ?)`,
@@ -871,7 +874,7 @@ const readdressCeoNotifications = (db: Pick<Db, "run">, generation: number, sess
   // separate safety holds. Move only their holder tuple, preserving every delivery field.
   db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ? WHERE ${notCurrent}
       AND status IN ('PENDING','SENT') AND (
-        reason_code IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED')
+        reason_code IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED','BUZZ_LOCAL_SEND_POLICY_REFUSED')
         OR (failure_class IN ('contract','security') AND NOT EXISTS (
           SELECT 1 FROM audit_events refused WHERE refused.kind = 'CEO_NOTIFICATION_BUZZ_REFUSED'
             AND json_extract(refused.evidence_json, '$.messageId') = outbox.message_id
@@ -1746,40 +1749,88 @@ export class Outbox {
   pendingCeoBuzzSignerRoutes(): OutboxMessage[] {
     return this.db.all<RawOutbox>(`SELECT o.* FROM outbox o WHERE o.kind = 'CEO_NOTIFICATION'
       AND o.status = 'PENDING' AND ${liveDeliveryTarget("o")} AND ${ceoBuzzRouteSql("o", this.#ceoDelivery !== null)}
-      AND (o.reason_code IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED') OR o.failure_class = 'contract')
-      ORDER BY o.created_at, o.rowid`).filter(row => (row.reason_code === ReasonCode.BUZZ_SIGNER_NOT_REGISTERED || row.reason_code === ReasonCode.BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED ||
+      AND (o.reason_code IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED','BUZZ_LOCAL_SEND_POLICY_REFUSED') OR o.failure_class = 'contract')
+      ORDER BY o.created_at, o.rowid`).filter(row => (row.reason_code === ReasonCode.BUZZ_SIGNER_NOT_REGISTERED || row.reason_code === ReasonCode.BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED || row.reason_code === ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED ||
         isBuzzSignerRefusal(row.last_error ?? "")) && ceoBuzzHistoryIsPrePost(this.db, row)).map(hydrate);
   }
 
-  /** Reclassify a proven old refusal, then use retained re-arm only on positive sender readback. */
-  resumeCeoBuzzSigner(message: OutboxMessage, destination: SentDestination, registered: boolean): void {
-    this.db.tx(() => {
+  /** Existing resume boundary. Without a verdict, true only requests authoritative revalidation.
+   * Re-arming requires current roster qualification AND the wrapper's fresh non-sending allowance.
+   */
+  resumeCeoBuzzSigner(message: OutboxMessage, destination: SentDestination, registered: boolean, policyBinding?: BuzzPolicyBinding, policyCheck?: BuzzPolicyReadiness): boolean {
+    return this.db.tx(() => {
       const row = this.db.get<RawOutbox>(`SELECT o.* FROM outbox o JOIN sessions s ON s.session_id = o.target_session_id
         WHERE o.message_id = ? AND o.status = 'PENDING' AND o.target_session_id = ? AND o.binding_generation = ?
           AND o.payload_digest = ? AND s.buzz_address = ? AND s.buzz_actor_id = ? AND ${liveDeliveryTarget("o")}
-          AND (o.reason_code IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED') OR o.failure_class = 'contract')`,
+          AND (o.reason_code IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED','BUZZ_LOCAL_SEND_POLICY_REFUSED') OR o.failure_class = 'contract')`,
       [message.messageId, message.targetSessionId, message.bindingGeneration, message.payloadDigest, destination.room, destination.recipient]);
-      if (!row || !ceoBuzzHistoryIsPrePost(this.db, row)) return;
+      if (!row || !ceoBuzzHistoryIsPrePost(this.db, row)) return false;
       if (row.failure_class === "contract") {
-        if (!isBuzzSignerRefusal(row.last_error ?? "")) return;
+        if (!isBuzzSignerRefusal(row.last_error ?? "")) return false;
         this.#recordSignerNotReady(hydrate(row), destination, null, "LEGACY_SEND_REFUSAL", row.attempts);
         this.db.run("UPDATE outbox SET failure_class = 'repairable', reason_code = ? WHERE message_id = ?",
           [ReasonCode.BUZZ_SIGNER_NOT_REGISTERED, message.messageId]);
       }
-      if (!registered) return;
+      // Upgrade either historical representation of the exact local-policy refusal without sending.
+      if (row.reason_code === ReasonCode.BUZZ_SIGNER_NOT_REGISTERED && policyBinding) {
+        const previous = this.db.get<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events
+          WHERE kind = 'CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY'
+            AND json_extract(evidence_json, '$.messageId') = ? ORDER BY rowid DESC LIMIT 1`, [message.messageId]);
+        if (previous && ["SEND_REFUSAL", "LEGACY_SEND_REFUSAL"].includes(JSON.parse(previous.evidence_json).source)) {
+          // Historical evidence identifies the refusal, not the old policy bytes. A fresh check
+          // may now determine permission; never bind an old refusal to today's policy.
+          this.#recordSignerNotReady(message, destination, policyBinding.signer, "SEND_REFUSAL", row.attempts,
+            ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED, { ...policyBinding, policyDigest: null });
+          this.db.run("UPDATE outbox SET reason_code = ? WHERE message_id = ?", [ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED, message.messageId]);
+          return true;
+        }
+      }
+      if (row.reason_code === ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED) {
+        const held = this.db.get<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events
+          WHERE (kind = 'CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY' OR (kind = 'CEO_NOTIFICATION_BUZZ_POLICY_CHECK'
+              AND json_extract(evidence_json, '$.verdict') = 'refused')) AND reason_code = 'BUZZ_LOCAL_SEND_POLICY_REFUSED'
+            AND json_extract(evidence_json, '$.messageId') = ? ORDER BY rowid DESC LIMIT 1`, [message.messageId]);
+        const previous = held ? JSON.parse(held.evidence_json).policyBinding as BuzzPolicyBinding | undefined : undefined;
+        if (!previous || !policyBinding || !policyBinding.signer) return false;
+        const changed = previous.routeDigest !== policyBinding.routeDigest || previous.signer !== policyBinding.signer ||
+          (typeof policyBinding.policyDigest === "string" && previous.policyDigest !== policyBinding.policyDigest);
+        // Recovery of observation may request a check, but only a fresh allowed verdict can release.
+        if (!changed && !policyCheck) return false;
+      }
+      if (!registered || !policyCheck || !policyBinding) return true;
+      if (policyCheck.verdict === "allowed" && (policyCheck.signer !== policyBinding.signer ||
+        policyCheck.recipient !== destination.recipient || !policyCheck.policyDigest ||
+        policyCheck.policyDigest !== policyBinding.policyDigest)) return false;
+      const checkDigest = digestOf({ messageId: message.messageId, policyBinding, policyCheck });
+      if (!this.db.get(`SELECT 1 FROM audit_events WHERE kind = 'CEO_NOTIFICATION_BUZZ_POLICY_CHECK'
+        AND json_extract(evidence_json, '$.checkDigest') = ?`, [checkDigest])) {
+        const recorded = this.audit.record({ kind: "CEO_NOTIFICATION_BUZZ_POLICY_CHECK",
+          reasonCode: policyCheck.verdict === "allowed" ? ReasonCode.OK : ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED,
+          roleKey: message.roleKey, sessionId: message.targetSessionId, runId: message.runId,
+          evidence: { messageId: message.messageId, targetSessionId: message.targetSessionId,
+            bindingGeneration: message.bindingGeneration, ...destination, policyBinding,
+            verdict: policyCheck.verdict, ...(policyCheck.message ? { message: policyCheck.message } : {}), checkDigest } });
+        if (!recorded.allowed) throw new Error("Buzz policy check evidence was not recorded");
+      }
+      if (policyCheck.verdict !== "allowed") {
+        if (policyCheck.verdict === "refused") this.db.run("UPDATE outbox SET reason_code = ? WHERE message_id = ?",
+          [ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED, message.messageId]);
+        return false;
+      }
       rearmRetainedDeliveries(this.db, { sessionId: message.targetSessionId, roleKey: message.roleKey,
         bindingGeneration: message.bindingGeneration, signerReadyMessageId: message.messageId });
+      return true;
     });
   }
 
   #recordSignerNotReady(message: Pick<OutboxMessage, "messageId" | "targetSessionId" | "bindingGeneration" | "roleKey" | "runId">,
     destination: SentDestination, signer: string | null, source: string, attemptNumber: number,
-    reasonCode: ReasonCode = ReasonCode.BUZZ_SIGNER_NOT_REGISTERED): void {
+    reasonCode: ReasonCode = ReasonCode.BUZZ_SIGNER_NOT_REGISTERED, policyBinding?: BuzzPolicyBinding): void {
     const recorded = this.audit.record({ kind: "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY",
       reasonCode, roleKey: message.roleKey,
       sessionId: message.targetSessionId, runId: message.runId,
       evidence: { messageId: message.messageId, targetSessionId: message.targetSessionId,
-        bindingGeneration: message.bindingGeneration, ...destination, signer, source, attemptNumber,
+        bindingGeneration: message.bindingGeneration, ...destination, signer, source, attemptNumber, ...(policyBinding ? { policyBinding } : {}),
         ...(source === "READBACK" ? { registered: reasonCode === ReasonCode.BUZZ_SIGNER_NOT_REGISTERED ? false : null } :
           { code: "mention_policy", message: "signer not registered for channel" }) } });
     if (!recorded.allowed) throw new Error("Buzz signer refusal evidence was not recorded");
@@ -1799,7 +1850,7 @@ export class Outbox {
         claim_token = NULL, claimed_at = NULL WHERE message_id = ?`,
       [failure.error.slice(0, 500), failure.signerNotRegistered.reasonCode ?? ReasonCode.BUZZ_SIGNER_NOT_REGISTERED, messageId]);
       this.#recordSignerNotReady(hydrate(row), failure.destination, failure.signerNotRegistered.signer,
-        failure.signerNotRegistered.source, row.attempts + 1, failure.signerNotRegistered.reasonCode);
+        failure.signerNotRegistered.source, row.attempts + 1, failure.signerNotRegistered.reasonCode, failure.signerNotRegistered.policyBinding);
       return allow(failure.signerNotRegistered.reasonCode ?? ReasonCode.BUZZ_SIGNER_NOT_REGISTERED, undefined,
         { messageId, failureClass: "repairable", attempts: row.attempts + 1, retained: true });
     });
@@ -2400,7 +2451,9 @@ export class Outbox {
   adoptHolderMessages(roleKey: string, generation: number, sessionId: string, deferCanonicalPeers = false): void {
     // A CEO notification SENT to the previous holder and never ACKed is delivered again to this one.
     if (roleKey === "CEO") readdressCeoNotifications(this.db, generation, sessionId);
-    this.db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?, reason_code = ?
+    this.db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?,
+      reason_code = CASE WHEN kind = 'CEO_NOTIFICATION' AND reason_code IN
+        ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED','BUZZ_LOCAL_SEND_POLICY_REFUSED') THEN reason_code ELSE ? END
       WHERE role_key = ? AND kind IN (${HOLDER_CLAIMED_KIND_SQL}, 'CEO_NOTIFICATION') AND status IN ('PENDING','SENT')
         AND (? = 0 OR kind <> 'PEER_MESSAGE')`,
       [generation, sessionId, ReasonCode.OUTBOX_RETARGETED, roleKey, deferCanonicalPeers ? 1 : 0]);
@@ -2493,7 +2546,9 @@ export class Outbox {
         // Role mail outlives its holder. SENT without ACK is redelivered with the same durable ID.
         // A revoke has no recipient yet; leave it queued until a later authenticated binding.
         if (toGeneration !== fromGeneration) {
-          this.db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?, reason_code = ?,
+          this.db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?,
+            reason_code = CASE WHEN kind = 'CEO_NOTIFICATION' AND reason_code IN
+              ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED','BUZZ_LOCAL_SEND_POLICY_REFUSED') THEN reason_code ELSE ? END,
             claim_token = NULL, claimed_at = NULL WHERE message_id = ? AND status IN ('PENDING','SENT')`,
             [toGeneration, toSessionId, ReasonCode.OUTBOX_RETARGETED, row.message_id]);
           retargeted.push(row.message_id);

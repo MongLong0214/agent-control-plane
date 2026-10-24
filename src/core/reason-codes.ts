@@ -226,6 +226,8 @@ export const ReasonCode = {
   SESSION_STOP_FAILED: "SESSION_STOP_FAILED",
 
   // --- buzz delivery -------------------------------------------------------
+  /** The local send wrapper refused this signer; roster membership alone cannot release the hold. */
+  BUZZ_LOCAL_SEND_POLICY_REFUSED: "BUZZ_LOCAL_SEND_POLICY_REFUSED",
   /** The daemon signing identity is absent from the exact destination room. */
   BUZZ_SIGNER_NOT_REGISTERED: "BUZZ_SIGNER_NOT_REGISTERED",
   BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED: "BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED",
