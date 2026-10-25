@@ -332,6 +332,8 @@ per-user job with the rendering installer
 pnpm build
 security add-generic-password -U -s com.agentcontrolplane.agentcpd -a ACP_MCP_TOKEN -w
 security add-generic-password -U -s com.agentcontrolplane.agentcpd -a ACP_OPERATOR_TOKEN -w
+# Install and upgrade require the absolute path of the policy file the Buzz wrapper evaluates.
+export ACP_BUZZ_SEND_POLICY_FILE=/absolute/path/to/buzz-send-policy.json
 deploy/install-launchd.sh install --app-root "$(pwd)" --node "$(command -v node)"
 ```
 

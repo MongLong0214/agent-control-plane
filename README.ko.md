@@ -320,6 +320,8 @@ node dist/daemon/agentcpd.js
 pnpm build
 security add-generic-password -U -s com.agentcontrolplane.agentcpd -a ACP_MCP_TOKEN -w
 security add-generic-password -U -s com.agentcontrolplane.agentcpd -a ACP_OPERATOR_TOKEN -w
+# install과 upgrade에는 Buzz wrapper가 실제로 평가하는 정책 파일의 절대 경로가 필요합니다.
+export ACP_BUZZ_SEND_POLICY_FILE=/absolute/path/to/buzz-send-policy.json
 deploy/install-launchd.sh install --app-root "$(pwd)" --node "$(command -v node)"
 ```
 
