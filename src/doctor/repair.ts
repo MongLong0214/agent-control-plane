@@ -2,15 +2,16 @@ import { execFileSync } from "node:child_process";
 
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
 import { type AuditLog, redact } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
-import { ArtifactKind } from "../domain/types.ts";
-import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
+import { ArtifactKind, type RunState } from "../domain/types.ts";
+import type { CandidateSnapshot } from "../snapshot/candidate-snapshot.ts";
+import { isTerminal, TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import { isClean, tryRevParse } from "../git/git.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import {
@@ -169,6 +170,19 @@ export class RepairService {
       undo: "re-observe the repository",
       preconditions: ["the repository is readable"],
     },
+    restore_refused_cancel_bootstrap_task: {
+      id: "restore_refused_cancel_bootstrap_task",
+      risk: "MEDIUM",
+      authorization: "HERMES",
+      description: "Restore the single frozen bootstrap PLAN task lost to a refused run cancel",
+      expectedEffect: "exactly the existing task returns from CANCELLED to READY; CONFIRM can check it again",
+      undo: "none needed; no plan, candidate, application or run authority changes",
+      preconditions: [
+        "EXACT_PARAMETERS", "NON_TERMINAL_BOOTSTRAP_RUN", "RESERVED_APPLICATION",
+        "CURRENT_PLAN_BINDING", "LATEST_PLAN_TASK", "CANCELLED_UNEXECUTED_TASK",
+        "SINGLE_CANCEL_CAUSE", "NO_CANCELLED_RUN_TRANSITION", "NO_NEWER_TASK_GRAPH", "NO_OTHER_LIVE_TASK",
+      ],
+    },
     // #246 C3, CEO decision (b) as corrected — a cancelled run's reservation released once its
     // application is shown to have had no external effect, so a new run may reserve the same name
     // under its own approval. It changes nothing outside the database and authorises nothing.
@@ -271,6 +285,15 @@ export class RepairService {
       ownerReceipt = request.ownerApproval;
     }
 
+    if (operation.id === "restore_refused_cancel_bootstrap_task") {
+      const result = this.db.txDecision(() => this.restoreRefusedCancelBootstrapTask(operation, request));
+      if (!result.allowed) {
+        this.audit.record({ kind: "REPAIR_REFUSED", reasonCode: result.reasonCode,
+          runId: request.parameters["runId"] ?? null, actor: request.authorizedBy, evidence: result.evidence });
+      }
+      return result;
+    }
+
     const plan = await this.plan(operation, request);
     if (plan.preconditions.some((precondition) => !precondition.satisfied)) {
       this.audit.record({
@@ -304,19 +327,29 @@ export class RepairService {
       return outcome.refusal;
     }
 
+    return this.recordReceipt(operation, request, plan.preconditions, outcome);
+  }
+
+  private recordReceipt(
+    operation: RepairOperation,
+    request: RepairRequest,
+    preconditions: RepairReceipt["preconditionsChecked"],
+    outcome: { changes: number; evidence: unknown },
+    requireAudit = false,
+  ): Decision<RepairReceipt> {
     const receipt: RepairReceipt = {
       operationId: operation.id,
       parameters: request.parameters,
       dryRun: request.dryRun,
       authorizedBy: request.authorizedBy,
-      preconditionsChecked: plan.preconditions,
+      preconditionsChecked: preconditions,
       effect: operation.expectedEffect,
       changes: outcome.changes,
       performedAt: this.clock.nowIso(),
       digest: digestOf({
         operation: operation.id,
         parameters: request.parameters,
-        preconditions: plan.preconditions,
+        preconditions,
         evidence: outcome.evidence,
       }),
     };
@@ -324,7 +357,7 @@ export class RepairService {
     if (request.runId) {
       this.artifacts.put(request.runId, ArtifactKind.REPAIR_RECEIPT, receipt);
     }
-    this.audit.record({
+    const recorded = this.audit.record({
       kind: request.dryRun ? "REPAIR_DRY_RUN" : "REPAIR_EXECUTED",
       runId: request.runId ?? null,
       actor: request.authorizedBy,
@@ -332,12 +365,93 @@ export class RepairService {
         operationId: operation.id,
         risk: operation.risk,
         changes: outcome.changes,
-        preconditions: plan.preconditions,
+        preconditions,
         target: outcome.evidence,
       },
     });
 
+    if (requireAudit && !recorded.allowed) fail(recorded.reasonCode, recorded.message, recorded.evidence);
     return allow(ReasonCode.OK, receipt);
+  }
+
+  /** All evidence is reloaded under the same BEGIN IMMEDIATE as the one-task write and receipt. */
+  private restoreRefusedCancelBootstrapTask(operation: RepairOperation, request: RepairRequest): Decision<RepairReceipt> {
+    const runId = request.parameters["runId"] ?? "";
+    const taskId = request.parameters["taskId"] ?? "";
+    const run = this.db.get<{ kind: string; state: RunState; current_candidate_digest: string | null }>(
+      `SELECT kind, state, current_candidate_digest FROM runs WHERE run_id = ?`, [runId],
+    );
+    const application = this.db.get<{ phase: string; plan_digest: string; candidate_snapshot_digest: string }>(
+      `SELECT phase, plan_digest, candidate_snapshot_digest FROM bootstrap_applications WHERE run_id = ?`, [runId],
+    );
+    const plan = this.artifacts.latest(runId, "PLAN");
+    const candidate = run?.current_candidate_digest
+      ? this.artifacts.latestForSnapshot<CandidateSnapshot>(runId, "CANDIDATE_SNAPSHOT", run.current_candidate_digest)
+      : null;
+    const tasks = this.db.all<{ task_id: string; state: string; updated_at: string }>(
+      `SELECT task_id, state, updated_at FROM tasks WHERE run_id = ?`, [runId],
+    );
+    const task = tasks.find(row => row.task_id === taskId);
+    const executions = this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM task_executions WHERE task_id = ?`, [taskId])!.n;
+    const events = this.audit.forRun(runId);
+    const binding = events.filter(event => event.kind === "BOOTSTRAP_PLAN_TASKS").at(-1);
+    // READY is a no-op only with this repair's own successful receipt, still the task's last write.
+    const restored = events.filter(event => event.kind === "REPAIR_EXECUTED" &&
+      event.evidence["operationId"] === operation.id && event.evidence["changes"] === 1 &&
+      (event.evidence["target"] as { taskId?: unknown } | undefined)?.taskId === taskId).at(-1);
+    const previous = restored?.evidence["target"] as { cancelledAt?: unknown; cancelEventId?: unknown; restoredAt?: unknown } | undefined;
+    const alreadyRestored = task?.state === "READY" && task.updated_at === previous?.restoredAt;
+    const cancelledAt = alreadyRestored ? previous?.cancelledAt : task?.updated_at;
+    const cancellations = events.filter(event => event.kind === "TASK_GRAPH_CANCELLED" && event.at === cancelledAt);
+    const cancellation = cancellations.length === 1 ? cancellations[0] : undefined;
+    const sameInstantTasks = tasks.filter(row => row.state === "CANCELLED" && row.updated_at === cancelledAt);
+    const causal = cancellation !== undefined && cancellation.evidence["changes"] === 1 &&
+      (alreadyRestored
+        ? previous?.cancelEventId === cancellation.eventId && sameInstantTasks.length === 0
+        : sameInstantTasks.length === 1 && sameInstantTasks[0]!.task_id === taskId) &&
+      binding !== undefined && binding.eventId < cancellation.eventId;
+    const cancelledTransitions = events.filter(event => event.kind === "RUN_TRANSITION" &&
+      event.evidence["to"] === "CANCELLED" && cancellation !== undefined &&
+      (event.eventId >= cancellation.eventId || event.at >= cancellation.at));
+    const newerGraphs = events.filter(event =>
+      ["BOOTSTRAP_TASKS_SUPERSEDED", "TASK_GRAPH_SUBMITTED", "BOOTSTRAP_PLAN_TASKS"].includes(event.kind) &&
+      cancellation !== undefined && event.eventId > cancellation.eventId);
+    const otherLiveTasks = tasks.filter(row => row.task_id !== taskId && row.state !== "CANCELLED");
+    const checks = [
+      checked("EXACT_PARAMETERS", runId !== "" && taskId !== "" &&
+        Object.keys(request.parameters).sort().join(",") === "runId,taskId" &&
+        (request.runId == null || request.runId === runId), { runId, taskId }),
+      checked("NON_TERMINAL_BOOTSTRAP_RUN", run !== undefined && run.kind === "PROJECT_BOOTSTRAP" &&
+        !isTerminal(run.state), run ?? null),
+      checked("RESERVED_APPLICATION", application?.phase === "RESERVED", application ?? null),
+      checked("CURRENT_PLAN_BINDING", plan != null && candidate != null &&
+        candidate.content?.bootstrapPlan?.planDigest === plan.digest && application?.plan_digest === plan.digest &&
+        application.candidate_snapshot_digest === run?.current_candidate_digest,
+      { planDigest: plan?.digest ?? null, candidatePlanDigest: candidate?.content?.bootstrapPlan?.planDigest ?? null }),
+      checked("LATEST_PLAN_TASK", binding !== undefined && binding.evidence["planDigest"] === plan?.digest &&
+        Array.isArray(binding.evidence["taskIds"]) && binding.evidence["taskIds"].length === 1 &&
+        binding.evidence["taskIds"][0] === taskId, { binding: binding ?? null }),
+      checked("CANCELLED_UNEXECUTED_TASK", task !== undefined && executions === 0 &&
+        (task.state === "CANCELLED" || alreadyRestored), { task: task ?? null, executions, alreadyRestored }),
+      checked("SINGLE_CANCEL_CAUSE", causal, { cancellations, sameInstantTaskIds: sameInstantTasks.map(row => row.task_id) }),
+      checked("NO_CANCELLED_RUN_TRANSITION", cancelledTransitions.length === 0, { cancelledTransitions }),
+      checked("NO_NEWER_TASK_GRAPH", newerGraphs.length === 0, { newerGraphs }),
+      checked("NO_OTHER_LIVE_TASK", otherLiveTasks.length === 0, { otherLiveTasks }),
+    ];
+    const failed = checks.find(check => !check.satisfied);
+    if (failed) return deny(ReasonCode.REPAIR_PRECONDITION_UNMET, `bootstrap task restore refused: ${failed.precondition}`, {
+      operationId: operation.id, refusal: failed.precondition, preconditions: checks,
+    });
+    const changes = alreadyRestored ? 0 : 1;
+    const restoredAt = this.clock.nowIso();
+    if (!request.dryRun && changes === 1) {
+      this.db.run(`UPDATE tasks SET state = 'READY', updated_at = ? WHERE task_id = ?`, [restoredAt, taskId]);
+    }
+    return this.recordReceipt(operation, { ...request, runId }, checks, {
+      changes,
+      evidence: { runId, taskId, from: "CANCELLED", to: "READY", planDigest: plan!.digest,
+        cancelEventId: cancellation!.eventId, cancelledAt, restoredAt, alreadyRestored },
+    }, true);
   }
 
   private async plan(operation: RepairOperation, request: RepairRequest): Promise<RepairPlan> {
