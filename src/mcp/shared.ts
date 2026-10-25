@@ -106,8 +106,12 @@ export interface McpMutationRequest {
   /** Returns the authorizing role key/generation when role-fenced. Runs before replay too. */
   authority: () => Decision<Record<string, unknown>>;
   provenance?: unknown;
-  /** Existing domain receipt recovery, consulted only after shared replay verification. */
-  durableReplay?: (fingerprint: string) => ToolResult | null;
+  /**
+   * Domain receipt recovery. `reservationVerified` is true only after current authority and
+   * the stored reservation's request/principal fingerprint pass. Before reservation, a
+   * domain receipt must independently prove the key and request it recovers.
+   */
+  durableReplay?: (fingerprint: string, reservationVerified: boolean) => ToolResult | null;
   /** Extra domain validation for settled handoff ACKs; never the mutation handler. */
   replayAuthority?: () => Decision<unknown>;
 }
@@ -204,7 +208,7 @@ export const idempotentMcpMutation = async (
   // A durable domain decision can survive a failed response store. With no reservation,
   // let its byte-preserving versioned identity refuse a changed retry without reserving that changed request.
   const existing = source.db.get("SELECT nonce FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?", [idempotencyKey]);
-  const recovered = existing ? null : request.durableReplay?.(fingerprint);
+  const recovered = existing ? null : request.durableReplay?.(fingerprint, false);
   // The receipt is the proof; do not mint a new fingerprint over recovered history.
   if (recovered) return recovered;
   const reservation = await runMcpReservedMutation(
@@ -246,14 +250,14 @@ export const idempotentMcpMutation = async (
     if (stored.result === null) {
       // A domain receipt can already prove completion after a response-store failure.
       // Its replay is safe only after the same fingerprint and current authority passed.
-      const durable = request.durableReplay?.(fingerprint);
+      const durable = request.durableReplay?.(fingerprint, true);
       if (durable) return durable;
       return respond(deny(reservation.inFlight ? ReasonCode.INGRESS_REPLAY_IGNORED : ReasonCode.MCP_MUTATION_OUTCOME_UNKNOWN,
         reservation.inFlight ? "MCP mutation is already reserved" : "MCP mutation outcome is unknown; reconcile durable state without resubmitting", { idempotencyKey }));
     }
     const replayAuthority = request.replayAuthority?.();
     if (replayAuthority && !replayAuthority.allowed) return respond(replayAuthority);
-    const durable = request.durableReplay?.(fingerprint);
+    const durable = request.durableReplay?.(fingerprint, true);
     if (durable?.isError) return durable;
     return stored.result;
   }
