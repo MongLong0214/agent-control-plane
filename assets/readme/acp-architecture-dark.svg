@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="580" viewBox="0 0 960 580" role="img" aria-labelledby="t d">
+<title id="t">Agent Control Plane architecture</title>
+<desc id="d">Left, the parties that request work and supply evidence: the owner through Telegram and Buzz, the CEO over the hermes.mcp.sock MCP socket, the project CTO over the cto.mcp.sock MCP socket, the operator through agentctl on the operator socket, and Repo Factory, which supplies a bootstrap PLAN. Centre, agentcpd, the only authoritative writer, holding twelve parts: runs and the task graph, sessions and role bindings, the ingress guard, the outbox with wake and ACK, the managed write guard, the verification engine, the blind review gate, the GitHub kernel, provider capacity, role continuity, bootstrap activation, and doctor, audit and export, all over one local SQLite database. Right, what runs under its authority: workers in disposable worktrees, the verification sandbox, egress-confined blind reviewers, the Buzz relay, and GitHub, where only the daemon publishes the production gate and merges.</desc>
+<style>
+text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif}
+.col{fill:#6e7889;font-size:12px;font-weight:700;letter-spacing:1.4px}
+.bx{fill:#151b24;stroke:#2c3543;stroke-width:1.2}
+.bt{fill:#e6eaf1;font-size:15px;font-weight:650}
+.bs{fill:#9aa4b5;font-size:12.5px}
+.core{fill:#1c2645;stroke:#7d9bff;stroke-width:1.6}
+.ct{fill:#e6eaf1;font-size:22px;font-weight:750;letter-spacing:-.3px}
+.cs{fill:#9aa4b5;font-size:13px}
+.md{fill:#0d1117;stroke:#2c3543;stroke-width:1.1}
+.mt{fill:#e6eaf1;font-size:13.5px;font-weight:650}
+.ms{fill:#9aa4b5;font-size:11.5px}
+.db{fill:#1b2330;stroke:#3d4859;stroke-width:1.2}
+.a{fill:#7d9bff}.v{fill:#3fcf9c}.r{fill:#b495ff}.w{fill:#ff8c57}.g{fill:#e3b341}.m{fill:#9aa4b5}
+.ln{fill:none;stroke:#3d4859;stroke-width:1.6}
+.fl{fill:none;stroke:#7d9bff;stroke-width:2;stroke-linecap:round;stroke-dasharray:4 9;animation:flow 1.6s linear infinite}
+.fr{animation-direction:reverse}
+.ah{fill:#3d4859}
+.in{animation:rise .5s cubic-bezier(.2,.9,.2,1) backwards}
+.i1{animation-delay:.05s}.i2{animation-delay:.18s}.i3{animation-delay:.31s}
+.pulse{fill:none;stroke:#7d9bff;stroke-width:1.6;opacity:0;animation:pulse 4s ease-out 1s infinite}
+@keyframes flow{to{stroke-dashoffset:-26}}
+@keyframes rise{from{opacity:0;transform:translateY(10px)}}
+@keyframes pulse{0%{opacity:.55}60%,100%{opacity:0}}
+@media (prefers-reduced-motion:reduce){.in{animation:none}.fl{animation:none}.pulse{display:none}}
+</style>
+<defs>
+<marker id="ar" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0L10 5L0 10z"/></marker>
+</defs>
+
+<text class="col" x="0" y="22">REQUEST · SUPPLY EVIDENCE</text>
+<text class="col" x="960" y="22" text-anchor="end">EXECUTE UNDER ITS AUTHORITY</text>
+
+<g class="in i1">
+<rect class="bx" x="0" y="42" width="196" height="76" rx="12"/><rect class="g" x="0" y="54" width="4" height="26" rx="2"/>
+<text class="bt" x="16" y="70">Owner</text><text class="bs" x="16" y="90">Telegram · Buzz</text><text class="bs" x="16" y="107">owner decisions, receipts</text>
+<rect class="bx" x="0" y="130" width="196" height="76" rx="12"/><rect class="a" x="0" y="142" width="4" height="26" rx="2"/>
+<text class="bt" x="16" y="158">CEO</text><text class="bs" x="16" y="178">MCP · hermes.mcp.sock</text><text class="bs" x="16" y="195">mode, PLAN attach, confirm</text>
+<rect class="bx" x="0" y="218" width="196" height="76" rx="12"/><rect class="a" x="0" y="230" width="4" height="26" rx="2"/>
+<text class="bt" x="16" y="246">Project CTO</text><text class="bs" x="16" y="266">MCP · cto.mcp.sock</text><text class="bs" x="16" y="283">plan, tasks, results, ACK</text>
+<rect class="bx" x="0" y="306" width="196" height="76" rx="12"/><rect class="m" x="0" y="318" width="4" height="26" rx="2"/>
+<text class="bt" x="16" y="334">Operator</text><text class="bs" x="16" y="354">agentctl · operator socket</text><text class="bs" x="16" y="371">status, doctor, export</text>
+<rect class="bx" x="0" y="394" width="196" height="76" rx="12"/><rect class="r" x="0" y="406" width="4" height="26" rx="2"/>
+<text class="bt" x="16" y="422">Repo Factory</text><text class="bs" x="16" y="442">bootstrap PLAN input</text><text class="bs" x="16" y="459">never a second authority</text>
+</g>
+
+<g class="in i2">
+<rect class="core" x="236" y="42" width="488" height="526" rx="18"/>
+<rect class="pulse" x="236" y="42" width="488" height="526" rx="18"/>
+<text class="ct" x="258" y="76">agentcpd</text>
+<text class="cs" x="360" y="76">the only authoritative writer</text>
+<text class="cs" x="258" y="97">One supervised Node process. Agents propose; the daemon decides.</text>
+
+<rect class="md" x="256" y="112" width="218" height="50" rx="9"/><text class="mt" x="268" y="133">Runs &amp; task graph</text><text class="ms" x="268" y="151">run state machine, owner pin</text>
+<rect class="md" x="486" y="112" width="218" height="50" rx="9"/><text class="mt" x="498" y="133">Sessions &amp; role bindings</text><text class="ms" x="498" y="151">binding generation is the fence</text>
+<rect class="md" x="256" y="172" width="218" height="50" rx="9"/><text class="mt" x="268" y="193">Ingress guard</text><text class="ms" x="268" y="211">authenticated owner &amp; actors</text>
+<rect class="md" x="486" y="172" width="218" height="50" rx="9"/><text class="mt" x="498" y="193">Outbox · wake · ACK</text><text class="ms" x="498" y="211">durable, generation-fenced</text>
+<rect class="md" x="256" y="232" width="218" height="50" rx="9"/><text class="mt" x="268" y="253">Managed write guard</text><text class="ms" x="268" y="271">claims, worktrees, receipts</text>
+<rect class="md" x="486" y="232" width="218" height="50" rx="9"/><text class="mt" x="498" y="253">Verification engine</text><text class="ms" x="498" y="271">contract-pinned, sandboxed</text>
+<rect class="md" x="256" y="292" width="218" height="50" rx="9"/><text class="mt" x="268" y="313">Blind review gate</text><text class="ms" x="268" y="331">independence &amp; coverage</text>
+<rect class="md" x="486" y="292" width="218" height="50" rx="9"/><text class="mt" x="498" y="313">GitHub kernel</text><text class="ms" x="498" y="331">gate publish, merge, receipts</text>
+<rect class="md" x="256" y="352" width="218" height="50" rx="9"/><text class="mt" x="268" y="373">Provider capacity</text><text class="ms" x="268" y="391">three signals, no UNKNOWN route</text>
+<rect class="md" x="486" y="352" width="218" height="50" rx="9"/><text class="mt" x="498" y="373">Role continuity</text><text class="ms" x="498" y="391">plan-first failover</text>
+<rect class="md" x="256" y="412" width="218" height="50" rx="9"/><text class="mt" x="268" y="433">Bootstrap activation</text><text class="ms" x="268" y="451">PLAN → genesis → activation</text>
+<rect class="md" x="486" y="412" width="218" height="50" rx="9"/><text class="mt" x="498" y="433">Doctor · audit · export</text><text class="ms" x="498" y="451">findings, audit events, bundles</text>
+
+<rect class="db" x="256" y="480" width="448" height="70" rx="10"/>
+<path class="ln" d="M276 497c0-5 24-5 24 0v26c0 5-24 5-24 0z"/><path class="ln" d="M276 497c0 5 24 5 24 0"/><path class="ln" d="M276 510c0 5 24 5 24 0"/>
+<text class="mt" x="316" y="507">SQLite state · WAL · synchronous=FULL</text>
+<text class="ms" x="316" y="526">runs, bindings, claims, receipts, immutable run artifacts,</text>
+<text class="ms" x="316" y="541">audit events — guarded by typed code and DB triggers</text>
+</g>
+
+<g class="in i3">
+<rect class="bx" x="764" y="42" width="196" height="76" rx="12"/><rect class="a" x="764" y="54" width="4" height="26" rx="2"/>
+<text class="bt" x="780" y="70">Workers</text><text class="bs" x="780" y="90">disposable worktrees</text><text class="bs" x="780" y="107">bounded by a live claim</text>
+<rect class="bx" x="764" y="130" width="196" height="76" rx="12"/><rect class="v" x="764" y="142" width="4" height="26" rx="2"/>
+<text class="bt" x="780" y="158">Verification sandbox</text><text class="bs" x="780" y="178">seatbelt, own process group</text><text class="bs" x="780" y="195">time, RSS and output limits</text>
+<rect class="bx" x="764" y="218" width="196" height="76" rx="12"/><rect class="r" x="764" y="230" width="4" height="26" rx="2"/>
+<text class="bt" x="780" y="246">Blind reviewers</text><text class="bs" x="780" y="266">gpt · claude · grok</text><text class="bs" x="780" y="283">provider-only egress proxy</text>
+<rect class="bx" x="764" y="306" width="196" height="76" rx="12"/><rect class="m" x="764" y="318" width="4" height="26" rx="2"/>
+<text class="bt" x="780" y="334">Buzz relay</text><text class="bs" x="780" y="354">fenced envelopes</text><text class="bs" x="780" y="371">to bound role holders</text>
+<rect class="bx" x="764" y="394" width="196" height="76" rx="12"/><rect class="g" x="764" y="406" width="4" height="26" rx="2"/>
+<text class="bt" x="780" y="422">GitHub</text><text class="bs" x="780" y="442">acp-production-gate check</text><text class="bs" x="780" y="459">programmatic merge</text>
+</g>
+
+<path class="ln" d="M198 80H232" marker-end="url(#ar)"/><path class="fl" d="M198 80H228"/>
+<path class="ln" d="M198 168H232" marker-end="url(#ar)"/><path class="fl" d="M198 168H228"/>
+<path class="ln" d="M198 256H232" marker-end="url(#ar)"/><path class="fl" d="M198 256H228"/>
+<path class="ln" d="M198 344H232" marker-end="url(#ar)"/><path class="fl" d="M198 344H228"/>
+<path class="ln" d="M198 432H232" marker-end="url(#ar)"/><path class="fl" d="M198 432H228"/>
+<path class="ln" d="M726 80H760" marker-end="url(#ar)"/><path class="fl" d="M726 80H756"/>
+<path class="ln" d="M726 168H760" marker-end="url(#ar)"/><path class="fl" d="M726 168H756"/>
+<path class="ln" d="M726 256H760" marker-end="url(#ar)"/><path class="fl" d="M726 256H756"/>
+<path class="ln" d="M726 344H760" marker-end="url(#ar)"/><path class="fl" d="M726 344H756"/>
+<path class="ln" d="M726 432H760" marker-end="url(#ar)"/><path class="fl" d="M726 432H756"/>
+
+<rect class="bx" x="0" y="486" width="196" height="64" rx="12" stroke-dasharray="4 4"/>
+<text class="bs" x="16" y="512">Credentials stay with</text><text class="bs" x="16" y="530">the daemon, never agents</text>
+<rect class="bx" x="764" y="486" width="196" height="64" rx="12" stroke-dasharray="4 4"/>
+<text class="bs" x="780" y="512">Evidence binds one exact</text><text class="bs" x="780" y="530">candidate snapshot</text>
+</svg>
