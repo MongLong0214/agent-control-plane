@@ -25,7 +25,7 @@ const a = JSON.parse(fs.readFileSync(path.join(root,'allocation.json'),'utf8'));
 const s = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile,'utf8')) : {};
 const out = x => process.stdout.write(x);
 if (cmd === 'gh') out('R_node');
-else if (cmd === 'claude') { if (args[1] === 'add') s.mcp = true; else if (args[1] === 'get') { if (!s.mcp) process.exit(1); out('acp-cto agentctl attach resident-cto --claimed-session-id '+a.sessionUuid+' --project-id test'); } }
+else if (cmd === 'claude') { if (args[1] === 'add') s.mcp = args.slice(args.indexOf('--')+1); else if (args[1] === 'remove') s.mcp = null; else if (args[1] === 'get') { if (!s.mcp) process.exit(1); out('acp-cto\\nCommand: '+s.mcp[0]+'\\nArgs: '+s.mcp.slice(1).join(' ')); } }
 else if (cmd === 'tmux') {
   if (args[0] === 'has-session') process.exit(s.launched ? 0 : 1);
   if (args[0] === 'new-session') { s.launched = true; fs.mkdirSync(path.join(root,'.claude','sessions'),{recursive:true}); fs.writeFileSync(path.join(root,'.claude','sessions',process.env.TEST_CLAUDE_PID+'.json'),JSON.stringify({sessionId:a.sessionUuid,cwd:a.clonePath,bridgeSessionId:'bridge'})); }
@@ -43,6 +43,10 @@ export async function residentGitHost() {
   const state = join(home, "acp");
   const bin = join(home, "bin");
   const clone = join(home, "projects", "fixture");
+  mkdirSync(join(state, "current", "dist", "bin"), { recursive: true });
+  mkdirSync(join(state, "current", "dist", "cli"), { recursive: true });
+  writeFileSync(join(state, "current", "dist", "bin", "node"), "#!/bin/sh\nexit 99\n", { mode: 0o700 });
+  writeFileSync(join(state, "current", "dist", "cli", "agentctl.js"), 'throw new Error("runtime must not run in tests");');
   mkdirSync(bin);
   mkdirSync(clone, { recursive: true });
   for (const cmd of ["gh", "claude", "tmux", "ps", "lsof"]) writeFileSync(join(bin, cmd), fake, { mode: 0o700 });
@@ -61,10 +65,15 @@ export async function residentGitHost() {
     privateKeyFile: join(home, ".hermes", "bridge", "keys", "cto-test.priv"), bootPacket: join(home, ".claude", "watchers", "fleet", "acp-test.boot.txt"), nonce: "nonce",
   };
   writeFileSync(join(home, "allocation.json"), JSON.stringify(a));
+  const env = {
+    ...process.env, HOME: home, ACP_STATE_DIR: state, PATH: `${bin}:${process.env.PATH}`, TEST_CLAUDE_PID: String(process.pid),
+    ACP_CLAUDE_BINARY: join(bin, "claude"), ACP_RESOLVED_CLAUDE_BINARY: "", CLAUDE_CONFIG_DIR: join(home, ".claude"),
+    ACP_BUZZ_BINARY: "", ACP_RESOLVED_BUZZ_BINARY: "",
+  };
   const invoke = (operation: HostOperation, allocation: ProjectAllocation = a) =>
     new Promise<HostObservation>((resolve, reject) => {
       const child = execFile(process.execPath, [hostScript], {
-        env: { ...process.env, HOME: home, ACP_STATE_DIR: state, PATH: `${bin}:${process.env.PATH}`, TEST_CLAUDE_PID: String(process.pid) },
+        env,
         timeout: 30_000,
       });
       let stdout = "";
@@ -81,6 +90,5 @@ export async function residentGitHost() {
     const stateFile = join(home, "fake.json");
     writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, "utf8")), launched: false }));
   };
-  const env = { ...process.env, HOME: home, ACP_STATE_DIR: state, PATH: `${bin}:${process.env.PATH}`, TEST_CLAUDE_PID: String(process.pid) };
   return { home, state, bin, env, clone, a, autoInit, genesis, invoke, head, killResident };
 }

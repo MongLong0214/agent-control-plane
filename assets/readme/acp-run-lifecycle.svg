@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="402" viewBox="0 0 960 402" role="img" aria-labelledby="t d">
+<title id="t">Run lifecycle: the runs.state machine</title>
+<desc id="d">Main path: QUEUED, created by the CEO with run_create; ACTIVE, dispatched to the project CTO; READY_FOR_CEO_REVIEW, when the production-ready packet exists; CEO_APPROVED, after the CEO confirms, when the daemon's finalizer takes over; MERGING, with gate_publish and merge_execute; POST_MERGE_VERIFYING; and COMPLETED, which only agentcpd decides. Project bootstrap runs go from READY_FOR_CEO_REVIEW straight to COMPLETED on the CEO's confirm after activation. Between ACTIVE and READY_FOR_CEO_REVIEW runs the candidate pipeline: plan, build in claimed disposable worktrees, freeze the candidate snapshot against the pinned contract, verify in the sandbox, automatic isolated blind review, and the production-ready packet with CTO final approval and zero blockers, all bound to one candidate digest. Side states: BLOCKED and AWAITING_HUMAN return to ACTIVE, REVISION_REQUIRED returns to ACTIVE after a CEO FINAL_REVISE, BLOCKED_POST_MERGE returns to POST_MERGE_VERIFYING, and FAILED and CANCELLED are terminal.</desc>
+<style>
+text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif}
+.col{fill:#8a93a3;font-size:12px;font-weight:700;letter-spacing:1.4px}
+.note{fill:#5a6577;font-size:12px}
+.st{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace;font-size:12.5px;font-weight:600;fill:#1b2333}
+.p{fill:#f6f8fb;stroke:#b9c2d0;stroke-width:1.2}
+.pa{fill:#e8edfc;stroke:#3457d5;stroke-width:1.4}
+.pv{fill:#e3f5ee;stroke:#0d8f6a;stroke-width:1.4}
+.pw{fill:#fdeee6;stroke:#c2410c;stroke-width:1.2}
+.pg{fill:#fbf3df;stroke:#a16207;stroke-width:1.2}
+.pm{fill:#f6f8fb;stroke:#b9c2d0;stroke-width:1.2;stroke-dasharray:4 3}
+.cap{fill:#5a6577;font-size:11.5px}
+.band{fill:#f6f8fb;stroke:#3457d5;stroke-width:1.2;stroke-dasharray:5 4}
+.bt{fill:#1b2333;font-size:13.5px;font-weight:650}
+.ch{fill:#ffffff;stroke:#d9dfe8;stroke-width:1.1}
+.cn{fill:#3457d5;font-size:12px;font-weight:700}
+.ct{fill:#1b2333;font-size:13.5px;font-weight:650}
+.cs{fill:#5a6577;font-size:11.5px}
+.ln{fill:none;stroke:#b9c2d0;stroke-width:1.6}
+.arc{fill:none;stroke:#0d8f6a;stroke-width:1.4;stroke-dasharray:5 4}
+.ah{fill:#b9c2d0}.ahv{fill:#0d8f6a}
+.lb{fill:#ffffff}
+.vt{fill:#0d8f6a;font-size:11.5px;font-weight:600}
+.lit{fill:none;stroke:#3457d5;stroke-width:2.6;opacity:0;animation:lit 7s ease-out infinite}
+.l1{animation-delay:1s}.l2{animation-delay:1.6s}.l3{animation-delay:2.2s}.l4{animation-delay:2.8s}.l5{animation-delay:3.4s}.l6{animation-delay:4s}.l7{animation-delay:4.6s;stroke:#0d8f6a}
+.in{animation:rise .5s cubic-bezier(.2,.9,.2,1) backwards}
+.i2{animation-delay:.15s}.i3{animation-delay:.3s}
+@keyframes lit{0%{opacity:0}3%{opacity:.95}12%,100%{opacity:0}}
+@keyframes rise{from{opacity:0;transform:translateY(10px)}}
+@media (prefers-reduced-motion:reduce){.in{animation:none}.lit{display:none}}
+</style>
+<defs>
+<marker id="ar" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0L10 5L0 10z"/></marker>
+<marker id="av" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ahv" d="M0 0L10 5L0 10z"/></marker>
+</defs>
+
+<text class="col" x="0" y="16">RUN STATE MACHINE</text>
+<text class="note" x="960" y="16" text-anchor="end">States and edges: runs.state CHECK and transition trigger, src/db/schema.sql</text>
+
+<g class="in">
+<path class="arc" d="M292 54Q600 6 910 54" marker-end="url(#av)"/>
+<rect class="lb" x="451" y="22" width="300" height="18" rx="4"/>
+<text class="vt" x="601" y="35" text-anchor="middle">PROJECT_BOOTSTRAP: CEO CONFIRM after activation</text>
+
+<path class="ln" d="M80 72H103" marker-end="url(#ar)"/>
+<path class="ln" d="M181 72H204" marker-end="url(#ar)"/>
+<path class="ln" d="M380 72H403" marker-end="url(#ar)"/>
+<path class="ln" d="M523 72H546" marker-end="url(#ar)"/>
+<path class="ln" d="M636 72H659" marker-end="url(#ar)"/>
+<path class="ln" d="M835 72H858" marker-end="url(#ar)"/>
+
+<rect class="p" x="0" y="54" width="78" height="36" rx="18"/><text class="st" x="39" y="76.5" text-anchor="middle">QUEUED</text>
+<rect class="pa" x="105" y="54" width="74" height="36" rx="18"/><text class="st" x="142" y="76.5" text-anchor="middle">ACTIVE</text>
+<rect class="pa" x="206" y="54" width="172" height="36" rx="18"/><text class="st" x="292" y="76.5" text-anchor="middle">READY_FOR_CEO_REVIEW</text>
+<rect class="p" x="405" y="54" width="116" height="36" rx="18"/><text class="st" x="463" y="76.5" text-anchor="middle">CEO_APPROVED</text>
+<rect class="p" x="548" y="54" width="86" height="36" rx="18"/><text class="st" x="591" y="76.5" text-anchor="middle">MERGING</text>
+<rect class="p" x="661" y="54" width="172" height="36" rx="18"/><text class="st" x="747" y="76.5" text-anchor="middle">POST_MERGE_VERIFYING</text>
+<rect class="pv" x="860" y="54" width="100" height="36" rx="18"/><text class="st" x="910" y="76.5" text-anchor="middle">COMPLETED</text>
+<rect class="lit l1" x="0" y="54" width="78" height="36" rx="18"/><rect class="lit l2" x="105" y="54" width="74" height="36" rx="18"/><rect class="lit l3" x="206" y="54" width="172" height="36" rx="18"/><rect class="lit l4" x="405" y="54" width="116" height="36" rx="18"/><rect class="lit l5" x="548" y="54" width="86" height="36" rx="18"/><rect class="lit l6" x="661" y="54" width="172" height="36" rx="18"/><rect class="lit l7" x="860" y="54" width="100" height="36" rx="18"/>
+
+<text class="cap" x="39" y="110" text-anchor="middle">run_create</text><text class="cap" x="39" y="125" text-anchor="middle">by the CEO</text>
+<text class="cap" x="142" y="110" text-anchor="middle">RUN_DISPATCH to</text><text class="cap" x="142" y="125" text-anchor="middle">the project CTO</text>
+<text class="cap" x="292" y="110" text-anchor="middle">production-ready packet</text><text class="cap" x="292" y="125" text-anchor="middle">awaits the CEO decision</text>
+<text class="cap" x="463" y="110" text-anchor="middle">CEO CONFIRM;</text><text class="cap" x="463" y="125" text-anchor="middle">finalizer takes over</text>
+<text class="cap" x="591" y="110" text-anchor="middle">gate_publish,</text><text class="cap" x="591" y="125" text-anchor="middle">merge_execute</text>
+<text class="cap" x="747" y="110" text-anchor="middle">post_merge_verify</text><text class="cap" x="747" y="125" text-anchor="middle">receipt per GitHub effect</text>
+<text class="cap" x="910" y="110" text-anchor="middle">decided by</text><text class="cap" x="910" y="125" text-anchor="middle">agentcpd only</text>
+</g>
+
+<g class="in i2">
+<rect class="band" x="0" y="146" width="960" height="114" rx="14"/>
+<text class="bt" x="16" y="170">ACTIVE → READY_FOR_CEO_REVIEW: the candidate pipeline</text>
+<text class="note" x="944" y="170" text-anchor="end">every fact is checked against the same candidate digest</text>
+
+<rect class="ch" x="15" y="184" width="145" height="62" rx="10"/><text class="cn" x="27" y="204">1</text><text class="ct" x="40" y="204">Plan</text><text class="cs" x="27" y="222">CTO plan_submit,</text><text class="cs" x="27" y="237">task graph</text>
+<rect class="ch" x="172" y="184" width="145" height="62" rx="10"/><text class="cn" x="184" y="204">2</text><text class="ct" x="197" y="204">Build</text><text class="cs" x="184" y="222">workers in claimed,</text><text class="cs" x="184" y="237">disposable worktrees</text>
+<rect class="ch" x="329" y="184" width="145" height="62" rx="10"/><text class="cn" x="341" y="204">3</text><text class="ct" x="354" y="204">Freeze</text><text class="cs" x="341" y="222">candidate snapshot</text><text class="cs" x="341" y="237">+ pinned contract</text>
+<rect class="ch" x="486" y="184" width="145" height="62" rx="10"/><text class="cn" x="498" y="204">4</text><text class="ct" x="511" y="204">Verify</text><text class="cs" x="498" y="222">sandboxed commands,</text><text class="cs" x="498" y="237">fail closed</text>
+<rect class="ch" x="643" y="184" width="145" height="62" rx="10"/><text class="cn" x="655" y="204">5</text><text class="ct" x="668" y="204">Blind review</text><text class="cs" x="655" y="222">automatic, isolated,</text><text class="cs" x="655" y="237">full coverage</text>
+<rect class="ch" x="800" y="184" width="145" height="62" rx="10"/><text class="cn" x="812" y="204">6</text><text class="ct" x="825" y="204">Packet</text><text class="cs" x="812" y="222">CTO final approval,</text><text class="cs" x="812" y="237">zero blockers</text>
+<path class="ln" d="M161 215H170" marker-end="url(#ar)"/><path class="ln" d="M318 215H327" marker-end="url(#ar)"/><path class="ln" d="M475 215H484" marker-end="url(#ar)"/><path class="ln" d="M632 215H641" marker-end="url(#ar)"/><path class="ln" d="M789 215H798" marker-end="url(#ar)"/>
+</g>
+
+<g class="in i3">
+<text class="col" x="0" y="290">SIDE STATES</text>
+<rect class="pw" x="0" y="302" width="92" height="32" rx="16"/><text class="st" x="46" y="322.5" text-anchor="middle">BLOCKED</text>
+<rect class="pg" x="137" y="302" width="140" height="32" rx="16"/><text class="st" x="207" y="322.5" text-anchor="middle">AWAITING_HUMAN</text>
+<rect class="pw" x="322" y="302" width="160" height="32" rx="16"/><text class="st" x="402" y="322.5" text-anchor="middle">REVISION_REQUIRED</text>
+<rect class="pw" x="527" y="302" width="168" height="32" rx="16"/><text class="st" x="611" y="322.5" text-anchor="middle">BLOCKED_POST_MERGE</text>
+<rect class="pm" x="740" y="302" width="76" height="32" rx="16"/><text class="st" x="778" y="322.5" text-anchor="middle">FAILED</text>
+<rect class="pm" x="860" y="302" width="100" height="32" rx="16"/><text class="st" x="910" y="322.5" text-anchor="middle">CANCELLED</text>
+<text class="cap" x="0" y="354">from ACTIVE;</text><text class="cap" x="0" y="369">resumes to ACTIVE</text>
+<text class="cap" x="137" y="354">waits for a human decision;</text><text class="cap" x="137" y="369">resumes to ACTIVE</text>
+<text class="cap" x="322" y="354">CEO FINAL_REVISE;</text><text class="cap" x="322" y="369">back to ACTIVE</text>
+<text class="cap" x="527" y="354">from MERGING or verifying;</text><text class="cap" x="527" y="369">back to POST_MERGE_VERIFYING</text>
+<text class="cap" x="740" y="354">terminal</text>
+<text class="cap" x="860" y="354">terminal</text>
+<text class="cap" x="960" y="396" text-anchor="end">From CEO_APPROVED on, no edge leads to FAILED or CANCELLED.</text>
+</g>
+</svg>

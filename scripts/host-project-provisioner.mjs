@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Version 1 host boundary. All paths are derived from HOME/ACP_STATE_DIR and a frozen allocation.
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, chmodSync, realpathSync, rmSync, symlinkSync, readlinkSync, lstatSync, openSync, fsyncSync, closeSync } from 'node:fs';
-import { join, resolve, dirname } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, chmodSync, realpathSync, rmSync, symlinkSync, readlinkSync, lstatSync, openSync, fsyncSync, closeSync, accessSync, constants, statSync } from 'node:fs';
+import { join, resolve, dirname, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { generateSecretKey, getPublicKey } from 'nostr-tools';
 import Database from 'better-sqlite3';
@@ -12,8 +12,40 @@ import { readProcessStartToken } from '../src/core/process-argv.ts';
 const home = process.env.HOME;
 const state = process.env.ACP_STATE_DIR;
 class ProvisionerRefusal extends Error {}
+class ProvisionerExecutionFailure extends Error {
+  constructor(message, error) {super(message);this.stderr = error.stderr;}
+}
+let operation = 'unknown';
 const check = (ok, why) => { if (!ok) throw new ProvisionerRefusal(why); };
-const run = (bin, args, opts = {}) => execFileSync(bin, args, { encoding:'utf8', timeout:30_000, maxBuffer:2_000_000, stdio:['pipe','pipe','pipe'], ...opts });
+const resolvedBinary = bin => {
+  const name = bin.toUpperCase();
+  // Match the launcher's nonempty operator pin, then its install-time answer. Never search PATH.
+  const value = process.env[`ACP_${name}_BINARY`] || process.env[`ACP_RESOLVED_${name}_BINARY`];
+  const why = reason => `${bin} in ${operation}: ${reason}`;
+  check(value, why('missing binary variable'));
+  check(isAbsolute(value), why('binary path is not absolute'));
+  let target;
+  try {target = realpathSync(value);} catch (error) {
+    throw new ProvisionerRefusal(why(error.code === 'ENOENT' || error.code === 'ENOTDIR' ? 'binary is missing' : 'binary is not executable'));
+  }
+  try {check(statSync(target).isFile(), why('binary is not an executable regular file'));accessSync(target,constants.X_OK);} catch (error) {
+    if (error instanceof ProvisionerRefusal) throw error;
+    throw new ProvisionerRefusal(why('binary is not executable'));
+  }
+  // Keep the stable install name: provider updaters may repoint it between operations.
+  return value;
+};
+const run = (bin, args, opts = {}) => {
+  const pinned = bin === 'buzz' || bin === 'claude';
+  const executable = pinned ? resolvedBinary(bin) : bin;
+  try {return execFileSync(executable, args, { encoding:'utf8', timeout:30_000, maxBuffer:2_000_000, stdio:['pipe','pipe','pipe'], ...opts });} catch (error) {
+    if (!pinned) throw error;
+    const reason = Number.isInteger(error.status) ? `non-zero exit with exit code ${error.status}` :
+      error.code === 'ENOENT' ? 'binary is missing (ENOENT)' : error.code === 'EACCES' ? 'binary is not executable' :
+      error.code === 'ETIMEDOUT' ? 'execution timed out' : 'execution failed';
+    throw new ProvisionerExecutionFailure(`${bin} in ${operation}: ${reason}`,error);
+  }
+};
 const json = (bin, args, opts) => JSON.parse(run(bin,args,opts));
 const atomic = (path, body, mode = 0o600) => {
   mkdirSync(dirname(path),{recursive:true,mode:0o700}); const tmp = `${path}.${randomUUID()}.tmp`;
@@ -27,6 +59,7 @@ let ownLock = null;
 let ceoSigner = false;
 try {
   const req = JSON.parse(readFileSync(0,'utf8'));
+  operation = req.operation;
   check(req.version === 1 && home && state, 'protocol');
   const a = req.allocation;
   ceoSigner = req.operation === 'ensure-buzz' && a?.mode === 'ceo-route-signer';
@@ -105,6 +138,54 @@ try {
   const pub = () => getPublicKey(Buffer.from(readFileSync(a.privateKeyFile,'utf8').trim(),'hex'));
   const pubFile = ceoSigner ? null : a.privateKeyFile.replace(/\.priv$/,'.pub');
   const rosterFile = join(home,'.hermes','bridge','required-mentions.json');
+  // Mirror canonical_roster.py's version-specific room rules before publishing a roster.
+  const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const validateRoster = roster => {
+    const v1 = roster.version === undefined || roster.version === 1;
+    const hex64 = value => typeof value === 'string' && value.length === 64 && !/[^a-f0-9]/.test(value);
+    const handle = value => typeof value === 'string' && value.length > 0 && !/[^A-Za-z0-9_-]/.test(value);
+    const identity = value => object(value) && hex64(value.pubkey) && handle(value.handle);
+    for (const [roomId, room] of Object.entries(roster.channels)) {
+      check(roomId.length === 36 && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(roomId),'invalid roster room UUID');
+      check(object(room) && identity(room.ceo) && identity(room.peer) && room.ceo.pubkey !== room.peer.pubkey,'invalid roster identities');
+      check(['active','retired'].includes(v1 && room.status === undefined ? 'active' : room.status),'invalid roster status');
+      if (!v1) check(room.ceo.handle === 'ceo' && ['relay_name','acp_project_id','classification'].every(key => typeof room[key] === 'string'),'invalid roster v2 room');
+    }
+    const known = v1 && roster.known_profiles !== undefined ? roster.known_profiles : {};
+    check(object(known) && Object.entries(known).every(([name,key]) => handle(name) && hex64(key)),'invalid roster known profiles');
+  };
+  // The room's CEO is the current canonical CEO binding's Buzz actor, never a key file or handle string.
+  const canonicalCeoKey = () => {
+    check(process.env.ACP_HOST_DATABASE_PATH, 'CEO database path unavailable');
+    const db = new Database(process.env.ACP_HOST_DATABASE_PATH, {readonly:true,fileMustExist:true});
+    try {
+      const route = currentCanonicalCeoBuzzRoute({all: (sql, params = []) => db.prepare(sql).all(...params)});
+      check(route && /^[a-f0-9]{64}$/.test(route.recipient), 'current canonical CEO binding unavailable');
+      return route.recipient;
+    } finally {db.close();}
+  };
+  // The policy wrapper's CEO handle in every room; v2 requires it and the live v1 rooms use it.
+  const ceoHandle = 'ceo';
+  const ensureRouting = (roomId, ceo = canonicalCeoKey()) => {
+    const pk = pub();
+    const rosterBytes = existsSync(rosterFile) ? readFileSync(rosterFile,'utf8') : null;
+    const roster = rosterBytes === null ? {version:2,generation:0,channels:{}} : JSON.parse(rosterBytes);
+    check(object(roster) && object(roster.channels),'invalid roster channels');
+    const v1 = roster.version === undefined || roster.version === 1;
+    check(v1 || (roster.version === 2 && Number.isInteger(roster.generation)),'invalid roster version or generation');
+    const desired = {relay_name:process.env.ACP_BUZZ_RELAY_NAME ?? 'production',ceo:{pubkey:ceo,handle:ceoHandle},peer:{pubkey:pk,handle:a.identityName},acp_project_id:a.projectId,status:'active',classification:v1 ? 'current project' : 'project'};
+    const old = roster.channels[roomId];
+    check(!old || (old.acp_project_id === a.projectId && old.peer?.pubkey === pk && old.status !== 'retired'),'route conflict');
+    const changed = canonicalJson(old ?? null) !== canonicalJson(desired);
+    if (changed) { roster.channels[roomId] = desired; if (!v1) roster.generation++; }
+    validateRoster(roster);
+    if (changed) {
+      // Other writers hold no shared lock: refuse rather than overwrite a roster that changed since it was read.
+      check((existsSync(rosterFile) ? readFileSync(rosterFile,'utf8') : null) === rosterBytes,'roster changed concurrently');
+      atomic(rosterFile,JSON.stringify(roster,null,2)+'\n');
+    }
+    return {...(v1 ? {} : {generation:read(rosterFile).generation}),roomId};
+  };
   const fleetFile = join(home,'.claude','watchers','fleet','manifest.tsv');
   const sessionFile = join(state,`resident-${a.projectId}.json`);
   const namesSession = command => new RegExp(`(?:^|\\s)--(?:session-id|resume)\\s+${a.sessionUuid}(?:\\s|$)`).test(command);
@@ -185,7 +266,7 @@ try {
       run(admission[0],[...admission.slice(1),'--pubkey',pk,'--role','member']);
       buzz(['users','set-profile','--name',a.identityName]);
       const profiles = buzz(['users','get','--pubkey',pk]);
-      check(Array.isArray(profiles) && profiles.some(p => p.pubkey === pk && (p.name === a.identityName || p.profile?.name === a.identityName)),'profile readback mismatch');
+      check(Array.isArray(profiles) && profiles.some(p => p.pubkey === pk && (p.name === a.identityName || p.profile?.name === a.identityName || p.display_name === a.identityName)),'profile readback mismatch');
       const intentFile = join(state,`buzz-room-${a.projectId}.json`);
       // The intent predates creation, including when the relay's response is lost.
       const intended = {name:a.roomName ?? a.projectId,pubkey:pk,runId:a.runId};
@@ -209,41 +290,44 @@ try {
       check(/^[a-f0-9-]{36}$/.test(roomId) && (!intent.roomId || intent.roomId === roomId) && room.name === intent.name && room.visibility === 'private' && (room.channel_type ?? room.type) === 'stream','room mismatch');
       atomic(intentFile,JSON.stringify({...intent,roomId}));
       const owner = readFileSync(join(home,'.hermes','bridge','keys','owner.pub'),'utf8').trim();
-      const ceo = readFileSync(join(home,'.hermes','bridge','keys','ceo2.pub'),'utf8').trim();
+      const ceo = canonicalCeoKey();
       const expectedMembers = [[pk,'owner'],[owner,'owner'],[ceo,'admin']];
       const before = buzz(['channels','members','--channel',roomId]);
       check(before.every(m => expectedMembers.some(([key,role]) => m.pubkey === key && m.role === role)),'existing room membership roles conflict');
       for (const [key,role] of [[owner,'owner'],[ceo,'admin']]) buzz(['channels','add-member','--channel',roomId,'--pubkey',key,'--role',role]);
       const members = buzz(['channels','members','--channel',roomId]);
       check(members.length === 3 && [[pk,'owner'],[owner,'owner'],[ceo,'admin']].every(([key,role]) => members.some(m => m.pubkey === key && m.role === role)),'room roster mismatch');
-      const nonce = `acp-provision:${a.nonce}`;
+      ensureRouting(roomId, ceo);
+      // The policy wrapper prefixes the counterpart's mention when it is absent, so the post is stated in that form.
+      const nonce = `@${ceoHandle} acp-provision:${a.nonce}`;
       let posts = buzz(['messages','get','--channel',roomId,'--limit','100']);
       if (!posts.some(m => m.content === nonce && m.pubkey === pk)) { run('buzz',['messages','send','--channel',roomId,'--content',nonce],{env:buzzEnv()}); posts = buzz(['messages','get','--channel',roomId,'--limit','100']); }
       const post = posts.find(m => m.content === nonce && m.pubkey === pk); check(post?.id,'nonce unreadable');
       result = {buzz:{pubkey:pk,roomId:roomId,rosterVerified:true,nonceEventId:post.id,nonceReadable:true}}; break;
     }
     case 'ensure-routing': {
-      const pk = pub(); const ceo = readFileSync(join(home,'.hermes','bridge','keys','ceo2.pub'),'utf8').trim();
-      const roster = existsSync(rosterFile) ? read(rosterFile) : {version:2,generation:0,channels:{}};
-      check(roster.version === 2 && Number.isInteger(roster.generation),'roster v2 required');
-      const desired = {relay_name:process.env.ACP_BUZZ_RELAY_NAME ?? 'production',ceo:{pubkey:ceo,handle:process.env.ACP_CEO_BUZZ_HANDLE ?? 'ceo2'},peer:{pubkey:pk,handle:a.identityName},acp_project_id:a.projectId,status:'active',classification:'project'};
-      const old = roster.channels[a.roomId];
-      check(!old || (old.acp_project_id === a.projectId && old.peer.pubkey === pk && old.status !== 'retired'),'route conflict');
-      if (canonicalJson(old ?? null) !== canonicalJson(desired)) { roster.channels[a.roomId] = desired; roster.generation++; atomic(rosterFile,JSON.stringify(roster,null,2)+'\n'); }
-      result = {routing:{generation:read(rosterFile).generation,roomId:a.roomId}}; break;
+      result = {routing:ensureRouting(a.roomId)}; break;
     }
     case 'ensure-resident': {
       // Also the fleet watcher's recovery path after a CTO dies: it relaunches over unfinished work.
       const observedCheckout = checkout(checkoutRequirement);
       run(join(home,'.claude','scripts','claude-trust-dir.sh'),[a.clonePath]);
+      const runtimeNode = join(state,'current','dist','bin','node');
+      const runtimeCli = join(state,'current','dist','cli','agentctl.js');
+      const runtimeUnavailable = 'agentctl runtime unavailable in ensure-resident';
+      try {
+        check(statSync(runtimeNode).isFile() && statSync(runtimeCli).isFile(),runtimeUnavailable);
+        accessSync(runtimeNode,constants.X_OK);
+      } catch {throw new ProvisionerRefusal(runtimeUnavailable);}
       const escaped = value => value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-      const mcpMatches = text => text.includes('acp-cto') && text.includes('agentctl') && /\battach\s+resident-cto\b/.test(text)
+      const mcpMatches = text => text.includes('acp-cto')
+        && new RegExp(`(?:^|\\s)${escaped(runtimeNode)}\\s+(?:Args:\\s+)?${escaped(runtimeCli)}\\s+attach\\s+resident-cto(?:\\s|$)`).test(text)
         && new RegExp(`--claimed-session-id\\s+${escaped(a.sessionUuid)}(?:\\s|$)`).test(text)
         && new RegExp(`--project-id\\s+${escaped(a.projectId)}(?:\\s|$)`).test(text);
       let currentMcp = ''; try {currentMcp = run('claude',['mcp','get','acp-cto'],{cwd:a.clonePath});} catch {}
       if (!mcpMatches(currentMcp)) {
         if (currentMcp) run('claude',['mcp','remove','--scope','local','acp-cto'],{cwd:a.clonePath});
-        run('claude',['mcp','add','--scope','local','acp-cto','--','agentctl','attach','resident-cto','--claimed-session-id',a.sessionUuid,'--project-id',a.projectId],{cwd:a.clonePath});
+        run('claude',['mcp','add','--scope','local','acp-cto','--',runtimeNode,runtimeCli,'attach','resident-cto','--claimed-session-id',a.sessionUuid,'--project-id',a.projectId],{cwd:a.clonePath});
       }
       check(mcpMatches(run('claude',['mcp','get','acp-cto'],{cwd:a.clonePath})),'MCP readback mismatch');
       atomic(join(dirname(a.bootPacket),`${a.fleetName}.resident.json`),JSON.stringify({allocation:a,packet:req.packet}));
@@ -257,7 +341,7 @@ try {
         const marker = join(state,`launched-${a.projectId}`);
         const launcher = join(state,`resident-${a.projectId}.sh`);
         const quote = v => `'${String(v).replaceAll("'", "'\\''")}'`;
-        const args = ['claude','--model','opus',(existsSync(sessionFile) || existsSync(join(home,'.claude','projects',a.clonePath.replaceAll('/','-'),`${a.sessionUuid}.jsonl`))) ? '--resume' : '--session-id',a.sessionUuid,'--name',`${a.projectId} CTO`,'--remote-control',`${a.projectId} CTO`,'--messaging-socket-path',a.socketPath,'--permission-mode','bypassPermissions','--dangerously-skip-permissions',`You are ${a.projectId} CTO. Connect to acp-cto, read role_dispatch_pending, and acknowledge the bootstrap handoff with handoff_ack. The handoff contains the approved genesis bytes and product intent.`];
+        const args = [resolvedBinary('claude'),'--model','opus',(existsSync(sessionFile) || existsSync(join(home,'.claude','projects',a.clonePath.replaceAll('/','-'),`${a.sessionUuid}.jsonl`))) ? '--resume' : '--session-id',a.sessionUuid,'--name',`${a.projectId} CTO`,'--remote-control',`${a.projectId} CTO`,'--messaging-socket-path',a.socketPath,'--permission-mode','bypassPermissions','--dangerously-skip-permissions',`You are ${a.projectId} CTO. Connect to acp-cto, read role_dispatch_pending, and acknowledge the bootstrap handoff with handoff_ack. The handoff contains the approved genesis bytes and product intent.`];
         atomic(launcher,`#!/bin/sh\nunset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\nexport ACP_STATE_DIR=${quote(state)}\nBUZZ_PRIVATE_KEY=$(cat ${quote(a.privateKeyFile)}) || exit 1\nexport BUZZ_PRIVATE_KEY\ncd ${quote(a.clonePath)} || exit 1\nexec ${args.map(quote).join(' ')}\n`,0o700);
         // Refuse a duplicate Claude even when RC is still registering. Never kill an unverified pane.
         const ps = run('ps',['-axo','command=']); check(!ps.split('\n').some(l => namesSession(l)),'resident awaits RC');
@@ -311,7 +395,7 @@ try {
   process.stdout.write(JSON.stringify(result));
 } catch (error) {
   if (ceoSigner) {
-    let failure = {outcome:'LOST',code:'host_response_unknown',message:'host provisioning outcome unknown'};
+    let failure = {outcome:'LOST',code:'host_response_unknown',message:error instanceof ProvisionerExecutionFailure ? error.message : 'host provisioning outcome unknown'};
     if (error instanceof ProvisionerRefusal) failure = {outcome:'INVALID',code:'host_verification_failed',message:error.message};
     else {
       try {
@@ -321,7 +405,7 @@ try {
       } catch { /* No precise relay refusal was received. */ }
     }
     process.stderr.write(JSON.stringify({ceoBuzzSignerFailure:failure}));
-  } else process.stderr.write(`host project provisioner refused operation${error instanceof ProvisionerRefusal ? ': '+error.message : ''}\n`);
+  } else process.stderr.write(`host project provisioner refused operation${error instanceof ProvisionerRefusal || error instanceof ProvisionerExecutionFailure ? ': '+error.message : ''}\n`);
   process.exitCode = 1;
 }
 finally {if (locked && readlinkSync(lock) === ownLock) rmSync(lock,{force:true});if (ownLock) rmSync(ownLock,{recursive:true,force:true});}
