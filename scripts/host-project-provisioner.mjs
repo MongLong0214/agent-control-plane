@@ -138,6 +138,16 @@ try {
   const pub = () => getPublicKey(Buffer.from(readFileSync(a.privateKeyFile,'utf8').trim(),'hex'));
   const pubFile = ceoSigner ? null : a.privateKeyFile.replace(/\.priv$/,'.pub');
   const rosterFile = join(home,'.hermes','bridge','required-mentions.json');
+  const ensureRouting = roomId => {
+    const pk = pub(); const ceo = readFileSync(join(home,'.hermes','bridge','keys','ceo2.pub'),'utf8').trim();
+    const roster = existsSync(rosterFile) ? read(rosterFile) : {version:2,generation:0,channels:{}};
+    check(roster.version === 2 && Number.isInteger(roster.generation),'roster v2 required');
+    const desired = {relay_name:process.env.ACP_BUZZ_RELAY_NAME ?? 'production',ceo:{pubkey:ceo,handle:process.env.ACP_CEO_BUZZ_HANDLE ?? 'ceo2'},peer:{pubkey:pk,handle:a.identityName},acp_project_id:a.projectId,status:'active',classification:'project'};
+    const old = roster.channels[roomId];
+    check(!old || (old.acp_project_id === a.projectId && old.peer.pubkey === pk && old.status !== 'retired'),'route conflict');
+    if (canonicalJson(old ?? null) !== canonicalJson(desired)) { roster.channels[roomId] = desired; roster.generation++; atomic(rosterFile,JSON.stringify(roster,null,2)+'\n'); }
+    return {generation:read(rosterFile).generation,roomId};
+  };
   const fleetFile = join(home,'.claude','watchers','fleet','manifest.tsv');
   const sessionFile = join(state,`resident-${a.projectId}.json`);
   const namesSession = command => new RegExp(`(?:^|\\s)--(?:session-id|resume)\\s+${a.sessionUuid}(?:\\s|$)`).test(command);
@@ -249,6 +259,7 @@ try {
       for (const [key,role] of [[owner,'owner'],[ceo,'admin']]) buzz(['channels','add-member','--channel',roomId,'--pubkey',key,'--role',role]);
       const members = buzz(['channels','members','--channel',roomId]);
       check(members.length === 3 && [[pk,'owner'],[owner,'owner'],[ceo,'admin']].every(([key,role]) => members.some(m => m.pubkey === key && m.role === role)),'room roster mismatch');
+      ensureRouting(roomId);
       const nonce = `acp-provision:${a.nonce}`;
       let posts = buzz(['messages','get','--channel',roomId,'--limit','100']);
       if (!posts.some(m => m.content === nonce && m.pubkey === pk)) { run('buzz',['messages','send','--channel',roomId,'--content',nonce],{env:buzzEnv()}); posts = buzz(['messages','get','--channel',roomId,'--limit','100']); }
@@ -256,14 +267,7 @@ try {
       result = {buzz:{pubkey:pk,roomId:roomId,rosterVerified:true,nonceEventId:post.id,nonceReadable:true}}; break;
     }
     case 'ensure-routing': {
-      const pk = pub(); const ceo = readFileSync(join(home,'.hermes','bridge','keys','ceo2.pub'),'utf8').trim();
-      const roster = existsSync(rosterFile) ? read(rosterFile) : {version:2,generation:0,channels:{}};
-      check(roster.version === 2 && Number.isInteger(roster.generation),'roster v2 required');
-      const desired = {relay_name:process.env.ACP_BUZZ_RELAY_NAME ?? 'production',ceo:{pubkey:ceo,handle:process.env.ACP_CEO_BUZZ_HANDLE ?? 'ceo2'},peer:{pubkey:pk,handle:a.identityName},acp_project_id:a.projectId,status:'active',classification:'project'};
-      const old = roster.channels[a.roomId];
-      check(!old || (old.acp_project_id === a.projectId && old.peer.pubkey === pk && old.status !== 'retired'),'route conflict');
-      if (canonicalJson(old ?? null) !== canonicalJson(desired)) { roster.channels[a.roomId] = desired; roster.generation++; atomic(rosterFile,JSON.stringify(roster,null,2)+'\n'); }
-      result = {routing:{generation:read(rosterFile).generation,roomId:a.roomId}}; break;
+      result = {routing:ensureRouting(a.roomId)}; break;
     }
     case 'ensure-resident': {
       // Also the fleet watcher's recovery path after a CTO dies: it relaunches over unfinished work.

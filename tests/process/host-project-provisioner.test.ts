@@ -46,7 +46,12 @@ else if(cmd === 'buzz') {
  else if(args[0] === 'channels' && args[1] === 'create') {if(args.includes('--id') || !process.env.BUZZ_PRIVATE_KEY || process.env.BUZZ_IDENTITY !== a.identityName) process.exit(3);const intent=JSON.parse(fs.readFileSync(path.join(process.env.ACP_STATE_DIR,'buzz-room-test.json'),'utf8'));if(intent.name!==value('--name') || intent.pubkey!==pk) process.exit(4);s.creates++;s.room={channel_id:'ffffffff-ffff-4fff-8fff-ffffffffffff',name:value('--name'),channel_type:value('--type'),visibility:value('--visibility')};s.members=[{pubkey:pk,role:'owner'}];save();if(s.loseCreate) {s.loseCreate=false;save();process.exit(1);}out(s.room);}
  else if(args[0] === 'channels' && args[1] === 'add-member') {const pubkey=value('--pubkey');s.members=s.members.filter(m=>m.pubkey!==pubkey);s.members.push({pubkey,role:value('--role')});out({});}
  else if(args[0] === 'channels' && args[1] === 'members') out(s.members);
- else if(args[0] === 'messages' && args[1] === 'send') {s.posts.push({id:'e'.repeat(64),pubkey:pk,content:value('--content')});out({});}
+ else if(args[0] === 'messages' && args[1] === 'send') {
+  const rosterFile=path.join(root,'.hermes','bridge','required-mentions.json');
+  const roster=fs.existsSync(rosterFile) ? JSON.parse(fs.readFileSync(rosterFile,'utf8')) : {channels:{}};
+  if(!roster.channels[value('--channel')]) {s.refusedSends=(s.refusedSends||0)+1;save();process.stderr.write('unregistered channel');process.exit(1);}
+  s.posts.push({id:'e'.repeat(64),pubkey:pk,content:value('--content')});out({});
+ }
  else if(args[0] === 'messages' && args[1] === 'get') out(s.posts);
  else process.exit(2);
 } else process.exit(2);
@@ -65,6 +70,48 @@ save();
   return {home,state,bin,resolvedBin,runtimeNode,runtimeCli,a,script,env,invoke};
 };
 const runtimeCommand = (f:ReturnType<typeof fixture>) => [f.runtimeNode,f.runtimeCli,'attach','resident-cto','--claimed-session-id',f.a.sessionUuid,'--project-id',f.a.projectId];
+
+it('registers the verified room before the policy-enforced nonce send and leaves ensure-routing unchanged',async () => {
+  const {home,a,invoke} = fixture();
+  const rosterFile = join(home,'.hermes','bridge','required-mentions.json');
+  expect(existsSync(rosterFile)).toBe(false);
+  const result = await invoke('ensure-buzz');
+  const buzz = result.buzz as {roomId:string;nonceEventId:string;nonceReadable:boolean};
+  expect(buzz).toMatchObject({roomId:'ffffffff-ffff-4fff-8fff-ffffffffffff',nonceEventId:'e'.repeat(64),nonceReadable:true});
+  const pk = readFileSync(a.privateKeyFile.replace('.priv','.pub'),'utf8').trim();
+  const roster = readFileSync(rosterFile,'utf8');
+  const before = statSync(rosterFile);
+  expect(JSON.parse(roster)).toEqual({version:2,generation:1,channels:{[buzz.roomId]:{
+    relay_name:'production',ceo:{pubkey:'d'.repeat(64),handle:'ceo2'},peer:{pubkey:pk,handle:a.identityName},
+    acp_project_id:a.projectId,status:'active',classification:'project',
+  }}});
+  expect(JSON.parse(readFileSync(join(home,'fake.json'),'utf8'))).toMatchObject({posts:[{content:`acp-provision:${a.nonce}`,pubkey:pk}]});
+  a.roomId = buzz.roomId;
+  expect(await invoke('ensure-routing')).toEqual({routing:{generation:1,roomId:buzz.roomId}});
+  expect(readFileSync(rosterFile,'utf8')).toBe(roster);
+  expect(statSync(rosterFile)).toMatchObject({ino:before.ino,mtimeMs:before.mtimeMs});
+  await invoke('ensure-buzz');
+  expect(readFileSync(rosterFile,'utf8')).toBe(roster);
+  expect(JSON.parse(readFileSync(join(home,'fake.json'),'utf8')).posts).toHaveLength(1);
+});
+
+it.each(['ensure-buzz','ensure-routing'])('refuses a route conflict in %s without posting a nonce or changing the roster',async operation => {
+  const {home,a,invoke} = fixture();
+  const rosterFile = join(home,'.hermes','bridge','required-mentions.json');
+  const roomId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+  const roster = JSON.stringify({version:2,generation:7,channels:{[roomId]:{
+    acp_project_id:'other',peer:{pubkey:'0'.repeat(64)},status:'active',
+  }}})+'\n';
+  writeFileSync(rosterFile,roster);
+  // ensure-routing needs a key, while ensure-buzz must discover the actual room id itself.
+  writeFileSync(a.privateKeyFile,'1'.repeat(64)+'\n');
+  if(operation === 'ensure-routing') a.roomId = roomId;
+  await expect(invoke(operation)).rejects.toThrow('route conflict');
+  expect(readFileSync(rosterFile,'utf8')).toBe(roster);
+  if(operation === 'ensure-buzz') {
+    expect(JSON.parse(readFileSync(join(home,'fake.json'),'utf8'))).toMatchObject({creates:1,posts:[]});
+  }
+});
 
 it('registers acp-cto through the ACP current runtime',async () => {
   const f = fixture();
