@@ -1,0 +1,7 @@
+Limit: The npm-test compatibility is limited to RF genesis verification of exactly npm test with an approved plain node --test script and no pretest or posttest; general LOCAL_COMMAND sandbox behavior and limits stay unchanged.
+Record-Id: r-e020324770d5
+Provenance: inherited c05242c663d0c47690a6a669d3060e1eb5e54e37
+
+Limit: repo-factory.result.v2 invocation fields are optional without defaults: existing result identities remain stable, while new invocation fields enter the existing artifact content digest.
+Record-Id: r-d0722bde7152
+Provenance: inherited d2f4a635f823ef9f5f7226d9fe14e023aea13c84
