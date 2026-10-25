@@ -1,5 +1,5 @@
 import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
-import { collectBootstrapReviewEvidence, reviewEvidenceStageAccess, stageBootstrapReviewEvidence, type ReviewEvidenceStageInput } from "../bootstrap/bootstrap-review-evidence.ts";
+import { BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES, collectBootstrapReviewEvidence, reviewEvidenceStageAccess, stageBootstrapReviewEvidence, type ReviewEvidenceStageInput } from "../bootstrap/bootstrap-review-evidence.ts";
 import { collectBootstrapCeoDecisions } from "../bootstrap/bootstrap-ceo-decisions.ts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -572,7 +572,7 @@ const createCtoServerFromPort = (
   );
   server.registerTool(
     "bootstrap_review_evidence_stage",
-    { description: "Stage one immutable private review evidence bundle (files, path/sha256/origin/grade manifest and explicit missing items) within the existing 128 KiB UTF-8 staging limit. Current PRIMARY_CTO only. Binds this run, contract and current bootstrapPlanDigest; CEO must select this exact attachment/stager/digest. No verification or approval. No automatic summaries, split uploads or external file references.",
+    { description: `Stage one immutable private review evidence bundle (files, path/sha256/origin/grade manifest and explicit missing items) within the ${BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES / 1024} KiB UTF-8 staging limit. Current PRIMARY_CTO only. Binds this run, contract and current bootstrapPlanDigest; CEO must select this exact attachment/stager/digest. No verification or approval. No automatic summaries, split uploads or external file references.`,
       inputSchema: { ...mutation, ...runIdentity, contractDigest: z.string(), bootstrapPlanDigest: z.string(), evidenceBody: z.string(), expectedSha256: z.string() } },
     async args => write("bootstrap_review_evidence_stage", args, peer => respond(port.stageBootstrapReviewEvidence(peer, args)),
       peer => port.reviewEvidenceStageAuthority(peer, args)),

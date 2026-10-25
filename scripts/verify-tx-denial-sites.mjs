@@ -144,6 +144,8 @@ const DENY_PATTERN =
  * owning same-file definition; `label` is the stable operator-facing identity printed below.
  */
 const EXPECTED_CONVERTED_SITES = [
+  // The receipt transition and audit must both roll back if the audit refuses.
+  { file: "outbox/ceo-notification-ack.ts", symbol: "acknowledgeCeoNotification", label: "acknowledgeCeoNotification", evidence: "direct" },
   // The selected artifact must roll back if its attachment audit refuses, preserving the prior selection.
   { file: "bootstrap/bootstrap-review-evidence.ts", symbol: "attachBootstrapReviewEvidence", label: "attachBootstrapReviewEvidence", evidence: "direct" },
   { file: "bootstrap/bootstrap-plan-artifact.ts", symbol: "stageBootstrapPlan", label: "stageBootstrapPlan", evidence: "direct" },

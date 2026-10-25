@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
+import { MAX_MCP_LINE_BYTES } from "../core/mcp-limits.ts";
 import { recordBootstrapServingRuntime } from "../bootstrap/bootstrap-runtime-observation.ts";
 import { readBuzzSubscriberConfig } from '../buzz/buzz-mention-subscriber.ts';
 import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
@@ -208,7 +209,7 @@ const STOP_INCOMPLETE_EXIT_CODE = 75;
  * other direction too — a line just under the limit passed with most of another message already
  * behind it, because the comparison ran once per read rather than once per line.
  */
-export const MAX_MCP_LINE_BYTES = 1024 * 1024;
+export { MAX_MCP_LINE_BYTES } from "../core/mcp-limits.ts";
 /**
  * The bound on input that has not produced a line yet, so a peer that never writes a newline
  * cannot grow the buffer without limit.

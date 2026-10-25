@@ -1,3 +1,4 @@
+import { MAX_MCP_LINE_BYTES } from "../core/mcp-limits.ts";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { lstatSync, watch } from "node:fs";
@@ -65,11 +66,11 @@ import type { Readable, Writable } from "node:stream";
  */
 
 /**
- * The daemon's own per-line ceiling (`MAX_MCP_LINE_BYTES` in `src/daemon/agentcpd.ts`, and the
- * same value on the claim socket's framing). A first line longer than this is not a line either
- * side would have accepted, so the relay stops rather than buffering without bound.
+ * The daemon's own per-line ceiling (`MAX_MCP_LINE_BYTES` in `src/core/mcp-limits.ts`).
+ * A first line longer than this is not a line either side would have accepted, so the relay
+ * stops rather than buffering without bound.
  */
-const MAX_LINE_BYTES = 1024 * 1024;
+const MAX_LINE_BYTES = MAX_MCP_LINE_BYTES;
 
 /**
  * Must name the same method `CANONICAL_SELF_CLAIM_METHOD` does in

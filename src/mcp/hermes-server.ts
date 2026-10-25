@@ -12,6 +12,7 @@ import type { BootstrapApplications } from "../bootstrap/bootstrap-applications.
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Outbox } from "../outbox/outbox.ts";
+import { acknowledgeCeoNotification, ceoNotificationAckAccess, replayCeoNotificationAck, type CeoNotificationAckInput } from "../outbox/ceo-notification-ack.ts";
 import type { CapacityMonitor } from "../capacity/capacity-monitor.ts";
 import type { RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import {
@@ -110,6 +111,12 @@ export const createHermesMcpPort = (
 ) => {
   const port = Object.freeze({
     mutation: createMcpMutationPort(source),
+    ceoNotificationAckAccess: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, messageId: string) =>
+      ceoNotificationAckAccess(source, peer, turn, messageId),
+    acknowledgeCeoNotification: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: CeoNotificationAckInput, fingerprint: string) =>
+      acknowledgeCeoNotification(source, peer, turn, input, fingerprint),
+    replayCeoNotificationAck: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: CeoNotificationAckInput, fingerprint: string, reservationVerified: boolean) =>
+      replayCeoNotificationAck(source, peer, turn, input, fingerprint, reservationVerified),
     // Authentication owns admission; capture the role that authorized a session-bearing peer.
     peerAuthority: (peer: AuthenticatedMcpPeer): Decision<Record<string, unknown>> => {
       if (!peer.sessionId) return allow(ReasonCode.OK, {});
@@ -382,6 +389,10 @@ const createHermesServerFromPort = (
       authority: () => {
         const current = authenticateMcpPeer(authenticate);
         const authority = current.allowed ? port.peerAuthority(peer.value) : current;
+        if (authority.allowed && toolName === "ceo_notification_ack") {
+          const access = port.ceoNotificationAckAccess(peer.value, admittedTurnOf(extra), args.messageId as string);
+          return access.allowed ? authority : access;
+        }
         if (!authority.allowed || (toolName !== "bootstrap_plan_attach" && toolName !== "bootstrap_review_resume" && toolName !== "bootstrap_review_evidence_attach")) return authority;
         const identity = port.bootstrapPlanAttachAuthority(peer.value, admittedTurnOf(extra));
         if (!identity.allowed) return identity;
@@ -420,6 +431,20 @@ const createHermesServerFromPort = (
     return write(toolName, args, extra, () => execute(peer.value.actor));
   });
 
+  server.registerTool(
+    "ceo_notification_ack",
+    { description: "Acknowledge receipt and processing of a posted CEO_NOTIFICATION addressed to the current canonical CEO. This is never owner approval, escalation resolution or execution approval.",
+      inputSchema: { ...mutation, messageId: z.string().min(1) } },
+    async (args, extra) => write("ceo_notification_ack", args, extra, fingerprint => {
+      const peer = authenticateMcpPeer(authenticate);
+      return peer.allowed ? respond(port.acknowledgeCeoNotification(peer.value, admittedTurnOf(extra), args, fingerprint)) : respond(peer);
+    }, (fingerprint, reservationVerified) => {
+      const peer = authenticateMcpPeer(authenticate);
+      if (!peer.allowed) return respond(peer);
+      const replay = port.replayCeoNotificationAck(peer.value, admittedTurnOf(extra), args, fingerprint, reservationVerified);
+      return replay ? respond(replay) : null;
+    }),
+  );
   server.registerTool(
     "bootstrap_review_resume",
     {

@@ -2,6 +2,10 @@ import { createConnection } from "node:net";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 
+/** Serialize every JSON string code unit as \uXXXX, including ASCII and surrogate pairs. */
+export const unicodeEscapedJson = (value: unknown): string => JSON.stringify(value).replace(/"(?:\\.|[^"\\])*"/g, literal =>
+  '"' + (JSON.parse(literal) as string).split("").map(unit => "\\u" + unit.charCodeAt(0).toString(16).padStart(4, "0")).join("") + '"');
+
 /** What a local MCP socket's first line carries: the deployment token and the session credential. */
 export interface McpSocketCredential {
   token: string;

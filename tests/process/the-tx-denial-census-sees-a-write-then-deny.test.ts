@@ -105,6 +105,12 @@ const DOOR_R1_TEST = "tests/unit/ceo-escalation-resolve-door-r1.test.ts";
 
 const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string; witnesses?: RollbackWitness[] }> = [
   {
+    label: "acknowledgeCeoNotification",
+    file: "outbox/ceo-notification-ack.ts",
+    anchor: "): Decision<AckResult> => source.db.txDecision(() => {",
+    witnesses: [{ file: "tests/unit/ceo-notification-ack.test.ts", title: "rolls back notification ACK and audit on audit denial" }],
+  },
+  {
     label: "attachBootstrapReviewEvidence",
     file: "bootstrap/bootstrap-review-evidence.ts",
     anchor: "export const attachBootstrapReviewEvidence = (source: Source, peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: ReviewEvidenceInput) => source.db.txDecision(() => {",
