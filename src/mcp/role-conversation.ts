@@ -270,6 +270,7 @@ export const ROLE_WAKE_TOKEN = "ACP-ROLE-WAKE";
  */
 export const ROLE_WAKE_CAUSE = {
   REGISTRATION: "registration",
+  CONNECTION_FALLBACK: "connection fallback",
   MENTION: "mention",
   UNSPECIFIED: "unspecified",
 } as const;
@@ -492,6 +493,8 @@ export class RoleConversationPort {
    * addressed rather than merely last-writer.
    */
   readonly #live = new Map<string, LivePeer>();
+  /** Open connections for the live binding, in attachment order. Older bindings are discarded. */
+  readonly #connections = new Map<string, Set<LivePeer>>();
   readonly #role: Role;
   readonly #bindings: RoleBindingSource;
   /**
@@ -534,10 +537,8 @@ export class RoleConversationPort {
   readonly #onWakeFailed: ((wake: WrittenRoleWake) => void) | null;
   readonly #onWakeWritten: ((wake: WrittenRoleWake) => void) | null;
   /**
-   * FIX-ROLE-WAKE — whether the holder has anything its wake would send it to read. Asked only by
-   * a registration's wake: a registration wake with no confirmed work (an answer of exactly
-   * `false`) is skipped, and one whose lookup throws is sent. Absent, a registration wakes
-   * unconditionally, as before.
+   * Whether a registration or connection fallback has work to wake its holder for. A confirmed
+   * `false` skips the wake; an absent or failing lookup wakes unconditionally.
    */
   readonly #holderHasWork: ((holder: HolderIdentity) => boolean) | null;
 
@@ -614,8 +615,8 @@ export class RoleConversationPort {
   /**
    * Records the peer that may be delivered to, returning its own detach.
    *
-   * An ordinary current holder replaces its earlier connection: the daemon may not yet have
-   * observed that socket closing. A scoped attachment acquires only an empty, approved role.
+   * The newest ordinary connection is current; earlier open connections of the same binding
+   * remain available for fallback. A scoped attachment acquires only an empty, approved role.
    * Admission clears stale occupancy; holder and endpoint lookups only judge it.
    */
   attach(server: McpServer, authenticate: McpPeerAuthenticator, scopeRoleKey?: string): () => void {
@@ -640,13 +641,19 @@ export class RoleConversationPort {
     const peer = identity.value;
     if (!peer.sessionId || !peer.sessionIncarnation) return () => {};
 
-    const owned: string[] = [];
+    const owned = new Map<string, LivePeer>();
     for (const binding of this.#bindings.currentCandidates()) {
       if (!this.#isCurrentHolder(binding, peer)) continue;
       if (scopeRoleKey !== undefined && binding.roleKey !== scopeRoleKey) continue;
       this.#clearStalePeer(binding.roleKey);
       if (scopeRoleKey !== undefined && this.#live.has(binding.roleKey)) continue;
-      this.#live.set(binding.roleKey, {
+      const previous = this.#live.get(binding.roleKey)?.binding;
+      if (!previous || previous.assignmentId !== binding.assignmentId ||
+          previous.bindingGeneration !== binding.bindingGeneration ||
+          previous.sessionId !== binding.sessionId || previous.sessionIncarnation !== binding.sessionIncarnation) {
+        this.#connections.set(binding.roleKey, new Set());
+      }
+      const connection: LivePeer = {
         server,
         authenticate,
         binding,
@@ -654,14 +661,30 @@ export class RoleConversationPort {
         acceptance: null,
         registration: 0,
         wakeFailure: null,
-      });
-      owned.push(binding.roleKey);
+      };
+      this.#connections.get(binding.roleKey)!.add(connection);
+      this.#live.set(binding.roleKey, connection);
+      owned.set(binding.roleKey, connection);
     }
     return () => {
-      // Identity-checked per slot: a late close from a replaced connection must not clear its
-      // successor, and a connection releases only the slots it is still the peer of.
-      for (const roleKey of owned) {
-        if (this.#live.get(roleKey)?.server === server) this.#live.delete(roleKey);
+      // Remove this exact connection even when it is not current, so a closed predecessor can
+      // never be restored. A late close from a discarded binding cannot clear its successor.
+      for (const [roleKey, connection] of owned) {
+        const connections = this.#connections.get(roleKey);
+        connections?.delete(connection);
+        if (this.#live.get(roleKey) !== connection) continue;
+        const fallback = connections && [...connections].at(-1);
+        if (!fallback) {
+          this.#live.delete(roleKey);
+          this.#connections.delete(roleKey);
+          continue;
+        }
+        this.#live.set(roleKey, fallback);
+        // Work admitted while the newer connection had no endpoint must not wait for another
+        // message. Keep the fallback's own endpoint, acceptance and registration unchanged.
+        if (fallback.endpoint !== null && this.#registrationFindsWork(fallback.server, roleKey)) {
+          void this.wake(roleKey, undefined, ROLE_WAKE_CAUSE.CONNECTION_FALLBACK);
+        }
       }
     };
   }
@@ -671,7 +694,10 @@ export class RoleConversationPort {
   }
 
   #clearStalePeer(roleKey: string): void {
-    if (!this.currentHolderConnected(roleKey)) this.#live.delete(roleKey);
+    if (!this.currentHolderConnected(roleKey)) {
+      this.#live.delete(roleKey);
+      this.#connections.delete(roleKey);
+    }
   }
 
   /** Pure eligibility lookup; admission owns stale-slot cleanup. connected() is a stored snapshot. */
@@ -1031,7 +1057,7 @@ export class RoleConversationPort {
     return allow(ReasonCode.OK, registered);
   }
 
-  /** Whether a registration's wake for `roleKey` has anything to point at; see `#holderHasWork`. */
+  /** Whether a registration or fallback wake has anything to point at; see `#holderHasWork`. */
   #registrationFindsWork(server: McpServer, roleKey: string): boolean {
     const hasWork = this.#holderHasWork;
     if (hasWork === null) return true;
