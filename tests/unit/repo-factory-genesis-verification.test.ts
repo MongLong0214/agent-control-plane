@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -169,6 +169,30 @@ describe.skipIf(process.platform !== "darwin" || !existsSync("/usr/bin/sandbox-e
 });
 
 describe("RF genesis approved worktree checks", () => {
+  it.skipIf(process.platform !== "darwin" || !existsSync("/usr/bin/sandbox-exec"))("passes verification for an approved checkout written under umask 0o077", async () => {
+    const previousUmask = process.umask(0o077);
+    try {
+      const f = fixture();
+      const open = f.port.openGenesisPull.bind(f.port);
+      const opened = vi.spyOn(f.port, "openGenesisPull").mockImplementation(async (...args) => {
+        await open(...args);
+        expect(lstatSync(join(f.checkout, "test/smoke.test.js")).mode & 0o777).toBe(0o600);
+        expect(execFileSync("git", ["-C", f.checkout, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
+      });
+      const decision = await produceRepoFactoryResult(f.input);
+      expect(opened).toHaveBeenCalledTimes(1);
+      expect(decision.allowed, JSON.stringify(decision)).toBe(true);
+      expect(f.runs).toHaveBeenCalledTimes(2);
+      expect(decision.evidence.genesisVerification).toEqual([
+        expect.objectContaining({ phase: "verifyGenesis", outcome: expect.objectContaining({ status: "PASS",
+          enforcement: expect.objectContaining({ mechanism: "seatbelt", networkEnforced: true, resourceLimitsEnforced: true }) }) }),
+        expect.objectContaining({ phase: "GENESIS_TEST", outcome: expect.objectContaining({ status: "PASS" }) }),
+      ]);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+
   const driftCases = ["verifyGenesis", "GENESIS_TEST"].flatMap(phase =>
     ["before", "after"].flatMap(when =>
       ["assume-unchanged", "skip-worktree", "ignored", "mode", "missing", "symlink"].map(kind => ({ phase, when, kind }))));

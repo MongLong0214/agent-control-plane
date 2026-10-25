@@ -986,7 +986,8 @@ export const produceRepoFactoryResult = async (
         }
         seen.add(path);
         const file = expected.get(path);
-        if (!file || !stat.isFile() || (stat.mode & 0o177777).toString(8) !== file.mode ||
+        // Git records regular-file type and owner execute, not umask-dependent permissions.
+        if (!file || !stat.isFile() || ((stat.mode & 0o100) !== 0) !== (file.mode === "100755") ||
             !readFileSync(join(localRepoPath, path)).equals(file.contentBase64 === undefined
               ? Buffer.from(file.content, "utf8") : Buffer.from(file.contentBase64, "base64"))) changes.push(path);
       }
