@@ -645,8 +645,10 @@ export class RoleConversationPort {
     for (const binding of this.#bindings.currentCandidates()) {
       if (!this.#isCurrentHolder(binding, peer)) continue;
       if (scopeRoleKey !== undefined && binding.roleKey !== scopeRoleKey) continue;
+      // Judge scoped occupancy before cleanup: promotion of a retained predecessor must not
+      // make an already-admitted attachment appear acquired without installing its connection.
+      if (scopeRoleKey !== undefined && this.currentHolderConnected(binding.roleKey)) continue;
       this.#clearStalePeer(binding.roleKey);
-      if (scopeRoleKey !== undefined && this.#live.has(binding.roleKey)) continue;
       const previous = this.#live.get(binding.roleKey)?.binding;
       if (!previous || previous.assignmentId !== binding.assignmentId ||
           previous.bindingGeneration !== binding.bindingGeneration ||
@@ -673,13 +675,9 @@ export class RoleConversationPort {
         const connections = this.#connections.get(roleKey);
         connections?.delete(connection);
         if (this.#live.get(roleKey) !== connection) continue;
-        const fallback = connections && [...connections].at(-1);
-        if (!fallback) {
-          this.#live.delete(roleKey);
-          this.#connections.delete(roleKey);
-          continue;
-        }
-        this.#live.set(roleKey, fallback);
+        this.#clearStalePeer(roleKey);
+        const fallback = this.#live.get(roleKey);
+        if (!fallback) continue;
         // Work admitted while the newer connection had no endpoint must not wait for another
         // message. Keep the fallback's own endpoint, acceptance and registration unchanged.
         if (fallback.endpoint !== null && this.#registrationFindsWork(fallback.server, roleKey)) {
@@ -694,10 +692,28 @@ export class RoleConversationPort {
   }
 
   #clearStalePeer(roleKey: string): void {
-    if (!this.currentHolderConnected(roleKey)) {
+    const connections = this.#connections.get(roleKey);
+    for (const peer of connections ?? []) {
+      try {
+        if (this.#eligibleConnection(peer)) continue;
+      } catch {
+        // A late close may outlive the authority's database. Such a connection cannot be
+        // restored, and its failed lookup must not prevent other eligible peers surviving.
+      }
+      connections!.delete(peer);
+    }
+    const current = connections && [...connections].at(-1);
+    if (current) this.#live.set(roleKey, current);
+    else {
       this.#live.delete(roleKey);
       this.#connections.delete(roleKey);
     }
+  }
+
+  /** Eligibility belongs to each connection's credential, including while it is shadowed. */
+  #eligibleConnection(peer: LivePeer): boolean {
+    const identity = peer.authenticate();
+    return identity.allowed && this.#isCurrentHolder(peer.binding, identity.value);
   }
 
   /** Pure eligibility lookup; admission owns stale-slot cleanup. connected() is a stored snapshot. */
@@ -985,11 +1001,12 @@ export class RoleConversationPort {
     const validated = this.#validateEndpointPath(endpoint);
     if (!validated.allowed) return validated as Decision<readonly string[]>;
 
-    // Unique across live slots. Two connections naming one path would make a wake for either role
-    // arrive at whichever process actually holds the bind, so the second one is refused rather
-    // than quietly aliased onto the first.
-    for (const [roleKey, peer] of this.#live) {
-      if (peer.server !== server && peer.endpoint === validated.value && this.currentHolderConnected(roleKey)) {
+    // Retained eligible connections reserve their endpoints too: fallback must not restore a
+    // path another role acquired while its original connection was shadowed. One server may
+    // legitimately register the same endpoint for all of the roles it holds.
+    for (const [roleKey, connections] of this.#connections) {
+      if ([...connections].some((peer) => peer.server !== server && peer.endpoint === validated.value &&
+          this.#eligibleConnection(peer))) {
         return deny(
           ReasonCode.ROLE_PEER_UNSUPPORTED,
           "another live peer of this role already registered that wake endpoint",
