@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -781,6 +781,47 @@ exec /bin/ps "$@"
       evidence: {
         duplicateRoles: [{ repositoryRole: "primary", identities: [repository.identity] }],
       },
+    });
+  });
+
+  sandboxIt("a pinned Node can set its title under a denied state root without reading sibling secrets", async () => {
+    const stateRoot = tempDir("acp-pinned-node-");
+    const runtimeBin = join(stateRoot, "runtime", "bin");
+    mkdirSync(runtimeBin, { recursive: true });
+    const pinnedNode = join(runtimeBin, "node");
+    // Reuse the interpreter inode; do not mint a new executable on each test run.
+    linkSync(process.execPath, pinnedNode);
+    const secrets = [join(stateRoot, "fixture-secret"), join(runtimeBin, "sibling-secret")];
+    for (const secret of secrets) writeFileSync(secret, "must remain unreadable\n");
+    const repository = makeRepo();
+    writeFileSync(join(repository, "verify.js"), `
+      process.title = 'acp-pinned-title';
+      const fs = require('node:fs');
+      for (const secret of ${JSON.stringify(secrets)}) {
+        try { fs.readFileSync(secret); process.exit(41); }
+        catch (error) { if (!['EPERM', 'EACCES'].includes(error.code)) throw error; }
+      }
+      console.log('TITLE_OK_SECRETS_DENIED');
+    `);
+    const descriptor = Object.getOwnPropertyDescriptor(process, "execPath")!;
+    let outcome;
+    try {
+      Object.defineProperty(process, "execPath", { ...descriptor, value: pinnedNode });
+      outcome = await runSandboxed({
+        command: parseVerificationCommand({
+          id: "pinned-title",
+          argv: [pinnedNode, "verify.js"],
+        }),
+        worktreePath: repository,
+        denyReadPaths: [stateRoot],
+      });
+    } finally {
+      Object.defineProperty(process, "execPath", descriptor);
+    }
+    expect(outcome).toMatchObject({
+      status: "PASS", exitCode: 0, signal: null,
+      stdout: "TITLE_OK_SECRETS_DENIED\n",
+      enforcement: { networkEnforced: true, writeConfinement: true, resourceLimitsEnforced: true, childContainmentEnforced: true },
     });
   });
 
