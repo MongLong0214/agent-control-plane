@@ -77,7 +77,7 @@ const sameBinding = (a: PlanBinding, b: PlanBinding) =>
   Object.entries(bindingOf(a)).every(([key, value]) => b[key as keyof PlanBinding] === value);
 
 /** CEO admission is separate from this check of the run's current owner and lifecycle. */
-const currentRun = (source: Source, runId: string): Decision<RunRow> => {
+export const currentBootstrapInputRun = (source: Source, runId: string): Decision<RunRow> => {
   const run = source.runs.get(runId);
   if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run");
   if (run.kind !== RunKind.PROJECT_BOOTSTRAP) return deny(ReasonCode.INVALID_ARGUMENT, "PLAN input requires a PROJECT_BOOTSTRAP run");
@@ -125,7 +125,7 @@ interface PlanCandidate extends PlanBinding {
 }
 /** Both input subtypes share HANDOFF storage but are never activation handoff packages. */
 export const isBootstrapPlanInputArtifact = (content: unknown): boolean => isBootstrapPlanAttachment(content)
-  || (typeof content === "object" && content !== null && "schema" in content && content.schema === BOOTSTRAP_PLAN_CANDIDATE_SCHEMA);
+  || (typeof content === "object" && content !== null && "schema" in content && (content.schema === BOOTSTRAP_PLAN_CANDIDATE_SCHEMA || content.schema === "acp.bootstrap-review-evidence-candidate.v1" || content.schema === "acp.bootstrap-review-evidence-attached.v1" || content.schema === "acp.bootstrap-review-context.v1"));
 const candidatesOf = (source: Source, runId: string, stagedBy: string) => source.artifacts.list<PlanCandidate>(runId, ArtifactKind.HANDOFF)
   .filter(a => a.content?.schema === BOOTSTRAP_PLAN_CANDIDATE_SCHEMA && a.content.stagedBy === stagedBy);
 const selectedStager = (stagedBy: string | undefined): Decision<string> => {
@@ -175,13 +175,8 @@ const readCandidate = (source: Source, run: RunRow, input: PlanBinding & { expec
 };
 
 type StageSource = AttachSource & { sessions: Pick<SessionRegistry, "get"> };
-/**
- * No provenance links a PRIMARY_CTO to a project-less bootstrap run. This is a non-authoritative
- * upload of immutable candidates, with at most one unattached candidate per stager. Only CEO attach selects run input;
- * neither the stager's generation nor the run's owner pin is part of the candidate's identity.
- */
-export const bootstrapPlanStageAccess = (source: StageSource, peer: AuthenticatedMcpPeer, input: BootstrapPlanStageInput)
-  : Decision<{ run: RunRow; primary: RoleBinding; bytes: Buffer }> => {
+/** Shared current PRIMARY_CTO admission for the two bounded bootstrap uploads. */
+export const bootstrapStagingIdentity = (source: StageSource, peer: AuthenticatedMcpPeer): Decision<RoleBinding> => {
   const session = peer.sessionId ? source.sessions.get(peer.sessionId) : null;
   if (!peer.sessionId || !peer.sessionIncarnation || session?.incarnation !== peer.sessionIncarnation || session.lifecycle !== SessionLifecycle.READY) {
     return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "staging requires a current PRIMARY_CTO session");
@@ -196,6 +191,19 @@ export const bootstrapPlanStageAccess = (source: StageSource, peer: Authenticate
       || primary.bindingGeneration !== peer.binding.bindingGeneration) {
     return deny(ReasonCode.BINDING_GENERATION_STALE, "staging requires the project's current PRIMARY_CTO binding");
   }
+  return allow(ReasonCode.OK, primary);
+};
+
+/**
+ * No provenance links a PRIMARY_CTO to a project-less bootstrap run. This is a non-authoritative
+ * upload of immutable candidates, with at most one unattached candidate per stager. Only CEO attach selects run input;
+ * neither the stager's generation nor the run's owner pin is part of the candidate's identity.
+ */
+export const bootstrapPlanStageAccess = (source: StageSource, peer: AuthenticatedMcpPeer, input: BootstrapPlanStageInput)
+  : Decision<{ run: RunRow; primary: RoleBinding; bytes: Buffer }> => {
+  const identity = bootstrapStagingIdentity(source, peer);
+  if (!identity.allowed) return identity;
+  const primary = identity.value;
   const stager = selectedStager(primary.roleKey);
   if (!stager.allowed) return stager;
   const identifiers = validIdentifiers(input);
@@ -207,7 +215,7 @@ export const bootstrapPlanStageAccess = (source: StageSource, peer: Authenticate
   }
   const digests = validateBootstrapPlanDigests({ contractDigest: input.contractDigest, expectedSha256: input.expectedSha256 });
   if (!digests.allowed) return digests;
-  const current = currentRun(source, input.runId);
+  const current = currentBootstrapInputRun(source, input.runId);
   if (!current.allowed) return current;
   const run = current.value;
   if (run.projectId !== null || !run.ownerSessionId || run.ownerRoleKey !== roleKeyFor(Role.BOOTSTRAP_CTO, { runId: run.runId })) {
@@ -272,7 +280,7 @@ export const stageBootstrapPlan = (source: StageSource, peer: AuthenticatedMcpPe
 
 /** Decoding never reserializes JSON: read returns the very UTF-8 bytes attach hashed. */
 export const readBootstrapPlanAttachment = (source: Source, runId: string): Decision<{ digest: string; planBody: string }> => {
-  const run = currentRun(source, runId);
+  const run = currentBootstrapInputRun(source, runId);
   if (!run.allowed) return run;
   const artifact = attachmentOf(source, runId);
   if (!artifact) return hasAttachmentReceipt(source, runId)
@@ -291,7 +299,7 @@ export const readBootstrapPlanAttachment = (source: Source, runId: string): Deci
 
 /** Runs inside MCP authority evaluation too, so a cached success cannot skip current checks. */
 export const bootstrapPlanAttachAccess = (source: AttachSource, input: BootstrapPlanAttachInput): Decision<RunRow> => {
-  const run = currentRun(source, input.runId);
+  const run = currentBootstrapInputRun(source, input.runId);
   if (!run.allowed) return run;
   const frozen = source.bootstrapApplications.assertNotFrozen(input.runId, "plan_submit");
   if (!frozen.allowed) return frozen;

@@ -149,6 +149,8 @@ export const prepareBootstrapRun = async (
      * binds it, and the PLAN stored as an artifact rather than through `plan_submit`; then reviewed.
      */
     legacyTask?: boolean;
+    /** Submit by a real CEO-selected PLAN attachment rather than the inline compatibility path. */
+    attachedPlan?: boolean;
     /** #246 B3 — the runner's CommitLore port; omitted, the runner has none. */
     commitlore?: CommitLorePort | null;
     /** S10 — the human-gate items the run's contract declares; omitted, it declares none. */
@@ -168,7 +170,7 @@ export const prepareBootstrapRun = async (
   if (options.earlierPlan !== undefined) await submitBootstrapPlan(harness, runId, options.earlierPlan);
   const reviewed = options.legacyTask === true
     ? await reviewLegacyBootstrapPlan(harness, runId, plan)
-    : await reviewBootstrapPlan(harness, runId, plannable ? plan : bootstrapPlan(cleanTreeManifest(projectId)));
+    : await reviewBootstrapPlan(harness, runId, plannable ? plan : bootstrapPlan(cleanTreeManifest(projectId)), options.attachedPlan);
   const planArtifact = plannable ? { digest: reviewed.planDigest } : harness.cp.artifacts.put(runId, "PLAN", plan);
 
   const workRoot = tempDir("acp-246-runner-");

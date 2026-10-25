@@ -8,6 +8,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import * as planModule from "../../src/bootstrap/bootstrap-plan.ts";
 import { bootstrapActivationHandoff } from "../../src/bootstrap/bootstrap-plan.ts";
+import { isBootstrapPlanInputArtifact, isBootstrapPlanAttachment } from "../../src/bootstrap/bootstrap-plan-artifact.ts";
 import type { RepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
 import { allow } from "../../src/core/errors.ts";
 import { manifestDigest, type ProjectManifest } from "../../src/contracts/manifest.ts";
@@ -44,7 +45,7 @@ const manifestFor = (projectId: string): ProjectManifest => {
 };
 
 /** As production delivers it: the PLAN-time package, its repository facts not yet observed. */
-const prepare = async (projectId: string, options: { legacyTask?: boolean } = {}) => {
+const prepare = async (projectId: string, options: { legacyTask?: boolean; attachedPlan?: boolean } = {}) => {
   const manifest = manifestFor(projectId);
   const prepared = await prepareBootstrapRun(projectId, { ops: createOnlyOperations(), manifest, ...options });
   return { ...prepared, input: { ...prepared.input, handoff: bootstrapActivationHandoff(manifest), ownerApproval: ownerApprovalFor(prepared) } };
@@ -331,40 +332,91 @@ describe("BCG-R1-01: a persisted handoff without the observed facts", () => {
  */
 describe("BCG-R1-02: the delivered head is bound to the required verification and the create's readback", () => {
   /** A factory result altered at activation's input boundary, the receipts and ledger left as they are. */
-  const alterAtActivation = (prepared: PreparedBootstrapRun, alter: (result: RepoFactoryResult, checkoutPath: string) => Promise<RepoFactoryResult>) => {
+  const alterAtActivation = (prepared: PreparedBootstrapRun, alter: (result: RepoFactoryResult, checkoutPath: string) => Promise<RepoFactoryResult>, afterActivation?: () => void) => {
     const bootstrap = prepared.harness.cp.bootstrap;
     const activate = bootstrap.activate.bind(bootstrap);
-    vi.spyOn(bootstrap, "activate").mockImplementation(async (input) =>
-      activate({ ...input, factoryResult: await alter(input.factoryResult as RepoFactoryResult, input.localBindings[0]!.checkoutPath) }),
-    );
+    vi.spyOn(bootstrap, "activate").mockImplementation(async (input) => {
+      const result = await activate({ ...input, factoryResult: await alter(input.factoryResult as RepoFactoryResult, input.localBindings[0]!.checkoutPath) });
+      afterActivation?.();
+      return result;
+    });
   };
 
   const noHandoff = (prepared: PreparedBootstrapRun) => {
-    expect(prepared.harness.cp.artifacts.latest(prepared.runId, "HANDOFF")).toBeNull();
+    // PLAN inputs and #1204's private review context already exist before activation; they
+    // share HANDOFF storage but are not activation packages. Keep the absence assertion on
+    // every other artifact, including malformed packages, rather than only a delivered message.
+    expect(prepared.harness.cp.artifacts.list(prepared.runId, "HANDOFF")
+      .filter(a => !isBootstrapPlanInputArtifact(a.content)).at(-1) ?? null).toBeNull();
     expect(prepared.harness.cp.db.all(`SELECT handoff_id FROM handoffs WHERE project_id = ?`, [prepared.manifest.projectId])).toEqual([]);
+    expect(prepared.harness.cp.outbox.listByRun(prepared.runId).filter(m => m.kind === "HANDOFF_PACKAGE")).toEqual([]);
+    expect(auditsOf(prepared, "HANDOFF_SUBMITTED")).toEqual([]);
+    expect(prepared.harness.cp.projects.get(prepared.manifest.projectId)).toBeNull();
+    expect(prepared.harness.cp.repositories.list().filter(r => r.projectId === prepared.manifest.projectId)).toEqual([]);
+    expect(prepared.harness.cp.bindings.activePrimaryCto(prepared.manifest.projectId)).toBeNull();
   };
 
-  for (const [name, row] of [
-    ["an all-zero head under another command, prepended", (head: string) => [{ commandId: "unrelated-command", head: "0".repeat(40) }, { commandId: "clean-tree", head }]],
-    ["a second well-formed head under the required command", (head: string) => [{ commandId: "clean-tree", head }, { commandId: "clean-tree", head: "0123456789abcdef0123456789abcdef01234567" }]],
-  ] as const) {
-    it(`conflicting verification rows (${name}) are refused at activation: no handoff is delivered and CONFIRM completes nothing`, async () => {
-      const prepared = await prepare(`bcg-r1-rows-${name.split(" ")[1]}`);
-      alterAtActivation(prepared, async (result) => ({
-        ...result,
-        bootstrapVerification: row(result.bootstrapVerification[0]!.exactHead).map(({ commandId, head }) => ({
-          commandId,
-          repositoryIdentity: IDENTITY,
-          exactHead: head,
-          status: "PASS" as const,
-        })),
-      }));
-      const refused = await prepared.runner.produceAndActivate(prepared.input);
-      expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.HANDOFF_PACKAGE_INCOMPLETE, evidence: { refusal: "RESULT_FACTS_UNBOUND" } });
-      noHandoff(prepared);
-      expect(confirm(prepared)).toMatchObject({ allowed: false });
-      nothingCompleted(prepared);
-    });
+  for (const attachedPlan of [false, true]) {
+    for (const [name, row] of [
+      ["an all-zero head under another command, prepended", (head: string) => [{ commandId: "unrelated-command", head: "0".repeat(40) }, { commandId: "clean-tree", head }]],
+      ["a second well-formed head under the required command", (head: string) => [{ commandId: "clean-tree", head }, { commandId: "clean-tree", head: "0123456789abcdef0123456789abcdef01234567" }]],
+    ] as const) {
+      it(`conflicting verification rows (${name}) are refused at activation: no handoff is delivered and CONFIRM completes nothing${attachedPlan ? " (attached PLAN)" : ""}`, async () => {
+        const prepared = await prepare(`bcg-r1-rows-${name.split(" ")[1]}`, { attachedPlan });
+        const { cp } = prepared.harness;
+        const preservedInputs = () => ({
+          run: cp.runs.require(prepared.runId),
+          plan: cp.artifacts.latest(prepared.runId, "PLAN"),
+          attachments: cp.artifacts.list(prepared.runId, "HANDOFF"),
+          currentAttachment: cp.artifacts.list(prepared.runId, "HANDOFF").find(a => !a.superseded && isBootstrapPlanAttachment(a.content)),
+        });
+        const before = preservedInputs();
+        expect(before.currentAttachment !== undefined).toBe(attachedPlan);
+        const activationEffects = () => ({
+          ...preservedInputs(), artifacts: cp.artifacts.list(prepared.runId),
+          application: cp.bootstrapApplications.get(prepared.runId),
+          audit: cp.audit.forRun(prepared.runId), outbox: cp.outbox.listByRun(prepared.runId),
+        });
+        let atActivation: ReturnType<typeof activationEffects> | undefined;
+        alterAtActivation(prepared, async (result) => {
+          // Production may persist its result before activation. The conflicting-row refusal
+          // itself must add no artifact or other run effect, just as on main.
+          atActivation = activationEffects();
+          return { ...result, bootstrapVerification: row(result.bootstrapVerification[0]!.exactHead).map(({ commandId, head }) => ({
+            commandId, repositoryIdentity: IDENTITY, exactHead: head, status: "PASS" as const,
+          })) };
+        }, () => {
+          expect(atActivation).toBeDefined();
+          expect(activationEffects()).toEqual(atActivation);
+        });
+        const refused = await prepared.runner.produceAndActivate(prepared.input);
+        expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.HANDOFF_PACKAGE_INCOMPLETE, evidence: { refusal: "RESULT_FACTS_UNBOUND" } });
+        // The runner records the refusal after activation returns; it never completes the application.
+        expect(cp.bootstrapApplications.get(prepared.runId)).toMatchObject({ phase: "WRITTEN",
+          lastRefusal: { stage: "activation", evidence: { refusal: "RESULT_FACTS_UNBOUND" } } });
+        noHandoff(prepared);
+        expect(preservedInputs()).toEqual(before);
+        expect(confirm(prepared)).toMatchObject({ allowed: false });
+        nothingCompleted(prepared);
+        expect(preservedInputs()).toEqual(before);
+
+        // A refusal leaves the selected inputs retryable and creates no second repository.
+        expect(await prepared.runner.produceAndActivate(prepared.input)).toMatchObject({
+          allowed: false, reasonCode: ReasonCode.HANDOFF_PACKAGE_INCOMPLETE, evidence: { refusal: "RESULT_FACTS_UNBOUND" },
+        });
+        noHandoff(prepared);
+        expect(preservedInputs()).toEqual(before);
+        nothingCompleted(prepared);
+        vi.restoreAllMocks();
+        await ackAndActivate(prepared, await produce(prepared));
+        expect(confirm(prepared)).toMatchObject({ allowed: true, value: { state: RunState.COMPLETED } });
+        expect(cp.artifacts.latest(prepared.runId, "PLAN")).toEqual(before.plan);
+        for (const attachment of before.attachments) {
+          expect(cp.artifacts.list(prepared.runId, "HANDOFF")).toContainEqual(attachment);
+        }
+        expect(prepared.github.createRequests).toHaveLength(1);
+      });
+    }
   }
 
   it("a well-formed head that is not the create's readback (the checkout moved to it, one coherent row): ACKed, then refused at completion with nothing completed", async () => {

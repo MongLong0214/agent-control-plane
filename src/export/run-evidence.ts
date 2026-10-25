@@ -734,7 +734,11 @@ const exportArtifacts = (artifacts: readonly StoredArtifact[]): RunEvidenceExpor
       createdAt: artifact.createdAt,
       superseded: artifact.superseded,
     };
-    const reason = exclusionReason(artifact.content, {
+    // Older PLANs copied private review originals inline. Keep their certified bytes intact
+    // and omit the whole content; new PLANs carry only a private-artifact reference.
+    const legacyReviewBundle = artifact.kind === "PLAN"
+      && asRecord(asRecord(artifact.content)?.["reviewEvidence"])?.["bundle"] !== undefined;
+    const reason = legacyReviewBundle ? "PRIVATE_BULK_CONTENT" : exclusionReason(artifact.content, {
       required: !NON_EXPORTABLE_ARTIFACT_CONTENT.has(artifact.kind),
     });
     if (reason) {

@@ -1,3 +1,4 @@
+import { attachBootstrapReviewEvidence, reviewEvidenceAttachAccess, reviewEvidenceAttachAuthority, type ReviewEvidenceInput } from "../bootstrap/bootstrap-review-evidence.ts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
@@ -122,6 +123,11 @@ export const createHermesMcpPort = (
     resumeBootstrapReview: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: BootstrapReviewResumeInput, fingerprint: string) =>
       resumeBootstrapReview(source, peer, turn, input, fingerprint),
     bootstrapReviewResumeAccess: (input: BootstrapReviewResumeInput) => bootstrapReviewResumeAccess(source, input),
+    attachBootstrapReviewEvidence: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: ReviewEvidenceInput) =>
+      attachBootstrapReviewEvidence(source, peer, turn, input),
+    reviewEvidenceAttachAccess: (input: ReviewEvidenceInput) => reviewEvidenceAttachAccess(source, input),
+    reviewEvidenceAttachAuthority: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined) =>
+      reviewEvidenceAttachAuthority(source, peer, turn),
     attachBootstrapPlan: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: BootstrapPlanAttachInput) =>
       attachBootstrapPlan(source, peer, turn, input),
     bootstrapPlanAttachAuthority: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined) =>
@@ -375,9 +381,15 @@ const createHermesServerFromPort = (
       authority: () => {
         const current = authenticateMcpPeer(authenticate);
         const authority = current.allowed ? port.peerAuthority(peer.value) : current;
-        if (!authority.allowed || (toolName !== "bootstrap_plan_attach" && toolName !== "bootstrap_review_resume")) return authority;
+        if (!authority.allowed || (toolName !== "bootstrap_plan_attach" && toolName !== "bootstrap_review_resume" && toolName !== "bootstrap_review_evidence_attach")) return authority;
         const identity = port.bootstrapPlanAttachAuthority(peer.value, admittedTurnOf(extra));
         if (!identity.allowed) return identity;
+        if (toolName === "bootstrap_review_evidence_attach") {
+          const ceo = port.reviewEvidenceAttachAuthority(peer.value, admittedTurnOf(extra));
+          if (!ceo.allowed) return ceo;
+          const access = port.reviewEvidenceAttachAccess(args as unknown as ReviewEvidenceInput);
+          return access.allowed ? authority : access;
+        }
         if (toolName === "bootstrap_review_resume") {
           const access = port.bootstrapReviewResumeAccess(args as unknown as BootstrapReviewResumeInput);
           return access.allowed ? authority : access;
@@ -422,6 +434,15 @@ const createHermesServerFromPort = (
       if (!peer.allowed) return respond(peer);
       const replay = port.replayBootstrapReviewResume(peer.value, args, fingerprint);
       return replay ? respond(replay) : null;
+    }),
+  );
+  server.registerTool(
+    "bootstrap_review_evidence_attach",
+    { description: "Attach the PRIMARY_CTO's private review evidence bundle by exact run/contract/current bootstrapPlanDigest/stager/digest. Current authenticated CEO owner or peer only. Attachment attributes labelled material; it is not independent verification, a PASS or execution approval. The next PLAN submission freezes it for review.",
+      inputSchema: { ...mutation, runId: z.string(), contractDigest: z.string(), bootstrapPlanDigest: z.string(), stagedBy: z.string(), expectedSha256: z.string(), replacesSha256: z.string().optional() } },
+    async (args, extra) => write("bootstrap_review_evidence_attach", args, extra, () => {
+      const peer = authenticateMcpPeer(authenticate);
+      return peer.allowed ? respond(port.attachBootstrapReviewEvidence(peer.value, admittedTurnOf(extra), args)) : respond(peer);
     }),
   );
   server.registerTool(

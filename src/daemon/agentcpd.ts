@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { recordBootstrapServingRuntime } from "../bootstrap/bootstrap-runtime-observation.ts";
 import { readBuzzSubscriberConfig } from '../buzz/buzz-mention-subscriber.ts';
 import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
 import { outboxDeliveryReadback, type OutboxMessage } from "../outbox/outbox.ts";
@@ -5333,6 +5334,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   const telegramExternalConfig = configuredTelegramExternalConsumerConfig(config.ownerIdentities ?? []);
   const telegramConfig = configuredTelegramLongPollConfig(config.ownerIdentities ?? []);
   const cp = new ControlPlane(config);
+  cp.review.attach({ servingRuntimeEventId: recordBootstrapServingRuntime(cp.audit, import.meta.url) });
 
   // A migration that ran did so because someone approved it, and the approval names them.
   // `schema_migrations` records what changed; this records who decided it should (#738).

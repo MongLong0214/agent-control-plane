@@ -447,7 +447,7 @@ export const plannedBootstrapOutputs = (
     // every authenticated handoff, without guessing which language or wording describes the split.
     // An empty issue set creates no work; queuedWork's existing reader contract stays unchanged.
     const issues = executable.genesis?.issues.map(issue => ({repository:shape.value.repositoryIdentity,key:issue.key,title:issue.title,acceptance:issue.body})) ?? [];
-    handoff.recommendedNextAction = "acknowledge this handoff; look up existing runs first and never create duplicates. As resident CTO, create one follow-on STANDARD_WORK run per seeded issue and verify each issue's acceptance there, covering ALL seeded issues: " + JSON.stringify(issues);
+    handoff.recommendedNextAction = "acknowledge this handoff. As resident CTO, inspect existing runs and dependencies first and never create duplicates; reuse or create appropriate follow-on STANDARD_WORK runs assigned by independent rollback responsibility. Preserve responsibility for EVERY seeded issue's acceptance; group issues into rollback-able runs where appropriate; never create runs mechanically one per issue. Explicitly track and verify each issue's acceptance, covering ALL seeded issues: " + JSON.stringify(issues);
   }
   return allow(ReasonCode.OK, {
     schema: BOOTSTRAP_PLANNED_OUTPUTS_SCHEMA_ID,

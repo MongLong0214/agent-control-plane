@@ -2,8 +2,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { bootstrapPlanCoverageTargets, currentBootstrapPlan } from "../../src/bootstrap/bootstrap-plan.ts";
+import { attachBootstrapPlan } from "../../src/bootstrap/bootstrap-plan-artifact.ts";
 import { allow } from "../../src/core/errors.ts";
-import { digestOf } from "../../src/core/digest.ts";
+import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { manifestDigest, type ProjectManifest } from "../../src/contracts/manifest.ts";
 import { Role, roleKeyFor } from "../../src/domain/types.ts";
@@ -130,13 +131,26 @@ export const callCtoToolAsOwner = async (
 let planSequence = 0;
 
 /** `plan_submit` as the run's bootstrap CTO, with one task; throws unless it is accepted. */
-export const submitBootstrapPlan = async (harness: Harness, runId: string, plan: Record<string, unknown>): Promise<string> => {
+export const submitBootstrapPlan = async (harness: Harness, runId: string, plan: Record<string, unknown>, attachPlan = false): Promise<string> => {
   planSequence += 1;
+  const tasks = [{ key: `bootstrap-${planSequence}`, title: `bootstrap the repository (${planSequence})`, category: "implementation" }];
+  let bootstrapPlanDigest: string | undefined;
+  if (attachPlan) {
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    const manifest = plan["projectManifest"] as ProjectManifest;
+    const planBody = JSON.stringify({ runId, plan, tasks });
+    bootstrapPlanDigest = sha256(planBody);
+    const attached = attachBootstrapPlan(harness.cp, { actor: ceo.sessionId, sessionId: ceo.sessionId,
+      sessionIncarnation: ceo.sessionIncarnation }, { principal: "owner", peerGrant: null }, {
+      runId, contractDigest: harness.cp.runs.require(runId).contractDigest!, bootstrapOperationId: plan["bootstrapOperationId"] as string,
+      projectId: manifest.projectId, repositoryIdentity: BOOTSTRAP_IDENTITY, planBody, expectedSha256: bootstrapPlanDigest,
+    });
+    if (!attached.allowed) throw new Error(`bootstrap_plan_attach refused: ${attached.message}`);
+  }
   const submitted = await callCtoToolAsOwner(harness, runId, "plan_submit", {
     idempotencyKey: `bootstrap-plan-${runId}-${planSequence}`,
     runId,
-    plan,
-    tasks: [{ key: `bootstrap-${planSequence}`, title: `bootstrap the repository (${planSequence})`, category: "implementation" }],
+    ...(bootstrapPlanDigest ? { bootstrapPlanDigest } : { plan, tasks }),
   });
   if (submitted.isError || submitted.body["ok"] !== true) throw new Error(`plan_submit refused: ${submitted.text}`);
   const stored = harness.cp.artifacts.latest(runId, "PLAN");
@@ -166,10 +180,11 @@ export const reviewBootstrapPlan = async (
   harness: Harness,
   runId: string,
   plan: Record<string, unknown>,
+  attachPlan = false,
 ): Promise<ReviewedBootstrapPlan> => {
   const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO));
   const ceoSessionId = ceo?.sessionId ?? bindCeo(harness);
-  const planDigest = await submitBootstrapPlan(harness, runId, plan);
+  const planDigest = await submitBootstrapPlan(harness, runId, plan, attachPlan);
   harness.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(harness, runId)) });
   const run = harness.cp.runs.require(runId);
   const outcome = await harness.cp.pipeline.submitResult({

@@ -1120,9 +1120,9 @@ export class BootstrapActivation {
   private observedHandoffFacts(handoffId: string, handoff: Partial<HandoffPackage>): Decision<void> {
     const owner = this.db.get<{ run_id: string }>(
       `SELECT run_id FROM run_artifacts WHERE kind = ? AND superseded = 0 AND json_extract(content_json, '$.handoffId') = ?
-        AND COALESCE(json_extract(content_json, '$.schema'), '') NOT IN (?, ?)
+        AND COALESCE(json_extract(content_json, '$.schema'), '') NOT IN (?, ?, ?, ?, ?)
         ORDER BY created_at DESC, rowid DESC LIMIT 1`,
-      [ArtifactKind.HANDOFF, handoffId, BOOTSTRAP_PLAN_INPUT_SCHEMA, BOOTSTRAP_PLAN_CANDIDATE_SCHEMA],
+      [ArtifactKind.HANDOFF, handoffId, BOOTSTRAP_PLAN_INPUT_SCHEMA, BOOTSTRAP_PLAN_CANDIDATE_SCHEMA, "acp.bootstrap-review-evidence-candidate.v1", "acp.bootstrap-review-evidence-attached.v1", "acp.bootstrap-review-context.v1"],
     );
     return this.handoffFactsObserved(owner?.run_id ?? null, handoffId, handoff);
   }

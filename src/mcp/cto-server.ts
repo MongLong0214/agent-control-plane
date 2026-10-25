@@ -1,3 +1,4 @@
+import { collectBootstrapReviewEvidence, reviewEvidenceStageAccess, stageBootstrapReviewEvidence, type ReviewEvidenceStageInput } from "../bootstrap/bootstrap-review-evidence.ts";
 import { collectBootstrapCeoDecisions } from "../bootstrap/bootstrap-ceo-decisions.ts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -212,6 +213,11 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       return checked.allowed ? allow(ReasonCode.OK, { roleKey: checked.value.primary.roleKey,
         bindingGeneration: checked.value.primary.bindingGeneration }) : checked;
     },
+    reviewEvidenceStageAuthority: (peer: AuthenticatedMcpPeer, input: ReviewEvidenceStageInput) => {
+      const checked = reviewEvidenceStageAccess(source, peer, input);
+      return checked.allowed ? allow(ReasonCode.OK, { roleKey: checked.value.roleKey, bindingGeneration: checked.value.bindingGeneration }) : checked;
+    },
+    stageBootstrapReviewEvidence: (peer: AuthenticatedMcpPeer, input: ReviewEvidenceStageInput) => stageBootstrapReviewEvidence(source, peer, input),
     stageBootstrapPlan: (peer: AuthenticatedMcpPeer, input: BootstrapPlanStageInput) => stageBootstrapPlan(source, peer, input),
     bootstrapPlanForRun: (runId: string) => readBootstrapPlanAttachment(source, runId),
     resolvePlanInput: (runId: string, input: { bootstrapPlanDigest?: string; plan?: Record<string, unknown>; tasks?: z.infer<typeof submittedTasksSchema> }) =>
@@ -233,6 +239,11 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       if (!admitted.allowed) return admitted as Decision<{ digest: string }>;
       // The authority field is ACP-owned. Never retain a producer's claim, even with no CEO replies.
       if (isProjectlessBootstrap(run)) {
+        delete admitted.value["reviewEvidence"];
+        try {
+          const evidence = collectBootstrapReviewEvidence(source, runId);
+          if (evidence) admitted.value["reviewEvidence"] = evidence;
+        } catch { return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "attached review evidence cannot be frozen"); }
         delete admitted.value["authenticatedCeoDecisions"];
         const decisions = collectBootstrapCeoDecisions(source.db, runId);
         if (decisions.length > 0) admitted.value["authenticatedCeoDecisions"] = decisions;
@@ -557,6 +568,13 @@ const createCtoServerFromPort = (
       const fenced = owner(peer, args.runId);
       return fenced.allowed ? ok(port.contractForRun(args.runId)) : respond(fenced);
     }),
+  );
+  server.registerTool(
+    "bootstrap_review_evidence_stage",
+    { description: "Stage one immutable private review evidence bundle (files, path/sha256/origin/grade manifest and explicit missing items) within the existing 128 KiB UTF-8 staging limit. Current PRIMARY_CTO only. Binds this run, contract and current bootstrapPlanDigest; CEO must select this exact attachment/stager/digest. No verification or approval. No automatic summaries, split uploads or external file references.",
+      inputSchema: { ...mutation, ...runIdentity, contractDigest: z.string(), bootstrapPlanDigest: z.string(), evidenceBody: z.string(), expectedSha256: z.string() } },
+    async args => write("bootstrap_review_evidence_stage", args, peer => respond(port.stageBootstrapReviewEvidence(peer, args)),
+      peer => port.reviewEvidenceStageAuthority(peer, args)),
   );
   server.registerTool(
     "bootstrap_plan_stage",
