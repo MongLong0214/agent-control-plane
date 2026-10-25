@@ -269,14 +269,22 @@ try {
       // Also the fleet watcher's recovery path after a CTO dies: it relaunches over unfinished work.
       const observedCheckout = checkout(checkoutRequirement);
       run(join(home,'.claude','scripts','claude-trust-dir.sh'),[a.clonePath]);
+      const runtimeNode = join(state,'current','dist','bin','node');
+      const runtimeCli = join(state,'current','dist','cli','agentctl.js');
+      const runtimeUnavailable = 'agentctl runtime unavailable in ensure-resident';
+      try {
+        check(statSync(runtimeNode).isFile() && statSync(runtimeCli).isFile(),runtimeUnavailable);
+        accessSync(runtimeNode,constants.X_OK);
+      } catch {throw new ProvisionerRefusal(runtimeUnavailable);}
       const escaped = value => value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-      const mcpMatches = text => text.includes('acp-cto') && text.includes('agentctl') && /\battach\s+resident-cto\b/.test(text)
+      const mcpMatches = text => text.includes('acp-cto')
+        && new RegExp(`(?:^|\\s)${escaped(runtimeNode)}\\s+(?:Args:\\s+)?${escaped(runtimeCli)}\\s+attach\\s+resident-cto(?:\\s|$)`).test(text)
         && new RegExp(`--claimed-session-id\\s+${escaped(a.sessionUuid)}(?:\\s|$)`).test(text)
         && new RegExp(`--project-id\\s+${escaped(a.projectId)}(?:\\s|$)`).test(text);
       let currentMcp = ''; try {currentMcp = run('claude',['mcp','get','acp-cto'],{cwd:a.clonePath});} catch {}
       if (!mcpMatches(currentMcp)) {
         if (currentMcp) run('claude',['mcp','remove','--scope','local','acp-cto'],{cwd:a.clonePath});
-        run('claude',['mcp','add','--scope','local','acp-cto','--','agentctl','attach','resident-cto','--claimed-session-id',a.sessionUuid,'--project-id',a.projectId],{cwd:a.clonePath});
+        run('claude',['mcp','add','--scope','local','acp-cto','--',runtimeNode,runtimeCli,'attach','resident-cto','--claimed-session-id',a.sessionUuid,'--project-id',a.projectId],{cwd:a.clonePath});
       }
       check(mcpMatches(run('claude',['mcp','get','acp-cto'],{cwd:a.clonePath})),'MCP readback mismatch');
       atomic(join(dirname(a.bootPacket),`${a.fleetName}.resident.json`),JSON.stringify({allocation:a,packet:req.packet}));
