@@ -118,7 +118,7 @@ const mcp = (sessionId, sessionSecret) => new Promise((resolve, reject) => {
   };
   const timer = setTimeout(() => finish(null, new Error("MCP response timed out")), 30_000);
   const inspect = () => {
-    for (const line of received.split("\n")) {
+    for (const line of received.split("\n").slice(0, -1)) {
       if (!line.trim()) continue;
       try {
         const value = JSON.parse(line);

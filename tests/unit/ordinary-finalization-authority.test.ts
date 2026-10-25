@@ -154,7 +154,7 @@ const openMcp = (socketPath: string, credential: { sessionId: string; sessionSec
   });
   socket.on("error", () => undefined);
   const lines = (): Record<string, unknown>[] =>
-    buffer.split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as Record<string, unknown>);
+    buffer.split("\n").slice(0, -1).filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as Record<string, unknown>);
   const send = (line: unknown): void => {
     socket.write(`${JSON.stringify(line)}\n`);
   };
