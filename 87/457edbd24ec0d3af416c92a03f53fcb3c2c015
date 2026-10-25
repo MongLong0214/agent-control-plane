@@ -1,0 +1,3 @@
+Limit: The host has no agentctl executable on PATH or in dist/bin; resident MCP entries use the ACP current link to follow upgrades and rollbacks.
+Record-Id: r-b1a3f2f5a1a7
+Provenance: inherited df465b8a1c5e653d2b3bf1670a3e73b923e851d3
