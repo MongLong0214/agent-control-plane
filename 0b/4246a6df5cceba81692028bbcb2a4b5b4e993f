@@ -1,0 +1,3 @@
+Limit: The real Buzz CLI users get readback can return display_name and pubkey without name or profile.name.
+Record-Id: r-6a162c326a31
+Provenance: inherited f6268340c344b5a4f9d775e117f5f2ebdec8d244
