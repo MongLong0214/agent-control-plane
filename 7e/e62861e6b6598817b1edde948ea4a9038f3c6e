@@ -1,0 +1,4 @@
+Limit: a role keeps every open connection of its current binding in attachment order; when the current holder closes, the most recent still-open connection of the same binding becomes holder with its own endpoint and acceptance, and a new binding discards the older binding's connections so they are never restored
+Warn: before this fix a second attach of the same CTO session (helper or overlapping reconnect) replaced the holder and its close deleted the slot, so owner/peer messages stayed PENDING with ROLE_PEER_ABSENT while the original connection was still open (2026-10-25 incident)
+Record-Id: r-6443fd330feb
+Provenance: inherited 271892a389ea2fe4e9a462de31a1ba0fc5a3d11a
