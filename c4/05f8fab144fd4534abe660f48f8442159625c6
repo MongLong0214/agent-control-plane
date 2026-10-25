@@ -1,0 +1,3 @@
+Limit: A Node interpreter pinned inside the denied state directory needs its own executable and ancestor directory metadata readable for process.title; sibling secret contents remain denied.
+Record-Id: r-pinnednoderuntime20261025
+Provenance: inherited 1f04ddd29608f21dd215ee90f0e5ba1cb01de593
