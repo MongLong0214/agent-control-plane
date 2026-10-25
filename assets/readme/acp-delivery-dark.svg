@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="236" viewBox="0 0 960 236" role="img" aria-labelledby="t d">
+<title id="t">Delivery: outbox, wake, read, ACK, fence</title>
+<desc id="d">Five steps. Enqueue: a durable outbox row names the role key, the binding generation and the target session. Wake: a payload-free knock on the role's registered wake endpoint. Read: the woken turn reads its pending rows over its own authenticated MCP connection. ACK: role_dispatch_ack, run_ack or handoff_ack marks the row ACKED. Fence: after a failover, role-level intent is retargeted to the new binding, and traffic under the old generation is audited and dropped. Row status is one of PENDING, IN_FLIGHT, SENT, ACKED, REJECTED or EXPIRED, and a still-pending in-band row is woken again at most once per re-wake window.</desc>
+<style>
+text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif}
+.col{fill:#6e7889;font-size:12px;font-weight:700;letter-spacing:1.4px}
+.note{fill:#9aa4b5;font-size:12px}
+.cd{fill:#151b24;stroke:#2c3543;stroke-width:1.2}
+.cf{fill:#3a2016;stroke:#ff8c57;stroke-width:1.2}
+.n{font-size:12px;font-weight:700;letter-spacing:1px}
+.a{fill:#7d9bff}.v{fill:#3fcf9c}.w{fill:#ff8c57}
+.tt{fill:#e6eaf1;font-size:16px;font-weight:650}
+.ds{fill:#9aa4b5;font-size:12.5px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace;font-size:11.5px;fill:#e6eaf1}
+.ln{fill:none;stroke:#3d4859;stroke-width:1.6}
+.ah{fill:#3d4859}
+.pk{fill:#7d9bff;opacity:0;animation:hop 5s cubic-bezier(.5,0,.3,1) 1s infinite}
+.k2{animation-delay:1.5s}.k3{animation-delay:2s}.k4{animation-delay:2.5s}
+.sb{fill:#0d1117;stroke:#2c3543;stroke-width:1}
+.in{animation:rise .5s cubic-bezier(.2,.9,.2,1) backwards}
+.i2{animation-delay:.08s}.i3{animation-delay:.16s}.i4{animation-delay:.24s}.i5{animation-delay:.32s}
+@keyframes hop{0%{opacity:0;transform:translateX(-10px)}8%{opacity:1}22%{opacity:1;transform:translateX(10px)}30%,100%{opacity:0;transform:translateX(10px)}}
+@keyframes rise{from{opacity:0;transform:translateY(10px)}}
+@media (prefers-reduced-motion:reduce){.in{animation:none}.pk{display:none}}
+</style>
+<defs>
+<marker id="ar" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0 0L10 5L0 10z"/></marker>
+</defs>
+<text class="col" x="0" y="16">DELIVERY · OUTBOX → WAKE → ACK</text>
+<text class="note" x="960" y="16" text-anchor="end">src/outbox · ADR-0003</text>
+
+<g class="in"><rect class="cd" x="0" y="32" width="180" height="128" rx="12"/>
+<text class="n a" x="16" y="56">01</text><text class="tt" x="42" y="57">Enqueue</text>
+<text class="ds" x="16" y="82">A durable outbox row</text><text class="ds" x="16" y="100">names the role key,</text><text class="ds" x="16" y="118">binding generation</text><text class="ds" x="16" y="136">and target session</text></g>
+
+<g class="in i2"><rect class="cd" x="195" y="32" width="180" height="128" rx="12"/>
+<text class="n a" x="211" y="56">02</text><text class="tt" x="237" y="57">Wake</text>
+<text class="ds" x="211" y="82">A payload-free knock</text><text class="ds" x="211" y="100">on the role's registered</text><text class="ds" x="211" y="118">wake endpoint</text></g>
+
+<g class="in i3"><rect class="cd" x="390" y="32" width="180" height="128" rx="12"/>
+<text class="n a" x="406" y="56">03</text><text class="tt" x="432" y="57">Read</text>
+<text class="ds" x="406" y="82">The woken turn reads</text><text class="ds" x="406" y="100">pending rows over its</text><text class="ds" x="406" y="118">own authenticated</text><text class="ds" x="406" y="136">MCP connection</text></g>
+
+<g class="in i4"><rect class="cd" x="585" y="32" width="180" height="128" rx="12"/>
+<text class="n v" x="601" y="56">04</text><text class="tt" x="627" y="57">ACK</text>
+<text class="mono" x="601" y="82">role_dispatch_ack</text><text class="mono" x="601" y="100">run_ack · handoff_ack</text><text class="ds" x="601" y="118">marks the row ACKED</text></g>
+
+<g class="in i5"><rect class="cf" x="780" y="32" width="180" height="128" rx="12"/>
+<text class="n w" x="796" y="56">05</text><text class="tt" x="822" y="57">Fence</text>
+<text class="ds" x="796" y="82">After failover, role-level</text><text class="ds" x="796" y="100">intent is retargeted;</text><text class="ds" x="796" y="118">old-generation traffic</text><text class="ds" x="796" y="136">is audited and dropped</text></g>
+
+<path class="ln" d="M181 96H193" marker-end="url(#ar)"/><path class="ln" d="M376 96H388" marker-end="url(#ar)"/><path class="ln" d="M571 96H583" marker-end="url(#ar)"/><path class="ln" d="M766 96H778" marker-end="url(#ar)"/>
+<circle class="pk" cx="187" cy="96" r="3.5"/><circle class="pk k2" cx="382" cy="96" r="3.5"/><circle class="pk k3" cx="577" cy="96" r="3.5"/><circle class="pk k4" cx="772" cy="96" r="3.5"/>
+
+<rect class="sb" x="0" y="176" width="960" height="52" rx="10"/>
+<text class="note" x="16" y="198">row status</text>
+<text class="mono" x="98" y="198">PENDING · IN_FLIGHT · SENT · ACKED · REJECTED · EXPIRED</text>
+<text class="note" x="16" y="217">A still-pending in-band row is woken again, at most once per re-wake window. Every envelope carries the binding generation as its fence.</text>
+</svg>

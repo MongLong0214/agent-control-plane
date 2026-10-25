@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="960" height="356" viewBox="0 0 960 356" role="img" aria-labelledby="t d">
+<title id="t">8가지 하드 불변식, CP-HI-01부터 CP-HI-08까지</title>
+<desc id="d">카드 여덟 장. CP-HI-01 관리형 쓰기 가드: ACP가 소유한 매니페스트·워크트리·GitHub 쓰기는 모두 가드를 거치고, 에이전트는 배정된 워크트리와 유효한 claim 안에서만 쓴다. CP-HI-02 단일 런타임 권한: 어떤 프로젝트 행위자도 혼자서 run을 완료하거나 게이트를 게시하거나 머지할 수 없다. CP-HI-03 후보·계약 고정: 검증은 승인된 계약 다이제스트와 동결된 후보에 묶인다. CP-HI-04 독립 품질 역할: 블라인드 리뷰어는 같은 run의 생산자가 될 수 없고, CEO 역할은 따로 둔다. CP-HI-05 신뢰된 GitHub 자격 증명: 프로덕션 게이트와 프로그램 머지에 쓰는 자격 증명은 데몬만 접근할 수 있다. CP-HI-06 정확한 증거: 검증·리뷰·게이트·머지 증거는 같은 후보 스냅샷에 묶이고, 소스가 바뀌면 효력을 잃는다. CP-HI-07 위임할 수 없는 사람의 역할: 프로바이더 페일오버가 오너 권한을 만들어 내지 않는다. CP-HI-08 조용한 품질 저하 금지: 누락·만료·실패·미격리 증거는 결코 PASS로 보이지 않는다.</desc>
+<style>
+text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Apple SD Gothic Neo','Malgun Gothic','Noto Sans KR','Noto Sans CJK KR','Noto Sans',Helvetica,Arial,sans-serif}
+.h{fill:#1b2333;font-size:21px;font-weight:700;letter-spacing:-.2px}
+.hs{fill:#5a6577;font-size:14.5px}
+.tile{fill:#f6f8fb;stroke:#d9dfe8;stroke-width:1.2}
+.id{font-size:12.5px;font-weight:700;letter-spacing:1.2px}
+.tt{fill:#1b2333;font-size:15.5px;font-weight:650;letter-spacing:-.1px}
+.ds{fill:#5a6577;font-size:13.5px}
+.a{fill:#3457d5}.v{fill:#0d8f6a}.r{fill:#7a45d6}.w{fill:#c2410c}.g{fill:#a16207}
+.sa{stroke:#3457d5}.sv{stroke:#0d8f6a}.sr{stroke:#7a45d6}.sw{stroke:#c2410c}.sg{stroke:#a16207}
+.lk{fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.c{animation:rise .55s cubic-bezier(.2,.9,.2,1) backwards}
+.c1{animation-delay:.05s}.c2{animation-delay:.12s}.c3{animation-delay:.19s}.c4{animation-delay:.26s}
+.c5{animation-delay:.33s}.c6{animation-delay:.40s}.c7{animation-delay:.47s}.c8{animation-delay:.54s}
+.sh{animation:sweep 6s cubic-bezier(.6,0,.4,1) 1.4s infinite backwards}
+@keyframes rise{from{opacity:0;transform:translateY(12px)}}
+@keyframes sweep{from{transform:translateX(-220px)}35%,to{transform:translateX(1180px)}}
+@media (prefers-reduced-motion:reduce){.c{animation:none}.sh{display:none}}
+</style>
+<defs>
+<linearGradient id="shg" x1="0" x2="1"><stop offset="0" stop-color="#3457d5" stop-opacity="0"/><stop offset=".5" stop-color="#3457d5" stop-opacity=".10"/><stop offset="1" stop-color="#3457d5" stop-opacity="0"/></linearGradient>
+<clipPath id="tc">
+<rect x="0" y="62" width="228" height="134" rx="12"/><rect x="244" y="62" width="228" height="134" rx="12"/><rect x="488" y="62" width="228" height="134" rx="12"/><rect x="732" y="62" width="228" height="134" rx="12"/>
+<rect x="0" y="212" width="228" height="134" rx="12"/><rect x="244" y="212" width="228" height="134" rx="12"/><rect x="488" y="212" width="228" height="134" rx="12"/><rect x="732" y="212" width="228" height="134" rx="12"/>
+</clipPath>
+<g id="lock"><rect x="-7" y="-1" width="14" height="10" rx="2.5"/><path d="M-4-1v-3.2a4 4 0 0 1 8 0V-1"/></g>
+</defs>
+<text class="h" x="0" y="26">8가지 하드 불변식</text>
+<text class="hs" x="0" y="48">모두 타입이 있는 코드와 DB 제약으로 강제하며, 정책 엔진에 맡기지 않는다. 규범 원문은 PRD §4.</text>
+
+<g class="c c1"><rect class="tile" x="0" y="62" width="228" height="134" rx="12"/><rect class="a" x="0" y="74" width="4" height="30" rx="2"/>
+<text class="id a" x="18" y="90">CP-HI-01</text><use xlink:href="#lock" x="206" y="84" class="lk sa"/>
+<text class="tt" x="18" y="116">관리형 쓰기 가드</text>
+<text class="ds" x="18" y="139">매니페스트·워크트리·GitHub</text><text class="ds" x="18" y="157">쓰기는 모두 가드를 거치고,</text><text class="ds" x="18" y="175">에이전트는 claim 안에서만 쓴다</text></g>
+
+<g class="c c2"><rect class="tile" x="244" y="62" width="228" height="134" rx="12"/><rect class="a" x="244" y="74" width="4" height="30" rx="2"/>
+<text class="id a" x="262" y="90">CP-HI-02</text><use xlink:href="#lock" x="450" y="84" class="lk sa"/>
+<text class="tt" x="262" y="116">단일 런타임 권한</text>
+<text class="ds" x="262" y="139">어떤 프로젝트 행위자도 혼자서</text><text class="ds" x="262" y="157">run을 완료하거나 게이트를</text><text class="ds" x="262" y="175">게시하거나 머지할 수 없다</text></g>
+
+<g class="c c3"><rect class="tile" x="488" y="62" width="228" height="134" rx="12"/><rect class="v" x="488" y="74" width="4" height="30" rx="2"/>
+<text class="id v" x="506" y="90">CP-HI-03</text><use xlink:href="#lock" x="694" y="84" class="lk sv"/>
+<text class="tt" x="506" y="116">후보·계약 고정</text>
+<text class="ds" x="506" y="139">검증은 승인된 계약</text><text class="ds" x="506" y="157">다이제스트와 동결된 후보에</text><text class="ds" x="506" y="175">묶인다</text></g>
+
+<g class="c c4"><rect class="tile" x="732" y="62" width="228" height="134" rx="12"/><rect class="r" x="732" y="74" width="4" height="30" rx="2"/>
+<text class="id r" x="750" y="90">CP-HI-04</text><use xlink:href="#lock" x="938" y="84" class="lk sr"/>
+<text class="tt" x="750" y="116">독립 품질 역할</text>
+<text class="ds" x="750" y="139">블라인드 리뷰어는 같은 run의</text><text class="ds" x="750" y="157">생산자가 될 수 없고,</text><text class="ds" x="750" y="175">CEO 역할은 따로 둔다</text></g>
+
+<g class="c c5"><rect class="tile" x="0" y="212" width="228" height="134" rx="12"/><rect class="g" x="0" y="224" width="4" height="30" rx="2"/>
+<text class="id g" x="18" y="240">CP-HI-05</text><use xlink:href="#lock" x="206" y="234" class="lk sg"/>
+<text class="tt" x="18" y="266">신뢰된 GitHub 자격 증명</text>
+<text class="ds" x="18" y="289">게이트와 프로그램 머지에 쓰는</text><text class="ds" x="18" y="307">자격 증명에는 데몬만</text><text class="ds" x="18" y="325">접근할 수 있다</text></g>
+
+<g class="c c6"><rect class="tile" x="244" y="212" width="228" height="134" rx="12"/><rect class="v" x="244" y="224" width="4" height="30" rx="2"/>
+<text class="id v" x="262" y="240">CP-HI-06</text><use xlink:href="#lock" x="450" y="234" class="lk sv"/>
+<text class="tt" x="262" y="266">정확한 증거</text>
+<text class="ds" x="262" y="289">검증·리뷰·게이트·머지 증거는</text><text class="ds" x="262" y="307">한 스냅샷에 묶이고, 소스가</text><text class="ds" x="262" y="325">바뀌면 효력을 잃는다</text></g>
+
+<g class="c c7"><rect class="tile" x="488" y="212" width="228" height="134" rx="12"/><rect class="a" x="488" y="224" width="4" height="30" rx="2"/>
+<text class="id a" x="506" y="240">CP-HI-07</text><use xlink:href="#lock" x="694" y="234" class="lk sa"/>
+<text class="tt" x="506" y="266">위임할 수 없는 사람의 역할</text>
+<text class="ds" x="506" y="289">프로바이더 페일오버가</text><text class="ds" x="506" y="307">오너 권한을 만들어 내지</text><text class="ds" x="506" y="325">않는다</text></g>
+
+<g class="c c8"><rect class="tile" x="732" y="212" width="228" height="134" rx="12"/><rect class="w" x="732" y="224" width="4" height="30" rx="2"/>
+<text class="id w" x="750" y="240">CP-HI-08</text><use xlink:href="#lock" x="938" y="234" class="lk sw"/>
+<text class="tt" x="750" y="266">조용한 품질 저하 금지</text>
+<text class="ds" x="750" y="289">누락·만료·실패·미격리</text><text class="ds" x="750" y="307">증거는 결코 PASS로</text><text class="ds" x="750" y="325">보이지 않는다</text></g>
+
+<g clip-path="url(#tc)"><rect class="sh" x="0" y="62" width="200" height="284" fill="url(#shg)"/></g>
+</svg>
