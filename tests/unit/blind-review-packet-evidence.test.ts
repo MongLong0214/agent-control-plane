@@ -120,7 +120,7 @@ describe("frozen candidate packet evidence", () => {
     expect(cut.entryLimit).toBe(2000);
   });
 
-  it("includes canonical control-plane facts and pending later obligations without identities or prior verdicts; same candidate can be re-reviewed", async () => {
+  it("includes canonical control-plane facts and pending later obligations without producer identities; a re-review carries the preserved review", async () => {
     const { harness, run, task, worker, submit } = await prepare();
     try {
       harness.scripted.script({ match: /Candidate review/, text: JSON.stringify({ verdict: "REVISE",
@@ -148,10 +148,12 @@ describe("frozen candidate packet evidence", () => {
       expect(prompt).toContain("publish the candidate branch, prepare its PR and merge, then verify CI");
       expect(prompt).toContain("exact merge commit SHA");
       expect(prompt).toContain("These obligations remain pending");
-      for (const secret of [worker, run.ownerSessionId!, "scripted-worker", "private producer self-assessment", "prior-verdict-marker"]) {
+      for (const secret of [worker, run.ownerSessionId!, "scripted-worker", "private producer self-assessment"]) {
         expect(prompt).not.toContain(secret);
       }
       const latest = harness.cp.artifacts.latest<ReviewPacket>(run.runId, ArtifactKind.BLIND_REVIEW)!;
+      expect(prompt).toContain("prior-verdict-marker");
+      expect(prompt).toContain(first.digest);
       expect(latest.content.verdict).toBe("PASS");
       expect(latest.digest).not.toBe(first.digest);
       expect(latest.candidateSnapshotDigest).toBe(first.candidateSnapshotDigest);
@@ -162,7 +164,8 @@ describe("frozen candidate packet evidence", () => {
   it("does not advertise daemon merge obligations when that run kind has no daemon completion gate", async () => {
     const { laterGateSection } = await import("../../src/review/candidate-review-evidence.ts");
     const section = laterGateSection(RunKind.PROJECT_BOOTSTRAP, 1).join("\n");
-    expect(section).toContain("BLOCKER");
+    expect(section).toContain("no daemon finalization completion gate");
+    expect(section).not.toContain("BLOCKER");
     expect(section).not.toContain("candidate-bound CEO CONFIRM");
     expect(section).not.toContain("publish the candidate branch, prepare its PR and merge, then verify CI");
     expect(section).not.toContain("exact merge commit SHA");

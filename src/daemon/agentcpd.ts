@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
 import { recordBootstrapServingRuntime } from "../bootstrap/bootstrap-runtime-observation.ts";
 import { readBuzzSubscriberConfig } from '../buzz/buzz-mention-subscriber.ts';
 import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
@@ -3352,7 +3353,7 @@ const startMcpSocket = async (
           endWithDecision(socket, deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "this socket does not admit attachments"));
           return;
         }
-        const mcp = new McpServer({ name: "role-attachment", version: "1" });
+        const mcp = new McpServer({ name: "role-attachment", version: "1" }, { instructions: frontierReviewPolicy() });
         const attached = attachments.authority.connect(mcp, attachments.port, accepted.credential);
         if (!attached.allowed) {
           endWithDecision(socket, attached);

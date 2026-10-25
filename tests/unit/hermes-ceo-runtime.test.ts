@@ -1,3 +1,4 @@
+import { frontierReviewPolicy } from "../../src/review/frontier-simplify-policy.ts";
 import { afterAll, describe, expect, it } from "vitest";
 import { createHmac } from "node:crypto";
 import { createServer, type Server, type Socket } from "node:net";
@@ -245,7 +246,7 @@ describe("the tool socket Hermes reaches ACP through", () => {
     runtime.stop();
     await runtime.done;
 
-    expect(replies[0]).toMatchObject({ id: 1, result: { capabilities: { tools: {} } } });
+    expect(replies[0]).toMatchObject({ id: 1, result: { capabilities: { tools: {} }, instructions: frontierReviewPolicy() } });
     // ACP's connection was initialized once, by the runtime. Forwarding Hermes's initialize
     // would put a second handshake on a connection already past it, and the two ends would
     // disagree about which one they are in.

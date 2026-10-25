@@ -1,3 +1,4 @@
+import { frontierReviewPolicy } from "../../src/review/frontier-simplify-policy.ts";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { allow, type Decision } from "../../src/core/errors.ts";
@@ -1021,7 +1022,7 @@ const C65E73B2_DISPATCH_PROMPT_TAIL: readonly string[] = [
 ];
 
 /** The driven RUN_DISPATCH prompt c65e73b2 wrote for this holder: its first line, then the frozen rest. */
-const c65e73b2DispatchPrompt = (firstLine: string): string => [firstLine, ...C65E73B2_DISPATCH_PROMPT_TAIL].join("\n");
+const c65e73b2DispatchPrompt = (firstLine: string): string => [firstLine, ...C65E73B2_DISPATCH_PROMPT_TAIL, frontierReviewPolicy()].join("\n");
 const withoutAdministrativeTeaching = (prompt:string): string => prompt.split("\n").filter(line => !line.startsWith("For an administrative CONTRACT_CHANGE")).join("\n").replace("The resolution never bypasses the blind review", "The resolution never bypasses T3, the blind review");
 
 /** ACP1195 input delivery is a separate amendment; all other dispatch/revision bytes stay frozen. */

@@ -1,7 +1,12 @@
+import { readFileSync } from "node:fs";
 import { afterAll, describe, expect, it } from "vitest";
 
+import { canonicalJson } from "../../src/core/digest.ts";
 import { manifestDigest } from "../../src/contracts/manifest.ts";
 import { ExecutionMode, RunKind } from "../../src/domain/types.ts";
+import type { CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
+import type { VerificationReport } from "../../src/verify/verification-engine.ts";
+import type { ReviewPacket } from "../../src/review/blind-review.ts";
 import { __testing } from "../../src/review/blind-review.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { bootstrapCoverageKeys, bootstrapPlan, cleanTreeManifest, submitBootstrapPlan } from "../helpers/bootstrap-plan.ts";
@@ -41,61 +46,84 @@ const CONTRACT: TaskContract = {
 
 const flat = (prompt: string): string => prompt.replace(/\s+/g, " ");
 
-/** The evidence standard, phrase by phrase, as one reviewer prompt must state it. */
-const expectEvidenceStandard = (prompt: string): void => {
+/** Check the actual production input, including removal of ACP's competing rubric. */
+const source = readFileSync(new URL("../../src/review/frontier-simplify-review.md", import.meta.url), "utf8");
+
+const expectEvidenceStandard = (prompt: string, round = 1): void => {
   const text = flat(prompt);
-  // The five things a finding's detail states.
-  expect(text).toContain("Each finding's `detail` must state all five of these:");
-  expect(text).toContain("1. Contract: the contract, invariant or acceptance criterion that breaks, and a reachable input or call order that breaks it.");
-  expect(text).toContain("2. Location: the packet file and a concrete location or construct in it");
-  expect(text).toContain("or a canonical artifact reference");
-  expect(text).toContain("3. Effect: the result the contract expects, the result the current code produces, and the consumer or boundary affected.");
-  expect(text).toContain("4. Origin: whether it is pre-existing or a regression introduced by this change");
-  expect(text).toContain("and why.");
-  expect(text).toContain("5. Evidence gap: anything you could not confirm from the packet, stated as an evidence gap, never as an established defect.");
-  // Static evidence suffices, and no tools are offered to produce any other.
-  expect(text).toContain("Static evidence is enough");
-  expect(text).toContain("no executed witness is needed, and you have no tools to run one.");
-  // No invented line numbers where none exist.
-  expect(text).toContain(
-    "A line number is not required, and must not be invented for a binary file, a deletion, a `#manifest/...` or `#operation/...` item, or an evidence or freshness finding.",
-  );
-  // Style is not a blocker; a contract-breaking maintainability problem is a defect.
-  expect(text).toContain("A remark only about style, naming or a possible future extension is not a blocker");
-  expect(text).toContain("A maintainability problem that breaks a stated contract is a defect");
-  // The verdict is the reviewer's, whatever the severities.
-  expect(text).toContain("Your verdict stands as you return it; severities do not change it.");
-  // The standard comes before the response the reviewer is asked for.
-  expect(prompt.indexOf("## What a finding must show")).toBeGreaterThan(-1);
-  expect(prompt.indexOf("## What a finding must show")).toBeLessThan(prompt.indexOf("## Required response"));
+  expect(text).toContain("Transport verdict PASS represents canonical PASS or PASS WITH NITS.");
+  expect(text).toContain("Transport verdict REVISE represents canonical INCOMPLETE, or canonical BLOCK with a confirmed blocker that can be repaired.");
+  expect(text).not.toContain("INCOMPLETE or PASS WITH NITS");
+  const template = source.split(`## Round ${round} prompt\n\n\`\`\`text\n`)[1]!.split("\n```")[0]!;
+  const escaped = template.split(/\{\{[A-Z0-9_]+\}\}/).map(part => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[^\n]*");
+  expect(prompt).toMatch(new RegExp(escaped));
+  expect(prompt).toContain(source.split("## Round 1 prompt")[0]!);
+  expect(prompt).not.toMatch(/\{\{[A-Z0-9_]+\}\}/);
+
+  expect(text).not.toContain("Each finding's `detail` must state all five");
+  expect(text).not.toContain("Your verdict stands as you return it; severities do not change it.");
+  expect(text).not.toContain("Everything you need is above");
+  expect(text).not.toContain("Do not praise");
 };
 
 const promptsStartingWith = (harness: ReturnType<typeof makeHarness>, heading: string): string[] =>
   harness.scripted.invocations.map((call) => call.prompt).filter((prompt) => prompt.startsWith(heading));
 
+const reReview = async (h: ReturnType<typeof makeHarness>, runId: string, kind: "CANDIDATE" | "BOOTSTRAP_PLAN" | "CONTRACT_CHANGE") => {
+  const snapshot = h.cp.artifacts.latest<CandidateSnapshot>(runId, "CANDIDATE_SNAPSHOT")!.content;
+  const contract = h.cp.artifacts.latest<TaskContract>(runId, "TASK_CONTRACT")!.content;
+  const original = h.cp.artifacts.list<ReviewPacket>(runId, "BLIND_REVIEW").at(-1)!;
+  const run = h.cp.runs.require(runId);
+  const before = h.scripted.invocations.length;
+  h.scripted.script({ match: /Final review/, text: reviewerPass([]) });
+  h.scripted.script({ match: /Candidate review|Review chunk|Bootstrap plan review|Contract change review/, text: reviewerPass(original.content.coveredFiles), once: false });
+  const result = await h.cp.review.controlPlaneInvoker()({
+    kind, runId, snapshot, contract, contractDigest: snapshot.contractDigest,
+    projectId: run.projectId, executionMode: run.executionMode,
+    verification: h.cp.artifacts.latest<VerificationReport>(runId, "VERIFICATION")?.content as VerificationReport,
+  });
+  expect(result.allowed, JSON.stringify(result)).toBe(true);
+  const calls = h.scripted.invocations.slice(before);
+  expect(calls.length).toBeGreaterThan(0);
+  for (const call of calls) {
+    expectEvidenceStandard(call.prompt, 2);
+    expect(call.prompt).toContain(canonicalJson(original.content));
+    expect(call.prompt).toContain(original.digest);
+    expect(call.prompt).toContain("## PREVIOUS_REVIEW.md");
+    expect((call.systemPrompt?.length ?? 0) + call.prompt.length).toBeLessThanOrEqual(120_000);
+    expect(call.systemPrompt).not.toMatch(/Attack the|Do not praise|Judge only/);
+  }
+};
+
 describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
-  it("a candidate review prompt states the evidence standard, and its example finding names the five parts", async () => {
+  it("candidate first review and preserved re-review use only the canonical round prompts", async () => {
     const harness = makeHarness();
-    await driveToReviewedCandidate(harness);
+    const driven = await driveToReviewedCandidate(harness);
     const [prompt] = promptsStartingWith(harness, "# Candidate review");
     expect(prompt).toBeDefined();
     expectEvidenceStandard(prompt!);
-    const text = flat(prompt!);
-    expect(text).not.toContain("what is wrong and why it matters");
-    for (const part of ["Contract:", "Location:", "Effect:", "Origin:", "Evidence gap:"]) {
-      expect(text).toMatch(new RegExp(`"detail": "[^"]*${part}`));
-    }
-    expect(text).toContain("you have no tools and are not expected to look anything up or run anything.");
-    expect(text).toContain("Evidence the packet should carry and does not is itself a finding (category `evidence`)");
-    expect(text).toContain("a guess about code the packet does not show is not.");
+    // A large repair must be chunked too, rather than becoming unbounded prompt metadata.
+    writeFiles(harness.repoPath, { "src/app.js": `module.exports = () => 2;\n// repair ${"x".repeat(130_000)}\n` });
+    commitAll(harness.repoPath, "large repair");
+    const frozen = await harness.cp.pipeline.freeze(driven.runId);
+    if (!frozen.allowed) throw new Error(frozen.message);
+    const verified = await harness.cp.verification.verify({ runId: driven.runId, snapshot: frozen.value,
+      commands: harness.cp.projects.activeManifest(driven.projectId)!.manifest.verificationCommands,
+      contractDigest: frozen.value.contractDigest });
+    if (!verified.allowed) throw new Error(verified.message);
+    await reReview(harness, driven.runId, "CANDIDATE");
   });
 
-  it("every chunk prompt and the final reviewer's prompt state it too", async () => {
+  it.each([
+    [RunKind.STANDARD_WORK, false], [RunKind.STANDARD_WORK, true],
+    [RunKind.CONTRACT_CHANGE, false], [RunKind.CONTRACT_CHANGE, true],
+  ])("candidate dispatch and re-review use the canonical method (kind=%s, chunked=%s)", async (kind, chunked) => {
     const harness = makeHarness();
     const { projectId, repositoryId, identity } = await registerFixtureProject(harness);
     bindCeo(harness);
     const created = harness.cp.runs.create({
       projectId,
+      kind,
       executionMode: ExecutionMode.STANDARD,
       contract: CONTRACT,
       repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
@@ -105,6 +133,8 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
     const dispatched = await harness.cp.runs.dispatch(runId);
     if (!dispatched.allowed) throw new Error(dispatched.message);
     const run = dispatched.value;
+    const proposed = kind === RunKind.CONTRACT_CHANGE ? stricter(harness.cp.projects.activeManifest(projectId)!.manifest) : null;
+    if (proposed !== null) carryContractChange(harness, runId, proposed);
     harness.cp.tasks.submit(runId, [{ key: "impl", title: "change app()", category: "implementation" }]);
     const task = harness.cp.tasks.ready(runId)[0]!;
     const execution = harness.cp.tasks.startExecution({
@@ -119,10 +149,12 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
     if (!execution.allowed) throw new Error(execution.message);
     applyPassingChange(harness.repoPath);
     // A change too large for one prompt.
-    writeFiles(harness.repoPath, { "src/app.js": `module.exports = () => 2;\n// ${"x".repeat(130_000)}\n` });
-    const head = commitAll(harness.repoPath, "large reviewed change");
+    if (chunked) writeFiles(harness.repoPath, { "src/app.js": `module.exports = () => 2;\n// ${"x".repeat(130_000)}\n` });
+    const head = chunked ? commitAll(harness.repoPath, "large reviewed change") : "passing-change";
     harness.cp.tasks.finishExecution(execution.value.executionId, { status: "SUCCEEDED", resultDigest: `sha256:${head}` });
+    const coverage = [`${identity}:src/app.js`, ...(proposed === null ? [] : [`${projectId}:#manifest/${manifestDigest(proposed)}`])];
     harness.scripted.script(
+      { match: /Candidate review|# Review chunk 1 of/, text: reviewerPass(coverage), once: false },
       { match: /Review chunk/, text: reviewerPass([`${identity}:src/app.js`]), once: false },
       { match: /Final review/, text: reviewerPass([]) },
     );
@@ -137,10 +169,19 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
 
     const chunks = promptsStartingWith(harness, "# Review chunk");
     const finals = promptsStartingWith(harness, "# Final review");
-    expect(chunks.length).toBeGreaterThan(1);
-    expect(finals).toHaveLength(1);
-    for (const prompt of [...chunks, ...finals]) expectEvidenceStandard(prompt);
-    for (const prompt of [...chunks, ...finals]) expect(prompt.length).toBeLessThanOrEqual(120_000);
+    if (chunked) {
+      expect(chunks.length).toBeGreaterThan(1);
+      expect(finals).toHaveLength(1);
+    } else {
+      expect(chunks).toHaveLength(0);
+      expect(promptsStartingWith(harness, "# Candidate review")).toHaveLength(1);
+    }
+    const prompts = [...chunks, ...finals, ...promptsStartingWith(harness, "# Candidate review")];
+    for (const prompt of prompts) {
+      expectEvidenceStandard(prompt);
+      expect(prompt.length).toBeLessThanOrEqual(120_000);
+    }
+    await reReview(harness, runId, "CANDIDATE");
   });
 
   it("a bootstrap plan review prompt states it", async () => {
@@ -177,6 +218,7 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
     const [prompt] = promptsStartingWith(harness, "# Bootstrap plan review");
     expect(prompt).toBeDefined();
     expectEvidenceStandard(prompt!);
+    await reReview(harness, runId, "BOOTSTRAP_PLAN");
   });
 
   it("a contract change review prompt states it", async () => {
@@ -201,6 +243,7 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
     const [prompt] = promptsStartingWith(harness, "# Contract change review");
     expect(prompt).toBeDefined();
     expectEvidenceStandard(prompt!);
+    await reReview(harness, run.runId, "CONTRACT_CHANGE");
   });
 });
 

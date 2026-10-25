@@ -106,7 +106,7 @@ let subject = null;
 try { subject = fs.readFileSync(path.join(viewDir, "src", "subject.txt"), "utf8"); } catch {}
 const nonce = Math.random().toString(36).slice(2) + "-" + process.pid;
 const model = after("-m") ?? null;
-fs.appendFileSync(process.env.FAKE_REVIEWER_LOG, JSON.stringify({ cli, area, mode, viewDir, subject, model }) + "\n");
+fs.appendFileSync(process.env.FAKE_REVIEWER_LOG, JSON.stringify({ cli, area, mode, viewDir, subject, model, prompt: cli === "codex" ? args.at(-1) : after("-p") }) + "\n");
 // The model the CLI's own output names: by default the one it was asked for, as the real CLIs do;
 // plan.observedModel "none" names none, a model id names that model instead, and the spoofs put the
 // requested model only where it is not the CLI's own metadata.
@@ -337,6 +337,11 @@ const makeFixture = (options: { smudged?: boolean; executable?: boolean; symlink
     mkdirSync(dirname(join(root, "scripts", name)), { recursive: true });
     copyFileSync(join(ACP_SCRIPTS, name), join(root, "scripts", name));
   }
+  for (const name of ["frontier-simplify-policy.ts", "frontier-simplify-review.md"]) {
+    const target = join(root, "src", "review", name);
+    mkdirSync(dirname(target), { recursive: true });
+    copyFileSync(join(ACP_SCRIPTS, "..", "src", "review", name), target);
+  }
   git(root, "add", "-A");
   git(root, "commit", "-q", "--no-verify", "-m", "base");
   if (options.symlinksOff === true) git(root, "config", "--local", "core.symlinks", "false");
@@ -562,6 +567,19 @@ describe.each(SCRIPTS)("%s", (script) => {
 
       const result = await run(fixture, script, ["core", "--allow-dirty"]);
       expect(callsOf(fixture).map((call) => call.subject)).toEqual(["pinned v1\n"]);
+      const input = (callsOf(fixture)[0] as Call & { prompt: string }).prompt;
+      expect(input).toContain("Review this change for concrete defects. Investigate first, then write one final review in prose.");
+      expect(input).not.toContain("How to review, in order of what matters");
+      expect(input).not.toContain("What to look for, in priority order");
+      expect(input).toContain("Transport verdict PASS represents canonical PASS or PASS WITH NITS.");
+      expect(input).not.toContain("INCOMPLETE or PASS WITH NITS");
+      const method = readFileSync(join(ACP_SCRIPTS, "..", "src", "review", "frontier-simplify-review.md"), "utf8");
+      expect(input).toContain(method.split("## Round 1 prompt")[0]!);
+      const template = method.split("## Round 1 prompt\n\n```text\n")[1]!.split("\n```")[0]!;
+      const escaped = template.split(/\{\{[A-Z0-9_]+\}\}/).map(part => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[^\n]*");
+      expect(input).toMatch(new RegExp(escaped));
+
+
       expect(result.status).toBe(0);
       expect(result.stdout).toMatch(/not reviewed/);
       const dir = runDirectoryOf(fixture, script, result);

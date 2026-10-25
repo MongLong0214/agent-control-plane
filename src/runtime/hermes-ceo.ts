@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
 /**
  * The CEO runtime — the process `agentctl bootstrap hermes -- <command>` spawns, and the one
  * that stays.
@@ -246,6 +247,7 @@ const openToolSocket = (path: string, upstream: Socket, clientName: string): { c
             protocolVersion: "2025-11-25",
             capabilities: { tools: {} },
             serverInfo: { name: `${clientName}-tools`, version: "1" },
+            instructions: frontierReviewPolicy(),
           },
         });
         return;
