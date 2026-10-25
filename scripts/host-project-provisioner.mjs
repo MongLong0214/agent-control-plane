@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Version 1 host boundary. All paths are derived from HOME/ACP_STATE_DIR and a frozen allocation.
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, chmodSync, realpathSync, rmSync, symlinkSync, readlinkSync, lstatSync, openSync, fsyncSync, closeSync } from 'node:fs';
-import { join, resolve, dirname } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, chmodSync, realpathSync, rmSync, symlinkSync, readlinkSync, lstatSync, openSync, fsyncSync, closeSync, accessSync, constants, statSync } from 'node:fs';
+import { join, resolve, dirname, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { generateSecretKey, getPublicKey } from 'nostr-tools';
 import Database from 'better-sqlite3';
@@ -12,8 +12,40 @@ import { readProcessStartToken } from '../src/core/process-argv.ts';
 const home = process.env.HOME;
 const state = process.env.ACP_STATE_DIR;
 class ProvisionerRefusal extends Error {}
+class ProvisionerExecutionFailure extends Error {
+  constructor(message, error) {super(message);this.stderr = error.stderr;}
+}
+let operation = 'unknown';
 const check = (ok, why) => { if (!ok) throw new ProvisionerRefusal(why); };
-const run = (bin, args, opts = {}) => execFileSync(bin, args, { encoding:'utf8', timeout:30_000, maxBuffer:2_000_000, stdio:['pipe','pipe','pipe'], ...opts });
+const resolvedBinary = bin => {
+  const name = bin.toUpperCase();
+  // Match the launcher's nonempty operator pin, then its install-time answer. Never search PATH.
+  const value = process.env[`ACP_${name}_BINARY`] || process.env[`ACP_RESOLVED_${name}_BINARY`];
+  const why = reason => `${bin} in ${operation}: ${reason}`;
+  check(value, why('missing binary variable'));
+  check(isAbsolute(value), why('binary path is not absolute'));
+  let target;
+  try {target = realpathSync(value);} catch (error) {
+    throw new ProvisionerRefusal(why(error.code === 'ENOENT' || error.code === 'ENOTDIR' ? 'binary is missing' : 'binary is not executable'));
+  }
+  try {check(statSync(target).isFile(), why('binary is not an executable regular file'));accessSync(target,constants.X_OK);} catch (error) {
+    if (error instanceof ProvisionerRefusal) throw error;
+    throw new ProvisionerRefusal(why('binary is not executable'));
+  }
+  // Keep the stable install name: provider updaters may repoint it between operations.
+  return value;
+};
+const run = (bin, args, opts = {}) => {
+  const pinned = bin === 'buzz' || bin === 'claude';
+  const executable = pinned ? resolvedBinary(bin) : bin;
+  try {return execFileSync(executable, args, { encoding:'utf8', timeout:30_000, maxBuffer:2_000_000, stdio:['pipe','pipe','pipe'], ...opts });} catch (error) {
+    if (!pinned) throw error;
+    const reason = Number.isInteger(error.status) ? `non-zero exit with exit code ${error.status}` :
+      error.code === 'ENOENT' ? 'binary is missing (ENOENT)' : error.code === 'EACCES' ? 'binary is not executable' :
+      error.code === 'ETIMEDOUT' ? 'execution timed out' : 'execution failed';
+    throw new ProvisionerExecutionFailure(`${bin} in ${operation}: ${reason}`,error);
+  }
+};
 const json = (bin, args, opts) => JSON.parse(run(bin,args,opts));
 const atomic = (path, body, mode = 0o600) => {
   mkdirSync(dirname(path),{recursive:true,mode:0o700}); const tmp = `${path}.${randomUUID()}.tmp`;
@@ -27,6 +59,7 @@ let ownLock = null;
 let ceoSigner = false;
 try {
   const req = JSON.parse(readFileSync(0,'utf8'));
+  operation = req.operation;
   check(req.version === 1 && home && state, 'protocol');
   const a = req.allocation;
   ceoSigner = req.operation === 'ensure-buzz' && a?.mode === 'ceo-route-signer';
@@ -257,7 +290,7 @@ try {
         const marker = join(state,`launched-${a.projectId}`);
         const launcher = join(state,`resident-${a.projectId}.sh`);
         const quote = v => `'${String(v).replaceAll("'", "'\\''")}'`;
-        const args = ['claude','--model','opus',(existsSync(sessionFile) || existsSync(join(home,'.claude','projects',a.clonePath.replaceAll('/','-'),`${a.sessionUuid}.jsonl`))) ? '--resume' : '--session-id',a.sessionUuid,'--name',`${a.projectId} CTO`,'--remote-control',`${a.projectId} CTO`,'--messaging-socket-path',a.socketPath,'--permission-mode','bypassPermissions','--dangerously-skip-permissions',`You are ${a.projectId} CTO. Connect to acp-cto, read role_dispatch_pending, and acknowledge the bootstrap handoff with handoff_ack. The handoff contains the approved genesis bytes and product intent.`];
+        const args = [resolvedBinary('claude'),'--model','opus',(existsSync(sessionFile) || existsSync(join(home,'.claude','projects',a.clonePath.replaceAll('/','-'),`${a.sessionUuid}.jsonl`))) ? '--resume' : '--session-id',a.sessionUuid,'--name',`${a.projectId} CTO`,'--remote-control',`${a.projectId} CTO`,'--messaging-socket-path',a.socketPath,'--permission-mode','bypassPermissions','--dangerously-skip-permissions',`You are ${a.projectId} CTO. Connect to acp-cto, read role_dispatch_pending, and acknowledge the bootstrap handoff with handoff_ack. The handoff contains the approved genesis bytes and product intent.`];
         atomic(launcher,`#!/bin/sh\nunset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\nexport ACP_STATE_DIR=${quote(state)}\nBUZZ_PRIVATE_KEY=$(cat ${quote(a.privateKeyFile)}) || exit 1\nexport BUZZ_PRIVATE_KEY\ncd ${quote(a.clonePath)} || exit 1\nexec ${args.map(quote).join(' ')}\n`,0o700);
         // Refuse a duplicate Claude even when RC is still registering. Never kill an unverified pane.
         const ps = run('ps',['-axo','command=']); check(!ps.split('\n').some(l => namesSession(l)),'resident awaits RC');
@@ -311,7 +344,7 @@ try {
   process.stdout.write(JSON.stringify(result));
 } catch (error) {
   if (ceoSigner) {
-    let failure = {outcome:'LOST',code:'host_response_unknown',message:'host provisioning outcome unknown'};
+    let failure = {outcome:'LOST',code:'host_response_unknown',message:error instanceof ProvisionerExecutionFailure ? error.message : 'host provisioning outcome unknown'};
     if (error instanceof ProvisionerRefusal) failure = {outcome:'INVALID',code:'host_verification_failed',message:error.message};
     else {
       try {
@@ -321,7 +354,7 @@ try {
       } catch { /* No precise relay refusal was received. */ }
     }
     process.stderr.write(JSON.stringify({ceoBuzzSignerFailure:failure}));
-  } else process.stderr.write(`host project provisioner refused operation${error instanceof ProvisionerRefusal ? ': '+error.message : ''}\n`);
+  } else process.stderr.write(`host project provisioner refused operation${error instanceof ProvisionerRefusal || error instanceof ProvisionerExecutionFailure ? ': '+error.message : ''}\n`);
   process.exitCode = 1;
 }
 finally {if (locked && readlinkSync(lock) === ownLock) rmSync(lock,{force:true});if (ownLock) rmSync(ownLock,{recursive:true,force:true});}
