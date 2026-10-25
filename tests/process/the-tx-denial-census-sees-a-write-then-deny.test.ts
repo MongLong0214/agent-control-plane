@@ -105,6 +105,13 @@ const DOOR_R1_TEST = "tests/unit/ceo-escalation-resolve-door-r1.test.ts";
 
 const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string; witnesses?: RollbackWitness[] }> = [
   {
+    label: "attachBootstrapReviewEvidence",
+    file: "bootstrap/bootstrap-review-evidence.ts",
+    anchor: "export const attachBootstrapReviewEvidence = (source: Source, peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: ReviewEvidenceInput) => source.db.txDecision(() => {",
+    witnesses: [{ file: "tests/unit/bootstrap-plan-artifact.test.ts",
+      title: "rolls back review evidence attachment and audit on denial, preserving the current selection and retry" }],
+  },
+  {
     label: "resumeBootstrapReview",
     file: "bootstrap/bootstrap-plan-artifact.ts",
     anchor: "): Decision<ResumeReviewResult> => source.db.txDecision(() => {",

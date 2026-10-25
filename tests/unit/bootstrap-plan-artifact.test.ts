@@ -1855,6 +1855,35 @@ describe("private bootstrap review originals and serving runtime", () => {
       return { ...f, bundle, bundleBody: body, upload, select, stageEvidence, attachEvidence, effects };
     };
 
+    it("rolls back review evidence attachment and audit on denial, preserving the current selection and retry", async () => {
+      const f = await evidenceFixture();
+      try {
+        expect(await f.stageEvidence()).toMatchObject({ ok: true });
+        expect(await f.attachEvidence()).toMatchObject({ ok: true });
+        const bodyB = JSON.stringify({ ...f.bundle, missing: ["replacement evidence"] });
+        expect(await f.stageEvidence({ idempotencyKey: "rollback-stage-B", evidenceBody: bodyB, expectedSha256: sha256(bodyB) })).toMatchObject({ ok: true });
+        const selectB = { idempotencyKey: "rollback-attach-B", expectedSha256: sha256(bodyB), replacesSha256: f.select.expectedSha256 };
+        const before = f.effects();
+        const auditBefore = f.h.cp.audit.forRun(f.run.runId);
+        const record = f.h.cp.audit.record.bind(f.h.cp.audit);
+        const refused = vi.spyOn(f.h.cp.audit, "record").mockImplementation(input => {
+          const recorded = record(input);
+          return input.kind === "BOOTSTRAP_REVIEW_EVIDENCE_ATTACHED"
+            ? deny(ReasonCode.CONFLICT, "test denial after attachment and audit writes") : recorded;
+        });
+        try {
+          expect(await f.attachEvidence(selectB)).toMatchObject({ ok: false, reasonCode: "CONFLICT" });
+          expect(f.effects()).toEqual(before);
+          expect(f.h.cp.audit.forRun(f.run.runId)).toEqual(auditBefore);
+        } finally { refused.mockRestore(); }
+        expect(await f.attachEvidence({ ...selectB, idempotencyKey: "rollback-attach-B-retry" })).toMatchObject({ ok: true });
+        const current = f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF")
+          .filter(a => a.content.schema === "acp.bootstrap-review-evidence-attached.v1" && !a.superseded);
+        expect(current).toHaveLength(1);
+        expect(current[0]!.content.sha256).toBe(sha256(bodyB));
+      } finally { await f.close(); }
+    });
+
     it("ACP1204-R1-02 refuses A→B→A atomically and preserves current-B retries and submission", async () => {
       const f = await evidenceFixture();
       try {
