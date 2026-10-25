@@ -1,4 +1,5 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, existsSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -6,6 +7,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { executablePlanOf } from "../../src/bootstrap/bootstrap-plan.ts";
 import { bytesDigest } from "../../src/bootstrap/genesis-bundle.ts";
 import { produceRepoFactoryResult } from "../../src/bootstrap/repo-factory-producer.ts";
+import { parseRepoFactoryResult, type RepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
+import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import * as sandbox from "../../src/verify/sandbox.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -19,6 +22,7 @@ afterEach(() => {
 const approvedArgv = ["npm", "test"];
 const executedArgv = ["node", "--test", "--experimental-test-isolation=none"];
 const compat = "npm-test-node-test-in-process";
+const realRunSandboxed = sandbox.runSandboxed;
 const passing = "const {test}=require('node:test');const assert=require('node:assert/strict');test('smoke',()=>assert.equal(2+2,4));\n";
 
 function fixture(options: { scripts?: Record<string, unknown>; argv?: string[]; source?: string; cwd?: string; packageBytes?: string | null } = {}) {
@@ -54,6 +58,38 @@ function fixture(options: { scripts?: Record<string, unknown>; argv?: string[]; 
 }
 
 describe.skipIf(process.platform !== "darwin" || !existsSync("/usr/bin/sandbox-exec"))("RF genesis npm test compatibility (real sandbox)", () => {
+  it("persists both invocations for every genesis command on PASS, preserving the v2 optional-field digest contract", async () => {
+    const f = fixture();
+    const directArgv = ["node", "test.js"];
+    f.input.plan.verificationCommands!.push({ ...f.input.plan.verificationCommands![0]!, id: "direct", argv: directArgv });
+    const persist = vi.fn((result: RepoFactoryResult): void => {
+      // The runner stores result, not Decision.evidence, as a JSON artifact.
+      const stored: unknown = JSON.parse(JSON.stringify(result));
+      const parsed = parseRepoFactoryResult(stored);
+      expect(parsed.allowed, JSON.stringify(parsed)).toBe(true);
+      if (!parsed.allowed) return;
+      expect(parsed.value.bootstrapVerification).toEqual(expect.arrayContaining([
+        expect.objectContaining({ commandId: "test", status: "PASS", approvedArgv, executedArgv, compat }),
+        expect.objectContaining({ commandId: "direct", status: "PASS", approvedArgv: directArgv, executedArgv: directArgv }),
+      ]));
+      expect(parsed.value.bootstrapVerification.find(row => row.commandId === "direct")).not.toHaveProperty("compat");
+      expect(parsed.value).toEqual(stored);
+      expect(digestOf(parsed.value)).toBe(digestOf(stored));
+      // Old v2 results acquire no default fields and retain their artifact identity.
+      const legacy = { ...result, bootstrapVerification: result.bootstrapVerification.map(row => ({
+        commandId: row.commandId, repositoryIdentity: row.repositoryIdentity, exactHead: row.exactHead, status: row.status,
+      })) };
+      const old = parseRepoFactoryResult(legacy);
+      expect(old.allowed).toBe(true);
+      if (old.allowed) expect(digestOf(old.value)).toBe(digestOf(legacy));
+      expect(digestOf(result)).not.toBe(digestOf(legacy));
+    });
+    const decision = await produceRepoFactoryResult({ ...f.input, persist });
+    expect(decision.allowed, JSON.stringify(decision)).toBe(true);
+    expect(persist).toHaveBeenCalledExactlyOnceWith(decision.allowed ? decision.value : undefined);
+    expect(f.runs).toHaveBeenCalledTimes(4);
+  });
+
   it.each([".", "app"])("passes default discovery in approved cwd %s and records both invocations at both verification steps", async cwd => {
     const f = fixture({ cwd });
     const passCount = cwd === "." ? 3 : 2; // Root discovery also includes the approved legacy test.js.
@@ -72,6 +108,22 @@ describe.skipIf(process.platform !== "darwin" || !existsSync("/usr/bin/sandbox-e
       expect(request.worktreePath).toBe(f.checkout);
     }
     expect(f.input.plan.verificationCommands![0]!.argv).toEqual(approvedArgv);
+  });
+
+  it("accepts one leading UTF-8 BOM in the approved package.json", async () => {
+    const f = fixture({ packageBytes: "\uFEFF" + JSON.stringify({ scripts: { test: "node --test" } }) });
+    const decision = await produceRepoFactoryResult(f.input);
+    expect(decision.allowed, JSON.stringify(decision)).toBe(true);
+    expect(f.runs).toHaveBeenCalledTimes(2);
+    expect(decision.evidence.genesisVerification).toEqual([
+      expect.objectContaining({ phase: "verifyGenesis", approvedArgv, executedArgv, compat,
+        outcome: expect.objectContaining({ status: "PASS" }) }),
+      expect.objectContaining({ phase: "GENESIS_TEST", approvedArgv, executedArgv, compat,
+        outcome: expect.objectContaining({ status: "PASS" }) }),
+    ]);
+    if (decision.allowed) expect(decision.value.bootstrapVerification).toEqual([
+      expect.objectContaining({ commandId: "test", approvedArgv, executedArgv, compat }),
+    ]);
   });
 
   it.each(["verifyGenesis", "GENESIS_TEST"])("propagates a real assertion failure in %s", async phase => {
@@ -98,6 +150,8 @@ describe.skipIf(process.platform !== "darwin" || !existsSync("/usr/bin/sandbox-e
     { name: "extra argv", argv: ["npm", "test", "--", "test/smoke.test.js"] },
     { name: "missing package", packageBytes: null },
     { name: "invalid JSON", packageBytes: "{" },
+    { name: "two leading BOMs", packageBytes: '\uFEFF\uFEFF{"scripts":{"test":"node --test"}}' },
+    { name: "non-leading BOM", packageBytes: ' \uFEFF{"scripts":{"test":"node --test"}}' },
   ])("runs unchanged for $name and records no compatibility reason", async options => {
     const f = fixture(options);
     const decision = await produceRepoFactoryResult(f.input);
@@ -115,6 +169,59 @@ describe.skipIf(process.platform !== "darwin" || !existsSync("/usr/bin/sandbox-e
 });
 
 describe("RF genesis approved worktree checks", () => {
+  const driftCases = ["verifyGenesis", "GENESIS_TEST"].flatMap(phase =>
+    ["before", "after"].flatMap(when =>
+      ["assume-unchanged", "skip-worktree", "ignored", "mode", "missing", "symlink"].map(kind => ({ phase, when, kind }))));
+
+  it.skipIf(process.platform !== "darwin" || !existsSync("/usr/bin/sandbox-exec")).each(driftCases)(
+    "refuses $kind disk drift $when $phase regardless of the index",
+    async ({ phase, when, kind }) => {
+      const f = fixture();
+      const mutate = () => {
+        const path = "test/smoke.test.js";
+        const git = (...args: string[]) => execFileSync("git", ["-C", f.checkout, ...args], { encoding: "utf8" });
+        if (kind === "ignored") writeFileSync(join(f.checkout, "ignored.test.js"), passing);
+        else if (kind === "mode") {
+          git("config", "core.filemode", "false");
+          chmodSync(join(f.checkout, path), 0o755);
+          expect(git("status", "--porcelain")).toBe("");
+        } else if (kind === "missing" || kind === "symlink") {
+          unlinkSync(join(f.checkout, path));
+          if (kind === "symlink") symlinkSync("second.test.js", join(f.checkout, path));
+        } else {
+          git("update-index", `--${kind}`, path);
+          writeFileSync(join(f.checkout, path), passing.replace("'smoke'", "'unapproved'"));
+          expect(git("status", "--porcelain")).toBe("");
+        }
+      };
+      if (when === "after") {
+        f.runs.mockImplementation(async request => {
+          const outcome = await realRunSandboxed(request);
+          if (f.runs.mock.calls.length === (phase === "verifyGenesis" ? 1 : 2)) mutate();
+          return outcome;
+        });
+      } else if (phase === "verifyGenesis") {
+        const open = f.port.openGenesisPull.bind(f.port);
+        vi.spyOn(f.port, "openGenesisPull").mockImplementation(async (...args) => {
+          await open(...args);
+          mutate();
+        });
+      }
+      const decision = await produceRepoFactoryResult({ ...f.input, beforeLedgerWrite: state => {
+        if (when === "before" && phase === "GENESIS_TEST" && !state.pending.length &&
+            state.receipts.length === f.input.plan.githubOperations.length) mutate();
+      } });
+      expect(decision).toMatchObject({ allowed: false, reasonCode: ReasonCode.VERIFICATION_GAP,
+        message: "genesis verification requires the clean approved worktree" });
+      expect(f.runs).toHaveBeenCalledTimes((phase === "GENESIS_TEST" ? 1 : 0) + (when === "after" ? 1 : 0));
+      if (when === "after") {
+        expect(decision.evidence.genesisVerification).toEqual(expect.arrayContaining([
+          expect.objectContaining({ phase, outcome: expect.objectContaining({ status: "PASS" }) }),
+        ]));
+      }
+    },
+  );
+
   it.each(["untracked", "modified", "package", "ignored"])("refuses %s drift before verifyGenesis runs any command", async kind => {
     const f = fixture({ argv: ["node", "test.js"] });
     const open = f.port.openGenesisPull.bind(f.port);

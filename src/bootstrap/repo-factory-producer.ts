@@ -4,6 +4,7 @@ import { parseGenesis, genesisBundleSchema, genesisPath } from './genesis-bundle
 import {
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -18,7 +19,7 @@ import { type Clock, systemClock } from "../core/clock.ts";
 import { canonicalJson, digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { git, tryRevParse, withoutRepositoryPrograms, type GitResult } from "../git/git.ts";
+import { git, tryRevParse, type GitResult } from "../git/git.ts";
 import { consumeWithheldExemption, readWithheldIntent, withheldUnsent } from "./bootstrap-approval-anchor.ts";
 import {
   COMMITLORE_VERIFICATION_ID,
@@ -968,13 +969,36 @@ export const produceRepoFactoryResult = async (
     }
     const tree = await approvedTree(head);
     if (!tree.allowed) return tree;
-    // Include ignored files: Node's discovery can execute them too. Only the producer's
-    // own ignored ownership marker is bookkeeping rather than an unapproved input.
-    const programs = await withoutRepositoryPrograms(localRepoPath);
-    const status = await git(localRepoPath, [...programs, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching", "--ignore-submodules=dirty"], { allowFailure: true });
-    const changes = status.stdout.split("\0").filter(entry => entry && entry !== `!! ${OPERATION_MARKER_NAME}`);
-    if (status.exitCode !== 0 || changes.length) {
-      return deny(ReasonCode.VERIFICATION_GAP, "genesis verification requires the clean approved worktree", { head, changes, ...genesisEvidence() });
+    // Git status trusts assume-unchanged/skip-worktree and core.filemode. Read disk
+    // instead, including ignored files that Node's default discovery can execute.
+    // Never follow symlinks; only .git and our root ownership marker are excluded.
+    const expected = new Map(approvedFiles.map(file => [file.path, file]));
+    const seen = new Set<string>();
+    const changes: string[] = [];
+    const walk = (directory: string): void => {
+      for (const name of readdirSync(join(localRepoPath, directory))) {
+        if (!directory && (name === ".git" || name === OPERATION_MARKER_NAME)) continue;
+        const path = directory ? `${directory}/${name}` : name;
+        const stat = lstatSync(join(localRepoPath, path));
+        if (stat.isDirectory()) {
+          walk(path);
+          continue;
+        }
+        seen.add(path);
+        const file = expected.get(path);
+        if (!file || !stat.isFile() || (stat.mode & 0o177777).toString(8) !== file.mode ||
+            !readFileSync(join(localRepoPath, path)).equals(file.contentBase64 === undefined
+              ? Buffer.from(file.content, "utf8") : Buffer.from(file.contentBase64, "base64"))) changes.push(path);
+      }
+    };
+    try {
+      walk("");
+    } catch {
+      return deny(ReasonCode.VERIFICATION_GAP, "genesis verification requires the clean approved worktree", { head, unreadable: true, ...genesisEvidence() });
+    }
+    changes.push(...[...expected.keys()].filter(path => !seen.has(path)));
+    if (changes.length) {
+      return deny(ReasonCode.VERIFICATION_GAP, "genesis verification requires the clean approved worktree", { head, changes: changes.sort(), ...genesisEvidence() });
     }
     return allow(ReasonCode.OK, undefined);
   };
@@ -996,7 +1020,7 @@ export const produceRepoFactoryResult = async (
         const pkg = await git(localRepoPath, ["--no-replace-objects", "cat-file", "blob", `${head}:${join(command.cwd, "package.json")}`], { allowFailure: true });
         if (pkg.exitCode === 0) {
           try {
-            const parsed = z.object({ scripts: z.record(z.unknown()) }).safeParse(JSON.parse(pkg.stdout));
+            const parsed = z.object({ scripts: z.record(z.unknown()) }).safeParse(JSON.parse(pkg.stdout.replace(/^\uFEFF/, "")));
             if (parsed.success && parsed.data.scripts["test"] === "node --test" &&
                 !Object.hasOwn(parsed.data.scripts, "pretest") && !Object.hasOwn(parsed.data.scripts, "posttest")) {
               compat = "npm-test-node-test-in-process";
@@ -1293,6 +1317,13 @@ export const produceRepoFactoryResult = async (
     cleanup();
     return deny(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,"genesis CI is not yet verified at the published head",{});
   }
+  // The runner persists result, not Decision.evidence. Retain the invocation at the
+  // published head for every genesis command, including unchanged commands.
+  const invocationAtPublishedHead = (commandId: string) => {
+    const record = genesisVerification.find(row => row.phase === "GENESIS_TEST" && row.commandId === commandId && row.head === head);
+    return record ? { approvedArgv: record.approvedArgv, executedArgv: record.executedArgv,
+      ...(record.compat ? { compat: record.compat } : {}) } : {};
+  };
   const result: RepoFactoryResult = {
     schema: REPO_FACTORY_RESULT_SCHEMA_ID,
     runId: plan.runId,
@@ -1314,12 +1345,14 @@ export const produceRepoFactoryResult = async (
     ],
     externalWriteReceipts: receipts,
     bootstrapVerification: [
-      ...(plan.verificationCommands?.slice(1).map(command => ({commandId:command.id,repositoryIdentity:identity,exactHead:head,status:"PASS" as const})) ?? []),
+      ...(plan.verificationCommands?.slice(1).map(command => ({commandId:command.id,repositoryIdentity:identity,exactHead:head,status:"PASS" as const,
+        ...invocationAtPublishedHead(command.id)})) ?? []),
       {
         commandId: plan.verificationCommandId,
         repositoryIdentity: identity,
         exactHead: head,
         status: "PASS",
+        ...invocationAtPublishedHead(plan.verificationCommandId),
       },
       ...(commitlorePass === null ? [] : [{ commandId: COMMITLORE_VERIFICATION_ID, repositoryIdentity: identity, exactHead: head, status: "PASS" as const }]),
     ],
