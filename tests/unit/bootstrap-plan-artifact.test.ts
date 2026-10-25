@@ -8,6 +8,7 @@ import { recordBootstrapServingRuntime } from "../../src/bootstrap/bootstrap-run
 import { currentBootstrapPlan, planForSubmission, deliveredBootstrapHandoff } from "../../src/bootstrap/bootstrap-plan.ts";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { Socket } from "node:net";
 import Database from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -22,8 +23,8 @@ import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-se
 import type { InBandWake } from "../../src/outbox/outbox.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, SELF_CLAIM_PROTOCOL } from "../../src/registry/canonical-self-claim.ts";
 import { HERMES_PROVENANCE_META_KEY } from "../../src/mcp/hermes-provenance.ts";
-import { startLocalMcpListeners } from "../../src/daemon/agentcpd.ts";
-import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
+import { authenticateSocket, startLocalMcpListeners } from "../../src/daemon/agentcpd.ts";
+import { callMcpToolOverSocket, unicodeEscapedJson } from "../helpers/mcp-socket.ts";
 import { cleanupTempDirs, seedRun, tempDir } from "../helpers/fixtures.ts";
 import { bindCeo, dispatchBootstrapRun, makeHarness, reviewerPass, reviewerRevise } from "../helpers/harness.ts";
 import { openActivationHandoff, producedHandoff } from "../helpers/driven-primary-cto.ts";
@@ -1808,6 +1809,56 @@ describe("private bootstrap review originals and serving runtime", () => {
       if (size > 512 * 1024) expect(f.h.cp.artifacts.list(f.run.runId)).toEqual(before);
     } finally { await f.close(); }
   });
+
+  it.each([{ padding: "é", extra: 0 }, { padding: "x", extra: 0 }, { padding: "é", extra: 1 }])(
+    "bounds Unicode-escaped evidence in a complete daemon frame ($padding, extra=$extra)", async ({ padding, extra }) => {
+      const f = await stagingFixture();
+      const socket = new Socket();
+      socket.on("error", () => {});
+      const replies = new Map<number, { result?: { structuredContent?: Args } }>();
+      // Capture transport output while driving each entire input frame in one data event.
+      socket._write = (chunk: Buffer, _encoding, callback) => {
+        const reply = JSON.parse(chunk.toString("utf8"));
+        replies.set(reply.id, reply);
+        callback();
+      };
+      const session = f.h.cp.sessions.require(f.primary.sessionId);
+      const server = createCtoServer(createCtoMcpPort(f.h.cp), () => allow(ReasonCode.OK, { actor: session.sessionId,
+        sessionId: session.sessionId, sessionIncarnation: session.incarnation,
+        binding: { roleKey: f.primary.roleKey, bindingGeneration: f.primary.generation } }));
+      const errors: Error[] = [];
+      server.server.onerror = error => errors.push(error);
+      try {
+        expect(await f.attach()).toMatchObject({ ok: true });
+        const opening = authenticateSocket(socket, "fixture-token", 1000);
+        socket.emit("data", Buffer.from(JSON.stringify({ token: "fixture-token", sessionId: session.sessionId, sessionSecret: "fixture-secret" }) + "\n"));
+        const accepted = await opening;
+        expect(accepted).not.toBeNull();
+        await server.connect(accepted!.transport);
+        socket.emit("data", Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {
+          protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "unicode-frames", version: "1" } } }) + "\n"));
+        await vi.waitFor(() => expect(replies.has(1)).toBe(true));
+        const bundle = { runId: f.run.runId, contractDigest: f.run.contractDigest, files: [], missing: [""] };
+        const remaining = 512 * 1024 + extra - Buffer.byteLength(JSON.stringify(bundle));
+        bundle.missing[0] = padding.repeat(Math.floor(remaining / Buffer.byteLength(padding))) + "x".repeat(remaining % Buffer.byteLength(padding));
+        const evidenceBody = JSON.stringify(bundle);
+        expect(Buffer.byteLength(evidenceBody)).toBe(512 * 1024 + extra);
+        const frame = unicodeEscapedJson({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {
+          name: "bootstrap_review_evidence_stage", arguments: { idempotencyKey: "complete-unicode-frame", runId: f.run.runId,
+            contractDigest: f.run.contractDigest, bootstrapPlanDigest: f.digest, evidenceBody, expectedSha256: sha256(evidenceBody) } } });
+        expect(Buffer.byteLength(frame)).toBeGreaterThan(1024 * 1024 + 1024);
+        socket.emit("data", Buffer.from(frame + "\n"));
+        await vi.waitFor(() => {
+          expect(errors).toEqual([]);
+          expect(replies.get(2)?.result?.structuredContent).toMatchObject(extra === 0
+            ? { ok: true, value: { digest: sha256(evidenceBody) } } : { ok: false, reasonCode: "INVALID_ARGUMENT" });
+        });
+        const candidate = f.h.cp.artifacts.list<{ schema: string; bodyBase64: string }>(f.run.runId, "HANDOFF")
+          .find(a => a.content.schema === "acp.bootstrap-review-evidence-candidate.v1");
+        if (extra === 0) expect(Buffer.from(candidate!.content.bodyBase64, "base64").equals(Buffer.from(evidenceBody))).toBe(true);
+        else expect(candidate).toBeUndefined();
+      } finally { await server.close(); socket.destroy(); await f.close(); }
+    });
 
   it("keeps the PLAN byte limit at 128 KiB plus one on staging and attachment", async () => {
     const f = await stagingFixture();

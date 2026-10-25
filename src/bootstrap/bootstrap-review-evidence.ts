@@ -2,6 +2,7 @@ import type { ReviewRecordVerification } from "./bootstrap-review-evidence-githu
 import { z } from "zod";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { allow, deny, type Decision } from "../core/errors.ts";
+import { BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES } from "../core/mcp-limits.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { artifactDigestMatches } from "../db/artifacts.ts";
 import { ArtifactKind, RunState } from "../domain/types.ts";
@@ -17,7 +18,7 @@ type Source = Parameters<typeof currentBootstrapInputRun>[0] & {
 };
 // Review originals and independently queried API facts each get a separate bounded budget.
 // API facts follow the evidence limit, never consume or truncate original file bytes.
-export const BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES = 512 * 1024;
+export { BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES } from "../core/mcp-limits.ts";
 const CANDIDATE = "acp.bootstrap-review-evidence-candidate.v1";
 const ATTACHED = "acp.bootstrap-review-evidence-attached.v1";
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);

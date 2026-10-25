@@ -7,6 +7,8 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vites
 
 import { ATTACH_EXIT, runAttachRelay, runAttachRelayCommand } from "../../src/cli/attach-relay.ts";
 import { attachBootstrapPlan } from "../../src/bootstrap/bootstrap-plan-artifact.ts";
+import { MAX_MCP_LINE_BYTES } from "../../src/core/mcp-limits.ts";
+import { unicodeEscapedJson } from "../helpers/mcp-socket.ts";
 import { sha256 } from "../../src/core/digest.ts";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
 import { RunKind } from "../../src/domain/types.ts";
@@ -156,7 +158,7 @@ const relay = (paths: { claimPath: string; ctoPath: string; reattachPath: string
     exit,
     stdin,
     err: () => errText,
-    request: (method: string, params: unknown, fragmented = false) =>
+    request: (method: string, params: unknown, fragmented = false, serialize = (value: unknown) => JSON.stringify(value)) =>
       new Promise<Wire>((resolve, reject) => {
         const id = nextId++;
         const timer = setTimeout(() => reject(new Error(`timeout awaiting ${method}; stderr=${errText}`)), 10_000);
@@ -164,7 +166,7 @@ const relay = (paths: { claimPath: string; ctoPath: string; reattachPath: string
           clearTimeout(timer);
           resolve(message);
         });
-        const line = JSON.stringify({ jsonrpc: "2.0", id, method, params });
+        const line = serialize({ jsonrpc: "2.0", id, method, params });
         if (fragmented) {
           stdin.write(line);
           setImmediate(() => stdin.write("\n"));
@@ -252,7 +254,13 @@ describe("the canonical CTO relay reattaches before it would claim", () => {
     expect(count(subject.h, "SELECT COUNT(*) AS n FROM sessions")).toBe(1);
   });
 
-  it.each([false, true])("stages a 512 KiB bundle through the canonical CTO relay and socket (escaped=%s)", async escaped => {
+  it.each([
+    { encoding: "plain", padding: " ", extra: 0 },
+    { encoding: "tabs", padding: "\t", extra: 0 },
+    { encoding: "unicode", padding: "é", extra: 0 },
+    { encoding: "unicode", padding: "x", extra: 0 },
+    { encoding: "unicode", padding: "é", extra: 1 },
+  ])("bounds review evidence through the canonical CTO relay and socket (encoding=$encoding padding=$padding extra=$extra)", async ({ encoding, padding, extra }) => {
     const paths = await started();
     const { h } = paths.subject;
     const ceo = bindCeo(h);
@@ -270,25 +278,41 @@ describe("the canonical CTO relay reattaches before it would claim", () => {
       { principal: "owner", peerGrant: null }, { runId: run.runId, contractDigest: run.contractDigest!,
         bootstrapOperationId: plan.bootstrapOperationId as string, projectId: manifest.projectId,
         repositoryIdentity: manifest.repositories[0]!.remote, planBody, expectedSha256: bootstrapPlanDigest })).toMatchObject({ allowed: true });
-    const base = JSON.stringify({ runId: run.runId, contractDigest: run.contractDigest, files: [], missing: ["é"] });
-    const evidenceBody = base + (escaped ? "\t" : " ").repeat(512 * 1024 - Buffer.byteLength(base));
-    expect(Buffer.byteLength(evidenceBody)).toBe(512 * 1024);
+    const bundle = { runId: run.runId, contractDigest: run.contractDigest, files: [], missing: ["é"] };
+    const remaining = 512 * 1024 + extra - Buffer.byteLength(JSON.stringify(bundle));
+    if (encoding === "unicode") bundle.missing[0] += padding.repeat(Math.floor(remaining / Buffer.byteLength(padding))) + "x".repeat(remaining % Buffer.byteLength(padding));
+    const evidenceBody = JSON.stringify(bundle) + (encoding === "unicode" ? "" : padding.repeat(remaining));
+    expect(Buffer.byteLength(evidenceBody)).toBe(512 * 1024 + extra);
     const args = { idempotencyKey: "canonical-limit", runId: run.runId, contractDigest: run.contractDigest,
       bootstrapPlanDigest, evidenceBody, expectedSha256: sha256(evidenceBody) };
-    if (escaped) expect(Buffer.byteLength(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call",
+    if (encoding === "tabs") expect(Buffer.byteLength(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call",
       params: { name: "bootstrap_review_evidence_stage", arguments: args } }))).toBeGreaterThan(1024 * 1024);
     const r = relay(paths, "command");
     try {
       expect((await r.request("initialize", { protocolVersion: "2024-11-05", capabilities: {},
         clientInfo: { name: "claude-code", version: "1" } })).error).toBeUndefined();
-      const result = await r.request("tools/call", { name: "bootstrap_review_evidence_stage", arguments: args }, true);
+      const result = await r.request("tools/call", { name: "bootstrap_review_evidence_stage", arguments: args }, true, encoding === "unicode" ? unicodeEscapedJson : JSON.stringify);
       expect(result.error).toBeUndefined();
-      expect(result.result?.structuredContent).toMatchObject({ ok: true, value: { digest: sha256(evidenceBody) } });
+      expect(result.result?.structuredContent).toMatchObject(extra === 0
+        ? { ok: true, value: { digest: sha256(evidenceBody) } } : { ok: false, reasonCode: "INVALID_ARGUMENT" });
       const candidate = h.cp.artifacts.list<{ schema: string; bodyBase64: string }>(run.runId, "HANDOFF")
         .find(a => a.content.schema === "acp.bootstrap-review-evidence-candidate.v1")!;
-      expect(Buffer.from(candidate.content.bodyBase64, "base64").equals(Buffer.from(evidenceBody))).toBe(true);
+      if (extra === 0) expect(Buffer.from(candidate.content.bodyBase64, "base64").equals(Buffer.from(evidenceBody))).toBe(true);
+      else expect(candidate).toBeUndefined();
       expect(paths.claims).toEqual([]);
     } finally { r.stdin.end(); await settles(r.exit); }
+  });
+
+  it("refuses fragmented relay input above the wire ceiling", async () => {
+    const paths = await started();
+    const r = relay(paths);
+    expect((await r.request("initialize", { protocolVersion: "2024-11-05", capabilities: {},
+      clientInfo: { name: "claude-code", version: "1" } })).error).toBeUndefined();
+    r.stdin.write(Buffer.alloc(MAX_MCP_LINE_BYTES, 0x61));
+    r.stdin.write("a");
+    expect(await settles(r.exit)).toBe(ATTACH_EXIT.PROTOCOL);
+    expect(r.err()).toBe("attach: client line malformed\n");
+    r.stdin.end();
   });
 
   it("claims only when this process holds no binding, and writes nothing on the way", async () => {
