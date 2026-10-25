@@ -1173,10 +1173,14 @@ export class RunEngine {
   }
 
   cancel(runId: string, reason: string): Decision<RunRow> {
-    const run = this.get(runId);
-    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
-    this.tasks.cancelAll(runId, reason);
-    return this.transition(runId, RunState.CANCELLED, reason);
+    return this.db.txDecision(() => {
+      const run = this.get(runId);
+      if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+      const check = canTransition(run.state, RunState.CANCELLED, run.kind);
+      if (!check.allowed) return check as Decision<RunRow>;
+      this.tasks.cancelAll(runId, reason);
+      return this.transition(runId, RunState.CANCELLED, reason);
+    });
   }
 
   /**
