@@ -1079,6 +1079,7 @@ const seatbeltProfile = (
   denyReadPaths: readonly string[],
 ): string => {
   const lines = ["(version 1)", "(allow default)"];
+  const runtimeExecutable = realpathSync(process.execPath);
   if (command.network === "deny") lines.push("(deny network*)");
   // A deny path below an allowed root would stop the command from reading its own inputs,
   // so that narrow case is omitted. An encompassing deny remains in force; the explicit
@@ -1087,9 +1088,9 @@ const seatbeltProfile = (
     if (isWithin(worktreePath, path) || isWithin(scratch, path)) continue;
     lines.push(`(deny file-read* (subpath ${quote(path)}))`);
     // Node resolves a module by lstat-ing each ancestor before it opens the file. Keep
-    // directory metadata traversal possible for an encompassing deny, but grant data
-    // reads only through the explicit worktree/scratch subpath rules below.
-    for (const allowedRoot of [worktreePath, scratch]) {
+    // directory metadata traversal possible for an encompassing deny. Data reads are
+    // limited to worktree/scratch subtrees and the one pinned runtime binary below.
+    for (const allowedRoot of [worktreePath, scratch, runtimeExecutable]) {
       if (!isWithin(path, allowedRoot)) continue;
       for (const metadataPath of metadataTraversalPaths(path, allowedRoot)) {
         lines.push(`(allow file-read-metadata (literal ${quote(metadataPath)}))`);
@@ -1098,6 +1099,11 @@ const seatbeltProfile = (
   }
 
   lines.push(
+    // A pinned Node can live inside the denied ACP state root. CoreFoundation must
+    // inspect its executable path when npm sets process.title; denying the metadata
+    // makes CFBundleGetMainBundle return null and older libuv versions segfault.
+    // Permit this one binary and ancestor metadata, never sibling file contents.
+    `(allow file-read* (literal ${quote(runtimeExecutable)}))`,
     `(allow file-read* (subpath ${quote(worktreePath)}))`,
     `(allow file-read* (subpath ${quote(scratch)}))`,
     "(deny file-write*)",
