@@ -114,8 +114,8 @@ export const createHermesMcpPort = (
       ceoNotificationAckAccess(source, peer, turn, messageId),
     acknowledgeCeoNotification: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: CeoNotificationAckInput, fingerprint: string) =>
       acknowledgeCeoNotification(source, peer, turn, input, fingerprint),
-    replayCeoNotificationAck: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: CeoNotificationAckInput, fingerprint: string) =>
-      replayCeoNotificationAck(source, peer, turn, input, fingerprint),
+    replayCeoNotificationAck: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: CeoNotificationAckInput, fingerprint: string, reservationVerified: boolean) =>
+      replayCeoNotificationAck(source, peer, turn, input, fingerprint, reservationVerified),
     // Authentication owns admission; capture the role that authorized a session-bearing peer.
     peerAuthority: (peer: AuthenticatedMcpPeer): Decision<Record<string, unknown>> => {
       if (!peer.sessionId) return allow(ReasonCode.OK, {});
@@ -437,10 +437,10 @@ const createHermesServerFromPort = (
     async (args, extra) => write("ceo_notification_ack", args, extra, fingerprint => {
       const peer = authenticateMcpPeer(authenticate);
       return peer.allowed ? respond(port.acknowledgeCeoNotification(peer.value, admittedTurnOf(extra), args, fingerprint)) : respond(peer);
-    }, fingerprint => {
+    }, (fingerprint, reservationVerified) => {
       const peer = authenticateMcpPeer(authenticate);
       if (!peer.allowed) return respond(peer);
-      const replay = port.replayCeoNotificationAck(peer.value, admittedTurnOf(extra), args, fingerprint);
+      const replay = port.replayCeoNotificationAck(peer.value, admittedTurnOf(extra), args, fingerprint, reservationVerified);
       return replay ? respond(replay) : null;
     }),
   );

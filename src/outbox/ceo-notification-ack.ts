@@ -63,7 +63,7 @@ export const ceoNotificationAckAccess = (
 /** Recover a lost MCP response only from this holder's committed domain receipt. */
 export const replayCeoNotificationAck = (
   source: Source, peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: CeoNotificationAckInput,
-  mcpFingerprint: string,
+  mcpFingerprint: string, reservationVerified = false,
 ): Decision<AckResult> | null => {
   const access = ceoNotificationAckAccess(source, peer, turn, input.messageId);
   if (!access.allowed) return access;
@@ -73,7 +73,12 @@ export const replayCeoNotificationAck = (
     WHERE kind = 'CEO_NOTIFICATION_ACKED' AND session_id = ?
       AND json_extract(evidence_json, '$.idempotencyKeyDigest') = ?`, [peer.sessionId, sha256(input.idempotencyKey)]);
   // A fresh repeat key must go through MCP reservation, even when the row is already ACKED.
-  if (!receipt) return null;
+  if (!receipt) {
+    // A repeat key has no ACK audit of its own. Its verified MCP reservation binds the
+    // request/principal; access above proves this exact holder's existing ACK receipt.
+    return reservationVerified && access.value.row.status === "ACKED"
+      ? allow(ReasonCode.OK, { messageId: input.messageId }) : null;
+  }
   return receipt.messageId === input.messageId && receipt.fingerprint === mcpFingerprint && access.value.row.status === "ACKED"
     ? allow(ReasonCode.OK, { messageId: input.messageId })
     : deny(ReasonCode.CONFLICT, "notification ACK key belongs to another request or principal");

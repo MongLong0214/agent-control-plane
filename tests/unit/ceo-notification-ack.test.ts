@@ -142,9 +142,21 @@ it("refuses missing provenance and incomplete identity before reserving an MCP k
   expect(f.h.cp.db.all("SELECT * FROM inbound_messages")).toEqual(reservations);
 });
 
-it.each(["target", "generation", "binding", "PENDING"])("rechecks %s before replaying a stored success", async changed => {
+it.each(["target", "generation", "binding", "PENDING"].flatMap(changed => [
+  { changed, response: "stored success" }, { changed, response: "lost repeat response" },
+]))("rechecks $changed before replaying a $response", async ({ changed, response }) => {
   const f = await fixture();
   expect(await f.call()).toMatchObject({ ok: true });
+  const args = response === "lost repeat response" ? { idempotencyKey: "repeat" } : {};
+  if (response === "lost repeat response") {
+    const original = f.h.cp.db.run.bind(f.h.cp.db);
+    const store = vi.spyOn(f.h.cp.db, "run").mockImplementation((sql, params) => {
+      if (sql.includes("UPDATE inbound_messages SET result_json")) throw new Error("response store failed");
+      return original(sql, params);
+    });
+    expect(await f.call(args)).toMatchObject({ ok: false, reasonCode: "INTERNAL_ERROR" });
+    store.mockRestore();
+  }
   if (changed === "binding") {
     expect(f.h.cp.bindings.revoke("CEO", "binding replaced").allowed).toBe(true);
     expect(f.h.cp.bindings.bind({ role: Role.CEO, sessionId: f.ceo }).allowed).toBe(true);
@@ -154,7 +166,7 @@ it.each(["target", "generation", "binding", "PENDING"])("rechecks %s before repl
     f.h.cp.db.run(`UPDATE outbox SET ${sql} WHERE message_id = ?`, [f.messageId]);
   }
   const before = f.state();
-  expect(await f.call()).toMatchObject({ ok: false });
+  expect(await f.call(args)).toMatchObject({ ok: false });
   expect(f.state()).toEqual(before);
 });
 
@@ -173,6 +185,38 @@ it("recovers the exact ACK after response storage fails, refusing changed argume
   expect(await f.call({}, { ...owner, principal: "peer", peer_grant: grant })).toMatchObject({ ok: false, reasonCode: "CONFLICT" });
   expect(await f.call()).toMatchObject({ ok: true });
   expect(f.state()).toEqual(before);
+});
+
+it.each(["owner", "peer"])("recovers a new-key ACK repeat after response storage fails on a %s turn without another audit", async principal => {
+  const f = await fixture();
+  const turn = principal === "owner" ? owner : { ...owner, principal, peer_grant: grant };
+  const first = await f.call({ idempotencyKey: "key-A" }, turn);
+  expect(first).toMatchObject({ ok: true });
+  const other = f.h.cp.outbox.enqueue({ idempotencyKey: "another-notification", roleKey: "CEO",
+    targetSessionId: f.ceo, bindingGeneration: f.binding.bindingGeneration,
+    kind: MessageKind.CEO_NOTIFICATION, payload: {} });
+  if (!other.allowed) throw new Error(other.message);
+  f.h.cp.db.run("UPDATE outbox SET status = 'SENT', sent_at = ? WHERE message_id = ?", [f.h.clock.nowIso(), other.value.messageId]);
+  const before = f.state();
+  const original = f.h.cp.db.run.bind(f.h.cp.db);
+  const store = vi.spyOn(f.h.cp.db, "run").mockImplementation((sql, params) => {
+    if (sql.includes("UPDATE inbound_messages SET result_json")) throw new Error("response store failed for key B");
+    return original(sql, params);
+  });
+  expect(await f.call({ idempotencyKey: "key-B" }, turn)).toMatchObject({ ok: false, reasonCode: "INTERNAL_ERROR" });
+  store.mockRestore();
+  const reservation = f.h.cp.db.get<{ result_json: string }>(
+    "SELECT result_json FROM inbound_messages WHERE channel = 'mcp' AND nonce = 'key-B'")!;
+  expect(JSON.parse(reservation.result_json)).toMatchObject({ kind: "mcp-mutation", result: null });
+  expect(await f.call({ idempotencyKey: "key-B", messageId: other.value.messageId }, turn))
+    .toMatchObject({ ok: false, reasonCode: "CONFLICT" });
+  expect(await f.call({ idempotencyKey: "key-B" }, principal === "owner" ? { ...owner, principal: "peer", peer_grant: grant } : owner))
+    .toMatchObject({ ok: false, reasonCode: "CONFLICT" });
+  expect(await f.call({ idempotencyKey: "key-B" }, turn)).toEqual(first);
+  expect(f.state()).toEqual(before);
+  expect(f.h.cp.audit.byKind("CEO_NOTIFICATION_ACKED")).toHaveLength(1);
+  expect(f.h.cp.db.get("SELECT result_json FROM inbound_messages WHERE channel = 'mcp' AND nonce = 'key-B'"))
+    .toEqual(reservation);
 });
 
 it("rolls back notification ACK and audit on audit denial", async () => {
