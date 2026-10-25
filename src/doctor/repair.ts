@@ -1,12 +1,12 @@
 import { execFileSync } from "node:child_process";
 
 import type { Clock } from "../core/clock.ts";
-import { digestOf } from "../core/digest.ts";
+import { digestOf, sha256Hex } from "../core/digest.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
-import { type AuditLog, redact } from "../db/audit.ts";
+import { type AuditLog, type AuditRow, redact } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, type RunState } from "../domain/types.ts";
@@ -181,6 +181,7 @@ export class RepairService {
         "EXACT_PARAMETERS", "NON_TERMINAL_BOOTSTRAP_RUN", "RESERVED_APPLICATION",
         "CURRENT_PLAN_BINDING", "LATEST_PLAN_TASK", "CANCELLED_UNEXECUTED_TASK",
         "SINGLE_CANCEL_CAUSE", "NO_CANCELLED_RUN_TRANSITION", "NO_NEWER_TASK_GRAPH", "NO_OTHER_LIVE_TASK",
+        "CANCEL_REASON_DIGEST", "NO_LATER_TASK_CHANGE",
       ],
     },
     // #246 C3, CEO decision (b) as corrected — a cancelled run's reservation released once its
@@ -374,10 +375,17 @@ export class RepairService {
     return allow(ReasonCode.OK, receipt);
   }
 
-  /** All evidence is reloaded under the same BEGIN IMMEDIATE as the one-task write and receipt. */
+  /**
+   * Limited recovery: direct database writes are outside its threat model. It relies on
+   * the only product path writing this shape being the pre-fix non-atomic refused cancel,
+   * plus separately held evidence of the refused request whose reason digest the caller supplies.
+   * All evidence is reloaded under the same BEGIN IMMEDIATE as the one-task write and receipt.
+   */
   private restoreRefusedCancelBootstrapTask(operation: RepairOperation, request: RepairRequest): Decision<RepairReceipt> {
     const runId = request.parameters["runId"] ?? "";
     const taskId = request.parameters["taskId"] ?? "";
+    const suppliedDigest = request.parameters["cancelReasonSha256"] ?? "";
+    const validDigest = /^[0-9a-f]{64}$/.test(suppliedDigest);
     const run = this.db.get<{ kind: string; state: RunState; current_candidate_digest: string | null }>(
       `SELECT kind, state, current_candidate_digest FROM runs WHERE run_id = ?`, [runId],
     );
@@ -404,6 +412,8 @@ export class RepairService {
     const cancelledAt = alreadyRestored ? previous?.cancelledAt : task?.updated_at;
     const cancellations = events.filter(event => event.kind === "TASK_GRAPH_CANCELLED" && event.at === cancelledAt);
     const cancellation = cancellations.length === 1 ? cancellations[0] : undefined;
+    const reason = cancellation?.evidence["reason"];
+    const reasonDigest = typeof reason === "string" ? sha256Hex(reason) : null;
     const sameInstantTasks = tasks.filter(row => row.state === "CANCELLED" && row.updated_at === cancelledAt);
     const causal = cancellation !== undefined && cancellation.evidence["changes"] === 1 &&
       (alreadyRestored
@@ -417,9 +427,20 @@ export class RepairService {
       ["BOOTSTRAP_TASKS_SUPERSEDED", "TASK_GRAPH_SUBMITTED", "BOOTSTRAP_PLAN_TASKS"].includes(event.kind) &&
       cancellation !== undefined && event.eventId > cancellation.eventId);
     const otherLiveTasks = tasks.filter(row => row.task_id !== taskId && row.state !== "CANCELLED");
+    const namesTask = (value: unknown): boolean => value === taskId ||
+      (value !== null && typeof value === "object" && Object.values(value).some(namesTask));
+    // This repair's own reports name the task but are not subsequent task activity.
+    // The one READY write is accepted only through alreadyRestored's receipt/timestamp check.
+    const laterTaskEvents = events.filter(event => cancellation !== undefined && event.eventId > cancellation.eventId &&
+      !(event.evidence["operationId"] === operation.id &&
+        ["REPAIR_DRY_RUN", "REPAIR_EXECUTED", "REPAIR_REFUSED"].includes(event.kind)) && namesTask(event.evidence));
+    // Never copy event payloads (especially reason text) into repair reports or refusals.
+    const eventEvidence = (event: AuditRow) => ({
+      eventId: event.eventId, at: event.at, kind: event.kind, digest: digestOf(event.evidence),
+    });
     const checks = [
       checked("EXACT_PARAMETERS", runId !== "" && taskId !== "" &&
-        Object.keys(request.parameters).sort().join(",") === "runId,taskId" &&
+        validDigest && Object.keys(request.parameters).sort().join(",") === "cancelReasonSha256,runId,taskId" &&
         (request.runId == null || request.runId === runId), { runId, taskId }),
       checked("NON_TERMINAL_BOOTSTRAP_RUN", run !== undefined && run.kind === "PROJECT_BOOTSTRAP" &&
         !isTerminal(run.state), run ?? null),
@@ -430,13 +451,20 @@ export class RepairService {
       { planDigest: plan?.digest ?? null, candidatePlanDigest: candidate?.content?.bootstrapPlan?.planDigest ?? null }),
       checked("LATEST_PLAN_TASK", binding !== undefined && binding.evidence["planDigest"] === plan?.digest &&
         Array.isArray(binding.evidence["taskIds"]) && binding.evidence["taskIds"].length === 1 &&
-        binding.evidence["taskIds"][0] === taskId, { binding: binding ?? null }),
+        binding.evidence["taskIds"][0] === taskId, { binding: binding ? eventEvidence(binding) : null }),
       checked("CANCELLED_UNEXECUTED_TASK", task !== undefined && executions === 0 &&
         (task.state === "CANCELLED" || alreadyRestored), { task: task ?? null, executions, alreadyRestored }),
-      checked("SINGLE_CANCEL_CAUSE", causal, { cancellations, sameInstantTaskIds: sameInstantTasks.map(row => row.task_id) }),
-      checked("NO_CANCELLED_RUN_TRANSITION", cancelledTransitions.length === 0, { cancelledTransitions }),
-      checked("NO_NEWER_TASK_GRAPH", newerGraphs.length === 0, { newerGraphs }),
+      checked("SINGLE_CANCEL_CAUSE", causal,
+        { cancellations: cancellations.map(eventEvidence), sameInstantTaskIds: sameInstantTasks.map(row => row.task_id) }),
+      checked("NO_CANCELLED_RUN_TRANSITION", cancelledTransitions.length === 0,
+        { cancelledTransitions: cancelledTransitions.map(eventEvidence) }),
+      checked("NO_NEWER_TASK_GRAPH", newerGraphs.length === 0, { newerGraphs: newerGraphs.map(eventEvidence) }),
       checked("NO_OTHER_LIVE_TASK", otherLiveTasks.length === 0, { otherLiveTasks }),
+      checked("CANCEL_REASON_DIGEST", validDigest && reasonDigest !== null && reasonDigest === suppliedDigest,
+        { expected: validDigest ? suppliedDigest : null, observedDigest: reasonDigest }),
+      checked("NO_LATER_TASK_CHANGE", cancellation !== undefined &&
+        (alreadyRestored || task?.updated_at === cancellation.at) && laterTaskEvents.length === 0,
+      { updatedAt: task?.updated_at ?? null, cancelledAt: cancellation?.at ?? null, laterTaskEvents: laterTaskEvents.map(eventEvidence) }),
     ];
     const failed = checks.find(check => !check.satisfied);
     if (failed) return deny(ReasonCode.REPAIR_PRECONDITION_UNMET, `bootstrap task restore refused: ${failed.precondition}`, {
@@ -450,7 +478,7 @@ export class RepairService {
     return this.recordReceipt(operation, { ...request, runId }, checks, {
       changes,
       evidence: { runId, taskId, from: "CANCELLED", to: "READY", planDigest: plan!.digest,
-        cancelEventId: cancellation!.eventId, cancelledAt, restoredAt, alreadyRestored },
+        cancelEventId: cancellation!.eventId, cancelReasonSha256: reasonDigest, cancelledAt, restoredAt, alreadyRestored },
     }, true);
   }
 

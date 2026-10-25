@@ -1,6 +1,7 @@
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { currentBootstrapPlan } from "../../src/bootstrap/bootstrap-plan.ts";
+import { sha256Hex } from "../../src/core/digest.ts";
 import type { RepairRequest } from "../../src/doctor/repair.ts";
 import { deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -85,8 +86,10 @@ describe("atomic run cancel", () => {
 });
 
 const repairId = "restore_refused_cancel_bootstrap_task";
+const cancelReason = "operator cancel — 취소";
+const cancelReasonSha256 = sha256Hex(cancelReason);
 const request = (f: Fixture, dryRun = false): RepairRequest => ({
-  operationId: repairId, parameters: { runId: f.runId, taskId: f.taskId }, authorizedBy: "HERMES", dryRun,
+  operationId: repairId, parameters: { runId: f.runId, taskId: f.taskId, cancelReasonSha256 }, authorizedBy: "HERMES", dryRun,
 });
 
 const damaged = async (auditChanges: number | null = 1, otherTask = false) => {
@@ -102,10 +105,10 @@ const damaged = async (auditChanges: number | null = 1, otherTask = false) => {
   }, { writer: null })).toMatchObject({ allowed: true });
   f.clock.advance(1000);
   // The pre-fix path: committed task cancellation followed by a refused run transition.
-  if (auditChanges === 1) f.cp.tasks.cancelAll(f.runId, "operator cancel");
+  if (auditChanges === 1) f.cp.tasks.cancelAll(f.runId, cancelReason);
   else {
     f.cp.db.run("UPDATE tasks SET state = 'CANCELLED', updated_at = ? WHERE task_id = ?", [f.clock.nowIso(), f.taskId]);
-    if (auditChanges !== null) f.cp.audit.record({ kind: "TASK_GRAPH_CANCELLED", runId: f.runId, evidence: { reason: "operator cancel", changes: auditChanges } });
+    if (auditChanges !== null) f.cp.audit.record({ kind: "TASK_GRAPH_CANCELLED", runId: f.runId, evidence: { reason: cancelReason, changes: auditChanges } });
   }
   expect(f.cp.runs.transition(f.runId, RunState.CANCELLED, "operator cancel")).toMatchObject({ allowed: false });
   return f;
@@ -142,7 +145,14 @@ describe("restore_refused_cancel_bootstrap_task", () => {
       const dry = await f.cp.repair.execute(request(f, true));
       expect(dry, JSON.stringify(dry)).toMatchObject({ allowed: true, value: { dryRun: true, changes: 1 } });
       if (!dry.allowed) throw new Error(dry.message);
-      expect(dry.value.preconditionsChecked).toHaveLength(10);
+      expect(dry.value.preconditionsChecked).toHaveLength(12);
+      expect(dry.value.preconditionsChecked).toEqual(expect.arrayContaining([
+        expect.objectContaining({ precondition: "CANCEL_REASON_DIGEST", satisfied: true,
+          evidence: { expected: cancelReasonSha256, observedDigest: cancelReasonSha256 } }),
+        expect.objectContaining({ precondition: "NO_LATER_TASK_CHANGE", satisfied: true }),
+      ]));
+      expect(JSON.stringify(dry)).not.toContain(cancelReason);
+      expect(JSON.stringify(f.cp.audit.byKind("REPAIR_DRY_RUN"))).not.toContain(cancelReason);
       expect(dry.value.preconditionsChecked.every(check => check.satisfied)).toBe(true);
       expect(f.cp.audit.byKind("REPAIR_DRY_RUN")[0]!.evidence["target"]).toMatchObject({
         runId: f.runId, taskId: f.taskId, from: "CANCELLED", to: "READY", planDigest: f.planDigest,
@@ -150,6 +160,7 @@ describe("restore_refused_cancel_bootstrap_task", () => {
       expect({ ...unchangedRows(f), artifacts: before.artifacts }).toEqual(before);
       f.clock.advance(1000);
       expect(await f.cp.repair.execute(request(f))).toMatchObject({ allowed: true, value: { changes: 1 } });
+      expect(JSON.stringify(f.cp.audit.byKind("REPAIR_EXECUTED"))).not.toContain(cancelReason);
       expect(f.cp.tasks.require(f.taskId).state).toBe("READY");
       expect(f.cp.tasks.bootstrapReviewEntry(f.runId, f.planDigest)).toMatchObject({ allowed: true, value: { taskId: f.taskId } });
       const restored = unchangedRows(f);
@@ -160,6 +171,73 @@ describe("restore_refused_cancel_bootstrap_task", () => {
       f.clock.advance(1000);
       expect(await f.cp.repair.execute(request(f))).toMatchObject({ allowed: true, value: { changes: 0 } });
       expect(f.cp.tasks.list(f.runId)).toEqual(restored.tasks);
+    } finally { f.cp.close(); }
+  });
+
+  it.each([undefined, "0".repeat(64), cancelReasonSha256.toUpperCase(), `sha256:${cancelReasonSha256}`])(
+    "refuses a missing, wrong or malformed cancel reason digest (%s)", async digest => {
+      const f = await damaged();
+      try {
+        const req = request(f);
+        if (digest === undefined) delete req.parameters["cancelReasonSha256"];
+        else req.parameters["cancelReasonSha256"] = digest;
+        const before = unchangedRows(f);
+        for (const dryRun of [true, false]) {
+          const result = await f.cp.repair.execute({ ...req, dryRun });
+          expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET,
+            evidence: { refusal: digest === "0".repeat(64) ? "CANCEL_REASON_DIGEST" : "EXACT_PARAMETERS" } });
+          expect(unchangedRows(f)).toEqual(before);
+          expect(JSON.stringify(result)).not.toContain(cancelReason);
+        }
+        expect(JSON.stringify(f.cp.audit.byKind("REPAIR_REFUSED"))).not.toContain(cancelReason);
+      } finally { f.cp.close(); }
+    },
+  );
+
+  it.each(["TASK_STATE_CHANGED", "BOOTSTRAP_TASK_UPDATED", "CUSTOM_TASK_OBSERVED", "nested task reference"])(
+    "refuses a later audit naming the task: %s, even at the same instant", async kind => {
+      const f = await damaged();
+      try {
+        const evidence = kind === "nested task reference"
+          ? { target: { taskIds: [f.taskId] }, reason: cancelReason }
+          : { taskId: f.taskId, reason: cancelReason };
+        expect(f.cp.audit.record({ kind, runId: f.runId, evidence }).allowed).toBe(true);
+        const before = unchangedRows(f);
+        for (const dryRun of [true, false]) {
+          const result = await f.cp.repair.execute(request(f, dryRun));
+          expect(result).toMatchObject({ allowed: false, evidence: { refusal: "NO_LATER_TASK_CHANGE" } });
+          expect(unchangedRows(f)).toEqual(before);
+          expect(JSON.stringify(result)).not.toContain(cancelReason);
+        }
+        expect(JSON.stringify(f.cp.audit.byKind("REPAIR_REFUSED"))).not.toContain(cancelReason);
+      } finally { f.cp.close(); }
+    },
+  );
+
+  it("refuses a task changed and returned to CANCELLED after the cancellation", async () => {
+    const f = await damaged();
+    try {
+      f.clock.advance(1000);
+      f.cp.db.run("UPDATE tasks SET state = 'READY', updated_at = ? WHERE task_id = ?", [f.clock.nowIso(), f.taskId]);
+      f.clock.advance(1000);
+      f.cp.db.run("UPDATE tasks SET state = 'CANCELLED', updated_at = ? WHERE task_id = ?", [f.clock.nowIso(), f.taskId]);
+      const before = unchangedRows(f);
+      for (const dryRun of [true, false]) {
+        expect(await f.cp.repair.execute(request(f, dryRun))).toMatchObject({ allowed: false });
+        expect(unchangedRows(f)).toEqual(before);
+      }
+    } finally { f.cp.close(); }
+  });
+
+  it("refuses a repeat after a later audit names the restored task", async () => {
+    const f = await damaged();
+    try {
+      expect(await f.cp.repair.execute(request(f))).toMatchObject({ allowed: true, value: { changes: 1 } });
+      f.clock.advance(1000);
+      expect(f.cp.audit.record({ kind: "TASK_UPDATED", runId: f.runId, evidence: { taskId: f.taskId } }).allowed).toBe(true);
+      const before = unchangedRows(f);
+      expect(await f.cp.repair.execute(request(f))).toMatchObject({ allowed: false, evidence: { refusal: "NO_LATER_TASK_CHANGE" } });
+      expect(unchangedRows(f)).toEqual(before);
     } finally { f.cp.close(); }
   });
 
@@ -209,7 +287,7 @@ describe("restore_refused_cancel_bootstrap_task", () => {
           allowed: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET, evidence: { refusal: reason },
         });
         expect(unchangedRows(f)).toEqual(before);
-        expect(result.evidence["preconditions"]).toHaveLength(10);
+        expect(result.evidence["preconditions"]).toHaveLength(12);
       }
     } finally { f.cp.close(); }
   });
