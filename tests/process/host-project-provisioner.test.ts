@@ -3,8 +3,32 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync, realpathSync, statSync,
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
+import { getPublicKey } from 'nostr-tools';
 import type { ProjectAllocation } from '../../src/runtime/host-project-provisioner.ts';
+import { hostObservationSchema } from '../../src/runtime/host-project-provisioner.ts';
+import Database from 'better-sqlite3';
 import { cleanupTempDirs, tempDir } from '../helpers/fixtures.ts';
+
+// Only the tables and columns currentCanonicalCeoBuzzRoute reads, with one current canonical CEO.
+const writeCeoDatabase = (path:string, recipient:string) => {
+  const db = new Database(path);
+  db.exec(`CREATE TABLE assignments(assignment_id,binding_generation,actor_id,role_key,role,status);
+    CREATE TABLE conversational_actors(actor_id,current_session_id,current_session_incarnation);
+    CREATE TABLE sessions(session_id,incarnation,buzz_address,buzz_actor_id,lifecycle);
+    CREATE TABLE actor_target_bindings(target_binding_id,target_actor_id,executor_kind);
+    CREATE TABLE actor_target_attestations(target_binding_id,assignment_id,binding_generation,executor_session_id,executor_session_incarnation,target_bind_receipt_json,target_bind_executor_runtime_identity);
+    INSERT INTO assignments VALUES('asg_ceo',1,'act_ceo','CEO','CEO','ACTIVE');
+    INSERT INTO conversational_actors VALUES('act_ceo','ses_ceo','inc_ceo');
+    INSERT INTO actor_target_bindings VALUES('tb_ceo','act_ceo','hermes');
+    INSERT INTO actor_target_attestations VALUES('tb_ceo','asg_ceo',1,'ses_ceo','inc_ceo','{}','runtime');`);
+  db.prepare(`INSERT INTO sessions VALUES('ses_ceo','inc_ceo','ffffffff-ffff-4fff-8fff-ffffffffffff',?,'READY')`).run(recipient);
+  db.close();
+};
+const setCeoRecipient = (path:string, recipient:string|null) => {
+  const db = new Database(path);
+  if (recipient === null) db.exec(`DELETE FROM sessions`); else db.prepare(`UPDATE sessions SET buzz_actor_id = ?`).run(recipient);
+  db.close();
+};
 
 afterAll(cleanupTempDirs);
 const fixture = (profileReadback:Record<string,unknown> = {name:'cto-test'}) => {
@@ -17,7 +41,8 @@ const fixture = (profileReadback:Record<string,unknown> = {name:'cto-test'}) => 
   symlinkSync(generation,join(state,'current'));
   const a:ProjectAllocation = {projectId:'test',runId:'run_test',repositoryIdentity:'github:acme/fixture',repositoryNodeId:'R_node',head:'a'.repeat(40),sessionUuid:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',roomId:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',roomName:'test',clonePath:join(home,'projects','fixture'),tmuxName:'acp-74657374',socketPath:join(state,'cc-session-test.sock'),fleetName:'acp-test',identityName:'cto-test',privateKeyFile:join(home,'.hermes','bridge','keys','cto-test.priv'),bootPacket:join(home,'.claude','watchers','fleet','acp-test.boot.txt'),nonce:'nonce'};
   mkdirSync(join(home,'.hermes','bridge','keys'),{recursive:true});
-  writeFileSync(join(home,'.hermes','bridge','keys','owner.pub'),'c'.repeat(64));writeFileSync(join(home,'.hermes','bridge','keys','ceo2.pub'),'d'.repeat(64));
+  writeFileSync(join(home,'.hermes','bridge','keys','owner.pub'),'c'.repeat(64));
+  const database = join(home,'state.sqlite');writeCeoDatabase(database,'d'.repeat(64));
   mkdirSync(join(home,'.claude','scripts'),{recursive:true});writeFileSync(join(home,'.claude','scripts','claude-trust-dir.sh'),'#!/bin/sh\nexit 0\n',{mode:0o700});
   const fake = `#!${process.execPath}
 const fs = require('node:fs'), path = require('node:path');
@@ -50,7 +75,7 @@ else if(cmd === 'buzz') {
   const rosterFile=path.join(root,'.hermes','bridge','required-mentions.json');
   const roster=fs.existsSync(rosterFile) ? JSON.parse(fs.readFileSync(rosterFile,'utf8')) : {channels:{}};
   if(!roster.channels[value('--channel')]) {s.refusedSends=(s.refusedSends||0)+1;save();process.stderr.write('unregistered channel');process.exit(1);}
-  s.posts.push({id:'e'.repeat(64),pubkey:pk,content:value('--content')});out({});
+  const content=value('--content');s.posts.push({id:'e'.repeat(64),pubkey:pk,content:/(^|\\s)@ceo(\\s|$)/.test(content) ? content : '@ceo '+content});out({});
  }
  else if(args[0] === 'messages' && args[1] === 'get') out(s.posts);
  else process.exit(2);
@@ -60,16 +85,51 @@ save();
   for (const cmd of ['git','gh','docker','buzz','claude','tmux','ps','lsof']) writeFileSync(join(['buzz','claude'].includes(cmd) ? resolvedBin : bin,cmd),fake,{mode:0o700});
   writeFileSync(join(home,'allocation.json'),JSON.stringify(a));
   const script = fileURLToPath(new URL('../../dist/host/host-project-provisioner.mjs',import.meta.url));
-  const env = {...process.env,HOME:home,ACP_STATE_DIR:state,PATH:bin+':/usr/bin:/bin:/usr/sbin',ACP_BUZZ_BINARY:join(resolvedBin,'buzz'),ACP_CLAUDE_BINARY:join(resolvedBin,'claude'),ACP_RESOLVED_BUZZ_BINARY:join(home,'wrong-buzz'),ACP_RESOLVED_CLAUDE_BINARY:join(home,'wrong-claude'),CLAUDE_CONFIG_DIR:join(home,'.claude'),ACP_BUZZ_ADMISSION_COMMAND:JSON.stringify(['docker','exec','buzz-prod-relay-1','buzz-admin','add-member']),TEST_CLAUDE_PID:String(process.pid)};
+  const env = {...process.env,HOME:home,ACP_STATE_DIR:state,ACP_HOST_DATABASE_PATH:database,PATH:bin+':/usr/bin:/bin:/usr/sbin',ACP_BUZZ_BINARY:join(resolvedBin,'buzz'),ACP_CLAUDE_BINARY:join(resolvedBin,'claude'),ACP_RESOLVED_BUZZ_BINARY:join(home,'wrong-buzz'),ACP_RESOLVED_CLAUDE_BINARY:join(home,'wrong-claude'),CLAUDE_CONFIG_DIR:join(home,'.claude'),ACP_BUZZ_ADMISSION_COMMAND:JSON.stringify(['docker','exec','buzz-prod-relay-1','buzz-admin','add-member']),TEST_CLAUDE_PID:String(process.pid)};
   const invoke = async (operation:string, overrides:NodeJS.ProcessEnv = {}) => {
     const child = execFile(process.execPath,[script],{env:{...env,...overrides},timeout:30_000,maxBuffer:1_000_000});
     child.stdin!.end(JSON.stringify({version:1,operation,allocation:a,packet:{productIntent:'bytes'}}));
     const stdout = await new Promise<string>((resolve,reject) => {let data='';let err='';child.stdout!.on('data',x=>data+=String(x));child.stderr!.on('data',x=>err+=String(x));child.on('error',reject);child.on('close',code=>code===0 ? resolve(data) : reject(new Error(operation+": "+err)));});
     return JSON.parse(stdout) as Record<string,unknown>;
   };
-  return {home,state,bin,resolvedBin,runtimeNode,runtimeCli,a,script,env,invoke};
+  return {home,state,bin,resolvedBin,runtimeNode,runtimeCli,a,database,script,env,invoke};
 };
 const runtimeCommand = (f:ReturnType<typeof fixture>) => [f.runtimeNode,f.runtimeCli,'attach','resident-cto','--claimed-session-id',f.a.sessionUuid,'--project-id',f.a.projectId];
+
+const liveV1Roster = (version:1|undefined) => ({
+  ...(version === undefined ? {} : {version}),
+  relay:'wss://relay.invalid',
+  channels:Object.fromEntries(['a','b','c'].map((key,index) => [`${key.repeat(8)}-${key.repeat(4)}-4${key.repeat(3)}-8${key.repeat(3)}-${key.repeat(12)}`,{
+    relay_name:'production',ceo:{pubkey:'d'.repeat(64),handle:'ceo2'},
+    peer:{pubkey:String(index+1).repeat(64),handle:`cto-existing-${index}`},
+    classification:'current project',acp_project_id:`existing-${index}`,extra:{preserved:true},
+  }])),
+  known_profiles:{ceo2:'d'.repeat(64),owner:'c'.repeat(64)},
+});
+
+it.each([1,undefined] as const)('registers the live v1 roster (version %s) before the nonce and preserves it on retries',async version => {
+  const {home,a,invoke} = fixture();
+  const rosterFile = join(home,'.hermes','bridge','required-mentions.json');
+  const original = liveV1Roster(version);
+  writeFileSync(rosterFile,JSON.stringify(original,null,2)+'\n');
+  const result = await invoke('ensure-buzz');
+  const roomId = (result.buzz as {roomId:string}).roomId;
+  const pk = readFileSync(a.privateKeyFile.replace('.priv','.pub'),'utf8').trim();
+  const bytes = readFileSync(rosterFile,'utf8');
+  const before = statSync(rosterFile);
+  expect(JSON.parse(bytes)).toEqual({...original,channels:{...original.channels,[roomId]:{
+    relay_name:'production',ceo:{pubkey:'d'.repeat(64),handle:'ceo'},peer:{pubkey:pk,handle:a.identityName},
+    acp_project_id:a.projectId,classification:'current project',status:'active',
+  }}});
+  expect(JSON.parse(bytes)).not.toHaveProperty('generation');
+  expect(JSON.parse(readFileSync(join(home,'fake.json'),'utf8')).posts).toHaveLength(1);
+  await invoke('ensure-buzz');
+  a.roomId = roomId;
+  expect(hostObservationSchema.parse(await invoke('ensure-routing'))).toEqual({routing:{roomId}});
+  expect(readFileSync(rosterFile,'utf8')).toBe(bytes);
+  expect(statSync(rosterFile)).toMatchObject({ino:before.ino,mtimeMs:before.mtimeMs});
+  expect(JSON.parse(readFileSync(join(home,'fake.json'),'utf8')).posts).toHaveLength(1);
+});
 
 it('registers the verified room before the policy-enforced nonce send and leaves ensure-routing unchanged',async () => {
   const {home,a,invoke} = fixture();
@@ -82,10 +142,10 @@ it('registers the verified room before the policy-enforced nonce send and leaves
   const roster = readFileSync(rosterFile,'utf8');
   const before = statSync(rosterFile);
   expect(JSON.parse(roster)).toEqual({version:2,generation:1,channels:{[buzz.roomId]:{
-    relay_name:'production',ceo:{pubkey:'d'.repeat(64),handle:'ceo2'},peer:{pubkey:pk,handle:a.identityName},
+    relay_name:'production',ceo:{pubkey:'d'.repeat(64),handle:'ceo'},peer:{pubkey:pk,handle:a.identityName},
     acp_project_id:a.projectId,status:'active',classification:'project',
   }}});
-  expect(JSON.parse(readFileSync(join(home,'fake.json'),'utf8'))).toMatchObject({posts:[{content:`acp-provision:${a.nonce}`,pubkey:pk}]});
+  expect(JSON.parse(readFileSync(join(home,'fake.json'),'utf8'))).toMatchObject({posts:[{content:`@ceo acp-provision:${a.nonce}`,pubkey:pk}]});
   a.roomId = buzz.roomId;
   expect(await invoke('ensure-routing')).toEqual({routing:{generation:1,roomId:buzz.roomId}});
   expect(readFileSync(rosterFile,'utf8')).toBe(roster);
@@ -95,22 +155,97 @@ it('registers the verified room before the policy-enforced nonce send and leaves
   expect(JSON.parse(readFileSync(join(home,'fake.json'),'utf8')).posts).toHaveLength(1);
 });
 
-it.each(['ensure-buzz','ensure-routing'])('refuses a route conflict in %s without posting a nonce or changing the roster',async operation => {
+it.each([1,2].flatMap(version => ['ensure-buzz','ensure-routing'].flatMap(operation => ['project','peer','retired'].map(conflict => ({version,operation,conflict})))))(
+  'refuses a v$version $conflict route conflict in $operation without posting a nonce or changing the roster',async ({version,operation,conflict}) => {
   const {home,a,invoke} = fixture();
   const rosterFile = join(home,'.hermes','bridge','required-mentions.json');
   const roomId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
-  const roster = JSON.stringify({version:2,generation:7,channels:{[roomId]:{
-    acp_project_id:'other',peer:{pubkey:'0'.repeat(64)},status:'active',
+  writeFileSync(a.privateKeyFile,'1'.repeat(64)+'\n');
+  const pk = getPublicKey(Buffer.from('1'.repeat(64),'hex'));
+  const roster = JSON.stringify({version,...(version === 2 ? {generation:7} : {}),channels:{[roomId]:{
+    acp_project_id:conflict === 'project' ? 'other' : a.projectId,peer:{pubkey:conflict === 'peer' ? '0'.repeat(64) : pk},status:conflict === 'retired' ? 'retired' : 'active',
   }}})+'\n';
   writeFileSync(rosterFile,roster);
+  const before = statSync(rosterFile);
   // ensure-routing needs a key, while ensure-buzz must discover the actual room id itself.
-  writeFileSync(a.privateKeyFile,'1'.repeat(64)+'\n');
   if(operation === 'ensure-routing') a.roomId = roomId;
   await expect(invoke(operation)).rejects.toThrow('route conflict');
   expect(readFileSync(rosterFile,'utf8')).toBe(roster);
+  expect(statSync(rosterFile)).toMatchObject({ino:before.ino,mtimeMs:before.mtimeMs});
   if(operation === 'ensure-buzz') {
     expect(JSON.parse(readFileSync(join(home,'fake.json'),'utf8'))).toMatchObject({creates:1,posts:[]});
   }
+});
+
+it.each([1,2].flatMap(version => ['ceo-key','peer-key','array-key','same-key','invalid-handle','empty-handle','newline-handle','newline-key','room-uuid','newline-uuid','status',
+  ...(version === 1 ? ['known-profile-handle','known-profile-key','known-profiles-type','known-profiles-null'] : []),
+  ...(version === 2 ? ['ceo-handle','missing-status','missing-relay_name','missing-acp_project_id','missing-classification'] : []),
+].map(problem => ({version,problem}))))('refuses a v$version roster with invalid $problem without writing',async ({version,problem}) => {
+  const {home,a,invoke} = fixture();
+  writeFileSync(a.privateKeyFile,'1'.repeat(64)+'\n');
+  const room:Record<string,unknown> = {
+    ceo:{pubkey:'d'.repeat(64),handle:'ceo'},peer:{pubkey:'c'.repeat(64),handle:'cto-existing'},
+    status:'active',relay_name:'production',acp_project_id:'existing',classification:'current project',
+  };
+  if(problem === 'ceo-key') room.ceo = {pubkey:'z'.repeat(64),handle:'ceo'};
+  if(problem === 'peer-key') room.peer = {pubkey:'c'.repeat(63),handle:'cto-existing'};
+  if(problem === 'array-key') room.peer = {pubkey:['c'.repeat(64)],handle:'cto-existing'};
+  if(problem === 'same-key') room.peer = {pubkey:'d'.repeat(64),handle:'cto-existing'};
+  if(problem === 'invalid-handle') room.peer = {pubkey:'c'.repeat(64),handle:'cto existing'};
+  if(problem === 'newline-handle') room.peer = {pubkey:'c'.repeat(64),handle:'cto-existing\n'};
+  if(problem === 'newline-key') room.peer = {pubkey:'c'.repeat(64)+'\n',handle:'cto-existing'};
+  if(problem === 'empty-handle') room.peer = {pubkey:'c'.repeat(64),handle:''};
+  if(problem === 'ceo-handle') room.ceo = {pubkey:'d'.repeat(64),handle:'ceo2'};
+  if(problem === 'status') room.status = 'unknown';
+  if(problem.startsWith('missing-')) delete room[problem.slice('missing-'.length)];
+  const roomId = problem === 'room-uuid' ? '-'.repeat(36) : 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'+(problem === 'newline-uuid' ? '\n' : '');
+  const knownProfiles = problem === 'known-profile-handle' ? {'bad handle':'c'.repeat(64)} :
+    problem === 'known-profile-key' ? {owner:'invalid'} : problem === 'known-profiles-type' ? [] : problem === 'known-profiles-null' ? null : {owner:'c'.repeat(64)};
+  const bytes = JSON.stringify({version,...(version === 2 ? {generation:7} : {}),channels:{[roomId]:room},known_profiles:knownProfiles})+'\n';
+  const rosterFile = join(home,'.hermes','bridge','required-mentions.json');
+  writeFileSync(rosterFile,bytes);
+  const before = statSync(rosterFile);
+  await expect(invoke('ensure-routing')).rejects.toThrow('invalid roster');
+  expect(readFileSync(rosterFile,'utf8')).toBe(bytes);
+  expect(statSync(rosterFile)).toMatchObject({ino:before.ino,mtimeMs:before.mtimeMs});
+});
+
+it.each([['no-ceo-binding','current canonical CEO binding unavailable'],['ceo-key','current canonical CEO binding unavailable'],
+  ['same-key','invalid roster'],['room-uuid','invalid roster']])('validates the proposed route with %s before writing',async (problem,refusal) => {
+  const {home,a,database,invoke} = fixture();
+  writeFileSync(a.privateKeyFile,'1'.repeat(64)+'\n');
+  if(problem === 'no-ceo-binding') setCeoRecipient(database,null);
+  if(problem === 'ceo-key') setCeoRecipient(database,'invalid');
+  if(problem === 'same-key') setCeoRecipient(database,getPublicKey(Buffer.from('1'.repeat(64),'hex')));
+  if(problem === 'room-uuid') a.roomId = '-'.repeat(36);
+  const rosterFile = join(home,'.hermes','bridge','required-mentions.json');
+  await expect(invoke('ensure-routing')).rejects.toThrow(refusal);
+  expect(existsSync(rosterFile)).toBe(false);
+});
+
+it('takes the room CEO from the current canonical CEO binding, for both the room roster and the route',async () => {
+  const {home,database,invoke} = fixture();
+  const ceo = 'f'.repeat(64);setCeoRecipient(database,ceo);
+  const result = await invoke('ensure-buzz');
+  const roomId = (result.buzz as {roomId:string}).roomId;
+  expect(JSON.parse(readFileSync(join(home,'fake.json'),'utf8')).members).toContainEqual({pubkey:ceo,role:'admin'});
+  expect(JSON.parse(readFileSync(join(home,'.hermes','bridge','required-mentions.json'),'utf8')).channels[roomId].ceo).toEqual({pubkey:ceo,handle:'ceo'});
+});
+
+it('bumps an existing v2 generation once while preserving other rooms and ignoring known_profiles',async () => {
+  const {home,a,invoke} = fixture();
+  writeFileSync(a.privateKeyFile,'1'.repeat(64)+'\n');
+  const existing = {ceo:{pubkey:'d'.repeat(64),handle:'ceo'},peer:{pubkey:'c'.repeat(64),handle:'cto-existing'},
+    status:'retired',relay_name:'production',acp_project_id:'existing',classification:'project'};
+  const original = {version:2,generation:7,channels:{'cccccccc-cccc-4ccc-8ccc-cccccccccccc':existing},known_profiles:{ignored:true}};
+  const rosterFile = join(home,'.hermes','bridge','required-mentions.json');
+  writeFileSync(rosterFile,JSON.stringify(original));
+  expect(await invoke('ensure-routing')).toEqual({routing:{generation:8,roomId:a.roomId}});
+  const bytes = readFileSync(rosterFile,'utf8');
+  expect(JSON.parse(bytes)).toMatchObject({...original,generation:8});
+  expect(Object.keys(JSON.parse(bytes).channels)).toHaveLength(2);
+  expect(await invoke('ensure-routing')).toEqual({routing:{generation:8,roomId:a.roomId}});
+  expect(readFileSync(rosterFile,'utf8')).toBe(bytes);
 });
 
 it('registers acp-cto through the ACP current runtime',async () => {
