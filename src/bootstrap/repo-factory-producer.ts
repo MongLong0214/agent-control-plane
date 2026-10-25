@@ -1,4 +1,4 @@
-import { runSandboxed } from '../verify/sandbox.ts';
+import { runSandboxed, type SandboxOutcome } from '../verify/sandbox.ts';
 import { verificationCommandSchema } from '../contracts/verification-command.ts';
 import { parseGenesis, genesisBundleSchema, genesisPath } from './genesis-bundle.ts';
 import {
@@ -18,7 +18,7 @@ import { type Clock, systemClock } from "../core/clock.ts";
 import { canonicalJson, digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { git, tryRevParse, type GitResult } from "../git/git.ts";
+import { git, tryRevParse, withoutRepositoryPrograms, type GitResult } from "../git/git.ts";
 import { consumeWithheldExemption, readWithheldIntent, withheldUnsent } from "./bootstrap-approval-anchor.ts";
 import {
   COMMITLORE_VERIFICATION_ID,
@@ -951,6 +951,69 @@ export const produceRepoFactoryResult = async (
   writeFileSync(join(localRepoPath, ".git", "info", "exclude"), `${OPERATION_MARKER_NAME}\n`, { flag: "a" });
 
   const approvedTree = (at: string): Promise<Decision<void>> => producedTreeDrift(localRepoPath, at, approvedFiles);
+  const genesisVerification: Array<{
+    phase: "verifyGenesis" | "GENESIS_TEST";
+    head: string;
+    commandId: string;
+    cwd: string;
+    approvedArgv: string[];
+    executedArgv: string[];
+    compat?: "npm-test-node-test-in-process";
+    outcome: SandboxOutcome;
+  }> = [];
+  const genesisEvidence = () => genesisVerification.length ? { genesisVerification } : {};
+  const approvedGenesisCheckout = async (head: string): Promise<Decision<void>> => {
+    if (await tryRevParse(localRepoPath, "HEAD") !== head) {
+      return deny(ReasonCode.VERIFICATION_GAP, "genesis verification checkout/head mismatch", { head, ...genesisEvidence() });
+    }
+    const tree = await approvedTree(head);
+    if (!tree.allowed) return tree;
+    // Include ignored files: Node's discovery can execute them too. Only the producer's
+    // own ignored ownership marker is bookkeeping rather than an unapproved input.
+    const programs = await withoutRepositoryPrograms(localRepoPath);
+    const status = await git(localRepoPath, [...programs, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching", "--ignore-submodules=dirty"], { allowFailure: true });
+    const changes = status.stdout.split("\0").filter(entry => entry && entry !== `!! ${OPERATION_MARKER_NAME}`);
+    if (status.exitCode !== 0 || changes.length) {
+      return deny(ReasonCode.VERIFICATION_GAP, "genesis verification requires the clean approved worktree", { head, changes, ...genesisEvidence() });
+    }
+    return allow(ReasonCode.OK, undefined);
+  };
+  // This compatibility is confined to the two RF genesis verification steps. The approved
+  // command stays frozen; all limits and sandbox executable resolution stay unchanged.
+  const verifyGenesisCommands = async (
+    head: string,
+    phase: "verifyGenesis" | "GENESIS_TEST",
+    failureMessage: string,
+  ): Promise<Decision<void>> => {
+    if (!plan.genesis || !plan.verificationCommands?.length) return deny(ReasonCode.VERIFICATION_GAP, "genesis test commands missing", {});
+    for (const command of plan.verificationCommands) {
+      const before = await approvedGenesisCheckout(head);
+      if (!before.allowed) return before;
+      let compat: "npm-test-node-test-in-process" | undefined;
+      if (canonicalJson(command.argv) === canonicalJson(["npm", "test"])) {
+        // Read the immutable approved git object, never candidate-writable package bytes.
+        // A package in the command's cwd is required; no parent-package/cwd inference.
+        const pkg = await git(localRepoPath, ["--no-replace-objects", "cat-file", "blob", `${head}:${join(command.cwd, "package.json")}`], { allowFailure: true });
+        if (pkg.exitCode === 0) {
+          try {
+            const parsed = z.object({ scripts: z.record(z.unknown()) }).safeParse(JSON.parse(pkg.stdout));
+            if (parsed.success && parsed.data.scripts["test"] === "node --test" &&
+                !Object.hasOwn(parsed.data.scripts, "pretest") && !Object.hasOwn(parsed.data.scripts, "posttest")) {
+              compat = "npm-test-node-test-in-process";
+            }
+          } catch { /* Invalid package JSON keeps the approved invocation unchanged. */ }
+        }
+      }
+      const execution = compat ? { ...command, argv: ["node", "--test", "--experimental-test-isolation=none"] } : command;
+      const outcome = await runSandboxed({ command: execution, worktreePath: localRepoPath, denyReadPaths: [dirname(dirname(input.workDir))] });
+      genesisVerification.push({ phase, head, commandId: command.id, cwd: command.cwd,
+        approvedArgv: [...command.argv], executedArgv: [...execution.argv], ...(compat ? { compat } : {}), outcome });
+      const after = await approvedGenesisCheckout(head);
+      if (outcome.status !== "PASS") return deny(ReasonCode.VERIFICATION_GAP, failureMessage, { commandId: command.id, status: outcome.status, ...genesisEvidence() });
+      if (!after.allowed) return after;
+    }
+    return allow(ReasonCode.OK, undefined, genesisEvidence());
+  };
   // #246 C5 — a create-only plan makes no commit and pushes none: the checkout stays unborn until the
   // create's step fetches the commit GitHub's initialization made and resets onto it.
   let validatedHead: string | null = null;
@@ -1088,13 +1151,7 @@ export const produceRepoFactoryResult = async (
           return checked.allowed ? allow(ReasonCode.OK,head) : checked as Decision<string>;
         },
         verifyGenesis: async (head) => {
-          if (await tryRevParse(localRepoPath,"HEAD") !== head || !plan.verificationCommands?.length) return deny(ReasonCode.VERIFICATION_GAP,"genesis PR checkout/head mismatch",{});
-          for (const command of plan.verificationCommands) {
-            const outcome = await runSandboxed({command,worktreePath:localRepoPath,denyReadPaths:[dirname(dirname(input.workDir))]});
-            if (outcome.status !== "PASS") return deny(ReasonCode.VERIFICATION_GAP,"genesis PR local verification failed",{commandId:command.id,status:outcome.status});
-          }
-          if (await tryRevParse(localRepoPath,"HEAD") !== head) return deny(ReasonCode.VERIFICATION_GAP,"genesis PR head moved during verification",{});
-          return approvedTree(head);
+          return verifyGenesisCommands(head, "verifyGenesis", "genesis PR local verification failed");
         },
         validatedHead,
       });
@@ -1104,7 +1161,7 @@ export const produceRepoFactoryResult = async (
     }
     if (!outcome.allowed) {
       cleanup();
-      return outcome as Decision<RepoFactoryResult>;
+      return { ...outcome, evidence: { ...outcome.evidence, ...genesisEvidence() } } as Decision<RepoFactoryResult>;
     }
     applied = outcome.value;
   }
@@ -1162,11 +1219,8 @@ export const produceRepoFactoryResult = async (
   // that denies is a genuine observation, not a fabricated one, and it must refuse rather
   // than record PASS regardless.
   if (plan.verificationKind === "GENESIS_TEST") {
-    if (!plan.genesis || !plan.verificationCommands?.length) return deny(ReasonCode.VERIFICATION_GAP,"genesis test commands missing",{});
-    for (const command of plan.verificationCommands) {
-      const outcome = await runSandboxed({command,worktreePath:localRepoPath,denyReadPaths:[dirname(dirname(input.workDir))]});
-      if (outcome.status !== "PASS") {cleanup();return deny(ReasonCode.VERIFICATION_GAP,"genesis tests failed or could not be confined",{commandId:command.id,status:outcome.status});}
-    }
+    const verified = await verifyGenesisCommands(head, "GENESIS_TEST", "genesis tests failed or could not be confined");
+    if (!verified.allowed) { cleanup(); return verified as Decision<RepoFactoryResult>; }
   }
   const verificationSpec = VERIFICATION_KINDS.CLEAN_TREE;
   const verificationRun = await gitOrCleanup(verificationSpec.argv, { allowFailure: true });
@@ -1287,5 +1341,5 @@ export const produceRepoFactoryResult = async (
       throw thrown;
     }
   }
-  return allow(ReasonCode.OK, result);
+  return allow(ReasonCode.OK, result, genesisEvidence());
 };
