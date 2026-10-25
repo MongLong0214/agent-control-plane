@@ -1,5 +1,4 @@
-import { BOOTSTRAP_PLAN_MAX_BYTES } from "./bootstrap-plan-artifact.ts";
-import type { ReviewEvidenceFile } from "./bootstrap-review-evidence.ts";
+import { BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES, type ReviewEvidenceFile } from "./bootstrap-review-evidence.ts";
 import { parseGitHubIdentity } from "./github-write-port.ts";
 import type { ProjectManifest } from "../contracts/manifest.ts";
 import { sha256 } from "../core/digest.ts";
@@ -29,6 +28,12 @@ export async function verifyReviewGithubEntry(client: GitHubClient, file: Review
   if (!workflows.length) return attributed("No ACP-approved Actions workflows are available");
   const root = `/repos/${target.owner}/${target.name}`;
   const facts: ReviewRecordVerification["facts"] = [];
+  let factBudgetExceeded = false;
+  const budgetRefusal = () => attributed("ACP API facts exceed the 512 KiB review evidence observation bound");
+  const withinBudget = () => {
+    factBudgetExceeded = Buffer.byteLength(JSON.stringify(facts)) > BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES;
+    return !factBudgetExceeded;
+  };
   const summarize = (value: unknown): unknown => {
     if (!value || typeof value !== "object") return null;
     const v = value as Record<string, unknown>;
@@ -43,7 +48,7 @@ export async function verifyReviewGithubEntry(client: GitHubClient, file: Review
     if (method !== "GET") throw new Error("review evidence uses GET only");
     const result = await client.request<T>(method, path, body);
     facts.push({ path, response: summarize(result) });
-    if (Buffer.byteLength(JSON.stringify(facts)) > BOOTSTRAP_PLAN_MAX_BYTES) throw new Error("API facts exceed staging bound");
+    if (!withinBudget()) throw new Error("API facts exceed review evidence observation bound");
     return result;
   } };
   try {
@@ -57,8 +62,11 @@ export async function verifyReviewGithubEntry(client: GitHubClient, file: Review
     if (commit.sha !== request.sha) return attributed("GitHub commit identity differs");
     const checks = await observeApprovedWorkflowChecks(observed, { root, owner: target.owner, repo: target.name,
       head: request.sha, workflows, requiredChecks });
+    if (factBudgetExceeded) return budgetRefusal();
     if (checks.state !== "success") return attributed(`Required exact-head Actions provenance/coverage is ${checks.state}`);
+    facts.push({ path: "ACP active manifest coverage", response: { repositoryIdentity: request.repositoryIdentity, sha: request.sha, requiredChecks, workflows } });
+    if (!withinBudget()) return budgetRefusal();
     return { status: "ACP-verified", reason: "Only the API facts below were independently confirmed; the attached file and bundle remain attributed",
-      facts: [...facts, { path: "ACP active manifest coverage", response: { repositoryIdentity: request.repositoryIdentity, sha: request.sha, requiredChecks, workflows } }] };
-  } catch { return attributed("ACP could not confirm public GitHub provenance and complete required coverage"); }
+      facts };
+  } catch { return factBudgetExceeded ? budgetRefusal() : attributed("ACP could not confirm public GitHub provenance and complete required coverage"); }
 }

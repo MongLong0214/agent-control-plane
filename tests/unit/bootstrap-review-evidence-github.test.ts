@@ -14,7 +14,7 @@ const manifest = fixtureManifest("approved", {
   ciWorkflows: [{ repositoryRole: "primary", path: ".github/workflows/ci.yml", checkName: "test", approvedDigest: sha256(workflow), unapprovedFirstActivation: false }],
   postMergeCommands: ["acceptance"],
 });
-const client = (fault = "") => {
+const client = (fault = "", factPadding = 0) => {
   const calls: string[] = [];
   const repository = { id: 4, full_name: "acme/fixture" };
   const api: GitHubClient = { async request<T>(method: string, path: string): Promise<T> {
@@ -27,7 +27,7 @@ const client = (fault = "") => {
       const name = new URL("https://example.test" + path).searchParams.get("check_name")!;
       result = { check_runs: name === "acceptance" && fault === "missing coverage" ? [] : [{ id: 41, name, head_sha: fault === "wrong head" ? "b".repeat(40) : head,
         status: "completed", conclusion: fault === "failed" ? "failure" : "success", app: { slug: "github-actions" }, check_suite: { id: 51 },
-        details_url: "https://github.com/acme/fixture/actions/runs/61/job/41" }] };
+        details_url: "https://github.com/acme/fixture/actions/runs/61/job/41?" + "f".repeat(factPadding) }] };
     } else if (path.includes("/check-suites/")) result = { id: 51, repository, head_sha: head, app: { slug: "github-actions" } };
     else if (path.includes("/actions/runs/")) result = { id: 61, repository: fault === "foreign repository" ? { id: 5, full_name: "other/repo" } : repository,
       check_suite_id: fault === "unrelated suite" ? 52 : 51, head_sha: head, path: fault === "wrong workflow" ? ".github/workflows/other.yml" : ".github/workflows/ci.yml", status: "completed", conclusion: "success" };
@@ -56,6 +56,18 @@ describe("private review GitHub originals earn verification only for queried fac
       expect((await verifyReviewGithubEntry(f.api, entry, manifest)).status).toBe("attributed");
       if (fault === "private") expect(f.calls).toHaveLength(1);
     });
+  it.each([70 * 1024, 280 * 1024])("bounds independently queried facts at 512 KiB (padding=%i)", async padding => {
+    const f = client("", padding);
+    const result = await verifyReviewGithubEntry(f.api, entry, manifest);
+    if (padding === 70 * 1024) {
+      expect(result.status).toBe("ACP-verified");
+      expect(Buffer.byteLength(JSON.stringify(result.facts))).toBeGreaterThan(128 * 1024);
+      expect(Buffer.byteLength(JSON.stringify(result.facts))).toBeLessThanOrEqual(512 * 1024);
+    } else {
+      expect(result).toMatchObject({ status: "attributed", facts: [] });
+      expect(result.reason).toContain("512 KiB");
+    }
+  });
   it("never treats a bare success string, author contract or non-GitHub original as verified", async () => {
     const f = client();
     expect((await verifyReviewGithubEntry(f.api, entry, null)).status).toBe("attributed");
