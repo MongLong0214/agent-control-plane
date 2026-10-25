@@ -177,7 +177,7 @@ describe("RF genesis approved worktree checks", () => {
       const opened = vi.spyOn(f.port, "openGenesisPull").mockImplementation(async (...args) => {
         await open(...args);
         expect(lstatSync(join(f.checkout, "test/smoke.test.js")).mode & 0o777).toBe(0o600);
-        expect(execFileSync("git", ["-C", f.checkout, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
+        expect(execFileSync("git", ["-C", f.checkout, "status", "--porcelain"], { encoding: "utf8", timeout: 30_000 })).toBe("");
       });
       const decision = await produceRepoFactoryResult(f.input);
       expect(opened).toHaveBeenCalledTimes(1);
@@ -203,7 +203,7 @@ describe("RF genesis approved worktree checks", () => {
       const f = fixture();
       const mutate = () => {
         const path = "test/smoke.test.js";
-        const git = (...args: string[]) => execFileSync("git", ["-C", f.checkout, ...args], { encoding: "utf8" });
+        const git = (...args: string[]) => execFileSync("git", ["-C", f.checkout, ...args], { encoding: "utf8", timeout: 30_000 });
         if (kind === "ignored") writeFileSync(join(f.checkout, "ignored.test.js"), passing);
         else if (kind === "mode") {
           git("config", "core.filemode", "false");
