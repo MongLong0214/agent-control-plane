@@ -1,0 +1,16 @@
+Limit: a bootstrap plan review now also carries the CEO's authenticated resume-review release (labelled for re-review only, never a verification log or PASS), the daemon's own startup facts kept separate from gate results, and a PRIMARY_CTO-staged, CEO-attached review evidence bundle whose items keep their grades, missing list and excerpt ranges; only facts ACP itself queried with approved provenance and complete check coverage are marked ACP-verified (blind review 2 R1/R2, CEO cf04873, 574e2728).
+Limit: the activation handoff tells the resident CTO to inspect existing runs and dependencies first, avoid duplicates and assign the seeded issues by independent rollback responsibility while keeping every issue's acceptance linked, never one run per issue mechanically (blind review 2 R3, CEO decision 156782 F3).
+Record-Id: r-08103756b5da
+Provenance: inherited 2cabc8967444abbcb46491553b84e167b18c3617
+
+Limit: a bootstrap PLAN freezes only an exact digest-bound reference to the CEO-selected review evidence; the original bytes stay in the private HANDOFF candidate and the reviewer resolves them from there by attachment digest (CEO 677a24d8, review ACP1204-R1-01)
+Limit: review evidence staging, CEO attachment, cached replay and PLAN freeze are all bound to the current bootstrapPlanDigest; a replaced bootstrap PLAN attachment refuses them
+Limit: a superseded review evidence selection cannot be made current again (A then B then A is refused before any state change, B stays current, a retry of the current B succeeds idempotently; CEO 677a24d8, review ACP1204-R1-02)
+Warn: older PLAN artifacts that copied private review originals inline are omitted whole from run and baseline exports to keep their certified bytes and digests unchanged; do not re-render or strip them in place
+Record-Id: r-835e0f00d934
+Provenance: inherited 49f8006375416ef0c3e79ba92525b7fbadf279b6
+
+Limit: attachBootstrapReviewEvidence is a converted tx-denial site: if its attachment audit refuses, the new selection rolls back and the prior selection stays current
+Warn: the private bootstrap review context (#1204) is stored as a HANDOFF artifact before activation, next to PLAN inputs; a reader that takes the latest HANDOFF as the activation package is wrong, select through isBootstrapPlanInputArtifact as BootstrapActivation does
+Record-Id: r-39f0c4dd7851
+Provenance: inherited c926fdaa9d92fb09f9c72e6613e8c78bcb86d325
