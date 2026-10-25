@@ -218,7 +218,7 @@ try {
       run(admission[0],[...admission.slice(1),'--pubkey',pk,'--role','member']);
       buzz(['users','set-profile','--name',a.identityName]);
       const profiles = buzz(['users','get','--pubkey',pk]);
-      check(Array.isArray(profiles) && profiles.some(p => p.pubkey === pk && (p.name === a.identityName || p.profile?.name === a.identityName)),'profile readback mismatch');
+      check(Array.isArray(profiles) && profiles.some(p => p.pubkey === pk && (p.name === a.identityName || p.profile?.name === a.identityName || p.display_name === a.identityName)),'profile readback mismatch');
       const intentFile = join(state,`buzz-room-${a.projectId}.json`);
       // The intent predates creation, including when the relay's response is lost.
       const intended = {name:a.roomName ?? a.projectId,pubkey:pk,runId:a.runId};
