@@ -1,0 +1,10 @@
+Limit: scripts/ssot-report.mjs checks the README status banner, so the hero keeps the top-level blockquote line starting > **Status: not production-ready.**
+Warn: the README does not copy counts or states from the issue tracker; link the tracker or a query instead of typing a number or an open/closed state into it
+Record-Id: r-23c6ea92a418
+Provenance: inherited ab595276998295ea5af3948ecc097e65c3efbef0
+
+Limit: scripts/ssot-report.mjs checks only README.md, so nothing gates README.ko.md's status banner or its parity with README.md
+Warn: README.ko.md mirrors README.md section for section and no check keeps them in step; change both files together, and keep each Korean in-page anchor equal to GitHub's slug of its Korean heading
+Warn: in README.ko.md a closing ** right after a code span and directly followed by a Hangul particle does not render as bold on GitHub; put such bold code spans in parentheses or before whitespace or punctuation
+Record-Id: r-1460f3ebc0f3
+Provenance: inherited 3884076390b8bc37415294d7e221928106a63f2a
