@@ -1,0 +1,7 @@
+Limit: The 2026-10-25 bootstrap task restore admits causal cancellation evidence, not timing alone: exactly one task in the changes=1 event, no CANCELLED run transition at or after it, and no newer task graph.
+Record-Id: r-548991d5014d
+Provenance: inherited 17f2c962b160e79b764b2c4d46581f0e6a94cf17
+
+Limit: This repair does not defend against direct database writes; it relies on the only product path writing this shape being the pre-fix non-atomic refused cancel, and separately held evidence of the refused request whose reason digest the caller supplies.
+Record-Id: r-01c5fd7a23fb
+Provenance: inherited beba8584d8d30069996bd3456f988faa07d8aa90
