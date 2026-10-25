@@ -11,6 +11,7 @@ import { ExecutionMode, Role, roleKeyFor } from "../../src/domain/types.ts";
 import { BlindReviewGate, REVIEWER_FALLBACK_SCOPE_UNCONFIGURED, __testing, type ReviewPacket } from "../../src/review/blind-review.ts";
 import { CandidatePipeline } from "../../src/run/candidate-pipeline.ts";
 import { canonical } from "../../src/guard/workspace-probe.ts";
+import { diffPatch } from "../../src/git/git.ts";
 import { ClaudeCliAdapter, reviewerEnvironment } from "../../src/runtime/cli-adapters.ts";
 import {
   ProviderSessionProvisionError,
@@ -168,6 +169,52 @@ it("re-reviews the same candidate after an accepted 55,000-character MINOR findi
     }
     // The finding remains intact in its immutable evidence artifact, as on main.
     expect(setup.harness.cp.artifacts.list<ReviewPacket>(setup.run.runId, "BLIND_REVIEW")[0]!.content.findings).toEqual([finding]);
+  } finally {
+    setup.harness.cp.close();
+  }
+});
+
+it("chunks when the serialized input exceeds the budget although raw-patch accounting fits", async () => {
+  const setup = await prepareReviewedInputs();
+  try {
+    // Capture a real single review to size the boundary fixture without pinning prompt wording.
+    const first = await directReview(setup);
+    if (!first.allowed) throw new Error(first.message);
+    const baseline = setup.harness.scripted.invocations.at(-1)!;
+    const baselineChars = baseline.prompt.length + (baseline.systemPrompt?.length ?? 0);
+    const repo = setup.snapshot.repositories[0]!;
+    const originalDiff = await diffPatch(setup.harness.repoPath, repo.baseHead, repo.candidateHead);
+    const formattedDiff = [`### ${setup.identity}`, "Files:", "- src/app.js", "```diff", originalDiff, "```", ""].join("\n");
+    expect(baseline.prompt).toContain(formattedDiff);
+    const framingChars = formattedDiff.length - originalDiff.length;
+    const targetChars = 120_010;
+    const oldEstimate = targetChars - framingChars;
+    expect(oldEstimate).toBeLessThanOrEqual(120_000);
+
+    // Extending the existing line changes only patch bytes; all bound IDs keep their widths.
+    const padding = targetChars - baselineChars - " // ".length;
+    expect(padding).toBeGreaterThan(0);
+    writeFiles(setup.harness.repoPath, { "src/app.js": `module.exports = () => 2; // ${"x".repeat(padding)}\n` });
+    const head = commitAll(setup.harness.repoPath, "near-budget candidate");
+    const diff = await diffPatch(setup.harness.repoPath, repo.baseHead, head);
+    expect(baselineChars + diff.length - originalDiff.length).toBe(targetChars);
+    const frozen = await setup.harness.cp.pipeline.freeze(setup.run.runId);
+    if (!frozen.allowed) throw new Error(frozen.message);
+    const next = { ...setup, snapshot: frozen.value, verification: persistPassingVerification(setup, frozen.value) };
+    const before = setup.harness.scripted.invocations.length;
+    setup.harness.scripted.script(
+      { match: /Candidate review|Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`]), once: false },
+      { match: /Final review/, text: reviewerPass([]) },
+    );
+    const result = await invokePreparedReview(next);
+    const calls = setup.harness.scripted.invocations.slice(before);
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) {
+      expect(call.prompt.length + (call.systemPrompt?.length ?? 0), `old estimate: ${oldEstimate}`).toBeLessThanOrEqual(120_000);
+    }
+    expect(result).toMatchObject({ allowed: true, value: { verdict: "PASS", chunked: true } });
+    expect(calls.filter(call => call.prompt.startsWith("# Review chunk")).length).toBeGreaterThan(1);
+    expect(calls.filter(call => call.prompt.startsWith("# Final review"))).toHaveLength(1);
   } finally {
     setup.harness.cp.close();
   }

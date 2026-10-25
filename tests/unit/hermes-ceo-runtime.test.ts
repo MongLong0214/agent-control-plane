@@ -145,11 +145,13 @@ describe("the CEO runtime's attachment", () => {
     // would satisfy the protocol and tell the owner something nobody wrote.
     expect(replies[0]).toMatchObject({
       id: 7,
-      result: { role: "assistant", content: { type: "text", text: "은행 잔고는?" } },
+      result: { role: "assistant", content: { type: "text", text: `${frontierReviewPolicy()}\n\n은행 잔고는?` } },
     });
   });
 
   it.each([
+    "Inspect PR #1208 and report concrete defects with file:line evidence",
+    "Check the repaired PR #1208 again against the original findings",
     "Please review PR #1208 for the first time.",
     "Re-review PR #1208 after the repairs; the earlier findings are attached.",
     "수정된 PR #1208을 다시 검토해 주세요.",

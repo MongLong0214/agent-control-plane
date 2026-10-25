@@ -507,7 +507,6 @@ export class BlindReviewGate {
       // #1166 r3 — the listings get only the room left under the reviewer budget after the other
       // metadata, the chunk envelope and a share for the change itself, so they never crowd out
       // the diff or push the metadata past the budget. A cut is marked in the packet.
-      const diffChars = diffs.reduce((n, d) => n + d.diff.length, 0);
       const bareEvidence = candidateEvidenceSection(this.db, request.runId, trees, 0);
       const bareOverhead = this.promptOverhead(request, change, bareEvidence);
       // The change's real share of a prompt, repository and file fences included.
@@ -515,8 +514,10 @@ export class BlindReviewGate {
       const evidenceRoom = CHUNK_THRESHOLD_CHARS - 4_096 - Math.min(diffShare, EVIDENCE_DIFF_RESERVE_CHARS) - bareOverhead;
       const evidenceSection = candidateEvidenceSection(this.db, request.runId, trees, evidenceRoom);
 
-      const totalChars = diffChars + this.promptOverhead(request, change, evidenceSection);
-      const chunked = totalChars > CHUNK_THRESHOLD_CHARS;
+      // Measure the complete input, including diff framing and system instructions, and send
+      // this same rendered prompt if it fits.
+      const prompt = this.buildPrompt(request, diffs, undefined, change, evidenceSection);
+      const chunked = prompt.length + REVIEWER_TRANSPORT_INSTRUCTIONS.length > CHUNK_THRESHOLD_CHARS;
 
       let outcome: Decision<ReviewOutcome>;
       if (chunked) {
@@ -525,7 +526,7 @@ export class BlindReviewGate {
         const reviewer = await this.constituteReviewer(request);
         if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
         rememberReviewer(reviewer.value);
-        outcome = await this.singleReview(request, this.buildPrompt(request, diffs, undefined, change, evidenceSection), reviewer.value);
+        outcome = await this.singleReview(request, prompt, reviewer.value);
       }
 
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
