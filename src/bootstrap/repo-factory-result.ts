@@ -55,6 +55,11 @@ export const repoFactoryResultSchema = z
             repositoryIdentity: z.string().min(1),
             exactHead: z.string().min(1),
             status: z.literal("PASS"),
+            // Optional v2 additions: legacy results gain no defaults. New invocation
+            // fields are included in the artifact's existing digestOf(content).
+            approvedArgv: z.array(z.string()).min(1).optional(),
+            executedArgv: z.array(z.string()).min(1).optional(),
+            compat: z.literal("npm-test-node-test-in-process").optional(),
           })
           .strict(),
       )

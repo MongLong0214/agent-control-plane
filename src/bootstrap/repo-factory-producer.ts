@@ -1,9 +1,10 @@
-import { runSandboxed } from '../verify/sandbox.ts';
+import { runSandboxed, type SandboxOutcome } from '../verify/sandbox.ts';
 import { verificationCommandSchema } from '../contracts/verification-command.ts';
 import { parseGenesis, genesisBundleSchema, genesisPath } from './genesis-bundle.ts';
 import {
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -951,6 +952,93 @@ export const produceRepoFactoryResult = async (
   writeFileSync(join(localRepoPath, ".git", "info", "exclude"), `${OPERATION_MARKER_NAME}\n`, { flag: "a" });
 
   const approvedTree = (at: string): Promise<Decision<void>> => producedTreeDrift(localRepoPath, at, approvedFiles);
+  const genesisVerification: Array<{
+    phase: "verifyGenesis" | "GENESIS_TEST";
+    head: string;
+    commandId: string;
+    cwd: string;
+    approvedArgv: string[];
+    executedArgv: string[];
+    compat?: "npm-test-node-test-in-process";
+    outcome: SandboxOutcome;
+  }> = [];
+  const genesisEvidence = () => genesisVerification.length ? { genesisVerification } : {};
+  const approvedGenesisCheckout = async (head: string): Promise<Decision<void>> => {
+    if (await tryRevParse(localRepoPath, "HEAD") !== head) {
+      return deny(ReasonCode.VERIFICATION_GAP, "genesis verification checkout/head mismatch", { head, ...genesisEvidence() });
+    }
+    const tree = await approvedTree(head);
+    if (!tree.allowed) return tree;
+    // Git status trusts assume-unchanged/skip-worktree and core.filemode. Read disk
+    // instead, including ignored files that Node's default discovery can execute.
+    // Never follow symlinks; only .git and our root ownership marker are excluded.
+    const expected = new Map(approvedFiles.map(file => [file.path, file]));
+    const seen = new Set<string>();
+    const changes: string[] = [];
+    const walk = (directory: string): void => {
+      for (const name of readdirSync(join(localRepoPath, directory))) {
+        if (!directory && (name === ".git" || name === OPERATION_MARKER_NAME)) continue;
+        const path = directory ? `${directory}/${name}` : name;
+        const stat = lstatSync(join(localRepoPath, path));
+        if (stat.isDirectory()) {
+          walk(path);
+          continue;
+        }
+        seen.add(path);
+        const file = expected.get(path);
+        // Git records regular-file type and owner execute, not umask-dependent permissions.
+        if (!file || !stat.isFile() || ((stat.mode & 0o100) !== 0) !== (file.mode === "100755") ||
+            !readFileSync(join(localRepoPath, path)).equals(file.contentBase64 === undefined
+              ? Buffer.from(file.content, "utf8") : Buffer.from(file.contentBase64, "base64"))) changes.push(path);
+      }
+    };
+    try {
+      walk("");
+    } catch {
+      return deny(ReasonCode.VERIFICATION_GAP, "genesis verification requires the clean approved worktree", { head, unreadable: true, ...genesisEvidence() });
+    }
+    changes.push(...[...expected.keys()].filter(path => !seen.has(path)));
+    if (changes.length) {
+      return deny(ReasonCode.VERIFICATION_GAP, "genesis verification requires the clean approved worktree", { head, changes: changes.sort(), ...genesisEvidence() });
+    }
+    return allow(ReasonCode.OK, undefined);
+  };
+  // This compatibility is confined to the two RF genesis verification steps. The approved
+  // command stays frozen; all limits and sandbox executable resolution stay unchanged.
+  const verifyGenesisCommands = async (
+    head: string,
+    phase: "verifyGenesis" | "GENESIS_TEST",
+    failureMessage: string,
+  ): Promise<Decision<void>> => {
+    if (!plan.genesis || !plan.verificationCommands?.length) return deny(ReasonCode.VERIFICATION_GAP, "genesis test commands missing", {});
+    for (const command of plan.verificationCommands) {
+      const before = await approvedGenesisCheckout(head);
+      if (!before.allowed) return before;
+      let compat: "npm-test-node-test-in-process" | undefined;
+      if (canonicalJson(command.argv) === canonicalJson(["npm", "test"])) {
+        // Read the immutable approved git object, never candidate-writable package bytes.
+        // A package in the command's cwd is required; no parent-package/cwd inference.
+        const pkg = await git(localRepoPath, ["--no-replace-objects", "cat-file", "blob", `${head}:${join(command.cwd, "package.json")}`], { allowFailure: true });
+        if (pkg.exitCode === 0) {
+          try {
+            const parsed = z.object({ scripts: z.record(z.unknown()) }).safeParse(JSON.parse(pkg.stdout.replace(/^\uFEFF/, "")));
+            if (parsed.success && parsed.data.scripts["test"] === "node --test" &&
+                !Object.hasOwn(parsed.data.scripts, "pretest") && !Object.hasOwn(parsed.data.scripts, "posttest")) {
+              compat = "npm-test-node-test-in-process";
+            }
+          } catch { /* Invalid package JSON keeps the approved invocation unchanged. */ }
+        }
+      }
+      const execution = compat ? { ...command, argv: ["node", "--test", "--experimental-test-isolation=none"] } : command;
+      const outcome = await runSandboxed({ command: execution, worktreePath: localRepoPath, denyReadPaths: [dirname(dirname(input.workDir))] });
+      genesisVerification.push({ phase, head, commandId: command.id, cwd: command.cwd,
+        approvedArgv: [...command.argv], executedArgv: [...execution.argv], ...(compat ? { compat } : {}), outcome });
+      const after = await approvedGenesisCheckout(head);
+      if (outcome.status !== "PASS") return deny(ReasonCode.VERIFICATION_GAP, failureMessage, { commandId: command.id, status: outcome.status, ...genesisEvidence() });
+      if (!after.allowed) return after;
+    }
+    return allow(ReasonCode.OK, undefined, genesisEvidence());
+  };
   // #246 C5 — a create-only plan makes no commit and pushes none: the checkout stays unborn until the
   // create's step fetches the commit GitHub's initialization made and resets onto it.
   let validatedHead: string | null = null;
@@ -1088,13 +1176,7 @@ export const produceRepoFactoryResult = async (
           return checked.allowed ? allow(ReasonCode.OK,head) : checked as Decision<string>;
         },
         verifyGenesis: async (head) => {
-          if (await tryRevParse(localRepoPath,"HEAD") !== head || !plan.verificationCommands?.length) return deny(ReasonCode.VERIFICATION_GAP,"genesis PR checkout/head mismatch",{});
-          for (const command of plan.verificationCommands) {
-            const outcome = await runSandboxed({command,worktreePath:localRepoPath,denyReadPaths:[dirname(dirname(input.workDir))]});
-            if (outcome.status !== "PASS") return deny(ReasonCode.VERIFICATION_GAP,"genesis PR local verification failed",{commandId:command.id,status:outcome.status});
-          }
-          if (await tryRevParse(localRepoPath,"HEAD") !== head) return deny(ReasonCode.VERIFICATION_GAP,"genesis PR head moved during verification",{});
-          return approvedTree(head);
+          return verifyGenesisCommands(head, "verifyGenesis", "genesis PR local verification failed");
         },
         validatedHead,
       });
@@ -1104,7 +1186,7 @@ export const produceRepoFactoryResult = async (
     }
     if (!outcome.allowed) {
       cleanup();
-      return outcome as Decision<RepoFactoryResult>;
+      return { ...outcome, evidence: { ...outcome.evidence, ...genesisEvidence() } } as Decision<RepoFactoryResult>;
     }
     applied = outcome.value;
   }
@@ -1162,11 +1244,8 @@ export const produceRepoFactoryResult = async (
   // that denies is a genuine observation, not a fabricated one, and it must refuse rather
   // than record PASS regardless.
   if (plan.verificationKind === "GENESIS_TEST") {
-    if (!plan.genesis || !plan.verificationCommands?.length) return deny(ReasonCode.VERIFICATION_GAP,"genesis test commands missing",{});
-    for (const command of plan.verificationCommands) {
-      const outcome = await runSandboxed({command,worktreePath:localRepoPath,denyReadPaths:[dirname(dirname(input.workDir))]});
-      if (outcome.status !== "PASS") {cleanup();return deny(ReasonCode.VERIFICATION_GAP,"genesis tests failed or could not be confined",{commandId:command.id,status:outcome.status});}
-    }
+    const verified = await verifyGenesisCommands(head, "GENESIS_TEST", "genesis tests failed or could not be confined");
+    if (!verified.allowed) { cleanup(); return verified as Decision<RepoFactoryResult>; }
   }
   const verificationSpec = VERIFICATION_KINDS.CLEAN_TREE;
   const verificationRun = await gitOrCleanup(verificationSpec.argv, { allowFailure: true });
@@ -1239,6 +1318,13 @@ export const produceRepoFactoryResult = async (
     cleanup();
     return deny(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,"genesis CI is not yet verified at the published head",{});
   }
+  // The runner persists result, not Decision.evidence. Retain the invocation at the
+  // published head for every genesis command, including unchanged commands.
+  const invocationAtPublishedHead = (commandId: string) => {
+    const record = genesisVerification.find(row => row.phase === "GENESIS_TEST" && row.commandId === commandId && row.head === head);
+    return record ? { approvedArgv: record.approvedArgv, executedArgv: record.executedArgv,
+      ...(record.compat ? { compat: record.compat } : {}) } : {};
+  };
   const result: RepoFactoryResult = {
     schema: REPO_FACTORY_RESULT_SCHEMA_ID,
     runId: plan.runId,
@@ -1260,12 +1346,14 @@ export const produceRepoFactoryResult = async (
     ],
     externalWriteReceipts: receipts,
     bootstrapVerification: [
-      ...(plan.verificationCommands?.slice(1).map(command => ({commandId:command.id,repositoryIdentity:identity,exactHead:head,status:"PASS" as const})) ?? []),
+      ...(plan.verificationCommands?.slice(1).map(command => ({commandId:command.id,repositoryIdentity:identity,exactHead:head,status:"PASS" as const,
+        ...invocationAtPublishedHead(command.id)})) ?? []),
       {
         commandId: plan.verificationCommandId,
         repositoryIdentity: identity,
         exactHead: head,
         status: "PASS",
+        ...invocationAtPublishedHead(plan.verificationCommandId),
       },
       ...(commitlorePass === null ? [] : [{ commandId: COMMITLORE_VERIFICATION_ID, repositoryIdentity: identity, exactHead: head, status: "PASS" as const }]),
     ],
@@ -1287,5 +1375,5 @@ export const produceRepoFactoryResult = async (
       throw thrown;
     }
   }
-  return allow(ReasonCode.OK, result);
+  return allow(ReasonCode.OK, result, genesisEvidence());
 };
