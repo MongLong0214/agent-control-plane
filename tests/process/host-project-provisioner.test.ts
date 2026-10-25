@@ -7,7 +7,7 @@ import type { ProjectAllocation } from '../../src/runtime/host-project-provision
 import { cleanupTempDirs, tempDir } from '../helpers/fixtures.ts';
 
 afterAll(cleanupTempDirs);
-const fixture = () => {
+const fixture = (profileReadback:Record<string,unknown> = {name:'cto-test'}) => {
   const home = realpathSync(tempDir('resident-host-home-'));const state = join(home,'acp');const bin = join(home,'bin');mkdirSync(bin);const resolvedBin = join(home,'resolved');mkdirSync(resolvedBin);
   const a:ProjectAllocation = {projectId:'test',runId:'run_test',repositoryIdentity:'github:acme/fixture',repositoryNodeId:'R_node',head:'a'.repeat(40),sessionUuid:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',roomId:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',roomName:'test',clonePath:join(home,'projects','fixture'),tmuxName:'acp-74657374',socketPath:join(state,'cc-session-test.sock'),fleetName:'acp-test',identityName:'cto-test',privateKeyFile:join(home,'.hermes','bridge','keys','cto-test.priv'),bootPacket:join(home,'.claude','watchers','fleet','acp-test.boot.txt'),nonce:'nonce'};
   mkdirSync(join(home,'.hermes','bridge','keys'),{recursive:true});
@@ -35,7 +35,7 @@ else if(cmd === 'ps') {if(s.launched) {if(args.includes('command=')) out('claude
 else if(cmd === 'lsof') out('n'+a.clonePath+'\\n');
 else if(cmd === 'buzz') {
  const pk = fs.readFileSync(a.privateKeyFile.replace('.priv','.pub'),'utf8').trim();
- if(args[0] === 'users') out([{pubkey:pk,name:a.identityName}]);
+ if(args[0] === 'users') out([{pubkey:pk,...${JSON.stringify(profileReadback)}}]);
  else if(args[0] === 'channels' && args[1] === 'search') out(s.room ? (s.ambiguous ? [s.room,{...s.room,channel_id:'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'}] : [s.room]) : []);
  else if(args[0] === 'channels' && args[1] === 'create') {if(args.includes('--id') || !process.env.BUZZ_PRIVATE_KEY || process.env.BUZZ_IDENTITY !== a.identityName) process.exit(3);const intent=JSON.parse(fs.readFileSync(path.join(process.env.ACP_STATE_DIR,'buzz-room-test.json'),'utf8'));if(intent.name!==value('--name') || intent.pubkey!==pk) process.exit(4);s.creates++;s.room={channel_id:'ffffffff-ffff-4fff-8fff-ffffffffffff',name:value('--name'),channel_type:value('--type'),visibility:value('--visibility')};s.members=[{pubkey:pk,role:'owner'}];save();if(s.loseCreate) {s.loseCreate=false;save();process.exit(1);}out(s.room);}
  else if(args[0] === 'channels' && args[1] === 'add-member') {const pubkey=value('--pubkey');s.members=s.members.filter(m=>m.pubkey!==pubkey);s.members.push({pubkey,role:value('--role')});out({});}
@@ -58,6 +58,28 @@ save();
   };
   return {home,state,bin,resolvedBin,a,script,env,invoke};
 };
+it.each([
+  ['name',{name:'cto-test'}],
+  ['profile.name',{profile:{name:'cto-test'}}],
+  // The CLI's compact users get response contains only pubkey and display_name.
+  ['display_name',{display_name:'cto-test'}],
+] as const)('accepts the Buzz profile readback with %s and the expected pubkey',async (_field,profile) => {
+  const {a,invoke} = fixture(profile);
+  const result = await invoke('ensure-buzz');
+  expect(result.buzz).toMatchObject({pubkey:readFileSync(a.privateKeyFile.replace('.priv','.pub'),'utf8').trim(),rosterVerified:true,nonceReadable:true});
+});
+
+it.each([
+  ['different display_name',{display_name:'cto-other'}],
+  ['different pubkey',{display_name:'cto-test',pubkey:'0'.repeat(64)}],
+  ['unsupported field',{displayName:'cto-test'}],
+] as const)('refuses the Buzz profile readback with %s',async (_reason,profile) => {
+  const {home,state,invoke} = fixture(profile);
+  await expect(invoke('ensure-buzz')).rejects.toThrow('profile readback mismatch');
+  expect(JSON.parse(readFileSync(join(home,'fake.json'),'utf8')).creates).toBe(0);
+  expect(existsSync(join(state,'buzz-room-test.json'))).toBe(false);
+});
+
 it.each(['normal','lost-response-after-create','ambiguity'])('runs packaged host provisioner with %s Buzz recovery in temp HOME',async recovery => {
   const {home,state,a,script,env,invoke} = fixture();
   await invoke('ensure-checkout');
