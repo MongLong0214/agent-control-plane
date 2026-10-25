@@ -1,0 +1,5 @@
+Limit: ensureRouting refuses when required-mentions.json changed between its read and its write, but other roster writers share no lock, so a write landing between that re-read and the rename can still be overwritten
+Warn: the Buzz policy wrapper prepends '@<counterpart handle> ' to a send that lacks it, so any provisioner readback of its own post must compare the wrapper's form; the nonce is therefore sent as '@ceo acp-provision:<nonce>'
+Warn: the room CEO (room admin and routing entry) comes from currentCanonicalCeoBuzzRoute's recipient, not ceo2.pub or a handle variable; ensure-buzz and ensure-routing now need ACP_HOST_DATABASE_PATH and refuse without exactly one current canonical CEO binding
+Record-Id: r-d88025f3e859
+Provenance: inherited e96067f56e30c5e01beb3305936d27dcd4c7cc3c
