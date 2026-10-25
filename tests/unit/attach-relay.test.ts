@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ATTACH_EXIT, runAttachRelay, type AttachRelayClaim } from "../../src/cli/attach-relay.ts";
+import { MAX_MCP_LINE_BYTES } from "../../src/core/mcp-limits.ts";
 import type { Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startDaemonMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
@@ -411,7 +412,7 @@ describe("the canonical CTO attach relay", () => {
     const junkPath = join(stateDir, "j.sock");
     await listen(
       createServer((socket) => {
-        socket.once("data", () => socket.write(Buffer.alloc(1024 * 1024 + 16, 0x41)));
+        socket.once("data", () => socket.write(Buffer.alloc(MAX_MCP_LINE_BYTES + 1, 0x41)));
       }),
       junkPath,
     );

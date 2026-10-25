@@ -8,13 +8,16 @@ import { ArtifactKind, RunState } from "../domain/types.ts";
 import type { AuthenticatedMcpPeer } from "../mcp/shared.ts";
 import type { HermesAdmittedTurn } from "../mcp/hermes-provenance.ts";
 import type { BootstrapApplications } from "./bootstrap-applications.ts";
-import { BOOTSTRAP_PLAN_MAX_BYTES, bootstrapPlanAttachAuthority, bootstrapStagingIdentity, currentBootstrapInputRun,
+import { bootstrapPlanAttachAuthority, bootstrapStagingIdentity, currentBootstrapInputRun,
   readBootstrapPlanAttachment, validateBootstrapPlanDigests } from "./bootstrap-plan-artifact.ts";
 import { screenPublicText } from "./genesis-bundle.ts";
 
 type Source = Parameters<typeof currentBootstrapInputRun>[0] & {
   bootstrapApplications: Pick<BootstrapApplications, "assertNotFrozen">;
 };
+// Review originals and independently queried API facts each get a separate bounded budget.
+// API facts follow the evidence limit, never consume or truncate original file bytes.
+export const BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES = 512 * 1024;
 const CANDIDATE = "acp.bootstrap-review-evidence-candidate.v1";
 const ATTACHED = "acp.bootstrap-review-evidence-attached.v1";
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
@@ -52,8 +55,8 @@ const referenceOf = ({ bundle: _bundle, ...reference }: FrozenReviewEvidence): F
 
 const parseBundle = (body: string, input: ReviewEvidenceInput): Decision<ReviewEvidenceBundle> => {
   const bytes = Buffer.from(body, "utf8");
-  if (bytes.length > BOOTSTRAP_PLAN_MAX_BYTES || bytes.toString("utf8") !== body) {
-    return deny(ReasonCode.INVALID_ARGUMENT, `review evidence bundle exceeds the existing ${BOOTSTRAP_PLAN_MAX_BYTES}-byte UTF-8 staging limit; no automatic summaries, split uploads or external references. Explicit excerpts must identify the original digest and line ranges and preserve failure, fix and result sections`);
+  if (bytes.length > BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES || bytes.toString("utf8") !== body) {
+    return deny(ReasonCode.INVALID_ARGUMENT, `review evidence bundle exceeds the ${BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES}-byte UTF-8 staging limit; no automatic summaries, split uploads or external references. Explicit excerpts must identify the original digest and line ranges and preserve failure, fix and result sections`);
   }
   if (sha256(bytes) !== input.expectedSha256) return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "review evidence bundle hash differs");
   let value: unknown;
@@ -216,10 +219,11 @@ export async function originalReviewRecords(record: FrozenReviewEvidence | null,
   let apiFactBytes = 0;
   for (const { bodyBase64, ...file } of record.bundle.files) {
     const withheld = file.grade === "implementer-final-report";
-    let verification = !withheld && verify && apiFactBytes < BOOTSTRAP_PLAN_MAX_BYTES ? await verify({ ...file, bodyBase64 })
-      : { status: "attributed" as const, reason: "ACP has not independently verified this content", facts: [] };
+    let verification = !withheld && verify && apiFactBytes < BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES ? await verify({ ...file, bodyBase64 })
+      : { status: "attributed" as const, reason: apiFactBytes >= BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES
+        ? "ACP API facts exceed the 512 KiB review evidence observation bound" : "ACP has not independently verified this content", facts: [] };
     const factBytes = Buffer.byteLength(JSON.stringify(verification.facts));
-    if (apiFactBytes + factBytes > BOOTSTRAP_PLAN_MAX_BYTES) verification = { status: "attributed", reason: "ACP API facts exceed the shared 128 KiB observation bound", facts: [] };
+    if (apiFactBytes + factBytes > BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES) verification = { status: "attributed", reason: "ACP API facts exceed the 512 KiB review evidence observation bound", facts: [] };
     else apiFactBytes += factBytes;
     // Free-form manifest fields can carry the same reasoning as the withheld body.
     files.push(withheld ? { grade: file.grade, sha256: file.sha256, verification, withheld: "producer self-assessment" }

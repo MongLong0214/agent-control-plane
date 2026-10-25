@@ -1781,7 +1781,7 @@ describe("private bootstrap review originals and serving runtime", () => {
         if (fault === "forged verification") file.verification = "ACP-verified";
         if (["author reasoning", "CTO reasoning", "worker reasoning", "chat history"].includes(fault)) file.grade = fault;
         if (fault === "missing excerpt sections") file.excerpt = { originalSha256: sha256("original"), omitted: true, ranges: [{ section: "result", startLine: 20, endLine: 22 }] };
-        if (fault === "oversized") file.origin = "x".repeat(128 * 1024);
+        if (fault === "oversized") file.origin = "x".repeat(512 * 1024);
         const body = JSON.stringify({ runId: fault === "wrong run" ? "run_other" : f.run.runId, contractDigest: f.run.contractDigest,
           files: fault === "duplicate path" ? [file, file] : [file], missing: ["#58 raw RED/GREEN", "#60 raw RED/GREEN", "#59 raw output"] });
         const before = f.h.cp.artifacts.list(f.run.runId);
@@ -1790,6 +1790,69 @@ describe("private bootstrap review originals and serving runtime", () => {
         expect(f.h.cp.artifacts.list(f.run.runId)).toEqual(before);
       } finally { await f.close(); }
     });
+
+  it.each([512 * 1024, 512 * 1024 + 1])("bounds review evidence by UTF-8 bytes at %i", async size => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      const base = JSON.stringify({ runId: f.run.runId, contractDigest: f.run.contractDigest, files: [], missing: [""] });
+      const padding = size - Buffer.byteLength(base);
+      const body = JSON.stringify({ runId: f.run.runId, contractDigest: f.run.contractDigest, files: [],
+        missing: ["é".repeat(Math.floor(padding / 2)) + "x".repeat(padding % 2)] });
+      expect(Buffer.byteLength(body)).toBe(size);
+      expect(body.length).toBeLessThan(size);
+      const before = f.h.cp.artifacts.list(f.run.runId);
+      const result = await f.call("bootstrap_review_evidence_stage", { idempotencyKey: "byte-boundary", runId: f.run.runId,
+        contractDigest: f.run.contractDigest, bootstrapPlanDigest: f.digest, evidenceBody: body, expectedSha256: sha256(body) });
+      expect(result).toMatchObject(size === 512 * 1024 ? { ok: true } : { ok: false, reasonCode: "INVALID_ARGUMENT" });
+      if (size > 512 * 1024) expect(f.h.cp.artifacts.list(f.run.runId)).toEqual(before);
+    } finally { await f.close(); }
+  });
+
+  it("keeps the PLAN byte limit at 128 KiB plus one on staging and attachment", async () => {
+    const f = await stagingFixture();
+    try {
+      const value = JSON.parse(f.body);
+      const padding = 128 * 1024 + 1 - Buffer.byteLength(JSON.stringify(value));
+      value.plan.summary += "é".repeat(Math.floor(padding / 2)) + " ".repeat(padding % 2);
+      const planBody = JSON.stringify(value);
+      expect(Buffer.byteLength(planBody)).toBe(128 * 1024 + 1);
+      const args = { planBody, expectedSha256: sha256(planBody) };
+      expect(await f.stage(args)).toMatchObject({ ok: false, reasonCode: "INVALID_ARGUMENT" });
+      expect(await f.attach(args)).toMatchObject({ ok: false, reasonCode: "INVALID_ARGUMENT" });
+    } finally { await f.close(); }
+  });
+
+  it("delivers large original files whole through staging, attachment, freeze and the actual reviewer packet", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      const originals = ["correction.log", "review.txt", "deployment.log"].map(path => ({ path,
+        text: `${path}: failure\n` + "é original result\n".repeat(4000) + `${path}: fix and result END\n` }));
+      const bundle = { runId: f.run.runId, contractDigest: f.run.contractDigest, missing: [], files: originals.map(({ path, text }) => ({
+        path, origin: "original records", grade: "execution-log", sha256: sha256(text), bodyBase64: Buffer.from(text).toString("base64") })) };
+      const evidenceBody = JSON.stringify(bundle);
+      expect(Buffer.byteLength(evidenceBody)).toBeGreaterThan(128 * 1024);
+      expect(Buffer.byteLength(evidenceBody)).toBeLessThanOrEqual(512 * 1024);
+      const args = { runId: f.run.runId, contractDigest: f.run.contractDigest, bootstrapPlanDigest: f.digest, expectedSha256: sha256(evidenceBody) };
+      expect(await f.call("bootstrap_review_evidence_stage", { ...args, idempotencyKey: "large-originals", evidenceBody })).toMatchObject({ ok: true });
+      expect(await f.hermes("bootstrap_review_evidence_attach", { ...args, idempotencyKey: "attach-large-originals", stagedBy: f.primary.roleKey })).toMatchObject({ ok: true });
+      expect(await f.cto("plan_submit", { idempotencyKey: "freeze-large-originals", runId: f.run.runId, bootstrapPlanDigest: f.digest })).toMatchObject({ ok: true });
+      const plan = f.h.cp.artifacts.latest<Args>(f.run.runId, "PLAN")!;
+      expect(frozenBootstrapReviewEvidence(f.h.cp, f.run.runId, plan.content)?.bundle).toEqual(bundle);
+      const verify = vi.fn(async (file: { path: string }) => ({ status: "ACP-verified" as const, reason: "fixture observation",
+        facts: [{ path: file.path, response: `${file.path}:` + "f".repeat(180 * 1024) + ":FACT-END" }] }));
+      f.h.cp.review.attach({ verifyOriginalRecord: verify });
+      f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
+      expect(await f.cto("result_submit", { idempotencyKey: "review-large-originals", runId: f.run.runId,
+        resultSummary: "review", recommendation: "review" })).toMatchObject({ ok: true });
+      const prompt = f.h.scripted.invocations.find(i => /Bootstrap plan review/.test(i.prompt))!.prompt;
+      for (const original of originals) expect(prompt.includes(original.text), original.path).toBe(true);
+      for (const original of originals.slice(0, 2)) expect(prompt.includes(`${original.path}:` + "f".repeat(180 * 1024) + ":FACT-END")).toBe(true);
+      expect(prompt).toContain("ACP API facts exceed the 512 KiB review evidence observation bound");
+      expect(verify).toHaveBeenCalledTimes(3);
+    } finally { await f.close(); }
+  });
 
   it("admits only current PRIMARY_CTO staging and CEO selection; freezes the selected originals", async () => {
     const f = await stagingFixture();
