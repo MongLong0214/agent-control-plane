@@ -9,6 +9,12 @@ import { cleanupTempDirs, tempDir } from '../helpers/fixtures.ts';
 afterAll(cleanupTempDirs);
 const fixture = (profileReadback:Record<string,unknown> = {name:'cto-test'}) => {
   const home = realpathSync(tempDir('resident-host-home-'));const state = join(home,'acp');const bin = join(home,'bin');mkdirSync(bin);const resolvedBin = join(home,'resolved');mkdirSync(resolvedBin);
+  const runtimeNode = join(state,'current','dist','bin','node');const runtimeCli = join(state,'current','dist','cli','agentctl.js');
+  const generation = join(state,'generations','fixture');
+  mkdirSync(join(generation,'dist','bin'),{recursive:true});mkdirSync(join(generation,'dist','cli'),{recursive:true});
+  writeFileSync(join(generation,'dist','bin','node'),'#!/bin/sh\nexit 99\n',{mode:0o700});
+  writeFileSync(join(generation,'dist','cli','agentctl.js'),'throw new Error("runtime must not run in tests");');
+  symlinkSync(generation,join(state,'current'));
   const a:ProjectAllocation = {projectId:'test',runId:'run_test',repositoryIdentity:'github:acme/fixture',repositoryNodeId:'R_node',head:'a'.repeat(40),sessionUuid:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',roomId:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',roomName:'test',clonePath:join(home,'projects','fixture'),tmuxName:'acp-74657374',socketPath:join(state,'cc-session-test.sock'),fleetName:'acp-test',identityName:'cto-test',privateKeyFile:join(home,'.hermes','bridge','keys','cto-test.priv'),bootPacket:join(home,'.claude','watchers','fleet','acp-test.boot.txt'),nonce:'nonce'};
   mkdirSync(join(home,'.hermes','bridge','keys'),{recursive:true});
   writeFileSync(join(home,'.hermes','bridge','keys','owner.pub'),'c'.repeat(64));writeFileSync(join(home,'.hermes','bridge','keys','ceo2.pub'),'d'.repeat(64));
@@ -25,7 +31,7 @@ const value = f => args[args.indexOf(f)+1];
 if(cmd === 'gh') out('R_node');
 else if(cmd === 'git') { if(args[0] === 'clone') fs.mkdirSync(path.join(a.clonePath,'.git'),{recursive:true}); else if(args[0] === 'remote') out(s.badOrigin ? 'https://github.com/other/repo.git' : 'https://github.com/acme/fixture.git'); else if(args[0] === 'cat-file') out('commit'); else if(args[0] === 'rev-parse') out(a.head); else if(args[0] === 'symbolic-ref') out('dev'); else if(args[0] === 'status') out(fs.existsSync(path.join(a.clonePath,'dirty.txt')) ? '?? dirty.txt\\n' : ''); else process.exit(2); }
 else if(cmd === 'docker') {s.admitted=s.admitted||[];if(!s.admitted.includes(value('--pubkey'))) {s.admitted.push(value('--pubkey'));s.admissions=(s.admissions||0)+1;}out('{}');}
-else if(cmd === 'claude') {if(args[0] !== 'mcp') process.exit(2);if(args[1] === 'add') {s.mcp=true;s.mcpUuid=a.sessionUuid;} else if(args[1] === 'remove') {s.mcp=false;s.mcpRemovals=(s.mcpRemovals||0)+1;} else if(!s.mcp) process.exit(1);else out('acp-cto agentctl attach resident-cto --claimed-session-id '+s.mcpUuid+' --project-id test');}
+else if(cmd === 'claude') {if(args[0] !== 'mcp') process.exit(2);if(args[1] === 'add') {s.mcp=true;s.mcpUuid=a.sessionUuid;s.mcpCommand=args.slice(args.indexOf('--')+1);s.mcpAdds=(s.mcpAdds||[]).concat([args]);} else if(args[1] === 'remove') {s.mcp=false;s.mcpRemovals=(s.mcpRemovals||0)+1;} else if(!s.mcp) process.exit(1);else {const command=s.mcpCommand||['agentctl','attach','resident-cto','--claimed-session-id',s.mcpUuid,'--project-id','test'];out('acp-cto\\nCommand: '+command[0]+'\\nArgs: '+command.slice(1).join(' '));}}
 else if(cmd === 'tmux') {
  if(args[0] === 'has-session') process.exit(s.launched || s.pane ? 0 : 1);
  if(args[0] === 'new-session') {s.launched=true;s.pane=true;s.launches++;fs.mkdirSync(path.join(root,'.claude','sessions'),{recursive:true});fs.writeFileSync(path.join(root,'.claude','sessions',process.env.TEST_CLAUDE_PID+'.json'),JSON.stringify({sessionId:a.sessionUuid,cwd:a.clonePath,bridgeSessionId:'bridge'}));}
@@ -56,8 +62,55 @@ save();
     const stdout = await new Promise<string>((resolve,reject) => {let data='';let err='';child.stdout!.on('data',x=>data+=String(x));child.stderr!.on('data',x=>err+=String(x));child.on('error',reject);child.on('close',code=>code===0 ? resolve(data) : reject(new Error(operation+": "+err)));});
     return JSON.parse(stdout) as Record<string,unknown>;
   };
-  return {home,state,bin,resolvedBin,a,script,env,invoke};
+  return {home,state,bin,resolvedBin,runtimeNode,runtimeCli,a,script,env,invoke};
 };
+const runtimeCommand = (f:ReturnType<typeof fixture>) => [f.runtimeNode,f.runtimeCli,'attach','resident-cto','--claimed-session-id',f.a.sessionUuid,'--project-id',f.a.projectId];
+
+it('registers acp-cto through the ACP current runtime',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');
+  await f.invoke('ensure-resident');
+  const saved = JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8'));
+  expect(saved.mcpAdds).toEqual([['mcp','add','--scope','local','acp-cto','--',...runtimeCommand(f)]]);
+  expect(saved.mcpRemovals ?? 0).toBe(0);
+});
+
+it.each(['bare-agentctl','wrong-node','wrong-cli','wrong-role','wrong-session','wrong-project','session-suffix','project-suffix','matching-runtime'])('reconciles a pre-existing %s acp-cto entry',async entry => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');
+  const command = runtimeCommand(f);
+  switch(entry) {
+    case 'bare-agentctl': command.splice(0,2,'agentctl');break;
+    case 'wrong-node': command[0] = process.execPath;break;
+    case 'wrong-cli': command[1] = join(f.state,'agentctl.js');break;
+    case 'wrong-role': command[3] = 'cto';break;
+    case 'wrong-session': command[5] = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';break;
+    case 'wrong-project': command[7] = 'other';break;
+    case 'session-suffix': command[5] += '-other';break;
+    case 'project-suffix': command[7] += '-other';break;
+  }
+  const stateFile = join(f.home,'fake.json');
+  const saved = JSON.parse(readFileSync(stateFile,'utf8'));
+  writeFileSync(stateFile,JSON.stringify({...saved,mcp:true,mcpCommand:command}));
+  await f.invoke('ensure-resident');
+  const after = JSON.parse(readFileSync(stateFile,'utf8'));
+  const matching = entry === 'matching-runtime';
+  expect(after.mcpRemovals ?? 0).toBe(matching ? 0 : 1);
+  expect(after.mcpAdds ?? []).toEqual(matching ? [] : [['mcp','add','--scope','local','acp-cto','--',...runtimeCommand(f)]]);
+});
+
+it.each(['missing-node','missing-cli','node-directory','cli-directory','nonexecutable-node'])('refuses %s in the agentctl runtime with a path-free reason',async problem => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');
+  const target = problem.includes('cli') ? f.runtimeCli : f.runtimeNode;
+  if(problem === 'nonexecutable-node') chmodSync(target,0o600);
+  else {rmSync(target);if(problem.endsWith('directory')) mkdirSync(target);}
+  const failure = await f.invoke('ensure-resident').then(() => 'unexpected success',error => String(error));
+  expect(failure).toBe('Error: ensure-resident: host project provisioner refused operation: agentctl runtime unavailable in ensure-resident\n');
+  const saved = JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8'));
+  expect(saved.mcpAdds ?? []).toEqual([]);expect(saved.launches).toBe(0);
+});
+
 it.each([
   ['name',{name:'cto-test'}],
   ['profile.name',{profile:{name:'cto-test'}}],
