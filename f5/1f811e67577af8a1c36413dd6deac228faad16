@@ -1,0 +1,3 @@
+Limit: The host's normal Claude install uses ~/.local/bin/claude as a symlink to a versioned executable under ~/.local/share/claude/versions; binary validation follows it to an executable regular file.
+Record-Id: r-21c68102e722
+Provenance: inherited ca90fa112ad0d9bba19c740bac059cd0deac3ef9
