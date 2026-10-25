@@ -138,15 +138,53 @@ try {
   const pub = () => getPublicKey(Buffer.from(readFileSync(a.privateKeyFile,'utf8').trim(),'hex'));
   const pubFile = ceoSigner ? null : a.privateKeyFile.replace(/\.priv$/,'.pub');
   const rosterFile = join(home,'.hermes','bridge','required-mentions.json');
-  const ensureRouting = roomId => {
-    const pk = pub(); const ceo = readFileSync(join(home,'.hermes','bridge','keys','ceo2.pub'),'utf8').trim();
-    const roster = existsSync(rosterFile) ? read(rosterFile) : {version:2,generation:0,channels:{}};
-    check(roster.version === 2 && Number.isInteger(roster.generation),'roster v2 required');
-    const desired = {relay_name:process.env.ACP_BUZZ_RELAY_NAME ?? 'production',ceo:{pubkey:ceo,handle:process.env.ACP_CEO_BUZZ_HANDLE ?? 'ceo2'},peer:{pubkey:pk,handle:a.identityName},acp_project_id:a.projectId,status:'active',classification:'project'};
+  // Mirror canonical_roster.py's version-specific room rules before publishing a roster.
+  const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const validateRoster = roster => {
+    const v1 = roster.version === undefined || roster.version === 1;
+    const hex64 = value => typeof value === 'string' && value.length === 64 && !/[^a-f0-9]/.test(value);
+    const handle = value => typeof value === 'string' && value.length > 0 && !/[^A-Za-z0-9_-]/.test(value);
+    const identity = value => object(value) && hex64(value.pubkey) && handle(value.handle);
+    for (const [roomId, room] of Object.entries(roster.channels)) {
+      check(roomId.length === 36 && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(roomId),'invalid roster room UUID');
+      check(object(room) && identity(room.ceo) && identity(room.peer) && room.ceo.pubkey !== room.peer.pubkey,'invalid roster identities');
+      check(['active','retired'].includes(v1 && room.status === undefined ? 'active' : room.status),'invalid roster status');
+      if (!v1) check(room.ceo.handle === 'ceo' && ['relay_name','acp_project_id','classification'].every(key => typeof room[key] === 'string'),'invalid roster v2 room');
+    }
+    const known = v1 && roster.known_profiles !== undefined ? roster.known_profiles : {};
+    check(object(known) && Object.entries(known).every(([name,key]) => handle(name) && hex64(key)),'invalid roster known profiles');
+  };
+  // The room's CEO is the current canonical CEO binding's Buzz actor, never a key file or handle string.
+  const canonicalCeoKey = () => {
+    check(process.env.ACP_HOST_DATABASE_PATH, 'CEO database path unavailable');
+    const db = new Database(process.env.ACP_HOST_DATABASE_PATH, {readonly:true,fileMustExist:true});
+    try {
+      const route = currentCanonicalCeoBuzzRoute({all: (sql, params = []) => db.prepare(sql).all(...params)});
+      check(route && /^[a-f0-9]{64}$/.test(route.recipient), 'current canonical CEO binding unavailable');
+      return route.recipient;
+    } finally {db.close();}
+  };
+  // The policy wrapper's CEO handle in every room; v2 requires it and the live v1 rooms use it.
+  const ceoHandle = 'ceo';
+  const ensureRouting = (roomId, ceo = canonicalCeoKey()) => {
+    const pk = pub();
+    const rosterBytes = existsSync(rosterFile) ? readFileSync(rosterFile,'utf8') : null;
+    const roster = rosterBytes === null ? {version:2,generation:0,channels:{}} : JSON.parse(rosterBytes);
+    check(object(roster) && object(roster.channels),'invalid roster channels');
+    const v1 = roster.version === undefined || roster.version === 1;
+    check(v1 || (roster.version === 2 && Number.isInteger(roster.generation)),'invalid roster version or generation');
+    const desired = {relay_name:process.env.ACP_BUZZ_RELAY_NAME ?? 'production',ceo:{pubkey:ceo,handle:ceoHandle},peer:{pubkey:pk,handle:a.identityName},acp_project_id:a.projectId,status:'active',classification:v1 ? 'current project' : 'project'};
     const old = roster.channels[roomId];
-    check(!old || (old.acp_project_id === a.projectId && old.peer.pubkey === pk && old.status !== 'retired'),'route conflict');
-    if (canonicalJson(old ?? null) !== canonicalJson(desired)) { roster.channels[roomId] = desired; roster.generation++; atomic(rosterFile,JSON.stringify(roster,null,2)+'\n'); }
-    return {generation:read(rosterFile).generation,roomId};
+    check(!old || (old.acp_project_id === a.projectId && old.peer?.pubkey === pk && old.status !== 'retired'),'route conflict');
+    const changed = canonicalJson(old ?? null) !== canonicalJson(desired);
+    if (changed) { roster.channels[roomId] = desired; if (!v1) roster.generation++; }
+    validateRoster(roster);
+    if (changed) {
+      // Other writers hold no shared lock: refuse rather than overwrite a roster that changed since it was read.
+      check((existsSync(rosterFile) ? readFileSync(rosterFile,'utf8') : null) === rosterBytes,'roster changed concurrently');
+      atomic(rosterFile,JSON.stringify(roster,null,2)+'\n');
+    }
+    return {...(v1 ? {} : {generation:read(rosterFile).generation}),roomId};
   };
   const fleetFile = join(home,'.claude','watchers','fleet','manifest.tsv');
   const sessionFile = join(state,`resident-${a.projectId}.json`);
@@ -252,15 +290,16 @@ try {
       check(/^[a-f0-9-]{36}$/.test(roomId) && (!intent.roomId || intent.roomId === roomId) && room.name === intent.name && room.visibility === 'private' && (room.channel_type ?? room.type) === 'stream','room mismatch');
       atomic(intentFile,JSON.stringify({...intent,roomId}));
       const owner = readFileSync(join(home,'.hermes','bridge','keys','owner.pub'),'utf8').trim();
-      const ceo = readFileSync(join(home,'.hermes','bridge','keys','ceo2.pub'),'utf8').trim();
+      const ceo = canonicalCeoKey();
       const expectedMembers = [[pk,'owner'],[owner,'owner'],[ceo,'admin']];
       const before = buzz(['channels','members','--channel',roomId]);
       check(before.every(m => expectedMembers.some(([key,role]) => m.pubkey === key && m.role === role)),'existing room membership roles conflict');
       for (const [key,role] of [[owner,'owner'],[ceo,'admin']]) buzz(['channels','add-member','--channel',roomId,'--pubkey',key,'--role',role]);
       const members = buzz(['channels','members','--channel',roomId]);
       check(members.length === 3 && [[pk,'owner'],[owner,'owner'],[ceo,'admin']].every(([key,role]) => members.some(m => m.pubkey === key && m.role === role)),'room roster mismatch');
-      ensureRouting(roomId);
-      const nonce = `acp-provision:${a.nonce}`;
+      ensureRouting(roomId, ceo);
+      // The policy wrapper prefixes the counterpart's mention when it is absent, so the post is stated in that form.
+      const nonce = `@${ceoHandle} acp-provision:${a.nonce}`;
       let posts = buzz(['messages','get','--channel',roomId,'--limit','100']);
       if (!posts.some(m => m.content === nonce && m.pubkey === pk)) { run('buzz',['messages','send','--channel',roomId,'--content',nonce],{env:buzzEnv()}); posts = buzz(['messages','get','--channel',roomId,'--limit','100']); }
       const post = posts.find(m => m.content === nonce && m.pubkey === pk); check(post?.id,'nonce unreadable');

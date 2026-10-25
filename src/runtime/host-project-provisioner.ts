@@ -24,7 +24,7 @@ export const hostObservationSchema = z.object({
       sessionId: z.string(), incarnation: z.string(), targetBindingId: z.string(), roomId: z.string().uuid(), recipient: z.string() }).strict(),
     signer: z.string().regex(/^[a-f0-9]{64}$/), changed: z.boolean(), rosterVerified: z.literal(true),
   }).strict().optional(),
-  routing: z.object({ generation: z.number().int(), roomId: z.string().uuid() }).optional(),
+  routing: z.object({ generation: z.number().int().optional(), roomId: z.string().uuid() }).optional(),
   resident: z.object({ pid: z.number().int().positive(), startedAt: z.string().min(1), cwd: z.string(), sessionUuid: z.string().uuid(), tmuxName: z.string(), tmuxAncestry: z.literal(true), bridgeSessionId: z.string().min(1) }).optional(),
   fleet: z.boolean().optional(), retired: z.boolean().optional(), retirementArchivePath: z.string().optional(),
 }).strict();
