@@ -24,12 +24,8 @@
  * counts only the reports that manifest attributes. A reviewer that failed, timed out, stopped
  * early or was interrupted has no verdict, and nothing an earlier run wrote can stand in for it.
  *
- * What it is not. A frontier PR review and this broad, one-off diagnostic serve different purposes:
- * frontier judges one change within its bounded attempts; this reads whole areas of one commit for
- * defects nobody asked about. It is not meant to run on every PR. Running it is not a way around
- * frontier's three-attempt limit and does not count as an additional approving review; its exit
- * status says whether the reviewers ran, its findings verdict says what they found, and neither is
- * a merge approval.
+ * This is a scoped diagnostic of a pinned tree. Its exit status says whether the reviewers ran;
+ * its findings verdict says what they found. Neither is a merge approval.
  *
  * Usage:
  *   node scripts/grok-review.mjs                              # every area, at HEAD
@@ -49,7 +45,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { runAudit } from "./lib/audit-run.mjs";
-import { FRONTIER_VERDICT_TRANSPORT, frontierReviewPolicy } from "../src/review/frontier-simplify-policy.ts";
+import { frontierReviewPolicy } from "../src/review/frontier-simplify-policy.ts";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 
@@ -138,18 +134,14 @@ const AREAS = {
 };
 
 const prompt = (key, area, revision) => [
-  frontierReviewPolicy({
-    repository: "agent-control-plane", base: "none; scoped diagnostic of a pinned tree",
-    head: revision.commit, attempt: 1,
-    requirements: `docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md; docs/prd/REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md; ${area.prd}`,
-    fullSuiteStatus: "unknown",
-    toolNotes: "Scoped diagnostic of a pinned tree, not a PR attempt. No change diff or changed-file list was supplied. The checkout has no installed dependencies. Read-only review; unavailable execution evidence remains unavailable.",
-  }),
+  frontierReviewPolicy(),
+  "Requirements: docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md; docs/prd/REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md.",
+  `Relevant PRD sections: ${area.prd}`,
+  "The working directory is a disposable checkout of the pinned commit. It has no installed dependencies. This is a read-only review.",
   `Revision under review: commit ${revision.commit} (tree ${revision.tree}).`,
   `Area: ${key} — ${area.focus}`,
   `Scope paths: ${area.paths.join(", ")}`,
-  "ACP transport conflicts with the method's prose-only response: return only the JSON object required by the output schema. Put review prose, stable IDs, evidence and dispositions in findings.detail, and limitations in omittedItems. This transport does not authorize a merge.",
-  FRONTIER_VERDICT_TRANSPORT,
+  "Return only the JSON object required by the output schema. Finding text goes in findings.detail; coverage limitations go in omittedItems. This transport does not authorize a merge.",
 ].join("\n\n");
 
 const reviewArea = async (key, area, ctx) => {

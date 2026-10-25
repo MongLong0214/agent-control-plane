@@ -350,7 +350,12 @@ export const serve = async (session: CeoSession, options: ServeOptions): Promise
       readLines(socket, (value) => {
         if (value["method"] !== "sampling/createMessage") return;
         const id = value["id"];
-        void askReplySource(options.replyCommand, promptFrom(value["params"]), replyTimeoutMs)
+        const prompt = promptFrom(value["params"]);
+        // Sampling can reach the reply source without opening the optional tools socket.
+        // Apply the shared method here when the owner asks for a review or re-review.
+        const reviewRequested = /\b(?:review|re-review|rereview|audit)\b|리뷰|검토/u.test(prompt.toLowerCase());
+        const modelInput = reviewRequested ? `${frontierReviewPolicy()}\n\n${prompt}` : prompt;
+        void askReplySource(options.replyCommand, modelInput, replyTimeoutMs)
           .then((text) => {
             line(socket, {
               jsonrpc: "2.0",

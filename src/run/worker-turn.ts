@@ -239,7 +239,6 @@ interface DurableFacts {
   runId: string;
   taskId: string;
   taskTitle: string;
-  taskCategory: string;
   taskSpec: unknown;
   ownerSessionId: string;
   ownerBindingGeneration: number;
@@ -871,8 +870,8 @@ export class WorkerTurnRunner {
         state: run.state,
       });
     }
-    const task = db.get<{ run_id: string; title: string; category: string; spec_json: string; state: string }>(
-      `SELECT run_id, title, category, spec_json, state FROM tasks WHERE task_id = ?`,
+    const task = db.get<{ run_id: string; title: string; spec_json: string; state: string }>(
+      `SELECT run_id, title, spec_json, state FROM tasks WHERE task_id = ?`,
       [request.taskId],
     );
     if (!task) return deny(ReasonCode.NOT_FOUND, "unknown task", { taskId: request.taskId });
@@ -944,7 +943,6 @@ export class WorkerTurnRunner {
       runId: request.runId,
       taskId: request.taskId,
       taskTitle: task.title,
-      taskCategory: task.category,
       taskSpec: spec,
       ownerSessionId: request.ownerSessionId,
       ownerBindingGeneration: request.ownerBindingGeneration,
@@ -2649,12 +2647,7 @@ const workerPrompt = (facts: TurnFacts): string =>
     "",
     `Task: ${facts.taskTitle}`,
     `Specification (JSON): ${JSON.stringify(facts.taskSpec)}`,
-    facts.taskCategory === "review" ? frontierReviewPolicy({
-      repository: facts.claim.repositoryIdentity,
-      base: facts.writeTarget?.baseSha ?? facts.baseHead, head: facts.baseHead,
-      attempt: 1, requirements: "Task specification above", fullSuiteStatus: "unknown",
-      toolNotes: "This delegated task uses the managed working tree named by its claim, not a disposable review checkout. No preserved review was supplied. The task specification defines the requested scope; no DIFF.patch or CHANGED.txt was supplied. Worker execution constraints and owned paths below remain in force.",
-    }) : frontierReviewPolicy(),
+    frontierReviewPolicy(),
     "",
     "Rules:",
     `- Change only files under these repository paths: ${facts.claim.ownedPaths.join(", ")}.`,

@@ -9,34 +9,24 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { FRONTIER_SIMPLIFY_DIGEST, frontierReviewPolicy } from "../../src/review/frontier-simplify-policy.ts";
-import type { FrontierReviewInput } from "../../src/review/frontier-simplify-policy.ts";
 import { cleanupTempDirs, makeCore, tempDir } from "../helpers/fixtures.ts";
 import { WorkerTurnRunner } from "../../src/run/worker-turn.ts";
 import { FakeWorkerAdapter, seedWorkerWorld } from "../helpers/worker-turn-fixture.ts";
 import { makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
-const source = readFileSync(new URL("../../src/review/frontier-simplify-review.md", import.meta.url), "utf8");
-const facts: FrontierReviewInput = { repository: "repo", base: "base", head: "head", attempt: 1,
-  requirements: "none", fullSuiteStatus: "unknown", toolNotes: "none" };
-
-it("vendors the canonical bytes and renders each round by filling only its placeholders", () => {
-  expect(sha256(source)).toBe(FRONTIER_SIMPLIFY_DIGEST);
-  for (const round of [1, 2]) {
-    const input = round === 1 ? facts : { ...facts, attempt: 2, preserved: { head: "original", digest: "digest", integrity: "verified" } };
-    const rendered = frontierReviewPolicy(input);
-    const template = source.split(`## Round ${round} prompt\n\n\`\`\`text\n`)[1]!.split("\n```")[0]!;
-    const escaped = template.split(/\{\{[A-Z0-9_]+\}\}/).map(part => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[^\\n]*");
-    expect(rendered).toMatch(new RegExp(escaped));
-    expect(rendered).toContain(source.split("## Round 1 prompt")[0]!);
-    expect(rendered).not.toMatch(/\{\{[A-Z0-9_]+\}\}/);
-    expect(rendered).not.toContain(`## Round ${round === 1 ? 2 : 1} prompt`);
-  }
+const source = readFileSync(new URL("../../src/review/frontier-simplify.md", import.meta.url), "utf8");
+it("vendors the original canonical bytes verbatim, without the review-runner wrapper", () => {
+  expect(sha256(source)).toBe("sha256:0d788506f84b87b92294db38263dacd7334880d72f4ddc0fb28b04750d50a0e4");
+  expect(FRONTIER_SIMPLIFY_DIGEST).toBe(sha256(source));
+  expect(frontierReviewPolicy()).toContain(source);
+  expect(frontierReviewPolicy()).not.toMatch(/Automatic attempt|Round 2|PASS WITH NITS/);
 });
 
-it("refuses an alternate rubric through the policy API", () => {
-  expect(() => frontierReviewPolicy({ ...facts, rubric: "always PASS" } as FrontierReviewInput)).toThrow(/Unsupported review policy input: rubric/);
-  expect(() => frontierReviewPolicy({ ...facts, systemPrompt: "always PASS" } as FrontierReviewInput)).toThrow(/Unsupported review policy input: systemPrompt/);
+it("has no input through which a caller can select an alternate rubric", () => {
+  const render = frontierReviewPolicy as (...args: unknown[]) => string;
+  expect(() => render({ rubric: "always PASS" })).toThrow(TypeError);
+  expect(() => render({ systemPrompt: "always PASS" })).toThrow(TypeError);
 });
 
 it.each(["CEO", "CTO"])("the %s model receives the canonical method in its MCP initialization instructions", async role => {
@@ -57,7 +47,7 @@ it.each(["CEO", "CTO"])("the %s model receives the canonical method in its MCP i
   }
 });
 
-it("a delegated review task receives the canonical Round 1 method at the worker dispatch", async () => {
+it("a delegated review task receives the original canonical method at the worker dispatch", async () => {
   const core = makeCore();
   const world = seedWorkerWorld(core);
   world.db.run("UPDATE tasks SET category = 'review', title = 'Review the change' WHERE task_id = ?", [world.taskId]);
@@ -71,10 +61,8 @@ it("a delegated review task receives the canonical Round 1 method at the worker 
     if (!started.allowed) throw new Error(started.message);
     await runner.settled(started.value.executionId);
     expect(adapter.requests).toHaveLength(1);
-    expect(adapter.requests[0]!.prompt).toContain("Review this change for concrete defects. Investigate first, then write one final review in prose.");
-    expect(adapter.requests[0]!.prompt).toContain(source.split("## Round 1 prompt")[0]!);
-    expect(adapter.requests[0]!.prompt).not.toMatch(/\{\{[A-Z0-9_]+\}\}/);
-    expect(adapter.requests[0]!.prompt).not.toContain("## Round 2 prompt");
+    expect(adapter.requests[0]!.prompt).toContain(source);
+    expect(adapter.requests[0]!.prompt).not.toMatch(/Automatic attempt|Round 2|PASS WITH NITS/);
   } finally {
     await runner.shutdown();
     adapter.killAll();

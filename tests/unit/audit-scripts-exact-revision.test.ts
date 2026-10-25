@@ -337,7 +337,7 @@ const makeFixture = (options: { smudged?: boolean; executable?: boolean; symlink
     mkdirSync(dirname(join(root, "scripts", name)), { recursive: true });
     copyFileSync(join(ACP_SCRIPTS, name), join(root, "scripts", name));
   }
-  for (const name of ["frontier-simplify-policy.ts", "frontier-simplify-review.md"]) {
+  for (const name of ["frontier-simplify-policy.ts", "frontier-simplify.md"]) {
     const target = join(root, "src", "review", name);
     mkdirSync(dirname(target), { recursive: true });
     copyFileSync(join(ACP_SCRIPTS, "..", "src", "review", name), target);
@@ -568,16 +568,11 @@ describe.each(SCRIPTS)("%s", (script) => {
       const result = await run(fixture, script, ["core", "--allow-dirty"]);
       expect(callsOf(fixture).map((call) => call.subject)).toEqual(["pinned v1\n"]);
       const input = (callsOf(fixture)[0] as Call & { prompt: string }).prompt;
-      expect(input).toContain("Review this change for concrete defects. Investigate first, then write one final review in prose.");
       expect(input).not.toContain("How to review, in order of what matters");
       expect(input).not.toContain("What to look for, in priority order");
-      expect(input).toContain("Transport verdict PASS represents canonical PASS or PASS WITH NITS.");
-      expect(input).not.toContain("INCOMPLETE or PASS WITH NITS");
-      const method = readFileSync(join(ACP_SCRIPTS, "..", "src", "review", "frontier-simplify-review.md"), "utf8");
-      expect(input).toContain(method.split("## Round 1 prompt")[0]!);
-      const template = method.split("## Round 1 prompt\n\n```text\n")[1]!.split("\n```")[0]!;
-      const escaped = template.split(/\{\{[A-Z0-9_]+\}\}/).map(part => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[^\n]*");
-      expect(input).toMatch(new RegExp(escaped));
+      expect(input).not.toMatch(/Automatic attempt|Round 2|PASS WITH NITS|INCOMPLETE/);
+      const method = readFileSync(join(ACP_SCRIPTS, "..", "src", "review", "frontier-simplify.md"), "utf8");
+      expect(input).toContain(method);
 
 
       expect(result.status).toBe(0);

@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { canonicalJson } from "../../src/core/digest.ts";
 import { manifestDigest } from "../../src/contracts/manifest.ts";
 import { ExecutionMode, RunKind } from "../../src/domain/types.ts";
 import type { CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
@@ -47,19 +46,12 @@ const CONTRACT: TaskContract = {
 const flat = (prompt: string): string => prompt.replace(/\s+/g, " ");
 
 /** Check the actual production input, including removal of ACP's competing rubric. */
-const source = readFileSync(new URL("../../src/review/frontier-simplify-review.md", import.meta.url), "utf8");
+const source = readFileSync(new URL("../../src/review/frontier-simplify.md", import.meta.url), "utf8");
 
-const expectEvidenceStandard = (prompt: string, round = 1): void => {
+const expectEvidenceStandard = (prompt: string): void => {
   const text = flat(prompt);
-  expect(text).toContain("Transport verdict PASS represents canonical PASS or PASS WITH NITS.");
-  expect(text).toContain("Transport verdict REVISE represents canonical INCOMPLETE, or canonical BLOCK with a confirmed blocker that can be repaired.");
-  expect(text).not.toContain("INCOMPLETE or PASS WITH NITS");
-  const template = source.split(`## Round ${round} prompt\n\n\`\`\`text\n`)[1]!.split("\n```")[0]!;
-  const escaped = template.split(/\{\{[A-Z0-9_]+\}\}/).map(part => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[^\n]*");
-  expect(prompt).toMatch(new RegExp(escaped));
-  expect(prompt).toContain(source.split("## Round 1 prompt")[0]!);
-  expect(prompt).not.toMatch(/\{\{[A-Z0-9_]+\}\}/);
-
+  expect(prompt).toContain(source);
+  expect(prompt).not.toMatch(/Automatic attempt|Round 2|PASS WITH NITS|INCOMPLETE/);
   expect(text).not.toContain("Each finding's `detail` must state all five");
   expect(text).not.toContain("Your verdict stands as you return it; severities do not change it.");
   expect(text).not.toContain("Everything you need is above");
@@ -86,17 +78,15 @@ const reReview = async (h: ReturnType<typeof makeHarness>, runId: string, kind: 
   const calls = h.scripted.invocations.slice(before);
   expect(calls.length).toBeGreaterThan(0);
   for (const call of calls) {
-    expectEvidenceStandard(call.prompt, 2);
-    expect(call.prompt).toContain(canonicalJson(original.content));
-    expect(call.prompt).toContain(original.digest);
-    expect(call.prompt).toContain("## PREVIOUS_REVIEW.md");
+    expectEvidenceStandard(call.prompt);
+    expect(call.prompt).not.toMatch(/ROUND1_INVENTORY|PREVIOUS_REVIEW|IMPLEMENTER_RESPONSE|REMEDIATION\.patch/);
     expect((call.systemPrompt?.length ?? 0) + call.prompt.length).toBeLessThanOrEqual(120_000);
     expect(call.systemPrompt).not.toMatch(/Attack the|Do not praise|Judge only/);
   }
 };
 
 describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
-  it("candidate first review and preserved re-review use only the canonical round prompts", async () => {
+  it("candidate first review and re-review use only the original canonical method", async () => {
     const harness = makeHarness();
     const driven = await driveToReviewedCandidate(harness);
     const [prompt] = promptsStartingWith(harness, "# Candidate review");

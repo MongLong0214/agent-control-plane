@@ -17,8 +17,8 @@ import type { ReviewFinding, ReviewPacket } from "./blind-review.ts";
  * It is a projection for the host and the CTO, and nothing else:
  * - It writes nothing and decides nothing. No gate reads it; the production gate, the pipeline and
  *   the CEO decision keep reading their own records, so nothing here can open or close a gate.
- * - This projection is not reviewer input. The review gate carries immutable original/follow-up
- *   review artifacts directly; producer claims and CTO reasoning remain withheld.
+ * - Nothing here is given to a reviewer. Past verdicts, producer claims and CTO reasoning stay out
+ *   of the independent reviewer's input; cross-round tracking happens on the host side only.
  * - A disposition (fixed, disputed, intentional, deferred) is a caller's note linked to a finding
  *   by the finding's digest. It is shown beside the finding and changes no verdict, outcome or
  *   readiness field: a new candidate still has to pass verification and a fresh review.

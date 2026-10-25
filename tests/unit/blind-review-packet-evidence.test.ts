@@ -120,7 +120,7 @@ describe("frozen candidate packet evidence", () => {
     expect(cut.entryLimit).toBe(2000);
   });
 
-  it("includes canonical control-plane facts and pending later obligations without producer identities; a re-review carries the preserved review", async () => {
+  it("includes canonical control-plane facts and pending later obligations without producer identities; same candidate can be re-reviewed without prior verdicts", async () => {
     const { harness, run, task, worker, submit } = await prepare();
     try {
       harness.scripted.script({ match: /Candidate review/, text: JSON.stringify({ verdict: "REVISE",
@@ -148,12 +148,10 @@ describe("frozen candidate packet evidence", () => {
       expect(prompt).toContain("publish the candidate branch, prepare its PR and merge, then verify CI");
       expect(prompt).toContain("exact merge commit SHA");
       expect(prompt).toContain("These obligations remain pending");
-      for (const secret of [worker, run.ownerSessionId!, "scripted-worker", "private producer self-assessment"]) {
+      for (const secret of [worker, run.ownerSessionId!, "scripted-worker", "private producer self-assessment", "prior-verdict-marker"]) {
         expect(prompt).not.toContain(secret);
       }
       const latest = harness.cp.artifacts.latest<ReviewPacket>(run.runId, ArtifactKind.BLIND_REVIEW)!;
-      expect(prompt).toContain("prior-verdict-marker");
-      expect(prompt).toContain(first.digest);
       expect(latest.content.verdict).toBe("PASS");
       expect(latest.digest).not.toBe(first.digest);
       expect(latest.candidateSnapshotDigest).toBe(first.candidateSnapshotDigest);

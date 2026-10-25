@@ -89,8 +89,7 @@ const VERSION_TIMEOUT_MS = 10_000;
 
 const NOT_AN_APPROVAL =
   "A diagnostic run. `execution` says whether each reviewer ran to a well-formed report; " +
-  "`findingsVerdict` says what the reports found. Neither is a PR review, neither counts toward " +
-  "or around a frontier review's attempt limit, and neither is a merge approval.";
+  "`findingsVerdict` says what the reports found. Neither is a merge approval.";
 
 /**
  * Git and the reviewer CLIs run with the repository named by `-C`/`cwd` only. An inherited

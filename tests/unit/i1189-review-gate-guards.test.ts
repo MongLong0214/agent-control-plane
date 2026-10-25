@@ -154,8 +154,8 @@ describe("#1189 §3: a verdict other than PASS never reaches CEO-ready", () => {
   }
 });
 
-describe("canonical PASS WITH NITS transport", () => {
-  it("accepts PASS with only MINOR findings and instructs the reviewer to keep it PASS", async () => {
+describe("existing verdict and severity semantics", () => {
+  it("accepts PASS with only MINOR findings without reclassifying the verdict", async () => {
     const harness = makeHarness();
     try {
       const { runId, submit, covered } = await startRun(harness);
@@ -170,8 +170,7 @@ describe("canonical PASS WITH NITS transport", () => {
       expect(harness.cp.outbox.listByRun(runId).filter(message => message.kind === MessageKind.REVISION_REQUEST)).toEqual([]);
       expect(harness.cp.audit.forRun(runId).filter(event => event.kind === "REVISION_RETURNED_TO_CTO")).toEqual([]);
       const prompt = harness.scripted.invocations.find(call => call.prompt.startsWith("# Candidate review"))!.prompt;
-      expect(prompt).toContain("Transport verdict PASS represents canonical PASS or PASS WITH NITS.");
-      expect(prompt).not.toContain("INCOMPLETE or PASS WITH NITS");
+      expect(prompt).not.toMatch(/Automatic attempt|Round 2|PASS WITH NITS|INCOMPLETE/);
     } finally {
       harness.cp.close();
     }
@@ -304,8 +303,8 @@ describe("#1189 §3: a return is never delivered to a stale CTO binding", () => 
   });
 });
 
-describe("#1189 §3: a follow-up reviewer receives preserved review evidence", () => {
-  it("the next reviewer preserves the earlier review but withholds producer claims and CTO reasoning; a fixed claim passes nothing", async () => {
+describe("#1189 §3: a new reviewer judges only the candidate", () => {
+  it("the next reviewer sees no earlier verdict, no producer claim and no CTO reasoning, and a 'fixed' claim passes nothing", async () => {
     const harness = makeHarness();
     const { runId, ceoSessionId, submit, covered } = await startRun(harness);
     const firstFinding = "first-round finding text zqvwk";
@@ -324,9 +323,10 @@ describe("#1189 §3: a follow-up reviewer receives preserved review evidence", (
     expect(prompts).toHaveLength(2);
     const later = `${prompts[1]!.systemPrompt ?? ""}\n${prompts[1]!.prompt}`;
     const firstReview = harness.cp.artifacts.list<{ reviewerSessionId: string }>(runId, "BLIND_REVIEW")[0]!;
-    for (const preserved of [firstFinding, firstReview.digest, firstReview.content.reviewerSessionId]) expect(later).toContain(preserved);
-    expect(later).toContain("Review the repair against the preserved findings and check the repair for regressions.");
     for (const withheld of [
+      firstFinding,
+      firstReview.digest,
+      firstReview.content.reviewerSessionId,
       // Markers spelt with letters no digest or id can contain, so a hash in the prompt cannot match them.
       "first producer summary xqzvj",
       "first recommendation wqzky",

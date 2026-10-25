@@ -151,6 +151,28 @@ const invokePreparedReview = (setup: Awaited<ReturnType<typeof prepareReviewedIn
     verification: setup.verification,
   });
 
+it("re-reviews the same candidate after an accepted 55,000-character MINOR finding within budget", async () => {
+  const setup = await prepareReviewedInputs();
+  try {
+    const finding = { category: "correctness", severity: "MINOR", repository: setup.identity,
+      path: "src/app.js", summary: "nonblocking observation", detail: "x".repeat(55_000) };
+    const first = await directReview(setup, JSON.stringify({ verdict: "PASS",
+      coveredFiles: [`${setup.identity}:src/app.js`], omittedItems: [], findings: [finding] }));
+    expect(first).toMatchObject({ allowed: true, value: { verdict: "PASS", findings: [finding] } });
+    const before = setup.harness.scripted.invocations.length;
+    const second = await directReview(setup);
+    expect(second.allowed, JSON.stringify(second)).toBe(true);
+    expect(setup.harness.scripted.invocations.length).toBeGreaterThan(before);
+    for (const call of setup.harness.scripted.invocations.slice(before)) {
+      expect(call.prompt.length + (call.systemPrompt?.length ?? 0)).toBeLessThanOrEqual(120_000);
+    }
+    // The finding remains intact in its immutable evidence artifact, as on main.
+    expect(setup.harness.cp.artifacts.list<ReviewPacket>(setup.run.runId, "BLIND_REVIEW")[0]!.content.findings).toEqual([finding]);
+  } finally {
+    setup.harness.cp.close();
+  }
+});
+
 const prepareLargeReviewedInputs = async () => {
   const setup = await prepareReviewedInputs();
   writeFiles(setup.harness.repoPath, {
