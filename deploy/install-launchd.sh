@@ -39,6 +39,11 @@ BUZZ_PRIVATE_KEY has a second source. When no such item exists under the selecte
 the launcher falls back to the Buzz desktop app's own store, whose layout is a JSON object
 keyed by identity rather than one item per variable. Point it elsewhere with
 ACP_BUZZ_KEYCHAIN_SERVICE, ACP_BUZZ_KEYCHAIN_ACCOUNT, and ACP_BUZZ_KEYCHAIN_IDENTITY.
+
+Install and upgrade require ACP_BUZZ_SEND_POLICY_FILE in the installing environment: an
+absolute readable regular file naming the policy the Buzz wrapper actually evaluates.
+The launcher exports that exact value (shell-quoted); there is no inferred or Keychain fallback.
+The daemon verifies the binding with the wrapper's read-only check before CEO notification sends.
 EOF
 }
 
@@ -59,6 +64,7 @@ keychain_service="com.agentcontrolplane.agentcpd"
 buzz_keychain_service="${ACP_BUZZ_KEYCHAIN_SERVICE:-buzz-desktop}"
 buzz_keychain_account="${ACP_BUZZ_KEYCHAIN_ACCOUNT:-secrets}"
 buzz_keychain_identity="${ACP_BUZZ_KEYCHAIN_IDENTITY:-identity}"
+buzz_send_policy_file="${ACP_BUZZ_SEND_POLICY_FILE:-}"
 pair_id=""
 expected_index_digest=""
 expect_schema_version=""
@@ -308,6 +314,11 @@ snapshot_current_deployment() {
   chmod 700 "$snapshot/agentcpd-launch.sh"
 }
 
+require_buzz_send_policy_file() {
+  [[ "$buzz_send_policy_file" == /* && -f "$buzz_send_policy_file" && -r "$buzz_send_policy_file" ]] ||
+    fail "install/upgrade requires ACP_BUZZ_SEND_POLICY_FILE to name an absolute readable regular policy file; no policy path can be inferred from the Buzz executable"
+}
+
 # The launcher runs under launchd with a fixed PATH that does not include a user-local bin
 # directory, so a `buzz` installed at ~/.local/bin is invisible to the daemon even though it
 # is on the installing shell's PATH. Resolve it here, while that PATH is still available, and
@@ -407,6 +418,7 @@ write_launcher() {
     printf 'ACP_BUZZ_KEYCHAIN_SERVICE=%q\n' "$buzz_keychain_service"
     printf 'ACP_BUZZ_KEYCHAIN_ACCOUNT=%q\n' "$buzz_keychain_account"
     printf 'ACP_BUZZ_KEYCHAIN_IDENTITY=%q\n' "$buzz_keychain_identity"
+    printf 'export ACP_BUZZ_SEND_POLICY_FILE=%q\n' "$buzz_send_policy_file"
     # Each ACP_RESOLVED_*_BINARY is this install's answer and nothing else's. Without this line a
     # launcher written where a CLI did not resolve carries no assignment for it, and the promotion
     # below would consume a value of that name inherited from launchd (`launchctl setenv`) — a pin no
@@ -862,6 +874,7 @@ publish_current_link() {
 
 case "$command_name" in
   install|upgrade)
+    require_buzz_send_policy_file
     resolve_app_root
     resolve_node
     private_directory "$state_dir"

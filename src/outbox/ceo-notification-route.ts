@@ -6,6 +6,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import type { DaemonNoticeBody, DaemonNoticeDestination } from "../runtime/acp-daemon-notice.ts";
 import type { OutboxMessage } from "./outbox.ts";
+import { ceoBuzzHistoryIsPrePost } from "./ceo-buzz-signer.ts";
 import { readHermesTargetHead } from "../session/hermes-target-head.ts";
 
 export interface CeoNoticeAttempt {
@@ -85,6 +86,12 @@ export class CeoNoticeRoute implements CeoNoticeAttempt {
     };
   }
 
+  #knownPrePostBuzzHistory(): boolean {
+    const row = this.db.get<{ message_id: string; attempts: number; last_error: string | null;
+      failure_class: string | null; sent_at: string | null }>("SELECT * FROM outbox WHERE message_id = ?", [this.message.messageId]);
+    return !!row && ceoBuzzHistoryIsPrePost(this.db, row);
+  }
+
   #support(receiver: string): "SUPPORTED" | "UNSUPPORTED" | "UNVERIFIED" {
     const support = this.db.get<{ evidence_json: string; at: string }>(`SELECT evidence_json, at FROM audit_events
       WHERE kind = 'CEO_NOTIFICATION_PROTOCOL_SUPPORT'
@@ -129,7 +136,7 @@ export class CeoNoticeRoute implements CeoNoticeAttempt {
       const { attempts, results } = this.#history();
       const marked = this.db.get(`SELECT 1 FROM audit_events WHERE kind = 'CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN'
         AND json_extract(evidence_json, '$.messageId') = ?`, [this.message.messageId]);
-      const legacyFailure = !attempts.length && (this.message.attempts > 0 || this.db.get(`SELECT 1 FROM audit_events
+      const legacyFailure = !attempts.length && ((this.message.attempts > 0 && !this.#knownPrePostBuzzHistory()) || this.db.get(`SELECT 1 FROM audit_events
         WHERE kind = 'CEO_NOTIFICATION_DELIVERY_FAILED' AND json_extract(evidence_json, '$.messageId') = ?`, [this.message.messageId]));
       if (marked || legacyFailure || attempts.some((a) => a.legacyUnknown)) {
         if (!marked) this.#record("CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN", { basis: "PREDATES_ATTEMPT_JOURNAL" }, true);
@@ -178,7 +185,7 @@ export class CeoNoticeRoute implements CeoNoticeAttempt {
       const legacyFailure = this.db.get(`SELECT 1 FROM audit_events
         WHERE kind IN ('CEO_NOTIFICATION_DELIVERY_FAILED','CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN')
         AND json_extract(evidence_json, '$.messageId') = ?`, [this.message.messageId]);
-      const legacyUnknown = attempts.some((a) => a.legacyUnknown) || (!last && (this.message.attempts > 0 || !!legacyFailure));
+      const legacyUnknown = attempts.some((a) => a.legacyUnknown) || (!last && ((this.message.attempts > 0 && !this.#knownPrePostBuzzHistory()) || !!legacyFailure));
       const unknown = legacyUnknown || attempts.some((a) => {
         const result = results.find((r) => r.attemptId === a.attemptId);
         return !result || result.outcome === "UNKNOWN" || result.outcome === "SETTLED";
