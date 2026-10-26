@@ -19,6 +19,7 @@ import { type Decision, type Evidence, allow, deny, isAcpError } from "../core/e
 import { ReasonCode } from "../core/reason-codes.ts";
 import { git, tryRevParse } from "../git/git.ts";
 import {
+  genesisLabelConflictOf,
   isGitHubNodeId,
   parseGitHubIdentity,
   REQUEST_OUTCOME_UNKNOWN,
@@ -810,6 +811,8 @@ export const applyGitHubOperations = async (
   const adopted: string[] = [];
   const resumed: string[] = [];
   let repositoryNodeId: string | null = null;
+  /** This attempt's repository receipt: whether this operation created the repository is read from it. */
+  let repositoryReceipt: Extract<GitHubOperationReceipt, { resourceType: "repository" }> | null = null;
   // Every successful attempt has exactly one branch receipt (`preflightGitHubOperations` requires the
   // push), which sets this to the head GitHub holds — or, create-only, exactly one repository receipt
   // carrying the initialized head, which sets it instead.
@@ -863,6 +866,19 @@ export const applyGitHubOperations = async (
           `${operationId ?? "the final readback"}'s request may have reached GitHub, and no answer to it was heard; it is not retried, and any intent it left pending stays in the ledger, reconciled against GitHub before anything is sent again`,
           operationId,
           { indeterminate: true, remote: describeFailure(error) },
+          false,
+        );
+      }
+      // ACP's own refusal, not GitHub's: a planned label GitHub holds differently on a repository this
+      // operation did not create. Retrying cannot change it; a person resolves the label.
+      const labelConflict = genesisLabelConflictOf(error);
+      if (labelConflict !== null) {
+        return stop(
+          ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
+          "GENESIS_LABEL_CONFLICT",
+          `${target.owner}/${target.name} holds label ${labelConflict.observed.name} with another name, color or description than the plan's ${labelConflict.name}, and this operation did not create the repository, so it is not repainted`,
+          operationId,
+          { label: labelConflict.name, observed: labelConflict.observed, desired: labelConflict.desired },
           false,
         );
       }
@@ -1732,9 +1748,12 @@ export const applyGitHubOperations = async (
     if (!observed.allowed) return observed as Decision<Step>;
     if (prior && (observed.value === null || digestOf(observed.value) !== digestOf(prior.observed))) return stop(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"RESUMED_RESOURCE_DRIFTED","genesis resources drifted",id,{},false);
     const intent = pending.get(id) ?? {operationId:id,resourceType:operation.resourceType,resourceIdentity:operation.resourceIdentity,attemptedAt:clock.nowIso(),preexisting:false,beforeStateDigest:null,marker:null,respondedNodeId:null,pushedHead:null};
+    // A same-named label is repainted only on a repository this operation created, as its receipt says
+    // and confirmRepository still observes: there it is GitHub's autoInit default label, never someone's.
+    const reconcileExistingLabels = repositoryReceipt !== null && repositoryReceipt.preexisting === false && repositoryReceipt.repositoryNodeId === repository.value.nodeId;
     if (!observed.value) {
       begin(intent);
-      const written = await remote(id,() => port.ensureGenesisResources!(target,operation.desiredState)); if (!written.allowed) return written as Decision<Step>;
+      const written = await remote(id,() => port.ensureGenesisResources!(target,operation.desiredState,{reconcileExistingLabels})); if (!written.allowed) return written as Decision<Step>;
       observed = await remote(id,() => port.observeGenesisResources!(target,operation.desiredState));
     }
     if (!observed.allowed) return observed as Decision<Step>;
@@ -1828,6 +1847,7 @@ export const applyGitHubOperations = async (
     if (!step.allowed) return step as Decision<AppliedGitHubOperations>;
     const { receipt, outcome } = step.value;
     if (receipt.resourceType === "repository") {
+      repositoryReceipt = receipt;
       repositoryNodeId = receipt.observed.nodeId;
       if (execution.createOnly) publishedHead = receipt.observed.initializedHead ?? null;
     }
