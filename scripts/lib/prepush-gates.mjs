@@ -8,7 +8,8 @@
  * and reading a workflow is not running one.
  *
  * So the manifest is here, it is data, and CI runs it through the same executor a developer does
- * (`pnpm gates`, one step in the `verify-matrix` job).
+ * (`pnpm gates`, split in CI into `--no-tests` in the `gates` job and `--tests-only --shard i/N` in
+ * each `verify-matrix` shard — two complementary halves of this one list).
  *
  * What belongs here: a check that stops a product defect, or one that keeps the commit record
  * intact. Checks whose only subject was this repository's own documents, rules or verification
@@ -17,7 +18,7 @@
  */
 
 /**
- * The `verify-matrix` job's verification, in order.
+ * The pre-push verification, in order.
  *
  * Order is not decoration. `trailers` reads a commit range; `build` produces `dist/` that the
  * suite's process-level tests spawn. The cheap structural checks come first because a failure

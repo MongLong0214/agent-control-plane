@@ -65,11 +65,17 @@ describe("ci preflight", () => {
     const hook = readFileSync(join(REPO_ROOT, ".githooks", "pre-commit"), "utf8");
     expect(hook.indexOf("pnpm ci:preflight")).toBeGreaterThan(-1);
 
+    // CI runs it once, as the first gate of `pnpm gates --no-tests` in the `gates` job. A separate
+    // step before install ran the same command on the same tree a second time in that job.
     const workflow = readFileSync(join(REPO_ROOT, ".github", "workflows", "ci.yml"), "utf8");
-    expect(workflow.indexOf("run: pnpm ci:preflight")).toBeGreaterThan(-1);
-    expect(workflow.indexOf("run: pnpm ci:preflight")).toBeLessThan(
-      workflow.indexOf("run: pnpm install --frozen-lockfile"),
+    expect(workflow).toContain("run: pnpm gates --no-tests");
+    const half = boundedSpawnSync(
+      process.execPath,
+      [join(REPO_ROOT, "scripts", "run-prepush-gates.mjs"), "--no-tests", "--list"],
+      { cwd: REPO_ROOT, encoding: "utf8", env: { ...process.env, ACP_TRAILERS_RANGE: "" } },
     );
+    expect(half.status, half.stderr).toBe(0);
+    expect(half.stdout.split("\n")[0]).toMatch(/\spnpm ci:preflight$/);
   });
 
   it("rejects a workflow pnpm command whose package script is missing", () => {
