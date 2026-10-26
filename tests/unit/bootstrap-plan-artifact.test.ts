@@ -1896,15 +1896,25 @@ describe("private bootstrap review originals and serving runtime", () => {
       expect(await f.cto("plan_submit", { idempotencyKey: "freeze-large-originals", runId: f.run.runId, bootstrapPlanDigest: f.digest })).toMatchObject({ ok: true });
       const plan = f.h.cp.artifacts.latest<Args>(f.run.runId, "PLAN")!;
       expect(frozenBootstrapReviewEvidence(f.h.cp, f.run.runId, plan.content)?.bundle).toEqual(bundle);
+      // 180 KiB of fact text that is not credential-shaped, except one long-base64 run in the first file's fact.
+      // An unbroken run of that size would itself be one; ACP redacts such text before it stores the facts.
+      const factText = (path: string) => `${path}:` + "f ".repeat(90 * 1024) + (path === "correction.log" ? ` key ${"Ab9+/Zq7".repeat(10)} ` : "") + ":FACT-END";
       const verify = vi.fn(async (file: { path: string }) => ({ status: "ACP-verified" as const, reason: "fixture observation",
-        facts: [{ path: file.path, response: `${file.path}:` + "f".repeat(180 * 1024) + ":FACT-END" }] }));
+        facts: [{ path: file.path, response: factText(file.path) }] }));
       f.h.cp.review.attach({ verifyOriginalRecord: verify });
       f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
       expect(await f.cto("result_submit", { idempotencyKey: "review-large-originals", runId: f.run.runId,
         resultSummary: "review", recommendation: "review" })).toMatchObject({ ok: true });
       const prompt = f.h.scripted.invocations.find(i => /Bootstrap plan review/.test(i.prompt))!.prompt;
       for (const original of originals) expect(prompt.includes(original.text), original.path).toBe(true);
-      for (const original of originals.slice(0, 2)) expect(prompt.includes(`${original.path}:` + "f".repeat(180 * 1024) + ":FACT-END")).toBe(true);
+      expect(prompt.includes(factText("review.txt"))).toBe(true);
+      // The credential-shaped run is replaced, the rest of that fact kept, and the fact marked; the
+      // staged originals above stay whole and the review context is stored.
+      expect(prompt.includes(factText("correction.log").replace("Ab9+/Zq7".repeat(10), "[redacted]"))).toBe(true);
+      expect(prompt).not.toContain("Ab9+/Zq7".repeat(10));
+      expect(prompt).toContain(`"redacted":true`);
+      const context = f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF").find(a => (a.content as { schema?: string }).schema === "acp.bootstrap-review-context.v1");
+      expect(JSON.stringify(context?.content)).not.toContain("Ab9+/Zq7".repeat(10));
       expect(prompt).toContain("ACP API facts exceed the 512 KiB review evidence observation bound");
       expect(verify).toHaveBeenCalledTimes(3);
     } finally { await f.close(); }

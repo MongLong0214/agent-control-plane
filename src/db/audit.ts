@@ -1,7 +1,9 @@
 import type { Clock } from "../core/clock.ts";
 import { allow, deny, type Decision, type Evidence } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
+import { hasCredentialShape, redactCredentialShapes, type AcpLocations, type WriteSite } from "../core/credential-shapes.ts";
 import type { Db } from "./database.ts";
+import { registryView } from "./registry-view.ts";
 
 export interface AuditRecord {
   kind: string;
@@ -20,9 +22,11 @@ export interface AuditRecord {
  * explained after the fact.
  */
 export class AuditLog {
+  /** `locations` are the ones the composition root computed: a verified location is checked against them. */
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
+    private readonly locations: AcpLocations = {},
   ) {}
 
   /**
@@ -35,7 +39,9 @@ export class AuditLog {
    * autoincrement integer and always was.
    */
   record(entry: AuditRecord): Decision<number> {
-    if (!isAllowlistedAuditEvidence(entry.evidence ?? {})) {
+    const site: WriteSite = { writer: entry.kind, runId: entry.runId ?? null, locations: this.locations,
+      registry: registryView(this.db), record: entry.evidence ?? {} };
+    if (!isAllowlistedAuditEvidence(entry.evidence ?? {}, 0, [], site)) {
       // Keep the decision itself visible without retaining the rejected payload. An audit
       // record that might contain a private payload is less useful than a privacy breach.
       this.insert(entry, ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED, { auditEvidenceRejected: true });
@@ -45,7 +51,7 @@ export class AuditLog {
         { kind: entry.kind },
       );
     }
-    const eventId = this.insert(entry, entry.reasonCode ?? null, redact(entry.evidence ?? {}) as Evidence);
+    const eventId = this.insert(entry, entry.reasonCode ?? null, redact(entry.evidence ?? {}, 0, [], site) as Evidence);
     return allow(ReasonCode.OK, eventId);
   }
 
@@ -146,22 +152,6 @@ const SECRET_COLLECTION_KEY =
 const BULK_KEY =
   /(?:^|[_-])(prompt|prompts|system_?prompt|transcript|chat_?transcript|chain_?of_?thought|reasoning|messages|conversation|raw_?output|full_?output)(?:$|[_-])/i;
 
-/** Credential shapes recognisable in a value regardless of its key. */
-const SECRET_VALUE_PATTERNS: readonly RegExp[] = [
-  /gh[pousr]_[A-Za-z0-9]{16,}/,
-  /\bsk-[A-Za-z0-9_-]{20,}/,
-  /\bnsec1[a-z0-9]{20,}/,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-  /\bxox[baprs]-[A-Za-z0-9-]{10,}/,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}/,
-  /\bAKIA[0-9A-Z]{16}\b/,
-  /\b\d{8,10}:AA[A-Za-z0-9_-]{30,}/,
-  /\bBearer\s+[A-Za-z0-9._~+/-]{20,}/i,
-  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\./, // JWT
-  // KEY=VALUE where the key looks secret, as it appears in an env dump.
-  /\b[A-Z0-9_]*(TOKEN|SECRET|PASSWORD|CREDENTIAL|API_?KEY|PRIVATE_KEY)[A-Z0-9_]*\s*=\s*\S+/,
-];
-
 const MAX_STRING = 2000;
 
 /**
@@ -206,66 +196,69 @@ const isPlainRecord = (value: object): value is Record<string, unknown> => {
 };
 
 /** Unknown fields are rejected before redaction so only explicitly reviewed shapes persist. */
-const isAllowlistedAuditEvidence = (value: unknown, depth = 0): boolean => {
+const isAllowlistedAuditEvidence = (value: unknown, depth = 0, path: readonly string[] = [], site?: WriteSite): boolean => {
   if (depth > 8) return true; // redact() replaces deeper material with a fixed marker.
   if (value == null || typeof value === "string" || typeof value === "boolean" || typeof value === "bigint") return true;
   if (typeof value === "number") return Number.isFinite(value);
-  if (Array.isArray(value)) return value.slice(0, 200).every((item) => isAllowlistedAuditEvidence(item, depth + 1));
+  if (Array.isArray(value)) return value.slice(0, 200).every((item) => isAllowlistedAuditEvidence(item, depth + 1, path, site));
   if (!value || typeof value !== "object" || !isPlainRecord(value)) return false;
 
   return Object.entries(value).every(([key, nested]) => {
     // These names are explicitly safe only because redact() replaces their values before
     // serialization. They stay outside the general allowlist on purpose.
     if (isSecretKey(key) || isSecretCollectionKey(key) || isBulkContentKey(key)) return true;
-    if (AUDIT_EVIDENCE_KEYS.has(key)) return isAllowlistedAuditEvidence(nested, depth + 1);
+    if (AUDIT_EVIDENCE_KEYS.has(key)) return isAllowlistedAuditEvidence(nested, depth + 1, [...path, key], site);
     // A name-only allowlist made every new audit field a refusal — it rejected the real
     // CANDIDATE_FROZEN record and stopped a run from ever reaching review. What §31.5 is
     // actually protecting against is a *payload*: a prompt, a transcript, a credential. So an
     // unknown name is admitted for values that cannot be one — numbers, booleans, and short
     // identifier-shaped strings — and refused for free-form text, which is what a private
     // payload looks like.
-    return isIdentifierLikeAuditValue(nested, depth);
+    return isIdentifierLikeAuditValue(nested, depth, [...path, key], site, value);
   });
 };
 
 /** The value shapes an unknown audit field may carry; see `isAllowlistedAuditEvidence`. */
 const MAX_UNKNOWN_AUDIT_STRING = 200;
 
-const isIdentifierLikeAuditValue = (value: unknown, depth: number): boolean => {
+const isIdentifierLikeAuditValue = (
+  value: unknown, depth: number, path: readonly string[], site?: WriteSite, holder?: unknown,
+): boolean => {
   if (value == null || typeof value === "boolean") return true;
   if (typeof value === "number") return Number.isFinite(value);
   if (typeof value === "bigint") return true;
   if (typeof value === "string") {
     if (value.length > MAX_UNKNOWN_AUDIT_STRING) return false;
-    return !SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(value));
+    return !hasCredentialShape(value, { path, store: "audit", ...(site ? { site } : {}), holder });
   }
   if (Array.isArray(value)) {
-    return value.slice(0, 200).every((item) => isIdentifierLikeAuditValue(item, depth + 1));
+    return value.slice(0, 200).every((item) => isIdentifierLikeAuditValue(item, depth + 1, path, site, holder));
   }
-  if (isPlainRecord(value)) return isAllowlistedAuditEvidence(value, depth + 1);
+  if (isPlainRecord(value)) return isAllowlistedAuditEvidence(value, depth + 1, path, site);
   return false;
 };
 
-const scrubValue = (text: string): string => {
-  let out = text;
-  for (const pattern of SECRET_VALUE_PATTERNS) {
-    out = out.replace(new RegExp(pattern.source, `g${pattern.flags.replace("g", "")}`), "[redacted]");
-  }
+// Credential shapes come from the one shared list (core/credential-shapes.ts); the field's path lets a
+// value ACP generates (an exact digest or id, a staged body, a listed audit token) skip the
+// long-base64 shape, and only it.
+const scrubValue = (text: string, path: readonly string[], site?: WriteSite, holder?: unknown): string => {
+  const out = redactCredentialShapes(text, { path, store: "audit", ...(site ? { site } : {}), holder });
   return out.length > MAX_STRING ? `${out.slice(0, MAX_STRING)}…[truncated]` : out;
 };
 
-export const redact = (value: unknown, depth = 0): unknown => {
+/** `site` is where the evidence is being written; `holder` is the object `value` sits in. */
+export const redact = (value: unknown, depth = 0, path: readonly string[] = [], site?: WriteSite, holder?: unknown): unknown => {
   if (depth > 8) return "[depth-limit]";
-  if (typeof value === "string") return scrubValue(value);
+  if (typeof value === "string") return scrubValue(value, path, site, holder);
   if (typeof value === "bigint") return value.toString();
-  if (Array.isArray(value)) return value.slice(0, 200).map((item) => redact(item, depth + 1));
+  if (Array.isArray(value)) return value.slice(0, 200).map((item) => redact(item, depth + 1, path, site, holder));
   if (value && typeof value === "object") {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value)) {
       if (isSecretKey(k)) out[k] = "[redacted]";
       else if (isSecretCollectionKey(k)) out[k] = "[redacted-collection]";
       else if (isBulkContentKey(k)) out[k] = "[not-stored]";
-      else out[k] = redact(v, depth + 1);
+      else out[k] = redact(v, depth + 1, [...path, k], site, value);
     }
     return out;
   }
@@ -319,15 +312,18 @@ const MAX_CREDENTIAL_SCAN_DEPTH = 24;
  * credential in evidence at all. Audit records keep using `redact`, where rewriting is the
  * right answer because nothing corroborates an audit row against a produced copy.
  */
-export const credentialBearingField = (value: unknown, depth = 0): string | null => {
+/** `site` is where the content is being stored (`WriteSite`); `holder` is the object `value` sits in. */
+export const credentialBearingField = (
+  value: unknown, depth = 0, path: readonly string[] = [], site?: WriteSite, holder?: unknown,
+): string | null => {
   // Deeper than the scan goes is not "clean": an unexamined subtree must not become evidence.
   if (depth > MAX_CREDENTIAL_SCAN_DEPTH) return "<unexaminable-depth>";
   if (typeof value === "string") {
-    return SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(value)) ? "<value>" : null;
+    return hasCredentialShape(value, { path, store: "artifact", ...(site ? { site } : {}), holder }) ? "<value>" : null;
   }
   if (Array.isArray(value)) {
     for (const item of value) {
-      const found = credentialBearingField(item, depth + 1);
+      const found = credentialBearingField(item, depth + 1, path, site, holder);
       if (found) return found;
     }
     return null;
@@ -343,7 +339,7 @@ export const credentialBearingField = (value: unknown, depth = 0): string | null
       ) {
         return key;
       }
-      const found = credentialBearingField(nested, depth + 1);
+      const found = credentialBearingField(nested, depth + 1, [...path, key], site, value);
       if (found) return found === "<value>" ? key : found;
     }
   }

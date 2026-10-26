@@ -146,7 +146,17 @@ const remainingAt = (deadline: GitDeadline, at: number, cwd: string, args: reado
 export const git = async (
   cwd: string,
   args: readonly string[],
-  options: { allowFailure?: boolean; timeoutMs?: number; isolatedConfig?: boolean; deadline?: GitDeadline } = {},
+  options: {
+    allowFailure?: boolean;
+    timeoutMs?: number;
+    isolatedConfig?: boolean;
+    deadline?: GitDeadline;
+    /**
+     * `latin1` maps each output byte to one character, so `Buffer.from(stdout, "latin1")` gives the
+     * exact bytes (a blob that is not UTF-8 text); the default `utf8` is lossy for such bytes.
+     */
+    encoding?: "utf8" | "latin1";
+  } = {},
 ): Promise<GitResult> => {
   // `?? ` would pass a caller's `0` straight through, and Node reads `timeout: 0` as *no*
   // timeout — so the one value that removes the bound would still census as bounded, because
@@ -182,7 +192,7 @@ export const git = async (
   try {
     settled = await exec("git", ["-C", cwd, ...args], {
       maxBuffer: MAX_BUFFER,
-      encoding: "utf8",
+      encoding: options.encoding ?? "utf8",
       timeout,
       env: { ...sanitizedGitEnv(), ...(options.isolatedConfig ? ISOLATED_CONFIG_ENV : {}) },
     });

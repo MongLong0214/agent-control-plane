@@ -161,9 +161,16 @@ const prepare = async (
     ops?: Operation[];
     manifest?: ReturnType<typeof fixtureManifest>;
     artifacts?: (real: ArtifactsPort) => ArtifactsPort;
+    /** Leave the control plane's own repo-factory work root unconfigured. */
+    unconfiguredControlPlane?: boolean;
   } = {},
 ): Promise<Prepared> => {
-  const harness = makeHarness();
+  // One configuration for the runner and the stores, as production has: the stores check a stored
+  // checkout against the work root they were constructed with.
+  const workRoot = mkdtempSync(join(tmpdir(), "acp-246-run-"));
+  roots.push(workRoot);
+  const github = new FakeGitHub(workRoot);
+  const harness = makeHarness(options.unconfiguredControlPlane === true ? {} : { repoFactory: { workRoot, githubPort: github } });
   const created = harness.cp.runs.create({
     kind: RunKind.PROJECT_BOOTSTRAP,
     executionMode: ExecutionMode.STANDARD,
@@ -186,9 +193,6 @@ const prepare = async (
   const snapshotDigest = reviewed.snapshotDigest;
   const planArtifact = plannable ? { digest: reviewed.planDigest } : harness.cp.artifacts.put(runId, "PLAN", plan);
 
-  const workRoot = mkdtempSync(join(tmpdir(), "acp-246-run-"));
-  roots.push(workRoot);
-  const github = new FakeGitHub(workRoot);
   const runner = new RepoFactoryBootstrapRunner({
     runs: harness.cp.runs,
     artifacts: options.artifacts ? options.artifacts(harness.cp.artifacts) : harness.cp.artifacts,
@@ -490,7 +494,7 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
   });
 
   it("the control plane composes the runner with the production port, and an unconfigured work root refuses before it", async () => {
-    const prepared = await prepare("unconfigured");
+    const prepared = await prepare("unconfigured", { unconfiguredControlPlane: true });
     expect(prepared.harness.cp.bootstrapProducer).toBeInstanceOf(RepoFactoryBootstrapRunner);
     const refused = await prepared.harness.cp.bootstrapProducer.produceAndActivate({
       ...prepared.input,

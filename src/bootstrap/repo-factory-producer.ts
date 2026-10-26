@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { createHash } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
+import { repositoryCheckoutPath } from "../core/repo-factory-paths.ts";
 
 import { z } from "zod";
 
@@ -338,9 +339,7 @@ export const producedTreeDrift = async (
   return allow(ReasonCode.OK, undefined);
 };
 
-/** Single source of truth for where a role's local checkout lives under `workDir`. */
-export const repositoryCheckoutPath = (workDir: string, repositoryRole: string): string =>
-  join(resolve(workDir), "repositories", repositoryRole);
+export { repositoryCheckoutPath };
 
 const localRepositoryIdentity = (repositoryRole: string): string => `local:${repositoryRole}`;
 
