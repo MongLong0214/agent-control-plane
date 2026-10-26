@@ -248,6 +248,12 @@ export interface InvocationRequest {
    */
   signal?: AbortSignal;
   /**
+   * #1246 — git configuration a WORKER turn's provider child, and every git it runs, applies over the
+   * repository's (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`). Honoured for a
+   * worker turn only.
+   */
+  gitConfig?: Readonly<Record<string, string>>;
+  /**
    * The non-negotiable boundary for a blind-review invocation. It deliberately does
    * not share the more permissive CTO/worker runtime environment: a reviewer may
    * inspect only its immutable packet and has no authority-bearing host tools.

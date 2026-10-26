@@ -11,6 +11,7 @@ import { fixedRuntimes } from "../domain/fixed-role-runtime.ts";
 import { type FailureClass, Role, RunKind, SessionLifecycle, TaskState, roleKeyFor } from "../domain/types.ts";
 import { type ManagedWriteGuard, WriteOperation } from "../guard/managed-write-guard.ts";
 import { canonical } from "../guard/workspace-probe.ts";
+import { providerHome } from "../runtime/cli-adapters.ts";
 import type { InvocationResult, ProviderAdapter } from "../runtime/provider.ts";
 import { randomUUID } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
@@ -38,7 +39,8 @@ import {
   committedChanges,
   dotGitFingerprint,
   effectiveConfig,
-  gitDirFingerprint,
+  gitDirChanges,
+  gitDirEntries,
   headOf,
   ignoredPathState,
   ignoredPathsChanged,
@@ -53,8 +55,10 @@ import {
   indexSnapshot,
   runPinnedGit,
   scanAgainst,
+  splitIndexOf,
   stagedAgainst,
   stagedContent,
+  workerGitConfig,
 } from "./worker-git.ts";
 
 export type { WorkerCommitPort, WorkerDiffEntry } from "./worker-git.ts";
@@ -263,8 +267,10 @@ interface TurnFacts extends DurableFacts {
   objectFormat: "sha1" | "sha256";
   /** `git config --list --show-origin` before the turn. */
   config: string;
-  /** Every git-dir file before the turn (bar the index). */
-  gitDirFingerprint: string;
+  /** Every git-dir entry before the turn (bar the index), as `gitDirEntries` read it. */
+  gitDirEntries: readonly string[];
+  /** #1246 — the git configuration the worker's own git runs with, over the repository's (`workerGitConfig`). */
+  workerGitConfig: Readonly<Record<string, string>>;
   /** What the real index staged before the turn (`stagedContent`): its entries, never its stat cache. */
   stagedBaseline: string;
   /** #1097 — every ignored path's state before the turn (`ignoredPathState`), or why it could not be read. */
@@ -276,6 +282,9 @@ type IgnoredReading = { state: ReadonlyMap<string, string>; error: null } | { st
 
 /** How many changed ignored paths a receipt names; the total is always given. */
 const IGNORED_CHANGES_NAMED = 200;
+
+/** #1246 — how many differing git-dir entries a GIT_DIR_CHANGED refusal names; the total is always given. */
+const GIT_DIR_CHANGES_NAMED = 50;
 
 interface InFlightTurn {
   promise: Promise<void>;
@@ -294,7 +303,7 @@ type CommitOutcome =
 
 /** What the worktree shows after a turn, or why it could not be read safely. */
 interface Observation {
-  problem: { reason: string; reasonCode: ReasonCode; message: string } | null;
+  problem: { reason: string; reasonCode: ReasonCode; message: string; evidence?: Evidence } | null;
   entries: WorkerDiffEntry[];
   diffDigest: string | null;
   outOfScope: string[];
@@ -1195,6 +1204,8 @@ export class WorkerTurnRunner {
       }
       if (!pinned.allowed) return pinned as Decision<never>;
       const repo = pinned.value;
+      const splitIndex = await splitIndexRefusal(repo, worktree);
+      if (splitIndex) return splitIndex;
       const objectFormat = await objectFormatOf(repo);
       const { head, branch } = await headOf(repo);
       if (!head) return deny(ReasonCode.PROBE_FAILED, "the claimed worktree has no HEAD commit", { worktreeId: worktree });
@@ -1249,7 +1260,8 @@ export class WorkerTurnRunner {
         config,
         stagedBaseline,
         ignoredBaseline,
-        gitDirFingerprint: gitDirFingerprint(repo),
+        workerGitConfig: await workerGitConfig(repo, providerHome()),
+        gitDirEntries: gitDirEntries(repo),
       });
     } catch (error) {
       return deny(ReasonCode.PROBE_FAILED, "the claimed worktree could not be inspected", {
@@ -1298,6 +1310,9 @@ export class WorkerTurnRunner {
 
   private async prepareTaskBranchOn(repo: PinnedRepository, facts: DurableFacts, target: TaskWriteTarget): Promise<Decision<void>> {
     const worktree = facts.claim.worktree;
+    // #1246 — before the branch is made, moved or read through the index: nothing is left behind.
+    const splitIndex = await splitIndexRefusal(repo, worktree);
+    if (splitIndex) return splitIndex;
     const format = await objectFormatOf(repo);
     const { head, branch } = await headOf(repo);
     if (!head) return deny(ReasonCode.PROBE_FAILED, "the claimed worktree has no HEAD commit", { worktreeId: worktree });
@@ -1569,6 +1584,7 @@ export class WorkerTurnRunner {
         readOnly: false,
         correlationId: executionId,
         externalSessionId: facts.worker.externalSessionId,
+        gitConfig: facts.workerGitConfig,
         managedWrite: {
           operation: WriteOperation.FILE_MUTATION,
           targetPath: facts.claim.worktree,
@@ -1717,6 +1733,7 @@ export class WorkerTurnRunner {
         reason: observed?.problem?.reason ?? "UNOBSERVED",
         reasonCode: observed?.problem?.reasonCode ?? ReasonCode.INTERNAL_ERROR,
         detail: observed?.problem?.message ?? null,
+        ...(observed?.problem?.evidence ?? {}),
       });
       return;
     }
@@ -1967,8 +1984,8 @@ export class WorkerTurnRunner {
    * git command run under it.
    */
   private async observe(facts: TurnFacts): Promise<Observation> {
-    const refused = (reason: string, reasonCode: ReasonCode, message: string): Observation => ({
-      problem: { reason, reasonCode, message },
+    const refused = (reason: string, reasonCode: ReasonCode, message: string, evidence?: Evidence): Observation => ({
+      problem: { reason, reasonCode, message, ...(evidence ? { evidence } : {}) },
       entries: [],
       diffDigest: null,
       outOfScope: [],
@@ -1979,8 +1996,15 @@ export class WorkerTurnRunner {
       if (dotGitFingerprint(repo.workTree) !== repo.dotGit) {
         return refused("GIT_INDIRECTION_CHANGED", ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "the worktree's .git entry changed during the turn");
       }
-      if (gitDirFingerprint(repo) !== facts.gitDirFingerprint) {
-        return refused("GIT_DIR_CHANGED", ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "a file of the git dir changed during the turn");
+      // #1246 — the refusal names what differs (root, relative path, kind; never contents), so a change no
+      // one expected can be traced to its writer.
+      const gitDir = gitDirEntries(repo);
+      const gitDirChanged = gitDirChanges(repo, facts.gitDirEntries, gitDir);
+      if (gitDirChanged.length > 0) {
+        return refused("GIT_DIR_CHANGED", ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "a file of the git dir changed during the turn", {
+          gitDirChanges: gitDirChanged.slice(0, GIT_DIR_CHANGES_NAMED),
+          gitDirChangeCount: gitDirChanged.length,
+        });
       }
       if ((await effectiveConfig(repo)) !== facts.config) {
         return refused("GIT_CONFIG_CHANGED", ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "the repository's effective git configuration changed during the turn");
@@ -2383,6 +2407,21 @@ const measurePartialMove = async (
  * (`TASK_BRANCH_CREATION_UNDONE`) so a later attempt may start afresh; an attempt whose own records
  * failed, or that left anything behind, stays unresolved and is not attempted again on its own.
  */
+/**
+ * #1246 — a repository with a split index is refused before a turn prepares or launches anything: git
+ * touches its shared index on every read, so the git dir the turn is held to cannot stay unchanged.
+ * The refusal names the setting, so the operator can turn it off.
+ */
+const splitIndexRefusal = async (repo: PinnedRepository, worktree: string): Promise<Decision<never> | null> => {
+  const split = await splitIndexOf(repo, providerHome());
+  if (!split.configured && !split.active) return null;
+  return deny(
+    ReasonCode.WORKER_REPOSITORY_SPLIT_INDEX_UNSUPPORTED,
+    "the claimed worktree's repository uses a split index, or is set to (core.splitIndex); git touches the shared index on every read, so a worker turn cannot hold the git dir unchanged. Turn it off (`git config core.splitIndex false`, then `git update-index --no-split-index`) and run the turn again",
+    { worktreeId: worktree, setting: "core.splitIndex", configured: split.configured, active: split.active },
+  );
+};
+
 const switchToTaskBranch = async (
   repo: PinnedRepository,
   input: {

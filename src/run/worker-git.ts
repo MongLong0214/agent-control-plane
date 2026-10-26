@@ -450,9 +450,10 @@ export const effectiveConfig = async (repo: PinnedRepository): Promise<string> =
 /**
  * Every entry of the pinned git dir(s): path, kind, size, mtime, inode, and a symlink's target. The
  * index is left out: the provider CLI's own `git status` rewrites its stat cache, and the control
- * plane never reads the real index after a turn.
+ * plane never reads the real index after a turn. One line per entry, its fields `\0`-separated and led
+ * by the root and the path relative to it; the order is the walk's, and the same tree gives the same list.
  */
-export const gitDirFingerprint = (repo: PinnedRepository): string => {
+export const gitDirEntries = (repo: PinnedRepository): string[] => {
   const roots = [...new Set([repo.commonDir, repo.gitDir])];
   const entries: string[] = [];
   const worktreesRoot = join(repo.commonDir, "worktrees");
@@ -470,7 +471,108 @@ export const gitDirFingerprint = (repo: PinnedRepository): string => {
     }
   };
   for (const root of roots) walk(root, root, 0);
-  return digestOf(entries);
+  return entries;
+};
+
+/**
+ * #1246 — git configuration a WORKER turn's own git runs with, over the repository's (`GIT_CONFIG_COUNT`
+ * in its environment; see `productionRunCli`), so the read-only commands its prompt allows write nothing
+ * in the git dir where the repository's configuration would have them do so. Measured on git 2.50, with
+ * `GIT_OPTIONAL_LOCKS=0` already set:
+ * - `core.fsmonitor=false`: the builtin fsmonitor daemon a `git status` or `git diff` starts keeps
+ *   cookie files under the git dir (`fsmonitor--daemon/`), and outlives the turn;
+ * - `diff.<driver>.cachetextconv=false`, for every driver the repository's configuration names: a caching
+ *   textconv driver stores its output as notes (`refs/notes/textconv/<driver>`, objects, a reflog) on a
+ *   `git diff`, `show`, `log -p` or `blame`.
+ * Read through the pinned git with the HOME the worker's git has (`home`, the provider child's), so a
+ * `~/` in an `include.path` or `includeIf` resolves to the file the worker reads: the repository's
+ * configuration and everything it includes. The worker's git reads no global or system configuration
+ * (`productionRunCli`), so this is all of what it reads.
+ */
+export const workerGitConfig = async (repo: PinnedRepository, home: string | undefined): Promise<Record<string, string>> => {
+  const cached = await runPinnedGit(repo, ["config", "-z", "--name-only", "--get-regexp", "^diff\\..*\\.cachetextconv$"], asTheWorker(home));
+  if (cached.exitCode !== 0 && cached.exitCode !== 1) {
+    throw new Error(`git config --get-regexp ${cached.exitCode === null ? "did not answer" : `exited ${cached.exitCode}`}: ${cached.stderr.slice(0, 300)}`);
+  }
+  const config: Record<string, string> = { "core.fsmonitor": "false" };
+  for (const key of cached.exitCode === 0 ? cached.stdout.split("\0").filter(Boolean) : []) config[key] = "false";
+  return config;
+};
+
+/** `runPinnedGit` options under which git reads its configuration as the worker's git does: with its HOME. */
+const asTheWorker = (home: string | undefined): Parameters<typeof runPinnedGit>[2] => (home === undefined ? {} : { extraEnv: { HOME: home } });
+
+/**
+ * #1246 — whether the repository depends on a split index, read as the worker's git reads it (`home`):
+ * - `configured`: `core.splitIndex` is effectively true, so the next index write splits the index;
+ * - `active`: the index on disk uses a shared index. Git freshens that file's mtime on every read of the
+ *   index, optional locks or not, so a turn on it always changes its git dir.
+ * `active` is asked with `core.splitIndex` forced true, because git applies the setting to the index it
+ * has read: with it false, `--shared-index-path` prints nothing for an index still split on disk, which
+ * every read still freshens. Forced true, it names the real shared index exactly when the index on disk
+ * is split, and an all-zero one when it is not. A `sharedindex.*` file the index no longer uses (left
+ * by `git update-index --no-split-index`) is not read and does not count. Writes nothing.
+ *
+ * A sparse index cannot be split, and the forced probe refuses on one ("cannot use split index with a
+ * sparse index"). That refusal, in a repository configured for a sparse index (`index.sparse` and
+ * `core.sparseCheckout`), reads as inactive; any other failure of the probe fails closed. The probe still
+ * runs there: an index split before sparse-index was turned on stays split, and is reported active.
+ */
+export const splitIndexOf = async (repo: PinnedRepository, home: string | undefined): Promise<{ configured: boolean; active: boolean }> => {
+  const options = asTheWorker(home);
+  const setting = await runPinnedGit(repo, ["config", "--type=bool", "--get", "core.splitIndex"], options);
+  if (setting.exitCode !== 0 && setting.exitCode !== 1) {
+    throw new Error(`git config core.splitIndex ${setting.exitCode === null ? "did not answer" : `exited ${setting.exitCode}`}: ${setting.stderr.slice(0, 300)}`);
+  }
+  const configured = setting.exitCode === 0 && setting.stdout.trim() === "true";
+  const sparse = await runPinnedGit(repo, ["config", "-z", "--type=bool", "--get-regexp", "^(index\\.sparse|core\\.sparsecheckout)$"], options);
+  if (sparse.exitCode !== 0 && sparse.exitCode !== 1) {
+    throw new Error(`git config index.sparse ${sparse.exitCode === null ? "did not answer" : `exited ${sparse.exitCode}`}: ${sparse.stderr.slice(0, 300)}`);
+  }
+  // `-z` prints `key\nvalue\0` per value; the last value of a key is the one git uses.
+  const sparseSettings = new Map(sparse.stdout.split("\0").filter(Boolean).map((entry) => entry.split("\n", 2) as [string, string]));
+  const sparseIndex = sparseSettings.get("index.sparse") === "true" && sparseSettings.get("core.sparsecheckout") === "true";
+  const shared = await runPinnedGit(repo, ["-c", "core.splitIndex=true", "rev-parse", "--shared-index-path"], options);
+  if (shared.exitCode === 0) return { configured, active: /sharedindex\.[0-9a-f]*[1-9a-f][0-9a-f]*$/.test(shared.stdout.trim()) };
+  if (sparseIndex && shared.exitCode === 128 && shared.stderr.includes("cannot use split index with a sparse index")) return { configured, active: false };
+  throw new Error(`git rev-parse --shared-index-path ${shared.exitCode === null ? "did not answer" : `exited ${shared.exitCode}`}: ${shared.stderr.slice(0, 300)}`);
+};
+
+/** One git-dir entry that differs between two `gitDirEntries` readings; never its contents. */
+export interface GitDirChange {
+  change: "added" | "removed" | "changed";
+  /** The walk root the path is relative to: the pinned git dir, or a linked worktree's common dir. */
+  root: "gitDir" | "commonDir";
+  path: string;
+  kind: "file" | "directory" | "symlink" | "other";
+}
+
+const GIT_DIR_KINDS: Readonly<Record<string, GitDirChange["kind"]>> = { f: "file", d: "directory", l: "symlink", o: "other" };
+
+/**
+ * #1246 — which entries differ between two readings of the same walk (`gitDirEntries`): added,
+ * removed, or changed in any recorded field. Named by root, relative path and kind only, ordered by
+ * root and path. A removed entry has the kind it had; any other, the kind it has now.
+ */
+export const gitDirChanges = (repo: PinnedRepository, before: readonly string[], after: readonly string[]): GitDirChange[] => {
+  const keyed = (lines: readonly string[]): Map<string, string> =>
+    new Map(lines.map((line) => [line.split("\0", 2).join("\0"), line]));
+  const was = keyed(before);
+  const now = keyed(after);
+  const changes: GitDirChange[] = [];
+  for (const key of [...new Set([...was.keys(), ...now.keys()])].sort()) {
+    const previous = was.get(key);
+    const current = now.get(key);
+    if (previous === current) continue;
+    const [root = "", path = "", kind = "o"] = (current ?? previous)!.split("\0", 3);
+    changes.push({
+      change: previous === undefined ? "added" : current === undefined ? "removed" : "changed",
+      root: root === repo.gitDir ? "gitDir" : "commonDir",
+      path,
+      kind: GIT_DIR_KINDS[kind] ?? "other",
+    });
+  }
+  return changes;
 };
 
 const gitBlobId = (format: "sha1" | "sha256", bytes: Buffer): string =>

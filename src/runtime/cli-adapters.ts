@@ -790,6 +790,15 @@ const productionRunCli = async (
      * that leaves the group (`setsid`) is outside it and is left alone.
      */
     reapProcessGroup?: boolean;
+    /**
+     * #1246 — a WORKER turn. Its child runs with `GIT_OPTIONAL_LOCKS=0`, so the read-only git its
+     * prompt allows (`git status`, `git diff`) takes no optional lock and never rewrites the index as a
+     * side effect; a rewrite in a linked worktree's git dir refuses the turn GIT_DIR_CHANGED. Set by the
+     * Claude and Codex worker turns only.
+     */
+    workerTurn?: boolean;
+    /** #1246 — with `workerTurn`: git configuration the child's git applies over the repository's. */
+    gitConfig?: Readonly<Record<string, string>>;
   },
 ): Promise<{
   stdout: string;
@@ -854,6 +863,24 @@ const productionRunCli = async (
           options.providerCredentialDir,
           options.codexHome,
         );
+    // Set after the allowlist, so an inherited value cannot turn optional locks back on. A worker's git
+    // reads no global or system configuration (the provider user's `~/.gitconfig` and XDG config, which
+    // `workerGitConfig` cannot see), and, since git applies `GIT_CONFIG_PARAMETERS` after
+    // `GIT_CONFIG_COUNT`, no injected configuration either: it runs with the repository's configuration
+    // and this turn's `gitConfig` over it, exactly what `workerGitConfig` read. The worker only reads;
+    // the control plane commits, so no identity or credential helper is needed.
+    if (options.workerTurn === true && !isolated) {
+      environment["GIT_OPTIONAL_LOCKS"] = "0";
+      environment["GIT_CONFIG_GLOBAL"] = "/dev/null";
+      environment["GIT_CONFIG_NOSYSTEM"] = "1";
+      for (const name of Object.keys(environment)) if (INJECTED_GIT_CONFIG.test(name)) delete environment[name];
+      const overrides = Object.entries(options.gitConfig ?? {});
+      if (overrides.length > 0) environment["GIT_CONFIG_COUNT"] = String(overrides.length);
+      overrides.forEach(([key, value], index) => {
+        environment[`GIT_CONFIG_KEY_${index}`] = key;
+        environment[`GIT_CONFIG_VALUE_${index}`] = value;
+      });
+    }
     if (egress) {
       // The child receives only the loopback proxy route. Do not let a caller-supplied
       // environment retain an alternate proxy, no-proxy escape hatch, or credentials.
@@ -1790,9 +1817,18 @@ const AUTHORITY_ENV = [
 ];
 
 const authorityEnvironment = (name: string): boolean => AUTHORITY_ENV.some((pattern) => pattern.test(name));
+/** #1246 — git configuration carried by the environment; a worker turn's child inherits none of it. */
+const INJECTED_GIT_CONFIG = /^GIT_CONFIG_(?:PARAMETERS|COUNT|KEY_\d+|VALUE_\d+)$/;
 // The shared list (core/credential-shapes.ts) in its text scope, found anywhere in the value: a
 // superset of the whole-value shapes this filter used to keep as its own copy.
 const looksLikeCredential = (value: string): boolean => hasCredentialShape(value);
+
+/**
+ * The HOME an agent CLI child runs with (`runtimeEnvironment`): the invoking user's, where its provider
+ * login lives. #1246 — a WORKER turn's configuration discovery reads the repository's git config with
+ * this HOME too, so a `~/` include resolves to the file the worker's own git will read.
+ */
+export const providerHome = (): string | undefined => process.env["HOME"];
 
 /**
  * Constructed, never inherited: an agent CLI receives no daemon authority.
@@ -1813,7 +1849,7 @@ export const runtimeEnvironment = (
 ): NodeJS.ProcessEnv => {
   const environment: NodeJS.ProcessEnv = {
     PATH: agentPath(),
-    HOME: process.env["HOME"] ?? scratch,
+    HOME: providerHome() ?? scratch,
     // Both CLIs resolve their own login through the invoking user's keychain, and neither
     // finds it without USER. Measured, not assumed: with HOME alone `claude --print`
     // answers "Not logged in"; with USER added it authenticates.
@@ -2331,7 +2367,8 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     if (request.externalSessionId) {
       args.push(conversationFlag(request.conversation ?? "new"), request.externalSessionId);
     }
-    if (!request.readOnly && !request.isolation && request.managedWrite) {
+    const workerTurn = !request.readOnly && !request.isolation && request.managedWrite !== undefined;
+    if (workerTurn) {
       // #512 — a writable worker turn edits files without asking, and gets nothing else: no
       // `--allowedTools`, no Bash grant and no network grant are added. Its file writes reach only
       // the target the guard-backed broker authorised for this one invocation (the seatbelt below).
@@ -2386,6 +2423,8 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       // #1104 — a worker or CTO turn owns what its CLI leaves in its group, and ends it on every
       // completion under the holder's ownership proof. A packet reviewer's profile admits no holder.
       reapProcessGroup: request.isolation === undefined,
+      workerTurn,
+      ...(workerTurn ? { gitConfig: request.gitConfig } : {}),
     });
 
     let result: Awaited<ReturnType<typeof runCli>>;
@@ -3114,7 +3153,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       // fails closed. The broker still authorises the checkout before launch.
       writablePaths: [...writablePaths, ...this.codexWritableRoots(scratch)],
       readablePaths: { subtrees: this.codexWritableRoots(scratch) },
-      ...(gptWorkerTurn ? { sandbox: "codex-workspace-write" as const } : {}),
+      ...(gptWorkerTurn ? { sandbox: "codex-workspace-write" as const, workerTurn: true, gitConfig: request.gitConfig } : {}),
       ...(tracked ? { onSpawn: request.onSpawn, signal: request.signal, reapProcessGroup: true as const } : {}),
     });
     let result: Awaited<ReturnType<typeof runCli>>;
