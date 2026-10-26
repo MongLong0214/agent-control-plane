@@ -7,7 +7,8 @@ import { residentBootPacket, residentClonePath, residentPrivateKeyFile, resident
 import type { Db } from '../db/database.ts';
 import type { Clock } from '../core/clock.ts';
 import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
-import type { HostProjectProvisioner, ProjectAllocation, HostObservation, HostOperation } from '../runtime/host-project-provisioner.ts';
+import { HostOperationFailure, type HostProjectProvisioner, type ProjectAllocation, type HostObservation, type HostOperation } from '../runtime/host-project-provisioner.ts';
+import { formatHostProvisionerReason } from '../runtime/host-provisioner-reason.ts';
 import type { BootstrapConfirmation } from './repo-factory-bootstrap-run.ts';
 
 interface ProvisioningRow {run_id:string; project_id:string; binding_json:string; allocation_json:string; confirmation_json:string; steps_json:string; status:string; last_error:string|null}
@@ -111,9 +112,12 @@ export class ResidentProjectProvisioning {
       const evidence = {runId:a.runId,allocation:a,observations,claimSessionId:claim?.session_id ?? null,subscriberReady,observedAt:this.clock.nowIso(),complete:false};
       this.save(a.runId,'readbacks',evidence);
       return evidence;
-    } catch {
-      this.db.run(`UPDATE resident_project_provisioning SET last_error = 'provisioning readback pending or refused', updated_at = ? WHERE run_id = ?`,[this.clock.nowIso(),input.runId]);
-      throw new Error('resident provisioning pending or refused; inspect provisioning ledger');
+    } catch (error) {
+      // Only the host's own allowlisted reason, as the shared module parsed it; any other failure keeps the fixed text.
+      const reason = error instanceof HostOperationFailure ? error.reason : null;
+      const detail = reason ? `: ${formatHostProvisionerReason(reason)}` : '';
+      this.db.run(`UPDATE resident_project_provisioning SET last_error = ?, updated_at = ? WHERE run_id = ?`,[`provisioning readback pending or refused${detail}`,this.clock.nowIso(),input.runId]);
+      throw Object.assign(new Error(`resident provisioning pending or refused${detail}; inspect provisioning ledger`),reason ? {reason} : {});
     } finally {this.#running.delete(input.runId);}
   }
   evidence(runId:string): ProvisioningEvidence | null {

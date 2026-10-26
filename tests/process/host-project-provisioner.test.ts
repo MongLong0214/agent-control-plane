@@ -1,11 +1,12 @@
-import { afterAll, expect, it } from 'vitest';
+import { afterAll, afterEach, expect, it, vi } from 'vitest';
 import { mkdirSync, readFileSync, rmSync, writeFileSync, realpathSync, statSync, symlinkSync, chmodSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { getPublicKey } from 'nostr-tools';
 import type { ProjectAllocation } from '../../src/runtime/host-project-provisioner.ts';
-import { hostObservationSchema } from '../../src/runtime/host-project-provisioner.ts';
+import { ExecFileHostProjectProvisioner, hostObservationSchema } from '../../src/runtime/host-project-provisioner.ts';
 import Database from 'better-sqlite3';
 import { cleanupTempDirs, tempDir } from '../helpers/fixtures.ts';
 
@@ -343,7 +344,7 @@ it.each(['normal','lost-response-after-create','ambiguity'])('runs packaged host
   const staleMcp = JSON.parse(readFileSync(join(home,'fake.json'),'utf8'));staleMcp.mcp=true;staleMcp.mcpUuid='cccccccc-cccc-4ccc-8ccc-cccccccccccc';writeFileSync(join(home,'fake.json'),JSON.stringify(staleMcp));
   await invoke('ensure-resident');expect(JSON.parse(readFileSync(join(home,'fake.json'),'utf8')).mcpRemovals).toBe(1);
   expect(statSync(a.privateKeyFile).mode & 0o777).toBe(0o600);expect(statSync(a.privateKeyFile.replace('.priv','.pub')).mode & 0o777).toBe(0o600);
-  const launcher = readFileSync(join(state,'resident-test.sh'),'utf8');expect(launcher).toContain("exec '"+env.ACP_CLAUDE_BINARY+"'");for (const flag of ['--session-id','--model','opus','--remote-control','--name','--messaging-socket-path','--permission-mode','bypassPermissions','--dangerously-skip-permissions']) expect(launcher).toContain(flag);
+  const launcher = readFileSync(join(state,'resident-test.sh'),'utf8');expect(launcher).toContain("\n'"+env.ACP_CLAUDE_BINARY+"' '--model'");for (const flag of ['--session-id','--model','opus','--remote-control','--name','--messaging-socket-path','--permission-mode','bypassPermissions','--dangerously-skip-permissions']) expect(launcher).toContain(flag);
   const rcPath = join(home,'.claude','sessions',`${process.pid}.json`);const rc = readFileSync(rcPath,'utf8');writeFileSync(rcPath,JSON.stringify({sessionId:a.sessionUuid,cwd:a.clonePath,bridgeSessionId:null}));await expect(invoke('observe')).rejects.toThrow();await expect(invoke('ensure-resident')).rejects.toThrow();writeFileSync(rcPath,rc);
   const intentPath = join(state,'buzz-room-test.json');const intent = readFileSync(intentPath,'utf8');const admitted = JSON.parse(readFileSync(join(home,'fake.json'),'utf8')).admitted;
   const key = readFileSync(a.privateKeyFile,'utf8');const roster = readFileSync(join(home,'.hermes','bridge','required-mentions.json'),'utf8');const fleet = readFileSync(join(home,'.claude','watchers','fleet','manifest.tsv'),'utf8');
@@ -412,7 +413,7 @@ it('accepts a stable Claude symlink to an executable regular file',async () => {
   symlinkSync(join(resolvedBin,'claude'),link);
   await invoke('ensure-checkout');await invoke('ensure-buzz');
   await invoke('ensure-resident',{ACP_CLAUDE_BINARY:link});
-  expect(readFileSync(join(state,'resident-test.sh'),'utf8')).toContain(`exec '${link}'`);
+  expect(readFileSync(join(state,'resident-test.sh'),'utf8')).toContain(`\n'${link}' '--model'`);
 });
 
 it("the launcher's PATH line appends $HOME/.local/bin without shadowing the daemon's own earlier entries",async () => {
@@ -445,4 +446,121 @@ it.each(binaries)('reports the %s step and non-zero exit code without subprocess
   const operation = binary === 'buzz' ? 'ensure-buzz' : 'ensure-resident';
   const failure = await invoke(operation).then(() => 'unexpected success',error => String(error));
   expect(failure).toBe(`Error: ${operation}: host project provisioner refused operation: ${binary} in ${operation}: non-zero exit with exit code 23\n`);
+});
+
+// #1215 and #1216: the daemon's own runner against the packaged script, in the fixture's HOME.
+afterEach(() => {vi.unstubAllEnvs();});
+const daemon = (f:ReturnType<typeof fixture>, overrides:Record<string,string> = {}) => {
+  for (const [key,value] of Object.entries({...f.env,...overrides})) if (value !== undefined && process.env[key] !== value) vi.stubEnv(key,value);
+  return new ExecFileHostProjectProvisioner(f.script,f.home,f.state,30_000,f.database);
+};
+const refusal = (pending:Promise<unknown>) => pending.then(() => {throw new Error('unexpected success');},(error:unknown) => error as Error & {reason?:unknown});
+const launchResident = (f:ReturnType<typeof fixture>) => new Promise<unknown>(resolve => {
+  execFile('/bin/sh',[join(f.state,'resident-test.sh')],{env:f.env,timeout:10_000},error => resolve(error ? error.code : 0));
+});
+const residentGone = (f:ReturnType<typeof fixture>) => {
+  const file = join(f.home,'fake.json');
+  writeFileSync(file,JSON.stringify({...JSON.parse(readFileSync(file,'utf8')),launched:false,pane:false}));
+};
+
+it.each([
+  ['missing binary variable',{ACP_BUZZ_BINARY:'',ACP_RESOLVED_BUZZ_BINARY:''},{binary:'buzz',operation:'ensure-buzz',kind:'missing binary variable'}],
+  ['non-zero exit',{},{binary:'buzz',operation:'ensure-buzz',kind:'non-zero exit',exitCode:23}],
+] as const)('the host script\'s own structured reason (%s) reaches the daemon result',async (_case,env,reason) => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');
+  if(reason.kind === 'non-zero exit') writeFileSync(join(f.home,'fail-buzz'),'');
+  const failure = await refusal(daemon(f,env).invoke('ensure-buzz',f.a));
+  expect(failure.reason).toEqual(reason);
+  expect(failure.message).toBe(`host provisioner ensure-buzz failed: buzz in ensure-buzz: ${reason.kind}${'exitCode' in reason ? ' with exit code 23' : ''}`);
+  expect(failure.message).not.toContain('SECRET');
+});
+
+it('the daemon takes only one exact allowlisted reason for its own operation and drops raw stderr and every off-shape report',async () => {
+  const {a} = fixture();
+  const line = (detail:string) => `host project provisioner refused operation: ${detail}\n`;
+  const exited = {binary:'claude',operation:'observe',kind:'non-zero exit',exitCode:2};
+  const cases:[string,unknown][] = [
+    [line('claude in observe: non-zero exit with exit code 2'),exited],
+    [line('claude in observe: exited with exit code 0'),{binary:'claude',operation:'observe',kind:'exited',exitCode:0}],
+    [line('buzz in observe: binary is missing (ENOENT)'),{binary:'buzz',operation:'observe',kind:'binary is missing (ENOENT)'}],
+    ['SECRET-STDERR',null],
+    ['SECRET-STDERR\n'+line('claude in observe: non-zero exit with exit code 2'),null],
+    [line('claude in observe: non-zero exit with exit code 2')+'SECRET-STDERR\n',null],
+    [line('claude in observe: non-zero exit with exit code 2 SECRET-STDERR'),null],
+    [line('claude in observe: non-zero exit with exit code 2').trimEnd(),null],
+    [line('git in observe: non-zero exit with exit code 2'),null],
+    [line('claude in observe: SECRET-STDERR'),null],
+    [line('agentctl runtime unavailable in observe'),null],
+    [line('claude in ensure-resident: non-zero exit with exit code 2'),null],
+    [line('claude in observe: non-zero exit with exit code 0'),null],
+    [line('claude in observe: exited with exit code 2'),null],
+    [line('claude in observe: non-zero exit with exit code 256'),null],
+    [line('claude in observe: non-zero exit with exit code 02'),null],
+    [line('claude in observe: non-zero exit'),null],
+    [line('claude in observe: binary is missing with exit code 2'),null],
+    [JSON.stringify({ceoBuzzSignerFailure:{outcome:'REFUSED',code:'SECRET-STDERR',message:'SECRET-STDERR'}}),null],
+  ];
+  for (const [stderr,expected] of cases) {
+    const dir = realpathSync(tempDir('host-reason-wire-'));const script = join(dir,'host.mjs');
+    writeFileSync(script,`import {readFileSync} from 'node:fs';readFileSync(0);process.stderr.write(${JSON.stringify(stderr)});process.exitCode = 1;\n`);
+    const failure = await refusal(new ExecFileHostProjectProvisioner(script,dir,join(dir,'state'),30_000).invoke('observe',a));
+    expect({stderr,reason:failure.reason}).toEqual({stderr,reason:expected});
+    if(expected === null) expect(failure.message).toBe('host provisioner observe failed');
+    expect(failure.message).not.toContain('SECRET');
+  }
+});
+
+it('the resident launcher records only claude\'s exit status for its launch, and observe reports a non-zero exit as a structured reason',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');await f.invoke('ensure-resident');
+  // The fake claude now prints SECRET-STDOUT and SECRET-STDERR and exits 23.
+  writeFileSync(join(f.home,'fail-claude'),'');
+  expect(await launchResident(f)).toBe(23);
+  residentGone(f);
+  const failure = await refusal(daemon(f).invoke('observe',f.a));
+  expect(failure.reason).toEqual({binary:'claude',operation:'observe',kind:'non-zero exit',exitCode:23});
+  expect(failure.message).toBe('host provisioner observe failed: claude in observe: non-zero exit with exit code 23');
+  const record = readFileSync(join(f.state,'resident-test.exit.json'),'utf8');
+  expect(Object.keys(JSON.parse(record)).sort()).toEqual(['exitCode','launch']);
+  for (const secret of ['SECRET',readFileSync(f.a.privateKeyFile,'utf8').trim(),f.home]) expect(record).not.toContain(secret);
+  // Written by rename: no partial record is left beside it.
+  expect(readdirSync(f.state).filter(name => name.startsWith('resident-test.exit'))).toEqual(['resident-test.exit.json']);
+});
+
+it('an exit record for one session never explains another session of the same project',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');await f.invoke('ensure-resident');
+  writeFileSync(join(f.home,'fail-claude'),'');
+  expect(await launchResident(f)).toBe(23);
+  residentGone(f);
+  expect((await refusal(daemon(f).invoke('observe',f.a))).reason).toEqual({binary:'claude',operation:'observe',kind:'non-zero exit',exitCode:23});
+  // Session B of the same project, before B has launched: A's marker and record are current, but they are A's.
+  f.a.sessionUuid = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';writeFileSync(join(f.home,'allocation.json'),JSON.stringify(f.a));
+  const other = await refusal(daemon(f).invoke('observe',f.a));
+  expect(other.reason ?? null).toBeNull();
+  expect(other.message).toBe('host provisioner observe failed');
+});
+
+it('an exit record from an earlier launch never explains a later one',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');await f.invoke('ensure-resident');
+  writeFileSync(join(f.home,'fail-claude'),'');
+  expect(await launchResident(f)).toBe(23);
+  residentGone(f);
+  expect((await refusal(daemon(f).invoke('observe',f.a))).reason).toEqual({binary:'claude',operation:'observe',kind:'non-zero exit',exitCode:23});
+  // Fleet recovery relaunches the dead resident: the first launch's record stays on disk but no longer describes it.
+  rmSync(join(f.home,'fail-claude'));
+  await f.invoke('ensure-resident');
+  expect(JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8')).launches).toBe(2);
+  residentGone(f);
+  const stale = await refusal(daemon(f).invoke('observe',f.a));
+  expect(stale.reason ?? null).toBeNull();
+  expect(stale.message).toBe('host provisioner observe failed');
+  // A record naming any other launch, even a clean exit, is ignored the same way.
+  writeFileSync(join(f.state,'resident-test.exit.json'),JSON.stringify({launch:randomUUID(),exitCode:0}));
+  expect((await refusal(daemon(f).invoke('observe',f.a))).reason ?? null).toBeNull();
+  // The current launch's own exit is reported: the fake claude exits 2 for a session launch.
+  expect(await launchResident(f)).toBe(2);
+  expect((await refusal(daemon(f).invoke('observe',f.a))).reason).toEqual({binary:'claude',operation:'observe',kind:'non-zero exit',exitCode:2});
 });

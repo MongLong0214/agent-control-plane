@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { z } from 'zod';
 import { join } from 'node:path';
 import type { CanonicalCeoBuzzRoute } from '../outbox/ceo-buzz-signer.ts';
+import { formatHostProvisionerReason, readHostProvisionerReason, type HostProvisionerReason } from './host-provisioner-reason.ts';
 
 export const hostOperations = ['ensure-checkout', 'ensure-buzz', 'ensure-routing', 'ensure-resident', 'observe', 'retire'] as const;
 export type HostOperation = typeof hostOperations[number];
@@ -39,6 +40,19 @@ export class HostProvisionerError extends Error {
   }
 }
 
+/**
+ * A project operation's failure. Its reason exists only as the shared module read it from the host's stderr:
+ * the host's own report in the one allowlisted shape, else null. The stderr itself is never kept.
+ */
+export class HostOperationFailure extends Error {
+  readonly reason: HostProvisionerReason | null;
+  constructor(readonly operation: HostOperation, stderr: string) {
+    const reason = readHostProvisionerReason(stderr, operation);
+    super(`host provisioner ${operation} failed${reason ? `: ${formatHostProvisionerReason(reason)}` : ''}`);
+    this.reason = reason;
+  }
+}
+
 /** One bounded execFile protocol. No shell, command text, credentials or raw child errors cross it. */
 export class ExecFileHostProjectProvisioner implements HostProjectProvisioner {
   constructor(private readonly script: string, private readonly home: string, private readonly stateDir: string, private readonly timeoutMs = 120_000, private readonly databasePath = join(stateDir, "state.sqlite")) {}
@@ -58,7 +72,7 @@ export class ExecFileHostProjectProvisioner implements HostProjectProvisioner {
             } catch { /* An unclassified failure supplies no verification. */ }
             reject(new HostProvisionerError(error.killed || error.code === 'ETIMEDOUT' ? 'LOST' : 'INVALID')); return;
           }
-          reject(new Error(`host provisioner ${operation} failed`)); return;
+          reject(new HostOperationFailure(operation, stderr)); return;
         }
         try { resolve(hostObservationSchema.parse(JSON.parse(stdout))); }
         catch { reject('mode' in allocation ? new HostProvisionerError('INVALID') : new Error('invalid host provisioner response')); }

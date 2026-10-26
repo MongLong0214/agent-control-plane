@@ -18,6 +18,7 @@ import { ResidentProjectProvisioning } from '../../src/bootstrap/resident-projec
 import { CanonicalSessionRegistry } from '../../src/registry/canonical-session-registry.ts';
 import { retireProject } from '../../src/registry/project-retirement.ts';
 import type { HostOperation, HostProjectProvisioner, ProjectAllocation, HostObservation } from '../../src/runtime/host-project-provisioner.ts';
+import { HostOperationFailure } from '../../src/runtime/host-project-provisioner.ts';
 import { git } from '../../src/git/git.ts';
 import { Db } from '../../src/db/database.ts';
 import { MIGRATIONS } from '../../src/db/migrations.ts';
@@ -228,6 +229,34 @@ describe('durable resident provisioning and retirement',() => {
     expect(service.ready(input.runId,'other-session')).toBe(false);
     expect(() => service.remember({...confirmation,candidateSnapshotDigest:'changed'},'resident',{})).toThrow();
     h.cp.close();
+  });
+  it.each(['ensure-buzz','observe'] as const)('records only the host\'s own allowlisted reason for a failed %s in the provisioning ledger and result',async failed => {
+    const h = makeHarness();const host = new FakeHost();const invoke = host.invoke.bind(host);
+    let failure:Error = new Error('unused');
+    host.invoke = async (op,a) => {if (op === failed) throw failure;return invoke(op,a);};
+    const run = h.cp.runs.create({kind:RunKind.PROJECT_BOOTSTRAP,executionMode:'STANDARD',contract});if (!run.allowed) throw new Error(run.message);
+    h.cp.projects.register({projectId:'resident',name:'resident'});
+    const service = new ResidentProjectProvisioning(h.cp.db,h.clock,host,join(h.root,'home'),h.root);service.attachSubscriber(async () => false);
+    service.remember({runId:run.value.runId,candidateSnapshotDigest:'candidate',ceoSessionId:'ceo'},'resident',{});
+    const input = {runId:run.value.runId,projectId:'resident',repositoryIdentity:'github:acme/fixture',repositoryNodeId:'R_node',head:'f'.repeat(40),packet:{}};
+    const refused = () => service.ensure(input).then(() => {throw new Error('unexpected success');},(error:unknown) => error as Error & {reason?:unknown});
+    const ledger = () => service.row(input.runId)?.last_error;
+    failure = new HostOperationFailure(failed,`host project provisioner refused operation: claude in ${failed}: non-zero exit with exit code 23\n`);
+    const result = await refused();
+    expect(ledger()).toBe(`provisioning readback pending or refused: claude in ${failed}: non-zero exit with exit code 23`);
+    expect(result.message).toBe(`resident provisioning pending or refused: claude in ${failed}: non-zero exit with exit code 23; inspect provisioning ledger`);
+    expect(result.reason).toEqual({binary:'claude',operation:failed,kind:'non-zero exit',exitCode:23});
+    // Raw host stderr, an off-shape report and any other error leave the fixed text and carry nothing of their own.
+    for (const other of [new HostOperationFailure(failed,'SECRET raw host stderr\n'),
+      new HostOperationFailure(failed,'host project provisioner refused operation: SECRET in observe: non-zero exit with exit code 23\n'),
+      new Error('SECRET raw error')]) {
+      failure = other;
+      const fallback = await refused();
+      expect(ledger()).toBe('provisioning readback pending or refused');
+      expect(fallback.message).toBe('resident provisioning pending or refused; inspect provisioning ledger');
+      expect(fallback.reason ?? null).toBeNull();
+    }
+    expect(service.row(input.runId)?.status).toBe('PENDING');h.cp.close();
   });
   it.each(['cwd','uuid','rc','ancestry','missing'] as const)('refuses a stale or missing %s readback even when the process was launched',async wrong => {
     const h = makeHarness();const host = new FakeHost();const invoke = host.invoke.bind(host);
