@@ -20,6 +20,7 @@ import {
   type CandidateSnapshot,
   candidateSnapshotDigest,
   duplicateRepositoryRoles,
+  expectedCheckoutHead,
   verifySnapshotFreshness,
 } from "../snapshot/candidate-snapshot.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
@@ -539,6 +540,7 @@ export class VerificationEngine {
           repo.treeDigest,
           repo.sourceBranch ?? null,
           gateObligations.get(command.id) ?? [],
+          expectedCheckoutHead(repo),
         );
         if (!local.allowed) return local as Decision<VerificationReport>;
         results.push(local.value);
@@ -695,7 +697,9 @@ export class VerificationEngine {
    * worktree's exactly: the run's worktree claim, every add, remove, cleanup and prune authorised by the
    * guard, and a `verification_worktrees` row (its `command_id` the purpose, its digest the inputs), so
    * the guard's prune and the doctor's orphan sweep know it. Torn down before this answers, whatever
-   * `use` answered; a teardown that did not complete leaves its row DESTROYING for the doctor.
+   * `use` answered; a teardown that did not complete leaves its row DESTROYING for the doctor. A claim
+   * this took for it is released once the worktree is gone: a worker turn reads the run's held claims
+   * as its own, and must not find this one there.
    */
   async withRunWorktree<T>(
     run: RunRow,
@@ -706,8 +710,11 @@ export class VerificationEngine {
     if (!record) {
       return deny(ReasonCode.EVIDENCE_MISSING, "the repository has no local binding", { repositoryIdentity: input.repositoryIdentity });
     }
+    const heldBefore = new Set(this.claims.heldByRun(run.runId).map((held) => held.claimId));
     const claim = this.ensureVerificationClaim(run, input.repositoryIdentity);
     if (!claim.allowed) return claim as Decision<T>;
+    const taken = this.claims.heldByRun(run.runId).filter((held) => !heldBefore.has(held.claimId)).map((held) => held.claimId);
+    let tornDown = true;
     const worktreeId = `${input.purpose}-${run.runId}-${input.head.slice(0, 8)}-${randomUUID().replaceAll("-", "")}`;
     const path = this.worktrees.pathFor(worktreeId);
     const authorization = this.worktreeAuthorization(run, input.repositoryIdentity, record.checkoutPath, path, null);
@@ -740,6 +747,7 @@ export class VerificationEngine {
           await this.worktrees.destroy(record.checkoutPath, worktree.path, authorization);
           this.updateVerificationWorktree(worktreeId, "DESTROYED", "ended_at");
         } catch (error) {
+          tornDown = false;
           if (!isAcpError(error)) throw error;
           // DESTROYING stays durable, as for a command's worktree: the doctor re-evaluates it.
           outcome = deny(error.reasonCode, `the disposable worktree was not torn down: ${error.message}`, { ...error.evidence, worktreeId });
@@ -748,7 +756,73 @@ export class VerificationEngine {
         this.updateVerificationWorktree(worktreeId, "FAILED", "ended_at");
       }
     }
+    // A worktree left behind keeps the claim its prune needs; it expires on its own.
+    if (tornDown) for (const claimId of taken) this.claims.release(claimId, run.runId);
     return outcome;
+  }
+
+  /**
+   * S6 review — a guarded write of refs under one private namespace of `run`'s repository (never a
+   * branch, never HEAD), for keeping an integrated candidate from git gc. The guard fences a ref
+   * write by a live claim of the run on that ref, so the run claims the namespace as its branch
+   * first (the run owner's claim, as a verification worktree's is), then `apply` runs inside one
+   * GIT_BRANCH grant naming it, and the claim this took is released at once: a worker turn reads
+   * the run's held claims as its own, and a branch claim it did not make would refuse its turn.
+   */
+  async writeRunRefs(
+    run: RunRow,
+    input: { repositoryIdentity: string; namespace: string },
+    apply: (checkoutPath: string) => Promise<Decision<void>>,
+  ): Promise<Decision<void>> {
+    const record = this.repositories.byIdentity(input.repositoryIdentity);
+    if (!record) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "the repository has no local binding", { repositoryIdentity: input.repositoryIdentity });
+    }
+    if (!run.ownerSessionId || run.ownerBindingGeneration == null || !run.ownerRoleKey) {
+      return deny(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "a run ref write requires a pinned run owner", { runId: run.runId });
+    }
+    const held = this.claims.heldByRun(run.runId).some(
+      (claim) => claim.repositoryIdentity === input.repositoryIdentity && claim.branch === input.namespace,
+    );
+    const taken: string[] = [];
+    if (!held) {
+      const acquired = this.claims.acquire({
+        runId: run.runId,
+        ownerSessionId: run.ownerSessionId,
+        ownerBindingGeneration: run.ownerBindingGeneration,
+        ownerRoleKey: run.ownerRoleKey,
+        repositoryIdentity: input.repositoryIdentity,
+        branch: input.namespace,
+      });
+      if (!acquired.allowed) return acquired as Decision<void>;
+      taken.push(...acquired.value.map((claim) => claim.claimId));
+    }
+    const effect: { outcome: Decision<void> } = {
+      outcome: deny(ReasonCode.INTERNAL_ERROR, "the run ref effect did not run", { runId: run.runId }),
+    };
+    let authorised: Decision<void>;
+    try {
+      authorised = await this.guard.authorize(
+        {
+          operation: WriteOperation.GIT_BRANCH,
+          targetPath: record.checkoutPath,
+          repositoryIdentity: input.repositoryIdentity,
+          targetBranch: input.namespace,
+          runId: run.runId,
+          sessionId: run.ownerSessionId,
+          bindingGeneration: run.ownerBindingGeneration,
+          claimedClassification: "MANAGED",
+          actor: "candidate-integration",
+        },
+        async () => {
+          effect.outcome = await apply(record.checkoutPath);
+        },
+      );
+    } finally {
+      for (const claimId of taken) this.claims.release(claimId, run.runId);
+    }
+    if (!authorised.allowed) return authorised;
+    return effect.outcome;
   }
 
   private async runLocal(
@@ -761,6 +835,8 @@ export class VerificationEngine {
     frozenTree: string,
     sourceBranch: string | null,
     gateEntries: readonly GateEntry[],
+    /** Where the source checkout must stand for a self-contained copy (`expectedCheckoutHead`). */
+    sourceHead: string,
   ): Promise<Decision<VerificationResultRecord>> {
     const runId = run.runId;
     const worktreeId = `verify-${runId}-${command.id}-${head.slice(0, 8)}-${randomUUID().replaceAll("-", "")}`;
@@ -798,6 +874,7 @@ export class VerificationEngine {
         selfContained: verificationKindRunning(command.argv) !== null,
         // The tree the snapshot froze, which the self-contained copy must hold (RF-REVIEW-03).
         frozenTree,
+        sourceHead,
       });
       this.updateVerificationWorktree(worktreeId, "ACTIVE", "active_at");
       // RF-S22 (#1082 R1-01) — the bytes this command is about to execute, read in its own

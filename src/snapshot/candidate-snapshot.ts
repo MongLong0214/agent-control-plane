@@ -146,6 +146,15 @@ export const candidateSnapshotSchema = z
   });
 
 export type SnapshotRepository = z.infer<typeof snapshotRepositorySchema>;
+
+/**
+ * S6-C — the HEAD a frozen repository's registered checkout must stand at for its candidate to be
+ * fresh: the candidate itself, or, for an integrated candidate, the HEAD the checkout stood at when it
+ * was frozen (the integrated commit is checked out nowhere). Every reader that holds the live checkout
+ * to a frozen candidate asks this, never `candidateHead` directly, so they cannot disagree.
+ */
+export const expectedCheckoutHead = (repository: Pick<SnapshotRepository, "candidateHead" | "integration">): string =>
+  repository.integration?.checkoutHead ?? repository.candidateHead;
 export type CandidateSnapshot = z.infer<typeof candidateSnapshotSchema>;
 
 export interface SnapshotRepositoryInput {
@@ -326,7 +335,7 @@ export const verifySnapshotFreshness = async (
     // branch moves on — and would report a moved head as fresh. An integrated candidate
     // (S6-C) is checked out nowhere, so its checkout is held to the HEAD it stood at
     // when frozen; a later turn moves that HEAD, and so stales the candidate.
-    const expectedHead = repo.integration?.checkoutHead ?? repo.candidateHead;
+    const expectedHead = expectedCheckoutHead(repo);
     const head = await tryRevParse(probe.checkoutPath, "HEAD");
     if (head !== expectedHead) {
       drift.push({ identity: repo.identity, expectedHead, observedHead: head });

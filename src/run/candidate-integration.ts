@@ -356,3 +356,116 @@ export const integrateTaskResults = async (input: {
   if (!built.allowed) return built as Decision<null>;
   return allow(ReasonCode.OK, { head: built.value, integration, declaredParent: planned[0]!.result.declaredParent, baseSha });
 };
+
+/**
+ * S6 review (P1) — ancestry alone can hide a task's lost bytes: a merge that keeps one side
+ * (`git merge -s ours`) makes a task's commit an ancestor of a candidate that holds none of its
+ * change. So when a repository has two or more task commits, every path a task's commit changes
+ * against its pinned base must stand in the candidate tree exactly as that task left it: the same
+ * mode and blob, or absent for a deletion. The one exception is a path that a later recorded task
+ * commit descending from it changed too (that task was built on top of it); the later version is
+ * then the one asked for. Under S-TB no task commit descends from another, so every task's every
+ * path is asked. Read-only, over the registered checkout. Lists each task with the paths it lost.
+ */
+export const lostTaskChanges = async (input: {
+  db: Db;
+  runId: string;
+  commits: readonly SucceededTaskCommit[];
+  repositoryIdentity: string;
+  checkoutPath: string;
+  candidateHead: string;
+}): Promise<Decision<Array<{ taskId: string; commitHead: string; paths: string[] }>>> => {
+  const here = input.commits.filter((commit) => commit.repositoryIdentity === input.repositoryIdentity);
+  if (here.length < 2) return allow(ReasonCode.OK, []);
+  type Lost = Array<{ taskId: string; commitHead: string; paths: string[] }>;
+  return withPinned<Lost>(input.checkoutPath, "acp-integration-content-", async (repo) => {
+    const targets = new Map(here.map((commit) => [commit.taskId, recordedWriteTarget(input.db, input.runId, commit.taskId)]));
+    const pin = [...targets.values()].find((target) => target?.repositoryIdentity === input.repositoryIdentity)?.baseSha ?? null;
+    const shared = pin ?? (await gitOrThrow(repo, ["merge-base", "--octopus", ...here.map((commit) => commit.commit)])).trim();
+    const changes = new Map<string, Map<string, string>>();
+    for (const commit of here) {
+      const target = targets.get(commit.taskId);
+      const base = target?.repositoryIdentity === input.repositoryIdentity ? target.baseSha : shared;
+      changes.set(commit.taskId, new Map((await committedChanges(repo, base, commit.commit)).map((change) => [change.path, `${change.mode ?? "-"} ${change.blob ?? "-"}`])));
+    }
+    const descends = new Map<string, boolean>();
+    const builtOn = async (earlier: SucceededTaskCommit, later: SucceededTaskCommit): Promise<boolean> => {
+      if (earlier.commit === later.commit) return false;
+      const key = `${earlier.commit}..${later.commit}`;
+      if (!descends.has(key)) {
+        const answer = await isAncestor(repo, earlier.commit, later.commit);
+        if (answer === null) throw new Error(`the ancestry of ${earlier.commit} and ${later.commit} could not be read`);
+        descends.set(key, answer);
+      }
+      return descends.get(key)!;
+    };
+    const asked = new Map<string, Array<{ path: string; expected: string }>>();
+    for (const commit of here) {
+      for (const [path, expected] of changes.get(commit.taskId)!) {
+        let superseded = false;
+        for (const later of here) {
+          if (later.taskId !== commit.taskId && changes.get(later.taskId)!.has(path) && (await builtOn(commit, later))) {
+            superseded = true;
+            break;
+          }
+        }
+        if (!superseded) asked.set(commit.taskId, [...(asked.get(commit.taskId) ?? []), { path, expected }]);
+      }
+    }
+    const paths = [...new Set([...asked.values()].flat().map((entry) => entry.path))].sort();
+    const inCandidate = new Map<string, string>();
+    for (let start = 0; start < paths.length; start += 500) {
+      const listed = await gitOrThrow(repo, ["ls-tree", "-z", "--full-tree", input.candidateHead, "--", ...paths.slice(start, start + 500)]);
+      for (const entry of listed.split("\0").filter((line) => line.length > 0)) {
+        const parsed = /^(\d{6}) \w+ ([0-9a-f]+)\t(.*)$/s.exec(entry);
+        if (parsed) inCandidate.set(parsed[3]!, `${parsed[1]} ${parsed[2]}`);
+      }
+    }
+    const lost: Lost = [];
+    for (const commit of here) {
+      const missing = (asked.get(commit.taskId) ?? [])
+        .filter(({ path, expected }) => (inCandidate.get(path) ?? "- -") !== expected)
+        .map(({ path }) => path);
+      if (missing.length > 0) lost.push({ taskId: commit.taskId, commitHead: commit.commit, paths: missing.slice(0, 50) });
+    }
+    return allow(ReasonCode.OK, lost);
+  });
+};
+
+/** S6 review (P2) — where an integrated candidate is kept reachable: never a branch, never HEAD. */
+export const CANDIDATE_REF_NAMESPACE = "refs/acp/candidates";
+
+/** The private ref that keeps a run's integrated candidate for one snapshot digest from git gc. */
+export const candidateRefFor = (runId: string, snapshotDigest: string): string =>
+  `${CANDIDATE_REF_NAMESPACE}/${runId}/${snapshotDigest.replace(/^[^:]*:/, "").slice(0, 16)}`;
+
+/**
+ * The refs a run holds under `CANDIDATE_REF_NAMESPACE` in a checkout, and the `update-ref --stdin`
+ * lines that would make them exactly `keep` (create it if missing; delete every other one, each
+ * only at the value read here). Empty lines: nothing to write.
+ */
+export const candidateRefPlan = async (
+  checkoutPath: string,
+  runId: string,
+  keep: { ref: string; commit: string } | null,
+): Promise<Decision<string[]>> =>
+  withPinned<string[]>(checkoutPath, "acp-candidate-ref-read-", async (repo) => {
+    const listed = await gitOrThrow(repo, ["for-each-ref", "--format=%(refname) %(objectname)", `${CANDIDATE_REF_NAMESPACE}/${runId}/`]);
+    const held = listed.split("\n").filter((line) => line.length > 0).map((line) => line.split(" ") as [string, string]);
+    const lines: string[] = [];
+    if (keep && !held.some(([ref, commit]) => ref === keep.ref && commit === keep.commit)) {
+      const stale = held.find(([ref]) => ref === keep.ref);
+      lines.push(stale ? `update ${keep.ref} ${keep.commit} ${stale[1]}` : `create ${keep.ref} ${keep.commit}`);
+    }
+    for (const [ref, commit] of held) {
+      if (ref !== keep?.ref) lines.push(`delete ${ref} ${commit}`);
+    }
+    return allow(ReasonCode.OK, lines);
+  });
+
+/** Applies `candidateRefPlan` lines as one atomic ref transaction, pinned and hook-free. */
+export const applyCandidateRefPlan = async (checkoutPath: string, lines: readonly string[]): Promise<Decision<void>> =>
+  withPinned<void>(checkoutPath, "acp-candidate-ref-write-", async (repo) => {
+    await gitOrThrow(repo, ["update-ref", "--stdin"], { input: `${lines.join("\n")}\n` });
+    return allow(ReasonCode.OK, undefined);
+  });

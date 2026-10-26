@@ -38,7 +38,16 @@ import {
 } from "../snapshot/candidate-snapshot.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationEngine, VerificationReport } from "../verify/verification-engine.ts";
-import { type SucceededTaskCommit, integrateTaskResults, succeededTaskCommits } from "./candidate-integration.ts";
+import {
+  CANDIDATE_REF_NAMESPACE,
+  type SucceededTaskCommit,
+  applyCandidateRefPlan,
+  candidateRefFor,
+  candidateRefPlan,
+  integrateTaskResults,
+  lostTaskChanges,
+  succeededTaskCommits,
+} from "./candidate-integration.ts";
 import type { RunEngine, TaskContract } from "./run-engine.ts";
 import type { TaskGraph } from "./task-graph.ts";
 import { recordedTargetForBranch } from "./task-write-target.ts";
@@ -350,17 +359,56 @@ export class CandidatePipeline {
           { runId, missing },
         );
       }
+      // S6 review — ancestry is not content: a merge that keeps one side holds a task's commit in its
+      // history and none of its change. With two or more task commits, each task's change must stand
+      // in the candidate's tree as the task left it.
+      for (const frozen of snapshot.repositories) {
+        const checkoutPath = repositories.find((repo) => repo.identity === frozen.identity)?.checkoutPath;
+        if (!checkoutPath) continue;
+        const lost = await lostTaskChanges({ db: this.db, runId, commits, repositoryIdentity: frozen.identity, checkoutPath, candidateHead: frozen.candidateHead });
+        if (!lost.allowed) return lost as Decision<CandidateSnapshot>;
+        if (lost.value.length > 0) {
+          const named = lost.value.map((task) => `${task.taskId} (${task.paths.join(", ")})`).join("; ");
+          return deny(
+            ReasonCode.CANDIDATE_MISSING_TASK_CHANGE,
+            `a SUCCEEDED task's change is not in the candidate's tree although its commit is in the candidate's history: ${named}`,
+            { runId, repositoryIdentity: frozen.identity, lost: lost.value },
+          );
+        }
+      }
     }
 
-    this.artifacts.put(runId, ArtifactKind.CANDIDATE_SNAPSHOT, snapshot, candidateSnapshotDigest(snapshot));
+    const digest = candidateSnapshotDigest(snapshot);
+    // S6 review — an integrated candidate is a commit no branch names. A private ref keeps it from
+    // git gc for as long as it is this run's candidate; it is written, through the guard, before the
+    // candidate is recorded, and a freeze that cannot write it records nothing.
+    for (const frozen of snapshot.repositories) {
+      if (frozen.integration === undefined) continue;
+      const checkoutPath = repositories.find((repo) => repo.identity === frozen.identity)!.checkoutPath;
+      const plan = await candidateRefPlan(checkoutPath, runId, { ref: candidateRefFor(runId, digest), commit: frozen.candidateHead });
+      if (!plan.allowed) return plan as Decision<CandidateSnapshot>;
+      const held = await this.writeCandidateRefs(run, frozen.identity, checkoutPath, plan.value.filter((line) => !line.startsWith("delete ")));
+      if (!held.allowed) return held as Decision<CandidateSnapshot>;
+    }
+
+    this.artifacts.put(runId, ArtifactKind.CANDIDATE_SNAPSHOT, snapshot, digest);
     // One transaction records the new candidate and stales everything bound to an older
     // one, so no window exists in which superseded evidence still reads as current.
-    this.runs.promoteCandidate(runId, candidateSnapshotDigest(snapshot));
+    this.runs.promoteCandidate(runId, digest);
+    // The refs of the candidates this one supersedes go now. Best effort: one left behind keeps an
+    // old candidate's objects from gc, nothing more, and the next freeze asks again.
+    for (const repo of repositories) {
+      const frozen = snapshot.repositories.find((candidate) => candidate.identity === repo.identity);
+      const keep = frozen?.integration === undefined ? null : { ref: candidateRefFor(runId, digest), commit: frozen.candidateHead };
+      const plan = await candidateRefPlan(repo.checkoutPath, runId, keep);
+      const superseded = plan.allowed ? plan.value.filter((line) => line.startsWith("delete ")) : [];
+      if (superseded.length > 0) await this.writeCandidateRefs(run, repo.identity, repo.checkoutPath, superseded);
+    }
     this.audit.record({
       kind: "CANDIDATE_FROZEN",
       runId,
       evidence: {
-        candidateSnapshotDigest: candidateSnapshotDigest(snapshot),
+        candidateSnapshotDigest: digest,
         repositories: snapshot.repositories.map((r) => ({
           identity: r.identity,
           candidateHead: r.candidateHead,
@@ -1055,6 +1103,19 @@ export class CandidatePipeline {
       }))
       .filter((p) => p.checkoutPath);
     return verifySnapshotFreshness(snapshot, probes);
+  }
+
+  /**
+   * S6 review — one guarded ref transaction under the run's private candidate namespace
+   * (`CANDIDATE_REF_NAMESPACE`): never a branch, never HEAD, never a task's ref (S-TB-02).
+   */
+  private async writeCandidateRefs(run: RunRow, identity: string, checkoutPath: string, lines: readonly string[]): Promise<Decision<void>> {
+    if (lines.length === 0) return allow(ReasonCode.OK, undefined);
+    return this.verification.writeRunRefs(
+      run,
+      { repositoryIdentity: identity, namespace: `${CANDIDATE_REF_NAMESPACE}/${run.runId}` },
+      () => applyCandidateRefPlan(checkoutPath, lines),
+    );
   }
 
   /**

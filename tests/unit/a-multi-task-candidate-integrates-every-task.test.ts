@@ -6,13 +6,15 @@ import { commandsForMode } from "../../src/contracts/manifest.ts";
 import type * as Ids from "../../src/core/ids.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ArtifactKind, ExecutionMode, Role, RunKind } from "../../src/domain/types.ts";
-import { integrationOrder, pathConflicts, type TaskResult } from "../../src/run/candidate-integration.ts";
+import { ArtifactKind, ExecutionMode, Role, RunKind, roleKeyFor } from "../../src/domain/types.ts";
+import { WorktreeAction, WriteOperation, type ManagedWriteGuard } from "../../src/guard/managed-write-guard.ts";
+import { CANDIDATE_REF_NAMESPACE, candidateRefFor, integrationOrder, pathConflicts, type TaskResult } from "../../src/run/candidate-integration.ts";
 import { GuardedInvocationWriteBroker } from "../../src/runtime/provider.ts";
 import { candidateSnapshotDigest, verifySnapshotFreshness } from "../../src/snapshot/candidate-snapshot.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
-import { cleanupTempDirs, gitSync } from "../helpers/fixtures.ts";
-import { registerFixtureProject } from "../helpers/harness.ts";
+import { WorktreeManager, type WorktreeAuthorization } from "../../src/verify/worktree.ts";
+import { cleanupTempDirs, commitAll, gitSync, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
+import { registerFixtureProject, reviewerPass } from "../helpers/harness.ts";
 import { FakeWorkerAdapter, type FakeTurnScript } from "../helpers/worker-turn-fixture.ts";
 
 /**
@@ -60,6 +62,7 @@ interface TaskInput {
 
 const README = { key: "readme", title: "update readme", category: "docs" as const, spec: { writeTarget: { paths: ["README.md"] } } };
 const APP = { key: "app", title: "update app", category: "implementation" as const, spec: { writeTarget: { paths: ["src/app.js"] } } };
+const NOTES = { key: "notes", title: "add notes", category: "docs" as const, spec: { writeTarget: { paths: ["docs/notes.md"] } } };
 
 /** A driven PRIMARY_CTO's STANDARD_WORK run, dispatched, its tasks submitted, the real worker path. */
 const standardRun = async (f: BootstrapRuntimeFixture, projectId: string, tasks: TaskInput[], taskIds: string[] = []) => {
@@ -81,7 +84,7 @@ const standardRun = async (f: BootstrapRuntimeFixture, projectId: string, tasks:
     contract: {
       goal: "update the project",
       why: "changes in one run",
-      scope: ["README.md", "src/app.js"],
+      scope: ["README.md", "src/app.js", "docs/notes.md"],
       nonGoals: [],
       acceptance: ["the files change"],
       priority: "NORMAL" as const,
@@ -131,7 +134,7 @@ const runToSuccess = async (f: BootstrapRuntimeFixture, s: StandardRun, worker: 
   expect(claimed).toMatchObject({ ok: true });
   const claimId = (claimed["value"] as { claims: Array<{ claimId: string; worktreeId: string | null }> }).claims.find((claim) => claim.worktreeId !== null)!.claimId;
   const ran = await f.cto(s.sessionId, "task_worker_run", { runId: s.runId, taskId, claimId });
-  expect(ran).toMatchObject({ ok: true });
+  expect(ran, JSON.stringify(ran).slice(0, 600)).toMatchObject({ ok: true });
   const executionId = (ran["value"] as { executionId: string }).executionId;
   await f.harness.cp.workerTurns.settled(executionId);
   expect(f.harness.cp.tasks.execution(executionId)?.status).toBe("SUCCEEDED");
@@ -140,6 +143,10 @@ const runToSuccess = async (f: BootstrapRuntimeFixture, s: StandardRun, worker: 
 };
 
 const refsOf = (repo: string): string => gitSync(repo, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+const refLines = (refs: string): string[] => refs.split("\n").filter((line) => line.length > 0).sort();
+/** The run's private candidate refs, as `<ref> <commit>` lines. */
+const candidateRefsOf = (repo: string, runId: string): string[] =>
+  refLines(gitSync(repo, ["for-each-ref", "--format=%(refname) %(objectname)", `${CANDIDATE_REF_NAMESPACE}/${runId}/`]));
 const worktreesOf = (repo: string): string => gitSync(repo, ["worktree", "list", "--porcelain"]);
 const objectsOf = (repo: string): string => gitSync(repo, ["count-objects", "-v"]);
 const fileAt = (repo: string, commit: string, path: string): string => gitSync(repo, ["show", `${commit}:${path}`]);
@@ -194,8 +201,10 @@ describe("a multi-task candidate is every SUCCEEDED task's result on the pinned 
         expect(repo.touchedPaths).toEqual(["README.md", "src/app.js"]);
         // The origin is the tasks' recorded one (S-TB-06).
         expect({ sourceBranch: repo.sourceBranch, sourceHead: repo.sourceHead }).toEqual({ sourceBranch: app.target.declaredParent, sourceHead: app.target.baseSha });
-        // Task refs, the checkout, its branch and its worktrees are exactly as they were (S-TB-02).
-        expect(refsOf(s.repo)).toBe(refsBefore);
+        // Task refs, the checkout, its branch and its worktrees are exactly as they were (S-TB-02); the
+        // one ref added is the candidate's own, under the private namespace, at the integrated commit.
+        const candidateRef = `${candidateRefFor(s.runId, candidateSnapshotDigest(frozen.value))} ${repo.candidateHead}`;
+        expect(refLines(refsOf(s.repo))).toEqual(refLines(`${refsBefore}\n${candidateRef}`));
         expect(gitSync(s.repo, ["rev-parse", "HEAD"])).toBe(head);
         expect(gitSync(s.repo, ["symbolic-ref", "--short", "HEAD"])).toBe(branch);
         expect(gitSync(s.repo, ["status", "--porcelain"])).toBe("");
@@ -211,6 +220,7 @@ describe("a multi-task candidate is every SUCCEEDED task's result on the pinned 
         if (!again.allowed) throw new Error(`${again.reasonCode}: ${again.message}`);
         expect(again.value.repositories[0]!.candidateHead).toBe(repo.candidateHead);
         expect(candidateSnapshotDigest(again.value)).toBe(candidateSnapshotDigest(frozen.value));
+        expect(candidateRefsOf(s.repo, s.runId)).toEqual([candidateRef]);
 
         // Fresh against the checkout as it stands, and verification judges the integrated commit: the
         // checkout's HEAD has app() === 1 and would fail the fixture's verify.js.
@@ -286,6 +296,112 @@ describe("a multi-task candidate is every SUCCEEDED task's result on the pinned 
     });
   });
 
+  it("an integrated candidate reaches the CEO packet through the real pipeline, and a later commit on the checkout stales it at confirmation", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s6c-packet", [README, APP]);
+      const worker = workerDoing(f);
+      let identity: string;
+      try {
+        const app = await runToSuccess(f, s, worker, s.ids["app"]!, { writes: { "src/app.js": "module.exports = () => 2;\n" } });
+        await runToSuccess(f, s, worker, s.ids["readme"]!, { writes: { "README.md": "# task one\n" } });
+        identity = app.target.repositoryIdentity;
+      } finally {
+        worker.killAll();
+      }
+      f.harness.scripted.script({ match: /Candidate review/, text: reviewerPass([`${identity}:README.md`, `${identity}:src/app.js`]) });
+      const run = cp.runs.require(s.runId);
+      const outcome = await cp.pipeline.submitResult({
+        runId: s.runId,
+        ownerSessionId: run.ownerSessionId!,
+        ownerBindingGeneration: run.ownerBindingGeneration!,
+        resultSummary: "both tasks",
+        recommendation: "merge",
+      });
+      if (!outcome.allowed) throw new Error(`${outcome.reasonCode}: ${outcome.message}`);
+      expect(outcome.value.stage).toBe("COMPLETED_REVIEW");
+      if (outcome.value.stage !== "COMPLETED_REVIEW") return;
+      const snapshot = cp.artifacts.latest<{ repositories: Array<{ candidateHead: string; integration?: unknown }> }>(s.runId, ArtifactKind.CANDIDATE_SNAPSHOT)!.content;
+      expect(snapshot.repositories[0]!.integration).toBeDefined();
+      expect(outcome.value.packet.changedRepositories.map((repository) => repository.candidateHead)).toEqual([snapshot.repositories[0]!.candidateHead]);
+
+      // A later commit on the checkout: the CEO's confirmation finds the candidate stale.
+      gitSync(s.repo, ["commit", "-q", "--allow-empty", "-m", "user commit"]);
+      const confirmed = cp.ceo.submitCeoDecision({
+        runId: s.runId,
+        decision: "CONFIRM",
+        candidateSnapshotDigest: outcome.value.snapshotDigest,
+        ceoSessionId: cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId,
+        rationale: "confirm",
+      });
+      expect(confirmed).toMatchObject({ allowed: false, reasonCode: ReasonCode.SNAPSHOT_STALE });
+    });
+  });
+
+  it("a merge that keeps one side holds both task commits and loses one task's change: the freeze is refused by task and path", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s6c-ours", [README, APP]);
+      const worker = workerDoing(f);
+      try {
+        const app = await runToSuccess(f, s, worker, s.ids["app"]!, { writes: { "src/app.js": "module.exports = () => 2;\n" } });
+        const readme = await runToSuccess(f, s, worker, s.ids["readme"]!, { writes: { "README.md": "# task one\n" } });
+        // On the README task's branch, the app task merged in with its change thrown away.
+        gitSync(s.repo, ["merge", "-q", "-s", "ours", "--no-edit", app.commit]);
+        expect(isAncestor(s.repo, app.commit, "HEAD")).toBe(true);
+        expect(isAncestor(s.repo, readme.commit, "HEAD")).toBe(true);
+        expect(fileAt(s.repo, "HEAD", "src/app.js")).toBe("module.exports = () => 1;");
+        const refsBefore = refsOf(s.repo);
+        const frozen = await cp.pipeline.freeze(s.runId);
+        expect(frozen).toMatchObject({
+          allowed: false,
+          reasonCode: ReasonCode.CANDIDATE_MISSING_TASK_CHANGE,
+          evidence: { lost: [{ taskId: s.ids["app"], commitHead: app.commit, paths: ["src/app.js"] }] },
+        });
+        if (frozen.allowed) return;
+        expect(frozen.message).toContain(`${s.ids["app"]} (src/app.js)`);
+        expect(cp.runs.currentCandidate(s.runId)).toBeNull();
+        expect(refsOf(s.repo)).toBe(refsBefore);
+      } finally {
+        worker.killAll();
+      }
+    });
+  });
+
+  it("the integrated candidate survives gc --prune=now; a later task runs with its ref in place, and the next freeze replaces the ref", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s6c-gc", [README, APP]);
+      const worker = workerDoing(f);
+      try {
+        await runToSuccess(f, s, worker, s.ids["app"]!, { writes: { "src/app.js": "module.exports = () => 2;\n" } });
+        await runToSuccess(f, s, worker, s.ids["readme"]!, { writes: { "README.md": "# task one\n" } });
+        const frozen = await cp.pipeline.freeze(s.runId);
+        if (!frozen.allowed) throw new Error(`${frozen.reasonCode}: ${frozen.message}`);
+        const first = frozen.value.repositories[0]!.candidateHead;
+        gitSync(s.repo, ["gc", "--quiet", "--prune=now"]);
+        expect(() => gitSync(s.repo, ["cat-file", "-e", `${first}^{commit}`]), "the frozen candidate survives gc --prune=now").not.toThrow();
+        expect(candidateRefsOf(s.repo, s.runId)).toEqual([`${candidateRefFor(s.runId, candidateSnapshotDigest(frozen.value))} ${first}`]);
+
+        // A third task: its turn runs with the candidate ref in place, and the next freeze holds only
+        // the new candidate's ref.
+        const added = cp.tasks.submit(s.runId, [NOTES]);
+        if (!added.allowed) throw new Error(added.message);
+        await runToSuccess(f, s, worker, added.value[0]!.taskId, { writes: { "docs/notes.md": "notes\n" } });
+        const next = await cp.pipeline.freeze(s.runId);
+        if (!next.allowed) throw new Error(`${next.reasonCode}: ${next.message}`);
+        const second = next.value.repositories[0]!;
+        expect(second.integration?.tasks).toHaveLength(3);
+        expect(second.candidateHead).not.toBe(first);
+        expect(candidateRefsOf(s.repo, s.runId)).toEqual([`${candidateRefFor(s.runId, candidateSnapshotDigest(next.value))} ${second.candidateHead}`]);
+        gitSync(s.repo, ["gc", "--quiet", "--prune=now"]);
+        expect(() => gitSync(s.repo, ["cat-file", "-e", `${second.candidateHead}^{commit}`])).not.toThrow();
+      } finally {
+        worker.killAll();
+      }
+    });
+  });
+
   it("a single-task run freezes its checkout's HEAD exactly as before, with no integration", async () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
@@ -300,6 +416,7 @@ describe("a multi-task candidate is every SUCCEEDED task's result on the pinned 
         expect(repo.candidateHead).toBe(gitSync(s.repo, ["rev-parse", "HEAD"]));
         expect("integration" in repo).toBe(false);
         expect(integrationWorktrees(f, s.runId)).toEqual([]);
+        expect(candidateRefsOf(s.repo, s.runId)).toEqual([]);
         expect(cp.audit.byKind("CANDIDATE_FROZEN").filter((row) => row.runId === s.runId).at(-1)?.evidence["repositories"]).toEqual([
           { identity: repo.identity, candidateHead: app.commit, sourceBranch: repo.sourceBranch, sourceHead: repo.sourceHead, files: 1 },
         ]);
@@ -332,5 +449,43 @@ describe("the integration order and its conflicts (S6-C)", () => {
       { taskId: "task_b", paths: ["README.md", "docs/guide/intro.md", "library.js"] },
       { taskId: "task_c", paths: ["src/app.js"] },
     ])).toEqual([{ tasks: ["task_a", "task_b"], paths: ["README.md", "docs/guide", "docs/guide/intro.md"] }]);
+  });
+});
+
+describe("a self-contained verification checkout of an integrated candidate (S6-C)", () => {
+  /** A guard that runs every lifecycle effect: the WorktreeManager's own checks are what is under test. */
+  const authorizationFor = (manager: WorktreeManager, repositoryPath: string, worktreeId: string): WorktreeAuthorization => {
+    const path = manager.pathFor(worktreeId);
+    const guard = {
+      authorize: async (_request: unknown, effect: (context: { grant: object }) => Promise<unknown> | unknown) => allow(ReasonCode.WRITE_ALLOWED, await effect({ grant: {} })),
+    } as unknown as ManagedWriteGuard;
+    const request = { operation: WriteOperation.GIT_WORKTREE, repositoryIdentity: "test-repository", targetWorktreeId: path, runId: "test-run", sessionId: "test-session", bindingGeneration: 1 };
+    return {
+      add: { guard, request: { ...request, targetPath: path, worktreeAction: WorktreeAction.ADD } },
+      remove: { guard, request: { ...request, targetPath: path, worktreeAction: WorktreeAction.REMOVE } },
+      cleanup: { guard, request: { ...request, targetPath: path, worktreeAction: WorktreeAction.CLEANUP } },
+      prune: { guard, request: { ...request, targetPath: repositoryPath, worktreeAction: WorktreeAction.PRUNE } },
+    };
+  };
+
+  it("holds the source to the HEAD it was frozen at, not to the candidate, and copies exactly the candidate", async () => {
+    const repository = makeRepo({ "README.md": "# fixture\n" });
+    const checkoutHead = gitSync(repository, ["rev-parse", "HEAD"]);
+    // A candidate commit checked out nowhere, as an integrated one is.
+    writeFiles(repository, { "src/app.js": "module.exports = 2;\n" });
+    const candidate = commitAll(repository, "integrated");
+    gitSync(repository, ["reset", "-q", "--hard", checkoutHead]);
+    const tree = `git-tree:${gitSync(repository, ["rev-parse", `${candidate}^{tree}`])}`;
+    const manager = new WorktreeManager(tempDir("acp-s6c-own-"));
+    await expect(manager.create(repository, candidate, "held-to-candidate", authorizationFor(manager, repository, "held-to-candidate"), { selfContained: true, frozenTree: tree }))
+      .rejects.toMatchObject({ reasonCode: ReasonCode.SNAPSHOT_STALE });
+    const copy = await manager.create(repository, candidate, "held-to-checkout", authorizationFor(manager, repository, "held-to-checkout"), {
+      selfContained: true,
+      frozenTree: tree,
+      sourceHead: checkoutHead,
+    });
+    expect(copy.head).toBe(candidate);
+    expect(gitSync(copy.path, ["rev-parse", "HEAD^{tree}"])).toBe(tree.slice("git-tree:".length));
+    await manager.destroy(repository, copy.path, authorizationFor(manager, repository, "held-to-checkout"));
   });
 });

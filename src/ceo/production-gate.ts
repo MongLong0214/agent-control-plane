@@ -46,6 +46,7 @@ import type { ContinuityGate } from "../run/run-engine.ts";
 import {
   candidateSnapshotDigest,
   candidateSnapshotSchema,
+  expectedCheckoutHead,
   type CandidateSnapshot,
 } from "../snapshot/candidate-snapshot.ts";
 
@@ -1259,11 +1260,14 @@ export class ProductionGate {
         }
       };
       const head = git(["rev-parse", "HEAD"]);
+      // An integrated candidate (S6-C) holds its checkout to the HEAD it was frozen at, as snapshot
+      // freshness does; one helper answers both.
+      const expectedHead = expectedCheckoutHead(frozen);
       const tree = git(["rev-parse", `${frozen.candidateHead}^{tree}`]);
       const base = git(["rev-parse", frozen.baseBranch]);
       const status = git(["status", "--porcelain", "--untracked-files=all"]);
-      if (head !== frozen.candidateHead) {
-        drift.push({ identity: frozen.identity, expectedHead: frozen.candidateHead, observedHead: head });
+      if (head !== expectedHead) {
+        drift.push({ identity: frozen.identity, expectedHead, observedHead: head });
       }
       if (`git-tree:${tree}` !== frozen.treeDigest) {
         drift.push({ identity: frozen.identity, expectedTree: frozen.treeDigest, observedTree: tree });

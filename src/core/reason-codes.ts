@@ -105,6 +105,13 @@ export const ReasonCode = {
    * and commit.
    */
   CANDIDATE_MISSING_TASK_COMMIT: "CANDIDATE_MISSING_TASK_COMMIT",
+  /**
+   * A freeze found a SUCCEEDED task whose commit is in the candidate's history but whose change is
+   * not in the candidate's tree: a path the task changed against its pinned base stands there with
+   * other bytes, or is missing (a merge that kept one side, `-s ours`, does exactly this). Refused
+   * before review or publication, naming the task and each such path.
+   */
+  CANDIDATE_MISSING_TASK_CHANGE: "CANDIDATE_MISSING_TASK_CHANGE",
 
   // --- CP-HI-07 Human Role ------------------------------------------------
   OWNER_AUTHORITY_NOT_DELEGABLE: "OWNER_AUTHORITY_NOT_DELEGABLE",
