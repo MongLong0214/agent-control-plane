@@ -119,7 +119,14 @@ export interface GitHubWritePort {
   /** One observation, without polling: pending leaves genesis-merge incomplete for the next drive. */
   observeGenesisPostMergeCi?(target:GitHubRepositoryTarget,head:string,workflows:readonly {path:string;checkName:string;approvedDigest:string}[],requiredChecks:readonly string[]):Promise<ApprovedWorkflowChecks>;
   createBranch?(target: GitHubRepositoryTarget, branch: string, head: string): Promise<void>;
-  ensureGenesisResources?(target: GitHubRepositoryTarget, bundle: Pick<GenesisBundle, 'labels' | 'milestones' | 'issues'>): Promise<void>;
+  /**
+   * A planned label GitHub already holds under its name, in any case, with another name, color or
+   * description is PATCHed to the planned ones only when `reconcileExistingLabels` is true: the producer's
+   * judgement that this operation created the repository, so the label is GitHub's own
+   * initialization (autoInit's default labels). Otherwise it is thrown as a
+   * `GenesisLabelConflict` and nothing is written for it.
+   */
+  ensureGenesisResources?(target: GitHubRepositoryTarget, bundle: Pick<GenesisBundle, 'labels' | 'milestones' | 'issues'>, options?: { reconcileExistingLabels?: boolean }): Promise<void>;
   observeGenesisResources?(target: GitHubRepositoryTarget, bundle: Pick<GenesisBundle, 'labels' | 'milestones' | 'issues'>): Promise<Record<string, unknown> | null>;
   observeBranch(target: GitHubRepositoryTarget, branch: string): Promise<ObservedBranch | null>;
   pushBranch(target: GitHubRepositoryTarget, branch: string, checkoutPath: string, commitSha: string): Promise<void>;
@@ -183,6 +190,32 @@ export const requestOutcomeUnknown = (error: unknown): boolean => {
   if (!isAcpError(error)) return false;
   const outcome = (error.evidence as { requestOutcome?: unknown } | undefined)?.requestOutcome;
   return outcome === REQUEST_OUTCOME_UNKNOWN;
+};
+
+/**
+ * A planned genesis label that GitHub holds under the same name with another color or description,
+ * on a repository the producer did not judge its own. ACP refuses it; GitHub refused nothing.
+ */
+export interface GenesisLabelConflict {
+  name: string;
+  observed: { name: string; color: string; description: string };
+  desired: { name: string; color: string; description: string };
+}
+
+const labelState = (value: unknown): value is { name: string; color: string; description: string } =>
+  typeof value === "object" && value !== null && typeof (value as { name?: unknown }).name === "string" &&
+  typeof (value as { color?: unknown }).color === "string" && typeof (value as { description?: unknown }).description === "string";
+
+/** GitHub label names are case-insensitive, and a label color is the same hex in either case. */
+const sameIgnoringCase = (left: string, right: string): boolean => left.toLowerCase() === right.toLowerCase();
+
+/** The port's label conflict, read from the failure's structured evidence only, as `requestOutcomeUnknown` is. */
+export const genesisLabelConflictOf = (error: unknown): GenesisLabelConflict | null => {
+  if (!isAcpError(error)) return null;
+  const conflict = (error.evidence as { genesisLabelConflict?: unknown } | undefined)?.genesisLabelConflict;
+  if (typeof conflict !== "object" || conflict === null) return null;
+  const { name, observed, desired } = conflict as Record<string, unknown>;
+  return typeof name === "string" && labelState(observed) && labelState(desired) ? { name, observed, desired } : null;
 };
 
 /** A 404 is "absent". Every other failure — including an unreadable one — propagates. */
@@ -442,13 +475,19 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
     async createBranch(target, branch, head) {
       await client.request("POST", `${repoPath(target)}/git/refs`, { ref: `refs/heads/${branch}`, sha: head });
     },
-    async ensureGenesisResources(target, bundle) {
-      const labels = await client.request<Array<{name:string;color:string;description:string}>>("GET", `${repoPath(target)}/labels?per_page=100`);
+    async ensureGenesisResources(target, bundle, options) {
+      const labels = await client.request<Array<{name:string;color:string;description:string|null}>>("GET", `${repoPath(target)}/labels?per_page=100`);
       for (const label of bundle.labels) {
-        const existing = labels.find(l => l.name === label.name);
-        if (existing) {
-          if (existing.color !== label.color || (existing.description ?? '') !== label.description) throw new Error('genesis label conflict');
-        } else await client.request("POST", `${repoPath(target)}/labels`, label);
+        // GitHub refuses a second label whose name differs only in case, so one is found that way.
+        const existing = labels.find(l => sameIgnoringCase(l.name, label.name));
+        if (!existing) await client.request("POST", `${repoPath(target)}/labels`, label);
+        else if (existing.name !== label.name || !sameIgnoringCase(existing.color, label.color) || (existing.description ?? '') !== label.description) {
+          if (options?.reconcileExistingLabels !== true) {
+            const conflict: GenesisLabelConflict = {name:label.name,observed:{name:existing.name,color:existing.color,description:existing.description ?? ''},desired:{name:label.name,color:label.color,description:label.description}};
+            throw acpError(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT, `genesis label ${label.name} exists as ${existing.name} with another name, color or description`, { genesisLabelConflict: conflict });
+          }
+          await client.request("PATCH", `${repoPath(target)}/labels/${encodeURIComponent(existing.name)}`, {new_name:label.name,color:label.color,description:label.description});
+        }
       }
       const milestones = await client.request<Array<{number:number;title:string;description:string}>>("GET", `${repoPath(target)}/milestones?state=all&per_page=100`);
       const numbers = new Map<string,number>();
@@ -471,7 +510,7 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
       const labels = await client.request<Array<{name:string;color:string;description:string}>>("GET", `${repoPath(target)}/labels?per_page=100`);
       const milestones = await client.request<Array<{number:number;title:string;description:string}>>("GET", `${repoPath(target)}/milestones?state=all&per_page=100`);
       const issues = await client.request<Array<{title:string;body:string;labels:Array<{name:string}>;milestone:{number:number}|null}>>("GET", `${repoPath(target)}/issues?state=all&per_page=100`);
-      if (!bundle.labels.every(l => labels.some(x => x.name === l.name && x.color === l.color && (x.description ?? '') === l.description))) return null;
+      if (!bundle.labels.every(l => labels.some(x => x.name === l.name && sameIgnoringCase(x.color, l.color) && (x.description ?? '') === l.description))) return null;
       if (!bundle.milestones.every(m => milestones.some(x => x.title === m.title && x.description === `${m.description}\n<!-- acp-genesis:${m.key} -->`))) return null;
       if (!bundle.issues.every(i => issues.some(x => x.title === i.title && x.body === `${i.body}\n<!-- acp-genesis:${i.key} -->` && canonicalLabels(x.labels.map(l => l.name)) === canonicalLabels(i.labels) && (i.milestoneKey === null ? x.milestone === null : x.milestone?.number === milestones.find(m => m.description.endsWith(`<!-- acp-genesis:${i.milestoneKey} -->`))?.number)))) return null;
       return { labels:bundle.labels, milestones:bundle.milestones, issues:bundle.issues };
