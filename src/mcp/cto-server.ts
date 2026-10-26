@@ -239,6 +239,13 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       const frozen = source.bootstrapApplications.assertNotFrozen(runId, "plan_submit");
       if (!frozen.allowed) return frozen as Decision<{ digest: string }>;
       const run = source.runs.require(runId);
+      // CEO msg_2b439e5a — only a STANDARD_WORK PLAN names the earlier tasks it supersedes; any other
+      // run's is refused before it is stored, rather than kept with a field nothing acts on.
+      if (plan["supersedesTaskIds"] !== undefined && run.kind !== RunKind.STANDARD_WORK) {
+        return deny(ReasonCode.INVALID_ARGUMENT, "only a STANDARD_WORK PLAN names the earlier tasks it supersedes", {
+          runId, refusal: "SUPERSEDES_TASKS_NOT_STANDARD_WORK", kind: run.kind,
+        });
+      }
       if (isProjectlessBootstrap(run) && source.bootstrap.residentGenesisRequired && plan["genesis"] === undefined) return deny(ReasonCode.INVALID_ARGUMENT,"bootstrap PLAN requires inline genesis bytes",{refusal:"GENESIS_MISSING"});
       const admitted = isContractChangeRun(run)
         ? contractChangePlanForSubmission(run, plan, (digest) => source.projects.manifest(digest), firstActivationFactsOf(source.db, run))
@@ -261,6 +268,16 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       return allow(ReasonCode.OK, { digest: source.artifacts.put(runId, ArtifactKind.PLAN, bootstrapPlanDigest ? { ...stored, bootstrapPlanDigest } : stored).digest });
     },
     submitTasks: (runId: string, tasks: Parameters<TaskGraph["submit"]>[1]) => source.tasks.submit(runId, tasks),
+    // CEO msg_2b439e5a — a STANDARD_WORK PLAN that names `supersedesTaskIds` is all or nothing: the PLAN
+    // write, the cancel of exactly the named tasks ("superseded by PLAN <digest>") and the new tasks
+    // commit in one transaction, and any refusal rolls every one of them back. A PLAN without the field
+    // keeps the path below unchanged.
+    submitSupersedingPlan: (runId: string, plan: Record<string, unknown>, tasks: Parameters<TaskGraph["submit"]>[1], bootstrapPlanDigest?: string) =>
+      source.db.txDecision((): Decision<unknown> => {
+        const stored = port.submitPlan(runId, plan, bootstrapPlanDigest);
+        if (!stored.allowed) return stored;
+        return source.tasks.submit(runId, tasks, { planDigest: stored.value.digest, taskIds: plan["supersedesTaskIds"] as string[] });
+      }),
     isProjectlessBootstrapRun: (runId: string) => isProjectlessBootstrap(source.runs.require(runId)),
     // PR #1114 BOOT-02 — a project-less bootstrap's re-plan is all or nothing: the PLAN write, the
     // supersession of the earlier PLAN's tasks, the one new task and its BOOTSTRAP_PLAN_TASKS binding
@@ -617,6 +634,7 @@ const createCtoServerFromPort = (
       if (!resolved.allowed) return respond(resolved);
       const { plan, tasks, bootstrapPlanDigest } = resolved.value;
       if (port.isProjectlessBootstrapRun(args.runId)) return respond(port.submitBootstrapPlan(args.runId, plan, tasks, bootstrapPlanDigest));
+      if (plan["supersedesTaskIds"] !== undefined) return respond(port.submitSupersedingPlan(args.runId, plan, tasks, bootstrapPlanDigest));
       const stored = port.submitPlan(args.runId, plan, bootstrapPlanDigest);
       if (!stored.allowed) return respond(stored);
       return respond(port.submitTasks(args.runId, tasks));

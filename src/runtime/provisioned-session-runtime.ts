@@ -989,9 +989,11 @@ const STANDARD_WORK_STEPS =
   "task_worker_run then creates that branch at the run's pinned base and checks it out, or continues on it, and refuses a checkout that is not clean, so never choose, derive, create or change a branch yourself; when the spec names no writeTarget, report it with mcp__acp-cto__escalation_open (task_worker_provision answers writeTargetRefused when the control plane cannot record one); " +
   "start that first execution with mcp__acp-cto__task_worker_run, naming the task and the claimId resource_claim returned for that worktree, and read the execution it returns as above. " +
   "A task with no execution that is not READY is left as it is. " +
-  "Once every task of the run has SUCCEEDED, submit the run's result with mcp__acp-cto__result_submit and a new idempotencyKey; result_submit runs the blind review itself and answers when it is done. " +
+  "A CANCELLED task was superseded by a later PLAN: skip it, it is never run and does not hold back the result. " +
+  "Once every task of the run that is not CANCELLED has SUCCEEDED, submit the run's result with mcp__acp-cto__result_submit and a new idempotencyKey; result_submit runs the blind review itself and answers when it is done. " +
   "A refused provision, claim or task_worker_run is reported for that run with mcp__acp-cto__escalation_open, and no result is submitted: never run an execution again or retry one on your own. " +
-  "Never submit that run's PLAN again to carry it on: a second plan_submit adds its tasks again";
+  "Never submit that run's PLAN again to carry it on: a second plan_submit adds its tasks again; " +
+  "only a new PLAN that replaces earlier tasks names their taskIds in its plan's supersedesTaskIds, which cancels exactly those, and is refused if any of them ever had an execution or a task that stays depends on one";
 
 /**
  * #512 — what a STANDARD_WORK run's PLAN gives each task, so that its claim later takes a declared
