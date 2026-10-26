@@ -173,8 +173,16 @@ describe("W1: the BOOTSTRAP_PLAN review input carries the PLAN's intent and the 
 
   it("a field over its bound fails the review clearly before any reviewer is constituted; nothing is truncated", async () => {
     const { h, runId, call } = await fixture();
-    const long = "x".repeat(4001);
-    expect((await call("plan_submit", { plan: intentPlan("intent-bound", long), tasks: [intentTask(CRITERIA)] })).body).toMatchObject({ ok: true });
+    // A normal summary is accepted, and a credential-shaped one (an unbroken base64-alphabet run of 60
+    // or more) is refused when the PLAN is stored, before any bound is read.
+    expect((await call("plan_submit", { plan: intentPlan("intent-bound", "a normal product summary"), tasks: [intentTask(CRITERIA)] })).body)
+      .toMatchObject({ ok: true });
+    expect((await call("plan_submit", { plan: intentPlan("intent-bound", "x".repeat(4001)), tasks: [intentTask(CRITERIA, "c0")] })).body)
+      .toMatchObject({ ok: false, reasonCode: ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED });
+    // Over the bound, and not credential-shaped: the bound refuses it at review, whole.
+    const long = `${"word ".repeat(800)}x`;
+    expect(long).toHaveLength(4001);
+    expect((await call("plan_submit", { plan: intentPlan("intent-bound", long), tasks: [intentTask(CRITERIA, "c1")] })).body).toMatchObject({ ok: true });
     h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(h, runId)) });
     const result = await call("result_submit", { resultSummary: "PLAN prepared", recommendation: "create repository" });
     expect(result.body, result.text).toMatchObject({

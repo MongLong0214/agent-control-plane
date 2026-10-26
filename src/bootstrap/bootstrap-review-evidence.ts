@@ -1,5 +1,6 @@
 import type { ReviewRecordVerification } from "./bootstrap-review-evidence-github.ts";
 import { z } from "zod";
+import { redactCredentialValues } from "../core/credential-shapes.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { allow, deny, type Decision } from "../core/errors.ts";
 import { BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES } from "../core/mcp-limits.ts";
@@ -213,6 +214,20 @@ export function frozenBootstrapReviewEvidence(source: Pick<Source, "artifacts" |
   return record;
 }
 
+/**
+ * API facts are text ACP read from outside: each is redacted through the shared credential shapes
+ * (core/credential-shapes.ts) before it is stored or shown, and a fact that lost text is marked. The
+ * staged original's bytes (`bodyBase64`) are digest-bound and left as they are, as is the PLAN,
+ * which holds only a digest reference to them.
+ */
+const redactedFacts = (verification: ReviewRecordVerification): ReviewRecordVerification => ({
+  ...verification,
+  facts: verification.facts.map((fact) => {
+    const { value, redacted } = redactCredentialValues(fact, { path: ["context", "originalRecords", "files", "verification", "facts"], store: "artifact" });
+    return redacted ? { ...value, redacted: true } : fact;
+  }),
+});
+
 export async function originalReviewRecords(record: FrozenReviewEvidence | null,
   verify?: (file: ReviewEvidenceFile) => Promise<ReviewRecordVerification>) {
   if (!record) return null;
@@ -220,7 +235,7 @@ export async function originalReviewRecords(record: FrozenReviewEvidence | null,
   let apiFactBytes = 0;
   for (const { bodyBase64, ...file } of record.bundle.files) {
     const withheld = file.grade === "implementer-final-report";
-    let verification = !withheld && verify && apiFactBytes < BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES ? await verify({ ...file, bodyBase64 })
+    let verification = !withheld && verify && apiFactBytes < BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES ? redactedFacts(await verify({ ...file, bodyBase64 }))
       : { status: "attributed" as const, reason: apiFactBytes >= BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES
         ? "ACP API facts exceed the 512 KiB review evidence observation bound" : "ACP has not independently verified this content", facts: [] };
     const factBytes = Buffer.byteLength(JSON.stringify(verification.facts));

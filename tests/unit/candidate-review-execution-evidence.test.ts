@@ -3,6 +3,10 @@ import { join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { sha256 } from "../../src/core/digest.ts";
+import { redactCredentialValues } from "../../src/core/credential-shapes.ts";
+import type { ReviewPacket } from "../../src/review/blind-review.ts";
+import { reviewEvidenceBundleSchema } from "../../src/bootstrap/bootstrap-review-evidence.ts";
+import { credentialBearingField } from "../../src/db/audit.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
 import {
   CONFIG_FILE_CHAR_LIMIT,
@@ -26,7 +30,7 @@ import {
   type VerificationResultRecord,
   verificationOutputExcerpt,
 } from "../../src/verify/verification-engine.ts";
-import { cleanupTempDirs, commitAll, gitSync, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, gitSync, makeCore, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { bindCeo, bindWorker, fixtureManifest, makeHarness, registerFixtureProject, startWorkBranch } from "../helpers/harness.ts";
 
 const GITHUB_TOKEN_SHAPE = `ghp_${"A1b2C3d4".repeat(5)}`;
@@ -292,24 +296,38 @@ describe("official output is bounded, redacted and bound to its execution", () =
     commandId: "test", repositoryIdentity: "github:acme/fixture", exactHead: "a".repeat(40) };
 
   it("replaces a credential-shaped value before anything is stored", () => {
-    const excerpt = verificationOutputExcerpt(binding, `ok ${GITHUB_TOKEN_SHAPE}\n`, `key sk-${"x".repeat(24)}\n`);
+    const excerpt = verificationOutputExcerpt(binding, `ok ${GITHUB_TOKEN_SHAPE}\n`, `key sk-${"x".repeat(24)}\n`, false);
     expect(JSON.stringify(excerpt)).not.toContain(GITHUB_TOKEN_SHAPE);
     expect(JSON.stringify(excerpt)).not.toContain(`sk-${"x".repeat(24)}`);
     expect(excerpt).toMatchObject({ stdout: "ok [redacted]\n", stderr: "key [redacted]\n", redacted: true, truncated: false });
     // A cut through a credential keeps no part of it: the whole stream is redacted before any cut.
     const straddling = `${"x ".repeat((OUTPUT_EXCERPT_HEAD_CHARS - 10) / 2)} ${GITHUB_TOKEN_SHAPE} ${"y ".repeat(10_000)}\n`;
-    const cut = verificationOutputExcerpt(binding, straddling, "");
+    const cut = verificationOutputExcerpt(binding, straddling, "", false);
     expect(cut.truncated).toBe(true);
     expect(cut.stdout).not.toContain(GITHUB_TOKEN_SHAPE.slice(0, 8));
   });
 
   it("#1223 P1: replaces a bare long-base64 value and one embedded in a line", () => {
-    const bare = verificationOutputExcerpt(binding, LONG_BASE64, "");
+    const bare = verificationOutputExcerpt(binding, LONG_BASE64, "", false);
     expect(bare).toMatchObject({ stdout: "[redacted]", redacted: true });
-    const embedded = verificationOutputExcerpt(binding, "", `${EMBEDDED_LINE}\n`);
+    const embedded = verificationOutputExcerpt(binding, "", `${EMBEDDED_LINE}\n`, false);
     expect(embedded).toMatchObject({ stderr: "key=[redacted] was printed by a test\n", redacted: true });
     // Hex digests have the same shape and are replaced too: over-redaction, marked as redaction.
-    expect(verificationOutputExcerpt(binding, `digest ${"0a".repeat(32)}\n`, "")).toMatchObject({ stdout: "digest [redacted]\n", redacted: true });
+    expect(verificationOutputExcerpt(binding, `digest ${"0a".repeat(32)}\n`, "", false)).toMatchObject({ stdout: "digest [redacted]\n", redacted: true });
+  });
+
+  it("#1223 P1-B: withholds the fragment at the sandbox's capture cut, which no shape can see whole", () => {
+    // maxOutputBytes 1024: 965 bytes ending in whitespace, then the 60-character run cut to 59.
+    const filler = `${"x ".repeat(482)} `;
+    const run = `${"Ab9+/Zq7".repeat(7)}Ab9+`;
+    const captured = `${filler}${run}`.slice(0, 1024);
+    expect(captured.endsWith(run.slice(0, 59))).toBe(true);
+    const excerpt = verificationOutputExcerpt(binding, captured, "partial stderr Ab9+", true);
+    expect(excerpt).toMatchObject({ boundaryFragmentWithheld: true, stderr: "partial stderr " });
+    expect(excerpt.stdout).not.toContain(run.slice(0, 8));
+    expect(excerpt.stdout.endsWith("x  ")).toBe(true);
+    // Uncut output keeps its last word.
+    expect(verificationOutputExcerpt(binding, "Tests 3 passed", "", false)).toMatchObject({ stdout: "Tests 3 passed", boundaryFragmentWithheld: false });
   });
 
   it("the sandbox still drops a long-base64 environment value, now from the shared list", () => {
@@ -332,7 +350,7 @@ describe("official output is bounded, redacted and bound to its execution", () =
 
   it("keeps the head and tail of oversized output and marks the cut", () => {
     const long = `HEAD-LINE\n${"x ".repeat(10_000)}\nTest Files  4 passed (4)\n`;
-    const excerpt = verificationOutputExcerpt(binding, long, "");
+    const excerpt = verificationOutputExcerpt(binding, long, "", false);
     expect(excerpt.truncated).toBe(true);
     expect(excerpt.stdoutChars).toBe(long.length);
     expect(excerpt.stdout.startsWith("HEAD-LINE\n")).toBe(true);
@@ -342,7 +360,7 @@ describe("official output is bounded, redacted and bound to its execution", () =
   });
 
   it("redacts a stored excerpt again before the review input, whatever it was stored with", () => {
-    const stored = { ...verificationOutputExcerpt(binding, "PASS\n", ""), stdout: `PASS ${LONG_BASE64}\n` };
+    const stored = { ...verificationOutputExcerpt(binding, "PASS\n", "", false), stdout: `PASS ${LONG_BASE64}\n` };
     expect(shown(stored)).toMatchObject({ output: "RETAINED", stdout: "PASS [redacted]\n", redacted: true });
   });
 
@@ -363,7 +381,7 @@ describe("official output is bounded, redacted and bound to its execution", () =
   });
 
   it("omits output bound to another snapshot, contract or head", () => {
-    const own = verificationOutputExcerpt(binding, "PASS 3 tests\n", "");
+    const own = verificationOutputExcerpt(binding, "PASS 3 tests\n", "", false);
     expect(shown(own)).toMatchObject({ output: "RETAINED", stdout: "PASS 3 tests\n" });
     for (const other of [{ candidateSnapshotDigest: `sha256:${"9".repeat(64)}` }, { contractDigest: `sha256:${"8".repeat(64)}` },
       { exactHead: "b".repeat(40) }, { commandId: "lint" }]) {
@@ -381,6 +399,7 @@ describe("the execution evidence stays inside the reviewer budget", () => {
       configFiles: [{ path: "package.json", state: "INCLUDED" as const, detail: null, chars: 7_000, redacted: false, truncated: false, content: "p\"\n".repeat(2_000) }] })),
     results: Array.from({ length: 6 }, (_, i) => ({ commandId: `c${i}`, repositoryIdentity: "github:acme/fixture", source: "local", exactHead: "a".repeat(40),
       status: "PASS", exitCode: 0, reasonCode: null, candidateSnapshotDigest: "s", contractDigest: "c", outputDigest: "o", captureTruncated: false,
+      boundaryFragmentWithheld: false,
       output: "RETAINED" as const, statement: null, stdoutChars: 4_000, stderrChars: 0, redacted: false, truncated: false,
       stdout: `start\n${"t".repeat(3_990)}\nTests 9 passed\n`, stderr: "" })),
     repositories: [{ repository: "github:acme/fixture", baseHead: "b".repeat(40), candidateHead: "a".repeat(40), linkedExecutionIds: ["e0"] }],
@@ -426,5 +445,168 @@ describe("the execution evidence stays inside the reviewer budget", () => {
         expect(full - bare, `budget ${budget}`).toBeLessThanOrEqual(budget);
       }
     } finally { setup.harness.cp.close(); }
+  });
+});
+
+describe("#1223 P1-A: the audit log and artifact store exempt only exact ACP-generated field shapes", () => {
+  const hex64 = "0123456789abcdef".repeat(4);
+  const body = Buffer.from("x".repeat(120)).toString("base64");
+
+  it("refuses a long-base64 run in any other string, free text included", () => {
+    expect(credentialBearingField({ detail: LONG_BASE64 })).toBe("detail");
+    expect(credentialBearingField({ detail: `printed ${LONG_BASE64} here` })).toBe("detail");
+    // A digest embedded in free text is not an exact field: it is checked like any text.
+    expect(credentialBearingField({ detail: `digest sha256:${hex64}` })).toBe("detail");
+    // A staged body anywhere but its known key path is not exempt either.
+    expect(credentialBearingField({ nested: { bodyBase64: body } })).toBe("bodyBase64");
+  });
+
+  it("accepts the exact generated shapes, and only those skip only the long-base64 shape", () => {
+    expect(credentialBearingField({ digest: `sha256:${hex64}`, head: hex64.slice(0, 40), eventId: hex64, bodyBase64: body,
+      context: { originalRecords: { files: [{ bodyBase64: body }] } } })).toBeNull();
+    // Identifiers ACP builds around a 64-hex digest, as whole values.
+    for (const id of [`acp-notice:${hex64}`, `repair:sha256:${hex64}`, `fixture-project:#manifest/sha256:${hex64}`, `buzz:buzz-message:${hex64}#1`]) {
+      expect(credentialBearingField({ id }), id).toBeNull();
+    }
+    expect(credentialBearingField({ id: `acp-notice:${LONG_BASE64}` })).toBe("id");
+    // A handoff decision ACP serializes is read as a record: its genesis bodies pass, other text does not.
+    const decision = (extra: Record<string, unknown>) => JSON.stringify({ genesis: { files: [{ contentBase64: body }] }, ...extra });
+    expect(credentialBearingField({ handoff: { recentDecisions: [decision({ genesisDigest: `sha256:${hex64}` })] } })).toBeNull();
+    expect(credentialBearingField({ handoff: { recentDecisions: [decision({ note: LONG_BASE64 })] } })).toBe("recentDecisions");
+    // Every other shape still applies to an exempt field shape.
+    expect(credentialBearingField({ bodyBase64: Buffer.from(GITHUB_TOKEN_SHAPE).toString("base64") })).toBeNull();
+    expect(credentialBearingField({ bodyBase64: `${body}${GITHUB_TOKEN_SHAPE}` })).toBe("bodyBase64");
+  });
+
+  it("reads the egress proxy's own log as records: its exact digest field passes, anything else is checked whole", () => {
+    const start = JSON.stringify({ t: 1, verdict: "START", port: 9000, pid: 1, allowlistDigest: `sha256:${hex64}` });
+    expect(credentialBearingField({ egress: `${start}\n` })).toBeNull();
+    expect(credentialBearingField({ egressEvidence: [{ jsonl: `${start}\n` }] })).toBeNull();
+    expect(credentialBearingField({ egress: `${start}\n${JSON.stringify({ t: 2, verdict: "ALLOW", host: LONG_BASE64 })}\n` })).toBe("egress");
+    expect(credentialBearingField({ egress: `${start}\nnot json ${LONG_BASE64}\n` })).toBe("egress");
+    // The same text under any other key is free text.
+    expect(credentialBearingField({ note: `${start}\n` })).toBe("note");
+  });
+
+  it("the audit log stores a long-base64 run in free text redacted", () => {
+    const core = makeCore();
+    try {
+      const recorded = core.audit.record({ kind: "TEST_FREE_TEXT", evidence: { detail: `kept ${LONG_BASE64}`, digest: `sha256:${hex64}` } });
+      expect(recorded.allowed).toBe(true);
+      const row = core.audit.byKind("TEST_FREE_TEXT")[0]!;
+      expect(row.evidence).toEqual({ detail: "kept [redacted]", digest: `sha256:${hex64}` });
+    } finally { core.db.close(); }
+  });
+
+  it("an audit reason keeps an exact digest token, and a served path keeps its generation id; nothing else around them", () => {
+    const core = makeCore();
+    try {
+      const hex40 = hex64.slice(0, 40);
+      const served = `/opt/acp/generations/generation-${hex40}/dist/daemon/agentcpd.js`;
+      const cases: Array<[Record<string, string>, Record<string, string>]> = [
+        // Preserved: the narrow forms the CEO decision names.
+        [{ reason: `superseded by PLAN sha256:${hex64}` }, { reason: `superseded by PLAN sha256:${hex64}` }],
+        [{ resolvedPath: served }, { resolvedPath: served }],
+        // Removed: a secret beside the token, glued to it, or in another path segment.
+        [{ reason: `superseded by PLAN sha256:${hex64} after ${LONG_BASE64}` }, { reason: `superseded by PLAN sha256:${hex64} after [redacted]` }],
+        [{ reason: `superseded by PLAN sha256:${hex64}${"A".repeat(8)}` }, { reason: "superseded by PLAN sha256:[redacted]" }],
+        [{ reason: `MY_TOKEN=sha256:${hex64}` }, { reason: "[redacted]" }],
+        [{ resolvedPath: `/opt/${LONG_BASE64}/generation-${hex40}/dist/daemon/agentcpd.js` },
+          // The run the secret forms with its neighbouring segments goes whole; the generation id stays.
+          { resolvedPath: `[redacted]-${hex40}/dist/daemon/agentcpd.js` }],
+        // Not exempt under any other key: the exceptions are per field, never a whole kind of value.
+        [{ detail: `superseded by PLAN sha256:${hex64}` }, { detail: "superseded by PLAN sha256:[redacted]" }],
+        [{ detail: served }, { detail: "/opt/acp/generations/generation-[redacted].js" }],
+      ];
+      for (const [index, [evidence, expected]] of cases.entries()) {
+        const kind = `TEST_AUDIT_TOKEN_${index}`;
+        expect(core.audit.record({ kind, evidence }).allowed, kind).toBe(true);
+        expect(core.audit.byKind(kind)[0]!.evidence, kind).toEqual(expected);
+      }
+      // An unknown audit field with that path is refused rather than stored.
+      expect(core.audit.record({ kind: "TEST_AUDIT_TOKEN_UNKNOWN", evidence: { servedFrom: served } }).allowed).toBe(false);
+      // The audit-only token is not an artifact exemption.
+      expect(credentialBearingField({ reason: `superseded by PLAN sha256:${hex64}` })).toBe("reason");
+    } finally { core.db.close(); }
+  });
+
+  it("the artifact store refuses VERIFICATION evidence carrying one", async () => {
+    const setup = await prepareRun();
+    try {
+      startWorkBranch(setup.harness.repoPath);
+      writeFiles(setup.harness.repoPath, { "src/app.js": APP_BYTES });
+      commitAll(setup.harness.repoPath, "make app() return 2");
+      const frozen = await setup.harness.cp.pipeline.freeze(setup.run.runId);
+      if (!frozen.allowed) throw new Error(frozen.message);
+      const digest = candidateSnapshotDigest(frozen.value);
+      const repository = frozen.value.repositories[0]!;
+      const report = (detail: string): VerificationReport => ({ runId: setup.run.runId, candidateSnapshotDigest: digest,
+        contractDigest: setup.run.contractDigest, expectedInputs: 1, observedInputs: 1, status: "FAIL", reasonCode: "VERIFICATION_COMMAND_FAILED", gaps: [],
+        results: [{ commandId: "test", repositoryIdentity: repository.identity, source: "local", exactHead: repository.candidateHead,
+          startedAt: "t", endedAt: "t", exitCode: 1, outputDigest: `sha256:${hex64}`, outputTruncated: false, status: "FAIL", reasonCode: detail }] });
+      const writer = setup.harness.cp.evidenceWritersForTests().VERIFICATION;
+      expect(() => setup.harness.cp.artifacts.putEvidence(writer, setup.run.runId, "VERIFICATION", report(LONG_BASE64), digest))
+        .toThrow(/contains a credential/);
+      expect(setup.harness.cp.artifacts.putEvidence(writer, setup.run.runId, "VERIFICATION", report("VERIFICATION_COMMAND_FAILED"), digest).digest)
+        .toMatch(/^sha256:/);
+    } finally { setup.harness.cp.close(); }
+  }, 60_000);
+});
+
+describe("#1223: a repository path is read per segment at every path-typed evidence field", () => {
+  const JAVA_PATH = "src/main/java/org/apache/commons/collections4/iterators/ObjectArrayIterator.java";
+  /** One segment that is itself a long-base64 run, with no `/` of its own. */
+  const SECRET_SEGMENT = "Ab9+Zq7x".repeat(8);
+  const secretPath = `src/${SECRET_SEGMENT}.txt`;
+
+  it("(a) a long Java path: the snapshot freezes and the review stores", async () => {
+    const setup = await prepareRun();
+    const { harness, run, identity } = setup;
+    try {
+      // Read whole, the path is one 75-character run of the base64 alphabet.
+      expect(JAVA_PATH.replace(/\.java$/, "")).toMatch(/^[A-Za-z0-9+/]{60,}$/);
+      startWorkBranch(harness.repoPath);
+      writeFiles(harness.repoPath, { [JAVA_PATH]: "class ObjectArrayIterator {}\n" });
+      commitAll(harness.repoPath, "add a java file");
+      harness.scripted.script({ match: /Candidate review/, text: JSON.stringify({ verdict: "PASS",
+        coveredFiles: [`${identity}:${JAVA_PATH}`], omittedItems: [], findings: [{ category: "correctness", severity: "MINOR",
+          repository: identity, path: JAVA_PATH, summary: "fine", detail: "nothing to fix" }] }) });
+      const outcome = await harness.cp.pipeline.submitResult({ runId: run.runId, ownerSessionId: run.ownerSessionId!,
+        ownerBindingGeneration: run.ownerBindingGeneration!, resultSummary: "java", recommendation: "merge" });
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+      const snapshot = harness.cp.artifacts.list<CandidateSnapshot>(run.runId, "CANDIDATE_SNAPSHOT").at(-1)!.content;
+      expect(snapshot.repositories[0]!.touchedPaths).toEqual([JAVA_PATH]);
+      const review = harness.cp.artifacts.list<ReviewPacket>(run.runId, "BLIND_REVIEW").at(-1)!.content;
+      expect(review.coveredFiles).toEqual([`${identity}:${JAVA_PATH}`]);
+      expect(review.findings[0]).toMatchObject({ path: JAVA_PATH, detail: "nothing to fix" });
+      expect(review.findings[0]!.redacted).toBeUndefined();
+    } finally { harness.cp.close(); }
+  }, 60_000);
+
+  it("(b) a path whose one segment is a long-base64 secret is still refused at both sites", async () => {
+    const setup = await prepareRun();
+    const { harness, run, identity } = setup;
+    try {
+      startWorkBranch(harness.repoPath);
+      writeFiles(harness.repoPath, { [secretPath]: "x\n" });
+      commitAll(harness.repoPath, "a file named by a secret");
+      const frozen = await harness.cp.pipeline.freeze(run.runId).catch((error: unknown) => ({ allowed: false, thrown: String(error) }));
+      expect(frozen, JSON.stringify(frozen)).toMatchObject({ allowed: false });
+      expect(JSON.stringify(frozen)).toMatch(/credential/);
+      expect(harness.cp.artifacts.list(run.runId, "CANDIDATE_SNAPSHOT")).toEqual([]);
+      expect(credentialBearingField({ repositories: [{ touchedPaths: [secretPath] }] })).toBe("touchedPaths");
+      expect(credentialBearingField({ coveredFiles: [`${identity}:${secretPath}`] })).toBe("coveredFiles");
+      // Redacted where ACP derives the text: only the secret segment goes.
+      expect(redactCredentialValues({ path: secretPath }, { path: ["findings"], store: "artifact" }).value).toEqual({ path: "src/[redacted].txt" });
+    } finally { harness.cp.close(); }
+  }, 60_000);
+
+  it("leaves path-escape validation as it was: absolute, '..' and control-character paths are still refused", () => {
+    const file = (path: string) => ({ runId: "run", contractDigest: `sha256:${"0".repeat(64)}`, missing: [], files: [{ path,
+      sha256: `sha256:${"1".repeat(64)}`, origin: "o", grade: "execution-log", bodyBase64: "" }] });
+    expect(reviewEvidenceBundleSchema.safeParse(file(JAVA_PATH)).success).toBe(true);
+    for (const escape of ["/etc/hosts", "src/../../etc/hosts", "src/a\u0001b.java"]) {
+      expect(reviewEvidenceBundleSchema.safeParse(file(escape)).success, escape).toBe(false);
+    }
   });
 });

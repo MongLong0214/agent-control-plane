@@ -1460,7 +1460,7 @@ export const buildSandboxEnvironment = (
 // A harmless name cannot turn an authority-shaped value into sandbox input. The shapes are the shared
 // list (core/credential-shapes.ts), found anywhere in the value: a superset of the whole-value
 // shapes this filter used to keep for itself.
-const looksLikeCredential = (value: string): boolean => hasCredentialShape(value, "text");
+const looksLikeCredential = (value: string): boolean => hasCredentialShape(value);
 
 /**
  * Named locations a candidate command must never read. Seatbelt retains allow-default

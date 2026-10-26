@@ -7,7 +7,11 @@ import { observeApprovedWorkflowChecks, type GitHubClient } from "../github/gith
 export interface ReviewRecordVerification {
   status: "attributed" | "ACP-verified";
   reason: string;
-  facts: Array<{ path: string; response: unknown }>;
+  /**
+   * `redacted` is present only when ACP replaced credential-shaped text in that fact with
+   * `[redacted]` before storing it (bootstrap-review-evidence.ts); what it no longer shows stays unproven.
+   */
+  facts: Array<{ path: string; response: unknown; redacted?: true }>;
 }
 /** Read only public GitHub facts. A CTO's requested head is a lookup target, never a trusted
  * verification contract: required workflows and coverage come from an ACP active manifest.

@@ -76,6 +76,7 @@ import type { VerificationReport } from "../verify/verification-engine.ts";
 import type { TaskContract } from "../run/run-engine.ts";
 import { bootstrapPlanTaskRecorded } from "../run/task-graph.ts";
 import { candidateEvidenceSection, readExecutionEvidence, readTrackedTree, type TrackedTreeEvidence } from "./candidate-review-evidence.ts";
+import { redactCredentialValues } from "../core/credential-shapes.ts";
 
 export interface ReviewFinding {
   category: ReviewFindingCategory;
@@ -84,7 +85,23 @@ export interface ReviewFinding {
   path: string | null;
   summary: string;
   detail: string;
+  /**
+   * Present only when ACP replaced credential-shaped text in this finding with `[redacted]` before
+   * storing the packet. The verdict is the reviewer's; what the finding no longer shows stays unproven.
+   */
+  redacted?: true;
 }
+
+/**
+ * A reviewer's findings as ACP stores them: every string redacted through the shared credential
+ * shapes (core/credential-shapes.ts), and each finding that lost text marked. The reviewer's own
+ * answer is kept nowhere but as a digest, so this derived copy is the only stored text.
+ */
+const storedFindings = (findings: readonly ReviewFinding[]): ReviewFinding[] =>
+  findings.map((finding) => {
+    const { value, redacted } = redactCredentialValues(finding, { path: ["findings"], store: "artifact" });
+    return redacted ? { ...value, redacted: true } : finding;
+  });
 
 export interface BootstrapReviewContext {
   deployment: BootstrapRuntimeObservation | null;
@@ -1846,7 +1863,7 @@ export class BlindReviewGate {
       coveredFiles: [...new Set(input.raw.coveredFiles)],
       omittedItems: [...new Set(input.raw.omittedItems)],
       verdict: input.raw.verdict,
-      findings: input.raw.findings,
+      findings: storedFindings(input.raw.findings),
       chunked: input.chunked,
       ...(input.bootstrapPlan === null ? {} : { bootstrapPlan: input.bootstrapPlan }),
       ...(input.bootstrapPlanIntentDigest === undefined ? {} : { bootstrapPlanIntentDigest: input.bootstrapPlanIntentDigest }),

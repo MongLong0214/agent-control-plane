@@ -1,7 +1,7 @@
 import type { Clock } from "../core/clock.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { verificationKindRunning } from "../bootstrap/repo-factory-producer.ts";
-import { redactCredentialShapes } from "../core/credential-shapes.ts";
+import { redactCredentialShapes, withholdCutFragment } from "../core/credential-shapes.ts";
 import { canonicalJson, digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -101,16 +101,22 @@ export interface VerificationOutputExcerpt {
    * as well as a credential; what was replaced is evidence of neither.
    */
   redacted: boolean;
+  /**
+   * The sandbox stopped capturing at the command's maxOutputBytes, so the end of each stream is a cut
+   * with the rest unseen; the trailing run of credential-alphabet characters at that cut (a possible
+   * start of a shape too short to recognise) was withheld from it.
+   */
+  boundaryFragmentWithheld: boolean;
 }
 
 /**
  * Credential shapes in free text replaced with `[redacted]`, from the one shared list
- * (core/credential-shapes.ts) in its text scope: the shapes the sandbox refuses as environment values
+ * (core/credential-shapes.ts), every shape applied: those the sandbox refuses as environment values
  * and those the audit log redacts, found anywhere in a line. A pattern filter, not a guarantee: a
  * secret in no listed shape passes.
  */
 export const redactCredentialText = (text: string): { text: string; redacted: boolean } => {
-  const scrubbed = redactCredentialShapes(text, "text");
+  const scrubbed = redactCredentialShapes(text);
   return { text: scrubbed, redacted: scrubbed !== text };
 };
 
@@ -124,26 +130,35 @@ const excerptOf = (text: string): { text: string; truncated: boolean } => {
 };
 
 /**
- * Redact the whole stream first, so a cut can never shorten a credential below its shape; cut; then
- * redact the excerpt again, because a cut can give a shape the word boundary it lacked in the stream.
+ * The sandbox's own capture cut comes first and its far side is never seen, so when the capture was
+ * cut the trailing credential-alphabet run is withheld before anything else. Then the whole stream is
+ * redacted, so the excerpt's own cut can never shorten a credential below its shape; then it is cut;
+ * then the excerpt is redacted again, because a cut can give a shape the word boundary it lacked.
  */
-const excerptStream = (text: string): { text: string; truncated: boolean; redacted: boolean } => {
+const excerptStream = (captured: string, captureTruncated: boolean): { text: string; truncated: boolean; redacted: boolean } => {
+  const text = captureTruncated ? withholdCutFragment(captured).text : captured;
   const whole = redactCredentialText(text);
   const cut = excerptOf(whole.text);
   const again = redactCredentialText(cut.text);
   return { text: again.text, truncated: cut.truncated, redacted: whole.redacted || again.redacted };
 };
 
+/**
+ * `captureTruncated` is the sandbox's `outputTruncated`. Capture stops for both streams at once, so
+ * either may end at the cut, and both have their cut edge withheld.
+ */
 export const verificationOutputExcerpt = (
   binding: Pick<VerificationOutputExcerpt, "candidateSnapshotDigest" | "contractDigest" | "commandId" | "repositoryIdentity" | "exactHead">,
   stdout: string,
   stderr: string,
+  captureTruncated: boolean,
 ): VerificationOutputExcerpt => {
-  const out = excerptStream(stdout);
-  const err = excerptStream(stderr);
+  const out = excerptStream(stdout, captureTruncated);
+  const err = excerptStream(stderr, captureTruncated);
   return {
     schema: "acp.verification-output-excerpt.v1", ...binding, stdoutChars: stdout.length, stderrChars: stderr.length,
     stdout: out.text, stderr: err.text, truncated: out.truncated || err.truncated, redacted: out.redacted || err.redacted,
+    boundaryFragmentWithheld: captureTruncated,
   };
 };
 
@@ -905,6 +920,7 @@ export class VerificationEngine {
           repositoryIdentity: identity, exactHead: head },
         outcome.stdout,
         outcome.stderr,
+        outcome.outputTruncated,
       ),
     };
     this.writeResultRow(runId, snapshotDigest, record);

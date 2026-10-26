@@ -1792,7 +1792,7 @@ const AUTHORITY_ENV = [
 const authorityEnvironment = (name: string): boolean => AUTHORITY_ENV.some((pattern) => pattern.test(name));
 // The shared list (core/credential-shapes.ts) in its text scope, found anywhere in the value: a
 // superset of the whole-value shapes this filter used to keep as its own copy.
-const looksLikeCredential = (value: string): boolean => hasCredentialShape(value, "text");
+const looksLikeCredential = (value: string): boolean => hasCredentialShape(value);
 
 /**
  * Constructed, never inherited: an agent CLI receives no daemon authority.
