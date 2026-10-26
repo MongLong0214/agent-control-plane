@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import { acpError, allow, deny, type Decision, type Evidence, isAcpError } from "../core/errors.ts";
-import { digestOf } from "../core/digest.ts";
+import { canonicalJson, digestOf } from "../core/digest.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { type BootstrapWriteGuard, runUnderWriteGuard } from "../bootstrap/bootstrap-write-guard.ts";
 import { screenPublicText } from "../bootstrap/genesis-bundle.ts";
@@ -82,6 +82,9 @@ interface ApprovedScope {
   sessionId: string | null;
   bindingGeneration: number;
   units: ApprovedUnit[];
+  /** The digest of the submitted task specs and the tasks they created (#1240 review R6: the replay). */
+  tasksDigest?: string;
+  submittedTaskIds?: string[];
 }
 
 export interface TrackedUnit {
@@ -244,6 +247,19 @@ export class WorkScopeTracking {
     if (repeatedKeys.length > 0) return invalid("WORK_UNITS_INVALID", `unit keys ${repeatedKeys.join(", ")} are declared more than once`, { units: repeatedKeys });
     // #1239 — the tasks this PLAN supersedes are cancelled with it: they stay live in no unit.
     const superseded = new Set(Array.isArray(plan["supersedesTaskIds"]) ? (plan["supersedesTaskIds"] as unknown[]).filter((id): id is string => typeof id === "string") : []);
+    // #1240 review R6 — a create whose outcome is unknown may still land for a task this PLAN would cancel; its
+    // replacement would then get a second issue. Refused until the intent resolves, unless the PLAN adopts an
+    // existing issue (by number, verified as always) for that work: the unit carrying the intent's key.
+    const adopting = new Set(units.filter((unit) => "number" in unit.issue).map((unit) => unit.key));
+    const unsettled = this.#unknownIntents(runId).filter((intent) => intent.taskIds.some((taskId) => superseded.has(taskId)) && !adopting.has(intent.unit));
+    if (unsettled.length > 0) {
+      return deny(ReasonCode.WORK_SCOPE_NOT_TRACKED_ON_GITHUB, "this PLAN supersedes a task whose issue create has an unknown outcome and may still land", {
+        refusal: "WORK_SCOPE_CREATION_UNRESOLVED", retryable: true, runId,
+        intents: unsettled.map((intent) => intent.intent),
+        tasks: [...new Set(unsettled.flatMap((intent) => intent.taskIds.filter((taskId) => superseded.has(taskId))))],
+        correction: "admit the work again once GitHub has answered (ACP links the issue when its token appears) and then supersede it, or adopt an existing issue by number for that unit",
+      });
+    }
     const live = this.#live(runId).map((task) => task.taskId).filter((taskId) => !superseded.has(taskId));
     const known = new Set([...submitted.map((task) => task.key), ...live]);
     const refs = units.flatMap((unit) => unit.tasks);
@@ -280,6 +296,24 @@ export class WorkScopeTracking {
     return allow(ReasonCode.OK, { units });
   }
 
+  /**
+   * #1240 review R6 — an identical resend of the run's CURRENT work-unit PLAN (the same content as stored,
+   * its submission sequence aside, and the same tasks) is a no-op: the tasks its accepted submission
+   * created, and nothing is stored. Only the current PLAN counts, so A, B, A is still three submissions.
+   */
+  replay(runId: string, stored: Record<string, unknown>, tasks: readonly unknown[]): TaskRecord[] | null {
+    const governed = this.#governed(runId);
+    if (!governed.allowed || governed.value === null) return null;
+    const current = this.ports.artifacts.latest<Record<string, unknown>>(runId, ArtifactKind.PLAN);
+    const scope = this.#scope(runId);
+    if (current === null || scope === null || scope.tasksDigest === undefined || scope.submittedTaskIds === undefined) return null;
+    const { submission: _submission, ...content } = current.content;
+    if (canonicalJson(content) !== canonicalJson(stored) || scope.tasksDigest !== digestOf(tasks)) return null;
+    const byId = new Map(this.ports.tasks.list(runId).map((task) => [task.taskId, task] as const));
+    const replayed = scope.submittedTaskIds.map((taskId) => byId.get(taskId));
+    return replayed.every((task) => task !== undefined) ? (replayed as TaskRecord[]) : null;
+  }
+
   /** After the PLAN and its tasks are stored: the declared mapping, resolved to task ids, and its owner. */
   approve(
     runId: string,
@@ -300,7 +334,7 @@ export class WorkScopeTracking {
       runId,
       projectId: this.ports.runs.get(runId)?.projectId ?? null,
       sessionId: owner.sessionId,
-      evidence: { planDigest, bindingGeneration: owner.bindingGeneration, units },
+      evidence: { planDigest, bindingGeneration: owner.bindingGeneration, units, tasksDigest: digestOf(submitted), submittedTaskIds: created.map((task) => task.taskId) },
     });
     return recorded.allowed ? allow(ReasonCode.OK, undefined) : (recorded as Decision<void>);
   }
@@ -476,8 +510,11 @@ export class WorkScopeTracking {
             }
           } else {
             const { title, body } = declared.issue.new;
-            // ACP's own earlier create for this unit: the same key, covering some of the same tasks.
-            const own = [...createdIssues].reverse().find((c) => c.unit === approved.unit && c.taskIds.some((t) => approved.taskIds.includes(t))
+            // ACP's own earlier create for this unit: the same key, covering some of the same tasks, or tasks that
+            // were all cancelled since (a re-plan replaced them). It stands only while its text is the PLAN's.
+            const cancelled = new Set(this.ports.tasks.list(runId).filter((task) => task.state === TaskState.CANCELLED).map((task) => task.taskId));
+            const own = [...createdIssues].reverse().find((c) => c.unit === approved.unit
+              && (c.taskIds.some((t) => approved.taskIds.includes(t)) || c.taskIds.every((t) => cancelled.has(t)))
               && resources.issues.some((i) => i.number === c.issueNumber && i.nodeId === c.nodeId));
             issue = own === undefined ? undefined : resources.issues.find((i) => i.number === own.issueNumber && i.nodeId === own.nodeId);
             // ACP's own earlier create stands for this unit only while it reads as the PLAN now declares it.
@@ -697,7 +734,11 @@ export class WorkScopeTracking {
     if (!row) return null;
     const evidence = JSON.parse(row.evidence_json) as Partial<ApprovedScope>;
     if (evidence.planDigest !== plan.digest || !Array.isArray(evidence.units) || typeof evidence.bindingGeneration !== "number") return null;
-    return { eventId: row.event_id, planDigest: evidence.planDigest, sessionId: row.session_id, bindingGeneration: evidence.bindingGeneration, units: evidence.units };
+    return {
+      eventId: row.event_id, planDigest: evidence.planDigest, sessionId: row.session_id, bindingGeneration: evidence.bindingGeneration, units: evidence.units,
+      ...(typeof evidence.tasksDigest === "string" ? { tasksDigest: evidence.tasksDigest } : {}),
+      ...(Array.isArray(evidence.submittedTaskIds) ? { submittedTaskIds: evidence.submittedTaskIds } : {}),
+    };
   }
 
   /** Every approval of the run, oldest first, with its units. */

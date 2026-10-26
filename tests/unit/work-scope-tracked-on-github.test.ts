@@ -1004,6 +1004,74 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     expect(startExecution(g, impl).allowed).toBe(true);
   });
 
+  it("review R6 P1: superseding a task whose issue create is unknown is refused until it resolves; then the replacement links to the found issue", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    const issue = { new: { title: "Add feed filtering", body: "Filter" } };
+    g.github.fault = { suffix: "/issues", when: "late" };
+    expect(tracking(await planSubmit(g, [{ key: "feed", tasks: [impl], issue, milestone: { number: 1 } }]))).toMatchObject({ tracked: false });
+    const plan = g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!.digest;
+    const supersede = (key: string) => callCtoTool(g.h, g.owner, "plan_submit", {
+      idempotencyKey: key, runId: g.runId,
+      plan: { summary: "replace the feed task", supersedesTaskIds: [impl], workUnits: [{ key: "feed", tasks: ["impl2"], issue, milestone: { number: 1 } }] },
+      tasks: [{ key: "impl2", title: "Implement the verdict feed, again", category: "implementation" }],
+    });
+    const refused = await supersede("supersede-1");
+    expect(refused).toMatchObject({ ok: false, evidence: { refusal: "WORK_SCOPE_CREATION_UNRESOLVED", retryable: true } });
+    expect((refused["evidence"] as { intents: string[] }).intents).toHaveLength(1);
+    expect(g.h.cp.tasks.get(impl)!.state).toBe("READY");
+    expect(g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!.digest).toBe(plan);
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    // The delayed POST completes; a sync links it, and then the supersede is accepted and reuses it.
+    g.github.land();
+    expect((await provision(g, impl))["reasonCode"]).not.toBe(REFUSED);
+    const accepted = await supersede("supersede-2");
+    expect(accepted["ok"]).toBe(true);
+    expect(tracking(accepted)).toMatchObject({ tracked: true });
+    expect(g.h.cp.tasks.get(impl)!.state).toBe("CANCELLED");
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(g.github.issues.filter((i) => i.title === "Add feed filtering")).toHaveLength(1);
+    const impl2 = g.h.cp.tasks.list(g.runId).find((t) => t.title === "Implement the verdict feed, again")!.taskId;
+    expect(startExecution(g, impl2).allowed).toBe(true);
+  });
+
+  it("review R6 P1 (adoption): superseding a task whose create is unknown is allowed when the PLAN adopts an existing issue for that work", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/issues", when: "late" };
+    await planSubmit(g, [{ key: "feed", tasks: [impl], issue: { new: { title: "Add feed filtering", body: "Filter" } }, milestone: { number: 1 } }]);
+    const adopted = await callCtoTool(g.h, g.owner, "plan_submit", {
+      idempotencyKey: "supersede-adopt", runId: g.runId,
+      plan: { summary: "replace the feed task", supersedesTaskIds: [impl], workUnits: [{ key: "feed", tasks: ["impl2"], issue: { number: 3 }, milestone: { number: 1 } }] },
+      tasks: [{ key: "impl2", title: "Implement the verdict feed, again", category: "implementation" }],
+    });
+    expect(tracking(adopted)).toMatchObject({ tracked: true });
+    expect(g.h.cp.tasks.get(impl)!.state).toBe("CANCELLED");
+    expect(g.github.posts("/issues")).toHaveLength(1);
+  });
+
+  it("review R6 P2: an identical resend of the current superseding work-unit PLAN with a new key is a no-op success returning its tasks", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 2) });
+    const [impl, review] = g.taskIds as [string, string];
+    const feed = { key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } };
+    expect(tracking(await planSubmit(g, [feed, { key: "detail", tasks: [review], issue: { number: 4 }, milestone: { number: 1 } }]))).toMatchObject({ tracked: true });
+    const args = {
+      runId: g.runId,
+      plan: { summary: "replace the detail page", supersedesTaskIds: [review], workUnits: [feed, { key: "detail2", tasks: ["detail2"], issue: { number: 6 }, milestone: { number: 2 } }] },
+      tasks: [{ key: "detail2", title: "Verdict detail, second cut", category: "implementation" }],
+    };
+    const first = await callCtoTool(g.h, g.owner, "plan_submit", { idempotencyKey: "supersede-first", ...args });
+    expect(first["ok"]).toBe(true);
+    const plans = g.h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN'`, [g.runId])!.n;
+    const tasks = g.h.cp.tasks.list(g.runId).length;
+    const resent = await callCtoTool(g.h, g.owner, "plan_submit", { idempotencyKey: "supersede-resent", ...args });
+    expect(resent).toMatchObject({ ok: true });
+    expect((resent["value"] as Array<{ taskId: string }>).map((t) => t.taskId)).toEqual((first["value"] as Array<{ taskId: string }>).map((t) => t.taskId));
+    expect(g.h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN'`, [g.runId])!.n).toBe(plans);
+    expect(g.h.cp.tasks.list(g.runId)).toHaveLength(tasks);
+    expect(g.h.cp.audit.byKind("STANDARD_WORK_TASKS_SUPERSEDED").filter((row) => row.runId === g.runId)).toHaveLength(1);
+  });
+
   it("a project that is not a Repo Factory project plans and is admitted as before, with no GitHub request", async () => {
     const g = await governedRun({ provisioned: false, legacy: [] });
     const answer = await callCtoTool(g.h, g.owner, "plan_submit", { idempotencyKey: "plan-plain", runId: g.runId, plan: { summary: "plain" }, tasks: [{ key: "impl", title: "Implement", category: "implementation" }] });
