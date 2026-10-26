@@ -262,6 +262,20 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     },
     submitTasks: (runId: string, tasks: Parameters<TaskGraph["submit"]>[1]) => source.tasks.submit(runId, tasks),
     workScope: () => source.tasks.workScope,
+    // #1240 review R2 — the artifact store hands back an identical earlier PLAN without making it current.
+    // For a PLAN that declares work units, the PLAN just submitted is the run's current one: the PLANs
+    // stored after it are withdrawn (their bytes stay), so `artifacts.latest` stays the one authority. A
+    // PLAN that was itself withdrawn is not made current again.
+    makePlanCurrent: (runId: string, digest: string): Decision<void> => {
+      const row = source.db.get<{ superseded: number }>(`SELECT superseded FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN' AND digest = ?`, [runId, digest]);
+      if (!row || row.superseded !== 0) {
+        return deny(ReasonCode.CONFLICT, "this PLAN was withdrawn and is not made current again; change it and submit it again", { runId, refusal: "PLAN_WITHDRAWN", planDigest: digest });
+      }
+      for (let latest = source.artifacts.latest(runId, ArtifactKind.PLAN); latest !== null && latest.digest !== digest; latest = source.artifacts.latest(runId, ArtifactKind.PLAN)) {
+        source.artifacts.supersede(runId, ArtifactKind.PLAN, latest.digest);
+      }
+      return allow(ReasonCode.OK, undefined);
+    },
     isProjectlessBootstrapRun: (runId: string) => isProjectlessBootstrap(source.runs.require(runId)),
     // PR #1114 BOOT-02 — a project-less bootstrap's re-plan is all or nothing: the PLAN write, the
     // supersession of the earlier PLAN's tasks, the one new task and its BOOTSTRAP_PLAN_TASKS binding
@@ -632,6 +646,10 @@ const createCtoServerFromPort = (
       if (tasks.length === 0 && declared.value === null) return respond(deny(ReasonCode.INVALID_ARGUMENT, "plan_submit requires plan and tasks, or bootstrapPlanDigest"));
       const stored = port.submitPlan(args.runId, plan, bootstrapPlanDigest);
       if (!stored.allowed) return respond(stored);
+      if (declared.value !== null) {
+        const current = port.makePlanCurrent(args.runId, stored.value.digest);
+        if (!current.allowed) return respond(current);
+      }
       const submitted = tasks.length === 0 ? allow(ReasonCode.OK, []) : port.submitTasks(args.runId, tasks);
       if (!submitted.allowed) return respond(submitted);
       if (scope === null || declared.value === null) return respond(submitted);

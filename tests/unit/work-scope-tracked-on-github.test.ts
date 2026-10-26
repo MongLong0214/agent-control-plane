@@ -11,7 +11,7 @@ import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { manifestDigest, projectManifestSchema } from "../../src/contracts/manifest.ts";
 import { digestOf } from "../../src/core/digest.ts";
-import { ArtifactKind, ExecutionMode, Role, RunKind, roleKeyFor } from "../../src/domain/types.ts";
+import { ArtifactKind, ExecutionMode, Role, RunKind, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
 import { callCtoTool } from "../helpers/cto-tool.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -267,8 +267,8 @@ const governedRun = async (options: { github?: IssuesGitHub; legacy?: typeof LEG
 };
 
 /** The run owner's plan_submit over the CTO MCP tools, declaring `workUnits` (and tasks, when given). */
-const planSubmit = (g: Governed, workUnits: unknown, tasks?: unknown[]) =>
-  callCtoTool(g.h, g.owner, "plan_submit", { idempotencyKey: `plan-${Math.random()}`, runId: g.runId, plan: { summary: "work units", workUnits }, ...(tasks === undefined ? {} : { tasks }) });
+const planSubmit = (g: Governed, workUnits: unknown, tasks?: unknown[], summary = "work units") =>
+  callCtoTool(g.h, g.owner, "plan_submit", { idempotencyKey: `plan-${Math.random()}`, runId: g.runId, plan: { summary, workUnits }, ...(tasks === undefined ? {} : { tasks }) });
 
 /** The CTO's task_worker_provision, as the run's owner calls it over the CTO MCP tools. */
 const provision = (g: Governed, taskId: string) =>
@@ -584,6 +584,72 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     expect(unmetOf(tracking(redeclared))).toMatchObject([{ unit: "feed-x", unmet: "ISSUE_TEXT_DIFFERS", issues: [created.number] }]);
     expect(g.github.calls.filter((c) => c.method !== "GET")).toHaveLength(1);
     expect(startExecution(g, impl).reasonCode).toBe(REFUSED);
+  });
+
+  it("review R2 P1-a: an owner revoked while the synchronization waits on GitHub publishes nothing", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/issues", when: "before" };
+    expect(tracking(await planSubmit(g, [{ key: "roundup", tasks: [impl], issue: { new: { title: "Weekly verdict roundup", body: "Collect" } }, milestone: { number: 1 } }]))).toMatchObject({ tracked: false });
+    const hold = g.github.holdNext(`${ROOT}/milestones`);
+    const sync = g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl);
+    await vi.waitFor(() => expect(hold.reached()).toBe(true));
+    // The run is held and its owner's binding revoked: ACP's own owner check no longer admits that owner.
+    const run = g.h.cp.runs.require(g.runId);
+    expect(g.h.cp.runs.transition(g.runId, RunState.BLOCKED, "test hold").allowed).toBe(true);
+    expect(g.h.cp.bindings.revoke(run.ownerRoleKey!, "test revocation", { allowBlockedRuns: true }).allowed).toBe(true);
+    expect(g.h.cp.runs.assertOwner(g.runId, run.ownerSessionId!, run.ownerBindingGeneration!).allowed).toBe(false);
+    hold.release();
+    const answer = await sync;
+    expect(answer.allowed).toBe(false);
+    expect(answer.evidence).toMatchObject({ causeRefusal: "WORK_SCOPE_APPROVAL_NOT_CURRENT_OWNER" });
+    expect(g.github.issues.filter((i) => i.title === "Weekly verdict roundup")).toEqual([]);
+    expect(g.github.posts("/issues")).toHaveLength(1);
+  });
+
+  it("review R2 P1-b: restoring an earlier mapping never revives the verification it had before a scope change", async () => {
+    // The intervening mapping verified (#4), or never verified (#99, not an issue): both invalidate #3's receipt.
+    for (const between of [4, 99]) {
+      const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+      const [impl] = g.taskIds as [string];
+      const at3 = { key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } };
+      expect(tracking(await planSubmit(g, [at3]))).toMatchObject({ tracked: true });
+      await planSubmit(g, [{ ...at3, issue: { number: between } }]);
+      g.github.issues.find((i) => i.number === 3)!.milestone = null;
+      const seen = g.github.calls.length;
+      const restored = await planSubmit(g, [at3], undefined, "restored");
+      expect(g.github.calls.length, `between #${between}`).toBeGreaterThan(seen);
+      expect(unmetOf(tracking(restored)).map((u) => [u.unit, u.unmet]), `between #${between}`).toEqual([["feed", "MILESTONE_LINK_MISSING"]]);
+      expect(startExecution(g, impl).reasonCode).toBe(REFUSED);
+    }
+  });
+
+  it("review R2 P1-c: home-relative, environment and Windows paths are refused like absolute ones; URL paths are not", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    const scope = g.h.cp.tasks.workScope!;
+    const declare = (text: string) => scope.declare(g.runId, { workUnits: [{ key: "notes", tasks: [impl], issue: { new: { title: "Notes", body: text } }, milestone: { number: 1 } }] }, []);
+    for (const text of [
+      "See ~/.hermes/private-notes.md", "~isaac/notes.md", "(~/x)", "<~/x>", "path=~/x", "$HOME/notes", "${HOME}/notes", "<$HOME/x>",
+      "%USERPROFILE%\\notes", "C:\\Users\\isaac\\notes", "see D:/work/notes", "https://example.com/a?path=/Users/isaac/x", "file:///Users/isaac/x",
+    ]) {
+      expect(declare(text), text).toMatchObject({ allowed: false, evidence: { refusal: "WORK_UNITS_TEXT_NOT_PUBLIC" } });
+    }
+    for (const text of ["https://example.com/~user/page", "https://example.com/Users/guide", "about ~5 minutes", "costs ~$5", "https://example.com/a?b=c", "the $HOMEPAGE link"]) {
+      expect(declare(text).allowed, text).toBe(true);
+    }
+  });
+
+  it("review R2 P2: re-submitting an identical earlier PLAN makes it the current PLAN again", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    const planA = [{ key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } }];
+    expect(tracking(await planSubmit(g, planA))).toMatchObject({ tracked: true });
+    expect(tracking(await planSubmit(g, [{ ...planA[0]!, issue: { number: 4 } }]))).toMatchObject({ tracked: true });
+    expect(tracking(await planSubmit(g, planA))).toMatchObject({ tracked: true });
+    const current = g.h.cp.artifacts.latest<{ workUnits: Array<{ issue: unknown }> }>(g.runId, ArtifactKind.PLAN)!;
+    expect(current.content.workUnits[0]!.issue).toEqual({ number: 3 });
+    expect(startExecution(g, impl).allowed).toBe(true);
   });
 
   it("a project that is not a Repo Factory project plans and is admitted as before, with no GitHub request", async () => {

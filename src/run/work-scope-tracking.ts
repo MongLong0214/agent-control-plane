@@ -17,7 +17,7 @@ import { type WorkUnitDeclaration, workUnitsSchema } from "../bootstrap/plan-inp
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { ArtifactKind, RunKind, RunState, TaskState } from "../domain/types.ts";
+import { ArtifactKind, RunKind, TaskState } from "../domain/types.ts";
 import type { RunEngine } from "./run-engine.ts";
 import { CLOSED_TO_NEW_TASKS, type TaskGraph, type TaskRecord } from "./task-graph.ts";
 
@@ -35,8 +35,10 @@ import { CLOSED_TO_NEW_TASKS, type TaskGraph, type TaskRecord } from "./task-gra
  * What is verified is structure and linkage, never content: the issue exists in the repository at the
  * node id the genesis receipted (all pages, pull requests excluded, every item naming that repository),
  * it links by node id to the unit's milestone, and no other unit links it. A verified unit is recorded
- * (`WORK_SCOPE_GITHUB_TRACKED`) with the digest of its declaration and task set, and reused only while
- * both are unchanged: a PLAN that adds, removes, relinks or regroups units re-verifies exactly those. An
+ * (`WORK_SCOPE_GITHUB_TRACKED`) with the digest of its declaration and task set and the approval it
+ * served. Only a unit's latest verification is reused, and only while its scope has stayed the same in
+ * every approval since: a PLAN that adds, removes, relinks or regroups units re-verifies exactly those,
+ * and restoring an earlier scope re-verifies it rather than reviving an older receipt. An
  * outage or another unit's change never holds back a unit already linked.
  *
  * No internal id is published. A created issue or milestone carries the PLAN's text and one marker,
@@ -59,6 +61,8 @@ interface ApprovedUnit {
 }
 
 interface ApprovedScope {
+  /** The approval's own audit event: approvals are ordered by it. */
+  eventId: number;
   planDigest: string;
   sessionId: string | null;
   bindingGeneration: number;
@@ -70,6 +74,8 @@ export interface TrackedUnit {
   declarationDigest: string;
   /** The link and task set this verification holds for (`scopeDigestOf`). */
   scopeDigest: string;
+  /** The approval the verification was made for; a scope change after it makes the verification stale. */
+  approvalEventId?: number;
   issueNumber: number;
   issueNodeId: string;
   milestoneNumber: number;
@@ -118,8 +124,6 @@ interface Status {
   tracked: Map<string, TrackedUnit>;
 }
 
-/** The run states that admit no more work, so no issue is written for one. */
-const ENDED: ReadonlySet<string> = new Set([RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED]);
 
 const SHAPE =
   "declare the run's work units in its PLAN: plan_submit with plan.workUnits, each {key, tasks: [this submission's task keys or the run's task ids], " +
@@ -128,13 +132,18 @@ const SHAPE =
 
 const INTERNAL_ID = /\b(?:prj|repo|ses|run|task|art|clm|msg|asg)_[0-9a-f]{24}\b/;
 // A path starts wherever the character before it cannot continue a path (src/github/branch-publish.ts
-// draws the same boundary): quotes, backticks, brackets, '<', '>', '|', '=', ':' or a '/' alike.
-const LOCAL_PATH = /(?:^|[^A-Za-z0-9._~-])(?:\/(?:Users|home|private|var|tmp|opt|etc)\/|[A-Za-z]:\\)/m;
+// draws the same boundary): quotes, backticks, brackets, '<', '>', '|', '=', ':' or a '/' alike. A local
+// path is an absolute one under a home or system root, a home-relative one (~/, ~user/), one through the
+// home environment ($HOME/, ${HOME}/, %USERPROFILE%\, %HOMEPATH%\) or a Windows drive path (C:\, C:/).
+const LOCAL_PATH = /(?:^|[^A-Za-z0-9._~-])(?:\/(?:Users|home|private|var|tmp|opt|etc|root)\/|~[A-Za-z0-9._-]*\/|\$\{?HOME\}?[\\/]|%(?:USERPROFILE|HOMEPATH)%[\\/]|[A-Za-z]:[\\/])/im;
+// A URL with a host names a path on that host, not on this machine: its scheme, host and path are set
+// aside before the screen; its query and fragment are still screened.
+const HOSTED_URL = /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s/?#]+[^\s?#]*/g;
 
 /** Why a PLAN text may not be published as written, or null. */
 const unpublishable = (text: string): string | null => {
   if (INTERNAL_ID.test(text)) return "an internal ACP id";
-  if (LOCAL_PATH.test(text)) return "a local filesystem path";
+  if (LOCAL_PATH.test(text.replace(HOSTED_URL, " "))) return "a local filesystem path";
   try {
     screenPublicText(text);
   } catch {
@@ -161,7 +170,7 @@ export interface WorkScopeTrackingPorts {
   db: Db;
   audit: AuditLog;
   artifacts: Pick<ArtifactStore, "latest">;
-  runs: Pick<RunEngine, "get" | "repositoriesOf">;
+  runs: Pick<RunEngine, "get" | "repositoriesOf" | "assertOwner">;
   tasks: Pick<TaskGraph, "list">;
   github: GitHubWritePort;
 }
@@ -456,7 +465,7 @@ export class WorkScopeTracking {
       else if (claimed.get(issue.number) !== unit) unmet.push({ unit, unmet: "CATCH_ALL_ISSUE", issues: [issue.number], correction: `issue #${issue.number} already stands for unit ${claimed.get(issue.number)}; give this unit its own issue` });
       else if (issue.milestone === null) unmet.push({ unit, unmet: "MILESTONE_LINK_MISSING", issues: [issue.number], milestones: [milestone.number], correction: `link issue #${issue.number} to milestone #${milestone.number}, or declare the milestone it is in` });
       else if (issue.milestone.nodeId !== milestone.nodeId) unmet.push({ unit, unmet: "MILESTONE_LINK_WRONG", issues: [issue.number], milestones: [milestone.number, issue.milestone.number], correction: `issue #${issue.number} is in milestone #${issue.milestone.number}, not #${milestone.number}; move it, or declare the milestone it is in` });
-      else verified.push({ unit, declarationDigest: approved.declarationDigest, scopeDigest: scopeDigestOf(approved), issueNumber: issue.number, issueNodeId: issue.nodeId, milestoneNumber: milestone.number, milestoneNodeId: milestone.nodeId, adopted: link.adopted });
+      else verified.push({ unit, declarationDigest: approved.declarationDigest, scopeDigest: scopeDigestOf(approved), approvalEventId: status.scope!.eventId, issueNumber: issue.number, issueNodeId: issue.nodeId, milestoneNumber: milestone.number, milestoneNodeId: milestone.nodeId, adopted: link.adopted });
     }
     if (verified.length > 0) {
       this.ports.audit.record({
@@ -485,13 +494,19 @@ export class WorkScopeTracking {
         if (request.kind !== "api" || request.method !== "POST" || path === null || !exact || (path === "issues" && typeof body["milestone"] !== "number")) {
           throw acpError(ReasonCode.GATE_AUTHORITY_DENIED, "a work-scope synchronization writes only the PLAN's own new milestones and issues", { request: { kind: request.kind, method: request.method, target: request.target } });
         }
+        // The same rule plan acceptance and the task graph apply: a sealed or ended run takes no new work.
         const run = this.ports.runs.get(runId);
-        if (!run || run.kind !== RunKind.STANDARD_WORK || ENDED.has(run.state)) {
+        if (!run || run.kind !== RunKind.STANDARD_WORK || CLOSED_TO_NEW_TASKS.has(run.state)) {
           throw acpError(ReasonCode.GATE_AUTHORITY_DENIED, "the run no longer admits work", { runId, state: run?.state ?? null });
         }
-        if (run.ownerSessionId !== scope.sessionId || run.ownerBindingGeneration !== scope.bindingGeneration) {
-          throw acpError(ReasonCode.GATE_AUTHORITY_DENIED, "the PLAN's work units were approved by another owner than the run's current one; its current owner submits them again before anything is created", {
-            refusal: "WORK_SCOPE_APPROVAL_NOT_CURRENT_OWNER", runId,
+        // ACP's own owner authority, the one its MCP fence ends in (`RunEngine.assertOwner`): the approval's
+        // owner is still the run's pinned owner and holds its role's active binding at that generation.
+        const owner = scope.sessionId === null
+          ? deny(ReasonCode.RUN_OWNER_NOT_PINNED, "the approval names no owner session", { runId })
+          : this.ports.runs.assertOwner(runId, scope.sessionId, scope.bindingGeneration);
+        if (!owner.allowed) {
+          throw acpError(ReasonCode.GATE_AUTHORITY_DENIED, "the PLAN's work units were approved by an owner ACP no longer admits as the run's current one; its current owner submits them again before anything is created", {
+            refusal: "WORK_SCOPE_APPROVAL_NOT_CURRENT_OWNER", runId, ownerRefusal: owner.reasonCode,
           });
         }
         // A PLAN accepted while this synchronization waited on GitHub supersedes the one it serves.
@@ -547,10 +562,19 @@ export class WorkScopeTracking {
     for (const unit of scope?.units ?? []) for (const taskId of unit.taskIds) unitOf.set(taskId, unit);
     const liveIds = new Set(live.map((task) => task.taskId));
     const liveUnits = (scope?.units ?? []).filter((unit) => unit.taskIds.some((taskId) => liveIds.has(taskId)));
+    // Only a unit's latest verification counts, and only if its scope (link and tasks) is the same in
+    // every approval from the one it was made for to the current one: any change in between makes it stale.
+    const latest = new Map<string, TrackedUnit>();
+    for (const record of this.#trackedRecords(runId, governed)) latest.set(record.unit, record);
+    const approvals = scope === null ? [] : this.#approvals(runId).filter((approval) => approval.eventId <= scope.eventId);
     const tracked = new Map<string, TrackedUnit>();
-    for (const record of this.#trackedRecords(runId, governed)) {
-      const unit = liveUnits.find((u) => u.unit === record.unit && record.scopeDigest === scopeDigestOf(u));
-      if (unit !== undefined) tracked.set(unit.unit, record);
+    for (const unit of liveUnits) {
+      const record = latest.get(unit.unit);
+      if (record === undefined || record.approvalEventId === undefined || record.scopeDigest !== scopeDigestOf(unit)) continue;
+      const unchanged = approvals
+        .filter((approval) => approval.eventId >= record.approvalEventId!)
+        .every((approval) => approval.units.some((u) => u.unit === unit.unit && scopeDigestOf(u) === record.scopeDigest));
+      if (unchanged) tracked.set(unit.unit, record);
     }
     return { scope, unitOf, unmapped: live.filter((task) => !unitOf.has(task.taskId)), live: liveUnits, tracked };
   }
@@ -558,14 +582,21 @@ export class WorkScopeTracking {
   #scope(runId: string): ApprovedScope | null {
     const plan = this.ports.artifacts.latest<unknown>(runId, ArtifactKind.PLAN);
     if (plan === null) return null;
-    const row = this.ports.db.get<{ session_id: string | null; evidence_json: string }>(
-      `SELECT session_id, evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id DESC LIMIT 1`,
+    const row = this.ports.db.get<{ event_id: number; session_id: string | null; evidence_json: string }>(
+      `SELECT event_id, session_id, evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id DESC LIMIT 1`,
       [WORK_SCOPE_APPROVED, runId],
     );
     if (!row) return null;
     const evidence = JSON.parse(row.evidence_json) as Partial<ApprovedScope>;
     if (evidence.planDigest !== plan.digest || !Array.isArray(evidence.units) || typeof evidence.bindingGeneration !== "number") return null;
-    return { planDigest: evidence.planDigest, sessionId: row.session_id, bindingGeneration: evidence.bindingGeneration, units: evidence.units };
+    return { eventId: row.event_id, planDigest: evidence.planDigest, sessionId: row.session_id, bindingGeneration: evidence.bindingGeneration, units: evidence.units };
+  }
+
+  /** Every approval of the run, oldest first, with its units. */
+  #approvals(runId: string): Array<{ eventId: number; units: ApprovedUnit[] }> {
+    return this.ports.db
+      .all<{ event_id: number; evidence_json: string }>(`SELECT event_id, evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`, [WORK_SCOPE_APPROVED, runId])
+      .map((row) => ({ eventId: row.event_id, units: (JSON.parse(row.evidence_json) as { units?: ApprovedUnit[] }).units ?? [] }));
   }
 
   #declarations(runId: string): Map<string, WorkUnitDeclaration> {
