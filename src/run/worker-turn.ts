@@ -11,6 +11,7 @@ import { fixedRuntimes } from "../domain/fixed-role-runtime.ts";
 import { type FailureClass, Role, RunKind, SessionLifecycle, TaskState, roleKeyFor } from "../domain/types.ts";
 import { type ManagedWriteGuard, WriteOperation } from "../guard/managed-write-guard.ts";
 import { canonical } from "../guard/workspace-probe.ts";
+import { residentRepository } from "../registry/worker-checkout.ts";
 import { providerHome } from "../runtime/cli-adapters.ts";
 import type { InvocationResult, ProviderAdapter } from "../runtime/provider.ts";
 import { randomUUID } from "node:crypto";
@@ -1162,6 +1163,17 @@ export class WorkerTurnRunner {
         worktreeId: worktree,
       });
     }
+    // #1227 — a resident CTO works in its clone, and nothing its tooling leaves there may reach a worker
+    // turn. A repository still registered at that clone runs no worker turn: the daemon moves it to its
+    // dedicated worker checkout on its next pass (registry/worker-checkout.ts), and a turn runs there.
+    const resident = residentRepository(db, repository.repository_id);
+    if (resident && worktree === resident.clonePath) {
+      return deny(
+        ReasonCode.CONFLICT,
+        "the registered checkout is the resident CTO's working directory; worker turns run only in the project's own worker checkout, which the daemon moves the repository to on its next pass",
+        { claimId: request.claimId, worktreeId: worktree, workerCheckout: resident.workerCheckoutPath },
+      );
+    }
     return allow(ReasonCode.OK, {
       claimId: request.claimId,
       repositoryId: repository.repository_id,
@@ -1371,7 +1383,11 @@ export class WorkerTurnRunner {
     // Re-entry: the checkout is on the task's branch already; the preparation that follows reads it.
     if (branch === target.branch) return allow(ReasonCode.OK, undefined);
     let handoff: { runId: string; taskId: string; branch: string } | null = null;
-    if (branch !== facts.claim.baseBranch) {
+    // #1227 — a resident project's worker checkout rests detached: the base branch is checked out in the
+    // resident's clone, and a branch is never checked out twice. Only that checkout is taken from a
+    // detached HEAD; any other detached checkout is someone's, and is not moved.
+    const resting = branch === null && residentRepository(this.ports.db, facts.claim.repositoryId)?.workerCheckoutPath === worktree;
+    if (branch !== facts.claim.baseBranch && !resting) {
       const previous = branch === null ? null : this.finishedTaskBranch(facts, branch);
       if (!previous) {
         return deny(
@@ -1382,6 +1398,16 @@ export class WorkerTurnRunner {
       }
       if (!previous.allowed) return previous as Decision<never>;
       handoff = previous.value;
+    }
+    // A branch another worktree of the repository stands on (the resident's clone, say) is not checked
+    // out here as well: a commit on it would move that tree's HEAD from under its files.
+    const holder = await worktreeOn(repo, target.branch);
+    if (holder !== null) {
+      return deny(
+        ReasonCode.CONFLICT,
+        "the task's branch is checked out in another worktree of the repository; a branch is never checked out twice, and neither tree is moved",
+        { worktreeId: worktree, branch: target.branch, checkedOutAt: holder },
+      );
     }
     const unclean = await uncleanPaths(repo, head, format, "branch");
     if (unclean.length > 0) {
@@ -1426,7 +1452,7 @@ export class WorkerTurnRunner {
       async () => {
         effect.outcome = await switchToTaskBranch(repo, {
           head,
-          branch: branch!,
+          branch,
           tip,
           to,
           target,
@@ -2314,6 +2340,18 @@ const headRefOf = async (repo: PinnedRepository): Promise<string | null> => {
   return read.exitCode === 0 ? read.stdout.trim() : null;
 };
 
+/** #1227 — the other worktree of the repository whose HEAD names `branch`, or null; a listing git did not give throws. */
+const worktreeOn = async (repo: PinnedRepository, branch: string): Promise<string | null> => {
+  const listed = await runPinnedGit(repo, ["worktree", "list", "--porcelain", "-z"]);
+  if (listed.exitCode !== 0) throw new Error(`git worktree list ${gitWords(listed)}`);
+  let tree: string | null = null;
+  for (const field of listed.stdout.split("\0")) {
+    if (field.startsWith("worktree ")) tree = field.slice("worktree ".length);
+    else if (field === `branch refs/heads/${branch}` && tree !== null && canonical(tree) !== repo.workTree) return tree;
+  }
+  return null;
+};
+
 /** Each path's mode and object id in `tree`, for the paths asked; a path the tree lacks is absent. */
 const treeEntriesOf = async (repo: PinnedRepository, tree: string, paths: readonly string[]): Promise<Map<string, { mode: string; oid: string }>> => {
   const entries = new Map<string, { mode: string; oid: string }>();
@@ -2426,7 +2464,8 @@ const switchToTaskBranch = async (
   repo: PinnedRepository,
   input: {
     head: string;
-    branch: string;
+    /** The branch HEAD named when it was read; null for a detached HEAD (#1227: a resident's worker checkout at rest). */
+    branch: string | null;
     tip: string | null;
     to: string;
     target: TaskWriteTarget;
@@ -2496,7 +2535,9 @@ const switchToTaskBranch = async (
             state: `HEAD is left on ${headElsewhere}; the files are ${filesMoved ? `at the task tree ${input.to}` : "as they were"}`,
           });
         } else {
-          const back = await runPinnedGit(repo, ["symbolic-ref", "-m", "agent-control-plane: task branch undone", "HEAD", `refs/heads/${input.branch}`]);
+          const back = input.branch === null
+            ? await runPinnedGit(repo, ["update-ref", "--no-deref", "-m", "agent-control-plane: task branch undone", "HEAD", input.head])
+            : await runPinnedGit(repo, ["symbolic-ref", "-m", "agent-control-plane: task branch undone", "HEAD", `refs/heads/${input.branch}`]);
           if (back.exitCode === 0) {
             headMoved = false;
           } else {
@@ -2523,7 +2564,7 @@ const switchToTaskBranch = async (
             blockers.push({
               step: "recovery incomplete",
               error: `${reverseRefused}${measured.error === null ? "" : `; ${measured.error}`}`,
-              state: `HEAD names ${input.branch} at ${input.head}; the index holds the task tree ${input.to}; the paths the reverse read-tree moved before it stopped are left exactly as they are, not put back`,
+              state: `HEAD names ${input.branch ?? "no branch"} at ${input.head}; the index holds the task tree ${input.to}; the paths the reverse read-tree moved before it stopped are left exactly as they are, not put back`,
               paths: measured.moved.map((path) => path.path),
             });
             recovery = { attemptId: input.attemptId, from: input.to, to: input.head, paths: measured.moved, indexChanged: measured.indexChanged, notOurs: measured.notOurs.slice(0, 50) };
@@ -2541,7 +2582,7 @@ const switchToTaskBranch = async (
               blockers.push({
                 step: "head-forward",
                 error: gitWords(forward),
-                state: `HEAD names ${input.branch} at ${input.head} while the index and files are at the task tree ${input.to}`,
+                state: `HEAD names ${input.branch ?? "no branch"} at ${input.head} while the index and files are at the task tree ${input.to}`,
               });
             }
           }
@@ -2631,7 +2672,7 @@ const switchToTaskBranch = async (
           blockers.push({
             step: "recovery incomplete",
             error: `${gitWords(moved)}${measured.error === null ? "" : `; ${measured.error}`}`,
-            state: `HEAD names ${input.branch} at ${input.head}; the index holds ${input.head}; ${createdHere ? `${branchRef} is kept at the pinned base, the moved files standing on it; ` : ""}the paths the read-tree moved before it stopped are left exactly as they are, not put back`,
+            state: `HEAD names ${input.branch ?? "no branch"} at ${input.head}; the index holds ${input.head}; ${createdHere ? `${branchRef} is kept at the pinned base, the moved files standing on it; ` : ""}the paths the read-tree moved before it stopped are left exactly as they are, not put back`,
             paths: measured.moved.map((path) => path.path),
           });
           return refused("the checkout's files could not be moved to the task's branch, and some had moved; recovery is incomplete and everything is left exactly as it stands", {

@@ -2193,6 +2193,9 @@ export class Daemon {
       const decision = this.cp.ceo.submitCeoDecision({...confirmation,decision:"CONFIRM",rationale:confirmation.rationale ?? ""});
       if (decision.allowed) this.cp.residentProjects.complete(confirmation.runId);
     }
+    // #1227 — a resident project's worker turns run in their own checkout, never the resident's clone:
+    // a project activated above, or one registered at its clone by an earlier build, is moved here.
+    await this.cp.workerCheckouts.ensureAll();
   }
 
   private async resumeApprovedRuns(): Promise<string[]> {

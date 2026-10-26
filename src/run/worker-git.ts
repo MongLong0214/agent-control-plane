@@ -448,10 +448,26 @@ export const effectiveConfig = async (repo: PinnedRepository): Promise<string> =
   must(repo, ["config", "--list", "--show-origin", "--show-scope", "-z"]);
 
 /**
+ * #1227 — the names under a git dir's `objects/` that are content-addressed storage: a loose object's
+ * fan-out directory (`objects/[0-9a-f]{2}`) and the pack directory (`objects/pack`).
+ */
+const OBJECT_STORAGE = /^(?:[0-9a-f]{2}|pack)$/;
+
+/**
  * Every entry of the pinned git dir(s): path, kind, size, mtime, inode, and a symlink's target. The
  * index is left out: the provider CLI's own `git status` rewrites its stat cache, and the control
  * plane never reads the real index after a turn. One line per entry, its fields `\0`-separated and led
  * by the root and the path relative to it; the order is the walk's, and the same tree gives the same list.
+ *
+ * #1227 — content-addressed object storage is left out as well, under the common dir and the pinned
+ * git dir alike: every loose object (`objects/[0-9a-f]{2}/*`) and everything in `objects/pack/`, so
+ * another writer of the shared object store (the resident's or the control plane's own commit,
+ * write-tree, hash-object or fetch) adding, freshening or repacking objects does not refuse a turn.
+ * Only a real directory of those names is left out; anything else there is read. The `objects`
+ * directory is read without its size and times, which those additions move, so its replacement still
+ * shows. Everything else under `objects/` (`objects/info/*`: alternates, http-alternates, the
+ * commit-graph) is read as before, as are refs, packed-refs, HEAD, config, hooks, info/, logs and a
+ * linked worktree's own files.
  */
 export const gitDirEntries = (repo: PinnedRepository): string[] => {
   const roots = [...new Set([repo.commonDir, repo.gitDir])];
@@ -461,12 +477,15 @@ export const gitDirEntries = (repo: PinnedRepository): string[] => {
   const holdsIndex = (dir: string): boolean => dir === repo.gitDir || dir === repo.commonDir || dirname(dir) === worktreesRoot;
   const walk = (root: string, dir: string, depth: number): void => {
     if (depth > 64) throw new Error("the git dir is nested too deeply to fingerprint");
+    const objects = join(root, "objects");
     for (const name of readdirSync(dir).sort()) {
       const path = join(dir, name);
       const stat = lstatSync(path);
       if ((name === "index" || name === "index.lock") && stat.isFile() && holdsIndex(dir)) continue;
       const kind = stat.isDirectory() ? "d" : stat.isSymbolicLink() ? "l" : stat.isFile() ? "f" : "o";
-      entries.push(`${root}\0${path.slice(root.length + 1)}\0${kind}\0${stat.size}\0${stat.mtimeMs}\0${stat.ino}\0${stat.mode}\0${kind === "l" ? readlinkSync(path) : ""}`);
+      if (dir === objects && kind === "d" && OBJECT_STORAGE.test(name)) continue;
+      const times = path === objects && kind === "d" ? "-\0-" : `${stat.size}\0${stat.mtimeMs}`;
+      entries.push(`${root}\0${path.slice(root.length + 1)}\0${kind}\0${times}\0${stat.ino}\0${stat.mode}\0${kind === "l" ? readlinkSync(path) : ""}`);
       if (kind === "d") walk(root, path, depth + 1);
     }
   };
@@ -610,26 +629,13 @@ const readWorktreePath = (
 };
 
 /**
- * The one untracked path under `.claude` a scan passes over. Claude Code writes it in its working
- * directory while a session holds a session-only cron, and a resident CTO runs in the registered
- * clone that worker turns also use. It is the CLI's runtime cron lock, not agent configuration: no
- * CLI loads settings, permissions, hooks or servers from it. Only a regular file at exactly this
- * root path, under a real `.claude` directory, is passed over; anything else there (a symlink, a
- * directory, even an empty one, a fifo) is unsafe agent configuration, and every other `.claude` path
- * or `.mcp.json` is reported as before. Never an entry, so never committed.
- */
-export const CLAUDE_CRON_LOCK_PATH = ".claude/scheduled_tasks.lock";
-
-const isClaudeCronLock = (workTree: string, path: string): boolean =>
-  path === CLAUDE_CRON_LOCK_PATH &&
-  lstatOrNull(join(workTree, ".claude"))?.isDirectory() === true &&
-  lstatOrNull(join(workTree, CLAUDE_CRON_LOCK_PATH))?.isFile() === true;
-
-/**
  * The worktree against a tree: tracked paths whose bytes or mode differ, untracked paths git does not
- * ignore, and the root's untracked agent configuration; an untracked `CLAUDE_CRON_LOCK_PATH` is in
- * neither. Computed from the raw bytes; git is asked only for the tree (`ls-tree`) and, over a private
- * index read from that tree, for untracked names.
+ * ignore, and the root's untracked agent configuration. Computed from the raw bytes; git is asked only
+ * for the tree (`ls-tree`) and, over a private index read from that tree, for untracked names.
+ *
+ * #1227 — nothing is passed over. A resident CTO's Claude Code session cron lock
+ * (`.claude/scheduled_tasks.lock`) is written in the resident's clone, which worker turns no longer
+ * use (registry/worker-checkout.ts); one in a worker checkout is untracked agent configuration.
  */
 export const scanAgainst = async (
   repo: PinnedRepository,
@@ -647,13 +653,12 @@ export const scanAgainst = async (
   }
   const index = join(repo.scratch, `${label}.index`);
   await must(repo, ["read-tree", treeIsh], { index });
-  const counted = (path: string): boolean => path !== "" && !isClaudeCronLock(repo.workTree, path);
-  const untracked = (await must(repo, ["ls-files", "-z", "--others", "--exclude-standard"], { index })).split("\0").filter(counted);
+  const untracked = (await must(repo, ["ls-files", "-z", "--others", "--exclude-standard"], { index })).split("\0").filter(Boolean);
   const untrackedAgentConfiguration = (await must(
     repo,
     ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", ".claude", ".mcp.json"],
     { index },
-  )).split("\0").filter(counted);
+  )).split("\0").filter(Boolean);
 
   const entries: WorkerDiffEntry[] = [];
   const unsafe: string[] = [];
@@ -681,15 +686,6 @@ export const scanAgainst = async (
     const now = readWorktreePath(repo.workTree, path.replace(/\/$/, ""), format);
     if (now.kind === "entry") entries.push(now.entry);
     else unsafe.push(path);
-  }
-  // Git lists no empty directory, fifo or socket, so the reserved lock path is read directly: anything
-  // there but a regular file is unsafe agent configuration, whatever git listed.
-  const reserved = lstatOrNull(join(repo.workTree, CLAUDE_CRON_LOCK_PATH));
-  if (reserved !== null && !reserved.isFile()) {
-    if (!unsafe.includes(CLAUDE_CRON_LOCK_PATH)) unsafe.push(CLAUDE_CRON_LOCK_PATH);
-    if (!tracked.has(CLAUDE_CRON_LOCK_PATH) && !untrackedAgentConfiguration.includes(CLAUDE_CRON_LOCK_PATH)) {
-      untrackedAgentConfiguration.push(CLAUDE_CRON_LOCK_PATH);
-    }
   }
   return {
     entries: entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)),

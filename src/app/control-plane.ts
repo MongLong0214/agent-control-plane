@@ -32,6 +32,7 @@ import { Outbox } from "../outbox/outbox.ts";
 import { ProjectRegistry, type ManagedManifestWrite } from "../registry/project-registry.ts";
 import { ManifestActivationGrants } from "../registry/manifest-activation-grants.ts";
 import { RepositoryRegistry } from "../registry/repository-registry.ts";
+import { WorkerCheckouts } from "../registry/worker-checkout.ts";
 import { ConversationalActorRegistry } from "../registry/conversational-actor-registry.ts";
 import { BlindReviewGate, type ReviewerPreference } from "../review/blind-review.ts";
 import { CandidatePipeline } from "../run/candidate-pipeline.ts";
@@ -325,6 +326,8 @@ export class ControlPlane {
   readonly repair: RepairService;
   readonly hostProjectProvisioner: HostProjectProvisioner | null;
   readonly residentProjects: ResidentProjectProvisioning;
+  /** #1227 — moves each resident project's worker turns off the resident's clone, into their own checkout. */
+  readonly workerCheckouts: WorkerCheckouts;
   readonly bootstrap: BootstrapActivation;
   /** Issue #246 — performs a bootstrap plan's GitHub writes, then hands the result to `bootstrap`. */
   readonly bootstrapProducer: RepoFactoryBootstrapRunner;
@@ -688,6 +691,7 @@ export class ControlPlane {
         this.db, this.clock, this.audit, this.artifacts, this.claims, this.worktrees,
         this.repositories, this.guard, this.#repairWorktreeAuthority,
       );
+      this.workerCheckouts = new WorkerCheckouts(this.db, this.clock, this.audit, this.guard, this.#repairWorktreeAuthority);
       this.doctor = new Doctor(
         this.db, this.clock, this.audit, this.projects, this.repositories, this.sessions,
         this.bindings, this.runs, this.tasks, this.claims, this.capacity, this.providers, this.continuity,
