@@ -1,0 +1,22 @@
+Limit: the execution-output excerpt is redacted with the db/audit.ts pattern list, not sandbox.ts CREDENTIAL_VALUE_SHAPES, so a bare long base64 secret can reach the reviewer; unifying the two lists is a follow-up
+Limit: a candidate built from more than one worker turn, or whose base moved between the worker turn and the freeze, shows its receipt as a base mismatch rather than linked; output exists only for results recorded after this change, older and CI results say not retained
+Warn: the execution evidence is untrusted data: a receipt is linked only when its recorded inputs reproduce the execution resultDigest, task, commitHead, base and recomputed diffDigest all match the frozen candidate; config files are read only from the candidate head's git objects by an explicit argv rule and never by guessing
+Record-Id: r-47484ef99591
+Provenance: inherited 4fd3c11aca78541527890fc093de0d934f98fbf7
+
+Limit: the shared credential-shape list has two scopes: text (every shape, for reviewer-visible output, config files and agent CLI env values) and evidence (without long-base64, for the artifact store and audit), because ACP's own sha256 digests, bodyBase64 and 64-hex ids match long-base64 by construction; a long-base64 secret placed directly in a structured evidence field is not refused there
+Warn: redaction covers only the listed shapes and runs before any truncation (whole stream, then the cut, then again, and again at the review side); 'no leak' holds only for these shapes and the verified counterexamples, and over-redacted hex digests show as redacted
+Record-Id: r-cc303b3858e3
+Provenance: inherited e04d5690174758c7bccde8af0442d5234de95101
+
+Limit: fields defined as repository paths (touchedPaths, coveredFiles, finding paths, genesis/workflow/evidence file paths and the audit paths keys) are checked one '/'-separated segment at a time with every credential shape, so a long Java path is storable while a credential-shaped segment is still refused; free text keeps full-text scope and the path-escape checks are unchanged (CEO 10-26)
+Limit: in the audit store only an exact sha256:<64hex> token in a reason and the id right after /generation- in resolvedPath are set aside before the other shapes run; reviewer findings and API facts are redacted before storage and marked redacted:true, while the verdict and the bootstrap intent's over-bound refusal are unchanged (CEO five-case decision)
+Warn: omittedItems stays on full-text scope, so a coverage key naming a long Java path still gets an incomplete-review packet refused; a base64 secret containing '/' splits into short segments at path fields and is not detected there; redaction covers only the listed shapes
+Record-Id: r-c1e3811e2717
+Provenance: inherited 2af9860a02fc076b4e4f554db41b4c9b14a7dc7d
+
+Limit: only whole values that exactly match an ACP id format in ACP_ID_FORMATS (sha256:<64hex>, a bare 64-hex digest, buzz-message ids, manifest refs and the listed recovery keys) are exempt from the long-base64 shape; a 64-hex run inside free text such as detail or reasonCode is a credential shape (review #1223-R3 P1)
+Limit: the execution-to-commit receipt check hashes each changed blob's raw bytes (git cat-file blob read as latin1) through the worker's workerDiffDigest, so binary changes link; config files still decode as strict UTF-8 (review #1223-R3 P2)
+Warn: a hex-encoded secret stored on its own as an entire field value still matches the bare 64-hex id format and passes; the filter covers the listed shapes only
+Record-Id: r-de62b975a4fd
+Provenance: inherited 25d27cb5eaa6d93efc18e663f9ed296cc68dca97
