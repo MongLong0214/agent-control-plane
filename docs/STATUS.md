@@ -109,8 +109,9 @@ Named here because a green suite otherwise reads as coverage of them.
   polled process budget (`ProcessLimitMode` in `src/verify/sandbox.ts`) and may spawn. A
   descendant created and reparented between two polls is neither counted against the budget nor
   killed, and the outcome can still be a pass. The supervisor runs as the same user in the same
-  sandbox, so a candidate that SIGKILLs it ends the run without a pass but leaves descendants
-  outside the launched process group unreaped. This is a known, accepted, non-blocking limit.
+  sandbox, so a candidate that SIGKILLs it ends the run without a pass, with containment recorded
+  as unproven, but leaves descendants outside the launched process group unreaped. This is a
+  known, accepted, non-blocking limit.
   Gate commands keep RLIMIT_NPROC 1 and cannot spawn at all.
 
 - **The full-vertical e2e is off by default.** `tests/e2e/real-component-integration.test.ts`

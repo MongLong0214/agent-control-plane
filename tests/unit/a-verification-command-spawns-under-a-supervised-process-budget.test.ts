@@ -231,6 +231,70 @@ setTimeout(() => { const line = 'x'.repeat(1000); for (;;) process.stdout.write(
     expect(await survivorsAfterOutcome(worktree)).toEqual([]);
   });
 
+  it("FAILs a candidate whose descendant is still running when it exits, even if that descendant ends moments later", async (context) => {
+    requireSeatbelt(context);
+    const worktree = tempDir("acp-budget-outlived-briefly-");
+    // The child waits on a pipe only the candidate holds, so it is running at the instant the
+    // candidate exits and ends a few milliseconds after -- inside the supervisor's settling turns,
+    // which a verdict read after those turns would no longer see.
+    writeFiles(worktree, {
+      "brief.js": [
+        "const { spawn } = require('node:child_process');",
+        "spawn('/bin/sh', ['-c', 'read line; /bin/sleep 0.005'], { stdio: ['pipe', 'ignore', 'ignore'] });",
+        "setTimeout(() => process.exit(0), 300);",
+        "",
+      ].join("\n"),
+    });
+
+    const outcome = await budgetRun(worktree, ["node", "brief.js"]);
+
+    expect(outcome, described(outcome)).toMatchObject({
+      status: "FAIL",
+      exitCode: 121,
+      reasonCode: ReasonCode.VERIFICATION_COMMAND_FAILED,
+    });
+    expect(outcome.stderr).toContain(`${DESCENDANT_OUTLIVED_CANDIDATE}:`);
+  });
+
+  it("does not claim containment, or pass, when the candidate kills its supervisor", async (context) => {
+    requireSeatbelt(context);
+    const worktree = tempDir("acp-budget-supervisor-killed-");
+    // The probe is tracked before the supervisor dies, and only the supervisor tracked it. It is the
+    // residual this case documents rather than asserts on: with the supervisor gone nothing reaps a
+    // probe that left the launched group, so the cleanup below kills it.
+    writeFiles(worktree, {
+      "kill-supervisor.js": probeSpawner(`
+probe(true);
+setTimeout(() => { process.kill(process.ppid, 'SIGKILL'); setTimeout(() => process.exit(0), 100); }, 300);
+`),
+    });
+
+    const outcome = await budgetRun(worktree, ["node", "kill-supervisor.js"]);
+    await survivorsAfterOutcome(worktree);
+
+    expect(outcome, described(outcome)).toMatchObject({
+      status: "ERROR",
+      signal: "SIGKILL",
+      reasonCode: ReasonCode.SANDBOX_CHILD_CLEANUP_FAILED,
+      enforcement: { processLimit: "supervised-budget", childContainmentEnforced: false },
+    });
+    expect(outcome.enforcement.childContainmentReason).toContain("supervisor");
+  });
+
+  it("records a candidate's own CPU-limit kill as SIGXCPU, exactly as without the budget", async (context) => {
+    requireSeatbelt(context);
+    const worktree = tempDir("acp-budget-cpu-");
+    writeFiles(worktree, { "spin.js": "for (;;) {}\n" });
+
+    const outcome = await budgetRun(worktree, ["node", "spin.js"], { maxCpuSeconds: 1, timeoutSeconds: 15 });
+
+    expect(outcome, described(outcome)).toMatchObject({
+      status: "ERROR",
+      signal: "SIGXCPU",
+      reasonCode: ReasonCode.SANDBOX_RESOURCE_LIMIT_EXCEEDED,
+    });
+  });
+
   it("FAILs closed, never reporting the candidate's own exit, when the child-list reader is unavailable", async (context) => {
     requireSeatbelt(context);
     const worktree = tempDir("acp-budget-no-reader-");

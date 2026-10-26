@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
 import { execFile } from "node:child_process";
 import { accessSync, constants as fsConstants, existsSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { constants as osConstants, homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import type { Readable } from "node:stream";
 import { promisify } from "node:util";
 
 import { sha256 } from "../core/digest.ts";
@@ -156,6 +157,27 @@ const PROCESS_LIMIT_EXCEEDED_EXIT = 123;
 const PROCESS_LIMIT_UNAVAILABLE_EXIT = 122;
 const DESCENDANT_OUTLIVED_EXIT = 121;
 
+/**
+ * The descriptor on which the supervisor reports the outcome it is about to end with (`exit <code>`
+ * or `signal <number>`). It is close-on-exec in the supervisor, so the candidate never holds it and
+ * cannot write a report; a supervisor whose end does not match its report -- killed by a signal,
+ * crashed, or ended before reporting -- has not reached one of its own outcomes.
+ */
+const SUPERVISOR_REPORT_FD = 3;
+
+/** Whether the launched supervisor ended exactly as it reported it would. */
+const supervisorEndedAsReported = (
+  report: string,
+  exit: { code: number | null; signal: NodeJS.Signals | null },
+): boolean => {
+  const reported = /^(exit|signal) (\d+)\n$/.exec(report);
+  if (!reported) return false;
+  const value = Number(reported[2]);
+  return reported[1] === "exit"
+    ? exit.signal === null && exit.code === value
+    : exit.code === null && exit.signal !== null && osConstants.signals[exit.signal] === value;
+};
+
 /*
  * The wrapper is trusted control-plane code. It lowers both soft and hard limits before
  * handing control to candidate code, so candidate code cannot raise them again. The
@@ -171,16 +193,19 @@ const DESCENDANT_OUTLIVED_EXIT = 121;
  *   found, and once they exceed the budget it freezes and kills every one of them and reports
  *   ACP_PROCESS_LIMIT_EXCEEDED. A child list it cannot read, or a supervisor that was stopped and
  *   continued -- it did not watch the tree meanwhile -- ends the run the same way, reported as
- *   ACP_PROCESS_LIMIT_UNAVAILABLE. A tracked descendant still running when the candidate exits is
- *   killed and reported as ACP_DESCENDANT_OUTLIVED_CANDIDATE, so the candidate's exit 0 does not
- *   pass. A signal that would end the supervisor makes it stop the tree first.
+ *   ACP_PROCESS_LIMIT_UNAVAILABLE. A tracked descendant running at the poll that sees the
+ *   candidate exit is killed and reported as ACP_DESCENDANT_OUTLIVED_CANDIDATE, so the candidate's
+ *   exit 0 does not pass -- even if that descendant ends during the settling turns that follow,
+ *   which serve only the cleanup proof. A signal that would end the supervisor makes it stop the
+ *   tree first. Every end the supervisor chooses is reported first on SUPERVISOR_REPORT_FD.
  *
  *   This is a supervised, polled budget, not a kernel limit, and it does not prevent escape. A
  *   descendant created and reparented between two polls is never seen (#461): it is neither
- *   counted nor killed. Between two polls the tree can grow past the budget before it is stopped.
- *   And the supervisor runs as the same user in the same sandbox, so the candidate can SIGKILL it:
- *   the outcome is then not a pass, but descendants that left the launched process group are not
- *   reaped.
+ *   counted nor killed. One that ends within a poll of the candidate's exit is not seen to outlive
+ *   it. Between two polls the tree can grow past the budget before it is stopped. And the
+ *   supervisor runs as the same user in the same sandbox, so the candidate can SIGKILL it: its end
+ *   then matches no report, so containment is recorded as unproven and the run cannot pass, but
+ *   descendants that left the launched process group are not reaped.
  *
  * The CPU and memory limits are per process and inherited, which is not the same as the
  * whole-tree budget. RLIMIT_CPU applies to each process on its own: every descendant starts with
@@ -200,6 +225,25 @@ const DESCENDANT_OUTLIVED_EXIT = 121;
 const RESOURCE_WRAPPER_PROGRAM = String.raw`
 import ctypes, errno, os, resource, signal, struct, sys, time
 
+REPORT_FD = ${SUPERVISOR_REPORT_FD}
+
+def finish(code=None, signum=None):
+    """End with one of the supervisor's own outcomes, first telling the trusted caller which one on
+    a descriptor the candidate never holds. An exit that does not match a report is not one of them."""
+    try:
+        os.write(REPORT_FD, (("signal %d" % signum) if signum is not None else ("exit %d" % code)).encode("ascii") + b"\n")
+    except OSError:
+        pass
+    if signum is not None:
+        # The supervisor may handle this signal itself; its default action is what ends it here.
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+        except (OSError, RuntimeError, ValueError):
+            pass
+        os.kill(os.getpid(), signum)
+        code = 128 + signum
+    sys.exit(code)
+
 def hard_limit(kind, value):
     soft, hard = resource.getrlimit(kind)
     if soft > value:
@@ -217,9 +261,11 @@ try:
     process_budget = int(sys.argv[4])
     if process_mode not in ("no-spawn", "budget") or process_budget < 1:
         raise RuntimeError("unknown process limit " + process_mode)
+    # Close-on-exec: the forked candidate drops the report descriptor when it execs.
+    os.set_inheritable(REPORT_FD, False)
 except Exception as error:
     print("ACP_RESOURCE_LIMIT_UNAVAILABLE:" + str(error), file=sys.stderr)
-    sys.exit(125)
+    finish(125)
 
 try:
     libproc = ctypes.CDLL(sys.argv[5], use_errno=True)
@@ -449,10 +495,16 @@ def supervise_budget(root_pid, budget):
         time.sleep(0.001)
 
     live = len(tree.known)
-    outlived = 0
+    outlived = set()
     if stop is None:
+        # The verdict is read here, at the poll that saw the candidate exit: a tracked descendant
+        # running now outlived it, even if it ends during the turns below.
+        tree.scan()
+        forget_exited(tree)
+        outlived = {pid for pid in tree.known if is_running(pid)}
         # As in fence_descendants: a few more turns of the child list before a child that was
-        # created as the candidate exited is reparented out of the tree.
+        # created as the candidate exited is reparented out of the tree. They serve the cleanup
+        # proof; they can only add to the verdict, never take a descendant out of it.
         for _ in range(20):
             tree.scan()
             time.sleep(0.001)
@@ -462,8 +514,8 @@ def supervise_budget(root_pid, budget):
             stop = "unavailable"
         elif live > budget:
             stop = "exceeded"
-        outlived = sum(1 for pid in tree.known if is_running(pid))
-    return stop, status, outlived, live, stop_tree(tree, not root_reaped)
+        outlived.update(pid for pid in tree.known if is_running(pid))
+    return stop, status, len(outlived), live, stop_tree(tree, not root_reaped)
 
 def report_candidate(pid):
     try:
@@ -500,38 +552,35 @@ if not report_candidate(candidate_pid):
     except ChildProcessError:
         pass
     print("ACP_CHILD_CLEANUP_UNAVAILABLE: candidate identity handshake failed", file=sys.stderr)
-    sys.exit(126)
+    finish(126)
 
 if process_mode == "no-spawn":
     reaped, candidate_status = fence_descendants(candidate_pid)
     if not reaped:
         print("ACP_CHILD_CLEANUP_UNAVAILABLE: descendant process remained", file=sys.stderr)
-        sys.exit(126)
+        finish(126)
 else:
     stop, candidate_status, outlived, live, cleaned = supervise_budget(candidate_pid, process_budget)
     if not cleaned:
         print("ACP_CHILD_CLEANUP_UNAVAILABLE: descendant process remained", file=sys.stderr)
-        sys.exit(126)
+        finish(126)
     if supervisor_signal is not None:
-        signal.signal(supervisor_signal, signal.SIG_DFL)
-        os.kill(os.getpid(), supervisor_signal)
-        sys.exit(128 + supervisor_signal)
+        finish(signum=supervisor_signal)
     if stop == "exceeded":
         print("${PROCESS_LIMIT_EXCEEDED}: %d live descendants exceeded the supervised budget of %d; the candidate tree was killed" % (live, process_budget), file=sys.stderr)
-        sys.exit(${PROCESS_LIMIT_EXCEEDED_EXIT})
+        finish(${PROCESS_LIMIT_EXCEEDED_EXIT})
     if stop == "unavailable":
         print("${PROCESS_LIMIT_UNAVAILABLE}: the supervisor could not watch the candidate's process tree; the candidate tree was killed", file=sys.stderr)
-        sys.exit(${PROCESS_LIMIT_UNAVAILABLE_EXIT})
+        finish(${PROCESS_LIMIT_UNAVAILABLE_EXIT})
     if outlived:
         print("${DESCENDANT_OUTLIVED_CANDIDATE}: %d tracked descendant(s) were still running when the candidate exited; they were killed" % outlived, file=sys.stderr)
         if os.WIFEXITED(candidate_status) and os.WEXITSTATUS(candidate_status) == 0:
-            sys.exit(${DESCENDANT_OUTLIVED_EXIT})
+            finish(${DESCENDANT_OUTLIVED_EXIT})
 if os.WIFEXITED(candidate_status):
-    sys.exit(os.WEXITSTATUS(candidate_status))
+    finish(os.WEXITSTATUS(candidate_status))
 if os.WIFSIGNALED(candidate_status):
-    os.kill(os.getpid(), os.WTERMSIG(candidate_status))
-    sys.exit(128 + os.WTERMSIG(candidate_status))
-sys.exit(125)
+    finish(signum=os.WTERMSIG(candidate_status))
+finish(125)
 `;
 
 /**
@@ -900,7 +949,12 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     cwd: targets.cwd,
     env,
     detached: true, // own process group so the timeout can reap the whole tree
-    stdio: ["ignore", "pipe", "pipe"],
+    // The fourth descriptor is SUPERVISOR_REPORT_FD, written only by the supervisor.
+    stdio: ["ignore", "pipe", "pipe", "pipe"],
+  });
+  let supervisorReport = "";
+  (child.stdio[SUPERVISOR_REPORT_FD] as Readable | null)?.on("data", (chunk: Buffer) => {
+    if (supervisorReport.length < 256) supervisorReport += chunk.toString("utf8");
   });
 
   let closeSeen = false;
@@ -1085,6 +1139,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     markContainmentLost("a process the supervisor did not track still held the candidate's output after the supervisor exited");
     child.stdout?.destroy();
     child.stderr?.destroy();
+    (child.stdio[SUPERVISOR_REPORT_FD] as Readable | null)?.destroy();
   };
   child.on("exit", () => {
     leaderExited = true;
@@ -1215,6 +1270,16 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     }
   } else if (!childContainmentReason && !killedByOurOwnLimit) {
     markContainmentLost("candidate identity was not captured, so containment could not be proved");
+  }
+  // Under the budget the supervisor is the only process that knows the candidate's descendants,
+  // so a supervisor that did not end with one of its own reported outcomes -- one the candidate
+  // killed, or one that crashed -- may have left tracked descendants running. Nothing here can
+  // reach them; containment is unproven and the run cannot pass. (Under no-spawn the candidate is
+  // the only process there can be, and it is reaped by identity above.)
+  if (supervisedBudget && observedCandidate !== null && !supervisorEndedAsReported(supervisorReport, exit)) {
+    markContainmentLost(
+      "the supervisor did not end with one of its own reported outcomes, so the candidate's descendants were not proven stopped",
+    );
   }
   // A process still in the launched group once its leader has exited outlived the command. It is
   // reaped, and the command does not pass: its exit status cannot speak for a process still running.
