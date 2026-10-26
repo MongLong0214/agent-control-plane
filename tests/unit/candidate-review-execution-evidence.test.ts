@@ -407,6 +407,15 @@ describe("official output is bounded, redacted and bound to its execution", () =
     expect(excerpt).toMatchObject({ boundaryFragmentWithheld: true, stderr: "partial stderr " });
     expect(excerpt.stdout).not.toContain(run.slice(0, 8));
     expect(excerpt.stdout.endsWith("x  ")).toBe(true);
+    // The sandbox's capture budget is shared by both streams, so a host's own stderr moves where stdout is
+    // cut. At every cut through or before the run, the stored stdout is the captured prefix with its
+    // trailing credential-alphabet run withheld: no fragment of the run survives.
+    const printed = `${filler}${run}\nafter the cut\n`;
+    for (let cut = filler.length - 10; cut <= filler.length + run.length; cut += 1) {
+      const swept = verificationOutputExcerpt(binding, printed.slice(0, cut), "host warning\n", true).stdout;
+      expect(swept, String(cut)).toBe(printed.slice(0, cut).replace(/\S+$/, ""));
+      expect(swept, String(cut)).not.toMatch(/Ab9|Zq7/);
+    }
     // #1223 R5: every character a shape accepts is in the cut alphabet, `~` of a bearer token included.
     const bearer = verificationOutputExcerpt(binding, "Bearer abcdefghij~klm", "", true);
     expect(bearer).toMatchObject({ boundaryFragmentWithheld: true, stdout: "Bearer " });
@@ -1057,7 +1066,10 @@ describe("#1223 R5: a serialized handoff path and an absent package.json", () =>
     const content = Buffer.from("class ObjectArrayIterator {}\n");
     return { schema: "acp.genesis-bundle.v1", commitMessage: "Create runnable project",
       files: [{ path, mode: "100644", contentBase64: content.toString("base64"), sha256: bytesDigest(content) }],
-      branches: { main: "main", integration: "dev", genesis: "genesis" }, labels: [], milestones: [], issues: [],
+      branches: { main: "main", integration: "dev", genesis: "genesis" }, labels: [],
+      // #1241: a genesis tracks its work as at least one issue in at least one milestone.
+      milestones: [{ key: "m1", title: "First increment", description: "first increment" }],
+      issues: [{ key: "i1", title: "Implement the iterator", body: "Implement ObjectArrayIterator", labels: [], milestoneKey: "m1" }],
       productIntent: { summary: "fixture", references: [], ownerInstructions: [] } } as GenesisBundle;
   };
 

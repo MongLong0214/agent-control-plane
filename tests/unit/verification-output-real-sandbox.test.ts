@@ -82,22 +82,30 @@ it("an official sandbox run's credential-shaped output is redacted before storag
 }, 120_000);
 
 /**
- * #1223 P1-B in the real sandbox: with maxOutputBytes 1024, 965 bytes ending in whitespace and then a
- * 60-character base64 run leave 59 of its characters at the capture cut, too few for the shape. The
- * failed run's stored excerpt withholds that fragment and says so.
+ * #1223 P1-B in the real sandbox: the capture cut at maxOutputBytes falls inside a base64 run, and the
+ * failed run's stored excerpt keeps no fragment of it. The 1024-byte budget is shared by both streams
+ * and a macOS runner adds its own stderr lines inside seatbelt (see the test above), so where stdout is
+ * cut depends on the host. The run is long enough that the cut falls inside it for any host stderr up to
+ * 600 bytes; where it fell is read from the excerpt, never assumed. The case of a fragment too short for
+ * any shape, at an exact cut, is witnessed without the sandbox in candidate-review-execution-evidence.
  */
 it("a capture cut through a credential keeps no fragment of it in the stored excerpt", async (ctx) => {
   if (!seatbeltStatus().applies) requireSeatbelt(ctx);
-  const run = `${"Ab9+/Zq7".repeat(7)}Ab9+`;
+  const filler = `${"x ".repeat(200)} `; // 401 bytes, ending in whitespace
+  const run = "Ab9+/Zq7".repeat(80); // 640 characters of the base64 alphabet, `+` and `/` included
   const { harness, outcome, stored } = await runPrinting(
-    `process.stdout.write(${JSON.stringify(`${"x ".repeat(482)} ${run}\nafter the cut\n`)});\n`, { maxOutputBytes: 1024 });
+    `process.stdout.write(${JSON.stringify(`${filler}${run}\nafter the cut\n`)});\n`, { maxOutputBytes: 1024 });
   try {
     const result = stored?.results[0];
     expect(result, JSON.stringify(outcome)).toMatchObject({ commandId: "print", source: "local", outputTruncated: true,
       enforcement: { mechanism: "seatbelt" } });
     expect(result!.status).not.toBe("PASS");
-    expect(result!.output).toMatchObject({ boundaryFragmentWithheld: true, redacted: false });
-    expect(result!.output!.stdout.endsWith("x  ")).toBe(true);
+    const excerpt = result!.output!;
+    // The cut fell inside the run: past the filler, before the run's end.
+    expect(excerpt.stdoutChars, `stderr took ${excerpt.stderrChars} of the budget`).toBeGreaterThan(filler.length);
+    expect(excerpt.stdoutChars).toBeLessThan(filler.length + run.length);
+    // Everything of the run before the cut is withheld, whether shorter or longer than a shape.
+    expect(excerpt).toMatchObject({ boundaryFragmentWithheld: true, redacted: false, stdout: filler });
     expect(JSON.stringify(stored)).not.toContain(run.slice(0, 8));
   } finally { harness.cp.close(); }
 }, 120_000);

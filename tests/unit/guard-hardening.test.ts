@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { symlinkSync } from "node:fs";
 
@@ -40,9 +40,10 @@ afterAll(cleanupTempDirs);
  * Regressions for the defects an independent GPT-5.6 Sol review found in the first
  * version of the guard. Each test names the class of bypass it closes.
  */
-const setup = (options: { probeFailsOnRepo?: boolean; probeErrorsFor?: string[] } = {}) => {
+const setup = (options: { probeFailsOnRepo?: boolean; probeErrorsFor?: string[]; canonicalRepo?: boolean } = {}) => {
   const core = makeCore();
-  const repo = makeRepo();
+  // `canonicalRepo` registers the checkout as the repository registry does: its canonical toplevel.
+  const repo = options.canonicalRepo === true ? realpathSync(makeRepo()) : makeRepo();
   const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
   const errorFor = options.probeFailsOnRepo ? [repo] : options.probeErrorsFor;
   const probe = errorFor
@@ -318,7 +319,7 @@ describe("P0-12 guarded worktree and source fences", () => {
   });
 
   it("routes real verification worktree add, remove, prune, and cleanup through consumed grants", async () => {
-    const { guard, audit, db, clock, seeded, repo } = setup();
+    const { guard, audit, db, clock, seeded, repo } = setup({ canonicalRepo: true });
     const manager = new WorktreeManager(tempDir("acp-guarded-worktrees-"));
     const path = manager.pathFor("real-guarded-worktree");
     recordVerificationTree(db, clock, seeded, repo, path, "real-guarded-worktree");
