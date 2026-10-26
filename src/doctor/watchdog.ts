@@ -24,8 +24,26 @@ export const DEFAULT_DEADLINES: WatchdogDeadlines = {
   outboxPendingMs: 10 * 60 * 1000,
 };
 
+/**
+ * #1189 C2 — an overdue resource as the CEO routing needs it: the run it belongs to, when there is one,
+ * and the instant its stall is measured from, which identifies the stall across ticks. An outbox stall
+ * also names its kind and role, so a stalled CEO notice is never routed to the CEO again.
+ */
+export interface WatchdogStall {
+  kind: string;
+  id: string;
+  runId: string | null;
+  since: string;
+  messageKind?: string;
+  roleKey?: string;
+}
+
+/** #1189 C2 — the CEO routing's record of a stall it routed. It is not progress of the run it names. */
+export const OWNERLESS_STALL_ROUTED = "OWNERLESS_STALL_ROUTED";
+
 export interface WatchdogTick {
   overdue: Array<{ kind: string; id: string; ageMs: number }>;
+  stalls: WatchdogStall[];
   triggered: Array<{ scope: DoctorScope; target: string | null }>;
   reports: DoctorReport[];
   ranAt: string;
@@ -53,6 +71,7 @@ export class Watchdog {
     const nowIso = this.clock.nowIso();
     const now = new Date(nowIso).getTime();
     const overdue: WatchdogTick["overdue"] = [];
+    const stalls: WatchdogStall[] = [];
     const scopes = new Map<string, { scope: DoctorScope; target: string | null }>();
     const stallFindings = new Map<string, Finding[]>();
     const addOverdue = (
@@ -63,8 +82,10 @@ export class Watchdog {
       id: string,
       ageMs: number,
       deadlineMs: number,
+      stall: Omit<WatchdogStall, "kind" | "id">,
     ): void => {
       overdue.push({ kind, id, ageMs });
+      stalls.push({ kind, id, ...stall });
       scopes.set(key, { scope, target });
       const findings = stallFindings.get(key) ?? [];
       findings.push({
@@ -97,6 +118,7 @@ export class Watchdog {
           execution.execution_id,
           ageMs,
           this.deadlines.taskActivityMs,
+          { runId: execution.run_id, since: execution.last_activity_at ?? execution.started_at },
         );
       }
     }
@@ -124,6 +146,7 @@ export class Watchdog {
 
       const key = `run:${attempt.run_id}`;
       overdue.push({ kind: "candidate_pipeline_attempt", id: attempt.attempt_id, ageMs });
+      stalls.push({ kind: "candidate_pipeline_attempt", id: attempt.attempt_id, runId: attempt.run_id, since: attempt.deadline_at });
       scopes.set(key, { scope: "run", target: attempt.run_id });
       const findings = stallFindings.get(key) ?? [];
       findings.push({
@@ -148,9 +171,10 @@ export class Watchdog {
       `SELECT run_id, dispatched_at FROM runs WHERE state = 'ACTIVE'`,
     )) {
       if (!run.dispatched_at) continue;
+      // A routed stall notice names the run without moving it, so it is not progress (#1189 C2).
       const lastEvent = this.db.get<{ at: string | null }>(
-        `SELECT MAX(at) AS at FROM audit_events WHERE run_id = ?`,
-        [run.run_id],
+        `SELECT MAX(at) AS at FROM audit_events WHERE run_id = ? AND kind <> ?`,
+        [run.run_id, OWNERLESS_STALL_ROUTED],
       );
       const since = new Date(lastEvent?.at ?? run.dispatched_at).getTime();
       const ageMs = now - since;
@@ -163,6 +187,7 @@ export class Watchdog {
           run.run_id,
           ageMs,
           this.deadlines.runProgressMs,
+          { runId: run.run_id, since: lastEvent?.at ?? run.dispatched_at },
         );
       }
     }
@@ -180,6 +205,7 @@ export class Watchdog {
           session.session_id,
           ageMs,
           this.deadlines.sessionStartMs,
+          { runId: null, since: session.created_at },
         );
       }
     }
@@ -194,11 +220,12 @@ export class Watchdog {
         claim.claimId,
         now - new Date(claim.expiresAt).getTime(),
         0,
+        { runId: claim.runId, since: claim.expiresAt },
       );
     }
 
-    for (const message of this.db.all<{ message_id: string; created_at: string }>(
-      `SELECT message_id, created_at FROM outbox WHERE status = 'PENDING'`,
+    for (const message of this.db.all<{ message_id: string; created_at: string; run_id: string | null; kind: string; role_key: string }>(
+      `SELECT message_id, created_at, run_id, kind, role_key FROM outbox WHERE status = 'PENDING'`,
     )) {
       const ageMs = now - new Date(message.created_at).getTime();
       if (ageMs > this.deadlines.outboxPendingMs) {
@@ -210,6 +237,7 @@ export class Watchdog {
           message.message_id,
           ageMs,
           this.deadlines.outboxPendingMs,
+          { runId: message.run_id, since: message.created_at, messageKind: message.kind, roleKey: message.role_key },
         );
       }
     }
@@ -235,6 +263,7 @@ export class Watchdog {
 
     return {
       overdue,
+      stalls,
       triggered: [...scopes.values()],
       reports,
       ranAt: this.clock.nowIso(),
