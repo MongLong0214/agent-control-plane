@@ -450,9 +450,10 @@ export const effectiveConfig = async (repo: PinnedRepository): Promise<string> =
 /**
  * Every entry of the pinned git dir(s): path, kind, size, mtime, inode, and a symlink's target. The
  * index is left out: the provider CLI's own `git status` rewrites its stat cache, and the control
- * plane never reads the real index after a turn.
+ * plane never reads the real index after a turn. One line per entry, its fields `\0`-separated and led
+ * by the root and the path relative to it; the order is the walk's, and the same tree gives the same list.
  */
-export const gitDirFingerprint = (repo: PinnedRepository): string => {
+export const gitDirEntries = (repo: PinnedRepository): string[] => {
   const roots = [...new Set([repo.commonDir, repo.gitDir])];
   const entries: string[] = [];
   const worktreesRoot = join(repo.commonDir, "worktrees");
@@ -470,7 +471,44 @@ export const gitDirFingerprint = (repo: PinnedRepository): string => {
     }
   };
   for (const root of roots) walk(root, root, 0);
-  return digestOf(entries);
+  return entries;
+};
+
+/** One git-dir entry that differs between two `gitDirEntries` readings; never its contents. */
+export interface GitDirChange {
+  change: "added" | "removed" | "changed";
+  /** The walk root the path is relative to: the pinned git dir, or a linked worktree's common dir. */
+  root: "gitDir" | "commonDir";
+  path: string;
+  kind: "file" | "directory" | "symlink" | "other";
+}
+
+const GIT_DIR_KINDS: Readonly<Record<string, GitDirChange["kind"]>> = { f: "file", d: "directory", l: "symlink", o: "other" };
+
+/**
+ * #1246 — which entries differ between two readings of the same walk (`gitDirEntries`): added,
+ * removed, or changed in any recorded field. Named by root, relative path and kind only, ordered by
+ * root and path. A removed entry has the kind it had; any other, the kind it has now.
+ */
+export const gitDirChanges = (repo: PinnedRepository, before: readonly string[], after: readonly string[]): GitDirChange[] => {
+  const keyed = (lines: readonly string[]): Map<string, string> =>
+    new Map(lines.map((line) => [line.split("\0", 2).join("\0"), line]));
+  const was = keyed(before);
+  const now = keyed(after);
+  const changes: GitDirChange[] = [];
+  for (const key of [...new Set([...was.keys(), ...now.keys()])].sort()) {
+    const previous = was.get(key);
+    const current = now.get(key);
+    if (previous === current) continue;
+    const [root = "", path = "", kind = "o"] = (current ?? previous)!.split("\0", 3);
+    changes.push({
+      change: previous === undefined ? "added" : current === undefined ? "removed" : "changed",
+      root: root === repo.gitDir ? "gitDir" : "commonDir",
+      path,
+      kind: GIT_DIR_KINDS[kind] ?? "other",
+    });
+  }
+  return changes;
 };
 
 const gitBlobId = (format: "sha1" | "sha256", bytes: Buffer): string =>

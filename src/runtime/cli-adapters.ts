@@ -789,6 +789,13 @@ const productionRunCli = async (
      * that leaves the group (`setsid`) is outside it and is left alone.
      */
     reapProcessGroup?: boolean;
+    /**
+     * #1246 — a WORKER turn. Its child runs with `GIT_OPTIONAL_LOCKS=0`, so the read-only git its
+     * prompt allows (`git status`, `git diff`) takes no optional lock and never rewrites the index as a
+     * side effect; a rewrite in a linked worktree's git dir refuses the turn GIT_DIR_CHANGED. Set by the
+     * Claude and Codex worker turns only.
+     */
+    workerTurn?: boolean;
   },
 ): Promise<{
   stdout: string;
@@ -853,6 +860,8 @@ const productionRunCli = async (
           options.providerCredentialDir,
           options.codexHome,
         );
+    // Set after the allowlist, so an inherited value cannot turn optional locks back on.
+    if (options.workerTurn === true && !isolated) environment["GIT_OPTIONAL_LOCKS"] = "0";
     if (egress) {
       // The child receives only the loopback proxy route. Do not let a caller-supplied
       // environment retain an alternate proxy, no-proxy escape hatch, or credentials.
@@ -2338,7 +2347,8 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     if (request.externalSessionId) {
       args.push(conversationFlag(request.conversation ?? "new"), request.externalSessionId);
     }
-    if (!request.readOnly && !request.isolation && request.managedWrite) {
+    const workerTurn = !request.readOnly && !request.isolation && request.managedWrite !== undefined;
+    if (workerTurn) {
       // #512 — a writable worker turn edits files without asking, and gets nothing else: no
       // `--allowedTools`, no Bash grant and no network grant are added. Its file writes reach only
       // the target the guard-backed broker authorised for this one invocation (the seatbelt below).
@@ -2393,6 +2403,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       // #1104 — a worker or CTO turn owns what its CLI leaves in its group, and ends it on every
       // completion under the holder's ownership proof. A packet reviewer's profile admits no holder.
       reapProcessGroup: request.isolation === undefined,
+      workerTurn,
     });
 
     let result: Awaited<ReturnType<typeof runCli>>;
@@ -3121,7 +3132,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       // fails closed. The broker still authorises the checkout before launch.
       writablePaths: [...writablePaths, ...this.codexWritableRoots(scratch)],
       readablePaths: { subtrees: this.codexWritableRoots(scratch) },
-      ...(gptWorkerTurn ? { sandbox: "codex-workspace-write" as const } : {}),
+      ...(gptWorkerTurn ? { sandbox: "codex-workspace-write" as const, workerTurn: true } : {}),
       ...(tracked ? { onSpawn: request.onSpawn, signal: request.signal, reapProcessGroup: true as const } : {}),
     });
     let result: Awaited<ReturnType<typeof runCli>>;

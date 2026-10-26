@@ -38,7 +38,8 @@ import {
   committedChanges,
   dotGitFingerprint,
   effectiveConfig,
-  gitDirFingerprint,
+  gitDirChanges,
+  gitDirEntries,
   headOf,
   ignoredPathState,
   ignoredPathsChanged,
@@ -263,8 +264,8 @@ interface TurnFacts extends DurableFacts {
   objectFormat: "sha1" | "sha256";
   /** `git config --list --show-origin` before the turn. */
   config: string;
-  /** Every git-dir file before the turn (bar the index). */
-  gitDirFingerprint: string;
+  /** Every git-dir entry before the turn (bar the index), as `gitDirEntries` read it. */
+  gitDirEntries: readonly string[];
   /** What the real index staged before the turn (`stagedContent`): its entries, never its stat cache. */
   stagedBaseline: string;
   /** #1097 — every ignored path's state before the turn (`ignoredPathState`), or why it could not be read. */
@@ -276,6 +277,9 @@ type IgnoredReading = { state: ReadonlyMap<string, string>; error: null } | { st
 
 /** How many changed ignored paths a receipt names; the total is always given. */
 const IGNORED_CHANGES_NAMED = 200;
+
+/** #1246 — how many differing git-dir entries a GIT_DIR_CHANGED refusal names; the total is always given. */
+const GIT_DIR_CHANGES_NAMED = 50;
 
 interface InFlightTurn {
   promise: Promise<void>;
@@ -294,7 +298,7 @@ type CommitOutcome =
 
 /** What the worktree shows after a turn, or why it could not be read safely. */
 interface Observation {
-  problem: { reason: string; reasonCode: ReasonCode; message: string } | null;
+  problem: { reason: string; reasonCode: ReasonCode; message: string; evidence?: Evidence } | null;
   entries: WorkerDiffEntry[];
   diffDigest: string | null;
   outOfScope: string[];
@@ -1249,7 +1253,7 @@ export class WorkerTurnRunner {
         config,
         stagedBaseline,
         ignoredBaseline,
-        gitDirFingerprint: gitDirFingerprint(repo),
+        gitDirEntries: gitDirEntries(repo),
       });
     } catch (error) {
       return deny(ReasonCode.PROBE_FAILED, "the claimed worktree could not be inspected", {
@@ -1717,6 +1721,7 @@ export class WorkerTurnRunner {
         reason: observed?.problem?.reason ?? "UNOBSERVED",
         reasonCode: observed?.problem?.reasonCode ?? ReasonCode.INTERNAL_ERROR,
         detail: observed?.problem?.message ?? null,
+        ...(observed?.problem?.evidence ?? {}),
       });
       return;
     }
@@ -1967,8 +1972,8 @@ export class WorkerTurnRunner {
    * git command run under it.
    */
   private async observe(facts: TurnFacts): Promise<Observation> {
-    const refused = (reason: string, reasonCode: ReasonCode, message: string): Observation => ({
-      problem: { reason, reasonCode, message },
+    const refused = (reason: string, reasonCode: ReasonCode, message: string, evidence?: Evidence): Observation => ({
+      problem: { reason, reasonCode, message, ...(evidence ? { evidence } : {}) },
       entries: [],
       diffDigest: null,
       outOfScope: [],
@@ -1979,8 +1984,15 @@ export class WorkerTurnRunner {
       if (dotGitFingerprint(repo.workTree) !== repo.dotGit) {
         return refused("GIT_INDIRECTION_CHANGED", ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "the worktree's .git entry changed during the turn");
       }
-      if (gitDirFingerprint(repo) !== facts.gitDirFingerprint) {
-        return refused("GIT_DIR_CHANGED", ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "a file of the git dir changed during the turn");
+      // #1246 — the refusal names what differs (root, relative path, kind; never contents), so a change no
+      // one expected can be traced to its writer.
+      const gitDir = gitDirEntries(repo);
+      const gitDirChanged = gitDirChanges(repo, facts.gitDirEntries, gitDir);
+      if (gitDirChanged.length > 0) {
+        return refused("GIT_DIR_CHANGED", ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "a file of the git dir changed during the turn", {
+          gitDirChanges: gitDirChanged.slice(0, GIT_DIR_CHANGES_NAMED),
+          gitDirChangeCount: gitDirChanged.length,
+        });
       }
       if ((await effectiveConfig(repo)) !== facts.config) {
         return refused("GIT_CONFIG_CHANGED", ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "the repository's effective git configuration changed during the turn");
