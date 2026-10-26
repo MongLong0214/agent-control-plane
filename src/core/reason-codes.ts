@@ -210,6 +210,12 @@ export const ReasonCode = {
   BINDING_REVOKED: "BINDING_REVOKED",
   BINDING_ALREADY_ACTIVE: "BINDING_ALREADY_ACTIVE",
   WORKER_BINDING_REQUIRED: "WORKER_BINDING_REQUIRED",
+  /**
+   * #1246 — the claimed worktree's repository keeps a split index (`core.splitIndex`, or a
+   * `sharedindex.*` file). Git touches the shared index on every read of it, so a worker turn cannot
+   * hold the git dir unchanged; the turn is refused before anything is prepared or launched.
+   */
+  WORKER_REPOSITORY_SPLIT_INDEX_UNSUPPORTED: "WORKER_REPOSITORY_SPLIT_INDEX_UNSUPPORTED",
   PRIMARY_CTO_ALREADY_BOUND: "PRIMARY_CTO_ALREADY_BOUND",
   SWITCHOVER_BLOCKED_ACTIVE_RUNS: "SWITCHOVER_BLOCKED_ACTIVE_RUNS",
   REVOCATION_BLOCKED_ACTIVE_RUNS: "REVOCATION_BLOCKED_ACTIVE_RUNS",

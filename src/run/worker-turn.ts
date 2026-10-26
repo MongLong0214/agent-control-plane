@@ -11,6 +11,7 @@ import { fixedRuntimes } from "../domain/fixed-role-runtime.ts";
 import { type FailureClass, Role, RunKind, SessionLifecycle, TaskState, roleKeyFor } from "../domain/types.ts";
 import { type ManagedWriteGuard, WriteOperation } from "../guard/managed-write-guard.ts";
 import { canonical } from "../guard/workspace-probe.ts";
+import { providerHome } from "../runtime/cli-adapters.ts";
 import type { InvocationResult, ProviderAdapter } from "../runtime/provider.ts";
 import { randomUUID } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
@@ -54,6 +55,7 @@ import {
   indexSnapshot,
   runPinnedGit,
   scanAgainst,
+  splitIndexOf,
   stagedAgainst,
   stagedContent,
   workerGitConfig,
@@ -1202,6 +1204,8 @@ export class WorkerTurnRunner {
       }
       if (!pinned.allowed) return pinned as Decision<never>;
       const repo = pinned.value;
+      const splitIndex = await splitIndexRefusal(repo, worktree);
+      if (splitIndex) return splitIndex;
       const objectFormat = await objectFormatOf(repo);
       const { head, branch } = await headOf(repo);
       if (!head) return deny(ReasonCode.PROBE_FAILED, "the claimed worktree has no HEAD commit", { worktreeId: worktree });
@@ -1256,7 +1260,7 @@ export class WorkerTurnRunner {
         config,
         stagedBaseline,
         ignoredBaseline,
-        workerGitConfig: await workerGitConfig(repo),
+        workerGitConfig: await workerGitConfig(repo, providerHome()),
         gitDirEntries: gitDirEntries(repo),
       });
     } catch (error) {
@@ -1306,6 +1310,9 @@ export class WorkerTurnRunner {
 
   private async prepareTaskBranchOn(repo: PinnedRepository, facts: DurableFacts, target: TaskWriteTarget): Promise<Decision<void>> {
     const worktree = facts.claim.worktree;
+    // #1246 — before the branch is made, moved or read through the index: nothing is left behind.
+    const splitIndex = await splitIndexRefusal(repo, worktree);
+    if (splitIndex) return splitIndex;
     const format = await objectFormatOf(repo);
     const { head, branch } = await headOf(repo);
     if (!head) return deny(ReasonCode.PROBE_FAILED, "the claimed worktree has no HEAD commit", { worktreeId: worktree });
@@ -2400,6 +2407,21 @@ const measurePartialMove = async (
  * (`TASK_BRANCH_CREATION_UNDONE`) so a later attempt may start afresh; an attempt whose own records
  * failed, or that left anything behind, stays unresolved and is not attempted again on its own.
  */
+/**
+ * #1246 — a repository with a split index is refused before a turn prepares or launches anything: git
+ * touches its shared index on every read, so the git dir the turn is held to cannot stay unchanged.
+ * The refusal names the setting, so the operator can turn it off.
+ */
+const splitIndexRefusal = async (repo: PinnedRepository, worktree: string): Promise<Decision<never> | null> => {
+  const split = await splitIndexOf(repo);
+  if (!split.configured && split.sharedIndexFiles.length === 0) return null;
+  return deny(
+    ReasonCode.WORKER_REPOSITORY_SPLIT_INDEX_UNSUPPORTED,
+    "the claimed worktree's repository keeps a split index (core.splitIndex); git touches its shared index on every read, so a worker turn cannot hold the git dir unchanged. Turn it off (`git config core.splitIndex false`, then `git update-index --no-split-index`) and run the turn again",
+    { worktreeId: worktree, setting: "core.splitIndex", configured: split.configured, sharedIndexFiles: split.sharedIndexFiles.length },
+  );
+};
+
 const switchToTaskBranch = async (
   repo: PinnedRepository,
   input: {

@@ -484,17 +484,38 @@ export const gitDirEntries = (repo: PinnedRepository): string[] => {
  * - `diff.<driver>.cachetextconv=false`, for every driver the repository's configuration names: a caching
  *   textconv driver stores its output as notes (`refs/notes/textconv/<driver>`, objects, a reflog) on a
  *   `git diff`, `show`, `log -p` or `blame`.
- * Read through the pinned git: the repository's configuration and what it includes. The worker's git
- * reads no global or system configuration (`productionRunCli`), so this is all of what it reads.
+ * Read through the pinned git with the HOME the worker's git has (`home`, the provider child's), so a
+ * `~/` in an `include.path` or `includeIf` resolves to the file the worker reads: the repository's
+ * configuration and everything it includes. The worker's git reads no global or system configuration
+ * (`productionRunCli`), so this is all of what it reads.
  */
-export const workerGitConfig = async (repo: PinnedRepository): Promise<Record<string, string>> => {
-  const cached = await runPinnedGit(repo, ["config", "-z", "--name-only", "--get-regexp", "^diff\\..*\\.cachetextconv$"]);
+export const workerGitConfig = async (repo: PinnedRepository, home: string | undefined): Promise<Record<string, string>> => {
+  const cached = await runPinnedGit(
+    repo,
+    ["config", "-z", "--name-only", "--get-regexp", "^diff\\..*\\.cachetextconv$"],
+    home === undefined ? {} : { extraEnv: { HOME: home } },
+  );
   if (cached.exitCode !== 0 && cached.exitCode !== 1) {
     throw new Error(`git config --get-regexp ${cached.exitCode === null ? "did not answer" : `exited ${cached.exitCode}`}: ${cached.stderr.slice(0, 300)}`);
   }
   const config: Record<string, string> = { "core.fsmonitor": "false" };
   for (const key of cached.exitCode === 0 ? cached.stdout.split("\0").filter(Boolean) : []) config[key] = "false";
   return config;
+};
+
+/**
+ * #1246 — whether the repository keeps a split index: `core.splitIndex` true in its configuration, or a
+ * `sharedindex.*` file in its git dir(s). Git freshens a shared index's mtime on every read of a split
+ * index, optional locks or not, so a turn on one always changes its git dir. Reads no index.
+ */
+export const splitIndexOf = async (repo: PinnedRepository): Promise<{ configured: boolean; sharedIndexFiles: string[] }> => {
+  const setting = await runPinnedGit(repo, ["config", "--type=bool", "--get", "core.splitIndex"]);
+  if (setting.exitCode !== 0 && setting.exitCode !== 1) {
+    throw new Error(`git config core.splitIndex ${setting.exitCode === null ? "did not answer" : `exited ${setting.exitCode}`}: ${setting.stderr.slice(0, 300)}`);
+  }
+  const sharedIndexFiles = [...new Set([repo.gitDir, repo.commonDir])]
+    .flatMap((dir) => readdirSync(dir).filter((name) => name.startsWith("sharedindex.")).map((name) => join(dir, name)));
+  return { configured: setting.exitCode === 0 && setting.stdout.trim() === "true", sharedIndexFiles };
 };
 
 /** One git-dir entry that differs between two `gitDirEntries` readings; never its contents. */

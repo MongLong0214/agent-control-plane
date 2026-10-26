@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
+import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ClaudeCliAdapter, CodexCliAdapter } from "../../src/runtime/cli-adapters.ts";
 import type { InvocationRequest, InvocationResult, ProviderAdapter } from "../../src/runtime/provider.ts";
 import { WorkerTurnRunner } from "../../src/run/worker-turn.ts";
@@ -30,7 +31,11 @@ import { FakeWorkerAdapter, seedWorkerWorld, type FakeTurnScript, type WorkerWor
  *   caching textconv driver's notes, or the builtin fsmonitor daemon's cookies. A worker that asks for
  *   the cache itself is still refused;
  * - (f) nor can the provider user's global configuration: a worker's git reads no global or system
- *   configuration (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`).
+ *   configuration (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`), nor a file the repository's
+ *   configuration includes from the provider's HOME (`include.path`, `includeIf`): discovery reads with
+ *   that same HOME;
+ * - (g) a repository that keeps a split index is refused before anything is prepared or launched
+ *   (WORKER_REPOSITORY_SPLIT_INDEX_UNSUPPORTED), naming `core.splitIndex`.
  */
 
 const adapters: FakeWorkerAdapter[] = [];
@@ -427,6 +432,75 @@ describe("#1246 (f) the provider user's global git configuration", () => {
       });
     } finally {
       rmSync(globalConfig, { force: true });
+    }
+  });
+});
+
+describe("#1246 (f) a file the repository's configuration includes from the provider's HOME", () => {
+  const CACHE = "[diff \"demo\"]\n\tcachetextconv = true\n";
+  const includes: Array<[string, (world: WorkerWorld) => [string, string]]> = [
+    ["include.path", () => ["include.path", "~/acp-1246-textconv-cache.inc"]],
+    ["includeIf gitdir", (world) => [`includeIf.gitdir:${realpathSync(join(world.repoPath, ".git"))}.path`, "~/acp-1246-textconv-cache.inc"]],
+  ];
+  for (const [name, include] of includes) {
+    it(`${name} = ~/…: discovery reads it with the worker's HOME, the worker's git diff stores no notes, and the turn succeeds`, async () => {
+      const included = join(process.env["HOME"]!, "acp-1246-textconv-cache.inc");
+      const world = textconvWorld({ cache: false });
+      const [key, value] = include(world);
+      gitSync(world.repoPath, ["config", key, value]);
+      writeFileSync(included, CACHE);
+      try {
+        const { report, outcome } = await codexTurn(world, { commands: [["diff"]] });
+        expect({ gitConfig: report.gitConfig, outcome, notes: notesRef(world) }).toEqual({
+          gitConfig: { "core.fsmonitor": "false", "diff.demo.cachetextconv": "false" },
+          outcome: { status: "SUCCEEDED", reason: null },
+          notes: null,
+        });
+      } finally {
+        rmSync(included, { force: true });
+      }
+    });
+  }
+});
+
+describe("#1246 (g) a repository that keeps a split index", () => {
+  /** Each variant, and what the refusal says of it: the setting, and how many shared index files. */
+  const variants: Array<[string, (repo: string) => void, { configured: boolean; sharedIndexFiles: number }]> = [
+    ["core.splitIndex true, its shared index written", (repo) => {
+      gitSync(repo, ["config", "core.splitIndex", "true"]);
+      gitSync(repo, ["update-index", "--split-index"]);
+    }, { configured: true, sharedIndexFiles: 1 }],
+    ["a shared index with core.splitIndex unset", (repo) => gitSync(repo, ["update-index", "--split-index"]), { configured: false, sharedIndexFiles: 1 }],
+    ["core.splitIndex true before any shared index exists", (repo) => gitSync(repo, ["config", "core.splitIndex", "true"]), { configured: true, sharedIndexFiles: 0 }],
+  ];
+
+  it("is refused before anything is prepared or launched, naming core.splitIndex, and nothing is left behind", async () => {
+    for (const [name, split, said] of variants) {
+      const world = freshRacyWorld("main");
+      split(world.repoPath);
+      const refs = gitSync(world.repoPath, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+      const branchRecords = world.audit.byKind("TASK_BRANCH_CREATED").length;
+      const adapter = new FakeWorkerAdapter(world.broker);
+      adapters.push(adapter);
+      const runner = new WorkerTurnRunner(
+        { db: world.db, clock: world.clock, audit: world.audit, tasks: world.tasks, guard: world.guard, workerAdapter: () => adapter as ProviderAdapter },
+        { pollMs: 10, scratchDir: (prefix) => tempDir(prefix) },
+      );
+      const started = await startTurn(runner, world);
+      expect(started, name).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.WORKER_REPOSITORY_SPLIT_INDEX_UNSUPPORTED,
+        message: expect.stringContaining("core.splitIndex"),
+        evidence: { setting: "core.splitIndex", ...said },
+      });
+      expect({
+        launches: adapter.launches,
+        executions: world.tasks.executions(world.runId).length,
+        head: gitSync(world.repoPath, ["symbolic-ref", "--short", "HEAD"]),
+        refs: gitSync(world.repoPath, ["for-each-ref", "--format=%(refname) %(objectname)"]),
+        branchRecords: world.audit.byKind("TASK_BRANCH_CREATED").length,
+        attempts: world.audit.byKind("TASK_BRANCH_CREATING").length,
+      }, name).toEqual({ launches: 0, executions: 0, head: "dev", refs, branchRecords, attempts: 0 });
     }
   });
 });

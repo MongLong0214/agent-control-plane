@@ -1831,6 +1831,13 @@ const INJECTED_GIT_CONFIG = /^GIT_CONFIG_(?:PARAMETERS|COUNT|KEY_\d+|VALUE_\d+)$
 const looksLikeCredential = (value: string): boolean => SECRET_VALUE_SHAPES.some((pattern) => pattern.test(value.trim()));
 
 /**
+ * The HOME an agent CLI child runs with (`runtimeEnvironment`): the invoking user's, where its provider
+ * login lives. #1246 — a WORKER turn's configuration discovery reads the repository's git config with
+ * this HOME too, so a `~/` include resolves to the file the worker's own git will read.
+ */
+export const providerHome = (): string | undefined => process.env["HOME"];
+
+/**
  * Constructed, never inherited: an agent CLI receives no daemon authority.
  *
  * What it *does* receive is its own provider identity. An agent session exists in order to
@@ -1849,7 +1856,7 @@ export const runtimeEnvironment = (
 ): NodeJS.ProcessEnv => {
   const environment: NodeJS.ProcessEnv = {
     PATH: agentPath(),
-    HOME: process.env["HOME"] ?? scratch,
+    HOME: providerHome() ?? scratch,
     // Both CLIs resolve their own login through the invoking user's keychain, and neither
     // finds it without USER. Measured, not assumed: with HOME alone `claude --print`
     // answers "Not logged in"; with USER added it authenticates.
