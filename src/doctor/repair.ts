@@ -27,9 +27,11 @@ import {
   unresolvedUnidentifiedOrphans,
 } from "../run/worker-orphan-release.ts";
 import { WorkerTurnEvent } from "../run/worker-turn.ts";
+import { CONTINUITY_HOLD_NON_MOVEMENT_KINDS, isRecordedMovement } from "../run/run-engine.ts";
 import {
   type RepairWorktreeAuthority,
   type ManagedWriteGuard,
+  ReadOperation,
   WorktreeAction,
   WriteOperation,
 } from "../guard/managed-write-guard.ts";
@@ -46,6 +48,9 @@ export type RepairAuthorization = "HERMES" | "OWNER";
 // default. The run-state machine is the single authority for deciding which states
 // are terminal and can release a verification tree.
 const VERIFICATION_WORKTREE_OWNER_RELEASE_STATES = TERMINAL_RUN_STATES;
+
+/** The guard's read operations, which it decides DIRECT without a grant to hold or consume. */
+const READ_OPERATIONS: ReadonlySet<unknown> = new Set(Object.values(ReadOperation));
 
 /** The exact admitted ingress operation used for owner-authorised repair. */
 export const REPAIR_OWNER_APPROVAL_OPERATION = "repair_execute";
@@ -429,11 +434,20 @@ export class RepairService {
     const otherLiveTasks = tasks.filter(row => row.task_id !== taskId && row.state !== "CANCELLED");
     const namesTask = (value: unknown): boolean => value === taskId ||
       (value !== null && typeof value === "object" && Object.values(value).some(namesTask));
+    // #1213 — a later record naming the task disqualifies the restore only if it may have changed something.
+    // It did not when the continuity-hold classification records its kind only as a refusal, deferral or
+    // ignored input, or reads its outcome as not applied (a refused guard evaluation), or when it is a guard
+    // evaluation of a read. Every other kind, one added later included, counts as a change.
+    const mayHaveChanged = (event: AuditRow): boolean =>
+      !CONTINUITY_HOLD_NON_MOVEMENT_KINDS.includes(event.kind) &&
+      !(event.kind === "MANAGED_WRITE_GUARD" && READ_OPERATIONS.has(event.evidence["operation"])) &&
+      isRecordedMovement({ kind: event.kind, reason_code: event.reasonCode, evidence_json: JSON.stringify(event.evidence) });
     // This repair's own reports name the task but are not subsequent task activity.
     // The one READY write is accepted only through alreadyRestored's receipt/timestamp check.
     const laterTaskEvents = events.filter(event => cancellation !== undefined && event.eventId > cancellation.eventId &&
       !(event.evidence["operationId"] === operation.id &&
-        ["REPAIR_DRY_RUN", "REPAIR_EXECUTED", "REPAIR_REFUSED"].includes(event.kind)) && namesTask(event.evidence));
+        ["REPAIR_DRY_RUN", "REPAIR_EXECUTED", "REPAIR_REFUSED"].includes(event.kind)) &&
+      namesTask(event.evidence) && mayHaveChanged(event));
     // Never copy event payloads (especially reason text) into repair reports or refusals.
     const eventEvidence = (event: AuditRow) => ({
       eventId: event.eventId, at: event.at, kind: event.kind, digest: digestOf(event.evidence),
