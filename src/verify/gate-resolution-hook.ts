@@ -26,7 +26,9 @@ import { pathToFileURL } from "node:url";
  * verdict is a failure, never a pass. What a specifier loads is then a function of the pinned bytes
  * alone. That also means a gate cannot load candidate code or dependencies in-process: it reads
  * candidate files as data. (Spawning a process does not escape the hook in production either: the
- * sandbox runs the command under RLIMIT_NPROC 1.)
+ * verification engine runs every command that runs a gate entry in the sandbox's `no-spawn` mode,
+ * under RLIMIT_NPROC 1. Other declared commands may spawn, under a supervised process budget, but
+ * they run no gate entry and no hook.)
  *
  * The preload is a `data:` URL ACP builds from this file, not a file it points at: nothing is read
  * from the candidate, the sandbox needs no read rule for ACP's own install, and the declared paths

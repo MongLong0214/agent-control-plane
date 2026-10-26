@@ -28,7 +28,6 @@ import {
   verifySnapshotFreshness,
 } from "../../src/snapshot/candidate-snapshot.ts";
 import {
-  __testing as sandboxTesting,
   buildSandboxEnvironment,
   memoryLimitForPlatform,
   runSandboxed,
@@ -345,7 +344,12 @@ describe("round-2 verification isolation and candidate freshness", () => {
   //
   // This is a real reduction in what CI proves. It is here, in STATUS.md and on #461 so that it
   // is visible in all three places rather than only where it is convenient.
-  sandboxIt.skip("#164 fences a detached descendant when RLIMIT_NPROC is unavailable", async () => {
+  //
+  // The race matters again now that a non-gate command runs under the supervised process budget
+  // instead of RLIMIT_NPROC 1, which is the mode this case runs in. When the fence wins, the
+  // descendant is killed and the run FAILs because it outlived the candidate; when it loses, the
+  // run passes with the descendant alive. Both assertions below fail on the second.
+  sandboxIt.skip("#164 fences a detached descendant under the supervised process budget", async () => {
     const repo = makeRepo();
     writeFileSync(
       join(repo, "detached.js"),
@@ -362,27 +366,25 @@ describe("round-2 verification isolation and candidate freshness", () => {
        });`,
     );
 
-    const { outcome, result } = await sandboxTesting.withProcessCountLimitDisabled(async () => {
-      const outcome = await runSandboxed({
-        command: parseVerificationCommand({
-          id: "detached",
-          argv: ["node", "detached.js"],
-          timeoutSeconds: 2,
-        }),
-        worktreePath: repo,
-      });
-      let result: { childPid: number | null; spawnError: string | null } | null = null;
-      try {
-        result = JSON.parse(outcome.stdout) as { childPid: number | null; spawnError: string | null };
-      } catch {
-        // The exact sandbox outcome below identifies a wrapper failure before output exists.
-      }
-      return { outcome, result };
+    const outcome = await runSandboxed({
+      command: parseVerificationCommand({
+        id: "detached",
+        argv: ["node", "detached.js"],
+        timeoutSeconds: 2,
+      }),
+      worktreePath: repo,
+      processLimit: "supervised-budget",
     });
+    let result: { childPid: number | null; spawnError: string | null } | null = null;
+    try {
+      result = JSON.parse(outcome.stdout) as { childPid: number | null; spawnError: string | null };
+    } catch {
+      // The exact sandbox outcome below identifies a wrapper failure before output exists.
+    }
 
     expect(outcome).toMatchObject({
-      status: "PASS",
-      reasonCode: null,
+      status: "FAIL",
+      reasonCode: ReasonCode.VERIFICATION_COMMAND_FAILED,
       enforcement: { resourceLimitsEnforced: true, childContainmentEnforced: true },
     });
     expect(result).toMatchObject({ childPid: expect.any(Number), spawnError: null });
@@ -946,6 +948,81 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     if (!verified.allowed) return;
     expect(verified.value).toMatchObject({ status: "PASS", results: [{ commandId: "verify", status: "PASS" }] });
     expect(vi.mocked(runSandboxed)).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * E2E-02 — the process limit follows the gate obligation the pinned manifest binds. A command that
+   * runs a gate entry still cannot spawn: its loader binds only what it loads in-process, and a
+   * spawned process would run outside it. Every other declared command may spawn, under the
+   * supervised process budget. Both run through the engine and the real sandbox.
+   */
+  const SPAWNING_GATE = [
+    "const { spawnSync } = require('node:child_process');",
+    "const spawned = spawnSync('/bin/echo', ['spawned']);",
+    "console.log('gate spawn: ' + (spawned.error ? spawned.error.code : 'status ' + spawned.status));",
+    "process.exit(spawned.error ? 0 : 1);",
+    "",
+  ].join("\n");
+  const verifyObserving = async (candidate: Awaited<ReturnType<typeof frozenPinnedCandidate>>) => {
+    const requests: Parameters<typeof runSandboxed>[0][] = [];
+    const outcomes: Awaited<ReturnType<typeof runSandboxed>>[] = [];
+    vi.mocked(runSandboxed).mockClear();
+    const real = vi.mocked(runSandboxed).getMockImplementation()!;
+    vi.mocked(runSandboxed).mockImplementation(async (input) => {
+      requests.push(input);
+      const outcome = await real(input);
+      outcomes.push(outcome);
+      return outcome;
+    });
+    try {
+      return { result: await verifyPinned(candidate), requests, outcomes };
+    } finally {
+      vi.mocked(runSandboxed).mockImplementation(real);
+    }
+  };
+
+  it("E2E-02: a gate command still cannot spawn: its spawn is refused EAGAIN, as under RLIMIT_NPROC 1 before", async () => {
+    const candidate = await frozenPinnedCandidate({
+      manifest: gateManifest([entry("gate/check.cjs", SPAWNING_GATE)]),
+      beforeRun: commitGate({ "gate/check.cjs": SPAWNING_GATE }),
+      candidateChange: (repo) => writeFiles(repo, { "src/app.js": "module.exports = () => 2;\n" }),
+    });
+
+    const { result, requests, outcomes } = await verifyObserving(candidate);
+    expect(requests.map((request) => request.processLimit)).toEqual(["no-spawn"]);
+    expect(outcomes[0]?.stdout, JSON.stringify(outcomes[0])).toContain("gate spawn: EAGAIN");
+    expect(result.allowed, result.allowed ? "" : `${result.reasonCode}: ${result.message}`).toBe(true);
+    if (!result.allowed) return;
+    expect(result.value).toMatchObject({ status: "PASS", results: [{ commandId: "verify", status: "PASS" }] });
+  });
+
+  it("E2E-02: a declared `npm test` that runs no gate entry spawns its runner under the supervised budget and passes", async () => {
+    const base = fixtureManifest("verify-r2-project");
+    const manifest: ProjectManifest = {
+      ...base,
+      verificationCommands: [{ ...base.verificationCommands[0]!, argv: ["npm", "test"] }],
+    };
+    const candidate = await frozenPinnedCandidate({
+      manifest,
+      candidateChange: (repo) => writeFiles(repo, {
+        "src/app.js": "module.exports = () => 2;\n",
+        "package.json": `${JSON.stringify({ name: "e2e-02", version: "1.0.0", scripts: { test: "node --test" } })}\n`,
+        "test/app.test.js": [
+          "const { test } = require('node:test');",
+          "const assert = require('node:assert/strict');",
+          "test('app returns 2', () => assert.equal(require('../src/app.js')(), 2));",
+          "",
+        ].join("\n"),
+      }),
+    });
+
+    const { result, requests, outcomes } = await verifyObserving(candidate);
+    expect(requests.map((request) => request.processLimit)).toEqual(["supervised-budget"]);
+    expect(outcomes[0], JSON.stringify(outcomes[0])).toMatchObject({ status: "PASS", exitCode: 0 });
+    expect(outcomes[0]?.stdout).toMatch(/^# pass 1$/m);
+    expect(result.allowed, result.allowed ? "" : `${result.reasonCode}: ${result.message}`).toBe(true);
+    if (!result.allowed) return;
+    expect(result.value).toMatchObject({ status: "PASS", results: [{ commandId: "verify", status: "PASS" }] });
   });
 
   it.each([

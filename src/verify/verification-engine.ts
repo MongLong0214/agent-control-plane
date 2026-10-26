@@ -772,6 +772,13 @@ export class VerificationEngine {
         // §33.3 — the control plane's own secret store and state must be unreadable to a
         // candidate, as must every other checkout on this machine.
         denyReadPaths: this.denyReadPaths(checkoutPath),
+        // A gate command cannot spawn at all (RLIMIT_NPROC 1): the loader above binds what it
+        // loads in-process only, and a spawned process would run outside it. Every other declared
+        // command -- `npm test`, a test runner -- needs children, and runs under the supervisor's
+        // polled process budget instead. See `ProcessLimitMode` in sandbox.ts. The choice follows
+        // `gateEntries`, this command's obligations under the run's pinned manifest, which the
+        // candidate cannot change; neither the command nor its environment carries a mode.
+        processLimit: gateEntries.length > 0 ? "no-spawn" : "supervised-budget",
       });
     } finally {
       if (worktree) {
