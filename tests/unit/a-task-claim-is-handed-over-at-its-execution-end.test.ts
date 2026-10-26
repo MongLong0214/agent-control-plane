@@ -289,7 +289,7 @@ const CRASH_CHILD = fileURLToPath(new URL("../helpers/s2-git-intent-crash-child.
 
 /** The live children of `parent` whose argv names a worker git gate (`acp-git-<nonce>`), from `ps`. */
 const gatesOf = (parent: number): number[] =>
-  execFileSync("/bin/ps", ["-axww", "-o", "pid=,ppid=,command="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })
+  execFileSync("/bin/ps", ["-axww", "-o", "pid=,ppid=,command="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: 10_000 })
     .split("\n")
     .map((line) => line.trim().split(/\s+/))
     .filter(([, ppid, ...command]) => Number(ppid) === parent && command.some((token) => token.startsWith("acp-git-")))
@@ -302,7 +302,7 @@ const gatesOf = (parent: number): number[] =>
  */
 const psReadable = (): boolean => {
   try {
-    return execFileSync("/bin/ps", ["-axww", "-o", "pid="], { encoding: "utf8" }).split("\n").some((line) => line.trim() === String(process.pid));
+    return execFileSync("/bin/ps", ["-axww", "-o", "pid="], { encoding: "utf8", timeout: 10_000 }).split("\n").some((line) => line.trim() === String(process.pid));
   } catch {
     return false;
   }
@@ -351,7 +351,7 @@ const crashRunner = async (
     if (input.mode !== "kill") {
       const watch = setInterval(() => {
         try {
-          const state = execFileSync("/bin/ps", ["-o", "stat=", "-p", String(runner.pid)], { encoding: "utf8" });
+          const state = execFileSync("/bin/ps", ["-o", "stat=", "-p", String(runner.pid)], { encoding: "utf8", timeout: 10_000 });
           if (state.trim().startsWith("T")) {
             clearInterval(watch);
             resolve("SIGSTOP");
