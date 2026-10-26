@@ -39,9 +39,42 @@ export interface TaskWriteTarget {
   paths: string[];
   /** The branch this one is cut from and integrates into: its declared parent under the branch contract. */
   declaredParent: string;
-  /** The run's pinned base commit for this repository. The branch is created here, never at a branch name. */
+  /**
+   * The run's pinned base commit for this repository. The branch is created here (or at `startsFrom`),
+   * never at a branch name.
+   */
   baseSha: string;
+  /**
+   * #1242 — only for a task whose dependsOn predecessors changed this repository: the commit its branch
+   * is created at instead of `baseSha`, which is those predecessors' SUCCEEDED commits integrated on
+   * `baseSha` (#1236's rules), and which predecessors it holds. Absent for every other task.
+   */
+  startsFrom?: StartsFrom;
 }
+
+/** #1242 — the base a task with dependsOn predecessors starts from. */
+export interface StartsFrom {
+  /** The integration of the predecessors' SUCCEEDED commits in this repository on the run's base. */
+  commit: string;
+  /** Each predecessor that commit holds, in integration order, with its commit. */
+  predecessors: Array<{ taskId: string; commit: string }>;
+}
+
+/**
+ * #1242 — builds a dependent task's `StartsFrom` and keeps it from gc. `predecessors` is every task the
+ * task depends on, directly or not, each SUCCEEDED. Null when none of them changed this repository.
+ */
+export type PredecessorBase = (input: {
+  runId: string;
+  taskId: string;
+  predecessors: readonly string[];
+  repositoryIdentity: string;
+  checkoutPath: string;
+  baseSha: string;
+}) => Promise<Decision<StartsFrom | null>>;
+
+/** #1242 — the commit a task's branch is created at: its predecessors' integration, or the run's base. */
+export const startOf = (target: Pick<TaskWriteTarget, "baseSha" | "startsFrom">): string => target.startsFrom?.commit ?? target.baseSha;
 
 export type WorkBranchClass = "task" | "hotfix";
 
@@ -258,6 +291,19 @@ const runBasePin = (db: Db, runId: string, repositoryIdentity: string): string |
     [TASK_WRITE_TARGET_RECORDED, runId, repositoryIdentity],
   )?.base ?? null;
 
+/** #1242 — every task `taskId` depends on in its run, directly or through another, with its state. */
+const predecessorsOf = (db: Db, runId: string, taskId: string): Array<{ taskId: string; state: string }> =>
+  db.all<{ taskId: string; state: string }>(
+    `WITH RECURSIVE up(task_id) AS (
+       SELECT depends_on FROM task_dependencies WHERE task_id = ?
+       UNION
+       SELECT d.depends_on FROM task_dependencies d JOIN up ON d.task_id = up.task_id
+     )
+     SELECT t.task_id AS taskId, t.state FROM up JOIN tasks t ON t.task_id = up.task_id
+      WHERE t.run_id = ? ORDER BY t.task_id`,
+    [taskId, runId],
+  );
+
 /** The latest write target the control plane recorded for a task, read from its audit record. */
 export const recordedWriteTarget = (db: Db, runId: string, taskId: string): TaskWriteTarget | null => {
   const row = db.get<{ evidence_json: string }>(
@@ -280,6 +326,8 @@ export interface TaskWriteTargetPorts {
   readonly audit: AuditLog;
   /** Private scratch for the pinned git reads; defaults to the control plane's scratch root. */
   readonly scratchDir?: (prefix: string) => string;
+  /** #1242 — builds the base a task with dependsOn predecessors starts from; without it such a task is refused. */
+  readonly predecessorBase?: PredecessorBase;
 }
 
 interface RepositoryFacts {
@@ -325,12 +373,27 @@ export class TaskWriteTargets {
     const existing = recordedWriteTarget(this.ports.db, runId, taskId);
     if (existing) return allow(ReasonCode.OK, existing);
 
+    // #1242 — a task starts from what the tasks it depends on left, so its target is recorded only once
+    // every one of them SUCCEEDED, as a worker is staffed only for a READY task.
+    const predecessors = predecessorsOf(this.ports.db, runId, taskId);
+    const unsatisfied = predecessors.filter((predecessor) => predecessor.state !== TaskState.SUCCEEDED);
+    if (unsatisfied.length > 0) {
+      return deny(
+        ReasonCode.TASK_DEPENDENCY_UNSATISFIED,
+        "a task this one depends on has not SUCCEEDED; its write target, and the base it starts from, are recorded only once every one has",
+        { taskId, unsatisfied: unsatisfied.slice(0, 20) },
+      );
+    }
+
     const derived = this.derive(runId, run.pinned_manifest_digest, taskId);
     if (!derived.allowed) return derived as Decision<never>;
     const base = await this.pinnedBase(runId, derived.value.repository);
     if (!base.allowed) return base as Decision<never>;
+    const start = await this.startFrom(runId, taskId, predecessors.map((predecessor) => predecessor.taskId), derived.value.repository, base.value);
+    if (!start.allowed) return start as Decision<never>;
+    const startsFrom = start.value;
     if (derived.value.pathFromScope) {
-      const file = await this.fileAtBase(derived.value.repository, base.value, derived.value.target.paths[0]!);
+      const file = await this.fileAtBase(derived.value.repository, startsFrom?.commit ?? base.value, derived.value.target.paths[0]!);
       if (!file.allowed) return file as Decision<never>;
     }
     // Every refusal comes before the first write; a failed audit write throws and takes the spec
@@ -342,16 +405,17 @@ export class TaskWriteTargets {
       if (raced) return allow(ReasonCode.OK, raced);
       // c98ea8a3 (S-TB-04) — one base per run and repository, decided here, in the transaction that
       // writes: a concurrent recording that committed first pinned it, and this one takes that pin.
-      // A path that stood only as a file at the base this one read is not carried to another base.
+      // A path that stood only as a file at the base this one read, or a start built on that base
+      // (#1242), is not carried to another base.
       const pinned = runBasePin(this.ports.db, runId, derived.value.repository.identity);
-      if (pinned !== null && pinned !== base.value && derived.value.pathFromScope) {
+      if (pinned !== null && pinned !== base.value && (derived.value.pathFromScope || startsFrom !== null)) {
         return deny(ReasonCode.CONFLICT, "the run's base was pinned at another commit while this target was derived; it is derived again from that pin", {
           taskId,
           pinnedBase: pinned,
           readBase: base.value,
         });
       }
-      const target: TaskWriteTarget = { ...derived.value.target, baseSha: pinned ?? base.value };
+      const target: TaskWriteTarget = { ...derived.value.target, baseSha: pinned ?? base.value, ...(startsFrom ? { startsFrom } : {}) };
       const task = this.ports.db.get<{ spec_json: string }>(
         `SELECT spec_json FROM tasks WHERE task_id = ? AND run_id = ?`,
         [taskId, runId],
@@ -511,6 +575,27 @@ export class TaskWriteTargets {
       branchClass: branch.value.branchClass,
       pathFromScope,
     });
+  }
+
+  /**
+   * #1242 — where a task's branch starts: null for a task that depends on nothing, which starts at the
+   * run's base exactly as before; otherwise what `predecessorBase` builds from its predecessors, or its
+   * refusal. A door without `predecessorBase` refuses such a task rather than start it at the base.
+   */
+  private async startFrom(
+    runId: string,
+    taskId: string,
+    predecessors: readonly string[],
+    repository: RepositoryFacts,
+    baseSha: string,
+  ): Promise<Decision<StartsFrom | null>> {
+    if (predecessors.length === 0) return allow(ReasonCode.OK, null);
+    if (!this.ports.predecessorBase) {
+      return deny(ReasonCode.INTERNAL_ERROR, "this door cannot build the base a task with dependsOn predecessors starts from; it is not started at the run's base instead", {
+        taskId,
+      });
+    }
+    return this.ports.predecessorBase({ runId, taskId, predecessors, repositoryIdentity: repository.identity, checkoutPath: repository.checkoutPath, baseSha });
   }
 
   /**

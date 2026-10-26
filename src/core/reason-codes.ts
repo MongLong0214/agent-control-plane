@@ -187,6 +187,19 @@ export const ReasonCode = {
   // --- task ----------------------------------------------------------------
   TASK_DEPENDENCY_UNSATISFIED: "TASK_DEPENDENCY_UNSATISFIED",
   TASK_DEPENDENCY_CYCLE: "TASK_DEPENDENCY_CYCLE",
+  /**
+   * #1242 — a task with dependsOn predecessors starts from their SUCCEEDED commits integrated on the
+   * run's pinned base, and one of those predecessors has no commit that can be read: no SUCCEEDED
+   * receipt naming one, no recorded write target, or a commit its repository no longer holds. Its
+   * write target is refused, never recorded at the run's base instead.
+   */
+  TASK_PREDECESSOR_COMMIT_MISSING: "TASK_PREDECESSOR_COMMIT_MISSING",
+  /**
+   * #1242 — two of a task's dependsOn predecessors change one path, or a path and one beneath it, and
+   * neither is built on the other, so no base holding both can be made (freeze's rule, #1236). Its
+   * write target is refused, never recorded at the run's base instead.
+   */
+  TASK_PREDECESSORS_OVERLAP: "TASK_PREDECESSORS_OVERLAP",
   TASK_RECEIPT_MISSING: "TASK_RECEIPT_MISSING",
   TASK_RESULT_COUNT_MISMATCH: "TASK_RESULT_COUNT_MISMATCH",
 
@@ -367,6 +380,12 @@ export const ReasonCode = {
   RELEASE_TAG_COMMIT_NOT_ACCEPTED: "RELEASE_TAG_COMMIT_NOT_ACCEPTED",
   RELEASE_TAG_DUPLICATE: "RELEASE_TAG_DUPLICATE",
   ISSUE_PROJECTION_UNVERIFIED: "ISSUE_PROJECTION_UNVERIFIED",
+  /**
+   * #1240 — a Repo Factory project's STANDARD_WORK run has approved work units that GitHub has not
+   * been read back to hold as issues linked to the run's goal milestone; none of the run's work is
+   * admitted to execution until it has. The evidence names each untracked unit and what is unmet.
+   */
+  WORK_SCOPE_NOT_TRACKED_ON_GITHUB: "WORK_SCOPE_NOT_TRACKED_ON_GITHUB",
   HOTFIX_PROPAGATION_INCOMPLETE: "HOTFIX_PROPAGATION_INCOMPLETE",
 
   // --- capacity ------------------------------------------------------------

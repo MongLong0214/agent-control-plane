@@ -1,6 +1,6 @@
 import { frozenBootstrapCeoDecisions, type AuthenticatedCeoDecision } from "./bootstrap-ceo-decisions.ts";
 import { MCP_MUTATION_RECOVERY } from "../core/mcp-recovery.ts";
-import { parseGenesis, genesisDigest, bytesDigest, type GenesisBundle } from './genesis-bundle.ts';
+import { parseGenesis, genesisDigest, genesisRefusalOf, bytesDigest, type GenesisBundle } from './genesis-bundle.ts';
 import { z } from "zod";
 import { BOOTSTRAP_POST_CONFIRM_LIFECYCLE, type BootstrapLifecycleItem } from "./bootstrap-lifecycle.ts";
 
@@ -782,7 +782,11 @@ export const planForSubmission = (
       const githubOperations = executableOperationsSchema.parse(expanded);
       if (canonicalJson(githubOperations.map(o => ({...o,operationId:""}))) !== canonicalJson([...base.slice(0,3),...bootstrap,...base.slice(3),...resources].map(o => ({...o,operationId:""})))) throw new Error("genesis operation order/state differs from the shared contract");
       return allow(ReasonCode.OK,{...rest,genesis,genesisDigest:genesisDigest(genesis),githubOperations,projectManifest:manifest.value});
-    } catch {return deny(ReasonCode.INVALID_ARGUMENT,"genesis bundle/manifest refused",{refusal:"GENESIS_INVALID"});}
+    } catch (error) {
+      // #1240 — a traced-backlog refusal names what is wrong; every other failure stays opaque, as it was.
+      const traced = genesisRefusalOf(error);
+      return deny(ReasonCode.INVALID_ARGUMENT,traced ? `genesis bundle refused: ${(error as Error).message}` : "genesis bundle/manifest refused",{refusal:"GENESIS_INVALID",...(traced ? {genesisRefusal:traced} : {})});
+    }
   }
   return allow(ReasonCode.OK, { ...rest, projectManifest: manifest.value });
 };
@@ -869,7 +873,7 @@ export const bootstrapPlanGuide = (): BootstrapPlanGuide => {
   const placeholders = BOOTSTRAP_PLAN_GUIDE_PLACEHOLDERS;
   const test = "const assert = require('node:assert/strict'); assert.equal(2 + 2, 4);\n";
   const workflow = "name: ci\non: [push, pull_request]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n      - run: node test.js\n";
-  const genesis:GenesisBundle = {schema:"acp.genesis-bundle.v1",commitMessage:"Create runnable project",files:[{path:"test.js",mode:"100644",contentBase64:Buffer.from(test).toString("base64"),sha256:bytesDigest(Buffer.from(test))},{path:".github/workflows/ci.yml",mode:"100644",contentBase64:Buffer.from(workflow).toString("base64"),sha256:bytesDigest(Buffer.from(workflow))}],branches:{main:"main",integration:"dev",genesis:"genesis"},labels:[],milestones:[],issues:[],productIntent:{summary:"Replace with the owner's product intent",references:[],ownerInstructions:[]}};
+  const genesis:GenesisBundle = {schema:"acp.genesis-bundle.v1",commitMessage:"Create runnable project",files:[{path:"test.js",mode:"100644",contentBase64:Buffer.from(test).toString("base64"),sha256:bytesDigest(Buffer.from(test))},{path:".github/workflows/ci.yml",mode:"100644",contentBase64:Buffer.from(workflow).toString("base64"),sha256:bytesDigest(Buffer.from(workflow))}],branches:{main:"main",integration:"dev",genesis:"genesis"},labels:[],milestones:[{key:"m1",title:"Replace with the first product stage",description:"Replace with what this stage delivers"}],issues:[{key:"i1",title:"Replace with the approved work unit",body:"Replace with what the unit delivers and how it is accepted",labels:[],milestoneKey:"m1"}],productIntent:{summary:"Replace with the owner's product intent",references:[],ownerInstructions:[]}};
   return {
     schema: BOOTSTRAP_PLAN_GUIDE_SCHEMA_ID,
     submit: [

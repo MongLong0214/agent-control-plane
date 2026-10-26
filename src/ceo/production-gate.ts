@@ -1007,6 +1007,13 @@ export class ProductionGate {
       if (!admissible.allowed) return admissible as Decision<{ isBootstrap: boolean }>;
     }
 
+    // #1240 — a Repo Factory project's run passes as complete only with every approved work unit linked
+    // on GitHub and verified; a sealed run with an untracked unit is refused here, the units named.
+    if (input.decision === "CONFIRM" && run.kind === RunKind.STANDARD_WORK) {
+      const settled = this.tasks.workScope?.assertSettled(input.runId);
+      if (settled !== undefined && !settled.allowed) return settled as Decision<{ isBootstrap: boolean }>;
+    }
+
     // The packet records what the owner gate said when it was published, but a later
     // authenticated rejection is authoritative at confirmation time.
     const humanGate = this.humanGateStatus(input.runId);

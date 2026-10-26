@@ -20,6 +20,7 @@ import {
   TASK_BRANCH_CREATED,
   TASK_BRANCH_CREATING,
   TASK_BRANCH_CREATION_UNDONE,
+  type PredecessorBase,
   type TaskWriteTarget,
   TaskWriteTargets,
   branchCreationAttempted,
@@ -27,6 +28,7 @@ import {
   unresolvedCreationAttempt,
   recordedWriteTarget,
   sameWriteTarget,
+  startOf,
 } from "./task-write-target.ts";
 import { ORPHAN_RESOLVED_EVENT, ORPHAN_UNIDENTIFIED_EVENT, unresolvedUnidentifiedOrphans } from "./worker-orphan-release.ts";
 import {
@@ -212,6 +214,8 @@ export interface WorkerTurnPorts {
   guard: ManagedWriteGuard;
   /** The adapter that serves the WORKER role for the bound session's provider. */
   workerAdapter: (provider: string) => ProviderAdapter;
+  /** #1242 — builds the base a task with dependsOn predecessors starts from, when its target is recorded here. */
+  predecessorBase?: PredecessorBase;
 }
 
 interface WorkerIdentity {
@@ -833,7 +837,13 @@ export class WorkerTurnRunner {
     // Anything else is the durable facts' to refuse, in their own words.
     if (run?.kind !== RunKind.STANDARD_WORK || task?.run_id !== request.runId || !owned().allowed) return allow(ReasonCode.OK, undefined);
     if (recordedWriteTarget(db, request.runId, request.taskId)) return allow(ReasonCode.OK, undefined);
-    const targets = new TaskWriteTargets({ db, clock: this.ports.clock, audit: this.ports.audit, scratchDir: this.#scratchDir });
+    const targets = new TaskWriteTargets({
+      db,
+      clock: this.ports.clock,
+      audit: this.ports.audit,
+      scratchDir: this.#scratchDir,
+      ...(this.ports.predecessorBase ? { predecessorBase: this.ports.predecessorBase } : {}),
+    });
     let ensured: Decision<TaskWriteTarget | null>;
     try {
       ensured = await targets.ensure(request.runId, request.taskId, owned);
@@ -1297,6 +1307,14 @@ export class WorkerTurnRunner {
         baseSha: target.baseSha,
       });
     }
+    // #1242 — a task with dependsOn predecessors starts from their integration, kept from gc by its private ref.
+    const start = startOf(target);
+    if ((await commitOf(repo, start)) !== start) {
+      return deny(ReasonCode.TASK_PREDECESSOR_COMMIT_MISSING, "the commit the task starts from, its predecessors' integration, is not in the registered checkout", {
+        worktreeId: worktree,
+        startsFrom: target.startsFrom ?? null,
+      });
+    }
     const tip = await commitOf(repo, `refs/heads/${target.branch}`);
     if (tip !== null) {
       // c98ea8a3, review r2 (S-TB-03) — a name and a SHA are not ownership, and neither is an attempt: an
@@ -1359,7 +1377,7 @@ export class WorkerTurnRunner {
       );
     }
     const indexBaseline = await stagedContent(repo, indexSnapshot(repo, "branch-index"));
-    const to = tip ?? target.baseSha;
+    const to = tip ?? start;
     const needsCheckout = (await commitOf(repo, `${head}^{tree}`)) !== (await commitOf(repo, `${to}^{tree}`));
     if (needsCheckout) {
       const filters = await runPinnedGit(repo, ["config", "--get-regexp", "^filter\\."]);
@@ -1440,6 +1458,8 @@ export class WorkerTurnRunner {
           created: tip === null,
           checkedOut: needsCheckout,
           handoffFrom: handoff,
+          // #1242 — the base a task with dependsOn predecessors started from, and which tasks it holds.
+          ...(target.startsFrom ? { startsFrom: target.startsFrom } : {}),
         },
       });
     } catch {
@@ -1474,18 +1494,20 @@ export class WorkerTurnRunner {
     return allow(ReasonCode.OK, { runId: creation.runId, taskId: creation.taskId, branch });
   }
 
-  /** An existing branch of the task's name descends from the pinned base, and past it holds only this task's commits. */
+  /** An existing branch of the task's name descends from where it starts (#1242), and past it holds only this task's commits. */
   private async taskBranchLineage(repo: PinnedRepository, facts: DurableFacts, target: TaskWriteTarget, tip: string): Promise<Decision<void>> {
-    if (tip === target.baseSha) return allow(ReasonCode.OK, undefined);
-    const ancestor = await runPinnedGit(repo, ["merge-base", "--is-ancestor", target.baseSha, tip]);
+    const start = startOf(target);
+    if (tip === start) return allow(ReasonCode.OK, undefined);
+    const ancestor = await runPinnedGit(repo, ["merge-base", "--is-ancestor", start, tip]);
     if (ancestor.exitCode === 1) {
-      return deny(ReasonCode.CONFLICT, "a branch with the task's name does not descend from the run's pinned base; it is left as it is", {
+      return deny(ReasonCode.CONFLICT, "a branch with the task's name does not descend from the commit the task starts from; it is left as it is", {
         branch: target.branch,
         tip,
         baseSha: target.baseSha,
+        ...(target.startsFrom ? { startsFrom: target.startsFrom.commit } : {}),
       });
     }
-    const listed = ancestor.exitCode === 0 ? await runPinnedGit(repo, ["rev-list", `${target.baseSha}..${tip}`]) : null;
+    const listed = ancestor.exitCode === 0 ? await runPinnedGit(repo, ["rev-list", `${start}..${tip}`]) : null;
     if (!listed || listed.exitCode !== 0) {
       return deny(ReasonCode.PROBE_FAILED, "the task branch's history could not be read", { branch: target.branch, tip });
     }
@@ -2492,10 +2514,10 @@ const switchToTaskBranch = async (
       if (createdHere) {
         const current = await commitOf(repo, branchRef);
         const standsOnIt = filesMoved || (await headRefOf(repo)) === branchRef;
-        if (current !== input.target.baseSha) {
+        if (current !== startOf(input.target)) {
           refNowElsewhere = current ?? "deleted";
         } else if (!standsOnIt && blockers.length === 0) {
-          const removed = await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: task branch undone", "-d", branchRef, input.target.baseSha]);
+          const removed = await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: task branch undone", "-d", branchRef, startOf(input.target)]);
           if (removed.exitCode === 0) {
             refRemoved = true;
           } else {
@@ -2542,7 +2564,7 @@ const switchToTaskBranch = async (
     if (input.tip === null) {
       const intent = record(TASK_BRANCH_CREATING);
       if (!intent.allowed) return refused(`the task branch's creation could not be recorded before it was made; nothing was created: ${intent.message}`);
-      const created = await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: task branch", branchRef, input.target.baseSha, ZERO_OID[input.format]]);
+      const created = await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: task branch", branchRef, startOf(input.target), ZERO_OID[input.format]]);
       if (created.exitCode !== 0) {
         // Nothing of this attempt exists: the attempt is resolved, the ref there is someone else's.
         const resolved = record(TASK_BRANCH_CREATION_UNDONE).allowed;
@@ -2552,8 +2574,8 @@ const switchToTaskBranch = async (
         });
       }
       createdHere = true;
-      if ((await commitOf(repo, branchRef)) !== input.target.baseSha) {
-        return await undo("the task's branch does not read back at the pinned base after its creation", {}, "git");
+      if ((await commitOf(repo, branchRef)) !== startOf(input.target)) {
+        return await undo("the task's branch does not read back at the commit it starts from after its creation", {}, "git");
       }
     } else if ((await commitOf(repo, branchRef)) !== input.tip) {
       return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "the task's branch moved before it was checked out", { branch: input.target.branch });

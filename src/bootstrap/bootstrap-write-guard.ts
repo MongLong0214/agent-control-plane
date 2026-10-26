@@ -28,6 +28,8 @@ export interface BootstrapWriteRequest {
   readonly kind: "api" | "git";
   readonly method: string;
   readonly target: string;
+  /** #1240 — the API request's body, so a guard can admit only the content it approved. Never recorded. */
+  readonly body?: unknown;
 }
 
 export interface BootstrapWriteGuard {
@@ -52,7 +54,7 @@ const ask = (request: BootstrapWriteRequest): void => {
   const guard = attemptGuard.getStore();
   if (guard === undefined) {
     throw acpError(ReasonCode.GATE_AUTHORITY_DENIED, "a Repo Factory GitHub write outside a bootstrap attempt is refused", {
-      request: { ...request },
+      request: { kind: request.kind, method: request.method, target: request.target },
     });
   }
   guard.beforeRequest(request);
@@ -63,7 +65,7 @@ const MUTATING = new Set(["POST", "PATCH", "PUT", "DELETE"]);
 /** A client that asks the attempt's guard immediately before each mutating request it sends. */
 export const guardGitHubWrites = (client: GitHubClient): GitHubClient => ({
   request<T>(method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE", path: string, body?: unknown): Promise<T> {
-    if (MUTATING.has(method)) ask({ kind: "api", method, target: path });
+    if (MUTATING.has(method)) ask({ kind: "api", method, target: path, body });
     return client.request<T>(method, path, body);
   },
 });

@@ -348,7 +348,8 @@ describe("#246 C5 create-only bootstrap: GitHub initializes the default branch a
     await runUnderWriteGuard({ beforeRequest: (request) => { asked.push(request); } }, () =>
       port.createRepository({ owner: "acme", name: "fixture" }, "public", "repo-factory:marker", true),
     );
-    expect(asked).toEqual([{ kind: "api", method: "POST", target: "orgs/acme/repos" }]);
+    // #1240 — the guard is also handed the request's body, so a guard can admit only content it approved.
+    expect(asked).toEqual([{ kind: "api", method: "POST", target: "orgs/acme/repos", body: { name: "fixture", description: "repo-factory:marker", private: false, visibility: "public", auto_init: true } }]);
     expect(calls.at(-1)).toEqual({
       method: "POST",
       path: "orgs/acme/repos",
