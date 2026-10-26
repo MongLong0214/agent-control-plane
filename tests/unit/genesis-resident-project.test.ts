@@ -39,7 +39,8 @@ describe('inline genesis bootstrap',() => {
     h.cp.close();
   });
   it('matches an independent Python canonical-JSON UTF-8 contract digest',() => {
-    expect(genesisDigest({"schema":"acp.genesis-bundle.v1","commitMessage":"초기 생성","files":[{"path":"README.md","mode":"100644","contentBase64":"aGVsbG8K","sha256":"sha256:5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"}],"branches":{"main":"main","integration":"dev","genesis":"genesis"},"labels":[],"milestones":[],"issues":[],"productIntent":{"summary":"제품 의도","references":["https://example.test/design"],"ownerInstructions":["그대로 보존"]}})).toBe('sha256:4b7c8f9db5f499909f6592c46e5adcaf62ab933ec596019289634297bad302ee');
+    // #1240 — a genesis needs at least one issue and milestone; recomputed with Python's canonical JSON, which reproduces the previous pin.
+    expect(genesisDigest({"schema":"acp.genesis-bundle.v1","commitMessage":"초기 생성","files":[{"path":"README.md","mode":"100644","contentBase64":"aGVsbG8K","sha256":"sha256:5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"}],"branches":{"main":"main","integration":"dev","genesis":"genesis"},"labels":[],"milestones":[{"key":"m1","title":"첫 제품 단계","description":"첫 단계"}],"issues":[{"key":"i1","title":"제품 의도 구현","body":"소유자 의도대로","labels":[],"milestoneKey":"m1"}],"productIntent":{"summary":"제품 의도","references":["https://example.test/design"],"ownerInstructions":["그대로 보존"]}})).toBe('sha256:733f2dd4a9234ad1efc60b37a0f80e1dedd3a56b5071247954d68e7cfe7813a9');
   });
   it('normalizes a shared-contract digest, preserves bytes/product intent, and derives public main/dev protection with no review requirement',() => {
     const f = planFixture();

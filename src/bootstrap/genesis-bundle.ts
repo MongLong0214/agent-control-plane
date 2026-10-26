@@ -48,13 +48,17 @@ const refuseGenesis = (refusal: string, message: string, evidence: Record<string
 /**
  * #1240 — the genesis issues' structure and linkage, never their content: a work-unit marker links an
  * issue to one approved unit (`work-unit-marker.ts`), and blind review judges whether the issue covers it.
- * Every issue links a milestone (a product stage). Once any issue carries a marker, every issue carries
+ * A genesis has at least one issue and one milestone, and every issue links a milestone (a product
+ * stage). Once any issue carries a marker, every issue carries
  * exactly one, as its last line; all name the same n; there are n issues; the k are exactly 1..n; and no
  * key is on two issues. An issue with no marker is valid only as the single issue of a single-unit plan.
  * The units are the request's declared work units, as Repo Factory numbered them; nothing here counts
  * requirements. Each refusal names itself in `refusal`, with the issues, indices or keys it is about.
  */
-const assertWorkUnits = (issues: GenesisBundle['issues']): void => {
+const assertWorkUnits = (bundle: Pick<GenesisBundle, 'issues' | 'milestones'>): void => {
+  const { issues } = bundle;
+  // A genesis tracks its approved work as issues in milestones: with none of either it tracks nothing.
+  if (issues.length === 0 || bundle.milestones.length === 0) refuseGenesis('GENESIS_BACKLOG_MISSING', `the genesis declares ${issues.length} issues and ${bundle.milestones.length} milestones; it needs at least one of each`, { issueCount: issues.length, milestoneCount: bundle.milestones.length });
   const unlinked = issues.filter(issue => issue.milestoneKey === null).map(issue => issue.key);
   if (unlinked.length > 0) refuseGenesis('GENESIS_ISSUE_MILESTONE_MISSING', `genesis issues ${unlinked.join(', ')} link no milestone`, { issues: unlinked });
   const read = issues.map(issue => ({ issue: issue.key, ...workUnitMarkers(issue.body) }));
@@ -109,7 +113,7 @@ export function parseGenesis(value: unknown, manifest?: ProjectManifest): Genesi
   for (const issue of bundle.issues) {
     if (issue.labels.some(l => !bundle.labels.some(x => x.name === l)) || (issue.milestoneKey !== null && !bundle.milestones.some(m => m.key === issue.milestoneKey))) throw new Error('unknown issue label/milestone');
   }
-  assertWorkUnits(bundle.issues);
+  assertWorkUnits(bundle);
   if (manifest) {
     if (!/^[a-z0-9][a-z0-9._-]{0,80}$/.test(manifest.projectId)) throw new Error("project id must be safe for resident allocation");
     const profile = manifest.branchProfile;

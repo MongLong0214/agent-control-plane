@@ -35,8 +35,8 @@ import { CLOSED_TO_NEW_TASKS, type TaskGraph, type TaskRecord } from "./task-gra
  * What is verified is structure and linkage, never content: the issue exists in the repository at the
  * node id the genesis receipted (all pages, pull requests excluded, every item naming that repository),
  * it links by node id to the unit's milestone, and no other unit links it. A verified unit is recorded
- * (`WORK_SCOPE_GITHUB_TRACKED`) with the digest of its declaration and reused only while that
- * declaration is unchanged: a PLAN that adds, removes or relinks units re-verifies exactly those. An
+ * (`WORK_SCOPE_GITHUB_TRACKED`) with the digest of its declaration and task set, and reused only while
+ * both are unchanged: a PLAN that adds, removes, relinks or regroups units re-verifies exactly those. An
  * outage or another unit's change never holds back a unit already linked.
  *
  * No internal id is published. A created issue or milestone carries the PLAN's text and one marker,
@@ -45,8 +45,8 @@ import { CLOSED_TO_NEW_TASKS, type TaskGraph, type TaskRecord } from "./task-gra
  * number and node id are recorded the moment GitHub answers (`WORK_SCOPE_GITHUB_CREATED`).
  *
  * Writes go through the Repo Factory GitHub port under a guard that admits only a POST of exactly a
- * planned new milestone or issue, to the exact repository, while the run is live and its approval is
- * the current owner's. Only a Repo Factory project is governed; every other run is as before.
+ * planned new milestone or issue, to the exact repository, while the run is live, its approval is the
+ * current owner's and its PLAN is still the current one. Only a Repo Factory project is governed.
  */
 export const WORK_SCOPE_APPROVED = "WORK_SCOPE_APPROVED";
 export const WORK_SCOPE_GITHUB_CREATED = "WORK_SCOPE_GITHUB_CREATED";
@@ -68,6 +68,8 @@ interface ApprovedScope {
 export interface TrackedUnit {
   unit: string;
   declarationDigest: string;
+  /** The link and task set this verification holds for (`scopeDigestOf`). */
+  scopeDigest: string;
   issueNumber: number;
   issueNodeId: string;
   milestoneNumber: number;
@@ -79,6 +81,8 @@ export type UnmetKind =
   | "DECLARATION_CHANGED"
   | "MILESTONE_NOT_FOUND"
   | "MILESTONE_EXISTS"
+  | "MILESTONE_TEXT_DIFFERS"
+  | "ISSUE_TEXT_DIFFERS"
   | "ISSUE_NOT_FOUND"
   | "ISSUE_EXISTS"
   | "DUPLICATE_OF_ADOPTED"
@@ -123,7 +127,9 @@ const SHAPE =
   "tasks may be omitted to re-link the run's existing tasks";
 
 const INTERNAL_ID = /\b(?:prj|repo|ses|run|task|art|clm|msg|asg)_[0-9a-f]{24}\b/;
-const LOCAL_PATH = /(?:^|[\s"'`(=:])(?:\/(?:Users|home|private|var|tmp|opt|etc)\/|[A-Za-z]:\\)/;
+// A path starts wherever the character before it cannot continue a path (src/github/branch-publish.ts
+// draws the same boundary): quotes, backticks, brackets, '<', '>', '|', '=', ':' or a '/' alike.
+const LOCAL_PATH = /(?:^|[^A-Za-z0-9._~-])(?:\/(?:Users|home|private|var|tmp|opt|etc)\/|[A-Za-z]:\\)/m;
 
 /** Why a PLAN text may not be published as written, or null. */
 const unpublishable = (text: string): string | null => {
@@ -143,6 +149,11 @@ const createdMarker = (runId: string, resource: "issue" | "milestone", key: stri
 const withMarker = (text: string, marker: string): string => (text.trimEnd() ? `${text.trimEnd()}\n\n${marker}` : marker);
 const sameTitle = (left: string, right: string): boolean => left.trim().toLowerCase() === right.trim().toLowerCase();
 const declarationDigestOf = (unit: WorkUnitDeclaration): string => digestOf({ issue: unit.issue, milestone: unit.milestone });
+/** What a unit's verification is reused for: its link and its task set; any change verifies it again. */
+const scopeDigestOf = (unit: { declarationDigest: string; taskIds: readonly string[] }): string =>
+  digestOf({ declarationDigest: unit.declarationDigest, taskIds: [...unit.taskIds].sort() });
+/** GitHub's text as the PLAN's: line endings and trailing space aside, exactly. */
+const sameText = (left: string, right: string): boolean => left.replace(/\r\n/g, "\n").trimEnd() === right.replace(/\r\n/g, "\n").trimEnd();
 const titleDigestOf = (title: string): string => digestOf(title.trim().toLowerCase());
 const list = (numbers: readonly number[]): string => numbers.map((n) => `#${n}`).join(", ");
 
@@ -361,6 +372,11 @@ export class WorkScopeTracking {
             const record = created.get(`milestone:${titleDigestOf(title)}`);
             milestone = resources.milestones.find((m) => record !== undefined && m.number === record.number && m.nodeId === record.nodeId)
               ?? resources.milestones.find((m) => m.description.includes(marker));
+            // ACP's own earlier create stands for this unit only while it reads as the PLAN now declares it.
+            if (milestone !== undefined && (milestone.title !== title || !sameText(milestone.description, withMarker(description, marker)))) {
+              unmet.push({ unit: approved.unit, unmet: "MILESTONE_TEXT_DIFFERS", milestones: [milestone.number], correction: `milestone #${milestone.number}, created for this unit, does not read as the PLAN now declares it; adopt it by number, or declare it as it reads` });
+              continue;
+            }
             if (milestone === undefined) {
               const clash = resources.milestones.find((m) => sameTitle(m.title, title));
               if (clash !== undefined) {
@@ -388,6 +404,11 @@ export class WorkScopeTracking {
             const record = created.get(`issue:${approved.unit}`);
             issue = resources.issues.find((i) => record !== undefined && i.number === record.number && i.nodeId === record.nodeId)
               ?? resources.issues.find((i) => i.body.includes(marker));
+            // ACP's own earlier create stands for this unit only while it reads as the PLAN now declares it.
+            if (issue !== undefined && (issue.title !== title || !sameText(issue.body, withMarker(body, marker)))) {
+              unmet.push({ unit: approved.unit, unmet: "ISSUE_TEXT_DIFFERS", issues: [issue.number], correction: `issue #${issue.number}, created for this unit, does not read as the PLAN now declares it; adopt it by number, or declare it as it reads` });
+              continue;
+            }
             if (issue === undefined) {
               const before = adoptedBefore.get(approved.unit);
               if (before !== undefined) {
@@ -435,7 +456,7 @@ export class WorkScopeTracking {
       else if (claimed.get(issue.number) !== unit) unmet.push({ unit, unmet: "CATCH_ALL_ISSUE", issues: [issue.number], correction: `issue #${issue.number} already stands for unit ${claimed.get(issue.number)}; give this unit its own issue` });
       else if (issue.milestone === null) unmet.push({ unit, unmet: "MILESTONE_LINK_MISSING", issues: [issue.number], milestones: [milestone.number], correction: `link issue #${issue.number} to milestone #${milestone.number}, or declare the milestone it is in` });
       else if (issue.milestone.nodeId !== milestone.nodeId) unmet.push({ unit, unmet: "MILESTONE_LINK_WRONG", issues: [issue.number], milestones: [milestone.number, issue.milestone.number], correction: `issue #${issue.number} is in milestone #${issue.milestone.number}, not #${milestone.number}; move it, or declare the milestone it is in` });
-      else verified.push({ unit, declarationDigest: approved.declarationDigest, issueNumber: issue.number, issueNodeId: issue.nodeId, milestoneNumber: milestone.number, milestoneNodeId: milestone.nodeId, adopted: link.adopted });
+      else verified.push({ unit, declarationDigest: approved.declarationDigest, scopeDigest: scopeDigestOf(approved), issueNumber: issue.number, issueNodeId: issue.nodeId, milestoneNumber: milestone.number, milestoneNodeId: milestone.nodeId, adopted: link.adopted });
     }
     if (verified.length > 0) {
       this.ports.audit.record({
@@ -450,7 +471,8 @@ export class WorkScopeTracking {
 
   /**
    * The only GitHub writes a synchronization makes: a POST of exactly one planned new milestone or
-   * issue to the exact repository, while the run is live and its approval is its current owner's.
+   * issue to the exact repository, while the run is live, its approval is its current owner's, and the
+   * PLAN it serves is still the run's current one.
    */
   #guard(runId: string, target: GitHubRepositoryTarget, scope: ApprovedScope, planned: ReadonlyArray<{ path: string; title: string; text: string }>): BootstrapWriteGuard {
     const root = `repos/${target.owner}/${target.name}`;
@@ -470,6 +492,13 @@ export class WorkScopeTracking {
         if (run.ownerSessionId !== scope.sessionId || run.ownerBindingGeneration !== scope.bindingGeneration) {
           throw acpError(ReasonCode.GATE_AUTHORITY_DENIED, "the PLAN's work units were approved by another owner than the run's current one; its current owner submits them again before anything is created", {
             refusal: "WORK_SCOPE_APPROVAL_NOT_CURRENT_OWNER", runId,
+          });
+        }
+        // A PLAN accepted while this synchronization waited on GitHub supersedes the one it serves.
+        const current = this.#scope(runId);
+        if (current === null || current.planDigest !== scope.planDigest || digestOf(current.units) !== digestOf(scope.units)) {
+          throw acpError(ReasonCode.GATE_AUTHORITY_DENIED, "the PLAN this synchronization serves is no longer the run's current one; nothing of it is created", {
+            refusal: "WORK_SCOPE_PLAN_SUPERSEDED", runId, planDigest: scope.planDigest, currentPlanDigest: current?.planDigest ?? null,
           });
         }
       },
@@ -520,7 +549,7 @@ export class WorkScopeTracking {
     const liveUnits = (scope?.units ?? []).filter((unit) => unit.taskIds.some((taskId) => liveIds.has(taskId)));
     const tracked = new Map<string, TrackedUnit>();
     for (const record of this.#trackedRecords(runId, governed)) {
-      const unit = liveUnits.find((u) => u.unit === record.unit && u.declarationDigest === record.declarationDigest);
+      const unit = liveUnits.find((u) => u.unit === record.unit && record.scopeDigest === scopeDigestOf(u));
       if (unit !== undefined) tracked.set(unit.unit, record);
     }
     return { scope, unitOf, unmapped: live.filter((task) => !unitOf.has(task.taskId)), live: liveUnits, tracked };

@@ -73,6 +73,16 @@ class IssuesGitHub implements GitHubClient {
   /** GitHub accepts an issue and drops its milestone. */
   dropMilestone = false;
   private next = 1;
+  /** The next GET of `route` waits until released, as a slow GitHub answer would. */
+  private hold: { route: string; reached: boolean; release: () => void; released: Promise<void> } | null = null;
+
+  holdNext(route: string): { reached: () => boolean; release: () => void } {
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    const hold = { route, reached: false, release, released };
+    this.hold = hold;
+    return { reached: () => hold.reached, release };
+  }
 
   milestoneRef(m: Milestone) {
     return { number: m.number, node_id: m.node_id, url: m.url, title: m.title };
@@ -109,6 +119,12 @@ class IssuesGitHub implements GitHubClient {
   async request<T>(method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE", path: string, body?: unknown): Promise<T> {
     this.calls.push({ method, path, ...(body === undefined ? {} : { body }) });
     const [route, query] = path.split("?");
+    const hold = this.hold;
+    if (method === "GET" && hold !== null && route === hold.route) {
+      this.hold = null;
+      hold.reached = true;
+      await hold.released;
+    }
     const params = new URLSearchParams(query ?? "");
     const perPage = Number(params.get("per_page") ?? "30");
     const page = Number(params.get("page") ?? "1");
@@ -509,6 +525,67 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     expect(github.calls.filter((c) => c.method !== "GET")).toEqual([]);
   });
 
+  it("review P1-a: a PLAN superseded while its synchronization waits on GitHub publishes nothing", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/issues", when: "before" };
+    expect(tracking(await planSubmit(g, [{ key: "roundup", tasks: [impl], issue: { new: { title: "Weekly verdict roundup", body: "Collect" } }, milestone: { number: 1 } }]))).toMatchObject({ tracked: false });
+    // PLAN A's synchronization is paused on GitHub's read; PLAN B, adopting #3 instead, is accepted meanwhile.
+    const hold = g.github.holdNext(`${ROOT}/milestones`);
+    const syncA = g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl);
+    await vi.waitFor(() => expect(hold.reached()).toBe(true));
+    const planB = planSubmit(g, [{ key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } }]);
+    await vi.waitFor(() => expect(g.h.cp.audit.byKind("WORK_SCOPE_APPROVED").filter((row) => row.runId === g.runId)).toHaveLength(2));
+    hold.release();
+    const a = await syncA;
+    expect(a.allowed).toBe(false);
+    expect(a.evidence).toMatchObject({ causeRefusal: "WORK_SCOPE_PLAN_SUPERSEDED" });
+    expect(tracking(await planB)).toMatchObject({ tracked: true });
+    expect(g.github.issues.filter((i) => i.title === "Weekly verdict roundup")).toEqual([]);
+    expect(g.github.posts("/issues")).toHaveLength(1);
+  });
+
+  it("review P1-b: adding a task to a verified unit re-verifies its link before the task is admitted", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    expect(tracking(await planSubmit(g, [{ key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } }]))).toMatchObject({ tracked: true });
+    // #3's milestone link is removed on GitHub; then the unit grows by a task.
+    g.github.issues.find((i) => i.number === 3)!.milestone = null;
+    const seen = g.github.calls.length;
+    const grown = await planSubmit(g, [{ key: "feed", tasks: [impl, "review"], issue: { number: 3 }, milestone: { number: 1 } }], [{ key: "review", title: "Review the verdict feed", category: "review" }]);
+    expect(g.github.calls.length).toBeGreaterThan(seen);
+    expect(unmetOf(tracking(grown)).map((u) => [u.unit, u.unmet])).toEqual([["feed", "MILESTONE_LINK_MISSING"]]);
+    const review = g.h.cp.tasks.list(g.runId).find((t) => t.title === "Review the verdict feed")!.taskId;
+    expect(startExecution(g, review).reasonCode).toBe(REFUSED);
+  });
+
+  it("review P1-c: a local path is refused behind any delimiter, and only a path", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    const scope = g.h.cp.tasks.workScope!;
+    const declare = (text: string) => scope.declare(g.runId, { workUnits: [{ key: "notes", tasks: [impl], issue: { new: { title: "Notes", body: text } }, milestone: { number: 1 } }] }, []);
+    for (const text of [
+      "See </Users/isaac/private-notes.md>", "\"/home/isaac/x\"", "'/tmp/x'", "`/var/folders/x`", "(/opt/x)", "[/etc/x]", "{/private/x}",
+      "a|/Users/isaac/x", "key=/Users/isaac/x", "at:/Users/isaac/x", "file:///Users/isaac/x", "<C:\\Users\\isaac>", "/Users/isaac/x at the start",
+    ]) {
+      expect(declare(text), text).toMatchObject({ allowed: false, evidence: { refusal: "WORK_UNITS_TEXT_NOT_PUBLIC" } });
+    }
+    for (const text of ["https://example.com/Users/guide", "docs/home/readme", "the /Users-facing page"]) {
+      expect(declare(text).allowed, text).toBe(true);
+    }
+  });
+
+  it("review P2-a: a unit re-declared with other text is not certified by the issue created for its old text", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    expect(tracking(await planSubmit(g, [{ key: "feed-x", tasks: [impl], issue: { new: { title: "Add feed filtering", body: "Filter the feed" } }, milestone: { number: 1 } }]))).toMatchObject({ tracked: true });
+    const created = g.github.issues.find((i) => i.title === "Add feed filtering")!;
+    const redeclared = await planSubmit(g, [{ key: "feed-x", tasks: [impl], issue: { new: { title: "Add feed export", body: "Export the feed" } }, milestone: { number: 1 } }]);
+    expect(unmetOf(tracking(redeclared))).toMatchObject([{ unit: "feed-x", unmet: "ISSUE_TEXT_DIFFERS", issues: [created.number] }]);
+    expect(g.github.calls.filter((c) => c.method !== "GET")).toHaveLength(1);
+    expect(startExecution(g, impl).reasonCode).toBe(REFUSED);
+  });
+
   it("a project that is not a Repo Factory project plans and is admitted as before, with no GitHub request", async () => {
     const g = await governedRun({ provisioned: false, legacy: [] });
     const answer = await callCtoTool(g.h, g.owner, "plan_submit", { idempotencyKey: "plan-plain", runId: g.runId, plan: { summary: "plain" }, tasks: [{ key: "impl", title: "Implement", category: "implementation" }] });
@@ -636,6 +713,19 @@ describe("#1240 (RF lane) — the genesis issues' work-unit markers are checked 
   it("a body with two markers, or a marker that is not its last line, is refused", () => {
     expect(refusalOf(genesisWith([{ body: "a\n\nWork unit 1 of 2: a\nWork unit 2 of 2: b" }, unit("b", 2, 2, "b")]))).toMatchObject({ refusal: "GENESIS_WORK_UNIT_MARKER_NOT_ONE_LAST_LINE", issues: ["i1"] });
     expect(refusalOf(genesisWith([{ body: "Work unit 1 of 2: a\n\nmore text" }, unit("b", 2, 2, "b")]))).toMatchObject({ refusal: "GENESIS_WORK_UNIT_MARKER_NOT_ONE_LAST_LINE", issues: ["i1"] });
+  });
+
+  it("review P2-b: a genesis with no issue, or no milestone, is refused before approval", () => {
+    expect(refusalOf(genesisWith([]))).toMatchObject({ refusal: "GENESIS_BACKLOG_MISSING", issueCount: 0, milestoneCount: 1 });
+    expect(refusalOf({ ...genesisWith([]), milestones: [] })).toMatchObject({ refusal: "GENESIS_BACKLOG_MISSING", issueCount: 0, milestoneCount: 0 });
+    const genesis = { ...genesisWith([]), milestones: [] };
+    const manifest = projectManifestSchema.parse(fixtureManifest("resident-test", {
+      verificationCommands: [{ id: "test", argv: ["node", "test.js"], repositoryRole: "primary", cwd: ".", timeoutSeconds: 30, envAllowlist: [], network: "deny", networkAllowlist: [], required: true, evidenceMode: "LOCAL_COMMAND", maxOutputBytes: 1048576, maxMemoryMb: 1024, maxCpuSeconds: 30 }],
+      verificationProfiles: { simple: ["test"], standard: ["test"], guarded: ["test"] },
+      ciWorkflows: [{ repositoryRole: "primary", path: ".github/workflows/ci.yml", checkName: "test", approvedDigest: genesis.files[1]!.sha256, unapprovedFirstActivation: false }],
+    }));
+    const submitted = planForSubmission({ kind: "PROJECT_BOOTSTRAP", projectId: null }, { summary: "create", bootstrapOperationId: "genesis-op", requestDigest: digestOf("request"), projectManifest: manifest, projectManifestDigest: manifestDigest(manifest), genesis });
+    expect(submitted).toMatchObject({ allowed: false, evidence: { refusal: "GENESIS_INVALID", genesisRefusal: { refusal: "GENESIS_BACKLOG_MISSING" } } });
   });
 
   it("plan submission answers with the precise refusal, not only GENESIS_INVALID", () => {
