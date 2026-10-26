@@ -50,6 +50,12 @@ export interface CreateOptions {
    * source's own object database, which is the same database the snapshot read.
    */
   readonly frozenTree?: string;
+  /**
+   * S6-C — the HEAD the source checkout must stand at before and after a self-contained copy
+   * (`expectedCheckoutHead` of the frozen repository). It is the candidate itself unless the
+   * candidate is an integrated commit, which is checked out nowhere. Defaults to the candidate.
+   */
+  readonly sourceHead?: string;
 }
 
 const WORKTREE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -185,7 +191,7 @@ export class WorktreeManager {
       });
     }
     if (options.selfContained) {
-      return this.createSelfContained(repositoryPath, head, worktreeId, path, authorization, options.frozenTree);
+      return this.createSelfContained(repositoryPath, head, worktreeId, path, authorization, options.frozenTree, options.sourceHead);
     }
 
     // Resolve the ref before materialising it. A worktree created for `HEAD` must still
@@ -352,7 +358,8 @@ export class WorktreeManager {
    * is only read: by `upload-pack`, the side of git's transport built to serve an untrusted
    * repository, and by `git status`, as the snapshot freshness check already reads it.
    *
-   * Dirty and untracked state. The candidate is the commit at the source checkout's HEAD, and only
+   * Dirty and untracked state. The candidate is the commit at the source checkout's HEAD (or, for an
+   * integrated candidate, a commit the checkout's frozen HEAD stands beside: `sourceHead`), and only
    * that commit is copied, so a tracked change (staged or not) or an untracked, non-ignored file in
    * the source is state the copy would drop. Preparation refuses it as SNAPSHOT_STALE instead of
    * handing CLEAN_TREE a clean copy of a checkout that is not clean. Ignored files are not
@@ -368,9 +375,11 @@ export class WorktreeManager {
     path: string,
     authorization: WorktreeAuthorization,
     frozenTree: string | undefined,
+    sourceHead: string | undefined,
   ): Promise<Worktree> {
     const source = canonical(repositoryPath);
     const expectedHead = await revParse(repositoryPath, head);
+    const expectedSourceHead = sourceHead ?? expectedHead;
     // The commit SHA does not bind the tree on its own. In the source, `<sha>^{tree}` honours
     // `refs/replace`, so a replaced commit resolves -- in the snapshot, in freshness and in a linked
     // worktree -- to the replacement's tree. The copy is fetched by SHA, and the transport ships
@@ -384,11 +393,12 @@ export class WorktreeManager {
     // A SHA-256 source cannot be fetched into a SHA-1 repository, so the copy takes its format.
     const objectFormat = (await git(repositoryPath, ["rev-parse", "--show-object-format"])).stdout.trim();
     const prepared = await sourceState(repositoryPath);
-    if (prepared.head !== expectedHead || prepared.status.length > 0 || sourceTree !== expectedTree) {
+    if (prepared.head !== expectedSourceHead || prepared.status.length > 0 || sourceTree !== expectedTree) {
       fail(ReasonCode.SNAPSHOT_STALE, "the source checkout is not exactly the candidate, so a copy of the candidate would not be it", {
         repositoryPath: source,
         worktreePath: path,
         expectedHead,
+        expectedSourceHead,
         sourceHead: prepared.head,
         expectedTree,
         sourceTree,
@@ -436,7 +446,7 @@ export class WorktreeManager {
         sourceTreeAfter !== expectedTree ||
         copyStatus.length > 0 ||
         !selfContained ||
-        after.head !== expectedHead ||
+        after.head !== expectedSourceHead ||
         after.status.length > 0
       ) {
         fail(ReasonCode.SNAPSHOT_STALE, "verification checkout differs from the frozen candidate", {

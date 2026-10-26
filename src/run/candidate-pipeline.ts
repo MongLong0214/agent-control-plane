@@ -32,6 +32,7 @@ import type { BlindReviewGate, BlindReviewInvoker, ReviewPacket } from "../revie
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import {
   type CandidateSnapshot,
+  type SnapshotRepositoryInput,
   buildCandidateSnapshot,
   buildNoRepositoryCandidateSnapshot,
   candidateSnapshotDigest,
@@ -39,6 +40,16 @@ import {
 } from "../snapshot/candidate-snapshot.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationEngine, VerificationReport } from "../verify/verification-engine.ts";
+import {
+  CANDIDATE_REF_NAMESPACE,
+  type SucceededTaskCommit,
+  applyCandidateRefPlan,
+  candidateRefFor,
+  candidateRefPlan,
+  integrateTaskResults,
+  lostTaskChanges,
+  succeededTaskCommits,
+} from "./candidate-integration.ts";
 import type { RunEngine, TaskContract } from "./run-engine.ts";
 import type { TaskGraph } from "./task-graph.ts";
 import { recordedTargetForBranch } from "./task-write-target.ts";
@@ -258,28 +269,43 @@ export class CandidatePipeline {
     const profile: BranchProfile | null = run.pinnedManifestDigest
       ? (this.projects.manifest(run.pinnedManifestDigest)?.branchProfile ?? null)
       : null;
-    const repositories = await Promise.all(
-      participants.map(async (repo) => {
-        const source = await this.sourceAtFreeze(
-          repo.checkoutPath,
-          repo.workBranch,
-          repo.baseBranch,
-          profile,
-          { runId, identity: repo.identity },
-        );
-        return {
-          identity: repo.identity,
-          repositoryRole: repo.repositoryRole,
-          checkoutPath: repo.checkoutPath,
-          baseBranch: repo.baseBranch,
-          baseRef: repo.baseBranch,
-          sourceBranch: source.sourceBranch,
-          sourceHead: source.sourceHead,
-          worktreeId: repo.worktreeId,
-          manifestDigest: this.repositories.byIdentity(repo.identity)?.activeManifestDigest ?? null,
-        };
-      }),
-    );
+    const tasks = participants.length === 0 ? [] : this.tasks.list(runId);
+    // One read of the run's SUCCEEDED task commits: what the integration places and what the
+    // missing-commit guard below asks the final candidate for are the same commits (S6-B, S6-C).
+    const commits = participants.length === 0 ? [] : succeededTaskCommits(this.db, runId);
+    const repositories: SnapshotRepositoryInput[] = [];
+    for (const repo of participants) {
+      // S6-C — when the checkout's HEAD does not hold every SUCCEEDED task's commit, the candidate is
+      // their integration onto the run's pinned base; a conflict between two tasks refuses the freeze.
+      const integrated = await integrateTaskResults({
+        db: this.db,
+        runId,
+        tasks,
+        commits,
+        repositoryIdentity: repo.identity,
+        checkoutPath: repo.checkoutPath,
+        worktree: (input, use) => this.verification.withRunWorktree(run, input, use),
+      });
+      if (!integrated.allowed) return integrated as Decision<CandidateSnapshot>;
+      // The integrated candidate's origin is its tasks' recorded one (S-TB-06), as one task's is below.
+      const source = integrated.value === null
+        ? await this.sourceAtFreeze(repo.checkoutPath, repo.workBranch, repo.baseBranch, profile, { runId, identity: repo.identity })
+        : profile
+          ? { sourceBranch: integrated.value.declaredParent, sourceHead: integrated.value.baseSha }
+          : { sourceBranch: null, sourceHead: null };
+      repositories.push({
+        identity: repo.identity,
+        repositoryRole: repo.repositoryRole,
+        checkoutPath: repo.checkoutPath,
+        baseBranch: repo.baseBranch,
+        baseRef: repo.baseBranch,
+        sourceBranch: source.sourceBranch,
+        sourceHead: source.sourceHead,
+        worktreeId: repo.worktreeId,
+        manifestDigest: this.repositories.byIdentity(repo.identity)?.activeManifestDigest ?? null,
+        ...(integrated.value === null ? {} : { candidateRef: integrated.value.head, integration: integrated.value.integration }),
+      });
+    }
 
     // #246 C2 — a project-less bootstrap run joins no repository; its candidate is its PLAN, the
     // manifest that PLAN carries and the outputs it plans. A PLAN with no plannable outputs freezes
@@ -327,21 +353,75 @@ export class CandidatePipeline {
           this.clock,
         );
 
-    this.artifacts.put(runId, ArtifactKind.CANDIDATE_SNAPSHOT, snapshot, candidateSnapshotDigest(snapshot));
+    // CEO (S6-B) — a candidate that is missing a SUCCEEDED task's own commit is refused here,
+    // before it is ever persisted as this run's current candidate. Asked of the final candidate
+    // head, integrated or not: the post-condition of the integration above, never replaced by it.
+    if (participants.length > 0) {
+      const missing = await this.missingTaskCommits(commits, snapshot.repositories, repositories);
+      if (missing.length > 0) {
+        return deny(
+          ReasonCode.CANDIDATE_MISSING_TASK_COMMIT,
+          "a SUCCEEDED task's commit is not in the candidate's history for its repository",
+          { runId, missing },
+        );
+      }
+      // S6 review — ancestry is not content: a merge that keeps one side holds a task's commit in its
+      // history and none of its change. With two or more task commits, each task's change must stand
+      // in the candidate's tree as the task left it.
+      for (const frozen of snapshot.repositories) {
+        const checkoutPath = repositories.find((repo) => repo.identity === frozen.identity)?.checkoutPath;
+        if (!checkoutPath) continue;
+        const lost = await lostTaskChanges({ db: this.db, runId, commits, repositoryIdentity: frozen.identity, checkoutPath, candidateHead: frozen.candidateHead });
+        if (!lost.allowed) return lost as Decision<CandidateSnapshot>;
+        if (lost.value.length > 0) {
+          const named = lost.value.map((task) => `${task.taskId} (${task.paths.join(", ")})`).join("; ");
+          return deny(
+            ReasonCode.CANDIDATE_MISSING_TASK_CHANGE,
+            `a SUCCEEDED task's change is not in the candidate's tree although its commit is in the candidate's history: ${named}`,
+            { runId, repositoryIdentity: frozen.identity, lost: lost.value },
+          );
+        }
+      }
+    }
+
+    const digest = candidateSnapshotDigest(snapshot);
+    // S6 review — an integrated candidate is a commit no branch names. A private ref keeps it from
+    // git gc for as long as it is this run's candidate; it is written, through the guard, before the
+    // candidate is recorded, and a freeze that cannot write it records nothing.
+    for (const frozen of snapshot.repositories) {
+      if (frozen.integration === undefined) continue;
+      const checkoutPath = repositories.find((repo) => repo.identity === frozen.identity)!.checkoutPath;
+      const plan = await candidateRefPlan(checkoutPath, runId, { ref: candidateRefFor(runId, digest), commit: frozen.candidateHead });
+      if (!plan.allowed) return plan as Decision<CandidateSnapshot>;
+      const held = await this.writeCandidateRefs(run, frozen.identity, checkoutPath, plan.value.filter((line) => !line.startsWith("delete ")));
+      if (!held.allowed) return held as Decision<CandidateSnapshot>;
+    }
+
+    this.artifacts.put(runId, ArtifactKind.CANDIDATE_SNAPSHOT, snapshot, digest);
     // One transaction records the new candidate and stales everything bound to an older
     // one, so no window exists in which superseded evidence still reads as current.
-    this.runs.promoteCandidate(runId, candidateSnapshotDigest(snapshot));
+    this.runs.promoteCandidate(runId, digest);
+    // The refs of the candidates this one supersedes go now. Best effort: one left behind keeps an
+    // old candidate's objects from gc, nothing more, and the next freeze asks again.
+    for (const repo of repositories) {
+      const frozen = snapshot.repositories.find((candidate) => candidate.identity === repo.identity);
+      const keep = frozen?.integration === undefined ? null : { ref: candidateRefFor(runId, digest), commit: frozen.candidateHead };
+      const plan = await candidateRefPlan(repo.checkoutPath, runId, keep);
+      const superseded = plan.allowed ? plan.value.filter((line) => line.startsWith("delete ")) : [];
+      if (superseded.length > 0) await this.writeCandidateRefs(run, repo.identity, repo.checkoutPath, superseded);
+    }
     this.audit.record({
       kind: "CANDIDATE_FROZEN",
       runId,
       evidence: {
-        candidateSnapshotDigest: candidateSnapshotDigest(snapshot),
+        candidateSnapshotDigest: digest,
         repositories: snapshot.repositories.map((r) => ({
           identity: r.identity,
           candidateHead: r.candidateHead,
           sourceBranch: r.sourceBranch ?? null,
           sourceHead: r.sourceHead ?? null,
           files: r.touchedPaths.length,
+          ...(r.integration === undefined ? {} : { integratedTasks: r.integration.tasks.length }),
         })),
         ...(attemptId === undefined ? {} : { attemptId }),
       },
@@ -1074,6 +1154,54 @@ export class CandidatePipeline {
       }))
       .filter((p) => p.checkoutPath);
     return verifySnapshotFreshness(snapshot, probes);
+  }
+
+  /**
+   * S6 review — one guarded ref transaction under the run's private candidate namespace
+   * (`CANDIDATE_REF_NAMESPACE`): never a branch, never HEAD, never a task's ref (S-TB-02).
+   */
+  private async writeCandidateRefs(run: RunRow, identity: string, checkoutPath: string, lines: readonly string[]): Promise<Decision<void>> {
+    if (lines.length === 0) return allow(ReasonCode.OK, undefined);
+    return this.verification.writeRunRefs(
+      run,
+      { repositoryIdentity: identity, namespace: `${CANDIDATE_REF_NAMESPACE}/${run.runId}` },
+      () => applyCandidateRefPlan(checkoutPath, lines),
+    );
+  }
+
+  /**
+   * CEO (S6-B) — every task's own commit that a valid SUCCEEDED receipt of this run names
+   * (`succeededTaskCommits`), checked against the candidate just frozen for its repository. Each
+   * STANDARD_WORK task's work branch is created at the run's pinned base, never stacked on another
+   * task's branch (#512 S-TB), so a candidate that is only the checkout's HEAD can hold one task's
+   * branch alone. The integration (S6-C) places every commit it can; this is its post-condition on
+   * the final head, so a commit it did not place (no write target, or an integration that dropped
+   * one) refuses the freeze instead of being lost. Not drift in an already-frozen snapshot
+   * (SNAPSHOT_STALE re-reads one after the fact; this is asked before one is ever recorded).
+   */
+  private async missingTaskCommits(
+    commits: readonly SucceededTaskCommit[],
+    snapshotRepositories: readonly { identity: string; candidateHead: string }[],
+    repositories: readonly { identity: string; checkoutPath: string }[],
+  ): Promise<Array<{ taskId: string; commitHead: string; repositoryIdentity: string }>> {
+    const checkoutByIdentity = new Map(repositories.map((repo) => [repo.identity, repo.checkoutPath]));
+    const candidateByIdentity = new Map(snapshotRepositories.map((repo) => [repo.identity, repo.candidateHead]));
+
+    const missing: Array<{ taskId: string; commitHead: string; repositoryIdentity: string }> = [];
+    for (const receipt of commits) {
+      const checkoutPath = checkoutByIdentity.get(receipt.repositoryIdentity);
+      const candidateHead = candidateByIdentity.get(receipt.repositoryIdentity);
+      if (!checkoutPath || !candidateHead) continue;
+      // The same ancestry idiom `sourceAtFreeze` uses below: a commit not resolvable in this
+      // checkout at all makes `mergeBase` answer null, which is "not contained" exactly as a
+      // resolvable but non-ancestor commit is — fail closed either way. An integrated head's
+      // objects are in this checkout's object store: its integration worktree was linked to it.
+      const ancestor = await mergeBase(checkoutPath, receipt.commit, candidateHead);
+      if (ancestor !== receipt.commit) {
+        missing.push({ taskId: receipt.taskId, commitHead: receipt.commit, repositoryIdentity: receipt.repositoryIdentity });
+      }
+    }
+    return missing.sort((a, b) => (a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0));
   }
 
   /**
