@@ -1,0 +1,3 @@
+Warn: the reviewer input size is the prompt plus the system instructions plus REVIEWER_TRANSPORT_SEPARATOR, the join the Codex adapter writes to stdin; a change to that join must keep using the exported constant, or the chunk decision under-counts the input again
+Record-Id: r-7bfeb98b0d6f
+Provenance: inherited d6193532ac0a41d82e2e0d1923499376a5d59c5f
