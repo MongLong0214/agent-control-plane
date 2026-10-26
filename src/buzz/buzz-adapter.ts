@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 
 import { canonicalJson, digestOf, sha256Hex } from "../core/digest.ts";
 import { HostProvisionerError, hostObservationSchema, type HostProjectProvisioner } from "../runtime/host-project-provisioner.ts";
-import { buzzPolicyHoldReason, currentCanonicalCeoBuzzRoute, daemonBuzzSigner, isBuzzRecipientRefusal, isBuzzSignerRefusal, type BuzzPolicyBinding, type BuzzPolicyIdentity, type BuzzPolicyReadiness, type CanonicalCeoBuzzRoute } from "../outbox/ceo-buzz-signer.ts";
+import { buzzPolicyHoldReason, currentCanonicalCeoBuzzRoute, daemonBuzzSigner, isBuzzRecipientRefusal, isBuzzSignerRefusal, type BuzzPolicyBinding, type BuzzPolicyIdentity, type BuzzPolicyReadiness, policyPathDigest, type CanonicalCeoBuzzRoute } from "../outbox/ceo-buzz-signer.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 
 import type { Clock } from "../core/clock.ts";
@@ -196,14 +196,14 @@ export class BuzzCliTransport implements BuzzTransport {
   }
 
   async policyReadiness(channel: string, content: string, recipient: string, signer: string): Promise<BuzzPolicyReadiness> {
-    const policyIdentity: BuzzPolicyIdentity = { configured: { file: null, digest: null }, reported: { file: null, digest: null } };
+    const policyIdentity: BuzzPolicyIdentity = { configured: { pathDigest: null, digest: null }, reported: { pathDigest: null, digest: null } };
     const unknown: BuzzPolicyReadiness = { verdict: "undeterminable", policyDigest: null, signer: null, recipient: null, policyIdentity };
     const sendPolicyFile = this.sendPolicyFile;
     if (!sendPolicyFile || !isAbsolute(sendPolicyFile)) return unknown;
     try {
       // Ask the same executable used by send, never a wrapper selected by a policy copy.
       const policyFile = realpathSync(sendPolicyFile);
-      policyIdentity.configured = { file: policyFile, digest: this.localSendPolicyDigest() };
+      policyIdentity.configured = { pathDigest: policyPathDigest(policyFile), digest: this.localSendPolicyDigest() };
       const result = await new Promise<{ code: number | null; stdout: string }>((resolve) => {
         const child = execFile(this.binary, ["__acp_policy_check_v1__", "--channel", channel, "--content", "-", "--mention", recipient],
         { encoding: "utf8", timeout: 60_000, maxBuffer: 16_000, env: this.#environment() }, (error, stdout) => {
@@ -213,14 +213,16 @@ export class BuzzCliTransport implements BuzzTransport {
         child.stdin?.end(content, "utf8");
       });
       const value = JSON.parse(result.stdout) as Record<string, unknown>;
+      const reportedFile = typeof value.policy_file === "string" ? value.policy_file : null;
       policyIdentity.reported = {
-        file: typeof value.policy_file === "string" ? value.policy_file : null,
+        pathDigest: reportedFile === null ? null : policyPathDigest(reportedFile),
         digest: typeof value.policy_digest === "string" && /^[a-f0-9]{64}$/.test(value.policy_digest) ? value.policy_digest : null,
       };
       // Compare the evaluated identity with the configured file, including edits during the read.
-      policyIdentity.configured = { file: realpathSync(sendPolicyFile), digest: this.localSendPolicyDigest() };
-      if (!policyIdentity.configured.digest || policyIdentity.configured.file !== policyFile ||
-        policyIdentity.reported.file !== policyIdentity.configured.file ||
+      // The paths are compared themselves; the identity records only their digests.
+      const configuredFile = realpathSync(sendPolicyFile);
+      policyIdentity.configured = { pathDigest: policyPathDigest(configuredFile), digest: this.localSendPolicyDigest() };
+      if (!policyIdentity.configured.digest || configuredFile !== policyFile || reportedFile !== configuredFile ||
         policyIdentity.reported.digest !== policyIdentity.configured.digest) return unknown;
       if (result.stdout.trim().split("\n").length !== 1 || value.protocol !== "acp.buzz-policy-check/v1" ||
         value.policy_file !== policyFile || value.channel !== channel ||

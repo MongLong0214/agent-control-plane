@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import type { Clock } from "../core/clock.ts";
+import type { AcpLocations } from "../core/credential-shapes.ts";
 import { canonicalJson, digestOf, isDigest } from "../core/digest.ts";
 import { newArtifactId } from "../core/ids.ts";
 import { fail } from "../core/errors.ts";
@@ -181,9 +182,11 @@ export const artifactDigestMatches = (
  * that could be edited after the fact is not evidence.
  */
 export class ArtifactStore {
+  /** `locations` are the ones the composition root computed: a verified location is checked against them. */
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
+    private readonly locations: AcpLocations = {},
   ) {}
 
   /**
@@ -345,7 +348,7 @@ export class ArtifactStore {
     // row, and CP-HI-06 makes the stored bytes the authority. So content carrying a
     // credential is *refused* rather than quietly altered — §31.5 is satisfied by
     // refusing to store it at all, and the producer is the one that must not include it.
-    const credential = credentialBearingField(content);
+    const credential = credentialBearingField(content, 0, [], { writer: kind, runId, locations: this.locations });
     if (credential) {
       fail(
         ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED,

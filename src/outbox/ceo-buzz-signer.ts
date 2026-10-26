@@ -2,6 +2,7 @@ import { decode } from "nostr-tools/nip19";
 import { getPublicKey } from "nostr-tools/pure";
 import type { Db } from "../db/database.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { sha256 } from "../core/digest.ts";
 
 /** Decode only the daemon credential formats supported by Buzz; never change the sending bytes. */
 export const daemonBuzzSigner = (credential: string | undefined): string | null => {
@@ -17,11 +18,18 @@ export const daemonBuzzSigner = (credential: string | undefined): string | null 
 /** Fixed failure categories emitted by the shared wrapper evaluator, never inferred from text. */
 export type BuzzPolicyCause = "POLICY" | "ROSTER_STATE" | "CREDENTIAL" | "AUTHORITY" | "UNKNOWN";
 
-/** Public file identities only; never credentials, notification bodies or policy contents. */
+/**
+ * Public file identities only; never credentials, notification bodies or policy contents. A policy
+ * file is named by `policyPathDigest` of its path, never by the path: the identity says whether the
+ * configured and the evaluated file are one file, and a path is free text the audit would read whole.
+ */
 export interface BuzzPolicyIdentity {
-  configured: { file: string | null; digest: string | null };
-  reported: { file: string | null; digest: string | null };
+  configured: { pathDigest: string | null; digest: string | null };
+  reported: { pathDigest: string | null; digest: string | null };
 }
+
+/** The identifier a policy file path is recorded as: `sha256:` and the digest of the path string. */
+export const policyPathDigest = (path: string): string => sha256(path);
 
 /** Authority consulted by a blocked attempt; contains no copy of its rules. */
 export interface BuzzPolicyBinding {

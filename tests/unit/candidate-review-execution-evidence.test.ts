@@ -1,12 +1,13 @@
-import { symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { sha256 } from "../../src/core/digest.ts";
 import { hasCredentialShape, redactCredentialValues } from "../../src/core/credential-shapes.ts";
+import { residentBootPacket, residentPrivateKeyFile, residentSessionSocket } from "../../src/core/resident-allocation-paths.ts";
 import type { ReviewPacket } from "../../src/review/blind-review.ts";
 import { reviewEvidenceBundleSchema } from "../../src/bootstrap/bootstrap-review-evidence.ts";
-import { credentialBearingField } from "../../src/db/audit.ts";
+import { AuditLog, credentialBearingField } from "../../src/db/audit.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
 import {
   CONFIG_FILE_CHAR_LIMIT,
@@ -573,6 +574,148 @@ describe("#1223 P1-A: the audit log and artifact store exempt only exact ACP-gen
     } finally { core.db.close(); }
   });
 
+  it("#1223 CI: only a location a verified ACP writer made reads per segment; no field name, path shape or look-alike id does", () => {
+    // The macOS runner's temp root has no `-` or `_`, so `/private/var/folders/nj/<30>/T/acp` is a
+    // 60-character base64-alphabet run, while no segment of it is.
+    const ciPath = "/private/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/acp-repo-Y0VU07";
+    const secretPath = `/opt/${"Ab9+Zq7x".repeat(8)}/checkout`;
+    const gateId = `acp:run_${"a".repeat(24)}:sha256:${hex64}:sha256:${hex64}`;
+    // A real checkout directory whose canonical path is also one long base64-alphabet run.
+    const verifiedDir = join(realpathSync(tempDir("acp-verified-")), "abcdefghij1234567890", "abcdefghij1234567890", "abcdefghij1234567890");
+    mkdirSync(verifiedDir, { recursive: true });
+    expect(verifiedDir).toMatch(/[A-Za-z0-9+/]{60,}/);
+    // Verified writers and fields: the CI path stores; a credential-shaped segment there is refused.
+    expect(credentialBearingField({ repositories: [{ proposedCheckoutPath: ciPath }] }, 0, [], { writer: "REPO_FACTORY_RESULT" })).toBeNull();
+    expect(credentialBearingField({ localBindings: [{ checkoutPath: ciPath, identity: `local:${verifiedDir}` }],
+      provisioning: { allocation: { clonePath: ciPath }, observations: { checkout: { path: ciPath }, resident: { cwd: ciPath } } } },
+    0, [], { writer: "BOOTSTRAP_ACTIVATION_RESULT" })).toBeNull();
+    expect(credentialBearingField({ repositories: [{ identity: `local:${verifiedDir}` }] }, 0, [], { writer: "CANDIDATE_SNAPSHOT" })).toBeNull();
+    expect(credentialBearingField({ repositories: [{ proposedCheckoutPath: secretPath }] }, 0, [], { writer: "REPO_FACTORY_RESULT" })).toBe("proposedCheckoutPath");
+    expect(credentialBearingField({ localBindings: [{ checkoutPath: secretPath }] }, 0, [], { writer: "BOOTSTRAP_ACTIVATION_RESULT" })).toBe("checkoutPath");
+    // A `local:` identity binds only to a real canonical directory: a path that is not one, a secret
+    // segment, or a non-path string is read whole, even in a verified field.
+    for (const identity of [`local:${ciPath}`, `local:${secretPath}`, `local:/${LONG_BASE64}`, `local:${LONG_BASE64}`]) {
+      expect(credentialBearingField({ repositories: [{ identity }] }, 0, [], { writer: "CANDIDATE_SNAPSHOT" }), identity).toBe("identity");
+    }
+    // No bypass by name: the same field under another writer, or any `*Path`/`*File` field, is read whole.
+    expect(credentialBearingField({ repositories: [{ proposedCheckoutPath: ciPath }] }, 0, [], { writer: "HANDOFF" })).toBe("proposedCheckoutPath");
+    // LONG_BASE64 holds `/`, so read per segment it would split into short pieces and pass.
+    expect(credentialBearingField({ fooPath: `/${LONG_BASE64}` }, 0, [], { writer: "HANDOFF" })).toBe("fooPath");
+    expect(credentialBearingField({ checkoutPath: `/${LONG_BASE64}` }, 0, [], { writer: "HANDOFF" })).toBe("checkoutPath");
+    expect(credentialBearingField({ keyFile: `/${LONG_BASE64}` }, 0, [], { writer: "BOOTSTRAP_ACTIVATION_RESULT" })).toBe("keyFile");
+    // No bypass by shape: an unverified `local:` value, or a non-path `local:` value in a verified field.
+    expect(credentialBearingField({ identity: `local:${verifiedDir}` }, 0, [], { writer: "HANDOFF" })).toBe("identity");
+    const core = makeCore();
+    try {
+      // The gate's external id stores only as the exact whole value; extra tokens make it free text.
+      expect(core.audit.record({ kind: "GATE_REJECTED", evidence: { observedExternalId: gateId } }).allowed).toBe(true);
+      expect(core.audit.byKind("GATE_REJECTED")[0]!.evidence).toEqual({ observedExternalId: gateId });
+      for (const forged of [`${gateId} extra`, `x ${gateId}`, `${gateId}:sha256:${hex64}`, `acp:${LONG_BASE64}`]) {
+        expect(core.audit.record({ kind: "GATE_REJECTED_FORGED", evidence: { observedExternalId: forged } }).allowed, forged).toBe(false);
+      }
+      // An audit writer that verified the path stores it; the same field from an unverified request does not.
+      expect(core.audit.record({ kind: "MANAGED_WRITE_GUARD_CONSUMED", evidence: { resolvedPath: ciPath, targetWorktreeId: ciPath } }).allowed).toBe(true);
+      expect(core.audit.byKind("MANAGED_WRITE_GUARD_CONSUMED")[0]!.evidence).toEqual({ resolvedPath: ciPath, targetWorktreeId: ciPath });
+      expect(core.audit.record({ kind: "MANAGED_WRITE_GUARD", evidence: { targetPath: ciPath } }).allowed).toBe(true);
+      expect(core.audit.byKind("MANAGED_WRITE_GUARD")[0]!.evidence).toEqual({ targetPath: "[redacted]-repo-Y0VU07" });
+      expect(core.audit.record({ kind: "MANAGED_WRITE_GUARD_CONSUMED", evidence: { resolvedPath: secretPath } }).allowed).toBe(true);
+      expect(core.audit.byKind("MANAGED_WRITE_GUARD_CONSUMED")[1]!.evidence).toEqual({ resolvedPath: "/opt/[redacted]/checkout" });
+      // An audit location field has no verified writer: a secret path is redacted whole, an unknown one refused.
+      expect(core.audit.record({ kind: "TEST_UNVERIFIED_PATH", evidence: { checkoutPath: secretPath } }).allowed).toBe(true);
+      expect(core.audit.byKind("TEST_UNVERIFIED_PATH")[0]!.evidence).toEqual({ checkoutPath: "[redacted]" });
+      expect(core.audit.record({ kind: "TEST_UNVERIFIED_PATH", evidence: { fooPath: `/${LONG_BASE64}` } }).allowed).toBe(false);
+      expect(core.audit.record({ kind: "TEST_UNVERIFIED_PATH", evidence: { lock: `/${LONG_BASE64}` } }).allowed).toBe(false);
+    } finally { core.db.close(); }
+  });
+
+  it("#1223 CEO: an approved writer-field pair reads per segment only at the location its production contract computes", () => {
+    const ciRoot = "/private/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/acp-harness-Y0VU07";
+    const secretRoot = `/opt/${"Ab9+Zq7x".repeat(8)}`;
+    // The allocator's socket, under the state root, for the `projectId` beside it (built by the allocator's own function).
+    const allocation = (root: string, projectId = "resident-test") =>
+      ({ provisioning: { allocation: { projectId: "resident-test", socketPath: residentSessionSocket(root, projectId) } } });
+    const activation = (stateRoot: string | null) => ({ writer: "BOOTSTRAP_ACTIVATION_RESULT", locations: { stateRoot } });
+    expect(credentialBearingField(allocation(ciRoot), 0, [], activation(ciRoot))).toBeNull();
+    // No provenance: no state root known, another root, another project's name, another writer, a secret segment.
+    expect(credentialBearingField(allocation(ciRoot), 0, [], activation(null))).toBe("socketPath");
+    expect(credentialBearingField(allocation(ciRoot), 0, [], activation(`${ciRoot}x`))).toBe("socketPath");
+    expect(credentialBearingField(allocation(ciRoot, "other"), 0, [], activation(ciRoot))).toBe("socketPath");
+    expect(credentialBearingField(allocation(ciRoot), 0, [], { writer: "HANDOFF", locations: { stateRoot: ciRoot } })).toBe("socketPath");
+    expect(credentialBearingField(allocation(secretRoot), 0, [], activation(secretRoot))).toBe("socketPath");
+
+    // The resident's key file (its location only) and boot packet, under the resident home, for the `projectId` beside them.
+    const home = join(ciRoot, "home");
+    const atHome = (residentHome: string | null) => ({ writer: "BOOTSTRAP_ACTIVATION_RESULT", locations: { residentHome } });
+    const resident = (root: string, projectId = "resident-test") => ({ provisioning: { allocation: { projectId: "resident-test",
+      privateKeyFile: residentPrivateKeyFile(root, projectId), bootPacket: residentBootPacket(root, projectId) } } });
+    expect(resident(home).provisioning.allocation.privateKeyFile).toMatch(/[A-Za-z0-9+/]{60,}/);
+    expect(credentialBearingField(resident(home), 0, [], atHome(home))).toBeNull();
+    for (const field of ["privateKeyFile", "bootPacket"] as const) {
+      const only = (root: string, projectId?: string) =>
+        ({ provisioning: { allocation: { projectId: "resident-test", [field]: resident(root, projectId).provisioning.allocation[field] } } });
+      // No provenance: no home known, another home, another project's name, another writer, a secret segment.
+      expect(credentialBearingField(only(home), 0, [], atHome(null)), field).toBe(field);
+      expect(credentialBearingField(only(home), 0, [], atHome(`${home}x`)), field).toBe(field);
+      expect(credentialBearingField(only(home, "other"), 0, [], atHome(home)), field).toBe(field);
+      expect(credentialBearingField(only(home), 0, [], { writer: "HANDOFF", locations: { residentHome: home } }), field).toBe(field);
+      expect(credentialBearingField(only(secretRoot), 0, [], atHome(secretRoot)), field).toBe(field);
+    }
+
+    // A run's GitHub ledger, `<work root>/<runId>/github-ledger/<role>.json`, for the run the record is filed under.
+    const workRoot = join(ciRoot, "repo-factory");
+    const runId = `run_${"a".repeat(24)}`;
+    const otherRun = `run_${"b".repeat(24)}`;
+    const ledger = join(workRoot, runId, "github-ledger", "primary.json");
+    const receipt = (ledgerPath: string) => ({ preconditionsChecked: [{ precondition: "p", satisfied: true, evidence: { ledgerPath } }] });
+    const repair = (run: string | null, root: string | null) => ({ writer: "REPAIR_RECEIPT", runId: run, locations: { repoFactoryWorkRoot: root } });
+    expect(credentialBearingField(receipt(ledger), 0, [], repair(runId, workRoot))).toBeNull();
+    // No provenance: another run, no work root known, another work root, not a ledger name, a secret segment.
+    expect(credentialBearingField(receipt(ledger), 0, [], repair(otherRun, workRoot))).toBe("ledgerPath");
+    expect(credentialBearingField(receipt(ledger), 0, [], repair(runId, null))).toBe("ledgerPath");
+    expect(credentialBearingField(receipt(ledger), 0, [], repair(runId, ciRoot))).toBe("ledgerPath");
+    expect(credentialBearingField(receipt(join(workRoot, runId, "github-ledger", "primary.txt")), 0, [], repair(runId, workRoot))).toBe("ledgerPath");
+    expect(credentialBearingField(receipt(join(secretRoot, runId, "github-ledger", "primary.json")), 0, [], repair(runId, secretRoot))).toBe("ledgerPath");
+
+    const core = makeCore();
+    try {
+      const audit = new AuditLog(core.db, core.clock, { repoFactoryWorkRoot: workRoot });
+      const refusal = (ledgerPath: string) => ({ operationId: "release_bootstrap_reservation",
+        preconditions: [{ precondition: "p", satisfied: false, evidence: { cause: "LEDGER_MISSING", ledgerPath } }] });
+      expect(audit.record({ kind: "REPAIR_REFUSED", runId, evidence: refusal(ledger) }).allowed).toBe(true);
+      expect(audit.byKind("REPAIR_REFUSED")[0]!.evidence).toEqual(refusal(ledger));
+      // The same value filed under another run, by a store with no work root, or by another writer.
+      expect(audit.record({ kind: "REPAIR_REFUSED", runId: otherRun, evidence: refusal(ledger) }).allowed).toBe(false);
+      expect(core.audit.record({ kind: "REPAIR_REFUSED", runId, evidence: refusal(ledger) }).allowed).toBe(false);
+      expect(audit.record({ kind: "TEST_REPAIR_REFUSED", runId, evidence: refusal(ledger) }).allowed).toBe(false);
+
+      // The served entrypoint: a canonical file whose bytes have the `entrypointSha256` recorded beside it.
+      const canonical = join(realpathSync(tempDir("acp-served-")), "abcdefghij1234567890", "abcdefghij1234567890", "abcdefghij1234567890");
+      const daemonDir = join(canonical, `generation-${hex64.slice(0, 40)}`, "dist", "daemon");
+      mkdirSync(daemonDir, { recursive: true });
+      const entrypoint = join(daemonDir, "agentcpd.js");
+      writeFileSync(entrypoint, "served bytes");
+      expect(entrypoint).toMatch(/[A-Za-z0-9+/]{60,}/);
+      // A link whose path is a long run only across its segments, as the canonical path is.
+      const linkParent = join(realpathSync(tempDir("acp-served-link-")), "abcdefghij1234567890", "abcdefghij1234567890");
+      mkdirSync(linkParent, { recursive: true });
+      const linked = join(linkParent, "abcdefghij1234567890");
+      symlinkSync(daemonDir, linked);
+      const observed = (resolvedPath: string, bytes = "served bytes") => ({ entrypointSha256: sha256(bytes), resolvedPath });
+      expect(audit.record({ kind: "DAEMON_RUNTIME_OBSERVED", evidence: observed(entrypoint) }).allowed).toBe(true);
+      expect(audit.byKind("DAEMON_RUNTIME_OBSERVED")[0]!.evidence).toEqual(observed(entrypoint));
+      // No provenance: other bytes' digest, a missing file, a link to the file, another writer. Read whole, redacted.
+      for (const [kind, evidence] of [
+        ["DAEMON_RUNTIME_OBSERVED", observed(entrypoint, "other bytes")],
+        ["DAEMON_RUNTIME_OBSERVED", observed(join(daemonDir, "missing.js"))],
+        ["DAEMON_RUNTIME_OBSERVED", observed(join(linked, "agentcpd.js"))],
+        ["DAEMON_START_REFUSED", observed(entrypoint)],
+      ] as const) {
+        expect(audit.record({ kind, evidence }).allowed, evidence.resolvedPath).toBe(true);
+        expect(audit.byKind(kind).at(-1)!.evidence["resolvedPath"], evidence.resolvedPath).toContain("[redacted]");
+      }
+    } finally { core.db.close(); }
+  });
+
   it("the audit log stores a long-base64 run in free text redacted", () => {
     const core = makeCore();
     try {
@@ -596,8 +739,8 @@ describe("#1223 P1-A: the audit log and artifact store exempt only exact ACP-gen
         [{ reason: `superseded by PLAN sha256:${hex64} after ${LONG_BASE64}` }, { reason: `superseded by PLAN sha256:${hex64} after [redacted]` }],
         [{ reason: `superseded by PLAN sha256:${hex64}${"A".repeat(8)}` }, { reason: "superseded by PLAN sha256:[redacted]" }],
         [{ reason: `MY_TOKEN=sha256:${hex64}` }, { reason: "[redacted]" }],
-        [{ resolvedPath: `/opt/${LONG_BASE64}/generation-${hex40}/dist/daemon/agentcpd.js` },
-          // The run the secret forms with its neighbouring segments goes whole; the generation id stays.
+        // Read whole, the run a secret forms with its neighbouring segments goes; the generation id stays.
+        [{ resolvedPath: `/opt/${"Ab9+Zq7x".repeat(8)}/generation-${hex40}/dist/daemon/agentcpd.js` },
           { resolvedPath: `[redacted]-${hex40}/dist/daemon/agentcpd.js` }],
         // Not exempt under any other key: the exceptions are per field, never a whole kind of value.
         [{ detail: `superseded by PLAN sha256:${hex64}` }, { detail: "superseded by PLAN sha256:[redacted]" }],

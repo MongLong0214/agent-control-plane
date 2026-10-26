@@ -3,6 +3,7 @@ import { readProcessStartToken } from '../core/process-argv.ts';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { canonicalJson } from '../core/digest.ts';
+import { residentBootPacket, residentPrivateKeyFile, residentSessionSocket } from '../core/resident-allocation-paths.ts';
 import type { Db } from '../db/database.ts';
 import type { Clock } from '../core/clock.ts';
 import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
@@ -54,8 +55,8 @@ export class ResidentProjectProvisioning {
       if (!a) {
         const repoName = input.repositoryIdentity.split('/')[1]!;
         a = {projectId:input.projectId,runId:input.runId,repositoryIdentity:input.repositoryIdentity,repositoryNodeId:input.repositoryNodeId,head:input.head,
-          sessionUuid:randomUUID(),roomId:randomUUID(),roomName:input.projectId,clonePath:join(this.home,'projects',repoName),tmuxName:`acp-${Buffer.from(input.projectId).toString("hex")}`,socketPath:join(this.stateDir,`cc-session-${input.projectId}.sock`),
-          fleetName:`acp-${input.projectId}`,identityName:`cto-${input.projectId}`,privateKeyFile:join(this.home,'.hermes','bridge','keys',`cto-${input.projectId}.priv`),bootPacket:join(this.home,'.claude','watchers','fleet',`acp-${input.projectId}.boot.txt`),nonce:randomUUID()};
+          sessionUuid:randomUUID(),roomId:randomUUID(),roomName:input.projectId,clonePath:join(this.home,'projects',repoName),tmuxName:`acp-${Buffer.from(input.projectId).toString("hex")}`,socketPath:residentSessionSocket(this.stateDir,input.projectId),
+          fleetName:`acp-${input.projectId}`,identityName:`cto-${input.projectId}`,privateKeyFile:residentPrivateKeyFile(this.home,input.projectId),bootPacket:residentBootPacket(this.home,input.projectId),nonce:randomUUID()};
         this.db.run(`UPDATE resident_project_provisioning SET allocation_json = ? WHERE run_id = ? AND allocation_json = '{}'`,[JSON.stringify(a),input.runId]);
         a = this.allocation(input.runId)!;
       }
@@ -154,7 +155,7 @@ export class ResidentProjectProvisioning {
       const legacy = this.db.get<{session_uuid:string;buzz_address:string;identity:string;checkout_path:string;last_observed_head:string|null;os_pid:number|null;os_process_started_at:string|null}>(`SELECT e.session_uuid,e.buzz_address,r.identity,r.checkout_path,r.last_observed_head,s.os_pid,s.os_process_started_at FROM canonical_session_entitlements e JOIN repositories r ON r.project_id = e.project_id AND r.retired_at IS NULL LEFT JOIN assignments b ON b.project_id = e.project_id AND b.role = 'PRIMARY_CTO' AND b.status = 'ACTIVE' LEFT JOIN conversational_actors c ON c.actor_id = b.actor_id LEFT JOIN sessions s ON s.session_id = c.current_session_id WHERE e.project_id = ? ORDER BY r.repository_id LIMIT 1`,[projectId]);
       if (!legacy) return;
       if (!this.host) throw new Error('legacy retirement host unavailable');
-      const allocation:ProjectAllocation = {projectId,runId:`legacy-retire:${projectId}`,repositoryIdentity:legacy.identity,repositoryNodeId:'legacy-history',head:legacy.last_observed_head ?? '0'.repeat(40),sessionUuid:legacy.session_uuid,roomId:legacy.buzz_address,clonePath:legacy.checkout_path,tmuxName:`acp-${Buffer.from(projectId).toString("hex")}`,socketPath:join(this.stateDir,`cc-session-${projectId}.sock`),fleetName:`acp-${projectId}`,identityName:`cto-${projectId}`,privateKeyFile:join(this.home,'.hermes','bridge','keys',`cto-${projectId}.priv`),bootPacket:join(this.home,'.claude','watchers','fleet',`acp-${projectId}.boot.txt`),nonce:'retirement',...(legacy.os_pid && legacy.os_process_started_at ? {retirementPin:{pid:legacy.os_pid,startedAt:legacy.os_process_started_at}} : {})};
+      const allocation:ProjectAllocation = {projectId,runId:`legacy-retire:${projectId}`,repositoryIdentity:legacy.identity,repositoryNodeId:'legacy-history',head:legacy.last_observed_head ?? '0'.repeat(40),sessionUuid:legacy.session_uuid,roomId:legacy.buzz_address,clonePath:legacy.checkout_path,tmuxName:`acp-${Buffer.from(projectId).toString("hex")}`,socketPath:residentSessionSocket(this.stateDir,projectId),fleetName:`acp-${projectId}`,identityName:`cto-${projectId}`,privateKeyFile:residentPrivateKeyFile(this.home,projectId),bootPacket:residentBootPacket(this.home,projectId),nonce:'retirement',...(legacy.os_pid && legacy.os_process_started_at ? {retirementPin:{pid:legacy.os_pid,startedAt:legacy.os_process_started_at}} : {})};
       if (!(await this.host.invoke('retire',allocation)).retired) throw new Error('legacy retirement incomplete');
       await this.#reconcile(allocation,'');
       return;

@@ -1,3 +1,8 @@
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
+import { sha256 } from "./digest.ts";
+import { residentBootPacket, residentPrivateKeyFile, residentSessionSocket } from "./resident-allocation-paths.ts";
+
 /**
  * The one list of credential shapes ACP recognises. Every consumer reads it from here: the
  * verification sandbox's environment filter (`verify/sandbox.ts`), an agent CLI's environment
@@ -69,6 +74,9 @@ const ACP_ID_FORMATS: readonly RegExp[] = [
   // A run id is exactly what `mint` in core/ids.ts makes (`run_` and 24 hex); generation and event
   // id are counts, bounded (runtime/provisioned-session-runtime.ts).
   /^bootstrap-(?:review-retry|result-recovery):run_[0-9a-f]{24}:\d{1,9}:sha256:[0-9a-f]{64}(?::\d{1,9})?$/,
+  // A production gate check's external id (github/github-kernel.ts gateExternalId): run id, snapshot
+  // digest, payload digest.
+  /^acp:run_[0-9a-f]{24}:sha256:[0-9a-f]{64}:sha256:[0-9a-f]{64}$/,
 ];
 
 /** A whole value in one of `ACP_ID_FORMATS`, whose caller-named part holds no shape of its own. */
@@ -116,6 +124,25 @@ const AUDIT_TOKENS: ReadonlyMap<string, RegExp> = new Map([
   ["resolvedPath", /(?<=\/generation-)(?:[0-9a-f]{64}|[0-9a-f]{40})(?=\/)/g],
 ]);
 
+/** Locations ACP computed from its own configuration for the store a record is written to. */
+export interface AcpLocations {
+  /** The state directory, `dirname(databasePath)`: it holds each resident session's socket. */
+  readonly stateRoot?: string | null;
+  /** The resident home a resident project's clone, key file and boot packet are allocated under. */
+  readonly residentHome?: string | null;
+  /** The repo-factory work root: `<workRoot>/<runId>` holds a run's checkout and GitHub ledger. */
+  readonly repoFactoryWorkRoot?: string | null;
+}
+
+/** Where a record is being written: the facts a verified location's contract is checked against. */
+export interface WriteSite {
+  /** The artifact kind or audit event kind being written: which ACP code path wrote the value. */
+  readonly writer: string;
+  /** The run the record is filed under: an artifact's run, an audit event's `runId`. */
+  readonly runId?: string | null;
+  readonly locations?: AcpLocations;
+}
+
 /**
  * A field of ACP's own evidence: its key path (property names, array positions left out) and the
  * store it is written to. Free text and external values (an environment value, command output)
@@ -124,6 +151,9 @@ const AUDIT_TOKENS: ReadonlyMap<string, RegExp> = new Map([
 export interface EvidenceField {
   readonly path: readonly string[];
   readonly store: "audit" | "artifact";
+  readonly site?: WriteSite;
+  /** The object that holds the value: a location contract reads the value's sibling fields there. */
+  readonly holder?: unknown;
 }
 
 export const REDACTED = "[redacted]";
@@ -217,7 +247,118 @@ const REPOSITORY_PATH_FIELDS: Readonly<Record<EvidenceField["store"], ReadonlySe
  */
 const isRepositoryPath = (text: string, field: EvidenceField | undefined): boolean =>
   // A whole-value ACP id there (`<project>:#manifest/sha256:<hex>`) keeps the id rule it has today.
-  field !== undefined && REPOSITORY_PATH_FIELDS[field.store].has(field.path.join(".")) && !isAcpId(text);
+  field !== undefined && !isAcpId(text) && REPOSITORY_PATH_FIELDS[field.store].has(field.path.join("."));
+
+/** Whether a value is the location its writer's contract makes: given the value, its field and write site. */
+type LocationContract = (text: string, field: EvidenceField) => boolean;
+
+/** A checkout, worktree or cwd path the writer made or probed itself (see `VERIFIED_LOCATIONS`). */
+const absolutePath: LocationContract = (text) => /^\/\S*$/.test(text);
+
+/**
+ * The registry's `local:` identity contract (repository-registry.ts: `local:` and the canonical git
+ * toplevel of a verified checkout): the path must be an existing directory that is its own canonical
+ * path. Any other `local:<string>`, a secret in that shape included, is read whole.
+ */
+const localIdentity: LocationContract = (text) => {
+  const match = /^local:(\/\S*)$/.exec(text);
+  if (!match) return false;
+  try { return statSync(match[1]!).isDirectory() && realpathSync(match[1]!) === match[1]; } catch { return false; }
+};
+
+const sibling = (field: EvidenceField, key: string): unknown =>
+  field.holder !== null && typeof field.holder === "object" && !Array.isArray(field.holder)
+    ? (field.holder as Readonly<Record<string, unknown>>)[key] : undefined;
+
+/**
+ * A path resident-project-provisioning.ts allocates, built by the same function from the root
+ * control-plane.ts computes (the state directory or the resident home) and the allocation's own
+ * `projectId`, which sits beside it. Only exactly that path is it; with no root known, nothing is.
+ * The comparison is of the location alone: no file is read.
+ */
+const allocatedPath = (
+  root: "stateRoot" | "residentHome", build: (root: string, projectId: string) => string,
+): LocationContract => (text, field) => {
+  const known = field.site?.locations?.[root];
+  const projectId = sibling(field, "projectId");
+  return typeof known === "string" && typeof projectId === "string" && text === build(known, projectId);
+};
+
+const PATH_SAFE_RUN_ID = /^[A-Za-z0-9_-]+$/;
+/** A repository role as repo-factory-producer.ts admits it: kebab-case. */
+const REPOSITORY_ROLE = /^[a-z0-9][a-z0-9-]*$/;
+
+/**
+ * repo-factory-github.ts `githubLedgerPath(join(workRoot, runId), role)`: the configured work root,
+ * resolved, the run the record is filed under, `github-ledger` and `<role>.json`. Only exactly that
+ * path is it; with no work root or run known, nothing is.
+ */
+const runLedger: LocationContract = (text, field) => {
+  const workRoot = field.site?.locations?.repoFactoryWorkRoot;
+  const runId = field.site?.runId;
+  if (typeof workRoot !== "string" || typeof runId !== "string" || !PATH_SAFE_RUN_ID.test(runId)) return false;
+  const role = basename(text, ".json");
+  return REPOSITORY_ROLE.test(role) && text === join(resolve(join(workRoot, runId)), "github-ledger", `${role}.json`);
+};
+
+/**
+ * bootstrap-runtime-observation.ts records the served entrypoint's canonical path beside the digest
+ * of its bytes, `entrypointSha256`. Only a canonical file whose bytes have that digest is it.
+ */
+const observedEntrypoint: LocationContract = (text, field) => {
+  const digest = sibling(field, "entrypointSha256");
+  if (typeof digest !== "string" || !text.startsWith("/")) return false;
+  try { return realpathSync(text) === text && statSync(text).isFile() && sha256(readFileSync(text)) === digest; }
+  catch { return false; }
+};
+
+/**
+ * Locations that ACP code itself made or checked, by the writer that stores them and the exact
+ * field, each with the contract its value must meet: only a value that meets it is read per segment,
+ * because it is that location, not because it looks like one. A temp directory's random segments can
+ * join `/` into a long base64-alphabet run (`/private/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/acp`
+ * is 60 such characters on a CI runner) while no segment is one. A field of the same name from any
+ * other writer, a value that does not meet its contract, and every other field, is read whole.
+ */
+const VERIFIED_LOCATIONS: ReadonlyMap<string, ReadonlyMap<string, LocationContract>> = new Map([
+  // repo-factory-producer.ts makes `proposedCheckoutPath` itself (repositoryCheckoutPath under its work
+  // directory, created with mkdirSync), and the runner refuses a result whose path is not the run's own.
+  ["artifact:REPO_FACTORY_RESULT", new Map([["repositories.proposedCheckoutPath", absolutePath]])],
+  ["artifact:BOOTSTRAP_ACTIVATION_RESULT", new Map([
+    // activation.ts: the repository registry's own record of each checkout it registered.
+    ["localBindings.checkoutPath", absolutePath], ["localBindings.identity", localIdentity],
+    // resident-project-provisioning.ts allocates the clone path under its own home, and accepts a host
+    // observation only when the checkout path and the resident's cwd equal that allocated path.
+    ["provisioning.allocation.clonePath", absolutePath],
+    ["provisioning.observations.checkout.path", absolutePath], ["provisioning.observations.resident.cwd", absolutePath],
+    ["provisioning.allocation.socketPath", allocatedPath("stateRoot", residentSessionSocket)],
+    ["provisioning.allocation.privateKeyFile", allocatedPath("residentHome", residentPrivateKeyFile)],
+    ["provisioning.allocation.bootPacket", allocatedPath("residentHome", residentBootPacket)],
+  ])],
+  // candidate-snapshot.ts freezes the registry's identity of each checkout; the verification engine
+  // copies it from that snapshot.
+  ["artifact:CANDIDATE_SNAPSHOT", new Map([["repositories.identity", localIdentity]])],
+  ["artifact:VERIFICATION", new Map([["results.repositoryIdentity", localIdentity], ["results.output.repositoryIdentity", localIdentity]])],
+  // doctor/repair.ts: a reservation release's preconditions name the ledger the run's attempts wrote.
+  ["artifact:REPAIR_RECEIPT", new Map([["preconditionsChecked.evidence.ledgerPath", runLedger]])],
+  // repository-registry.ts: the canonical git toplevel it registered, and the identity it made from it.
+  ["audit:REPOSITORY_REGISTERED", new Map([["checkoutPath", absolutePath], ["identity", localIdentity]])],
+  ["audit:REPOSITORY_TEMPORARY_BINDING", new Map([["checkoutPath", absolutePath], ["identity", localIdentity]])],
+  // managed-write-guard.ts: a consumed grant's canonical target, granted only inside a checkout or
+  // worktree the guard probed; its canonical worktree, which a GIT_WORKTREE grant must match to that
+  // effect path (or, to prune, own as the run's verification tree); and its registered repository.
+  ["audit:MANAGED_WRITE_GUARD_CONSUMED", new Map([
+    ["resolvedPath", absolutePath], ["targetWorktreeId", absolutePath], ["repositoryIdentity", localIdentity],
+  ])],
+  ["audit:REPAIR_REFUSED", new Map([["preconditions.evidence.ledgerPath", runLedger]])],
+  ["audit:DAEMON_RUNTIME_OBSERVED", new Map([["resolvedPath", observedEntrypoint]])],
+]);
+
+const isVerifiedLocation = (text: string, field: EvidenceField | undefined): boolean => {
+  if (field?.site === undefined || isAcpId(text)) return false;
+  const contract = VERIFIED_LOCATIONS.get(`${field.store}:${field.site.writer}`)?.get(field.path.join("."));
+  return contract !== undefined && contract(text, field);
+};
 
 const segmentsHoldShape = (text: string): boolean => text.split("/").some((segment) => holdsShape(segment, CREDENTIAL_SHAPES));
 
@@ -227,7 +368,7 @@ const GLOBAL = new Map(CREDENTIAL_SHAPES.map((shape) => [shape, new RegExp(shape
  * Whether `text` holds a listed shape. `field` is given only for a field of ACP's own evidence: it
  * lets `isAcpGeneratedField` values, such fields inside the records at a `SERIALIZED_PATHS` path,
  * and an `AUDIT_TOKENS` token inside its audit field, skip the long-base64 shape, and reads a
- * `REPOSITORY_PATH_FIELDS` path per segment.
+ * `REPOSITORY_PATH_FIELDS` path, and a value that meets its `VERIFIED_LOCATIONS` contract, per segment.
  */
 export const hasCredentialShape = (text: string, field?: EvidenceField): boolean => {
   const kind = serializedKind(field);
@@ -236,11 +377,16 @@ export const hasCredentialShape = (text: string, field?: EvidenceField): boolean
   return fieldHoldsShape(text, field);
 };
 
-/** One field's string, not serialized records: a repository path per segment, else the whole value. */
+/**
+ * One field's string, not serialized records: a repository path per segment, else the whole value,
+ * and a verified location per segment. A segment's shape is always also the whole value's, so the
+ * location's contract is checked only for a value whose whole holds a shape.
+ */
 const fieldHoldsShape = (text: string, field: EvidenceField | undefined): boolean => {
-  if (isRepositoryPath(text, field)) return segmentsHoldShape(text);
   const aside = setAside(text, tokensFor(field));
-  return holdsShape(aside.text, shapesFor(text, field?.path));
+  if (isRepositoryPath(text, field)) return segmentsHoldShape(aside.text);
+  if (!holdsShape(aside.text, shapesFor(text, field?.path))) return false;
+  return !isVerifiedLocation(text, field) || segmentsHoldShape(aside.text);
 };
 
 const redactWith = (text: string, shapes: readonly RegExp[]): string => {
@@ -268,9 +414,10 @@ export const redactCredentialShapes = (text: string, field?: EvidenceField): str
     (field !== undefined && serializedHoldsShape(record, field.store) ? redactWith(record, CREDENTIAL_SHAPES) : record);
   if (kind === "jsonl") return text.split("\n").map(asRecord).join("\n");
   if (kind === "json") return asRecord(text);
-  if (isRepositoryPath(text, field)) return redactSegments(text);
   const aside = setAside(text, tokensFor(field));
-  return putBack(redactWith(aside.text, shapesFor(text, field?.path)), aside.tokens);
+  const shapes = shapesFor(text, field?.path);
+  const perSegment = isRepositoryPath(text, field) || (holdsShape(aside.text, shapes) && isVerifiedLocation(text, field));
+  return putBack(perSegment ? redactSegments(aside.text) : redactWith(aside.text, shapes), aside.tokens);
 };
 
 /**
