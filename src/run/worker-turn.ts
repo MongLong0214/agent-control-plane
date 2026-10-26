@@ -11,7 +11,7 @@ import { fixedRuntimes } from "../domain/fixed-role-runtime.ts";
 import { type FailureClass, Role, RunKind, SessionLifecycle, TaskState, roleKeyFor } from "../domain/types.ts";
 import { type ManagedWriteGuard, WriteOperation } from "../guard/managed-write-guard.ts";
 import { canonical } from "../guard/workspace-probe.ts";
-import { residentRepository } from "../registry/worker-checkout.ts";
+import { residentRepository } from "../registry/resident-repositories.ts";
 import { providerHome } from "../runtime/cli-adapters.ts";
 import type { InvocationResult, ProviderAdapter } from "../runtime/provider.ts";
 import { randomUUID } from "node:crypto";
@@ -1383,10 +1383,11 @@ export class WorkerTurnRunner {
     // Re-entry: the checkout is on the task's branch already; the preparation that follows reads it.
     if (branch === target.branch) return allow(ReasonCode.OK, undefined);
     let handoff: { runId: string; taskId: string; branch: string } | null = null;
-    // #1227 — a resident project's worker checkout rests detached: the base branch is checked out in the
-    // resident's clone, and a branch is never checked out twice. Only that checkout is taken from a
-    // detached HEAD; any other detached checkout is someone's, and is not moved.
-    const resting = branch === null && residentRepository(this.ports.db, facts.claim.repositoryId)?.workerCheckoutPath === worktree;
+    // #1227 — a resident project's worker clone rests detached, so its base branch is a ref nobody has
+    // checked out, which follows each run's pin (below). Only that checkout is taken from a detached
+    // HEAD; any other detached checkout is someone's, and is not moved.
+    const dedicated = residentRepository(this.ports.db, facts.claim.repositoryId)?.workerCheckoutPath === worktree;
+    const resting = branch === null && dedicated;
     if (branch !== facts.claim.baseBranch && !resting) {
       const previous = branch === null ? null : this.finishedTaskBranch(facts, branch);
       if (!previous) {
@@ -1399,16 +1400,14 @@ export class WorkerTurnRunner {
       if (!previous.allowed) return previous as Decision<never>;
       handoff = previous.value;
     }
-    // A branch another worktree of the repository stands on (the resident's clone, say) is not checked
-    // out here as well: a commit on it would move that tree's HEAD from under its files.
-    const holder = await worktreeOn(repo, target.branch);
-    if (holder !== null) {
-      return deny(
-        ReasonCode.CONFLICT,
-        "the task's branch is checked out in another worktree of the repository; a branch is never checked out twice, and neither tree is moved",
-        { worktreeId: worktree, branch: target.branch, checkedOutAt: holder },
-      );
-    }
+    // #1227 — a resident's worker clone has its own base branch, which no one checks out: it follows the
+    // run's pinned base (read from the resident's clone), so freeze and freshness read the base its task
+    // branches were made from. Only a branch other than the one checked out is moved, and only here,
+    // where no turn runs in this checkout.
+    const baseRef = `refs/heads/${facts.claim.baseBranch}`;
+    const mirrors = dedicated && branch !== facts.claim.baseBranch;
+    const baseNow = mirrors ? await commitOf(repo, baseRef) : null;
+    const mirrorBase = mirrors && baseNow !== target.baseSha ? { ref: baseRef, sha: target.baseSha, was: baseNow } : null;
     const unclean = await uncleanPaths(repo, head, format, "branch");
     if (unclean.length > 0) {
       return deny(
@@ -1453,6 +1452,7 @@ export class WorkerTurnRunner {
         effect.outcome = await switchToTaskBranch(repo, {
           head,
           branch,
+          mirrorBase,
           tip,
           to,
           target,
@@ -1498,6 +1498,7 @@ export class WorkerTurnRunner {
           fromBranch: branch,
           created: tip === null,
           checkedOut: needsCheckout,
+          ...(mirrorBase ? { baseFollowedPin: { branch: facts.claim.baseBranch, from: mirrorBase.was, to: mirrorBase.sha } } : {}),
           handoffFrom: handoff,
           // #1242 — the base a task with dependsOn predecessors started from, and which tasks it holds.
           ...(target.startsFrom ? { startsFrom: target.startsFrom } : {}),
@@ -2340,18 +2341,6 @@ const headRefOf = async (repo: PinnedRepository): Promise<string | null> => {
   return read.exitCode === 0 ? read.stdout.trim() : null;
 };
 
-/** #1227 — the other worktree of the repository whose HEAD names `branch`, or null; a listing git did not give throws. */
-const worktreeOn = async (repo: PinnedRepository, branch: string): Promise<string | null> => {
-  const listed = await runPinnedGit(repo, ["worktree", "list", "--porcelain", "-z"]);
-  if (listed.exitCode !== 0) throw new Error(`git worktree list ${gitWords(listed)}`);
-  let tree: string | null = null;
-  for (const field of listed.stdout.split("\0")) {
-    if (field.startsWith("worktree ")) tree = field.slice("worktree ".length);
-    else if (field === `branch refs/heads/${branch}` && tree !== null && canonical(tree) !== repo.workTree) return tree;
-  }
-  return null;
-};
-
 /** Each path's mode and object id in `tree`, for the paths asked; a path the tree lacks is absent. */
 const treeEntriesOf = async (repo: PinnedRepository, tree: string, paths: readonly string[]): Promise<Map<string, { mode: string; oid: string }>> => {
   const entries = new Map<string, { mode: string; oid: string }>();
@@ -2466,6 +2455,8 @@ const switchToTaskBranch = async (
     head: string;
     /** The branch HEAD named when it was read; null for a detached HEAD (#1227: a resident's worker checkout at rest). */
     branch: string | null;
+    /** #1227 — a worker clone's base branch, moved to the run's pinned base before anything else is written. */
+    mirrorBase: { ref: string; sha: string; was: string | null } | null;
     tip: string | null;
     to: string;
     target: TaskWriteTarget;
@@ -2501,6 +2492,13 @@ const switchToTaskBranch = async (
       "the registered checkout changed before its task branch was made; nothing was created or moved, and the change is left where it is",
       { paths: unclean.slice(0, 50) },
     );
+  }
+  if (input.mirrorBase) {
+    const { ref, sha, was } = input.mirrorBase;
+    const followed = await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: the worker checkout's base follows the run's pinned base", ref, sha, was ?? ZERO_OID[input.format]]);
+    if (followed.exitCode !== 0) {
+      return refused("the worker checkout's base branch could not be moved to the run's pinned base; nothing was created or moved", { error: gitWords(followed) });
+    }
   }
   if (input.needsCheckout) {
     // The index's stat cache can be stale where the control plane's own commit updated entries without

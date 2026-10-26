@@ -1,4 +1,4 @@
-import { lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
@@ -20,8 +20,10 @@ import { FakeWorkerAdapter, type FakeTurnScript, seedWorkerWorld } from "../help
  * session cron lock (`.claude/scheduled_tasks.lock`), its own local settings, notes, an edit in
  * progress. Worker turns ran in that same checkout, so every one of those was in front of the worker
  * scan and could reach a candidate. A resident project's worker turns now get their own checkout: a
- * linked worktree of the clone the daemon adds beside it and registers in its place, moving an
- * existing project's HELD claims and the task branch its clone stood on with it.
+ * separate local clone of the resident's clone, with its own git dir and hardlinked objects, which the
+ * daemon makes beside it and registers in its place, moving an existing project's HELD claims with it
+ * and standing on the task branch the resident's clone stood on. Nothing of the resident's clone is
+ * written, and nothing the resident's git writes (a commit, a fetch) is in a worker turn's baseline.
  *
  * Over the real CTO MCP socket, the real daemon pass, claim registry, guard, worker runner, pipeline and
  * verification engine, in scratch repositories only. Stood in: the WORKER provider and its capacity
@@ -33,6 +35,7 @@ afterAll(cleanupTempDirs);
 afterEach(() => vi.restoreAllMocks());
 
 const IDENTITY = "github:acme/fixture";
+const ORIGIN = "https://github.com/acme/fixture.git";
 const MOVED = "REPOSITORY_CHECKOUT_MOVED";
 const LOCK = ".claude/scheduled_tasks.lock";
 const LOCK_BYTES = '{"sessionId":"resident-cto","pid":4242,"acquiredAt":1761460000000}\n';
@@ -59,6 +62,7 @@ const residentClone = (): string => {
   const clone = join(home, "projects", "fixture");
   gitSync(clone, ["config", "--local", "maintenance.auto", "false"]);
   gitSync(clone, ["config", "--local", "core.excludesFile", "/dev/null"]);
+  gitSync(clone, ["remote", "add", "origin", ORIGIN]);
   writeFiles(clone, {
     "README.md": "# fixture project\n",
     "src/app.js": "module.exports = () => 1;\n",
@@ -184,14 +188,30 @@ const claim = async (f: BootstrapRuntimeFixture, s: StandardRun, target: WriteTa
   return (claimed["value"] as { claims: Array<{ claimId: string; worktreeId: string | null }> }).claims.find((row) => row.worktreeId !== null)!.claimId;
 };
 
-/** One worker turn to its end; answers the execution, or the refusal of its start. */
+/** One worker turn to its end; answers the execution and its diagnostics, or the refusal of its start. */
 const turn = async (f: BootstrapRuntimeFixture, s: StandardRun, worker: FakeWorkerAdapter, taskId: string, claimId: string, script: FakeTurnScript) => {
   worker.script = script;
   const ran = await f.cto(s.sessionId, "task_worker_run", { runId: s.runId, taskId, claimId });
-  if (ran["ok"] !== true) return { ran, execution: null };
+  if (ran["ok"] !== true) return { ran, execution: null, diagnostics: {} as Record<string, unknown> };
   const executionId = (ran["value"] as { executionId: string }).executionId;
   await f.harness.cp.workerTurns.settled(executionId);
-  return { ran, execution: f.harness.cp.tasks.execution(executionId)! };
+  const view = f.harness.cp.workerTurns.describe(executionId, s.runId);
+  const diagnostics = view.allowed ? (view.value.diagnostics?.evidence ?? {}) : {};
+  return { ran, execution: f.harness.cp.tasks.execution(executionId)!, diagnostics };
+};
+
+/** git as the resident's own session runs it, in its clone. */
+const residentGit = (clone: string, args: readonly string[]): string => gitSync(clone, args);
+
+/** A migrated resident project with one task staffed and claimed in its worker clone, ready for a turn. */
+const migratedWithClaim = async (f: BootstrapRuntimeFixture, projectId: string) => {
+  const s = await standardRun(f, projectId, [APP]);
+  becomeResident(f, s);
+  await daemonPass(f);
+  const checkout = await registeredCheckout(f, s);
+  expect(checkout).not.toBe(s.clone);
+  const target = await provision(f, s, s.ids["app"]!);
+  return { s, checkout, target, claimId: await claim(f, s, target, checkout) };
 };
 
 const release = async (f: BootstrapRuntimeFixture, s: StandardRun): Promise<void> => {
@@ -215,26 +235,54 @@ const isAncestor = (repo: string, ancestor: string, of: string): boolean => {
   }
 };
 const moves = (f: BootstrapRuntimeFixture) => f.harness.cp.audit.byKind(MOVED).map((row) => row.evidence);
+/** Every file under a git dir, with its inode and times: what changed in it, if anything did. */
+const gitDirState = (repo: string): string => {
+  const out: string[] = [];
+  const walk = (dir: string): void => {
+    for (const name of readdirSync(dir).sort()) {
+      const path = join(dir, name);
+      const stat = lstatSync(path);
+      out.push(`${path} ${stat.ino} ${stat.size} ${stat.mtimeMs}`);
+      if (stat.isDirectory()) walk(path);
+    }
+  };
+  walk(join(repo, ".git"));
+  return out.join("\n");
+};
 
 describe("#1227 a resident's working directory never reaches a worker turn", () => {
-  it("W1: the resident writes the cron lock and other files in its cwd; the worker turn runs in the dedicated checkout, succeeds, and none of them reach it or its commit", async () => {
+  it("W1: the resident writes the cron lock and other files in its cwd and commits on its own dev; the worker turn runs in the worker clone, from that dev, succeeds, and none of the cwd files reach it", async () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const s = await standardRun(f, "resident-w1", [APP]);
       becomeResident(f, s);
       residentWrites(s.clone);
-      const statusBefore = gitSync(s.clone, ["status", "--porcelain", "--untracked-files=all"]);
-      const base = gitSync(s.clone, ["rev-parse", "refs/heads/dev"]);
       const worker = workerDoing(f);
       try {
         await daemonPass(f);
         const checkout = await registeredCheckout(f, s);
-        // The registered checkout, read back, is not the resident's cwd.
+        // The registered checkout, read back, is not the resident's cwd: a separate clone with its own git
+        // dir, its objects hardlinked to the resident's, its origin the repository's own remote.
         expect(checkout).not.toBe(s.clone);
         expect(cp.repositories.byIdentity(IDENTITY)!.checkoutPath).toBe(checkout);
-        expect(lstatSync(join(checkout, ".git")).isFile()).toBe(true);
+        expect(lstatSync(join(checkout, ".git")).isDirectory()).toBe(true);
+        expect(gitSync(checkout, ["rev-parse", "--git-common-dir"])).toBe(".git");
+        expect(gitSync(checkout, ["remote", "get-url", "origin"])).toBe(ORIGIN);
+        expect(gitSync(checkout, ["for-each-ref", "--format=%(refname)", "refs/remotes/"])).toBe("");
+        const object = gitSync(s.clone, ["rev-parse", "HEAD:src/app.js"]);
+        const objectPath = (repo: string): string => join(repo, ".git", "objects", object.slice(0, 2), object.slice(2));
+        expect(statSync(objectPath(checkout)).ino).toBe(statSync(objectPath(s.clone)).ino);
+
+        // The resident commits on its own dev, in its own clone, after the move: the run's base is read there.
+        writeFiles(s.clone, { "docs/resident.md": "# committed by the resident\n" });
+        residentGit(s.clone, ["add", "docs/resident.md"]);
+        residentGit(s.clone, ["commit", "-q", "-m", "the resident's own commit"]);
+        const residentDev = gitSync(s.clone, ["rev-parse", "refs/heads/dev"]);
+        const statusBefore = gitSync(s.clone, ["status", "--porcelain", "--untracked-files=all"]);
+        const cloneGitDir = gitDirState(s.clone);
 
         const target = await provision(f, s, s.ids["app"]!);
+        expect(target.baseSha).toBe(residentDev);
         const claimId = await claim(f, s, target, checkout);
         const { ran, execution } = await turn(f, s, worker, s.ids["app"]!, claimId, { writes: { "src/app.js": "module.exports = () => 2;\n" } });
         expect(ran, JSON.stringify(ran).slice(0, 800)).toMatchObject({ ok: true });
@@ -242,16 +290,19 @@ describe("#1227 a resident's working directory never reaches a worker turn", () 
         // Where the worker actually ran: the registered checkout, never the resident's cwd.
         expect(execution!.worktreeId).toBe(checkout);
 
-        const commit = gitSync(s.clone, ["rev-parse", `refs/heads/${target.branch}`]);
-        expect(gitSync(s.clone, ["rev-parse", `${commit}^`])).toBe(base);
-        expect(gitSync(s.clone, ["diff-tree", "--no-commit-id", "--name-only", "-r", base, commit])).toBe("src/app.js");
-        expect(gitSync(s.clone, ["show", `${commit}:README.md`])).toBe("# fixture project");
-        expect(gitSync(s.clone, ["ls-tree", "-r", "--name-only", commit])).not.toMatch(/\.claude|notes/);
-        // The resident's tree is exactly as it left it, on its own branch; the worker's stands clean on the task's.
+        const commit = gitSync(checkout, ["rev-parse", `refs/heads/${target.branch}`]);
+        expect(gitSync(checkout, ["rev-parse", `${commit}^`])).toBe(residentDev);
+        expect(gitSync(checkout, ["diff-tree", "--no-commit-id", "--name-only", "-r", residentDev, commit])).toBe("src/app.js");
+        expect(gitSync(checkout, ["show", `${commit}:README.md`])).toBe("# fixture project");
+        expect(gitSync(checkout, ["ls-tree", "-r", "--name-only", commit])).not.toMatch(/\.claude|notes/);
+        // The worker clone's base branch followed the run's pin; the clone's dev is the resident's alone.
+        expect(gitSync(checkout, ["rev-parse", "refs/heads/dev"])).toBe(residentDev);
+        // The resident's clone is exactly as it left it: every file of its git dir (read first: this test's
+        // own git status below may refresh the index), its files, its branch.
+        expect(gitDirState(s.clone)).toBe(cloneGitDir);
         expectResidentFilesUntouched(s.clone);
         expect(gitSync(s.clone, ["status", "--porcelain", "--untracked-files=all"])).toBe(statusBefore);
         expect(headRef(s.clone)).toBe("refs/heads/dev");
-        expect(gitSync(s.clone, ["rev-parse", "refs/heads/dev"])).toBe(base);
         expect(headRef(checkout)).toBe(`refs/heads/${target.branch}`);
         expect(gitSync(checkout, ["status", "--porcelain", "--untracked-files=all"])).toBe("");
       } finally {
@@ -260,7 +311,7 @@ describe("#1227 a resident's working directory never reaches a worker turn", () 
     }, { repoPath: residentClone() });
   });
 
-  it("W2: an existing project worked on in the resident's clone is moved with its HELD claim and the task branch its clone stood on, and that branch is re-entered in the new checkout", async () => {
+  it("W2: an existing project worked on in the resident's clone is moved with its HELD claim, its worker clone stands on the task branch the resident's clone stood on, and that branch is re-entered there; the resident's clone is not written", async () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const s = await standardRun(f, "resident-w2", [APP, README]);
@@ -284,31 +335,36 @@ describe("#1227 a resident's working directory never reaches a worker turn", () 
         becomeResident(f, s);
         residentWrites(s.clone);
         const refsBefore = refsOf(s.clone);
+        const cloneGitDir = gitDirState(s.clone);
 
         await daemonPass(f);
         const checkout = await registeredCheckout(f, s);
         expect(checkout).not.toBe(s.clone);
         expect(moves(f)).toEqual([expect.objectContaining({ identity: IDENTITY, branch: readme.branch, head: readmeTip, claimsMoved: 1 })]);
-        // No ref moved; the clone's HEAD is detached where it stood, its files as the resident left them;
-        // the worker checkout holds README's branch at the same commit, clean.
+        // The resident's clone is untouched: its HEAD still on README's branch, its refs and git dir as they were.
+        expect(headRef(s.clone)).toBe(`refs/heads/${readme.branch}`);
         expect(refsOf(s.clone)).toBe(refsBefore);
-        expect(headRef(s.clone)).toBeNull();
-        expect(gitSync(s.clone, ["rev-parse", "HEAD"])).toBe(readmeTip);
+        expect(gitDirState(s.clone)).toBe(cloneGitDir);
         expectResidentFilesUntouched(s.clone);
+        // The worker clone has every branch the clone had, and stands on README's at the same commit, clean.
+        expect(refsOf(checkout)).toBe(refsBefore);
         expect(headRef(checkout)).toBe(`refs/heads/${readme.branch}`);
         expect(gitSync(checkout, ["rev-parse", "HEAD"])).toBe(readmeTip);
         expect(gitSync(checkout, ["status", "--porcelain", "--untracked-files=all"])).toBe("");
         // The HELD claim followed the checkout.
         expect(cp.db.get<{ worktree_id: string }>(`SELECT worktree_id FROM resource_claims WHERE claim_id = ?`, [readmeClaim])!.worktree_id).toBe(checkout);
 
-        // The earlier task's branch is re-entered by the same claim, and its turn commits on it.
+        // The earlier task's branch is re-entered by the same claim, and its turn commits on it there.
         const again = await turn(f, s, worker, s.ids["readme"]!, readmeClaim, { writes: { "README.md": "# by the readme task\n" } });
         expect(again.ran, JSON.stringify(again.ran).slice(0, 800)).toMatchObject({ ok: true });
         expect(again.execution!.status).toBe("SUCCEEDED");
         expect(again.execution!.worktreeId).toBe(checkout);
-        const readmeCommit = gitSync(s.clone, ["rev-parse", `refs/heads/${readme.branch}`]);
-        expect(gitSync(s.clone, ["rev-parse", `${readmeCommit}^`])).toBe(readmeTip);
-        expect(gitSync(s.clone, ["rev-parse", `refs/heads/${app.branch}`])).toBe(appCommit);
+        const readmeCommit = gitSync(checkout, ["rev-parse", `refs/heads/${readme.branch}`]);
+        expect(gitSync(checkout, ["rev-parse", `${readmeCommit}^`])).toBe(readmeTip);
+        expect(gitSync(checkout, ["rev-parse", `refs/heads/${app.branch}`])).toBe(appCommit);
+        // The resident's copy of that branch stays where the resident has it.
+        expect(gitSync(s.clone, ["rev-parse", `refs/heads/${readme.branch}`])).toBe(readmeTip);
+        expect(gitDirState(s.clone)).toBe(cloneGitDir);
         expectResidentFilesUntouched(s.clone);
 
         // A second pass moves nothing.
@@ -324,7 +380,7 @@ describe("#1227 a resident's working directory never reaches a worker turn", () 
     }, { repoPath: residentClone() });
   });
 
-  it("W3: freeze still integrates every task commit made in the dedicated checkout; the candidate is fresh against it and verification passes on it", async () => {
+  it("W3: freeze still integrates every task commit made in the worker clone; the candidate is fresh against it and verification passes on it", async () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const s = await standardRun(f, "resident-w3", [APP, README]);
@@ -344,20 +400,20 @@ describe("#1227 a resident's working directory never reaches a worker turn", () 
           const { ran, execution } = await turn(f, s, worker, s.ids[key]!, await claim(f, s, target, checkout), script);
           expect(ran, JSON.stringify(ran).slice(0, 800)).toMatchObject({ ok: true });
           expect(execution!.status).toBe("SUCCEEDED");
-          results[key] = gitSync(s.clone, ["rev-parse", `refs/heads/${target.branch}`]);
+          results[key] = gitSync(checkout, ["rev-parse", `refs/heads/${target.branch}`]);
           await release(f, s);
         }
 
         const frozen = await cp.pipeline.freeze(s.runId);
         if (!frozen.allowed) throw new Error(`${frozen.reasonCode}: ${frozen.message} ${JSON.stringify(frozen.evidence).slice(0, 600)}`);
         const repo = frozen.value.repositories[0]!;
-        expect(isAncestor(s.clone, results["app"]!, repo.candidateHead)).toBe(true);
-        expect(isAncestor(s.clone, results["readme"]!, repo.candidateHead)).toBe(true);
-        expect(gitSync(s.clone, ["show", `${repo.candidateHead}:src/app.js`])).toBe("module.exports = () => 2;");
-        expect(gitSync(s.clone, ["show", `${repo.candidateHead}:README.md`])).toBe("# task one");
+        expect(isAncestor(checkout, results["app"]!, repo.candidateHead)).toBe(true);
+        expect(isAncestor(checkout, results["readme"]!, repo.candidateHead)).toBe(true);
+        expect(gitSync(checkout, ["show", `${repo.candidateHead}:src/app.js`])).toBe("module.exports = () => 2;");
+        expect(gitSync(checkout, ["show", `${repo.candidateHead}:README.md`])).toBe("# task one");
         expect(repo.touchedPaths).toEqual(["README.md", "src/app.js"]);
         expect((await verifySnapshotFreshness(frozen.value, [{ identity: IDENTITY, checkoutPath: checkout }])).allowed).toBe(true);
-        // Candidate verification runs on the integrated commit, read from the worker checkout.
+        // Candidate verification runs on the integrated commit, read from the worker clone.
         const run = cp.runs.require(s.runId);
         const manifest = cp.projects.manifest(run.pinnedManifestDigest!)!;
         const verified = await cp.verification.verify({ runId: s.runId, snapshot: frozen.value, commands: commandsForMode(manifest, run.executionMode), contractDigest: run.contractDigest });
@@ -375,7 +431,108 @@ describe("#1227 a resident's working directory never reaches a worker turn", () 
   });
 });
 
-describe("#1227 the move refuses, and a refused move keeps worker turns out of the resident's cwd", () => {
+describe("#1227 review (PR #1256): the resident's git activity does not reach a worker turn", () => {
+  it("R1: the resident commits in its clone during a worker turn, and the turn succeeds", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { s, checkout, target, claimId } = await migratedWithClaim(f, "resident-r1");
+      const worker = workerDoing(f);
+      try {
+        const before = gitSync(s.clone, ["rev-parse", "HEAD"]);
+        const { ran, execution, diagnostics } = await turn(f, s, worker, s.ids["app"]!, claimId, {
+          writes: { "src/app.js": "module.exports = () => 2;\n" },
+          whileLatched: () => {
+            residentGit(s.clone, ["commit", "-q", "--allow-empty", "-m", "the resident commits mid-turn"]);
+          },
+        });
+        expect(ran).toMatchObject({ ok: true });
+        expect({ status: execution!.status, reason: diagnostics["reason"] ?? null }).toEqual({ status: "SUCCEEDED", reason: null });
+        expect(gitSync(s.clone, ["rev-parse", "HEAD^"])).toBe(before);
+        expect(gitSync(checkout, ["rev-parse", `refs/heads/${target.branch}^`])).toBe(target.baseSha);
+      } finally {
+        worker.killAll();
+      }
+    }, { repoPath: residentClone() });
+  });
+
+  it("R2: the resident fetches origin in its clone during a worker turn, and the turn succeeds", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { s, checkout, target, claimId } = await migratedWithClaim(f, "resident-r2");
+      // The repository's remote, stood in by a local bare repository one commit ahead of the clone.
+      const remote = join(realpathSync(tempDir("acp-resident-remote-")), "fixture.git");
+      gitSync(dirname(remote), ["clone", "-q", "--bare", s.clone, remote]);
+      const ahead = join(dirname(remote), "ahead");
+      gitSync(dirname(remote), ["clone", "-q", remote, ahead]);
+      gitSync(ahead, ["commit", "-q", "--allow-empty", "-m", "upstream moved"]);
+      gitSync(ahead, ["push", "-q", "origin", "HEAD:dev"]);
+      const upstream = gitSync(remote, ["rev-parse", "refs/heads/dev"]);
+      const worker = workerDoing(f);
+      try {
+        const { ran, execution, diagnostics } = await turn(f, s, worker, s.ids["app"]!, claimId, {
+          writes: { "src/app.js": "module.exports = () => 2;\n" },
+          whileLatched: () => {
+            residentGit(s.clone, ["-c", `url.${remote}.insteadOf=${ORIGIN}`, "fetch", "-q", "origin"]);
+          },
+        });
+        expect(ran).toMatchObject({ ok: true });
+        expect({ status: execution!.status, reason: diagnostics["reason"] ?? null }).toEqual({ status: "SUCCEEDED", reason: null });
+        expect(gitSync(s.clone, ["rev-parse", "refs/remotes/origin/dev"])).toBe(upstream);
+        expect(gitSync(checkout, ["rev-parse", `refs/heads/${target.branch}^`])).toBe(target.baseSha);
+      } finally {
+        worker.killAll();
+      }
+    }, { repoPath: residentClone() });
+  });
+
+  for (const [name, write, named] of [
+    ["config", (checkout: string) => gitSync(checkout, ["config", "--local", "acp.stray", "1"]), [{ change: "changed", root: "gitDir", path: "config", kind: "file" }]],
+    ["a ref", (checkout: string) => gitSync(checkout, ["update-ref", "refs/heads/stray", "HEAD"]), [{ change: "added", root: "gitDir", path: "refs/heads/stray", kind: "file" }]],
+    ["objects/info/alternates", (checkout: string) => writeFileSync(join(checkout, ".git", "objects", "info", "alternates"), `${join(checkout, "..", "elsewhere", "objects")}\n`), [
+      { change: "added", root: "gitDir", path: "objects/info/alternates", kind: "file" },
+    ]],
+  ] as const) {
+    it(`R3: a write to the worker clone's own ${name} during a turn is still refused GIT_DIR_CHANGED, named in the worker clone's own git dir`, async () => {
+      await withBootstrapRuntime(async (f) => {
+        const { s, checkout, claimId } = await migratedWithClaim(f, `resident-r3-${name.replace(/[^a-z]/g, "")}`);
+        mkdirSync(join(checkout, ".git", "objects", "info"), { recursive: true });
+        const worker = workerDoing(f);
+        try {
+          const { execution, diagnostics } = await turn(f, s, worker, s.ids["app"]!, claimId, {
+            writes: { "src/app.js": "module.exports = () => 2;\n" },
+            whileLatched: () => {
+              write(checkout);
+            },
+          });
+          expect({ status: execution!.status, reason: diagnostics["reason"] }).toEqual({ status: "FAILED", reason: "GIT_DIR_CHANGED" });
+          expect(diagnostics["gitDirChanges"]).toEqual(expect.arrayContaining([...named]));
+          expect(diagnostics["gitDirChangeCount"]).toBe((diagnostics["gitDirChanges"] as unknown[]).length);
+        } finally {
+          worker.killAll();
+        }
+      }, { repoPath: residentClone() });
+    });
+  }
+
+  it("the resident has a branch of a task's name in its own clone; the worker clone's turn on that task is not affected, and neither clone's branch moves the other's", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { s, checkout, target, claimId } = await migratedWithClaim(f, "resident-own-branch");
+      residentGit(s.clone, ["switch", "-q", "-c", target.branch]);
+      residentGit(s.clone, ["commit", "-q", "--allow-empty", "-m", "the resident's own work on that name"]);
+      const residentTip = gitSync(s.clone, ["rev-parse", "HEAD"]);
+      const worker = workerDoing(f);
+      try {
+        const { execution } = await turn(f, s, worker, s.ids["app"]!, claimId, { writes: { "src/app.js": "module.exports = () => 2;\n" } });
+        expect(execution!.status).toBe("SUCCEEDED");
+        expect(gitSync(checkout, ["rev-parse", `refs/heads/${target.branch}^`])).toBe(target.baseSha);
+        expect(gitSync(s.clone, ["rev-parse", `refs/heads/${target.branch}`])).toBe(residentTip);
+        expect(headRef(s.clone)).toBe(`refs/heads/${target.branch}`);
+      } finally {
+        worker.killAll();
+      }
+    }, { repoPath: residentClone() });
+  });
+});
+
+describe("#1227 the move refuses, recovers, and a refused move keeps worker turns out of the resident's cwd", () => {
   it("a path the control plane did not make is left as it is, the refusal is recorded once, and a turn in the clone is refused with nothing launched", async () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
@@ -405,35 +562,21 @@ describe("#1227 the move refuses, and a refused move keeps worker turns out of t
     }, { repoPath: residentClone() });
   });
 
-  it("a task branch the resident checked out in its clone is not checked out in the worker checkout as well; neither tree moves", async () => {
+  it("a worker clone an earlier pass made, whose registration never moved, is taken as it is", async () => {
     await withBootstrapRuntime(async (f) => {
-      const s = await standardRun(f, "resident-held-branch", [APP, README]);
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "resident-adopt", [APP]);
       becomeResident(f, s);
-      const worker = workerDoing(f);
-      try {
-        await daemonPass(f);
-        const checkout = await registeredCheckout(f, s);
-        // APP's first turn fails on its new branch; README's succeeds, taking the checkout off APP's.
-        const app = await provision(f, s, s.ids["app"]!);
-        const appClaim = await claim(f, s, app, checkout);
-        expect((await turn(f, s, worker, s.ids["app"]!, appClaim, { exitCode: 1 })).execution!.status).not.toBe("SUCCEEDED");
-        await release(f, s);
-        const readme = await provision(f, s, s.ids["readme"]!);
-        expect((await turn(f, s, worker, s.ids["readme"]!, await claim(f, s, readme, checkout), { writes: { "README.md": "# done\n" } })).execution!.status).toBe("SUCCEEDED");
-        await release(f, s);
-        // The resident checks APP's branch out in its own clone.
-        gitSync(s.clone, ["switch", "-q", app.branch]);
-        const before = { clone: gitSync(s.clone, ["rev-parse", "HEAD"]), checkout: gitSync(checkout, ["rev-parse", "HEAD"]), refs: refsOf(s.clone) };
-
-        const refused = await turn(f, s, worker, s.ids["app"]!, await claim(f, s, app, checkout), { writes: { "src/app.js": "module.exports = () => 2;\n" } });
-        expect(refused.ran).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
-        expect(JSON.stringify(refused.ran)).toContain("checked out in another worktree");
-        expect(headRef(s.clone)).toBe(`refs/heads/${app.branch}`);
-        expect(headRef(checkout)).toBe(`refs/heads/${readme.branch}`);
-        expect({ clone: gitSync(s.clone, ["rev-parse", "HEAD"]), checkout: gitSync(checkout, ["rev-parse", "HEAD"]), refs: refsOf(s.clone) }).toEqual(before);
-      } finally {
-        worker.killAll();
-      }
+      await daemonPass(f);
+      const checkout = cp.repositories.byIdentity(IDENTITY)!.checkoutPath;
+      // The pass stopped after the clone was renamed into place and before the registry moved.
+      cp.db.run(`UPDATE repositories SET checkout_path = ? WHERE repository_id = ?`, [s.clone, s.repositoryId]);
+      const inode = statSync(join(checkout, ".git")).ino;
+      await daemonPass(f);
+      expect(cp.repositories.byIdentity(IDENTITY)!.checkoutPath).toBe(checkout);
+      expect(statSync(join(checkout, ".git")).ino).toBe(inode);
+      expect(moves(f)).toHaveLength(2);
+      expect(readdirSync(dirname(checkout))).toEqual([s.repositoryId]);
     }, { repoPath: residentClone() });
   });
 });

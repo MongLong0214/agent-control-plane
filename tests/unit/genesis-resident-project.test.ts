@@ -381,7 +381,7 @@ it('completes a reviewed genesis bootstrap on its resident claim and same-sessio
   expect(JSON.stringify(h.cp.outbox.get(message.messageId)!.payload)).toBe(originalPayload);
   expect(port.writes.filter(w => w.method === 'pushBranch')).toHaveLength(1);
   expect(h.cp.sessions.get(pending.to_session_id)?.provider).toBe('claude');
-  // #1227 — the same daemon pass gives the activated project's worker turns their own checkout beside
+  // #1227 — the same daemon pass gives the activated project's worker turns their own clone beside
   // the resident's clone, which stays on dev where the resident works.
   const allocation = h.cp.residentProjects.allocation(run.value.runId)!;
   const registered = h.cp.repositories.byIdentity(allocation.repositoryIdentity)!;
@@ -389,6 +389,9 @@ it('completes a reviewed genesis bootstrap on its resident claim and same-sessio
   expect(registered.checkoutPath).not.toBe(allocation.clonePath);
   expect((await git(allocation.clonePath,['symbolic-ref','--short','HEAD'])).stdout.trim()).toBe('dev');
   expect((await git(registered.checkoutPath,['rev-parse','HEAD'])).stdout).toBe((await git(allocation.clonePath,['rev-parse','HEAD'])).stdout);
+  // Its own git dir, not the clone's; its origin the repository's own remote, as the clone has it.
+  expect((await git(registered.checkoutPath,['rev-parse','--git-common-dir'])).stdout.trim()).toBe('.git');
+  expect((await git(registered.checkoutPath,['remote','get-url','origin'])).stdout).toBe((await git(allocation.clonePath,['remote','get-url','origin'])).stdout);
   expect(h.cp.audit.byKind('REPOSITORY_CHECKOUT_MOVED').map(row => row.evidence)).toEqual([expect.objectContaining({from:allocation.clonePath,to:registered.checkoutPath,branch:null})]);
   probe.mockRestore();h.cp.close();
 });

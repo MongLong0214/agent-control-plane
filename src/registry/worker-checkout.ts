@@ -1,14 +1,14 @@
-import { lstatSync, type Stats } from "node:fs";
-import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { lstatSync, renameSync, rmSync, type Stats } from "node:fs";
+import { basename, dirname, join } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { residentWorkerCheckoutPath } from "../core/resident-allocation-paths.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
-import { git, listWorktrees, withoutRepositoryPrograms } from "../git/git.ts";
+import { git, withoutRepositoryPrograms } from "../git/git.ts";
 import {
   type ManagedWriteGuard,
   type RepairWorktreeAuthority,
@@ -16,90 +16,33 @@ import {
   WriteOperation,
 } from "../guard/managed-write-guard.ts";
 import { canonical } from "../guard/workspace-probe.ts";
+import { type ResidentRepository, residentRepositories } from "./resident-repositories.ts";
 import { branchCreations } from "../run/task-write-target.ts";
 
 /**
  * #1227 — a resident CTO runs in its project's clone, and every worker turn ran in that same checkout:
  * whatever the resident's tooling wrote there (Claude Code's `.claude/scheduled_tasks.lock`, notes, an
  * edit in progress) was in front of the worker scan, and could reach a candidate. A resident project's
- * worker turns therefore get their own checkout: a linked worktree of the clone, at
- * `residentWorkerCheckoutPath`, made by the control plane and registered in the clone's place, so every
- * machine that reads the registered checkout — claims, the write target, the worker turn, freeze,
- * candidate verification — uses it unchanged. The clone stays the resident's.
+ * worker turns therefore get their own checkout at `residentWorkerCheckoutPath`: a separate local clone of
+ * the resident's clone, with its own git dir (refs, config, HEAD, index, logs; no hooks), made by the
+ * control plane and registered in the clone's place, so every machine that reads the registered checkout
+ * — claims, the write target, the worker turn, freeze, candidate verification, GitHub publication —
+ * uses it unchanged. The clone stays the resident's, and nothing in it is ever written.
+ *
+ * Not a linked worktree: that shares the clone's git dir, so a resident's commit or fetch (its refs,
+ * reflogs, COMMIT_EDITMSG, FETCH_HEAD) changed the git dir a worker turn is held to and refused the turn
+ * (#1227 review, PR #1256). Objects come over by git's local clone, which hardlinks the clone's object
+ * files rather than borrowing them through `objects/info/alternates`: git never rewrites an object file
+ * in place, so the resident's gc, repack or prune can only unlink its own names, never take an object
+ * from the worker clone. Later objects (a base the resident committed after the move) are fetched from
+ * the clone by name when a run pins its base (`task-write-target.ts`), and only objects are written then.
  */
 export const REPOSITORY_CHECKOUT_MOVED = "REPOSITORY_CHECKOUT_MOVED";
 /** A move that could not happen on this pass; recorded once per distinct refusal, tried again on the next. */
 export const REPOSITORY_CHECKOUT_MOVE_REFUSED = "REPOSITORY_CHECKOUT_MOVE_REFUSED";
 
-/** A registered repository whose project has a live resident, and where that resident works. */
-export interface ResidentRepository {
-  repositoryId: string;
-  identity: string;
-  projectId: string;
-  /** The registered checkout, as the registry holds it. */
-  checkoutPath: string;
-  /** The resident's clone, its working directory: the provisioning allocation's `clonePath`. */
-  clonePath: string;
-  /** `residentWorkerCheckoutPath` of that clone and this repository. */
-  workerCheckoutPath: string;
-}
-
-interface ResidentRow {
-  repository_id: string;
-  identity: string;
-  project_id: string;
-  checkout_path: string;
-  clone_path: string;
-}
-
-/**
- * Every active repository of a project whose resident provisioning is live (PENDING or COMPLETE), for
- * the repository the allocation was made for. Optionally just one repository.
- */
-export const residentRepositories = (db: Db, repositoryId?: string): ResidentRepository[] =>
-  db
-    .all<ResidentRow>(
-      `SELECT r.repository_id, r.identity, r.project_id, r.checkout_path,
-              json_extract(p.allocation_json, '$.clonePath') AS clone_path
-         FROM resident_project_provisioning p
-         JOIN repositories r ON r.project_id = p.project_id AND r.retired_at IS NULL
-                            AND r.identity = json_extract(p.allocation_json, '$.repositoryIdentity')
-        WHERE p.status IN ('PENDING', 'COMPLETE')
-          AND json_type(p.allocation_json, '$.clonePath') = 'text'
-          AND (? IS NULL OR r.repository_id = ?)
-        ORDER BY r.repository_id`,
-      [repositoryId ?? null, repositoryId ?? null],
-    )
-    .map((row) => {
-      const clonePath = canonical(row.clone_path);
-      return {
-        repositoryId: row.repository_id,
-        identity: row.identity,
-        projectId: row.project_id,
-        checkoutPath: row.checkout_path,
-        clonePath,
-        workerCheckoutPath: residentWorkerCheckoutPath(clonePath, row.repository_id),
-      };
-    });
-
-/** The resident a repository belongs to, or null when its project has no live resident. */
-export const residentRepository = (db: Db, repositoryId: string): ResidentRepository | null =>
-  residentRepositories(db, repositoryId)[0] ?? null;
-
-/**
- * Every clone a resident allocation names, whatever its state: the resident's own tree, which no
- * candidate command may read. Once its repository is registered at the worker checkout, no registry
- * row names the clone any more, so a deny list built from the registry alone would leave it open.
- */
-export const residentClonePaths = (db: Db): string[] =>
-  [...new Set(
-    db
-      .all<{ clone_path: string }>(
-        `SELECT json_extract(allocation_json, '$.clonePath') AS clone_path FROM resident_project_provisioning
-          WHERE json_type(allocation_json, '$.clonePath') = 'text' ORDER BY run_id`,
-      )
-      .map((row) => canonical(row.clone_path)),
-  )];
+/** The worker clone's own configuration naming the resident clone it was made from: how a move recognises its own. */
+const MADE_FROM = "acp.residentClone";
 
 const lstatOrNull = (path: string): Stats | null => {
   try {
@@ -112,26 +55,28 @@ const lstatOrNull = (path: string): Stats | null => {
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 /**
- * Moves each live resident's repository from the resident's clone to its dedicated worker checkout.
+ * Moves each live resident's repository from the resident's clone to its dedicated worker clone.
  *
  * Run by the daemon at start and on every watchdog pass (`Daemon.resumeResidentProjects`), so a new
  * project is moved on the pass after its activation and an existing one on the first start of a build
- * that has this. Idempotent: a repository already at its worker checkout, or registered anywhere but
- * its resident's clone, is left alone. Until it is moved, worker turns refuse to run in the clone
+ * that has this. Idempotent: a repository already at its worker clone, or registered anywhere but its
+ * resident's clone, is left alone. Until it is moved, worker turns refuse to run in the clone
  * (`WorkerTurnRunner`), so no turn is ever in flight there while it moves.
  *
  * One move, under one Managed Write Guard grant (GIT_WORKTREE ADD, outside any run, by the composition
- * root's repair authority, for the registered checkout it reads):
- * 1. the worker checkout is added detached at the clone's HEAD commit, with no hook, fsmonitor or
- *    filter program run, and must stand clean; a path there that is not this clone's worktree is
- *    refused and left as it is;
- * 2. a clone standing on a branch the control plane made for one of the repository's tasks (S-TB)
- *    hands that branch over: the clone's HEAD is detached at the same commit — no file, index or ref
- *    of the clone moves — and the worker checkout takes the branch, so a branch is never checked out
- *    twice and the task re-enters it as before;
- * 3. in one transaction the registry names the worker checkout, the repository's HELD worktree claims
+ * root's repair authority, for the registered checkout it reads), with nothing of the resident clone
+ * written:
+ * 1. the clone is cloned beside the final path (`git clone --no-checkout`, no template, no hook): its
+ *    objects hardlinked; every local branch and ACP private ref (`refs/acp/*`) copied as the clone has
+ *    them; none of its remote-tracking refs; `origin` set to the clone's own `origin` URL, the
+ *    repository's real remote; gc and maintenance off;
+ * 2. it stands where the clone stands: on a branch the control plane made for one of the repository's
+ *    tasks (S-TB) when the clone is on one, so that task re-enters it; otherwise detached at the clone's
+ *    HEAD commit, so the base branch stays a ref the control plane can move to a run's pin;
+ * 3. it is checked out with no hook, fsmonitor or filter program run, must stand clean, and is renamed
+ *    into place; a path there that is not a worker clone made from this clone is refused and left as it is;
+ * 4. in one transaction the registry names the worker clone, the repository's HELD worktree claims
  *    follow it, and `REPOSITORY_CHECKOUT_MOVED` records from where to where.
- * Task branches, the base branch and every other ref are shared by the two trees and never written.
  */
 export class WorkerCheckouts {
   readonly #lastRefusal = new Map<string, string>();
@@ -183,8 +128,12 @@ export class WorkerCheckouts {
       });
     }
     if (lstatOrNull(worker) !== null) {
-      const known = (await listWorktrees(clone)).some((entry) => canonical(entry.path) === worker);
-      if (!known || lstatOrNull(join(worker, ".git"))?.isFile() !== true) {
+      // Made by an earlier pass that stopped before the registry moved: it is renamed into place only
+      // complete, and names the clone it was made from in its own configuration.
+      const made = lstatOrNull(join(worker, ".git"))?.isDirectory() === true
+        ? await git(worker, ["config", "--local", "--get", MADE_FROM], { allowFailure: true })
+        : null;
+      if (made?.exitCode !== 0 || made.stdout.trim() !== clone) {
         return deny(ReasonCode.CONFLICT, "the worker checkout's path holds something the control plane did not make there; it is left as it is", {
           identity: resident.identity,
           worktreePath: worker,
@@ -248,14 +197,18 @@ export class WorkerCheckouts {
     });
   }
 
-  /** The guarded effect: the worker checkout made or found, clean, and a task branch the clone stood on handed to it. */
+  /** The guarded effect: the worker clone made (or found, made by an earlier pass) and standing clean. */
   private async materialize(resident: ResidentRepository): Promise<Decision<{ head: string; branch: string | null }>> {
-    const { clonePath: clone, workerCheckoutPath: worker } = resident;
-    const programs = await withoutRepositoryPrograms(clone);
-    const head = (await git(clone, [...programs, "rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
+    const worker = resident.workerCheckoutPath;
     if (lstatOrNull(worker) === null) {
-      // Detached: the clone keeps whatever branch it is on, and no branch is ever checked out twice.
-      await git(clone, [...programs, "worktree", "add", "--detach", worker, head]);
+      const staging = join(dirname(worker), `.${basename(worker)}.${randomUUID()}.tmp`);
+      try {
+        const made = await this.cloneInto(resident, staging);
+        if (!made.allowed) return made;
+        renameSync(staging, worker);
+      } finally {
+        if (lstatOrNull(staging) !== null) rmSync(staging, { recursive: true, force: true });
+      }
     }
     const own = await withoutRepositoryPrograms(worker);
     const status = await git(worker, [...own, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=dirty"]);
@@ -267,24 +220,45 @@ export class WorkerCheckouts {
         paths: dirty.slice(0, 20),
       });
     }
+    const head = (await git(worker, [...own, "rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
+    const symbolic = await git(worker, [...own, "symbolic-ref", "-q", "HEAD"], { allowFailure: true });
+    const ref = symbolic.exitCode === 0 ? symbolic.stdout.trim() : null;
+    return allow(ReasonCode.OK, { head, branch: ref?.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : null });
+  }
+
+  /** The worker clone, made at `staging` from the resident clone, which is only read. */
+  private async cloneInto(resident: ResidentRepository, staging: string): Promise<Decision<void>> {
+    const clone = resident.clonePath;
+    const programs = await withoutRepositoryPrograms(clone);
+    // What the clone stands on, read before the copy so the copy holds it.
+    const head = (await git(clone, [...programs, "rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
     const symbolic = await git(clone, [...programs, "symbolic-ref", "-q", "HEAD"], { allowFailure: true });
     if (symbolic.exitCode !== 0 && symbolic.exitCode !== 1) {
       return deny(ReasonCode.PROBE_FAILED, "the resident checkout's HEAD could not be read", { identity: resident.identity });
     }
     const ref = symbolic.exitCode === 0 ? symbolic.stdout.trim() : null;
-    const branch = ref?.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : null;
-    if (ref === null || branch === null || branchCreations(this.db, resident.identity, branch).length === 0) {
-      return allow(ReasonCode.OK, { head, branch: null });
+    const onTask = ref !== null && ref.startsWith("refs/heads/") &&
+      branchCreations(this.db, resident.identity, ref.slice("refs/heads/".length)).length > 0;
+    const origin = await git(clone, ["remote", "get-url", "origin"], { allowFailure: true });
+
+    // A local clone hardlinks the object files; no template, so no hooks; nothing checked out yet.
+    await git(dirname(staging), ["-c", "core.hooksPath=/dev/null", "clone", "--quiet", "--no-checkout", "--template=", "--origin", "origin", "--", clone, staging]);
+    await git(staging, [
+      ...programs, "-c", "gc.auto=0", "-c", "maintenance.auto=false",
+      "fetch", "--quiet", "--no-write-fetch-head", "--no-tags", "--no-recurse-submodules", "--update-head-ok", clone,
+      "+refs/heads/*:refs/heads/*", "+refs/acp/*:refs/acp/*",
+    ]);
+    // The clone's branches, read as remote-tracking refs, are not the real remote's: dropped, and origin
+    // names the repository's own remote, the URL the resident clone has.
+    await git(staging, ["remote", "remove", "origin"]);
+    if (origin.exitCode === 0 && origin.stdout.trim().length > 0) await git(staging, ["remote", "add", "origin", origin.stdout.trim()]);
+    for (const [key, value] of [["gc.auto", "0"], ["maintenance.auto", "false"], [MADE_FROM, clone]] as const) {
+      await git(staging, ["config", "--local", key, value]);
     }
-    // The clone stands on a task branch the control plane made: the branch is the worker's.
-    const tip = (await git(clone, [...programs, "rev-parse", "--verify", `${ref}^{commit}`])).stdout.trim();
-    await git(clone, [...programs, "update-ref", "--no-deref", "-m", "agent-control-plane: the worker checkout takes the task branch", "HEAD", tip, tip]);
-    const workerHead = (await git(worker, [...own, "rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
-    const workerRef = await git(worker, [...own, "symbolic-ref", "-q", "HEAD"], { allowFailure: true });
-    if (workerRef.exitCode === 1 && workerHead === tip) {
-      await git(worker, [...own, "symbolic-ref", "-m", "agent-control-plane: the worker checkout takes the task branch", "HEAD", ref]);
-    }
-    return allow(ReasonCode.OK, { head: tip, branch });
+    if (onTask) await git(staging, ["symbolic-ref", "-m", "agent-control-plane: the worker checkout stands on the task branch", "HEAD", ref]);
+    else await git(staging, ["update-ref", "--no-deref", "-m", "agent-control-plane: the worker checkout rests detached", "HEAD", head]);
+    await git(staging, [...(await withoutRepositoryPrograms(staging)), "read-tree", "-u", "--reset", "HEAD"]);
+    return allow(ReasonCode.OK, undefined);
   }
 
   private recordRefusal(resident: ResidentRepository, refusal: Decision<string>): void {

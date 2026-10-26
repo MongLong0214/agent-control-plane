@@ -461,8 +461,10 @@ const OBJECT_STORAGE = /^(?:[0-9a-f]{2}|pack)$/;
  *
  * #1227 — content-addressed object storage is left out as well, under the common dir and the pinned
  * git dir alike: every loose object (`objects/[0-9a-f]{2}/*`) and everything in `objects/pack/`, so
- * another writer of the shared object store (the resident's or the control plane's own commit,
- * write-tree, hash-object or fetch) adding, freshening or repacking objects does not refuse a turn.
+ * another writer of the object store adding, freshening or repacking objects does not refuse a turn:
+ * the control plane's own fetch of a run's base into a resident's worker clone, or the resident's gc
+ * freshening an object file the worker clone shares with it by hardlink. A resident's worker clone has
+ * its own git dir, so nothing else the resident writes is in its baseline.
  * Only a real directory of those names is left out; anything else there is read. The `objects`
  * directory is read without its size and times, which those additions move, so its replacement still
  * shows. Everything else under `objects/` (`objects/info/*`: alternates, http-alternates, the
