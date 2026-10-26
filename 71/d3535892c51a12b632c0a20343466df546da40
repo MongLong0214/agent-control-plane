@@ -1,0 +1,10 @@
+Limit: the non-gate process budget is supervised and polled, not a kernel limit, and does not prevent escape: a descendant created and reparented between two polls is never seen, counted or killed (#461, accepted by the CEO as non-blocking), and the tree can overshoot 64 between polls
+Limit: RLIMIT_CPU and RLIMIT_AS apply per process and are inherited, so a tree's total CPU can exceed the command limit and only the wall-clock timeout bounds the tree; only the polled budget counts the tracked tree as a whole
+Warn: only the trusted call site chooses the process-limit mode: a gate command must stay no-spawn because gate-resolution-hook.ts binds loads in-process only, and any value other than exactly supervised-budget, including none, is treated as no-spawn
+Record-Id: r-890902841282
+Provenance: inherited c522077145df02004765bb7a7f5b6ab21fd437d4
+
+Limit: a descendant that ends within one poll (about 1 ms) of the candidate's exit is not seen to outlive it, and a candidate that SIGKILLs its supervisor gets no PASS but descendants that left the launched process group stay unreaped
+Warn: in budget mode the supervisor ends only through finish(), which reports its exact outcome on fd 3 (closed in the candidate); a supervisor end that does not match that report means containment is unproven, so any new exit path in the wrapper must go through finish()
+Record-Id: r-1f1639638311
+Provenance: inherited b0583fd011b32195d4e040b2dffc474096b8e64f
