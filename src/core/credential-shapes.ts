@@ -61,12 +61,22 @@ const ACP_ID_FORMATS: readonly RegExp[] = [
   /^[0-9a-f]{64}$/,
   /^acp-notice(?:-probe)?:[0-9a-f]{64}$/,
   /^(?:repair|rf-write|owner-decision|telegram:owner-decision):sha256:[0-9a-f]{64}$/,
-  /^(?:buzz:)?buzz-message:[0-9a-f]{64}(?::[0-9a-f]{64}|#\d+)?$/,
-  /^[A-Za-z0-9._-]+:#manifest\/sha256:[0-9a-f]{64}$/,
-  /^bootstrap-(?:review-retry|result-recovery):run_[0-9a-f]+:\d+:sha256:[0-9a-f]{64}(?::\d+)?$/,
+  // A Buzz message's sequence number is a count, bounded.
+  /^(?:buzz:)?buzz-message:[0-9a-f]{64}(?::[0-9a-f]{64}|#\d{1,9})?$/,
+  // The project id is the one part a caller names: it is captured and checked against every shape.
+  /^(?<free>[A-Za-z0-9._-]+):#manifest\/sha256:[0-9a-f]{64}$/,
+  // A run id is exactly what `mint` in core/ids.ts makes (`run_` and 24 hex); generation and event
+  // id are counts, bounded (runtime/provisioned-session-runtime.ts).
+  /^bootstrap-(?:review-retry|result-recovery):run_[0-9a-f]{24}:\d{1,9}:sha256:[0-9a-f]{64}(?::\d{1,9})?$/,
 ];
 
-const isAcpId = (value: string): boolean => ACP_ID_FORMATS.some((format) => format.test(value));
+/** A whole value in one of `ACP_ID_FORMATS`, whose caller-named part holds no shape of its own. */
+const isAcpId = (value: string): boolean =>
+  ACP_ID_FORMATS.some((format) => {
+    const match = format.exec(value);
+    const free = match?.groups?.["free"];
+    return match !== null && (free === undefined || !CREDENTIAL_SHAPES.some((shape) => shape.test(free)));
+  });
 
 /**
  * A value of a field ACP generates, validated by its exact shape, which has the long-base64 shape

@@ -13,6 +13,7 @@ import {
   type ExecutionEvidence,
   type OutputEvidence,
   candidateEvidenceSection,
+  configFileRuleFor,
   executionEvidenceSection,
   outputEvidence,
   readConfigFile,
@@ -297,6 +298,15 @@ describe("an ordinary candidate review carries the official execution evidence",
     } finally { harness.cp.close(); }
   }, 60_000);
 
+  it("#1223 R4: a package manager moved to another directory claims no config file, and says why", () => {
+    expect(configFileRuleFor(["npm", "--prefix", "sub", "test"])).toEqual({ rule: "config file not resolved: argv selects a directory with --prefix", files: [] });
+    expect(configFileRuleFor(["pnpm", "--filter=web", "test"])).toEqual({ rule: "config file not resolved: argv selects a directory with --filter", files: [] });
+    expect(configFileRuleFor(["pnpm", "-C", "sub", "run", "lint"]).files).toEqual([]);
+    // The plain forms are unchanged; arguments after `--` belong to the script.
+    expect(configFileRuleFor(["npm", "test"])).toEqual({ rule: "npm reads <cwd>/package.json", files: ["package.json"] });
+    expect(configFileRuleFor(["pnpm", "run", "lint", "--", "--prefix", "x"])).toEqual({ rule: "pnpm reads <cwd>/package.json", files: ["package.json"] });
+  });
+
   it("refuses a '..' or absolute path before any read; a pinned manifest cannot carry one, a run-scoped command can", async () => {
     const repo = makeRepo({ "README.md": "fixture\n", "inner/run.js": "console.log(1);\n",
       "inner/token.js": `module.exports = "${GITHUB_TOKEN_SHAPE}";\n`,
@@ -525,6 +535,22 @@ describe("#1223 P1-A: the audit log and artifact store exempt only exact ACP-gen
     } finally { core.db.close(); }
   });
 
+  it("#1223 R4: an ACP id's caller-named part is checked against every shape; a real manifest id still stores", async () => {
+    const forged = `${"Ab9Zq7x2".repeat(10)}:#manifest/sha256:${hex64}`;
+    const real = `myeotnyeon:#manifest/sha256:${hex64}`;
+    expect(credentialBearingField({ detail: forged })).toBe("detail");
+    expect(credentialBearingField({ id: real })).toBeNull();
+    // Each other format's variable part is bounded to ACP's own grammar.
+    expect(credentialBearingField({ id: `bootstrap-review-retry:run_${"a".repeat(24)}:1:sha256:${hex64}:29` })).toBeNull();
+    expect(credentialBearingField({ id: `bootstrap-review-retry:run_${"a".repeat(64)}:1:sha256:${hex64}:29` })).toBe("id");
+    expect(credentialBearingField({ id: `buzz:buzz-message:${hex64}#${"1".repeat(60)}` })).toBe("id");
+    const core = makeCore();
+    try {
+      expect(core.audit.record({ kind: "TEST_FORGED_ID", evidence: { detail: forged, digest: real } }).allowed).toBe(true);
+      expect(core.audit.byKind("TEST_FORGED_ID")[0]!.evidence).toEqual({ detail: `[redacted]:#manifest/sha256:[redacted]`, digest: real });
+    } finally { core.db.close(); }
+  });
+
   it("the audit log stores a long-base64 run in free text redacted", () => {
     const core = makeCore();
     try {
@@ -584,6 +610,9 @@ describe("#1223 P1-A: the audit log and artifact store exempt only exact ACP-gen
       const writer = setup.harness.cp.evidenceWritersForTests().VERIFICATION;
       expect(() => setup.harness.cp.artifacts.putEvidence(writer, setup.run.runId, "VERIFICATION", report(LONG_BASE64), digest))
         .toThrow(/contains a credential/);
+      // #1223 R4: nor is a manifest id whose project part is itself a credential run.
+      expect(() => setup.harness.cp.artifacts.putEvidence(writer, setup.run.runId, "VERIFICATION",
+        report(`${"Ab9Zq7x2".repeat(10)}:#manifest/sha256:${hex64}`), digest)).toThrow(/contains a credential/);
       // #1223 R3: a 64-hex run inside a whitespace-free free-text value is not an id.
       expect(() => setup.harness.cp.artifacts.putEvidence(writer, setup.run.runId, "VERIFICATION", report(EXPOSED_HEX), digest))
         .toThrow(/contains a credential/);
