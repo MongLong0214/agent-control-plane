@@ -95,6 +95,15 @@ export interface GitProcessGroup {
   leaderStartedAt: string | null;
 }
 
+/**
+ * S2 — what records a turn's git groups durably, so a daemon that restarts still sees one that lives
+ * on: `started` at the spawn (false when the record could not be written), `ended` once confirmed empty.
+ */
+export interface GitGroupRecorder {
+  started(group: GitProcessGroup): boolean;
+  ended(group: GitProcessGroup): void;
+}
+
 export interface GitChildrenClosed {
   /** Every group was emptied: its leader seen to exit and no member left (`kill(-pgid, 0)` is ESRCH). */
   reaped: boolean;
@@ -123,6 +132,12 @@ export class GitChildren {
   #retired = false;
   readonly #groups = new Map<number, { child: ChildProcess; leaderExited: boolean; leaderStartedAt: string | null }>();
   #heldIndexLock: string | null = null;
+  #recorder: GitGroupRecorder | null = null;
+
+  /** S2 — every group from now on is recorded at its spawn and again once confirmed empty. */
+  record(recorder: GitGroupRecorder): void {
+    this.#recorder = recorder;
+  }
 
   get closed(): boolean {
     return this.#closed;
@@ -144,17 +159,32 @@ export class GitChildren {
     if (pgid === undefined) return;
     const entry = { child, leaderExited: false, leaderStartedAt: readProcessStartToken(pgid) };
     this.#groups.set(pgid, entry);
+    // A group that cannot be recorded does not run: it is killed at once, and stays registered until empty.
+    if (this.#recorder && !this.#recorder.started({ pgid, leaderStartedAt: entry.leaderStartedAt })) {
+      try {
+        process.kill(-pgid, "SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }
     child.once("exit", () => {
       entry.leaderExited = true;
       // Released only when nothing is left in the group; a descendant keeps it registered.
-      if (groupGone(pgid, entry)) this.#groups.delete(pgid);
+      if (groupGone(pgid, entry)) this.drop(pgid);
     });
+  }
+
+  private drop(pgid: number): void {
+    const entry = this.#groups.get(pgid);
+    if (!entry) return;
+    this.#groups.delete(pgid);
+    this.#recorder?.ended({ pgid, leaderStartedAt: entry.leaderStartedAt });
   }
 
   /** Groups still registered after dropping every one confirmed empty. */
   liveGroups(): GitProcessGroup[] {
     for (const [pgid, entry] of this.#groups) {
-      if (groupGone(pgid, entry)) this.#groups.delete(pgid);
+      if (groupGone(pgid, entry)) this.drop(pgid);
     }
     return [...this.#groups.entries()].map(([pgid, entry]) => ({ pgid, leaderStartedAt: entry.leaderStartedAt }));
   }
@@ -202,7 +232,7 @@ export class GitChildren {
       }
     }
     const unreaped = entries.filter(([pgid]) => !stopped(pgid)).map(([pgid, entry]) => ({ pgid, leaderStartedAt: entry.leaderStartedAt }));
-    for (const [pgid] of entries) if (stopped(pgid)) this.#groups.delete(pgid);
+    for (const [pgid] of entries) if (stopped(pgid)) this.drop(pgid);
     let indexLockReleased = false;
     if (this.#heldIndexLock !== null) {
       rmSync(this.#heldIndexLock, { force: true });

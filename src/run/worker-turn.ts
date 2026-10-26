@@ -5,7 +5,7 @@ import { allow, deny, isAcpError, type Decision, type Evidence } from "../core/e
 import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { acpScratchDir } from "../core/scratch-root.ts";
-import type { CheckoutWriterFact } from "../claims/claim-registry.ts";
+import { type CheckoutWriterFact, claimAcquisition } from "../claims/claim-registry.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { fixedRuntimes } from "../domain/fixed-role-runtime.ts";
@@ -96,6 +96,14 @@ const DEFAULT_SHUTDOWN_BUDGET_MS = 15_000;
 const GIT_REAP_BOUND_MS = 5_000;
 /** The bounded second attempt for a group the first one could not confirm empty. */
 const GIT_REAP_RETRY_MS = 10_000;
+
+/**
+ * S2 — a git process group a worker turn started, recorded at its spawn, and the same group recorded
+ * once confirmed empty. A started record with no ended record is a group a restarted daemon must still
+ * see gone (`confirmedGone`) before anything of the run enters the checkout (`settledWriter`).
+ */
+export const TASK_WORKER_GIT_GROUP_STARTED = "TASK_WORKER_GIT_GROUP_STARTED";
+export const TASK_WORKER_GIT_GROUP_ENDED = "TASK_WORKER_GIT_GROUP_ENDED";
 
 /** Audit kinds this runner writes; `describe` reads them back. */
 export const WorkerTurnEvent = {
@@ -651,9 +659,45 @@ export class WorkerTurnRunner {
     return { drained: drained && outstanding.length === 0 && gitStopped, outstanding, gitStopped, unconfirmedGroups };
   }
 
-  private openRegistry(children: GitChildren, worktree: string): void {
+  private openRegistry(children: GitChildren, facts: DurableFacts): void {
+    const worktree = facts.claim.worktree;
     this.#gitRegistries.add(children);
     this.#registryWorktrees.set(children, worktree);
+    const recorded = new Map<number, number>();
+    children.record({
+      started: (group) => {
+        try {
+          const written = this.ports.audit.record({
+            kind: TASK_WORKER_GIT_GROUP_STARTED,
+            runId: facts.runId,
+            sessionId: facts.worker.sessionId,
+            roleKey: facts.worker.roleKey,
+            evidence: { worktreeId: worktree, taskId: facts.taskId, pgid: group.pgid, leaderStartedAt: group.leaderStartedAt },
+          });
+          if (!written.allowed) return false;
+          recorded.set(group.pgid, written.value);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      ended: (group) => {
+        const startedEventId = recorded.get(group.pgid);
+        if (startedEventId === undefined) return;
+        recorded.delete(group.pgid);
+        try {
+          this.ports.audit.record({
+            kind: TASK_WORKER_GIT_GROUP_ENDED,
+            runId: facts.runId,
+            sessionId: facts.worker.sessionId,
+            roleKey: facts.worker.roleKey,
+            evidence: { worktreeId: worktree, taskId: facts.taskId, pgid: group.pgid, startedEventId },
+          });
+        } catch {
+          // Unrecorded, the group stays started on record and is asked again, live, whenever it matters.
+        }
+      },
+    });
   }
 
   /** Drops every registry whose owner retired it and whose groups are all confirmed empty. */
@@ -708,10 +752,11 @@ export class WorkerTurnRunner {
     const groups = [...this.#gitRegistries]
       .filter((registry) => this.#registryWorktrees.get(registry) === worktree)
       .flatMap((registry) => registry.liveGroups());
-    if (groups.length > 0) {
+    const recorded = this.recordedGitGroup(runId, worktree);
+    if (groups.length > 0 || recorded !== null) {
       return {
         reason: "a git child a worker turn started is still running against the checkout",
-        evidence: { worktreeId: worktree, groups: groups.map((group) => group.pgid) },
+        evidence: { worktreeId: worktree, groups: groups.length > 0 ? groups.map((group) => group.pgid) : [recorded] },
       };
     }
     const rows = this.ports.db.all<{
@@ -751,6 +796,43 @@ export class WorkerTurnRunner {
           evidence: { ...evidence, pgid: unended },
         };
       }
+    }
+    return null;
+  }
+
+  /**
+   * S2 — a git group a turn of the run started on the checkout, recorded at its spawn with no record of
+   * its end, that is not confirmed gone now: its leader and every member gone, or its id held by another
+   * process. This is what a restarted daemon has in place of the registries the last one held. A record
+   * that cannot be read, or names no group, counts as a live one.
+   */
+  private recordedGitGroup(runId: string, worktree: string): number | null {
+    const events = (kind: string): Array<{ eventId: number; evidence: Record<string, unknown> | null }> =>
+      this.ports.db
+        .all<{ event_id: number; evidence_json: string }>(
+          `SELECT event_id, evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`,
+          [kind, runId],
+        )
+        .map((row) => {
+          try {
+            const parsed = JSON.parse(row.evidence_json) as unknown;
+            return { eventId: row.event_id, evidence: typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : null };
+          } catch {
+            return { eventId: row.event_id, evidence: null };
+          }
+        });
+    const ended = new Set(events(TASK_WORKER_GIT_GROUP_ENDED).map((event) => event.evidence?.["startedEventId"]));
+    for (const started of events(TASK_WORKER_GIT_GROUP_STARTED)) {
+      if (ended.has(started.eventId)) continue;
+      if (started.evidence === null) return -1;
+      if (started.evidence["worktreeId"] !== worktree) {
+        if (typeof started.evidence["worktreeId"] === "string") continue;
+        return -1;
+      }
+      const pgid = Number(started.evidence["pgid"]);
+      const leaderStartedAt = started.evidence["leaderStartedAt"];
+      if (!Number.isSafeInteger(pgid) || pgid <= 1) return -1;
+      if (!this.confirmedGone(pgid, typeof leaderStartedAt === "string" ? leaderStartedAt : null)) return pgid;
     }
     return null;
   }
@@ -1206,13 +1288,18 @@ export class WorkerTurnRunner {
         claimId: request.claimId,
       });
     }
-    const siblings = db.all<{ branch: string | null; declared_path: string | null }>(
-      `SELECT branch, declared_path FROM resource_claims
-        WHERE run_id = ? AND repository_identity = ? AND status = 'HELD' AND expires_at > ?
-          AND owner_session_id = ? AND owner_binding_generation = ? AND acquired_at = ?
-        ORDER BY claim_id`,
-      [request.runId, claim.repository_identity, now, claim.owner_session_id, claim.owner_binding_generation, claim.acquired_at],
-    );
+    // S2 — the rows acquired with this claim, by the same authority the hand-over releases by: never a
+    // claim acquired apart in the same millisecond.
+    const acquisition = claimAcquisition(db, request.claimId);
+    if (!acquisition || acquisition.membership === "UNPROVEN") {
+      return deny(ReasonCode.INVALID_ARGUMENT, "the rows acquired with the claim cannot be proven complete", {
+        claimId: request.claimId,
+      });
+    }
+    const siblings = acquisition.rows.filter((row) =>
+      row.run_id === request.runId && row.repository_identity === claim.repository_identity && row.status === "HELD" &&
+      row.expires_at > now && row.owner_session_id === claim.owner_session_id &&
+      row.owner_binding_generation === claim.owner_binding_generation);
     const branches = siblings.map((row) => row.branch).filter((branch): branch is string => branch !== null);
     const ownedPaths = [...new Set(siblings.map((row) => row.declared_path).filter((path): path is string => path !== null))].sort();
     if (branches.length !== 1) {
@@ -1282,7 +1369,7 @@ export class WorkerTurnRunner {
     try {
       const pinned = pinRepository(worktree, scratch);
       if (pinned.allowed) {
-        this.openRegistry(pinned.value.children, worktree);
+        this.openRegistry(pinned.value.children, facts);
         onOpened(pinned.value.children);
       }
       if (!pinned.allowed) return pinned as Decision<never>;
@@ -1375,7 +1462,7 @@ export class WorkerTurnRunner {
       const pinned = pinRepository(facts.claim.worktree, scratch);
       if (!pinned.allowed) return pinned as Decision<never>;
       opened = pinned.value.children;
-      this.openRegistry(opened, facts.claim.worktree);
+      this.openRegistry(opened, facts);
       return await this.prepareTaskBranchOn(pinned.value, facts, target);
     } catch (error) {
       return deny(ReasonCode.PROBE_FAILED, "the claimed worktree could not be prepared on the task's branch", {

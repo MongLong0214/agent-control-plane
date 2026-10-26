@@ -61,7 +61,76 @@ const NO_RUNNER: CheckoutWriterFact = { reason: "no worker runner answers for th
 /** The run's own HELD worktree claim on a checkout, which a hand-over releases with its acquisition. */
 interface EarlierClaim {
   claimId: string;
+  /** The rows acquired with it, exactly: the ones a hand-over releases. */
+  acquisition: string;
 }
+
+/**
+ * S2 — a claim names its acquisition and its place in it: `<acquisition>.<index>.<count>`, every row of
+ * one acquisition sharing the same acquisition id and count. Rows are never deleted while their run
+ * lives, so an acquisition's membership is read from the rows themselves, complete or provably not.
+ */
+const ACQUIRED_CLAIM_ID = /^(clm_[0-9a-f]{24})\.([1-9][0-9]*)\.([1-9][0-9]*)$/;
+
+export interface AcquisitionRow {
+  claim_id: string;
+  run_id: string;
+  repository_identity: string;
+  branch: string | null;
+  worktree_id: string | null;
+  declared_path: string | null;
+  owner_session_id: string;
+  owner_binding_generation: number;
+  acquired_at: string;
+  expires_at: string;
+  status: ClaimRecord["status"];
+}
+
+/**
+ * S2 — every row acquired together with `claimId`, the one authority both the hand-over and a worker
+ * turn's claim facts read. PROVEN: the claim carries its acquisition, and each index from 1 to its count
+ * is there once, every row of the same run, repository, owner and time. UNPROVEN: it carries one, and
+ * the rows do not add up; nothing may be released or run on it. LEGACY: a claim minted before S2, with
+ * no acquisition in its id, whose rows are those minted before S2 with its run, repository, owner and
+ * acquisition time — a superset when two acquisitions shared a millisecond, so a turn on it can only be
+ * refused more, and a hand-over never releases one. null for an unknown claim.
+ */
+export const claimAcquisition = (
+  db: Db,
+  claimId: string,
+): { membership: "PROVEN" | "UNPROVEN" | "LEGACY"; acquisition: string | null; rows: AcquisitionRow[] } | null => {
+  const anchor = db.get<AcquisitionRow>(`SELECT * FROM resource_claims WHERE claim_id = ?`, [claimId]);
+  if (!anchor) return null;
+  const minted = ACQUIRED_CLAIM_ID.exec(claimId);
+  if (!minted) {
+    const rows = db.all<AcquisitionRow>(
+      `SELECT * FROM resource_claims
+        WHERE run_id = ? AND repository_identity = ? AND owner_session_id = ? AND owner_binding_generation = ?
+          AND acquired_at = ? AND instr(claim_id, '.') = 0
+        ORDER BY claim_id`,
+      [anchor.run_id, anchor.repository_identity, anchor.owner_session_id, anchor.owner_binding_generation, anchor.acquired_at],
+    );
+    return { membership: "LEGACY", acquisition: null, rows };
+  }
+  const acquisition = minted[1]!;
+  const count = Number(minted[3]);
+  // Every id of the acquisition sorts between `<acquisition>.` and `<acquisition>/`, on the primary key.
+  const rows = db.all<AcquisitionRow>(
+    `SELECT * FROM resource_claims WHERE claim_id >= ? AND claim_id < ? ORDER BY claim_id`,
+    [`${acquisition}.`, `${acquisition}/`],
+  );
+  const indices = new Set<number>();
+  const consistent = rows.every((row) => {
+    const own = ACQUIRED_CLAIM_ID.exec(row.claim_id);
+    if (!own || own[1] !== acquisition || Number(own[3]) !== count) return false;
+    indices.add(Number(own[2]));
+    return row.run_id === anchor.run_id && row.repository_identity === anchor.repository_identity &&
+      row.owner_session_id === anchor.owner_session_id && row.owner_binding_generation === anchor.owner_binding_generation &&
+      row.acquired_at === anchor.acquired_at;
+  });
+  const complete = rows.length === count && indices.size === count && [...indices].every((index) => index <= count);
+  return { membership: consistent && complete ? "PROVEN" : "UNPROVEN", acquisition, rows };
+};
 
 /**
  * PRD §23 — a *minimal* coordination registry, not a scheduler.
@@ -202,8 +271,9 @@ export class ClaimRegistry {
       const created: ClaimRecord[] = [];
       if (earlier.value) this.handOver(request, earlier.value, now);
 
-      for (const target of wanted) {
-        const claimId = newClaimId();
+      const acquisition = newClaimId();
+      for (const [index, target] of wanted.entries()) {
+        const claimId = `${acquisition}.${index + 1}.${wanted.length}`;
         this.db.run(
           `INSERT INTO resource_claims (claim_id, repository_identity, branch, worktree_id,
                                         declared_path, run_id, owner_session_id,
@@ -239,8 +309,6 @@ export class ClaimRegistry {
           worktreeId: canonicalWorktree?.allowed ? canonicalWorktree.value : null,
           paths: request.declaredPaths ?? [],
           expiresAt,
-          // The exact rows of this acquisition, so a hand-over releases these and nothing acquired apart.
-          claimIds: created.map((claim) => claim.claimId),
           ...(earlier.value ? { handedOverFrom: earlier.value.claimId } : {}),
         },
       });
@@ -276,37 +344,42 @@ export class ClaimRegistry {
         },
       );
     }
-    return allow(ReasonCode.OK, { claimId: held.claim_id });
+    const membership = claimAcquisition(this.db, held.claim_id);
+    if (membership?.membership !== "PROVEN" || membership.acquisition === null) {
+      return deny(
+        ReasonCode.CLAIM_WORKTREE_CONFLICT,
+        `worktree is still held by this run's claim ${held.claim_id}, and the rows acquired with it cannot be ` +
+          "proven complete; nothing is released",
+        {
+          repositoryIdentity: request.repositoryIdentity,
+          worktree,
+          heldByRun: request.runId,
+          claimId: held.claim_id,
+          membership: membership?.membership ?? null,
+        },
+      );
+    }
+    return allow(ReasonCode.OK, { claimId: held.claim_id, acquisition: membership.acquisition });
   }
 
   /**
-   * Releases the rows of the earlier claim's own acquisition — its worktree, branch and paths, as its
-   * CLAIM_ACQUIRED record lists them — in the transaction that inserts this claim, so the checkout
-   * passes from one claim of the run to the next and is never free to another run in between. A claim
-   * acquired apart, even in the same millisecond, is not one of them; an acquisition with no list
-   * (recorded before the list existed) gives up its worktree row only.
+   * Releases every row of the earlier claim's own acquisition, proven complete (`claimAcquisition`), in
+   * the transaction that inserts this claim, so the checkout passes from one claim of the run to the
+   * next and is never free to another run in between. A claim acquired apart, even in the same
+   * millisecond, is not one of them.
    */
   private handOver(request: ClaimRequest, earlier: EarlierClaim, now: string): void {
-    const acquisition = this.db.get<{ evidence_json: string }>(
-      `SELECT evidence_json FROM audit_events
-        WHERE kind = 'CLAIM_ACQUIRED' AND run_id = ?
-          AND EXISTS (SELECT 1 FROM json_each(audit_events.evidence_json, '$.claimIds') WHERE value = ?)
-        ORDER BY event_id DESC LIMIT 1`,
-      [request.runId, earlier.claimId],
-    );
-    const listed = acquisition ? (JSON.parse(acquisition.evidence_json) as { claimIds?: unknown }).claimIds : undefined;
-    const claimIds = [...new Set([earlier.claimId, ...(Array.isArray(listed) ? listed.filter((id): id is string => typeof id === "string") : [])])];
     const released = this.db.run(
       `UPDATE resource_claims SET status = 'RELEASED', released_at = ?
-        WHERE status = 'HELD' AND run_id = ? AND claim_id IN (${claimIds.map(() => "?").join(", ")})`,
-      [now, request.runId, ...claimIds],
+        WHERE status = 'HELD' AND run_id = ? AND claim_id >= ? AND claim_id < ?`,
+      [now, request.runId, `${earlier.acquisition}.`, `${earlier.acquisition}/`],
     ).changes;
     this.audit.record({
       kind: "CLAIM_RELEASED",
       runId: request.runId,
       sessionId: request.ownerSessionId,
       roleKey: request.ownerRoleKey,
-      evidence: { reason: "HANDED_OVER", claimId: earlier.claimId, claimIds, released },
+      evidence: { reason: "HANDED_OVER", claimId: earlier.claimId, acquisition: earlier.acquisition, released },
     });
   }
 

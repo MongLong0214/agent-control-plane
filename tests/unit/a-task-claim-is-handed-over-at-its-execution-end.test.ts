@@ -625,6 +625,66 @@ describe("S2 — while any writer of the previous execution may still exist, the
       }
     });
   });
+  it("restart: a git child a successful turn left alive keeps a fresh runner over the same database refusing the hand-over claim and task_worker_run until it has exited", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s2-git-child-restart");
+      const [one, two] = s.taskIds;
+      const worker = workerDoing(f, { writes: { "README.md": "# task one\n" } });
+      const git = gitLeavingAChild();
+      const path = process.env["PATH"];
+      const original = cp.workerTurns;
+      let child: number | null = null;
+      try {
+        const first = await staffAndClaim(f, s, one);
+        process.env["PATH"] = `${git.bin}${delimiter}${path ?? ""}`;
+        const ran = await runTask(f, s, one, first.claimId);
+        expect(ran).toMatchObject({ ok: true });
+        await original.settled(executionOf(ran));
+        process.env["PATH"] = path;
+        expect(cp.tasks.execution(executionOf(ran))?.status).toBe("SUCCEEDED");
+        child = git.childPid();
+        expect(child !== null && alive(child), "the turn's git child still runs").toBe(true);
+
+        // The daemon restarts: a fresh runner over the same database, holding none of the last one's registries.
+        const restarted = new WorkerTurnRunner({
+          db: cp.db, clock: cp.clock, audit: cp.audit, tasks: cp.tasks, guard: cp.guard,
+          workerAdapter: (provider: string) => cp.providers.requireForRole(provider, Role.WORKER),
+        });
+        Object.defineProperty(cp, "workerTurns", { value: restarted, configurable: true });
+        expect(await restarted.reconcileAfterRestart()).toEqual([]);
+
+        const target = await provision(f, s, two);
+        const handOver = await claim(f, s, target);
+        expect(handOver).toMatchObject({ ok: false, reasonCode: ReasonCode.CLAIM_WORKTREE_CONFLICT });
+        expect(String(handOver["message"])).toMatch(/this run's claim .*git child .*still running/);
+        expect(statusOf(f, first.claimId)).toBe("HELD");
+
+        expect(await f.cto(s.sessionId, "resource_release", { runId: s.runId })).toMatchObject({ ok: true });
+        const taken = await claim(f, s, target);
+        expect(taken).toMatchObject({ ok: true });
+        const entered = await runTask(f, s, two, worktreeClaimOf(taken));
+        expect(entered).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
+        expect(String(entered["message"])).toMatch(/git child .*still running .*no task of the run enters the checkout/);
+        expect(cp.tasks.executions(s.runId).filter((execution) => execution.taskId === two)).toHaveLength(0);
+
+        process.kill(child!, "SIGKILL");
+        await vi.waitFor(() => expect(alive(child!)).toBe(false), { timeout: 5_000, interval: 20 });
+        const passed = await claim(f, s, target);
+        expect(passed, "the hand-over once the git child has exited").toMatchObject({ ok: true });
+        worker.script = { writes: { "src/app.js": "module.exports = () => 2;\n" } };
+        const next = await runTask(f, s, two, worktreeClaimOf(passed));
+        expect(next, "task_worker_run once the git child has exited").toMatchObject({ ok: true });
+        await restarted.settled(executionOf(next));
+        expect(cp.tasks.execution(executionOf(next))?.status).toBe("SUCCEEDED");
+      } finally {
+        process.env["PATH"] = path;
+        Object.defineProperty(cp, "workerTurns", { value: original, configurable: true });
+        if (child !== null && alive(child)) process.kill(child, "SIGKILL");
+        worker.killAll();
+      }
+    });
+  });
 });
 
 describe("S2 — cross-run exclusivity is unchanged", () => {
@@ -689,6 +749,80 @@ describe("S2 — cross-run exclusivity is unchanged", () => {
       });
       expect(taken, "another run").toMatchObject({ ok: false, reasonCode: ReasonCode.CLAIM_PATH_CONFLICT });
       expect(taken["evidence"]).toMatchObject({ heldByRun: s.runId, claimId: reservation });
+    });
+  });
+
+  it("same millisecond: the next task's turn runs on its own acquisition, not on a reservation acquired apart at the same instant", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s2-same-ms-turn");
+      const [one, two] = s.taskIds;
+      const worker = workerDoing(f, { writes: { "README.md": "# task one\n" } });
+      try {
+        const first = await staffAndClaim(f, s, one);
+        const ran = await runTask(f, s, one, first.claimId);
+        await cp.workerTurns.settled(executionOf(ran));
+        expect(cp.tasks.execution(executionOf(ran))?.status).toBe("SUCCEEDED");
+        const reserved = await f.cto(s.sessionId, "resource_claim", {
+          runId: s.runId, repositoryIdentity: first.target.repositoryIdentity, declaredPaths: ["docs/reserved.md"],
+        });
+        expect(reserved).toMatchObject({ ok: true });
+        const reservation = (reserved["value"] as { claims: Array<{ claimId: string }> }).claims[0]!.claimId;
+
+        const second = await claim(f, s, await provision(f, s, two));
+        expect(second).toMatchObject({ ok: true });
+        const acquiredAt = (claimId: string): string =>
+          cp.db.get<{ acquired_at: string }>(`SELECT acquired_at FROM resource_claims WHERE claim_id = ?`, [claimId])!.acquired_at;
+        expect(acquiredAt(reservation), "the clock did not move").toBe(acquiredAt(worktreeClaimOf(second)));
+        worker.script = { writes: { "src/app.js": "module.exports = () => 2;\n" } };
+        const next = await runTask(f, s, two, worktreeClaimOf(second));
+        expect(next).toMatchObject({ ok: true });
+        await cp.workerTurns.settled(executionOf(next));
+        expect(cp.tasks.execution(executionOf(next))?.status).toBe("SUCCEEDED");
+        expect(statusOf(f, reservation)).toBe("HELD");
+      } finally {
+        worker.killAll();
+      }
+    });
+  });
+
+  it("an acquisition of 203 rows is handed over whole, nothing of it left held; one whose rows no longer add up is not handed over, nor run on", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s2-203-rows");
+      const [one, two] = s.taskIds;
+      const firstTarget = await provision(f, s, one);
+      const paths = Array.from({ length: 201 }, (_, index) => `docs/file${index}.md`);
+      const first = await claim(f, s, { ...firstTarget, paths });
+      expect(first).toMatchObject({ ok: true });
+      const firstIds = (first["value"] as { claims: Array<{ claimId: string }> }).claims.map((row) => row.claimId);
+      expect(firstIds).toHaveLength(203);
+
+      const secondTarget = await provision(f, s, two);
+      const second = await claim(f, s, secondTarget);
+      expect(second).toMatchObject({ ok: true });
+      const secondIds = (second["value"] as { claims: Array<{ claimId: string }> }).claims.map((row) => row.claimId);
+      expect(firstIds.filter((claimId) => statusOf(f, claimId) !== "RELEASED"), "rows of the first acquisition left unreleased").toEqual([]);
+      const held = cp.db.all<{ claim_id: string }>(`SELECT claim_id FROM resource_claims WHERE run_id = ? AND status = 'HELD' ORDER BY claim_id`, [s.runId]);
+      expect(held.map((row) => row.claim_id), "only the second acquisition is held").toEqual([...secondIds].sort());
+
+      const other = await s.dispatchRun();
+      const taken = await f.cto(s.sessionId, "resource_claim", {
+        runId: other, repositoryIdentity: firstTarget.repositoryIdentity, declaredPaths: ["docs/file200.md"],
+      });
+      expect(taken, "the last path of the first acquisition is free to another run").toMatchObject({ ok: true });
+
+      // A row of the second acquisition goes missing: its membership cannot be proven, so nothing moves.
+      const pathRow = cp.db.get<{ claim_id: string }>(
+        `SELECT claim_id FROM resource_claims WHERE run_id = ? AND status = 'HELD' AND declared_path IS NOT NULL`, [s.runId])!.claim_id;
+      cp.db.run(`DELETE FROM resource_claims WHERE claim_id = ?`, [pathRow]);
+      const again = await claim(f, s, secondTarget);
+      expect(again).toMatchObject({ ok: false, reasonCode: ReasonCode.CLAIM_WORKTREE_CONFLICT });
+      expect(String(again["message"])).toMatch(/cannot be proven complete; nothing is released/);
+      expect(secondIds.filter((claimId) => claimId !== pathRow).map((claimId) => statusOf(f, claimId))).toEqual(["HELD", "HELD"]);
+      const entered = await runTask(f, s, two, worktreeClaimOf(second));
+      expect(entered).toMatchObject({ ok: false, reasonCode: ReasonCode.INVALID_ARGUMENT });
+      expect(String(entered["message"])).toMatch(/cannot be proven complete/);
     });
   });
 });
