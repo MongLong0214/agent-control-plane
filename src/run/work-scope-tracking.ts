@@ -52,6 +52,13 @@ import { CLOSED_TO_NEW_TASKS, type TaskGraph, type TaskRecord } from "./task-gra
  */
 export const WORK_SCOPE_APPROVED = "WORK_SCOPE_APPROVED";
 export const WORK_SCOPE_GITHUB_CREATED = "WORK_SCOPE_GITHUB_CREATED";
+/**
+ * #1240 review R4 — an issue ACP is about to create, recorded before the POST with the tasks it covers and
+ * the exact marker it carries. It stays pending until a readback finds that marker, when it becomes
+ * CREATED for those tasks; every sync of the run looks for it first. It is never retired on one absent
+ * readback: a request whose answer was lost may still land, and is then still found.
+ */
+export const WORK_SCOPE_GITHUB_CREATING = "WORK_SCOPE_GITHUB_CREATING";
 export const WORK_SCOPE_GITHUB_TRACKED = "WORK_SCOPE_GITHUB_TRACKED";
 
 interface ApprovedUnit {
@@ -354,13 +361,18 @@ export class WorkScopeTracking {
       return { cause: "the GitHub port cannot read or write work issues", correction: "compose the daemon with the Repo Factory GitHub port" };
     }
     const declarations = this.#declarations(runId);
-    const created = this.#created(runId);
     const adoptedBefore = new Map(this.#trackedRecords(runId, governed).filter((unit) => unit.adopted).map((unit) => [unit.unit, unit.issueNumber] as const));
-    // The issues that already track each task's work, verified or created, under whatever unit key it had.
+    // The issues that already track each task's work, verified or created, under whatever unit key it had;
+    // read once the pending creates are resolved, so an issue whose answer was lost is among them.
     const trackedByTask = new Map<string, Set<number>>();
-    for (const link of [...this.#trackedRecords(runId, governed), ...this.#createdIssues(runId)]) {
-      for (const taskId of link.taskIds ?? []) trackedByTask.set(taskId, (trackedByTask.get(taskId) ?? new Set()).add(link.issueNumber));
-    }
+    let created = new Map<string, { number: number; nodeId: string }>();
+    const known = (): void => {
+      created = this.#created(runId);
+      trackedByTask.clear();
+      for (const link of [...this.#trackedRecords(runId, governed), ...this.#createdIssues(runId)]) {
+        for (const taskId of link.taskIds ?? []) trackedByTask.set(taskId, (trackedByTask.get(taskId) ?? new Set()).add(link.issueNumber));
+      }
+    };
     const unmet: UnmetWork[] = [];
     // The only bodies a POST may carry: exactly the PLAN's new milestones and issues, with their markers.
     const planned: Array<{ path: "milestones" | "issues"; title: string; text: string }> = [];
@@ -375,6 +387,13 @@ export class WorkScopeTracking {
     try {
       readback = await runUnderWriteGuard(this.#guard(runId, target, status.scope!, planned), async () => {
         const resources = await github.observeWorkResources!(target, repositoryNodeId);
+        // First, every create whose answer was never heard: found by the marker it was sent with, it is ACP's
+        // issue for the tasks it covered, whatever unit key they have now.
+        for (const intent of this.#pendingIntents(runId)) {
+          const found = resources.issues.find((i) => i.body.includes(intent.marker));
+          if (found !== undefined) this.#recordCreated(runId, "issue", { unit: intent.unit, taskIds: intent.taskIds, marker: intent.marker }, found);
+        }
+        known();
         for (const approved of pending) {
           const declared = declarations.get(approved.unit);
           if (declared === undefined || declarationDigestOf(declared) !== approved.declarationDigest) {
@@ -450,8 +469,10 @@ export class WorkScopeTracking {
                 unmet.push({ unit: approved.unit, unmet: "ISSUE_EXISTS", issues: [clash.number], correction: `issue #${clash.number} already has this title; adopt it by number rather than create a duplicate` });
                 continue;
               }
+              // Durable before the POST: if GitHub's answer is lost, the next sync finds this issue by its marker.
+              this.ports.audit.record({ kind: WORK_SCOPE_GITHUB_CREATING, runId, projectId: this.ports.runs.get(runId)?.projectId ?? null, evidence: { resource: "issue", unit: approved.unit, taskIds: approved.taskIds, marker } });
               issue = await github.createWorkIssue!(target, repositoryNodeId, { title, body: withMarker(body, marker), milestone: milestone.number });
-              this.#recordCreated(runId, "issue", { unit: approved.unit, taskIds: approved.taskIds }, issue);
+              this.#recordCreated(runId, "issue", { unit: approved.unit, taskIds: approved.taskIds, marker }, issue);
               created.set(`issue:${approved.unit}`, issue);
               resources.issues.push(issue);
             }
@@ -655,7 +676,18 @@ export class WorkScopeTracking {
       .flatMap((e) => (e.resource === "issue" && typeof e.number === "number" ? [{ issueNumber: e.number, ...(Array.isArray(e.taskIds) ? { taskIds: e.taskIds } : {}) }] : []));
   }
 
-  #recordCreated(runId: string, resource: "issue" | "milestone", key: { unit?: string; titleDigest?: string; taskIds?: string[] }, answered: { number: number; nodeId: string }): void {
+  /** Issue creates recorded as intended and not yet found (CREATED with their marker). */
+  #pendingIntents(runId: string): Array<{ unit: string; taskIds: string[]; marker: string }> {
+    const rows = (kind: string) => this.ports.db
+      .all<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`, [kind, runId])
+      .map((row) => JSON.parse(row.evidence_json) as { resource?: string; unit?: string; taskIds?: string[]; marker?: string });
+    const settled = new Set(rows(WORK_SCOPE_GITHUB_CREATED).map((e) => e.marker).filter((m) => typeof m === "string"));
+    return rows(WORK_SCOPE_GITHUB_CREATING)
+      .filter((e) => e.resource === "issue" && typeof e.unit === "string" && typeof e.marker === "string" && Array.isArray(e.taskIds) && !settled.has(e.marker))
+      .map((e) => ({ unit: e.unit!, taskIds: e.taskIds!, marker: e.marker! }));
+  }
+
+  #recordCreated(runId: string, resource: "issue" | "milestone", key: { unit?: string; titleDigest?: string; taskIds?: string[]; marker?: string }, answered: { number: number; nodeId: string }): void {
     this.ports.audit.record({
       kind: WORK_SCOPE_GITHUB_CREATED,
       runId,

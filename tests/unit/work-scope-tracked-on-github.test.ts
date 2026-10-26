@@ -747,6 +747,48 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     expect(startExecution(g, impl).allowed).toBe(true);
   });
 
+  it("review R4 P2: a unit renamed after GitHub created its issue and lost the answer gains no second issue", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    // GitHub creates `feed`'s issue, and the call throws before ACP hears the answer.
+    g.github.fault = { suffix: "/issues", when: "after" };
+    expect(tracking(await planSubmit(g, [{ key: "feed", tasks: [impl], issue: { new: { title: "Add feed filtering", body: "Filter the feed" } }, milestone: { number: 1 } }]))).toMatchObject({ tracked: false });
+    const first = g.github.issues.find((i) => i.title === "Add feed filtering")!;
+    // The identical task, resubmitted under another unit key with another issue title.
+    const renamed = await planSubmit(g, [{ key: "feed-renamed", tasks: [impl], issue: { new: { title: "Feed filtering, renamed", body: "Filter the feed" } }, milestone: { number: 1 } }], undefined, "renamed");
+    expect(unmetOf(tracking(renamed)).map((u) => [u.unit, u.unmet, u.issues])).toEqual([["feed-renamed", "TASK_ALREADY_TRACKED", [first.number]]]);
+    expect(unmetOf(tracking(renamed))[0]!.correction).toBe(`task ${impl} is already tracked by #${first.number}; adopt it by number`);
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(g.github.issues.filter((i) => i.title === "Feed filtering, renamed")).toEqual([]);
+    expect(startExecution(g, impl).reasonCode).toBe(REFUSED);
+    // Adopting it by number tracks the task.
+    expect(tracking(await planSubmit(g, [{ key: "feed-renamed", tasks: [impl], issue: { number: first.number }, milestone: { number: 1 } }], undefined, "adopted"))).toMatchObject({ tracked: true });
+    expect(startExecution(g, impl).allowed).toBe(true);
+  });
+
+  it("review R4 P2 (sibling): a create GitHub never received holds nothing back", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/issues", when: "before" };
+    expect(tracking(await planSubmit(g, [{ key: "feed", tasks: [impl], issue: { new: { title: "Add feed filtering", body: "Filter the feed" } }, milestone: { number: 1 } }]))).toMatchObject({ tracked: false });
+    expect(g.github.issues.filter((i) => i.title === "Add feed filtering")).toEqual([]);
+    const renamed = await planSubmit(g, [{ key: "feed-renamed", tasks: [impl], issue: { new: { title: "Feed filtering, renamed", body: "Filter the feed" } }, milestone: { number: 1 } }], undefined, "renamed");
+    expect(tracking(renamed)).toMatchObject({ tracked: true });
+    expect(g.github.issues.filter((i) => /feed filtering/i.test(i.title)).map((i) => i.title)).toEqual(["Feed filtering, renamed"]);
+  });
+
+  it("review R4 P2 (milestones): a new milestone whose answer was lost is found again by its title's marker under a renamed unit", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/milestones", when: "after" };
+    const stage = { new: { title: "채널 성장: 구독자 10,000명", description: "The next growth goal" } };
+    expect(tracking(await planSubmit(g, [{ key: "feed", tasks: [impl], issue: { number: 3 }, milestone: stage }]))).toMatchObject({ tracked: false });
+    const renamed = await planSubmit(g, [{ key: "feed-renamed", tasks: [impl], issue: { new: { title: "Grow to ten thousand", body: "Plan" } }, milestone: stage }], undefined, "renamed");
+    expect(tracking(renamed)).toMatchObject({ tracked: true });
+    expect(g.github.milestones.filter((m) => m.title === stage.new.title)).toHaveLength(1);
+    expect(g.github.posts("/milestones")).toHaveLength(1);
+  });
+
   it("a project that is not a Repo Factory project plans and is admitted as before, with no GitHub request", async () => {
     const g = await governedRun({ provisioned: false, legacy: [] });
     const answer = await callCtoTool(g.h, g.owner, "plan_submit", { idempotencyKey: "plan-plain", runId: g.runId, plan: { summary: "plain" }, tasks: [{ key: "impl", title: "Implement", category: "implementation" }] });
