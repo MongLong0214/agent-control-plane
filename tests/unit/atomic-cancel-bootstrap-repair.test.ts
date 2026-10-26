@@ -268,6 +268,15 @@ describe("restore_refused_cancel_bootstrap_task", () => {
     { name: "an unknown kind", blocks: true, write: f => {
       f.cp.audit.record({ kind: "TASK_REOPENED_BY_A_NEW_WRITER", runId: f.runId, evidence: { taskId: f.taskId } });
     } },
+    ...["SESSION_TURN_REFUSED", "INGRESS_REFUSED", "BRANCH_PUBLISH_REFUSED"].map(kind => ({
+      name: `an explicit refusal ${kind}`, blocks: false, write: (f: Fixture) => {
+        f.cp.audit.record({ kind, runId: f.runId, reasonCode: ReasonCode.CONFLICT, evidence: { taskId: f.taskId } });
+      },
+    })),
+    { name: "a refusal recorded after its recovery rotated a credential", blocks: true, write: f => {
+      f.cp.audit.record({ kind: "BOOTSTRAP_CTO_RECOVERY_REFUSED", runId: f.runId, reasonCode: ReasonCode.CONFLICT,
+        evidence: { taskId: f.taskId } });
+    } },
   ];
   it.each(laterEvents)("a later audit naming the task, $name, blocks the restore: $blocks", async ({ blocks, write }) => {
     const f = await damaged();
