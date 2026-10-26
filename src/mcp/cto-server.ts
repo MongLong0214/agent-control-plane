@@ -261,7 +261,7 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       return allow(ReasonCode.OK, { digest: source.artifacts.put(runId, ArtifactKind.PLAN, bootstrapPlanDigest ? { ...stored, bootstrapPlanDigest } : stored).digest });
     },
     submitTasks: (runId: string, tasks: Parameters<TaskGraph["submit"]>[1]) => source.tasks.submit(runId, tasks),
-    ensureWorkScopeTracked: (runId: string) => source.tasks.ensureWorkScopeTracked(runId),
+    workScope: () => source.tasks.workScope,
     isProjectlessBootstrapRun: (runId: string) => isProjectlessBootstrap(source.runs.require(runId)),
     // PR #1114 BOOT-02 — a project-less bootstrap's re-plan is all or nothing: the PLAN write, the
     // supersession of the earlier PLAN's tasks, the one new task and its BOOTSTRAP_PLAN_TASKS binding
@@ -620,19 +620,27 @@ const createCtoServerFromPort = (
         tasks: submittedTasksSchema.optional(),
       },
     },
-    async (args) => writeOwned("plan_submit", args, async () => {
+    async (args) => writeOwned("plan_submit", args, async (_peer, fenced) => {
       const resolved = port.resolvePlanInput(args.runId, args);
       if (!resolved.allowed) return respond(resolved);
       const { plan, tasks, bootstrapPlanDigest } = resolved.value;
       if (port.isProjectlessBootstrapRun(args.runId)) return respond(port.submitBootstrapPlan(args.runId, plan, tasks, bootstrapPlanDigest));
+      // #1240 — a Repo Factory project's PLAN declares its work units; refused before anything is stored.
+      const scope = port.workScope();
+      const declared = scope === null ? allow(ReasonCode.OK, null) : scope.declare(args.runId, plan, tasks);
+      if (!declared.allowed) return respond(declared);
+      if (tasks.length === 0 && declared.value === null) return respond(deny(ReasonCode.INVALID_ARGUMENT, "plan_submit requires plan and tasks, or bootstrapPlanDigest"));
       const stored = port.submitPlan(args.runId, plan, bootstrapPlanDigest);
       if (!stored.allowed) return respond(stored);
-      const submitted = port.submitTasks(args.runId, tasks);
+      const submitted = tasks.length === 0 ? allow(ReasonCode.OK, []) : port.submitTasks(args.runId, tasks);
       if (!submitted.allowed) return respond(submitted);
-      // #1240 — an accepted PLAN's approved scope is synchronized to GitHub now. The tasks are stored
-      // either way, so a refusal is reported beside them, never as the PLAN's: admission refuses later.
-      const tracking = await port.ensureWorkScopeTracked(args.runId);
-      if (tracking.allowed && tracking.value === null) return respond(submitted);
+      if (scope === null || declared.value === null) return respond(submitted);
+      // The mapping, resolved to the stored tasks' ids, and the owner who submitted it; then the units are
+      // synchronized now. The tasks are stored either way, so a refusal is reported beside them, never as
+      // the PLAN's: admission refuses later, naming the units.
+      const approved = scope.approve(args.runId, stored.value.digest, declared.value, tasks, submitted.value, fenced);
+      if (!approved.allowed) return respond(approved);
+      const tracking = await scope.ensure(args.runId);
       return respond(allow(submitted.reasonCode, submitted.value, {
         ...submitted.evidence,
         githubTracking: tracking.allowed

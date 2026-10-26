@@ -2,8 +2,31 @@ import { z } from "zod";
 import { genesisBundleSchema } from "./genesis-bundle.ts";
 import { githubOperationSchema } from "./repo-factory-github.ts";
 
+/**
+ * #1240 — a Repo Factory project's STANDARD_WORK PLAN maps its tasks to responsibility units (several
+ * tasks may share one unit: implementation, review and correction of one deliverable). Each unit links
+ * one GitHub issue and one milestone, each either an existing one by number (adopted, verified by
+ * readback) or a `new` one ACP creates with exactly this text. `tasks` names this submission's task
+ * keys or the run's existing task ids. The latest PLAN's units are the run's whole approved scope.
+ */
+const workText = z.string().max(65_536);
+export const workUnitsSchema = z.array(z.object({
+  key: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
+  tasks: z.array(z.string().min(1)).min(1),
+  issue: z.union([
+    z.object({ number: z.number().int().positive() }).strict(),
+    z.object({ new: z.object({ title: z.string().trim().min(1).max(256), body: workText }).strict() }).strict(),
+  ]),
+  milestone: z.union([
+    z.object({ number: z.number().int().positive() }).strict(),
+    z.object({ new: z.object({ title: z.string().trim().min(1).max(256), description: workText.default("") }).strict() }).strict(),
+  ]),
+}).strict()).min(1).max(200);
+export type WorkUnitDeclaration = z.infer<typeof workUnitsSchema>[number];
+
 // Shared with the ordinary plan_submit path; attached input receives the same validation.
 export const submittedPlanSchema = z.object({
+  workUnits: workUnitsSchema.optional(),
   summary: z.string(),
   genesis: genesisBundleSchema.optional(),
   repositoryContentChange: z.boolean().optional(),

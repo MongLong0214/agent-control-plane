@@ -1,10 +1,11 @@
 /**
- * #1240 — the work-unit marker, the one place it is written and read.
+ * #1240 — Repo Factory's work-unit marker, the one place it is read.
  *
- * A planned issue's body ends, after a blank line, with `Work unit <k> of <n>: <key>`: the link from
- * the issue to one approved work unit. It links; it proves nothing about the issue's content, which
- * blind review judges. Repo Factory's genesis issues and ACP's STANDARD_WORK issues carry the same
- * form. Repo Factory's unit rule may change, so nothing else parses or spells the line.
+ * A genesis issue's body ends, after a blank line, with `Work unit <k> of <n>: <key>`: the link from
+ * the issue to one approved work unit, named by the request's public plan key. It links; it proves
+ * nothing about the issue's content, which blind review judges. Repo Factory's unit rule may change, so
+ * nothing else parses the line. STANDARD_WORK issues carry no such line: their unit links are ACP's own
+ * record (`work-scope-tracking.ts`), so no internal id is published.
  */
 export interface WorkUnitMarker {
   k: number;
@@ -14,7 +15,7 @@ export interface WorkUnitMarker {
 
 const WORK_UNIT = /^Work unit ([1-9]\d*) of ([1-9]\d*): ([A-Za-z0-9][A-Za-z0-9._-]*)$/;
 
-/** Every marker line of a body, in order, and whether the last line is one of them. */
+/** Every marker line of a body, in order, and the marker that is its last line, if one is. */
 export const workUnitMarkers = (body: string | null | undefined): { markers: WorkUnitMarker[]; last: WorkUnitMarker | null } => {
   const lines = (body ?? "").trimEnd().split(/\r?\n/);
   const markers: WorkUnitMarker[] = [];
@@ -28,7 +29,3 @@ export const workUnitMarkers = (body: string | null | undefined): { markers: Wor
   }
   return { markers, last };
 };
-
-/** The body a planned issue is written with: its text, a blank line, then its marker. */
-export const withWorkUnitMarker = (body: string, marker: WorkUnitMarker): string =>
-  `${body.trimEnd()}\n\nWork unit ${marker.k} of ${marker.n}: ${marker.key}`;

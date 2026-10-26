@@ -991,7 +991,7 @@ const STANDARD_WORK_STEPS =
   "A task with no execution that is not READY is left as it is. " +
   "Once every task of the run has SUCCEEDED, submit the run's result with mcp__acp-cto__result_submit and a new idempotencyKey; result_submit runs the blind review itself and answers when it is done. " +
   "A refused provision, claim or task_worker_run is reported for that run with mcp__acp-cto__escalation_open, and no result is submitted: never run an execution again or retry one on your own. " +
-  "Never submit that run's PLAN again to carry it on: a second plan_submit adds its tasks again";
+  "Never submit that run's PLAN again to carry it on: a second plan_submit adds its tasks again; only a PLAN that declares or re-links a Repo Factory project's workUnits, with tasks omitted, may be submitted again";
 
 /**
  * #512 — what a STANDARD_WORK run's PLAN gives each task, so that its claim later takes a declared
@@ -1000,6 +1000,14 @@ const STANDARD_WORK_STEPS =
  */
 const STANDARD_PLAN_WRITE_TARGET =
   "When you plan such a run, give each task's spec a writeTarget: repositoryIdentity (one of the repositories contract_get returned), paths (the repository-relative paths the task changes) and branch only when the run's contract names a work branch for that repository; otherwise leave branch out rather than choose one: the control plane derives the task's branch and records the whole writeTarget when it provisions the task's worker";
+
+/**
+ * #1240 — what a Repo Factory project's STANDARD_WORK PLAN also declares: its tasks' responsibility
+ * units, each linked to a GitHub issue and milestone (`WorkScopeTracking`). Adoption comes first; one
+ * deliverable's tasks share a unit; a re-link PLAN carries no tasks.
+ */
+const STANDARD_PLAN_WORK_UNITS =
+  "For a Repo Factory project (plan_submit refuses WORK_UNITS_MISSING without it) the PLAN also declares plan.workUnits, each {key, tasks: [this PLAN's task keys or the run's task ids], issue: {number} | {new: {title, body}}, milestone: {number} | {new: {title}}}: adopt the existing issue and milestone by number first, and declare new only for work no issue covers; the tasks of one deliverable (its implementation, review and correction) share one unit, and every live task is in exactly one; a plan_submit that only declares or re-links workUnits omits tasks";
 
 /**
  * The audit kind that records one standard work continuation wake: an ACTIVE STANDARD_WORK run whose
@@ -1065,7 +1073,7 @@ const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[
     // its directive (CEO 07b5b0df): a bootstrap or CONTRACT_CHANGE run's turn is written as before.
     ...(binding.role === Role.PRIMARY_CTO && standardWork
       ? [
-          `For a STANDARD_WORK run (contract_get's run.kind), a missing bootstrapPlanGuide is no reason to stop: once its PLAN is accepted and the run is ACTIVE, unless its result was already submitted, and before you acknowledge its RUN_DISPATCH: ${STANDARD_WORK_STEPS}. ${STANDARD_PLAN_WRITE_TARGET}.`,
+          `For a STANDARD_WORK run (contract_get's run.kind), a missing bootstrapPlanGuide is no reason to stop: once its PLAN is accepted and the run is ACTIVE, unless its result was already submitted, and before you acknowledge its RUN_DISPATCH: ${STANDARD_WORK_STEPS}. ${STANDARD_PLAN_WRITE_TARGET}. ${STANDARD_PLAN_WORK_UNITS}.`,
         ]
       : []),
     ...(triggers.some((trigger) => trigger.kind.startsWith(STANDARD_CONTINUATION_KIND_PREFIX))

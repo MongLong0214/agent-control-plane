@@ -11,6 +11,7 @@ import { newTaskId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import type { WorkScopeTracking } from "./work-scope-tracking.ts";
 import {
   type FailureClass,
   Role,
@@ -187,15 +188,6 @@ export interface WorkerExecutionBindingGate {
   hasLiveWorkerBinding(taskId: string, sessionId: string): boolean;
 }
 
-/**
- * #1240 — whether a unit's GitHub link is recorded (`WorkScopeTracking`). `assertTracked` reads the
- * recorded readbacks only, so it can be asked inside an execution's transaction; `ensure` synchronizes
- * the run's unrecorded units and reads them back first. A run it does not govern is allowed by both.
- */
-export interface WorkScopeGate {
-  assertTracked(runId: string, taskId: string): Decision<unknown>;
-  ensure(runId: string, taskId?: string): Promise<Decision<unknown>>;
-}
 
 /**
  * The CTO creates, extends and serialises the graph; the control plane checks only what
@@ -210,7 +202,7 @@ export interface WorkScopeGate {
  * States in which the graph is sealed. A packet has been produced or the run is over, so
  * a new pending task could only invalidate a completeness claim already made (§34.3).
  */
-const CLOSED_TO_NEW_TASKS: ReadonlySet<RunState> = new Set([
+export const CLOSED_TO_NEW_TASKS: ReadonlySet<string> = new Set<string>([
   RunState.READY_FOR_CEO_REVIEW,
   RunState.CEO_APPROVED,
   RunState.MERGING,
@@ -225,7 +217,7 @@ const CLOSED_TO_NEW_TASKS: ReadonlySet<RunState> = new Set([
 export class TaskGraph {
   #capacity: WorkerCapacityGate | null = null;
   #workerBindings: WorkerExecutionBindingGate | null = null;
-  #workScope: WorkScopeGate | null = null;
+  #workScope: WorkScopeTracking | null = null;
   readonly #baseline: BaselineRecorder;
 
   constructor(
@@ -238,19 +230,23 @@ export class TaskGraph {
   }
 
   /** Closed by the composition root after the capacity monitor exists. */
-  attach(ports: { capacity?: WorkerCapacityGate; workerBindings?: WorkerExecutionBindingGate; workScope?: WorkScopeGate }): void {
+  attach(ports: { capacity?: WorkerCapacityGate; workerBindings?: WorkerExecutionBindingGate; workScope?: WorkScopeTracking }): void {
     if (ports.capacity) this.#capacity = ports.capacity;
     if (ports.workerBindings) this.#workerBindings = ports.workerBindings;
     if (ports.workScope) this.#workScope = ports.workScope;
   }
 
   /**
-   * #1240 — a Repo Factory project's STANDARD_WORK unit is admitted once its GitHub link is recorded;
-   * the run's units not yet recorded are synchronized and read back first. Without a task, at plan
-   * acceptance, the whole approved scope is answered for.
+   * #1240 — a Repo Factory project's STANDARD_WORK task is admitted once its PLAN unit's GitHub link is
+   * verified; the run's units not yet verified are synchronized and read back first.
    */
-  ensureWorkScopeTracked(runId: string, taskId?: string): Promise<Decision<unknown>> {
+  ensureWorkScopeTracked(runId: string, taskId: string): Promise<Decision<unknown>> {
     return this.#workScope ? this.#workScope.ensure(runId, taskId) : Promise.resolve(allow(ReasonCode.OK, null));
+  }
+
+  /** #1240 — the work-unit tracking plan acceptance and CEO confirmation ask, when composed. */
+  get workScope(): WorkScopeTracking | null {
+    return this.#workScope;
   }
 
   /**

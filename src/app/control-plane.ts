@@ -776,7 +776,7 @@ export class ControlPlane {
       // project's STANDARD_WORK issues go through the same port, under their own write guard.
       const repoFactoryGitHub = config.repoFactory?.githubPort ?? createBootstrapGitHubWritePort();
       this.tasks.attach({
-        workScope: new WorkScopeTracking({ db: this.db, audit: this.audit, runs: this.runs, tasks: this.tasks, github: repoFactoryGitHub }),
+        workScope: new WorkScopeTracking({ db: this.db, audit: this.audit, artifacts: this.artifacts, runs: this.runs, tasks: this.tasks, github: repoFactoryGitHub }),
       });
       this.bootstrapProducer = new RepoFactoryBootstrapRunner({
         residentProjects: this.residentProjects,

@@ -5,31 +5,30 @@ import { join } from "node:path";
 import { executablePlanOf, planForSubmission } from "../../src/bootstrap/bootstrap-plan.ts";
 import { createBootstrapGitHubWritePort } from "../../src/bootstrap/bootstrap-write-guard.ts";
 import { type GenesisBundle, parseGenesis } from "../../src/bootstrap/genesis-bundle.ts";
-import { workUnitMarkers } from "../../src/bootstrap/work-unit-marker.ts";
 import { createGitHubApiWritePort, type GitHubRepositoryTarget } from "../../src/bootstrap/github-write-port.ts";
 import { produceRepoFactoryResult } from "../../src/bootstrap/repo-factory-producer.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { manifestDigest, projectManifestSchema } from "../../src/contracts/manifest.ts";
 import { digestOf } from "../../src/core/digest.ts";
-import { ExecutionMode, Role, RunKind, roleKeyFor } from "../../src/domain/types.ts";
+import { ArtifactKind, ExecutionMode, Role, RunKind, roleKeyFor } from "../../src/domain/types.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
 import { callCtoTool } from "../helpers/cto-tool.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { GenesisGitHub, genesisBundle, genesisPlanFixture } from "../helpers/genesis-github.ts";
-import { bindCeo, bindWorker, fixtureManifest, makeHarness, registerFixtureProject, type Harness } from "../helpers/harness.ts";
+import { approveReviewedCandidateForFinalization, bindCeo, bindWorker, driveToReviewedCandidate, fixtureManifest, makeHarness, registerFixtureProject, type Harness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 afterEach(() => vi.restoreAllMocks());
 
 /**
- * #1240 (ACP part) — a Repo Factory project's approved work exists on GitHub as linked issues and a
- * milestone, read back from the exact repository, before any of it is admitted to execution.
+ * #1240 (ACP part) — a Repo Factory project's approved work units, as its PLAN declares them, are linked
+ * on GitHub (adopted existing issues, or new ones), read back from the exact repository, before any of
+ * their tasks is admitted to execution or the run is confirmed.
  *
- * The live counterexample (project myeotnyeon): the repository held only the genesis issue #2
- * "Implement the owner's product intent" in the genesis milestone "First product increment", and the
- * approved execution scope added afterwards as STANDARD_WORK runs with task graphs never reached
- * GitHub, yet its tasks were staffed and executed.
+ * The live counterexample (project myeotnyeon): approved STANDARD_WORK runs executed with no link to
+ * GitHub, while the repository holds the genesis catch-all #2 and the issues #3–#10 across milestones
+ * 1 "First product increment", 2 "채널 성장: 구독자 1,000명" and 3 "채널 성장: 구독자 5,000명".
  *
  * Over the real control plane (database, task graph, CTO MCP tools) and the production GitHub write
  * port composed exactly as the daemon composes it (`createBootstrapGitHubWritePort`, its write guard
@@ -164,10 +163,33 @@ const genesisRepository = (): IssuesGitHub => {
   return github;
 };
 
-const TASKS = [
-  { key: "feed", title: "Render the verdict feed", category: "implementation" as const, spec: { goal: "The home screen lists verdicts", acceptance: ["the feed renders ten verdicts"] } },
-  { key: "detail", title: "Show one verdict's detail", category: "implementation" as const, spec: {} },
-  { key: "docs", title: "Document the feed", category: "docs" as const, dependsOn: [] as string[], spec: {} },
+/**
+ * myeotnyeon's repository as it stands: the genesis PR #1, the genesis catch-all #2, and the issues
+ * #3–#10 across its three milestones (product implementation, and two channel-growth goals).
+ */
+const myeotnyeon = (): IssuesGitHub => {
+  const github = new IssuesGitHub();
+  const product = github.addMilestone("First product increment", "The first product increment\n<!-- acp-genesis:m1 -->");
+  const growth1k = github.addMilestone("채널 성장: 구독자 1,000명", "");
+  const growth5k = github.addMilestone("채널 성장: 구독자 5,000명", "");
+  github.addIssue("Bootstrap genesis", "repo-factory:genesis", null, true);
+  github.addIssue("Implement the owner's product intent", "Build what the owner asked for\n<!-- acp-genesis:i1 -->", product);
+  github.addIssue("Render the verdict feed", "The home screen lists verdicts", product); // #3
+  github.addIssue("Verdict detail page", "One verdict, in full", product); // #4
+  github.addIssue("Daily verdict short", "One short a day", growth1k); // #5
+  github.addIssue("Thumbnail A/B", "Two thumbnails per short", growth1k); // #6
+  github.addIssue("Upload schedule", "19:00 every day", growth1k); // #7
+  github.addIssue("Community posts", "Weekly community post", growth5k); // #8
+  github.addIssue("Shorts analytics", "Read retention", null); // #9, in no milestone
+  github.addIssue("Collaboration outreach", "Reach two channels", growth5k); // #10
+  return github;
+};
+
+/** The live runs' shape: tasks in the graph with no declared unit, as the runs before #1240 left them. */
+const LEGACY = [
+  { key: "impl", title: "Implement the verdict feed", category: "implementation" as const, spec: {} },
+  { key: "review", title: "Review the verdict feed", category: "review" as const, spec: {} },
+  { key: "short", title: "Make the daily short", category: "implementation" as const, spec: {} },
 ];
 
 interface Governed {
@@ -181,64 +203,56 @@ interface Governed {
 }
 
 /**
- * A Repo Factory project, as activation leaves one: registered, with its resident provisioning row
- * naming the repository and the node id the genesis receipted; then a dispatched STANDARD_WORK run
- * whose PLAN's tasks are in the graph.
+ * The project's Repo Factory provisioning row, as activation leaves it, naming the repository and its
+ * node id. Activation's row belongs to the bootstrap run; a run of the project stands in for it here.
  */
-const governedRun = async (
-  options: { github?: IssuesGitHub; tasks?: typeof TASKS; provisioned?: boolean } = {},
-): Promise<Governed> => {
-  const github = options.github ?? genesisRepository();
-  const h = makeHarness({
-    repoFactory: { workRoot: tempDir("rf-work-"), githubPort: createBootstrapGitHubWritePort(github, async () => ({ exitCode: 0, stdout: "", stderr: "" })) },
-  });
+const provisionRow = (h: Harness, projectId: string): void => {
+  const contract = { goal: "bootstrap", why: "genesis", scope: [], nonGoals: [], acceptance: [], priority: "NORMAL" as const, humanGate: [], references: [] };
+  const holder = h.cp.runs.create({ projectId, kind: RunKind.STANDARD_WORK, executionMode: ExecutionMode.SIMPLE, contract, repositories: [] });
+  if (!holder.allowed) throw new Error(holder.message);
+  const holderRunId = holder.value.runId;
+  h.cp.db.run(
+    `INSERT INTO resident_project_provisioning(run_id,project_id,binding_json,allocation_json,confirmation_json,steps_json,status,updated_at)
+     VALUES (?,?,'{}',?,'{}','{}','COMPLETE',?)`,
+    [holderRunId, projectId, JSON.stringify({ projectId, repositoryIdentity: IDENTITY, repositoryNodeId: NODE }), h.clock.nowIso()],
+  );
+};
+
+const harnessFor = (github: IssuesGitHub): Harness =>
+  makeHarness({ repoFactory: { workRoot: tempDir("rf-work-"), githubPort: createBootstrapGitHubWritePort(github, async () => ({ exitCode: 0, stdout: "", stderr: "" })) } });
+
+/**
+ * A Repo Factory project, as activation leaves one, and a dispatched STANDARD_WORK run of it whose
+ * `legacy` tasks are in the graph with no declared unit (the provisioning row is recorded after
+ * dispatch: the resident CTO already holds the project).
+ */
+const governedRun = async (options: { github?: IssuesGitHub; legacy?: typeof LEGACY; provisioned?: boolean } = {}): Promise<Governed> => {
+  const github = options.github ?? myeotnyeon();
+  const h = harnessFor(github);
   const project = await registerFixtureProject(h, "myeotnyeon", {}, { identity: IDENTITY });
   bindCeo(h);
-  const contract = {
-    goal: "Ship the verdict feed",
-    why: "the owner's next product goal",
-    scope: ["src/app.js"],
-    nonGoals: [],
-    acceptance: ["the feed is live"],
-    priority: "NORMAL" as const,
-    humanGate: [],
-    references: [],
-  };
-  const created = h.cp.runs.create({
-    projectId: project.projectId,
-    kind: RunKind.STANDARD_WORK,
-    executionMode: ExecutionMode.SIMPLE,
-    contract,
-    repositories: [{ repositoryId: project.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
-  });
+  const contract = { goal: "Ship the verdict feed", why: "the owner's next product goal", scope: ["src/app.js"], nonGoals: [], acceptance: ["the feed is live"], priority: "NORMAL" as const, humanGate: [], references: [] };
+  const created = h.cp.runs.create({ projectId: project.projectId, kind: RunKind.STANDARD_WORK, executionMode: ExecutionMode.SIMPLE, contract, repositories: [{ repositoryId: project.repositoryId, repositoryRole: "primary", baseBranch: "dev" }] });
   if (!created.allowed) throw new Error(created.message);
   const runId = created.value.runId;
   const dispatched = await h.cp.runs.dispatch(runId);
   if (!dispatched.allowed) throw new Error(`${dispatched.reasonCode}: ${dispatched.message}`);
-  if (options.provisioned !== false) {
-    // Recorded after dispatch: the resident CTO already holds the project, as it does once activated.
-    // The provisioning row references a run; activation's is the bootstrap run, any run row holds it here.
-    const holder = h.cp.runs.create({ projectId: project.projectId, kind: RunKind.STANDARD_WORK, executionMode: ExecutionMode.SIMPLE, contract, repositories: [] });
-    if (!holder.allowed) throw new Error(holder.message);
-    h.cp.db.run(
-      `INSERT INTO resident_project_provisioning(run_id,project_id,binding_json,allocation_json,confirmation_json,steps_json,status,updated_at)
-       VALUES (?,?,'{}',?,'{}','{}','COMPLETE',?)`,
-      [holder.value.runId, project.projectId, JSON.stringify({ projectId: project.projectId, repositoryIdentity: IDENTITY, repositoryNodeId: NODE }), h.clock.nowIso()],
-    );
-  }
-  const submitted = h.cp.tasks.submit(runId, options.tasks ?? TASKS);
+  if (options.provisioned !== false) provisionRow(h, project.projectId);
+  const legacy = options.legacy ?? LEGACY;
+  const submitted = legacy.length === 0 ? { allowed: true as const, value: [] } : h.cp.tasks.submit(runId, legacy);
   if (!submitted.allowed) throw new Error(submitted.message);
   const run = h.cp.runs.require(runId);
   return {
-    h,
-    github,
-    runId,
-    projectId: project.projectId,
+    h, github, runId, projectId: project.projectId,
     taskIds: submitted.value.map((task) => task.taskId),
     owner: { sessionId: run.ownerSessionId!, incarnation: h.cp.sessions.get(run.ownerSessionId!)!.incarnation },
     generation: run.ownerBindingGeneration!,
   };
 };
+
+/** The run owner's plan_submit over the CTO MCP tools, declaring `workUnits` (and tasks, when given). */
+const planSubmit = (g: Governed, workUnits: unknown, tasks?: unknown[]) =>
+  callCtoTool(g.h, g.owner, "plan_submit", { idempotencyKey: `plan-${Math.random()}`, runId: g.runId, plan: { summary: "work units", workUnits }, ...(tasks === undefined ? {} : { tasks }) });
 
 /** The CTO's task_worker_provision, as the run's owner calls it over the CTO MCP tools. */
 const provision = (g: Governed, taskId: string) =>
@@ -250,229 +264,257 @@ const workerOf = (g: Governed, taskId: string): string =>
 
 /** The synchronous execution receipt every execution start ends in. */
 const startExecution = (g: Governed, taskId: string) =>
-  g.h.cp.tasks.startExecution({
-    runId: g.runId,
-    taskId,
-    ownerBindingGeneration: g.generation,
-    workerSessionId: workerOf(g, taskId),
-    provider: "scripted",
-    model: "scripted-worker",
-  });
+  g.h.cp.tasks.startExecution({ runId: g.runId, taskId, ownerBindingGeneration: g.generation, workerSessionId: workerOf(g, taskId), provider: "scripted", model: "scripted-worker" });
 
 /** The admission-bearing worker start task_worker_run and a started receipt go through. */
 const startWorkerExecution = (g: Governed, taskId: string) => {
   vi.spyOn(g.h.cp.tasks, "admitWorkerFanout").mockResolvedValue(allow(ReasonCode.OK, undefined) as never);
-  return g.h.cp.tasks.startWorkerExecution({
-    runId: g.runId,
-    taskId,
-    ownerBindingGeneration: g.generation,
-    workerSessionId: workerOf(g, taskId),
-    provider: "scripted",
-    model: "scripted-worker",
-  });
+  return g.h.cp.tasks.startWorkerExecution({ runId: g.runId, taskId, ownerBindingGeneration: g.generation, workerSessionId: workerOf(g, taskId), provider: "scripted", model: "scripted-worker" });
 };
 
-/** A work-unit marker line naming the task, as Repo Factory's genesis issues carry one. */
-const marker = (taskId: string, k = 1, n = 1) => `Work unit ${k} of ${n}: ${taskId}`;
-const issueOf = (github: IssuesGitHub, taskId: string) => github.issues.filter((i) => workUnitMarkers(i.body).markers.some((m) => m.key === taskId));
-const refusal = (answer: Record<string, unknown>) => ({
-  ok: answer["ok"],
-  reasonCode: answer["reasonCode"],
-  untracked: ((answer["evidence"] as { untracked?: Array<{ taskId: string }> } | undefined)?.untracked ?? []).map((u) => u.taskId).sort(),
-});
+const tracking = (answer: Record<string, unknown>) => (answer["evidence"] as { githubTracking?: Record<string, unknown> } | undefined)?.githubTracking;
+const unmetOf = (evidence: unknown) => ((evidence as { unmet?: Array<{ unit: string; unmet: string; issues?: number[]; correction: string }> } | undefined)?.unmet ?? []);
+const trackedRecords = (g: Governed) => g.h.cp.audit.byKind("WORK_SCOPE_GITHUB_TRACKED").filter((row) => row.runId === g.runId).map((row) => row.evidence as { units: Array<{ unit: string; issueNumber: number; milestoneNumber: number; adopted: boolean }> });
+const INTERNAL_ID = /\b(?:prj|repo|ses|run|task|art|clm|msg|asg)_[0-9a-f]{24}\b/;
 
-describe("#1240 — a Repo Factory project's approved work is tracked on GitHub before execution", () => {
-  it("the myeotnyeon counterexample: a catch-all genesis issue does not let three untracked tasks reach execution", async () => {
+describe("#1240 — a Repo Factory project's approved work units are linked on GitHub before execution", () => {
+  it("the myeotnyeon counterexample: tasks with no declared unit are refused; a PLAN adopting the existing issues admits them with no POST", async () => {
     const g = await governedRun();
-    g.github.fault = { suffix: "/milestones", when: "before" };
-    // Nothing tracks the approved units on GitHub: an execution receipt is not admitted.
-    const receipt = startExecution(g, g.taskIds[2]!);
-    expect(receipt.allowed).toBe(false);
+    const [impl, review, short] = g.taskIds as [string, string, string];
+    const receipt = startExecution(g, impl);
     expect(receipt.reasonCode).toBe(REFUSED);
-    // GitHub is down for the milestone write: nothing can be tracked, and staffing is not admitted either.
-    const refused = await provision(g, g.taskIds[0]!);
-    expect(refusal(refused)).toEqual({ ok: false, reasonCode: REFUSED, untracked: [...g.taskIds].sort() });
-    expect(g.github.issues.map((i) => i.number)).toEqual([1, 2]);
-    expect(g.h.cp.tasks.executions(g.runId)).toEqual([]);
+    expect((receipt.evidence as { unmapped: Array<{ taskId: string }> }).unmapped.map((t) => t.taskId).sort()).toEqual([...g.taskIds].sort());
+    expect((await provision(g, short))["reasonCode"]).toBe(REFUSED);
 
-    // GitHub answers again: the same admission synchronizes the approved scope, reads it back, and proceeds.
-    const tracked = await provision(g, g.taskIds[0]!);
-    expect(tracked["reasonCode"]).not.toBe(REFUSED);
-    const goal = g.github.milestones.find((m) => m.description.includes(`<!-- acp-work:goal:${g.runId} -->`))!;
-    expect(goal.title).toBe("Ship the verdict feed");
-    for (const [index, taskId] of g.taskIds.entries()) {
-      const issues = issueOf(g.github, taskId);
-      expect(issues).toHaveLength(1);
-      expect(issues[0]!.title).toBe(TASKS[index]!.title);
-      expect(issues[0]!.milestone?.node_id).toBe(goal.node_id);
-    }
-    // The catch-all genesis issue is neither reused nor touched.
-    expect(workUnitMarkers(g.github.issues.find((i) => i.number === 2)!.body).markers).toEqual([]);
-    // Each issue ends, after a blank line, with its unit's marker: the task, its place among the run's units.
-    expect(g.taskIds.map((taskId) => issueOf(g.github, taskId)[0]!.body.split("\n").slice(-2))).toEqual(
-      g.taskIds.map((taskId, index) => ["", marker(taskId, index + 1, 3)]),
-    );
-    expect(startExecution(g, g.taskIds[1]!).allowed).toBe(true);
-  });
-
-  it("plan acceptance synchronizes the approved scope; an addition is not admitted until it is synchronized too", async () => {
-    const g = await governedRun({ tasks: [TASKS[0]!] });
-    const plan = await callCtoTool(g.h, g.owner, "plan_submit", {
-      idempotencyKey: "plan-2",
-      runId: g.runId,
-      plan: { summary: "add the detail view" },
-      tasks: [{ key: "detail", title: "Show one verdict's detail", category: "implementation" }],
-    });
-    expect(plan["ok"]).toBe(true);
-    const all = g.h.cp.tasks.list(g.runId).map((task) => task.taskId);
-    expect(all).toHaveLength(2);
-    for (const taskId of all) expect(issueOf(g.github, taskId)).toHaveLength(1);
-    expect(startExecution(g, all[1]!).allowed).toBe(true);
-
-    // An addition that bypassed plan acceptance is refused by name; the linked units are not held back.
-    const added = g.h.cp.tasks.submit(g.runId, [TASKS[2]!]);
-    if (!added.allowed) throw new Error(added.message);
-    const addedId = added.value[0]!.taskId;
-    const blocked = startExecution(g, addedId);
-    expect(blocked.reasonCode).toBe(REFUSED);
-    expect((blocked.evidence as { untracked: Array<{ taskId: string }> }).untracked.map((u) => u.taskId)).toEqual([addedId]);
-    expect(startExecution(g, all[0]!).allowed).toBe(true);
-    // Its first admission synchronizes only it: one new issue, the goal milestone reused.
-    const before = g.github.posts("/issues").length;
-    expect((await startWorkerExecution(g, addedId)).allowed).toBe(true);
-    expect(g.github.posts("/issues").length - before).toBe(1);
-    expect(g.github.posts("/milestones")).toHaveLength(1);
-  });
-
-  it("a GitHub outage holds back only the unit not yet linked; a linked unit's admission asks GitHub nothing", async () => {
-    const g = await governedRun({ tasks: [TASKS[0]!] });
-    expect((await startWorkerExecution(g, g.taskIds[0]!)).allowed).toBe(true);
-    const added = g.h.cp.tasks.submit(g.runId, [TASKS[1]!]);
-    if (!added.allowed) throw new Error(added.message);
-    const addedId = added.value[0]!.taskId;
-    g.github.fault = { suffix: "/issues", when: "before" };
-    const refused = await provision(g, addedId);
-    expect(refusal(refused)).toEqual({ ok: false, reasonCode: REFUSED, untracked: [addedId] });
-    expect((refused["evidence"] as { correction: string }).correction).toMatch(/reuses the milestone and issues already created/);
-    // The linked unit is admitted on its record, with no GitHub request.
-    const seen = g.github.calls.length;
-    expect((await provision(g, g.taskIds[0]!))["reasonCode"]).not.toBe(REFUSED);
-    expect(g.github.calls.length).toBe(seen);
-    // GitHub answers again: the added unit is linked with one issue, and nothing is duplicated.
-    expect((await provision(g, addedId))["reasonCode"]).not.toBe(REFUSED);
-    expect(issueOf(g.github, addedId)).toHaveLength(1);
-    expect(issueOf(g.github, g.taskIds[0]!)).toHaveLength(1);
-    expect(g.github.posts("/milestones")).toHaveLength(1);
-  });
-
-  it("an issue already linked for one unit, reused for a new one, is a catch-all, refused", async () => {
-    const g = await governedRun({ tasks: [TASKS[0]!] });
-    expect((await startWorkerExecution(g, g.taskIds[0]!)).allowed).toBe(true);
-    const first = issueOf(g.github, g.taskIds[0]!)[0]!;
-    const added = g.h.cp.tasks.submit(g.runId, [TASKS[1]!]);
-    if (!added.allowed) throw new Error(added.message);
-    const addedId = added.value[0]!.taskId;
-    first.body = `${first.body}\n\n${marker(addedId, 2, 2)}`;
-    const refused = await provision(g, addedId);
-    expect(refused["reasonCode"]).toBe(REFUSED);
-    const unmet = (refused["evidence"] as { unmet: Array<{ unmet: string; covers: string[]; correction: string }> }).unmet;
-    expect(unmet.map((u) => u.unmet)).toEqual(["CATCH_ALL_ISSUE"]);
-    expect(unmet[0]!.covers.sort()).toEqual([addedId, g.taskIds[0]!].sort());
-    expect(unmet[0]!.correction).toMatch(new RegExp(`issue #${first.number}`));
-    expect(g.github.posts("/issues")).toHaveLength(1);
-  });
-
-  it("a retry after GitHub accepted an issue and its answer was lost resumes with no duplicate", async () => {
-    const g = await governedRun();
-    g.github.fault = { suffix: "/issues", when: "after", skip: 1 };
-    const first = await provision(g, g.taskIds[0]!);
-    expect(first["reasonCode"]).toBe(REFUSED);
-    expect(g.github.posts("/issues")).toHaveLength(2);
-    const second = await provision(g, g.taskIds[0]!);
-    expect(second["reasonCode"]).not.toBe(REFUSED);
-    for (const taskId of g.taskIds) expect(issueOf(g.github, taskId)).toHaveLength(1);
-    expect(g.github.posts("/milestones")).toHaveLength(1);
-    expect(g.github.posts("/issues")).toHaveLength(3);
-  });
-
-  it("a unit's issue found on a later page is not created again", async () => {
-    const github = genesisRepository();
-    // The repository's history is longer than one page, so the unit's issue lands on page two.
-    for (let n = 0; n < 120; n += 1) github.addIssue(`old ${n}`, "unrelated", null);
-    const g = await governedRun({ github, tasks: [TASKS[0]!] });
-    github.fault = { suffix: "/issues", when: "after" };
-    expect((await startWorkerExecution(g, g.taskIds[0]!)).reasonCode).toBe(REFUSED);
-    expect((await startWorkerExecution(g, g.taskIds[0]!)).allowed).toBe(true);
-    expect(github.posts("/issues")).toHaveLength(1);
-    expect(issueOf(github, g.taskIds[0]!)).toHaveLength(1);
-  });
-
-  it("a repository at the name with another node id is refused before anything is written", async () => {
-    const g = await governedRun();
-    g.github.nodeId = "R_kgDOsomeoneelse";
-    const refused = await provision(g, g.taskIds[0]!);
-    expect(refusal(refused).reasonCode).toBe(REFUSED);
-    expect(JSON.stringify(refused["evidence"])).toContain("R_kgDOsomeoneelse");
+    // The owner's PLAN re-links the run's existing tasks, adopting #3 (product) and #5 (growth), adding none.
+    const answer = await planSubmit(g, [
+      { key: "feed", tasks: [impl, review], issue: { number: 3 }, milestone: { number: 1 } },
+      { key: "short", tasks: [short], issue: { number: 5 }, milestone: { number: 2 } },
+    ]);
+    expect(answer["ok"]).toBe(true);
+    expect(tracking(answer)).toMatchObject({ tracked: true });
     expect(g.github.calls.filter((c) => c.method !== "GET")).toEqual([]);
-    expect(startExecution(g, g.taskIds[0]!).reasonCode).toBe(REFUSED);
-    // task_worker_run is refused before the turn records a write target or makes a branch.
-    const turn = await callCtoTool(g.h, g.owner, "task_worker_run", { idempotencyKey: "turn-1", runId: g.runId, taskId: g.taskIds[0]!, claimId: "claim-none" });
+    expect(g.h.cp.tasks.list(g.runId)).toHaveLength(3);
+    expect(trackedRecords(g).flatMap((r) => r.units).map((u) => [u.unit, u.issueNumber, u.milestoneNumber, u.adopted])).toEqual([["feed", 3, 1, true], ["short", 5, 2, true]]);
+    // Implementation and review share #3; the short is #5; the catch-all #2 stands for nothing.
+    for (const taskId of [impl, review, short]) expect(startExecution(g, taskId).allowed).toBe(true);
+  });
+
+  it("two tasks of one unit share its one new issue: nothing is created per task", async () => {
+    const g = await governedRun({ legacy: [] });
+    const answer = await planSubmit(g, [{ key: "roundup", tasks: ["impl", "review"], issue: { new: { title: "Weekly verdict roundup", body: "Collect the week's verdicts" } }, milestone: { number: 1 } }], [
+      { key: "impl", title: "Build the weekly roundup", category: "implementation" },
+      { key: "review", title: "Review the weekly roundup", category: "review" },
+    ]);
+    expect(tracking(answer)).toMatchObject({ tracked: true });
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(g.github.posts("/milestones")).toHaveLength(0);
+    expect(g.github.issues.at(-1)!.milestone?.number).toBe(1);
+    for (const task of g.h.cp.tasks.list(g.runId)) expect(startExecution(g, task.taskId).allowed).toBe(true);
+  });
+
+  it("a PLAN change re-verifies only the units whose link changed; an unchanged PLAN asks GitHub nothing", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 2) });
+    const [impl, review] = g.taskIds as [string, string];
+    const feed = { key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } };
+    expect(tracking(await planSubmit(g, [feed, { key: "detail", tasks: [review], issue: { number: 4 }, milestone: { number: 1 } }]))).toMatchObject({ tracked: true });
+    expect(trackedRecords(g)).toHaveLength(1);
+    // Relinked: detail now adopts #6 in the growth milestone; feed is unchanged and is not verified again.
+    expect(tracking(await planSubmit(g, [feed, { key: "detail", tasks: [review], issue: { number: 6 }, milestone: { number: 2 } }]))).toMatchObject({ tracked: true });
+    expect(trackedRecords(g)).toHaveLength(2);
+    expect(trackedRecords(g)[1]!.units.map((u) => [u.unit, u.issueNumber])).toEqual([["detail", 6]]);
+    // The same PLAN again: nothing changed, so GitHub is not asked.
+    const seen = g.github.calls.length;
+    expect(tracking(await planSubmit(g, [feed, { key: "detail", tasks: [review], issue: { number: 6 }, milestone: { number: 2 } }]))).toMatchObject({ tracked: true });
+    expect(g.github.calls.length).toBe(seen);
+    // A relink to a wrong milestone holds back that unit only.
+    const wrong = await planSubmit(g, [feed, { key: "detail", tasks: [review], issue: { number: 8 }, milestone: { number: 2 } }]);
+    expect(unmetOf(tracking(wrong)).map((u) => [u.unit, u.unmet])).toEqual([["detail", "MILESTONE_LINK_WRONG"]]);
+    expect(startExecution(g, impl).allowed).toBe(true);
+    const held = startExecution(g, review);
+    expect(held.reasonCode).toBe(REFUSED);
+    expect((held.evidence as { untracked: Array<{ unit: string }> }).untracked.map((u) => u.unit)).toEqual(["detail"]);
+  });
+
+  it("a sealed run whose approved units are not tracked is refused at CONFIRM, the units named", async () => {
+    const github = myeotnyeon();
+    const h = harnessFor(github);
+    const driven = await driveToReviewedCandidate(h, { projectId: "myeotnyeon", repositoryIdentity: IDENTITY });
+    // The run was executed before #1240 and is now sealed; the project is a Repo Factory one.
+    provisionRow(h, driven.projectId);
+    await expect(approveReviewedCandidateForFinalization(h, driven)).rejects.toThrow(REFUSED);
+    expect(h.cp.runs.require(driven.runId).state).toBe("READY_FOR_CEO_REVIEW");
+    const ceo = h.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    const admitted = h.cp.ceo.assertCeoDecisionAdmissible({ runId: driven.runId, decision: "CONFIRM", candidateSnapshotDigest: driven.candidateSnapshotDigest, ceoSessionId: ceo.sessionId, rationale: "confirm" });
+    expect(admitted.reasonCode).toBe(REFUSED);
+    expect((admitted.evidence as { unmapped: Array<{ title: string }> }).unmapped.map((t) => t.title)).toEqual(["change app()"]);
+    expect((admitted.evidence as { correction: string }).correction).toMatch(/FINAL_REVISE/);
+    expect(github.calls).toEqual([]);
+  });
+
+  it("no internal id is published: a created issue and milestone carry the PLAN's text and one digest marker", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    const leaked = await planSubmit(g, [{ key: "roundup", tasks: [impl], issue: { new: { title: "Weekly verdict roundup", body: `Implements ${impl}` } }, milestone: { number: 1 } }]);
+    expect(leaked).toMatchObject({ ok: false, evidence: { refusal: "WORK_UNITS_TEXT_NOT_PUBLIC" } });
+    const answer = await planSubmit(g, [{ key: "roundup", tasks: [impl], issue: { new: { title: "Weekly verdict roundup", body: "Collect the week's verdicts" } }, milestone: { new: { title: "Product: weekly roundup", description: "The weekly product increment" } } }]);
+    expect(tracking(answer)).toMatchObject({ tracked: true });
+    const bodies = g.github.calls.filter((c) => c.method === "POST").map((c) => c.body as Record<string, unknown>);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).toEqual({ title: "Product: weekly roundup", description: expect.stringMatching(/^The weekly product increment\n\n<!-- acp:[0-9a-f]{16} -->$/) });
+    expect(bodies[1]).toEqual({ title: "Weekly verdict roundup", body: expect.stringMatching(/^Collect the week's verdicts\n\n<!-- acp:[0-9a-f]{16} -->$/), milestone: 4 });
+    const published = JSON.stringify(bodies);
+    expect(published).not.toMatch(INTERNAL_ID);
+    for (const id of [g.runId, impl, g.owner.sessionId, g.projectId]) expect(published).not.toContain(id);
+    expect(published).not.toContain("Work unit");
+  });
+
+  it("a new milestone needs only its title, as the PLAN guide states", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    const answer = await planSubmit(g, [{ key: "roundup", tasks: [impl], issue: { new: { title: "Weekly verdict roundup", body: "Collect" } }, milestone: { new: { title: "채널 성장: 구독자 10,000명" } } }]);
+    expect(tracking(answer)).toMatchObject({ tracked: true });
+    expect(g.github.posts("/milestones").map((c) => c.body)).toEqual([{ title: "채널 성장: 구독자 10,000명", description: expect.stringMatching(/^<!-- acp:[0-9a-f]{16} -->$/) }]);
+  });
+
+  it("a duplicate-creation attempt for work that already has an issue is refused", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(2) });
+    const [short] = g.taskIds as [string];
+    // A new unit titled as #5 is the work #5 already tracks.
+    const same = await planSubmit(g, [{ key: "short", tasks: [short], issue: { new: { title: "Daily verdict short", body: "One short a day" } }, milestone: { number: 2 } }]);
+    expect(tracking(same)).toMatchObject({ tracked: false });
+    expect(unmetOf(tracking(same))).toMatchObject([{ unit: "short", unmet: "ISSUE_EXISTS", issues: [5] }]);
+    // Adopted, then declared new: a second issue for adopted work.
+    expect(tracking(await planSubmit(g, [{ key: "short", tasks: [short], issue: { number: 5 }, milestone: { number: 2 } }]))).toMatchObject({ tracked: true });
+    const relinked = await planSubmit(g, [{ key: "short", tasks: [short], issue: { new: { title: "Daily short, second take", body: "One short a day" } }, milestone: { number: 2 } }]);
+    expect(unmetOf(tracking(relinked))).toMatchObject([{ unit: "short", unmet: "DUPLICATE_OF_ADOPTED", issues: [5] }]);
+    expect(g.github.calls.filter((c) => c.method !== "GET")).toEqual([]);
+    expect(startExecution(g, short).reasonCode).toBe(REFUSED);
+  });
+
+  it("a retry after GitHub accepted an issue and lost its answer finds it by its marker on a later page: no duplicate", async () => {
+    const github = myeotnyeon();
+    for (let n = 0; n < 120; n += 1) github.addIssue(`old ${n}`, "unrelated", null);
+    const g = await governedRun({ github, legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    github.fault = { suffix: "/issues", when: "after" };
+    const first = await planSubmit(g, [{ key: "roundup", tasks: [impl], issue: { new: { title: "Weekly verdict roundup", body: "Collect the week's verdicts" } }, milestone: { number: 1 } }]);
+    expect(tracking(first)).toMatchObject({ tracked: false, correction: expect.stringMatching(/never duplicated/) });
+    expect((await startWorkerExecution(g, impl)).allowed).toBe(true);
+    expect(github.posts("/issues")).toHaveLength(1);
+    expect(github.issues.filter((i) => i.title === "Weekly verdict roundup")).toHaveLength(1);
+  });
+
+  it("a repository at the name with another node id, or an answer from another repository, is refused with nothing written", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.nodeId = "R_kgDOsomeoneelse";
+    const wrong = await planSubmit(g, [{ key: "roundup", tasks: [impl], issue: { new: { title: "Weekly verdict roundup", body: "x" } }, milestone: { number: 1 } }]);
+    expect(tracking(wrong)).toMatchObject({ tracked: false, causeRefusal: "WRONG_REPOSITORY" });
+    expect(JSON.stringify(tracking(wrong))).toContain("R_kgDOsomeoneelse");
+    const turn = await callCtoTool(g.h, g.owner, "task_worker_run", { idempotencyKey: "turn-1", runId: g.runId, taskId: impl, claimId: "claim-none" });
     expect(turn["reasonCode"]).toBe(REFUSED);
+    g.github.nodeId = NODE;
+    g.github.foreign = true;
+    const foreign = await provision(g, impl);
+    expect(foreign["reasonCode"]).toBe(REFUSED);
+    expect(JSON.stringify(foreign["evidence"])).toContain(`${OWNER}/other`);
+    expect(g.github.calls.filter((c) => c.method !== "GET")).toEqual([]);
     expect(g.h.cp.audit.byKind("TASK_WRITE_TARGET_RECORDED")).toEqual([]);
   });
 
-  it("a readback answered with another repository's issues is refused", async () => {
+  it("an adopted issue in no milestone, in another milestone, or that is not an issue, is refused by name", async () => {
     const g = await governedRun();
-    g.github.foreign = true;
-    const refused = await provision(g, g.taskIds[0]!);
-    expect(refusal(refused).reasonCode).toBe(REFUSED);
-    expect(JSON.stringify(refused["evidence"])).toContain(`${OWNER}/other`);
-    expect(startExecution(g, g.taskIds[0]!).reasonCode).toBe(REFUSED);
+    const [impl, review, short] = g.taskIds as [string, string, string];
+    const answer = await planSubmit(g, [
+      { key: "analytics", tasks: [impl], issue: { number: 9 }, milestone: { number: 3 } },
+      { key: "community", tasks: [review], issue: { number: 8 }, milestone: { number: 2 } },
+      { key: "genesis-pr", tasks: [short], issue: { number: 1 }, milestone: { number: 1 } },
+    ]);
+    expect(unmetOf(tracking(answer)).map((u) => [u.unit, u.unmet])).toEqual([["genesis-pr", "ISSUE_NOT_FOUND"], ["analytics", "MILESTONE_LINK_MISSING"], ["community", "MILESTONE_LINK_WRONG"]]);
+    expect(unmetOf(tracking(answer)).find((u) => u.unit === "community")!.correction).toMatch(/issue #8 is in milestone #3, not #2/);
+    expect(g.github.calls.filter((c) => c.method !== "GET")).toEqual([]);
   });
 
-  it("an issue GitHub holds with no milestone, or another milestone, is refused by name", async () => {
+  it("two units adopting one issue, or a task in no unit, is refused at plan acceptance with nothing stored", async () => {
     const g = await governedRun();
-    g.github.dropMilestone = true;
-    const refused = await provision(g, g.taskIds[0]!);
-    expect(refused["reasonCode"]).toBe(REFUSED);
-    const unmet = (refused["evidence"] as { unmet: Array<{ taskId?: string; unmet: string; correction: string }> }).unmet;
-    expect(unmet.map((u) => u.unmet)).toEqual(["MILESTONE_LINK_MISSING", "MILESTONE_LINK_MISSING", "MILESTONE_LINK_MISSING"]);
-    expect(unmet.map((u) => u.taskId).sort()).toEqual([...g.taskIds].sort());
-    expect(unmet.every((u) => /link issue #\d+ to the run's goal milestone #\d+/.test(u.correction))).toBe(true);
-
-    // Linked to the genesis milestone instead of the run's goal: the wrong milestone, refused.
-    const genesisStage = g.github.milestones[0]!;
-    for (const issue of g.github.issues.filter((i) => workUnitMarkers(i.body).markers.length > 0)) issue.milestone = g.github.milestoneRef(genesisStage);
-    const wrong = await provision(g, g.taskIds[0]!);
-    expect((wrong["evidence"] as { unmet: Array<{ unmet: string }> }).unmet.map((u) => u.unmet)).toEqual(["MILESTONE_LINK_WRONG", "MILESTONE_LINK_WRONG", "MILESTONE_LINK_WRONG"]);
-    expect(startExecution(g, g.taskIds[0]!).reasonCode).toBe(REFUSED);
+    const [impl, review, short] = g.taskIds as [string, string, string];
+    const plans = g.h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN'`, [g.runId])!.n;
+    const shared = await planSubmit(g, [
+      { key: "feed", tasks: [impl, review], issue: { number: 2 }, milestone: { number: 1 } },
+      { key: "short", tasks: [short], issue: { number: 2 }, milestone: { number: 1 } },
+    ]);
+    expect(shared).toMatchObject({ ok: false, evidence: { refusal: "WORK_UNITS_SHARE_AN_ISSUE", issues: [2] } });
+    const unmapped = await planSubmit(g, [{ key: "feed", tasks: [impl, review], issue: { number: 3 }, milestone: { number: 1 } }]);
+    expect(unmapped).toMatchObject({ ok: false, evidence: { refusal: "WORK_UNITS_TASKS_UNMAPPED", unmapped: [short] } });
+    expect(g.h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN'`, [g.runId])!.n).toBe(plans);
+    expect(g.github.calls).toEqual([]);
   });
 
-  it("one issue standing for two approved units is a catch-all, refused", async () => {
-    const g = await governedRun({ tasks: [TASKS[0]!, TASKS[1]!] });
-    const goal = g.github.addMilestone("Ship the verdict feed", `goal\n<!-- acp-work:goal:${g.runId} -->`);
-    g.github.addIssue("Everything", `all of it\n\n${marker(g.taskIds[0]!, 1, 2)}\n${marker(g.taskIds[1]!, 2, 2)}`, goal);
-    const refused = await provision(g, g.taskIds[0]!);
-    expect(refused["reasonCode"]).toBe(REFUSED);
-    expect((refused["evidence"] as { unmet: Array<{ unmet: string }> }).unmet.map((u) => u.unmet)).toEqual(["CATCH_ALL_ISSUE", "CATCH_ALL_ISSUE"]);
-    expect(g.github.posts("/issues")).toHaveLength(0);
-  });
-
-  it("a single-unit run gets exactly one issue and its goal's milestone, nothing more", async () => {
-    const g = await governedRun({ tasks: [TASKS[1]!] });
-    expect((await startWorkerExecution(g, g.taskIds[0]!)).allowed).toBe(true);
-    expect(g.github.posts("/issues")).toHaveLength(1);
-    expect(g.github.posts("/milestones")).toHaveLength(1);
-    expect(g.github.calls.filter((c) => c.method !== "GET" && c.method !== "POST")).toEqual([]);
-    // Read back once: a later admission of the same scope asks GitHub nothing.
+  it("a GitHub outage holds back only the unit not yet linked; a linked unit's admission asks GitHub nothing", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    const feed = { key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } };
+    expect(tracking(await planSubmit(g, [feed]))).toMatchObject({ tracked: true });
+    g.github.fault = { suffix: "/issues", when: "before" };
+    const added = await planSubmit(g, [feed, { key: "roundup", tasks: ["roundup"], issue: { new: { title: "Weekly verdict roundup", body: "Collect" } }, milestone: { number: 1 } }], [{ key: "roundup", title: "Build the weekly roundup", category: "implementation" }]);
+    expect(tracking(added)).toMatchObject({ tracked: false });
+    const roundup = g.h.cp.tasks.list(g.runId).find((t) => t.title === "Build the weekly roundup")!.taskId;
     const seen = g.github.calls.length;
-    expect((await provision(g, g.taskIds[0]!))["reasonCode"]).not.toBe(REFUSED);
+    expect(startExecution(g, impl).allowed).toBe(true);
+    expect((await provision(g, impl))["reasonCode"]).not.toBe(REFUSED);
     expect(g.github.calls.length).toBe(seen);
+    expect(startExecution(g, roundup).reasonCode).toBe(REFUSED);
+    expect((await startWorkerExecution(g, roundup)).allowed).toBe(true);
+    expect(g.github.posts("/issues")).toHaveLength(2);
+    expect(g.github.issues.filter((i) => i.title === "Weekly verdict roundup")).toHaveLength(1);
   });
 
-  it("a project that is not a Repo Factory project is admitted as before, with no GitHub request", async () => {
-    const g = await governedRun({ provisioned: false });
-    expect(startExecution(g, g.taskIds[0]!).allowed).toBe(true);
+  it("an approval that is not the run's current owner's creates nothing", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    const units = [{ key: "roundup", tasks: [impl], issue: { new: { title: "Weekly verdict roundup", body: "Collect" } }, milestone: { number: 1 } }];
+    g.github.fault = { suffix: "/issues", when: "before" };
+    expect(tracking(await planSubmit(g, units))).toMatchObject({ tracked: false });
+    // The same PLAN, as an earlier owner approved it: the run is held by another session now.
+    const scope = g.h.cp.tasks.workScope!;
+    const declared = scope.declare(g.runId, { workUnits: units }, []);
+    if (!declared.allowed || declared.value === null) throw new Error("declaration refused");
+    const plan = g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!;
+    expect(scope.approve(g.runId, plan.digest, declared.value, [], [], { sessionId: "ses_000000000000000000000000", bindingGeneration: g.generation }).allowed).toBe(true);
+    const refused = await g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl);
+    expect(refused.evidence).toMatchObject({ causeRefusal: "WORK_SCOPE_APPROVAL_NOT_CURRENT_OWNER" });
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(g.github.issues.filter((i) => i.title === "Weekly verdict roundup")).toEqual([]);
+  });
+
+  it("the write guard admits only the PLAN's exact text: an altered body never reaches GitHub", async () => {
+    const github = myeotnyeon();
+    const port = createBootstrapGitHubWritePort(github, async () => ({ exitCode: 0, stdout: "", stderr: "" }));
+    const createWorkIssue = port.createWorkIssue!.bind(port);
+    // A port path that edits what it was given: the guard, not the port, is what stops it.
+    port.createWorkIssue = (target, nodeId, issue) => createWorkIssue(target, nodeId, { ...issue, body: `${issue.body}\nsee /Users/someone/notes` });
+    const h = makeHarness({ repoFactory: { workRoot: tempDir("rf-work-"), githubPort: port } });
+    const project = await registerFixtureProject(h, "myeotnyeon", {}, { identity: IDENTITY });
+    bindCeo(h);
+    const contract = { goal: "Ship", why: "goal", scope: ["src/app.js"], nonGoals: [], acceptance: ["live"], priority: "NORMAL" as const, humanGate: [], references: [] };
+    const created = h.cp.runs.create({ projectId: project.projectId, kind: RunKind.STANDARD_WORK, executionMode: ExecutionMode.SIMPLE, contract, repositories: [{ repositoryId: project.repositoryId, repositoryRole: "primary", baseBranch: "dev" }] });
+    if (!created.allowed) throw new Error(created.message);
+    expect((await h.cp.runs.dispatch(created.value.runId)).allowed).toBe(true);
+    provisionRow(h, project.projectId);
+    const run = h.cp.runs.require(created.value.runId);
+    const g: Governed = { h, github, runId: run.runId, projectId: project.projectId, taskIds: [], owner: { sessionId: run.ownerSessionId!, incarnation: h.cp.sessions.get(run.ownerSessionId!)!.incarnation }, generation: run.ownerBindingGeneration! };
+    const answer = await planSubmit(g, [{ key: "roundup", tasks: ["impl"], issue: { new: { title: "Weekly verdict roundup", body: "Collect" } }, milestone: { number: 1 } }], [{ key: "impl", title: "Build", category: "implementation" }]);
+    expect(tracking(answer)).toMatchObject({ tracked: false, cause: expect.stringMatching(/writes only the PLAN's own new milestones and issues/) });
+    expect(github.calls.filter((c) => c.method !== "GET")).toEqual([]);
+  });
+
+  it("a project that is not a Repo Factory project plans and is admitted as before, with no GitHub request", async () => {
+    const g = await governedRun({ provisioned: false, legacy: [] });
+    const answer = await callCtoTool(g.h, g.owner, "plan_submit", { idempotencyKey: "plan-plain", runId: g.runId, plan: { summary: "plain" }, tasks: [{ key: "impl", title: "Implement", category: "implementation" }] });
+    expect(answer["ok"]).toBe(true);
+    expect(tracking(answer)).toBeUndefined();
+    expect(startExecution(g, g.h.cp.tasks.list(g.runId)[0]!.taskId).allowed).toBe(true);
     expect(g.github.calls).toEqual([]);
   });
 });

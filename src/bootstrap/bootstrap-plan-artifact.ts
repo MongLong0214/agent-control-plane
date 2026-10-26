@@ -435,8 +435,9 @@ export const resolveBootstrapPlanInput = (
     const parsed = bootstrapPlanInputSchema.parse(JSON.parse(read.value.planBody));
     return allow(ReasonCode.OK, { plan: parsed.plan, tasks: parsed.tasks, bootstrapPlanDigest: read.value.digest });
   }
-  if (!input.plan || !input.tasks) return deny(ReasonCode.INVALID_ARGUMENT, "plan_submit requires plan and tasks, or bootstrapPlanDigest");
-  return allow(ReasonCode.OK, { plan: input.plan, tasks: input.tasks });
+  // #1240 — a PLAN that declares work units may re-link the run's existing tasks without adding any.
+  if (!input.plan || (!input.tasks && input.plan["workUnits"] === undefined)) return deny(ReasonCode.INVALID_ARGUMENT, "plan_submit requires plan and tasks, or bootstrapPlanDigest");
+  return allow(ReasonCode.OK, { plan: input.plan, tasks: input.tasks ?? [] });
 };
 
 export interface BootstrapReviewResumeInput {
