@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
@@ -28,7 +28,9 @@ import { FakeWorkerAdapter, seedWorkerWorld, type FakeTurnScript, type WorkerWor
  *   git-dir comparison reads, before this change and after: the live main-checkout refusal is not this;
  * - (e) the repository's own configuration cannot make that read-only git write the git dir either: a
  *   caching textconv driver's notes, or the builtin fsmonitor daemon's cookies. A worker that asks for
- *   the cache itself is still refused.
+ *   the cache itself is still refused;
+ * - (f) nor can the provider user's global configuration: a worker's git reads no global or system
+ *   configuration (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`).
  */
 
 const adapters: FakeWorkerAdapter[] = [];
@@ -130,6 +132,8 @@ interface CodexReport {
   indexRewritten: boolean;
   /** `GIT_CONFIG_KEY_<n>` to `GIT_CONFIG_VALUE_<n>`, as the child's environment carries them. */
   gitConfig: Record<string, string>;
+  /** `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_NOSYSTEM`, as the child's environment carries them. */
+  configFiles: { global: string | null; nosystem: string | null };
 }
 
 /**
@@ -170,7 +174,8 @@ process.stdin.on("end", () => {
   const indexRewritten = statSync(index).mtimeMs !== before;
   const gitConfig = Object.fromEntries(Array.from({ length: Number(process.env.GIT_CONFIG_COUNT ?? 0) },
     (_, n) => [process.env["GIT_CONFIG_KEY_" + n], process.env["GIT_CONFIG_VALUE_" + n]]));
-  const report = { optionalLocks: process.env.GIT_OPTIONAL_LOCKS ?? null, racilyClean, status, indexRewritten, gitConfig };
+  const configFiles = { global: process.env.GIT_CONFIG_GLOBAL ?? null, nosystem: process.env.GIT_CONFIG_NOSYSTEM ?? null };
+  const report = { optionalLocks: process.env.GIT_OPTIONAL_LOCKS ?? null, racilyClean, status, indexRewritten, gitConfig, configFiles };
   writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify(report));
   process.exit(0);
 });
@@ -215,6 +220,7 @@ describe("#1246 (a) a gpt worker's git status on a freshly prepared, racily clea
       status: " M src/app.js\n",
       indexRewritten: false,
       gitConfig: { "core.fsmonitor": "false" },
+      configFiles: { global: "/dev/null", nosystem: "1" },
       outcome: { status: "SUCCEEDED", reason: null },
     });
     expect(world.audit.byKind("TASK_BRANCH_PREPARED").map((row) => row.evidence)).toEqual([
@@ -284,7 +290,7 @@ describe("#1246 (d) a main checkout, racily clean, where the worker runs a plain
   });
 });
 
-describe("#1246 (c) a WORKER turn's provider child runs with GIT_OPTIONAL_LOCKS=0 and core.fsmonitor=false", () => {
+describe("#1246 (c) a WORKER turn's provider child runs with GIT_OPTIONAL_LOCKS=0, core.fsmonitor=false and no global or system git config", () => {
   it("codex (gpt): the status it runs on an index gone stale after the baseline takes no lock, and the turn succeeds", async () => {
     const world = seedWorkerWorld(makeCore(), { linkedWorktree: true });
     const { report, outcome } = await codexTurn(world, { stale: true });
@@ -310,7 +316,8 @@ const sessionId = argv[argv.indexOf("--session-id") + 1];
 writeFileSync(join(process.cwd(), "src", "app.js"), ${JSON.stringify(CHANGE)});
 const gitConfig = Object.fromEntries(Array.from({ length: Number(process.env.GIT_CONFIG_COUNT ?? 0) },
   (_, n) => [process.env["GIT_CONFIG_KEY_" + n], process.env["GIT_CONFIG_VALUE_" + n]]));
-const report = { optionalLocks: process.env.GIT_OPTIONAL_LOCKS ?? null, gitConfig };
+const configFiles = { global: process.env.GIT_CONFIG_GLOBAL ?? null, nosystem: process.env.GIT_CONFIG_NOSYSTEM ?? null };
+const report = { optionalLocks: process.env.GIT_OPTIONAL_LOCKS ?? null, gitConfig, configFiles };
 process.stdout.write(JSON.stringify({ type: "result", session_id: sessionId, result: JSON.stringify(report) }));
 `);
     chmodSync(binary, 0o700);
@@ -332,27 +339,35 @@ process.stdout.write(JSON.stringify({ type: "result", session_id: sessionId, res
     if (!seatbeltStatus().applies) requireSeatbelt(ctx);
     expect(answers).toHaveLength(1);
     expect({ ...(JSON.parse(answers[0]!.text) as Record<string, unknown>), outcome: outcomeOf(runner, world, started.value.executionId) })
-      .toEqual({ optionalLocks: "0", gitConfig: { "core.fsmonitor": "false" }, outcome: { status: "SUCCEEDED", reason: null } });
+      .toEqual({
+        optionalLocks: "0",
+        gitConfig: { "core.fsmonitor": "false" },
+        configFiles: { global: "/dev/null", nosystem: "1" },
+        outcome: { status: "SUCCEEDED", reason: null },
+      });
   });
 });
 
+/** A main checkout whose owner configured a textconv driver for the owned file before the turn, caching unless `cache: false`. */
+const textconvWorld = (options: { cache: boolean } = { cache: true }): WorkerWorld => {
+  const world = seedWorkerWorld(makeCore());
+  gitSync(world.repoPath, ["config", "diff.demo.textconv", "cat"]);
+  if (options.cache) gitSync(world.repoPath, ["config", "diff.demo.cachetextconv", "true"]);
+  mkdirSync(join(world.repoPath, ".git", "info"), { recursive: true });
+  writeFileSync(join(world.repoPath, ".git", "info", "attributes"), "src/app.js diff=demo\n");
+  return world;
+};
+const cachingTextconvWorld = (): WorkerWorld => textconvWorld();
+
+const notesRef = (world: WorkerWorld): string | null => {
+  try {
+    return gitSync(world.repoPath, ["rev-parse", "--verify", "-q", "refs/notes/textconv/demo"]);
+  } catch {
+    return null;
+  }
+};
+
 describe("#1246 (e) the repository's own configuration cannot make the worker's read-only git write the git dir", () => {
-  /** A main checkout whose owner configured a caching textconv driver for the owned file before the turn. */
-  const cachingTextconvWorld = (): WorkerWorld => {
-    const world = seedWorkerWorld(makeCore());
-    gitSync(world.repoPath, ["config", "diff.demo.textconv", "cat"]);
-    gitSync(world.repoPath, ["config", "diff.demo.cachetextconv", "true"]);
-    mkdirSync(join(world.repoPath, ".git", "info"), { recursive: true });
-    writeFileSync(join(world.repoPath, ".git", "info", "attributes"), "src/app.js diff=demo\n");
-    return world;
-  };
-  const notesRef = (world: WorkerWorld): string | null => {
-    try {
-      return gitSync(world.repoPath, ["rev-parse", "--verify", "-q", "refs/notes/textconv/demo"]);
-    } catch {
-      return null;
-    }
-  };
 
   it("a caching textconv driver: the worker's git diff after its edit stores no notes, and the turn succeeds", async () => {
     const world = cachingTextconvWorld();
@@ -390,6 +405,28 @@ describe("#1246 (e) the repository's own configuration cannot make the worker's 
       } catch {
         /* none was running */
       }
+    }
+  });
+});
+
+describe("#1246 (f) the provider user's global git configuration", () => {
+  it("caching configured only in the provider HOME's .gitconfig: the worker's git diff stores no notes, and the turn succeeds", async () => {
+    // The provider child keeps HOME (its own login lives there); this file's HOME is a private temporary one.
+    const home = process.env["HOME"]!;
+    const globalConfig = join(home, ".gitconfig");
+    expect(existsSync(globalConfig)).toBe(false);
+    const world = textconvWorld({ cache: false });
+    writeFileSync(globalConfig, "[diff \"demo\"]\n\tcachetextconv = true\n");
+    try {
+      const { report, outcome } = await codexTurn(world, { commands: [["diff"]] });
+      expect({ gitConfig: report.gitConfig, configFiles: report.configFiles, outcome, notes: notesRef(world) }).toEqual({
+        gitConfig: { "core.fsmonitor": "false" },
+        configFiles: { global: "/dev/null", nosystem: "1" },
+        outcome: { status: "SUCCEEDED", reason: null },
+        notes: null,
+      });
+    } finally {
+      rmSync(globalConfig, { force: true });
     }
   });
 });

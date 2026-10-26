@@ -484,8 +484,8 @@ export const gitDirEntries = (repo: PinnedRepository): string[] => {
  * - `diff.<driver>.cachetextconv=false`, for every driver the repository's configuration names: a caching
  *   textconv driver stores its output as notes (`refs/notes/textconv/<driver>`, objects, a reflog) on a
  *   `git diff`, `show`, `log -p` or `blame`.
- * Read through the pinned git: the repository's configuration and what it includes, not the provider
- * user's global configuration.
+ * Read through the pinned git: the repository's configuration and what it includes. The worker's git
+ * reads no global or system configuration (`productionRunCli`), so this is all of what it reads.
  */
 export const workerGitConfig = async (repo: PinnedRepository): Promise<Record<string, string>> => {
   const cached = await runPinnedGit(repo, ["config", "-z", "--name-only", "--get-regexp", "^diff\\..*\\.cachetextconv$"]);

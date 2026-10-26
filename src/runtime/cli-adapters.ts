@@ -862,11 +862,16 @@ const productionRunCli = async (
           options.providerCredentialDir,
           options.codexHome,
         );
-    // Set after the allowlist, so an inherited value cannot turn optional locks back on. Git applies
-    // `GIT_CONFIG_PARAMETERS` after `GIT_CONFIG_COUNT`, so no injected configuration is inherited either:
-    // a worker's git runs with the repository's configuration and this turn's `gitConfig` over it.
+    // Set after the allowlist, so an inherited value cannot turn optional locks back on. A worker's git
+    // reads no global or system configuration (the provider user's `~/.gitconfig` and XDG config, which
+    // `workerGitConfig` cannot see), and, since git applies `GIT_CONFIG_PARAMETERS` after
+    // `GIT_CONFIG_COUNT`, no injected configuration either: it runs with the repository's configuration
+    // and this turn's `gitConfig` over it, exactly what `workerGitConfig` read. The worker only reads;
+    // the control plane commits, so no identity or credential helper is needed.
     if (options.workerTurn === true && !isolated) {
       environment["GIT_OPTIONAL_LOCKS"] = "0";
+      environment["GIT_CONFIG_GLOBAL"] = "/dev/null";
+      environment["GIT_CONFIG_NOSYSTEM"] = "1";
       for (const name of Object.keys(environment)) if (INJECTED_GIT_CONFIG.test(name)) delete environment[name];
       const overrides = Object.entries(options.gitConfig ?? {});
       if (overrides.length > 0) environment["GIT_CONFIG_COUNT"] = String(overrides.length);
