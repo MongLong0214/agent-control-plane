@@ -27,6 +27,7 @@ export const hostObservationSchema = z.object({
   routing: z.object({ generation: z.number().int().optional(), roomId: z.string().uuid() }).optional(),
   resident: z.object({ pid: z.number().int().positive(), startedAt: z.string().min(1), cwd: z.string(), sessionUuid: z.string().uuid(), tmuxName: z.string(), tmuxAncestry: z.literal(true), bridgeSessionId: z.string().min(1) }).optional(),
   fleet: z.boolean().optional(), retired: z.boolean().optional(), retirementArchivePath: z.string().optional(),
+  buzzRoomArchived: z.boolean().optional(), identityArchivePath: z.string().optional(),
 }).strict();
 export type HostObservation = z.infer<typeof hostObservationSchema>;
 export interface HostProjectProvisioner {
@@ -38,6 +39,23 @@ export class HostProvisionerError extends Error {
     super(refusal ? `host provisioner refused: ${refusal.code}: ${refusal.message}` : `host provisioner result ${outcome.toLowerCase()}`);
   }
 }
+
+/** #1229 — the host refused a retirement it cannot complete yet; `requiredOrder` is what lets it complete. */
+export class HostRetirementRefusal extends Error {
+  constructor(readonly reason: string, readonly requiredOrder: readonly string[]) {
+    super(`host retirement refused: ${reason}`);
+  }
+}
+
+/** The provisioner's own structured retirement refusal: the last stderr line, and nothing else from the child. */
+const retirementRefusalOf = (stderr: string): HostRetirementRefusal | null => {
+  try {
+    const refusal = (JSON.parse(stderr.trim().split('\n').at(-1) ?? '') as {retirementRefusal?: {reason?: unknown; requiredOrder?: unknown}}).retirementRefusal;
+    const order = refusal?.requiredOrder;
+    if (typeof refusal?.reason !== 'string' || !Array.isArray(order) || order.length === 0 || !order.every(step => typeof step === 'string')) return null;
+    return new HostRetirementRefusal(refusal.reason, order as string[]);
+  } catch { return null; }
+};
 
 /** One bounded execFile protocol. No shell, command text, credentials or raw child errors cross it. */
 export class ExecFileHostProjectProvisioner implements HostProjectProvisioner {
@@ -58,7 +76,7 @@ export class ExecFileHostProjectProvisioner implements HostProjectProvisioner {
             } catch { /* An unclassified failure supplies no verification. */ }
             reject(new HostProvisionerError(error.killed || error.code === 'ETIMEDOUT' ? 'LOST' : 'INVALID')); return;
           }
-          reject(new Error(`host provisioner ${operation} failed`)); return;
+          reject((operation === 'retire' ? retirementRefusalOf(String(stderr)) : null) ?? new Error(`host provisioner ${operation} failed`)); return;
         }
         try { resolve(hostObservationSchema.parse(JSON.parse(stdout))); }
         catch { reject('mode' in allocation ? new HostProvisionerError('INVALID') : new Error('invalid host provisioner response')); }

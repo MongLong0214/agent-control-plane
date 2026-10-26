@@ -88,6 +88,40 @@ describe("explicit bootstrap predecessor", () => {
     expect({ ...after, manifests: before.manifests }).toEqual(before);
   });
 
+  it.each([true, false])("#1231: CONFIRM refuses, retryably, while the same-named predecessor's repository exists, and proceeds once it is deleted (node id recorded: %s)", async (recorded) => {
+    const p = await prepare("freshreadme");
+    const oldRun = await retired(p.harness);
+    p.harness.cp.db.run(`UPDATE repositories SET retired_at = ? WHERE project_id = 'freshreadme'`, [p.harness.clock.nowIso()]);
+    // The predecessor's repository, at the very name this supersede creates; a provisioned predecessor recorded its node id.
+    const predecessor = await p.github.seedForeign("acme", "fixture");
+    if (recorded) {
+      p.harness.cp.db.run(`INSERT INTO resident_project_provisioning(run_id,project_id,binding_json,allocation_json,confirmation_json,status,updated_at) VALUES (?,?,?,?,?,'RETIRED',?)`,
+        [oldRun, "freshreadme", "{}", JSON.stringify({ repositoryNodeId: predecessor.nodeId }), "{}", p.harness.clock.nowIso()]);
+    }
+    const refused = await p.runner.produceAndActivate(p.input);
+    expect(refused, JSON.stringify(refused)).toMatchObject({
+      allowed: false,
+      reasonCode: "RESOURCE_COLLISION",
+      evidence: {
+        stage: "precondition",
+        refusal: "PREDECESSOR_REPOSITORY_PRESENT",
+        predecessorProjectId: "freshreadme",
+        expectedPredecessorNodeId: recorded ? predecessor.nodeId : null,
+        observedNodeId: predecessor.nodeId,
+        observedIsPredecessor: recorded ? true : null,
+        resumable: true,
+        requiredOrder: [`delete acme/fixture (node id ${predecessor.nodeId}), the repository of retired predecessor freshreadme`, "CONFIRM this run again"],
+      },
+    });
+    expect(p.github.writes).toEqual([]);
+    expect(p.harness.cp.bootstrapApplications.get(p.runId)).toBeNull();
+    // Deleted outside ACP; the next CONFIRM finds the name free and creates the new repository.
+    p.github.remove("acme", "fixture");
+    const { final } = await activateAndConfirm(p);
+    expect(final).toMatchObject({ projectRegistration: { supersedesProjectId: "freshreadme" } });
+    expect(p.github.repository("acme", "fixture")?.nodeId).not.toBe(predecessor.nodeId);
+  });
+
   it.each([
     ["missing", "PROJECT_PREDECESSOR_NOT_FOUND"],
     ["active", "PROJECT_PREDECESSOR_NOT_RETIRED"],

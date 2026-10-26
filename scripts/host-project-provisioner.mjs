@@ -2,7 +2,7 @@
 // Version 1 host boundary. All paths are derived from HOME/ACP_STATE_DIR and a frozen allocation.
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, chmodSync, realpathSync, rmSync, symlinkSync, readlinkSync, lstatSync, openSync, fsyncSync, closeSync, accessSync, constants, statSync } from 'node:fs';
-import { join, resolve, dirname, isAbsolute } from 'node:path';
+import { join, resolve, dirname, isAbsolute, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { generateSecretKey, getPublicKey } from 'nostr-tools';
 import Database from 'better-sqlite3';
@@ -12,6 +12,10 @@ import { readProcessStartToken } from '../src/core/process-argv.ts';
 const home = process.env.HOME;
 const state = process.env.ACP_STATE_DIR;
 class ProvisionerRefusal extends Error {}
+/** A retirement that cannot go ahead yet; the caller is told the order that lets it (#1229). */
+class RetirementOrderRefusal extends ProvisionerRefusal {
+  constructor(message, requiredOrder) {super(message);this.requiredOrder = requiredOrder;}
+}
 class ProvisionerExecutionFailure extends Error {
   constructor(message, error) {super(message);this.stderr = error.stderr;}
 }
@@ -186,6 +190,20 @@ try {
     }
     return {...(v1 ? {} : {generation:read(rosterFile).generation}),roomId};
   };
+  // #1230 — the CTO's Buzz identity on this host: its key pair, the room intent and the record of the run that minted
+  // the key. Moved aside together into a fresh 0700 directory, never deleted and never overwritten.
+  const intentFile = ceoSigner ? null : join(state,`buzz-room-${a.projectId}.json`);
+  const keyProvenanceFile = ceoSigner ? null : join(state,`buzz-key-${a.projectId}.json`);
+  const moveIdentityAside = () => {
+    const present = [a.privateKeyFile,pubFile,intentFile,keyProvenanceFile].filter(file => existsSync(file));
+    if (!present.length) return null;
+    const parent = join(state,'retired-buzz-identities');
+    const archive = join(parent,`${a.identityName}.${new Date().toISOString().replace(/[:.]/g,'-')}.${randomUUID().slice(0,8)}`);
+    mkdirSync(archive,{recursive:true,mode:0o700});chmodSync(parent,0o700);chmodSync(archive,0o700);
+    for (const file of present) renameSync(file,join(archive,basename(file)));
+    for (const dir of [archive,...new Set(present.map(dirname))]) {const fd = openSync(dir,'r');try {fsyncSync(fd);} finally {closeSync(fd);}}
+    return archive;
+  };
   const fleetFile = join(home,'.claude','watchers','fleet','manifest.tsv');
   const sessionFile = join(state,`resident-${a.projectId}.json`);
   const namesSession = command => new RegExp(`(?:^|\\s)--(?:session-id|resume)\\s+${a.sessionUuid}(?:\\s|$)`).test(command);
@@ -256,7 +274,26 @@ try {
         routeDb.close();
         break;
       }
-      if (!existsSync(a.privateKeyFile)) atomic(a.privateKeyFile,Buffer.from(generateSecretKey()).toString('hex')+'\n');
+      // #1230 — a key at this identity's path is used only when this run minted it (its provenance or its room intent
+      // names this run and this key) or the roster binds it to this project on an active route. Anything else there —
+      // a retired project's identity or a hand-made one under this name — is moved aside and a new key is minted.
+      const existingKey = existsSync(a.privateKeyFile) ? pub() : null;
+      if (existingKey !== null) {
+        const roster = existsSync(rosterFile) ? read(rosterFile) : {channels:{}};
+        check(object(roster) && object(roster.channels),'invalid roster channels');
+        const mintedHere = file => {
+          if (!existsSync(file)) return false;
+          const record = read(file);
+          return object(record) && record.runId === a.runId && record.pubkey === existingKey;
+        };
+        const bound = Object.values(roster.channels).some(room => object(room) && room.acp_project_id === a.projectId && room.peer?.pubkey === existingKey && room.status !== 'retired');
+        if (!mintedHere(keyProvenanceFile) && !mintedHere(intentFile) && !bound) moveIdentityAside();
+      } else moveIdentityAside();
+      if (!existsSync(a.privateKeyFile)) {
+        const secret = generateSecretKey();
+        atomic(a.privateKeyFile,Buffer.from(secret).toString('hex')+'\n');
+        atomic(keyProvenanceFile,JSON.stringify({runId:a.runId,pubkey:getPublicKey(secret)}));
+      }
       check(lstatSync(a.privateKeyFile).isFile() && !lstatSync(a.privateKeyFile).isSymbolicLink(),'key must be a regular file');
       chmodSync(a.privateKeyFile,0o600); const pk = pub();
       if (existsSync(pubFile)) check(readFileSync(pubFile,'utf8').trim() === pk,'public key conflict'); else atomic(pubFile,pk+'\n');
@@ -267,7 +304,6 @@ try {
       buzz(['users','set-profile','--name',a.identityName]);
       const profiles = buzz(['users','get','--pubkey',pk]);
       check(Array.isArray(profiles) && profiles.some(p => p.pubkey === pk && (p.name === a.identityName || p.profile?.name === a.identityName || p.display_name === a.identityName)),'profile readback mismatch');
-      const intentFile = join(state,`buzz-room-${a.projectId}.json`);
       // The intent predates creation, including when the relay's response is lost.
       const intended = {name:a.roomName ?? a.projectId,pubkey:pk,runId:a.runId};
       if (!existsSync(intentFile)) atomic(intentFile,JSON.stringify(intended));
@@ -358,24 +394,37 @@ try {
     // Activation's readback: the bootstrap requirement holds until the CTO has been observed on the clone.
     case 'observe': result = {checkout:checkout(checkoutRequirement),resident:observeResident()}; break;
     case 'retire': {
+      // #1229 — the CTO process is identified before anything on the host changes, so a refusal leaves no partial host
+      // state. Only a verified Claude incarnation may be stopped; a missing process needs no signal. A refusal names the
+      // order that lets retirement complete, and nothing here stops a process it could not verify.
+      const requiredOrder = pid => [
+        `end the CTO session ${a.sessionUuid}${pid ? ` (pid ${pid})` : ''} yourself: exit it in its own terminal`,
+        `run agentctl project retire ${a.projectId} again`,
+      ];
+      const sessionRecordNames = pid => {
+        try {const rc = read(join(home,'.claude','sessions',`${pid}.json`));return (rc.sessionId ?? rc.sessionUuid ?? rc.session_id) === a.sessionUuid;} catch {return false;}
+      };
+      let resident;
+      if (a.retirementPin) {
+        // The pin is the session row ACP recorded for this project's PRIMARY_CTO: its pid and native start token. An equal
+        // token is that exact incarnation, wherever its working directory is; its argv or Claude's own session record
+        // must still name the session. Any other token means that incarnation has exited and its pid is free or reused.
+        const pin = a.retirementPin;const token = readProcessStartToken(pin.pid);
+        if (token !== null && token === pin.startedAt) {
+          if (!namesSession(run('ps',['-p',String(pin.pid),'-o','command='])) && !sessionRecordNames(pin.pid))
+            throw new RetirementOrderRefusal(`process ${pin.pid} is the recorded CTO incarnation but no longer names session ${a.sessionUuid}`,requiredOrder(pin.pid));
+          resident = {pid:pin.pid,startedAt:pin.startedAt};
+        }
+      }
+      try {resident ??= observeResident(false);} catch {
+        if (run('ps',['-axo','command=']).split('\n').some(l => namesSession(l)))
+          throw new RetirementOrderRefusal(`a process names CTO session ${a.sessionUuid} and retirement cannot verify it as the incarnation ACP recorded`,requiredOrder(null));
+      }
+      const plannedRoute = existsSync(rosterFile) ? read(rosterFile).channels?.[a.roomId] : undefined;
+      check(!plannedRoute || plannedRoute.status === 'retired' || plannedRoute.acp_project_id === a.projectId,'retirement route conflict');
       rmSync(join(dirname(a.bootPacket),`${a.fleetName}.resident.json`),{force:true});
       if (existsSync(rosterFile)) { const roster = read(rosterFile); const route = roster.channels[a.roomId]; if (route && route.status !== 'retired') { check(route.acp_project_id === a.projectId,'retirement route conflict'); route.status = 'retired'; roster.generation++; atomic(rosterFile,JSON.stringify(roster,null,2)+'\n'); } }
       if (existsSync(fleetFile)) atomic(fleetFile,readFileSync(fleetFile,'utf8').split('\n').filter(l => {const f=l.split('\t');return f[0] !== a.fleetName && !(f[1] === a.clonePath && f[4] === a.sessionUuid);}).join('\n'));
-      // Only a fully verified Claude incarnation may be stopped. A missing process needs no signal.
-      let resident;
-      if (a.retirementPin) {
-        const pin = a.retirementPin;const token = readProcessStartToken(pin.pid);
-        if (token === pin.startedAt) {
-          const command = run('ps',['-p',String(pin.pid),'-o','command=']);
-          const cwd = run('lsof',['-a','-p',String(pin.pid),'-d','cwd','-Fn']).split('\n').find(l => l.startsWith('n'))?.slice(1);
-          const rc = read(join(home,'.claude','sessions',`${pin.pid}.json`));
-          check(namesSession(command) && cwd === a.clonePath && (rc.sessionId ?? rc.sessionUuid ?? rc.session_id) === a.sessionUuid && rc.cwd === cwd,'retirement process identity mismatch');
-          resident={pid:pin.pid,startedAt:pin.startedAt};
-        } else if (token !== null) throw new Error('retirement PID was reused');
-      }
-      try {resident ??= observeResident(false);} catch {
-        check(!run('ps',['-axo','command=']).split('\n').some(l => namesSession(l)),'project process exists but retirement cannot verify it');
-      }
       if (resident) {
         process.kill(resident.pid,'SIGTERM');
         for (let i = 0;i < 100 && readProcessStartToken(resident.pid) === resident.startedAt;i++) await new Promise(r => setTimeout(r,100));
@@ -388,7 +437,28 @@ try {
         check([origin,`git@github.com:${match[1]}/${repoName}.git`].includes(remote),'retirement clone origin mismatch');
         mkdirSync(dirname(archive),{recursive:true,mode:0o700});renameSync(a.clonePath,archive);
       }
-      result = {retired:true,...(existsSync(archive) ? {retirementArchivePath:archive} : {})}; break;
+      // #1230 — the room is archived by its owner, this identity's key, through the Buzz CLI, and read back as archived;
+      // only then are the key and the room intent moved aside, so a retry still holds the key that can archive the room.
+      // A room this key does not own (a hand-made identity under another name) is left as it is and reported so.
+      let buzzRoomArchived = false;
+      if (existsSync(a.privateKeyFile)) {
+        const pk = pub();
+        const members = buzz(['channels','members','--channel',a.roomId]);
+        if (Array.isArray(members) && members.some(m => m.pubkey === pk && m.role === 'owner')) {
+          const room = buzz(['channels','get','--channel',a.roomId]);
+          check(room.channel_id === a.roomId && typeof room.name === 'string' && room.name.length > 0,'retiring Buzz room readback mismatch');
+          const archived = () => {
+            const found = buzz(['channels','search','--query',room.name,'--exact','--include-archived']);
+            check(Array.isArray(found),'invalid channel search');
+            return found.some(c => (c.channel_id ?? c.id) === a.roomId && c.archived === true);
+          };
+          if (!archived()) run('buzz',['channels','archive','--channel',a.roomId],{env:buzzEnv()});
+          check(archived(),'Buzz room archive readback mismatch');
+          buzzRoomArchived = true;
+        }
+      }
+      const identityArchive = moveIdentityAside();
+      result = {retired:true,buzzRoomArchived,...(existsSync(archive) ? {retirementArchivePath:archive} : {}),...(identityArchive ? {identityArchivePath:identityArchive} : {})}; break;
     }
     default: throw new Error('unknown operation');
   }
@@ -405,7 +475,11 @@ try {
       } catch { /* No precise relay refusal was received. */ }
     }
     process.stderr.write(JSON.stringify({ceoBuzzSignerFailure:failure}));
-  } else process.stderr.write(`host project provisioner refused operation${error instanceof ProvisionerRefusal || error instanceof ProvisionerExecutionFailure ? ': '+error.message : ''}\n`);
+  } else {
+    process.stderr.write(`host project provisioner refused operation${error instanceof ProvisionerRefusal || error instanceof ProvisionerExecutionFailure ? ': '+error.message : ''}\n`);
+    // The one structured line the daemon reads back: the provisioner's own reason and the order it names.
+    if (error instanceof RetirementOrderRefusal) process.stderr.write(JSON.stringify({retirementRefusal:{reason:error.message,requiredOrder:error.requiredOrder}})+'\n');
+  }
   process.exitCode = 1;
 }
 finally {if (locked && readlinkSync(lock) === ownLock) rmSync(lock,{force:true});if (ownLock) rmSync(ownLock,{recursive:true,force:true});}

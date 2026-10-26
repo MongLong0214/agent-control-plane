@@ -2,10 +2,11 @@ import { afterAll, expect, it } from 'vitest';
 import { mkdirSync, readFileSync, rmSync, writeFileSync, realpathSync, statSync, symlinkSync, chmodSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFile } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { getPublicKey } from 'nostr-tools';
 import type { ProjectAllocation } from '../../src/runtime/host-project-provisioner.ts';
-import { hostObservationSchema } from '../../src/runtime/host-project-provisioner.ts';
+import { ExecFileHostProjectProvisioner, HostRetirementRefusal, hostObservationSchema } from '../../src/runtime/host-project-provisioner.ts';
+import { readProcessStartToken } from '../../src/core/process-argv.ts';
 import Database from 'better-sqlite3';
 import { cleanupTempDirs, tempDir } from '../helpers/fixtures.ts';
 
@@ -62,13 +63,16 @@ else if(cmd === 'tmux') {
  if(args[0] === 'new-session') {s.launched=true;s.pane=true;s.launches++;fs.mkdirSync(path.join(root,'.claude','sessions'),{recursive:true});fs.writeFileSync(path.join(root,'.claude','sessions',process.env.TEST_CLAUDE_PID+'.json'),JSON.stringify({sessionId:a.sessionUuid,cwd:a.clonePath,bridgeSessionId:'bridge'}));}
  else if(args[0] === 'display-message') {if(args.at(-1).includes('pane_current_path')) out(a.clonePath+'\\t'+path.join(process.env.ACP_STATE_DIR,'resident-test.sh'));else {if(!s.launched) process.exit(1);out('999999');}} else if(args[0] === 'kill-session') {s.pane=false;} else process.exit(2);
 }
-else if(cmd === 'ps') {if(s.launched) {if(args.includes('command=')) out('claude --session-id '+a.sessionUuid);else out(process.env.TEST_CLAUDE_PID+' 999999 Thu Oct 22 01:00:00 2026 claude --session-id '+a.sessionUuid+'\\n999999 1 Thu Oct 22 01:00:00 2026 tmux');}}
-else if(cmd === 'lsof') out('n'+a.clonePath+'\\n');
+else if(cmd === 'ps') {if(args[0] === '-p') out(s.pinCommand || '');else if(s.launched) {if(args.includes('command=')) out('claude --session-id '+a.sessionUuid);else out(process.env.TEST_CLAUDE_PID+' 999999 Thu Oct 22 01:00:00 2026 claude --session-id '+a.sessionUuid+'\\n999999 1 Thu Oct 22 01:00:00 2026 tmux');}}
+else if(cmd === 'lsof') out('n'+(s.cwd || a.clonePath)+'\\n');
 else if(cmd === 'buzz') {
  const pk = fs.readFileSync(a.privateKeyFile.replace('.priv','.pub'),'utf8').trim();
+ const archived = s.archivedRooms || [];
  if(args[0] === 'users') out([{pubkey:pk,...${JSON.stringify(profileReadback)}}]);
- else if(args[0] === 'channels' && args[1] === 'search') out(s.room ? (s.ambiguous ? [s.room,{...s.room,channel_id:'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'}] : [s.room]) : []);
- else if(args[0] === 'channels' && args[1] === 'create') {if(args.includes('--id') || !process.env.BUZZ_PRIVATE_KEY || process.env.BUZZ_IDENTITY !== a.identityName) process.exit(3);const intent=JSON.parse(fs.readFileSync(path.join(process.env.ACP_STATE_DIR,'buzz-room-test.json'),'utf8'));if(intent.name!==value('--name') || intent.pubkey!==pk) process.exit(4);s.creates++;s.room={channel_id:'ffffffff-ffff-4fff-8fff-ffffffffffff',name:value('--name'),channel_type:value('--type'),visibility:value('--visibility')};s.members=[{pubkey:pk,role:'owner'}];save();if(s.loseCreate) {s.loseCreate=false;save();process.exit(1);}out(s.room);}
+ else if(args[0] === 'channels' && args[1] === 'search') out([...(s.room ? (s.ambiguous ? [s.room,{...s.room,channel_id:'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'}] : [s.room]) : []),...(args.includes('--include-archived') ? archived : [])]);
+ else if(args[0] === 'channels' && args[1] === 'get') {const room=[s.room,...archived].find(r => r && r.channel_id === value('--channel'));if(!room) process.exit(5);out({channel_id:room.channel_id,name:room.name,description:null,created_at:0,pubkey:pk});}
+ else if(args[0] === 'channels' && args[1] === 'archive') {if(!process.env.BUZZ_PRIVATE_KEY || process.env.BUZZ_IDENTITY !== a.identityName || !s.room || s.room.channel_id !== value('--channel') || !s.members.some(m => m.pubkey === pk && m.role === 'owner')) process.exit(6);s.archivedRooms=[...archived,{...s.room,archived:true}];s.room=null;s.members=[];out({event_id:'a'.repeat(64),accepted:true,message:''});}
+ else if(args[0] === 'channels' && args[1] === 'create') {if(args.includes('--id') || !process.env.BUZZ_PRIVATE_KEY || process.env.BUZZ_IDENTITY !== a.identityName) process.exit(3);const intent=JSON.parse(fs.readFileSync(path.join(process.env.ACP_STATE_DIR,'buzz-room-test.json'),'utf8'));if(intent.name!==value('--name') || intent.pubkey!==pk) process.exit(4);s.creates++;s.room={channel_id:s.creates === 1 ? 'ffffffff-ffff-4fff-8fff-ffffffffffff' : '99999999-9999-4999-8999-999999999999',name:value('--name'),channel_type:value('--type'),visibility:value('--visibility')};s.members=[{pubkey:pk,role:'owner'}];save();if(s.loseCreate) {s.loseCreate=false;save();process.exit(1);}out(s.room);}
  else if(args[0] === 'channels' && args[1] === 'add-member') {const pubkey=value('--pubkey');s.members=s.members.filter(m=>m.pubkey!==pubkey);s.members.push({pubkey,role:value('--role')});out({});}
  else if(args[0] === 'channels' && args[1] === 'members') out(s.members);
  else if(args[0] === 'messages' && args[1] === 'send') {
@@ -445,4 +449,119 @@ it.each(binaries)('reports the %s step and non-zero exit code without subprocess
   const operation = binary === 'buzz' ? 'ensure-buzz' : 'ensure-resident';
   const failure = await invoke(operation).then(() => 'unexpected success',error => String(error));
   expect(failure).toBe(`Error: ${operation}: host project provisioner refused operation: ${binary} in ${operation}: non-zero exit with exit code 23\n`);
+});
+
+const saveAllocation = (f:ReturnType<typeof fixture>) => writeFileSync(join(f.home,'allocation.json'),JSON.stringify(f.a));
+const fakeState = (f:ReturnType<typeof fixture>) => JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8')) as Record<string,unknown>;
+const patchFake = (f:ReturnType<typeof fixture>, patch:Record<string,unknown>) => writeFileSync(join(f.home,'fake.json'),JSON.stringify({...fakeState(f),...patch}));
+/** A process this test starts and owns, standing in for a CTO incarnation; only its exact PID is ever signalled. */
+const standInCto = async (args:string[] = []) => {
+  const child:ChildProcess = spawn(process.execPath,['-e','setInterval(() => {}, 1000)','--',...args],{stdio:'ignore'});
+  const exit = new Promise<NodeJS.Signals|null>(resolve => child.once('exit',(_code,signal) => resolve(signal)));
+  let startedAt:string|null = null;
+  for (let i = 0;i < 100 && startedAt === null;i++) {startedAt = readProcessStartToken(child.pid!);if (startedAt === null) await new Promise(r => setTimeout(r,20));}
+  if (startedAt === null) throw new Error('stand-in CTO did not start');
+  return {pid:child.pid!,startedAt,exit,stop:() => {if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');}};
+};
+const sessionRecord = (f:ReturnType<typeof fixture>, pid:number, record:Record<string,unknown>) => {
+  mkdirSync(join(f.home,'.claude','sessions'),{recursive:true});
+  writeFileSync(join(f.home,'.claude','sessions',`${pid}.json`),JSON.stringify(record));
+};
+
+it('#1229: retires the recorded CTO incarnation, identified by its session row pid and start token, while its cwd is outside the clone',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');
+  const cto = await standInCto();
+  try {
+    // The CTO session runs from the home directory, not the clone; its argv and Claude's session record name the session.
+    sessionRecord(f,cto.pid,{sessionId:f.a.sessionUuid,cwd:f.home});
+    patchFake(f,{pinCommand:`claude --resume ${f.a.sessionUuid}`,cwd:f.home});
+    f.a.retirementPin = {pid:cto.pid,startedAt:cto.startedAt};saveAllocation(f);
+    expect(await f.invoke('retire')).toMatchObject({retired:true,retirementArchivePath:join(f.home,'projects','.retired','fixture-test')});
+    expect(await cto.exit).toBe('SIGTERM');
+  } finally {cto.stop();}
+});
+
+it('#1229: refuses with the required order, before any host change, when the recorded incarnation no longer names its session',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');
+  const buzz = await f.invoke('ensure-buzz');f.a.roomId = (buzz.buzz as {roomId:string}).roomId;saveAllocation(f);
+  await f.invoke('ensure-routing');
+  const fleetDir = join(f.home,'.claude','watchers','fleet');mkdirSync(fleetDir,{recursive:true});
+  writeFileSync(join(fleetDir,'manifest.tsv'),[f.a.fleetName,f.a.clonePath,'test CTO',f.a.bootPacket,f.a.sessionUuid].join('\t')+'\n');
+  writeFileSync(join(fleetDir,`${f.a.fleetName}.resident.json`),'{}');
+  // Its argv names no session and Claude's own record now names another one: it cannot be verified, so it is not stopped.
+  const cto = await standInCto();
+  try {
+    sessionRecord(f,cto.pid,{sessionId:'cccccccc-cccc-4ccc-8ccc-cccccccccccc',cwd:f.a.clonePath});
+    f.a.retirementPin = {pid:cto.pid,startedAt:cto.startedAt};saveAllocation(f);
+    const snapshot = () => [join(f.home,'.hermes','bridge','required-mentions.json'),join(fleetDir,'manifest.tsv'),join(fleetDir,`${f.a.fleetName}.resident.json`),f.a.privateKeyFile,join(f.state,'buzz-room-test.json')]
+      .map(file => existsSync(file) ? readFileSync(file,'utf8') : null).concat([String(existsSync(f.a.clonePath))]);
+    const before = snapshot();
+    // The daemon's own protocol class against the packaged script: real ps reads the stand-in's argv.
+    const refused = await new ExecFileHostProjectProvisioner(f.script,f.home,f.state,30_000,f.database).invoke('retire',f.a).then(() => null,(error:unknown) => error);
+    expect(refused).toBeInstanceOf(HostRetirementRefusal);
+    expect((refused as HostRetirementRefusal).requiredOrder).toEqual([
+      `end the CTO session ${f.a.sessionUuid} (pid ${cto.pid}) yourself: exit it in its own terminal`,
+      `run agentctl project retire ${f.a.projectId} again`,
+    ]);
+    expect(snapshot()).toEqual(before);
+    expect(readProcessStartToken(cto.pid)).toBe(cto.startedAt);
+  } finally {cto.stop();}
+});
+
+it('#1230: retire archives the room and moves the key and room intent aside; a same-named provisioning mints a new key and leaves one active room',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');
+  const first = await f.invoke('ensure-buzz');const oldRoom = (first.buzz as {roomId:string}).roomId;
+  f.a.roomId = oldRoom;saveAllocation(f);await f.invoke('ensure-routing');
+  const oldKey = readFileSync(f.a.privateKeyFile,'utf8');const oldIntent = readFileSync(join(f.state,'buzz-room-test.json'),'utf8');
+  const retired = await f.invoke('retire');
+  expect(retired).toMatchObject({retired:true,buzzRoomArchived:true});
+  const archive = retired['identityArchivePath'] as string;
+  expect(archive.startsWith(join(f.state,'retired-buzz-identities','cto-test.'))).toBe(true);
+  expect(statSync(archive).mode & 0o777).toBe(0o700);expect(statSync(join(f.state,'retired-buzz-identities')).mode & 0o777).toBe(0o700);
+  expect(readdirSync(archive).sort()).toEqual(['buzz-key-test.json','buzz-room-test.json','cto-test.priv','cto-test.pub']);
+  expect(readFileSync(join(archive,'cto-test.priv'),'utf8')).toBe(oldKey);
+  expect(readFileSync(join(archive,'buzz-room-test.json'),'utf8')).toBe(oldIntent);
+  expect(existsSync(f.a.privateKeyFile)).toBe(false);expect(existsSync(join(f.state,'buzz-room-test.json'))).toBe(false);
+  expect(JSON.parse(readFileSync(join(f.home,'.hermes','bridge','required-mentions.json'),'utf8')).channels[oldRoom].status).toBe('retired');
+  // A new project provisioned under the same identity name: a new run, session and nonce.
+  Object.assign(f.a,{runId:'run_next',sessionUuid:'cccccccc-cccc-4ccc-8ccc-cccccccccccc',nonce:'next-nonce',roomId:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'});saveAllocation(f);
+  const next = await f.invoke('ensure-buzz');
+  const newKey = readFileSync(f.a.privateKeyFile,'utf8');
+  expect(newKey).not.toBe(oldKey);
+  expect(next.buzz).toMatchObject({pubkey:getPublicKey(Buffer.from(newKey.trim(),'hex')),roomId:'99999999-9999-4999-8999-999999999999'});
+  const fake = fakeState(f) as {room:{channel_id:string}|null;archivedRooms:Array<{channel_id:string;archived:boolean}>;creates:number};
+  expect(fake.room?.channel_id).toBe('99999999-9999-4999-8999-999999999999');
+  expect(fake.archivedRooms).toEqual([expect.objectContaining({channel_id:oldRoom,archived:true})]);
+  expect(fake.creates).toBe(2);
+});
+
+it.each(['hand-made','bound'] as const)('#1230: ensure-buzz uses an existing key only when this run minted it or the roster binds it (%s)',async kind => {
+  const f = fixture();
+  const handMade = '1'.repeat(64);const pk = getPublicKey(Buffer.from(handMade,'hex'));
+  writeFileSync(f.a.privateKeyFile,handMade+'\n');writeFileSync(f.a.privateKeyFile.replace('.priv','.pub'),pk+'\n');
+  if (kind === 'hand-made') {
+    // Left by a hand-made setup under this identity name, with its own room intent from another run.
+    mkdirSync(f.state,{recursive:true});writeFileSync(join(f.state,'buzz-room-test.json'),JSON.stringify({name:'test',pubkey:pk,runId:'run_old',roomId:'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'}));
+  } else {
+    writeFileSync(join(f.home,'.hermes','bridge','required-mentions.json'),JSON.stringify({version:2,generation:3,channels:{'ffffffff-ffff-4fff-8fff-ffffffffffff':{
+      relay_name:'production',ceo:{pubkey:'d'.repeat(64),handle:'ceo'},peer:{pubkey:pk,handle:'cto-test'},acp_project_id:'test',status:'active',classification:'project'}}}));
+  }
+  const result = await f.invoke('ensure-buzz');
+  const key = readFileSync(f.a.privateKeyFile,'utf8').trim();
+  const archives = existsSync(join(f.state,'retired-buzz-identities')) ? readdirSync(join(f.state,'retired-buzz-identities')) : [];
+  if (kind === 'bound') {
+    expect(key).toBe(handMade);expect(archives).toEqual([]);
+    expect(result.buzz).toMatchObject({pubkey:pk});
+  } else {
+    expect(key).not.toBe(handMade);expect(archives).toHaveLength(1);
+    const archive = join(f.state,'retired-buzz-identities',archives[0]!);
+    expect(statSync(archive).mode & 0o777).toBe(0o700);
+    expect(readFileSync(join(archive,'cto-test.priv'),'utf8')).toBe(handMade+'\n');
+    expect(JSON.parse(readFileSync(join(archive,'buzz-room-test.json'),'utf8'))).toMatchObject({runId:'run_old'});
+    expect(result.buzz).toMatchObject({pubkey:getPublicKey(Buffer.from(key,'hex'))});
+    expect(JSON.parse(readFileSync(join(f.state,'buzz-key-test.json'),'utf8'))).toEqual({runId:f.a.runId,pubkey:getPublicKey(Buffer.from(key,'hex'))});
+  }
 });

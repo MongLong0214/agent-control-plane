@@ -2,6 +2,7 @@ import { afterAll, expect, it, vi } from 'vitest';
 import { buzzMentionSubscriberRegistry } from '../../src/daemon/agentcpd.ts';
 import { CanonicalSessionRegistry } from '../../src/registry/canonical-session-registry.ts';
 import { retireProject } from '../../src/registry/project-retirement.ts';
+import { HostRetirementRefusal } from '../../src/runtime/host-project-provisioner.ts';
 import { SELF_CLAIM_EXECUTOR_KIND, SELF_CLAIM_PROTOCOL } from '../../src/registry/canonical-self-claim.ts';
 import { Role, SessionLifecycle } from '../../src/domain/types.ts';
 import { digestOf, sha256 } from '../../src/core/digest.ts';
@@ -55,6 +56,19 @@ it.each([false,true])('FV52-01: host retirement failure excludes the revoked ent
       .toEqual({verdict:'EXCLUDED',reason:'CANONICAL_ENTITLEMENT_REVOKED'});
     expect(stderr.mock.calls.flat().join('')).toContain('CANONICAL_ENTITLEMENT_REVOKED');
   } finally {stderr.mockRestore();h.cp.close();}
+});
+
+it('#1229: a host retirement refusal reaches the retire result with the order it names',async () => {
+  const h = makeHarness();
+  try {
+    bind(h);
+    new CanonicalSessionRegistry(h.cp.db).grant(entry,null);
+    const order = [`end the CTO session ${entry.sessionUuid} (pid 4242) yourself: exit it in its own terminal`,`run agentctl project retire ${entry.projectId} again`];
+    vi.spyOn(h.cp.residentProjects,'retire').mockRejectedValue(new HostRetirementRefusal('process 4242 is the recorded CTO incarnation but no longer names session',order));
+    expect(await retireProject(h.cp,entry.projectId,'retire')).toMatchObject({allowed:false,reasonCode:ReasonCode.CONFLICT,
+      evidence:{projectId:entry.projectId,refusal:'process 4242 is the recorded CTO incarnation but no longer names session',requiredOrder:order}});
+    expect(h.cp.projects.get(entry.projectId)?.retiredAt).toBeNull();
+  } finally {h.cp.close();}
 });
 
 it('FV52-01: a tombstoned conversation cannot regain admission under a different pubkey or env project',() => {

@@ -210,6 +210,12 @@ const requestKind = (request: BootstrapWriteRequest): PendingWrite["resourceType
   return null;
 };
 
+/** #1231 — a retired predecessor recorded at the repository identity a supersede creates, and its node id if known. */
+interface SameNamedPredecessor {
+  projectId: string;
+  nodeId: string | null;
+}
+
 /**
  * The intents an earlier attempt left pending in the ledger, as a new attempt finds them: requests that
  * may have been sent, which are never sent again, and requests proven withheld and never sent, whose
@@ -673,7 +679,8 @@ export class RepoFactoryBootstrapRunner {
         if (existing !== null) this.deps.applications.recordRefusal(runId, refusalRecord(occupied, "precondition"));
         return atStage(occupied as Decision<ACPBootstrapActivationResult>, "precondition");
       }
-      const attribution = await this.observedTarget(runId, workRoot, executable, execution.value, existing);
+      const attribution = await this.observedTarget(runId, workRoot, executable, execution.value, existing,
+        this.sameNamedPredecessor(outputs.supersedesProjectId, outputs.target.repositoryIdentity));
       if (!attribution.allowed) return attribution as Decision<ACPBootstrapActivationResult>;
       pendingAtStart = attribution.value.pending;
       exemptAtStart = attribution.value.exempt;
@@ -1421,6 +1428,7 @@ export class RepoFactoryBootstrapRunner {
     plan: RepoFactoryPlanFixture,
     execution: GitHubExecutionPlan,
     existing: BootstrapApplication | null,
+    predecessor: SameNamedPredecessor | null = null,
   ): Promise<Decision<PendingAtStart>> {
     const ledgerPath = githubLedgerPath(join(workRoot, runId), plan.repositoryRole);
     const ledger = readGitHubLedger(
@@ -1520,6 +1528,35 @@ export class RepoFactoryBootstrapRunner {
       createSent: pending !== undefined,
       ledgerPath,
     };
+    // #1231 — a supersede whose retired predecessor has this same repository name: the predecessor's repository is
+    // deleted outside ACP, before the create. While the name still resolves to a repository this run never sent a
+    // create for, the CONFIRM is refused before anything is consumed, retryably, naming the predecessor's node id; a
+    // CONFIRM after the deletion finds the name free and proceeds. A run that sent a create keeps the rules below.
+    if (predecessor !== null && receipt === undefined && pending === undefined) {
+      const target = `${execution.target.owner}/${execution.target.name}`;
+      const refused = deny<PendingAtStart>(
+        ReasonCode.RESOURCE_COLLISION,
+        `${target} still holds a repository, and this supersede of ${predecessor.projectId} creates that name: delete the predecessor's repository, then CONFIRM again; nothing is consumed or written`,
+        {
+          stage: "precondition",
+          refusal: "PREDECESSOR_REPOSITORY_PRESENT",
+          runId,
+          ...evidence,
+          predecessorProjectId: predecessor.projectId,
+          expectedPredecessorNodeId: predecessor.nodeId,
+          observedIsPredecessor: predecessor.nodeId === null ? null : predecessor.nodeId === observed.nodeId,
+          resumable: true,
+          requiredOrder: [
+            predecessor.nodeId === null || predecessor.nodeId === observed.nodeId
+              ? `delete ${target} (node id ${observed.nodeId}), the repository of retired predecessor ${predecessor.projectId}`
+              : `free ${target}: it resolves to node id ${observed.nodeId}, not ${predecessor.nodeId}, the repository predecessor ${predecessor.projectId} recorded`,
+            "CONFIRM this run again",
+          ],
+        },
+      );
+      if (existing !== null) this.deps.applications.recordRefusal(runId, refusalRecord(refused, "precondition"));
+      return refused;
+    }
     if (existing === null) {
       return deny(
         ReasonCode.RESOURCE_COLLISION,
@@ -1528,6 +1565,24 @@ export class RepoFactoryBootstrapRunner {
       );
     }
     return this.strand(runId, "ATTRIBUTION_UNCERTAIN", evidence);
+  }
+
+  /**
+   * #1231 — the retired predecessor this PLAN supersedes, when ACP recorded it at this same repository identity, with
+   * the node id of its repository if a resident provisioning of that project recorded one. Read only.
+   */
+  private sameNamedPredecessor(supersedesProjectId: string | undefined, repositoryIdentity: string): SameNamedPredecessor | null {
+    if (supersedesProjectId === undefined) return null;
+    const sameName = this.deps.db.get<{ found: number }>(
+      `SELECT 1 AS found FROM repositories WHERE project_id = ? AND lower(identity) = lower(?) LIMIT 1`,
+      [supersedesProjectId, repositoryIdentity],
+    );
+    if (sameName === undefined) return null;
+    const recorded = this.deps.db.get<{ nodeId: unknown }>(
+      `SELECT json_extract(allocation_json, '$.repositoryNodeId') AS nodeId FROM resident_project_provisioning WHERE project_id = ?`,
+      [supersedesProjectId],
+    );
+    return { projectId: supersedesProjectId, nodeId: typeof recorded?.nodeId === "string" && recorded.nodeId.length > 0 ? recorded.nodeId : null };
   }
 
   /**

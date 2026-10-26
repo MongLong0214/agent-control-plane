@@ -3,6 +3,7 @@ import { allow, deny, type Decision } from '../core/errors.ts';
 import { ReasonCode } from '../core/reason-codes.ts';
 import { CanonicalSessionRegistry } from './canonical-session-registry.ts';
 import { Role, roleKeyFor } from '../domain/types.ts';
+import { HostRetirementRefusal } from '../runtime/host-project-provisioner.ts';
 
 /** Suspension commits first. Failure leaves a resumable, non-dispatching project with its history intact. */
 export async function retireProject(cp:ControlPlane,projectId:string,reason:string):Promise<Decision<unknown>> {
@@ -20,7 +21,11 @@ export async function retireProject(cp:ControlPlane,projectId:string,reason:stri
   if (workers.remaining.some(w => projectWorkers.has(w.sessionId)) || workers.stopFailed.some(id => projectWorkers.has(id)) || cp.db.get(`SELECT 1 FROM assignments a JOIN tasks t ON t.task_id = a.task_id JOIN runs r ON r.run_id = t.run_id WHERE a.role = 'WORKER' AND a.status = 'ACTIVE' AND r.project_id = ?`,[projectId])) return deny(ReasonCode.CONFLICT,'retirement waits for worker processes to settle',{projectId});
   const at = cp.clock.nowIso();
   new CanonicalSessionRegistry(cp.db).revoke(projectId,at);
-  try {await cp.residentProjects.retire(projectId);} catch {return deny(ReasonCode.CONFLICT,'host retirement pending; project remains suspended',{projectId});}
+  try {await cp.residentProjects.retire(projectId);} catch (error) {
+    // #1229 — a host refusal that names its order is reported with it; the host changed nothing before refusing.
+    if (error instanceof HostRetirementRefusal) return deny(ReasonCode.CONFLICT,`host retirement refused: ${error.reason}; project remains suspended`,{projectId,refusal:error.reason,requiredOrder:[...error.requiredOrder]});
+    return deny(ReasonCode.CONFLICT,'host retirement pending; project remains suspended',{projectId});
+  }
   return cp.db.txDecision(() => {
     const roleKey = roleKeyFor(Role.PRIMARY_CTO,{projectId});
     if (cp.bindings.active(roleKey)) {const revoked = cp.bindings.revoke(roleKey,reason,{allowBlockedRuns:true,allowHeldRuns:true});if (!revoked.allowed) return revoked;}
