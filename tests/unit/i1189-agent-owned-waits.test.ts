@@ -9,7 +9,7 @@ import {
 } from "../../src/ceo/agent-owned-waits.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
-import { OWNERLESS_STALL_ROUTED } from "../../src/doctor/watchdog.ts";
+import { OWNERLESS_STALL_ROUTED, type WatchdogTick } from "../../src/doctor/watchdog.ts";
 import { ExecutionMode, Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import type { OutboxMessage } from "../../src/outbox/outbox.ts";
@@ -474,6 +474,89 @@ describe("#1189 B12/C2 — a stall nobody watches reaches the CEO as CRITICAL_SY
       .toEqual({ status: "RUNNING" });
     expect(harness.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM task_executions WHERE run_id = ?`, [run.runId])).toEqual({ n: 1 });
     expect(harness.cp.runs.require(run.runId).state).toBe(RunState.ACTIVE);
+  });
+
+  it("F3-1: an idle run's stall is one episode however its notice is delivered, and a real run event starts the next", async () => {
+    const harness = makeHarness();
+    const run = await activeRun(harness);
+    const waits = waitsOf(harness);
+    const runStalls = (tick: WatchdogTick) => tick.stalls.filter((stall) => stall.kind === "run");
+    const alerts = () => ceoNotices(harness, run.runId).filter((message) =>
+      payloadOf(message)["notification"] === "CRITICAL_SYSTEM_FAILURE" && payloadOf(message)["stall"] === "run");
+
+    harness.clock.advance(121 * 60 * 1000);
+    const first = runStalls(await harness.cp.watchdog.tick());
+    expect(first).toHaveLength(1);
+    waits.routeWatchdogStalls(first);
+    await harness.cp.outbox.deliverCeoNotifications();
+    // The CEO has no route in this fixture: delivering the notice writes its bookkeeping against the run.
+    expect(harness.cp.audit.forRun(run.runId).some((entry) => entry.kind === "CEO_NOTIFICATION_ROUTE_UNAVAILABLE")).toBe(true);
+    expect(alerts()).toHaveLength(1);
+
+    harness.clock.advance(121 * 60 * 1000);
+    const second = runStalls(await harness.cp.watchdog.tick());
+    expect(second).toEqual([expect.objectContaining({ since: first[0]!.since })]);
+    waits.routeWatchdogStalls(second);
+    await harness.cp.outbox.deliverCeoNotifications();
+    expect(alerts()).toHaveLength(1);
+
+    // Real progress: the run's task graph. The run idles again after it, and that is a new episode.
+    expect(harness.cp.tasks.submit(run.runId, [{ key: "impl", title: "change app()", category: "implementation" }]).allowed).toBe(true);
+    const progressedAt = harness.clock.nowIso();
+    harness.clock.advance(121 * 60 * 1000);
+    const third = runStalls(await harness.cp.watchdog.tick());
+    expect(third).toEqual([expect.objectContaining({ since: progressedAt })]);
+    waits.routeWatchdogStalls(third);
+    expect(alerts()).toHaveLength(2);
+  });
+
+  it("F3-2: a reclaimed attempt the CEO could not be told of reaches the CEO once it is back, exactly once", async () => {
+    const harness = makeHarness();
+    const run = await activeRun(harness);
+    const waits = waitsOf(harness);
+    harness.cp.db.run(
+      `INSERT INTO candidate_pipeline_attempts
+         (run_id, attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, started_at, deadline_at, released_at)
+       VALUES (?, 'attempt_crashed', ?, ?, NULL, 'RUNNING', ?, ?, NULL)`,
+      [
+        run.runId, run.ownerSessionId, run.ownerBindingGeneration,
+        new Date(harness.clock.now().getTime() - 31 * 60 * 1000).toISOString(),
+        new Date(harness.clock.now().getTime() - 60_000).toISOString(),
+      ],
+    );
+    const attemptNotices = () => ceoNotices(harness, run.runId).filter((message) =>
+      payloadOf(message)["notification"] === "CRITICAL_SYSTEM_FAILURE" && payloadOf(message)["stall"] === "candidate_pipeline_attempt");
+    expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "CEO runtime lost").allowed).toBe(true);
+
+    const reclaimed = (await harness.cp.watchdog.tick()).stalls.filter((stall) => stall.kind === "candidate_pipeline_attempt");
+    expect(reclaimed).toEqual([expect.objectContaining({ id: "attempt_crashed", runId: run.runId })]);
+    expect(waits.routeWatchdogStalls(reclaimed)).toEqual([
+      expect.objectContaining({ kind: "candidate_pipeline_attempt", messageId: null, reasonCode: ReasonCode.GATE_AUTHORITY_DENIED }),
+    ]);
+    expect(attemptNotices()).toEqual([]);
+
+    const ceo = bindCeo(harness);
+    const later = await harness.cp.watchdog.tick();
+    // The attempt is RELEASED now: no tick sees it again.
+    expect(later.stalls.some((stall) => stall.kind === "candidate_pipeline_attempt")).toBe(false);
+    waits.routeWatchdogStalls(later.stalls);
+    expect(attemptNotices()).toHaveLength(1);
+    expect(attemptNotices()[0]).toMatchObject({
+      targetSessionId: ceo,
+      payload: {
+        resource: "attempt_crashed",
+        owner: { role: run.ownerRoleKey, sessionId: run.ownerSessionId, generation: run.ownerBindingGeneration },
+        effects: "MAY_HAVE_RUN",
+        checkBeforeRerun: true,
+        recoveryAction: expect.stringContaining("result_submit"),
+        productFailure: false,
+      },
+    });
+
+    harness.clock.advance(60_000);
+    waits.routeWatchdogStalls((await harness.cp.watchdog.tick()).stalls);
+    waits.routeWatchdogStalls([]);
+    expect(attemptNotices()).toHaveLength(1);
   });
 
   it("with no CEO bound nothing is written, and the next pass routes it once the CEO is back", async () => {

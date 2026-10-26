@@ -5,7 +5,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { OWNERLESS_STALL_ROUTED, type WatchdogStall } from "../doctor/watchdog.ts";
+import { OWNERLESS_STALL_OWED, OWNERLESS_STALL_ROUTED, type WatchdogStall } from "../doctor/watchdog.ts";
 import { ArtifactKind, Role, RunState, roleKeyFor, type RoleBinding, type RunRow } from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
@@ -178,6 +178,10 @@ const WATCHDOG_STALL_ROUTES: Readonly<Record<string, { recoveryAction: string; e
   },
 };
 
+/** The one notice an ownerless stall is owed: its source, kind, resource and episode name it. */
+const ownerlessStallKey = (stall: Pick<OwnerlessStall, "source" | "kind" | "id" | "episode">): string =>
+  `ownerless-stall:${stall.source}:${digestOf({ kind: stall.kind, id: stall.id, episode: stall.episode })}`;
+
 /** One component for the agent-owned waits' deadlines, the review re-delivery and the ownerless stall routing. */
 export class AgentOwnedWaits {
   constructor(
@@ -282,7 +286,7 @@ export class AgentOwnedWaits {
    * CEO bound (or its session not READY) nothing is written and the next pass asks again.
    */
   routeOwnerlessStall(stall: OwnerlessStall): Decision<{ messageId: string; routed: boolean }> {
-    const idempotencyKey = `ownerless-stall:${stall.source}:${digestOf({ kind: stall.kind, id: stall.id, episode: stall.episode })}`;
+    const idempotencyKey = ownerlessStallKey(stall);
     const existing = this.ports.outbox.byIdempotencyKey(idempotencyKey);
     if (existing) return allow(ReasonCode.OK, { messageId: existing.messageId, routed: false });
     return this.ports.db.txDecision(() => {
@@ -322,6 +326,7 @@ export class AgentOwnedWaits {
           source: stall.source,
           kind: stall.kind,
           target: stall.id,
+          since: stall.since,
           owner: stall.owner,
           action: stall.recoveryAction,
           detail: stall.blocker,
@@ -338,13 +343,18 @@ export class AgentOwnedWaits {
    * C2 — the watchdog's overdue resources, routed to the CEO. A stalled CEO notice is never routed (it is
    * already addressed to the CEO, and routing it would only add another notice to the same stuck route),
    * and the other stalled messages are routed one notice per role, keyed by that role's oldest one.
+   * F3-2 — then every stall the watchdog recorded as owed (`OWNERLESS_STALL_OWED`) and nobody has been
+   * told of yet: a stall seen once, such as a reclaimed attempt, reaches the CEO when it is back, once.
    */
   routeWatchdogStalls(stalls: readonly WatchdogStall[]): Array<{ kind: string; id: string; messageId: string | null; reasonCode: string }> {
     const routed: Array<{ kind: string; id: string; messageId: string | null; reasonCode: string }> = [];
     const oldestByRole = new Map<string, { stall: WatchdogStall; count: number }>();
+    const asked = new Set<string>();
     const routeOne = (stall: WatchdogStall, blocker: string): void => {
       const route = WATCHDOG_STALL_ROUTES[stall.kind];
-      if (!route) return;
+      const key = ownerlessStallKey({ source: "WATCHDOG", kind: stall.kind, id: stall.id, episode: stall.since });
+      if (!route || asked.has(key)) return;
+      asked.add(key);
       const decision = this.routeOwnerlessStall({
         source: "WATCHDOG",
         kind: stall.kind,
@@ -379,7 +389,31 @@ export class AgentOwnedWaits {
     for (const [role, { stall, count }] of oldestByRole) {
       routeOne(stall, `${count} ${WATCHDOG_STALL_ROUTES["outbox"]!.what} to ${role}; the oldest is ${stall.id}, since ${stall.since}`);
     }
+    for (const owed of this.#owedStalls()) {
+      if (this.ports.outbox.byIdempotencyKey(ownerlessStallKey({ source: "WATCHDOG", kind: owed.kind, id: owed.id, episode: owed.since }))) continue;
+      routeOne(owed, `${WATCHDOG_STALL_ROUTES[owed.kind]?.what ?? owed.kind}: ${owed.kind} ${owed.id}, since ${owed.since}`);
+    }
     return routed;
+  }
+
+  /** The owed stalls no routed record answers yet (a routed one is also checked by its notice's key). */
+  #owedStalls(): WatchdogStall[] {
+    return this.ports.db.all<{ run_id: string | null; evidence_json: string }>(
+      `SELECT owed.run_id, owed.evidence_json FROM audit_events owed
+        WHERE owed.kind = ?
+          AND NOT EXISTS (SELECT 1 FROM audit_events routed WHERE routed.kind = ?
+            AND json_extract(routed.evidence_json, '$.kind') = json_extract(owed.evidence_json, '$.kind')
+            AND json_extract(routed.evidence_json, '$.target') = json_extract(owed.evidence_json, '$.target')
+            AND json_extract(routed.evidence_json, '$.since') = json_extract(owed.evidence_json, '$.since'))
+        ORDER BY owed.event_id`,
+      [OWNERLESS_STALL_OWED, OWNERLESS_STALL_ROUTED],
+    ).flatMap((row) => {
+      const evidence = evidenceOf(row.evidence_json) ?? {};
+      const [kind, id, since] = [evidence["kind"], evidence["target"], evidence["since"]];
+      return typeof kind === "string" && typeof id === "string" && typeof since === "string"
+        ? [{ kind, id, runId: row.run_id, since }]
+        : [];
+    });
   }
 
   #stallOwner(stall: WatchdogStall): OwnerlessStall["owner"] {
