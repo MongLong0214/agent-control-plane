@@ -11,7 +11,7 @@ import { acpError, allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { manifestDigest, projectManifestSchema } from "../../src/contracts/manifest.ts";
 import { digestOf } from "../../src/core/digest.ts";
-import { ArtifactKind, ExecutionMode, Role, RunKind, RunState, roleKeyFor } from "../../src/domain/types.ts";
+import { ArtifactKind, ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
 import { callCtoTool } from "../helpers/cto-tool.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -1035,19 +1035,35 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     expect(startExecution(g, impl2).allowed).toBe(true);
   });
 
-  it("review R6 P1 (adoption): superseding a task whose create is unknown is allowed when the PLAN adopts an existing issue for that work", async () => {
-    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
-    const [impl] = g.taskIds as [string];
-    g.github.fault = { suffix: "/issues", when: "late" };
-    await planSubmit(g, [{ key: "feed", tasks: [impl], issue: { new: { title: "Add feed filtering", body: "Filter" } }, milestone: { number: 1 } }]);
-    const adopted = await callCtoTool(g.h, g.owner, "plan_submit", {
-      idempotencyKey: "supersede-adopt", runId: g.runId,
-      plan: { summary: "replace the feed task", supersedesTaskIds: [impl], workUnits: [{ key: "feed", tasks: ["impl2"], issue: { number: 3 }, milestone: { number: 1 } }] },
-      tasks: [{ key: "impl2", title: "Implement the verdict feed, again", category: "implementation" }],
-    });
-    expect(tracking(adopted)).toMatchObject({ tracked: true });
-    expect(g.h.cp.tasks.get(impl)!.state).toBe("CANCELLED");
-    expect(g.github.posts("/issues")).toHaveLength(1);
+  it("review R7 P1: no adoption exception; a supersede of a task whose create is unknown is refused, however the PLAN is shaped", async () => {
+    // The PLAN adopts #3 for the unit carrying the intent's key, or (the reviewer's repro) puts an unrelated
+    // task adopting #4 into that unit and the replacement under another key with the original issue text.
+    for (const shape of ["adopt the same unit", "unrelated adoption, renamed replacement"] as const) {
+      const g = await governedRun({ legacy: [LEGACY[0]!, LEGACY[2]!] });
+      const [impl, short] = g.taskIds as [string, string];
+      const issue = { new: { title: "Add feed filtering", body: "Filter" } };
+      const shortUnit = { key: "short", tasks: [short], issue: { number: 5 }, milestone: { number: 2 } };
+      g.github.fault = { suffix: "/issues", when: "late" };
+      await planSubmit(g, [{ key: "feed", tasks: [impl], issue, milestone: { number: 1 } }, shortUnit]);
+      const plan = g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!.digest;
+      const workUnits = shape === "adopt the same unit"
+        ? [{ key: "feed", tasks: ["impl2"], issue: { number: 3 }, milestone: { number: 1 } }, shortUnit]
+        : [{ key: "feed", tasks: ["other"], issue: { number: 4 }, milestone: { number: 1 } }, { key: "feed-renamed", tasks: ["impl2"], issue, milestone: { number: 1 } }, shortUnit];
+      const tasks = shape === "adopt the same unit"
+        ? [{ key: "impl2", title: "Implement the verdict feed, again", category: "implementation" }]
+        : [{ key: "other", title: "An unrelated task", category: "implementation" }, { key: "impl2", title: "Implement the verdict feed, again", category: "implementation" }];
+      const refused = await callCtoTool(g.h, g.owner, "plan_submit", {
+        idempotencyKey: `supersede-${shape}`, runId: g.runId,
+        plan: { summary: "replace the feed task", supersedesTaskIds: [impl], workUnits },
+        tasks,
+      });
+      expect(refused, shape).toMatchObject({ ok: false, evidence: { refusal: "WORK_SCOPE_CREATION_UNRESOLVED", retryable: true } });
+      expect(g.h.cp.tasks.get(impl)!.state, shape).toBe("READY");
+      expect(g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!.digest, shape).toBe(plan);
+      expect(g.github.posts("/issues"), shape).toHaveLength(1);
+      g.github.land();
+      expect(g.github.issues.filter((i) => i.title === "Add feed filtering"), shape).toHaveLength(1);
+    }
   });
 
   it("review R6 P2: an identical resend of the current superseding work-unit PLAN with a new key is a no-op success returning its tasks", async () => {
@@ -1070,6 +1086,33 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     expect(g.h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN'`, [g.runId])!.n).toBe(plans);
     expect(g.h.cp.tasks.list(g.runId)).toHaveLength(tasks);
     expect(g.h.cp.audit.byKind("STANDARD_WORK_TASKS_SUPERSEDED").filter((row) => row.runId === g.runId)).toHaveLength(1);
+  });
+
+  it("review R7 P2: after an owner takeover, an identical resend is approved afresh for the new owner, not replayed on the old approval", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    const units = [{ key: "feed", tasks: [impl], issue: { new: { title: "Add feed filtering", body: "Filter" } }, milestone: { number: 1 } }];
+    g.github.fault = { suffix: "/issues", when: "before", status: 422 };
+    expect(tracking(await planSubmit(g, units))).toMatchObject({ tracked: false });
+    // Ownership moves to another session: the run is held, its owner revoked, a replacement bound and pinned.
+    const run = g.h.cp.runs.require(g.runId);
+    const held = g.h.cp.bindings.active(run.ownerRoleKey!)!;
+    expect(g.h.cp.runs.transition(g.runId, RunState.BLOCKED, "test hold").allowed).toBe(true);
+    expect(g.h.cp.bindings.revoke(run.ownerRoleKey!, "test takeover", { allowBlockedRuns: true }).allowed).toBe(true);
+    const other = g.h.cp.sessions.create({ provider: "scripted", model: "scripted-cto" });
+    g.h.cp.sessions.transition(other.sessionId, SessionLifecycle.READY, "the replacement owner");
+    const bound = g.h.cp.bindings.bind({ roleKey: run.ownerRoleKey!, role: held.role, sessionId: other.sessionId, projectId: g.projectId });
+    if (!bound.allowed) throw new Error(bound.message);
+    expect(g.h.cp.runs.reassignOwner(g.runId, bound.value, "a replacement took the run").allowed).toBe(true);
+    expect(g.h.cp.runs.transition(g.runId, RunState.ACTIVE, "test release").allowed).toBe(true);
+    const owner = { sessionId: other.sessionId, incarnation: g.h.cp.sessions.get(other.sessionId)!.incarnation };
+    const resent = await callCtoTool(g.h, owner, "plan_submit", { idempotencyKey: "resent-after-takeover", runId: g.runId, plan: { summary: "work units", workUnits: units } });
+    expect(resent["ok"]).toBe(true);
+    expect((resent["evidence"] as { replayed?: boolean }).replayed).toBeUndefined();
+    expect(tracking(resent)).toMatchObject({ tracked: true });
+    const approval = g.h.cp.audit.byKind("WORK_SCOPE_APPROVED").filter((row) => row.runId === g.runId).at(-1)!;
+    expect(approval.sessionId).toBe(other.sessionId);
+    expect(g.github.issues.filter((i) => i.title === "Add feed filtering")).toHaveLength(1);
   });
 
   it("a project that is not a Repo Factory project plans and is admitted as before, with no GitHub request", async () => {

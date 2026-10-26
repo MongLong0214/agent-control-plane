@@ -247,17 +247,16 @@ export class WorkScopeTracking {
     if (repeatedKeys.length > 0) return invalid("WORK_UNITS_INVALID", `unit keys ${repeatedKeys.join(", ")} are declared more than once`, { units: repeatedKeys });
     // #1239 — the tasks this PLAN supersedes are cancelled with it: they stay live in no unit.
     const superseded = new Set(Array.isArray(plan["supersedesTaskIds"]) ? (plan["supersedesTaskIds"] as unknown[]).filter((id): id is string => typeof id === "string") : []);
-    // #1240 review R6 — a create whose outcome is unknown may still land for a task this PLAN would cancel; its
-    // replacement would then get a second issue. Refused until the intent resolves, unless the PLAN adopts an
-    // existing issue (by number, verified as always) for that work: the unit carrying the intent's key.
-    const adopting = new Set(units.filter((unit) => "number" in unit.issue).map((unit) => unit.key));
-    const unsettled = this.#unknownIntents(runId).filter((intent) => intent.taskIds.some((taskId) => superseded.has(taskId)) && !adopting.has(intent.unit));
+    // #1240 reviews R6/R7 — a create whose outcome is unknown may still land for a task this PLAN would cancel;
+    // its replacement would then get a second issue. Refused until the intent resolves: its own token found and
+    // linked, or a definite 4xx retiring it. No exception: adopting an issue for other work is unaffected.
+    const unsettled = this.#unknownIntents(runId).filter((intent) => intent.taskIds.some((taskId) => superseded.has(taskId)));
     if (unsettled.length > 0) {
       return deny(ReasonCode.WORK_SCOPE_NOT_TRACKED_ON_GITHUB, "this PLAN supersedes a task whose issue create has an unknown outcome and may still land", {
         refusal: "WORK_SCOPE_CREATION_UNRESOLVED", retryable: true, runId,
         intents: unsettled.map((intent) => intent.intent),
         tasks: [...new Set(unsettled.flatMap((intent) => intent.taskIds.filter((taskId) => superseded.has(taskId))))],
-        correction: "admit the work again once GitHub has answered (ACP links the issue when its token appears) and then supersede it, or adopt an existing issue by number for that unit",
+        correction: "admit the work again once GitHub has answered (ACP links the issue when its token appears), then supersede it",
       });
     }
     const live = this.#live(runId).map((task) => task.taskId).filter((taskId) => !superseded.has(taskId));
@@ -298,8 +297,9 @@ export class WorkScopeTracking {
 
   /**
    * #1240 review R6 — an identical resend of the run's CURRENT work-unit PLAN (the same content as stored,
-   * its submission sequence aside, and the same tasks) is a no-op: the tasks its accepted submission
-   * created, and nothing is stored. Only the current PLAN counts, so A, B, A is still three submissions.
+   * its submission sequence aside, and the same tasks), approved by the run's current owner, is a no-op: the
+   * tasks its accepted submission created, and nothing is stored. Only the current PLAN counts, so A, B, A is
+   * still three submissions; after an owner takeover the resend is a normal submission the new owner approves.
    */
   replay(runId: string, stored: Record<string, unknown>, tasks: readonly unknown[]): TaskRecord[] | null {
     const governed = this.#governed(runId);
@@ -307,6 +307,8 @@ export class WorkScopeTracking {
     const current = this.ports.artifacts.latest<Record<string, unknown>>(runId, ArtifactKind.PLAN);
     const scope = this.#scope(runId);
     if (current === null || scope === null || scope.tasksDigest === undefined || scope.submittedTaskIds === undefined) return null;
+    // Only an approval its run's current owner made (ACP's own owner check) is reused; any other is approved afresh.
+    if (scope.sessionId === null || !this.ports.runs.assertOwner(runId, scope.sessionId, scope.bindingGeneration).allowed) return null;
     const { submission: _submission, ...content } = current.content;
     if (canonicalJson(content) !== canonicalJson(stored) || scope.tasksDigest !== digestOf(tasks)) return null;
     const byId = new Map(this.ports.tasks.list(runId).map((task) => [task.taskId, task] as const));
