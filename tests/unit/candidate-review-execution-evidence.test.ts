@@ -20,6 +20,8 @@ import {
   readExecutionEvidence,
 } from "../../src/review/candidate-review-evidence.ts";
 import { runtimeEnvironment } from "../../src/runtime/cli-adapters.ts";
+import { bootstrapActivationHandoff } from "../../src/bootstrap/bootstrap-plan.ts";
+import { bytesDigest, type GenesisBundle } from "../../src/bootstrap/genesis-bundle.ts";
 import { WorkerTurnEvent, type WorkerSuccessDigestInputs, workerDiffDigest, workerSuccessDigest } from "../../src/run/worker-turn.ts";
 import { candidateSnapshotDigest, type CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
 import type * as SandboxModule from "../../src/verify/sandbox.ts";
@@ -290,7 +292,10 @@ describe("an ordinary candidate review carries the official execution evidence",
       const files = Object.fromEntries(evidence.commands.map((command) => [command.commandId, command.configFiles]));
       expect(files["linked"]).toMatchObject([{ path: "package.json", state: "NOT_A_REGULAR_FILE", content: "",
         detail: "a symbolic link; it is not followed" }]);
-      expect(files["through-link"]).toMatchObject([{ path: "pkg/package.json", state: "ABSENT", content: "" }]);
+      // pkg/ is a link, so pkg/package.json is not in the tree; with it absent pnpm would search parents.
+      expect(files["through-link"]).toEqual([]);
+      expect(evidence.commands.find((command) => command.commandId === "through-link")!.configFileRule)
+        .toBe("config file not resolved: pnpm searches parent directories");
       expect(files["status"]).toEqual([]);
       expect(evidence.commands.find((command) => command.commandId === "status")!.configFileRule)
         .toBe("no config-file rule for this command; its config files are omitted, not guessed");
@@ -303,8 +308,8 @@ describe("an ordinary candidate review carries the official execution evidence",
     expect(configFileRuleFor(["pnpm", "--filter=web", "test"])).toEqual({ rule: "config file not resolved: argv selects a directory with --filter", files: [] });
     expect(configFileRuleFor(["pnpm", "-C", "sub", "run", "lint"]).files).toEqual([]);
     // The plain forms are unchanged; arguments after `--` belong to the script.
-    expect(configFileRuleFor(["npm", "test"])).toEqual({ rule: "npm reads <cwd>/package.json", files: ["package.json"] });
-    expect(configFileRuleFor(["pnpm", "run", "lint", "--", "--prefix", "x"])).toEqual({ rule: "pnpm reads <cwd>/package.json", files: ["package.json"] });
+    expect(configFileRuleFor(["npm", "test"])).toMatchObject({ rule: "npm reads <cwd>/package.json", files: ["package.json"] });
+    expect(configFileRuleFor(["pnpm", "run", "lint", "--", "--prefix", "x"])).toMatchObject({ rule: "pnpm reads <cwd>/package.json", files: ["package.json"] });
   });
 
   it("refuses a '..' or absolute path before any read; a pinned manifest cannot carry one, a run-scoped command can", async () => {
@@ -362,6 +367,9 @@ describe("official output is bounded, redacted and bound to its execution", () =
     expect(excerpt).toMatchObject({ boundaryFragmentWithheld: true, stderr: "partial stderr " });
     expect(excerpt.stdout).not.toContain(run.slice(0, 8));
     expect(excerpt.stdout.endsWith("x  ")).toBe(true);
+    // #1223 R5: every character a shape accepts is in the cut alphabet, `~` of a bearer token included.
+    const bearer = verificationOutputExcerpt(binding, "Bearer abcdefghij~klm", "", true);
+    expect(bearer).toMatchObject({ boundaryFragmentWithheld: true, stdout: "Bearer " });
     // Uncut output keeps its last word.
     expect(verificationOutputExcerpt(binding, "Tests 3 passed", "", false)).toMatchObject({ stdout: "Tests 3 passed", boundaryFragmentWithheld: false });
   });
@@ -679,4 +687,52 @@ describe("#1223: a repository path is read per segment at every path-typed evide
       expect(reviewEvidenceBundleSchema.safeParse(file(escape)).success, escape).toBe(false);
     }
   });
+});
+
+describe("#1223 R5: a serialized handoff path and an absent package.json", () => {
+  const JAVA_PATH = "src/main/java/org/apache/commons/collections4/iterators/ObjectArrayIterator.java";
+
+  const genesisWith = (path: string): GenesisBundle => {
+    const content = Buffer.from("class ObjectArrayIterator {}\n");
+    return { schema: "acp.genesis-bundle.v1", commitMessage: "Create runnable project",
+      files: [{ path, mode: "100644", contentBase64: content.toString("base64"), sha256: bytesDigest(content) }],
+      branches: { main: "main", integration: "dev", genesis: "genesis" }, labels: [], milestones: [], issues: [],
+      productIntent: { summary: "fixture", references: [], ownerInstructions: [] } } as GenesisBundle;
+  };
+
+  it("activation's HANDOFF stores a genesis with a long Java path; a credential-shaped segment there is still refused", async () => {
+    const setup = await prepareRun();
+    try {
+      const handoff = bootstrapActivationHandoff(fixtureManifest("fixture-project"), genesisWith(JAVA_PATH));
+      expect(handoff.recentDecisions[0]).toContain(JAVA_PATH);
+      const stored = setup.harness.cp.artifacts.put(setup.run.runId, "HANDOFF",
+        { handoffId: "handoff-java", projectId: "fixture-project", toSessionId: "ses", handoff, at: "t" });
+      expect(stored.digest).toMatch(/^sha256:/);
+      // The same record with one credential-shaped segment in its genesis path.
+      const forged = { ...handoff, recentDecisions: [handoff.recentDecisions[0]!.replace(JAVA_PATH, `src/${"Ab9+Zq7x".repeat(8)}.java`)] };
+      expect(() => setup.harness.cp.artifacts.put(setup.run.runId, "HANDOFF",
+        { handoffId: "handoff-forged", projectId: "fixture-project", toSessionId: "ses", handoff: forged, at: "t" })).toThrow(/credential/);
+    } finally { setup.harness.cp.close(); }
+  }, 60_000);
+
+  it("npm at a cwd without package.json claims no file, because npm searches parent directories", async () => {
+    const setup = await prepareRun([npmCommand("tools", ["npm", "test"], "tools"), npmCommand("root", ["npm", "test"])],
+      (repoPath) => writeFiles(repoPath, { "package.json": PACKAGE_JSON, "tools/run.js": "console.log(1);\n" }));
+    const { harness, run } = setup;
+    try {
+      startWorkBranch(harness.repoPath);
+      writeFiles(harness.repoPath, { "src/app.js": APP_BYTES });
+      commitAll(harness.repoPath, "make app() return 2");
+      const frozen = await harness.cp.pipeline.freeze(run.runId);
+      if (!frozen.allowed) throw new Error(frozen.message);
+      const evidence = await readExecutionEvidence(harness.cp.db, { runId: run.runId, snapshot: frozen.value,
+        snapshotDigest: candidateSnapshotDigest(frozen.value), contractDigest: run.contractDigest,
+        verification: { results: [] } as unknown as VerificationReport, checkoutOf: () => harness.repoPath });
+      const byId = new Map(evidence.commands.map((command) => [command.commandId, command]));
+      expect(byId.get("tools")).toMatchObject({ configFileRule: "config file not resolved: npm searches parent directories", configFiles: [] });
+      // Present at cwd: unchanged.
+      expect(byId.get("root")).toMatchObject({ configFileRule: "npm reads <cwd>/package.json",
+        configFiles: [{ path: "package.json", state: "INCLUDED", content: PACKAGE_JSON }] });
+    } finally { harness.cp.close(); }
+  }, 60_000);
 });

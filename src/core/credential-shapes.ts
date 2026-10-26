@@ -132,22 +132,25 @@ const shapesFor = (value: string, path: readonly string[] | undefined): readonly
 
 const holdsShape = (text: string, shapes: readonly RegExp[]): boolean => shapes.some((shape) => shape.test(text));
 
-/** Whether a record's keys or values hold a shape, each value validated as an evidence field at its path. */
-const recordHoldsShape = (value: unknown, depth: number, path: readonly string[]): boolean => {
-  if (typeof value === "string") return holdsShape(value, shapesFor(value, path));
+/**
+ * Whether a record's keys or values hold a shape, each value checked by the same field rules as the
+ * object it was serialized from, at its path inside the record (a repository path per segment).
+ */
+const recordHoldsShape = (value: unknown, depth: number, field: EvidenceField): boolean => {
+  if (typeof value === "string") return fieldHoldsShape(value, field);
   if (depth > 8) return true;
-  if (Array.isArray(value)) return value.some((item) => recordHoldsShape(item, depth + 1, path));
+  if (Array.isArray(value)) return value.some((item) => recordHoldsShape(item, depth + 1, field));
   if (value !== null && typeof value === "object") {
     return Object.entries(value).some(([key, nested]) =>
-      holdsShape(key, CREDENTIAL_SHAPES) || recordHoldsShape(nested, depth + 1, [...path, key]));
+      holdsShape(key, CREDENTIAL_SHAPES) || recordHoldsShape(nested, depth + 1, { ...field, path: [...field.path, key] }));
   }
   return false;
 };
 
-const serializedHoldsShape = (text: string): boolean => {
+const serializedHoldsShape = (text: string, store: EvidenceField["store"]): boolean => {
   let record: unknown;
   try { record = JSON.parse(text); } catch { return holdsShape(text, CREDENTIAL_SHAPES); }
-  return record !== null && typeof record === "object" ? recordHoldsShape(record, 0, []) : holdsShape(text, CREDENTIAL_SHAPES);
+  return record !== null && typeof record === "object" ? recordHoldsShape(record, 0, { path: [], store }) : holdsShape(text, CREDENTIAL_SHAPES);
 };
 
 /** Private-use marks around an index stand in for a set-aside token; text that has them already sets nothing aside. */
@@ -227,8 +230,13 @@ const GLOBAL = new Map(CREDENTIAL_SHAPES.map((shape) => [shape, new RegExp(shape
  */
 export const hasCredentialShape = (text: string, field?: EvidenceField): boolean => {
   const kind = serializedKind(field);
-  if (kind === "jsonl") return text.split("\n").some(serializedHoldsShape);
-  if (kind === "json") return serializedHoldsShape(text);
+  if (field !== undefined && kind === "jsonl") return text.split("\n").some((line) => serializedHoldsShape(line, field.store));
+  if (field !== undefined && kind === "json") return serializedHoldsShape(text, field.store);
+  return fieldHoldsShape(text, field);
+};
+
+/** One field's string, not serialized records: a repository path per segment, else the whole value. */
+const fieldHoldsShape = (text: string, field: EvidenceField | undefined): boolean => {
   if (isRepositoryPath(text, field)) return segmentsHoldShape(text);
   const aside = setAside(text, tokensFor(field));
   return holdsShape(aside.text, shapesFor(text, field?.path));
@@ -255,7 +263,8 @@ const redactSegments = (text: string): string => text.split("/").map((segment) =
  */
 export const redactCredentialShapes = (text: string, field?: EvidenceField): string => {
   const kind = serializedKind(field);
-  const asRecord = (record: string): string => (serializedHoldsShape(record) ? redactWith(record, CREDENTIAL_SHAPES) : record);
+  const asRecord = (record: string): string =>
+    (field !== undefined && serializedHoldsShape(record, field.store) ? redactWith(record, CREDENTIAL_SHAPES) : record);
   if (kind === "jsonl") return text.split("\n").map(asRecord).join("\n");
   if (kind === "json") return asRecord(text);
   if (isRepositoryPath(text, field)) return redactSegments(text);
@@ -293,16 +302,36 @@ export const redactCredentialValues = <T>(value: T, at: EvidenceField): { value:
   return { value: redacted ? out : value, redacted };
 };
 
-/** Characters a listed shape is made of, apart from the spaces some allow between parts. */
-const CREDENTIAL_ALPHABET = /[A-Za-z0-9+/=_.:-]/;
+/**
+ * The character classes the listed shapes match with (`[...]`, `\S`, `\d`, `\w`), read from the
+ * shapes themselves, so a character any shape accepts is in the cut alphabet below and no second
+ * list can drift from them.
+ */
+const SHAPE_CLASSES: readonly RegExp[] = CREDENTIAL_SHAPES.flatMap((shape) =>
+  (shape.source.match(/\[(?:\\.|[^\]\\])*\]|\\[dDwWS]/g) ?? []).map((part) => new RegExp(part, shape.flags)));
+
+const inCutAlphabet = new Map<string, boolean>();
 
 /**
- * Text cut at a byte limit with the rest unseen: the trailing run of credential-alphabet characters
- * at the cut can be the start of a shape the filter cannot see whole, so it is withheld. Scanned
- * back from the end rather than matched with `$`, which backtracks across a long run.
+ * A character a shape can be made of: one that some shape's class accepts. Whitespace, which a few
+ * shapes allow only between their parts (`Bearer <token>`, `KEY = value`), ends the run.
+ */
+const shapeCharacter = (char: string): boolean => {
+  let known = inCutAlphabet.get(char);
+  if (known === undefined) {
+    known = !/\s/.test(char) && SHAPE_CLASSES.some((part) => part.test(char));
+    inCutAlphabet.set(char, known);
+  }
+  return known;
+};
+
+/**
+ * Text cut at a byte limit with the rest unseen: the trailing run of characters a shape can be made
+ * of can be the start of a shape the filter cannot see whole, so it is withheld. Scanned back from
+ * the end rather than matched with `$`, which backtracks across a long run.
  */
 export const withholdCutFragment = (text: string): { text: string; withheld: number } => {
   let start = text.length;
-  while (start > 0 && CREDENTIAL_ALPHABET.test(text[start - 1]!)) start -= 1;
+  while (start > 0 && shapeCharacter(text[start - 1]!)) start -= 1;
   return { text: text.slice(0, start), withheld: text.length - start };
 };

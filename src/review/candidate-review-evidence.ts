@@ -298,7 +298,7 @@ const directoryOption = (args: readonly string[]): string | undefined =>
  * given a directory-selecting option claims no file and says so; no other form or executable has a
  * rule here, and none is guessed.
  */
-export const configFileRuleFor = (argv: readonly string[]): { rule: string; files: string[] } => {
+export const configFileRuleFor = (argv: readonly string[]): { rule: string; files: string[]; whenAbsent?: string } => {
   const executable = basename(argv[0] ?? "");
   if (executable === "npm" || executable === "pnpm" || executable === "yarn") {
     // Options after `--` belong to the script, not to the package manager.
@@ -310,7 +310,11 @@ export const configFileRuleFor = (argv: readonly string[]): { rule: string; file
     // Only a plain `npm|pnpm [run] <script>` runs the package.json at cwd.
     const plain = executable !== "yarn" && (own.length === 1 || (own.length === 2 && own[0] === "run"))
       && own.every((arg) => !arg.startsWith("-"));
-    if (plain) return { rule: `${executable} reads <cwd>/package.json`, files: ["package.json"] };
+    // Without a <cwd>/package.json the manager walks up to a parent's; that search is not reproduced.
+    if (plain) {
+      return { rule: `${executable} reads <cwd>/package.json`, files: ["package.json"],
+        whenAbsent: `config file not resolved: ${executable} searches parent directories` };
+    }
   }
   const entry = argv[1];
   if (executable === "node" && entry !== undefined && !entry.startsWith("-")) {
@@ -416,7 +420,7 @@ const approvedCommands = (db: Db, runId: string): { source: string; commands: Ap
 const commandEvidence = async (input: ExecutionEvidenceInput, command: ApprovedCommand): Promise<CommandEvidence> => {
   const repos = input.snapshot.repositories.filter((repo) => repo.repositoryRole === command.repositoryRole);
   const repo = repos.length === 1 ? repos[0]! : null;
-  const { rule, files } = configFileRuleFor(command.argv);
+  const { rule: declared, files, whenAbsent } = configFileRuleFor(command.argv);
   const checkout = repo === null ? null : input.checkoutOf(repo.identity);
   const configFiles: ConfigFileEvidence[] = [];
   const unread = repo === null ? "the command's repositoryRole maps to no single candidate repository" : "the repository has no local checkout";
@@ -425,6 +429,10 @@ const commandEvidence = async (input: ExecutionEvidenceInput, command: ApprovedC
       ? { path: posix.join(command.cwd, file), state: "UNREADABLE", detail: unread, chars: null, redacted: false, truncated: false, content: "" }
       : await readConfigFile(checkout, repo.candidateHead, command.cwd, file));
   }
+  // An absent <cwd>/package.json is not the file the command reads: no file is claimed, and it says so.
+  const absent = whenAbsent !== undefined && configFiles.some((file) => file.state === "ABSENT");
+  const rule = absent ? whenAbsent : declared;
+  if (absent) configFiles.length = 0;
   return {
     commandId: command.id, argv: [...command.argv], cwd: command.cwd, required: command.required,
     repositoryRole: command.repositoryRole, repository: repo?.identity ?? null, candidateHead: repo?.candidateHead ?? null,
