@@ -1,6 +1,7 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { allow } from "../../src/core/errors.ts";
@@ -258,6 +259,126 @@ class CancelledBeforeSpawnAdapter extends FakeWorkerAdapter {
       providerSessionId: null, isolationAttested: false,
       processGroup: { pgid, ownership: "UNVERIFIABLE", detail: "the witness's cleanup could not confirm the group ended" },
     };
+  }
+}
+
+/**
+ * S2 round 3 — a git on PATH that, on the first worker git call (the one that names its GIT_DIR), leaves
+ * a real child in that call's group, records the call's own pid and the child's, and runs the real git.
+ * It runs at all only if git does: a gated child that never passes its gate never reaches it.
+ */
+const gitLeavingAChildOnIntent = () => {
+  const realGit = (process.env["PATH"] ?? "").split(delimiter).map((dir) => join(dir, "git")).find((path) => existsSync(path))!;
+  const bin = tempDir("acp-s2-git-intent-");
+  const read = (name: string): number | null => (existsSync(join(bin, name)) ? Number(readFileSync(join(bin, name), "utf8").trim()) || null : null);
+  writeFileSync(join(bin, "git"), [
+    "#!/bin/sh",
+    `if [ -n "$GIT_DIR" ] && mkdir '${join(bin, "once")}' 2>/dev/null; then`,
+    `  echo $$ > '${join(bin, "leader.pid")}'`,
+    "  /bin/sleep 600 </dev/null >/dev/null 2>&1 &",
+    `  echo $! > '${join(bin, "child.pid")}'`,
+    "fi",
+    `exec '${realGit}' "$@"`,
+    "",
+  ].join("\n"));
+  chmodSync(join(bin, "git"), 0o755);
+  return { bin, leaderPid: () => read("leader.pid"), childPid: () => read("child.pid") };
+};
+
+const CRASH_CHILD = fileURLToPath(new URL("../helpers/s2-git-intent-crash-child.ts", import.meta.url));
+
+/** The live children of `parent` whose argv names a worker git gate (`acp-git-<nonce>`), from `ps`. */
+const gatesOf = (parent: number): number[] =>
+  execFileSync("/bin/ps", ["-axww", "-o", "pid=,ppid=,command="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })
+    .split("\n")
+    .map((line) => line.trim().split(/\s+/))
+    .filter(([, ppid, ...command]) => Number(ppid) === parent && command.some((token) => token.startsWith("acp-git-")))
+    .map(([pid]) => Number(pid));
+
+/** Kills, by exact pid, whatever the PATH git recorded it left behind; it may still be writing its pid. */
+const killLeftBy = async (git: { childPid: () => number | null; leaderPid: () => number | null }): Promise<void> => {
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  for (const pid of [git.childPid(), git.leaderPid()]) if (pid !== null && alive(pid)) process.kill(pid, "SIGKILL");
+};
+
+/**
+ * Runs the turn of `input.taskId` in a runner process of its own over the fixture's database, with
+ * `bin` first on its PATH, until that process is killed (`kill`) or stopped (`stop`) at the group record
+ * of its first git child. Answers the signal and whatever the process wrote.
+ */
+const crashRunner = async (
+  f: BootstrapRuntimeFixture,
+  s: StandardRun,
+  bin: string,
+  input: { taskId: string; claimId: string; ownerSessionId: string; ownerBindingGeneration: number; mode: "kill" | "stop" },
+): Promise<{ runner: ChildProcess; signal: NodeJS.Signals | null; output: string; spawned: () => number | null }> => {
+  const spawnedFile = join(bin, "spawned.pid");
+  const runner = spawn(process.execPath, ["--experimental-transform-types", CRASH_CHILD, JSON.stringify({
+    root: f.harness.root, repoPath: f.harness.repoPath, nowIso: f.harness.cp.clock.nowIso(), runId: s.runId, spawnedFile, ...input,
+  })], { env: { ...process.env, PATH: `${bin}${delimiter}${process.env["PATH"] ?? ""}` }, stdio: ["ignore", "pipe", "pipe"] });
+  let output = "";
+  runner.stdout?.on("data", (chunk: Buffer) => (output += chunk.toString("utf8")));
+  runner.stderr?.on("data", (chunk: Buffer) => (output += chunk.toString("utf8")));
+  const signal = await new Promise<NodeJS.Signals | null>((resolve) => {
+    runner.once("exit", (_code, exited) => resolve(exited));
+    if (input.mode === "stop") {
+      const watch = setInterval(() => {
+        try {
+          const state = execFileSync("/bin/ps", ["-o", "stat=", "-p", String(runner.pid)], { encoding: "utf8" });
+          if (state.trim().startsWith("T")) {
+            clearInterval(watch);
+            resolve("SIGSTOP");
+          }
+        } catch {
+          clearInterval(watch);
+        }
+      }, 50);
+      runner.once("exit", () => clearInterval(watch));
+    }
+  });
+  return {
+    runner, signal, output,
+    spawned: () => (existsSync(spawnedFile) ? Number(readFileSync(spawnedFile, "utf8").trim()) || null : null),
+  };
+};
+
+/**
+ * S2 round 3 (P1-a) — a provider cancelled before its spawn is reported, which then pauses before it
+ * answers anything: the child it launched lives, no pid is recorded, and no diagnostic exists.
+ */
+class PausedAfterRefusedSpawnAdapter extends FakeWorkerAdapter {
+  cancel: () => void = () => undefined;
+  child: ChildProcess | null = null;
+  spawnReportRefused = false;
+  #resume: (() => void) | null = null;
+  constructor(private readonly admission: ManagedInvocationWriteBroker) {
+    super(admission);
+  }
+  override async invoke(request: InvocationRequest): Promise<InvocationResult> {
+    this.launches += 1;
+    await this.admission.authorize(request.managedWrite!, async () => {
+      this.cancel();
+      await vi.waitFor(() => expect(request.signal?.aborted).toBe(true), { timeout: 5_000, interval: 20 });
+      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+      this.child = child;
+      this.children.push(child);
+      try {
+        request.onSpawn?.(child.pid!, readProcessStartToken(child.pid!));
+      } catch {
+        this.spawnReportRefused = true;
+      }
+    });
+    await new Promise<void>((resolve) => {
+      this.#resume = resolve;
+    });
+    return {
+      ok: false, text: "", json: null, provider: "claude", model: "opus", durationMs: 0, exitCode: null,
+      error: "the provider was cancelled", providerSessionId: null, isolationAttested: false,
+    };
+  }
+  /** For cleanup only: the paused provider answers. */
+  resume(): void {
+    this.#resume?.();
   }
 }
 
@@ -682,6 +803,152 @@ describe("S2 — while any writer of the previous execution may still exist, the
         Object.defineProperty(cp, "workerTurns", { value: original, configurable: true });
         if (child !== null && alive(child)) process.kill(child, "SIGKILL");
         worker.killAll();
+      }
+    });
+  });
+  it("restart after a cancel before the spawn report: a fresh runner over the same database finds the launch on record with no end, reconciles it as outstanding, and refuses the hand-over claim and task_worker_run, after the child too", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s2-cancel-paused-restart");
+      const [one, two] = s.taskIds;
+      const run = cp.runs.require(s.runId);
+      const adapter = new PausedAfterRefusedSpawnAdapter(new GuardedInvocationWriteBroker(cp.guard));
+      adapter.cancel = () => {
+        expect(cp.tasks.abandonStaleExecutions(s.runId, run.ownerBindingGeneration! + 1, "cancelled for the witness")).toBe(1);
+      };
+      workerDoing(f, { writes: {} }, adapter);
+      const original = cp.workerTurns;
+      let child: number | null = null;
+      let executionId = "";
+      try {
+        const first = await staffAndClaim(f, s, one);
+        const ran = await runTask(f, s, one, first.claimId);
+        expect(ran).toMatchObject({ ok: true });
+        executionId = executionOf(ran);
+        await vi.waitFor(() => expect(adapter.spawnReportRefused).toBe(true), { timeout: 10_000, interval: 20 });
+        child = adapter.child!.pid!;
+        expect(alive(child)).toBe(true);
+        expect(cp.tasks.execution(executionId)).toMatchObject({ status: "ABANDONED", workerProcessId: null });
+
+        // The daemon restarts while the provider is still paused, before any diagnostic exists.
+        const restarted = new WorkerTurnRunner({
+          db: cp.db, clock: cp.clock, audit: cp.audit, tasks: cp.tasks, guard: cp.guard,
+          workerAdapter: (provider: string) => cp.providers.requireForRole(provider, Role.WORKER),
+        });
+        Object.defineProperty(cp, "workerTurns", { value: restarted, configurable: true });
+        expect(await restarted.reconcileAfterRestart()).toEqual([{ executionId, outcome: "UNIDENTIFIED" }]);
+
+        const target = await provision(f, s, two);
+        const handOver = await claim(f, s, target);
+        expect(handOver).toMatchObject({ ok: false, reasonCode: ReasonCode.CLAIM_WORKTREE_CONFLICT });
+        expect(String(handOver["message"])).toMatch(/this run's claim .*never recorded/);
+        expect(statusOf(f, first.claimId)).toBe("HELD");
+
+        expect(await f.cto(s.sessionId, "resource_release", { runId: s.runId })).toMatchObject({ ok: true });
+        const taken = await claim(f, s, target);
+        expect(taken).toMatchObject({ ok: true });
+        const entered = await runTask(f, s, two, worktreeClaimOf(taken));
+        expect(entered).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
+        expect(String(entered["message"])).toMatch(/never recorded/);
+        expect(cp.tasks.executions(s.runId).filter((execution) => execution.taskId === two)).toHaveLength(0);
+
+        // Nothing names the child: with it gone, nothing proves it gone, so only the operator's release clears it.
+        process.kill(child, "SIGKILL");
+        await vi.waitFor(() => expect(alive(child!)).toBe(false), { timeout: 5_000, interval: 20 });
+        const after = await claim(f, s, target);
+        expect(after).toMatchObject({ ok: false, reasonCode: ReasonCode.CLAIM_WORKTREE_CONFLICT });
+        expect(String(after["message"])).toMatch(/never recorded/);
+      } finally {
+        Object.defineProperty(cp, "workerTurns", { value: original, configurable: true });
+        if (child !== null && alive(child)) process.kill(child, "SIGKILL");
+        adapter.resume();
+        if (executionId) await original.settled(executionId);
+        adapter.killAll();
+      }
+    });
+  });
+
+  it("crash between a git child's intent and its group record (SIGKILL, in admission): the gated child never runs git, so nothing of the run is left to write and the hand-over is admitted", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s2-git-intent-kill");
+      const [one, two] = s.taskIds;
+      const run = cp.runs.require(s.runId);
+      const first = await staffAndClaim(f, s, one);
+      const target = await provision(f, s, two);
+      const git = gitLeavingAChildOnIntent();
+      let runner: ChildProcess | null = null;
+      try {
+        const crashed = await crashRunner(f, s, git.bin, { taskId: one, claimId: first.claimId, ownerSessionId: run.ownerSessionId!, ownerBindingGeneration: run.ownerBindingGeneration!, mode: "kill" });
+        runner = crashed.runner;
+        expect(crashed.signal, crashed.output.slice(0, 2000)).toBe("SIGKILL");
+        expect(cp.tasks.executions(s.runId), "it died in admission, before any execution existed").toHaveLength(0);
+        // The git child the runner spawned, followed until it is gone, whatever it became.
+        const spawned = crashed.spawned();
+        expect(spawned, "the runner spawned its git child before it died").not.toBeNull();
+        await vi.waitFor(() => expect(alive(spawned!)).toBe(false), { timeout: 15_000, interval: 50 });
+        expect(git.leaderPid(), "the gated child never ran git").toBeNull();
+
+        const handOver = await claim(f, s, target);
+        expect(handOver, "nothing of the run can write the checkout").toMatchObject({ ok: true });
+        expect(statusOf(f, first.claimId)).toBe("RELEASED");
+        // On record: the intent, no group, and its end, proven once its gate was gone from the process table.
+        const recorded = (kind: string) => cp.audit.byKind(kind).filter((row) => row.runId === s.runId).map((row) => row.evidence);
+        expect(recorded("TASK_WORKER_GIT_INTENT")).toHaveLength(1);
+        expect(recorded("TASK_WORKER_GIT_GROUP_STARTED")).toHaveLength(0);
+        expect(recorded("TASK_WORKER_GIT_GROUP_ENDED")).toMatchObject([{ proven: "GATE_GONE" }]);
+      } finally {
+        if (runner?.pid !== undefined && runner.exitCode === null && runner.signalCode === null) process.kill(runner.pid, "SIGKILL");
+        await killLeftBy(git);
+      }
+    });
+  });
+
+  it("a runner frozen between a git child's intent and its group record (SIGSTOP, in admission): its gated child lives on, and the next runner refuses the hand-over claim and task_worker_run until that child is killed by its exact pid", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s2-git-intent-stop");
+      const [one, two] = s.taskIds;
+      const run = cp.runs.require(s.runId);
+      const first = await staffAndClaim(f, s, one);
+      const target = await provision(f, s, two);
+      const git = gitLeavingAChildOnIntent();
+      let runner: ChildProcess | null = null;
+      let gated: number | null = null;
+      try {
+        const frozen = await crashRunner(f, s, git.bin, { taskId: one, claimId: first.claimId, ownerSessionId: run.ownerSessionId!, ownerBindingGeneration: run.ownerBindingGeneration!, mode: "stop" });
+        runner = frozen.runner;
+        expect(frozen.signal, frozen.output.slice(0, 2000)).toBe("SIGSTOP");
+        expect(gatesOf(runner.pid!), "the git child lives, waiting at its gate").toHaveLength(1);
+        gated = gatesOf(runner.pid!)[0]!;
+
+        const handOver = await claim(f, s, target);
+        expect(handOver).toMatchObject({ ok: false, reasonCode: ReasonCode.CLAIM_WORKTREE_CONFLICT });
+        expect(String(handOver["message"])).toMatch(/this run's claim .*git child .*still running/);
+        expect(statusOf(f, first.claimId)).toBe("HELD");
+
+        expect(await f.cto(s.sessionId, "resource_release", { runId: s.runId })).toMatchObject({ ok: true });
+        const taken = await claim(f, s, target);
+        expect(taken).toMatchObject({ ok: true });
+        const entered = await runTask(f, s, two, worktreeClaimOf(taken));
+        expect(entered).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
+        expect(String(entered["message"])).toMatch(/git child .*still running .*no task of the run enters the checkout/);
+        const again = await claim(f, s, target);
+        expect(again, "nor a hand-over of that claim").toMatchObject({ ok: false, reasonCode: ReasonCode.CLAIM_WORKTREE_CONFLICT });
+
+        // Killed, it is a zombie its frozen parent cannot reap: no longer a process that can run git.
+        process.kill(gated, "SIGKILL");
+        await vi.waitFor(() => expect(gatesOf(runner!.pid!)).toEqual([]), { timeout: 5_000, interval: 20 });
+        const passed = await claim(f, s, target);
+        expect(passed, "the hand-over once the child has exited").toMatchObject({ ok: true });
+        expect(git.leaderPid(), "the gated child never ran git").toBeNull();
+        const recorded = (kind: string) => cp.audit.byKind(kind).filter((row) => row.runId === s.runId);
+        expect(recorded("TASK_WORKER_GIT_INTENT")).toHaveLength(1);
+        expect(recorded("TASK_WORKER_GIT_GROUP_STARTED")).toHaveLength(0);
+      } finally {
+        if (runner?.pid !== undefined && runner.exitCode === null) process.kill(runner.pid, "SIGKILL");
+        if (gated !== null && alive(gated)) process.kill(gated, "SIGKILL");
+        await killLeftBy(git);
       }
     });
   });

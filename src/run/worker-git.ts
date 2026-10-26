@@ -1,5 +1,5 @@
-import { type ChildProcess, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   copyFileSync,
@@ -96,13 +96,59 @@ export interface GitProcessGroup {
 }
 
 /**
- * S2 — what records a turn's git groups durably, so a daemon that restarts still sees one that lives
- * on: `started` at the spawn (false when the record could not be written), `ended` once confirmed empty.
+ * S2 — what records a turn's git groups durably and ahead, so a daemon that restarts, or one killed at
+ * any instant, still sees one that may live on: `intended` before the spawn, under a nonce (false when
+ * it could not be written: nothing is spawned); `started` with the group once spawned (false when it
+ * could not be written: the child never runs git); `ended` once the group is confirmed empty or was
+ * never spawned.
  */
 export interface GitGroupRecorder {
-  started(group: GitProcessGroup): boolean;
-  ended(group: GitProcessGroup): void;
+  intended(nonce: string): boolean;
+  started(nonce: string, group: GitProcessGroup): boolean;
+  ended(nonce: string, group: GitProcessGroup | null): void;
 }
+
+/**
+ * S2 — a worker git child is spawned as this gate, its argv[0] naming its intent (`GIT_GATE_NAME` +
+ * nonce): it runs git, in place and in the same process group, only on reading `go`, which the runner
+ * writes only once the group is on record. A runner that dies first closes the pipe, and the gate
+ * exits without ever running git. So git runs only as a recorded group, and a gate still waiting is
+ * found by its argv (`gatedGitChildren`).
+ */
+const GIT_GATE = 'IFS= read -r gate || exit 97; [ "$gate" = go ] || exit 97; exec git "$@"';
+export const GIT_GATE_NAME = "acp-git-";
+
+/**
+ * S2 — which of `nonces` a live process still carries as its gate's name (`GIT_GATE_NAME` + nonce, one
+ * whole argument), read from `ps` as the release repair reads it. null when the table cannot be read,
+ * or does not list this process itself: then nothing is proven gone.
+ */
+export const gatedGitChildren = (nonces: readonly string[]): Set<string> | null => {
+  if (nonces.length === 0) return new Set();
+  let table: string;
+  try {
+    table = execFileSync("/bin/ps", ["-axww", "-o", "pid=,command="], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: 15_000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch {
+    return null;
+  }
+  const wanted = new Map(nonces.map((nonce) => [`${GIT_GATE_NAME}${nonce}`, nonce]));
+  const carried = new Set<string>();
+  let listsItself = false;
+  for (const line of table.split("\n")) {
+    const tokens = line.trim().split(/\s+/);
+    if (tokens[0] === String(process.pid)) listsItself = true;
+    for (const token of tokens.slice(1)) {
+      const nonce = wanted.get(token);
+      if (nonce !== undefined) carried.add(nonce);
+    }
+  }
+  return listsItself ? carried : null;
+};
 
 export interface GitChildrenClosed {
   /** Every group was emptied: its leader seen to exit and no member left (`kill(-pgid, 0)` is ESRCH). */
@@ -130,7 +176,7 @@ export interface GitChildrenClosed {
 export class GitChildren {
   #closed = false;
   #retired = false;
-  readonly #groups = new Map<number, { child: ChildProcess; leaderExited: boolean; leaderStartedAt: string | null }>();
+  readonly #groups = new Map<number, { child: ChildProcess; leaderExited: boolean; leaderStartedAt: string | null; nonce: string }>();
   #heldIndexLock: string | null = null;
   #recorder: GitGroupRecorder | null = null;
 
@@ -153,32 +199,56 @@ export class GitChildren {
     return this.#retired && this.liveGroups().length === 0;
   }
 
-  /** Records a child's group the moment the child is spawned. */
-  track(child: ChildProcess): void {
+  /**
+   * S2 — before a spawn: a fresh nonce whose intent is recorded, durably, before the child exists. null
+   * when the intent could not be recorded: the child is then never spawned.
+   */
+  intend(): string | null {
+    const nonce = randomUUID();
+    if (!this.#recorder) return nonce;
+    try {
+      return this.#recorder.intended(nonce) ? nonce : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** S2 — an intended child that was never spawned. */
+  abandon(nonce: string): void {
+    this.#recorder?.ended(nonce, null);
+  }
+
+  /**
+   * Records a child's group the moment the child is spawned, against the intent it was spawned under.
+   * Whether the group is on record: only then may a gated child run git.
+   */
+  track(child: ChildProcess, nonce: string = randomUUID()): boolean {
     const pgid = child.pid;
-    if (pgid === undefined) return;
-    const entry = { child, leaderExited: false, leaderStartedAt: readProcessStartToken(pgid) };
+    if (pgid === undefined) {
+      this.abandon(nonce);
+      return false;
+    }
+    const entry = { child, leaderExited: false, leaderStartedAt: readProcessStartToken(pgid), nonce };
     this.#groups.set(pgid, entry);
-    // A group that cannot be recorded does not run: it is killed at once, and stays registered until empty.
-    if (this.#recorder && !this.#recorder.started({ pgid, leaderStartedAt: entry.leaderStartedAt })) {
-      try {
-        process.kill(-pgid, "SIGKILL");
-      } catch {
-        /* already gone */
-      }
+    let recorded = true;
+    try {
+      recorded = this.#recorder?.started(nonce, { pgid, leaderStartedAt: entry.leaderStartedAt }) ?? true;
+    } catch {
+      recorded = false;
     }
     child.once("exit", () => {
       entry.leaderExited = true;
       // Released only when nothing is left in the group; a descendant keeps it registered.
       if (groupGone(pgid, entry)) this.drop(pgid);
     });
+    return recorded;
   }
 
   private drop(pgid: number): void {
     const entry = this.#groups.get(pgid);
     if (!entry) return;
     this.#groups.delete(pgid);
-    this.#recorder?.ended({ pgid, leaderStartedAt: entry.leaderStartedAt });
+    this.#recorder?.ended(entry.nonce, { pgid, leaderStartedAt: entry.leaderStartedAt });
   }
 
   /** Groups still registered after dropping every one confirmed empty. */
@@ -416,12 +486,23 @@ export const runPinnedGit = (
       ...CONTROL_PLANE_IDENTITY,
       ...(options.extraEnv ?? {}),
     };
+    // S2 — write-ahead: the intent is on record before the child exists, and the child runs git only
+    // once its group is on record too (`GIT_GATE`).
+    const nonce = repo.children.intend();
+    if (nonce === null) {
+      resolveRun({ stdout: "", stderr: "the git command's intent could not be recorded; it is not started", exitCode: null });
+      return;
+    }
     let child: ReturnType<typeof spawn>;
+    let admitted: boolean;
     try {
       // Its own process group, so a stopping daemon can stop it whole (ACP-WORKER-03).
-      child = spawn("git", [...GIT_HARDENING, ...args], { cwd: repo.workTree, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
-      repo.children.track(child);
+      child = spawn("/bin/sh", ["-c", GIT_GATE, `${GIT_GATE_NAME}${nonce}`, ...GIT_HARDENING, ...args], {
+        cwd: repo.workTree, env, stdio: ["pipe", "pipe", "pipe"], detached: true,
+      });
+      admitted = repo.children.track(child, nonce);
     } catch (error) {
+      repo.children.abandon(nonce);
       resolveRun({ stdout: "", stderr: error instanceof Error ? error.message : String(error), exitCode: null });
       return;
     }
@@ -451,7 +532,13 @@ export const runPinnedGit = (
     child.on("error", () => finish(null));
     child.on("close", (code, signal) => finish(signal ? null : code));
     child.stdin?.on("error", () => undefined);
-    child.stdin?.end(options.input ?? "");
+    if (admitted) {
+      child.stdin?.write("go\n");
+      child.stdin?.end(options.input ?? "");
+    } else {
+      // Its group is not on record: the gate reads end of input and exits without running git.
+      child.stdin?.end();
+    }
   });
 
 const must = async (repo: PinnedRepository, args: readonly string[], options: Parameters<typeof runPinnedGit>[2] = {}): Promise<string> => {

@@ -45,6 +45,7 @@ import {
   parentOf,
   pinRepository,
   plumbingWorkerCommit,
+  gatedGitChildren,
   type GitChildren,
   type GitChildrenClosed,
   type GitRun,
@@ -104,6 +105,16 @@ const GIT_REAP_RETRY_MS = 10_000;
  */
 export const TASK_WORKER_GIT_GROUP_STARTED = "TASK_WORKER_GIT_GROUP_STARTED";
 export const TASK_WORKER_GIT_GROUP_ENDED = "TASK_WORKER_GIT_GROUP_ENDED";
+/** S2 — written before a worker git child is spawned: run, checkout and the nonce its gate is named by (`GIT_GATE_NAME`). */
+export const TASK_WORKER_GIT_INTENT = "TASK_WORKER_GIT_INTENT";
+/**
+ * S2 — written before a turn's provider is invoked, so before it can spawn anything; and its end, once
+ * the provider answered with its own process group confirmed ended or nothing spawned (#1104), whatever
+ * the pid. An intent with no end, no recorded pid and no group to watch is an outstanding writer that
+ * only the operator's orphan release clears (`settledWriter`, `reconcileAfterRestart`).
+ */
+export const TASK_WORKER_LAUNCH_INTENT = "TASK_WORKER_LAUNCH_INTENT";
+export const TASK_WORKER_LAUNCH_ENDED = "TASK_WORKER_LAUNCH_ENDED";
 
 /** Audit kinds this runner writes; `describe` reads them back. */
 export const WorkerTurnEvent = {
@@ -663,38 +674,35 @@ export class WorkerTurnRunner {
     const worktree = facts.claim.worktree;
     this.#gitRegistries.add(children);
     this.#registryWorktrees.set(children, worktree);
-    const recorded = new Map<number, number>();
+    const record = (kind: string, evidence: Record<string, unknown>): Decision<number> =>
+      this.ports.audit.record({
+        kind,
+        runId: facts.runId,
+        sessionId: facts.worker.sessionId,
+        roleKey: facts.worker.roleKey,
+        evidence: { worktreeId: worktree, taskId: facts.taskId, ...evidence } as Evidence,
+      });
     children.record({
-      started: (group) => {
+      intended: (nonce) => {
         try {
-          const written = this.ports.audit.record({
-            kind: TASK_WORKER_GIT_GROUP_STARTED,
-            runId: facts.runId,
-            sessionId: facts.worker.sessionId,
-            roleKey: facts.worker.roleKey,
-            evidence: { worktreeId: worktree, taskId: facts.taskId, pgid: group.pgid, leaderStartedAt: group.leaderStartedAt },
-          });
-          if (!written.allowed) return false;
-          recorded.set(group.pgid, written.value);
-          return true;
+          return record(TASK_WORKER_GIT_INTENT, { nonce }).allowed;
         } catch {
           return false;
         }
       },
-      ended: (group) => {
-        const startedEventId = recorded.get(group.pgid);
-        if (startedEventId === undefined) return;
-        recorded.delete(group.pgid);
+      started: (nonce, group) => {
         try {
-          this.ports.audit.record({
-            kind: TASK_WORKER_GIT_GROUP_ENDED,
-            runId: facts.runId,
-            sessionId: facts.worker.sessionId,
-            roleKey: facts.worker.roleKey,
-            evidence: { worktreeId: worktree, taskId: facts.taskId, pgid: group.pgid, startedEventId },
-          });
+          return record(TASK_WORKER_GIT_GROUP_STARTED, { nonce, pgid: group.pgid, leaderStartedAt: group.leaderStartedAt }).allowed;
         } catch {
-          // Unrecorded, the group stays started on record and is asked again, live, whenever it matters.
+          // Unrecorded, the child is never let through its gate.
+          return false;
+        }
+      },
+      ended: (nonce, group) => {
+        try {
+          record(TASK_WORKER_GIT_GROUP_ENDED, { nonce, pgid: group?.pgid ?? null });
+        } catch {
+          // Unrecorded, the intent stays open and is proven gone live whenever it matters.
         }
       },
     });
@@ -788,6 +796,11 @@ export class WorkerTurnRunner {
         }
       } else if (unresolvedUnidentifiedOrphans(this.ports.db, { executionId: row.execution_id }).length > 0) {
         return { reason: `execution ${row.execution_id} may have launched a process that was never recorded`, evidence };
+      } else if (this.launchUnended(runId, row.execution_id)) {
+        return {
+          reason: `execution ${row.execution_id} may have launched a process that was never recorded: its launch has no recorded end`,
+          evidence,
+        };
       }
       const unended = this.unendedGroupOf(runId, row.execution_id);
       if (unended !== null) {
@@ -801,38 +814,59 @@ export class WorkerTurnRunner {
   }
 
   /**
-   * S2 — a git group a turn of the run started on the checkout, recorded at its spawn with no record of
-   * its end, that is not confirmed gone now: its leader and every member gone, or its id held by another
-   * process. This is what a restarted daemon has in place of the registries the last one held. A record
-   * that cannot be read, or names no group, counts as a live one.
+   * S2 — a worker git child of the run on the checkout whose intent is on record with no end, and that
+   * is not proven gone: its recorded group not confirmed gone (`confirmedGone`); or, with no group on
+   * record, its gate still waiting in the process table (`gatedGitChildren`), or a table that cannot be
+   * read. A gate with no group on record never ran git and never will once its runner is gone, so one
+   * not in the table is gone, and is recorded ended so it is not proven again. A record that cannot be
+   * read counts as a live child. This is what a restarted daemon has in place of the registries the last
+   * one held, the admission window before an execution exists included.
    */
   private recordedGitGroup(runId: string, worktree: string): number | null {
-    const events = (kind: string): Array<{ eventId: number; evidence: Record<string, unknown> | null }> =>
+    const events = (kind: string): Array<Record<string, unknown> | null> =>
       this.ports.db
-        .all<{ event_id: number; evidence_json: string }>(
-          `SELECT event_id, evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`,
+        .all<{ evidence_json: string }>(
+          `SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`,
           [kind, runId],
         )
         .map((row) => {
           try {
             const parsed = JSON.parse(row.evidence_json) as unknown;
-            return { eventId: row.event_id, evidence: typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : null };
+            return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : null;
           } catch {
-            return { eventId: row.event_id, evidence: null };
+            return null;
           }
         });
-    const ended = new Set(events(TASK_WORKER_GIT_GROUP_ENDED).map((event) => event.evidence?.["startedEventId"]));
-    for (const started of events(TASK_WORKER_GIT_GROUP_STARTED)) {
-      if (ended.has(started.eventId)) continue;
-      if (started.evidence === null) return -1;
-      if (started.evidence["worktreeId"] !== worktree) {
-        if (typeof started.evidence["worktreeId"] === "string") continue;
-        return -1;
+    const intents = events(TASK_WORKER_GIT_INTENT);
+    if (intents.length === 0) return null;
+    const ended = new Set(events(TASK_WORKER_GIT_GROUP_ENDED).map((evidence) => evidence?.["nonce"]));
+    const groups = new Map<unknown, Record<string, unknown>>();
+    for (const evidence of events(TASK_WORKER_GIT_GROUP_STARTED)) if (evidence) groups.set(evidence["nonce"], evidence);
+    const open: string[] = [];
+    for (const intent of intents) {
+      const nonce = intent?.["nonce"];
+      if (typeof nonce !== "string" || typeof intent?.["worktreeId"] !== "string") return -1;
+      if (intent["worktreeId"] !== worktree || ended.has(nonce)) continue;
+      const group = groups.get(nonce);
+      if (group) {
+        const pgid = Number(group["pgid"]);
+        if (!Number.isSafeInteger(pgid) || pgid <= 1) return -1;
+        const leaderStartedAt = typeof group["leaderStartedAt"] === "string" ? group["leaderStartedAt"] : null;
+        if (!this.confirmedGone(pgid, leaderStartedAt)) return pgid;
       }
-      const pgid = Number(started.evidence["pgid"]);
-      const leaderStartedAt = started.evidence["leaderStartedAt"];
-      if (!Number.isSafeInteger(pgid) || pgid <= 1) return -1;
-      if (!this.confirmedGone(pgid, typeof leaderStartedAt === "string" ? leaderStartedAt : null)) return pgid;
+      open.push(nonce);
+    }
+    // A group on record and confirmed gone needs nothing more; a gate with no group on record is looked for.
+    const gated = open.filter((nonce) => !groups.has(nonce));
+    const waiting = gatedGitChildren(gated);
+    if (waiting === null) return -1;
+    if (gated.some((nonce) => waiting.has(nonce))) return -1;
+    for (const nonce of open) {
+      this.ports.audit.record({
+        kind: TASK_WORKER_GIT_GROUP_ENDED,
+        runId,
+        evidence: { worktreeId: worktree, nonce, pgid: Number(groups.get(nonce)?.["pgid"] ?? 0) || null, proven: groups.has(nonce) ? "GROUP_GONE" : "GATE_GONE" },
+      });
     }
     return null;
   }
@@ -842,6 +876,70 @@ export class WorkerTurnRunner {
    * with the execution's diagnostics, that is still not seen gone; one that cannot be named counts as
    * not gone. A cancel before the spawn was reported leaves exactly this with no recorded pid.
    */
+  /**
+   * S2 — a launch on record (`TASK_WORKER_LAUNCH_INTENT`) with no recorded end, no process group the
+   * provider named to watch instead, and no orphan record (an unresolved one blocks by itself; the
+   * operator's release of one is its end). Read for an execution with no recorded pid.
+   */
+  private launchUnended(runId: string, executionId: string): boolean {
+    const recorded = (kind: string): boolean => Boolean(this.ports.db.get<{ n: number }>(
+      `SELECT 1 AS n FROM audit_events WHERE kind = ? AND run_id = ? AND json_extract(evidence_json, '$.executionId') = ? LIMIT 1`,
+      [kind, runId, executionId],
+    ));
+    if (!recorded(TASK_WORKER_LAUNCH_INTENT) || recorded(TASK_WORKER_LAUNCH_ENDED) || recorded(ORPHAN_UNIDENTIFIED_EVENT)) return false;
+    return !this.eventsFor(runId, executionId).some((event) => event.evidence["processGroup"] !== undefined && event.evidence["processGroup"] !== null);
+  }
+
+  /** S2 — writes a launch record for `executionId`; false when it could not be written. */
+  private recordLaunch(facts: TurnFacts, executionId: string, kind: string, evidence: Record<string, unknown>): boolean {
+    try {
+      return this.ports.audit.record({
+        kind,
+        runId: facts.runId,
+        sessionId: facts.worker.sessionId,
+        roleKey: facts.worker.roleKey,
+        evidence: { executionId, taskId: facts.taskId, worktreeId: facts.claim.worktree, ...evidence } as Evidence,
+      }).allowed;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * S2 — once the provider answered: its launch ended when it named no process group left behind and
+   * its pid, if one was recorded, is released. A provider that threw left no answer at all: with no pid
+   * recorded, that is an unidentified orphan now, exactly as a restart would find it, and only the
+   * operator's release clears it. Written before the turn's own outcome, which stays its last record.
+   */
+  private recordLaunchEnd(facts: TurnFacts, executionId: string, result: InvocationResult | null): void {
+    const execution = this.ports.tasks.execution(executionId);
+    const pid = execution?.workerProcessId ?? null;
+    if (result !== null && result.processGroup === undefined && (pid === null || execution?.workerProcessReleasedAt !== null)) {
+      this.recordLaunch(facts, executionId, TASK_WORKER_LAUNCH_ENDED, { how: pid === null ? "NO_PROCESS_LEFT" : "PROCESS_RELEASED" });
+      return;
+    }
+    if (result === null && pid === null) {
+      this.ports.audit.record({
+        kind: WorkerTurnEvent.ORPHAN_UNIDENTIFIED,
+        runId: facts.runId,
+        sessionId: facts.worker.sessionId,
+        evidence: {
+          executionId,
+          taskId: facts.taskId,
+          status: execution?.status ?? null,
+          reason: "the provider launch ended with no answer and no recorded process",
+          pid: null,
+          recordedStartedAt: null,
+          observedStartedAt: null,
+          claimsOnPid: 0,
+          ownership: null,
+          killed: false,
+          reexecutionBlocked: true,
+        },
+      });
+    }
+  }
+
   private unendedGroupOf(runId: string, executionId: string): number | null {
     for (const event of this.eventsFor(runId, executionId)) {
       const group = event.evidence["processGroup"];
@@ -934,7 +1032,7 @@ export class WorkerTurnRunner {
       let observed: string | null = null;
       let ownership: ProcessOwnership | null = null;
       if (pid === null) {
-        outcome = this.launchWasAuthorised(row.execution_id) ? "UNIDENTIFIED" : "NEVER_LAUNCHED";
+        outcome = this.launchWasAuthorised(row.execution_id) || this.launchUnended(row.run_id, row.execution_id) ? "UNIDENTIFIED" : "NEVER_LAUNCHED";
       } else if (this.releaseIfGone(row.execution_id, pid, recorded)) {
         outcome = "GONE";
       } else {
@@ -980,6 +1078,34 @@ export class WorkerTurnRunner {
         },
       });
       outcomes.push({ executionId: row.execution_id, outcome });
+    }
+    // S2 — an execution that ended (a cancel, a takeover) while its provider's launch was still open:
+    // no pid to confirm gone and no end on record, so it is outstanding, as an unidentified orphan.
+    for (const row of this.ports.db.all<{ execution_id: string; run_id: string; task_id: string; worker_session_id: string; status: string }>(
+      `SELECT execution_id, run_id, task_id, worker_session_id, status FROM task_executions
+        WHERE runtime_managed = 1 AND status <> 'RUNNING' AND worker_process_id IS NULL
+        ORDER BY execution_id`,
+    )) {
+      if (!this.launchUnended(row.run_id, row.execution_id)) continue;
+      this.ports.audit.record({
+        kind: WorkerTurnEvent.ORPHAN_UNIDENTIFIED,
+        runId: row.run_id,
+        sessionId: row.worker_session_id,
+        evidence: {
+          executionId: row.execution_id,
+          taskId: row.task_id,
+          status: row.status,
+          reason: `restart found the runtime-managed execution (${row.status}) with a launch on record and no end: UNIDENTIFIED`,
+          pid: null,
+          recordedStartedAt: null,
+          observedStartedAt: null,
+          claimsOnPid: 0,
+          ownership: null,
+          killed: false,
+          reexecutionBlocked: true,
+        },
+      });
+      outcomes.push({ executionId: row.execution_id, outcome: "UNIDENTIFIED" });
     }
     return outcomes;
   }
@@ -1713,6 +1839,7 @@ export class WorkerTurnRunner {
     let spawned = false;
     let result: InvocationResult | null = null;
     let thrown: string | null = null;
+    let launchRecorded = false;
     const timer = setTimeout(() => {
       timedOut = true;
       controller.abort();
@@ -1728,6 +1855,10 @@ export class WorkerTurnRunner {
     try {
       // Stopped between admission and launch (a shutdown, a cancel or a takeover): nothing is launched.
       if (controller.signal.aborted) throw new Error("the turn was stopped before its provider was launched");
+      // S2 — write-ahead: the launch is on record before the provider can spawn anything, whether or not
+      // it ever answers.
+      launchRecorded = this.recordLaunch(facts, executionId, TASK_WORKER_LAUNCH_INTENT, {});
+      if (!launchRecorded) throw new Error("the provider launch could not be recorded ahead; it is not launched");
       result = await adapter.invoke({
         prompt: workerPrompt(facts),
         workdir: facts.claim.worktree,
@@ -1771,6 +1902,7 @@ export class WorkerTurnRunner {
 
     // The process this turn launched must be gone before anything it may have written is read.
     const processGone = await this.settleProcess(executionId);
+    if (launchRecorded) this.recordLaunchEnd(facts, executionId, result);
     try {
       await this.conclude(facts, executionId, { result, thrown, spawned, timedOut, stopped, processGone, stopping: inFlight.stopping });
     } catch (error) {
