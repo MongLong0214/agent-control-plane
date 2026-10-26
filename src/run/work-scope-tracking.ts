@@ -74,6 +74,8 @@ export interface TrackedUnit {
   declarationDigest: string;
   /** The link and task set this verification holds for (`scopeDigestOf`). */
   scopeDigest: string;
+  /** The tasks the unit covered when verified: an issue tracks its tasks' work under any unit key. */
+  taskIds?: string[];
   /** The approval the verification was made for; a scope change after it makes the verification stale. */
   approvalEventId?: number;
   issueNumber: number;
@@ -92,6 +94,7 @@ export type UnmetKind =
   | "ISSUE_NOT_FOUND"
   | "ISSUE_EXISTS"
   | "DUPLICATE_OF_ADOPTED"
+  | "TASK_ALREADY_TRACKED"
   | "CATCH_ALL_ISSUE"
   | "MILESTONE_LINK_MISSING"
   | "MILESTONE_LINK_WRONG";
@@ -136,14 +139,19 @@ const INTERNAL_ID = /\b(?:prj|repo|ses|run|task|art|clm|msg|asg)_[0-9a-f]{24}\b/
 // path is an absolute one under a home or system root, a home-relative one (~/, ~user/), one through the
 // home environment ($HOME/, ${HOME}/, %USERPROFILE%\, %HOMEPATH%\) or a Windows drive path (C:\, C:/).
 const LOCAL_PATH = /(?:^|[^A-Za-z0-9._~-])(?:\/(?:Users|home|private|var|tmp|opt|etc|root)\/|~[A-Za-z0-9._-]*\/|\$\{?HOME\}?[\\/]|%(?:USERPROFILE|HOMEPATH)%[\\/]|[A-Za-z]:[\\/])/im;
-// A URL with a host names a path on that host, not on this machine: its scheme, host and path are set
-// aside before the screen; its query and fragment are still screened.
-const HOSTED_URL = /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s/?#]+[^\s?#]*/g;
+// Only an http(s) URL with a real host names a path on another machine: its scheme, host and path are set
+// aside before the screen (its query and fragment are still screened). A loopback host is this machine.
+const HOSTED_URL = /\bhttps?:\/\/(?!(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?=[:/?#\s]|$))[^\s/?#]+[^\s?#]*/gi;
+// Any other URL keeps its path in the screen: its scheme and authority are dropped, so the path starts at
+// a boundary. A file URL names a local file whatever its host, and is never published.
+const URL_AUTHORITY = /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s/?#]*/g;
+const FILE_URL = /(?:^|[^A-Za-z0-9+.-])file:\/\//i;
 
 /** Why a PLAN text may not be published as written, or null. */
 const unpublishable = (text: string): string | null => {
   if (INTERNAL_ID.test(text)) return "an internal ACP id";
-  if (LOCAL_PATH.test(text.replace(HOSTED_URL, " "))) return "a local filesystem path";
+  const remote = text.replace(HOSTED_URL, " ");
+  if (FILE_URL.test(remote) || LOCAL_PATH.test(remote.replace(URL_AUTHORITY, " "))) return "a local filesystem path";
   try {
     screenPublicText(text);
   } catch {
@@ -227,9 +235,10 @@ export class WorkScopeTracking {
       if (seen !== undefined && seen !== unit.milestone.new.description) return invalid("WORK_UNITS_NEW_MILESTONE_CONFLICT", "one new milestone is declared with two descriptions", { milestone: unit.milestone.new.title });
       milestones.set(title, unit.milestone.new.description);
     }
+    // Each published field on its own: a whole-value shape (a bare key) is only seen in the field it fills.
     const texts = units.flatMap((unit) => [
-      ...("new" in unit.issue ? [{ unit: unit.key, field: "issue", text: `${unit.issue.new.title}\n${unit.issue.new.body}` }] : []),
-      ...("new" in unit.milestone ? [{ unit: unit.key, field: "milestone", text: `${unit.milestone.new.title}\n${unit.milestone.new.description}` }] : []),
+      ...("new" in unit.issue ? [{ unit: unit.key, field: "issue title", text: unit.issue.new.title }, { unit: unit.key, field: "issue body", text: unit.issue.new.body }] : []),
+      ...("new" in unit.milestone ? [{ unit: unit.key, field: "milestone title", text: unit.milestone.new.title }, { unit: unit.key, field: "milestone description", text: unit.milestone.new.description }] : []),
     ]);
     const leaks = texts.flatMap(({ unit, field, text }) => {
       const why = unpublishable(text);
@@ -347,6 +356,11 @@ export class WorkScopeTracking {
     const declarations = this.#declarations(runId);
     const created = this.#created(runId);
     const adoptedBefore = new Map(this.#trackedRecords(runId, governed).filter((unit) => unit.adopted).map((unit) => [unit.unit, unit.issueNumber] as const));
+    // The issues that already track each task's work, verified or created, under whatever unit key it had.
+    const trackedByTask = new Map<string, Set<number>>();
+    for (const link of [...this.#trackedRecords(runId, governed), ...this.#createdIssues(runId)]) {
+      for (const taskId of link.taskIds ?? []) trackedByTask.set(taskId, (trackedByTask.get(taskId) ?? new Set()).add(link.issueNumber));
+    }
     const unmet: UnmetWork[] = [];
     // The only bodies a POST may carry: exactly the PLAN's new milestones and issues, with their markers.
     const planned: Array<{ path: "milestones" | "issues"; title: string; text: string }> = [];
@@ -424,13 +438,20 @@ export class WorkScopeTracking {
                 unmet.push({ unit: approved.unit, unmet: "DUPLICATE_OF_ADOPTED", issues: [before], correction: `this unit was linked to existing issue #${before}; keep adopting it rather than creating a duplicate` });
                 continue;
               }
+              // Renaming a unit does not make its tasks' work new: a task an issue already tracks is adopted.
+              const tracked = approved.taskIds.flatMap((taskId) => [...(trackedByTask.get(taskId) ?? [])].map((n) => [taskId, n] as const));
+              if (tracked.length > 0) {
+                const [taskId, number] = tracked[0]!;
+                unmet.push({ unit: approved.unit, unmet: "TASK_ALREADY_TRACKED", issues: [...new Set(tracked.map(([, n]) => n))], correction: `task ${taskId} is already tracked by #${number}; adopt it by number` });
+                continue;
+              }
               const clash = resources.issues.find((i) => sameTitle(i.title, title));
               if (clash !== undefined) {
                 unmet.push({ unit: approved.unit, unmet: "ISSUE_EXISTS", issues: [clash.number], correction: `issue #${clash.number} already has this title; adopt it by number rather than create a duplicate` });
                 continue;
               }
               issue = await github.createWorkIssue!(target, repositoryNodeId, { title, body: withMarker(body, marker), milestone: milestone.number });
-              this.#recordCreated(runId, "issue", { unit: approved.unit }, issue);
+              this.#recordCreated(runId, "issue", { unit: approved.unit, taskIds: approved.taskIds }, issue);
               created.set(`issue:${approved.unit}`, issue);
               resources.issues.push(issue);
             }
@@ -465,7 +486,7 @@ export class WorkScopeTracking {
       else if (claimed.get(issue.number) !== unit) unmet.push({ unit, unmet: "CATCH_ALL_ISSUE", issues: [issue.number], correction: `issue #${issue.number} already stands for unit ${claimed.get(issue.number)}; give this unit its own issue` });
       else if (issue.milestone === null) unmet.push({ unit, unmet: "MILESTONE_LINK_MISSING", issues: [issue.number], milestones: [milestone.number], correction: `link issue #${issue.number} to milestone #${milestone.number}, or declare the milestone it is in` });
       else if (issue.milestone.nodeId !== milestone.nodeId) unmet.push({ unit, unmet: "MILESTONE_LINK_WRONG", issues: [issue.number], milestones: [milestone.number, issue.milestone.number], correction: `issue #${issue.number} is in milestone #${issue.milestone.number}, not #${milestone.number}; move it, or declare the milestone it is in` });
-      else verified.push({ unit, declarationDigest: approved.declarationDigest, scopeDigest: scopeDigestOf(approved), approvalEventId: status.scope!.eventId, issueNumber: issue.number, issueNodeId: issue.nodeId, milestoneNumber: milestone.number, milestoneNodeId: milestone.nodeId, adopted: link.adopted });
+      else verified.push({ unit, declarationDigest: approved.declarationDigest, scopeDigest: scopeDigestOf(approved), taskIds: approved.taskIds, approvalEventId: status.scope!.eventId, issueNumber: issue.number, issueNodeId: issue.nodeId, milestoneNumber: milestone.number, milestoneNodeId: milestone.nodeId, adopted: link.adopted });
     }
     if (verified.length > 0) {
       this.ports.audit.record({
@@ -626,7 +647,15 @@ export class WorkScopeTracking {
     return created;
   }
 
-  #recordCreated(runId: string, resource: "issue" | "milestone", key: { unit?: string; titleDigest?: string }, answered: { number: number; nodeId: string }): void {
+  /** Every issue ACP created for the run, with the tasks its unit covered then. */
+  #createdIssues(runId: string): Array<{ issueNumber: number; taskIds?: string[] }> {
+    return this.ports.db
+      .all<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`, [WORK_SCOPE_GITHUB_CREATED, runId])
+      .map((row) => JSON.parse(row.evidence_json) as { resource?: string; number?: number; taskIds?: string[] })
+      .flatMap((e) => (e.resource === "issue" && typeof e.number === "number" ? [{ issueNumber: e.number, ...(Array.isArray(e.taskIds) ? { taskIds: e.taskIds } : {}) }] : []));
+  }
+
+  #recordCreated(runId: string, resource: "issue" | "milestone", key: { unit?: string; titleDigest?: string; taskIds?: string[] }, answered: { number: number; nodeId: string }): void {
     this.ports.audit.record({
       kind: WORK_SCOPE_GITHUB_CREATED,
       runId,

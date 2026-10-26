@@ -652,6 +652,101 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     expect(startExecution(g, impl).allowed).toBe(true);
   });
 
+  it("review R3 P1-a: a file URL is screened whatever its host; only an http(s) URL with a real host is set aside", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    const scope = g.h.cp.tasks.workScope!;
+    const declare = (text: string) => scope.declare(g.runId, { workUnits: [{ key: "notes", tasks: [impl], issue: { new: { title: "Notes", body: text } }, milestone: { number: 1 } }] }, []);
+    for (const text of [
+      "file://localhost/Users/isaac/x", "file:///Users/isaac/x", "FILE://host/Users/isaac/x",
+      "file://localhost/~/notes", "file:///~isaac/notes", "file://host/C:/Users/isaac/x", "file:///C:/x",
+      "http://localhost/Users/isaac/x", "http://127.0.0.1:8080/home/isaac/x", "file:///srv/data/x",
+    ]) {
+      expect(declare(text), text).toMatchObject({ allowed: false, evidence: { refusal: "WORK_UNITS_TEXT_NOT_PUBLIC" } });
+    }
+    for (const text of ["https://example.com/Users/guide", "https://example.com/~user/page", "http://example.org/home/x/"]) {
+      expect(declare(text).allowed, text).toBe(true);
+    }
+  });
+
+  it("review R3 P1-b: every published field is screened on its own, so a whole-value key is caught in any of them", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    const scope = g.h.cp.tasks.workScope!;
+    const key = "a".repeat(32) + "0123456789abcdef0123456789abcdef";
+    const declare = (issue: { title: string; body: string }, milestone: { title: string; description: string }) =>
+      scope.declare(g.runId, { workUnits: [{ key: "notes", tasks: [impl], issue: { new: issue }, milestone: { new: milestone } }] }, []);
+    const fine = { title: "Notes", body: "plain" };
+    const stage = { title: "Stage", description: "plain" };
+    for (const [issue, milestone, field] of [
+      [{ title: "Notes", body: key }, stage, "issue body"],
+      [{ title: key, body: "plain" }, stage, "issue title"],
+      [fine, { title: "Stage", description: key }, "milestone description"],
+      [fine, { title: key, description: "plain" }, "milestone title"],
+    ] as const) {
+      expect(declare(issue, milestone), field).toMatchObject({ allowed: false, evidence: { refusal: "WORK_UNITS_TEXT_NOT_PUBLIC" } });
+    }
+    expect(declare(fine, stage).allowed).toBe(true);
+  });
+
+  it("review R3 P2-a: renaming a unit keeps its tasks' earlier link; a new issue for tracked work is refused by name", async () => {
+    const g = await governedRun({ legacy: [LEGACY[0]!, LEGACY[2]!] });
+    const [impl, short] = g.taskIds as [string, string];
+    expect(tracking(await planSubmit(g, [
+      { key: "feed", tasks: [impl], issue: { new: { title: "Add feed filtering", body: "Filter the feed" } }, milestone: { number: 1 } },
+      { key: "short", tasks: [short], issue: { number: 5 }, milestone: { number: 2 } },
+    ]))).toMatchObject({ tracked: true });
+    const created = g.github.issues.find((i) => i.title === "Add feed filtering")!;
+    const posts = g.github.posts("/issues").length;
+    const renamed = await planSubmit(g, [
+      { key: "feed-v2", tasks: [impl], issue: { new: { title: "Feed filtering, second cut", body: "Filter the feed" } }, milestone: { number: 1 } },
+      { key: "daily", tasks: [short], issue: { new: { title: "Daily short, second take", body: "One a day" } }, milestone: { number: 2 } },
+    ], undefined, "renamed");
+    expect(unmetOf(tracking(renamed)).map((u) => [u.unit, u.unmet, u.issues])).toEqual([
+      ["feed-v2", "TASK_ALREADY_TRACKED", [created.number]],
+      ["daily", "TASK_ALREADY_TRACKED", [5]],
+    ]);
+    expect(unmetOf(tracking(renamed))[0]!.correction).toBe(`task ${impl} is already tracked by #${created.number}; adopt it by number`);
+    expect(g.github.posts("/issues")).toHaveLength(posts);
+    expect(startExecution(g, impl).reasonCode).toBe(REFUSED);
+  });
+
+  it("review R3 P2-b: PLAN A, B, A, B are each accepted, each the current PLAN with its own approval", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    const planA = [{ key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } }];
+    const planB = [{ key: "feed", tasks: [impl], issue: { number: 4 }, milestone: { number: 1 } }];
+    for (const [units, issue] of [[planA, 3], [planB, 4], [planA, 3], [planB, 4]] as const) {
+      const answer = await planSubmit(g, units);
+      expect(answer["ok"], `#${issue}`).toBe(true);
+      expect(tracking(answer), `#${issue}`).toMatchObject({ tracked: true });
+      const current = g.h.cp.artifacts.latest<{ workUnits: Array<{ issue: unknown }> }>(g.runId, ArtifactKind.PLAN)!;
+      expect(current.content.workUnits[0]!.issue).toEqual({ number: issue });
+      const approval = g.h.cp.audit.byKind("WORK_SCOPE_APPROVED").filter((row) => row.runId === g.runId).at(-1)!.evidence as { planDigest: string };
+      expect(approval.planDigest).toBe(current.digest);
+      expect(startExecution(g, impl).allowed).toBe(true);
+      g.h.cp.tasks.finishExecution(g.h.cp.tasks.executions(g.runId).at(-1)!.executionId, { status: "FAILED", resultDigest: null, failureClass: "transient" });
+    }
+  });
+
+  it("review R3 P2-c: a refused plan_submit leaves the accepted PLAN and its approval current", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    expect(tracking(await planSubmit(g, [{ key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } }]))).toMatchObject({ tracked: true });
+    const plan = g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!.digest;
+    const approvals = g.h.cp.audit.byKind("WORK_SCOPE_APPROVED").filter((row) => row.runId === g.runId).length;
+    // PLAN B's units are well formed, but its task depends on one that does not exist: the task graph refuses it.
+    const refused = await planSubmit(g, [
+      { key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } },
+      { key: "detail", tasks: ["detail"], issue: { number: 4 }, milestone: { number: 1 } },
+    ], [{ key: "detail", title: "Verdict detail page", category: "implementation", dependsOn: ["no-such-task"] }], "B");
+    expect(refused["ok"]).toBe(false);
+    expect(g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!.digest).toBe(plan);
+    expect(g.h.cp.audit.byKind("WORK_SCOPE_APPROVED").filter((row) => row.runId === g.runId)).toHaveLength(approvals);
+    expect(g.h.cp.tasks.list(g.runId)).toHaveLength(1);
+    expect(startExecution(g, impl).allowed).toBe(true);
+  });
+
   it("a project that is not a Repo Factory project plans and is admitted as before, with no GitHub request", async () => {
     const g = await governedRun({ provisioned: false, legacy: [] });
     const answer = await callCtoTool(g.h, g.owner, "plan_submit", { idempotencyKey: "plan-plain", runId: g.runId, plan: { summary: "plain" }, tasks: [{ key: "impl", title: "Implement", category: "implementation" }] });

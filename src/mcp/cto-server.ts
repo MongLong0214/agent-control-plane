@@ -31,6 +31,7 @@ import type { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
 import { TaskWriteTargets } from "../run/task-write-target.ts";
+import type { WorkScopeDeclaration } from "../run/work-scope-tracking.ts";
 import { WORKER_TURN_MAX_TIMEOUT_MS, type WorkerTurnRequest, type WorkerTurnRunner } from "../run/worker-turn.ts";
 import type { WorkerProvisionRequest, WorkerStaffing } from "../run/worker-staffing.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -262,20 +263,29 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     },
     submitTasks: (runId: string, tasks: Parameters<TaskGraph["submit"]>[1]) => source.tasks.submit(runId, tasks),
     workScope: () => source.tasks.workScope,
-    // #1240 review R2 — the artifact store hands back an identical earlier PLAN without making it current.
-    // For a PLAN that declares work units, the PLAN just submitted is the run's current one: the PLANs
-    // stored after it are withdrawn (their bytes stay), so `artifacts.latest` stays the one authority. A
-    // PLAN that was itself withdrawn is not made current again.
-    makePlanCurrent: (runId: string, digest: string): Decision<void> => {
-      const row = source.db.get<{ superseded: number }>(`SELECT superseded FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN' AND digest = ?`, [runId, digest]);
-      if (!row || row.superseded !== 0) {
-        return deny(ReasonCode.CONFLICT, "this PLAN was withdrawn and is not made current again; change it and submit it again", { runId, refusal: "PLAN_WITHDRAWN", planDigest: digest });
-      }
-      for (let latest = source.artifacts.latest(runId, ArtifactKind.PLAN); latest !== null && latest.digest !== digest; latest = source.artifacts.latest(runId, ArtifactKind.PLAN)) {
-        source.artifacts.supersede(runId, ArtifactKind.PLAN, latest.digest);
-      }
-      return allow(ReasonCode.OK, undefined);
-    },
+    // #1240 — a Repo Factory PLAN that declares work units is accepted all or nothing: the PLAN, its tasks
+    // and the approval commit in one transaction, and any refusal rolls all of them back, so the PLAN and
+    // approval accepted before stay current. The PLAN is stored with its submission's sequence, so the
+    // artifact store's content dedup never hands back an earlier PLAN: each accepted one is the latest.
+    acceptWorkUnitsPlan: (
+      runId: string,
+      plan: Record<string, unknown>,
+      tasks: Parameters<TaskGraph["submit"]>[1],
+      declaration: WorkScopeDeclaration,
+      owner: { sessionId: string; bindingGeneration: number },
+      bootstrapPlanDigest?: string,
+    ) =>
+      source.db.txDecision((): ReturnType<TaskGraph["submit"]> => {
+        const scope = source.tasks.workScope;
+        if (scope === null) return deny(ReasonCode.INTERNAL_ERROR, "work-unit tracking is not composed", { runId });
+        const submission = (source.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN'`, [runId])?.n ?? 0) + 1;
+        const stored = port.submitPlan(runId, { ...plan, submission }, bootstrapPlanDigest);
+        if (!stored.allowed) return stored as Decision<never>;
+        const submitted = tasks.length === 0 ? allow(ReasonCode.OK, []) : port.submitTasks(runId, tasks);
+        if (!submitted.allowed) return submitted;
+        const approved = scope.approve(runId, stored.value.digest, declaration, tasks, submitted.value, owner);
+        return approved.allowed ? submitted : (approved as Decision<never>);
+      }),
     isProjectlessBootstrapRun: (runId: string) => isProjectlessBootstrap(source.runs.require(runId)),
     // PR #1114 BOOT-02 — a project-less bootstrap's re-plan is all or nothing: the PLAN write, the
     // supersession of the earlier PLAN's tasks, the one new task and its BOOTSTRAP_PLAN_TASKS binding
@@ -644,20 +654,15 @@ const createCtoServerFromPort = (
       const declared = scope === null ? allow(ReasonCode.OK, null) : scope.declare(args.runId, plan, tasks);
       if (!declared.allowed) return respond(declared);
       if (tasks.length === 0 && declared.value === null) return respond(deny(ReasonCode.INVALID_ARGUMENT, "plan_submit requires plan and tasks, or bootstrapPlanDigest"));
-      const stored = port.submitPlan(args.runId, plan, bootstrapPlanDigest);
-      if (!stored.allowed) return respond(stored);
-      if (declared.value !== null) {
-        const current = port.makePlanCurrent(args.runId, stored.value.digest);
-        if (!current.allowed) return respond(current);
+      if (scope === null || declared.value === null) {
+        const stored = port.submitPlan(args.runId, plan, bootstrapPlanDigest);
+        if (!stored.allowed) return respond(stored);
+        return respond(port.submitTasks(args.runId, tasks));
       }
-      const submitted = tasks.length === 0 ? allow(ReasonCode.OK, []) : port.submitTasks(args.runId, tasks);
+      const submitted = port.acceptWorkUnitsPlan(args.runId, plan, tasks, declared.value, fenced, bootstrapPlanDigest);
       if (!submitted.allowed) return respond(submitted);
-      if (scope === null || declared.value === null) return respond(submitted);
-      // The mapping, resolved to the stored tasks' ids, and the owner who submitted it; then the units are
-      // synchronized now. The tasks are stored either way, so a refusal is reported beside them, never as
-      // the PLAN's: admission refuses later, naming the units.
-      const approved = scope.approve(args.runId, stored.value.digest, declared.value, tasks, submitted.value, fenced);
-      if (!approved.allowed) return respond(approved);
+      // Accepted: the units are synchronized now. GitHub's answer does not undo the accepted PLAN; it is
+      // reported beside it, and admission refuses each unit GitHub does not yet hold, naming it.
       const tracking = await scope.ensure(args.runId);
       return respond(allow(submitted.reasonCode, submitted.value, {
         ...submitted.evidence,
