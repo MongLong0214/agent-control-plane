@@ -7,7 +7,7 @@ import { createBootstrapGitHubWritePort } from "../../src/bootstrap/bootstrap-wr
 import { type GenesisBundle, parseGenesis } from "../../src/bootstrap/genesis-bundle.ts";
 import { createGitHubApiWritePort, type GitHubRepositoryTarget } from "../../src/bootstrap/github-write-port.ts";
 import { produceRepoFactoryResult } from "../../src/bootstrap/repo-factory-producer.ts";
-import { allow } from "../../src/core/errors.ts";
+import { acpError, allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { manifestDigest, projectManifestSchema } from "../../src/contracts/manifest.ts";
 import { digestOf } from "../../src/core/digest.ts";
@@ -67,7 +67,18 @@ class IssuesGitHub implements GitHubClient {
   readonly milestones: Milestone[] = [];
   readonly issues: Issue[] = [];
   /** The next POST to a path ending with `suffix` fails: "before" sends nothing, "after" loses the answer. */
-  fault: { suffix: string; when: "before" | "after"; skip?: number } | null = null;
+  /**
+   * The next POST to a path ending with `suffix` fails. "before": GitHub answers an error and creates
+   * nothing (with `status`, the HTTP status the client reports; without one, no status is heard).
+   * "after": GitHub creates it and the answer is lost. "late": the client gives up with no answer while
+   * GitHub is still processing; the issue appears only when `land()` is called.
+   */
+  fault: { suffix: string; when: "before" | "after" | "late"; skip?: number; status?: number } | null = null;
+  private landing: Array<() => void> = [];
+  /** GitHub completes the requests a "late" fault left in flight. */
+  land(): void {
+    for (const complete of this.landing.splice(0)) complete();
+  }
   /** Lists answer with another repository's items, as a misrouted or reused-name answer would. */
   foreign = false;
   /** GitHub accepts an issue and drops its milestone. */
@@ -146,10 +157,18 @@ class IssuesGitHub implements GitHubClient {
       const faulted = matched && (this.fault!.skip ?? 0) === 0;
       if (matched && !faulted) this.fault!.skip! -= 1;
       if (faulted && this.fault!.when === "before") {
+        const status = this.fault!.status;
         this.fault = null;
+        if (status !== undefined) throw acpError(ReasonCode.INTERNAL_ERROR, `gh api POST ${path} failed: (HTTP ${status})`, { status, method, path });
         throw new Error("HTTP 502 before GitHub acted");
       }
       const value = body as Record<string, unknown>;
+      if (faulted && this.fault!.when === "late") {
+        this.fault = null;
+        const milestone = this.milestones.find((m) => m.number === value["milestone"]) ?? null;
+        this.landing.push(() => { this.addIssue(String(value["title"]), String(value["body"]), milestone); });
+        throw new Error("timed out waiting for GitHub's answer");
+      }
       let answer: unknown;
       if (route.endsWith("/milestones")) {
         if (this.milestones.some((m) => m.title.toLowerCase() === String(value["title"]).toLowerCase())) {
@@ -292,6 +311,12 @@ const tracking = (answer: Record<string, unknown>) => (answer["evidence"] as { g
 const unmetOf = (evidence: unknown) => ((evidence as { unmet?: Array<{ unit: string; unmet: string; issues?: number[]; correction: string }> } | undefined)?.unmet ?? []);
 const trackedRecords = (g: Governed) => g.h.cp.audit.byKind("WORK_SCOPE_GITHUB_TRACKED").filter((row) => row.runId === g.runId).map((row) => row.evidence as { units: Array<{ unit: string; issueNumber: number; milestoneNumber: number; adopted: boolean }> });
 const INTERNAL_ID = /\b(?:prj|repo|ses|run|task|art|clm|msg|asg)_[0-9a-f]{24}\b/;
+/** Every create intent of the run that was retired, with why. */
+const intentsOf = (g: Governed) => g.h.cp.audit.byKind("WORK_SCOPE_GITHUB_INTENT_RETIRED").filter((row) => row.runId === g.runId).map((row) => {
+  const e = row.evidence as { outcome: string; status?: number };
+  return { outcome: e.outcome, ...(e.status === undefined ? {} : { status: e.status }) };
+});
+const unresolved = (answer: Record<string, unknown>) => unmetOf(tracking(answer)).filter((u) => u.unmet === "WORK_SCOPE_CREATION_UNRESOLVED");
 
 describe("#1240 — a Repo Factory project's approved work units are linked on GitHub before execution", () => {
   it("the myeotnyeon counterexample: tasks with no declared unit are refused; a PLAN adopting the existing issues admits them with no POST", async () => {
@@ -472,7 +497,7 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     const [impl] = g.taskIds as [string];
     const feed = { key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } };
     expect(tracking(await planSubmit(g, [feed]))).toMatchObject({ tracked: true });
-    g.github.fault = { suffix: "/issues", when: "before" };
+    g.github.fault = { suffix: "/issues", when: "late" };
     const added = await planSubmit(g, [feed, { key: "roundup", tasks: ["roundup"], issue: { new: { title: "Weekly verdict roundup", body: "Collect" } }, milestone: { number: 1 } }], [{ key: "roundup", title: "Build the weekly roundup", category: "implementation" }]);
     expect(tracking(added)).toMatchObject({ tracked: false });
     const roundup = g.h.cp.tasks.list(g.runId).find((t) => t.title === "Build the weekly roundup")!.taskId;
@@ -480,9 +505,12 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     expect(startExecution(g, impl).allowed).toBe(true);
     expect((await provision(g, impl))["reasonCode"]).not.toBe(REFUSED);
     expect(g.github.calls.length).toBe(seen);
+    // The outage's request may still land: nothing is sent again for roundup until it is known.
     expect(startExecution(g, roundup).reasonCode).toBe(REFUSED);
+    expect((await startWorkerExecution(g, roundup)).reasonCode).toBe(REFUSED);
+    g.github.land();
     expect((await startWorkerExecution(g, roundup)).allowed).toBe(true);
-    expect(g.github.posts("/issues")).toHaveLength(2);
+    expect(g.github.posts("/issues")).toHaveLength(1);
     expect(g.github.issues.filter((i) => i.title === "Weekly verdict roundup")).toHaveLength(1);
   });
 
@@ -490,7 +518,7 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
     const [impl] = g.taskIds as [string];
     const units = [{ key: "roundup", tasks: [impl], issue: { new: { title: "Weekly verdict roundup", body: "Collect" } }, milestone: { number: 1 } }];
-    g.github.fault = { suffix: "/issues", when: "before" };
+    g.github.fault = { suffix: "/issues", when: "before", status: 422 };
     expect(tracking(await planSubmit(g, units))).toMatchObject({ tracked: false });
     // The same PLAN, as an earlier owner approved it: the run is held by another session now.
     const scope = g.h.cp.tasks.workScope!;
@@ -528,7 +556,7 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
   it("review P1-a: a PLAN superseded while its synchronization waits on GitHub publishes nothing", async () => {
     const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
     const [impl] = g.taskIds as [string];
-    g.github.fault = { suffix: "/issues", when: "before" };
+    g.github.fault = { suffix: "/issues", when: "before", status: 422 };
     expect(tracking(await planSubmit(g, [{ key: "roundup", tasks: [impl], issue: { new: { title: "Weekly verdict roundup", body: "Collect" } }, milestone: { number: 1 } }]))).toMatchObject({ tracked: false });
     // PLAN A's synchronization is paused on GitHub's read; PLAN B, adopting #3 instead, is accepted meanwhile.
     const hold = g.github.holdNext(`${ROOT}/milestones`);
@@ -589,7 +617,7 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
   it("review R2 P1-a: an owner revoked while the synchronization waits on GitHub publishes nothing", async () => {
     const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
     const [impl] = g.taskIds as [string];
-    g.github.fault = { suffix: "/issues", when: "before" };
+    g.github.fault = { suffix: "/issues", when: "before", status: 422 };
     expect(tracking(await planSubmit(g, [{ key: "roundup", tasks: [impl], issue: { new: { title: "Weekly verdict roundup", body: "Collect" } }, milestone: { number: 1 } }]))).toMatchObject({ tracked: false });
     const hold = g.github.holdNext(`${ROOT}/milestones`);
     const sync = g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl);
@@ -766,12 +794,13 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     expect(startExecution(g, impl).allowed).toBe(true);
   });
 
-  it("review R4 P2 (sibling): a create GitHub never received holds nothing back", async () => {
+  it("review R5: a definite 4xx is retired at once, and the renamed unit's issue is created once", async () => {
     const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
     const [impl] = g.taskIds as [string];
-    g.github.fault = { suffix: "/issues", when: "before" };
+    g.github.fault = { suffix: "/issues", when: "before", status: 422 };
     expect(tracking(await planSubmit(g, [{ key: "feed", tasks: [impl], issue: { new: { title: "Add feed filtering", body: "Filter the feed" } }, milestone: { number: 1 } }]))).toMatchObject({ tracked: false });
     expect(g.github.issues.filter((i) => i.title === "Add feed filtering")).toEqual([]);
+    expect(intentsOf(g)).toEqual([{ outcome: "DEFINITE_NOT_CREATED", status: 422 }]);
     const renamed = await planSubmit(g, [{ key: "feed-renamed", tasks: [impl], issue: { new: { title: "Feed filtering, renamed", body: "Filter the feed" } }, milestone: { number: 1 } }], undefined, "renamed");
     expect(tracking(renamed)).toMatchObject({ tracked: true });
     expect(g.github.issues.filter((i) => /feed filtering/i.test(i.title)).map((i) => i.title)).toEqual(["Feed filtering, renamed"]);
@@ -787,6 +816,108 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     expect(tracking(renamed)).toMatchObject({ tracked: true });
     expect(g.github.milestones.filter((m) => m.title === stage.new.title)).toHaveLength(1);
     expect(g.github.posts("/milestones")).toHaveLength(1);
+  });
+
+  it("review R5 P2-a: an intent links only to the issue its own POST created, never to another reuse of the unit key", async () => {
+    // A's POST fails, definitely (422) or with an unknown outcome (502); `feed` is reused for B, whose created issue's answer is lost.
+    for (const status of [422, 502]) {
+      const g = await governedRun({ legacy: [LEGACY[0]!, LEGACY[2]!] });
+      const [impl, short] = g.taskIds as [string, string];
+      g.github.fault = { suffix: "/issues", when: "before", status };
+      await planSubmit(g, [
+        { key: "feed", tasks: [impl], issue: { new: { title: "Add feed filtering", body: "Filter" } }, milestone: { number: 1 } },
+        { key: "short", tasks: [short], issue: { number: 5 }, milestone: { number: 2 } },
+      ]);
+      g.github.fault = { suffix: "/issues", when: "after" };
+      const reused = [
+        { key: "feed", tasks: [short], issue: { new: { title: "Daily short pipeline", body: "Shorts" } }, milestone: { number: 2 } },
+        { key: "a-unit", tasks: [impl], issue: { new: { title: "Feed filtering", body: "Filter" } }, milestone: { number: 1 } },
+      ];
+      await planSubmit(g, reused, undefined, `reused ${status}`);
+      const next = await planSubmit(g, reused, undefined, `next ${status}`);
+      const unmet = unmetOf(tracking(next));
+      // A is never taken for tracked by B's issue.
+      expect(unmet.filter((u) => u.unmet === "TASK_ALREADY_TRACKED"), `${status}`).toEqual([]);
+      expect(g.github.issues.filter((i) => i.title === "Daily short pipeline"), `${status}`).toHaveLength(1);
+      if (status === 422) {
+        expect(tracking(next), "422").toMatchObject({ tracked: true });
+        expect(g.github.issues.filter((i) => i.title === "Feed filtering"), "422").toHaveLength(1);
+      } else {
+        expect(unmet.map((u) => [u.unit, u.unmet]), "502").toEqual([["a-unit", "WORK_SCOPE_CREATION_UNRESOLVED"]]);
+        expect(g.github.issues.filter((i) => i.title === "Feed filtering"), "502").toEqual([]);
+      }
+      expect(startExecution(g, short).allowed, `${status}: B is tracked by its own issue`).toBe(true);
+    }
+  });
+
+  it("review R5 P2-b: a POST still in flight blocks a renamed or re-planned create for its task; when it lands it is linked, and nothing is sent twice", async () => {
+    const g = await governedRun({ legacy: [LEGACY[0]!, LEGACY[2]!] });
+    const [impl, short] = g.taskIds as [string, string];
+    const shortUnit = { key: "short", tasks: [short], issue: { number: 5 }, milestone: { number: 2 } };
+    g.github.fault = { suffix: "/issues", when: "late" };
+    expect(tracking(await planSubmit(g, [{ key: "feed", tasks: [impl], issue: { new: { title: "Add feed filtering", body: "Filter" } }, milestone: { number: 1 } }, shortUnit]))).toMatchObject({ tracked: false });
+    // Renamed, then re-planned with other text: both refused, retryably, while the first may still land.
+    for (const [key, title, summary] of [["feed-renamed", "Feed filtering, renamed", "renamed"], ["filters", "Filters for the feed", "re-planned"]] as const) {
+      const retried = await planSubmit(g, [{ key, tasks: [impl], issue: { new: { title, body: "Filter" } }, milestone: { number: 1 } }, shortUnit], undefined, summary);
+      expect(unresolved(retried).map((u) => u.unit), summary).toEqual([key]);
+      expect(unresolved(retried)[0]!.correction).toMatch(/may still land/);
+    }
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(startExecution(g, impl).reasonCode).toBe(REFUSED);
+    // GitHub completes the first POST: the next sync links it by its own token.
+    g.github.land();
+    const first = g.github.issues.find((i) => i.title === "Add feed filtering")!;
+    const linked = await planSubmit(g, [{ key: "filters", tasks: [impl], issue: { new: { title: "Filters for the feed", body: "Filter" } }, milestone: { number: 1 } }, shortUnit], undefined, "after landing");
+    expect(unmetOf(tracking(linked)).map((u) => [u.unit, u.unmet, u.issues])).toEqual([["filters", "TASK_ALREADY_TRACKED", [first.number]]]);
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(intentsOf(g)).toEqual([]);
+  });
+
+  it("review R5: a delayed completion is linked by the next sync of the same unit, and no second issue is created", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    const feed = [{ key: "feed", tasks: [impl], issue: { new: { title: "Add feed filtering", body: "Filter" } }, milestone: { number: 1 } }];
+    g.github.fault = { suffix: "/issues", when: "late" };
+    expect(tracking(await planSubmit(g, feed))).toMatchObject({ tracked: false });
+    expect(unresolved(await planSubmit(g, feed, undefined, "retry")).map((u) => u.unit)).toEqual(["feed"]);
+    g.github.land();
+    expect(tracking(await planSubmit(g, feed, undefined, "landed"))).toMatchObject({ tracked: true });
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(g.github.issues.filter((i) => i.title === "Add feed filtering")).toHaveLength(1);
+    expect(startExecution(g, impl).allowed).toBe(true);
+  });
+
+  it("review R5: an unknown create holds back only its own tasks; an unrelated unit is created and admitted", async () => {
+    const g = await governedRun({ legacy: [LEGACY[0]!, LEGACY[2]!] });
+    const [impl, short] = g.taskIds as [string, string];
+    g.github.fault = { suffix: "/issues", when: "late" };
+    const units = [
+      { key: "feed", tasks: [impl], issue: { new: { title: "Add feed filtering", body: "Filter" } }, milestone: { number: 1 } },
+      { key: "short", tasks: [short], issue: { new: { title: "Daily short pipeline", body: "Shorts" } }, milestone: { number: 2 } },
+    ];
+    await planSubmit(g, units);
+    const again = await planSubmit(g, units, undefined, "again");
+    expect(unmetOf(tracking(again)).map((u) => [u.unit, u.unmet])).toEqual([["feed", "WORK_SCOPE_CREATION_UNRESOLVED"]]);
+    expect(g.github.issues.filter((i) => i.title === "Daily short pipeline")).toHaveLength(1);
+    expect(startExecution(g, short).allowed).toBe(true);
+    expect(startExecution(g, impl).reasonCode).toBe(REFUSED);
+  });
+
+  it("review R5: while a create is unknown, adopting an existing issue by number is verified and then allowed", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    const feed = [{ key: "feed", tasks: [impl], issue: { new: { title: "Add feed filtering", body: "Filter" } }, milestone: { number: 1 } }];
+    g.github.fault = { suffix: "/issues", when: "late" };
+    await planSubmit(g, feed);
+    expect(unresolved(await planSubmit(g, feed, undefined, "retry"))).toHaveLength(1);
+    // Adoption is verified as always: #8 is not in milestone 2.
+    const wrong = await planSubmit(g, [{ key: "feed", tasks: [impl], issue: { number: 8 }, milestone: { number: 2 } }], undefined, "wrong");
+    expect(unmetOf(tracking(wrong)).map((u) => u.unmet)).toEqual(["MILESTONE_LINK_WRONG"]);
+    const adopted = await planSubmit(g, [{ key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } }], undefined, "adopted");
+    expect(tracking(adopted)).toMatchObject({ tracked: true });
+    expect(startExecution(g, impl).allowed).toBe(true);
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(intentsOf(g)).toEqual([]);
   });
 
   it("a project that is not a Repo Factory project plans and is admitted as before, with no GitHub request", async () => {

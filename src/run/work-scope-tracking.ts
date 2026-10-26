@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
-import { acpError, allow, deny, type Decision, type Evidence } from "../core/errors.ts";
+import { acpError, allow, deny, type Decision, type Evidence, isAcpError } from "../core/errors.ts";
 import { digestOf } from "../core/digest.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { type BootstrapWriteGuard, runUnderWriteGuard } from "../bootstrap/bootstrap-write-guard.ts";
@@ -12,6 +12,7 @@ import {
   type WorkMilestone,
   isGitHubNodeId,
   parseGitHubIdentity,
+  requestOutcomeUnknown,
 } from "../bootstrap/github-write-port.ts";
 import { type WorkUnitDeclaration, workUnitsSchema } from "../bootstrap/plan-input-schema.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
@@ -53,12 +54,19 @@ import { CLOSED_TO_NEW_TASKS, type TaskGraph, type TaskRecord } from "./task-gra
 export const WORK_SCOPE_APPROVED = "WORK_SCOPE_APPROVED";
 export const WORK_SCOPE_GITHUB_CREATED = "WORK_SCOPE_GITHUB_CREATED";
 /**
- * #1240 review R4 — an issue ACP is about to create, recorded before the POST with the tasks it covers and
- * the exact marker it carries. It stays pending until a readback finds that marker, when it becomes
- * CREATED for those tasks; every sync of the run looks for it first. It is never retired on one absent
- * readback: a request whose answer was lost may still land, and is then still found.
+ * #1240 reviews R4/R5 — an issue ACP is about to create. Its intent is recorded by the write guard the
+ * moment it admits the POST, with the tasks it covers and its own token: a random intent id, published
+ * only as the truncated SHA-256 of that id (`<!-- acp:<16 hex> -->`), so it identifies one request and
+ * nothing about the run, the unit or the tasks. Its outcome is one of three:
+ *   - CREATED: GitHub answered the POST, or a readback of the exact repository shows the intent's own token;
+ *   - DEFINITE_NOT_CREATED: GitHub answered with a 4xx other than 408, which proves nothing was created —
+ *     the intent is retired at once (`WORK_SCOPE_GITHUB_INTENT_RETIRED`);
+ *   - UNKNOWN: anything else (no answer, a timeout, a 5xx, a 408). It is kept, never expired: a POST GitHub
+ *     is still processing can land later. Until its token is found, no new issue is created for any task it
+ *     covers, under any unit key; adopting an existing issue by number stays allowed.
  */
 export const WORK_SCOPE_GITHUB_CREATING = "WORK_SCOPE_GITHUB_CREATING";
+export const WORK_SCOPE_GITHUB_INTENT_RETIRED = "WORK_SCOPE_GITHUB_INTENT_RETIRED";
 export const WORK_SCOPE_GITHUB_TRACKED = "WORK_SCOPE_GITHUB_TRACKED";
 
 interface ApprovedUnit {
@@ -101,6 +109,7 @@ export type UnmetKind =
   | "ISSUE_NOT_FOUND"
   | "ISSUE_EXISTS"
   | "DUPLICATE_OF_ADOPTED"
+  | "WORK_SCOPE_CREATION_UNRESOLVED"
   | "TASK_ALREADY_TRACKED"
   | "CATCH_ALL_ISSUE"
   | "MILESTONE_LINK_MISSING"
@@ -112,6 +121,9 @@ export interface UnmetWork {
   unmet: UnmetKind;
   issues?: number[];
   milestones?: number[];
+  /** The intents whose unknown outcome holds this unit back (WORK_SCOPE_CREATION_UNRESOLVED). */
+  intents?: string[];
+  retryable?: boolean;
   correction: string;
 }
 
@@ -168,6 +180,17 @@ const unpublishable = (text: string): string | null => {
 };
 
 /** The non-identifying marker of ACP's own create, recognised again after a lost answer. */
+/** An issue intent's public token: the truncated SHA-256 of its random id, nothing else. */
+const intentMarker = (intent: string): string => `<!-- acp:${createHash("sha256").update(intent).digest("hex").slice(0, 16)} -->`;
+/** A 4xx other than 408 is GitHub's answer that the request was refused, so nothing was created. */
+const definitelyNotCreated = (error: unknown): number | null => {
+  if (!isAcpError(error) || requestOutcomeUnknown(error)) return null;
+  const status = (error.evidence as { status?: unknown }).status;
+  return typeof status === "number" && status >= 400 && status < 500 && status !== 408 ? status : null;
+};
+interface IssueIntent { intent: string; unit: string; taskIds: string[]; marker: string }
+interface CreatedIssue { intent?: string; unit: string; taskIds: string[]; marker: string; issueNumber: number; nodeId: string }
+
 const createdMarker = (runId: string, resource: "issue" | "milestone", key: string): string =>
   `<!-- acp:${createHash("sha256").update(`${runId}\n${resource}\n${key}`).digest("hex").slice(0, 16)} -->`;
 const withMarker = (text: string, marker: string): string => (text.trimEnd() ? `${text.trimEnd()}\n\n${marker}` : marker);
@@ -366,32 +389,41 @@ export class WorkScopeTracking {
     // read once the pending creates are resolved, so an issue whose answer was lost is among them.
     const trackedByTask = new Map<string, Set<number>>();
     let created = new Map<string, { number: number; nodeId: string }>();
+    let createdIssues: CreatedIssue[] = [];
+    // The tasks an intent with an unknown outcome still covers: no new issue is created for them.
+    const unresolvedByTask = new Map<string, IssueIntent[]>();
     const known = (): void => {
       created = this.#created(runId);
+      createdIssues = this.#createdIssues(runId);
       trackedByTask.clear();
-      for (const link of [...this.#trackedRecords(runId, governed), ...this.#createdIssues(runId)]) {
+      for (const link of [...this.#trackedRecords(runId, governed), ...createdIssues]) {
         for (const taskId of link.taskIds ?? []) trackedByTask.set(taskId, (trackedByTask.get(taskId) ?? new Set()).add(link.issueNumber));
       }
+      unresolvedByTask.clear();
+      for (const intent of this.#unknownIntents(runId)) {
+        for (const taskId of intent.taskIds) unresolvedByTask.set(taskId, [...(unresolvedByTask.get(taskId) ?? []), intent]);
+      }
     };
+    // The issue POST about to be sent: the guard admits exactly it, and records its intent as it does.
+    const outbound: { current: (IssueIntent & { title: string; text: string; recorded: boolean }) | null } = { current: null };
     const unmet: UnmetWork[] = [];
-    // The only bodies a POST may carry: exactly the PLAN's new milestones and issues, with their markers.
+    // The only milestone bodies a POST may carry: exactly the PLAN's new milestones, with their markers.
     const planned: Array<{ path: "milestones" | "issues"; title: string; text: string }> = [];
     for (const approved of pending) {
       const declared = declarations.get(approved.unit);
       if (declared === undefined) continue;
       if ("new" in declared.milestone) planned.push({ path: "milestones", title: declared.milestone.new.title, text: withMarker(declared.milestone.new.description, createdMarker(runId, "milestone", declared.milestone.new.title.trim().toLowerCase())) });
-      if ("new" in declared.issue) planned.push({ path: "issues", title: declared.issue.new.title, text: withMarker(declared.issue.new.body, createdMarker(runId, "issue", approved.unit)) });
     }
     const resolved = new Map<string, { milestoneNumber: number; issueNumber: number; adopted: boolean }>();
     let readback: { milestones: WorkMilestone[]; issues: WorkIssue[] };
     try {
-      readback = await runUnderWriteGuard(this.#guard(runId, target, status.scope!, planned), async () => {
+      readback = await runUnderWriteGuard(this.#guard(runId, target, status.scope!, planned, outbound), async () => {
         const resources = await github.observeWorkResources!(target, repositoryNodeId);
-        // First, every create whose answer was never heard: found by the marker it was sent with, it is ACP's
-        // issue for the tasks it covered, whatever unit key they have now.
-        for (const intent of this.#pendingIntents(runId)) {
+        // First, every create with an unknown outcome: found by its own token, it is ACP's issue for the
+        // tasks it covered, whatever unit key they have now; not found, it stays unknown.
+        for (const intent of this.#unknownIntents(runId)) {
           const found = resources.issues.find((i) => i.body.includes(intent.marker));
-          if (found !== undefined) this.#recordCreated(runId, "issue", { unit: intent.unit, taskIds: intent.taskIds, marker: intent.marker }, found);
+          if (found !== undefined) this.#recordCreated(runId, "issue", { intent: intent.intent, unit: intent.unit, taskIds: intent.taskIds, marker: intent.marker }, found);
         }
         known();
         for (const approved of pending) {
@@ -442,12 +474,12 @@ export class WorkScopeTracking {
             }
           } else {
             const { title, body } = declared.issue.new;
-            const marker = createdMarker(runId, "issue", approved.unit);
-            const record = created.get(`issue:${approved.unit}`);
-            issue = resources.issues.find((i) => record !== undefined && i.number === record.number && i.nodeId === record.nodeId)
-              ?? resources.issues.find((i) => i.body.includes(marker));
+            // ACP's own earlier create for this unit: the same key, covering some of the same tasks.
+            const own = [...createdIssues].reverse().find((c) => c.unit === approved.unit && c.taskIds.some((t) => approved.taskIds.includes(t))
+              && resources.issues.some((i) => i.number === c.issueNumber && i.nodeId === c.nodeId));
+            issue = own === undefined ? undefined : resources.issues.find((i) => i.number === own.issueNumber && i.nodeId === own.nodeId);
             // ACP's own earlier create stands for this unit only while it reads as the PLAN now declares it.
-            if (issue !== undefined && (issue.title !== title || !sameText(issue.body, withMarker(body, marker)))) {
+            if (issue !== undefined && (issue.title !== title || !sameText(issue.body, withMarker(body, own!.marker)))) {
               unmet.push({ unit: approved.unit, unmet: "ISSUE_TEXT_DIFFERS", issues: [issue.number], correction: `issue #${issue.number}, created for this unit, does not read as the PLAN now declares it; adopt it by number, or declare it as it reads` });
               continue;
             }
@@ -464,16 +496,34 @@ export class WorkScopeTracking {
                 unmet.push({ unit: approved.unit, unmet: "TASK_ALREADY_TRACKED", issues: [...new Set(tracked.map(([, n]) => n))], correction: `task ${taskId} is already tracked by #${number}; adopt it by number` });
                 continue;
               }
+              // A create whose outcome is unknown may still land: nothing is sent again for its tasks.
+              const unsettled = approved.taskIds.flatMap((taskId) => (unresolvedByTask.get(taskId) ?? []).map((intent) => [taskId, intent] as const));
+              if (unsettled.length > 0) {
+                const [taskId, intent] = unsettled[0]!;
+                unmet.push({ unit: approved.unit, unmet: "WORK_SCOPE_CREATION_UNRESOLVED", intents: [...new Set(unsettled.map(([, i]) => i.intent))], retryable: true, correction: `an earlier issue create for task ${taskId} (intent ${intent.intent}) has an unknown outcome and may still land; ACP links it when it appears, and creates nothing for that task until then. Retry later, or adopt an existing issue by number` });
+                continue;
+              }
               const clash = resources.issues.find((i) => sameTitle(i.title, title));
               if (clash !== undefined) {
                 unmet.push({ unit: approved.unit, unmet: "ISSUE_EXISTS", issues: [clash.number], correction: `issue #${clash.number} already has this title; adopt it by number rather than create a duplicate` });
                 continue;
               }
-              // Durable before the POST: if GitHub's answer is lost, the next sync finds this issue by its marker.
-              this.ports.audit.record({ kind: WORK_SCOPE_GITHUB_CREATING, runId, projectId: this.ports.runs.get(runId)?.projectId ?? null, evidence: { resource: "issue", unit: approved.unit, taskIds: approved.taskIds, marker } });
-              issue = await github.createWorkIssue!(target, repositoryNodeId, { title, body: withMarker(body, marker), milestone: milestone.number });
-              this.#recordCreated(runId, "issue", { unit: approved.unit, taskIds: approved.taskIds, marker }, issue);
-              created.set(`issue:${approved.unit}`, issue);
+              // A new intent, with its own token; the guard records it the moment it admits the POST.
+              const intent = `wsi_${randomUUID().replace(/-/g, "")}`;
+              const marker = intentMarker(intent);
+              outbound.current = { intent, unit: approved.unit, taskIds: approved.taskIds, marker, title, text: withMarker(body, marker), recorded: false };
+              try {
+                issue = await github.createWorkIssue!(target, repositoryNodeId, { title, body: withMarker(body, marker), milestone: milestone.number });
+              } catch (error) {
+                const sent = outbound.current.recorded;
+                outbound.current = null;
+                const status = definitelyNotCreated(error);
+                if (sent && status !== null) this.ports.audit.record({ kind: WORK_SCOPE_GITHUB_INTENT_RETIRED, runId, projectId: this.ports.runs.get(runId)?.projectId ?? null, evidence: { intent, outcome: "DEFINITE_NOT_CREATED", status } });
+                throw error;
+              }
+              outbound.current = null;
+              this.#recordCreated(runId, "issue", { intent, unit: approved.unit, taskIds: approved.taskIds, marker }, issue);
+              createdIssues.push({ intent, unit: approved.unit, taskIds: approved.taskIds, marker, issueNumber: issue.number, nodeId: issue.nodeId });
               resources.issues.push(issue);
             }
           }
@@ -525,14 +575,23 @@ export class WorkScopeTracking {
    * issue to the exact repository, while the run is live, its approval is its current owner's, and the
    * PLAN it serves is still the run's current one.
    */
-  #guard(runId: string, target: GitHubRepositoryTarget, scope: ApprovedScope, planned: ReadonlyArray<{ path: string; title: string; text: string }>): BootstrapWriteGuard {
+  #guard(
+    runId: string,
+    target: GitHubRepositoryTarget,
+    scope: ApprovedScope,
+    planned: ReadonlyArray<{ path: string; title: string; text: string }>,
+    outbound: { current: (IssueIntent & { title: string; text: string; recorded: boolean }) | null },
+  ): BootstrapWriteGuard {
     const root = `repos/${target.owner}/${target.name}`;
     return {
       beforeRequest: (request) => {
         const body = isRecord(request.body) ? request.body : {};
         const path = request.target === `${root}/milestones` ? "milestones" : request.target === `${root}/issues` ? "issues" : null;
         const text = path === "milestones" ? body["description"] : body["body"];
-        const exact = planned.some((p) => p.path === path && p.title === body["title"] && p.text === text);
+        const sending = outbound.current;
+        const exact = path === "issues"
+          ? sending !== null && !sending.recorded && sending.title === body["title"] && sending.text === text
+          : planned.some((p) => p.path === path && p.title === body["title"] && p.text === text);
         if (request.kind !== "api" || request.method !== "POST" || path === null || !exact || (path === "issues" && typeof body["milestone"] !== "number")) {
           throw acpError(ReasonCode.GATE_AUTHORITY_DENIED, "a work-scope synchronization writes only the PLAN's own new milestones and issues", { request: { kind: request.kind, method: request.method, target: request.target } });
         }
@@ -557,6 +616,11 @@ export class WorkScopeTracking {
           throw acpError(ReasonCode.GATE_AUTHORITY_DENIED, "the PLAN this synchronization serves is no longer the run's current one; nothing of it is created", {
             refusal: "WORK_SCOPE_PLAN_SUPERSEDED", runId, planDigest: scope.planDigest, currentPlanDigest: current?.planDigest ?? null,
           });
+        }
+        // Admitted: from here on GitHub may create it, so its intent is durable before the request starts.
+        if (path === "issues" && sending !== null) {
+          this.ports.audit.record({ kind: WORK_SCOPE_GITHUB_CREATING, runId, projectId: run.projectId, evidence: { resource: "issue", intent: sending.intent, unit: sending.unit, taskIds: sending.taskIds, marker: sending.marker } });
+          sending.recorded = true;
         }
       },
     };
@@ -668,26 +732,30 @@ export class WorkScopeTracking {
     return created;
   }
 
-  /** Every issue ACP created for the run, with the tasks its unit covered then. */
-  #createdIssues(runId: string): Array<{ issueNumber: number; taskIds?: string[] }> {
+  #rows(kind: string, runId: string): Array<Record<string, unknown>> {
     return this.ports.db
-      .all<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`, [WORK_SCOPE_GITHUB_CREATED, runId])
-      .map((row) => JSON.parse(row.evidence_json) as { resource?: string; number?: number; taskIds?: string[] })
-      .flatMap((e) => (e.resource === "issue" && typeof e.number === "number" ? [{ issueNumber: e.number, ...(Array.isArray(e.taskIds) ? { taskIds: e.taskIds } : {}) }] : []));
-  }
-
-  /** Issue creates recorded as intended and not yet found (CREATED with their marker). */
-  #pendingIntents(runId: string): Array<{ unit: string; taskIds: string[]; marker: string }> {
-    const rows = (kind: string) => this.ports.db
       .all<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`, [kind, runId])
-      .map((row) => JSON.parse(row.evidence_json) as { resource?: string; unit?: string; taskIds?: string[]; marker?: string });
-    const settled = new Set(rows(WORK_SCOPE_GITHUB_CREATED).map((e) => e.marker).filter((m) => typeof m === "string"));
-    return rows(WORK_SCOPE_GITHUB_CREATING)
-      .filter((e) => e.resource === "issue" && typeof e.unit === "string" && typeof e.marker === "string" && Array.isArray(e.taskIds) && !settled.has(e.marker))
-      .map((e) => ({ unit: e.unit!, taskIds: e.taskIds!, marker: e.marker! }));
+      .map((row) => JSON.parse(row.evidence_json) as Record<string, unknown>);
   }
 
-  #recordCreated(runId: string, resource: "issue" | "milestone", key: { unit?: string; titleDigest?: string; taskIds?: string[]; marker?: string }, answered: { number: number; nodeId: string }): void {
+  /** Every issue ACP created for the run, answered or found by its intent's token, with the tasks it covered. */
+  #createdIssues(runId: string): CreatedIssue[] {
+    return this.#rows(WORK_SCOPE_GITHUB_CREATED, runId).flatMap((e) =>
+      e["resource"] === "issue" && typeof e["number"] === "number" && typeof e["nodeId"] === "string" && typeof e["unit"] === "string" && typeof e["marker"] === "string" && Array.isArray(e["taskIds"])
+        ? [{ ...(typeof e["intent"] === "string" ? { intent: e["intent"] } : {}), unit: e["unit"], taskIds: e["taskIds"] as string[], marker: e["marker"], issueNumber: e["number"], nodeId: e["nodeId"] }]
+        : []);
+  }
+
+  /** Issue intents neither created (by their own token) nor retired: their outcome is unknown, and they are kept. */
+  #unknownIntents(runId: string): IssueIntent[] {
+    const settled = new Set([...this.#rows(WORK_SCOPE_GITHUB_CREATED, runId), ...this.#rows(WORK_SCOPE_GITHUB_INTENT_RETIRED, runId)].map((e) => e["intent"]).filter((i) => typeof i === "string"));
+    return this.#rows(WORK_SCOPE_GITHUB_CREATING, runId).flatMap((e) =>
+      e["resource"] === "issue" && typeof e["intent"] === "string" && typeof e["unit"] === "string" && typeof e["marker"] === "string" && Array.isArray(e["taskIds"]) && !settled.has(e["intent"])
+        ? [{ intent: e["intent"], unit: e["unit"], taskIds: e["taskIds"] as string[], marker: e["marker"] }]
+        : []);
+  }
+
+  #recordCreated(runId: string, resource: "issue" | "milestone", key: { intent?: string; unit?: string; titleDigest?: string; taskIds?: string[]; marker?: string }, answered: { number: number; nodeId: string }): void {
     this.ports.audit.record({
       kind: WORK_SCOPE_GITHUB_CREATED,
       runId,
