@@ -559,6 +559,20 @@ describe("#1223 P1-A: the audit log and artifact store exempt only exact ACP-gen
     } finally { core.db.close(); }
   });
 
+  it("#1223 CI: a canonical CTO restore challenge id is an ACP id; a secret in that field is still refused", () => {
+    const core = makeCore();
+    try {
+      // The id agentcpd's restoreChallengeId makes, recorded under the unknown audit key `challengeId`.
+      const challengeId = `acp-restore-challenge:sha256:${hex64}`;
+      expect(core.audit.record({ kind: "TEST_RESTORE_CHALLENGE", evidence: { challengeId } }).allowed).toBe(true);
+      expect(core.audit.byKind("TEST_RESTORE_CHALLENGE")[0]!.evidence).toEqual({ challengeId });
+      for (const secret of [`acp-restore-challenge:${LONG_BASE64}`, `acp-restore-challenge:sha256:${hex64}${"A".repeat(8)}`]) {
+        expect(core.audit.record({ kind: "TEST_RESTORE_CHALLENGE_FORGED", evidence: { challengeId: secret } }).allowed, secret).toBe(false);
+      }
+      expect(JSON.stringify(core.audit.byKind("TEST_RESTORE_CHALLENGE_FORGED").map((row) => row.evidence))).not.toContain(LONG_BASE64);
+    } finally { core.db.close(); }
+  });
+
   it("the audit log stores a long-base64 run in free text redacted", () => {
     const core = makeCore();
     try {
