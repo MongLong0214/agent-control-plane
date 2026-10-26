@@ -490,11 +490,7 @@ export const gitDirEntries = (repo: PinnedRepository): string[] => {
  * (`productionRunCli`), so this is all of what it reads.
  */
 export const workerGitConfig = async (repo: PinnedRepository, home: string | undefined): Promise<Record<string, string>> => {
-  const cached = await runPinnedGit(
-    repo,
-    ["config", "-z", "--name-only", "--get-regexp", "^diff\\..*\\.cachetextconv$"],
-    home === undefined ? {} : { extraEnv: { HOME: home } },
-  );
+  const cached = await runPinnedGit(repo, ["config", "-z", "--name-only", "--get-regexp", "^diff\\..*\\.cachetextconv$"], asTheWorker(home));
   if (cached.exitCode !== 0 && cached.exitCode !== 1) {
     throw new Error(`git config --get-regexp ${cached.exitCode === null ? "did not answer" : `exited ${cached.exitCode}`}: ${cached.stderr.slice(0, 300)}`);
   }
@@ -503,19 +499,31 @@ export const workerGitConfig = async (repo: PinnedRepository, home: string | und
   return config;
 };
 
+/** `runPinnedGit` options under which git reads its configuration as the worker's git does: with its HOME. */
+const asTheWorker = (home: string | undefined): Parameters<typeof runPinnedGit>[2] => (home === undefined ? {} : { extraEnv: { HOME: home } });
+
 /**
- * #1246 — whether the repository keeps a split index: `core.splitIndex` true in its configuration, or a
- * `sharedindex.*` file in its git dir(s). Git freshens a shared index's mtime on every read of a split
- * index, optional locks or not, so a turn on one always changes its git dir. Reads no index.
+ * #1246 — whether the repository depends on a split index, read as the worker's git reads it (`home`):
+ * - `configured`: `core.splitIndex` is effectively true, so the next index write splits the index;
+ * - `active`: the index on disk uses a shared index. Git freshens that file's mtime on every read of the
+ *   index, optional locks or not, so a turn on it always changes its git dir.
+ * `active` is asked with `core.splitIndex` forced true, because git applies the setting to the index it
+ * has read: with it false, `--shared-index-path` prints nothing for an index still split on disk, which
+ * every read still freshens. Forced true, it names the real shared index exactly when the index on disk
+ * is split, and an all-zero one when it is not. A `sharedindex.*` file the index no longer uses (left
+ * by `git update-index --no-split-index`) is not read and does not count. Writes nothing.
  */
-export const splitIndexOf = async (repo: PinnedRepository): Promise<{ configured: boolean; sharedIndexFiles: string[] }> => {
-  const setting = await runPinnedGit(repo, ["config", "--type=bool", "--get", "core.splitIndex"]);
+export const splitIndexOf = async (repo: PinnedRepository, home: string | undefined): Promise<{ configured: boolean; active: boolean }> => {
+  const options = asTheWorker(home);
+  const setting = await runPinnedGit(repo, ["config", "--type=bool", "--get", "core.splitIndex"], options);
   if (setting.exitCode !== 0 && setting.exitCode !== 1) {
     throw new Error(`git config core.splitIndex ${setting.exitCode === null ? "did not answer" : `exited ${setting.exitCode}`}: ${setting.stderr.slice(0, 300)}`);
   }
-  const sharedIndexFiles = [...new Set([repo.gitDir, repo.commonDir])]
-    .flatMap((dir) => readdirSync(dir).filter((name) => name.startsWith("sharedindex.")).map((name) => join(dir, name)));
-  return { configured: setting.exitCode === 0 && setting.stdout.trim() === "true", sharedIndexFiles };
+  const shared = await must(repo, ["-c", "core.splitIndex=true", "rev-parse", "--shared-index-path"], options);
+  return {
+    configured: setting.exitCode === 0 && setting.stdout.trim() === "true",
+    active: /sharedindex\.[0-9a-f]*[1-9a-f][0-9a-f]*$/.test(shared.trim()),
+  };
 };
 
 /** One git-dir entry that differs between two `gitDirEntries` readings; never its contents. */

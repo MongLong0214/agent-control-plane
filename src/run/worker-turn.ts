@@ -2413,12 +2413,12 @@ const measurePartialMove = async (
  * The refusal names the setting, so the operator can turn it off.
  */
 const splitIndexRefusal = async (repo: PinnedRepository, worktree: string): Promise<Decision<never> | null> => {
-  const split = await splitIndexOf(repo);
-  if (!split.configured && split.sharedIndexFiles.length === 0) return null;
+  const split = await splitIndexOf(repo, providerHome());
+  if (!split.configured && !split.active) return null;
   return deny(
     ReasonCode.WORKER_REPOSITORY_SPLIT_INDEX_UNSUPPORTED,
-    "the claimed worktree's repository keeps a split index (core.splitIndex); git touches its shared index on every read, so a worker turn cannot hold the git dir unchanged. Turn it off (`git config core.splitIndex false`, then `git update-index --no-split-index`) and run the turn again",
-    { worktreeId: worktree, setting: "core.splitIndex", configured: split.configured, sharedIndexFiles: split.sharedIndexFiles.length },
+    "the claimed worktree's repository uses a split index, or is set to (core.splitIndex); git touches the shared index on every read, so a worker turn cannot hold the git dir unchanged. Turn it off (`git config core.splitIndex false`, then `git update-index --no-split-index`) and run the turn again",
+    { worktreeId: worktree, setting: "core.splitIndex", configured: split.configured, active: split.active },
   );
 };
 

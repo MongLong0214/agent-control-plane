@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
@@ -34,8 +34,10 @@ import { FakeWorkerAdapter, seedWorkerWorld, type FakeTurnScript, type WorkerWor
  *   configuration (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`), nor a file the repository's
  *   configuration includes from the provider's HOME (`include.path`, `includeIf`): discovery reads with
  *   that same HOME;
- * - (g) a repository that keeps a split index is refused before anything is prepared or launched
- *   (WORKER_REPOSITORY_SPLIT_INDEX_UNSUPPORTED), naming `core.splitIndex`.
+ * - (g) a repository whose index uses a shared index, or whose `core.splitIndex` is true, is refused
+ *   before anything is prepared or launched (WORKER_REPOSITORY_SPLIT_INDEX_UNSUPPORTED), naming
+ *   `core.splitIndex`; one recovered as that refusal says, its unused `sharedindex.*` file left behind,
+ *   runs.
  */
 
 const adapters: FakeWorkerAdapter[] = [];
@@ -464,14 +466,19 @@ describe("#1246 (f) a file the repository's configuration includes from the prov
 });
 
 describe("#1246 (g) a repository that keeps a split index", () => {
-  /** Each variant, and what the refusal says of it: the setting, and how many shared index files. */
-  const variants: Array<[string, (repo: string) => void, { configured: boolean; sharedIndexFiles: number }]> = [
-    ["core.splitIndex true, its shared index written", (repo) => {
+  /** Each variant, and what the refusal says of it: whether the setting is true, and whether the index uses a shared index. */
+  const variants: Array<[string, (repo: string) => void, { configured: boolean; active: boolean }]> = [
+    ["core.splitIndex true, the index split", (repo) => {
       gitSync(repo, ["config", "core.splitIndex", "true"]);
       gitSync(repo, ["update-index", "--split-index"]);
-    }, { configured: true, sharedIndexFiles: 1 }],
-    ["a shared index with core.splitIndex unset", (repo) => gitSync(repo, ["update-index", "--split-index"]), { configured: false, sharedIndexFiles: 1 }],
-    ["core.splitIndex true before any shared index exists", (repo) => gitSync(repo, ["config", "core.splitIndex", "true"]), { configured: true, sharedIndexFiles: 0 }],
+    }, { configured: true, active: true }],
+    ["the index split with core.splitIndex unset", (repo) => gitSync(repo, ["update-index", "--split-index"]), { configured: false, active: true }],
+    ["core.splitIndex true before the index is split", (repo) => gitSync(repo, ["config", "core.splitIndex", "true"]), { configured: true, active: false }],
+    // Only the first half of the recovery: every read of this index still touches its shared index.
+    ["core.splitIndex false with the index still split", (repo) => {
+      gitSync(repo, ["update-index", "--split-index"]);
+      gitSync(repo, ["config", "core.splitIndex", "false"]);
+    }, { configured: false, active: true }],
   ];
 
   it("is refused before anything is prepared or launched, naming core.splitIndex, and nothing is left behind", async () => {
@@ -502,5 +509,18 @@ describe("#1246 (g) a repository that keeps a split index", () => {
         attempts: world.audit.byKind("TASK_BRANCH_CREATING").length,
       }, name).toEqual({ launches: 0, executions: 0, head: "dev", refs, branchRecords, attempts: 0 });
     }
+  });
+
+  it("recovered as the refusal says, an unused sharedindex.* file left behind: the turn runs and succeeds", async () => {
+    const world = freshRacyWorld("main");
+    gitSync(world.repoPath, ["config", "core.splitIndex", "true"]);
+    gitSync(world.repoPath, ["update-index", "--split-index"]);
+    gitSync(world.repoPath, ["config", "core.splitIndex", "false"]);
+    gitSync(world.repoPath, ["update-index", "--no-split-index"]);
+    const leftover = readdirSync(join(world.repoPath, ".git")).filter((name) => name.startsWith("sharedindex."));
+    expect({ leftover: leftover.length, sharedIndexPath: gitSync(world.repoPath, ["rev-parse", "--shared-index-path"]) }).toEqual({ leftover: 1, sharedIndexPath: "" });
+    const outcome = await fakeTurn(world, () => shellGit(world.repoPath, ["status", "--short"], { GIT_OPTIONAL_LOCKS: "0" }));
+    expect({ status: outcome.status, reason: outcome.reason }).toEqual({ status: "SUCCEEDED", reason: null });
+    expect(gitSync(world.repoPath, ["show", "HEAD:src/app.js"])).toBe(CHANGE.trimEnd());
   });
 });
