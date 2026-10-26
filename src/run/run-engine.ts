@@ -283,16 +283,11 @@ const isContinuityPause = (evidence: Record<string, unknown> | null, stateReason
  * and their replies, claims, leases, guards, bindings it scopes, wakes and finalization. One of these
  * after continuity's pause keeps the hold. Classified by what each emission site records, not by name
  * (#1162 r3): a kind every site of which records only a refusal, a deferral or an ignored input is not
- * listed (OUTBOX_ACK_REJECTED, GATE_REJECTED, MERGE_REFUSED, REPAIR_REFUSED, REPAIR_DRY_RUN,
- * CTO_DISPATCH_REFUSED_CANONICAL, CTO_SESSION_PROBE_FAILED, WORKER_PROBE_GROUP_UNCONFIRMED,
- * CEO_NOTIFICATION_BLOCKED, BLIND_REVIEW_MANUAL_DENIED, BLIND_REVIEW_REJECTED, RUN_DISPATCH_DEFERRED,
- * TASK_EXECUTION_LATE_RESULT_IGNORED, TASK_WORKER_TURN_LATE_RESULT_REFUSED, WORKER_RETIREMENT_DEFERRED,
- * BOOTSTRAP_CTO_RECLAIM_DEFERRED, WORKER_SESSION_STOP_FAILED, STANDARD_WORK_CONTINUATION_STALLED) and never
- * keeps it; a kind whose sites record both outcomes is movement only for the applied one
- * (`isRecordedMovement`). The S-TB branch records are movement too. A writer that leaves
- * no record, or a record of a kind added later, is still caught by the row snapshot (`#holdSnapshot`) or,
- * for a pause that predates it, by the row times. A kind whose effect was unclear is listed: listing keeps
- * the hold, the safe side.
+ * listed (`CONTINUITY_HOLD_NON_MOVEMENT_KINDS`) and never keeps it; a kind whose sites record both
+ * outcomes is movement only for the applied one (`isRecordedMovement`). The S-TB branch records are
+ * movement too. A writer that leaves no record, or a record of a kind added later, is still caught by the
+ * row snapshot (`#holdSnapshot`) or, for a pause that predates it, by the row times. A kind whose effect was
+ * unclear is listed: listing keeps the hold, the safe side.
  */
 const CONTINUITY_HOLD_MUTATING_KINDS: readonly string[] = [
   "RUN_CREATED", "DISPATCHED", "RUN_TRANSITION", "RUN_PRIORITY_SET", "RUN_OWNER_RENEWED",
@@ -331,12 +326,24 @@ const CONTINUITY_HOLD_MUTATING_KINDS: readonly string[] = [
 ];
 
 /**
+ * #1162 r3 — the kinds every emission site of which records only a refusal, a deferral or an ignored
+ * input, so they are not movement. A kind absent from both lists is not classified here.
+ */
+export const CONTINUITY_HOLD_NON_MOVEMENT_KINDS: readonly string[] = [
+  "OUTBOX_ACK_REJECTED", "GATE_REJECTED", "MERGE_REFUSED", "REPAIR_REFUSED", "REPAIR_DRY_RUN",
+  "CTO_DISPATCH_REFUSED_CANONICAL", "CTO_SESSION_PROBE_FAILED", "WORKER_PROBE_GROUP_UNCONFIRMED",
+  "CEO_NOTIFICATION_BLOCKED", "BLIND_REVIEW_MANUAL_DENIED", "BLIND_REVIEW_REJECTED", "RUN_DISPATCH_DEFERRED",
+  "TASK_EXECUTION_LATE_RESULT_IGNORED", "TASK_WORKER_TURN_LATE_RESULT_REFUSED", "WORKER_RETIREMENT_DEFERRED",
+  "BOOTSTRAP_CTO_RECLAIM_DEFERRED", "WORKER_SESSION_STOP_FAILED", "STANDARD_WORK_CONTINUATION_STALLED",
+];
+
+/**
  * #1162 r3 — whether a listed record is movement by its recorded outcome. The two listed kinds whose sites
  * record both outcomes count only the applied one: a MANAGED_WRITE_GUARD evaluation whose evidence says
  * `allowed: false` granted nothing, and a PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP that could not stop its session
  * (SESSION_STOP_FAILED) changed nothing. An outcome that cannot be read counts as movement.
  */
-const isRecordedMovement = (row: { kind: string; reason_code: string | null; evidence_json: string }): boolean => {
+export const isRecordedMovement = (row: { kind: string; reason_code: string | null; evidence_json: string }): boolean => {
   if (row.kind === "MANAGED_WRITE_GUARD") return auditEvidence(row.evidence_json)?.["allowed"] !== false;
   if (row.kind === "PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP") return row.reason_code !== ReasonCode.SESSION_STOP_FAILED;
   return true;
