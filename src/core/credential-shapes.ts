@@ -11,7 +11,6 @@
 
 /** A run of 60 or more base64 (or hex) characters, inside a line or as a whole value. */
 const LONG_BASE64_RUN = /[A-Za-z0-9+/]{60,}={0,2}/;
-const LONG_BASE64_RUN_GLOBAL = new RegExp(LONG_BASE64_RUN.source, "g");
 
 /** Unanchored, so each shape is found inside a line as well as as a whole value. */
 const CREDENTIAL_SHAPES: readonly RegExp[] = [
@@ -52,26 +51,31 @@ const isCanonicalBase64 = (value: string): boolean =>
   /^[A-Za-z0-9+/]*={0,2}$/.test(value) && Buffer.from(value, "base64").toString("base64") === value;
 
 /**
- * An identifier ACP builds around digests and object names, as the whole value: no whitespace, and
- * every run long enough for the long-base64 shape is exactly 64 lowercase hex characters, the length
- * of ACP's sha256 digests and event ids -- `sha256:<hex>`, a bare event id, `acp-notice:<hex>`,
- * `repair:sha256:<hex>`, `<project>:#manifest/sha256:<hex>`, `buzz:buzz-message:<hex>#1`. A 40-hex
- * commit is shorter than that shape and needs no exemption.
+ * ACP's own identifier formats, each exact: the whole value is the id, with nothing around it. A
+ * digest, a bare 64-hex id (an event id, signer, public key or hex digest), and the composite ids
+ * ACP builds from them. A whitespace-free value that merely contains a 64-hex run (`exposed=<hex>`)
+ * is not one of these and gets every shape. A 40-hex commit is shorter than any shape and needs none.
  */
-const isGeneratedId = (value: string): boolean => {
-  if (/\s/.test(value)) return false;
-  const runs = value.match(LONG_BASE64_RUN_GLOBAL) ?? [];
-  return runs.length > 0 && runs.every((run) => /^[0-9a-f]{64}$/.test(run));
-};
+const ACP_ID_FORMATS: readonly RegExp[] = [
+  /^sha256:[0-9a-f]{64}$/,
+  /^[0-9a-f]{64}$/,
+  /^acp-notice(?:-probe)?:[0-9a-f]{64}$/,
+  /^(?:repair|rf-write|owner-decision|telegram:owner-decision):sha256:[0-9a-f]{64}$/,
+  /^(?:buzz:)?buzz-message:[0-9a-f]{64}(?::[0-9a-f]{64}|#\d+)?$/,
+  /^[A-Za-z0-9._-]+:#manifest\/sha256:[0-9a-f]{64}$/,
+  /^bootstrap-(?:review-retry|result-recovery):run_[0-9a-f]+:\d+:sha256:[0-9a-f]{64}(?::\d+)?$/,
+];
+
+const isAcpId = (value: string): boolean => ACP_ID_FORMATS.some((format) => format.test(value));
 
 /**
  * A value of a field ACP generates, validated by its exact shape, which has the long-base64 shape
- * by construction: an `isGeneratedId` value, or a staged file's canonical base64 bytes at its known
- * key path. Only these skip the long-base64 shape, and only that one; every other string, free text
- * included, is checked against every shape.
+ * by construction: a whole `ACP_ID_FORMATS` id, or a staged file's canonical base64 bytes at its
+ * known key path. Only these skip the long-base64 shape, and only that one; every other string --
+ * free text included, and an id or digest inside it -- is checked against every shape.
  */
 export const isAcpGeneratedField = (value: string, path: readonly string[]): boolean =>
-  isGeneratedId(value) || (STAGED_BODY_PATHS.has(path.join(".")) && isCanonicalBase64(value));
+  isAcpId(value) || (STAGED_BODY_PATHS.has(path.join(".")) && isCanonicalBase64(value));
 
 /**
  * Key paths at which an evidence string is itself records ACP serialized, read field by field: each
@@ -199,7 +203,7 @@ const REPOSITORY_PATH_FIELDS: Readonly<Record<EvidenceField["store"], ReadonlySe
  */
 const isRepositoryPath = (text: string, field: EvidenceField | undefined): boolean =>
   // A whole-value ACP id there (`<project>:#manifest/sha256:<hex>`) keeps the id rule it has today.
-  field !== undefined && REPOSITORY_PATH_FIELDS[field.store].has(field.path.join(".")) && !isGeneratedId(text);
+  field !== undefined && REPOSITORY_PATH_FIELDS[field.store].has(field.path.join(".")) && !isAcpId(text);
 
 const segmentsHoldShape = (text: string): boolean => text.split("/").some((segment) => holdsShape(segment, CREDENTIAL_SHAPES));
 

@@ -266,17 +266,24 @@ export interface ExecutionEvidenceInput {
 }
 
 /**
- * The bytes of one blob as text, or null. `git()` decodes stdout as UTF-8, which is lossy for other
- * bytes, so the object id is re-derived from the decoded text: only when it equals the id git named
- * are these the committed bytes (the same check as verification's gate-entry read).
+ * The exact bytes of one blob, or null. Read as `latin1`, one character per byte, so binary content
+ * survives; the object id is re-derived from those bytes, and only when it equals the id git named
+ * are they the committed bytes.
  */
-const exactBlobText = async (checkoutPath: string, id: string): Promise<string | null> => {
+const blobBytes = async (checkoutPath: string, id: string): Promise<Buffer | null> => {
   if (!OBJECT_ID.test(id)) return null;
-  const blob = await git(checkoutPath, ["--no-replace-objects", "cat-file", "blob", id], { allowFailure: true });
+  const blob = await git(checkoutPath, ["--no-replace-objects", "cat-file", "blob", id], { allowFailure: true, encoding: "latin1" });
   if (blob.exitCode !== 0) return null;
-  const bytes = Buffer.from(blob.stdout, "utf8");
+  const bytes = Buffer.from(blob.stdout, "latin1");
   const format = id.length === 64 ? "sha256" : "sha1";
-  return createHash(format).update(`blob ${bytes.length}\0`).update(bytes).digest("hex") === id ? blob.stdout : null;
+  return createHash(format).update(`blob ${bytes.length}\0`).update(bytes).digest("hex") === id ? bytes : null;
+};
+
+/** A blob's bytes as text, or null when they are not valid UTF-8 (a config file must be text). */
+const exactBlobText = async (checkoutPath: string, id: string): Promise<string | null> => {
+  const bytes = await blobBytes(checkoutPath, id);
+  if (bytes === null) return null;
+  try { return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); } catch { return null; }
 };
 
 /**
@@ -488,9 +495,10 @@ const recomputedDiffDigest = async (checkoutPath: string, base: string, entries:
     if (!WORKER_ENTRY_MODES.has(entry.mode) || entry.blob === null) {
       return { problem: `diffDigest was not recomputed: ${entry.path} is a mode ${entry.mode} entry, which no worker receipt records` };
     }
-    const text = await exactBlobText(checkoutPath, entry.blob);
-    if (text === null) return { problem: `diffDigest was not recomputed: the bytes of ${entry.path} cannot be read exactly as UTF-8 text` };
-    digested.push({ path: entry.path, mode: entry.mode as "100644" | "100755" | "120000", sha256: sha256(Buffer.from(text, "utf8")), blob: entry.blob });
+    // The committed bytes, hashed as the worker hashes the file it committed (worker-git.ts).
+    const bytes = await blobBytes(checkoutPath, entry.blob);
+    if (bytes === null) return { problem: `diffDigest was not recomputed: the committed bytes of ${entry.path} could not be read` };
+    digested.push({ path: entry.path, mode: entry.mode as "100644" | "100755" | "120000", sha256: sha256(bytes), blob: entry.blob });
   }
   return { digest: workerDiffDigest(base, digested) };
 };

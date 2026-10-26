@@ -1,9 +1,9 @@
-import { symlinkSync } from "node:fs";
+import { symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { sha256 } from "../../src/core/digest.ts";
-import { redactCredentialValues } from "../../src/core/credential-shapes.ts";
+import { hasCredentialShape, redactCredentialValues } from "../../src/core/credential-shapes.ts";
 import type { ReviewPacket } from "../../src/review/blind-review.ts";
 import { reviewEvidenceBundleSchema } from "../../src/bootstrap/bootstrap-review-evidence.ts";
 import { credentialBearingField } from "../../src/db/audit.ts";
@@ -36,6 +36,8 @@ import { bindCeo, bindWorker, fixtureManifest, makeHarness, registerFixtureProje
 const GITHUB_TOKEN_SHAPE = `ghp_${"A1b2C3d4".repeat(5)}`;
 /** #1223 review P1: a bare long-base64 value, which the sandbox's own shapes refuse. */
 const LONG_BASE64 = "Ab9+/Zq7".repeat(10);
+/** #1223 review R3: a whitespace-free value whose only long run is 64 hex, which is not an ACP id. */
+const EXPOSED_HEX = `exposed=${"a1b2c3d4".repeat(8)}`;
 /** The same shape embedded inside a line, with no prefix to recognise it by. */
 const EMBEDDED_LINE = `key=${"Kx7/Lp2+".repeat(9)}== was printed by a test`;
 const sandboxOutput = { stdout: "", stderr: "" };
@@ -110,7 +112,7 @@ const openExecution = (setup: Prepared, key: string) => {
  * inputs digest to the execution's resultDigest, and the execution closed with that digest.
  */
 const finishWithReceipt = (setup: Prepared, opened: ReturnType<typeof openExecution>, receipt: {
-  base: string; commitHead: string; changed: Array<[path: string, bytes: string]>; recordedResultDigest?: string;
+  base: string; commitHead: string; changed: Array<[path: string, bytes: string | Buffer]>; recordedResultDigest?: string;
 }) => {
   const diffDigest = workerDiffDigest(receipt.base,
     receipt.changed.map(([path, bytes]) => ({ path, mode: "100644" as const, sha256: sha256(bytes), blob: null })));
@@ -237,6 +239,30 @@ describe("an ordinary candidate review carries the official execution evidence",
       expect(byExecution.get(wrongBytes.executionId)!.mismatches).toEqual(["the receipt's diffDigest is not the frozen change's"]);
       expect(byExecution.get(wrongBase.executionId)!.mismatches).toEqual([`the receipt's base head is not the snapshot's baseHead ${baseHead}`]);
       expect(byExecution.get(unreproduced.executionId)!.mismatches).toEqual(["no success record of this execution reproduces its resultDigest"]);
+    } finally { harness.cp.close(); }
+  }, 60_000);
+
+  it("#1223 R3: a binary change links by its raw committed bytes; other bytes still do not", async () => {
+    const setup = await prepareRun();
+    const { harness, run, baseHead } = setup;
+    try {
+      const bytes = Buffer.from([0, 255, 1, 2]);
+      const linked = openExecution(setup, "binary");
+      const other = openExecution(setup, "binary-other-bytes");
+      startWorkBranch(harness.repoPath);
+      writeFileSync(join(harness.repoPath, "src", "image.bin"), bytes);
+      const head = commitAll(harness.repoPath, "add a binary file");
+      finishWithReceipt(setup, linked, { base: baseHead, commitHead: head, changed: [["src/image.bin", bytes]] });
+      finishWithReceipt(setup, other, { base: baseHead, commitHead: head, changed: [["src/image.bin", Buffer.from([0, 255, 1, 3])]] });
+      const frozen = await harness.cp.pipeline.freeze(run.runId);
+      if (!frozen.allowed) throw new Error(frozen.message);
+      const evidence = await readExecutionEvidence(harness.cp.db, { runId: run.runId, snapshot: frozen.value,
+        snapshotDigest: candidateSnapshotDigest(frozen.value), contractDigest: run.contractDigest,
+        verification: { results: [] } as unknown as VerificationReport, checkoutOf: () => harness.repoPath });
+      const byExecution = new Map(evidence.receipts.map((receipt) => [receipt.executionId, receipt]));
+      expect(byExecution.get(linked.executionId)).toMatchObject({ linked: true, mismatches: [] });
+      expect(byExecution.get(other.executionId)).toMatchObject({ linked: false, mismatches: ["the receipt's diffDigest is not the frozen change's"] });
+      expect(evidence.repositories[0]!.linkedExecutionIds).toEqual([linked.executionId]);
     } finally { harness.cp.close(); }
   }, 60_000);
 
@@ -488,6 +514,17 @@ describe("#1223 P1-A: the audit log and artifact store exempt only exact ACP-gen
     expect(credentialBearingField({ note: `${start}\n` })).toBe("note");
   });
 
+  it("#1223 R3: a 64-hex run inside a whitespace-free free-text value gets every shape; an exact id does not", () => {
+    expect(hasCredentialShape(EXPOSED_HEX)).toBe(true);
+    expect(credentialBearingField({ detail: EXPOSED_HEX })).toBe("detail");
+    expect(credentialBearingField({ digest: `sha256:${hex64}`, eventId: hex64 })).toBeNull();
+    const core = makeCore();
+    try {
+      expect(core.audit.record({ kind: "TEST_EXPOSED_HEX", evidence: { detail: EXPOSED_HEX, digest: `sha256:${hex64}` } }).allowed).toBe(true);
+      expect(core.audit.byKind("TEST_EXPOSED_HEX")[0]!.evidence).toEqual({ detail: "exposed=[redacted]", digest: `sha256:${hex64}` });
+    } finally { core.db.close(); }
+  });
+
   it("the audit log stores a long-base64 run in free text redacted", () => {
     const core = makeCore();
     try {
@@ -547,6 +584,10 @@ describe("#1223 P1-A: the audit log and artifact store exempt only exact ACP-gen
       const writer = setup.harness.cp.evidenceWritersForTests().VERIFICATION;
       expect(() => setup.harness.cp.artifacts.putEvidence(writer, setup.run.runId, "VERIFICATION", report(LONG_BASE64), digest))
         .toThrow(/contains a credential/);
+      // #1223 R3: a 64-hex run inside a whitespace-free free-text value is not an id.
+      expect(() => setup.harness.cp.artifacts.putEvidence(writer, setup.run.runId, "VERIFICATION", report(EXPOSED_HEX), digest))
+        .toThrow(/contains a credential/);
+      // The exact `sha256:<64hex>` outputDigest field of the stored report is an id and stores.
       expect(setup.harness.cp.artifacts.putEvidence(writer, setup.run.runId, "VERIFICATION", report("VERIFICATION_COMMAND_FAILED"), digest).digest)
         .toMatch(/^sha256:/);
     } finally { setup.harness.cp.close(); }
