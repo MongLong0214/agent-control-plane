@@ -834,8 +834,7 @@ export class RepoFactoryBootstrapRunner {
       commitlore,
       persist: (result) => {
         const written = this.deps.db.txDecision(() => {
-          // The run's work directory this runner computed: the producer's checkout is built under it.
-          this.deps.artifacts.put(runId, ArtifactKind.REPO_FACTORY_RESULT, result, null, [workDir]);
+          this.deps.artifacts.put(runId, ArtifactKind.REPO_FACTORY_RESULT, result);
           return this.deps.applications.markWritten(runId);
         });
         if (!written.allowed) throw acpError(written.reasonCode, written.message, written.evidence);

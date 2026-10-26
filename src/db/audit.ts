@@ -14,12 +14,6 @@ export interface AuditRecord {
   roleKey?: string | null;
   actor?: string | null;
   evidence?: Evidence;
-  /**
-   * Canonical locations the writing code computed itself for this record (the toplevel the registry
-   * resolved, the roots the write guard probed): what a location in `evidence` is checked against
-   * before it is read per segment. Never stored.
-   */
-  verifiedLocations?: readonly string[];
 }
 
 /**
@@ -46,8 +40,7 @@ export class AuditLog {
    */
   record(entry: AuditRecord): Decision<number> {
     const site: WriteSite = { writer: entry.kind, runId: entry.runId ?? null, locations: this.locations,
-      registry: registryView(this.db), record: entry.evidence ?? {},
-      ...(entry.verifiedLocations ? { verified: entry.verifiedLocations } : {}) };
+      registry: registryView(this.db), record: entry.evidence ?? {} };
     if (!isAllowlistedAuditEvidence(entry.evidence ?? {}, 0, [], site)) {
       // Keep the decision itself visible without retaining the rejected payload. An audit
       // record that might contain a private payload is less useful than a privacy breach.

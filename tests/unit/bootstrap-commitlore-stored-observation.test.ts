@@ -90,8 +90,7 @@ describe("review S11-R1-03: a stored CommitLore PASS is bound to the observation
     // The documented completion-chain threat includes a raw database writer. These APIs make the
     // same two database changes, while every approval/attempt/GitHub ledger remains unmodified.
     harness.cp.db.tx(() => {
-      // Its checkout is the producer's own, under the run's work directory, which the runner hands the store.
-      harness.cp.artifacts.put(runId, "REPO_FACTORY_RESULT", forged, null, [join(prepared.workRoot, runId)]);
+      harness.cp.artifacts.put(runId, "REPO_FACTORY_RESULT", forged);
       expect(harness.cp.bootstrapApplications.markWritten(runId).allowed).toBe(true);
     });
 

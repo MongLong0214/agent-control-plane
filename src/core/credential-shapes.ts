@@ -135,12 +135,21 @@ export interface AcpLocations {
   readonly repoFactoryWorkRoot?: string | null;
 }
 
-/** What the repository registry recorded, read by the store from its own database. */
+/**
+ * Facts ACP already stored, read by the store itself from its own database (db/registry-view.ts):
+ * never a value the caller of `put` or `record` hands over. Paths are canonical.
+ */
 export interface RegistryView {
   /** Whether the registry records exactly this identity at exactly this checkout. */
   records(identity: string, checkoutPath: string): boolean;
   /** The same, for a repository registered for the run: its project's, or the run's own temporary one. */
   recordsForRun(runId: string, identity: string, checkoutPath: string): boolean;
+  /** The checkouts the registry records for an identity. */
+  checkoutsOf(identity: string): readonly string[];
+  /** The run's verification trees of a repository (verification_worktrees). */
+  runWorktrees(runId: string, identity: string): readonly string[];
+  /** The worktree a task execution of the run is bound to (task_executions.worktree_id), or null. */
+  receiptWorktree(runId: string, executionId: string): string | null;
 }
 
 /** Where a record is being written: the facts a verified location's contract is checked against. */
@@ -149,13 +158,9 @@ export interface WriteSite {
   readonly writer: string;
   /** The run the record is filed under: an artifact's run, an audit event's `runId`. */
   readonly runId?: string | null;
+  /** Trusted configuration the store was constructed with. */
   readonly locations?: AcpLocations;
-  /**
-   * Canonical locations the writing code computed itself for this one record and hands to the store
-   * beside it, never read from the record: the toplevel the registry resolved, the roots the write
-   * guard probed for a grant. Not stored.
-   */
-  readonly verified?: readonly string[];
+  /** Facts the store reads from its own database. */
   readonly registry?: RegistryView;
   /** The whole record being written: a contract reads facts elsewhere in it (an allocation's repository). */
   readonly record?: unknown;
@@ -326,18 +331,19 @@ const runLedger: LocationContract = (text, field) => {
 
 /**
  * The producer's checkout for the result's own `role`, beside it: `repositoryCheckoutPath` or an
- * attempt's `attemptCheckoutPath` under the run's work directory, `join(workRoot, runId)`, as the
- * runner that stores the result computed it and hands it to the store. Once activation registered
- * the binding, the registry's record of the result's identity at exactly this checkout is it too.
+ * attempt's `attemptCheckoutPath` under the run's work directory, `join(workRoot, runId)`, from the
+ * configured work root and the run the result is filed under. Once activation registered the binding,
+ * the registry's stored record of the result's identity at exactly this checkout is it too.
  */
 const factoryCheckout: LocationContract = (text, field) => {
   const identity = sibling(field, "identity");
   if (typeof identity === "string" && field.site?.registry?.records(identity, text) === true) return true;
+  const workDir = runWorkDir(field);
   const role = sibling(field, "role");
-  if (typeof role !== "string" || !REPOSITORY_ROLE.test(role)) return false;
+  if (workDir === null || typeof role !== "string" || !REPOSITORY_ROLE.test(role)) return false;
+  if (text === repositoryCheckoutPath(workDir, role)) return true;
   const attempt = /\.attempt-(\d{1,9})$/.exec(text);
-  return (field.site?.verified ?? []).some((workDir) => (text === repositoryCheckoutPath(workDir, role)
-    || (attempt !== null && text === attemptCheckoutPath(workDir, role, Number(attempt[1])))));
+  return attempt !== null && text === attemptCheckoutPath(workDir, role, Number(attempt[1]));
 };
 
 /**
@@ -371,35 +377,57 @@ const runRepositoryIdentity: LocationContract = (text, field) => {
   return checkoutPath !== null && typeof runId === "string" && field.site?.registry?.recordsForRun(runId, text, checkoutPath) === true;
 };
 
-/** The canonical checkout the writing code computed for this record (repository-registry.ts: its git toplevel). */
-const writerComputedCheckout: LocationContract = (text, field) => field.site?.verified?.includes(text) === true;
+/**
+ * A registration's checkout (repository-registry.ts writes the row before its audit record): the
+ * canonical toplevel the registry stored for the identity beside it.
+ */
+const storedRegistrationCheckout: LocationContract = (text, field) => {
+  const identity = sibling(field, "identity");
+  return typeof identity === "string" && field.site?.registry?.records(identity, text) === true;
+};
 
-/** `local:` and the checkout beside it in the same record, which the writing code computed. */
-const writerComputedIdentity: LocationContract = (text, field) => {
+/** A registration's `local:` identity: `local:` and the checkout beside it, as the registry stored the pair. */
+const storedRegistrationIdentity: LocationContract = (text, field) => {
   const checkoutPath = sibling(field, "checkoutPath");
-  return typeof checkoutPath === "string" && localPath(text) === checkoutPath && field.site?.verified?.includes(checkoutPath) === true;
+  return typeof checkoutPath === "string" && localPath(text) === checkoutPath
+    && field.site?.registry?.records(text, checkoutPath) === true;
 };
 
 /**
- * Inside a root the write guard probed for this grant and hands to the audit beside it (the
- * registered checkout, the assigned worktree, the run's own verification trees): the root itself or
- * a normalized path under it. The part under the root is a repository path, read per segment.
+ * The roots a consumed grant may reach, read from the store's own database for the grant's
+ * repository and run: the registry's checkouts of that repository, the run's verification trees of
+ * it, and the worktree its task execution is bound to. None comes from the caller.
  */
-const insideProbedRoot: LocationContract = (text, field) =>
-  text.startsWith("/") && resolve(text) === text
-  && (field.site?.verified ?? []).some((root) => root.startsWith("/") && (text === root || text.startsWith(`${root}/`)));
+const grantRoots = (field: EvidenceField): readonly string[] => {
+  const registry = field.site?.registry;
+  const record = field.site?.record;
+  const identity = member(record, "repositoryIdentity");
+  if (registry === undefined || typeof identity !== "string") return [];
+  const runId = field.site?.runId;
+  const execution = member(record, "taskReceiptId");
+  return [
+    ...registry.checkoutsOf(identity),
+    ...(typeof runId === "string" ? registry.runWorktrees(runId, identity) : []),
+    ...(typeof runId === "string" && typeof execution === "string" ? [registry.receiptWorktree(runId, execution)] : []),
+  ].filter((root): root is string => typeof root === "string" && root.startsWith("/"));
+};
 
-/** `local:` and exactly a root the write guard probed for this grant. */
-const probedRootIdentity: LocationContract = (text, field) => {
+/** Inside a stored root of the grant: the root itself or a normalized path under it, the rest read per segment. */
+const insideGrantRoot: LocationContract = (text, field) =>
+  text.startsWith("/") && resolve(text) === text
+  && grantRoots(field).some((root) => text === root || text.startsWith(`${root}/`));
+
+/** A grant's `local:` repository identity: the registry stores that identity at exactly that checkout. */
+const storedLocalIdentity: LocationContract = (text, field) => {
   const path = localPath(text);
-  return path !== null && field.site?.verified?.includes(path) === true;
+  return path !== null && field.site?.registry?.records(text, path) === true;
 };
 
 /**
  * Locations that ACP code itself made or checked, by the writer that stores them and the exact
- * field, each with the contract its value must meet: a location ACP itself knows (a root it computed
- * from its configuration, the registry's record, or what the writing code computed for this record),
- * never the value's shape and its writer alone. Only a value that meets its contract is read per
+ * field, each with the contract its value must meet: a location ACP itself knows, from the trusted
+ * configuration the store was constructed with and facts the store reads from its own database, never
+ * from the caller of `put` or `record`, and never the value's shape and its writer alone. Only a value that meets its contract is read per
  * segment. A temp directory's random segments can join `/` into a long base64-alphabet run
  * (`/private/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/acp` is 60 such characters on a CI
  * runner) while no segment is one. A field of the same name from any other writer, a value that does
@@ -419,10 +447,10 @@ const VERIFIED_LOCATIONS: ReadonlyMap<string, ReadonlyMap<string, LocationContra
   ["artifact:VERIFICATION", new Map([["results.repositoryIdentity", runRepositoryIdentity], ["results.output.repositoryIdentity", runRepositoryIdentity]])],
   // doctor/repair.ts: a reservation release's preconditions name the ledger the run's attempts wrote.
   ["artifact:REPAIR_RECEIPT", new Map([["preconditionsChecked.evidence.ledgerPath", runLedger]])],
-  ["audit:REPOSITORY_REGISTERED", new Map([["checkoutPath", writerComputedCheckout], ["identity", writerComputedIdentity]])],
-  ["audit:REPOSITORY_TEMPORARY_BINDING", new Map([["checkoutPath", writerComputedCheckout], ["identity", writerComputedIdentity]])],
+  ["audit:REPOSITORY_REGISTERED", new Map([["checkoutPath", storedRegistrationCheckout], ["identity", storedRegistrationIdentity]])],
+  ["audit:REPOSITORY_TEMPORARY_BINDING", new Map([["checkoutPath", storedRegistrationCheckout], ["identity", storedRegistrationIdentity]])],
   ["audit:MANAGED_WRITE_GUARD_CONSUMED", new Map([
-    ["resolvedPath", insideProbedRoot], ["targetWorktreeId", insideProbedRoot], ["repositoryIdentity", probedRootIdentity],
+    ["resolvedPath", insideGrantRoot], ["targetWorktreeId", insideGrantRoot], ["repositoryIdentity", storedLocalIdentity],
   ])],
   ["audit:REPAIR_REFUSED", new Map([["preconditions.evidence.ledgerPath", runLedger]])],
   ["audit:DAEMON_RUNTIME_OBSERVED", new Map([["resolvedPath", observedEntrypoint]])],
