@@ -9,6 +9,7 @@ import type { ReviewPacket } from "../../src/review/blind-review.ts";
 import { reviewEvidenceBundleSchema } from "../../src/bootstrap/bootstrap-review-evidence.ts";
 import { AuditLog, credentialBearingField } from "../../src/db/audit.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
   CONFIG_FILE_CHAR_LIMIT,
   type ExecutionEvidence,
@@ -215,8 +216,13 @@ describe("an ordinary candidate review carries the official execution evidence",
       writeFiles(harness.repoPath, { "src/app.js": APP_BYTES });
       const head = commitAll(harness.repoPath, "make app() return 2");
 
+      // A receipt for a commit outside the candidate's history. Since #1236 a SUCCEEDED task's own
+      // receipt there stops the freeze before any review (the next test); this one reaches the review
+      // evidence because the freeze reads it as naming nothing: its execution's stored resultDigest is
+      // another. The review evidence must still never list it as this candidate's.
       const otherCandidate = openExecution(setup, "other-candidate");
-      finishWithReceipt(setup, otherCandidate, { base: baseHead, commitHead: elsewhere, changed: [["src/app.js", "module.exports = () => 9;\n"]] });
+      finishWithReceipt(setup, otherCandidate, { base: baseHead, commitHead: elsewhere, changed: [["src/app.js", "module.exports = () => 9;\n"]],
+        recordedResultDigest: sha256("the execution's own result") });
       const inHistory = openExecution(setup, "earlier-attempt");
       finishWithReceipt(setup, inHistory, { base: baseHead, commitHead: earlier, changed: [["src/app.js", "module.exports = () => 4;\n"]] });
       const wrongBytes = openExecution(setup, "wrong-bytes");
@@ -243,6 +249,36 @@ describe("an ordinary candidate review carries the official execution evidence",
       expect(byExecution.get(wrongBytes.executionId)!.mismatches).toEqual(["the receipt's diffDigest is not the frozen change's"]);
       expect(byExecution.get(wrongBase.executionId)!.mismatches).toEqual([`the receipt's base head is not the snapshot's baseHead ${baseHead}`]);
       expect(byExecution.get(unreproduced.executionId)!.mismatches).toEqual(["no success record of this execution reproduces its resultDigest"]);
+    } finally { harness.cp.close(); }
+  }, 60_000);
+
+  it("a SUCCEEDED task's own receipt for a commit outside the candidate never reaches review: the freeze refuses the candidate (#1236)", async () => {
+    const setup = await prepareRun();
+    const { harness, run, identity, baseHead } = setup;
+    try {
+      gitSync(harness.repoPath, ["checkout", "-q", "-b", "elsewhere"]);
+      writeFiles(harness.repoPath, { "src/app.js": "module.exports = () => 9;\n" });
+      const elsewhere = commitAll(harness.repoPath, "another candidate");
+      gitSync(harness.repoPath, ["checkout", "-q", "dev"]);
+      startWorkBranch(harness.repoPath);
+      writeFiles(harness.repoPath, { "src/app.js": APP_BYTES });
+      const head = commitAll(harness.repoPath, "make app() return 2");
+      const candidate = openExecution(setup, "candidate");
+      finishWithReceipt(setup, candidate, { base: baseHead, commitHead: head, changed: [["src/app.js", APP_BYTES]] });
+      const otherCandidate = openExecution(setup, "other-candidate");
+      finishWithReceipt(setup, otherCandidate, { base: baseHead, commitHead: elsewhere, changed: [["src/app.js", "module.exports = () => 9;\n"]] });
+      harness.scripted.script({ match: /Candidate review/, text: JSON.stringify({ verdict: "PASS",
+        coveredFiles: [`${identity}:src/app.js`], omittedItems: [], findings: [] }) });
+
+      const frozen = await harness.cp.pipeline.freeze(run.runId);
+      expect(frozen).toMatchObject({ allowed: false, reasonCode: ReasonCode.CANDIDATE_MISSING_TASK_COMMIT,
+        evidence: { missing: [{ taskId: otherCandidate.taskId, commitHead: elsewhere, repositoryIdentity: identity }] } });
+      const outcome = await harness.cp.pipeline.submitResult({ runId: run.runId, ownerSessionId: run.ownerSessionId!,
+        ownerBindingGeneration: run.ownerBindingGeneration!, resultSummary: "app returns 2", recommendation: "merge" });
+      expect(outcome.allowed, JSON.stringify(outcome)).toBe(false);
+      // No candidate was frozen and no review ran, so no review input ever carried the receipt.
+      expect(harness.cp.artifacts.list(run.runId, "CANDIDATE_SNAPSHOT")).toEqual([]);
+      expect(harness.scripted.invocations.filter((call) => call.prompt.startsWith("# Candidate review"))).toEqual([]);
     } finally { harness.cp.close(); }
   }, 60_000);
 
