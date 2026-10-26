@@ -175,6 +175,10 @@ export const NotificationKind = {
 } as const;
 export type NotificationKind = (typeof NotificationKind)[keyof typeof NotificationKind];
 
+/** The outbox idempotency key of a CEO notification: its kind, its run and the digest of what identifies it. */
+export const notificationKey = (kind: NotificationKind, runId: string, identity: Record<string, unknown>): string =>
+  `notify:${kind}:${runId}:${digestOf(identity)}`;
+
 /**
  * The operation an owner-decision receipt must name. The ingress router mints receipts per
  * operation, so a receipt admitted for anything else cannot clear a human gate.
@@ -2068,10 +2072,46 @@ export class ProductionGate {
   }
 
   /**
+   * #1189, CEO ruling 5 — one notification per durable fact. Its idempotency key is the digest of
+   * `identity` rather than of the payload, and it is sent only while no notification with that key
+   * exists in the outbox, in any status: an ACK neither ends nor renews it, and a payload whose facts
+   * moved since does not make a second one. Call it outside a transaction. A notification the outbox
+   * would not take (no CEO holds the role, or its session is not ready) rolls back with its audit row,
+   * so the next pass asks again instead of leaving a record of a notice nobody holds.
+   */
+  notifyOnce(
+    kind: NotificationKind,
+    runId: string,
+    identity: Record<string, unknown>,
+    payload: Record<string, unknown>,
+  ): Decision<{ messageId: string; created: boolean }> {
+    const key = notificationKey(kind, runId, identity);
+    const existing = this.outbox.byIdempotencyKey(key);
+    if (existing) return allow(ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED, { messageId: existing.messageId, created: false });
+    return this.db.txDecision(() => {
+      const notified = this.notify(kind, runId, payload, { identity });
+      if (!notified.allowed) return notified as Decision<{ messageId: string; created: boolean }>;
+      const queued = this.outbox.byIdempotencyKey(key);
+      if (!queued) {
+        return deny(ReasonCode.OUTBOX_TARGET_NOT_CURRENT, "no ready CEO session took the notification", {
+          runId,
+          notification: kind,
+        });
+      }
+      return allow(ReasonCode.OK, { messageId: queued.messageId, created: true });
+    });
+  }
+
+  /**
    * §19.3 — routine worker, test and review churn never reaches Hermes. Only the three
    * documented notification kinds are emitted, and this is the only emitter.
    */
-  notify(kind: NotificationKind, runId: string, payload: Record<string, unknown>): Decision<void> {
+  notify(
+    kind: NotificationKind,
+    runId: string,
+    payload: Record<string, unknown>,
+    options: { identity?: Record<string, unknown> } = {},
+  ): Decision<void> {
     // Audit evidence is intentionally a reviewed, bounded vocabulary. The delivery needs
     // the full explanation, but persisting its unreviewed field name causes AuditLog to
     // replace the whole evidence payload and makes the notification impossible to trace.
@@ -2098,7 +2138,7 @@ export class ProductionGate {
       evidence: auditEvidence,
     });
     this.outbox.enqueue({
-      idempotencyKey: `notify:${kind}:${runId}:${digestOf(payload)}`,
+      idempotencyKey: notificationKey(kind, runId, options.identity ?? payload),
       roleKey: ceo.roleKey,
       bindingGeneration: ceo.bindingGeneration,
       targetSessionId: ceo.sessionId,

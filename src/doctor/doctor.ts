@@ -865,9 +865,10 @@ export class Doctor {
       blocking: false,
       confidence: "HIGH",
       observedEvidence: { projectId: run.projectId, state: run.state, cause: run.cause },
+      // #1189 — the daemon routes this run to the CEO (CRITICAL_SYSTEM_FAILURE) with the action its state allows.
       recommendedAction: run.cause === "CONFIRMED_WITHOUT_GRANT"
-        ? "this run was confirmed without an activation grant and cannot complete; the CTO cancels it and creates a new CONTRACT_CHANGE run whose PLAN carries the manifest, and its artifacts are kept"
-        : "this run's PLAN carries no manifest, so it can never be confirmed; the CTO submits a PLAN carrying the manifest or cancels and re-creates the run, and its artifacts are kept",
+        ? "this run was confirmed without an activation grant and cannot complete; the CEO, notified with CRITICAL_SYSTEM_FAILURE, creates a new CONTRACT_CHANGE run whose PLAN carries the manifest, and this run and its artifacts are kept as recorded (no cancel edge leaves a confirmed run)"
+        : "this run's PLAN carries no manifest, so it can never be confirmed; the CEO, notified with CRITICAL_SYSTEM_FAILURE, cancels it and creates a new CONTRACT_CHANGE run whose PLAN carries the manifest, or its CTO submits such a PLAN, and its artifacts are kept",
     }));
   }
 

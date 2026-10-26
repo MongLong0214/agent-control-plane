@@ -1,0 +1,456 @@
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+
+import { currentBootstrapPlan } from "../../src/bootstrap/bootstrap-plan.ts";
+import type { ProjectManifest } from "../../src/contracts/manifest.ts";
+import { sha256 } from "../../src/core/digest.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { Daemon } from "../../src/daemon/daemon.ts";
+import { ApprovedRunFinalizer } from "../../src/daemon/finalizer.ts";
+import { Role, RunKind, RunState, roleKeyFor } from "../../src/domain/types.ts";
+import { retireProject } from "../../src/registry/project-retirement.ts";
+import { bootstrapPlan, cleanTreeManifest, reviewBootstrapPlan } from "../helpers/bootstrap-plan.ts";
+import { dispatchRun, normalized } from "../helpers/contract-change.ts";
+import { FakeGitHub } from "../helpers/fake-github.ts";
+import { cleanupTempDirs, commitAll, tempDir, writeFiles } from "../helpers/fixtures.ts";
+import {
+  bindCeo,
+  carryContractChange,
+  dispatchBootstrapRun,
+  driveToReviewedCandidate,
+  makeHarness,
+  registerFixtureProject,
+  type Harness,
+} from "../helpers/harness.ts";
+
+afterAll(cleanupTempDirs);
+afterEach(() => vi.restoreAllMocks());
+
+/**
+ * #1189, CEO ruling 5 and the ruling on post-merge follow-ups — a stall nothing in the system moves on its own is
+ * routed to the CEO through the existing CRITICAL_SYSTEM_FAILURE notification, once per stall, with its
+ * owner, its concrete blocker and the recovery action the CEO owns. Merged facts are never changed: no
+ * re-merge, no revert, and a merge is never turned into a failure.
+ *
+ * The module under test is imported dynamically where it is called directly, so the daemon-level cases run,
+ * and fail on their assertions, against a tree that predates it.
+ */
+
+const CRITICAL = "CRITICAL_SYSTEM_FAILURE";
+const WORKFLOW_PATH = ".github/workflows/ci.yml";
+const WORKFLOW = "name: project-ci\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node verify.js\n";
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+interface Notice {
+  messageId: string;
+  status: string;
+  roleKey: string;
+  targetSessionId: string;
+  payload: Record<string, unknown>;
+}
+
+/** Every CRITICAL_SYSTEM_FAILURE the outbox holds for this run, in any status. */
+const criticalNotices = (h: Harness, runId: string): Notice[] =>
+  h.cp.db
+    .all<{ message_id: string; status: string; role_key: string; target_session_id: string; payload_json: string }>(
+      `SELECT message_id, status, role_key, target_session_id, payload_json FROM outbox
+        WHERE kind = 'CEO_NOTIFICATION' AND run_id = ? ORDER BY created_at, message_id`,
+      [runId],
+    )
+    .map((row) => ({
+      messageId: row.message_id,
+      status: row.status,
+      roleKey: row.role_key,
+      targetSessionId: row.target_session_id,
+      payload: JSON.parse(row.payload_json) as Record<string, unknown>,
+    }))
+    .filter((notice) => notice.payload["notification"] === CRITICAL);
+
+const criticalAudits = (h: Harness, runId: string) =>
+  h.cp.audit
+    .forRun(runId)
+    .filter((entry) => entry.kind.startsWith("CEO_NOTIFICATION") && entry.evidence["notification"] === CRITICAL);
+
+/** Waits for `count` more watchdog passes; a new pass starts only once the previous one has finished. */
+const ticker = (h: Harness) => {
+  const tick = vi.spyOn(h.cp.watchdog, "tick");
+  return async (count: number): Promise<void> => {
+    const target = tick.mock.calls.length + count;
+    const deadline = Date.now() + 10_000;
+    while (tick.mock.calls.length < target && Date.now() < deadline) await delay(20);
+    expect(tick.mock.calls.length).toBeGreaterThanOrEqual(target);
+  };
+};
+
+/** GitHub's merged pull retains its base snapshot; the target ref is reread separately. */
+const reflectMergedBase = (github: FakeGitHub): void => {
+  const request = github.request.bind(github);
+  github.request = async <T>(method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE", path: string, body?: unknown): Promise<T> => {
+    const response = await request<T>(method, path, body);
+    if (method !== "PUT" || !/\/pulls\/\d+\/merge$/.test(path) || !response || typeof response !== "object") return response;
+    const merged = response as { merged?: unknown; sha?: unknown };
+    const number = Number(/\/pulls\/(\d+)\/merge$/.exec(path)?.[1]);
+    const pull = github.pulls.find((entry) => entry.number === number);
+    if (merged.merged !== true || typeof merged.sha !== "string" || !pull) return response;
+    pull.merge_commit_sha = merged.sha;
+    github.setBranch(pull.base.ref, merged.sha);
+    return response;
+  };
+};
+
+/** A CEO-confirmed run whose one merge lands and whose declared post-merge check then fails (or passes). */
+const confirmedRun = async (options: { noChecks?: boolean } = {}) => {
+  const github = new FakeGitHub();
+  reflectMergedBase(github);
+  const harness = makeHarness({ githubClient: github });
+  harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
+  writeFiles(harness.repoPath, { [WORKFLOW_PATH]: WORKFLOW });
+  commitAll(harness.repoPath, "add trusted project CI workflow");
+  const driven = await driveToReviewedCandidate(harness, {
+    workBranch: "feature/stall-routing",
+    manifestOverrides: {
+      ciWorkflows: options.noChecks ? [] : [{ path: WORKFLOW_PATH, checkName: "project-ci", approvedDigest: sha256(WORKFLOW), unapprovedFirstActivation: false, repositoryRole: "primary" }],
+    },
+  });
+  github.setBranch("dev", driven.baseHead);
+  github.setBranch("main", "m".repeat(40));
+  github.setBranch(driven.workBranch, driven.candidateHead);
+  github.nextMergeSha = driven.candidateHead;
+  github.onMerge = options.noChecks ? null : ({ mergeSha }) => github.setPostMergeCheck(mergeSha, "project-ci", "failure");
+  const claimed = harness.cp.claims.acquire({
+    runId: driven.runId,
+    ownerSessionId: driven.ownerSessionId,
+    ownerBindingGeneration: driven.ownerBindingGeneration,
+    ownerRoleKey: harness.cp.runs.require(driven.runId).ownerRoleKey!,
+    repositoryIdentity: driven.identity,
+    branch: driven.workBranch,
+  });
+  if (!claimed.allowed) throw new Error(claimed.message);
+  await harness.cp.continuity.evaluate("stall routing packet");
+  const packet = harness.cp.ceo.buildPacket({
+    runId: driven.runId,
+    candidateSnapshotDigest: driven.candidateSnapshotDigest,
+    approval: {
+      runId: driven.runId,
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      resultSummary: "candidate verified",
+      recommendation: "merge",
+      residualRisk: [],
+      approvedBySessionId: driven.ownerSessionId,
+      approvedByGeneration: driven.ownerBindingGeneration,
+      approvedAt: harness.clock.nowIso(),
+    },
+  });
+  if (!packet.allowed) throw new Error(`${packet.reasonCode}: ${packet.message}`);
+  const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+  const confirmed = harness.cp.ceo.submitCeoDecision({
+    runId: driven.runId,
+    decision: "CONFIRM",
+    candidateSnapshotDigest: driven.candidateSnapshotDigest,
+    ceoSessionId: ceo.sessionId,
+    rationale: "exact packet accepted",
+  });
+  if (!confirmed.allowed) throw new Error(`${confirmed.reasonCode}: ${confirmed.message}`);
+  return { github, harness, driven };
+};
+
+/** What a merge left behind: the run, its finalization attempt, its GitHub receipts and its merge states. */
+const mergedFacts = (h: Harness, runId: string) => {
+  const run = h.cp.runs.require(runId);
+  return {
+    run: { state: run.state, stateReason: run.stateReason, endedAt: run.endedAt },
+    attempt: h.cp.db.get(
+      `SELECT attempt_id, candidate_digest, state, last_step, failure_reason, compensation_plan_json, completed_at
+         FROM finalization_attempts WHERE run_id = ?`,
+      [runId],
+    ),
+    receipts: h.cp.db.all(
+      `SELECT receipt_id, operation, repository_identity, status, verified, response_json
+         FROM github_receipts WHERE run_id = ? ORDER BY receipt_id`,
+      [runId],
+    ),
+    repositories: h.cp.db.all(`SELECT * FROM run_repositories WHERE run_id = ? ORDER BY 1, 2`, [runId]),
+    transitions: h.cp.audit
+      .forRun(runId)
+      .filter((entry) => entry.kind === "RUN_TRANSITION")
+      .map((entry) => `${String(entry.evidence["from"])}->${String(entry.evidence["to"])}`),
+  };
+};
+
+describe("a merge whose post-merge verification failed reaches the CEO", () => {
+  it("is routed once as CRITICAL_SYSTEM_FAILURE with the merged commit, the failed check, the kept effects and the CEO's action, and the merge stays as it is across passes, an ACK and a restart", async () => {
+    const { github, harness, driven } = await confirmedRun();
+    const ticks = ticker(harness);
+    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-stall-post-merge-"), watchdogIntervalMs: 25 });
+    let facts: ReturnType<typeof mergedFacts>;
+    let notice: Notice;
+    try {
+      expect((await daemon.start()).allowed).toBe(true);
+      facts = mergedFacts(harness, driven.runId);
+      // The merge happened and its check failed: terminal BLOCKED_POST_MERGE, the merge kept, nothing reverted.
+      expect(facts.run.state).toBe(RunState.BLOCKED_POST_MERGE);
+      expect(facts.attempt).toMatchObject({ state: "BLOCKED", failure_reason: ReasonCode.POST_MERGE_VERIFICATION_FAILED });
+      expect(facts.receipts.filter((receipt) => (receipt as { operation: string }).operation === "merge_execute"))
+        .toEqual([expect.objectContaining({ status: "APPLIED", verified: 1 })]);
+      expect(facts.transitions.filter((edge) => edge.startsWith(`${RunState.BLOCKED_POST_MERGE}->`))).toEqual([]);
+      expect(github.mergeCount).toBe(1);
+
+      const notices = criticalNotices(harness, driven.runId);
+      expect(notices).toHaveLength(1);
+      notice = notices[0]!;
+      expect(notice).toMatchObject({ roleKey: "CEO", targetSessionId: harness.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId });
+      expect(notice.payload).toMatchObject({
+        notification: CRITICAL,
+        runId: driven.runId,
+        stall: "BLOCKED_POST_MERGE",
+        owner: "CEO",
+        projectId: driven.projectId,
+        state: RunState.BLOCKED_POST_MERGE,
+        failureReasonCode: ReasonCode.POST_MERGE_VERIFICATION_FAILED,
+        repositories: [{ repositoryIdentity: driven.identity, mergeCommitSha: driven.candidateHead, status: "APPLIED", verified: true }],
+        failedChecks: [{ repositoryIdentity: driven.identity, mergeCommitSha: driven.candidateHead, name: "project-ci", conclusion: "failure" }],
+        compensation: [expect.objectContaining({
+          repositoryIdentity: driven.identity,
+          mergeCommitSha: driven.candidateHead,
+          requiredAction: "halt and review rollback plan",
+        })],
+      });
+      expect(notice.payload["reason"]).toEqual(expect.stringContaining("terminal in BLOCKED_POST_MERGE"));
+      expect(notice.payload["action"]).toEqual(expect.stringContaining("run_create"));
+      expect(notice.payload["detail"]).toEqual(expect.stringContaining("the merge commits stay merged"));
+      // The owner, the recovery action and the blocker are recorded, not only sent.
+      expect(criticalAudits(harness, driven.runId)).toEqual([expect.objectContaining({
+        kind: "CEO_NOTIFICATION",
+        evidence: expect.objectContaining({
+          stall: "BLOCKED_POST_MERGE",
+          owner: "CEO",
+          reason: notice.payload["reason"],
+          action: notice.payload["action"],
+          repositories: notice.payload["repositories"],
+        }),
+      })]);
+
+      // Later passes find the same block and send nothing more; an undelivered notice is not a failure.
+      await ticks(3);
+      expect(criticalNotices(harness, driven.runId)).toEqual([notice]);
+      expect(criticalAudits(harness, driven.runId)).toHaveLength(1);
+      expect(mergedFacts(harness, driven.runId)).toEqual(facts);
+
+      // A prior ACK neither ends the notice nor sends it again.
+      harness.cp.db.run(`UPDATE outbox SET status = 'ACKED' WHERE message_id = ?`, [notice.messageId]);
+      await ticks(2);
+      expect(criticalNotices(harness, driven.runId)).toEqual([{ ...notice, status: "ACKED" }]);
+    } finally {
+      await daemon.stop();
+    }
+
+    const restarted = new Daemon(harness.cp, { stateDir: tempDir("acp-stall-post-merge-restart-") });
+    try {
+      expect((await restarted.start()).allowed).toBe(true);
+      expect(criticalNotices(harness, driven.runId)).toEqual([{ ...notice, status: "ACKED" }]);
+      expect(criticalAudits(harness, driven.runId)).toHaveLength(1);
+      expect(mergedFacts(harness, driven.runId)).toEqual(facts);
+      expect(github.mergeCount).toBe(1);
+    } finally {
+      await restarted.stop();
+    }
+  });
+
+  it("with no CEO to hold it nothing is queued or recorded, and the first pass once a CEO is bound routes it, once", async () => {
+    const { routePostMergeStall } = await import("../../src/ceo/ownerless-stalls.ts");
+    const { harness, driven } = await confirmedRun();
+    const blocked = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+    expect(blocked.reasonCode).toBe(ReasonCode.FINALIZATION_COMPENSATION_REQUIRED);
+    const facts = mergedFacts(harness, driven.runId);
+    expect(facts.run.state).toBe(RunState.BLOCKED_POST_MERGE);
+
+    expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "CEO replaced").allowed).toBe(true);
+    const audit = harness.cp.audit.forRun(driven.runId).length;
+    expect(routePostMergeStall(harness.cp, driven.runId)).toMatchObject({ allowed: false });
+    expect(criticalNotices(harness, driven.runId)).toEqual([]);
+    expect(harness.cp.audit.forRun(driven.runId)).toHaveLength(audit);
+
+    const ceoSessionId = bindCeo(harness);
+    expect(routePostMergeStall(harness.cp, driven.runId)).toMatchObject({ allowed: true, value: { created: true } });
+    expect(routePostMergeStall(harness.cp, driven.runId)).toMatchObject({ allowed: true, value: { created: false } });
+    expect(criticalNotices(harness, driven.runId)).toEqual([expect.objectContaining({ targetSessionId: ceoSessionId })]);
+    expect(mergedFacts(harness, driven.runId)).toEqual(facts);
+  });
+
+  it("a historical block the daemon resumes is completed, not routed", async () => {
+    const { harness, driven } = await confirmedRun({ noChecks: true });
+    const verifier = vi.spyOn(harness.cp.github, "postMergeVerify").mockResolvedValueOnce({
+      allowed: false, reasonCode: ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED,
+      message: "the pinned manifest declares no post-merge checks", evidence: {},
+    });
+    await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+    verifier.mockRestore();
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.BLOCKED_POST_MERGE);
+    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-stall-resumable-") });
+    try {
+      expect((await daemon.start()).allowed).toBe(true);
+      expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+      expect(criticalNotices(harness, driven.runId)).toEqual([]);
+    } finally {
+      await daemon.stop();
+    }
+  });
+});
+
+describe("an owner retirement held by a terminal BLOCKED_POST_MERGE run", () => {
+  it("names the run it waits on, is routed to the CEO once, stays refused, and changes nothing merged", async () => {
+    const { github, harness, driven } = await confirmedRun();
+    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-stall-retirement-") });
+    try {
+      expect((await daemon.start()).allowed).toBe(true);
+      const facts = mergedFacts(harness, driven.runId);
+      expect(facts.run.state).toBe(RunState.BLOCKED_POST_MERGE);
+      const held = () => criticalNotices(harness, driven.runId).filter((notice) => notice.payload["stall"] === "PROJECT_RETIREMENT_HELD");
+
+      for (const reason of ["retire the project", "retire the project again"]) {
+        expect(await retireProject(harness.cp, driven.projectId, reason)).toMatchObject({
+          allowed: false,
+          reasonCode: ReasonCode.CONFLICT,
+          evidence: { projectId: driven.projectId, waitingOn: [{ runId: driven.runId, state: RunState.BLOCKED_POST_MERGE }] },
+        });
+        expect(held()).toHaveLength(1);
+      }
+      expect(held()[0]!.payload).toMatchObject({ owner: "CEO", projectId: driven.projectId, state: RunState.BLOCKED_POST_MERGE });
+      expect(held()[0]!.payload["action"]).toEqual(expect.stringContaining("settled for retirement"));
+      expect(mergedFacts(harness, driven.runId)).toEqual(facts);
+      expect(github.mergeCount).toBe(1);
+      expect(harness.cp.projects.get(driven.projectId)?.retiredAt ?? null).toBeNull();
+    } finally {
+      await daemon.stop();
+    }
+  });
+});
+
+describe("a stranded bootstrap application reaches the CEO", () => {
+  const strandedBootstrap = async () => {
+    const h = makeHarness();
+    h.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
+    const created = h.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: "STANDARD", contract: {
+      goal: "bootstrap", why: "stall routing", scope: [], nonGoals: [], acceptance: ["verify"], priority: "NORMAL", humanGate: [], references: [],
+    } });
+    if (!created.allowed) throw new Error(created.message);
+    const runId = created.value.runId;
+    await dispatchBootstrapRun(h.cp, h.clock, runId);
+    const { planDigest } = await reviewBootstrapPlan(h, runId, bootstrapPlan(cleanTreeManifest("prj_stranded")));
+    const plan = currentBootstrapPlan(runId, h.cp.artifacts.latest(runId, "PLAN"));
+    if (!plan.allowed) throw new Error(plan.message);
+    expect(h.cp.bootstrapApplications.reserve({
+      runId, projectId: "prj_stranded", repositoryIdentity: "github:acme/stranded",
+      bootstrapOperationId: "op-bootstrap", planDigest,
+      manifestDigest: plan.value.binding.projectManifestDigest, plannedOutputsDigest: plan.value.binding.plannedOutputsDigest,
+      candidateSnapshotDigest: h.cp.runs.currentCandidate(runId)!, reviewDigest: "sha256:review", approvalDigest: "sha256:scope",
+    }, { writer: null }).allowed).toBe(true);
+    expect(h.cp.bootstrapApplications.markStranded(runId, {
+      cause: "ATTRIBUTION_UNCERTAIN", requiredRecovery: "recorded recovery", evidence: { ledger: "attempt-ledger" },
+    }).allowed).toBe(true);
+    return { h, runId };
+  };
+
+  it("is routed once with its blocker and the CEO's action, and its reservation and run stay as recorded", async () => {
+    const { h, runId } = await strandedBootstrap();
+    const kept = () => ({
+      state: h.cp.runs.require(runId).state,
+      application: h.cp.bootstrapApplications.get(runId),
+      held: h.cp.db.all(`SELECT run_id, phase FROM bootstrap_applications WHERE run_id = ?`, [runId]),
+    });
+    const before = kept();
+    expect(before).toMatchObject({ state: RunState.READY_FOR_CEO_REVIEW, application: { phase: "STRANDED" } });
+    const ticks = ticker(h);
+    const daemon = new Daemon(h.cp, { stateDir: tempDir("acp-stall-stranded-"), watchdogIntervalMs: 25 });
+    try {
+      const started = await daemon.start();
+      expect(started.allowed, JSON.stringify(started)).toBe(true);
+      await ticks(3);
+      const notices = criticalNotices(h, runId);
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.payload).toMatchObject({
+        stall: "BOOTSTRAP_APPLICATION_STRANDED",
+        owner: "CEO",
+        projectId: "prj_stranded",
+        repositoryIdentity: "github:acme/stranded",
+        state: RunState.READY_FOR_CEO_REVIEW,
+        cause: "ATTRIBUTION_UNCERTAIN",
+        attempts: 1,
+      });
+      expect(notices[0]!.payload["reason"]).toEqual(expect.stringContaining("cannot be attributed to this run"));
+      expect(notices[0]!.payload["action"]).toEqual(expect.stringContaining("new project id and repository identity"));
+      expect(notices[0]!.payload["detail"]).toEqual(expect.stringContaining("never released"));
+      expect(kept()).toEqual(before);
+    } finally {
+      await daemon.stop();
+    }
+  });
+});
+
+describe("a CONTRACT_CHANGE run the activation path cannot finish reaches the CEO", () => {
+  const readyContractChange = async (h: Harness, projectId: string) => {
+    const run = await dispatchRun(h, projectId, RunKind.CONTRACT_CHANGE);
+    carryContractChange(h, run.runId, normalized({ ...run.base, commitlore: { mode: "required" } } as ProjectManifest));
+    await h.cp.continuity.evaluate("contract change candidate");
+    const submitted = await h.cp.pipeline.submitResult({
+      runId: run.runId,
+      ownerSessionId: run.ownerSessionId,
+      ownerBindingGeneration: run.ownerBindingGeneration,
+      resultSummary: "the proposed manifest",
+      recommendation: "activate the contract change",
+      residualRisk: [],
+    });
+    if (!submitted.allowed) throw new Error(`${submitted.reasonCode}: ${submitted.message}`);
+    return { run, candidate: h.cp.runs.currentCandidate(run.runId)! };
+  };
+
+  it("a run confirmed without a grant is routed once with an action its state allows, stays as recorded, and the doctor names the CEO", async () => {
+    const h = makeHarness();
+    const { projectId } = await registerFixtureProject(h, "cc-stall");
+    const { run, candidate } = await readyContractChange(h, projectId);
+    // What a run confirmed before grants existed looks like: CEO_APPROVED, with no grant.
+    expect(h.cp.runs.transition(run.runId, RunState.CEO_APPROVED, "confirmed before grants", { candidateSnapshotDigest: candidate }).allowed).toBe(true);
+    const artifacts = h.cp.artifacts.list(run.runId).length;
+    for (const prefix of ["acp-stall-cc-", "acp-stall-cc-restart-"]) {
+      const daemon = new Daemon(h.cp, { stateDir: tempDir(prefix) });
+      try {
+        const started = await daemon.start();
+        expect(started.allowed, JSON.stringify(started)).toBe(true);
+      } finally {
+        await daemon.stop();
+      }
+      const notices = criticalNotices(h, run.runId);
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.payload).toMatchObject({
+        stall: "CONTRACT_CHANGE_RUN_WITHOUT_GRANT",
+        owner: "CEO",
+        projectId,
+        state: RunState.CEO_APPROVED,
+        cause: "CONFIRMED_WITHOUT_GRANT",
+      });
+      expect(notices[0]!.payload["action"]).toEqual(expect.stringContaining("no cancel edge leaves CEO_APPROVED"));
+    }
+    expect(h.cp.runs.require(run.runId).state).toBe(RunState.CEO_APPROVED);
+    expect(h.cp.artifacts.list(run.runId)).toHaveLength(artifacts);
+    const finding = (await h.cp.doctor.run("run", run.runId)).findings.find((entry) => entry.code === "CONTRACT_CHANGE_RUN_WITHOUT_GRANT");
+    expect(finding?.recommendedAction).toEqual(expect.stringContaining("the CEO, notified with CRITICAL_SYSTEM_FAILURE"));
+    expect(finding?.recommendedAction).not.toEqual(expect.stringContaining("the CTO cancels it"));
+  });
+
+  it("an ACTIVE run whose PLAN carries no manifest is routed with run_cancel or a new PLAN from its CTO", async () => {
+    const { routeOwnerlessStalls } = await import("../../src/ceo/ownerless-stalls.ts");
+    const h = makeHarness();
+    const { projectId } = await registerFixtureProject(h, "cc-no-manifest");
+    const run = await dispatchRun(h, projectId, RunKind.CONTRACT_CHANGE);
+    h.cp.artifacts.put(run.runId, "PLAN", { tasks: [] });
+    expect(h.cp.runs.require(run.runId).state).toBe(RunState.ACTIVE);
+    routeOwnerlessStalls(h.cp);
+    routeOwnerlessStalls(h.cp);
+    const notices = criticalNotices(h, run.runId);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.payload).toMatchObject({ stall: "CONTRACT_CHANGE_RUN_WITHOUT_GRANT", cause: "PLAN_CARRIES_NO_MANIFEST", state: RunState.ACTIVE });
+    expect(notices[0]!.payload["action"]).toEqual(expect.stringContaining("run_cancel"));
+    expect(notices[0]!.payload["action"]).toEqual(expect.stringContaining("its CTO submit a PLAN carrying the manifest"));
+    expect(h.cp.runs.require(run.runId).state).toBe(RunState.ACTIVE);
+  });
+});

@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { ControlPlane } from "../app/control-plane.ts";
+import { routeOwnerlessStalls, routePostMergeStall } from "../ceo/ownerless-stalls.ts";
 import { outboxDeliveryReadback } from "../outbox/outbox.ts";
 import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../capacity/capacity-monitor.ts";
 import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
@@ -1470,6 +1471,9 @@ export class Daemon {
       report.resumedRuns = await this.resumeQueuedRuns();
       report.resumedFinalizations = await this.resumeApprovedRuns();
       await this.resumeResidentProjects();
+      // #1189 — a stranded bootstrap application or a CONTRACT_CHANGE run that cannot finish is routed to
+      // the CEO once each; the watchdog repeats the pass, and a stall already routed sends nothing more.
+      await this.runPeriodic("ownerless_stall_routing", async () => { routeOwnerlessStalls(this.cp); });
       // Issue #246 — a bootstrap run that ended while no daemon was running left its BOOTSTRAP_CTO
       // bound or its session running; the watchdog repeats this, through the same backoff.
       await this.runPeriodic("bootstrap_cto_reclaim", () => this.reclaimBootstrapCtos());
@@ -2197,12 +2201,24 @@ export class Daemon {
 
   private async resumeApprovedRuns(): Promise<string[]> {
     const resumed: string[] = [];
+    const stalled: string[] = [];
     const states = [RunState.CEO_APPROVED, RunState.MERGING, RunState.POST_MERGE_VERIFYING, RunState.BLOCKED_POST_MERGE];
     for (const state of states) {
       for (const run of this.cp.runs.list({ state })) {
         const finalized = await this.finalizeApprovedRun(run.runId);
         if (finalized.allowed) resumed.push(run.runId);
+        // A run blocked earlier in this pass is listed again here, so its first refusal is seen at once.
+        else if (state === RunState.BLOCKED_POST_MERGE && finalized.reasonCode === ReasonCode.FINALIZATION_COMPENSATION_REQUIRED) {
+          stalled.push(run.runId);
+        }
       }
+    }
+    // #1189 — a block the finalizer will not resume is routed to the CEO, once per finalization attempt;
+    // the run, its merges and its compensation plan stay as recorded.
+    if (stalled.length > 0) {
+      await this.runPeriodic("post_merge_stall_routing", async () => {
+        for (const runId of stalled) routePostMergeStall(this.cp, runId);
+      });
     }
     return resumed;
   }
@@ -2983,6 +2999,7 @@ export class Daemon {
         await this.cp.workerRetirement.reconcile();
       });
       void this.runPeriodic("cto_canonical_switchover_settle", () => this.settleCanonicalSwitchovers());
+      void this.runPeriodic("ownerless_stall_routing", async () => { routeOwnerlessStalls(this.cp); });
     }, watchdogMs);
     watchdog.unref();
     this.#timers.push(watchdog);
