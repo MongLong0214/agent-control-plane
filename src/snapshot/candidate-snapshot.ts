@@ -2,11 +2,11 @@ import { z } from "zod";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
-import { digestOf } from "../core/digest.ts";
+import { digestOf, sha256 } from "../core/digest.ts";
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { changedPaths, diffDigest, git, isClean, revParse, treeOf, tryRevParse } from "../git/git.ts";
+import { changedPaths, diffDigest, git, isClean, readBlob, revParse, treeOf, tryRevParse } from "../git/git.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
 
 export const CANDIDATE_SNAPSHOT_SCHEMA_ID = "agent-control-plane.candidate-snapshot.v1";
@@ -28,6 +28,24 @@ export const snapshotIntegrationSchema = z
   .strict();
 
 export type SnapshotIntegration = z.infer<typeof snapshotIntegrationSchema>;
+
+/**
+ * #1232 — a file a SUCCEEDED task imported, as the freeze found it: the candidate head holds a regular
+ * file at `path` whose blob is `blob` and whose bytes have exactly the manifest's `size` and `sha256`,
+ * and the base holds nothing at or below `path`. Its patch is left out of `diffDigest`, so its bytes are
+ * never materialised for the freeze or the review; the head and tree digests still fix it exactly.
+ */
+export const snapshotImportSchema = z
+  .object({
+    path: z.string().min(1),
+    size: z.number().int().nonnegative(),
+    sha256: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+    blob: z.string().regex(/^[0-9a-f]{40}$/),
+    taskId: z.string().min(1),
+  })
+  .strict();
+
+export type SnapshotImport = z.infer<typeof snapshotImportSchema>;
 
 export const snapshotRepositorySchema = z
   .object({
@@ -53,6 +71,11 @@ export const snapshotRepositorySchema = z
      * the key out, so its digest is exactly what it was before the field existed.
      */
     integration: snapshotIntegrationSchema.optional(),
+    /**
+     * #1232 — present only when a SUCCEEDED task's imported files are in the candidate byte for byte;
+     * every other snapshot leaves the key out, so its digest is what it was before the field existed.
+     */
+    imports: z.array(snapshotImportSchema).optional(),
   })
   .strict()
   .superRefine((repository, ctx) => {
@@ -172,6 +195,8 @@ export interface SnapshotRepositoryInput {
   manifestDigest?: string | null;
   /** S6-C — given with `candidateRef` naming the integrated commit; see `snapshotIntegrationSchema`. */
   integration?: SnapshotIntegration;
+  /** #1232 — the import manifests of this repository's SUCCEEDED tasks; see `snapshotImportSchema`. */
+  imports?: ReadonlyArray<{ taskId: string; path: string; size: number; sha256: string }>;
 }
 
 /** A verification command must resolve to exactly one repository identity. */
@@ -215,6 +240,34 @@ export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
     ...(snapshot.contractChange === undefined ? {} : { contractChange: snapshot.contractChange }),
   });
 
+/**
+ * #1232 — the declared imports the candidate holds byte for byte (`snapshotImportSchema`), read one
+ * blob at a time. A declared import the candidate does not hold so -- changed by a later task, say --
+ * is not bound and stays in the patch like any other change.
+ */
+const importsAtCandidate = async (
+  checkoutPath: string,
+  baseHead: string,
+  candidateHead: string,
+  declared: NonNullable<SnapshotRepositoryInput["imports"]>,
+): Promise<SnapshotImport[]> => {
+  const bound = new Map<string, SnapshotImport>();
+  for (const entry of declared) {
+    if (bound.has(entry.path)) continue;
+    const atHead = await git(checkoutPath, ["--no-replace-objects", "ls-tree", "-z", "--full-tree", candidateHead, "--", entry.path], { allowFailure: true });
+    const record = atHead.exitCode === 0 ? atHead.stdout.split("\0").find((line) => line.endsWith(`\t${entry.path}`)) : undefined;
+    const blob = record === undefined ? undefined : /^100644 blob ([0-9a-f]{40})\t/.exec(record)?.[1];
+    if (blob === undefined) continue;
+    // Nothing at or below the path at the base: leaving it out of the patch hides no other change.
+    const atBase = await git(checkoutPath, ["--no-replace-objects", "ls-tree", "-r", "-z", "--name-only", "--full-tree", baseHead, "--", entry.path], { allowFailure: true });
+    if (atBase.exitCode !== 0 || atBase.stdout.length > 0) continue;
+    const bytes = await readBlob(checkoutPath, blob);
+    if (bytes === null || bytes.length !== entry.size || sha256(bytes) !== entry.sha256) continue;
+    bound.set(entry.path, { path: entry.path, size: entry.size, sha256: entry.sha256, blob, taskId: entry.taskId });
+  }
+  return [...bound.values()].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+};
+
 export const buildCandidateSnapshot = async (
   params: {
     runId: string;
@@ -248,6 +301,7 @@ export const buildCandidateSnapshot = async (
       });
     }
     const candidateHead = await revParse(input.checkoutPath, input.candidateRef ?? "HEAD");
+    const imports = await importsAtCandidate(input.checkoutPath, baseHead, candidateHead, input.imports ?? []);
     repositories.push({
       identity: input.identity,
       repositoryRole: input.repositoryRole,
@@ -257,11 +311,12 @@ export const buildCandidateSnapshot = async (
       sourceHead,
       candidateHead,
       treeDigest: `git-tree:${await treeOf(input.checkoutPath, candidateHead)}`,
-      diffDigest: await diffDigest(input.checkoutPath, baseHead, candidateHead),
+      diffDigest: await diffDigest(input.checkoutPath, baseHead, candidateHead, imports.map((entry) => entry.path)),
       worktreeId: input.worktreeId ?? null,
       manifestDigest: input.manifestDigest ?? null,
       touchedPaths: await changedPaths(input.checkoutPath, baseHead, candidateHead),
       ...(input.integration === undefined ? {} : { integration: input.integration }),
+      ...(imports.length === 0 ? {} : { imports }),
     });
   }
 

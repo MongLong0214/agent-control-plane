@@ -307,6 +307,11 @@ export class CandidatePipeline {
         worktreeId: repo.worktreeId,
         manifestDigest: this.repositories.byIdentity(repo.identity)?.activeManifestDigest ?? null,
         ...(integrated.value === null ? {} : { candidateRef: integrated.value.head, integration: integrated.value.integration }),
+        // #1232 — the same receipts' import manifests: an import the candidate holds byte for byte is
+        // bound by blob and sha256, and its patch is not materialised (`buildCandidateSnapshot`).
+        imports: commits
+          .filter((commit) => commit.repositoryIdentity === repo.identity)
+          .flatMap((commit) => commit.imports.map((entry) => ({ ...entry, taskId: commit.taskId }))),
       });
     }
 

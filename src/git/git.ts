@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 
 import { sha256 } from "../core/digest.ts";
@@ -15,6 +16,12 @@ import { canonical } from "../guard/workspace-probe.ts";
 const exec = promisify(execFile);
 
 const MAX_BUFFER = 64 * 1024 * 1024;
+
+/**
+ * The most a git command run through this wrapper may write to stdout. Anything read whole through
+ * it -- a patch, a blob -- must fit; #1232's per-file import limit is derived from this.
+ */
+export const GIT_OUTPUT_MAX_BYTES = MAX_BUFFER;
 
 export interface GitResult {
   stdout: string;
@@ -431,14 +438,34 @@ const PATCH_WITHOUT_PROGRAMS = ["--no-ext-diff", "--no-textconv", "--submodule=s
 /**
  * The exact patch between two commits: the bytes the freeze digests and the blind reviewer reads,
  * so what is reviewed is what was frozen.
+ *
+ * #1232 — `withheld` names files the candidate snapshot binds by blob and sha256 instead (a task's
+ * imported files): each is left out of the patch by an exact, literal, root-relative pathspec, so
+ * their bytes are never materialised here. With none, the command and its bytes are as before.
  */
-export const diffPatch = async (cwd: string, base: string, head: string): Promise<string> =>
-  (await git(cwd, ["diff", "--no-color", ...PATCH_WITHOUT_PROGRAMS, "--full-index", "--binary", `${base}..${head}`]))
-    .stdout;
+export const diffPatch = async (cwd: string, base: string, head: string, withheld: readonly string[] = []): Promise<string> =>
+  (await git(cwd, [
+    "diff", "--no-color", ...PATCH_WITHOUT_PROGRAMS, "--full-index", "--binary", `${base}..${head}`,
+    ...(withheld.length === 0 ? [] : ["--", ":(top)", ...withheld.map((path) => `:(top,exclude,literal)${path}`)]),
+  ])).stdout;
 
-/** Stable digest of the exact patch between two commits. */
-export const diffDigest = async (cwd: string, base: string, head: string): Promise<string> =>
-  sha256(await diffPatch(cwd, base, head));
+/** Stable digest of the exact patch between two commits, less any `withheld` file (`diffPatch`). */
+export const diffDigest = async (cwd: string, base: string, head: string, withheld: readonly string[] = []): Promise<string> =>
+  sha256(await diffPatch(cwd, base, head, withheld));
+
+/**
+ * The exact bytes of one blob, or null. Read as `latin1`, one character per byte, so binary content
+ * survives; the object id is re-derived from those bytes, and only when it equals the id git named
+ * are they the committed bytes. A blob larger than `GIT_OUTPUT_MAX_BYTES` cannot be read whole here.
+ */
+export const readBlob = async (cwd: string, id: string): Promise<Buffer | null> => {
+  if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(id)) return null;
+  const blob = await git(cwd, ["--no-replace-objects", "cat-file", "blob", id], { allowFailure: true, encoding: "latin1" });
+  if (blob.exitCode !== 0) return null;
+  const bytes = Buffer.from(blob.stdout, "latin1");
+  const format = id.length === 64 ? "sha256" : "sha1";
+  return createHash(format).update(`blob ${bytes.length}\0`).update(bytes).digest("hex") === id ? bytes : null;
+};
 
 export const diffText = async (cwd: string, base: string, head: string): Promise<string> =>
   (await git(cwd, ["diff", "--no-color", ...PATCH_WITHOUT_PROGRAMS, "--full-index", `${base}..${head}`]))

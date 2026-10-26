@@ -236,6 +236,7 @@ const serializedKind = (field: EvidenceField | undefined): "jsonl" | "json" | un
 const REPOSITORY_PATH_FIELDS: Readonly<Record<EvidenceField["store"], ReadonlySet<string>>> = {
   artifact: new Set([
     "repositories.touchedPaths", // CANDIDATE_SNAPSHOT
+    "repositories.imports.path", // CANDIDATE_SNAPSHOT, #1232
     "coveredFiles", // BLIND_REVIEW coverage keys, `<identity>:<path>`
     "findings.path", // BLIND_REVIEW finding location
     "inputManifest.binaryArtifacts.path", // BLIND_REVIEW

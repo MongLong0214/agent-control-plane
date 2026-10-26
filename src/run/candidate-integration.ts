@@ -10,6 +10,7 @@ import type { SnapshotIntegration } from "../snapshot/candidate-snapshot.ts";
 import type { TaskRecord } from "./task-graph.ts";
 import { type StartsFrom, recordedWriteTarget, startOf } from "./task-write-target.ts";
 import { type PinnedRepository, committedChanges, objectFormatOf, pinRepository, runPinnedGit } from "./worker-git.ts";
+import { type TaskImport, parseImportManifest } from "./task-import.ts";
 import { WorkerTurnEvent } from "./worker-turn.ts";
 
 /**
@@ -72,7 +73,20 @@ export interface SucceededTaskCommit {
   taskId: string;
   commit: string;
   repositoryIdentity: string;
+  /** #1232 — the import manifest the same receipt binds; empty for a task that imported nothing. */
+  imports: TaskImport[];
 }
+
+/** #1232 — a receipt's recorded import manifest, or none when it has none or records no valid one. */
+const importsOf = (recorded: unknown): TaskImport[] => {
+  if (typeof recorded !== "string") return [];
+  try {
+    const parsed = parseImportManifest(JSON.parse(recorded) as unknown, ["."]);
+    return parsed.allowed ? parsed.value : [];
+  } catch {
+    return [];
+  }
+};
 
 /**
  * The one source of a run's SUCCEEDED task commits, for the integration and for the freeze's
@@ -82,10 +96,11 @@ export interface SucceededTaskCommit {
  * together when the receipt was written. A receipt that cannot be read back that way names nothing.
  */
 export const succeededTaskCommits = (db: Db, runId: string): SucceededTaskCommit[] => {
-  const rows = db.all<{ taskId: string; commitHead: unknown; repositoryIdentity: string | null }>(
+  const rows = db.all<{ taskId: string; commitHead: unknown; repositoryIdentity: string | null; imports: unknown }>(
     `SELECT te.task_id AS taskId,
             json_extract(a.evidence_json, '$.commitHead') AS commitHead,
-            r.identity AS repositoryIdentity
+            r.identity AS repositoryIdentity,
+            json_extract(a.evidence_json, '$.imports') AS imports
        FROM task_executions te
        JOIN audit_events a
          ON a.kind = ?
@@ -104,7 +119,7 @@ export const succeededTaskCommits = (db: Db, runId: string): SucceededTaskCommit
   const commits = new Map<string, SucceededTaskCommit>();
   for (const row of rows) {
     if (commits.has(row.taskId) || typeof row.commitHead !== "string" || row.commitHead.length === 0 || !row.repositoryIdentity) continue;
-    commits.set(row.taskId, { taskId: row.taskId, commit: row.commitHead, repositoryIdentity: row.repositoryIdentity });
+    commits.set(row.taskId, { taskId: row.taskId, commit: row.commitHead, repositoryIdentity: row.repositoryIdentity, imports: importsOf(row.imports) });
   }
   return [...commits.values()];
 };

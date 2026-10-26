@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { GIT_OUTPUT_MAX_BYTES } from "../git/git.ts";
 
 /**
  * #1232 — files the CTO imports into a STANDARD_WORK task's write target.
@@ -49,8 +50,15 @@ export interface StagedImport extends TaskImport {
 }
 
 export const IMPORT_MAX_FILES = 100;
-export const IMPORT_MAX_FILE_BYTES = 50 * 1024 * 1024;
-export const IMPORT_MAX_TOTAL_BYTES = 200 * 1024 * 1024;
+/**
+ * 50 MiB, GitHub's warning size, and never more than the git wrapper can hand back whole: the freeze
+ * reads each imported blob through it to bind the file by sha256 (`buildCandidateSnapshot`), and the
+ * receipt check in review reads it again. No imported file's patch is ever materialised, so this is
+ * the only git output an import's size meets downstream.
+ */
+export const IMPORT_MAX_FILE_BYTES = Math.min(50 * 1024 * 1024, GIT_OUTPUT_MAX_BYTES);
+/** The bytes one task imports, held in memory once while they are verified and written. */
+export const IMPORT_MAX_TOTAL_BYTES = 4 * IMPORT_MAX_FILE_BYTES;
 /** The audit log keeps an unlisted string field only up to 200 characters, and an entry's path is one. */
 const IMPORT_PATH_MAX_CHARS = 200;
 

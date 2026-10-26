@@ -68,6 +68,7 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 import {
   type CandidateSnapshot,
+  type SnapshotImport,
   candidateSnapshotDigest,
   snapshotCoverageTargets,
 } from "../snapshot/candidate-snapshot.ts";
@@ -75,19 +76,13 @@ import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
 import type { TaskContract } from "../run/run-engine.ts";
 import { bootstrapPlanTaskRecorded } from "../run/task-graph.ts";
-import {
-  type ImportEvidence,
-  type TrackedTreeEvidence,
-  candidateEvidenceSection,
-  readExecutionEvidence,
-  readTrackedTree,
-} from "./candidate-review-evidence.ts";
+import { candidateEvidenceSection, readExecutionEvidence, readTrackedTree, type TrackedTreeEvidence } from "./candidate-review-evidence.ts";
 import { redactCredentialValues } from "../core/credential-shapes.ts";
 
 /**
- * How a binary path reached the reviewer: git's binary patch, immutable and digest-bound, or (#1232)
- * for a task's imported file whose frozen bytes are exactly its manifest entry, that entry, whose
- * digest is the file's sha256.
+ * How a path without a textual diff reached the reviewer: git's binary patch, immutable and
+ * digest-bound, or (#1232) for a task's imported file the candidate snapshot binds by blob and
+ * sha256, its manifest entry, whose digest is the file's sha256.
  */
 export interface BinaryArtifact {
   repository: string;
@@ -549,16 +544,13 @@ export class BlindReviewGate {
     try {
       const collected = await this.collectDiffs(request.snapshot);
       if (!collected.allowed) return collected as Decision<ReviewPacket>;
-      const { trees } = collected.value;
+      const { diffs, binaryArtifacts, trees } = collected.value;
       // E2E-02 — the approved commands with the config files they read, the official output and the
       // execution -> commit receipts, read after the diffs proved the frozen objects are the candidate.
       const execution = await readExecutionEvidence(this.db, {
         runId: request.runId, snapshot: request.snapshot, snapshotDigest, contractDigest: request.contractDigest,
         verification: request.verification, checkoutOf: (identity) => this.repositories.byIdentity(identity)?.checkoutPath ?? null,
       });
-      // #1232 — an imported file whose frozen bytes are its manifest's reaches the reviewer as that
-      // manifest entry, not as its binary patch.
-      const { diffs, binaryArtifacts } = withImportManifests(collected.value.diffs, collected.value.binaryArtifacts, execution.imports ?? []);
       // #1166 r3 — the listings get only the room left under the reviewer budget after the other
       // metadata, the chunk envelope and a share for the change itself, so they never crowd out
       // the diff or push the metadata past the budget. A cut is marked in the packet.
@@ -1148,7 +1140,9 @@ export class BlindReviewGate {
       // and a moved gitlink as one `Subproject commit` line. This read used to pass `--no-ext-diff`
       // alone, so a candidate's `diff=<driver>` textconv and, under `diff.submodule=diff`, a populated
       // nested repository's own textconv and external diff ran while the reviewer's diff was built.
-      const diff = await diffPatch(record.checkoutPath, repo.baseHead, repo.candidateHead);
+      // #1232 — the imported files the snapshot binds by blob and sha256 are left out, as the freeze left them out.
+      const withheld = (repo.imports ?? []).map((entry) => entry.path);
+      const diff = await diffPatch(record.checkoutPath, repo.baseHead, repo.candidateHead, withheld);
       // The diff must be the one the frozen candidate describes, and these are the bytes reviewed.
       const observedDigest = sha256(diff);
       if (observedDigest !== repo.diffDigest) {
@@ -1176,8 +1170,13 @@ export class BlindReviewGate {
         });
       }
 
+      // #1232 — each bound import is its manifest entry: one section per file, so chunking and coverage
+      // treat it like any other changed path, and the packet records how it was shown.
+      for (const entry of repo.imports ?? []) {
+        binaryArtifacts.push({ repository: repo.identity, path: entry.path, digest: entry.sha256, method: "import-manifest" });
+      }
       trees.push(await readTrackedTree(record.checkoutPath, repo.identity, repo.candidateHead));
-      diffs.push({ identity: repo.identity, diff, files: repo.touchedPaths });
+      diffs.push({ identity: repo.identity, diff: diff + (repo.imports ?? []).map(importManifestSection).join(""), files: repo.touchedPaths });
     }
 
     return allow(ReasonCode.OK, { diffs, binaryArtifacts, trees });
@@ -1615,7 +1614,7 @@ export class BlindReviewGate {
       "",
       "## Candidate snapshot manifest",
       "```json",
-      JSON.stringify(request.snapshot, null, 2),
+      JSON.stringify(snapshotForReviewer(request.snapshot), null, 2),
       "```",
       "",
       "## Packet identity and required coverage",
@@ -2654,43 +2653,20 @@ interface ReviewerDiff {
 }
 
 /**
- * #1232 — the reviewer's diffs with each binary patch of an imported file replaced by its manifest
- * entry, and that path's binary artifact recorded as `import-manifest`. Only an entry whose frozen
- * bytes were read and found to be exactly its size and sha256 (`MATCHES`) replaces anything; every
- * other binary patch, and every text change, is shown as it is.
+ * #1232 — one imported file the candidate snapshot binds, as the reviewer reads it in the diff: the
+ * `diff --git` header of a new file at its blob, then its manifest entry instead of its bytes.
  */
-const withImportManifests = (
-  diffs: readonly ReviewerDiff[],
-  binaryArtifacts: readonly BinaryArtifact[],
-  imports: readonly ImportEvidence[],
-): { diffs: ReviewerDiff[]; binaryArtifacts: BinaryArtifact[] } => {
-  const key = (repository: string, path: string): string => `${repository}\0${path}`;
-  const matched = new Map(imports.filter((entry) => entry.frozen === "MATCHES").map((entry) => [key(entry.repository, entry.path), entry]));
-  const replaced = new Map<string, ImportEvidence>();
-  const shown = diffs.map((repo) => ({
-    ...repo,
-    diff: repo.diff
-      .split(/(?=^diff --git )/m)
-      .map((section) => {
-        // Git's binary patch starts on its own line in the header, before any text-diff line.
-        const at = section.search(/^GIT binary patch$/m);
-        const textBefore = at >= 0 && /^(?:---|\+\+\+|@@) /m.test(section.slice(0, at));
-        const path = /^diff --git a\/(.+?) b\//m.exec(section)?.[1];
-        const entry = at < 0 || textBefore || path === undefined ? undefined : matched.get(key(repo.identity, path));
-        if (entry === undefined) return section;
-        replaced.set(key(repo.identity, entry.path), entry);
-        return `${section.slice(0, at)}Imported file, bytes withheld from review: size ${entry.size} bytes, ${entry.sha256}, from the import manifest of task ${entry.taskId} (execution ${entry.executionId}); the frozen candidate holds exactly these bytes.\n`;
-      })
-      .join(""),
-  }));
-  return {
-    diffs: shown,
-    binaryArtifacts: binaryArtifacts.map((artifact) => {
-      const entry = replaced.get(key(artifact.repository, artifact.path));
-      return entry === undefined ? artifact : { repository: artifact.repository, path: artifact.path, digest: entry.sha256, method: "import-manifest" };
-    }),
-  };
-};
+const importManifestSection = (entry: SnapshotImport): string =>
+  `diff --git a/${entry.path} b/${entry.path}\nnew file mode 100644\nindex ${"0".repeat(entry.blob.length)}..${entry.blob}\n` +
+  `Imported file, bytes not shown: ${entry.path}: ${entry.size} bytes, ${entry.sha256}, git blob ${entry.blob}, from the import manifest of task ${entry.taskId}. ` +
+  "The freeze read exactly these bytes at the candidate head, and the candidate snapshot binds them.\n";
+
+/** #1232 — the snapshot as the reviewer reads it: a repository's imports are counted; each is a manifest entry in the diff. */
+const snapshotForReviewer = (snapshot: CandidateSnapshot): unknown => ({
+  ...snapshot,
+  repositories: snapshot.repositories.map(({ imports, ...repository }) =>
+    imports === undefined ? repository : { ...repository, imports: `${imports.length} imported files, each shown in the Actual diff as its manifest entry` }),
+});
 
 interface ReviewChunkPart extends ReviewerDiff {
   coverageTargets: SliceCoverageTarget[];

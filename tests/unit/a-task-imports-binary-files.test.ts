@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
@@ -6,6 +7,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { allow } from "../../src/core/errors.ts";
 import { sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { IMPORT_MAX_FILE_BYTES, IMPORT_MAX_TOTAL_BYTES } from "../../src/run/task-import.ts";
 import { TaskWriteTargets } from "../../src/run/task-write-target.ts";
 import { WorkerTurnEvent, WorkerTurnRunner, type WorkerTurnOptions, workerSuccessDigest } from "../../src/run/worker-turn.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeCore, tempDir } from "../helpers/fixtures.ts";
@@ -93,7 +95,8 @@ const declareImports = (world: WorkerWorld, imports: unknown): void => {
   world.audit.record({ kind: "TASK_WRITE_TARGET_RECORDED", runId: world.runId, evidence: { taskId: world.taskId, writeTarget } });
 };
 
-const blobAt = (repo: string, spec: string): Buffer => execFileSync("git", ["-C", repo, "cat-file", "blob", spec], { timeout: 30_000 });
+const blobAt = (repo: string, spec: string): Buffer =>
+  execFileSync("git", ["-C", repo, "cat-file", "blob", spec], { timeout: 30_000, maxBuffer: 2 * IMPORT_MAX_FILE_BYTES });
 const status = (world: WorkerWorld): string => gitSync(world.repoPath, ["status", "--porcelain", "--untracked-files=all"]);
 
 /** A refused import opens no execution, launches nothing and writes nothing. */
@@ -172,6 +175,26 @@ describe("#1232 a task imports binary files through its write target", () => {
     const [failed] = world.audit.byKind(WorkerTurnEvent.FAILED);
     expect(failed!.evidence).toMatchObject({ reason: "IMPORT_ALTERED", altered: ["assets/logo.png"] });
   }, 60_000);
+
+  it("W1c the largest import set validation accepts, every file at its maximum size, is imported and committed", async () => {
+    const world = seedWorkerWorld(makeCore(), { ownedPaths: ["assets", "src"] });
+    const root = tempDir("acp-imports-");
+    const count = Math.floor(IMPORT_MAX_TOTAL_BYTES / IMPORT_MAX_FILE_BYTES);
+    const files = Array.from({ length: count }, (_, index) => ({ path: `assets/blob-${index}.bin`, bytes: randomBytes(IMPORT_MAX_FILE_BYTES) }));
+    const imports = files.map((file) => entry(file.path, file.bytes));
+    declareImports(world, imports);
+    for (const [index, file] of files.entries()) stage(root, world, imports[index]!.sha256, file.bytes);
+    const adapter = fakeFor(world);
+    const runner = makeRunner(world, adapter, { importRoot: root });
+
+    const started = await startTurn(world, runner);
+    if (!started.allowed) throw new Error(`start refused: ${started.reasonCode} ${started.message}`);
+    await runner.settled(started.value.executionId);
+
+    expect(world.tasks.execution(started.value.executionId)!.status).toBe("SUCCEEDED");
+    for (const file of files) expect(sha256(blobAt(world.repoPath, `HEAD:${file.path}`))).toBe(sha256(file.bytes));
+    expect((world.audit.byKind(WorkerTurnEvent.SUCCEEDED)[0]!.evidence as Record<string, unknown>)["imports"]).toEqual(imports);
+  }, 300_000);
 
   it("W2 a sha256 mismatch refuses the whole import: nothing is written and no worker is launched", async () => {
     const world = seedWorkerWorld(makeCore(), { ownedPaths: ["assets"] });

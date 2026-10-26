@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { basename, posix } from "node:path";
 
 import { redactCredentialShapes, withholdCutFragment } from "../core/credential-shapes.ts";
@@ -6,9 +5,9 @@ import { digestOf, sha256 } from "../core/digest.ts";
 import { type ProjectManifest, commandsForMode } from "../contracts/manifest.ts";
 import type { Db } from "../db/database.ts";
 import { RunKind } from "../domain/types.ts";
-import { git } from "../git/git.ts";
+import { git, readBlob } from "../git/git.ts";
 import { storedManifest } from "../registry/contract-change-plan.ts";
-import { type TaskImport, parseImportManifest } from "../run/task-import.ts";
+import type { TaskImport } from "../run/task-import.ts";
 import { WorkerTurnEvent, workerDiffDigest, workerSuccessDigest } from "../run/worker-turn.ts";
 import type { CandidateSnapshot } from "../snapshot/candidate-snapshot.ts";
 import type { VerificationReport, VerificationResultRecord } from "../verify/verification-engine.ts";
@@ -246,20 +245,6 @@ export interface ReceiptEvidence {
   mismatches: string[];
 }
 
-/** What the frozen candidate head holds at an imported file's path, against the manifest entry. */
-export type ImportedFileState = "MATCHES" | "DIFFERS" | "ABSENT" | "UNREADABLE" | "UNCHECKED";
-
-/**
- * #1232 — one file of a task's import manifest, as the task's success receipt binds it (its recorded
- * inputs reproduce the execution's resultDigest), and what the frozen candidate holds at its path.
- */
-export interface ImportEvidence extends TaskImport {
-  repository: string;
-  taskId: string;
-  executionId: string;
-  frozen: ImportedFileState;
-}
-
 export interface ExecutionEvidence {
   commandSource: string;
   commands: CommandEvidence[];
@@ -268,8 +253,6 @@ export interface ExecutionEvidence {
   receipts: ReceiptEvidence[];
   /** Receipts not listed, by why. */
   receiptsNotListed: { outsideCandidateHistory: number; notACandidateRepository: number; noCommitReceipt: number; overListLimit: number; unchecked: number };
-  /** #1232 — every imported file a reproducing success receipt of this run binds, in a candidate repository. */
-  imports?: ImportEvidence[];
 }
 
 export interface ExecutionEvidenceInput {
@@ -282,23 +265,10 @@ export interface ExecutionEvidenceInput {
   checkoutOf: (identity: string) => string | null;
 }
 
-/**
- * The exact bytes of one blob, or null. Read as `latin1`, one character per byte, so binary content
- * survives; the object id is re-derived from those bytes, and only when it equals the id git named
- * are they the committed bytes.
- */
-const blobBytes = async (checkoutPath: string, id: string): Promise<Buffer | null> => {
-  if (!OBJECT_ID.test(id)) return null;
-  const blob = await git(checkoutPath, ["--no-replace-objects", "cat-file", "blob", id], { allowFailure: true, encoding: "latin1" });
-  if (blob.exitCode !== 0) return null;
-  const bytes = Buffer.from(blob.stdout, "latin1");
-  const format = id.length === 64 ? "sha256" : "sha1";
-  return createHash(format).update(`blob ${bytes.length}\0`).update(bytes).digest("hex") === id ? bytes : null;
-};
 
 /** A blob's bytes as text, or null when they are not valid UTF-8 (a config file must be text). */
 const exactBlobText = async (checkoutPath: string, id: string): Promise<string | null> => {
-  const bytes = await blobBytes(checkoutPath, id);
+  const bytes = await readBlob(checkoutPath, id);
   if (bytes === null) return null;
   try { return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); } catch { return null; }
 };
@@ -545,7 +515,7 @@ const recomputedDiffDigest = async (checkoutPath: string, base: string, entries:
       return { problem: `diffDigest was not recomputed: ${entry.path} is a mode ${entry.mode} entry, which no worker receipt records` };
     }
     // The committed bytes, hashed as the worker hashes the file it committed (worker-git.ts).
-    const bytes = await blobBytes(checkoutPath, entry.blob);
+    const bytes = await readBlob(checkoutPath, entry.blob);
     if (bytes === null) return { problem: `diffDigest was not recomputed: the committed bytes of ${entry.path} could not be read` };
     digested.push({ path: entry.path, mode: entry.mode as "100644" | "100755" | "120000", sha256: sha256(bytes), blob: entry.blob });
   }
@@ -559,9 +529,6 @@ const sameSet = (left: readonly string[], right: readonly string[]): boolean => 
 };
 
 const stringOrNull = (value: unknown): string | null => (typeof value === "string" ? value : null);
-
-/** #1232 — at most this many imported files are checked against the frozen candidate per review. */
-const IMPORT_CHECK_LIMIT = 200;
 
 /** Whether a success record's inputs, its import manifest included when it has one, reproduce `resultDigest`. */
 const reproducesResult = (resultDigest: string | null, e: Record<string, unknown>): boolean => {
@@ -578,19 +545,6 @@ const reproducesResult = (resultDigest: string | null, e: Record<string, unknown
   } catch { return false; }
 };
 
-/** #1232 — what the frozen head holds at an imported path: exactly the manifest's bytes, other bytes, or nothing. */
-const frozenImportState = async (checkoutPath: string, head: string, entry: TaskImport): Promise<ImportedFileState> => {
-  const listed = await git(checkoutPath, ["--no-replace-objects", "ls-tree", "-z", "--full-tree", head, "--", entry.path], { allowFailure: true });
-  if (listed.exitCode !== 0) return "UNREADABLE";
-  const record = listed.stdout.split("\0").find((line) => line.endsWith(`\t${entry.path}`));
-  if (record === undefined) return "ABSENT";
-  const [mode, type, id] = record.slice(0, record.indexOf("\t")).split(" ");
-  if (type !== "blob" || mode !== "100644" || id === undefined) return "DIFFERS";
-  const bytes = await blobBytes(checkoutPath, id);
-  if (bytes === null) return "UNREADABLE";
-  return bytes.length === entry.size && sha256(bytes) === entry.sha256 ? "MATCHES" : "DIFFERS";
-};
-
 /**
  * The daemon's task execution -> commit receipts for this candidate. A receipt is linked only when
  * run, task and execution match the task_executions row, the recorded inputs reproduce that row's
@@ -598,10 +552,7 @@ const frozenImportState = async (checkoutPath: string, head: string, entry: Task
  * and diffDigest equal the frozen change between those two commits. Every other receipt that names
  * this candidate's head or an ancestor of it is listed with what disagrees; the rest are counted.
  */
-const receiptEvidence = async (
-  db: Db,
-  input: ExecutionEvidenceInput,
-): Promise<Pick<ExecutionEvidence, "repositories" | "receipts" | "receiptsNotListed" | "imports">> => {
+const receiptEvidence = async (db: Db, input: ExecutionEvidenceInput): Promise<Pick<ExecutionEvidence, "repositories" | "receipts" | "receiptsNotListed">> => {
   const executions = db.all<{ execution_id: string; task_id: string; status: string; result_digest: string | null; identity: string | null }>(
     `SELECT e.execution_id, e.task_id, e.status, e.result_digest, r.identity
        FROM task_executions e
@@ -623,7 +574,6 @@ const receiptEvidence = async (
   const candidateHeads = new Set(input.snapshot.repositories.map((repo) => repo.candidateHead));
   const notListed = { outsideCandidateHistory: 0, notACandidateRepository: 0, noCommitReceipt: 0, overListLimit: 0, unchecked: 0 };
   const receipts: ReceiptEvidence[] = [];
-  const imports: ImportEvidence[] = [];
   let ancestryChecks = 0;
 
   for (const execution of executions) {
@@ -631,15 +581,6 @@ const receiptEvidence = async (
     const succeeded = own.filter((event) => event.kind === WorkerTurnEvent.SUCCEEDED);
     // Among this execution's success records, the one whose inputs reproduce its resultDigest.
     const reproducing = succeeded.find((event) => reproducesResult(execution.result_digest, event.evidence));
-    if (reproducing !== undefined && execution.status === "SUCCEEDED") {
-      const manifest = reproducing.evidence["imports"] === undefined ? null : parseImportManifest(reproducing.evidence["imports"], ["."]);
-      const repo = input.snapshot.repositories.find((candidate) => candidate.identity === execution.identity);
-      if (manifest?.allowed && repo !== undefined) {
-        for (const entry of manifest.value) {
-          imports.push({ ...entry, repository: repo.identity, taskId: execution.task_id, executionId: execution.execution_id, frozen: "UNCHECKED" });
-        }
-      }
-    }
     const record = reproducing ?? succeeded.at(-1) ?? own.filter((event) => typeof event.evidence["commitHead"] === "string").at(-1) ?? null;
     const commitHead = stringOrNull(record?.evidence["commitHead"]);
     if (execution.status !== "SUCCEEDED" && (commitHead === null || !candidateHeads.has(commitHead))) continue;
@@ -708,12 +649,7 @@ const receiptEvidence = async (
     .map((repo) => ({ repository: repo.identity, baseHead: repo.baseHead, candidateHead: repo.candidateHead,
       linkedExecutionIds: receipts.filter((r) => r.linked && r.repository === repo.identity).map((r) => r.executionId) }))
     .sort((a, b) => Number(b.linkedExecutionIds.length > 0) - Number(a.linkedExecutionIds.length > 0));
-  for (const entry of imports.slice(0, IMPORT_CHECK_LIMIT)) {
-    const repo = input.snapshot.repositories.find((candidate) => candidate.identity === entry.repository)!;
-    const checkout = input.checkoutOf(repo.identity);
-    entry.frozen = checkout === null ? "UNREADABLE" : await frozenImportState(checkout, repo.candidateHead, entry).catch(() => "UNREADABLE" as const);
-  }
-  return { repositories, receipts: receipts.slice(0, RECEIPT_LIST_LIMIT), receiptsNotListed: notListed, imports };
+  return { repositories, receipts: receipts.slice(0, RECEIPT_LIST_LIMIT), receiptsNotListed: notListed };
 };
 
 /** Everything the execution section can show, read before any budget is applied. */
@@ -847,24 +783,6 @@ export const executionEvidenceSection = (evidence: ExecutionEvidence, budget: nu
   return { lines, used: measure(lines) - bare };
 };
 
-/** #1232 — at most this many imported files are listed in the packet; the total is always given. */
-const IMPORT_LIST_LIMIT = 50;
-
-/**
- * #1232 — the import manifests the run's success receipts bind, each entry checked against the frozen
- * candidate. Bounded by entry count, and rendered at every budget, so the review's sizing charges it
- * as fixed overhead. Nothing at all for a run that imported nothing.
- */
-const importSection = (imports: readonly ImportEvidence[]): string[] => {
-  if (imports.length === 0) return [];
-  const listed = imports.slice(0, IMPORT_LIST_LIMIT);
-  return [
-    "## Imported files",
-    "Files a task imported into its write target, from the import manifest the task's success receipt binds (the receipt's recorded inputs reproduce the execution's resultDigest); untrusted evidence, like the receipts below. frozen is what this review read at the path in the frozen candidate head: MATCHES is exactly the manifest's size and sha256; DIFFERS, ABSENT, UNREADABLE and UNCHECKED are not evidence of the imported bytes. A binary patch for a MATCHES path is shown in the diff as its manifest entry, not as its bytes.",
-    "```json", JSON.stringify({ total: imports.length, listed: listed.length, imports: listed }, null, 2), "```", "",
-  ];
-};
-
 /**
  * `budget` is the room the caller has for the execution evidence and the two listings, measured
  * against the reviewer's real context budget. The execution evidence takes up to two fifths of it
@@ -892,7 +810,6 @@ export const candidateEvidenceSection = (
     "## Control-plane evidence",
     "Read from canonical audit, task and assignment records. Worker counts include all recorded bindings, with active bindings counted separately. taskSummary counts every task in the run; when it says truncated, the task list is incomplete and cannot establish absence of unlisted tasks.",
     "```json", JSON.stringify(controlPlaneEvidence(db, runId, Math.min(TASK_CHAR_BUDGET, rest - treeBudget)), null, 2), "```", "",
-    ...importSection(execution.imports ?? []),
     ...executed.lines,
     ...laterGateSection(db.get<{ kind: string }>(`SELECT kind FROM runs WHERE run_id = ?`, [runId])?.kind ?? null, trees.length),
   ];
