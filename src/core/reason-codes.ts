@@ -206,6 +206,12 @@ export const ReasonCode = {
    * nothing is committed.
    */
   IMPORT_DIGEST_MISMATCH: "IMPORT_DIGEST_MISMATCH",
+  /**
+   * #1232 — a file a task imports could not be reviewed: executable or loadable code, an archive, or
+   * binary bytes at a source path; or the task's text imports exceed what its patch can carry. Nothing
+   * is imported.
+   */
+  IMPORT_CONTENT_REFUSED: "IMPORT_CONTENT_REFUSED",
   TASK_RECEIPT_MISSING: "TASK_RECEIPT_MISSING",
   TASK_RESULT_COUNT_MISMATCH: "TASK_RESULT_COUNT_MISMATCH",
 

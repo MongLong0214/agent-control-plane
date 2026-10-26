@@ -34,6 +34,13 @@ import { GIT_OUTPUT_MAX_BYTES } from "../git/git.ts";
  * symlinked source, a path outside the target or a destination that is a symlink or already exists
  * refuses the whole import before anything is written. The files are committed with the worker's
  * change, and the success receipt binds the manifest.
+ *
+ * What review sees depends on the content (`classifyImport`). A file git reads as text is never bound
+ * by its manifest: it stays in the candidate's patch and is reviewed like any other change, so a task's
+ * text imports are bounded by what that patch can carry (`IMPORT_MAX_TEXT_BYTES`). A binary file may be
+ * bound by its manifest only as non-executable data: executable or loadable formats and archives, and
+ * binary bytes at a source, script or configuration path, are refused, and the reviewer reads the
+ * detected type of every bound file.
  */
 
 /** One imported file: where it lands in the repository, its size in bytes and the sha256 of its bytes. */
@@ -53,14 +60,160 @@ export const IMPORT_MAX_FILES = 100;
 /**
  * 50 MiB, GitHub's warning size, and never more than the git wrapper can hand back whole: the freeze
  * reads each imported blob through it to bind the file by sha256 (`buildCandidateSnapshot`), and the
- * receipt check in review reads it again. No imported file's patch is ever materialised, so this is
- * the only git output an import's size meets downstream.
+ * receipt check in review reads it again. A bound (binary data) import's patch is never materialised;
+ * a text import's is, and `IMPORT_MAX_TEXT_BYTES` bounds that.
  */
 export const IMPORT_MAX_FILE_BYTES = Math.min(50 * 1024 * 1024, GIT_OUTPUT_MAX_BYTES);
 /** The bytes one task imports, held in memory once while they are verified and written. */
 export const IMPORT_MAX_TOTAL_BYTES = 4 * IMPORT_MAX_FILE_BYTES;
 /** The audit log keeps an unlisted string field only up to 200 characters, and an entry's path is one. */
 const IMPORT_PATH_MAX_CHARS = 200;
+/**
+ * The most patch one new text file adds besides its lines: `diff --git a/<path> b/<path>`, the mode and
+ * full-index lines, `--- /dev/null`, `+++ b/<path>`, the hunk header and a no-newline marker.
+ */
+const TEXT_PATCH_HEADER_BYTES = 3 * IMPORT_PATH_MAX_CHARS + 256;
+/**
+ * The text one task may import, all files together. A new text file of n bytes is at most 2n bytes of
+ * patch (were every byte a newline, each would become `+\n`) plus its header, and the candidate's whole
+ * patch is read through the git wrapper, which hands back at most `GIT_OUTPUT_MAX_BYTES`. One task's
+ * text imports may take half of that; the other half is left to everything else the candidate changes.
+ * Review carries any text the patch carries, chunked and range-split.
+ */
+export const IMPORT_MAX_TEXT_BYTES = Math.floor((GIT_OUTPUT_MAX_BYTES / 2 - IMPORT_MAX_FILES * TEXT_PATCH_HEADER_BYTES) / 2);
+
+/**
+ * Git's own text/binary decision on content (`buffer_is_binary` in git's xdiff-interface.c): a NUL byte
+ * within the first 8000 bytes makes a blob binary. The freeze also asks git for its decision on each
+ * path, attributes included (`binaryPaths`), before it binds anything.
+ */
+const GIT_BINARY_PROBE_BYTES = 8000;
+export const gitReadsAsBinary = (bytes: Buffer): boolean => bytes.subarray(0, GIT_BINARY_PROBE_BYTES).includes(0);
+
+interface Format {
+  name: string;
+  /** Every signature must match: `[offset, bytes]`. */
+  signatures: ReadonlyArray<readonly [number, Buffer]>;
+  /** Matched only in content git reads as binary (a text script's shebang is reviewed as text). */
+  binaryOnly?: boolean;
+}
+
+const format = (name: string, ...signatures: Array<readonly [number, string | number[]]>): Format => ({
+  name,
+  signatures: signatures.map(([offset, bytes]) => [offset, typeof bytes === "string" ? Buffer.from(bytes, "latin1") : Buffer.from(bytes)] as const),
+});
+
+const matches = (bytes: Buffer, candidate: Format): boolean =>
+  candidate.signatures.every(([offset, signature]) =>
+    bytes.length >= offset + signature.length && bytes.subarray(offset, offset + signature.length).equals(signature));
+
+/** Executable or loadable code, and archives that can carry it, by magic number: never imported. */
+const REFUSED_FORMATS: readonly Format[] = [
+  format("ELF executable or library", [0, [0x7f, 0x45, 0x4c, 0x46]]),
+  ...[[0xfe, 0xed, 0xfa, 0xce], [0xfe, 0xed, 0xfa, 0xcf], [0xce, 0xfa, 0xed, 0xfe], [0xcf, 0xfa, 0xed, 0xfe]]
+    .map((magic) => format("Mach-O executable or library", [0, magic])),
+  format("Mach-O universal binary or Java class", [0, [0xca, 0xfe, 0xba, 0xbe]]),
+  format("Mach-O universal binary", [0, [0xca, 0xfe, 0xba, 0xbf]]),
+  format("Mach-O universal binary", [0, [0xbe, 0xba, 0xfe, 0xca]]),
+  format("PE or DOS executable", [0, "MZ"]),
+  format("WebAssembly module", [0, [0x00, 0x61, 0x73, 0x6d]]),
+  { ...format("script with a shebang", [0, "#!"]), binaryOnly: true },
+  format("Dalvik executable", [0, "dex\n"]),
+  format("Lua bytecode", [0, [0x1b, 0x4c, 0x75, 0x61]]),
+  ...["PK\x03\x04", "PK\x05\x06", "PK\x07\x08"].map((magic) => format("zip archive (JAR, APK and wheel included)", [0, magic])),
+  format("gzip archive", [0, [0x1f, 0x8b]]),
+  format("compress archive", [0, [0x1f, 0x9d]]),
+  format("bzip2 archive", [0, "BZh"]),
+  format("xz archive", [0, [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]]),
+  format("zstd archive", [0, [0x28, 0xb5, 0x2f, 0xfd]]),
+  format("7z archive", [0, [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]]),
+  format("RAR archive", [0, "Rar!\x1a\x07"]),
+  format("lzip archive", [0, "LZIP"]),
+  format("LZ4 archive", [0, [0x04, 0x22, 0x4d, 0x18]]),
+  format("cabinet archive", [0, "MSCF"]),
+  format("ar archive (.deb and static libraries included)", [0, "!<arch>\n"]),
+  format("xar archive", [0, "xar!"]),
+  format("RPM package", [0, [0xed, 0xab, 0xee, 0xdb]]),
+  ...["070707", "070701", "070702"].map((magic) => format("cpio archive", [0, magic])),
+  format("cpio archive", [0, [0xc7, 0x71]]),
+  format("cpio archive", [0, [0x71, 0xc7]]),
+  format("tar archive", [257, "ustar"]),
+];
+
+/** Non-executable data formats a reviewer can name, by magic number; anything else is `unknown-binary`. */
+const DATA_FORMATS: readonly Format[] = [
+  format("PNG", [0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]]),
+  format("JPEG", [0, [0xff, 0xd8, 0xff]]),
+  format("GIF", [0, "GIF87a"]),
+  format("GIF", [0, "GIF89a"]),
+  format("WebP", [0, "RIFF"], [8, "WEBP"]),
+  format("WAV", [0, "RIFF"], [8, "WAVE"]),
+  format("BMP", [0, "BM"]),
+  format("ICO", [0, [0x00, 0x00, 0x01, 0x00]]),
+  format("TIFF", [0, "II*\x00"]),
+  format("TIFF", [0, "MM\x00*"]),
+  format("font (WOFF2)", [0, "wOF2"]),
+  format("font (WOFF)", [0, "wOFF"]),
+  format("font (OpenType)", [0, "OTTO"]),
+  format("font (TrueType)", [0, [0x00, 0x01, 0x00, 0x00]]),
+  format("font (TrueType)", [0, "true"]),
+  format("font (collection)", [0, "ttcf"]),
+  format("PDF", [0, "%PDF-"]),
+  format("ISO media (MP4, MOV, AVIF or HEIF)", [4, "ftyp"]),
+  format("MP3", [0, "ID3"]),
+  format("Ogg", [0, "OggS"]),
+  format("FLAC", [0, "fLaC"]),
+  format("MIDI", [0, "MThd"]),
+  format("Photoshop document", [0, "8BPS"]),
+  format("SQLite database", [0, "SQLite format 3\x00"]),
+];
+
+/**
+ * Extensions and file names a toolchain loads as source, script or configuration. Binary bytes there
+ * are refused: no reviewer can read them, and a loader may still run them (JavaScript allows a NUL in a
+ * comment, so a script git reads as binary can still be loaded).
+ */
+const SOURCE_EXTENSIONS: ReadonlySet<string> = new Set([
+  "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "json", "json5", "jsonc", "map", "vue", "svelte", "astro",
+  "sh", "bash", "zsh", "fish", "ksh", "csh", "tcsh", "command", "ps1", "psm1", "psd1", "bat", "cmd", "vbs", "vba", "wsf",
+  "py", "pyw", "pyi", "pyc", "pyo", "rb", "erb", "pl", "pm", "php", "phtml", "go", "rs", "java", "kt", "kts", "scala",
+  "groovy", "gradle", "clj", "cljs", "cljc", "edn", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx", "m", "mm", "swift",
+  "cs", "csx", "fs", "fsx", "vb", "lua", "r", "jl", "dart", "ex", "exs", "erl", "hrl", "hs", "lhs", "ml", "mli", "elm",
+  "nim", "zig", "sol", "sql", "yml", "yaml", "toml", "ini", "cfg", "conf", "env", "properties", "xml", "xsl", "xslt",
+  "plist", "html", "htm", "xhtml", "css", "scss", "sass", "less", "md", "mdx", "txt", "rst", "lock", "tf", "tfvars",
+  "hcl", "nix", "mk", "cmake", "service", "desktop", "npmrc", "yarnrc", "editorconfig", "gitattributes", "gitignore",
+  "gitmodules", "dockerignore",
+]);
+const SOURCE_NAMES: ReadonlySet<string> = new Set([
+  "makefile", "dockerfile", "containerfile", "gemfile", "rakefile", "procfile", "vagrantfile", "jenkinsfile", "brewfile",
+  "podfile", "justfile", "build", "workspace",
+]);
+
+const isSourcePath = (path: string): boolean => {
+  const name = path.slice(path.lastIndexOf("/") + 1).toLowerCase();
+  const dot = name.lastIndexOf(".");
+  return SOURCE_NAMES.has(name) || (dot >= 0 && SOURCE_EXTENSIONS.has(name.slice(dot + 1)));
+};
+
+/** How review can see one imported file, from its bytes and path. */
+export type ImportContent =
+  | { kind: "text" }
+  | { kind: "data"; type: string }
+  | { kind: "refused"; why: string };
+
+/**
+ * Text (git reads it as text) is reviewed as the patch it is; data is bound by its manifest and shown
+ * as its detected type; anything else is refused. Executable or loadable formats and archives are
+ * refused whatever git reads them as; binary bytes at a source, script or configuration path are refused.
+ */
+export const classifyImport = (path: string, bytes: Buffer): ImportContent => {
+  const binary = gitReadsAsBinary(bytes);
+  const refused = REFUSED_FORMATS.find((candidate) => (binary || candidate.binaryOnly !== true) && matches(bytes, candidate));
+  if (refused !== undefined) return { kind: "refused", why: `${refused.name}: executable or loadable code, or an archive that can carry it` };
+  if (!binary) return { kind: "text" };
+  if (isSourcePath(path)) return { kind: "refused", why: "binary bytes at a source, script or configuration path, which no reviewer can read" };
+  return { kind: "data", type: DATA_FORMATS.find((candidate) => matches(bytes, candidate))?.name ?? "unknown-binary" };
+};
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 /**
@@ -257,6 +410,14 @@ export const readStagedImports = (input: {
     staged.push({ ...entry, bytes: read.bytes });
   }
   const named = { stagingDir, missing: missing.slice(0, 50), mismatched: mismatched.slice(0, 50), insecure: insecure.slice(0, 50) };
+  const refused: Array<{ path: string; why: string }> = [];
+  const text: StagedImport[] = [];
+  for (const entry of staged) {
+    const content = classifyImport(entry.path, entry.bytes);
+    if (content.kind === "refused") refused.push({ path: entry.path, why: content.why });
+    else if (content.kind === "text") text.push(entry);
+  }
+  const textBytes = text.reduce((sum, entry) => sum + entry.size, 0);
   if (insecure.length > 0) {
     return deny(ReasonCode.STATE_PATH_INSECURE, "a staged import is not a regular file in its staging directory; nothing is imported", {
       reason: "IMPORT_SOURCE_INSECURE",
@@ -271,6 +432,20 @@ export const readStagedImports = (input: {
   }
   if (missing.length > 0) {
     return deny(ReasonCode.EVIDENCE_MISSING, "a manifest entry has no staged file; nothing is imported", { reason: "IMPORT_SOURCE_MISSING", ...named });
+  }
+  if (refused.length > 0) {
+    return deny(ReasonCode.IMPORT_CONTENT_REFUSED, "an import is executable or loadable code, an archive, or binary bytes at a source path; nothing is imported", {
+      reason: "IMPORT_NOT_REVIEWABLE",
+      refused: refused.slice(0, 50),
+    });
+  }
+  if (textBytes > IMPORT_MAX_TEXT_BYTES) {
+    return deny(ReasonCode.IMPORT_CONTENT_REFUSED, `a task imports at most ${IMPORT_MAX_TEXT_BYTES} bytes of text, which review reads as patch; nothing is imported`, {
+      reason: "IMPORT_TEXT_TOO_LARGE",
+      textBytes,
+      limit: IMPORT_MAX_TEXT_BYTES,
+      text: text.map((entry) => entry.path).slice(0, 50),
+    });
   }
   return allow(ReasonCode.OK, staged);
 };

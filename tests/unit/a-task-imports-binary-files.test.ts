@@ -7,6 +7,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { allow } from "../../src/core/errors.ts";
 import { sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import * as taskImport from "../../src/run/task-import.ts";
 import { IMPORT_MAX_FILE_BYTES, IMPORT_MAX_TOTAL_BYTES } from "../../src/run/task-import.ts";
 import { TaskWriteTargets } from "../../src/run/task-write-target.ts";
 import { WorkerTurnEvent, WorkerTurnRunner, type WorkerTurnOptions, workerSuccessDigest } from "../../src/run/worker-turn.ts";
@@ -42,6 +43,8 @@ const FONT = Buffer.concat([Buffer.from("wOF2"), Buffer.from([0x00, 0x01, 0x00, 
 interface ImportEntry { path: string; size: number; sha256: string }
 
 const entry = (path: string, bytes: Buffer): ImportEntry => ({ path, size: bytes.length, sha256: sha256(bytes) });
+/** Binary data of `size` bytes that no magic number names: a fixed prefix, then random bytes. */
+const dataBlob = (size: number): Buffer => Buffer.concat([Buffer.from("ACPDATA\0"), randomBytes(size - 8)]);
 const hexOf = (digest: string): string => digest.slice("sha256:".length);
 
 const adapters: FakeWorkerAdapter[] = [];
@@ -180,7 +183,8 @@ describe("#1232 a task imports binary files through its write target", () => {
     const world = seedWorkerWorld(makeCore(), { ownedPaths: ["assets", "src"] });
     const root = tempDir("acp-imports-");
     const count = Math.floor(IMPORT_MAX_TOTAL_BYTES / IMPORT_MAX_FILE_BYTES);
-    const files = Array.from({ length: count }, (_, index) => ({ path: `assets/blob-${index}.bin`, bytes: randomBytes(IMPORT_MAX_FILE_BYTES) }));
+    // Data no magic number names: a fixed prefix, then random bytes.
+    const files = Array.from({ length: count }, (_, index) => ({ path: `assets/blob-${index}.bin`, bytes: dataBlob(IMPORT_MAX_FILE_BYTES) }));
     const imports = files.map((file) => entry(file.path, file.bytes));
     declareImports(world, imports);
     for (const [index, file] of files.entries()) stage(root, world, imports[index]!.sha256, file.bytes);
@@ -326,5 +330,41 @@ describe("#1232 a task imports binary files through its write target", () => {
       expect(existsSync(join(world.repoPath, ".git", "hooks", "pre-commit")), testCase.name).toBe(false);
       expect(readdirSync(outside), testCase.name).toEqual([]);
     }
+  }, 120_000);
+  /** Imports one file through a worker turn and expects the whole import refused before anything is written. */
+  const expectRefusedImport = async (testCase: { name: string; path: string; bytes: Buffer }): Promise<void> => {
+    const world = seedWorkerWorld(makeCore(), { ownedPaths: ["assets"] });
+    const root = tempDir("acp-imports-");
+    const imports = [entry(testCase.path, testCase.bytes)];
+    declareImports(world, imports);
+    stage(root, world, imports[0]!.sha256, testCase.bytes);
+    const head = gitSync(world.repoPath, ["rev-parse", "HEAD"]);
+    const adapter = fakeFor(world);
+
+    const refused = await startTurn(world, makeRunner(world, adapter, { importRoot: root }));
+
+    expect(refused.allowed, testCase.name).toBe(false);
+    expect(refused.reasonCode, testCase.name).toBe("IMPORT_CONTENT_REFUSED");
+    expect(JSON.stringify(refused.evidence), testCase.name).toContain(testCase.path);
+    expectNothingImported(world, adapter, head);
+  };
+
+  it("W8 an executable, loadable or archive binary, and binary bytes at a source path, are each refused", async () => {
+    const tail = Buffer.concat([Buffer.alloc(64, 0x00), randomBytes(64)]);
+    const cases: Array<{ name: string; path: string; bytes: Buffer }> = [
+      { name: "an ELF executable", path: "assets/tool", bytes: Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]), tail]) },
+      { name: "a Mach-O library", path: "assets/libhelper.dylib", bytes: Buffer.concat([Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01]), tail]) },
+      { name: "a zip archive", path: "assets/bundle.zip", bytes: Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00]), tail]) },
+      { name: "a WebAssembly module", path: "assets/module.bin", bytes: Buffer.concat([Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]), tail]) },
+      { name: "a gzip archive", path: "assets/data.gz", bytes: Buffer.concat([Buffer.from([0x1f, 0x8b, 0x08, 0x00]), tail]) },
+      { name: "JavaScript with a NUL byte, which git reads as binary", path: "assets/hidden.js", bytes: Buffer.from("require('child_process').execSync('id'); // \0\n") },
+    ];
+    for (const testCase of cases) await expectRefusedImport(testCase);
+  }, 120_000);
+
+  it("W8b a text import past the text limit derived from the patch cap is refused", async () => {
+    const limits = taskImport as unknown as Record<string, unknown>;
+    expect(typeof limits["IMPORT_MAX_TEXT_BYTES"], "the text limit is exported").toBe("number");
+    await expectRefusedImport({ name: "text one byte past the limit", path: "assets/table.json", bytes: Buffer.alloc((limits["IMPORT_MAX_TEXT_BYTES"] as number) + 1, 0x0a) });
   }, 120_000);
 });

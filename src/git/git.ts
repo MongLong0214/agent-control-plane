@@ -454,6 +454,24 @@ export const diffDigest = async (cwd: string, base: string, head: string, withhe
   sha256(await diffPatch(cwd, base, head, withheld));
 
 /**
+ * #1232 — which of `paths` git itself treats as binary in the patch between two commits: its numstat
+ * reports `-` for both counts, read with the same options as `diffPatch`, so the repository's
+ * attributes decide exactly as they do there. Every path is a literal, root-relative pathspec.
+ */
+export const binaryPaths = async (cwd: string, base: string, head: string, paths: readonly string[]): Promise<Set<string>> => {
+  if (paths.length === 0) return new Set();
+  const listed = await git(cwd, [
+    "diff", "--numstat", "-z", "--no-renames", ...PATCH_WITHOUT_PROGRAMS, `${base}..${head}`, "--", ...paths.map((path) => `:(top,literal)${path}`),
+  ]);
+  const binary = new Set<string>();
+  for (const record of listed.stdout.split("\0")) {
+    const [added, deleted, path] = record.split("\t");
+    if (added === "-" && deleted === "-" && path !== undefined && paths.includes(path)) binary.add(path);
+  }
+  return binary;
+};
+
+/**
  * The exact bytes of one blob, or null. Read as `latin1`, one character per byte, so binary content
  * survives; the object id is re-derived from those bytes, and only when it equals the id git named
  * are they the committed bytes. A blob larger than `GIT_OUTPUT_MAX_BYTES` cannot be read whole here.

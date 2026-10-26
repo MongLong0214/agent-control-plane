@@ -6,7 +6,8 @@ import { digestOf, sha256 } from "../core/digest.ts";
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { changedPaths, diffDigest, git, isClean, readBlob, revParse, treeOf, tryRevParse } from "../git/git.ts";
+import { binaryPaths, changedPaths, diffDigest, git, isClean, readBlob, revParse, treeOf, tryRevParse } from "../git/git.ts";
+import { classifyImport } from "../run/task-import.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
 
 export const CANDIDATE_SNAPSHOT_SCHEMA_ID = "agent-control-plane.candidate-snapshot.v1";
@@ -32,8 +33,10 @@ export type SnapshotIntegration = z.infer<typeof snapshotIntegrationSchema>;
 /**
  * #1232 — a file a SUCCEEDED task imported, as the freeze found it: the candidate head holds a regular
  * file at `path` whose blob is `blob` and whose bytes have exactly the manifest's `size` and `sha256`,
- * and the base holds nothing at or below `path`. Its patch is left out of `diffDigest`, so its bytes are
- * never materialised for the freeze or the review; the head and tree digests still fix it exactly.
+ * the base holds nothing at or below `path`, and the bytes are non-executable binary data of `type`
+ * (`classifyImport`), which git's own numstat also reads as binary. Its patch is left out of
+ * `diffDigest`, so its bytes are never materialised for the freeze or the review; the head and tree
+ * digests still fix it exactly. Text is never bound: it stays in the patch and is reviewed as such.
  */
 export const snapshotImportSchema = z
   .object({
@@ -42,6 +45,8 @@ export const snapshotImportSchema = z
     sha256: z.string().regex(/^sha256:[0-9a-f]{64}$/),
     blob: z.string().regex(/^[0-9a-f]{40}$/),
     taskId: z.string().min(1),
+    /** The detected data type the reviewer reads (`PNG`, `font (WOFF2)`, `unknown-binary`, ...). */
+    type: z.string().min(1),
   })
   .strict();
 
@@ -241,9 +246,9 @@ export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
   });
 
 /**
- * #1232 — the declared imports the candidate holds byte for byte (`snapshotImportSchema`), read one
- * blob at a time. A declared import the candidate does not hold so -- changed by a later task, say --
- * is not bound and stays in the patch like any other change.
+ * #1232 — the declared imports the candidate holds byte for byte as binary data (`snapshotImportSchema`),
+ * read one blob at a time. Anything else a manifest names -- text, code, an archive, a file a later task
+ * changed -- is not bound and stays in the patch like any other change.
  */
 const importsAtCandidate = async (
   checkoutPath: string,
@@ -263,9 +268,13 @@ const importsAtCandidate = async (
     if (atBase.exitCode !== 0 || atBase.stdout.length > 0) continue;
     const bytes = await readBlob(checkoutPath, blob);
     if (bytes === null || bytes.length !== entry.size || sha256(bytes) !== entry.sha256) continue;
-    bound.set(entry.path, { path: entry.path, size: entry.size, sha256: entry.sha256, blob, taskId: entry.taskId });
+    const content = classifyImport(entry.path, bytes);
+    if (content.kind !== "data") continue;
+    bound.set(entry.path, { path: entry.path, size: entry.size, sha256: entry.sha256, blob, taskId: entry.taskId, type: content.type });
   }
-  return [...bound.values()].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  // Git's own decision for each path, attributes included: only what git also reads as binary is bound.
+  const binary = await binaryPaths(checkoutPath, baseHead, candidateHead, [...bound.keys()]);
+  return [...bound.values()].filter((entry) => binary.has(entry.path)).sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 };
 
 export const buildCandidateSnapshot = async (
