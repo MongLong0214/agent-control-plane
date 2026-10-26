@@ -1,0 +1,4 @@
+Limit: the worker scan exempts exactly one path, .claude/scheduled_tasks.lock at the repository root, when .claude is a real directory and the lock is a regular file; it is Claude Code's session cron lock that a resident CTO writes into its cwd, which is the registered checkout every worker turn uses (live myeotnyeon, 2026-10-26). Every other .claude/** path, .mcp.json, a symlink or directory at that path, and a tracked lock are still unsafe
+Warn: the resident's cwd and the worker checkout are still one tree; a worker that rewrites the lock file is no longer refused (the file is never committed); a dedicated worker checkout is the structural fix and needs a re-registration path that does not exist yet
+Record-Id: r-9ba23649e49f
+Provenance: inherited 9f848ba6e186c8b7aa12a4ef954bcfbb3ed44e7b
