@@ -1,0 +1,4 @@
+Limit: on a repository this operation created (create receipt preexisting:false with the node id just read), a genesis label that matches an existing one ignoring case is PATCHed to the planned name, color and description, so GitHub's autoInit defaults (enhancement, bug, ...) no longer stop acp-genesis-labels; elsewhere the step refuses GENESIS_LABEL_CONFLICT with observed and desired, never REMOTE_REFUSED (live run_3884d4fc, 2026-10-26)
+Warn: the not-created-repository branch is reachable in practice only through a ledger whose repository receipt says preexisting:true, since genesis plans always create; tested against the in-memory GitHub only, and the label read still fetches one page of 100
+Record-Id: r-470fa72377e3
+Provenance: inherited 02cc7fc613e9c833ee87539937fb9d7ea01bd6fe
