@@ -2865,6 +2865,15 @@ type CodexReviewerHome =
   | { readonly kind: "SHARED"; readonly root: string };
 
 /**
+ * Joins a reviewer's system prompt and prompt into the single string the Codex CLI actually
+ * receives (as an argv element or as stdin, below). A caller sizing that combined input — the
+ * blind-review chunk decision, in particular — must count this separator too, or an input that
+ * fits only because the separator was left uncounted reaches the CLI a few characters over budget
+ * (#1208).
+ */
+export const REVIEWER_TRANSPORT_SEPARATOR = "\n\n---\n\n";
+
+/**
  * Codex CLI adapter. Preferred runtime for the blind reviewer (GPT-6.1 Sol at xhigh
  * effort, §18.1) and for mechanical worker tasks.
  */
@@ -3092,7 +3101,7 @@ export class CodexCliAdapter implements ProviderAdapter {
     }
 
     const prompt = request.systemPrompt
-      ? `${request.systemPrompt}\n\n---\n\n${request.prompt}`
+      ? `${request.systemPrompt}${REVIEWER_TRANSPORT_SEPARATOR}${request.prompt}`
       : request.prompt;
 
     // A worker turn names its child and ends that child's group. Any other one-shot exec keeps
@@ -3347,7 +3356,7 @@ export class CodexCliAdapter implements ProviderAdapter {
     const result = await runCli(nativeBinary, args, {
       cwd: request.workdir,
       timeoutMs: request.timeoutMs,
-      stdin: request.systemPrompt ? `${request.systemPrompt}\n\n---\n\n${request.prompt}` : request.prompt,
+      stdin: request.systemPrompt ? `${request.systemPrompt}${REVIEWER_TRANSPORT_SEPARATOR}${request.prompt}` : request.prompt,
       isolation: request.isolation,
       ...this.reviewerHomeOptions(constituted.home, request.workdir),
       reviewerExecutablePaths: codexReviewerExecutables(this.#binary),

@@ -220,6 +220,53 @@ it("chunks when the serialized input exceeds the budget although raw-patch accou
   }
 });
 
+/**
+ * #1208 — the chunk decision compares `prompt.length + systemPrompt.length` (the budget this test
+ * measures as `baselineChars`, scaled by the diff's growth) against the 120,000-char threshold. The
+ * adapter that actually sends this to the reviewer CLI joins the two with a `\n\n---\n\n` separator
+ * (`REVIEWER_TRANSPORT_SEPARATOR` in `src/runtime/cli-adapters.ts`), seven more characters the
+ * decision must count. Landing the combined length exactly on the threshold is the case that fits
+ * only if that separator is left uncounted: before the fix it was accepted unchunked and reached
+ * the CLI seven characters over budget; this proves it is chunked instead.
+ */
+it("chunks an input landing exactly on the 120,000-char threshold (separator must be counted)", async () => {
+  const setup = await prepareReviewedInputs();
+  try {
+    // Capture a real single review to size the boundary fixture without pinning prompt wording.
+    const first = await directReview(setup);
+    if (!first.allowed) throw new Error(first.message);
+    const baseline = setup.harness.scripted.invocations.at(-1)!;
+    const baselineChars = baseline.prompt.length + (baseline.systemPrompt?.length ?? 0);
+    const repo = setup.snapshot.repositories[0]!;
+    const originalDiff = await diffPatch(setup.harness.repoPath, repo.baseHead, repo.candidateHead);
+    const targetChars = 120_000;
+
+    // Extending the existing line changes only patch bytes; all bound IDs keep their widths.
+    const padding = targetChars - baselineChars - " // ".length;
+    expect(padding).toBeGreaterThan(0);
+    writeFiles(setup.harness.repoPath, { "src/app.js": `module.exports = () => 2; // ${"x".repeat(padding)}\n` });
+    const head = commitAll(setup.harness.repoPath, "exactly-at-budget candidate");
+    const diff = await diffPatch(setup.harness.repoPath, repo.baseHead, head);
+    expect(baselineChars + diff.length - originalDiff.length).toBe(targetChars);
+    const frozen = await setup.harness.cp.pipeline.freeze(setup.run.runId);
+    if (!frozen.allowed) throw new Error(frozen.message);
+    const next = { ...setup, snapshot: frozen.value, verification: persistPassingVerification(setup, frozen.value) };
+    const before = setup.harness.scripted.invocations.length;
+    setup.harness.scripted.script(
+      { match: /Candidate review|Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`]), once: false },
+      { match: /Final review/, text: reviewerPass([]) },
+    );
+    const result = await invokePreparedReview(next);
+    const calls = setup.harness.scripted.invocations.slice(before);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(result).toMatchObject({ allowed: true, value: { verdict: "PASS", chunked: true } });
+    expect(calls.filter(call => call.prompt.startsWith("# Review chunk")).length).toBeGreaterThan(1);
+    expect(calls.filter(call => call.prompt.startsWith("# Final review"))).toHaveLength(1);
+  } finally {
+    setup.harness.cp.close();
+  }
+});
+
 const prepareLargeReviewedInputs = async () => {
   const setup = await prepareReviewedInputs();
   writeFiles(setup.harness.repoPath, {

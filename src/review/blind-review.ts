@@ -62,6 +62,7 @@ import {
   type ProviderRegistry,
   type ReviewerEgressRecord,
 } from "../runtime/provider.ts";
+import { REVIEWER_TRANSPORT_SEPARATOR } from "../runtime/cli-adapters.ts";
 import type { PacketReviewerScope } from "../runtime/reviewer-codex-home.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
@@ -327,6 +328,16 @@ const REVIEWER_TRANSPORT_INSTRUCTIONS = "You are an independent blind reviewer. 
   "A RESUME_REVIEW release is FOR RE-REVIEW ONLY, not a verification log and not a PASS. " +
   "Worker/CTO reasoning, chat history and producer self-assessment remain withheld.";
 
+/**
+ * Every reviewer invocation carries `REVIEWER_TRANSPORT_INSTRUCTIONS` as its system prompt
+ * (`reviewInvocation` below), and the adapter joins system prompt and prompt with
+ * `REVIEWER_TRANSPORT_SEPARATOR` before the complete string reaches the CLI (argv or stdin).
+ * Every place here that sizes that complete transport-bound input against `CHUNK_THRESHOLD_CHARS`
+ * must count both, not only the instructions text — an input accepted because the separator was
+ * left uncounted still reaches the CLI over budget (#1208).
+ */
+const REVIEWER_TRANSPORT_OVERHEAD_CHARS = REVIEWER_TRANSPORT_INSTRUCTIONS.length + REVIEWER_TRANSPORT_SEPARATOR.length;
+
 /** Packet capabilities and the existing wire envelope, not review methodology. */
 const REVIEW_INPUT_STATEMENT =
   "Return the existing ACP JSON envelope; findings.detail carries the finding text and omittedItems lists coverage limitations. " +
@@ -510,14 +521,14 @@ export class BlindReviewGate {
       const bareEvidence = candidateEvidenceSection(this.db, request.runId, trees, 0);
       const bareOverhead = this.promptOverhead(request, change, bareEvidence);
       // The change's real share of a prompt, repository and file fences included.
-      const diffShare = this.buildPrompt(request, diffs, undefined, change, bareEvidence).length + REVIEWER_TRANSPORT_INSTRUCTIONS.length - bareOverhead;
+      const diffShare = this.buildPrompt(request, diffs, undefined, change, bareEvidence).length + REVIEWER_TRANSPORT_OVERHEAD_CHARS - bareOverhead;
       const evidenceRoom = CHUNK_THRESHOLD_CHARS - 4_096 - Math.min(diffShare, EVIDENCE_DIFF_RESERVE_CHARS) - bareOverhead;
       const evidenceSection = candidateEvidenceSection(this.db, request.runId, trees, evidenceRoom);
 
       // Measure the complete input, including diff framing and system instructions, and send
       // this same rendered prompt if it fits.
       const prompt = this.buildPrompt(request, diffs, undefined, change, evidenceSection);
-      const chunked = prompt.length + REVIEWER_TRANSPORT_INSTRUCTIONS.length > CHUNK_THRESHOLD_CHARS;
+      const chunked = prompt.length + REVIEWER_TRANSPORT_OVERHEAD_CHARS > CHUNK_THRESHOLD_CHARS;
 
       let outcome: Decision<ReviewOutcome>;
       if (chunked) {
@@ -1339,7 +1350,7 @@ export class BlindReviewGate {
 
     for (const [index, chunk] of chunks.entries()) {
       const prompt = this.buildPrompt(request, chunk, { chunk: index + 1, of: chunks.length }, change, evidenceSection);
-      if (prompt.length + REVIEWER_TRANSPORT_INSTRUCTIONS.length > CHUNK_THRESHOLD_CHARS) {
+      if (prompt.length + REVIEWER_TRANSPORT_OVERHEAD_CHARS > CHUNK_THRESHOLD_CHARS) {
         return deny(ReasonCode.EVIDENCE_MISSING, "a review chunk exceeds the context budget", {
           runId: request.runId,
           chunk: index + 1,
@@ -1435,7 +1446,7 @@ export class BlindReviewGate {
     rememberReviewer(finalReviewer.value);
 
     const finalPrompt = this.buildFinalPrompt(request, reduced, chunks.length, change, evidenceSection);
-    if (finalPrompt.length + REVIEWER_TRANSPORT_INSTRUCTIONS.length > CHUNK_THRESHOLD_CHARS) {
+    if (finalPrompt.length + REVIEWER_TRANSPORT_OVERHEAD_CHARS > CHUNK_THRESHOLD_CHARS) {
       return deny(ReasonCode.EVIDENCE_MISSING, "the reduced final-review prompt exceeds the context budget", {
         runId: request.runId,
         length: finalPrompt.length,
@@ -2241,7 +2252,7 @@ export class BlindReviewGate {
   }
 
   private promptOverhead(request: BlindReviewRequest, change: TrustedContractChange | null = null, evidenceSection: readonly string[] = []): number {
-    return this.buildPrompt(request, [], undefined, change, evidenceSection).length + REVIEWER_TRANSPORT_INSTRUCTIONS.length;
+    return this.buildPrompt(request, [], undefined, change, evidenceSection).length + REVIEWER_TRANSPORT_OVERHEAD_CHARS;
   }
 
   /**
