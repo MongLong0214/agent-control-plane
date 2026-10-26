@@ -536,7 +536,13 @@ export const runPinnedGit = (
       child.stdin?.write("go\n");
       child.stdin?.end(options.input ?? "");
     } else {
-      // Its group is not on record: the gate reads end of input and exits without running git.
+      // Its group is not on record: the gate is killed by its exact pid, and would read end of input and
+      // exit without running git besides.
+      try {
+        if (child.pid !== undefined) process.kill(child.pid, "SIGKILL");
+      } catch {
+        /* already gone */
+      }
       child.stdin?.end();
     }
   });

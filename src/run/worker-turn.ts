@@ -692,7 +692,14 @@ export class WorkerTurnRunner {
       },
       started: (nonce, group) => {
         try {
-          return record(TASK_WORKER_GIT_GROUP_STARTED, { nonce, pgid: group.pgid, leaderStartedAt: group.leaderStartedAt }).allowed;
+          // S2 — one transaction: the group is recorded, and its gate opened, only while its intent has no
+          // end (a recovery may have proven a gate-less intent gone) and the turn still holds its claim
+          // (after a hand-over a turn starts no git at all). Otherwise nothing is recorded and the gate
+          // stays shut.
+          return this.ports.db.tx(() => {
+            if (this.gitIntentEnded(facts.runId, nonce) || !this.claimStillHeld(facts)) return false;
+            return record(TASK_WORKER_GIT_GROUP_STARTED, { nonce, pgid: group.pgid, leaderStartedAt: group.leaderStartedAt }).allowed;
+          });
         } catch {
           // Unrecorded, the child is never let through its gate.
           return false;
@@ -706,6 +713,22 @@ export class WorkerTurnRunner {
         }
       },
     });
+  }
+
+  /** S2 — whether `nonce` has any end on record: its group's, or its gate's proven gone. */
+  private gitIntentEnded(runId: string, nonce: string): boolean {
+    return Boolean(this.ports.db.get<{ n: number }>(
+      `SELECT 1 AS n FROM audit_events WHERE kind = ? AND run_id = ? AND json_extract(evidence_json, '$.nonce') = ? LIMIT 1`,
+      [TASK_WORKER_GIT_GROUP_ENDED, runId, nonce],
+    ));
+  }
+
+  /** S2 — the turn's worktree claim is still this run's, HELD and in its lease. */
+  private claimStillHeld(facts: DurableFacts): boolean {
+    return Boolean(this.ports.db.get<{ n: number }>(
+      `SELECT 1 AS n FROM resource_claims WHERE claim_id = ? AND run_id = ? AND status = 'HELD' AND expires_at > ?`,
+      [facts.claim.claimId, facts.runId, this.ports.clock.nowIso()],
+    ));
   }
 
   /** Drops every registry whose owner retired it and whose groups are all confirmed empty. */
@@ -823,52 +846,57 @@ export class WorkerTurnRunner {
    * one held, the admission window before an execution exists included.
    */
   private recordedGitGroup(runId: string, worktree: string): number | null {
-    const events = (kind: string): Array<Record<string, unknown> | null> =>
-      this.ports.db
-        .all<{ evidence_json: string }>(
-          `SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`,
-          [kind, runId],
-        )
-        .map((row) => {
-          try {
-            const parsed = JSON.parse(row.evidence_json) as unknown;
-            return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : null;
-          } catch {
-            return null;
-          }
-        });
-    const intents = events(TASK_WORKER_GIT_INTENT);
-    if (intents.length === 0) return null;
-    const ended = new Set(events(TASK_WORKER_GIT_GROUP_ENDED).map((evidence) => evidence?.["nonce"]));
-    const groups = new Map<unknown, Record<string, unknown>>();
-    for (const evidence of events(TASK_WORKER_GIT_GROUP_STARTED)) if (evidence) groups.set(evidence["nonce"], evidence);
-    const open: string[] = [];
-    for (const intent of intents) {
-      const nonce = intent?.["nonce"];
-      if (typeof nonce !== "string" || typeof intent?.["worktreeId"] !== "string") return -1;
-      if (intent["worktreeId"] !== worktree || ended.has(nonce)) continue;
-      const group = groups.get(nonce);
-      if (group) {
+    // One transaction, so an end recorded here rests on what it read: a group recorded meanwhile by
+    // another runner (`openRegistry`'s started, which re-reads the end in its own) is never ended unseen.
+    return this.ports.db.tx(() => {
+      const events = (kind: string): Array<Record<string, unknown> | null> =>
+        this.ports.db
+          .all<{ evidence_json: string }>(
+            `SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`,
+            [kind, runId],
+          )
+          .map((row) => {
+            try {
+              const parsed = JSON.parse(row.evidence_json) as unknown;
+              return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : null;
+            } catch {
+              return null;
+            }
+          });
+      const ends = events(TASK_WORKER_GIT_GROUP_ENDED);
+      // A group ends only by its own end (its nonce and pgid); an intent with no group, by any end of its nonce.
+      const groupEnded = new Set(ends.filter((end) => end?.["pgid"] != null).map((end) => `${String(end!["nonce"])}:${String(end!["pgid"])}`));
+      const intentEnded = new Set(ends.map((end) => end?.["nonce"]));
+      const grouped = new Set<unknown>();
+      const goneGroups: Array<{ nonce: string; pgid: number }> = [];
+      for (const group of events(TASK_WORKER_GIT_GROUP_STARTED)) {
+        if (group === null || typeof group["worktreeId"] !== "string" || typeof group["nonce"] !== "string") return -1;
+        grouped.add(group["nonce"]);
+        if (group["worktreeId"] !== worktree) continue;
         const pgid = Number(group["pgid"]);
         if (!Number.isSafeInteger(pgid) || pgid <= 1) return -1;
+        if (groupEnded.has(`${group["nonce"]}:${pgid}`)) continue;
         const leaderStartedAt = typeof group["leaderStartedAt"] === "string" ? group["leaderStartedAt"] : null;
         if (!this.confirmedGone(pgid, leaderStartedAt)) return pgid;
+        goneGroups.push({ nonce: group["nonce"], pgid });
       }
-      open.push(nonce);
-    }
-    // A group on record and confirmed gone needs nothing more; a gate with no group on record is looked for.
-    const gated = open.filter((nonce) => !groups.has(nonce));
-    const waiting = gatedGitChildren(gated);
-    if (waiting === null) return -1;
-    if (gated.some((nonce) => waiting.has(nonce))) return -1;
-    for (const nonce of open) {
-      this.ports.audit.record({
-        kind: TASK_WORKER_GIT_GROUP_ENDED,
-        runId,
-        evidence: { worktreeId: worktree, nonce, pgid: Number(groups.get(nonce)?.["pgid"] ?? 0) || null, proven: groups.has(nonce) ? "GROUP_GONE" : "GATE_GONE" },
-      });
-    }
-    return null;
+      const gateless: string[] = [];
+      for (const intent of events(TASK_WORKER_GIT_INTENT)) {
+        const nonce = intent?.["nonce"];
+        if (typeof nonce !== "string" || typeof intent?.["worktreeId"] !== "string") return -1;
+        if (intent["worktreeId"] !== worktree || grouped.has(nonce) || intentEnded.has(nonce)) continue;
+        gateless.push(nonce);
+      }
+      const waiting = gatedGitChildren(gateless);
+      if (waiting === null) return -1;
+      if (gateless.some((nonce) => waiting.has(nonce))) return -1;
+      const record = (nonce: string, pgid: number | null, proven: string): void => {
+        this.ports.audit.record({ kind: TASK_WORKER_GIT_GROUP_ENDED, runId, evidence: { worktreeId: worktree, nonce, pgid, proven } });
+      };
+      for (const group of goneGroups) record(group.nonce, group.pgid, "GROUP_GONE");
+      for (const nonce of gateless) record(nonce, null, "GATE_GONE");
+      return null;
+    });
   }
 
   /**
