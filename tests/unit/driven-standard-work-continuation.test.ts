@@ -112,7 +112,9 @@ const CLAUSE = {
   run: "start that first execution with mcp__acp-cto__task_worker_run",
   readReturned: "read the execution it returns as above",
   leaveOthers: "A task with no execution that is not READY is left as it is.",
-  result: "Once every task of the run has SUCCEEDED, submit the run's result with mcp__acp-cto__result_submit",
+  /** CEO msg_2b439e5a — a task a later PLAN superseded is skipped and does not hold the result back. */
+  skipCancelled: "A CANCELLED task was superseded by a later PLAN: skip it, it is never run and does not hold back the result.",
+  result: "Once every task of the run that is not CANCELLED has SUCCEEDED, submit the run's result with mcp__acp-cto__result_submit",
   refusal: "A refused provision, claim or task_worker_run is reported for that run with mcp__acp-cto__escalation_open",
   /** What a PLAN gives each task. */
   planWriteTarget: "give each task's spec a writeTarget",
@@ -252,6 +254,7 @@ const scriptStandardOwner = (
           done.add(task.taskId);
           continue;
         }
+        if (task.state === "CANCELLED" && says(CLAUSE.skipCancelled)) continue;
         if (task.state !== "READY") {
           if (says(CLAUSE.leaveOthers)) continue;
           return;
@@ -300,7 +303,8 @@ const scriptStandardOwner = (
         if ((await readAsSaid(runId, task.taskId, (ran["value"] as { executionId: string }).executionId)) !== "done") return;
         done.add(task.taskId);
       }
-      if (says(CLAUSE.result) && tasks.every((task) => done.has(task.taskId))) {
+      const counted = tasks.filter((task) => !(task.state === "CANCELLED" && says(CLAUSE.skipCancelled)));
+      if (says(CLAUSE.result) && counted.every((task) => done.has(task.taskId))) {
         await call("result_submit", runId, null, {
           idempotencyKey: `std-owner-${++keys}`, runId, resultSummary: "README.md updated", recommendation: "merge",
         });
@@ -575,6 +579,7 @@ describe("witness 1 — the driven work prompt carries a STANDARD_WORK run past 
         CLAUSE.run,
         CLAUSE.readReturned,
         CLAUSE.leaveOthers,
+        CLAUSE.skipCancelled,
         CLAUSE.result,
         CLAUSE.refusal,
         CLAUSE.planWriteTarget,
@@ -586,6 +591,7 @@ describe("witness 1 — the driven work prompt carries a STANDARD_WORK run past 
       expect(directive).toContain('provider "claude" with no model');
       expect(directive).toContain("result_submit runs the blind review itself");
       expect(directive).toContain("Never submit that run's PLAN again");
+      expect(directive).toContain("names their taskIds in its plan's supersedesTaskIds, which cancels exactly those");
       // The project's bootstrap run's BOOTSTRAP_CTO turns, on the same double: no worker step at all.
       const bootstrapPrompts = f.claude.turns
         .filter((turn) => turn.relay !== null && !/nonce set to/.test(turn.prompt) && /You are the BOOTSTRAP_CTO/.test(turn.prompt))
@@ -687,6 +693,41 @@ describe("witness 2 — a run stopped after its PLAN is woken once for the same 
       expect(markers(f, STANDARD_WORK_CONTINUATION_STALLED, runId)).toEqual([]);
       expect(standIn.provision).toHaveBeenCalledTimes(1);
       expect(f.finishedTurns(sessionId)).toBe(turns + 1);
+    });
+  });
+});
+
+describe("CEO msg_2b439e5a — a task a later PLAN superseded is never a continuation's, and never holds back the result", () => {
+  it("after a re-plan names the stalled task in supersedesTaskIds, the wake names the live task; the woken owner skips the CANCELLED one and submits the result", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const standIn = standInWorkerRuntime(f);
+      const { owner, runId, sessionId, taskId: superseded } = await stalledAfterPlan(f, "std-supersede", "follow-prompt");
+      const replanned = await f.cto(sessionId, "plan_submit", {
+        runId,
+        plan: { summary: "the README.md change, re-planned", supersedesTaskIds: [superseded] },
+        tasks: [{ key: "readme-2", title: "update README.md, re-planned", category: "docs", spec: cp.tasks.require(superseded).spec }],
+      });
+      expect(replanned).toMatchObject({ ok: true });
+      const live = cp.tasks.list(runId).find((task) => task.taskId !== superseded)!;
+      expect(cp.tasks.list(runId).map((task) => [task.taskId, task.state]))
+        .toEqual([[superseded, TaskState.CANCELLED], [live.taskId, TaskState.READY]]);
+      const turns = f.finishedTurns(sessionId);
+      expect(f.daemon.wakeStandardWorkContinuation().woken).toEqual([expect.objectContaining({ runId, taskId: live.taskId })]);
+      await f.awaitFinishedTurns(sessionId, turns + 1);
+      await idle(f, sessionId);
+      expect(owner.calls.slice(3).map((call) => [call.tool, call.taskId, call.ok])).toEqual([
+        ["contract_get", null, true],
+        ["task_worker_provision", live.taskId, true],
+        ["resource_claim", live.taskId, true],
+        ["task_worker_run", live.taskId, true],
+        ["task_execution_get", live.taskId, true],
+        ["result_submit", null, true],
+      ]);
+      expect(standIn.submit).toHaveBeenCalledTimes(1);
+      expect(cp.tasks.require(superseded).state).toBe(TaskState.CANCELLED);
+      expect(cp.tasks.executions(runId).map((execution) => execution.taskId)).toEqual([live.taskId]);
+      expect(f.daemon.wakeStandardWorkContinuation()).toEqual(nothing);
     });
   });
 });
