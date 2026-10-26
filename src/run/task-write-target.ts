@@ -10,6 +10,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { RunKind, TaskState } from "../domain/types.ts";
 import { classifyBranch, validateBranchContract } from "../github/branch-contract.ts";
+import { type TaskImport, parseImportManifest } from "./task-import.ts";
 import { type PinnedRepository, pinRepository, runPinnedGit } from "./worker-git.ts";
 
 /**
@@ -50,6 +51,12 @@ export interface TaskWriteTarget {
    * `baseSha` (#1236's rules), and which predecessors it holds. Absent for every other task.
    */
   startsFrom?: StartsFrom;
+  /**
+   * #1232 — only for a task whose PLAN declared them: the files the control plane imports into the
+   * checkout before the task's worker runs, each inside `paths`, with its size and sha256
+   * (`task-import.ts`). Absent for every other task.
+   */
+  imports?: TaskImport[];
 }
 
 /** #1242 — the base a task with dependsOn predecessors starts from. */
@@ -542,6 +549,14 @@ export class TaskWriteTargets {
       derivedFields.push("paths");
     }
 
+    // #1232 — the PLAN's import manifest, each file inside the paths just settled; never derived.
+    let imports: TaskImport[] | null = null;
+    if (declared?.["imports"] !== undefined) {
+      const parsed = parseImportManifest(declared["imports"], paths);
+      if (!parsed.allowed) return parsed as Decision<never>;
+      imports = parsed.value;
+    }
+
     // The branch and its declared parent, from the one policy point and the branch contract.
     const manifest = pinnedManifestDigest
       ? db.get<{ content_json: string }>(`SELECT content_json FROM manifests WHERE digest = ?`, [pinnedManifestDigest])
@@ -568,7 +583,13 @@ export class TaskWriteTargets {
     if (typeof declaredBranch !== "string") derivedFields.push("branch");
 
     return allow(ReasonCode.OK, {
-      target: { repositoryIdentity: chosen.identity, branch: branch.value.branch, paths, declaredParent: branch.value.declaredParent },
+      target: {
+        repositoryIdentity: chosen.identity,
+        branch: branch.value.branch,
+        paths,
+        declaredParent: branch.value.declaredParent,
+        ...(imports ? { imports } : {}),
+      },
       repository: { identity: chosen.identity, checkoutPath: chosen.checkoutPath, baseBranch: chosen.baseBranch },
       declared,
       derivedFields: derivedFields.sort(),

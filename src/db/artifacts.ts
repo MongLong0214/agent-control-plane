@@ -699,14 +699,15 @@ const blindReviewEvidenceSchema = z
         withheld: z.array(z.string()),
         // A binary change has no textual diff, so the reviewer receives a digest-bound
         // patch artifact instead. Recording which ones were supplied is what separates
-        // "reviewed the binary" from "omitted it".
+        // "reviewed the binary" from "omitted it". #1232 — a task's imported file whose frozen
+        // bytes are its manifest entry is supplied as that entry, its digest the file's sha256.
         binaryArtifacts: z.array(
           z
             .object({
               repository: z.string().min(1),
               path: z.string().min(1),
               digest: DIGEST_SCHEMA,
-              method: z.literal("git-binary-patch"),
+              method: z.enum(["git-binary-patch", "import-manifest"]),
             })
             .strict(),
         ),

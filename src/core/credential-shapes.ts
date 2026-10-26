@@ -253,6 +253,10 @@ const REPOSITORY_PATH_FIELDS: Readonly<Record<EvidenceField["store"], ReadonlySe
     "paths", // a worker turn's owned, changed or dirty paths; a check's workflow files
     "declared.paths",
     "writeTarget.paths",
+    // #1232 — a task's import manifest: in its recorded write target, as declared, and in its receipt.
+    "declared.imports.path",
+    "writeTarget.imports.path",
+    "imports.path",
     "ignoredChanges.paths",
     "workflow.path",
     "workflows.path",

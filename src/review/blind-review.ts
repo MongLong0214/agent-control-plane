@@ -75,8 +75,26 @@ import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
 import type { TaskContract } from "../run/run-engine.ts";
 import { bootstrapPlanTaskRecorded } from "../run/task-graph.ts";
-import { candidateEvidenceSection, readExecutionEvidence, readTrackedTree, type TrackedTreeEvidence } from "./candidate-review-evidence.ts";
+import {
+  type ImportEvidence,
+  type TrackedTreeEvidence,
+  candidateEvidenceSection,
+  readExecutionEvidence,
+  readTrackedTree,
+} from "./candidate-review-evidence.ts";
 import { redactCredentialValues } from "../core/credential-shapes.ts";
+
+/**
+ * How a binary path reached the reviewer: git's binary patch, immutable and digest-bound, or (#1232)
+ * for a task's imported file whose frozen bytes are exactly its manifest entry, that entry, whose
+ * digest is the file's sha256.
+ */
+export interface BinaryArtifact {
+  repository: string;
+  path: string;
+  digest: string;
+  method: "git-binary-patch" | "import-manifest";
+}
 
 export interface ReviewFinding {
   category: ReviewFindingCategory;
@@ -136,7 +154,7 @@ export interface ReviewPacket {
     /** §18.3 — what was deliberately withheld from the reviewer. */
     withheld: string[];
     /** Immutable representations supplied for binary paths. */
-    binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
+    binaryArtifacts: BinaryArtifact[];
   };
   coveredRepositories: string[];
   coveredFiles: string[];
@@ -531,13 +549,16 @@ export class BlindReviewGate {
     try {
       const collected = await this.collectDiffs(request.snapshot);
       if (!collected.allowed) return collected as Decision<ReviewPacket>;
-      const { diffs, binaryArtifacts, trees } = collected.value;
+      const { trees } = collected.value;
       // E2E-02 — the approved commands with the config files they read, the official output and the
       // execution -> commit receipts, read after the diffs proved the frozen objects are the candidate.
       const execution = await readExecutionEvidence(this.db, {
         runId: request.runId, snapshot: request.snapshot, snapshotDigest, contractDigest: request.contractDigest,
         verification: request.verification, checkoutOf: (identity) => this.repositories.byIdentity(identity)?.checkoutPath ?? null,
       });
+      // #1232 — an imported file whose frozen bytes are its manifest's reaches the reviewer as that
+      // manifest entry, not as its binary patch.
+      const { diffs, binaryArtifacts } = withImportManifests(collected.value.diffs, collected.value.binaryArtifacts, execution.imports ?? []);
       // #1166 r3 — the listings get only the room left under the reviewer budget after the other
       // metadata, the chunk envelope and a share for the change itself, so they never crowd out
       // the diff or push the metadata past the budget. A cut is marked in the packet.
@@ -715,7 +736,7 @@ export class BlindReviewGate {
     outcome: ReviewOutcome;
     chunked: boolean;
     expected: Array<{ identity: string; path: string }>;
-    binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
+    binaryArtifacts: BinaryArtifact[];
     bootstrapPlan: BootstrapPlanBinding | null;
     /** A BOOTSTRAP_PLAN review's intent digest; absent for every other review. */
     bootstrapPlanIntentDigest?: string;
@@ -1106,17 +1127,12 @@ export class BlindReviewGate {
     Decision<{
       diffs: ReviewerDiff[];
       trees: TrackedTreeEvidence[];
-      binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
+      binaryArtifacts: BinaryArtifact[];
     }>
   > {
     const diffs: ReviewerDiff[] = [];
     const trees: TrackedTreeEvidence[] = [];
-    const binaryArtifacts: Array<{
-      repository: string;
-      path: string;
-      digest: string;
-      method: "git-binary-patch";
-    }> = [];
+    const binaryArtifacts: BinaryArtifact[] = [];
 
     for (const repo of snapshot.repositories) {
       const record = this.repositories.byIdentity(repo.identity);
@@ -1817,7 +1833,7 @@ export class BlindReviewGate {
     raw: RawVerdict;
     providerSessionId: string | null;
     expected: Array<{ identity: string; path: string }>;
-    binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
+    binaryArtifacts: BinaryArtifact[];
     egressEvidence: ReviewerEgressRecord[];
     /** A BOOTSTRAP_PLAN review's binding; null for a candidate review, whose packet has no such key. */
     bootstrapPlan: BootstrapPlanBinding | null;
@@ -2636,6 +2652,45 @@ interface ReviewerDiff {
   diff: string;
   files: string[];
 }
+
+/**
+ * #1232 — the reviewer's diffs with each binary patch of an imported file replaced by its manifest
+ * entry, and that path's binary artifact recorded as `import-manifest`. Only an entry whose frozen
+ * bytes were read and found to be exactly its size and sha256 (`MATCHES`) replaces anything; every
+ * other binary patch, and every text change, is shown as it is.
+ */
+const withImportManifests = (
+  diffs: readonly ReviewerDiff[],
+  binaryArtifacts: readonly BinaryArtifact[],
+  imports: readonly ImportEvidence[],
+): { diffs: ReviewerDiff[]; binaryArtifacts: BinaryArtifact[] } => {
+  const key = (repository: string, path: string): string => `${repository}\0${path}`;
+  const matched = new Map(imports.filter((entry) => entry.frozen === "MATCHES").map((entry) => [key(entry.repository, entry.path), entry]));
+  const replaced = new Map<string, ImportEvidence>();
+  const shown = diffs.map((repo) => ({
+    ...repo,
+    diff: repo.diff
+      .split(/(?=^diff --git )/m)
+      .map((section) => {
+        // Git's binary patch starts on its own line in the header, before any text-diff line.
+        const at = section.search(/^GIT binary patch$/m);
+        const textBefore = at >= 0 && /^(?:---|\+\+\+|@@) /m.test(section.slice(0, at));
+        const path = /^diff --git a\/(.+?) b\//m.exec(section)?.[1];
+        const entry = at < 0 || textBefore || path === undefined ? undefined : matched.get(key(repo.identity, path));
+        if (entry === undefined) return section;
+        replaced.set(key(repo.identity, entry.path), entry);
+        return `${section.slice(0, at)}Imported file, bytes withheld from review: size ${entry.size} bytes, ${entry.sha256}, from the import manifest of task ${entry.taskId} (execution ${entry.executionId}); the frozen candidate holds exactly these bytes.\n`;
+      })
+      .join(""),
+  }));
+  return {
+    diffs: shown,
+    binaryArtifacts: binaryArtifacts.map((artifact) => {
+      const entry = replaced.get(key(artifact.repository, artifact.path));
+      return entry === undefined ? artifact : { repository: artifact.repository, path: artifact.path, digest: entry.sha256, method: "import-manifest" };
+    }),
+  };
+};
 
 interface ReviewChunkPart extends ReviewerDiff {
   coverageTargets: SliceCoverageTarget[];

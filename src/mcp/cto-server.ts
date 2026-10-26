@@ -786,7 +786,8 @@ const createCtoServerFromPort = (
     "task_worker_run",
     {
       description:
-        "Run one worker turn for a task: the control plane launches the task's WORKER session in the claimed worktree, verifies and commits its change, and owns the receipts. Returns the execution id at once; read it with task_execution_get.",
+        "Run one worker turn for a task: the control plane launches the task's WORKER session in the claimed worktree, verifies and commits its change, and owns the receipts. Returns the execution id at once; read it with task_execution_get. " +
+        "A task whose PLAN writeTarget declares imports ([{path, size, sha256: 'sha256:<hex>'}], each path inside writeTarget.paths) first gets those files copied into the worktree: stage each one as <ACP state root>/imports/<runId>/<taskId>/<hex> (a directory only you can write). Every byte is checked against the manifest before anything is written; a missing, mismatched or symlinked file, or a path outside the target, refuses the turn and writes nothing. The files are committed with the worker's change and the receipt binds the manifest.",
       inputSchema: {
         ...mutation,
         ...runIdentity,
