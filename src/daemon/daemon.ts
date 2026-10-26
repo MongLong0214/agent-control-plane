@@ -2188,6 +2188,9 @@ export class Daemon {
     for (const confirmation of this.cp.residentProjects.pending()) {
       const run = this.cp.runs.get(confirmation.runId);
       if (!run || run.state === RunState.COMPLETED || run.state === RunState.CANCELLED) continue;
+      // #1231 C-2 — only a CONFIRM that passed the pre-write checks, which reserves the run's application, is carried on.
+      // A confirmation an earlier version remembered before such a check refused it is left for a new CONFIRM.
+      if (this.cp.bootstrapApplications.get(confirmation.runId) === null) continue;
       const produced = await this.cp.bootstrapProducer.produceAndActivateApproved(confirmation);
       if (!produced.allowed) continue;
       const decision = this.cp.ceo.submitCeoDecision({...confirmation,decision:"CONFIRM",rationale:confirmation.rationale ?? ""});

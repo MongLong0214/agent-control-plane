@@ -84,7 +84,7 @@ try {
   } else {
     check(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(a.projectId), 'project id');
     check(match && match[2] !== '.' && match[2] !== '..', 'repository identity');
-    check(req.operation === 'retire' ? a.clonePath.startsWith(home+'/') && resolve(a.clonePath) === a.clonePath : a.clonePath === join(home,'projects',repoName), 'clone path');
+    check(['retire','verify-retire'].includes(req.operation) ? a.clonePath.startsWith(home+'/') && resolve(a.clonePath) === a.clonePath : a.clonePath === join(home,'projects',repoName), 'clone path');
     check(a.privateKeyFile === join(home,'.hermes','bridge','keys',`${a.identityName}.priv`) && a.identityName === `cto-${a.projectId}`, 'key path');
     check(a.bootPacket === join(home,'.claude','watchers','fleet',`${a.fleetName}.boot.txt`) && a.fleetName === `acp-${a.projectId}`, 'fleet path');
     check(a.socketPath === join(state,`cc-session-${a.projectId}.sock`) && a.tmuxName === `acp-${Buffer.from(a.projectId).toString("hex")}`, 'runtime path');
@@ -207,7 +207,7 @@ try {
   const fleetFile = join(home,'.claude','watchers','fleet','manifest.tsv');
   const sessionFile = join(state,`resident-${a.projectId}.json`);
   const namesSession = command => new RegExp(`(?:^|\\s)--(?:session-id|resume)\\s+${a.sessionUuid}(?:\\s|$)`).test(command);
-  const observeResident = (needsRc = true) => {
+  const observeResident = (needsRc = true, record = true) => {
     const pane = run('tmux',['display-message','-p','-t',a.tmuxName,'#{pane_pid}']).trim();
     const lines = run('ps',['-axo','pid=,ppid=,lstart=,command=']).split('\n');
     const rows = lines.map(line => /^\s*(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\d+\s+\S+\s+\d+)\s+(.*)$/.exec(line)).filter(Boolean);
@@ -224,7 +224,54 @@ try {
     if (needsRc) check(typeof rc.bridgeSessionId === 'string' && rc.bridgeSessionId.length > 0,'RC not registered');
     const resident = {pid,startedAt:readProcessStartToken(pid),cwd,sessionUuid:a.sessionUuid,tmuxName:a.tmuxName,tmuxAncestry:true,bridgeSessionId:rc.bridgeSessionId ?? "retirement"};
     check(resident.startedAt,'native process start token unavailable');
-    atomic(sessionFile,JSON.stringify(resident)); return resident;
+    if (record) atomic(sessionFile,JSON.stringify(resident));
+    return resident;
+  };
+  // #1229 — everything retirement must know before it changes anything: the CTO process, the roster route and the clone.
+  // Read only. verify-retire asks it alone, before the daemon suspends, records or revokes anything; retire asks it
+  // again before its first host write, so a change in between is refused with nothing written. A refusal it cannot
+  // resolve by itself names the order that lets retirement complete; nothing here stops a process it could not verify.
+  const retirementPreflight = () => {
+    const requiredOrder = pid => [
+      `end the CTO session ${a.sessionUuid}${pid ? ` (pid ${pid})` : ''} yourself: exit it in its own terminal`,
+      `run agentctl project retire ${a.projectId} again`,
+    ];
+    const sessionRecordNames = pid => {
+      try {const rc = read(join(home,'.claude','sessions',`${pid}.json`));return (rc.sessionId ?? rc.sessionUuid ?? rc.session_id) === a.sessionUuid;} catch {return false;}
+    };
+    let resident = null;
+    if (a.retirementPin) {
+      // The pin is the session row ACP recorded for this project's PRIMARY_CTO: its pid and start. A row written by the
+      // canonical claim holds the native start token; one written through setPid holds ps's lstart text, compared in
+      // that form. A match is that exact incarnation, wherever its working directory is, and its argv or Claude's own
+      // session record must still name the session. No match means that incarnation has exited.
+      const pin = a.retirementPin;const token = readProcessStartToken(pin.pid);
+      let same = token !== null && token === pin.startedAt;
+      if (!same && token !== null && /^[A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(pin.startedAt)) {
+        let lstart = '';try {lstart = run('ps',['-o','lstart=','-p',String(pin.pid)]).trim();} catch { /* An unanswered probe is no match. */ }
+        same = lstart === pin.startedAt;
+      }
+      if (same) {
+        if (!namesSession(run('ps',['-p',String(pin.pid),'-o','command='])) && !sessionRecordNames(pin.pid))
+          throw new RetirementOrderRefusal(`process ${pin.pid} is the recorded CTO incarnation but no longer names session ${a.sessionUuid}`,requiredOrder(pin.pid));
+        resident = {pid:pin.pid,startedAt:token};
+      }
+    }
+    if (!resident) {
+      try {resident = observeResident(false,false);} catch {
+        if (run('ps',['-axo','command=']).split('\n').some(l => namesSession(l)))
+          throw new RetirementOrderRefusal(`a process names CTO session ${a.sessionUuid} and retirement cannot verify it as the incarnation ACP recorded`,requiredOrder(null));
+      }
+    }
+    const plannedRoute = existsSync(rosterFile) ? read(rosterFile).channels?.[a.roomId] : undefined;
+    check(!plannedRoute || plannedRoute.status === 'retired' || plannedRoute.acp_project_id === a.projectId,'retirement route conflict');
+    const archive = join(home,'projects','.retired',`${repoName}-${a.projectId}`);
+    if (existsSync(a.clonePath)) {
+      check(!existsSync(archive),'retirement archive already exists alongside clone');
+      const remote = run('git',['remote','get-url','origin'],{cwd:a.clonePath}).trim();
+      check([origin,`git@github.com:${match[1]}/${repoName}.git`].includes(remote),'retirement clone origin mismatch');
+    }
+    return {resident,archive};
   };
   let result = {};
   switch(req.operation) {
@@ -393,35 +440,9 @@ try {
     }
     // Activation's readback: the bootstrap requirement holds until the CTO has been observed on the clone.
     case 'observe': result = {checkout:checkout(checkoutRequirement),resident:observeResident()}; break;
+    case 'verify-retire': retirementPreflight(); result = {retirementVerified:true}; break;
     case 'retire': {
-      // #1229 — the CTO process is identified before anything on the host changes, so a refusal leaves no partial host
-      // state. Only a verified Claude incarnation may be stopped; a missing process needs no signal. A refusal names the
-      // order that lets retirement complete, and nothing here stops a process it could not verify.
-      const requiredOrder = pid => [
-        `end the CTO session ${a.sessionUuid}${pid ? ` (pid ${pid})` : ''} yourself: exit it in its own terminal`,
-        `run agentctl project retire ${a.projectId} again`,
-      ];
-      const sessionRecordNames = pid => {
-        try {const rc = read(join(home,'.claude','sessions',`${pid}.json`));return (rc.sessionId ?? rc.sessionUuid ?? rc.session_id) === a.sessionUuid;} catch {return false;}
-      };
-      let resident;
-      if (a.retirementPin) {
-        // The pin is the session row ACP recorded for this project's PRIMARY_CTO: its pid and native start token. An equal
-        // token is that exact incarnation, wherever its working directory is; its argv or Claude's own session record
-        // must still name the session. Any other token means that incarnation has exited and its pid is free or reused.
-        const pin = a.retirementPin;const token = readProcessStartToken(pin.pid);
-        if (token !== null && token === pin.startedAt) {
-          if (!namesSession(run('ps',['-p',String(pin.pid),'-o','command='])) && !sessionRecordNames(pin.pid))
-            throw new RetirementOrderRefusal(`process ${pin.pid} is the recorded CTO incarnation but no longer names session ${a.sessionUuid}`,requiredOrder(pin.pid));
-          resident = {pid:pin.pid,startedAt:pin.startedAt};
-        }
-      }
-      try {resident ??= observeResident(false);} catch {
-        if (run('ps',['-axo','command=']).split('\n').some(l => namesSession(l)))
-          throw new RetirementOrderRefusal(`a process names CTO session ${a.sessionUuid} and retirement cannot verify it as the incarnation ACP recorded`,requiredOrder(null));
-      }
-      const plannedRoute = existsSync(rosterFile) ? read(rosterFile).channels?.[a.roomId] : undefined;
-      check(!plannedRoute || plannedRoute.status === 'retired' || plannedRoute.acp_project_id === a.projectId,'retirement route conflict');
+      const {resident,archive} = retirementPreflight();
       rmSync(join(dirname(a.bootPacket),`${a.fleetName}.resident.json`),{force:true});
       if (existsSync(rosterFile)) { const roster = read(rosterFile); const route = roster.channels[a.roomId]; if (route && route.status !== 'retired') { check(route.acp_project_id === a.projectId,'retirement route conflict'); route.status = 'retired'; roster.generation++; atomic(rosterFile,JSON.stringify(roster,null,2)+'\n'); } }
       if (existsSync(fleetFile)) atomic(fleetFile,readFileSync(fleetFile,'utf8').split('\n').filter(l => {const f=l.split('\t');return f[0] !== a.fleetName && !(f[1] === a.clonePath && f[4] === a.sessionUuid);}).join('\n'));
@@ -430,13 +451,7 @@ try {
         for (let i = 0;i < 100 && readProcessStartToken(resident.pid) === resident.startedAt;i++) await new Promise(r => setTimeout(r,100));
         check(readProcessStartToken(resident.pid) !== resident.startedAt,'resident did not stop');
       }
-      const archive = join(home,'projects','.retired',`${repoName}-${a.projectId}`);
-      if (existsSync(a.clonePath)) {
-        check(!existsSync(archive),'retirement archive already exists alongside clone');
-        const remote = run('git',['remote','get-url','origin'],{cwd:a.clonePath}).trim();
-        check([origin,`git@github.com:${match[1]}/${repoName}.git`].includes(remote),'retirement clone origin mismatch');
-        mkdirSync(dirname(archive),{recursive:true,mode:0o700});renameSync(a.clonePath,archive);
-      }
+      if (existsSync(a.clonePath)) {mkdirSync(dirname(archive),{recursive:true,mode:0o700});renameSync(a.clonePath,archive);}
       // #1230 — the room is archived by its owner, this identity's key, through the Buzz CLI, and read back as archived;
       // only then are the key and the room intent moved aside, so a retry still holds the key that can archive the room.
       // A room this key does not own (a hand-made identity under another name) is left as it is and reported so.

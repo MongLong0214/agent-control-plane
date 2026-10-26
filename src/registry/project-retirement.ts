@@ -5,11 +5,18 @@ import { CanonicalSessionRegistry } from './canonical-session-registry.ts';
 import { Role, roleKeyFor } from '../domain/types.ts';
 import { HostRetirementRefusal } from '../runtime/host-project-provisioner.ts';
 
-/** Suspension commits first. Failure leaves a resumable, non-dispatching project with its history intact. */
+/**
+ * The host is asked first, changing nothing (#1229): a refusal there leaves every row and host file as it was. Then
+ * suspension commits; a later failure leaves a resumable, non-dispatching project with its history intact.
+ */
 export async function retireProject(cp:ControlPlane,projectId:string,reason:string):Promise<Decision<unknown>> {
   const project = cp.projects.get(projectId);
   if (!project) return deny(ReasonCode.NOT_FOUND,'unknown project',{projectId});
   if (project.retiredAt) return allow(ReasonCode.OK,{projectId,retiredAt:project.retiredAt});
+  try {await cp.residentProjects.verifyRetirement(projectId);} catch (error) {
+    if (error instanceof HostRetirementRefusal) return deny(ReasonCode.CONFLICT,`host retirement refused: ${error.reason}; nothing was changed`,{projectId,refusal:error.reason,requiredOrder:[...error.requiredOrder]});
+    return deny(ReasonCode.CONFLICT,'host retirement could not be verified; nothing was changed',{projectId});
+  }
   cp.projects.setSuspended(projectId,true,true);
   if (!cp.db.get(`SELECT 1 FROM project_retirements WHERE project_id = ?`,[projectId])) cp.db.run(`INSERT INTO project_retirements(project_id,requested_at,reason) VALUES (?,?,?)`,[projectId,cp.clock.nowIso(),reason]);
   const work = cp.db.all<{run_id:string;state:string}>(`SELECT run_id,state FROM runs WHERE (project_id = ? OR run_id IN (SELECT run_id FROM bootstrap_applications WHERE project_id = ?)) AND state NOT IN ('COMPLETED','CANCELLED','FAILED') ORDER BY created_at,run_id`,[projectId,projectId]);
@@ -22,7 +29,8 @@ export async function retireProject(cp:ControlPlane,projectId:string,reason:stri
   const at = cp.clock.nowIso();
   new CanonicalSessionRegistry(cp.db).revoke(projectId,at);
   try {await cp.residentProjects.retire(projectId);} catch (error) {
-    // #1229 — a host refusal that names its order is reported with it; the host changed nothing before refusing.
+    // #1229 — the host refused at the retire step itself, after the check above passed (the process changed in
+    // between): the host changed nothing, and the order it names is reported with it.
     if (error instanceof HostRetirementRefusal) return deny(ReasonCode.CONFLICT,`host retirement refused: ${error.reason}; project remains suspended`,{projectId,refusal:error.reason,requiredOrder:[...error.requiredOrder]});
     return deny(ReasonCode.CONFLICT,'host retirement pending; project remains suspended',{projectId});
   }

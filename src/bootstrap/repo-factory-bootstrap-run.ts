@@ -132,6 +132,12 @@ export interface ProduceAndActivateInput {
   approvedManifest: ProjectManifest;
   projectName: string;
   handoff: HandoffPackage;
+  /**
+   * #1231 C-2 — records a genesis CONFIRM for resume (`ResidentProjectProvisioning.remember`). Called only once every
+   * pre-write check has passed, inside the transaction that reserves the application or records the attempt, so a
+   * refused CONFIRM leaves no confirmation a resume could act on and freezes no PLAN.
+   */
+  rememberConfirmation?: () => Decision<void>;
 }
 
 /** The CEO's CONFIRM of a PROJECT_BOOTSTRAP run, as every CONFIRM door hands it to the runner. */
@@ -427,14 +433,18 @@ export class RepoFactoryBootstrapRunner {
       if (!this.deps.residentProjects?.configured()) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"resident host provisioner/subscriber is not configured",{});
       const reviewed = this.deps.bootstrap.reviewForConfirmation(confirmation.runId,confirmation.candidateSnapshotDigest);
       if (!reviewed.allowed) return reviewed as Decision<ACPBootstrapActivationResult>;
-      try {this.deps.residentProjects?.remember(confirmation,current.value.manifest.projectId,{...current.value.binding,candidateSnapshotDigest:confirmation.candidateSnapshotDigest});}
-      catch {return deny(ReasonCode.CONFLICT,"confirmed provisioning intent conflicts with stored tuple",{});}
     }
+    const projectId = current.value.manifest.projectId;
+    const binding = {...current.value.binding,candidateSnapshotDigest:confirmation.candidateSnapshotDigest};
     return this.produceAndActivate({
       ...confirmation,
       approvedManifest: scope.value.approvedManifest,
       projectName: scope.value.projectName,
       handoff: current.value.outputs.handoff,
+      ...(current.value.outputs.genesis ? {rememberConfirmation: (): Decision<void> => {
+        try {this.deps.residentProjects?.remember(confirmation,projectId,binding);return allow(ReasonCode.OK,undefined);}
+        catch {return deny(ReasonCode.CONFLICT,"confirmed provisioning intent conflicts with stored tuple",{});}
+      }} : {}),
     });
   }
 
@@ -690,6 +700,9 @@ export class RepoFactoryBootstrapRunner {
     // attempt recorded, in one transaction — its UNIQUE constraints close the race the checks above
     // could not, and a refusal there rolls the consumption back with it. A recovery records its
     // attempt the same way, before its first external write. A WRITTEN application has none to make.
+    // #1231 C-2 — a genesis CONFIRM is remembered for resume here, with the reservation or the attempt, never before
+    // the checks above: a CONFIRM they refuse leaves nothing a resume could act on.
+    const remember = (): Decision<void> => input.rememberConfirmation?.() ?? allow(ReasonCode.OK, undefined);
     let attempt: number;
     if (existing === null) {
       const reserved = this.deps.db.txDecision(() => {
@@ -697,6 +710,8 @@ export class RepoFactoryBootstrapRunner {
         if (!applicable.allowed) return applicable as Decision<BootstrapApplication>;
         const fresh = this.reservationConflicts(reservation, null);
         if (!fresh.allowed) return fresh as Decision<BootstrapApplication>;
+        const remembered = remember();
+        if (!remembered.allowed) return remembered as Decision<BootstrapApplication>;
         return this.deps.applications.reserve(reservation, {
           writer: this.currentWriter(),
         });
@@ -707,6 +722,8 @@ export class RepoFactoryBootstrapRunner {
       const recorded = this.deps.db.txDecision(() => {
         const applicable = authorityHolds();
         if (!applicable.allowed) return applicable as Decision<BootstrapApplication>;
+        const remembered = remember();
+        if (!remembered.allowed) return remembered as Decision<BootstrapApplication>;
         return this.deps.applications.recordAttempt(runId, existing.attempts, this.currentWriter());
       });
       if (!recorded.allowed) return atStage(recorded as Decision<ACPBootstrapActivationResult>, "precondition");
@@ -719,6 +736,8 @@ export class RepoFactoryBootstrapRunner {
       // row and a stored result are database rows, and a database writer can write both. That is
       // the chain the completion entries ask for, the owner's current decision included. Nothing is
       // consumed. A refusal leaves the application WRITTEN with its writes as recorded.
+      const remembered = remember();
+      if (!remembered.allowed) return remembered as Decision<ACPBootstrapActivationResult>;
       const written = this.completionChain(existing);
       if (!written.allowed) {
         this.deps.applications.recordRefusal(runId, refusalRecord(written, "precondition"));
@@ -1536,7 +1555,7 @@ export class RepoFactoryBootstrapRunner {
       const target = `${execution.target.owner}/${execution.target.name}`;
       const refused = deny<PendingAtStart>(
         ReasonCode.RESOURCE_COLLISION,
-        `${target} still holds a repository, and this supersede of ${predecessor.projectId} creates that name: delete the predecessor's repository, then CONFIRM again; nothing is consumed or written`,
+        `${target} still holds a repository, and this supersede of ${predecessor.projectId} creates that name: delete the predecessor's repository, then CONFIRM again; nothing is consumed, remembered or sent to GitHub`,
         {
           stage: "precondition",
           refusal: "PREDECESSOR_REPOSITORY_PRESENT",

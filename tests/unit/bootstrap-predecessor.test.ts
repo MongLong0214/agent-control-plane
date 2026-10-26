@@ -1,4 +1,5 @@
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 
 import { bootstrapActivationHandoff, currentBootstrapPlan, executablePlanOf, planForSubmission } from "../../src/bootstrap/bootstrap-plan.ts";
@@ -7,10 +8,13 @@ import type { RepoFactoryResult } from "../../src/bootstrap/repo-factory-result.
 import { submittedPlanSchema } from "../../src/bootstrap/plan-input-schema.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { ExecutionMode, RunKind } from "../../src/domain/types.ts";
-import { bootstrapPlan, cleanTreeManifest } from "../helpers/bootstrap-plan.ts";
+import { Daemon } from "../../src/daemon/daemon.ts";
+import type { HostProjectProvisioner } from "../../src/runtime/host-project-provisioner.ts";
+import { bootstrapPlan, cleanTreeManifest, reviewBootstrapPlan } from "../helpers/bootstrap-plan.ts";
 import { activateAndConfirm, ownerApprovalFor, prepareBootstrapRun } from "../helpers/bootstrap-runner.ts";
-import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { makeHarness, registerFixtureProject, type Harness } from "../helpers/harness.ts";
+import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { GenesisGitHub, genesisPlanFixture } from "../helpers/genesis-github.ts";
+import { dispatchBootstrapRun, makeHarness, registerFixtureProject, type Harness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 afterEach(() => vi.restoreAllMocks());
@@ -120,6 +124,55 @@ describe("explicit bootstrap predecessor", () => {
     const { final } = await activateAndConfirm(p);
     expect(final).toMatchObject({ projectRegistration: { supersedesProjectId: "freshreadme" } });
     expect(p.github.repository("acme", "fixture")?.nodeId).not.toBe(predecessor.nodeId);
+  });
+
+  it("#1231 C-2: a genesis CONFIRM refused for the same-named predecessor queues nothing; a resume after the deletion creates nothing until a new CONFIRM", async () => {
+    const root = realpathSync(tempDir("c2-supersede-"));
+    const home = join(root, "home");
+    mkdirSync(home);
+    const port = new GenesisGitHub(root);
+    // Activation is outside this witness: the host never becomes ready, so a CONFIRM that applies stops after production.
+    const host: HostProjectProvisioner = { async invoke() { throw new Error("host readiness remains pending"); } };
+    const h = makeHarness({ repoFactory: { workRoot: join(root, "factory"), githubPort: port }, residentProvisioner: { home, port: host } });
+    try {
+      h.cp.residentProjects.attachSubscriber(async () => true);
+      h.cp.bootstrapProducer.attachWriterLock(() => true);
+      const now = h.clock.nowIso();
+      h.cp.projects.register({ projectId: "old", name: "old" });
+      h.cp.db.run(`INSERT INTO repositories(repository_id,identity,checkout_path,project_id,created_at,retired_at) VALUES ('old-repo','github:acme/fixture','/old/fixture','old',?,?)`, [now, now]);
+      h.cp.db.run(`UPDATE projects SET retired_at = ? WHERE project_id = 'old'`, [now]);
+      const predecessor = await port.seedForeign("acme", "fixture");
+      const run = h.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: ExecutionMode.STANDARD,
+        contract: { goal: "bootstrap", why: "owner request", scope: [], nonGoals: [], acceptance: ["developable"], priority: "NORMAL", humanGate: [], references: [] } });
+      if (!run.allowed) throw new Error(run.message);
+      const runId = run.value.runId;
+      await dispatchBootstrapRun(h.cp, h.clock, runId);
+      const f = genesisPlanFixture();
+      const reviewed = await reviewBootstrapPlan(h, runId, { ...f.artifact.content, requestDigest: h.cp.runs.get(runId)!.contractDigest, supersedesProjectId: "old" });
+      const confirmation = { runId, candidateSnapshotDigest: reviewed.snapshotDigest, ceoSessionId: reviewed.ceoSessionId, rationale: "replace the predecessor" };
+      const refused = await h.cp.bootstrapProducer.produceAndActivateApproved(confirmation);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ allowed: false, evidence: { refusal: "PREDECESSOR_REPOSITORY_PRESENT", observedNodeId: predecessor.nodeId, resumable: true } });
+      // The predecessor is deleted outside ACP; the daemon's resume finds nothing confirmed to carry on.
+      port.remove("acme", "fixture");
+      await new Daemon(h.cp, { stateDir: join(root, "daemon") }).resumeResidentProjects();
+      expect(port.creates).toBe(0);
+      expect(h.cp.bootstrapApplications.get(runId)).toBeNull();
+      expect(h.cp.residentProjects.row(runId)).toBeUndefined();
+      // A confirmation an earlier version remembered before refusing the CONFIRM is not carried on by a resume either.
+      const plan = currentBootstrapPlan(runId, h.cp.artifacts.latest(runId, "PLAN"));
+      if (!plan.allowed) throw new Error(plan.message);
+      h.cp.residentProjects.remember(confirmation, plan.value.manifest.projectId, { ...plan.value.binding, candidateSnapshotDigest: confirmation.candidateSnapshotDigest });
+      await new Daemon(h.cp, { stateDir: join(root, "daemon") }).resumeResidentProjects();
+      expect(port.creates).toBe(0);
+      expect(h.cp.bootstrapApplications.get(runId)).toBeNull();
+      // A new CONFIRM, a decision of its own, is what creates the replacement.
+      await h.cp.bootstrapProducer.produceAndActivateApproved(confirmation);
+      expect(port.creates).toBe(1);
+      expect(h.cp.residentProjects.row(runId)?.status).toBe("PENDING");
+      expect(h.cp.bootstrapApplications.get(runId)).not.toBeNull();
+    } finally {
+      h.cp.close();
+    }
   });
 
   it.each([

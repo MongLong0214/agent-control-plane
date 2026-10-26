@@ -7,6 +7,12 @@ import { getPublicKey } from 'nostr-tools';
 import type { ProjectAllocation } from '../../src/runtime/host-project-provisioner.ts';
 import { ExecFileHostProjectProvisioner, HostRetirementRefusal, hostObservationSchema } from '../../src/runtime/host-project-provisioner.ts';
 import { readProcessStartToken } from '../../src/core/process-argv.ts';
+import { makeHarness } from '../helpers/harness.ts';
+import { retireProject } from '../../src/registry/project-retirement.ts';
+import { CanonicalSessionRegistry } from '../../src/registry/canonical-session-registry.ts';
+import { SELF_CLAIM_EXECUTOR_KIND, SELF_CLAIM_PROTOCOL } from '../../src/registry/canonical-self-claim.ts';
+import { Role, SessionLifecycle } from '../../src/domain/types.ts';
+import { digestOf, sha256 } from '../../src/core/digest.ts';
 import Database from 'better-sqlite3';
 import { cleanupTempDirs, tempDir } from '../helpers/fixtures.ts';
 
@@ -63,7 +69,7 @@ else if(cmd === 'tmux') {
  if(args[0] === 'new-session') {s.launched=true;s.pane=true;s.launches++;fs.mkdirSync(path.join(root,'.claude','sessions'),{recursive:true});fs.writeFileSync(path.join(root,'.claude','sessions',process.env.TEST_CLAUDE_PID+'.json'),JSON.stringify({sessionId:a.sessionUuid,cwd:a.clonePath,bridgeSessionId:'bridge'}));}
  else if(args[0] === 'display-message') {if(args.at(-1).includes('pane_current_path')) out(a.clonePath+'\\t'+path.join(process.env.ACP_STATE_DIR,'resident-test.sh'));else {if(!s.launched) process.exit(1);out('999999');}} else if(args[0] === 'kill-session') {s.pane=false;} else process.exit(2);
 }
-else if(cmd === 'ps') {if(args[0] === '-p') out(s.pinCommand || '');else if(s.launched) {if(args.includes('command=')) out('claude --session-id '+a.sessionUuid);else out(process.env.TEST_CLAUDE_PID+' 999999 Thu Oct 22 01:00:00 2026 claude --session-id '+a.sessionUuid+'\\n999999 1 Thu Oct 22 01:00:00 2026 tmux');}}
+else if(cmd === 'ps') {if(args[0] === '-p') out(s.pinCommand || '');else if(args[0] === '-o' && args[1] === 'lstart=') out(s.lstart || '');else if(s.launched) {if(args.includes('command=')) out('claude --session-id '+a.sessionUuid);else out(process.env.TEST_CLAUDE_PID+' 999999 Thu Oct 22 01:00:00 2026 claude --session-id '+a.sessionUuid+'\\n999999 1 Thu Oct 22 01:00:00 2026 tmux');}}
 else if(cmd === 'lsof') out('n'+(s.cwd || a.clonePath)+'\\n');
 else if(cmd === 'buzz') {
  const pk = fs.readFileSync(a.privateKeyFile.replace('.priv','.pub'),'utf8').trim();
@@ -564,4 +570,63 @@ it.each(['hand-made','bound'] as const)('#1230: ensure-buzz uses an existing key
     expect(result.buzz).toMatchObject({pubkey:getPublicKey(Buffer.from(key,'hex'))});
     expect(JSON.parse(readFileSync(join(f.state,'buzz-key-test.json'),'utf8'))).toEqual({runId:f.a.runId,pubkey:getPublicKey(Buffer.from(key,'hex'))});
   }
+});
+
+it('#1229 C-1: a session row holding ps lstart text still pins the CTO; it is stopped, never skipped as exited',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');
+  const cto = await standInCto();
+  try {
+    // Its argv names no session; Claude's own record does. The row's start is in setPid's lstart form, not the native token.
+    sessionRecord(f,cto.pid,{sessionId:f.a.sessionUuid,cwd:f.home});
+    const lstart = 'Mon Oct 26 01:00:00 2026';
+    patchFake(f,{pinCommand:'claude',lstart});
+    f.a.retirementPin = {pid:cto.pid,startedAt:lstart};saveAllocation(f);
+    expect(await f.invoke('retire')).toMatchObject({retired:true});
+    expect(await Promise.race([cto.exit,new Promise(resolve => setTimeout(() => resolve('still running'),5_000))])).toBe('SIGTERM');
+  } finally {cto.stop();}
+});
+
+it('#1229 C-1: a refused retirement changes no database row and no host file',async () => {
+  const home = realpathSync(tempDir('retire-verify-home-'));
+  const script = fileURLToPath(new URL('../../dist/host/host-project-provisioner.mjs',import.meta.url));
+  const h = makeHarness({residentProvisioner:{home,script}});
+  const cto = await standInCto();
+  try {
+    // A legacy project: its PRIMARY_CTO bound, its entitlement granted, its clone under the resident home.
+    const entry = {sessionUuid:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',projectId:'resident',buzzActorId:'a'.repeat(64),buzzAddress:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'};
+    h.cp.projects.register({projectId:entry.projectId,name:entry.projectId});
+    const session = h.cp.sessions.create({provider:'claude',model:'claude-cli',buzzAddress:entry.buzzAddress});
+    expect(h.cp.sessions.transition(session.sessionId,SessionLifecycle.READY,'fixture').allowed).toBe(true);
+    expect(h.cp.sessions.bindBuzzActor({sessionId:session.sessionId,sessionSecret:session.sessionSecret!,buzzActorId:entry.buzzActorId},{isAllowedActor:() => true}).allowed).toBe(true);
+    const claimed = {executorKind:SELF_CLAIM_EXECUTOR_KIND,targetLocator:entry.sessionUuid,targetLocatorDigest:sha256(entry.sessionUuid)};
+    const bound = h.cp.bindings.bind({role:Role.PRIMARY_CTO,projectId:entry.projectId,sessionId:session.sessionId,
+      authenticatedTarget:{claimed,protocolVersion:SELF_CLAIM_PROTOCOL,attestationDigest:digestOf({fixture:entry}),verify:() => claimed}});
+    if (!bound.allowed) throw new Error(bound.message);
+    // The session row pins the stand-in CTO, which now names another session: it cannot be verified.
+    h.cp.db.run(`UPDATE sessions SET os_pid = ?, os_process_started_at = ? WHERE session_id = ?`,[cto.pid,cto.startedAt,session.sessionId]);
+    new CanonicalSessionRegistry(h.cp.db).grant(entry,null);
+    const clone = join(home,'projects','fixture');mkdirSync(clone,{recursive:true});writeFileSync(join(clone,'work.txt'),'unfinished');
+    h.cp.db.run(`INSERT INTO repositories(repository_id,identity,checkout_path,project_id,created_at) VALUES ('resident-repo','github:acme/fixture',?,'resident',?)`,[clone,h.clock.nowIso()]);
+    mkdirSync(join(home,'.claude','sessions'),{recursive:true});
+    writeFileSync(join(home,'.claude','sessions',`${cto.pid}.json`),JSON.stringify({sessionId:'cccccccc-cccc-4ccc-8ccc-cccccccccccc',cwd:clone}));
+    const fleetDir = join(home,'.claude','watchers','fleet');mkdirSync(fleetDir,{recursive:true});
+    const keys = join(home,'.hermes','bridge','keys');mkdirSync(keys,{recursive:true});
+    const files = {
+      roster:join(home,'.hermes','bridge','required-mentions.json'),fleet:join(fleetDir,'manifest.tsv'),resident:join(fleetDir,'acp-resident.resident.json'),
+      key:join(keys,'cto-resident.priv'),intent:join(h.root,'buzz-room-resident.json'),work:join(clone,'work.txt'),
+    };
+    writeFileSync(files.roster,JSON.stringify({version:2,generation:4,channels:{[entry.buzzAddress]:{relay_name:'production',ceo:{pubkey:'d'.repeat(64),handle:'ceo'},peer:{pubkey:entry.buzzActorId,handle:'cto-resident'},acp_project_id:'resident',status:'active',classification:'project'}}}));
+    writeFileSync(files.fleet,['acp-resident',clone,'resident CTO',join(fleetDir,'acp-resident.boot.txt'),entry.sessionUuid].join('\t')+'\n');
+    writeFileSync(files.resident,'{}');writeFileSync(files.key,'not a real key\n');writeFileSync(files.intent,'{}');
+    const database = () => h.cp.db.all<{name:string}>(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`)
+      .map(({name}) => [name,h.cp.db.all(`SELECT * FROM "${name.replaceAll('"','""')}"`)]);
+    const host = () => Object.fromEntries(Object.entries(files).map(([name,file]) => [name,existsSync(file) ? readFileSync(file,'utf8') : null]));
+    const before = {database:database(),host:host(),retired:existsSync(join(home,'projects','.retired'))};
+    const refused = await retireProject(h.cp,entry.projectId,'operator retirement');
+    expect(refused).toMatchObject({allowed:false,evidence:{projectId:'resident',requiredOrder:[
+      `end the CTO session ${entry.sessionUuid} (pid ${cto.pid}) yourself: exit it in its own terminal`,'run agentctl project retire resident again']}});
+    expect({database:database(),host:host(),retired:existsSync(join(home,'projects','.retired'))}).toEqual(before);
+    expect(readProcessStartToken(cto.pid)).toBe(cto.startedAt);
+  } finally {cto.stop();h.cp.close();}
 });

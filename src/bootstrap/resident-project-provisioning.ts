@@ -148,13 +148,30 @@ export class ResidentProjectProvisioning {
     this.save(a.runId,operation,{state:'OBSERVED',attempts:(steps[operation]?.attempts ?? 0)+1,observed});
     return observed;
   }
+  /** The host allocation a project without a provisioning row retires: its legacy entitlement's, pinned to its PRIMARY_CTO's session row. */
+  private legacyRetirementAllocation(projectId:string):ProjectAllocation|null {
+    const legacy = this.db.get<{session_uuid:string;buzz_address:string;identity:string;checkout_path:string;last_observed_head:string|null;os_pid:number|null;os_process_started_at:string|null}>(`SELECT e.session_uuid,e.buzz_address,r.identity,r.checkout_path,r.last_observed_head,s.os_pid,s.os_process_started_at FROM canonical_session_entitlements e JOIN repositories r ON r.project_id = e.project_id AND r.retired_at IS NULL LEFT JOIN assignments b ON b.project_id = e.project_id AND b.role = 'PRIMARY_CTO' AND b.status = 'ACTIVE' LEFT JOIN conversational_actors c ON c.actor_id = b.actor_id LEFT JOIN sessions s ON s.session_id = c.current_session_id WHERE e.project_id = ? ORDER BY r.repository_id LIMIT 1`,[projectId]);
+    if (!legacy) return null;
+    return {projectId,runId:`legacy-retire:${projectId}`,repositoryIdentity:legacy.identity,repositoryNodeId:'legacy-history',head:legacy.last_observed_head ?? '0'.repeat(40),sessionUuid:legacy.session_uuid,roomId:legacy.buzz_address,clonePath:legacy.checkout_path,tmuxName:`acp-${Buffer.from(projectId).toString("hex")}`,socketPath:residentSessionSocket(this.stateDir,projectId),fleetName:`acp-${projectId}`,identityName:`cto-${projectId}`,privateKeyFile:residentPrivateKeyFile(this.home,projectId),bootPacket:residentBootPacket(this.home,projectId),nonce:'retirement',...(legacy.os_pid && legacy.os_process_started_at ? {retirementPin:{pid:legacy.os_pid,startedAt:legacy.os_process_started_at}} : {})};
+  }
+  /**
+   * #1229 — asks the host, changing nothing anywhere, whether retire can go ahead: the CTO process it would stop, the
+   * route and the clone. Asked before the daemon suspends, records or revokes anything, so a refusal (a
+   * `HostRetirementRefusal` naming its order) leaves every row and every host file as it was. Retire asks it again.
+   */
+  async verifyRetirement(projectId:string):Promise<void> {
+    const row = this.db.get<ProvisioningRow>(`SELECT * FROM resident_project_provisioning WHERE project_id = ?`,[projectId]);
+    const allocation = row ? (row.status === 'RETIRED' ? null : this.allocation(row.run_id)) : this.legacyRetirementAllocation(projectId);
+    // Without a host retire reports the missing host itself; without an allocation nothing on the host is retired.
+    if (!allocation || !this.host) return;
+    if (!(await this.host.invoke('verify-retire',allocation)).retirementVerified) throw new Error('retirement not verifiable');
+  }
   async retire(projectId:string):Promise<void> {
     const row = this.db.get<ProvisioningRow>(`SELECT * FROM resident_project_provisioning WHERE project_id = ?`,[projectId]);
     if (!row) {
-      const legacy = this.db.get<{session_uuid:string;buzz_address:string;identity:string;checkout_path:string;last_observed_head:string|null;os_pid:number|null;os_process_started_at:string|null}>(`SELECT e.session_uuid,e.buzz_address,r.identity,r.checkout_path,r.last_observed_head,s.os_pid,s.os_process_started_at FROM canonical_session_entitlements e JOIN repositories r ON r.project_id = e.project_id AND r.retired_at IS NULL LEFT JOIN assignments b ON b.project_id = e.project_id AND b.role = 'PRIMARY_CTO' AND b.status = 'ACTIVE' LEFT JOIN conversational_actors c ON c.actor_id = b.actor_id LEFT JOIN sessions s ON s.session_id = c.current_session_id WHERE e.project_id = ? ORDER BY r.repository_id LIMIT 1`,[projectId]);
-      if (!legacy) return;
+      const allocation = this.legacyRetirementAllocation(projectId);
+      if (!allocation) return;
       if (!this.host) throw new Error('legacy retirement host unavailable');
-      const allocation:ProjectAllocation = {projectId,runId:`legacy-retire:${projectId}`,repositoryIdentity:legacy.identity,repositoryNodeId:'legacy-history',head:legacy.last_observed_head ?? '0'.repeat(40),sessionUuid:legacy.session_uuid,roomId:legacy.buzz_address,clonePath:legacy.checkout_path,tmuxName:`acp-${Buffer.from(projectId).toString("hex")}`,socketPath:residentSessionSocket(this.stateDir,projectId),fleetName:`acp-${projectId}`,identityName:`cto-${projectId}`,privateKeyFile:residentPrivateKeyFile(this.home,projectId),bootPacket:residentBootPacket(this.home,projectId),nonce:'retirement',...(legacy.os_pid && legacy.os_process_started_at ? {retirementPin:{pid:legacy.os_pid,startedAt:legacy.os_process_started_at}} : {})};
       if (!(await this.host.invoke('retire',allocation)).retired) throw new Error('legacy retirement incomplete');
       await this.#reconcile(allocation,'');
       return;

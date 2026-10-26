@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { join } from 'node:path';
 import type { CanonicalCeoBuzzRoute } from '../outbox/ceo-buzz-signer.ts';
 
-export const hostOperations = ['ensure-checkout', 'ensure-buzz', 'ensure-routing', 'ensure-resident', 'observe', 'retire'] as const;
+export const hostOperations = ['ensure-checkout', 'ensure-buzz', 'ensure-routing', 'ensure-resident', 'observe', 'verify-retire', 'retire'] as const;
 export type HostOperation = typeof hostOperations[number];
 export interface ProjectAllocation {
   projectId: string; runId: string; repositoryIdentity: string; repositoryNodeId: string; head: string;
@@ -27,7 +27,7 @@ export const hostObservationSchema = z.object({
   routing: z.object({ generation: z.number().int().optional(), roomId: z.string().uuid() }).optional(),
   resident: z.object({ pid: z.number().int().positive(), startedAt: z.string().min(1), cwd: z.string(), sessionUuid: z.string().uuid(), tmuxName: z.string(), tmuxAncestry: z.literal(true), bridgeSessionId: z.string().min(1) }).optional(),
   fleet: z.boolean().optional(), retired: z.boolean().optional(), retirementArchivePath: z.string().optional(),
-  buzzRoomArchived: z.boolean().optional(), identityArchivePath: z.string().optional(),
+  buzzRoomArchived: z.boolean().optional(), identityArchivePath: z.string().optional(), retirementVerified: z.literal(true).optional(),
 }).strict();
 export type HostObservation = z.infer<typeof hostObservationSchema>;
 export interface HostProjectProvisioner {
@@ -76,7 +76,7 @@ export class ExecFileHostProjectProvisioner implements HostProjectProvisioner {
             } catch { /* An unclassified failure supplies no verification. */ }
             reject(new HostProvisionerError(error.killed || error.code === 'ETIMEDOUT' ? 'LOST' : 'INVALID')); return;
           }
-          reject((operation === 'retire' ? retirementRefusalOf(String(stderr)) : null) ?? new Error(`host provisioner ${operation} failed`)); return;
+          reject((operation === 'retire' || operation === 'verify-retire' ? retirementRefusalOf(String(stderr)) : null) ?? new Error(`host provisioner ${operation} failed`)); return;
         }
         try { resolve(hostObservationSchema.parse(JSON.parse(stdout))); }
         catch { reject('mode' in allocation ? new HostProvisionerError('INVALID') : new Error('invalid host provisioner response')); }
