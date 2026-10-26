@@ -4,6 +4,7 @@ import { pathToFileURL } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 import { bootstrapCodeGuarantees, bootstrapServingRuntime, recordBootstrapServingRuntime } from "../../src/bootstrap/bootstrap-runtime-observation.ts";
 import { digestOf, sha256 } from "../../src/core/digest.ts";
+import { AuditLog } from "../../src/db/audit.ts";
 import { cleanupTempDirs, makeCore, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -17,19 +18,21 @@ describe("ACP observed serving runtime", () => {
       // Reproduce /var → /private/var even when the host TMPDIR is already canonical.
       const alias = join(tempDir(), "daemon-alias"); symlinkSync(directory, alias, "dir");
       const entrypoint = join(alias, "agentcpd.js");
-      const eventId = recordBootstrapServingRuntime(f.audit, pathToFileURL(entrypoint).href);
-      const original = bootstrapServingRuntime(f.audit, eventId);
+      // As the daemon composes it: the store knows the entrypoint the daemon resolved for itself at startup.
+      const audit = new AuditLog(f.db, f.clock, { servingEntrypoint: realpathSync(entrypoint) });
+      const eventId = recordBootstrapServingRuntime(audit, pathToFileURL(entrypoint).href);
+      const original = bootstrapServingRuntime(audit, eventId);
       expect(original).toMatchObject({ eventId, generation, runtimeSha256: digestOf([{ path: "daemon/agentcpd.js", sha256: sha256("// fixture daemon runtime\n") }]),
         entrypointSha256: sha256("// fixture daemon runtime\n"), runtimeFileCount: 1,
         entrypoint: realpathSync(entrypoint), pid: process.pid, lifecycleDigest: digestOf(bootstrapCodeGuarantees()) });
-      expect(bootstrapServingRuntime(f.audit, recordBootstrapServingRuntime(f.audit, pathToFileURL(actualEntrypoint).href))?.entrypoint).toBe(original?.entrypoint);
+      expect(bootstrapServingRuntime(audit, recordBootstrapServingRuntime(audit, pathToFileURL(actualEntrypoint).href))?.entrypoint).toBe(original?.entrypoint);
       writeFileSync(join(directory, "correction.js"), "// correction changed without changing the entrypoint\n");
-      const later = bootstrapServingRuntime(f.audit, recordBootstrapServingRuntime(f.audit, pathToFileURL(entrypoint).href));
+      const later = bootstrapServingRuntime(audit, recordBootstrapServingRuntime(audit, pathToFileURL(entrypoint).href));
       expect(later?.entrypointSha256).toBe(original?.entrypointSha256);
       expect(later?.runtimeSha256).not.toBe(original?.runtimeSha256);
       writeFileSync(entrypoint, "// later bytes are not the startup observation\n");
-      expect(bootstrapServingRuntime(f.audit, eventId)).toEqual(original);
-      expect(bootstrapServingRuntime(f.audit, null)).toBeNull();
+      expect(bootstrapServingRuntime(audit, eventId)).toEqual(original);
+      expect(bootstrapServingRuntime(audit, null)).toBeNull();
     } finally { f.db.close(); }
   });
   it("does not borrow another process's or another generation's lifecycle observation", () => {

@@ -1,4 +1,4 @@
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { sha256 } from "./digest.ts";
 import { attemptCheckoutPath, githubLedgerPath, repositoryCheckoutPath } from "./repo-factory-paths.ts";
@@ -133,6 +133,8 @@ export interface AcpLocations {
   readonly residentHome?: string | null;
   /** The repo-factory work root: `<workRoot>/<runId>` holds a run's checkout and GitHub ledger. */
   readonly repoFactoryWorkRoot?: string | null;
+  /** The serving daemon's own entrypoint, resolved once by the daemon at startup (daemon/agentcpd.ts). */
+  readonly servingEntrypoint?: string | null;
 }
 
 /**
@@ -346,13 +348,15 @@ const factoryCheckout: LocationContract = (text, field) => {
 
 /**
  * bootstrap-runtime-observation.ts records the served entrypoint's canonical path beside the digest
- * of its bytes, `entrypointSha256`. Only a canonical file whose bytes have that digest is it.
+ * of its bytes, `entrypointSha256`. It is exactly the entrypoint the daemon resolved for itself at
+ * startup and the store was constructed with, compared as a string, and the file there still has
+ * that digest. With no such entrypoint configured, nothing is.
  */
 const observedEntrypoint: LocationContract = (text, field) => {
+  const entrypoint = field.site?.locations?.servingEntrypoint;
   const digest = sibling(field, "entrypointSha256");
-  if (typeof digest !== "string" || !text.startsWith("/")) return false;
-  try { return realpathSync(text) === text && statSync(text).isFile() && sha256(readFileSync(text)) === digest; }
-  catch { return false; }
+  if (typeof entrypoint !== "string" || text !== entrypoint || typeof digest !== "string") return false;
+  try { return sha256(readFileSync(text)) === digest; } catch { return false; }
 };
 
 /** An activation's local binding (activation.ts): the registry's record of that identity at that checkout. */
@@ -407,10 +411,14 @@ const grantRoots = (field: EvidenceField): readonly string[] => {
     .filter((root) => root.startsWith("/"));
 };
 
-/** Inside a stored root of the grant: the root itself or a normalized path under it, the rest read per segment. */
+/**
+ * Inside a stored root of the grant: the root string itself or a normalized path under it at a `/`
+ * boundary, compared as strings only. Nothing is resolved on the filesystem at check time, so a
+ * symlink placed at a stored root later does not carry the exemption to where it points.
+ */
 const insideGrantRoot: LocationContract = (text, field) =>
   text.startsWith("/") && resolve(text) === text
-  && grantRoots(field).some((root) => text === root || text.startsWith(`${root}/`));
+  && grantRoots(field).some((root) => text === root || text.startsWith(root.endsWith("/") ? root : `${root}/`));
 
 /** A grant's `local:` repository identity: the registry stores that identity at exactly that checkout. */
 const storedLocalIdentity: LocationContract = (text, field) => {

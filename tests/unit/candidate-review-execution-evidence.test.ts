@@ -1,5 +1,5 @@
-import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { sha256 } from "../../src/core/digest.ts";
@@ -709,6 +709,11 @@ describe("#1223 P1-A: the audit log and artifact store exempt only exact ACP-gen
         expect(audit.record({ kind: "MANAGED_WRITE_GUARD_CONSUMED", runId, evidence }).allowed).toBe(true);
         for (const [key, value] of Object.entries(stored("MANAGED_WRITE_GUARD_CONSUMED"))) expect(value, key).toContain("[redacted]");
       }
+      // Containment is at a `/` boundary of the stored root string: a sibling sharing its prefix is outside.
+      expect(audit.record({ kind: "MANAGED_WRITE_GUARD_CONSUMED", runId,
+        evidence: grant(`${ciRoot}-sibling/x`, `${ciRoot}-sibling`, `local:${ciRoot}`) }).allowed).toBe(true);
+      expect(stored("MANAGED_WRITE_GUARD_CONSUMED")["resolvedPath"]).toContain("[redacted]");
+      expect(stored("MANAGED_WRITE_GUARD_CONSUMED")["targetWorktreeId"]).toContain("[redacted]");
       expect(audit.record({ kind: "MANAGED_WRITE_GUARD", runId, evidence: normal }).allowed).toBe(true);
       expect(stored("MANAGED_WRITE_GUARD")["resolvedPath"]).toContain("[redacted]"); // another writer
 
@@ -766,6 +771,29 @@ describe("#1223 P1-A: the audit log and artifact store exempt only exact ACP-gen
       // ...for that run only.
       expect(harness.cp.audit.record({ kind: "MANAGED_WRITE_GUARD_CONSUMED", runId: otherRun, evidence: inTree }).allowed).toBe(true);
       expect(harness.cp.audit.byKind("MANAGED_WRITE_GUARD_CONSUMED").at(-1)!.evidence["targetWorktreeId"]).toContain("[redacted]");
+
+      // The reviewer's symlink swap: a registered checkout P renamed and replaced by a link to T, a path
+      // that holds the secret. The root is the string the registry stored, never resolved again, so T
+      // gains nothing, before the swap or after it.
+      const swapped = makeRepo({ "README.md": "# swapped\n" });
+      const registeredSwap = await harness.cp.repositories.register({ checkoutPath: swapped });
+      expect(registeredSwap.allowed).toBe(true);
+      const swapIdentity = registeredSwap.allowed ? registeredSwap.value.identity : "";
+      const target = join(realpathSync(tempDir("acp-swap-target-")), ...LONG_BASE64.split("/"));
+      mkdirSync(join(target, "src"), { recursive: true });
+      const viaSwap = { repositoryIdentity: swapIdentity, resolvedPath: join(target, "src", "a.js"), targetWorktreeId: target };
+      for (const phase of ["before", "after"]) {
+        if (phase === "after") {
+          renameSync(swapped, `${swapped}.moved`);
+          symlinkSync(target, swapped, "dir");
+        }
+        const kept = consumed(viaSwap);
+        expect(kept["resolvedPath"], phase).toContain("[redacted]");
+        expect(kept["targetWorktreeId"], phase).toContain("[redacted]");
+      }
+      // The stored checkout string itself still is a root.
+      const inCheckout = { repositoryIdentity: swapIdentity, resolvedPath: join(registeredSwap.allowed ? registeredSwap.value.checkoutPath : "", "src", "a.js") };
+      expect(consumed(inCheckout)).toEqual(inCheckout);
 
       // No laundering through an identical stored row: a row a raw writer left is not admission, and
       // every put is checked before an identical row is looked up.
@@ -855,7 +883,8 @@ describe("#1223 P1-A: the audit log and artifact store exempt only exact ACP-gen
       expect(core.audit.record({ kind: "REPAIR_REFUSED", runId, evidence: refusal(ledger) }).allowed).toBe(false);
       expect(audit.record({ kind: "TEST_REPAIR_REFUSED", runId, evidence: refusal(ledger) }).allowed).toBe(false);
 
-      // The served entrypoint: a canonical file whose bytes have the `entrypointSha256` recorded beside it.
+      // The served entrypoint: exactly the one the daemon resolved for itself at startup and the store was
+      // constructed with, whose file still has the `entrypointSha256` recorded beside it.
       const canonical = join(realpathSync(tempDir("acp-served-")), "abcdefghij1234567890", "abcdefghij1234567890", "abcdefghij1234567890");
       const daemonDir = join(canonical, `generation-${hex64.slice(0, 40)}`, "dist", "daemon");
       mkdirSync(daemonDir, { recursive: true });
@@ -867,18 +896,26 @@ describe("#1223 P1-A: the audit log and artifact store exempt only exact ACP-gen
       mkdirSync(linkParent, { recursive: true });
       const linked = join(linkParent, "abcdefghij1234567890");
       symlinkSync(daemonDir, linked);
+      // A file at a secret path, recorded beside its own digest: consistent, but not the daemon's entrypoint.
+      const secretFile = join(realpathSync(tempDir("acp-served-secret-")), ...LONG_BASE64.split("/"), "agentcpd.js");
+      mkdirSync(dirname(secretFile), { recursive: true });
+      writeFileSync(secretFile, "served bytes");
+      const served = new AuditLog(core.db, core.clock, { servingEntrypoint: entrypoint });
       const observed = (resolvedPath: string, bytes = "served bytes") => ({ entrypointSha256: sha256(bytes), resolvedPath });
-      expect(audit.record({ kind: "DAEMON_RUNTIME_OBSERVED", evidence: observed(entrypoint) }).allowed).toBe(true);
-      expect(audit.byKind("DAEMON_RUNTIME_OBSERVED")[0]!.evidence).toEqual(observed(entrypoint));
-      // No provenance: other bytes' digest, a missing file, a link to the file, another writer. Read whole, redacted.
-      for (const [kind, evidence] of [
-        ["DAEMON_RUNTIME_OBSERVED", observed(entrypoint, "other bytes")],
-        ["DAEMON_RUNTIME_OBSERVED", observed(join(daemonDir, "missing.js"))],
-        ["DAEMON_RUNTIME_OBSERVED", observed(join(linked, "agentcpd.js"))],
-        ["DAEMON_START_REFUSED", observed(entrypoint)],
+      expect(served.record({ kind: "DAEMON_RUNTIME_OBSERVED", evidence: observed(entrypoint) }).allowed).toBe(true);
+      expect(served.byKind("DAEMON_RUNTIME_OBSERVED")[0]!.evidence).toEqual(observed(entrypoint));
+      // No provenance: other bytes' digest, a missing file, a link to the file, a self-consistent file elsewhere,
+      // another writer, and a store with no serving entrypoint configured. Read whole, redacted.
+      for (const [store, kind, evidence] of [
+        [served, "DAEMON_RUNTIME_OBSERVED", observed(entrypoint, "other bytes")],
+        [served, "DAEMON_RUNTIME_OBSERVED", observed(join(daemonDir, "missing.js"))],
+        [served, "DAEMON_RUNTIME_OBSERVED", observed(join(linked, "agentcpd.js"))],
+        [served, "DAEMON_RUNTIME_OBSERVED", observed(secretFile)],
+        [served, "DAEMON_START_REFUSED", observed(entrypoint)],
+        [audit, "DAEMON_RUNTIME_OBSERVED", observed(entrypoint)],
       ] as const) {
-        expect(audit.record({ kind, evidence }).allowed, evidence.resolvedPath).toBe(true);
-        expect(audit.byKind(kind).at(-1)!.evidence["resolvedPath"], evidence.resolvedPath).toContain("[redacted]");
+        expect(store.record({ kind, evidence }).allowed, evidence.resolvedPath).toBe(true);
+        expect(store.byKind(kind).at(-1)!.evidence["resolvedPath"], evidence.resolvedPath).toContain("[redacted]");
       }
     } finally { core.db.close(); }
   });

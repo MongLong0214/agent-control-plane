@@ -1,12 +1,5 @@
-import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
 import type { RegistryView } from "../core/credential-shapes.ts";
 import type { Db } from "./database.ts";
-
-/** A stored path, canonical where it still exists (a removed tree keeps its stored, resolved form). */
-const canonicalStored = (path: string): string => {
-  try { return realpathSync(path); } catch { return resolve(path); }
-};
 
 /**
  * Facts ACP already stored, read from a store's own database: what a stored repository identity,
@@ -14,7 +7,9 @@ const canonicalStored = (path: string): string => {
  * (core/credential-shapes.ts). Read-only. Only locations ACP itself made or registered: the
  * registry's checkouts (the canonical git toplevel it resolved) and the verification engine's own
  * trees (under its configured worktree root). A path a caller or MCP request supplied and ACP only
- * stored, such as a task execution's worktree, is never one.
+ * stored, such as a task execution's worktree, is never one. Each is the exact string ACP stored
+ * when it resolved or created the location, never resolved again: what is at that path now (a
+ * symlink swapped in after registration) does not move the root.
  */
 export const registryView = (db: Db): RegistryView => ({
   records: (identity, checkoutPath) =>
@@ -28,9 +23,9 @@ export const registryView = (db: Db): RegistryView => ({
     ) !== undefined,
   checkoutsOf: (identity) =>
     db.all<{ checkout_path: string }>(`SELECT checkout_path FROM repositories WHERE identity = ?`, [identity])
-      .map((row) => canonicalStored(row.checkout_path)),
+      .map((row) => row.checkout_path),
   runWorktrees: (runId, identity) =>
     db.all<{ worktree_path: string }>(
       `SELECT worktree_path FROM verification_worktrees WHERE run_id = ? AND repository_identity = ?`, [runId, identity],
-    ).map((row) => canonicalStored(row.worktree_path)),
+    ).map((row) => row.worktree_path),
 });

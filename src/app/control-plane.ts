@@ -101,6 +101,8 @@ export interface ControlPlaneConfig {
   githubAppPrivateKeyPath?: string;
   /** Neutral, daemon-managed runtime root for CTO/continuity sessions. */
   runtimeRoot?: string;
+  /** The serving daemon's own entrypoint, resolved once at startup; a stored observation of it is checked against it. */
+  servingEntrypoint?: string;
   /**
    * Explicit status-only Hermes receipt transport. Omitted is deliberately dark: reconciliation
    * keeps returning `found: false` until a deployment names this bounded endpoint.
@@ -460,7 +462,8 @@ export class ControlPlane {
     try {
       // The locations this configuration computes, which a stored location ACP made is checked against.
       const residentHome = config.residentProvisioner?.home ?? homedir();
-      const locations = { stateRoot: dirname(config.databasePath), residentHome, repoFactoryWorkRoot: config.repoFactory?.workRoot ?? null };
+      const locations = { stateRoot: dirname(config.databasePath), residentHome, repoFactoryWorkRoot: config.repoFactory?.workRoot ?? null,
+        servingEntrypoint: config.servingEntrypoint ?? null };
       this.audit = new AuditLog(this.db, this.clock, locations);
       // A production deployment is dark unless it explicitly supplies a bounded Hermes receipt
       // endpoint: the Gateway's loopback receipt store (U4) or the `hermes acp` status call. The
