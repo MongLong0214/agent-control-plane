@@ -612,6 +612,39 @@ describe("round-2 run and production-gate regressions", () => {
     expect(packet.reasonCode).toBe(ReasonCode.VERIFICATION_INCOMPLETE);
   });
 
+  /** #1258 — one more execution of the fixture's one input, beside the PASS the fixture wrote. */
+  const recordExecution = (fixture: Awaited<ReturnType<typeof evidenceReadyRun>>, attempt: number, status: "PASS" | "FAIL") => {
+    const result = fixture.report.results[0]!;
+    fixture.harness.cp.db.run(
+      `INSERT INTO verification_results
+         (result_id, run_id, candidate_snapshot_digest, command_id, repository_identity, source, attempt,
+          exact_head, started_at, ended_at, exit_code, output_digest, output_truncated, status, reason_code)
+       VALUES (?, ?, ?, ?, ?, 'local', ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+      [`${fixture.digest}:${result.commandId}:${result.repositoryIdentity}:local:${attempt}`, fixture.runId, fixture.digest,
+        result.commandId, result.repositoryIdentity, attempt, result.exactHead, result.startedAt, result.endedAt,
+        status === "PASS" ? 0 : 1, `sha256:execution-${attempt}`, status,
+        status === "PASS" ? null : ReasonCode.VERIFICATION_COMMAND_FAILED],
+    );
+  };
+
+  it("#1258 builds the packet when an earlier execution of the input failed and its latest passed", async () => {
+    const fixture = await evidenceReadyRun();
+    // The fixture's PASS becomes the input's second execution, after a FAIL on the same candidate.
+    fixture.harness.cp.db.run(`UPDATE verification_results SET attempt = 2 WHERE run_id = ?`, [fixture.runId]);
+    recordExecution(fixture, 1, "FAIL");
+    expect(buildPacket(fixture)).toBeDefined();
+  });
+
+  it("#1258 refuses the packet when the input's latest execution failed after an earlier PASS", async () => {
+    const fixture = await evidenceReadyRun();
+    recordExecution(fixture, 2, "FAIL");
+    const packet = fixture.harness.cp.ceo.buildPacket({
+      runId: fixture.runId, candidateSnapshotDigest: fixture.digest, approval: fixture.approval,
+    });
+    expect(packet).toMatchObject({ allowed: false, reasonCode: ReasonCode.VERIFICATION_COMMAND_FAILED });
+    expect(packet.evidence?.["failing"]).toEqual([expect.objectContaining({ attempt: 2, status: "FAIL" })]);
+  });
+
   it("#145 rejects an incomplete bootstrap activation artifact", async () => {
     const harness = makeHarness();
     const ceoSessionId = bindCeo(harness);

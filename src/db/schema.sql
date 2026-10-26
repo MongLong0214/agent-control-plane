@@ -1890,9 +1890,16 @@ END;
 
 -- ---------------------------------------------------------------------------
 -- verification_results  (PRD §17.6, §17.7)
---   Lifecycle: one row per (snapshot, command, repository) execution.
---   Integrity: the completeness gate counts these rows; a JSON blob cannot be
---   counted or uniquely constrained.
+--   Lifecycle: one row per finished execution of an input, an input being one
+--   (snapshot, command, repository, source). `attempt` numbers an input's
+--   executions from 1 in the order they finished. A re-verification appends the
+--   next attempt; no row is replaced, so an earlier FAIL stays beside a later
+--   PASS (#1258, schema v53). A row written without an attempt is its input's
+--   first, and a second such row is refused by the key rather than replacing it.
+--   Current verdict: an input's highest attempt alone decides
+--   (src/verify/verification-history.ts).
+--   Integrity: the completeness gate counts the current rows; a JSON blob cannot
+--   be counted or uniquely constrained.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS verification_results (
   result_id                 TEXT PRIMARY KEY,
@@ -1910,7 +1917,8 @@ CREATE TABLE IF NOT EXISTS verification_results (
   status                    TEXT NOT NULL
                               CHECK (status IN ('PASS','FAIL','TIMEOUT','ERROR','SKIPPED')),
   reason_code               TEXT,
-  UNIQUE (candidate_snapshot_digest, command_id, repository_identity, source)
+  attempt                   INTEGER NOT NULL DEFAULT 1 CHECK (attempt >= 1),
+  UNIQUE (candidate_snapshot_digest, command_id, repository_identity, source, attempt)
 );
 
 -- ---------------------------------------------------------------------------
