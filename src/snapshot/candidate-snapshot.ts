@@ -11,6 +11,24 @@ import { canonical, isWithin } from "../guard/workspace-probe.ts";
 
 export const CANDIDATE_SNAPSHOT_SCHEMA_ID = "agent-control-plane.candidate-snapshot.v1";
 
+/**
+ * S6-C — what a candidate that is not its checkout's HEAD was built from: the SUCCEEDED task results of
+ * the run in this repository, integrated onto the run's pinned base in the order listed (the task
+ * graph's dependencies first, then task id), and the HEAD the registered checkout stood at when it was
+ * frozen. Freshness compares the checkout with that HEAD, because the integrated commit is checked out
+ * nowhere (`verifySnapshotFreshness`).
+ */
+export const snapshotIntegrationSchema = z
+  .object({
+    checkoutHead: z.string().regex(/^[0-9a-f]{40}$/),
+    tasks: z
+      .array(z.object({ taskId: z.string().min(1), commit: z.string().regex(/^[0-9a-f]{40}$/) }).strict())
+      .min(1),
+  })
+  .strict();
+
+export type SnapshotIntegration = z.infer<typeof snapshotIntegrationSchema>;
+
 export const snapshotRepositorySchema = z
   .object({
     identity: z.string().min(1),
@@ -30,6 +48,11 @@ export const snapshotRepositorySchema = z
     worktreeId: z.string().nullable(),
     manifestDigest: z.string().nullable(),
     touchedPaths: z.array(z.string()),
+    /**
+     * Present only on an integrated candidate (S6-C). A candidate that is its checkout's HEAD leaves
+     * the key out, so its digest is exactly what it was before the field existed.
+     */
+    integration: snapshotIntegrationSchema.optional(),
   })
   .strict()
   .superRefine((repository, ctx) => {
@@ -123,6 +146,15 @@ export const candidateSnapshotSchema = z
   });
 
 export type SnapshotRepository = z.infer<typeof snapshotRepositorySchema>;
+
+/**
+ * S6-C — the HEAD a frozen repository's registered checkout must stand at for its candidate to be
+ * fresh: the candidate itself, or, for an integrated candidate, the HEAD the checkout stood at when it
+ * was frozen (the integrated commit is checked out nowhere). Every reader that holds the live checkout
+ * to a frozen candidate asks this, never `candidateHead` directly, so they cannot disagree.
+ */
+export const expectedCheckoutHead = (repository: Pick<SnapshotRepository, "candidateHead" | "integration">): string =>
+  repository.integration?.checkoutHead ?? repository.candidateHead;
 export type CandidateSnapshot = z.infer<typeof candidateSnapshotSchema>;
 
 export interface SnapshotRepositoryInput {
@@ -138,6 +170,8 @@ export interface SnapshotRepositoryInput {
   candidateRef?: string;
   worktreeId?: string | null;
   manifestDigest?: string | null;
+  /** S6-C — given with `candidateRef` naming the integrated commit; see `snapshotIntegrationSchema`. */
+  integration?: SnapshotIntegration;
 }
 
 /** A verification command must resolve to exactly one repository identity. */
@@ -227,6 +261,7 @@ export const buildCandidateSnapshot = async (
       worktreeId: input.worktreeId ?? null,
       manifestDigest: input.manifestDigest ?? null,
       touchedPaths: await changedPaths(input.checkoutPath, baseHead, candidateHead),
+      ...(input.integration === undefined ? {} : { integration: input.integration }),
     });
   }
 
@@ -297,10 +332,13 @@ export const verifySnapshotFreshness = async (
     }
     // Compare the checkout's *current* tip against the frozen candidate. Resolving
     // the recorded sha would always succeed — the commit still exists after the
-    // branch moves on — and would report a moved head as fresh.
+    // branch moves on — and would report a moved head as fresh. An integrated candidate
+    // (S6-C) is checked out nowhere, so its checkout is held to the HEAD it stood at
+    // when frozen; a later turn moves that HEAD, and so stales the candidate.
+    const expectedHead = expectedCheckoutHead(repo);
     const head = await tryRevParse(probe.checkoutPath, "HEAD");
-    if (head !== repo.candidateHead) {
-      drift.push({ identity: repo.identity, expectedHead: repo.candidateHead, observedHead: head });
+    if (head !== expectedHead) {
+      drift.push({ identity: repo.identity, expectedHead, observedHead: head });
       continue;
     }
     const tree = `git-tree:${await treeOf(probe.checkoutPath, repo.candidateHead)}`;

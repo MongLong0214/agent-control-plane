@@ -95,6 +95,23 @@ export const ReasonCode = {
   SNAPSHOT_STALE: "SNAPSHOT_STALE",
   SNAPSHOT_DIGEST_MISMATCH: "SNAPSHOT_DIGEST_MISMATCH",
   EVIDENCE_STALE: "EVIDENCE_STALE",
+  /**
+   * A freeze found a SUCCEEDED task whose own commit is not in the candidate's history for its
+   * repository. Each STANDARD_WORK task's branch is created at the run's pinned base rather than
+   * stacked on another task's branch (#512 S-TB), so the freeze integrates every SUCCEEDED task's
+   * commit onto that base (S6-C); this is the post-condition on the final candidate head, integrated
+   * or not, for any commit the candidate still does not hold. Not staleness: nothing moved since an
+   * earlier read. The candidate is refused before review or publication, naming the missing task
+   * and commit.
+   */
+  CANDIDATE_MISSING_TASK_COMMIT: "CANDIDATE_MISSING_TASK_COMMIT",
+  /**
+   * A freeze found a SUCCEEDED task whose commit is in the candidate's history but whose change is
+   * not in the candidate's tree: a path the task changed against its pinned base stands there with
+   * other bytes, or is missing (a merge that kept one side, `-s ours`, does exactly this). Refused
+   * before review or publication, naming the task and each such path.
+   */
+  CANDIDATE_MISSING_TASK_CHANGE: "CANDIDATE_MISSING_TASK_CHANGE",
 
   // --- CP-HI-07 Human Role ------------------------------------------------
   OWNER_AUTHORITY_NOT_DELEGABLE: "OWNER_AUTHORITY_NOT_DELEGABLE",
