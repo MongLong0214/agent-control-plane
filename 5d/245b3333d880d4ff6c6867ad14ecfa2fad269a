@@ -1,0 +1,4 @@
+Limit: a project-less bootstrap review is refused with BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN when the run's current review-evidence attachment or any admitted CEO decision (a RESUME_REVIEW included) is not frozen into the latest PLAN; the CTO must plan_submit again with a new idempotency key, because a same-key replay returns the stale result (live run_3884d4fc, 2026-10-26)
+Warn: the CONFIRM path's separate reviewEntry in production-gate.ts is not gated, so a decision admitted after a PASS and before CONFIRM is not checked there; RESUME_REVIEW messages queued before this build still carry the old directive text
+Record-Id: r-0eae8470e2d0
+Provenance: inherited 51a214414465eea431ebb94b108513d702ebffc3
