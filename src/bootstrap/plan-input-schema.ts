@@ -44,6 +44,9 @@ export const submittedPlanSchema = z.object({
   bootstrapOperationId: z.string().min(1).optional(),
   // Explicit retired project replaced by this bootstrap; covered by the normalized PLAN digest.
   supersedesProjectId: z.string().min(1).regex(/^[^\x00-\x1f\x7f]+$/).optional(),
+  // CEO msg_2b439e5a — a STANDARD_WORK re-plan names the earlier tasks of its run that it replaces; only
+  // those are cancelled, and only when none of them ever had an execution. Covered by the PLAN digest.
+  supersedesTaskIds: z.array(z.string().min(1)).min(1).optional(),
   requestDigest: z.string().min(1).optional(),
   projectManifestDigest: z.string().min(1).optional(),
   // Issue #246 — each operation as the Repo Factory runner executes it and the owner

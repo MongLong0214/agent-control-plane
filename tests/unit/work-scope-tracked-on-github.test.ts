@@ -7,7 +7,7 @@ import { createBootstrapGitHubWritePort } from "../../src/bootstrap/bootstrap-wr
 import { type GenesisBundle, parseGenesis } from "../../src/bootstrap/genesis-bundle.ts";
 import { createGitHubApiWritePort, type GitHubRepositoryTarget } from "../../src/bootstrap/github-write-port.ts";
 import { produceRepoFactoryResult } from "../../src/bootstrap/repo-factory-producer.ts";
-import { acpError, allow } from "../../src/core/errors.ts";
+import { acpError, allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { manifestDigest, projectManifestSchema } from "../../src/contracts/manifest.ts";
 import { digestOf } from "../../src/core/digest.ts";
@@ -918,6 +918,90 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     expect(startExecution(g, impl).allowed).toBe(true);
     expect(g.github.posts("/issues")).toHaveLength(1);
     expect(intentsOf(g)).toEqual([]);
+  });
+
+  it("merge #1239: a refused work-unit plan_submit that names supersedesTaskIds cancels nothing; the earlier PLAN and approval stay current", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 2) });
+    const [impl, review] = g.taskIds as [string, string];
+    const feed = { key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } };
+    expect(tracking(await planSubmit(g, [feed, { key: "detail", tasks: [review], issue: { number: 4 }, milestone: { number: 1 } }]))).toMatchObject({ tracked: true });
+    const plan = g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!.digest;
+    const approvals = () => g.h.cp.audit.byKind("WORK_SCOPE_APPROVED").filter((row) => row.runId === g.runId).length;
+    const before = approvals();
+    const superseding = (dependsOn: string[]) => callCtoTool(g.h, g.owner, "plan_submit", {
+      idempotencyKey: `plan-${Math.random()}`, runId: g.runId,
+      plan: { summary: "replace the detail page", supersedesTaskIds: [review], workUnits: [feed, { key: "detail2", tasks: ["detail2"], issue: { number: 6 }, milestone: { number: 2 } }] },
+      tasks: [{ key: "detail2", title: "Verdict detail, second cut", category: "implementation", dependsOn }],
+    });
+    const unchanged = () => {
+      expect(g.h.cp.tasks.get(review)!.state).toBe("READY");
+      expect(g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!.digest).toBe(plan);
+      expect(approvals()).toBe(before);
+      expect(g.h.cp.audit.byKind("STANDARD_WORK_TASKS_SUPERSEDED").filter((row) => row.runId === g.runId)).toEqual([]);
+      expect(g.h.cp.tasks.list(g.runId)).toHaveLength(2);
+    };
+    // Refused by the task graph: the new task depends on one that does not exist.
+    expect((await superseding(["no-such-task"]))["ok"]).toBe(false);
+    unchanged();
+    // Refused after the cancel already ran inside the transaction: the cancel is rolled back with the rest.
+    const scope = g.h.cp.tasks.workScope!;
+    const approve = vi.spyOn(scope, "approve").mockReturnValue(deny(ReasonCode.CONFLICT, "approval refused for the witness", {}));
+    expect((await superseding([]))).toMatchObject({ ok: false, reasonCode: "CONFLICT" });
+    expect(approve).toHaveBeenCalledTimes(1);
+    approve.mockRestore();
+    unchanged();
+    expect(startExecution(g, impl).allowed).toBe(true);
+  });
+
+  it("merge #1239: an accepted work-unit plan_submit cancels the named tasks and records STANDARD_WORK_TASKS_SUPERSEDED with its PLAN", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 2) });
+    const [impl, review] = g.taskIds as [string, string];
+    const feed = { key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } };
+    expect(tracking(await planSubmit(g, [feed, { key: "detail", tasks: [review], issue: { number: 4 }, milestone: { number: 1 } }]))).toMatchObject({ tracked: true });
+    // A unit may not name a task the PLAN supersedes: it is cancelled with the PLAN.
+    const naming = await callCtoTool(g.h, g.owner, "plan_submit", {
+      idempotencyKey: "plan-naming", runId: g.runId,
+      plan: { summary: "keep naming it", supersedesTaskIds: [review], workUnits: [feed, { key: "detail", tasks: [review, "detail2"], issue: { number: 4 }, milestone: { number: 1 } }] },
+      tasks: [{ key: "detail2", title: "Verdict detail, second cut", category: "implementation" }],
+    });
+    expect(naming).toMatchObject({ ok: false, evidence: { refusal: "WORK_UNITS_TASKS_UNMAPPED", unknown: [review] } });
+    expect(g.h.cp.tasks.get(review)!.state).toBe("READY");
+    const accepted = await callCtoTool(g.h, g.owner, "plan_submit", {
+      idempotencyKey: "plan-accepted", runId: g.runId,
+      plan: { summary: "replace the detail page", supersedesTaskIds: [review], workUnits: [feed, { key: "detail2", tasks: ["detail2"], issue: { number: 6 }, milestone: { number: 2 } }] },
+      tasks: [{ key: "detail2", title: "Verdict detail, second cut", category: "implementation" }],
+    });
+    expect(accepted["ok"]).toBe(true);
+    expect(tracking(accepted)).toMatchObject({ tracked: true });
+    expect(g.h.cp.tasks.get(review)!.state).toBe("CANCELLED");
+    const plan = g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!.digest;
+    const superseded = g.h.cp.audit.byKind("STANDARD_WORK_TASKS_SUPERSEDED").filter((row) => row.runId === g.runId).map((row) => row.evidence as { planDigest: string; cancelled: string[] });
+    expect(superseded).toEqual([expect.objectContaining({ planDigest: plan, cancelled: [review] })]);
+    const approval = g.h.cp.audit.byKind("WORK_SCOPE_APPROVED").filter((row) => row.runId === g.runId).at(-1)!.evidence as { planDigest: string };
+    expect(approval.planDigest).toBe(plan);
+    const detail2 = g.h.cp.tasks.list(g.runId).find((t) => t.title === "Verdict detail, second cut")!.taskId;
+    expect(startExecution(g, detail2).allowed).toBe(true);
+  });
+
+  it("merge #1239: a unit whose only tasks were superseded no longer blocks admission or confirmation", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 2) });
+    const [impl, review] = g.taskIds as [string, string];
+    const feed = { key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } };
+    // `detail` adopts #8 in milestone 2, but #8 is in milestone 3: it is never tracked, and holds the run back.
+    await planSubmit(g, [feed, { key: "detail", tasks: [review], issue: { number: 8 }, milestone: { number: 2 } }]);
+    const scope = g.h.cp.tasks.workScope!;
+    expect(scope.assertSettled(g.runId)).toMatchObject({ allowed: false, evidence: { untracked: [{ unit: "detail" }] } });
+    expect(startExecution(g, review).reasonCode).toBe(REFUSED);
+    // A re-plan supersedes the detail task: its unit is gone, and nothing it covered blocks the run.
+    const replaced = await callCtoTool(g.h, g.owner, "plan_submit", {
+      idempotencyKey: "plan-supersede", runId: g.runId,
+      plan: { summary: "drop the detail page", supersedesTaskIds: [review], workUnits: [feed, { key: "docs", tasks: ["docs"], issue: { number: 6 }, milestone: { number: 2 } }] },
+      tasks: [{ key: "docs", title: "Document the feed", category: "docs" }],
+    });
+    expect(tracking(replaced)).toMatchObject({ tracked: true });
+    expect(g.h.cp.tasks.get(review)!.state).toBe("CANCELLED");
+    expect(scope.assertSettled(g.runId).allowed).toBe(true);
+    expect(startExecution(g, impl).allowed).toBe(true);
   });
 
   it("a project that is not a Repo Factory project plans and is admitted as before, with no GitHub request", async () => {

@@ -240,6 +240,13 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       const frozen = source.bootstrapApplications.assertNotFrozen(runId, "plan_submit");
       if (!frozen.allowed) return frozen as Decision<{ digest: string }>;
       const run = source.runs.require(runId);
+      // CEO msg_2b439e5a — only a STANDARD_WORK PLAN names the earlier tasks it supersedes; any other
+      // run's is refused before it is stored, rather than kept with a field nothing acts on.
+      if (plan["supersedesTaskIds"] !== undefined && run.kind !== RunKind.STANDARD_WORK) {
+        return deny(ReasonCode.INVALID_ARGUMENT, "only a STANDARD_WORK PLAN names the earlier tasks it supersedes", {
+          runId, refusal: "SUPERSEDES_TASKS_NOT_STANDARD_WORK", kind: run.kind,
+        });
+      }
       if (isProjectlessBootstrap(run) && source.bootstrap.residentGenesisRequired && plan["genesis"] === undefined) return deny(ReasonCode.INVALID_ARGUMENT,"bootstrap PLAN requires inline genesis bytes",{refusal:"GENESIS_MISSING"});
       const admitted = isContractChangeRun(run)
         ? contractChangePlanForSubmission(run, plan, (digest) => source.projects.manifest(digest), firstActivationFactsOf(source.db, run))
@@ -263,10 +270,11 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     },
     submitTasks: (runId: string, tasks: Parameters<TaskGraph["submit"]>[1]) => source.tasks.submit(runId, tasks),
     workScope: () => source.tasks.workScope,
-    // #1240 — a Repo Factory PLAN that declares work units is accepted all or nothing: the PLAN, its tasks
-    // and the approval commit in one transaction, and any refusal rolls all of them back, so the PLAN and
-    // approval accepted before stay current. The PLAN is stored with its submission's sequence, so the
-    // artifact store's content dedup never hands back an earlier PLAN: each accepted one is the latest.
+    // #1240 — a Repo Factory PLAN that declares work units is accepted all or nothing: the PLAN, its tasks,
+    // the cancel of the earlier tasks it names in `supersedesTaskIds` (#1239) and the approval commit in one
+    // transaction, and any refusal rolls all of them back, so the PLAN and approval accepted before stay
+    // current and nothing is cancelled. The PLAN is stored with its submission's sequence, so the artifact
+    // store's content dedup never hands back an earlier PLAN: each accepted one is the latest.
     acceptWorkUnitsPlan: (
       runId: string,
       plan: Record<string, unknown>,
@@ -281,10 +289,25 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
         const submission = (source.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN'`, [runId])?.n ?? 0) + 1;
         const stored = port.submitPlan(runId, { ...plan, submission }, bootstrapPlanDigest);
         if (!stored.allowed) return stored as Decision<never>;
-        const submitted = tasks.length === 0 ? allow(ReasonCode.OK, []) : port.submitTasks(runId, tasks);
+        // A PLAN that supersedes earlier tasks adds the ones that replace them: the task graph refuses an
+        // empty submission, so a units-only re-submit (tasks omitted) supersedes nothing.
+        const supersedes = plan["supersedesTaskIds"] as string[] | undefined;
+        const submitted = tasks.length === 0 && supersedes === undefined
+          ? allow(ReasonCode.OK, [])
+          : source.tasks.submit(runId, tasks, supersedes === undefined ? undefined : { planDigest: stored.value.digest, taskIds: supersedes });
         if (!submitted.allowed) return submitted;
         const approved = scope.approve(runId, stored.value.digest, declaration, tasks, submitted.value, owner);
         return approved.allowed ? submitted : (approved as Decision<never>);
+      }),
+    // CEO msg_2b439e5a — a STANDARD_WORK PLAN that names `supersedesTaskIds` is all or nothing: the PLAN
+    // write, the cancel of exactly the named tasks ("superseded by PLAN <digest>") and the new tasks
+    // commit in one transaction, and any refusal rolls every one of them back. A PLAN without the field
+    // keeps the path below unchanged.
+    submitSupersedingPlan: (runId: string, plan: Record<string, unknown>, tasks: Parameters<TaskGraph["submit"]>[1], bootstrapPlanDigest?: string) =>
+      source.db.txDecision((): Decision<unknown> => {
+        const stored = port.submitPlan(runId, plan, bootstrapPlanDigest);
+        if (!stored.allowed) return stored;
+        return source.tasks.submit(runId, tasks, { planDigest: stored.value.digest, taskIds: plan["supersedesTaskIds"] as string[] });
       }),
     isProjectlessBootstrapRun: (runId: string) => isProjectlessBootstrap(source.runs.require(runId)),
     // PR #1114 BOOT-02 — a project-less bootstrap's re-plan is all or nothing: the PLAN write, the
@@ -653,8 +676,9 @@ const createCtoServerFromPort = (
       const scope = port.workScope();
       const declared = scope === null ? allow(ReasonCode.OK, null) : scope.declare(args.runId, plan, tasks);
       if (!declared.allowed) return respond(declared);
-      if (tasks.length === 0 && declared.value === null) return respond(deny(ReasonCode.INVALID_ARGUMENT, "plan_submit requires plan and tasks, or bootstrapPlanDigest"));
       if (scope === null || declared.value === null) {
+        if (tasks.length === 0) return respond(deny(ReasonCode.INVALID_ARGUMENT, "plan_submit requires plan and tasks, or bootstrapPlanDigest"));
+        if (plan["supersedesTaskIds"] !== undefined) return respond(port.submitSupersedingPlan(args.runId, plan, tasks, bootstrapPlanDigest));
         const stored = port.submitPlan(args.runId, plan, bootstrapPlanDigest);
         if (!stored.allowed) return respond(stored);
         return respond(port.submitTasks(args.runId, tasks));

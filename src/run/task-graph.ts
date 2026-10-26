@@ -5,7 +5,7 @@ import type {
   DynamicReserveDemand,
   WorkerFanoutCapacityTarget,
 } from "../capacity/capacity-monitor.ts";
-import { digestOf } from "../core/digest.ts";
+import { canonicalJson, digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny, fail, isAcpError } from "../core/errors.ts";
 import { newTaskId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -164,6 +164,18 @@ export const BOOTSTRAP_PLAN_TASKS = "BOOTSTRAP_PLAN_TASKS";
 export const BOOTSTRAP_TASKS_SUPERSEDED = "BOOTSTRAP_TASKS_SUPERSEDED";
 /** The audit kind of the one settlement of a project-less bootstrap's execution task. */
 export const BOOTSTRAP_TASK_SETTLED = "BOOTSTRAP_TASK_SETTLED";
+/** The audit kind a STANDARD_WORK re-plan writes when it cancels the earlier tasks its PLAN names. */
+export const STANDARD_WORK_TASKS_SUPERSEDED = "STANDARD_WORK_TASKS_SUPERSEDED";
+
+/**
+ * CEO msg_2b439e5a — the earlier tasks of the same STANDARD_WORK run a new PLAN names in
+ * `supersedesTaskIds`, which `submit` cancels in the transaction that adds that PLAN's tasks.
+ */
+export interface TaskSupersession {
+  /** The superseding PLAN's digest: each cancel is recorded as "superseded by PLAN <digest>". */
+  planDigest: string;
+  taskIds: readonly string[];
+}
 
 /** The `BOOTSTRAP_PLAN_TASKS` records of a run, as its `plan_submit`s wrote them. */
 const bootstrapPlanTaskRecords = (db: Pick<Db, "all">, runId: string): Array<{ planDigest?: unknown; taskIds?: unknown }> =>
@@ -254,12 +266,12 @@ export class TaskGraph {
    * pending task to a run that has already produced a packet would make the packet's
    * completeness claim false after the fact (§34.3, CP-HI-08).
    */
-  submit(runId: string, specs: readonly TaskSpec[]): Decision<TaskRecord[]> {
+  submit(runId: string, specs: readonly TaskSpec[], supersede?: TaskSupersession): Decision<TaskRecord[]> {
     if (specs.length === 0) {
       return deny(ReasonCode.INVALID_ARGUMENT, "task submission is empty", { runId });
     }
 
-    const run = this.db.get<{ state: string }>(`SELECT state FROM runs WHERE run_id = ?`, [runId]);
+    const run = this.db.get<{ state: string; kind: string }>(`SELECT state, kind FROM runs WHERE run_id = ?`, [runId]);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
     if (CLOSED_TO_NEW_TASKS.has(run.state as RunState)) {
       return deny(
@@ -267,6 +279,11 @@ export class TaskGraph {
         `run is ${run.state}; its work is already sealed against new tasks`,
         { runId, state: run.state },
       );
+    }
+    if (supersede && run.kind !== RunKind.STANDARD_WORK) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "only a STANDARD_WORK PLAN names the earlier tasks it supersedes", {
+        runId, refusal: "SUPERSEDES_TASKS_NOT_STANDARD_WORK", kind: run.kind,
+      });
     }
 
     const keys = new Set(specs.map((s) => s.key));
@@ -300,6 +317,33 @@ export class TaskGraph {
 
     return this.db.tx(() => {
       const now = this.clock.nowIso();
+      // CEO msg_2b439e5a — a STANDARD_WORK PLAN's supersedesTaskIds is judged and applied here, under the
+      // write lock `recordExecution` opens an execution under: a retry of an applied one changes nothing,
+      // and any named task that may not be cancelled refuses the whole submission before anything is written.
+      if (supersede) {
+        const replayed = this.#supersessionReplay(runId, supersede, specs);
+        if (replayed) return allow(ReasonCode.OK, replayed);
+        const refused = this.#supersessionRefusal(runId, supersede);
+        if (refused) return refused;
+      }
+      const named = new Set(supersede?.taskIds ?? []);
+      for (const spec of specs) {
+        for (const dep of spec.dependsOn ?? []) {
+          const dependsOn = resolve(dep);
+          if (dependsOn !== null && (named.has(dependsOn) || this.get(dependsOn)?.state === TaskState.CANCELLED)) {
+            return deny(ReasonCode.TASK_DEPENDENCY_UNSATISFIED, `task '${spec.key}' depends on a cancelled task`, {
+              runId, refusal: "LIVE_TASK_DEPENDS_ON_CANCELLED", task: spec.key, dependency: dep, dependsOn,
+            });
+          }
+        }
+      }
+      for (const taskId of named) {
+        const cancelled = this.db.run(
+          `UPDATE tasks SET state = 'CANCELLED', updated_at = ? WHERE task_id = ? AND run_id = ? AND state IN ('PENDING', 'READY')`,
+          [now, taskId, runId],
+        );
+        if (cancelled.changes !== 1) fail(ReasonCode.CONFLICT, "a superseded task changed while it was cancelled", { runId, taskId });
+      }
       // CEO 1792120860 (3) — a project-less bootstrap's re-plan supersedes the earlier PLAN's tasks in
       // this same transaction: an unexecuted READY one is CANCELLED, anything else is left as it is.
       const bootstrapPlan = this.#projectlessBootstrapPlanDigest(runId);
@@ -360,6 +404,19 @@ export class TaskGraph {
           kind: BOOTSTRAP_PLAN_TASKS,
           runId,
           evidence: { planDigest: bootstrapPlan, taskIds: created.map((task) => task.taskId) },
+        });
+      }
+      if (supersede) {
+        this.audit.record({
+          kind: STANDARD_WORK_TASKS_SUPERSEDED,
+          runId,
+          evidence: {
+            planDigest: supersede.planDigest,
+            reason: `superseded by PLAN ${supersede.planDigest}`,
+            cancelled: [...named],
+            taskIds: created.map((task) => task.taskId),
+            tasksDigest: digestOf(specs),
+          },
         });
       }
       this.telemetry.record({ scope: "graph", name: "task_count", runId, value: created.length });
@@ -1335,6 +1392,75 @@ export class TaskGraph {
       runId,
       evidence: { planDigest, reason: `superseded by PLAN ${planDigest}`, cancelled, left },
     });
+  }
+
+  /**
+   * CEO msg_2b439e5a (2, 4) — why `supersede` may not cancel what it names, or null. Each named task
+   * must be this run's, PENDING or READY, and never have had an execution; no task of the run that
+   * stays live may depend on one. Read inside `submit`'s transaction: `recordExecution` opens an
+   * execution only for a READY or FAILED task under the same write lock, so an execution start and
+   * this cancel cannot both win.
+   */
+  #supersessionRefusal(runId: string, supersede: TaskSupersession): Decision<TaskRecord[]> | null {
+    const refuse = (reasonCode: ReasonCode, refusal: string, message: string, evidence: Record<string, unknown>) =>
+      deny(reasonCode, message, { runId, refusal, planDigest: supersede.planDigest, ...evidence }) as Decision<TaskRecord[]>;
+    const named = new Set(supersede.taskIds);
+    if (named.size !== supersede.taskIds.length) {
+      return refuse(ReasonCode.INVALID_ARGUMENT, "SUPERSEDED_TASK_DUPLICATE", "supersedesTaskIds names a task more than once", {
+        supersedesTaskIds: supersede.taskIds,
+      });
+    }
+    for (const taskId of named) {
+      const task = this.get(taskId);
+      if (!task) return refuse(ReasonCode.NOT_FOUND, "SUPERSEDED_TASK_UNKNOWN", "a superseded task is unknown", { taskId });
+      if (task.runId !== runId) {
+        return refuse(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "SUPERSEDED_TASK_OUTSIDE_RUN", "a superseded task belongs to another run", {
+          taskId, taskRunId: task.runId,
+        });
+      }
+      const executed = this.db.get<{ n: number }>(`SELECT 1 AS n FROM task_executions WHERE task_id = ? LIMIT 1`, [taskId]);
+      if (executed || task.attemptCount > 0) {
+        return refuse(ReasonCode.CONFLICT, "SUPERSEDED_TASK_HAS_EXECUTION", "a superseded task has an execution; it is never cancelled by a re-plan", {
+          taskId, state: task.state, attemptCount: task.attemptCount,
+        });
+      }
+      if (task.state !== TaskState.PENDING && task.state !== TaskState.READY) {
+        return refuse(ReasonCode.CONFLICT, "SUPERSEDED_TASK_NOT_CANCELLABLE", `a superseded task is ${task.state}; only a PENDING or READY task is cancelled`, {
+          taskId, state: task.state,
+        });
+      }
+    }
+    for (const task of this.list(runId)) {
+      if (task.state === TaskState.CANCELLED || named.has(task.taskId)) continue;
+      const dependsOn = task.dependsOn.find((dep) => named.has(dep));
+      if (dependsOn !== undefined) {
+        return refuse(ReasonCode.TASK_DEPENDENCY_UNSATISFIED, "LIVE_TASK_DEPENDS_ON_CANCELLED", "a task that stays live depends on a superseded task", {
+          taskId: task.taskId, dependsOn,
+        });
+      }
+    }
+    return null;
+  }
+
+  /**
+   * CEO msg_2b439e5a (3) — a retried superseding submission: the same PLAN naming the same tasks with
+   * the same graph, whose `STANDARD_WORK_TASKS_SUPERSEDED` record is written and whose named tasks are
+   * all CANCELLED. Its tasks are answered again and nothing is written; null when it is not one.
+   */
+  #supersessionReplay(runId: string, supersede: TaskSupersession, specs: readonly TaskSpec[]): TaskRecord[] | null {
+    const names = canonicalJson([...supersede.taskIds].sort());
+    const tasksDigest = digestOf(specs);
+    for (const row of this.db.all<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`,
+      [STANDARD_WORK_TASKS_SUPERSEDED, runId],
+    )) {
+      const record = JSON.parse(row.evidence_json) as { planDigest?: unknown; cancelled?: unknown; taskIds?: unknown; tasksDigest?: unknown };
+      if (record.planDigest !== supersede.planDigest || record.tasksDigest !== tasksDigest) continue;
+      if (!Array.isArray(record.cancelled) || canonicalJson([...(record.cancelled as string[])].sort()) !== names) continue;
+      if (!supersede.taskIds.every((taskId) => this.get(taskId)?.state === TaskState.CANCELLED)) continue;
+      return (record.taskIds as string[]).map((taskId) => this.require(taskId));
+    }
+    return null;
   }
 
   cancelAll(runId: string, reason: string): number {

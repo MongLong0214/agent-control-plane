@@ -242,7 +242,9 @@ export class WorkScopeTracking {
     const keys = units.map((unit) => unit.key);
     const repeatedKeys = [...new Set(keys.filter((key, index) => keys.indexOf(key) !== index))];
     if (repeatedKeys.length > 0) return invalid("WORK_UNITS_INVALID", `unit keys ${repeatedKeys.join(", ")} are declared more than once`, { units: repeatedKeys });
-    const live = this.#live(runId).map((task) => task.taskId);
+    // #1239 — the tasks this PLAN supersedes are cancelled with it: they stay live in no unit.
+    const superseded = new Set(Array.isArray(plan["supersedesTaskIds"]) ? (plan["supersedesTaskIds"] as unknown[]).filter((id): id is string => typeof id === "string") : []);
+    const live = this.#live(runId).map((task) => task.taskId).filter((taskId) => !superseded.has(taskId));
     const known = new Set([...submitted.map((task) => task.key), ...live]);
     const refs = units.flatMap((unit) => unit.tasks);
     const unknown = refs.filter((ref) => !known.has(ref));

@@ -156,6 +156,11 @@ export const DESCENDANT_OUTLIVED_CANDIDATE = "ACP_DESCENDANT_OUTLIVED_CANDIDATE"
 const PROCESS_LIMIT_EXCEEDED_EXIT = 123;
 const PROCESS_LIMIT_UNAVAILABLE_EXIT = 122;
 const DESCENDANT_OUTLIVED_EXIT = 121;
+/**
+ * The supervisor's end once the process that launched it is gone (#1233). Nobody is left to read it:
+ * it exists so that end, like every other, goes through `finish()`.
+ */
+const PARENT_GONE_EXIT = 120;
 
 /**
  * The descriptor on which the supervisor reports the outcome it is about to end with (`exit <code>`
@@ -208,6 +213,15 @@ const supervisorEndedAsReported = (
  *   supervisor runs as the same user in the same sandbox, so the candidate can SIGKILL it: its end
  *   then matches no report, so containment is recorded as unproven and the run cannot pass, but
  *   descendants that left the launched process group are not reaped.
+ *
+ * The supervisor also dies with the process that launched it (#1233). That parent's pid is passed
+ * in, and every poll of either mode compares it with getppid(): a parent that is gone -- SIGKILLed,
+ * crashed, a test worker torn down mid-run -- has had its child re-parented by the kernel, so nobody
+ * would ever continue a candidate still in its pre-exec SIGSTOP, or stop a running one. The
+ * supervisor then kills the candidate by its own unreaped pid (no-spawn), or stops the tree it tracks
+ * as it does for a signal (budget), and ends through finish(). The comparison is with the pid the
+ * caller passed rather than one read at startup, so a parent that died before the interpreter ran
+ * is caught too.
  *
  * The CPU and memory limits are per process and inherited, which is not the same as the
  * whole-tree budget. RLIMIT_CPU applies to each process on its own: every descendant starts with
@@ -263,6 +277,7 @@ try:
     process_budget = int(sys.argv[4])
     if process_mode not in ("no-spawn", "budget") or process_budget < 1:
         raise RuntimeError("unknown process limit " + process_mode)
+    launching_parent = int(sys.argv[6])
     # Close-on-exec: the forked candidate drops the report descriptor when it execs.
     os.set_inheritable(REPORT_FD, False)
 except Exception as error:
@@ -353,6 +368,16 @@ class Tree:
                     continue
                 pending.append(pid)
 
+parent_gone = False
+
+def launching_parent_gone():
+    """The process that launched the supervisor has exited and the kernel re-parented it. Nobody is
+    left to continue, stop or wait for the candidate, so the supervisor must."""
+    global parent_gone
+    if os.getppid() != launching_parent:
+        parent_gone = True
+    return parent_gone
+
 def fence_descendants(root_pid):
     tree = Tree(root_pid)
 
@@ -360,6 +385,14 @@ def fence_descendants(root_pid):
         tree.scan()
         waited, status = os.waitpid(root_pid, os.WNOHANG)
         if waited == root_pid:
+            break
+        if launching_parent_gone():
+            # Its own unreaped child, so this pid is still the candidate, stopped or running.
+            try:
+                os.kill(root_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            waited, status = os.waitpid(root_pid, 0)
             break
         time.sleep(0.001)
 
@@ -490,6 +523,9 @@ def supervise_budget(root_pid, budget):
         if supervisor_continued:
             stop = "unavailable"
             break
+        if launching_parent_gone():
+            stop = "orphaned"
+            break
         waited, status = os.waitpid(root_pid, os.WNOHANG)
         if waited == root_pid:
             root_reaped = True
@@ -545,7 +581,7 @@ if candidate_pid == 0:
     # The outer supervisor must record this exact pid before candidate code can exec.
     # A candidate cannot skip this stop without first becoming a different process.
     os.kill(os.getpid(), signal.SIGSTOP)
-    os.execvpe(sys.argv[6], sys.argv[6:], os.environ)
+    os.execvpe(sys.argv[7], sys.argv[7:], os.environ)
 
 if process_mode == "budget":
     guard_supervisor()
@@ -564,11 +600,16 @@ if not report_candidate(candidate_pid):
 
 if process_mode == "no-spawn":
     reaped, candidate_status = fence_descendants(candidate_pid)
+    if parent_gone:
+        # Before any print: the output's reader died with the parent.
+        finish(${PARENT_GONE_EXIT})
     if not reaped:
         print("ACP_CHILD_CLEANUP_UNAVAILABLE: descendant process remained", file=sys.stderr)
         finish(126)
 else:
     stop, candidate_status, outlived, live, cleaned = supervise_budget(candidate_pid, process_budget)
+    if parent_gone:
+        finish(${PARENT_GONE_EXIT})
     if not cleaned:
         print("ACP_CHILD_CLEANUP_UNAVAILABLE: descendant process remained", file=sys.stderr)
         finish(126)
@@ -945,6 +986,8 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     supervisedBudget ? "budget" : "no-spawn",
     String(CANDIDATE_PROCESS_BUDGET),
     childListReader,
+    // The supervisor's parent: sandbox-exec execs the interpreter in place, so it is this process.
+    String(process.pid),
     ...launch.value,
   ];
   const file = "/usr/bin/sandbox-exec";

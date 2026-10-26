@@ -12,34 +12,28 @@ The CI workflow is `project-ci` (`.github/workflows/ci.yml`), and **the bare `ve
 required status check context** — that is a job check name GitHub reports, not the workflow name.
 Its jobs, and what each contributes to that check:
 
-- `verify-matrix`, displayed as `verify`, runs the main build and test steps on Node 22.23.2, the
-  runtime the daemon is deployed on, producing one `verify (22.23.2)` check;
-- `guard-falsifiability`, displayed as `guard falsifiability`, runs the mutation sweep after the
-  matrix, split four ways: each leg is its own clean checkout running `--shard=<n>/4`, because the
-  harness edits the working tree in place and two shards sharing a tree would read each other's
-  mutants. GitHub appends the matrix value to the job's check name, so these report as
-  `guard falsifiability (1/4)` and three more, and `guard-falsifiability-gate` — carrying the bare
-  `guard falsifiability` name and needing every leg under `if: always()` — is what turns four
-  results into one verdict. A leg missing from that matrix would leave a quarter of the table
-  unchecked behind green results, so
-  `tests/process/the-falsifiability-sweep-is-sharded-without-gaps.test.ts` reads the shard list out
-  of `ci.yml` and requires it to partition the row table;
-- `traceability`, displayed as `traceability`, checks out clean and consumes the Vitest JSON the
-  gate judged, downloaded from the `22.18.0` matrix leg of the same run. It does not run the suite
-  again: a second execution is a different run, so a report built from it describes something no
-  gate examined. A missing or empty artifact fails the job rather than falling back to a fresh run;
-- `ssot`, displayed as `SSOT reconciliation`, runs the reconciliation check in its own checkout;
-  and
-- `verify-gate`, displayed as bare `verify`, needs `verify-matrix` and runs under `if: always()`
-  so only an explicit `success` result passes it.
+- `test-reuse`, displayed as `test reuse`, decides whether a `push` may skip the suite because the
+  same-repository pull-request run on the squash's `Merged-Head` already passed every shard, and the
+  `ci-executed-*` record each of its jobs wrote from its own checkout names this push's tree, parent
+  and workflow blob (`scripts/ci-reuse-verified-tree.mjs`). Every other event, and every unproven
+  case, runs the suite;
+- `gates`, displayed as `verify (gates)`, runs every gate in the pre-push manifest except the suite
+  (`pnpm gates --no-tests`), once, on every event;
+- `verify-matrix`, displayed as `verify (shard 1/3)` through `verify (shard 3/3)`, runs the suite
+  as Vitest's `--shard=i/N` (`pnpm gates --tests-only --shard i/N`) on Node 22.23.2, the runtime the
+  daemon is deployed on; it is skipped only when `test-reuse` answered `true`; and
+- `verify-gate`, displayed as bare `verify`, needs all three and runs under `if: always()`. It
+  passes only when `gates` succeeded and either every shard succeeded or the shards were skipped on
+  a `push` that `test-reuse` proved; when the shards ran, it joins their reports into the
+  `vitest-results-22.23.2` artifact and refuses unless every test file ran exactly once.
 
-Only `verify-matrix` is therefore transitively required by the bare `verify` gate — read `ci.yml`,
-not this list, for what any other job gates today. The remaining jobs run, report and are read, but
-they are not branch-protection contexts and are not reached through `verify`. The required context
-remains `verify` with GitHub Actions App id `15368`. Existing protection that already requires that
-pinned context needs no settings change for this workflow split, and the commands below remain
-current. Registering the component checks separately would be a repository-owner policy change and
-is not part of this document or the workflow change.
+`gates` and `verify-matrix` are therefore both transitively required by the bare `verify` gate —
+read `ci.yml`, not this list, for what any job gates today. The component checks are not
+branch-protection contexts. The required context remains `verify` with GitHub Actions App id
+`15368`. Existing protection that already requires that pinned context needs no settings change
+for this workflow split, and the commands below remain current. Registering the component checks
+separately would be a repository-owner policy change and is not part of this document or the
+workflow change.
 
 Applying this is an owner action: it changes repository settings.
 

@@ -537,7 +537,7 @@ export const resumeBootstrapReview = (
     kind: MessageKind.RESUME_REVIEW,
     payload: { intent: "RESUME_REVIEW", runId: run.runId, contractDigest: input.contractDigest,
       bootstrapPlanDigest: input.bootstrapPlanDigest, attachmentDigest: attachment.digest,
-      directive: "Resume review only: read bootstrap_plan_get and verify bootstrapPlanDigest is still current, then plan_submit with idempotencyKey, runId and bootstrapPlanDigest, followed by result_submit for a new blind review. Acknowledge this message with run_ack after handling it; deduplicate effects by messageId. If the digest changed, this instruction is void. This is not CONFIRM, not genesis or workflow approval, not a review PASS, and grants no execution authority. Blind review and CEO CONFIRM are still required." } });
+      directive: "Resume review only: read bootstrap_plan_get and verify bootstrapPlanDigest is still current, then plan_submit with a NEW idempotencyKey (a key an earlier plan_submit used replays that earlier PLAN without this release, attached review evidence or later CEO decisions), runId and bootstrapPlanDigest, followed by result_submit with a new idempotencyKey for a new blind review. Acknowledge this message with run_ack after handling it; deduplicate effects by messageId. If the digest changed, this instruction is void. This is not CONFIRM, not genesis or workflow approval, not a review PASS, and grants no execution authority. Blind review and CEO CONFIRM are still required." } });
   if (!queued.allowed) return queued;
   const audit = source.audit.record({ kind: "CEO_DECISION", runId: run.runId, projectId: run.projectId,
     sessionId: peer.sessionId, roleKey: identity.value.ceo.roleKey,
