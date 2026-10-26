@@ -796,6 +796,8 @@ const productionRunCli = async (
      * Claude and Codex worker turns only.
      */
     workerTurn?: boolean;
+    /** #1246 — with `workerTurn`: git configuration the child's git applies over the repository's. */
+    gitConfig?: Readonly<Record<string, string>>;
   },
 ): Promise<{
   stdout: string;
@@ -860,8 +862,19 @@ const productionRunCli = async (
           options.providerCredentialDir,
           options.codexHome,
         );
-    // Set after the allowlist, so an inherited value cannot turn optional locks back on.
-    if (options.workerTurn === true && !isolated) environment["GIT_OPTIONAL_LOCKS"] = "0";
+    // Set after the allowlist, so an inherited value cannot turn optional locks back on. Git applies
+    // `GIT_CONFIG_PARAMETERS` after `GIT_CONFIG_COUNT`, so no injected configuration is inherited either:
+    // a worker's git runs with the repository's configuration and this turn's `gitConfig` over it.
+    if (options.workerTurn === true && !isolated) {
+      environment["GIT_OPTIONAL_LOCKS"] = "0";
+      for (const name of Object.keys(environment)) if (INJECTED_GIT_CONFIG.test(name)) delete environment[name];
+      const overrides = Object.entries(options.gitConfig ?? {});
+      if (overrides.length > 0) environment["GIT_CONFIG_COUNT"] = String(overrides.length);
+      overrides.forEach(([key, value], index) => {
+        environment[`GIT_CONFIG_KEY_${index}`] = key;
+        environment[`GIT_CONFIG_VALUE_${index}`] = value;
+      });
+    }
     if (egress) {
       // The child receives only the loopback proxy route. Do not let a caller-supplied
       // environment retain an alternate proxy, no-proxy escape hatch, or credentials.
@@ -1808,6 +1821,8 @@ const SECRET_VALUE_SHAPES: readonly RegExp[] = [
 ];
 
 const authorityEnvironment = (name: string): boolean => AUTHORITY_ENV.some((pattern) => pattern.test(name));
+/** #1246 — git configuration carried by the environment; a worker turn's child inherits none of it. */
+const INJECTED_GIT_CONFIG = /^GIT_CONFIG_(?:PARAMETERS|COUNT|KEY_\d+|VALUE_\d+)$/;
 const looksLikeCredential = (value: string): boolean => SECRET_VALUE_SHAPES.some((pattern) => pattern.test(value.trim()));
 
 /**
@@ -2404,6 +2419,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       // completion under the holder's ownership proof. A packet reviewer's profile admits no holder.
       reapProcessGroup: request.isolation === undefined,
       workerTurn,
+      ...(workerTurn ? { gitConfig: request.gitConfig } : {}),
     });
 
     let result: Awaited<ReturnType<typeof runCli>>;
@@ -3132,7 +3148,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       // fails closed. The broker still authorises the checkout before launch.
       writablePaths: [...writablePaths, ...this.codexWritableRoots(scratch)],
       readablePaths: { subtrees: this.codexWritableRoots(scratch) },
-      ...(gptWorkerTurn ? { sandbox: "codex-workspace-write" as const, workerTurn: true } : {}),
+      ...(gptWorkerTurn ? { sandbox: "codex-workspace-write" as const, workerTurn: true, gitConfig: request.gitConfig } : {}),
       ...(tracked ? { onSpawn: request.onSpawn, signal: request.signal, reapProcessGroup: true as const } : {}),
     });
     let result: Awaited<ReturnType<typeof runCli>>;

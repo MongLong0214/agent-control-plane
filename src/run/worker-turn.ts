@@ -56,6 +56,7 @@ import {
   scanAgainst,
   stagedAgainst,
   stagedContent,
+  workerGitConfig,
 } from "./worker-git.ts";
 
 export type { WorkerCommitPort, WorkerDiffEntry } from "./worker-git.ts";
@@ -266,6 +267,8 @@ interface TurnFacts extends DurableFacts {
   config: string;
   /** Every git-dir entry before the turn (bar the index), as `gitDirEntries` read it. */
   gitDirEntries: readonly string[];
+  /** #1246 — the git configuration the worker's own git runs with, over the repository's (`workerGitConfig`). */
+  workerGitConfig: Readonly<Record<string, string>>;
   /** What the real index staged before the turn (`stagedContent`): its entries, never its stat cache. */
   stagedBaseline: string;
   /** #1097 — every ignored path's state before the turn (`ignoredPathState`), or why it could not be read. */
@@ -1253,6 +1256,7 @@ export class WorkerTurnRunner {
         config,
         stagedBaseline,
         ignoredBaseline,
+        workerGitConfig: await workerGitConfig(repo),
         gitDirEntries: gitDirEntries(repo),
       });
     } catch (error) {
@@ -1573,6 +1577,7 @@ export class WorkerTurnRunner {
         readOnly: false,
         correlationId: executionId,
         externalSessionId: facts.worker.externalSessionId,
+        gitConfig: facts.workerGitConfig,
         managedWrite: {
           operation: WriteOperation.FILE_MUTATION,
           targetPath: facts.claim.worktree,

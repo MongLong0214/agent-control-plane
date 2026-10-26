@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
@@ -25,7 +25,10 @@ import { FakeWorkerAdapter, seedWorkerWorld, type FakeTurnScript, type WorkerWor
  * - (c) the provider child of a WORKER turn, Codex's and Claude's, runs with `GIT_OPTIONAL_LOCKS=0`, so
  *   the status it runs takes no lock even on an index whose stat cache went stale after the baseline;
  * - (d) in a main checkout a plain `git status` that does rewrite a racily clean index changes nothing the
- *   git-dir comparison reads, before this change and after: the live main-checkout refusal is not this.
+ *   git-dir comparison reads, before this change and after: the live main-checkout refusal is not this;
+ * - (e) the repository's own configuration cannot make that read-only git write the git dir either: a
+ *   caching textconv driver's notes, or the builtin fsmonitor daemon's cookies. A worker that asks for
+ *   the cache itself is still refused.
  */
 
 const adapters: FakeWorkerAdapter[] = [];
@@ -125,15 +128,23 @@ interface CodexReport {
   racilyClean: boolean;
   status: string;
   indexRewritten: boolean;
+  /** `GIT_CONFIG_KEY_<n>` to `GIT_CONFIG_VALUE_<n>`, as the child's environment carries them. */
+  gitConfig: Record<string, string>;
 }
 
 /**
  * A codex stand-in. Its turn edits the owned file; with `stale`, it also leaves README.md's bytes as they
  * were with its mtime moved (a stale stat cache, after the baseline). It reads, without writing, whether
- * the index it found was racily clean, runs `git status --short` with the environment it was given, and
- * reports that environment and whether the index was rewritten.
+ * the index it found was racily clean, runs each of `commands` and then `git status --short` with the
+ * environment it was given, and reports that environment and whether the index was rewritten.
  */
-const stubCodex = (root: string, options: { stale: boolean }): string => {
+interface CodexScript {
+  stale?: boolean;
+  /** git argument lists run after the edit, before the status. */
+  commands?: string[][];
+}
+
+const stubCodex = (root: string, options: CodexScript): string => {
   const binary = join(root, "codex");
   writeFileSync(binary, `#!${process.execPath}
 import { execFileSync } from "node:child_process";
@@ -149,14 +160,17 @@ process.stdin.on("end", () => {
   const indexSecond = Math.floor(statSync(index).mtimeMs / 1000);
   const racilyClean = [...git("ls-files", "--debug").matchAll(/^  mtime: (\\d+):/gm)].some((match) => Number(match[1]) >= indexSecond);
   writeFileSync(join(process.cwd(), "src", "app.js"), ${JSON.stringify(CHANGE)});
-  if (${JSON.stringify(options.stale)}) {
+  if (${JSON.stringify(options.stale ?? false)}) {
     const past = Math.floor(Date.now() / 1000) - 120;
     utimesSync(join(process.cwd(), "README.md"), past, past);
   }
+  for (const command of ${JSON.stringify(options.commands ?? [])}) git(...command);
   const before = statSync(index).mtimeMs;
   const status = git("status", "--short");
   const indexRewritten = statSync(index).mtimeMs !== before;
-  const report = { optionalLocks: process.env.GIT_OPTIONAL_LOCKS ?? null, racilyClean, status, indexRewritten };
+  const gitConfig = Object.fromEntries(Array.from({ length: Number(process.env.GIT_CONFIG_COUNT ?? 0) },
+    (_, n) => [process.env["GIT_CONFIG_KEY_" + n], process.env["GIT_CONFIG_VALUE_" + n]]));
+  const report = { optionalLocks: process.env.GIT_OPTIONAL_LOCKS ?? null, racilyClean, status, indexRewritten, gitConfig };
   writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify(report));
   process.exit(0);
 });
@@ -166,7 +180,7 @@ process.stdin.on("end", () => {
 };
 
 /** One gpt WORKER turn on the real Codex adapter, its binary the stand-in above. */
-const codexTurn = async (world: WorkerWorld, options: { stale: boolean }) => {
+const codexTurn = async (world: WorkerWorld, options: CodexScript) => {
   world.db.run(`UPDATE sessions SET provider = 'gpt', model = 'gpt-6.1-sol' WHERE session_id = ?`, [world.worker.sessionId]);
   const root = tempDir("acp-codex-optional-locks-");
   const codex = new CodexCliAdapter({
@@ -184,7 +198,11 @@ const codexTurn = async (world: WorkerWorld, options: { stale: boolean }) => {
   if (!started.allowed) throw new Error(`${started.reasonCode}: ${started.message}`);
   await runner.settled(started.value.executionId);
   expect(answers).toHaveLength(1);
-  return { report: JSON.parse(answers[0]!.text) as CodexReport, outcome: outcomeOf(runner, world, started.value.executionId) };
+  return {
+    report: JSON.parse(answers[0]!.text) as CodexReport,
+    outcome: outcomeOf(runner, world, started.value.executionId),
+    diagnostics: diagnosticsOf(runner, world, started.value.executionId),
+  };
 };
 
 describe("#1246 (a) a gpt worker's git status on a freshly prepared, racily clean branch", () => {
@@ -196,6 +214,7 @@ describe("#1246 (a) a gpt worker's git status on a freshly prepared, racily clea
       racilyClean: true,
       status: " M src/app.js\n",
       indexRewritten: false,
+      gitConfig: { "core.fsmonitor": "false" },
       outcome: { status: "SUCCEEDED", reason: null },
     });
     expect(world.audit.byKind("TASK_BRANCH_PREPARED").map((row) => row.evidence)).toEqual([
@@ -265,7 +284,7 @@ describe("#1246 (d) a main checkout, racily clean, where the worker runs a plain
   });
 });
 
-describe("#1246 (c) a WORKER turn's provider child runs with GIT_OPTIONAL_LOCKS=0", () => {
+describe("#1246 (c) a WORKER turn's provider child runs with GIT_OPTIONAL_LOCKS=0 and core.fsmonitor=false", () => {
   it("codex (gpt): the status it runs on an index gone stale after the baseline takes no lock, and the turn succeeds", async () => {
     const world = seedWorkerWorld(makeCore(), { linkedWorktree: true });
     const { report, outcome } = await codexTurn(world, { stale: true });
@@ -289,7 +308,9 @@ import { join } from "node:path";
 const argv = process.argv.slice(2);
 const sessionId = argv[argv.indexOf("--session-id") + 1];
 writeFileSync(join(process.cwd(), "src", "app.js"), ${JSON.stringify(CHANGE)});
-const report = { optionalLocks: process.env.GIT_OPTIONAL_LOCKS ?? null };
+const gitConfig = Object.fromEntries(Array.from({ length: Number(process.env.GIT_CONFIG_COUNT ?? 0) },
+  (_, n) => [process.env["GIT_CONFIG_KEY_" + n], process.env["GIT_CONFIG_VALUE_" + n]]));
+const report = { optionalLocks: process.env.GIT_OPTIONAL_LOCKS ?? null, gitConfig };
 process.stdout.write(JSON.stringify({ type: "result", session_id: sessionId, result: JSON.stringify(report) }));
 `);
     chmodSync(binary, 0o700);
@@ -310,7 +331,65 @@ process.stdout.write(JSON.stringify({ type: "result", session_id: sessionId, res
     // No unconfined fallback exists: without seatbelt the turn cannot run, so this is skipped loudly.
     if (!seatbeltStatus().applies) requireSeatbelt(ctx);
     expect(answers).toHaveLength(1);
-    expect({ ...(JSON.parse(answers[0]!.text) as { optionalLocks: string | null }), outcome: outcomeOf(runner, world, started.value.executionId) })
-      .toEqual({ optionalLocks: "0", outcome: { status: "SUCCEEDED", reason: null } });
+    expect({ ...(JSON.parse(answers[0]!.text) as Record<string, unknown>), outcome: outcomeOf(runner, world, started.value.executionId) })
+      .toEqual({ optionalLocks: "0", gitConfig: { "core.fsmonitor": "false" }, outcome: { status: "SUCCEEDED", reason: null } });
+  });
+});
+
+describe("#1246 (e) the repository's own configuration cannot make the worker's read-only git write the git dir", () => {
+  /** A main checkout whose owner configured a caching textconv driver for the owned file before the turn. */
+  const cachingTextconvWorld = (): WorkerWorld => {
+    const world = seedWorkerWorld(makeCore());
+    gitSync(world.repoPath, ["config", "diff.demo.textconv", "cat"]);
+    gitSync(world.repoPath, ["config", "diff.demo.cachetextconv", "true"]);
+    mkdirSync(join(world.repoPath, ".git", "info"), { recursive: true });
+    writeFileSync(join(world.repoPath, ".git", "info", "attributes"), "src/app.js diff=demo\n");
+    return world;
+  };
+  const notesRef = (world: WorkerWorld): string | null => {
+    try {
+      return gitSync(world.repoPath, ["rev-parse", "--verify", "-q", "refs/notes/textconv/demo"]);
+    } catch {
+      return null;
+    }
+  };
+
+  it("a caching textconv driver: the worker's git diff after its edit stores no notes, and the turn succeeds", async () => {
+    const world = cachingTextconvWorld();
+    const { report, outcome } = await codexTurn(world, { commands: [["diff"]] });
+    expect({ gitConfig: report.gitConfig, outcome, notes: notesRef(world) }).toEqual({
+      gitConfig: { "core.fsmonitor": "false", "diff.demo.cachetextconv": "false" },
+      outcome: { status: "SUCCEEDED", reason: null },
+      notes: null,
+    });
+  });
+
+  it("a worker that turns the cache on for itself is still refused GIT_DIR_CHANGED, naming the notes ref", async () => {
+    const world = cachingTextconvWorld();
+    const { outcome, diagnostics } = await codexTurn(world, { commands: [["-c", "diff.demo.cachetextconv=true", "diff"]] });
+    expect(outcome).toEqual({ status: "FAILED", reason: "GIT_DIR_CHANGED" });
+    expect(diagnostics["gitDirChanges"]).toEqual(expect.arrayContaining([
+      { change: "added", root: "gitDir", path: "refs/notes/textconv/demo", kind: "file" },
+    ]));
+  });
+
+  it("core.fsmonitor=true: the worker's git status starts no fsmonitor daemon in the git dir, and the turn succeeds", async () => {
+    const world = seedWorkerWorld(makeCore());
+    gitSync(world.repoPath, ["config", "core.fsmonitor", "true"]);
+    try {
+      const { report, outcome } = await codexTurn(world, {});
+      expect({ status: report.status, outcome, daemonDir: existsSync(join(world.repoPath, ".git", "fsmonitor--daemon")) }).toEqual({
+        status: " M src/app.js\n",
+        outcome: { status: "SUCCEEDED", reason: null },
+        daemonDir: false,
+      });
+    } finally {
+      // Where a daemon did start (the tree before this change), it is stopped, never left running.
+      try {
+        shellGit(world.repoPath, ["fsmonitor--daemon", "stop"]);
+      } catch {
+        /* none was running */
+      }
+    }
   });
 });

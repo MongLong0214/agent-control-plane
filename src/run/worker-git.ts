@@ -474,6 +474,29 @@ export const gitDirEntries = (repo: PinnedRepository): string[] => {
   return entries;
 };
 
+/**
+ * #1246 — git configuration a WORKER turn's own git runs with, over the repository's (`GIT_CONFIG_COUNT`
+ * in its environment; see `productionRunCli`), so the read-only commands its prompt allows write nothing
+ * in the git dir where the repository's configuration would have them do so. Measured on git 2.50, with
+ * `GIT_OPTIONAL_LOCKS=0` already set:
+ * - `core.fsmonitor=false`: the builtin fsmonitor daemon a `git status` or `git diff` starts keeps
+ *   cookie files under the git dir (`fsmonitor--daemon/`), and outlives the turn;
+ * - `diff.<driver>.cachetextconv=false`, for every driver the repository's configuration names: a caching
+ *   textconv driver stores its output as notes (`refs/notes/textconv/<driver>`, objects, a reflog) on a
+ *   `git diff`, `show`, `log -p` or `blame`.
+ * Read through the pinned git: the repository's configuration and what it includes, not the provider
+ * user's global configuration.
+ */
+export const workerGitConfig = async (repo: PinnedRepository): Promise<Record<string, string>> => {
+  const cached = await runPinnedGit(repo, ["config", "-z", "--name-only", "--get-regexp", "^diff\\..*\\.cachetextconv$"]);
+  if (cached.exitCode !== 0 && cached.exitCode !== 1) {
+    throw new Error(`git config --get-regexp ${cached.exitCode === null ? "did not answer" : `exited ${cached.exitCode}`}: ${cached.stderr.slice(0, 300)}`);
+  }
+  const config: Record<string, string> = { "core.fsmonitor": "false" };
+  for (const key of cached.exitCode === 0 ? cached.stdout.split("\0").filter(Boolean) : []) config[key] = "false";
+  return config;
+};
+
 /** One git-dir entry that differs between two `gitDirEntries` readings; never its contents. */
 export interface GitDirChange {
   change: "added" | "removed" | "changed";
