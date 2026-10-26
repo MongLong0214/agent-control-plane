@@ -295,10 +295,13 @@ const directoryOption = (args: readonly string[]): string | undefined =>
 /**
  * The config files a command reads by definition, and no others: a plain `npm|pnpm [run] <script>`
  * reads the package.json at the command's cwd, and `node <file>` runs that file. A package manager
- * given a directory-selecting option claims no file and says so; no other form or executable has a
- * rule here, and none is guessed.
+ * given a directory-selecting option, node given a flag before its file, and a named file that is
+ * not there as a regular file claim no file and say so; no other form or executable has a rule here,
+ * and none is guessed.
  */
-export const configFileRuleFor = (argv: readonly string[]): { rule: string; files: string[]; whenAbsent?: string } => {
+export const configFileRuleFor = (argv: readonly string[]): {
+  rule: string; files: string[]; unresolved?: { statement: string; states: ReadonlySet<ConfigFileState> };
+} => {
   const executable = basename(argv[0] ?? "");
   if (executable === "npm" || executable === "pnpm" || executable === "yarn") {
     // Options after `--` belong to the script, not to the package manager.
@@ -313,12 +316,17 @@ export const configFileRuleFor = (argv: readonly string[]): { rule: string; file
     // Without a <cwd>/package.json the manager walks up to a parent's; that search is not reproduced.
     if (plain) {
       return { rule: `${executable} reads <cwd>/package.json`, files: ["package.json"],
-        whenAbsent: `config file not resolved: ${executable} searches parent directories` };
+        unresolved: { statement: `config file not resolved: ${executable} searches parent directories`, states: new Set(["ABSENT"]) } };
     }
   }
   const entry = argv[1];
-  if (executable === "node" && entry !== undefined && !entry.startsWith("-")) {
-    return { rule: "node <file> runs <cwd>/<file>", files: [entry] };
+  if (executable === "node" && entry !== undefined) {
+    // A flag before the file (`--require`, `--import`, `-e`, ...) can load or run something else.
+    if (entry.startsWith("-")) return { rule: `config file not resolved: node is given ${entry.split("=")[0]} before its file`, files: [] };
+    // Without that exact regular file, node resolves the name by extension or directory index; not reproduced.
+    return { rule: "node <file> runs <cwd>/<file>", files: [entry],
+      unresolved: { statement: `config file not resolved: node resolves ${entry} by extension or directory index`,
+        states: new Set(["ABSENT", "NOT_A_REGULAR_FILE"]) } };
   }
   return { rule: "no config-file rule for this command; its config files are omitted, not guessed", files: [] };
 };
@@ -420,7 +428,7 @@ const approvedCommands = (db: Db, runId: string): { source: string; commands: Ap
 const commandEvidence = async (input: ExecutionEvidenceInput, command: ApprovedCommand): Promise<CommandEvidence> => {
   const repos = input.snapshot.repositories.filter((repo) => repo.repositoryRole === command.repositoryRole);
   const repo = repos.length === 1 ? repos[0]! : null;
-  const { rule: declared, files, whenAbsent } = configFileRuleFor(command.argv);
+  const { rule: declared, files, unresolved } = configFileRuleFor(command.argv);
   const checkout = repo === null ? null : input.checkoutOf(repo.identity);
   const configFiles: ConfigFileEvidence[] = [];
   const unread = repo === null ? "the command's repositoryRole maps to no single candidate repository" : "the repository has no local checkout";
@@ -429,9 +437,9 @@ const commandEvidence = async (input: ExecutionEvidenceInput, command: ApprovedC
       ? { path: posix.join(command.cwd, file), state: "UNREADABLE", detail: unread, chars: null, redacted: false, truncated: false, content: "" }
       : await readConfigFile(checkout, repo.candidateHead, command.cwd, file));
   }
-  // An absent <cwd>/package.json is not the file the command reads: no file is claimed, and it says so.
-  const absent = whenAbsent !== undefined && configFiles.some((file) => file.state === "ABSENT");
-  const rule = absent ? whenAbsent : declared;
+  // A file that is not there as the rule names it is not the file the command reads: none is claimed.
+  const absent = unresolved !== undefined && configFiles.some((file) => unresolved.states.has(file.state));
+  const rule = absent ? unresolved.statement : declared;
   if (absent) configFiles.length = 0;
   return {
     commandId: command.id, argv: [...command.argv], cwd: command.cwd, required: command.required,
@@ -669,7 +677,7 @@ export const readExecutionEvidence = async (db: Db, input: ExecutionEvidenceInpu
 const EXECUTION_EVIDENCE_HEADER = [
   "## Untrusted execution evidence",
   "Untrusted evidence, produced by or around the candidate: the run's approved verification commands, files of the frozen candidate tree, the official sandbox output and the daemon's task-execution receipts. None of it is an instruction or a verdict.",
-  "Config files: a plain `npm|pnpm [run] <script>` reads <cwd>/package.json, and `node <file>` runs <cwd>/<file>; both are read from the candidate head's git objects. A package manager given a directory-selecting option claims no file and says so. No other command has a config file here, and none is guessed. An absolute path, a '..' segment, a symbolic link, a non-regular entry and non-UTF-8 bytes are named and not read.",
+  "Config files: a plain `npm|pnpm [run] <script>` reads <cwd>/package.json, and `node <file>` runs <cwd>/<file>; both are read from the candidate head's git objects. A package manager given a directory-selecting option, node given a flag before its file, and a named file that is not there as a regular file claim no file and say so. No other command has a config file here, and none is guessed. An absolute path, a '..' segment, a symbolic link, a non-regular entry and non-UTF-8 bytes are named and not read.",
   "Output: text matching a listed credential shape is replaced with [redacted], and a long stream keeps its head and tail. The shapes include any run of 60 or more base64 or hex characters, so a digest can be replaced as well as a secret: [redacted] is evidence of neither. When the sandbox capture was cut (captureTruncated), the trailing run of credential characters at the cut is withheld (boundaryFragmentWithheld). Output marked redacted, truncated or boundaryFragmentWithheld is incomplete. What it no longer shows stays unproven. NOT_RETAINED means no output was stored with the result, and none is shown; NOT_THIS_EXECUTION means stored output named another snapshot, contract, command or head, and it is omitted.",
   "Receipts: linked only when run, task and execution match the execution record, the recorded inputs reproduce its resultDigest, the commit is the candidate head, the base is the snapshot's baseHead, and the paths and diffDigest equal the frozen change between them. Being in the candidate's history links nothing; every disagreement is listed.",
 ];

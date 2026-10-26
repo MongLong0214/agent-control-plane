@@ -715,6 +715,31 @@ describe("#1223 R5: a serialized handoff path and an absent package.json", () =>
     } finally { setup.harness.cp.close(); }
   }, 60_000);
 
+  it("an extensionless or flagged `node <file>` claims no file; the exact path is unchanged", async () => {
+    const setup = await prepareRun([npmCommand("bare", ["node", "verify"]), npmCommand("exact", ["node", "verify.js"])],
+      (repoPath) => writeFiles(repoPath, { "package.json": PACKAGE_JSON }));
+    const { harness, run } = setup;
+    try {
+      startWorkBranch(harness.repoPath);
+      writeFiles(harness.repoPath, { "src/app.js": APP_BYTES });
+      commitAll(harness.repoPath, "make app() return 2");
+      const frozen = await harness.cp.pipeline.freeze(run.runId);
+      if (!frozen.allowed) throw new Error(frozen.message);
+      const evidence = await readExecutionEvidence(harness.cp.db, { runId: run.runId, snapshot: frozen.value,
+        snapshotDigest: candidateSnapshotDigest(frozen.value), contractDigest: run.contractDigest,
+        verification: { results: [] } as unknown as VerificationReport, checkoutOf: () => harness.repoPath });
+      const byId = new Map(evidence.commands.map((command) => [command.commandId, command]));
+      // The fixture holds only verify.js, which `node verify` runs.
+      expect(byId.get("bare")).toMatchObject({ configFileRule: "config file not resolved: node resolves verify by extension or directory index", configFiles: [] });
+      expect(byId.get("exact")).toMatchObject({ configFileRule: "node <file> runs <cwd>/<file>",
+        configFiles: [{ path: "verify.js", state: "INCLUDED" }] });
+    } finally { harness.cp.close(); }
+    for (const flag of ["--require", "-r", "--import", "--loader", "-e", "--eval", "-p"]) {
+      expect(configFileRuleFor(["node", flag, "x", "verify.js"]), flag).toEqual({ rule: `config file not resolved: node is given ${flag} before its file`, files: [] });
+    }
+    expect(configFileRuleFor(["node", "--import=x", "verify.js"]).files).toEqual([]);
+  }, 60_000);
+
   it("npm at a cwd without package.json claims no file, because npm searches parent directories", async () => {
     const setup = await prepareRun([npmCommand("tools", ["npm", "test"], "tools"), npmCommand("root", ["npm", "test"])],
       (repoPath) => writeFiles(repoPath, { "package.json": PACKAGE_JSON, "tools/run.js": "console.log(1);\n" }));
