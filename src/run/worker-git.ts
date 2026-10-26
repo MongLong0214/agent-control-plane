@@ -512,8 +512,9 @@ const readWorktreePath = (
  * directory while a session holds a session-only cron, and a resident CTO runs in the registered
  * clone that worker turns also use. It is the CLI's runtime cron lock, not agent configuration: no
  * CLI loads settings, permissions, hooks or servers from it. Only a regular file at exactly this
- * root path, under a real `.claude` directory, is passed over; a symlink or a directory there, and
- * every other `.claude` path or `.mcp.json`, is reported as before. Never an entry, so never committed.
+ * root path, under a real `.claude` directory, is passed over; anything else there (a symlink, a
+ * directory, even an empty one, a fifo) is unsafe agent configuration, and every other `.claude` path
+ * or `.mcp.json` is reported as before. Never an entry, so never committed.
  */
 export const CLAUDE_CRON_LOCK_PATH = ".claude/scheduled_tasks.lock";
 
@@ -578,6 +579,15 @@ export const scanAgainst = async (
     const now = readWorktreePath(repo.workTree, path.replace(/\/$/, ""), format);
     if (now.kind === "entry") entries.push(now.entry);
     else unsafe.push(path);
+  }
+  // Git lists no empty directory, fifo or socket, so the reserved lock path is read directly: anything
+  // there but a regular file is unsafe agent configuration, whatever git listed.
+  const reserved = lstatOrNull(join(repo.workTree, CLAUDE_CRON_LOCK_PATH));
+  if (reserved !== null && !reserved.isFile()) {
+    if (!unsafe.includes(CLAUDE_CRON_LOCK_PATH)) unsafe.push(CLAUDE_CRON_LOCK_PATH);
+    if (!tracked.has(CLAUDE_CRON_LOCK_PATH) && !untrackedAgentConfiguration.includes(CLAUDE_CRON_LOCK_PATH)) {
+      untrackedAgentConfiguration.push(CLAUDE_CRON_LOCK_PATH);
+    }
   }
   return {
     entries: entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)),

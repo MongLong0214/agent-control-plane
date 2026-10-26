@@ -1,4 +1,5 @@
-import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { lstatSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
@@ -172,6 +173,27 @@ describe("the resident CTO's Claude Code cron lock does not keep a worker turn f
       await expectRefused(target, `${CLAUDE_CRON_LOCK_PATH}/inner`);
     });
 
+    it("an empty directory at the lock path, which git does not list", async () => {
+      const target = world();
+      mkdirSync(join(target.repoPath, CLAUDE_CRON_LOCK_PATH), { recursive: true });
+      await expectRefused(target, CLAUDE_CRON_LOCK_PATH);
+      expect(lstatSync(join(target.repoPath, CLAUDE_CRON_LOCK_PATH)).isDirectory()).toBe(true);
+    });
+
+    it("an empty directory at the lock path, ignored by git", async () => {
+      const target = world({ ignored: ".claude/" });
+      mkdirSync(join(target.repoPath, CLAUDE_CRON_LOCK_PATH), { recursive: true });
+      await expectRefused(target, CLAUDE_CRON_LOCK_PATH);
+    });
+
+    it("a fifo at the lock path, which git does not list", async () => {
+      const target = world();
+      mkdirSync(join(target.repoPath, ".claude"), { recursive: true });
+      execFileSync("mkfifo", [join(target.repoPath, CLAUDE_CRON_LOCK_PATH)]);
+      await expectRefused(target, CLAUDE_CRON_LOCK_PATH);
+      expect(lstatSync(join(target.repoPath, CLAUDE_CRON_LOCK_PATH)).isFIFO()).toBe(true);
+    });
+
     it("a .claude that is a symlink to a directory holding the lock", async () => {
       const target = world();
       const elsewhere = tempDir("acp-cron-lock-dir-");
@@ -179,5 +201,40 @@ describe("the resident CTO's Claude Code cron lock does not keep a worker turn f
       symlinkSync(elsewhere, join(target.repoPath, ".claude"));
       await expectRefused(target, ".claude");
     });
+  });
+
+  describe("D: a lock the turn replaced with anything but a regular file fails the turn, uncommitted", () => {
+    for (const ignored of [undefined, ".claude/"] as const) {
+      it(`a regular lock swapped for an empty directory mid-turn${ignored === undefined ? "" : ` (ignored by ${ignored})`}`, async () => {
+        const target = world(ignored === undefined ? {} : { ignored });
+        placeLock(target);
+        const adapter = fakeFor(target);
+        adapter.script = {
+          writes: { "src/app.js": "module.exports = () => 2;\n" },
+          whileLatched: () => {
+            rmSync(join(target.repoPath, CLAUDE_CRON_LOCK_PATH));
+            mkdirSync(join(target.repoPath, CLAUDE_CRON_LOCK_PATH));
+          },
+        };
+        const runner = runnerFor(target, adapter);
+        const base = head(target);
+        const started = await start(target, runner);
+        if (!started.allowed) throw new Error(`start refused: ${started.reasonCode} ${started.message}`);
+        await runner.settled(started.value.executionId);
+
+        expect(adapter.launches).toBe(1);
+        expect(target.tasks.execution(started.value.executionId)!.status).toBe("FAILED");
+        const view = runner.describe(started.value.executionId, target.runId);
+        if (!view.allowed) throw new Error(view.message);
+        expect(view.value.success).toBeNull();
+        const evidence = view.value.diagnostics!.evidence;
+        expect(evidence["reason"]).toBe("OUT_OF_SCOPE");
+        expect(evidence["uncovered"]).toContain(CLAUDE_CRON_LOCK_PATH);
+        expect(evidence["agentConfiguration"]).toContain(CLAUDE_CRON_LOCK_PATH);
+        expect(head(target)).toBe(base);
+        expect(gitSync(target.repoPath, ["log", "--all", "--format=%H", "--", ".claude"])).toBe("");
+        expect(lstatSync(join(target.repoPath, CLAUDE_CRON_LOCK_PATH)).isDirectory()).toBe(true);
+      });
+    }
   });
 });
