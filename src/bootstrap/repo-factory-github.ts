@@ -1744,7 +1744,9 @@ export const applyGitHubOperations = async (
     const repository = await confirmRepository(id); if (!repository.allowed) return repository as Decision<Step>;
     if (!port.observeGenesisResources || !port.ensureGenesisResources) return stop(ReasonCode.VERIFICATION_GAP,"GENESIS_RESOURCES_UNSUPPORTED","GitHub port cannot provision genesis resources",id,{},false);
     const prior = input.prior.receipts.get(id);
-    let observed = await remote(id,() => port.observeGenesisResources!(target,operation.desiredState));
+    // #1240 — the readback is bound to the repository confirmRepository just matched to its receipted node id.
+    const bound = { repositoryNodeId: repository.value.nodeId };
+    let observed = await remote(id,() => port.observeGenesisResources!(target,operation.desiredState,bound));
     if (!observed.allowed) return observed as Decision<Step>;
     if (prior && (observed.value === null || digestOf(observed.value) !== digestOf(prior.observed))) return stop(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"RESUMED_RESOURCE_DRIFTED","genesis resources drifted",id,{},false);
     const intent = pending.get(id) ?? {operationId:id,resourceType:operation.resourceType,resourceIdentity:operation.resourceIdentity,attemptedAt:clock.nowIso(),preexisting:false,beforeStateDigest:null,marker:null,respondedNodeId:null,pushedHead:null};
@@ -1754,7 +1756,7 @@ export const applyGitHubOperations = async (
     if (!observed.value) {
       begin(intent);
       const written = await remote(id,() => port.ensureGenesisResources!(target,operation.desiredState,{reconcileExistingLabels})); if (!written.allowed) return written as Decision<Step>;
-      observed = await remote(id,() => port.observeGenesisResources!(target,operation.desiredState));
+      observed = await remote(id,() => port.observeGenesisResources!(target,operation.desiredState,bound));
     }
     if (!observed.allowed) return observed as Decision<Step>;
     if (!observed.value) return stop(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,"REREAD_MISMATCH","genesis resource readback failed",id,{},true);

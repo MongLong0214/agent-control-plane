@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { digestOf } from '../core/digest.ts';
+import { acpError, isAcpError } from '../core/errors.ts';
+import { ReasonCode } from '../core/reason-codes.ts';
+import { workUnitMarkers } from './work-unit-marker.ts';
 import type { ProjectManifest } from '../contracts/manifest.ts';
 
 const text = z.string().max(1_000_000);
@@ -39,6 +42,53 @@ export function screenPublicText(value: string): void {
 const publicStrings = (value: unknown): string[] =>
   typeof value === 'string' ? [value] : Array.isArray(value) ? value.flatMap(publicStrings)
     : value !== null && typeof value === 'object' ? Object.values(value).flatMap(publicStrings) : [];
+const refuseGenesis = (refusal: string, message: string, evidence: Record<string, unknown>): never => {
+  throw acpError(ReasonCode.INVALID_ARGUMENT, message, { refusal, ...evidence });
+};
+/**
+ * #1240 — the genesis issues' structure and linkage, never their content: a work-unit marker links an
+ * issue to one approved unit (`work-unit-marker.ts`), and blind review judges whether the issue covers it.
+ * A genesis has at least one issue and one milestone, and every issue links a milestone (a product
+ * stage). Once any issue carries a marker, every issue carries
+ * exactly one, as its last line; all name the same n; there are n issues; the k are exactly 1..n; and no
+ * key is on two issues. An issue with no marker is valid only as the single issue of a single-unit plan.
+ * The units are the request's declared work units, as Repo Factory numbered them; nothing here counts
+ * requirements. Each refusal names itself in `refusal`, with the issues, indices or keys it is about.
+ */
+const assertWorkUnits = (bundle: Pick<GenesisBundle, 'issues' | 'milestones'>): void => {
+  const { issues } = bundle;
+  // A genesis tracks its approved work as issues in milestones: with none of either it tracks nothing.
+  if (issues.length === 0 || bundle.milestones.length === 0) refuseGenesis('GENESIS_BACKLOG_MISSING', `the genesis declares ${issues.length} issues and ${bundle.milestones.length} milestones; it needs at least one of each`, { issueCount: issues.length, milestoneCount: bundle.milestones.length });
+  const unlinked = issues.filter(issue => issue.milestoneKey === null).map(issue => issue.key);
+  if (unlinked.length > 0) refuseGenesis('GENESIS_ISSUE_MILESTONE_MISSING', `genesis issues ${unlinked.join(', ')} link no milestone`, { issues: unlinked });
+  const read = issues.map(issue => ({ issue: issue.key, ...workUnitMarkers(issue.body) }));
+  if (read.every(r => r.markers.length === 0)) {
+    if (issues.length > 1) refuseGenesis('GENESIS_WORK_UNITS_UNMARKED', `${issues.length} genesis issues carry no work-unit marker; an unmarked issue is valid only as the single issue of a single-unit plan`, { issues: issues.map(issue => issue.key) });
+    return;
+  }
+  const unmarked = read.filter(r => r.markers.length === 0).map(r => r.issue);
+  if (unmarked.length > 0) refuseGenesis('GENESIS_WORK_UNIT_UNMARKED', `genesis issues ${unmarked.join(', ')} carry no work-unit marker beside marked ones`, { issues: unmarked });
+  const misplaced = read.filter(r => r.markers.length > 1 || r.last === null).map(r => r.issue);
+  if (misplaced.length > 0) refuseGenesis('GENESIS_WORK_UNIT_MARKER_NOT_ONE_LAST_LINE', `genesis issues ${misplaced.join(', ')} carry more than one work-unit marker, or one that is not the body's last line`, { issues: misplaced });
+  const units = read.map(r => ({ issue: r.issue, ...r.last! }));
+  const totals = [...new Set(units.map(u => u.n))];
+  if (totals.length > 1) refuseGenesis('GENESIS_WORK_UNIT_MIXED_TOTAL', `genesis issues name different unit totals: ${totals.join(', ')}`, { totals });
+  const total = totals[0]!;
+  if (issues.length !== total) refuseGenesis('GENESIS_WORK_UNIT_COUNT_MISMATCH', `the work-unit markers name ${total} units and the genesis has ${issues.length} issues`, { total, issueCount: issues.length });
+  const indices = units.map(u => u.k);
+  const missing = Array.from({ length: total }, (_, index) => index + 1).filter(k => !indices.includes(k));
+  const repeated = [...new Set(indices.filter((k, index) => indices.indexOf(k) !== index))];
+  if (missing.length > 0 || repeated.length > 0) refuseGenesis('GENESIS_WORK_UNIT_INDEX_MISMATCH', `the work-unit indices are not exactly 1..${total}`, { total, missing, repeated, unexpected: indices.filter(k => k > total) });
+  const keys = units.map(u => u.key);
+  const duplicated = [...new Set(keys.filter((key, index) => keys.indexOf(key) !== index))];
+  if (duplicated.length > 0) refuseGenesis('GENESIS_WORK_UNIT_KEY_DUPLICATE', `work-unit keys ${duplicated.join(', ')} are each on more than one issue`, { keys: duplicated, issues: units.filter(u => duplicated.includes(u.key)).map(u => u.issue) });
+};
+/** #1240 — a work-unit refusal `parseGenesis` threw, with what it names; null for any other failure. */
+export const genesisRefusalOf = (error: unknown): Record<string, unknown> | null => {
+  if (!isAcpError(error)) return null;
+  const evidence = error.evidence as Record<string, unknown>;
+  return typeof evidence['refusal'] === 'string' && evidence['refusal'].startsWith('GENESIS_') ? { ...evidence } : null;
+};
 export function parseGenesis(value: unknown, manifest?: ProjectManifest): GenesisBundle {
   const bundle = genesisBundleSchema.parse(value);
   const paths = new Set<string>();
@@ -63,6 +113,7 @@ export function parseGenesis(value: unknown, manifest?: ProjectManifest): Genesi
   for (const issue of bundle.issues) {
     if (issue.labels.some(l => !bundle.labels.some(x => x.name === l)) || (issue.milestoneKey !== null && !bundle.milestones.some(m => m.key === issue.milestoneKey))) throw new Error('unknown issue label/milestone');
   }
+  assertWorkUnits(bundle);
   if (manifest) {
     if (!/^[a-z0-9][a-z0-9._-]{0,80}$/.test(manifest.projectId)) throw new Error("project id must be safe for resident allocation");
     const profile = manifest.branchProfile;

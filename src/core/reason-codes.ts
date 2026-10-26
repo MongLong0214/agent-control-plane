@@ -380,6 +380,12 @@ export const ReasonCode = {
   RELEASE_TAG_COMMIT_NOT_ACCEPTED: "RELEASE_TAG_COMMIT_NOT_ACCEPTED",
   RELEASE_TAG_DUPLICATE: "RELEASE_TAG_DUPLICATE",
   ISSUE_PROJECTION_UNVERIFIED: "ISSUE_PROJECTION_UNVERIFIED",
+  /**
+   * #1240 — a Repo Factory project's STANDARD_WORK run has approved work units that GitHub has not
+   * been read back to hold as issues linked to the run's goal milestone; none of the run's work is
+   * admitted to execution until it has. The evidence names each untracked unit and what is unmet.
+   */
+  WORK_SCOPE_NOT_TRACKED_ON_GITHUB: "WORK_SCOPE_NOT_TRACKED_ON_GITHUB",
   HOTFIX_PROPAGATION_INCOMPLETE: "HOTFIX_PROPAGATION_INCOMPLETE",
 
   // --- capacity ------------------------------------------------------------

@@ -591,7 +591,16 @@ describe("witness 1 — the driven work prompt carries a STANDARD_WORK run past 
       expect(directive).toContain('provider "claude" with no model');
       expect(directive).toContain("result_submit runs the blind review itself");
       expect(directive).toContain("Never submit that run's PLAN again");
+      // #1239 — a re-plan names the earlier tasks it replaces in supersedesTaskIds.
       expect(directive).toContain("names their taskIds in its plan's supersedesTaskIds, which cancels exactly those");
+      // #1240 — a Repo Factory project's PLAN declares its work units, adopting existing issues first; a
+      // PLAN that only declares or re-links them may be submitted again, with tasks omitted.
+      expect(directive).toContain("only a PLAN that declares or re-links a Repo Factory project's workUnits, with tasks omitted, may be submitted again, and it supersedes nothing");
+      expect(directive).toContain("the PLAN also declares plan.workUnits, each {key, tasks: [this PLAN's task keys or the run's task ids], issue: {number} | {new: {title, body}}, milestone: {number} | {new: {title}}}");
+      expect(directive).toContain("adopt the existing issue and milestone by number first");
+      expect(directive).toContain("the tasks of one deliverable (its implementation, review and correction) share one unit");
+      expect(directive).toContain("every live task is in exactly one (a task the PLAN supersedes is in none)");
+      expect(directive).toContain("a plan_submit that only declares or re-links workUnits omits tasks");
       // The project's bootstrap run's BOOTSTRAP_CTO turns, on the same double: no worker step at all.
       const bootstrapPrompts = f.claude.turns
         .filter((turn) => turn.relay !== null && !/nonce set to/.test(turn.prompt) && /You are the BOOTSTRAP_CTO/.test(turn.prompt))

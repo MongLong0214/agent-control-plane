@@ -31,6 +31,7 @@ import type { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
 import { TaskWriteTargets } from "../run/task-write-target.ts";
+import type { WorkScopeDeclaration } from "../run/work-scope-tracking.ts";
 import { WORKER_TURN_MAX_TIMEOUT_MS, type WorkerTurnRequest, type WorkerTurnRunner } from "../run/worker-turn.ts";
 import type { WorkerProvisionRequest, WorkerStaffing } from "../run/worker-staffing.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -273,6 +274,44 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       return allow(ReasonCode.OK, { digest: source.artifacts.put(runId, ArtifactKind.PLAN, bootstrapPlanDigest ? { ...stored, bootstrapPlanDigest } : stored).digest });
     },
     submitTasks: (runId: string, tasks: Parameters<TaskGraph["submit"]>[1]) => source.tasks.submit(runId, tasks),
+    workScope: () => source.tasks.workScope,
+    // #1240 review R6 — the PLAN as `acceptWorkUnitsPlan` would store it, its sequence aside, matched against
+    // the run's current PLAN: an identical resend answers that PLAN's tasks and stores nothing.
+    workUnitsReplay: (runId: string, plan: Record<string, unknown>, tasks: Parameters<TaskGraph["submit"]>[1], owner: { sessionId: string; bindingGeneration: number }, bootstrapPlanDigest?: string) => {
+      const scope = source.tasks.workScope;
+      const admitted = planForSubmission(source.runs.require(runId), plan);
+      if (scope === null || !admitted.allowed) return null;
+      return scope.replay(runId, bootstrapPlanDigest ? { ...admitted.value, bootstrapPlanDigest } : admitted.value, tasks, owner);
+    },
+    // #1240 — a Repo Factory PLAN that declares work units is accepted all or nothing: the PLAN, its tasks,
+    // the cancel of the earlier tasks it names in `supersedesTaskIds` (#1239) and the approval commit in one
+    // transaction, and any refusal rolls all of them back, so the PLAN and approval accepted before stay
+    // current and nothing is cancelled. The PLAN is stored with its submission's sequence, so the artifact
+    // store's content dedup never hands back an earlier PLAN: each accepted one is the latest.
+    acceptWorkUnitsPlan: (
+      runId: string,
+      plan: Record<string, unknown>,
+      tasks: Parameters<TaskGraph["submit"]>[1],
+      declaration: WorkScopeDeclaration,
+      owner: { sessionId: string; bindingGeneration: number },
+      bootstrapPlanDigest?: string,
+    ) =>
+      source.db.txDecision((): ReturnType<TaskGraph["submit"]> => {
+        const scope = source.tasks.workScope;
+        if (scope === null) return deny(ReasonCode.INTERNAL_ERROR, "work-unit tracking is not composed", { runId });
+        const submission = (source.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN'`, [runId])?.n ?? 0) + 1;
+        const stored = port.submitPlan(runId, { ...plan, submission }, bootstrapPlanDigest);
+        if (!stored.allowed) return stored as Decision<never>;
+        // A PLAN that supersedes earlier tasks adds the ones that replace them: the task graph refuses an
+        // empty submission, so a units-only re-submit (tasks omitted) supersedes nothing.
+        const supersedes = plan["supersedesTaskIds"] as string[] | undefined;
+        const submitted = tasks.length === 0 && supersedes === undefined
+          ? allow(ReasonCode.OK, [])
+          : source.tasks.submit(runId, tasks, supersedes === undefined ? undefined : { planDigest: stored.value.digest, taskIds: supersedes });
+        if (!submitted.allowed) return submitted;
+        const approved = scope.approve(runId, stored.value.digest, declaration, tasks, submitted.value, owner);
+        return approved.allowed ? submitted : (approved as Decision<never>);
+      }),
     // CEO msg_2b439e5a — a STANDARD_WORK PLAN that names `supersedesTaskIds` is all or nothing: the PLAN
     // write, the cancel of exactly the named tasks ("superseded by PLAN <digest>") and the new tasks
     // commit in one transaction, and any refusal rolls every one of them back. A PLAN without the field
@@ -327,7 +366,11 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       source.tasks.startWorkerExecution(input),
     taskRunningWidth: (runId: string) => source.tasks.runningWidth(runId),
     // #512 — the runtime launches and owns a worker turn; the CTO names run, task and claim only.
-    startWorkerTurn: (input: WorkerTurnRequest) => source.workerTurns.start(input),
+    // #1240 — refused before the turn records a write target or makes a branch for an untracked unit.
+    startWorkerTurn: async (input: WorkerTurnRequest) => {
+      const tracked = await source.tasks.ensureWorkScopeTracked(input.runId, input.taskId);
+      return tracked.allowed ? source.workerTurns.start(input) : (tracked as Decision<never>);
+    },
     workerExecution: (executionId: string, runId: string) => source.workerTurns.describe(executionId, runId),
     executionIsRuntimeManaged: (executionId: string) => source.tasks.execution(executionId)?.runtimeManaged === true,
     taskIsRuntimeManaged: (taskId: string) =>
@@ -342,6 +385,9 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     // is refused by name in `writeTargetRefused`; the worker stays staffed, and a claim has nothing to
     // take until the CTO escalates. Any other run kind is answered exactly as before.
     provisionWorker: async (request: WorkerProvisionRequest) => {
+      // #1240 — no worker is staffed for a Repo Factory project's work GitHub does not track yet.
+      const tracked = await source.tasks.ensureWorkScopeTracked(request.runId, request.taskId);
+      if (!tracked.allowed) return tracked as Decision<never>;
       const provisioned = await source.workers.provision(request);
       if (!provisioned.allowed) return provisioned;
       const fence = () => {
@@ -634,15 +680,44 @@ const createCtoServerFromPort = (
         tasks: submittedTasksSchema.optional(),
       },
     },
-    async (args) => writeOwned("plan_submit", args, () => {
+    async (args) => writeOwned("plan_submit", args, async (_peer, fenced) => {
       const resolved = port.resolvePlanInput(args.runId, args);
       if (!resolved.allowed) return respond(resolved);
       const { plan, tasks, bootstrapPlanDigest } = resolved.value;
       if (port.isProjectlessBootstrapRun(args.runId)) return respond(port.submitBootstrapPlan(args.runId, plan, tasks, bootstrapPlanDigest));
-      if (plan["supersedesTaskIds"] !== undefined) return respond(port.submitSupersedingPlan(args.runId, plan, tasks, bootstrapPlanDigest));
-      const stored = port.submitPlan(args.runId, plan, bootstrapPlanDigest);
-      if (!stored.allowed) return respond(stored);
-      return respond(port.submitTasks(args.runId, tasks));
+      // #1240 — a Repo Factory project's PLAN declares its work units; refused before anything is stored.
+      const scope = port.workScope();
+      // An identical resend of the current work-unit PLAN is a no-op success with its tasks (review R6).
+      const replayed = scope === null ? null : port.workUnitsReplay(args.runId, plan, tasks, fenced, bootstrapPlanDigest);
+      if (scope !== null && replayed !== null) {
+        const tracking = await scope.ensure(args.runId);
+        return respond(allow(ReasonCode.OK, replayed, {
+          replayed: true,
+          githubTracking: tracking.allowed
+            ? { tracked: true, scope: tracking.value as Record<string, unknown> }
+            : { tracked: false, reasonCode: tracking.reasonCode, message: tracking.message, ...tracking.evidence },
+        }));
+      }
+      const declared = scope === null ? allow(ReasonCode.OK, null) : scope.declare(args.runId, plan, tasks);
+      if (!declared.allowed) return respond(declared);
+      if (scope === null || declared.value === null) {
+        if (tasks.length === 0) return respond(deny(ReasonCode.INVALID_ARGUMENT, "plan_submit requires plan and tasks, or bootstrapPlanDigest"));
+        if (plan["supersedesTaskIds"] !== undefined) return respond(port.submitSupersedingPlan(args.runId, plan, tasks, bootstrapPlanDigest));
+        const stored = port.submitPlan(args.runId, plan, bootstrapPlanDigest);
+        if (!stored.allowed) return respond(stored);
+        return respond(port.submitTasks(args.runId, tasks));
+      }
+      const submitted = port.acceptWorkUnitsPlan(args.runId, plan, tasks, declared.value, fenced, bootstrapPlanDigest);
+      if (!submitted.allowed) return respond(submitted);
+      // Accepted: the units are synchronized now. GitHub's answer does not undo the accepted PLAN; it is
+      // reported beside it, and admission refuses each unit GitHub does not yet hold, naming it.
+      const tracking = await scope.ensure(args.runId);
+      return respond(allow(submitted.reasonCode, submitted.value, {
+        ...submitted.evidence,
+        githubTracking: tracking.allowed
+          ? { tracked: true, scope: tracking.value as Record<string, unknown> }
+          : { tracked: false, reasonCode: tracking.reasonCode, message: tracking.message, ...tracking.evidence },
+      }));
     }),
   );
   server.registerTool(

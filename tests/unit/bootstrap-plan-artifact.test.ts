@@ -2231,7 +2231,7 @@ describe("private bootstrap review originals and serving runtime", () => {
       const body = JSON.stringify(bundle);
       const input = JSON.parse(f.body);
       input.plan.genesis.issues = Array.from({ length: 7 }, (_, i) => ({ ...input.plan.genesis.issues[0],
-        key: `i${i + 1}`, title: `Seeded issue ${i + 1}`, body: `Acceptance for issue ${i + 1}: https://example.test/issues/${i + 1}` }));
+        key: `i${i + 1}`, title: `Seeded issue ${i + 1}`, body: `Acceptance for issue ${i + 1}: https://example.test/issues/${i + 1}\n\nWork unit ${i + 1} of 7: i${i + 1}` }));
       delete input.plan.githubOperations;
       const normalized = planForSubmission(f.run, input.plan);
       if (!normalized.allowed) throw new Error(normalized.message);
