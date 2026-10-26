@@ -12,6 +12,7 @@ import {
   type GatePayload,
 } from "../../src/github/github-kernel.ts";
 import { classifyBranch, validateBranchContract } from "../../src/github/branch-contract.ts";
+import { createHermesMcpPort } from "../../src/mcp/hermes-server.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { candidateSnapshotDigest, type CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeRepo, writeFiles } from "../helpers/fixtures.ts";
@@ -1014,6 +1015,17 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
     );
     expect(verified.allowed).toBe(false);
     expect(verified.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
+
+    // #1257 — the receipt this verification wrote is what project_get reads back as an observed FAIL.
+    const projectId = fixture.harness.cp.runs.require(fixture.runId).projectId!;
+    expect(createHermesMcpPort(fixture.harness.cp).projectView(projectId)?.ci).toMatchObject({
+      declared: true,
+      workflows: [{
+        checkName: "project-ci",
+        unobserved: false,
+        lastObserved: { result: "FAIL", conclusion: "failure", commitSha: merged.value.mergeCommitSha, source: { runId: fixture.runId } },
+      }],
+    });
 
     const dependent = fixture.harness.cp.github.dependentMergeBlocked(fixture.runId, fixture.identity);
     expect(dependent.allowed).toBe(false);
