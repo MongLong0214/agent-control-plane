@@ -1,0 +1,16 @@
+Limit: supersedes the Limit of r-7870e008b911: a multi-task freeze now builds its candidate from every SUCCEEDED task's recorded commit on the pinned base, ordered by the run's dependsOn graph (ties by task id), each later task joined by a plumbing-written merge commit so every task commit is an ancestor; no task branch, ref or the checkout is moved (S-TB-02 holds)
+Limit: conflicts are path-level: two tasks changing the same path, or a path and one beneath it, refuse the freeze naming both tasks and paths; file contents are never merged, so edits to different parts of one file are refused rather than merged
+Warn: no ref points at the integrated commit once its throwaway worktree is gone, so git gc --prune=now in that checkout would delete it (fails closed, untested); freshness of an integrated candidate compares the checkout with the recorded HEAD, not task branches; publish and blind review on an integrated candidate, multi-repository runs and a crash mid integration are not exercised
+Record-Id: r-065d6daafa03
+Provenance: inherited b9ebc2dcb8eb316d7337194b6e735c2b54028df1
+
+Limit: freeze's final check refuses CANDIDATE_MISSING_TASK_COMMIT when any SUCCEEDED task's recorded commit is not an ancestor of the candidate head, integrated or not; integration and the check read the same succeededTaskCommits list, so a task the integration cannot place is refused rather than dropped silently
+Warn: a SUCCEEDED execution whose TASK_WORKER_TURN_SUCCEEDED audit row does not match its executionId and resultDigest is not read by either the integration or the check; that case is out of reach here and relies on the worker write path's digest binding
+Record-Id: r-0f8f8fb6a807
+Provenance: inherited 4ccf0d33342a39d3daaf6a33e85b13550e4af2d0
+
+Limit: every site that compares the live checkout with a candidate (snapshot freshness, the production gate's packet and CONFIRM check, the self-contained verification checkout) uses expectedCheckoutHead: integration.checkoutHead for an integrated candidate, else the candidate (review S6-R1 P1)
+Limit: with two or more task commits, freeze also checks content: each path a task changed against its pinned base must have that task's mode and blob in the candidate tree, else CANDIDATE_MISSING_TASK_CHANGE; ancestry alone is not trusted (review S6-R1 P1, merge -s ours repro)
+Warn: the integrated commit is kept alive by refs/acp/candidates/<runId>/<digest16> written through the guard under a transient claim; refs are removed only when a later freeze supersedes them, so a finished run keeps its last ref; publication still names the PR branch after the checkout's current branch
+Record-Id: r-6d07443c56db
+Provenance: inherited 86cd3f43bc77b653d735422299d7a2d458c1a514
