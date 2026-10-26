@@ -508,9 +508,25 @@ const readWorktreePath = (
 };
 
 /**
+ * The one untracked path under `.claude` a scan passes over. Claude Code writes it in its working
+ * directory while a session holds a session-only cron, and a resident CTO runs in the registered
+ * clone that worker turns also use. It is the CLI's runtime cron lock, not agent configuration: no
+ * CLI loads settings, permissions, hooks or servers from it. Only a regular file at exactly this
+ * root path, under a real `.claude` directory, is passed over; a symlink or a directory there, and
+ * every other `.claude` path or `.mcp.json`, is reported as before. Never an entry, so never committed.
+ */
+export const CLAUDE_CRON_LOCK_PATH = ".claude/scheduled_tasks.lock";
+
+const isClaudeCronLock = (workTree: string, path: string): boolean =>
+  path === CLAUDE_CRON_LOCK_PATH &&
+  lstatOrNull(join(workTree, ".claude"))?.isDirectory() === true &&
+  lstatOrNull(join(workTree, CLAUDE_CRON_LOCK_PATH))?.isFile() === true;
+
+/**
  * The worktree against a tree: tracked paths whose bytes or mode differ, untracked paths git does not
- * ignore, and the root's untracked agent configuration. Computed from the raw bytes; git is asked only
- * for the tree (`ls-tree`) and, over a private index read from that tree, for untracked names.
+ * ignore, and the root's untracked agent configuration; an untracked `CLAUDE_CRON_LOCK_PATH` is in
+ * neither. Computed from the raw bytes; git is asked only for the tree (`ls-tree`) and, over a private
+ * index read from that tree, for untracked names.
  */
 export const scanAgainst = async (
   repo: PinnedRepository,
@@ -528,12 +544,13 @@ export const scanAgainst = async (
   }
   const index = join(repo.scratch, `${label}.index`);
   await must(repo, ["read-tree", treeIsh], { index });
-  const untracked = (await must(repo, ["ls-files", "-z", "--others", "--exclude-standard"], { index })).split("\0").filter(Boolean);
+  const counted = (path: string): boolean => path !== "" && !isClaudeCronLock(repo.workTree, path);
+  const untracked = (await must(repo, ["ls-files", "-z", "--others", "--exclude-standard"], { index })).split("\0").filter(counted);
   const untrackedAgentConfiguration = (await must(
     repo,
     ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", ".claude", ".mcp.json"],
     { index },
-  )).split("\0").filter(Boolean);
+  )).split("\0").filter(counted);
 
   const entries: WorkerDiffEntry[] = [];
   const unsafe: string[] = [];
