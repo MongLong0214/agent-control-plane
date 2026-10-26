@@ -237,6 +237,7 @@ const REPOSITORY_PATH_FIELDS: Readonly<Record<EvidenceField["store"], ReadonlySe
   artifact: new Set([
     "repositories.touchedPaths", // CANDIDATE_SNAPSHOT
     "coveredFiles", // BLIND_REVIEW coverage keys, `<identity>:<path>`
+    "extraClaims", // BLIND_REVIEW claims outside the assigned items, same `<identity>:<path>` shape (#1259)
     "findings.path", // BLIND_REVIEW finding location
     "inputManifest.binaryArtifacts.path", // BLIND_REVIEW
     "contractChange.workflowEvidence.path", // CONTRACT_CHANGE workflow files
