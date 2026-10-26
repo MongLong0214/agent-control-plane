@@ -30,6 +30,7 @@ import type { BlindReviewGate, BlindReviewInvoker, ReviewPacket } from "../revie
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import {
   type CandidateSnapshot,
+  type SnapshotRepositoryInput,
   buildCandidateSnapshot,
   buildNoRepositoryCandidateSnapshot,
   candidateSnapshotDigest,
@@ -37,6 +38,7 @@ import {
 } from "../snapshot/candidate-snapshot.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationEngine, VerificationReport } from "../verify/verification-engine.ts";
+import { integrateTaskResults } from "./candidate-integration.ts";
 import type { RunEngine, TaskContract } from "./run-engine.ts";
 import type { TaskGraph } from "./task-graph.ts";
 import { recordedTargetForBranch } from "./task-write-target.ts";
@@ -252,28 +254,39 @@ export class CandidatePipeline {
     const profile: BranchProfile | null = run.pinnedManifestDigest
       ? (this.projects.manifest(run.pinnedManifestDigest)?.branchProfile ?? null)
       : null;
-    const repositories = await Promise.all(
-      participants.map(async (repo) => {
-        const source = await this.sourceAtFreeze(
-          repo.checkoutPath,
-          repo.workBranch,
-          repo.baseBranch,
-          profile,
-          { runId, identity: repo.identity },
-        );
-        return {
-          identity: repo.identity,
-          repositoryRole: repo.repositoryRole,
-          checkoutPath: repo.checkoutPath,
-          baseBranch: repo.baseBranch,
-          baseRef: repo.baseBranch,
-          sourceBranch: source.sourceBranch,
-          sourceHead: source.sourceHead,
-          worktreeId: repo.worktreeId,
-          manifestDigest: this.repositories.byIdentity(repo.identity)?.activeManifestDigest ?? null,
-        };
-      }),
-    );
+    const tasks = participants.length === 0 ? [] : this.tasks.list(runId);
+    const repositories: SnapshotRepositoryInput[] = [];
+    for (const repo of participants) {
+      // S6-C — when the checkout's HEAD does not hold every SUCCEEDED task's commit, the candidate is
+      // their integration onto the run's pinned base; a conflict between two tasks refuses the freeze.
+      const integrated = await integrateTaskResults({
+        db: this.db,
+        runId,
+        tasks,
+        repositoryIdentity: repo.identity,
+        checkoutPath: repo.checkoutPath,
+        worktree: (input, use) => this.verification.withRunWorktree(run, input, use),
+      });
+      if (!integrated.allowed) return integrated as Decision<CandidateSnapshot>;
+      // The integrated candidate's origin is its tasks' recorded one (S-TB-06), as one task's is below.
+      const source = integrated.value === null
+        ? await this.sourceAtFreeze(repo.checkoutPath, repo.workBranch, repo.baseBranch, profile, { runId, identity: repo.identity })
+        : profile
+          ? { sourceBranch: integrated.value.declaredParent, sourceHead: integrated.value.baseSha }
+          : { sourceBranch: null, sourceHead: null };
+      repositories.push({
+        identity: repo.identity,
+        repositoryRole: repo.repositoryRole,
+        checkoutPath: repo.checkoutPath,
+        baseBranch: repo.baseBranch,
+        baseRef: repo.baseBranch,
+        sourceBranch: source.sourceBranch,
+        sourceHead: source.sourceHead,
+        worktreeId: repo.worktreeId,
+        manifestDigest: this.repositories.byIdentity(repo.identity)?.activeManifestDigest ?? null,
+        ...(integrated.value === null ? {} : { candidateRef: integrated.value.head, integration: integrated.value.integration }),
+      });
+    }
 
     // #246 C2 — a project-less bootstrap run joins no repository; its candidate is its PLAN, the
     // manifest that PLAN carries and the outputs it plans. A PLAN with no plannable outputs freezes
@@ -336,6 +349,7 @@ export class CandidatePipeline {
           sourceBranch: r.sourceBranch ?? null,
           sourceHead: r.sourceHead ?? null,
           files: r.touchedPaths.length,
+          ...(r.integration === undefined ? {} : { integratedTasks: r.integration.tasks.length }),
         })),
         ...(attemptId === undefined ? {} : { attemptId }),
       },

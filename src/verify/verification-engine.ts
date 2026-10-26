@@ -2,7 +2,7 @@ import type { Clock } from "../core/clock.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { verificationKindRunning } from "../bootstrap/repo-factory-producer.ts";
 import { canonicalJson, digestOf, sha256 } from "../core/digest.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { type VerificationCommand, verificationCommandSchema } from "../contracts/verification-command.ts";
 import { type ProjectManifest, commandsForMode, gateEntriesFor } from "../contracts/manifest.ts";
@@ -687,6 +687,68 @@ export class VerificationEngine {
       }
       return allow(ReasonCode.OK, persisted);
     });
+  }
+
+  /**
+   * S6-C — a disposable worktree of one of `run`'s repositories at `head`, for a control-plane step that
+   * runs no candidate command: integrating a multi-task candidate at freeze. Its lifecycle is a command
+   * worktree's exactly: the run's worktree claim, every add, remove, cleanup and prune authorised by the
+   * guard, and a `verification_worktrees` row (its `command_id` the purpose, its digest the inputs), so
+   * the guard's prune and the doctor's orphan sweep know it. Torn down before this answers, whatever
+   * `use` answered; a teardown that did not complete leaves its row DESTROYING for the doctor.
+   */
+  async withRunWorktree<T>(
+    run: RunRow,
+    input: { purpose: string; inputDigest: string; repositoryIdentity: string; head: string },
+    use: (worktreePath: string) => Promise<Decision<T>>,
+  ): Promise<Decision<T>> {
+    const record = this.repositories.byIdentity(input.repositoryIdentity);
+    if (!record) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "the repository has no local binding", { repositoryIdentity: input.repositoryIdentity });
+    }
+    const claim = this.ensureVerificationClaim(run, input.repositoryIdentity);
+    if (!claim.allowed) return claim as Decision<T>;
+    const worktreeId = `${input.purpose}-${run.runId}-${input.head.slice(0, 8)}-${randomUUID().replaceAll("-", "")}`;
+    const path = this.worktrees.pathFor(worktreeId);
+    const authorization = this.worktreeAuthorization(run, input.repositoryIdentity, record.checkoutPath, path, null);
+    this.recordVerificationWorktree({
+      worktreeId,
+      runId: run.runId,
+      commandId: input.purpose,
+      candidateSnapshotDigest: input.inputDigest,
+      repositoryIdentity: input.repositoryIdentity,
+      repositoryCheckoutPath: record.checkoutPath,
+      worktreePath: path,
+      head: input.head,
+      ownerSessionId: run.ownerSessionId,
+      ownerBindingGeneration: run.ownerBindingGeneration,
+      ownerRoleKey: run.ownerRoleKey,
+    });
+    let worktree: Awaited<ReturnType<WorktreeManager["create"]>> | null = null;
+    let outcome: Decision<T> = deny(ReasonCode.INTERNAL_ERROR, "the worktree step did not run", { worktreeId });
+    try {
+      worktree = await this.worktrees.create(record.checkoutPath, input.head, worktreeId, authorization);
+      this.updateVerificationWorktree(worktreeId, "ACTIVE", "active_at");
+      outcome = await use(worktree.path);
+    } catch (error) {
+      if (!isAcpError(error)) throw error;
+      outcome = deny(error.reasonCode, error.message, error.evidence);
+    } finally {
+      if (worktree) {
+        this.updateVerificationWorktree(worktreeId, "DESTROYING");
+        try {
+          await this.worktrees.destroy(record.checkoutPath, worktree.path, authorization);
+          this.updateVerificationWorktree(worktreeId, "DESTROYED", "ended_at");
+        } catch (error) {
+          if (!isAcpError(error)) throw error;
+          // DESTROYING stays durable, as for a command's worktree: the doctor re-evaluates it.
+          outcome = deny(error.reasonCode, `the disposable worktree was not torn down: ${error.message}`, { ...error.evidence, worktreeId });
+        }
+      } else {
+        this.updateVerificationWorktree(worktreeId, "FAILED", "ended_at");
+      }
+    }
+    return outcome;
   }
 
   private async runLocal(

@@ -1,0 +1,307 @@
+import { rmSync } from "node:fs";
+import { join } from "node:path";
+
+import { digestOf } from "../core/digest.ts";
+import { type Decision, allow, deny } from "../core/errors.ts";
+import { ReasonCode } from "../core/reason-codes.ts";
+import { acpScratchDir } from "../core/scratch-root.ts";
+import type { Db } from "../db/database.ts";
+import { TaskState } from "../domain/types.ts";
+import type { SnapshotIntegration } from "../snapshot/candidate-snapshot.ts";
+import type { TaskRecord } from "./task-graph.ts";
+import { recordedWriteTarget } from "./task-write-target.ts";
+import { type PinnedRepository, committedChanges, objectFormatOf, pinRepository, runPinnedGit } from "./worker-git.ts";
+import { WorkerTurnEvent } from "./worker-turn.ts";
+
+/**
+ * S6-C — the candidate of a STANDARD_WORK run whose tasks each worked on their own branch.
+ *
+ * Every task branch starts at the run's pinned base (S-TB), so the checkout's HEAD holds one task's
+ * work only. At freeze, when some SUCCEEDED task's recorded commit is not in that HEAD, the candidate
+ * is instead every SUCCEEDED task's result in the repository, integrated onto the pinned base:
+ *
+ * - The order is the task graph's: a task after every task it depends on, through the whole run's
+ *   graph, ties broken by task id. The first task's commit is taken as it is; each later one is joined
+ *   by a merge commit whose parents are the integration so far and the task's own commit, so every
+ *   task commit is an ancestor of the candidate, and no task branch, ref or commit is moved (S-TB-02).
+ * - A task's change is what its commit changes against the pinned base, path by path. Two tasks that
+ *   change the same path, or a path and one beneath it, are a conflict: the freeze is refused naming
+ *   both tasks and the paths, before anything is written. Nothing merges file contents, so no merge
+ *   driver runs and no task's bytes are overwritten or dropped.
+ * - The merge commits are plumbing over a private index, in a disposable worktree the verification
+ *   engine makes and tears down through the guard; the registered checkout is only read. Their
+ *   author, committer, dates and messages come from their inputs, so freezing twice gives one commit.
+ * - The declared parent and the pinned base come from the tasks' write-target records (S-TB-06), and
+ *   must be the same for every task.
+ */
+
+/** One SUCCEEDED task's result in a repository: its last recorded commit and the origin its branch has. */
+export interface TaskResult {
+  taskId: string;
+  title: string;
+  commit: string;
+  declaredParent: string;
+  baseSha: string;
+}
+
+export interface IntegratedCandidate {
+  head: string;
+  integration: SnapshotIntegration;
+  declaredParent: string;
+  baseSha: string;
+}
+
+/** A disposable worktree of the run's repository at `head`, made and torn down through the guard. */
+export type RunWorktree = <T>(
+  input: { purpose: string; inputDigest: string; repositoryIdentity: string; head: string },
+  use: (worktreePath: string) => Promise<Decision<T>>,
+) => Promise<Decision<T>>;
+
+/** The `verification_worktrees.command_id` and worktree-id prefix of an integration's worktree. */
+export const INTEGRATION_WORKTREE_PURPOSE = "candidate-integration";
+
+/**
+ * The run's SUCCEEDED tasks whose write target is in this repository, each with the commit its last
+ * successful turn recorded. A SUCCEEDED task with no recorded commit is not a result here.
+ */
+export const succeededTaskResults = (db: Db, runId: string, tasks: readonly TaskRecord[], repositoryIdentity: string): TaskResult[] => {
+  const results: TaskResult[] = [];
+  for (const task of tasks) {
+    if (task.state !== TaskState.SUCCEEDED) continue;
+    const target = recordedWriteTarget(db, runId, task.taskId);
+    if (!target || target.repositoryIdentity !== repositoryIdentity) continue;
+    const commit = db.get<{ head: unknown }>(
+      `SELECT json_extract(evidence_json, '$.commitHead') AS head FROM audit_events
+        WHERE run_id = ? AND kind = ? AND json_extract(evidence_json, '$.taskId') = ?
+        ORDER BY event_id DESC LIMIT 1`,
+      [runId, WorkerTurnEvent.SUCCEEDED, task.taskId],
+    )?.head;
+    if (typeof commit !== "string") continue;
+    results.push({ taskId: task.taskId, title: task.title, commit, declaredParent: target.declaredParent, baseSha: target.baseSha });
+  }
+  return results;
+};
+
+/**
+ * The order results are integrated in: Kahn's order over the whole run's task graph, so a dependency
+ * that passes through a task of another repository still counts, always taking the smallest ready
+ * task id. Null when the graph has a cycle.
+ */
+export const integrationOrder = (
+  tasks: readonly Pick<TaskRecord, "taskId" | "dependsOn">[],
+  results: readonly TaskResult[],
+): TaskResult[] | null => {
+  const indegree = new Map(tasks.map((task) => [task.taskId, 0]));
+  const dependents = new Map(tasks.map((task) => [task.taskId, [] as string[]]));
+  for (const task of tasks) {
+    for (const dependency of task.dependsOn) {
+      if (!indegree.has(dependency)) continue;
+      indegree.set(task.taskId, indegree.get(task.taskId)! + 1);
+      dependents.get(dependency)!.push(task.taskId);
+    }
+  }
+  const ready = [...indegree].filter(([, count]) => count === 0).map(([taskId]) => taskId).sort();
+  const position = new Map<string, number>();
+  while (ready.length > 0) {
+    const next = ready.shift()!;
+    position.set(next, position.size);
+    for (const dependent of dependents.get(next)!) {
+      const left = indegree.get(dependent)! - 1;
+      indegree.set(dependent, left);
+      if (left === 0) {
+        ready.push(dependent);
+        ready.sort();
+      }
+    }
+  }
+  if (position.size !== tasks.length) return null;
+  return [...results].sort((a, b) => position.get(a.taskId)! - position.get(b.taskId)!);
+};
+
+interface Change {
+  path: string;
+  mode: string | null;
+  blob: string | null;
+}
+
+interface Planned {
+  result: TaskResult;
+  changes: Change[];
+}
+
+/** Two changed paths collide when they are one path, or one lies beneath the other. */
+const collide = (a: string, b: string): boolean => a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+
+/** Every pair of tasks that change a colliding path, with the paths; empty when none do. */
+export const pathConflicts = (planned: readonly { taskId: string; paths: readonly string[] }[]): Array<{ tasks: [string, string]; paths: string[] }> => {
+  const conflicts: Array<{ tasks: [string, string]; paths: string[] }> = [];
+  for (let i = 0; i < planned.length; i += 1) {
+    for (let j = i + 1; j < planned.length; j += 1) {
+      const paths = new Set<string>();
+      for (const a of planned[i]!.paths) {
+        for (const b of planned[j]!.paths) {
+          if (collide(a, b)) {
+            paths.add(a);
+            paths.add(b);
+          }
+        }
+      }
+      if (paths.size > 0) conflicts.push({ tasks: [planned[i]!.taskId, planned[j]!.taskId], paths: [...paths].sort() });
+    }
+  }
+  return conflicts;
+};
+
+const gitOrThrow = async (repo: PinnedRepository, args: readonly string[], options: Parameters<typeof runPinnedGit>[2] = {}): Promise<string> => {
+  const run = await runPinnedGit(repo, args, options);
+  if (run.exitCode !== 0) {
+    throw new Error(`git ${args[0]} ${run.exitCode === null ? "did not answer" : `exited ${run.exitCode}`}: ${run.stderr.slice(0, 300)}`);
+  }
+  return run.stdout;
+};
+
+/** 0 when `ancestor` is an ancestor of (or is) `of`, 1 when not; anything else is a failed read. */
+const isAncestor = async (repo: PinnedRepository, ancestor: string, of: string): Promise<boolean | null> => {
+  const run = await runPinnedGit(repo, ["merge-base", "--is-ancestor", ancestor, of]);
+  return run.exitCode === 0 ? true : run.exitCode === 1 ? false : null;
+};
+
+/** The committer timestamp in the commit object itself; no log formatting, which could run a program. */
+const committerEpoch = async (repo: PinnedRepository, commit: string): Promise<number> => {
+  const raw = await gitOrThrow(repo, ["cat-file", "commit", commit]);
+  const header = raw.slice(0, raw.indexOf("\n\n") === -1 ? raw.length : raw.indexOf("\n\n"));
+  const epoch = /^committer .* (\d+) [+-]\d{4}$/m.exec(header)?.[1];
+  if (epoch === undefined) throw new Error(`commit ${commit} has no committer timestamp`);
+  return Number(epoch);
+};
+
+const subjectOf = (title: string): string => {
+  const subject = title.replace(/\s+/g, " ").trim().slice(0, 120);
+  return subject.length > 0 ? `Integrate: ${subject}` : "Integrate a task's work";
+};
+
+const withPinned = async <T>(workTree: string, prefix: string, read: (repo: PinnedRepository, scratch: string) => Promise<Decision<T>>): Promise<Decision<T>> => {
+  const scratch = acpScratchDir(prefix);
+  try {
+    const pinned = pinRepository(workTree, scratch);
+    if (!pinned.allowed) return pinned as Decision<never>;
+    try {
+      return await read(pinned.value, scratch);
+    } catch (error) {
+      return deny(ReasonCode.PROBE_FAILED, "the integration's git step failed; nothing was frozen", {
+        error: error instanceof Error ? error.message.slice(0, 300) : String(error),
+      });
+    } finally {
+      pinned.value.children.retire();
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+};
+
+/**
+ * The run's integrated candidate in one repository, or null when the checkout's HEAD already holds
+ * every SUCCEEDED task's commit (a single-task run, as before), or there is no result at all.
+ */
+export const integrateTaskResults = async (input: {
+  db: Db;
+  runId: string;
+  tasks: readonly TaskRecord[];
+  repositoryIdentity: string;
+  checkoutPath: string;
+  worktree: RunWorktree;
+}): Promise<Decision<IntegratedCandidate | null>> => {
+  const results = succeededTaskResults(input.db, input.runId, input.tasks, input.repositoryIdentity);
+  if (results.length === 0) return allow(ReasonCode.OK, null);
+
+  // Read-only, over the registered checkout: everything is decided, and every conflict refused,
+  // before anything is written.
+  type Plan = { checkoutHead: string; baseSha: string; planned: Planned[]; format: "sha1" | "sha256" } | null;
+  const plan = await withPinned<Plan>(input.checkoutPath, "acp-integration-read-", async (repo) => {
+    const headRead = await runPinnedGit(repo, ["rev-parse", "--verify", "-q", "HEAD^{commit}"]);
+    const checkoutHead = headRead.exitCode === 0 ? headRead.stdout.trim() : null;
+    if (checkoutHead === null) return allow(ReasonCode.OK, null);
+    const contained = await Promise.all(results.map((result) => isAncestor(repo, result.commit, checkoutHead)));
+    if (contained.every((answer) => answer === true)) return allow(ReasonCode.OK, null);
+
+    const origins = new Set(results.map((result) => `${result.declaredParent}\u0000${result.baseSha}`));
+    if (origins.size !== 1) {
+      return deny(ReasonCode.CONFLICT, "the run's task results in this repository were made from different origins; they are not integrated", {
+        repositoryIdentity: input.repositoryIdentity,
+        origins: results.map((result) => ({ taskId: result.taskId, declaredParent: result.declaredParent, baseSha: result.baseSha })),
+      });
+    }
+    const ordered = integrationOrder(input.tasks, results);
+    if (!ordered) {
+      return deny(ReasonCode.TASK_DEPENDENCY_CYCLE, "the run's task graph has a cycle, so no integration order exists", { runId: input.runId });
+    }
+    const baseSha = ordered[0]!.baseSha;
+    const planned: Planned[] = [];
+    for (const result of ordered) {
+      const descends = await isAncestor(repo, baseSha, result.commit);
+      if (descends !== true) {
+        return deny(ReasonCode.CONFLICT, "a task's recorded commit does not descend from the run's pinned base; it is not integrated", {
+          repositoryIdentity: input.repositoryIdentity,
+          taskId: result.taskId,
+          commit: result.commit,
+          baseSha,
+          readFailed: descends === null,
+        });
+      }
+      planned.push({ result, changes: await committedChanges(repo, baseSha, result.commit) });
+    }
+    const conflicts = pathConflicts(planned.map((step) => ({ taskId: step.result.taskId, paths: step.changes.map((change) => change.path) })));
+    if (conflicts.length > 0) {
+      const named = conflicts.map((conflict) => `${conflict.tasks.join(" and ")} both change ${conflict.paths.join(", ")}`).join("; ");
+      return deny(
+        ReasonCode.CONFLICT,
+        `the run's task results cannot be integrated: ${named}. The candidate is not frozen; the control plane does not choose between them`,
+        { repositoryIdentity: input.repositoryIdentity, baseSha, conflicts: conflicts.slice(0, 20) },
+      );
+    }
+    return allow(ReasonCode.OK, { checkoutHead, baseSha, planned, format: await objectFormatOf(repo) });
+  });
+  if (!plan.allowed || plan.value === null) return plan as Decision<null>;
+  const { checkoutHead, baseSha, planned, format } = plan.value;
+  const integration: SnapshotIntegration = {
+    checkoutHead,
+    tasks: planned.map((step) => ({ taskId: step.result.taskId, commit: step.result.commit })),
+  };
+  const inputDigest = digestOf({ schema: "agent-control-plane.candidate-integration.v1", runId: input.runId, repositoryIdentity: input.repositoryIdentity, baseSha, tasks: integration.tasks });
+
+  const built = await input.worktree<string>(
+    { purpose: INTEGRATION_WORKTREE_PURPOSE, inputDigest, repositoryIdentity: input.repositoryIdentity, head: baseSha },
+    (worktreePath) => withPinned<string>(worktreePath, "acp-integration-write-", async (repo, scratch) => {
+      const zero = "0".repeat(format === "sha256" ? 64 : 40);
+      const index = join(scratch, "integration.index");
+      let head = planned[0]!.result.commit;
+      for (const step of planned.slice(1)) {
+        await gitOrThrow(repo, ["read-tree", head], { index });
+        const entries = step.changes
+          .map((change) => (change.mode === null ? `0 ${zero}\t${change.path}\0` : `${change.mode} ${change.blob}\t${change.path}\0`))
+          .join("");
+        await gitOrThrow(repo, ["update-index", "-z", "--index-info"], { index, input: entries });
+        const tree = (await gitOrThrow(repo, ["write-tree"], { index })).trim();
+        const date = `${Math.max(await committerEpoch(repo, head), await committerEpoch(repo, step.result.commit))} +0000`;
+        head = (await gitOrThrow(repo, ["commit-tree", tree, "-p", head, "-p", step.result.commit, "--no-gpg-sign", "-m", subjectOf(step.result.title)], {
+          extraEnv: { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date },
+        })).trim();
+      }
+      // The integrated commit changes exactly what the tasks changed, each path as its task left it.
+      const expected = new Map(planned.flatMap((step) => step.changes.map((change) => [change.path, `${change.mode}:${change.blob}`] as const)));
+      const observed = await committedChanges(repo, baseSha, head);
+      const exact = observed.length === expected.size && observed.every((change) => expected.get(change.path) === `${change.mode}:${change.blob}`);
+      if (!exact) {
+        return deny(ReasonCode.INTERNAL_ERROR, "the integrated commit does not change exactly what the tasks changed; nothing was frozen", {
+          repositoryIdentity: input.repositoryIdentity,
+          head,
+          expected: expected.size,
+          observed: observed.length,
+        });
+      }
+      return allow(ReasonCode.OK, head);
+    }),
+  );
+  if (!built.allowed) return built as Decision<null>;
+  return allow(ReasonCode.OK, { head: built.value, integration, declaredParent: planned[0]!.result.declaredParent, baseSha });
+};
