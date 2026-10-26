@@ -645,6 +645,7 @@ export class CandidatePipeline {
    * one used replays that earlier PLAN and freezes nothing. So review entry asks the collectors
    * `plan_submit` freezes from, and refuses while the run holds an attachment or a decision its current
    * PLAN lacks: absent from the PLAN is not absent from the run. A run that holds neither is unchanged.
+   * `bootstrapPlanStillCurrent` asks it again after the review, for what arrived while it ran.
    */
   private bootstrapPlanCarriesCurrentAuthority(runId: string, plan: { digest: string; content: unknown }): Decision<void> {
     const source = { db: this.db, artifacts: this.artifacts, audit: this.audit, runs: this.runs, bindings: this.bindings };
@@ -661,7 +662,7 @@ export class CandidatePipeline {
     if (!evidenceUnfrozen && decisionsUnfrozen.length === 0) return allow(ReasonCode.OK, undefined);
     return deny(
       ReasonCode.BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN,
-      "this run's current PLAN does not carry the review evidence attached or the CEO decisions admitted since it was submitted, so nothing was frozen, promoted or reviewed. Call plan_submit again with the same bootstrapPlanDigest and a NEW idempotencyKey (a key an earlier plan_submit used replays that earlier PLAN and freezes nothing), then result_submit with a new idempotencyKey",
+      "this run's current PLAN does not carry the review evidence attached or the CEO decisions admitted since it was submitted, so no review of it is entered or accepted and the run is not made ready for CEO review. Call plan_submit again with the same bootstrapPlanDigest and a NEW idempotencyKey (a key an earlier plan_submit used replays that earlier PLAN and freezes nothing), then result_submit with a new idempotencyKey",
       {
         runId,
         refusal: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN",
@@ -1016,6 +1017,11 @@ export class CandidatePipeline {
         current: currentBinding,
       });
     }
+    // Review of 51a21441 — evidence attached or a CEO decision admitted while the candidate was judged
+    // leaves the PLAN binding as it was, so every outcome (PASS, verdict or unavailable) is stale on the
+    // same check review entry asks. A matched binding means currentBootstrapPlan read a PLAN.
+    const carried = this.bootstrapPlanCarriesCurrentAuthority(runId, planArtifact!);
+    if (!carried.allowed) return carried;
     if (reviewedSnapshotDigest === null) return allow(ReasonCode.OK, undefined);
     const intent = bootstrapReviewIntentCurrent({
       runId,

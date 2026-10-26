@@ -2490,4 +2490,61 @@ describe("live run_3884d4fc: a bootstrap PLAN is reviewed only while it carries 
       expect(reviews(f)).toHaveLength(0);
     } finally { await f.close(); }
   });
+
+  // Review of 51a21441 — authority that arrives while the reviewer is answering. Holds the next
+  // bootstrap-plan reviewer invocation until released; the answer is the scripted one, only its timing is the test's.
+  const holdNextReview = (f: Staged) => {
+    const scripted = f.h.scripted;
+    const original = scripted.invoke.bind(scripted);
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    let enter!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    let held = false;
+    vi.spyOn(scripted, "invoke").mockImplementation(async request => {
+      if (!held && /Bootstrap plan review/.test(request.prompt)) { held = true; enter(); await released; }
+      return original(request);
+    });
+    return { entered, release };
+  };
+
+  it.each(["PASS", "REVISE"] as const)("makes a %s stale when evidence is attached and an escalation resolved while the reviewer is answering", async verdict => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      expect(await planSubmit(f, "mid-review-plan")).toMatchObject({ ok: true });
+      const keys = bootstrapCoverageKeys(f.h, f.run.runId);
+      f.h.scripted.script({ match: /Bootstrap plan review/, text: verdict === "PASS" ? reviewerPass(keys) : reviewerRevise(keys, "judged without the attached records") });
+      const held = holdNextReview(f);
+      const pending = resultSubmit(f, "mid-review-result");
+      await held.entered;
+      const candidate = f.h.cp.runs.currentCandidate(f.run.runId);
+      expect(candidate).not.toBeNull();
+      // While the reviewer answers: the CEO resolves a blocking escalation and attaches review evidence, over MCP.
+      const resolution = "Judge the attached originals before anything else.";
+      await resolveEscalation(f, resolution);
+      const e = evidence(f, "attached-mid-review");
+      await stageAndAttach(f, e, "mid-review");
+      held.release();
+      const submitted = await pending;
+      expect(submitted, JSON.stringify(submitted)).toMatchObject({ ok: true,
+        value: { stage: "CANDIDATE_STALE", reasonCode: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN", snapshotDigest: candidate } });
+      const judged = reviews(f)[0]!.prompt;
+      expect(judged).not.toContain(e.text.trim());
+      expect(judged).not.toContain(resolution);
+      expect(f.h.cp.runs.require(f.run.runId).state).toBe("ACTIVE");
+      expect(f.h.cp.artifacts.list(f.run.runId, "PRODUCTION_READY_PACKET")).toEqual([]);
+      expect(f.h.cp.outbox.listByRun(f.run.runId).filter(m => m.kind === "REVISION_REQUEST")).toEqual([]);
+      expect(f.h.cp.audit.forRun(f.run.runId).filter(a => a.kind === "BLIND_REVIEW_UNAVAILABLE")).toEqual([]);
+      // The next result_submit is refused at entry with the instruction; a fresh-key PLAN is reviewed with both.
+      expect(await resultSubmit(f, "mid-review-result-again")).toMatchObject({ ok: false, reasonCode: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN" });
+      expect(await planSubmit(f, "mid-review-plan-fresh")).toMatchObject({ ok: true });
+      f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
+      expect(await resultSubmit(f, "mid-review-result-fresh")).toMatchObject({ ok: true });
+      const fresh = reviews(f).at(-1)!.prompt;
+      expect(fresh).toContain(e.text.trim());
+      expect(fresh).toContain(resolution);
+      expect(f.h.cp.runs.require(f.run.runId).state).toBe("READY_FOR_CEO_REVIEW");
+    } finally { vi.restoreAllMocks(); await f.close(); }
+  });
 });
