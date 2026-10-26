@@ -26,7 +26,6 @@ import {
   PROJECT_MANIFEST_SCHEMA_ID,
 } from "../../src/contracts/manifest.ts";
 import {
-  __testing as sandboxTesting,
   buildSandboxEnvironment,
   runSandboxed,
 } from "../../src/verify/sandbox.ts";
@@ -1132,10 +1131,12 @@ describe("verification sandbox (PRD §17.4)", () => {
        setInterval(() => {}, 1000);`,
     );
     const started = Date.now();
-    const outcome = await sandboxTesting.withProcessCountLimitDisabled(() => runSandboxed({
+    // A child can start only under the supervised budget; the default no-spawn mode refuses it.
+    const outcome = await runSandboxed({
       command: parseVerificationCommand({ id: "hang", argv: ["node", "hang.js"], timeoutSeconds: 2 }),
       worktreePath: repo,
-    }));
+      processLimit: "supervised-budget",
+    });
     expect(outcome.status).toBe("TIMEOUT");
     expect(outcome.reasonCode).toBe(ReasonCode.VERIFICATION_TIMEOUT);
     const child = JSON.parse(outcome.stdout) as { childPid: number | null };

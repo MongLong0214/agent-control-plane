@@ -103,6 +103,17 @@ Named here because a green suite otherwise reads as coverage of them.
   close. So CI no longer exercises detached-descendant containment at all, which is a real
   reduction in what a green run means and is recorded here for that reason.
 
+  **The race matters again for every declared command that runs no gate entry** (E2E-02). Under
+  RLIMIT_NPROC 1 no candidate could spawn, so there was nothing to miss; that limit is per user
+  on macOS and refused `npm test` its own `sh`, so such a command now runs under a supervised,
+  polled process budget (`ProcessLimitMode` in `src/verify/sandbox.ts`) and may spawn. A
+  descendant created and reparented between two polls is neither counted against the budget nor
+  killed, and the outcome can still be a pass. The supervisor runs as the same user in the same
+  sandbox, so a candidate that SIGKILLs it ends the run without a pass, with containment recorded
+  as unproven, but leaves descendants outside the launched process group unreaped. This is a
+  known, accepted, non-blocking limit.
+  Gate commands keep RLIMIT_NPROC 1 and cannot spawn at all.
+
 - **The full-vertical e2e is off by default.** `tests/e2e/real-component-integration.test.ts`
   is `describe.runIf(ACP_COMPONENT_INTEGRATION=1)` — it is the only test that drives SIMPLE,
   STANDARD and GUARDED through a real cloned repository and a live adapter, and it is the
