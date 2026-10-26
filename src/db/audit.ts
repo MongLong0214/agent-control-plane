@@ -17,10 +17,10 @@ export interface AuditRecord {
 }
 
 /**
- * #1213 — every refusal kind (`_REFUSED`, the repository's naming for a record of a refusal) that src
- * records with a literal kind. `AuditRecord.kind` is a string and no registry declares the kinds, so this
- * set is derived from the emitters, and tests/unit/the-recorded-refusal-kinds-are-the-ones-src-records
- * fails when it differs from them. A kind outside it is not known to be a refusal.
+ * #1213 — refusal kinds (`_REFUSED`, the repository's naming for a record of a refusal) that src records
+ * and whose record naming a task does not block the bootstrap task restore. Omission is safe: a refusal
+ * kind missing from this list blocks the restore, which fails closed, so the list never has to be complete.
+ * Add a kind only when a refusal that names a task should not block.
  */
 export const RECORDED_REFUSAL_KINDS: ReadonlySet<string> = new Set([
   "BOOTSTRAP_CTO_RECOVERY_REFUSED", "BRANCH_PUBLISH_REFUSED", "BUZZ_MENTION_REFUSED", "BUZZ_PEER_REFUSED",
