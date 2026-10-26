@@ -1,6 +1,6 @@
 import { frozenBootstrapCeoDecisions, type AuthenticatedCeoDecision } from "./bootstrap-ceo-decisions.ts";
 import { MCP_MUTATION_RECOVERY } from "../core/mcp-recovery.ts";
-import { parseGenesis, genesisDigest, bytesDigest, type GenesisBundle } from './genesis-bundle.ts';
+import { parseGenesis, genesisDigest, genesisRefusalOf, bytesDigest, type GenesisBundle } from './genesis-bundle.ts';
 import { z } from "zod";
 import { BOOTSTRAP_POST_CONFIRM_LIFECYCLE, type BootstrapLifecycleItem } from "./bootstrap-lifecycle.ts";
 
@@ -782,7 +782,11 @@ export const planForSubmission = (
       const githubOperations = executableOperationsSchema.parse(expanded);
       if (canonicalJson(githubOperations.map(o => ({...o,operationId:""}))) !== canonicalJson([...base.slice(0,3),...bootstrap,...base.slice(3),...resources].map(o => ({...o,operationId:""})))) throw new Error("genesis operation order/state differs from the shared contract");
       return allow(ReasonCode.OK,{...rest,genesis,genesisDigest:genesisDigest(genesis),githubOperations,projectManifest:manifest.value});
-    } catch {return deny(ReasonCode.INVALID_ARGUMENT,"genesis bundle/manifest refused",{refusal:"GENESIS_INVALID"});}
+    } catch (error) {
+      // #1240 — a traced-backlog refusal names what is wrong; every other failure stays opaque, as it was.
+      const traced = genesisRefusalOf(error);
+      return deny(ReasonCode.INVALID_ARGUMENT,traced ? `genesis bundle refused: ${(error as Error).message}` : "genesis bundle/manifest refused",{refusal:"GENESIS_INVALID",...(traced ? {genesisRefusal:traced} : {})});
+    }
   }
   return allow(ReasonCode.OK, { ...rest, projectManifest: manifest.value });
 };

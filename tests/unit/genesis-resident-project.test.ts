@@ -315,7 +315,7 @@ it('completes a reviewed genesis bootstrap on its resident claim and same-sessio
     expect(h.cp.ceo.resolveEscalation(run.value.runId,resolution,ceoSessionId,{escalationId:opened.value.escalationId!}).allowed).toBe(true);
   }
   const f = planFixture();
-  const genesis = {...f.genesis,issues:Array.from({length:7},(_,i)=>({...f.genesis.issues[0]!,key:`issue-${i+1}`,title:`Seeded issue ${i+1}`,body:`Acceptance for seeded issue ${i+1}`}))};
+  const genesis = {...f.genesis,issues:Array.from({length:7},(_,i)=>({...f.genesis.issues[0]!,key:`issue-${i+1}`,title:`Seeded issue ${i+1}`,body:`Acceptance for seeded issue ${i+1}\n\nWork unit ${i+1} of 7: issue-${i+1}`}))};
   const reviewed = await reviewBootstrapPlan(h,run.value.runId,{...f.artifact.content,genesis,githubOperations:undefined,summary:"이번 단계는 부트스트랩까지만 수행하고 각 이슈의 인수 조건 검증은 후속 작업에서 진행한다",requestDigest:h.cp.runs.get(run.value.runId)!.contractDigest});
   const refused = await h.cp.bootstrapProducer.produceAndActivateApproved({runId:run.value.runId,candidateSnapshotDigest:'unreviewed-candidate',ceoSessionId:reviewed.ceoSessionId});
   expect(refused.allowed).toBe(false);expect(h.cp.residentProjects.row(run.value.runId)).toBeUndefined();
@@ -335,7 +335,7 @@ it('completes a reviewed genesis bootstrap on its resident claim and same-sessio
   expect(frozen).toHaveLength(2);
   expect(delivered.queuedWork).toEqual([]);
   expect(delivered.recommendedNextAction).toContain("existing runs");
-  for (const issue of genesis.issues) expect(delivered.recommendedNextAction).toContain(issue.body);
+  for (const issue of genesis.issues) expect(delivered.recommendedNextAction).toContain(JSON.stringify(issue.body));
   // Inspect the produced tree, commit messages and actual seeding calls, beyond the PLAN projection.
   const publishedBare=port.repository("acme","fixture")!.bare;
   const publishedFiles=await Promise.all(genesis.files.map(async file=>(await git(publishedBare,["show",`${port.pull!.mergeCommitSha}:${file.path}`])).stdout));

@@ -37,6 +37,7 @@ import { BlindReviewGate, type ReviewerPreference } from "../review/blind-review
 import { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import { type CompletionAuthority, type CompletionAuthoritySet, RunEngine } from "../run/run-engine.ts";
 import { TaskGraph } from "../run/task-graph.ts";
+import { WorkScopeTracking } from "../run/work-scope-tracking.ts";
 import { BootstrapCtoStaffing } from "../run/bootstrap-cto-staffing.ts";
 import { WorkerTurnRunner } from "../run/worker-turn.ts";
 import { WorkerRetirement } from "../run/worker-retirement.ts";
@@ -770,14 +771,19 @@ export class ControlPlane {
         },
       });
       this.ownerAuthority = new OwnerAuthority(this.db, config.ownerIdentities ?? [], this.clock);
+      // #246 C3, review 1076-R2 — the production port asks the attempt's authority at the moment each
+      // write request starts, after any read the port method makes first. #1240 — a Repo Factory
+      // project's STANDARD_WORK issues go through the same port, under their own write guard.
+      const repoFactoryGitHub = config.repoFactory?.githubPort ?? createBootstrapGitHubWritePort();
+      this.tasks.attach({
+        workScope: new WorkScopeTracking({ db: this.db, audit: this.audit, runs: this.runs, tasks: this.tasks, github: repoFactoryGitHub }),
+      });
       this.bootstrapProducer = new RepoFactoryBootstrapRunner({
         residentProjects: this.residentProjects,
         runs: this.runs,
         artifacts: this.artifacts,
         bootstrap: this.bootstrap,
-        // #246 C3, review 1076-R2 — the production port asks the attempt's authority at the moment each
-        // write request starts, after any read the port method makes first.
-        githubPort: config.repoFactory?.githubPort ?? createBootstrapGitHubWritePort(),
+        githubPort: repoFactoryGitHub,
         workRoot: config.repoFactory?.workRoot ?? null,
         clock: this.clock,
         // #246 C3 — the application record and the pre-write checks' sources.

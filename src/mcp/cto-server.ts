@@ -261,6 +261,7 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       return allow(ReasonCode.OK, { digest: source.artifacts.put(runId, ArtifactKind.PLAN, bootstrapPlanDigest ? { ...stored, bootstrapPlanDigest } : stored).digest });
     },
     submitTasks: (runId: string, tasks: Parameters<TaskGraph["submit"]>[1]) => source.tasks.submit(runId, tasks),
+    ensureWorkScopeTracked: (runId: string) => source.tasks.ensureWorkScopeTracked(runId),
     isProjectlessBootstrapRun: (runId: string) => isProjectlessBootstrap(source.runs.require(runId)),
     // PR #1114 BOOT-02 — a project-less bootstrap's re-plan is all or nothing: the PLAN write, the
     // supersession of the earlier PLAN's tasks, the one new task and its BOOTSTRAP_PLAN_TASKS binding
@@ -305,7 +306,11 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       source.tasks.startWorkerExecution(input),
     taskRunningWidth: (runId: string) => source.tasks.runningWidth(runId),
     // #512 — the runtime launches and owns a worker turn; the CTO names run, task and claim only.
-    startWorkerTurn: (input: WorkerTurnRequest) => source.workerTurns.start(input),
+    // #1240 — refused before the turn records a write target or makes a branch for an untracked unit.
+    startWorkerTurn: async (input: WorkerTurnRequest) => {
+      const tracked = await source.tasks.ensureWorkScopeTracked(input.runId, input.taskId);
+      return tracked.allowed ? source.workerTurns.start(input) : (tracked as Decision<never>);
+    },
     workerExecution: (executionId: string, runId: string) => source.workerTurns.describe(executionId, runId),
     executionIsRuntimeManaged: (executionId: string) => source.tasks.execution(executionId)?.runtimeManaged === true,
     taskIsRuntimeManaged: (taskId: string) =>
@@ -320,6 +325,9 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     // is refused by name in `writeTargetRefused`; the worker stays staffed, and a claim has nothing to
     // take until the CTO escalates. Any other run kind is answered exactly as before.
     provisionWorker: async (request: WorkerProvisionRequest) => {
+      // #1240 — no worker is staffed for a Repo Factory project's work GitHub does not track yet.
+      const tracked = await source.tasks.ensureWorkScopeTracked(request.runId, request.taskId);
+      if (!tracked.allowed) return tracked as Decision<never>;
       const provisioned = await source.workers.provision(request);
       if (!provisioned.allowed) return provisioned;
       const fence = () => {
@@ -612,14 +620,25 @@ const createCtoServerFromPort = (
         tasks: submittedTasksSchema.optional(),
       },
     },
-    async (args) => writeOwned("plan_submit", args, () => {
+    async (args) => writeOwned("plan_submit", args, async () => {
       const resolved = port.resolvePlanInput(args.runId, args);
       if (!resolved.allowed) return respond(resolved);
       const { plan, tasks, bootstrapPlanDigest } = resolved.value;
       if (port.isProjectlessBootstrapRun(args.runId)) return respond(port.submitBootstrapPlan(args.runId, plan, tasks, bootstrapPlanDigest));
       const stored = port.submitPlan(args.runId, plan, bootstrapPlanDigest);
       if (!stored.allowed) return respond(stored);
-      return respond(port.submitTasks(args.runId, tasks));
+      const submitted = port.submitTasks(args.runId, tasks);
+      if (!submitted.allowed) return respond(submitted);
+      // #1240 — an accepted PLAN's approved scope is synchronized to GitHub now. The tasks are stored
+      // either way, so a refusal is reported beside them, never as the PLAN's: admission refuses later.
+      const tracking = await port.ensureWorkScopeTracked(args.runId);
+      if (tracking.allowed && tracking.value === null) return respond(submitted);
+      return respond(allow(submitted.reasonCode, submitted.value, {
+        ...submitted.evidence,
+        githubTracking: tracking.allowed
+          ? { tracked: true, scope: tracking.value as Record<string, unknown> }
+          : { tracked: false, reasonCode: tracking.reasonCode, message: tracking.message, ...tracking.evidence },
+      }));
     }),
   );
   server.registerTool(

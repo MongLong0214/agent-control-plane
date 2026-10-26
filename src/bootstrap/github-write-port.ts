@@ -1,5 +1,6 @@
 import { mergeBootstrapGenesis, observeApprovedWorkflowChecks } from '../github/github-kernel.ts';
 import type { GenesisBundle } from './genesis-bundle.ts';
+import { type WorkUnitMarker, withWorkUnitMarker, workUnitMarkers } from './work-unit-marker.ts';
 import { spawn } from "node:child_process";
 
 import { acpError, isAcpError } from "../core/errors.ts";
@@ -98,6 +99,32 @@ export const UNOBSERVED = "unobserved";
 
 export interface GenesisPull {number:number; headSha:string; baseSha:string; merged:boolean; mergeCommitSha:string|null}
 
+/**
+ * #1240 — what one run's approved work is on GitHub: a milestone for its goal, found by its `acp-work`
+ * marker, and an issue per approved unit, found by its work-unit marker (`work-unit-marker.ts`).
+ */
+export interface WorkIssuesPlan {
+  readonly milestone: { readonly key: string; readonly title: string; readonly description: string };
+  readonly issues: ReadonlyArray<{ readonly unit: WorkUnitMarker; readonly title: string; readonly body: string }>;
+}
+
+/**
+ * #1240 — every milestone carrying the plan's milestone marker and every issue (never a pull request)
+ * whose work-unit markers name a planned unit, each from the repository at `repositoryNodeId`. `keys`
+ * are all the distinct unit keys the issue's markers name; the port reports, the caller judges.
+ */
+export interface ObservedWorkIssues {
+  readonly repositoryNodeId: string;
+  readonly milestones: ReadonlyArray<{ number: number; nodeId: string; title: string }>;
+  readonly issues: ReadonlyArray<{ number: number; nodeId: string; keys: string[]; milestoneNodeId: string | null }>;
+}
+
+/** #1240 — the marker a run's goal milestone carries on GitHub. */
+export const workMilestoneMarker = (key: string): string => `<!-- acp-work:${key} -->`;
+const milestoneKeys = (text: unknown): string[] =>
+  typeof text === "string" ? [...text.matchAll(/<!-- acp-work:(\S+) -->/g)].map((match) => match[1]!) : [];
+const unitKeys = (body: string | null): string[] => [...new Set(workUnitMarkers(body).markers.map((marker) => marker.key))];
+
 export interface GitHubWritePort {
   observeRepository(target: GitHubRepositoryTarget): Promise<ObservedRepository | null>;
   /**
@@ -127,7 +154,20 @@ export interface GitHubWritePort {
    * `GenesisLabelConflict` and nothing is written for it.
    */
   ensureGenesisResources?(target: GitHubRepositoryTarget, bundle: Pick<GenesisBundle, 'labels' | 'milestones' | 'issues'>, options?: { reconcileExistingLabels?: boolean }): Promise<void>;
-  observeGenesisResources?(target: GitHubRepositoryTarget, bundle: Pick<GenesisBundle, 'labels' | 'milestones' | 'issues'>): Promise<Record<string, unknown> | null>;
+  /**
+   * #1240 — with `repositoryNodeId`, the readback is the repository's at that node id, read before and
+   * after the lists, and every listed milestone and issue must name that repository (an answer naming
+   * another is thrown, never matched); an issue's milestone is judged by the milestone's node id.
+   */
+  observeGenesisResources?(target: GitHubRepositoryTarget, bundle: Pick<GenesisBundle, 'labels' | 'milestones' | 'issues'>, options?: { repositoryNodeId?: string }): Promise<Record<string, unknown> | null>;
+  /**
+   * #1240 — one STANDARD_WORK run's approved work on the repository at `repositoryNodeId`: the run's
+   * goal milestone and one issue per approved unit, each found by its marker on every page and created
+   * only when no issue carries it, the issue linked to the goal milestone. Writes nothing else.
+   */
+  ensureWorkIssues?(target: GitHubRepositoryTarget, repositoryNodeId: string, plan: WorkIssuesPlan): Promise<void>;
+  /** #1240 — the readback `ensureWorkIssues` is judged by, bound to the repository as `observeGenesisResources` is. */
+  observeWorkIssues?(target: GitHubRepositoryTarget, repositoryNodeId: string, plan: WorkIssuesPlan): Promise<ObservedWorkIssues>;
   observeBranch(target: GitHubRepositoryTarget, branch: string): Promise<ObservedBranch | null>;
   pushBranch(target: GitHubRepositoryTarget, branch: string, checkoutPath: string, commitSha: string): Promise<void>;
   /** A read: brings an already-pushed commit into a fresh local checkout on resume. */
@@ -342,6 +382,44 @@ const remoteUrl = (target: GitHubRepositoryTarget): string =>
 
 const repoPath = (target: GitHubRepositoryTarget): string => `repos/${target.owner}/${target.name}`;
 
+const LIST_PAGE = 100;
+const LIST_PAGE_BOUND = 100;
+
+interface ListedMilestone { number: number; node_id: string; title: string; description: string; url?: unknown }
+interface ListedIssue {
+  number: number;
+  node_id: string;
+  title: string;
+  body: string | null;
+  labels: Array<{ name: string }>;
+  milestone: { number: number; node_id: string; url?: unknown } | null;
+  repository_url?: unknown;
+  pull_request?: unknown;
+}
+
+/** An API URL names `/repos/<full name>` exactly, in GitHub's case-insensitive spelling, then `rest`. */
+const namesRepository = (url: unknown, fullName: string, rest: string): boolean =>
+  typeof url === "string" && url.toLowerCase().endsWith(`/repos/${fullName.toLowerCase()}${rest}`);
+
+const foreign = (what: string, fullName: string, url: unknown): never => {
+  throw acpError(ReasonCode.RESOURCE_COLLISION, `${what} in GitHub's answer belongs to another repository than ${fullName}: ${String(url)}`, {
+    refusal: "FOREIGN_REPOSITORY_RESPONSE", repository: fullName, url: typeof url === "string" ? url : null,
+  });
+};
+
+/** #1240 — a listed milestone is the repository's own, or the answer is refused. */
+const ownMilestone = (fullName: string, milestone: ListedMilestone): ListedMilestone =>
+  namesRepository(milestone.url, fullName, `/milestones/${milestone.number}`) ? milestone : foreign(`milestone ${milestone.number}`, fullName, milestone.url);
+
+/** #1240 — a listed issue, and the milestone it links, are the repository's own, or the answer is refused. */
+const ownIssue = (fullName: string, issue: ListedIssue): ListedIssue => {
+  if (!namesRepository(issue.repository_url, fullName, "")) foreign(`issue ${issue.number}`, fullName, issue.repository_url);
+  if (issue.milestone != null && !namesRepository(issue.milestone.url, fullName, `/milestones/${issue.milestone.number}`)) {
+    foreign(`issue ${issue.number}'s milestone`, fullName, issue.milestone.url);
+  }
+  return issue;
+};
+
 export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): GitHubWritePort => {
   const { client } = options;
   const runGit: GitRunner = options.git ?? ((cwd, args) => git(cwd, args, { allowFailure: true }));
@@ -355,6 +433,27 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
   };
   const branchPath = (target: GitHubRepositoryTarget, branch: string): string =>
     `${repoPath(target)}/branches/${encodeURIComponent(branch)}`;
+  /** #1240 — every page of a GitHub list, bounded; a list that does not end is refused, never cut short. */
+  const listAll = async <T>(path: string): Promise<T[]> => {
+    const all: T[] = [];
+    for (let page = 1; page <= LIST_PAGE_BOUND; page += 1) {
+      const rows = await client.request<unknown>("GET", `${path}&per_page=${LIST_PAGE}&page=${page}`);
+      if (!Array.isArray(rows)) throw acpError(ReasonCode.INTERNAL_ERROR, "GitHub's list answer is not a list", { path, page });
+      all.push(...(rows as T[]));
+      if (rows.length < LIST_PAGE) return all;
+    }
+    throw acpError(ReasonCode.INTERNAL_ERROR, "GitHub's list did not end within its page bound", { path, pages: LIST_PAGE_BOUND });
+  };
+  /** #1240 — the repository at the name is the one at the recorded node id; its GitHub-spelled full name. */
+  const identified = async (target: GitHubRepositoryTarget, repositoryNodeId: string): Promise<string> => {
+    const observed = repositoryFrom(await client.request<RepositoryDocument>("GET", repoPath(target)), repoPath(target));
+    if (observed.nodeId !== repositoryNodeId) {
+      throw acpError(ReasonCode.RESOURCE_COLLISION, `${target.owner}/${target.name} is not the repository at the recorded node id ${repositoryNodeId}; GitHub answers ${observed.nodeId}`, {
+        refusal: "WRONG_REPOSITORY", recordedNodeId: repositoryNodeId, observedNodeId: observed.nodeId,
+      });
+    }
+    return observed.fullName;
+  };
 
   return {
     observeRepository: (target) =>
@@ -489,16 +588,17 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
           await client.request("PATCH", `${repoPath(target)}/labels/${encodeURIComponent(existing.name)}`, {new_name:label.name,color:label.color,description:label.description});
         }
       }
-      const milestones = await client.request<Array<{number:number;title:string;description:string}>>("GET", `${repoPath(target)}/milestones?state=all&per_page=100`);
+      // #1240 — every page: a marker that sits on page two is still found, so it is never created twice.
+      const milestones = await listAll<ListedMilestone>(`${repoPath(target)}/milestones?state=all`);
       const numbers = new Map<string,number>();
       for (const milestone of bundle.milestones) {
         const description = `${milestone.description}\n<!-- acp-genesis:${milestone.key} -->`;
         let existing = milestones.find(m => m.description === description);
         if (existing && existing.title !== milestone.title) throw new Error('genesis milestone conflict');
-        existing ??= await client.request("POST", `${repoPath(target)}/milestones`, {title:milestone.title,description});
-        numbers.set(milestone.key,existing!.number);
+        existing ??= await client.request<ListedMilestone>("POST", `${repoPath(target)}/milestones`, {title:milestone.title,description});
+        numbers.set(milestone.key,existing.number);
       }
-      const issues = await client.request<Array<{title:string;body:string}>>("GET", `${repoPath(target)}/issues?state=all&per_page=100`);
+      const issues = await listAll<ListedIssue>(`${repoPath(target)}/issues?state=all`);
       for (const issue of bundle.issues) {
         const body = `${issue.body}\n<!-- acp-genesis:${issue.key} -->`;
         const existing = issues.find(i => i.body === body);
@@ -506,14 +606,63 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
         if (!existing) await client.request("POST", `${repoPath(target)}/issues`, {title:issue.title,body,labels:issue.labels,...(issue.milestoneKey === null ? {} : {milestone:numbers.get(issue.milestoneKey)})});
       }
     },
-    async observeGenesisResources(target, bundle) {
+    async observeGenesisResources(target, bundle, options) {
+      const repositoryNodeId = options?.repositoryNodeId;
+      const fullName = repositoryNodeId === undefined ? null : await identified(target, repositoryNodeId);
       const labels = await client.request<Array<{name:string;color:string;description:string}>>("GET", `${repoPath(target)}/labels?per_page=100`);
-      const milestones = await client.request<Array<{number:number;title:string;description:string}>>("GET", `${repoPath(target)}/milestones?state=all&per_page=100`);
-      const issues = await client.request<Array<{title:string;body:string;labels:Array<{name:string}>;milestone:{number:number}|null}>>("GET", `${repoPath(target)}/issues?state=all&per_page=100`);
+      const milestones = await listAll<ListedMilestone>(`${repoPath(target)}/milestones?state=all`);
+      const listed = await listAll<ListedIssue>(`${repoPath(target)}/issues?state=all`);
+      if (fullName !== null) {
+        // The lists were read between two reads of the repository at the receipted node id, and each item
+        // names that repository: an answer about another repository is not this one's readback.
+        milestones.forEach(m => ownMilestone(fullName, m));
+        listed.forEach(i => ownIssue(fullName, i));
+        await identified(target, repositoryNodeId!);
+      }
+      const issues = fullName === null ? listed : listed.filter(i => i.pull_request === undefined);
+      const markedMilestone = (key: string) => milestones.find(m => m.description.endsWith(`<!-- acp-genesis:${key} -->`));
+      // With the repository bound, a link is the milestone's node id; a number alone can name another one.
+      const linked = (x: ListedIssue, key: string): boolean => fullName === null
+        ? x.milestone?.number === markedMilestone(key)?.number
+        : x.milestone != null && x.milestone.node_id === markedMilestone(key)?.node_id;
       if (!bundle.labels.every(l => labels.some(x => x.name === l.name && sameIgnoringCase(x.color, l.color) && (x.description ?? '') === l.description))) return null;
       if (!bundle.milestones.every(m => milestones.some(x => x.title === m.title && x.description === `${m.description}\n<!-- acp-genesis:${m.key} -->`))) return null;
-      if (!bundle.issues.every(i => issues.some(x => x.title === i.title && x.body === `${i.body}\n<!-- acp-genesis:${i.key} -->` && canonicalLabels(x.labels.map(l => l.name)) === canonicalLabels(i.labels) && (i.milestoneKey === null ? x.milestone === null : x.milestone?.number === milestones.find(m => m.description.endsWith(`<!-- acp-genesis:${i.milestoneKey} -->`))?.number)))) return null;
+      if (!bundle.issues.every(i => issues.some(x => x.title === i.title && x.body === `${i.body}\n<!-- acp-genesis:${i.key} -->` && canonicalLabels(x.labels.map(l => l.name)) === canonicalLabels(i.labels) && (i.milestoneKey === null ? x.milestone === null : linked(x, i.milestoneKey))))) return null;
       return { labels:bundle.labels, milestones:bundle.milestones, issues:bundle.issues };
+    },
+    async ensureWorkIssues(target, repositoryNodeId, plan) {
+      const fullName = await identified(target, repositoryNodeId);
+      const milestones = (await listAll<ListedMilestone>(`${repoPath(target)}/milestones?state=all`)).map(m => ownMilestone(fullName, m));
+      const goal = milestones.filter(m => milestoneKeys(m.description).includes(plan.milestone.key));
+      if (goal.length > 1) throw acpError(ReasonCode.CONFLICT, `more than one milestone carries ${workMilestoneMarker(plan.milestone.key)}`, { milestones: goal.map(m => m.number) });
+      let milestone = goal[0];
+      if (milestone === undefined) {
+        // GitHub refuses a second milestone of the same title, so a goal another milestone already names
+        // takes its key as well; the marker, never the title, is what finds it again.
+        const title = milestones.some(m => sameIgnoringCase(m.title, plan.milestone.title)) ? `${plan.milestone.title} (${plan.milestone.key})` : plan.milestone.title;
+        milestone = ownMilestone(fullName, await client.request<ListedMilestone>("POST", `${repoPath(target)}/milestones`, { title, description: `${plan.milestone.description}\n${workMilestoneMarker(plan.milestone.key)}` }));
+      }
+      const issues = (await listAll<ListedIssue>(`${repoPath(target)}/issues?state=all`)).map(i => ownIssue(fullName, i)).filter(i => i.pull_request === undefined);
+      for (const planned of plan.issues) {
+        // Found by its marker wherever its body was edited since; created only when no issue carries it.
+        if (issues.some(i => unitKeys(i.body).includes(planned.unit.key))) continue;
+        await client.request("POST", `${repoPath(target)}/issues`, { title: planned.title, body: withWorkUnitMarker(planned.body, planned.unit), milestone: milestone.number });
+      }
+    },
+    async observeWorkIssues(target, repositoryNodeId, plan) {
+      const fullName = await identified(target, repositoryNodeId);
+      const milestones = (await listAll<ListedMilestone>(`${repoPath(target)}/milestones?state=all`)).map(m => ownMilestone(fullName, m));
+      const listed = (await listAll<ListedIssue>(`${repoPath(target)}/issues?state=all`)).map(i => ownIssue(fullName, i));
+      await identified(target, repositoryNodeId);
+      const planned = new Set(plan.issues.map(i => i.unit.key));
+      return {
+        repositoryNodeId,
+        milestones: milestones.filter(m => milestoneKeys(m.description).includes(plan.milestone.key)).map(m => ({ number: m.number, nodeId: m.node_id, title: m.title })),
+        issues: listed
+          .filter(i => i.pull_request === undefined)
+          .map(i => ({ number: i.number, nodeId: i.node_id, keys: unitKeys(i.body), milestoneNodeId: i.milestone?.node_id ?? null }))
+          .filter(i => i.keys.some(key => planned.has(key))),
+      };
     },
     async setDefaultBranch(target, branch) {
       await client.request("PATCH", repoPath(target), { default_branch: branch });
