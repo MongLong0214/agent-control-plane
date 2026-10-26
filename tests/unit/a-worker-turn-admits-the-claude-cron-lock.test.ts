@@ -189,7 +189,7 @@ describe("the resident CTO's Claude Code cron lock does not keep a worker turn f
     it("a fifo at the lock path, which git does not list", async () => {
       const target = world();
       mkdirSync(join(target.repoPath, ".claude"), { recursive: true });
-      execFileSync("mkfifo", [join(target.repoPath, CLAUDE_CRON_LOCK_PATH)]);
+      execFileSync("mkfifo", [join(target.repoPath, CLAUDE_CRON_LOCK_PATH)], { timeout: 10_000 });
       await expectRefused(target, CLAUDE_CRON_LOCK_PATH);
       expect(lstatSync(join(target.repoPath, CLAUDE_CRON_LOCK_PATH)).isFIFO()).toBe(true);
     });
