@@ -6,7 +6,7 @@ import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
-import { type AuditLog, type AuditRow, redact } from "../db/audit.ts";
+import { type AuditLog, type AuditRow, RECORDED_REFUSAL_KINDS, redact } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, type RunState } from "../domain/types.ts";
@@ -51,21 +51,6 @@ const VERIFICATION_WORKTREE_OWNER_RELEASE_STATES = TERMINAL_RUN_STATES;
 
 /** The guard's read operations, which it decides DIRECT without a grant to hold or consume. */
 const READ_OPERATIONS: ReadonlySet<unknown> = new Set(Object.values(ReadOperation));
-
-/**
- * #1213 — the `_REFUSED` kinds whose emitting path can change state before it records the refusal,
- * found by reading every emitter: a CTO recovery that already rotated the session credential (the
- * bootstrap CTO's also renewed and revoked its binding, or restored its run's owner), a Hermes adoption
- * that already created a session, and a Buzz refusal whose outbox message is then rejected. None of them
- * changes a task or an execution, but they are not plain refusals, so they still count as a change.
- */
-const REFUSALS_AFTER_A_CHANGE: ReadonlySet<string> = new Set([
-  "BOOTSTRAP_CTO_RECOVERY_REFUSED", "PRIMARY_CTO_RECOVERY_REFUSED",
-  "HERMES_CEO_AUTO_ADOPTION_REFUSED", "CEO_NOTIFICATION_BUZZ_REFUSED",
-]);
-
-/** An explicit refusal: a `_REFUSED` kind, the naming every refusal record in this repository uses. */
-const isExplicitRefusal = (kind: string): boolean => kind.endsWith("_REFUSED") && !REFUSALS_AFTER_A_CHANGE.has(kind);
 
 /** The exact admitted ingress operation used for owner-authorised repair. */
 export const REPAIR_OWNER_APPROVAL_OPERATION = "repair_execute";
@@ -450,12 +435,13 @@ export class RepairService {
     const namesTask = (value: unknown): boolean => value === taskId ||
       (value !== null && typeof value === "object" && Object.values(value).some(namesTask));
     // #1213 — a later record naming the task disqualifies the restore only if it may have changed something.
-    // It did not when it is an explicit refusal, when the continuity-hold classification records its kind
-    // only as a refusal, deferral or ignored input, or reads its outcome as not applied (a refused guard
-    // evaluation), or when it is a guard evaluation of a read. Every other kind, one added later included,
-    // counts as a change.
+    // It did not when it is a refusal of a kind src records (`RECORDED_REFUSAL_KINDS`; none of their paths
+    // changes a task or an execution), when the continuity-hold classification records its kind only as a
+    // refusal, deferral or ignored input, or reads its outcome as not applied (a refused guard evaluation),
+    // or when it is a guard evaluation of a read. Every other kind, an unknown or later one included, counts
+    // as a change.
     const mayHaveChanged = (event: AuditRow): boolean =>
-      !isExplicitRefusal(event.kind) &&
+      !RECORDED_REFUSAL_KINDS.has(event.kind) &&
       !CONTINUITY_HOLD_NON_MOVEMENT_KINDS.includes(event.kind) &&
       !(event.kind === "MANAGED_WRITE_GUARD" && READ_OPERATIONS.has(event.evidence["operation"])) &&
       isRecordedMovement({ kind: event.kind, reason_code: event.reasonCode, evidence_json: JSON.stringify(event.evidence) });
