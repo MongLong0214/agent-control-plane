@@ -744,6 +744,28 @@ export class WorkerTurnRunner {
       } else if (unresolvedUnidentifiedOrphans(this.ports.db, { executionId: row.execution_id }).length > 0) {
         return { reason: `execution ${row.execution_id} may have launched a process that was never recorded`, evidence };
       }
+      const unended = this.unendedGroupOf(runId, row.execution_id);
+      if (unended !== null) {
+        return {
+          reason: `execution ${row.execution_id} left a process group its cleanup did not confirm ended`,
+          evidence: { ...evidence, pgid: unended },
+        };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * S2 — a process group the provider reported its cleanup could not confirm ended (#1104), recorded
+   * with the execution's diagnostics, that is still not seen gone; one that cannot be named counts as
+   * not gone. A cancel before the spawn was reported leaves exactly this with no recorded pid.
+   */
+  private unendedGroupOf(runId: string, executionId: string): number | null {
+    for (const event of this.eventsFor(runId, executionId)) {
+      const group = event.evidence["processGroup"];
+      if (group === undefined || group === null) continue;
+      const pgid = typeof group === "object" ? Number((group as { pgid?: unknown }).pgid) : Number.NaN;
+      if (!Number.isSafeInteger(pgid) || pgid <= 1 || this.#processes.groupAlive(pgid)) return pgid;
     }
     return null;
   }
@@ -1699,6 +1721,9 @@ export class WorkerTurnRunner {
       spawned: turn.spawned,
       processGone: turn.processGone,
       error: (result?.error ?? turn.thrown)?.slice(0, 500) ?? null,
+      // S2 — kept on every outcome, a late one included: a group its cleanup did not confirm ended keeps
+      // the checkout from the run's next task (`settledWriter`) until it is seen gone.
+      ...(result?.processGroup ? { processGroup: result.processGroup } : {}),
     };
     // Observed for every outcome whose writer is gone, so a failure keeps the digest of whatever the
     // turn left behind. A writer that may still be running is not read at all.
@@ -2201,6 +2226,7 @@ export class WorkerTurnRunner {
       reason: evidence["reason"] ?? "UNKNOWN",
       reasonCode: evidence["reasonCode"] ?? null,
       diagnosticsRejected: full.decision.reasonCode,
+      ...(evidence["processGroup"] === undefined ? {} : { processGroup: evidence["processGroup"] }),
     });
     if (minimal.decision.allowed) return;
     attempt(null);

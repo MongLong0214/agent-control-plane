@@ -58,12 +58,9 @@ export type CheckoutWriter = (runId: string, worktreeId: string) => CheckoutWrit
 /** A registry with no runner attached cannot tell that a writer is gone, so it never hands a claim over. */
 const NO_RUNNER: CheckoutWriterFact = { reason: "no worker runner answers for the checkout", evidence: {} };
 
-/** The run's own HELD claim on a checkout, by the key its sibling rows share (`worker-turn.ts` claimFacts). */
+/** The run's own HELD worktree claim on a checkout, which a hand-over releases with its acquisition. */
 interface EarlierClaim {
   claimId: string;
-  ownerSessionId: string;
-  ownerBindingGeneration: number;
-  acquiredAt: string;
 }
 
 /**
@@ -242,6 +239,8 @@ export class ClaimRegistry {
           worktreeId: canonicalWorktree?.allowed ? canonicalWorktree.value : null,
           paths: request.declaredPaths ?? [],
           expiresAt,
+          // The exact rows of this acquisition, so a hand-over releases these and nothing acquired apart.
+          claimIds: created.map((claim) => claim.claimId),
           ...(earlier.value ? { handedOverFrom: earlier.value.claimId } : {}),
         },
       });
@@ -256,8 +255,8 @@ export class ClaimRegistry {
    * confirmed gone. Anything else refuses, the earlier claim untouched.
    */
   private earlierWorktreeClaim(request: ClaimRequest, worktree: string): Decision<EarlierClaim | null> {
-    const held = this.db.get<{ claim_id: string; owner_session_id: string; owner_binding_generation: number; acquired_at: string }>(
-      `SELECT claim_id, owner_session_id, owner_binding_generation, acquired_at FROM resource_claims
+    const held = this.db.get<{ claim_id: string }>(
+      `SELECT claim_id FROM resource_claims
         WHERE status = 'HELD' AND repository_identity = ? AND worktree_id = ? AND run_id = ?`,
       [request.repositoryIdentity, worktree, request.runId],
     );
@@ -277,32 +276,37 @@ export class ClaimRegistry {
         },
       );
     }
-    return allow(ReasonCode.OK, {
-      claimId: held.claim_id,
-      ownerSessionId: held.owner_session_id,
-      ownerBindingGeneration: held.owner_binding_generation,
-      acquiredAt: held.acquired_at,
-    });
+    return allow(ReasonCode.OK, { claimId: held.claim_id });
   }
 
   /**
-   * Releases every row of the earlier claim — its worktree, branch and paths, acquired together — in
-   * the transaction that inserts this claim, so the checkout passes from one claim of the run to the
-   * next and is never free to another run in between.
+   * Releases the rows of the earlier claim's own acquisition — its worktree, branch and paths, as its
+   * CLAIM_ACQUIRED record lists them — in the transaction that inserts this claim, so the checkout
+   * passes from one claim of the run to the next and is never free to another run in between. A claim
+   * acquired apart, even in the same millisecond, is not one of them; an acquisition with no list
+   * (recorded before the list existed) gives up its worktree row only.
    */
   private handOver(request: ClaimRequest, earlier: EarlierClaim, now: string): void {
+    const acquisition = this.db.get<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events
+        WHERE kind = 'CLAIM_ACQUIRED' AND run_id = ?
+          AND EXISTS (SELECT 1 FROM json_each(audit_events.evidence_json, '$.claimIds') WHERE value = ?)
+        ORDER BY event_id DESC LIMIT 1`,
+      [request.runId, earlier.claimId],
+    );
+    const listed = acquisition ? (JSON.parse(acquisition.evidence_json) as { claimIds?: unknown }).claimIds : undefined;
+    const claimIds = [...new Set([earlier.claimId, ...(Array.isArray(listed) ? listed.filter((id): id is string => typeof id === "string") : [])])];
     const released = this.db.run(
       `UPDATE resource_claims SET status = 'RELEASED', released_at = ?
-        WHERE status = 'HELD' AND run_id = ? AND repository_identity = ? AND owner_session_id = ?
-          AND owner_binding_generation = ? AND acquired_at = ?`,
-      [now, request.runId, request.repositoryIdentity, earlier.ownerSessionId, earlier.ownerBindingGeneration, earlier.acquiredAt],
+        WHERE status = 'HELD' AND run_id = ? AND claim_id IN (${claimIds.map(() => "?").join(", ")})`,
+      [now, request.runId, ...claimIds],
     ).changes;
     this.audit.record({
       kind: "CLAIM_RELEASED",
       runId: request.runId,
       sessionId: request.ownerSessionId,
       roleKey: request.ownerRoleKey,
-      evidence: { reason: "HANDED_OVER", claimId: earlier.claimId, released },
+      evidence: { reason: "HANDED_OVER", claimId: earlier.claimId, claimIds, released },
     });
   }
 

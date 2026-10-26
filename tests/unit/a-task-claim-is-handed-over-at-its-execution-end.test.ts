@@ -1,4 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { delimiter, join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { allow } from "../../src/core/errors.ts";
@@ -13,7 +15,7 @@ import {
   type ManagedInvocationWriteBroker,
 } from "../../src/runtime/provider.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
-import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { registerFixtureProject } from "../helpers/harness.ts";
 import { FakeWorkerAdapter, type FakeTurnScript } from "../helpers/worker-turn-fixture.ts";
 
@@ -188,6 +190,74 @@ class UnrecordedWriterAdapter extends FakeWorkerAdapter {
   /** Lets the dead daemon's pending invocation return, for cleanup only. */
   end(): void {
     this.#die?.();
+  }
+}
+
+/**
+ * A git on PATH that, on the turn's worker-commit ref update, leaves a real child in that git call's own
+ * process group (a non-interactive shell's background job keeps its group) and then runs the real git,
+ * so the turn goes on and succeeds. The child's exact pid is written to a file the test reads.
+ */
+const gitLeavingAChild = () => {
+  const realGit = (process.env["PATH"] ?? "").split(delimiter).map((dir) => join(dir, "git")).find((path) => existsSync(path))!;
+  const bin = tempDir("acp-s2-git-child-");
+  const pidFile = join(bin, "child.pid");
+  writeFileSync(join(bin, "git"), [
+    "#!/bin/sh",
+    'case "$*" in *"update-ref -m agent-control-plane: worker commit"*)',
+    "  /bin/sleep 600 </dev/null >/dev/null 2>&1 &",
+    `  echo $! > '${pidFile}'`,
+    `  exec '${realGit}' "$@";;`,
+    "esac",
+    `exec '${realGit}' "$@"`,
+    "",
+  ].join("\n"));
+  chmodSync(join(bin, "git"), 0o755);
+  return { bin, childPid: (): number | null => (existsSync(pidFile) ? Number(readFileSync(pidFile, "utf8").trim()) : null) };
+};
+
+const alive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * A provider whose turn is cancelled after its launch was admitted and before its spawn is reported:
+ * the runner refuses the report, the child it launched lives on, and its cleanup is not confirmed, so it
+ * answers the group it could not confirm ended (#1104). No pid is ever recorded for the execution.
+ */
+class CancelledBeforeSpawnAdapter extends FakeWorkerAdapter {
+  cancel: () => void = () => undefined;
+  child: ChildProcess | null = null;
+  spawnReportRefused = false;
+  constructor(private readonly admission: ManagedInvocationWriteBroker) {
+    super(admission);
+  }
+  override async invoke(request: InvocationRequest): Promise<InvocationResult> {
+    this.launches += 1;
+    await this.admission.authorize(request.managedWrite!, async () => {
+      this.cancel();
+      await vi.waitFor(() => expect(request.signal?.aborted).toBe(true), { timeout: 5_000, interval: 20 });
+      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+      this.child = child;
+      this.children.push(child);
+      try {
+        request.onSpawn?.(child.pid!, readProcessStartToken(child.pid!));
+      } catch {
+        this.spawnReportRefused = true;
+      }
+    });
+    const pgid = this.child?.pid ?? 0;
+    return {
+      ok: false, text: "", json: null, provider: "claude", model: "opus", durationMs: 0, exitCode: null,
+      error: `PROCESS_GROUP_UNCONFIRMED: the turn's own process group ${pgid} was not confirmed ended (UNVERIFIABLE)`,
+      providerSessionId: null, isolationAttested: false,
+      processGroup: { pgid, ownership: "UNVERIFIABLE", detail: "the witness's cleanup could not confirm the group ended" },
+    };
   }
 }
 
@@ -443,6 +513,118 @@ describe("S2 — while any writer of the previous execution may still exist, the
       }
     });
   });
+  it("git child: while a git child of the previous task's turn still runs in the checkout, the hand-over claim and task_worker_run are both refused; once it has exited, both are admitted", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s2-git-child");
+      const [one, two] = s.taskIds;
+      const worker = workerDoing(f, { writes: { "README.md": "# task one\n" } });
+      const git = gitLeavingAChild();
+      const path = process.env["PATH"];
+      let child: number | null = null;
+      try {
+        const first = await staffAndClaim(f, s, one);
+        process.env["PATH"] = `${git.bin}${delimiter}${path ?? ""}`;
+        const ran = await runTask(f, s, one, first.claimId);
+        expect(ran).toMatchObject({ ok: true });
+        await cp.workerTurns.settled(executionOf(ran));
+        process.env["PATH"] = path;
+        const ended = cp.tasks.execution(executionOf(ran))!;
+        expect(ended.status).toBe("SUCCEEDED");
+        expect(ended.workerProcessReleasedAt, "the worker process itself is gone").not.toBeNull();
+        child = git.childPid();
+        expect(child !== null && alive(child), "the turn's git child still runs").toBe(true);
+
+        // While it runs: the hand-over is refused and the earlier claim is untouched.
+        const target = await provision(f, s, two);
+        const handOver = await claim(f, s, target);
+        expect(handOver).toMatchObject({ ok: false, reasonCode: ReasonCode.CLAIM_WORKTREE_CONFLICT });
+        expect(String(handOver["message"])).toMatch(/this run's claim .*git child .*still running/);
+        expect(statusOf(f, first.claimId)).toBe("HELD");
+
+        // A claim taken after a release by hand does not let the next task in either.
+        expect(await f.cto(s.sessionId, "resource_release", { runId: s.runId })).toMatchObject({ ok: true });
+        const taken = await claim(f, s, target);
+        expect(taken).toMatchObject({ ok: true });
+        const entered = await runTask(f, s, two, worktreeClaimOf(taken));
+        expect(entered).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
+        expect(String(entered["message"])).toMatch(/git child .*still running .*no task of the run enters the checkout/);
+        expect(cp.tasks.executions(s.runId).filter((execution) => execution.taskId === two)).toHaveLength(0);
+        const again = await claim(f, s, target);
+        expect(again, "nor does a hand-over of that claim").toMatchObject({ ok: false, reasonCode: ReasonCode.CLAIM_WORKTREE_CONFLICT });
+
+        // The child exits (killed by its exact pid): the hand-over and the turn are both admitted.
+        process.kill(child!, "SIGKILL");
+        await vi.waitFor(() => expect(alive(child!)).toBe(false), { timeout: 5_000, interval: 20 });
+        const passed = await claim(f, s, target);
+        expect(passed, "the hand-over once the git child has exited").toMatchObject({ ok: true });
+        expect(statusOf(f, worktreeClaimOf(taken))).toBe("RELEASED");
+        worker.script = { writes: { "src/app.js": "module.exports = () => 2;\n" } };
+        const next = await runTask(f, s, two, worktreeClaimOf(passed));
+        expect(next, "task_worker_run once the git child has exited").toMatchObject({ ok: true });
+        await cp.workerTurns.settled(executionOf(next));
+        expect(cp.tasks.execution(executionOf(next))?.status).toBe("SUCCEEDED");
+      } finally {
+        process.env["PATH"] = path;
+        if (child !== null && alive(child)) process.kill(child, "SIGKILL");
+        worker.killAll();
+      }
+    });
+  });
+  it("cancel before the spawn is reported: an execution ABANDONED with no pid whose provider could not confirm its group ended keeps the hand-over claim and task_worker_run refused while the child lives", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s2-cancel-before-spawn");
+      const [one, two] = s.taskIds;
+      const run = cp.runs.require(s.runId);
+      const adapter = new CancelledBeforeSpawnAdapter(new GuardedInvocationWriteBroker(cp.guard));
+      adapter.cancel = () => {
+        expect(cp.tasks.abandonStaleExecutions(s.runId, run.ownerBindingGeneration! + 1, "cancelled for the witness")).toBe(1);
+      };
+      workerDoing(f, { writes: {} }, adapter);
+      let child: number | null = null;
+      try {
+        const first = await staffAndClaim(f, s, one);
+        const ran = await runTask(f, s, one, first.claimId);
+        expect(ran).toMatchObject({ ok: true });
+        await cp.workerTurns.settled(executionOf(ran));
+        const ended = cp.tasks.execution(executionOf(ran))!;
+        expect(ended.status).toBe("ABANDONED");
+        expect(ended.workerProcessId, "no pid was ever recorded").toBeNull();
+        expect(adapter.spawnReportRefused).toBe(true);
+        child = adapter.child!.pid!;
+        expect(alive(child), "the launched child lives on").toBe(true);
+
+        const target = await provision(f, s, two);
+        const handOver = await claim(f, s, target);
+        expect(handOver).toMatchObject({ ok: false, reasonCode: ReasonCode.CLAIM_WORKTREE_CONFLICT });
+        expect(String(handOver["message"])).toMatch(/this run's claim .*cleanup did not confirm ended/);
+        expect(handOver["evidence"]).toMatchObject({ claimId: first.claimId, writer: { executionId: executionOf(ran), pgid: child } });
+        expect(statusOf(f, first.claimId)).toBe("HELD");
+
+        expect(await f.cto(s.sessionId, "resource_release", { runId: s.runId })).toMatchObject({ ok: true });
+        const taken = await claim(f, s, target);
+        expect(taken).toMatchObject({ ok: true });
+        const entered = await runTask(f, s, two, worktreeClaimOf(taken));
+        expect(entered).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
+        expect(String(entered["message"])).toMatch(/cleanup did not confirm ended; no task of the run enters the checkout/);
+        expect(cp.tasks.executions(s.runId).filter((execution) => execution.taskId === two)).toHaveLength(0);
+
+        process.kill(child, "SIGKILL");
+        await vi.waitFor(() => expect(alive(child!)).toBe(false), { timeout: 5_000, interval: 20 });
+        const passed = await claim(f, s, target);
+        expect(passed, "the hand-over once the child has exited").toMatchObject({ ok: true });
+        workerDoing(f, { writes: { "src/app.js": "module.exports = () => 2;\n" } });
+        const next = await runTask(f, s, two, worktreeClaimOf(passed));
+        expect(next, "task_worker_run once the child has exited").toMatchObject({ ok: true });
+        await cp.workerTurns.settled(executionOf(next));
+        expect(cp.tasks.execution(executionOf(next))?.status).toBe("SUCCEEDED");
+      } finally {
+        if (child !== null && alive(child)) process.kill(child, "SIGKILL");
+        adapter.killAll();
+      }
+    });
+  });
 });
 
 describe("S2 — cross-run exclusivity is unchanged", () => {
@@ -473,6 +655,40 @@ describe("S2 — cross-run exclusivity is unchanged", () => {
       } finally {
         worker.killAll();
       }
+    });
+  });
+
+  it("same millisecond: the hand-over releases only the earlier claim's own acquisition, not a reservation acquired apart at the same instant, which another run is still refused", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s2-same-ms");
+      const [one, two] = s.taskIds;
+      const claimIdsOf = (answer: Record<string, unknown>): string[] =>
+        (answer["value"] as { claims: Array<{ claimId: string }> }).claims.map((row) => row.claimId);
+      const firstTarget = await provision(f, s, one);
+      const first = await claim(f, s, firstTarget);
+      expect(first).toMatchObject({ ok: true });
+      const reserved = await f.cto(s.sessionId, "resource_claim", {
+        runId: s.runId, repositoryIdentity: firstTarget.repositoryIdentity, declaredPaths: ["docs/reserved.md"],
+      });
+      expect(reserved).toMatchObject({ ok: true });
+      const [reservation] = claimIdsOf(reserved) as [string];
+      const acquiredAt = (claimId: string): string =>
+        cp.db.get<{ acquired_at: string }>(`SELECT acquired_at FROM resource_claims WHERE claim_id = ?`, [claimId])!.acquired_at;
+      expect(acquiredAt(reservation), "the clock did not move between the two acquisitions").toBe(acquiredAt(worktreeClaimOf(first)));
+
+      const second = await claim(f, s, await provision(f, s, two));
+      expect(second).toMatchObject({ ok: true });
+      expect(claimIdsOf(first).map((claimId) => statusOf(f, claimId)), "the earlier acquisition: worktree, branch, path")
+        .toEqual(["RELEASED", "RELEASED", "RELEASED"]);
+      expect(statusOf(f, reservation), "the reservation acquired apart").toBe("HELD");
+
+      const other = await s.dispatchRun();
+      const taken = await f.cto(s.sessionId, "resource_claim", {
+        runId: other, repositoryIdentity: firstTarget.repositoryIdentity, declaredPaths: ["docs/reserved.md"],
+      });
+      expect(taken, "another run").toMatchObject({ ok: false, reasonCode: ReasonCode.CLAIM_PATH_CONFLICT });
+      expect(taken["evidence"]).toMatchObject({ heldByRun: s.runId, claimId: reservation });
     });
   });
 });
