@@ -529,7 +529,10 @@ describe("task_worker_provision mints a task's first WORKER binding (#512)", () 
         const refused = await peer.call("task_worker_provision", {
           idempotencyKey: randomUUID(), runId: f.runId, taskId: f.taskId, provider: "claude",
         });
-        expect(refused.reasonCode).toBe(ReasonCode.MCP_PEER_UNAUTHENTICATED);
+        // The stranger's session is real and currently authenticated; the run-owner fence refuses
+        // it for not owning this run, so S9 (CEO 2026-10-26) names that RUN_OWNER_REVOKED, not an
+        // authentication failure.
+        expect(refused.reasonCode).toBe(ReasonCode.RUN_OWNER_REVOKED);
       } finally {
         await peer.close();
       }
@@ -594,7 +597,10 @@ describe("task_worker_provision mints a task's first WORKER binding (#512)", () 
         if (!switched.allowed) throw new Error(switched.message);
       };
       const refused = await f.provision();
-      expect(refused.reasonCode).toBe(ReasonCode.MCP_PEER_UNAUTHENTICATED);
+      // The original owner's session is still a real, currently authenticated session; the
+      // takeover moved the run's owner away from it, so S9 (CEO 2026-10-26) names that
+      // RUN_OWNER_REVOKED, not an authentication failure.
+      expect(refused.reasonCode).toBe(ReasonCode.RUN_OWNER_REVOKED);
       expectSpawnedAndStopped(f, 0);
     });
   });
@@ -616,7 +622,10 @@ describe("task_worker_provision mints a task's first WORKER binding (#512)", () 
         if (!switched.allowed) throw new Error(switched.message);
       };
       const refused = await f.provision();
-      expect(refused.reasonCode).toBe(ReasonCode.MCP_PEER_UNAUTHENTICATED);
+      // Same cause as the prior case, caught at the capacity-admission re-check instead of
+      // session start: a real, currently authenticated owner whose takeover-moved run is now
+      // RUN_OWNER_REVOKED (S9, CEO 2026-10-26), not MCP_PEER_UNAUTHENTICATED.
+      expect(refused.reasonCode).toBe(ReasonCode.RUN_OWNER_REVOKED);
       expectNothingSpawned(f, 0);
     });
   });

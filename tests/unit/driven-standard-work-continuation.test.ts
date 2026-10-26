@@ -814,7 +814,10 @@ describe("R1-01 (a), CEO e64aa10b — contract_get gives a STANDARD_WORK run's c
       expect(otherRun["ok"]).toBe(false);
       const bootstrapOwner = cp.runs.require(bootstrapRunId).ownerSessionId!;
       const repoFactory = await read(bootstrapOwner, runId);
-      expect(repoFactory).toMatchObject({ ok: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED });
+      // `bootstrapOwner` is a real, currently authenticated session -- just not this run's owner
+      // (S9, CEO 2026-10-26), so the owner fence names that cause as RUN_OWNER_REVOKED, not an
+      // authentication failure.
+      expect(repoFactory).toMatchObject({ ok: false, reasonCode: ReasonCode.RUN_OWNER_REVOKED });
       expect(JSON.stringify(repoFactory)).not.toContain(taskId);
       // A stale generation: the role rebound to another session while the run is pinned to the first.
       expect(cp.runs.transition(runId, RunState.BLOCKED, "test: blocked for the rebind").allowed).toBe(true);
