@@ -147,8 +147,14 @@ const assertCtoRunPeerFromSource = (
   }
   const run = source.runs.get(runId);
   if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+  // S9 (CEO 2026-10-26) — the peer above is a current, authenticated session; this is not an
+  // authentication failure but the owner fence naming a different cause: an authenticated
+  // identity that is not, or is no longer, this run's pinned owner. `RUN_OWNER_REVOKED` is the
+  // code `RunEngine.assertOwner` and `projectlessOwnerBinding` already use for exactly this
+  // (`!run.ownerRoleKey` cannot fire on its own: the owner columns are only ever written together,
+  // so an unpinned run already fails the `ownerSessionId` comparison against a truthy peer id).
   if (run.ownerSessionId !== peer.sessionId || run.ownerSessionIncarnation !== peer.sessionIncarnation || !run.ownerRoleKey) {
-    return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "authenticated CTO peer does not own this run", { runId });
+    return deny(ReasonCode.RUN_OWNER_REVOKED, "authenticated CTO peer does not own this run", { runId });
   }
   const binding = source.bindings.active(run.ownerRoleKey);
   if (!binding || binding.sessionId !== peer.sessionId || binding.sessionIncarnation !== peer.sessionIncarnation || binding.bindingGeneration !== run.ownerBindingGeneration) {

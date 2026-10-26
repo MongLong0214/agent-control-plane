@@ -290,7 +290,10 @@ describe("an adopted canonical CTO receives its dispatch in band", () => {
         "run_ack",
         { idempotencyKey: "ack-other", runId: f.runId, messageId: f.messageId },
       );
-      expect(otherAck).toMatchObject({ ok: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED });
+      // `other` is a real, currently authenticated session -- just not this run's owner (S9, CEO
+      // 2026-10-26), so the owner fence names that cause as RUN_OWNER_REVOKED, not an authentication
+      // failure.
+      expect(otherAck).toMatchObject({ ok: false, reasonCode: ReasonCode.RUN_OWNER_REVOKED });
       expect(outboxRow(f.h, f.messageId)?.status).toBe("PENDING");
       expect(f.h.cp.audit.byKind("OUTBOX_ACKED_IN_BAND")).toHaveLength(0);
 

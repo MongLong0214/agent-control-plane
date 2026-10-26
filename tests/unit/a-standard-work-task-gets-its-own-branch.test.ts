@@ -10,6 +10,7 @@ import { classifyBranch, validateBranchContract } from "../../src/github/branch-
 import { GuardedInvocationWriteBroker } from "../../src/runtime/provider.ts";
 import type { CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
+import { callCtoTool } from "../helpers/cto-tool.ts";
 import { cleanupTempDirs, commitAll, gitSync, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { fixtureManifest, registerFixtureProject } from "../helpers/harness.ts";
 import { FakeWorkerAdapter, type FakeTurnScript } from "../helpers/worker-turn-fixture.ts";
@@ -1239,9 +1240,11 @@ describe("a checkout that is not clean or not the writer's", () => {
       });
       const taskId = s.taskIds[0]!;
       const { target, claimId } = await staffAndClaim(f, s, taskId);
-      // Another caller: the project's bootstrap run's owner, which does not own this run.
+      // Another caller: the project's bootstrap run's owner, which does not own this run. It is a
+      // currently authenticated session (S9, CEO 2026-10-26) — not an authentication failure — so
+      // the owner fence refuses it as RUN_OWNER_REVOKED, not MCP_PEER_UNAUTHENTICATED.
       const outsider = f.harness.cp.runs.require(s.bootstrapRunId).ownerSessionId!;
-      expect(await runTask(f, s, taskId, claimId, outsider)).toMatchObject({ ok: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED });
+      expect(await runTask(f, s, taskId, claimId, outsider)).toMatchObject({ ok: false, reasonCode: ReasonCode.RUN_OWNER_REVOKED });
       // The checkout is on someone's other branch: neither the task's nor the run's base.
       gitSync(s.repo, ["checkout", "-q", "-b", "someone/else"]);
       const refsBefore = refsOf(s.repo);
@@ -1256,6 +1259,47 @@ describe("a checkout that is not clean or not the writer's", () => {
       expect(branchOf(s.repo)).toBe("dev");
       expect(f.harness.cp.tasks.executions(s.runId)).toEqual([]);
       expect(events(f, PREPARED, s.runId)).toEqual([]);
+    });
+  });
+});
+
+/**
+ * S9 (CEO 2026-10-26) — `assertCtoRunPeerFromSource`'s owner fence (cto-server.ts, ~line 150) used
+ * to answer a non-owner with the same code as a genuine authentication failure. Two witnesses, each
+ * targeted at one of the fence's two distinct branches, so a revert of either shows up here directly
+ * rather than only as a side effect of the heavier branch-creation scenarios above.
+ */
+describe("S9 — the owner fence names its cause, not an authentication failure", () => {
+  it("an authenticated session that is not this run's owner is refused RUN_OWNER_REVOKED, never MCP_PEER_UNAUTHENTICATED", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "stb-s9-owner", {
+        tasks: [{ key: "readme", title: "update README.md", category: "docs", spec: { writeTarget: { paths: ["README.md"] } } }],
+      });
+      // A real, currently authenticated session -- the sibling bootstrap run's owner -- asking
+      // about a run it never owned. Its credential is fine; only the ownership pin refuses it.
+      const outsider = f.harness.cp.runs.require(s.bootstrapRunId).ownerSessionId!;
+      const incarnation = f.harness.cp.sessions.get(outsider)!.incarnation;
+      const answer = await callCtoTool(f.harness, { sessionId: outsider, incarnation }, "contract_get", { runId: s.runId });
+      expect(answer).toMatchObject({ ok: false, reasonCode: ReasonCode.RUN_OWNER_REVOKED });
+      expect(answer["reasonCode"]).not.toBe(ReasonCode.MCP_PEER_UNAUTHENTICATED);
+    });
+  });
+
+  it("a stale session incarnation -- a real authentication failure -- still gets MCP_PEER_UNAUTHENTICATED", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "stb-s9-auth", {
+        tasks: [{ key: "readme", title: "update README.md", category: "docs", spec: { writeTarget: { paths: ["README.md"] } } }],
+      });
+      // The run's real, pinned owner session id, but a claimed incarnation the session registry
+      // does not recognise as current: a credential failure, not an ownership one. The fence must
+      // refuse this before it ever reasons about run ownership.
+      const answer = await callCtoTool(
+        f.harness,
+        { sessionId: s.sessionId, incarnation: "stale-incarnation-does-not-exist" },
+        "contract_get",
+        { runId: s.runId },
+      );
+      expect(answer).toMatchObject({ ok: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED });
     });
   });
 });
