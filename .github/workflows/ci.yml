@@ -75,17 +75,20 @@ env:
 # `scripts/lib/prepush-gates.mjs`, split on the suite alone, so every gate runs in every run — the
 # suite excepted only on a push whose exact tree a pull-request run already passed (`test-reuse`).
 jobs:
-  # Whether this run may skip the suite because a pull-request run already passed every shard on
-  # this exact tree. Only a `push` can say yes, and only when `scripts/ci-reuse-verified-tree.mjs`
-  # proves it from GitHub's own records — read that file for the six conditions. Every other event,
-  # and every unproven or unreadable case, answers no and the shards run. This job never fails the
-  # run by answering no; if it fails outright its output is empty, and empty also runs the shards.
+  # Whether this run may skip the suite because the pull-request run this push merged already
+  # passed every shard on the tree, base and workflow it lands. Only a `push` can say yes, and only
+  # when `scripts/ci-reuse-verified-tree.mjs` proves it — read that file for the six conditions:
+  # the run is the one on the squash's `Merged-Head`, and the `ci-executed-*` record each of its
+  # jobs wrote from its own checkout matches this push. Every other event, and every unproven or
+  # unreadable case, answers no and the shards run. This job never fails the run by answering no;
+  # if it fails outright its output is empty, and empty also runs the shards.
   test-reuse:
     name: test reuse
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # Read-only: the run and job records of earlier pull-request runs of this workflow.
+      # Read-only: the run, job and artifact records of the pull-request run this push merged, and
+      # its `ci-executed-*` artifacts, which `gh run download` fetches with this same read scope.
       actions: read
     outputs:
       reuse: ${{ steps.decide.outputs.reuse }}
@@ -140,6 +143,17 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
+      # What this job executes, read from its own checkout before any gate runs: on `pull_request`
+      # that is GitHub's synthetic merge, whose first parent is the base it was tested against. A
+      # later `main` push reuses this run only if every job's record matches what it lands.
+      # `overwrite` so a re-run job replaces its own record rather than failing on the name.
+      - run: node scripts/ci-reuse-verified-tree.mjs --record gates
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: ci-executed-gates
+          path: evidence/local/ci-executed.json
+          if-no-files-found: error
+          overwrite: true
       # `pnpm trailers` spawns `commitlore` to judge a message carrying more than one record: SPEC
       # §2.4 recovers separate identified record paragraphs, and git's trailer parser, which reads
       # only the last one, is not that authority. A hosted runner has no such program, so the spawn
@@ -228,6 +242,14 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
+      # This shard's record of what it executes; see the same step in `gates`.
+      - run: node scripts/ci-reuse-verified-tree.mjs --record shard-${{ matrix.shard }}
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: ci-executed-shard-${{ matrix.shard }}
+          path: evidence/local/ci-executed.json
+          if-no-files-found: error
+          overwrite: true
       - run: pnpm ci:commitlore
       - run: pnpm install --frozen-lockfile
       - run: pnpm rebuild better-sqlite3

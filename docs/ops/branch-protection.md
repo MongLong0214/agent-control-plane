@@ -12,10 +12,11 @@ The CI workflow is `project-ci` (`.github/workflows/ci.yml`), and **the bare `ve
 required status check context** — that is a job check name GitHub reports, not the workflow name.
 Its jobs, and what each contributes to that check:
 
-- `test-reuse`, displayed as `test reuse`, decides whether a `push` may skip the suite because a
-  pull-request run of this workflow already passed every shard on the identical tree
-  (`scripts/ci-reuse-verified-tree.mjs`, which reads only GitHub's run, job, commit and compare
-  records). Every other event, and every unproven case, runs the suite;
+- `test-reuse`, displayed as `test reuse`, decides whether a `push` may skip the suite because the
+  same-repository pull-request run on the squash's `Merged-Head` already passed every shard, and the
+  `ci-executed-*` record each of its jobs wrote from its own checkout names this push's tree, parent
+  and workflow blob (`scripts/ci-reuse-verified-tree.mjs`). Every other event, and every unproven
+  case, runs the suite;
 - `gates`, displayed as `verify (gates)`, runs every gate in the pre-push manifest except the suite
   (`pnpm gates --no-tests`), once, on every event;
 - `verify-matrix`, displayed as `verify (shard 1/3)` through `verify (shard 3/3)`, runs the suite
