@@ -296,6 +296,35 @@ describe("a multi-task candidate is every SUCCEEDED task's result on the pinned 
     });
   });
 
+  it("two tasks that change one path to the same bytes, merged by hand so HEAD holds both, are still refused by name", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s6c-merged-overlap", [README, { ...README, key: "readme-again", title: "update readme again" }]);
+      const worker = workerDoing(f);
+      try {
+        const first = await runToSuccess(f, s, worker, s.ids["readme"]!, { writes: { "README.md": "# same\n" } });
+        const second = await runToSuccess(f, s, worker, s.ids["readme-again"]!, { writes: { "README.md": "# same\n" } });
+        // On the second task's branch, the first task's commit merged in: identical bytes, a clean merge.
+        gitSync(s.repo, ["merge", "-q", "--no-edit", first.commit]);
+        expect(isAncestor(s.repo, first.commit, "HEAD")).toBe(true);
+        expect(isAncestor(s.repo, second.commit, "HEAD")).toBe(true);
+        expect(fileAt(s.repo, "HEAD", "README.md")).toBe("# same");
+        const refsBefore = refsOf(s.repo);
+        const frozen = await cp.pipeline.freeze(s.runId);
+        const pair = [s.ids["readme"]!, s.ids["readme-again"]!].sort();
+        expect(frozen).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT, evidence: { conflicts: [{ tasks: pair, paths: ["README.md"] }] } });
+        if (frozen.allowed) return;
+        expect(frozen.message).toContain(`${pair[0]} and ${pair[1]} both change README.md`);
+        expect(cp.runs.currentCandidate(s.runId)).toBeNull();
+        expect(cp.audit.byKind("CANDIDATE_FROZEN").filter((row) => row.runId === s.runId)).toEqual([]);
+        expect(refsOf(s.repo)).toBe(refsBefore);
+        expect(integrationWorktrees(f, s.runId)).toEqual([]);
+      } finally {
+        worker.killAll();
+      }
+    });
+  });
+
   it("an integrated candidate reaches the CEO packet through the real pipeline, and a later commit on the checkout stales it at confirmation", async () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;

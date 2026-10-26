@@ -249,8 +249,9 @@ const withPinned = async <T>(workTree: string, prefix: string, read: (repo: Pinn
 };
 
 /**
- * The run's integrated candidate in one repository, or null when the checkout's HEAD already holds
- * every SUCCEEDED task's commit (a single-task run, as before), or there is no result at all.
+ * The run's integrated candidate in one repository, or null when no two tasks' changes overlap and
+ * the checkout's HEAD already holds every SUCCEEDED task's commit (a single-task run, as before), or
+ * there is no result at all. Overlapping tasks are refused either way.
  */
 export const integrateTaskResults = async (input: {
   db: Db;
@@ -272,6 +273,26 @@ export const integrateTaskResults = async (input: {
     const headRead = await runPinnedGit(repo, ["rev-parse", "--verify", "-q", "HEAD^{commit}"]);
     const checkoutHead = headRead.exitCode === 0 ? headRead.stdout.trim() : null;
     if (checkoutHead === null) return allow(ReasonCode.OK, null);
+    const ordered = integrationOrder(input.tasks, results);
+    if (!ordered) {
+      return deny(ReasonCode.TASK_DEPENDENCY_CYCLE, "the run's task graph has a cycle, so no integration order exists", { runId: input.runId });
+    }
+    // Each task's change against its own recorded pinned base, read once.
+    const changesOf = new Map<string, Change[]>();
+    for (const result of ordered) changesOf.set(result.taskId, await committedChanges(repo, result.baseSha, result.commit));
+    // S6 review r2 — two tasks that change one path, or a path and one beneath it, are a conflict
+    // whether or not the checkout's HEAD already holds both commits: a merge someone made by hand
+    // is not the control plane choosing between them. So this is asked before the shortcut below.
+    const conflicts = pathConflicts(ordered.map((result) => ({ taskId: result.taskId, paths: changesOf.get(result.taskId)!.map((change) => change.path) })));
+    if (conflicts.length > 0) {
+      const named = conflicts.map((conflict) => `${conflict.tasks.join(" and ")} both change ${conflict.paths.join(", ")}`).join("; ");
+      return deny(
+        ReasonCode.CONFLICT,
+        `the run's task results cannot be integrated: ${named}. The candidate is not frozen; the control plane does not choose between them`,
+        { repositoryIdentity: input.repositoryIdentity, baseSha: ordered[0]!.baseSha, conflicts: conflicts.slice(0, 20) },
+      );
+    }
+    // No overlap, and HEAD already holds every task's commit: the candidate is HEAD, as before.
     const contained = await Promise.all(results.map((result) => isAncestor(repo, result.commit, checkoutHead)));
     if (contained.every((answer) => answer === true)) return allow(ReasonCode.OK, null);
 
@@ -281,10 +302,6 @@ export const integrateTaskResults = async (input: {
         repositoryIdentity: input.repositoryIdentity,
         origins: results.map((result) => ({ taskId: result.taskId, declaredParent: result.declaredParent, baseSha: result.baseSha })),
       });
-    }
-    const ordered = integrationOrder(input.tasks, results);
-    if (!ordered) {
-      return deny(ReasonCode.TASK_DEPENDENCY_CYCLE, "the run's task graph has a cycle, so no integration order exists", { runId: input.runId });
     }
     const baseSha = ordered[0]!.baseSha;
     const planned: Planned[] = [];
@@ -299,16 +316,8 @@ export const integrateTaskResults = async (input: {
           readFailed: descends === null,
         });
       }
-      planned.push({ result, changes: await committedChanges(repo, baseSha, result.commit) });
-    }
-    const conflicts = pathConflicts(planned.map((step) => ({ taskId: step.result.taskId, paths: step.changes.map((change) => change.path) })));
-    if (conflicts.length > 0) {
-      const named = conflicts.map((conflict) => `${conflict.tasks.join(" and ")} both change ${conflict.paths.join(", ")}`).join("; ");
-      return deny(
-        ReasonCode.CONFLICT,
-        `the run's task results cannot be integrated: ${named}. The candidate is not frozen; the control plane does not choose between them`,
-        { repositoryIdentity: input.repositoryIdentity, baseSha, conflicts: conflicts.slice(0, 20) },
-      );
+      // One origin by now, so each change was read against this base.
+      planned.push({ result, changes: changesOf.get(result.taskId)! });
     }
     return allow(ReasonCode.OK, { checkoutHead, baseSha, planned, format: await objectFormatOf(repo) });
   });
