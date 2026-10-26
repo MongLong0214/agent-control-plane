@@ -512,6 +512,11 @@ const asTheWorker = (home: string | undefined): Parameters<typeof runPinnedGit>[
  * every read still freshens. Forced true, it names the real shared index exactly when the index on disk
  * is split, and an all-zero one when it is not. A `sharedindex.*` file the index no longer uses (left
  * by `git update-index --no-split-index`) is not read and does not count. Writes nothing.
+ *
+ * A sparse index cannot be split, and the forced probe refuses on one ("cannot use split index with a
+ * sparse index"). That refusal, in a repository configured for a sparse index (`index.sparse` and
+ * `core.sparseCheckout`), reads as inactive; any other failure of the probe fails closed. The probe still
+ * runs there: an index split before sparse-index was turned on stays split, and is reported active.
  */
 export const splitIndexOf = async (repo: PinnedRepository, home: string | undefined): Promise<{ configured: boolean; active: boolean }> => {
   const options = asTheWorker(home);
@@ -519,11 +524,18 @@ export const splitIndexOf = async (repo: PinnedRepository, home: string | undefi
   if (setting.exitCode !== 0 && setting.exitCode !== 1) {
     throw new Error(`git config core.splitIndex ${setting.exitCode === null ? "did not answer" : `exited ${setting.exitCode}`}: ${setting.stderr.slice(0, 300)}`);
   }
-  const shared = await must(repo, ["-c", "core.splitIndex=true", "rev-parse", "--shared-index-path"], options);
-  return {
-    configured: setting.exitCode === 0 && setting.stdout.trim() === "true",
-    active: /sharedindex\.[0-9a-f]*[1-9a-f][0-9a-f]*$/.test(shared.trim()),
-  };
+  const configured = setting.exitCode === 0 && setting.stdout.trim() === "true";
+  const sparse = await runPinnedGit(repo, ["config", "-z", "--type=bool", "--get-regexp", "^(index\\.sparse|core\\.sparsecheckout)$"], options);
+  if (sparse.exitCode !== 0 && sparse.exitCode !== 1) {
+    throw new Error(`git config index.sparse ${sparse.exitCode === null ? "did not answer" : `exited ${sparse.exitCode}`}: ${sparse.stderr.slice(0, 300)}`);
+  }
+  // `-z` prints `key\nvalue\0` per value; the last value of a key is the one git uses.
+  const sparseSettings = new Map(sparse.stdout.split("\0").filter(Boolean).map((entry) => entry.split("\n", 2) as [string, string]));
+  const sparseIndex = sparseSettings.get("index.sparse") === "true" && sparseSettings.get("core.sparsecheckout") === "true";
+  const shared = await runPinnedGit(repo, ["-c", "core.splitIndex=true", "rev-parse", "--shared-index-path"], options);
+  if (shared.exitCode === 0) return { configured, active: /sharedindex\.[0-9a-f]*[1-9a-f][0-9a-f]*$/.test(shared.stdout.trim()) };
+  if (sparseIndex && shared.exitCode === 128 && shared.stderr.includes("cannot use split index with a sparse index")) return { configured, active: false };
+  throw new Error(`git rev-parse --shared-index-path ${shared.exitCode === null ? "did not answer" : `exited ${shared.exitCode}`}: ${shared.stderr.slice(0, 300)}`);
 };
 
 /** One git-dir entry that differs between two `gitDirEntries` readings; never its contents. */

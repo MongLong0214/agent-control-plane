@@ -479,6 +479,12 @@ describe("#1246 (g) a repository that keeps a split index", () => {
       gitSync(repo, ["update-index", "--split-index"]);
       gitSync(repo, ["config", "core.splitIndex", "false"]);
     }, { configured: false, active: true }],
+    // Git does not make a split index sparse: configured for a sparse index, it is still split.
+    ["the index split, then a sparse index configured", (repo) => {
+      gitSync(repo, ["update-index", "--split-index"]);
+      gitSync(repo, ["sparse-checkout", "init", "--cone", "--sparse-index"]);
+      gitSync(repo, ["sparse-checkout", "set", "src"]);
+    }, { configured: false, active: true }],
   ];
 
   it("is refused before anything is prepared or launched, naming core.splitIndex, and nothing is left behind", async () => {
@@ -509,6 +515,40 @@ describe("#1246 (g) a repository that keeps a split index", () => {
         attempts: world.audit.byKind("TASK_BRANCH_CREATING").length,
       }, name).toEqual({ launches: 0, executions: 0, head: "dev", refs, branchRecords, attempts: 0 });
     }
+  });
+
+  it("a sparse index, which cannot be split, passes the check and the worker is launched", async () => {
+    const world = freshRacyWorld("main");
+    gitSync(world.repoPath, ["sparse-checkout", "init", "--cone", "--sparse-index"]);
+    gitSync(world.repoPath, ["sparse-checkout", "set", "src"]);
+    const adapter = new FakeWorkerAdapter(world.broker);
+    adapters.push(adapter);
+    adapter.script = { writes: { "src/app.js": CHANGE } };
+    const runner = new WorkerTurnRunner(
+      { db: world.db, clock: world.clock, audit: world.audit, tasks: world.tasks, guard: world.guard, workerAdapter: () => adapter as ProviderAdapter },
+      { pollMs: 10, scratchDir: (prefix) => tempDir(prefix) },
+    );
+    const started = await startTurn(runner, world);
+    // What follows the launch on a sparse checkout is not this check's concern; only that it was reached.
+    if (started.allowed) await runner.settled(started.value.executionId);
+    expect({ allowed: started.allowed, reasonCode: started.allowed ? null : started.reasonCode, launches: adapter.launches })
+      .toEqual({ allowed: true, reasonCode: null, launches: 1 });
+  });
+
+  it("configured for a sparse index, a probe that fails for any other reason fails closed and launches nothing", async () => {
+    const world = freshRacyWorld("main");
+    gitSync(world.repoPath, ["sparse-checkout", "init", "--cone", "--sparse-index"]);
+    gitSync(world.repoPath, ["sparse-checkout", "set", "src"]);
+    writeFileSync(join(world.repoPath, ".git", "index"), "not an index");
+    const adapter = new FakeWorkerAdapter(world.broker);
+    adapters.push(adapter);
+    const runner = new WorkerTurnRunner(
+      { db: world.db, clock: world.clock, audit: world.audit, tasks: world.tasks, guard: world.guard, workerAdapter: () => adapter as ProviderAdapter },
+      { pollMs: 10, scratchDir: (prefix) => tempDir(prefix) },
+    );
+    const started = await startTurn(runner, world);
+    expect({ allowed: started.allowed, reasonCode: started.allowed ? null : started.reasonCode, launches: adapter.launches })
+      .toEqual({ allowed: false, reasonCode: ReasonCode.PROBE_FAILED, launches: 0 });
   });
 
   it("recovered as the refusal says, an unused sharedindex.* file left behind: the turn runs and succeeds", async () => {
