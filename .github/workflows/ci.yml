@@ -55,31 +55,77 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# One Node, the one the daemon is deployed on. 22.23.2 is the version the peercred addon's
+# provenance pins (ADR-0010) and the floor CommitLore's installer enforces, so the gate runs on the
+# runtime that ships and `pnpm ci:commitlore` needs no Node of its own.
+#
+# Ruled out: keeping the `22.18.0` (declared `engines.node` floor, ADR-0010) and `22` (moving
+# alias) legs. Each ran every gate and the whole suite again on macOS for a runtime nothing
+# deploys. The engines floor is therefore no longer exercised by CI.
+env:
+  NODE_VERSION: "22.23.2"
+
+# The run, as a graph. `pnpm gates` used to be one job of ~37 minutes, 2105 s of it the suite:
+#
+#   test-reuse ──► verify-matrix (3 suite shards, macOS) ──┐
+#   gates (every other gate, macOS) ───────────────────────┼──► verify-gate (bare `verify`)
+#
+# `gates` and the shards run side by side, so the required check waits for the slowest shard
+# rather than for the sum. `--no-tests` and `--tests-only` are the two complementary halves of
+# `scripts/lib/prepush-gates.mjs`, split on the suite alone, so every gate runs in every run — the
+# suite excepted only on a push whose exact tree a pull-request run already passed (`test-reuse`).
 jobs:
-  # This job's id used to be `verify`, which is also the literal string branch protection
-  # requires (contexts: ["verify"]). Adding a matrix made every check GitHub reports for this job
-  # get the matrix value appended — "verify (22.23.2)" — and a check literally named `verify`
-  # stopped existing. Branch protection then waits for a check that can never appear, on every PR
-  # in the repository, not just this one. `name: verify` here keeps the per-leg check reading
-  # "verify (<node>)"; `verify-gate` below is what produces the bare `verify` check branch
-  # protection actually requires.
-  verify-matrix:
-    name: verify
+  # Whether this run may skip the suite because the pull-request run this push merged already
+  # passed every shard on the tree, base and workflow it lands. Only a `push` can say yes, and only
+  # when `scripts/ci-reuse-verified-tree.mjs` proves it — read that file for the six conditions:
+  # the run is the one on the squash's `Merged-Head`, and the `ci-executed-*` record each of its
+  # jobs wrote from its own checkout matches this push. Every other event, and every unproven or
+  # unreadable case, answers no and the shards run. This job never fails the run by answering no;
+  # if it fails outright its output is empty, and empty also runs the shards.
+  test-reuse:
+    name: test reuse
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Read-only: the run, job and artifact records of the pull-request run this push merged, and
+      # its `ci-executed-*` artifacts, which `gh run download` fetches with this same read scope.
+      actions: read
+      # Read-only: GitHub's merged-PR record for the pushed commit (`/commits/{sha}/pulls`), which
+      # the squash's `Merged-Head` trailer is checked against rather than trusted.
+      pull-requests: read
+    outputs:
+      reuse: ${{ steps.decide.outputs.reuse }}
+      run_id: ${{ steps.decide.outputs.run_id }}
+      head_sha: ${{ steps.decide.outputs.head_sha }}
+      tree_sha: ${{ steps.decide.outputs.tree_sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - id: decide
+        run: node scripts/ci-reuse-verified-tree.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # Every gate but the suite, once per run, on every event — a reused push included. One step, one
+  # manifest, one executor: every gate is in `scripts/lib/prepush-gates.mjs`, and `pnpm gates` is
+  # what a developer runs before pushing — the same command, the same order, the same fail-fast
+  # stop. It replaced twenty listed steps here because a list CI owns is a list nobody can execute:
+  # #736 was verified locally against a hand-made set of four checks and failed here in 35 seconds
+  # on `pnpm lint`, which was not on it, and the same wrong set went into four subagent briefs.
+  #
+  # `pnpm ci:preflight` used to run here a second time, as its own step before install. It is the
+  # first gate of `pnpm gates --no-tests`, on the same tree in the same job, so the separate step
+  # was the same command and the same verdict twice; the gate copy is the one `pnpm gates` keeps.
+  #
+  # The job log stays per-gate. The runner prints a banner and an exit code for every gate, an
+  # `::error::` annotation naming the one that failed, and a table of all of them to the run's
+  # step summary — which is also the readback that this job ran the runner rather than a step
+  # list of its own.
+  #
+  # Named `verify (gates)`, never bare `verify`: `scripts/merge-pr.mjs` refuses a run with more than
+  # one job of that exact name, and the bare name belongs to `verify-gate`.
+  gates:
+    name: verify (gates)
     runs-on: macos-15
-    strategy:
-      fail-fast: false
-      matrix:
-        # One leg, on the Node the daemon is deployed on. 22.23.2 is the version the peercred
-        # addon's provenance pins (ADR-0010) and the floor CommitLore's installer enforces, so the
-        # gate runs on the runtime that ships and `pnpm ci:commitlore` needs no Node of its own.
-        #
-        # Ruled out: keeping the `22.18.0` (declared `engines.node` floor, ADR-0010) and `22`
-        # (moving alias) legs. Each ran every gate and the whole suite again on macOS for a runtime
-        # nothing deploys. The engines floor is therefore no longer exercised by CI.
-        #
-        # Still a matrix, of one element: the check names above, and `verify-gate`'s bare
-        # `verify`, stay exactly what branch protection already pins.
-        node-version: ["22.23.2"]
     permissions:
       contents: read
       # Read-only, for `pnpm merge-records`: it asks GitHub which pull request a `(#N)` commit
@@ -98,11 +144,19 @@ jobs:
           version: 10
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
-      # Dependency-free and first: the same working-tree check as pre-commit catches a workflow
-      # package-script mismatch or invalid Bash before install and the suite spend minutes.
-      - run: pnpm ci:preflight
+      # What this job executes, read from its own checkout before any gate runs: on `pull_request`
+      # that is GitHub's synthetic merge, whose first parent is the base it was tested against. A
+      # later `main` push reuses this run only if every job's record matches what it lands.
+      # `overwrite` so a re-run job replaces its own record rather than failing on the name.
+      - run: node scripts/ci-reuse-verified-tree.mjs --record gates
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: ci-executed-gates
+          path: evidence/local/ci-executed.json
+          if-no-files-found: error
+          overwrite: true
       # `pnpm trailers` spawns `commitlore` to judge a message carrying more than one record: SPEC
       # §2.4 recovers separate identified record paragraphs, and git's trailer parser, which reads
       # only the last one, is not that authority. A hosted runner has no such program, so the spawn
@@ -116,22 +170,10 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm rebuild better-sqlite3
       # ADR-0010: this repository's own binding.gyp + node-addon-api convention for native
-      # addons, prebuilt here rather than compiled on load. macos-15 is the only runner this job
-      # uses, so this is also where #539's Darwin-only peercred addon gets its one build.
+      # addons, prebuilt here rather than compiled on load. macos-15 is the only runner these jobs
+      # use, so this is also where #539's Darwin-only peercred addon gets built.
       - run: pnpm native:peercred:build
       - run: pnpm native:fd-vfs:build
-      # One step, one manifest, one executor. Every gate this job runs is in
-      # `scripts/lib/prepush-gates.mjs`, and `pnpm gates` is what a developer runs before pushing
-      # — the same command, the same order, the same fail-fast stop. It replaced twenty listed
-      # steps here because a list CI owns is a list nobody can execute: #736 was verified locally
-      # against a hand-made set of four checks and failed here in 35 seconds on `pnpm lint`, which
-      # was not on it, and the same wrong set went into four subagent briefs.
-      #
-      # The job log stays per-gate. The runner prints a banner and an exit code for every gate, an
-      # `::error::` annotation naming the one that failed, and a table of all of them to the run's
-      # step summary — which is also the readback that this job ran the runner rather than a step
-      # list of its own.
-      #
       # ACP_TRAILERS_RANGE is the one workflow-specific value the runner takes: which commits to
       # read is a property of the event GitHub is handling, not of the gate. Unset locally, where
       # the check uses its own default of `origin/main..HEAD`.
@@ -158,25 +200,87 @@ jobs:
       # tell a preserved record from a lost one, and the gate refuses rather than guess. `checkout`
       # does not bring notes refs down, `fetch-depth: 0` or not.
       - run: pnpm notes:fetch
-      - run: pnpm gates
+      - run: pnpm gates --no-tests
         env:
           ACP_TRAILERS_RANGE: ${{ github.event.pull_request.base.sha && format('{0}..{1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha) || 'HEAD~1..HEAD' }}
           # `merge-records` reads pull requests through `gh api`; the job's token is read-only.
           GH_TOKEN: ${{ github.token }}
+
+  # The suite, as Vitest's own `--shard=i/N`, one macOS job per shard. Vitest partitions by a hash
+  # of each file's path, so the N jobs between them run every file once; `verify-gate` checks that
+  # against Vitest's own file list on every run rather than trusting it
+  # (`scripts/merge-vitest-results.mjs`).
+  # N is `strategy.job-total`, so the shard count is the matrix's length and cannot disagree with it.
+  #
+  # Each shard prepares its runner exactly as the single job did before the suite: the same
+  # checkout depth, CommitLore on PATH (`tests/unit/commitlore-pin.test.ts` skips without it), the
+  # same native builds, the notes ref, and `pnpm build` for the `dist/` the process-level tests
+  # spawn. A shard that skipped one of those would not fail; its tests would quietly see less.
+  #
+  # The job id used to be `verify` and then carried the Node matrix; branch protection requires
+  # the literal `verify` (contexts: ["verify"]), and a matrixed job's check always has its matrix
+  # values appended, so the bare name comes from `verify-gate` and these report as
+  # "verify (shard 1/3)" and so on.
+  #
+  # Skipped only when `test-reuse` said `true`. That condition and `verify-gate`'s excuse for a
+  # skipped matrix are one decision in two places, and move together.
+  verify-matrix:
+    name: verify (shard ${{ matrix.shard }}/${{ strategy.job-total }})
+    needs: [test-reuse]
+    if: ${{ !cancelled() && needs.test-reuse.outputs.reuse != 'true' }}
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        with:
+          version: 10
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      # This shard's record of what it executes, and as which shard of how many; see the same step
+      # in `gates`. The Node version recorded is the one setup-node just put on PATH.
+      - run: node scripts/ci-reuse-verified-tree.mjs --record shard-${{ matrix.shard }} --shards ${{ strategy.job-total }}
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: ci-executed-shard-${{ matrix.shard }}
+          path: evidence/local/ci-executed.json
+          if-no-files-found: error
+          overwrite: true
+      - run: pnpm ci:commitlore
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm rebuild better-sqlite3
+      - run: pnpm native:peercred:build
+      - run: pnpm native:fd-vfs:build
+      - run: pnpm notes:fetch
+      - run: pnpm build
+      # The suite's whole file set as Vitest itself discovers it — same config, checkout and runner
+      # as the tests below — for `verify` to check the shards' union against. `list` ignores
+      # `--shard`, so every shard writes the whole set, and `verify` refuses shards that disagree.
+      - run: node_modules/.bin/vitest list --filesOnly --json=evidence/local/ci-vitest-files.json
+      - run: pnpm gates --tests-only --shard ${{ matrix.shard }}/${{ strategy.job-total }}
       - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         if: always()
         with:
-          name: vitest-results-${{ matrix.node-version }}
-          path: evidence/local/ci-vitest-results.json
+          name: vitest-results-shard-${{ matrix.shard }}
+          path: |
+            evidence/local/ci-vitest-results.json
+            evidence/local/ci-vitest-files.json
           if-no-files-found: error
 
   # Branch protection requires the check named exactly `verify` (app_id 15368, GitHub Actions) —
-  # confirmed against this repository's live protection settings, not assumed. `verify-matrix`
-  # above cannot ever produce that name once it carries a matrix: GitHub always appends the
-  # matrix values to a matrixed job's check name, so its check is "verify (22.23.2)", never bare
-  # "verify". This job carries no matrix, so its own check name is exactly its `name:` —
-  # `verify` — with nothing appended. It is what makes the required check
-  # exist again, without touching the required-check string itself.
+  # confirmed against this repository's live protection settings, not assumed. A matrixed job can
+  # never produce that name, because GitHub always appends the matrix values to its check name.
+  # This job carries no matrix, so its own check name is exactly its `name:` — `verify` — with
+  # nothing appended.
   #
   # `if: always()` is load-bearing, not decoration. Without it, this job's default condition is
   # "the jobs it needs all succeeded" — so the moment any verification job fails or the run is
@@ -189,22 +293,64 @@ jobs:
   #
   # The check itself must read `== 'success'` (an allow-list), not `!= 'failure'` (a deny-list):
   # `needs.<job>.result` can be `success`, `failure`, `cancelled`, or `skipped`. An allow-list
-  # fails closed on `cancelled` and `skipped` too, with no separate case needed.
+  # fails closed on `cancelled` and `skipped` too, with no separate case needed. A matrix job's
+  # result is `success` only when every shard succeeded, so one failed or cancelled shard fails it.
+  #
+  # The one `skipped` it accepts is the shards on a `push` that `test-reuse` proved — and only
+  # with `test-reuse` itself `success` and answering exactly `true`. `gates` has no such excuse.
+  #
+  # Then, when the shards ran, it joins their reports into the one whole-suite
+  # `vitest-results-<node>` artifact readers already download, and refuses if the shards between
+  # them did not run every test file Vitest lists exactly once.
   verify-gate:
     name: verify
-    needs: [verify-matrix]
+    needs: [test-reuse, gates, verify-matrix]
     if: always()
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - name: require the test matrix to have actually succeeded
+      - name: require the gates and every test shard to have actually succeeded
+        env:
+          REUSED_RUN: ${{ needs.test-reuse.outputs.run_id }}
+          REUSED_HEAD: ${{ needs.test-reuse.outputs.head_sha }}
+          REUSED_TREE: ${{ needs.test-reuse.outputs.tree_sha }}
         run: |
-          verify_matrix="${{ needs.verify-matrix.result }}"
-          # Print the value before deciding on it. A gate that only prints its verdict cannot be
+          gates="${{ needs.gates.result }}"
+          shards="${{ needs.verify-matrix.result }}"
+          reuse_job="${{ needs.test-reuse.result }}"
+          reuse="${{ needs.test-reuse.outputs.reuse }}"
+          event="${{ github.event_name }}"
+          # Print the values before deciding on them. A gate that only prints its verdict cannot be
           # told apart from a gate that read the wrong input, which is the position this check was
           # in when it failed while both matrix legs were green.
-          echo "needs.verify-matrix.result=${verify_matrix}"
-          if [ "$verify_matrix" != "success" ]; then
-            echo "the test matrix did not succeed — failing the required verify check"
+          echo "needs.gates.result=${gates}"
+          echo "needs.verify-matrix.result=${shards}"
+          echo "needs.test-reuse.result=${reuse_job} reuse=${reuse} event=${event}"
+          if [ "$gates" != "success" ]; then
+            echo "the gates did not succeed — failing the required verify check"
             exit 1
           fi
-          echo "the test matrix succeeded"
+          if [ "$shards" = "success" ]; then
+            echo "the gates and every test shard succeeded"
+          elif [ "$shards" = "skipped" ] && [ "$reuse_job" = "success" ] && [ "$reuse" = "true" ] && [ "$event" = "push" ]; then
+            echo "the gates succeeded; the suite was not run again because pull-request run ${REUSED_RUN} passed every shard on head ${REUSED_HEAD}, tree ${REUSED_TREE}"
+          else
+            echo "the test shards did not succeed — failing the required verify check"
+            exit 1
+          fi
+      - if: needs.verify-matrix.result == 'success'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - if: needs.verify-matrix.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: vitest-results-shard-*
+          path: shard-results
+      - if: needs.verify-matrix.result == 'success'
+        run: node scripts/merge-vitest-results.mjs --out evidence/local/ci-vitest-results.json shard-results/*/ci-vitest-results.json
+      - if: needs.verify-matrix.result == 'success'
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: vitest-results-${{ env.NODE_VERSION }}
+          path: evidence/local/ci-vitest-results.json
+          if-no-files-found: error

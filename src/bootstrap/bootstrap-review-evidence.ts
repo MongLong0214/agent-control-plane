@@ -81,7 +81,7 @@ const parseBundle = (body: string, input: ReviewEvidenceInput): Decision<ReviewE
   return allow(ReasonCode.OK, parsed.data);
 };
 const candidates = (source: Source, runId: string) => source.artifacts.list<Candidate>(runId, ArtifactKind.HANDOFF).filter(a => a.content?.schema === CANDIDATE);
-const attachments = (source: Source, runId: string) => source.artifacts.list<Attachment>(runId, ArtifactKind.HANDOFF).filter(a => a.content?.schema === ATTACHED);
+const attachments = (source: Pick<Source, "artifacts">, runId: string) => source.artifacts.list<Attachment>(runId, ArtifactKind.HANDOFF).filter(a => a.content?.schema === ATTACHED);
 const reviewEvidenceRunAccess = (source: Source, input: ReviewEvidenceInput) => {
   const digests = validateBootstrapPlanDigests({ contractDigest: input.contractDigest, expectedSha256: input.expectedSha256, replacesSha256: input.replacesSha256 });
   if (!digests.allowed) return digests;
@@ -191,8 +191,11 @@ const readPrivateReviewEvidence = (source: Pick<Source, "artifacts" | "audit">, 
   return { ...record, digest: digestOf(record) };
 };
 
-/** Freeze a reference only. Original bytes stay in the existing private HANDOFF candidate. */
-export function collectBootstrapReviewEvidence(source: Source, runId: string): FrozenReviewEvidenceReference | null {
+/**
+ * Freeze a reference only. Original bytes stay in the existing private HANDOFF candidate. It reads
+ * no application freeze, so review entry, which holds no BootstrapApplications, asks it too.
+ */
+export function collectBootstrapReviewEvidence(source: Parameters<typeof currentBootstrapInputRun>[0], runId: string): FrozenReviewEvidenceReference | null {
   const attached = attachments(source, runId).find(a => !a.superseded);
   if (!attached) {
     if (source.audit.forRun(runId).some(e => e.kind === "BOOTSTRAP_REVIEW_EVIDENCE_ATTACHED")) throw new Error("attached review evidence is missing");

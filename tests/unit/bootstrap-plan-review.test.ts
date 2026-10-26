@@ -670,6 +670,15 @@ describe("authenticated run-bound CEO decisions", () => {
       const later = cp.ceo.openEscalation({runId:run.runId,openedBySessionId:run.owner,openedAt:f.harness.clock.nowIso(),question:"later?",options:["yes"],ctoRecommendation:"yes",whyItMatters:"later",blocksCriticalPath:true});
       if (!later.allowed) throw new Error(later.message);
       expect(cp.ceo.resolveEscalation(run.runId,"A later authentic decision stays outside the frozen set",f.ceoSessionId,{escalationId:later.value.escalationId!}).allowed).toBe(true);
+      // The later decision stays outside this PLAN's frozen set and handoff, so this PLAN is not reviewed
+      // (live run_3884d4fc); a fresh plan_submit freezes it, and only that PLAN is reviewed.
+      expect(await submitResult(f,run)).toMatchObject({ok:false,reasonCode:"BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN"});
+      expect(currentBootstrapPlan(run.runId,cp.artifacts.latest(run.runId,"PLAN"))).toMatchObject({allowed:true,value:{outputs:{handoff}}});
+      expect(await submitPlan(f,run,plan,"ceo-records")).toMatchObject({ok:true});
+      const refrozen = cp.artifacts.latest<Record<string,unknown>>(run.runId,"PLAN")!.content["authenticatedCeoDecisions"] as typeof records;
+      expect(refrozen.slice(0,2)).toEqual(records);
+      expect(refrozen.map(r=>r.resolution)).toEqual([...replies,"A later authentic decision stays outside the frozen set"]);
+      const resubmitted = currentBootstrapPlan(run.runId,cp.artifacts.latest(run.runId,"PLAN")); if (!resubmitted.allowed) throw new Error(resubmitted.message);
       const reviewed = await submitResult(f,run);
       expect(reviewed,JSON.stringify(reviewed)).toMatchObject({ok:true});
       const packet = cp.artifacts.latest<{inputManifest:Record<string,unknown>;authenticatedCeoDecisions:unknown}>(run.runId,"BLIND_REVIEW")!;
@@ -680,14 +689,14 @@ describe("authenticated run-bound CEO decisions", () => {
       expect(prompt).toContain("## Authenticated CEO decisions (ACP records)");
       expect(prompt).toContain("CEO's acceptance judgment");
       const decisionSection = prompt.split("## Authenticated CEO decisions (ACP records)")[1]!.split("```json\n")[1]!.split("\n```")[0]!;
-      expect(JSON.parse(decisionSection)).toEqual(records);
-      expect(packet.content).toMatchObject({bootstrapPlan:current.value.binding});
+      expect(JSON.parse(decisionSection)).toEqual(refrozen);
+      expect(packet.content).toMatchObject({bootstrapPlan:resubmitted.value.binding});
       for (const r of records) expect(prompt).toContain(r.digest);
       expect(prompt).not.toContain("forged author claim");
       // A later reply cannot change the package activation retries reload from the frozen PLAN.
       const opened = cp.ceo.openEscalation({runId:run.runId,openedBySessionId:run.owner,openedAt:f.harness.clock.nowIso(),question:"later?",options:["yes"],ctoRecommendation:"yes",whyItMatters:"later",blocksCriticalPath:false});
       expect(opened.allowed).toBe(true);
-      expect(currentBootstrapPlan(run.runId,cp.artifacts.latest(run.runId,"PLAN"))).toMatchObject({allowed:true,value:{outputs:{handoff}}});
+      expect(currentBootstrapPlan(run.runId,cp.artifacts.latest(run.runId,"PLAN"))).toMatchObject({allowed:true,value:{outputs:{handoff:resubmitted.value.outputs.handoff}}});
     });
   });
 });

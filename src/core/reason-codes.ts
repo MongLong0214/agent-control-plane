@@ -95,6 +95,23 @@ export const ReasonCode = {
   SNAPSHOT_STALE: "SNAPSHOT_STALE",
   SNAPSHOT_DIGEST_MISMATCH: "SNAPSHOT_DIGEST_MISMATCH",
   EVIDENCE_STALE: "EVIDENCE_STALE",
+  /**
+   * A freeze found a SUCCEEDED task whose own commit is not in the candidate's history for its
+   * repository. Each STANDARD_WORK task's branch is created at the run's pinned base rather than
+   * stacked on another task's branch (#512 S-TB), so the freeze integrates every SUCCEEDED task's
+   * commit onto that base (S6-C); this is the post-condition on the final candidate head, integrated
+   * or not, for any commit the candidate still does not hold. Not staleness: nothing moved since an
+   * earlier read. The candidate is refused before review or publication, naming the missing task
+   * and commit.
+   */
+  CANDIDATE_MISSING_TASK_COMMIT: "CANDIDATE_MISSING_TASK_COMMIT",
+  /**
+   * A freeze found a SUCCEEDED task whose commit is in the candidate's history but whose change is
+   * not in the candidate's tree: a path the task changed against its pinned base stands there with
+   * other bytes, or is missing (a merge that kept one side, `-s ours`, does exactly this). Refused
+   * before review or publication, naming the task and each such path.
+   */
+  CANDIDATE_MISSING_TASK_CHANGE: "CANDIDATE_MISSING_TASK_CHANGE",
 
   // --- CP-HI-07 Human Role ------------------------------------------------
   OWNER_AUTHORITY_NOT_DELEGABLE: "OWNER_AUTHORITY_NOT_DELEGABLE",
@@ -921,6 +938,13 @@ export const ReasonCode = {
   /** #246 C3 — the repository identity a bootstrap would create is already bound. Nothing is written. */
   IDENTITY_COLLISION: "IDENTITY_COLLISION",
   BOOTSTRAP_CONTRACT_DRIFT: "BOOTSTRAP_CONTRACT_DRIFT",
+  /**
+   * A project-less bootstrap PLAN review was asked for while the run holds review evidence the CEO
+   * attached, or a CEO decision ACP admitted, that the run's current PLAN did not freeze (live
+   * run_3884d4fc: a same-key `plan_submit` replayed the earlier PLAN). Nothing is frozen, promoted or
+   * reviewed; a fresh-key `plan_submit` of the same bootstrapPlanDigest freezes them, then `result_submit`.
+   */
+  BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN",
   BOOTSTRAP_RESULT_OVERCLAIMS_ACTIVATION: "BOOTSTRAP_RESULT_OVERCLAIMS_ACTIVATION",
   HERMES_BOOTSTRAP_ALREADY_INITIALIZED: "HERMES_BOOTSTRAP_ALREADY_INITIALIZED",
   HERMES_BOOTSTRAP_PROOF_INVALID: "HERMES_BOOTSTRAP_PROOF_INVALID",

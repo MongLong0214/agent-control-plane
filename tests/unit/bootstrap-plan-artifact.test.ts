@@ -1441,11 +1441,16 @@ describe("bootstrap_review_resume", () => {
       expect(JSON.parse(instructionText.split("ALL seeded issues: ")[1]!)).toEqual(issues.map(issue => ({
         repository: f.attachArgs.repositoryIdentity, key: issue.key, title: issue.title, acceptance: issue.body,
       })));
-      // Another genuine release after submission stays outside this PLAN's review and handoff.
+      // Another genuine release after submission stays outside this PLAN's handoff, and this PLAN is
+      // no longer reviewed without it: a fresh-key plan_submit freezes it first (BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN).
       expect(await f.hermes("bootstrap_review_resume", args(f, { idempotencyKey: "later-release" }))).toMatchObject({ ok: true });
       expect(collectBootstrapCeoDecisions(f.h.cp.db, f.run.runId)).toHaveLength(2);
       expect(currentBootstrapPlan(f.run.runId, f.h.cp.artifacts.latest(f.run.runId, "PLAN")))
         .toMatchObject({ allowed: true, value: { outputs: { handoff: planned.value.outputs.handoff } } });
+      expect(await f.cto("result_submit", { idempotencyKey: "resume-result-unfrozen", runId: f.run.runId, resultSummary: "resubmitted current PLAN", recommendation: "review" }))
+        .toMatchObject({ ok: false, reasonCode: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN" });
+      expect(f.h.cp.runs.currentCandidate(f.run.runId)).toEqual(firstCandidate);
+      expect(await f.cto("plan_submit", { idempotencyKey: "later-release-plan", runId: f.run.runId, bootstrapPlanDigest: f.digest })).toMatchObject({ ok: true });
       f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
       expect(await f.cto("result_submit", { idempotencyKey: "resume-result", runId: f.run.runId, resultSummary: "resubmitted current PLAN", recommendation: "review" })).toMatchObject({ ok: true });
       // The release is newly frozen authority, so the re-review judges a new candidate.
@@ -1455,7 +1460,7 @@ describe("bootstrap_review_resume", () => {
       expect(prompt).toContain("distinct from escalation resolutions");
       expect(prompt).toContain(records[0]!.digest);
       const decisionSection = prompt.split("## Authenticated CEO decisions (ACP records)")[1]!.split("```json\n")[1]!.split("\n```")[0]!;
-      expect(JSON.parse(decisionSection)).toEqual(records);
+      expect(JSON.parse(decisionSection)).toEqual(collectBootstrapCeoDecisions(f.h.cp.db, f.run.runId));
       const freezes = f.h.cp.audit.forRun(f.run.runId).filter(a => a.kind === "CANDIDATE_FROZEN");
       expect(freezes).toHaveLength(2);
       expect(freezes[0]!.evidence["attemptId"]).not.toEqual(freezes[1]!.evidence["attemptId"]);
@@ -2303,5 +2308,260 @@ describe("private bootstrap review originals and serving runtime", () => {
         expect(readFileSync(join(renderDir, "activation-handoff.json"), "utf8")).toContain("EVERY seeded issue's acceptance");
       }
     } finally { await f.close(); }
+  });
+});
+
+describe("live run_3884d4fc: a bootstrap PLAN is reviewed only while it carries the run's attached evidence and admitted CEO decisions", () => {
+  type Staged = Awaited<ReturnType<typeof stagingFixture>>;
+  const evidence = (f: Staged, label: string) => {
+    const text = `failure: ${label} original\nfix: ${label} fix\nresult: ${label} passed\n`;
+    const bundle = { runId: f.run.runId, contractDigest: f.run.contractDigest, missing: [`${label} missing item`],
+      files: [{ path: `${label}/execution.log`, origin: `${label} execution stdout`, grade: "execution-log",
+        sha256: sha256(text), bodyBase64: Buffer.from(text).toString("base64") }] };
+    const body = JSON.stringify(bundle);
+    return { text, bundle, body, sha: sha256(body) };
+  };
+  const stageAndAttach = async (f: Staged, e: ReturnType<typeof evidence>, key: string, replacesSha256?: string) => {
+    const args = { runId: f.run.runId, contractDigest: f.run.contractDigest, bootstrapPlanDigest: f.digest, expectedSha256: e.sha };
+    expect(await f.call("bootstrap_review_evidence_stage", { ...args, idempotencyKey: `${key}-stage`, evidenceBody: e.body })).toMatchObject({ ok: true });
+    expect(await f.hermes("bootstrap_review_evidence_attach", { ...args, idempotencyKey: `${key}-attach`, stagedBy: f.primary.roleKey,
+      ...(replacesSha256 === undefined ? {} : { replacesSha256 }) })).toMatchObject({ ok: true });
+  };
+  const planSubmit = (f: Staged, idempotencyKey: string) => f.cto("plan_submit", { idempotencyKey, runId: f.run.runId, bootstrapPlanDigest: f.digest });
+  const resultSubmit = (f: Staged, idempotencyKey: string) => f.cto("result_submit", { idempotencyKey, runId: f.run.runId, resultSummary: "review", recommendation: "review" });
+  const resolveEscalation = async (f: Staged, resolution: string) => {
+    expect(await f.cto("escalation_open", { idempotencyKey: `open-${resolution.length}`, runId: f.run.runId, question: "Which records does the reviewer judge?",
+      options: ["attach originals"], ctoRecommendation: "attach originals", whyItMatters: "reviewer provenance", blocksCriticalPath: true })).toMatchObject({ ok: true });
+    expect(await f.hermes("escalation_resolve", { idempotencyKey: `resolve-${resolution.length}`, runId: f.run.runId,
+      escalationId: f.h.cp.ceo.openEscalationOf(f.run.runId)!.escalationId, resolution })).toMatchObject({ ok: true });
+    expect(f.h.cp.runs.require(f.run.runId).state).toBe("ACTIVE");
+  };
+  const reviews = (f: Staged) => f.h.scripted.invocations.filter(i => /Bootstrap plan review/.test(i.prompt));
+  // What a refusal must leave untouched: nothing frozen, promoted or reviewed.
+  const effects = (f: Staged) => ({ plans: f.h.cp.artifacts.list(f.run.runId, "PLAN"), candidate: f.h.cp.runs.currentCandidate(f.run.runId),
+    snapshots: f.h.cp.artifacts.list(f.run.runId, "CANDIDATE_SNAPSHOT"), blindReviews: f.h.cp.artifacts.list(f.run.runId, "BLIND_REVIEW"),
+    frozen: f.h.cp.audit.forRun(f.run.runId).filter(a => a.kind === "CANDIDATE_FROZEN"), tasks: f.h.cp.tasks.list(f.run.runId),
+    run: f.h.cp.runs.require(f.run.runId), invocations: reviews(f).length });
+  const decisionSection = (prompt: string) =>
+    JSON.parse(prompt.split("## Authenticated CEO decisions (ACP records)")[1]!.split("```json\n")[1]!.split("\n```")[0]!) as unknown;
+
+  it("admits review unchanged when the run holds no attachment and no decision its PLAN lacks", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      expect(await planSubmit(f, "plain-plan")).toMatchObject({ ok: true });
+      f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
+      expect(await resultSubmit(f, "plain-result")).toMatchObject({ ok: true });
+      expect(reviews(f)).toHaveLength(1);
+      expect(f.h.cp.artifacts.latest<Args>(f.run.runId, "BLIND_REVIEW")?.content).toMatchObject({ verdict: "PASS" });
+    } finally { await f.close(); }
+  });
+
+  it("refuses the PLAN submitted before evidence and an escalation resolution, keeps a same-key replay refused, and reviews a fresh-key PLAN with both", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      const first = await planSubmit(f, "plan-before-evidence");
+      expect(first).toMatchObject({ ok: true });
+      const earlier = f.h.cp.artifacts.latest<Args>(f.run.runId, "PLAN")!;
+      expect(earlier.content).not.toHaveProperty("reviewEvidence");
+      expect(earlier.content).not.toHaveProperty("authenticatedCeoDecisions");
+      // After the PLAN: the CEO resolves a blocking escalation, attaches review evidence and releases review.
+      const resolution = "Attach the original review records; the reviewer judges the originals, not a summary.";
+      await resolveEscalation(f, resolution);
+      const e = evidence(f, "attached-after-plan");
+      await stageAndAttach(f, e, "late");
+      expect(await f.hermes("bootstrap_review_resume", { idempotencyKey: "resume", runId: f.run.runId, contractDigest: f.run.contractDigest,
+        bootstrapPlanDigest: f.digest, ownerSessionId: f.run.ownerSessionId, ownerSessionIncarnation: f.run.ownerSessionIncarnation,
+        ownerBindingGeneration: f.run.ownerBindingGeneration })).toMatchObject({ ok: true });
+      const release = f.h.cp.outbox.listByRun(f.run.runId).find(m => m.kind === "RESUME_REVIEW")!;
+      expect(String((release.payload as Args)["directive"])).toContain("plan_submit with a NEW idempotencyKey");
+      const decisions = collectBootstrapCeoDecisions(f.h.cp.db, f.run.runId);
+      expect(decisions.map(d => d.source.kind)).toEqual(["ACP_CEO_ESCALATION_REPLY", "ACP_CEO_REVIEW_ENTRY_RELEASE"]);
+      const escalation = decisions[0]!;
+      expect(escalation.resolution).toBe(resolution);
+
+      // The CTO resubmits under its first key: the cached result replays, no PLAN and no task graph is written.
+      const graphs = () => f.h.cp.audit.forRun(f.run.runId).filter(a => a.kind === "TASK_GRAPH_SUBMITTED").length;
+      const graphsBefore = graphs();
+      expect(await planSubmit(f, "plan-before-evidence")).toEqual(first);
+      expect(f.h.cp.artifacts.latest(f.run.runId, "PLAN")).toEqual(earlier);
+      expect(graphs()).toBe(graphsBefore);
+      const before = effects(f);
+      const refused = await resultSubmit(f, "result-after-replay");
+      expect(refused).toMatchObject({ ok: false, reasonCode: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN", evidence: {
+        refusal: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN", planDigest: earlier.digest, bootstrapPlanDigest: f.digest,
+        unfrozenReviewEvidenceAttachment: expect.stringMatching(/^sha256:/),
+        unfrozenCeoDecisionEvents: decisions.map(d => d.source.decisionEventId) } });
+      expect(refused["message"]).toContain("plan_submit again with the same bootstrapPlanDigest and a NEW idempotencyKey");
+      expect(refused["message"]).toContain("then result_submit");
+      expect(effects(f)).toEqual(before);
+      expect(reviews(f)).toHaveLength(0);
+
+      // A fresh key freezes the attachment and every admitted decision, and only then is the PLAN reviewed.
+      expect(await planSubmit(f, "plan-fresh-key")).toMatchObject({ ok: true, value: { digest: f.digest } });
+      const fresh = f.h.cp.artifacts.latest<Args>(f.run.runId, "PLAN")!;
+      expect(fresh.digest).not.toBe(earlier.digest);
+      expect(fresh.content["authenticatedCeoDecisions"]).toEqual(decisions);
+      expect(frozenBootstrapReviewEvidence(f.h.cp, f.run.runId, fresh.content)?.bundle).toEqual(e.bundle);
+      f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
+      const reviewed = await resultSubmit(f, "result-fresh-key");
+      expect(reviewed, JSON.stringify(reviewed)).toMatchObject({ ok: true });
+      expect(reviews(f)).toHaveLength(1);
+      const prompt = reviews(f)[0]!.prompt;
+      expect(prompt).toContain(e.text.trim());
+      expect(prompt).toContain(e.bundle.files[0]!.path);
+      expect(prompt).toContain(e.bundle.files[0]!.origin);
+      expect(prompt).toContain(resolution);
+      expect(decisionSection(prompt)).toEqual(decisions);
+      const privateInputs = f.h.cp.artifacts.list<{ schema: string; context: BootstrapReviewContext }>(f.run.runId, "HANDOFF")
+        .find(a => a.content.schema === "acp.bootstrap-review-context.v1")!;
+      expect(privateInputs.content.context.originalRecords?.files).toEqual([expect.objectContaining({
+        path: e.bundle.files[0]!.path, origin: e.bundle.files[0]!.origin, sha256: e.bundle.files[0]!.sha256 })]);
+      expect(privateInputs.content.context.originalRecords?.missing).toEqual(e.bundle.missing);
+
+      // The resident CTO's activation handoff carries the decision admitted after the first PLAN.
+      const plan = currentBootstrapPlan(f.run.runId, f.h.cp.artifacts.latest(f.run.runId, "PLAN"));
+      if (!plan.allowed) throw new Error(plan.message);
+      const delivered = deliveredBootstrapHandoff(plan.value.outputs.handoff, [{ identity: String(f.attachArgs.repositoryIdentity),
+        branch: plan.value.outputs.defaultBranch, head: "a".repeat(40) }]);
+      const activation = f.h.cp.bootstrap as unknown as { openActivationHandoff(projectId: string, runId: string, toSessionId: string,
+        handoff: typeof delivered): Decision<{ handoffId: string }> };
+      const opened = activation.openActivationHandoff(f.primary.projectId, f.run.runId, f.primary.sessionId, delivered);
+      if (!opened.allowed) throw new Error(opened.message);
+      const actual = f.h.cp.artifacts.list<{ handoffId: string; handoff: typeof delivered }>(f.run.runId, "HANDOFF")
+        .find(a => a.content.handoffId === opened.value.handoffId)!.content.handoff;
+      expect(actual.recentDecisions).toContain(JSON.stringify({ authenticatedCeoDecision: escalation }));
+      expect(actual.recentDecisions.filter(d => d.includes(resolution))).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+
+  it("refuses a PLAN that lacks only a CEO decision admitted after it, until a fresh-key plan_submit freezes it", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      expect(await planSubmit(f, "decision-plan")).toMatchObject({ ok: true });
+      const resolution = "Keep the single repository create; nothing else changes.";
+      await resolveEscalation(f, resolution);
+      const [decision] = collectBootstrapCeoDecisions(f.h.cp.db, f.run.runId);
+      const before = effects(f);
+      expect(await resultSubmit(f, "decision-result-refused")).toMatchObject({ ok: false, reasonCode: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN",
+        evidence: { unfrozenReviewEvidenceAttachment: null, unfrozenCeoDecisionEvents: [decision!.source.decisionEventId] } });
+      expect(effects(f)).toEqual(before);
+      expect(await planSubmit(f, "decision-plan-fresh")).toMatchObject({ ok: true });
+      f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
+      expect(await resultSubmit(f, "decision-result")).toMatchObject({ ok: true });
+      expect(decisionSection(reviews(f)[0]!.prompt)).toEqual([decision]);
+      const plan = currentBootstrapPlan(f.run.runId, f.h.cp.artifacts.latest(f.run.runId, "PLAN"));
+      if (!plan.allowed) throw new Error(plan.message);
+      expect(plan.value.outputs.handoff.recentDecisions).toContain(JSON.stringify({ authenticatedCeoDecision: decision }));
+    } finally { await f.close(); }
+  });
+
+  it("refuses a PLAN that froze evidence the CEO has since replaced, and reviews only the replacement after a fresh-key plan_submit", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      const a = evidence(f, "selection-A");
+      await stageAndAttach(f, a, "A");
+      expect(await planSubmit(f, "plan-A")).toMatchObject({ ok: true });
+      const planA = f.h.cp.artifacts.latest<Args>(f.run.runId, "PLAN")!;
+      expect(frozenBootstrapReviewEvidence(f.h.cp, f.run.runId, planA.content)?.bundle).toEqual(a.bundle);
+      const b = evidence(f, "selection-B");
+      await stageAndAttach(f, b, "B", a.sha);
+      expect(collectBootstrapCeoDecisions(f.h.cp.db, f.run.runId)).toEqual([]);
+      const before = effects(f);
+      expect(await resultSubmit(f, "result-A")).toMatchObject({ ok: false, reasonCode: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN",
+        evidence: { planDigest: planA.digest, unfrozenReviewEvidenceAttachment: expect.stringMatching(/^sha256:/), unfrozenCeoDecisionEvents: [] } });
+      expect(effects(f)).toEqual(before);
+      expect(await planSubmit(f, "plan-B")).toMatchObject({ ok: true });
+      f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
+      expect(await resultSubmit(f, "result-B")).toMatchObject({ ok: true });
+      const prompt = reviews(f)[0]!.prompt;
+      expect(prompt).toContain(b.text.trim());
+      expect(prompt).not.toContain(a.text.trim());
+    } finally { await f.close(); }
+  });
+
+  it("still refuses evidence that names a replaced PLAN input, with nothing frozen or reviewed", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      await stageAndAttach(f, evidence(f, "first-input"), "first-input");
+      expect(await planSubmit(f, "plan-first-input")).toMatchObject({ ok: true });
+      const replacement = JSON.parse(f.body); replacement.plan.summary = "replacement PLAN input";
+      const planBody = JSON.stringify(replacement);
+      expect(await f.attach({ idempotencyKey: "replace-input", planBody, expectedSha256: sha256(planBody), replacesSha256: f.digest })).toMatchObject({ ok: true });
+      const before = effects(f);
+      expect(await f.cto("plan_submit", { idempotencyKey: "plan-replaced-input", runId: f.run.runId, bootstrapPlanDigest: sha256(planBody) }))
+        .toMatchObject({ ok: false, reasonCode: "SNAPSHOT_DIGEST_MISMATCH" });
+      expect(await resultSubmit(f, "result-replaced-input")).toMatchObject({ ok: false });
+      expect(effects(f)).toEqual(before);
+      expect(reviews(f)).toHaveLength(0);
+    } finally { await f.close(); }
+  });
+
+  // Review of 51a21441 — authority that arrives while the reviewer is answering. Holds the next
+  // bootstrap-plan reviewer invocation until released; the answer is the scripted one, only its timing is the test's.
+  const holdNextReview = (f: Staged) => {
+    const scripted = f.h.scripted;
+    const original = scripted.invoke.bind(scripted);
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    let enter!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    let held = false;
+    vi.spyOn(scripted, "invoke").mockImplementation(async request => {
+      if (!held && /Bootstrap plan review/.test(request.prompt)) { held = true; enter(); await released; }
+      return original(request);
+    });
+    return { entered, release };
+  };
+
+  it.each(["PASS", "REVISE"] as const)("makes a %s stale when evidence is attached and an escalation resolved while the reviewer is answering", async verdict => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      expect(await planSubmit(f, "mid-review-plan")).toMatchObject({ ok: true });
+      const keys = bootstrapCoverageKeys(f.h, f.run.runId);
+      f.h.scripted.script({ match: /Bootstrap plan review/, text: verdict === "PASS" ? reviewerPass(keys) : reviewerRevise(keys, "judged without the attached records") });
+      const held = holdNextReview(f);
+      const pending = resultSubmit(f, "mid-review-result");
+      await held.entered;
+      const candidate = f.h.cp.runs.currentCandidate(f.run.runId);
+      expect(candidate).not.toBeNull();
+      // While the reviewer answers: the CEO resolves a blocking escalation and attaches review evidence, over MCP.
+      const resolution = "Judge the attached originals before anything else.";
+      await resolveEscalation(f, resolution);
+      const e = evidence(f, "attached-mid-review");
+      await stageAndAttach(f, e, "mid-review");
+      held.release();
+      const submitted = await pending;
+      expect(submitted, JSON.stringify(submitted)).toMatchObject({ ok: true,
+        value: { stage: "CANDIDATE_STALE", reasonCode: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN", snapshotDigest: candidate } });
+      // Review of 2bf6f98c — the same answer carries what to do next, and which authority is unfrozen.
+      const detail = (submitted["value"] as { detail?: { message: string; evidence: Args } }).detail;
+      expect(detail?.message).toContain("plan_submit again with the same bootstrapPlanDigest and a NEW idempotencyKey");
+      expect(detail?.message).toContain("then result_submit");
+      expect(detail?.evidence).toMatchObject({ refusal: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN", bootstrapPlanDigest: f.digest,
+        unfrozenReviewEvidenceAttachment: expect.stringMatching(/^sha256:/),
+        unfrozenCeoDecisionEvents: collectBootstrapCeoDecisions(f.h.cp.db, f.run.runId).map(d => d.source.decisionEventId) });
+      const judged = reviews(f)[0]!.prompt;
+      expect(judged).not.toContain(e.text.trim());
+      expect(judged).not.toContain(resolution);
+      expect(f.h.cp.runs.require(f.run.runId).state).toBe("ACTIVE");
+      expect(f.h.cp.artifacts.list(f.run.runId, "PRODUCTION_READY_PACKET")).toEqual([]);
+      expect(f.h.cp.outbox.listByRun(f.run.runId).filter(m => m.kind === "REVISION_REQUEST")).toEqual([]);
+      expect(f.h.cp.audit.forRun(f.run.runId).filter(a => a.kind === "BLIND_REVIEW_UNAVAILABLE")).toEqual([]);
+      // The next result_submit is refused at entry with the instruction; a fresh-key PLAN is reviewed with both.
+      expect(await resultSubmit(f, "mid-review-result-again")).toMatchObject({ ok: false, reasonCode: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN" });
+      expect(await planSubmit(f, "mid-review-plan-fresh")).toMatchObject({ ok: true });
+      f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
+      expect(await resultSubmit(f, "mid-review-result-fresh")).toMatchObject({ ok: true });
+      const fresh = reviews(f).at(-1)!.prompt;
+      expect(fresh).toContain(e.text.trim());
+      expect(fresh).toContain(resolution);
+      expect(f.h.cp.runs.require(f.run.runId).state).toBe("READY_FOR_CEO_REVIEW");
+    } finally { vi.restoreAllMocks(); await f.close(); }
   });
 });
