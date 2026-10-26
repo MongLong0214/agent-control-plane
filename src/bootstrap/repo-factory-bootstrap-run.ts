@@ -1,6 +1,7 @@
 import type { ResidentProjectProvisioning } from './resident-project-provisioning.ts';
 import { lstatSync, readdirSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
+import { attemptCheckoutPath } from "../core/repo-factory-paths.ts";
 
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
@@ -51,7 +52,6 @@ import {
   checkoutMarkerOf,
   occupiedCheckoutLeaf,
   produceRepoFactoryResult,
-  repositoryCheckoutPath,
   type RepoFactoryPlanFixture,
 } from "./repo-factory-producer.ts";
 import { type ExternalWriteReceipt, parseRepoFactoryResult, type RepoFactoryResult } from "./repo-factory-result.ts";
@@ -323,13 +323,7 @@ const gitLockFiles = (checkoutPath: string): string[] | null => {
   return walk(gitDir, 0) ? found.sort() : null;
 };
 
-/**
- * #246 C3, CEO decision (c) — the checkout leaf attempt `attempt` of a run creates: a name of its
- * own beside the producer's default leaf, bound to the run (its work directory) and the attempt. No
- * attempt ever reuses, moves or removes another attempt's checkout; an earlier one stays where it is.
- */
-export const attemptCheckoutPath = (workDir: string, repositoryRole: string, attempt: number): string =>
-  join(dirname(repositoryCheckoutPath(workDir, repositoryRole)), `${repositoryRole}.attempt-${attempt}`);
+export { attemptCheckoutPath };
 
 export class RepoFactoryBootstrapRunner {
   /** #246 C3 — the runs with an application attempt in flight in this process. */
@@ -840,7 +834,8 @@ export class RepoFactoryBootstrapRunner {
       commitlore,
       persist: (result) => {
         const written = this.deps.db.txDecision(() => {
-          this.deps.artifacts.put(runId, ArtifactKind.REPO_FACTORY_RESULT, result);
+          // The run's work directory this runner computed: the producer's checkout is built under it.
+          this.deps.artifacts.put(runId, ArtifactKind.REPO_FACTORY_RESULT, result, null, [workDir]);
           return this.deps.applications.markWritten(runId);
         });
         if (!written.allowed) throw acpError(written.reasonCode, written.message, written.evidence);

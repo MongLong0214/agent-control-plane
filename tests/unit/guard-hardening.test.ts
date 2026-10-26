@@ -349,6 +349,8 @@ describe("P0-12 guarded worktree and source fences", () => {
 
     const cleanupPath = manager.pathFor("real-guarded-cleanup");
     mkdirSync(cleanupPath);
+    // As the verification engine does for every tree it makes: recorded for the run before it is acted on.
+    recordVerificationTree(db, clock, seeded, repo, cleanupPath, "real-guarded-cleanup");
     await manager.cleanup(cleanupPath, {
       ...authorization.cleanup!,
       request: {

@@ -3,6 +3,7 @@ import { allow, deny, type Decision, type Evidence } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
 import { hasCredentialShape, redactCredentialShapes, type AcpLocations, type WriteSite } from "../core/credential-shapes.ts";
 import type { Db } from "./database.ts";
+import { registryView } from "./registry-view.ts";
 
 export interface AuditRecord {
   kind: string;
@@ -13,6 +14,12 @@ export interface AuditRecord {
   roleKey?: string | null;
   actor?: string | null;
   evidence?: Evidence;
+  /**
+   * Canonical locations the writing code computed itself for this record (the toplevel the registry
+   * resolved, the roots the write guard probed): what a location in `evidence` is checked against
+   * before it is read per segment. Never stored.
+   */
+  verifiedLocations?: readonly string[];
 }
 
 /**
@@ -38,7 +45,9 @@ export class AuditLog {
    * autoincrement integer and always was.
    */
   record(entry: AuditRecord): Decision<number> {
-    const site: WriteSite = { writer: entry.kind, runId: entry.runId ?? null, locations: this.locations };
+    const site: WriteSite = { writer: entry.kind, runId: entry.runId ?? null, locations: this.locations,
+      registry: registryView(this.db), record: entry.evidence ?? {},
+      ...(entry.verifiedLocations ? { verified: entry.verifiedLocations } : {}) };
     if (!isAllowlistedAuditEvidence(entry.evidence ?? {}, 0, [], site)) {
       // Keep the decision itself visible without retaining the rejected payload. An audit
       // record that might contain a private payload is less useful than a privacy breach.

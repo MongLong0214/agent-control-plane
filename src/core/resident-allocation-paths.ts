@@ -9,6 +9,10 @@ import { join } from "node:path";
 export const residentSessionSocket = (stateDir: string, projectId: string): string =>
   join(stateDir, `cc-session-${projectId}.sock`);
 
+/** The clone of the allocation's repository under the resident home: `projects/<name>` of `<owner>/<name>`. */
+export const residentClonePath = (home: string, repositoryIdentity: string): string =>
+  join(home, "projects", repositoryIdentity.split("/")[1]!);
+
 /** Where the resident's Buzz identity key file is: its location, never its contents. */
 export const residentPrivateKeyFile = (home: string, projectId: string): string =>
   join(home, ".hermes", "bridge", "keys", `cto-${projectId}.priv`);

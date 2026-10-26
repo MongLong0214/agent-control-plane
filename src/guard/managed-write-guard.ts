@@ -1304,9 +1304,36 @@ export class ManagedWriteGuard {
     return left.dev === right.dev && left.ino === right.ino;
   }
 
+  /**
+   * The roots a grant's paths were checked against, read from the guard's own records rather than
+   * the grant's strings: the registered checkout of its repository, the worktree its task receipt is
+   * bound to (probed equal to the target's toplevel when granted), and the run's own verification
+   * trees of that repository. Handed to the audit beside the consumed grant, never stored.
+   */
+  private probedRoots(grant: GuardGrant): string[] {
+    if (!grant.repositoryIdentity) return [];
+    const roots = this.db.all<{ checkout_path: string }>(
+      `SELECT checkout_path FROM repositories WHERE identity = ?`, [grant.repositoryIdentity],
+    ).map((row) => this.probe.canonical(row.checkout_path));
+    if (grant.runId) {
+      roots.push(...this.db.all<{ worktree_path: string }>(
+        `SELECT worktree_path FROM verification_worktrees WHERE run_id = ? AND repository_identity = ?`,
+        [grant.runId, grant.repositoryIdentity],
+      ).map((row) => this.probe.canonical(row.worktree_path)));
+    }
+    if (grant.runId && grant.taskReceiptId) {
+      const receipt = this.db.get<{ worktree_id: string | null }>(
+        `SELECT worktree_id FROM task_executions WHERE execution_id = ? AND run_id = ?`, [grant.taskReceiptId, grant.runId],
+      );
+      if (receipt?.worktree_id) roots.push(this.probe.canonical(receipt.worktree_id));
+    }
+    return roots;
+  }
+
   private auditConsumed(grant: GuardGrant): void {
     this.audit.record({
       kind: "MANAGED_WRITE_GUARD_CONSUMED",
+      verifiedLocations: this.probedRoots(grant),
       reasonCode: ReasonCode.WRITE_ALLOWED,
       runId: grant.runId,
       sessionId: grant.sessionId,

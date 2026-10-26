@@ -1,7 +1,8 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { sha256 } from "./digest.ts";
-import { residentBootPacket, residentPrivateKeyFile, residentSessionSocket } from "./resident-allocation-paths.ts";
+import { attemptCheckoutPath, githubLedgerPath, repositoryCheckoutPath } from "./repo-factory-paths.ts";
+import { residentBootPacket, residentClonePath, residentPrivateKeyFile, residentSessionSocket } from "./resident-allocation-paths.ts";
 
 /**
  * The one list of credential shapes ACP recognises. Every consumer reads it from here: the
@@ -134,6 +135,14 @@ export interface AcpLocations {
   readonly repoFactoryWorkRoot?: string | null;
 }
 
+/** What the repository registry recorded, read by the store from its own database. */
+export interface RegistryView {
+  /** Whether the registry records exactly this identity at exactly this checkout. */
+  records(identity: string, checkoutPath: string): boolean;
+  /** The same, for a repository registered for the run: its project's, or the run's own temporary one. */
+  recordsForRun(runId: string, identity: string, checkoutPath: string): boolean;
+}
+
 /** Where a record is being written: the facts a verified location's contract is checked against. */
 export interface WriteSite {
   /** The artifact kind or audit event kind being written: which ACP code path wrote the value. */
@@ -141,6 +150,15 @@ export interface WriteSite {
   /** The run the record is filed under: an artifact's run, an audit event's `runId`. */
   readonly runId?: string | null;
   readonly locations?: AcpLocations;
+  /**
+   * Canonical locations the writing code computed itself for this one record and hands to the store
+   * beside it, never read from the record: the toplevel the registry resolved, the roots the write
+   * guard probed for a grant. Not stored.
+   */
+  readonly verified?: readonly string[];
+  readonly registry?: RegistryView;
+  /** The whole record being written: a contract reads facts elsewhere in it (an allocation's repository). */
+  readonly record?: unknown;
 }
 
 /**
@@ -252,23 +270,15 @@ const isRepositoryPath = (text: string, field: EvidenceField | undefined): boole
 /** Whether a value is the location its writer's contract makes: given the value, its field and write site. */
 type LocationContract = (text: string, field: EvidenceField) => boolean;
 
-/** A checkout, worktree or cwd path the writer made or probed itself (see `VERIFIED_LOCATIONS`). */
-const absolutePath: LocationContract = (text) => /^\/\S*$/.test(text);
-
-/**
- * The registry's `local:` identity contract (repository-registry.ts: `local:` and the canonical git
- * toplevel of a verified checkout): the path must be an existing directory that is its own canonical
- * path. Any other `local:<string>`, a secret in that shape included, is read whole.
- */
-const localIdentity: LocationContract = (text) => {
-  const match = /^local:(\/\S*)$/.exec(text);
-  if (!match) return false;
-  try { return statSync(match[1]!).isDirectory() && realpathSync(match[1]!) === match[1]; } catch { return false; }
-};
-
 const sibling = (field: EvidenceField, key: string): unknown =>
   field.holder !== null && typeof field.holder === "object" && !Array.isArray(field.holder)
     ? (field.holder as Readonly<Record<string, unknown>>)[key] : undefined;
+
+const member = (value: unknown, key: string): unknown =>
+  value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Readonly<Record<string, unknown>>)[key] : undefined;
+
+/** A `local:` identity's path, or null. */
+const localPath = (text: string): string | null => (text.startsWith("local:") ? text.slice("local:".length) : null);
 
 /**
  * A path resident-project-provisioning.ts allocates, built by the same function from the root
@@ -284,21 +294,50 @@ const allocatedPath = (
   return typeof known === "string" && typeof projectId === "string" && text === build(known, projectId);
 };
 
+/**
+ * The allocation's clone (resident-project-provisioning.ts): `residentClonePath` of the resident home
+ * control-plane.ts computes and the allocation's repository. A host observation's checkout and the
+ * resident's cwd are accepted only when they equal it, so the same contract binds them.
+ */
+const allocatedClone: LocationContract = (text, field) => {
+  const home = field.site?.locations?.residentHome;
+  const repositoryIdentity = member(member(member(field.site?.record, "provisioning"), "allocation"), "repositoryIdentity");
+  return typeof home === "string" && typeof repositoryIdentity === "string" && /^[^/]+\/[^/]+$/.test(repositoryIdentity)
+    && text === residentClonePath(home, repositoryIdentity);
+};
+
 const PATH_SAFE_RUN_ID = /^[A-Za-z0-9_-]+$/;
 /** A repository role as repo-factory-producer.ts admits it: kebab-case. */
 const REPOSITORY_ROLE = /^[a-z0-9][a-z0-9-]*$/;
 
-/**
- * repo-factory-github.ts `githubLedgerPath(join(workRoot, runId), role)`: the configured work root,
- * resolved, the run the record is filed under, `github-ledger` and `<role>.json`. Only exactly that
- * path is it; with no work root or run known, nothing is.
- */
-const runLedger: LocationContract = (text, field) => {
+/** The run's work directory, `join(workRoot, runId)`, for the run the record is filed under; or null. */
+const runWorkDir = (field: EvidenceField): string | null => {
   const workRoot = field.site?.locations?.repoFactoryWorkRoot;
   const runId = field.site?.runId;
-  if (typeof workRoot !== "string" || typeof runId !== "string" || !PATH_SAFE_RUN_ID.test(runId)) return false;
+  return typeof workRoot === "string" && typeof runId === "string" && PATH_SAFE_RUN_ID.test(runId) ? join(workRoot, runId) : null;
+};
+
+/** `githubLedgerPath(join(workRoot, runId), role)` for a kebab-case role. With no work root or run known, nothing is. */
+const runLedger: LocationContract = (text, field) => {
+  const workDir = runWorkDir(field);
   const role = basename(text, ".json");
-  return REPOSITORY_ROLE.test(role) && text === join(resolve(join(workRoot, runId)), "github-ledger", `${role}.json`);
+  return workDir !== null && REPOSITORY_ROLE.test(role) && text === githubLedgerPath(workDir, role);
+};
+
+/**
+ * The producer's checkout for the result's own `role`, beside it: `repositoryCheckoutPath` or an
+ * attempt's `attemptCheckoutPath` under the run's work directory, `join(workRoot, runId)`, as the
+ * runner that stores the result computed it and hands it to the store. Once activation registered
+ * the binding, the registry's record of the result's identity at exactly this checkout is it too.
+ */
+const factoryCheckout: LocationContract = (text, field) => {
+  const identity = sibling(field, "identity");
+  if (typeof identity === "string" && field.site?.registry?.records(identity, text) === true) return true;
+  const role = sibling(field, "role");
+  if (typeof role !== "string" || !REPOSITORY_ROLE.test(role)) return false;
+  const attempt = /\.attempt-(\d{1,9})$/.exec(text);
+  return (field.site?.verified ?? []).some((workDir) => (text === repositoryCheckoutPath(workDir, role)
+    || (attempt !== null && text === attemptCheckoutPath(workDir, role, Number(attempt[1])))));
 };
 
 /**
@@ -312,43 +351,78 @@ const observedEntrypoint: LocationContract = (text, field) => {
   catch { return false; }
 };
 
+/** An activation's local binding (activation.ts): the registry's record of that identity at that checkout. */
+const registeredBindingCheckout: LocationContract = (text, field) => {
+  const identity = sibling(field, "identity");
+  return typeof identity === "string" && field.site?.registry?.records(identity, text) === true;
+};
+
+/** A local binding's `local:` identity: `local:` and the checkout beside it, as the registry records the pair. */
+const registeredBindingIdentity: LocationContract = (text, field) => {
+  const checkoutPath = sibling(field, "checkoutPath");
+  return typeof checkoutPath === "string" && localPath(text) === checkoutPath
+    && field.site?.registry?.records(text, checkoutPath) === true;
+};
+
+/** A `local:` identity of a repository the registry records for the run, at exactly the checkout it names. */
+const runRepositoryIdentity: LocationContract = (text, field) => {
+  const checkoutPath = localPath(text);
+  const runId = field.site?.runId;
+  return checkoutPath !== null && typeof runId === "string" && field.site?.registry?.recordsForRun(runId, text, checkoutPath) === true;
+};
+
+/** The canonical checkout the writing code computed for this record (repository-registry.ts: its git toplevel). */
+const writerComputedCheckout: LocationContract = (text, field) => field.site?.verified?.includes(text) === true;
+
+/** `local:` and the checkout beside it in the same record, which the writing code computed. */
+const writerComputedIdentity: LocationContract = (text, field) => {
+  const checkoutPath = sibling(field, "checkoutPath");
+  return typeof checkoutPath === "string" && localPath(text) === checkoutPath && field.site?.verified?.includes(checkoutPath) === true;
+};
+
+/**
+ * Inside a root the write guard probed for this grant and hands to the audit beside it (the
+ * registered checkout, the assigned worktree, the run's own verification trees): the root itself or
+ * a normalized path under it. The part under the root is a repository path, read per segment.
+ */
+const insideProbedRoot: LocationContract = (text, field) =>
+  text.startsWith("/") && resolve(text) === text
+  && (field.site?.verified ?? []).some((root) => root.startsWith("/") && (text === root || text.startsWith(`${root}/`)));
+
+/** `local:` and exactly a root the write guard probed for this grant. */
+const probedRootIdentity: LocationContract = (text, field) => {
+  const path = localPath(text);
+  return path !== null && field.site?.verified?.includes(path) === true;
+};
+
 /**
  * Locations that ACP code itself made or checked, by the writer that stores them and the exact
- * field, each with the contract its value must meet: only a value that meets it is read per segment,
- * because it is that location, not because it looks like one. A temp directory's random segments can
- * join `/` into a long base64-alphabet run (`/private/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/acp`
- * is 60 such characters on a CI runner) while no segment is one. A field of the same name from any
- * other writer, a value that does not meet its contract, and every other field, is read whole.
+ * field, each with the contract its value must meet: a location ACP itself knows (a root it computed
+ * from its configuration, the registry's record, or what the writing code computed for this record),
+ * never the value's shape and its writer alone. Only a value that meets its contract is read per
+ * segment. A temp directory's random segments can join `/` into a long base64-alphabet run
+ * (`/private/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/acp` is 60 such characters on a CI
+ * runner) while no segment is one. A field of the same name from any other writer, a value that does
+ * not meet its contract, and every other field, is read whole.
  */
 const VERIFIED_LOCATIONS: ReadonlyMap<string, ReadonlyMap<string, LocationContract>> = new Map([
-  // repo-factory-producer.ts makes `proposedCheckoutPath` itself (repositoryCheckoutPath under its work
-  // directory, created with mkdirSync), and the runner refuses a result whose path is not the run's own.
-  ["artifact:REPO_FACTORY_RESULT", new Map([["repositories.proposedCheckoutPath", absolutePath]])],
+  ["artifact:REPO_FACTORY_RESULT", new Map([["repositories.proposedCheckoutPath", factoryCheckout]])],
   ["artifact:BOOTSTRAP_ACTIVATION_RESULT", new Map([
-    // activation.ts: the repository registry's own record of each checkout it registered.
-    ["localBindings.checkoutPath", absolutePath], ["localBindings.identity", localIdentity],
-    // resident-project-provisioning.ts allocates the clone path under its own home, and accepts a host
-    // observation only when the checkout path and the resident's cwd equal that allocated path.
-    ["provisioning.allocation.clonePath", absolutePath],
-    ["provisioning.observations.checkout.path", absolutePath], ["provisioning.observations.resident.cwd", absolutePath],
+    ["localBindings.checkoutPath", registeredBindingCheckout], ["localBindings.identity", registeredBindingIdentity],
+    ["provisioning.allocation.clonePath", allocatedClone],
+    ["provisioning.observations.checkout.path", allocatedClone], ["provisioning.observations.resident.cwd", allocatedClone],
     ["provisioning.allocation.socketPath", allocatedPath("stateRoot", residentSessionSocket)],
     ["provisioning.allocation.privateKeyFile", allocatedPath("residentHome", residentPrivateKeyFile)],
     ["provisioning.allocation.bootPacket", allocatedPath("residentHome", residentBootPacket)],
   ])],
-  // candidate-snapshot.ts freezes the registry's identity of each checkout; the verification engine
-  // copies it from that snapshot.
-  ["artifact:CANDIDATE_SNAPSHOT", new Map([["repositories.identity", localIdentity]])],
-  ["artifact:VERIFICATION", new Map([["results.repositoryIdentity", localIdentity], ["results.output.repositoryIdentity", localIdentity]])],
+  ["artifact:CANDIDATE_SNAPSHOT", new Map([["repositories.identity", runRepositoryIdentity]])],
+  ["artifact:VERIFICATION", new Map([["results.repositoryIdentity", runRepositoryIdentity], ["results.output.repositoryIdentity", runRepositoryIdentity]])],
   // doctor/repair.ts: a reservation release's preconditions name the ledger the run's attempts wrote.
   ["artifact:REPAIR_RECEIPT", new Map([["preconditionsChecked.evidence.ledgerPath", runLedger]])],
-  // repository-registry.ts: the canonical git toplevel it registered, and the identity it made from it.
-  ["audit:REPOSITORY_REGISTERED", new Map([["checkoutPath", absolutePath], ["identity", localIdentity]])],
-  ["audit:REPOSITORY_TEMPORARY_BINDING", new Map([["checkoutPath", absolutePath], ["identity", localIdentity]])],
-  // managed-write-guard.ts: a consumed grant's canonical target, granted only inside a checkout or
-  // worktree the guard probed; its canonical worktree, which a GIT_WORKTREE grant must match to that
-  // effect path (or, to prune, own as the run's verification tree); and its registered repository.
+  ["audit:REPOSITORY_REGISTERED", new Map([["checkoutPath", writerComputedCheckout], ["identity", writerComputedIdentity]])],
+  ["audit:REPOSITORY_TEMPORARY_BINDING", new Map([["checkoutPath", writerComputedCheckout], ["identity", writerComputedIdentity]])],
   ["audit:MANAGED_WRITE_GUARD_CONSUMED", new Map([
-    ["resolvedPath", absolutePath], ["targetWorktreeId", absolutePath], ["repositoryIdentity", localIdentity],
+    ["resolvedPath", insideProbedRoot], ["targetWorktreeId", insideProbedRoot], ["repositoryIdentity", probedRootIdentity],
   ])],
   ["audit:REPAIR_REFUSED", new Map([["preconditions.evidence.ledgerPath", runLedger]])],
   ["audit:DAEMON_RUNTIME_OBSERVED", new Map([["resolvedPath", observedEntrypoint]])],

@@ -228,6 +228,8 @@ export class RepositoryRegistry {
         kind: "REPOSITORY_REGISTERED",
         projectId: existing.projectId,
         evidence: { identity, checkoutPath: existing.checkoutPath, role: existing.repositoryRole, idempotent: true },
+        // The toplevel this registry resolved, which a stored checkout path is checked against.
+        verifiedLocations: [rootPath],
       });
       return allow(ReasonCode.OK, existing);
     }
@@ -270,6 +272,7 @@ export class RepositoryRegistry {
       kind: "REPOSITORY_REGISTERED",
       projectId: record.projectId,
       evidence: { identity, checkoutPath: record.checkoutPath, role: record.repositoryRole },
+      verifiedLocations: [rootPath],
     });
     return allow(ReasonCode.OK, record);
   }
@@ -339,6 +342,7 @@ export class RepositoryRegistry {
       kind: "REPOSITORY_TEMPORARY_BINDING",
       runId,
       evidence: { identity, checkoutPath: rootPath },
+      verifiedLocations: [rootPath],
     });
     return allow(ReasonCode.OK, this.byIdentity(identity)!);
   }

@@ -3,7 +3,7 @@ import { readProcessStartToken } from '../core/process-argv.ts';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { canonicalJson } from '../core/digest.ts';
-import { residentBootPacket, residentPrivateKeyFile, residentSessionSocket } from '../core/resident-allocation-paths.ts';
+import { residentBootPacket, residentClonePath, residentPrivateKeyFile, residentSessionSocket } from '../core/resident-allocation-paths.ts';
 import type { Db } from '../db/database.ts';
 import type { Clock } from '../core/clock.ts';
 import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
@@ -53,9 +53,8 @@ export class ResidentProjectProvisioning {
       if (!row || row.status === 'RETIRED' || row.status === 'RETIRING') throw new Error('no active confirmed provisioning intent');
       let a = this.allocation(input.runId);
       if (!a) {
-        const repoName = input.repositoryIdentity.split('/')[1]!;
         a = {projectId:input.projectId,runId:input.runId,repositoryIdentity:input.repositoryIdentity,repositoryNodeId:input.repositoryNodeId,head:input.head,
-          sessionUuid:randomUUID(),roomId:randomUUID(),roomName:input.projectId,clonePath:join(this.home,'projects',repoName),tmuxName:`acp-${Buffer.from(input.projectId).toString("hex")}`,socketPath:residentSessionSocket(this.stateDir,input.projectId),
+          sessionUuid:randomUUID(),roomId:randomUUID(),roomName:input.projectId,clonePath:residentClonePath(this.home,input.repositoryIdentity),tmuxName:`acp-${Buffer.from(input.projectId).toString("hex")}`,socketPath:residentSessionSocket(this.stateDir,input.projectId),
           fleetName:`acp-${input.projectId}`,identityName:`cto-${input.projectId}`,privateKeyFile:residentPrivateKeyFile(this.home,input.projectId),bootPacket:residentBootPacket(this.home,input.projectId),nonce:randomUUID()};
         this.db.run(`UPDATE resident_project_provisioning SET allocation_json = ? WHERE run_id = ? AND allocation_json = '{}'`,[JSON.stringify(a),input.runId]);
         a = this.allocation(input.runId)!;

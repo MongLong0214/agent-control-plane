@@ -90,7 +90,8 @@ describe("review S11-R1-03: a stored CommitLore PASS is bound to the observation
     // The documented completion-chain threat includes a raw database writer. These APIs make the
     // same two database changes, while every approval/attempt/GitHub ledger remains unmodified.
     harness.cp.db.tx(() => {
-      harness.cp.artifacts.put(runId, "REPO_FACTORY_RESULT", forged);
+      // Its checkout is the producer's own, under the run's work directory, which the runner hands the store.
+      harness.cp.artifacts.put(runId, "REPO_FACTORY_RESULT", forged, null, [join(prepared.workRoot, runId)]);
       expect(harness.cp.bootstrapApplications.markWritten(runId).allowed).toBe(true);
     });
 
@@ -172,12 +173,12 @@ describe("review S11-R1-03: a stored CommitLore PASS is bound to the observation
     // The producer has recorded its observation when the result is stored; the record is moved away at
     // that moment, so the only check between it and activation is the one activation makes.
     const put = harness.cp.artifacts.put.bind(harness.cp.artifacts);
-    vi.spyOn(harness.cp.artifacts, "put").mockImplementation(((id: string, kind: string, content: unknown) => {
-      if (kind === "REPO_FACTORY_RESULT") {
+    vi.spyOn(harness.cp.artifacts, "put").mockImplementation(((...args: Parameters<typeof put>) => {
+      if (args[1] === "REPO_FACTORY_RESULT") {
         const recordPath = commitloreObservationPath(join(prepared.workRoot, runId), paths[1]!);
         renameSync(recordPath, `${recordPath}.aside`);
       }
-      return put(id, kind as never, content);
+      return put(...args);
     }) as typeof harness.cp.artifacts.put);
     const first = await prepared.runner.produceAndActivate({ ...prepared.input, ownerApproval: ownerApprovalFor(prepared) });
     expect(first, JSON.stringify(first)).toMatchObject({

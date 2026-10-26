@@ -12,6 +12,7 @@ import {
   candidateSnapshotSchema,
 } from "../snapshot/candidate-snapshot.ts";
 import { credentialBearingField, prohibitedDurableField } from "./audit.ts";
+import { registryView } from "./registry-view.ts";
 import type { Db, EvidenceWritePort } from "./database.ts";
 import { OWNER_DECISION_LABEL, ownerDecisionShapeSql } from "./migrations.ts";
 
@@ -224,11 +225,17 @@ export class ArtifactStore {
   }
 
   /** Non-evidence artifacts: contracts, plans, snapshots, handoffs, receipts. */
+  /**
+   * `verifiedLocations` are canonical locations the writing code computed itself for this content
+   * (the producer's work directory for the run): what a location in it is checked against before it
+   * is read per segment. Never stored.
+   */
   put<T>(
     runId: string,
     kind: ArtifactKind,
     content: T,
     candidateSnapshotDigest?: string | null,
+    verifiedLocations?: readonly string[],
   ): StoredArtifact<T> {
     if (isEvidenceKind(kind)) {
       fail(
@@ -237,7 +244,7 @@ export class ArtifactStore {
         { runId, kind },
       );
     }
-    return this.write(runId, kind, content, candidateSnapshotDigest ?? null, "service");
+    return this.write(runId, kind, content, candidateSnapshotDigest ?? null, "service", undefined, verifiedLocations);
   }
 
   /**
@@ -325,6 +332,7 @@ export class ArtifactStore {
     candidateSnapshotDigest: string | null,
     producedBy: string,
     evidenceWritePort?: EvidenceWritePort,
+    verifiedLocations?: readonly string[],
   ): StoredArtifact<T> {
     if (SNAPSHOT_BOUND.has(kind) && !candidateSnapshotDigest) {
       fail(
@@ -343,19 +351,6 @@ export class ArtifactStore {
       );
     }
 
-    // Evidence is stored exactly as produced. Rewriting it would make its digest
-    // uncorroborable: a later gate compares the report it was handed against the stored
-    // row, and CP-HI-06 makes the stored bytes the authority. So content carrying a
-    // credential is *refused* rather than quietly altered — §31.5 is satisfied by
-    // refusing to store it at all, and the producer is the one that must not include it.
-    const credential = credentialBearingField(content, 0, [], { writer: kind, runId, locations: this.locations });
-    if (credential) {
-      fail(
-        ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED,
-        `${kind} contains a credential and cannot be stored as evidence`,
-        { runId, kind, field: credential },
-      );
-    }
     const durableContent = content;
     const digest = digestArtifactContent(kind, durableContent, candidateSnapshotDigest);
     const existing = this.db.get<RawArtifact>(
@@ -363,6 +358,24 @@ export class ArtifactStore {
         WHERE run_id = ? AND kind = ? AND digest = ? AND candidate_snapshot_digest IS ?`,
       [runId, kind, digest, candidateSnapshotDigest],
     );
+    // Evidence is stored exactly as produced. Rewriting it would make its digest
+    // uncorroborable: a later gate compares the report it was handed against the stored
+    // row, and CP-HI-06 makes the stored bytes the authority. So content carrying a
+    // credential is *refused* rather than quietly altered — §31.5 is satisfied by
+    // refusing to store it at all, and the producer is the one that must not include it.
+    // Content identical to a row this run already holds writes nothing, so it is answered with
+    // that row rather than checked again without the context its first write was checked in.
+    const credential = existing ? null : credentialBearingField(content, 0, [], {
+      writer: kind, runId, locations: this.locations, registry: registryView(this.db), record: content,
+      ...(verifiedLocations ? { verified: verifiedLocations } : {}),
+    });
+    if (credential) {
+      fail(
+        ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED,
+        `${kind} contains a credential and cannot be stored as evidence`,
+        { runId, kind, field: credential },
+      );
+    }
     if (existing) {
       // SEC-OD1 — an identical row another writer stored first is not this owner decision. Returning
       // it would report the decision recorded while no canonical record exists.

@@ -9,7 +9,8 @@ import {
   renameSync,
   type Stats,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname } from "node:path";
+import { githubLedgerPath } from "../core/repo-factory-paths.ts";
 
 import { z } from "zod";
 
@@ -540,12 +541,7 @@ export interface LedgerState {
   pending: ReadonlyMap<string, PendingWrite>;
 }
 
-/**
- * Beside the checkout, never inside it. The checkout is disposable — a failed run removes it
- * so the same operation can retry — and the ledger is the one thing a retry must find.
- */
-export const githubLedgerPath = (workDir: string, repositoryRole: string): string =>
-  join(resolve(workDir), "github-ledger", `${repositoryRole}.json`);
+export { githubLedgerPath };
 
 const unsafeFile = <T>(path: string, message: string): Decision<T> =>
   refuse(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "LEDGER_UNSAFE", message, { ledgerPath: path });
