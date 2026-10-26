@@ -6,7 +6,7 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { type VerificationCommand, verificationCommandSchema } from "../contracts/verification-command.ts";
 import { type ProjectManifest, commandsForMode, gateEntriesFor } from "../contracts/manifest.ts";
-import type { AuditLog } from "../db/audit.ts";
+import { type AuditLog, credentialBearingField, redact } from "../db/audit.ts";
 import type { ArtifactStore, EvidenceWriter } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, type RunRow } from "../domain/types.ts";
@@ -64,7 +64,113 @@ export interface VerificationResultRecord {
   /** Local sandbox measurement; CI evidence has no host-process RSS. */
   peakRssMb?: number | null;
   enforcement?: SandboxEnforcement;
+  /**
+   * What a reviewer may read of a local command's captured output: bounded and credential-redacted.
+   * Absent on CI evidence (ACP captures no CI log) and on every result recorded before it existed:
+   * such output was not retained, and nothing is reconstructed for it.
+   */
+  output?: VerificationOutputExcerpt;
 }
+
+/** Per stream, the first and last characters of the captured output that are kept. */
+export const OUTPUT_EXCERPT_HEAD_CHARS = 1_000;
+export const OUTPUT_EXCERPT_TAIL_CHARS = 3_000;
+
+/**
+ * A bounded, redacted excerpt of one official sandbox execution, bound to the execution it was taken
+ * from. It is candidate-produced text: evidence to read, never an instruction or a verdict.
+ */
+export interface VerificationOutputExcerpt {
+  schema: "acp.verification-output-excerpt.v1";
+  candidateSnapshotDigest: string;
+  contractDigest: string;
+  commandId: string;
+  repositoryIdentity: string;
+  exactHead: string;
+  /** Captured characters per stream, before redaction and excerpting. */
+  stdoutChars: number;
+  stderrChars: number;
+  stdout: string;
+  stderr: string;
+  /** Characters were left out between each stream's head and tail. */
+  truncated: boolean;
+  /** At least one credential-shaped value was replaced with `[redacted]`. */
+  redacted: boolean;
+  /**
+   * Credential-shaped text remained after redaction (one split across two redaction pieces), so no text is
+   * kept: `stdout` and `stderr` are empty and say nothing about what the command printed.
+   */
+  withheld: boolean;
+}
+
+/**
+ * `redact` caps a string at 2,000 characters, and replacing a short `NAME_TOKEN=x` lengthens it, so
+ * text is scrubbed in pieces that stay under the cap whatever is replaced.
+ */
+const REDACTION_PIECE_CHARS = 1_000;
+
+/**
+ * Replaces credential-shaped values with the durable-storage redaction (`redact` in db/audit.ts,
+ * whose patterns are the ones the artifact store refuses), in pieces of whole lines where a line
+ * fits. Returns null when a shape no piece held whole (one split across two pieces) remains in the
+ * joined text, so a caller keeps none of it rather than a credential.
+ */
+export const redactCredentialText = (text: string): { text: string; redacted: boolean } | null => {
+  const pieces: string[] = [];
+  let piece = "";
+  const flush = (): void => {
+    if (piece.length > 0) pieces.push(redact(piece) as string);
+    piece = "";
+  };
+  for (const line of text.split(/(?<=\n)/)) {
+    if (piece.length + line.length > REDACTION_PIECE_CHARS) flush();
+    // A long line is cut after its last space or tab in reach: no recognised shape holds one, so
+    // only a run of more than a piece without whitespace is cut through.
+    for (let at = 0; at < line.length;) {
+      const window = line.slice(at, at + REDACTION_PIECE_CHARS);
+      const space = window.length < REDACTION_PIECE_CHARS ? -1 : Math.max(window.lastIndexOf(" "), window.lastIndexOf("\t"));
+      const part = space > 0 ? window.slice(0, space + 1) : window;
+      if (piece.length + part.length > REDACTION_PIECE_CHARS) flush();
+      piece += part;
+      at += part.length;
+    }
+  }
+  flush();
+  const joined = pieces.join("");
+  return credentialBearingField(joined) === null ? { text: joined, redacted: joined !== text } : null;
+};
+
+const excerptOf = (text: string): { text: string; truncated: boolean } => {
+  if (text.length <= OUTPUT_EXCERPT_HEAD_CHARS + OUTPUT_EXCERPT_TAIL_CHARS) return { text, truncated: false };
+  const omitted = text.length - OUTPUT_EXCERPT_HEAD_CHARS - OUTPUT_EXCERPT_TAIL_CHARS;
+  return {
+    text: `${text.slice(0, OUTPUT_EXCERPT_HEAD_CHARS)}\n[... ${omitted} characters omitted ...]\n${text.slice(-OUTPUT_EXCERPT_TAIL_CHARS)}`,
+    truncated: true,
+  };
+};
+
+/**
+ * Redact the whole stream first, so a cut can never keep part of a credential; cut; then redact the
+ * excerpt again, because a cut can give a shape the word boundary it lacked inside the stream.
+ */
+export const verificationOutputExcerpt = (
+  binding: Pick<VerificationOutputExcerpt, "candidateSnapshotDigest" | "contractDigest" | "commandId" | "repositoryIdentity" | "exactHead">,
+  stdout: string,
+  stderr: string,
+): VerificationOutputExcerpt => {
+  const streams = [stdout, stderr].map((text) => {
+    const whole = redactCredentialText(text);
+    if (whole === null) return null;
+    const cut = excerptOf(whole.text);
+    const again = redactCredentialText(cut.text);
+    return again === null ? null : { text: again.text, truncated: cut.truncated, redacted: whole.redacted || again.redacted };
+  });
+  const [out, err] = streams;
+  const base = { schema: "acp.verification-output-excerpt.v1" as const, ...binding, stdoutChars: stdout.length, stderrChars: stderr.length };
+  if (out == null || err == null) return { ...base, stdout: "", stderr: "", truncated: false, redacted: true, withheld: true };
+  return { ...base, stdout: out.text, stderr: err.text, truncated: out.truncated || err.truncated,
+    redacted: out.redacted || err.redacted, withheld: false };
+};
 
 export interface VerificationReport {
   runId: string;
@@ -819,6 +925,12 @@ export class VerificationEngine {
       reasonCode: passingMemoryFailure ?? outcome.reasonCode,
       peakRssMb: outcome.peakRssMb,
       enforcement: outcome.enforcement,
+      output: verificationOutputExcerpt(
+        { candidateSnapshotDigest: snapshotDigest, contractDigest: run.contractDigest, commandId: command.id,
+          repositoryIdentity: identity, exactHead: head },
+        outcome.stdout,
+        outcome.stderr,
+      ),
     };
     this.writeResultRow(runId, snapshotDigest, record);
     return allow(ReasonCode.OK, record);

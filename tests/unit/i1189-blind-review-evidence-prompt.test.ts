@@ -208,6 +208,8 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
     const [prompt] = promptsStartingWith(harness, "# Bootstrap plan review");
     expect(prompt).toBeDefined();
     expectEvidenceStandard(prompt!);
+    // E2E-02 — the execution evidence is a candidate-review input only; a plan review is unchanged.
+    expect(prompt).not.toContain("## Untrusted execution evidence");
     await reReview(harness, runId, "BOOTSTRAP_PLAN");
   });
 
@@ -233,6 +235,8 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
     const [prompt] = promptsStartingWith(harness, "# Contract change review");
     expect(prompt).toBeDefined();
     expectEvidenceStandard(prompt!);
+    // E2E-02 — the execution evidence is a candidate-review input only; a plan review is unchanged.
+    expect(prompt).not.toContain("## Untrusted execution evidence");
     await reReview(harness, run.runId, "CONTRACT_CHANGE");
   });
 });
