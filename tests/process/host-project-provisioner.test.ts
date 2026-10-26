@@ -415,6 +415,28 @@ it('accepts a stable Claude symlink to an executable regular file',async () => {
   expect(readFileSync(join(state,'resident-test.sh'),'utf8')).toContain(`exec '${link}'`);
 });
 
+it("the launcher's PATH line appends $HOME/.local/bin without shadowing the daemon's own earlier entries",async () => {
+  const {home,state,bin,env,invoke} = fixture();
+  await invoke('ensure-checkout');await invoke('ensure-buzz');await invoke('ensure-resident');
+  const launcher = readFileSync(join(state,'resident-test.sh'),'utf8');
+  const pathLine = launcher.split('\n').find(line => line.startsWith('export PATH='));
+  expect(pathLine).toBeDefined();
+  const localBin = join(home,'.local','bin');mkdirSync(localBin,{recursive:true});
+  // (1) A tool that exists only under $HOME/.local/bin must still resolve: the daemon PATH
+  // (like this fixture's own PATH) never includes it, so only the launcher's export line can add it.
+  writeFileSync(join(localBin,'probe-tool'),'#!/bin/sh\nexit 0\n',{mode:0o700});
+  // (2) $HOME/.local/bin also carries node/npm/npx/buzz/claude. `bin` sits earlier on the inherited
+  // PATH than anything the export line adds (standing in for the daemon's own runtime bin dir), so
+  // a bare `node` must still resolve to `bin`'s copy, never to $HOME/.local/bin's — append, not prepend.
+  writeFileSync(join(bin,'node'),'#!/bin/sh\nexit 0\n',{mode:0o700});
+  writeFileSync(join(localBin,'node'),'#!/bin/sh\nexit 0\n',{mode:0o700});
+  const resolve = (tool:string) => new Promise<string>((res,rej) => {
+    execFile('/bin/sh',['-c',`${pathLine}; command -v ${tool}`],{env,timeout:10_000},(error,stdout) => error ? rej(error) : res(stdout.trim()));
+  });
+  expect(await resolve('probe-tool')).toBe(join(localBin,'probe-tool'));
+  expect(await resolve('node')).toBe(join(bin,'node'));
+});
+
 it.each(binaries)('reports the %s step and non-zero exit code without subprocess output',async binary => {
   const {home,invoke} = fixture();
   await invoke('ensure-checkout');
