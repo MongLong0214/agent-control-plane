@@ -6,6 +6,7 @@ import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "no
 import type { Readable } from "node:stream";
 import { promisify } from "node:util";
 
+import { hasCredentialShape } from "../core/credential-shapes.ts";
 import { sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { acpScratchDir } from "../core/scratch-root.ts";
@@ -126,16 +127,6 @@ const SAFE_COMMAND_ENV: ReadonlyMap<string, (value: string) => boolean> = new Ma
   ["FORCE_COLOR", (value) => SAFE_BOOLEAN_ENV.has(value)],
   ["TZ", (value) => /^[A-Za-z0-9_+\-/]{1,64}$/.test(value)],
 ]);
-// A harmless name cannot turn an authority-shaped value into sandbox input.
-const CREDENTIAL_VALUE_SHAPES: readonly RegExp[] = [
-  /^gh[pousr]_[A-Za-z0-9]{16,}$/,
-  /^sk-[A-Za-z0-9_-]{20,}$/,
-  /^nsec1[a-z0-9]{20,}$/,
-  /^xox[baprs]-/,
-  /^eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\./,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-  /^[A-Za-z0-9+/]{60,}={0,2}$/,
-];
 const RESOURCE_WRAPPER = "/usr/bin/python3";
 
 /** The kernel child-list reader the supervisor loads. */
@@ -1466,8 +1457,10 @@ export const buildSandboxEnvironment = (
   return env;
 };
 
-const looksLikeCredential = (value: string): boolean =>
-  CREDENTIAL_VALUE_SHAPES.some((pattern) => pattern.test(value.trim()));
+// A harmless name cannot turn an authority-shaped value into sandbox input. The shapes are the shared
+// list (core/credential-shapes.ts), found anywhere in the value: a superset of the whole-value
+// shapes this filter used to keep for itself.
+const looksLikeCredential = (value: string): boolean => hasCredentialShape(value, "text");
 
 /**
  * Named locations a candidate command must never read. Seatbelt retains allow-default

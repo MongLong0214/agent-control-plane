@@ -1,6 +1,7 @@
 import type { Clock } from "../core/clock.ts";
 import { allow, deny, type Decision, type Evidence } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
+import { hasCredentialShape, redactCredentialShapes } from "../core/credential-shapes.ts";
 import type { Db } from "./database.ts";
 
 export interface AuditRecord {
@@ -146,22 +147,6 @@ const SECRET_COLLECTION_KEY =
 const BULK_KEY =
   /(?:^|[_-])(prompt|prompts|system_?prompt|transcript|chat_?transcript|chain_?of_?thought|reasoning|messages|conversation|raw_?output|full_?output)(?:$|[_-])/i;
 
-/** Credential shapes recognisable in a value regardless of its key. */
-const SECRET_VALUE_PATTERNS: readonly RegExp[] = [
-  /gh[pousr]_[A-Za-z0-9]{16,}/,
-  /\bsk-[A-Za-z0-9_-]{20,}/,
-  /\bnsec1[a-z0-9]{20,}/,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-  /\bxox[baprs]-[A-Za-z0-9-]{10,}/,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}/,
-  /\bAKIA[0-9A-Z]{16}\b/,
-  /\b\d{8,10}:AA[A-Za-z0-9_-]{30,}/,
-  /\bBearer\s+[A-Za-z0-9._~+/-]{20,}/i,
-  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\./, // JWT
-  // KEY=VALUE where the key looks secret, as it appears in an env dump.
-  /\b[A-Z0-9_]*(TOKEN|SECRET|PASSWORD|CREDENTIAL|API_?KEY|PRIVATE_KEY)[A-Z0-9_]*\s*=\s*\S+/,
-];
-
 const MAX_STRING = 2000;
 
 /**
@@ -237,7 +222,7 @@ const isIdentifierLikeAuditValue = (value: unknown, depth: number): boolean => {
   if (typeof value === "bigint") return true;
   if (typeof value === "string") {
     if (value.length > MAX_UNKNOWN_AUDIT_STRING) return false;
-    return !SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(value));
+    return !hasCredentialShape(value, "evidence");
   }
   if (Array.isArray(value)) {
     return value.slice(0, 200).every((item) => isIdentifierLikeAuditValue(item, depth + 1));
@@ -246,11 +231,9 @@ const isIdentifierLikeAuditValue = (value: unknown, depth: number): boolean => {
   return false;
 };
 
+// Credential shapes come from the one shared list (core/credential-shapes.ts), in its evidence scope.
 const scrubValue = (text: string): string => {
-  let out = text;
-  for (const pattern of SECRET_VALUE_PATTERNS) {
-    out = out.replace(new RegExp(pattern.source, `g${pattern.flags.replace("g", "")}`), "[redacted]");
-  }
+  const out = redactCredentialShapes(text, "evidence");
   return out.length > MAX_STRING ? `${out.slice(0, MAX_STRING)}…[truncated]` : out;
 };
 
@@ -323,7 +306,7 @@ export const credentialBearingField = (value: unknown, depth = 0): string | null
   // Deeper than the scan goes is not "clean": an unexamined subtree must not become evidence.
   if (depth > MAX_CREDENTIAL_SCAN_DEPTH) return "<unexaminable-depth>";
   if (typeof value === "string") {
-    return SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(value)) ? "<value>" : null;
+    return hasCredentialShape(value, "evidence") ? "<value>" : null;
   }
   if (Array.isArray(value)) {
     for (const item of value) {

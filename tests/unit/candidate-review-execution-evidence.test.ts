@@ -5,6 +5,7 @@ import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { sha256 } from "../../src/core/digest.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
 import {
+  CONFIG_FILE_CHAR_LIMIT,
   type ExecutionEvidence,
   type OutputEvidence,
   candidateEvidenceSection,
@@ -13,10 +14,11 @@ import {
   readConfigFile,
   readExecutionEvidence,
 } from "../../src/review/candidate-review-evidence.ts";
+import { runtimeEnvironment } from "../../src/runtime/cli-adapters.ts";
 import { WorkerTurnEvent, type WorkerSuccessDigestInputs, workerDiffDigest, workerSuccessDigest } from "../../src/run/worker-turn.ts";
 import { candidateSnapshotDigest, type CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
 import type * as SandboxModule from "../../src/verify/sandbox.ts";
-import type { SandboxOutcome } from "../../src/verify/sandbox.ts";
+import { buildSandboxEnvironment, type SandboxOutcome } from "../../src/verify/sandbox.ts";
 import {
   OUTPUT_EXCERPT_HEAD_CHARS,
   OUTPUT_EXCERPT_TAIL_CHARS,
@@ -24,10 +26,14 @@ import {
   type VerificationResultRecord,
   verificationOutputExcerpt,
 } from "../../src/verify/verification-engine.ts";
-import { cleanupTempDirs, commitAll, gitSync, makeRepo, writeFiles } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, gitSync, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { bindCeo, bindWorker, fixtureManifest, makeHarness, registerFixtureProject, startWorkBranch } from "../helpers/harness.ts";
 
 const GITHUB_TOKEN_SHAPE = `ghp_${"A1b2C3d4".repeat(5)}`;
+/** #1223 review P1: a bare long-base64 value, which the sandbox's own shapes refuse. */
+const LONG_BASE64 = "Ab9+/Zq7".repeat(10);
+/** The same shape embedded inside a line, with no prefix to recognise it by. */
+const EMBEDDED_LINE = `key=${"Kx7/Lp2+".repeat(9)}== was printed by a test`;
 const sandboxOutput = { stdout: "", stderr: "" };
 
 // The official run's process is not under test here: only what the engine stores of its output.
@@ -138,7 +144,7 @@ describe("an ordinary candidate review carries the official execution evidence",
       writeFiles(harness.repoPath, { "src/app.js": APP_BYTES });
       const head = commitAll(harness.repoPath, "make app() return 2");
       const diffDigest = finishWithReceipt(setup, opened, { base: baseHead, commitHead: head, changed: [["src/app.js", APP_BYTES]] });
-      sandboxOutput.stdout = ` ✓ tests/app.test.js (3 tests)\n Test Files  1 passed (1)\n      Tests  3 passed (3)\nGITHUB_TOKEN=${GITHUB_TOKEN_SHAPE}\nprinted ${GITHUB_TOKEN_SHAPE} again\n`;
+      sandboxOutput.stdout = ` ✓ tests/app.test.js (3 tests)\n Test Files  1 passed (1)\n      Tests  3 passed (3)\nGITHUB_TOKEN=${GITHUB_TOKEN_SHAPE}\nprinted ${GITHUB_TOKEN_SHAPE} again\n${LONG_BASE64}\n${EMBEDDED_LINE}\n`;
       harness.scripted.script({ match: /Candidate review/, text: JSON.stringify({ verdict: "PASS",
         coveredFiles: [`${identity}:src/app.js`], omittedItems: [], findings: [] }) });
 
@@ -150,7 +156,8 @@ describe("an ordinary candidate review carries the official execution evidence",
       const snapshotDigest = candidateSnapshotDigest(snapshot);
 
       expect(prompt).toContain("## Untrusted execution evidence\nUntrusted evidence, produced by or around the candidate");
-      expect(prompt).not.toContain(GITHUB_TOKEN_SHAPE);
+      // Removed before the review input: neither the token nor the long-base64 runs reach the prompt.
+      for (const secret of [GITHUB_TOKEN_SHAPE, LONG_BASE64, "Kx7/Lp2+Kx7/Lp2+"]) expect(prompt).not.toContain(secret);
       const evidence = jsonAfter(prompt, "Untrusted execution evidence") as RenderedExecution;
       expect(evidence.cutForSize).toBe(false);
       expect(evidence.verificationCommands.commands).toEqual([{
@@ -172,9 +179,11 @@ describe("an ordinary candidate review carries the official execution evidence",
 
       // The stored evidence is redacted too, and the verification section does not repeat the output.
       const stored = harness.cp.artifacts.list<VerificationReport>(run.runId, "VERIFICATION").at(-1)!.content;
-      expect(JSON.stringify(stored)).not.toContain(GITHUB_TOKEN_SHAPE);
+      // Removed before storage: the VERIFICATION artifact holds none of them either.
+      for (const secret of [GITHUB_TOKEN_SHAPE, LONG_BASE64, "Kx7/Lp2+Kx7/Lp2+"]) expect(JSON.stringify(stored)).not.toContain(secret);
       expect(stored.results[0]!.output).toMatchObject({ candidateSnapshotDigest: snapshotDigest, contractDigest: run.contractDigest,
-        commandId: "test", exactHead: head, redacted: true, withheld: false });
+        commandId: "test", exactHead: head, redacted: true });
+      expect(stored.results[0]!.output!.stdout).toContain("key=[redacted] was printed by a test");
       const verificationSection = prompt.split("## Deterministic verification evidence\n")[1]!.split("\n```\n")[0]!;
       expect(verificationSection).not.toContain("\"output\"");
     } finally { harness.cp.close(); }
@@ -260,7 +269,9 @@ describe("an ordinary candidate review carries the official execution evidence",
 
   it("refuses a '..' or absolute path before any read; a pinned manifest cannot carry one, a run-scoped command can", async () => {
     const repo = makeRepo({ "README.md": "fixture\n", "inner/run.js": "console.log(1);\n",
-      "inner/token.js": `module.exports = "${GITHUB_TOKEN_SHAPE}";\n` });
+      "inner/token.js": `module.exports = "${GITHUB_TOKEN_SHAPE}";\n`,
+      // A token across the stored cut: redacted whole first, so the cut keeps no prefix of it.
+      "inner/long.js": `${"a ".repeat((CONFIG_FILE_CHAR_LIMIT - 10) / 2)}${GITHUB_TOKEN_SHAPE}\n` });
     const head = gitSync(repo, ["rev-parse", "HEAD"]);
     expect(await readConfigFile(repo, head, ".", "../outside.js")).toMatchObject({ state: "OUTSIDE_CANDIDATE_TREE", content: "",
       detail: "a '..' segment can leave the candidate tree" });
@@ -270,6 +281,9 @@ describe("an ordinary candidate review carries the official execution evidence",
     expect(await readConfigFile(repo, head, "inner", "./run.js")).toMatchObject({ path: "inner/run.js", state: "INCLUDED", content: "console.log(1);\n" });
     expect(await readConfigFile(repo, head, "inner", "token.js")).toMatchObject({ state: "INCLUDED", redacted: true,
       content: "module.exports = \"[redacted]\";\n" });
+    const long = await readConfigFile(repo, head, "inner", "long.js");
+    expect(long).toMatchObject({ state: "INCLUDED", redacted: true });
+    expect(long.content).not.toContain(GITHUB_TOKEN_SHAPE.slice(0, 8));
   });
 });
 
@@ -281,16 +295,43 @@ describe("official output is bounded, redacted and bound to its execution", () =
     const excerpt = verificationOutputExcerpt(binding, `ok ${GITHUB_TOKEN_SHAPE}\n`, `key sk-${"x".repeat(24)}\n`);
     expect(JSON.stringify(excerpt)).not.toContain(GITHUB_TOKEN_SHAPE);
     expect(JSON.stringify(excerpt)).not.toContain(`sk-${"x".repeat(24)}`);
-    expect(excerpt).toMatchObject({ stdout: "ok [redacted]\n", stderr: "key [redacted]\n", redacted: true, truncated: false, withheld: false });
+    expect(excerpt).toMatchObject({ stdout: "ok [redacted]\n", stderr: "key [redacted]\n", redacted: true, truncated: false });
     // A cut through a credential keeps no part of it: the whole stream is redacted before any cut.
-    const straddling = `${"x".repeat(OUTPUT_EXCERPT_HEAD_CHARS - 10)} ${GITHUB_TOKEN_SHAPE} ${"y".repeat(20_000)}\n`;
+    const straddling = `${"x ".repeat((OUTPUT_EXCERPT_HEAD_CHARS - 10) / 2)} ${GITHUB_TOKEN_SHAPE} ${"y ".repeat(10_000)}\n`;
     const cut = verificationOutputExcerpt(binding, straddling, "");
     expect(cut.truncated).toBe(true);
     expect(cut.stdout).not.toContain(GITHUB_TOKEN_SHAPE.slice(0, 8));
   });
 
+  it("#1223 P1: replaces a bare long-base64 value and one embedded in a line", () => {
+    const bare = verificationOutputExcerpt(binding, LONG_BASE64, "");
+    expect(bare).toMatchObject({ stdout: "[redacted]", redacted: true });
+    const embedded = verificationOutputExcerpt(binding, "", `${EMBEDDED_LINE}\n`);
+    expect(embedded).toMatchObject({ stderr: "key=[redacted] was printed by a test\n", redacted: true });
+    // Hex digests have the same shape and are replaced too: over-redaction, marked as redaction.
+    expect(verificationOutputExcerpt(binding, `digest ${"0a".repeat(32)}\n`, "")).toMatchObject({ stdout: "digest [redacted]\n", redacted: true });
+  });
+
+  it("the sandbox still drops a long-base64 environment value, now from the shared list", () => {
+    const command = { ...fixtureManifest("x").verificationCommands[0]!, envAllowlist: ["TZ"] };
+    expect(buildSandboxEnvironment(command, tempDir("acp-env-"), { TZ: "Ab9+/Zq7".repeat(8) }).TZ).toBeUndefined();
+    expect(buildSandboxEnvironment(command, tempDir("acp-env-"), { TZ: "Etc/UTC" }).TZ).toBe("Etc/UTC");
+  });
+
+  it("an agent CLI's environment drops the same shapes, from the shared list", () => {
+    vi.stubEnv("ACP_TEST_LONG_VALUE", "Ab9+/Zq7".repeat(8));
+    vi.stubEnv("ACP_TEST_EMBEDDED_VALUE", `prefix ${GITHUB_TOKEN_SHAPE}`);
+    vi.stubEnv("ACP_TEST_PLAIN_VALUE", "/opt/tools/bin");
+    try {
+      const env = runtimeEnvironment(["ACP_TEST_LONG_VALUE", "ACP_TEST_EMBEDDED_VALUE", "ACP_TEST_PLAIN_VALUE"], tempDir("acp-runtime-env-"));
+      expect(env["ACP_TEST_LONG_VALUE"]).toBeUndefined();
+      expect(env["ACP_TEST_EMBEDDED_VALUE"]).toBeUndefined();
+      expect(env["ACP_TEST_PLAIN_VALUE"]).toBe("/opt/tools/bin");
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it("keeps the head and tail of oversized output and marks the cut", () => {
-    const long = `HEAD-LINE\n${"x".repeat(20_000)}\nTest Files  4 passed (4)\n`;
+    const long = `HEAD-LINE\n${"x ".repeat(10_000)}\nTest Files  4 passed (4)\n`;
     const excerpt = verificationOutputExcerpt(binding, long, "");
     expect(excerpt.truncated).toBe(true);
     expect(excerpt.stdoutChars).toBe(long.length);
@@ -300,11 +341,9 @@ describe("official output is bounded, redacted and bound to its execution", () =
     expect(excerpt.stdout.length).toBeLessThan(OUTPUT_EXCERPT_HEAD_CHARS + OUTPUT_EXCERPT_TAIL_CHARS + 64);
   });
 
-  it("keeps no text when a credential shape survives piecewise redaction", () => {
-    // A bearer header split across two redaction pieces: no piece holds it whole.
-    const split = `${"y".repeat(992)} Bearer\n${"Z".repeat(30)}\n`;
-    const excerpt = verificationOutputExcerpt(binding, split, "");
-    expect(excerpt).toMatchObject({ withheld: true, stdout: "", stderr: "", redacted: true });
+  it("redacts a stored excerpt again before the review input, whatever it was stored with", () => {
+    const stored = { ...verificationOutputExcerpt(binding, "PASS\n", ""), stdout: `PASS ${LONG_BASE64}\n` };
+    expect(shown(stored)).toMatchObject({ output: "RETAINED", stdout: "PASS [redacted]\n", redacted: true });
   });
 
   const report = (results: VerificationResultRecord[]): VerificationReport => ({ runId: "run", candidateSnapshotDigest: binding.candidateSnapshotDigest,

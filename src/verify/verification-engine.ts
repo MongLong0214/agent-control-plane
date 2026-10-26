@@ -1,12 +1,13 @@
 import type { Clock } from "../core/clock.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { verificationKindRunning } from "../bootstrap/repo-factory-producer.ts";
+import { redactCredentialShapes } from "../core/credential-shapes.ts";
 import { canonicalJson, digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { type VerificationCommand, verificationCommandSchema } from "../contracts/verification-command.ts";
 import { type ProjectManifest, commandsForMode, gateEntriesFor } from "../contracts/manifest.ts";
-import { type AuditLog, credentialBearingField, redact } from "../db/audit.ts";
+import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore, EvidenceWriter } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, type RunRow } from "../domain/types.ts";
@@ -94,50 +95,23 @@ export interface VerificationOutputExcerpt {
   stderr: string;
   /** Characters were left out between each stream's head and tail. */
   truncated: boolean;
-  /** At least one credential-shaped value was replaced with `[redacted]`. */
-  redacted: boolean;
   /**
-   * Credential-shaped text remained after redaction (one split across two redaction pieces), so no text is
-   * kept: `stdout` and `stderr` are empty and say nothing about what the command printed.
+   * At least one run of text matched a listed credential shape and was replaced with `[redacted]`.
+   * The shapes include any run of 60 or more base64 or hex characters, so a digest can be replaced
+   * as well as a credential; what was replaced is evidence of neither.
    */
-  withheld: boolean;
+  redacted: boolean;
 }
 
 /**
- * `redact` caps a string at 2,000 characters, and replacing a short `NAME_TOKEN=x` lengthens it, so
- * text is scrubbed in pieces that stay under the cap whatever is replaced.
+ * Credential shapes in free text replaced with `[redacted]`, from the one shared list
+ * (core/credential-shapes.ts) in its text scope: the shapes the sandbox refuses as environment values
+ * and those the audit log redacts, found anywhere in a line. A pattern filter, not a guarantee: a
+ * secret in no listed shape passes.
  */
-const REDACTION_PIECE_CHARS = 1_000;
-
-/**
- * Replaces credential-shaped values with the durable-storage redaction (`redact` in db/audit.ts,
- * whose patterns are the ones the artifact store refuses), in pieces of whole lines where a line
- * fits. Returns null when a shape no piece held whole (one split across two pieces) remains in the
- * joined text, so a caller keeps none of it rather than a credential.
- */
-export const redactCredentialText = (text: string): { text: string; redacted: boolean } | null => {
-  const pieces: string[] = [];
-  let piece = "";
-  const flush = (): void => {
-    if (piece.length > 0) pieces.push(redact(piece) as string);
-    piece = "";
-  };
-  for (const line of text.split(/(?<=\n)/)) {
-    if (piece.length + line.length > REDACTION_PIECE_CHARS) flush();
-    // A long line is cut after its last space or tab in reach: no recognised shape holds one, so
-    // only a run of more than a piece without whitespace is cut through.
-    for (let at = 0; at < line.length;) {
-      const window = line.slice(at, at + REDACTION_PIECE_CHARS);
-      const space = window.length < REDACTION_PIECE_CHARS ? -1 : Math.max(window.lastIndexOf(" "), window.lastIndexOf("\t"));
-      const part = space > 0 ? window.slice(0, space + 1) : window;
-      if (piece.length + part.length > REDACTION_PIECE_CHARS) flush();
-      piece += part;
-      at += part.length;
-    }
-  }
-  flush();
-  const joined = pieces.join("");
-  return credentialBearingField(joined) === null ? { text: joined, redacted: joined !== text } : null;
+export const redactCredentialText = (text: string): { text: string; redacted: boolean } => {
+  const scrubbed = redactCredentialShapes(text, "text");
+  return { text: scrubbed, redacted: scrubbed !== text };
 };
 
 const excerptOf = (text: string): { text: string; truncated: boolean } => {
@@ -150,26 +124,27 @@ const excerptOf = (text: string): { text: string; truncated: boolean } => {
 };
 
 /**
- * Redact the whole stream first, so a cut can never keep part of a credential; cut; then redact the
- * excerpt again, because a cut can give a shape the word boundary it lacked inside the stream.
+ * Redact the whole stream first, so a cut can never shorten a credential below its shape; cut; then
+ * redact the excerpt again, because a cut can give a shape the word boundary it lacked in the stream.
  */
+const excerptStream = (text: string): { text: string; truncated: boolean; redacted: boolean } => {
+  const whole = redactCredentialText(text);
+  const cut = excerptOf(whole.text);
+  const again = redactCredentialText(cut.text);
+  return { text: again.text, truncated: cut.truncated, redacted: whole.redacted || again.redacted };
+};
+
 export const verificationOutputExcerpt = (
   binding: Pick<VerificationOutputExcerpt, "candidateSnapshotDigest" | "contractDigest" | "commandId" | "repositoryIdentity" | "exactHead">,
   stdout: string,
   stderr: string,
 ): VerificationOutputExcerpt => {
-  const streams = [stdout, stderr].map((text) => {
-    const whole = redactCredentialText(text);
-    if (whole === null) return null;
-    const cut = excerptOf(whole.text);
-    const again = redactCredentialText(cut.text);
-    return again === null ? null : { text: again.text, truncated: cut.truncated, redacted: whole.redacted || again.redacted };
-  });
-  const [out, err] = streams;
-  const base = { schema: "acp.verification-output-excerpt.v1" as const, ...binding, stdoutChars: stdout.length, stderrChars: stderr.length };
-  if (out == null || err == null) return { ...base, stdout: "", stderr: "", truncated: false, redacted: true, withheld: true };
-  return { ...base, stdout: out.text, stderr: err.text, truncated: out.truncated || err.truncated,
-    redacted: out.redacted || err.redacted, withheld: false };
+  const out = excerptStream(stdout);
+  const err = excerptStream(stderr);
+  return {
+    schema: "acp.verification-output-excerpt.v1", ...binding, stdoutChars: stdout.length, stderrChars: stderr.length,
+    stdout: out.text, stderr: err.text, truncated: out.truncated || err.truncated, redacted: out.redacted || err.redacted,
+  };
 };
 
 export interface VerificationReport {
