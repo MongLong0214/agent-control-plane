@@ -5,6 +5,7 @@ import { allow, deny, isAcpError, type Decision, type Evidence } from "../core/e
 import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { acpScratchDir } from "../core/scratch-root.ts";
+import type { CheckoutWriterFact } from "../claims/claim-registry.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { fixedRuntimes } from "../domain/fixed-role-runtime.ts";
@@ -395,6 +396,8 @@ export class WorkerTurnRunner {
    * can leave a descendant in its group; shutdown stops that too before the daemon lets go.
    */
   readonly #gitRegistries = new Set<GitChildren>();
+  /** The checkout each registry's git runs against, so a lingering group keeps that checkout written (S2). */
+  readonly #registryWorktrees = new WeakMap<GitChildren, string>();
   readonly #busyWorktrees = new Set<string>();
   readonly #pollMs: number;
   readonly #processes: WorkerProcessPort;
@@ -648,6 +651,11 @@ export class WorkerTurnRunner {
     return { drained: drained && outstanding.length === 0 && gitStopped, outstanding, gitStopped, unconfirmedGroups };
   }
 
+  private openRegistry(children: GitChildren, worktree: string): void {
+    this.#gitRegistries.add(children);
+    this.#registryWorktrees.set(children, worktree);
+  }
+
   /** Drops every registry whose owner retired it and whose groups are all confirmed empty. */
   private pruneGitRegistries(): void {
     for (const registry of this.#gitRegistries) if (registry.finished) this.#gitRegistries.delete(registry);
@@ -677,6 +685,69 @@ export class WorkerTurnRunner {
   }
 
   /** Read-only: an execution's state, with diagnostics kept apart from the success digest. */
+  /**
+   * S2 — what may still write the registered checkout for `runId`: a turn or an admission in flight on
+   * it, a git child one of them started still running, or an execution of the run there that has not
+   * ended, whose process is not confirmed gone, or that may have launched one never recorded. These are
+   * the facts that keep a task from being run again (`readFacts`); a turn's end is when none of them
+   * holds, not when its provider returned or its status left RUNNING. null when none holds.
+   *
+   * The claim registry asks it before the run's earlier claim on the checkout passes to the run's next
+   * claim. A process confirmed gone here is recorded released, as `outstandingProcess` records it.
+   */
+  checkoutWriter(runId: string, worktreeId: string): CheckoutWriterFact | null {
+    const worktree = canonical(worktreeId);
+    if (this.#busyWorktrees.has(worktree)) {
+      return { reason: "a worker turn, or its admission, is still in flight on the checkout", evidence: { worktreeId: worktree } };
+    }
+    return this.settledWriter(runId, worktree);
+  }
+
+  /** `checkoutWriter` past the turns in flight, which a turn's admission refuses on its own terms. */
+  private settledWriter(runId: string, worktree: string): CheckoutWriterFact | null {
+    const groups = [...this.#gitRegistries]
+      .filter((registry) => this.#registryWorktrees.get(registry) === worktree)
+      .flatMap((registry) => registry.liveGroups());
+    if (groups.length > 0) {
+      return {
+        reason: "a git child a worker turn started is still running against the checkout",
+        evidence: { worktreeId: worktree, groups: groups.map((group) => group.pgid) },
+      };
+    }
+    const rows = this.ports.db.all<{
+      execution_id: string;
+      task_id: string;
+      status: string;
+      worker_process_id: number | null;
+      worker_process_started_at: string | null;
+      worker_process_released_at: string | null;
+    }>(
+      `SELECT execution_id, task_id, status, worker_process_id, worker_process_started_at, worker_process_released_at
+         FROM task_executions
+        WHERE run_id = ? AND worktree_id = ? AND runtime_managed = 1
+        ORDER BY execution_id`,
+      [runId, worktree],
+    );
+    for (const row of rows) {
+      const evidence = { worktreeId: worktree, executionId: row.execution_id, taskId: row.task_id };
+      if (row.status === "RUNNING") return { reason: `execution ${row.execution_id} has not ended`, evidence };
+      if (row.worker_process_id !== null) {
+        if (
+          row.worker_process_released_at === null &&
+          !this.releaseIfGone(row.execution_id, row.worker_process_id, row.worker_process_started_at)
+        ) {
+          return {
+            reason: `the worker process of execution ${row.execution_id} is not confirmed gone`,
+            evidence: { ...evidence, pid: row.worker_process_id },
+          };
+        }
+      } else if (unresolvedUnidentifiedOrphans(this.ports.db, { executionId: row.execution_id }).length > 0) {
+        return { reason: `execution ${row.execution_id} may have launched a process that was never recorded`, evidence };
+      }
+    }
+    return null;
+  }
+
   describe(executionId: string, runId: string): Decision<WorkerExecutionView> {
     const execution = this.ports.tasks.execution(executionId);
     if (!execution) return deny(ReasonCode.NOT_FOUND, "unknown execution", { executionId });
@@ -919,6 +990,15 @@ export class WorkerTurnRunner {
     if (!independent.allowed) return independent as Decision<never>;
     const claim = this.claimFacts(request);
     if (!claim.allowed) return claim as Decision<never>;
+    // S2 — a task enters the checkout only once nothing an earlier turn of its run started can write
+    // it, whatever released that turn's claim: the hand-over, resource_release or its lease.
+    const writer = this.settledWriter(request.runId, claim.value.worktree);
+    if (writer) {
+      return deny(ReasonCode.CONFLICT, `${writer.reason}; no task of the run enters the checkout before it is gone`, {
+        ...writer.evidence,
+        enteringTaskId: request.taskId,
+      });
+    }
     let spec: unknown = {};
     try {
       spec = JSON.parse(task.spec_json) as unknown;
@@ -1180,7 +1260,7 @@ export class WorkerTurnRunner {
     try {
       const pinned = pinRepository(worktree, scratch);
       if (pinned.allowed) {
-        this.#gitRegistries.add(pinned.value.children);
+        this.openRegistry(pinned.value.children, worktree);
         onOpened(pinned.value.children);
       }
       if (!pinned.allowed) return pinned as Decision<never>;
@@ -1273,7 +1353,7 @@ export class WorkerTurnRunner {
       const pinned = pinRepository(facts.claim.worktree, scratch);
       if (!pinned.allowed) return pinned as Decision<never>;
       opened = pinned.value.children;
-      this.#gitRegistries.add(opened);
+      this.openRegistry(opened, facts.claim.worktree);
       return await this.prepareTaskBranchOn(pinned.value, facts, target);
     } catch (error) {
       return deny(ReasonCode.PROBE_FAILED, "the claimed worktree could not be prepared on the task's branch", {

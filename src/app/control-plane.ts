@@ -596,6 +596,9 @@ export class ControlPlane {
         guard: this.guard,
         workerAdapter: (provider: string) => this.providers.requireForRole(provider, Role.WORKER),
       });
+      // S2 — a run's claim on its checkout passes to its next claim only when the runner says nothing
+      // a turn of that run started can still write the checkout.
+      this.claims.attach({ checkoutWriter: (runId, worktreeId) => this.workerTurns.checkoutWriter(runId, worktreeId) });
       // The shared packet-reviewer predicate, read from the raw reviewer adapter (the registry hands
       // out only wrapped ones): the gate may pass over its preferred reviewer only when this says
       // UNCONFIGURED. Only the Codex adapter has such a scope.

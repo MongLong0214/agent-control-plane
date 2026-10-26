@@ -561,8 +561,9 @@ describe("the hand-off between task branches (c98ea8a3, S-TB-02)", () => {
         expect(cp.tasks.execution(await settle(f, ran))?.status).toBe("SUCCEEDED");
         const oneTip = refOf(s.repo, `refs/heads/${first.target.branch}`)!;
         expect(oneTip).not.toBe(first.target.baseSha);
-        expect(await f.cto(s.sessionId, "resource_release", { runId: s.runId })).toMatchObject({ ok: true });
 
+        // S2 — no resource_release: the live CTO is never told to make one, and the first claim passes
+        // to the second once the first execution has ended.
         worker.script = { writes: { "src/app.js": "module.exports = () => 2;\n" } };
         const second = await staffAndClaim(f, s, two);
         expect(second.target.baseSha).toBe(first.target.baseSha);

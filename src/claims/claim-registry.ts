@@ -2,7 +2,7 @@ import { isAbsolute } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
 import { newClaimId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
@@ -43,6 +43,29 @@ export interface ClaimRecord {
 
 const DEFAULT_TTL_MS = 2 * 60 * 60 * 1000;
 
+/** What may still write a registered checkout for a run, and why; see `CheckoutWriter`. */
+export interface CheckoutWriterFact {
+  reason: string;
+  evidence: Evidence;
+}
+
+/**
+ * S2 — what the worker runner knows may still write a registered checkout for a run
+ * (`WorkerTurnRunner.checkoutWriter`): null only when nothing a turn of that run started can write it.
+ */
+export type CheckoutWriter = (runId: string, worktreeId: string) => CheckoutWriterFact | null;
+
+/** A registry with no runner attached cannot tell that a writer is gone, so it never hands a claim over. */
+const NO_RUNNER: CheckoutWriterFact = { reason: "no worker runner answers for the checkout", evidence: {} };
+
+/** The run's own HELD claim on a checkout, by the key its sibling rows share (`worker-turn.ts` claimFacts). */
+interface EarlierClaim {
+  claimId: string;
+  ownerSessionId: string;
+  ownerBindingGeneration: number;
+  acquiredAt: string;
+}
+
 /**
  * PRD §23 — a *minimal* coordination registry, not a scheduler.
  *
@@ -58,6 +81,12 @@ export class ClaimRegistry {
     private readonly audit: AuditLog,
     private readonly bindings: BindingRegistry,
   ) {}
+
+  #checkoutWriter: CheckoutWriter | null = null;
+
+  attach(ports: { checkoutWriter: CheckoutWriter }): void {
+    this.#checkoutWriter = ports.checkoutWriter;
+  }
 
   /** Every claim read uses the same lease boundary as acquisition. */
   private readAfterExpirySweep<T>(read: () => T): T {
@@ -159,6 +188,13 @@ export class ClaimRegistry {
         });
       }
 
+      // S2 — the run's own earlier claim on this checkout passes to this one, never while anything a
+      // turn of the run started may still write the checkout.
+      const earlier = canonicalWorktree?.allowed
+        ? this.earlierWorktreeClaim(request, canonicalWorktree.value)
+        : allow(ReasonCode.OK, null);
+      if (!earlier.allowed) return earlier as Decision<ClaimRecord[]>;
+
       for (const target of wanted) {
         const conflict = this.findConflict(request, target);
         if (conflict) return conflict as Decision<ClaimRecord[]>;
@@ -167,6 +203,7 @@ export class ClaimRegistry {
       const now = this.clock.nowIso();
       const expiresAt = isoPlus(now, request.ttlMs ?? DEFAULT_TTL_MS);
       const created: ClaimRecord[] = [];
+      if (earlier.value) this.handOver(request, earlier.value, now);
 
       for (const target of wanted) {
         const claimId = newClaimId();
@@ -205,9 +242,67 @@ export class ClaimRegistry {
           worktreeId: canonicalWorktree?.allowed ? canonicalWorktree.value : null,
           paths: request.declaredPaths ?? [],
           expiresAt,
+          ...(earlier.value ? { handedOverFrom: earlier.value.claimId } : {}),
         },
       });
       return allow(ReasonCode.OK, created);
+    });
+  }
+
+  /**
+   * S2 — the run's HELD claim on the checkout this request names, which may pass to it only when the
+   * runner answers that nothing a turn of the run started can still write the checkout: no turn or
+   * admission in flight there, no git child of one left, every execution there ended with its process
+   * confirmed gone. Anything else refuses, the earlier claim untouched.
+   */
+  private earlierWorktreeClaim(request: ClaimRequest, worktree: string): Decision<EarlierClaim | null> {
+    const held = this.db.get<{ claim_id: string; owner_session_id: string; owner_binding_generation: number; acquired_at: string }>(
+      `SELECT claim_id, owner_session_id, owner_binding_generation, acquired_at FROM resource_claims
+        WHERE status = 'HELD' AND repository_identity = ? AND worktree_id = ? AND run_id = ?`,
+      [request.repositoryIdentity, worktree, request.runId],
+    );
+    if (!held) return allow(ReasonCode.OK, null);
+    const writer = this.#checkoutWriter ? this.#checkoutWriter(request.runId, worktree) : NO_RUNNER;
+    if (writer) {
+      return deny(
+        ReasonCode.CLAIM_WORKTREE_CONFLICT,
+        `worktree is still held by this run's claim ${held.claim_id}: ${writer.reason}; ` +
+          "it passes to the run's next claim only once nothing of the run can write the checkout",
+        {
+          repositoryIdentity: request.repositoryIdentity,
+          worktree,
+          heldByRun: request.runId,
+          claimId: held.claim_id,
+          writer: writer.evidence,
+        },
+      );
+    }
+    return allow(ReasonCode.OK, {
+      claimId: held.claim_id,
+      ownerSessionId: held.owner_session_id,
+      ownerBindingGeneration: held.owner_binding_generation,
+      acquiredAt: held.acquired_at,
+    });
+  }
+
+  /**
+   * Releases every row of the earlier claim — its worktree, branch and paths, acquired together — in
+   * the transaction that inserts this claim, so the checkout passes from one claim of the run to the
+   * next and is never free to another run in between.
+   */
+  private handOver(request: ClaimRequest, earlier: EarlierClaim, now: string): void {
+    const released = this.db.run(
+      `UPDATE resource_claims SET status = 'RELEASED', released_at = ?
+        WHERE status = 'HELD' AND run_id = ? AND repository_identity = ? AND owner_session_id = ?
+          AND owner_binding_generation = ? AND acquired_at = ?`,
+      [now, request.runId, request.repositoryIdentity, earlier.ownerSessionId, earlier.ownerBindingGeneration, earlier.acquiredAt],
+    ).changes;
+    this.audit.record({
+      kind: "CLAIM_RELEASED",
+      runId: request.runId,
+      sessionId: request.ownerSessionId,
+      roleKey: request.ownerRoleKey,
+      evidence: { reason: "HANDED_OVER", claimId: earlier.claimId, released },
     });
   }
 
