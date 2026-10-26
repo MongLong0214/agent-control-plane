@@ -77,6 +77,12 @@ import {
   ownerApprovalPayload,
 } from "../ingress/ingress-guard.ts";
 import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
+import {
+  AgentOwnedWaits,
+  type AgentWaitDeadlines,
+  type AgentWaitSweepReport,
+  DEFAULT_AGENT_WAIT_DEADLINES,
+} from "../ceo/agent-owned-waits.ts";
 import { ROLE_ATTACHMENT_OPERATION, RoleAttachmentCredentials } from "../session/role-attachment-credentials.ts";
 import type { SessionRecord } from "../session/session-registry.ts";
 import type { BuzzAdapter } from "../buzz/buzz-adapter.ts";
@@ -295,6 +301,12 @@ export interface DaemonOptions {
    * refresh interval; see `assertDoctorFreshnessOrdering`.
    */
   doctorFreshnessMs?: number;
+  /**
+   * #1189 B4/B6/B7/B10 — how long an agent-owned wait (an unresolved escalation, a CEO review, a
+   * FINAL_REVISE not dispatched again, a continuity hold) sits before its next deadline step. Each kind
+   * falls back to `DEFAULT_AGENT_WAIT_DEADLINES`.
+   */
+  agentWaitDeadlines?: Partial<AgentWaitDeadlines>;
 }
 
 /**
@@ -695,6 +707,8 @@ export class Daemon {
    * again. Process memory only: a restarted daemon tries once more.
    */
   readonly #refusedTargets = new Set<string>();
+  /** #1189 — the agent-owned waits' deadlines, the pending-review re-delivery and the ownerless stall routing. */
+  readonly #agentWaits: AgentOwnedWaits;
 
   constructor(
     private readonly cp: ControlPlane,
@@ -707,6 +721,13 @@ export class Daemon {
     this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.clock);
     this.#finalizer = new ApprovedRunFinalizer(cp, undefined, authorities);
     this.#evidenceExporter = new RunEvidenceExporter(cp.db, cp.artifacts, cp.clock, cp.audit);
+    this.#agentWaits = new AgentOwnedWaits(
+      {
+        db: cp.db, clock: cp.clock, audit: cp.audit, runs: cp.runs, bindings: cp.bindings,
+        outbox: cp.outbox, artifacts: cp.artifacts, gate: cp.ceo,
+      },
+      { ...DEFAULT_AGENT_WAIT_DEADLINES, ...options.agentWaitDeadlines },
+    );
     // Nothing is registered with `cp.doctor` here. A constructed daemon is not yet the live one: a
     // second `Daemon` over the same control plane that `start()` then refuses the lock would, if it
     // registered here, replace the supplier of the daemon that does hold the lock, and that
@@ -1491,6 +1512,9 @@ export class Daemon {
         await this.recordStandardWorkTargets();
         this.wakeStandardWorkContinuation();
       });
+      // #1189 — a CEO recovered while no daemon ran is given the reviews still pending, and a wait whose
+      // deadline passed meanwhile takes its next step.
+      await this.runPeriodic("agent_owned_waits", async () => { await this.sweepAgentOwnedWaits(); });
       // #639 contract 6, at the moment it matters most: right after a restart, before the first
       // periodic sweep would otherwise get to it. This genuinely runs and asks — it is not a
       // no-op by omission — but two independent facts limit it today, both stated in full in
@@ -2786,7 +2810,31 @@ export class Daemon {
       if (marked(STANDARD_WORK_CONTINUATION_WAKE)) {
         // The one wake this state earned has run, or was dropped, and the state is unchanged: the
         // owner made no progress on it. That is left as an explicit blocker, once, and never re-woken.
-        if (marked(STANDARD_WORK_CONTINUATION_STALLED)) continue;
+        // #1189 B12 — and no agent watches that blocker, so it goes to the CEO as CRITICAL_SYSTEM_FAILURE,
+        // once per stalled state; a pass with no CEO to tell asks again on the next one.
+        const routeStall = (): void => {
+          this.#agentWaits.routeOwnerlessStall({
+            source: "STANDARD_WORK_CONTINUATION",
+            kind: "standard_work_continuation",
+            id: `${runId}:${tuple.taskId}`,
+            episode: `${tuple.taskState}:${tuple.messageId}`,
+            runId,
+            since: null,
+            owner: { role: owner.roleKey, sessionId: owner.sessionId, generation: owner.bindingGeneration },
+            recoveryAction:
+              "replace the run's PRIMARY_CTO (cto_replace) so the READY task is staffed and run, or cancel the run (run_cancel); " +
+              "the task has no execution and no attempt, so nothing it would do has run and nothing needs checking first",
+            blocker:
+              `task ${tuple.taskId} is READY (${tuple.taskState}) with no execution after its one continuation wake, ` +
+              "and its CTO is not woken again",
+            effects: "NONE_STARTED",
+            deliveryTimeout: false,
+          });
+        };
+        if (marked(STANDARD_WORK_CONTINUATION_STALLED)) {
+          routeStall();
+          continue;
+        }
         this.cp.audit.record({
           kind: STANDARD_WORK_CONTINUATION_STALLED,
           reasonCode: ReasonCode.WORKER_BINDING_REQUIRED,
@@ -2805,6 +2853,7 @@ export class Daemon {
         report.stalled.push({
           runId, roleKey: owner.roleKey, bindingGeneration: tuple.bindingGeneration, taskId: tuple.taskId, taskState: tuple.taskState,
         });
+        routeStall();
         continue;
       }
       if (
@@ -2948,6 +2997,18 @@ export class Daemon {
     return this.cp.sessions.get(owner.sessionId)?.lifecycle === SessionLifecycle.READY;
   }
 
+  /**
+   * #1189 B4/B6/B7/B10 (CEO ruling 4) — every pending review is delivered to the CEO role's current holder
+   * when it does not have it and no decision exists for it, then every agent-owned wait past its deadline
+   * takes its next step: re-notify, reassign or a recovery attempt, CEO escalation. A continuity hold's
+   * recovery attempt is this daemon's own continuity reconcile. Nothing here moves a run to FAILED.
+   */
+  async sweepAgentOwnedWaits(): Promise<AgentWaitSweepReport & { redelivered: Array<{ runId: string; messageId: string }> }> {
+    const redelivered = this.#agentWaits.redeliverPendingReviews();
+    const swept = await this.#agentWaits.sweep(() => this.reconcileContinuity("agent-owned wait deadline"));
+    return { ...swept, redelivered };
+  }
+
   private startTimers(): void {
     const watchdogMs = this.options.watchdogIntervalMs ?? 60_000;
     const deliveryMs = this.options.deliveryIntervalMs ?? 5_000;
@@ -2978,6 +3039,9 @@ export class Daemon {
           // an interrupted callback without requiring a daemon restart.
           const finalized = await this.resumeApprovedRuns();
           await this.resumeResidentProjects();
+          // #1189 C2 — what the watchdog found overdue is routed to the CEO, once per stall; after the
+          // recovery sweeps, so a routing that cannot be written never costs them their tick.
+          this.#agentWaits.routeWatchdogStalls(tick.stalls);
           if (tick.overdue.length > 0 || finalized.length > 0) this.writeHealth(null);
         }).finally(() => { watchdogRunning = false; });
       }
@@ -2994,6 +3058,8 @@ export class Daemon {
         await this.recordStandardWorkTargets();
         this.wakeStandardWorkContinuation();
       });
+      // #1189 — pending reviews follow a recovered CEO, and agent-owned waits take their deadline steps.
+      void this.runPeriodic("agent_owned_waits", async () => { await this.sweepAgentOwnedWaits(); });
       // #512 — and a retired worker's session left live while its process ran is settled on a later tick.
       void this.runPeriodic("worker_retirement", async () => {
         await this.cp.workerRetirement.reconcile();

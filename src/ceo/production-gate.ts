@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 
 import { deriveHumanGate } from "./human-gate.ts";
+import { admitOwnerDecisionReason } from "./owner-decision-reason.ts";
 import {
   bootstrapPlanIntentTasks,
   bootstrapReviewIntentCurrent,
@@ -221,6 +222,13 @@ export interface CeoDecisionInput {
   ingress?: CeoDecisionIngress;
   /** The Hermes turn the CEO door admitted this call for, recorded in the decision's audit row. */
   hermesTurn?: HermesAdmittedTurn;
+  /**
+   * #1189 B1 — an OWNER_DECISION_REQUIRED names its owner-only reason (a key of `OWNER_ONLY_REASONS`)
+   * and the specific action that reason blocks; both are recorded with the decision. Ignored for the
+   * other decisions.
+   */
+  ownerReason?: string;
+  blockedAction?: string;
 }
 
 /** #246 B2-b — the grant authority a CONTRACT_CHANGE CONFIRM admits against and issues through. */
@@ -645,6 +653,10 @@ export class ProductionGate {
         : input.decision === "FINAL_REVISE"
           ? RunState.REVISION_REQUIRED
           : RunState.AWAITING_HUMAN;
+    // #1189 B1 — admitted above; what the owner is asked, and why, travels with the decision's records.
+    const ownerDecisionEvidence = input.decision === "OWNER_DECISION_REQUIRED"
+      ? { ownerReason: input.ownerReason?.trim() ?? null, blockedAction: input.blockedAction?.trim() ?? null }
+      : {};
 
     try {
       return this.db.tx(() => {
@@ -696,7 +708,7 @@ export class ProductionGate {
           input.runId,
           target,
           `CEO ${input.decision}`,
-          { candidateSnapshotDigest: input.candidateSnapshotDigest, rationale: input.rationale },
+          { candidateSnapshotDigest: input.candidateSnapshotDigest, rationale: input.rationale, ...ownerDecisionEvidence },
           isBootstrap && input.decision === "CONFIRM"
             ? this.completion.bootstrapActivation
             : undefined,
@@ -760,6 +772,7 @@ export class ProductionGate {
             decision: input.decision,
             candidateSnapshotDigest: input.candidateSnapshotDigest,
             rationale: input.rationale,
+            ...ownerDecisionEvidence,
             // Traceability only; the grant row is what activation reads, never this.
             ...(grantDigest === null ? {} : { manifestActivationGrantDigest: grantDigest }),
             ...(firstActivation ? { manifestActivation: "FIRST" } : {}),
@@ -952,6 +965,14 @@ export class ProductionGate {
     // or blind reviewer.
     const independence = this.bindings.assertFinalCeoIndependence(input.runId, input.ceoSessionId);
     if (!independence.allowed) return independence as Decision<{ isBootstrap: boolean }>;
+
+    // #1189 B1 (CEO ruling 3) — with a human gate or without one, the owner is asked only for an
+    // owner-only reason and the action it blocks; a CEO-scope judgement is refused with the CEO's own
+    // path. A refusal changes nothing: the run stays at review for the CEO's next decision.
+    if (input.decision === "OWNER_DECISION_REQUIRED") {
+      const reason = admitOwnerDecisionReason(input.runId, input);
+      if (!reason.allowed) return reason as Decision<{ isBootstrap: boolean }>;
+    }
 
     // Issue #246 PR-C slice C3 — a bootstrap CONFIRM sets off the Repo Factory GitHub writes, and
     // only the runner's full path performs them: the pre-write checks, the reservation, an attempt

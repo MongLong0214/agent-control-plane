@@ -26,6 +26,7 @@ import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { CtoLifecycle } from "../cto/cto-lifecycle.ts";
+import { OWNER_ONLY_REASONS } from "../ceo/owner-decision-reason.ts";
 import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
 import type { ExecutionMode, RunPriority } from "../domain/types.ts";
@@ -581,7 +582,16 @@ const createHermesServerFromPort = (
   );
   server.registerTool(
     "ceo_decision_submit",
-    { description: "Submit the CEO's final decision.", inputSchema: { ...mutation, runId: z.string(), decision: z.enum(["CONFIRM", "FINAL_REVISE", "OWNER_DECISION_REQUIRED"]), candidateSnapshotDigest: z.string(), ceoSessionId: z.string(), rationale: z.string() } },
+    {
+      description:
+        "Submit the CEO's final decision. OWNER_DECISION_REQUIRED hands the run to the owner only for an owner-only reason: " +
+        `ownerReason is one of ${Object.keys(OWNER_ONLY_REASONS).join(", ")} (PRD §21), and blockedAction names the specific action it blocks. ` +
+        "A judgement within the CEO's authority (candidate quality, technical approach, priority, uncertainty, recovery, staffing, cancellation) is refused with the CEO's own path.",
+      inputSchema: {
+        ...mutation, runId: z.string(), decision: z.enum(["CONFIRM", "FINAL_REVISE", "OWNER_DECISION_REQUIRED"]), candidateSnapshotDigest: z.string(), ceoSessionId: z.string(), rationale: z.string(),
+        ownerReason: z.string().optional(), blockedAction: z.string().optional(),
+      },
+    },
     async (args, extra) => write("ceo_decision_submit", args, extra, async () => {
       // #246 B2-b — the door's authenticated session travels with the decision, never an argument, so a
       // CONTRACT_CHANGE grant is issued, or its consumer re-bound, only when it is the CEO session the call
@@ -593,7 +603,10 @@ const createHermesServerFromPort = (
         sessionIncarnation: peer.allowed ? peer.value.sessionIncarnation ?? null : null,
         idempotencyKey: args.idempotencyKey,
       };
-      return respond(await port.submitCeoDecision({ runId: args.runId, decision: args.decision, candidateSnapshotDigest: args.candidateSnapshotDigest, ceoSessionId: args.ceoSessionId, rationale: args.rationale, ingress, hermesTurn: admittedTurnOf(extra) }));
+      return respond(await port.submitCeoDecision({ runId: args.runId, decision: args.decision, candidateSnapshotDigest: args.candidateSnapshotDigest, ceoSessionId: args.ceoSessionId, rationale: args.rationale,
+        ...(args.ownerReason === undefined ? {} : { ownerReason: args.ownerReason }),
+        ...(args.blockedAction === undefined ? {} : { blockedAction: args.blockedAction }),
+        ingress, hermesTurn: admittedTurnOf(extra) }));
     }),
   );
 
