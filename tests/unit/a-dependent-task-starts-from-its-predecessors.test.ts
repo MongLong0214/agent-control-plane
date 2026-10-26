@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
@@ -11,7 +11,7 @@ import { baseRefFor } from "../../src/run/candidate-integration.ts";
 import { TASK_WRITE_TARGET_RECORDED, TaskWriteTargets, recordedWriteTarget } from "../../src/run/task-write-target.ts";
 import { GuardedInvocationWriteBroker } from "../../src/runtime/provider.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
-import { cleanupTempDirs, gitSync } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, gitSync, makeRepo } from "../helpers/fixtures.ts";
 import { registerFixtureProject } from "../helpers/harness.ts";
 import { FakeWorkerAdapter, type FakeTurnScript } from "../helpers/worker-turn-fixture.ts";
 
@@ -66,16 +66,26 @@ const task = (key: string, paths: string[], dependsOn: string[] = []): TaskInput
 });
 
 /** A driven PRIMARY_CTO's STANDARD_WORK run, dispatched, its tasks submitted, the real worker path. */
-const standardRun = async (f: BootstrapRuntimeFixture, projectId: string, tasks: TaskInput[], taskIds: string[]) => {
+const SECOND = "github:acme/second";
+
+/** `second`: the run also writes a second registered repository, `SECOND`. */
+const standardRun = async (f: BootstrapRuntimeFixture, projectId: string, tasks: TaskInput[], taskIds: string[], options: { second?: boolean } = {}) => {
   const cp = f.harness.cp;
   cp.providers.registerForRole(f.claude, Role.PRIMARY_CTO);
-  await registerFixtureProject(f.harness, projectId);
+  // The project declares the secondary role the second repository joins the run under (#530).
+  await registerFixtureProject(f.harness, projectId, options.second
+    ? { repositories: [{ role: "primary", remote: "github:acme/fixture", manifestRoot: "." }, { role: "secondary", remote: SECOND, manifestRoot: "." }] }
+    : {});
+  const second = options.second
+    ? await cp.repositories.register({ checkoutPath: makeRepo({ "README.md": "# second\n" }), projectId, repositoryRole: "secondary", identity: SECOND })
+    : null;
+  if (second && !second.allowed) throw new Error(second.message);
   const bootstrap = await f.dispatchBootstrap();
   const bound = await cp.cto.ensureDrivenPrimaryCto(projectId, bootstrap.runId);
   if (!bound.allowed) throw new Error(`driven primary CTO refused: ${bound.reasonCode}: ${bound.message}`);
   const sessionId = bound.value.sessionId;
   const repository = cp.db.get<{ repository_id: string; checkout_path: string }>(
-    `SELECT repository_id, checkout_path FROM repositories WHERE project_id = ?`,
+    `SELECT repository_id, checkout_path FROM repositories WHERE project_id = ? AND repository_role = 'primary'`,
     [projectId],
   )!;
   const created = cp.runs.create({
@@ -92,7 +102,10 @@ const standardRun = async (f: BootstrapRuntimeFixture, projectId: string, tasks:
       humanGate: [],
       references: [],
     },
-    repositories: [{ repositoryId: repository.repository_id, repositoryRole: "primary", baseBranch: "dev" }],
+    repositories: [
+      { repositoryId: repository.repository_id, repositoryRole: "primary", baseBranch: "dev" },
+      ...(second?.allowed ? [{ repositoryId: second.value.repositoryId, repositoryRole: "secondary", baseBranch: "dev" }] : []),
+    ],
   });
   if (!created.allowed) throw new Error(created.message);
   const runId = created.value.runId;
@@ -420,6 +433,102 @@ describe("a dependent task of several predecessors (#1242)", () => {
       });
       expect(recordedWriteTarget(cp.db, s.runId, s.ids["d"]!)).toBeNull();
       expect(gitSync(s.repo, ["for-each-ref", "refs/acp/bases/"])).toBe("");
+    });
+  });
+});
+
+describe("review of #1242 (PR #1245)", () => {
+  it("P2-a: a predecessor's commit lost from another repository refuses the dependent task by name, not only one lost from its own", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const primary = "github:acme/fixture";
+      const s = await standardRun(
+        f,
+        "dep-p2a",
+        [
+          { key: "a", title: "task a", category: "implementation", spec: { writeTarget: { repositoryIdentity: primary, paths: ["README.md"] } } },
+          { key: "b", title: "task b", category: "implementation", dependsOn: ["a"], spec: { writeTarget: { repositoryIdentity: SECOND, paths: ["README.md"] } } },
+        ],
+        ["task_aaaaaaaaaaaaaaaaaaaaaaaa", "task_bbbbbbbbbbbbbbbbbbbbbbbb"],
+        { second: true },
+      );
+      const worker = workerDoing(f);
+      let a: { target: WriteTarget; commit: string };
+      try {
+        a = await runToSuccess(f, s, worker, s.ids["a"]!, { writes: { "README.md": "# from a\n" } });
+      } finally {
+        worker.killAll();
+      }
+      expect(a.target.repositoryIdentity).toBe(primary);
+      // A's commit is lost from its repository (R1); B writes the other one (R2).
+      gitSync(s.repo, ["checkout", "-q", "dev"]);
+      gitSync(s.repo, ["branch", "-q", "-D", a.target.branch]);
+      gitSync(s.repo, ["reflog", "expire", "--expire=now", "--all"]);
+      gitSync(s.repo, ["gc", "--quiet", "--prune=now"]);
+      expect(() => gitSync(s.repo, ["cat-file", "-e", `${a.commit}^{commit}`])).toThrow();
+
+      const provisioned = await provision(f, s, s.ids["b"]!);
+      expect(provisioned).toMatchObject({
+        ok: true,
+        value: {
+          writeTarget: null,
+          writeTargetRefused: {
+            reasonCode: ReasonCode.TASK_PREDECESSOR_COMMIT_MISSING,
+            evidence: { taskId: s.ids["b"], predecessor: s.ids["a"], commit: a.commit, repositoryIdentity: primary },
+          },
+        },
+      });
+      expect(recordedWriteTarget(cp.db, s.runId, s.ids["b"]!)).toBeNull();
+      expect(recordsFor(f, s.runId, s.ids["b"]!)).toEqual([]);
+    });
+  });
+
+  it("P2-b: a file that becomes a directory, and a directory that becomes a file, along a chain do not block a later dependent or the freeze", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      // Neither `module` nor `dir` exists at the base. A makes both as one kind, B deletes them, C makes each as the other kind.
+      const s = await standardRun(
+        f,
+        "dep-p2b",
+        [task("a", ["dir/x", "module"]), task("b", ["dir/x", "module"], ["a"]), task("c", ["dir", "module/index.js"], ["b"]), task("d", ["src/app.js"], ["c"])],
+        ["task_aaaaaaaaaaaaaaaaaaaaaaaa", "task_bbbbbbbbbbbbbbbbbbbbbbbb", "task_cccccccccccccccccccccccc", "task_dddddddddddddddddddddddd"],
+      );
+      expect(() => gitSync(s.repo, ["cat-file", "-e", `${s.runBase}:module`])).toThrow();
+      expect(() => gitSync(s.repo, ["cat-file", "-e", `${s.runBase}:dir`])).toThrow();
+      const worker = workerDoing(f);
+      let a: { commit: string };
+      let b: { commit: string };
+      let c: { commit: string };
+      try {
+        a = await runToSuccess(f, s, worker, s.ids["a"]!, { writes: { module: "a file\n", "dir/x": "x\n" } });
+        b = await runToSuccess(f, s, worker, s.ids["b"]!, {
+          writes: {},
+          whileLatched: () => {
+            rmSync(join(s.checkoutPath, "module"));
+            rmSync(join(s.checkoutPath, "dir"), { recursive: true });
+          },
+        });
+        c = await runToSuccess(f, s, worker, s.ids["c"]!, { writes: { "module/index.js": "module.exports = 1;\n", dir: "a file\n" } });
+      } finally {
+        worker.killAll();
+      }
+      expect(gitSync(s.repo, ["cat-file", "-t", `${c.commit}:module`])).toBe("tree");
+      expect(gitSync(s.repo, ["cat-file", "-t", `${c.commit}:dir`])).toBe("blob");
+
+      const provisioned = await provision(f, s, s.ids["d"]!);
+      expect(provisioned.value?.writeTargetRefused).toBeUndefined();
+      expect(provisioned.value!.writeTarget?.startsFrom).toEqual({
+        commit: c.commit,
+        predecessors: [
+          { taskId: s.ids["a"], commit: a.commit },
+          { taskId: s.ids["b"], commit: b.commit },
+          { taskId: s.ids["c"], commit: c.commit },
+        ],
+      });
+      // The freeze's content check reads the same entries: B's deletions stand in C's candidate.
+      const frozen = await cp.pipeline.freeze(s.runId);
+      if (!frozen.allowed) throw new Error(`${frozen.reasonCode}: ${frozen.message} ${JSON.stringify(frozen.evidence).slice(0, 400)}`);
+      expect(frozen.value.repositories[0]!.candidateHead).toBe(c.commit);
     });
   });
 });

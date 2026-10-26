@@ -340,14 +340,18 @@ const placeResults = async (repo: PinnedRepository, changes: TaskChanges, reposi
 const ABSENT = "- -";
 const entryOf = (change: Change): string => `${change.mode ?? "-"} ${change.blob ?? "-"}`;
 
-/** Each path's `<mode> <object>` in `commit`, for the paths asked; a path the commit lacks is absent. */
+/**
+ * Each path's `<mode> <object>` in `commit`, for the paths asked; a path the commit lacks is absent.
+ * Every path asked is a leaf a diff named (a file, a link or a submodule), so a tree that now stands at
+ * that name is no such leaf: a directory that took a deleted file's name is that deletion (#1242).
+ */
 const entriesAt = async (repo: PinnedRepository, commit: string, paths: readonly string[]): Promise<Map<string, string>> => {
   const found = new Map<string, string>();
   for (let start = 0; start < paths.length; start += 500) {
     const listed = await gitOrThrow(repo, ["ls-tree", "-z", "--full-tree", commit, "--", ...paths.slice(start, start + 500)]);
     for (const entry of listed.split("\0").filter((line) => line.length > 0)) {
-      const parsed = /^(\d{6}) \w+ ([0-9a-f]+)\t(.*)$/s.exec(entry);
-      if (parsed) found.set(parsed[3]!, `${parsed[1]} ${parsed[2]}`);
+      const parsed = /^(\d{6}) (\w+) ([0-9a-f]+)\t(.*)$/s.exec(entry);
+      if (parsed && parsed[2] !== "tree") found.set(parsed[4]!, `${parsed[1]} ${parsed[3]}`);
     }
   }
   return found;
@@ -495,30 +499,47 @@ export const integratePredecessors = async (input: {
   baseSha: string;
   worktree: RunWorktree;
 }): Promise<Decision<StartsFrom | null>> => {
-  const missing = (predecessor: string, missingWhat: string, commit: string | null): Decision<never> =>
+  const missing = (predecessor: string, missingWhat: string, commit: string | null, repositoryIdentity = input.repositoryIdentity): Decision<never> =>
     deny(ReasonCode.TASK_PREDECESSOR_COMMIT_MISSING, `a task this one depends on has no ${missingWhat} to start from; it is not started at the run's base instead`, {
       taskId: input.taskId,
       predecessor,
       commit,
-      repositoryIdentity: input.repositoryIdentity,
+      repositoryIdentity,
     });
   const receipts = new Map(succeededTaskCommits(input.db, input.runId).map((receipt) => [receipt.taskId, receipt]));
-  const here: SucceededTaskCommit[] = [];
+  const byRepository = new Map<string, SucceededTaskCommit[]>();
   for (const predecessor of [...input.predecessors].sort()) {
     const receipt = receipts.get(predecessor);
     const target = recordedWriteTarget(input.db, input.runId, predecessor);
     if (!receipt) return missing(predecessor, "SUCCEEDED commit", null);
     if (!target || target.repositoryIdentity !== receipt.repositoryIdentity) return missing(predecessor, "recorded write target in its commit's repository", receipt.commit);
-    if (receipt.repositoryIdentity === input.repositoryIdentity) here.push(receipt);
+    byRepository.set(receipt.repositoryIdentity, [...(byRepository.get(receipt.repositoryIdentity) ?? []), receipt]);
   }
+  // Review P2-a — every predecessor's commit is asked in its own repository first, whichever one this
+  // task writes: a commit lost from another repository refuses it exactly as one lost from this one.
+  const checkouts = new Map(input.db.all<{ identity: string; checkoutPath: string }>(
+    `SELECT r.identity, r.checkout_path AS checkoutPath FROM run_repositories rr JOIN repositories r ON r.repository_id = rr.repository_id
+      WHERE rr.run_id = ?`,
+    [input.runId],
+  ).map((row) => [row.identity, row.checkoutPath]));
+  for (const [repositoryIdentity, held] of byRepository) {
+    const checkoutPath = repositoryIdentity === input.repositoryIdentity ? input.checkoutPath : checkouts.get(repositoryIdentity);
+    if (!checkoutPath) return missing(held[0]!.taskId, "repository this run includes", held[0]!.commit, repositoryIdentity);
+    const lost = await withPinned<SucceededTaskCommit | null>(checkoutPath, "acp-predecessor-held-", async (repo) => {
+      for (const receipt of held) {
+        const read = await runPinnedGit(repo, ["cat-file", "-e", `${receipt.commit}^{commit}`]);
+        if (read.exitCode !== 0) return allow(ReasonCode.OK, receipt);
+      }
+      return allow(ReasonCode.OK, null);
+    });
+    if (!lost.allowed) return lost as Decision<never>;
+    if (lost.value) return missing(lost.value.taskId, "commit its repository still holds", lost.value.commit, repositoryIdentity);
+  }
+  const here = byRepository.get(input.repositoryIdentity) ?? [];
   if (here.length === 0) return allow(ReasonCode.OK, null);
   const results = succeededTaskResults(input.db, input.runId, input.tasks, here, input.repositoryIdentity);
 
   const plan = await withPinned<Placement>(input.checkoutPath, "acp-predecessor-read-", async (repo) => {
-    for (const result of results) {
-      const held = await runPinnedGit(repo, ["cat-file", "-e", `${result.commit}^{commit}`]);
-      if (held.exitCode !== 0) return missing(result.taskId, "commit its repository still holds", result.commit);
-    }
     const read = await readTaskChanges(repo, { runId: input.runId, tasks: input.tasks, results });
     if (!read.allowed) return read as Decision<never>;
     const { conflicts } = read.value;
