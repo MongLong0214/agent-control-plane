@@ -208,7 +208,8 @@ jobs:
 
   # The suite, as Vitest's own `--shard=i/N`, one macOS job per shard. Vitest partitions by a hash
   # of each file's path, so the N jobs between them run every file once; `verify-gate` checks that
-  # against the tree on every run rather than trusting it (`scripts/merge-vitest-results.mjs`).
+  # against Vitest's own file list on every run rather than trusting it
+  # (`scripts/merge-vitest-results.mjs`).
   # N is `strategy.job-total`, so the shard count is the matrix's length and cannot disagree with it.
   #
   # Each shard prepares its runner exactly as the single job did before the suite: the same
@@ -261,12 +262,18 @@ jobs:
       - run: pnpm native:fd-vfs:build
       - run: pnpm notes:fetch
       - run: pnpm build
+      # The suite's whole file set as Vitest itself discovers it — same config, checkout and runner
+      # as the tests below — for `verify` to check the shards' union against. `list` ignores
+      # `--shard`, so every shard writes the whole set, and `verify` refuses shards that disagree.
+      - run: node_modules/.bin/vitest list --filesOnly --json=evidence/local/ci-vitest-files.json
       - run: pnpm gates --tests-only --shard ${{ matrix.shard }}/${{ strategy.job-total }}
       - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         if: always()
         with:
           name: vitest-results-shard-${{ matrix.shard }}
-          path: evidence/local/ci-vitest-results.json
+          path: |
+            evidence/local/ci-vitest-results.json
+            evidence/local/ci-vitest-files.json
           if-no-files-found: error
 
   # Branch protection requires the check named exactly `verify` (app_id 15368, GitHub Actions) —
@@ -294,7 +301,7 @@ jobs:
   #
   # Then, when the shards ran, it joins their reports into the one whole-suite
   # `vitest-results-<node>` artifact readers already download, and refuses if the shards between
-  # them did not run every test file in the tree exactly once.
+  # them did not run every test file Vitest lists exactly once.
   verify-gate:
     name: verify
     needs: [test-reuse, gates, verify-matrix]
