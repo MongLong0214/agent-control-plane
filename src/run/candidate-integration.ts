@@ -6,7 +6,6 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { acpScratchDir } from "../core/scratch-root.ts";
 import type { Db } from "../db/database.ts";
-import { TaskState } from "../domain/types.ts";
 import type { SnapshotIntegration } from "../snapshot/candidate-snapshot.ts";
 import type { TaskRecord } from "./task-graph.ts";
 import { recordedWriteTarget } from "./task-write-target.ts";
@@ -60,24 +59,74 @@ export type RunWorktree = <T>(
 /** The `verification_worktrees.command_id` and worktree-id prefix of an integration's worktree. */
 export const INTEGRATION_WORKTREE_PURPOSE = "candidate-integration";
 
+/** One SUCCEEDED task's own commit, in the repository its execution ran in. */
+export interface SucceededTaskCommit {
+  taskId: string;
+  commit: string;
+  repositoryIdentity: string;
+}
+
 /**
- * The run's SUCCEEDED tasks whose write target is in this repository, each with the commit its last
- * successful turn recorded. A SUCCEEDED task with no recorded commit is not a result here.
+ * The one source of a run's SUCCEEDED task commits, for the integration and for the freeze's
+ * missing-commit guard alike (S6-B, S6-C), so the two can never be asked about different commits.
+ * Each task's latest SUCCEEDED attempt only, and only when its own SUCCEEDED evidence still reads
+ * back by both its execution id and its stored result digest, the two values ACP-WORKER-02 bound
+ * together when the receipt was written. A receipt that cannot be read back that way names nothing.
  */
-export const succeededTaskResults = (db: Db, runId: string, tasks: readonly TaskRecord[], repositoryIdentity: string): TaskResult[] => {
+export const succeededTaskCommits = (db: Db, runId: string): SucceededTaskCommit[] => {
+  const rows = db.all<{ taskId: string; commitHead: unknown; repositoryIdentity: string | null }>(
+    `SELECT te.task_id AS taskId,
+            json_extract(a.evidence_json, '$.commitHead') AS commitHead,
+            r.identity AS repositoryIdentity
+       FROM task_executions te
+       JOIN audit_events a
+         ON a.kind = ?
+        AND json_extract(a.evidence_json, '$.executionId') = te.execution_id
+        AND json_extract(a.evidence_json, '$.resultDigest') = te.result_digest
+       LEFT JOIN repositories r ON r.repository_id = te.repository_id
+      WHERE te.run_id = ?
+        AND te.status = 'SUCCEEDED'
+        AND te.attempt = (
+          SELECT MAX(te2.attempt) FROM task_executions te2
+           WHERE te2.task_id = te.task_id AND te2.status = 'SUCCEEDED'
+        )
+      ORDER BY te.task_id, a.event_id DESC`,
+    [WorkerTurnEvent.SUCCEEDED, runId],
+  );
+  const commits = new Map<string, SucceededTaskCommit>();
+  for (const row of rows) {
+    if (commits.has(row.taskId) || typeof row.commitHead !== "string" || row.commitHead.length === 0 || !row.repositoryIdentity) continue;
+    commits.set(row.taskId, { taskId: row.taskId, commit: row.commitHead, repositoryIdentity: row.repositoryIdentity });
+  }
+  return [...commits.values()];
+};
+
+/**
+ * The commits of `succeededTaskCommits` in this repository that the integration can place: each
+ * task's recorded write target is in the same repository and names the origin its branch was made
+ * at. A commit with no such target is not integrated, and the freeze's guard then refuses the
+ * candidate for it unless the checkout's HEAD already holds it.
+ */
+export const succeededTaskResults = (
+  db: Db,
+  runId: string,
+  tasks: readonly TaskRecord[],
+  commits: readonly SucceededTaskCommit[],
+  repositoryIdentity: string,
+): TaskResult[] => {
+  const titles = new Map(tasks.map((task) => [task.taskId, task.title]));
   const results: TaskResult[] = [];
-  for (const task of tasks) {
-    if (task.state !== TaskState.SUCCEEDED) continue;
-    const target = recordedWriteTarget(db, runId, task.taskId);
+  for (const succeeded of commits) {
+    if (succeeded.repositoryIdentity !== repositoryIdentity) continue;
+    const target = recordedWriteTarget(db, runId, succeeded.taskId);
     if (!target || target.repositoryIdentity !== repositoryIdentity) continue;
-    const commit = db.get<{ head: unknown }>(
-      `SELECT json_extract(evidence_json, '$.commitHead') AS head FROM audit_events
-        WHERE run_id = ? AND kind = ? AND json_extract(evidence_json, '$.taskId') = ?
-        ORDER BY event_id DESC LIMIT 1`,
-      [runId, WorkerTurnEvent.SUCCEEDED, task.taskId],
-    )?.head;
-    if (typeof commit !== "string") continue;
-    results.push({ taskId: task.taskId, title: task.title, commit, declaredParent: target.declaredParent, baseSha: target.baseSha });
+    results.push({
+      taskId: succeeded.taskId,
+      title: titles.get(succeeded.taskId) ?? "",
+      commit: succeeded.commit,
+      declaredParent: target.declaredParent,
+      baseSha: target.baseSha,
+    });
   }
   return results;
 };
@@ -207,11 +256,13 @@ export const integrateTaskResults = async (input: {
   db: Db;
   runId: string;
   tasks: readonly TaskRecord[];
+  /** `succeededTaskCommits` of the run, read once by the freeze for the integration and its guard. */
+  commits: readonly SucceededTaskCommit[];
   repositoryIdentity: string;
   checkoutPath: string;
   worktree: RunWorktree;
 }): Promise<Decision<IntegratedCandidate | null>> => {
-  const results = succeededTaskResults(input.db, input.runId, input.tasks, input.repositoryIdentity);
+  const results = succeededTaskResults(input.db, input.runId, input.tasks, input.commits, input.repositoryIdentity);
   if (results.length === 0) return allow(ReasonCode.OK, null);
 
   // Read-only, over the registered checkout: everything is decided, and every conflict refused,

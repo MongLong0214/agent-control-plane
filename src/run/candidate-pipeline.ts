@@ -38,7 +38,7 @@ import {
 } from "../snapshot/candidate-snapshot.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationEngine, VerificationReport } from "../verify/verification-engine.ts";
-import { integrateTaskResults } from "./candidate-integration.ts";
+import { type SucceededTaskCommit, integrateTaskResults, succeededTaskCommits } from "./candidate-integration.ts";
 import type { RunEngine, TaskContract } from "./run-engine.ts";
 import type { TaskGraph } from "./task-graph.ts";
 import { recordedTargetForBranch } from "./task-write-target.ts";
@@ -255,6 +255,9 @@ export class CandidatePipeline {
       ? (this.projects.manifest(run.pinnedManifestDigest)?.branchProfile ?? null)
       : null;
     const tasks = participants.length === 0 ? [] : this.tasks.list(runId);
+    // One read of the run's SUCCEEDED task commits: what the integration places and what the
+    // missing-commit guard below asks the final candidate for are the same commits (S6-B, S6-C).
+    const commits = participants.length === 0 ? [] : succeededTaskCommits(this.db, runId);
     const repositories: SnapshotRepositoryInput[] = [];
     for (const repo of participants) {
       // S6-C — when the checkout's HEAD does not hold every SUCCEEDED task's commit, the candidate is
@@ -263,6 +266,7 @@ export class CandidatePipeline {
         db: this.db,
         runId,
         tasks,
+        commits,
         repositoryIdentity: repo.identity,
         checkoutPath: repo.checkoutPath,
         worktree: (input, use) => this.verification.withRunWorktree(run, input, use),
@@ -333,6 +337,20 @@ export class CandidatePipeline {
           },
           this.clock,
         );
+
+    // CEO (S6-B) — a candidate that is missing a SUCCEEDED task's own commit is refused here,
+    // before it is ever persisted as this run's current candidate. Asked of the final candidate
+    // head, integrated or not: the post-condition of the integration above, never replaced by it.
+    if (participants.length > 0) {
+      const missing = await this.missingTaskCommits(commits, snapshot.repositories, repositories);
+      if (missing.length > 0) {
+        return deny(
+          ReasonCode.CANDIDATE_MISSING_TASK_COMMIT,
+          "a SUCCEEDED task's commit is not in the candidate's history for its repository",
+          { runId, missing },
+        );
+      }
+    }
 
     this.artifacts.put(runId, ArtifactKind.CANDIDATE_SNAPSHOT, snapshot, candidateSnapshotDigest(snapshot));
     // One transaction records the new candidate and stales everything bound to an older
@@ -1037,6 +1055,41 @@ export class CandidatePipeline {
       }))
       .filter((p) => p.checkoutPath);
     return verifySnapshotFreshness(snapshot, probes);
+  }
+
+  /**
+   * CEO (S6-B) — every task's own commit that a valid SUCCEEDED receipt of this run names
+   * (`succeededTaskCommits`), checked against the candidate just frozen for its repository. Each
+   * STANDARD_WORK task's work branch is created at the run's pinned base, never stacked on another
+   * task's branch (#512 S-TB), so a candidate that is only the checkout's HEAD can hold one task's
+   * branch alone. The integration (S6-C) places every commit it can; this is its post-condition on
+   * the final head, so a commit it did not place (no write target, or an integration that dropped
+   * one) refuses the freeze instead of being lost. Not drift in an already-frozen snapshot
+   * (SNAPSHOT_STALE re-reads one after the fact; this is asked before one is ever recorded).
+   */
+  private async missingTaskCommits(
+    commits: readonly SucceededTaskCommit[],
+    snapshotRepositories: readonly { identity: string; candidateHead: string }[],
+    repositories: readonly { identity: string; checkoutPath: string }[],
+  ): Promise<Array<{ taskId: string; commitHead: string; repositoryIdentity: string }>> {
+    const checkoutByIdentity = new Map(repositories.map((repo) => [repo.identity, repo.checkoutPath]));
+    const candidateByIdentity = new Map(snapshotRepositories.map((repo) => [repo.identity, repo.candidateHead]));
+
+    const missing: Array<{ taskId: string; commitHead: string; repositoryIdentity: string }> = [];
+    for (const receipt of commits) {
+      const checkoutPath = checkoutByIdentity.get(receipt.repositoryIdentity);
+      const candidateHead = candidateByIdentity.get(receipt.repositoryIdentity);
+      if (!checkoutPath || !candidateHead) continue;
+      // The same ancestry idiom `sourceAtFreeze` uses below: a commit not resolvable in this
+      // checkout at all makes `mergeBase` answer null, which is "not contained" exactly as a
+      // resolvable but non-ancestor commit is — fail closed either way. An integrated head's
+      // objects are in this checkout's object store: its integration worktree was linked to it.
+      const ancestor = await mergeBase(checkoutPath, receipt.commit, candidateHead);
+      if (ancestor !== receipt.commit) {
+        missing.push({ taskId: receipt.taskId, commitHead: receipt.commit, repositoryIdentity: receipt.repositoryIdentity });
+      }
+    }
+    return missing.sort((a, b) => (a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0));
   }
 
   /**
