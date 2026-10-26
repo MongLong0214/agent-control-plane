@@ -1,0 +1,4 @@
+Limit: only ~/.local/bin is added: a user tool installed elsewhere outside the daemon PATH (for example ~/.cargo/bin or an nvm bin) still does not resolve for the resident's MCP servers and hooks
+Warn: the resident launcher appends $HOME/.local/bin to PATH rather than prepending it: that directory also holds node, npm, npx, buzz and claude, and a prepend would shadow the daemon runtime's node for every bare node in the resident session
+Record-Id: r-cc9d1d908729
+Provenance: inherited ef64ff5b67d29223ee12b2c814b014a90c20e5f0
