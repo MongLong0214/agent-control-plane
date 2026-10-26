@@ -103,14 +103,14 @@ const prepareRun = async (
 type Prepared = Awaited<ReturnType<typeof prepareRun>>;
 
 /** Opens one task's execution, the way a worker turn does before it commits. */
-const openExecution = (setup: Prepared, key: string) => {
+const openExecution = (setup: Prepared, key: string, extra: { worktreeId?: string } = {}) => {
   const submitted = setup.harness.cp.tasks.submit(setup.run.runId, [{ key, title: key, category: "implementation" }]);
   if (!submitted.allowed) throw new Error(submitted.message);
   const task = setup.harness.cp.tasks.ready(setup.run.runId).find((candidate) => candidate.title === key)!;
   const worker = bindWorker(setup.harness, task.taskId);
   const execution = setup.harness.cp.tasks.startExecution({ runId: setup.run.runId, taskId: task.taskId,
     ownerBindingGeneration: setup.run.ownerBindingGeneration!, workerSessionId: worker,
-    provider: "scripted", model: "scripted-worker", repositoryId: setup.repositoryId });
+    provider: "scripted", model: "scripted-worker", repositoryId: setup.repositoryId, ...extra });
   if (!execution.allowed) throw new Error(execution.message);
   return { taskId: task.taskId, executionId: execution.value.executionId, worker };
 };
@@ -736,8 +736,37 @@ describe("#1223 P1-A: the audit log and artifact store exempt only exact ACP-gen
     // The earlier second bypass, through the real registry: a remote-less checkout registered under a
     // declared `local:` identity naming another directory that holds the secret. The registry still admits
     // the declaration; its audit record does not keep the identity, which is not `local:` and that checkout.
-    const { harness, run } = await prepareRun();
+    const setup = await prepareRun();
+    const { harness, run } = setup;
     try {
+      // The reviewer's repro: an execution admitted with a worktree that does not exist. A task
+      // execution's worktree is a path its caller supplied, so naming that receipt gives a grant no root.
+      const opened = openExecution(setup, "receipt-root", { worktreeId: nonexistent });
+      expect(harness.cp.db.get<{ worktree_id: string }>(`SELECT worktree_id FROM task_executions WHERE execution_id = ?`,
+        [opened.executionId])?.worktree_id).toBe(nonexistent);
+      const consumed = (evidence: Record<string, unknown>) => {
+        expect(harness.cp.audit.record({ kind: "MANAGED_WRITE_GUARD_CONSUMED", runId: run.runId, evidence }).allowed).toBe(true);
+        return harness.cp.audit.byKind("MANAGED_WRITE_GUARD_CONSUMED").at(-1)!.evidence;
+      };
+      const viaReceipt = consumed({ repositoryIdentity: setup.identity, taskReceiptId: opened.executionId,
+        resolvedPath: `${nonexistent}/src/a.js`, targetWorktreeId: nonexistent });
+      expect(viaReceipt["resolvedPath"]).toContain("[redacted]");
+      expect(viaReceipt["targetWorktreeId"]).toContain("[redacted]");
+      // A verification tree the engine recorded for the run is a root: a grant inside it is kept whole.
+      const tree = join(other, "worktrees", `verify-${run.runId}-test`);
+      harness.cp.db.run(
+        `INSERT INTO verification_worktrees
+           (worktree_id, run_id, command_id, candidate_snapshot_digest, repository_identity, repository_checkout_path,
+            worktree_path, head, owner_session_id, owner_binding_generation, owner_role_key, state, created_at)
+         VALUES (?, ?, 'test', 'sha256:test', ?, ?, ?, 'head', ?, ?, 'owner', 'CREATING', ?)`,
+        [`verify-${run.runId}-test`, run.runId, setup.identity, harness.repoPath, tree, run.ownerSessionId,
+          run.ownerBindingGeneration, harness.cp.clock.nowIso()]);
+      const inTree = { repositoryIdentity: setup.identity, resolvedPath: tree, targetWorktreeId: tree };
+      expect(consumed(inTree)).toEqual(inTree);
+      // ...for that run only.
+      expect(harness.cp.audit.record({ kind: "MANAGED_WRITE_GUARD_CONSUMED", runId: otherRun, evidence: inTree }).allowed).toBe(true);
+      expect(harness.cp.audit.byKind("MANAGED_WRITE_GUARD_CONSUMED").at(-1)!.evidence["targetWorktreeId"]).toContain("[redacted]");
+
       // No laundering through an identical stored row: a row a raw writer left is not admission, and
       // every put is checked before an identical row is looked up.
       const repro = { repositories: [{ role: "primary", identity: "github:other/unregistered", proposedCheckoutPath: `${nonexistent}/repositories/primary` }] };

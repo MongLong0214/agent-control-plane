@@ -11,7 +11,10 @@ const canonicalStored = (path: string): string => {
 /**
  * Facts ACP already stored, read from a store's own database: what a stored repository identity,
  * checkout or grant path is checked against before it is read per segment
- * (core/credential-shapes.ts). Read-only; never a value the caller hands over.
+ * (core/credential-shapes.ts). Read-only. Only locations ACP itself made or registered: the
+ * registry's checkouts (the canonical git toplevel it resolved) and the verification engine's own
+ * trees (under its configured worktree root). A path a caller or MCP request supplied and ACP only
+ * stored, such as a task execution's worktree, is never one.
  */
 export const registryView = (db: Db): RegistryView => ({
   records: (identity, checkoutPath) =>
@@ -30,10 +33,4 @@ export const registryView = (db: Db): RegistryView => ({
     db.all<{ worktree_path: string }>(
       `SELECT worktree_path FROM verification_worktrees WHERE run_id = ? AND repository_identity = ?`, [runId, identity],
     ).map((row) => canonicalStored(row.worktree_path)),
-  receiptWorktree: (runId, executionId) => {
-    const row = db.get<{ worktree_id: string | null }>(
-      `SELECT worktree_id FROM task_executions WHERE execution_id = ? AND run_id = ?`, [executionId, runId],
-    );
-    return row?.worktree_id ? canonicalStored(row.worktree_id) : null;
-  },
 });

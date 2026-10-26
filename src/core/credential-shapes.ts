@@ -146,10 +146,8 @@ export interface RegistryView {
   recordsForRun(runId: string, identity: string, checkoutPath: string): boolean;
   /** The checkouts the registry records for an identity. */
   checkoutsOf(identity: string): readonly string[];
-  /** The run's verification trees of a repository (verification_worktrees). */
+  /** The run's verification trees of a repository, which the verification engine made (verification_worktrees). */
   runWorktrees(runId: string, identity: string): readonly string[];
-  /** The worktree a task execution of the run is bound to (task_executions.worktree_id), or null. */
-  receiptWorktree(runId: string, executionId: string): string | null;
 }
 
 /** Where a record is being written: the facts a verified location's contract is checked against. */
@@ -395,21 +393,18 @@ const storedRegistrationIdentity: LocationContract = (text, field) => {
 
 /**
  * The roots a consumed grant may reach, read from the store's own database for the grant's
- * repository and run: the registry's checkouts of that repository, the run's verification trees of
- * it, and the worktree its task execution is bound to. None comes from the caller.
+ * repository and run, and only ones ACP itself made or registered: the registry's checkouts of that
+ * repository and the run's verification trees of it. A task execution's worktree is a path the
+ * caller supplied (`task_receipt_submit`) and is never a root; a runtime-managed worker's worktree is
+ * the registered checkout, which is one.
  */
 const grantRoots = (field: EvidenceField): readonly string[] => {
   const registry = field.site?.registry;
-  const record = field.site?.record;
-  const identity = member(record, "repositoryIdentity");
+  const identity = member(field.site?.record, "repositoryIdentity");
   if (registry === undefined || typeof identity !== "string") return [];
   const runId = field.site?.runId;
-  const execution = member(record, "taskReceiptId");
-  return [
-    ...registry.checkoutsOf(identity),
-    ...(typeof runId === "string" ? registry.runWorktrees(runId, identity) : []),
-    ...(typeof runId === "string" && typeof execution === "string" ? [registry.receiptWorktree(runId, execution)] : []),
-  ].filter((root): root is string => typeof root === "string" && root.startsWith("/"));
+  return [...registry.checkoutsOf(identity), ...(typeof runId === "string" ? registry.runWorktrees(runId, identity) : [])]
+    .filter((root) => root.startsWith("/"));
 };
 
 /** Inside a stored root of the grant: the root itself or a normalized path under it, the rest read per segment. */
