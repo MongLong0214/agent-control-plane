@@ -189,8 +189,12 @@ export type PipelineOutcome =
        */
       detail: { message: string; evidence: Evidence };
     }
-  /** The source moved while the candidate was being judged; all its evidence is stale. */
-  | { stage: "CANDIDATE_STALE"; reasonCode: string; snapshotDigest: string };
+  /**
+   * The source moved while the candidate was being judged; all its evidence is stale. Review of
+   * 2bf6f98c — a freshness denial after the review keeps its message and evidence here (`detail`),
+   * so what to do next (a fresh-key plan_submit) is in this answer rather than the next one.
+   */
+  | { stage: "CANDIDATE_STALE"; reasonCode: string; snapshotDigest: string; detail?: { message: string; evidence: Evidence } };
 
 /**
  * A durable submission lease that a watchdog reclaimed after its holder disappeared.
@@ -451,7 +455,8 @@ export class CandidatePipeline {
         if (snapshot.bootstrapPlan !== undefined) {
           const planAtPublication = this.bootstrapPlanStillCurrent(input.runId, snapshot);
           if (!planAtPublication.allowed) {
-            return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest });
+            return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest,
+              detail: { message: planAtPublication.message, evidence: planAtPublication.evidence } });
           }
         }
         if (snapshot.contractChange !== undefined) {
@@ -725,7 +730,8 @@ export class CandidatePipeline {
       reviewed.reasonCode === ReasonCode.REVIEW_OMITTED_ITEMS_PRESENT;
     const current = stillCurrent(isVerdict);
     if (!current.allowed) {
-      return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: current.reasonCode, snapshotDigest });
+      return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: current.reasonCode, snapshotDigest,
+        detail: { message: current.message, evidence: current.evidence } });
     }
 
     if (!isVerdict) {

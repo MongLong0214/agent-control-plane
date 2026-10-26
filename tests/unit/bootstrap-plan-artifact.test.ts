@@ -2529,6 +2529,13 @@ describe("live run_3884d4fc: a bootstrap PLAN is reviewed only while it carries 
       const submitted = await pending;
       expect(submitted, JSON.stringify(submitted)).toMatchObject({ ok: true,
         value: { stage: "CANDIDATE_STALE", reasonCode: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN", snapshotDigest: candidate } });
+      // Review of 2bf6f98c — the same answer carries what to do next, and which authority is unfrozen.
+      const detail = (submitted["value"] as { detail?: { message: string; evidence: Args } }).detail;
+      expect(detail?.message).toContain("plan_submit again with the same bootstrapPlanDigest and a NEW idempotencyKey");
+      expect(detail?.message).toContain("then result_submit");
+      expect(detail?.evidence).toMatchObject({ refusal: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN", bootstrapPlanDigest: f.digest,
+        unfrozenReviewEvidenceAttachment: expect.stringMatching(/^sha256:/),
+        unfrozenCeoDecisionEvents: collectBootstrapCeoDecisions(f.h.cp.db, f.run.runId).map(d => d.source.decisionEventId) });
       const judged = reviews(f)[0]!.prompt;
       expect(judged).not.toContain(e.text.trim());
       expect(judged).not.toContain(resolution);
