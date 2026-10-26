@@ -191,9 +191,11 @@ const supervisorEndedAsReported = (
  * - `budget` sets no process rlimit. The supervisor polls the candidate's tree through the kernel
  *   child list (`proc_listchildpids`) about once a millisecond, counts the live descendants it has
  *   found, and once they exceed the budget it freezes and kills every one of them and reports
- *   ACP_PROCESS_LIMIT_EXCEEDED. A child list it cannot read, or a supervisor that was stopped and
- *   continued -- it did not watch the tree meanwhile -- ends the run the same way, reported as
- *   ACP_PROCESS_LIMIT_UNAVAILABLE. A tracked descendant running at the poll that sees the
+ *   ACP_PROCESS_LIMIT_EXCEEDED. A child list it cannot read before the candidate starts refuses the
+ *   run with no candidate started, reported as ACP_PROCESS_LIMIT_UNAVAILABLE. Once the candidate
+ *   exists, a child list it cannot read, or a supervisor that was stopped and continued -- it did
+ *   not watch the tree meanwhile -- ends the run the same way but as a cleanup it cannot prove,
+ *   ACP_CHILD_CLEANUP_UNAVAILABLE. A tracked descendant running at the poll that sees the
  *   candidate exit is killed and reported as ACP_DESCENDANT_OUTLIVED_CANDIDATE, so the candidate's
  *   exit 0 does not pass -- even if that descendant ends during the settling turns that follow,
  *   which serve only the cleanup proof. A signal that would end the supervisor makes it stop the
@@ -526,6 +528,12 @@ def report_candidate(pid):
     except OSError:
         return False
 
+if process_mode == "budget" and child_pids(os.getpid()) is None:
+    # Known before any candidate exists, so nothing has run and there is nothing to clean up: the
+    # run is refused as a budget that cannot be enforced, and no candidate is started.
+    print("${PROCESS_LIMIT_UNAVAILABLE}: the kernel child list cannot be read, so no candidate was started", file=sys.stderr)
+    finish(${PROCESS_LIMIT_UNAVAILABLE_EXIT})
+
 candidate_pid = os.fork()
 if candidate_pid == 0:
     try:
@@ -570,8 +578,10 @@ else:
         print("${PROCESS_LIMIT_EXCEEDED}: %d live descendants exceeded the supervised budget of %d; the candidate tree was killed" % (live, process_budget), file=sys.stderr)
         finish(${PROCESS_LIMIT_EXCEEDED_EXIT})
     if stop == "unavailable":
-        print("${PROCESS_LIMIT_UNAVAILABLE}: the supervisor could not watch the candidate's process tree; the candidate tree was killed", file=sys.stderr)
-        finish(${PROCESS_LIMIT_UNAVAILABLE_EXIT})
+        # The candidate exists by now, so a tree the supervisor could not watch -- an unreadable
+        # child list, or a stop it was continued from -- is a cleanup it cannot prove.
+        print("ACP_CHILD_CLEANUP_UNAVAILABLE: the supervisor could not watch the candidate's process tree; it killed what it had tracked", file=sys.stderr)
+        finish(126)
     if outlived:
         print("${DESCENDANT_OUTLIVED_CANDIDATE}: %d tracked descendant(s) were still running when the candidate exited; they were killed" % outlived, file=sys.stderr)
         if os.WIFEXITED(candidate_status) and os.WEXITSTATUS(candidate_status) == 0:
@@ -1245,6 +1255,15 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   // the second one fire instead and report the same false conclusion by a different name.
   const killedByOurOwnLimit = memoryLimitExceeded || timedOut || exit.signal === "SIGXCPU";
   await observeCandidate();
+  // Under the budget, a supervisor that cannot read the kernel child list refuses before it starts
+  // any candidate: it reported that outcome and ended with it, and no candidate pid was ever
+  // reported. Nothing ran, so the missing candidate is explained rather than an escape.
+  const refusedBeforeCandidate =
+    supervisedBudget &&
+    !candidateReportSeen &&
+    supervisorEndedAsReported(supervisorReport, exit) &&
+    exit.code === PROCESS_LIMIT_UNAVAILABLE_EXIT &&
+    stderrChunks.join("").includes(`${PROCESS_LIMIT_UNAVAILABLE}:`);
   if (!candidateReportSeen) {
     // A missing candidate report normally means a self-detaching process got away before we
     // could follow it. It means something different when *we* killed the wrapper: a command
@@ -1255,7 +1274,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     //
     // Containment is still proven, not assumed: the process-group reap immediately below is
     // unchanged and is what would catch anything that actually survived.
-    if (!killedByOurOwnLimit) {
+    if (!killedByOurOwnLimit && !refusedBeforeCandidate) {
       markContainmentLost(
         "candidate identity was not observed; an orphaned self-detaching process could not be followed",
       );
@@ -1268,7 +1287,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     if (!(await reapKnownProcess(observedCandidate))) {
       markContainmentLost(`candidate pid ${observedCandidate.pid} survived wrapper cleanup`);
     }
-  } else if (!childContainmentReason && !killedByOurOwnLimit) {
+  } else if (!childContainmentReason && !killedByOurOwnLimit && !refusedBeforeCandidate) {
     markContainmentLost("candidate identity was not captured, so containment could not be proved");
   }
   // Under the budget the supervisor is the only process that knows the candidate's descendants,
@@ -1307,9 +1326,9 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   const supervisorReported = (marker: string, code: number): boolean =>
     supervisedBudget && exit.code === code && stderr.includes(`${marker}:`);
   const processBudgetExceeded = supervisorReported(PROCESS_LIMIT_EXCEEDED, PROCESS_LIMIT_EXCEEDED_EXIT);
-  const processBudgetUnavailable = supervisorReported(PROCESS_LIMIT_UNAVAILABLE, PROCESS_LIMIT_UNAVAILABLE_EXIT);
+  const processBudgetUnavailable = refusedBeforeCandidate;
   if (processBudgetUnavailable) {
-    childContainmentReason ??= "the supervisor could not watch the candidate's process tree, so its process budget was not in force";
+    childContainmentReason ??= "the supervisor could not read the kernel child list, so it started no candidate and its process budget was not in force";
   }
   const descendantOutlived =
     groupOutlivedLeader ||

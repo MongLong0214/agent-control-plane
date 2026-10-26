@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -17,6 +17,7 @@ import {
 import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { requireSeatbelt } from "../helpers/seatbelt.ts";
+import { stableFixtureExecutable } from "../helpers/stable-fixture-executable.ts";
 
 /**
  * E2E-02: a freshly activated project's required verification is `npm test`, and under RLIMIT_NPROC 1
@@ -295,21 +296,69 @@ setTimeout(() => { process.kill(process.ppid, 'SIGKILL'); setTimeout(() => proce
     });
   });
 
-  it("FAILs closed, never reporting the candidate's own exit, when the child-list reader is unavailable", async (context) => {
-    requireSeatbelt(context);
-    const worktree = tempDir("acp-budget-no-reader-");
+  /**
+   * A `ps` that answers late, as on a loaded CI runner: the sandbox's own identity probes run through
+   * it. That is how #1222's CI saw the candidate gone before its identity could be fenced.
+   */
+  const SLOW_PS = "#!/bin/sh\n/bin/sleep 0.08\nexec /bin/ps \"$@\"\n";
+  const withSlowPs = async <T>(operation: () => Promise<T>): Promise<T> => {
+    const previous = process.env["PATH"];
+    process.env["PATH"] = `${dirname(stableFixtureExecutable("ps", SLOW_PS))}${delimiter}${previous ?? ""}`;
+    try {
+      return await operation();
+    } finally {
+      if (previous === undefined) delete process.env["PATH"];
+      else process.env["PATH"] = previous;
+    }
+  };
 
-    const outcome = await sandboxTesting.withChildListReaderUnavailable(() =>
-      budgetRun(worktree, ["node", "-e", "process.exit(0)"]),
-    );
+  const asIs = <T>(operation: () => Promise<T>): Promise<T> => operation();
+  for (const [answers, probes] of [["promptly", asIs], ["late, as on a loaded runner", withSlowPs]] as const) {
+    it(`FAILs closed, starting no candidate, when the child-list reader is unavailable and ps answers ${answers}`, async (context) => {
+      requireSeatbelt(context);
+      const worktree = tempDir("acp-budget-no-reader-");
+
+      const outcome = await probes(() =>
+        sandboxTesting.withChildListReaderUnavailable(() => budgetRun(worktree, ["node", "-e", "process.exit(0)"])),
+      );
+
+      expect(outcome, described(outcome)).toMatchObject({
+        status: "FAIL",
+        exitCode: 122,
+        reasonCode: ReasonCode.SANDBOX_RESOURCE_LIMIT_UNAVAILABLE,
+        enforcement: { processLimit: "supervised-budget", childContainmentEnforced: false },
+      });
+      expect(outcome.stderr).toContain(`${PROCESS_LIMIT_UNAVAILABLE}: the kernel child list cannot be read, so no candidate was started`);
+      expect(outcome.enforcement.childContainmentReason).toContain("started no candidate");
+    });
+  }
+
+  it("records a cleanup it cannot prove when the candidate stops and continues its supervisor", async (context) => {
+    requireSeatbelt(context);
+    const worktree = tempDir("acp-budget-supervisor-stopped-");
+    // After release the supervisor did not watch the tree while it was stopped, so whatever the
+    // candidate did meanwhile is not proven stopped: that is not the same as a budget refused up front.
+    writeFiles(worktree, {
+      "stop-supervisor.js": [
+        "setTimeout(() => {",
+        "  process.kill(process.ppid, 'SIGSTOP');",
+        "  setTimeout(() => process.kill(process.ppid, 'SIGCONT'), 100);",
+        "}, 300);",
+        "setInterval(() => {}, 1000);",
+        "",
+      ].join("\n"),
+    });
+
+    const outcome = await budgetRun(worktree, ["node", "stop-supervisor.js"]);
 
     expect(outcome, described(outcome)).toMatchObject({
-      status: "FAIL",
-      exitCode: 122,
-      reasonCode: ReasonCode.SANDBOX_RESOURCE_LIMIT_UNAVAILABLE,
+      status: "ERROR",
+      exitCode: 126,
+      reasonCode: ReasonCode.SANDBOX_CHILD_CLEANUP_FAILED,
       enforcement: { processLimit: "supervised-budget", childContainmentEnforced: false },
     });
-    expect(outcome.stderr).toContain(`${PROCESS_LIMIT_UNAVAILABLE}:`);
+    expect(outcome.stderr).toContain("ACP_CHILD_CLEANUP_UNAVAILABLE: the supervisor could not watch the candidate's process tree");
+    expect(outcome.stderr).not.toContain(`${PROCESS_LIMIT_UNAVAILABLE}:`);
   });
 
   it("still refuses every spawn when the trusted caller asks for no-spawn or names no mode", async (context) => {
