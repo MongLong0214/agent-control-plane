@@ -431,7 +431,7 @@ it("the launcher's PATH line appends $HOME/.local/bin without shadowing the daem
   writeFileSync(join(bin,'node'),'#!/bin/sh\nexit 0\n',{mode:0o700});
   writeFileSync(join(localBin,'node'),'#!/bin/sh\nexit 0\n',{mode:0o700});
   const resolve = (tool:string) => new Promise<string>((res,rej) => {
-    execFile('/bin/sh',['-c',`${pathLine}; command -v ${tool}`],{env},(error,stdout) => error ? rej(error) : res(stdout.trim()));
+    execFile('/bin/sh',['-c',`${pathLine}; command -v ${tool}`],{env,timeout:10_000},(error,stdout) => error ? rej(error) : res(stdout.trim()));
   });
   expect(await resolve('probe-tool')).toBe(join(localBin,'probe-tool'));
   expect(await resolve('node')).toBe(join(bin,'node'));
