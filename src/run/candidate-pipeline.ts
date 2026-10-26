@@ -7,6 +7,8 @@ import {
   isProjectlessBootstrap,
   sameBootstrapPlanBinding,
 } from "../bootstrap/bootstrap-plan.ts";
+import { collectBootstrapCeoDecisions, frozenBootstrapCeoDecisions } from "../bootstrap/bootstrap-ceo-decisions.ts";
+import { collectBootstrapReviewEvidence } from "../bootstrap/bootstrap-review-evidence.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
@@ -629,9 +631,46 @@ export class CandidatePipeline {
    */
   private reviewEntry(run: RunRow): Decision<unknown> {
     if (!isProjectlessBootstrap(run) || this.runs.repositoriesOf(run.runId).length > 0) return this.tasks.administrativeReviewEntry(run.runId);
-    const current = currentBootstrapPlan(run.runId, this.artifacts.latest<unknown>(run.runId, ArtifactKind.PLAN));
-    if (!current.allowed) return current;
+    const planArtifact = this.artifacts.latest<unknown>(run.runId, ArtifactKind.PLAN);
+    const current = currentBootstrapPlan(run.runId, planArtifact);
+    if (!current.allowed || planArtifact === null) return current;
+    const carried = this.bootstrapPlanCarriesCurrentAuthority(run.runId, planArtifact);
+    if (!carried.allowed) return carried;
     return this.tasks.bootstrapReviewEntry(run.runId, current.value.binding.planDigest);
+  }
+
+  /**
+   * Live run_3884d4fc — attached review evidence and admitted CEO decisions reach a bootstrap PLAN
+   * review only as `plan_submit` froze them into the PLAN, and a `plan_submit` under a key an earlier
+   * one used replays that earlier PLAN and freezes nothing. So review entry asks the collectors
+   * `plan_submit` freezes from, and refuses while the run holds an attachment or a decision its current
+   * PLAN lacks: absent from the PLAN is not absent from the run. A run that holds neither is unchanged.
+   */
+  private bootstrapPlanCarriesCurrentAuthority(runId: string, plan: { digest: string; content: unknown }): Decision<void> {
+    const source = { db: this.db, artifacts: this.artifacts, audit: this.audit, runs: this.runs, bindings: this.bindings };
+    let attached: ReturnType<typeof collectBootstrapReviewEvidence>;
+    // An attachment `plan_submit` cannot freeze (one naming a replaced PLAN input) is refused as there.
+    try { attached = collectBootstrapReviewEvidence(source, runId); }
+    catch { return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "attached review evidence cannot be frozen", { runId }); }
+    const content = plan.content as { reviewEvidence?: unknown; bootstrapPlanDigest?: unknown };
+    const evidenceUnfrozen = attached !== null
+      && (content.reviewEvidence === undefined || digestOf(content.reviewEvidence) !== digestOf(attached));
+    // currentBootstrapPlan has already validated the frozen records this reads.
+    const frozen = new Set(frozenBootstrapCeoDecisions(plan.content).map((decision) => decision.digest));
+    const decisionsUnfrozen = collectBootstrapCeoDecisions(this.db, runId).filter((decision) => !frozen.has(decision.digest));
+    if (!evidenceUnfrozen && decisionsUnfrozen.length === 0) return allow(ReasonCode.OK, undefined);
+    return deny(
+      ReasonCode.BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN,
+      "this run's current PLAN does not carry the review evidence attached or the CEO decisions admitted since it was submitted, so nothing was frozen, promoted or reviewed. Call plan_submit again with the same bootstrapPlanDigest and a NEW idempotencyKey (a key an earlier plan_submit used replays that earlier PLAN and freezes nothing), then result_submit with a new idempotencyKey",
+      {
+        runId,
+        refusal: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN",
+        planDigest: plan.digest,
+        bootstrapPlanDigest: typeof content.bootstrapPlanDigest === "string" ? content.bootstrapPlanDigest : null,
+        unfrozenReviewEvidenceAttachment: evidenceUnfrozen ? attached!.source.attachmentDigest : null,
+        unfrozenCeoDecisionEvents: decisionsUnfrozen.map((decision) => decision.source.decisionEventId),
+      },
+    );
   }
 
   /** The run's pinned task contract, read back by its digest. */

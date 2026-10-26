@@ -921,6 +921,13 @@ export const ReasonCode = {
   /** #246 C3 — the repository identity a bootstrap would create is already bound. Nothing is written. */
   IDENTITY_COLLISION: "IDENTITY_COLLISION",
   BOOTSTRAP_CONTRACT_DRIFT: "BOOTSTRAP_CONTRACT_DRIFT",
+  /**
+   * A project-less bootstrap PLAN review was asked for while the run holds review evidence the CEO
+   * attached, or a CEO decision ACP admitted, that the run's current PLAN did not freeze (live
+   * run_3884d4fc: a same-key `plan_submit` replayed the earlier PLAN). Nothing is frozen, promoted or
+   * reviewed; a fresh-key `plan_submit` of the same bootstrapPlanDigest freezes them, then `result_submit`.
+   */
+  BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN",
   BOOTSTRAP_RESULT_OVERCLAIMS_ACTIVATION: "BOOTSTRAP_RESULT_OVERCLAIMS_ACTIVATION",
   HERMES_BOOTSTRAP_ALREADY_INITIALIZED: "HERMES_BOOTSTRAP_ALREADY_INITIALIZED",
   HERMES_BOOTSTRAP_PROOF_INVALID: "HERMES_BOOTSTRAP_PROOF_INVALID",
