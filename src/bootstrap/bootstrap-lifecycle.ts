@@ -389,8 +389,7 @@ export const bootstrapLifecycleSection = (run?: BootstrapPlanTaskProvenance): st
   return [
     "## Control-plane lifecycle after CEO CONFIRM",
     "These are statements about the control plane's code, not about this PLAN, and not a request to pass it. Each",
-    "is kept beside the code named with it and tested against that code. Evaluate them as facts: a gap in them,",
-    "in their enforcement, or in how this plan's outputs meet the contract is a finding.",
+    "is kept beside the code named with it and tested against that code. They are packet facts, not review instructions.",
     ...KIND_HEADINGS.flatMap(([kind, heading]) => [
       "",
       heading,

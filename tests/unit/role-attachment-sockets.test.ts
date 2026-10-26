@@ -1,3 +1,4 @@
+import { frontierReviewPolicy } from "../../src/review/frontier-simplify-policy.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
@@ -21,7 +22,7 @@ const valueOf = <T>(decision: Decision<T>): T => {
   return decision.value;
 };
 interface ToolBody { ok: boolean; reasonCode: string }
-interface WireMessage { id?: number; result?: { structuredContent?: ToolBody }; error?: unknown; ok?: boolean }
+interface WireMessage { id?: number; result?: { structuredContent?: ToolBody; instructions?: string }; error?: unknown; ok?: boolean }
 
 // These tests require real Unix listeners. They are intentionally separate from authorization
 // tests: only this file checks daemon listener composition, connection ownership and close.
@@ -90,7 +91,8 @@ describe("role attachment over real daemon sockets", () => {
       socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
     });
     socket.write(`${JSON.stringify({ token: presentedToken, ...credential })}\n`);
-    await request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] });
+    const initialized = await request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] });
+    expect(initialized.result?.instructions).toBe(frontierReviewPolicy());
     socket.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
     return {
       socket,

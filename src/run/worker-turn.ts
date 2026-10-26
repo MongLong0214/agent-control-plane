@@ -1,3 +1,4 @@
+import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { allow, deny, isAcpError, type Decision, type Evidence } from "../core/errors.ts";
@@ -2646,6 +2647,7 @@ const workerPrompt = (facts: TurnFacts): string =>
     "",
     `Task: ${facts.taskTitle}`,
     `Specification (JSON): ${JSON.stringify(facts.taskSpec)}`,
+    frontierReviewPolicy(),
     "",
     "Rules:",
     `- Change only files under these repository paths: ${facts.claim.ownedPaths.join(", ")}.`,

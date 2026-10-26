@@ -1,3 +1,4 @@
+import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
 import { BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES, collectBootstrapReviewEvidence, reviewEvidenceStageAccess, stageBootstrapReviewEvidence, type ReviewEvidenceStageInput } from "../bootstrap/bootstrap-review-evidence.ts";
 import { collectBootstrapCeoDecisions } from "../bootstrap/bootstrap-ceo-decisions.ts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -416,7 +417,7 @@ const createCtoServerFromPort = (
   authenticate: McpPeerAuthenticator,
   access: CtoMcpAccess = {},
 ): McpServer => {
-  const server = new McpServer({ name: "agent-control-plane-cto", version: "1.3.0" });
+  const server = new McpServer({ name: "agent-control-plane-cto", version: "1.3.0" }, { instructions: frontierReviewPolicy() });
   const peerFor = (toolName: string): Decision<AuthenticatedMcpPeer> => {
     const peer = authenticateMcpPeer(authenticate);
     if (!peer.allowed) return peer;

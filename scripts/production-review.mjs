@@ -14,12 +14,8 @@
  * counts only the reports that manifest attributes. A reviewer that failed, timed out or was
  * interrupted has no verdict, and nothing an earlier run wrote can stand in for it.
  *
- * What it is not. A frontier PR review and this broad, one-off diagnostic serve different purposes:
- * frontier judges one change within its bounded attempts; this reads whole areas of one commit for
- * defects nobody asked about. It is not meant to run on every PR. Running it is not a way around
- * frontier's three-attempt limit and does not count as an additional approving review; its exit
- * status says whether the reviewers ran, its findings verdict says what they found, and neither is
- * a merge approval.
+ * This is a scoped diagnostic of a pinned tree. Its exit status says whether the reviewers ran;
+ * its findings verdict says what they found. Neither is a merge approval.
  *
  * Usage:
  *   node scripts/production-review.mjs                          # every area, at HEAD
@@ -40,6 +36,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { runAudit } from "./lib/audit-run.mjs";
+import { frontierReviewPolicy } from "../src/review/frontier-simplify-policy.ts";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 
@@ -198,53 +195,16 @@ const AREAS = {
   },
 };
 
-const prompt = (key, area, revision) =>
-  [
-    "You are an independent production-readiness reviewer. You did not write this code.",
-    "Your job is to attack it, not to praise it. Report only defects you can point at in the code.",
-    "",
-    `Revision under review: commit ${revision.commit} (tree ${revision.tree}). Your working directory`,
-    "is a disposable checkout of exactly that commit; review it, not any other state of the repository.",
-    "",
-    `# Area under review: ${area.title}`,
-    "",
-    "## Files to review (read them all)",
-    ...area.files.map((f) => `- ${f}`),
-    "",
-    "## Governing specification",
-    "The two PRDs are vendored in this repository and are the only normative input:",
-    "- docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md",
-    "- docs/prd/REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md",
-    "",
-    `Sections that govern this area: ${area.prd}`,
-    "",
-    "## What to look for, in priority order",
-    "1. A hard invariant (CP-HI-01..08) that the code does not actually enforce, or that a",
-    "   plausible sequence of calls can bypass. Name the call sequence.",
-    "2. Correctness or concurrency defects: race conditions, check-then-act windows,",
-    "   transaction boundaries that do not cover what the PRD requires, error paths that",
-    "   silently succeed.",
-    "3. Security: a credential reachable from somewhere it must not be, an isolation claim",
-    "   the code does not deliver, an authentication or replay check that can be skipped.",
-    "4. Evidence integrity: anything that could report a pass without the evidence the PRD",
-    "   demands, or accept stale evidence. CP-HI-08 forbids silent degradation.",
-    "5. PRD non-conformance: behaviour that contradicts a MUST, or a required behaviour",
-    "   that is simply absent.",
-    "6. Over-engineering the PRD forbids: a generic policy DSL, event sourcing, an",
-    "   unnecessary abstraction, an unconsumed field or a future-only feature (§13.3, §30.4,",
-    "   §35.3).",
-    "",
-    "## Rules",
-    "- Ground every finding in a specific file and, where you can, a line.",
-    "- Do not report style preferences, naming, or test coverage gaps as findings.",
-    "- Do not invent problems to appear thorough. An area with no defect should return PASS",
-    "  with an empty findings array.",
-    "- BLOCKER means it must not ship. MAJOR means it will cause a real failure. MINOR is a",
-    "  genuine but bounded defect. INFO is an observation worth recording.",
-    "- If you could not examine something you were asked to, list it in omittedItems.",
-    "",
-    "Return only the JSON object required by the output schema.",
-  ].join("\n");
+const prompt = (key, area, revision) => [
+  frontierReviewPolicy(),
+  "Requirements: docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md; docs/prd/REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md.",
+  `Relevant PRD sections: ${area.prd}`,
+  "The working directory is a disposable checkout of the pinned commit. It has no installed dependencies. This is a read-only review.",
+  `Revision under review: commit ${revision.commit} (tree ${revision.tree}).`,
+  `Area: ${key} — ${area.title}`,
+  `Scope paths: ${area.files.join(", ")}`,
+  "Return only the JSON object required by the output schema. Finding text goes in findings.detail; coverage limitations go in omittedItems. This transport does not authorize a merge.",
+].join("\n\n");
 
 /**
  * The model `codex exec` says it is running, read only from its own configuration header, which

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
 /**
  * The CEO runtime — the process `agentctl bootstrap hermes -- <command>` spawns, and the one
  * that stays.
@@ -246,6 +247,7 @@ const openToolSocket = (path: string, upstream: Socket, clientName: string): { c
             protocolVersion: "2025-11-25",
             capabilities: { tools: {} },
             serverInfo: { name: `${clientName}-tools`, version: "1" },
+            instructions: frontierReviewPolicy(),
           },
         });
         return;
@@ -348,7 +350,9 @@ export const serve = async (session: CeoSession, options: ServeOptions): Promise
       readLines(socket, (value) => {
         if (value["method"] !== "sampling/createMessage") return;
         const id = value["id"];
-        void askReplySource(options.replyCommand, promptFrom(value["params"]), replyTimeoutMs)
+        // The shared method is a standing instruction, including when no tools socket is open.
+        const modelInput = `${frontierReviewPolicy()}\n\n${promptFrom(value["params"])}`;
+        void askReplySource(options.replyCommand, modelInput, replyTimeoutMs)
           .then((text) => {
             line(socket, {
               jsonrpc: "2.0",

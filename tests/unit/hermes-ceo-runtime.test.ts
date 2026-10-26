@@ -1,5 +1,7 @@
+import { frontierReviewPolicy } from "../../src/review/frontier-simplify-policy.ts";
 import { afterAll, describe, expect, it } from "vitest";
 import { createHmac } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 
@@ -143,8 +145,37 @@ describe("the CEO runtime's attachment", () => {
     // would satisfy the protocol and tell the owner something nobody wrote.
     expect(replies[0]).toMatchObject({
       id: 7,
-      result: { role: "assistant", content: { type: "text", text: "은행 잔고는?" } },
+      result: { role: "assistant", content: { type: "text", text: `${frontierReviewPolicy()}\n\n은행 잔고는?` } },
     });
+  });
+
+  it.each([
+    "Inspect PR #1208 and report concrete defects with file:line evidence",
+    "Check the repaired PR #1208 again against the original findings",
+    "Please review PR #1208 for the first time.",
+    "Re-review PR #1208 after the repairs; the earlier findings are attached.",
+    "수정된 PR #1208을 다시 검토해 주세요.",
+  ])("delivers the canonical method to the reply source without a tool socket: %s", async request => {
+    let modelInput = "";
+    const path = await listening(socket => {
+      lines(socket, value => {
+        if (value["method"] === "notifications/initialized") {
+          socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: 9, method: "sampling/createMessage",
+            params: { messages: [{ role: "user", content: { type: "text", text: request } }] },
+          })}\n`);
+        }
+        if (value["id"] === 9) {
+          modelInput = (value as { result: { content: { text: string } } }).result.content.text;
+          socket.end();
+        }
+      });
+    });
+    await serve(SESSION, { mcpSocketPath: path, mcpToken: "t", replyCommand: echoCommand, reattach: false });
+    // The subprocess echoes its exact argv, so this observes the actual model-input boundary.
+    const source = readFileSync(new URL("../../src/review/frontier-simplify.md", import.meta.url), "utf8");
+    expect(modelInput).toBe(`${frontierReviewPolicy()}\n\n${request}`.trim());
+    expect(modelInput).toContain(source);
+    expect(modelInput).not.toMatch(/Automatic attempt|Round 2|PASS WITH NITS/);
   });
 
   it("tells the owner the reply source failed instead of holding the turn open", async () => {
@@ -245,7 +276,7 @@ describe("the tool socket Hermes reaches ACP through", () => {
     runtime.stop();
     await runtime.done;
 
-    expect(replies[0]).toMatchObject({ id: 1, result: { capabilities: { tools: {} } } });
+    expect(replies[0]).toMatchObject({ id: 1, result: { capabilities: { tools: {} }, instructions: frontierReviewPolicy() } });
     // ACP's connection was initialized once, by the runtime. Forwarding Hermes's initialize
     // would put a second handshake on a connection already past it, and the two ends would
     // disagree about which one they are in.

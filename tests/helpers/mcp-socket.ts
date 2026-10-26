@@ -47,7 +47,7 @@ export const callMcpToolOverSocket = (
       ].map((line) => JSON.stringify(line)).join("\n")}\n`));
     socket.on("data", (chunk: string) => {
       buffer += chunk;
-      for (const line of buffer.split("\n")) {
+      for (const line of buffer.split("\n").slice(0, -1)) {
         if (!line.includes('"id":2')) continue;
         clearTimeout(timer);
         socket.end();
@@ -69,7 +69,7 @@ export const callMcpToolOverSocket = (
     // answer that refusal at once rather than waiting out the timer.
     socket.once("close", () => {
       clearTimeout(timer);
-      for (const line of buffer.split("\n")) {
+      for (const line of buffer.split("\n").slice(0, -1)) {
         if (!line.trim()) continue;
         try {
           const refused = JSON.parse(line) as Record<string, unknown>;

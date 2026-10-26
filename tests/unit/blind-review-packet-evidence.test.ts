@@ -120,7 +120,7 @@ describe("frozen candidate packet evidence", () => {
     expect(cut.entryLimit).toBe(2000);
   });
 
-  it("includes canonical control-plane facts and pending later obligations without identities or prior verdicts; same candidate can be re-reviewed", async () => {
+  it("includes canonical control-plane facts and pending later obligations without producer identities; same candidate can be re-reviewed without prior verdicts", async () => {
     const { harness, run, task, worker, submit } = await prepare();
     try {
       harness.scripted.script({ match: /Candidate review/, text: JSON.stringify({ verdict: "REVISE",
@@ -162,7 +162,8 @@ describe("frozen candidate packet evidence", () => {
   it("does not advertise daemon merge obligations when that run kind has no daemon completion gate", async () => {
     const { laterGateSection } = await import("../../src/review/candidate-review-evidence.ts");
     const section = laterGateSection(RunKind.PROJECT_BOOTSTRAP, 1).join("\n");
-    expect(section).toContain("BLOCKER");
+    expect(section).toContain("no daemon finalization completion gate");
+    expect(section).not.toContain("BLOCKER");
     expect(section).not.toContain("candidate-bound CEO CONFIRM");
     expect(section).not.toContain("publish the candidate branch, prepare its PR and merge, then verify CI");
     expect(section).not.toContain("exact merge commit SHA");

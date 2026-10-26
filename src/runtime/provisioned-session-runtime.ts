@@ -1,3 +1,4 @@
+import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
 import { MCP_MUTATION_RECOVERY } from "../core/mcp-recovery.ts";
 import { randomUUID } from "node:crypto";
 
@@ -1089,4 +1090,5 @@ const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[
       : []),
     "A HANDOFF_PACKAGE is accepted with mcp__acp-cto__handoff_ack for its handoffId before it is acknowledged.",
     "When nothing addressed to you remains, reply with a one-line summary of what you did.",
+    frontierReviewPolicy(),
   ].join("\n");

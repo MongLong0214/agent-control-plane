@@ -83,7 +83,7 @@ export const laterGateSection = (runKind: string | null, repositoryCount: number
   if (runKind !== RunKind.STANDARD_WORK && runKind !== RunKind.CONTRACT_CHANGE) {
     // src/run/run-engine.ts:1072-1096 routes PROJECT_BOOTSTRAP completion to bootstrap activation,
     // not daemon finalization. Its separate PLAN lifecycle must not inherit these guarantees.
-    return ["## Later-gate blockers", "BLOCKER: this run kind has no daemon finalization completion gate; repository publish/PR/CI/merge and post-merge verification are not verified-later obligations here.", ""];
+    return ["## Completion path", "This run kind has no daemon finalization completion gate; repository publish/PR/CI/merge and post-merge verification are not verified-later obligations here.", ""];
   }
   return [
     "## Obligations verified by later gates, not by this review",

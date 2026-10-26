@@ -24,12 +24,8 @@
  * counts only the reports that manifest attributes. A reviewer that failed, timed out, stopped
  * early or was interrupted has no verdict, and nothing an earlier run wrote can stand in for it.
  *
- * What it is not. A frontier PR review and this broad, one-off diagnostic serve different purposes:
- * frontier judges one change within its bounded attempts; this reads whole areas of one commit for
- * defects nobody asked about. It is not meant to run on every PR. Running it is not a way around
- * frontier's three-attempt limit and does not count as an additional approving review; its exit
- * status says whether the reviewers ran, its findings verdict says what they found, and neither is
- * a merge approval.
+ * This is a scoped diagnostic of a pinned tree. Its exit status says whether the reviewers ran;
+ * its findings verdict says what they found. Neither is a merge approval.
  *
  * Usage:
  *   node scripts/grok-review.mjs                              # every area, at HEAD
@@ -44,11 +40,12 @@
  * Exit status: 0 every selected area returned a well-formed report, 1 at least one did not,
  * 2 refused before starting, 130 interrupted.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { runAudit } from "./lib/audit-run.mjs";
+import { frontierReviewPolicy } from "../src/review/frontier-simplify-policy.ts";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 
@@ -136,62 +133,20 @@ const AREAS = {
   },
 };
 
-const PRD = join("docs", "prd", "AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md");
-
-const prompt = (key, area, revision, preamble) => `You are performing an independent, adversarial production-readiness
-review of one area of a repository you did not write. You are the final reviewer before this
-project is made public, and the people who built it are asking you to find what they missed —
-not to confirm what they believe.
-
-Revision under review: commit ${revision.commit} (tree ${revision.tree}). Your working directory
-is a disposable checkout of exactly that commit; review it, not any other state of the repository.
-
-**Area: ${key}** — ${area.focus}
-Relevant PRD sections: ${area.prd}
-Start with: ${area.paths.join(", ")}
-
-The implementation SSOT is \`docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md\` (${preamble} bytes;
-read the sections named above). \`docs/adr/\` holds the decisions the implementation rests on.
-\`docs/ACCEPTANCE.md\` states what the authors claim is met.
-
-What this system is: a single local runtime authority that turns managed project intent into
-verified production-ready results. Its Hard Invariants (PRD §4, CP-HI-01..08) are the whole
-product — a plausible-looking gate that can be bypassed is worse than no gate, because a run
-completes carrying a claim nobody checked.
-
-How to review, in order of what matters:
-
-1. **Attack the invariants in your area.** For each, find the call sequence, interleaving or
-   input that gets past it. Trace it in the code and cite \`file:line\`. A refusal that depends
-   on a caller behaving well is not enforcement.
-2. **Check that the enforcement is where it claims to be.** This codebase says the database
-   enforces §30.2 constraints, that evidence is immutable, that a producer cannot be forged,
-   that a merge lands on a proven base. Verify each claim against the code rather than the
-   comment above it.
-3. **Distrust the tests.** An earlier audit found 26 tests that pass with their enforcement
-   deleted. For any invariant you judge sound, name the test that would fail if it regressed —
-   and if that test would still pass with the check removed, that is a finding.
-4. **Look for the fail-closed choice that broke the product, and the fail-open one that kept it
-   working.** Both are defects. Several deliberate trade-offs are recorded on GitHub issue #247
-   (\`gh issue view 247\`); disagree with them if the reasoning does not hold.
-5. **Say what you could not establish.** \`omittedItems\` is not a formality: an empty list
-   means you examined everything you were asked to.
-
-Severity: BLOCKER = an invariant is bypassable, or the product cannot perform its function.
-MAJOR = a real defect with a bounded blast radius. MINOR = correctness or clarity. INFO =
-observation. Do not inflate; a BLOCKER you cannot demonstrate with a concrete sequence is a
-MAJOR at most, and say so.
-
-Read the code. Do not run the test suite — this checkout has no installed dependencies, and
-execution evidence comes from the repository's own gates, not from this review. Do not modify any
-file.
-
-Return only the structured JSON the schema describes.`;
+const prompt = (key, area, revision) => [
+  frontierReviewPolicy(),
+  "Requirements: docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md; docs/prd/REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md.",
+  `Relevant PRD sections: ${area.prd}`,
+  "The working directory is a disposable checkout of the pinned commit. It has no installed dependencies. This is a read-only review.",
+  `Revision under review: commit ${revision.commit} (tree ${revision.tree}).`,
+  `Area: ${key} — ${area.focus}`,
+  `Scope paths: ${area.paths.join(", ")}`,
+  "Return only the JSON object required by the output schema. Finding text goes in findings.detail; coverage limitations go in omittedItems. This transport does not authorize a merge.",
+].join("\n\n");
 
 const reviewArea = async (key, area, ctx) => {
-  const preamble = readFileSync(join(ctx.checkoutDir, PRD), "utf8").length;
   const args = [
-    "-p", prompt(key, area, ctx.revision, preamble),
+    "-p", prompt(key, area, ctx.revision),
     "-m", ctx.model,
     "--output-format", "json",
     "--json-schema", JSON.stringify(SCHEMA),

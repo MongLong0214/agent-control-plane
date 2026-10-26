@@ -1,3 +1,4 @@
+import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
 import { attachBootstrapReviewEvidence, reviewEvidenceAttachAccess, reviewEvidenceAttachAuthority, type ReviewEvidenceInput } from "../bootstrap/bootstrap-review-evidence.ts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -347,7 +348,7 @@ const createHermesServerFromPort = (
   authenticate: McpPeerAuthenticator,
   options: HermesServerOptions,
 ): McpServer => {
-  const server = new McpServer({ name: "agent-control-plane-hermes", version: "1.3.0" });
+  const server = new McpServer({ name: "agent-control-plane-hermes", version: "1.3.0" }, { instructions: frontierReviewPolicy() });
   // The adopted-CEO relay forwards this SDK notification unchanged to Hermes's stdio client.
   // connect() precedes initialization; only the client's initialized notification opens this door.
   let toolListAnnounced = false;

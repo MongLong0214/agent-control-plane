@@ -154,6 +154,29 @@ describe("#1189 §3: a verdict other than PASS never reaches CEO-ready", () => {
   }
 });
 
+describe("existing verdict and severity semantics", () => {
+  it("accepts PASS with only MINOR findings without reclassifying the verdict", async () => {
+    const harness = makeHarness();
+    try {
+      const { runId, submit, covered } = await startRun(harness);
+      harness.scripted.script({ match: /Candidate review/,
+        text: verdict("PASS", covered, [{ severity: "MINOR", summary: "NIT-1: nonblocking clarification" }]) });
+      const outcome = await submit();
+      expect(outcome).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+      expect(harness.cp.review.latestPacket(runId, harness.cp.runs.currentCandidate(runId)!)).toMatchObject({
+        verdict: "PASS", findings: [{ severity: "MINOR", detail: "NIT-1: nonblocking clarification" }],
+      });
+      expect(harness.cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+      expect(harness.cp.outbox.listByRun(runId).filter(message => message.kind === MessageKind.REVISION_REQUEST)).toEqual([]);
+      expect(harness.cp.audit.forRun(runId).filter(event => event.kind === "REVISION_RETURNED_TO_CTO")).toEqual([]);
+      const prompt = harness.scripted.invocations.find(call => call.prompt.startsWith("# Candidate review"))!.prompt;
+      expect(prompt).not.toMatch(/Automatic attempt|Round 2|PASS WITH NITS|INCOMPLETE/);
+    } finally {
+      harness.cp.close();
+    }
+  });
+});
+
 describe("#1189 §3: an unavailable review is not a code-fix verdict", () => {
   it("REVIEW_UNAVAILABLE returns nothing to the CTO and is not CEO-ready", async () => {
     const harness = makeHarness();
