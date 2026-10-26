@@ -157,7 +157,14 @@ export const prepareBootstrapRun = async (
     humanGate?: readonly string[];
   },
 ): Promise<PreparedBootstrapRun> => {
-  const harness = makeHarness(options.ownerIdentities === undefined ? {} : { ownerIdentities: options.ownerIdentities });
+  // One configuration for the runner and the stores, as production has: the stores check a stored
+  // checkout against the work root they were constructed with.
+  const workRoot = tempDir("acp-246-runner-");
+  const github = new InitializingGitHub(workRoot);
+  const harness = makeHarness({
+    repoFactory: { workRoot, githubPort: github },
+    ...(options.ownerIdentities === undefined ? {} : { ownerIdentities: options.ownerIdentities }),
+  });
   const contract = options.humanGate === undefined ? CONTRACT : { ...CONTRACT, humanGate: [...options.humanGate] };
   const created = harness.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: ExecutionMode.STANDARD, contract });
   if (!created.allowed) throw new Error(created.message);
@@ -173,8 +180,6 @@ export const prepareBootstrapRun = async (
     : await reviewBootstrapPlan(harness, runId, plannable ? plan : bootstrapPlan(cleanTreeManifest(projectId)), options.attachedPlan);
   const planArtifact = plannable ? { digest: reviewed.planDigest } : harness.cp.artifacts.put(runId, "PLAN", plan);
 
-  const workRoot = tempDir("acp-246-runner-");
-  const github = new InitializingGitHub(workRoot);
   const runner = new RepoFactoryBootstrapRunner({
     runs: harness.cp.runs,
     artifacts: harness.cp.artifacts,

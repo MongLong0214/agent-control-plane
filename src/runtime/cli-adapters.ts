@@ -16,6 +16,7 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import type { Clock } from "../core/clock.ts";
+import { hasCredentialShape } from "../core/credential-shapes.ts";
 import { disposableWorkspaceLocation } from "../core/disposable-workspace-root.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
 import { acpScratchDir } from "../core/scratch-root.ts";
@@ -1788,18 +1789,10 @@ const AUTHORITY_ENV = [
   /CREDENTIAL/i,
 ];
 
-const SECRET_VALUE_SHAPES: readonly RegExp[] = [
-  /^gh[pousr]_[A-Za-z0-9]{16,}$/,
-  /^sk-[A-Za-z0-9_-]{20,}$/,
-  /^nsec1[a-z0-9]{20,}$/,
-  /^xox[baprs]-/,
-  /^eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\./,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-  /^[A-Za-z0-9+/]{60,}={0,2}$/,
-];
-
 const authorityEnvironment = (name: string): boolean => AUTHORITY_ENV.some((pattern) => pattern.test(name));
-const looksLikeCredential = (value: string): boolean => SECRET_VALUE_SHAPES.some((pattern) => pattern.test(value.trim()));
+// The shared list (core/credential-shapes.ts) in its text scope, found anywhere in the value: a
+// superset of the whole-value shapes this filter used to keep as its own copy.
+const looksLikeCredential = (value: string): boolean => hasCredentialShape(value);
 
 /**
  * Constructed, never inherited: an agent CLI receives no daemon authority.

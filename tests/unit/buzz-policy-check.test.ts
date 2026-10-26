@@ -2,7 +2,7 @@ import { cpSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "
 import { join } from "node:path";
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 import { BuzzCliTransport } from "../../src/buzz/buzz-adapter.ts";
-import { sha256Hex } from "../../src/core/digest.ts";
+import { sha256, sha256Hex } from "../../src/core/digest.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { stableFixtureLink } from "../helpers/stable-fixture-executable.ts";
 
@@ -82,8 +82,8 @@ it("ACP1202 runtime binding: a well-formed but different reported digest fails c
   writeFileSync(f.reply, JSON.stringify({ overrides: { policy_digest: reported } }));
   expect(await f.transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).toMatchObject({
     verdict: "undeterminable", policyIdentity: {
-      configured: { file: realpathSync(f.file), digest: sha256Hex(readFileSync(f.file)) },
-      reported: { file: realpathSync(f.file), digest: reported },
+      configured: { pathDigest: sha256(realpathSync(f.file)), digest: sha256Hex(readFileSync(f.file)) },
+      reported: { pathDigest: sha256(realpathSync(f.file)), digest: reported },
     },
   });
 });
@@ -93,11 +93,11 @@ it("ACP1202 runtime binding: compares resolved policy paths without guessing ano
   const f = fixture(); const alias = join(f.file, "..", "policy-alias.json"); symlinkSync(f.file, alias);
   const transport = new BuzzCliTransport(f.binary, null, alias);
   expect(await transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).toMatchObject({
-    verdict: "allowed", policyIdentity: { configured: { file: realpathSync(f.file) }, reported: { file: realpathSync(f.file) } },
+    verdict: "allowed", policyIdentity: { configured: { pathDigest: sha256(realpathSync(f.file)) }, reported: { pathDigest: sha256(realpathSync(f.file)) } },
   });
   writeFileSync(f.reply, JSON.stringify({ overrides: { policy_file: "/another/copy.json" } }));
   expect(await transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).toMatchObject({
-    verdict: "undeterminable", policyIdentity: { configured: { file: realpathSync(f.file) }, reported: { file: "/another/copy.json" } },
+    verdict: "undeterminable", policyIdentity: { configured: { pathDigest: sha256(realpathSync(f.file)) }, reported: { pathDigest: sha256("/another/copy.json") } },
   });
 });
 
@@ -108,7 +108,7 @@ it("ACP1202 runtime binding: checks the sending executable, never a wrapper besi
   cpSync(join(f.file, "..", "buzz-mention-enforce.py"), join(copy, "buzz-mention-enforce.py"));
   const transport = new BuzzCliTransport(f.binary, null, file);
   expect(await transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).toMatchObject({
-    verdict: "undeterminable", policyIdentity: { configured: { file: realpathSync(file) }, reported: { file: realpathSync(f.file) } },
+    verdict: "undeterminable", policyIdentity: { configured: { pathDigest: sha256(realpathSync(file)) }, reported: { pathDigest: sha256(realpathSync(f.file)) } },
   });
   expect(readFileSync(f.log, "utf8").trim().split("\n")).toHaveLength(1);
 });
@@ -119,14 +119,15 @@ it.each(["different file", "different digest"] as const)(
     const alias = join(f.file, "..", "another-alias.json"); symlinkSync(f.file, alias);
     const transport = new BuzzCliTransport(f.binary, null, alias);
     const send = vi.spyOn(transport, "send");
-    const configured = { file: realpathSync(f.file), digest: sha256Hex(readFileSync(f.file)) };
+    const configuredFile = realpathSync(f.file);
+    const configured = { pathDigest: sha256(configuredFile), digest: sha256Hex(readFileSync(f.file)) };
     expect((await transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).verdict).toBe("allowed");
     const copy = join(f.file, "..", "equal-bytes-different-file.json"); writeFileSync(copy, readFileSync(f.file));
-    expect(realpathSync(copy)).not.toBe(configured.file);
+    expect(realpathSync(copy)).not.toBe(configuredFile);
     expect(sha256Hex(readFileSync(copy))).toBe(configured.digest);
-    const reported = difference === "different file"
-      ? { file: realpathSync(copy), digest: configured.digest } : { file: configured.file, digest: "b".repeat(64) };
-    writeFileSync(f.reply, JSON.stringify({ overrides: { policy_file: reported.file, policy_digest: reported.digest } }));
+    const reportedFile = difference === "different file" ? realpathSync(copy) : configuredFile;
+    const reported = { pathDigest: sha256(reportedFile), digest: difference === "different file" ? configured.digest : "b".repeat(64) };
+    writeFileSync(f.reply, JSON.stringify({ overrides: { policy_file: reportedFile, policy_digest: reported.digest } }));
     expect(await transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).toMatchObject({
       verdict: "undeterminable", policyIdentity: { configured, reported },
     });

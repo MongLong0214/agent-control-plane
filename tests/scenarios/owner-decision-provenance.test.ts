@@ -292,11 +292,14 @@ const admittedFor = (w: World, item: string, note: string, candidate: string): O
     candidateSnapshotDigest: candidate,
     operation: "owner_decision_submit",
     parameters: { item, approved: true, note },
-    idempotencyKey: `admitted-for:${digestOf({ item, note, candidate })}`,
+    idempotencyKey: `owner-decision:${digestOf({ item, note, candidate })}`,
     approved: true,
   };
   const admitted = guard.admitOwnerApproval(
-    { channel: "cli", actor: TEST_OWNER.actor, nonce: `admitted-for:${digestOf(approval)}`, payload: ownerApprovalPayload(approval) },
+    // Nonce and idempotency key (above) in the form ACP's own CLI owner path gives them (daemon.ts), so the
+    // stored receipt carries real ACP ids; the credential filter reads any other `<prefix>:sha256:<hex>`
+    // as a long hex run.
+    { channel: "cli", actor: TEST_OWNER.actor, nonce: `owner-decision:${digestOf(approval)}`, payload: ownerApprovalPayload(approval) },
     approval,
   );
   if (!admitted.allowed) throw new Error(admitted.message);

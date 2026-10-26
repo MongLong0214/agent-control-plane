@@ -6,7 +6,8 @@ import { dirname, join, resolve, sep } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { bootstrapActivationHandoff, plannedBootstrapOutputs } from "../../src/bootstrap/bootstrap-plan.ts";
 import { attemptCheckoutPath, repoFactoryGitHubWriteParameters } from "../../src/bootstrap/repo-factory-bootstrap-run.ts";
-import { digestOf } from "../../src/core/digest.ts";
+import { canonicalJson, digestOf } from "../../src/core/digest.ts";
+import { digestArtifactContent } from "../../src/db/artifacts.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { readWithheldIntent, withheldUnsent, writeWithheldRequest } from "../../src/bootstrap/bootstrap-approval-anchor.ts";
 import { createBootstrapGitHubWritePort } from "../../src/bootstrap/bootstrap-write-guard.ts";
@@ -822,7 +823,15 @@ describe("#246 C3 decision (d): the WRITTEN chain is verified at the execution b
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-d-result"));
 
       forgeApplication(f, run, "WRITTEN", 1);
-      f.harness.cp.artifacts.put(run.runId, ArtifactKind.REPO_FACTORY_RESULT, forgedResult(f, run));
+      // The forged result is a raw database writer's row, written past the store as forgeApplication's is:
+      // its checkout is a repository no producer made, which the store itself would not accept.
+      const forged = forgedResult(f, run);
+      f.harness.cp.db.run(
+        `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest, content_json, produced_by, created_at)
+         VALUES (?, ?, ?, ?, NULL, ?, 'service', ?)`,
+        [`art_forged_${run.runId}`, run.runId, ArtifactKind.REPO_FACTORY_RESULT,
+          digestArtifactContent(ArtifactKind.REPO_FACTORY_RESULT, forged, null), canonicalJson(forged), f.harness.clock.nowIso()],
+      );
       const refused = await confirm(f, run);
       // No approval was ever anchored for this execution: refused at the approval, before its result
       // is read (review 1076-R1-02). A real WRITTEN application with an altered result is refused as

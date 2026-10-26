@@ -6,7 +6,7 @@ import { getPublicKey } from "nostr-tools/pure";
 import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
 import type * as Http from "node:http";
 
-import { digestOf, sha256Hex } from "../../src/core/digest.ts";
+import { digestOf, sha256, sha256Hex } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { createConfiguredHermesGatewayDaemonNoticeTarget, startConfiguredCeoNotificationRoute } from "../../src/daemon/agentcpd.ts";
@@ -1520,10 +1520,12 @@ sys.exit(2 if mode=='undeterminable' else 1 if mode=='refused' else 0)
     for (let n = 0; n < 3; n++) await f.h.buzzAdapter.deliverPending();
     expect(send).not.toHaveBeenCalled();
     expect(processingOf(f, id)).toMatchObject({ status: "PENDING", reason_code: mode === "refused" || mode === "undeterminable" ? "BUZZ_LOCAL_SEND_POLICY_REFUSED" : "BUZZ_SEND_POLICY_BINDING_UNVERIFIED", retry_eligible: 0 });
-    const configured = { file: mode === "missing" ? null : realpathSync(policy), digest: mode === "missing" ? null : sha256Hex(readFileSync(policy)) };
-    const reported = { file: mode === "missing" ? null : mode === "mismatched-file" ? "/another/policy" : realpathSync(policy),
+    // A policy file is recorded by the digest of its path, never the path (#1223).
+    const configured = { pathDigest: mode === "missing" ? null : sha256(realpathSync(policy)), digest: mode === "missing" ? null : sha256Hex(readFileSync(policy)) };
+    const reported = { pathDigest: mode === "missing" ? null : sha256(mode === "mismatched-file" ? "/another/policy" : realpathSync(policy)),
       digest: mode === "missing" ? null : mode === "mismatched-digest" ? "b".repeat(64) : configured.digest };
     expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY")).toMatchObject([{ evidence: { messageId: id, policyBinding: { policyIdentity: { configured, reported } } } }]);
+    expect(JSON.stringify(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY"))).not.toMatch(/required-mentions\.json|policy-link\.json|\/another\/policy/);
     if (mode === "refused" || mode === "undeterminable") {
       expect(configured).toEqual(reported); // Matching identities alone never grant permission.
       expect(await check.mock.results[0]!.value).toMatchObject({ verdict: mode, policyDigest: configured.digest });

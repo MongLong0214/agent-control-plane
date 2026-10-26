@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import type { Clock } from "../core/clock.ts";
+import type { AcpLocations } from "../core/credential-shapes.ts";
 import { canonicalJson, digestOf, isDigest } from "../core/digest.ts";
 import { newArtifactId } from "../core/ids.ts";
 import { fail } from "../core/errors.ts";
@@ -11,6 +12,7 @@ import {
   candidateSnapshotSchema,
 } from "../snapshot/candidate-snapshot.ts";
 import { credentialBearingField, prohibitedDurableField } from "./audit.ts";
+import { registryView } from "./registry-view.ts";
 import type { Db, EvidenceWritePort } from "./database.ts";
 import { OWNER_DECISION_LABEL, ownerDecisionShapeSql } from "./migrations.ts";
 
@@ -181,9 +183,11 @@ export const artifactDigestMatches = (
  * that could be edited after the fact is not evidence.
  */
 export class ArtifactStore {
+  /** `locations` are the ones the composition root computed: a verified location is checked against them. */
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
+    private readonly locations: AcpLocations = {},
   ) {}
 
   /**
@@ -345,7 +349,11 @@ export class ArtifactStore {
     // row, and CP-HI-06 makes the stored bytes the authority. So content carrying a
     // credential is *refused* rather than quietly altered — §31.5 is satisfied by
     // refusing to store it at all, and the producer is the one that must not include it.
-    const credential = credentialBearingField(content);
+    // Checked before an identical stored row is looked up, so every write, a repeated one
+    // included, is checked against the store's own configuration and stored facts.
+    const credential = credentialBearingField(content, 0, [], {
+      writer: kind, runId, locations: this.locations, registry: registryView(this.db), record: content,
+    });
     if (credential) {
       fail(
         ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED,

@@ -75,7 +75,8 @@ import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
 import type { TaskContract } from "../run/run-engine.ts";
 import { bootstrapPlanTaskRecorded } from "../run/task-graph.ts";
-import { candidateEvidenceSection, readTrackedTree, type TrackedTreeEvidence } from "./candidate-review-evidence.ts";
+import { candidateEvidenceSection, readExecutionEvidence, readTrackedTree, type TrackedTreeEvidence } from "./candidate-review-evidence.ts";
+import { redactCredentialValues } from "../core/credential-shapes.ts";
 
 export interface ReviewFinding {
   category: ReviewFindingCategory;
@@ -84,7 +85,23 @@ export interface ReviewFinding {
   path: string | null;
   summary: string;
   detail: string;
+  /**
+   * Present only when ACP replaced credential-shaped text in this finding with `[redacted]` before
+   * storing the packet. The verdict is the reviewer's; what the finding no longer shows stays unproven.
+   */
+  redacted?: true;
 }
+
+/**
+ * A reviewer's findings as ACP stores them: every string redacted through the shared credential
+ * shapes (core/credential-shapes.ts), and each finding that lost text marked. The reviewer's own
+ * answer is kept nowhere but as a digest, so this derived copy is the only stored text.
+ */
+const storedFindings = (findings: readonly ReviewFinding[]): ReviewFinding[] =>
+  findings.map((finding) => {
+    const { value, redacted } = redactCredentialValues(finding, { path: ["findings"], store: "artifact" });
+    return redacted ? { ...value, redacted: true } : finding;
+  });
 
 export interface BootstrapReviewContext {
   deployment: BootstrapRuntimeObservation | null;
@@ -515,15 +532,21 @@ export class BlindReviewGate {
       const collected = await this.collectDiffs(request.snapshot);
       if (!collected.allowed) return collected as Decision<ReviewPacket>;
       const { diffs, binaryArtifacts, trees } = collected.value;
+      // E2E-02 — the approved commands with the config files they read, the official output and the
+      // execution -> commit receipts, read after the diffs proved the frozen objects are the candidate.
+      const execution = await readExecutionEvidence(this.db, {
+        runId: request.runId, snapshot: request.snapshot, snapshotDigest, contractDigest: request.contractDigest,
+        verification: request.verification, checkoutOf: (identity) => this.repositories.byIdentity(identity)?.checkoutPath ?? null,
+      });
       // #1166 r3 — the listings get only the room left under the reviewer budget after the other
       // metadata, the chunk envelope and a share for the change itself, so they never crowd out
       // the diff or push the metadata past the budget. A cut is marked in the packet.
-      const bareEvidence = candidateEvidenceSection(this.db, request.runId, trees, 0);
+      const bareEvidence = candidateEvidenceSection(this.db, request.runId, trees, execution, 0);
       const bareOverhead = this.promptOverhead(request, change, bareEvidence);
       // The change's real share of a prompt, repository and file fences included.
       const diffShare = this.buildPrompt(request, diffs, undefined, change, bareEvidence).length + REVIEWER_TRANSPORT_OVERHEAD_CHARS - bareOverhead;
       const evidenceRoom = CHUNK_THRESHOLD_CHARS - 4_096 - Math.min(diffShare, EVIDENCE_DIFF_RESERVE_CHARS) - bareOverhead;
-      const evidenceSection = candidateEvidenceSection(this.db, request.runId, trees, evidenceRoom);
+      const evidenceSection = candidateEvidenceSection(this.db, request.runId, trees, execution, evidenceRoom);
 
       // Measure the complete input, including diff framing and system instructions, and send
       // this same rendered prompt if it fits.
@@ -1587,8 +1610,9 @@ export class BlindReviewGate {
       ...evidenceSection,
       ...(change === null ? [] : contractChangeSection(change)),
       "## Deterministic verification evidence",
+      // Retained output is budgeted and shown under "Untrusted execution evidence", not here.
       "```json",
-      JSON.stringify(request.verification, null, 2),
+      JSON.stringify({ ...request.verification, results: request.verification.results.map(({ output: _output, ...result }) => result) }, null, 2),
       "```",
       "",
       "## Actual diff",
@@ -1839,7 +1863,7 @@ export class BlindReviewGate {
       coveredFiles: [...new Set(input.raw.coveredFiles)],
       omittedItems: [...new Set(input.raw.omittedItems)],
       verdict: input.raw.verdict,
-      findings: input.raw.findings,
+      findings: storedFindings(input.raw.findings),
       chunked: input.chunked,
       ...(input.bootstrapPlan === null ? {} : { bootstrapPlan: input.bootstrapPlan }),
       ...(input.bootstrapPlanIntentDigest === undefined ? {} : { bootstrapPlanIntentDigest: input.bootstrapPlanIntentDigest }),

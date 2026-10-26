@@ -102,6 +102,8 @@ export interface ControlPlaneConfig {
   githubAppPrivateKeyPath?: string;
   /** Neutral, daemon-managed runtime root for CTO/continuity sessions. */
   runtimeRoot?: string;
+  /** The serving daemon's own entrypoint, resolved once at startup; a stored observation of it is checked against it. */
+  servingEntrypoint?: string;
   /**
    * Explicit status-only Hermes receipt transport. Omitted is deliberately dark: reconciliation
    * keeps returning `found: false` until a deployment names this bounded endpoint.
@@ -459,7 +461,11 @@ export class ControlPlane {
     // corrected configuration was refused for the life of the process. Closing the handle here
     // hands back exactly what this attempt took.
     try {
-      this.audit = new AuditLog(this.db, this.clock);
+      // The locations this configuration computes, which a stored location ACP made is checked against.
+      const residentHome = config.residentProvisioner?.home ?? homedir();
+      const locations = { stateRoot: dirname(config.databasePath), residentHome, repoFactoryWorkRoot: config.repoFactory?.workRoot ?? null,
+        servingEntrypoint: config.servingEntrypoint ?? null };
+      this.audit = new AuditLog(this.db, this.clock, locations);
       // A production deployment is dark unless it explicitly supplies a bounded Hermes receipt
       // endpoint: the Gateway's loopback receipt store (U4) or the `hermes acp` status call. The
       // resolvers are closures because this coordinator must claim its singular materialization
@@ -489,7 +495,7 @@ export class ControlPlane {
         this.audit,
         receiptPort,
       );
-      this.artifacts = new ArtifactStore(this.db, this.clock);
+      this.artifacts = new ArtifactStore(this.db, this.clock, locations);
       // Claimed immediately: issuance succeeds once per database, so claiming here is what
       // makes every later claim — by any component that reaches this store — fail.
       this.#evidenceWriters = this.artifacts.issueEvidenceWriters();
@@ -695,11 +701,10 @@ export class ControlPlane {
       this.watchdog = new Watchdog(this.db, this.clock, this.audit, this.doctor, this.claims, this.outbox);
       this.bootstrapApplications = new BootstrapApplications(this.db, this.clock, this.audit);
       const hostScript = config.residentProvisioner?.script ?? process.env["ACP_HOST_PROJECT_PROVISIONER"];
-      const residentHome = config.residentProvisioner?.home ?? homedir();
       this.hostProjectProvisioner = config.residentProvisioner?.port ?? (hostScript
         ? new ExecFileHostProjectProvisioner(hostScript,residentHome,dirname(config.databasePath),120_000,config.databasePath) : null);
       this.residentProjects = new ResidentProjectProvisioning(this.db,this.clock,
-        this.hostProjectProvisioner,residentHome,dirname(config.databasePath));
+        this.hostProjectProvisioner,residentHome,locations.stateRoot);
       this.bootstrap = new BootstrapActivation(
         this.db, this.clock, this.audit, this.artifacts, this.projects, this.repositories,
         this.runs, this.bindings, this.sessions, this.cto, this.doctor, this.ceo, this.outbox, this.residentProjects, !config.allowTestEvidenceWriters,

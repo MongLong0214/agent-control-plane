@@ -5335,7 +5335,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   // control plane or any listener exists. In that mode the long-poll parser answers null.
   const telegramExternalConfig = configuredTelegramExternalConsumerConfig(config.ownerIdentities ?? []);
   const telegramConfig = configuredTelegramLongPollConfig(config.ownerIdentities ?? []);
-  const cp = new ControlPlane(config);
+  const cp = new ControlPlane({ ...config, servingEntrypoint: realpathSync(fileURLToPath(import.meta.url)) });
   cp.review.attach({ servingRuntimeEventId: recordBootstrapServingRuntime(cp.audit, import.meta.url) });
 
   // A migration that ran did so because someone approved it, and the approval names them.
