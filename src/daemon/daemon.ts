@@ -2677,7 +2677,7 @@ export class Daemon {
     );
     const outcomes: Array<{ runId: string; taskId: string; recorded: boolean; reasonCode: string }> = [];
     if (rows.length === 0) return outcomes;
-    const targets = new TaskWriteTargets({ db, clock: this.cp.clock, audit: this.cp.audit });
+    const targets = new TaskWriteTargets({ db, clock: this.cp.clock, audit: this.cp.audit, predecessorBase: (input) => this.cp.pipeline.predecessorBase(input) });
     for (const row of rows) {
       const key = `${row.task_id}\u0000${row.spec_json}`;
       if (this.#refusedTargets.has(key)) continue;

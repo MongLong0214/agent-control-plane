@@ -595,6 +595,8 @@ export class ControlPlane {
         tasks: this.tasks,
         guard: this.guard,
         workerAdapter: (provider: string) => this.providers.requireForRole(provider, Role.WORKER),
+        // #1242 — a dependent task's base, when its target is first recorded at its run; the pipeline is built below.
+        predecessorBase: (input) => this.pipeline.predecessorBase(input),
       });
       // The shared packet-reviewer predicate, read from the raw reviewer adapter (the registry hands
       // out only wrapped ones): the gate may pass over its preferred reviewer only when this says

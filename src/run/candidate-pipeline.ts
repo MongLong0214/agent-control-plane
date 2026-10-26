@@ -41,18 +41,21 @@ import {
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationEngine, VerificationReport } from "../verify/verification-engine.ts";
 import {
+  BASE_REF_NAMESPACE,
   CANDIDATE_REF_NAMESPACE,
   type SucceededTaskCommit,
   applyCandidateRefPlan,
+  baseRefFor,
   candidateRefFor,
   candidateRefPlan,
+  integratePredecessors,
   integrateTaskResults,
   lostTaskChanges,
   succeededTaskCommits,
 } from "./candidate-integration.ts";
 import type { RunEngine, TaskContract } from "./run-engine.ts";
 import type { TaskGraph } from "./task-graph.ts";
-import { recordedTargetForBranch } from "./task-write-target.ts";
+import { type PredecessorBase, type StartsFrom, recordedTargetForBranch } from "./task-write-target.ts";
 import type { ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 
 const ATTEMPT_LEASE_TTL_MS = 30 * 60 * 1000;
@@ -1157,6 +1160,42 @@ export class CandidatePipeline {
   }
 
   /**
+   * #1242 — the base a task with dependsOn predecessors starts from (`PredecessorBase`): its
+   * predecessors' SUCCEEDED commits in its repository, integrated on the run's pinned base by the
+   * freeze's own integration, kept from gc by a private ref under `BASE_REF_NAMESPACE` written through
+   * the guard before the base is returned. A base that cannot be kept is refused, as one that cannot
+   * be built is.
+   */
+  async predecessorBase(input: Parameters<PredecessorBase>[0]): Promise<Decision<StartsFrom | null>> {
+    const run = this.runs.get(input.runId);
+    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
+    const built = await integratePredecessors({
+      db: this.db,
+      runId: input.runId,
+      taskId: input.taskId,
+      tasks: this.tasks.list(input.runId),
+      predecessors: input.predecessors,
+      repositoryIdentity: input.repositoryIdentity,
+      checkoutPath: input.checkoutPath,
+      baseSha: input.baseSha,
+      worktree: (worktreeInput, use) => this.verification.withRunWorktree(run, worktreeInput, use),
+    });
+    if (!built.allowed || built.value === null) return built;
+    const ref = baseRefFor(input.runId, input.taskId);
+    const plan = await candidateRefPlan(input.checkoutPath, input.runId, { ref, commit: built.value.commit }, ref);
+    if (!plan.allowed) return plan as Decision<never>;
+    if (plan.value.length > 0) {
+      const held = await this.verification.writeRunRefs(
+        run,
+        { repositoryIdentity: input.repositoryIdentity, namespace: `${BASE_REF_NAMESPACE}/${input.runId}` },
+        () => applyCandidateRefPlan(input.checkoutPath, plan.value),
+      );
+      if (!held.allowed) return held as Decision<never>;
+    }
+    return built;
+  }
+
+  /**
    * S6 review — one guarded ref transaction under the run's private candidate namespace
    * (`CANDIDATE_REF_NAMESPACE`): never a branch, never HEAD, never a task's ref (S-TB-02).
    */
@@ -1172,8 +1211,8 @@ export class CandidatePipeline {
   /**
    * CEO (S6-B) — every task's own commit that a valid SUCCEEDED receipt of this run names
    * (`succeededTaskCommits`), checked against the candidate just frozen for its repository. Each
-   * STANDARD_WORK task's work branch is created at the run's pinned base, never stacked on another
-   * task's branch (#512 S-TB), so a candidate that is only the checkout's HEAD can hold one task's
+   * STANDARD_WORK task's work branch is created at the run's pinned base (#512 S-TB), or at its
+   * dependsOn predecessors' integration on it (#1242), so the checkout's HEAD can hold one task's
    * branch alone. The integration (S6-C) places every commit it can; this is its post-condition on
    * the final head, so a commit it did not place (no write target, or an integration that dropped
    * one) refuses the freeze instead of being lost. Not drift in an already-frozen snapshot
