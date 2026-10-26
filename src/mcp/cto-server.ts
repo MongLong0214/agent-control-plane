@@ -272,11 +272,11 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     workScope: () => source.tasks.workScope,
     // #1240 review R6 — the PLAN as `acceptWorkUnitsPlan` would store it, its sequence aside, matched against
     // the run's current PLAN: an identical resend answers that PLAN's tasks and stores nothing.
-    workUnitsReplay: (runId: string, plan: Record<string, unknown>, tasks: Parameters<TaskGraph["submit"]>[1], bootstrapPlanDigest?: string) => {
+    workUnitsReplay: (runId: string, plan: Record<string, unknown>, tasks: Parameters<TaskGraph["submit"]>[1], owner: { sessionId: string; bindingGeneration: number }, bootstrapPlanDigest?: string) => {
       const scope = source.tasks.workScope;
       const admitted = planForSubmission(source.runs.require(runId), plan);
       if (scope === null || !admitted.allowed) return null;
-      return scope.replay(runId, bootstrapPlanDigest ? { ...admitted.value, bootstrapPlanDigest } : admitted.value, tasks);
+      return scope.replay(runId, bootstrapPlanDigest ? { ...admitted.value, bootstrapPlanDigest } : admitted.value, tasks, owner);
     },
     // #1240 — a Repo Factory PLAN that declares work units is accepted all or nothing: the PLAN, its tasks,
     // the cancel of the earlier tasks it names in `supersedesTaskIds` (#1239) and the approval commit in one
@@ -683,7 +683,7 @@ const createCtoServerFromPort = (
       // #1240 — a Repo Factory project's PLAN declares its work units; refused before anything is stored.
       const scope = port.workScope();
       // An identical resend of the current work-unit PLAN is a no-op success with its tasks (review R6).
-      const replayed = scope === null ? null : port.workUnitsReplay(args.runId, plan, tasks, bootstrapPlanDigest);
+      const replayed = scope === null ? null : port.workUnitsReplay(args.runId, plan, tasks, fenced, bootstrapPlanDigest);
       if (scope !== null && replayed !== null) {
         const tracking = await scope.ensure(args.runId);
         return respond(allow(ReasonCode.OK, replayed, {

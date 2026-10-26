@@ -296,24 +296,35 @@ export class WorkScopeTracking {
   }
 
   /**
-   * #1240 review R6 — an identical resend of the run's CURRENT work-unit PLAN (the same content as stored,
-   * its submission sequence aside, and the same tasks), approved by the run's current owner, is a no-op: the
-   * tasks its accepted submission created, and nothing is stored. Only the current PLAN counts, so A, B, A is
-   * still three submissions; after an owner takeover the resend is a normal submission the new owner approves.
+   * #1240 reviews R6/R9 — an identical resend of the run's CURRENT work-unit PLAN (the same content as stored,
+   * its submission sequence aside, and the same tasks) always answers the tasks its accepted submission
+   * created, and creates nothing. Only the current PLAN counts, so A, B, A is still three submissions. After
+   * an owner takeover its approval is recorded again for the new owner, over the same PLAN and task mapping.
    */
-  replay(runId: string, stored: Record<string, unknown>, tasks: readonly unknown[]): TaskRecord[] | null {
+  replay(runId: string, stored: Record<string, unknown>, tasks: readonly unknown[], owner: { sessionId: string; bindingGeneration: number }): TaskRecord[] | null {
     const governed = this.#governed(runId);
     if (!governed.allowed || governed.value === null) return null;
     const current = this.ports.artifacts.latest<Record<string, unknown>>(runId, ArtifactKind.PLAN);
     const scope = this.#scope(runId);
     if (current === null || scope === null || scope.tasksDigest === undefined || scope.submittedTaskIds === undefined) return null;
-    // Only an approval its run's current owner made (ACP's own owner check) is reused; any other is approved afresh.
-    if (scope.sessionId === null || !this.ports.runs.assertOwner(runId, scope.sessionId, scope.bindingGeneration).allowed) return null;
     const { submission: _submission, ...content } = current.content;
     if (canonicalJson(content) !== canonicalJson(stored) || scope.tasksDigest !== digestOf(tasks)) return null;
     const byId = new Map(this.ports.tasks.list(runId).map((task) => [task.taskId, task] as const));
     const replayed = scope.submittedTaskIds.map((taskId) => byId.get(taskId));
-    return replayed.every((task) => task !== undefined) ? (replayed as TaskRecord[]) : null;
+    if (!replayed.every((task) => task !== undefined)) return null;
+    // An approval its run's current owner no longer holds (ACP's own owner check) is recorded again for the
+    // caller, who passed the owner fence: the same PLAN and the same task mapping, nothing re-validated.
+    if (scope.sessionId === null || !this.ports.runs.assertOwner(runId, scope.sessionId, scope.bindingGeneration).allowed) {
+      const recorded = this.ports.audit.record({
+        kind: WORK_SCOPE_APPROVED,
+        runId,
+        projectId: this.ports.runs.get(runId)?.projectId ?? null,
+        sessionId: owner.sessionId,
+        evidence: { planDigest: scope.planDigest, bindingGeneration: owner.bindingGeneration, units: scope.units, tasksDigest: scope.tasksDigest, submittedTaskIds: scope.submittedTaskIds },
+      });
+      if (!recorded.allowed) return null;
+    }
+    return replayed as TaskRecord[];
   }
 
   /** After the PLAN and its tasks are stored: the declared mapping, resolved to task ids, and its owner. */

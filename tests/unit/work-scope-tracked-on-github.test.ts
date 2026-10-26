@@ -289,6 +289,24 @@ const governedRun = async (options: { github?: IssuesGitHub; legacy?: typeof LEG
 const planSubmit = (g: Governed, workUnits: unknown, tasks?: unknown[], summary = "work units") =>
   callCtoTool(g.h, g.owner, "plan_submit", { idempotencyKey: `plan-${Math.random()}`, runId: g.runId, plan: { summary, workUnits }, ...(tasks === undefined ? {} : { tasks }) });
 
+/**
+ * Ownership moves to another session the way a takeover moves it: the run is held, its owner's binding
+ * revoked, a replacement bound to the same role and pinned as the run's owner, and the run released.
+ */
+const takeOver = (g: Governed): { sessionId: string; incarnation: string } => {
+  const run = g.h.cp.runs.require(g.runId);
+  const held = g.h.cp.bindings.active(run.ownerRoleKey!)!;
+  expect(g.h.cp.runs.transition(g.runId, RunState.BLOCKED, "test hold").allowed).toBe(true);
+  expect(g.h.cp.bindings.revoke(run.ownerRoleKey!, "test takeover", { allowBlockedRuns: true }).allowed).toBe(true);
+  const other = g.h.cp.sessions.create({ provider: "scripted", model: "scripted-cto" });
+  g.h.cp.sessions.transition(other.sessionId, SessionLifecycle.READY, "the replacement owner");
+  const bound = g.h.cp.bindings.bind({ roleKey: run.ownerRoleKey!, role: held.role, sessionId: other.sessionId, projectId: g.projectId });
+  if (!bound.allowed) throw new Error(bound.message);
+  expect(g.h.cp.runs.reassignOwner(g.runId, bound.value, "a replacement took the run").allowed).toBe(true);
+  expect(g.h.cp.runs.transition(g.runId, RunState.ACTIVE, "test release").allowed).toBe(true);
+  return { sessionId: other.sessionId, incarnation: g.h.cp.sessions.get(other.sessionId)!.incarnation };
+};
+
 /** The CTO's task_worker_provision, as the run's owner calls it over the CTO MCP tools. */
 const provision = (g: Governed, taskId: string) =>
   callCtoTool(g.h, g.owner, "task_worker_provision", { idempotencyKey: `provision-${taskId}-${Math.random()}`, runId: g.runId, taskId, provider: "scripted" });
@@ -1088,30 +1106,42 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     expect(g.h.cp.audit.byKind("STANDARD_WORK_TASKS_SUPERSEDED").filter((row) => row.runId === g.runId)).toHaveLength(1);
   });
 
-  it("review R7 P2: after an owner takeover, an identical resend is approved afresh for the new owner, not replayed on the old approval", async () => {
+  it("review R7 P2: after an owner takeover, an identical units-only resend is approved afresh for the new owner, not kept on the old approval", async () => {
     const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
     const [impl] = g.taskIds as [string];
     const units = [{ key: "feed", tasks: [impl], issue: { new: { title: "Add feed filtering", body: "Filter" } }, milestone: { number: 1 } }];
     g.github.fault = { suffix: "/issues", when: "before", status: 422 };
     expect(tracking(await planSubmit(g, units))).toMatchObject({ tracked: false });
-    // Ownership moves to another session: the run is held, its owner revoked, a replacement bound and pinned.
-    const run = g.h.cp.runs.require(g.runId);
-    const held = g.h.cp.bindings.active(run.ownerRoleKey!)!;
-    expect(g.h.cp.runs.transition(g.runId, RunState.BLOCKED, "test hold").allowed).toBe(true);
-    expect(g.h.cp.bindings.revoke(run.ownerRoleKey!, "test takeover", { allowBlockedRuns: true }).allowed).toBe(true);
-    const other = g.h.cp.sessions.create({ provider: "scripted", model: "scripted-cto" });
-    g.h.cp.sessions.transition(other.sessionId, SessionLifecycle.READY, "the replacement owner");
-    const bound = g.h.cp.bindings.bind({ roleKey: run.ownerRoleKey!, role: held.role, sessionId: other.sessionId, projectId: g.projectId });
-    if (!bound.allowed) throw new Error(bound.message);
-    expect(g.h.cp.runs.reassignOwner(g.runId, bound.value, "a replacement took the run").allowed).toBe(true);
-    expect(g.h.cp.runs.transition(g.runId, RunState.ACTIVE, "test release").allowed).toBe(true);
-    const owner = { sessionId: other.sessionId, incarnation: g.h.cp.sessions.get(other.sessionId)!.incarnation };
+    const plan = g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!.digest;
+    const owner = takeOver(g);
     const resent = await callCtoTool(g.h, owner, "plan_submit", { idempotencyKey: "resent-after-takeover", runId: g.runId, plan: { summary: "work units", workUnits: units } });
     expect(resent["ok"]).toBe(true);
-    expect((resent["evidence"] as { replayed?: boolean }).replayed).toBeUndefined();
     expect(tracking(resent)).toMatchObject({ tracked: true });
     const approval = g.h.cp.audit.byKind("WORK_SCOPE_APPROVED").filter((row) => row.runId === g.runId).at(-1)!;
-    expect(approval.sessionId).toBe(other.sessionId);
+    expect(approval.sessionId).toBe(owner.sessionId);
+    expect((approval.evidence as { planDigest: string }).planDigest).toBe(plan);
+    expect(g.github.issues.filter((i) => i.title === "Add feed filtering")).toHaveLength(1);
+  });
+
+  it("review R9 P2: after an owner takeover, an identical task-creating resend answers the same tasks and is approved for the new owner", async () => {
+    const g = await governedRun({ legacy: [] });
+    const units = [{ key: "feed", tasks: ["impl"], issue: { new: { title: "Add feed filtering", body: "Filter" } }, milestone: { number: 1 } }];
+    const tasks = [{ key: "impl", title: "Implement the verdict feed", category: "implementation" }];
+    g.github.fault = { suffix: "/issues", when: "before", status: 422 };
+    const first = await planSubmit(g, units, tasks);
+    expect(tracking(first)).toMatchObject({ tracked: false });
+    const created = (first["value"] as Array<{ taskId: string }>).map((t) => t.taskId);
+    const plan = g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!.digest;
+    const owner = takeOver(g);
+    const resent = await callCtoTool(g.h, owner, "plan_submit", { idempotencyKey: "resent-tasks-after-takeover", runId: g.runId, plan: { summary: "work units", workUnits: units }, tasks });
+    expect(resent["ok"]).toBe(true);
+    expect((resent["value"] as Array<{ taskId: string }>).map((t) => t.taskId)).toEqual(created);
+    expect(g.h.cp.tasks.list(g.runId).map((t) => t.taskId)).toEqual(created);
+    expect(g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!.digest).toBe(plan);
+    const approval = g.h.cp.audit.byKind("WORK_SCOPE_APPROVED").filter((row) => row.runId === g.runId).at(-1)!;
+    expect(approval.sessionId).toBe(owner.sessionId);
+    expect(approval.evidence).toMatchObject({ planDigest: plan, submittedTaskIds: created });
+    expect(tracking(resent)).toMatchObject({ tracked: true });
     expect(g.github.issues.filter((i) => i.title === "Add feed filtering")).toHaveLength(1);
   });
 
