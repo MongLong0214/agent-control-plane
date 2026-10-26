@@ -187,6 +187,19 @@ export const ReasonCode = {
   // --- task ----------------------------------------------------------------
   TASK_DEPENDENCY_UNSATISFIED: "TASK_DEPENDENCY_UNSATISFIED",
   TASK_DEPENDENCY_CYCLE: "TASK_DEPENDENCY_CYCLE",
+  /**
+   * #1242 — a task with dependsOn predecessors starts from their SUCCEEDED commits integrated on the
+   * run's pinned base, and one of those predecessors has no commit that can be read: no SUCCEEDED
+   * receipt naming one, no recorded write target, or a commit its repository no longer holds. Its
+   * write target is refused, never recorded at the run's base instead.
+   */
+  TASK_PREDECESSOR_COMMIT_MISSING: "TASK_PREDECESSOR_COMMIT_MISSING",
+  /**
+   * #1242 — two of a task's dependsOn predecessors change one path, or a path and one beneath it, and
+   * neither is built on the other, so no base holding both can be made (freeze's rule, #1236). Its
+   * write target is refused, never recorded at the run's base instead.
+   */
+  TASK_PREDECESSORS_OVERLAP: "TASK_PREDECESSORS_OVERLAP",
   TASK_RECEIPT_MISSING: "TASK_RECEIPT_MISSING",
   TASK_RESULT_COUNT_MISMATCH: "TASK_RESULT_COUNT_MISMATCH",
 

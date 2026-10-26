@@ -241,23 +241,38 @@ describe("a multi-task candidate is every SUCCEEDED task's result on the pinned 
     });
   });
 
-  it("a task is integrated after every task it depends on, even when its task id sorts first", async () => {
+  it("a task is integrated after every task it depends on, even when its task id sorts first; built on it (#1242), it is taken as it is", async () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const dependent = "task_000000000000000000000000";
-      const dependency = "task_ffffffffffffffffffffffff";
-      const s = await standardRun(f, "s6c-order", [README, { ...APP, dependsOn: ["readme"] }], [dependency, dependent]);
-      expect(s.ids).toEqual({ app: dependent, readme: dependency });
+      const dependency = "task_111111111111111111111111";
+      const independent = "task_ffffffffffffffffffffffff";
+      const s = await standardRun(f, "s6c-order", [README, { ...APP, dependsOn: ["readme"] }, NOTES], [dependency, dependent, independent]);
+      expect(s.ids).toEqual({ app: dependent, readme: dependency, notes: independent });
       const worker = workerDoing(f);
       try {
         const readme = await runToSuccess(f, s, worker, dependency, { writes: { "README.md": "# task one\n" } });
         const app = await runToSuccess(f, s, worker, dependent, { writes: { "src/app.js": "module.exports = () => 2;\n" } });
+        // The independent task last, so the checkout's HEAD holds neither of the others and the freeze integrates.
+        const notes = await runToSuccess(f, s, worker, independent, { writes: { "docs/notes.md": "notes\n" } });
+        // #1242 — the dependent started from its dependency's commit, not from the pinned base.
+        expect(gitSync(s.repo, ["rev-parse", `${app.commit}^`])).toBe(readme.commit);
         const frozen = await cp.pipeline.freeze(s.runId);
         if (!frozen.allowed) throw new Error(`${frozen.reasonCode}: ${frozen.message}`);
         const repo = frozen.value.repositories[0]!;
-        // The dependency's commit is the first parent, the dependent's joins it.
-        expect(gitSync(s.repo, ["rev-list", "--parents", "-n", "1", repo.candidateHead]).split(" ").slice(1)).toEqual([readme.commit, app.commit]);
-        expect(repo.integration?.tasks).toEqual([{ taskId: dependency, commit: readme.commit }, { taskId: dependent, commit: app.commit }]);
+        // Order: the dependency, then the dependent although its id sorts first, then the rest.
+        expect(repo.integration?.tasks).toEqual([
+          { taskId: dependency, commit: readme.commit },
+          { taskId: dependent, commit: app.commit },
+          { taskId: independent, commit: notes.commit },
+        ]);
+        // The dependent already holds its dependency, so it is taken as it is (no merge between them,
+        // nothing applied twice); the independent task joins it.
+        expect(gitSync(s.repo, ["rev-list", "--parents", "-n", "1", repo.candidateHead]).split(" ").slice(1)).toEqual([app.commit, notes.commit]);
+        expect(fileAt(s.repo, repo.candidateHead, "README.md")).toBe("# task one");
+        expect(fileAt(s.repo, repo.candidateHead, "src/app.js")).toBe("module.exports = () => 2;");
+        expect(fileAt(s.repo, repo.candidateHead, "docs/notes.md")).toBe("notes");
+        expect(repo.touchedPaths).toEqual(["README.md", "docs/notes.md", "src/app.js"]);
       } finally {
         worker.killAll();
       }

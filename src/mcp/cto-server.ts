@@ -171,7 +171,12 @@ const assertCtoRunPeerFromSource = (
  * a database executor from the daemon (#352).
  */
 export const createCtoMcpPort = (source: CtoMcpSource) => {
-  const writeTargets = new TaskWriteTargets({ db: source.db, clock: source.clock, audit: source.audit });
+  const writeTargets = new TaskWriteTargets({
+    db: source.db,
+    clock: source.clock,
+    audit: source.audit,
+    predecessorBase: (input) => source.pipeline.predecessorBase(input),
+  });
   const port = Object.freeze({
     mutation: createMcpMutationPort(source),
     assertRunPeer: (peer: AuthenticatedMcpPeer, runId: string) => assertCtoRunPeerFromSource(source, peer, runId),
