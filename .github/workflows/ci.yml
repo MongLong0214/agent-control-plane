@@ -90,6 +90,9 @@ jobs:
       # Read-only: the run, job and artifact records of the pull-request run this push merged, and
       # its `ci-executed-*` artifacts, which `gh run download` fetches with this same read scope.
       actions: read
+      # Read-only: GitHub's merged-PR record for the pushed commit (`/commits/{sha}/pulls`), which
+      # the squash's `Merged-Head` trailer is checked against rather than trusted.
+      pull-requests: read
     outputs:
       reuse: ${{ steps.decide.outputs.reuse }}
       run_id: ${{ steps.decide.outputs.run_id }}
@@ -242,8 +245,9 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
-      # This shard's record of what it executes; see the same step in `gates`.
-      - run: node scripts/ci-reuse-verified-tree.mjs --record shard-${{ matrix.shard }}
+      # This shard's record of what it executes, and as which shard of how many; see the same step
+      # in `gates`. The Node version recorded is the one setup-node just put on PATH.
+      - run: node scripts/ci-reuse-verified-tree.mjs --record shard-${{ matrix.shard }} --shards ${{ strategy.job-total }}
       - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         with:
           name: ci-executed-shard-${{ matrix.shard }}

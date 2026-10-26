@@ -34,7 +34,13 @@ type Decision = { reuse: boolean; reason: string; evidence?: Record<string, unkn
 type Download = (runId: number, name: string) => Promise<unknown>;
 const { decideReuse, executionRecord } = reuseModule as {
   decideReuse: (context: Record<string, unknown>, api: (path: string) => Promise<unknown>, download: Download) => Promise<Decision>;
-  executionRecord: (job: string, env: Record<string, string>, rev: (revision: string) => string) => Record<string, string>;
+  executionRecord: (options: {
+    job: string;
+    shards?: number | null;
+    env: Record<string, string>;
+    rev: (revision: string) => string;
+    node?: string;
+  }) => Record<string, unknown>;
 };
 
 const WORKFLOW = readFileSync(join(process.cwd(), ".github", "workflows", "ci.yml"), "utf8");
@@ -85,18 +91,41 @@ const artifacts = (runId: number, head: string, records = RECORDS, over: Record<
   return { total_count: list.length, artifacts: list };
 };
 
-/** What a pull-request job reads from its own checkout of GitHub's merge of `head` onto `base`. */
-const record = (job: string, over: Record<string, unknown> = {}) => ({
-  schema: "acp.ci-executed.v1",
-  job,
-  event: "pull_request",
-  head: MERGE,
-  tree: TREE,
-  base: PARENT,
-  mergedHead: HEAD,
-  workflowBlob: BLOB,
+const NODE = "22.23.2";
+
+/**
+ * What a pull-request job reads from its own checkout of GitHub's merge of `head` onto `base`, and
+ * the conditions it ran under: its Node, and for a shard, which one of how many.
+ */
+const record = (job: string, over: Record<string, unknown> = {}) => {
+  const shard = /^shard-(\d+)$/.exec(job)?.[1];
+  return {
+    schema: "acp.ci-executed.v1",
+    job,
+    event: "pull_request",
+    head: MERGE,
+    tree: TREE,
+    base: PARENT,
+    mergedHead: HEAD,
+    parents: [PARENT, HEAD],
+    workflowBlob: BLOB,
+    node: `v${NODE}`,
+    shard: shard === undefined ? null : Number(shard),
+    shards: shard === undefined ? null : 3,
+    ...over,
+  };
+};
+
+/** GitHub's merged-PR record for the pushed commit: the squash of `HEAD` into `main`, within `REPO`. */
+const pull = (over: Record<string, unknown> = {}) => ({
+  number: 9,
+  merged_at: "2026-10-26T06:57:45Z",
+  merge_commit_sha: PUSHED,
+  head: { sha: HEAD, repo: { full_name: REPO } },
+  base: { ref: "main", repo: { full_name: REPO } },
   ...over,
 });
+const PULLS = `/repos/${REPO}/commits/${PUSHED}/pulls?per_page=100`;
 
 type World = { routes: Map<string, unknown>; records: Map<string, unknown> };
 
@@ -110,6 +139,7 @@ const world = (patch: (world: World) => void = () => {}) => {
     [`/repos/${REPO}/commits/${PUSHED}`, { commit: { tree: { sha: TREE }, message: MESSAGE }, parents: [{ sha: PARENT }] }],
     [`/repos/${REPO}/actions/runs/${PUSH_RUN}`, { head_sha: PUSHED, event: "push", repository: { full_name: REPO }, path: PATH, workflow_id: WORKFLOW_ID }],
     [`/repos/${REPO}/contents/${PATH}?ref=${PUSHED}`, { sha: BLOB }],
+    [PULLS, [pull()]],
     [`/repos/${REPO}/actions/workflows/${WORKFLOW_ID}/runs?event=pull_request&per_page=100`, { workflow_runs: [prRun()] }],
     [`/repos/${REPO}/actions/workflows/${WORKFLOW_ID}/runs?event=pull_request&head_sha=${HEAD}&per_page=100`, { workflow_runs: [prRun()] }],
     [`/repos/${REPO}/commits/${HEAD}`, { commit: { tree: { sha: TREE } } }],
@@ -148,6 +178,8 @@ const context = (over: Record<string, unknown> = {}) => ({
   localHead: PUSHED,
   localTree: TREE,
   localWorkflowBlob: BLOB,
+  branch: "main",
+  expectedNode: NODE,
   ...over,
 });
 
@@ -164,7 +196,7 @@ describe("the reuse decision", () => {
   it("reuses the run on the push's Merged-Head whose every job recorded what the push lands", async () => {
     const { decision } = await decide();
     expect(decision.reuse, decision.reason).toBe(true);
-    expect(decision.evidence).toMatchObject({ runId: PR_RUN, attempt: 1, headSha: HEAD, testedCommit: MERGE, treeSha: TREE, parentSha: PARENT });
+    expect(decision.evidence).toMatchObject({ runId: PR_RUN, attempt: 1, headSha: HEAD, testedCommit: MERGE, treeSha: TREE, parentSha: PARENT, node: `v${NODE}` });
   });
 
   it("never reuses off a push, and asks GitHub nothing there", async () => {
@@ -230,6 +262,56 @@ describe("the reuse decision", () => {
     expect(decision.reuse).toBe(false);
   });
 
+  // The Merged-Head trailer is a claim in a message; GitHub's merged-PR record must say the same.
+
+  it("does not reuse a forged Merged-Head: the PR GitHub says this push merged has another head", async () => {
+    const { decision } = await decide({}, ({ routes }) => routes.set(PULLS, [pull({ head: { sha: SIBLING, repo: { full_name: REPO } } })]));
+    expect(decision.reuse).toBe(false);
+    expect(decision.reason).toContain(`but the Merged-Head says ${HEAD}`);
+  });
+
+  it("does not reuse a pull request from another repository, on either side", async () => {
+    for (const fork of [
+      pull({ head: { sha: HEAD, repo: { full_name: "someone/fork" } } }),
+      pull({ base: { ref: "main", repo: { full_name: "someone/fork" } } }),
+      pull({ head: { sha: HEAD, repo: null } }),
+    ]) {
+      const { decision } = await decide({}, ({ routes }) => routes.set(PULLS, [fork]));
+      expect(decision.reuse, JSON.stringify(fork)).toBe(false);
+    }
+  });
+
+  it("does not reuse a pull request merged into another branch than the one pushed", async () => {
+    const { decision } = await decide({}, ({ routes }) => routes.set(PULLS, [pull({ base: { ref: "release/1", repo: { full_name: REPO } } })]));
+    expect(decision.reuse).toBe(false);
+    expect(decision.reason).toContain("not the pushed branch main");
+  });
+
+  it("does not reuse a push GitHub associates with no pull request", async () => {
+    const { decision } = await decide({}, ({ routes }) => routes.set(PULLS, []));
+    expect(decision.reuse).toBe(false);
+    expect(decision.reason).toContain("associates 0 pull request(s)");
+  });
+
+  it("does not reuse a push GitHub associates with two pull requests", async () => {
+    const { decision } = await decide({}, ({ routes }) => routes.set(PULLS, [pull(), pull({ number: 10 })]));
+    expect(decision.reuse).toBe(false);
+    expect(decision.reason).toContain("associates 2 pull request(s)");
+  });
+
+  it("does not reuse a pull request GitHub does not record as merged, or as merged into this commit", async () => {
+    for (const unmerged of [pull({ merged_at: null }), pull({ merge_commit_sha: OTHER })]) {
+      const { decision } = await decide({}, ({ routes }) => routes.set(PULLS, [unmerged]));
+      expect(decision.reuse, JSON.stringify(unmerged)).toBe(false);
+    }
+  });
+
+  it("does not reuse when the pushed ref is not a branch, or the merged-PR record cannot be read", async () => {
+    expect((await decide({ branch: "" })).decision.reuse).toBe(false);
+    const { decision } = await decide({}, ({ routes }) => routes.set(PULLS, new Error("HTTP 403")));
+    expect(decision.reuse).toBe(false);
+  });
+
   it("does not reuse a head whose newest run failed, even after an older one passed", async () => {
     const { decision } = await decide({}, ({ routes }) => {
       routes.set(`/repos/${REPO}/actions/workflows/${WORKFLOW_ID}/runs?event=pull_request&head_sha=${HEAD}&per_page=100`, {
@@ -253,7 +335,7 @@ describe("the reuse decision", () => {
 
   it("does not reuse a run that was tested against another base than the push's parent", async () => {
     const { decision } = await decide({}, ({ records }) => {
-      for (const job of RECORDS) setRecord(job, { base: OTHER })({ records } as World);
+      for (const job of RECORDS) setRecord(job, { base: OTHER, parents: [OTHER, HEAD] })({ records } as World);
     });
     expect(decision.reuse).toBe(false);
     expect(decision.reason).toContain(`tested on base ${OTHER}`);
@@ -274,9 +356,53 @@ describe("the reuse decision", () => {
     expect(decision.reuse).toBe(false);
   });
 
+  // Execution conditions: a run under another Node or another shard matrix is never reused.
+
+  it("does not reuse a run whose jobs ran on another Node than this workflow's", async () => {
+    const { decision } = await decide({}, (world) => {
+      for (const job of RECORDS) setRecord(job, { node: "v22.18.0" })(world);
+    });
+    expect(decision.reuse).toBe(false);
+    expect(decision.reason).toContain("ran on Node v22.18.0");
+  });
+
+  it("does not reuse when this workflow names no Node version to compare with", async () => {
+    expect((await decide({ expectedNode: "" })).decision.reuse).toBe(false);
+  });
+
+  it("does not reuse a run whose jobs disagree on Node, or whose record names none", async () => {
+    expect((await decide({}, setRecord("shard-2", { node: "v24.18.0" }))).decision.reason).toContain("different node values");
+    expect((await decide({}, setRecord("gates", { node: undefined }))).decision.reuse).toBe(false);
+  });
+
+  it("does not reuse a run whose shards ran under another shard count, or as another shard", async () => {
+    const cases: Array<[string, (world: World) => void]> = [
+      ["every shard recorded 4 shards", (world) => { for (const job of RECORDS.slice(1)) setRecord(job, { shards: 4 })(world); }],
+      ["shard 2 recorded itself as shard 3", setRecord("shard-2", { shard: 3 })],
+      ["the gates recorded a shard", setRecord("gates", { shard: 1, shards: 3 })],
+      ["a shard recorded no count", setRecord("shard-1", { shards: null })],
+    ];
+    for (const [what, patch] of cases) {
+      const { decision } = await decide({}, patch);
+      expect(decision.reuse, what).toBe(false);
+      expect(decision.reason, what).toContain("ran as shard");
+    }
+  });
+
+  it("does not reuse a run whose recorded merge had other parents than [push parent, Merged-Head]", async () => {
+    for (const parents of [[PARENT, HEAD, OTHER], [HEAD, PARENT], [PARENT]]) {
+      const { decision } = await decide({}, (world) => {
+        for (const job of RECORDS) setRecord(job, { parents })(world);
+      });
+      expect(decision.reuse, JSON.stringify(parents)).toBe(false);
+    }
+  });
+
   it("does not reuse a run whose jobs recorded different checkouts", async () => {
     for (const field of ["head", "tree", "base", "mergedHead", "workflowBlob"]) {
-      const { decision } = await decide({}, setRecord("shard-2", { [field]: OTHER }));
+      // A record stays internally consistent: its parents list moves with the parent it names.
+      const parents = field === "base" ? [OTHER, HEAD] : field === "mergedHead" ? [PARENT, OTHER] : [PARENT, HEAD];
+      const { decision } = await decide({}, setRecord("shard-2", { [field]: OTHER, parents }));
       expect(decision.reuse, field).toBe(false);
       expect(decision.reason, field).toContain(`different ${field} values`);
     }
@@ -295,6 +421,7 @@ describe("the reuse decision", () => {
         routes.set(`/repos/${REPO}/actions/runs/${PR_RUN}/artifacts?per_page=100`, { ...listed, total_count: listed.total_count + 1 });
       }],
       ["a record that cannot be downloaded", ({ records }) => records.set(`${PR_RUN}/ci-executed-shard-3`, new Error("HTTP 410"))],
+      ["a record that is not JSON", ({ records }) => records.set(`${PR_RUN}/ci-executed-gates`, new SyntaxError("Unexpected token"))],
       ["a record with an unresolved field", setRecord("gates", { base: "" })],
       ["a record from a push event", setRecord("shard-1", { event: "push" })],
       ["a record of another job", setRecord("shard-1", { job: "shard-2" })],
@@ -322,6 +449,10 @@ describe("the reuse decision", () => {
       ["no verdict job", jobs(PR_RUN, HEAD, JOBS.filter((name) => name !== "verify"))],
       ["a job still running", jobs(PR_RUN, HEAD, JOBS, { verify: { status: "in_progress", conclusion: null } })],
       ["a job from another run", jobs(PR_RUN, HEAD, JOBS, { "verify (shard 1/3)": { run_id: PR_RUN + 5 } })],
+      ["skipped gates", jobs(PR_RUN, HEAD, JOBS, { "verify (gates)": { conclusion: "skipped" } })],
+      ["cancelled gates", jobs(PR_RUN, HEAD, JOBS, { "verify (gates)": { conclusion: "cancelled" } })],
+      ["a cancelled verdict", jobs(PR_RUN, HEAD, JOBS, { verify: { conclusion: "cancelled" } })],
+      ["a skipped test-reuse job", jobs(PR_RUN, HEAD, JOBS, { "test reuse": { conclusion: "skipped" } })],
     ];
     for (const [what, listed] of broken) {
       const { decision } = await decide({}, ({ routes }) => {
@@ -386,7 +517,8 @@ describe("the record a pull-request job writes", () => {
         return "";
       }
     };
-    const written = executionRecord("shard-2", { GITHUB_EVENT_NAME: "pull_request", GITHUB_REPOSITORY: REPO, GITHUB_WORKFLOW_REF: `${REPO}/${PATH}@refs/pull/9/merge` }, rev);
+    const env = { GITHUB_EVENT_NAME: "pull_request", GITHUB_REPOSITORY: REPO, GITHUB_WORKFLOW_REF: `${REPO}/${PATH}@refs/pull/9/merge` };
+    const written = executionRecord({ job: "shard-2", shards: 3, env, rev, node: "v22.23.2" });
     expect(written).toEqual({
       schema: "acp.ci-executed.v1",
       job: "shard-2",
@@ -395,19 +527,24 @@ describe("the record a pull-request job writes", () => {
       tree: git("rev-parse", "HEAD^{tree}"),
       base,
       mergedHead: head,
+      parents: [base, head],
       workflowBlob: git("rev-parse", `HEAD:${PATH}`),
+      node: "v22.23.2",
+      shard: 2,
+      shards: 3,
     });
+    expect(executionRecord({ job: "gates", env, rev, node: "v22.23.2" })).toMatchObject({ shard: null, shards: null, parents: [base, head] });
     expect(written["tree"]).not.toBe(git("rev-parse", "feature^{tree}"));
   });
 });
 
 /** The gate's own `run:` block, lifted from the workflow with its indentation removed. */
 const GATE_STEP = "require the gates and every test shard to have actually succeeded";
-const gateScript = (): string => {
-  const lines = WORKFLOW.split("\n");
+const gateScript = (workflow: string): string => {
+  const lines = workflow.split("\n");
   const step = lines.findIndex((line) => line.includes(GATE_STEP));
   expect(step, `the workflow no longer has a step named "${GATE_STEP}"`).toBeGreaterThan(-1);
-  const runAt = lines.findIndex((line, index) => index > step && line.trim() === "run: |");
+  const runAt = lines.findIndex((line, index) => index > step && /^\s*run:\s*\|[-+]?\s*$/.test(line));
   expect(runAt, "the gate step no longer carries a `run: |` block").toBeGreaterThan(-1);
   const indent = (lines[runAt + 1] ?? "").match(/^\s*/)?.[0] ?? "";
   const body: string[] = [];
@@ -420,16 +557,30 @@ const gateScript = (): string => {
 };
 
 type Needs = { gates: string; shards: string; reuseJob: string; reuse: string; event: string };
-/** Actions substitutes `${{ … }}` before bash sees it, so the test does the same. */
-const runGate = (needs: Needs): number => {
-  const script = gateScript()
-    .replaceAll("${{ needs.gates.result }}", needs.gates)
-    .replaceAll("${{ needs.verify-matrix.result }}", needs.shards)
-    .replaceAll("${{ needs.test-reuse.result }}", needs.reuseJob)
-    .replaceAll("${{ needs.test-reuse.outputs.reuse }}", needs.reuse)
-    .replaceAll("${{ github.event_name }}", needs.event);
-  // An expression this test does not supply would reach bash as literal text and decide nothing.
-  expect(script).not.toContain("${{");
+
+/**
+ * Actions substitutes `${{ … }}` before bash sees it, so the test does the same — by what each
+ * expression names, not by how it is spaced. The gate reads plain context paths, so an expression
+ * is resolved after dropping its whitespace and lowering its case (context names are
+ * case-insensitive in Actions). One this test does not supply fails the test rather than reaching
+ * bash as literal text that decides nothing.
+ */
+const EXPRESSION = /\$\{\{([\s\S]*?)\}\}/g;
+const resolveExpressions = (script: string, values: Record<string, string>): string =>
+  script.replace(EXPRESSION, (whole, inner: string) => {
+    const key = inner.replace(/\s+/g, "").toLowerCase();
+    expect(Object.hasOwn(values, key), `the gate reads ${whole}, which this test does not supply`).toBe(true);
+    return values[key]!;
+  });
+
+const runGate = (needs: Needs, workflow = WORKFLOW): number => {
+  const script = resolveExpressions(gateScript(workflow), {
+    "needs.gates.result": needs.gates,
+    "needs.verify-matrix.result": needs.shards,
+    "needs.test-reuse.result": needs.reuseJob,
+    "needs.test-reuse.outputs.reuse": needs.reuse,
+    "github.event_name": needs.event,
+  });
   try {
     execFileSync("/bin/bash", ["-e", "-c", script], {
       stdio: "pipe",
@@ -472,6 +623,38 @@ describe("the required verify check", () => {
     expect(runGate({ ...reused, reuse: "" })).toBe(1);
     expect(runGate({ ...reused, reuseJob: "failure" })).toBe(1);
     expect(runGate({ ...reused, reuseJob: "cancelled" })).toBe(1);
+  });
+
+  /**
+   * The verdicts above, again, on a copy of the workflow whose gate lines are respaced the way
+   * actionlint and Actions both accept — inside every `${{ }}`, after `if:` and after `run:`. The
+   * gate's text is not its behaviour, so every verdict must come out the same.
+   */
+  it("keeps every verdict when the gate's lines are respaced", () => {
+    let nth = 0;
+    const respaced = WORKFLOW.replace(EXPRESSION, (_whole, inner: string) => {
+      nth += 1;
+      return nth % 2 === 0 ? `\${{${inner.trim()}}}` : `\${{  ${inner.trim()}  }}`;
+    })
+      .replace(/^(\s*)run: \|$/gm, "$1run:   |")
+      .replace(/^(\s*)if: always\(\)$/gm, "$1if:   always()");
+    expect(respaced).not.toBe(WORKFLOW);
+    expect(gateScript(respaced)).not.toBe(gateScript(WORKFLOW));
+    const cases: Array<[Needs, number]> = [
+      ...["pull_request", "push", "schedule"].map((event): [Needs, number] => [{ ...ran, event }, 0]),
+      [reused, 0],
+      ...["failure", "cancelled"].flatMap((shards): Array<[Needs, number]> => [[{ ...ran, shards }, 1], [{ ...reused, shards }, 1]]),
+      ...["failure", "cancelled", "skipped"].flatMap((gates): Array<[Needs, number]> => [[{ ...ran, gates }, 1], [{ ...reused, gates }, 1]]),
+      [{ ...reused, event: "pull_request" }, 1],
+      [{ ...reused, event: "schedule" }, 1],
+      [{ ...reused, reuse: "false" }, 1],
+      [{ ...reused, reuse: "" }, 1],
+      [{ ...reused, reuseJob: "failure" }, 1],
+      [{ ...reused, reuseJob: "cancelled" }, 1],
+    ];
+    for (const [needs, verdict] of cases) {
+      expect(runGate(needs, respaced), JSON.stringify(needs)).toBe(verdict);
+    }
   });
 
   it("names its shard matrix 1..N, so `strategy.job-total` is the shard count", () => {

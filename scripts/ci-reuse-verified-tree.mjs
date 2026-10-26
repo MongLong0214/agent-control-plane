@@ -21,17 +21,23 @@
  *   2. the tree GitHub records for this push equals `git rev-parse HEAD^{tree}` of the checkout,
  *      and the push has exactly one parent;
  *   3. its message names exactly one `Merged-Head: <sha>` (`mergedHeadIn`, the parser the
- *      merge-records gate uses); no line, or more than one, is no reuse;
+ *      merge-records gate uses); no line, or more than one, is no reuse. The trailer is a claim in
+ *      a message, so it is cross-checked against GitHub's own merged-PR record for the pushed commit
+ *      (`/commits/{sha}/pulls`): exactly one pull request, merged, whose merge commit is this push,
+ *      whose head is the `Merged-Head`, whose head and base repository are both this repository,
+ *      and whose base branch is the branch pushed;
  *   4. the newest run of this workflow on that head is a `pull_request` run in this repository from
  *      a head in this repository — never a fork, whose workflow could write its own record — and it
  *      is completed/success, and in its latest attempt every job is completed/success, with exactly
  *      one `verify`, exactly one `verify (gates)` and shard jobs `verify (shard i/N)`, i in 1..N;
  *   5. that run holds exactly one unexpired record artifact per job that executed code —
  *      `ci-executed-gates` and `ci-executed-shard-i` — each written by `--record` from that job's own
- *      checkout, and all of them agree on the commit, tree, base and workflow blob they ran;
- *   6. what they ran is what this push lands: recorded tree == this push's tree, recorded base (the
- *      synthetic merge's first parent) == this push's parent, recorded second parent == the
- *      `Merged-Head`, and recorded workflow blob == this push's `.github/workflows/ci.yml` blob.
+ *      checkout, and all of them agree on the merge commit, its parents, tree and workflow blob, and
+ *      the conditions they ran under: the Node version, and for shards `i` of `N` with every shard
+ *      1..N recorded once and `N` the run's own shard count;
+ *   6. what they ran is what this push lands: recorded tree == this push's tree, recorded parents
+ *      == [this push's parent, the `Merged-Head`] exactly, recorded workflow blob == this push's
+ *      `.github/workflows/ci.yml` blob, and recorded Node == this workflow's `NODE_VERSION`.
  *
  * Fail closed: any API error, missing or expired record, unreadable field, or unmet condition answers
  * `reuse=false` and the full sharded suite runs. The script exits 0 for either answer; if it cannot
@@ -47,7 +53,9 @@
  *   node scripts/ci-reuse-verified-tree.mjs                 decide; reads GITHUB_* and GH_TOKEN,
  *                                                           writes `reuse`, `run_id`, `head_sha`,
  *                                                           `tree_sha`, `reason` to GITHUB_OUTPUT
- *   node scripts/ci-reuse-verified-tree.mjs --record <job>  write this checkout's record to
+ *   node scripts/ci-reuse-verified-tree.mjs --record gates
+ *   node scripts/ci-reuse-verified-tree.mjs --record shard-<i> --shards <N>
+ *                                                           write this checkout's record to
  *                                                           evidence/local/ci-executed.json
  */
 import { execFileSync } from "node:child_process";
@@ -106,8 +114,9 @@ export const jobsProveTheSuite = (jobs, { runId, headSha }) => {
   return { shards: total };
 };
 
-/** The fields a record pins, in the order they are compared. */
+/** The commit fields every record must carry as a full sha, and agree on. */
 const RECORDED = ["head", "tree", "base", "mergedHead", "workflowBlob"];
+const NODE = /^v\d+\.\d+\.\d+$/;
 
 /**
  * `context` holds the runner's own facts; `api(path)` returns GitHub's parsed JSON or throws;
@@ -116,12 +125,14 @@ const RECORDED = ["head", "tree", "base", "mergedHead", "workflowBlob"];
  */
 export const decideReuse = async (context, api, download) => {
   try {
-    const { event, sha, repository, runId, forced, localHead, localTree, workflowPath, localWorkflowBlob } = context;
+    const { event, sha, repository, runId, forced, localHead, localTree, workflowPath, localWorkflowBlob, branch, expectedNode } = context;
     if (event !== "push") refuse(`event is ${event || "unknown"}; only a push may reuse a pull-request result`);
     if (forced !== false) refuse(`the push event does not record forced: false (forced=${String(forced)})`);
     if (!SHA.test(sha ?? "") || localHead !== sha) refuse(`the checkout HEAD ${localHead} is not the pushed commit ${sha}`);
     if (!SHA.test(localTree ?? "")) refuse("the checkout tree could not be read");
-    if (!repository || !workflowPath || !runId) refuse("the runner did not supply the repository, workflow path or run id");
+    if (!repository || !workflowPath || !runId || !branch) refuse("the runner did not supply the repository, branch, workflow path or run id");
+    const node = `v${String(expectedNode ?? "").replace(/^v/, "")}`;
+    if (!NODE.test(node)) refuse(`this workflow names no Node version to compare a record with (${expectedNode})`);
 
     const pushed = await api(`/repos/${repository}/commits/${sha}`);
     const tree = pushed?.commit?.tree?.sha;
@@ -138,6 +149,22 @@ export const decideReuse = async (context, api, download) => {
       refuse(error?.message ?? String(error));
     }
     if (!SHA.test(head)) refuse(`the Merged-Head ${head} is not a full commit sha`);
+
+    // The trailer is text anyone composing the message chose. GitHub's merged-PR record says which
+    // pull request this commit merged, and from which head, base and repositories.
+    const pulls = await api(`/repos/${repository}/commits/${sha}/pulls?per_page=100`);
+    if (!Array.isArray(pulls) || pulls.length !== 1) {
+      refuse(`GitHub associates ${Array.isArray(pulls) ? pulls.length : "no"} pull request(s) with ${sha.slice(0, 12)}; exactly one is required`);
+    }
+    const pull = pulls[0];
+    const named = `#${pull?.number}`;
+    if (!pull?.merged_at) refuse(`${named} is not recorded as merged`);
+    if (pull.merge_commit_sha !== sha) refuse(`${named}'s merge commit is ${pull.merge_commit_sha}, not this push ${sha}`);
+    if (pull.head?.sha !== head) refuse(`${named}'s head is ${pull.head?.sha}, but the Merged-Head says ${head}`);
+    if (pull.head?.repo?.full_name !== repository || pull.base?.repo?.full_name !== repository) {
+      refuse(`${named} runs from ${pull.head?.repo?.full_name} into ${pull.base?.repo?.full_name}, not within ${repository}`);
+    }
+    if (pull.base?.ref !== branch) refuse(`${named} was merged into ${pull.base?.ref}, not the pushed branch ${branch}`);
 
     const self = await api(`/repos/${repository}/actions/runs/${runId}`);
     if (self?.head_sha !== sha || self?.event !== "push" || self?.repository?.full_name !== repository || self?.path !== workflowPath) {
@@ -204,10 +231,20 @@ export const decideReuse = async (context, api, download) => {
       for (const field of RECORDED) {
         if (!SHA.test(record[field] ?? "")) refuse(`record ${name} of run ${newest.id} has no full sha for ${field}`);
       }
+      // Exactly two parents, and they are the two the record names: GitHub's merge of one head.
+      if (JSON.stringify(record.parents) !== JSON.stringify([record.base, record.mergedHead])) {
+        refuse(`record ${name} of run ${newest.id} does not list exactly the parents [base, merged head]`);
+      }
+      if (!NODE.test(record.node ?? "")) refuse(`record ${name} of run ${newest.id} names no Node version`);
+      const shard = /^shard-(\d+)$/.exec(record.job)?.[1];
+      const ranAs = shard === undefined ? [null, null] : [Number(shard), suite.shards];
+      if (record.shard !== ranAs[0] || record.shards !== ranAs[1]) {
+        refuse(`record ${name} of run ${newest.id} ran as shard ${record.shard} of ${record.shards}, not ${ranAs[0]} of ${ranAs[1]}`);
+      }
       records.push(record);
     }
-    for (const field of RECORDED) {
-      const values = new Set(records.map((record) => record[field]));
+    for (const field of [...RECORDED, "parents", "node"]) {
+      const values = new Set(records.map((record) => JSON.stringify(record[field])));
       if (values.size !== 1) refuse(`the jobs of run ${newest.id} executed different ${field} values: ${[...values].join(", ")}`);
     }
     const ran = records[0];
@@ -215,6 +252,7 @@ export const decideReuse = async (context, api, download) => {
     if (ran.base !== base) refuse(`run ${newest.id} tested on base ${ran.base}; this push's parent is ${base}`);
     if (ran.mergedHead !== head) refuse(`run ${newest.id} merged ${ran.mergedHead}, not the Merged-Head ${head}`);
     if (ran.workflowBlob !== pushedBlob) refuse(`run ${newest.id} executed ${workflowPath} ${ran.workflowBlob}; this push has ${pushedBlob}`);
+    if (ran.node !== node) refuse(`run ${newest.id} ran on Node ${ran.node}; this workflow runs ${node}`);
 
     return {
       reuse: true,
@@ -228,6 +266,7 @@ export const decideReuse = async (context, api, download) => {
         parentSha: base,
         workflowBlob: pushedBlob,
         jobs: jobs.map((job) => job.name).sort(),
+        node,
         records: expected,
       },
     };
@@ -293,28 +332,42 @@ const oneLine = (text) => String(text).replace(/[\r\n]+/g, " ").slice(0, 400);
  * the base it was tested against and whose second is the pull request's head. Written before any
  * gate or test runs; a value that does not resolve is written as "" and makes the record unusable.
  */
-export const executionRecord = (job, env = process.env, rev = revParse) => {
+export const executionRecord = ({ job, shards = null, env = process.env, rev = revParse, node = process.version }) => {
   const workflowPath = workflowPathFrom(env.GITHUB_WORKFLOW_REF, env.GITHUB_REPOSITORY ?? "");
+  const parents = [];
+  for (let index = 1; index <= 8; index += 1) {
+    const parent = rev(`HEAD^${index}`);
+    if (parent === "") break;
+    parents.push(parent);
+  }
+  const shard = /^shard-(\d+)$/.exec(job)?.[1];
   return {
     schema: RECORD_SCHEMA,
     job,
     event: env.GITHUB_EVENT_NAME ?? "",
     head: rev("HEAD"),
     tree: rev("HEAD^{tree}"),
-    base: rev("HEAD^1"),
-    mergedHead: rev("HEAD^2"),
+    base: parents[0] ?? "",
+    mergedHead: parents[1] ?? "",
+    parents,
     workflowBlob: workflowPath ? rev(`HEAD:${workflowPath}`) : "",
+    node,
+    shard: shard === undefined ? null : Number(shard),
+    shards: shard === undefined ? null : shards,
   };
 };
 
 export const main = async (argv = process.argv.slice(2), env = process.env, out = (line) => process.stdout.write(`${line}\n`)) => {
   if (argv[0] === "--record") {
     const job = argv[1] ?? "";
-    if (!/^(gates|shard-[1-9]\d*)$/.test(job) || argv.length !== 2) {
-      out("usage: ci-reuse-verified-tree.mjs --record gates|shard-<i>");
+    const gates = job === "gates" && argv.length === 2;
+    const shard = /^shard-([1-9]\d*)$/.exec(job);
+    const shards = argv[2] === "--shards" && /^[1-9]\d*$/.test(argv[3] ?? "") && argv.length === 4 ? Number(argv[3]) : null;
+    if (!gates && !(shard && shards !== null && Number(shard[1]) <= shards)) {
+      out("usage: ci-reuse-verified-tree.mjs --record gates | --record shard-<i> --shards <N>");
       return 2;
     }
-    const record = executionRecord(job, env);
+    const record = executionRecord({ job, shards, env });
     mkdirSync(dirname(RECORD_PATH), { recursive: true });
     writeFileSync(RECORD_PATH, `${JSON.stringify(record)}\n`);
     out(`recorded ${recordArtifact(job)}: ${JSON.stringify(record)}`);
@@ -344,6 +397,9 @@ export const main = async (argv = process.argv.slice(2), env = process.env, out 
     localHead: revParse("HEAD"),
     localTree: revParse("HEAD^{tree}"),
     localWorkflowBlob: workflowPath ? revParse(`HEAD:${workflowPath}`) : "",
+    branch: (env.GITHUB_REF ?? "").startsWith("refs/heads/") ? env.GITHUB_REF.slice("refs/heads/".length) : "",
+    // The workflow-level `env: NODE_VERSION`, which Actions exports to every step of every job.
+    expectedNode: env.NODE_VERSION ?? "",
   };
   const token = env.GH_TOKEN ?? "";
   const api = token ? githubApi(token, env.GITHUB_API_URL || undefined) : async () => refuse("no GH_TOKEN to ask GitHub with");
@@ -353,7 +409,7 @@ export const main = async (argv = process.argv.slice(2), env = process.env, out 
   if (decision.reuse) {
     const e = decision.evidence;
     out(`  matching run ${e.runId} attempt ${e.attempt}, Merged-Head ${e.headSha}, tested merge ${e.testedCommit}`);
-    out(`  tree ${e.treeSha}, base ${e.parentSha}, workflow blob ${e.workflowBlob}`);
+    out(`  tree ${e.treeSha}, base ${e.parentSha}, workflow blob ${e.workflowBlob}, Node ${e.node}`);
     out(`  jobs: ${e.jobs.join(", ")}; records: ${e.records.join(", ")}`);
   }
 
