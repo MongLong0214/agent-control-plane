@@ -528,6 +528,20 @@ it('the resident launcher records only claude\'s exit status for its launch, and
   expect(readdirSync(f.state).filter(name => name.startsWith('resident-test.exit'))).toEqual(['resident-test.exit.json']);
 });
 
+it('an exit record for one session never explains another session of the same project',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');await f.invoke('ensure-resident');
+  writeFileSync(join(f.home,'fail-claude'),'');
+  expect(await launchResident(f)).toBe(23);
+  residentGone(f);
+  expect((await refusal(daemon(f).invoke('observe',f.a))).reason).toEqual({binary:'claude',operation:'observe',kind:'non-zero exit',exitCode:23});
+  // Session B of the same project, before B has launched: A's marker and record are current, but they are A's.
+  f.a.sessionUuid = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';writeFileSync(join(f.home,'allocation.json'),JSON.stringify(f.a));
+  const other = await refusal(daemon(f).invoke('observe',f.a));
+  expect(other.reason ?? null).toBeNull();
+  expect(other.message).toBe('host provisioner observe failed');
+});
+
 it('an exit record from an earlier launch never explains a later one',async () => {
   const f = fixture();
   await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');await f.invoke('ensure-resident');

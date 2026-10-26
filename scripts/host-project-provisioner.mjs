@@ -215,14 +215,15 @@ try {
   const launchMarker = join(state,`launched-${a.projectId}`);
   const exitRecord = join(state,`resident-${a.projectId}.exit.json`);
   // A resident that cannot be observed is explained by claude's recorded exit only when the record names the
-  // current launch; one left by an earlier launch says nothing about this one. A record is never taken for a
-  // running resident: only observeResident reports one.
+  // current launch and that launch was this allocation's session; a record left by an earlier launch or by
+  // another session of the project says nothing about this one. A record is never taken for a running
+  // resident: only observeResident reports one.
   const observeLaunch = () => {
     try {return observeResident();} catch (error) {
       let reason = null;
       try {
-        const {launch} = read(launchMarker); const record = read(exitRecord);
-        if (typeof launch === 'string' && record.launch === launch) reason = hostProvisionerReason('claude',operation,record.exitCode === 0 ? hostReasonKind.exited : hostReasonKind.nonZeroExit,record.exitCode);
+        const {sessionUuid,launch} = read(launchMarker); const record = read(exitRecord);
+        if (sessionUuid === a.sessionUuid && typeof launch === 'string' && record.launch === launch) reason = hostProvisionerReason('claude',operation,record.exitCode === 0 ? hostReasonKind.exited : hostReasonKind.nonZeroExit,record.exitCode);
       } catch { /* No readable record for this launch: the observation's own refusal stands. */ }
       if (!reason) throw error;
       throw new ProvisionerRefusal(formatHostProvisionerReason(reason));
