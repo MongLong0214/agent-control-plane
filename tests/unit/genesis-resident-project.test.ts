@@ -20,6 +20,7 @@ import { retireProject } from '../../src/registry/project-retirement.ts';
 import type { HostOperation, HostProjectProvisioner, ProjectAllocation, HostObservation } from '../../src/runtime/host-project-provisioner.ts';
 import { git } from '../../src/git/git.ts';
 import { Db } from '../../src/db/database.ts';
+import { redact } from '../../src/db/audit.ts';
 import { MIGRATIONS } from '../../src/db/migrations.ts';
 import { makeHarness } from '../helpers/harness.ts';
 import { cleanupTempDirs, tempDir } from '../helpers/fixtures.ts';
@@ -281,7 +282,9 @@ describe('durable resident provisioning and retirement',() => {
 });
 
 it('completes a reviewed genesis bootstrap on its resident claim and same-session ACK, resuming the original CEO CONFIRM',async () => {
-  const root = realpathSync(tempDir('resident-complete-'));const home = join(root,'home');mkdirSync(home);
+  // Exercise the CI runner's long slash-joined base64-shaped path without any credential segment.
+  const root = join(realpathSync(tempDir('resident-complete-')), 'a'.repeat(32), 'b'.repeat(32));
+  const home = join(root,'home');mkdirSync(home,{recursive:true});
   const port = new GenesisGitHub(root);const host = new FakeHost();
   const h = makeHarness({repoFactory:{workRoot:join(root,'factory'),githubPort:port},residentProvisioner:{home,port:host}});
   const doctor = h.cp.doctor.run.bind(h.cp.doctor);
@@ -392,6 +395,10 @@ it('completes a reviewed genesis bootstrap on its resident claim and same-sessio
   // Its own git dir, not the clone's; its origin the repository's own remote, as the clone has it.
   expect((await git(registered.checkoutPath,['rev-parse','--git-common-dir'])).stdout.trim()).toBe('.git');
   expect((await git(registered.checkoutPath,['remote','get-url','origin'])).stdout).toBe((await git(allocation.clonePath,['remote','get-url','origin'])).stdout);
-  expect(h.cp.audit.byKind('REPOSITORY_CHECKOUT_MOVED').map(row => row.evidence)).toEqual([expect.objectContaining({from:allocation.clonePath,to:registered.checkoutPath,branch:null})]);
+  // The raw paths and isolation are checked above; the durable audit stores their privacy projection.
+  // Do not grant this audit writer a location exemption merely to make the assertion pass.
+  const movedPaths = redact({from:allocation.clonePath,to:registered.checkoutPath,branch:null});
+  expect(JSON.stringify(movedPaths)).toContain('[redacted]');
+  expect(h.cp.audit.byKind('REPOSITORY_CHECKOUT_MOVED').map(row => row.evidence)).toEqual([expect.objectContaining(movedPaths as Record<string,unknown>)]);
   probe.mockRestore();h.cp.close();
 });
