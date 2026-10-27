@@ -62,7 +62,9 @@ export const RECEIPT_BYTES_SHA256 =
 export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob?: string }> = [
   {
     path: "src/db/migrations.ts",
-    sha256: "6f2b136bbe4b14e1e067b4f913d00b8647c2ff3332b96e2041ed3b670cc32c3d",
+    // v53 appends verification history and freezes v52's released schema. Replayed lineage and
+    // compiled upgrades still bind the unchanged historical SQL, trace and receipt pins below.
+    sha256: "50126f29329c47520f9f5fd779011c67640eb4b7b0239e8da44fae7fbcb2ef68",
   },
   {
     path: "src/db/schema-v37.sql",
