@@ -41,7 +41,7 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl capacity show                  current provider capacity and admission
   agentctl project register <name> <path> register a project and its primary repository
   agentctl project retire <id> <reason>    retire a project, preserving history
-  agentctl project list                   list projects with derived activity
+  agentctl project list                   list projects with derived activity and CI observations
   agentctl actor register <id> <generation> <expected-set-generation>
   agentctl actor list                     list registered conversational actors
   agentctl actor unregister <id> <generation> <expected-set-generation> <reason>

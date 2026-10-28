@@ -157,6 +157,7 @@ describe("project_get CI section (#1257)", () => {
       observedAt: "2026-08-12T01:00:00.000Z",
       source: { kind: "POST_MERGE_VERIFY_RECEIPT", receiptId, runId },
       approvedDigestAtObservation: WORKFLOW.approvedDigest,
+      workflowPathAtObservation: WORKFLOW.path,
       freshness: "current",
       staleReasons: [],
     });
@@ -231,6 +232,32 @@ describe("project_get CI section (#1257)", () => {
       approvedDigestAtObservation: "sha256:earlier-ci",
       freshness: "stale",
       staleReasons: ["DIGEST_MISMATCH"],
+    });
+  });
+
+  it("does not report an old workflow path as current when check name, digest, and head are reused", async () => {
+    const h = makeHarness();
+    const project = await declaredProject(h);
+    const earlierContract = fixtureManifest(project.projectId, {
+      ciWorkflows: [{ ...DECLARED, path: ".github/workflows/old.yml" }],
+    });
+    const stored = h.cp.projects.storeManifest(earlierContract, h.cp.manifestAuthorizationForTests(earlierContract));
+    if (!stored.allowed) throw new Error(stored.message);
+    const runId = seedObservingRun(h, project.projectId, project.repositoryId, stored.value);
+    recordPostMergeReceipt(h, {
+      runId, identity: project.identity, commitSha: project.head, conclusion: "success", at: "2026-08-12T01:00:00.000Z",
+    });
+
+    const workflow = onlyWorkflow((await projectGet(h, project.projectId)).ci);
+
+    expect(workflow.path).toBe(WORKFLOW.path);
+    expect(workflow.lastObserved).toMatchObject({
+      result: "PASS",
+      commitSha: project.head,
+      approvedDigestAtObservation: WORKFLOW.approvedDigest,
+      workflowPathAtObservation: ".github/workflows/old.yml",
+      freshness: "stale",
+      staleReasons: ["PATH_MISMATCH"],
     });
   });
 });

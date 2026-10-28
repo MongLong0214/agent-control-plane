@@ -15,9 +15,10 @@ export type ProjectCiUndeclaredReason = "NO_ACTIVE_MANIFEST" | "NO_CI_WORKFLOWS"
 /**
  * OLDER_COMMIT: the observation is for a commit other than the repository's recorded head.
  * DIGEST_MISMATCH: the observing run's pinned manifest approved a different digest (or none).
+ * PATH_MISMATCH: the observing run approved this check name at a different workflow path (or none).
  * HEAD_UNOBSERVED: ACP has recorded no head for the repository, so no commit can be shown current.
  */
-export type ProjectCiStaleReason = "OLDER_COMMIT" | "DIGEST_MISMATCH" | "HEAD_UNOBSERVED";
+export type ProjectCiStaleReason = "OLDER_COMMIT" | "DIGEST_MISMATCH" | "PATH_MISMATCH" | "HEAD_UNOBSERVED";
 
 export interface ProjectCiObservation {
   /** PASS only for a recorded `success`; any other recorded conclusion fails, as post-merge verification judges it. */
@@ -28,6 +29,8 @@ export interface ProjectCiObservation {
   source: { kind: "POST_MERGE_VERIFY_RECEIPT"; receiptId: string; runId: string | null };
   /** The digest the observing run's pinned manifest approved for this check; null when it approved none. */
   approvedDigestAtObservation: string | null;
+  /** The workflow path the observing run pinned for this check; null when it cannot be bound uniquely. */
+  workflowPathAtObservation: string | null;
   freshness: "current" | "stale";
   staleReasons: ProjectCiStaleReason[];
 }
@@ -107,15 +110,18 @@ export const projectCi = (
     const at = row.resource_identity.lastIndexOf("@");
     const commitSha = at >= 0 ? row.resource_identity.slice(at + 1) : null;
     const conclusion = typeof row.conclusion === "string" ? row.conclusion : null;
-    const approvedDigestAtObservation = row.run_id === null
+    const approvedWorkflowAtObservation = row.run_id === null
       ? null
-      : pinnedApprovedDigest(db, projects, row.run_id, repository.identity, workflow.checkName);
+      : pinnedApprovedWorkflow(db, projects, row.run_id, repository.identity, workflow.checkName);
+    const approvedDigestAtObservation = approvedWorkflowAtObservation?.approvedDigest ?? null;
+    const workflowPathAtObservation = approvedWorkflowAtObservation?.path ?? null;
     const staleReasons: ProjectCiStaleReason[] = [];
     if (repositoryHead === null) staleReasons.push("HEAD_UNOBSERVED");
     else if (commitSha !== repositoryHead.commitSha) staleReasons.push("OLDER_COMMIT");
     if (workflow.approvedDigest === null || approvedDigestAtObservation !== workflow.approvedDigest) {
       staleReasons.push("DIGEST_MISMATCH");
     }
+    if (workflowPathAtObservation !== workflow.path) staleReasons.push("PATH_MISMATCH");
     return {
       ...declared,
       repositoryIdentity: repository.identity,
@@ -127,6 +133,7 @@ export const projectCi = (
         observedAt: row.created_at,
         source: { kind: "POST_MERGE_VERIFY_RECEIPT", receiptId: row.receipt_id, runId: row.run_id },
         approvedDigestAtObservation,
+        workflowPathAtObservation,
         freshness: staleReasons.length === 0 ? "current" : "stale",
         staleReasons,
       },
@@ -138,16 +145,16 @@ export const projectCi = (
 };
 
 /**
- * The digest the observing run's pinned manifest approved for this check, matched on the role the
- * repository held in that run — the same entry post-merge verification compared the workflow against.
+ * The workflow entry the observing run's pinned manifest approved for this check, matched on the
+ * role the repository held in that run — the same entry post-merge verification compared against.
  */
-const pinnedApprovedDigest = (
+const pinnedApprovedWorkflow = (
   db: Db,
   projects: Pick<ProjectRegistry, "manifest">,
   runId: string,
   repositoryIdentity: string,
   checkName: string,
-): string | null => {
+): { path: string; approvedDigest: string | null } | null => {
   const pinned = db.get<{ pinned_manifest_digest: string | null }>(
     `SELECT pinned_manifest_digest FROM runs WHERE run_id = ?`,
     [runId],
@@ -161,6 +168,10 @@ const pinnedApprovedDigest = (
   if (pinned === null || role === null) return null;
   const manifest = projectManifestSchema.safeParse(projects.manifest(pinned));
   if (!manifest.success) return null;
-  return manifest.data.ciWorkflows.find((entry) => entry.checkName === checkName && entry.repositoryRole === role)
-    ?.approvedDigest ?? null;
+  const matches = manifest.data.ciWorkflows.filter(
+    (entry) => entry.checkName === checkName && entry.repositoryRole === role,
+  );
+  if (matches.length !== 1) return null;
+  const workflow = matches[0]!;
+  return { path: workflow.path, approvedDigest: workflow.approvedDigest };
 };
