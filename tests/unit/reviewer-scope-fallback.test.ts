@@ -11,7 +11,12 @@ import { ArtifactKind, Role, RunState } from "../../src/domain/types.ts";
 import { REVIEWER_FALLBACK_SCOPE_UNCONFIGURED } from "../../src/review/blind-review.ts";
 import { CodexCliAdapter, __testing } from "../../src/runtime/cli-adapters.ts";
 import { ProviderSessionProvisionError, type InvocationRequest, type SessionSpec } from "../../src/runtime/provider.ts";
-import { BOOTSTRAP_REVIEW_RETRY_WAKE, reviewRetryTriggerKind } from "../../src/runtime/provisioned-session-runtime.ts";
+import {
+  BOOTSTRAP_REVIEW_RETRY_WAKE,
+  SESSION_WAKE_TRIGGER_COMPLETED,
+  reviewRetryTriggerId,
+  reviewRetryTriggerKind,
+} from "../../src/runtime/provisioned-session-runtime.ts";
 import { provisionReviewerCodexHome } from "../../src/runtime/reviewer-codex-home.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { bootstrapCoverageKeys } from "../helpers/bootstrap-plan.ts";
@@ -410,7 +415,7 @@ describe("a frozen result whose review was unavailable gets one official retry o
     }, harnessOptions);
   });
 
-  it("a second pass or a restart does not retry the same unavailable review again", async () => {
+  it("an ignored retry fails explicitly and stays terminal after restart", async () => {
     await withBootstrapRuntime(async (f) => {
       claudeReviewer(f, "PASS");
       const { owner, runId, ownerSessionId, candidate } = await liveShape(f, { onRetry: "ignore" });
@@ -427,11 +432,59 @@ describe("a frozen result whose review was unavailable gets one official retry o
       expect(f.finishedTurns(ownerSessionId)).toBe(2);
       expect(owner.results).toHaveLength(1);
       expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, runId)).toHaveLength(1);
-      expect(resultState(f, runId)).toEqual({ state: RunState.ACTIVE, candidate, attempts: ["RELEASED"] });
+      expect(resultState(f, runId)).toEqual({ state: RunState.FAILED, candidate, attempts: ["RELEASED"] });
     }, harnessOptions);
   });
 
-  it("a retry whose own review is unavailable again is not retried in a loop", async () => {
+  it("a restart after durable admission but before the retry turn re-presents the exact trigger", async () => {
+    await withBootstrapRuntime(async (f) => {
+      claudeReviewer(f, "PASS");
+      const { owner, runId, ownerSessionId, roleKey, planDigest, candidate, unavailableEventId } = await liveShape(f);
+      const triggerId = reviewRetryTriggerId(runId, 1, candidate, unavailableEventId);
+      // The prior daemon admitted the wake and persisted its marker, then stopped before its
+      // in-memory lane ran. The replacement runtime therefore knows only this durable record.
+      f.harness.cp.audit.record({
+        kind: BOOTSTRAP_REVIEW_RETRY_WAKE,
+        reasonCode: ReasonCode.OK,
+        runId,
+        sessionId: ownerSessionId,
+        roleKey,
+        evidence: { bindingGeneration: 1, planDigest, candidateSnapshotDigest: candidate, unavailableEventId, triggerId },
+      });
+
+      expect(f.daemon.wakeBootstrapResultRecovery()).toEqual({ woken: [] });
+      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
+      await vi.waitFor(() => expect(owner.results).toHaveLength(2), { timeout: 10_000, interval: 25 });
+      expect(owner.results.at(-1)).toMatchObject({ stage: "COMPLETED_REVIEW" });
+      await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
+      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+      expect(f.harness.cp.audit.byKind(SESSION_WAKE_TRIGGER_COMPLETED)
+        .filter((row) => row.evidence["triggerId"] === triggerId)).toHaveLength(1);
+      expect(auditOf(f, "RUN_TRANSITION", runId).filter((row) => row.evidence["to"] === RunState.FAILED)).toEqual([]);
+    }, harnessOptions);
+  });
+
+  it("a failed retry work turn is released and the same trigger can complete once", async () => {
+    await withBootstrapRuntime(async (f) => {
+      claudeReviewer(f, "PASS");
+      const { owner, runId, ownerSessionId } = await liveShape(f);
+      f.claude.failNextWorkTurns = 1;
+      expect(f.daemon.wakeBootstrapResultRecovery().woken).toHaveLength(1);
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2), { timeout: 10_000, interval: 25 });
+      expect(owner.results).toHaveLength(1);
+      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
+
+      expect(f.daemon.wakeBootstrapResultRecovery()).toEqual({ woken: [] });
+      await vi.waitFor(() => expect(owner.results).toHaveLength(2), { timeout: 10_000, interval: 25 });
+      expect(owner.results.at(-1)).toMatchObject({ stage: "COMPLETED_REVIEW" });
+      await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
+      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+      expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, runId)).toHaveLength(1);
+      expect(auditOf(f, "RUN_TRANSITION", runId).filter((row) => row.evidence["to"] === RunState.FAILED)).toEqual([]);
+    }, harnessOptions);
+  });
+
+  it("a retry whose own review is unavailable again fails instead of looping or waiting", async () => {
     await withBootstrapRuntime(async (f) => {
       const claude = claudeReviewer(f, "NO_ANSWER");
       const { owner, runId, ownerSessionId } = await liveShape(f);
@@ -443,7 +496,7 @@ describe("a frozen result whose review was unavailable gets one official retry o
       expect(auditOf(f, "BLIND_REVIEW_UNAVAILABLE", runId)).toHaveLength(2);
       expect(f.daemon.wakeBootstrapResultRecovery()).toEqual({ woken: [] });
       expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, runId)).toHaveLength(1);
-      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
+      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.FAILED);
     }, harnessOptions);
   });
 });
