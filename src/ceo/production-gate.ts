@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 
 import { deriveHumanGate } from "./human-gate.ts";
+import { admitOwnerDecisionReason } from "./owner-decision-reason.ts";
 import {
   bootstrapPlanIntentTasks,
   bootstrapReviewIntentCurrent,
@@ -175,6 +176,10 @@ export const NotificationKind = {
 } as const;
 export type NotificationKind = (typeof NotificationKind)[keyof typeof NotificationKind];
 
+/** The outbox idempotency key of a CEO notification: its kind, its run and the digest of what identifies it. */
+export const notificationKey = (kind: NotificationKind, runId: string, identity: Record<string, unknown>): string =>
+  `notify:${kind}:${runId}:${digestOf(identity)}`;
+
 /**
  * The operation an owner-decision receipt must name. The ingress router mints receipts per
  * operation, so a receipt admitted for anything else cannot clear a human gate.
@@ -217,6 +222,13 @@ export interface CeoDecisionInput {
   ingress?: CeoDecisionIngress;
   /** The Hermes turn the CEO door admitted this call for, recorded in the decision's audit row. */
   hermesTurn?: HermesAdmittedTurn;
+  /**
+   * #1189 B1 — an OWNER_DECISION_REQUIRED names its owner-only reason (a key of `OWNER_ONLY_REASONS`)
+   * and the specific action that reason blocks; both are recorded with the decision. Ignored for the
+   * other decisions.
+   */
+  ownerReason?: string;
+  blockedAction?: string;
 }
 
 /** #246 B2-b — the grant authority a CONTRACT_CHANGE CONFIRM admits against and issues through. */
@@ -641,6 +653,10 @@ export class ProductionGate {
         : input.decision === "FINAL_REVISE"
           ? RunState.REVISION_REQUIRED
           : RunState.AWAITING_HUMAN;
+    // #1189 B1 — admitted above; what the owner is asked, and why, travels with the decision's records.
+    const ownerDecisionEvidence = input.decision === "OWNER_DECISION_REQUIRED"
+      ? { ownerReason: input.ownerReason?.trim() ?? null, blockedAction: input.blockedAction?.trim() ?? null }
+      : {};
 
     try {
       return this.db.tx(() => {
@@ -692,7 +708,7 @@ export class ProductionGate {
           input.runId,
           target,
           `CEO ${input.decision}`,
-          { candidateSnapshotDigest: input.candidateSnapshotDigest, rationale: input.rationale },
+          { candidateSnapshotDigest: input.candidateSnapshotDigest, rationale: input.rationale, ...ownerDecisionEvidence },
           isBootstrap && input.decision === "CONFIRM"
             ? this.completion.bootstrapActivation
             : undefined,
@@ -756,6 +772,7 @@ export class ProductionGate {
             decision: input.decision,
             candidateSnapshotDigest: input.candidateSnapshotDigest,
             rationale: input.rationale,
+            ...ownerDecisionEvidence,
             // Traceability only; the grant row is what activation reads, never this.
             ...(grantDigest === null ? {} : { manifestActivationGrantDigest: grantDigest }),
             ...(firstActivation ? { manifestActivation: "FIRST" } : {}),
@@ -948,6 +965,14 @@ export class ProductionGate {
     // or blind reviewer.
     const independence = this.bindings.assertFinalCeoIndependence(input.runId, input.ceoSessionId);
     if (!independence.allowed) return independence as Decision<{ isBootstrap: boolean }>;
+
+    // #1189 B1 (CEO ruling 3) — with a human gate or without one, the owner is asked only for an
+    // owner-only reason and the action it blocks; a CEO-scope judgement is refused with the CEO's own
+    // path. A refusal changes nothing: the run stays at review for the CEO's next decision.
+    if (input.decision === "OWNER_DECISION_REQUIRED") {
+      const reason = admitOwnerDecisionReason(input.runId, input);
+      if (!reason.allowed) return reason as Decision<{ isBootstrap: boolean }>;
+    }
 
     // Issue #246 PR-C slice C3 — a bootstrap CONFIRM sets off the Repo Factory GitHub writes, and
     // only the runner's full path performs them: the pre-write checks, the reservation, an attempt
@@ -2068,10 +2093,46 @@ export class ProductionGate {
   }
 
   /**
+   * #1189, CEO ruling 5 — one notification per durable fact. Its idempotency key is the digest of
+   * `identity` rather than of the payload, and it is sent only while no notification with that key
+   * exists in the outbox, in any status: an ACK neither ends nor renews it, and a payload whose facts
+   * moved since does not make a second one. Call it outside a transaction. A notification the outbox
+   * would not take (no CEO holds the role, or its session is not ready) rolls back with its audit row,
+   * so the next pass asks again instead of leaving a record of a notice nobody holds.
+   */
+  notifyOnce(
+    kind: NotificationKind,
+    runId: string,
+    identity: Record<string, unknown>,
+    payload: Record<string, unknown>,
+  ): Decision<{ messageId: string; created: boolean }> {
+    const key = notificationKey(kind, runId, identity);
+    const existing = this.outbox.byIdempotencyKey(key);
+    if (existing) return allow(ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED, { messageId: existing.messageId, created: false });
+    return this.db.txDecision(() => {
+      const notified = this.notify(kind, runId, payload, { identity });
+      if (!notified.allowed) return notified as Decision<{ messageId: string; created: boolean }>;
+      const queued = this.outbox.byIdempotencyKey(key);
+      if (!queued) {
+        return deny(ReasonCode.OUTBOX_TARGET_NOT_CURRENT, "no ready CEO session took the notification", {
+          runId,
+          notification: kind,
+        });
+      }
+      return allow(ReasonCode.OK, { messageId: queued.messageId, created: true });
+    });
+  }
+
+  /**
    * §19.3 — routine worker, test and review churn never reaches Hermes. Only the three
    * documented notification kinds are emitted, and this is the only emitter.
    */
-  notify(kind: NotificationKind, runId: string, payload: Record<string, unknown>): Decision<void> {
+  notify(
+    kind: NotificationKind,
+    runId: string,
+    payload: Record<string, unknown>,
+    options: { identity?: Record<string, unknown> } = {},
+  ): Decision<void> {
     // Audit evidence is intentionally a reviewed, bounded vocabulary. The delivery needs
     // the full explanation, but persisting its unreviewed field name causes AuditLog to
     // replace the whole evidence payload and makes the notification impossible to trace.
@@ -2098,7 +2159,7 @@ export class ProductionGate {
       evidence: auditEvidence,
     });
     this.outbox.enqueue({
-      idempotencyKey: `notify:${kind}:${runId}:${digestOf(payload)}`,
+      idempotencyKey: notificationKey(kind, runId, options.identity ?? payload),
       roleKey: ceo.roleKey,
       bindingGeneration: ceo.bindingGeneration,
       targetSessionId: ceo.sessionId,
