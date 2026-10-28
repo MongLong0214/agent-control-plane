@@ -230,10 +230,10 @@ describe('durable resident provisioning and retirement',() => {
     expect(() => service.remember({...confirmation,candidateSnapshotDigest:'changed'},'resident',{})).toThrow();
     h.cp.close();
   });
-  it.each(['ensure-buzz','observe'] as const)('records only the host\'s own allowlisted reason for a failed %s in the provisioning ledger and result',async failed => {
+  it.each(['ensure-buzz','ensure-resident','observe'] as const)('records only the host\'s own allowlisted reason for a failed %s in the provisioning ledger and result',async failed => {
     const h = makeHarness();const host = new FakeHost();const invoke = host.invoke.bind(host);
-    let failure:Error = new Error('unused');
-    host.invoke = async (op,a) => {if (op === failed) throw failure;return invoke(op,a);};
+    let failure:Error|null = new Error('unused');
+    host.invoke = async (op,a) => {if (op === failed && failure) throw failure;return invoke(op,a);};
     const run = h.cp.runs.create({kind:RunKind.PROJECT_BOOTSTRAP,executionMode:'STANDARD',contract});if (!run.allowed) throw new Error(run.message);
     h.cp.projects.register({projectId:'resident',name:'resident'});
     const service = new ResidentProjectProvisioning(h.cp.db,h.clock,host,join(h.root,'home'),h.root);service.attachSubscriber(async () => false);
@@ -255,6 +255,10 @@ describe('durable resident provisioning and retirement',() => {
       expect(ledger()).toBe('provisioning readback pending or refused');
       expect(fallback.message).toBe('resident provisioning pending or refused; inspect provisioning ledger');
       expect(fallback.reason ?? null).toBeNull();
+    }
+    if (failed === 'ensure-resident') {
+      failure = null;
+      await expect(service.ensure(input)).resolves.toMatchObject({observations:{resident:{sessionUuid:service.allocation(input.runId)?.sessionUuid}}});
     }
     expect(service.row(input.runId)?.status).toBe('PENDING');h.cp.close();
   });

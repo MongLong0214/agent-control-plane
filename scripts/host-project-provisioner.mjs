@@ -214,19 +214,23 @@ try {
   // launcher records claude's exit status under the same id.
   const launchMarker = join(state,`launched-${a.projectId}`);
   const exitRecord = join(state,`resident-${a.projectId}.exit.json`);
+  const recordedLaunchExit = () => {
+    try {
+      const marker = read(launchMarker); const record = read(exitRecord);
+      if (marker.sessionUuid !== a.sessionUuid || typeof marker.launch !== 'string' || record.launch !== marker.launch) return null;
+      const reason = hostProvisionerReason('claude',operation,record.exitCode === 0 ? hostReasonKind.exited : hostReasonKind.nonZeroExit,record.exitCode);
+      return {marker,reason};
+    } catch {return null;}
+  };
   // A resident that cannot be observed is explained by claude's recorded exit only when the record names the
   // current launch and that launch was this allocation's session; a record left by an earlier launch or by
   // another session of the project says nothing about this one. A record is never taken for a running
   // resident: only observeResident reports one.
   const observeLaunch = () => {
     try {return observeResident();} catch (error) {
-      let reason = null;
-      try {
-        const {sessionUuid,launch} = read(launchMarker); const record = read(exitRecord);
-        if (sessionUuid === a.sessionUuid && typeof launch === 'string' && record.launch === launch) reason = hostProvisionerReason('claude',operation,record.exitCode === 0 ? hostReasonKind.exited : hostReasonKind.nonZeroExit,record.exitCode);
-      } catch { /* No readable record for this launch: the observation's own refusal stands. */ }
-      if (!reason) throw error;
-      throw new ProvisionerRefusal(formatHostProvisionerReason(reason));
+      const recorded = recordedLaunchExit();
+      if (!recorded) throw error;
+      throw new ProvisionerRefusal(formatHostProvisionerReason(recorded.reason));
     }
   };
   let result = {};
@@ -359,6 +363,13 @@ try {
       if (!existing) atomic(fleetFile,[...lines,line].join('\n')+'\n');
       let alive = false; try { observeResident(); alive = true; } catch { /* A tmux shell alone is never health. */ }
       if (!alive) {
+        // Surface a completed launch's exact exit once before replacing its identity. The original record
+        // remains intact; the boolean on the same marker lets the following retry perform recovery.
+        const priorExit = recordedLaunchExit();
+        if (priorExit && priorExit.marker.exitReported !== true) {
+          atomic(launchMarker,JSON.stringify({...priorExit.marker,exitReported:true}));
+          throw new ProvisionerRefusal(formatHostProvisionerReason(priorExit.reason));
+        }
         const launch = randomUUID();
         const launcher = join(state,`resident-${a.projectId}.sh`);
         const quote = v => `'${String(v).replaceAll("'", "'\\''")}'`;

@@ -528,6 +528,23 @@ it('the resident launcher records only claude\'s exit status for its launch, and
   expect(readdirSync(f.state).filter(name => name.startsWith('resident-test.exit'))).toEqual(['resident-test.exit.json']);
 });
 
+it('an ensure-resident retry reports the current launch exit before a later retry replaces it',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');await f.invoke('ensure-resident');
+  expect(await launchResident(f)).toBe(2);
+  residentGone(f);
+  const marker = readFileSync(join(f.state,'launched-test'),'utf8');
+
+  const failed = await refusal(daemon(f).invoke('ensure-resident',f.a));
+  expect(failed.reason).toEqual({binary:'claude',operation:'ensure-resident',kind:'non-zero exit',exitCode:2});
+  expect(failed.message).toBe('host provisioner ensure-resident failed: claude in ensure-resident: non-zero exit with exit code 2');
+  expect(JSON.parse(readFileSync(join(f.state,'launched-test'),'utf8'))).toEqual({...JSON.parse(marker),exitReported:true});
+  expect(JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8')).launches).toBe(1);
+
+  expect((await daemon(f).invoke('ensure-resident',f.a)).resident).toMatchObject({sessionUuid:f.a.sessionUuid,bridgeSessionId:'bridge'});
+  expect(JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8')).launches).toBe(2);
+});
+
 it('an exit record for one session never explains another session of the same project',async () => {
   const f = fixture();
   await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');await f.invoke('ensure-resident');
@@ -551,6 +568,8 @@ it('an exit record from an earlier launch never explains a later one',async () =
   expect((await refusal(daemon(f).invoke('observe',f.a))).reason).toEqual({binary:'claude',operation:'observe',kind:'non-zero exit',exitCode:23});
   // Fleet recovery relaunches the dead resident: the first launch's record stays on disk but no longer describes it.
   rmSync(join(f.home,'fail-claude'));
+  expect((await refusal(daemon(f).invoke('ensure-resident',f.a))).reason)
+    .toEqual({binary:'claude',operation:'ensure-resident',kind:'non-zero exit',exitCode:23});
   await f.invoke('ensure-resident');
   expect(JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8')).launches).toBe(2);
   residentGone(f);
