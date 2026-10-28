@@ -959,6 +959,76 @@ describe("#1189 — a wait continuity placed for the CEO is handed back once the
     });
   });
 
+  it("a same-session owner renewal while the CEO is gone does not strand the CEO review wait", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const ready = await reviewReady(f);
+      await loseCeo(f);
+      expect(f.harness.cp.runs.require(ready.runId)).toMatchObject({
+        state: RunState.AWAITING_HUMAN,
+        ownerBindingGeneration: 1,
+      });
+
+      f.harness.clock.advance(6 * 60000);
+      await restart(f, ready);
+      await recover(f, ready);
+      expect(f.harness.cp.runs.require(ready.runId)).toMatchObject({
+        state: RunState.AWAITING_HUMAN,
+        ownerSessionId: ready.ownerSessionId,
+        ownerBindingGeneration: 2,
+      });
+
+      readoptCeo(f);
+      await f.daemon.reconcileContinuity("the CEO re-adopted after the owner renewed");
+      expect(f.harness.cp.runs.require(ready.runId)).toMatchObject({
+        state: RunState.READY_FOR_CEO_REVIEW,
+        ownerSessionId: ready.ownerSessionId,
+        ownerBindingGeneration: 2,
+        continuityHoldRoleKey: null,
+      });
+    });
+  });
+
+  it("an unfinished CEO-loss pause cannot borrow a later reconcile episode", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const ready = await reviewReady(f);
+      f.harness.clock.advance(1_000);
+      const ceo = f.harness.cp.bindings.active(CEO)!;
+      expect(f.harness.cp.sessions.transition(ceo.sessionId, SessionLifecycle.ERROR, "the CEO session stopped").allowed).toBe(true);
+      const failover = vi.spyOn(f.harness.cp.continuity, "failover")
+        .mockResolvedValue(deny(ReasonCode.SESSION_NOT_READY, "the planned CEO session is not ready") as never);
+      try {
+        await interruptedAfterPause(f, "the interrupted CEO-loss pass");
+      } finally {
+        failover.mockRestore();
+      }
+
+      const paused = transitions(f, ready.runId).length;
+      expect(f.harness.cp.bindings.revoke(CEO, CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON, { allowBlockedRuns: true }).allowed)
+        .toBe(true);
+      expect(f.harness.cp.audit.record({
+        kind: "CONTINUITY_RECONCILED",
+        evidence: {
+          reason: "a later pass revoked the CEO",
+          outcome: "PARTIAL_COVERAGE",
+          action: "PAUSE_NEW_WORK",
+          mode: "DEGRADED",
+          reassigned: [],
+          pausedRuns: [],
+          unresolved: [],
+          restoration: { restored: [], deferred: [] },
+          restorationPending: [],
+        },
+      }).allowed).toBe(true);
+      readoptCeo(f);
+      await f.daemon.reconcileContinuity("the CEO re-adopted after the later pass");
+      expect(f.harness.cp.runs.require(ready.runId)).toMatchObject({
+        state: RunState.AWAITING_HUMAN,
+        ownerBindingGeneration: 1,
+      });
+      expect(transitions(f, ready.runId)).toHaveLength(paused);
+    });
+  });
+
   it("the CEO's own OWNER_DECISION_REQUIRED wait is not continuity's: a CEO loss and re-adoption keep it", async () => {
     await withBootstrapRuntime(async (f) => {
       const ready = await reviewReady(f);

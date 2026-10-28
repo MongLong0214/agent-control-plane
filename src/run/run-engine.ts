@@ -1,5 +1,9 @@
 import type { DispatchCapacityTarget } from "../capacity/capacity-monitor.ts";
-import { isContinuityRevocationReason } from "../continuity/continuity-kernel.ts";
+import {
+  CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX,
+  CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON,
+  isContinuityRevocationReason,
+} from "../continuity/continuity-kernel.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
@@ -269,6 +273,19 @@ const isContinuityPauseReason = (reason: unknown): reason is string =>
   (isContinuityRevocationReason(reason) ||
     reason.startsWith(CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX) ||
     reason === CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON);
+
+/** The revocation row paired with each reason `pauseAffectedRuns` records for the same loss. */
+const continuityRevocationReasonForPause = (reason: unknown): string | null => {
+  if (typeof reason !== "string") return null;
+  if (isContinuityRevocationReason(reason)) return reason;
+  if (reason.startsWith(CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX)) {
+    return `${CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX}${reason.slice(CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX.length)}`;
+  }
+  if (reason === CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON) {
+    return CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON;
+  }
+  return null;
+};
 
 /** S-HOLD — a RUN_TRANSITION's evidence is continuity's own pause of an ACTIVE run, for `stateReason`. */
 const isContinuityPause = (evidence: Record<string, unknown> | null, stateReason: string | null): boolean =>
@@ -2160,9 +2177,11 @@ export class RunEngine {
    * - the run's latest RUN_TRANSITION is continuity's pause READY_FOR_CEO_REVIEW → AWAITING_HUMAN
    *   (PAUSE_NEW_WORK, one of continuity's pause reasons) whose `continuityHold` names `held.roleKey`
    *   and the current candidate, and the one before it entered READY_FOR_CEO_REVIEW with that candidate.
-   *   A pause written before `continuityHold` existed names no role and is kept;
-   * - the run's owner pin is exactly the owner the pause recorded (`CONTINUITY_PAUSE_OWNER_FIELDS`), and
-   *   it is still its role's active binding on a READY session: the owner did not move under the wait;
+   *   A pause written before `continuityHold` existed names no role and is kept. Its reconcile pass must
+   *   also have completed its own loss episode; an interrupted pause cannot borrow a later pass;
+   * - the run's owner pin is the same session and incarnation the pause recorded
+   *   (`CONTINUITY_PAUSE_OWNER_FIELDS`), at that generation or a later renewal, and it is still its role's
+   *   active binding on a READY session: the owner did not move under the wait;
    * - `held` is its role's active binding (assignment and generation) on a READY session;
    * - no candidate was promoted or invalidated since the run entered review, no CEO or owner decision was
    *   recorded since the pause, the candidate's PRODUCTION_READY_PACKET is current, and the human gate
@@ -2192,13 +2211,18 @@ export class RunEngine {
     if (candidate === null || review["candidateSnapshotDigest"] !== candidate || paused["candidateSnapshotDigest"] !== candidate) {
       return null;
     }
+    const revocationReason = continuityRevocationReasonForPause(paused["reason"]);
+    if (!revocationReason) return null;
+    const episode = this.#lossEpisode(run, pause.event_id, revocationReason, held.roleKey);
+    if (!episode) return null;
     const pausedOwner = recordedPauseOwner(paused);
-    if (
-      !pausedOwner ||
-      run.ownerSessionId !== pausedOwner.sessionId ||
-      run.ownerSessionIncarnation !== pausedOwner.incarnation ||
-      run.ownerBindingGeneration !== pausedOwner.generation
-    ) {
+    if (!pausedOwner || run.ownerSessionId === null || run.ownerSessionIncarnation === null ||
+        run.ownerBindingGeneration === null || !this.#sameOwner(pausedOwner, {
+          roleKey: run.ownerRoleKey,
+          sessionId: run.ownerSessionId,
+          incarnation: run.ownerSessionIncarnation,
+          generation: run.ownerBindingGeneration,
+        })) {
       return null;
     }
     const owner = this.#activeBindingNow(run.ownerRoleKey);
