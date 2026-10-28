@@ -2405,9 +2405,9 @@ export class Daemon {
    *
    * The same pass also makes the review retry (`#bootstrapReviewRetry`): a result submitted for the
    * current PLAN whose candidate's latest review ended unavailable wakes the owner once per (run,
-   * owner binding generation, candidate) to submit that result again, under the same runtime
+   * candidate) to submit that result again, under the same runtime
    * conditions, marked by a `BOOTSTRAP_REVIEW_RETRY_WAKE` audit event. A failed/refused turn or a
-   * restart after admission re-presents that exact trigger; only its durable
+   * restart or owner-generation recovery after admission re-presents that exact trigger; only its durable
    * `SESSION_WAKE_TRIGGER_COMPLETED` settlement spends the retry. If the review is still unavailable
    * after that completed turn, the run fails explicitly instead of waiting for a person.
    */
@@ -2435,22 +2435,22 @@ export class Daemon {
       const retry = resultStage ? null : this.#bootstrapReviewRetry(runId, owner, planDigest);
       if (!resultStage && retry === null) continue;
       if (retry !== null) {
-        const retryWake = this.cp.db.get<{ trigger_id: unknown }>(
-          `SELECT json_extract(evidence_json, '$.triggerId') AS trigger_id FROM audit_events
+        const retryWake = this.cp.db.get<{ trigger_id: unknown; binding_generation: unknown }>(
+          `SELECT json_extract(evidence_json, '$.triggerId') AS trigger_id,
+                  json_extract(evidence_json, '$.bindingGeneration') AS binding_generation
+             FROM audit_events
             WHERE kind = ? AND run_id = ?
-              AND json_extract(evidence_json, '$.bindingGeneration') = ?
               AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?
             ORDER BY event_id
             LIMIT 1`,
-          [BOOTSTRAP_REVIEW_RETRY_WAKE, runId, owner.bindingGeneration, retry.candidateSnapshotDigest],
+          [BOOTSTRAP_REVIEW_RETRY_WAKE, runId, retry.candidateSnapshotDigest],
         );
         if (typeof retryWake?.trigger_id === "string") {
           const completed = this.cp.db.get<{ n: number }>(
             `SELECT 1 AS n FROM audit_events
-              WHERE kind = ? AND session_id = ?
-                AND json_extract(evidence_json, '$.triggerId') = ?
+              WHERE kind = ? AND json_extract(evidence_json, '$.triggerId') = ?
               LIMIT 1`,
-            [SESSION_WAKE_TRIGGER_COMPLETED, owner.sessionId, retryWake.trigger_id],
+            [SESSION_WAKE_TRIGGER_COMPLETED, retryWake.trigger_id],
           );
           if (completed) {
             // The exact admitted retry turn completed, but the candidate's latest review is still
@@ -2462,6 +2462,7 @@ export class Daemon {
               {
                 failureClass: "BLIND_REVIEW_RETRY_EXHAUSTED",
                 bindingGeneration: owner.bindingGeneration,
+                retryBindingGeneration: retryWake.binding_generation,
                 planDigest,
                 candidateSnapshotDigest: retry.candidateSnapshotDigest,
                 unavailableEventId: retry.unavailableEventId,
