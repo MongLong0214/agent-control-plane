@@ -117,6 +117,17 @@ export class ResidentProjectProvisioning {
       const reason = error instanceof HostOperationFailure ? error.reason : null;
       const detail = reason ? `: ${formatHostProvisionerReason(reason)}` : '';
       this.db.run(`UPDATE resident_project_provisioning SET last_error = ?, updated_at = ? WHERE run_id = ?`,[`provisioning readback pending or refused${detail}`,this.clock.nowIso(),input.runId]);
+      // The ledger commit is the durable consumer acknowledgement. If the host response is lost before
+      // or after its marker write, a later retry either repeats this reason or safely relaunches it; it
+      // can never consume the only copy before the diagnostic is durable here.
+      if (reason?.binary === 'claude' && reason.operation === 'ensure-resident' &&
+        (reason.kind === 'non-zero exit' || reason.kind === 'exited')) {
+        const allocation = this.allocation(input.runId);
+        if (allocation) {
+          try {await this.host!.invoke('acknowledge-resident-exit',allocation,{residentExitReason:reason});}
+          catch { /* A missing ACK deliberately causes the host to repeat the already durable reason. */ }
+        }
+      }
       throw Object.assign(new Error(`resident provisioning pending or refused${detail}; inspect provisioning ledger`),reason ? {reason} : {});
     } finally {this.#running.delete(input.runId);}
   }

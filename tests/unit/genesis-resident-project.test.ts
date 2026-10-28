@@ -169,13 +169,14 @@ class FakeHost implements HostProjectProvisioner {
   actualRoomId:string|null = null;
   allocations:ProjectAllocation[] = [];
   resources = new Set<string>();
-  async invoke(op:HostOperation,a:ProjectAllocation):Promise<HostObservation> {
+  async invoke(op:HostOperation,a:ProjectAllocation,_packet?:unknown):Promise<HostObservation> {
     this.allocations.push({...a});this.resources.add(op+':'+a.sessionUuid);
     if (op === this.fail) {this.fail = null;throw new Error('crash after effect');}
     if (op === 'ensure-checkout') return {checkout:{path:a.clonePath,origin:'https://github.com/acme/fixture.git',head:a.head,repositoryNodeId:a.repositoryNodeId}};
     if (op === 'ensure-buzz') return {buzz:{pubkey:'a'.repeat(64),roomId:this.actualRoomId ?? a.roomId,rosterVerified:true,nonceEventId:'b'.repeat(64),nonceReadable:true}};
     if (op === 'ensure-routing') return {routing:{generation:1,roomId:a.roomId}};
     if (op === 'ensure-resident' || op === 'observe') return {checkout:{path:a.clonePath,origin:'https://github.com/acme/fixture.git',head:a.head,repositoryNodeId:a.repositoryNodeId},resident:{pid:12345,startedAt:'start',cwd:a.clonePath,sessionUuid:a.sessionUuid,tmuxName:a.tmuxName,tmuxAncestry:true,bridgeSessionId:'rc'}};
+    if (op === 'acknowledge-resident-exit') return {};
     return {retired:true};
   }
 }
@@ -261,6 +262,32 @@ describe('durable resident provisioning and retirement',() => {
       await expect(service.ensure(input)).resolves.toMatchObject({observations:{resident:{sessionUuid:service.allocation(input.runId)?.sessionUuid}}});
     }
     expect(service.row(input.runId)?.status).toBe('PENDING');h.cp.close();
+  });
+  it('persists a resident exit before acknowledging it and safely repeats after a lost acknowledgement response',async () => {
+    const h = makeHarness();const host = new FakeHost();const invoke = host.invoke.bind(host);
+    const run = h.cp.runs.create({kind:RunKind.PROJECT_BOOTSTRAP,executionMode:'STANDARD',contract});if (!run.allowed) throw new Error(run.message);
+    h.cp.projects.register({projectId:'resident',name:'resident'});
+    const service = new ResidentProjectProvisioning(h.cp.db,h.clock,host,join(h.root,'home'),h.root);service.attachSubscriber(async () => false);
+    service.remember({runId:run.value.runId,candidateSnapshotDigest:'candidate',ceoSessionId:'ceo'},'resident',{});
+    const input = {runId:run.value.runId,projectId:'resident',repositoryIdentity:'github:acme/fixture',repositoryNodeId:'R_node',head:'f'.repeat(40),packet:{}};
+    const reason = {binary:'claude',operation:'ensure-resident',kind:'non-zero exit',exitCode:23} as const;
+    let reports = 0;let acknowledgements = 0;
+    host.invoke = async (op,a,packet) => {
+      if (op === 'ensure-resident' && reports++ < 2) throw new HostOperationFailure(op,'host project provisioner refused operation: claude in ensure-resident: non-zero exit with exit code 23\n');
+      if (op === 'acknowledge-resident-exit') {
+        acknowledgements++;
+        expect(service.row(input.runId)?.last_error).toBe('provisioning readback pending or refused: claude in ensure-resident: non-zero exit with exit code 23');
+        expect(packet).toEqual({residentExitReason:reason});
+        if (acknowledgements === 1) throw new Error('lost acknowledgement response');
+        return {};
+      }
+      return invoke(op,a,packet);
+    };
+    await expect(service.ensure(input)).rejects.toMatchObject({reason});
+    await expect(service.ensure(input)).rejects.toMatchObject({reason});
+    expect({reports,acknowledgements}).toEqual({reports:2,acknowledgements:2});
+    await expect(service.ensure(input)).resolves.toMatchObject({observations:{resident:{sessionUuid:service.allocation(input.runId)?.sessionUuid}}});
+    h.cp.close();
   });
   it.each(['cwd','uuid','rc','ancestry','missing'] as const)('refuses a stale or missing %s readback even when the process was launched',async wrong => {
     const h = makeHarness();const host = new FakeHost();const invoke = host.invoke.bind(host);

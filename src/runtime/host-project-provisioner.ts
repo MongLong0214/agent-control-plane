@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { CanonicalCeoBuzzRoute } from '../outbox/ceo-buzz-signer.ts';
 import { formatHostProvisionerReason, readHostProvisionerReason, type HostProvisionerReason } from './host-provisioner-reason.ts';
 
-export const hostOperations = ['ensure-checkout', 'ensure-buzz', 'ensure-routing', 'ensure-resident', 'observe', 'retire'] as const;
+export const hostOperations = ['ensure-checkout', 'ensure-buzz', 'ensure-routing', 'ensure-resident', 'acknowledge-resident-exit', 'observe', 'retire'] as const;
 export type HostOperation = typeof hostOperations[number];
 export interface ProjectAllocation {
   projectId: string; runId: string; repositoryIdentity: string; repositoryNodeId: string; head: string;

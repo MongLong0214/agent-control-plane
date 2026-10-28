@@ -214,11 +214,12 @@ try {
   // launcher records claude's exit status under the same id.
   const launchMarker = join(state,`launched-${a.projectId}`);
   const exitRecord = join(state,`resident-${a.projectId}.exit.json`);
-  const recordedLaunchExit = () => {
+  const recordedLaunchExit = (reasonOperation = operation) => {
     try {
       const marker = read(launchMarker); const record = read(exitRecord);
       if (marker.sessionUuid !== a.sessionUuid || typeof marker.launch !== 'string' || record.launch !== marker.launch) return null;
-      const reason = hostProvisionerReason('claude',operation,record.exitCode === 0 ? hostReasonKind.exited : hostReasonKind.nonZeroExit,record.exitCode);
+      const reason = hostProvisionerReason('claude',reasonOperation,record.exitCode === 0 ? hostReasonKind.exited : hostReasonKind.nonZeroExit,record.exitCode);
+      if (!reason) return null;
       return {marker,reason};
     } catch {return null;}
   };
@@ -333,6 +334,12 @@ try {
     case 'ensure-routing': {
       result = {routing:ensureRouting(a.roomId)}; break;
     }
+    case 'acknowledge-resident-exit': {
+      const recorded = recordedLaunchExit('ensure-resident');
+      check(recorded && canonicalJson(req.packet?.residentExitReason) === canonicalJson(recorded.reason),'resident exit acknowledgment mismatch');
+      if (recorded.marker.exitReported !== true) atomic(launchMarker,JSON.stringify({...recorded.marker,exitReported:true}));
+      result = {}; break;
+    }
     case 'ensure-resident': {
       // Also the fleet watcher's recovery path after a CTO dies: it relaunches over unfinished work.
       const observedCheckout = checkout(checkoutRequirement);
@@ -363,11 +370,10 @@ try {
       if (!existing) atomic(fleetFile,[...lines,line].join('\n')+'\n');
       let alive = false; try { observeResident(); alive = true; } catch { /* A tmux shell alone is never health. */ }
       if (!alive) {
-        // Surface a completed launch's exact exit once before replacing its identity. The original record
-        // remains intact; the boolean on the same marker lets the following retry perform recovery.
+        // Keep surfacing a completed launch's exact exit until the daemon acknowledges that its ledger
+        // write committed. The record and marker remain untouched while a response may be lost.
         const priorExit = recordedLaunchExit();
         if (priorExit && priorExit.marker.exitReported !== true) {
-          atomic(launchMarker,JSON.stringify({...priorExit.marker,exitReported:true}));
           throw new ProvisionerRefusal(formatHostProvisionerReason(priorExit.reason));
         }
         const launch = randomUUID();
@@ -383,8 +389,13 @@ try {
         if (hasPane) {
           const pane = run('tmux',['display-message','-p','-t',a.tmuxName,'#{pane_current_path}\t#{pane_start_command}']).trim();
           check(pane === `${a.clonePath}\t${launcher}`,'unverified tmux pane cannot be replaced');
-          run('tmux',['kill-session','-t',a.tmuxName]);
+          // The verified launcher writes the exit record before its tmux command ends. Replacing its
+          // marker while it is still settling creates a check/rotate race that can orphan that record.
+          throw new ProvisionerRefusal('resident launcher is still settling');
         }
+        const completedExit = recordedLaunchExit();
+        if (completedExit && completedExit.marker.exitReported !== true)
+          throw new ProvisionerRefusal(formatHostProvisionerReason(completedExit.reason));
         atomic(launchMarker,JSON.stringify({sessionUuid:a.sessionUuid,launch})); run('tmux',['new-session','-d','-s',a.tmuxName,launcher]);
       }
       result = {fleet:true,checkout:observedCheckout,resident:observeLaunch()}; break;

@@ -353,7 +353,7 @@ it.each(['normal','lost-response-after-create','ambiguity'])('runs packaged host
   expect(readFileSync(intentPath,'utf8')).toBe(intent);expect(JSON.parse(readFileSync(join(home,'fake.json'),'utf8'))).toMatchObject({admitted,admissions:1,creates:1});
   expect(readFileSync(a.privateKeyFile,'utf8')).toBe(key);expect(readFileSync(join(home,'.hermes','bridge','required-mentions.json'),'utf8')).toBe(roster);expect(readFileSync(join(home,'.claude','watchers','fleet','manifest.tsv'),'utf8')).toBe(fleet);
   const effects = JSON.parse(readFileSync(join(home,'fake.json'),'utf8')) as {creates:number;launches:number;launched:boolean;pane:boolean};expect(effects.creates).toBe(1);expect(effects.launches).toBe(1);
-  effects.launched=false;effects.pane=true;writeFileSync(join(home,'fake.json'),JSON.stringify(effects));
+  effects.launched=false;effects.pane=false;writeFileSync(join(home,'fake.json'),JSON.stringify(effects));
   // The watcher recovery entry uses exactly the same resident launcher and preserves its UUID.
   const recoveryScript = fileURLToPath(new URL('../../dist/host/resident-fleet-up.mjs',import.meta.url));
   await new Promise<void>((resolve,reject) => {execFile(process.execPath,[recoveryScript],{env:{...env,ACP_HOST_PROJECT_PROVISIONER:script},timeout:30_000},error=>error ? reject(error) : resolve());});
@@ -538,11 +538,33 @@ it('an ensure-resident retry reports the current launch exit before a later retr
   const failed = await refusal(daemon(f).invoke('ensure-resident',f.a));
   expect(failed.reason).toEqual({binary:'claude',operation:'ensure-resident',kind:'non-zero exit',exitCode:2});
   expect(failed.message).toBe('host provisioner ensure-resident failed: claude in ensure-resident: non-zero exit with exit code 2');
-  expect(JSON.parse(readFileSync(join(f.state,'launched-test'),'utf8'))).toEqual({...JSON.parse(marker),exitReported:true});
+  expect(readFileSync(join(f.state,'launched-test'),'utf8')).toBe(marker);
   expect(JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8')).launches).toBe(1);
 
+  // A lost daemon response cannot consume the diagnostic: the host repeats it until the daemon
+  // acknowledges only after its provisioning ledger write has committed.
+  const repeated = await refusal(daemon(f).invoke('ensure-resident',f.a));
+  expect(repeated.reason).toEqual(failed.reason);
+  expect(readFileSync(join(f.state,'launched-test'),'utf8')).toBe(marker);
+  await expect(daemon(f).invoke('acknowledge-resident-exit',f.a,{residentExitReason:{binary:'claude',operation:'ensure-resident',kind:'non-zero exit',exitCode:3}})).rejects.toThrow();
+  expect(readFileSync(join(f.state,'launched-test'),'utf8')).toBe(marker);
+  await daemon(f).invoke('acknowledge-resident-exit',f.a,{residentExitReason:failed.reason});
+  expect(JSON.parse(readFileSync(join(f.state,'launched-test'),'utf8'))).toEqual({...JSON.parse(marker),exitReported:true});
   expect((await daemon(f).invoke('ensure-resident',f.a)).resident).toMatchObject({sessionUuid:f.a.sessionUuid,bridgeSessionId:'bridge'});
   expect(JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8')).launches).toBe(2);
+});
+
+it('does not rotate a launch marker while its verified tmux launcher can still publish an exit',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');await f.invoke('ensure-resident');
+  const markerPath = join(f.state,'launched-test');const marker = readFileSync(markerPath,'utf8');
+  const effects = JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8'));
+  effects.launched=false;effects.pane=true;writeFileSync(join(f.home,'fake.json'),JSON.stringify(effects));
+
+  const settling = await refusal(daemon(f).invoke('ensure-resident',f.a));
+  expect(settling.reason ?? null).toBeNull();
+  expect(readFileSync(markerPath,'utf8')).toBe(marker);
+  expect(JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8')).launches).toBe(1);
 });
 
 it('an exit record for one session never explains another session of the same project',async () => {
@@ -568,8 +590,9 @@ it('an exit record from an earlier launch never explains a later one',async () =
   expect((await refusal(daemon(f).invoke('observe',f.a))).reason).toEqual({binary:'claude',operation:'observe',kind:'non-zero exit',exitCode:23});
   // Fleet recovery relaunches the dead resident: the first launch's record stays on disk but no longer describes it.
   rmSync(join(f.home,'fail-claude'));
-  expect((await refusal(daemon(f).invoke('ensure-resident',f.a))).reason)
-    .toEqual({binary:'claude',operation:'ensure-resident',kind:'non-zero exit',exitCode:23});
+  const reported = await refusal(daemon(f).invoke('ensure-resident',f.a));
+  expect(reported.reason).toEqual({binary:'claude',operation:'ensure-resident',kind:'non-zero exit',exitCode:23});
+  await daemon(f).invoke('acknowledge-resident-exit',f.a,{residentExitReason:reported.reason});
   await f.invoke('ensure-resident');
   expect(JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8')).launches).toBe(2);
   residentGone(f);
