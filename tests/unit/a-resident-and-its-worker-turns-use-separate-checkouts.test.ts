@@ -450,6 +450,14 @@ describe("#1227 a resident's working directory never reaches a worker turn", () 
         await daemonPass(f);
         const checkout = await registeredCheckout(f, s);
         expect(checkout).not.toBe(s.clone);
+        const workerDev = gitSync(checkout, ["rev-parse", "refs/heads/dev"]);
+        // The resident advances its own dev after the worker clone was created. Task branches must use
+        // this exact recorded pin as their candidate base without moving the worker clone's stale dev ref.
+        writeFiles(s.clone, { "docs/resident.md": "# resident base commit\n" });
+        residentGit(s.clone, ["add", "docs/resident.md"]);
+        residentGit(s.clone, ["commit", "-q", "-m", "resident advances the task base"]);
+        const residentDev = residentGit(s.clone, ["rev-parse", "refs/heads/dev"]);
+        expect(workerDev).not.toBe(residentDev);
         const results: Record<string, string> = {};
         for (const [key, script] of [
           ["app", { writes: { "src/app.js": "module.exports = () => 2;\n" } }],
@@ -466,8 +474,11 @@ describe("#1227 a resident's working directory never reaches a worker turn", () 
         const frozen = await cp.pipeline.freeze(s.runId);
         if (!frozen.allowed) throw new Error(`${frozen.reasonCode}: ${frozen.message} ${JSON.stringify(frozen.evidence).slice(0, 600)}`);
         const repo = frozen.value.repositories[0]!;
+        expect(repo.baseHead).toBe(residentDev);
+        expect(repo.baseHeadPinned).toBe(true);
         expect(isAncestor(checkout, results["app"]!, repo.candidateHead)).toBe(true);
         expect(isAncestor(checkout, results["readme"]!, repo.candidateHead)).toBe(true);
+        expect(gitSync(checkout, ["show", `${repo.candidateHead}:docs/resident.md`])).toBe("# resident base commit");
         expect(gitSync(checkout, ["show", `${repo.candidateHead}:src/app.js`])).toBe("module.exports = () => 2;");
         expect(gitSync(checkout, ["show", `${repo.candidateHead}:README.md`])).toBe("# task one");
         expect(repo.touchedPaths).toEqual(["README.md", "src/app.js"]);
