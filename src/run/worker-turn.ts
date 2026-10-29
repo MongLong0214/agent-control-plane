@@ -884,16 +884,21 @@ export class WorkerTurnRunner {
         const pathKind = event?.["worktreePathKind"];
         if (pathKind === "CANONICAL_V1") return "OTHER";
         if (pathKind !== undefined) return null;
-        try {
-          const resolved = canonical(value);
-          if (resolved === worktree) return "CURRENT";
-          // Normal legacy records stored `worktree`, which was already canonical. Preserve
-          // their checkout boundary. A path that resolves differently is an alias and stays
-          // ambiguous: it may have been deleted or retargeted after the event was committed.
-          return resolved === value ? "OTHER" : "AMBIGUOUS";
-        } catch {
-          return "AMBIGUOUS";
-        }
+        const taskId = event?.["taskId"];
+        if (typeof taskId !== "string") return "AMBIGUOUS";
+        const target = recordedWriteTarget(this.ports.db, runId, taskId);
+        if (!target) return "AMBIGUOUS";
+        const repository = this.ports.db.get<{ checkout_path: string }>(
+          `SELECT r.checkout_path FROM run_repositories rr
+             JOIN repositories r ON r.repository_id = rr.repository_id
+            WHERE rr.run_id = ? AND r.identity = ?`,
+          [runId, target.repositoryIdentity],
+        );
+        if (!repository || !isAbsolute(repository.checkout_path)) return "AMBIGUOUS";
+        // RepositoryRegistry persisted this path canonical at registration. It is durable task
+        // provenance; unlike the event path's current filesystem shape it cannot be changed by
+        // deleting, retargeting, or replacing a legacy alias after the event was committed.
+        return repository.checkout_path === worktree ? "CURRENT" : "OTHER";
       };
       // A group ends only by its own end (its nonce and pgid); an intent with no group, by any end of its nonce.
       const groupEnded = new Set(ends.filter((end) => end?.["pgid"] != null).map((end) => `${String(end!["nonce"])}:${String(end!["pgid"])}`));

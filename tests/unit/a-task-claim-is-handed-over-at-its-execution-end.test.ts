@@ -1,5 +1,5 @@
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
-import { chmodSync, existsSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
@@ -1085,7 +1085,7 @@ describe("S2 — while any writer of the previous execution may still exist, the
       children.push(gate);
       await vi.waitFor(() => expect(readProcessStartToken(gate.pid!)).not.toBeNull(), { timeout: 5_000, interval: 20 });
 
-      const alias = join(tempDir("s2-gate-alias-"), "checkout");
+      const alias = join(canonical(tempDir("s2-gate-alias-")), "checkout");
       symlinkSync(s.checkoutPath, alias, "dir");
       cp.audit.record({
         kind: "TASK_WORKER_GIT_INTENT",
@@ -1136,7 +1136,7 @@ describe("S2 — while any writer of the previous execution may still exist, the
     });
   });
 
-  it("a legacy event whose recorded path is already canonical for another checkout does not block this checkout", async () => {
+  it("a legacy event whose path looks canonical but whose task belongs to this checkout stays fail-closed", async () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const s = await standardRun(f, "s2-other-legacy-canonical-checkout");
@@ -1162,7 +1162,46 @@ describe("S2 — while any writer of the previous execution may still exist, the
       });
 
       const passed = await claim(f, s, target);
-      expect(passed, "the legacy path itself proves it was canonical for another checkout").toMatchObject({ ok: true });
+      expect(passed, "a current path cannot prove where an unmarked legacy event was written").toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.CLAIM_WORKTREE_CONFLICT,
+      });
+    });
+  });
+
+  it("a live legacy group recorded through an alias replaced by a real directory still blocks this checkout", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s2-group-alias-replaced-by-directory");
+      const [one, two] = s.taskIds;
+      const first = await staffAndClaim(f, s, one);
+      const target = await provision(f, s, two);
+      const group = spawn("/bin/sleep", ["600"], { detached: true, stdio: "ignore" });
+      children.push(group);
+      const pgid = group.pid!;
+      await vi.waitFor(() => expect(readProcessStartToken(pgid)).not.toBeNull(), { timeout: 5_000, interval: 20 });
+
+      const nonce = "944c6d8c-9118-477f-aafe-667125e2c34c";
+      const alias = join(canonical(tempDir("s2-replaced-alias-")), "checkout");
+      symlinkSync(s.checkoutPath, alias, "dir");
+      const base = { worktreeId: alias, taskId: one, nonce };
+      cp.audit.record({ kind: "TASK_WORKER_GIT_INTENT", runId: s.runId, evidence: base });
+      cp.audit.record({
+        kind: "TASK_WORKER_GIT_GROUP_STARTED",
+        runId: s.runId,
+        evidence: { ...base, pgid, leaderStartedAt: readProcessStartToken(pgid) },
+      });
+      unlinkSync(alias);
+      mkdirSync(alias);
+
+      const refused = await claim(f, s, target);
+      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CLAIM_WORKTREE_CONFLICT });
+      expect(statusOf(f, first.claimId)).toBe("HELD");
+
+      process.kill(pgid, "SIGKILL");
+      await vi.waitFor(() => expect(alive(pgid)).toBe(false), { timeout: 5_000, interval: 20 });
+      const passed = await claim(f, s, target);
+      expect(passed, "once the group is gone").toMatchObject({ ok: true });
     });
   });
 
