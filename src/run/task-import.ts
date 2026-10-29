@@ -12,6 +12,7 @@ import {
   writeSync,
 } from "node:fs";
 import { join } from "node:path";
+import { inflateSync } from "node:zlib";
 
 import { sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -38,9 +39,9 @@ import { GIT_OUTPUT_MAX_BYTES } from "../git/git.ts";
  * What review sees depends on the content (`classifyImport`). A file git reads as text is never bound
  * by its manifest: it stays in the candidate's patch and is reviewed like any other change, so a task's
  * text imports are bounded by what that patch can carry (`IMPORT_MAX_TEXT_BYTES`). A binary file may be
- * bound by its manifest only as non-executable data: executable or loadable formats and archives, and
- * binary bytes at a source, script or configuration path, are refused, and the reviewer reads the
- * detected type of every bound file.
+ * bound by its manifest only when its exact extension selects a bounded parser that consumes a
+ * complete structurally valid PNG or TrueType font. Unknown, mismatched, malformed and trailing
+ * bytes are refused; the reviewer reads the validated format of every bound file.
  */
 
 /** One imported file: where it lands in the repository, its size in bytes and the sha256 of its bytes. */
@@ -140,59 +141,182 @@ const REFUSED_FORMATS: readonly Format[] = [
   format("tar archive", [257, "ustar"]),
 ];
 
-/** Non-executable data formats a reviewer can name, by magic number; anything else is `unknown-binary`. */
-const DATA_FORMATS: readonly Format[] = [
-  format("PNG", [0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]]),
-  format("JPEG", [0, [0xff, 0xd8, 0xff]]),
-  format("GIF", [0, "GIF87a"]),
-  format("GIF", [0, "GIF89a"]),
-  format("WebP", [0, "RIFF"], [8, "WEBP"]),
-  format("WAV", [0, "RIFF"], [8, "WAVE"]),
-  format("BMP", [0, "BM"]),
-  format("ICO", [0, [0x00, 0x00, 0x01, 0x00]]),
-  format("TIFF", [0, "II*\x00"]),
-  format("TIFF", [0, "MM\x00*"]),
-  format("font (WOFF2)", [0, "wOF2"]),
-  format("font (WOFF)", [0, "wOFF"]),
-  format("font (OpenType)", [0, "OTTO"]),
-  format("font (TrueType)", [0, [0x00, 0x01, 0x00, 0x00]]),
-  format("font (TrueType)", [0, "true"]),
-  format("font (collection)", [0, "ttcf"]),
-  format("PDF", [0, "%PDF-"]),
-  format("ISO media (MP4, MOV, AVIF or HEIF)", [4, "ftyp"]),
-  format("MP3", [0, "ID3"]),
-  format("Ogg", [0, "OggS"]),
-  format("FLAC", [0, "fLaC"]),
-  format("MIDI", [0, "MThd"]),
-  format("Photoshop document", [0, "8BPS"]),
-  format("SQLite database", [0, "SQLite format 3\x00"]),
-];
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const PNG_CRC_TABLE = Uint32Array.from({ length: 256 }, (_, index) => {
+  let value = index;
+  for (let bit = 0; bit < 8; bit += 1) value = (value >>> 1) ^ (value & 1 ? 0xedb88320 : 0);
+  return value >>> 0;
+});
 
-/**
- * Extensions and file names a toolchain loads as source, script or configuration. Binary bytes there
- * are refused: no reviewer can read them, and a loader may still run them (JavaScript allows a NUL in a
- * comment, so a script git reads as binary can still be loaded).
- */
-const SOURCE_EXTENSIONS: ReadonlySet<string> = new Set([
-  "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "json", "json5", "jsonc", "map", "vue", "svelte", "astro",
-  "sh", "bash", "zsh", "fish", "ksh", "csh", "tcsh", "command", "ps1", "psm1", "psd1", "bat", "cmd", "vbs", "vba", "wsf",
-  "py", "pyw", "pyi", "pyc", "pyo", "rb", "erb", "pl", "pm", "php", "phtml", "go", "rs", "java", "kt", "kts", "scala",
-  "groovy", "gradle", "clj", "cljs", "cljc", "edn", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx", "m", "mm", "swift",
-  "cs", "csx", "fs", "fsx", "vb", "lua", "r", "jl", "dart", "ex", "exs", "erl", "hrl", "hs", "lhs", "ml", "mli", "elm",
-  "nim", "zig", "sol", "sql", "yml", "yaml", "toml", "ini", "cfg", "conf", "env", "properties", "xml", "xsl", "xslt",
-  "plist", "html", "htm", "xhtml", "css", "scss", "sass", "less", "md", "mdx", "txt", "rst", "lock", "tf", "tfvars",
-  "hcl", "nix", "mk", "cmake", "service", "desktop", "npmrc", "yarnrc", "editorconfig", "gitattributes", "gitignore",
-  "gitmodules", "dockerignore",
-]);
-const SOURCE_NAMES: ReadonlySet<string> = new Set([
-  "makefile", "dockerfile", "containerfile", "gemfile", "rakefile", "procfile", "vagrantfile", "jenkinsfile", "brewfile",
-  "podfile", "justfile", "build", "workspace",
-]);
+const pngCrc32 = (bytes: Buffer): number => {
+  let crc = 0xffffffff;
+  for (const byte of bytes) crc = (crc >>> 8) ^ PNG_CRC_TABLE[(crc ^ byte) & 0xff]!;
+  return (crc ^ 0xffffffff) >>> 0;
+};
 
-const isSourcePath = (path: string): boolean => {
-  const name = path.slice(path.lastIndexOf("/") + 1).toLowerCase();
-  const dot = name.lastIndexOf(".");
-  return SOURCE_NAMES.has(name) || (dot >= 0 && SOURCE_EXTENSIONS.has(name.slice(dot + 1)));
+/** A complete, bounded PNG parse. `null` means every byte belongs to one structurally valid PNG. */
+const invalidPng = (bytes: Buffer): string | null => {
+  if (bytes.length < 8 || !bytes.subarray(0, 8).equals(PNG_SIGNATURE)) return "the bytes are not a PNG";
+  let cursor = 8;
+  let width = 0;
+  let height = 0;
+  let bitsPerPixel = 0;
+  let bitDepth = 0;
+  let colorType = 0;
+  let sawHeader = false;
+  let sawPalette = false;
+  let sawData = false;
+  let dataEnded = false;
+  let sawEnd = false;
+  const compressed: Buffer[] = [];
+  while (cursor < bytes.length) {
+    if (bytes.length - cursor < 12) return "the PNG ends inside a chunk";
+    const length = bytes.readUInt32BE(cursor);
+    if (length > 0x7fffffff || length > bytes.length - cursor - 12) return "a PNG chunk length leaves the file";
+    const typeBytes = bytes.subarray(cursor + 4, cursor + 8);
+    if (![...typeBytes].every((byte) => (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)) || (typeBytes[2]! & 0x20) !== 0) {
+      return "a PNG chunk type is invalid";
+    }
+    const type = typeBytes.toString("ascii");
+    const data = bytes.subarray(cursor + 8, cursor + 8 + length);
+    if (pngCrc32(bytes.subarray(cursor + 4, cursor + 8 + length)) !== bytes.readUInt32BE(cursor + 8 + length)) return `the PNG ${type} checksum is invalid`;
+    cursor += 12 + length;
+    if (!sawHeader && type !== "IHDR") return "the PNG does not begin with IHDR";
+    if (type === "IHDR") {
+      if (sawHeader || length !== 13) return "the PNG has an invalid IHDR";
+      width = data.readUInt32BE(0);
+      height = data.readUInt32BE(4);
+      const depth = data[8]!;
+      const color = data[9]!;
+      const channels = new Map([[0, 1], [2, 3], [3, 1], [4, 2], [6, 4]]).get(color);
+      const depths = new Map([[0, [1, 2, 4, 8, 16]], [2, [8, 16]], [3, [1, 2, 4, 8]], [4, [8, 16]], [6, [8, 16]]]).get(color);
+      if (width === 0 || height === 0 || channels === undefined || !depths?.includes(depth) || data[10] !== 0 || data[11] !== 0 || data[12] !== 0) {
+        return "the PNG IHDR fields are unsupported or invalid";
+      }
+      bitsPerPixel = channels * depth;
+      bitDepth = depth;
+      colorType = color;
+      sawHeader = true;
+    } else if (type === "PLTE") {
+      if (sawPalette || sawData || colorType === 0 || colorType === 4 || length === 0 || length % 3 !== 0 || length > 3 * 2 ** bitDepth) {
+        return "the PNG has an invalid PLTE";
+      }
+      sawPalette = true;
+    } else if (type === "IDAT") {
+      if (dataEnded || sawEnd || (colorType === 3 && !sawPalette)) return "the PNG IDAT chunks are not consecutive or lack the required palette";
+      sawData = true;
+      compressed.push(data);
+    } else if (type === "IEND") {
+      if (!sawData || sawEnd || length !== 0 || cursor !== bytes.length) return "the PNG has an invalid IEND or trailing bytes";
+      sawEnd = true;
+    } else {
+      if ((typeBytes[0]! & 0x20) === 0) return `the PNG has an unknown critical chunk ${type}`;
+      if (sawData) dataEnded = true;
+    }
+  }
+  if (!sawEnd) return "the PNG has no IEND";
+  const rowBytes = Math.ceil((width * bitsPerPixel) / 8);
+  const decodedLength = height * (rowBytes + 1);
+  if (!Number.isSafeInteger(decodedLength) || decodedLength > IMPORT_MAX_TOTAL_BYTES) return "the decoded PNG exceeds the import bound";
+  try {
+    const decoded = inflateSync(Buffer.concat(compressed), { maxOutputLength: decodedLength });
+    if (decoded.length !== decodedLength) return "the PNG pixel stream has the wrong length";
+    for (let offset = 0; offset < decoded.length; offset += rowBytes + 1) if (decoded[offset]! > 4) return "the PNG has an invalid row filter";
+  } catch {
+    return "the PNG pixel stream does not decode within its bound";
+  }
+  return null;
+};
+
+const sfntChecksum = (bytes: Buffer, zeroAdjustment = false): number => {
+  let sum = 0;
+  for (let offset = 0; offset < bytes.length; offset += 4) {
+    let word = 0;
+    for (let byte = 0; byte < 4; byte += 1) {
+      const position = offset + byte;
+      const value = zeroAdjustment && position >= 8 && position < 12 ? 0 : (bytes[position] ?? 0);
+      word = ((word << 8) | value) >>> 0;
+    }
+    sum = (sum + word) >>> 0;
+  }
+  return sum;
+};
+
+interface SfntTable { tag: string; checksum: number; offset: number; length: number; bytes: Buffer }
+
+/** A complete TrueType sfnt parse. It rejects gaps, overlaps, trailing bytes and malformed core tables. */
+const invalidTrueType = (bytes: Buffer): string | null => {
+  if (bytes.length < 12 || bytes.readUInt32BE(0) !== 0x00010000) return "the bytes are not a TrueType sfnt";
+  const count = bytes.readUInt16BE(4);
+  if (count === 0 || count > 4095 || 12 + count * 16 > bytes.length) return "the TrueType table directory is invalid";
+  const power = 2 ** Math.floor(Math.log2(count));
+  if (bytes.readUInt16BE(6) !== power * 16 || bytes.readUInt16BE(8) !== Math.log2(power) || bytes.readUInt16BE(10) !== count * 16 - power * 16) {
+    return "the TrueType table search fields are invalid";
+  }
+  const tables: SfntTable[] = [];
+  let previousTag = "";
+  for (let index = 0; index < count; index += 1) {
+    const at = 12 + index * 16;
+    const tagBytes = bytes.subarray(at, at + 4);
+    if (![...tagBytes].every((byte) => byte >= 0x20 && byte <= 0x7e)) return "a TrueType table tag is invalid";
+    const tag = tagBytes.toString("ascii");
+    const checksum = bytes.readUInt32BE(at + 4);
+    const offset = bytes.readUInt32BE(at + 8);
+    const length = bytes.readUInt32BE(at + 12);
+    if (tag <= previousTag || length === 0 || offset % 4 !== 0 || offset < 12 + count * 16 || length > bytes.length - offset) {
+      return "a TrueType table record is invalid";
+    }
+    previousTag = tag;
+    tables.push({ tag, checksum, offset, length, bytes: bytes.subarray(offset, offset + length) });
+  }
+  let expectedOffset = (12 + count * 16 + 3) & ~3;
+  for (const table of [...tables].sort((left, right) => left.offset - right.offset)) {
+    if (table.offset !== expectedOffset || sfntChecksum(table.bytes, table.tag === "head") !== table.checksum) return "the TrueType tables overlap, have gaps or fail checksum";
+    expectedOffset = (table.offset + table.length + 3) & ~3;
+    if ([...bytes.subarray(table.offset + table.length, expectedOffset)].some((byte) => byte !== 0)) return "the TrueType table padding is nonzero";
+  }
+  if (expectedOffset !== bytes.length || sfntChecksum(bytes) !== 0xb1b0afba) return "the TrueType file has trailing bytes or an invalid whole-font checksum";
+  const byTag = new Map(tables.map((table) => [table.tag, table]));
+  const required = ["OS/2", "cmap", "glyf", "head", "hhea", "hmtx", "loca", "maxp", "name", "post"];
+  if (required.some((tag) => !byTag.has(tag))) return "the TrueType font lacks a required table";
+  const head = byTag.get("head")!.bytes;
+  const hhea = byTag.get("hhea")!.bytes;
+  const maxp = byTag.get("maxp")!.bytes;
+  if (head.length < 54 || head.readUInt32BE(0) !== 0x00010000 || head.readUInt32BE(12) !== 0x5f0f3cf5 || head.readUInt16BE(18) < 16) return "the TrueType head table is invalid";
+  if (maxp.length < 32 || maxp.readUInt32BE(0) !== 0x00010000 || maxp.readUInt16BE(4) === 0) return "the TrueType maxp table is invalid";
+  const glyphs = maxp.readUInt16BE(4);
+  if (hhea.length < 36 || hhea.readUInt32BE(0) !== 0x00010000 || hhea.readUInt16BE(34) === 0 || hhea.readUInt16BE(34) > glyphs) return "the TrueType hhea table is invalid";
+  const longMetrics = hhea.readUInt16BE(34);
+  const loca = byTag.get("loca")!.bytes;
+  const glyf = byTag.get("glyf")!.bytes;
+  const longLoca = head.readInt16BE(50);
+  const locaWidth = longLoca === 0 ? 2 : longLoca === 1 ? 4 : 0;
+  if (locaWidth === 0 || loca.length !== (glyphs + 1) * locaWidth || byTag.get("hmtx")!.length < longMetrics * 4 + (glyphs - longMetrics) * 2) {
+    return "the TrueType glyph index or metrics are invalid";
+  }
+  let previousLocation = 0;
+  for (let index = 0; index <= glyphs; index += 1) {
+    const location = locaWidth === 2 ? loca.readUInt16BE(index * 2) * 2 : loca.readUInt32BE(index * 4);
+    if (location < previousLocation || location > glyf.length) return "the TrueType glyph locations are invalid";
+    previousLocation = location;
+  }
+  const cmap = byTag.get("cmap")!.bytes;
+  const name = byTag.get("name")!.bytes;
+  if (cmap.length < 12 || cmap.readUInt16BE(0) !== 0 || cmap.readUInt16BE(2) === 0 || 4 + cmap.readUInt16BE(2) * 8 > cmap.length) return "the TrueType cmap table is invalid";
+  if (name.length < 6 || 6 + name.readUInt16BE(2) * 12 > name.length || name.readUInt16BE(4) > name.length) return "the TrueType name table is invalid";
+  if (byTag.get("OS/2")!.length < 78 || byTag.get("post")!.length < 32) return "a required TrueType table is truncated";
+  return null;
+};
+
+const validatedBinary = (path: string, bytes: Buffer): { type: string } | { why: string } => {
+  const extension = path.slice(path.lastIndexOf("."));
+  const validation = extension === ".png"
+    ? { type: "PNG", problem: invalidPng(bytes) }
+    : extension === ".ttf"
+      ? { type: "font (TrueType)", problem: invalidTrueType(bytes) }
+      : null;
+  if (validation === null) return { why: "the path does not have an allowed image or font extension (.png or .ttf)" };
+  return validation.problem === null ? { type: validation.type } : { why: validation.problem };
 };
 
 /** How review can see one imported file, from its bytes and path. */
@@ -202,17 +326,18 @@ export type ImportContent =
   | { kind: "refused"; why: string };
 
 /**
- * Text (git reads it as text) is reviewed as the patch it is; data is bound by its manifest and shown
- * as its detected type; anything else is refused. Executable or loadable formats and archives are
- * refused whatever git reads them as; binary bytes at a source, script or configuration path are refused.
+ * Text (git reads it as text) is reviewed as the patch it is. Binary bytes are bound by their manifest
+ * only when an exact allowed extension selects a bounded parser that validates the complete file.
  */
 export const classifyImport = (path: string, bytes: Buffer): ImportContent => {
   const binary = gitReadsAsBinary(bytes);
   const refused = REFUSED_FORMATS.find((candidate) => (binary || candidate.binaryOnly !== true) && matches(bytes, candidate));
   if (refused !== undefined) return { kind: "refused", why: `${refused.name}: executable or loadable code, or an archive that can carry it` };
   if (!binary) return { kind: "text" };
-  if (isSourcePath(path)) return { kind: "refused", why: "binary bytes at a source, script or configuration path, which no reviewer can read" };
-  return { kind: "data", type: DATA_FORMATS.find((candidate) => matches(bytes, candidate))?.name ?? "unknown-binary" };
+  const validated = validatedBinary(path, bytes);
+  return "type" in validated
+    ? { kind: "data", type: validated.type }
+    : { kind: "refused", why: `binary bytes are not a complete structurally valid allowed image or font: ${validated.why}` };
 };
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
@@ -434,7 +559,7 @@ export const readStagedImports = (input: {
     return deny(ReasonCode.EVIDENCE_MISSING, "a manifest entry has no staged file; nothing is imported", { reason: "IMPORT_SOURCE_MISSING", ...named });
   }
   if (refused.length > 0) {
-    return deny(ReasonCode.IMPORT_CONTENT_REFUSED, "an import is executable or loadable code, an archive, or binary bytes at a source path; nothing is imported", {
+    return deny(ReasonCode.IMPORT_CONTENT_REFUSED, "an import is not a complete structurally valid allowed image or font; nothing is imported", {
       reason: "IMPORT_NOT_REVIEWABLE",
       refused: refused.slice(0, 50),
     });

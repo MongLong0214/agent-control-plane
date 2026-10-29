@@ -12,6 +12,7 @@ import { IMPORT_MAX_FILE_BYTES, IMPORT_MAX_TOTAL_BYTES } from "../../src/run/tas
 import { TaskWriteTargets } from "../../src/run/task-write-target.ts";
 import { WorkerTurnEvent, WorkerTurnRunner, type WorkerTurnOptions, workerSuccessDigest } from "../../src/run/worker-turn.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeCore, tempDir } from "../helpers/fixtures.ts";
+import { VALID_TTF, validPng, validPngOfSize } from "../helpers/import-fixtures.ts";
 import { FakeWorkerAdapter, recordSeededTarget, seedWorkerWorld, type WorkerWorld } from "../helpers/worker-turn-fixture.ts";
 
 /**
@@ -30,21 +31,12 @@ import { FakeWorkerAdapter, recordSeededTarget, seedWorkerWorld, type WorkerWorl
 
 const DIGEST_MISMATCH = "IMPORT_DIGEST_MISMATCH";
 
-/** A PNG signature and IHDR chunk start, then bytes git reads as binary. */
-const PNG = Buffer.concat([
-  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]),
-  Buffer.from("IHDR"),
-  Buffer.alloc(64, 0xff),
-  Buffer.from([0x00, 0x01, 0x02, 0x03]),
-]);
-/** A WOFF2 signature, then bytes git reads as binary. */
-const FONT = Buffer.concat([Buffer.from("wOF2"), Buffer.from([0x00, 0x01, 0x00, 0x00]), Buffer.alloc(128, 0x00), Buffer.from([0xde, 0xad, 0xbe, 0xef])]);
+const PNG = validPng();
+const FONT = VALID_TTF;
 
 interface ImportEntry { path: string; size: number; sha256: string }
 
 const entry = (path: string, bytes: Buffer): ImportEntry => ({ path, size: bytes.length, sha256: sha256(bytes) });
-/** Binary data of `size` bytes that no magic number names: a fixed prefix, then random bytes. */
-const dataBlob = (size: number): Buffer => Buffer.concat([Buffer.from("ACPDATA\0"), randomBytes(size - 8)]);
 const hexOf = (digest: string): string => digest.slice("sha256:".length);
 
 const adapters: FakeWorkerAdapter[] = [];
@@ -114,7 +106,7 @@ describe("#1232 a task imports binary files through its write target", () => {
   it("W1 imports a PNG and a font before the worker runs, commits them byte for byte, and the receipt binds both sha256", async () => {
     const world = seedWorkerWorld(makeCore(), { ownedPaths: ["assets", "src"] });
     const root = tempDir("acp-imports-");
-    const imports = [entry("assets/fonts/Inter.woff2", FONT), entry("assets/logo.png", PNG)];
+    const imports = [entry("assets/fonts/Inter.ttf", FONT), entry("assets/logo.png", PNG)];
     declareImports(world, imports);
     stage(root, world, imports[0]!.sha256, FONT);
     stage(root, world, imports[1]!.sha256, PNG);
@@ -123,7 +115,7 @@ describe("#1232 a task imports binary files through its write target", () => {
     adapter.script = {
       writes: { "src/app.js": "module.exports = () => 2;\n" },
       beforeSpawn: async () => {
-        seenAtLaunch.push(existsSync(join(world.repoPath, "assets/logo.png")), existsSync(join(world.repoPath, "assets/fonts/Inter.woff2")));
+        seenAtLaunch.push(existsSync(join(world.repoPath, "assets/logo.png")), existsSync(join(world.repoPath, "assets/fonts/Inter.ttf")));
       },
     };
     const runner = makeRunner(world, adapter, { importRoot: root });
@@ -138,9 +130,9 @@ describe("#1232 a task imports binary files through its write target", () => {
     expect(seenAtLaunch).toEqual([true, true]);
     // One commit holds the worker's change and both files, byte for byte.
     expect(blobAt(world.repoPath, "HEAD:assets/logo.png").equals(PNG)).toBe(true);
-    expect(blobAt(world.repoPath, "HEAD:assets/fonts/Inter.woff2").equals(FONT)).toBe(true);
+    expect(blobAt(world.repoPath, "HEAD:assets/fonts/Inter.ttf").equals(FONT)).toBe(true);
     expect(gitSync(world.repoPath, ["diff", "--name-only", "HEAD~1", "HEAD"]).split("\n")).toEqual([
-      "assets/fonts/Inter.woff2", "assets/logo.png", "src/app.js",
+      "assets/fonts/Inter.ttf", "assets/logo.png", "src/app.js",
     ]);
     expect(status(world)).toBe("");
 
@@ -183,8 +175,7 @@ describe("#1232 a task imports binary files through its write target", () => {
     const world = seedWorkerWorld(makeCore(), { ownedPaths: ["assets", "src"] });
     const root = tempDir("acp-imports-");
     const count = Math.floor(IMPORT_MAX_TOTAL_BYTES / IMPORT_MAX_FILE_BYTES);
-    // Data no magic number names: a fixed prefix, then random bytes.
-    const files = Array.from({ length: count }, (_, index) => ({ path: `assets/blob-${index}.bin`, bytes: dataBlob(IMPORT_MAX_FILE_BYTES) }));
+    const files = Array.from({ length: count }, (_, index) => ({ path: `assets/blob-${index}.png`, bytes: validPngOfSize(IMPORT_MAX_FILE_BYTES, index) }));
     const imports = files.map((file) => entry(file.path, file.bytes));
     declareImports(world, imports);
     for (const [index, file] of files.entries()) stage(root, world, imports[index]!.sha256, file.bytes);
@@ -203,10 +194,12 @@ describe("#1232 a task imports binary files through its write target", () => {
   it("W2 a sha256 mismatch refuses the whole import: nothing is written and no worker is launched", async () => {
     const world = seedWorkerWorld(makeCore(), { ownedPaths: ["assets"] });
     const root = tempDir("acp-imports-");
-    const imports = [entry("assets/fonts/Inter.woff2", FONT), entry("assets/logo.png", PNG)];
+    const imports = [entry("assets/fonts/Inter.ttf", FONT), entry("assets/logo.png", PNG)];
     declareImports(world, imports);
     // The font is staged under its declared name with other bytes; the logo is staged correctly.
-    stage(root, world, imports[0]!.sha256, Buffer.concat([FONT.subarray(0, FONT.length - 1), Buffer.from([0x00])]));
+    const alteredFont = Buffer.from(FONT);
+    alteredFont[alteredFont.length - 1] = alteredFont[alteredFont.length - 1]! ^ 0xff;
+    stage(root, world, imports[0]!.sha256, alteredFont);
     stage(root, world, imports[1]!.sha256, PNG);
     const head = gitSync(world.repoPath, ["rev-parse", "HEAD"]);
     const adapter = fakeFor(world);
@@ -215,14 +208,14 @@ describe("#1232 a task imports binary files through its write target", () => {
 
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(DIGEST_MISMATCH);
-    expect(refused.evidence).toMatchObject({ mismatched: ["assets/fonts/Inter.woff2"] });
+    expect(refused.evidence).toMatchObject({ mismatched: ["assets/fonts/Inter.ttf"] });
     expectNothingImported(world, adapter, head);
   }, 60_000);
 
   it("W2b a manifest entry with no staged file refuses the whole import", async () => {
     const world = seedWorkerWorld(makeCore(), { ownedPaths: ["assets"] });
     const root = tempDir("acp-imports-");
-    const imports = [entry("assets/fonts/Inter.woff2", FONT), entry("assets/logo.png", PNG)];
+    const imports = [entry("assets/fonts/Inter.ttf", FONT), entry("assets/logo.png", PNG)];
     declareImports(world, imports);
     stage(root, world, imports[1]!.sha256, PNG);
     const head = gitSync(world.repoPath, ["rev-parse", "HEAD"]);
@@ -232,14 +225,14 @@ describe("#1232 a task imports binary files through its write target", () => {
 
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe("EVIDENCE_MISSING");
-    expect(refused.evidence).toMatchObject({ missing: ["assets/fonts/Inter.woff2"] });
+    expect(refused.evidence).toMatchObject({ missing: ["assets/fonts/Inter.ttf"] });
     expectNothingImported(world, adapter, head);
   }, 60_000);
 
   it("W3 a path outside the task's write-target paths is refused, at the turn and when the target is recorded", async () => {
     const world = seedWorkerWorld(makeCore(), { ownedPaths: ["src"] });
     const root = tempDir("acp-imports-");
-    const imports = [entry("assets/logo.png", PNG), entry("src/font.woff2", FONT)];
+    const imports = [entry("assets/logo.png", PNG), entry("src/font.ttf", FONT)];
     declareImports(world, imports);
     stage(root, world, imports[0]!.sha256, PNG);
     stage(root, world, imports[1]!.sha256, FONT);
@@ -361,6 +354,29 @@ describe("#1232 a task imports binary files through its write target", () => {
     ];
     for (const testCase of cases) await expectRefusedImport(testCase);
   }, 120_000);
+
+  it("W8a fails closed when executable bytes masquerade as an unknown or magic-only data file", () => {
+    const nulJavaScript = Buffer.concat([
+      Buffer.from("// binary"), Buffer.from([0]), Buffer.from(" comment\nprocess.stdout.write('EXECUTED')\n"),
+    ]);
+    const forgedBmp = Buffer.concat([
+      Buffer.from("BM=0// binary"), Buffer.from([0]), Buffer.from(" comment\nprocess.stdout.write('EXECUTED')\n"),
+    ]);
+    const malformedPng = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(32)]);
+    const pngWithTrailingJavaScript = Buffer.concat([validPng(), Buffer.from("process.stdout.write('EXECUTED')\n")]);
+
+    for (const [path, bytes] of [
+      ["assets/payload", nulJavaScript],
+      ["assets/payload.bmp", forgedBmp],
+      ["assets/malformed.png", malformedPng],
+      ["assets/trailing.png", pngWithTrailingJavaScript],
+      ["assets/trailing.ttf", Buffer.concat([VALID_TTF, Buffer.from("process.stdout.write('EXECUTED')\n")])],
+      ["assets/mismatched.ttf", validPng()],
+      ["assets/mismatched.png", VALID_TTF],
+    ] as const) {
+      expect(taskImport.classifyImport(path, bytes), path).toMatchObject({ kind: "refused" });
+    }
+  });
 
   it("W8b a text import past the text limit derived from the patch cap is refused", async () => {
     const limits = taskImport as unknown as Record<string, unknown>;

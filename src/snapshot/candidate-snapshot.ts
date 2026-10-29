@@ -33,8 +33,8 @@ export type SnapshotIntegration = z.infer<typeof snapshotIntegrationSchema>;
 /**
  * #1232 — a file a SUCCEEDED task imported, as the freeze found it: the candidate head holds a regular
  * file at `path` whose blob is `blob` and whose bytes have exactly the manifest's `size` and `sha256`,
- * the base holds nothing at or below `path`, and the bytes are non-executable binary data of `type`
- * (`classifyImport`), which git's own numstat also reads as binary. Its patch is left out of
+ * the base holds nothing at or below `path`, and a bounded parser consumed the complete structurally
+ * valid image or font of `type` (`classifyImport`), which git's own numstat also reads as binary. Its patch is left out of
  * `diffDigest`, so its bytes are never materialised for the freeze or the review; the head and tree
  * digests still fix it exactly. Text is never bound: it stays in the patch and is reviewed as such.
  */
@@ -45,7 +45,7 @@ export const snapshotImportSchema = z
     sha256: z.string().regex(/^sha256:[0-9a-f]{64}$/),
     blob: z.string().regex(/^[0-9a-f]{40}$/),
     taskId: z.string().min(1),
-    /** The detected data type the reviewer reads (`PNG`, `font (WOFF2)`, `unknown-binary`, ...). */
+    /** The structurally validated data type the reviewer reads (`PNG` or `font (TrueType)`). */
     type: z.string().min(1),
   })
   .strict();

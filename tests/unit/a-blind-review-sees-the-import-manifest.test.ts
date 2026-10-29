@@ -1,5 +1,4 @@
 import { execFileSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
@@ -15,6 +14,7 @@ import type * as SandboxModule from "../../src/verify/sandbox.ts";
 import type { SandboxOutcome } from "../../src/verify/sandbox.ts";
 import { cleanupTempDirs, commitAll, writeFiles } from "../helpers/fixtures.ts";
 import { bindCeo, bindWorker, fixtureManifest, makeHarness, registerFixtureProject, startWorkBranch } from "../helpers/harness.ts";
+import { VALID_TTF, validPng, validPngOfSize } from "../helpers/import-fixtures.ts";
 
 /**
  * #1232 — a task's imported files reach the freeze and blind review bound by their manifest, never as
@@ -45,18 +45,8 @@ afterAll(cleanupTempDirs);
 
 const PACKAGE_JSON = `${JSON.stringify({ name: "fixture", private: true, scripts: { test: "node verify.js" } }, null, 2)}\n`;
 const APP_BYTES = "module.exports = () => 2;\n";
-/** A PNG signature and IHDR chunk start, then bytes git reads as binary. */
-const PNG = Buffer.concat([
-  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]),
-  Buffer.from("IHDR"),
-  Buffer.alloc(256, 0xff),
-  Buffer.from([0x00, 0x01, 0x02, 0x03]),
-]);
-
-/** A WOFF2 signature, then bytes git reads as binary. */
-const FONT = Buffer.concat([Buffer.from("wOF2"), Buffer.from([0x00, 0x01, 0x00, 0x00]), Buffer.alloc(128, 0x00), Buffer.from([0xde, 0xad, 0xbe, 0xef])]);
-/** Binary data of `size` bytes that no magic number names: a fixed prefix, then random bytes. */
-const dataBlob = (size: number): Buffer => Buffer.concat([Buffer.from("ACPDATA\0"), randomBytes(size - 8)]);
+const PNG = validPng();
+const FONT = VALID_TTF;
 /** The manifest entry the reviewer reads for a bound import. */
 const manifestLine = (entry: { path: string; size: number; sha256: string }, type: string): string => `${entry.path}: ${type}, ${entry.size} bytes, ${entry.sha256}`;
 
@@ -147,17 +137,17 @@ describe("#1232 freeze and blind review carry a task's import manifest", () => {
   it("W5 a PNG and a font stay bound by their manifest, and the reviewer reads each one's detected type", async () => {
     const { outcome, reviewerInput, packet, snapshot, imports, identity, taskId } = await reviewImports([
       { path: "src/logo.png", bytes: PNG },
-      { path: "src/fonts/Inter.woff2", bytes: FONT },
+      { path: "src/fonts/Inter.ttf", bytes: FONT },
     ]);
 
     expect(outcome, JSON.stringify(outcome)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
     // The freeze bound both by their bytes at the candidate head.
-    expect(snapshot!.repositories[0]!.touchedPaths).toEqual(["src/app.js", "src/fonts/Inter.woff2", "src/logo.png"]);
+    expect(snapshot!.repositories[0]!.touchedPaths).toEqual(["src/app.js", "src/fonts/Inter.ttf", "src/logo.png"]);
     for (const entry of imports) expect(JSON.stringify(snapshot)).toContain(entry.sha256);
     // Not the raw binaries: each is its manifest entry, with the type the freeze detected.
     expect(reviewerInput).not.toContain("GIT binary patch");
     expect(reviewerInput).toContain(manifestLine(imports.find((entry) => entry.path === "src/logo.png")!, "PNG"));
-    expect(reviewerInput).toContain(manifestLine(imports.find((entry) => entry.path === "src/fonts/Inter.woff2")!, "font (WOFF2)"));
+    expect(reviewerInput).toContain(manifestLine(imports.find((entry) => entry.path === "src/fonts/Inter.ttf")!, "font (TrueType)"));
     expect(reviewerInput).toContain(`task ${taskId}`);
     // The stored packet says how each binary path was represented.
     expect(packet!.inputManifest.binaryArtifacts).toEqual(imports.map((entry) => ({ repository: identity, path: entry.path, digest: entry.sha256, method: "import-manifest" })));
@@ -166,15 +156,14 @@ describe("#1232 freeze and blind review carry a task's import manifest", () => {
   it("W6 the largest import set validation accepts, every file at its maximum size, freezes and is reviewed", async () => {
     const count = Math.floor(IMPORT_MAX_TOTAL_BYTES / IMPORT_MAX_FILE_BYTES);
     expect(count * IMPORT_MAX_FILE_BYTES).toBe(IMPORT_MAX_TOTAL_BYTES);
-    // Random bytes: neither zlib nor git's delta can shrink them, so a binary patch would be larger still.
-    const files = Array.from({ length: count }, (_, index) => ({ path: `src/assets/blob-${index}.bin`, bytes: dataBlob(IMPORT_MAX_FILE_BYTES) }));
+    const files = Array.from({ length: count }, (_, index) => ({ path: `src/assets/blob-${index}.png`, bytes: validPngOfSize(IMPORT_MAX_FILE_BYTES, index) }));
 
     const { outcome, reviewerInput, packet, imports } = await reviewImports(files);
 
     expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
     const missing = imports.filter((entry) => !reviewerInput.includes(entry.path) || !reviewerInput.includes(entry.sha256)).map((entry) => entry.path);
     expect(missing).toEqual([]);
-    expect(reviewerInput).toContain(manifestLine(imports[0]!, "unknown-binary"));
+    expect(reviewerInput).toContain(manifestLine(imports[0]!, "PNG"));
     expect(reviewerInput).not.toContain("GIT binary patch");
     // The receipt check read every imported blob at its maximum size and linked the receipt.
     expect(reviewerInput).toMatch(/"linked": true/);
@@ -184,7 +173,7 @@ describe("#1232 freeze and blind review carry a task's import manifest", () => {
   it("W7 the reviewer gets every entry of the largest manifest validation accepts, each with its detected type", async () => {
     const files = Array.from({ length: IMPORT_MAX_FILES }, (_, index) => ({
       path: `src/icons/icon-${String(index).padStart(3, "0")}.png`,
-      bytes: Buffer.concat([PNG, Buffer.from([index])]),
+      bytes: validPng(Buffer.from([index])),
     }));
 
     const { outcome, reviewerInput, imports } = await reviewImports(files);
