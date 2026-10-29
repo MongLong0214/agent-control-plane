@@ -2,7 +2,7 @@ import { isAbsolute } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
-import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
+import { type Decision, allow, deny } from "../core/errors.ts";
 import { newClaimId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
@@ -43,95 +43,6 @@ export interface ClaimRecord {
 
 const DEFAULT_TTL_MS = 2 * 60 * 60 * 1000;
 
-/** What may still write a registered checkout for a run, and why; see `CheckoutWriter`. */
-export interface CheckoutWriterFact {
-  reason: string;
-  evidence: Evidence;
-}
-
-/**
- * S2 — what the worker runner knows may still write a registered checkout for a run
- * (`WorkerTurnRunner.checkoutWriter`): null only when nothing a turn of that run started can write it.
- */
-export type CheckoutWriter = (runId: string, worktreeId: string) => CheckoutWriterFact | null;
-
-/** A registry with no runner attached cannot tell that a writer is gone, so it never hands a claim over. */
-const NO_RUNNER: CheckoutWriterFact = { reason: "no worker runner answers for the checkout", evidence: {} };
-
-/** The run's own HELD worktree claim on a checkout, which a hand-over releases with its acquisition. */
-interface EarlierClaim {
-  claimId: string;
-  /** The rows acquired with it, exactly: the ones a hand-over releases. */
-  acquisition: string;
-}
-
-/**
- * S2 — a claim names its acquisition and its place in it: `<acquisition>.<index>.<count>`, every row of
- * one acquisition sharing the same acquisition id and count. Rows are never deleted while their run
- * lives, so an acquisition's membership is read from the rows themselves, complete or provably not.
- */
-const ACQUIRED_CLAIM_ID = /^(clm_[0-9a-f]{24})\.([1-9][0-9]*)\.([1-9][0-9]*)$/;
-
-export interface AcquisitionRow {
-  claim_id: string;
-  run_id: string;
-  repository_identity: string;
-  branch: string | null;
-  worktree_id: string | null;
-  declared_path: string | null;
-  owner_session_id: string;
-  owner_binding_generation: number;
-  acquired_at: string;
-  expires_at: string;
-  status: ClaimRecord["status"];
-}
-
-/**
- * S2 — every row acquired together with `claimId`, the one authority both the hand-over and a worker
- * turn's claim facts read. PROVEN: the claim carries its acquisition, and each index from 1 to its count
- * is there once, every row of the same run, repository, owner and time. UNPROVEN: it carries one, and
- * the rows do not add up; nothing may be released or run on it. LEGACY: a claim minted before S2, with
- * no acquisition in its id, whose rows are those minted before S2 with its run, repository, owner and
- * acquisition time — a superset when two acquisitions shared a millisecond, so a turn on it can only be
- * refused more, and a hand-over never releases one. null for an unknown claim.
- */
-export const claimAcquisition = (
-  db: Db,
-  claimId: string,
-): { membership: "PROVEN" | "UNPROVEN" | "LEGACY"; acquisition: string | null; rows: AcquisitionRow[] } | null => {
-  const anchor = db.get<AcquisitionRow>(`SELECT * FROM resource_claims WHERE claim_id = ?`, [claimId]);
-  if (!anchor) return null;
-  const minted = ACQUIRED_CLAIM_ID.exec(claimId);
-  if (!minted) {
-    const rows = db.all<AcquisitionRow>(
-      `SELECT * FROM resource_claims
-        WHERE run_id = ? AND repository_identity = ? AND owner_session_id = ? AND owner_binding_generation = ?
-          AND acquired_at = ? AND instr(claim_id, '.') = 0
-        ORDER BY claim_id`,
-      [anchor.run_id, anchor.repository_identity, anchor.owner_session_id, anchor.owner_binding_generation, anchor.acquired_at],
-    );
-    return { membership: "LEGACY", acquisition: null, rows };
-  }
-  const acquisition = minted[1]!;
-  const count = Number(minted[3]);
-  // Every id of the acquisition sorts between `<acquisition>.` and `<acquisition>/`, on the primary key.
-  const rows = db.all<AcquisitionRow>(
-    `SELECT * FROM resource_claims WHERE claim_id >= ? AND claim_id < ? ORDER BY claim_id`,
-    [`${acquisition}.`, `${acquisition}/`],
-  );
-  const indices = new Set<number>();
-  const consistent = rows.every((row) => {
-    const own = ACQUIRED_CLAIM_ID.exec(row.claim_id);
-    if (!own || own[1] !== acquisition || Number(own[3]) !== count) return false;
-    indices.add(Number(own[2]));
-    return row.run_id === anchor.run_id && row.repository_identity === anchor.repository_identity &&
-      row.owner_session_id === anchor.owner_session_id && row.owner_binding_generation === anchor.owner_binding_generation &&
-      row.acquired_at === anchor.acquired_at;
-  });
-  const complete = rows.length === count && indices.size === count && [...indices].every((index) => index <= count);
-  return { membership: consistent && complete ? "PROVEN" : "UNPROVEN", acquisition, rows };
-};
-
 /**
  * PRD §23 — a *minimal* coordination registry, not a scheduler.
  *
@@ -147,12 +58,6 @@ export class ClaimRegistry {
     private readonly audit: AuditLog,
     private readonly bindings: BindingRegistry,
   ) {}
-
-  #checkoutWriter: CheckoutWriter | null = null;
-
-  attach(ports: { checkoutWriter: CheckoutWriter }): void {
-    this.#checkoutWriter = ports.checkoutWriter;
-  }
 
   /** Every claim read uses the same lease boundary as acquisition. */
   private readAfterExpirySweep<T>(read: () => T): T {
@@ -254,13 +159,6 @@ export class ClaimRegistry {
         });
       }
 
-      // S2 — the run's own earlier claim on this checkout passes to this one, never while anything a
-      // turn of the run started may still write the checkout.
-      const earlier = canonicalWorktree?.allowed
-        ? this.earlierWorktreeClaim(request, canonicalWorktree.value)
-        : allow(ReasonCode.OK, null);
-      if (!earlier.allowed) return earlier as Decision<ClaimRecord[]>;
-
       for (const target of wanted) {
         const conflict = this.findConflict(request, target);
         if (conflict) return conflict as Decision<ClaimRecord[]>;
@@ -269,11 +167,9 @@ export class ClaimRegistry {
       const now = this.clock.nowIso();
       const expiresAt = isoPlus(now, request.ttlMs ?? DEFAULT_TTL_MS);
       const created: ClaimRecord[] = [];
-      if (earlier.value) this.handOver(request, earlier.value, now);
 
-      const acquisition = newClaimId();
-      for (const [index, target] of wanted.entries()) {
-        const claimId = `${acquisition}.${index + 1}.${wanted.length}`;
+      for (const target of wanted) {
+        const claimId = newClaimId();
         this.db.run(
           `INSERT INTO resource_claims (claim_id, repository_identity, branch, worktree_id,
                                         declared_path, run_id, owner_session_id,
@@ -309,77 +205,9 @@ export class ClaimRegistry {
           worktreeId: canonicalWorktree?.allowed ? canonicalWorktree.value : null,
           paths: request.declaredPaths ?? [],
           expiresAt,
-          ...(earlier.value ? { handedOverFrom: earlier.value.claimId } : {}),
         },
       });
       return allow(ReasonCode.OK, created);
-    });
-  }
-
-  /**
-   * S2 — the run's HELD claim on the checkout this request names, which may pass to it only when the
-   * runner answers that nothing a turn of the run started can still write the checkout: no turn or
-   * admission in flight there, no git child of one left, every execution there ended with its process
-   * confirmed gone. Anything else refuses, the earlier claim untouched.
-   */
-  private earlierWorktreeClaim(request: ClaimRequest, worktree: string): Decision<EarlierClaim | null> {
-    const held = this.db.get<{ claim_id: string }>(
-      `SELECT claim_id FROM resource_claims
-        WHERE status = 'HELD' AND repository_identity = ? AND worktree_id = ? AND run_id = ?`,
-      [request.repositoryIdentity, worktree, request.runId],
-    );
-    if (!held) return allow(ReasonCode.OK, null);
-    const writer = this.#checkoutWriter ? this.#checkoutWriter(request.runId, worktree) : NO_RUNNER;
-    if (writer) {
-      return deny(
-        ReasonCode.CLAIM_WORKTREE_CONFLICT,
-        `worktree is still held by this run's claim ${held.claim_id}: ${writer.reason}; ` +
-          "it passes to the run's next claim only once nothing of the run can write the checkout",
-        {
-          repositoryIdentity: request.repositoryIdentity,
-          worktree,
-          heldByRun: request.runId,
-          claimId: held.claim_id,
-          writer: writer.evidence,
-        },
-      );
-    }
-    const membership = claimAcquisition(this.db, held.claim_id);
-    if (membership?.membership !== "PROVEN" || membership.acquisition === null) {
-      return deny(
-        ReasonCode.CLAIM_WORKTREE_CONFLICT,
-        `worktree is still held by this run's claim ${held.claim_id}, and the rows acquired with it cannot be ` +
-          "proven complete; nothing is released",
-        {
-          repositoryIdentity: request.repositoryIdentity,
-          worktree,
-          heldByRun: request.runId,
-          claimId: held.claim_id,
-          membership: membership?.membership ?? null,
-        },
-      );
-    }
-    return allow(ReasonCode.OK, { claimId: held.claim_id, acquisition: membership.acquisition });
-  }
-
-  /**
-   * Releases every row of the earlier claim's own acquisition, proven complete (`claimAcquisition`), in
-   * the transaction that inserts this claim, so the checkout passes from one claim of the run to the
-   * next and is never free to another run in between. A claim acquired apart, even in the same
-   * millisecond, is not one of them.
-   */
-  private handOver(request: ClaimRequest, earlier: EarlierClaim, now: string): void {
-    const released = this.db.run(
-      `UPDATE resource_claims SET status = 'RELEASED', released_at = ?
-        WHERE status = 'HELD' AND run_id = ? AND claim_id >= ? AND claim_id < ?`,
-      [now, request.runId, `${earlier.acquisition}.`, `${earlier.acquisition}/`],
-    ).changes;
-    this.audit.record({
-      kind: "CLAIM_RELEASED",
-      runId: request.runId,
-      sessionId: request.ownerSessionId,
-      roleKey: request.ownerRoleKey,
-      evidence: { reason: "HANDED_OVER", claimId: earlier.claimId, acquisition: earlier.acquisition, released },
     });
   }
 

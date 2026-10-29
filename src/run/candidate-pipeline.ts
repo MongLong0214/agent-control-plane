@@ -11,7 +11,7 @@ import { collectBootstrapCeoDecisions, frozenBootstrapCeoDecisions } from "../bo
 import { collectBootstrapReviewEvidence } from "../bootstrap/bootstrap-review-evidence.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, type Evidence, allow, deny, isAcpError } from "../core/errors.ts";
+import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { commandsForMode, type BranchProfile } from "../contracts/manifest.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
@@ -24,12 +24,11 @@ import { currentBranch, mergeBase, revParse, tryRevParse } from "../git/git.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { ProductionGate, ProductionReadyPacket } from "../ceo/production-gate.ts";
-import { currentContractChangeTarget, isContractChangeRun, sameContractChangeBinding, type WorkflowRevision } from "../registry/contract-change-plan.ts";
+import { currentContractChangeTarget, isContractChangeRun, sameContractChangeBinding } from "../registry/contract-change-plan.ts";
 import { firstActivationFactsOf } from "../registry/manifest-activation-grants.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { BlindReviewGate, BlindReviewInvoker, ReviewPacket } from "../review/blind-review.ts";
-import { captureContractChangeReviewContext } from "../review/contract-change-review-context.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import {
   type CandidateSnapshot,
@@ -327,7 +326,6 @@ export class CandidatePipeline {
     // The carried manifest is what is reviewed, and what a later activation may install; the bar this
     // run is verified against stays its dispatch pin, rather than a contract the candidate proposes.
     let contractChange: Parameters<typeof buildNoRepositoryCandidateSnapshot>[0]["contractChange"];
-    let boundRevisions: readonly WorkflowRevision[] = [];
     if (isContractChangeRun(run)) {
       // #512 (v45) — or a first activation, judged against the project as it stands now (E2–E6).
       const current = currentContractChangeTarget(
@@ -338,7 +336,6 @@ export class CandidatePipeline {
       );
       if (!current.allowed) return current as Decision<CandidateSnapshot>;
       contractChange = current.value.binding;
-      if (current.value.firstActivation) boundRevisions = current.value.workflowRevisions;
     }
 
     const snapshot = participants.length === 0
@@ -405,24 +402,7 @@ export class CandidatePipeline {
       if (!held.allowed) return held as Decision<CandidateSnapshot>;
     }
 
-    // #1255 — what a CONTRACT_CHANGE candidate's review is shown beside its PLAN, read by ACP now, at the
-    // freeze, and bound to this candidate, so the review sees what held when the candidate was frozen.
-    const reviewContext = contractChange === undefined || run.projectId === null
-      ? null
-      : await captureContractChangeReviewContext(
-          { db: this.db, repositories: this.repositories, clock: this.clock },
-          { runId, projectId: run.projectId, candidateSnapshotDigest: digest, planDigest: contractChange.planDigest, workflowRevisions: boundRevisions },
-        );
-
     this.artifacts.put(runId, ArtifactKind.CANDIDATE_SNAPSHOT, snapshot, digest);
-    if (reviewContext !== null) {
-      try {
-        this.artifacts.put(runId, ArtifactKind.HANDOFF, reviewContext, digest);
-      } catch (error) {
-        // Not stored, the readback is absent, and the review packet names it as missing.
-        if (!isAcpError(error)) throw error;
-      }
-    }
     // One transaction records the new candidate and stales everything bound to an older
     // one, so no window exists in which superseded evidence still reads as current.
     this.runs.promoteCandidate(runId, digest);
@@ -518,7 +498,6 @@ export class CandidatePipeline {
           snapshot,
           contract: contract.value,
           contractDigest: run.contractDigest,
-          attemptId,
         });
         // Review rounds 1 and 2 (RF-REVIEW-02) — the review is asynchronous, and `plan_submit` can
         // replace the PLAN while it runs or while anything after it is awaited. A candidate whose PLAN
@@ -546,7 +525,6 @@ export class CandidatePipeline {
           snapshot,
           contract: contract.value,
           contractDigest: run.contractDigest,
-          attemptId,
         });
         const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, () =>
           this.contractChangePlanStillCurrent(input.runId, snapshot),
@@ -667,7 +645,6 @@ export class CandidatePipeline {
       contract: contract.value,
       contractDigest: run.contractDigest,
       verification: verified.value,
-      attemptId,
     });
 
     // #246 B2-a — a CONTRACT_CHANGE candidate's verdict is for the PLAN it names; one replaced since

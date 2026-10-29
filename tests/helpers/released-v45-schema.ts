@@ -98,10 +98,8 @@ export const contentDigests = (path: string, throughVersion = Infinity): { userV
     for (const table of listed) {
       if (throughVersion < 52 && ['resident_project_provisioning','canonical_session_entitlements','project_retirements'].includes(table.name)) continue;
       const v52Columns:Record<string,string[]> = {projects:['buzz_address','retired_at','supersedes_project_id'],repositories:['retired_at'],bootstrap_applications:['retired_at']};
-      // #1258 — v53's attempt column, which an image taken through v52 does not have.
-      const laterColumns:Record<string,string[]> = {...(throughVersion < 52 ? v52Columns : {}),...(throughVersion < 53 ? {verification_results:['attempt']} : {})};
-      const projection = laterColumns[table.name]
-        ? (raw.prepare('SELECT name FROM pragma_table_info(?)').pluck().all(table.name) as string[]).filter(c => !laterColumns[table.name]!.includes(c)).map(c => `"${c}"`).join(',') : '*';
+      const projection = throughVersion < 52 && v52Columns[table.name]
+        ? (raw.prepare('SELECT name FROM pragma_table_info(?)').pluck().all(table.name) as string[]).filter(c => !v52Columns[table.name]!.includes(c)).map(c => `"${c}"`).join(',') : '*';
       const quoted = `"${table.name.replace(/"/g, '""')}"`;
       if (table.wr === 0) {
         const columns = (raw.prepare("SELECT name FROM pragma_table_info(?)").pluck().all(table.name) as string[]).map((name) => name.toLowerCase());
