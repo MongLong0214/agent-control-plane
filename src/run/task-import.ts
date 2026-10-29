@@ -166,8 +166,9 @@ const invalidPng = (bytes: Buffer): string | null => {
   let sawHeader = false;
   let sawPalette = false;
   let sawData = false;
-  let dataEnded = false;
   let sawEnd = false;
+  let gamma: number | null = null;
+  let sawSrgb = false;
   const compressed: Buffer[] = [];
   while (cursor < bytes.length) {
     if (bytes.length - cursor < 12) return "the PNG ends inside a chunk";
@@ -198,20 +199,29 @@ const invalidPng = (bytes: Buffer): string | null => {
       colorType = color;
       sawHeader = true;
     } else if (type === "PLTE") {
-      if (sawPalette || sawData || colorType === 0 || colorType === 4 || length === 0 || length % 3 !== 0 || length > 3 * 2 ** bitDepth) {
+      const paletteLimit = colorType === 3 ? 3 * 2 ** bitDepth : 768;
+      if (sawPalette || sawData || colorType === 0 || colorType === 4 || length === 0 || length % 3 !== 0 || length > paletteLimit) {
         return "the PNG has an invalid PLTE";
       }
       sawPalette = true;
     } else if (type === "IDAT") {
-      if (dataEnded || sawEnd || (colorType === 3 && !sawPalette)) return "the PNG IDAT chunks are not consecutive or lack the required palette";
+      if (sawEnd || (colorType === 3 && !sawPalette)) return "the PNG IDAT chunks lack the required palette or follow IEND";
       sawData = true;
       compressed.push(data);
     } else if (type === "IEND") {
       if (!sawData || sawEnd || length !== 0 || cursor !== bytes.length) return "the PNG has an invalid IEND or trailing bytes";
       sawEnd = true;
+    } else if (type === "gAMA") {
+      if (gamma !== null || sawPalette || sawData || length !== 4 || data.readUInt32BE(0) === 0) return "the PNG has an invalid gAMA";
+      gamma = data.readUInt32BE(0);
+      if (sawSrgb && gamma !== 45_455) return "the PNG gAMA conflicts with sRGB";
+    } else if (type === "sRGB") {
+      if (sawSrgb || sawPalette || sawData || length !== 1 || data[0]! > 3 || (gamma !== null && gamma !== 45_455)) return "the PNG has an invalid sRGB";
+      sawSrgb = true;
     } else {
-      if ((typeBytes[0]! & 0x20) === 0) return `the PNG has an unknown critical chunk ${type}`;
-      if (sawData) dataEnded = true;
+      return (typeBytes[0]! & 0x20) === 0
+        ? `the PNG has an unknown critical chunk ${type}`
+        : `the PNG ancillary chunk ${type} is not in the structurally validated allowlist`;
     }
   }
   if (!sawEnd) return "the PNG has no IEND";
@@ -219,7 +229,14 @@ const invalidPng = (bytes: Buffer): string | null => {
   const decodedLength = height * (rowBytes + 1);
   if (!Number.isSafeInteger(decodedLength) || decodedLength > IMPORT_MAX_TOTAL_BYTES) return "the decoded PNG exceeds the import bound";
   try {
-    const decoded = inflateSync(Buffer.concat(compressed), { maxOutputLength: decodedLength });
+    const encoded = Buffer.concat(compressed);
+    // Node returns this documented shape for `info: true`; @types/node still declares only Buffer.
+    const inflated = inflateSync(encoded, { maxOutputLength: decodedLength, info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten: number };
+    };
+    const decoded = inflated.buffer;
+    if (inflated.engine.bytesWritten !== encoded.length) return "the PNG pixel stream has trailing compressed bytes";
     if (decoded.length !== decodedLength) return "the PNG pixel stream has the wrong length";
     for (let offset = 0; offset < decoded.length; offset += rowBytes + 1) if (decoded[offset]! > 4) return "the PNG has an invalid row filter";
   } catch {
@@ -243,6 +260,73 @@ const sfntChecksum = (bytes: Buffer, zeroAdjustment = false): number => {
 };
 
 interface SfntTable { tag: string; checksum: number; offset: number; length: number; bytes: Buffer }
+
+const hasOnlyGlyphPadding = (glyph: Buffer, cursor: number): boolean =>
+  glyph.length - cursor <= 3 && [...glyph.subarray(cursor)].every((byte) => byte === 0);
+
+/** Validates one non-empty simple or composite `glyf` record and consumes it through zero padding. */
+const invalidGlyph = (glyph: Buffer, glyphCount: number): string | null => {
+  if (glyph.length < 10) return "a non-empty TrueType glyph is shorter than its header";
+  const contours = glyph.readInt16BE(0);
+  let cursor = 10;
+  if (contours >= 0) {
+    if (cursor + contours * 2 + 2 > glyph.length) return "a simple TrueType glyph ends inside its contour endpoints";
+    let lastPoint = -1;
+    for (let contour = 0; contour < contours; contour += 1) {
+      const endpoint = glyph.readUInt16BE(cursor);
+      cursor += 2;
+      if (endpoint <= lastPoint) return "a simple TrueType glyph has unordered contour endpoints";
+      lastPoint = endpoint;
+    }
+    const instructions = glyph.readUInt16BE(cursor);
+    cursor += 2;
+    if (instructions > glyph.length - cursor) return "a simple TrueType glyph ends inside its instructions";
+    cursor += instructions;
+    const points = lastPoint + 1;
+    let flags = 0;
+    let coordinateBytes = 0;
+    while (flags < points) {
+      if (cursor >= glyph.length) return "a simple TrueType glyph ends inside its flags";
+      const flag = glyph[cursor++]!;
+      let repeats = 1;
+      if ((flag & 0x08) !== 0) {
+        if (cursor >= glyph.length) return "a simple TrueType glyph lacks its flag repeat count";
+        repeats += glyph[cursor++]!;
+      }
+      if (flags + repeats > points) return "a simple TrueType glyph repeats flags past its point count";
+      const xBytes = (flag & 0x02) !== 0 ? 1 : (flag & 0x10) !== 0 ? 0 : 2;
+      const yBytes = (flag & 0x04) !== 0 ? 1 : (flag & 0x20) !== 0 ? 0 : 2;
+      coordinateBytes += repeats * (xBytes + yBytes);
+      flags += repeats;
+    }
+    cursor += coordinateBytes;
+    if (cursor > glyph.length || !hasOnlyGlyphPadding(glyph, cursor)) return "a simple TrueType glyph has truncated coordinates or hidden trailing bytes";
+    return null;
+  }
+  let flags = 0;
+  do {
+    if (cursor + 4 > glyph.length) return "a composite TrueType glyph ends inside a component";
+    flags = glyph.readUInt16BE(cursor);
+    const componentGlyph = glyph.readUInt16BE(cursor + 2);
+    cursor += 4;
+    if (componentGlyph >= glyphCount) return "a composite TrueType glyph names a missing component";
+    cursor += (flags & 0x0001) !== 0 ? 4 : 2;
+    const transforms = [(flags & 0x0008) !== 0, (flags & 0x0040) !== 0, (flags & 0x0080) !== 0].filter(Boolean).length;
+    if (transforms > 1) return "a composite TrueType glyph has conflicting transforms";
+    if ((flags & 0x0008) !== 0) cursor += 2;
+    else if ((flags & 0x0040) !== 0) cursor += 4;
+    else if ((flags & 0x0080) !== 0) cursor += 8;
+    if (cursor > glyph.length) return "a composite TrueType glyph ends inside its arguments or transform";
+  } while ((flags & 0x0020) !== 0);
+  if ((flags & 0x0100) !== 0) {
+    if (cursor + 2 > glyph.length) return "a composite TrueType glyph lacks its instruction length";
+    const instructions = glyph.readUInt16BE(cursor);
+    cursor += 2;
+    if (instructions > glyph.length - cursor) return "a composite TrueType glyph ends inside its instructions";
+    cursor += instructions;
+  }
+  return hasOnlyGlyphPadding(glyph, cursor) ? null : "a composite TrueType glyph has hidden trailing bytes";
+};
 
 /** A complete TrueType sfnt parse. It rejects gaps, overlaps, trailing bytes and malformed core tables. */
 const invalidTrueType = (bytes: Buffer): string | null => {
@@ -291,19 +375,61 @@ const invalidTrueType = (bytes: Buffer): string | null => {
   const glyf = byTag.get("glyf")!.bytes;
   const longLoca = head.readInt16BE(50);
   const locaWidth = longLoca === 0 ? 2 : longLoca === 1 ? 4 : 0;
-  if (locaWidth === 0 || loca.length !== (glyphs + 1) * locaWidth || byTag.get("hmtx")!.length < longMetrics * 4 + (glyphs - longMetrics) * 2) {
+  if (locaWidth === 0 || loca.length !== (glyphs + 1) * locaWidth || byTag.get("hmtx")!.length !== longMetrics * 4 + (glyphs - longMetrics) * 2) {
     return "the TrueType glyph index or metrics are invalid";
   }
   let previousLocation = 0;
+  const locations: number[] = [];
   for (let index = 0; index <= glyphs; index += 1) {
     const location = locaWidth === 2 ? loca.readUInt16BE(index * 2) * 2 : loca.readUInt32BE(index * 4);
     if (location < previousLocation || location > glyf.length) return "the TrueType glyph locations are invalid";
+    locations.push(location);
     previousLocation = location;
   }
+  for (let index = 0; index < glyphs; index += 1) {
+    const start = locations[index]!;
+    const end = locations[index + 1]!;
+    if (end > start) {
+      const problem = invalidGlyph(glyf.subarray(start, end), glyphs);
+      if (problem !== null) return problem;
+    }
+  }
+  const glyfPadding = glyf.subarray(previousLocation);
+  if (glyfPadding.length > 3 || [...glyfPadding].some((byte) => byte !== 0)) return "the TrueType glyf endpoint leaves non-padding bytes unindexed";
   const cmap = byTag.get("cmap")!.bytes;
   const name = byTag.get("name")!.bytes;
-  if (cmap.length < 12 || cmap.readUInt16BE(0) !== 0 || cmap.readUInt16BE(2) === 0 || 4 + cmap.readUInt16BE(2) * 8 > cmap.length) return "the TrueType cmap table is invalid";
-  if (name.length < 6 || 6 + name.readUInt16BE(2) * 12 > name.length || name.readUInt16BE(4) > name.length) return "the TrueType name table is invalid";
+  const cmapCount = cmap.length >= 4 ? cmap.readUInt16BE(2) : 0;
+  const cmapDirectoryEnd = 4 + cmapCount * 8;
+  if (cmap.length < 12 || cmap.readUInt16BE(0) !== 0 || cmapCount === 0 || cmapDirectoryEnd > cmap.length) return "the TrueType cmap table is invalid";
+  for (let index = 0; index < cmapCount; index += 1) {
+    const subtableOffset = cmap.readUInt32BE(4 + index * 8 + 4);
+    if (subtableOffset < cmapDirectoryEnd || subtableOffset + 4 > cmap.length) return "a TrueType cmap subtable offset is invalid";
+    const formatNumber = cmap.readUInt16BE(subtableOffset);
+    let subtableLength = 0;
+    if ([0, 2, 4, 6].includes(formatNumber)) subtableLength = cmap.readUInt16BE(subtableOffset + 2);
+    else if ([8, 10, 12, 13].includes(formatNumber)) {
+      if (subtableOffset + 8 > cmap.length) return "a TrueType cmap subtable header is truncated";
+      subtableLength = cmap.readUInt32BE(subtableOffset + 4);
+    } else if (formatNumber === 14) {
+      if (subtableOffset + 6 > cmap.length) return "a TrueType cmap subtable header is truncated";
+      subtableLength = cmap.readUInt32BE(subtableOffset + 2);
+    } else return "the TrueType cmap format is unsupported";
+    if (subtableLength < 4 || subtableLength > cmap.length - subtableOffset) return "a TrueType cmap subtable length is invalid";
+  }
+  const nameCount = name.length >= 6 ? name.readUInt16BE(2) : 0;
+  const nameRecordsEnd = 6 + nameCount * 12;
+  const stringsOffset = name.length >= 6 ? name.readUInt16BE(4) : 0;
+  if (name.length < 6 || name.readUInt16BE(0) !== 0 || nameCount === 0 || nameRecordsEnd > name.length || stringsOffset < nameRecordsEnd || stringsOffset > name.length) {
+    return "the TrueType name table is invalid";
+  }
+  for (let index = 0; index < nameCount; index += 1) {
+    const record = 6 + index * 12;
+    const stringLength = name.readUInt16BE(record + 8);
+    const stringOffset = name.readUInt16BE(record + 10);
+    if (stringOffset > name.length - stringsOffset || stringLength > name.length - stringsOffset - stringOffset) {
+      return "a TrueType name string leaves its table";
+    }
+  }
   if (byTag.get("OS/2")!.length < 78 || byTag.get("post")!.length < 32) return "a required TrueType table is truncated";
   return null;
 };

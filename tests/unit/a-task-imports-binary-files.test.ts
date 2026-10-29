@@ -12,7 +12,19 @@ import { IMPORT_MAX_FILE_BYTES, IMPORT_MAX_TOTAL_BYTES } from "../../src/run/tas
 import { TaskWriteTargets } from "../../src/run/task-write-target.ts";
 import { WorkerTurnEvent, WorkerTurnRunner, type WorkerTurnOptions, workerSuccessDigest } from "../../src/run/worker-turn.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeCore, tempDir } from "../helpers/fixtures.ts";
-import { VALID_TTF, validPng, validPngOfSize } from "../helpers/import-fixtures.ts";
+import {
+  VALID_TTF,
+  pngWithIdatSuffix,
+  pngWithOversizedPalette,
+  pngWithPrivateAncillary,
+  ttfWithCmapSubtableOutside,
+  ttfWithHiddenHmtxPayload,
+  ttfWithNameStringOutside,
+  ttfWithNonzeroGlyfPadding,
+  ttfWithShortGlyphRecords,
+  validPng,
+  validPngOfSize,
+} from "../helpers/import-fixtures.ts";
 import { FakeWorkerAdapter, recordSeededTarget, seedWorkerWorld, type WorkerWorld } from "../helpers/worker-turn-fixture.ts";
 
 /**
@@ -370,7 +382,15 @@ describe("#1232 a task imports binary files through its write target", () => {
       ["assets/payload.bmp", forgedBmp],
       ["assets/malformed.png", malformedPng],
       ["assets/trailing.png", pngWithTrailingJavaScript],
+      ["assets/idat-trailing.png", pngWithIdatSuffix(Buffer.from("process.stdout.write('EXECUTED')\n"))],
+      ["assets/oversized-palette.png", pngWithOversizedPalette()],
+      ["assets/private-code.png", pngWithPrivateAncillary(Buffer.from("<?php echo 'EXECUTED'; ?>"))],
       ["assets/trailing.ttf", Buffer.concat([VALID_TTF, Buffer.from("process.stdout.write('EXECUTED')\n")])],
+      ["assets/glyf-padding.ttf", ttfWithNonzeroGlyfPadding()],
+      ["assets/short-glyphs.ttf", ttfWithShortGlyphRecords()],
+      ["assets/hidden-hmtx.ttf", ttfWithHiddenHmtxPayload()],
+      ["assets/cmap-outside.ttf", ttfWithCmapSubtableOutside()],
+      ["assets/name-outside.ttf", ttfWithNameStringOutside()],
       ["assets/mismatched.ttf", validPng()],
       ["assets/mismatched.png", VALID_TTF],
     ] as const) {
