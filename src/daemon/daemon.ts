@@ -35,6 +35,7 @@ import {
   BOOTSTRAP_PLAN_RECOVERY_WAKE,
   BOOTSTRAP_RESULT_RECOVERY_WAKE,
   BOOTSTRAP_REVIEW_RETRY_WAKE,
+  SESSION_WAKE_TRIGGER_COMPLETED,
   ProvisionedSessionRuntime,
   planRecoveryTriggerId,
   planRecoveryTriggerKind,
@@ -2404,8 +2405,11 @@ export class Daemon {
    *
    * The same pass also makes the review retry (`#bootstrapReviewRetry`): a result submitted for the
    * current PLAN whose candidate's latest review ended unavailable wakes the owner once per (run,
-   * owner binding generation, candidate) to submit that result again, under the same runtime
-   * conditions, marked by a `BOOTSTRAP_REVIEW_RETRY_WAKE` audit event.
+   * candidate) to submit that result again, under the same runtime
+   * conditions, marked by a `BOOTSTRAP_REVIEW_RETRY_WAKE` audit event. A failed/refused turn or a
+   * restart or owner-generation recovery after admission re-presents that exact trigger; only its durable
+   * `SESSION_WAKE_TRIGGER_COMPLETED` settlement spends the retry. If the review is still unavailable
+   * after that completed turn, the run fails explicitly instead of waiting for a person.
    */
   wakeBootstrapResultRecovery(): BootstrapResultRecoveryReport {
     const woken: BootstrapResultRecoveryReport["woken"] = [];
@@ -2430,6 +2434,62 @@ export class Daemon {
       const resultStage = this.#bootstrapResultOwnerStands(runId, owner, planDigest);
       const retry = resultStage ? null : this.#bootstrapReviewRetry(runId, owner, planDigest);
       if (!resultStage && retry === null) continue;
+      if (retry !== null) {
+        const retryWake = this.cp.db.get<{ trigger_id: unknown; binding_generation: unknown }>(
+          `SELECT json_extract(evidence_json, '$.triggerId') AS trigger_id,
+                  json_extract(evidence_json, '$.bindingGeneration') AS binding_generation
+             FROM audit_events
+            WHERE kind = ? AND run_id = ?
+              AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?
+            ORDER BY event_id
+            LIMIT 1`,
+          [BOOTSTRAP_REVIEW_RETRY_WAKE, runId, retry.candidateSnapshotDigest],
+        );
+        if (typeof retryWake?.trigger_id === "string") {
+          const completed = this.cp.db.get<{ n: number }>(
+            `SELECT 1 AS n FROM audit_events
+              WHERE kind = ? AND json_extract(evidence_json, '$.triggerId') = ?
+              LIMIT 1`,
+            [SESSION_WAKE_TRIGGER_COMPLETED, retryWake.trigger_id],
+          );
+          if (completed) {
+            // The exact admitted retry turn completed, but the candidate's latest review is still
+            // unavailable. Its finite review-recovery budget is spent; do not create a human wait.
+            this.cp.runs.transition(
+              runId,
+              RunState.FAILED,
+              "bootstrap blind review remained unavailable after its bounded retry",
+              {
+                failureClass: "BLIND_REVIEW_RETRY_EXHAUSTED",
+                bindingGeneration: owner.bindingGeneration,
+                retryBindingGeneration: retryWake.binding_generation,
+                planDigest,
+                candidateSnapshotDigest: retry.candidateSnapshotDigest,
+                unavailableEventId: retry.unavailableEventId,
+                triggerId: retryWake.trigger_id,
+              },
+            );
+            continue;
+          }
+          // Admission is durable but a failed/refused turn, or a daemon restart before settlement,
+          // is not a spent retry. Re-present the same deterministic trigger; the runtime coalesces
+          // an in-progress copy and releases a failed one.
+          if (
+            !runtime.drivesSession(owner.sessionId, Role.BOOTSTRAP_CTO) ||
+            !runtime.holds(owner.sessionId) ||
+            !runtime.attachedToDaemon() ||
+            runtime.turnInProgress(owner.sessionId)
+          ) {
+            continue;
+          }
+          runtime.wake(owner.roleKey, [{
+            id: retryWake.trigger_id,
+            kind: reviewRetryTriggerKind(runId),
+            stillAdmissible: () => this.#bootstrapReviewRetry(runId, owner, planDigest) !== null,
+          }]);
+          continue;
+        }
+      }
       if (
         !runtime.drivesSession(owner.sessionId, Role.BOOTSTRAP_CTO) ||
         !runtime.holds(owner.sessionId) ||
@@ -2439,18 +2499,6 @@ export class Daemon {
         continue;
       }
       if (retry !== null) {
-        // One official retry per (run, owner generation, candidate): a retry whose own review is
-        // unavailable again records a new unavailable event, and keying on that alone would wake the
-        // owner on every tick for as long as the reviewer stays down.
-        const alreadyRetried = this.cp.db.get<{ n: number }>(
-          `SELECT 1 AS n FROM audit_events
-            WHERE kind = ? AND run_id = ?
-              AND json_extract(evidence_json, '$.bindingGeneration') = ?
-              AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?
-            LIMIT 1`,
-          [BOOTSTRAP_REVIEW_RETRY_WAKE, runId, owner.bindingGeneration, retry.candidateSnapshotDigest],
-        );
-        if (alreadyRetried) continue;
         const triggerId = reviewRetryTriggerId(
           runId, owner.bindingGeneration, retry.candidateSnapshotDigest, retry.unavailableEventId,
         );

@@ -4,26 +4,55 @@ import { fileURLToPath } from "node:url";
 import { prepareVitestRpcTrace, VITEST_RPC_TRACE_ENV } from "./tests/helpers/vitest-rpc-trace.ts";
 
 const rpcTrace = prepareVitestRpcTrace(process.env[VITEST_RPC_TRACE_ENV], process.cwd());
+const checkoutWriterProcessWitness = "tests/unit/a-task-claim-is-handed-over-at-its-execution-end.test.ts";
+const sourceAlias = { "@": fileURLToPath(new URL("./src", import.meta.url)) };
+// #1093: HOME is private before any test file loads. Both projects must use the same setup so moving
+// a file between them cannot weaken the live-state boundary or the optional RPC trace.
+const setupFiles = [
+  fileURLToPath(new URL("./tests/helpers/isolated-home.ts", import.meta.url)),
+  ...(rpcTrace ? [fileURLToPath(new URL("./tests/helpers/vitest-rpc-trace-worker.ts", import.meta.url))] : []),
+];
 
 export default defineConfig({
   resolve: {
-    alias: {
-      "@": fileURLToPath(new URL("./src", import.meta.url)),
-    },
+    alias: sourceAlias,
   },
   test: {
-    include: ["tests/**/*.test.ts"],
-    testTimeout: 60_000,
-    hookTimeout: 60_000,
-    // Forks, not threads. This suite loads a native addon (better-sqlite3) and starts real
-    // sandboxed children; on the macOS runner that combination crashed the worker outright —
-    // `Segmentation fault: 11`, exit 139, with the suite otherwise passing. A crashed worker
-    // is not a test failure and reads like one, or like a missing result file downstream.
-    // Forks isolate each file in its own process, where a native addon is far safer.
-    pool: "forks",
-    // These files start their own process trees. CPU-count fork concurrency can starve
-    // their startup and reap deadlines on the host, even when each test passes alone.
-    maxWorkers: 2,
+    // This file stops and kills real process groups while proving restart recovery. Once shard 2
+    // grew, running a second test-file fork beside it made the macOS 15 hosted runner lose those
+    // witnesses even though the exact file passes in isolation. Keep ordinary files at two workers,
+    // then run this one as its own ordered project group; no test is skipped or retried.
+    projects: [
+      {
+        resolve: { alias: sourceAlias },
+        test: {
+          name: "parallel",
+          include: ["tests/**/*.test.ts"],
+          exclude: [checkoutWriterProcessWitness],
+          testTimeout: 60_000,
+          hookTimeout: 60_000,
+          // Forks isolate native addons and real sandbox children; two workers retain the existing
+          // ordinary-suite throughput without sharing one native-addon process.
+          pool: "forks",
+          maxWorkers: 2,
+          setupFiles,
+          sequence: { groupOrder: 0 },
+        },
+      },
+      {
+        resolve: { alias: sourceAlias },
+        test: {
+          name: "checkout-writer-process-witness",
+          include: [checkoutWriterProcessWitness],
+          testTimeout: 60_000,
+          hookTimeout: 60_000,
+          pool: "forks",
+          fileParallelism: false,
+          setupFiles,
+          sequence: { groupOrder: 1 },
+        },
+      },
+    ],
     // The JSON reporter is declared here rather than passed on the command line: `pnpm test --`
     // forwards `--` to vitest, which then has to guess whether the rest are flags or filters.
     // The gate reads the JSON report rather than the exit status, so it needs that report even
@@ -33,12 +62,6 @@ export default defineConfig({
         ? (["default", "junit", "json"] as const)
         : (["default"] as const)),
       ...(rpcTrace ? [rpcTrace.reporter] : []),
-    ],
-    // #1093: HOME is a private temporary directory before any test file loads, so no run allocates
-    // under the live daemon's scratch root. First, so every later setup file already sees it.
-    setupFiles: [
-      fileURLToPath(new URL("./tests/helpers/isolated-home.ts", import.meta.url)),
-      ...(rpcTrace ? [fileURLToPath(new URL("./tests/helpers/vitest-rpc-trace-worker.ts", import.meta.url))] : []),
     ],
     outputFile: {
       junit: "evidence/junit.xml",
