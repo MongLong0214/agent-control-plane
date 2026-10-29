@@ -27,7 +27,7 @@ export const hostObservationSchema = z.object({
   routing: z.object({ generation: z.number().int().optional(), roomId: z.string().uuid() }).optional(),
   resident: z.object({ pid: z.number().int().positive(), startedAt: z.string().min(1), cwd: z.string(), sessionUuid: z.string().uuid(), tmuxName: z.string(), tmuxAncestry: z.literal(true), bridgeSessionId: z.string().min(1) }).optional(),
   fleet: z.boolean().optional(), retired: z.boolean().optional(), retirementArchivePath: z.string().optional(),
-  buzzRoomArchived: z.boolean().optional(), identityArchivePath: z.string().optional(), retirementVerified: z.literal(true).optional(),
+  buzzRoom: z.enum(['archived', 'none']).optional(), identityArchivePath: z.string().optional(), retirementVerified: z.literal(true).optional(),
 }).strict();
 export type HostObservation = z.infer<typeof hostObservationSchema>;
 export interface HostProjectProvisioner {
@@ -40,20 +40,23 @@ export class HostProvisionerError extends Error {
   }
 }
 
-/** #1229 — the host refused a retirement it cannot complete yet; `requiredOrder` is what lets it complete. */
+/**
+ * #1229 — the host stopped a retirement (or its verification) and said how far it got. `hostChanged: false` is a
+ * refusal before its first host write: the host is exactly as it was. `requiredOrder` is what lets retirement complete.
+ */
 export class HostRetirementRefusal extends Error {
-  constructor(readonly reason: string, readonly requiredOrder: readonly string[]) {
+  constructor(readonly reason: string, readonly requiredOrder: readonly string[], readonly hostChanged: boolean) {
     super(`host retirement refused: ${reason}`);
   }
 }
 
-/** The provisioner's own structured retirement refusal: the last stderr line, and nothing else from the child. */
+/** The provisioner's own structured retirement outcome: the last stderr line, and nothing else from the child. */
 const retirementRefusalOf = (stderr: string): HostRetirementRefusal | null => {
   try {
-    const refusal = (JSON.parse(stderr.trim().split('\n').at(-1) ?? '') as {retirementRefusal?: {reason?: unknown; requiredOrder?: unknown}}).retirementRefusal;
-    const order = refusal?.requiredOrder;
-    if (typeof refusal?.reason !== 'string' || !Array.isArray(order) || order.length === 0 || !order.every(step => typeof step === 'string')) return null;
-    return new HostRetirementRefusal(refusal.reason, order as string[]);
+    const outcome = (JSON.parse(stderr.trim().split('\n').at(-1) ?? '') as {retirementOutcome?: {hostChanged?: unknown; reason?: unknown; requiredOrder?: unknown}}).retirementOutcome;
+    const order = outcome?.requiredOrder;
+    if (typeof outcome?.hostChanged !== 'boolean' || typeof outcome.reason !== 'string' || !Array.isArray(order) || order.length === 0 || !order.every(step => typeof step === 'string')) return null;
+    return new HostRetirementRefusal(outcome.reason, order as string[], outcome.hostChanged);
   } catch { return null; }
 };
 

@@ -20,6 +20,9 @@ class ProvisionerExecutionFailure extends Error {
   constructor(message, error) {super(message);this.stderr = error.stderr;}
 }
 let operation = 'unknown';
+// #1229 — set just before retire's first host write: a failure before it leaves the host exactly as it was.
+let hostChanged = false;
+let rerun = 'run agentctl project retire again';
 const check = (ok, why) => { if (!ok) throw new ProvisionerRefusal(why); };
 const resolvedBinary = bin => {
   const name = bin.toUpperCase();
@@ -227,14 +230,16 @@ try {
     if (record) atomic(sessionFile,JSON.stringify(resident));
     return resident;
   };
-  // #1229 — everything retirement must know before it changes anything: the CTO process, the roster route and the clone.
-  // Read only. verify-retire asks it alone, before the daemon suspends, records or revokes anything; retire asks it
-  // again before its first host write, so a change in between is refused with nothing written. A refusal it cannot
-  // resolve by itself names the order that lets retirement complete; nothing here stops a process it could not verify.
+  // #1229 — everything retirement must know before it changes anything: the CTO process, the roster route, the clone
+  // and the Buzz room (#1230). Read only. verify-retire asks it alone, before the daemon suspends, records or revokes
+  // anything; retire asks it again before its first host write, so a change in between is refused with nothing written.
+  // Every refusal here names the order that lets retirement complete; nothing here stops a process it could not verify.
+  rerun = `run agentctl project retire ${a.projectId} again`;
+  const refuseWithOrder = (why, ...steps) => {throw new RetirementOrderRefusal(why,[...steps,rerun]);};
   const retirementPreflight = () => {
     const requiredOrder = pid => [
       `end the CTO session ${a.sessionUuid}${pid ? ` (pid ${pid})` : ''} yourself: exit it in its own terminal`,
-      `run agentctl project retire ${a.projectId} again`,
+      rerun,
     ];
     const sessionRecordNames = pid => {
       try {const rc = read(join(home,'.claude','sessions',`${pid}.json`));return (rc.sessionId ?? rc.sessionUuid ?? rc.session_id) === a.sessionUuid;} catch {return false;}
@@ -264,14 +269,45 @@ try {
       }
     }
     const plannedRoute = existsSync(rosterFile) ? read(rosterFile).channels?.[a.roomId] : undefined;
-    check(!plannedRoute || plannedRoute.status === 'retired' || plannedRoute.acp_project_id === a.projectId,'retirement route conflict');
+    if (plannedRoute && plannedRoute.status !== 'retired' && plannedRoute.acp_project_id !== a.projectId)
+      refuseWithOrder(`retirement route conflict: the roster routes room ${a.roomId} to project ${plannedRoute.acp_project_id}`,`correct room ${a.roomId}'s entry in ${rosterFile}: it must name project ${a.projectId} or be retired`);
     const archive = join(home,'projects','.retired',`${repoName}-${a.projectId}`);
     if (existsSync(a.clonePath)) {
-      check(!existsSync(archive),'retirement archive already exists alongside clone');
+      if (existsSync(archive)) refuseWithOrder(`retirement archive already exists alongside clone: ${archive}`,`move ${archive} aside`);
       const remote = run('git',['remote','get-url','origin'],{cwd:a.clonePath}).trim();
-      check([origin,`git@github.com:${match[1]}/${repoName}.git`].includes(remote),'retirement clone origin mismatch');
+      if (![origin,`git@github.com:${match[1]}/${repoName}.git`].includes(remote))
+        refuseWithOrder(`retirement clone origin mismatch: ${a.clonePath} points at ${remote}`,`point ${a.clonePath}'s origin at ${origin}, or move that clone aside`);
     }
-    return {resident,archive};
+    // #1230 — the room. ACP's own records say whether this project has one: the roster's route for the allocation's
+    // room naming this project, or the room intent naming it, or the room itself being visible to this identity. With
+    // none of them there is no room and nothing to archive. A room that exists must be archived already or archivable
+    // by this identity as one of its owners; anything else is refused here, before anything moves.
+    const intentRoom = existsSync(intentFile) ? read(intentFile).roomId : undefined;
+    const pk = existsSync(a.privateKeyFile) ? pub() : null;
+    const room = pk === null ? null : buzz(['channels','get','--channel',a.roomId]);
+    if (room !== null) check(object(room) && room.channel_id === a.roomId && typeof room.name === 'string' && room.name.length > 0,'retiring Buzz room readback mismatch');
+    const recorded = plannedRoute?.acp_project_id === a.projectId || intentRoom === a.roomId;
+    if (!recorded && room === null) return {resident,archive,room:{state:'none'}};
+    // A rerun after this retirement's host step already finished: retire archives the room before it retires the route
+    // and moves the key and intent aside last, so a retired route with neither left is a room already archived.
+    if (pk === null && intentRoom === undefined && plannedRoute?.acp_project_id === a.projectId && plannedRoute.status === 'retired') return {resident,archive,room:{state:'archived'}};
+    const owner = plannedRoute?.peer?.pubkey ?? 'not recorded';
+    if (pk === null) refuseWithOrder(`Buzz room ${a.roomId} cannot be archived: no key for ${a.identityName} at ${a.privateKeyFile}`,
+      `put the key of room ${a.roomId}'s owner (pubkey ${owner} per the roster) at ${a.privateKeyFile}; retirement archives the room with it and then moves it aside`);
+    if (room === null) refuseWithOrder(`Buzz room ${a.roomId} is not visible to ${a.identityName} (${pk})`,
+      `make ${pk} an owner of room ${a.roomId}, or put the key of its owner (pubkey ${owner} per the roster) at ${a.privateKeyFile}`);
+    const members = buzz(['channels','members','--channel',a.roomId]);
+    check(Array.isArray(members) && members.every(m => object(m) && typeof m.pubkey === 'string' && typeof m.role === 'string'),'invalid Buzz room roster');
+    if (roomArchived(room.name)) return {resident,archive,room:{state:'archived',name:room.name}};
+    if (members.some(m => m.pubkey === pk && m.role === 'owner')) return {resident,archive,room:{state:'archive',name:room.name}};
+    const owners = members.filter(m => m.role === 'owner').map(m => m.pubkey);
+    refuseWithOrder(`Buzz room ${a.roomId} is owned by ${owners.length ? owners.join(', ') : 'no member visible to this identity'}, and ${a.identityName} (${pk}) is ${members.find(m => m.pubkey === pk)?.role ?? 'not a member'}`,
+      `have an owner archive room ${a.roomId} (buzz channels archive --channel ${a.roomId}), or make ${pk} an owner of it`);
+  };
+  const roomArchived = name => {
+    const found = buzz(['channels','search','--query',name,'--exact','--include-archived']);
+    check(Array.isArray(found),'invalid channel search');
+    return found.some(c => (c.channel_id ?? c.id) === a.roomId && c.archived === true);
   };
   let result = {};
   switch(req.operation) {
@@ -442,7 +478,14 @@ try {
     case 'observe': result = {checkout:checkout(checkoutRequirement),resident:observeResident()}; break;
     case 'verify-retire': retirementPreflight(); result = {retirementVerified:true}; break;
     case 'retire': {
-      const {resident,archive} = retirementPreflight();
+      const {resident,archive,room} = retirementPreflight();
+      // #1230 — the room first: nothing else on the host changes, and nothing moves, until its archive is confirmed.
+      if (room.state === 'archive') {
+        hostChanged = true; // the archive may land even when its answer is lost
+        run('buzz',['channels','archive','--channel',a.roomId],{env:buzzEnv()});
+        check(roomArchived(room.name),'Buzz room archive readback mismatch');
+      }
+      hostChanged = true;
       rmSync(join(dirname(a.bootPacket),`${a.fleetName}.resident.json`),{force:true});
       if (existsSync(rosterFile)) { const roster = read(rosterFile); const route = roster.channels[a.roomId]; if (route && route.status !== 'retired') { check(route.acp_project_id === a.projectId,'retirement route conflict'); route.status = 'retired'; roster.generation++; atomic(rosterFile,JSON.stringify(roster,null,2)+'\n'); } }
       if (existsSync(fleetFile)) atomic(fleetFile,readFileSync(fleetFile,'utf8').split('\n').filter(l => {const f=l.split('\t');return f[0] !== a.fleetName && !(f[1] === a.clonePath && f[4] === a.sessionUuid);}).join('\n'));
@@ -452,28 +495,8 @@ try {
         check(readProcessStartToken(resident.pid) !== resident.startedAt,'resident did not stop');
       }
       if (existsSync(a.clonePath)) {mkdirSync(dirname(archive),{recursive:true,mode:0o700});renameSync(a.clonePath,archive);}
-      // #1230 — the room is archived by its owner, this identity's key, through the Buzz CLI, and read back as archived;
-      // only then are the key and the room intent moved aside, so a retry still holds the key that can archive the room.
-      // A room this key does not own (a hand-made identity under another name) is left as it is and reported so.
-      let buzzRoomArchived = false;
-      if (existsSync(a.privateKeyFile)) {
-        const pk = pub();
-        const members = buzz(['channels','members','--channel',a.roomId]);
-        if (Array.isArray(members) && members.some(m => m.pubkey === pk && m.role === 'owner')) {
-          const room = buzz(['channels','get','--channel',a.roomId]);
-          check(room.channel_id === a.roomId && typeof room.name === 'string' && room.name.length > 0,'retiring Buzz room readback mismatch');
-          const archived = () => {
-            const found = buzz(['channels','search','--query',room.name,'--exact','--include-archived']);
-            check(Array.isArray(found),'invalid channel search');
-            return found.some(c => (c.channel_id ?? c.id) === a.roomId && c.archived === true);
-          };
-          if (!archived()) run('buzz',['channels','archive','--channel',a.roomId],{env:buzzEnv()});
-          check(archived(),'Buzz room archive readback mismatch');
-          buzzRoomArchived = true;
-        }
-      }
       const identityArchive = moveIdentityAside();
-      result = {retired:true,buzzRoomArchived,...(existsSync(archive) ? {retirementArchivePath:archive} : {}),...(identityArchive ? {identityArchivePath:identityArchive} : {})}; break;
+      result = {retired:true,buzzRoom:room.state === 'none' ? 'none' : 'archived',...(existsSync(archive) ? {retirementArchivePath:archive} : {}),...(identityArchive ? {identityArchivePath:identityArchive} : {})}; break;
     }
     default: throw new Error('unknown operation');
   }
@@ -492,8 +515,13 @@ try {
     process.stderr.write(JSON.stringify({ceoBuzzSignerFailure:failure}));
   } else {
     process.stderr.write(`host project provisioner refused operation${error instanceof ProvisionerRefusal || error instanceof ProvisionerExecutionFailure ? ': '+error.message : ''}\n`);
-    // The one structured line the daemon reads back: the provisioner's own reason and the order it names.
-    if (error instanceof RetirementOrderRefusal) process.stderr.write(JSON.stringify({retirementRefusal:{reason:error.message,requiredOrder:error.requiredOrder}})+'\n');
+    // The one structured line the daemon reads back for a retirement: whether the host changed anything before it
+    // stopped, the provisioner's own reason and the order that lets retirement complete.
+    if (operation === 'retire' || operation === 'verify-retire') process.stderr.write(JSON.stringify({retirementOutcome:{
+      hostChanged,
+      reason:error instanceof ProvisionerRefusal || error instanceof ProvisionerExecutionFailure ? error.message : 'host step failed',
+      requiredOrder:error instanceof RetirementOrderRefusal ? error.requiredOrder : [rerun],
+    }})+'\n');
   }
   process.exitCode = 1;
 }

@@ -58,16 +58,22 @@ it.each([false,true])('FV52-01: host retirement failure excludes the revoked ent
   } finally {stderr.mockRestore();h.cp.close();}
 });
 
-it('#1229: a host retirement refusal reaches the retire result with the order it names',async () => {
+it.each([false,true])('#1229: a host retirement refusal reaches the retire result with its order; host changed: %s',async hostChanged => {
   const h = makeHarness();
   try {
     bind(h);
-    new CanonicalSessionRegistry(h.cp.db).grant(entry,null);
+    const registry = new CanonicalSessionRegistry(h.cp.db);
+    registry.grant(entry,null);
     const order = [`end the CTO session ${entry.sessionUuid} (pid 4242) yourself: exit it in its own terminal`,`run agentctl project retire ${entry.projectId} again`];
-    vi.spyOn(h.cp.residentProjects,'retire').mockRejectedValue(new HostRetirementRefusal('process 4242 is the recorded CTO incarnation but no longer names session',order));
+    vi.spyOn(h.cp.residentProjects,'retire').mockRejectedValue(new HostRetirementRefusal('process 4242 is the recorded CTO incarnation but no longer names session',order,hostChanged));
     expect(await retireProject(h.cp,entry.projectId,'retire')).toMatchObject({allowed:false,reasonCode:ReasonCode.CONFLICT,
       evidence:{projectId:entry.projectId,refusal:'process 4242 is the recorded CTO incarnation but no longer names session',requiredOrder:order}});
     expect(h.cp.projects.get(entry.projectId)?.retiredAt).toBeNull();
+    // C-3: a refusal that left the host as it was takes its marker back and commits nothing irreversible; one that
+    // changed the host is committed as a pending retirement, suspended and tombstoned until the sweep finishes it.
+    expect(h.cp.projects.get(entry.projectId)?.suspended).toBe(hostChanged);
+    expect(Boolean(h.cp.db.get(`SELECT 1 FROM project_retirements WHERE project_id = ?`,[entry.projectId]))).toBe(hostChanged);
+    expect(registry.effective()).toEqual(hostChanged ? [] : [entry]);
   } finally {h.cp.close();}
 });
 

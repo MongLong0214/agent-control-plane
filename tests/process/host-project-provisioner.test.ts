@@ -1,6 +1,6 @@
-import { afterAll, expect, it } from 'vitest';
-import { mkdirSync, readFileSync, rmSync, writeFileSync, realpathSync, statSync, symlinkSync, chmodSync, existsSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { afterAll, expect, it, vi } from 'vitest';
+import { mkdirSync, readFileSync, rmSync, writeFileSync, realpathSync, statSync, symlinkSync, chmodSync, existsSync, readdirSync, renameSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { getPublicKey } from 'nostr-tools';
@@ -523,7 +523,7 @@ it('#1230: retire archives the room and moves the key and room intent aside; a s
   f.a.roomId = oldRoom;saveAllocation(f);await f.invoke('ensure-routing');
   const oldKey = readFileSync(f.a.privateKeyFile,'utf8');const oldIntent = readFileSync(join(f.state,'buzz-room-test.json'),'utf8');
   const retired = await f.invoke('retire');
-  expect(retired).toMatchObject({retired:true,buzzRoomArchived:true});
+  expect(retired).toMatchObject({retired:true,buzzRoom:'archived'});
   const archive = retired['identityArchivePath'] as string;
   expect(archive.startsWith(join(f.state,'retired-buzz-identities','cto-test.'))).toBe(true);
   expect(statSync(archive).mode & 0o777).toBe(0o700);expect(statSync(join(f.state,'retired-buzz-identities')).mode & 0o777).toBe(0o700);
@@ -582,51 +582,123 @@ it('#1229 C-1: a session row holding ps lstart text still pins the CTO; it is st
     const lstart = 'Mon Oct 26 01:00:00 2026';
     patchFake(f,{pinCommand:'claude',lstart});
     f.a.retirementPin = {pid:cto.pid,startedAt:lstart};saveAllocation(f);
-    expect(await f.invoke('retire')).toMatchObject({retired:true});
+    expect(await f.invoke('retire')).toMatchObject({retired:true,buzzRoom:'none'});
     expect(await Promise.race([cto.exit,new Promise(resolve => setTimeout(() => resolve('still running'),5_000))])).toBe('SIGTERM');
   } finally {cto.stop();}
 });
 
-it('#1229 C-1: a refused retirement changes no database row and no host file',async () => {
+/**
+ * A legacy project retired through the daemon's own path and the packaged host script: its PRIMARY_CTO bound and pinned
+ * to a stand-in process, its entitlement granted, its roster route, fleet entry and files under a temporary home.
+ */
+const legacyRetirement = async (options:{key:boolean;clone:boolean;roster:boolean}) => {
   const home = realpathSync(tempDir('retire-verify-home-'));
   const script = fileURLToPath(new URL('../../dist/host/host-project-provisioner.mjs',import.meta.url));
   const h = makeHarness({residentProvisioner:{home,script}});
   const cto = await standInCto();
-  try {
-    // A legacy project: its PRIMARY_CTO bound, its entitlement granted, its clone under the resident home.
-    const entry = {sessionUuid:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',projectId:'resident',buzzActorId:'a'.repeat(64),buzzAddress:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'};
-    h.cp.projects.register({projectId:entry.projectId,name:entry.projectId});
-    const session = h.cp.sessions.create({provider:'claude',model:'claude-cli',buzzAddress:entry.buzzAddress});
-    expect(h.cp.sessions.transition(session.sessionId,SessionLifecycle.READY,'fixture').allowed).toBe(true);
-    expect(h.cp.sessions.bindBuzzActor({sessionId:session.sessionId,sessionSecret:session.sessionSecret!,buzzActorId:entry.buzzActorId},{isAllowedActor:() => true}).allowed).toBe(true);
-    const claimed = {executorKind:SELF_CLAIM_EXECUTOR_KIND,targetLocator:entry.sessionUuid,targetLocatorDigest:sha256(entry.sessionUuid)};
-    const bound = h.cp.bindings.bind({role:Role.PRIMARY_CTO,projectId:entry.projectId,sessionId:session.sessionId,
-      authenticatedTarget:{claimed,protocolVersion:SELF_CLAIM_PROTOCOL,attestationDigest:digestOf({fixture:entry}),verify:() => claimed}});
-    if (!bound.allowed) throw new Error(bound.message);
-    // The session row pins the stand-in CTO, which now names another session: it cannot be verified.
-    h.cp.db.run(`UPDATE sessions SET os_pid = ?, os_process_started_at = ? WHERE session_id = ?`,[cto.pid,cto.startedAt,session.sessionId]);
-    new CanonicalSessionRegistry(h.cp.db).grant(entry,null);
-    const clone = join(home,'projects','fixture');mkdirSync(clone,{recursive:true});writeFileSync(join(clone,'work.txt'),'unfinished');
-    h.cp.db.run(`INSERT INTO repositories(repository_id,identity,checkout_path,project_id,created_at) VALUES ('resident-repo','github:acme/fixture',?,'resident',?)`,[clone,h.clock.nowIso()]);
+  const entry = {sessionUuid:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',projectId:'resident',buzzActorId:'a'.repeat(64),buzzAddress:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'};
+  h.cp.projects.register({projectId:entry.projectId,name:entry.projectId});
+  const session = h.cp.sessions.create({provider:'claude',model:'claude-cli',buzzAddress:entry.buzzAddress});
+  expect(h.cp.sessions.transition(session.sessionId,SessionLifecycle.READY,'fixture').allowed).toBe(true);
+  expect(h.cp.sessions.bindBuzzActor({sessionId:session.sessionId,sessionSecret:session.sessionSecret!,buzzActorId:entry.buzzActorId},{isAllowedActor:() => true}).allowed).toBe(true);
+  const claimed = {executorKind:SELF_CLAIM_EXECUTOR_KIND,targetLocator:entry.sessionUuid,targetLocatorDigest:sha256(entry.sessionUuid)};
+  const bound = h.cp.bindings.bind({role:Role.PRIMARY_CTO,projectId:entry.projectId,sessionId:session.sessionId,
+    authenticatedTarget:{claimed,protocolVersion:SELF_CLAIM_PROTOCOL,attestationDigest:digestOf({fixture:entry}),verify:() => claimed}});
+  if (!bound.allowed) throw new Error(bound.message);
+  h.cp.db.run(`UPDATE sessions SET os_pid = ?, os_process_started_at = ? WHERE session_id = ?`,[cto.pid,cto.startedAt,session.sessionId]);
+  new CanonicalSessionRegistry(h.cp.db).grant(entry,null);
+  const clone = join(home,'projects','fixture');
+  if (options.clone) {mkdirSync(clone,{recursive:true});writeFileSync(join(clone,'work.txt'),'unfinished');}
+  h.cp.db.run(`INSERT INTO repositories(repository_id,identity,checkout_path,project_id,created_at) VALUES ('resident-repo','github:acme/fixture',?,'resident',?)`,[clone,h.clock.nowIso()]);
+  const sessionRecord = (sessionId:string) => {
     mkdirSync(join(home,'.claude','sessions'),{recursive:true});
-    writeFileSync(join(home,'.claude','sessions',`${cto.pid}.json`),JSON.stringify({sessionId:'cccccccc-cccc-4ccc-8ccc-cccccccccccc',cwd:clone}));
-    const fleetDir = join(home,'.claude','watchers','fleet');mkdirSync(fleetDir,{recursive:true});
-    const keys = join(home,'.hermes','bridge','keys');mkdirSync(keys,{recursive:true});
-    const files = {
-      roster:join(home,'.hermes','bridge','required-mentions.json'),fleet:join(fleetDir,'manifest.tsv'),resident:join(fleetDir,'acp-resident.resident.json'),
-      key:join(keys,'cto-resident.priv'),intent:join(h.root,'buzz-room-resident.json'),work:join(clone,'work.txt'),
-    };
-    writeFileSync(files.roster,JSON.stringify({version:2,generation:4,channels:{[entry.buzzAddress]:{relay_name:'production',ceo:{pubkey:'d'.repeat(64),handle:'ceo'},peer:{pubkey:entry.buzzActorId,handle:'cto-resident'},acp_project_id:'resident',status:'active',classification:'project'}}}));
-    writeFileSync(files.fleet,['acp-resident',clone,'resident CTO',join(fleetDir,'acp-resident.boot.txt'),entry.sessionUuid].join('\t')+'\n');
-    writeFileSync(files.resident,'{}');writeFileSync(files.key,'not a real key\n');writeFileSync(files.intent,'{}');
-    const database = () => h.cp.db.all<{name:string}>(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`)
-      .map(({name}) => [name,h.cp.db.all(`SELECT * FROM "${name.replaceAll('"','""')}"`)]);
-    const host = () => Object.fromEntries(Object.entries(files).map(([name,file]) => [name,existsSync(file) ? readFileSync(file,'utf8') : null]));
-    const before = {database:database(),host:host(),retired:existsSync(join(home,'projects','.retired'))};
-    const refused = await retireProject(h.cp,entry.projectId,'operator retirement');
+    writeFileSync(join(home,'.claude','sessions',`${cto.pid}.json`),JSON.stringify({sessionId,cwd:clone}));
+  };
+  const fleetDir = join(home,'.claude','watchers','fleet');mkdirSync(fleetDir,{recursive:true});
+  const keys = join(home,'.hermes','bridge','keys');mkdirSync(keys,{recursive:true});
+  const files = {
+    roster:join(home,'.hermes','bridge','required-mentions.json'),fleet:join(fleetDir,'manifest.tsv'),resident:join(fleetDir,'acp-resident.resident.json'),
+    key:join(keys,'cto-resident.priv'),intent:join(h.root,'buzz-room-resident.json'),work:join(clone,'work.txt'),
+  };
+  if (options.roster) writeFileSync(files.roster,JSON.stringify({version:2,generation:4,channels:{[entry.buzzAddress]:{relay_name:'production',ceo:{pubkey:'d'.repeat(64),handle:'ceo'},peer:{pubkey:entry.buzzActorId,handle:'cto-resident'},acp_project_id:'resident',status:'active',classification:'project'}}}));
+  writeFileSync(files.fleet,['acp-resident',clone,'resident CTO',join(fleetDir,'acp-resident.boot.txt'),entry.sessionUuid].join('\t')+'\n');
+  writeFileSync(files.resident,'{}');
+  if (options.key) {writeFileSync(files.key,'not a real key\n');writeFileSync(files.intent,'{}');}
+  const tables = (except:string[] = []) => h.cp.db.all<{name:string}>(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`)
+    .filter(({name}) => !except.includes(name)).map(({name}) => [name,h.cp.db.all(`SELECT * FROM "${name.replaceAll('"','""')}"`)]);
+  const host = () => ({...Object.fromEntries(Object.entries(files).map(([name,file]) => [name,existsSync(file) ? readFileSync(file,'utf8') : null])),retired:existsSync(join(home,'projects','.retired'))});
+  return {h,cto,entry,session,sessionRecord,tables,host};
+};
+
+it('#1229 C-1: a refused retirement changes no database row and no host file',async () => {
+  const r = await legacyRetirement({key:true,clone:true,roster:true});
+  try {
+    // The session row pins the stand-in CTO, which now names another session: it cannot be verified.
+    r.sessionRecord('cccccccc-cccc-4ccc-8ccc-cccccccccccc');
+    const before = {database:r.tables(),host:r.host()};
+    const refused = await retireProject(r.h.cp,r.entry.projectId,'operator retirement');
     expect(refused).toMatchObject({allowed:false,evidence:{projectId:'resident',requiredOrder:[
-      `end the CTO session ${entry.sessionUuid} (pid ${cto.pid}) yourself: exit it in its own terminal`,'run agentctl project retire resident again']}});
-    expect({database:database(),host:host(),retired:existsSync(join(home,'projects','.retired'))}).toEqual(before);
-    expect(readProcessStartToken(cto.pid)).toBe(cto.startedAt);
-  } finally {cto.stop();h.cp.close();}
+      `end the CTO session ${r.entry.sessionUuid} (pid ${r.cto.pid}) yourself: exit it in its own terminal`,'run agentctl project retire resident again']}});
+    expect({database:r.tables(),host:r.host()}).toEqual(before);
+    expect(readProcessStartToken(r.cto.pid)).toBe(r.cto.startedAt);
+  } finally {r.cto.stop();r.h.cp.close();}
+});
+
+it('#1229 C-3: when the CTO changes between verification and the host step, the refusal commits nothing irreversible',async () => {
+  // No key, no roster route and no clone: the CTO is the only thing this retirement has to verify.
+  const r = await legacyRetirement({key:false,clone:false,roster:false});
+  try {
+    r.sessionRecord(r.entry.sessionUuid);
+    const verify = r.h.cp.residentProjects.verifyRetirement.bind(r.h.cp.residentProjects);
+    vi.spyOn(r.h.cp.residentProjects,'verifyRetirement').mockImplementation(async projectId => {
+      await verify(projectId);
+      // Verified; then, before the host step, the incarnation's session record names another session.
+      r.sessionRecord('cccccccc-cccc-4ccc-8ccc-cccccccccccc');
+    });
+    // Audit rows are the one committed change a refusal may leave; sqlite_sequence counts them.
+    const before = {database:r.tables(['audit_events','sqlite_sequence']),host:r.host()};
+    const refused = await retireProject(r.h.cp,r.entry.projectId,'operator retirement');
+    expect(refused).toMatchObject({allowed:false,evidence:{projectId:'resident',requiredOrder:[
+      `end the CTO session ${r.entry.sessionUuid} (pid ${r.cto.pid}) yourself: exit it in its own terminal`,'run agentctl project retire resident again']}});
+    expect(r.h.cp.projects.get('resident')).toMatchObject({suspended:false,retiredAt:null});
+    expect(r.h.cp.db.get(`SELECT 1 FROM project_retirements WHERE project_id = 'resident'`)).toBeUndefined();
+    expect(new CanonicalSessionRegistry(r.h.cp.db).effective()).toEqual([r.entry]);
+    expect({database:r.tables(['audit_events','sqlite_sequence']),host:r.host()}).toEqual(before);
+    expect(readProcessStartToken(r.cto.pid)).toBe(r.cto.startedAt);
+  } finally {r.cto.stop();r.h.cp.close();}
+});
+
+it.each(['member','no-key'] as const)('#1230 C-4: retire refuses, moving nothing, while the room cannot be archived (%s)',async problem => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');
+  const first = await f.invoke('ensure-buzz');const roomId = (first.buzz as {roomId:string}).roomId;
+  f.a.roomId = roomId;saveAllocation(f);await f.invoke('ensure-routing');
+  const pk = readFileSync(f.a.privateKeyFile.replace('.priv','.pub'),'utf8').trim();
+  if (problem === 'member') {
+    // The CTO identity was demoted: only the owner's key still owns the room.
+    const state = fakeState(f) as {members:Array<{pubkey:string;role:string}>};
+    patchFake(f,{members:state.members.map(m => m.pubkey === pk ? {...m,role:'member'} : m)});
+  } else {
+    // The room's owner key is not at this identity's path (a hand-made identity under another name).
+    for (const ext of ['priv','pub']) renameSync(f.a.privateKeyFile.replace('.priv',`.${ext}`),join(dirname(f.a.privateKeyFile),`cto-other.${ext}`));
+  }
+  const rosterFile = join(f.home,'.hermes','bridge','required-mentions.json');
+  const snapshot = () => ({
+    fake:fakeState(f).room,archived:fakeState(f).archivedRooms ?? [],roster:readFileSync(rosterFile,'utf8'),
+    key:existsSync(f.a.privateKeyFile) ? readFileSync(f.a.privateKeyFile,'utf8') : null,intent:readFileSync(join(f.state,'buzz-room-test.json'),'utf8'),
+    clone:existsSync(f.a.clonePath),identities:existsSync(join(f.state,'retired-buzz-identities')),
+  });
+  const before = snapshot();
+  const order = problem === 'member'
+    ? [`have an owner archive room ${roomId} (buzz channels archive --channel ${roomId}), or make ${pk} an owner of it`,'run agentctl project retire test again']
+    : [`put the key of room ${roomId}'s owner (pubkey ${pk} per the roster) at ${f.a.privateKeyFile}; retirement archives the room with it and then moves it aside`,'run agentctl project retire test again'];
+  for (const operation of ['retire','verify-retire']) {
+    const failure = await f.invoke(operation).then(result => `unexpected success ${JSON.stringify(result)}`,(error:unknown) => String(error));
+    expect(failure).not.toContain('unexpected success');
+    const outcome = JSON.parse(failure.trim().split('\n').at(-1)!) as {retirementOutcome:{hostChanged:boolean;reason:string;requiredOrder:string[]}};
+    expect(outcome.retirementOutcome).toMatchObject({hostChanged:false,requiredOrder:order});
+    expect(outcome.retirementOutcome.reason).toContain(roomId);
+    if (problem === 'member') expect(outcome.retirementOutcome.reason).toContain(`owned by ${'c'.repeat(64)}`);
+    expect(snapshot()).toEqual(before);
+  }
 });

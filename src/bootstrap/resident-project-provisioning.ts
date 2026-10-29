@@ -7,7 +7,7 @@ import { residentBootPacket, residentClonePath, residentPrivateKeyFile, resident
 import type { Db } from '../db/database.ts';
 import type { Clock } from '../core/clock.ts';
 import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
-import type { HostProjectProvisioner, ProjectAllocation, HostObservation, HostOperation } from '../runtime/host-project-provisioner.ts';
+import { HostRetirementRefusal, type HostProjectProvisioner, type ProjectAllocation, type HostObservation, type HostOperation } from '../runtime/host-project-provisioner.ts';
 import type { BootstrapConfirmation } from './repo-factory-bootstrap-run.ts';
 
 interface ProvisioningRow {run_id:string; project_id:string; binding_json:string; allocation_json:string; confirmation_json:string; steps_json:string; status:string; last_error:string|null}
@@ -156,14 +156,15 @@ export class ResidentProjectProvisioning {
   }
   /**
    * #1229 — asks the host, changing nothing anywhere, whether retire can go ahead: the CTO process it would stop, the
-   * route and the clone. Asked before the daemon suspends, records or revokes anything, so a refusal (a
+   * route, the clone and the Buzz room. Asked before the daemon changes anything, so a refusal (a
    * `HostRetirementRefusal` naming its order) leaves every row and every host file as it was. Retire asks it again.
    */
   async verifyRetirement(projectId:string):Promise<void> {
     const row = this.db.get<ProvisioningRow>(`SELECT * FROM resident_project_provisioning WHERE project_id = ?`,[projectId]);
     const allocation = row ? (row.status === 'RETIRED' ? null : this.allocation(row.run_id)) : this.legacyRetirementAllocation(projectId);
-    // Without a host retire reports the missing host itself; without an allocation nothing on the host is retired.
-    if (!allocation || !this.host) return;
+    // Without an allocation nothing on the host is retired.
+    if (!allocation) return;
+    if (!this.host) throw new Error('retirement host unavailable');
     if (!(await this.host.invoke('verify-retire',allocation)).retirementVerified) throw new Error('retirement not verifiable');
   }
   async retire(projectId:string):Promise<void> {
@@ -181,7 +182,12 @@ export class ResidentProjectProvisioning {
     const a = this.allocation(row.run_id);
     if (a) {
       if (!this.host) throw new Error('retirement host unavailable');
-      const observation = await this.host.invoke('retire',a);
+      let observation:HostObservation;
+      try {observation = await this.host.invoke('retire',a);} catch (error) {
+        // #1229 — the host refused before its first write: this attempt's RETIRING marker is taken back with it.
+        if (error instanceof HostRetirementRefusal && !error.hostChanged) this.db.run(`UPDATE resident_project_provisioning SET status = ? WHERE run_id = ? AND status = 'RETIRING'`,[row.status,row.run_id]);
+        throw error;
+      }
       if (!observation.retired) throw new Error('retirement not verified');
       this.save(row.run_id,'retire',observation);
       await this.#reconcile(a,'');
