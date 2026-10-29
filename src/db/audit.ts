@@ -17,6 +17,20 @@ export interface AuditRecord {
 }
 
 /**
+ * #1213 — refusal kinds (`_REFUSED`, the repository's naming for a record of a refusal) that src records
+ * and whose record naming a task does not block the bootstrap task restore. Omission is safe: a refusal
+ * kind missing from this list blocks the restore, which fails closed, so the list never has to be complete.
+ * Add a kind only when a refusal that names a task should not block.
+ */
+export const RECORDED_REFUSAL_KINDS: ReadonlySet<string> = new Set([
+  "BOOTSTRAP_CTO_RECOVERY_REFUSED", "BRANCH_PUBLISH_REFUSED", "BUZZ_MENTION_REFUSED", "BUZZ_PEER_REFUSED",
+  "CANONICAL_CTO_RESTORE_REFUSED", "CANONICAL_SELF_CLAIM_REFUSED", "CEO_NOTIFICATION_BUZZ_REFUSED",
+  "DAEMON_START_REFUSED", "HERMES_CEO_AUTO_ADOPTION_REFUSED", "INGRESS_REFUSED", "MERGE_REFUSED",
+  "PRIMARY_CTO_RECOVERY_REFUSED", "REPAIR_REFUSED", "SESSION_BUZZ_ACTOR_BIND_REFUSED", "SESSION_TURN_REFUSED",
+  "TASK_WORKER_TURN_LATE_RESULT_REFUSED",
+]);
+
+/**
  * Append-only authority log. Deliberately not a hash chain and not the state SSOT
  * (PRD §30.4) — it records who decided what, with the evidence, so a denial can be
  * explained after the fact.
