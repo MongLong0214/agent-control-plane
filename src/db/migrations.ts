@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 53;
+export const SCHEMA_VERSION = 52;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -21,7 +21,6 @@ const v48SchemaPath = fileURLToPath(new URL("./schema-v48.sql", import.meta.url)
 const v49SchemaPath = fileURLToPath(new URL("./schema-v49.sql", import.meta.url)); // released v49 reads only this
 const v50SchemaPath = fileURLToPath(new URL("./schema-v50.sql", import.meta.url)); // released v50 reads only this
 const v51SchemaPath = fileURLToPath(new URL("./schema-v51.sql", import.meta.url)); // released v51 reads only this
-const v52SchemaPath = fileURLToPath(new URL("./schema-v52.sql", import.meta.url)); // released v52 reads only this
 export const schemaSql = (): string => readFileSync(schemaPath, "utf8");
 const historicalSchemaSql = (): string => readFileSync(historicalSchemaPath, "utf8");
 const schemaSqlAt = (version: number): string =>
@@ -33,8 +32,7 @@ const schemaSqlAt = (version: number): string =>
             : version <= 48 ? readFileSync(v48SchemaPath, "utf8")
               : version <= 49 ? readFileSync(v49SchemaPath, "utf8")
                 : version <= 50 ? readFileSync(v50SchemaPath, "utf8")
-                  : version <= 51 ? readFileSync(v51SchemaPath, "utf8")
-                    : version <= LATEST_FROZEN_VERSION ? readFileSync(v52SchemaPath, "utf8") : schemaSql();
+                  : version <= LATEST_FROZEN_VERSION ? readFileSync(v51SchemaPath, "utf8") : schemaSql();
 
 /** Connection PRAGMAs are established by Db before any migration transaction begins. */
 export const schemaDdl = (): string =>
@@ -4217,7 +4215,7 @@ const v52: SchemaMigration = {
   id: "v52-resident-project-provisioning", fromVersion: 51, toVersion: 52,
   foreignKeysOffDuringApply: true,
   apply(raw) {
-    const ddl = schemaSqlAt(52);
+    const ddl = schemaSql();
     // Keep the canonical definitions identical on fresh installs and upgrades. Legacy rename
     // semantics plus foreign_keys=OFF preserve every other table's references to these names.
     raw.pragma("legacy_alter_table = ON");
@@ -4246,58 +4244,6 @@ const v52: SchemaMigration = {
     raw.exec(ddl.slice(ddl.indexOf('-- v52:')));
   },
   checksum: () => migrationChecksum("v52-resident-project-provisioning", 52),
-};
-
-/**
- * #1258 — v53 keeps every execution of a verification input. v52's verification_results held one row
- * per (snapshot, command, repository, source), and a re-verification replaced it, so a FAIL that a later
- * PASS followed survived only in its report artifact and audit row. v53 rebuilds the table to schema.sql's
- * definition, whose key adds `attempt`, so each finished execution is its own row. Every v52 row is
- * carried with its rowid and every column unchanged, as its input's attempt 1: the only execution of that
- * input the table still held. No artifact or audit row is read or written.
- *
- * Nothing but the table's own automatic indexes may be on it or name it (v52 has nothing else); anything
- * else refuses the step before anything moves, as does a held temporary name. A table already at v53's
- * definition is not rebuilt. The step runs in the migrator's one transaction, so a failure anywhere in it
- * rolls back to the v52 table, and the migrator then restores the pre-migration backup.
- */
-const V53_PRIOR_TABLE = "verification_results_v53_prior";
-const v53: SchemaMigration = {
-  id: "v53-verification-result-history",
-  fromVersion: 52,
-  toVersion: 53,
-  apply(raw) {
-    const ddl = schemaObject(/CREATE TABLE IF NOT EXISTS verification_results \([\s\S]*?\n\);/, "verification_results", 53);
-    const stored = (raw
-      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'verification_results'")
-      .get() as { sql?: string | null } | undefined)?.sql;
-    if (stored === undefined || stored === null) throw new Error("v53 refuses: verification_results does not exist");
-    const attached = raw
-      .prepare(`SELECT type, name FROM sqlite_master
-         WHERE name <> 'verification_results' AND sql IS NOT NULL
-           AND (tbl_name = 'verification_results' COLLATE NOCASE OR sql LIKE '%verification_results%')`)
-      .all() as Array<{ type: string; name: string }>;
-    if (attached.length > 0) {
-      throw new Error(`v53 refuses: ${attached.map((object) => `${object.type} ${object.name}`).join(", ")} is on or names verification_results`);
-    }
-    if (normaliseStepSql(stored) === (normaliseStepSql(ddl) ?? stepSchemaUnreadable(53, ddl))) return;
-    if (raw.prepare("SELECT 1 FROM sqlite_master WHERE name = ? COLLATE NOCASE").get(V53_PRIOR_TABLE) !== undefined) {
-      throw new Error(`v53 refuses: ${V53_PRIOR_TABLE} is already held`);
-    }
-    raw.exec(`ALTER TABLE verification_results RENAME TO ${V53_PRIOR_TABLE}`);
-    raw.exec(ddl);
-    const columns = sharedColumns(raw, V53_PRIOR_TABLE, "verification_results");
-    const list = columns.map((column) => `"${column}"`).join(", ");
-    const image = (table: string): string =>
-      JSON.stringify(raw.prepare(`SELECT rowid, ${list} FROM ${table} ORDER BY rowid`).raw(true).all());
-    const before = image(V53_PRIOR_TABLE);
-    raw.exec(`INSERT INTO verification_results (rowid, ${list}) SELECT rowid, ${list} FROM ${V53_PRIOR_TABLE} ORDER BY rowid`);
-    if (image("verification_results") !== before) {
-      throw new Error("v53 refuses: the rebuilt verification_results does not hold exactly the rows of the v52 table");
-    }
-    raw.exec(`DROP TABLE ${V53_PRIOR_TABLE}`);
-  },
-  checksum: () => migrationChecksum("v53-verification-result-history", 53),
 };
 
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
@@ -4342,7 +4288,6 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v50,
   v51,
   v52,
-  v53,
 ]);
 
 interface RequiredTrigger {
@@ -4707,9 +4652,6 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * reads the live schema.sql, so its checksum still moves with any schema edit until the next freeze.
  * Declared here, below the anchors other gates hold into this file, and read only inside functions.
  *
- * #1258: v52 is frozen as v53's prerequisite in schema-v52.sql, byte-identical to schema.sql at 372c6669
- * (blob 4d92c123, unchanged through 5d45ae8b), and its step now reads that snapshot rather than the live
- * file, so a later schema edit cannot change what a database receives at its v52 step.
  * v51 is frozen as v52's prerequisite in schema-v51.sql, byte-identical to schema.sql at 3915f78c; v50 is
  * frozen as v51's prerequisite in schema-v50.sql.
  * v49 is frozen as v50's prerequisite in schema-v49.sql, byte-identical to a620b8d2.
@@ -4718,7 +4660,7 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * cannot leak back into what a database receives at its v48 step, and v48's checksum is the value the
  * pre-freeze build computed.
  */
-const LATEST_FROZEN_VERSION = 52;
+const LATEST_FROZEN_VERSION = 51;
 
 /**
  * The last version whose stored receipt is compared by value (`receiptMismatches`). It stays at 47 when

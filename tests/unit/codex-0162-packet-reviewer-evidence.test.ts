@@ -437,7 +437,7 @@ describe("an off-schema bootstrap PLAN review keeps its candidate, so the offici
     }, harnessOptions);
   });
 
-  it("an off-schema retry exhausts recovery and fails without an extra run", async () => {
+  it("an already-spent retry gets no extra run when the retried review is off-schema again", async () => {
     await withBootstrapRuntime(async (f) => {
       const { reviewer, owner, runId, ownerSessionId, candidate } = await unavailableOffSchema(f, [offSchemaNow(f)]);
       expect(f.daemon.wakeBootstrapResultRecovery().woken).toHaveLength(1);
@@ -449,7 +449,7 @@ describe("an off-schema bootstrap PLAN review keeps its candidate, so the offici
       expect(f.daemon.wakeBootstrapResultRecovery()).toEqual({ woken: [] });
       expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, runId)).toHaveLength(1);
       expect(reviewer.reviews()).toBe(2);
-      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.FAILED);
+      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
     }, harnessOptions);
   });
 
