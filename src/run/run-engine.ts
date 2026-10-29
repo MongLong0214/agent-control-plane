@@ -2152,7 +2152,7 @@ export class RunEngine {
     if (recorded && (paused["continuityHold"] !== owner.roleKey || paused["candidateSnapshotDigest"] !== candidate)) {
       return null;
     }
-    const episode = this.#lossEpisode(run, pause.event_id, paused["reason"], owner.roleKey);
+    const episode = this.#lossEpisode(run, pause.event_id, paused["reason"], owner.roleKey, false);
     if (!episode) return null;
     const pausedOwner = recorded ? recordedPauseOwner(paused) : this.#legacyPausedOwner(run, pause.event_id, episode);
     if (!pausedOwner) return null;
@@ -2185,7 +2185,9 @@ export class RunEngine {
    *   (PAUSE_NEW_WORK, one of continuity's pause reasons) whose `continuityHold` names `held.roleKey`
    *   and the current candidate, and the one before it entered READY_FOR_CEO_REVIEW with that candidate.
    *   A pause written before `continuityHold` existed names no role and is kept. Its reconcile pass must
-   *   also have completed its own loss episode; an interrupted pause cannot borrow a later pass;
+   *   also have completed its own loss episode, in which `held.roleKey` was revoked or deferred once, for
+   *   the pause's loss; another role lost in that pass for the same reason does not make it ambiguous.
+   *   An interrupted pause cannot borrow a later pass;
    * - the run's owner pin is the same session and incarnation the pause recorded
    *   (`CONTINUITY_PAUSE_OWNER_FIELDS`), at that generation or a later renewal, and it is still its role's
    *   active binding on a READY session: the owner did not move under the wait;
@@ -2220,7 +2222,8 @@ export class RunEngine {
     }
     const revocationReason = continuityRevocationReasonForPause(paused["reason"]);
     if (!revocationReason) return null;
-    const episode = this.#lossEpisode(run, pause.event_id, revocationReason, held.roleKey);
+    // The pause's `continuityHold` names `held.roleKey` (checked above): the episode is that role's loss.
+    const episode = this.#lossEpisode(run, pause.event_id, revocationReason, held.roleKey, true);
     if (!episode) return null;
     const pausedOwner = recordedPauseOwner(paused);
     if (!pausedOwner || run.ownerSessionId === null || run.ownerSessionIncarnation === null ||
@@ -2270,14 +2273,17 @@ export class RunEngine {
    *   (a) that CONTINUITY_RECONCILED exists, and (b) its `pausedRuns` names the run exactly once — a
    *       pass that never finished, or a later one that paused nothing of this run, is no episode;
    *   (c) the revocation's (BINDING_REVOKED) or deferral's (CONTINUITY_REVOKE_DEFERRED) reason is the
-   *       pause's own loss reason, and one of continuity's;
-   *   (d) it is the only such row in the window for any role whose loss pauses this run (the CEO, a
-   *       role of the run, of its project or of one of its tasks), and the only row of any reason for
-   *       `roleKey`: two candidates leave the pause's role ambiguous;
+   *       pause's own loss reason, and one of continuity's, for a role whose loss pauses this run (the
+   *       CEO, a role of the run, of its project or of one of its tasks);
+   *   (d) it is the only row of any reason for `roleKey` in the window. Unless the caller identified
+   *       the pause's role by the pause's own `continuityHold` (`holdNamesRole`), it must also be the
+   *       only row of (c) for any role: two candidates leave the pause's role ambiguous. The held-role
+   *       release passes `holdNamesRole`, so another role lost in the same pass for the same reason
+   *       (the CEO and the run's reviewer both refused failover) does not strand the CEO's wait;
    *   (e) it names the session and the generation it took the role from (`session_id`,
    *       `evidence.generation`) — the caller checks those against the pause's owner.
    */
-  #lossEpisode(run: RunRow, pauseEventId: number, lossReason: unknown, roleKey: string): ContinuityLossEpisode | null {
+  #lossEpisode(run: RunRow, pauseEventId: number, lossReason: unknown, roleKey: string, holdNamesRole: boolean): ContinuityLossEpisode | null {
     if (typeof lossReason !== "string" || !isContinuityRevocationReason(lossReason)) return null;
     const closed = this.db.get<{ event_id: number; evidence_json: string }>(
       `SELECT event_id, evidence_json FROM audit_events
@@ -2299,15 +2305,15 @@ export class RunEngine {
         ORDER BY event_id`,
       [pauseEventId, closed.event_id],
     );
-    const sameLoss = window.filter((row) =>
+    const isSameLoss = (row: { role_key: string | null; evidence_json: string }): boolean =>
       row.role_key !== null &&
       this.#lossPauses(run, row.role_key) &&
-      auditEvidence(row.evidence_json)?.["reason"] === lossReason,
-    );
-    if (sameLoss.length !== 1) return null;
-    const [revocation] = sameLoss;
-    if (revocation?.role_key !== roleKey) return null;
-    if (window.filter((row) => row.role_key === roleKey).length !== 1) return null;
+      auditEvidence(row.evidence_json)?.["reason"] === lossReason;
+    const own = window.filter((row) => row.role_key === roleKey);
+    if (own.length !== 1) return null;
+    const [revocation] = own;
+    if (!revocation || !isSameLoss(revocation)) return null;
+    if (!holdNamesRole && window.filter(isSameLoss).length !== 1) return null;
     const generation = auditEvidence(revocation.evidence_json)?.["generation"];
     if (revocation.session_id === null || typeof generation !== "number" || !Number.isInteger(generation)) return null;
     return { sessionId: revocation.session_id, generation };

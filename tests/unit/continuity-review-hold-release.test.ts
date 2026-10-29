@@ -2,6 +2,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   CONTINUITY_COVERAGE_REVOCATION_REASON,
+  CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX,
   CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON,
 } from "../../src/continuity/continuity-kernel.ts";
 import { deny } from "../../src/core/errors.ts";
@@ -1028,6 +1029,77 @@ describe("#1189 — a wait continuity placed for the CEO is handed back once the
         ownerBindingGeneration: 1,
       });
       expect(transitions(f, ready.runId)).toHaveLength(paused);
+    });
+  });
+
+  it("the CEO and the run's reviewer lost in one pass for the same reason: the CEO's return, and only it, hands the wait back", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const ready = await reviewReady(f);
+      const reviewerRole = roleKeyFor(Role.BLIND_REVIEWER, { runId: ready.runId });
+      const bindReviewer = (model: string): RoleBinding => {
+        const session = f.harness.cp.sessions.create({ provider: "gpt", model });
+        expect(f.harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "the run's reviewer").allowed).toBe(true);
+        const bound = f.harness.cp.bindings.bind({ role: Role.BLIND_REVIEWER, runId: ready.runId, sessionId: session.sessionId });
+        if (!bound.allowed) throw new Error(bound.message);
+        return bound.value;
+      };
+      const reviewer = bindReviewer("reviewer-lost");
+      const before = sideEffects(f, ready.runId);
+
+      // Both sessions stop and continuity's failover is refused for each, in the one pass.
+      const mark = f.harness.cp.db.get<{ n: number }>(`SELECT MAX(event_id) AS n FROM audit_events`)?.n ?? 0;
+      expect(f.harness.cp.sessions.transition(reviewer.sessionId, SessionLifecycle.ERROR, "the reviewer session stopped").allowed)
+        .toBe(true);
+      const pass = await loseCeo(f);
+      expect(pass?.unresolved).toEqual(expect.arrayContaining([
+        expect.objectContaining({ roleKey: CEO, reasonCode: ReasonCode.SESSION_NOT_READY }),
+        expect.objectContaining({ roleKey: reviewerRole, reasonCode: ReasonCode.SESSION_NOT_READY }),
+      ]));
+      expect(f.harness.cp.bindings.active(CEO)).toBeNull();
+      expect(f.harness.cp.bindings.active(reviewerRole)).toBeNull();
+      expect(f.harness.cp.runs.require(ready.runId).state).toBe(RunState.AWAITING_HUMAN);
+      expect(transitions(f, ready.runId).at(-1)).toMatchObject({
+        from: RunState.READY_FOR_CEO_REVIEW,
+        to: RunState.AWAITING_HUMAN,
+        continuityAction: "PAUSE_NEW_WORK",
+        continuityHold: CEO,
+      });
+      // Two revocations of roles whose loss pauses the run, for the one reason the pause names.
+      const refused = `${CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX}${ReasonCode.SESSION_NOT_READY}`;
+      expect(f.harness.cp.db.all<{ role_key: string; reason: string }>(
+        `SELECT role_key, json_extract(evidence_json, '$.reason') AS reason FROM audit_events
+          WHERE kind = 'BINDING_REVOKED' AND event_id > ? AND role_key IN (?, ?) ORDER BY event_id`,
+        [mark, CEO, reviewerRole],
+      )).toEqual([{ role_key: CEO, reason: refused }, { role_key: reviewerRole, reason: refused }]);
+      const paused = transitions(f, ready.runId).length;
+
+      // The reviewer is back first: the pause was the CEO's, so the reviewer's return keeps it.
+      bindReviewer("reviewer-back");
+      await f.daemon.reconcileContinuity("the reviewer is back, the CEO is still gone");
+      expect(f.harness.cp.runs.require(ready.runId).state).toBe(RunState.AWAITING_HUMAN);
+      expect(transitions(f, ready.runId)).toHaveLength(paused);
+
+      readoptCeo(f);
+      await f.daemon.reconcileContinuity("the CEO re-adopted after both losses");
+      expect(f.harness.cp.runs.require(ready.runId)).toMatchObject({
+        state: RunState.READY_FOR_CEO_REVIEW,
+        ownerSessionId: ready.ownerSessionId,
+        ownerBindingGeneration: 1,
+        continuityHoldRoleKey: null,
+      });
+      expect(f.harness.cp.runs.currentCandidate(ready.runId)).toBe(ready.candidate);
+      expect(f.harness.cp.artifacts.latestForSnapshot(ready.runId, ArtifactKind.PRODUCTION_READY_PACKET, ready.candidate)?.artifactId)
+        .toBe(ready.packetId);
+      expect(sideEffects(f, ready.runId)).toEqual(before);
+      expect(transitions(f, ready.runId).slice(paused)).toEqual([
+        expect.objectContaining({ from: RunState.AWAITING_HUMAN, to: RunState.ACTIVE, continuityRelease: CEO, candidateSnapshotDigest: ready.candidate }),
+        expect.objectContaining({ from: RunState.ACTIVE, to: RunState.READY_FOR_CEO_REVIEW, continuityRelease: CEO, candidateSnapshotDigest: ready.candidate }),
+      ]);
+      expect(f.harness.cp.audit.forRun(ready.runId).some((entry) => entry.kind === "CEO_DECISION" || entry.kind === "OWNER_DECISION"))
+        .toBe(false);
+
+      await f.daemon.reconcileContinuity("a repeat pass");
+      expect(transitions(f, ready.runId)).toHaveLength(paused + 2);
     });
   });
 
