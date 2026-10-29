@@ -991,6 +991,25 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
     expect(fixture.harness.cp.audit.byKind("MERGE_REPLAY")).toHaveLength(1);
   });
 
+  it("#1257: the trusted-CI result the candidate's verification wrote is what project_get reads back", async () => {
+    const fixture = await setup();
+    const projectId = fixture.harness.cp.runs.require(fixture.runId).projectId!;
+    expect(createHermesMcpPort(fixture.harness.cp).projectView(projectId)?.ci).toMatchObject({
+      declared: true,
+      workflows: [{
+        checkName: "project-ci",
+        unobserved: false,
+        lastObserved: {
+          result: "PASS",
+          commitSha: fixture.head,
+          source: { kind: "CI_VERIFICATION_RESULT", runId: fixture.runId, status: "PASS" },
+          freshness: "stale",
+          staleReasons: expect.arrayContaining(["DIGEST_UNVERIFIED"]),
+        },
+      }],
+    });
+  });
+
   it("CP-S40: a failed post-merge check blocks dependent merges and a rollback plan is prepared", async () => {
     const fixture = await setup();
     const pullNumber = await prepared(fixture);
