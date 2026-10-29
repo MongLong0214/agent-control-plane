@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { manifestDigest } from "../../src/contracts/manifest.ts";
+import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ExecutionMode, RunKind } from "../../src/domain/types.ts";
 import type { CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
 import type { VerificationReport } from "../../src/verify/verification-engine.ts";
@@ -86,6 +87,53 @@ const reReview = async (h: ReturnType<typeof makeHarness>, runId: string, kind: 
 };
 
 describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
+  it("binds a repository-owned REVIEW.md from the exact candidate into the prompt, packet, and packet digest", async () => {
+    const harness = makeHarness();
+    const policy = [
+      "# Project review requirements",
+      "",
+      "- Treat a claimed native observation as unproved without exact-build evidence.",
+      "- Protocol-only changes do not invent native observations.",
+      "",
+    ].join("\n");
+    writeFiles(harness.repoPath, { "REVIEW.md": policy });
+    commitAll(harness.repoPath, "add project review requirements");
+
+    const driven = await driveToReviewedCandidate(harness);
+    const prompt = promptsStartingWith(harness, "# Candidate review")[0]!;
+    const packet = harness.cp.review.latestPacket(driven.runId, driven.candidateSnapshotDigest)!;
+    const verification = harness.cp.artifacts.latestForSnapshot<VerificationReport>(
+      driven.runId,
+      "VERIFICATION",
+      driven.candidateSnapshotDigest,
+    )!.content;
+    const reviewPolicy = {
+      repository: driven.identity,
+      path: "REVIEW.md",
+      revision: driven.candidateHead,
+      digest: sha256(policy),
+      content: policy,
+    };
+
+    expect(packet.inputManifest.reviewPolicies).toEqual([reviewPolicy]);
+    expect(packet.inputManifest.reviewerPromptDigests).toEqual([sha256(prompt)]);
+    expect(prompt).toContain("## Repository-owned review requirements");
+    expect(prompt).toContain(JSON.stringify([reviewPolicy], null, 2));
+    expect(prompt).toContain(`Packet digest: ${digestOf({
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      contractDigest: driven.contractDigest,
+      verificationDigest: digestOf(verification),
+      coverageTargets: [`${driven.identity}:src/app.js`],
+      reviewPolicies: [reviewPolicy],
+    })}`);
+
+    writeFiles(harness.repoPath, { "REVIEW.md": "working-tree-only replacement\n" });
+    await reReview(harness, driven.runId, "CANDIDATE");
+    const secondPrompt = promptsStartingWith(harness, "# Candidate review").at(-1)!;
+    expect(secondPrompt).toContain(JSON.stringify([reviewPolicy], null, 2));
+    expect(secondPrompt).not.toContain("working-tree-only replacement");
+  });
+
   it("candidate first review and re-review use only the original canonical method", async () => {
     const harness = makeHarness();
     const driven = await driveToReviewedCandidate(harness);
@@ -171,6 +219,8 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
       expectEvidenceStandard(prompt);
       expect(prompt.length).toBeLessThanOrEqual(120_000);
     }
+    const packet = harness.cp.review.latestPacket(runId, harness.cp.runs.currentCandidate(runId)!)!;
+    expect(packet.inputManifest.reviewerPromptDigests).toEqual(prompts.map(sha256));
     await reReview(harness, runId, "CANDIDATE");
   });
 
