@@ -3,6 +3,7 @@ import { allow, deny, type Decision } from '../core/errors.ts';
 import { ReasonCode } from '../core/reason-codes.ts';
 import { CanonicalSessionRegistry } from './canonical-session-registry.ts';
 import { Role, roleKeyFor } from '../domain/types.ts';
+import { retirementWaitsForSettlement } from '../ceo/ownerless-stalls.ts';
 
 /** Suspension commits first. Failure leaves a resumable, non-dispatching project with its history intact. */
 export async function retireProject(cp:ControlPlane,projectId:string,reason:string):Promise<Decision<unknown>> {
@@ -13,7 +14,8 @@ export async function retireProject(cp:ControlPlane,projectId:string,reason:stri
   if (!cp.db.get(`SELECT 1 FROM project_retirements WHERE project_id = ?`,[projectId])) cp.db.run(`INSERT INTO project_retirements(project_id,requested_at,reason) VALUES (?,?,?)`,[projectId,cp.clock.nowIso(),reason]);
   const work = cp.db.all<{run_id:string;state:string}>(`SELECT run_id,state FROM runs WHERE (project_id = ? OR run_id IN (SELECT run_id FROM bootstrap_applications WHERE project_id = ?)) AND state NOT IN ('COMPLETED','CANCELLED','FAILED') ORDER BY created_at,run_id`,[projectId,projectId]);
   // Confirmed/merged effects must settle through their own finalizer; cancellation never erases them.
-  if (work.some(r => ['CEO_APPROVED','FINALIZING','MERGING','POST_MERGE_VERIFYING','BLOCKED_POST_MERGE'].includes(r.state))) return deny(ReasonCode.CONFLICT,'retirement waits for confirmed external effects to settle',{projectId});
+  const settling = work.filter(r => ['CEO_APPROVED','FINALIZING','MERGING','POST_MERGE_VERIFYING','BLOCKED_POST_MERGE'].includes(r.state));
+  if (settling.length > 0) return retirementWaitsForSettlement(cp,projectId,settling);
   for (const run of work) {const cancelled = cp.runs.cancel(run.run_id,`project retirement: ${reason}`);if (!cancelled.allowed) return cancelled;}
   const workers = await cp.workerRetirement.reconcile();
   const projectWorkers = new Set(cp.db.all<{worker_session_id:string}>(`SELECT DISTINCT e.worker_session_id FROM task_executions e JOIN runs r ON r.run_id = e.run_id WHERE r.project_id = ? OR r.run_id IN (SELECT run_id FROM bootstrap_applications WHERE project_id = ?)`,[projectId,projectId]).map(r => r.worker_session_id));
