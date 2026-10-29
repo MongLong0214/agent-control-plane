@@ -42,8 +42,10 @@ export class ResidentProjectProvisioning {
   allocation(runId:string): ProjectAllocation | null {
     const row=this.row(runId);if (!row) return null;
     const value=JSON.parse(row.allocation_json) as Partial<ProjectAllocation>;
-    const binding=(JSON.parse(row.steps_json) as {roomBinding?:{roomId:string}}).roomBinding;
-    return value.sessionUuid ? {...value,...(binding ? {roomId:binding.roomId} : {})} as ProjectAllocation : null;
+    const steps=JSON.parse(row.steps_json) as {roomBinding?:{roomId:string};'ensure-buzz'?:unknown};
+    const binding=steps.roomBinding;
+    const roomLifecycle = steps['ensure-buzz'] === undefined && binding === undefined ? 'never-created' : 'created-or-unknown';
+    return value.sessionUuid ? {...value,...(binding ? {roomId:binding.roomId} : {}),roomLifecycle} as ProjectAllocation : null;
   }
   async ensure(input:{runId:string;projectId:string;repositoryIdentity:string;repositoryNodeId:string;head:string;packet:unknown}):Promise<ProvisioningEvidence> {
     if (this.#running.has(input.runId)) throw new Error('provisioning already in progress');
@@ -167,7 +169,7 @@ export class ResidentProjectProvisioning {
   private legacyRetirementAllocation(projectId:string):ProjectAllocation|null {
     const legacy = this.db.get<{session_uuid:string;buzz_address:string;identity:string;checkout_path:string;last_observed_head:string|null;os_pid:number|null;os_process_started_at:string|null}>(`SELECT e.session_uuid,e.buzz_address,r.identity,r.checkout_path,r.last_observed_head,s.os_pid,s.os_process_started_at FROM canonical_session_entitlements e JOIN repositories r ON r.project_id = e.project_id AND r.retired_at IS NULL LEFT JOIN assignments b ON b.project_id = e.project_id AND b.role = 'PRIMARY_CTO' AND b.status = 'ACTIVE' LEFT JOIN conversational_actors c ON c.actor_id = b.actor_id LEFT JOIN sessions s ON s.session_id = c.current_session_id WHERE e.project_id = ? ORDER BY r.repository_id LIMIT 1`,[projectId]);
     if (!legacy) return null;
-    return {projectId,runId:`legacy-retire:${projectId}`,repositoryIdentity:legacy.identity,repositoryNodeId:'legacy-history',head:legacy.last_observed_head ?? '0'.repeat(40),sessionUuid:legacy.session_uuid,roomId:legacy.buzz_address,clonePath:legacy.checkout_path,tmuxName:`acp-${Buffer.from(projectId).toString("hex")}`,socketPath:residentSessionSocket(this.stateDir,projectId),fleetName:`acp-${projectId}`,identityName:`cto-${projectId}`,privateKeyFile:residentPrivateKeyFile(this.home,projectId),bootPacket:residentBootPacket(this.home,projectId),nonce:'retirement',...(legacy.os_pid && legacy.os_process_started_at ? {retirementPin:{pid:legacy.os_pid,startedAt:legacy.os_process_started_at}} : {})};
+    return {projectId,runId:`legacy-retire:${projectId}`,repositoryIdentity:legacy.identity,repositoryNodeId:'legacy-history',head:legacy.last_observed_head ?? '0'.repeat(40),sessionUuid:legacy.session_uuid,roomId:legacy.buzz_address,roomLifecycle:'created-or-unknown',clonePath:legacy.checkout_path,tmuxName:`acp-${Buffer.from(projectId).toString("hex")}`,socketPath:residentSessionSocket(this.stateDir,projectId),fleetName:`acp-${projectId}`,identityName:`cto-${projectId}`,privateKeyFile:residentPrivateKeyFile(this.home,projectId),bootPacket:residentBootPacket(this.home,projectId),nonce:'retirement',...(legacy.os_pid && legacy.os_process_started_at ? {retirementPin:{pid:legacy.os_pid,startedAt:legacy.os_process_started_at}} : {})};
   }
   /**
    * #1229 — asks the host, changing nothing anywhere, whether retire can go ahead: the CTO process it would stop, the

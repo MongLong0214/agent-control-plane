@@ -280,19 +280,23 @@ try {
       if (![origin,`git@github.com:${match[1]}/${repoName}.git`].includes(remote))
         refuseWithOrder(`retirement clone origin mismatch: ${a.clonePath} points at ${remote}`,`point ${a.clonePath}'s origin at ${origin}, or move that clone aside`);
     }
-    // #1230 — the room. ACP's own records say whether this project has one: the roster's route for the allocation's
-    // room naming this project, or the room intent naming it, or the room itself being visible to this identity. With
-    // none of them there is no room and nothing to archive. A room that exists must be archived already or archivable
-    // by this identity as one of its owners; anything else is refused here, before anything moves.
+    // #1230 — the room. Missing host artifacts do not prove that a remote room never existed. Only the daemon ledger's
+    // never-created state or this host's exact post-archive receipt can settle that boundary without a key. A room that
+    // may exist must be archived already or archivable by this identity; anything else refuses before anything moves.
     const intentRoom = existsSync(intentFile) ? read(intentFile).roomId : undefined;
+    const roomArchiveFile = join(state,`retired-buzz-room-${a.projectId}.json`);
+    const roomArchiveReceipt = (() => {
+      try {
+        const receipt = read(roomArchiveFile);
+        return object(receipt) && receipt.version === 1 && receipt.projectId === a.projectId && receipt.roomId === a.roomId && receipt.archived === true;
+      } catch { return false; }
+    })();
     const pk = existsSync(a.privateKeyFile) ? pub() : null;
     const room = pk === null ? null : buzz(['channels','get','--channel',a.roomId]);
     if (room !== null) check(object(room) && room.channel_id === a.roomId && typeof room.name === 'string' && room.name.length > 0,'retiring Buzz room readback mismatch');
     const recorded = plannedRoute?.acp_project_id === a.projectId || intentRoom === a.roomId;
-    if (!recorded && room === null) return {resident,archive,room:{state:'none'}};
-    // A rerun after this retirement's host step already finished: retire archives the room before it retires the route
-    // and moves the key and intent aside last, so a retired route with neither left is a room already archived.
-    if (pk === null && intentRoom === undefined && plannedRoute?.acp_project_id === a.projectId && plannedRoute.status === 'retired') return {resident,archive,room:{state:'archived'}};
+    if (roomArchiveReceipt) return {resident,archive,room:{state:'archived',archiveReceipt:roomArchiveFile}};
+    if (!recorded && room === null && a.roomLifecycle === 'never-created') return {resident,archive,room:{state:'none'}};
     const owner = plannedRoute?.peer?.pubkey ?? 'not recorded';
     if (pk === null) refuseWithOrder(`Buzz room ${a.roomId} cannot be archived: no key for ${a.identityName} at ${a.privateKeyFile}`,
       `put the key of room ${a.roomId}'s owner (pubkey ${owner} per the roster) at ${a.privateKeyFile}; retirement archives the room with it and then moves it aside`);
@@ -529,6 +533,10 @@ try {
         hostChanged = true; // the archive may land even when its answer is lost
         run('buzz',['channels','archive','--channel',a.roomId],{env:buzzEnv()});
         check(roomArchived(room.name),'Buzz room archive readback mismatch');
+      }
+      if (room.state !== 'none') {
+        hostChanged = true;
+        atomic(join(state,`retired-buzz-room-${a.projectId}.json`),JSON.stringify({version:1,projectId:a.projectId,roomId:a.roomId,archived:true})+'\n');
       }
       hostChanged = true;
       rmSync(join(dirname(a.bootPacket),`${a.fleetName}.resident.json`),{force:true});

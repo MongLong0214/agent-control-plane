@@ -459,6 +459,10 @@ it.each(binaries)('reports the %s step and non-zero exit code without subprocess
 });
 
 const saveAllocation = (f:ReturnType<typeof fixture>) => writeFileSync(join(f.home,'allocation.json'),JSON.stringify(f.a));
+const saveArchivedRoomReceipt = (f:ReturnType<typeof fixture>) => writeFileSync(
+  join(f.state,`retired-buzz-room-${f.a.projectId}.json`),
+  JSON.stringify({version:1,projectId:f.a.projectId,roomId:f.a.roomId,archived:true})+'\n',
+);
 const fakeState = (f:ReturnType<typeof fixture>) => JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8')) as Record<string,unknown>;
 const patchFake = (f:ReturnType<typeof fixture>, patch:Record<string,unknown>) => writeFileSync(join(f.home,'fake.json'),JSON.stringify({...fakeState(f),...patch}));
 /** A process this test starts and owns, standing in for a CTO incarnation; only its exact PID is ever signalled. */
@@ -478,6 +482,7 @@ const sessionRecord = (f:ReturnType<typeof fixture>, pid:number, record:Record<s
 it('#1229: retires the recorded CTO incarnation, identified by its session row pid and start token, while its cwd is outside the clone',async () => {
   const f = fixture();
   await f.invoke('ensure-checkout');
+  saveArchivedRoomReceipt(f);
   const cto = await standInCto();
   try {
     // The CTO session runs from the home directory, not the clone; its argv and Claude's session record name the session.
@@ -525,6 +530,9 @@ it('#1230: retire archives the room and moves the key and room intent aside; a s
   const oldKey = readFileSync(f.a.privateKeyFile,'utf8');const oldIntent = readFileSync(join(f.state,'buzz-room-test.json'),'utf8');
   const retired = await f.invoke('retire');
   expect(retired).toMatchObject({retired:true,buzzRoom:'archived'});
+  expect(JSON.parse(readFileSync(join(f.state,'retired-buzz-room-test.json'),'utf8'))).toEqual({
+    version:1,projectId:'test',roomId:oldRoom,archived:true,
+  });
   const archive = retired['identityArchivePath'] as string;
   expect(archive.startsWith(join(f.state,'retired-buzz-identities','cto-test.'))).toBe(true);
   expect(statSync(archive).mode & 0o777).toBe(0o700);expect(statSync(join(f.state,'retired-buzz-identities')).mode & 0o777).toBe(0o700);
@@ -576,6 +584,7 @@ it.each(['hand-made','bound'] as const)('#1230: ensure-buzz uses an existing key
 it('#1229 C-1: a session row holding ps lstart text still pins the CTO; it is stopped, never skipped as exited',async () => {
   const f = fixture();
   await f.invoke('ensure-checkout');
+  saveArchivedRoomReceipt(f);
   const cto = await standInCto();
   try {
     // Its argv names no session; Claude's own record does. The row's start is in setPid's lstart form, not the native token.
@@ -583,7 +592,7 @@ it('#1229 C-1: a session row holding ps lstart text still pins the CTO; it is st
     const lstart = 'Mon Oct 26 01:00:00 2026';
     patchFake(f,{pinCommand:'claude',lstart});
     f.a.retirementPin = {pid:cto.pid,startedAt:lstart};saveAllocation(f);
-    expect(await f.invoke('retire')).toMatchObject({retired:true,buzzRoom:'none'});
+    expect(await f.invoke('retire')).toMatchObject({retired:true,buzzRoom:'archived'});
     expect(await Promise.race([cto.exit,new Promise(resolve => setTimeout(() => resolve('still running'),5_000))])).toBe('SIGTERM');
   } finally {cto.stop();}
 });
@@ -646,9 +655,12 @@ it('#1229 C-1: a refused retirement changes no database row and no host file',as
 });
 
 it('#1229 C-3: when the CTO changes between verification and the host step, the refusal commits nothing irreversible',async () => {
-  // No key, no roster route and no clone: the CTO is the only thing this retirement has to verify.
+  // The exact host receipt proves the room was archived already; the CTO is the only unsettled boundary.
   const r = await legacyRetirement({key:false,clone:false,roster:false});
   try {
+    writeFileSync(join(r.h.root,'retired-buzz-room-resident.json'),JSON.stringify({
+      version:1,projectId:r.entry.projectId,roomId:r.entry.buzzAddress,archived:true,
+    })+'\n');
     r.sessionRecord(r.entry.sessionUuid);
     const verify = r.h.cp.residentProjects.verifyRetirement.bind(r.h.cp.residentProjects);
     vi.spyOn(r.h.cp.residentProjects,'verifyRetirement').mockImplementation(async projectId => {
@@ -666,6 +678,28 @@ it('#1229 C-3: when the CTO changes between verification and the host step, the 
     expect(new CanonicalSessionRegistry(r.h.cp.db).effective()).toEqual([r.entry]);
     expect({database:r.tables(['audit_events','sqlite_sequence']),host:r.host()}).toEqual(before);
     expect(readProcessStartToken(r.cto.pid)).toBe(r.cto.startedAt);
+  } finally {r.cto.stop();r.h.cp.close();}
+});
+
+it('#1230 C-4: a legacy entitlement with lost local room artifacts is not treated as proof that no room exists',async () => {
+  const r = await legacyRetirement({key:false,clone:false,roster:false});
+  try {
+    r.sessionRecord(r.entry.sessionUuid);
+    const before = {database:r.tables(),host:r.host()};
+    const refused = await retireProject(r.h.cp,r.entry.projectId,'operator retirement');
+    expect(refused).toMatchObject({
+      allowed:false,
+      reasonCode:'CONFLICT',
+      evidence:{
+        projectId:'resident',
+        refusal:expect.stringContaining(`no key for cto-resident`),
+        requiredOrder:[
+          expect.stringContaining(`put the key of room ${r.entry.buzzAddress}'s owner`),
+          'run agentctl project retire resident again',
+        ],
+      },
+    });
+    expect({database:r.tables(),host:r.host()}).toEqual(before);
   } finally {r.cto.stop();r.h.cp.close();}
 });
 
@@ -700,6 +734,42 @@ it.each(['member','no-key'] as const)('#1230 C-4: retire refuses, moving nothing
     expect(outcome.retirementOutcome).toMatchObject({hostChanged:false,requiredOrder:order});
     expect(outcome.retirementOutcome.reason).toContain(roomId);
     if (problem === 'member') expect(outcome.retirementOutcome.reason).toContain(`owned by ${'c'.repeat(64)}`);
+    expect(snapshot()).toEqual(before);
+  }
+});
+
+it('#1230 C-4: a retired local route alone does not prove the external room was archived',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');
+  const first = await f.invoke('ensure-buzz');const roomId = (first.buzz as {roomId:string}).roomId;
+  f.a.roomId = roomId;saveAllocation(f);await f.invoke('ensure-routing');
+  const pk = readFileSync(f.a.privateKeyFile.replace('.priv','.pub'),'utf8').trim();
+  for (const ext of ['priv','pub']) renameSync(f.a.privateKeyFile.replace('.priv',`.${ext}`),join(dirname(f.a.privateKeyFile),`cto-lost.${ext}`));
+  rmSync(join(f.state,'buzz-room-test.json'),{force:true});
+  const rosterFile = join(f.home,'.hermes','bridge','required-mentions.json');
+  const roster = JSON.parse(readFileSync(rosterFile,'utf8')) as {channels:Record<string,{status:string}>};
+  roster.channels[roomId]!.status = 'retired';
+  writeFileSync(rosterFile,JSON.stringify(roster,null,2)+'\n');
+  const snapshot = () => ({
+    fake:fakeState(f).room,
+    archived:fakeState(f).archivedRooms ?? [],
+    roster:readFileSync(rosterFile,'utf8'),
+    clone:existsSync(f.a.clonePath),
+    marker:existsSync(join(f.state,'retired-buzz-room-test.json')),
+  });
+  const before = snapshot();
+  for (const operation of ['retire','verify-retire']) {
+    const failure = await f.invoke(operation).then(result => `unexpected success ${JSON.stringify(result)}`,(error:unknown) => String(error));
+    expect(failure).not.toContain('unexpected success');
+    const outcome = JSON.parse(failure.trim().split('\n').at(-1)!) as {retirementOutcome:{hostChanged:boolean;reason:string;requiredOrder:string[]}};
+    expect(outcome.retirementOutcome).toMatchObject({
+      hostChanged:false,
+      reason:expect.stringContaining(`no key for cto-test`),
+      requiredOrder:[
+        `put the key of room ${roomId}'s owner (pubkey ${pk} per the roster) at ${f.a.privateKeyFile}; retirement archives the room with it and then moves it aside`,
+        'run agentctl project retire test again',
+      ],
+    });
     expect(snapshot()).toEqual(before);
   }
 });
