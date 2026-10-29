@@ -286,7 +286,7 @@ it("SHA-256 checkout prepares its task branch at the 64-character pinned SHA",as
  });
 });
 
-it.each(["dev","main"])("S-TB-06 %s real worker, freeze, verification, PR preparation retain the pin",async base=>{
+it.each(["dev","main"])("S-TB-06 %s real worker, freeze, verification, and PR preparation refuse an advanced base",async base=>{
  const gh=new FakeGitHub();
  await withBootstrapRuntime(async f=>{
   const cp=f.harness.cp;
@@ -314,18 +314,18 @@ it.each(["dev","main"])("S-TB-06 %s real worker, freeze, verification, PR prepar
   const verified=await cp.verification.verify({runId:s.runId,snapshot:frozen.value,commands:commandsForMode(manifest,run.executionMode),contractDigest:run.contractDigest});
   console.error("LINEAGE_VERIFY",base,JSON.stringify(verified));
   expect.soft(verified.allowed).toBe(true);
-  // Exercise actual prPrepare and its guard/receipt/readback, with finalization state set by the
-  // test. This boundary check does not certify the CEO/review approval workflow.
+  // Exercise actual prPrepare and its readback with finalization state set by the test. The remote
+  // base moved after the recorded pin, so preparation must fail closed without finalizing the
+  // reservation created before the external PR effect.
   expect(cp.runs.transition(s.runId,RunState.READY_FOR_CEO_REVIEW,"boundary fixture").allowed).toBe(true);
   expect(cp.runs.transition(s.runId,RunState.CEO_APPROVED,"boundary fixture").allowed).toBe(true);
   gh.setBranch(base,advanced);gh.setBranch(target.branch,repo.candidateHead);
   const prepared=await cp.github.prPrepare({runId:s.runId,repositoryIdentity:IDENTITY,head:target.branch,base,title:"pinned lineage",body:"review boundary probe",declaredParent:repo.sourceBranch!,exactHeadSha:repo.candidateHead,ownerSessionId:run.ownerSessionId!,ownerBindingGeneration:run.ownerBindingGeneration!,daemonFinalizerAuthority:cp.daemonFinalizationAuthorities().write});
   console.error("LINEAGE_PR",base,JSON.stringify(prepared));
-  expect(prepared.allowed).toBe(true);
+  expect(prepared).toMatchObject({allowed:false,reasonCode:ReasonCode.MERGE_BASE_STALE});
   const receipt=cp.db.get<{response_json:string}>("SELECT response_json FROM github_receipts WHERE run_id = ? AND operation = 'pr_prepare'",[s.runId]);
   console.error("LINEAGE_RECEIPT",base,receipt);
   expect(receipt).toBeTruthy();
-  const intent=JSON.parse(receipt!.response_json).intent;
-  expect(intent.sourceHead).toBe(target.baseSha);expect(intent.sourceBranch).toBe(base);
+  expect(JSON.parse(receipt!.response_json)).toEqual({pending:true});
  },{githubClient:gh});
 });
