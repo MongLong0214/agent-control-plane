@@ -1727,9 +1727,9 @@ export class WorkerTurnRunner {
     // Re-entry: the checkout is on the task's branch already; the preparation that follows reads it.
     if (branch === target.branch) return allow(ReasonCode.OK, undefined);
     let handoff: { runId: string; taskId: string; branch: string } | null = null;
-    // #1227 — a resident project's worker clone rests detached, so its base branch is a ref nobody has
-    // checked out, which follows each run's pin (below). Only that checkout is taken from a detached
-    // HEAD; any other detached checkout is someone's, and is not moved.
+    // #1227 — a resident project's worker clone rests detached. Its task branch is cut directly from
+    // the run's pinned commit; no unclaimed base ref is moved. Only that checkout is taken from a
+    // detached HEAD; any other detached checkout is someone's, and is not moved.
     const dedicated = residentRepository(this.ports.db, facts.claim.repositoryId)?.workerCheckoutPath === worktree;
     const resting = branch === null && dedicated;
     if (branch !== facts.claim.baseBranch && !resting) {
@@ -1744,14 +1744,6 @@ export class WorkerTurnRunner {
       if (!previous.allowed) return previous as Decision<never>;
       handoff = previous.value;
     }
-    // #1227 — a resident's worker clone has its own base branch, which no one checks out: it follows the
-    // run's pinned base (read from the resident's clone), so freeze and freshness read the base its task
-    // branches were made from. Only a branch other than the one checked out is moved, and only here,
-    // where no turn runs in this checkout.
-    const baseRef = `refs/heads/${facts.claim.baseBranch}`;
-    const mirrors = dedicated && branch !== facts.claim.baseBranch;
-    const baseNow = mirrors ? await commitOf(repo, baseRef) : null;
-    const mirrorBase = mirrors && baseNow !== target.baseSha ? { ref: baseRef, sha: target.baseSha, was: baseNow } : null;
     const unclean = await uncleanPaths(repo, head, format, "branch");
     if (unclean.length > 0) {
       return deny(
@@ -1796,7 +1788,6 @@ export class WorkerTurnRunner {
         effect.outcome = await switchToTaskBranch(repo, {
           head,
           branch,
-          mirrorBase,
           tip,
           to,
           target,
@@ -1842,7 +1833,6 @@ export class WorkerTurnRunner {
           fromBranch: branch,
           created: tip === null,
           checkedOut: needsCheckout,
-          ...(mirrorBase ? { baseFollowedPin: { branch: facts.claim.baseBranch, from: mirrorBase.was, to: mirrorBase.sha } } : {}),
           handoffFrom: handoff,
           // #1242 — the base a task with dependsOn predecessors started from, and which tasks it holds.
           ...(target.startsFrom ? { startsFrom: target.startsFrom } : {}),
@@ -2690,7 +2680,7 @@ type CreationRecordKind = typeof TASK_BRANCH_CREATING | typeof TASK_BRANCH_CREAT
 
 /** One undo step that did not do what it was for: the step, git's (or the store's) own words, and where that leaves the checkout. */
 interface UndoBlocker {
-  step: "head-back" | "files-back" | "head-forward" | "ref-delete" | "base-ref-back" | "recovery incomplete" | "completion" | "undo";
+  step: "head-back" | "files-back" | "head-forward" | "ref-delete" | "recovery incomplete" | "completion" | "undo";
   error: string;
   state: string;
   paths?: string[];
@@ -2818,8 +2808,6 @@ const switchToTaskBranch = async (
     head: string;
     /** The branch HEAD named when it was read; null for a detached HEAD (#1227: a resident's worker checkout at rest). */
     branch: string | null;
-    /** #1227 — a worker clone's base branch, moved to the run's pinned base before anything else is written. */
-    mirrorBase: { ref: string; sha: string; was: string | null } | null;
     tip: string | null;
     to: string;
     target: TaskWriteTarget;
@@ -2874,35 +2862,7 @@ const switchToTaskBranch = async (
   let createdHere = false;
   let filesMoved = false;
   let headMoved = false;
-  let mirrorBaseMoved = false;
   const blockers: UndoBlocker[] = [];
-  /** Restore only the exact base-ref value this attempt moved; a foreign later move is never overwritten. */
-  const restoreMirrorBase = async (): Promise<boolean> => {
-    if (!mirrorBaseMoved || !input.mirrorBase) return true;
-    const { ref, sha, was } = input.mirrorBase;
-    const current = await commitOf(repo, ref);
-    if (current !== sha) {
-      blockers.push({
-        step: "base-ref-back",
-        error: `${ref} names ${current ?? "deleted"}, not the pinned base this attempt set; it is not moved`,
-        state: `${ref} is left at ${current ?? "deleted"}`,
-      });
-      return false;
-    }
-    const restored = was === null
-      ? await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: worker checkout base undone", "-d", ref, sha])
-      : await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: worker checkout base undone", ref, was, sha]);
-    if (restored.exitCode !== 0) {
-      blockers.push({
-        step: "base-ref-back",
-        error: gitWords(restored),
-        state: `${ref} is left at ${(await commitOf(repo, ref)) ?? "deleted"}`,
-      });
-      return false;
-    }
-    mirrorBaseMoved = false;
-    return true;
-  };
   const undo = async (message: string, evidence: Record<string, unknown>, cause: "git" | "records"): Promise<Decision<never>> => {
     try {
       // 1. HEAD back, only while it still names the task branch this attempt set.
@@ -2991,7 +2951,6 @@ const switchToTaskBranch = async (
           }
         }
       }
-      const mirrorBaseRestored = await restoreMirrorBase();
       const leftOnBranch = createdHere && !refRemoved && refNowElsewhere === null && headMoved && (await headRefOf(repo)) === branchRef;
       if (leftOnBranch) {
         const done = record(TASK_BRANCH_CREATED);
@@ -3000,7 +2959,7 @@ const switchToTaskBranch = async (
         }
       }
       const nothingKept = !createdHere || refRemoved || refNowElsewhere !== null;
-      const rolledBack = blockers.length === 0 && !headMoved && !filesMoved && nothingKept && !mirrorBaseMoved;
+      const rolledBack = blockers.length === 0 && !headMoved && !filesMoved && nothingKept;
       let undoRecorded = false;
       if (rolledBack && cause === "git") undoRecorded = record(TASK_BRANCH_CREATION_UNDONE).allowed;
       return refused(message, {
@@ -3010,8 +2969,6 @@ const switchToTaskBranch = async (
         leftOnBranch,
         headMoved,
         filesMoved,
-        mirrorBaseMoved,
-        mirrorBaseRestored,
         rolledBack,
         undoRecorded,
         ...(refNowElsewhere === null ? {} : { refNowElsewhere }),
@@ -3021,7 +2978,7 @@ const switchToTaskBranch = async (
       });
     } catch (failure) {
       blockers.push({ step: "undo", error: errorText(failure).slice(0, 300), state: "the undo stopped where it was; the checkout was not measured after it" });
-      return refused(message, { ...evidence, created: createdHere, headMoved, filesMoved, mirrorBaseMoved, rolledBack: false, blockers });
+      return refused(message, { ...evidence, created: createdHere, headMoved, filesMoved, rolledBack: false, blockers });
     }
   };
 
@@ -3030,26 +2987,14 @@ const switchToTaskBranch = async (
       const intent = record(TASK_BRANCH_CREATING);
       if (!intent.allowed) return refused(`the task branch's creation could not be recorded before it was made; nothing was created: ${intent.message}`);
     }
-    if (input.mirrorBase) {
-      const { ref, sha, was } = input.mirrorBase;
-      const followed = await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: the worker checkout's base follows the run's pinned base", ref, sha, was ?? ZERO_OID[input.format]]);
-      if (followed.exitCode !== 0) {
-        return refused("the worker checkout's base branch could not be moved to the run's pinned base; nothing was created or moved", { error: gitWords(followed) });
-      }
-      mirrorBaseMoved = true;
-    }
     if (input.tip === null) {
       const created = await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: task branch", branchRef, startOf(input.target), ZERO_OID[input.format]]);
       if (created.exitCode !== 0) {
         // Nothing of this attempt exists: the attempt is resolved, the ref there is someone else's.
         const resolved = record(TASK_BRANCH_CREATION_UNDONE).allowed;
-        const mirrorBaseRestored = await restoreMirrorBase();
         return refused("the task's branch could not be created; a ref that exists is never overwritten, nor adopted", {
           error: created.stderr.slice(0, 300),
           undoRecorded: resolved,
-          mirrorBaseMoved,
-          mirrorBaseRestored,
-          blockers,
         });
       }
       createdHere = true;
@@ -3057,13 +3002,7 @@ const switchToTaskBranch = async (
         return await undo("the task's branch does not read back at the commit it starts from after its creation", {}, "git");
       }
     } else if ((await commitOf(repo, branchRef)) !== input.tip) {
-      const mirrorBaseRestored = await restoreMirrorBase();
-      return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "the task's branch moved before it was checked out", {
-        branch: input.target.branch,
-        mirrorBaseMoved,
-        mirrorBaseRestored,
-        blockers,
-      });
+      return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "the task's branch moved before it was checked out", { branch: input.target.branch });
     }
     if (input.needsCheckout) {
       const moved = await runPinnedGit(repo, ["read-tree", "-m", "-u", input.head, input.to]);
@@ -3080,7 +3019,6 @@ const switchToTaskBranch = async (
             state: `HEAD names ${input.branch ?? "no branch"} at ${input.head}; the index holds ${input.head}; ${createdHere ? `${branchRef} is kept at the pinned base, the moved files standing on it; ` : ""}the paths the read-tree moved before it stopped are left exactly as they are, not put back`,
             paths: measured.moved.map((path) => path.path),
           });
-          const mirrorBaseRestored = await restoreMirrorBase();
           return refused("the checkout's files could not be moved to the task's branch, and some had moved; recovery is incomplete and everything is left exactly as it stands", {
             error: moved.stderr.slice(0, 300),
             created: createdHere,
@@ -3088,8 +3026,6 @@ const switchToTaskBranch = async (
             leftOnBranch: false,
             headMoved: false,
             filesMoved: true,
-            mirrorBaseMoved,
-            mirrorBaseRestored,
             rolledBack: false,
             undoRecorded: false,
             recovery: { attemptId: input.attemptId, from: input.head, to: input.to, paths: measured.moved, indexChanged: measured.indexChanged, notOurs: measured.notOurs.slice(0, 50) },

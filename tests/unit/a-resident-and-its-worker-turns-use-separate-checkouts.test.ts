@@ -293,6 +293,7 @@ describe("#1227 a resident's working directory never reaches a worker turn", () 
         const object = gitSync(s.clone, ["rev-parse", "HEAD:src/app.js"]);
         const objectPath = (repo: string): string => join(repo, ".git", "objects", object.slice(0, 2), object.slice(2));
         expect(statSync(objectPath(checkout)).ino).toBe(statSync(objectPath(s.clone)).ino);
+        const workerDev = gitSync(checkout, ["rev-parse", "refs/heads/dev"]);
 
         // The resident commits on its own dev, in its own clone, after the move: the run's base is read there.
         writeFiles(s.clone, { "docs/resident.md": "# committed by the resident\n" });
@@ -316,8 +317,10 @@ describe("#1227 a resident's working directory never reaches a worker turn", () 
         expect(gitSync(checkout, ["diff-tree", "--no-commit-id", "--name-only", "-r", residentDev, commit])).toBe("src/app.js");
         expect(gitSync(checkout, ["show", `${commit}:README.md`])).toBe("# fixture project");
         expect(gitSync(checkout, ["ls-tree", "-r", "--name-only", commit])).not.toMatch(/\.claude|notes/);
-        // The worker clone's base branch followed the run's pin; the clone's dev is the resident's alone.
-        expect(gitSync(checkout, ["rev-parse", "refs/heads/dev"])).toBe(residentDev);
+        // Only the claimed task branch moves. The worker clone's base ref is not an unclaimed mirror
+        // of the resident's dev; the task branch starts directly from the pinned commit instead.
+        expect(gitSync(checkout, ["rev-parse", "refs/heads/dev"])).toBe(workerDev);
+        expect(workerDev).not.toBe(residentDev);
         // The resident's clone is exactly as it left it: every file of its git dir (read first: this test's
         // own git status below may refresh the index), its files, its branch.
         expect(gitDirState(s.clone)).toBe(cloneGitDir);
