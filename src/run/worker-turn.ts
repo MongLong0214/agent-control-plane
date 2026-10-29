@@ -16,7 +16,7 @@ import { providerHome } from "../runtime/cli-adapters.ts";
 import type { InvocationResult, ProviderAdapter } from "../runtime/provider.ts";
 import { randomUUID } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type { ExecutionRecord, TaskGraph } from "./task-graph.ts";
 import {
   TASK_BRANCH_CREATED,
@@ -693,7 +693,7 @@ export class WorkerTurnRunner {
         runId: facts.runId,
         sessionId: facts.worker.sessionId,
         roleKey: facts.worker.roleKey,
-        evidence: { worktreeId: worktree, taskId: facts.taskId, ...evidence } as Evidence,
+        evidence: { ...evidence, worktreeId: worktree, worktreePathKind: "CANONICAL_V1", taskId: facts.taskId } as Evidence,
       });
     children.record({
       intended: (nonce) => {
@@ -877,15 +877,45 @@ export class WorkerTurnRunner {
             }
           });
       const ends = events(TASK_WORKER_GIT_GROUP_ENDED);
+      const eventWorktree = (event: Record<string, unknown> | null): "CURRENT" | "OTHER" | "AMBIGUOUS" | null => {
+        const value = event?.["worktreeId"];
+        const pathKind = event?.["worktreePathKind"];
+        if (typeof value !== "string") return null;
+        if (isAbsolute(value)) {
+          if (value === worktree) return "CURRENT";
+          if (pathKind === "CANONICAL_V1") return "OTHER";
+        }
+        if (pathKind !== undefined && pathKind !== "CANONICAL_V1") return null;
+        const taskId = event?.["taskId"];
+        if (typeof taskId !== "string") return "AMBIGUOUS";
+        const target = recordedWriteTarget(this.ports.db, runId, taskId);
+        if (!target) return "AMBIGUOUS";
+        const repository = this.ports.db.get<{ checkout_path: string }>(
+          `SELECT r.checkout_path FROM run_repositories rr
+             JOIN repositories r ON r.repository_id = rr.repository_id
+            WHERE rr.run_id = ? AND r.identity = ?`,
+          [runId, target.repositoryIdentity],
+        );
+        if (!repository || !isAbsolute(repository.checkout_path)) return "AMBIGUOUS";
+        // RepositoryRegistry persisted this path canonical at registration. It is durable task
+        // provenance; unlike the event path's current filesystem shape it cannot be changed by
+        // deleting, retargeting, or replacing a legacy alias after the event was committed. It also
+        // survives AuditLog replacing a credential-shaped hosted-runner prefix with `[redacted]`.
+        return repository.checkout_path === worktree ? "CURRENT" : "OTHER";
+      };
       // A group ends only by its own end (its nonce and pgid); an intent with no group, by any end of its nonce.
       const groupEnded = new Set(ends.filter((end) => end?.["pgid"] != null).map((end) => `${String(end!["nonce"])}:${String(end!["pgid"])}`));
       const intentEnded = new Set(ends.map((end) => end?.["nonce"]));
       const grouped = new Set<unknown>();
       const goneGroups: Array<{ nonce: string; pgid: number }> = [];
       for (const group of events(TASK_WORKER_GIT_GROUP_STARTED)) {
-        if (group === null || typeof group["worktreeId"] !== "string" || typeof group["nonce"] !== "string") return -1;
+        const recordedWorktree = eventWorktree(group);
+        if (group === null || recordedWorktree === null || typeof group["nonce"] !== "string") return -1;
         grouped.add(group["nonce"]);
-        if (group["worktreeId"] !== worktree) continue;
+        // Older records did not attest that their path was canonical. Probe those conservatively:
+        // resolving a symlink again after the record was committed would let deletion or retargeting
+        // make a live writer disappear from this checkout's recovery.
+        if (recordedWorktree === "OTHER") continue;
         const pgid = Number(group["pgid"]);
         if (!Number.isSafeInteger(pgid) || pgid <= 1) return -1;
         if (groupEnded.has(`${group["nonce"]}:${pgid}`)) continue;
@@ -896,15 +926,20 @@ export class WorkerTurnRunner {
       const gateless: string[] = [];
       for (const intent of events(TASK_WORKER_GIT_INTENT)) {
         const nonce = intent?.["nonce"];
-        if (typeof nonce !== "string" || typeof intent?.["worktreeId"] !== "string") return -1;
-        if (intent["worktreeId"] !== worktree || grouped.has(nonce) || intentEnded.has(nonce)) continue;
+        const recordedWorktree = eventWorktree(intent);
+        if (typeof nonce !== "string" || recordedWorktree === null) return -1;
+        if (recordedWorktree === "OTHER" || grouped.has(nonce) || intentEnded.has(nonce)) continue;
         gateless.push(nonce);
       }
       const waiting = gatedGitChildren(gateless);
       if (waiting === null) return -1;
       if (gateless.some((nonce) => waiting.has(nonce))) return -1;
       const record = (nonce: string, pgid: number | null, proven: string): void => {
-        this.ports.audit.record({ kind: TASK_WORKER_GIT_GROUP_ENDED, runId, evidence: { worktreeId: worktree, nonce, pgid, proven } });
+        this.ports.audit.record({
+          kind: TASK_WORKER_GIT_GROUP_ENDED,
+          runId,
+          evidence: { worktreeId: worktree, worktreePathKind: "CANONICAL_V1", nonce, pgid, proven },
+        });
       };
       for (const group of goneGroups) record(group.nonce, group.pgid, "GROUP_GONE");
       for (const nonce of gateless) record(nonce, null, "GATE_GONE");

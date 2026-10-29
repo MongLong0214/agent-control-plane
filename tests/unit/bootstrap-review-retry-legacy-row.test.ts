@@ -151,7 +151,7 @@ describe("a legacy UNAVAILABLE row with no candidate digest gets the one officia
     });
   });
 
-  it("two sweeps at once, a second pass, and a restart wake nothing more", async () => {
+  it("two sweeps admit one retry, then an ignored retry fails once and stays terminal after restart", async () => {
     await withBootstrapRuntime(async (f) => {
       const run = await legacyRun(f, { onRetry: "ignore" });
       const other = new Daemon(f.harness.cp, { stateDir: tempDir("acp-rlr-other-") });
@@ -173,7 +173,7 @@ describe("a legacy UNAVAILABLE row with no candidate digest gets the one officia
       expect(f.finishedTurns(run.ownerSessionId)).toBe(2);
       expect(run.owner.results).toHaveLength(1);
       expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, run.runId)).toHaveLength(1);
-      expect(resultState(f, run.runId)).toEqual({ state: RunState.ACTIVE, candidate: run.candidate, attempts: ["RELEASED"] });
+      expect(resultState(f, run.runId)).toEqual({ state: RunState.FAILED, candidate: run.candidate, attempts: ["RELEASED"] });
       expect(rawRow(f, run.unavailableEventId)).toEqual(run.original);
     });
   });
@@ -257,7 +257,7 @@ describe("a legacy row is not retried twice", () => {
     });
   });
 
-  it("once the official retry for (run, generation, candidate) is spent; the digest path's retry is unchanged", async () => {
+  it("fails explicitly when the one official retry is spent and its review is unavailable again", async () => {
     await withBootstrapRuntime(async (f) => {
       reviews(f);
       const legacy = legacyRows(f);
@@ -290,7 +290,16 @@ describe("a legacy row is not retried twice", () => {
       expect(freezes.at(-1)!.eventId).toBeLessThan(rows[1]!.eventId);
       expect(sweep(f)).toEqual({ woken: [] });
       expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, runId)).toHaveLength(1);
-      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
+      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.FAILED);
+      expect(auditOf(f, "RUN_TRANSITION", runId).at(-1)?.evidence).toMatchObject({
+        from: RunState.ACTIVE,
+        to: RunState.FAILED,
+        failureClass: "BLIND_REVIEW_RETRY_EXHAUSTED",
+        bindingGeneration: 1,
+        planDigest,
+        candidateSnapshotDigest: candidate,
+        unavailableEventId: rows[1]!.eventId,
+      });
     });
   });
 });
