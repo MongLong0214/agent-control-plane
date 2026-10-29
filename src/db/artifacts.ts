@@ -710,6 +710,18 @@ const blindReviewEvidenceSchema = z
             })
             .strict(),
         ),
+        reviewPolicies: z.array(
+          z
+            .object({
+              repository: z.string().min(1),
+              path: z.literal("REVIEW.md"),
+              revision: z.string().regex(/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/),
+              digest: DIGEST_SCHEMA,
+              content: z.string().min(1).max(16_384),
+            })
+            .strict(),
+        ),
+        reviewerPromptDigests: z.array(DIGEST_SCHEMA).min(1),
       })
       .strict(),
     coveredRepositories: z.array(z.string()),

@@ -668,6 +668,38 @@ describe("round-2 blind-review regressions", () => {
     expect(setup.harness.cp.review.latestPacket(setup.run.runId, candidateSnapshotDigest(setup.snapshot))).toBeNull();
   });
 
+  /** #1258 — one more execution of the fixture's one input, beside the PASS the fixture wrote. */
+  const recordExecution = (setup: Awaited<ReturnType<typeof prepareReviewedInputs>>, attempt: number, status: "PASS" | "FAIL") => {
+    const digest = candidateSnapshotDigest(setup.snapshot);
+    const result = setup.verification.results[0]!;
+    setup.harness.cp.db.run(
+      `INSERT INTO verification_results
+         (result_id, run_id, candidate_snapshot_digest, command_id, repository_identity, source, attempt,
+          exact_head, started_at, ended_at, exit_code, output_digest, output_truncated, status, reason_code)
+       VALUES (?, ?, ?, ?, ?, 'local', ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+      [`${digest}:${result.commandId}:${result.repositoryIdentity}:local:${attempt}`, setup.run.runId, digest, result.commandId,
+        result.repositoryIdentity, attempt, result.exactHead, result.startedAt, result.endedAt, status === "PASS" ? 0 : 1,
+        `sha256:execution-${attempt}`, status, status === "PASS" ? null : ReasonCode.VERIFICATION_COMMAND_FAILED],
+    );
+  };
+
+  it("#1258 admits review when an earlier execution of the input failed and its latest passed", async () => {
+    const setup = await prepareReviewedInputs();
+    // The fixture's PASS becomes the input's second execution, after a FAIL on the same candidate.
+    setup.harness.cp.db.run(`UPDATE verification_results SET attempt = 2 WHERE run_id = ?`, [setup.run.runId]);
+    recordExecution(setup, 1, "FAIL");
+    const reviewed = await directReview(setup);
+    expect(reviewed, JSON.stringify(reviewed)).toMatchObject({ allowed: true, value: { verdict: "PASS" } });
+  });
+
+  it("#1258 refuses review when the input's latest execution failed after an earlier PASS", async () => {
+    const setup = await prepareReviewedInputs();
+    recordExecution(setup, 2, "FAIL");
+    const reviewed = await directReview(setup);
+    expect(reviewed).toMatchObject({ allowed: false, reasonCode: ReasonCode.EVIDENCE_MISSING });
+    expect(setup.harness.cp.review.latestPacket(setup.run.runId, candidateSnapshotDigest(setup.snapshot))).toBeNull();
+  });
+
   it("#126 rejects a contract whose bytes do not hash to the run's pinned contract", async () => {
     const setup = await prepareReviewedInputs();
     const result = await setup.harness.cp.review.controlPlaneInvoker()({

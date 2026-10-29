@@ -1222,6 +1222,8 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
 /**
  * The CEO cancels the run over the Hermes socket. A run at CEO review is cancelled the way the run
  * state machine allows: the CEO hands the decision to the owner, and the run is then cancelled.
+ * #1189 B1 — abandoning a bootstrap whose application may have written is a project decommission,
+ * an owner-only reason, and the CEO names it with the action it blocks.
  */
 const cancelRun = async (f: Fixture, run: ReviewedRun): Promise<void> => {
   await f.harness.cp.continuity.evaluate("bootstrap cancellation");
@@ -1231,6 +1233,8 @@ const cancelRun = async (f: Fixture, run: ReviewedRun): Promise<void> => {
     candidateSnapshotDigest: run.candidate,
     ceoSessionId: f.ceoSessionId,
     rationale: "the bootstrap is abandoned",
+    ownerReason: "PROJECT_DECOMMISSION",
+    blockedAction: "abandon the project bootstrap and its reserved repository",
   });
   expect(held, JSON.stringify(held)).toMatchObject({ ok: true, value: { state: RunState.AWAITING_HUMAN } });
   const cancelled = await f.hermes("run_cancel", { runId: run.runId, reason: "the bootstrap is abandoned" });
