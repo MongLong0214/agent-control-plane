@@ -63,7 +63,8 @@ class BlockingMainReporter {
   return `
 import base from ${JSON.stringify(configPath)};
 ${blockingReporter}
-const baseTest = base.test ?? {};
+const { projects: baseProjects = [], ...baseTest } = base.test ?? {};
+const projectSetupFiles = baseProjects.flatMap((project) => project.test?.setupFiles ?? []);
 export default {
   ...base,
   root: import.meta.dirname,
@@ -73,7 +74,7 @@ export default {
     minWorkers: 1,
     maxWorkers: 1,
     reporters: [...(baseTest.reporters ?? [])${appendedReporter}],
-    setupFiles: [...(baseTest.setupFiles ?? [])${
+    setupFiles: [...new Set([...projectSetupFiles, ...(baseTest.setupFiles ?? [])])${
       delaySetup === undefined ? "" : `, ${JSON.stringify(delaySetup)}`
     }],
   },
