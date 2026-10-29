@@ -879,11 +879,13 @@ export class WorkerTurnRunner {
       const ends = events(TASK_WORKER_GIT_GROUP_ENDED);
       const eventWorktree = (event: Record<string, unknown> | null): "CURRENT" | "OTHER" | "AMBIGUOUS" | null => {
         const value = event?.["worktreeId"];
-        if (typeof value !== "string" || !isAbsolute(value)) return null;
-        if (value === worktree) return "CURRENT";
         const pathKind = event?.["worktreePathKind"];
-        if (pathKind === "CANONICAL_V1") return "OTHER";
-        if (pathKind !== undefined) return null;
+        if (typeof value !== "string") return null;
+        if (isAbsolute(value)) {
+          if (value === worktree) return "CURRENT";
+          if (pathKind === "CANONICAL_V1") return "OTHER";
+        }
+        if (pathKind !== undefined && pathKind !== "CANONICAL_V1") return null;
         const taskId = event?.["taskId"];
         if (typeof taskId !== "string") return "AMBIGUOUS";
         const target = recordedWriteTarget(this.ports.db, runId, taskId);
@@ -897,7 +899,8 @@ export class WorkerTurnRunner {
         if (!repository || !isAbsolute(repository.checkout_path)) return "AMBIGUOUS";
         // RepositoryRegistry persisted this path canonical at registration. It is durable task
         // provenance; unlike the event path's current filesystem shape it cannot be changed by
-        // deleting, retargeting, or replacing a legacy alias after the event was committed.
+        // deleting, retargeting, or replacing a legacy alias after the event was committed. It also
+        // survives AuditLog replacing a credential-shaped hosted-runner prefix with `[redacted]`.
         return repository.checkout_path === worktree ? "CURRENT" : "OTHER";
       };
       // A group ends only by its own end (its nonce and pgid); an intent with no group, by any end of its nonce.

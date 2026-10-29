@@ -1136,6 +1136,56 @@ describe("S2 — while any writer of the previous execution may still exist, the
     });
   });
 
+  it("a redacted modern event recovers its checkout from durable task provenance", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s2-redacted-modern-checkout");
+      const [one] = s.taskIds;
+      await staffAndClaim(f, s, one);
+      const hostilePath = "/private/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/acp-repo-d6bqkZ";
+      const endedNonce = "4a4b160e-b619-442a-b092-b36073c4d125";
+      const ended = {
+        worktreeId: hostilePath,
+        worktreePathKind: "CANONICAL_V1",
+        taskId: one,
+        nonce: endedNonce,
+      };
+      expect(cp.audit.record({ kind: "TASK_WORKER_GIT_INTENT", runId: s.runId, evidence: ended }).allowed).toBe(true);
+      expect(cp.audit.record({
+        kind: "TASK_WORKER_GIT_GROUP_STARTED",
+        runId: s.runId,
+        evidence: { ...ended, pgid: 424_242, leaderStartedAt: null },
+      }).allowed).toBe(true);
+      expect(cp.audit.record({
+        kind: "TASK_WORKER_GIT_GROUP_ENDED",
+        runId: s.runId,
+        evidence: { ...ended, pgid: 424_242 },
+      }).allowed).toBe(true);
+      expect(cp.audit.byKind("TASK_WORKER_GIT_INTENT").at(-1)?.evidence["worktreeId"]).toBe("[redacted]-repo-d6bqkZ");
+      expect(cp.workerTurns.checkoutWriter(s.runId, s.checkoutPath), "the matching end releases the redacted modern event").toBeNull();
+
+      const group = spawn("/bin/sleep", ["600"], { detached: true, stdio: "ignore" });
+      children.push(group);
+      const pgid = group.pid!;
+      await vi.waitFor(() => expect(readProcessStartToken(pgid)).not.toBeNull(), { timeout: 5_000, interval: 20 });
+      const live = { ...ended, nonce: "204fd714-a2ea-4dc4-923f-2a3677ba6c28" };
+      expect(cp.audit.record({ kind: "TASK_WORKER_GIT_INTENT", runId: s.runId, evidence: live }).allowed).toBe(true);
+      expect(cp.audit.record({
+        kind: "TASK_WORKER_GIT_GROUP_STARTED",
+        runId: s.runId,
+        evidence: { ...live, pgid, leaderStartedAt: readProcessStartToken(pgid) },
+      }).allowed).toBe(true);
+      expect(cp.workerTurns.checkoutWriter(s.runId, s.checkoutPath)).toMatchObject({
+        reason: expect.stringContaining("git child"),
+        evidence: { groups: [pgid] },
+      });
+
+      process.kill(pgid, "SIGKILL");
+      await vi.waitFor(() => expect(alive(pgid)).toBe(false), { timeout: 5_000, interval: 20 });
+      expect(cp.workerTurns.checkoutWriter(s.runId, s.checkoutPath), "the same live event releases only after its group is gone").toBeNull();
+    });
+  });
+
   it("a legacy event whose path looks canonical but whose task belongs to this checkout stays fail-closed", async () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
