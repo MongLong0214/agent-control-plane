@@ -60,8 +60,14 @@ else if(cmd === 'docker') {s.admitted=s.admitted||[];if(!s.admitted.includes(val
 else if(cmd === 'claude') {if(args[0] !== 'mcp') process.exit(2);if(args[1] === 'add') {s.mcp=true;s.mcpUuid=a.sessionUuid;s.mcpCommand=args.slice(args.indexOf('--')+1);s.mcpAdds=(s.mcpAdds||[]).concat([args]);} else if(args[1] === 'remove') {s.mcp=false;s.mcpRemovals=(s.mcpRemovals||0)+1;} else if(!s.mcp) process.exit(1);else {const command=s.mcpCommand||['agentctl','attach','resident-cto','--claimed-session-id',s.mcpUuid,'--project-id','test'];out('acp-cto\\nCommand: '+command[0]+'\\nArgs: '+command.slice(1).join(' '));}}
 else if(cmd === 'tmux') {
  if(args[0] === 'has-session') process.exit(s.launched || s.pane ? 0 : 1);
- if(args[0] === 'new-session') {s.launched=true;s.pane=true;s.launches++;fs.mkdirSync(path.join(root,'.claude','sessions'),{recursive:true});fs.writeFileSync(path.join(root,'.claude','sessions',process.env.TEST_CLAUDE_PID+'.json'),JSON.stringify({sessionId:a.sessionUuid,cwd:a.clonePath,bridgeSessionId:'bridge'}));}
- else if(args[0] === 'display-message') {if(args.at(-1).includes('pane_current_path')) out(a.clonePath+'\\t'+path.join(process.env.ACP_STATE_DIR,'resident-test.sh'));else {if(!s.launched) process.exit(1);out('999999');}} else if(args[0] === 'kill-session') {s.pane=false;} else process.exit(2);
+ if(args[0] === 'new-session') {s.launched=true;s.pane=true;s.paneDead=false;s.launches++;fs.mkdirSync(path.join(root,'.claude','sessions'),{recursive:true});fs.writeFileSync(path.join(root,'.claude','sessions',process.env.TEST_CLAUDE_PID+'.json'),JSON.stringify({sessionId:a.sessionUuid,cwd:a.clonePath,bridgeSessionId:'bridge'}));}
+ else if(args[0] === 'display-message' && args.at(-1) === '#{pane_pid}') {if(!s.launched) process.exit(1);out('999999');}
+ else if(args[0] === 'display-message') {
+  // As real tmux reports them: a dead pane (remain-on-exit) has no current path.
+  const fields={pane_dead:s.paneDead ? '1' : '0',session_windows:String(s.windows||1),window_panes:'1',pane_current_path:s.paneDead ? '' : a.clonePath,pane_start_command:s.paneCommand||path.join(process.env.ACP_STATE_DIR,'resident-test.sh')};
+  out(Object.entries(fields).reduce((text,[key,v])=>text.split('#{'+key+'}').join(v),args.at(-1)));
+ }
+ else if(args[0] === 'kill-session') {s.pane=false;s.paneDead=false;s.kills=(s.kills||0)+1;} else process.exit(2);
 }
 else if(cmd === 'ps') {if(s.launched) {if(args.includes('command=')) out('claude --session-id '+a.sessionUuid);else out(process.env.TEST_CLAUDE_PID+' 999999 Thu Oct 22 01:00:00 2026 claude --session-id '+a.sessionUuid+'\\n999999 1 Thu Oct 22 01:00:00 2026 tmux');}}
 else if(cmd === 'lsof') out('n'+a.clonePath+'\\n');
@@ -565,6 +571,53 @@ it('does not rotate a launch marker while its verified tmux launcher can still p
   expect(settling.reason ?? null).toBeNull();
   expect(readFileSync(markerPath,'utf8')).toBe(marker);
   expect(JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8')).launches).toBe(1);
+});
+
+const fakeState = (f:ReturnType<typeof fixture>, changes:Record<string,unknown> = {}) => {
+  const file = join(f.home,'fake.json');const s = {...JSON.parse(readFileSync(file,'utf8')),...changes};
+  writeFileSync(file,JSON.stringify(s));return s as {launches:number;kills?:number;pane:boolean};
+};
+
+it('replaces a retained dead launcher pane after its exit is acknowledged, never a foreign one',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');await f.invoke('ensure-resident');
+  expect(await launchResident(f)).toBe(2);
+  // tmux remain-on-exit keeps the ended launcher's pane: has-session succeeds and pane_dead is 1.
+  fakeState(f,{launched:false,pane:true,paneDead:true});
+  const failed = await refusal(daemon(f).invoke('ensure-resident',f.a));
+  expect(failed.reason).toEqual({binary:'claude',operation:'ensure-resident',kind:'non-zero exit',exitCode:2});
+  await daemon(f).invoke('acknowledge-resident-exit',f.a,{residentExitReason:failed.reason});
+  // The same launcher pane while it is still alive may yet publish an exit: it is left running.
+  fakeState(f,{paneDead:false});
+  await expect(f.invoke('ensure-resident')).rejects.toThrow('resident launcher is still settling');
+  const live = fakeState(f,{paneDead:true});
+  expect([live.launches,live.pane,live.kills]).toEqual([1,true,undefined]);
+  // A dead pane that is not exactly this launcher's only pane is never removed.
+  for (const foreign of [{paneCommand:'/bin/sh'},{windows:2}]) {
+    fakeState(f,foreign);
+    await expect(f.invoke('ensure-resident')).rejects.toThrow('unverified tmux pane cannot be replaced');
+    expect(fakeState(f,{paneCommand:'',windows:1})).toMatchObject({launches:1,pane:true});
+  }
+  expect((await daemon(f).invoke('ensure-resident',f.a)).resident).toMatchObject({sessionUuid:f.a.sessionUuid,bridgeSessionId:'bridge'});
+  expect(fakeState(f)).toMatchObject({launches:2,kills:1});
+});
+
+const fleetRecovery = fileURLToPath(new URL('../../dist/host/resident-fleet-up.mjs',import.meta.url));
+const sweep = (f:ReturnType<typeof fixture>) => new Promise<{code:unknown;stderr:string}>(resolve => {
+  execFile(process.execPath,[fleetRecovery],{env:{...f.env,ACP_HOST_PROJECT_PROVISIONER:f.script},timeout:30_000},(error,_stdout,stderr) => resolve({code:error ? error.code : 0,stderr:String(stderr)}));
+});
+
+it('fleet recovery logs a completed project\'s recorded Claude exit, acknowledges it and relaunches once',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');await f.invoke('ensure-resident');
+  expect(await launchResident(f)).toBe(2);
+  residentGone(f);
+  // No daemon pass resumes a completed row, so no daemon acknowledgment arrives: the watcher's log line is the durable copy.
+  expect(await sweep(f)).toEqual({code:0,stderr:'resident exited: acp-test.resident.json: claude in ensure-resident: non-zero exit with exit code 2\n'});
+  expect(fakeState(f).launches).toBe(2);
+  // The relaunched resident is alive: a later sweep never starts it again.
+  expect(await sweep(f)).toEqual({code:0,stderr:''});
+  expect(fakeState(f).launches).toBe(2);
 });
 
 it('an exit record for one session never explains another session of the same project',async () => {

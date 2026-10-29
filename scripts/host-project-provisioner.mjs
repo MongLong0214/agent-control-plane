@@ -370,8 +370,9 @@ try {
       if (!existing) atomic(fleetFile,[...lines,line].join('\n')+'\n');
       let alive = false; try { observeResident(); alive = true; } catch { /* A tmux shell alone is never health. */ }
       if (!alive) {
-        // Keep surfacing a completed launch's exact exit until the daemon acknowledges that its ledger
-        // write committed. The record and marker remain untouched while a response may be lost.
+        // Keep surfacing a completed launch's exact exit until its caller acknowledges that the reason is
+        // durable on its side: the daemon after its ledger commit, the fleet watcher (the only recovery for
+        // a completed row) after its log line. The record and marker remain untouched while a response may be lost.
         const priorExit = recordedLaunchExit();
         if (priorExit && priorExit.marker.exitReported !== true) {
           throw new ProvisionerRefusal(formatHostProvisionerReason(priorExit.reason));
@@ -387,11 +388,16 @@ try {
         const ps = run('ps',['-axo','command=']); check(!ps.split('\n').some(l => namesSession(l)),'resident awaits RC');
         let hasPane = false;try {run('tmux',['has-session','-t',a.tmuxName]);hasPane = true;} catch(e) {if (!e.status) throw e;}
         if (hasPane) {
-          const pane = run('tmux',['display-message','-p','-t',a.tmuxName,'#{pane_current_path}\t#{pane_start_command}']).trim();
-          check(pane === `${a.clonePath}\t${launcher}`,'unverified tmux pane cannot be replaced');
-          // The verified launcher writes the exit record before its tmux command ends. Replacing its
-          // marker while it is still settling creates a check/rotate race that can orphan that record.
-          throw new ProvisionerRefusal('resident launcher is still settling');
+          // One free-text field per read: for a client without a UTF-8 locale tmux prints a tab separator as '_'.
+          // A dead pane (remain-on-exit) has no current path to report; its start command still names the launcher.
+          const pane = format => run('tmux',['display-message','-p','-t',a.tmuxName,format]).replace(/\n$/,'');
+          const [dead,windows,panes] = pane('#{pane_dead} #{session_windows} #{window_panes}').split(' ');
+          check(windows === '1' && panes === '1' && pane('#{pane_start_command}') === launcher && (dead === '1' || pane('#{pane_current_path}') === a.clonePath),'unverified tmux pane cannot be replaced');
+          // A live launcher writes the exit record before its tmux command ends. Replacing its marker
+          // while it is still settling creates a check/rotate race that can orphan that record.
+          check(dead === '1','resident launcher is still settling');
+          // A dead pane is a launcher that has ended: its record is final and removing the pane stops nothing.
+          run('tmux',['kill-session','-t',a.tmuxName]);
         }
         const completedExit = recordedLaunchExit();
         if (completedExit && completedExit.marker.exitReported !== true)
