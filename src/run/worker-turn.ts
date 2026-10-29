@@ -883,7 +883,17 @@ export class WorkerTurnRunner {
         if (value === worktree) return "CURRENT";
         const pathKind = event?.["worktreePathKind"];
         if (pathKind === "CANONICAL_V1") return "OTHER";
-        return pathKind === undefined ? "AMBIGUOUS" : null;
+        if (pathKind !== undefined) return null;
+        try {
+          const resolved = canonical(value);
+          if (resolved === worktree) return "CURRENT";
+          // Normal legacy records stored `worktree`, which was already canonical. Preserve
+          // their checkout boundary. A path that resolves differently is an alias and stays
+          // ambiguous: it may have been deleted or retargeted after the event was committed.
+          return resolved === value ? "OTHER" : "AMBIGUOUS";
+        } catch {
+          return "AMBIGUOUS";
+        }
       };
       // A group ends only by its own end (its nonce and pgid); an intent with no group, by any end of its nonce.
       const groupEnded = new Set(ends.filter((end) => end?.["pgid"] != null).map((end) => `${String(end!["nonce"])}:${String(end!["pgid"])}`));

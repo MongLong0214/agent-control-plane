@@ -8,6 +8,7 @@ import { allow } from "../../src/core/errors.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, Role, RunKind } from "../../src/domain/types.ts";
+import { canonical } from "../../src/guard/workspace-probe.ts";
 import { WorkerTurnRunner } from "../../src/run/worker-turn.ts";
 import {
   GuardedInvocationWriteBroker,
@@ -1132,6 +1133,36 @@ describe("S2 — while any writer of the previous execution may still exist, the
 
       const passed = await claim(f, s, target);
       expect(passed, "the attested canonical path belongs to another checkout").toMatchObject({ ok: true });
+    });
+  });
+
+  it("a legacy event whose recorded path is already canonical for another checkout does not block this checkout", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s2-other-legacy-canonical-checkout");
+      const [one, two] = s.taskIds;
+      await staffAndClaim(f, s, one);
+      const target = await provision(f, s, two);
+      const group = spawn("/bin/sleep", ["600"], { detached: true, stdio: "ignore" });
+      children.push(group);
+      const pgid = group.pid!;
+      await vi.waitFor(() => expect(readProcessStartToken(pgid)).not.toBeNull(), { timeout: 5_000, interval: 20 });
+
+      const nonce = "f1aa6677-9aba-4c4a-9b55-ea57890b66b7";
+      const base = {
+        worktreeId: canonical(tempDir("s2-other-legacy-canonical-checkout-")),
+        taskId: one,
+        nonce,
+      };
+      cp.audit.record({ kind: "TASK_WORKER_GIT_INTENT", runId: s.runId, evidence: base });
+      cp.audit.record({
+        kind: "TASK_WORKER_GIT_GROUP_STARTED",
+        runId: s.runId,
+        evidence: { ...base, pgid, leaderStartedAt: readProcessStartToken(pgid) },
+      });
+
+      const passed = await claim(f, s, target);
+      expect(passed, "the legacy path itself proves it was canonical for another checkout").toMatchObject({ ok: true });
     });
   });
 
