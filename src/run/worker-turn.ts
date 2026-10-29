@@ -154,9 +154,9 @@ export interface WorkerSuccessDigestInputs {
   commitHead: string;
   diffDigest: string;
   /**
-   * #1232 — the task's import manifest, present only when the turn imported files: each one's path,
-   * size and sha256, so the digest binds every imported file. Absent, the digest is computed exactly
-   * as before.
+   * #1232 — the task's CTO PLAN import attestation, present only when the turn imported files: each
+   * opaque, potentially active file's path, size and sha256, so the receipt digest binds its exact
+   * identity without claiming byte safety or passivity. Absent, the digest is computed as before.
    */
   imports?: TaskImport[];
 }

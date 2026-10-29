@@ -2655,13 +2655,13 @@ interface ReviewerDiff {
 /**
  * #1232 — one imported file the candidate snapshot binds, as the reviewer reads it in the diff: the
  * `diff --git` header of a new file at its blob, then its manifest entry, detected type first, instead
- * of its bytes. Only complete, structurally validated allowed image/font formats are bound; text
- * imports are in the patch itself.
+ * of its bytes. The CTO PLAN manifest authorizes exact opaque, potentially active binary content;
+ * selected structural checks are defense in depth and do not make those hidden bytes safe.
  */
 const importManifestSection = (entry: SnapshotImport): string =>
   `diff --git a/${entry.path} b/${entry.path}\nnew file mode 100644\nindex ${"0".repeat(entry.blob.length)}..${entry.blob}\n` +
-  `Imported binary data, bytes not shown: ${entry.path}: ${entry.type}, ${entry.size} bytes, ${entry.sha256}, git blob ${entry.blob}, from the import manifest of task ${entry.taskId}. ` +
-  "The freeze read exactly these bytes at the candidate head, parsed the complete file as this allowed image or font format with no trailing bytes, and the candidate snapshot binds them. Judge whether this type of file belongs at this path.\n";
+  `Opaque, potentially active binary; raw bytes not shown: ${entry.path}: ${entry.type}, ${entry.size} bytes, ${entry.sha256}, git blob ${entry.blob}, task ${entry.taskId}. ` +
+  "The CTO PLAN manifest authorizes these exact bytes. Reviewer approves path, size, digest, recognized structurally checked container type and placement only, NOT full format conformance, byte safety, passivity, non-executability, or freedom from polyglots.\n";
 
 /** #1232 — the snapshot as the reviewer reads it: a repository's imports are counted; each is a manifest entry in the diff. */
 const snapshotForReviewer = (snapshot: CandidateSnapshot): unknown => ({

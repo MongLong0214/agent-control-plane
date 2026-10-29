@@ -14,7 +14,7 @@ import type * as SandboxModule from "../../src/verify/sandbox.ts";
 import type { SandboxOutcome } from "../../src/verify/sandbox.ts";
 import { cleanupTempDirs, commitAll, writeFiles } from "../helpers/fixtures.ts";
 import { bindCeo, bindWorker, fixtureManifest, makeHarness, registerFixtureProject, startWorkBranch } from "../helpers/harness.ts";
-import { VALID_TTF, validPng, validPngOfSize } from "../helpers/import-fixtures.ts";
+import { pngWithActivePixelBytes, ttfWithActiveInstructions, VALID_TTF, validPng, validPngOfSize } from "../helpers/import-fixtures.ts";
 
 /**
  * #1232 — a task's imported files reach the freeze and blind review bound by their manifest, never as
@@ -153,6 +153,19 @@ describe("#1232 freeze and blind review carry a task's import manifest", () => {
     expect(packet!.inputManifest.binaryArtifacts).toEqual(imports.map((entry) => ({ repository: identity, path: entry.path, digest: entry.sha256, method: "import-manifest" })));
   }, 60_000);
 
+  it("W5b active opaque bytes are accepted only with the CTO attestation and exact blind-review warning", async () => {
+    const { outcome, reviewerInput } = await reviewImports([
+      { path: "src/active-pixels.png", bytes: pngWithActivePixelBytes() },
+      { path: "src/active-instructions.ttf", bytes: ttfWithActiveInstructions() },
+    ]);
+
+    expect(outcome, JSON.stringify(outcome)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    expect(reviewerInput).toContain("Opaque, potentially active binary; raw bytes not shown");
+    expect(reviewerInput).toContain("The CTO PLAN manifest authorizes these exact bytes.");
+    expect(reviewerInput).toContain("Reviewer approves path, size, digest, recognized structurally checked container type and placement only");
+    expect(reviewerInput).toContain("NOT full format conformance, byte safety, passivity, non-executability, or freedom from polyglots");
+  }, 60_000);
+
   it("W6 the largest import set validation accepts, every file at its maximum size, freezes and is reviewed", async () => {
     const count = Math.floor(IMPORT_MAX_TOTAL_BYTES / IMPORT_MAX_FILE_BYTES);
     expect(count * IMPORT_MAX_FILE_BYTES).toBe(IMPORT_MAX_TOTAL_BYTES);
@@ -216,7 +229,7 @@ describe("#1232 freeze and blind review carry a task's import manifest", () => {
     expect(packet!.inputManifest.binaryArtifacts).toEqual([]);
   }, 120_000);
 
-  it("W10 the freeze binds no executable or archive, and no binary at a source path, whatever a receipt's manifest names", async () => {
+  it("W10 the freeze does not hide policy-refused top-level signatures or an unsupported source-path binary", async () => {
     const tail = Buffer.concat([Buffer.alloc(64, 0x00), Buffer.from([1, 2, 3, 4])]);
     const files = [
       { path: "src/tool", bytes: Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]), tail]) },

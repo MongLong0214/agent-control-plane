@@ -39,9 +39,11 @@ import { GIT_OUTPUT_MAX_BYTES } from "../git/git.ts";
  * What review sees depends on the content (`classifyImport`). A file git reads as text is never bound
  * by its manifest: it stays in the candidate's patch and is reviewed like any other change, so a task's
  * text imports are bounded by what that patch can carry (`IMPORT_MAX_TEXT_BYTES`). A binary file may be
- * bound by its manifest only when its exact extension selects a bounded parser that consumes a
- * complete structurally valid PNG or TrueType font. Unknown, mismatched, malformed and trailing
- * bytes are refused; the reviewer reads the validated format of every bound file.
+ * bound by its manifest only when its exact extension and signature identify PNG or TrueType and
+ * bounded selected structural checks account for every file byte. The CTO PLAN manifest authorizes the
+ * exact opaque, potentially active bytes; parsing is malformed-container defense in depth, not proof
+ * of passivity, non-executability or freedom from polyglots. Unknown, mismatched, malformed and
+ * trailing bytes are refused; the reviewer reads the recognized, structurally checked container type.
  */
 
 /** One imported file: where it lands in the repository, its size in bytes and the sha256 of its bytes. */
@@ -61,8 +63,8 @@ export const IMPORT_MAX_FILES = 100;
 /**
  * 50 MiB, GitHub's warning size, and never more than the git wrapper can hand back whole: the freeze
  * reads each imported blob through it to bind the file by sha256 (`buildCandidateSnapshot`), and the
- * receipt check in review reads it again. A bound (binary data) import's patch is never materialised;
- * a text import's is, and `IMPORT_MAX_TEXT_BYTES` bounds that.
+ * receipt check in review reads it again. An opaque, potentially active binary import's patch is
+ * never materialised; a text import's is, and `IMPORT_MAX_TEXT_BYTES` bounds that.
  */
 export const IMPORT_MAX_FILE_BYTES = Math.min(50 * 1024 * 1024, GIT_OUTPUT_MAX_BYTES);
 /** The bytes one task imports, held in memory once while they are verified and written. */
@@ -108,7 +110,7 @@ const matches = (bytes: Buffer, candidate: Format): boolean =>
   candidate.signatures.every(([offset, signature]) =>
     bytes.length >= offset + signature.length && bytes.subarray(offset, offset + signature.length).equals(signature));
 
-/** Executable or loadable code, and archives that can carry it, by magic number: never imported. */
+/** Top-level native/loadable signatures and archives refused as defense-in-depth policy. */
 const REFUSED_FORMATS: readonly Format[] = [
   format("ELF executable or library", [0, [0x7f, 0x45, 0x4c, 0x46]]),
   ...[[0xfe, 0xed, 0xfa, 0xce], [0xfe, 0xed, 0xfa, 0xcf], [0xce, 0xfa, 0xed, 0xfe], [0xcf, 0xfa, 0xed, 0xfe]]
@@ -154,7 +156,7 @@ const pngCrc32 = (bytes: Buffer): number => {
   return (crc ^ 0xffffffff) >>> 0;
 };
 
-/** A complete, bounded PNG parse. `null` means every byte belongs to one structurally valid PNG. */
+/** Bounded selected PNG checks. `null` means the recognized container accounts for every file byte. */
 const invalidPng = (bytes: Buffer): string | null => {
   if (bytes.length < 8 || !bytes.subarray(0, 8).equals(PNG_SIGNATURE)) return "the bytes are not a PNG";
   let cursor = 8;
@@ -221,7 +223,7 @@ const invalidPng = (bytes: Buffer): string | null => {
     } else {
       return (typeBytes[0]! & 0x20) === 0
         ? `the PNG has an unknown critical chunk ${type}`
-        : `the PNG ancillary chunk ${type} is not in the structurally validated allowlist`;
+        : `the PNG ancillary chunk ${type} is not in the selected structural-check allowlist`;
     }
   }
   if (!sawEnd) return "the PNG has no IEND";
@@ -264,12 +266,28 @@ interface SfntTable { tag: string; checksum: number; offset: number; length: num
 const hasOnlyGlyphPadding = (glyph: Buffer, cursor: number): boolean =>
   glyph.length - cursor <= 3 && [...glyph.subarray(cursor)].every((byte) => byte === 0);
 
+interface GlyphLimits {
+  maxPoints: number;
+  maxContours: number;
+  maxInstructions: number;
+  maxComponents: number;
+}
+
+interface GlyphShape {
+  composite: boolean;
+  points: number;
+  contours: number;
+  components: number[];
+}
+
 /** Validates one non-empty simple or composite `glyf` record and consumes it through zero padding. */
-const invalidGlyph = (glyph: Buffer, glyphCount: number): string | null => {
+const invalidGlyph = (glyph: Buffer, glyphCount: number, limits: GlyphLimits, shape: GlyphShape): string | null => {
   if (glyph.length < 10) return "a non-empty TrueType glyph is shorter than its header";
   const contours = glyph.readInt16BE(0);
   let cursor = 10;
   if (contours >= 0) {
+    shape.contours = contours;
+    if (contours > limits.maxContours) return "a simple TrueType glyph exceeds maxp.maxContours";
     if (cursor + contours * 2 + 2 > glyph.length) return "a simple TrueType glyph ends inside its contour endpoints";
     let lastPoint = -1;
     for (let contour = 0; contour < contours; contour += 1) {
@@ -281,35 +299,83 @@ const invalidGlyph = (glyph: Buffer, glyphCount: number): string | null => {
     const instructions = glyph.readUInt16BE(cursor);
     cursor += 2;
     if (instructions > glyph.length - cursor) return "a simple TrueType glyph ends inside its instructions";
+    if (instructions > limits.maxInstructions) return "a simple TrueType glyph exceeds maxp.maxSizeOfInstructions";
     cursor += instructions;
     const points = lastPoint + 1;
-    let flags = 0;
-    let coordinateBytes = 0;
-    while (flags < points) {
+    shape.points = points;
+    if (points > limits.maxPoints) return "a simple TrueType glyph exceeds maxp.maxPoints";
+    const pointFlags: number[] = [];
+    while (pointFlags.length < points) {
       if (cursor >= glyph.length) return "a simple TrueType glyph ends inside its flags";
       const flag = glyph[cursor++]!;
+      if ((flag & 0x80) !== 0) return "a simple TrueType glyph sets a reserved flag";
       let repeats = 1;
       if ((flag & 0x08) !== 0) {
         if (cursor >= glyph.length) return "a simple TrueType glyph lacks its flag repeat count";
         repeats += glyph[cursor++]!;
       }
-      if (flags + repeats > points) return "a simple TrueType glyph repeats flags past its point count";
-      const xBytes = (flag & 0x02) !== 0 ? 1 : (flag & 0x10) !== 0 ? 0 : 2;
-      const yBytes = (flag & 0x04) !== 0 ? 1 : (flag & 0x20) !== 0 ? 0 : 2;
-      coordinateBytes += repeats * (xBytes + yBytes);
-      flags += repeats;
+      if (pointFlags.length + repeats > points) return "a simple TrueType glyph repeats flags past its point count";
+      for (let repeat = 0; repeat < repeats; repeat += 1) pointFlags.push(flag);
     }
-    cursor += coordinateBytes;
-    if (cursor > glyph.length || !hasOnlyGlyphPadding(glyph, cursor)) return "a simple TrueType glyph has truncated coordinates or hidden trailing bytes";
+    const xs: number[] = [];
+    let x = 0;
+    for (const flag of pointFlags) {
+      if ((flag & 0x02) !== 0) {
+        if (cursor >= glyph.length) return "a simple TrueType glyph ends inside its x coordinates";
+        const distance = glyph[cursor++]!;
+        x += (flag & 0x10) !== 0 ? distance : -distance;
+      } else if ((flag & 0x10) === 0) {
+        if (cursor + 2 > glyph.length) return "a simple TrueType glyph ends inside its x coordinates";
+        x += glyph.readInt16BE(cursor);
+        cursor += 2;
+      }
+      xs.push(x);
+    }
+    const ys: number[] = [];
+    let y = 0;
+    for (const flag of pointFlags) {
+      if ((flag & 0x04) !== 0) {
+        if (cursor >= glyph.length) return "a simple TrueType glyph ends inside its y coordinates";
+        const distance = glyph[cursor++]!;
+        y += (flag & 0x20) !== 0 ? distance : -distance;
+      } else if ((flag & 0x20) === 0) {
+        if (cursor + 2 > glyph.length) return "a simple TrueType glyph ends inside its y coordinates";
+        y += glyph.readInt16BE(cursor);
+        cursor += 2;
+      }
+      ys.push(y);
+    }
+    if (!hasOnlyGlyphPadding(glyph, cursor)) return "a simple TrueType glyph has hidden trailing bytes";
+    const declaredBox = [glyph.readInt16BE(2), glyph.readInt16BE(4), glyph.readInt16BE(6), glyph.readInt16BE(8)];
+    const observedBox = [0, 0, 0, 0];
+    if (points > 0) {
+      observedBox[0] = observedBox[2] = xs[0]!;
+      observedBox[1] = observedBox[3] = ys[0]!;
+      for (let point = 1; point < points; point += 1) {
+        observedBox[0] = Math.min(observedBox[0]!, xs[point]!);
+        observedBox[1] = Math.min(observedBox[1]!, ys[point]!);
+        observedBox[2] = Math.max(observedBox[2]!, xs[point]!);
+        observedBox[3] = Math.max(observedBox[3]!, ys[point]!);
+      }
+    }
+    if (declaredBox.some((value, index) => value !== observedBox[index])) return "a simple TrueType glyph bounding box does not match its decoded points";
     return null;
   }
+  if (contours !== -1) return "a composite TrueType glyph has an invalid contour marker";
+  shape.composite = true;
   let flags = 0;
   do {
     if (cursor + 4 > glyph.length) return "a composite TrueType glyph ends inside a component";
     flags = glyph.readUInt16BE(cursor);
+    if ((flags & ~0x1fef) !== 0) return "a composite TrueType glyph sets a reserved flag";
+    if ((flags & 0x1800) === 0x1800) return "a composite TrueType glyph sets both scaled and unscaled offset flags";
+    if ((flags & 0x0002) === 0) return "point-matched composite glyph arguments are outside the admitted structural subset";
+    if ((flags & 0x0020) !== 0 && (flags & 0x0100) !== 0) return "a nonfinal composite component claims instructions";
     const componentGlyph = glyph.readUInt16BE(cursor + 2);
     cursor += 4;
     if (componentGlyph >= glyphCount) return "a composite TrueType glyph names a missing component";
+    shape.components.push(componentGlyph);
+    if (shape.components.length > limits.maxComponents) return "a composite TrueType glyph exceeds maxp.maxComponentElements";
     cursor += (flags & 0x0001) !== 0 ? 4 : 2;
     const transforms = [(flags & 0x0008) !== 0, (flags & 0x0040) !== 0, (flags & 0x0080) !== 0].filter(Boolean).length;
     if (transforms > 1) return "a composite TrueType glyph has conflicting transforms";
@@ -323,12 +389,70 @@ const invalidGlyph = (glyph: Buffer, glyphCount: number): string | null => {
     const instructions = glyph.readUInt16BE(cursor);
     cursor += 2;
     if (instructions > glyph.length - cursor) return "a composite TrueType glyph ends inside its instructions";
+    if (instructions > limits.maxInstructions) return "a composite TrueType glyph exceeds maxp.maxSizeOfInstructions";
     cursor += instructions;
   }
   return hasOnlyGlyphPadding(glyph, cursor) ? null : "a composite TrueType glyph has hidden trailing bytes";
 };
 
-/** A complete TrueType sfnt parse. It rejects gaps, overlaps, trailing bytes and malformed core tables. */
+/** The admitted cmap subset: format 4 with bounded arrays, mapped glyphs and byte coverage. */
+const invalidCmapFormat4 = (subtable: Buffer, glyphCount: number): string | null => {
+  if (subtable.length < 24 || subtable.readUInt16BE(0) !== 4 || subtable.readUInt16BE(2) !== subtable.length || subtable.length % 2 !== 0) {
+    return "the TrueType cmap format-4 length is invalid";
+  }
+  const segmentBytes = subtable.readUInt16BE(6);
+  if (segmentBytes === 0 || segmentBytes % 2 !== 0) return "the TrueType cmap format-4 segment count is invalid";
+  const segments = segmentBytes / 2;
+  const minimumLength = 16 + segments * 8;
+  if (minimumLength > subtable.length) return "the TrueType cmap format-4 arrays leave the subtable";
+  const power = 2 ** Math.floor(Math.log2(segments));
+  if (subtable.readUInt16BE(8) !== power * 2 || subtable.readUInt16BE(10) !== Math.log2(power) || subtable.readUInt16BE(12) !== segmentBytes - power * 2) {
+    return "the TrueType cmap format-4 search fields are invalid";
+  }
+  const endCodes = 14;
+  const reserved = endCodes + segments * 2;
+  const startCodes = reserved + 2;
+  const deltas = startCodes + segments * 2;
+  const rangeOffsets = deltas + segments * 2;
+  const glyphArray = rangeOffsets + segments * 2;
+  if (subtable.readUInt16BE(reserved) !== 0) return "the TrueType cmap format-4 reserved word is nonzero";
+  let previousEnd = -1;
+  const usedGlyphWords = new Set<number>();
+  for (let index = 0; index < segments; index += 1) {
+    const end = subtable.readUInt16BE(endCodes + index * 2);
+    const start = subtable.readUInt16BE(startCodes + index * 2);
+    if (start > end || start <= previousEnd) return "the TrueType cmap format-4 segments overlap or are unordered";
+    previousEnd = end;
+    const rangeOffsetWord = rangeOffsets + index * 2;
+    const rangeOffset = subtable.readUInt16BE(rangeOffsetWord);
+    const delta = subtable.readInt16BE(deltas + index * 2);
+    if (rangeOffset % 2 !== 0) return "the TrueType cmap format-4 glyph offset is unaligned";
+    if (rangeOffset !== 0) {
+      const firstGlyph = rangeOffsetWord + rangeOffset;
+      const lastGlyph = firstGlyph + (end - start) * 2;
+      if (firstGlyph < glyphArray || lastGlyph + 2 > subtable.length) return "the TrueType cmap format-4 glyph range leaves the subtable";
+    }
+    for (let code = start; code <= end; code += 1) {
+      let glyph = (code + delta) & 0xffff;
+      if (rangeOffset !== 0) {
+        const glyphWord = rangeOffsetWord + rangeOffset + (code - start) * 2;
+        usedGlyphWords.add(glyphWord);
+        glyph = subtable.readUInt16BE(glyphWord);
+        if (glyph !== 0) glyph = (glyph + delta) & 0xffff;
+      }
+      if (glyph >= glyphCount) return "the TrueType cmap format-4 map names a missing glyph";
+    }
+  }
+  if (subtable.readUInt16BE(endCodes + (segments - 1) * 2) !== 0xffff || subtable.readUInt16BE(startCodes + (segments - 1) * 2) !== 0xffff) {
+    return "the TrueType cmap format-4 map lacks its terminal segment";
+  }
+  for (let offset = glyphArray; offset < subtable.length; offset += 2) {
+    if (!usedGlyphWords.has(offset)) return "the TrueType cmap format-4 glyph array contains unreferenced bytes";
+  }
+  return null;
+};
+
+/** Bounded selected TrueType checks, including exact byte coverage and the admitted cmap/glyph subset. */
 const invalidTrueType = (bytes: Buffer): string | null => {
   if (bytes.length < 12 || bytes.readUInt32BE(0) !== 0x00010000) return "the bytes are not a TrueType sfnt";
   const count = bytes.readUInt16BE(4);
@@ -386,12 +510,66 @@ const invalidTrueType = (bytes: Buffer): string | null => {
     locations.push(location);
     previousLocation = location;
   }
+  const limits: GlyphLimits = {
+    maxPoints: maxp.readUInt16BE(6),
+    maxContours: maxp.readUInt16BE(8),
+    maxInstructions: maxp.readUInt16BE(26),
+    maxComponents: maxp.readUInt16BE(28),
+  };
+  const shapes = Array.from({ length: glyphs }, (): GlyphShape => ({ composite: false, points: 0, contours: 0, components: [] }));
   for (let index = 0; index < glyphs; index += 1) {
     const start = locations[index]!;
     const end = locations[index + 1]!;
     if (end > start) {
-      const problem = invalidGlyph(glyf.subarray(start, end), glyphs);
+      const problem = invalidGlyph(glyf.subarray(start, end), glyphs, limits, shapes[index]!);
       if (problem !== null) return problem;
+    }
+  }
+  const active = new Uint8Array(glyphs);
+  const remainingDepth = new Int16Array(glyphs);
+  remainingDepth.fill(-1);
+  const visitComposite = (glyph: number, depth: number): string | null => {
+    if (depth > 32) return "the TrueType composite glyph graph exceeds depth 32";
+    if (active[glyph] === 1) return "the TrueType composite glyph graph contains a cycle";
+    if (remainingDepth[glyph]! >= 0) return depth + remainingDepth[glyph]! > 32 ? "the TrueType composite glyph graph exceeds depth 32" : null;
+    active[glyph] = 1;
+    let longest = 0;
+    for (const component of shapes[glyph]!.components) {
+      const problem = visitComposite(component, depth + 1);
+      if (problem !== null) return problem;
+      longest = Math.max(longest, 1 + remainingDepth[component]!);
+    }
+    active[glyph] = 0;
+    remainingDepth[glyph] = longest;
+    return depth + longest > 32 ? "the TrueType composite glyph graph exceeds depth 32" : null;
+  };
+  for (let glyph = 0; glyph < glyphs; glyph += 1) {
+    const problem = visitComposite(glyph, 0);
+    if (problem !== null) return problem;
+  }
+  const declaredDepth = maxp.readUInt16BE(30);
+  if ([...remainingDepth].some((depth) => depth > declaredDepth)) return "the TrueType composite graph exceeds maxp.maxComponentDepth";
+  const totals = shapes.map((shape) => ({ points: shape.points, contours: shape.contours }));
+  const aggregated = new Uint8Array(glyphs);
+  const aggregateComposite = (glyph: number): { points: number; contours: number } => {
+    const shape = shapes[glyph]!;
+    if (!shape.composite || aggregated[glyph] === 1) return totals[glyph]!;
+    let points = 0;
+    let contours = 0;
+    for (const component of shape.components) {
+      const total = aggregateComposite(component);
+      points = Math.min(0x10000, points + total.points);
+      contours = Math.min(0x10000, contours + total.contours);
+    }
+    totals[glyph] = { points, contours };
+    aggregated[glyph] = 1;
+    return totals[glyph]!;
+  };
+  for (let glyph = 0; glyph < glyphs; glyph += 1) {
+    if (!shapes[glyph]!.composite) continue;
+    const total = aggregateComposite(glyph);
+    if (total.points > maxp.readUInt16BE(10) || total.contours > maxp.readUInt16BE(12)) {
+      return "a TrueType composite glyph exceeds maxp composite point or contour limits";
     }
   }
   const glyfPadding = glyf.subarray(previousLocation);
@@ -401,21 +579,28 @@ const invalidTrueType = (bytes: Buffer): string | null => {
   const cmapCount = cmap.length >= 4 ? cmap.readUInt16BE(2) : 0;
   const cmapDirectoryEnd = 4 + cmapCount * 8;
   if (cmap.length < 12 || cmap.readUInt16BE(0) !== 0 || cmapCount === 0 || cmapDirectoryEnd > cmap.length) return "the TrueType cmap table is invalid";
+  const cmapSubtables = new Map<number, number>();
   for (let index = 0; index < cmapCount; index += 1) {
     const subtableOffset = cmap.readUInt32BE(4 + index * 8 + 4);
     if (subtableOffset < cmapDirectoryEnd || subtableOffset + 4 > cmap.length) return "a TrueType cmap subtable offset is invalid";
     const formatNumber = cmap.readUInt16BE(subtableOffset);
-    let subtableLength = 0;
-    if ([0, 2, 4, 6].includes(formatNumber)) subtableLength = cmap.readUInt16BE(subtableOffset + 2);
-    else if ([8, 10, 12, 13].includes(formatNumber)) {
-      if (subtableOffset + 8 > cmap.length) return "a TrueType cmap subtable header is truncated";
-      subtableLength = cmap.readUInt32BE(subtableOffset + 4);
-    } else if (formatNumber === 14) {
-      if (subtableOffset + 6 > cmap.length) return "a TrueType cmap subtable header is truncated";
-      subtableLength = cmap.readUInt32BE(subtableOffset + 2);
-    } else return "the TrueType cmap format is unsupported";
-    if (subtableLength < 4 || subtableLength > cmap.length - subtableOffset) return "a TrueType cmap subtable length is invalid";
+    if (formatNumber !== 4) return "the TrueType cmap format is unsupported";
+    const subtableLength = cmap.readUInt16BE(subtableOffset + 2);
+    if (subtableLength > cmap.length - subtableOffset) return "a TrueType cmap subtable length is invalid";
+    const previousLength = cmapSubtables.get(subtableOffset);
+    if (previousLength !== undefined && previousLength !== subtableLength) return "shared TrueType cmap records disagree about subtable length";
+    cmapSubtables.set(subtableOffset, subtableLength);
+    if (previousLength === undefined) {
+      const problem = invalidCmapFormat4(cmap.subarray(subtableOffset, subtableOffset + subtableLength), glyphs);
+      if (problem !== null) return problem;
+    }
   }
+  let cmapCursor = cmapDirectoryEnd;
+  for (const [offset, length] of [...cmapSubtables].sort(([left], [right]) => left - right)) {
+    if (offset !== cmapCursor) return "the TrueType cmap has overlap, gaps or hidden bytes";
+    cmapCursor = offset + length;
+  }
+  if (cmapCursor !== cmap.length) return "the TrueType cmap has trailing hidden bytes";
   const nameCount = name.length >= 6 ? name.readUInt16BE(2) : 0;
   const nameRecordsEnd = 6 + nameCount * 12;
   const stringsOffset = name.length >= 6 ? name.readUInt16BE(4) : 0;
@@ -441,7 +626,7 @@ const validatedBinary = (path: string, bytes: Buffer): { type: string } | { why:
     : extension === ".ttf"
       ? { type: "font (TrueType)", problem: invalidTrueType(bytes) }
       : null;
-  if (validation === null) return { why: "the path does not have an allowed image or font extension (.png or .ttf)" };
+  if (validation === null) return { why: "the path does not have a recognized image or font extension (.png or .ttf)" };
   return validation.problem === null ? { type: validation.type } : { why: validation.problem };
 };
 
@@ -453,17 +638,17 @@ export type ImportContent =
 
 /**
  * Text (git reads it as text) is reviewed as the patch it is. Binary bytes are bound by their manifest
- * only when an exact allowed extension selects a bounded parser that validates the complete file.
+ * only when an exact extension/signature is recognized and selected checks account for every byte.
  */
 export const classifyImport = (path: string, bytes: Buffer): ImportContent => {
   const binary = gitReadsAsBinary(bytes);
   const refused = REFUSED_FORMATS.find((candidate) => (binary || candidate.binaryOnly !== true) && matches(bytes, candidate));
-  if (refused !== undefined) return { kind: "refused", why: `${refused.name}: executable or loadable code, or an archive that can carry it` };
+  if (refused !== undefined) return { kind: "refused", why: `${refused.name}: top-level signature refused by binary-import policy` };
   if (!binary) return { kind: "text" };
   const validated = validatedBinary(path, bytes);
   return "type" in validated
     ? { kind: "data", type: validated.type }
-    : { kind: "refused", why: `binary bytes are not a complete structurally valid allowed image or font: ${validated.why}` };
+    : { kind: "refused", why: `binary bytes do not pass the selected checks for a recognized .png/.ttf container: ${validated.why}` };
 };
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
@@ -685,7 +870,7 @@ export const readStagedImports = (input: {
     return deny(ReasonCode.EVIDENCE_MISSING, "a manifest entry has no staged file; nothing is imported", { reason: "IMPORT_SOURCE_MISSING", ...named });
   }
   if (refused.length > 0) {
-    return deny(ReasonCode.IMPORT_CONTENT_REFUSED, "an import is not a complete structurally valid allowed image or font; nothing is imported", {
+    return deny(ReasonCode.IMPORT_CONTENT_REFUSED, "an import does not pass the selected checks for a recognized .png/.ttf container; nothing is imported", {
       reason: "IMPORT_NOT_REVIEWABLE",
       refused: refused.slice(0, 50),
     });
@@ -820,7 +1005,7 @@ export const undoImports = (worktree: string, written: WrittenImports): string[]
 
 /**
  * The imports a scan of the checkout against its base (`scanAgainst` entries) does not show as
- * imported: each must be a regular, non-executable file with its declared sha256. After the import
+ * imported: each must be a regular 100644 file with its CTO-authorized declared sha256. After the import
  * this names one git does not see (an ignored path, say); after a turn, one the worker changed.
  */
 export const importsNotHeld = (

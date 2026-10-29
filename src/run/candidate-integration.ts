@@ -73,11 +73,11 @@ export interface SucceededTaskCommit {
   taskId: string;
   commit: string;
   repositoryIdentity: string;
-  /** #1232 — the import manifest the same receipt binds; empty for a task that imported nothing. */
+  /** #1232 — the CTO PLAN attestation the same receipt binds for exact opaque, potentially active imports. */
   imports: TaskImport[];
 }
 
-/** #1232 — a receipt's recorded import manifest, or none when it has none or records no valid one. */
+/** #1232 — a receipt's recorded opaque-active import attestation, or none when it records no valid one. */
 const importsOf = (recorded: unknown): TaskImport[] => {
   if (typeof recorded !== "string") return [];
   try {

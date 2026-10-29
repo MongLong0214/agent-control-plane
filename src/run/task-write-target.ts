@@ -53,8 +53,9 @@ export interface TaskWriteTarget {
   startsFrom?: StartsFrom;
   /**
    * #1232 — only for a task whose PLAN declared them: the files the control plane imports into the
-   * checkout before the task's worker runs, each inside `paths`, with its size and sha256
-   * (`task-import.ts`). Absent for every other task.
+   * checkout before the task's worker runs, each inside `paths`, with its size and sha256. Declaring
+   * an import is the CTO PLAN's attestation authorizing those exact opaque, potentially active bytes;
+   * their raw content is not made safe or passive by structural parsing (`task-import.ts`).
    */
   imports?: TaskImport[];
 }

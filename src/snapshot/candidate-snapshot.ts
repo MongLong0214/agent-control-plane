@@ -33,8 +33,10 @@ export type SnapshotIntegration = z.infer<typeof snapshotIntegrationSchema>;
 /**
  * #1232 — a file a SUCCEEDED task imported, as the freeze found it: the candidate head holds a regular
  * file at `path` whose blob is `blob` and whose bytes have exactly the manifest's `size` and `sha256`,
- * the base holds nothing at or below `path`, and a bounded parser consumed the complete structurally
- * valid image or font of `type` (`classifyImport`), which git's own numstat also reads as binary. Its patch is left out of
+ * the base holds nothing at or below `path`, and its exact extension/signature is recognized while
+ * bounded selected structural checks account for every byte (`classifyImport`), which git also reads as binary. The CTO
+ * PLAN manifest attests to these exact opaque, potentially active bytes; parsing does not attest their
+ * safety or passivity. Its patch is left out of
  * `diffDigest`, so its bytes are never materialised for the freeze or the review; the head and tree
  * digests still fix it exactly. Text is never bound: it stays in the patch and is reviewed as such.
  */
@@ -45,7 +47,7 @@ export const snapshotImportSchema = z
     sha256: z.string().regex(/^sha256:[0-9a-f]{64}$/),
     blob: z.string().regex(/^[0-9a-f]{40}$/),
     taskId: z.string().min(1),
-    /** The structurally validated data type the reviewer reads (`PNG` or `font (TrueType)`). */
+    /** The recognized, structurally checked container type; not a full-format or byte-safety attestation. */
     type: z.string().min(1),
   })
   .strict();
@@ -246,9 +248,9 @@ export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
   });
 
 /**
- * #1232 — the declared imports the candidate holds byte for byte as binary data (`snapshotImportSchema`),
- * read one blob at a time. Anything else a manifest names -- text, code, an archive, a file a later task
- * changed -- is not bound and stays in the patch like any other change.
+ * #1232 — opaque, potentially active imports the CTO PLAN manifest authorized and the candidate holds
+ * byte for byte (`snapshotImportSchema`), read one blob at a time. Anything whose path, digest, size or
+ * selected container checks differ is not bound and stays in the patch like any other change.
  */
 const importsAtCandidate = async (
   checkoutPath: string,

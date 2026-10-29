@@ -88,7 +88,7 @@ const storedZlibZeros = (length: number): Buffer => {
   return output;
 };
 
-/** A structurally valid, IDAT-backed PNG whose complete encoded size is exactly 50 MiB. */
+/** A selected-check-admitted, IDAT-backed PNG whose encoded size is exactly 50 MiB. */
 export const validPngOfSize = (size: number, fill: number): Buffer => {
   if (size !== 50 * 1024 * 1024) throw new Error("the maximum-size PNG fixture is defined only at 50 MiB");
   const width = 100;
@@ -229,3 +229,193 @@ export const ttfWithHiddenHmtxPayload = (): Buffer => {
     ["hmtx", Buffer.concat([VALID_TTF.subarray(original.offset, original.offset + original.length), payload])],
   ]));
 };
+
+const mutateSharedFormat4 = (mutate: (font: Buffer, subtable: number) => void): Buffer => {
+  const font = Buffer.from(VALID_TTF);
+  const cmap = tableRecord(font, "cmap");
+  const subtable = cmap.offset + font.readUInt32BE(cmap.offset + 8);
+  mutate(font, subtable);
+  return repairTrueTypeChecksums(font, "cmap");
+};
+
+export const ttfWithShortFormat4 = (): Buffer =>
+  mutateSharedFormat4((font, subtable) => font.writeUInt16BE(4, subtable + 2));
+
+export const ttfWithBadFormat4Search = (): Buffer =>
+  mutateSharedFormat4((font, subtable) => font.writeUInt16BE(0, subtable + 8));
+
+export const ttfWithFormat4RangeOutside = (): Buffer =>
+  mutateSharedFormat4((font, subtable) => {
+    const segments = font.readUInt16BE(subtable + 6) / 2;
+    const rangeOffsets = subtable + 16 + segments * 6;
+    font.writeUInt16BE(0xfffe, rangeOffsets);
+  });
+
+export const ttfWithUncoveredCmapPayload = (): Buffer => {
+  const cmap = tableRecord(VALID_TTF, "cmap");
+  return rebuildTrueType(new Map([
+    ["cmap", Buffer.concat([VALID_TTF.subarray(cmap.offset, cmap.offset + cmap.length), Buffer.from("MZPAYLOAD")])],
+  ]));
+};
+
+const ttfWithExtendedFormat4 = (glyph: number, referenced: boolean): Buffer => {
+  const cmapRecord = tableRecord(VALID_TTF, "cmap");
+  const cmap = Buffer.concat([
+    VALID_TTF.subarray(cmapRecord.offset, cmapRecord.offset + cmapRecord.length),
+    Buffer.from([glyph >>> 8, glyph & 0xff]),
+  ]);
+  const subtable = cmap.readUInt32BE(8);
+  cmap.writeUInt16BE(cmap.length - subtable, subtable + 2);
+  if (referenced) {
+    const segments = cmap.readUInt16BE(subtable + 6) / 2;
+    const rangeOffsets = subtable + 16 + segments * 6;
+    cmap.writeUInt16BE(cmap.length - (rangeOffsets + 2), rangeOffsets);
+  }
+  return rebuildTrueType(new Map([["cmap", cmap]]));
+};
+
+export const ttfWithUnreferencedFormat4Glyph = (): Buffer => ttfWithExtendedFormat4(0x4d5a, false);
+export const ttfWithMissingFormat4Glyph = (): Buffer => ttfWithExtendedFormat4(0xffff, true);
+
+const compositeGlyph = (component: number): Buffer => {
+  const glyph = Buffer.alloc(18);
+  glyph.writeInt16BE(-1, 0);
+  glyph.writeUInt16BE(0x0003, 10);
+  glyph.writeUInt16BE(component, 12);
+  return glyph;
+};
+
+const ttfWithGlyphZero = (glyph: Buffer, configureMaxp?: (maxp: Buffer) => void): Buffer => {
+  if (glyph.length % 2 !== 0) throw new Error("short loca needs an even glyph record");
+  const loca = Buffer.alloc(6);
+  loca.writeUInt16BE(0, 0);
+  loca.writeUInt16BE(glyph.length / 2, 2);
+  loca.writeUInt16BE(glyph.length / 2, 4);
+  const maxpSource = tableRecord(VALID_TTF, "maxp");
+  const maxp = Buffer.from(VALID_TTF.subarray(maxpSource.offset, maxpSource.offset + maxpSource.length));
+  configureMaxp?.(maxp);
+  return rebuildTrueType(new Map([
+    ["glyf", glyph],
+    ["loca", loca],
+    ["maxp", maxp],
+  ]));
+};
+
+const oneComponentGlyph = (flags: number, component: number, firstArg = 0, secondArg = 0, contours = -1): Buffer => {
+  const words = (flags & 0x0001) !== 0;
+  const glyph = Buffer.alloc(10 + 4 + (words ? 4 : 2));
+  glyph.writeInt16BE(contours, 0);
+  glyph.writeUInt16BE(flags, 10);
+  glyph.writeUInt16BE(component, 12);
+  if (words) {
+    glyph.writeUInt16BE(firstArg, 14);
+    glyph.writeUInt16BE(secondArg, 16);
+  } else {
+    glyph[14] = firstArg;
+    glyph[15] = secondArg;
+  }
+  return glyph;
+};
+
+export const ttfWithCompositeContoursMinusTwo = (): Buffer =>
+  ttfWithGlyphZero(oneComponentGlyph(0x0003, 1, 0, 0, -2));
+
+export const ttfWithCompositeReservedFlag = (): Buffer =>
+  ttfWithGlyphZero(oneComponentGlyph(0x8003, 1));
+
+export const ttfWithConflictingOffsetFlags = (): Buffer =>
+  ttfWithGlyphZero(oneComponentGlyph(0x1803, 1));
+
+export const ttfWithNonfinalInstructions = (): Buffer => {
+  const glyph = Buffer.alloc(26);
+  glyph.writeInt16BE(-1, 0);
+  glyph.writeUInt16BE(0x0123, 10);
+  glyph.writeUInt16BE(1, 12);
+  glyph.writeUInt16BE(0x0003, 18);
+  glyph.writeUInt16BE(1, 20);
+  return ttfWithGlyphZero(glyph);
+};
+
+export const ttfWithPointArgsOutside = (): Buffer =>
+  ttfWithGlyphZero(oneComponentGlyph(0x0001, 1, 0xffff, 0xffff));
+
+const simplePointGlyph = (flag: number, xBytes: Buffer): Buffer => {
+  const glyph = Buffer.alloc(10 + 2 + 2 + 1 + xBytes.length);
+  glyph.writeInt16BE(1, 0);
+  glyph.writeUInt16BE(0, 10);
+  glyph.writeUInt16BE(0, 12);
+  glyph[14] = flag;
+  xBytes.copy(glyph, 15);
+  return glyph;
+};
+
+const pointMaxp = (maxp: Buffer): void => {
+  maxp.writeUInt16BE(1, 6);
+  maxp.writeUInt16BE(1, 8);
+};
+
+export const ttfWithReservedSimpleFlag = (): Buffer =>
+  ttfWithGlyphZero(simplePointGlyph(0xb1, Buffer.from([0])), pointMaxp);
+
+export const ttfWithWrongSimpleBbox = (): Buffer =>
+  ttfWithGlyphZero(simplePointGlyph(0x33, Buffer.from([0xff])), pointMaxp);
+
+export const ttfWithInstructionsPastMaxp = (): Buffer => {
+  const glyph = Buffer.alloc(16);
+  glyph.writeInt16BE(0, 0);
+  glyph.writeUInt16BE(4, 10);
+  Buffer.from([0xb0, 0x00, 0x2b, 0x2d]).copy(glyph, 12);
+  return ttfWithGlyphZero(glyph);
+};
+
+export const ttfWithActiveInstructions = (): Buffer => {
+  const glyph = Buffer.alloc(16);
+  glyph.writeInt16BE(0, 0);
+  glyph.writeUInt16BE(4, 10);
+  Buffer.from([0xb0, 0x00, 0x2b, 0x2d]).copy(glyph, 12);
+  return ttfWithGlyphZero(glyph, (maxp) => maxp.writeUInt16BE(4, 26));
+};
+
+export const pngWithActivePixelBytes = (): Buffer => {
+  const pixels = Buffer.from("<?php echo 'EXECUTED'; ?>");
+  const width = Math.ceil(pixels.length / 4);
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(1, 4);
+  header[8] = 8;
+  header[9] = 6;
+  const row = Buffer.alloc(1 + width * 4);
+  pixels.copy(row, 1);
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", header),
+    chunk("IDAT", deflateSync(row)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+};
+
+const ttfWithCompositeLinks = (links: readonly number[]): Buffer => {
+  const glyphCount = links.length + 1;
+  const glyf = Buffer.concat(links.map(compositeGlyph));
+  const loca = Buffer.alloc((glyphCount + 1) * 2);
+  for (let index = 0; index <= glyphCount; index += 1) loca.writeUInt16BE((Math.min(index, links.length) * 18) / 2, index * 2);
+  const maxpSource = tableRecord(VALID_TTF, "maxp");
+  const maxp = Buffer.from(VALID_TTF.subarray(maxpSource.offset, maxpSource.offset + maxpSource.length));
+  maxp.writeUInt16BE(glyphCount, 4);
+  maxp.writeUInt16BE(1, 28);
+  maxp.writeUInt16BE(links.length, 30);
+  const hmtxSource = tableRecord(VALID_TTF, "hmtx");
+  const hmtx = Buffer.alloc(4 + (glyphCount - 1) * 2);
+  VALID_TTF.copy(hmtx, 0, hmtxSource.offset, hmtxSource.offset + 4);
+  return rebuildTrueType(new Map([
+    ["glyf", glyf],
+    ["hmtx", hmtx],
+    ["loca", loca],
+    ["maxp", maxp],
+  ]));
+};
+
+export const ttfWithSelfComposite = (): Buffer => ttfWithCompositeLinks([0]);
+export const ttfWithCompositeCycle = (): Buffer => ttfWithCompositeLinks([1, 0]);
+export const ttfWithCompositeChain = (links: number): Buffer =>
+  ttfWithCompositeLinks(Array.from({ length: links }, (_, index) => index + 1));

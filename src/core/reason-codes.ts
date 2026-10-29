@@ -207,9 +207,9 @@ export const ReasonCode = {
    */
   IMPORT_DIGEST_MISMATCH: "IMPORT_DIGEST_MISMATCH",
   /**
-   * #1232 — a file a task imports could not be reviewed: executable or loadable code, an archive, or
-   * binary bytes are not a complete structurally valid allowed image or font; or the task's text imports exceed what its patch can carry. Nothing
-   * is imported.
+   * #1232 — an opaque import failed its CTO-attested manifest/container policy: a top-level signature
+   * is policy-refused, a recognized PNG/TrueType container fails selected bounded checks, or text
+   * imports exceed what their review patch can carry. Refusal does not imply accepted bytes are safe.
    */
   IMPORT_CONTENT_REFUSED: "IMPORT_CONTENT_REFUSED",
   TASK_RECEIPT_MISSING: "TASK_RECEIPT_MISSING",

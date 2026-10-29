@@ -14,14 +14,33 @@ import { WorkerTurnEvent, WorkerTurnRunner, type WorkerTurnOptions, workerSucces
 import { cleanupTempDirs, commitAll, gitSync, makeCore, tempDir } from "../helpers/fixtures.ts";
 import {
   VALID_TTF,
+  pngWithActivePixelBytes,
   pngWithIdatSuffix,
   pngWithOversizedPalette,
   pngWithPrivateAncillary,
   ttfWithCmapSubtableOutside,
+  ttfWithBadFormat4Search,
+  ttfWithActiveInstructions,
+  ttfWithCompositeChain,
+  ttfWithCompositeContoursMinusTwo,
+  ttfWithCompositeCycle,
+  ttfWithCompositeReservedFlag,
+  ttfWithConflictingOffsetFlags,
+  ttfWithFormat4RangeOutside,
   ttfWithHiddenHmtxPayload,
+  ttfWithInstructionsPastMaxp,
   ttfWithNameStringOutside,
+  ttfWithNonfinalInstructions,
+  ttfWithMissingFormat4Glyph,
   ttfWithNonzeroGlyfPadding,
+  ttfWithPointArgsOutside,
+  ttfWithReservedSimpleFlag,
+  ttfWithShortFormat4,
   ttfWithShortGlyphRecords,
+  ttfWithSelfComposite,
+  ttfWithUncoveredCmapPayload,
+  ttfWithUnreferencedFormat4Glyph,
+  ttfWithWrongSimpleBbox,
   validPng,
   validPngOfSize,
 } from "../helpers/import-fixtures.ts";
@@ -354,7 +373,7 @@ describe("#1232 a task imports binary files through its write target", () => {
     expectNothingImported(world, adapter, head);
   };
 
-  it("W8 an executable, loadable or archive binary, and binary bytes at a source path, are each refused", async () => {
+  it("W8 top-level native/archive policy signatures and an unsupported source-path binary are refused", async () => {
     const tail = Buffer.concat([Buffer.alloc(64, 0x00), randomBytes(64)]);
     const cases: Array<{ name: string; path: string; bytes: Buffer }> = [
       { name: "an ELF executable", path: "assets/tool", bytes: Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]), tail]) },
@@ -390,12 +409,36 @@ describe("#1232 a task imports binary files through its write target", () => {
       ["assets/short-glyphs.ttf", ttfWithShortGlyphRecords()],
       ["assets/hidden-hmtx.ttf", ttfWithHiddenHmtxPayload()],
       ["assets/cmap-outside.ttf", ttfWithCmapSubtableOutside()],
+      ["assets/cmap-short-format4.ttf", ttfWithShortFormat4()],
+      ["assets/cmap-search.ttf", ttfWithBadFormat4Search()],
+      ["assets/cmap-range.ttf", ttfWithFormat4RangeOutside()],
+      ["assets/cmap-uncovered.ttf", ttfWithUncoveredCmapPayload()],
+      ["assets/cmap-unreferenced-glyph.ttf", ttfWithUnreferencedFormat4Glyph()],
+      ["assets/cmap-missing-glyph.ttf", ttfWithMissingFormat4Glyph()],
+      ["assets/composite-self-cycle.ttf", ttfWithSelfComposite()],
+      ["assets/composite-two-cycle.ttf", ttfWithCompositeCycle()],
+      ["assets/composite-too-deep.ttf", ttfWithCompositeChain(33)],
+      ["assets/composite-minus-two.ttf", ttfWithCompositeContoursMinusTwo()],
+      ["assets/composite-reserved.ttf", ttfWithCompositeReservedFlag()],
+      ["assets/composite-offset-flags.ttf", ttfWithConflictingOffsetFlags()],
+      ["assets/composite-nonfinal-instructions.ttf", ttfWithNonfinalInstructions()],
+      ["assets/composite-point-args.ttf", ttfWithPointArgsOutside()],
+      ["assets/simple-reserved.ttf", ttfWithReservedSimpleFlag()],
+      ["assets/simple-bbox.ttf", ttfWithWrongSimpleBbox()],
+      ["assets/instructions-past-maxp.ttf", ttfWithInstructionsPastMaxp()],
       ["assets/name-outside.ttf", ttfWithNameStringOutside()],
       ["assets/mismatched.ttf", validPng()],
       ["assets/mismatched.png", VALID_TTF],
     ] as const) {
       expect(taskImport.classifyImport(path, bytes), path).toMatchObject({ kind: "refused" });
     }
+    expect(taskImport.classifyImport("assets/composite-depth-limit.ttf", ttfWithCompositeChain(32))).toMatchObject({
+      kind: "data", type: "font (TrueType)",
+    });
+    expect(taskImport.classifyImport("assets/active-pixels.png", pngWithActivePixelBytes())).toMatchObject({ kind: "data", type: "PNG" });
+    expect(taskImport.classifyImport("assets/active-instructions.ttf", ttfWithActiveInstructions())).toMatchObject({
+      kind: "data", type: "font (TrueType)",
+    });
   });
 
   it("W8b a text import past the text limit derived from the patch cap is refused", async () => {
