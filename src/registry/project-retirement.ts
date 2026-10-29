@@ -4,7 +4,6 @@ import { ReasonCode } from '../core/reason-codes.ts';
 import { CanonicalSessionRegistry } from './canonical-session-registry.ts';
 import { Role, roleKeyFor } from '../domain/types.ts';
 import { HostRetirementRefusal } from '../runtime/host-project-provisioner.ts';
-import { retirementWaitsForSettlement } from '../ceo/ownerless-stalls.ts';
 
 /**
  * #1229 — a retirement commits its irreversible rows (the retirement record, which is also negative authority, and the
@@ -25,12 +24,8 @@ export async function retireProject(cp:ControlPlane,projectId:string,reason:stri
   }
   const work = cp.db.all<{run_id:string;state:string}>(`SELECT run_id,state FROM runs WHERE (project_id = ? OR run_id IN (SELECT run_id FROM bootstrap_applications WHERE project_id = ?)) AND state NOT IN ('COMPLETED','CANCELLED','FAILED') ORDER BY created_at,run_id`,[projectId,projectId]);
   // Confirmed/merged effects must settle through their own finalizer; cancellation never erases them.
-  const settling = work.filter(r => ['CEO_APPROVED','FINALIZING','MERGING','POST_MERGE_VERIFYING','BLOCKED_POST_MERGE'].includes(r.state));
-  if (settling.length > 0) {
-    const held = retirementWaitsForSettlement(cp,projectId,settling);
-    if (held.allowed) return held;
-    return deny(held.reasonCode,`${held.message}; nothing was changed`,{...held.evidence,requiredOrder:[`let runs ${settling.map(run => run.run_id).join(', ')} finish finalizing`,rerun]});
-  }
+  const settling = work.filter(r => ['CEO_APPROVED','FINALIZING','MERGING','POST_MERGE_VERIFYING','BLOCKED_POST_MERGE'].includes(r.state)).map(r => r.run_id);
+  if (settling.length > 0) return deny(ReasonCode.CONFLICT,'retirement waits for confirmed external effects to settle; nothing was changed',{projectId,settling,requiredOrder:[`let runs ${settling.join(', ')} finish finalizing`,rerun]});
   // The reversible marker: this call suspends only a project that was not suspended, and takes that back on a refusal.
   const markedHere = !project.suspended;
   if (markedHere) cp.projects.setSuspended(projectId,true,true);

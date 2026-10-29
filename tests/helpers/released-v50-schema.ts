@@ -23,7 +23,6 @@ export const takeBackV50 = (raw: Database.Database): void => {
 
 /** Historical fixtures must remove v52's additive objects and restore the three parent definitions v51 left. */
 export const takeBackV52 = (raw: Database.Database): void => {
-  takeBackV53(raw);
   if (!(raw.prepare('PRAGMA table_info(projects)').all() as {name:string}[]).some(c => c.name === 'retired_at')) return;
   const snapshot = readFileSync(new URL('../../src/db/schema-v51.sql',import.meta.url),'utf8');
   raw.pragma('foreign_keys = OFF');raw.pragma('legacy_alter_table = ON');
@@ -46,16 +45,3 @@ export const takeBackV52 = (raw: Database.Database): void => {
 };
 
 export const V52_ADDED_TRIGGERS = ["resident_project_provisioning", "canonical_session_entitlements", "project_retirements"].flatMap(table => ["identity_immutable", "no_replace", "no_delete"].map(suffix => `${table}_${suffix}`));
-
-/** #1258 — historical fixtures restore v52's verification_results: v53's attempt column and wider key go, every row and rowid stays. */
-export const takeBackV53 = (raw: Database.Database): void => {
-  if (!(raw.prepare("PRAGMA table_info(verification_results)").all() as { name: string }[]).some((c) => c.name === "attempt")) return;
-  const snapshot = readFileSync(new URL("../../src/db/schema-v52.sql", import.meta.url), "utf8");
-  const ddl = /CREATE TABLE IF NOT EXISTS verification_results \([\s\S]*?\n\);/.exec(snapshot)?.[0];
-  if (!ddl) throw new Error("v52 verification_results missing");
-  raw.exec("ALTER TABLE verification_results RENAME TO verification_results_v53_fixture");
-  raw.exec(ddl);
-  const list = (raw.prepare("PRAGMA table_info(verification_results)").all() as { name: string }[]).map((c) => `"${c.name}"`).join(",");
-  raw.exec(`INSERT INTO verification_results (rowid, ${list}) SELECT rowid, ${list} FROM verification_results_v53_fixture;
-    DROP TABLE verification_results_v53_fixture`);
-};
