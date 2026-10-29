@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { readdirSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { deflateSync } from "node:zlib";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import type { ProviderAdapter } from "../../src/runtime/provider.ts";
@@ -99,6 +100,33 @@ const turn = async (world: WorkerWorld, whileLatched: () => void) => {
 };
 
 const inObjectStore = (path: string): boolean => /^objects\/(?:[0-9a-f]{2}|pack)(?:\/|$)/.test(path) || path === "objects";
+
+/** Replaces one loose object without changing its object-id path, the corruption `git fsck` must reject. */
+const replaceLooseBlob = (world: WorkerWorld, objectId: string, bytes: Buffer): void => {
+  const loose = join(commonDirOf(world), "objects", objectId.slice(0, 2), objectId.slice(2));
+  mkdirSync(join(commonDirOf(world), "objects", objectId.slice(0, 2)), { recursive: true });
+  rmSync(loose, { force: true });
+  writeFileSync(loose, deflateSync(Buffer.concat([Buffer.from(`blob ${bytes.length}\0`), bytes])));
+};
+
+describe("#1227 review: content-addressed storage is mutable only when its object IDs remain truthful", () => {
+  for (const layout of ["linked", "main"] as const) {
+    it(`refuses before comparing candidate bytes when an existing base object is replaced (${layout} checkout)`, async () => {
+      const world = worldIn(layout);
+      const readme = gitSync(world.repoPath, ["rev-parse", "HEAD:README.md"]);
+      let replacementError: unknown = null;
+      const outcome = await turn(world, () => {
+        try {
+          replaceLooseBlob(world, readme, Buffer.from("forged base bytes\n"));
+        } catch (error) {
+          replacementError = error;
+        }
+      });
+      expect(replacementError).toBeNull();
+      expect({ status: outcome.status, reason: outcome.reason }).toEqual({ status: "FAILED", reason: "GIT_OBJECT_STORE_INVALID" });
+    });
+  }
+});
 
 describe("#1227 (a) another process adds, freshens and repacks objects during the turn", () => {
   for (const layout of ["linked", "main"] as const) {

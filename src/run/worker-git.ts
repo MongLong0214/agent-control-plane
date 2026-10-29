@@ -496,6 +496,16 @@ export const gitDirEntries = (repo: PinnedRepository): string[] => {
 };
 
 /**
+ * #1227 review — the object store may be repacked, freshened, or gain objects while a resident and a
+ * worker share it, but an object already named by an id must still hash to that id. Normal Git reads
+ * trust the object-id path and can consume substituted bytes; strict fsck re-hashes the reachable
+ * graph before those bytes are used to compare or commit a candidate. Dangling objects are harmless
+ * concurrent additions and are not reported, while corrupt reachable loose or packed objects refuse.
+ */
+export const objectStoreIntegrity = async (repo: PinnedRepository, head: string): Promise<GitRun> =>
+  runPinnedGit(repo, ["fsck", "--strict", "--no-dangling", "--no-reflogs", "--no-progress", head]);
+
+/**
  * #1246 — git configuration a WORKER turn's own git runs with, over the repository's (`GIT_CONFIG_COUNT`
  * in its environment; see `productionRunCli`), so the read-only commands its prompt allows write nothing
  * in the git dir where the repository's configuration would have them do so. Measured on git 2.50, with

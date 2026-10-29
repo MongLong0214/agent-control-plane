@@ -1,5 +1,5 @@
-import { lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { delimiter, dirname, join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { commandsForMode } from "../../src/contracts/manifest.ts";
@@ -234,6 +234,27 @@ const isAncestor = (repo: string, ancestor: string, of: string): boolean => {
     return false;
   }
 };
+
+/** A git first on PATH that mutates the checkout before the first matching real git invocation. */
+const gitOnce = (match: string, before: string): { restore: () => void; fired: () => boolean } => {
+  const bin = tempDir("acp-resident-git-");
+  const fired = join(bin, "fired");
+  const real = (process.env["PATH"] ?? "")
+    .split(delimiter)
+    .map((dir) => join(dir, "git"))
+    .find((path) => existsSync(path));
+  if (!real) throw new Error("no git on PATH");
+  writeFileSync(join(bin, "git"), [
+    "#!/bin/sh",
+    `case "$*" in *"${match}"*) if [ ! -e '${fired}' ]; then : > '${fired}'; ${before}; fi;; esac`,
+    `exec '${real}' "$@"`,
+    "",
+  ].join("\n"));
+  chmodSync(join(bin, "git"), 0o755);
+  const path = process.env["PATH"];
+  process.env["PATH"] = `${bin}${delimiter}${path ?? ""}`;
+  return { restore: () => { process.env["PATH"] = path; }, fired: () => existsSync(fired) };
+};
 const moves = (f: BootstrapRuntimeFixture) => f.harness.cp.audit.byKind(MOVED).map((row) => row.evidence);
 /** Every file under a git dir, with its inode and times: what changed in it, if anything did. */
 const gitDirState = (repo: string): string => {
@@ -306,6 +327,41 @@ describe("#1227 a resident's working directory never reaches a worker turn", () 
         expect(headRef(checkout)).toBe(`refs/heads/${target.branch}`);
         expect(gitSync(checkout, ["status", "--porcelain", "--untracked-files=all"])).toBe("");
       } finally {
+        worker.killAll();
+      }
+    }, { repoPath: residentClone() });
+  });
+
+  it("a refresh refusal leaves the worker clone's base ref at the exact value held before the task-branch attempt", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-base-ref-refresh", [APP]);
+      becomeResident(f, s);
+      const worker = workerDoing(f);
+      let wrapper: ReturnType<typeof gitOnce> | null = null;
+      try {
+        await daemonPass(f);
+        const checkout = await registeredCheckout(f, s);
+        const workerDev = gitSync(checkout, ["rev-parse", "refs/heads/dev"]);
+
+        writeFiles(s.clone, { "docs/resident.md": "# a later resident commit\n" });
+        residentGit(s.clone, ["add", "docs/resident.md"]);
+        residentGit(s.clone, ["commit", "-q", "-m", "resident advances dev"]);
+        const residentDev = gitSync(s.clone, ["rev-parse", "refs/heads/dev"]);
+        expect(residentDev).not.toBe(workerDev);
+
+        const target = await provision(f, s, s.ids["app"]!);
+        expect(target.baseSha).toBe(residentDev);
+        const claimId = await claim(f, s, target, checkout);
+        const lateBytes = "# a late checkout edit\n";
+        wrapper = gitOnce("update-index --refresh", `printf '${lateBytes.replace(/\n/g, "\\n")}' > '${join(checkout, "README.md")}'`);
+        const refused = await turn(f, s, worker, s.ids["app"]!, claimId, { writes: { "src/app.js": "module.exports = () => 2;\n" } });
+
+        expect(wrapper.fired()).toBe(true);
+        expect(refused.ran).toMatchObject({ ok: false });
+        expect(gitSync(checkout, ["rev-parse", "refs/heads/dev"])).toBe(workerDev);
+        expect(readFileSync(join(checkout, "README.md"), "utf8")).toBe(lateBytes);
+      } finally {
+        wrapper?.restore();
         worker.killAll();
       }
     }, { repoPath: residentClone() });
