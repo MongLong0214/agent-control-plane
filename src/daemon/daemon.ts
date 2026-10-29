@@ -3,7 +3,6 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { ControlPlane } from "../app/control-plane.ts";
-import { routeOwnerlessStalls, routePostMergeStall } from "../ceo/ownerless-stalls.ts";
 import { outboxDeliveryReadback } from "../outbox/outbox.ts";
 import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../capacity/capacity-monitor.ts";
 import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
@@ -35,7 +34,6 @@ import {
   BOOTSTRAP_PLAN_RECOVERY_WAKE,
   BOOTSTRAP_RESULT_RECOVERY_WAKE,
   BOOTSTRAP_REVIEW_RETRY_WAKE,
-  SESSION_WAKE_TRIGGER_COMPLETED,
   ProvisionedSessionRuntime,
   planRecoveryTriggerId,
   planRecoveryTriggerKind,
@@ -78,12 +76,6 @@ import {
   ownerApprovalPayload,
 } from "../ingress/ingress-guard.ts";
 import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
-import {
-  AgentOwnedWaits,
-  type AgentWaitDeadlines,
-  type AgentWaitSweepReport,
-  DEFAULT_AGENT_WAIT_DEADLINES,
-} from "../ceo/agent-owned-waits.ts";
 import { ROLE_ATTACHMENT_OPERATION, RoleAttachmentCredentials } from "../session/role-attachment-credentials.ts";
 import type { SessionRecord } from "../session/session-registry.ts";
 import type { BuzzAdapter } from "../buzz/buzz-adapter.ts";
@@ -302,12 +294,6 @@ export interface DaemonOptions {
    * refresh interval; see `assertDoctorFreshnessOrdering`.
    */
   doctorFreshnessMs?: number;
-  /**
-   * #1189 B4/B6/B7/B10 — how long an agent-owned wait (an unresolved escalation, a CEO review, a
-   * FINAL_REVISE not dispatched again, a continuity hold) sits before its next deadline step. Each kind
-   * falls back to `DEFAULT_AGENT_WAIT_DEADLINES`.
-   */
-  agentWaitDeadlines?: Partial<AgentWaitDeadlines>;
 }
 
 /**
@@ -708,8 +694,6 @@ export class Daemon {
    * again. Process memory only: a restarted daemon tries once more.
    */
   readonly #refusedTargets = new Set<string>();
-  /** #1189 — the agent-owned waits' deadlines, the pending-review re-delivery and the ownerless stall routing. */
-  readonly #agentWaits: AgentOwnedWaits;
 
   constructor(
     private readonly cp: ControlPlane,
@@ -722,13 +706,6 @@ export class Daemon {
     this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.clock);
     this.#finalizer = new ApprovedRunFinalizer(cp, undefined, authorities);
     this.#evidenceExporter = new RunEvidenceExporter(cp.db, cp.artifacts, cp.clock, cp.audit);
-    this.#agentWaits = new AgentOwnedWaits(
-      {
-        db: cp.db, clock: cp.clock, audit: cp.audit, runs: cp.runs, bindings: cp.bindings,
-        outbox: cp.outbox, artifacts: cp.artifacts, gate: cp.ceo,
-      },
-      { ...DEFAULT_AGENT_WAIT_DEADLINES, ...options.agentWaitDeadlines },
-    );
     // Nothing is registered with `cp.doctor` here. A constructed daemon is not yet the live one: a
     // second `Daemon` over the same control plane that `start()` then refuses the lock would, if it
     // registered here, replace the supplier of the daemon that does hold the lock, and that
@@ -1493,9 +1470,6 @@ export class Daemon {
       report.resumedRuns = await this.resumeQueuedRuns();
       report.resumedFinalizations = await this.resumeApprovedRuns();
       await this.resumeResidentProjects();
-      // #1189 — a stranded bootstrap application or a CONTRACT_CHANGE run that cannot finish is routed to
-      // the CEO once each; the watchdog repeats the pass, and a stall already routed sends nothing more.
-      await this.runPeriodic("ownerless_stall_routing", async () => { routeOwnerlessStalls(this.cp); });
       // Issue #246 — a bootstrap run that ended while no daemon was running left its BOOTSTRAP_CTO
       // bound or its session running; the watchdog repeats this, through the same backoff.
       await this.runPeriodic("bootstrap_cto_reclaim", () => this.reclaimBootstrapCtos());
@@ -1513,9 +1487,6 @@ export class Daemon {
         await this.recordStandardWorkTargets();
         this.wakeStandardWorkContinuation();
       });
-      // #1189 — a CEO recovered while no daemon ran is given the reviews still pending, and a wait whose
-      // deadline passed meanwhile takes its next step.
-      await this.runPeriodic("agent_owned_waits", async () => { await this.sweepAgentOwnedWaits(); });
       // #639 contract 6, at the moment it matters most: right after a restart, before the first
       // periodic sweep would otherwise get to it. This genuinely runs and asks — it is not a
       // no-op by omission — but two independent facts limit it today, both stated in full in
@@ -2102,15 +2073,11 @@ export class Daemon {
    * engine decides, per run, whether the wait is continuity's own and nothing has moved since, and
    * answers `released: false` for every other one; a refusal here changes nothing and the next pass
    * asks again.
-   *
-   * #1189 — a wait continuity placed for a role that is not the run's owner (the CEO's, whose loss pauses
-   * every run) is handed back too, once `binding` covers that role again; the run engine decides that one
-   * by the pause's own record (`RunEngine.releaseHeldRoleReviewHold`).
    */
   private releaseContinuityReviewHolds(binding: RoleBinding): void {
     for (const run of this.cp.runs.list({ state: RunState.AWAITING_HUMAN })) {
-      if (run.ownerRoleKey === binding.roleKey) this.cp.runs.releaseContinuityReviewHold(run.runId, binding);
-      else this.cp.runs.releaseHeldRoleReviewHold(run.runId, binding);
+      if (run.ownerRoleKey !== binding.roleKey) continue;
+      this.cp.runs.releaseContinuityReviewHold(run.runId, binding);
     }
   }
 
@@ -2230,24 +2197,12 @@ export class Daemon {
 
   private async resumeApprovedRuns(): Promise<string[]> {
     const resumed: string[] = [];
-    const stalled: string[] = [];
     const states = [RunState.CEO_APPROVED, RunState.MERGING, RunState.POST_MERGE_VERIFYING, RunState.BLOCKED_POST_MERGE];
     for (const state of states) {
       for (const run of this.cp.runs.list({ state })) {
         const finalized = await this.finalizeApprovedRun(run.runId);
         if (finalized.allowed) resumed.push(run.runId);
-        // A run blocked earlier in this pass is listed again here, so its first refusal is seen at once.
-        else if (state === RunState.BLOCKED_POST_MERGE && finalized.reasonCode === ReasonCode.FINALIZATION_COMPENSATION_REQUIRED) {
-          stalled.push(run.runId);
-        }
       }
-    }
-    // #1189 — a block the finalizer will not resume is routed to the CEO, once per finalization attempt;
-    // the run, its merges and its compensation plan stay as recorded.
-    if (stalled.length > 0) {
-      await this.runPeriodic("post_merge_stall_routing", async () => {
-        for (const runId of stalled) routePostMergeStall(this.cp, runId);
-      });
     }
     return resumed;
   }
@@ -2405,11 +2360,8 @@ export class Daemon {
    *
    * The same pass also makes the review retry (`#bootstrapReviewRetry`): a result submitted for the
    * current PLAN whose candidate's latest review ended unavailable wakes the owner once per (run,
-   * candidate) to submit that result again, under the same runtime
-   * conditions, marked by a `BOOTSTRAP_REVIEW_RETRY_WAKE` audit event. A failed/refused turn or a
-   * restart or owner-generation recovery after admission re-presents that exact trigger; only its durable
-   * `SESSION_WAKE_TRIGGER_COMPLETED` settlement spends the retry. If the review is still unavailable
-   * after that completed turn, the run fails explicitly instead of waiting for a person.
+   * owner binding generation, candidate) to submit that result again, under the same runtime
+   * conditions, marked by a `BOOTSTRAP_REVIEW_RETRY_WAKE` audit event.
    */
   wakeBootstrapResultRecovery(): BootstrapResultRecoveryReport {
     const woken: BootstrapResultRecoveryReport["woken"] = [];
@@ -2434,62 +2386,6 @@ export class Daemon {
       const resultStage = this.#bootstrapResultOwnerStands(runId, owner, planDigest);
       const retry = resultStage ? null : this.#bootstrapReviewRetry(runId, owner, planDigest);
       if (!resultStage && retry === null) continue;
-      if (retry !== null) {
-        const retryWake = this.cp.db.get<{ trigger_id: unknown; binding_generation: unknown }>(
-          `SELECT json_extract(evidence_json, '$.triggerId') AS trigger_id,
-                  json_extract(evidence_json, '$.bindingGeneration') AS binding_generation
-             FROM audit_events
-            WHERE kind = ? AND run_id = ?
-              AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?
-            ORDER BY event_id
-            LIMIT 1`,
-          [BOOTSTRAP_REVIEW_RETRY_WAKE, runId, retry.candidateSnapshotDigest],
-        );
-        if (typeof retryWake?.trigger_id === "string") {
-          const completed = this.cp.db.get<{ n: number }>(
-            `SELECT 1 AS n FROM audit_events
-              WHERE kind = ? AND json_extract(evidence_json, '$.triggerId') = ?
-              LIMIT 1`,
-            [SESSION_WAKE_TRIGGER_COMPLETED, retryWake.trigger_id],
-          );
-          if (completed) {
-            // The exact admitted retry turn completed, but the candidate's latest review is still
-            // unavailable. Its finite review-recovery budget is spent; do not create a human wait.
-            this.cp.runs.transition(
-              runId,
-              RunState.FAILED,
-              "bootstrap blind review remained unavailable after its bounded retry",
-              {
-                failureClass: "BLIND_REVIEW_RETRY_EXHAUSTED",
-                bindingGeneration: owner.bindingGeneration,
-                retryBindingGeneration: retryWake.binding_generation,
-                planDigest,
-                candidateSnapshotDigest: retry.candidateSnapshotDigest,
-                unavailableEventId: retry.unavailableEventId,
-                triggerId: retryWake.trigger_id,
-              },
-            );
-            continue;
-          }
-          // Admission is durable but a failed/refused turn, or a daemon restart before settlement,
-          // is not a spent retry. Re-present the same deterministic trigger; the runtime coalesces
-          // an in-progress copy and releases a failed one.
-          if (
-            !runtime.drivesSession(owner.sessionId, Role.BOOTSTRAP_CTO) ||
-            !runtime.holds(owner.sessionId) ||
-            !runtime.attachedToDaemon() ||
-            runtime.turnInProgress(owner.sessionId)
-          ) {
-            continue;
-          }
-          runtime.wake(owner.roleKey, [{
-            id: retryWake.trigger_id,
-            kind: reviewRetryTriggerKind(runId),
-            stillAdmissible: () => this.#bootstrapReviewRetry(runId, owner, planDigest) !== null,
-          }]);
-          continue;
-        }
-      }
       if (
         !runtime.drivesSession(owner.sessionId, Role.BOOTSTRAP_CTO) ||
         !runtime.holds(owner.sessionId) ||
@@ -2499,6 +2395,18 @@ export class Daemon {
         continue;
       }
       if (retry !== null) {
+        // One official retry per (run, owner generation, candidate): a retry whose own review is
+        // unavailable again records a new unavailable event, and keying on that alone would wake the
+        // owner on every tick for as long as the reviewer stays down.
+        const alreadyRetried = this.cp.db.get<{ n: number }>(
+          `SELECT 1 AS n FROM audit_events
+            WHERE kind = ? AND run_id = ?
+              AND json_extract(evidence_json, '$.bindingGeneration') = ?
+              AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?
+            LIMIT 1`,
+          [BOOTSTRAP_REVIEW_RETRY_WAKE, runId, owner.bindingGeneration, retry.candidateSnapshotDigest],
+        );
+        if (alreadyRetried) continue;
         const triggerId = reviewRetryTriggerId(
           runId, owner.bindingGeneration, retry.candidateSnapshotDigest, retry.unavailableEventId,
         );
@@ -2862,31 +2770,7 @@ export class Daemon {
       if (marked(STANDARD_WORK_CONTINUATION_WAKE)) {
         // The one wake this state earned has run, or was dropped, and the state is unchanged: the
         // owner made no progress on it. That is left as an explicit blocker, once, and never re-woken.
-        // #1189 B12 — and no agent watches that blocker, so it goes to the CEO as CRITICAL_SYSTEM_FAILURE,
-        // once per stalled state; a pass with no CEO to tell asks again on the next one.
-        const routeStall = (): void => {
-          this.#agentWaits.routeOwnerlessStall({
-            source: "STANDARD_WORK_CONTINUATION",
-            kind: "standard_work_continuation",
-            id: `${runId}:${tuple.taskId}`,
-            episode: `${tuple.taskState}:${tuple.messageId}`,
-            runId,
-            since: null,
-            owner: { role: owner.roleKey, sessionId: owner.sessionId, generation: owner.bindingGeneration },
-            recoveryAction:
-              "replace the run's PRIMARY_CTO (cto_replace) so the READY task is staffed and run, or cancel the run (run_cancel); " +
-              "the task has no execution and no attempt, so nothing it would do has run and nothing needs checking first",
-            blocker:
-              `task ${tuple.taskId} is READY (${tuple.taskState}) with no execution after its one continuation wake, ` +
-              "and its CTO is not woken again",
-            effects: "NONE_STARTED",
-            deliveryTimeout: false,
-          });
-        };
-        if (marked(STANDARD_WORK_CONTINUATION_STALLED)) {
-          routeStall();
-          continue;
-        }
+        if (marked(STANDARD_WORK_CONTINUATION_STALLED)) continue;
         this.cp.audit.record({
           kind: STANDARD_WORK_CONTINUATION_STALLED,
           reasonCode: ReasonCode.WORKER_BINDING_REQUIRED,
@@ -2905,7 +2789,6 @@ export class Daemon {
         report.stalled.push({
           runId, roleKey: owner.roleKey, bindingGeneration: tuple.bindingGeneration, taskId: tuple.taskId, taskState: tuple.taskState,
         });
-        routeStall();
         continue;
       }
       if (
@@ -3049,18 +2932,6 @@ export class Daemon {
     return this.cp.sessions.get(owner.sessionId)?.lifecycle === SessionLifecycle.READY;
   }
 
-  /**
-   * #1189 B4/B6/B7/B10 (CEO ruling 4) — every pending review is delivered to the CEO role's current holder
-   * when it does not have it and no decision exists for it, then every agent-owned wait past its deadline
-   * takes its next step: re-notify, reassign or a recovery attempt, CEO escalation. A continuity hold's
-   * recovery attempt is this daemon's own continuity reconcile. Nothing here moves a run to FAILED.
-   */
-  async sweepAgentOwnedWaits(): Promise<AgentWaitSweepReport & { redelivered: Array<{ runId: string; messageId: string }> }> {
-    const redelivered = this.#agentWaits.redeliverPendingReviews();
-    const swept = await this.#agentWaits.sweep(() => this.reconcileContinuity("agent-owned wait deadline"));
-    return { ...swept, redelivered };
-  }
-
   private startTimers(): void {
     const watchdogMs = this.options.watchdogIntervalMs ?? 60_000;
     const deliveryMs = this.options.deliveryIntervalMs ?? 5_000;
@@ -3091,9 +2962,6 @@ export class Daemon {
           // an interrupted callback without requiring a daemon restart.
           const finalized = await this.resumeApprovedRuns();
           await this.resumeResidentProjects();
-          // #1189 C2 — what the watchdog found overdue is routed to the CEO, once per stall; after the
-          // recovery sweeps, so a routing that cannot be written never costs them their tick.
-          this.#agentWaits.routeWatchdogStalls(tick.stalls);
           if (tick.overdue.length > 0 || finalized.length > 0) this.writeHealth(null);
         }).finally(() => { watchdogRunning = false; });
       }
@@ -3110,14 +2978,11 @@ export class Daemon {
         await this.recordStandardWorkTargets();
         this.wakeStandardWorkContinuation();
       });
-      // #1189 — pending reviews follow a recovered CEO, and agent-owned waits take their deadline steps.
-      void this.runPeriodic("agent_owned_waits", async () => { await this.sweepAgentOwnedWaits(); });
       // #512 — and a retired worker's session left live while its process ran is settled on a later tick.
       void this.runPeriodic("worker_retirement", async () => {
         await this.cp.workerRetirement.reconcile();
       });
       void this.runPeriodic("cto_canonical_switchover_settle", () => this.settleCanonicalSwitchovers());
-      void this.runPeriodic("ownerless_stall_routing", async () => { routeOwnerlessStalls(this.cp); });
     }, watchdogMs);
     watchdog.unref();
     this.#timers.push(watchdog);

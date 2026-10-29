@@ -11,12 +11,7 @@ import { ArtifactKind, Role, RunState } from "../../src/domain/types.ts";
 import { REVIEWER_FALLBACK_SCOPE_UNCONFIGURED } from "../../src/review/blind-review.ts";
 import { CodexCliAdapter, __testing } from "../../src/runtime/cli-adapters.ts";
 import { ProviderSessionProvisionError, type InvocationRequest, type SessionSpec } from "../../src/runtime/provider.ts";
-import {
-  BOOTSTRAP_REVIEW_RETRY_WAKE,
-  SESSION_WAKE_TRIGGER_COMPLETED,
-  reviewRetryTriggerId,
-  reviewRetryTriggerKind,
-} from "../../src/runtime/provisioned-session-runtime.ts";
+import { BOOTSTRAP_REVIEW_RETRY_WAKE, reviewRetryTriggerKind } from "../../src/runtime/provisioned-session-runtime.ts";
 import { provisionReviewerCodexHome } from "../../src/runtime/reviewer-codex-home.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { bootstrapCoverageKeys } from "../helpers/bootstrap-plan.ts";
@@ -388,30 +383,6 @@ describe("a frozen result whose review was unavailable gets one official retry o
     return { ...run, candidate, unavailableEventId: unavailable[0]!.eventId, before: nothingSynthesized(f, run.runId) };
   };
 
-  const renewOwner = async (
-    f: BootstrapRuntimeFixture,
-    runId: string,
-    ownerSessionId: string,
-    roleKey: string,
-    fromGeneration: number,
-  ): Promise<number> => {
-    const cp = f.harness.cp;
-    expect(cp.runs.pauseForContinuity(runId, roleKey, "test: retry owner lost", {
-      continuityAction: "PAUSE_NEW_WORK",
-    })).toMatchObject({ allowed: true, value: { state: RunState.BLOCKED } });
-    expect(cp.bindings.revoke(roleKey, "test: retry owner lost", { allowBlockedRuns: true }).allowed).toBe(true);
-    const renewed = cp.bindings.bind({ role: Role.BOOTSTRAP_CTO, runId, sessionId: ownerSessionId });
-    if (!renewed.allowed) throw new Error(renewed.message);
-    expect(renewed.value.bindingGeneration).toBe(fromGeneration + 1);
-    expect(cp.runs.restoreRecoveredBootstrapOwner(runId, renewed.value, fromGeneration))
-      .toMatchObject({ allowed: true, value: { resumed: true, run: { state: RunState.ACTIVE } } });
-    await vi.waitFor(() => expect(cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false), {
-      timeout: 10_000,
-      interval: 25,
-    });
-    return renewed.value.bindingGeneration;
-  };
-
   it("wakes the owner once, its result_submit reviews the same candidate, and the run reaches CEO review with nothing synthesized", async () => {
     await withBootstrapRuntime(async (f) => {
       const claude = claudeReviewer(f, "PASS");
@@ -439,7 +410,7 @@ describe("a frozen result whose review was unavailable gets one official retry o
     }, harnessOptions);
   });
 
-  it("an ignored retry fails explicitly and stays terminal after restart", async () => {
+  it("a second pass or a restart does not retry the same unavailable review again", async () => {
     await withBootstrapRuntime(async (f) => {
       claudeReviewer(f, "PASS");
       const { owner, runId, ownerSessionId, candidate } = await liveShape(f, { onRetry: "ignore" });
@@ -456,105 +427,11 @@ describe("a frozen result whose review was unavailable gets one official retry o
       expect(f.finishedTurns(ownerSessionId)).toBe(2);
       expect(owner.results).toHaveLength(1);
       expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, runId)).toHaveLength(1);
-      expect(resultState(f, runId)).toEqual({ state: RunState.FAILED, candidate, attempts: ["RELEASED"] });
+      expect(resultState(f, runId)).toEqual({ state: RunState.ACTIVE, candidate, attempts: ["RELEASED"] });
     }, harnessOptions);
   });
 
-  it("a completed retry stays spent across repeated owner-generation recovery", async () => {
-    await withBootstrapRuntime(async (f) => {
-      claudeReviewer(f, "PASS");
-      const { runId, ownerSessionId, roleKey, candidate } = await liveShape(f, { onRetry: "ignore" });
-      expect(f.daemon.wakeBootstrapResultRecovery().woken).toHaveLength(1);
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2), { timeout: 10_000, interval: 25 });
-      await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
-      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
-
-      let generation = await renewOwner(f, runId, ownerSessionId, roleKey, 1);
-      generation = await renewOwner(f, runId, ownerSessionId, roleKey, generation);
-      expect(generation).toBe(3);
-
-      expect(f.daemon.wakeBootstrapResultRecovery()).toEqual({ woken: [] });
-      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.FAILED);
-      expect(f.harness.cp.runs.currentCandidate(runId)).toBe(candidate);
-      expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, runId)).toHaveLength(1);
-    }, harnessOptions);
-  });
-
-  it("a restart after durable admission but before the retry turn re-presents the exact trigger", async () => {
-    await withBootstrapRuntime(async (f) => {
-      claudeReviewer(f, "PASS");
-      const { owner, runId, ownerSessionId, roleKey, planDigest, candidate, unavailableEventId } = await liveShape(f);
-      const triggerId = reviewRetryTriggerId(runId, 1, candidate, unavailableEventId);
-      // The prior daemon admitted the wake and persisted its marker, then stopped before its
-      // in-memory lane ran. The replacement runtime therefore knows only this durable record.
-      f.harness.cp.audit.record({
-        kind: BOOTSTRAP_REVIEW_RETRY_WAKE,
-        reasonCode: ReasonCode.OK,
-        runId,
-        sessionId: ownerSessionId,
-        roleKey,
-        evidence: { bindingGeneration: 1, planDigest, candidateSnapshotDigest: candidate, unavailableEventId, triggerId },
-      });
-
-      expect(f.daemon.wakeBootstrapResultRecovery()).toEqual({ woken: [] });
-      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
-      await vi.waitFor(() => expect(owner.results).toHaveLength(2), { timeout: 10_000, interval: 25 });
-      expect(owner.results.at(-1)).toMatchObject({ stage: "COMPLETED_REVIEW" });
-      await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
-      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
-      expect(f.harness.cp.audit.byKind(SESSION_WAKE_TRIGGER_COMPLETED)
-        .filter((row) => row.evidence["triggerId"] === triggerId)).toHaveLength(1);
-      expect(auditOf(f, "RUN_TRANSITION", runId).filter((row) => row.evidence["to"] === RunState.FAILED)).toEqual([]);
-    }, harnessOptions);
-  });
-
-  it("an incomplete admitted retry keeps its exact trigger after owner recovery", async () => {
-    await withBootstrapRuntime(async (f) => {
-      claudeReviewer(f, "PASS");
-      const { owner, runId, ownerSessionId, roleKey, planDigest, candidate, unavailableEventId } = await liveShape(f);
-      const triggerId = reviewRetryTriggerId(runId, 1, candidate, unavailableEventId);
-      f.harness.cp.audit.record({
-        kind: BOOTSTRAP_REVIEW_RETRY_WAKE,
-        reasonCode: ReasonCode.OK,
-        runId,
-        sessionId: ownerSessionId,
-        roleKey,
-        evidence: { bindingGeneration: 1, planDigest, candidateSnapshotDigest: candidate, unavailableEventId, triggerId },
-      });
-
-      await renewOwner(f, runId, ownerSessionId, roleKey, 1);
-      expect(f.daemon.wakeBootstrapResultRecovery()).toEqual({ woken: [] });
-      await vi.waitFor(() => expect(owner.results).toHaveLength(2), { timeout: 10_000, interval: 25 });
-      expect(owner.results.at(-1)).toMatchObject({ stage: "COMPLETED_REVIEW" });
-      await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
-      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
-      expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, runId)).toHaveLength(1);
-      expect(f.harness.cp.audit.byKind(SESSION_WAKE_TRIGGER_COMPLETED)
-        .filter((row) => row.evidence["triggerId"] === triggerId)).toHaveLength(1);
-    }, harnessOptions);
-  });
-
-  it("a failed retry work turn is released and the same trigger can complete once", async () => {
-    await withBootstrapRuntime(async (f) => {
-      claudeReviewer(f, "PASS");
-      const { owner, runId, ownerSessionId } = await liveShape(f);
-      f.claude.failNextWorkTurns = 1;
-      expect(f.daemon.wakeBootstrapResultRecovery().woken).toHaveLength(1);
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2), { timeout: 10_000, interval: 25 });
-      expect(owner.results).toHaveLength(1);
-      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
-
-      expect(f.daemon.wakeBootstrapResultRecovery()).toEqual({ woken: [] });
-      await vi.waitFor(() => expect(owner.results).toHaveLength(2), { timeout: 10_000, interval: 25 });
-      expect(owner.results.at(-1)).toMatchObject({ stage: "COMPLETED_REVIEW" });
-      await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
-      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
-      expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, runId)).toHaveLength(1);
-      expect(auditOf(f, "RUN_TRANSITION", runId).filter((row) => row.evidence["to"] === RunState.FAILED)).toEqual([]);
-    }, harnessOptions);
-  });
-
-  it("a retry whose own review is unavailable again fails instead of looping or waiting", async () => {
+  it("a retry whose own review is unavailable again is not retried in a loop", async () => {
     await withBootstrapRuntime(async (f) => {
       const claude = claudeReviewer(f, "NO_ANSWER");
       const { owner, runId, ownerSessionId } = await liveShape(f);
@@ -566,7 +443,7 @@ describe("a frozen result whose review was unavailable gets one official retry o
       expect(auditOf(f, "BLIND_REVIEW_UNAVAILABLE", runId)).toHaveLength(2);
       expect(f.daemon.wakeBootstrapResultRecovery()).toEqual({ woken: [] });
       expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, runId)).toHaveLength(1);
-      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.FAILED);
+      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
     }, harnessOptions);
   });
 });

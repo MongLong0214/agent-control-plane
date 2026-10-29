@@ -103,9 +103,7 @@ type LocalOutcome =
   | { kind: "ABSENT" }
   | { kind: "REFUSED"; decision: Decision<never> };
 
-const readLocal = async (
-  checkoutPath: string, request: Pick<ExactCommitReadRequest, "repositoryIdentity" | "commitSha" | "path">,
-): Promise<LocalOutcome> => {
+const readLocal = async (checkoutPath: string, request: ExactCommitReadRequest): Promise<LocalOutcome> => {
   const evidence = { repositoryIdentity: request.repositoryIdentity, commitSha: request.commitSha, path: request.path, readVia: "LOCAL" };
   const protectedRead = await withoutRepositoryPrograms(checkoutPath);
   const typeOf = await git(checkoutPath, [...protectedRead, "cat-file", "-t", request.commitSha], { allowFailure: true });
@@ -265,11 +263,10 @@ const reachability = async (
   return { reachable: "UNKNOWN", defaultBranchHead: head };
 };
 
-/** What every exact read checks before it reads: the commit id, the path, the registration and the identity. */
-const exactReadTarget = (
-  repositories: ExactCommitReaderPorts["repositories"],
-  request: Omit<ExactCommitReadRequest, "defaultBranch">,
-): Decision<{ checkoutPath: string; segments: string[]; owner: string; repo: string }> => {
+export const workflowDigestAtCommit = async (
+  ports: ExactCommitReaderPorts,
+  request: ExactCommitReadRequest,
+): Promise<Decision<ExactWorkflowRead>> => {
   const evidence = { repositoryIdentity: request.repositoryIdentity, commitSha: request.commitSha, path: request.path };
   if (!FULL_COMMIT_SHA.test(request.commitSha)) {
     return refused(ExactReadRefusal.COMMIT_SHA_MALFORMED, "a bound commit is a full object id: 40 lowercase hex", evidence);
@@ -278,7 +275,7 @@ const exactReadTarget = (
   if (segments === null) {
     return refused(ExactReadRefusal.PATH_MALFORMED, "a workflow path is repository-relative, of plain segments", evidence);
   }
-  const repository = repositories.byIdentity(request.repositoryIdentity);
+  const repository = ports.repositories.byIdentity(request.repositoryIdentity);
   if (!repository || repository.registration !== "REGISTERED" || repository.projectId !== request.projectId) {
     return refused(ExactReadRefusal.REPOSITORY_NOT_REGISTERED, "the bound repository is not REGISTERED in the run's project", {
       ...evidence,
@@ -291,46 +288,6 @@ const exactReadTarget = (
   if (!slug) {
     return refused(ExactReadRefusal.NOT_A_GITHUB_REPOSITORY, "the bound repository is not a GitHub repository identity", evidence);
   }
-  return allow(ReasonCode.OK, { checkoutPath: repository.checkoutPath, segments, owner: slug.owner, repo: slug.repo });
-};
-
-/** One exact read of the local checkout alone: what it read, that the object is not here, or why it refused. */
-export type LocalWorkflowRead =
-  | { status: "READ"; observedDigest: string; blobSha: string; readVia: "LOCAL" }
-  | { status: "ABSENT" }
-  | { status: "REFUSED"; reasonCode: string; refusal: string | null };
-
-const refusalOf = (decision: Decision<unknown>): LocalWorkflowRead => {
-  const refusal = decision.allowed ? undefined : decision.evidence?.["refusal"];
-  return { status: "REFUSED", reasonCode: decision.reasonCode, refusal: typeof refusal === "string" ? refusal : null };
-};
-
-/**
- * The local half of `workflowDigestAtCommit`, for a reader with no GitHub client (a candidate's freeze):
- * the same checks and the same exact read of the registered checkout, with replacement objects and
- * repository programs off. An object the checkout does not hold is ABSENT; it is not read another way.
- */
-export const workflowDigestAtCommitLocal = async (
-  repositories: ExactCommitReaderPorts["repositories"],
-  request: Omit<ExactCommitReadRequest, "defaultBranch">,
-): Promise<LocalWorkflowRead> => {
-  const target = exactReadTarget(repositories, request);
-  if (!target.allowed) return refusalOf(target);
-  const local = await readLocal(target.value.checkoutPath, request);
-  if (local.kind === "ABSENT") return { status: "ABSENT" };
-  if (local.kind === "REFUSED") return refusalOf(local.decision);
-  return { status: "READ", observedDigest: sha256(local.content), blobSha: local.blobSha, readVia: "LOCAL" };
-};
-
-export const workflowDigestAtCommit = async (
-  ports: ExactCommitReaderPorts,
-  request: ExactCommitReadRequest,
-): Promise<Decision<ExactWorkflowRead>> => {
-  const target = exactReadTarget(ports.repositories, request);
-  if (!target.allowed) return target as Decision<never>;
-  const { checkoutPath, segments, owner, repo } = target.value;
-  const repository = { checkoutPath };
-  const slug = { owner, repo };
 
   const local = await readLocal(repository.checkoutPath, request);
   if (local.kind === "REFUSED") return local.decision;
