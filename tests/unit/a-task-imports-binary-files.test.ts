@@ -13,8 +13,12 @@ import { TaskWriteTargets } from "../../src/run/task-write-target.ts";
 import { WorkerTurnEvent, WorkerTurnRunner, type WorkerTurnOptions, workerSuccessDigest } from "../../src/run/worker-turn.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeCore, tempDir } from "../helpers/fixtures.ts";
 import {
+  INERT_MARKER,
   VALID_TTF,
+  ZIP_END_OF_DIRECTORY_SIGNATURE,
+  ZIP_LOCAL_FILE_SIGNATURE,
   pngWithActivePixelBytes,
+  pngWithStoredPixels,
   pngWithIdatSuffix,
   pngWithOversizedPalette,
   pngWithPrivateAncillary,
@@ -26,6 +30,8 @@ import {
   ttfWithCompositeCycle,
   ttfWithCompositeReservedFlag,
   ttfWithConflictingOffsetFlags,
+  ttfWithExtraTable,
+  ttfWithNameStringBytes,
   ttfWithFormat4RangeOutside,
   ttfWithHiddenHmtxPayload,
   ttfWithInstructionsPastMaxp,
@@ -356,7 +362,7 @@ describe("#1232 a task imports binary files through its write target", () => {
     }
   }, 120_000);
   /** Imports one file through a worker turn and expects the whole import refused before anything is written. */
-  const expectRefusedImport = async (testCase: { name: string; path: string; bytes: Buffer }): Promise<void> => {
+  const expectRefusedImport = async (testCase: { name: string; path: string; bytes: Buffer }): Promise<Record<string, unknown>> => {
     const world = seedWorkerWorld(makeCore(), { ownedPaths: ["assets"] });
     const root = tempDir("acp-imports-");
     const imports = [entry(testCase.path, testCase.bytes)];
@@ -371,6 +377,7 @@ describe("#1232 a task imports binary files through its write target", () => {
     expect(refused.reasonCode, testCase.name).toBe("IMPORT_CONTENT_REFUSED");
     expect(JSON.stringify(refused.evidence), testCase.name).toContain(testCase.path);
     expectNothingImported(world, adapter, head);
+    return refused.evidence;
   };
 
   it("W8 top-level native/archive policy signatures and an unsupported source-path binary are refused", async () => {
@@ -440,6 +447,35 @@ describe("#1232 a task imports binary files through its write target", () => {
       kind: "data", type: "font (TrueType)",
     });
   });
+
+  it("W8c a polyglot cannot pass as font or image data: an unknown table, a zip signature inside a table or chunk and bytes after IEND are refused with the reason, nothing is written", async () => {
+    // Inert fixtures: each carries a bare signature or a marker, never an archive or a program.
+    const cases = [
+      { name: "a font with an unknown extra table", path: "assets/extra-table.ttf", bytes: ttfWithExtraTable("zzzz", INERT_MARKER), why: /TrueType table "zzzz" is not one of the standard tables/ },
+      { name: "a font with a zip signature in a name string", path: "assets/zip-in-name.ttf", bytes: ttfWithNameStringBytes(ZIP_LOCAL_FILE_SIGNATURE), why: /embedded zip archive .*signature at byte \d+/ },
+      { name: "a PNG with a zip signature in its pixel chunk", path: "assets/zip-in-idat.png", bytes: pngWithStoredPixels(Buffer.concat([ZIP_END_OF_DIRECTORY_SIGNATURE, INERT_MARKER])), why: /embedded zip archive .*signature at byte \d+/ },
+      { name: "a PNG with bytes after IEND", path: "assets/after-iend.png", bytes: Buffer.concat([validPng(), INERT_MARKER]), why: /trailing bytes/ },
+    ];
+    for (const testCase of cases) {
+      // The freeze re-checks with the same classification.
+      expect(taskImport.classifyImport(testCase.path, testCase.bytes), testCase.name).toMatchObject({ kind: "refused", why: expect.stringMatching(testCase.why) });
+      const evidence = await expectRefusedImport(testCase);
+      expect(evidence["refused"], testCase.name).toEqual([{ path: testCase.path, why: expect.stringMatching(testCase.why) }]);
+    }
+    // In isolation: the same carriers without the signature, and the clean files, are still bound as their type.
+    for (const [path, bytes, type] of [
+      ["assets/logo.png", validPng(), "PNG"],
+      ["assets/fonts/Inter.ttf", VALID_TTF, "font (TrueType)"],
+      ["assets/marker-in-name.ttf", ttfWithNameStringBytes(INERT_MARKER.subarray(0, 4)), "font (TrueType)"],
+      ["assets/marker-in-idat.png", pngWithStoredPixels(INERT_MARKER), "PNG"],
+    ] as const) {
+      expect(taskImport.classifyImport(path, bytes), path).toEqual({ kind: "data", type });
+    }
+    // A registered table the parse does not inspect is refused like an unknown one.
+    expect(taskImport.classifyImport("assets/signed.ttf", ttfWithExtraTable("DSIG", Buffer.alloc(8)))).toMatchObject({
+      kind: "refused", why: expect.stringMatching(/TrueType table "DSIG" is not one of the standard tables/),
+    });
+  }, 120_000);
 
   it("W8b a text import past the text limit derived from the patch cap is refused", async () => {
     const limits = taskImport as unknown as Record<string, unknown>;

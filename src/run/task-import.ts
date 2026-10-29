@@ -39,11 +39,14 @@ import { GIT_OUTPUT_MAX_BYTES } from "../git/git.ts";
  * What review sees depends on the content (`classifyImport`). A file git reads as text is never bound
  * by its manifest: it stays in the candidate's patch and is reviewed like any other change, so a task's
  * text imports are bounded by what that patch can carry (`IMPORT_MAX_TEXT_BYTES`). A binary file may be
- * bound by its manifest only when its exact extension and signature identify PNG or TrueType and
- * bounded selected structural checks account for every file byte. The CTO PLAN manifest authorizes the
- * exact opaque, potentially active bytes; parsing is malformed-container defense in depth, not proof
- * of passivity, non-executability or freedom from polyglots. Unknown, mismatched, malformed and
- * trailing bytes are refused; the reviewer reads the recognized, structurally checked container type.
+ * bound by its manifest only when its exact extension and signature identify PNG or TrueType, a strict
+ * parse of that format accounts for every file byte (PNG: the standard critical chunks and gAMA/sRGB,
+ * nothing after IEND; TrueType: only the standard tables the parser inspects, every byte inside one of
+ * them or its padding), and no embedded archive or executable signature appears anywhere in the bytes
+ * (`EMBEDDED_SIGNATURES`). Anything else is refused at validation and, re-checked at freeze, stays in
+ * the patch; it is never bound. The CTO PLAN manifest authorizes the exact opaque bytes; the parse and
+ * the scan are defense in depth, not proof of passivity, non-executability or freedom from polyglots.
+ * The reviewer reads the recognized container type.
  */
 
 /** One imported file: where it lands in the repository, its size in bytes and the sha256 of its bytes. */
@@ -142,6 +145,43 @@ const REFUSED_FORMATS: readonly Format[] = [
   format("cpio archive", [0, [0x71, 0xc7]]),
   format("tar archive", [257, "ustar"]),
 ];
+
+const caseVariants = (text: string): string[] =>
+  [...text].reduce<string[]>((variants, char) => variants.flatMap((prefix) => [...new Set([prefix + char.toLowerCase(), prefix + char.toUpperCase()])]), [""]);
+
+/**
+ * Signatures refused anywhere in a binary's bytes, on top of its strict parse. An interpreter given a
+ * polyglot finds what it runs on its own: Python a zip's `__main__.py` through its end-of-central-directory
+ * record, `perl -x` and `ruby -x` a line starting `#!`, PHP any `<?php` or `<?=` block. So every
+ * top-level signature above of four or more bytes, every zip record, a gzip member header, a tar header,
+ * a bzip2 block, a shebang line and a PHP open tag. Shorter top-level magics (`MZ`, `#!` mid-line,
+ * compress, binary cpio) are not scanned: two bytes recur by chance in compressed pixels and font data.
+ */
+const EMBEDDED_SIGNATURES: ReadonlyArray<{ name: string; bytes: Buffer }> = [
+  ...REFUSED_FORMATS.flatMap(({ name, signatures }) =>
+    signatures.length === 1 && signatures[0]![0] === 0 && signatures[0]![1].length >= 4 ? [{ name, bytes: signatures[0]![1] }] : []),
+  ...[[1, 2], [6, 6], [6, 7]].map(([kind, record]) => ({ name: "zip archive record", bytes: Buffer.from([0x50, 0x4b, kind!, record!]) })),
+  // RFC 1952: deflate, and the reserved flag bits a compliant reader refuses are clear.
+  ...Array.from({ length: 0x20 }, (_, flags) => ({ name: "gzip member header", bytes: Buffer.from([0x1f, 0x8b, 0x08, flags]) })),
+  ...["ustar\x00", "ustar  \x00"].map((magic) => ({ name: "tar archive header", bytes: Buffer.from(magic, "latin1") })),
+  ...[1, 2, 3, 4, 5, 6, 7, 8, 9].map((level) => ({ name: "bzip2 stream", bytes: Buffer.from(`BZh${level}1AY&SY`, "latin1") })),
+  { name: "shebang line", bytes: Buffer.from("\n#!", "latin1") },
+  ...[...caseVariants("<?php"), "<?="].map((tag) => ({ name: "PHP open tag", bytes: Buffer.from(tag, "latin1") })),
+];
+
+/** Every signature is at least three bytes; a position is compared only when its first two bytes begin one. */
+const SIGNATURE_PREFIXES = new Uint8Array(0x10000);
+for (const signature of EMBEDDED_SIGNATURES) SIGNATURE_PREFIXES[(signature.bytes[0]! << 8) | signature.bytes[1]!] = 1;
+
+/** The first embedded archive or executable signature in `bytes`, named with its offset, or null. One pass. */
+const embeddedSignature = (bytes: Buffer): string | null => {
+  for (let at = 0; at + 1 < bytes.length; at += 1) {
+    if (SIGNATURE_PREFIXES[(bytes[at]! << 8) | bytes[at + 1]!] === 0) continue;
+    const found = EMBEDDED_SIGNATURES.find((signature) => bytes.subarray(at, at + signature.bytes.length).equals(signature.bytes));
+    if (found !== undefined) return `an embedded ${found.name} signature at byte ${at}`;
+  }
+  return null;
+};
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const PNG_CRC_TABLE = Uint32Array.from({ length: 256 }, (_, index) => {
@@ -452,7 +492,37 @@ const invalidCmapFormat4 = (subtable: Buffer, glyphCount: number): string | null
   return null;
 };
 
-/** Bounded selected TrueType checks, including exact byte coverage and the admitted cmap/glyph subset. */
+/**
+ * The standard tables a TrueType import may hold: the required ones, each of which the parse below
+ * inspects. Any other table, registered or not, is bytes nothing here accounts for.
+ */
+const TRUETYPE_TABLES = ["OS/2", "cmap", "glyf", "head", "hhea", "hmtx", "loca", "maxp", "name", "post"];
+/** The exact length of each OS/2 table version. */
+const OS2_LENGTHS = new Map([[0, 78], [1, 86], [2, 96], [3, 96], [4, 96], [5, 100]]);
+
+/** A `post` table of version 1.0 or 3.0 (header only) or 2.0 whose glyph names it references exactly. */
+const invalidPost = (post: Buffer, glyphs: number): string | null => {
+  if (post.length < 32) return "the TrueType post table is truncated";
+  const version = post.readUInt32BE(0);
+  if (version === 0x00010000 || version === 0x00030000) return post.length === 32 ? null : "the TrueType post table has bytes past its header";
+  if (version !== 0x00020000) return "the TrueType post version is unsupported";
+  if (post.length < 34 || post.readUInt16BE(32) !== glyphs || 34 + glyphs * 2 > post.length) return "the TrueType post glyph-name index is invalid";
+  let names = 0;
+  for (let cursor = 34 + glyphs * 2; cursor < post.length; cursor += 1 + post[cursor]!) {
+    if (cursor + 1 + post[cursor]! > post.length) return "a TrueType post glyph name leaves its table";
+    names += 1;
+  }
+  const referenced = new Set<number>();
+  for (let glyph = 0; glyph < glyphs; glyph += 1) {
+    const index = post.readUInt16BE(34 + glyph * 2);
+    if (index < 258) continue;
+    if (index - 258 >= names) return "a TrueType post index names a missing glyph name";
+    referenced.add(index - 258);
+  }
+  return referenced.size === names ? null : "the TrueType post table holds glyph names no glyph references";
+};
+
+/** A strict TrueType parse: the standard tables only, every byte inside one or its padding, each table inspected. */
 const invalidTrueType = (bytes: Buffer): string | null => {
   if (bytes.length < 12 || bytes.readUInt32BE(0) !== 0x00010000) return "the bytes are not a TrueType sfnt";
   const count = bytes.readUInt16BE(4);
@@ -468,6 +538,7 @@ const invalidTrueType = (bytes: Buffer): string | null => {
     const tagBytes = bytes.subarray(at, at + 4);
     if (![...tagBytes].every((byte) => byte >= 0x20 && byte <= 0x7e)) return "a TrueType table tag is invalid";
     const tag = tagBytes.toString("ascii");
+    if (!TRUETYPE_TABLES.includes(tag)) return `the TrueType table "${tag}" is not one of the standard tables the parse inspects (${TRUETYPE_TABLES.join(", ")})`;
     const checksum = bytes.readUInt32BE(at + 4);
     const offset = bytes.readUInt32BE(at + 8);
     const length = bytes.readUInt32BE(at + 12);
@@ -485,15 +556,14 @@ const invalidTrueType = (bytes: Buffer): string | null => {
   }
   if (expectedOffset !== bytes.length || sfntChecksum(bytes) !== 0xb1b0afba) return "the TrueType file has trailing bytes or an invalid whole-font checksum";
   const byTag = new Map(tables.map((table) => [table.tag, table]));
-  const required = ["OS/2", "cmap", "glyf", "head", "hhea", "hmtx", "loca", "maxp", "name", "post"];
-  if (required.some((tag) => !byTag.has(tag))) return "the TrueType font lacks a required table";
+  if (TRUETYPE_TABLES.some((tag) => !byTag.has(tag))) return "the TrueType font lacks a required table";
   const head = byTag.get("head")!.bytes;
   const hhea = byTag.get("hhea")!.bytes;
   const maxp = byTag.get("maxp")!.bytes;
-  if (head.length < 54 || head.readUInt32BE(0) !== 0x00010000 || head.readUInt32BE(12) !== 0x5f0f3cf5 || head.readUInt16BE(18) < 16) return "the TrueType head table is invalid";
-  if (maxp.length < 32 || maxp.readUInt32BE(0) !== 0x00010000 || maxp.readUInt16BE(4) === 0) return "the TrueType maxp table is invalid";
+  if (head.length !== 54 || head.readUInt32BE(0) !== 0x00010000 || head.readUInt32BE(12) !== 0x5f0f3cf5 || head.readUInt16BE(18) < 16) return "the TrueType head table is invalid";
+  if (maxp.length !== 32 || maxp.readUInt32BE(0) !== 0x00010000 || maxp.readUInt16BE(4) === 0) return "the TrueType maxp table is invalid";
   const glyphs = maxp.readUInt16BE(4);
-  if (hhea.length < 36 || hhea.readUInt32BE(0) !== 0x00010000 || hhea.readUInt16BE(34) === 0 || hhea.readUInt16BE(34) > glyphs) return "the TrueType hhea table is invalid";
+  if (hhea.length !== 36 || hhea.readUInt32BE(0) !== 0x00010000 || hhea.readUInt16BE(34) === 0 || hhea.readUInt16BE(34) > glyphs) return "the TrueType hhea table is invalid";
   const longMetrics = hhea.readUInt16BE(34);
   const loca = byTag.get("loca")!.bytes;
   const glyf = byTag.get("glyf")!.bytes;
@@ -604,9 +674,10 @@ const invalidTrueType = (bytes: Buffer): string | null => {
   const nameCount = name.length >= 6 ? name.readUInt16BE(2) : 0;
   const nameRecordsEnd = 6 + nameCount * 12;
   const stringsOffset = name.length >= 6 ? name.readUInt16BE(4) : 0;
-  if (name.length < 6 || name.readUInt16BE(0) !== 0 || nameCount === 0 || nameRecordsEnd > name.length || stringsOffset < nameRecordsEnd || stringsOffset > name.length) {
+  if (name.length < 6 || name.readUInt16BE(0) !== 0 || nameCount === 0 || nameRecordsEnd > name.length || stringsOffset !== nameRecordsEnd) {
     return "the TrueType name table is invalid";
   }
+  const nameStorage = new Uint8Array(name.length - stringsOffset);
   for (let index = 0; index < nameCount; index += 1) {
     const record = 6 + index * 12;
     const stringLength = name.readUInt16BE(record + 8);
@@ -614,9 +685,12 @@ const invalidTrueType = (bytes: Buffer): string | null => {
     if (stringOffset > name.length - stringsOffset || stringLength > name.length - stringsOffset - stringOffset) {
       return "a TrueType name string leaves its table";
     }
+    nameStorage.fill(1, stringOffset, stringOffset + stringLength);
   }
-  if (byTag.get("OS/2")!.length < 78 || byTag.get("post")!.length < 32) return "a required TrueType table is truncated";
-  return null;
+  if (nameStorage.includes(0)) return "the TrueType name storage holds bytes no name record references";
+  const os2 = byTag.get("OS/2")!.bytes;
+  if (os2.length < 2 || OS2_LENGTHS.get(os2.readUInt16BE(0)) !== os2.length) return "the TrueType OS/2 table is not the exact length of its version";
+  return invalidPost(byTag.get("post")!.bytes, glyphs);
 };
 
 const validatedBinary = (path: string, bytes: Buffer): { type: string } | { why: string } => {
@@ -627,7 +701,8 @@ const validatedBinary = (path: string, bytes: Buffer): { type: string } | { why:
       ? { type: "font (TrueType)", problem: invalidTrueType(bytes) }
       : null;
   if (validation === null) return { why: "the path does not have a recognized image or font extension (.png or .ttf)" };
-  return validation.problem === null ? { type: validation.type } : { why: validation.problem };
+  const problem = validation.problem ?? embeddedSignature(bytes);
+  return problem === null ? { type: validation.type } : { why: problem };
 };
 
 /** How review can see one imported file, from its bytes and path. */
@@ -638,7 +713,8 @@ export type ImportContent =
 
 /**
  * Text (git reads it as text) is reviewed as the patch it is. Binary bytes are bound by their manifest
- * only when an exact extension/signature is recognized and selected checks account for every byte.
+ * only as a .png or .ttf whose strict parse accounts for every byte and that carries no embedded
+ * archive or executable signature.
  */
 export const classifyImport = (path: string, bytes: Buffer): ImportContent => {
   const binary = gitReadsAsBinary(bytes);
@@ -648,7 +724,7 @@ export const classifyImport = (path: string, bytes: Buffer): ImportContent => {
   const validated = validatedBinary(path, bytes);
   return "type" in validated
     ? { kind: "data", type: validated.type }
-    : { kind: "refused", why: `binary bytes do not pass the selected checks for a recognized .png/.ttf container: ${validated.why}` };
+    : { kind: "refused", why: `binary bytes are not a strictly parsed .png/.ttf free of embedded archive or executable signatures: ${validated.why}` };
 };
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
@@ -870,7 +946,7 @@ export const readStagedImports = (input: {
     return deny(ReasonCode.EVIDENCE_MISSING, "a manifest entry has no staged file; nothing is imported", { reason: "IMPORT_SOURCE_MISSING", ...named });
   }
   if (refused.length > 0) {
-    return deny(ReasonCode.IMPORT_CONTENT_REFUSED, "an import does not pass the selected checks for a recognized .png/.ttf container; nothing is imported", {
+    return deny(ReasonCode.IMPORT_CONTENT_REFUSED, "a binary import is not a strictly parsed .png/.ttf free of embedded archive or executable signatures; nothing is imported", {
       reason: "IMPORT_NOT_REVIEWABLE",
       refused: refused.slice(0, 50),
     });

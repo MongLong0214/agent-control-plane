@@ -14,7 +14,19 @@ import type * as SandboxModule from "../../src/verify/sandbox.ts";
 import type { SandboxOutcome } from "../../src/verify/sandbox.ts";
 import { cleanupTempDirs, commitAll, writeFiles } from "../helpers/fixtures.ts";
 import { bindCeo, bindWorker, fixtureManifest, makeHarness, registerFixtureProject, startWorkBranch } from "../helpers/harness.ts";
-import { pngWithActivePixelBytes, ttfWithActiveInstructions, VALID_TTF, validPng, validPngOfSize } from "../helpers/import-fixtures.ts";
+import {
+  INERT_MARKER,
+  pngWithActivePixelBytes,
+  pngWithStoredPixels,
+  ttfWithActiveInstructions,
+  ttfWithExtraTable,
+  ttfWithNameStringBytes,
+  VALID_TTF,
+  validPng,
+  validPngOfSize,
+  ZIP_END_OF_DIRECTORY_SIGNATURE,
+  ZIP_LOCAL_FILE_SIGNATURE,
+} from "../helpers/import-fixtures.ts";
 
 /**
  * #1232 — a task's imported files reach the freeze and blind review bound by their manifest, never as
@@ -247,6 +259,25 @@ describe("#1232 freeze and blind review carry a task's import manifest", () => {
       files.map((file) => [file.path, "git-binary-patch"]).sort(),
     );
   }, 120_000);
+  it("W10b the freeze re-checks each import: a font with an unknown table, a zip signature in a table or chunk and bytes after IEND stay in the patch", async () => {
+    // Inert fixtures: each carries a bare signature or a marker, never an archive or a program.
+    const files = [
+      { path: "src/extra-table.ttf", bytes: ttfWithExtraTable("zzzz", INERT_MARKER) },
+      { path: "src/zip-in-name.ttf", bytes: ttfWithNameStringBytes(ZIP_LOCAL_FILE_SIGNATURE) },
+      { path: "src/zip-in-idat.png", bytes: pngWithStoredPixels(Buffer.concat([ZIP_END_OF_DIRECTORY_SIGNATURE, INERT_MARKER])) },
+      { path: "src/after-iend.png", bytes: Buffer.concat([validPng(), INERT_MARKER]) },
+    ];
+
+    const { outcome, reviewerInput, snapshot, packet } = await reviewImports(files);
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    expect(snapshot!.repositories[0]).not.toHaveProperty("imports");
+    expect(reviewerInput).not.toContain("bytes not shown");
+    expect(packet!.inputManifest.binaryArtifacts.map((artifact) => [artifact.path, artifact.method])).toEqual(
+      files.map((file) => [file.path, "git-binary-patch"]).sort(),
+    );
+  }, 120_000);
+
   it("W11 the most text a task may import, at its worst-case patch expansion, freezes with the text in the patch", async () => {
     const limits = taskImport as unknown as Record<string, unknown>;
     expect(typeof limits["IMPORT_MAX_TEXT_BYTES"], "the text limit is exported").toBe("number");

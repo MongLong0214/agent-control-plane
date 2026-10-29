@@ -22,9 +22,9 @@ const chunk = (type: string, data: Buffer): Buffer => {
   return output;
 };
 
-const png = (compressed: Buffer, beforeData: readonly Buffer[] = []): Buffer => {
+const png = (compressed: Buffer, beforeData: readonly Buffer[] = [], width = 1): Buffer => {
   const header = Buffer.alloc(13);
-  header.writeUInt32BE(1, 0);
+  header.writeUInt32BE(width, 0);
   header.writeUInt32BE(1, 4);
   header[8] = 8;
   header[9] = 6;
@@ -43,6 +43,20 @@ export const validPng = (pixel: Buffer = Buffer.alloc(0)): Buffer => {
   const rgba = Buffer.from([0, 0, 0, 0xff]);
   pixel.copy(rgba);
   return png(deflateSync(Buffer.concat([Buffer.from([0]), rgba])));
+};
+
+/** Harmless bytes the polyglot fixtures carry where a payload would be: nothing here is an archive or a program. */
+export const INERT_MARKER = Buffer.from("ACP-INERT-TEST-MARKER", "ascii");
+/** The four-byte zip local-file and end-of-central-directory record signatures, alone. */
+export const ZIP_LOCAL_FILE_SIGNATURE = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
+export const ZIP_END_OF_DIRECTORY_SIGNATURE = Buffer.from([0x50, 0x4b, 0x05, 0x06]);
+
+/** A valid one-row RGBA PNG whose pixels are `pixels`, deflate-stored so they appear verbatim in its IDAT. */
+export const pngWithStoredPixels = (pixels: Buffer): Buffer => {
+  const width = Math.ceil(pixels.length / 4);
+  const row = Buffer.alloc(1 + width * 4);
+  pixels.copy(row, 1);
+  return png(deflateSync(row, { level: 0 }), [], width);
 };
 
 /** CRC-valid PNG whose one IDAT contains a valid stream followed by bytes the inflater may ignore. */
@@ -157,19 +171,28 @@ const repairTrueTypeChecksums = (font: Buffer, changedTag: string): Buffer => {
   return font;
 };
 
-const rebuildTrueType = (replacements: ReadonlyMap<string, Buffer>): Buffer => {
-  const count = VALID_TTF.readUInt16BE(4);
-  const tables = Array.from({ length: count }, (_, index) => {
-    const record = 12 + index * 16;
-    const tag = VALID_TTF.subarray(record, record + 4).toString("ascii");
-    const offset = VALID_TTF.readUInt32BE(record + 8);
-    const length = VALID_TTF.readUInt32BE(record + 12);
-    return { tag, bytes: Buffer.from(replacements.get(tag) ?? VALID_TTF.subarray(offset, offset + length)) };
-  });
+/** The valid font with tables replaced and others added, its directory, offsets and checksums rebuilt. */
+const rebuildTrueType = (replacements: ReadonlyMap<string, Buffer>, added: ReadonlyMap<string, Buffer> = new Map()): Buffer => {
+  const tables = [
+    ...Array.from({ length: VALID_TTF.readUInt16BE(4) }, (_, index) => {
+      const record = 12 + index * 16;
+      const tag = VALID_TTF.subarray(record, record + 4).toString("ascii");
+      const offset = VALID_TTF.readUInt32BE(record + 8);
+      const length = VALID_TTF.readUInt32BE(record + 12);
+      return { tag, bytes: Buffer.from(replacements.get(tag) ?? VALID_TTF.subarray(offset, offset + length)) };
+    }),
+    ...[...added].map(([tag, bytes]) => ({ tag, bytes: Buffer.from(bytes) })),
+  ].sort((left, right) => (left.tag < right.tag ? -1 : 1));
+  const count = tables.length;
   let size = (12 + count * 16 + 3) & ~3;
   for (const table of tables) size += (table.bytes.length + 3) & ~3;
   const font = Buffer.alloc(size);
-  VALID_TTF.copy(font, 0, 0, 12);
+  const power = 2 ** Math.floor(Math.log2(count));
+  font.writeUInt32BE(0x00010000, 0);
+  font.writeUInt16BE(count, 4);
+  font.writeUInt16BE(power * 16, 6);
+  font.writeUInt16BE(Math.log2(power), 8);
+  font.writeUInt16BE(count * 16 - power * 16, 10);
   let offset = (12 + count * 16 + 3) & ~3;
   let headOffset = 0;
   for (const [index, table] of tables.entries()) {
@@ -187,6 +210,18 @@ const rebuildTrueType = (replacements: ReadonlyMap<string, Buffer>): Buffer => {
   }
   font.writeUInt32BE((0xb1b0afba - sfntChecksum(font)) >>> 0, headOffset + 8);
   return font;
+};
+
+/** The valid font with one more, checksum-valid table under `tag` holding `data`. */
+export const ttfWithExtraTable = (tag: string, data: Buffer): Buffer => rebuildTrueType(new Map(), new Map([[tag, data]]));
+
+/** The valid font with `bytes` written over the start of its first name string, which it references. */
+export const ttfWithNameStringBytes = (bytes: Buffer): Buffer => {
+  const font = Buffer.from(VALID_TTF);
+  const name = tableRecord(font, "name");
+  if (bytes.length > font.readUInt16BE(name.offset + 6 + 8)) throw new Error("the fixture bytes exceed the first name string");
+  bytes.copy(font, name.offset + font.readUInt16BE(name.offset + 4) + font.readUInt16BE(name.offset + 6 + 10));
+  return repairTrueTypeChecksums(font, "name");
 };
 
 export const ttfWithNonzeroGlyfPadding = (): Buffer => {
@@ -407,11 +442,16 @@ const ttfWithCompositeLinks = (links: readonly number[]): Buffer => {
   const hmtxSource = tableRecord(VALID_TTF, "hmtx");
   const hmtx = Buffer.alloc(4 + (glyphCount - 1) * 2);
   VALID_TTF.copy(hmtx, 0, hmtxSource.offset, hmtxSource.offset + 4);
+  // A version 3.0 post header names no glyphs, so it holds for any glyph count.
+  const postSource = tableRecord(VALID_TTF, "post");
+  const post = Buffer.from(VALID_TTF.subarray(postSource.offset, postSource.offset + 32));
+  post.writeUInt32BE(0x00030000, 0);
   return rebuildTrueType(new Map([
     ["glyf", glyf],
     ["hmtx", hmtx],
     ["loca", loca],
     ["maxp", maxp],
+    ["post", post],
   ]));
 };
 
