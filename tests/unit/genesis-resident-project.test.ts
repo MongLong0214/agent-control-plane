@@ -223,7 +223,7 @@ describe('durable resident provisioning and retirement',() => {
     service = new ResidentProjectProvisioning(h.cp.db,h.clock,host,join(h.root,'home'),h.root);service.attachSubscriber(async () => false);
     const observed = await service.ensure(input);
     expect(service.pending()).toEqual([confirmation]);
-    expect(service.allocation(input.runId)).toEqual(allocation);
+    expect(service.allocation(input.runId)).toEqual({ ...allocation, roomLifecycle: 'created-or-unknown' });
     expect(new Set(host.allocations.map(a => a.sessionUuid)).size).toBe(1);
     expect(service.confirmedRoom(observed.allocation.roomId)).toBe(true);
     expect(observed.claimSessionId).toBeNull(); // process/RC alone never complete activation
