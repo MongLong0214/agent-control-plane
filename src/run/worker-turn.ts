@@ -16,7 +16,7 @@ import { providerHome } from "../runtime/cli-adapters.ts";
 import type { InvocationResult, ProviderAdapter } from "../runtime/provider.ts";
 import { randomUUID } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type { ExecutionRecord, TaskGraph } from "./task-graph.ts";
 import {
   TASK_BRANCH_CREATED,
@@ -877,15 +877,25 @@ export class WorkerTurnRunner {
             }
           });
       const ends = events(TASK_WORKER_GIT_GROUP_ENDED);
+      const eventWorktree = (event: Record<string, unknown> | null): string | null => {
+        const value = event?.["worktreeId"];
+        if (typeof value !== "string" || !isAbsolute(value)) return null;
+        try {
+          return canonical(value);
+        } catch {
+          return null;
+        }
+      };
       // A group ends only by its own end (its nonce and pgid); an intent with no group, by any end of its nonce.
       const groupEnded = new Set(ends.filter((end) => end?.["pgid"] != null).map((end) => `${String(end!["nonce"])}:${String(end!["pgid"])}`));
       const intentEnded = new Set(ends.map((end) => end?.["nonce"]));
       const grouped = new Set<unknown>();
       const goneGroups: Array<{ nonce: string; pgid: number }> = [];
       for (const group of events(TASK_WORKER_GIT_GROUP_STARTED)) {
-        if (group === null || typeof group["worktreeId"] !== "string" || typeof group["nonce"] !== "string") return -1;
+        const recordedWorktree = eventWorktree(group);
+        if (group === null || recordedWorktree === null || typeof group["nonce"] !== "string") return -1;
         grouped.add(group["nonce"]);
-        if (group["worktreeId"] !== worktree) continue;
+        if (recordedWorktree !== worktree) continue;
         const pgid = Number(group["pgid"]);
         if (!Number.isSafeInteger(pgid) || pgid <= 1) return -1;
         if (groupEnded.has(`${group["nonce"]}:${pgid}`)) continue;
@@ -896,8 +906,9 @@ export class WorkerTurnRunner {
       const gateless: string[] = [];
       for (const intent of events(TASK_WORKER_GIT_INTENT)) {
         const nonce = intent?.["nonce"];
-        if (typeof nonce !== "string" || typeof intent?.["worktreeId"] !== "string") return -1;
-        if (intent["worktreeId"] !== worktree || grouped.has(nonce) || intentEnded.has(nonce)) continue;
+        const recordedWorktree = eventWorktree(intent);
+        if (typeof nonce !== "string" || recordedWorktree === null) return -1;
+        if (recordedWorktree !== worktree || grouped.has(nonce) || intentEnded.has(nonce)) continue;
         gateless.push(nonce);
       }
       const waiting = gatedGitChildren(gateless);

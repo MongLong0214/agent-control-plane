@@ -1,5 +1,5 @@
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
@@ -1067,7 +1067,7 @@ describe("S2 — while any writer of the previous execution may still exist, the
     });
   });
 
-  it("a git group on record after its intent was proven gate-gone still blocks the hand-over until it is gone: an intent's end is not its group's", async () => {
+  it("a git group on record through a checkout path alias after its intent was proven gate-gone still blocks the hand-over until it is gone", async () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const s = await standardRun(f, "s2-group-after-gate-gone");
@@ -1080,7 +1080,9 @@ describe("S2 — while any writer of the previous execution may still exist, the
       await vi.waitFor(() => expect(readProcessStartToken(pgid)).not.toBeNull(), { timeout: 5_000, interval: 20 });
       // The records a runner without the round-4 re-read could leave: intent, a recovery's GATE_GONE, then its group.
       const nonce = "4f1c0b9e-6d2a-4c3b-9e8f-7a6b5c4d3e2f";
-      const base = { worktreeId: s.checkoutPath, taskId: one, nonce };
+      const alias = join(tempDir("s2-checkout-alias-"), "checkout");
+      symlinkSync(s.checkoutPath, alias, "dir");
+      const base = { worktreeId: alias, taskId: one, nonce };
       cp.audit.record({ kind: "TASK_WORKER_GIT_INTENT", runId: s.runId, evidence: base });
       cp.audit.record({ kind: "TASK_WORKER_GIT_GROUP_ENDED", runId: s.runId, evidence: { ...base, pgid: null, proven: "GATE_GONE" } });
       cp.audit.record({ kind: "TASK_WORKER_GIT_GROUP_STARTED", runId: s.runId, evidence: { ...base, pgid, leaderStartedAt: readProcessStartToken(pgid) } });
