@@ -693,7 +693,7 @@ export class WorkerTurnRunner {
         runId: facts.runId,
         sessionId: facts.worker.sessionId,
         roleKey: facts.worker.roleKey,
-        evidence: { worktreeId: worktree, taskId: facts.taskId, ...evidence } as Evidence,
+        evidence: { ...evidence, worktreeId: worktree, worktreePathKind: "CANONICAL_V1", taskId: facts.taskId } as Evidence,
       });
     children.record({
       intended: (nonce) => {
@@ -877,14 +877,13 @@ export class WorkerTurnRunner {
             }
           });
       const ends = events(TASK_WORKER_GIT_GROUP_ENDED);
-      const eventWorktree = (event: Record<string, unknown> | null): string | null => {
+      const eventWorktree = (event: Record<string, unknown> | null): "CURRENT" | "OTHER" | "AMBIGUOUS" | null => {
         const value = event?.["worktreeId"];
         if (typeof value !== "string" || !isAbsolute(value)) return null;
-        try {
-          return canonical(value);
-        } catch {
-          return null;
-        }
+        if (value === worktree) return "CURRENT";
+        const pathKind = event?.["worktreePathKind"];
+        if (pathKind === "CANONICAL_V1") return "OTHER";
+        return pathKind === undefined ? "AMBIGUOUS" : null;
       };
       // A group ends only by its own end (its nonce and pgid); an intent with no group, by any end of its nonce.
       const groupEnded = new Set(ends.filter((end) => end?.["pgid"] != null).map((end) => `${String(end!["nonce"])}:${String(end!["pgid"])}`));
@@ -895,7 +894,10 @@ export class WorkerTurnRunner {
         const recordedWorktree = eventWorktree(group);
         if (group === null || recordedWorktree === null || typeof group["nonce"] !== "string") return -1;
         grouped.add(group["nonce"]);
-        if (recordedWorktree !== worktree) continue;
+        // Older records did not attest that their path was canonical. Probe those conservatively:
+        // resolving a symlink again after the record was committed would let deletion or retargeting
+        // make a live writer disappear from this checkout's recovery.
+        if (recordedWorktree === "OTHER") continue;
         const pgid = Number(group["pgid"]);
         if (!Number.isSafeInteger(pgid) || pgid <= 1) return -1;
         if (groupEnded.has(`${group["nonce"]}:${pgid}`)) continue;
@@ -908,14 +910,18 @@ export class WorkerTurnRunner {
         const nonce = intent?.["nonce"];
         const recordedWorktree = eventWorktree(intent);
         if (typeof nonce !== "string" || recordedWorktree === null) return -1;
-        if (recordedWorktree !== worktree || grouped.has(nonce) || intentEnded.has(nonce)) continue;
+        if (recordedWorktree === "OTHER" || grouped.has(nonce) || intentEnded.has(nonce)) continue;
         gateless.push(nonce);
       }
       const waiting = gatedGitChildren(gateless);
       if (waiting === null) return -1;
       if (gateless.some((nonce) => waiting.has(nonce))) return -1;
       const record = (nonce: string, pgid: number | null, proven: string): void => {
-        this.ports.audit.record({ kind: TASK_WORKER_GIT_GROUP_ENDED, runId, evidence: { worktreeId: worktree, nonce, pgid, proven } });
+        this.ports.audit.record({
+          kind: TASK_WORKER_GIT_GROUP_ENDED,
+          runId,
+          evidence: { worktreeId: worktree, worktreePathKind: "CANONICAL_V1", nonce, pgid, proven },
+        });
       };
       for (const group of goneGroups) record(group.nonce, group.pgid, "GROUP_GONE");
       for (const nonce of gateless) record(nonce, null, "GATE_GONE");

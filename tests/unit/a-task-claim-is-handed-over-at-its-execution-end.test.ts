@@ -1,5 +1,5 @@
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
-import { chmodSync, existsSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
@@ -1067,7 +1067,75 @@ describe("S2 — while any writer of the previous execution may still exist, the
     });
   });
 
-  it("a git group on record through a checkout path alias after its intent was proven gate-gone still blocks the hand-over until it is gone", async () => {
+  it("a live gate recorded through a deleted checkout path alias still blocks the hand-over until it is gone", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s2-gate-deleted-alias");
+      const [one, two] = s.taskIds;
+      const first = await staffAndClaim(f, s, one);
+      const target = await provision(f, s, two);
+      expect(psReadable(), PS_REQUIRED).toBe(true);
+
+      const nonce = "9bd89c71-8d2d-469d-8c28-2cb6b70b13a1";
+      const gate = spawn("/bin/sh", ["-c", "IFS= read -r gate", `acp-git-${nonce}`], {
+        detached: true,
+        stdio: ["pipe", "ignore", "ignore"],
+      });
+      children.push(gate);
+      await vi.waitFor(() => expect(readProcessStartToken(gate.pid!)).not.toBeNull(), { timeout: 5_000, interval: 20 });
+
+      const alias = join(tempDir("s2-gate-alias-"), "checkout");
+      symlinkSync(s.checkoutPath, alias, "dir");
+      cp.audit.record({
+        kind: "TASK_WORKER_GIT_INTENT",
+        runId: s.runId,
+        evidence: { worktreeId: alias, taskId: one, nonce },
+      });
+      unlinkSync(alias);
+
+      const refused = await claim(f, s, target);
+      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CLAIM_WORKTREE_CONFLICT });
+      expect(statusOf(f, first.claimId)).toBe("HELD");
+
+      process.kill(gate.pid!, "SIGKILL");
+      await vi.waitFor(() => expect(alive(gate.pid!)).toBe(false), { timeout: 5_000, interval: 20 });
+      const passed = await claim(f, s, target);
+      expect(passed, "once the legacy gate is gone").toMatchObject({ ok: true });
+    });
+  });
+
+  it("a canonical event for another checkout does not block this checkout", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "s2-other-canonical-checkout");
+      const [one, two] = s.taskIds;
+      await staffAndClaim(f, s, one);
+      const target = await provision(f, s, two);
+      const group = spawn("/bin/sleep", ["600"], { detached: true, stdio: "ignore" });
+      children.push(group);
+      const pgid = group.pid!;
+      await vi.waitFor(() => expect(readProcessStartToken(pgid)).not.toBeNull(), { timeout: 5_000, interval: 20 });
+
+      const nonce = "d9dbbcb6-0ab9-424e-ae82-c62dbd9715ba";
+      const base = {
+        worktreeId: tempDir("s2-other-canonical-checkout-"),
+        worktreePathKind: "CANONICAL_V1",
+        taskId: one,
+        nonce,
+      };
+      cp.audit.record({ kind: "TASK_WORKER_GIT_INTENT", runId: s.runId, evidence: base });
+      cp.audit.record({
+        kind: "TASK_WORKER_GIT_GROUP_STARTED",
+        runId: s.runId,
+        evidence: { ...base, pgid, leaderStartedAt: readProcessStartToken(pgid) },
+      });
+
+      const passed = await claim(f, s, target);
+      expect(passed, "the attested canonical path belongs to another checkout").toMatchObject({ ok: true });
+    });
+  });
+
+  it("a git group on record through a retargeted checkout path alias still blocks the hand-over until it is gone", async () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const s = await standardRun(f, "s2-group-after-gate-gone");
@@ -1086,6 +1154,8 @@ describe("S2 — while any writer of the previous execution may still exist, the
       cp.audit.record({ kind: "TASK_WORKER_GIT_INTENT", runId: s.runId, evidence: base });
       cp.audit.record({ kind: "TASK_WORKER_GIT_GROUP_ENDED", runId: s.runId, evidence: { ...base, pgid: null, proven: "GATE_GONE" } });
       cp.audit.record({ kind: "TASK_WORKER_GIT_GROUP_STARTED", runId: s.runId, evidence: { ...base, pgid, leaderStartedAt: readProcessStartToken(pgid) } });
+      unlinkSync(alias);
+      symlinkSync(tempDir("s2-other-checkout-"), alias, "dir");
 
       const refused = await claim(f, s, target);
       expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CLAIM_WORKTREE_CONFLICT });
