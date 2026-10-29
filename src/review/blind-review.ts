@@ -74,6 +74,7 @@ import {
 } from "../snapshot/candidate-snapshot.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
+import { currentVerdictPasses, currentVerificationResults } from "../verify/verification-history.ts";
 import type { TaskContract } from "../run/run-engine.ts";
 import { bootstrapPlanTaskRecorded } from "../run/task-graph.ts";
 import { candidateEvidenceSection, readExecutionEvidence, readTrackedTree, type TrackedTreeEvidence } from "./candidate-review-evidence.ts";
@@ -2119,22 +2120,13 @@ export class BlindReviewGate {
       });
     }
 
-    const rows = this.db.all<{
-      command_id: string;
-      repository_identity: string;
-      source: string;
-      exact_head: string;
-      status: string;
-    }>(
-      `SELECT command_id, repository_identity, source, exact_head, status
-         FROM verification_results WHERE run_id = ? AND candidate_snapshot_digest = ?`,
-      [request.runId, snapshotDigest],
-    );
+    // #1258 — each input's current execution only; its earlier executions stay in the history.
+    const rows = currentVerificationResults(this.db, request.runId, snapshotDigest);
     const reported = new Set(
       report.results.map((result) => `${result.commandId}\u0000${result.repositoryIdentity}\u0000${result.source}\u0000${result.exactHead}`),
     );
     const corroborated = rows.length >= report.expectedInputs && rows.every((row) =>
-      row.status === "PASS" && reported.has(`${row.command_id}\u0000${row.repository_identity}\u0000${row.source}\u0000${row.exact_head}`),
+      currentVerdictPasses(row) && reported.has(`${row.command_id}\u0000${row.repository_identity}\u0000${row.source}\u0000${row.exact_head}`),
     );
     if (!corroborated || report.observedInputs !== report.expectedInputs || report.results.length < report.expectedInputs) {
       return deny(ReasonCode.EVIDENCE_MISSING, "passing verification report lacks corroborating result rows", {
