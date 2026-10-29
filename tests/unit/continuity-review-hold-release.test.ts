@@ -1041,6 +1041,8 @@ describe("#1189 — a wait continuity placed for the CEO is handed back once the
         candidateSnapshotDigest: ready.candidate,
         ceoSessionId: f.ceoSessionId,
         rationale: "the owner decides",
+        ownerReason: "DIRECTION_CHANGE_OUTSIDE_CONTRACT",
+        blockedAction: "activate the bootstrapped project",
       });
       expect(decided, JSON.stringify(decided)).toMatchObject({ ok: true, value: { state: RunState.AWAITING_HUMAN } });
       const count = transitions(f, ready.runId).length;
