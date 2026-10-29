@@ -179,7 +179,6 @@ const LATER_OBJECTS: ReadonlyArray<{ version: number; objects?: readonly string[
       "bootstrap_applications.retired_at",
     ],
   },
-  { version: 53, columns: ["verification_results.attempt"] },
   { version: 47, objects: ["run_artifacts_owner_decision_authority_guard"] },
   {
     version: 48,

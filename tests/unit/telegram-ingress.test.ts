@@ -912,8 +912,6 @@ describe("Telegram production ingress", () => {
       candidateSnapshotDigest: driven.candidateSnapshotDigest,
       ceoSessionId: ceo!.sessionId,
       rationale: "owner must decide on the production candidate",
-      ownerReason: "IRREVERSIBLE_PRODUCTION_ACTION",
-      blockedAction: "merge the production candidate",
     });
     expect(parked.allowed).toBe(true);
 
@@ -2886,8 +2884,6 @@ describe("Telegram production ingress", () => {
       candidateSnapshotDigest: driven.candidateSnapshotDigest,
       ceoSessionId: ceo!.sessionId,
       rationale: "the configured owner must approve the production scope",
-      ownerReason: "IRREVERSIBLE_PRODUCTION_ACTION",
-      blockedAction: "merge the production candidate",
     });
     expect(parked.allowed).toBe(true);
     expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.AWAITING_HUMAN);
