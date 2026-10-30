@@ -144,13 +144,20 @@ try {
   const buzz = (args, keyFile) => json('buzz',args,{env:buzzEnv(keyFile)});
   const pub = () => getPublicKey(Buffer.from(readFileSync(a.privateKeyFile,'utf8').trim(),'hex'));
   const pubFile = ceoSigner ? null : a.privateKeyFile.replace(/\.priv$/,'.pub');
-  // The rooms under `name` that `pk` owns: how ensure-buzz finds the room it created, and retirement an unrecorded one.
-  // Asked as the key in `keyFile`: this identity's path, or a key of this run moved aside with its records (#1251 C6).
-  const ownedRooms = (name, pk, keyFile) => {
+  // The active rooms under `name` for which `holds(roomId)`, asked as the key in `keyFile`: this identity's path, or a key
+  // of this run moved aside with its records (#1251 C6).
+  const roomsUnder = (name, keyFile, holds) => {
     const channels = buzz(['channels','search','--query',name,'--exact'],keyFile);
     check(Array.isArray(channels),'invalid channel search');
-    return channels.filter(c => c.name === name && buzz(['channels','members','--channel',c.channel_id ?? c.id],keyFile).some(m => m.pubkey === pk && m.role === 'owner'));
+    return channels.filter(c => c.name === name && holds(c.channel_id ?? c.id));
   };
+  const memberOf = (room, keyFile, member) => buzz(['channels','members','--channel',room],keyFile).some(member);
+  // The rooms under `name` that `pk` owns: how ensure-buzz finds the room it created.
+  const ownedRooms = (name, pk, keyFile) => roomsUnder(name,keyFile,room => memberOf(room,keyFile,m => m.pubkey === pk && m.role === 'owner'));
+  // #1251 C8 — retirement's view of the rooms a key of this run may have left active: the room recorded for it, and every
+  // active room under its name that key is in, as owner or any other role. A key that lost ownership proves nothing about
+  // the room's archive; only no active room here settles it.
+  const activeRooms = (name, pk, keyFile, recorded) => roomsUnder(name,keyFile,room => room === recorded || memberOf(room,keyFile,m => m.pubkey === pk));
   const rosterFile = join(home,'.hermes','bridge','required-mentions.json');
   // Mirror canonical_roster.py's version-specific room rules before publishing a roster.
   const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -259,7 +266,7 @@ try {
   const refuseWithOrder = (why, ...steps) => {throw new RetirementOrderRefusal(why,[...steps,rerun]);};
   // #1251 C-P2 — an `unbound` allocation: ensure-buzz stopped before the daemon recorded the room it verified, so the
   // allocation's room id is a placeholder that names no room. Retirement takes the room ensure-buzz itself would find:
-  // this run's room intent, else the one room under the intended name this run's key owns. With this run's key and no
+  // this run's room intent, else the one active room under the intended name this run's key is in, as owner or not (C8). With this run's key and no
   // such room there is none: the intent is written before any creation, and only this key creates the room. Once this
   // run's retirement has finished, its identity has been moved aside (retire's last host step), and the room it settled
   // is the one that identity's intent names. `record` is the room id the unfinished intent never received.
@@ -285,8 +292,8 @@ try {
       return [{dir,pubkey,intent:ofThisRun(records[1],pubkey) ? records[1] : null,keyFile:key === pubkey ? keyFile : null}];
     });
   };
-  // The active rooms an intent's own key owns under its name; null when that key is not here to look with.
-  const roomsOf = m => m.keyFile === null ? null : ownedRooms(m.intent.name,m.pubkey,m.keyFile).map(room => room.channel_id ?? room.id);
+  // The active rooms of an intent (activeRooms, with its own key); null when that key is not here to look with.
+  const roomsOf = m => m.keyFile === null ? null : activeRooms(m.intent.name,m.pubkey,m.keyFile,m.intent.roomId).map(room => room.channel_id ?? room.id);
   // Before retirement settles its own room, each earlier key of this run moved aside with its intent settles the room it
   // may have created: without that key, or with that room still active, retirement refuses before any host write.
   // `settled(m)` holds for the intent whose room retirement settles itself.
@@ -297,7 +304,7 @@ try {
       const rooms = roomsOf(m);
       if (rooms === null) refuseWithOrder(`this run's earlier key (pubkey ${m.pubkey}), moved aside to ${m.dir} with the intent of a Buzz room named ${m.intent.name}, is not there to find that room with`,
         `put the key this run minted (pubkey ${m.pubkey}) in ${m.dir} as ${basename(a.privateKeyFile)}; retirement looks for that room with it`);
-      if (rooms.length) refuseWithOrder(`this run's earlier key (pubkey ${m.pubkey}), moved aside to ${m.dir}, owns Buzz room${rooms.length > 1 ? 's' : ''} ${rooms.join(', ')}`,
+      if (rooms.length) refuseWithOrder(`this run's earlier key (pubkey ${m.pubkey}), moved aside to ${m.dir}, finds active Buzz room${rooms.length > 1 ? 's' : ''} ${rooms.join(', ')}`,
         ...rooms.map(room => `have an owner archive room ${room} (buzz channels archive --channel ${room})`));
     }
   };
@@ -310,8 +317,8 @@ try {
       const intent = existsSync(intentFile) ? read(intentFile) : null;
       if (ofThisRun(intent,pk) && typeof intent.roomId === 'string') return {pk,roomId:intent.roomId,record:null};
       const name = ofThisRun(intent,pk) ? intent.name : a.roomName ?? a.projectId;
-      const owned = ownedRooms(name,pk).map(room => room.channel_id ?? room.id);
-      if (owned.length > 1) refuseWithOrder(`the Buzz room of ${a.projectId} was never recorded, and ${a.identityName} (${pk}) owns ${owned.length} rooms named ${name}: ${owned.join(', ')}`,
+      const owned = activeRooms(name,pk).map(room => room.channel_id ?? room.id);
+      if (owned.length > 1) refuseWithOrder(`the Buzz room of ${a.projectId} was never recorded, and ${a.identityName} (${pk}) is in ${owned.length} active rooms named ${name}: ${owned.join(', ')}`,
         `have an owner archive all but one of rooms ${owned.join(', ')} (buzz channels archive --channel <room>); retirement archives the one left`);
       if (owned.length === 0) return {pk,roomId:null,record:null};
       check(/^[a-f0-9-]{36}$/.test(owned[0]),'unrecorded room identity');
@@ -326,7 +333,7 @@ try {
     for (const m of intents.filter(m => typeof m.intent.roomId !== 'string')) {
       const rooms = roomsOf(m);
       if (rooms === null) refuseWithOrder(`the Buzz room of ${a.projectId} was never recorded, and the key this run created it with (pubkey ${m.pubkey}) is not ${m.dir === null ? `at ${a.privateKeyFile}` : `in ${m.dir}`} to find it with`,...steps(m));
-      if (rooms.length) refuseWithOrder(`the Buzz room of ${a.projectId} was never recorded, and this run's key moved aside to ${m.dir} (pubkey ${m.pubkey}) owns room${rooms.length > 1 ? 's' : ''} ${rooms.join(', ')}`,...steps(m));
+      if (rooms.length) refuseWithOrder(`the Buzz room of ${a.projectId} was never recorded, and this run's key moved aside to ${m.dir} (pubkey ${m.pubkey}) finds active room${rooms.length > 1 ? 's' : ''} ${rooms.join(', ')}`,...steps(m));
     }
     const recorded = intents.find(m => typeof m.intent.roomId === 'string');
     if (recorded) return {pk:null,roomId:recorded.intent.roomId,record:null,missing:{pubkey:recorded.pubkey,steps:steps(recorded)}};

@@ -999,7 +999,38 @@ it('#1251 C6: an intent of this run moved aside with its key is looked up with t
   expect(fakeState(f)).toMatchObject({room:null,archivedRooms:[expect.objectContaining({channel_id:room,archived:true})]});
 });
 
-it('#1251 C7: a room this run created before a retry bound its replacement keeps retirement from archiving only the replacement',async () => {
+it.each(['in place','moved aside'] as const)('#1251 C8: a room of this run whose key was demoted to member keeps an unbound retirement from settling no room (%s)',async where => {
+  const {f,pubFile,room,ownPk,retiredDir,identity} = await lostCreate();
+  // Another owner joins the room this run created, and this run's key is demoted to member: the room is still active.
+  patchFake(f,{members:[{pubkey:'c'.repeat(64),role:'owner'},{pubkey:ownPk,role:'member'}]});
+  if (where === 'moved aside') {
+    // As in C6: a later run's ensure-buzz moves this run's whole identity aside and stops, leaving its own key at the path.
+    f.a.runId = 'run_next';writeFileSync(join(f.home,'fail-buzz'),'');
+    await expect(f.invoke('ensure-buzz')).rejects.toThrow();
+    rmSync(join(f.home,'fail-buzz'));
+  }
+  f.a.runId = 'run_test';f.a.roomLifecycle = 'unbound';saveAllocation(f);
+  const snapshot = () => ({fake:fakeState(f),clone:existsSync(f.a.clonePath),moved:existsSync(retiredDir) ? readdirSync(retiredDir,{recursive:true}).sort() : [],
+    files:[f.a.privateKeyFile,...identity].map(file => existsSync(file) ? readFileSync(file,'utf8') : null)});
+  if (where === 'moved aside') {
+    const dir = join(retiredDir,readdirSync(retiredDir)[0]!);const nextPk = readFileSync(pubFile,'utf8').trim();
+    await refusesUnchanged(f,[
+      `move the key at ${f.a.privateKeyFile} (pubkey ${nextPk}) aside: this run did not mint it and the roster binds it to no active route of test`,
+      `put this run's identity back from ${dir}: its cto-test.priv and cto-test.pub in ${dirname(f.a.privateKeyFile)}, its buzz-key-test.json and buzz-room-test.json in ${f.state}`,
+    ],snapshot);
+    renameSync(f.a.privateKeyFile,join(f.home,'next.priv'));renameSync(pubFile,join(f.home,'next.pub'));
+    for (const file of [f.a.privateKeyFile,...identity]) renameSync(join(dir,basename(file)),file);
+  }
+  // With this run's key at the path, retirement finds the room and, not owning it, names the owner archive step.
+  const host = await refusesUnchanged(f,[`have an owner archive room ${room} (buzz channels archive --channel ${room}), or make ${ownPk} an owner of it`],snapshot);
+  // Once an owner archives it, no active room of this run is left and retirement completes.
+  patchFake(f,{room:null,members:[],archivedRooms:[{...(fakeState(f).room as Record<string,unknown>),archived:true}]});
+  expect(await host.invoke('retire',f.a)).toMatchObject({retired:true});
+  expect(fakeState(f)).toMatchObject({room:null,archivedRooms:[expect.objectContaining({channel_id:room,archived:true})]});
+});
+
+// #1251 C8 — with the earlier key demoted to member under another owner, its room is as active and refused the same way.
+it.each(['owner','member'] as const)('#1251 C7: a room this run created before a retry bound its replacement keeps retirement from archiving only the replacement (earlier key %s)',async role => {
   const f = fixture();
   const root = realpathSync(tempDir('retire-replaced-'));
   const h = makeHarness({root,residentProvisioner:{home:f.home,script:daemonHost(f)}});
@@ -1041,6 +1072,7 @@ it('#1251 C7: a room this run created before a retry bound its replacement keeps
     await refuses([`put the key this run minted (pubkey ${firstPk}) in ${dir} as cto-test.priv; retirement looks for that room with it`]);
     // With that key back it finds the earlier room still active: refused, naming the owner archive step.
     renameSync(join(f.home,'lost.priv'),join(dir,'cto-test.priv'));
+    if (role === 'member') patchFake(f,{otherRooms:(fakeState(f).otherRooms as {room:unknown}[]).map(o => ({...o,members:[{pubkey:'c'.repeat(64),role:'owner'},{pubkey:firstPk,role:'member'}]}))});
     await refuses([`have an owner archive room ${first} (buzz channels archive --channel ${first})`]);
     // Once an owner archives it, retirement archives the replacement room and leaves no room of this run active.
     const kept = (fakeState(f).otherRooms as {room:Record<string,unknown>}[])[0]!.room;
