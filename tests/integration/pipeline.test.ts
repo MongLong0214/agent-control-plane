@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { digestOf } from "../../src/core/digest.ts";
 import { ExecutionMode, RunState, TaskState } from "../../src/domain/types.ts";
 import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
@@ -480,6 +481,9 @@ describe("one safe project run, end to end", () => {
           projectContext: false,
           withheld: [],
           binaryArtifacts: [],
+          reviewPolicies: [],
+          reviewerPromptDigests: [digestOf("review prompt")],
+          reviewerInputRepresentations: ["stdin"],
         },
         coveredRepositories: [identity],
         coveredFiles: [`${identity}:src/app.js`],

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { Clock } from "../core/clock.ts";
+import { reviewerTransportInput } from "./cli-adapters.ts";
 import type {
   CapacityReading,
   InvocationRequest,
@@ -8,6 +9,7 @@ import type {
   ProviderAdapter,
   SessionHandle,
   SessionSpec,
+  TransmittedInput,
 } from "./provider.ts";
 import { extractJson } from "./provider.ts";
 
@@ -103,6 +105,15 @@ export class ScriptedAdapter implements ProviderAdapter {
     if (!handle || handle.provider !== this.provider) return;
     this.#knownSessions.delete(handle.externalSessionId);
     this.#sessionHealth.delete(handle.externalSessionId);
+  }
+
+  /**
+   * A scripted reviewer is handed the request in process and transmits nothing. It declares the one
+   * joined string the preferred (Codex) reviewer receives on stdin, so a scenario's packet digests the
+   * system instructions and the prompt together, as a real review's does.
+   */
+  transmittedReviewerInput(request: Pick<InvocationRequest, "systemPrompt" | "prompt">): TransmittedInput {
+    return { argv: [], stdin: reviewerTransportInput(request) };
   }
 
   async invoke(request: InvocationRequest): Promise<InvocationResult> {

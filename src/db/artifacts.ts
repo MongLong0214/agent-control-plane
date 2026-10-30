@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import type { Clock } from "../core/clock.ts";
 import type { AcpLocations } from "../core/credential-shapes.ts";
-import { canonicalJson, digestOf, isDigest } from "../core/digest.ts";
+import { canonicalJson, digestOf, isDigest, sha256 } from "../core/digest.ts";
 import { newArtifactId } from "../core/ids.ts";
 import { fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -75,6 +75,37 @@ export const ownerDecideAgainEvidence = (items: readonly string[]): { decideAgai
   decideAgain: [...items],
   remedy: "NEW_OWNER_DECISION",
 });
+
+/**
+ * Whether a repository REVIEW.md's decoded content declares anything (#1274). The content keeps a
+ * leading byte-order mark so it hashes to the policy digest; a file that is only that mark is as
+ * empty as a zero-byte one. Review collection refuses such a file and the BLIND_REVIEW schema
+ * refuses such content, both through this one rule.
+ */
+export const reviewPolicyDeclaresContent = (content: string): boolean => content.replace(/^\uFEFF/, "") !== "";
+
+/**
+ * A REVIEW.md blob's text: UTF-8 decoded byte for byte, a leading byte-order mark kept (the default
+ * decoder drops it), so the text is exactly the bytes the policy digest hashes. Throws on bytes that
+ * are not UTF-8 (#1274).
+ */
+export const reviewPolicyText = (bytes: Uint8Array): string =>
+  new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+
+/**
+ * Whether a review policy's bytes are the ones its digest hashes and its text reads (#1274). The bytes
+ * are stored because `canonicalJson` normalizes line endings in every stored string. They are numbers,
+ * not text, so no credential shape is relaxed for them; requiring them to decode to `content`, which is
+ * checked against every shape, keeps them from carrying anything the checked text does not.
+ */
+const reviewPolicyBytesAgree = (policy: { digest: string; content: string; contentBytes: number[] }): boolean => {
+  const bytes = Buffer.from(policy.contentBytes);
+  try {
+    return sha256(bytes) === policy.digest && reviewPolicyText(bytes) === policy.content;
+  } catch {
+    return false;
+  }
+};
 
 /**
  * The only secret in this module. It is never exported and never stored on a token, so the
@@ -724,6 +755,21 @@ const blindReviewEvidenceSchema = z
             })
             .strict(),
         ),
+        reviewPolicies: z.array(
+          z
+            .object({
+              repository: z.string().min(1),
+              path: z.literal("REVIEW.md"),
+              revision: z.string().regex(/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/),
+              digest: DIGEST_SCHEMA,
+              content: z.string().max(16_384).refine(reviewPolicyDeclaresContent),
+              contentBytes: z.array(z.number().int().min(0).max(255)).max(16_384),
+            })
+            .strict()
+            .refine(reviewPolicyBytesAgree),
+        ),
+        reviewerPromptDigests: z.array(DIGEST_SCHEMA).min(1),
+        reviewerInputRepresentations: z.array(z.string().min(1)).min(1),
       })
       .strict(),
     coveredRepositories: z.array(z.string()),
