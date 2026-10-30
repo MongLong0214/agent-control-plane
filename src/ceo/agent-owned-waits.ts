@@ -7,7 +7,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { OWNERLESS_STALL_OWED, OWNERLESS_STALL_ROUTED, type WatchdogStall } from "../doctor/watchdog.ts";
 import { ArtifactKind, Role, RunState, roleKeyFor, type RoleBinding, type RunRow } from "../domain/types.ts";
-import { MessageKind } from "../outbox/envelope.ts";
+import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -415,8 +415,7 @@ export class AgentOwnedWaits {
         episode: stall.since,
         runId: stall.runId,
         since: stall.since,
-        owner: this.#stallOwner(stall),
-        recoveryAction: route.recoveryAction,
+        ...(this.#holderClaimedStall(stall) ?? { owner: this.#stallOwner(stall), recoveryAction: route.recoveryAction }),
         blocker,
         effects: route.effects,
         deliveryTimeout: stall.kind === "outbox",
@@ -496,6 +495,40 @@ export class AgentOwnedWaits {
       runId: stall.runId,
       evidence: { source: "WATCHDOG", kind: stall.kind, target: stall.id, since: stall.since, ...outcome },
     });
+  }
+
+  /**
+   * A stalled message of a holder-claimed kind (`HOLDER_CLAIMED_KINDS`) is never pushed: the delivery pass
+   * does not pick it up and a delivery retry cannot deliver it, so its recovery is its receiving session's
+   * claim. It names the session and binding generation the row is addressed to, and whether that session is
+   * live. Null for any other stall, which keeps its route's recovery.
+   */
+  #holderClaimedStall(stall: WatchdogStall): Pick<OwnerlessStall, "owner" | "recoveryAction"> | null {
+    if (stall.kind !== "outbox" || !(HOLDER_CLAIMED_KINDS as ReadonlySet<string>).has(stall.messageKind ?? "")) return null;
+    const row = this.ports.db.get<{ role_key: string; binding_generation: number; target_session_id: string; lifecycle: string | null }>(
+      `SELECT o.role_key, o.binding_generation, o.target_session_id, s.lifecycle
+         FROM outbox o LEFT JOIN sessions s ON s.session_id = o.target_session_id
+        WHERE o.message_id = ?`,
+      [stall.id],
+    );
+    const role = row?.role_key ?? stall.roleKey ?? null;
+    const claim = `the receiving session claims it (role_owner_message_claim); if its relay or attachment is gone, ` +
+      `it reconnects and then claims it. A ${stall.messageKind} is delivered only by its holder's claim, never by the ` +
+      `delivery pass, so a delivery retry cannot deliver it; a delivery timeout does not fail the run`;
+    if (!row) return { owner: { role, sessionId: null, generation: null }, recoveryAction: `${claim}. Its row is no longer readable` };
+    const current = this.ports.bindings.active(row.role_key);
+    const isCurrent = current?.bindingGeneration === row.binding_generation && current.sessionId === row.target_session_id;
+    const ready = row.lifecycle === "READY" || row.lifecycle === "DRAINING";
+    const liveness = ready && isCurrent
+      ? `live (${row.lifecycle}, the role's current binding)`
+      : `not live (session ${row.lifecycle ?? "unknown"}; ${current
+        ? `the role's current binding is generation ${current.bindingGeneration}, session ${current.sessionId}`
+        : "the role has no current binding"})`;
+    return {
+      owner: { role: row.role_key, sessionId: row.target_session_id, generation: row.binding_generation },
+      recoveryAction: `${claim}. It is addressed to session ${row.target_session_id} at binding generation ` +
+        `${row.binding_generation} of ${row.role_key}, which is ${liveness}`,
+    };
   }
 
   #stallOwner(stall: WatchdogStall): OwnerlessStall["owner"] {
