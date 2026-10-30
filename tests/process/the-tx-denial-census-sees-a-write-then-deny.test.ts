@@ -105,6 +105,11 @@ const DOOR_R1_TEST = "tests/unit/ceo-escalation-resolve-door-r1.test.ts";
 
 const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string; witnesses?: RollbackWitness[] }> = [
   {
+    label: "deliverIncident",
+    file: "ceo/ceo-incident-notices.ts",
+    anchor: "export const deliverIncident = (ports: NoticePorts, incident: Incident): Decision<NoticeDelivery> =>\n  ports.db.txDecision(() => {",
+  },
+  {
     label: "acknowledgeCeoNotification",
     file: "outbox/ceo-notification-ack.ts",
     anchor: "): Decision<AckResult> => source.db.txDecision(() => {",

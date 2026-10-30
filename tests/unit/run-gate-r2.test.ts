@@ -145,6 +145,8 @@ const evidenceReadyRun = async (
       verificationEvidence: true,
       projectContext: true,
       binaryArtifacts: [],
+      reviewPolicies: [],
+      reviewerPromptDigests: [digestOf("review prompt")],
       withheld: [],
     },
     coveredRepositories: [repository.identity],
@@ -693,6 +695,8 @@ describe("round-2 run and production-gate regressions", () => {
       candidateSnapshotDigest: fixture.digest,
       ceoSessionId: fixture.ceoSessionId,
       rationale: "owner must decide",
+      ownerReason: "IRREVERSIBLE_PRODUCTION_ACTION",
+      blockedAction: "merge the candidate to production",
     });
     expect(requested.allowed).toBe(true);
     expect(fixture.harness.cp.runs.require(fixture.runId).state).toBe(RunState.AWAITING_HUMAN);

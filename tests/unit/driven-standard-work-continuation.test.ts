@@ -654,6 +654,39 @@ describe("witness 2 — a run stopped after its PLAN is woken once for the same 
     });
   });
 
+  it("#1189 B12 — the blocker nobody watched reaches the CEO once, as CRITICAL_SYSTEM_FAILURE naming its owner, recovery action and blocker", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { runId, sessionId, roleKey, taskId } = await stalledAfterPlan(f, "std-route", "ignore");
+      const turns = f.finishedTurns(sessionId);
+      const critical = () => f.harness.cp.outbox.listByRun(runId).filter((message) =>
+        message.kind === MessageKind.CEO_NOTIFICATION &&
+        (message.payload as Record<string, unknown>)["notification"] === "CRITICAL_SYSTEM_FAILURE");
+      expect(f.daemon.wakeStandardWorkContinuation().woken).toHaveLength(1);
+      await f.awaitFinishedTurns(sessionId, turns + 1);
+      await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(sessionId)).toBe(false), { timeout: 10_000, interval: 25 });
+      expect(critical()).toEqual([]);
+      expect(f.daemon.wakeStandardWorkContinuation().stalled).toHaveLength(1);
+      expect(critical()).toHaveLength(1);
+      expect(critical()[0]).toMatchObject({
+        targetSessionId: f.harness.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId,
+        payload: {
+          stall: "standard_work_continuation",
+          owner: { role: roleKey, sessionId, generation: 1 },
+          recoveryAction: expect.stringContaining("cto_replace"),
+          blocker: expect.stringContaining(taskId),
+          effects: "NONE_STARTED",
+          checkBeforeRerun: false,
+          productFailure: false,
+        },
+      });
+      expect(f.daemon.wakeStandardWorkContinuation()).toEqual(nothing);
+      expect(f.daemon.wakeStandardWorkContinuation()).toEqual(nothing);
+      expect(critical()).toHaveLength(1);
+      expect(f.finishedTurns(sessionId)).toBe(turns + 1);
+      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
+    });
+  });
+
   it("through the daemon's own scheduling: startup and watchdog ticks wake it exactly once and record one blocker; a restarted daemon wakes nothing", async () => {
     await withBootstrapRuntime(async (f) => {
       const { runId, sessionId } = await stalledAfterPlan(f, "std-ticks", "ignore");

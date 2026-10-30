@@ -144,6 +144,9 @@ const DENY_PATTERN =
  * owning same-file definition; `label` is the stable operator-facing identity printed below.
  */
 const EXPECTED_CONVERTED_SITES = [
+  // A CEO incident notice's enqueue is atomic with its delivery record and rolls back on denial; every
+  // stall router (the watchdog's, the agent-owned waits', the ownerless stalls') delivers through it.
+  { file: "ceo/ceo-incident-notices.ts", symbol: "deliverIncident", label: "deliverIncident", evidence: "direct" },
   // The receipt transition and audit must both roll back if the audit refuses.
   { file: "outbox/ceo-notification-ack.ts", symbol: "acknowledgeCeoNotification", label: "acknowledgeCeoNotification", evidence: "direct" },
   // The selected artifact must roll back if its attachment audit refuses, preserving the prior selection.

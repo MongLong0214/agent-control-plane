@@ -871,9 +871,13 @@ export class Doctor {
       blocking: false,
       confidence: "HIGH",
       observedEvidence: { projectId: run.projectId, state: run.state, cause: run.cause },
-      recommendedAction: run.cause === "CONFIRMED_WITHOUT_GRANT"
-        ? "this run was confirmed without an activation grant and cannot complete; the CTO cancels it and creates a new CONTRACT_CHANGE run whose PLAN carries the manifest, and its artifacts are kept"
-        : "this run's PLAN carries no manifest, so it can never be confirmed; the CTO submits a PLAN carrying the manifest or cancels and re-creates the run, and its artifacts are kept",
+      // #1189 — the daemon routes this run to the CEO (CRITICAL_SYSTEM_FAILURE) with the action its state allows.
+      recommendedAction: run.cause !== "CONFIRMED_WITHOUT_GRANT"
+        ? "this run's PLAN carries no manifest, so it can never be confirmed; the CEO, notified with CRITICAL_SYSTEM_FAILURE, cancels it and creates a new CONTRACT_CHANGE run whose PLAN carries the manifest, or its CTO submits such a PLAN, and its artifacts are kept"
+        : run.state === RunState.MERGING || run.state === RunState.POST_MERGE_VERIFYING
+          // A finalizing CONTRACT_CHANGE refuses every other one of its project (CONTRACT_CHANGE_FINALIZATION_OVERLAP).
+          ? `this run was confirmed without an activation grant and cannot complete, and while it is ${run.state} every other CONTRACT_CHANGE of its project is refused at finalization; no action within existing authority unblocks it: it needs an exit transition from ${run.state} (pending), and the CEO is notified with CRITICAL_SYSTEM_FAILURE; the run and its artifacts are kept as recorded`
+          : "this run was confirmed without an activation grant and cannot complete; the CEO, notified with CRITICAL_SYSTEM_FAILURE, creates a new CONTRACT_CHANGE run whose PLAN carries the manifest, and this run and its artifacts are kept as recorded (no cancel edge leaves a confirmed run)",
     }));
   }
 
