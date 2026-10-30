@@ -2712,6 +2712,8 @@ export class Daemon {
       `SELECT event_id, kind, json_extract(evidence_json, '$.candidateSnapshotDigest') AS candidate
          FROM audit_events
         WHERE run_id = ? AND kind IN ('BLIND_REVIEW_UNAVAILABLE', 'BLIND_REVIEW_COMPLETED', 'BLIND_REVIEW_REJECTED')
+          -- An attempt that no longer held the run recorded its late failure as its own history only.
+          AND NOT (kind = 'BLIND_REVIEW_UNAVAILABLE' AND json_extract(evidence_json, '$.attemptHeld') IS 0)
         ORDER BY event_id DESC
         LIMIT 1`,
       [runId],

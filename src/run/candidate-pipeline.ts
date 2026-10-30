@@ -918,17 +918,6 @@ export class CandidatePipeline {
   ): Promise<Decision<PipelineOutcome> | null> {
     if (reviewed.allowed) return null;
     const runId = input.runId;
-    // A submission whose attempt no longer holds the run applies no outcome: not here, and not after
-    // the await below, where what it writes is written only in a transaction that holds it.
-    if (reviewed.reasonCode === ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE || !this.attemptHolds(input, attemptId)) {
-      return this.attemptLost(runId, attemptId, snapshotDigest, reviewed);
-    }
-    // §18.7 is an assurance decision too. Re-evaluate continuity before deciding
-    // whether a provider/isolation failure waits or moves the system into SURVIVAL.
-    if (this.#continuity?.evaluate) await this.#continuity.evaluate("blind-review-unavailable");
-    // #246 C2, review round 2 (RF-REVIEW-02) — the review and the evaluation above were awaited, and
-    // a bootstrap PLAN replaced during either makes this outcome stale: no revision request and no
-    // unavailable-review record is produced for it. Nothing below awaits before either is written.
     // §18.7 — only a reviewer *verdict* enters the CTO revision loop. A lost isolation
     // or a provider that never answered is an assurance failure the candidate cannot
     // repair, so the gate is neither lowered nor handed to the CTO to "fix".
@@ -936,6 +925,19 @@ export class CandidatePipeline {
       reviewed.reasonCode === ReasonCode.REVIEW_REVISE ||
       reviewed.reasonCode === ReasonCode.REVIEW_BLOCK ||
       reviewed.reasonCode === ReasonCode.REVIEW_OMITTED_ITEMS_PRESENT;
+    // A submission whose attempt no longer holds the run applies no outcome: not the gate's refusal for a
+    // lost lease, not a verdict, and nothing after the await below unless a transaction that holds it
+    // writes it. Its assurance failure is still that attempt's own history (#1189 R1-01), below.
+    if (reviewed.reasonCode === ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE) return this.attemptLost(runId, attemptId, snapshotDigest, reviewed);
+    const held = this.attemptHolds(input, attemptId);
+    if (!held && isVerdict) return this.attemptLost(runId, attemptId, snapshotDigest, reviewed);
+    // §18.7 is an assurance decision too. Re-evaluate continuity before deciding
+    // whether a provider/isolation failure waits or moves the system into SURVIVAL. A stale attempt's
+    // failure moves nothing, so it is not asked.
+    if (held && this.#continuity?.evaluate) await this.#continuity.evaluate("blind-review-unavailable");
+    // #246 C2, review round 2 (RF-REVIEW-02) — the review and the evaluation above were awaited, and
+    // a bootstrap PLAN replaced during either makes this outcome stale: no revision request and no
+    // unavailable-review record is produced for it. Nothing below awaits before either is written.
     const current = stillCurrent(isVerdict);
     if (!current.allowed) {
       this.recordStaleAfterReview(runId, snapshotDigest, attemptId, "AFTER_REVIEW", current, reviewed);
@@ -944,16 +946,27 @@ export class CandidatePipeline {
     }
 
     if (!isVerdict) {
-      const recorded = this.applyHolding(input, attemptId, () => {
+      const recordUnavailable = (attemptHeld: boolean): void => {
         this.audit.record({
           kind: "BLIND_REVIEW_UNAVAILABLE",
           runId,
           reasonCode: reviewed.reasonCode,
-          evidence: unavailableReviewEvidence(snapshotDigest, reviewed.evidence, attemptId),
+          evidence: {
+            ...unavailableReviewEvidence(snapshotDigest, reviewed.evidence, attemptId),
+            ...(attemptHeld ? {} : { attemptHeld: false }),
+          },
         });
-        return allow(ReasonCode.OK, undefined);
-      });
-      if (recorded === null) return this.attemptLost(runId, attemptId, snapshotDigest, reviewed);
+      };
+      const recorded = held
+        ? this.applyHolding(input, attemptId, () => {
+            recordUnavailable(true);
+            return allow(ReasonCode.OK, undefined);
+          })
+        : null;
+      // #1189 R1-01 — an attempt that no longer holds the run keeps its failure as its own history: the
+      // row names its attempt and says it did not hold the run, so it is never the run's current outcome
+      // and never the cause of a review retry (`Daemon.#bootstrapReviewRetry`).
+      if (recorded === null) recordUnavailable(false);
       return allow(ReasonCode.OK, {
         stage: "REVIEW_UNAVAILABLE",
         reasonCode: reviewed.reasonCode,

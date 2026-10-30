@@ -9,14 +9,16 @@ import { parseVerificationCommand } from "../../src/contracts/verification-comma
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ArtifactKind, ExecutionMode, RunKind, RunState, type RunRow } from "../../src/domain/types.ts";
+import { Daemon } from "../../src/daemon/daemon.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { progressNotifier } from "../../src/mcp/shared.ts";
 import type { InvocationRequest, InvocationResult } from "../../src/runtime/provider.ts";
+import { BOOTSTRAP_REVIEW_RETRY_WAKE } from "../../src/runtime/provisioned-session-runtime.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { runSandboxed } from "../../src/verify/sandbox.ts";
 import { bootstrapCoverageKeys, submitBootstrapPlan } from "../helpers/bootstrap-plan.ts";
 import { WORKFLOW, WORKFLOW_PATH } from "../helpers/contract-change.ts";
-import { cleanupTempDirs, commitAll, gitSync, makeRepo, writeFiles } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, gitSync, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { createRun, firstManifest, firstPlan, operatorRegisteredProject, revisionsFor } from "../helpers/first-activation.ts";
 import { genesisPlanFixture } from "../helpers/genesis-github.ts";
 import {
@@ -353,6 +355,45 @@ describe("work an attempt started stops when ACP releases it, and what comes bac
       expect(reclaimed(h, runId)).toEqual([]);
     },
   );
+});
+
+describe("a late failure of an attempt that no longer holds the run is that attempt's history only", () => {
+  it("it names its attempt and says so, and it wakes no review retry after the current attempt's revision", async () => {
+    const { h, run, runId } = await bootstrapPlanRun();
+    h.scripted.reset();
+    h.scripted.script({ match: /Bootstrap plan review/, text: reviewerRevise(bootstrapCoverageKeys(h, runId), "a finding"), once: false });
+    let entered!: () => void;
+    const reviewing = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const invoke = h.scripted.invoke.bind(h.scripted);
+    let calls = 0;
+    h.scripted.invoke = async (request: InvocationRequest): Promise<InvocationResult> => {
+      if (/Bootstrap plan review/.test(request.prompt) && ++calls === 1) {
+        entered();
+        await held;
+      }
+      return invoke(request);
+    };
+    // The first attempt's review outlasts its lease; a second attempt is returned for revision; then the first ends.
+    const first = h.cp.pipeline.submitResult(submission(run));
+    await reviewing;
+    h.clock.advance(31 * MINUTE);
+    const second = await h.cp.pipeline.submitResult(submission(run));
+    release();
+    const late = await first;
+
+    expect(second).toMatchObject({ allowed: true, value: { stage: "REVISION_REQUIRED" } });
+    expect(late).toMatchObject({ allowed: true, value: { stage: "REVIEW_UNAVAILABLE" } });
+    const reclaimedAttempt = reclaimed(h, runId)[0]!.evidence["attemptId"];
+    const history = h.cp.audit.forRun(runId).filter((row) => row.kind === "BLIND_REVIEW_UNAVAILABLE");
+    expect(history).toHaveLength(1);
+    expect(history[0]!.evidence).toMatchObject({ attemptId: reclaimedAttempt, attemptHeld: false });
+    expect(h.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
+    const report = new Daemon(h.cp, { stateDir: tempDir("acp-late-history-") }).wakeBootstrapResultRecovery();
+    expect(report.woken.filter((woken) => "retry" in woken)).toEqual([]);
+    expect(h.cp.audit.byKind(BOOTSTRAP_REVIEW_RETRY_WAKE).filter((row) => row.runId === runId)).toEqual([]);
+  });
 });
 
 /** A dispatched no-repository CONTRACT_CHANGE (a first activation) with its PLAN, and a passing reviewer for it. */
