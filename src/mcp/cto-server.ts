@@ -46,6 +46,7 @@ import {
   type AuthenticatedMcpPeer,
   type McpMutationSource,
   type McpPeerAuthenticator,
+  progressNotifier,
   respond,
   type ToolResult,
 } from "./shared.ts";
@@ -517,6 +518,7 @@ const createCtoServerFromPort = (
     args: Record<string, unknown> & { idempotencyKey: string },
     execute: (peer: AuthenticatedMcpPeer) => Promise<ToolResult> | ToolResult,
     authority: (peer: AuthenticatedMcpPeer) => Decision<Record<string, unknown>> = () => allow(ReasonCode.OK, {}),
+    answersInFlight = false,
   ) => guarded(async () => {
     const peer = peerFor(toolName);
     return peer.allowed
@@ -525,6 +527,7 @@ const createCtoServerFromPort = (
             const current = peerFor(toolName);
             return current.allowed ? authority(current.value) : current;
           },
+          ...(answersInFlight ? { answersInFlight } : {}),
         })
       : respond(peer);
   });
@@ -534,6 +537,7 @@ const createCtoServerFromPort = (
     toolName: string,
     args: Record<string, unknown> & { idempotencyKey: string; runId: string },
     execute: (peer: AuthenticatedMcpPeer, owner: { sessionId: string; bindingGeneration: number; roleKey: string }) => Promise<ToolResult> | ToolResult,
+    answersInFlight = false,
   ) => {
     let current!: { sessionId: string; bindingGeneration: number; roleKey: string };
     return write(toolName, args, peer => execute(peer, current), peer => {
@@ -550,7 +554,7 @@ const createCtoServerFromPort = (
         }
       }
       return fenced;
-    });
+    }, answersInFlight);
   };
   const primary = (peer: AuthenticatedMcpPeer, projectId: string): Decision<Record<string, unknown>> => {
     if (!peer.sessionId || !peer.sessionIncarnation) return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP peer is missing a session incarnation");
@@ -847,10 +851,13 @@ const createCtoServerFromPort = (
   server.registerTool(
     "result_submit",
     { description: "Submit a candidate for automatic verification and blind review.", inputSchema: { ...mutation, ...runIdentity, resultSummary: z.string(), recommendation: z.string(), residualRisk: z.array(z.string()).default([]), runScopedCommands: z.array(z.record(z.unknown())).default([]) } },
-    async (args) => writeOwned("result_submit", args, async (peer, fenced) => {
+    // A long review: each real step renews the submission's lease and, when the caller asked with a
+    // progressToken, is a progress notice to it; a replay of its key while it runs is answered as in flight.
+    async (args, extra) => writeOwned("result_submit", args, async (peer, fenced) => {
       const commands = args.runScopedCommands.map((command) => parseVerificationCommand(command));
-      return respond(await port.submitResult({ runId: args.runId, ownerSessionId: fenced.sessionId, ownerBindingGeneration: fenced.bindingGeneration, resultSummary: args.resultSummary, recommendation: args.recommendation, residualRisk: args.residualRisk, ...(commands.length === 0 ? {} : { runScopedCommands: commands }) }));
-    }),
+      const onProgress = progressNotifier(extra);
+      return respond(await port.submitResult({ runId: args.runId, ownerSessionId: fenced.sessionId, ownerBindingGeneration: fenced.bindingGeneration, resultSummary: args.resultSummary, recommendation: args.recommendation, residualRisk: args.residualRisk, ...(commands.length === 0 ? {} : { runScopedCommands: commands }), ...(onProgress === undefined ? {} : { onProgress }) }));
+    }, true),
   );
   server.registerTool(
     "escalation_open",
