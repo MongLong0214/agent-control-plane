@@ -63,9 +63,9 @@ const FONT = VALID_TTF;
 /** The manifest entry the reviewer reads for a bound import. */
 const manifestLine = (entry: { path: string; size: number; sha256: string }, type: string): string => `${entry.path}: ${type}, ${entry.size} bytes, ${entry.sha256}`;
 
-const prepareRun = async () => {
+const prepareRun = async (base: Record<string, string> = {}) => {
   const harness = makeHarness();
-  writeFiles(harness.repoPath, { "package.json": PACKAGE_JSON });
+  writeFiles(harness.repoPath, { "package.json": PACKAGE_JSON, ...base });
   const baseHead = commitAll(harness.repoPath, "base with config files");
   const command = { ...fixtureManifest("x").verificationCommands[0]!, id: "test", argv: ["npm", "test"], cwd: "." };
   const { projectId, repositoryId, identity } = await registerFixtureProject(harness, "fixture-project", {
@@ -84,13 +84,24 @@ const prepareRun = async () => {
 
 interface Imported { path: string; bytes: Buffer }
 
+interface ReviewOptions {
+  freezeOnly?: boolean;
+  /** Files the base commit already holds, such as an existing `.gitattributes` rule. */
+  base?: Record<string, string>;
+  /** Files the worker itself writes besides `src/app.js`; they are not imports. */
+  worker?: readonly Imported[];
+  /** The registered checkout's own `git config` settings, each `[key, value]`. */
+  config?: ReadonlyArray<readonly [string, string]>;
+}
+
 /**
  * One task's worker turn as it finishes: the worker's change and the imported files committed on the
  * work branch, and the SUCCEEDED receipt whose resultDigest binds the import manifest. Then the run's
  * result is submitted: freeze, verification and blind review, with a reviewer that passes everything.
  */
-const reviewImports = async (files: readonly Imported[], options: { freezeOnly?: boolean } = {}) => {
-  const { harness, run, repositoryId, identity, baseHead } = await prepareRun();
+const reviewImports = async (files: readonly Imported[], options: ReviewOptions = {}) => {
+  const { harness, run, repositoryId, identity, baseHead } = await prepareRun(options.base);
+  for (const [key, value] of options.config ?? []) execFileSync("git", ["-C", harness.repoPath, "config", key, value], { timeout: 30_000 });
   const submitted = harness.cp.tasks.submit(run.runId, [{ key: "import", title: "import", category: "implementation" }]);
   if (!submitted.allowed) throw new Error(submitted.message);
   const taskId = harness.cp.tasks.ready(run.runId).find((task) => task.title === "import")!.taskId;
@@ -102,7 +113,7 @@ const reviewImports = async (files: readonly Imported[], options: { freezeOnly?:
 
   startWorkBranch(harness.repoPath);
   writeFiles(harness.repoPath, { "src/app.js": APP_BYTES });
-  for (const file of files) {
+  for (const file of [...files, ...(options.worker ?? [])]) {
     mkdirSync(dirname(join(harness.repoPath, file.path)), { recursive: true });
     writeFileSync(join(harness.repoPath, file.path), file.bytes);
   }
@@ -116,12 +127,13 @@ const reviewImports = async (files: readonly Imported[], options: { freezeOnly?:
   const head = execFileSync("git", ["-C", harness.repoPath, "rev-parse", "HEAD"], { timeout: 30_000, encoding: "utf8" }).trim();
 
   const imports = [...files].sort((a, b) => (a.path < b.path ? -1 : 1)).map((file) => ({ path: file.path, size: file.bytes.length, sha256: sha256(file.bytes) }));
-  const parsed = parseImportManifest(imports, ["src"]);
-  if (!parsed.allowed) throw new Error(`the manifest is not one validation accepts: ${parsed.message}`);
-  const changed = [{ path: "src/app.js", sha256: sha256(APP_BYTES) }, ...imports.map((entry) => ({ path: entry.path, sha256: entry.sha256 }))];
+  const parsed = files.length === 0 ? null : parseImportManifest(imports, ["src"]);
+  if (parsed !== null && !parsed.allowed) throw new Error(`the manifest is not one validation accepts: ${parsed.message}`);
+  const changed = [{ path: "src/app.js", sha256: sha256(APP_BYTES) }, ...[...imports, ...(options.worker ?? []).map((file) => ({ path: file.path, sha256: sha256(file.bytes) }))]
+    .map((entry) => ({ path: entry.path, sha256: entry.sha256 }))];
   const diffDigest = workerDiffDigest(baseHead, changed.map((entry) => ({ ...entry, mode: "100644" as const, blob: null })));
   const inputs = { executionId, workerSessionId: worker, sessionIncarnation: "incarnation-1", providerSessionId: "provider-session-1",
-    exitCode: 0, stdoutSha256: sha256("worker stdout"), commitHead: head, diffDigest, imports } as WorkerSuccessDigestInputs;
+    exitCode: 0, stdoutSha256: sha256("worker stdout"), commitHead: head, diffDigest, ...(files.length === 0 ? {} : { imports }) } as WorkerSuccessDigestInputs;
   const resultDigest = workerSuccessDigest(inputs);
   const recorded = harness.cp.audit.record({ kind: WorkerTurnEvent.SUCCEEDED, runId: run.runId,
     evidence: { ...inputs, resultDigest, taskId, head: baseHead, paths: changed.map((entry) => entry.path) } });
@@ -371,4 +383,45 @@ describe("#1232 freeze and blind review carry a task's import manifest", () => {
     expect(snapshot!.repositories[0]!.touchedPaths).toContain("src/generated/blank-lines.txt");
     expect(snapshot!.repositories[0]).not.toHaveProperty("imports");
   }, 300_000);
+
+  it("W12 an imported text file under an existing `-diff` rule reaches the reviewer as its readable content, not a binary patch (review lane-e-fs-r6 P1)", async () => {
+    // The reviewer's repro: only the inert marker, imported at a path the base's attributes mark `-diff`.
+    const files = [{ path: "src/inert.js", bytes: Buffer.from(`${INERT_MARKER.toString("ascii")}\n`) }];
+
+    const { outcome, reviewerInput, snapshot, packet } = await reviewImports(files, { base: { ".gitattributes": "src/inert.js -diff\n" } });
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    expect(reviewerInput).toContain(`+${INERT_MARKER.toString("ascii")}`);
+    expect(reviewerInput).not.toContain("GIT binary patch");
+    // Text: neither bound nor refused, and no path of the packet is a binary artifact.
+    expect(snapshot!.repositories[0]).not.toHaveProperty("imports");
+    expect(snapshot!.repositories[0]).not.toHaveProperty("refusedImports");
+    expect(packet!.inputManifest.binaryArtifacts).toEqual([]);
+  }, 120_000);
+
+  it("W12b a worker's text files under `-diff`, `binary` and a binary `diff=<driver>` reach the reviewer as text, added or modified; binary content under `-diff` stays its binary patch (review lane-e-fs-r6 P1, sibling)", async () => {
+    const marker = INERT_MARKER.toString("ascii");
+    const worker = [
+      { path: "src/worker-diff.js", bytes: Buffer.from(`${marker} under -diff\n`) },
+      { path: "src/worker-binary.txt", bytes: Buffer.from(`${marker} under binary\n`) },
+      { path: "src/worker-driver.txt", bytes: Buffer.from(`${marker} under a binary driver\n`) },
+      { path: "src/legacy.js", bytes: Buffer.from(`legacy line one\n${marker} replaces line two\n`) },
+      // Inert binary content: the marker and NUL bytes.
+      { path: "src/tool.bin", bytes: Buffer.concat([INERT_MARKER, Buffer.alloc(16, 0x00)]) },
+    ];
+    const base = {
+      ".gitattributes": "src/worker-diff.js -diff\nsrc/worker-binary.txt binary\nsrc/worker-driver.txt diff=acpbinary\nsrc/legacy.js -diff\nsrc/tool.bin -diff\n",
+      "src/legacy.js": "legacy line one\nlegacy line two\n",
+    };
+
+    const { outcome, reviewerInput, packet, identity } = await reviewImports([], { base, worker, config: [["diff.acpbinary.binary", "true"]] });
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    for (const file of worker.slice(0, 3)) expect(reviewerInput, file.path).toContain(`+${file.bytes.toString("ascii").trimEnd()}`);
+    expect(reviewerInput).toContain(`-legacy line two`);
+    expect(reviewerInput).toContain(`+${marker} replaces line two`);
+    // Only the binary content is a binary patch.
+    expect(packet!.inputManifest.binaryArtifacts.map(({ repository, path, method }) => ({ repository, path, method })))
+      .toEqual([{ repository: identity, path: "src/tool.bin", method: "git-binary-patch" }]);
+  }, 120_000);
 });

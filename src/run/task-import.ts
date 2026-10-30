@@ -17,7 +17,7 @@ import { inflateSync } from "node:zlib";
 import { sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { GIT_OUTPUT_MAX_BYTES } from "../git/git.ts";
+import { GIT_OUTPUT_MAX_BYTES, gitReadsAsBinary } from "../git/git.ts";
 
 /**
  * #1232 — files the CTO imports into a STANDARD_WORK task's write target.
@@ -87,17 +87,12 @@ const TEXT_PATCH_HEADER_BYTES = 3 * IMPORT_PATH_MAX_CHARS + 256;
  * patch (were every byte a newline, each would become `+\n`) plus its header, and the candidate's whole
  * patch is read through the git wrapper, which hands back at most `GIT_OUTPUT_MAX_BYTES`. One task's
  * text imports may take half of that; the other half is left to everything else the candidate changes.
- * Review carries any text the patch carries, chunked and range-split.
+ * Review carries any text the patch carries, chunked and range-split. A text file is one git's own
+ * content check reads as text (`gitReadsAsBinary`), and the patch shows it as text whatever the
+ * repository's attributes say (`diffPatch`), so a `-diff` or `binary` rule does not turn it into a
+ * binary patch the reviewer cannot read (review lane-e-fs-r6 P1).
  */
 export const IMPORT_MAX_TEXT_BYTES = Math.floor((GIT_OUTPUT_MAX_BYTES / 2 - IMPORT_MAX_FILES * TEXT_PATCH_HEADER_BYTES) / 2);
-
-/**
- * Git's own text/binary decision on content (`buffer_is_binary` in git's xdiff-interface.c): a NUL byte
- * within the first 8000 bytes makes a blob binary. The freeze also asks git for its decision on each
- * path, attributes included (`binaryPaths`), before it binds anything.
- */
-const GIT_BINARY_PROBE_BYTES = 8000;
-export const gitReadsAsBinary = (bytes: Buffer): boolean => bytes.subarray(0, GIT_BINARY_PROBE_BYTES).includes(0);
 
 interface Format {
   name: string;
