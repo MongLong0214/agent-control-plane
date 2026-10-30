@@ -7,6 +7,8 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { allow } from "../../src/core/errors.ts";
+import { sha256 } from "../../src/core/digest.ts";
+import { attachBootstrapPlan } from "../../src/bootstrap/bootstrap-plan-artifact.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 
@@ -18,7 +20,7 @@ import { residentRepositories } from "../../src/registry/resident-repositories.t
 import { ArtifactKind, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { HostObservation, HostOperation, HostProjectProvisioner } from "../../src/runtime/host-project-provisioner.ts";
 import type { ACPBootstrapActivationResult } from "../../src/bootstrap/activation.ts";
-import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, seedRun, tempDir } from "../helpers/fixtures.ts";
 import { callCtoTool } from "../helpers/cto-tool.ts";
 import { GenesisGitHub, genesisPlanFixture } from "../helpers/genesis-github.ts";
 import { reviewBootstrapPlan } from "../helpers/bootstrap-plan.ts";
@@ -151,6 +153,18 @@ const hermesTool = async (h: Harness, name: string, args: Record<string, unknown
 };
 
 const runCount = (h: Harness): number => h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM runs`)!.n;
+
+/** `bootstrap_plan_stage` arguments for `runId`: the genesis PLAN, bound to that run's contract. */
+const stageArgs = (h: Harness, runId: string, f: ReturnType<typeof genesisPlanFixture>) => {
+  const run = h.cp.runs.require(runId);
+  const plan = { ...f.artifact.content, requestDigest: run.contractDigest };
+  const planBody = JSON.stringify({ runId, plan, tasks: [{ key: "create", title: "Create repository", category: "implementation" }] });
+  return {
+    idempotencyKey: `stage-${runId}`, runId, planBody, expectedSha256: sha256(planBody), contractDigest: run.contractDigest!,
+    bootstrapOperationId: f.artifact.content.bootstrapOperationId as string, projectId: f.manifest.projectId,
+    repositoryIdentity: f.manifest.repositories[0]!.remote,
+  };
+};
 
 describe("PROJECT_BOOTSTRAP adopting an existing canonical CTO", () => {
   it("completes on the existing conversation: no BOOTSTRAP_CTO, no resident, binding and Buzz route preserved, the new repository linked by its node id", async () => {
@@ -423,6 +437,87 @@ describe("PROJECT_BOOTSTRAP adopting an existing canonical CTO", () => {
     expect(passed.allowed).toBe(false);
     expect(passed.evidence["incomplete"]).toEqual(["handoffAck"]);
     expect(h.cp.projects.require(projectId).activeManifestDigest).toBe(manifestDigest(f.manifest));
+  });
+
+  it("the adopted owner stages its PLAN after dispatch; the CEO attaches that candidate and the owner submits it", async () => {
+    const { h } = adoptionHarness();
+    const f = genesisPlanFixture();
+    const projectId = f.manifest.projectId;
+    const adopted = await adoptExistingConversation(h, { projectId, pid: process.pid, callerPid: 900_009, buzzActorId: "3".repeat(64) });
+    const created = createAdopting(h, { projectId, sessionId: adopted.sessionId, bindingGeneration: 1 });
+    if (!created.allowed) throw new Error(created.message);
+    const runId = created.value.runId;
+    const dispatched = await h.cp.runs.dispatch(runId);
+    expect(dispatched.allowed, JSON.stringify(dispatched)).toBe(true);
+    bindCeo(h);
+
+    const args = stageArgs(h, runId, f);
+    const session = h.cp.sessions.require(adopted.sessionId);
+    const owner = { sessionId: session.sessionId, incarnation: session.incarnation };
+    const staged = await callCtoTool(h, owner, "bootstrap_plan_stage", args);
+    const stagedBy = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+    expect(staged, JSON.stringify(staged)).toMatchObject({ ok: true, value: { digest: args.expectedSha256, stagedBy } });
+    expect(h.cp.audit.forRun(runId).filter((row) => row.kind === "BOOTSTRAP_PLAN_STAGED").map((row) => [row.roleKey, row.sessionId]))
+      .toEqual([[stagedBy, adopted.sessionId]]);
+
+    const ceo = h.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    const attached = attachBootstrapPlan(h.cp, { actor: ceo.sessionId, sessionId: ceo.sessionId, sessionIncarnation: ceo.sessionIncarnation },
+      { principal: "owner", peerGrant: null }, { ...args, planBody: undefined, stagedBy });
+    expect(attached, JSON.stringify(attached)).toMatchObject({ allowed: true, value: { digest: args.expectedSha256 } });
+    const submitted = await callCtoTool(h, owner, "plan_submit", { idempotencyKey: "adopted-plan-submit", runId, bootstrapPlanDigest: args.expectedSha256 });
+    expect(submitted, JSON.stringify(submitted)).toMatchObject({ ok: true, value: { digest: args.expectedSha256 } });
+    expect(h.cp.artifacts.latest(runId, ArtifactKind.PLAN)).not.toBeNull();
+    expect(h.cp.bindings.history(roleKeyFor(Role.BOOTSTRAP_CTO, { runId }))).toEqual([]);
+  });
+
+  it("refuses PLAN staging for an adopting run by a non-adopted PRIMARY_CTO, on a stale generation, and by another project's owner", async () => {
+    const { h } = adoptionHarness();
+    const f = genesisPlanFixture();
+    const projectId = f.manifest.projectId;
+    const adopted = await adoptExistingConversation(h, { projectId, pid: process.pid, callerPid: 900_010, buzzActorId: "5".repeat(64) });
+    const other = await adoptExistingConversation(h, { projectId: "project-other", pid: process.ppid, callerPid: 900_011, buzzActorId: "6".repeat(64) });
+    const created = createAdopting(h, { projectId, sessionId: adopted.sessionId, bindingGeneration: 1 });
+    if (!created.allowed) throw new Error(created.message);
+    const runId = created.value.runId;
+    expect((await h.cp.runs.dispatch(runId)).allowed).toBe(true);
+    const ordinary = seedRun({ db: h.cp.db, clock: h.clock, repoPath: h.repoPath, claim: false });
+    let calls = 0;
+    const stageAs = (sessionId: string, args: Record<string, unknown>, binding?: { roleKey: string; bindingGeneration: number }) =>
+      callCtoTool(h, { sessionId, incarnation: h.cp.sessions.require(sessionId).incarnation, ...(binding ? { binding } : {}) },
+        "bootstrap_plan_stage", { ...args, idempotencyKey: `refused-stage-${++calls}` });
+    const args = stageArgs(h, runId, f);
+
+    // Another project's adopted canonical CTO, and an ordinary (non-adopted) PRIMARY_CTO.
+    const notOwner = { ok: false, reasonCode: "MCP_PEER_UNAUTHENTICATED", evidence: { refusal: "ADOPTION_STAGER_NOT_OWNER" } };
+    expect(await stageAs(other.sessionId, args)).toMatchObject(notOwner);
+    expect(await stageAs(ordinary.sessionId, args, { roleKey: ordinary.roleKey, bindingGeneration: ordinary.generation })).toMatchObject(notOwner);
+    const unrecorded = { ok: false, reasonCode: "MCP_PEER_UNAUTHENTICATED", message: "staging requires a project-less bootstrap run with its current run-scoped owner" };
+
+    // A PRIMARY_CTO pinned as the owner of a bootstrap created without the adoption: the label alone admits nothing.
+    const plain = h.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: "STANDARD", contract });
+    if (!plain.allowed) throw new Error(plain.message);
+    const held = h.cp.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId }))!;
+    h.cp.db.run(`UPDATE runs SET owner_role_key = ?, owner_session_id = ?, owner_session_incarnation = ?, owner_binding_generation = ? WHERE run_id = ?`,
+      [held.roleKey, held.sessionId, held.sessionIncarnation, held.bindingGeneration, plain.value.runId]);
+    expect(await stageAs(adopted.sessionId, stageArgs(h, plain.value.runId, f))).toMatchObject(unrecorded);
+
+    // The adopted binding moves to generation 2: neither generation stages for the run pinned at 1,
+    // and a pin moved to 2 without ACP's adoption record (which names 1) is refused as well.
+    h.cp.db.run(`UPDATE assignments SET status = 'REVOKED', revoked_at = ?, revoked_reason = 'test' WHERE assignment_id = ?`,
+      [h.clock.nowIso(), held.assignmentId]);
+    const moved = h.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId, sessionId: adopted.sessionId });
+    if (!moved.allowed) throw new Error(moved.message);
+    expect(moved.value.bindingGeneration).toBe(2);
+    expect(await stageAs(adopted.sessionId, args, { roleKey: held.roleKey, bindingGeneration: 2 }))
+      .toMatchObject({ ok: false, reasonCode: "BINDING_GENERATION_STALE" });
+    expect(await stageAs(adopted.sessionId, args, { roleKey: held.roleKey, bindingGeneration: 1 }))
+      .toMatchObject({ ok: false, reasonCode: "BINDING_GENERATION_STALE" });
+    h.cp.db.run(`UPDATE runs SET owner_binding_generation = 2 WHERE run_id = ?`, [runId]);
+    expect(await stageAs(adopted.sessionId, args, { roleKey: held.roleKey, bindingGeneration: 2 })).toMatchObject(unrecorded);
+
+    expect(h.cp.artifacts.list(runId, ArtifactKind.HANDOFF)).toEqual([]);
+    expect(h.cp.artifacts.list(plain.value.runId, ArtifactKind.HANDOFF)).toEqual([]);
+    expect(h.cp.audit.byKind("BOOTSTRAP_PLAN_STAGED")).toEqual([]);
   });
 
   it("a bootstrap created without the input still staffs its own BOOTSTRAP_CTO, exactly as before", async () => {
