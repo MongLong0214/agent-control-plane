@@ -808,4 +808,111 @@ describe("a same-key CONFIRM replay of a resumable bootstrap refusal answers fro
     expect(produce).toHaveBeenCalledTimes(1);
     expect(storedResult(wired, "p2-conflict")).toEqual(stored);
   });
+
+  /** A refusal as the runner records it on the application. */
+  const recordOf = (refusal: typeof resumableRefusal): Record<string, unknown> => refusal.allowed ? {} : {
+    stage: refusal.evidence["stage"],
+    reasonCode: refusal.reasonCode,
+    message: refusal.message,
+    evidence: refusal.evidence,
+  };
+
+  /**
+   * The door's CONFIRM as the runner answers it before any GitHub write: the reservation with its first
+   * attempt, the resumable refusal recorded on the application, and that refusal as the answer.
+   */
+  const confirmReservedResumable = async (wired: Wired, key: string) => {
+    const applications = wired.harness.cp.bootstrapApplications;
+    const produce = vi.spyOn(wired.harness.cp.bootstrapProducer, "produceAndActivateApproved").mockImplementationOnce(async () => {
+      const reserved = applications.reserve({
+        runId: wired.runId,
+        projectId: wired.manifest.projectId,
+        repositoryIdentity: IDENTITY,
+        bootstrapOperationId: "p2-operation",
+        planDigest: wired.planDigest,
+        manifestDigest: digestOf(wired.manifest),
+        plannedOutputsDigest: digestOf("p2-outputs"),
+        candidateSnapshotDigest: wired.snapshotDigest,
+        reviewDigest: digestOf("p2-review"),
+        approvalDigest: digestOf("p2-approval"),
+      }, { writer: null });
+      if (!reserved.allowed) throw new Error(reserved.message);
+      applications.recordRefusal(wired.runId, recordOf(resumableRefusal));
+      return resumableRefusal;
+    });
+    const first = await door(wired, key);
+    expect(first.structuredContent).toMatchObject({ ok: false, evidence: { refusal: "GENESIS_POST_MERGE_CI_PENDING", resumable: true } });
+    expect(applications.get(wired.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+    return { produce, applications };
+  };
+
+  it("F1: a newer refusal stays the answer after a later attempt has started", async () => {
+    const wired = await wire("p2-replay-later-attempt");
+    const { produce, applications } = await confirmReservedResumable(wired, "p2-later-attempt");
+    // The daemon's re-drive: attempt 2 is refused by GitHub, and attempt 3 has started with no answer yet.
+    expect(applications.recordAttempt(wired.runId, 1).allowed).toBe(true);
+    const remoteRefused = deny<never>(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "genesis-bootstrap was refused by GitHub or did not answer", {
+      stage: "production",
+      refusal: "REMOTE_REFUSED",
+      failedOperationId: "genesis-bootstrap",
+      resumable: true,
+      remote: { status: 422 },
+    });
+    if (remoteRefused.allowed) throw new Error("unreachable");
+    applications.recordRefusal(wired.runId, recordOf(remoteRefused));
+    expect(applications.recordAttempt(wired.runId, 2).allowed).toBe(true);
+
+    const replay = await door(wired, "p2-later-attempt");
+    expect(replay.structuredContent).toEqual({
+      ok: false,
+      reasonCode: remoteRefused.reasonCode,
+      message: remoteRefused.message,
+      evidence: { ...remoteRefused.evidence, resumable: true, application: { phase: "RESERVED", attempts: 3 } },
+    });
+    expect(produce).toHaveBeenCalledTimes(1);
+    expect(wired.github.writes).toEqual([]);
+  });
+
+  it.each([
+    {
+      phase: "STRANDED" as const,
+      reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_STRANDED,
+      record: {
+        cause: "ATTRIBUTION_UNCERTAIN",
+        requiredRecovery: "a person inspects the repository at the target and resolves the reservation",
+        evidence: { production: { refusal: "LEDGER_CORRUPT" } },
+      },
+    },
+    {
+      phase: "RELEASED" as const,
+      reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
+      record: {
+        cause: "RELEASED",
+        requiredRecovery: "none: a new run reserves the project id and repository identity again under its own owner approval",
+        evidence: { releasedAt: "2026-01-01T00:00:00.000Z" },
+      },
+    },
+  ])("F2: an application since $phase answers with its recorded cause and recovery, not resumable", async ({ phase, reasonCode, record }) => {
+    const wired = await wire(`p2-replay-${phase.toLowerCase()}`);
+    const { produce, applications } = await confirmReservedResumable(wired, `p2-${phase}`);
+    const marked = phase === "STRANDED" ? applications.markStranded(wired.runId, record) : applications.markReleased(wired.runId, record);
+    expect(marked.allowed).toBe(true);
+
+    const replay = await door(wired, `p2-${phase}`);
+    expect(replay.structuredContent).toMatchObject({
+      ok: false,
+      reasonCode,
+      evidence: {
+        refusal: `BOOTSTRAP_APPLICATION_${phase}`,
+        cause: record.cause,
+        requiredRecovery: record.requiredRecovery,
+        evidence: record.evidence,
+        resumable: false,
+        application: { phase, attempts: 1 },
+      },
+    });
+    expect(JSON.stringify(replay.structuredContent)).not.toContain("GENESIS_POST_MERGE_CI_PENDING");
+    expect(produce).toHaveBeenCalledTimes(1);
+    expect(wired.github.writes).toEqual([]);
+  });
 });

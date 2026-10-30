@@ -8,7 +8,7 @@ import {
   BOOTSTRAP_PLAN_MAX_BYTES, type BootstrapPlanAttachInput, bootstrapReviewResumeAccess,
   replayBootstrapReviewResume, resumeBootstrapReview, type BootstrapReviewResumeInput,
 } from "../bootstrap/bootstrap-plan-artifact.ts";
-import { bootstrapApplicationOf, type BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
+import { bootstrapApplicationOf, type BootstrapApplicationPhase, type BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Outbox } from "../outbox/outbox.ts";
@@ -109,6 +109,22 @@ const refusalOf = (value: Record<string, unknown> | null | undefined): { reasonC
     && typeof evidence === "object" && evidence !== null && !Array.isArray(evidence)
     ? { reasonCode, message, evidence: evidence as Evidence }
     : null;
+};
+
+/** A replay's answer for an application in a terminal phase that is not this CONFIRM's completion. */
+const TERMINAL_APPLICATION_REFUSALS: Partial<Record<BootstrapApplicationPhase, { reasonCode: ReasonCode; message: string }>> = {
+  STRANDED: {
+    reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_STRANDED,
+    message: "this bootstrap run's application is STRANDED: what GitHub holds could not be attributed to it, and a person resolves it",
+  },
+  RELEASED: {
+    reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
+    message: "this bootstrap run's application is RELEASED: its reservation ended with no external effect, and nothing is applied",
+  },
+  COMPLETED: {
+    reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
+    message: "this bootstrap run's application is COMPLETED for another candidate than this CONFIRM's",
+  },
 };
 
 /**
@@ -269,20 +285,31 @@ export const createHermesMcpPort = (
         && application.candidateSnapshotDigest === input.candidateSnapshotDigest) {
         return respond(allow(ReasonCode.OK, { state: RunState.COMPLETED }));
       }
-      // Every attempt records the refusal it answers with, stamped with the attempt count: one stamped
-      // with the current count is no older than the stored answer.
+      const status = { phase: application.phase, attempts: application.attempts };
       const latest = application.lastRefusal;
-      const recorded = latest?.["attempt"] === application.attempts ? refusalOf(latest) : null;
+      const terminal = TERMINAL_APPLICATION_REFUSALS[application.phase];
+      if (terminal) {
+        // A STRANDED or RELEASED row's record is its cause and the recovery a person performs; a COMPLETED
+        // row's is the refusal it met before completing, not its answer.
+        return respond(deny(terminal.reasonCode, terminal.message, {
+          refusal: `BOOTSTRAP_APPLICATION_${application.phase}`,
+          runId: input.runId,
+          ...(application.phase === "COMPLETED" ? { reserved: application.candidateSnapshotDigest } : latest ?? {}),
+          resumable: false,
+          application: status,
+        }));
+      }
+      // Every attempt records the refusal it answers with, and only a later refusal replaces the record:
+      // it is the newest refusal, whichever attempt has started since.
+      const recorded = refusalOf(latest);
       const current = recorded === null ? answered : {
         ...recorded,
         evidence: { ...(latest?.["stage"] === undefined ? {} : { stage: latest["stage"] }), ...recorded.evidence },
       };
-      const resumable = (application.phase === "RESERVED" || application.phase === "WRITTEN")
-        && current.evidence["resumable"] !== false;
       return respond(deny(current.reasonCode, current.message, {
         ...current.evidence,
-        resumable,
-        application: { phase: application.phase, attempts: application.attempts },
+        resumable: current.evidence["resumable"] !== false,
+        application: status,
       }));
     },
     executeRepair:(input: Parameters<RepairService["execute"]>[0]) => source.repair.execute(input),
