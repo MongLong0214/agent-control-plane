@@ -2928,6 +2928,17 @@ export const reviewerTransportInput = (request: Pick<InvocationRequest, "systemP
   request.systemPrompt ? `${request.systemPrompt}${REVIEWER_TRANSPORT_SEPARATOR}${request.prompt}` : request.prompt;
 
 /**
+ * The reviewer input bound for GPT-6.1 Sol through `codex exec`, whose packet reviewer input goes on
+ * stdin, so no argv limit applies. Codex CLI 0.164.0's model catalogue gives gpt-6.1-sol a 500,000-token
+ * context window, 95% of it usable: 475,000 tokens. Less 128,000 tokens for the model's reasoning and
+ * answer and 96,000 for the CLI's own instructions and tools (its instructions for this model in that
+ * catalogue are 62,023 bytes) leaves 251,000. A byte-level tokenizer's token covers at least one byte,
+ * so an input of at most 250,000 UTF-8 bytes is at most 250,000 tokens. Derived, not measured against
+ * a live model.
+ */
+export const CODEX_REVIEWER_INPUT_MAX_BYTES = 250_000;
+
+/**
  * Codex CLI adapter. Preferred runtime for the blind reviewer (GPT-6.1 Sol at xhigh
  * effort, §18.1) and for mechanical worker tasks.
  */
@@ -3089,6 +3100,11 @@ export class CodexCliAdapter implements ProviderAdapter {
     // reviewer id; the review gate removes its packet root in its own finally block.
     this.#reviewerSessions.delete(handle.externalSessionId);
     this.#workerSessions.delete(handle.externalSessionId);
+  }
+
+  /** `CODEX_REVIEWER_INPUT_MAX_BYTES` for the model it is derived for; no bound for any other. */
+  reviewerInputMaxBytes(model: string): number | undefined {
+    return model === "gpt-6.1-sol" ? CODEX_REVIEWER_INPUT_MAX_BYTES : undefined;
   }
 
   /** A packet reviewer's request reaches `codex exec resume` as one string on stdin (`invokePacketReviewer`). */

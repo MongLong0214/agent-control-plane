@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { rmSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
@@ -41,13 +41,17 @@ const CANDIDATE_BLOB = "22".repeat(20);
 const WORST_CASE_ROOM = __testing.LOCKFILE_CHUNK_THRESHOLD_CHARS - 84_000 - 4_096;
 
 /** A lockfile change as git's raw diff gives it; modified unless `fields` says otherwise. */
-const lockfileChange = (fields: Partial<LockfileChange> & Pick<LockfileChange, "section">): LockfileChange => ({
-  listed: LOCKFILE, path: LOCKFILE, from: null, status: "M", base: BASE_BLOB, candidate: CANDIDATE_BLOB, text: null, ...fields,
+const lockfileChange = (fields: Partial<LockfileChange> = {}): LockfileChange => ({
+  listed: LOCKFILE, path: LOCKFILE, from: null, status: "M", base: BASE_BLOB, candidate: CANDIDATE_BLOB, baseText: "", text: "", ...fields,
 });
+
+/** The text a `newFileSection` adds. */
+const addedText = (section: string): string =>
+  `${section.slice(section.indexOf("\n@@ ") + 1).split("\n").slice(1, -1).map((line) => line.slice(1)).join("\n")}\n`;
 
 /** An added lockfile change whose section is `section`. */
 const added = (path: string, section: string, blob = "ab".repeat(20)): LockfileChange =>
-  lockfileChange({ listed: path, path, status: "A", base: null, candidate: blob, section });
+  lockfileChange({ listed: path, path, status: "A", base: null, baseText: null, candidate: blob, text: addedText(section) });
 
 /** A modified file's section from `BASE_BLOB` to `CANDIDATE_BLOB`, changing the lines `removed` to `added` at line 1. */
 const modifiedSection = (path: string, removed: readonly string[], addedLines: readonly string[]): string =>
@@ -72,7 +76,7 @@ describe("a lockfile is reviewed whole in its own chunk, never cut into ranges",
     expect(holding[0]).toHaveLength(1);
     expect(holding[0]![0]!.diff).toBe(lock);
     expect(holding[0]![0]!.lockfile).toBe(
-      `Lockfile ${LOCKFILE}, added, reviewed whole in this chunk: the patch below adds its full text, candidate blob ${"ab".repeat(20)} (git's digest of its full bytes).`,
+      `Lockfile ${LOCKFILE}, added, shown whole in this chunk: the patch below adds its full text, candidate blob ${"ab".repeat(20)} (git's digest of its full bytes).`,
     );
     expect(chunks.flat().filter((part) => part !== holding[0]![0]).map((part) => part.diff)).toEqual([small]);
   });
@@ -112,7 +116,7 @@ describe("a lockfile is reviewed whole in its own chunk, never cut into ranges",
   it("omits an 832,937-byte modified lockfile whose full candidate text does not fit, and never calls its patch whole", () => {
     const text = lockfileText(832_937, 20_000);
     const { chunks, omitted } = __testing.splitDiffs(
-      [{ identity: IDENTITY, diff: ONE_LINE, files: [LOCKFILE], lockfiles: [lockfileChange({ section: ONE_LINE, text })] }],
+      [{ identity: IDENTITY, diff: ONE_LINE, files: [LOCKFILE], lockfiles: [lockfileChange({ text })] }],
       100_000,
       WORST_CASE_ROOM,
     );
@@ -127,13 +131,13 @@ describe("a lockfile is reviewed whole in its own chunk, never cut into ranges",
 
   it("omits a modified lockfile whose candidate text could not be read, by name", () => {
     const { chunks, omitted } = __testing.splitDiffs(
-      [{ identity: IDENTITY, diff: ONE_LINE, files: [LOCKFILE], lockfiles: [lockfileChange({ section: ONE_LINE })] }],
+      [{ identity: IDENTITY, diff: ONE_LINE, files: [LOCKFILE], lockfiles: [lockfileChange({ text: null })] }],
       100_000,
       WORST_CASE_ROOM,
     );
 
     expect(omitted).toEqual([
-      `${IDENTITY}:${LOCKFILE}: lockfile not reviewed: its full candidate text, blob ${CANDIDATE_BLOB}, could not be read from the frozen candidate as UTF-8 text`,
+      `${IDENTITY}:${LOCKFILE}: lockfile not reviewed: its candidate blob ${CANDIDATE_BLOB} is not UTF-8 text without NUL bytes, or could not be read whole`,
     ]);
     expect(chunks.flat().some((part) => part.diff.includes(LOCKFILE))).toBe(false);
   });
@@ -141,7 +145,7 @@ describe("a lockfile is reviewed whole in its own chunk, never cut into ranges",
   it("shows a modified lockfile that fits as its full candidate text and its change, the patch or else its changed line ranges", () => {
     const text = lockfileText(50_000, 1_000);
     const whole = __testing.splitDiffs(
-      [{ identity: IDENTITY, diff: ONE_LINE, files: [LOCKFILE], lockfiles: [lockfileChange({ section: ONE_LINE, text })] }],
+      [{ identity: IDENTITY, diff: ONE_LINE, files: [LOCKFILE], lockfiles: [lockfileChange({ text })] }],
       100_000,
       WORST_CASE_ROOM,
     );
@@ -158,7 +162,7 @@ describe("a lockfile is reviewed whole in its own chunk, never cut into ranges",
     const lines = large.split("\n").slice(0, 2_500);
     const broad = modifiedSection(LOCKFILE, lines, lines.map((line) => line.replace("1.0.0", "2.0.0")));
     const ranged = __testing.splitDiffs(
-      [{ identity: IDENTITY, diff: broad, files: [LOCKFILE], lockfiles: [lockfileChange({ section: broad, text: large })] }],
+      [{ identity: IDENTITY, diff: broad, files: [LOCKFILE], lockfiles: [lockfileChange({ text: large })] }],
       100_000,
       250_000,
     );
@@ -183,7 +187,7 @@ describe("a lockfile is reviewed whole in its own chunk, never cut into ranges",
     expect(chunks.flat()).toHaveLength(1);
     expect(chunks[0]![0]!.files).toEqual([listed]);
     expect(chunks[0]![0]!.coverageTargets.map((target) => target.file)).toEqual([`${IDENTITY}:${listed}`]);
-    expect(chunks[0]![0]!.lockfile).toMatch(/^Lockfile 한글\/package-lock\.json, added, reviewed whole in this chunk:/);
+    expect(chunks[0]![0]!.lockfile).toMatch(/^Lockfile 한글\/package-lock\.json, added, shown whole in this chunk:/);
   });
 
   it("gives a small lockfile a chunk of its own beside a small and an oversized file", () => {
@@ -207,6 +211,35 @@ describe("a lockfile is reviewed whole in its own chunk, never cut into ranges",
       expect(holding.map((chunk) => chunk.flatMap((part) => part.files))).toEqual([["yarn.lock"]]);
       expect(holding[0]![0]!.diff).toBe(lock);
       expect(chunks.flat().filter((part) => part.diff.includes("yarn.lock"))).toHaveLength(1);
+    }
+  });
+
+  it("splits ordinary files under git-quoted, spaced and escaped paths by the path git lists, none dropped or mis-mapped", () => {
+    const listed = ['"\\355\\225\\234\\352\\270\\200/data.txt"', "my dir/a.txt", '"q\\"uote\\\\x.txt"'];
+    const side = (prefix: string, path: string): string => (path.startsWith('"') ? `"${prefix}${path.slice(1)}` : `${prefix}${path}`);
+    const sections = listed.map((path, index) => `diff --git ${side("a/", path)} ${side("b/", path)}\n${String(index).repeat(300)}\n`);
+    const { chunks, omitted, unmapped } = __testing.splitDiffs([{ identity: IDENTITY, diff: sections.join(""), files: listed }], 100);
+
+    expect([omitted, unmapped]).toEqual([[], []]);
+    for (const [index, path] of listed.entries()) {
+      const parts = chunks.flat().filter((part) => part.files.includes(path));
+      expect(parts.every((part) => part.files.length === 1 && part.diff.startsWith(`diff --git ${side("a/", path)} `))).toBe(true);
+      expect(parts.map((part) => part.diff.slice(part.diff.indexOf("\n") + 1)).join("")).toBe(`${String(index).repeat(300)}\n`);
+    }
+  });
+
+  it("sends nothing when a lockfile's sections cannot be told from the others' by path", () => {
+    const lock = newFileSection(LOCKFILE, lockfileText(400, 10));
+    const app = "diff --git a/app.ts b/app.ts\n--- a/app.ts\n+++ b/app.ts\n@@ -1 +1 @@\n-a\n+b\n";
+    const renamed = { ...added(LOCKFILE, lock), status: "R", from: "old.json", base: BASE_BLOB, baseText: addedText(lock) };
+    for (const [diff, lockfile] of [
+      [app, added(LOCKFILE, lock)],
+      [`${lock}diff --git unreadable header\n`, added(LOCKFILE, lock)],
+      [lock + app, renamed],
+    ] as const) {
+      const { chunks, unmapped } = __testing.splitDiffs([{ identity: IDENTITY, diff, files: [LOCKFILE, "app.ts"], lockfiles: [lockfile] }], 100_000, WORST_CASE_ROOM);
+      expect(unmapped).toEqual([IDENTITY]);
+      expect(chunks.flat()).toEqual([]);
     }
   });
 
@@ -289,7 +322,7 @@ const persistPassingVerification = (
 
 /** A candidate that makes the passing change, writes `candidate` and deletes `removed` over a base holding `base`, under repository `config`, frozen and verified. */
 const prepareCandidate = async (
-  candidate: Record<string, string>,
+  candidate: Record<string, string | Uint8Array>,
   base: Record<string, string> = {},
   removed: readonly string[] = [],
   config: Readonly<Record<string, string>> = {},
@@ -327,7 +360,10 @@ const prepareCandidate = async (
   });
   if (!execution.allowed) throw new Error(execution.message);
   applyPassingChange(harness.repoPath);
-  writeFiles(harness.repoPath, candidate);
+  for (const [path, content] of Object.entries(candidate)) {
+    mkdirSync(dirname(join(harness.repoPath, path)), { recursive: true });
+    writeFileSync(join(harness.repoPath, path), content);
+  }
   for (const path of removed) rmSync(join(harness.repoPath, path));
   const head = commitAll(harness.repoPath, "candidate files");
   harness.cp.tasks.finishExecution(execution.value.executionId, { status: "SUCCEEDED", resultDigest: `sha256:${head}` });
@@ -375,7 +411,7 @@ describe("a review binds each whole lockfile to the candidate in a chunk of its 
     const setup = await prepareCandidate({ [LOCKFILE]: lockfile });
     try {
       setup.harness.scripted.script(
-        { match: /Lockfile compositor\/package-lock\.json, added, reviewed whole/, text: reviewerPass([`${setup.identity}:${LOCKFILE}`]) },
+        { match: /Lockfile compositor\/package-lock\.json, added, shown whole/, text: reviewerPass([`${setup.identity}:${LOCKFILE}`]) },
         { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`]), once: false },
         { match: /Final review/, text: reviewerPass([]) },
       );
@@ -389,7 +425,7 @@ describe("a review binds each whole lockfile to the candidate in a chunk of its 
       expect(holding[0]).toContain(lockfile.split("\n").slice(0, -1).map((line) => `+${line}\n`).join(""));
       expect(holding[0]!.split('"node_modules/p04000"')).toHaveLength(2);
       expect(holding[0]).toContain(
-        `Lockfile ${LOCKFILE}, added, reviewed whole in this chunk: the patch below adds its full text, candidate blob ${setup.blob(setup.head, LOCKFILE)}`,
+        `Lockfile ${LOCKFILE}, added, shown whole in this chunk: the patch below adds its full text, candidate blob ${setup.blob(setup.head, LOCKFILE)}`,
       );
     } finally {
       setup.harness.cp.close();
@@ -402,7 +438,7 @@ describe("a review binds each whole lockfile to the candidate in a chunk of its 
     const setup = await prepareCandidate({ [LOCKFILE]: candidate }, { [LOCKFILE]: base });
     try {
       setup.harness.scripted.script(
-        { match: /Lockfile compositor\/package-lock\.json, modified, reviewed whole/, text: reviewerPass([`${setup.identity}:${LOCKFILE}`]) },
+        { match: /Lockfile compositor\/package-lock\.json, modified, shown whole/, text: reviewerPass([`${setup.identity}:${LOCKFILE}`]) },
         { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`]), once: false },
         { match: /Final review/, text: reviewerPass([]) },
       );
@@ -481,7 +517,7 @@ describe("a review binds each whole lockfile to the candidate in a chunk of its 
     const setup = await prepareCandidate({ [LOCKFILE]: text }, { "old.json": text }, ["old.json"]);
     try {
       setup.harness.scripted.script(
-        { match: /Lockfile compositor\/package-lock\.json \(from old\.json\), renamed, reviewed whole/, text: reviewerPass([`${setup.identity}:${LOCKFILE}`]) },
+        { match: /Lockfile compositor\/package-lock\.json \(from old\.json\), renamed, shown whole/, text: reviewerPass([`${setup.identity}:${LOCKFILE}`]) },
         { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`]), once: false },
         { match: /Final review/, text: reviewerPass([]) },
       );
@@ -506,7 +542,7 @@ describe("a review binds each whole lockfile to the candidate in a chunk of its 
     const setup = await prepareCandidate({ "web/package-lock.json": text }, { [LOCKFILE]: text }, [LOCKFILE], { "diff.renames": "false" });
     try {
       setup.harness.scripted.script(
-        { match: /Lockfile web\/package-lock\.json, added, reviewed whole/, text: reviewerPass([`${setup.identity}:web/package-lock.json`]) },
+        { match: /Lockfile web\/package-lock\.json, added, shown whole/, text: reviewerPass([`${setup.identity}:web/package-lock.json`]) },
         { match: /Lockfile compositor\/package-lock\.json, deleted/, text: reviewerPass([`${setup.identity}:${LOCKFILE}`]) },
         { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`]), once: false },
         { match: /Final review/, text: reviewerPass([]) },
@@ -523,7 +559,7 @@ describe("a review binds each whole lockfile to the candidate in a chunk of its 
         expect(holding[0]).toContain(`Lockfile ${path}, `);
         expect(holding[0]).not.toContain("diff --git a/src/app.js");
       }
-      const addition = prompts.find((prompt) => prompt.includes("Lockfile web/package-lock.json, added, reviewed whole"));
+      const addition = prompts.find((prompt) => prompt.includes("Lockfile web/package-lock.json, added, shown whole"));
       expect(addition).toContain(`new file mode 100644\nindex ${"0".repeat(40)}..${setup.blob(setup.head, "web/package-lock.json")}\n`);
       expect(addition).toContain(text.split("\n").slice(0, -1).map((line) => `+${line}\n`).join(""));
     } finally {
@@ -538,7 +574,7 @@ describe("a review binds each whole lockfile to the candidate in a chunk of its 
     const listed = setup.snapshot.repositories[0]!.touchedPaths.find((touched) => touched !== "src/app.js")!;
     try {
       setup.harness.scripted.script(
-        { match: /Lockfile 한글\/package-lock\.json, added, reviewed whole/, text: reviewerPass([`${setup.identity}:${listed}`]) },
+        { match: /Lockfile 한글\/package-lock\.json, added, shown whole/, text: reviewerPass([`${setup.identity}:${listed}`]) },
         { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`]), once: false },
         { match: /Final review/, text: reviewerPass([]) },
       );
@@ -547,7 +583,146 @@ describe("a review binds each whole lockfile to the candidate in a chunk of its 
 
       if (!result.allowed) throw new Error(`${result.reasonCode}: ${result.message}`);
       expect(result.value).toMatchObject({ chunked: true, verdict: "PASS", omittedItems: [] });
-      expect(chunkPrompts(setup).filter((prompt) => prompt.includes(`Lockfile ${path}, added, reviewed whole`))).toHaveLength(1);
+      expect(chunkPrompts(setup).filter((prompt) => prompt.includes(`Lockfile ${path}, added, shown whole`))).toHaveLength(1);
+    } finally {
+      setup.harness.cp.close();
+    }
+  });
+
+  for (const [name, content] of [
+    ["the bytes FF FE 61 0A", Uint8Array.from([0xff, 0xfe, 0x61, 0x0a])],
+    ["832,938 bytes with a NUL", Buffer.concat([Buffer.from([0]), Buffer.from(lockfileText(832_937, 20_000))])],
+  ] as const) {
+    it(`omits an added lockfile of ${name}, which is not UTF-8 text without NUL bytes, sends none of it, and refuses PASS`, async () => {
+      const setup = await prepareCandidate({ [LOCKFILE]: content });
+      try {
+        setup.harness.scripted.script(
+          { match: /Review chunk|Candidate review/, text: reviewerPass([`${setup.identity}:src/app.js`, `${setup.identity}:${LOCKFILE}`]), once: false },
+          { match: /Final review/, text: reviewerPass([]) },
+        );
+
+        const result = await setup.invoke();
+
+        expect(result.allowed).toBe(false);
+        expect(result.reasonCode).toBe(ReasonCode.REVIEW_REVISE);
+        const prompts = setup.harness.scripted.invocations.map((invocation) => invocation.prompt);
+        expect(prompts.some((prompt) => prompt.includes(`diff --git a/${LOCKFILE}`) || prompt.includes(`Lockfile ${LOCKFILE}`))).toBe(false);
+        const packet = setup.harness.cp.review.latestPacket(setup.run.runId, candidateSnapshotDigest(setup.snapshot));
+        expect(packet?.omittedItems).toContain(
+          `${setup.identity}:${LOCKFILE}: lockfile not reviewed: its candidate blob ${setup.blob(setup.head, LOCKFILE)} is not UTF-8 text without NUL bytes, or could not be read whole`,
+        );
+      } finally {
+        setup.harness.cp.close();
+      }
+    });
+  }
+
+  it("under a -diff attribute, reviews a 155K added lockfile whole in one chunk and in no other", async () => {
+    const text = lockfileText(155_291, 4_287);
+    const setup = await prepareCandidate({ [LOCKFILE]: text }, { ".gitattributes": "**/package-lock.json -diff\n" });
+    try {
+      setup.harness.scripted.script(
+        { match: /Lockfile compositor\/package-lock\.json, added, shown whole/, text: reviewerPass([`${setup.identity}:${LOCKFILE}`]) },
+        { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`]), once: false },
+        { match: /Final review/, text: reviewerPass([]) },
+      );
+
+      const result = await setup.invoke();
+
+      if (!result.allowed) throw new Error(`${result.reasonCode}: ${result.message}`);
+      expect(result.value).toMatchObject({ chunked: true, verdict: "PASS", omittedItems: [] });
+      const prompts = chunkPrompts(setup);
+      const holding = prompts.filter((prompt) => prompt.includes(`Lockfile ${LOCKFILE}`));
+      expect(holding).toHaveLength(1);
+      // The full text, as the patch that adds it exactly or as the text itself.
+      const added = text.split("\n").slice(0, -1).map((line) => `+${line}\n`).join("");
+      expect(holding[0]!.includes(added) || holding[0]!.includes(`\`\`\`text\n${text}\n\`\`\``)).toBe(true);
+      expect(prompts.filter((prompt) => prompt.includes(`diff --git a/${LOCKFILE}`))).toEqual(holding);
+    } finally {
+      setup.harness.cp.close();
+    }
+  });
+
+  it("under a -diff attribute, omits an 832K added lockfile and sends none of it to any reviewer", async () => {
+    const setup = await prepareCandidate({ [LOCKFILE]: lockfileText(832_937, 20_000) }, { ".gitattributes": "**/package-lock.json -diff\n" });
+    try {
+      setup.harness.scripted.script(
+        { match: /Review chunk|Candidate review/, text: reviewerPass([`${setup.identity}:src/app.js`]), once: false },
+        { match: /Final review/, text: reviewerPass([]) },
+      );
+
+      const result = await setup.invoke();
+
+      expectOmittedForSize(setup, result, LOCKFILE, 832_937);
+      expect(setup.harness.scripted.invocations.some((invocation) => invocation.prompt.includes(`diff --git a/${LOCKFILE}`))).toBe(false);
+    } finally {
+      setup.harness.cp.close();
+    }
+  });
+
+  it("reviews a 130,004-byte ordinary file at a git-quoted path by range, under the path the snapshot lists", async () => {
+    const setup = await prepareCandidate({ "한글/data.txt": `${"d".repeat(130_003)}\n` });
+    const listed = setup.snapshot.repositories[0]!.touchedPaths.find((touched) => touched !== "src/app.js")!;
+    try {
+      setup.harness.scripted.script(
+        { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`, `${setup.identity}:${listed}`]), once: false },
+        { match: /Final review/, text: reviewerPass([]) },
+      );
+
+      const result = await setup.invoke();
+
+      if (!result.allowed) throw new Error(`${result.reasonCode}: ${result.message}`);
+      expect(result.value).toMatchObject({ chunked: true, verdict: "PASS", omittedItems: [] });
+      expect(result.value.coveredFiles).toContain(`${setup.identity}:${listed}`);
+    } finally {
+      setup.harness.cp.close();
+    }
+  });
+
+  it("reviews ordinary Korean, spaced and quoted paths normally beside a valid lockfile", async () => {
+    const base = lockfileText(30_000, 700);
+    const ordinary = { "한글/data.txt": `${"d".repeat(130_003)}\n`, "my dir/a.txt": "spaced file\n", 'q"uote\\x.txt': "quoted file\n" };
+    const setup = await prepareCandidate({ [LOCKFILE]: oneLineChange(base), ...ordinary }, { [LOCKFILE]: base });
+    const listed = setup.snapshot.repositories[0]!.touchedPaths.filter((touched) => touched !== "src/app.js" && touched !== LOCKFILE);
+    try {
+      expect(listed).toHaveLength(3);
+      setup.harness.scripted.script(
+        { match: /Lockfile compositor\/package-lock\.json, modified, shown whole/, text: reviewerPass([`${setup.identity}:${LOCKFILE}`]) },
+        { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`, ...listed.map((path) => `${setup.identity}:${path}`)]), once: false },
+        { match: /Final review/, text: reviewerPass([]) },
+      );
+
+      const result = await setup.invoke();
+
+      if (!result.allowed) throw new Error(`${result.reasonCode}: ${result.message}`);
+      expect(result.value).toMatchObject({ chunked: true, verdict: "PASS", omittedItems: [] });
+      expect(result.value.coveredFiles).toEqual(expect.arrayContaining(listed.map((path) => `${setup.identity}:${path}`)));
+      const ordinaryPrompts = chunkPrompts(setup).filter((prompt) => !prompt.includes(`Lockfile ${LOCKFILE}`));
+      for (const content of ["+spaced file\n", "+quoted file\n"]) expect(ordinaryPrompts.filter((prompt) => prompt.includes(content))).toHaveLength(1);
+    } finally {
+      setup.harness.cp.close();
+    }
+  });
+
+  it("does not send a lockfile chunk to a reviewer that declares no input bound for its model, and refuses PASS", async () => {
+    const base = lockfileText(30_000, 700);
+    const setup = await prepareCandidate({ [LOCKFILE]: oneLineChange(base) }, { [LOCKFILE]: base });
+    Object.assign(setup.harness.scripted, { reviewerInputMaxBytes: (): undefined => undefined });
+    try {
+      setup.harness.scripted.script(
+        { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`, `${setup.identity}:${LOCKFILE}`]), once: false },
+        { match: /Final review/, text: reviewerPass([]) },
+      );
+
+      const result = await setup.invoke();
+
+      expect(result.allowed).toBe(false);
+      expect(result.reasonCode).toBe(ReasonCode.REVIEW_REVISE);
+      expect(setup.harness.scripted.invocations.some((invocation) => invocation.prompt.includes(`Lockfile ${LOCKFILE}`))).toBe(false);
+      const packet = setup.harness.cp.review.latestPacket(setup.run.runId, candidateSnapshotDigest(setup.snapshot));
+      expect(packet?.omittedItems).toEqual(expect.arrayContaining([
+        expect.stringMatching(new RegExp(`^${setup.identity}:${LOCKFILE}: lockfile not reviewed: its chunk is \\d+ bytes and the selected reviewer model \\S+ declares no input bound for it$`)),
+      ]));
     } finally {
       setup.harness.cp.close();
     }

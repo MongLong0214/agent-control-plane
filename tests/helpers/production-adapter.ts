@@ -9,6 +9,7 @@ import type {
   SessionHandle,
   SessionSpec,
 } from "../../src/runtime/provider.ts";
+import { CODEX_REVIEWER_INPUT_MAX_BYTES } from "../../src/runtime/cli-adapters.ts";
 import { REVIEWER_PROVIDER_ENDPOINTS } from "../../src/runtime/provider.ts";
 import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 
@@ -27,6 +28,11 @@ export class TestProductionAdapter extends ScriptedAdapter {
 
   constructor(clock: Clock, provider = "scripted") {
     super(clock, provider);
+  }
+
+  /** The primary reviewer path's bound, so a lockfile chunk reaches this stand-in reviewer as it would that one. */
+  reviewerInputMaxBytes(): number {
+    return CODEX_REVIEWER_INPUT_MAX_BYTES;
   }
 
   /**
