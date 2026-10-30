@@ -2069,9 +2069,10 @@ export class ProductionGate {
 
   /**
    * §19.3 — routine worker, test and review churn never reaches Hermes. Only the three
-   * documented notification kinds are emitted, and this is the only emitter.
+   * documented notification kinds are emitted, and this is the only emitter. `runId` is null
+   * only for a CRITICAL_SYSTEM_FAILURE about the deployment rather than one run (#1189).
    */
-  notify(kind: NotificationKind, runId: string, payload: Record<string, unknown>): Decision<void> {
+  notify(kind: NotificationKind, runId: string | null, payload: Record<string, unknown>): Decision<void> {
     // Audit evidence is intentionally a reviewed, bounded vocabulary. The delivery needs
     // the full explanation, but persisting its unreviewed field name causes AuditLog to
     // replace the whole evidence payload and makes the notification impossible to trace.

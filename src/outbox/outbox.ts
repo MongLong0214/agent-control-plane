@@ -1063,6 +1063,7 @@ export class Outbox {
   }
 
   #ceoDelivery: ((message: OutboxMessage, attempt: CeoNoticeAttempt) => Promise<Decision<void>>) | null = null;
+  #ceoDeliveryOnly: ReadonlySet<string> | null = null;
   #ceoDelivering: Promise<void> | null = null;
   #ceoPending = false;
 
@@ -1070,8 +1071,15 @@ export class Outbox {
    * Installs the canonical notice transport. Its configuration alone does not prove receiver
    * support: the per-row journal decides whether a verified Buzz route may take over. Startup,
    * enqueue, binding adoption and authenticated CEO traffic are delivery events.
+   *
+   * `only` restricts the transport to the named messages until the next attach: every other row is
+   * left exactly as it was, unread by the transport and with nothing recorded against it (#1189 D1,
+   * a start that refused sends its own stall notice and nothing else).
    */
-  attachCeoNotificationDelivery(send: (message: OutboxMessage, attempt: CeoNoticeAttempt) => Promise<Decision<void>>): void {
+  attachCeoNotificationDelivery(
+    send: (message: OutboxMessage, attempt: CeoNoticeAttempt) => Promise<Decision<void>>,
+    only?: readonly string[],
+  ): void {
     this.db.tx(() => {
       if (this.db.get("SELECT 1 FROM audit_events WHERE kind = 'CEO_NOTIFICATION_ATTEMPT_JOURNAL_STARTED'")) return;
       // A pre-upgrade crash could have dispatched without incrementing attempts. Absence of an
@@ -1089,6 +1097,7 @@ export class Outbox {
       if (!started.allowed) throw new Error("CEO attempt journal boundary was not recorded");
     });
     this.#ceoDelivery = send;
+    this.#ceoDeliveryOnly = only ? new Set(only) : null;
     void this.deliverCeoNotifications();
   }
 
@@ -1173,6 +1182,7 @@ export class Outbox {
       return Promise.resolve();
     }
     const send = this.#ceoDelivery;
+    const only = this.#ceoDeliveryOnly;
     const run = (async () => {
       do {
         this.#ceoPending = false;
@@ -1184,6 +1194,7 @@ export class Outbox {
             AND ${ceoCanonicalRouteSql("o", true)}
           ORDER BY o.created_at, o.rowid`);
         for (const row of rows) {
+          if (only && !only.has(row.message_id)) continue;
           let accepted = false;
           let unavailable = false;
           let reasonCode: ReasonCode = ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED;

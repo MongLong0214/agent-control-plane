@@ -696,13 +696,7 @@ export class RepairService {
           `SELECT task_id, status, worker_process_id, worker_session_id FROM task_executions WHERE execution_id = ?`,
           [executionId],
         );
-        const incarnation = execution
-          ? this.db.get<{ incarnation: string }>(`SELECT incarnation FROM sessions WHERE session_id = ?`, [execution.worker_session_id])?.incarnation
-          : undefined;
-        // Claude carries the session as `--session-id <id>`. A Codex worker carries the same id as
-        // the argv element after `--thread-source`. Either way it is one whole argument.
-        const workerSessionId = incarnation?.split("#", 1)[0] ?? "";
-        const scan = workerSessionId === "" ? { carriers: [], error: "the worker session's id is unknown" } : processesCarrying(workerSessionId);
+        const scan = liveWorkerSessionCarriers(this.db, execution?.worker_session_id ?? null);
         const confirmation = request.parameters["confirm"] ?? null;
         const evidence = {
           executionId,
@@ -895,6 +889,24 @@ const alive = (pid: number): boolean => {
   } catch {
     return false;
   }
+};
+
+/**
+ * #1096 — the release's machine precondition: the live processes whose command line carries the
+ * worker session's id. It observes and signals nothing. #1189 A2 — exported so the daemon can run
+ * the same check when it routes a held task to the CEO; the release itself stays owner-authorised.
+ */
+export const liveWorkerSessionCarriers = (
+  db: Db,
+  workerSessionId: string | null,
+): { carriers: number[]; error: string | null } => {
+  const incarnation = workerSessionId
+    ? db.get<{ incarnation: string }>(`SELECT incarnation FROM sessions WHERE session_id = ?`, [workerSessionId])?.incarnation
+    : undefined;
+  // Claude carries the session as `--session-id <id>`. A Codex worker carries the same id as
+  // the argv element after `--thread-source`. Either way it is one whole argument.
+  const token = incarnation?.split("#", 1)[0] ?? "";
+  return token === "" ? { carriers: [], error: "the worker session's id is unknown" } : processesCarrying(token);
 };
 
 /**

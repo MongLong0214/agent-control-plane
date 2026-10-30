@@ -57,6 +57,8 @@ import {
 } from "../doctor/doctor.ts";
 import { isProjectlessBootstrap } from "../bootstrap/bootstrap-plan.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
+import { describeStartStall, type StartStall } from "./start-stall.ts";
+import { routeUnreleasedWorkerOrphans } from "../run/worker-orphan-routing.ts";
 import {
   ArtifactKind,
   Role,
@@ -484,7 +486,16 @@ export interface BootstrapDoor {
 
 export interface DaemonStartOptions {
   bootstrapDoor?: () => Promise<BootstrapDoor>;
+  /**
+   * #1189 D1 — sends the CEO stall notices a refused or parked start enqueued, called while this
+   * daemon still holds its lock and before it releases it. The caller decides what route that is;
+   * omitting it leaves the notice PENDING for the first daemon that starts.
+   */
+  stallNotice?: (messageIds: readonly string[]) => Promise<unknown>;
 }
+
+/** #1189 D1 — how long a refused or parked start waits for its stall notice to be sent. */
+const START_STALL_NOTICE_BUDGET_MS = 15_000;
 
 export interface OperatorRequest {
   requestId: string;
@@ -627,6 +638,8 @@ export class Daemon {
   #startedAt: string | null = null;
   #mode: DaemonMode = "NORMAL";
   #bootstrapBlocking: BlockingFinding[] = [];
+  /** #1189 D1 — what this start is stalled on, in `health.json` until a start succeeds. */
+  #startStall: StartStall | null = null;
   // A counter, not a one-shot waiter: an observation can land while the park is inside its
   // re-check, and a signal delivered to nobody must not be discarded. The park compares the
   // counter against what it last consumed, so it only sleeps when nothing is outstanding.
@@ -1441,13 +1454,16 @@ export class Daemon {
       if (report.doctorStatus === "BLOCKED" || report.doctorStatus === "ERROR") {
         const reasonCode =
           report.doctorStatus === "BLOCKED" ? ReasonCode.DOCTOR_BLOCKED : ReasonCode.DOCTOR_ERROR;
+        const parks = options.bootstrapDoor !== undefined && canParkForBootstrap(report.blockingFindings);
+        // #1189 D1 — before it parks or refuses, while it still holds the lock: what it waits on.
+        const stall = await this.recordStartStall(report, parks ? "PARKED" : "REFUSED", options.stallNotice);
 
-        if (options.bootstrapDoor && canParkForBootstrap(report.blockingFindings)) {
+        if (parks && options.bootstrapDoor) {
           const promoted = await this.parkForBootstrap(report, options.bootstrapDoor);
           if (promoted) {
             report = promoted;
           } else {
-            this.recordStartupFailure(reasonCode, { reconcile: report });
+            this.recordStartupFailure(reasonCode, { reconcile: report, stall });
             this.uninstallContinuityCoordinator();
             this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
             this.lock.release();
@@ -1455,7 +1471,7 @@ export class Daemon {
             return deny(reasonCode, "startup doctor did not permit dispatch resume", { reconcile: report });
           }
         } else {
-          this.recordStartupFailure(reasonCode, { reconcile: report });
+          this.recordStartupFailure(reasonCode, { reconcile: report, stall });
           this.uninstallContinuityCoordinator();
           this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
           this.lock.release();
@@ -1503,6 +1519,7 @@ export class Daemon {
       // through `runPeriodic` for the same backoff/audit treatment the timer gets, rather than a
       // bare `void` that would let a repeatedly-failing sweep fail silently forever.
       void this.runPeriodic("turn_reconcile", () => this.runTurnReconcile());
+      this.#startStall = null;
       this.writeHealth(report);
       this.startTimers();
       this.clearCrashLoop();
@@ -2983,6 +3000,10 @@ export class Daemon {
         await this.cp.workerRetirement.reconcile();
       });
       void this.runPeriodic("cto_canonical_switchover_settle", () => this.settleCanonicalSwitchovers());
+      // #1189 A2 — a task an unidentified worker orphan holds is told to the CEO once, with the machine check.
+      void this.runPeriodic("worker_orphan_routing", async () => {
+        routeUnreleasedWorkerOrphans(this.cp);
+      });
     }, watchdogMs);
     watchdog.unref();
     this.#timers.push(watchdog);
@@ -3432,6 +3453,7 @@ export class Daemon {
       continuityMode: this.cp.continuity.mode(),
       mode: this.#mode,
       blockingFindings: this.#bootstrapBlocking,
+      startStall: this.#startStall,
       lockHeld: this.lock.held(),
       runs: {
         queued: this.cp.runs.list({ state: RunState.QUEUED }).length,
@@ -3559,6 +3581,57 @@ export class Daemon {
       reasonCode,
       evidence: { ...next, threshold, backoffSeconds, ...evidence },
     });
+  }
+
+  /**
+   * #1189 D1 — classifies the blocking findings of a start that cannot resume dispatch, writes them
+   * to `health.json`, routes a PERMANENT stall (or a TRANSIENT one whose refusal reaches the crash-loop
+   * threshold) to the CEO once, and — through the caller's
+   * `stallNotice`, while this daemon still holds its lock — sends that notice before the start parks
+   * or refuses. It moves no run. A failure here is recorded on the stall and never changes why the
+   * start was refused.
+   */
+  private async recordStartStall(
+    report: ReconcileReport,
+    phase: StartStall["phase"],
+    stallNotice: DaemonStartOptions["stallNotice"],
+  ): Promise<StartStall | { error: string }> {
+    let stall: StartStall;
+    try {
+      // A refusal is the next crash-loop failure; a park holds its lock and is not one.
+      const crashLoop = phase === "REFUSED" &&
+        this.readCrashLoop().failures + 1 >= (this.options.crashLoopThreshold ?? 3);
+      stall = describeStartStall(this.cp, report.blockingFindings, phase, crashLoop);
+    } catch (error) {
+      return { error: safeErrorMessage(error) };
+    }
+    this.#startStall = stall;
+    this.writeHealth(report);
+    const routing = stall.routing;
+    if (stallNotice && (routing.status === "ROUTED" || routing.status === "ALREADY_ROUTED") &&
+        routing.deliveryStatus === "PENDING") {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          stallNotice([routing.messageId]),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, START_STALL_NOTICE_BUDGET_MS);
+            timer.unref?.();
+          }),
+        ]);
+      } catch {
+        // An unsent notice stays PENDING and the next start sends it; delivery is not the stall.
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      const delivered = this.cp.db.get<{ status: string }>(
+        `SELECT status FROM outbox WHERE message_id = ?`, [routing.messageId],
+      );
+      stall = { ...stall, routing: { ...routing, deliveryStatus: delivered?.status ?? routing.deliveryStatus } };
+      this.#startStall = stall;
+      this.writeHealth(report);
+    }
+    return stall;
   }
 
   private recordLockContention(evidence: Record<string, unknown>): void {
