@@ -2362,9 +2362,9 @@ export const createDaemonBuzzMentionSink = (
  * for it, `CRITICAL_SYSTEM_FAILURE`, beside the subscriber's stderr line.
  *
  * The subscriber's incident route: offered the outage's first report until this returns `true`, at
- * each stall and each health tick while the outage lasts, so a notice refused (no live CEO binding,
- * say: `notify` records CEO_NOTIFICATION_BLOCKED) is enqueued once a CEO is bound. One notice per
- * outage: once enqueued it is not offered again, and the row's idempotency key covers the outage's
+ * each stall and each health tick, after the outage has ended too, so a notice refused (no live CEO
+ * binding, say: `notify` records CEO_NOTIFICATION_BLOCKED) is enqueued once a CEO is bound. One notice
+ * per outage: once enqueued it is not offered again, and the row's idempotency key covers the outage's
  * identity and the second it was found, so the next outage is a new one. No run owns it, so it names
  * none. A refusal is said on stderr at the first attempt only; the subscriber is never stopped by
  * its own report.
@@ -2374,7 +2374,7 @@ const notifyCeoOfBuzzMentionStall = (cp: ControlPlane, report: BuzzMentionStallR
     if (attempt === 1) {
       process.stderr.write(
         `Buzz mention subscriber outage for ${report.identity} was not routed to the CEO: ${why}; ` +
-          "it is offered again while the outage lasts\n",
+          "it is offered again until it is taken\n",
       );
     }
     return false;
@@ -2392,7 +2392,9 @@ const notifyCeoOfBuzzMentionStall = (cp: ControlPlane, report: BuzzMentionStallR
         `Buzz mentions for ${report.roleKey ?? report.identity} are not being delivered: ` +
         (report.cause === "UNANSWERED"
           ? `the relay had not answered its subscription for ${report.quietSeconds}s on an open connection.`
-          : "a probe found a stored mention its subscription never delivered.") +
+          : report.cause === "MISSED_EVENTS"
+            ? "a probe found a stored mention its subscription never delivered."
+            : "a probe could not page past one second holding a full page of stored mentions, so their delivery could not be shown.") +
         " The daemon keeps reconnecting from the preserved window, so missed mentions arrive once it answers; " +
         "doctor's BUZZ_MENTION_SUBSCRIBER_STALE finding says whether the outage is still open.",
     }));

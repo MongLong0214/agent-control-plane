@@ -128,26 +128,47 @@ export const LIVENESS_PROBE_GRACE_SECONDS = 10;
 
 /**
  * The most stored events one probe page asks the relay for, per filter: the bound on what one probe
- * costs the relay. A probe asks from its floor, which moves only past durable admissions, so after a
- * quiet spell its range can hold more than this; it then pages back with `until`, one page per
- * health tick, and the sweep is complete at the first page that comes back short. A relay whose own
- * cap is lower than this would make a capped page look short, so this stays below the common caps.
+ * costs the relay. A probe asks from its floor, at least a day back, so its range can hold more than
+ * this; it then pages back with `until`, one page per health tick, and the sweep is complete at the
+ * first page that comes back short. A relay whose own cap is lower than this would make a capped page
+ * look short, so this stays below the common caps.
  */
 export const LIVENESS_PROBE_PAGE_LIMIT = 200;
 
 /**
- * The `until` of a probe sweep's next page, given the `created_at` of every distinct event the last
- * page returned, or `null` when that page came back short and the sweep is complete.
+ * How far back, at the least, every probe sweep asks (#1283), by the events' own `created_at`: a
+ * day, the lifetime of the seam's replay slot. The CEO may change it.
+ *
+ * A relay filters by `created_at` only, so a mention signed long before it is published is found
+ * only by asking back that far. The durable floor alone is not enough: admitting a newer mention
+ * says nothing about whether an older one has reached the relay yet. So a probe asks from whichever
+ * is older, the durable floor or now less this. A mention signed more than this before it was
+ * published, while the live push was down, is outside the guarantee.
+ */
+export const LIVENESS_PROBE_LOOKBACK_GUARANTEE_SECONDS = 24 * 60 * 60;
+
+/**
+ * How many outages one identity keeps owing a notice for while the incident route refuses them (no
+ * CEO bound, say). Past it the oldest is dropped; each outage is still on stderr once.
+ */
+export const OWED_STALL_INCIDENT_LIMIT = 16;
+
+/**
+ * Where a probe sweep goes after a page, given the `created_at` of every distinct event the page
+ * returned and the page's `until`: `DONE` when the page came back short, `SATURATED` when it was full
+ * and cannot move, otherwise the next page's `until`.
  *
  * A page holds at most the limit per filter, so the limit-th newest event it returned is no newer
  * than the oldest event of any filter that filled its page: everything newer was seen. `until` is
- * inclusive, so events sharing that second are asked again; a page that would not move moves one
- * second, so a relay holding more than the limit in one second cannot hold a sweep in place.
+ * inclusive, so the next page asks that second again, and what the sweep already judged in it is not
+ * judged twice. A full page whose limit-th newest is in its own `until` second cannot move: asked
+ * again, the relay returns the same page, and it may hold more in that second than a page shows. That
+ * second cannot be shown delivered, so the sweep is not certified, never skipped past.
  */
-const nextProbePageUntil = (returned: readonly number[], until: number | null): number | null => {
-  if (returned.length < LIVENESS_PROBE_PAGE_LIMIT) return null;
+const nextProbePage = (returned: readonly number[], until: number | null): { readonly until: number } | "DONE" | "SATURATED" => {
+  if (returned.length < LIVENESS_PROBE_PAGE_LIMIT) return "DONE";
   const next = [...returned].sort((a, b) => b - a)[LIVENESS_PROBE_PAGE_LIMIT - 1]!;
-  return until !== null && next >= until ? until - 1 : next;
+  return until !== null && next >= until ? "SATURATED" : { until: next };
 };
 
 /** How an identity's secret key is written in its file. Declared, never sniffed. */
@@ -742,9 +763,10 @@ export type BuzzMentionAdmissionReporter = (change: BuzzMentionAdmissionChange) 
 
 /**
  * Why a subscription was judged stalled: the relay answered nothing on its connection within the
- * bound, or it answered a probe with stored events the subscription itself never delivered.
+ * bound, it answered a probe with stored events the subscription itself never delivered, or a probe
+ * sweep could not page past one second holding a full page, so delivery there cannot be shown.
  */
-export type BuzzMentionStallCause = "UNANSWERED" | "MISSED_EVENTS";
+export type BuzzMentionStallCause = "UNANSWERED" | "MISSED_EVENTS" | "UNCERTIFIED";
 
 /** One identity's subscription found stalled and replaced (#1283). The first of an outage only. */
 export interface BuzzMentionStallReport {
@@ -765,9 +787,9 @@ export type BuzzMentionStallReporter = (report: BuzzMentionStallReport) => void;
 
 /**
  * Where an outage is routed as an incident (#1283): `true` once it is taken. Called with the
- * outage's first report, again at each stall and each liveness step while the outage lasts and it
- * has not been taken, and never once it has. `attempt` counts from 1, so a router can say once why
- * it refused rather than on every tick.
+ * outage's first report, again at each stall and each liveness step until it has been taken, after
+ * the outage has ended too, and never once it has. `attempt` counts from 1, so a router can say once
+ * why it refused rather than on every tick.
  */
 export type BuzzMentionStallRouter = (report: BuzzMentionStallReport, attempt: number) => boolean;
 
@@ -1457,25 +1479,31 @@ class BuzzMentionSubscription {
   /** A probe's subscription id is this, then its number; it can never equal `#subscriptionId`. */
   readonly #probePrefix = `live-${this.#subscriptionId}-`;
   /**
-   * Where a probe asks from, by the events' own `created_at`: the oldest point the seam's durable
-   * record has not yet certified. Per identity, not per connection. Set to the window (`#since`) when
-   * the identity's first subscription reaches `EOSE`, and moved on only by a sweep that came back
-   * clean, and then only to the window as it stood when that sweep began: a point durable admissions
-   * reached and the sweep found nothing undelivered behind. Never by local time, so a mention signed
-   * long before it reaches the relay is still asked for when it does.
+   * The durable floor, by the events' own `created_at`: the oldest point the seam's durable record
+   * has not yet certified. Per identity, not per connection. Set to the window (`#since`) when the
+   * identity's first subscription reaches `EOSE`, and moved on only by a sweep that came back clean,
+   * and then only to the window as it stood when that sweep began: a point durable admissions reached
+   * and the sweep found nothing undelivered behind. Never by local time. A sweep asks from this or
+   * from `LIVENESS_PROBE_LOOKBACK_GUARANTEE_SECONDS` back, whichever is older.
    */
   #probeFloor: number | null = null;
   /**
-   * The sweep from the floor in progress: the `until` of its next page (`null`: the newest stored
-   * events) and the point a clean finish moves the floor to.
+   * The sweep in progress: the `since` every page of it asks from, the `until` of its next page
+   * (`null`: the newest stored events), the point a clean finish moves the floor to, and the events it
+   * has already judged, so the inclusive `until` second asked again is not judged twice.
    */
-  #sweep: { until: number | null; readonly certifies: number } | null = null;
+  #sweep: {
+    until: number | null;
+    readonly since: number;
+    readonly certifies: number;
+    readonly judged: Set<string>;
+  } | null = null;
   /** Whether the current connection's subscription has reached `EOSE`; a probe waits for it. */
   #caughtUp = false;
   /**
    * Event ids the subscription itself delivered, with their `created_at`; read only by the probe,
    * and only for what the durable record cannot say (a refused event leaves no admission). Never
-   * evicted by count: an id goes only once it is below the floor, where no probe asks.
+   * evicted by count: an id goes only once it is below where every later sweep asks from.
    */
   readonly #heard = new Map<string, number>();
   #stalls = 0;
@@ -1485,9 +1513,11 @@ class BuzzMentionSubscription {
    * comes back clean. A replacement connection's `EOSE` is an answer, not the end of an outage.
    */
   #outageSince: number | null = null;
-  /** The outage's first report while `routeStall` has not taken it, and how often it was offered. */
-  #owedIncident: BuzzMentionStallReport | null = null;
-  #incidentAttempts = 0;
+  /**
+   * Each outage's first report that `routeStall` has not taken yet, oldest first, and how often it
+   * was offered. Kept after the outage ends: an outage is owed its notice until the route takes it.
+   */
+  #owedIncidents: { readonly report: BuzzMentionStallReport; attempts: number }[] = [];
 
   constructor(
     deps: SubscriptionDeps,
@@ -1988,13 +2018,15 @@ class BuzzMentionSubscription {
    * has stopped.
    *
    * The probe pages: at most `LIVENESS_PROBE_PAGE_LIMIT` events per filter, one page per step, back
-   * from the newest with `until` until a page comes back short. That is all it costs the relay.
+   * from the newest with `until` until a page comes back short. That is all it costs the relay. A
+   * full page that cannot move past its `until` second is the third stall: that second cannot be
+   * shown delivered.
    *
-   * An outage the incident route has not yet taken is offered to it again here, on every step while
-   * the outage lasts, whatever the connection is doing.
+   * An outage notice the incident route has not yet taken is offered to it again here, on every
+   * step until it is, whatever the connection is doing and whether or not the outage is over.
    */
   checkLiveness(): void {
-    this.#routeIncident();
+    this.#routeIncidents();
     const generation = this.#generation;
     if (!this.admitted || this.#socket === null || !this.#isCurrent(generation)) return;
     const now = this.#deps.scheduler.nowSeconds();
@@ -2009,17 +2041,24 @@ class BuzzMentionSubscription {
     // probe at a time: an unanswered or refused one ages into a stall.
     const floor = this.#probeFloor;
     if (!this.#caughtUp || this.#probe !== null || floor === null) return;
-    // A sweep that comes back clean certifies the window as it stands when the sweep begins: the
-    // point durable admissions have reached, never past what the grace leaves unjudged.
+    // A sweep asks from the durable floor or the lookback guarantee, whichever is older, so a mention
+    // signed before a newer admission and published after it is still asked for. One that comes back
+    // clean certifies the window as it stands when the sweep begins: the point durable admissions
+    // have reached, never past what the grace leaves unjudged.
     if (this.#sweep === null) {
-      this.#sweep = { until: null, certifies: Math.min(this.#since ?? floor, now - LIVENESS_PROBE_GRACE_SECONDS) };
+      this.#sweep = {
+        until: null,
+        since: Math.max(0, Math.min(floor, now - LIVENESS_PROBE_LOOKBACK_GUARANTEE_SECONDS)),
+        certifies: Math.min(this.#since ?? floor, now - LIVENESS_PROBE_GRACE_SECONDS),
+        judged: new Set(),
+      };
     }
     this.#probes += 1;
     const id = `${this.#probePrefix}${this.#probes}`;
     this.#probe = { id, sentAt: now, missedFrom: null, returned: new Map() };
     try {
       const page = { limit: LIVENESS_PROBE_PAGE_LIMIT, until: this.#sweep.until };
-      this.#send(generation, JSON.stringify(["REQ", id, ...this.#filters(floor, page)]));
+      this.#send(generation, JSON.stringify(["REQ", id, ...this.#filters(this.#sweep.since, page)]));
     } catch {
       // A socket that refuses the write is not a connection anything arrives on.
       this.#reconnect(generation);
@@ -2054,7 +2093,7 @@ class BuzzMentionSubscription {
     this.#answeredAt = now;
   }
 
-  /** Records an event the subscription delivered, for the probe; dropped only below the floor. */
+  /** Records an event the subscription delivered, for the probe; dropped only below every later sweep. */
   #hear(event: { readonly id: string; readonly created_at: number }): void {
     this.#heard.set(event.id, event.created_at);
   }
@@ -2104,29 +2143,31 @@ class BuzzMentionSubscription {
         boundSeconds: SUBSCRIPTION_LIVENESS_BOUND_SECONDS,
         outageSinceSeconds: now,
       };
-      this.#owedIncident = this.#deps.routeStall === null ? null : report;
-      this.#incidentAttempts = 0;
+      if (this.#deps.routeStall !== null) {
+        this.#owedIncidents.push({ report, attempts: 0 });
+        if (this.#owedIncidents.length > OWED_STALL_INCIDENT_LIMIT) this.#owedIncidents.shift();
+      }
       this.#deps.reportStall(report);
     }
-    this.#routeIncident();
+    this.#routeIncidents();
   }
 
   /**
-   * Offers the open outage's first report to the incident route until it is taken: one notice per
-   * outage, and an outage whose notice was refused (no CEO bound yet, say) is still owed one.
+   * Offers each owed outage report to the incident route until it is taken: one notice per outage,
+   * and an outage whose notice was refused (no CEO bound yet, say) is still owed one, over or not.
    */
-  #routeIncident(): void {
-    const report = this.#owedIncident;
+  #routeIncidents(): void {
     const route = this.#deps.routeStall;
-    if (report === null || route === null) return;
-    this.#incidentAttempts += 1;
-    let taken = false;
-    try {
-      taken = route(report, this.#incidentAttempts) === true;
-    } catch {
-      // Not taken: offered again on the next stall or step while the outage lasts.
-    }
-    if (taken) this.#owedIncident = null;
+    if (route === null || this.#owedIncidents.length === 0) return;
+    this.#owedIncidents = this.#owedIncidents.filter((owed) => {
+      owed.attempts += 1;
+      try {
+        return route(owed.report, owed.attempts) !== true;
+      } catch {
+        // Not taken: offered again on the next stall or step.
+        return true;
+      }
+    });
   }
 
   /** Whether `id` names one of this connection's probes, current or already ended. */
@@ -2150,44 +2191,56 @@ class BuzzMentionSubscription {
     // Checked as the subscription checks it, so an event the subscription would have refused before
     // hearing it (not signed by its author) is not counted against it either.
     if (!verifyEvent(event)) return ACCEPTED;
-    if (event.created_at <= probe.sentAt - LIVENESS_PROBE_GRACE_SECONDS && !this.#delivered(event)) {
-      probe.missedFrom = Math.min(probe.missedFrom ?? event.created_at, event.created_at);
-    }
+    if (event.created_at > probe.sentAt - LIVENESS_PROBE_GRACE_SECONDS) return ACCEPTED;
+    // The inclusive `until` hands the last page's oldest second back; what this sweep judged there
+    // is not judged again.
+    const judged = this.#sweep?.judged;
+    if (judged?.has(event.id) === true) return ACCEPTED;
+    judged?.add(event.id);
+    if (!this.#delivered(event)) probe.missedFrom = Math.min(probe.missedFrom ?? event.created_at, event.created_at);
     return ACCEPTED;
   }
 
   /**
    * The relay ended a probe page with `EOSE`: the one answer that says what the subscription should
-   * have delivered. With a missed event it is a stall whose replacement asks from that event. Clean
-   * and full, the sweep goes on to the next page at the next step. Clean and short, the sweep reached
-   * the floor: the outage, if any, is over, and the floor moves to what the sweep certified.
+   * have delivered. With a missed event it is a stall whose replacement asks from that event. Full
+   * and unable to move past its `until` second, it is a stall too, whose replacement asks from that
+   * second: what the relay holds there beyond a page cannot be shown delivered. Clean and full, the
+   * sweep goes on to the next page at the next step. Clean and short, the sweep reached its floor: the
+   * outage, if any, is over (its notice stays owed until taken), and the floor moves to what the sweep
+   * certified.
    */
   #onProbeEnd(id: string, generation: number): BuzzMentionFrameOutcome {
     const probe = this.#probe;
     if (probe === null || probe.id !== id || !this.#isCurrent(generation)) return ACCEPTED;
     this.#probe = null;
     this.#send(generation, JSON.stringify(["CLOSE", id]));
+    const now = this.#deps.scheduler.nowSeconds();
     if (probe.missedFrom !== null) {
       this.#sweep = null;
-      this.#stalled(generation, "MISSED_EVENTS", this.#deps.scheduler.nowSeconds() - this.#heardAt, probe.missedFrom);
+      this.#stalled(generation, "MISSED_EVENTS", now - this.#heardAt, probe.missedFrom);
+      return ACCEPTED;
+    }
+    const sweep = this.#sweep;
+    const next = sweep === null ? "DONE" : nextProbePage([...probe.returned.values()], sweep.until);
+    if (next === "SATURATED") {
+      this.#sweep = null;
+      this.#stalled(generation, "UNCERTIFIED", now - this.#heardAt, sweep?.until ?? null);
       return ACCEPTED;
     }
     this.#answered();
-    const sweep = this.#sweep;
     if (sweep === null) return ACCEPTED;
-    const until = nextProbePageUntil([...probe.returned.values()], sweep.until);
-    if (until !== null) {
-      sweep.until = until;
+    if (next !== "DONE") {
+      sweep.until = next.until;
       return ACCEPTED;
     }
     this.#sweep = null;
     this.#outageSince = null;
-    this.#owedIncident = null;
-    if (this.#probeFloor !== null && sweep.certifies > this.#probeFloor) {
-      this.#probeFloor = sweep.certifies;
-      for (const [eventId, createdAt] of this.#heard) {
-        if (createdAt < sweep.certifies) this.#heard.delete(eventId);
-      }
+    if (this.#probeFloor !== null && sweep.certifies > this.#probeFloor) this.#probeFloor = sweep.certifies;
+    // Every later sweep asks from at least this low: the floor only rises and now only advances.
+    const below = Math.min(this.#probeFloor ?? sweep.certifies, now - LIVENESS_PROBE_LOOKBACK_GUARANTEE_SECONDS);
+    for (const [eventId, createdAt] of this.#heard) {
+      if (createdAt < below) this.#heard.delete(eventId);
     }
     return ACCEPTED;
   }
