@@ -33,7 +33,7 @@ const git = (cwd: string, ...args: readonly string[]): string =>
   execFileSync("git", ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", ...args],
     { cwd, encoding: "utf8", timeout: 30_000, env: { ...process.env, ...IDENTITY, GIT_DIR: undefined, GIT_WORK_TREE: undefined } }).trim();
 
-/** As `gh`: the pull request, its one green run, a merge-commit-only merge composed in the bare origin, and the REST read-back. */
+/** As `gh`: the pull request, its one green run, the base-to-head compare, a merge-commit-only merge composed in the bare origin, and the REST read-back. */
 const GH = String.raw`
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
@@ -65,6 +65,11 @@ if (args[0] === "pr" && args[1] === "view") {
   const merged = origin("commit-tree", tree, ...parents, "-F", world.composed);
   origin("update-ref", "refs/heads/main", merged);
   fs.writeFileSync(world.state, JSON.stringify({ merged }));
+} else if (args[0] === "api" && /\/compare\/[0-9a-f]+\.\.\.[0-9a-f]+$/.test(args[1])) {
+  const [base, head] = args[1].split("/compare/")[1].split("...");
+  let contained = true;
+  try { origin("merge-base", "--is-ancestor", base, head); } catch { contained = false; }
+  process.stdout.write(JSON.stringify({ status: contained ? "ahead" : "diverged" }));
 } else if (args[0] === "api" && args.includes("--include") && /\/pulls\/\d+$/.test(args[args.length - 1])) {
   const merged = state.merged !== undefined && world.apiMerged !== false;
   process.stdout.write("HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n" +
@@ -90,6 +95,8 @@ interface Options {
   readonly apiMerged?: boolean;
   readonly headRefOid?: string;
   readonly baseRefOid?: string;
+  /** The base gains a commit after the head's green run, so the head no longer contains the base tip. */
+  readonly advanceBase?: boolean;
 }
 
 const mergeWorld = (options: Options = {}) => {
@@ -114,6 +121,16 @@ const mergeWorld = (options: Options = {}) => {
   const head = git(work, "rev-parse", "HEAD");
   git(work, "notes", "--ref=commitlore", "add", "-m", LIMIT, first);
   git(work, "push", "--quiet", "--no-verify", "origin", "main", "feature");
+  let baseRefOid = options.baseRefOid;
+  if (options.advanceBase) {
+    const other = join(dir, "other");
+    git(dir, "clone", "--quiet", "-b", "main", origin, other);
+    writeFileSync(join(other, "c.txt"), "the base moves on\n");
+    git(other, "add", "--all");
+    git(other, "commit", "--quiet", "--no-verify", "-m", "the base moves on");
+    git(other, "push", "--quiet", "--no-verify", "origin", "main");
+    baseRefOid = git(other, "rev-parse", "HEAD");
+  }
   const bin = join(dir, "bin");
   mkdirSync(bin);
   writeFileSync(join(bin, "gh"), `#!${process.execPath}\n${GH}`);
@@ -125,7 +142,7 @@ const mergeWorld = (options: Options = {}) => {
   writeFileSync(join(dir, "world.json"), JSON.stringify({
     origin, base, first, head, number: 8, ...files,
     tamper: options.tamper, noSync: options.noSync ?? false, apiMerged: options.apiMerged,
-    headRefOid: options.headRefOid, baseRefOid: options.baseRefOid,
+    headRefOid: options.headRefOid, baseRefOid,
   }));
   return { dir, origin, work, base, first, head, files };
 };
@@ -222,6 +239,17 @@ describe("a merge that cannot be read back is refused before it exists", () => {
     const result = merge(mergeWorld({ baseRefOid: "main" }));
     expect(result.merges, result.stdout).toEqual([]);
     expect(result.stdout).toContain("#8's base from GitHub is not one full commit sha (main).");
+    expect(result.status).toBe(1);
+  });
+
+  it("when the base gained a commit after the head's green run: the head does not contain it, so CI never checked the merge's tree", () => {
+    const w = mergeWorld({ advanceBase: true });
+    const result = merge(w);
+    expect(result.merges, result.stdout).toEqual([]);
+    expect(result.merged).toBeUndefined();
+    expect(result.stdout).toContain(`#8's head ${w.head.slice(0, 7)} does not contain the base`);
+    expect(result.stdout).toContain("Update the branch, re-run CI.");
+    expect(result.stdout).not.toContain("RESULT: PASS — #8 merged");
     expect(result.status).toBe(1);
   });
 

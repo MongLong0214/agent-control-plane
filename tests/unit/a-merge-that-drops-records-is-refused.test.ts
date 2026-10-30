@@ -141,7 +141,8 @@ describe("a merge that drops records is refused", () => {
  * GitHub records for the pull request, never a trailer.
  */
 describe("a merge commit is checked by its parents", () => {
-  const repositoryWithAMergeCommit = (secondParent: "head" | "other") => {
+  /** `base-tree`: parents [base, head] as GitHub records them, with the base's tree, so the branch's changes are dropped. */
+  const repositoryWithAMergeCommit = (secondParent: "head" | "other" | "base-tree") => {
     const dir = tempDir("acp-merge-commit-records-");
     const work = join(dir, "work");
     mkdirSync(work, { recursive: true });
@@ -160,8 +161,12 @@ describe("a merge commit is checked by its parents", () => {
     git(work, "commit", "--quiet", "--no-verify", "-am", `feat: the second half\n\n${WARN}`);
     const head = git(work, "rev-parse", "HEAD").trim();
     git(work, "checkout", "--quiet", "main");
-    const merged = secondParent === "head" ? head : first;
-    git(work, "merge", "--quiet", "--no-ff", "--no-verify", "-m", "Merge pull request #7 from acme/feature", merged);
+    if (secondParent === "base-tree") {
+      const dropped = git(work, "commit-tree", `${base}^{tree}`, "-p", base, "-p", head, "-m", "Merge pull request #7 from acme/feature").trim();
+      git(work, "update-ref", "refs/heads/main", dropped);
+    } else {
+      git(work, "merge", "--quiet", "--no-ff", "--no-verify", "-m", "Merge pull request #7 from acme/feature", secondParent === "head" ? head : first);
+    }
     const merge = git(work, "rev-parse", "HEAD").trim();
     git(work, "remote", "add", "origin", work);
     const env = fakeGitHub(dir, { 7: { merged: true, mergeCommit: merge, head } });
@@ -172,7 +177,7 @@ describe("a merge commit is checked by its parents", () => {
       const failure = error as { status?: number; stdout?: string; stderr?: string };
       result = { status: failure.status ?? -1, out: `${failure.stdout ?? ""}${failure.stderr ?? ""}` };
     }
-    return { ...result, head, first, merge };
+    return { ...result, head, first, merge, tree: (sha: string) => git(work, "rev-parse", `${sha}^{tree}`).trim() };
   };
 
   it("passes a merge commit whose second parent is the pull request's head, with the branch's records reachable through it", () => {
@@ -187,5 +192,14 @@ describe("a merge commit is checked by its parents", () => {
     expect(result.out).toContain(`its second parent ${result.first.slice(0, 8)} is not #7's head ${result.head.slice(0, 8)}`);
     expect(result.out).toContain("RESULT: FAIL");
     expect(result.status).toBe(1);
+  });
+
+  it("refuses a merge commit whose parents are the base and the pull request's head but whose tree is the base's, dropping the branch's changes", () => {
+    const result = repositoryWithAMergeCommit("base-tree");
+    const [mergeTree, headTree] = [result.tree(result.merge), result.tree(result.head)];
+    expect(mergeTree).not.toBe(headTree);
+    expect(result.out).toContain(`its tree ${mergeTree.slice(0, 8)} is not #7's head tree ${headTree.slice(0, 8)}`);
+    expect(result.out).not.toContain("RESULT: PASS");
+    expect(result.status, result.out).toBe(1);
   });
 });

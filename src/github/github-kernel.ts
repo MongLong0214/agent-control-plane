@@ -2310,8 +2310,9 @@ export class GitHubKernel {
    * outcome it establishes is recorded: merged, the PENDING receipt is proven as `mergeExecute` proves it;
    * proven unmerged, nothing was applied and the reservation is released; a read that cannot tell keeps it
    * PENDING. No merge is requested from here: an unmerged pull is merged only by the ordinary path, after its
-   * branch, pull request and gate have been published and validated again. `merged` is true only when a
-   * receipt proves the merge; with no receipt there is nothing to settle.
+   * branch, pull request and gate have been published and validated again. A merged pull's proof includes its
+   * candidate's CommitLore notes on the remote, carried here as `mergeExecute` carries them (#1269). `merged` is
+   * true only when a receipt proves the merge; with no receipt there is nothing to settle.
    */
   async mergeSettle(input: MergeInput): Promise<Decision<{ merged: boolean }>> {
     const authority = this.assertAuthority(input.runId, input.repositoryIdentity, input);
@@ -2357,7 +2358,6 @@ export class GitHubKernel {
     mergeRepositoryId: string,
     idempotencyKey: string,
     requestDigest: string,
-    carryNotes = false,
   ): Promise<Decision<{ mergeCommitSha: string; replayed: boolean }> | null> {
     if (this.inFlightReservations.has(idempotencyKey)) {
       return deny(ReasonCode.RESOURCE_COLLISION, "merge operation is in flight", { idempotencyKey });
@@ -2489,11 +2489,12 @@ export class GitHubKernel {
       }
       return proof as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
-    // #1269 — the notes are written only on the merge path; a settle reads them and never writes.
-    const notesTarget = carryNotes ? this.writeTarget(input.runId, input.repositoryIdentity, prepared.value.head) : null;
-    const notes = notesTarget && !notesTarget.allowed
-      ? notesTarget
-      : await this.carryCandidateNotes(input, slug.value.owner, slug.value.repo, notesTarget?.value ?? null);
+    // #1269 — the merge is proven, so its candidate's notes are carried as on the merge path: without that, a
+    // notes upload that failed once would leave the merged pull PENDING on every later settlement.
+    const notesTarget = this.writeTarget(input.runId, input.repositoryIdentity, prepared.value.head);
+    const notes = notesTarget.allowed
+      ? await this.carryCandidateNotes(input, slug.value.owner, slug.value.repo, notesTarget.value)
+      : notesTarget;
     if (!notes.allowed) {
       this.recordPendingMergeProofFailure(input, mergeRepositoryId, idempotencyKey, observedMergeCommitSha, notes);
       return notes as Decision<{ mergeCommitSha: string; replayed: boolean }>;
@@ -2551,7 +2552,7 @@ export class GitHubKernel {
         });
       }
       if (!existing.verified) {
-        const settled = await this.reconcilePendingMerge(input, mergeRepositoryId, idempotencyKey, requestDigest, true);
+        const settled = await this.reconcilePendingMerge(input, mergeRepositoryId, idempotencyKey, requestDigest);
         // Proven unmerged after reclaiming the stale crash-era reservation: the merge is evaluated and sent again.
         return settled ?? this.mergeExecute(input);
       }
@@ -2876,17 +2877,16 @@ export class GitHubKernel {
   /**
    * #1269 — the candidate's CommitLore notes, on the remote. A merge commit keeps the branch's commits, but
    * their notes travel only on `refs/notes/commitlore`, which no merge moves. Every note the registered
-   * checkout holds for a commit of base..head must be on the remote ref as the same blob. With a `target`,
-   * the missing ones are written through the Git Data API (their blobs, a tree on the remote notes tree, a
-   * commit on the remote notes commit, then a fast-forward of the ref); without one nothing is written. The
-   * ref is then read back. A remote note that differs is never overwritten, and every failure is a refusal
-   * the caller records as a pending proof failure.
+   * checkout holds for a commit of base..head must be on the remote ref as the same blob. The missing ones
+   * are written through the Git Data API (their blobs, a tree on the remote notes tree, a commit on the
+   * remote notes commit, then a fast-forward of the ref), and the ref is then read back. A remote note that
+   * differs is never overwritten, and every failure is a refusal the caller records as a pending proof failure.
    */
   private async carryCandidateNotes(
     input: MergeInput,
     owner: string,
     repo: string,
-    target: GitHubWriteTarget | null,
+    target: GitHubWriteTarget,
   ): Promise<Decision<{ notes: number }>> {
     const refused = (message: string, evidence: Record<string, unknown> = {}) =>
       deny<{ notes: number }>(ReasonCode.EVIDENCE_MISSING, message, { phase: "postflight-notes", ref: NOTES_REF, ...evidence });
@@ -2918,7 +2918,6 @@ export class GitHubKernel {
     }
     const missing = owed.filter((note) => !before.value.notes.has(note.object));
     if (missing.length > 0) {
-      if (!target) return refused("the remote does not carry the candidate's notes", { objects: missing.map((note) => note.object) });
       let contents: Buffer[];
       try {
         contents = await Promise.all(missing.map(async (note) => (await gitBytes(checkout, ["cat-file", "blob", note.blob])).stdout));

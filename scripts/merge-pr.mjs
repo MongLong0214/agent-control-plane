@@ -18,8 +18,10 @@
  *
  * It refuses to merge on anything but an observed-green head, because "the CI was green" is a claim
  * about a specific commit and the head can move between reading and merging; the same sha goes to
- * `--match-head-commit`, so GitHub merges that head or nothing. GitHub's merge API takes no expected
- * base, so the base is read back instead: a base that moved in between fails loudly after the merge.
+ * `--match-head-commit`, so GitHub merges that head or nothing. It refuses, too, a head that does
+ * not already contain the base tip: CI checked the head's tree, and only then is the merge's tree
+ * that same tree. GitHub's merge API takes no expected base, so the base is read back instead: a
+ * base that moved in between fails loudly after the merge.
  *
  * After the merge it is read back -- and any mismatch fails loudly, because the merge cannot be
  * undone: GitHub reports the pull request merged at that commit; its parents are exactly the base
@@ -161,8 +163,19 @@ for (const status of (pr.statusCheckRollup ?? []).filter((c) => c.context === RE
   if (status.state !== "SUCCESS") fail(`the \`${REQUIRED_CHECK}\` commit status on ${short} is ${status.state}.`);
 }
 
+// The head must already contain the base tip. CI checked the head's tree; merged onto a base it does
+// not contain, the merge commit's tree is one no CI run saw, however green the head. GitHub's compare
+// answers it for these exact two shas, so nothing local has to be fetched first.
+const compared = ghJson(
+  ["api", `repos/{owner}/{repo}/compare/${base}...${head}`, "--jq", "{status: .status}"],
+  `how ${short} compares with the base ${base.slice(0, 7)}`,
+)?.status;
+if (compared !== "ahead" && compared !== "identical") {
+  fail(`#${number}'s head ${short} does not contain the base ${base.slice(0, 7)} (GitHub compares it as ${String(compared)}), so CI never checked the tree this merge would make. Update the branch, re-run CI.`);
+}
+
 process.stdout.write(
-  `\n  #${number} ${pr.title}\n  head ${short} — \`${REQUIRED_CHECK}\` green in ${named}\n`,
+  `\n  #${number} ${pr.title}\n  head ${short} — \`${REQUIRED_CHECK}\` green in ${named}, contains base ${base.slice(0, 7)}\n`,
 );
 
 if (dryRun) {

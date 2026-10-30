@@ -7,7 +7,7 @@ import { Daemon } from "../../src/daemon/daemon.ts";
 import { RunState, Role, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
-import { cleanupTempDirs, commitAll, tempDir, writeFiles } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, gitSync, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { bindCeo, driveToReviewedCandidate, makeHarness } from "../helpers/harness.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
 
@@ -542,6 +542,31 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
       expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === kind), kind).toHaveLength(0);
     }
     expect(outboxOf(fixture, "REVISION_REQUEST")).toHaveLength(0);
+    await daemon.stop();
+  });
+
+  it("#1269: a merge whose answer was lost is settled by the daemon's next attempt, which carries the candidate's CommitLore notes to the remote without a second merge", async () => {
+    let lose = true;
+    const fixture = await approved({
+      after: (method, path) => {
+        if (isMergePut(method, path) && lose) {
+          lose = false;
+          throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method });
+        }
+      },
+    });
+    const { harness, driven, daemon } = fixture;
+    gitSync(harness.repoPath, ["notes", "--ref=commitlore", "add", "-m", "Limit: a record kept only in a note", driven.candidateHead]);
+    const blob = gitSync(harness.repoPath, ["notes", "--ref=commitlore", "list", driven.candidateHead]);
+    expect((await daemon.start()).allowed).toBe(true);
+    expectHeld(fixture, { outcome: "unheard" });
+    expect(fixture.github.remoteNoteFor(driven.candidateHead)).toBeUndefined();
+    harness.clock.advance(MINUTE);
+    await daemon.resumeApprovedRuns();
+    expect(fixture.github.remoteNoteFor(driven.candidateHead)).toBe(blob);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+    expect(mergePuts(fixture)).toBe(1);
+    expect(fixture.github.mergeCount).toBe(1);
     await daemon.stop();
   });
 

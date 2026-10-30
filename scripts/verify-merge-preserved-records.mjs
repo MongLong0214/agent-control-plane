@@ -67,7 +67,9 @@
  * checked is that it is that commit: for each two-parent commit naming `(#N)` (or GitHub's own
  * `Merge pull request #N`) that GitHub reports as #N's merge commit, it has exactly two parents and
  * the second is #N's head as GitHub records it. The head comes from the commit's own parents, never
- * from a trailer. A second parent that is not #N's head refuses.
+ * from a trailer. A second parent that is not #N's head refuses. So does a tree other than that
+ * head's: a pull request merges only once its head contains the base, so its merge commit's tree is
+ * the tree CI checked, and any other tree dropped or added changes no check saw.
  *
  * The API is `gh api`; `ACP_MERGE_RECORDS_GH` names another executable that answers the same call,
  * which is how the tests run it offline. The repository is `GITHUB_REPOSITORY`, or origin's GitHub
@@ -272,7 +274,8 @@ export const examineSquash = (squash, pull) => {
 
 /**
  * #1269 — #N's merge commit M, read from its own parents: exactly two, the second #N's head as GitHub
- * records it. `wrongHead` names a second parent that is not that head; the branch is `M^1..M^2`.
+ * records it. `wrongHead` names a second parent that is not that head; `wrongTree` names M's tree when
+ * it is not that head's tree; the branch is `M^1..M^2`.
  */
 export const examineMergeCommit = (merge, pull, pullHead) => {
   const short = merge.slice(0, 8);
@@ -280,11 +283,14 @@ export const examineMergeCommit = (merge, pull, pullHead) => {
   const parents = git(`the parents of ${short}`, ["rev-list", "--parents", "-n", "1", merge]).trim().split(" ").slice(1);
   if (parents.length !== 2) throw new Unanswered(`${short} has ${parents.length} parents, not the base and #${pull}'s head`);
   const [base, head] = parents;
-  if (head !== pullHead) return { base, head, wrongHead: true, recordLines: 0, branchCommits: 0 };
+  if (head !== pullHead) return { base, head, wrongHead: true, wrongTree: null, recordLines: 0, branchCommits: 0 };
+  const tree = git(`the tree of ${short}`, ["rev-parse", "--verify", `${merge}^{tree}`]).trim();
+  const headTree = git(`the tree of #${pull}'s head`, ["rev-parse", "--verify", `${head}^{tree}`]).trim();
+  if (tree !== headTree) return { base, head, wrongHead: false, wrongTree: { tree, headTree }, recordLines: 0, branchCommits: 0 };
   const branch = git(`#${pull}'s branch`, ["rev-list", `${base}..${head}`]).trim().split("\n").filter(Boolean);
   let recordLines = 0;
   for (const sha of branch) recordLines += storedRecordIds(sha).size;
-  return { base, head, wrongHead: false, recordLines, branchCommits: branch.length };
+  return { base, head, wrongHead: false, wrongTree: null, recordLines, branchCommits: branch.length };
 };
 
 /** The pull request a forge-composed commit names: `(#N)` at the end of its subject, or GitHub's `Merge pull request #N`. */
@@ -315,6 +321,7 @@ const main = () => {
   let examined = 0;
   let nonTarget = 0;
   let wrongHeads = 0;
+  let wrongTrees = 0;
   for (const sha of merges) {
     const short = sha.slice(0, 8);
     let pull;
@@ -336,6 +343,11 @@ const main = () => {
       if (merged.wrongHead) {
         wrongHeads += 1;
         out(`  ${short}  #${pull}  its second parent ${merged.head.slice(0, 8)} is not #${pull}'s head ${pr.head.slice(0, 8)}, so it did not merge that pull request`);
+        continue;
+      }
+      if (merged.wrongTree) {
+        wrongTrees += 1;
+        out(`  ${short}  #${pull}  its tree ${merged.wrongTree.tree.slice(0, 8)} is not #${pull}'s head tree ${merged.wrongTree.headTree.slice(0, 8)}, so it is not the tree CI checked`);
         continue;
       }
       out(`  #${pull}  ${merged.recordLines} record line(s) on ${merged.branchCommits} branch commit(s), reachable from ${short} through its second parent, #${pull}'s head ${merged.head.slice(0, 8)}`);
@@ -391,7 +403,7 @@ const main = () => {
 
   out("");
   out(`verify-merge-preserved-records: ${examined} merge commit(s) examined, ${nonTarget} attribution non-target, in ${range}.`);
-  if (refused > 0 || unanswered > 0 || wrongHeads > 0) {
+  if (refused > 0 || unanswered > 0 || wrongHeads > 0 || wrongTrees > 0) {
     if (refused > 0) {
       out("A squash cannot preserve them. Pull requests merge as merge commits (`pnpm merge`),");
       out("which keep every branch commit as it was committed.");
@@ -399,6 +411,7 @@ const main = () => {
     const reasons = [
       ...(refused > 0 ? [`${refused} merge commit(s) dropped record lines their branch carried`] : []),
       ...(wrongHeads > 0 ? [`${wrongHeads} merge commit(s) whose second parent is not their pull request's head`] : []),
+      ...(wrongTrees > 0 ? [`${wrongTrees} merge commit(s) whose tree is not their pull request's head tree`] : []),
       ...(unanswered > 0 ? [`${unanswered} commit(s) could not be checked`] : []),
     ];
     out(`RESULT: FAIL — ${reasons.join("; ")}.`);
