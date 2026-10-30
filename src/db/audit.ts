@@ -204,6 +204,9 @@ const AUDIT_EVIDENCE_KEYS: ReadonlySet<string> = new Set([
   "startedAt", "status", "statuses", "takeover", "target", "targetBranch", "targetPath", "targetWorktreeId",
   "taskCount", "taskId", "taskReceiptId", "assignedWorktreeId", "claimedPath", "overlap", "candidates", "liveWorktreeIds", "liveWorktreeIdsByRepository", "worktreePath", "threshold", "timer", "to", "toGeneration", "toSessionId", "trigger",
   "triggeredScopes", "uncovered", "verdict", "viaRunKind", "worktreeId", "ok",
+  // #1271 — an upstream dogfood finding's public text, built from scrubbed fields before it is recorded
+  // (quality/upstream-dogfood.ts); `expected` and `evidence` are above.
+  "actual", "impact", "problem", "reproduction", "workaround",
 ]);
 
 const isPlainRecord = (value: object): value is Record<string, unknown> => {

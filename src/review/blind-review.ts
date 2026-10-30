@@ -1,4 +1,5 @@
 import { FRONTIER_SIMPLIFY_SOURCE, frontierReviewPolicy, type FrontierSimplifySource } from "./frontier-simplify-policy.ts";
+import { DogfoodFindingStore } from "../quality/upstream-dogfood.ts";
 import { frozenBootstrapReviewEvidence, originalReviewRecords, type FrozenReviewEvidence, type ReviewEvidenceFile } from "../bootstrap/bootstrap-review-evidence.ts";
 import type { ReviewRecordVerification } from "../bootstrap/bootstrap-review-evidence-github.ts";
 import { bootstrapServingRuntime, bootstrapCodeGuarantees, type BootstrapRuntimeObservation } from "../bootstrap/bootstrap-runtime-observation.ts";
@@ -247,7 +248,14 @@ export interface ReviewPacket {
   extraClaims?: string[];
   omittedItems: string[];
   verdict: ReviewVerdict;
+  /** The candidate's findings. A `method` finding is never one of them (`methodFindings`). */
   findings: ReviewFinding[];
+  /**
+   * #1271 — present only when the reviewer returned `method` findings: gaps in the frontier-simplify
+   * method, not in the candidate. Kept apart so they never weigh on the candidate; they are recorded
+   * as frontier-simplify dogfood findings bound to this review, and nothing else reads them.
+   */
+  methodFindings?: ReviewFinding[];
   chunked: boolean;
   /**
    * Issue #246 PR-C slice C2 — present only on a BOOTSTRAP_PLAN review: the PLAN, manifest and
@@ -440,9 +448,10 @@ const VERDICT_SCHEMA = {
         properties: {
           category: {
             type: "string",
+            description: "method: a defect or gap in the frontier-simplify review method itself, not in the candidate. It is recorded for frontier-simplify and is never a reason for the verdict.",
             enum: [
               "correctness", "regression", "security", "scope", "performance",
-              "maintainability", "evidence", "freshness", "source",
+              "maintainability", "evidence", "freshness", "source", "method",
             ],
           },
           severity: { type: "string", enum: ["INFO", "MINOR", "MAJOR", "BLOCKER"] },
@@ -1025,6 +1034,23 @@ export class BlindReviewGate {
       },
     });
 
+    // #1271 — a REVISE or BLOCK whose only grounds are method findings judges the review method, not the
+    // candidate: it is no revision request and no PASS. The candidate waits for a fresh review, as after an
+    // unavailable one; the method findings are recorded with the review. A verdict with no findings at
+    // all, or with any finding about the candidate, is unchanged.
+    if (
+      validated.verdict !== "PASS" &&
+      validated.findings.length === 0 &&
+      validated.omittedItems.length === 0 &&
+      validated.methodFindings !== undefined
+    ) {
+      return deny(ReasonCode.REVIEW_REQUIRED, `blind review returned ${validated.verdict} on method findings alone; the candidate needs a fresh review`, {
+        runId,
+        problem: "METHOD_FINDINGS_ONLY",
+        verdict: validated.verdict,
+        methodFindings: validated.methodFindings.length,
+      });
+    }
     if (validated.verdict !== "PASS") {
       return deny(
         validated.verdict === "REVISE" ? ReasonCode.REVIEW_REVISE : ReasonCode.REVIEW_BLOCK,
@@ -1082,8 +1108,17 @@ export class BlindReviewGate {
     packet: ReviewPacket, reviewer: ReviewerBinding, attemptId: string | undefined, packetDigests?: ReviewPacketDigests,
   ): Decision<void> {
     try {
-      this.artifacts.putEvidence(this.evidenceWriter, packet.runId, ArtifactKind.BLIND_REVIEW, packet, packet.candidateSnapshotDigest,
-        packetDigests);
+      // #1271 — the review and the frontier-simplify findings its reviewer returned are kept in one
+      // transaction, bound to this review: a method finding exists exactly when the review carrying it does.
+      // Recording one never fails the review; a finding the store refuses is left out.
+      this.db.tx(() => {
+        const stored = this.artifacts.putEvidence(this.evidenceWriter, packet.runId, ArtifactKind.BLIND_REVIEW, packet, packet.candidateSnapshotDigest,
+          packetDigests);
+        if (packet.methodFindings !== undefined) {
+          new DogfoodFindingStore({ db: this.db, audit: this.audit, artifacts: this.artifacts, clock: this.clock })
+            .recordReviewMethodFindings(packet.runId, stored.artifactId);
+        }
+      });
       return allow(ReasonCode.OK, undefined);
     } catch (error) {
       if (!isAcpError(error) || error.reasonCode !== ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED) throw error;
@@ -2228,6 +2263,7 @@ export class BlindReviewGate {
     planReview: boolean;
   }): ReviewPacket {
     const planReview = input.planReview;
+    const methodFindings = input.raw.findings.filter((finding) => finding.category === "method");
     return {
       runId: input.request.runId,
       candidateSnapshotDigest: input.snapshotDigest,
@@ -2275,7 +2311,8 @@ export class BlindReviewGate {
       // #1254 G-4 — the findings as the reviewer wrote them. The artifact store checks them, like every
       // other field of the packet, before anything is stored, so a credential in a finding refuses the
       // review through `storeReview`'s refusal record instead of being rewritten into a stored verdict.
-      findings: [...input.raw.findings],
+      findings: input.raw.findings.filter((finding) => finding.category !== "method"),
+      ...(methodFindings.length === 0 ? {} : { methodFindings }),
       chunked: input.chunked,
       ...(input.bootstrapPlan === null ? {} : { bootstrapPlan: input.bootstrapPlan }),
       ...(input.bootstrapPlanIntentDigest === undefined ? {} : { bootstrapPlanIntentDigest: input.bootstrapPlanIntentDigest }),
