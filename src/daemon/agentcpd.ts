@@ -88,6 +88,7 @@ import {
   type BuzzMentionIdentityJudgement,
   type BuzzMentionRegistry,
   type BuzzMentionSink,
+  type BuzzMentionStallReporter,
   type BuzzMentionSubscriberHandle,
   type BuzzMentionVerdict,
   type BuzzRelaySocketFactory,
@@ -2358,6 +2359,8 @@ export const startDaemonBuzzMentionSubscriber = (
     canonical?: BuzzMentionCanonicalEntries | null;
     /** Where admission changes are reported; the subscriber's own stderr line when absent. */
     reportAdmission?: BuzzMentionAdmissionReporter;
+    /** Where a stalled subscription is reported (#1283); the subscriber's own stderr line when absent. */
+    reportStall?: BuzzMentionStallReporter;
 
   } = {},
 ): BuzzMentionSubscriberHandle => {
@@ -2377,6 +2380,7 @@ export const startDaemonBuzzMentionSubscriber = (
     ...(options.openSocket ? { openSocket: options.openSocket } : {}),
     ...(options.scheduler ? { scheduler: options.scheduler } : {}),
     ...(options.reportAdmission ? { reportAdmission: options.reportAdmission } : {}),
+    ...(options.reportStall ? { reportStall: options.reportStall } : {}),
 
   }, process.env["ACP_BUZZ_RELAY_URL"]);
   // The file remains the deployment baseline; resident allocations are merged dynamically.
@@ -5919,8 +5923,13 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     // session that stops, or whose room is rewritten, publishes no binding switch, and an admitted
     // identity would otherwise be judged again only when its next mention arrives. Judged first,
     // so the health written on the same tick reports the result.
+    //
+    // Its liveness step rides it too (#1283): a subscription whose relay stopped answering on an
+    // open connection raises no socket event, so only something that asks finds it. A connection
+    // unanswered past the bound is replaced from its preserved window, and health says STALE.
     setInterval(() => {
       buzzMentionSubscriber?.rejudge();
+      buzzMentionSubscriber?.checkLiveness();
       daemon.writeHealth(null);
     }, 30_000).unref();
     await new Promise<void>(() => undefined);
