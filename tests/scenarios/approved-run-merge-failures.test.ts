@@ -248,11 +248,10 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     await fixture.daemon.stop();
   });
 
-  it("a transient GitHub 5xx backs off, reaches its cap, is handed to the CEO with a blocker, never fails, and a later retry merges", async () => {
-    let outage = true;
+  it("a transient GitHub 5xx backs off 1–16 minutes, stops after 5 automatic retries, is handed to the CEO once with a blocker, and never fails", async () => {
     const fixture = await approved({
       before: (method) => {
-        if (outage) throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method, status: 503 });
+        throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method, status: 503 });
       },
     });
     const { harness, driven, daemon } = fixture;
@@ -260,9 +259,10 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     expect(started.allowed).toBe(true);
     expect(failedAttempts(fixture)).toBe(1);
 
-    // Backoff: 1, 2, 4, 8, 16 and 32 minutes, then the hourly ceiling; an early sweep attempts nothing.
+    // The first attempt is not a retry; retries follow at 1, 2, 4, 8 and 16 minutes, and an early sweep
+    // attempts nothing.
     let elapsed = 0;
-    for (const [delay, attempts] of [[1, 2], [2, 3], [4, 4], [8, 5], [16, 6], [32, 7]] as const) {
+    for (const [delay, attempts] of [[1, 2], [2, 3], [4, 4], [8, 5], [16, 6]] as const) {
       harness.clock.advance(delay * MINUTE - 30_000);
       await daemon.resumeApprovedRuns();
       expect(failedAttempts(fixture), `${elapsed + delay - 0.5} min`).toBe(attempts - 1);
@@ -275,44 +275,66 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     expect(last.reasonCode).toBe(ReasonCode.PROBE_FAILED);
     expect(last.evidence).toMatchObject({ candidateSnapshotDigest: driven.candidateSnapshotDigest, disposition: "RETRY", failureClass: "TRANSIENT" });
     const schedules = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_RETRY_SCHEDULED");
-    expect(schedules.map((entry) => entry.evidence.refusals)).toEqual([1, 2, 3, 4, 5, 6, 7]);
-    expect(schedules.at(-1)!.evidence).toMatchObject({
-      candidateSnapshotDigest: driven.candidateSnapshotDigest, failureClass: "TRANSIENT", failureCause: "TRANSIENT", threshold: 5,
+    expect(schedules.map((entry) => [entry.evidence.refusals, entry.evidence.retries])).toEqual([[1, 0], [2, 1], [3, 2], [4, 3], [5, 4]]);
+    const exhausted = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_RETRIES_EXHAUSTED");
+    expect(exhausted).toHaveLength(1);
+    expect(exhausted[0]!.evidence).toMatchObject({
+      candidateSnapshotDigest: driven.candidateSnapshotDigest, failureClass: "TRANSIENT", failureCause: "TRANSIENT",
+      refusals: 6, retries: 5, retryCap: 5, limit: "FAILURE",
     });
-    expect(Date.parse(schedules.at(-1)!.evidence.retryNotBefore as string) - harness.clock.now().getTime()).toBe(60 * MINUTE);
+    expect(exhausted[0]!.evidence.retryNotBefore).toBeUndefined();
 
-    // The cap: handed to the CEO once, at the fifth refusal, the run still approved, nothing FAILED and
-    // nothing invalidated.
-    const run = harness.cp.runs.require(driven.runId);
-    expect(run.state).toBe(RunState.CEO_APPROVED);
+    // The cap: handed to the CEO once, the run still approved, nothing FAILED and nothing invalidated.
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
     expect(transitions(fixture).some(([, to]) => to === RunState.FAILED || to === RunState.REVISION_REQUIRED)).toBe(false);
     expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CEO_APPROVAL_INVALIDATED")).toHaveLength(0);
     const handed = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_HANDED_OFF");
     expect(handed).toHaveLength(1);
     expect(handed[0]!.evidence).toMatchObject({
-      candidateSnapshotDigest: driven.candidateSnapshotDigest, failureClass: "TRANSIENT", owner: "CEO", refusals: 5, delivered: true,
+      candidateSnapshotDigest: driven.candidateSnapshotDigest, failureClass: "TRANSIENT", owner: "CEO", retries: 5, delivered: true,
       blocker: "PROBE_FAILED: could not enumerate active release branches",
     });
-    const notices = outboxOf(fixture, "CEO_NOTIFICATION").filter((notice) => notice.payload.notification === "CRITICAL_SYSTEM_FAILURE");
-    expect(notices).toHaveLength(1);
-    expect(notices[0]!.payload).toMatchObject({
+    const notices = () => outboxOf(fixture, "CEO_NOTIFICATION").filter((notice) => notice.payload.notification === "CRITICAL_SYSTEM_FAILURE");
+    expect(notices()).toHaveLength(1);
+    expect(notices()[0]!.payload).toMatchObject({
       runId: driven.runId, candidateSnapshotDigest: driven.candidateSnapshotDigest, failureReasonCode: ReasonCode.PROBE_FAILED, owner: "CEO",
-      blocker: "PROBE_FAILED: could not enumerate active release branches",
+      blocker: "PROBE_FAILED: could not enumerate active release branches", retries: 5, retryCap: 5,
     });
-    expect(typeof notices[0]!.payload.action).toBe("string");
-
-    // GitHub recovers: the next due retry, at the ceiling, merges without any command.
-    outage = false;
-    harness.clock.advance(59 * MINUTE);
-    await daemon.resumeApprovedRuns();
-    expect(failedAttempts(fixture)).toBe(7);
-    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
-    harness.clock.advance(MINUTE);
-    await daemon.resumeApprovedRuns();
-    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
-    expect(fixture.github.mergeCount).toBe(1);
-    expect(outboxOf(fixture, "CEO_NOTIFICATION").filter((notice) => notice.payload.notification === "CRITICAL_SYSTEM_FAILURE")).toHaveLength(1);
+    expect(notices()[0]!.payload.action).toEqual(expect.stringContaining("no longer retries this candidate automatically"));
     await daemon.stop();
+  });
+
+  it("past the cap the watchdog stops: a day of sweeps and a restart attempt nothing, and the hand-off is not repeated", async () => {
+    let outage = true;
+    const fixture = await approved({
+      before: (method) => {
+        if (outage) throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method, status: 503 });
+      },
+    });
+    const { harness, driven, daemon } = fixture;
+    expect((await daemon.start()).allowed).toBe(true);
+    for (let sweep = 0; sweep < 5; sweep += 1) {
+      harness.clock.advance(60 * MINUTE);
+      await daemon.resumeApprovedRuns();
+    }
+    expect(failedAttempts(fixture)).toBe(6);
+    const calls = fixture.github.calls.length;
+    // GitHub recovers; nothing retries the run automatically any more, not the watchdog and not a restart.
+    outage = false;
+    for (let sweep = 0; sweep < 24; sweep += 1) {
+      harness.clock.advance(60 * MINUTE);
+      await daemon.resumeApprovedRuns();
+    }
+    await daemon.stop();
+    const restarted = new Daemon(harness.cp, { stateDir: tempDir("acp-b5-restart-"), watchdogIntervalMs: 24 * 60 * MINUTE });
+    expect((await restarted.start()).allowed).toBe(true);
+    expect(failedAttempts(fixture)).toBe(6);
+    expect(fixture.github.calls.length).toBe(calls);
+    expect(fixture.github.mergeCount).toBe(0);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
+    expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_HANDED_OFF")).toHaveLength(1);
+    expect(outboxOf(fixture, "CEO_NOTIFICATION").filter((notice) => notice.payload.notification === "CRITICAL_SYSTEM_FAILURE")).toHaveLength(1);
+    await restarted.stop();
   });
 
   it("a GitHub outage seen as a caught denial at one step and a thrown error at the next is one failure for the cap", async () => {
@@ -328,7 +350,7 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     });
     const { harness, driven, daemon } = fixture;
     expect((await daemon.start()).allowed).toBe(true);
-    for (const next of ["list", "all", "list", "all"] as const) {
+    for (const next of ["list", "all", "list", "all", "list"] as const) {
       mode = next;
       harness.clock.advance(60 * MINUTE);
       await daemon.resumeApprovedRuns();
@@ -336,15 +358,47 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     const failed = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_ATTEMPT_FAILED");
     expect(failed.map((entry) => entry.reasonCode)).toEqual([
       ReasonCode.PROBE_FAILED, ReasonCode.INTERNAL_ERROR, ReasonCode.PROBE_FAILED, ReasonCode.INTERNAL_ERROR, ReasonCode.PROBE_FAILED,
+      ReasonCode.INTERNAL_ERROR,
     ]);
     expect(failed.every((entry) => entry.evidence.failureClass === "TRANSIENT")).toBe(true);
     const schedules = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_RETRY_SCHEDULED");
     expect(schedules.map((entry) => entry.evidence.refusals)).toEqual([1, 2, 3, 4, 5]);
     const handed = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_HANDED_OFF");
     expect(handed).toHaveLength(1);
-    expect(handed[0]!.evidence).toMatchObject({ failureClass: "TRANSIENT", failureCause: "TRANSIENT", refusals: 5, owner: "CEO" });
+    expect(handed[0]!.evidence).toMatchObject({ failureClass: "TRANSIENT", failureCause: "TRANSIENT", refusals: 6, retries: 5, limit: "FAILURE", owner: "CEO" });
     expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
     expect(fixture.github.mergeCount).toBe(0);
+    await daemon.stop();
+  });
+
+  it("alternating failures keep their counts: each failure's refusals accumulate across the other's, and the candidate's 5 retries end it", async () => {
+    // Two different refusals, each thrown by the open-pull query prPrepare makes before any reservation.
+    const causes = [ReasonCode.CONFLICT, ReasonCode.NOT_FOUND] as const;
+    let turn = 0;
+    const fixture = await approved({
+      before: (method, path) => {
+        if (method === "GET" && /\/pulls\?head=/.test(path)) throw acpError(causes[turn % 2]!, "refused for the witness", {});
+      },
+    });
+    const { harness, driven, daemon } = fixture;
+    expect((await daemon.start()).allowed).toBe(true);
+    for (let sweep = 0; sweep < 12; sweep += 1) {
+      turn += 1;
+      harness.clock.advance(60 * MINUTE);
+      await daemon.resumeApprovedRuns();
+    }
+    const counts = harness.cp.audit.forRun(driven.runId)
+      .filter((entry) => entry.kind === "FINALIZATION_RETRY_SCHEDULED" || entry.kind === "FINALIZATION_RETRIES_EXHAUSTED")
+      .map((entry) => [entry.evidence.failureCause, entry.evidence.refusals, entry.evidence.retries]);
+    expect(counts).toEqual([
+      [ReasonCode.CONFLICT, 1, 0], [ReasonCode.NOT_FOUND, 1, 1], [ReasonCode.CONFLICT, 2, 2],
+      [ReasonCode.NOT_FOUND, 2, 3], [ReasonCode.CONFLICT, 3, 4], [ReasonCode.NOT_FOUND, 3, 5],
+    ]);
+    expect(failedAttempts(fixture)).toBe(6);
+    const handed = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_HANDED_OFF");
+    expect(handed).toHaveLength(1);
+    expect(handed[0]!.evidence).toMatchObject({ limit: "CANDIDATE", owner: "CEO", retries: 5, delivered: true });
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
     await daemon.stop();
   });
 
@@ -367,11 +421,198 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     const invalidated = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CEO_APPROVAL_INVALIDATED");
     expect(invalidated).toHaveLength(1);
     expect(invalidated[0]!.evidence).toMatchObject({ disposition: "UNRECOVERABLE", candidateSnapshotDigest: driven.candidateSnapshotDigest });
+    // FAILED on GitHub's own read that the pull request is unmerged, not on the absence of a receipt alone.
+    const refused = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_ATTEMPT_FAILED").at(-1)!;
+    expect(refused.evidence).toMatchObject({ mergeStrategy: "fast_forward", pullMerged: false, disposition: "UNRECOVERABLE" });
     const notices = outboxOf(fixture, "CEO_NOTIFICATION").filter((notice) => notice.payload.notification === "CRITICAL_SYSTEM_FAILURE");
     expect(notices).toHaveLength(1);
     expect(notices[0]!.payload).toMatchObject({ failureReasonCode: ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED, failureClass: "UNRECOVERABLE" });
     expect(outboxOf(fixture, "REVISION_REQUEST")).toHaveLength(0);
     expect(fixture.github.mergeCount).toBe(0);
+    await daemon.stop();
+  });
+
+  const pendingMergeReceipts = (fixture: Fixture) =>
+    fixture.harness.cp.db.all<{ status: string }>(
+      "SELECT status FROM github_receipts WHERE run_id = ? AND operation = 'merge_execute'",
+      [fixture.driven.runId],
+    ).map((row) => row.status);
+
+  /** A merge request whose outcome is unknown is held: MERGING, its PENDING receipt kept, nothing invalidated. */
+  const expectHeld = (fixture: Fixture, outcome: Record<string, unknown>): void => {
+    const { harness, driven } = fixture;
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.MERGING);
+    expect(pendingMergeReceipts(fixture)).toEqual(["PENDING"]);
+    expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_BLOCKED_POST_MERGE")).toHaveLength(0);
+    const unknown = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "MERGE_OUTCOME_UNKNOWN");
+    expect(unknown).toHaveLength(1);
+    expect(unknown[0]!.evidence).toMatchObject({ repositoryIdentity: driven.identity, exactHead: driven.candidateHead, ...outcome });
+    const refused = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_ATTEMPT_FAILED").at(-1)!;
+    expect(refused.evidence).toMatchObject({ disposition: "RETRY", failureClass: "MERGE_OUTCOME_UNKNOWN" });
+    expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CEO_APPROVAL_INVALIDATED")).toHaveLength(0);
+    expect(outboxOf(fixture, "REVISION_REQUEST")).toHaveLength(0);
+    // Never returned for revision while a merge could have happened.
+    const returned = harness.cp.runs.returnApprovedCandidate(driven.runId, {
+      candidateSnapshotDigest: driven.candidateSnapshotDigest, attemptId: "finalize_witness",
+      reasonCode: ReasonCode.MERGE_CONFLICT, reason: "witness", unrecoverable: false,
+    });
+    expect(returned.reasonCode).toBe(ReasonCode.FINALIZATION_COMPENSATION_REQUIRED);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.MERGING);
+  };
+
+  it("a merge request GitHub answers 405 after an evaluation that saw mergeable null is held; the next attempt re-reads the pull and, proven unmerged, returns it for revision", async () => {
+    let fixture: Fixture | null = null;
+    // GitHub had not computed mergeability when the merge was evaluated, and finds the conflict only as the
+    // merge is requested.
+    fixture = await approved({
+      before: (method, path) => {
+        if (isMergePut(method, path)) for (const pull of fixture!.github.pulls) pull.mergeable = false;
+      },
+      after: (method, path) => {
+        if (method === "POST" && /\/pulls$/.test(path)) for (const pull of fixture!.github.pulls) pull.mergeable = null;
+      },
+    });
+    const { harness, driven, daemon } = fixture;
+    expect((await daemon.start()).allowed).toBe(true);
+    expect(mergePuts(fixture)).toBe(1);
+    expectHeld(fixture, { status: 405, outcome: "answered" });
+
+    // The backoff holds the reconciliation for a minute; then the pull is re-read before anything else is sent.
+    harness.clock.advance(30_000);
+    await daemon.resumeApprovedRuns();
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.MERGING);
+    const callsBefore = fixture.github.calls.length;
+    harness.clock.advance(30_000);
+    await daemon.resumeApprovedRuns();
+    const after = fixture.github.calls.slice(callsBefore);
+    expect(after.some((call) => call.method === "GET" && /\/pulls\/\d+$/.test(call.path))).toBe(true);
+    expect(mergePuts(fixture)).toBe(1);
+    const run = harness.cp.runs.require(driven.runId);
+    expect(run.state).toBe(RunState.ACTIVE);
+    expect(transitions(fixture).slice(-2)).toEqual([[RunState.MERGING, RunState.REVISION_REQUIRED], [RunState.REVISION_REQUIRED, RunState.ACTIVE]]);
+    const invalidated = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CEO_APPROVAL_INVALIDATED");
+    expect(invalidated).toHaveLength(1);
+    expect(invalidated[0]!.reasonCode).toBe(ReasonCode.MERGE_CONFLICT);
+    expect(outboxOf(fixture, "REVISION_REQUEST")).toHaveLength(1);
+    expect(pendingMergeReceipts(fixture)).toEqual([]);
+    expect(fixture.github.mergeCount).toBe(0);
+    await daemon.stop();
+  });
+
+  it("a merge request whose answer was lost after GitHub merged it is held: never sent again, never revised or failed, and handed to the CEO at the cap", async () => {
+    let lose = true;
+    const fixture = await approved({
+      after: (method, path) => {
+        if (isMergePut(method, path) && lose) {
+          lose = false;
+          throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method });
+        }
+      },
+    });
+    const { harness, driven, daemon } = fixture;
+    expect((await daemon.start()).allowed).toBe(true);
+    expect(fixture.github.mergeCount).toBe(1);
+    expectHeld(fixture, { outcome: "unheard" });
+    // The PR is closed now, so the retries are refused before the merge step (a cached PR must be open); none
+    // of them sends the merge again, and the run is not returned or failed while the receipt is open.
+    for (let sweep = 0; sweep < 8; sweep += 1) {
+      harness.clock.advance(60 * MINUTE);
+      await daemon.resumeApprovedRuns();
+    }
+    expect(failedAttempts(fixture)).toBe(6);
+    expect(mergePuts(fixture)).toBe(1);
+    expect(fixture.github.mergeCount).toBe(1);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.MERGING);
+    expect(pendingMergeReceipts(fixture)).toEqual(["PENDING"]);
+    expect(transitions(fixture).some(([, to]) => to === RunState.FAILED || to === RunState.REVISION_REQUIRED)).toBe(false);
+    const handed = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_HANDED_OFF");
+    expect(handed).toHaveLength(1);
+    expect(handed[0]!.evidence).toMatchObject({ failureClass: "MERGE_OUTCOME_UNKNOWN", owner: "CEO", retries: 5, delivered: true });
+    await daemon.stop();
+  });
+
+  it("a merge request that got a 5xx is not sent again until a re-read shows the pull unmerged; then it merges once", async () => {
+    let fail = true;
+    let fixture: Fixture | null = null;
+    fixture = await approved({
+      before: (method, path, body) => {
+        if (isMergePut(method, path) && fail) {
+          fail = false;
+          fixture!.github.calls.push({ method, path, body });
+          throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method, status: 502 });
+        }
+      },
+    });
+    const { harness, driven, daemon } = fixture;
+    expect((await daemon.start()).allowed).toBe(true);
+    expectHeld(fixture, { status: 502, outcome: "answered" });
+    const firstPut = fixture.github.calls.findIndex((call) => isMergePut(call.method as HttpMethod, call.path));
+    harness.clock.advance(MINUTE);
+    await daemon.resumeApprovedRuns();
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+    expect(mergePuts(fixture)).toBe(2);
+    expect(fixture.github.mergeCount).toBe(1);
+    const secondPut = fixture.github.calls.findIndex((call, index) => index > firstPut && isMergePut(call.method as HttpMethod, call.path));
+    expect(fixture.github.calls.slice(firstPut + 1, secondPut).some((call) => call.method === "GET" && /\/pulls\/\d+$/.test(call.path))).toBe(true);
+    await daemon.stop();
+  });
+
+  it("a pinned fast-forward whose unmerged state could not be read is retried, never FAILED", async () => {
+    let gated = false;
+    let reads = 0;
+    const fixture = await approved({
+      manifest: {
+        branchProfile: {
+          longLived: ["main", "dev"], defaultBranch: "dev", updateStrategy: "rebase_before_review",
+          mergeStrategy: "fast_forward", releaseTagPolicy: "semver", releaseBranchCleanup: "keep",
+        },
+      },
+      // After the gate, the merge evaluation reads the pull once; the second read is the fast-forward refusal's.
+      before: (method, path) => {
+        if (method === "POST" && path.endsWith("/check-runs")) gated = true;
+        if (gated && method === "GET" && /\/pulls\/\d+$/.test(path) && ++reads === 2) {
+          throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method, status: 502 });
+        }
+      },
+    });
+    const { harness, driven, daemon } = fixture;
+    expect((await daemon.start()).allowed).toBe(true);
+    const refused = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_ATTEMPT_FAILED");
+    expect(refused).toHaveLength(1);
+    expect(refused[0]!.reasonCode).toBe(ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED);
+    expect(refused[0]!.evidence).toMatchObject({ mergeStrategy: "fast_forward", pullMerged: null, disposition: "RETRY", failureClass: "UNCLASSIFIED" });
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.MERGING);
+    expect(transitions(fixture).some(([, to]) => to === RunState.FAILED || to === RunState.REVISION_REQUIRED)).toBe(false);
+    expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CEO_APPROVAL_INVALIDATED")).toHaveLength(0);
+    expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_RETRY_SCHEDULED")).toHaveLength(1);
+    await daemon.stop();
+  });
+
+  it("an invalid branch claim is an authority blocker, not a candidate defect: no approval is invalidated and no revision request goes to any owner", async () => {
+    const fixture = await approved();
+    const { harness, driven, daemon } = fixture;
+    const held = harness.cp.db.all<{ claim_id: string }>("SELECT claim_id FROM resource_claims WHERE run_id = ? AND status = 'HELD'", [driven.runId]);
+    expect(held.length).toBeGreaterThan(0);
+    for (const claim of held) expect(harness.cp.claims.release(claim.claim_id, driven.runId).allowed).toBe(true);
+    expect((await daemon.start()).allowed).toBe(true);
+    const refused = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_ATTEMPT_FAILED");
+    expect(refused).toHaveLength(1);
+    expect(refused[0]!.reasonCode).toBe(ReasonCode.MERGE_CLAIM_INVALID);
+    expect(refused[0]!.evidence).toMatchObject({ disposition: "RETRY", failureClass: "AUTHORITY_RECOVERY" });
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
+    expect(harness.cp.runs.currentCandidate(driven.runId)).toBe(driven.candidateSnapshotDigest);
+    expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CEO_APPROVAL_INVALIDATED")).toHaveLength(0);
+    expect(outboxOf(fixture, "REVISION_REQUEST")).toHaveLength(0);
+    const handed = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_HANDED_OFF");
+    expect(handed).toHaveLength(1);
+    expect(handed[0]!.evidence).toMatchObject({
+      failureClass: "AUTHORITY_RECOVERY", failureCause: ReasonCode.MERGE_CLAIM_INVALID, owner: "CEO", refusals: 1, retries: 0, delivered: true,
+      blocker: expect.stringMatching(/^MERGE_CLAIM_INVALID: /),
+    });
+    // It allows no automatic retry.
+    harness.clock.advance(3 * 60 * MINUTE);
+    await daemon.resumeApprovedRuns();
+    expect(failedAttempts(fixture)).toBe(1);
     await daemon.stop();
   });
 

@@ -2523,10 +2523,20 @@ export class GitHubKernel {
     const { owner, repo } = slug.value;
 
     if (input.mergeStrategy === "fast_forward") {
+      // #1189 B5 — the one refusal the finalizer ends a run FAILED for, and only on this read's confirmation
+      // that the pull request is not merged: no receipt alone proves that nothing was applied.
+      let pullMerged: boolean | null = null;
+      try {
+        const observed = await this.api().request<unknown>("GET", `/repos/${owner}/${repo}/pulls/${input.pullNumber}`);
+        const flag = (observed as { merged?: unknown } | null)?.merged;
+        pullMerged = typeof flag === "boolean" ? flag : null;
+      } catch {
+        pullMerged = null;
+      }
       return deny(
         ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED,
         "GitHub's pull-request merge API cannot perform a true fast-forward",
-        { mergeStrategy: input.mergeStrategy },
+        { mergeStrategy: input.mergeStrategy, pullNumber: input.pullNumber, pullMerged },
       );
     }
     const method = this.githubMergeMethod(input.mergeStrategy);
@@ -2595,6 +2605,9 @@ export class GitHubKernel {
     // predicate, so the late base reread and first-parent proof below make that residual
     // race explicit rather than treating the preflight as an atomic guarantee.
     const dispatch = this.payloadBackedAtDispatch(selectedGate, input.repositoryIdentity);
+    // #1189 B5 — the guard reports a failed effect without its error, so whether GitHub answered the PUT, and
+    // with what status, is kept here.
+    const put: { failure: { outcome: TransportOutcome; status?: number } | null } = { failure: null };
     const merged = await this.mediate(
       WriteOperation.PROGRAMMATIC_MERGE,
       input.runId,
@@ -2613,7 +2626,10 @@ export class GitHubKernel {
           } : {}),
         },
         { beforeDispatch: dispatch.beforeDispatch },
-      ),
+      ).catch((error: unknown) => {
+        put.failure = transportOutcome(error);
+        throw error;
+      }),
     );
     if (!merged.allowed) {
       const refusedAtDispatch = dispatch.refused();
@@ -2628,6 +2644,28 @@ export class GitHubKernel {
         // The fenced effect ran but did not yield a proveable acknowledgement. Preserve the
         // PENDING row for recovery while making the run fail closed now.
         this.markMergeUnproven(input, mergeRepositoryId, idempotencyKey);
+        // INTERNAL_ERROR is the guard's answer when the effect itself failed with its fence intact.
+        if (put.failure && merged.reasonCode === ReasonCode.INTERNAL_ERROR &&
+            (put.failure.outcome === "unheard" || (put.failure.status ?? 0) >= 400)) {
+          // #1189 B5 — the request was sent and came back with an error status (a 405 included) or with
+          // nothing: whether it merged is unknown, and the PENDING receipt holds it. Recorded so the
+          // finalizer keeps the run MERGING, where the next attempt's merge step reconciles that receipt
+          // (re-reading the pull before any second PUT), instead of blocking it as merged. A redirect is
+          // not among them: the transport refuses to follow it, and the run fails closed as before.
+          this.audit.record({
+            kind: "MERGE_OUTCOME_UNKNOWN",
+            runId: input.runId,
+            reasonCode: merged.reasonCode,
+            evidence: {
+              repositoryIdentity: input.repositoryIdentity,
+              pullNumber: input.pullNumber,
+              exactHead: input.exactHeadSha,
+              phase: "merge-put",
+              ...put.failure,
+            },
+          });
+          return deny(merged.reasonCode, merged.message, { ...merged.evidence, phase: "merge-put", ...put.failure });
+        }
       }
       return merged as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }

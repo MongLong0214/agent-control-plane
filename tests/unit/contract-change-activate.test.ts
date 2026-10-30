@@ -661,6 +661,8 @@ describe("ruling 6: every workflow the manifest points to is compared before act
     expect(failure.evidence).toMatchObject({ revision: wrongHead, observedDigest: sha256(tampered) });
 
     const rightHead = publishOnDev(harness, github, WORKFLOW);
+    // #1189 B5 — the refused attempt's backoff (one minute) holds across the restart.
+    harness.clock.advance(60_000);
     await runDaemon(harness, "acp-cc-workflow-fixed-");
     expect(stateOf(harness, run.runId)).toBe(RunState.COMPLETED);
     expect(activeManifest(harness, projectId)).toBe(manifestDigest(proposed));

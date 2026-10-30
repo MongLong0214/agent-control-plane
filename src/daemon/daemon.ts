@@ -1468,7 +1468,7 @@ export class Daemon {
       // replacement left DRAINING would hold every one of its project's runs back.
       await this.runPeriodic("cto_canonical_switchover_settle", () => this.settleCanonicalSwitchovers());
       report.resumedRuns = await this.resumeQueuedRuns();
-      report.resumedFinalizations = await this.resumeApprovedRuns("start");
+      report.resumedFinalizations = await this.resumeApprovedRuns();
       await this.resumeResidentProjects();
       // Issue #246 — a bootstrap run that ended while no daemon was running left its BOOTSTRAP_CTO
       // bound or its session running; the watchdog repeats this, through the same backoff.
@@ -2196,17 +2196,18 @@ export class Daemon {
   }
 
   /**
-   * The finalization sweep, once at start and then on every watchdog tick. #1189 B5 — on a tick, a run whose
-   * last attempt was refused before anything merged waits out that refusal's backoff
-   * (`ApprovedRunFinalizer.retryDue`). A start is itself the recovery event and tries every run once, as an
-   * explicit `finalizeApprovedRun` (the one a CONFIRM triggers) does; its refusals still count towards the cap.
+   * The finalization sweep, once at start and then on every watchdog tick. #1189 B5 (CEO ruling 5) — a run
+   * whose last attempt was refused before anything merged waits out that refusal's backoff, and one that
+   * reached its retry cap is not tried again (`ApprovedRunFinalizer.retryDue`): both are durable, so a
+   * restart neither shortens the wait nor restarts the count. Only an explicit `finalizeApprovedRun` (the one a
+   * CONFIRM triggers) skips the wait; its refusals still count.
    */
-  async resumeApprovedRuns(sweep: "start" | "tick" = "tick"): Promise<string[]> {
+  async resumeApprovedRuns(): Promise<string[]> {
     const resumed: string[] = [];
     const states = [RunState.CEO_APPROVED, RunState.MERGING, RunState.POST_MERGE_VERIFYING, RunState.BLOCKED_POST_MERGE];
     for (const state of states) {
       for (const run of this.cp.runs.list({ state })) {
-        if (sweep === "tick" && !this.#finalizer.retryDue(run.runId)) continue;
+        if (!this.#finalizer.retryDue(run.runId)) continue;
         const finalized = await this.finalizeApprovedRun(run.runId);
         if (finalized.allowed) resumed.push(run.runId);
       }

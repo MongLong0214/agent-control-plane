@@ -502,10 +502,10 @@ describe("FD-GATE: after the owner decides again, the kernel merges on the gate 
       gatesOnHead(fixture)[0]!.app = { slug: "candidate-ci" };
     });
 
-    await finalizeAttempts(fixture, 0);
+    // #1189 B5 — startup's attempt, then an explicit one: the sweep itself waits out the refusal's backoff.
+    await finalizeAttempts(fixture, 1);
     expect(publishedPayloads(fixture).map((payload) => payload.humanGateDigest)).toEqual([fixture.binding]);
-    // Startup visits CEO_APPROVED, then retries the now-MERGING run. Neither
-    // attempt may select the untrusted gate.
+    // Neither attempt may select the untrusted gate.
     expect(failedAttempts(fixture)).toHaveLength(2);
     expect(harness.cp.audit.byKind("GATE_REJECTED").some((event) =>
       event.reasonCode === ReasonCode.GATE_CREATOR_UNTRUSTED && event.evidence["creator"] === "candidate-ci")).toBe(true);
@@ -553,7 +553,8 @@ describe("FD-GATE: after the owner decides again, the kernel merges on the gate 
       });
     });
 
-    await finalizeAttempts(fixture, 0);
+    // #1189 B5 — startup's attempt, then an explicit one: the sweep itself waits out the refusal's backoff.
+    await finalizeAttempts(fixture, 1);
 
     const rebound = expectedBinding(fixture);
     expect(forgedDigest).not.toBe("");
@@ -917,7 +918,9 @@ describe("FD-R2: the transport checks the gate payload again once it holds its i
         transport.atNextRequest("POST", /\/check-runs$/, () => transport.expireTokenThen(() =>
           recordOwnerDecision(harness, driven.runId, fixture.items[0]!, false, "refused while the re-sent gate POST waited")));
       }
-      await finalizeAttempts(restarted, 0);
+      // #1189 B5 — the refused attempt's backoff holds across the restart, so the next process's attempt is an
+      // explicit one.
+      await finalizeAttempts(restarted, 1);
       expect(transport.staleWrites).toEqual([]);
       if (change === "the owner refuses during its token refresh") {
         expect(transport.events).toEqual(["token refresh", `refused ${ReasonCode.HUMAN_GATE_UNSATISFIED}`]);
@@ -994,8 +997,9 @@ describe("FD-R2: the transport checks the gate payload again once it holds its i
       throwNext = true;
     });
 
-    // Daemon.start's sweep: the attempt whose check threw, then the MERGING run's next attempt.
-    await finalizeAttempts(fixture, 0);
+    // Daemon.start's sweep: the attempt whose check threw; then the MERGING run's next attempt, explicit, as the
+    // sweep itself waits out the refusal's backoff (#1189 B5).
+    await finalizeAttempts(fixture, 1);
     expect(failedAttempts(fixture)[0]?.reasonCode).toBe(ReasonCode.INTERNAL_ERROR);
     expect(transport.events).toEqual(["verified", "gate POST", `refused ${ReasonCode.INTERNAL_ERROR}`, "verified", "merge PUT"]);
     expect(mergePuts(fixture)).toEqual([{ pull: github.pulls[0]!.number, sha: driven.candidateHead }]);
@@ -1203,7 +1207,8 @@ describe("FIX-FD-REDIRECT: the transport sends each gate POST and merge PUT once
     expect(published).toHaveLength(1);
     expect(fixture.harness.cp.runs.require(fixture.driven.runId).state).not.toBe(RunState.COMPLETED);
 
-    // The same database opened by a new process: GitHub already holds the gate the refused POST created.
+    // The same database opened by a new process: GitHub already holds the gate the refused POST created. The
+    // refused attempt's backoff holds across the restart (#1189 B5), so its attempt is an explicit one.
     fixture.harness.cp.db.close();
     const harness = makeHarness({
       root: fixture.harness.root,
@@ -1214,7 +1219,7 @@ describe("FIX-FD-REDIRECT: the transport sends each gate POST and merge PUT once
     const restarted: Fixture = { ...fixture, harness };
     const next = await nativeTransport(restarted);
     try {
-      await finalizeAttempts(restarted, 0);
+      await finalizeAttempts(restarted, 1);
       expect(next.sends).toEqual(["merge PUT"]);
       expect(next.redirected).toEqual([]);
       expect(next.refusals).toEqual([]);
@@ -1250,7 +1255,8 @@ describe("FIX-FD-REDIRECT: the transport sends each gate POST and merge PUT once
     expect(writes(fixture.github)).toEqual({ gates: 0, merges: 0 });
 
     // The same database opened by a new process: GitHub shows no gate, so the reservation is released
-    // and the gate is published again from its call site, through the transport's check.
+    // and the gate is published again from its call site, through the transport's check. The refused
+    // attempt's backoff holds across the restart (#1189 B5), so its attempt is an explicit one.
     fixture.harness.cp.db.close();
     const harness = makeHarness({
       root: fixture.harness.root,
@@ -1261,7 +1267,7 @@ describe("FIX-FD-REDIRECT: the transport sends each gate POST and merge PUT once
     const restarted: Fixture = { ...fixture, harness };
     const next = await nativeTransport(restarted);
     try {
-      await finalizeAttempts(restarted, 0);
+      await finalizeAttempts(restarted, 1);
       expect(next.sends).toEqual(["gate POST", "merge PUT"]);
       expect(next.redirected).toEqual([]);
       expect(pending(harness)).toEqual([{ status: "APPLIED" }]);
