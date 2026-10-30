@@ -511,6 +511,8 @@ export class CandidatePipeline {
     // inspect. Publish the explicit no-op packet through the same production gate, then let
     // CEO confirmation and the daemon own completion exactly as for a repository run.
     if (snapshot.repositories.length === 0) {
+      // The review this candidate had, if any: a refusal at publication records what it refused.
+      let reviewedPlan: Decision<ReviewPacket> | null = null;
       // #246 C2 — except a project-less bootstrap candidate, whose planned outputs are exactly the
       // blind-review input there is. Its review is as automatic as a candidate's (§18.2): the gate
       // reloads the outputs from the PLAN artifact, a verdict other than PASS returns the run to its
@@ -526,6 +528,7 @@ export class CandidatePipeline {
           contractDigest: run.contractDigest,
           attemptId,
         });
+        reviewedPlan = reviewed;
         // Review rounds 1 and 2 (RF-REVIEW-02) — the review is asynchronous, and `plan_submit` can
         // replace the PLAN while it runs or while anything after it is awaited. A candidate whose PLAN
         // was replaced is stale whatever the verdict: a PASS is not P2's review, and a REVISE or BLOCK
@@ -554,6 +557,7 @@ export class CandidatePipeline {
           contractDigest: run.contractDigest,
           attemptId,
         });
+        reviewedPlan = reviewed;
         const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, () =>
           this.contractChangePlanStillCurrent(input.runId, snapshot),
         );
@@ -568,6 +572,7 @@ export class CandidatePipeline {
         if (snapshot.bootstrapPlan !== undefined) {
           const planAtPublication = this.bootstrapPlanStillCurrent(input.runId, snapshot);
           if (!planAtPublication.allowed) {
+            this.recordStaleAfterReview(input.runId, snapshotDigest, attemptId, "PLAN_AT_PUBLICATION", planAtPublication, reviewedPlan);
             return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest,
               detail: { message: planAtPublication.message, evidence: planAtPublication.evidence } });
           }
@@ -575,6 +580,7 @@ export class CandidatePipeline {
         if (snapshot.contractChange !== undefined) {
           const planAtPublication = this.contractChangePlanStillCurrent(input.runId, snapshot);
           if (!planAtPublication.allowed) {
+            this.recordStaleAfterReview(input.runId, snapshotDigest, attemptId, "PLAN_AT_PUBLICATION", planAtPublication, reviewedPlan);
             return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest });
           }
         }
@@ -699,6 +705,7 @@ export class CandidatePipeline {
       // writes cannot slip between this observation and production-ready publication.
       const stillFreshAfterReview = await this.assertStillFresh(snapshot);
       if (!stillFreshAfterReview.allowed) {
+        this.recordStaleAfterReview(input.runId, snapshotDigest, attemptId, "SOURCE_AT_PUBLICATION", stillFreshAfterReview, reviewed);
         return allow(ReasonCode.OK, {
           stage: "CANDIDATE_STALE",
           reasonCode: stillFreshAfterReview.reasonCode,
@@ -709,6 +716,7 @@ export class CandidatePipeline {
       if (snapshot.contractChange !== undefined) {
         const planAtPublication = this.contractChangePlanStillCurrent(input.runId, snapshot);
         if (!planAtPublication.allowed) {
+          this.recordStaleAfterReview(input.runId, snapshotDigest, attemptId, "PLAN_AT_PUBLICATION", planAtPublication, reviewed);
           return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest });
         }
       }
@@ -844,6 +852,7 @@ export class CandidatePipeline {
       reviewed.reasonCode === ReasonCode.REVIEW_OMITTED_ITEMS_PRESENT;
     const current = stillCurrent(isVerdict);
     if (!current.allowed) {
+      this.recordStaleAfterReview(runId, snapshotDigest, attemptId, "AFTER_REVIEW", current, reviewed);
       return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: current.reasonCode, snapshotDigest,
         detail: { message: current.message, evidence: current.evidence } });
     }
@@ -875,6 +884,37 @@ export class CandidatePipeline {
       reasonCode: reviewed.reasonCode,
       snapshotDigest,
       ...(packet ? { review: packet } : {}),
+    });
+  }
+
+  /**
+   * A candidate refused as stale once its review had run. The refusal is unchanged — no revision, no
+   * unavailable-review record, no packet — and this row says so: which check found it stale (`stale`),
+   * the candidate, the submission attempt, the review's own outcome and, when the review carried a
+   * packet, that reviewer's binding generation. Built field by field, never spread from a denial. An
+   * answer the review gate did not keep has the gate's own BLIND_REVIEW_REJECTED row naming its reviewer.
+   */
+  private recordStaleAfterReview(
+    runId: string,
+    snapshotDigest: string,
+    attemptId: string,
+    stale: "AFTER_REVIEW" | "SOURCE_AT_PUBLICATION" | "PLAN_AT_PUBLICATION",
+    refusal: Decision<unknown>,
+    reviewed: Decision<ReviewPacket> | null,
+  ): void {
+    const packet = reviewed === null ? null : reviewed.allowed ? reviewed.value : reviewed.evidence["packet"];
+    const generation = (packet as Partial<ReviewPacket> | null | undefined)?.reviewerRoleBindingGeneration;
+    this.audit.record({
+      kind: "BLIND_REVIEW_REJECTED",
+      runId,
+      reasonCode: refusal.reasonCode,
+      evidence: {
+        candidateSnapshotDigest: snapshotDigest,
+        attemptId,
+        stale,
+        reviewReasonCode: reviewed?.reasonCode ?? null,
+        reviewerRoleBindingGeneration: typeof generation === "number" ? generation : null,
+      },
     });
   }
 
