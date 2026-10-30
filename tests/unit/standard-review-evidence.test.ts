@@ -7,6 +7,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { allow, deny } from "../../src/core/errors.ts";
 import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { screenPublicText } from "../../src/bootstrap/genesis-bundle.ts";
 import { ApprovedRunFinalizer } from "../../src/daemon/finalizer.ts";
 import { ExecutionMode, Role, roleKeyFor, RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { RunEvidenceExporter } from "../../src/export/run-evidence.ts";
@@ -717,6 +718,31 @@ describe("review round 3: answers kept by provenance, and every string and key o
       expect(await submitVia(f, "success")).toMatchObject({ ok: true, reasonCode: "MCP_MUTATION_IN_FLIGHT", value: { inFlight: true } });
       expect(await pending).toMatchObject({ ok: true, value: { outcome: "SUCCEEDED", stage: "COMPLETED_REVIEW", blindReview: { verdict: "PASS" } } });
       expect(f.refusals.join("\n")).not.toContain(MARKER);
+    } finally { await f.close(); }
+  });
+
+  it("R14 a body under 45 bytes is scanned as the text it carries: a token-only body and a private-path body are refused", async () => {
+    const f = await fixture();
+    try {
+      const stageBody = (key: string, text: string) => {
+        const body = bundleFor(f.run.runId, f.run.contractDigest, "", [fileFor(text)]);
+        return f.stage(key, "", { evidenceBody: body, expectedSha256: sha256(body) });
+      };
+      const tokenBody = `${TOKEN}\n`;
+      const pathMarker = "/synthetic/keys/fixture.priv";
+      const pathBody = `private_key: ${pathMarker}\n`;
+      for (const short of [tokenBody, pathBody]) expect(Buffer.from(short).toString("base64").length).toBeLessThan(60);
+      expect(() => screenPublicText(pathBody)).toThrow();
+
+      const token = await stageBody("short-token", tokenBody);
+      expect(token).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "slack_token" } });
+      expect(JSON.stringify(token)).not.toContain(TOKEN);
+      const path = await stageBody("short-path", pathBody);
+      expect(path).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "public_text_screen" } });
+      expect(JSON.stringify(path)).not.toContain(pathMarker);
+      expect(f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF")).toEqual([]);
+      expect(f.refusals.join("\n")).not.toContain(TOKEN);
+      expect(f.refusals.join("\n")).not.toContain(pathMarker);
     } finally { await f.close(); }
   });
 });

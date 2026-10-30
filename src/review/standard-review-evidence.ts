@@ -62,26 +62,34 @@ export type StandardReviewEvidenceBundle = z.infer<typeof standardBundleSchema>;
 export const STANDARD_REVIEW_SCAN_MAX_DEPTH = MAX_CREDENTIAL_SCAN_DEPTH;
 export const STANDARD_REVIEW_SCAN_MAX_VALUES = 20_000;
 const WHOLE_DIGEST = /^sha256:[0-9a-f]{64}$/;
-const CANONICAL_BASE64 = /^[A-Za-z0-9+/]{60,}={0,2}$/;
+const BASE64_TEXT = /^[A-Za-z0-9+/]+={0,2}$/;
+const LONG_BASE64_TEXT = /^[A-Za-z0-9+/]{60,}={0,2}$/;
 type ScanRefusal = { rule: string; form: string };
 
-/**
- * One string or object key through the shared credential rules (core/credential-shapes.ts) and the public-text
- * screen, by its form and never its name: a canonical base64 value that decodes to UTF-8 (a staged body) is
- * checked as the text it carries, and a whole `sha256:<64hex>` digest is a digest, not a long base64 run.
- */
-const textRefusal = (text: string): ScanRefusal | null => {
-  let subject = text;
-  if (CANONICAL_BASE64.test(text)) {
-    const bytes = Buffer.from(text, "base64");
-    const decoded = bytes.toString("utf8");
-    if (bytes.toString("base64") === text && Buffer.from(decoded, "utf8").equals(bytes)) subject = decoded;
-  }
+/** One text through the shared credential rules (core/credential-shapes.ts) and the public-text screen; a whole digest passes. */
+const subjectRefusal = (subject: string): ScanRefusal | null => {
   if (WHOLE_DIGEST.test(subject)) return null;
   const match = credentialShapeMatch(subject);
   if (match !== null) return { rule: match.rule, form: match.form };
   try { screenPublicText(subject); } catch { return { rule: "public_text_screen", form: "other" }; }
   return null;
+};
+
+/**
+ * One string or object key, by its form and never its name: canonical base64 of any length (non-empty and
+ * re-encoding byte-identically, so a multiple of 4) that decodes to UTF-8 is checked as the text it carries. The
+ * raw string is checked too, except for the 60+ character form, which would otherwise be refused as the long
+ * base64 run every staged body is; a whole `sha256:<64hex>` digest is a digest.
+ */
+const textRefusal = (text: string): ScanRefusal | null => {
+  let decoded: string | null = null;
+  if (BASE64_TEXT.test(text)) {
+    const bytes = Buffer.from(text, "base64");
+    const utf8 = bytes.toString("utf8");
+    if (bytes.toString("base64") === text && Buffer.from(utf8, "utf8").equals(bytes)) decoded = utf8;
+  }
+  if (decoded === null) return subjectRefusal(text);
+  return subjectRefusal(decoded) ?? (LONG_BASE64_TEXT.test(text) ? null : subjectRefusal(text));
 };
 
 /** Every string and every object key of the bundle, at any depth, with no field list; bounded, and refused past the bound. */
