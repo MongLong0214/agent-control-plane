@@ -964,6 +964,20 @@ export class ProductionGate {
       if (!continuity.allowed) return continuity as Decision<{ isBootstrap: boolean }>;
     }
 
+    // #1270 — a packet published before reviews recorded their method still names that review: CONFIRM
+    // reads the review the packet binds and refuses it as stale unless it records the current method.
+    // A no-repository packet's not-applicable placeholder binds no review and is left as it is.
+    if (input.decision === "CONFIRM" && packet && packet.content.blindReview.provider !== "not-applicable") {
+      const review = this.artifacts.byDigest<ReviewPacket>(packet.content.blindReview.digest);
+      if (!review || review.runId !== input.runId || review.kind !== ArtifactKind.BLIND_REVIEW || !reviewedUnderCurrentMethod(review.content)) {
+        return deny(ReasonCode.EVIDENCE_STALE, METHOD_REVIEW_STALE, {
+          runId: input.runId,
+          candidateSnapshotDigest: input.candidateSnapshotDigest,
+          reviewDigest: packet.content.blindReview.digest,
+        });
+      }
+    }
+
     // The decision is an exercise of the CEO role, so the session must currently hold it.
     // Independence alone would let any unknown id decide (CP-HI-07).
     const holds = this.assertCurrentCeo(input.ceoSessionId);

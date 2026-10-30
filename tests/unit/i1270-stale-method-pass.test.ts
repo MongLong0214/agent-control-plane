@@ -4,6 +4,8 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { canonicalJson } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import type { ProductionReadyPacket } from "../../src/ceo/production-gate.ts";
+import { Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import { digestArtifactContent } from "../../src/db/artifacts.ts";
 import { deriveConfirmedMergePlan, type ConfirmedMergePorts } from "../../src/github/confirmed-merge-operation.ts";
 import type { ReviewPacket } from "../../src/review/blind-review.ts";
@@ -23,25 +25,35 @@ type Driven = Awaited<ReturnType<typeof driveToReviewedCandidate>>;
  * without `inputManifest.methodology`, written to the database file as a daemon of that time wrote it.
  * Returns how to read that row back, to show nothing here rewrites it.
  */
-const storePreMethodPass = (h: Harness, driven: Driven): (() => unknown) => {
-  const current = h.cp.artifacts.latestForSnapshot<ReviewPacket>(driven.runId, "BLIND_REVIEW", driven.candidateSnapshotDigest)!;
-  const { methodology: _methodology, ...inputManifest } = current.content.inputManifest;
-  const content = { ...current.content, inputManifest };
-  const artifactId = `pre-method-${driven.runId}`;
+const storeAsEarlierDaemon = (
+  h: Harness,
+  driven: Driven,
+  kind: "BLIND_REVIEW" | "PRODUCTION_READY_PACKET",
+  content: unknown,
+): { digest: string; row: () => unknown } => {
+  const artifactId = `pre-method-${kind}-${driven.runId}`;
+  const digest = digestArtifactContent(kind, content, driven.candidateSnapshotDigest);
   const file = new Database(join(h.root, "state.sqlite"));
   try {
     file.function("acp_evidence_write_authorized", () => 1);
     file.prepare(`INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest, content_json, produced_by, created_at)
-                  VALUES (?, ?, 'BLIND_REVIEW', ?, ?, ?, 'blind-review-gate', ?)`)
-      .run(artifactId, driven.runId, digestArtifactContent("BLIND_REVIEW", content, driven.candidateSnapshotDigest),
-        driven.candidateSnapshotDigest, canonicalJson(content), h.clock.nowIso());
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(artifactId, driven.runId, kind, digest, driven.candidateSnapshotDigest, canonicalJson(content),
+        kind === "BLIND_REVIEW" ? "blind-review-gate" : "production-gate", h.clock.nowIso());
   } finally {
     file.close();
   }
+  return { digest, row: () => h.cp.db.get("SELECT * FROM run_artifacts WHERE artifact_id = ?", [artifactId]) };
+};
+
+const storePreMethodPass = (h: Harness, driven: Driven): { digest: string; row: () => unknown } => {
+  const current = h.cp.artifacts.latestForSnapshot<ReviewPacket>(driven.runId, "BLIND_REVIEW", driven.candidateSnapshotDigest)!;
+  const { methodology: _methodology, ...inputManifest } = current.content.inputManifest;
+  const stored = storeAsEarlierDaemon(h, driven, "BLIND_REVIEW", { ...current.content, inputManifest });
   const latest = h.cp.artifacts.latestForSnapshot<ReviewPacket>(driven.runId, "BLIND_REVIEW", driven.candidateSnapshotDigest)!;
   expect(latest.content.verdict).toBe("PASS");
   expect(latest.content.inputManifest).not.toHaveProperty("methodology");
-  return () => h.cp.db.get("SELECT * FROM run_artifacts WHERE artifact_id = ?", [artifactId]);
+  return stored;
 };
 
 const confirmPacket = (h: Harness, driven: Driven) => {
@@ -85,11 +97,11 @@ const mergePlan = (h: Harness, driven: Driven) => deriveConfirmedMergePlan({
 }, { runId: driven.runId, repositoryIdentity: driven.identity, head: driven.candidateHead, title: "finalize" });
 
 describe("#1270: a stored PASS that records no method is not current evidence", () => {
-  it("CONFIRM refuses it as stale, leaves its bytes as stored, and admits the candidate's fresh review", async () => {
+  it("publishing the CONFIRM packet refuses it as stale, leaves its bytes as stored, and admits the candidate's fresh review", async () => {
     const h = makeHarness();
     const driven = await driveToReviewedCandidate(h);
     await h.cp.continuity.evaluate("i1270 confirm");
-    const row = storePreMethodPass(h, driven);
+    const { row } = storePreMethodPass(h, driven);
     const before = row();
 
     const refused = confirmPacket(h, driven);
@@ -110,11 +122,40 @@ describe("#1270: a stored PASS that records no method is not current evidence", 
     const admitted = mergePlan(h, driven);
     expect(admitted.allowed, JSON.stringify(admitted).slice(0, 400)).toBe(true);
 
-    const row = storePreMethodPass(h, driven);
+    const { row } = storePreMethodPass(h, driven);
     const before = row();
     const refused = mergePlan(h, driven);
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.EVIDENCE_STALE);
     expect(row()).toEqual(before);
+  });
+
+  it("the CEO's CONFIRM decision refuses a published packet bound to it, leaving the run at review and both records as stored", async () => {
+    const h = makeHarness();
+    const driven = await driveToReviewedCandidate(h);
+    await h.cp.continuity.evaluate("i1270 decision");
+    // A packet an earlier daemon published for this candidate, bound to that daemon's PASS.
+    expect(confirmPacket(h, driven).allowed).toBe(true);
+    expect(h.cp.runs.require(driven.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+    const published = h.cp.artifacts.latestForSnapshot<ProductionReadyPacket>(driven.runId, "PRODUCTION_READY_PACKET", driven.candidateSnapshotDigest)!;
+    const pass = storePreMethodPass(h, driven);
+    const packet = storeAsEarlierDaemon(h, driven, "PRODUCTION_READY_PACKET",
+      { ...published.content, blindReview: { ...published.content.blindReview, digest: pass.digest } });
+    expect(h.cp.artifacts.latestForSnapshot<ProductionReadyPacket>(driven.runId, "PRODUCTION_READY_PACKET", driven.candidateSnapshotDigest)!.digest)
+      .toBe(packet.digest);
+    const before = [pass.row(), packet.row()];
+
+    const ceo = h.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    const decided = h.cp.ceo.submitCeoDecision({
+      runId: driven.runId,
+      decision: "CONFIRM",
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      ceoSessionId: ceo.sessionId,
+      rationale: "confirm the reviewed candidate",
+    });
+    expect(decided.allowed).toBe(false);
+    expect(decided.reasonCode).toBe(ReasonCode.EVIDENCE_STALE);
+    expect(h.cp.runs.require(driven.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+    expect([pass.row(), packet.row()]).toEqual(before);
   });
 });
