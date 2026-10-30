@@ -567,6 +567,13 @@ export interface ProviderAdapter {
    * is refused as a reviewer rather than assumed to send what another adapter sends.
    */
   transmittedReviewerInput?(request: Pick<InvocationRequest, "systemPrompt" | "prompt">): TransmittedInput;
+  /**
+   * The most UTF-8 bytes one packet reviewer input (system instructions, separator and prompt) may take
+   * for `model` and still reach that model whole, with room for the CLI's own instructions and the
+   * model's answer. Undefined, or absent, where no such bound is known: a blind review then does not
+   * send that reviewer a lockfile chunk.
+   */
+  reviewerInputMaxBytes?(model: string): number | undefined;
   /** Cheap liveness check for an existing critical session (§14.3). */
   probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE">;
   /**
@@ -691,6 +698,10 @@ class CapacityObservedAdapter implements ProviderAdapter {
   }
 
   /** Present exactly when the wrapped adapter declares it, so a review digests that adapter's own input. */
+  get reviewerInputMaxBytes(): ProviderAdapter["reviewerInputMaxBytes"] {
+    return this.inner.reviewerInputMaxBytes?.bind(this.inner);
+  }
+
   get transmittedReviewerInput(): ProviderAdapter["transmittedReviewerInput"] {
     return this.inner.transmittedReviewerInput?.bind(this.inner);
   }
