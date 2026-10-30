@@ -80,7 +80,7 @@ else if(cmd === 'buzz') {
  const others = s.otherRooms || [], other = others.find(o => o.room.channel_id === value('--channel'));
  if(args[0] === 'users') out([{pubkey:pk,...${JSON.stringify(profileReadback)}}]);
  else if(args[0] === 'channels' && args[1] === 'search') out([...(s.room ? (s.ambiguous ? [s.room,{...s.room,channel_id:'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'}] : [s.room]) : []),...others.map(o => o.room),...(args.includes('--include-archived') ? archived : [])]);
- else if(args[0] === 'channels' && args[1] === 'get') {const room=[s.room,...archived,...others.map(o => o.room)].find(r => r && r.channel_id === value('--channel'));if(!room) process.exit(5);out({channel_id:room.channel_id,name:room.name,description:null,created_at:0,pubkey:pk});}
+ else if(args[0] === 'channels' && args[1] === 'get') {const id=value('--channel');if((s.unreadableRooms||[]).includes(id)) {out(null);} else {const room=[s.room,...archived,...others.map(o => o.room)].find(r => r && r.channel_id === id);if(!room) process.exit(5);out({channel_id:room.channel_id,name:room.name,description:null,created_at:0,pubkey:pk});}}
  else if(args[0] === 'channels' && args[1] === 'archive') {if(!process.env.BUZZ_PRIVATE_KEY || process.env.BUZZ_IDENTITY !== a.identityName || !s.room || s.room.channel_id !== value('--channel') || !s.members.some(m => m.pubkey === pk && m.role === 'owner')) process.exit(6);s.archivedRooms=[...archived,{...s.room,archived:true}];s.room=null;s.members=[];out({event_id:'a'.repeat(64),accepted:true,message:''});}
  else if(args[0] === 'channels' && args[1] === 'create') {if(args.includes('--id') || !process.env.BUZZ_PRIVATE_KEY || process.env.BUZZ_IDENTITY !== a.identityName) process.exit(3);const intent=JSON.parse(fs.readFileSync(path.join(process.env.ACP_STATE_DIR,'buzz-room-test.json'),'utf8'));if(intent.name!==value('--name') || intent.pubkey!==pk) process.exit(4);if(s.refuseCreate) {s.refuseCreate=false;save();process.exit(1);}if(s.keepRooms && s.room) s.otherRooms=[...others,{room:s.room,members:s.members}];s.creates++;s.room={channel_id:s.creates === 1 ? 'ffffffff-ffff-4fff-8fff-ffffffffffff' : '99999999-9999-4999-8999-999999999999',name:value('--name'),channel_type:value('--type'),visibility:value('--visibility')};s.members=[{pubkey:pk,role:'owner'}];save();if(s.loseCreate) {s.loseCreate=false;save();process.exit(1);}out(s.room);}
  else if(args[0] === 'channels' && args[1] === 'add-member') {const pubkey=value('--pubkey');s.members=s.members.filter(m=>m.pubkey!==pubkey);s.members.push({pubkey,role:value('--role')});out({});}
@@ -1147,4 +1147,33 @@ it('#1251 C9-2: a same-name room the roster routes to another project is not a r
   expect(await host.invoke('retire',f.a)).toMatchObject({retired:true,buzzRoom:'archived'});
   expect(fakeState(f)).toMatchObject({room:null,otherRooms:[{room:{channel_id:other},members}],
     archivedRooms:[expect.objectContaining({channel_id:earlier}),expect.objectContaining({channel_id:replacement})]});
+});
+
+it('#1251 C10: an earlier key that cannot read its recorded room is refused with the room and a remedy, not silently passed',async () => {
+  const {f,firstPk,earlier,snapshot,kept} = await replaced('recorded');
+  const dir = join(f.state,'retired-buzz-identities',readdirSync(join(f.state,'retired-buzz-identities'))[0]!);
+  // The relay answers `channels get` for the earlier room with a valid null: the key lost its membership of it (the
+  // room may still be active, archived, or gone), not a lookup error. Retirement must not treat this as settled.
+  patchFake(f,{unreadableRooms:[earlier]});
+  const host = new ExecFileHostProjectProvisioner(daemonHost(f),f.home,f.state,30_000,f.database);
+  const before = snapshot();
+  const order = [
+    `have an owner add pubkey ${firstPk} back to room ${earlier} as a member (buzz channels add-member --channel ${earlier} --pubkey ${firstPk} --role member) so retirement can read it and verify its archive`,
+    `or have an owner confirm room ${earlier}'s archive or deletion directly with its owner key (buzz channels get --channel ${earlier})`,
+    'run agentctl project retire test again',
+  ];
+  for (const operation of ['verify-retire','retire'] as const) {
+    const refused = await host.invoke(operation,f.a).then(result => result,(error:unknown) => error);
+    expect(refused).toBeInstanceOf(HostRetirementRefusal);
+    expect(refused,String(refused)).toMatchObject({hostChanged:false,requiredOrder:order,
+      reason:`this run's earlier key (pubkey ${firstPk}), moved aside to ${dir}, cannot read its recorded Buzz room ${earlier}: it may have lost membership of that room, archived or not, or the room may have been deleted`});
+    expect(snapshot()).toEqual(before);
+  }
+  // The order is executable: once the key can read it again, retirement finds it still active and asks for its archive.
+  patchFake(f,{unreadableRooms:[]});
+  const host2 = await refusesUnchanged(f,[`have an owner archive room ${earlier} (buzz channels archive --channel ${earlier})`],snapshot);
+  // Once an owner archives it, retirement archives the replacement room and leaves no room of this run active.
+  patchFake(f,{otherRooms:[],archivedRooms:[{...kept,archived:true}]});
+  expect(await host2.invoke('retire',f.a)).toMatchObject({retired:true,buzzRoom:'archived'});
+  expect(fakeState(f)).toMatchObject({room:null,otherRooms:[],archivedRooms:[expect.objectContaining({channel_id:earlier}),expect.objectContaining({channel_id:'99999999-9999-4999-8999-999999999999'})]});
 });

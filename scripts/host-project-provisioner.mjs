@@ -166,6 +166,9 @@ try {
   // #1251 C9 — the recorded room is looked up by its id, under whatever name it has now: a rename never hides it (C9-1).
   // `name` only finds rooms that have no record: one that key is in is this run's unless the roster routes it to another
   // project, whose room retirement never asks to archive (C9-2).
+  // #1251 C10 — a recorded room this key cannot read (`channels get` answers null: an archived room it lost membership
+  // of, or one that was deleted) is never treated as settled either; it refuses, naming the room and how an owner
+  // restores visibility or confirms its fate, before any host write.
   const activeRooms = (name, pk, keyFile, recorded) => {
     const roster = existsSync(rosterFile) ? read(rosterFile) : {channels:{}};
     check(object(roster) && object(roster.channels),'invalid roster channels');
@@ -173,7 +176,10 @@ try {
     const found = roomsUnder(name,keyFile,room => room !== recorded && !elsewhere(room) && memberOf(room,keyFile,m => m.pubkey === pk));
     if (typeof recorded !== 'string') return found;
     const room = buzz(['channels','get','--channel',recorded],keyFile);
-    check(object(room) && room.channel_id === recorded && typeof room.name === 'string' && room.name.length > 0,'recorded Buzz room readback mismatch');
+    if (!(object(room) && room.channel_id === recorded && typeof room.name === 'string' && room.name.length > 0))
+      refuseWithOrder(`this run's earlier key (pubkey ${pk}), moved aside to ${dirname(keyFile)}, cannot read its recorded Buzz room ${recorded}: it may have lost membership of that room, archived or not, or the room may have been deleted`,
+        `have an owner add pubkey ${pk} back to room ${recorded} as a member (buzz channels add-member --channel ${recorded} --pubkey ${pk} --role member) so retirement can read it and verify its archive`,
+        `or have an owner confirm room ${recorded}'s archive or deletion directly with its owner key (buzz channels get --channel ${recorded})`);
     return roomArchived(room.name,recorded,keyFile) ? found : [room,...found];
   };
   const rosterFile = join(home,'.hermes','bridge','required-mentions.json');
