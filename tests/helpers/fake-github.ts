@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
 
 export interface FakePull {
@@ -48,6 +50,12 @@ export class FakeGitHub implements GitHubClient {
   commitParents = new Map<string, string[]>();
   /** When set, the next merge records this sha as the merge commit's first parent. */
   driftBaseTo: string | null = null;
+  /** sha -> its tree. A commit not named here has a tree derived from its sha; a merge takes its head's. */
+  commitTrees = new Map<string, string>();
+  /** When set, the next merge records this tree instead of its head's. */
+  nextMergeTree: string | null = null;
+  /** Heads that do not contain the base they are compared with; every other head does. */
+  headsMissingBase = new Set<string>();
   /** Lets a scenario use a real local candidate commit for trusted workflow-file inspection. */
   nextMergeSha: string | null = null;
   /** Synchronous hook used to model Actions publishing its exact-merge check before a reread. */
@@ -126,6 +134,8 @@ export class FakeGitHub implements GitHubClient {
       const firstParent = this.driftBaseTo ?? pull.base.sha;
       this.driftBaseTo = null;
       this.commitParents.set(mergeSha, [firstParent, pull.head.sha]);
+      this.commitTrees.set(mergeSha, this.nextMergeTree ?? this.treeOf(pull.head.sha));
+      this.nextMergeTree = null;
       // GitHub's merged-PR resource retains the base snapshot it was opened against;
       // the separate target ref is the mutable source of truth after a merge.
       pull.merge_commit_sha = mergeSha;
@@ -175,7 +185,7 @@ export class FakeGitHub implements GitHubClient {
     if (method === "GET" && /\/commits\/[^/]+$/.test(path)) {
       const sha = /\/commits\/([^/]+)$/.exec(path)![1]!;
       const parents = this.commitParents.get(sha) ?? [];
-      return { sha, parents: parents.map((p) => ({ sha: p })) } as unknown as T;
+      return { sha, parents: parents.map((p) => ({ sha: p })), commit: { tree: { sha: this.treeOf(sha) } } } as unknown as T;
     }
 
     if (method === "GET" && /\/contents\//.test(path)) {
@@ -219,6 +229,10 @@ export class FakeGitHub implements GitHubClient {
     }
     if (method === "GET" && /\/compare\//.test(path)) {
       const [, base, headSha] = /\/compare\/(.+)\.\.\.(.+)$/.exec(path)!;
+      // A merge's base-in-head preflight compares two commits, never a branch name.
+      if (/^[0-9a-f]{40}$/.test(base!)) {
+        return { status: this.headsMissingBase.has(headSha!) ? "diverged" : "ahead" } as unknown as T;
+      }
       const branch = decodeURIComponent(base!);
       const has = this.contains.get(branch)?.has(headSha!) ?? false;
       return { status: has ? "behind" : "diverged" } as unknown as T;
@@ -263,6 +277,10 @@ export class FakeGitHub implements GitHubClient {
   }
 
   /** Register a branch and the sha it points at. */
+  treeOf(sha: string): string {
+    return this.commitTrees.get(sha) ?? createHash("sha1").update(`tree:${sha}`).digest("hex");
+  }
+
   setBranch(ref: string, sha: string): void {
     if (!this.branches.includes(ref)) this.branches.push(ref);
     this.#heads.set(ref, sha);

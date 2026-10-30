@@ -61,10 +61,17 @@
  * Every lookup that fails refuses -- the range, a message, the trailer parser, the notes, a fetch,
  * the API, a parse. None of them reads as empty evidence.
  *
+ * #1269 — pull requests now merge as merge commits, and the squash path above is kept for the
+ * squashes already in history. A merge commit drops nothing: its second parent is the branch's
+ * head, so every record the branch's commits carry is reachable from it as committed. What is
+ * checked is that it is that commit: for each two-parent commit naming `(#N)` (or GitHub's own
+ * `Merge pull request #N`) that GitHub reports as #N's merge commit, it has exactly two parents and
+ * the second is #N's head as GitHub records it. The head comes from the commit's own parents, never
+ * from a trailer. A second parent that is not #N's head refuses.
+ *
  * The API is `gh api`; `ACP_MERGE_RECORDS_GH` names another executable that answers the same call,
  * which is how the tests run it offline. The repository is `GITHUB_REPOSITORY`, or origin's GitHub
- * URL. `merge-pr.mjs` imports `pullRequest`, `examineSquash` and `mergedHeadIn` to read its own merge
- * back the way this check will.
+ * URL. `merge-pr.mjs` imports `pullRequest` to read its own merge back.
  *
  * Usage:  node scripts/verify-merge-preserved-records.mjs [<range>]
  *         default range `HEAD~1..HEAD`, which is what CI hands the trailer check beside it.
@@ -205,7 +212,7 @@ export const pullRequest = (pull) => {
       (body.merged && !isSha(body.merge_commit_sha))) {
     throw new Unanswered(`pull request #${pull} from GitHub is missing what this check reads`);
   }
-  return { merged: body.merged, mergeCommit: body.merge_commit_sha };
+  return { merged: body.merged, mergeCommit: body.merge_commit_sha, head: isSha(body.head?.sha) ? body.head.sha : null };
 };
 
 /** Any line declaring the key, in any case or spacing: each one counts against "exactly one". */
@@ -263,20 +270,42 @@ export const examineSquash = (squash, pull) => {
   return { head, parent, carried, missing };
 };
 
+/**
+ * #1269 — #N's merge commit M, read from its own parents: exactly two, the second #N's head as GitHub
+ * records it. `wrongHead` names a second parent that is not that head; the branch is `M^1..M^2`.
+ */
+export const examineMergeCommit = (merge, pull, pullHead) => {
+  const short = merge.slice(0, 8);
+  if (!isSha(pullHead)) throw new Unanswered(`GitHub records no full head sha for #${pull}, so ${short}'s second parent cannot be checked against it`);
+  const parents = git(`the parents of ${short}`, ["rev-list", "--parents", "-n", "1", merge]).trim().split(" ").slice(1);
+  if (parents.length !== 2) throw new Unanswered(`${short} has ${parents.length} parents, not the base and #${pull}'s head`);
+  const [base, head] = parents;
+  if (head !== pullHead) return { base, head, wrongHead: true, recordLines: 0, branchCommits: 0 };
+  const branch = git(`#${pull}'s branch`, ["rev-list", `${base}..${head}`]).trim().split("\n").filter(Boolean);
+  let recordLines = 0;
+  for (const sha of branch) recordLines += storedRecordIds(sha).size;
+  return { base, head, wrongHead: false, recordLines, branchCommits: branch.length };
+};
+
+/** The pull request a forge-composed commit names: `(#N)` at the end of its subject, or GitHub's `Merge pull request #N`. */
+const pullNamedBy = (subject) => /\(#(\d+)\)\s*$/u.exec(subject)?.[1] ?? /^Merge pull request #(\d+)\b/u.exec(subject)?.[1];
+
 const out = (line) => process.stdout.write(`${line}\n`);
 
 const main = () => {
   const range = process.argv[2]?.trim() || "HEAD~1..HEAD";
   let commits;
+  let merges;
   try {
     commits = git(`the range ${range}`, ["rev-list", "--no-merges", range]).trim().split("\n").filter(Boolean);
+    merges = git(`the range ${range}`, ["rev-list", "--merges", range]).trim().split("\n").filter(Boolean);
   } catch (error) {
     out(`verify-merge-preserved-records: ${error.message} — refused.`);
     out(`RESULT: FAIL — the range ${range} could not be read.`);
     process.exit(1);
   }
-  if (commits.length === 0) {
-    out(`verify-merge-preserved-records: no single-parent commit in ${range} — nothing a squash could have dropped.`);
+  if (commits.length === 0 && merges.length === 0) {
+    out(`verify-merge-preserved-records: no commit in ${range} — nothing a merge could have dropped.`);
     out("RESULT: PASS");
     process.exit(0);
   }
@@ -285,6 +314,37 @@ const main = () => {
   let unanswered = 0;
   let examined = 0;
   let nonTarget = 0;
+  let wrongHeads = 0;
+  for (const sha of merges) {
+    const short = sha.slice(0, 8);
+    let pull;
+    try {
+      pull = pullNamedBy(git(`the subject of ${short}`, ["log", "-1", "--format=%s", sha]).trim());
+      if (!pull) continue;
+      const pr = pullRequest(pull);
+      if (pr === "absent") {
+        out(`  ${short}  #${pull}  not examined (no PR #${pull})`);
+        continue;
+      }
+      if (!(pr.merged && pr.mergeCommit === sha)) {
+        nonTarget += 1;
+        out(`  ${short}  #${pull}  attribution non-target (not PR #${pull}'s merge commit: #${pull} ${pr.merged ? `merged as ${pr.mergeCommit.slice(0, 8)}` : "is not merged"})`);
+        continue;
+      }
+      const merged = examineMergeCommit(sha, pull, pr.head);
+      examined += 1;
+      if (merged.wrongHead) {
+        wrongHeads += 1;
+        out(`  ${short}  #${pull}  its second parent ${merged.head.slice(0, 8)} is not #${pull}'s head ${pr.head.slice(0, 8)}, so it did not merge that pull request`);
+        continue;
+      }
+      out(`  #${pull}  ${merged.recordLines} record line(s) on ${merged.branchCommits} branch commit(s), reachable from ${short} through its second parent, #${pull}'s head ${merged.head.slice(0, 8)}`);
+    } catch (error) {
+      if (!(error instanceof Unanswered)) throw error;
+      unanswered += 1;
+      out(`  ${short}  ${pull ? `#${pull}  ` : ""}refused: ${error.message}`);
+    }
+  }
   for (const sha of commits) {
     const short = sha.slice(0, 8);
     let pull;
@@ -331,13 +391,14 @@ const main = () => {
 
   out("");
   out(`verify-merge-preserved-records: ${examined} merge commit(s) examined, ${nonTarget} attribution non-target, in ${range}.`);
-  if (refused > 0 || unanswered > 0) {
+  if (refused > 0 || unanswered > 0 || wrongHeads > 0) {
     if (refused > 0) {
-      out("A merge performed with `gh pr merge` cannot preserve them; `pnpm merge` calls");
-      out("`commitlore squash-preserve` first and is the only merge path here that can.");
+      out("A squash cannot preserve them. Pull requests merge as merge commits (`pnpm merge`),");
+      out("which keep every branch commit as it was committed.");
     }
     const reasons = [
       ...(refused > 0 ? [`${refused} merge commit(s) dropped record lines their branch carried`] : []),
+      ...(wrongHeads > 0 ? [`${wrongHeads} merge commit(s) whose second parent is not their pull request's head`] : []),
       ...(unanswered > 0 ? [`${unanswered} commit(s) could not be checked`] : []),
     ];
     out(`RESULT: FAIL — ${reasons.join("; ")}.`);

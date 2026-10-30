@@ -125,14 +125,15 @@ const OWNER_ACTIONS: ReadonlyMap<ReasonCode, Pick<RetryRoute, "failureClass" | "
  */
 const classifyPreMergeRefusal = (kind: RunKind, failure: Decision<unknown>): PreMergeRoute => {
   const evidence = failure.evidence as Record<string, unknown>;
-  // The pinned merge strategy is one GitHub's pull-request merge API cannot perform: no revision of this
+  // The pinned merge strategy is not a merge commit, the only one ACP sends (#1269): no revision of this
   // run's candidate changes its pinned contract. FAILED only on the kernel's read that the pull request is
   // not merged (CEO rulings 2 and 6); without it the refusal is retried like an unknown one.
-  if (failure.reasonCode === ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED && evidence["mergeStrategy"] === "fast_forward") {
+  const strategy = evidence["mergeStrategy"];
+  if (failure.reasonCode === ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED && typeof strategy === "string" && strategy !== "merge_commit") {
     if (evidence["pullMerged"] === false) return { disposition: "UNRECOVERABLE" };
     return {
       disposition: "RETRY", failureClass: "UNCLASSIFIED", failureCause: failure.reasonCode, retries: FINALIZATION_RETRY_CAP, owner: "CEO",
-      action: "the pinned fast_forward strategy cannot be merged through GitHub's API, and the pull request could not be confirmed unmerged; confirm it, then cancel the run",
+      action: `the pinned ${strategy} strategy is not a merge commit, and the pull request could not be confirmed unmerged; confirm it, then cancel the run and migrate the contract`,
     };
   }
   const cause = failure.reasonCode === ReasonCode.INTERNAL_ERROR && typeof evidence["errorReasonCode"] === "string"

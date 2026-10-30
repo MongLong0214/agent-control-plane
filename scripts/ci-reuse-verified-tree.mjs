@@ -10,22 +10,24 @@
  *
  * What a pull-request run tests is not its head. `actions/checkout` on `pull_request` checks out
  * GitHub's synthetic merge commit (`refs/pull/N/merge`): the head merged into the base tip of that
- * moment, with that commit's own workflow file. And a squash merge's head is never an ancestor of
- * the push — the squash's parent is the previous `main`, and its message carries the head as a
- * `Merged-Head:` line. So identity comes from the message, and what was tested comes from the run.
+ * moment, with that commit's own workflow file. A merge commit (#1269, how pull requests merge now)
+ * names its head as its second parent, so identity comes from the commit's own parents. A squash,
+ * still accepted for one already in history, never has the head as an ancestor — its parent is the
+ * previous `main` and its message carries the head as a `Merged-Head:` line — so for a squash
+ * identity comes from the message. Either way, what was tested comes from the run.
  *
  * A pull-request run is reused only when all of these hold, and each is checked, not assumed:
  *
  *   1. the event is `push` and the payload says `forced: false`; `pull_request`, `schedule` and
  *      everything else always run the shards;
  *   2. the tree GitHub records for this push equals `git rev-parse HEAD^{tree}` of the checkout,
- *      and the push has exactly one parent;
- *   3. its message names exactly one `Merged-Head: <sha>` (`mergedHeadIn`, the parser the
- *      merge-records gate uses); no line, or more than one, is no reuse. The trailer is a claim in
- *      a message, so it is cross-checked against GitHub's own merged-PR record for the pushed commit
- *      (`/commits/{sha}/pulls`): exactly one pull request, merged, whose merge commit is this push,
- *      whose head is the `Merged-Head`, whose head and base repository are both this repository,
- *      and whose base branch is the branch pushed;
+ *      and the push has exactly two parents (a merge commit) or one (a squash);
+ *   3. the merged head is a merge commit's second parent, or for a squash the one `Merged-Head:
+ *      <sha>` its message names (`mergedHeadIn`, the parser the merge-records gate uses; no line, or
+ *      more than one, is no reuse). Either is cross-checked against GitHub's own merged-PR record
+ *      for the pushed commit (`/commits/{sha}/pulls`): exactly one pull request, merged, whose merge
+ *      commit is this push, whose head is that merged head, whose head and base repository are both
+ *      this repository, and whose base branch is the branch pushed;
  *   4. the newest run of this workflow on that head is a `pull_request` run in this repository from
  *      a head in this repository — never a fork, whose workflow could write its own record — and it
  *      is completed/success, and in its latest attempt every job is completed/success, with exactly
@@ -36,7 +38,7 @@
  *      the conditions they ran under: the Node version, and for shards `i` of `N` with every shard
  *      1..N recorded once and `N` the run's own shard count;
  *   6. what they ran is what this push lands: recorded tree == this push's tree, recorded parents
- *      == [this push's parent, the `Merged-Head`] exactly, recorded workflow blob == this push's
+ *      == [this push's first parent, the merged head] exactly, recorded workflow blob == this push's
  *      `.github/workflows/ci.yml` blob, and recorded Node == this workflow's `NODE_VERSION`.
  *
  * Fail closed: any API error, missing or expired record, unreadable field, or unmet condition answers
@@ -137,21 +139,24 @@ export const decideReuse = async (context, api, download) => {
     const pushed = await api(`/repos/${repository}/commits/${sha}`);
     const tree = pushed?.commit?.tree?.sha;
     if (tree !== localTree) refuse(`GitHub records tree ${tree} for ${sha}, the checkout has ${localTree}`);
-    const parents = pushed?.parents;
-    if (!Array.isArray(parents) || parents.length !== 1 || !SHA.test(parents[0]?.sha ?? "")) {
-      refuse(`${sha} does not have exactly one parent, so it is not a squash a pull-request run could have tested`);
+    const parents = Array.isArray(pushed?.parents) ? pushed.parents.map((parent) => parent?.sha) : [];
+    if ((parents.length !== 1 && parents.length !== 2) || !parents.every((parent) => SHA.test(parent ?? ""))) {
+      refuse(`${sha} has ${parents.length} parent(s), so it is neither a merge commit nor a squash a pull-request run could have tested`);
     }
-    const base = parents[0].sha;
-    let head;
-    try {
-      head = mergedHeadIn(String(pushed?.commit?.message ?? ""), `push ${sha.slice(0, 12)}`);
-    } catch (error) {
-      refuse(error?.message ?? String(error));
+    const base = parents[0];
+    // #1269 — a merge commit's head is its own second parent; only a squash names it in a trailer.
+    let head = parents[1];
+    if (head === undefined) {
+      try {
+        head = mergedHeadIn(String(pushed?.commit?.message ?? ""), `push ${sha.slice(0, 12)}`);
+      } catch (error) {
+        refuse(error?.message ?? String(error));
+      }
+      if (!SHA.test(head)) refuse(`the Merged-Head ${head} is not a full commit sha`);
     }
-    if (!SHA.test(head)) refuse(`the Merged-Head ${head} is not a full commit sha`);
 
-    // The trailer is text anyone composing the message chose. GitHub's merged-PR record says which
-    // pull request this commit merged, and from which head, base and repositories.
+    // The head is what the commit or its message claims. GitHub's merged-PR record says which pull
+    // request this commit merged, and from which head, base and repositories.
     const pulls = await api(`/repos/${repository}/commits/${sha}/pulls?per_page=100`);
     if (!Array.isArray(pulls) || pulls.length !== 1) {
       refuse(`GitHub associates ${Array.isArray(pulls) ? pulls.length : "no"} pull request(s) with ${sha.slice(0, 12)}; exactly one is required`);
@@ -160,7 +165,9 @@ export const decideReuse = async (context, api, download) => {
     const named = `#${pull?.number}`;
     if (!pull?.merged_at) refuse(`${named} is not recorded as merged`);
     if (pull.merge_commit_sha !== sha) refuse(`${named}'s merge commit is ${pull.merge_commit_sha}, not this push ${sha}`);
-    if (pull.head?.sha !== head) refuse(`${named}'s head is ${pull.head?.sha}, but the Merged-Head says ${head}`);
+    if (pull.head?.sha !== head) {
+      refuse(`${named}'s head is ${pull.head?.sha}, but ${parents.length === 2 ? "the push's second parent is" : "the Merged-Head says"} ${head}`);
+    }
     if (pull.head?.repo?.full_name !== repository || pull.base?.repo?.full_name !== repository) {
       refuse(`${named} runs from ${pull.head?.repo?.full_name} into ${pull.base?.repo?.full_name}, not within ${repository}`);
     }
@@ -250,7 +257,7 @@ export const decideReuse = async (context, api, download) => {
     const ran = records[0];
     if (ran.tree !== tree) refuse(`run ${newest.id} tested tree ${ran.tree}; this push lands ${tree}`);
     if (ran.base !== base) refuse(`run ${newest.id} tested on base ${ran.base}; this push's parent is ${base}`);
-    if (ran.mergedHead !== head) refuse(`run ${newest.id} merged ${ran.mergedHead}, not the Merged-Head ${head}`);
+    if (ran.mergedHead !== head) refuse(`run ${newest.id} merged ${ran.mergedHead}, not the merged head ${head}`);
     if (ran.workflowBlob !== pushedBlob) refuse(`run ${newest.id} executed ${workflowPath} ${ran.workflowBlob}; this push has ${pushedBlob}`);
     if (ran.node !== node) refuse(`run ${newest.id} ran on Node ${ran.node}; this workflow runs ${node}`);
 

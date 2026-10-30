@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { acpError } from "../../src/core/errors.ts";
 import { sha256 } from "../../src/core/digest.ts";
@@ -61,7 +61,13 @@ const githubFor = (options: { before?: Hook; after?: Hook } = {}) => {
   return github;
 };
 
-const approved = async (options: { before?: Hook; after?: Hook; manifest?: Partial<ProjectManifest> } = {}) => {
+const approved = async (options: {
+  before?: Hook;
+  after?: Hook;
+  manifest?: Partial<ProjectManifest>;
+  /** A contract admitted before #1269 pinned this strategy; no manifest is admitted with it now. */
+  pinnedMergeStrategy?: ProjectManifest["branchProfile"]["mergeStrategy"];
+} = {}) => {
   const github = githubFor(options);
   const harness = makeHarness({ githubClient: github });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
@@ -79,6 +85,14 @@ const approved = async (options: { before?: Hook; after?: Hook; manifest?: Parti
   github.setBranch(driven.workBranch, driven.candidateHead);
   github.nextMergeSha = driven.candidateHead;
   github.onMerge = ({ mergeSha }) => github.setTrustedPostMergeCheck(mergeSha, "project-ci", WORKFLOW_PATH);
+  const legacy = options.pinnedMergeStrategy;
+  if (legacy !== undefined) {
+    const stored = harness.cp.projects.manifest.bind(harness.cp.projects);
+    vi.spyOn(harness.cp.projects, "manifest").mockImplementation((digest) => {
+      const pinned = stored(digest);
+      return pinned ? { ...pinned, branchProfile: { ...pinned.branchProfile, mergeStrategy: legacy } } : null;
+    });
+  }
   const claimed = harness.cp.claims.acquire({
     runId: driven.runId,
     ownerSessionId: driven.ownerSessionId,
@@ -402,15 +416,8 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     await daemon.stop();
   });
 
-  it("an unrecoverable refusal ends FAILED with its reason: a pinned fast-forward strategy GitHub's merge API cannot perform", async () => {
-    const fixture = await approved({
-      manifest: {
-        branchProfile: {
-          longLived: ["main", "dev"], defaultBranch: "dev", updateStrategy: "rebase_before_review",
-          mergeStrategy: "fast_forward", releaseTagPolicy: "semver", releaseBranchCleanup: "keep",
-        },
-      },
-    });
+  it.each(["fast_forward", "squash", "rebase"] as const)("an unrecoverable refusal ends FAILED with its reason: a pinned %s contract, which is not a merge commit", async (strategy) => {
+    const fixture = await approved({ pinnedMergeStrategy: strategy });
     const { harness, driven, daemon } = fixture;
     const started = await daemon.start();
     expect(started.allowed).toBe(true);
@@ -423,7 +430,7 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     expect(invalidated[0]!.evidence).toMatchObject({ disposition: "UNRECOVERABLE", candidateSnapshotDigest: driven.candidateSnapshotDigest });
     // FAILED on GitHub's own read that the pull request is unmerged, not on the absence of a receipt alone.
     const refused = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_ATTEMPT_FAILED").at(-1)!;
-    expect(refused.evidence).toMatchObject({ mergeStrategy: "fast_forward", pullMerged: false, disposition: "UNRECOVERABLE" });
+    expect(refused.evidence).toMatchObject({ mergeStrategy: strategy, pullMerged: false, disposition: "UNRECOVERABLE" });
     const notices = outboxOf(fixture, "CEO_NOTIFICATION").filter((notice) => notice.payload.notification === "CRITICAL_SYSTEM_FAILURE");
     expect(notices).toHaveLength(1);
     expect(notices[0]!.payload).toMatchObject({ failureReasonCode: ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED, failureClass: "UNRECOVERABLE" });
@@ -689,12 +696,7 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     let gated = false;
     let reads = 0;
     const fixture = await approved({
-      manifest: {
-        branchProfile: {
-          longLived: ["main", "dev"], defaultBranch: "dev", updateStrategy: "rebase_before_review",
-          mergeStrategy: "fast_forward", releaseTagPolicy: "semver", releaseBranchCleanup: "keep",
-        },
-      },
+      pinnedMergeStrategy: "fast_forward",
       // After the gate, the merge evaluation reads the pull once; the second read is the fast-forward refusal's.
       before: (method, path) => {
         if (method === "POST" && path.endsWith("/check-runs")) gated = true;

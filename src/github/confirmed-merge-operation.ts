@@ -231,7 +231,7 @@ export const deriveConfirmedMergePlan = (
       repositoryIdentity: input.repositoryIdentity,
       exactHeadSha: repository.candidateHead,
       expectedBaseSha: repository.baseHead,
-      mergeStrategy: manifest.branchProfile.mergeStrategy,
+      mergeStrategy: manifest.branchProfile.mergeStrategy ?? "merge_commit",
       ...owner,
     },
   });

@@ -134,3 +134,58 @@ describe("a merge that drops records is refused", () => {
     expect(result.out).toContain("2 record line(s) on the branch, all reachable");
   });
 });
+
+/**
+ * #1269 — a pull request merges as a merge commit. Its head is its own second parent, so the branch's
+ * records are reachable as committed; what the gate checks is that the second parent is the head
+ * GitHub records for the pull request, never a trailer.
+ */
+describe("a merge commit is checked by its parents", () => {
+  const repositoryWithAMergeCommit = (secondParent: "head" | "other") => {
+    const dir = tempDir("acp-merge-commit-records-");
+    const work = join(dir, "work");
+    mkdirSync(work, { recursive: true });
+    git(work, "init", "--quiet", "-b", "main");
+    git(work, "config", "user.email", "test@example.invalid");
+    git(work, "config", "user.name", "test");
+    writeFileSync(join(work, "a.txt"), "base\n");
+    git(work, "add", "a.txt");
+    git(work, "commit", "--quiet", "--no-verify", "-m", "base");
+    const base = git(work, "rev-parse", "HEAD").trim();
+    git(work, "checkout", "--quiet", "-b", "feature");
+    writeFileSync(join(work, "a.txt"), "first\n");
+    git(work, "commit", "--quiet", "--no-verify", "-am", `feat: the first half\n\n${LIMIT}`);
+    const first = git(work, "rev-parse", "HEAD").trim();
+    writeFileSync(join(work, "a.txt"), "second\n");
+    git(work, "commit", "--quiet", "--no-verify", "-am", `feat: the second half\n\n${WARN}`);
+    const head = git(work, "rev-parse", "HEAD").trim();
+    git(work, "checkout", "--quiet", "main");
+    const merged = secondParent === "head" ? head : first;
+    git(work, "merge", "--quiet", "--no-ff", "--no-verify", "-m", "Merge pull request #7 from acme/feature", merged);
+    const merge = git(work, "rev-parse", "HEAD").trim();
+    git(work, "remote", "add", "origin", work);
+    const env = fakeGitHub(dir, { 7: { merged: true, mergeCommit: merge, head } });
+    let result: { status: number; out: string };
+    try {
+      result = { status: 0, out: execFileSync(process.execPath, [CHECK, `${base}..${merge}`], { cwd: work, env, encoding: "utf8", timeout: 60_000 }) };
+    } catch (error) {
+      const failure = error as { status?: number; stdout?: string; stderr?: string };
+      result = { status: failure.status ?? -1, out: `${failure.stdout ?? ""}${failure.stderr ?? ""}` };
+    }
+    return { ...result, head, first, merge };
+  };
+
+  it("passes a merge commit whose second parent is the pull request's head, with the branch's records reachable through it", () => {
+    const result = repositoryWithAMergeCommit("head");
+    expect(result.out).toContain(`#7  2 record line(s) on 2 branch commit(s), reachable from ${result.merge.slice(0, 8)} through its second parent, #7's head ${result.head.slice(0, 8)}`);
+    expect(result.out).toContain("1 merge commit(s) examined");
+    expect(result.status, result.out).toBe(0);
+  });
+
+  it("refuses a merge commit whose second parent is not the pull request's head", () => {
+    const result = repositoryWithAMergeCommit("other");
+    expect(result.out).toContain(`its second parent ${result.first.slice(0, 8)} is not #7's head ${result.head.slice(0, 8)}`);
+    expect(result.out).toContain("RESULT: FAIL");
+    expect(result.status).toBe(1);
+  });
+});

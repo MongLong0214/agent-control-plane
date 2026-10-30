@@ -26,7 +26,6 @@ import {
 } from "../guard/managed-write-guard.ts";
 import { hotfixPropagationTargets, requiredBaseFor, validateBranchContract } from "./branch-contract.ts";
 import type { BeforeDispatch, TrustedCredentialStore } from "./credential-store.ts";
-import { type BranchCommitMessage, squashCommitForMerge } from "./merge-commit-message.ts";
 import {
   type BranchObjects,
   type BranchPublishLimits,
@@ -2468,6 +2467,7 @@ export class GitHubKernel {
       prepared.value,
       observedMergeCommitSha,
       input.expectedBaseSha,
+      input.exactHeadSha,
       this.githubMergeMethod(input.mergeStrategy),
     );
     if (!proof.allowed) {
@@ -2584,9 +2584,11 @@ export class GitHubKernel {
     if (!slug.allowed) return slug as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     const { owner, repo } = slug.value;
 
-    if (input.mergeStrategy === "fast_forward") {
-      // #1189 B5 — the one refusal the finalizer ends a run FAILED for, and only on this read's confirmation
-      // that the pull request is not merged: no receipt alone proves that nothing was applied.
+    if (input.mergeStrategy !== "merge_commit") {
+      // #1269 — pull requests merge only as merge commits. A contract naming squash, rebase or fast-forward
+      // predates that rule; it is refused here, before anything is sent, and never mapped onto another
+      // method. #1189 B5 — the one refusal the finalizer ends a run FAILED for, and only on this read's
+      // confirmation that the pull request is not merged: no receipt alone proves that nothing was applied.
       let pullMerged: boolean | null = null;
       try {
         const observed = await this.api().request<unknown>("GET", `/repos/${owner}/${repo}/pulls/${input.pullNumber}`);
@@ -2597,11 +2599,11 @@ export class GitHubKernel {
       }
       return deny(
         ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED,
-        "GitHub's pull-request merge API cannot perform a true fast-forward",
+        "pull requests merge only as merge commits; the pinned contract must be migrated by a contract change",
         { mergeStrategy: input.mergeStrategy, pullNumber: input.pullNumber, pullMerged },
       );
     }
-    const method = this.githubMergeMethod(input.mergeStrategy);
+    const method = "merge";
 
     const prepared = this.preparedPrIntent(input.runId, input.repositoryIdentity, input.pullNumber);
     if (!prepared.allowed) return prepared as Decision<{ mergeCommitSha: string; replayed: boolean }>;
@@ -2628,19 +2630,17 @@ export class GitHubKernel {
       });
     }
 
-    // What the merge commit will say, decided here before the reservation: a branch whose commits
-    // cannot be listed fails with nothing reserved, as GitHub's own composition is the leak this avoids.
-    // Squash only (`outgoingSquashCommitMessage`). Its Merged-Head is the `sha` the PUT below sends.
-    const outgoing = method === "squash" ? await this.outgoingSquashCommitMessage(owner, repo, input.pullNumber,
-      preflight, input.exactHeadSha) : allow(ReasonCode.OK, undefined); // or a refusal: records it cannot keep
-    if (!outgoing.allowed) return outgoing as Decision<{ mergeCommitSha: string; replayed: boolean }>;
-    const outgoingCommitMessage = outgoing.value;
+    // #1269 — the merge commit's tree is the verified head's tree only when the head already contains the
+    // base. A head that does not would merge into a tree no verification saw, so it goes back for a new
+    // candidate rather than being merged; read before the reservation, so a refusal leaves nothing reserved.
+    const contained = await this.assertHeadContainsBase(owner, repo, input.expectedBaseSha, input.exactHeadSha);
+    if (!contained.allowed) return contained as Decision<{ mergeCommitSha: string; replayed: boolean }>;
 
     const target = this.writeTarget(input.runId, input.repositoryIdentity, preflight.head.ref);
     if (!target.allowed) return target as Decision<{ mergeCommitSha: string; replayed: boolean }>;
 
-    // FD-R1-RACE — the evaluation above was followed by awaited reads (the preflight, and for a squash the
-    // commits its message is composed from), and an owner decision or a new candidate can land during
+    // FD-R1-RACE — the evaluation above was followed by awaited reads (the preflight and the base-in-head
+    // compare), and an owner decision or a new candidate can land during
     // any of them. So the selected gate's payload is verified again here, after the last await: its
     // evidence still backs the current candidate and its human-gate binding is the one the owner's
     // current decisions resolve to. Nothing is awaited between this check and the client's request
@@ -2679,14 +2679,7 @@ export class GitHubKernel {
       () => this.api().request<{ sha: string; merged: boolean }>(
         "PUT",
         `/repos/${owner}/${repo}/pulls/${input.pullNumber}/merge`,
-        {
-          sha: input.exactHeadSha,
-          merge_method: method,
-          ...(outgoingCommitMessage !== undefined ? {
-            commit_title: outgoingCommitMessage.title,
-            commit_message: outgoingCommitMessage.message,
-          } : {}),
-        },
+        { sha: input.exactHeadSha, merge_method: method },
         { beforeDispatch: dispatch.beforeDispatch },
       ).catch((error: unknown) => {
         put.failure = transportOutcome(error);
@@ -2822,6 +2815,7 @@ export class GitHubKernel {
       prepared.value,
       mergeCommitSha,
       input.expectedBaseSha,
+      input.exactHeadSha,
       method,
     );
     if (!proof.allowed) {
@@ -2861,83 +2855,44 @@ export class GitHubKernel {
   }
 
   /**
-   * The message the squash commit will carry, composed from the branch it squashes.
-   *
-   * Squash only, and that is a scope statement rather than an omission. GitHub composes a squash
-   * message from the branch's commit messages (`squash_merge_commit_message = COMMIT_MESSAGES`),
-   * so that is the one method where the merge commit is the thing that publishes them. A
-   * `merge` commit's message is "Merge pull request #N from …" and the branch's commits survive
-   * it individually, so stating a message there would add content GitHub never wrote and remove
-   * nothing. `rebase` replays the branch's commits onto the base, so those commit messages land
-   * as themselves whatever this request says — the merge commit's body is not the mechanism that
-   * publishes them, and filtering it there would buy a guarantee this method cannot keep.
-   *
-   * Every failure here is a throw rather than a composed-anyway, because the fallback for "the
-   * branch could not be read" is GitHub's own composition — precisely what this exists to
-   * replace. It runs before the receipt reservation, so a failure leaves nothing reserved.
-   * Its one refusal, records the squash would not keep, is `squashCommitForMerge`'s.
+   * The shape a merge's proof expects. Only `merge` is ever sent (#1269); `squash` and `rebase` remain so a
+   * receipt a contract of that strategy left PENDING is still proven against what that request did.
    */
-  private async outgoingSquashCommitMessage(
-    owner: string,
-    repo: string,
-    pullNumber: number,
-    pull: PullRequest,
-    mergedHead: string,
-  ): Promise<Decision<{ title: string; message: string }>> {
-    const expectedCount = pull.commits;
-    if (typeof expectedCount !== "number" || !Number.isSafeInteger(expectedCount) || expectedCount < 1) {
-      throw new Error(`pull request ${pullNumber} has no usable exact commit total`);
-    }
-    if (expectedCount > 250) {
-      throw new Error(`pull request ${pullNumber} exceeds GitHub's 250-commit list cap`);
-    }
-    const perPage = 100;
-    // The endpoint's 250-commit cap can end in a short page. Page termination alone is no
-    // completeness proof: reconcile with the exact total and head from the checked preflight.
-    const maxPages = 3;
-    const commits: BranchCommitMessage[] = [];
-    for (let page = 1; page <= maxPages; page += 1) {
-      const batch = await this.api().request<Array<{ sha?: unknown; commit?: { message?: unknown } }>>(
-        "GET",
-        `/repos/${owner}/${repo}/pulls/${pullNumber}/commits?per_page=${perPage}&page=${page}`,
-      );
-      if (!Array.isArray(batch)) {
-        throw new Error(`pull request ${pullNumber} commits could not be read as a list`);
-      }
-      for (const entry of batch) {
-        const sha = entry?.sha;
-        const message = entry?.commit?.message;
-        if (typeof sha !== "string" || typeof message !== "string") {
-          throw new Error(`pull request ${pullNumber} reported a commit with no readable message`);
-        }
-        commits.push({ sha, message });
-      }
-      if (batch.length < perPage) break;
-      if (page === maxPages) {
-        throw new Error(`pull request ${pullNumber} lists more commits than GitHub will page through`);
-      }
-    }
-    if (commits.length === 0) {
-      // An empty list would compose an empty message, which is a silent way to publish nothing
-      // where the branch had records.
-      throw new Error(`pull request ${pullNumber} reported no commits to compose a message from`);
-    }
-    if (commits.length !== expectedCount || new Set(commits.map((commit) => commit.sha)).size !== commits.length) {
-      throw new Error(`pull request ${pullNumber} commit list does not match its exact commit total`);
-    }
-    if (commits.at(-1)!.sha !== pull.head.sha) {
-      throw new Error(`pull request ${pullNumber} commit list does not end at its exact head`);
-    }
-    return squashCommitForMerge(commits, pull.title, pullNumber, mergedHead);
-  }
-
-  /** Translate the pinned contract vocabulary to GitHub's REST API vocabulary. */
   private githubMergeMethod(strategy: BranchProfile["mergeStrategy"]): "merge" | "squash" | "rebase" {
     if (strategy === "squash") return "squash";
-    // `rebase` is intentionally checked at runtime as well as in the manifest schema so a
-    // newly admitted pinned contract cannot silently degrade into GitHub's merge method.
     if ((strategy as string) === "rebase") return "rebase";
     return "merge";
+  }
+
+  /** #1269 — the head merges only if it already contains the base, so the merge commit's tree is its tree. */
+  private async assertHeadContainsBase(
+    owner: string,
+    repo: string,
+    expectedBaseSha: string,
+    exactHeadSha: string,
+  ): Promise<Decision<void>> {
+    let status: unknown;
+    try {
+      const compared = await this.api().request<{ status?: unknown } | null>(
+        "GET",
+        `/repos/${owner}/${repo}/compare/${expectedBaseSha}...${exactHeadSha}`,
+      );
+      status = compared?.status;
+    } catch (error) {
+      return deny(ReasonCode.PROBE_FAILED, "whether the head contains the base could not be read", {
+        expectedBase: expectedBaseSha,
+        exactHead: exactHeadSha,
+        phase: "preflight-compare",
+        ...transportOutcome(error),
+      });
+    }
+    if (status === "ahead" || status === "identical") return allow(ReasonCode.OK, undefined);
+    return deny(ReasonCode.MERGE_BASE_STALE, "the head does not contain the base it would merge into; a new candidate must be verified", {
+      expectedBase: expectedBaseSha,
+      exactHead: exactHeadSha,
+      observed: typeof status === "string" ? status : null,
+      phase: "preflight-compare",
+    });
   }
 
   /** The prepare receipt binds a branch name, not merely the commit it happened to name. */
@@ -2981,6 +2936,7 @@ export class GitHubKernel {
     prepared: PreparedPrIntent,
     mergeCommitSha: string,
     expectedBaseSha: string,
+    exactHeadSha: string,
     method: "merge" | "squash" | "rebase",
   ): Promise<Decision<void>> {
     const preparedBase = this.assertPreparedBaseRef(pull, prepared, "after-put");
@@ -3079,19 +3035,25 @@ export class GitHubKernel {
         observed: targetHead,
       });
     }
-    return this.assertMergedOntoBase(owner, repo, mergeCommitSha, expectedBaseSha, method);
+    return this.assertMergedOntoBase(owner, repo, mergeCommitSha, expectedBaseSha, exactHeadSha, method);
   }
 
   /**
-   * §24.6 — the merge commit's first-parent chain must reach the base the run evaluated.
-   * For a merge or squash the first parent *is* the base tip; a rebase produces a chain of
-   * rebased commits ending at it, so the chain is walked.
+   * §24.6 — the merge commit's first-parent chain must reach the base the run evaluated. For a merge or
+   * squash the first parent *is* the base tip; a rebase produces a chain of rebased commits ending at it,
+   * so the chain is walked. Only `merge` is sent (#1269); squash and rebase remain for a receipt such a
+   * contract left PENDING.
+   *
+   * #1269 — a merge commit is then read back as exactly the commit it should be: its second and last
+   * parent is the exact head, so the head stays an ancestor, and its tree is the head's own tree, which
+   * the merge's tree must be because the head was checked to contain the base before the request.
    */
   private async assertMergedOntoBase(
     owner: string,
     repo: string,
     mergeCommitSha: string,
     expectedBaseSha: string,
+    exactHeadSha: string,
     method: "merge" | "squash" | "rebase",
   ): Promise<Decision<void>> {
     const walked: string[] = [];
@@ -3129,7 +3091,11 @@ export class GitHubKernel {
       }
       if (hop === 0) observedFirstParent = first;
       walked.push(sha);
-      if (first === expectedBaseSha) return allow(ReasonCode.OK, undefined);
+      if (first === expectedBaseSha) {
+        return method === "merge"
+          ? this.assertHeadMergedAsItself(owner, repo, mergeCommitSha, commit, exactHeadSha)
+          : allow(ReasonCode.OK, undefined);
+      }
       if (method !== "rebase") break;
       sha = first;
     }
@@ -3138,6 +3104,58 @@ export class GitHubKernel {
       "the merge did not land on the base the run's evidence was bound to",
       { mergeCommitSha, expected: expectedBaseSha, observed: observedFirstParent, walked },
     );
+  }
+
+  /** #1269 — the merge commit's second and last parent is the exact head, and its tree is the head's. */
+  private async assertHeadMergedAsItself(
+    owner: string,
+    repo: string,
+    mergeCommitSha: string,
+    merged: unknown,
+    exactHeadSha: string,
+  ): Promise<Decision<void>> {
+    const parents = (merged as { parents?: unknown[] }).parents ?? [];
+    const second = (parents[1] as { sha?: unknown } | null | undefined)?.sha;
+    if (parents.length !== 2 || second !== exactHeadSha) {
+      return deny(ReasonCode.MERGE_BASE_STALE, "the merge commit's parents are not the evaluated base and the exact head", {
+        mergeCommitSha,
+        expected: exactHeadSha,
+        observed: typeof second === "string" ? second : null,
+        parentCount: parents.length,
+        phase: "postflight-merge-parents",
+      });
+    }
+    const head = await this.api()
+      .request<unknown>("GET", `/repos/${owner}/${repo}/commits/${exactHeadSha}`)
+      .catch(() => null);
+    const treeOf = (commit: unknown): string | null => {
+      const tree = (commit as { commit?: { tree?: { sha?: unknown } } } | null)?.commit?.tree?.sha;
+      return typeof tree === "string" && tree.trim() !== "" ? tree : null;
+    };
+    if (!head) {
+      return deny(ReasonCode.PROBE_FAILED, "the merged head could not be re-read", {
+        mergeCommitSha,
+        at: exactHeadSha,
+        phase: "postflight-merge-tree",
+      });
+    }
+    const mergedTree = treeOf(merged);
+    const headTree = treeOf(head);
+    if (!mergedTree || !headTree) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "the merge commit or its head has no usable tree sha", {
+        mergeCommitSha,
+        phase: "postflight-merge-tree",
+      });
+    }
+    if (mergedTree !== headTree) {
+      return deny(ReasonCode.MERGE_BASE_STALE, "the merge commit's tree is not the exact head's tree", {
+        mergeCommitSha,
+        expected: headTree,
+        observed: mergedTree,
+        phase: "postflight-merge-tree",
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   // -------------------------------------------------------------------------
@@ -4618,7 +4636,8 @@ export class GitHubKernel {
         pinnedManifestDigest: run.pinnedManifestDigest,
       });
     }
-    return allow(ReasonCode.OK, manifest.branchProfile);
+    // #1269 — a stored contract written before the field existed reads as the default, a merge commit.
+    return allow(ReasonCode.OK, { ...manifest.branchProfile, mergeStrategy: manifest.branchProfile.mergeStrategy ?? "merge_commit" });
   }
 
   private async activeReleases(repositoryIdentity: string): Promise<Decision<string[]>> {
