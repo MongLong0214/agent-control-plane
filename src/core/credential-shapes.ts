@@ -51,9 +51,6 @@ const STAGED_BODY_PATHS: ReadonlySet<string> = new Set([
   "genesis.files.contentBase64",
   // The review evidence a bootstrap PLAN froze (bootstrap/bootstrap-review-evidence.ts).
   "reviewEvidence.bundle.files.bodyBase64",
-  // A blind review's REVIEW.md bytes (review/blind-review.ts, #1274). The BLIND_REVIEW schema refuses
-  // them unless they decode to the policy's `content`, which is checked against every shape.
-  "inputManifest.reviewPolicies.contentBase64",
 ]);
 
 const isCanonicalBase64 = (value: string): boolean =>

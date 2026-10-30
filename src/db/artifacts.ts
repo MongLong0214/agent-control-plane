@@ -94,11 +94,12 @@ export const reviewPolicyText = (bytes: Uint8Array): string =>
 
 /**
  * Whether a review policy's bytes are the ones its digest hashes and its text reads (#1274). The bytes
- * are stored because `canonicalJson` normalizes line endings in every stored string; they are exempt
- * from the long-base64 credential shape only at this path, so they must say what the checked text says.
+ * are stored because `canonicalJson` normalizes line endings in every stored string. They are numbers,
+ * not text, so no credential shape is relaxed for them; requiring them to decode to `content`, which is
+ * checked against every shape, keeps them from carrying anything the checked text does not.
  */
-const reviewPolicyBytesAgree = (policy: { digest: string; content: string; contentBase64: string }): boolean => {
-  const bytes = Buffer.from(policy.contentBase64, "base64");
+const reviewPolicyBytesAgree = (policy: { digest: string; content: string; contentBytes: number[] }): boolean => {
+  const bytes = Buffer.from(policy.contentBytes);
   try {
     return sha256(bytes) === policy.digest && reviewPolicyText(bytes) === policy.content;
   } catch {
@@ -748,7 +749,7 @@ const blindReviewEvidenceSchema = z
               revision: z.string().regex(/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/),
               digest: DIGEST_SCHEMA,
               content: z.string().max(16_384).refine(reviewPolicyDeclaresContent),
-              contentBase64: z.string().max(Math.ceil(16_384 / 3) * 4).regex(/^[A-Za-z0-9+/]*={0,2}$/),
+              contentBytes: z.array(z.number().int().min(0).max(255)).max(16_384),
             })
             .strict()
             .refine(reviewPolicyBytesAgree),

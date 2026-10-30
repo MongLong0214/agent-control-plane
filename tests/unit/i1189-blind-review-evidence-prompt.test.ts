@@ -127,7 +127,7 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
       digest: sha256(policy),
       content: policy,
     };
-    const reviewPolicy = { ...shown, contentBase64: Buffer.from(policy, "utf8").toString("base64") };
+    const reviewPolicy = { ...shown, contentBytes: [...Buffer.from(policy, "utf8")] };
 
     expect(packet.inputManifest.reviewPolicies).toEqual([reviewPolicy]);
     expect(packet.inputManifest.reviewerPromptDigests).toEqual([transmittedDigest(harness, prompt)]);
@@ -165,7 +165,7 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
       digest: sha256(committed),
       content: policy,
     };
-    expect(packet.inputManifest.reviewPolicies).toEqual([{ ...shown, contentBase64: committed.toString("base64") }]);
+    expect(packet.inputManifest.reviewPolicies).toEqual([{ ...shown, contentBytes: [...committed] }]);
     const [bound] = packet.inputManifest.reviewPolicies;
     expect(sha256(Buffer.from(bound!.content, "utf8"))).toBe(bound!.digest);
     expect(promptsStartingWith(harness, "# Candidate review")[0]).toContain(JSON.stringify([shown], null, 2));
@@ -173,8 +173,9 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
 
   /**
    * #1274 — every string the artifact store keeps goes through `canonicalJson`, which turns CRLF and a
-   * bare CR into LF. The policy's bytes are kept beside its text, so the stored record still holds the
-   * exact bytes its digest hashes after the row is read back.
+   * bare CR into LF. The policy's bytes are kept beside its text as numbers, which no string rule
+   * rewrites, so the stored record still holds the exact bytes its digest hashes after the row is read
+   * back.
    */
   it.each([
     ["CRLF", "# Review\r\n\r\n- Line endings are part of the committed file.\r\n"],
@@ -189,8 +190,10 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
     const driven = await driveToReviewedCandidate(harness);
     // `latestPacket` reads the stored row: `canonicalJson` on the way in, `JSON.parse` on the way out.
     const [stored] = harness.cp.review.latestPacket(driven.runId, driven.candidateSnapshotDigest)!.inputManifest.reviewPolicies;
-    expect(stored).toMatchObject({ digest: sha256(committed), contentBase64: committed.toString("base64") });
-    expect(sha256(Buffer.from(stored!.contentBase64, "base64"))).toBe(stored!.digest);
+    expect(stored).toMatchObject({ digest: sha256(committed), contentBytes: [...committed] });
+    const bytes = Buffer.from(stored!.contentBytes);
+    expect(sha256(bytes)).toBe(stored!.digest);
+    expect(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes)).toBe(policy);
     // The reviewer is shown the policy text with its own line endings.
     expect(promptsStartingWith(harness, "# Candidate review")[0]).toContain(JSON.stringify(policy));
   });
@@ -220,7 +223,7 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
           ...policy,
           content,
           digest: sha256(content),
-          contentBase64: Buffer.from(content, "utf8").toString("base64"),
+          contentBytes: [...Buffer.from(content, "utf8")],
         })),
       },
     });
@@ -256,12 +259,103 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
       },
       driven.candidateSnapshotDigest,
     );
+    const committed = [...Buffer.from("# Review\r\n", "utf8")];
     const other = Buffer.from("# Other\r\n", "utf8");
 
-    // The bytes are exempt from the long-base64 credential shape only because they must decode to `content`.
-    expect(() => store({ contentBase64: other.toString("base64") })).toThrow("BLIND_REVIEW has an invalid evidence envelope");
+    expect(() => store({ contentBytes: [...other] })).toThrow("BLIND_REVIEW has an invalid evidence envelope");
     expect(() => store({ digest: sha256(other) })).toThrow("BLIND_REVIEW has an invalid evidence envelope");
-    expect(store({}).content.inputManifest.reviewPolicies[0]!.contentBase64).toBe(Buffer.from("# Review\r\n").toString("base64"));
+    // Each entry is one byte: `Buffer.from` would read 266, -246 and 10.5 all as the final LF.
+    for (const notAByte of [266, -246, 10.5]) {
+      expect(() => store({ contentBytes: [...committed.slice(0, -1), notAByte] }), String(notAByte))
+        .toThrow("BLIND_REVIEW has an invalid evidence envelope");
+    }
+    expect(store({}).content.inputManifest.reviewPolicies[0]!.contentBytes).toEqual(committed);
+  });
+
+  /**
+   * #1274, review pr1274-fs-r3 — the policy bytes were once a base64 string exempt from the long-base64
+   * credential shape at its property path, an exemption every artifact kind got while only BLIND_REVIEW
+   * checks the bytes against the text. No path is exempt now: the bytes are numbers, and the text is
+   * checked against every shape.
+   */
+  it("#1274: a PLAN carrying a review policy's base64 field is refused as a credential, as the same value is under any other field", async () => {
+    const harness = makeHarness();
+    const { projectId, repositoryId } = await registerFixtureProject(harness);
+    bindCeo(harness);
+    const created = harness.cp.runs.create({
+      projectId,
+      kind: RunKind.STANDARD_WORK,
+      executionMode: ExecutionMode.STANDARD,
+      contract: CONTRACT,
+      repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    });
+    if (!created.allowed) throw new Error(created.message);
+    const runId = created.value.runId;
+    const refusal = (content: unknown): unknown => {
+      try {
+        harness.cp.artifacts.put(runId, ArtifactKind.PLAN, content);
+        return null;
+      } catch (error) {
+        return error;
+      }
+    };
+    // The reviewer's probe: sixty 0xff bytes, which are not UTF-8, with no text or digest beside them.
+    const encoded = Buffer.alloc(60, 0xff).toString("base64");
+
+    expect(refusal({ inputManifest: { reviewPolicies: [{ contentBase64: encoded }] } })).toMatchObject({
+      reasonCode: ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED,
+      evidence: { field: "contentBase64" },
+    });
+    expect(refusal({ note: encoded })).toMatchObject({ reasonCode: ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED, evidence: { field: "note" } });
+    expect(refusal({ inputManifest: { reviewPolicies: [] } })).toBeNull();
+  });
+
+  it("#1274: a credential in REVIEW.md text refuses the record, and the base64 form of policy bytes is not a record field", async () => {
+    const harness = makeHarness();
+    writeFiles(harness.repoPath, { "REVIEW.md": "# Review\n" });
+    commitAll(harness.repoPath, "add project review requirements");
+    const driven = await driveToReviewedCandidate(harness);
+    const packet = harness.cp.review.latestPacket(driven.runId, driven.candidateSnapshotDigest)!;
+    const store = (policy: Record<string, unknown>) => harness.cp.artifacts.putEvidence(
+      harness.cp.evidenceWritersForTests().BLIND_REVIEW,
+      driven.runId,
+      ArtifactKind.BLIND_REVIEW,
+      {
+        ...packet,
+        inputManifest: {
+          ...packet.inputManifest,
+          reviewPolicies: packet.inputManifest.reviewPolicies.map(({ repository, path, revision }) => ({ repository, path, revision, ...policy })),
+        },
+      },
+      driven.candidateSnapshotDigest,
+    );
+    const refusal = (policy: Record<string, unknown>): unknown => {
+      try {
+        store(policy);
+        return null;
+      } catch (error) {
+        return error;
+      }
+    };
+    const exactly = (text: string) => {
+      const bytes = Buffer.from(text, "utf8");
+      return { digest: sha256(bytes), content: text, contentBytes: [...bytes] };
+    };
+
+    // A base64 credential in the text is refused by the ordinary rules, at the text.
+    expect(refusal(exactly(`# Review\n\n- Deploy with ${Buffer.alloc(60, 0xff).toString("base64")}\n`))).toMatchObject({
+      reasonCode: ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED,
+      evidence: { field: "content" },
+    });
+    // Ordinary prose whose base64 is a long base64 run: the record that carried that base64 beside the
+    // prose, accepted while its path was exempt, is refused; the same bytes as numbers are stored.
+    const prose = "# Review\n\n- Keep every change small, readable, and covered by a focused test.\n";
+    const encoded = Buffer.from(prose, "utf8").toString("base64");
+    expect(encoded).toMatch(/[A-Za-z0-9+/]{60,}/);
+    expect(refusal({ digest: sha256(prose), content: prose, contentBase64: encoded })).toMatchObject({
+      reasonCode: ReasonCode.INVALID_ARGUMENT,
+    });
+    expect(store(exactly(prose)).content.inputManifest.reviewPolicies[0]).toMatchObject(exactly(prose));
   });
 
   it("candidate first review and re-review use only the original canonical method", async () => {
