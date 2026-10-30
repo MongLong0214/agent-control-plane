@@ -6,13 +6,14 @@ import { sha256 } from "../../src/core/digest.ts";
 import { acpError, deny, isAcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ApprovedRunFinalizer } from "../../src/daemon/finalizer.ts";
-import { followUpCauseOf } from "../../src/daemon/post-merge-follow-up.ts";
+import { Daemon } from "../../src/daemon/daemon.ts";
+import { assessFollowUpRetry, followUpCauseOf, openPostMergeResponsibility } from "../../src/daemon/post-merge-follow-up.ts";
 import { Role, RunKind, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import { workflowDigestAtCommit } from "../../src/github/workflow-digest-at-commit.ts";
 import { retireProject } from "../../src/registry/project-retirement.ts";
 import { WORKFLOW, WORKFLOW_PATH, dispatchRun, normalized, stricter, type DispatchedRun } from "../helpers/contract-change.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
-import { cleanupTempDirs, commitAll, makeRepo, writeFiles } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import {
   applyPassingChange,
   bindWorker,
@@ -224,7 +225,7 @@ const legacyMergeReceipt = (h: Harness, runId: string, applied: boolean): void =
  * requires it are merged first, then the manifest is activated. The fixture contract-change-activate.test.ts
  * builds for W18, with the CEO's CONFIRM taken here.
  */
-const confirmedRepositoryContractChange = async (projectId: string) => {
+const confirmedRepositoryContractChange = async (projectId: string, options: { legacy?: boolean } = {}) => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
   const h = makeHarness({ githubClient: github });
@@ -288,8 +289,18 @@ const confirmedRepositoryContractChange = async (projectId: string) => {
   github.nextMergeSha = repository.candidateHead;
   github.onMerge = ({ mergeSha }) => github.setTrustedPostMergeCheck(mergeSha, "project-ci", CI_PATH);
   await h.cp.continuity.evaluate("confirm the contract change");
+  if (options.legacy) {
+    // Raw history only: the approval a build that issued no grants wrote — the edge to CEO_APPROVED and a
+    // CEO_DECISION CONFIRM of this candidate that names no grant.
+    expect(h.cp.runs.transition(run.runId, RunState.CEO_APPROVED, "confirmed before grants", { candidateSnapshotDigest: candidate }).allowed).toBe(true);
+    h.cp.audit.record({
+      kind: "CEO_DECISION", runId: run.runId, sessionId: h.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId, roleKey: roleKeyFor(Role.CEO),
+      evidence: { decision: "CONFIRM", candidateSnapshotDigest: candidate },
+    });
+    return { github, h, registered, run, m1, candidate };
+  }
   expect((await decideThroughHermes(h, { runId: run.runId, decision: "CONFIRM", candidateSnapshotDigest: candidate })).allowed).toBe(true);
-  return { github, h, registered, run, m1 };
+  return { github, h, registered, run, m1, candidate };
 };
 
 /**
@@ -737,5 +748,237 @@ describe("A10 — retirement proceeds only when nothing a terminal block holds i
     });
     expect(h.cp.projects.get(projectId)?.retiredAt ?? null).toBeNull();
     expect(grantsOf(h, run.runId)).toEqual([expect.objectContaining({ consumed_at: null })]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------
+// #1189 B15 (CEO, 2026-10-30) — a run blocked for recovery that stays CEO_APPROVED, and the CEO's place in every block
+
+/** The run's execution owner and authority as stored: its owner columns and its claims' owners, the CEO and owner bindings, its grants. */
+const authorityOf = (h: Harness, runId: string) => ({
+  run: h.cp.db.get(`SELECT owner_session_id, owner_binding_generation, owner_session_incarnation, owner_role_key FROM runs WHERE run_id = ?`, [runId]),
+  claims: h.cp.db.all(`SELECT claim_id, owner_session_id, owner_binding_generation FROM resource_claims WHERE run_id = ? ORDER BY claim_id`, [runId]),
+  ceo: h.cp.bindings.active(roleKeyFor(Role.CEO)),
+  owner: h.cp.bindings.active(h.cp.runs.require(runId).ownerRoleKey!),
+  grants: [
+    ...h.cp.db.all(`SELECT * FROM manifest_activation_grants WHERE run_id = ?`, [runId]),
+    ...h.cp.db.all(`SELECT * FROM manifest_first_activation_grants WHERE run_id = ?`, [runId]),
+  ],
+});
+
+/**
+ * What a handover or an acknowledgement would write: a binding change of the CEO or of the run's owner role, a handoff, decision or
+ * ACK record, an ACKED message or handoff. A terminal block revoking the run's WORKER bindings is #512's terminal cleanup, not this.
+ */
+const HANDOVER_OR_ACK = ["HANDOFF_SUBMITTED", "HANDOFF_ACK", "CEO_DECISION", "CEO_NOTIFICATION_ACKED", "OUTBOX_ACKED_IN_BAND"];
+const handoverOrAck = (h: Harness, runId: string) => ({
+  records: h.cp.db.all(
+    `SELECT event_id, kind, role_key FROM audit_events
+      WHERE kind IN (${HANDOVER_OR_ACK.map(() => "?").join(", ")}) OR (kind LIKE 'BINDING_%' AND role_key IN (?, ?)) ORDER BY event_id`,
+    [...HANDOVER_OR_ACK, roleKeyFor(Role.CEO), h.cp.runs.require(runId).ownerRoleKey!]),
+  acked: h.cp.db.all(`SELECT message_id FROM outbox WHERE status = 'ACKED' ORDER BY message_id`),
+  handoffs: h.cp.db.all(`SELECT handoff_id, status FROM handoffs ORDER BY handoff_id`),
+});
+
+interface LeaseRow {
+  attempt_id: string; lease_owner: string; candidate_digest: string; state: string; started_at: string; deadline_at: string;
+  failure_reason: string | null; compensation_plan_json: string | null;
+}
+const leaseOf = (h: Harness, runId: string) => h.cp.db.get<LeaseRow>(
+  `SELECT attempt_id, lease_owner, candidate_digest, state, started_at, deadline_at, failure_reason, compensation_plan_json
+     FROM finalization_attempts WHERE run_id = ?`, [runId])!;
+
+/**
+ * One finalizer pass, under a named lease owner, that ends in a block — checked against the CEO's rule: the block records the CEO as
+ * responsible for the follow-up decision and changes no execution owner, binding, claim owner or grant; it writes no handover and no
+ * acknowledgement; the lease that blocked is this pass's own, unchanged in owner, and it keeps the block's cause and compensation.
+ */
+const blockedPass = async (h: Harness, runId: string, leaseOwner: string) => {
+  const authority = authorityOf(h, runId);
+  const acks = handoverOrAck(h, runId);
+  const blocksOf = () => h.cp.audit.forRun(runId).filter((entry) => entry.kind === "FINALIZATION_BLOCKED_POST_MERGE");
+  const before = blocksOf().length;
+  expect(await new ApprovedRunFinalizer(h.cp, leaseOwner).finalizeApprovedRun(runId)).toMatchObject({
+    allowed: false, reasonCode: ReasonCode.FINALIZATION_COMPENSATION_REQUIRED,
+  });
+  const blocks = blocksOf();
+  expect(blocks).toHaveLength(before + 1);
+  const block = blocks.at(-1)!;
+  expect(block).toMatchObject({ roleKey: "CEO", sessionId: null, evidence: { owner: "CEO" } });
+  const lease = leaseOf(h, runId);
+  const acquired = h.cp.audit.forRun(runId).filter((entry) => entry.kind === "FINALIZATION_ATTEMPT_ACQUIRED").at(-1)!;
+  expect(acquired.evidence).toMatchObject({ attemptId: lease.attempt_id, leaseOwner });
+  expect(lease).toMatchObject({
+    attempt_id: block.evidence["attemptId"], lease_owner: leaseOwner, candidate_digest: h.cp.runs.currentCandidate(runId),
+    state: "BLOCKED", failure_reason: block.evidence["failureReasonCode"],
+  });
+  expect(JSON.parse(lease.compensation_plan_json!)).toEqual(block.evidence["compensation"]);
+  expect(authorityOf(h, runId)).toEqual(authority);
+  expect(handoverOrAck(h, runId)).toEqual(acks);
+  expect(openPostMergeResponsibility(h.cp.db, runId)).toContain("COMPENSATION_UNRESOLVED");
+  return lease;
+};
+
+describe("B15 recovery block — a run blocked for recovery stays CEO_APPROVED, and nothing acts on that state name alone", () => {
+  it("evidence: no daemon sweep, restart after the lease deadline, CONFIRM re-entry, follow-up retry or cancel re-runs, re-merges or re-activates the blocked run, and retirement does not take it as settled", async () => {
+    const { github, h, registered, run, candidate } = await confirmedRepositoryContractChange("cc-b15-hold", { legacy: true });
+    const runId = run.runId;
+    // Raw history only: the manifest activation a build that issued no grants recorded for this run.
+    h.cp.audit.record({ kind: "PROJECT_MANIFEST_ACTIVATED", runId, projectId: registered.projectId, evidence: { legacy: true } });
+    const manifest = h.cp.projects.require(registered.projectId).activeManifestDigest;
+    const writes = () => github.calls.filter((call) => call.method !== "GET").length;
+    expect(writes()).toBe(0);
+    const authority = authorityOf(h, runId);
+
+    // The one pass that blocks it. Its CONFIRM is found; the grant check refuses it before any GitHub write; the applied
+    // activation turns that refusal into the recovery block. The run has no edge to BLOCKED_POST_MERGE and stays CEO_APPROVED.
+    const lease = await blockedPass(h, runId, "agentcpd:b15-blocking-pass");
+    expect(lease.failure_reason).toBe(ReasonCode.MANIFEST_ACTIVATION_GRANT_MISSING);
+    expect(h.cp.runs.require(runId).state).toBe(RunState.CEO_APPROVED);
+
+    const plan = vi.spyOn(ApprovedRunFinalizer.prototype as unknown as { reconfirmAndPlan: () => Promise<unknown> }, "reconfirmAndPlan");
+    const count = (kind: string) => h.cp.audit.forRun(runId).filter((entry) => entry.kind === kind).length;
+    const held = () => ({
+      state: h.cp.runs.require(runId).state,
+      lease: leaseOf(h, runId),
+      transitions: count("RUN_TRANSITION"),
+      acquired: count("FINALIZATION_ATTEMPT_ACQUIRED"),
+      blocks: count("FINALIZATION_BLOCKED_POST_MERGE"),
+      resumed: count("FINALIZATION_POST_MERGE_RESUMED"),
+      retryable: count("FINALIZATION_FOLLOW_UP_RETRYABLE"),
+      activations: count("PROJECT_MANIFEST_ACTIVATED"),
+      manifest: h.cp.projects.require(registered.projectId).activeManifestDigest,
+      grants: grantsOf(h, runId),
+      receipts: h.cp.db.all(`SELECT receipt_id, operation, status FROM github_receipts WHERE run_id = ? ORDER BY receipt_id`, [runId]),
+      writes: writes(),
+      merges: github.mergeCount,
+    });
+    const blocked = held();
+    expect(blocked).toMatchObject({
+      state: RunState.CEO_APPROVED, acquired: 1, blocks: 1, resumed: 0, retryable: 0, activations: 1, manifest, grants: [], receipts: [], writes: 0, merges: 0,
+    });
+
+    // (a) The daemon: its startup sweep over CEO_APPROVED runs and its production entry point take no lease.
+    const daemon = new Daemon(h.cp, { stateDir: tempDir("acp-b15-hold-") });
+    const started = await daemon.start();
+    expect(started, JSON.stringify(started)).toMatchObject({ allowed: true });
+    expect(started.allowed ? started.value.resumedFinalizations : null).toEqual([]);
+    for (let pass = 0; pass < 2; pass += 1) {
+      expect(await daemon.finalizeApprovedRun(runId)).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+    }
+    // (a) A CONFIRM through the CEO's door, the consumer re-entry, binds nothing and starts no finalization.
+    const onApproved = vi.fn((id: string) => daemon.finalizeApprovedRun(id));
+    expect((await decideThroughHermes(h, { runId, decision: "CONFIRM", candidateSnapshotDigest: candidate }, { onCeoApproved: onApproved })).allowed).toBe(false);
+    expect(onApproved).not.toHaveBeenCalled();
+    await daemon.stop();
+
+    // (b) No retry path: the follow-up assessment finds no cause, and the cancel stays refused for the applied effect.
+    expect(assessFollowUpRetry(h.cp.db, h.cp.runs.require(runId), leaseOf(h, runId), candidate)).toMatchObject({ cause: null, refusal: "NOT_RETRYABLE" });
+    expect(h.cp.runs.cancel(runId, "withdraw the legacy change")).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.FINALIZATION_COMPENSATION_REQUIRED, evidence: { classification: "APPLIED" },
+    });
+
+    // (c) Retirement waits on it and cancels nothing.
+    vi.spyOn(h.cp.residentProjects, "retire").mockResolvedValue(undefined as never);
+    expect(await retireProject(h.cp, registered.projectId, "the owner retires the project")).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.CONFLICT, evidence: { waitingOn: [expect.objectContaining({ runId, state: RunState.CEO_APPROVED })] },
+    });
+
+    // (a)(c) Past the blocked lease's deadline a restarted daemon reclaims expired leases, sweeps CEO_APPROVED runs and retries
+    // the pending retirement: the BLOCKED lease is not RUNNING, so nothing is reclaimed, acquired or retired.
+    h.clock.advance(2 * 60 * 60_000);
+    expect(h.clock.nowIso() > blocked.lease.deadline_at).toBe(true);
+    const restarted = new Daemon(h.cp, { stateDir: tempDir("acp-b15-hold-restart-") });
+    const again = await restarted.start();
+    expect(again, JSON.stringify(again)).toMatchObject({ allowed: true });
+    expect(again.allowed ? again.value.resumedFinalizations : null).toEqual([]);
+    expect(await restarted.finalizeApprovedRun(runId)).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+    await restarted.stop();
+    expect(count("FINALIZATION_ATTEMPT_RECLAIMED")).toBe(0);
+    expect(h.cp.projects.get(registered.projectId)?.retiredAt ?? null).toBeNull();
+
+    // Nothing moved: the run, its lease with the block's cause, its one activation, the manifest, GitHub; and nobody planned it again.
+    expect(held()).toEqual(blocked);
+    expect(plan).not.toHaveBeenCalled();
+    expect(authorityOf(h, runId)).toEqual(authority);
+  });
+
+  it("evidence: every post-merge block records the CEO as responsible for the follow-up decision, leaves the execution owner, grant and lease as they were, is read as no handover or ACK, and keeps its cause and open responsibility", async () => {
+    // A STANDARD_WORK run whose declared check FAILed after its merge.
+    const fail = await reviewedRun("failure");
+    const failRun = fail.driven.runId;
+    expect(confirmIn(fail.harness, failRun, fail.driven.candidateSnapshotDigest)).toMatchObject({ allowed: true });
+    const failed = await blockedPass(fail.harness, failRun, "agentcpd:block-real-fail");
+    expect(fail.harness.cp.runs.require(failRun).state).toBe(RunState.BLOCKED_POST_MERGE);
+    expect(failed.failure_reason).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
+    expect(await new ApprovedRunFinalizer(fail.harness.cp).finalizeApprovedRun(failRun)).toMatchObject({ allowed: false });
+    expect(leaseOf(fail.harness, failRun)).toEqual(failed);
+    expect(openPostMergeResponsibility(fail.harness.cp.db, failRun)).toEqual(["COMPENSATION_UNRESOLVED", "RECOVERY_NOT_HANDED_OVER"]);
+
+    // A granted CONTRACT_CHANGE whose activation read goes unanswered after its verified merge: blocked, re-blocked on each of
+    // its three follow-up retries, then exhausted. Its grant stays unconsumed and its own throughout.
+    const { github, h, run } = await confirmedRepositoryContractChange("cc-block-authority");
+    const read = h.cp.github.workflowDigestAt.bind(h.cp.github);
+    let reads = 0;
+    vi.spyOn(h.cp.github, "workflowDigestAt").mockImplementation(async (...args) => {
+      reads += 1;
+      return reads > 2 ? deny(ReasonCode.PROBE_FAILED, "the exact workflow read went unanswered", { outcome: "unheard" }) : read(...args);
+    });
+    const authority = authorityOf(h, run.runId);
+    expect(authority.grants).toEqual([expect.objectContaining({ consumed_at: null })]);
+    for (let pass = 0; pass <= 3; pass += 1) {
+      const lease = await blockedPass(h, run.runId, `agentcpd:block-activation-${pass}`);
+      expect(lease.failure_reason).toBe(ReasonCode.MANIFEST_ACTIVATION_REFUSED);
+      expect(h.cp.runs.require(run.runId).state).toBe(RunState.BLOCKED_POST_MERGE);
+      expect(resumes(h, run.runId)).toHaveLength(pass);
+    }
+    const exhaustedLease = leaseOf(h, run.runId);
+    const acks = handoverOrAck(h, run.runId);
+    expect(await new ApprovedRunFinalizer(h.cp, "agentcpd:block-exhausted").finalizeApprovedRun(run.runId)).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.FINALIZATION_COMPENSATION_REQUIRED, evidence: { followUp: { refusal: "BUDGET_EXHAUSTED" } },
+    });
+    expect(h.cp.audit.forRun(run.runId).filter((entry) => entry.kind === "FINALIZATION_FOLLOW_UP_EXHAUSTED")).toEqual([
+      expect.objectContaining({
+        roleKey: "CEO", sessionId: null,
+        evidence: expect.objectContaining({ owner: "CEO", blocker: ReasonCode.MANIFEST_ACTIVATION_REFUSED, cause: "ACTIVATION_READ_TRANSIENT", retriesUsed: 3 }),
+      }),
+    ]);
+    expect(leaseOf(h, run.runId)).toEqual(exhaustedLease);
+    expect(handoverOrAck(h, run.runId)).toEqual(acks);
+    expect(authorityOf(h, run.runId)).toEqual(authority);
+    expect(openPostMergeResponsibility(h.cp.db, run.runId)).toEqual(["GRANT_UNCONSUMED", "COMPENSATION_UNRESOLVED", "RECOVERY_NOT_HANDED_OVER"]);
+    expect(github.mergeCount).toBe(1);
+  });
+
+  it("fix: a run blocked for recovery at CEO_APPROVED holds its recovery open, and retirement names it rather than reading the state name as a finalization in flight", async () => {
+    const h = makeHarness();
+    const { projectId } = await registerFixtureProject(h, "cc-b15-open");
+    const blocked = (await legacyApproved(h, projectId)).run.runId;
+    // Raw history only: a manifest activation recorded for a run confirmed before grants existed.
+    h.cp.audit.record({ kind: "PROJECT_MANIFEST_ACTIVATED", runId: blocked, projectId, evidence: { legacy: true } });
+    expect(await new ApprovedRunFinalizer(h.cp).finalizeApprovedRun(blocked)).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.FINALIZATION_COMPENSATION_REQUIRED,
+    });
+    expect(attemptOf(h, blocked)?.state).toBe("BLOCKED");
+    expect(h.cp.runs.require(blocked).state).toBe(RunState.CEO_APPROVED);
+    // An approved run of the same project with no block: it waits as a finalization would, and nothing names recovery open for it.
+    const plain = (await legacyApproved(h, projectId)).run.runId;
+
+    expect(openPostMergeResponsibility(h.cp.db, blocked)).toEqual(["COMPENSATION_UNRESOLVED", "RECOVERY_NOT_HANDED_OVER"]);
+    expect(openPostMergeResponsibility(h.cp.db, plain)).toEqual([]);
+    vi.spyOn(h.cp.residentProjects, "retire").mockResolvedValue(undefined as never);
+    const retired = await retireProject(h.cp, projectId, "the owner retires the project");
+    expect(retired, JSON.stringify(retired)).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+    // Both runs were created in one clock instant, so the refusal lists them by run id: read each by its id.
+    const waitingOn = retired.evidence["waitingOn"] as Array<Record<string, unknown>>;
+    expect(waitingOn).toHaveLength(2);
+    expect(waitingOn.find((entry) => entry["runId"] === blocked)).toEqual({
+      runId: blocked, state: RunState.CEO_APPROVED, open: ["COMPENSATION_UNRESOLVED", "RECOVERY_NOT_HANDED_OVER"],
+    });
+    expect(waitingOn.find((entry) => entry["runId"] === plain)).toEqual({ runId: plain, state: RunState.CEO_APPROVED });
+    expect(h.cp.projects.get(projectId)?.retiredAt ?? null).toBeNull();
+    expect(h.cp.runs.require(blocked).state).toBe(RunState.CEO_APPROVED);
+    expect(h.cp.runs.require(plain).state).toBe(RunState.CEO_APPROVED);
+    expect(attemptOf(h, blocked)?.state).toBe("BLOCKED");
   });
 });

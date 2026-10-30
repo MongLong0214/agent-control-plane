@@ -185,7 +185,9 @@ export const assessFollowUpRetry = (
  * - RECOVERY_NOT_HANDED_OVER: the block itself. A recorded blocker and owner (a real FAIL, a spent budget,
  *   FINALIZATION_FOLLOW_UP_EXHAUSTED) is not settlement; settled would need a durable record that a party
  *   took over the recovery, with retirement leaving that path intact. No such handover record exists, so
- *   every BLOCKED_POST_MERGE run is open and holds retirement.
+ *   every BLOCKED_POST_MERGE run is open and holds retirement. The block is read from the lease as well as
+ *   the state: a run blocked for recovery while its state stays CEO_APPROVED (B15, an activation applied
+ *   with no merge; no edge leaves CEO_APPROVED for BLOCKED_POST_MERGE) holds a BLOCKED attempt.
  */
 export const openPostMergeResponsibility = (db: Pick<Db, "get" | "all">, runId: string): string[] => {
   const run = db.get<{ kind: RunKind; state: RunState; current_candidate_digest: string | null }>(
@@ -221,6 +223,6 @@ export const openPostMergeResponsibility = (db: Pick<Db, "get" | "all">, runId: 
                           AND d.event_id > e.event_id AND json_extract(d.evidence_json, '$.escalation') = 1)`, [runId, runId]) > 0) {
     open.push("ESCALATION_OPEN");
   }
-  if (run.state === RunState.BLOCKED_POST_MERGE) open.push("RECOVERY_NOT_HANDED_OVER");
+  if (run.state === RunState.BLOCKED_POST_MERGE || attempt?.state === "BLOCKED") open.push("RECOVERY_NOT_HANDED_OVER");
   return open;
 };
