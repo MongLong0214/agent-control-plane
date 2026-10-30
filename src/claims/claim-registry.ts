@@ -43,6 +43,19 @@ export interface ClaimRecord {
 
 const DEFAULT_TTL_MS = 2 * 60 * 60 * 1000;
 
+/**
+ * #1269 — whether the claim row aliased `c` keeps its target from every other run: while it is HELD, and also once
+ * its lease lapsed while its run holds a merge proven but for its CommitLore notes on that repository (MERGING,
+ * the merge receipt PENDING, MERGE_NOTES_PENDING recorded). That target stays closed until the run settles, ends,
+ * or is resolved. The lapsed claim is not revived: its own run still cannot write under it.
+ */
+export const standingClaimSql = (c: string): string => `(${c}.status = 'HELD' OR (${c}.status = 'EXPIRED'
+  AND EXISTS (SELECT 1 FROM runs sr WHERE sr.run_id = ${c}.run_id AND sr.state = 'MERGING')
+  AND EXISTS (SELECT 1 FROM github_receipts sg WHERE sg.run_id = ${c}.run_id AND sg.repository_identity = ${c}.repository_identity
+                AND sg.operation = 'merge_execute' AND sg.status = 'PENDING')
+  AND EXISTS (SELECT 1 FROM audit_events sa WHERE sa.run_id = ${c}.run_id AND sa.kind = 'MERGE_NOTES_PENDING'
+                AND json_extract(sa.evidence_json, '$.repositoryIdentity') = ${c}.repository_identity)))`;
+
 /** What may still write a registered checkout for a run, and why; see `CheckoutWriter`. */
 export interface CheckoutWriterFact {
   reason: string;
@@ -428,8 +441,8 @@ export class ClaimRegistry {
         : (["declared_path", target.declaredPath!, ReasonCode.CLAIM_PATH_CONFLICT, "path"] as const);
 
     const held = this.db.get<{ claim_id: string; run_id: string; owner_session_id: string }>(
-      `SELECT claim_id, run_id, owner_session_id FROM resource_claims
-        WHERE status = 'HELD' AND repository_identity = ? AND ${column} = ? AND run_id <> ?`,
+      `SELECT c.claim_id, c.run_id, c.owner_session_id FROM resource_claims c
+        WHERE ${standingClaimSql("c")} AND c.repository_identity = ? AND c.${column} = ? AND c.run_id <> ?`,
       [request.repositoryIdentity, value, request.runId],
     );
     if (!held) return null;
@@ -477,6 +490,20 @@ export class ClaimRegistry {
       this.audit.record({ kind: "CLAIM_RELEASED", runId: row.run_id, evidence: { claimId } });
       return allow(ReasonCode.OK, undefined);
     });
+  }
+
+  /**
+   * #1269 — a run held for a pending effect on a repository keeps the claims it already holds there until `until`.
+   * Only its own HELD, unexpired claims under its current owner generation are extended: none is shortened,
+   * revived, moved or created, so the target stays the run's alone while the effect is retried, and nothing more.
+   */
+  holdThrough(runId: string, repositoryIdentity: string, until: string): number {
+    return this.db.run(
+      `UPDATE resource_claims SET expires_at = ?
+        WHERE run_id = ? AND repository_identity = ? AND status = 'HELD' AND expires_at > ? AND expires_at < ?
+          AND owner_binding_generation = (SELECT owner_binding_generation FROM runs WHERE run_id = ?)`,
+      [until, runId, repositoryIdentity, this.clock.nowIso(), until, runId],
+    ).changes;
   }
 
   releaseRun(runId: string): number {

@@ -478,6 +478,8 @@ export const driveToReviewedCandidate = async (
     humanGate?: readonly string[];
     /** Extra candidate-relative paths the scripted blind reviewer must attest to. */
     reviewedPaths?: readonly string[];
+    /** Findings the scripted blind reviewer returns with its PASS. */
+    reviewerFindings?: ReadonlyArray<Record<string, unknown>>;
     /** Explicit GitHub identity for a disposable live repository. */
     repositoryIdentity?: string;
     /** A project whose repository was registered by the bootstrap activation path. */
@@ -568,9 +570,12 @@ export const driveToReviewedCandidate = async (
   });
   if (!verified.allowed) throw new Error(`${verified.reasonCode}: ${verified.message}`);
 
+  const reviewedFiles = (options.reviewedPaths ?? ["src/app.js"]).map((path) => `${identity}:${path}`);
   harness.scripted.script({
     match: /Candidate review/,
-    text: reviewerPass((options.reviewedPaths ?? ["src/app.js"]).map((path) => `${identity}:${path}`)),
+    text: options.reviewerFindings === undefined
+      ? reviewerPass(reviewedFiles)
+      : JSON.stringify({ verdict: "PASS", coveredFiles: reviewedFiles, omittedItems: [], findings: options.reviewerFindings }),
   });
   const reviewed = await harness.cp.review.controlPlaneInvoker()({
     runId,

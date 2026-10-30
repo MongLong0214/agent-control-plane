@@ -16,6 +16,7 @@ import {
   roleKeyFor,
 } from "../../src/domain/types.ts";
 import type { ReviewPacket } from "../../src/review/blind-review.ts";
+import { FRONTIER_SIMPLIFY_SOURCE } from "../../src/review/frontier-simplify-policy.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { VerificationReport } from "../../src/verify/verification-engine.ts";
 import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
@@ -148,6 +149,7 @@ const evidenceReadyRun = async (
       reviewPolicies: [],
       reviewerPromptDigests: [digestOf("review prompt")],
       reviewerInputRepresentations: ["stdin"],
+      methodology: { ...FRONTIER_SIMPLIFY_SOURCE },
       withheld: [],
     },
     coveredRepositories: [repository.identity],

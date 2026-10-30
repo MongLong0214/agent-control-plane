@@ -47,7 +47,8 @@ const FINALIZATION_RETRY_BASE_MS = 60_000;
 const FINALIZATION_RETRY_CEILING_MS = 60 * 60_000;
 export const FINALIZATION_RETRY_CAP = 5;
 
-type RetryClass = "TRANSIENT" | "UNCLASSIFIED" | "OWNER_ACTION" | "AUTHORITY_RECOVERY" | "MERGE_OUTCOME_UNKNOWN";
+type RetryClass =
+  | "TRANSIENT" | "UNCLASSIFIED" | "OWNER_ACTION" | "AUTHORITY_RECOVERY" | "MERGE_OUTCOME_UNKNOWN" | "MERGE_NOTES_PENDING";
 
 /** What a hand-off at a cap adds to its action: nothing retries the run automatically any more. */
 const RETRIES_STOPPED =
@@ -125,14 +126,15 @@ const OWNER_ACTIONS: ReadonlyMap<ReasonCode, Pick<RetryRoute, "failureClass" | "
  */
 const classifyPreMergeRefusal = (kind: RunKind, failure: Decision<unknown>): PreMergeRoute => {
   const evidence = failure.evidence as Record<string, unknown>;
-  // The pinned merge strategy is one GitHub's pull-request merge API cannot perform: no revision of this
+  // The pinned merge strategy is not a merge commit, the only one ACP sends (#1269): no revision of this
   // run's candidate changes its pinned contract. FAILED only on the kernel's read that the pull request is
   // not merged (CEO rulings 2 and 6); without it the refusal is retried like an unknown one.
-  if (failure.reasonCode === ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED && evidence["mergeStrategy"] === "fast_forward") {
+  const strategy = evidence["mergeStrategy"];
+  if (failure.reasonCode === ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED && typeof strategy === "string" && strategy !== "merge_commit") {
     if (evidence["pullMerged"] === false) return { disposition: "UNRECOVERABLE" };
     return {
       disposition: "RETRY", failureClass: "UNCLASSIFIED", failureCause: failure.reasonCode, retries: FINALIZATION_RETRY_CAP, owner: "CEO",
-      action: "the pinned fast_forward strategy cannot be merged through GitHub's API, and the pull request could not be confirmed unmerged; confirm it, then cancel the run",
+      action: `the pinned ${strategy} strategy is not a merge commit, and the pull request could not be confirmed unmerged; confirm it, then cancel the run and migrate the contract`,
     };
   }
   const cause = failure.reasonCode === ReasonCode.INTERNAL_ERROR && typeof evidence["errorReasonCode"] === "string"
@@ -186,6 +188,39 @@ const UNKNOWN_MERGE_ROUTE: RetryRoute = {
   owner: "CEO",
   action: "a merge request was sent and whether it merged is unknown: its PENDING merge receipt stays until a re-read of the pull " +
     "request settles it; read the pull request and reconcile that receipt",
+};
+
+/**
+ * #1269 — a merge that is proven, and whose candidate's CommitLore notes are not on the remote yet (the kernel's
+ * MERGE_NOTES_PENDING): its own failure, not an unknown merge outcome. The run stays MERGING with its receipt
+ * PENDING and keeps its claims; each retry only settles that receipt, carrying the notes for the merge commit
+ * already proven, and never merges again. Counted, backed off and handed to the CEO at the cap like any retry.
+ */
+const NOTES_PENDING_ROUTE: RetryRoute = {
+  disposition: "RETRY",
+  failureClass: "MERGE_NOTES_PENDING",
+  failureCause: "MERGE_NOTES_PENDING",
+  retries: FINALIZATION_RETRY_CAP,
+  owner: "CEO",
+  action: "the pull request is merged and proven, but its candidate's CommitLore notes did not reach the remote notes ref; " +
+    "its PENDING merge receipt stays until they do: restore the notes transport, or carry the notes and settle that receipt",
+};
+
+/**
+ * #1269 — a merge proven but for its notes whose run no longer holds the claim its notes are written under (the
+ * daemon was down past the claim's hold, or it was released): the lapsed claim is not revived and no transport is
+ * tried, so no automatic retry is left. The CEO is told the ownership needs recovery; the receipt stays PENDING,
+ * the run MERGING, and the target closed to other runs (`standingClaimSql`).
+ */
+const NOTES_OWNERSHIP_ROUTE: RetryRoute = {
+  disposition: "RETRY",
+  failureClass: "AUTHORITY_RECOVERY",
+  failureCause: "MERGE_NOTES_OWNERSHIP",
+  retries: 0,
+  owner: "CEO",
+  action: "ownership recovery needed: the pull request is merged and proven and its candidate's CommitLore notes are not on the remote, " +
+    "but the run no longer holds the claim its notes are written under; the lapsed claim is not revived and its target stays closed " +
+    "to other runs: recover the run's ownership of that target, or resolve the pending notes",
 };
 
 const retryDelayMs = (refusals: number): number =>
@@ -430,7 +465,19 @@ export class ApprovedRunFinalizer {
           const receipt = this.mergeReceiptPull(runId, plan.repositoryIdentity);
           if (receipt?.status !== "PENDING") continue;
           this.touchAttempt(runId, attemptId, `RECONCILE_MERGE:${plan.repositoryIdentity}`);
-          const settled = await this.cp.github.mergeSettle({ ...plan.merge, pullNumber: receipt.pullNumber });
+          // #1269 — a merge proven but for its notes is settled only as that merge: the pull must read back merged
+          // at the merge commit recorded for it, and then only its notes are carried.
+          const proven = this.notesPendingMerge(runId, plan.repositoryIdentity, receipt.pullNumber);
+          // The notes are written under the run's own claim on its branch. A claim found lapsed is not revived and
+          // no transport is tried: the ownership of the target needs recovery (NOTES_OWNERSHIP_ROUTE).
+          if (proven !== null && !this.holdsBranchClaim(runId, plan.repositoryIdentity, plan.prepare.head)) {
+            return this.handleFailure(runId, attemptId, deny(ReasonCode.MERGE_CLAIM_INVALID,
+              "ownership recovery needed: the run no longer holds the claim its pending notes are written under", {
+                runId, repositoryIdentity: plan.repositoryIdentity, pullNumber: receipt.pullNumber, branch: plan.prepare.head,
+                mergeCommitSha: proven, phase: "notes-ownership",
+              }));
+          }
+          const settled = await this.cp.github.mergeSettle({ ...plan.merge, pullNumber: receipt.pullNumber }, proven);
           if (!settled.allowed) return this.handleFailure(runId, attemptId, settled as Decision<unknown>);
         }
       }
@@ -1217,7 +1264,9 @@ export class ApprovedRunFinalizer {
     // BLOCKED_POST_MERGE, whose recovery reads only proven receipts. A recorded activation is an applied
     // effect whatever the merge outcome, so it still blocks the run for recovery.
     const unknown = merges.length > 0 && this.mergeOutcomeUnknown(runId);
-    if ((merges.length > 0 && !unknown) || activations > 0) {
+    // #1269 — a merge proven but for its notes is held the same way, as its own failure (NOTES_PENDING_ROUTE).
+    const notesPending = merges.length > 0 && !unknown && this.mergeNotesPending(runId);
+    if ((merges.length > 0 && !unknown && !notesPending) || activations > 0) {
       const compensation: Array<Record<string, unknown>> = merges.map((receipt) => {
         const sha = this.mergeSha(receipt);
         const prepared = sha
@@ -1275,22 +1324,22 @@ export class ApprovedRunFinalizer {
         { runId, attemptId, failureReasonCode: failure.reasonCode, compensation },
       );
     }
-    return this.refusedBeforeMerge(runId, attemptId, failure, unknown);
+    return this.refusedBeforeMerge(runId, attemptId, failure, unknown ? "MERGE_OUTCOME_UNKNOWN" : notesPending ? "MERGE_NOTES_PENDING" : null);
   }
 
   /**
    * #1189 B5 — a refusal with no merge receipt: nothing merged. An approved run (CEO_APPROVED or MERGING)
    * goes where `classifyPreMergeRefusal` sends it: back to its CTO with the approval invalidated, to FAILED
-   * when unrecoverable, or to a backoff whose cap hands it to the owner of its fix. With `unknownMerge` the
-   * run holds only receipts of merge requests whose outcome is unknown: it is retried as that one failure and
-   * never returned (`returnApprovedCandidate` would refuse it anyway). The returned decision is the refusal
-   * itself, as before.
+   * when unrecoverable, or to a backoff whose cap hands it to the owner of its fix. With `heldMerge` the run
+   * holds PENDING receipts of merge requests whose outcome is unknown, or (#1269) of merges proven but for their
+   * notes: it is retried as that one failure and never returned (`returnApprovedCandidate` would refuse it
+   * anyway). The returned decision is the refusal itself, as before.
    */
   private refusedBeforeMerge(
     runId: string,
     attemptId: string,
     failure: Decision<unknown>,
-    unknownMerge = false,
+    heldMerge: "MERGE_OUTCOME_UNKNOWN" | "MERGE_NOTES_PENDING" | null = null,
   ): Decision<FinalizationResult> {
     const run = this.cp.runs.get(runId);
     const attempt = this.attempt(runId);
@@ -1305,7 +1354,12 @@ export class ApprovedRunFinalizer {
       });
       return failure as Decision<FinalizationResult>;
     }
-    let route = unknownMerge ? UNKNOWN_MERGE_ROUTE : classifyPreMergeRefusal(run.kind, failure);
+    // A notes write the guard refused for want of the claim is the same ownership loss, never a counted retry.
+    const ownershipLost = failure.reasonCode === ReasonCode.MERGE_CLAIM_INVALID ||
+      (failure.evidence as Record<string, unknown>)["cause"] === ReasonCode.WRITE_PATH_NOT_CLAIMED;
+    let route = heldMerge === "MERGE_OUTCOME_UNKNOWN" ? UNKNOWN_MERGE_ROUTE
+      : heldMerge === "MERGE_NOTES_PENDING" ? (ownershipLost ? NOTES_OWNERSHIP_ROUTE : NOTES_PENDING_ROUTE)
+      : classifyPreMergeRefusal(run.kind, failure);
     this.cp.audit.record({
       kind: "FINALIZATION_ATTEMPT_FAILED",
       runId,
@@ -1384,12 +1438,19 @@ export class ApprovedRunFinalizer {
       retryCap: FINALIZATION_RETRY_CAP,
     };
     if (limit === null) {
+      const retryNotBefore = new Date(this.cp.clock.now().getTime() + retryDelayMs(retries + 1));
       this.cp.audit.record({
         kind: "FINALIZATION_RETRY_SCHEDULED",
         runId,
         reasonCode: failure.reasonCode,
-        evidence: { ...counted, retryNotBefore: new Date(this.cp.clock.now().getTime() + retryDelayMs(retries + 1)).toISOString() },
+        evidence: { ...counted, retryNotBefore: retryNotBefore.toISOString() },
       });
+      // #1269 — the merged repositories keep the claims the run already holds there through the retry and its
+      // lease, so no other run takes that target before the notes are carried.
+      if (heldMerge === "MERGE_NOTES_PENDING") {
+        const until = new Date(retryNotBefore.getTime() + FINALIZATION_LEASE_TTL_MS).toISOString();
+        for (const receipt of this.durableMergeReceipts(runId)) this.cp.claims.holdThrough(runId, receipt.repository_identity, until);
+      }
       return failure as Decision<FinalizationResult>;
     }
 
@@ -1510,6 +1571,58 @@ export class ApprovedRunFinalizer {
         !ofRepository.some((entry) => entry.kind === "MERGE_EXECUTED" ||
           (entry.kind === "MERGE_BASE_DRIFT" && typeof entry.evidence["mergeCommitSha"] === "string"));
     });
+  }
+
+  /**
+   * #1269 — whether the MERGING run's merges are all proven, every PENDING receipt being one whose merge was proven
+   * but whose notes are not on the remote yet (`notesPendingMerge`).
+   */
+  private mergeNotesPending(runId: string): boolean {
+    if (this.cp.runs.get(runId)?.state !== RunState.MERGING) return false;
+    const receipts = this.cp.db.all<{ repository_identity: string; idempotency_key: string; status: string; verified: number }>(
+      `SELECT repository_identity, idempotency_key, status, verified FROM github_receipts
+        WHERE run_id = ? AND operation = 'merge_execute' AND status IN ('PENDING','APPLIED')`,
+      [runId],
+    );
+    const prefix = (identity: string) => `merge_execute:${identity}:`;
+    return receipts.some((receipt) => receipt.status === "PENDING") && receipts.every((receipt) => {
+      if (receipt.status === "APPLIED") return receipt.verified === 1;
+      const pull = receipt.idempotency_key.startsWith(prefix(receipt.repository_identity))
+        ? Number(receipt.idempotency_key.slice(prefix(receipt.repository_identity).length))
+        : Number.NaN;
+      return receipt.verified === 0 && this.notesPendingMerge(runId, receipt.repository_identity, pull) !== null;
+    });
+  }
+
+  /**
+   * #1269 — the merge commit of this repository's pull that the kernel proved before only its notes failed: its
+   * newest merge-proof record is MERGE_NOTES_PENDING, naming this pull, made no earlier than the PENDING receipt.
+   * A later read GitHub did not answer (PROBE_FAILED) changes nothing; any other later record (an unknown outcome,
+   * or a read-back that answered another merge, head or state) means the merge is no longer known as proven: null.
+   */
+  private notesPendingMerge(runId: string, repositoryIdentity: string, pullNumber: number): string | null {
+    const receipt = this.cp.db.get<{ created_at: string }>(
+      `SELECT created_at FROM github_receipts
+        WHERE run_id = ? AND repository_identity = ? AND operation = 'merge_execute' AND idempotency_key = ? AND status = 'PENDING'`,
+      [runId, repositoryIdentity, `merge_execute:${repositoryIdentity}:${pullNumber}`],
+    );
+    if (!receipt) return null;
+    const latest = this.cp.audit.forRun(runId).filter((entry) =>
+      (entry.kind === "MERGE_NOTES_PENDING" || entry.kind === "MERGE_OUTCOME_UNKNOWN" ||
+        (entry.kind === "MERGE_BASE_DRIFT" && entry.reasonCode !== ReasonCode.PROBE_FAILED)) &&
+      entry.evidence["repositoryIdentity"] === repositoryIdentity).at(-1);
+    const sha = latest?.evidence["mergeCommitSha"];
+    return latest?.kind === "MERGE_NOTES_PENDING" && latest.at >= receipt.created_at &&
+      latest.evidence["pullNumber"] === pullNumber && typeof sha === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(sha)
+      ? sha
+      : null;
+  }
+
+  /** Whether the run still holds, under its current owner generation, the claim on `branch` its GitHub writes need. */
+  private holdsBranchClaim(runId: string, repositoryIdentity: string, branch: string): boolean {
+    const generation = this.cp.runs.get(runId)?.ownerBindingGeneration;
+    return this.cp.claims.heldByRun(runId).some((claim) =>
+      claim.repositoryIdentity === repositoryIdentity && claim.branch === branch && claim.ownerBindingGeneration === generation);
   }
 
   private touchAttempt(runId: string, attemptId: string, step: string): void {

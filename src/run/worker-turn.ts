@@ -2648,6 +2648,32 @@ export class WorkerTurnRunner {
   }
 
   /**
+   * CTO-opened receipts have no runner to confirm their worker process gone; the daemon's restart
+   * pass and its worker-retirement tick ask here (#1070). A recorded pid that now names no process and
+   * leads no group is gone, whatever start the receipt bound — the rule `outstandingProcess` already
+   * applies — and is recorded released under an authority minted here for that one execution and the
+   * pid and start its row records. A pid still held, by that process or by another since, is not
+   * confirmed gone and stays outstanding. Returns the executions released.
+   */
+  releaseGoneReceiptProcesses(): string[] {
+    const released: string[] = [];
+    for (const row of this.ports.db.all<{ execution_id: string; worker_process_id: number; worker_process_started_at: string | null }>(
+      `SELECT execution_id, worker_process_id, worker_process_started_at FROM task_executions
+        WHERE runtime_managed = 0 AND worker_process_id IS NOT NULL AND worker_process_released_at IS NULL
+        ORDER BY execution_id`,
+    )) {
+      const { execution_id: executionId, worker_process_id: pid, worker_process_started_at: startedAt } = row;
+      if (this.#processes.alive(pid) || this.#processes.groupAlive(pid)) continue;
+      const written = this.ports.tasks.releaseWorkerProcess(
+        executionId,
+        new WorkerProcessAuthorityToken(this.ports.db, "release", { executionId, pid, startedAt }),
+      );
+      if (written.allowed) released.push(executionId);
+    }
+    return released;
+  }
+
+  /**
    * Whether a live pid is, right now, the process this execution launched (#1070) — asked immediately
    * before any kill. The OS start time it reports must be the recorded one, and its command line must
    * carry this execution's worker session as the argv element after `--session-id` (Claude) or

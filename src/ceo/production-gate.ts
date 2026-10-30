@@ -44,6 +44,7 @@ import {
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { ReviewPacket } from "../review/blind-review.ts";
+import { METHOD_REVIEW_STALE, reviewedUnderCurrentMethod } from "../review/frontier-simplify-policy.ts";
 import type { RunEngine, CompletionAuthoritySet } from "../run/run-engine.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -459,6 +460,12 @@ export class ProductionGate {
         if (reviewArtifact.content.verdict !== "PASS") {
           return deny(ReasonCode.REVIEW_REQUIRED, "blind review has not passed", {
             verdict: reviewArtifact.content.verdict,
+          });
+        }
+        if (!reviewedUnderCurrentMethod(reviewArtifact.content)) {
+          return deny(ReasonCode.EVIDENCE_STALE, METHOD_REVIEW_STALE, {
+            runId: input.runId,
+            candidateSnapshotDigest: input.candidateSnapshotDigest,
           });
         }
         if (reviewArtifact.content.omittedItems.length > 0) {
@@ -957,6 +964,20 @@ export class ProductionGate {
       if (!continuity.allowed) return continuity as Decision<{ isBootstrap: boolean }>;
     }
 
+    // #1270 — a packet published before reviews recorded their method still names that review: CONFIRM
+    // reads the review the packet binds and refuses it as stale unless it records the current method.
+    // A no-repository packet's not-applicable placeholder binds no review and is left as it is.
+    if (input.decision === "CONFIRM" && packet && packet.content.blindReview.provider !== "not-applicable") {
+      const review = this.artifacts.byDigest<ReviewPacket>(packet.content.blindReview.digest);
+      if (!review || review.runId !== input.runId || review.kind !== ArtifactKind.BLIND_REVIEW || !reviewedUnderCurrentMethod(review.content)) {
+        return deny(ReasonCode.EVIDENCE_STALE, METHOD_REVIEW_STALE, {
+          runId: input.runId,
+          candidateSnapshotDigest: input.candidateSnapshotDigest,
+          reviewDigest: packet.content.blindReview.digest,
+        });
+      }
+    }
+
     // The decision is an exercise of the CEO role, so the session must currently hold it.
     // Independence alone would let any unknown id decide (CP-HI-07).
     const holds = this.assertCurrentCeo(input.ceoSessionId);
@@ -1425,7 +1446,8 @@ export class ProductionGate {
     const review = blindReview
       ? this.artifacts
           .list<{ verdict?: string }>(runId, ArtifactKind.BLIND_REVIEW)
-          .find((artifact) => artifact.digest === blindReview["digest"] && artifact.content.verdict === "PASS")
+          .find((artifact) => artifact.digest === blindReview["digest"] && artifact.content.verdict === "PASS"
+            && reviewedUnderCurrentMethod(artifact.content))
       : null;
     if (!review) incomplete.push("blindReviewBinding");
 
@@ -1528,6 +1550,9 @@ export class ProductionGate {
     if (!intent.allowed) return deny(intent.reasonCode, intent.message, { candidateSnapshotDigest, ...intent.evidence });
     if (review.verdict !== "PASS") {
       return deny(ReasonCode.REVIEW_REQUIRED, "blind review has not passed", { verdict: review.verdict });
+    }
+    if (!reviewedUnderCurrentMethod(review)) {
+      return deny(ReasonCode.EVIDENCE_STALE, METHOD_REVIEW_STALE, { runId, candidateSnapshotDigest });
     }
     if (review.omittedItems.length > 0) {
       return deny(ReasonCode.COVERAGE_INCOMPLETE, "blind review reports omitted items", {

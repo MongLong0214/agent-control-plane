@@ -45,7 +45,7 @@ const merge = (world: World): { status: number | null; stdout: string; merges: s
   mkdirSync(bin);
   writeFileSync(join(bin, "gh"), readFileSync(join(ROOT, "tests/helpers/merge-gh-fixture.mjs")));
   chmodSync(join(bin, "gh"), 0o755);
-  // A body with no records gives squash-preserve and validate nothing to say.
+  // A body with no records gives validate nothing to say.
   writeFileSync(join(bin, "commitlore"), "#!/bin/sh\nexit 0\n");
   chmodSync(join(bin, "commitlore"), 0o755);
   writeFileSync(join(directory, "body"), "body\n");
@@ -177,7 +177,8 @@ describe("a merge is judged by the newest project-ci run on the head", () => {
     });
 
     expect(result.merges, result.stdout).toHaveLength(1);
-    expect(result.merges[0]).toEqual(expect.arrayContaining(["--match-head-commit", HEAD]));
+    expect(result.merges[0]).toEqual(expect.arrayContaining(["--merge", "--match-head-commit", HEAD]));
+    expect(result.merges[0]).not.toEqual(expect.arrayContaining(["--squash"]));
     // This world has no merge commit for the read-back to find, so after merging the script fails
     // loudly rather than claim it; a-merge-names-the-head-it-checked.test.ts reads a real one back.
     expect(result.stdout).toContain("RESULT: FAIL — #1 is merged, and reading it back does not match what was checked");

@@ -6,6 +6,7 @@ import { ArtifactKind, RunState } from "../domain/types.ts";
 import type { DaemonFinalizerAuthority } from "../guard/managed-write-guard.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ReviewPacket } from "../review/blind-review.ts";
+import { METHOD_REVIEW_STALE, reviewedUnderCurrentMethod } from "../review/frontier-simplify-policy.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { CandidateSnapshot } from "../snapshot/candidate-snapshot.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
@@ -155,6 +156,9 @@ export const deriveConfirmedMergePlan = (
       review: Boolean(review),
     });
   }
+  if (!reviewedUnderCurrentMethod(review.content)) {
+    return deny(ReasonCode.EVIDENCE_STALE, METHOD_REVIEW_STALE, { runId: input.runId, candidateSnapshotDigest: candidateDigest });
+  }
   const manifest = ports.projects.manifest(run.pinnedManifestDigest);
   if (!manifest?.branchProfile) {
     // #448: the pinned digest exists, but the manifest it names cannot be produced to compare
@@ -231,7 +235,7 @@ export const deriveConfirmedMergePlan = (
       repositoryIdentity: input.repositoryIdentity,
       exactHeadSha: repository.candidateHead,
       expectedBaseSha: repository.baseHead,
-      mergeStrategy: manifest.branchProfile.mergeStrategy,
+      mergeStrategy: manifest.branchProfile.mergeStrategy ?? "merge_commit",
       ...owner,
     },
   });
