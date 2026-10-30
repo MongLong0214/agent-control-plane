@@ -1,0 +1,5 @@
+Limit: PR history is preserved by a normal merge; force/rebase and restoration of the nine reverted features are prohibited
+Warn: keep main's deletion of the CEO continuity test block so reverted functionality is not reintroduced
+Record-Id: r-pr1256mainmerge
+Provenance: inherited a38a8c74739adb4302a12542007e43b4c9c9e09c
+CommitLore-Version: 1.7.5
