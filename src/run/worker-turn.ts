@@ -2213,6 +2213,8 @@ export class WorkerTurnRunner {
       // S2 — kept on every outcome, a late one included: a group its cleanup did not confirm ended keeps
       // the checkout from the run's next task (`settledWriter`) until it is seen gone.
       ...(result?.processGroup ? { processGroup: result.processGroup } : {}),
+      // What a GPT worker turn wrote to its private temporary directory, which is already removed.
+      ...(result?.turnScratch ? { turnScratch: result.turnScratch } : {}),
     };
     // Observed for every outcome whose writer is gone, so a failure keeps the digest of whatever the
     // turn left behind. A writer that may still be running is not read at all.
@@ -2389,6 +2391,8 @@ export class WorkerTurnRunner {
             paths: observed.entries.map((entry) => entry.path),
             // #1097 — a finding, not an input of the digest: what the turn changed that was not committed.
             ...(ignoredChanges ? { ignoredChanges } : {}),
+            // Also not an input of the digest.
+            ...(result.turnScratch ? { turnScratch: result.turnScratch } : {}),
           },
         });
         if (!recorded.allowed) {

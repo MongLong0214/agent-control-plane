@@ -314,6 +314,20 @@ export interface InvocationResult {
   effortAttested?: boolean;
   /** #1104 — present when the invocation's own process group was not confirmed ended; `ok` is then false. */
   processGroup?: UnendedProcessGroup;
+  /**
+   * A GPT worker turn only: what the turn left in its private temporary directory, read after its
+   * process ended and before the directory was removed. Diagnostic; never part of the change scan.
+   */
+  turnScratch?: TurnScratchListing;
+}
+
+/** Files under a turn's temporary directory: counts, and the first sorted relative paths. */
+export interface TurnScratchListing {
+  files: number;
+  bytes: number;
+  paths: string[];
+  /** False when the walk stopped at its entry limit, so the counts are a lower bound. */
+  complete: boolean;
 }
 
 /**
