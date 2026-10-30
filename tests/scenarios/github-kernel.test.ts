@@ -2336,28 +2336,126 @@ describe("merge target proof (#350)", () => {
     expectPendingMergeProof(fixture);
   });
 
-  it("sends a pinned rebase strategy to GitHub as rebase", async () => {
+  it.each(["squash", "rebase", "fast_forward"] as const)(
+    "#1269: a pinned %s contract is refused before anything is sent, never mapped onto a merge",
+    async (strategy) => {
+      const fixture = await setup();
+      const originalManifest = fixture.harness.cp.projects.manifest.bind(fixture.harness.cp.projects);
+      const manifest = vi.spyOn(fixture.harness.cp.projects, "manifest").mockImplementation((digest) => {
+        const pinned = originalManifest(digest);
+        return pinned ? { ...pinned, branchProfile: { ...pinned.branchProfile, mergeStrategy: strategy } } : null;
+      });
+      try {
+        const pullNumber = await openPreparedPull(fixture);
+        const refused = await fixture.harness.cp.github.mergeExecute({ ...mergeInput(fixture, pullNumber), mergeStrategy: strategy });
+        expect(refused.reasonCode).toBe(ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED);
+        if (refused.allowed) throw new Error("expected a non-merge-commit strategy to be refused");
+        expect(refused.evidence).toMatchObject({ mergeStrategy: strategy, pullNumber, pullMerged: false });
+        expect(fixture.github.calls.filter((call) => call.method === "PUT")).toEqual([]);
+        expect(fixture.github.mergeCount).toBe(0);
+      } finally {
+        manifest.mockRestore();
+      }
+    },
+  );
+
+  it("#1269: a stored contract with no merge strategy reads as a merge commit and merges as one", async () => {
     const fixture = await setup();
     const originalManifest = fixture.harness.cp.projects.manifest.bind(fixture.harness.cp.projects);
     const manifest = vi.spyOn(fixture.harness.cp.projects, "manifest").mockImplementation((digest) => {
       const pinned = originalManifest(digest);
-      return pinned
-        ? { ...pinned, branchProfile: { ...pinned.branchProfile, mergeStrategy: "rebase" as never } }
-        : null;
+      if (!pinned) return null;
+      const { mergeStrategy: _omitted, ...profile } = pinned.branchProfile;
+      return { ...pinned, branchProfile: profile as typeof pinned.branchProfile };
     });
     try {
       const pullNumber = await openPreparedPull(fixture);
-      const merged = await fixture.harness.cp.github.mergeExecute({
-        ...mergeInput(fixture, pullNumber),
-        mergeStrategy: "rebase" as never,
-      });
+      const merged = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
       expect(merged.reasonCode).toBe(ReasonCode.OK);
-      expect(
-        fixture.github.calls.find((call) => call.method === "PUT" && call.path.endsWith("/merge"))?.body,
-      ).toEqual({ sha: fixture.head, merge_method: "rebase" });
+      expect(fixture.github.calls.filter((call) => call.method === "PUT" && call.path.endsWith("/merge")).map((call) => call.body))
+        .toEqual([{ sha: fixture.head, merge_method: "merge" }]);
     } finally {
       manifest.mockRestore();
     }
+  });
+
+  it("#1269: a head that does not contain the base goes back for a new candidate before anything is sent", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    fixture.github.headsMissingBase.add(fixture.head);
+    const refused = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(refused.reasonCode).toBe(ReasonCode.MERGE_BASE_STALE);
+    if (refused.allowed) throw new Error("expected a head without its base to be refused");
+    expect(refused.evidence).toMatchObject({ expectedBase: fixture.base, exactHead: fixture.head, observed: "diverged", phase: "preflight-compare" });
+    expect(fixture.github.calls.filter((call) => call.method === "PUT")).toEqual([]);
+  });
+
+  it.each([
+    ["a single parent, as a squash has", (base: string) => [base]],
+    ["a second parent that is not the exact head", (base: string) => [base, "9".repeat(40)]],
+    ["a third parent", (base: string, head: string) => [base, head, "9".repeat(40)]],
+  ] as const)("#1269: a merge read back with %s is not proven", async (_label, parentsOf) => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    fixture.github.onMerge = ({ mergeSha }) => fixture.github.commitParents.set(mergeSha, parentsOf(fixture.base, fixture.head));
+    const unproven = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(unproven.reasonCode).toBe(ReasonCode.MERGE_BASE_STALE);
+    if (unproven.allowed) throw new Error("expected a merge with the wrong parents to be unproven");
+    expect(unproven.evidence).toMatchObject({ phase: "postflight-merge-parents", expected: fixture.head });
+    expect(fixture.github.mergeCount).toBe(1);
+    expectPendingMergeProof(fixture);
+  });
+
+  it("#1269: a merge read back with a tree other than the exact head's is not proven", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    fixture.github.nextMergeTree = "8".repeat(40);
+    const unproven = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(unproven.reasonCode).toBe(ReasonCode.MERGE_BASE_STALE);
+    if (unproven.allowed) throw new Error("expected a merge with another tree to be unproven");
+    expect(unproven.evidence).toMatchObject({
+      phase: "postflight-merge-tree", expected: fixture.github.treeOf(fixture.head), observed: "8".repeat(40),
+    });
+    expect(fixture.github.mergeCount).toBe(1);
+    expectPendingMergeProof(fixture);
+  });
+
+  /** A record kept only as a CommitLore note on the candidate head, the way a capture stores one. */
+  const noteOnCandidate = (fixture: Fixture): string => {
+    gitSync(fixture.harness.repoPath, ["notes", "--ref=commitlore", "add", "-m", "Limit: a record kept only in a note", fixture.head]);
+    return gitSync(fixture.harness.repoPath, ["notes", "--ref=commitlore", "list", fixture.head]);
+  };
+
+  it("#1269: a merge is proven only once the candidate's CommitLore notes are on the remote notes ref", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const blob = noteOnCandidate(fixture);
+    const merged = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(merged.reasonCode, merged.allowed ? "" : merged.message).toBe(ReasonCode.OK);
+    expect(fixture.github.remoteNoteFor(fixture.head)).toBe(blob);
+  });
+
+  it("#1269: a merge whose notes cannot reach the remote is MERGE_NOTES_PENDING, naming the proven merge, and is settled later without a second merge", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const blob = noteOnCandidate(fixture);
+    fixture.github.refuseNotesWrite = true;
+    const unproven = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(unproven.reasonCode).toBe(ReasonCode.MERGE_NOTES_PENDING);
+    if (unproven.allowed) throw new Error("expected a merge without its notes on the remote to be unproven");
+    const named = { repositoryIdentity: fixture.identity, pullNumber, exactHead: fixture.head, mergeCommitSha: fixture.github.pulls[0]!.merge_commit_sha };
+    expect(unproven.evidence).toMatchObject({ phase: "postflight-notes", ref: "refs/notes/commitlore", ...named });
+    expect(fixture.harness.cp.audit.byKind("MERGE_NOTES_PENDING").map((entry) => entry.evidence)).toEqual([expect.objectContaining(named)]);
+    expect(fixture.github.remoteNoteFor(fixture.head)).toBeUndefined();
+    expect(fixture.github.mergeCount).toBe(1);
+    expectPendingMergeProof(fixture);
+
+    // The next attempt settles the PENDING receipt by reading the merged pull: the notes are carried, no PUT is sent.
+    const settled = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(settled.reasonCode, settled.allowed ? "" : settled.message).toBe(ReasonCode.MERGE_IDEMPOTENT_REPLAY);
+    expect(settled.allowed).toBe(true);
+    expect(fixture.github.remoteNoteFor(fixture.head)).toBe(blob);
+    expect(fixture.github.mergeCount).toBe(1);
   });
 });
 
