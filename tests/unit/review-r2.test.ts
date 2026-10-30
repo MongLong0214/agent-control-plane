@@ -992,12 +992,12 @@ describe("round-2 blind-review regressions", () => {
     const renamed = section("rename", "src/old.js", "src/new.js", `-${"o".repeat(60)}\n+${"n".repeat(60)}\n`);
     const copied = section("copy", "src/base.js", "src/copy.js", `-${"b".repeat(60)}\n+${"c".repeat(60)}\n`);
     const budget = Math.max(renamed.length, copied.length);
-    const parts = __testing.splitDiffs([{ identity, diff: renamed + copied, files: ["src/copy.js", "src/new.js"] }], budget).flat();
+    const parts = __testing.splitDiffs([{ identity, diff: renamed + copied, files: ["src/copy.js", "src/new.js"] }], budget).chunks.flat();
     expect(parts.map((part) => part.files)).toEqual([["src/new.js"], ["src/copy.js"]]);
 
     // A section larger than the budget is range-split under its destination too.
     const large = section("rename", "src/old.js", "src/new.js", Array.from({ length: 40 }, (_, index) => `+line ${index}\n`).join(""));
-    const ranges = __testing.splitDiffs([{ identity, diff: large, files: ["src/new.js"] }], 150).flat();
+    const ranges = __testing.splitDiffs([{ identity, diff: large, files: ["src/new.js"] }], 150).chunks.flat();
     expect(ranges.length).toBeGreaterThan(1);
     expect(ranges.every((part) => part.files.length === 1 && part.files[0] === "src/new.js")).toBe(true);
   });
@@ -1765,7 +1765,7 @@ describe("round-2 blind-review regressions", () => {
       identity: "github:acme/fixture",
       diff: `${header}${payload}`,
       files: ["large.ts"],
-    }], 100);
+    }], 100).chunks;
     const parts = chunks.flat();
     expect(parts.length).toBeGreaterThan(1);
     expect(parts.every((part) => part.diff.length <= 100)).toBe(true);
