@@ -711,9 +711,9 @@ const probeTick = async (f: Awaited<ReturnType<typeof start>>, label: string): P
   await f.waitFor(label, () => quiet() || stallCount(f) > stalls, 10_000);
 };
 
-/** The probe pages of one connection's historical sweeps, oldest first: not its head checks. */
-const sweepPages = (connection: { readonly requests: readonly { readonly id: string; readonly filters: readonly Record<string, unknown>[] }[] }) =>
-  connection.requests.filter((one) => /^live-[0-9a-f]+-s\d+$/u.test(one.id));
+/** The probe pages of one connection's head checks, oldest first: not its sweep pages. */
+const headPages = (connection: { readonly requests: readonly { readonly id: string; readonly filters: readonly Record<string, unknown>[] }[] }) =>
+  connection.requests.filter((one) => /^live-[0-9a-f]+-h\d+$/u.test(one.id));
 
 /** Moves the control plane's clock to `second`. */
 const jumpTo = (f: Awaited<ReturnType<typeof start>>, second: number): void => {
@@ -735,10 +735,10 @@ describe("a stalled Buzz subscription's evidence, under the probe's second revie
       expect(f.inboundFor(skipped.id)).toHaveLength(0);
 
       // Delivered is what the seam's durable record or this subscription shows, never the absence of
-      // an evicted id. The probe pages back past the 257 and finds A undelivered.
+      // an evicted id. The head check pages back past the 257 and finds A undelivered.
       for (let tick = 0; tick < 4 && f.stalls.length === 0; tick += 1) await probeTick(f, `probe ${tick + 1} answered`);
       expect(f.stalls).toEqual([expect.objectContaining({ cause: "MISSED_EVENTS" })]);
-      expect(sweepPages(f.relay.connections[0]!).map((one) => one.filters[0]!["until"])).toEqual([undefined, skipped.created_at + 58]);
+      expect(headPages(f.relay.connections[0]!).map((one) => one.filters[0]!["until"])).toEqual([undefined, skipped.created_at + 58]);
 
       f.fireTimers();
       await f.waitFor("the skipped mention admitted", () => f.inboundFor(skipped.id).length === 1, 30_000);
@@ -875,11 +875,11 @@ describe("a stalled Buzz subscription's evidence, under the probe's third review
       expect(f.inboundFor(hidden.id)).toHaveLength(0);
 
       for (let tick = 0; tick < 6 && f.stalls.length === 0; tick += 1) await probeTick(f, `probe ${tick + 1} answered`);
-      // The sweep could not get past that second, so it is not clean: it went on below it, and at its
-      // floor the identity is STALE and replaced, asking from that floor.
+      // The head check could not get past that second, so it is not clean: it went on below it, and at
+      // its floor the identity is STALE and replaced, asking from that floor.
       expect(f.stalls).toEqual([expect.objectContaining({ cause: "UNCERTIFIED" })]);
       expect(f.liveness()?.identities[0]).toMatchObject({ state: "STALE", outageSinceSeconds: f.stalls[0]!.outageSinceSeconds });
-      const pages = sweepPages(f.relay.connections[0]!);
+      const pages = headPages(f.relay.connections[0]!);
       expect(pages.map((one) => one.filters[0]!["until"])).toEqual([undefined, hidden.created_at, hidden.created_at - 1]);
       f.fireTimers();
       await f.waitFor("the hidden mention admitted", () => f.inboundFor(hidden.id).length === 1, 30_000);
@@ -983,24 +983,24 @@ describe("a stalled Buzz subscription's evidence, under the probe's fourth revie
       await f.settle();
       expect(f.inboundFor(older.id)).toHaveLength(0);
 
-      // The sweep pages from the newest, asks the saturated second again, and goes on below it to A.
+      // The head check pages from the newest, asks the saturated second again, and goes on below it to A.
       for (let tick = 0; tick < 4 && f.stalls.length === 0; tick += 1) await probeTick(f, `probe ${tick + 1} answered`);
       expect(f.stalls).toEqual([expect.objectContaining({ cause: "MISSED_EVENTS" })]);
       const first = f.relay.connections[0]!;
-      expect(sweepPages(first).map((one) => one.filters[0]!["until"])).toEqual([undefined, second, second - 1]);
+      expect(headPages(first).map((one) => one.filters[0]!["until"])).toEqual([undefined, second, second - 1]);
       f.fireTimers();
       await f.waitFor("the older mention admitted", () => f.inboundFor(older.id).length === 1, 30_000);
       expect(f.relay.connections[1]!.requests[0]!.filters[0]).toMatchObject({ since: older.created_at });
       expect(f.wakes.filter((id) => id === older.id)).toHaveLength(1);
       expect(f.ownerMessages()).toBe(LIVENESS_PROBE_PAGE_LIMIT + 1);
 
-      // The saturated second still cannot be shown delivered: the next sweep pages past it again,
-      // finds nothing missed, and ends UNCERTIFIED. The identity stays STALE, and its replacement
-      // asks from that sweep's floor, not from the saturated second.
+      // The saturated second still cannot be shown delivered: the replacement's head check pages past
+      // it again, finds nothing missed, and ends UNCERTIFIED. The identity stays STALE, and its
+      // replacement asks from that head check's floor, not from the saturated second.
       const stalls = stallCount(f);
       for (let tick = 0; tick < 6 && stallCount(f) === stalls; tick += 1) await probeTick(f, `replacement probe ${tick + 1} answered`);
       expect(f.liveness()?.identities[0]).toMatchObject({ state: "STALE", lastStall: { cause: "UNCERTIFIED" } });
-      const floor = sweepPages(f.relay.connections[1]!).at(-1)!.filters[0]!["since"] as number;
+      const floor = headPages(f.relay.connections[1]!).at(-1)!.filters[0]!["since"] as number;
       expect(floor).toBeLessThan(second);
       f.fireTimers();
       await f.waitFor("a third connection", () => f.relay.connections[2]?.requests.length === 1, 30_000);
@@ -1145,4 +1145,88 @@ describe("a stalled Buzz subscription's evidence, under the probe's fourth revie
       await f.close();
     }
   });
+});
+
+/**
+ * The fifth review of the probe (#1283, lane-n-fs-r5): a head check whose page came back full was
+ * taken as its whole interval checked.
+ */
+describe("a stalled Buzz subscription's evidence, under the probe's fifth review (#1283)", () => {
+  it("does not take a full head page as its interval checked: a mention stored behind a page of newer ones is found within the bound", async () => {
+    const f = await start();
+    try {
+      // 800 mentions, all pushed and admitted, one clean sweep, and the first page of the next one.
+      for (let n = 0; n < 4 * LIVENESS_PROBE_PAGE_LIMIT; n += 1) {
+        f.h.clock.advance(1_000);
+        f.relay.publish(f.mention(`지난 답장 ${n}`));
+      }
+      await f.waitFor("the mentions admitted", () => f.ownerMessages() === 4 * LIVENESS_PROBE_PAGE_LIMIT, 90_000);
+      for (let tick = 0; tick < 6; tick += 1) await probeTick(f, `probe ${tick + 1} answered`);
+      expect(f.stalls).toEqual([]);
+
+      // A is stored and never pushed; then a page of newer mentions is pushed and admitted, all before
+      // the next tick. Then the live push stops.
+      const connection = f.relay.connections[0]!;
+      const missed = f.mention("새 답장 한 페이지 아래에 묻힌 답장");
+      f.relay.publish(missed, { push: false });
+      for (let n = 0; n < LIVENESS_PROBE_PAGE_LIMIT; n += 1) {
+        if (n % (LIVENESS_PROBE_PAGE_LIMIT / 2) === 0) f.h.clock.advance(1_000);
+        f.relay.publish(f.mention(`새 답장 ${n}`));
+      }
+      await f.waitFor("the newer mentions admitted", () => f.ownerMessages() === 5 * LIVENESS_PROBE_PAGE_LIMIT, 30_000);
+      expect(f.inboundFor(missed.id)).toHaveLength(0);
+      connection.noLivePush = true;
+      const heads = headPages(connection).length;
+
+      // The head check's first page holds only the newer page; it pages on from that page's oldest
+      // second before its interval counts as checked, and finds A within the 90-second bound.
+      for (let tick = 0; tick < 3 && f.stalls.length === 0; tick += 1) await probeTick(f, `late probe ${tick + 1} answered`);
+      expect(f.stalls).toEqual([expect.objectContaining({ cause: "MISSED_EVENTS" })]);
+      expect(headPages(connection).slice(heads).map((one) => one.filters[0]!["until"])).toEqual([undefined, missed.created_at + 1]);
+      expect(f.liveness()?.identities[0]).toMatchObject({ state: "STALE" });
+      f.fireTimers();
+      await f.waitFor("the missed mention admitted", () => f.inboundFor(missed.id).length === 1, 60_000);
+      expect(f.relay.connections[1]!.requests[0]!.filters[0]).toMatchObject({ since: missed.created_at });
+      expect(f.wakes.filter((id) => id === missed.id)).toHaveLength(1);
+    } finally {
+      await f.close();
+    }
+  }, 240_000);
+
+  it("does not take a head interval holding a second of more than a page as checked: it pages below that second and is a stall", async () => {
+    const f = await start();
+    try {
+      // A clean tick, so the next head check asks from a grace before it.
+      await f.waitFor("the subscription answered", () => f.liveness()?.identities[0]?.answeredAtSeconds !== null);
+      await probeTick(f, "the first probe answered");
+      expect(f.stalls).toEqual([]);
+      const connection = f.relay.connections[0]!;
+      const heads = headPages(connection).length;
+
+      // A page and one more mentions in one second, all pushed and admitted.
+      f.h.clock.advance(1_000);
+      const second = nowSeconds(f);
+      for (let n = 0; n <= LIVENESS_PROBE_PAGE_LIMIT; n += 1) f.relay.publish(f.mention(`한 초에 몰린 답장 ${n}`));
+      await f.waitFor("the mentions admitted", () => f.ownerMessages() === LIVENESS_PROBE_PAGE_LIMIT + 1, 30_000);
+
+      // The head check asks that second again, cannot move past it, goes on below it, and is not
+      // liveness: it is a stall whose replacement asks from where the head check asked.
+      await probeTick(f, "the head check answered");
+      const pages = headPages(connection).slice(heads);
+      expect(pages.map((one) => one.filters[0]!["until"])).toEqual([undefined, second, second - 1]);
+      expect(f.stalls).toEqual([expect.objectContaining({ cause: "UNCERTIFIED" })]);
+      expect(f.liveness()?.identities[0]).toMatchObject({ state: "STALE" });
+      f.fireTimers();
+      await f.waitFor("the replacement's subscription", () => f.relay.connections[1]?.requests.length === 1, 30_000);
+      expect(f.relay.connections[1]!.requests[0]!.filters[0]).toMatchObject({ since: pages[0]!.filters[0]!["since"] });
+      await f.waitFor("the replacement answered", () => f.liveness()?.identities[0]?.answeredAtSeconds === nowSeconds(f), 30_000);
+
+      // The replacement's head check asks from after that second, so it does not meet it again.
+      await probeTick(f, "the replacement's head check answered");
+      expect(headPages(f.relay.connections[1]!)[0]!.filters[0]!["since"]).toBeGreaterThan(second);
+      expect(f.ownerMessages()).toBe(LIVENESS_PROBE_PAGE_LIMIT + 1);
+    } finally {
+      await f.close();
+    }
+  }, 120_000);
 });

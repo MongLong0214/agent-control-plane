@@ -128,11 +128,11 @@ export const LIVENESS_PROBE_GRACE_SECONDS = 10;
 
 /**
  * The most stored events one probe page asks the relay for, per filter: the bound on what one probe
- * costs the relay. Each health tick asks two pages at most, one after the other: the head, the newest
- * events since the last head check, and then one page of the historical sweep, which pages back with
- * `until` from the newest to its floor, at least a day back, and is complete at the first page that
- * comes back short. A relay whose own cap is lower than this would make a capped page look short, so
- * this stays below the common caps.
+ * page costs the relay. Each health tick asks, one page after the other, the head, the events since
+ * the last head check, paged back with `until` until a page comes back short (one page, unless more
+ * than this many arrived since), and then one page of the historical sweep, which pages back the same
+ * way from the newest to its floor, at least a day back, one page per tick. A relay whose own cap is
+ * lower than this would make a capped page look short, so this stays below the common caps.
  */
 export const LIVENESS_PROBE_PAGE_LIMIT = 200;
 
@@ -1515,6 +1515,19 @@ class BuzzMentionSubscription {
    */
   #headSince: number | null = null;
   /**
+   * The head check in progress, paged like a sweep when its interval holds more than a page: the
+   * `since` every page asks from, the `until` of its next page (`null`: the newest), when its first
+   * page was sent, the events already judged, and the first second it met holding more than a page.
+   * Its interval is checked, for liveness and for `#headSince`, only once a page comes back short.
+   */
+  #head: {
+    readonly since: number;
+    until: number | null;
+    readonly sentAt: number;
+    readonly judged: Set<string>;
+    uncertified: number | null;
+  } | null = null;
+  /**
    * The sweep in progress: the `since` every page of it asks from, the `until` of its next page
    * (`null`: the newest stored events), the point a clean finish moves the floor to, when it began, the
    * events it has already judged, so the inclusive `until` second asked again is not judged twice, and
@@ -1840,9 +1853,11 @@ class BuzzMentionSubscription {
     // looks back from here.
     this.#lookbackFrom ??= this.#heardAt;
     this.#caughtUp = false;
-    // A sweep runs on one connection: the replacement's starts again from the newest page.
+    // A sweep or a head check runs on one connection: the replacement's starts again from the newest
+    // page.
     this.#probe = null;
     this.#sweep = null;
+    this.#head = null;
     // Claimed before the socket exists, so every callback the factory registers is already fenced
     // by the time it can fire.
     const generation = ++this.#connections;
@@ -2046,13 +2061,15 @@ class BuzzMentionSubscription {
    * stall: the relay answers requests while this subscription's live push has stopped.
    *
    * Each step asks two things, one after the other, at most `LIVENESS_PROBE_PAGE_LIMIT` events per
-   * filter each. First the head: the newest events since the last head check. Its answer is the one a
+   * filter a page. First the head: the events since the last head check, paged back on this step until
+   * a page comes back short, so a full page never stands for the whole interval. Its answer is the one a
    * probe gives liveness, and what it finds missed is a stall within a tick or two of the mention, so
-   * the bound holds however much history there is. Then, once the head is answered, one page of the
+   * the bound holds however much history there is. Then, once the head is checked, one page of the
    * historical sweep, which pages back with `until` from the newest to the sweep's floor, a day or more
    * back, on its own cursor, one page per step. Its answers are not liveness: a connection answering
    * pages of old history is not thereby delivering what is new. A second holding more than a page
-   * cannot be shown delivered; the sweep goes on below it and ends uncertified, the third stall.
+   * cannot be shown delivered; the head check or the sweep goes on below it and ends uncertified, the
+   * third stall.
    */
   checkLiveness(): void {
     const generation = this.#generation;
@@ -2072,7 +2089,7 @@ class BuzzMentionSubscription {
   }
 
   /**
-   * Sends the head check, or the sweep's next page, starting a sweep if none is in progress.
+   * Sends the head check's next page, or the sweep's, starting either if none is in progress.
    *
    * A sweep asks from the durable floor or a day before the last clean sweep began, whichever is
    * older (`LIVENESS_PROBE_LOOKBACK_GUARANTEE_SECONDS`), so a mention signed before a newer admission
@@ -2086,7 +2103,9 @@ class BuzzMentionSubscription {
     let since: number;
     let until: number | null = null;
     if (kind === "HEAD") {
-      since = this.#headSince ?? floor;
+      this.#head ??= { since: this.#headSince ?? floor, until: null, sentAt: now, judged: new Set(), uncertified: null };
+      since = this.#head.since;
+      until = this.#head.until;
     } else {
       if (this.#sweep === null) {
         const from = this.#lookbackFrom ?? now;
@@ -2225,9 +2244,9 @@ class BuzzMentionSubscription {
     // hearing it (not signed by its author) is not counted against it either.
     if (!verifyEvent(event)) return ACCEPTED;
     if (event.created_at > probe.sentAt - LIVENESS_PROBE_GRACE_SECONDS) return ACCEPTED;
-    // The inclusive `until` hands a sweep's last page's oldest second back; what the sweep judged
-    // there is not judged again. A head check judges what it returns.
-    const judged = probe.kind === "SWEEP" ? this.#sweep?.judged : undefined;
+    // The inclusive `until` hands a sweep's or a head check's last page's oldest second back; what it
+    // judged there is not judged again.
+    const judged = probe.kind === "SWEEP" ? this.#sweep?.judged : this.#head?.judged;
     if (judged?.has(event.id) === true) return ACCEPTED;
     judged?.add(event.id);
     if (!this.#delivered(event)) probe.missedFrom = Math.min(probe.missedFrom ?? event.created_at, event.created_at);
@@ -2239,8 +2258,14 @@ class BuzzMentionSubscription {
    * delivered. With a missed event, head or sweep page, it is a stall whose replacement asks from that
    * event.
    *
-   * A head check answered clean is the liveness a probe gives: the stall anchor moves, the next head
-   * check asks from a grace before this one, and the sweep's next page follows on this step.
+   * A head check is paged like a sweep, and on this step: a full page leaves part of its interval
+   * unchecked, so the next page asks from that page's oldest second down, and the interval counts as
+   * checked only once a page comes back short. Until then nothing moves, so a head check that never
+   * finishes still ages into a stall. A head check checked clean is the liveness a probe gives: the
+   * stall anchor moves, the next head check asks from a grace before this one's first page, and the
+   * sweep's next page follows on this step. One that met a second holding more than a page went on
+   * below it and is uncertified: a stall whose replacement asks from where it asked, so that second is
+   * delivered whole, and the next head check still asks from after it, so it does not meet it again.
    *
    * A sweep page is never liveness. Full, the sweep goes on to the next page at the next step; full and
    * unable to move past its `until` second, it goes on below that second, uncertified, because that
@@ -2258,12 +2283,37 @@ class BuzzMentionSubscription {
     const now = this.#deps.scheduler.nowSeconds();
     if (probe.missedFrom !== null) {
       this.#sweep = null;
+      this.#head = null;
       this.#stalled(generation, "MISSED_EVENTS", now - this.#heardAt, probe.missedFrom);
       return ACCEPTED;
     }
     if (probe.kind === "HEAD") {
+      const head = this.#head;
+      if (head === null) return ACCEPTED;
+      const next = nextProbePage([...probe.returned.values()], head.until);
+      if (next !== "DONE") {
+        let until: number;
+        if (next === "SATURATED") {
+          // `nextProbePage` says SATURATED only for a page with an `until`.
+          head.uncertified ??= head.until!;
+          until = head.until! - 1;
+        } else {
+          until = next.until;
+        }
+        head.until = until;
+        // Below its own `since` the interval is exhausted: nothing is left to ask for.
+        if (until >= head.since) {
+          this.#sendProbe(generation, "HEAD", now);
+          return ACCEPTED;
+        }
+      }
+      this.#head = null;
+      this.#headSince = Math.max(this.#headSince ?? Number.NEGATIVE_INFINITY, head.sentAt - LIVENESS_PROBE_GRACE_SECONDS);
+      if (head.uncertified !== null) {
+        this.#stalled(generation, "UNCERTIFIED", now - this.#heardAt, head.since);
+        return ACCEPTED;
+      }
       this.#answered();
-      this.#headSince = Math.max(this.#headSince ?? Number.NEGATIVE_INFINITY, probe.sentAt - LIVENESS_PROBE_GRACE_SECONDS);
       this.#sendProbe(generation, "SWEEP", now);
       return ACCEPTED;
     }
