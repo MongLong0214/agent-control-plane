@@ -703,7 +703,9 @@ export class BlindReviewGate {
       // a verdict on a PLAN the run no longer has is stale and is not stored. `settle` does not await.
       if (change !== null) {
         const stillCurrent = this.contractChangeForCandidate(request.runId, request.snapshot);
-        if (!stillCurrent.allowed) return stillCurrent as Decision<ReviewPacket>;
+        if (!stillCurrent.allowed) {
+          return this.verdictNotKept("REVIEW_INPUTS", outcome.value.reviewer, request.runId, snapshotDigest, request.attemptId, stillCurrent);
+        }
       }
       return this.settle({
         runId: request.runId,
@@ -768,7 +770,9 @@ export class BlindReviewGate {
       // only a review of the current PLAN can make its candidate ready. `settle` does not await, so
       // nothing can replace the PLAN between this reload and the packet it stores.
       const stillCurrent = this.trustedBootstrapPlanInputs(request, snapshotDigest);
-      if (!stillCurrent.allowed) return stillCurrent as Decision<ReviewPacket>;
+      if (!stillCurrent.allowed) {
+        return this.verdictNotKept("REVIEW_INPUTS", outcome.value.reviewer, inputs.runId, snapshotDigest, request.attemptId, stillCurrent);
+      }
       // The same PLAN can be submitted again with another task, which no binding digest covers: a
       // verdict on an intent the run no longer has is stale too.
       const intentCurrent = bootstrapReviewIntentCurrent({
@@ -777,7 +781,9 @@ export class BlindReviewGate {
         planArtifact: this.artifacts.latest<unknown>(inputs.runId, ArtifactKind.PLAN),
         tasks: bootstrapPlanIntentTasks(this.db, inputs.runId),
       });
-      if (!intentCurrent.allowed) return intentCurrent as Decision<ReviewPacket>;
+      if (!intentCurrent.allowed) {
+        return this.verdictNotKept("REVIEW_INTENT", outcome.value.reviewer, inputs.runId, snapshotDigest, request.attemptId, intentCurrent);
+      }
       return this.settle({
         runId: inputs.runId,
         contractDigest: inputs.contractDigest,
@@ -825,7 +831,9 @@ export class BlindReviewGate {
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
       // As for a bootstrap PLAN: reloaded after the reviewer answered, before the verdict is kept.
       const stillCurrent = this.trustedContractChangeInputs(request, snapshotDigest);
-      if (!stillCurrent.allowed) return stillCurrent as Decision<ReviewPacket>;
+      if (!stillCurrent.allowed) {
+        return this.verdictNotKept("REVIEW_INPUTS", outcome.value.reviewer, inputs.runId, snapshotDigest, request.attemptId, stillCurrent);
+      }
       return this.settle({
         runId: inputs.runId,
         contractDigest: inputs.contractDigest,
@@ -874,11 +882,12 @@ export class BlindReviewGate {
     // A reviewer binding is a fencing token. If something replaced it while the
     // provider was working, its verdict is no longer attributable to the active role.
     if (!this.bindings.isCurrent(authoritativeReviewer.roleKey, authoritativeReviewer.generation)) {
-      return deny(ReasonCode.BINDING_GENERATION_STALE, "reviewer binding changed during review", {
-        runId,
-        roleKey: authoritativeReviewer.roleKey,
-        generation: authoritativeReviewer.generation,
-      });
+      return this.verdictNotKept("REVIEWER_BINDING", authoritativeReviewer, runId, snapshotDigest, input.attemptId,
+        deny(ReasonCode.BINDING_GENERATION_STALE, "reviewer binding changed during review", {
+          runId,
+          roleKey: authoritativeReviewer.roleKey,
+          generation: authoritativeReviewer.generation,
+        }));
     }
 
     const packet = this.assemble({
@@ -985,6 +994,36 @@ export class BlindReviewGate {
       });
     }
     return allow(ReasonCode.REVIEW_PASS, validated);
+  }
+
+  /**
+   * A reviewer answered and its verdict is not kept, because its binding was replaced while it worked
+   * or what it judged is no longer the run's. The refusal returned is unchanged; this row is why no
+   * BLIND_REVIEW exists for that answer: which check refused it (`stale`), the candidate, the submission
+   * attempt and the reviewer's binding generation, never the answer itself.
+   */
+  private verdictNotKept(
+    stale: "REVIEWER_BINDING" | "REVIEW_INPUTS" | "REVIEW_INTENT",
+    reviewer: ReviewerBinding,
+    runId: string,
+    snapshotDigest: string,
+    attemptId: string | undefined,
+    refusal: Decision<unknown>,
+  ): Decision<ReviewPacket> {
+    this.audit.record({
+      kind: "BLIND_REVIEW_REJECTED",
+      runId,
+      sessionId: reviewer.sessionId,
+      roleKey: reviewer.roleKey,
+      reasonCode: refusal.reasonCode,
+      evidence: {
+        candidateSnapshotDigest: snapshotDigest,
+        attemptId: attemptId ?? null,
+        stale,
+        reviewerRoleBindingGeneration: reviewer.generation,
+      },
+    });
+    return refusal as Decision<ReviewPacket>;
   }
 
   /**
