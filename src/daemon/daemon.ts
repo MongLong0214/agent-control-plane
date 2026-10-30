@@ -1,4 +1,4 @@
-import { retireProject } from '../registry/project-retirement.ts';
+import { resumeRetirements, retireProject } from '../registry/project-retirement.ts';
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -2184,10 +2184,14 @@ export class Daemon {
 
   /** Recover CEO-approved work after the durable lease and GitHub receipt reconciliations. */
   async resumeResidentProjects(): Promise<void> {
-    for (const row of this.cp.db.all<{project_id:string;reason:string}>(`SELECT project_id,reason FROM project_retirements WHERE completed_at IS NULL ORDER BY requested_at,project_id`)) await retireProject(this.cp,row.project_id,row.reason);
+    // #1251 C-P1 — pending retirements and the retirement intents a daemon exit left open.
+    await resumeRetirements(this.cp);
     for (const confirmation of this.cp.residentProjects.pending()) {
       const run = this.cp.runs.get(confirmation.runId);
       if (!run || run.state === RunState.COMPLETED || run.state === RunState.CANCELLED) continue;
+      // #1231 C-2 — only a CONFIRM that passed the pre-write checks, which reserves the run's application, is carried on.
+      // A confirmation an earlier version remembered before such a check refused it is left for a new CONFIRM.
+      if (this.cp.bootstrapApplications.get(confirmation.runId) === null) continue;
       const produced = await this.cp.bootstrapProducer.produceAndActivateApproved(confirmation);
       if (!produced.allowed) continue;
       const decision = this.cp.ceo.submitCeoDecision({...confirmation,decision:"CONFIRM",rationale:confirmation.rationale ?? ""});
