@@ -768,6 +768,243 @@ describe("#1189 B12/C2 — a stall nobody watches reaches the CEO as CRITICAL_SY
     expect(stallSettlements(harness, run.runId)).toEqual([expect.objectContaining({ target: "attempt_crashed", settled: "RUN_PROGRESSED" })]);
   });
 
+  it("H5-1: a run's queued stall notice that also covered a reclaimed attempt is withdrawn before it moves to a new CEO once its run's progress settled both", async () => {
+    const harness = makeHarness();
+    const run = await activeRun(harness);
+    const waits = waitsOf(harness);
+    insertAttempt(harness, run, { deadlineInMs: 150 * 60 * 1000 });
+    const critical = () => ceoNotices(harness, run.runId).filter((message) => payloadOf(message)["incidentClass"] === "RUN_STALLED");
+    const runStalls = (tick: WatchdogTick) => tick.stalls.filter((stall) => stall.runId === run.runId && stall.kind !== "outbox");
+    const routingPass = async (): Promise<WatchdogTick> => {
+      const tick = await harness.cp.watchdog.tick();
+      waits.routeWatchdogStalls(tick.stalls);
+      return tick;
+    };
+
+    // The run idles past its deadline: its RUN_STALLED notice, queued and not taken yet.
+    harness.clock.advance(121 * 60 * 1000);
+    await routingPass();
+    const [runStall] = critical();
+    expect(critical()).toEqual([expect.objectContaining({ status: "PENDING", payload: expect.objectContaining({ stall: "run" }) })]);
+
+    // The attempt passes its deadline in the same episode: reclaimed, and covered by that queued notice.
+    harness.clock.advance(30 * 60 * 1000);
+    expect(runStalls(await routingPass())).toContainEqual(expect.objectContaining({ kind: "candidate_pipeline_attempt", id: "attempt_crashed" }));
+    expect(critical()).toEqual([expect.objectContaining({ messageId: runStall!.messageId, status: "PENDING" })]);
+
+    // The run's CTO moves the run on: the next pass settles the attempt, and no stall of the run remains.
+    harness.clock.advance(60_000);
+    expect(harness.cp.tasks.submit(run.runId, [{ key: "impl", title: "change app()", category: "implementation" }]).allowed).toBe(true);
+    expect(runStalls(await routingPass())).toEqual([]);
+    expect(stallSettlements(harness, run.runId)).toEqual([expect.objectContaining({ target: "attempt_crashed", settled: "RUN_PROGRESSED" })]);
+
+    const replacement = withBuzzRoute(harness, recoverCeo(harness));
+    expect(harness.cp.outbox.claimDeliverable().filter((message) =>
+      message.runId === run.runId && payloadOf(message)["incidentClass"] === "RUN_STALLED")).toEqual([]);
+    expect(critical()).toEqual([expect.objectContaining({ messageId: runStall!.messageId, status: "REJECTED" })]);
+    expect(harness.cp.audit.forRun(run.runId).filter((entry) => entry.kind === "CEO_NOTIFICATION_WITHDRAWN")).toEqual([
+      expect.objectContaining({ evidence: expect.objectContaining({ messageId: runStall!.messageId, resolvedBy: "RUN_PROGRESSED" }) }),
+    ]);
+
+    // Later passes tell the replacement nothing of it.
+    for (let pass = 0; pass < 3; pass += 1) await routingPass();
+    expect(critical()).toHaveLength(1);
+    expect(critical().filter((message) => message.targetSessionId === replacement)).toEqual([]);
+  });
+
+  it("H5-1: a queued notice stays deliverable to a new CEO while any incident it stands for is open, whichever detector delivered it", async () => {
+    const { IncidentClass, deliverIncident, resolutionOf, runEpisode } = await import("../../src/ceo/ceo-incident-notices.ts");
+    const harness = makeHarness();
+    const run = await activeRun(harness);
+    const stated = {
+      cls: IncidentClass.RUN_STALLED, subject: run.runId, runId: run.runId, episode: runEpisode(harness.cp.db, run.runId),
+      payload: { stall: "probe" },
+    };
+    // A detector that settles the incident on progress delivers the notice; one that does not states the same
+    // incident in the same episode, and that notice covers it.
+    const delivered = deliverIncident(harness.cp, { ...stated, settlesOnProgress: true });
+    if (!delivered.allowed) throw new Error(`${delivered.reasonCode}: ${delivered.message}`);
+    expect(delivered.value).toMatchObject({ created: true });
+    expect(deliverIncident(harness.cp, stated)).toMatchObject({ allowed: true, value: { created: false, messageId: delivered.value.messageId } });
+
+    harness.clock.advance(60_000);
+    expect(harness.cp.tasks.submit(run.runId, [{ key: "impl", title: "change app()", category: "implementation" }]).allowed).toBe(true);
+    // The run progressed past the episode, and one of its incidents is still open: the episode is not resolved,
+    // asked for either of them.
+    expect(resolutionOf(harness.cp.db, { ...stated, settlesOnProgress: true })).toBeNull();
+    expect(resolutionOf(harness.cp.db, stated)).toBeNull();
+
+    const replacement = withBuzzRoute(harness, recoverCeo(harness));
+    expect(harness.cp.outbox.claimDeliverable().filter((message) => message.messageId === delivered.value.messageId)).toEqual([
+      expect.objectContaining({ targetSessionId: replacement }),
+    ]);
+    expect(harness.cp.audit.forRun(run.runId).filter((entry) => entry.kind === "CEO_NOTIFICATION_WITHDRAWN")).toEqual([]);
+  });
+
+  /**
+   * H6-1 — a task execution goes quiet while continuity holds its run: the watchdog's notice is queued, and the
+   * hold's CEO escalation, stated in the same episode, is covered by that notice. H7-1 — with `escalationFirst`,
+   * the other order: the hold's ladder queues the notice, and the watchdog's stall of the execution, stated in the
+   * same episode, is covered by it.
+   */
+  const quietExecutionUnderHold = async (harness: Harness, escalationFirst = false) => {
+    const run = await activeRun(harness);
+    const waits = waitsOf(harness, { continuityHoldMs: 10 * 60 * 1000 });
+    const recover = vi.fn();
+    expect(harness.cp.tasks.submit(run.runId, [{ key: "impl", title: "change app()", category: "implementation" }]).allowed).toBe(true);
+    const task = harness.cp.tasks.ready(run.runId)[0]!;
+    const execution = harness.cp.tasks.startExecution({
+      runId: run.runId,
+      taskId: task.taskId,
+      ownerBindingGeneration: run.ownerBindingGeneration!,
+      workerSessionId: bindWorker(harness, task.taskId),
+      provider: "scripted",
+      model: "scripted-worker",
+    });
+    if (!execution.allowed) throw new Error(execution.message);
+    // Paused as continuity itself pauses a run, so that its own release can end the hold.
+    expect(harness.cp.runs.pauseForContinuity(run.runId, run.ownerRoleKey!, "failover refused: SESSION_NOT_READY", {
+      roleKey: run.ownerRoleKey, continuityAction: "PAUSE_NEW_WORK",
+    })).toMatchObject({ allowed: true, value: { state: RunState.BLOCKED } });
+    const critical = () => ceoNotices(harness, run.runId).filter((message) => payloadOf(message)["incidentClass"] === "RUN_STALLED");
+    const runStalls = (tick: WatchdogTick) => tick.stalls.filter((stall) => stall.runId === run.runId && stall.kind !== "outbox");
+
+    if (escalationFirst) {
+      for (const step of ["RENOTIFY", "REASSIGN", "CEO_ESCALATION"]) {
+        harness.clock.advance(10 * 60 * 1000);
+        expect((await waits.sweep(recover)).taken).toEqual([expect.objectContaining({ kind: "CONTINUITY_HOLD", step })]);
+      }
+      const [notice] = critical();
+      expect(critical()).toEqual([expect.objectContaining({ status: "PENDING", payload: expect.objectContaining({ step: "CEO_ESCALATION" }) })]);
+      harness.clock.advance(60_000);
+      const tick = await harness.cp.watchdog.tick();
+      expect(runStalls(tick)).toContainEqual(expect.objectContaining({ kind: "task_execution", id: execution.value.executionId }));
+      expect(waits.routeWatchdogStalls(runStalls(tick))).toEqual([
+        expect.objectContaining({ kind: "task_execution", reasonCode: ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED }),
+      ]);
+      expect(critical()).toEqual([expect.objectContaining({ messageId: notice!.messageId, status: "PENDING" })]);
+      return { run, waits, recover, execution: execution.value, notice: notice!, critical, runStalls };
+    }
+
+    harness.clock.advance(31 * 60 * 1000);
+    const tick = await harness.cp.watchdog.tick();
+    expect(runStalls(tick)).toContainEqual(expect.objectContaining({ kind: "task_execution", id: execution.value.executionId }));
+    waits.routeWatchdogStalls(tick.stalls);
+    const [notice] = critical();
+    expect(critical()).toEqual([expect.objectContaining({ status: "PENDING", payload: expect.objectContaining({ stall: "task_execution" }) })]);
+
+    for (const step of ["RENOTIFY", "REASSIGN", "CEO_ESCALATION"]) {
+      expect((await waits.sweep(recover)).taken).toEqual([expect.objectContaining({ kind: "CONTINUITY_HOLD", step })]);
+      harness.clock.advance(10 * 60 * 1000);
+    }
+    expect(critical()).toEqual([expect.objectContaining({ messageId: notice!.messageId, status: "PENDING" })]);
+    expect(harness.cp.audit.forRun(run.runId).filter((entry) => entry.kind === "CEO_NOTIFICATION_COVERED")).toHaveLength(1);
+    return { run, waits, recover, execution: execution.value, notice: notice!, critical, runStalls };
+  };
+
+  it("H6-1: a run's queued stall notice that covered a continuity hold's escalation is withdrawn before it moves to a new CEO once the hold ended and the run progressed", async () => {
+    const harness = makeHarness();
+    const { run, waits, recover, execution, notice, critical, runStalls } = await quietExecutionUnderHold(harness);
+
+    // Continuity releases the hold (BLOCKED → ACTIVE) and the execution records activity: no stall of the run
+    // remains, and the wait is over.
+    const held = harness.cp.bindings.active(run.ownerRoleKey!)!;
+    expect(harness.cp.runs.releaseContinuityHold(run.runId, held)).toMatchObject({ allowed: true, value: { kept: null, released: true } });
+    harness.clock.advance(60_000);
+    expect(harness.cp.tasks.recordActivity(execution.executionId).allowed).toBe(true);
+    expect(harness.cp.runs.require(run.runId).state).toBe(RunState.ACTIVE);
+    expect(runStalls(await harness.cp.watchdog.tick())).toEqual([]);
+    expect(waits.waits().filter((wait) => wait.runId === run.runId)).toEqual([]);
+
+    const replacement = withBuzzRoute(harness, recoverCeo(harness));
+    expect(harness.cp.outbox.claimDeliverable().filter((message) =>
+      message.runId === run.runId && payloadOf(message)["incidentClass"] === "RUN_STALLED")).toEqual([]);
+    expect(critical()).toEqual([expect.objectContaining({ messageId: notice.messageId, status: "REJECTED" })]);
+    expect(harness.cp.audit.forRun(run.runId).filter((entry) => entry.kind === "CEO_NOTIFICATION_WITHDRAWN")).toEqual([
+      expect.objectContaining({ evidence: expect.objectContaining({ messageId: notice.messageId, resolvedBy: "RUN_PROGRESSED" }) }),
+    ]);
+
+    // Later passes tell the replacement nothing of it.
+    for (let pass = 0; pass < 3; pass += 1) {
+      waits.routeWatchdogStalls((await harness.cp.watchdog.tick()).stalls);
+      await waits.sweep(recover);
+    }
+    expect(critical()).toHaveLength(1);
+    expect(critical().filter((message) => message.targetSessionId === replacement)).toEqual([]);
+  });
+
+  it("H6-1: the same notice stays deliverable to a new CEO while the hold whose escalation it covered lasts, though the run progressed", async () => {
+    const { runEpisode } = await import("../../src/ceo/ceo-incident-notices.ts");
+    const harness = makeHarness();
+    const { run, waits, execution, notice } = await quietExecutionUnderHold(harness);
+
+    // The execution records activity while continuity still holds the run: the run progressed past the notice's
+    // episode, and the wait goes on.
+    harness.clock.advance(60_000);
+    expect(harness.cp.tasks.recordActivity(execution.executionId).allowed).toBe(true);
+    expect(runEpisode(harness.cp.db, run.runId)).not.toBe(payloadOf(notice)["episode"]);
+    expect(harness.cp.runs.require(run.runId)).toMatchObject({ state: RunState.BLOCKED, continuityHoldRoleKey: run.ownerRoleKey });
+    expect(waits.waits().filter((wait) => wait.runId === run.runId)).toEqual([expect.objectContaining({ kind: "CONTINUITY_HOLD" })]);
+
+    const replacement = withBuzzRoute(harness, recoverCeo(harness));
+    expect(harness.cp.outbox.claimDeliverable().filter((message) => message.messageId === notice.messageId)).toEqual([
+      expect.objectContaining({ targetSessionId: replacement }),
+    ]);
+    expect(harness.cp.audit.forRun(run.runId).filter((entry) => entry.kind === "CEO_NOTIFICATION_WITHDRAWN")).toEqual([]);
+  });
+
+  it("H7-1: a continuity hold's queued escalation that covered the run's execution stall is withdrawn before it moves to a new CEO once the hold ended and the run progressed", async () => {
+    const harness = makeHarness();
+    const { run, waits, recover, execution, notice, critical, runStalls } = await quietExecutionUnderHold(harness, true);
+
+    const held = harness.cp.bindings.active(run.ownerRoleKey!)!;
+    expect(harness.cp.runs.releaseContinuityHold(run.runId, held)).toMatchObject({ allowed: true, value: { kept: null, released: true } });
+    harness.clock.advance(60_000);
+    expect(harness.cp.tasks.recordActivity(execution.executionId).allowed).toBe(true);
+    expect(harness.cp.runs.require(run.runId).state).toBe(RunState.ACTIVE);
+    expect(runStalls(await harness.cp.watchdog.tick())).toEqual([]);
+    expect(waits.waits().filter((wait) => wait.runId === run.runId)).toEqual([]);
+
+    const replacement = withBuzzRoute(harness, recoverCeo(harness));
+    expect(harness.cp.outbox.claimDeliverable().filter((message) =>
+      message.runId === run.runId && payloadOf(message)["incidentClass"] === "RUN_STALLED")).toEqual([]);
+    expect(critical()).toEqual([expect.objectContaining({ messageId: notice.messageId, status: "REJECTED" })]);
+    expect(harness.cp.audit.forRun(run.runId).filter((entry) => entry.kind === "CEO_NOTIFICATION_WITHDRAWN")).toEqual([
+      expect.objectContaining({ evidence: expect.objectContaining({ messageId: notice.messageId, resolvedBy: "RUN_PROGRESSED" }) }),
+    ]);
+
+    for (let pass = 0; pass < 3; pass += 1) {
+      waits.routeWatchdogStalls((await harness.cp.watchdog.tick()).stalls);
+      await waits.sweep(recover);
+    }
+    expect(critical()).toHaveLength(1);
+    expect(critical().filter((message) => message.targetSessionId === replacement)).toEqual([]);
+  });
+
+  it("H7-1: that notice stays deliverable to a new CEO while an incident it covered is still open, though the hold ended and the run progressed", async () => {
+    const { IncidentClass, deliverIncident } = await import("../../src/ceo/ceo-incident-notices.ts");
+    const harness = makeHarness();
+    const { run, execution, notice } = await quietExecutionUnderHold(harness, true);
+    // A detector that names no wait and does not settle on progress states the run's incident in the same episode:
+    // nothing here reads its end, so it stays open.
+    expect(deliverIncident(harness.cp, {
+      cls: IncidentClass.RUN_STALLED, subject: run.runId, runId: run.runId, episode: String(payloadOf(notice)["episode"]),
+      payload: { stall: "probe" },
+    })).toMatchObject({ allowed: true, value: { created: false, messageId: notice.messageId } });
+
+    const held = harness.cp.bindings.active(run.ownerRoleKey!)!;
+    expect(harness.cp.runs.releaseContinuityHold(run.runId, held)).toMatchObject({ allowed: true, value: { kept: null, released: true } });
+    harness.clock.advance(60_000);
+    expect(harness.cp.tasks.recordActivity(execution.executionId).allowed).toBe(true);
+    expect(harness.cp.runs.require(run.runId).state).toBe(RunState.ACTIVE);
+
+    const replacement = withBuzzRoute(harness, recoverCeo(harness));
+    expect(harness.cp.outbox.claimDeliverable().filter((message) => message.messageId === notice.messageId)).toEqual([
+      expect.objectContaining({ targetSessionId: replacement }),
+    ]);
+    expect(harness.cp.audit.forRun(run.runId).filter((entry) => entry.kind === "CEO_NOTIFICATION_WITHDRAWN")).toEqual([]);
+  });
+
   it("with no CEO bound nothing is written, and the next pass routes it once the CEO is back", async () => {
     const harness = makeHarness();
     await activeRun(harness);

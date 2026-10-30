@@ -11,7 +11,16 @@ import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
-import { type Incident, IncidentClass, type NoticeState, NotificationKind, deliverIncident, runEpisode, runProgressedPast } from "./ceo-incident-notices.ts";
+import {
+  type Incident,
+  IncidentClass,
+  type NoticeState,
+  NotificationKind,
+  deliverIncident,
+  runEpisode,
+  runProgressedPast,
+  runStateEntry,
+} from "./ceo-incident-notices.ts";
 import type { ProductionGate } from "./production-gate.ts";
 
 /**
@@ -120,8 +129,10 @@ export interface OwnerlessStall {
   /** A stall of a run stated again in the incident episode it was first routed in; absent, the run's current one. */
   incidentEpisode?: string;
   /**
-   * A stall of a run its detector settles when the run progresses past its episode (an owed stall: a reclaimed
-   * attempt), so that progress also resolves its incident (`Incident.settlesOnProgress`). Absent, it does not.
+   * A stall of a run its detector settles when the run progresses past its episode (every watchdog stall: one
+   * stated in its run's current episode is never stated in an earlier one, and an owed one, a reclaimed attempt,
+   * is settled when its run moved on), so that progress also resolves its incident (`Incident.settlesOnProgress`).
+   * Absent, it does not.
    */
   settlesOnProgress?: boolean;
 }
@@ -375,6 +386,10 @@ export class AgentOwnedWaits {
    * the same progress also resolves its notice wherever it is asked. H4-2 — an owed stall the watchdog found
    * on this pass is routed as owed the first time: when the run's existing notice covers it, the episode it is
    * stated in from then on is recorded at once, before any progress can move the run's episode on.
+   * H5-1 — every watchdog stall of a run says so too: the watchdog states it only in its run's current episode,
+   * and again in the next one if it outlasts the progress, so a run stall's notice that covered a reclaimed
+   * attempt is resolved by the progress that settled both, unless an incident progress does not settle (an
+   * agent-owned wait's escalation) was stated in that episode as well and is still open (H6-1: its wait lasts).
    */
   routeWatchdogStalls(stalls: readonly WatchdogStall[]): Array<{ kind: string; id: string; messageId: string | null; reasonCode: string }> {
     const routed: Array<{ kind: string; id: string; messageId: string | null; reasonCode: string }> = [];
@@ -406,7 +421,7 @@ export class AgentOwnedWaits {
         effects: route.effects,
         deliveryTimeout: stall.kind === "outbox",
         ...(owed?.episode != null ? { incidentEpisode: owed.episode } : {}),
-        ...(owed ? { settlesOnProgress: true } : {}),
+        settlesOnProgress: true,
       });
       if (owed && decision.allowed) {
         if (decision.value.state === "RESOLVED") {
@@ -504,16 +519,12 @@ export class AgentOwnedWaits {
     return this.ports.bindings.active(roleKeyFor(Role.CEO));
   }
 
-  /** The wait `run` is in, read from the RUN_TRANSITION that entered its current state, or null. */
+  /** The wait `run` is in, read from the RUN_TRANSITION that entered its current state (`runStateEntry`), or null. */
   #waitOf(run: RunRow): AgentWait | null {
-    const entered = this.ports.db.get<{ event_id: number; at: string; evidence_json: string }>(
-      `SELECT event_id, at, evidence_json FROM audit_events WHERE run_id = ? AND kind = 'RUN_TRANSITION'
-        ORDER BY event_id DESC LIMIT 1`,
-      [run.runId],
-    );
-    const transition = evidenceOf(entered?.evidence_json);
-    if (!entered || transition?.["to"] !== run.state) return null;
-    const base = { runId: run.runId, projectId: run.projectId, episode: entered.event_id, since: entered.at };
+    const entered = runStateEntry(this.ports.db, run);
+    if (!entered) return null;
+    const transition = entered.evidence;
+    const base = { runId: run.runId, projectId: run.projectId, episode: entered.eventId, since: entered.at };
     if (run.state === RunState.READY_FOR_CEO_REVIEW) {
       const review = this.#currentReview(run.runId);
       return {
@@ -710,7 +721,7 @@ export class AgentOwnedWaits {
     deliverIncident(this.ports, this.#waitIncident(run, wait, deadlineMs, episode));
   }
 
-  /** The wait's CEO_ESCALATION notice as its run's RUN_STALLED incident. */
+  /** The wait's CEO_ESCALATION notice as its run's RUN_STALLED incident, stated for the wait while it lasts (H6-1). */
   #waitIncident(run: RunRow, wait: AgentWait, deadlineMs: number, episode: string): Incident {
     const step = AgentWaitStep.CEO_ESCALATION;
     const { notification: _notification, runId: _runId, ...notice } = this.#noticeOf(run, wait, step, deadlineMs);
@@ -719,6 +730,7 @@ export class AgentOwnedWaits {
       subject: wait.runId,
       runId: wait.runId,
       episode,
+      waitEpisode: wait.episode,
       payload: notice,
       record: { waitKind: wait.kind, step, owner: wait.owner, action: wait.recoveryAction, detail: wait.blocker, productFailure: false },
     };
