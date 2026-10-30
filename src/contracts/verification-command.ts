@@ -129,8 +129,11 @@ export const ALLOWED_VERIFICATION_EXECUTABLES: ReadonlySet<string> = new Set([
  * in its manifest's `verificationExecutables` (#1253). A name here admits nothing by itself: a
  * command is checked against it only when the manifest pinned for its run declares it, so no other
  * project's commands gain it. Like the allowlist above, this is defence in depth, not the boundary.
+ *
+ * Empty: no executable is addable yet, so a manifest that declares one is refused. Adding a name
+ * here is a policy change in its own right, not part of the mechanism.
  */
-export const PROJECT_VERIFICATION_EXECUTABLES: ReadonlySet<string> = new Set(["python3"]);
+export const PROJECT_VERIFICATION_EXECUTABLES: ReadonlySet<string> = new Set<string>();
 
 const SYSTEM_EXECUTABLE_ROOTS = [
   "/usr/local/bin",

@@ -1,9 +1,12 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { fixtureManifest, makeHarness } from "../helpers/harness.ts";
 import { cleanupTempDirs, commitAll, gitSync, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { assertPortableManifest, type ProjectManifest } from "../../src/contracts/manifest.ts";
-import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
+import {
+  parseVerificationCommand,
+  PROJECT_VERIFICATION_EXECUTABLES,
+} from "../../src/contracts/verification-command.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
 import { runSandboxed, type SandboxOutcome } from "../../src/verify/sandbox.ts";
@@ -11,12 +14,27 @@ import { runSandboxed, type SandboxOutcome } from "../../src/verify/sandbox.ts";
 /**
  * #1253 — a project whose suite is not a Node toolchain (Repo Factory's is pytest) could declare no
  * verification command, because argv[0] had to be one of the shared allowlist's Node tools, so its
- * STANDARD_WORK runs stopped at VERIFICATION_GAP. A project now names the extra executable in its
+ * STANDARD_WORK runs stopped at VERIFICATION_GAP. A project can now name an extra executable in its
  * own manifest (`verificationExecutables`); only that project's runs may launch it, and only names
- * ACP lists as addable are accepted.
+ * ACP lists as addable are accepted. ACP ships that list empty, so production admits none.
+ *
+ * To exercise the mechanism, the "with an addable name" cases add `python3` to that list for this
+ * file only and remove it afterwards. Nothing in src/ changes for it; the "production" cases run
+ * against the list as shipped.
  */
 
 afterEach(cleanupTempDirs);
+
+const ADDED_FOR_TESTS = "python3";
+const addable = PROJECT_VERIFICATION_EXECUTABLES as Set<string>;
+const withAddableName = (): void => {
+  beforeEach(() => {
+    addable.add(ADDED_FOR_TESTS);
+  });
+  afterEach(() => {
+    addable.delete(ADDED_FOR_TESTS);
+  });
+};
 
 const sandboxIt = (name: string, fn: () => Promise<void>): void => {
   if (process.platform === "darwin") it(name, fn);
@@ -33,8 +51,8 @@ const pythonCommand = (argv: string[]): ProjectManifest["verificationCommands"][
 
 const pythonManifest = (overrides: Partial<ProjectManifest> = {}): ProjectManifest =>
   fixtureManifest("python-project", {
-    verificationExecutables: ["python3"],
-    verificationCommands: [pythonCommand(["python3", "verify.py"])],
+    verificationExecutables: [ADDED_FOR_TESTS],
+    verificationCommands: [pythonCommand([ADDED_FOR_TESTS, "verify.py"])],
     ...overrides,
   });
 
@@ -44,12 +62,49 @@ const issuesOf = (manifest: unknown): Array<{ path: string; message: string }> =
   return (decision.evidence as { issues?: Array<{ path: string; message: string }> }).issues ?? [];
 };
 
-describe("#1253 a project's manifest names the executables its own verification commands may launch", () => {
-  it("accepts a python3 command when the manifest names python3", () => {
+const notAddable = (name: string) => [
+  expect.objectContaining({ path: "verificationExecutables", message: expect.stringContaining(`'${name}'`) }),
+  expect.objectContaining({
+    path: "verificationCommands.0.argv.0",
+    message: expect.stringContaining("is not on the verification executable allowlist"),
+  }),
+];
+
+describe("#1253 production admits no project-added executable", () => {
+  it("ships an empty addable list", () => {
+    expect([...PROJECT_VERIFICATION_EXECUTABLES]).toEqual([]);
+  });
+
+  it("refuses a manifest that names python3 exactly as it refuses any other name", () => {
+    expect(issuesOf(pythonManifest())).toEqual(notAddable("python3"));
+    expect(issuesOf(pythonManifest({
+      verificationExecutables: ["sh"],
+      verificationCommands: [pythonCommand(["sh", "verify.py"])],
+    }))).toEqual(notAddable("sh"));
+  });
+
+  sandboxIt("the sandbox refuses python3 even for a request that declares it", async () => {
+    const worktree = tempDir("acp-1253-sandbox-");
+    writeFiles(worktree, { "verify.py": "print('python suite ran')\n" });
+    const outcome = await runSandboxed({
+      command: pythonCommand(["python3", "verify.py"]),
+      worktreePath: worktree,
+      processLimit: "supervised-budget",
+      executables: ["python3"],
+    });
+    expect(outcome, described(outcome)).toMatchObject({ status: "ERROR", reasonCode: ReasonCode.INVALID_ARGUMENT });
+    expect(outcome.stderr).toContain("is not on the verification executable allowlist");
+  });
+});
+
+describe("#1253 with an addable name, a project's manifest names the executables its own commands may launch", () => {
+  withAddableName();
+
+  it("accepts the command when the manifest names the executable", () => {
     expect(assertPortableManifest(pythonManifest())).toMatchObject({ allowed: true });
   });
 
-  it("refuses the same command in a manifest that does not name python3", () => {
+  it("refuses the same command in a manifest that does not name it", () => {
     const { verificationExecutables: _omitted, ...undeclared } = pythonManifest();
     expect(issuesOf(undeclared)).toEqual([
       expect.objectContaining({
@@ -59,15 +114,11 @@ describe("#1253 a project's manifest names the executables its own verification 
     ]);
   });
 
-  it("refuses a name ACP does not list as addable, and a command that uses it", () => {
-    const issues = issuesOf(pythonManifest({
+  it("still refuses a name ACP does not list as addable", () => {
+    expect(issuesOf(pythonManifest({
       verificationExecutables: ["sh"],
       verificationCommands: [pythonCommand(["sh", "-c", "exit 0"])],
-    }));
-    expect(issues).toEqual(expect.arrayContaining([
-      expect.objectContaining({ path: "verificationExecutables", message: expect.stringContaining("'sh'") }),
-      expect.objectContaining({ path: "verificationCommands.0.argv.0" }),
-    ]));
+    }))).toEqual(notAddable("sh"));
   });
 
   it("leaves a command outside a manifest on the shared allowlist", () => {
@@ -75,7 +126,7 @@ describe("#1253 a project's manifest names the executables its own verification 
       .toThrow(/not on the verification executable allowlist/);
   });
 
-  sandboxIt("the sandbox launches python3 only for a request that carries the declaration", async () => {
+  sandboxIt("the sandbox launches it only for a request that carries the declaration", async () => {
     const worktree = tempDir("acp-1253-sandbox-");
     writeFiles(worktree, { "verify.py": "print('python suite ran')\n" });
     const command = pythonCommand(["python3", "verify.py"]);
@@ -95,7 +146,9 @@ describe("#1253 a project's manifest names the executables its own verification 
   });
 });
 
-describe("#1253 a STANDARD run of that project runs its python suite in the sandbox and records the result", () => {
+describe("#1253 with an addable name, a STANDARD run runs the project's suite in the sandbox and records the result", () => {
+  withAddableName();
+
   const contract = {
     goal: "python verification",
     why: "test",

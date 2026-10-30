@@ -59,8 +59,8 @@ export const projectManifestSchema = z
     verificationCommands: z.array(manifestVerificationCommandSchema).default([]),
     /**
      * #1253 — executables this project's own verification commands may launch beyond the shared
-     * allowlist, each one PROJECT_VERIFICATION_EXECUTABLES names (a Python suite's `python3`). It
-     * reaches only this project's runs: the sandbox takes it from the manifest pinned for the run.
+     * allowlist, each one PROJECT_VERIFICATION_EXECUTABLES names (none yet, so any declaration is
+     * refused). It reaches only this project's runs: the sandbox takes it from the pinned manifest.
      * `.optional()` with no default keeps every existing manifest's digest unchanged, and `.min(1)`
      * keeps an empty list from looking like a declaration.
      */
