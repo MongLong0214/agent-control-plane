@@ -1157,6 +1157,7 @@ describe("baseline boundary contracts", () => {
       "v53-verification-result-history",
       "v54-run-state-exits",
       "v55-approved-run-revision-reentry",
+      "v56-adopted-bootstrap-first-manifest",
     ]);
   });
 
