@@ -9,10 +9,12 @@ import Database from 'better-sqlite3';
 import { currentCanonicalCeoBuzzRoute, daemonBuzzSigner } from '../src/outbox/ceo-buzz-signer.ts';
 import { canonicalJson } from '../src/core/digest.ts';
 import { readProcessStartToken } from '../src/core/process-argv.ts';
-import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText } from '../src/runtime/host-provisioner-reason.ts';
+import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText, recordedResidentExitStatus } from '../src/runtime/host-provisioner-reason.ts';
 const home = process.env.HOME;
 const state = process.env.ACP_STATE_DIR;
 class ProvisionerRefusal extends Error {}
+// The current launch's recorded claude exit, as opposed to claude failing in this operation's own calls.
+class RecordedExitRefusal extends ProvisionerRefusal {}
 class ProvisionerExecutionFailure extends Error {
   constructor(message, error) {super(message);this.stderr = error.stderr;}
 }
@@ -231,7 +233,7 @@ try {
     try {return observeResident();} catch (error) {
       const recorded = recordedLaunchExit();
       if (!recorded) throw error;
-      throw new ProvisionerRefusal(formatHostProvisionerReason(recorded.reason));
+      throw new RecordedExitRefusal(formatHostProvisionerReason(recorded.reason));
     }
   };
   let result = {};
@@ -375,7 +377,7 @@ try {
         // a completed row) after its log line. The record and marker remain untouched while a response may be lost.
         const priorExit = recordedLaunchExit();
         if (priorExit && priorExit.marker.exitReported !== true) {
-          throw new ProvisionerRefusal(formatHostProvisionerReason(priorExit.reason));
+          throw new RecordedExitRefusal(formatHostProvisionerReason(priorExit.reason));
         }
         const launch = randomUUID();
         const launcher = join(state,`resident-${a.projectId}.sh`);
@@ -401,7 +403,7 @@ try {
         }
         const completedExit = recordedLaunchExit();
         if (completedExit && completedExit.marker.exitReported !== true)
-          throw new ProvisionerRefusal(formatHostProvisionerReason(completedExit.reason));
+          throw new RecordedExitRefusal(formatHostProvisionerReason(completedExit.reason));
         atomic(launchMarker,JSON.stringify({sessionUuid:a.sessionUuid,launch})); run('tmux',['new-session','-d','-s',a.tmuxName,launcher]);
       }
       result = {fleet:true,checkout:observedCheckout,resident:observeLaunch()}; break;
@@ -457,6 +459,6 @@ try {
     }
     process.stderr.write(JSON.stringify({ceoBuzzSignerFailure:failure}));
   } else process.stderr.write(hostRefusalText(error instanceof ProvisionerRefusal || error instanceof ProvisionerExecutionFailure ? error.message : undefined));
-  process.exitCode = 1;
+  process.exitCode = error instanceof RecordedExitRefusal ? recordedResidentExitStatus : 1;
 }
 finally {if (locked && readlinkSync(lock) === ownLock) rmSync(lock,{force:true});if (ownLock) rmSync(ownLock,{recursive:true,force:true});}

@@ -42,6 +42,13 @@ export function hostProvisionerReason(binary: unknown, operation: unknown, kind:
 export const formatHostProvisionerReason = (reason: HostProvisionerReason): string =>
   `${reason.binary} in ${reason.operation}: ${reason.kind}${reason.exitCode === undefined ? '' : ` with exit code ${reason.exitCode}`}`;
 
+/**
+ * The host's exit status when its refusal is the resident launch's recorded claude exit; every other refusal
+ * exits 1. That reason has the same shape as claude failing inside the operation itself (`claude mcp` in
+ * ensure-resident), so only this status tells the fleet watcher that the resident is what exited.
+ */
+export const recordedResidentExitStatus = 3;
+
 /** The host's whole stderr for a refused operation. `detail` is only ever the script's own text. */
 export const hostRefusalText = (detail?: string): string => `host project provisioner refused operation${detail === undefined ? '' : `: ${detail}`}\n`;
 

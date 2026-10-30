@@ -603,9 +603,18 @@ it('replaces a retained dead launcher pane after its exit is acknowledged, never
 });
 
 const fleetRecovery = fileURLToPath(new URL('../../dist/host/resident-fleet-up.mjs',import.meta.url));
+// The sweep's host is the packaged script behind a recorder of each operation the sweep asks of it.
 const sweep = (f:ReturnType<typeof fixture>) => new Promise<{code:unknown;stderr:string}>(resolve => {
-  execFile(process.execPath,[fleetRecovery],{env:{...f.env,ACP_HOST_PROJECT_PROVISIONER:f.script},timeout:30_000},(error,_stdout,stderr) => resolve({code:error ? error.code : 0,stderr:String(stderr)}));
+  const host = join(f.home,'recording-host.mjs');
+  writeFileSync(host,`import {appendFileSync,readFileSync} from 'node:fs';import {spawnSync} from 'node:child_process';
+const input = readFileSync(0,'utf8');appendFileSync(${JSON.stringify(join(f.home,'host-operations'))},JSON.parse(input).operation+'\\n');
+process.exitCode = spawnSync(process.execPath,[${JSON.stringify(f.script)}],{input,stdio:['pipe','inherit','inherit']}).status ?? 1;\n`);
+  execFile(process.execPath,[fleetRecovery],{env:{...f.env,ACP_HOST_PROJECT_PROVISIONER:host},timeout:30_000},(error,_stdout,stderr) => resolve({code:error ? error.code : 0,stderr:String(stderr)}));
 });
+const sweptOperations = (f:ReturnType<typeof fixture>) => {
+  const file = join(f.home,'host-operations');const operations = existsSync(file) ? readFileSync(file,'utf8').split('\n').filter(Boolean) : [];
+  rmSync(file,{force:true});return operations;
+};
 
 it('fleet recovery logs a completed project\'s recorded Claude exit, acknowledges it and relaunches once',async () => {
   const f = fixture();
@@ -614,10 +623,24 @@ it('fleet recovery logs a completed project\'s recorded Claude exit, acknowledge
   residentGone(f);
   // No daemon pass resumes a completed row, so no daemon acknowledgment arrives: the watcher's log line is the durable copy.
   expect(await sweep(f)).toEqual({code:0,stderr:'resident exited: acp-test.resident.json: claude in ensure-resident: non-zero exit with exit code 2\n'});
+  expect(sweptOperations(f)).toEqual(['ensure-resident','acknowledge-resident-exit','ensure-resident']);
   expect(fakeState(f).launches).toBe(2);
   // The relaunched resident is alive: a later sweep never starts it again.
   expect(await sweep(f)).toEqual({code:0,stderr:''});
   expect(fakeState(f).launches).toBe(2);
+});
+
+it('fleet recovery reports claude failing in provisioning as a provisioning failure, never as a resident exit',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');await f.invoke('ensure-resident');
+  // The resident stays healthy; only ensure-resident's own `claude mcp` calls exit 23, in the same reason shape as a recorded exit.
+  writeFileSync(join(f.home,'fail-claude'),'');
+  const marker = readFileSync(join(f.state,'launched-test'),'utf8');
+  expect(await sweep(f)).toEqual({code:1,stderr:'resident provisioning failed: acp-test.resident.json: claude in ensure-resident: non-zero exit with exit code 23\nresident recovery pending: acp-test.resident.json\n'});
+  expect(sweptOperations(f)).toEqual(['ensure-resident']);
+  expect(readFileSync(join(f.state,'launched-test'),'utf8')).toBe(marker);
+  expect(existsSync(join(f.state,'resident-test.exit.json'))).toBe(false);
+  expect(fakeState(f)).toMatchObject({launches:1,launched:true});
 });
 
 it('an exit record for one session never explains another session of the same project',async () => {
