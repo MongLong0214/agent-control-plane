@@ -255,6 +255,57 @@ describe("#1189 B4/B6/B7/B10 — an agent-owned wait's deadline re-notifies, rea
     expect(harness.cp.audit.forRun(run.runId).some((entry) => entry.kind === "RUN_TRANSITION" && entry.evidence["to"] === RunState.FAILED)).toBe(false);
   });
 
+  it("after the ladder, an unresolved wait's CRITICAL_SYSTEM_FAILURE reaches a replacement CEO once, under the same correlation; a resolved one reaches no later CEO", async () => {
+    const harness = makeHarness();
+    const run = await activeRun(harness);
+    const opened = harness.cp.ceo.openEscalation({
+      runId: run.runId,
+      question: "which schema version does the importer target?",
+      options: ["v1", "v2"],
+      ctoRecommendation: "v2",
+      whyItMatters: "the importer cannot be written against both",
+      blocksCriticalPath: true,
+      openedBySessionId: run.ownerSessionId!,
+      openedAt: harness.clock.nowIso(),
+    });
+    expect(opened).toMatchObject({ allowed: true, value: { state: RunState.BLOCKED } });
+    const escalationId = opened.allowed ? opened.value.escalationId! : -1;
+    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-agent-waits-redelivery-"), agentWaitDeadlines: { escalationMs: HOUR } });
+    const critical = () => ceoNotices(harness, run.runId).filter((message) => payloadOf(message)["notification"] === "CRITICAL_SYSTEM_FAILURE");
+    for (const step of ["RENOTIFY", "REASSIGN", "CEO_ESCALATION"]) {
+      harness.clock.advance(HOUR);
+      expect((await daemon.sweepAgentOwnedWaits()).taken).toEqual([expect.objectContaining({ step })]);
+    }
+    const [first] = critical();
+    expect(critical()).toHaveLength(1);
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    expect(harness.cp.outbox.acknowledge(first!.messageId, ceo.sessionId, ceo.bindingGeneration).allowed).toBe(true);
+    harness.clock.advance(10 * HOUR);
+    await daemon.sweepAgentOwnedWaits();
+    // An ACK is a receipt, not a resolution, and the CEO that ACKed it is not told again.
+    expect(critical()).toHaveLength(1);
+
+    const replacement = recoverCeo(harness);
+    for (let pass = 0; pass < 3; pass += 1) await daemon.sweepAgentOwnedWaits();
+    expect(critical()).toHaveLength(2);
+    const second = critical().find((message) => message.messageId !== first!.messageId);
+    expect(second).toMatchObject({ targetSessionId: replacement });
+    expect(payloadOf(second)).toMatchObject({
+      redelivery: true,
+      correlation: payloadOf(first)["correlation"],
+      episode: payloadOf(first)["episode"],
+      step: "CEO_ESCALATION",
+      blocker: expect.stringContaining(`CTO escalation ${escalationId}`),
+    });
+    expect(harness.cp.runs.require(run.runId).state).toBe(RunState.BLOCKED);
+
+    // The CEO answers the escalation: the run leaves the wait, and a CEO bound after that is told nothing.
+    expect(harness.cp.ceo.resolveEscalation(run.runId, "v2", replacement, { escalationId })).toMatchObject({ allowed: true });
+    recoverCeo(harness);
+    for (let pass = 0; pass < 3; pass += 1) await daemon.sweepAgentOwnedWaits();
+    expect(critical()).toHaveLength(2);
+  });
+
   it("a pending review, then the FINAL_REVISE not dispatched again, each take the ladder as their own wait and stay where they are", async () => {
     const harness = makeHarness();
     const driven = await atReview(harness);

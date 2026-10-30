@@ -231,12 +231,13 @@ interface AuthoritySnapshot {
 }
 
 /**
- * What a person does about a STRANDED application. The reservation is never reused and nothing is
- * deleted automatically, so the recovery is a person's: establish what the repository at the target
- * is, then cancel this run and bootstrap again under a new project id and repository identity.
+ * The recovery of a STRANDED application, as the paths that exist allow it. The reservation is never
+ * reused and nothing is deleted automatically. No edge cancels this run: it is at CEO review, which no
+ * cancel edge leaves, and its reserved application refuses FINAL_REVISE. So the supported path is a new
+ * bootstrap under a new project id and repository identity, and the daemon routes the stall to the CEO.
  */
 const STRANDED_RECOVERY =
-  "a person establishes whether the repository at the target is this run's, by comparing its GitHub node id with the attempt ledger named in the evidence; nothing is created, adopted or deleted automatically, the reservation is kept and never reused, so the run is cancelled and the project is bootstrapped again under a new project id and repository identity";
+  "the CEO is notified (CRITICAL_SYSTEM_FAILURE); whether the repository at the target is this run's is read by comparing its GitHub node id with the attempt ledger named in the evidence; nothing is created, adopted, deleted or released automatically, and the reservation is kept and never reused; the supported recovery is a new bootstrap under a new project id and repository identity (run_create, run_dispatch), while this run stays at CEO review: no cancel edge leaves it and its reserved application refuses FINAL_REVISE, so an exit for it is a pending transition";
 
 /** One precondition as a repair receipt keeps it. */
 export interface CheckoutRecoveryPrecondition {

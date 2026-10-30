@@ -1,5 +1,13 @@
 import { execFileSync } from "node:child_process";
 
+import {
+  IncidentClass,
+  type NoticePorts,
+  NotificationKind,
+  deferIncidentNotice,
+  deliverIncident,
+  enqueueAdHocNotice,
+} from "./ceo-incident-notices.ts";
 import { deriveHumanGate } from "./human-gate.ts";
 import { admitOwnerDecisionReason } from "./owner-decision-reason.ts";
 import {
@@ -168,17 +176,8 @@ export interface SourceReadLeasePort {
   ): Decision<void>;
 }
 
-/** PRD §19.3 — the only three automatic Hermes notifications. */
-export const NotificationKind = {
-  READY_FOR_CEO_REVIEW: "READY_FOR_CEO_REVIEW",
-  TRUE_ESCALATION: "TRUE_ESCALATION",
-  CRITICAL_SYSTEM_FAILURE: "CRITICAL_SYSTEM_FAILURE",
-} as const;
-export type NotificationKind = (typeof NotificationKind)[keyof typeof NotificationKind];
-
-/** The outbox idempotency key of a CEO notification: its kind, its run and the digest of what identifies it. */
-export const notificationKey = (kind: NotificationKind, runId: string, identity: Record<string, unknown>): string =>
-  `notify:${kind}:${runId}:${digestOf(identity)}`;
+/** PRD §19.3 — the only three automatic Hermes notifications, owned with their delivery by `ceo-incident-notices.ts`. */
+export { NotificationKind };
 
 /**
  * The operation an owner-decision receipt must name. The ingress router mints receipts per
@@ -1872,15 +1871,38 @@ export class ProductionGate {
       });
       const escalationId = recorded.allowed ? recorded.value : null;
 
-      const notified = this.notify(NotificationKind.TRUE_ESCALATION, escalation.runId, {
+      const notice = {
         ...(escalationId === null ? {} : { escalationId }),
         question: escalation.question,
         options: escalation.options,
         recommendation: escalation.ctoRecommendation,
         whyItMatters: escalation.whyItMatters,
         blocksCriticalPath: escalation.blocksCriticalPath,
-      });
-      if (!notified.allowed) return notified as Decision<{ state: RunState; escalationId: number | null }>;
+      };
+      if (!this.bindings.active(roleKeyFor(Role.CEO))) {
+        return deny(ReasonCode.GATE_AUTHORITY_DENIED, "no CEO binding can receive notification", {
+          runId: escalation.runId,
+          notification: NotificationKind.TRUE_ESCALATION,
+        });
+      }
+      if (escalationId === null) {
+        // No escalation record to deliver it from later: a notice the outbox refuses refuses the opening.
+        const notified = this.notify(NotificationKind.TRUE_ESCALATION, escalation.runId, notice);
+        if (!notified.allowed) return notified as Decision<{ state: RunState; escalationId: number | null }>;
+      } else {
+        // #1189 round 2, item 2 — a bound CEO whose session would not take the notice keeps the escalation
+        // open with its notice deferred; the daemon's next pass delivers it, once.
+        const incident = {
+          cls: IncidentClass.CTO_ESCALATION,
+          subject: escalation.runId,
+          runId: escalation.runId,
+          episode: String(escalationId),
+          openedEventId: escalationId,
+          payload: notice,
+        };
+        const delivered = deliverIncident(this.#notices, incident);
+        if (!delivered.allowed) deferIncidentNotice(this.#notices, incident, delivered);
+      }
 
       if (!escalation.blocksCriticalPath) return allow(ReasonCode.OK, { state: run.state, escalationId });
 
@@ -2093,81 +2115,16 @@ export class ProductionGate {
   }
 
   /**
-   * #1189, CEO ruling 5 — one notification per durable fact. Its idempotency key is the digest of
-   * `identity` rather than of the payload, and it is sent only while no notification with that key
-   * exists in the outbox, in any status: an ACK neither ends nor renews it, and a payload whose facts
-   * moved since does not make a second one. Call it outside a transaction. A notification the outbox
-   * would not take (no CEO holds the role, or its session is not ready) rolls back with its audit row,
-   * so the next pass asks again instead of leaving a record of a notice nobody holds.
+   * §19.3 — routine worker, test and review churn never reaches Hermes. Only the three documented
+   * notification kinds are emitted, and only through `ceo-incident-notices.ts`. A notification no incident
+   * states is keyed by its payload; a refused enqueue is returned, never dropped.
    */
-  notifyOnce(
-    kind: NotificationKind,
-    runId: string,
-    identity: Record<string, unknown>,
-    payload: Record<string, unknown>,
-  ): Decision<{ messageId: string; created: boolean }> {
-    const key = notificationKey(kind, runId, identity);
-    const existing = this.outbox.byIdempotencyKey(key);
-    if (existing) return allow(ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED, { messageId: existing.messageId, created: false });
-    return this.db.txDecision(() => {
-      const notified = this.notify(kind, runId, payload, { identity });
-      if (!notified.allowed) return notified as Decision<{ messageId: string; created: boolean }>;
-      const queued = this.outbox.byIdempotencyKey(key);
-      if (!queued) {
-        return deny(ReasonCode.OUTBOX_TARGET_NOT_CURRENT, "no ready CEO session took the notification", {
-          runId,
-          notification: kind,
-        });
-      }
-      return allow(ReasonCode.OK, { messageId: queued.messageId, created: true });
-    });
+  notify(kind: NotificationKind, runId: string, payload: Record<string, unknown>): Decision<void> {
+    return enqueueAdHocNotice(this.#notices, kind, runId, payload);
   }
 
-  /**
-   * §19.3 — routine worker, test and review churn never reaches Hermes. Only the three
-   * documented notification kinds are emitted, and this is the only emitter.
-   */
-  notify(
-    kind: NotificationKind,
-    runId: string,
-    payload: Record<string, unknown>,
-    options: { identity?: Record<string, unknown> } = {},
-  ): Decision<void> {
-    // Audit evidence is intentionally a reviewed, bounded vocabulary. The delivery needs
-    // the full explanation, but persisting its unreviewed field name causes AuditLog to
-    // replace the whole evidence payload and makes the notification impossible to trace.
-    const { whyItMatters: _whyItMatters, ...auditPayload } = payload;
-    const auditEvidence = { notification: kind, ...auditPayload };
-    const ceo = this.bindings.active(roleKeyFor(Role.CEO));
-    if (!ceo) {
-      this.audit.record({
-        kind: "CEO_NOTIFICATION_BLOCKED",
-        runId,
-        reasonCode: ReasonCode.GATE_AUTHORITY_DENIED,
-        roleKey: "CEO",
-        evidence: auditEvidence,
-      });
-      return deny(ReasonCode.GATE_AUTHORITY_DENIED, "no CEO binding can receive notification", {
-        runId,
-        notification: kind,
-      });
-    }
-    this.audit.record({
-      kind: "CEO_NOTIFICATION",
-      runId,
-      roleKey: ceo.roleKey,
-      evidence: auditEvidence,
-    });
-    this.outbox.enqueue({
-      idempotencyKey: notificationKey(kind, runId, options.identity ?? payload),
-      roleKey: ceo.roleKey,
-      bindingGeneration: ceo.bindingGeneration,
-      targetSessionId: ceo.sessionId,
-      runId,
-      kind: MessageKind.CEO_NOTIFICATION,
-      payload: { notification: kind, runId, ...payload },
-    });
-    return allow(ReasonCode.OK, undefined);
+  get #notices(): NoticePorts {
+    return { db: this.db, audit: this.audit, outbox: this.outbox, bindings: this.bindings };
   }
 
   packet(runId: string, candidateSnapshotDigest: string): ProductionReadyPacket | null {

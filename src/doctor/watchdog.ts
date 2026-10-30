@@ -65,6 +65,10 @@ const RUN_PROGRESS_SQL = `SELECT MAX(at) AS at FROM (
     UNION ALL SELECT started_at FROM candidate_pipeline_attempts WHERE run_id = ?
   )`;
 
+/** The instant of the run's latest progress, as `RUN_PROGRESS_SQL` defines it, or null for a run with none. */
+export const runProgressAt = (db: Pick<Db, "get">, runId: string): string | null =>
+  db.get<{ at: string | null }>(RUN_PROGRESS_SQL, [runId, runId, runId, runId, runId])?.at ?? null;
+
 export interface WatchdogTick {
   overdue: Array<{ kind: string; id: string; ageMs: number }>;
   stalls: WatchdogStall[];
@@ -207,11 +211,8 @@ export class Watchdog {
       `SELECT run_id, dispatched_at FROM runs WHERE state = 'ACTIVE'`,
     )) {
       if (!run.dispatched_at) continue;
-      const lastEvent = this.db.get<{ at: string | null }>(
-        RUN_PROGRESS_SQL,
-        [run.run_id, run.run_id, run.run_id, run.run_id, run.run_id],
-      );
-      const since = new Date(lastEvent?.at ?? run.dispatched_at).getTime();
+      const lastEvent = { at: runProgressAt(this.db, run.run_id) };
+      const since = new Date(lastEvent.at ?? run.dispatched_at).getTime();
       const ageMs = now - since;
       if (ageMs > this.deadlines.runProgressMs) {
         addOverdue(
@@ -222,7 +223,7 @@ export class Watchdog {
           run.run_id,
           ageMs,
           this.deadlines.runProgressMs,
-          { runId: run.run_id, since: lastEvent?.at ?? run.dispatched_at },
+          { runId: run.run_id, since: lastEvent.at ?? run.dispatched_at },
         );
       }
     }

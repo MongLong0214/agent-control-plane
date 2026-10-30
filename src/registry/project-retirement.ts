@@ -14,7 +14,7 @@ export async function retireProject(cp:ControlPlane,projectId:string,reason:stri
   if (!cp.db.get(`SELECT 1 FROM project_retirements WHERE project_id = ?`,[projectId])) cp.db.run(`INSERT INTO project_retirements(project_id,requested_at,reason) VALUES (?,?,?)`,[projectId,cp.clock.nowIso(),reason]);
   const work = cp.db.all<{run_id:string;state:string}>(`SELECT run_id,state FROM runs WHERE (project_id = ? OR run_id IN (SELECT run_id FROM bootstrap_applications WHERE project_id = ?)) AND state NOT IN ('COMPLETED','CANCELLED','FAILED') ORDER BY created_at,run_id`,[projectId,projectId]);
   // Confirmed/merged effects must settle through their own finalizer; cancellation never erases them.
-  const settling = work.filter(r => ['CEO_APPROVED','FINALIZING','MERGING','POST_MERGE_VERIFYING','BLOCKED_POST_MERGE'].includes(r.state));
+  const settling = work.filter(r => ['CEO_APPROVED','MERGING','POST_MERGE_VERIFYING','BLOCKED_POST_MERGE'].includes(r.state));
   if (settling.length > 0) return retirementWaitsForSettlement(cp,projectId,settling);
   for (const run of work) {const cancelled = cp.runs.cancel(run.run_id,`project retirement: ${reason}`);if (!cancelled.allowed) return cancelled;}
   const workers = await cp.workerRetirement.reconcile();

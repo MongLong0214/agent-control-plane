@@ -11,7 +11,8 @@ import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
-import { NotificationKind, type ProductionGate } from "./production-gate.ts";
+import { type Incident, IncidentClass, NotificationKind, deliverIncident, runEpisode } from "./ceo-incident-notices.ts";
+import type { ProductionGate } from "./production-gate.ts";
 
 /**
  * #1189 B4, B6, B7, B10 (CEO ruling 4) — the waits whose next move belongs to an agent, not the owner:
@@ -41,8 +42,9 @@ export type AgentWaitKind = (typeof AgentWaitKind)[keyof typeof AgentWaitKind];
  * - CEO_ESCALATION: a CRITICAL_SYSTEM_FAILURE notice to the CEO naming the owner, the recovery action and
  *   the blocker.
  *
- * After the last step the wait stays as it is. No step moves the run: a deadline is never a FAILED, and a
- * terminal outcome stays with the existing explicit paths (run_cancel, a CEO decision).
+ * After the last step the wait stays as it is, and its CRITICAL_SYSTEM_FAILURE reaches a CEO that replaced
+ * the one it went to, once (`ceo-incident-notices.ts`). No step moves the run: a deadline is never a FAILED,
+ * and a terminal outcome stays with the existing explicit paths (run_cancel, a CEO decision).
  */
 export const AgentWaitStep = {
   RENOTIFY: "RENOTIFY",
@@ -178,9 +180,48 @@ const WATCHDOG_STALL_ROUTES: Readonly<Record<string, { recoveryAction: string; e
   },
 };
 
-/** The one notice an ownerless stall is owed: its source, kind, resource and episode name it. */
-const ownerlessStallKey = (stall: Pick<OwnerlessStall, "source" | "kind" | "id" | "episode">): string =>
-  `ownerless-stall:${stall.source}:${digestOf({ kind: stall.kind, id: stall.id, episode: stall.episode })}`;
+/**
+ * The incident an ownerless stall is, in `ceo-incident-notices.ts`'s one correlation per (subject, class):
+ * a stall of a run is that run's RUN_STALLED incident in its current progress episode (F3-1), so two
+ * watchdog findings, or a watchdog finding and another detector, on one unchanged run are one notice;
+ * messages stalled to a role are that role's DELIVERY_STALLED; anything else is its own RESOURCE_STALLED.
+ */
+const stallIncident = (db: Db, stall: OwnerlessStall): Incident => {
+  const checkBeforeRerun = stall.effects === "MAY_HAVE_RUN" || stall.effects === "UNKNOWN";
+  const placed = stall.kind === "outbox"
+    ? { cls: IncidentClass.DELIVERY_STALLED, subject: stall.owner.role ?? "unknown", episode: stall.episode }
+    : stall.runId !== null
+      ? { cls: IncidentClass.RUN_STALLED, subject: stall.runId, episode: runEpisode(db, stall.runId) }
+      : { cls: IncidentClass.RESOURCE_STALLED, subject: `${stall.kind}:${stall.id}`, episode: stall.episode };
+  return {
+    ...placed,
+    runId: stall.runId,
+    payload: {
+      stall: stall.kind,
+      source: stall.source,
+      resource: stall.id,
+      since: stall.since,
+      owner: stall.owner,
+      recoveryAction: stall.recoveryAction,
+      blocker: stall.blocker,
+      effects: stall.effects,
+      checkBeforeRerun,
+      deliveryTimeout: stall.deliveryTimeout,
+      productFailure: false,
+    },
+    record: {
+      source: stall.source,
+      kind: stall.kind,
+      target: stall.id,
+      since: stall.since,
+      owner: stall.owner,
+      action: stall.recoveryAction,
+      detail: stall.blocker,
+      effects: stall.effects,
+      deliveryTimeout: stall.deliveryTimeout,
+    },
+  };
+};
 
 /** One component for the agent-owned waits' deadlines, the review re-delivery and the ownerless stall routing. */
 export class AgentOwnedWaits {
@@ -212,7 +253,13 @@ export class AgentOwnedWaits {
     for (const wait of this.waits()) {
       const markers = this.#markers(wait);
       const step = LADDER[markers.length];
-      if (step === undefined) continue;
+      if (step === undefined) {
+        // #1189 round 2, item 1 — after its last step the wait's CRITICAL_SYSTEM_FAILURE is still its open
+        // incident. Stated again on every pass while the wait lasts, it reaches a CEO generation that has not
+        // had it, once; the CEO that already has it, ACKed or not, is not told again.
+        this.#restateEscalation(wait, markers.at(-1)?.evidence ?? {});
+        continue;
+      }
       const deadlineMs = this.#deadlineOf(wait.kind);
       const from = markers.at(-1)?.at ?? wait.since;
       if (now - Date.parse(from) < deadlineMs) continue;
@@ -282,61 +329,16 @@ export class AgentOwnedWaits {
   }
 
   /**
-   * B12, C2 — routes one ownerless stall to the CEO as CRITICAL_SYSTEM_FAILURE, once per episode. With no
-   * CEO bound (or its session not READY) nothing is written and the next pass asks again.
+   * B12, C2 — routes one ownerless stall to the CEO as CRITICAL_SYSTEM_FAILURE through
+   * `ceo-incident-notices.ts`: once per incident episode and CEO generation, with its delivery record
+   * (OWNERLESS_STALL_ROUTED). With no CEO bound (or its session not READY) nothing is written and the next
+   * pass asks again. `routed` is whether this call delivered a notice; `messageId` is the notice that covers
+   * the stall, delivered now or before.
    */
-  routeOwnerlessStall(stall: OwnerlessStall): Decision<{ messageId: string; routed: boolean }> {
-    const idempotencyKey = ownerlessStallKey(stall);
-    const existing = this.ports.outbox.byIdempotencyKey(idempotencyKey);
-    if (existing) return allow(ReasonCode.OK, { messageId: existing.messageId, routed: false });
-    return this.ports.db.txDecision(() => {
-      const ceo = this.#ceo();
-      if (!ceo) return deny(ReasonCode.GATE_AUTHORITY_DENIED, "no CEO binding can receive the stall notice", { kind: stall.kind, id: stall.id });
-      const checkBeforeRerun = stall.effects === "MAY_HAVE_RUN" || stall.effects === "UNKNOWN";
-      const enqueued = this.ports.outbox.enqueue({
-        idempotencyKey,
-        roleKey: ceo.roleKey,
-        bindingGeneration: ceo.bindingGeneration,
-        targetSessionId: ceo.sessionId,
-        runId: stall.runId,
-        kind: MessageKind.CEO_NOTIFICATION,
-        payload: {
-          notification: NotificationKind.CRITICAL_SYSTEM_FAILURE,
-          runId: stall.runId,
-          stall: stall.kind,
-          source: stall.source,
-          resource: stall.id,
-          since: stall.since,
-          owner: stall.owner,
-          recoveryAction: stall.recoveryAction,
-          blocker: stall.blocker,
-          effects: stall.effects,
-          checkBeforeRerun,
-          deliveryTimeout: stall.deliveryTimeout,
-          productFailure: false,
-        },
-      });
-      if (!enqueued.allowed) return enqueued as unknown as Decision<{ messageId: string; routed: boolean }>;
-      this.ports.audit.record({
-        kind: OWNERLESS_STALL_ROUTED,
-        runId: stall.runId,
-        sessionId: ceo.sessionId,
-        evidence: {
-          notification: NotificationKind.CRITICAL_SYSTEM_FAILURE,
-          source: stall.source,
-          kind: stall.kind,
-          target: stall.id,
-          since: stall.since,
-          owner: stall.owner,
-          action: stall.recoveryAction,
-          detail: stall.blocker,
-          effects: stall.effects,
-          deliveryTimeout: stall.deliveryTimeout,
-          messageId: enqueued.value.messageId,
-        },
-      });
-      return allow(ReasonCode.OK, { messageId: enqueued.value.messageId, routed: true });
-    });
+  routeOwnerlessStall(stall: OwnerlessStall): Decision<{ messageId: string | null; routed: boolean }> {
+    const delivered = deliverIncident(this.ports, stallIncident(this.ports.db, stall));
+    if (!delivered.allowed) return delivered as unknown as Decision<{ messageId: string | null; routed: boolean }>;
+    return allow(delivered.reasonCode, { messageId: delivered.value.messageId, routed: delivered.value.created });
   }
 
   /**
@@ -350,9 +352,9 @@ export class AgentOwnedWaits {
     const routed: Array<{ kind: string; id: string; messageId: string | null; reasonCode: string }> = [];
     const oldestByRole = new Map<string, { stall: WatchdogStall; count: number }>();
     const asked = new Set<string>();
-    const routeOne = (stall: WatchdogStall, blocker: string): void => {
+    const routeOne = (stall: WatchdogStall, blocker: string, owed = false): void => {
       const route = WATCHDOG_STALL_ROUTES[stall.kind];
-      const key = ownerlessStallKey({ source: "WATCHDOG", kind: stall.kind, id: stall.id, episode: stall.since });
+      const key = `${stall.kind}:${stall.id}:${stall.since}`;
       if (!route || asked.has(key)) return;
       asked.add(key);
       const decision = this.routeOwnerlessStall({
@@ -368,6 +370,15 @@ export class AgentOwnedWaits {
         effects: route.effects,
         deliveryTimeout: stall.kind === "outbox",
       });
+      // An owed stall its run's notice already covers (this episode, this CEO), or whose incident a CEO decision
+      // resolved, is answered here so the owed record is not asked again: nothing more is owed for it.
+      if (owed && decision.allowed && !decision.value.routed) {
+        this.ports.audit.record({
+          kind: OWNERLESS_STALL_ROUTED,
+          runId: stall.runId,
+          evidence: { source: "WATCHDOG", kind: stall.kind, target: stall.id, since: stall.since, messageId: decision.value.messageId, covered: true },
+        });
+      }
       routed.push({
         kind: stall.kind,
         id: stall.id,
@@ -390,13 +401,12 @@ export class AgentOwnedWaits {
       routeOne(stall, `${count} ${WATCHDOG_STALL_ROUTES["outbox"]!.what} to ${role}; the oldest is ${stall.id}, since ${stall.since}`);
     }
     for (const owed of this.#owedStalls()) {
-      if (this.ports.outbox.byIdempotencyKey(ownerlessStallKey({ source: "WATCHDOG", kind: owed.kind, id: owed.id, episode: owed.since }))) continue;
-      routeOne(owed, `${WATCHDOG_STALL_ROUTES[owed.kind]?.what ?? owed.kind}: ${owed.kind} ${owed.id}, since ${owed.since}`);
+      routeOne(owed, `${WATCHDOG_STALL_ROUTES[owed.kind]?.what ?? owed.kind}: ${owed.kind} ${owed.id}, since ${owed.since}`, true);
     }
     return routed;
   }
 
-  /** The owed stalls no routed record answers yet (a routed one is also checked by its notice's key). */
+  /** The owed stalls no routed record answers yet. */
   #owedStalls(): WatchdogStall[] {
     return this.ports.db.all<{ run_id: string | null; evidence_json: string }>(
       `SELECT owed.run_id, owed.evidence_json FROM audit_events owed
@@ -579,8 +589,19 @@ export class AgentOwnedWaits {
       let messageId: string | null = null;
       let holder: { generation: number; sessionId: string } | null = null;
       let reassigned: boolean | null = null;
+      let incidentEpisode: string | null = null;
       const recovery = step === AgentWaitStep.REASSIGN && wait.kind === AgentWaitKind.CONTINUITY_HOLD;
-      if (!recovery) {
+      if (step === AgentWaitStep.CEO_ESCALATION) {
+        // The wait's CRITICAL_SYSTEM_FAILURE is its run's RUN_STALLED incident: one notice per unchanged run,
+        // whichever detector told the CEO first, delivered and deduplicated in `ceo-incident-notices.ts`.
+        const ceo = this.#ceo();
+        if (!ceo) return deny(ReasonCode.GATE_AUTHORITY_DENIED, "no CEO binding can receive the wait's notice", { runId: wait.runId });
+        incidentEpisode = runEpisode(this.ports.db, wait.runId);
+        const delivered = deliverIncident(this.ports, this.#waitIncident(run, wait, deadlineMs, incidentEpisode));
+        if (!delivered.allowed) return delivered as unknown as Decision<string | null>;
+        messageId = delivered.value.messageId;
+        holder = { generation: ceo.bindingGeneration, sessionId: ceo.sessionId };
+      } else if (!recovery) {
         const ceo = this.#ceo();
         if (!ceo) return deny(ReasonCode.GATE_AUTHORITY_DENIED, "no CEO binding can receive the wait's notice", { runId: wait.runId });
         const enqueued = this.ports.outbox.enqueue({
@@ -617,10 +638,33 @@ export class AgentOwnedWaits {
           ...(holder ? { generation: holder.generation, sessionId: holder.sessionId } : {}),
           ...(reassigned === null ? {} : { reassigned }),
           ...(recovery ? { released: false } : {}),
+          ...(incidentEpisode === null ? {} : { incidentEpisode }),
         },
       });
       return allow(ReasonCode.OK, messageId);
     });
+  }
+
+  /** The wait's CRITICAL_SYSTEM_FAILURE, stated again in the episode its CEO_ESCALATION step opened it in. */
+  #restateEscalation(wait: AgentWait, escalated: Record<string, unknown>): void {
+    const [episode, deadlineMs] = [escalated["incidentEpisode"], escalated["deadlineMs"]];
+    const run = this.ports.runs.get(wait.runId);
+    if (!run || typeof episode !== "string" || typeof deadlineMs !== "number") return;
+    deliverIncident(this.ports, this.#waitIncident(run, wait, deadlineMs, episode));
+  }
+
+  /** The wait's CEO_ESCALATION notice as its run's RUN_STALLED incident. */
+  #waitIncident(run: RunRow, wait: AgentWait, deadlineMs: number, episode: string): Incident {
+    const step = AgentWaitStep.CEO_ESCALATION;
+    const { notification: _notification, runId: _runId, ...notice } = this.#noticeOf(run, wait, step, deadlineMs);
+    return {
+      cls: IncidentClass.RUN_STALLED,
+      subject: wait.runId,
+      runId: wait.runId,
+      episode,
+      payload: notice,
+      record: { waitKind: wait.kind, step, owner: wait.owner, action: wait.recoveryAction, detail: wait.blocker, productFailure: false },
+    };
   }
 
   #noticeOf(run: RunRow, wait: AgentWait, step: AgentWaitStep, deadlineMs: number): Record<string, unknown> {

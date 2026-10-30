@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { ControlPlane } from "../app/control-plane.ts";
+import { retryDeferredNotices } from "../ceo/ceo-incident-notices.ts";
 import { routeOwnerlessStalls, routePostMergeStall } from "../ceo/ownerless-stalls.ts";
 import { outboxDeliveryReadback } from "../outbox/outbox.ts";
 import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../capacity/capacity-monitor.ts";
@@ -1493,8 +1494,9 @@ export class Daemon {
       report.resumedFinalizations = await this.resumeApprovedRuns();
       await this.resumeResidentProjects();
       // #1189 — a stranded bootstrap application or a CONTRACT_CHANGE run that cannot finish is routed to
-      // the CEO once each; the watchdog repeats the pass, and a stall already routed sends nothing more.
-      await this.runPeriodic("ownerless_stall_routing", async () => { routeOwnerlessStalls(this.cp); });
+      // the CEO once each, and a notice the outbox refused while its fact was kept is delivered; the watchdog
+      // repeats the pass, and an incident already told to the current CEO sends nothing more.
+      await this.runPeriodic("ownerless_stall_routing", async () => { this.routeCeoIncidents(); });
       // Issue #246 — a bootstrap run that ended while no daemon was running left its BOOTSTRAP_CTO
       // bound or its session running; the watchdog repeats this, through the same backoff.
       await this.runPeriodic("bootstrap_cto_reclaim", () => this.reclaimBootstrapCtos());
@@ -2208,6 +2210,12 @@ export class Daemon {
         evidence: { reason, generation: current.bindingGeneration },
       });
     }
+  }
+
+  /** #1189 — the ownerless stalls this daemon detects, and the CEO notices deferred while their facts were kept. */
+  private routeCeoIncidents(): void {
+    routeOwnerlessStalls(this.cp);
+    retryDeferredNotices(this.cp);
   }
 
   /** Recover CEO-approved work after the durable lease and GitHub receipt reconciliations. */
@@ -3065,7 +3073,7 @@ export class Daemon {
         await this.cp.workerRetirement.reconcile();
       });
       void this.runPeriodic("cto_canonical_switchover_settle", () => this.settleCanonicalSwitchovers());
-      void this.runPeriodic("ownerless_stall_routing", async () => { routeOwnerlessStalls(this.cp); });
+      void this.runPeriodic("ownerless_stall_routing", async () => { this.routeCeoIncidents(); });
     }, watchdogMs);
     watchdog.unref();
     this.#timers.push(watchdog);

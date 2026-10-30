@@ -105,9 +105,9 @@ const DOOR_R1_TEST = "tests/unit/ceo-escalation-resolve-door-r1.test.ts";
 
 const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string; witnesses?: RollbackWitness[] }> = [
   {
-    label: "AgentOwnedWaits.routeOwnerlessStall",
-    file: "ceo/agent-owned-waits.ts",
-    anchor: "    if (existing) return allow(ReasonCode.OK, { messageId: existing.messageId, routed: false });\n    return this.ports.db.txDecision(() => {",
+    label: "deliverIncident",
+    file: "ceo/ceo-incident-notices.ts",
+    anchor: "export const deliverIncident = (ports: NoticePorts, incident: Incident): Decision<NoticeDelivery> =>\n  ports.db.txDecision(() => {",
   },
   {
     label: "acknowledgeCeoNotification",

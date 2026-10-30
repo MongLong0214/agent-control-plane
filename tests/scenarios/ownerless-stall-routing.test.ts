@@ -6,7 +6,8 @@ import { sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { ApprovedRunFinalizer } from "../../src/daemon/finalizer.ts";
-import { Role, RunKind, RunState, roleKeyFor } from "../../src/domain/types.ts";
+import { Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { routeOwnerlessStalls } from "../../src/ceo/ownerless-stalls.ts";
 import { retireProject } from "../../src/registry/project-retirement.ts";
 import { bootstrapPlan, cleanTreeManifest, reviewBootstrapPlan } from "../helpers/bootstrap-plan.ts";
 import { dispatchRun, normalized } from "../helpers/contract-change.ts";
@@ -66,10 +67,12 @@ const criticalNotices = (h: Harness, runId: string): Notice[] =>
     }))
     .filter((notice) => notice.payload["notification"] === CRITICAL);
 
+/** The delivery records of this run's CRITICAL_SYSTEM_FAILURE notices (a stall's is OWNERLESS_STALL_ROUTED). */
 const criticalAudits = (h: Harness, runId: string) =>
   h.cp.audit
     .forRun(runId)
-    .filter((entry) => entry.kind.startsWith("CEO_NOTIFICATION") && entry.evidence["notification"] === CRITICAL);
+    .filter((entry) => (entry.kind === "OWNERLESS_STALL_ROUTED" || entry.kind.startsWith("CEO_NOTIFICATION")) &&
+      entry.evidence["notification"] === CRITICAL);
 
 /** Waits for `count` more watchdog passes; a new pass starts only once the previous one has finished. */
 const ticker = (h: Harness) => {
@@ -220,7 +223,7 @@ describe("a merge whose post-merge verification failed reaches the CEO", () => {
       expect(notice.payload["detail"]).toEqual(expect.stringContaining("the merge commits stay merged"));
       // The owner, the recovery action and the blocker are recorded, not only sent.
       expect(criticalAudits(harness, driven.runId)).toEqual([expect.objectContaining({
-        kind: "CEO_NOTIFICATION",
+        kind: "OWNERLESS_STALL_ROUTED",
         evidence: expect.objectContaining({
           stall: "BLOCKED_POST_MERGE",
           owner: "CEO",
@@ -316,7 +319,8 @@ describe("an owner retirement held by a terminal BLOCKED_POST_MERGE run", () => 
         expect(held()).toHaveLength(1);
       }
       expect(held()[0]!.payload).toMatchObject({ owner: "CEO", projectId: driven.projectId, state: RunState.BLOCKED_POST_MERGE });
-      expect(held()[0]!.payload["action"]).toEqual(expect.stringContaining("settled for retirement"));
+      expect(held()[0]!.payload["action"]).toEqual(expect.stringContaining("none within existing authority"));
+      expect(held()[0]!.payload["needsTransition"]).toEqual(expect.stringMatching(/settled for retirement \(pending\)$/));
       expect(mergedFacts(harness, driven.runId)).toEqual(facts);
       expect(github.mergeCount).toBe(1);
       expect(harness.cp.projects.get(driven.projectId)?.retiredAt ?? null).toBeNull();
@@ -452,5 +456,261 @@ describe("a CONTRACT_CHANGE run the activation path cannot finish reaches the CE
     expect(notices[0]!.payload["action"]).toEqual(expect.stringContaining("run_cancel"));
     expect(notices[0]!.payload["action"]).toEqual(expect.stringContaining("its CTO submit a PLAN carrying the manifest"));
     expect(h.cp.runs.require(run.runId).state).toBe(RunState.ACTIVE);
+  });
+});
+
+/** The CEO role recovered onto a new runtime: the old binding revoked, a new session bound. */
+const replaceCeo = (h: Harness): string => {
+  expect(h.cp.bindings.revoke(roleKeyFor(Role.CEO), "CEO runtime lost").allowed).toBe(true);
+  return bindCeo(h);
+};
+
+/** A CONTRACT_CHANGE run whose latest PLAN carries no manifest, in a project registered on first use: a stall nothing moves. */
+const manifestlessContractChange = async (h: Harness, projectId: string) => {
+  if (!h.cp.projects.get(projectId)) await registerFixtureProject(h, projectId);
+  const run = await dispatchRun(h, projectId, RunKind.CONTRACT_CHANGE);
+  h.cp.artifacts.put(run.runId, "PLAN", { tasks: [] });
+  return run;
+};
+
+describe("round 2, item 1 — an ACK is not a resolution: an unresolved incident reaches a replacement CEO once", () => {
+  it("a CEO replacement with the post-merge block unresolved: exactly one re-delivery, to the new CEO, under the same correlation; more passes and a restart add none", async () => {
+    const { github, harness, driven } = await confirmedRun();
+    const ticks = ticker(harness);
+    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-incident-redelivery-"), watchdogIntervalMs: 25 });
+    let facts: ReturnType<typeof mergedFacts>;
+    let first: Notice;
+    let second: Notice;
+    try {
+      expect((await daemon.start()).allowed).toBe(true);
+      facts = mergedFacts(harness, driven.runId);
+      expect(facts.run.state).toBe(RunState.BLOCKED_POST_MERGE);
+      [first] = criticalNotices(harness, driven.runId) as [Notice];
+      expect(first.payload).toMatchObject({ stall: "BLOCKED_POST_MERGE" });
+      const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+      expect(harness.cp.outbox.acknowledge(first.messageId, ceo.sessionId, ceo.bindingGeneration).allowed).toBe(true);
+      await ticks(2);
+      // The CEO that ACKed it is not told again.
+      expect(criticalNotices(harness, driven.runId)).toEqual([{ ...first, status: "ACKED" }]);
+
+      const replacement = replaceCeo(harness);
+      await ticks(3);
+      const notices = criticalNotices(harness, driven.runId);
+      expect(notices).toHaveLength(2);
+      // Rows written at one clock instant come back in either order: the re-delivery is the other one.
+      second = notices.find((notice) => notice.messageId !== first.messageId)!;
+      expect(second).toMatchObject({ targetSessionId: replacement, status: "PENDING" });
+      expect(first.payload).toMatchObject({ correlation: `ceo-incident:RUN_STALLED:${driven.runId}` });
+      expect(second.payload).toMatchObject({
+        redelivery: true,
+        correlation: first.payload["correlation"],
+        episode: first.payload["episode"],
+        stall: "BLOCKED_POST_MERGE",
+        repositories: first.payload["repositories"],
+        failedChecks: first.payload["failedChecks"],
+      });
+      await ticks(3);
+      expect(criticalNotices(harness, driven.runId)).toHaveLength(2);
+      expect(criticalNotices(harness, driven.runId)).toEqual(expect.arrayContaining([{ ...first, status: "ACKED" }, second]));
+      expect(mergedFacts(harness, driven.runId)).toEqual(facts);
+    } finally {
+      await daemon.stop();
+    }
+    const restarted = new Daemon(harness.cp, { stateDir: tempDir("acp-incident-redelivery-restart-") });
+    try {
+      expect((await restarted.start()).allowed).toBe(true);
+      expect(criticalNotices(harness, driven.runId)).toHaveLength(2);
+      expect(criticalNotices(harness, driven.runId)).toEqual(expect.arrayContaining([{ ...first, status: "ACKED" }, second]));
+      expect(mergedFacts(harness, driven.runId)).toEqual(facts);
+      expect(github.mergeCount).toBe(1);
+    } finally {
+      await restarted.stop();
+    }
+  });
+
+  it("a resolved incident is never delivered again: the run that left its stall gets nothing after the CEO is replaced, the one still stalled gets one", async () => {
+    const h = makeHarness();
+    const open = await manifestlessContractChange(h, "cc-two-runs");
+    const closed = await manifestlessContractChange(h, "cc-two-runs");
+    routeOwnerlessStalls(h.cp);
+    const ceo = h.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    for (const runId of [open.runId, closed.runId]) {
+      const [notice] = criticalNotices(h, runId);
+      expect(h.cp.outbox.acknowledge(notice!.messageId, ceo.sessionId, ceo.bindingGeneration).allowed).toBe(true);
+    }
+    // The CEO cancels one of them: that run left its stall.
+    expect(h.cp.runs.cancel(closed.runId, "replaced by a CONTRACT_CHANGE carrying its manifest").allowed).toBe(true);
+
+    const replacement = replaceCeo(h);
+    routeOwnerlessStalls(h.cp);
+    routeOwnerlessStalls(h.cp);
+    expect(criticalNotices(h, closed.runId).map((notice) => notice.status)).toEqual(["ACKED"]);
+    expect(criticalNotices(h, open.runId)).toHaveLength(2);
+    expect(criticalNotices(h, open.runId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: "ACKED" }),
+      expect.objectContaining({ targetSessionId: replacement, payload: expect.objectContaining({ redelivery: true }) }),
+    ]));
+    // What the CEO has of each: an ACK is a receipt, the open one is ENQUEUED to the new CEO.
+    const { noticeStatus, IncidentClass, runEpisode } = await import("../../src/ceo/ceo-incident-notices.ts");
+    const incident = (runId: string) => ({ cls: IncidentClass.RUN_STALLED, subject: runId, runId, episode: runEpisode(h.cp.db, runId), payload: {} });
+    expect(noticeStatus(h.cp, incident(open.runId)).state).toBe("ENQUEUED");
+    expect(noticeStatus(h.cp, incident(closed.runId)).state).toBe("ACKED");
+  });
+
+  it("a CTO escalation the CEO decided before its deferred notice went out is never delivered; the undecided one is, once", async () => {
+    const h = makeHarness();
+    const { projectId } = await registerFixtureProject(h, "escalations");
+    const decided = await dispatchRun(h, projectId, RunKind.STANDARD_WORK);
+    const undecided = await dispatchRun(h, projectId, RunKind.STANDARD_WORK);
+    // The CEO's session is not ready: the outbox refuses both notices, and both escalations are kept.
+    const ceoSession = h.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId;
+    h.cp.sessions.transition(ceoSession, SessionLifecycle.ERROR, "the CEO's runtime failed");
+    const escalate = (run: { runId: string; ownerSessionId: string }) => h.cp.ceo.openEscalation({
+      runId: run.runId, question: "v1 or v2?", options: ["v1", "v2"], ctoRecommendation: "v2",
+      whyItMatters: "the importer cannot target both", blocksCriticalPath: true,
+      openedBySessionId: run.ownerSessionId, openedAt: h.clock.nowIso(),
+    });
+    const opened = [escalate(decided), escalate(undecided)];
+    for (const result of opened) expect(result).toMatchObject({ allowed: true, value: { state: RunState.BLOCKED } });
+    const escalationNotices = (runId: string) => h.cp.outbox.listByRun(runId).filter((message) =>
+      message.kind === "CEO_NOTIFICATION" && (message.payload as Record<string, unknown>)["notification"] === "TRUE_ESCALATION");
+    expect([...escalationNotices(decided.runId), ...escalationNotices(undecided.runId)]).toEqual([]);
+
+    const replacement = replaceCeo(h);
+    const escalationId = opened[0]!.allowed ? opened[0]!.value.escalationId! : -1;
+    expect(h.cp.ceo.resolveEscalation(decided.runId, "v2", replacement, { escalationId })).toMatchObject({ allowed: true });
+
+    const daemon = new Daemon(h.cp, { stateDir: tempDir("acp-incident-decided-") });
+    try {
+      const started = await daemon.start();
+      expect(started.allowed, JSON.stringify(started)).toBe(true);
+      expect(escalationNotices(decided.runId)).toEqual([]);
+      expect(escalationNotices(undecided.runId)).toEqual([
+        expect.objectContaining({ targetSessionId: replacement, payload: expect.objectContaining({ question: "v1 or v2?" }) }),
+      ]);
+    } finally {
+      await daemon.stop();
+    }
+  });
+});
+
+describe("round 2, item 2 — a CTO escalation's notice the outbox refused is retried later and delivered once", () => {
+  it.each(["refused", "unknown"] as const)("an enqueue %s at opening keeps the escalation open, and a later pass delivers its notice, once", async (outcome) => {
+    const h = makeHarness();
+    const { projectId } = await registerFixtureProject(h, `escalation-${outcome}`);
+    const run = await dispatchRun(h, projectId, RunKind.STANDARD_WORK);
+    if (outcome === "refused") {
+      h.cp.sessions.transition(h.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId, SessionLifecycle.ERROR, "the CEO's runtime failed");
+    } else {
+      vi.spyOn(h.cp.outbox, "enqueue").mockImplementationOnce(() => { throw new Error("disk I/O error"); });
+    }
+    const opened = h.cp.ceo.openEscalation({
+      runId: run.runId, question: "which schema version?", options: ["v1", "v2"], ctoRecommendation: "v2",
+      whyItMatters: "the importer cannot target both", blocksCriticalPath: true,
+      openedBySessionId: run.ownerSessionId, openedAt: h.clock.nowIso(),
+    });
+    expect(opened).toMatchObject({ allowed: true, value: { state: RunState.BLOCKED } });
+    const notices = () => h.cp.outbox.listByRun(run.runId).filter((message) =>
+      message.kind === "CEO_NOTIFICATION" && (message.payload as Record<string, unknown>)["notification"] === "TRUE_ESCALATION");
+    // Not "escalation recorded, notice sent": nothing claims a notice that does not exist.
+    expect(notices()).toEqual([]);
+    expect(h.cp.audit.forRun(run.runId).filter((entry) => entry.kind === "CEO_NOTIFICATION")).toEqual([]);
+    expect(h.cp.audit.forRun(run.runId).filter((entry) => entry.kind === "CEO_NOTIFICATION_DEFERRED")).toHaveLength(1);
+
+    const target = outcome === "refused" ? replaceCeo(h) : h.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId;
+    const ticks = ticker(h);
+    const daemon = new Daemon(h.cp, { stateDir: tempDir(`acp-escalation-${outcome}-`), watchdogIntervalMs: 25 });
+    try {
+      const started = await daemon.start();
+      expect(started.allowed, JSON.stringify(started)).toBe(true);
+      await ticks(3);
+      const escalationId = opened.allowed ? opened.value.escalationId : null;
+      expect(notices()).toEqual([expect.objectContaining({
+        targetSessionId: target,
+        payload: expect.objectContaining({
+          escalationId, question: "which schema version?", whyItMatters: "the importer cannot target both", blocksCriticalPath: true,
+        }),
+      })]);
+      expect(h.cp.runs.require(run.runId).state).toBe(RunState.BLOCKED);
+    } finally {
+      await daemon.stop();
+    }
+  });
+});
+
+describe("H-1 — a grantless CONTRACT_CHANGE that holds its project's finalization names the transition it needs", () => {
+  it("in MERGING its notice recommends nothing that cannot work: it says what it blocks, by which run, and that the exit transition is pending", async () => {
+    const h = makeHarness();
+    const { projectId } = await registerFixtureProject(h, "cc-holding");
+    const holding = await dispatchRun(h, projectId, RunKind.CONTRACT_CHANGE);
+    carryContractChange(h, holding.runId, normalized({ ...holding.base, commitlore: { mode: "required" } } as ProjectManifest));
+    await h.cp.continuity.evaluate("contract change candidate");
+    expect((await h.cp.pipeline.submitResult({
+      runId: holding.runId, ownerSessionId: holding.ownerSessionId, ownerBindingGeneration: holding.ownerBindingGeneration,
+      resultSummary: "the proposed manifest", recommendation: "activate", residualRisk: [],
+    })).allowed).toBe(true);
+    // What a run confirmed before grants existed and caught mid-finalization looks like.
+    const candidate = h.cp.runs.currentCandidate(holding.runId)!;
+    expect(h.cp.runs.transition(holding.runId, RunState.CEO_APPROVED, "confirmed before grants", { candidateSnapshotDigest: candidate }).allowed).toBe(true);
+    expect(h.cp.runs.transition(holding.runId, RunState.MERGING, "finalization began before grants").allowed).toBe(true);
+    const replacement = h.cp.runs.create({
+      projectId, kind: RunKind.CONTRACT_CHANGE, executionMode: "STANDARD",
+      contract: { goal: "replace it", why: "it cannot finish", scope: [], nonGoals: [], acceptance: ["verify"], priority: "NORMAL", humanGate: [], references: [] },
+    });
+    if (!replacement.allowed) throw new Error(replacement.message);
+
+    routeOwnerlessStalls(h.cp);
+    const [notice] = criticalNotices(h, holding.runId);
+    expect(notice?.payload).toMatchObject({
+      stall: "CONTRACT_CHANGE_RUN_WITHOUT_GRANT",
+      cause: "CONFIRMED_WITHOUT_GRANT",
+      state: RunState.MERGING,
+      blocks: { by: holding.runId, runs: [replacement.value.runId] },
+    });
+    expect(notice?.payload["action"]).toEqual(expect.stringContaining("none within existing authority"));
+    expect(notice?.payload["action"]).not.toEqual(expect.stringContaining("create a new CONTRACT_CHANGE"));
+    expect(notice?.payload["needsTransition"]).toEqual(expect.stringMatching(/^an exit from MERGING .*\(pending\)$/));
+    // The delivery record keeps what the notice says and the correlation a later pass resolves it by.
+    expect(criticalAudits(h, holding.runId)).toEqual([expect.objectContaining({
+      kind: "OWNERLESS_STALL_ROUTED",
+      evidence: expect.objectContaining({
+        correlation: `ceo-incident:RUN_STALLED:${holding.runId}`,
+        needsTransition: notice?.payload["needsTransition"],
+        blocks: expect.objectContaining({ by: holding.runId }),
+      }),
+    })]);
+    const finding = (await h.cp.doctor.run("run", holding.runId)).findings.find((entry) => entry.code === "CONTRACT_CHANGE_RUN_WITHOUT_GRANT");
+    expect(finding?.recommendedAction).toEqual(expect.stringContaining("needs an exit transition from MERGING (pending)"));
+    expect(h.cp.runs.require(holding.runId).state).toBe(RunState.MERGING);
+  });
+});
+
+describe("H-2 — the reviewer's probe: one ACTIVE CONTRACT_CHANGE with no manifest, seen by both detectors, is one notice", () => {
+  it.each(["contract change first", "watchdog first"] as const)("%s: exactly one CRITICAL_SYSTEM_FAILURE for the unchanged run", async (order) => {
+    const { AgentOwnedWaits, DEFAULT_AGENT_WAIT_DEADLINES } = await import("../../src/ceo/agent-owned-waits.ts");
+    const h = makeHarness();
+    const run = await manifestlessContractChange(h, "cc-probe");
+    const waits = new AgentOwnedWaits({
+      db: h.cp.db, clock: h.cp.clock, audit: h.cp.audit, runs: h.cp.runs, bindings: h.cp.bindings,
+      outbox: h.cp.outbox, artifacts: h.cp.artifacts, gate: h.cp.ceo,
+    }, DEFAULT_AGENT_WAIT_DEADLINES);
+    const watchdogPath = async () => {
+      h.clock.advance(121 * 60 * 1000);
+      // The watchdog's stalls of the run itself; a message stalled to the CTO role is that role's own incident.
+      const stalls = (await h.cp.watchdog.tick()).stalls.filter((stall) => stall.runId === run.runId && stall.kind !== "outbox");
+      expect(stalls).toEqual([expect.objectContaining({ kind: "run", id: run.runId })]);
+      waits.routeWatchdogStalls(stalls);
+    };
+    if (order === "contract change first") {
+      routeOwnerlessStalls(h.cp);
+      await watchdogPath();
+    } else {
+      await watchdogPath();
+      routeOwnerlessStalls(h.cp);
+    }
+    routeOwnerlessStalls(h.cp);
+    const notices = criticalNotices(h, run.runId);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.payload).toMatchObject({ correlation: `ceo-incident:RUN_STALLED:${run.runId}` });
   });
 });
