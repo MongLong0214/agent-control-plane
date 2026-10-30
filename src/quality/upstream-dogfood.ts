@@ -1,18 +1,18 @@
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, readdirSync, renameSync } from "node:fs";
-import { join } from "node:path";
-
 import { z } from "zod";
 
 import { COMMITLORE_OBSERVATION_ARGV, type CommitLoreObservation } from "../bootstrap/commitlore-observation.ts";
-import { frameRecord, unframeRecord, writeWholeSync } from "../bootstrap/whole-write.ts";
 import { type Clock, isoPlus, systemClock } from "../core/clock.ts";
 import { hasCredentialShape, redactCredentialShapes } from "../core/credential-shapes.ts";
 import { canonicalJson, sha256Hex } from "../core/digest.ts";
 import { type Decision, acpError, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { ensurePrivateDirectory, inspectPrivatePath } from "../db/state-preflight.ts";
+import type { ArtifactStore } from "../db/artifacts.ts";
+import type { AuditLog } from "../db/audit.ts";
+import type { Db } from "../db/database.ts";
+import { ArtifactKind } from "../domain/types.ts";
 import { publicTextRefusals } from "../github/branch-publish.ts";
 import { type GitHubClient, transportOutcome } from "../github/github-kernel.ts";
+import { FRONTIER_SIMPLIFY_DIGEST } from "../review/frontier-simplify-policy.ts";
 
 /**
  * #1271 — what ACP finds while it uses CommitLore or frontier-simplify goes to that product's own issue
@@ -35,9 +35,17 @@ import { type GitHubClient, transportOutcome } from "../github/github-kernel.ts"
  *   restart, a retry or a response lost after GitHub accepted the write links what is there instead of
  *   writing it again. The write intent is stored before the write.
  *
- * Storage is one framed record per finding in a private directory, written whole and renamed into place
- * (the bootstrap GitHub ledger's discipline). The outbox carries Buzz envelopes and `github_receipts`
- * admits a fixed set of run-scoped operations; neither is reused for this.
+ * - A frontier-simplify finding is accepted only from the check that produced it: a `method` finding in a
+ *   BLIND_REVIEW artifact the blind-review gate stored, bound to that review's candidate, contract and
+ *   reviewer session. Nothing a caller declares on its own is recorded for frontier-simplify.
+ *
+ * Storage is the state database's audit log, append-only: one `UPSTREAM_DOGFOOD_FINDING` row per finding
+ * (its initial state included) and one `UPSTREAM_DOGFOOD_STATE` row per later state. The current state
+ * is the newest of those. The outbox carries Buzz envelopes and `github_receipts` admits a fixed set of
+ * run-scoped operations; neither is reused for this, and nothing here changes the schema.
+ *
+ * Publishing is off unless a publisher is given: without one the reporter sends nothing and moves no
+ * record, so findings accumulate QUEUED.
  */
 
 export const UPSTREAM_REPOSITORIES = Object.freeze({
@@ -75,18 +83,18 @@ export const dogfoodFindingSchema = z
     /** The boundary that produced the finding. */
     source: z.string().regex(/^[a-z0-9][a-z0-9._:-]{2,79}$/),
     /** Where the original evidence already lives. Kept private; never published. */
-    privateEvidenceRef: z.string().min(1).max(2000),
+    privateEvidenceRef: z.string().min(1).max(200),
     title: text(200),
     /** The problem, or for an improvement the use case and what is inconvenient now. */
-    problem: text(4000),
+    problem: text(2000),
     expected: text(2000),
     actual: text(2000),
     /** Steps, or the boundary at which it did not reproduce. */
-    reproduction: text(4000),
+    reproduction: text(2000),
     productRevision: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._+-]{0,79}$/),
     impact: text(2000),
     workaround: text(2000),
-    evidence: z.string().max(8000).optional(),
+    evidence: z.string().max(2000).optional(),
     /** The other product's side of a finding that spans both (`splitAcrossProducts`). */
     related: z.object({ product: z.enum(PRODUCTS), key: z.string().regex(/^[0-9a-f]{24}$/) }).strict().optional(),
   })
@@ -137,7 +145,7 @@ export interface DogfoodPublic {
 
 const publicPayload = (finding: DogfoodFinding): { payload: DogfoodPublic; unsafe: SummaryField[] } => {
   const fields = Object.fromEntries(
-    SUMMARY_FIELDS.map((field) => [field, inertMentions(scrubPublicText(field === "title" ? finding.title.replace(/\s+/g, " ") : finding[field]))]),
+    SUMMARY_FIELDS.map((field) => [field, inertMentions(scrubPublicText(field === "title" ? finding.title.replace(/\s+/g, " ") : finding[field])).slice(0, 2000)]),
   ) as Record<SummaryField, string>;
   const unsafe = SUMMARY_FIELDS.filter((field) => !isPublicSafe(fields[field]));
   let evidence: string | null = null;
@@ -177,7 +185,11 @@ const revisionLine = (revision: string): string => `Product revision: \`${revisi
 // Records
 // ---------------------------------------------------------------------------
 
-export const DOGFOOD_RECORD_SCHEMA = "acp.upstream-dogfood.v1";
+export const DOGFOOD_FINDING_KIND = "UPSTREAM_DOGFOOD_FINDING";
+export const DOGFOOD_STATE_KIND = "UPSTREAM_DOGFOOD_STATE";
+
+/** The refusal of a frontier-simplify finding that does not come from the stored review that performed the check. */
+export const FRONTIER_SIMPLIFY_EVIDENCE_UNBOUND = "FRONTIER_SIMPLIFY_EVIDENCE_UNBOUND";
 
 export type NotReportedReason = "NORMAL_REFUSAL" | "CALLER_MISUSE" | "ENVIRONMENT" | "CAUSE_UNDETERMINED" | "NOT_PUBLIC_SAFE";
 export type LinkAction = "created" | "commented" | "regression" | "existing";
@@ -189,8 +201,17 @@ export type DogfoodState =
   | { status: "LINKED"; attempts: number; url: string; issueNumber: number; commentId: number | null; action: LinkAction; readAt: string }
   | { status: "UNPUBLISHED"; attempts: number; reason: string; lastError: string | null; at: string };
 
+/** What ACP bound a frontier-simplify finding to: the stored review whose reviewer performed the check. */
+export interface ReviewBinding {
+  runId: string;
+  artifactId: string;
+  candidateSnapshotDigest: string;
+  contractDigest: string;
+  reviewerSessionId: string;
+  findingIndex: number;
+}
+
 export interface DogfoodRecord {
-  schema: typeof DOGFOOD_RECORD_SCHEMA;
   id: string;
   key: string;
   evidenceKey: string;
@@ -205,6 +226,7 @@ export interface DogfoodRecord {
   privateEvidenceRef: string;
   public: DogfoodPublic;
   related: { product: DogfoodProduct; key: string } | null;
+  binding: ReviewBinding | null;
   state: DogfoodState;
 }
 
@@ -216,31 +238,97 @@ const stateSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("UNPUBLISHED"), attempts: z.number().int().min(0), reason: z.string(), lastError: z.string().nullable(), at: z.string() }).strict(),
 ]);
 
-const recordSchema = z
+const bindingSchema = z
   .object({
-    schema: z.literal(DOGFOOD_RECORD_SCHEMA),
-    id: z.string().regex(/^[0-9a-f]{24}-[0-9a-f]{16}$/),
-    key: z.string().regex(/^[0-9a-f]{24}$/),
-    evidenceKey: z.string().regex(/^[0-9a-f]{16}$/),
+    runId: z.string(),
+    artifactId: z.string(),
+    candidateSnapshotDigest: z.string(),
+    contractDigest: z.string(),
+    reviewerSessionId: z.string(),
+    findingIndex: z.number().int().min(0),
+  })
+  .strict();
+
+/**
+ * A finding as its audit row carries it. The audit log redacts any field whose name ends in "key", so
+ * the duplicate key is stored as `correlation` and the evidence key as `observationId`.
+ */
+const storedFindingSchema = z
+  .object({
+    findingId: z.string().regex(/^[0-9a-f]{24}-[0-9a-f]{16}$/),
+    correlation: z.string().regex(/^[0-9a-f]{24}$/),
+    observationId: z.string().regex(/^[0-9a-f]{16}$/),
     product: z.enum(PRODUCTS),
     kind: z.enum(["defect", "improvement"]),
     basis: z.enum(["observed", "inferred"]),
     reproduced: z.boolean(),
     source: z.string(),
     revision: z.string(),
-    recordedAt: z.string(),
     privateEvidenceRef: z.string(),
-    public: z.object({
-      fields: z.object(Object.fromEntries(SUMMARY_FIELDS.map((field) => [field, z.string()])) as Record<SummaryField, z.ZodString>).strict(),
-      evidence: z.string().nullable(),
-      evidenceWithheld: z.boolean(),
-    }).strict(),
-    related: z.object({ product: z.enum(PRODUCTS), key: z.string() }).strict().nullable(),
+    ...(Object.fromEntries(SUMMARY_FIELDS.map((field) => [field, z.string()])) as Record<SummaryField, z.ZodString>),
+    evidence: z.string().nullable(),
+    evidenceWithheld: z.boolean(),
+    related: z.object({ product: z.enum(PRODUCTS), correlation: z.string() }).strict().nullable(),
+    binding: bindingSchema.nullable(),
     state: stateSchema,
   })
   .strict();
 
-/** What a defect's cause makes of it: reported (null), or not, and why. */
+const storedStateSchema = z.object({ findingId: z.string(), state: stateSchema }).strict();
+
+const toEvidence = (record: DogfoodRecord): Record<string, unknown> => ({
+  findingId: record.id,
+  correlation: record.key,
+  observationId: record.evidenceKey,
+  product: record.product,
+  kind: record.kind,
+  basis: record.basis,
+  reproduced: record.reproduced,
+  source: record.source,
+  revision: record.revision,
+  privateEvidenceRef: record.privateEvidenceRef,
+  ...record.public.fields,
+  evidence: record.public.evidence,
+  evidenceWithheld: record.public.evidenceWithheld,
+  related: record.related === null ? null : { product: record.related.product, correlation: record.related.key },
+  binding: record.binding,
+  state: record.state,
+});
+
+const fromEvidence = (at: string, evidenceJson: string): DogfoodRecord | null => {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(evidenceJson);
+  } catch {
+    return null;
+  }
+  const parsed = storedFindingSchema.safeParse(raw);
+  if (!parsed.success) return null;
+  const stored = parsed.data;
+  return {
+    id: stored.findingId,
+    key: stored.correlation,
+    evidenceKey: stored.observationId,
+    product: stored.product,
+    kind: stored.kind,
+    basis: stored.basis,
+    reproduced: stored.reproduced,
+    source: stored.source,
+    revision: stored.revision,
+    recordedAt: at,
+    privateEvidenceRef: stored.privateEvidenceRef,
+    public: {
+      fields: Object.fromEntries(SUMMARY_FIELDS.map((field) => [field, stored[field]])) as Record<SummaryField, string>,
+      evidence: stored.evidence,
+      evidenceWithheld: stored.evidenceWithheld,
+    },
+    related: stored.related === null ? null : { product: stored.related.product, key: stored.related.correlation },
+    binding: stored.binding,
+    state: stored.state as DogfoodState,
+  };
+};
+
+/** What makes a defect's cause reported (null) or not, and why. */
 const DEFECT_CAUSE_REASON: Readonly<Record<DogfoodFinding["cause"], NotReportedReason | null>> = {
   product: null,
   normal_refusal: "NORMAL_REFUSAL",
@@ -255,49 +343,149 @@ const triage = (finding: DogfoodFinding, unsafe: readonly SummaryField[]): NotRe
   return finding.kind === "improvement" ? null : DEFECT_CAUSE_REASON[finding.cause];
 };
 
-const recordFileName = (id: string): string => `${id}.json`;
+/** The part of a stored BLIND_REVIEW packet a method finding is read from; the gate wrote all of it. */
+const reviewPacketSchema = z
+  .object({
+    runId: z.string(),
+    candidateSnapshotDigest: z.string(),
+    contractDigest: z.string(),
+    reviewerSessionId: z.string().min(1),
+    findings: z.array(
+      z.object({ category: z.string(), severity: z.string(), summary: z.string(), detail: z.string() }).passthrough(),
+    ),
+  })
+  .passthrough();
 
-/** Written whole to a scratch file, synced, renamed over the record and the directory synced. */
-const writeRecordFile = (path: string, content: unknown): void => {
-  const scratch = `${path}.partial`;
-  const descriptor = openSync(scratch, "w", 0o600);
-  try {
-    writeWholeSync(descriptor, frameRecord(content));
-    fsyncSync(descriptor);
-  } finally {
-    closeSync(descriptor);
-  }
-  renameSync(scratch, path);
-  const directory = openSync(join(path, ".."), "r");
-  try {
-    fsyncSync(directory);
-  } finally {
-    closeSync(directory);
-  }
+const FRONTIER_SIMPLIFY_REVISION = FRONTIER_SIMPLIFY_DIGEST.replace(/^sha256:/, "").slice(0, 12);
+
+/**
+ * A reviewer's `method` finding as a frontier-simplify finding. The reviewer's envelope carries a summary
+ * and a detail only; what it does not state is said to be unstated, never filled in.
+ */
+const reviewMethodFinding = (
+  finding: { severity: string; summary: string; detail: string },
+  privateEvidenceRef: string,
+): DogfoodFindingInput => {
+  const summary = finding.summary.trim() || "frontier-simplify review method finding";
+  return {
+    product: "frontier-simplify",
+    kind: finding.severity === "MAJOR" || finding.severity === "BLOCKER" ? "defect" : "improvement",
+    cause: "product",
+    basis: "observed",
+    reproduced: false,
+    signature: `review-method.${sha256Hex(normalise(summary)).slice(0, 16)}`,
+    source: "blind-review.method-finding",
+    privateEvidenceRef,
+    title: summary.slice(0, 200),
+    problem: (finding.detail.trim() || summary).slice(0, 2000),
+    expected: "Not stated separately by the reviewer; the problem above names the gap.",
+    actual: summary.slice(0, 2000),
+    reproduction: "Seen by an independent reviewer applying frontier-simplify to one candidate review; not reproduced.",
+    productRevision: FRONTIER_SIMPLIFY_REVISION,
+    impact: "Not assessed by the reviewer.",
+    workaround: "None stated.",
+  };
 };
 
-/** The durable finding store: one framed record per finding, in a private directory. */
+export interface DogfoodStoreDeps {
+  db: Pick<Db, "tx" | "all">;
+  audit: Pick<AuditLog, "record">;
+  artifacts: Pick<ArtifactStore, "list">;
+  clock?: Clock;
+}
+
+/** Where a finding came from, as the audit row names it. */
+export interface DogfoodOrigin {
+  runId?: string | null;
+  actor: string;
+}
+
+/** The durable finding store, on the state database's append-only audit log. */
 export class DogfoodFindingStore {
-  constructor(
-    readonly directory: string,
-    private readonly clock: Clock = systemClock,
-  ) {}
+  readonly #deps: DogfoodStoreDeps;
+  readonly #clock: Clock;
+
+  constructor(deps: DogfoodStoreDeps) {
+    this.#deps = deps;
+    this.#clock = deps.clock ?? systemClock;
+  }
 
   /**
-   * Records a finding, idempotently: the same finding with the same public evidence is one record, so a
-   * restart, a retry or a second project meeting it changes nothing. Never throws: a failure to record
-   * is a refusal the caller can name, and never the outcome of the work that found it.
+   * Records a CommitLore finding, idempotently: the same finding with the same public evidence is one
+   * record, so a restart, a retry or a second project meeting it adds nothing. A frontier-simplify
+   * finding is refused here: it is accepted only through `recordReviewMethodFindings`. Never throws: a
+   * failure to record is a refusal, never the outcome of the work that found it.
    */
-  record(input: unknown): Decision<DogfoodRecord> {
+  record(input: unknown, origin: DogfoodOrigin): Decision<DogfoodRecord> {
     const parsed = dogfoodFindingSchema.safeParse(input);
     if (!parsed.success) {
       return deny(ReasonCode.INVALID_ARGUMENT, "the finding is not a dogfood finding this store records", {
         fields: [...new Set(parsed.error.issues.map((issue) => issue.path.join(".") || "<root>"))],
       });
     }
-    const finding = parsed.data;
+    if (parsed.data.product === "frontier-simplify") {
+      return deny(
+        ReasonCode.VERIFICATION_GAP,
+        "a frontier-simplify finding is accepted only as a method finding of the stored review that performed the check",
+        { refusal: FRONTIER_SIMPLIFY_EVIDENCE_UNBOUND },
+      );
+    }
+    return this.#store(parsed.data, null, origin);
+  }
+
+  /**
+   * The frontier-simplify findings of one stored review: each `method` finding its reviewer returned,
+   * bound to the review's run, candidate, contract and reviewer session. Refused unless the artifact is a
+   * BLIND_REVIEW the blind-review gate stored for that run and candidate. A review with no method finding
+   * records nothing; no other statement about frontier-simplify is ever recorded.
+   */
+  recordReviewMethodFindings(runId: string, artifactId: string): Decision<DogfoodRecord[]> {
+    const unbound = (why: string) =>
+      deny<DogfoodRecord[]>(ReasonCode.VERIFICATION_GAP, `the review's method findings cannot be bound: ${why}`, {
+        refusal: FRONTIER_SIMPLIFY_EVIDENCE_UNBOUND,
+        runId,
+        artifactId,
+      });
+    let artifacts: ReturnType<ArtifactStore["list"]>;
     try {
-      ensurePrivateDirectory(this.directory);
+      artifacts = this.#deps.artifacts.list(runId, ArtifactKind.BLIND_REVIEW);
+    } catch {
+      return unbound("the run's reviews could not be read");
+    }
+    const artifact = artifacts.find((candidate) => candidate.artifactId === artifactId);
+    if (artifact === undefined) return unbound("no stored review of this run has that id");
+    if (artifact.producedBy !== "blind-review-gate" || artifact.candidateSnapshotDigest === null) {
+      return unbound("the artifact is not a review the blind-review gate stored");
+    }
+    const packet = reviewPacketSchema.safeParse(artifact.content);
+    if (!packet.success || packet.data.runId !== runId || packet.data.candidateSnapshotDigest !== artifact.candidateSnapshotDigest) {
+      return unbound("the stored review does not name this run and candidate");
+    }
+    const recorded: DogfoodRecord[] = [];
+    let refused = 0;
+    packet.data.findings.forEach((finding, findingIndex) => {
+      if (finding.category !== "method") return;
+      const input = dogfoodFindingSchema.safeParse(
+        reviewMethodFinding(finding, `blind review ${artifact.artifactId}, finding ${findingIndex}`),
+      );
+      const stored = input.success
+        ? this.#store(input.data, {
+            runId,
+            artifactId: artifact.artifactId,
+            candidateSnapshotDigest: packet.data.candidateSnapshotDigest,
+            contractDigest: packet.data.contractDigest,
+            reviewerSessionId: packet.data.reviewerSessionId,
+            findingIndex,
+          }, { runId, actor: "blind-review-gate" })
+        : null;
+      if (stored?.allowed) recorded.push(stored.value);
+      else refused += 1;
+    });
+    return allow(ReasonCode.OK, recorded, { refused });
+  }
+
+  #store(finding: DogfoodFinding, binding: ReviewBinding | null, origin: DogfoodOrigin): Decision<DogfoodRecord> {
+    try {
       const key = findingKey(finding);
       const { payload, unsafe } = publicPayload(finding);
       const evidenceKey = sha256Hex(
@@ -310,75 +498,109 @@ export class DogfoodFindingStore {
         }),
       ).slice(0, 16);
       const id = `${key}-${evidenceKey}`;
-      const existing = this.get(id);
-      if (existing !== null) return allow(ReasonCode.OK, existing, { replayed: true });
-      const now = this.clock.nowIso();
-      const reason = triage(finding, unsafe);
-      const record: DogfoodRecord = {
-        schema: DOGFOOD_RECORD_SCHEMA,
-        id,
-        key,
-        evidenceKey,
-        product: finding.product,
-        kind: finding.kind,
-        basis: finding.basis,
-        reproduced: finding.reproduced,
-        source: finding.source,
-        revision: finding.productRevision,
-        recordedAt: now,
-        privateEvidenceRef: finding.privateEvidenceRef,
-        public: payload,
-        related: finding.related ?? null,
-        state:
-          reason === null
-            ? { status: "QUEUED", attempts: 0, nextAttemptAt: now, lastError: null }
-            : { status: "NOT_REPORTED", reason, at: now },
-      };
-      writeRecordFile(join(this.directory, recordFileName(id)), record);
-      return allow(ReasonCode.OK, record, { replayed: false, ...(unsafe.length > 0 ? { unsafeFields: unsafe } : {}) });
+      return this.#deps.db.tx(() => {
+        const existing = this.get(id);
+        if (existing !== null) return allow(ReasonCode.OK, existing, { replayed: true });
+        const now = this.#clock.nowIso();
+        const reason = triage(finding, unsafe);
+        const record: DogfoodRecord = {
+          id,
+          key,
+          evidenceKey,
+          product: finding.product,
+          kind: finding.kind,
+          basis: finding.basis,
+          reproduced: finding.reproduced,
+          source: finding.source,
+          revision: finding.productRevision,
+          recordedAt: now,
+          privateEvidenceRef: finding.privateEvidenceRef,
+          public: payload,
+          related: finding.related ?? null,
+          binding,
+          state:
+            reason === null
+              ? { status: "QUEUED", attempts: 0, nextAttemptAt: now, lastError: null }
+              : { status: "NOT_REPORTED", reason, at: now },
+        };
+        this.#append({ kind: DOGFOOD_FINDING_KIND, runId: origin.runId ?? null, actor: origin.actor, evidence: toEvidence(record) });
+        return allow(ReasonCode.OK, record, { replayed: false, ...(unsafe.length > 0 ? { unsafeFields: unsafe } : {}) });
+      });
     } catch (error) {
       return deny(ReasonCode.INVALID_ARGUMENT, "the finding could not be recorded", { message: (error as Error).message.slice(0, 300) });
     }
   }
 
   get(id: string): DogfoodRecord | null {
-    const path = join(this.directory, recordFileName(id));
-    if (!existsSync(path)) return null;
-    const read = this.read(path);
-    if (read === null) throw acpError(ReasonCode.INVALID_ARGUMENT, "a dogfood record is unreadable", { id });
-    return read;
+    const row = this.#deps.db.all<{ at: string; evidence_json: string }>(
+      `SELECT at, evidence_json FROM audit_events WHERE kind = ? AND json_extract(evidence_json, '$.findingId') = ? ORDER BY event_id LIMIT 1`,
+      [DOGFOOD_FINDING_KIND, id],
+    )[0];
+    if (row === undefined) return null;
+    const record = fromEvidence(row.at, row.evidence_json);
+    if (record === null) throw acpError(ReasonCode.INVALID_ARGUMENT, "a dogfood record is unreadable", { id });
+    const latest = this.#deps.db.all<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events WHERE kind = ? AND json_extract(evidence_json, '$.findingId') = ? ORDER BY event_id DESC LIMIT 1`,
+      [DOGFOOD_STATE_KIND, id],
+    )[0];
+    if (latest === undefined) return record;
+    const state = storedStateSchema.safeParse(JSON.parse(latest.evidence_json));
+    if (!state.success) throw acpError(ReasonCode.INVALID_ARGUMENT, "a dogfood state is unreadable", { id });
+    return { ...record, state: state.data.state as DogfoodState };
   }
 
-  /** Every record, and the files that are not readable records: named, never skipped in silence. */
+  /** Every record, and the audit rows that are not readable records: named, never skipped in silence. */
   list(): { records: DogfoodRecord[]; unreadable: string[] } {
-    if (!existsSync(this.directory)) return { records: [], unreadable: [] };
-    ensurePrivateDirectory(this.directory);
     const records: DogfoodRecord[] = [];
     const unreadable: string[] = [];
-    for (const name of readdirSync(this.directory).sort()) {
-      if (!name.endsWith(".json")) continue;
-      const record = this.read(join(this.directory, name));
-      if (record === null || recordFileName(record.id) !== name) unreadable.push(name);
-      else records.push(record);
+    const findings = this.#deps.db.all<{ event_id: number; at: string; evidence_json: string }>(
+      `SELECT event_id, at, evidence_json FROM audit_events WHERE kind = ? ORDER BY event_id`,
+      [DOGFOOD_FINDING_KIND],
+    );
+    const latest = new Map<string, DogfoodState>();
+    for (const row of this.#deps.db.all<{ event_id: number; evidence_json: string }>(
+      `SELECT event_id, evidence_json FROM audit_events WHERE kind = ? ORDER BY event_id`,
+      [DOGFOOD_STATE_KIND],
+    )) {
+      let parsed: ReturnType<typeof storedStateSchema.safeParse>;
+      try {
+        parsed = storedStateSchema.safeParse(JSON.parse(row.evidence_json));
+      } catch {
+        unreadable.push(`audit:${row.event_id}`);
+        continue;
+      }
+      if (parsed.success) latest.set(parsed.data.findingId, parsed.data.state as DogfoodState);
+      else unreadable.push(`audit:${row.event_id}`);
+    }
+    const seen = new Set<string>();
+    for (const row of findings) {
+      const record = fromEvidence(row.at, row.evidence_json);
+      if (record === null) {
+        unreadable.push(`audit:${row.event_id}`);
+        continue;
+      }
+      if (seen.has(record.id)) continue;
+      seen.add(record.id);
+      records.push({ ...record, state: latest.get(record.id) ?? record.state });
     }
     return { records, unreadable };
   }
 
   /** Moves a record from the state it was read in; a record that moved meanwhile is left alone. */
   transition(record: DogfoodRecord, state: DogfoodState): DogfoodRecord {
-    const current = this.get(record.id);
-    if (current === null || canonicalJson(current.state) !== canonicalJson(record.state)) {
-      throw acpError(ReasonCode.INVALID_ARGUMENT, "the dogfood record changed under this transition", { id: record.id });
-    }
-    const next: DogfoodRecord = { ...current, state };
-    writeRecordFile(join(this.directory, recordFileName(record.id)), next);
-    return next;
+    return this.#deps.db.tx(() => {
+      const current = this.get(record.id);
+      if (current === null || canonicalJson(current.state) !== canonicalJson(record.state)) {
+        throw acpError(ReasonCode.INVALID_ARGUMENT, "the dogfood record changed under this transition", { id: record.id });
+      }
+      this.#append({ kind: DOGFOOD_STATE_KIND, runId: current.binding?.runId ?? null, actor: "upstream-dogfood-reporter", evidence: { findingId: record.id, state } });
+      return { ...current, state };
+    });
   }
 
-  private read(path: string): DogfoodRecord | null {
-    if (!inspectPrivatePath(path, "file").secure) return null;
-    const parsed = recordSchema.safeParse(unframeRecord(readFileSync(path)));
-    return parsed.success ? (parsed.data as DogfoodRecord) : null;
+  #append(entry: { kind: string; runId: string | null; actor: string; evidence: Record<string, unknown> }): void {
+    const written = this.#deps.audit.record(entry);
+    if (!written.allowed) throw acpError(written.reasonCode, written.message, written.evidence);
   }
 }
 
@@ -465,7 +687,7 @@ export const commitloreObservationFinding = (
     expected: "`commitlore init` and `commitlore doctor --json` both pass in a freshly initialised repository.",
   };
   if (/^commitlore doctor failed \(/.test(detail)) return { ...common, cause: "normal_refusal", signature: "doctor.nonzero-exit" };
-  if (/could not be run$/.test(detail) || /^the CommitLore observation did not complete/.test(detail)) {
+  if (/^commitlore(?: init| doctor)? could not be run/.test(detail) || /^the CommitLore observation did not complete/.test(detail)) {
     return { ...common, cause: "environment", signature: "observation.not-run" };
   }
   if (/^commitlore init failed \(/.test(detail)) return { ...common, cause: "undetermined", signature: "init.nonzero-exit" };
@@ -669,6 +891,7 @@ export interface DogfoodReportSummary {
   /** Record files that did not read as records, and a store that could not be listed: named, not skipped. */
   unreadable: string[];
   storeError: string | null;
+  publishing: "enabled" | "disabled";
 }
 
 const DEFAULT_MAX_ATTEMPTS = 5;
@@ -700,9 +923,12 @@ export class UpstreamDogfoodReporter {
   readonly #backoffMs: number;
   readonly #limit: number;
 
+  /**
+   * `publisher` null is publishing off: a pass names what is due and sends nothing, and no record moves.
+   */
   constructor(
     private readonly store: DogfoodFindingStore,
-    private readonly port: UpstreamIssuePort,
+    private readonly publisher: UpstreamIssuePort | null,
     options: DogfoodReporterOptions = {},
   ) {
     this.#clock = options.clock ?? systemClock;
@@ -712,7 +938,10 @@ export class UpstreamDogfoodReporter {
   }
 
   async reportDue(): Promise<DogfoodReportSummary> {
-    const summary: DogfoodReportSummary = { linked: [], waiting: [], unpublished: [], unreadable: [], storeError: null };
+    const publisher = this.publisher;
+    const summary: DogfoodReportSummary = {
+      linked: [], waiting: [], unpublished: [], unreadable: [], storeError: null, publishing: publisher === null ? "disabled" : "enabled",
+    };
     let listed: DogfoodRecord[];
     try {
       const read = this.store.list();
@@ -726,11 +955,15 @@ export class UpstreamDogfoodReporter {
     const due = listed
       .filter((record) => (record.state.status === "QUEUED" || record.state.status === "IN_DOUBT") && new Date(record.state.nextAttemptAt).getTime() <= now)
       .slice(0, this.#limit);
+    if (publisher === null) {
+      summary.waiting = due.map((record) => record.id);
+      return summary;
+    }
     for (const record of due) {
       if (this.#claims.has(record.id)) continue;
       this.#claims.add(record.id);
       try {
-        const after = await this.#pass(record);
+        const after = await this.#pass(record, publisher);
         const status = after.state.status;
         if (status === "LINKED") summary.linked.push(record.id);
         else if (status === "UNPUBLISHED") summary.unpublished.push(record.id);
@@ -744,7 +977,7 @@ export class UpstreamDogfoodReporter {
     return summary;
   }
 
-  async #pass(record: DogfoodRecord): Promise<DogfoodRecord> {
+  async #pass(record: DogfoodRecord, port: UpstreamIssuePort): Promise<DogfoodRecord> {
     const state = record.state;
     if (state.status !== "QUEUED" && state.status !== "IN_DOUBT") return record;
     const repository = UPSTREAM_REPOSITORIES[record.product];
@@ -753,7 +986,7 @@ export class UpstreamDogfoodReporter {
 
     let located: Located;
     try {
-      located = await this.#locate(record, repository);
+      located = await this.#locate(record, repository, port);
     } catch (error) {
       return this.#failed(record, error, attempt);
     }
@@ -784,13 +1017,13 @@ export class UpstreamDogfoodReporter {
     });
     try {
       if (plan.action === "commented") {
-        const { id } = await this.port.createComment(repository, plan.issue.number, body);
-        const read = await this.port.readComment(repository, id);
+        const { id } = await port.createComment(repository, plan.issue.number, body);
+        const read = await port.readComment(repository, id);
         if (!this.#commentHolds(intent, repository, plan.issue.number, read)) return this.#unverified(intent);
         return this.#link(intent, plan.issue, read, "commented", attempt);
       }
-      const { number } = await this.port.createIssue(repository, title, body);
-      const read = await this.port.readIssue(repository, number);
+      const { number } = await port.createIssue(repository, title, body);
+      const read = await port.readIssue(repository, number);
       if (!this.#issueHolds(intent, repository, number, read, title)) return this.#unverified(intent);
       return this.#link(intent, read, null, plan.action, attempt);
     } catch (error) {
@@ -798,15 +1031,15 @@ export class UpstreamDogfoodReporter {
     }
   }
 
-  async #locate(record: DogfoodRecord, repository: string): Promise<Located> {
+  async #locate(record: DogfoodRecord, repository: string, port: UpstreamIssuePort): Promise<Located> {
     const token = keyToken(record.key);
     const evidence = evidenceToken(record.evidenceKey);
-    const issues = (await this.port.findIssues(repository, token)).filter((issue) => issue.body.includes(token));
+    const issues = (await port.findIssues(repository, token)).filter((issue) => issue.body.includes(token));
     const carrying = issues.find((issue) => issue.body.includes(evidence));
     if (carrying) return { linked: { issue: carrying, comment: null } };
     const comments = new Map<number, UpstreamComment[]>();
     for (const issue of issues) {
-      const listed = await this.port.listComments(repository, issue.number);
+      const listed = await port.listComments(repository, issue.number);
       comments.set(issue.number, listed);
       const found = listed.find((comment) => comment.body.includes(evidence));
       if (found) return { linked: { issue, comment: found } };

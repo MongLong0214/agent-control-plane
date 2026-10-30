@@ -1,4 +1,5 @@
 import { frontierReviewPolicy } from "./frontier-simplify-policy.ts";
+import { DogfoodFindingStore } from "../quality/upstream-dogfood.ts";
 import { frozenBootstrapReviewEvidence, originalReviewRecords, type FrozenReviewEvidence, type ReviewEvidenceFile } from "../bootstrap/bootstrap-review-evidence.ts";
 import type { ReviewRecordVerification } from "../bootstrap/bootstrap-review-evidence-github.ts";
 import { bootstrapServingRuntime, bootstrapCodeGuarantees, type BootstrapRuntimeObservation } from "../bootstrap/bootstrap-runtime-observation.ts";
@@ -432,9 +433,10 @@ const VERDICT_SCHEMA = {
         properties: {
           category: {
             type: "string",
+            description: "method: a defect or gap in the frontier-simplify review method itself, not in the candidate.",
             enum: [
               "correctness", "regression", "security", "scope", "performance",
-              "maintainability", "evidence", "freshness", "source",
+              "maintainability", "evidence", "freshness", "source", "method",
             ],
           },
           severity: { type: "string", enum: ["INFO", "MINOR", "MAJOR", "BLOCKER"] },
@@ -996,7 +998,16 @@ export class BlindReviewGate {
    */
   private storeReview(packet: ReviewPacket, reviewer: ReviewerBinding, attemptId: string | undefined): Decision<void> {
     try {
-      this.artifacts.putEvidence(this.evidenceWriter, packet.runId, ArtifactKind.BLIND_REVIEW, packet, packet.candidateSnapshotDigest);
+      // #1271 — the review and the frontier-simplify findings its reviewer returned are kept in one
+      // transaction, bound to this review: a method finding exists exactly when the review carrying it does.
+      // Recording one never fails the review; a finding the store refuses is left out.
+      this.db.tx(() => {
+        const stored = this.artifacts.putEvidence(this.evidenceWriter, packet.runId, ArtifactKind.BLIND_REVIEW, packet, packet.candidateSnapshotDigest);
+        if (packet.findings.some((finding) => finding.category === "method")) {
+          new DogfoodFindingStore({ db: this.db, audit: this.audit, artifacts: this.artifacts, clock: this.clock })
+            .recordReviewMethodFindings(packet.runId, stored.artifactId);
+        }
+      });
       return allow(ReasonCode.OK, undefined);
     } catch (error) {
       if (!isAcpError(error) || error.reasonCode !== ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED) throw error;

@@ -1,16 +1,13 @@
-import { readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-
 import { afterAll, describe, expect, it } from "vitest";
 
 import { judgeCommitLoreRuns } from "../../src/bootstrap/commitlore-observation.ts";
-import { ManualClock } from "../../src/core/clock.ts";
 import { acpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
 import {
   type DogfoodFindingInput,
   type DogfoodRecord,
+  DOGFOOD_FINDING_KIND,
   DogfoodFindingStore,
   UPSTREAM_REPOSITORIES,
   UpstreamDogfoodReporter,
@@ -19,7 +16,8 @@ import {
   githubUpstreamIssuePort,
   splitAcrossProducts,
 } from "../../src/quality/upstream-dogfood.ts";
-import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { driveToReviewedCandidate, makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -133,37 +131,45 @@ class FakeTracker implements GitHubClient {
 }
 
 const finding = (over: Partial<DogfoodFindingInput> = {}): DogfoodFindingInput => ({
-  product: "frontier-simplify",
+  product: "commitlore",
   kind: "improvement",
   cause: "product",
   basis: "observed",
   reproduced: true,
-  signature: "method.no-stop-rule-for-review-rounds",
-  source: "review.round-summary",
-  privateEvidenceRef: "review-round-7",
-  title: "State when a review round may stop",
-  problem: "Reviewers repeat rounds on a change with no new finding because the method names no stop rule.",
-  expected: "The method says a round with no new finding ends the review.",
-  actual: "A third round re-raised two findings already answered.",
-  reproduction: "Review one change three times with the method; compare the findings.",
-  productRevision: "0d788506",
-  impact: "Review time spent on rounds that find nothing new.",
-  workaround: "The caller stops after a round with no new finding.",
+  signature: "capture.names-no-rejected-field",
+  source: "test.boundary",
+  privateEvidenceRef: "capture-7",
+  title: "Name the field a rejected capture failed on",
+  problem: "A rejected capture says it was rejected without naming the field, so the caller retries blind.",
+  expected: "The rejection names the field and the rule it broke.",
+  actual: "The rejection names neither.",
+  reproduction: "Stage a capture with an empty Limit and read the rejection.",
+  productRevision: "1.7.5",
+  impact: "Retries that change the wrong field.",
+  workaround: "Read the verifier source.",
   ...over,
 });
 
-const setup = (options: { maxAttempts?: number } = {}) => {
-  const directory = join(tempDir("acp-dogfood-"), "findings");
-  const clock = new ManualClock("2026-10-30T00:00:00.000Z");
+const ORIGIN = { runId: null, actor: "test-boundary" };
+
+const setup = (options: { maxAttempts?: number; publishing?: boolean } = {}) => {
+  const harness = makeHarness();
+  const clock = harness.clock;
   const tracker = new FakeTracker();
   const port = githubUpstreamIssuePort(tracker);
-  const store = new DogfoodFindingStore(directory, clock);
-  const reporter = () => new UpstreamDogfoodReporter(new DogfoodFindingStore(directory, clock), port, { clock, backoffMs: 1000, ...options });
-  return { directory, clock, tracker, port, store, reporter };
+  const store = harness.cp.dogfoodFindings;
+  // A reporter built afresh each time, on a store built afresh over the same database: a restart.
+  const reporter = () =>
+    new UpstreamDogfoodReporter(
+      new DogfoodFindingStore({ db: harness.cp.db, audit: harness.cp.audit, artifacts: harness.cp.artifacts, clock }),
+      options.publishing === false ? null : port,
+      { clock, backoffMs: 1000, ...(options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }) },
+    );
+  return { harness, clock, tracker, port, store, reporter };
 };
 
 const recorded = (store: DogfoodFindingStore, input: DogfoodFindingInput): DogfoodRecord => {
-  const decision = store.record(input);
+  const decision = store.record(input, ORIGIN);
   if (!decision.allowed) throw new Error(`not recorded: ${decision.message}`);
   return decision.value;
 };
@@ -194,13 +200,33 @@ describe("a dogfood finding reaches its own upstream tracker once, and is read b
     expect(tracker.calls).toContain(`GET /repos/${CL}/issues/${issue!.number}`);
   });
 
-  it("a frontier-simplify improvement goes to the frontier-simplify tracker", async () => {
-    const { tracker, store, reporter } = setup();
-    const record = recorded(store, finding());
+  it("a frontier-simplify method finding from a stored review goes to the frontier-simplify tracker", async () => {
+    const { harness, tracker, store, reporter } = setup();
+    await driveToReviewedCandidate(harness, {
+      reviewerFindings: [{
+        category: "method",
+        severity: "MINOR",
+        repository: "github:acme/fixture",
+        path: null,
+        summary: "State when a review round may stop",
+        detail: "Reviewers repeat rounds on a change with no new finding because the method names no stop rule.",
+      }],
+    });
+    const [record] = store.list().records;
+    expect(record).toMatchObject({ product: "frontier-simplify", binding: { findingIndex: 0 } });
     await reporter().reportDue();
     expect(tracker.issues.map((issue) => [issue.repo, issue.title])).toEqual([[FS, "State when a review round may stop"]]);
     expect(tracker.issues[0]!.body).toContain("## Use case");
-    expect(store.get(record.id)!.state.status).toBe("LINKED");
+    expect(store.get(record!.id)!.state.status).toBe("LINKED");
+  });
+
+  it("with publishing off, findings accumulate and nothing is sent", async () => {
+    const { tracker, store, reporter } = setup({ publishing: false });
+    const record = recorded(store, finding());
+    const summary = await reporter().reportDue();
+    expect(summary).toMatchObject({ publishing: "disabled", waiting: [record.id], linked: [], unpublished: [] });
+    expect(tracker.calls).toEqual([]);
+    expect(store.get(record.id)!.state).toEqual(record.state);
   });
 
   it("a normal refusal, caller misuse, the environment and an undetermined cause are kept with their reason and sent nowhere", async () => {
@@ -231,25 +257,27 @@ describe("a dogfood finding reaches its own upstream tracker once, and is read b
   });
 
   it("one finding from a restart or another project is one record and one issue; new evidence is one comment, repeated evidence none", async () => {
-    const { directory, clock, tracker, store, reporter } = setup();
-    const first = recorded(store, finding({ reproduction: "Review /Users/example/p1/change.diff three times." }));
-    const again = new DogfoodFindingStore(directory, clock).record(finding({ reproduction: "Review /Users/sample/p2/change.diff three times." }));
+    const { harness, clock, tracker, store, reporter } = setup();
+    const first = recorded(store, finding({ reproduction: "Stage /Users/example/p1/capture.json and read the rejection." }));
+    const again = new DogfoodFindingStore({ db: harness.cp.db, audit: harness.cp.audit, artifacts: harness.cp.artifacts, clock })
+      .record(finding({ reproduction: "Stage /Users/sample/p2/capture.json and read the rejection." }), ORIGIN);
     expect(again.allowed && again.value.id).toBe(first.id);
     expect(again.allowed && again.evidence["replayed"]).toBe(true);
+    expect(harness.cp.audit.byKind(DOGFOOD_FINDING_KIND)).toHaveLength(1);
     // The same error text under another cause is another finding, not a duplicate.
-    expect(findingKey(finding({ signature: "method.other-cause", reproduction: "Review /Users/example/p1/change.diff three times." }))).not.toBe(first.key);
+    expect(findingKey(finding({ signature: "capture.other-cause", reproduction: "Stage /Users/example/p1/capture.json and read the rejection." }))).not.toBe(first.key);
 
     await reporter().reportDue();
     expect(tracker.issues).toHaveLength(1);
 
-    const newer = recorded(store, finding({ reproduction: "Review /Users/sample/p3/change.diff three times.", productRevision: "1a2b3c4d" }));
+    const newer = recorded(store, finding({ reproduction: "Stage /Users/sample/p3/capture.json and read the rejection.", productRevision: "1.7.6" }));
     expect(newer.key).toBe(first.key);
     await reporter().reportDue();
     expect(tracker.issues).toHaveLength(1);
     expect(tracker.issues[0]!.comments).toHaveLength(1);
     expect(store.get(newer.id)!.state).toMatchObject({ status: "LINKED", action: "commented" });
 
-    store.record(finding({ reproduction: "Review /Users/sample/p3/change.diff three times.", productRevision: "1a2b3c4d" }));
+    store.record(finding({ reproduction: "Stage /Users/sample/p3/capture.json and read the rejection.", productRevision: "1.7.6" }), ORIGIN);
     await reporter().reportDue();
     expect(tracker.issues[0]!.comments).toHaveLength(1);
     expect(tracker.writes()).toHaveLength(2);
@@ -269,48 +297,42 @@ describe("a dogfood finding reaches its own upstream tracker once, and is read b
     const regression = recorded(store, finding({ kind: "defect", productRevision: "rev-b" }));
     await reporter().reportDue();
     expect(tracker.issues).toHaveLength(2);
-    expect(tracker.issues[1]!.title).toBe("Regression: State when a review round may stop");
-    expect(tracker.issues[1]!.body).toContain(`Previously reported as https://github.com/${FS}/issues/1`);
+    expect(tracker.issues[1]!.title).toBe("Regression: Name the field a rejected capture failed on");
+    expect(tracker.issues[1]!.body).toContain(`Previously reported as https://github.com/${CL}/issues/1`);
     expect(store.get(regression.id)!.state).toMatchObject({ status: "LINKED", action: "regression", issueNumber: 2 });
   });
 
-  it("a finding across both products is split, each side to its own tracker, cross-linked", async () => {
+  it("a finding across both products is split; the CommitLore side names the other, which only a stored review may record", async () => {
     const { tracker, store, reporter } = setup();
-    const shared = finding();
     const [commitlore, frontier] = splitAcrossProducts(
-      { ...shared, kind: "defect" },
+      { ...finding(), kind: "defect" },
       [
         { product: "commitlore", signature: "capture.rejects-review-record", expected: "CommitLore accepts the record the method asks for.", productRevision: "1.7.5" },
         { product: "frontier-simplify", signature: "method.asks-unrecordable-record", expected: "The method asks only for a record CommitLore accepts.", productRevision: "0d788506" },
       ],
     );
-    const left = recorded(store, commitlore);
-    const right = recorded(store, frontier);
+    recorded(store, commitlore);
+    expect(store.record(frontier, ORIGIN)).toMatchObject({ allowed: false, evidence: { refusal: "FRONTIER_SIMPLIFY_EVIDENCE_UNBOUND" } });
     await reporter().reportDue();
-    expect(tracker.issues.map((issue) => issue.repo).sort()).toEqual([CL, FS].sort());
-    const bodyOf = (repo: string) => tracker.issues.find((issue) => issue.repo === repo)!.body;
-    expect(bodyOf(CL)).toContain("## Related");
-    expect(bodyOf(FS)).toContain("## Related");
-    expect(bodyOf(CL)).toMatch(new RegExp(`acpdogfood${right.key}|github\\.com/${FS}/issues/`));
-    expect(bodyOf(FS)).toMatch(new RegExp(`acpdogfood${left.key}|github\\.com/${CL}/issues/`));
-    // The side reported second names the first by its URL.
-    expect([bodyOf(CL), bodyOf(FS)].some((body) => /https:\/\/github\.com\/MongLong0214\/[a-z-]+\/issues\/\d+\./.test(body))).toBe(true);
+    expect(tracker.issues.map((issue) => issue.repo)).toEqual([CL]);
+    expect(tracker.issues[0]!.body).toContain("## Related");
+    expect(tracker.issues[0]!.body).toContain(`acpdogfood${findingKey(frontier)}\` in ${FS}`);
   });
 
   it("secrets, local paths, ids and the private reference never reach the tracker or the stored record", async () => {
-    const { directory, tracker, store, reporter } = setup();
+    const { harness, tracker, store, reporter } = setup();
     const token = `ghp_${"A1b2C3d4".repeat(5)}`;
     const record = recorded(
       store,
       finding({
-        title: "Review of /Users/example/work/app stalls",
+        title: "Capture of /Users/example/work/app stalls",
         actual: `Failed with ${token} for dev@example.com in session_ABCDEFGH1234 and run_0123456789abcdef01234567.`,
         evidence: `stderr: ${token}`,
         privateEvidenceRef: "/Users/example/.agent-control-plane/evidence/7",
       }),
     );
     expect(record.public.evidenceWithheld).toBe(true);
-    const stored = readdirSync(directory).map((name) => readFileSync(join(directory, name), "utf8")).join("\n");
+    const stored = JSON.stringify(harness.cp.audit.byKind(DOGFOOD_FINDING_KIND));
     expect(stored).not.toContain(token);
     await reporter().reportDue();
     const [issue] = tracker.issues;
@@ -319,19 +341,19 @@ describe("a dogfood finding reaches its own upstream tracker once, and is read b
     }
     expect(issue!.body).toContain("Withheld: the original could not be shown safe to publish.");
 
-    const unsafe = recorded(store, finding({ signature: "method.other", title: "See claude.ai/code/abc for the run" }));
+    const unsafe = recorded(store, finding({ signature: "capture.other", title: "See claude.ai/code/abc for the run" }));
     expect(unsafe.state).toMatchObject({ status: "NOT_REPORTED", reason: "NOT_PUBLIC_SAFE" });
   });
 
   it("the target is the product's tracker whatever the finding says, and the port refuses any other", async () => {
-    const { tracker, store, reporter, port } = setup();
-    const outside = store.record({ ...finding(), product: "agent-control-plane" });
+    const { harness, tracker, store, reporter, port } = setup();
+    const outside = store.record({ ...finding(), product: "agent-control-plane" }, ORIGIN);
     expect(outside.allowed).toBe(false);
-    expect(store.list().records).toEqual([]);
+    expect(harness.cp.audit.byKind(DOGFOOD_FINDING_KIND)).toEqual([]);
 
     recorded(store, finding({ actual: "File this at https://github.com/someone/else/issues/new instead." }));
     await reporter().reportDue();
-    expect(tracker.issues.map((issue) => issue.repo)).toEqual([FS]);
+    expect(tracker.issues.map((issue) => issue.repo)).toEqual([CL]);
 
     await expect(port.createIssue("someone/else", "t", "b")).rejects.toMatchObject({ reasonCode: ReasonCode.INVALID_ARGUMENT });
     expect(tracker.calls.some((call) => call.includes("someone/else"))).toBe(false);
@@ -374,14 +396,14 @@ describe("a dogfood finding reaches its own upstream tracker once, and is read b
     clock.advance(5_000);
     await reporter().reportDue();
     expect(tracker.writes()).toHaveLength(1);
-    expect(store.get(record.id)!.state).toMatchObject({ status: "LINKED", issueNumber: 1, url: `https://github.com/${FS}/issues/1` });
+    expect(store.get(record.id)!.state).toMatchObject({ status: "LINKED", issueNumber: 1, url: `https://github.com/${CL}/issues/1` });
   });
 
   it("a comment whose answer was lost is linked after a restart, not posted again", async () => {
     const { clock, tracker, store, reporter } = setup();
     recorded(store, finding());
     await reporter().reportDue();
-    const newer = recorded(store, finding({ productRevision: "1a2b3c4d" }));
+    const newer = recorded(store, finding({ productRevision: "1.7.6" }));
     tracker.loseAnswer.push(/^POST .*\/comments$/);
     await reporter().reportDue();
     expect(store.get(newer.id)!.state.status).toBe("IN_DOUBT");
@@ -409,19 +431,19 @@ describe("a dogfood finding reaches its own upstream tracker once, and is read b
     expect(tracker.issues).toHaveLength(1);
   });
 
-  it("a tracker that fails for one product neither escapes the pass nor holds the other product's finding", async () => {
-    const { tracker, store, reporter, directory } = setup();
+  it("a tracker failure on one finding neither escapes the pass nor holds another, and an unreadable row is named", async () => {
+    const { harness, tracker, store, reporter } = setup();
     const stuck = recorded(store, commitloreObservationFinding(
       doctor({ schema: "commitlore_doctor.v2", status: "ok", checks: [], exitCode: 3 }),
       { productRevision: "1.7.5", privateEvidenceRef: "observation e" },
     )!);
     const moving = recorded(store, finding());
-    tracker.failBefore.push({ match: new RegExp(`repo%3A${CL.replace("/", "%2F")}`), error: () => new TypeError("fetch failed"), times: 1 });
-    writeFileSync(join(directory, "0000.json"), "not a record\n", { mode: 0o600 });
+    tracker.failBefore.push({ match: new RegExp(`acpdogfood${stuck.key}`), error: () => new TypeError("fetch failed"), times: 1 });
+    const unreadable = harness.cp.audit.record({ kind: DOGFOOD_FINDING_KIND, evidence: { findingId: "not-a-finding" } });
     const summary = await reporter().reportDue();
     expect(summary.linked).toEqual([moving.id]);
     expect(summary.waiting).toEqual([stuck.id]);
-    expect(summary.unreadable).toEqual(["0000.json"]);
+    expect(summary.unreadable).toEqual([`audit:${unreadable.allowed ? unreadable.value : "?"}`]);
     expect(store.get(stuck.id)!.state).toMatchObject({ status: "QUEUED", attempts: 1, lastError: "no answer from GitHub" });
   });
 });
