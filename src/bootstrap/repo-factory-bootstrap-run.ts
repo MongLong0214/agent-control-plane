@@ -433,6 +433,15 @@ export class RepoFactoryBootstrapRunner {
   }
 
   /**
+   * #1189 B14 — whether a CONFIRM's application of `runId` is running in this process now: from the
+   * moment it is admitted, before its first read of the run, until it has returned. Asked synchronously
+   * by a cancel inside its transaction, so a cancel and an application never both proceed.
+   */
+  applicationInFlight(runId: string): boolean {
+    return this.#applying.has(runId);
+  }
+
+  /**
    * One application attempt of a run at a time in this process (#246 C3): a CONFIRM that arrives
    * while another of the same run is in flight — two re-CONFIRMs racing — consumes nothing, writes
    * nothing and is told so. The attempt record's compare-and-set states the same rule in the

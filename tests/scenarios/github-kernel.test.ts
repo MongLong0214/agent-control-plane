@@ -1113,7 +1113,7 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
     expect(whilePending.reasonCode).toBe(ReasonCode.DEPENDENT_MERGE_BLOCKED);
   });
 
-  it("post-merge verification treats a missing check as a failure, not a pass", async () => {
+  it("post-merge verification treats a missing check as no answer, never a pass; a real failure is recorded and immutable", async () => {
     const fixture = await setup();
     const pullNumber = await prepared(fixture);
     const merged = await fixture.harness.cp.github.mergeExecute({
@@ -1135,8 +1135,23 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
       merged.value.mergeCommitSha,
       ["project-ci"],
     );
+    // #1189 B13 — no answer is not a pass and not a FAIL: refused, nothing recorded, dependents stay blocked.
     expect(verified.allowed).toBe(false);
-    expect(verified.evidence["failed"]).toEqual([{ name: "project-ci", conclusion: "missing" }]);
+    expect(verified.reasonCode).toBe(ReasonCode.POST_MERGE_CHECKS_INCOMPLETE);
+    expect(verified.evidence["incomplete"]).toEqual([{ name: "project-ci", conclusion: "missing" }]);
+    expect(fixture.harness.cp.db.get(`SELECT 1 FROM github_receipts WHERE operation = 'post_merge_verify'`)).toBeUndefined();
+    expect(fixture.harness.cp.github.dependentMergeBlocked(fixture.runId, fixture.identity).allowed).toBe(false);
+
+    // A check that answers failure is a FAIL, recorded once.
+    fixture.github.setPostMergeCheck(merged.value.mergeCommitSha, "project-ci", "failure");
+    const failed = await fixture.harness.cp.github.postMergeVerify(
+      fixture.runId,
+      fixture.identity,
+      merged.value.mergeCommitSha,
+      ["project-ci"],
+    );
+    expect(failed.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
+    expect(failed.evidence["failed"]).toEqual([{ name: "project-ci", conclusion: "failure" }]);
 
     // The failed coverage receipt is immutable: a later check cannot rewrite the fact
     // that this run first failed exact post-merge verification.
@@ -1148,7 +1163,7 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
       ["project-ci"],
     );
     expect(replayed.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
-    expect(replayed.evidence["failed"]).toEqual([{ name: "project-ci", conclusion: "missing" }]);
+    expect(replayed.evidence["failed"]).toEqual([{ name: "project-ci", conclusion: "failure" }]);
   });
 });
 

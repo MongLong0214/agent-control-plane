@@ -895,7 +895,14 @@ describe("post-merge no-check declarations and recovery", () => {
     github.onMerge = conclusion === "missing" ? () => {} : ({ mergeSha }) => github.setPostMergeCheck(mergeSha, "project-ci", "failure");
     const result = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
     expect(result.reasonCode).toBe(ReasonCode.FINALIZATION_COMPENSATION_REQUIRED);
-    expect(harness.cp.audit.byKind("POST_MERGE_FAILED")[0]?.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.BLOCKED_POST_MERGE);
+    // #1189 B13 — a missing check is no answer (POST_MERGE_CHECKS_INCOMPLETE, no receipt); a failing one is a FAIL.
+    if (conclusion === "missing") {
+      expect(harness.cp.audit.byKind("POST_MERGE_CHECKS_INCOMPLETE")[0]?.reasonCode).toBe(ReasonCode.POST_MERGE_CHECKS_INCOMPLETE);
+      expect(harness.cp.audit.byKind("POST_MERGE_FAILED")).toEqual([]);
+    } else {
+      expect(harness.cp.audit.byKind("POST_MERGE_FAILED")[0]?.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
+    }
   });
 
   it("the daemon sweep resumes the historical refusal without publishing, preparing a PR, gating, or merging again; the second call replays completion", async () => {

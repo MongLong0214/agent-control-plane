@@ -32,7 +32,7 @@ export const RECEIPT_BYTES_SHA256 =
   "aa90c6af77754fce9861cb4f57501879c24f66f5616cf46225c5375adfd2a19d";
 
 /**
- * `src/db/migrations.ts`, its historical schema snapshots (v37, v44, v45, v46, v47, v48, v49, v50 and v51), and
+ * `src/db/migrations.ts`, its historical schema snapshots (v37, v44, v45, v46, v47, v48, v49, v50, v51 and v52), and
  * `tests/fixtures/schema-v25-lineage.sql` are append-only, frozen inputs: pinning their exact
  * bytes here means a coordinated edit changes the value a reader compares against, not merely
  * the file being read. These digests are not recomputed from the files they describe: a pin a run
@@ -55,11 +55,15 @@ export const RECEIPT_BYTES_SHA256 =
  *
  * `src/db/schema-v51.sql` is likewise `git show 3915f78c:src/db/schema.sql` (v51's final review head, frozen as
  * v52's prerequisite), and carries that file's git blob id.
+ *
+ * `src/db/schema-v52.sql` is likewise `git show 5d45ae8b:src/db/schema.sql` (unchanged since v52's squash merge,
+ * frozen as the prerequisite of #1189's run-state exits step), and carries that file's git blob id.
  */
 export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob?: string }> = [
   {
     path: "src/db/migrations.ts",
-    sha256: "6f2b136bbe4b14e1e067b4f913d00b8647c2ff3332b96e2041ed3b670cc32c3d",
+    // #1189 — the run-state exits step (v53) and v52's freeze; the frozen historical SQL below is unchanged.
+    sha256: "95bc3dc1b58e767d138122c01c0a7390fad3a1aecb8516dee4fc9064974a4acb",
   },
   {
     path: "src/db/schema-v37.sql",
@@ -102,6 +106,11 @@ export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob
     path: "src/db/schema-v51.sql",
     sha256: "f0d20b4a1bcd369a177e309eaae0659fb03485d32435c38cd68604a866e297cf",
     gitBlob: "dfb804d372e85e276b2735f0bb2367b3724d81ff",
+  },
+  {
+    path: "src/db/schema-v52.sql",
+    sha256: "f0d5f8ac7272a1d26a092f99e4dc75c97a24fe75cdf46f5707e4a54d294b5dc1",
+    gitBlob: "4d92c12346efdb6096955d66fd83933c3a3a9eb5",
   },
   {
     path: "tests/fixtures/schema-v13.sql",

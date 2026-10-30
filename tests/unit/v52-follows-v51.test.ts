@@ -55,8 +55,9 @@ const seedV50 = (path: string): void => {
 
 describe("v52 follows v51", () => {
   it("chains v50 → v51 → v52, and frozen v51 keeps the checksum it was released with", () => {
-    expect(SCHEMA_VERSION).toBe(52);
-    expect(MIGRATIONS.slice(-3).map((step) => [step.id, step.fromVersion, step.toVersion])).toEqual([
+    // v53 (#1189 run-state exits) follows; this file judges the v50 → v52 span.
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(52);
+    expect(MIGRATIONS.filter((step) => step.toVersion >= 50 && step.toVersion <= 52).map((step) => [step.id, step.fromVersion, step.toVersion])).toEqual([
       ["v50-post-merge-verification-reentry", 49, 50],
       ["v51-durable-recipient-delivery", 50, 51],
       ["v52-resident-project-provisioning", 51, 52],
@@ -84,8 +85,12 @@ describe("v52 follows v51", () => {
     const plan = JSON.parse(writes.join("")) as Record<string, unknown>;
     expect(plan).toMatchObject({
       onDiskVersion: 50,
-      buildVersion: 52,
-      plan: { fromVersion: 50, toVersion: 52, migrations: ["v51-durable-recipient-delivery", "v52-resident-project-provisioning"] },
+      buildVersion: SCHEMA_VERSION,
+      plan: {
+        fromVersion: 50,
+        toVersion: SCHEMA_VERSION,
+        migrations: ["v51-durable-recipient-delivery", "v52-resident-project-provisioning", "v53-run-state-exits"],
+      },
     });
     // The field the deployment refuses on is present across the whole 50 → 52 span, and empty here.
     expect(plan).toHaveProperty("v51AnchorFallback");
@@ -123,7 +128,7 @@ describe("v52 follows v51", () => {
 
     // Every row v50 held is still there, v52's new columns aside, and repositories keep their rowids.
     const after = contentDigests(path, 50);
-    expect(after.userVersion).toBe(52);
+    expect(after.userVersion).toBe(SCHEMA_VERSION);
     const { schema_migrations: receiptsBefore, ...restBefore } = before.tables;
     const { schema_migrations: receiptsAfter, ...restAfter } = after.tables;
     expect(Object.fromEntries(Object.keys(restBefore).map((name) => [name, restAfter[name]]))).toEqual(restBefore);
@@ -140,6 +145,7 @@ describe("v52 follows v51", () => {
           { version: 50, migration_id: "v50-post-merge-verification-reentry", checksum: MIGRATIONS.find((step) => step.toVersion === 50)!.checksum() },
           { version: 51, migration_id: "v51-durable-recipient-delivery", checksum: V51_CHECKSUM },
           { version: 52, migration_id: "v52-resident-project-provisioning", checksum: MIGRATIONS.find((step) => step.toVersion === 52)!.checksum() },
+          { version: 53, migration_id: "v53-run-state-exits", checksum: MIGRATIONS.find((step) => step.toVersion === 53)!.checksum() },
         ]);
       // v51's backfill survived the v52 rebuild.
       expect(raw.prepare("SELECT message_id FROM holder_message_terminals").pluck().all()).toEqual(["acked-before-v51"]);

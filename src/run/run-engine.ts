@@ -17,6 +17,7 @@ import {
 } from "../export/baseline-contract.ts";
 import { BaselineRecorder } from "../export/baseline-recorder.ts";
 import { canTransition, isTerminal } from "../domain/run-state.ts";
+import { admitPostApprovalCancel, admitReviewedBootstrapCancel } from "./post-approval-cancel.ts";
 import {
   ArtifactKind,
   type ContinuityMode,
@@ -161,6 +162,17 @@ export interface BootstrapCtoProvisioner {
  */
 export interface WorkerRetirementPort {
   retireRun(runId: string, state: RunState): unknown;
+}
+
+/**
+ * #1189 B14 — the bootstrap runner, as a cancel of a PROJECT_BOOTSTRAP run at CEO review asks it.
+ * `applicationInFlight` is asked synchronously inside the cancel's transaction; `afterBootstrapCancel`
+ * runs only after that transaction commits, releases the reservation through the existing release path
+ * (which re-proves that no external effect happened), and never throws into the cancel.
+ */
+export interface CancelSettlementPort {
+  applicationInFlight(runId: string): boolean;
+  afterBootstrapCancel(runId: string): void;
 }
 
 /** A session `ensure` staffed: freshly spawned and unbound, or the live binding it reuses. */
@@ -373,6 +385,7 @@ export class RunEngine {
   #cto: CtoProvisioner | null = null;
   #bootstrapCto: BootstrapCtoProvisioner | null = null;
   #workerRetirement: WorkerRetirementPort | null = null;
+  #cancelSettlement: CancelSettlementPort | null = null;
   #capacity: CapacityGate | null = null;
   #continuity: ContinuityGate | null = null;
   #ceoReview: CeoReviewGate | null = null;
@@ -402,6 +415,7 @@ export class RunEngine {
     cto?: CtoProvisioner;
     bootstrapCto?: BootstrapCtoProvisioner;
     workerRetirement?: WorkerRetirementPort;
+    cancelSettlement?: CancelSettlementPort;
     capacity?: CapacityGate;
     continuity?: ContinuityGate;
     ceoReview?: CeoReviewGate;
@@ -409,6 +423,7 @@ export class RunEngine {
     if (ports.cto) this.#cto = ports.cto;
     if (ports.bootstrapCto) this.#bootstrapCto = ports.bootstrapCto;
     if (ports.workerRetirement) this.#workerRetirement = ports.workerRetirement;
+    if (ports.cancelSettlement) this.#cancelSettlement = ports.cancelSettlement;
     if (ports.capacity) this.#capacity = ports.capacity;
     if (ports.continuity) this.#continuity = ports.continuity;
     if (ports.ceoReview) this.#ceoReview = ports.ceoReview;
@@ -1178,8 +1193,22 @@ export class RunEngine {
       if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
       const check = canTransition(run.state, RunState.CANCELLED, run.kind);
       if (!check.allowed) return check as Decision<RunRow>;
+      // #1189 B15 — past CEO approval only confirmed non-application is cancelled, judged in this transaction.
+      // B14 — a PROJECT_BOOTSTRAP at CEO review is cancelled only while no CONFIRM's application of it is
+      // in flight and nothing it wrote has landed (WRITTEN), asked in this transaction too.
+      const settlement = this.#cancelSettlement;
+      const reviewedBootstrap = run.kind === RunKind.PROJECT_BOOTSTRAP && run.state === RunState.READY_FOR_CEO_REVIEW;
+      const admitted = reviewedBootstrap
+        ? admitReviewedBootstrapCancel(this.db, run, settlement?.applicationInFlight(runId) ?? false)
+        : admitPostApprovalCancel(this.db, run);
+      if (!admitted.allowed) return admitted as Decision<RunRow>;
       this.tasks.cancelAll(runId, reason);
-      return this.transition(runId, RunState.CANCELLED, reason);
+      const cancelled = this.transition(runId, RunState.CANCELLED, reason, admitted.value);
+      // A frozen bootstrap's reservation is released only once this cancel has committed, and only on proof.
+      if (cancelled.allowed && reviewedBootstrap && settlement) {
+        this.db.afterCommit(() => settlement.afterBootstrapCancel(runId));
+      }
+      return cancelled;
     });
   }
 

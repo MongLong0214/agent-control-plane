@@ -26,6 +26,7 @@ import type {
 } from "../registry/manifest-activation-grants.ts";
 import { GitHubAppClient } from "../github/github-kernel.ts";
 import { workflowDigestAtCommit } from "../github/workflow-digest-at-commit.ts";
+import { FOLLOW_UP_OWNER, type FollowUpAssessment, assessFollowUpRetry, followUpCauseOf } from "./post-merge-follow-up.ts";
 
 type ChangeTarget = Extract<ManifestActivationTarget, { kind: "CHANGE" }>;
 type FirstTarget = Extract<ManifestActivationTarget, { kind: "FIRST" }>;
@@ -450,12 +451,22 @@ export class ApprovedRunFinalizer {
       const candidateDigest = this.cp.runs.currentCandidate(runId);
       const receipts = this.durableMergeReceipts(runId);
       const blocked = run.state === RunState.BLOCKED_POST_MERGE;
+      // #1189 B13 — beside v50's historical refusal, a block whose cause is a follow-up step only, on the
+      // same merges, manifest, grant and target, within its budget (post-merge-follow-up.ts).
+      const followUp: FollowUpAssessment | null = blocked && prior !== null &&
+        prior.failure_reason !== ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED
+        ? assessFollowUpRetry(this.cp.db, run, prior, candidateDigest)
+        : null;
+      const resumable = blocked
+        ? prior?.state === "BLOCKED" &&
+          (prior.failure_reason === ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED || followUp?.refusal === null)
+        : run.state === RunState.POST_MERGE_VERIFYING && this.wasPostMergeResumed(runId);
       if (!prior || !candidateDigest || prior.candidate_digest !== candidateDigest || receipts.length === 0 ||
           receipts.some((receipt) => receipt.status !== "APPLIED" || receipt.verified !== 1 || !this.mergeSha(receipt)) ||
-          (blocked && (prior.state !== "BLOCKED" || prior.failure_reason !== ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED)) ||
-          (!blocked && (run.state !== RunState.POST_MERGE_VERIFYING || !this.wasPostMergeResumed(runId)))) {
+          !resumable) {
         return deny(ReasonCode.FINALIZATION_COMPENSATION_REQUIRED,
-          "run has a partial merge failure and requires its durable compensation plan", { runId, attempt: prior });
+          "run has a partial merge failure and requires its durable compensation plan",
+          { runId, attempt: prior, ...(followUp === null ? {} : { followUp }) });
       }
       const repositories = receipts.map((receipt) => ({
         repositoryIdentity: receipt.repository_identity,
@@ -474,7 +485,7 @@ export class ApprovedRunFinalizer {
             WHERE run_id = ? AND attempt_id = ? AND state = 'BLOCKED'
               AND failure_reason = ? AND candidate_digest = ?`,
           [attemptId, this.leaseOwner, startedAt, deadlineAt, runId, prior.attempt_id,
-            ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED, candidateDigest],
+            prior.failure_reason, candidateDigest],
         );
         if (changed.changes !== 1) return deny(ReasonCode.CONFLICT, "blocked attempt no longer owns this run", { runId });
         // The lease table holds only the current attempt. Preserve the entire old attempt in a
@@ -484,6 +495,9 @@ export class ApprovedRunFinalizer {
           evidence: {
             resumedFromAttemptId: prior.attempt_id,
             reason: prior.failure_reason,
+            ...(followUp === null ? {} : {
+              followUp: followUp.cause, followUpRetry: followUp.retriesUsed + 1, followUpBudget: followUp.budget,
+            }),
             priorAttempt: {
               ...prior,
               compensation_plan_json: prior.compensation_plan_json ? JSON.parse(prior.compensation_plan_json) : null,
@@ -496,8 +510,11 @@ export class ApprovedRunFinalizer {
           evidence: { attemptId, candidateSnapshotDigest: candidateDigest, leaseOwner: this.leaseOwner, deadlineAt, resumed: true },
         });
         const transitioned = this.cp.runs.transition(runId, RunState.POST_MERGE_VERIFYING,
-          "resume post-merge verification with no checks declared", {
-            resumedFromAttemptId: prior.attempt_id, reason: ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED,
+          followUp === null
+            ? "resume post-merge verification with no checks declared"
+            : `resume post-merge follow-up only: ${followUp.cause}`, {
+            resumedFromAttemptId: prior.attempt_id, reason: prior.failure_reason,
+            ...(followUp === null ? {} : { followUp: followUp.cause }),
           });
         if (!transitioned.allowed) return transitioned;
         return allow(ReasonCode.OK, { attemptId, repositories });
@@ -507,7 +524,11 @@ export class ApprovedRunFinalizer {
       if (!retry.allowed) return retry;
       return allow(ReasonCode.OK, { attemptId: retry.value, repositories });
     });
-    if (!acquired.allowed) return acquired;
+    if (!acquired.allowed) {
+      const followUp = acquired.evidence["followUp"] as FollowUpAssessment | undefined;
+      if (followUp?.refusal === "BUDGET_EXHAUSTED") this.recordFollowUpExhausted(runId, followUp);
+      return acquired;
+    }
     const { attemptId, repositories } = acquired.value;
     let completed = false;
     try {
@@ -535,6 +556,32 @@ export class ApprovedRunFinalizer {
     } finally {
       if (!completed) this.releaseAttemptIfRunning(runId, attemptId);
     }
+  }
+
+  /**
+   * #1189 B13 — the follow-up budget is spent: the blocker and its owner are recorded once, and the run
+   * stays BLOCKED_POST_MERGE with its merged commits, receipts and compensation plan as they are.
+   */
+  private recordFollowUpExhausted(runId: string, followUp: FollowUpAssessment): void {
+    this.cp.db.tx(() => {
+      if (this.cp.db.get(`SELECT 1 FROM audit_events WHERE run_id = ? AND kind = 'FINALIZATION_FOLLOW_UP_EXHAUSTED' LIMIT 1`, [runId])) return;
+      const prior = this.attempt(runId);
+      this.cp.audit.record({
+        kind: "FINALIZATION_FOLLOW_UP_EXHAUSTED",
+        runId,
+        roleKey: FOLLOW_UP_OWNER,
+        reasonCode: ReasonCode.FINALIZATION_COMPENSATION_REQUIRED,
+        evidence: {
+          attemptId: prior?.attempt_id ?? null,
+          blocker: prior?.failure_reason ?? null,
+          cause: followUp.cause,
+          retriesUsed: followUp.retriesUsed,
+          budget: followUp.budget,
+          owner: FOLLOW_UP_OWNER,
+          action: "the follow-up retries are spent: the run stays BLOCKED_POST_MERGE with its merged commits, receipts and compensation plan, and its owner decides the recovery",
+        },
+      });
+    });
   }
 
   private async reconfirmAndPlan(
@@ -840,6 +887,15 @@ export class ApprovedRunFinalizer {
     // #664 — the upsert below is the reservation itself; a denial means the reservation
     // did not happen and must not leave a row behind.
     return this.cp.db.txDecision(() => {
+      // #1189 B15 — the run's state is asked again in the transaction that takes the lease, so a cancel
+      // that committed after this finalizer last read the run leaves it nothing to acquire.
+      const current = this.cp.runs.get(runId);
+      if (!current || !this.isFinalizingState(current.state)) {
+        return deny(ReasonCode.GATE_AUTHORITY_DENIED, "the run is no longer CEO-approved; no finalization attempt is acquired", {
+          runId,
+          state: current?.state ?? null,
+        });
+      }
       const now = this.cp.clock.now();
       const startedAt = now.toISOString();
       const deadlineAt = new Date(now.getTime() + FINALIZATION_LEASE_TTL_MS).toISOString();
@@ -958,6 +1014,11 @@ export class ApprovedRunFinalizer {
         reasonCode: ReasonCode.FINALIZATION_COMPENSATION_REQUIRED,
         evidence: { attemptId, failureReasonCode: failure.reasonCode, compensation },
       });
+      // #1189 B13 — a block whose cause is a follow-up step only is marked so, in its own small record.
+      const followUpCause = followUpCauseOf(failure.reasonCode, failure.evidence);
+      if (followUpCause !== null) {
+        this.cp.audit.record({ kind: "FINALIZATION_FOLLOW_UP_RETRYABLE", runId, evidence: { attemptId, cause: followUpCause } });
+      }
       return deny(
         ReasonCode.FINALIZATION_COMPENSATION_REQUIRED,
         "a merge may have occurred; run is blocked with a compensation plan",

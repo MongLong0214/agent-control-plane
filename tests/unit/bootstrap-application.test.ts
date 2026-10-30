@@ -3129,3 +3129,94 @@ describe("#246 C3 review 1076-R3: a withheld request is made at most once, its e
     expect(withheldUnsent(readWithheldIntent(workDir, key))).toBe(false);
   });
 });
+
+/**
+ * #1189 B14 (CEO ruling 2) — the direct cancel of a frozen bootstrap at CEO review, by the CEO over the
+ * Hermes socket (the existing `run_cancel` authority). It never races the run's CONFIRM: it is refused
+ * while that CONFIRM's application is in flight, and once it commits nothing further is written and the
+ * CONFIRM is refused. The reservation is released only after the cancel commits, and only on the release
+ * path's own proof; otherwise it is kept, as STRANDED or RELEASE_IN_DOUBT. Nothing on GitHub is deleted.
+ */
+describe("#1189 B14: a frozen bootstrap at CEO review is cancelled directly, never racing its CONFIRM", () => {
+  const reservationAfterCancel = (f: Fixture, runId: string) =>
+    f.harness.cp.audit.forRun(runId).filter((entry) => entry.kind === "BOOTSTRAP_RESERVATION_AFTER_CANCEL").map((entry) => entry.evidence["outcome"]);
+
+  it("refuses the cancel while the CONFIRM's attempt is in flight; once it ended, the cancel commits, the reservation is released, and the CONFIRM is refused", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("b14-race"));
+
+      const observe = f.github.observeRepository.bind(f.github);
+      const hung = deferred();
+      let reads = 0;
+      const read = vi.spyOn(f.github, "observeRepository").mockImplementation(async (target) => {
+        reads += 1;
+        return reads === 2 ? hung.promise : observe(target);
+      });
+      const confirming = confirm(f, run);
+      await vi.waitFor(() => expect(reads).toBe(2), { timeout: 30_000, interval: 20 });
+
+      const raced = await f.hermes("run_cancel", { runId: run.runId, reason: "the bootstrap is abandoned" });
+      expect(raced, JSON.stringify(raced)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS });
+      expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+
+      hung.reject(new Error("the read never answered"));
+      expect((await confirming)["ok"]).toBe(false);
+      read.mockRestore();
+      expect(f.github.writes).toEqual([]);
+
+      const cancelled = await f.hermes("run_cancel", { runId: run.runId, reason: "the bootstrap is abandoned" });
+      expect(cancelled, JSON.stringify(cancelled)).toMatchObject({ ok: true });
+      expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.CANCELLED);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RELEASED", attempts: 1 });
+      expect(reservationAfterCancel(f, run.runId)).toEqual(["RELEASED"]);
+      expect((await confirm(f, run))["ok"]).toBe(false);
+      expect(f.github.writes).toEqual([]);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RELEASED", attempts: 1 });
+    });
+  });
+
+  it("a cancelled frozen bootstrap whose attempt provably sent nothing releases its reservation, with no separate repair", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("b14-release"));
+      await attemptEndsBeforeAnyRequest(f, run);
+
+      const cancelled = await f.hermes("run_cancel", { runId: run.runId, reason: "the bootstrap is abandoned" });
+      expect(cancelled, JSON.stringify(cancelled)).toMatchObject({ ok: true });
+      expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.CANCELLED);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RELEASED", attempts: 1, projectId: "b14-release", repositoryIdentity: BOOTSTRAP_IDENTITY });
+      expect(applicationOf(f, run.runId)?.lastRefusal).toMatchObject({ cause: "RELEASED", evidence: { attempts: 1, ledgerPresent: false, ledgerStageAttempts: [] } });
+      expect(reservationAfterCancel(f, run.runId)).toEqual(["RELEASED"]);
+      expect(f.github.writes).toEqual([]);
+    });
+  });
+
+  it("a request sent and never resolved keeps the reservation RELEASE_IN_DOUBT; the run is CANCELLED and the name stays held", async () => {
+    await withFixture(async (f) => {
+      const doubt = await reviewedBootstrap(f, cleanTreeManifest("b14-doubt"));
+      f.github.failNext = "createRepository";
+      expect((await confirm(f, doubt))["ok"]).toBe(false);
+      expect((await f.hermes("run_cancel", { runId: doubt.runId, reason: "abandoned" }))["ok"]).toBe(true);
+      expect(f.harness.cp.runs.require(doubt.runId).state).toBe(RunState.CANCELLED);
+      expect(applicationOf(f, doubt.runId)).toMatchObject({ phase: "RESERVED", lastRefusal: { refusal: "RELEASE_IN_DOUBT", cause: "UNRESOLVED_REQUEST" } });
+      expect(reservationAfterCancel(f, doubt.runId)).toEqual(["KEPT_IN_DOUBT"]);
+      // The name stays held: another run is refused the same repository identity.
+      const next = await reviewedBootstrap(f, cleanTreeManifest("b14-doubt-next"), "bootstrap-next");
+      expect(await confirm(f, next)).toMatchObject({ ok: false, reasonCode: "BOOTSTRAP_APPLICATION_RESERVED" });
+    });
+  });
+
+  it("a STRANDED application is cancelled with its run and keeps its reservation as it is", async () => {
+    await withFixture(async (f) => {
+      const stranded = await reviewedBootstrap(f, cleanTreeManifest("b14-stranded"));
+      await attemptEndsBeforeAnyRequest(f, stranded);
+      expect(f.harness.cp.bootstrapApplications.markStranded(stranded.runId, {
+        cause: "ATTRIBUTION_UNCERTAIN", requiredRecovery: "recorded recovery", evidence: { ledger: "attempt-ledger" },
+      }).allowed).toBe(true);
+      expect((await f.hermes("run_cancel", { runId: stranded.runId, reason: "abandoned" }))["ok"]).toBe(true);
+      expect(f.harness.cp.runs.require(stranded.runId).state).toBe(RunState.CANCELLED);
+      expect(applicationOf(f, stranded.runId)).toMatchObject({ phase: "STRANDED", projectId: "b14-stranded" });
+      expect(reservationAfterCancel(f, stranded.runId)).toEqual(["KEPT"]);
+    });
+  });
+});

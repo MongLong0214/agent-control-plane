@@ -179,6 +179,8 @@ const LATER_OBJECTS: ReadonlyArray<{ version: number; objects?: readonly string[
       "bootstrap_applications.retired_at",
     ],
   },
+  // #1189 — the run-state exits add one guard; the two state guards they replace keep their names.
+  { version: 53, objects: ["runs_cancel_after_approval_requires_no_grant"] },
   { version: 47, objects: ["run_artifacts_owner_decision_authority_guard"] },
   {
     version: 48,

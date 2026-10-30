@@ -381,6 +381,19 @@ export const ReasonCode = {
   GATE_EVIDENCE_NOT_BACKED: "GATE_EVIDENCE_NOT_BACKED",
   POST_MERGE_CHECKS_NOT_DECLARED: "POST_MERGE_CHECKS_NOT_DECLARED",
   POST_MERGE_VERIFICATION_FAILED: "POST_MERGE_VERIFICATION_FAILED",
+  /**
+   * #1189 B13 — the bounded post-merge wait ended with every failing declared check still missing or
+   * incomplete: no answer, so no receipt is written and the merge state stays pending. The run ends
+   * BLOCKED_POST_MERGE naming this, and the finalizer may retry the lookup on the same merge, within
+   * its budget. A check that answered anything but success is POST_MERGE_VERIFICATION_FAILED.
+   */
+  POST_MERGE_CHECKS_INCOMPLETE: "POST_MERGE_CHECKS_INCOMPLETE",
+  /**
+   * #1189 B15 — a CONTRACT_CHANGE confirmed without an activation grant was not cancelled: that its
+   * approval was never applied could not be confirmed. `evidence.classification` names why: a
+   * finalization in flight, an external effect whose outcome is unknown, or a grant record in error.
+   */
+  CANCEL_NON_APPLICATION_UNCONFIRMED: "CANCEL_NON_APPLICATION_UNCONFIRMED",
   DEPENDENT_MERGE_BLOCKED: "DEPENDENT_MERGE_BLOCKED",
   RELEASE_TAG_SEMVER_MISMATCH: "RELEASE_TAG_SEMVER_MISMATCH",
   RELEASE_TAG_COMMIT_NOT_ACCEPTED: "RELEASE_TAG_COMMIT_NOT_ACCEPTED",

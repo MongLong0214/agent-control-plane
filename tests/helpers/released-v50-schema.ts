@@ -21,8 +21,25 @@ export const takeBackV50 = (raw: Database.Database): void => {
   }
 };
 
+/** The definitions v53 replaces, and the one it adds, named independently of the migration. */
+export const V53_CHANGED_GUARDS = ["runs_state_transition_guard", "runs_state_transition_authority_guard"];
+export const V53_ADDED_TRIGGERS = ["runs_cancel_after_approval_requires_no_grant"];
+
+/** A fixture built from a current database that claims to predate v53 holds v52's state guards and not v53's guard. */
+export const takeBackV53 = (raw: Database.Database): void => {
+  const snapshot = readFileSync(new URL("../../src/db/schema-v52.sql", import.meta.url), "utf8");
+  for (const name of V53_ADDED_TRIGGERS) raw.exec(`DROP TRIGGER IF EXISTS ${name}`);
+  for (const name of V53_CHANGED_GUARDS) {
+    const ddl = new RegExp(`CREATE TRIGGER IF NOT EXISTS ${name}\\n[\\s\\S]*?\\nEND;`).exec(snapshot)?.[0];
+    if (!ddl) throw new Error(`${name} is absent from the v52 snapshot`);
+    raw.exec(`DROP TRIGGER IF EXISTS ${name}`);
+    raw.exec(ddl);
+  }
+};
+
 /** Historical fixtures must remove v52's additive objects and restore the three parent definitions v51 left. */
 export const takeBackV52 = (raw: Database.Database): void => {
+  takeBackV53(raw);
   if (!(raw.prepare('PRAGMA table_info(projects)').all() as {name:string}[]).some(c => c.name === 'retired_at')) return;
   const snapshot = readFileSync(new URL('../../src/db/schema-v51.sql',import.meta.url),'utf8');
   raw.pragma('foreign_keys = OFF');raw.pragma('legacy_alter_table = ON');

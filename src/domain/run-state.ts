@@ -22,10 +22,15 @@ const TRANSITIONS: Readonly<Record<RunState, readonly RunState[]>> = {
     RunState.CANCELLED,
     RunState.AWAITING_HUMAN,
   ],
+  // #1189 B14 (schema v53) — a run at CEO review, a frozen PROJECT_BOOTSTRAP included, may be cancelled.
+  // The cancel and a CONFIRM each decide against the state inside their own transaction, so the later
+  // one is refused; a bootstrap whose CONFIRM is still applying, or whose writes landed, is not cancelled
+  // (`admitReviewedBootstrapCancel`), and its reservation is released only after the cancel commits.
   [RunState.READY_FOR_CEO_REVIEW]: [
     RunState.CEO_APPROVED,
     RunState.REVISION_REQUIRED,
     RunState.AWAITING_HUMAN,
+    RunState.CANCELLED,
   ],
   // A CEO approval authorizes the daemon to begin a one-way external finalization
   // sequence. It is deliberately not completion: completion is only legal after exact
@@ -62,11 +67,25 @@ export const TERMINAL_RUN_STATES: readonly RunState[] = Object.freeze([
 
 export const isTerminal = (state: RunState): boolean => TERMINAL_RUN_STATES.includes(state);
 
+/**
+ * #1189 B15 (schema v53) — the states a CONTRACT_CHANGE confirmed without an activation grant may be
+ * cancelled from. The edge is the kind's alone, the database refuses it once a grant exists
+ * (`runs_cancel_after_approval_requires_no_grant`), and `RunEngine.cancel` takes it only when
+ * non-application is confirmed (`post-approval-cancel.ts`).
+ */
+const CONTRACT_CHANGE_UNAPPLIED_CANCEL_FROM: readonly RunState[] = Object.freeze([
+  RunState.CEO_APPROVED,
+  RunState.MERGING,
+  RunState.POST_MERGE_VERIFYING,
+]);
+
 /** Returns a copy: callers must not be able to reach the table itself. */
-export const legalTargets = (from: RunState, kind?: RunKind): readonly RunState[] =>
-  kind === RunKind.PROJECT_BOOTSTRAP && from === RunState.READY_FOR_CEO_REVIEW
-    ? [...TRANSITIONS[from], RunState.COMPLETED]
-    : [...TRANSITIONS[from]];
+export const legalTargets = (from: RunState, kind?: RunKind): readonly RunState[] => {
+  const targets = [...TRANSITIONS[from]];
+  if (kind === RunKind.PROJECT_BOOTSTRAP && from === RunState.READY_FOR_CEO_REVIEW) targets.push(RunState.COMPLETED);
+  if (kind === RunKind.CONTRACT_CHANGE && CONTRACT_CHANGE_UNAPPLIED_CANCEL_FROM.includes(from)) targets.push(RunState.CANCELLED);
+  return targets;
+};
 
 export const canTransition = (from: RunState, to: RunState, kind?: RunKind): Decision<RunState> => {
   if (from === to) {

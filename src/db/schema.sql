@@ -655,6 +655,11 @@ CREATE INDEX IF NOT EXISTS finalization_attempts_running_deadline
 -- CP-HI-02 — §29's state machine is enforced in the database, not only in the service that usually writes it.
 -- §29 is a persisted state machine. The service owns authority/evidence/outbox work,
 -- while this guard rejects topology bypasses even from a raw SQLite caller.
+-- #1189 (schema v53) — CANCELLED is reachable from READY_FOR_CEO_REVIEW (B14), and from CEO_APPROVED,
+-- MERGING and POST_MERGE_VERIFYING only for a CONTRACT_CHANGE holding no activation grant (B15,
+-- `runs_cancel_after_approval_requires_no_grant` below). Like every edge it needs the authority marker.
+-- That nothing merged is RunEngine.cancel's check, not a guard's: a guard reading github_receipts
+-- would tie these triggers to every rebuild of that table (v49 refuses such a trigger).
 CREATE TRIGGER IF NOT EXISTS runs_state_transition_guard
 BEFORE UPDATE OF state ON runs
 WHEN NEW.state <> OLD.state
@@ -662,10 +667,10 @@ WHEN NEW.state <> OLD.state
    (OLD.state = 'QUEUED' AND NEW.state IN ('ACTIVE','CANCELLED')) OR
    (OLD.state = 'ACTIVE' AND NEW.state IN ('BLOCKED','READY_FOR_CEO_REVIEW','FAILED','CANCELLED','AWAITING_HUMAN')) OR
    (OLD.state = 'BLOCKED' AND NEW.state IN ('ACTIVE','FAILED','CANCELLED','AWAITING_HUMAN')) OR
-   (OLD.state = 'READY_FOR_CEO_REVIEW' AND NEW.state IN ('CEO_APPROVED','COMPLETED','REVISION_REQUIRED','AWAITING_HUMAN')) OR
-   (OLD.state = 'CEO_APPROVED' AND NEW.state IN ('MERGING')) OR
-   (OLD.state = 'MERGING' AND NEW.state IN ('POST_MERGE_VERIFYING','BLOCKED_POST_MERGE')) OR
-   (OLD.state = 'POST_MERGE_VERIFYING' AND NEW.state IN ('MERGING','COMPLETED','BLOCKED_POST_MERGE')) OR
+   (OLD.state = 'READY_FOR_CEO_REVIEW' AND NEW.state IN ('CEO_APPROVED','COMPLETED','REVISION_REQUIRED','AWAITING_HUMAN','CANCELLED')) OR
+   (OLD.state = 'CEO_APPROVED' AND NEW.state IN ('MERGING','CANCELLED')) OR
+   (OLD.state = 'MERGING' AND NEW.state IN ('POST_MERGE_VERIFYING','BLOCKED_POST_MERGE','CANCELLED')) OR
+   (OLD.state = 'POST_MERGE_VERIFYING' AND NEW.state IN ('MERGING','COMPLETED','BLOCKED_POST_MERGE','CANCELLED')) OR
    (OLD.state = 'BLOCKED_POST_MERGE' AND NEW.state = 'POST_MERGE_VERIFYING') OR
    (OLD.state = 'REVISION_REQUIRED' AND NEW.state IN ('ACTIVE','FAILED','CANCELLED')) OR
    (OLD.state = 'AWAITING_HUMAN' AND NEW.state IN ('ACTIVE','CANCELLED','FAILED'))
@@ -693,10 +698,10 @@ WHEN NEW.state <> OLD.state
    (OLD.state = 'QUEUED' AND NEW.state IN ('ACTIVE','CANCELLED')) OR
    (OLD.state = 'ACTIVE' AND NEW.state IN ('BLOCKED','READY_FOR_CEO_REVIEW','FAILED','CANCELLED','AWAITING_HUMAN')) OR
    (OLD.state = 'BLOCKED' AND NEW.state IN ('ACTIVE','FAILED','CANCELLED','AWAITING_HUMAN')) OR
-   (OLD.state = 'READY_FOR_CEO_REVIEW' AND NEW.state IN ('CEO_APPROVED','COMPLETED','REVISION_REQUIRED','AWAITING_HUMAN')) OR
-   (OLD.state = 'CEO_APPROVED' AND NEW.state IN ('MERGING')) OR
-   (OLD.state = 'MERGING' AND NEW.state IN ('POST_MERGE_VERIFYING','BLOCKED_POST_MERGE')) OR
-   (OLD.state = 'POST_MERGE_VERIFYING' AND NEW.state IN ('MERGING','COMPLETED','BLOCKED_POST_MERGE')) OR
+   (OLD.state = 'READY_FOR_CEO_REVIEW' AND NEW.state IN ('CEO_APPROVED','COMPLETED','REVISION_REQUIRED','AWAITING_HUMAN','CANCELLED')) OR
+   (OLD.state = 'CEO_APPROVED' AND NEW.state IN ('MERGING','CANCELLED')) OR
+   (OLD.state = 'MERGING' AND NEW.state IN ('POST_MERGE_VERIFYING','BLOCKED_POST_MERGE','CANCELLED')) OR
+   (OLD.state = 'POST_MERGE_VERIFYING' AND NEW.state IN ('MERGING','COMPLETED','BLOCKED_POST_MERGE','CANCELLED')) OR
    (OLD.state = 'BLOCKED_POST_MERGE' AND NEW.state = 'POST_MERGE_VERIFYING') OR
    (OLD.state = 'REVISION_REQUIRED' AND NEW.state IN ('ACTIVE','FAILED','CANCELLED')) OR
    (OLD.state = 'AWAITING_HUMAN' AND NEW.state IN ('ACTIVE','CANCELLED','FAILED'))
@@ -1712,6 +1717,19 @@ WHEN NEW.state = 'COMPLETED' AND OLD.state IS NOT 'COMPLETED' AND NEW.kind = 'CO
 )
 BEGIN
   SELECT RAISE(ABORT, 'CONTRACT_CHANGE_NOT_ACTIVATED');
+END;
+
+-- CP-HI-02 — #1189 B15 (schema v53): after a CEO approval only a CONTRACT_CHANGE that holds no activation
+-- grant may be cancelled. A grant is issued in the transaction that approves, so a cancel and an issue
+-- cannot both commit; a run that holds one, and every other kind, finalizes or blocks post-merge instead.
+CREATE TRIGGER IF NOT EXISTS runs_cancel_after_approval_requires_no_grant
+BEFORE UPDATE OF state ON runs
+WHEN NEW.state = 'CANCELLED' AND OLD.state IN ('CEO_APPROVED','MERGING','POST_MERGE_VERIFYING')
+ AND (OLD.kind IS NOT 'CONTRACT_CHANGE'
+  OR EXISTS (SELECT 1 FROM manifest_activation_grants g WHERE g.run_id = OLD.run_id)
+  OR EXISTS (SELECT 1 FROM manifest_first_activation_grants f WHERE f.run_id = OLD.run_id))
+BEGIN
+  SELECT RAISE(ABORT, 'RUN_STATE_TRANSITION_ILLEGAL');
 END;
 
 -- ---------------------------------------------------------------------------

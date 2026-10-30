@@ -345,6 +345,10 @@ interface ObservedPostMergeCheck {
   conclusion: string;
 }
 
+/** A declared post-merge check that has not answered yet: absent, or still running. */
+const isUnansweredPostMergeCheck = (check: ObservedPostMergeCheck): boolean =>
+  check.conclusion === "missing" || check.conclusion.startsWith("incomplete:");
+
 /**
  * PRD §24 — the sole writer of programmatic merges and production gates.
  *
@@ -3153,6 +3157,24 @@ export class GitHubKernel {
     const observed = observedResult.value;
     const failed = observed.filter((c) => c.conclusion !== "success");
 
+    // #1189 B13 — the bounded wait ended with every failing check still missing or incomplete. That is
+    // no answer: no receipt is written and the merge state stays pending, so dependent merges stay
+    // blocked and a later lookup on this exact merge is not replayed as a failure. Every declared
+    // check stays mandatory; anything that answered other than success is a FAIL below.
+    if (failed.length > 0 && failed.every(isUnansweredPostMergeCheck)) {
+      this.audit.record({
+        kind: "POST_MERGE_CHECKS_INCOMPLETE",
+        runId,
+        reasonCode: ReasonCode.POST_MERGE_CHECKS_INCOMPLETE,
+        evidence: { repositoryIdentity, mergeCommitSha, incomplete: failed },
+      });
+      return deny(
+        ReasonCode.POST_MERGE_CHECKS_INCOMPLETE,
+        "post-merge checks were still missing or incomplete when the bounded wait ended; dependent merges stay blocked",
+        { mergeCommitSha, incomplete: failed },
+      );
+    }
+
     this.writeReceipt({
       idempotencyKey,
       operation: "post_merge_verify",
@@ -3208,9 +3230,7 @@ export class GitHubKernel {
       if (!inspected.allowed) return inspected;
       observed = inspected.value;
       const failed = observed.filter((check) => check.conclusion !== "success");
-      const transientOnly = failed.length > 0 && failed.every((check) =>
-        check.conclusion === "missing" || check.conclusion.startsWith("incomplete:"),
-      );
+      const transientOnly = failed.length > 0 && failed.every(isUnansweredPostMergeCheck);
       if (!transientOnly || attempt === this.postMergePollAttempts) return allow(ReasonCode.OK, observed);
       await this.sleep(this.postMergePollIntervalMs);
     }

@@ -994,12 +994,14 @@ describe("post-merge verification cannot be made vacuous (§24.7)", () => {
       fixture.identity,
       mergeSha,
     );
+    // #1189 B13 — a declared check that never answered is not a PASS and not a recorded FAIL: refused, no receipt.
     expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
-    expect(refused.evidence["failed"]).toEqual([{ name: "project-ci", conclusion: "missing" }]);
+    expect(refused.reasonCode).toBe(ReasonCode.POST_MERGE_CHECKS_INCOMPLETE);
+    expect(refused.evidence["incomplete"]).toEqual([{ name: "project-ci", conclusion: "missing" }]);
+    expect(fixture.harness.cp.db.get(`SELECT 1 FROM github_receipts WHERE operation = 'post_merge_verify'`)).toBeUndefined();
   });
 
-  it("treats a check that has not completed as a failure", async () => {
+  it("treats a check that has not completed as no answer: refused, never a PASS, and no FAIL is recorded", async () => {
     const fixture = await setup();
     const mergeSha = await mergeForReal(fixture);
     fixture.github.checkRuns.push({
@@ -1017,9 +1019,11 @@ describe("post-merge verification cannot be made vacuous (§24.7)", () => {
       mergeSha,
     );
     expect(refused.allowed).toBe(false);
-    expect(refused.evidence["failed"]).toEqual([
+    expect(refused.reasonCode).toBe(ReasonCode.POST_MERGE_CHECKS_INCOMPLETE);
+    expect(refused.evidence["incomplete"]).toEqual([
       { name: "project-ci", conclusion: "incomplete:in_progress" },
     ]);
+    expect(fixture.harness.cp.db.get(`SELECT 1 FROM github_receipts WHERE operation = 'post_merge_verify'`)).toBeUndefined();
   });
 
   it("#387/#388: paginates flooded gate and post-merge lists, then accepts a fully proven Actions workflow", async () => {
