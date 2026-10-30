@@ -313,7 +313,10 @@ it.each(["dev","main"])("S-TB-06 %s real worker, freeze, verification, and PR pr
   const manifest=cp.projects.manifest(run.pinnedManifestDigest!)!;
   const verified=await cp.verification.verify({runId:s.runId,snapshot:frozen.value,commands:commandsForMode(manifest,run.executionMode),contractDigest:run.contractDigest});
   console.error("LINEAGE_VERIFY",base,JSON.stringify(verified));
-  expect.soft(verified.allowed).toBe(true);
+  // #1227 review r3 (PR #1256, D-P2) — the base branch moved past the run's pin, so the frozen candidate is
+  // stale: verification refuses it before any command runs, as the CEO confirmation does.
+  expect(verified).toMatchObject({allowed:false,reasonCode:ReasonCode.SNAPSHOT_STALE});
+  expect(verified.evidence["drift"]).toEqual([expect.objectContaining({identity:IDENTITY,baseBranch:base,expectedBaseHead:target.baseSha,observedBaseHead:advanced})]);
   // Exercise actual prPrepare and its readback with finalization state set by the test. The remote
   // base moved after the recorded pin, so preparation must fail closed without finalizing the
   // reservation created before the external PR effect.

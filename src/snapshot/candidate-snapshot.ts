@@ -313,7 +313,8 @@ export interface FreshnessProbe {
   checkoutPath: string;
   /**
    * #1227 — the resident's clone, when `checkoutPath` is that resident's worker clone
-   * (`residentBaseClone`): the base branch is read there as the current base. Only read.
+   * (`residentBaseClone`): the base branch is read there as the current base. Only read. Without
+   * one, a pinned candidate's current base is read in `checkoutPath`.
    */
   residentClone?: string | null;
   /**
@@ -368,16 +369,20 @@ export const verifySnapshotFreshness = async (
       });
       continue;
     }
-    // #1227 review r2 (PR #1256, D-P2) — a resident's worker clone keeps its base branch where the clone
-    // was made, so the check above cannot see the resident move its base. The current base is the
-    // resident's base branch in its clone, read only (no ref, no FETCH_HEAD); pinned or not, a candidate
-    // whose base is no longer that commit is stale.
-    if (probe.residentClone) {
-      const current = await tryRevParse(probe.residentClone, `refs/heads/${repo.baseBranch}`);
+    // #1227 review r2/r3 (PR #1256, D-P2) — readable is not current: a pinned candidate is held to the
+    // base branch as it stands now, read where the run's base pin read it (`task-write-target.ts`): a
+    // resident's base branch in its clone, since the resident's worker clone keeps its own where the
+    // clone was made, and otherwise the registered checkout's. Read only (no ref, no FETCH_HEAD);
+    // pinned or not, a candidate whose base is no longer that commit is stale.
+    const currentBaseAt = probe.residentClone || (repo.baseHeadPinned === true ? probe.checkoutPath : null);
+    if (currentBaseAt) {
+      const current = await tryRevParse(currentBaseAt, `refs/heads/${repo.baseBranch}`);
       if (current !== repo.baseHead) {
         drift.push({
           identity: repo.identity,
-          reason: "the resident's base branch no longer names the candidate's base",
+          reason: probe.residentClone
+            ? "the resident's base branch no longer names the candidate's base"
+            : "the base branch no longer names the candidate's pinned base",
           baseBranch: repo.baseBranch,
           expectedBaseHead: repo.baseHead,
           observedBaseHead: current,

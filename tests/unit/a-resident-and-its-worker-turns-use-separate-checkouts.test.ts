@@ -482,7 +482,8 @@ describe("#1227 a resident's working directory never reaches a worker turn", () 
         expect(gitSync(checkout, ["show", `${repo.candidateHead}:src/app.js`])).toBe("module.exports = () => 2;");
         expect(gitSync(checkout, ["show", `${repo.candidateHead}:README.md`])).toBe("# task one");
         expect(repo.touchedPaths).toEqual(["README.md", "src/app.js"]);
-        expect((await verifySnapshotFreshness(frozen.value, [{ identity: IDENTITY, checkoutPath: checkout }])).allowed).toBe(true);
+        // Fresh as every freshness caller probes a resident: the worker clone, and the resident's clone for the current base.
+        expect((await verifySnapshotFreshness(frozen.value, [{ identity: IDENTITY, checkoutPath: checkout, residentClone: s.clone }])).allowed).toBe(true);
         // Candidate verification runs on the integrated commit, read from the worker clone.
         const run = cp.runs.require(s.runId);
         const manifest = cp.projects.manifest(run.pinnedManifestDigest!)!;
@@ -600,6 +601,60 @@ describe("#1227 review r2 (PR #1256, D-P2): candidate freshness reads the reside
         const checks = freshnessChecks(f, s, frozen.value);
         expect(await checks.pipeline()).toMatchObject({ allowed: true });
         expect(checks.confirm()).toMatchObject({ allowed: true });
+      } finally {
+        worker.killAll();
+      }
+    }, { repoPath: residentClone() });
+  });
+});
+
+describe("#1227 review r3 (PR #1256, D-P2): a non-resident candidate is held to its registered checkout's base", () => {
+  it("a candidate frozen in a non-resident's checkout goes stale when its dev moves through another worktree: snapshot, pipeline and verification freshness refuse it, as the CEO confirmation does, and none writes a ref or FETCH_HEAD", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "non-resident-p2", [APP]);
+      const worker = workerDoing(f);
+      try {
+        const target = await provision(f, s, s.ids["app"]!);
+        const { execution } = await turn(f, s, worker, s.ids["app"]!, await claim(f, s, target, s.clone), { writes: { "src/app.js": "module.exports = () => 2;\n" } });
+        expect(execution!.status).toBe("SUCCEEDED");
+        const frozen = await cp.pipeline.freeze(s.runId);
+        if (!frozen.allowed) throw new Error(`${frozen.reasonCode}: ${frozen.message}`);
+        const snapshot = frozen.value;
+        expect(snapshot.repositories[0]).toMatchObject({ baseBranch: "dev", baseHead: target.baseSha, baseHeadPinned: true });
+        const probes = [{ identity: IDENTITY, checkoutPath: s.clone }];
+        const checks = freshnessChecks(f, s, snapshot);
+        // Fresh while the registered checkout's dev is the base the candidate was made from.
+        expect(await verifySnapshotFreshness(snapshot, probes)).toMatchObject({ allowed: true });
+        expect(await checks.verify()).toMatchObject({ allowed: true });
+        expect(await checks.pipeline()).toMatchObject({ allowed: true });
+        expect(checks.confirm()).toMatchObject({ allowed: true });
+
+        // Someone commits a README change on dev through another worktree of the registered checkout.
+        const other = join(realpathSync(tempDir("acp-non-resident-wt-")), "dev");
+        gitSync(s.clone, ["worktree", "add", "-q", other, "dev"]);
+        writeFileSync(join(other, "README.md"), "# dev moved in another worktree\n");
+        gitSync(other, ["commit", "-q", "-am", "dev moves after freeze"]);
+        const movedBase = gitSync(s.clone, ["rev-parse", "refs/heads/dev"]);
+        expect(movedBase).not.toBe(target.baseSha);
+        const before = refsAndFetchHead(s.clone);
+
+        // The candidate keeps the old README, and every freshness check now refuses it as stale.
+        expect(gitSync(s.clone, ["show", `${snapshot.repositories[0]!.candidateHead}:README.md`])).toBe("# fixture project");
+        const drift = expect.objectContaining({ identity: IDENTITY, baseBranch: "dev", expectedBaseHead: target.baseSha, observedBaseHead: movedBase });
+        const fresh = await verifySnapshotFreshness(snapshot, probes);
+        expect(fresh).toMatchObject({ allowed: false, reasonCode: ReasonCode.SNAPSHOT_STALE });
+        expect(fresh.evidence?.["drift"]).toEqual([drift]);
+        const pipeline = await checks.pipeline();
+        expect(pipeline).toMatchObject({ allowed: false, reasonCode: ReasonCode.SNAPSHOT_STALE });
+        expect(pipeline.evidence?.["drift"]).toEqual([drift]);
+        const verified = await checks.verify();
+        expect(verified).toMatchObject({ allowed: false, reasonCode: ReasonCode.SNAPSHOT_STALE });
+        expect(verified.evidence?.["drift"]).toEqual([drift]);
+        expect(checks.confirm()).toMatchObject({ allowed: false, reasonCode: ReasonCode.SNAPSHOT_STALE });
+
+        // Read only: no ref or FETCH_HEAD in the registered checkout was written.
+        expect(refsAndFetchHead(s.clone)).toBe(before);
       } finally {
         worker.killAll();
       }
