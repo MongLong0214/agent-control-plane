@@ -316,6 +316,8 @@ export interface FakeTurnScript {
   neverRuns?: boolean;
   /** Awaited inside the admitted effect just before the child is spawned. */
   beforeSpawn?: () => Promise<void>;
+  /** #1268 — the reply the "provider" gives (`InvocationResult.text`); defaults to a one-line summary. */
+  reply?: string;
 }
 
 /**
@@ -408,7 +410,7 @@ export class FakeWorkerAdapter implements ProviderAdapter {
     const effect = authorised.value as { exitCode: number | null; stdout: string; sessionId?: string | null };
     return {
       ok: effect.exitCode === 0,
-      text: "changed app.js",
+      text: script.reply ?? "changed app.js",
       json: null,
       provider: "claude",
       model: request.model ?? "opus",

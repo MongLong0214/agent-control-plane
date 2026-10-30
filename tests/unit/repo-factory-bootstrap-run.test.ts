@@ -1,3 +1,4 @@
+import { passingCommitLore } from "../helpers/commitlore-attempt.ts";
 import { acknowledgeBootstrapHandoff } from "../helpers/bootstrap-handoff-ack.ts";
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync } from "node:fs";
@@ -131,10 +132,12 @@ const CLEAN_TREE_COMMAND = {
   maxMemoryMb: 2048,
 };
 
+// #1268 — a bootstrap is a new project, and a new project requires CommitLore (the runner gets a passing double).
 const cleanTreeManifest = (projectId: string, overrides: Parameters<typeof fixtureManifest>[1] = {}) =>
   fixtureManifest(projectId, {
     verificationCommands: [CLEAN_TREE_COMMAND],
     verificationProfiles: { simple: ["clean-tree"], standard: ["clean-tree"], guarded: ["clean-tree"] },
+    commitlore: { mode: "required" },
     ...overrides,
   });
 
@@ -207,6 +210,7 @@ const prepare = async (
     bindings: harness.cp.bindings,
     projects: harness.cp.projects,
     repositories: harness.cp.repositories,
+    commitlore: passingCommitLore(),
   });
   // #246 C3 — no daemon runs here: the test process is the only control-plane writer, which a
   // daemon's single-instance lock and its holder record attest in production. A new attempt after an
@@ -556,7 +560,7 @@ describe("PR #1043 review witnesses — the run path", () => {
   });
 
   it("RF1043-03: refuses, before any GitHub call, a manifest command this producer would not run (`node verify.js`)", async () => {
-    const prepared = await prepare("rf1043-03-command", { manifest: fixtureManifest("rf1043-03-command") });
+    const prepared = await prepare("rf1043-03-command", { manifest: fixtureManifest("rf1043-03-command", { commitlore: { mode: "required" } }) });
     const refused = await prepared.runner.produceAndActivate(
       withReviewedHeadPlan(
         { ...prepared.input, ownerApproval: ownerApproval(prepared) },

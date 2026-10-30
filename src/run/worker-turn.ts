@@ -1,4 +1,13 @@
 import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
+import {
+  type CommitLoreAttempt,
+  type CommitLoreConsidered,
+  type CommitLoreSettled,
+  COMMITLORE_DRAFT_FENCE,
+  draftFromReply,
+  workerCommitLoreSection,
+} from "../bootstrap/commitlore-commit.ts";
+import { type CommitLorePort, commitloreGoverned, createCommitLoreCliPort } from "../bootstrap/commitlore-observation.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { allow, deny, isAcpError, type Decision, type Evidence } from "../core/errors.ts";
@@ -47,6 +56,7 @@ import {
 import { ORPHAN_RESOLVED_EVENT, ORPHAN_UNIDENTIFIED_EVENT, unresolvedUnidentifiedOrphans } from "./worker-orphan-release.ts";
 import {
   type PinnedRepository,
+  type WorkerCommitLoreStep,
   type WorkerCommitPort,
   type WorkerDiffEntry,
   committedChanges,
@@ -251,6 +261,12 @@ export interface WorkerTurnOptions {
    * hex>`). Without one, a task whose write target declares imports is refused before it starts.
    */
   importRoot?: string;
+  /**
+   * #1268 — the CommitLore a turn commits through when its run's pinned manifest requires CommitLore.
+   * Defaults to the pinned CLI (`createCommitLoreCliPort`); null is a deployment with none, where such a
+   * turn is refused before it starts. A turn whose run requires nothing of CommitLore never asks it.
+   */
+  commitlore?: CommitLorePort | null;
 }
 
 /** Ports the runner needs; the composition root supplies them, none is a service it could misuse. */
@@ -321,6 +337,11 @@ interface TurnFacts extends DurableFacts {
   ignoredBaseline: IgnoredReading;
   /** #1232 — the files imported before this turn's worker ran, as its write target declares them; empty for most tasks. */
   imports: readonly TaskImport[];
+  /**
+   * #1268 — CommitLore's drafting contract, read for this turn before its worker launched, when the run's
+   * pinned manifest requires CommitLore; null when it requires nothing of it.
+   */
+  commitloreContract: string | null;
 }
 
 /** #1097 — a reading of the worktree's ignored paths; a failed one is kept as its error, never as empty. */
@@ -464,6 +485,7 @@ export class WorkerTurnRunner {
   readonly #scratchDir: (prefix: string) => string;
   readonly #processSettleMs: number;
   readonly #importRoot: string | null;
+  readonly #commitlore: CommitLorePort | null;
   #stopping = false;
 
   constructor(private readonly ports: WorkerTurnPorts, options: WorkerTurnOptions = {}) {
@@ -474,6 +496,7 @@ export class WorkerTurnRunner {
     this.#scratchDir = options.scratchDir ?? acpScratchDir;
     this.#processSettleMs = options.processSettleMs ?? DEFAULT_PROCESS_SETTLE_MS;
     this.#importRoot = options.importRoot ?? null;
+    this.#commitlore = options.commitlore === undefined ? createCommitLoreCliPort() : options.commitlore;
   }
 
   /**
@@ -552,7 +575,16 @@ export class WorkerTurnRunner {
       // anything is opened or written: a refusal here leaves no execution and no file behind.
       const staged = this.stageImports(prepared.value);
       if (!staged.allowed) return staged as Decision<{ executionId: string }>;
-      const turn: TurnFacts = { ...prepared.value, imports: staged.value.map(({ bytes: _bytes, ...entry }) => entry) };
+      // #1268 — a run whose contract requires CommitLore gets CommitLore's drafting contract into its
+      // worker's prompt, or no turn: refused here, before an execution is opened or anything launched.
+      const contract = await this.commitloreContract(prepared.value);
+      if (this.#stopping) return this.stoppingRefusal(request.taskId);
+      if (!contract.allowed) return contract as Decision<{ executionId: string }>;
+      const turn: TurnFacts = {
+        ...prepared.value,
+        imports: staged.value.map(({ bytes: _bytes, ...entry }) => entry),
+        commitloreContract: contract.value,
+      };
       const started = await this.ports.tasks.startWorkerExecution({
         runId: turn.runId,
         taskId: turn.taskId,
@@ -1619,6 +1651,80 @@ export class WorkerTurnRunner {
    * what verifies that the previous attempt's preserved state is safe to build on. The configuration
    * and the git dir are recorded last, as the baseline the turn is held to.
    */
+  /**
+   * #1268 — the drafting contract for a turn whose run's pinned manifest requires CommitLore, read in the
+   * claimed worktree; null for a run that requires nothing of it. Refused when the run requires it and
+   * this deployment has no CommitLore that can commit, or the contract cannot be read.
+   */
+  private async commitloreContract(facts: TurnFacts): Promise<Decision<string | null>> {
+    if (!commitloreGoverned(this.ports.db, facts.runId)) return allow(ReasonCode.OK, null);
+    const port = this.#commitlore;
+    if (port === null || port.contract === undefined || port.attempt === undefined) {
+      return deny(ReasonCode.VERIFICATION_GAP, "this run's contract requires CommitLore, and this deployment has no CommitLore to commit through", {
+        refusal: "COMMITLORE_REQUIRED_UNOBSERVABLE",
+        runId: facts.runId,
+        taskId: facts.taskId,
+      });
+    }
+    const contract = await port.contract(facts.claim.worktree, { gitDir: facts.repo.gitDir, workTree: facts.repo.workTree, objectFormat: facts.objectFormat });
+    if (!contract.allowed) return contract as Decision<string | null>;
+    return allow(ReasonCode.OK, contract.value);
+  }
+
+  /**
+   * #1268 — CommitLore's procedure around this turn's commit (`WorkerCommitLoreStep`): one commit attempt
+   * (the pin's checks and the newest-release confirmation, made for it alone), the worker's draft verified
+   * and bound against `transcript` and the private index before the commit exists, and the commit
+   * finalised and read back once it does. `settled` is set when it settles.
+   */
+  private commitloreStep(
+    facts: TurnFacts,
+    worker: { draft: string; transcript: string },
+    settled: { value: CommitLoreSettled | null },
+  ): WorkerCommitLoreStep & { close(): void } {
+    const port = this.#commitlore;
+    let attempt: CommitLoreAttempt | null = null;
+    let considered: CommitLoreConsidered | null = null;
+    return {
+      close: () => attempt?.dispose(),
+      consider: async (index, message) => {
+        if (port?.attempt === undefined) {
+          return deny(ReasonCode.VERIFICATION_GAP, "this deployment has no CommitLore to commit through", { refusal: "COMMITLORE_REQUIRED_UNOBSERVABLE" });
+        }
+        // The worker's own git hardening, on the git dir and work tree pinned before its turn.
+        const begun = await port.attempt(facts.claim.worktree, { gitDir: facts.repo.gitDir, workTree: facts.repo.workTree, objectFormat: facts.objectFormat });
+        if (!begun.allowed) return begun as Decision<string>;
+        attempt = begun.value;
+        const answer = await attempt.consider({
+          checkout: facts.claim.worktree,
+          index,
+          baseHead: facts.baseHead,
+          message,
+          transcript: worker.transcript,
+          draft: worker.draft,
+          scratch: facts.repo.scratch,
+        });
+        if (!answer.allowed) return answer as Decision<string>;
+        considered = answer.value;
+        return allow(ReasonCode.OK, answer.value.message);
+      },
+      settle: async (commit) => {
+        if (attempt === null || considered === null) {
+          return deny(ReasonCode.INTERNAL_ERROR, "CommitLore settled a commit it did not consider", { refusal: "COMMITLORE_NOT_SETTLED", commit });
+        }
+        const raw = await runPinnedGit(facts.repo, ["cat-file", "commit", commit]);
+        if (raw.exitCode !== 0) {
+          return deny(ReasonCode.VERIFICATION_GAP, "the commit could not be read back", { refusal: "COMMITLORE_NOT_SETTLED", commit });
+        }
+        const separator = raw.stdout.indexOf("\n\n");
+        const committedMessage = separator === -1 ? "" : raw.stdout.slice(separator + 2);
+        const done = await attempt.settle({ checkout: facts.claim.worktree, commit, committedMessage, considered });
+        if (done.allowed) settled.value = done.value;
+        return done;
+      },
+    };
+  }
+
   private async prepareWorktree(facts: DurableFacts, scratch: string): Promise<Decision<TurnFacts>> {
     let opened: GitChildren | null = null;
     const prepared = await this.prepareWorktreeOnce(facts, scratch, (children) => {
@@ -1702,6 +1808,7 @@ export class WorkerTurnRunner {
         workerGitConfig: await workerGitConfig(repo, providerHome()),
         gitDirEntries: gitDirEntries(repo),
         imports: [],
+        commitloreContract: null,
       });
     } catch (error) {
       return deny(ReasonCode.PROBE_FAILED, "the claimed worktree could not be inspected", {
@@ -2326,8 +2433,32 @@ export class WorkerTurnRunner {
       return;
     }
 
+    // #1268 — a run that requires CommitLore commits only a change its worker considered: its reply carries
+    // exactly one CommitLore draft, `{"records": []}` when there is nothing to record. None is not a draft.
+    let commitlore: { draft: string; transcript: string } | null = null;
+    if (facts.commitloreContract !== null) {
+      const answered = draftFromReply(result.text);
+      if (answered === null) {
+        this.fail(facts, executionId, "FAILED", "contract", {
+          ...evidence,
+          reason: "COMMITLORE_NOT_CONSIDERED",
+          reasonCode: ReasonCode.VERIFICATION_GAP,
+          detail: `the worker's reply carries no single \`\`\`${COMMITLORE_DRAFT_FENCE} block, so the change was not considered for CommitLore and is not committed`,
+        });
+        return;
+      }
+      commitlore = { draft: answered.draft, transcript: workerTranscript(facts, answered.said) };
+    }
+
     await this.#beforeCommit?.();
-    const committed = await this.commitVerified(facts, executionId, observed);
+    const settledCommitLore: { value: CommitLoreSettled | null } = { value: null };
+    const commitloreStep = commitlore === null ? undefined : this.commitloreStep(facts, commitlore, settledCommitLore);
+    let committed: CommitOutcome;
+    try {
+      committed = await this.commitVerified(facts, executionId, observed, commitloreStep);
+    } finally {
+      commitloreStep?.close();
+    }
     if (!committed.ok && this.authorityFor(executionId).allowed === false) {
       // Authority went while the commit was being made: the live fence refused it (nothing committed)
       // or something after it failed. Either way the turn ends with the daemon, never FAILED on its own.
@@ -2395,6 +2526,8 @@ export class WorkerTurnRunner {
             paths: observed.entries.map((entry) => entry.path),
             // #1097 — a finding, not an input of the digest: what the turn changed that was not committed.
             ...(ignoredChanges ? { ignoredChanges } : {}),
+            // #1268 — what CommitLore recorded on the commit, read back from it: nothing, or its records.
+            ...(settledCommitLore.value ? { commitlore: settledCommitLore.value } : {}),
             // Also not an input of the digest.
             ...(result.turnScratch ? { turnScratch: result.turnScratch } : {}),
           },
@@ -2437,7 +2570,12 @@ export class WorkerTurnRunner {
    * runs inside the guard's grant for a task-bound GIT_COMMIT, so the run owner's binding, the WORKER
    * binding, the live receipt and the claims are all re-read immediately before it and settled after.
    */
-  private async commitVerified(facts: TurnFacts, executionId: string, first: Observation): Promise<CommitOutcome> {
+  private async commitVerified(
+    facts: TurnFacts,
+    executionId: string,
+    first: Observation,
+    commitlore?: WorkerCommitLoreStep,
+  ): Promise<CommitOutcome> {
     // A holder rather than a `let`: the effect below reassigns it, and a narrowed local would hide that.
     const state: { outcome: CommitOutcome } = {
       outcome: {
@@ -2486,6 +2624,7 @@ export class WorkerTurnRunner {
           format: facts.objectFormat,
           stagedBaseline: facts.stagedBaseline,
           stillAuthorized: () => this.authorityFor(executionId),
+          ...(commitlore === undefined ? {} : { commitlore }),
         });
         if (!committed.allowed) {
           const head = typeof committed.evidence["head"] === "string" ? committed.evidence["head"] : null;
@@ -3320,7 +3459,17 @@ const ignoredChangesOf = async (facts: TurnFacts): Promise<{ paths: string[]; to
   return { paths: changed.slice(0, IGNORED_CHANGES_NAMED), total: changed.length, error: null };
 };
 
+/**
+ * #1268 — what the worker was asked, without CommitLore's part, followed by what it said, without its draft:
+ * the exchange a CommitLore draft is verified against. Nothing in the contract or in the draft itself can be
+ * quoted from it.
+ */
+const workerTranscript = (facts: TurnFacts, said: string): string => `${workerTaskPrompt(facts)}\n\n${said}\n`;
+
 const workerPrompt = (facts: TurnFacts): string =>
+  facts.commitloreContract === null ? workerTaskPrompt(facts) : `${workerTaskPrompt(facts)}\n${workerCommitLoreSection(facts.commitloreContract)}`;
+
+const workerTaskPrompt = (facts: TurnFacts): string =>
   [
     "You are the implementer for one task of a managed run. Make the change by editing files in this working tree.",
     "",

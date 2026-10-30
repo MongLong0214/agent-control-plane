@@ -83,6 +83,20 @@ export interface BootstrapHandoffReceipt {
   payloadDigest: string;
 }
 
+/**
+ * #1268 — the CommitLore mode a new project's bootstrap manifest must state: `required`. `preferred` and
+ * `off` are refused here, at activation, and before the producer writes anything (`newProjectCommitLore` in
+ * the bootstrap run's precondition).
+ */
+export const newProjectCommitLore = (manifest: ProjectManifest): Decision<void> =>
+  manifest.commitlore.mode === "required"
+    ? allow(ReasonCode.OK, undefined)
+    : deny(ReasonCode.VERIFICATION_GAP, `a new project's manifest must require CommitLore, and this one says ${manifest.commitlore.mode}`, {
+        refusal: "COMMITLORE_MODE_NOT_REQUIRED",
+        commitloreMode: manifest.commitlore.mode,
+        projectId: manifest.projectId,
+      });
+
 const activationWarnings = (manifest: ProjectManifest | null, observed: boolean): ActivationWarning[] => {
   const mode = manifest?.commitlore.mode ?? null;
   if (observed) return [];
@@ -254,6 +268,10 @@ export class BootstrapActivation {
     if (this.residentGenesisRequired && !current.value.outputs.genesis) return deny(ReasonCode.INVALID_ARGUMENT,"bootstrap requires an inline genesis bundle and resident CTO",{});
     const facts = observedRepositoryFacts(result, factsTargetOf(current.value.outputs));
     if (!facts.allowed) return facts as Decision<ACPBootstrapActivationResult>;
+    // #1268 — a new project requires CommitLore: a bootstrap manifest that prefers it or turns it off
+    // activates nothing. A project that exists keeps its manifest until a contract change raises it.
+    const newProjectMode = newProjectCommitLore(input.approvedManifest);
+    if (!newProjectMode.allowed) return newProjectMode as Decision<ACPBootstrapActivationResult>;
     // #246 B3 — the approved manifest's CommitLore mode, enforced on this result at those facts' heads.
     const commitlore = commitloreActivationGate(input.approvedManifest.commitlore.mode, result, facts.value);
     if (!commitlore.allowed) return commitlore as Decision<ACPBootstrapActivationResult>;

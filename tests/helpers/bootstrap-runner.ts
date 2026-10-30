@@ -1,3 +1,4 @@
+import { passingCommitLore } from "./commitlore-attempt.ts";
 import { acknowledgeBootstrapHandoff } from "./bootstrap-handoff-ack.ts";
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -151,7 +152,10 @@ export const prepareBootstrapRun = async (
     legacyTask?: boolean;
     /** Submit by a real CEO-selected PLAN attachment rather than the inline compatibility path. */
     attachedPlan?: boolean;
-    /** #246 B3 — the runner's CommitLore port; omitted, the runner has none. */
+    /**
+     * #246 B3 — the runner's CommitLore port; null, the runner has none. #1268 — omitted, a passing double
+     * (`passingCommitLore`), since a new project requires CommitLore.
+     */
     commitlore?: CommitLorePort | null;
     /** S10 — the human-gate items the run's contract declares; omitted, it declares none. */
     humanGate?: readonly string[];
@@ -162,7 +166,8 @@ export const prepareBootstrapRun = async (
   const workRoot = tempDir("acp-246-runner-");
   const github = new InitializingGitHub(workRoot);
   const harness = makeHarness({
-    repoFactory: { workRoot, githubPort: github },
+    // #1268 — a CommitLore port the test names is the control plane's producer's too, one configuration as in production.
+    repoFactory: { workRoot, githubPort: github, ...(options.commitlore ? { commitlore: options.commitlore } : {}) },
     ...(options.ownerIdentities === undefined ? {} : { ownerIdentities: options.ownerIdentities }),
   });
   const contract = options.humanGate === undefined ? CONTRACT : { ...CONTRACT, humanGate: [...options.humanGate] };
@@ -193,7 +198,7 @@ export const prepareBootstrapRun = async (
     bindings: harness.cp.bindings,
     projects: harness.cp.projects,
     repositories: harness.cp.repositories,
-    commitlore: options.commitlore ?? null,
+    commitlore: options.commitlore === undefined ? passingCommitLore() : options.commitlore,
   });
   // As the runner's own witnesses do (#246 C3, review 1076-R3): every attempt is recorded with a writer
   // that has since exited — a real process that led its own group, its start token read while it ran,

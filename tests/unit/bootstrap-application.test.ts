@@ -811,6 +811,12 @@ const forgedResult = (f: Fixture, run: ReviewedRun): Record<string, unknown> => 
       repositoryIdentity: outputs.target.repositoryIdentity,
       exactHead: head,
       status: "PASS",
+    }, {
+      // #1268 — a new project requires CommitLore, so a result that is to activate carries its row too.
+      commandId: "commitlore:doctor",
+      repositoryIdentity: outputs.target.repositoryIdentity,
+      exactHead: head,
+      status: "PASS",
     }],
     ciEvidence: [],
     unresolvedGaps: [],

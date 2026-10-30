@@ -698,17 +698,25 @@ describe("portable project manifest (Integration §10.2)", () => {
     expect("gateEntries" in parsed.value).toBe(false);
     expect(manifestDigest(parsed.value)).toBe("sha256:65bd321ae60be501826cfd667cfbf39385997c9a1b488a79b78c55c87c947bfc");
 
-    // The same for a manifest that leaves every defaulted field to the schema.
-    const minimal = assertPortableManifest({
+    // The same for a manifest that leaves every defaulted field to the schema but CommitLore's mode, which
+    // it names as the default named it then: a stored manifest is stored as parsed, so it names its mode.
+    const input = {
       schema: PROJECT_MANIFEST_SCHEMA_ID,
       projectId: "minimal",
       repositories: [{ role: "primary", remote: "github:acme/minimal" }],
       branchProfile: {},
       verificationProfiles: {},
-    });
+    };
+    const minimal = assertPortableManifest({ ...input, commitlore: { mode: "preferred" } });
     if (!minimal.allowed) throw new Error(minimal.message);
     expect("gateEntries" in minimal.value).toBe(false);
     expect(manifestDigest(minimal.value)).toBe("sha256:ca1dc49e1f7a4724d696210edeeb89cb586a0e9a887a97bdfec77e1d7e5c47a2");
+
+    // #1268 — an input that leaves CommitLore's mode to the schema now gets `required`, and that digest.
+    const unnamed = assertPortableManifest(input);
+    if (!unnamed.allowed) throw new Error(unnamed.message);
+    expect(unnamed.value.commitlore).toEqual({ mode: "required" });
+    expect(manifestDigest(unnamed.value)).toBe("sha256:38545fe208531996999eb6b95f1123ca7e4fd0923dd36744fc20d175ce55b1b2");
   });
 
   /** `base` with its one command running a gate script directly. */

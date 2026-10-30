@@ -26,7 +26,9 @@ import type { CommitLoreRun, CommitLoreRunner } from "./commitlore-observation.t
  * with it, the pinned CLI is asked its version, its `doctor` command's usage and its `init` command's
  * usage, once for that observation, under the same bounded child and the same constructed child
  * environment as the observation's commands (`commitloreRunner`'s `ready`). The file those checks ran is
- * the file every later spawn of that observation must still be (`commitlorePinIdentity`).
+ * the file every later spawn of that observation must still be (`commitlorePinIdentity`). Its version
+ * must then be the newest published stable CommitLore release, confirmed for that observation
+ * (`judgeCommitLoreLatest`, #1268).
  *
  * The `init` usage must offer every option the observation passes (`COMMITLORE_INIT_OPTIONS`), among them
  * `--no-agent-hooks`, without which `init` writes its Claude Code injection hook into the checkout. A CLI
@@ -40,6 +42,11 @@ export const COMMITLORE_BINARY_VARIABLE = "ACP_COMMITLORE_BINARY";
  * `NO_DOCTOR_COMMAND`: `doctor --help` gives no `doctor` usage that declares `--json` (`judgeCommitLoreDoctorCommand`).
  * `NO_INIT_COMMAND`: `init --help` gives no `init` usage at all (it fails, or answers something else).
  * `NO_INIT_OPTION`: it gives one, and that usage does not offer an option the observation passes.
+ * `RELEASE_UNCONFIRMED`: the newest published stable release could not be confirmed for this observation.
+ * `NOT_LATEST`: it was, and the pinned CLI's version is not that release's.
+ * `PACKAGE_MISMATCH`, `UNSUPPORTED_ENTRYPOINT`, `UNSUPPORTED_PACKAGE`: the package a commit attempt copies
+ * and runs (`commitlore-snapshot.ts`) states another version than it answers, cannot be named from the pin,
+ * or is not one package of regular files with a published file list.
  */
 export type CommitLorePinCondition =
   | "NOT_CONFIGURED"
@@ -52,6 +59,11 @@ export type CommitLorePinCondition =
   | "NO_DOCTOR_COMMAND"
   | "NO_INIT_COMMAND"
   | "NO_INIT_OPTION"
+  | "RELEASE_UNCONFIRMED"
+  | "NOT_LATEST"
+  | "PACKAGE_MISMATCH"
+  | "UNSUPPORTED_ENTRYPOINT"
+  | "UNSUPPORTED_PACKAGE"
   | "TOO_LARGE"
   | "REPLACED";
 
@@ -233,17 +245,127 @@ export const judgeCommitLoreInitCommand = (pin: string, run: CommitLoreRun): str
 };
 
 /**
- * The pinned CLI's version, then its `doctor` command, then its `init` command, each through `run` in
- * `cwd`. Null when all hold; otherwise the first reason, and no later check is run. A check that cannot be
- * run at all throws, as `run` does.
+ * #1268 — the release a pin must be: the newest published stable release of the official CommitLore
+ * repository, as GitHub's `releases/latest` answers it (a published release that is neither a draft nor a
+ * prerelease). The source is fixed here: nothing in a plan, a manifest, a checkout or a candidate's
+ * submission names it or answers for it.
+ *
+ * It is confirmed once per readiness (`commitloreRunner`'s `ready`), so once per attempt, and never kept:
+ * the next attempt, a restart included, asks again. A lookup that fails, times out or answers anything but
+ * one whole stable release refuses `RELEASE_UNCONFIRMED`, and no earlier answer stands in for it. A release
+ * published after an attempt's lookup does not fail that attempt; the next attempt's lookup sees it.
  */
-export const verifyCommitLorePin = async (pin: string, run: CommitLoreRunner, cwd: string): Promise<string | null> => {
+export const COMMITLORE_RELEASE_REPOSITORY = "MongLong0214/commitlore";
+export const COMMITLORE_LATEST_RELEASE_URL = `https://api.github.com/repos/${COMMITLORE_RELEASE_REPOSITORY}/releases/latest`;
+const COMMITLORE_RELEASE_ORIGIN = "https://api.github.com";
+
+/** How long one lookup may take, its body included: a bound of its own, taken from no check's or command's. */
+export const COMMITLORE_RELEASE_TIMEOUT_MS = 10_000;
+
+/** The most of an answer read as a release. One release's JSON, its notes included, is far below it. */
+const COMMITLORE_RELEASE_MAX_BYTES = 1024 * 1024;
+
+/** One lookup of the newest stable release: the answer as parsed JSON, or a rejection when there is none. */
+export type CommitLoreReleaseLookup = () => Promise<unknown>;
+
+/** A confirmed release: GitHub's id for it, its tag, and the version that tag names. */
+export interface CommitLoreRelease {
+  readonly id: number;
+  readonly tag: string;
+  readonly version: readonly [bigint, bigint, bigint];
+}
+
+/** The production lookup: one unauthenticated GET of `COMMITLORE_LATEST_RELEASE_URL`, bounded in time and size. */
+export const officialCommitLoreRelease: CommitLoreReleaseLookup = async () => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), COMMITLORE_RELEASE_TIMEOUT_MS);
+  try {
+    const response = await fetch(COMMITLORE_LATEST_RELEASE_URL, {
+      headers: { Accept: "application/vnd.github+json", "User-Agent": "agent-control-plane" },
+      redirect: "error",
+      signal: controller.signal,
+    });
+    if (response.status !== 200) throw new Error(`GitHub answered ${response.status}`);
+    if (new URL(response.url || COMMITLORE_LATEST_RELEASE_URL).origin !== COMMITLORE_RELEASE_ORIGIN) {
+      throw new Error("the release was answered from an unexpected origin");
+    }
+    const body = await response.text();
+    if (body.length > COMMITLORE_RELEASE_MAX_BYTES) throw new Error("the answer is larger than one release");
+    return JSON.parse(body) as unknown;
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+/** `answer` as one published stable release with a canonical `vMAJOR.MINOR.PATCH` tag; throws the reason otherwise. */
+export const confirmCommitLoreRelease = (answer: unknown): CommitLoreRelease => {
+  if (typeof answer !== "object" || answer === null || Array.isArray(answer)) throw new Error("the answer is not one release");
+  const release = answer as Record<string, unknown>;
+  if (release["draft"] !== false || release["prerelease"] !== false || typeof release["published_at"] !== "string") {
+    throw new Error("the answer is not a published stable release");
+  }
+  const { id, tag_name: tag } = release;
+  if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) throw new Error("the release has no id");
+  const version = typeof tag === "string" && tag.startsWith("v") ? parseCommitLoreVersion(tag.slice(1)) : null;
+  if (version === null) throw new Error(`the release tag ${JSON.stringify(tail(String(tag)))} is not vMAJOR.MINOR.PATCH`);
+  return { id, tag: tag as string, version };
+};
+
+/**
+ * Whether `answer`, the pinned CLI's own `--version` answer, is the version of the release `lookup` confirms
+ * now. Null when it is; otherwise the reason, `RELEASE_UNCONFIRMED` or `NOT_LATEST`. Equal versions only: an
+ * older pin is not the newest release, and a newer one is no published release.
+ */
+export const judgeCommitLoreLatest = async (pin: string, answer: string, lookup: CommitLoreReleaseLookup): Promise<string | null> => {
+  let release: CommitLoreRelease;
+  try {
+    release = confirmCommitLoreRelease(await lookup());
+  } catch (error) {
+    return (
+      `${COMMITLORE_BINARY_VARIABLE} RELEASE_UNCONFIRMED: the newest published stable release of ${COMMITLORE_RELEASE_REPOSITORY} ` +
+      `could not be confirmed for this attempt (${tail(error instanceof Error ? error.message : String(error), 200)}); no earlier answer stands in for it`
+    );
+  }
+  const version = parseCommitLoreVersion(answer.trim());
+  if (version !== null && version.every((part, index) => part === release.version[index])) return null;
+  return (
+    `${COMMITLORE_BINARY_VARIABLE} NOT_LATEST: ${pin} --version answered ${JSON.stringify(tail(answer))}, and the newest ` +
+    `published stable release of ${COMMITLORE_RELEASE_REPOSITORY} is ${release.tag} (release ${release.id})`
+  );
+};
+
+/**
+ * The pinned CLI's version, then its `doctor` command, then its `init` command, each through `run` in
+ * `cwd`, then that version against the newest stable release `latest` confirms (#1268). Null when all hold;
+ * otherwise the first reason, and nothing later is asked. A check that cannot be run at all throws, as `run`
+ * does.
+ *
+ * #1268 — `packageVersion`, for a run of a copied package (`commitlore-snapshot.ts`): the version that
+ * package's own `package.json` states. It must be the version the copy answers, and it is what the newest
+ * release is compared with.
+ */
+export const verifyCommitLorePin = async (
+  pin: string,
+  run: CommitLoreRunner,
+  cwd: string,
+  latest: CommitLoreReleaseLookup,
+  packageVersion?: string,
+): Promise<string | null> => {
   const [versionArgv, doctorArgv, initArgv] = COMMITLORE_PIN_CHECK_ARGV as [readonly string[], readonly string[], readonly string[]];
-  const version = judgeCommitLoreVersion(pin, await run(versionArgv, cwd));
+  const versionRun = await run(versionArgv, cwd);
+  const version = judgeCommitLoreVersion(pin, versionRun);
   if (version !== null) return version;
   const doctor = judgeCommitLoreDoctorCommand(pin, await run(doctorArgv, cwd));
   if (doctor !== null) return doctor;
-  return judgeCommitLoreInitCommand(pin, await run(initArgv, cwd));
+  const init = judgeCommitLoreInitCommand(pin, await run(initArgv, cwd));
+  if (init !== null) return init;
+  if (packageVersion !== undefined && packageVersion !== versionRun.stdout.trim()) {
+    return (
+      `${COMMITLORE_BINARY_VARIABLE} PACKAGE_MISMATCH: the CommitLore package ${pin} runs states version ` +
+      `${JSON.stringify(tail(packageVersion))} and answers ${JSON.stringify(tail(versionRun.stdout))}`
+    );
+  }
+  return judgeCommitLoreLatest(pin, packageVersion ?? versionRun.stdout, latest);
 };
 
 /**

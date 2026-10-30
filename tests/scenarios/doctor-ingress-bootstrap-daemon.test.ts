@@ -975,6 +975,12 @@ describe("Repo Factory boundary (CP-S52)", () => {
           repositoryIdentity: "github:acme/fixture",
           exactHead: gitSync(harness.repoPath, ["rev-parse", "HEAD"]),
           status: "PASS",
+        }, {
+          // #1268 — a new project requires CommitLore, so its result carries CommitLore's row too.
+          commandId: "commitlore:doctor",
+          repositoryIdentity: "github:acme/fixture",
+          exactHead: gitSync(harness.repoPath, ["rev-parse", "HEAD"]),
+          status: "PASS",
         }],
       });
 
