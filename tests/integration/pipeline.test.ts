@@ -4,6 +4,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { ExecutionMode, RunState, TaskState } from "../../src/domain/types.ts";
 import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
+import { FRONTIER_SIMPLIFY_SOURCE } from "../../src/review/frontier-simplify-policy.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, commitAll, writeFiles } from "../helpers/fixtures.ts";
 import {
@@ -484,6 +485,7 @@ describe("one safe project run, end to end", () => {
           reviewPolicies: [],
           reviewerPromptDigests: [digestOf("review prompt")],
           reviewerInputRepresentations: ["stdin"],
+          methodology: { ...FRONTIER_SIMPLIFY_SOURCE },
         },
         coveredRepositories: [identity],
         coveredFiles: [`${identity}:src/app.js`],

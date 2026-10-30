@@ -4,6 +4,7 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { ProjectManifest } from "../contracts/manifest.ts";
 import { type ArtifactStore, EVIDENCE_PRODUCERS } from "../db/artifacts.ts";
+import { METHOD_REVIEW_STALE, reviewedUnderCurrentMethod } from "../review/frontier-simplify-policy.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, Role, RunKind, RunState, type RunRow, roleKeyFor } from "../domain/types.ts";
 import type { CandidateSnapshot } from "../snapshot/candidate-snapshot.ts";
@@ -1063,6 +1064,9 @@ export class ManifestActivationGrants {
         reviewDigest: review?.digest ?? null,
       });
     }
+    if (!reviewedUnderCurrentMethod(review.content)) {
+      return deny(ReasonCode.EVIDENCE_STALE, METHOD_REVIEW_STALE, { ...evidence, reviewDigest: review.digest });
+    }
     return allow(ReasonCode.OK, {
       planDigest: current.value.binding.planDigest,
       manifestDigest: current.value.binding.manifestDigest,
@@ -1123,6 +1127,9 @@ export class ManifestActivationGrants {
         packetDigest: packet.digest,
         reviewDigest: review?.digest ?? null,
       });
+    }
+    if (!reviewedUnderCurrentMethod(review.content)) {
+      return deny(ReasonCode.EVIDENCE_STALE, METHOD_REVIEW_STALE, { ...evidence, reviewDigest: review.digest });
     }
     // E3's registration, which `currentFirstActivationPlan` above has just required to exist.
     const registrationEventId = facts.registrationEventId!;

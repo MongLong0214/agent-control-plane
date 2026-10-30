@@ -1,7 +1,7 @@
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { manifestDigest, type ProjectManifest } from "../../src/contracts/manifest.ts";
-import { sha256 } from "../../src/core/digest.ts";
+import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { acpError, allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { credentialBearingField, prohibitedDurableField } from "../../src/db/audit.ts";
@@ -9,15 +9,16 @@ import { registryView } from "../../src/db/registry-view.ts";
 import { RunKind, RunState, type RunRow } from "../../src/domain/types.ts";
 import { createCtoMcpPort } from "../../src/mcp/cto-server.ts";
 import { idempotentMcpMutation, ok } from "../../src/mcp/shared.ts";
+import { CanonicalSessionRegistry } from "../../src/registry/canonical-session-registry.ts";
 import type { ReviewPacket } from "../../src/review/blind-review.ts";
 import type { ContractChangeReviewContext } from "../../src/review/contract-change-review-context.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
-import { buildNoRepositoryCandidateSnapshot, candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
+import { buildNoRepositoryCandidateSnapshot, candidateSnapshotDigest, type CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
 import { callCtoToolAsOwner } from "../helpers/bootstrap-plan.ts";
 import { CONTRACT_CHANGE_CONTRACT, WORKFLOW, WORKFLOW_PATH } from "../helpers/contract-change.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeRepo, writeFiles } from "../helpers/fixtures.ts";
 import { FIRST_IDENTITY, createRun, firstManifest, firstPlan, operatorRegisteredProject, revisionsFor, unitTestsWorkflow } from "../helpers/first-activation.ts";
-import { makeHarness, reviewerPass, type Harness } from "../helpers/harness.ts";
+import { driveToReviewedCandidate, makeHarness, reviewerPass, type Harness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 afterEach(() => vi.restoreAllMocks());
@@ -423,6 +424,113 @@ describe("#1255: the CONTRACT_CHANGE first-activation packet carries the PLAN an
       expect(again.allowed, JSON.stringify(again)).toBe(true);
       expect(contractChangePrompts(r.h).at(-1)).toContain("MISSING: ACP stored no readback for this candidate");
     } finally { r.h.cp.close(); }
+  }, 60_000);
+});
+
+describe("the CONTRACT_CHANGE readback carries the project's canonical CTO identity as ACP read it at freeze", () => {
+  it("an entitled project with an ACTIVE PRIMARY_CTO binding: the packet shows the entitlement and the binding with whole ids, as stored", async () => {
+    const r = await firstActivation();
+    try {
+      const actor = hex("the project's canonical CTO actor");
+      const room = "0f5c1a2e-7b3d-4c9e-8a61-2d4f6b8e0c13";
+      const conversation = "6e1b9d4a-3c27-4f85-9b0e-a7d2c5f81e64";
+      const bound = r.h.cp.db.get<{
+        assignment_id: string; role_key: string; actor_id: string; session_id: string; session_incarnation: string;
+        binding_generation: number; created_at: string; current_session_id: string;
+      }>(
+        `SELECT a.assignment_id, a.role_key, a.actor_id, a.session_id, a.session_incarnation, a.binding_generation, a.created_at,
+                c.current_session_id
+           FROM assignments a JOIN conversational_actors c ON c.actor_id = a.actor_id
+          WHERE a.project_id = ? AND a.role = 'PRIMARY_CTO' AND a.status = 'ACTIVE'`,
+        [r.projectId],
+      );
+      expect(bound, "the dispatched run's project has an ACTIVE PRIMARY_CTO binding").toBeDefined();
+      // The bound actor's session speaks as the entitled Buzz actor in the entitled room.
+      r.h.cp.db.run(`UPDATE sessions SET buzz_actor_id = ?, buzz_address = ? WHERE session_id = ?`, [actor, room, bound!.current_session_id]);
+      new CanonicalSessionRegistry(r.h.cp.db).grant({ sessionUuid: conversation, projectId: r.projectId, buzzActorId: actor, buzzAddress: room }, null);
+      const session = r.h.cp.db.get<{ incarnation: string; lifecycle: string }>(
+        `SELECT incarnation, lifecycle FROM sessions WHERE session_id = ?`, [bound!.current_session_id],
+      )!;
+
+      r.h.scripted.script({ match: /Contract change review/, text: reviewerPass([r.coverage]) });
+      const result = await submit(r);
+      expect(result.allowed, JSON.stringify(result)).toBe(true);
+      const prompt = contractChangePrompts(r.h)[0]!;
+      const readback = fencedJsonAfter(prompt, "### ACP readback at the candidate's freeze") as ContractChangeReviewContext;
+      expect(readback).toEqual(storedContext(r.h, r.run.runId, r.h.cp.runs.currentCandidate(r.run.runId)!));
+      expect(readback.project.canonicalSessionEntitlements).toEqual([
+        { sessionUuid: conversation, buzzActorId: actor, buzzAddress: room, revision: 1, revokedAt: null },
+      ]);
+      expect(readback.project.primaryCtoBinding).toEqual({
+        assignmentId: bound!.assignment_id, roleKey: bound!.role_key, actorId: bound!.actor_id,
+        sessionId: bound!.session_id, sessionIncarnation: bound!.session_incarnation,
+        bindingGeneration: bound!.binding_generation, createdAt: bound!.created_at,
+        currentSession: {
+          sessionId: bound!.current_session_id, incarnation: session.incarnation, lifecycle: session.lifecycle,
+          buzzActorId: actor, buzzAddress: room,
+        },
+      });
+      // The 64-hex actor id is shown whole, never cut or redacted.
+      expect(prompt).toContain(`"buzzActorId": "${actor}"`);
+      // The candidate snapshot holds the same baseline, under its digest.
+      const snapshot = r.h.cp.artifacts.latest<CandidateSnapshot>(r.run.runId, "CANDIDATE_SNAPSHOT")!.content;
+      expect(snapshot.canonicalCtoIdentity).toEqual({
+        canonicalSessionEntitlements: readback.project.canonicalSessionEntitlements,
+        primaryCtoBinding: readback.project.primaryCtoBinding,
+      });
+    } finally { r.h.cp.close(); }
+  }, 60_000);
+
+  it("a revoked entitlement after a PASS: the re-freeze is another candidate, and the PASS is not current for it", async () => {
+    const r = await firstActivation();
+    try {
+      const actor = hex("an entitled actor later revoked");
+      new CanonicalSessionRegistry(r.h.cp.db).grant(
+        { sessionUuid: "3a9e5c71-0d2b-4f68-9c14-b7e3a2d5f908", projectId: r.projectId, buzzActorId: actor, buzzAddress: "8c2f4e6a-1b3d-4a5c-9e7f-0d1c2b3a4f5e" },
+        null,
+      );
+      const first = await r.h.cp.pipeline.freeze(r.run.runId);
+      expect(first.allowed, JSON.stringify(first)).toBe(true);
+      if (!first.allowed) return;
+      const reviewed = candidateSnapshotDigest(first.value);
+      await reviewCurrent(r, first.value);
+      expect(r.h.cp.review.latestPacket(r.run.runId, reviewed)).toMatchObject({ verdict: "PASS" });
+
+      new CanonicalSessionRegistry(r.h.cp.db).revoke(r.projectId, r.h.cp.clock.nowIso());
+      const second = await r.h.cp.pipeline.freeze(r.run.runId);
+      expect(second.allowed, JSON.stringify(second)).toBe(true);
+      if (!second.allowed) return;
+      const refrozen = candidateSnapshotDigest(second.value);
+      expect(refrozen).not.toBe(reviewed);
+      expect(second.value.canonicalCtoIdentity!.canonicalSessionEntitlements).toMatchObject([{ buzzActorId: actor, revision: 2 }]);
+      expect(second.value.canonicalCtoIdentity!.canonicalSessionEntitlements[0]!.revokedAt).not.toBeNull();
+      expect(r.h.cp.runs.currentCandidate(r.run.runId)).toBe(refrozen);
+      expect(r.h.cp.review.latestPacket(r.run.runId, refrozen)).toBeNull();
+      expect(r.h.cp.review.latestPacket(r.run.runId, reviewed)).toBeNull();
+    } finally { r.h.cp.close(); }
+  }, 60_000);
+
+  it("a STANDARD_WORK candidate of an entitled project carries no identity baseline: its snapshot bytes and digest are as before", async () => {
+    const h = makeHarness();
+    try {
+      const driven = await driveToReviewedCandidate(h, { projectId: "standard-work-entitled" });
+      const snapshot = h.cp.artifacts.latestForSnapshot<CandidateSnapshot>(driven.runId, "CANDIDATE_SNAPSHOT", driven.candidateSnapshotDigest)!.content;
+      expect(Object.keys(snapshot).sort()).toEqual(["contractDigest", "createdAt", "repositories", "runId", "schema"]);
+      // The digest is the four fields every snapshot without a plan or contract change always digested.
+      expect(driven.candidateSnapshotDigest).toBe(digestOf({
+        schema: snapshot.schema, runId: snapshot.runId, contractDigest: snapshot.contractDigest, repositories: snapshot.repositories,
+      }));
+      // An entitlement granted to its project later leaves a re-freeze of the same candidate at the same digest.
+      new CanonicalSessionRegistry(h.cp.db).grant(
+        { sessionUuid: "5d7f9b13-2e4a-4c6e-8a0b-c1d3e5f7a9b2", projectId: driven.projectId, buzzActorId: hex("a standard work project's actor"), buzzAddress: "7e9a1c3e-5f7b-4d9f-8b1d-3f5a7c9e1b3d" },
+        null,
+      );
+      const refrozen = await h.cp.pipeline.freeze(driven.runId);
+      expect(refrozen.allowed, JSON.stringify(refrozen)).toBe(true);
+      if (!refrozen.allowed) return;
+      expect(refrozen.value).not.toHaveProperty("canonicalCtoIdentity");
+      expect(candidateSnapshotDigest(refrozen.value)).toBe(driven.candidateSnapshotDigest);
+    } finally { h.cp.close(); }
   }, 60_000);
 });
 

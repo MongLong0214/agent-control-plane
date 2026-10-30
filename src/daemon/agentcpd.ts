@@ -961,9 +961,10 @@ export const startLocalMcpListeners = async (
       ownerMessages: ownerMessageLedger(cp),
       serializeWake: (body) => cp.db.tx(body),
       // #1103 — every wake frame handed to a CTO, with its cause, so a wake that finds empty queues
-      // can be attributed (a registration's, at a daemon start or a re-registration).
-      onWakeFailed: ({ roleKey, cause }) =>
-        cp.audit.record({ kind: "ROLE_WAKE_FAILED", reasonCode: ReasonCode.ROLE_PEER_FAILED, roleKey, evidence: { cause } }),
+      // can be attributed (a registration's, at a daemon start or a re-registration). A wake refused
+      // before it connected is recorded with its own code, as a failed connection is.
+      onWakeFailed: ({ roleKey, cause, reasonCode }) =>
+        cp.audit.record({ kind: "ROLE_WAKE_FAILED", reasonCode, roleKey, evidence: { cause } }),
       onWakeWritten: ({ roleKey, cause }) =>
         cp.audit.record({ kind: "ROLE_WAKE_SENT", reasonCode: ReasonCode.OK, roleKey, evidence: { cause } }),
       // FIX-ROLE-WAKE — a registration wake with no confirmed work is skipped; a failed lookup wakes.

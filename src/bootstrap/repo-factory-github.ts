@@ -27,6 +27,7 @@ import {
   requestOutcomeUnknown,
   sameGitHubName,
   type BranchProtectionState,
+  type GenesisResourceUnmet,
   type GitHubRepositoryTarget,
   type GitHubVisibility,
   type GitHubWritePort,
@@ -1741,10 +1742,12 @@ export const applyGitHubOperations = async (
     if (!port.observeGenesisResources || !port.ensureGenesisResources) return stop(ReasonCode.VERIFICATION_GAP,"GENESIS_RESOURCES_UNSUPPORTED","GitHub port cannot provision genesis resources",id,{},false);
     const prior = input.prior.receipts.get(id);
     // #1240 — the readback is bound to the repository confirmRepository just matched to its receipted node id.
-    const bound = { repositoryNodeId: repository.value.nodeId };
-    let observed = await remote(id,() => port.observeGenesisResources!(target,operation.desiredState,bound));
+    // A failed readback names each planned item it did not find as planned.
+    const unmet: GenesisResourceUnmet[] = [];
+    const readback = () => { unmet.length = 0; return remote(id,() => port.observeGenesisResources!(target,operation.desiredState,{repositoryNodeId:repository.value.nodeId,unmet})); };
+    let observed = await readback();
     if (!observed.allowed) return observed as Decision<Step>;
-    if (prior && (observed.value === null || digestOf(observed.value) !== digestOf(prior.observed))) return stop(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"RESUMED_RESOURCE_DRIFTED","genesis resources drifted",id,{},false);
+    if (prior && (observed.value === null || digestOf(observed.value) !== digestOf(prior.observed))) return stop(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"RESUMED_RESOURCE_DRIFTED","genesis resources drifted",id,{unmet},false);
     const intent = pending.get(id) ?? {operationId:id,resourceType:operation.resourceType,resourceIdentity:operation.resourceIdentity,attemptedAt:clock.nowIso(),preexisting:false,beforeStateDigest:null,marker:null,respondedNodeId:null,pushedHead:null};
     // A same-named label is repainted only on a repository this operation created, as its receipt says
     // and confirmRepository still observes: there it is GitHub's autoInit default label, never someone's.
@@ -1752,10 +1755,10 @@ export const applyGitHubOperations = async (
     if (!observed.value) {
       begin(intent);
       const written = await remote(id,() => port.ensureGenesisResources!(target,operation.desiredState,{reconcileExistingLabels})); if (!written.allowed) return written as Decision<Step>;
-      observed = await remote(id,() => port.observeGenesisResources!(target,operation.desiredState,bound));
+      observed = await readback();
     }
     if (!observed.allowed) return observed as Decision<Step>;
-    if (!observed.value) return stop(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,"REREAD_MISMATCH","genesis resource readback failed",id,{},true);
+    if (!observed.value) return stop(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,"REREAD_MISMATCH","genesis resource readback failed",id,{unmet},true);
     return allow(ReasonCode.OK,{receipt:{operationId:id,resourceType:"genesis-resources",resourceIdentity:operation.resourceIdentity,repositoryNodeId:repository.value.nodeId,preexisting:false,beforeStateDigest:null,createdAt:prior?.createdAt ?? intent.attemptedAt,rereadAt:clock.nowIso(),observed:observed.value},outcome:prior ? "resumed" : "written"});
   };
 

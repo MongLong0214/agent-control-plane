@@ -46,6 +46,13 @@ const SCAN_RULES: ReadonlyArray<readonly [RegExp, string]> = [
   [/(?:^|[^A-Za-z0-9._~-])\/(?:Users|home)\/[A-Za-z0-9._-]+\//im, "absolute home path"],
 ];
 
+/**
+ * #1271 — the same rules over one text another public surface sends (an upstream issue or comment): the
+ * names of the rules it matches, never the text. Empty means none matched, which is all it can say.
+ */
+export const publicTextRefusals = (text: string): string[] =>
+  [...new Set(SCAN_RULES.filter(([pattern]) => pattern.test(text)).map(([, rule]) => rule))];
+
 export const BRANCH_PUBLISH_SCANNER = "acp.branch-publish-scan.v2";
 
 /** The most tree entries the full-path walk visits before it refuses rather than scan a subset. */
