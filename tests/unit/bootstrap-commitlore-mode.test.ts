@@ -17,6 +17,7 @@ import {
   prepareBootstrapRun,
   writesOf,
 } from "../helpers/bootstrap-runner.ts";
+import { gitCommitAttempt } from "../helpers/commitlore-attempt.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 
 /**
@@ -54,6 +55,9 @@ const FAIL: CommitLoreObservation = {
 /** A CommitLore double answering the n-th observation (1-based) with `answer(n)`, recording each path. */
 class FakeCommitLore implements CommitLorePort {
   readonly paths: string[] = [];
+  /** #1268 — the bootstrap's own commits, made by this double with plain git (`gitCommitAttempt`). */
+  readonly committed: string[] = [];
+  readonly attempt = gitCommitAttempt(this.committed);
   constructor(private readonly answer: (call: number) => CommitLoreObservation = () => PASS) {}
   async observe(checkoutPath: string): Promise<CommitLoreObservation> {
     this.paths.push(checkoutPath);

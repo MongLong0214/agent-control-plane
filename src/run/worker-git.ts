@@ -943,8 +943,21 @@ export interface WorkerCommitPort {
        * branch moves. A refusal commits nothing.
        */
       stillAuthorized: () => Decision<void>;
+      /**
+       * #1268 — CommitLore's procedure around this commit, for a run whose contract requires it. `consider`
+       * gets the private index once it stages exactly `entries`, before any commit object exists, and
+       * answers the message to commit; a refusal commits nothing. `settle` gets the commit once the branch
+       * and the index are at it; a refusal leaves that commit where it is and reports it.
+       */
+      commitlore?: WorkerCommitLoreStep;
     },
   ): Promise<Decision<string>>;
+}
+
+/** #1268 — see `WorkerCommitPort`'s `commitlore`. */
+export interface WorkerCommitLoreStep {
+  consider(index: string, message: string): Promise<Decision<string>>;
+  settle(commit: string): Promise<Decision<unknown>>;
 }
 
 /**
@@ -983,8 +996,17 @@ export const plumbingWorkerCommit: WorkerCommitPort = {
       }
       const indexInfo = lines.map((line) => `${line}\0`).join("");
       await must(repo, ["update-index", "-z", "--index-info"], { index, input: indexInfo });
+      // #1268 — CommitLore considers exactly the tree this commit will have, before the commit exists.
+      let message = input.message;
+      if (input.commitlore) {
+        const considered = await input.commitlore.consider(index, input.message);
+        if (!considered.allowed) {
+          return deny(considered.reasonCode, considered.message, { ...considered.evidence, committed: false });
+        }
+        message = considered.value;
+      }
       const tree = (await must(repo, ["write-tree"], { index })).trim();
-      const commit = (await must(repo, ["commit-tree", tree, "-p", input.baseHead, "--no-gpg-sign", "-m", input.message])).trim();
+      const commit = (await must(repo, ["commit-tree", tree, "-p", input.baseHead, "--no-gpg-sign", "-m", message])).trim();
 
       try {
         writeFileSync(lock, "", { flag: "wx", mode: 0o644 });
@@ -1040,6 +1062,15 @@ export const plumbingWorkerCommit: WorkerCommitPort = {
       renameSync(lock, realIndex);
       held = false;
       repo.children.holdIndexLock(null);
+      if (input.commitlore) {
+        const settled = await input.commitlore.settle(commit);
+        if (!settled.allowed) {
+          return deny(settled.reasonCode, `the worker commit exists, and CommitLore did not settle it: ${settled.message}`, {
+            ...settled.evidence,
+            head: commit,
+          });
+        }
+      }
       return allow(ReasonCode.OK, commit);
     } catch (error) {
       return deny(ReasonCode.INTERNAL_ERROR, "the worker commit could not be written", {
