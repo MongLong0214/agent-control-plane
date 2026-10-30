@@ -192,7 +192,7 @@ describe("project_get CI section (#1257)", () => {
     });
   });
 
-  it("reports a recorded FAIL as FAIL, the latest receipt winning, while availability stays HEALTHY", async () => {
+  it("reports a trusted-CI check that finished failing as FAIL, the newest record winning, while availability stays HEALTHY", async () => {
     const h = makeHarness();
     const project = await declaredProject(h);
     const runId = seedObservingRun(h, project.projectId, project.repositoryId, project.activeDigest);
@@ -200,21 +200,48 @@ describe("project_get CI section (#1257)", () => {
     recordPostMergeReceipt(h, {
       runId: earlier, identity: project.identity, commitSha: "e".repeat(40), conclusion: "success", at: "2026-08-12T00:30:00.000Z",
     });
-    const receiptId = recordPostMergeReceipt(h, {
-      runId, identity: project.identity, commitSha: project.head, conclusion: "failure", at: "2026-08-12T01:00:00.000Z",
+    const resultId = recordCiVerification(h, {
+      runId, identity: project.identity, head: project.head, status: "FAIL",
+      reasonCode: ReasonCode.VERIFICATION_CI_CHECK_FAILED, at: "2026-08-12T01:00:00.000Z",
     });
 
     const view = await projectGet(h, project.projectId);
 
-    expect(onlyWorkflow(view.ci).lastObserved).toMatchObject({
-      result: "FAIL",
-      conclusion: "failure",
-      commitSha: project.head,
-      source: { receiptId, runId },
-      freshness: "current",
-      staleReasons: [],
+    expect(onlyWorkflow(view.ci)).toMatchObject({
+      unobserved: false,
+      latestNonResult: null,
+      lastObserved: {
+        result: "FAIL",
+        conclusion: null,
+        commitSha: project.head,
+        source: { kind: "CI_VERIFICATION_RESULT", resultId, runId, status: "FAIL", reasonCode: ReasonCode.VERIFICATION_CI_CHECK_FAILED },
+        freshness: "stale",
+        staleReasons: ["DIGEST_UNVERIFIED"],
+      },
     });
     expect(view.project.availability).toBe("HEALTHY");
+  });
+
+  it("reports a trusted-CI check that had not finished as PENDING, not as a result", async () => {
+    const h = makeHarness();
+    const project = await declaredProject(h);
+    const runId = seedObservingRun(h, project.projectId, project.repositoryId, project.activeDigest);
+    const resultId = recordCiVerification(h, {
+      runId, identity: project.identity, head: project.head, status: "FAIL",
+      reasonCode: ReasonCode.VERIFICATION_CI_CHECK_PENDING, at: "2026-08-12T01:00:00.000Z",
+    });
+
+    expect(onlyWorkflow((await projectGet(h, project.projectId)).ci)).toMatchObject({
+      lastObserved: null,
+      unobserved: true,
+      unobservedReason: "PENDING",
+      latestNonResult: {
+        reason: "PENDING",
+        conclusion: null,
+        commitSha: project.head,
+        source: { kind: "CI_VERIFICATION_RESULT", resultId, status: "FAIL", reasonCode: ReasonCode.VERIFICATION_CI_CHECK_PENDING },
+      },
+    });
   });
 
   it("marks an observation stale with OLDER_COMMIT once the repository head has moved past it", async () => {
@@ -289,6 +316,8 @@ describe("project_get CI section (#1257)", () => {
   it.each([
     ["missing", "NOT_A_RESULT"],
     ["incomplete:in_progress", "PENDING"],
+    // Post-merge records a failing check by name before proving who produced it (J-6).
+    ["failure", "PROVENANCE_UNRECORDED"],
   ])("does not report a %s receipt as an observed result", async (conclusion, reason) => {
     const h = makeHarness();
     const project = await declaredProject(h);
@@ -343,6 +372,8 @@ describe("project_get CI section (#1257)", () => {
     const passId = recordCiVerification(h, {
       runId, identity: project.identity, head: project.head, status: "PASS", at: "2026-08-12T01:00:00.000Z",
     });
+    // The general code is what every trusted-CI FAIL row carried before the engine kept the
+    // conclusion's kind, finished or not; such a row stays no result.
     const failId = recordCiVerification(h, {
       runId, identity: project.identity, head: project.head, status: "FAIL",
       reasonCode: ReasonCode.VERIFICATION_COMMAND_FAILED, at: "2026-08-12T02:00:00.000Z",

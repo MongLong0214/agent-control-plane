@@ -1010,6 +1010,53 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
     });
   });
 
+  it("#1257: a failing same-name check from another app, with no Actions suite, is not read back as the approved workflow's FAIL", async () => {
+    const fixture = await setup();
+    const pullNumber = await prepared(fixture);
+    const merged = await fixture.harness.cp.github.mergeExecute({
+      runId: fixture.runId,
+      repositoryIdentity: fixture.identity,
+      pullNumber,
+      exactHeadSha: fixture.head,
+      expectedBaseSha: fixture.base,
+      mergeStrategy: "merge_commit",
+      ownerSessionId: fixture.ownerSessionId,
+      ownerBindingGeneration: fixture.ownerBindingGeneration,
+    });
+    if (!merged.allowed) throw new Error(merged.message);
+    fixture.github.checkRuns.push({
+      id: 900_001,
+      name: "project-ci",
+      head_sha: merged.value.mergeCommitSha,
+      conclusion: "failure",
+      status: "completed",
+      app: { slug: "untrusted-app" },
+      completed_at: "2026-08-12T00:00:00.000Z",
+    });
+
+    const verified = await fixture.harness.cp.github.postMergeVerify(
+      fixture.runId,
+      fixture.identity,
+      merged.value.mergeCommitSha,
+      ["project-ci"],
+    );
+    // The merge stays blocked: the read surface narrows what it reports, not what blocks.
+    expect(verified.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
+
+    const projectId = fixture.harness.cp.runs.require(fixture.runId).projectId!;
+    const ci = createHermesMcpPort(fixture.harness.cp).projectView(projectId)?.ci;
+    if (!ci?.declared) throw new Error("expected a declared CI section");
+    const workflow = ci.workflows[0]!;
+    expect(workflow.lastObserved?.result).not.toBe("FAIL");
+    expect(workflow.lastObserved?.source.kind).not.toBe("POST_MERGE_VERIFY_RECEIPT");
+    expect(workflow.latestNonResult).toMatchObject({
+      reason: "PROVENANCE_UNRECORDED",
+      conclusion: "failure",
+      commitSha: merged.value.mergeCommitSha,
+      source: { kind: "POST_MERGE_VERIFY_RECEIPT", runId: fixture.runId },
+    });
+  });
+
   it("CP-S40: a failed post-merge check blocks dependent merges and a rollback plan is prepared", async () => {
     const fixture = await setup();
     const pullNumber = await prepared(fixture);
@@ -1035,14 +1082,19 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
     expect(verified.allowed).toBe(false);
     expect(verified.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
 
-    // #1257 — the receipt this verification wrote is what project_get reads back as an observed FAIL.
+    // #1257 — the receipt this verification wrote is what project_get reads back. Post-merge records the
+    // failing check without proving which workflow produced it, so it is shown, but not as a FAIL.
     const projectId = fixture.harness.cp.runs.require(fixture.runId).projectId!;
     expect(createHermesMcpPort(fixture.harness.cp).projectView(projectId)?.ci).toMatchObject({
       declared: true,
       workflows: [{
         checkName: "project-ci",
-        unobserved: false,
-        lastObserved: { result: "FAIL", conclusion: "failure", commitSha: merged.value.mergeCommitSha, source: { runId: fixture.runId } },
+        latestNonResult: {
+          reason: "PROVENANCE_UNRECORDED",
+          conclusion: "failure",
+          commitSha: merged.value.mergeCommitSha,
+          source: { kind: "POST_MERGE_VERIFY_RECEIPT", runId: fixture.runId },
+        },
       }],
     });
 
@@ -2540,6 +2592,52 @@ describe("trusted CI evidence (CP-S29)", () => {
       fixture.harness.cp.verification.latestReport(fixture.runId, candidateSnapshotDigest(snapshot))!
         .results[0]?.status,
     ).toBe("FAIL");
+  });
+
+  // #1257 J-5 — the row collectCi writes keeps whether the trusted check finished failing or had not
+  // finished, and project_get reads it back as an observed FAIL or as PENDING.
+  it.each([
+    ["failure", ReasonCode.VERIFICATION_CI_CHECK_FAILED, "an observed FAIL"],
+    ["unknown", ReasonCode.VERIFICATION_CI_CHECK_PENDING, "PENDING"],
+  ] as const)("#1257: a trusted check concluding %s is recorded as %s and read back as %s", async (conclusion, reasonCode, shown) => {
+    const fixture = await setup({ finalization: false });
+    const snapshot = await frozen(fixture);
+    const repo = snapshot.repositories[0]!;
+    fixture.harness.cp.verification.attachCi({
+      fetch: async () => [{
+        commandId: "project-ci",
+        repositoryIdentity: repo.identity,
+        head: repo.candidateHead,
+        conclusion,
+        workflowDigest: "sha256:approved",
+        creatorIdentity: "github-actions",
+        completedAt: "2026-08-12T01:00:00.000Z",
+        nonVacuous: true,
+      }],
+      approvedWorkflowDigests: async () => ["sha256:approved"],
+      trustedCreators: async () => ["github-actions"],
+    });
+
+    const verified = await fixture.harness.cp.verification.verify({
+      runId: fixture.runId,
+      snapshot,
+      commands: TRUSTED_CI_COMMANDS,
+      contractDigest: snapshot.contractDigest,
+    });
+    expect(verified.allowed).toBe(false);
+    expect(
+      fixture.harness.cp.verification.latestReport(fixture.runId, candidateSnapshotDigest(snapshot))!.results[0],
+    ).toMatchObject({ status: "FAIL", reasonCode });
+
+    const projectId = fixture.harness.cp.runs.require(fixture.runId).projectId!;
+    const ci = createHermesMcpPort(fixture.harness.cp).projectView(projectId)?.ci;
+    if (!ci?.declared) throw new Error("expected a declared CI section");
+    const source = { kind: "CI_VERIFICATION_RESULT", runId: fixture.runId, status: "FAIL", reasonCode };
+    expect(ci.workflows[0]).toMatchObject(shown === "PENDING"
+      ? { lastObserved: null, unobserved: true, unobservedReason: "PENDING",
+        latestNonResult: { reason: "PENDING", commitSha: repo.candidateHead, source } }
+      : { unobserved: false, unobservedReason: null, latestNonResult: null,
+        lastObserved: { result: "FAIL", commitSha: repo.candidateHead, source } });
   });
 
   it("a CI result belonging to another repository is not evidence for this one", async () => {

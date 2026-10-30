@@ -1,6 +1,7 @@
 import { projectManifestSchema } from "../contracts/manifest.ts";
+import { ReasonCode } from "../core/reason-codes.ts";
 import type { Db } from "../db/database.ts";
-import { ciVerificationRecords, type CiVerificationRecord } from "../verify/ci-verification-records.ts";
+import { CI_FAILED_CONCLUSIONS, ciVerificationRecords, type CiVerificationRecord } from "../verify/ci-verification-records.ts";
 import type { ProjectRegistry } from "./project-registry.ts";
 
 /**
@@ -27,10 +28,14 @@ export type ProjectCiStaleReason = "OLDER_COMMIT" | "HEAD_UNOBSERVED" | "DIGEST_
  * PENDING: the check had not finished when it was observed.
  * NOT_A_RESULT: the record holds no pass or fail — a missing check, `neutral`, `skipped`, a refused
  * provenance, a conclusion not listed below, or a verification ERROR, TIMEOUT or SKIPPED.
- * CONCLUSION_UNRECORDED: a trusted-CI verification FAIL. The engine records "not success" without
- * the check's conclusion, so it cannot be told apart from an unfinished or skipped check.
+ * CONCLUSION_UNRECORDED: a trusted-CI verification FAIL whose reason code says neither "finished
+ * failing" nor "not finished": every such row written before those codes existed, and a `neutral`,
+ * `skipped` or unlisted conclusion.
+ * PROVENANCE_UNRECORDED: a post-merge receipt's failing conclusion. Post-merge verification records a
+ * failing check by name before, and without, proving which workflow or app produced it, so the
+ * receipt cannot say that the approved workflow failed.
  */
-export type ProjectCiNoResultReason = "PENDING" | "NOT_A_RESULT" | "CONCLUSION_UNRECORDED";
+export type ProjectCiNoResultReason = "PENDING" | "NOT_A_RESULT" | "CONCLUSION_UNRECORDED" | "PROVENANCE_UNRECORDED";
 
 export type ProjectCiSource =
   | { kind: "POST_MERGE_VERIFY_RECEIPT"; receiptId: string; runId: string }
@@ -51,7 +56,10 @@ interface ProjectCiRecord {
 }
 
 export interface ProjectCiObservation extends ProjectCiRecord {
-  /** PASS only for a recorded success; FAIL only for a finished, failing conclusion. */
+  /**
+   * PASS only for a recorded success whose provenance was proven before it was recorded. FAIL only
+   * for a trusted-CI result recorded as a finished, failing check (VERIFICATION_CI_CHECK_FAILED).
+   */
   result: "PASS" | "FAIL";
   /** The digest the observing run's pinned manifest approved; null when it approved none or the record cannot say. */
   approvedDigestAtObservation: string | null;
@@ -93,31 +101,38 @@ interface CandidateRecord extends ProjectCiRecord {
   rowOrder: number;
 }
 
-const FAIL_CONCLUSIONS = new Set(["failure", "timed_out", "cancelled", "action_required", "startup_failure"]);
 const PENDING_CONCLUSIONS = new Set(["pending", "in_progress", "queued", "requested", "waiting"]);
 
 /**
- * A post-merge conclusion mapped explicitly. Only `success` passes; only a finished, failing GitHub
- * conclusion fails; an unfinished check (`incomplete:<status>` as post-merge records it) is
- * pending; everything else — `missing`, `neutral`, `skipped`, `ambiguous`, `untrusted`,
- * `unapproved`, or a value not listed here — is not a result.
+ * A post-merge conclusion mapped explicitly. Only `success` passes: post-merge records it only after
+ * proving the approved workflow produced the check. A finished, failing conclusion is recorded with
+ * no such proof (github-kernel `observePostMergeChecks`), so it is never a FAIL for a workflow. An
+ * unfinished check (`incomplete:<status>` as post-merge records it) is pending; everything else —
+ * `missing`, `neutral`, `skipped`, `ambiguous`, `untrusted`, `unapproved`, or a value not listed
+ * here — is not a result.
  */
 const receiptOutcome = (conclusion: string | null): CandidateRecord["outcome"] => {
   if (conclusion === "success") return "PASS";
   if (conclusion === null) return "NOT_A_RESULT";
-  if (FAIL_CONCLUSIONS.has(conclusion)) return "FAIL";
+  if (CI_FAILED_CONCLUSIONS.has(conclusion)) return "PROVENANCE_UNRECORDED";
   if (conclusion.startsWith("incomplete:") || PENDING_CONCLUSIONS.has(conclusion)) return "PENDING";
   return "NOT_A_RESULT";
 };
 
 /**
- * A trusted-CI verification status mapped. `collectCi` writes PASS only for `success`, and FAIL for
- * every other conclusion of a trusted check, including an unfinished one, so FAIL is no result.
+ * A trusted-CI verification row mapped. `collectCi` writes a row PASS or FAIL only after the check
+ * passed its trust checks, PASS only for `success`, and keeps in a FAIL row's reason code whether the
+ * check finished failing or had not finished. A FAIL row with neither code is no result.
  */
-const verificationOutcome = (status: CiVerificationRecord["status"]): CandidateRecord["outcome"] => {
+const verificationOutcome = (
+  status: CiVerificationRecord["status"],
+  reasonCode: string | null,
+): CandidateRecord["outcome"] => {
   if (status === "PASS") return "PASS";
-  if (status === "FAIL") return "CONCLUSION_UNRECORDED";
-  return "NOT_A_RESULT";
+  if (status !== "FAIL") return "NOT_A_RESULT";
+  if (reasonCode === ReasonCode.VERIFICATION_CI_CHECK_FAILED) return "FAIL";
+  if (reasonCode === ReasonCode.VERIFICATION_CI_CHECK_PENDING) return "PENDING";
+  return "CONCLUSION_UNRECORDED";
 };
 
 export const projectCi = (db: Db, projects: Projects, projectId: string): ProjectCi => {
@@ -152,7 +167,9 @@ export const projectCi = (db: Db, projects: Projects, projectId: string): Projec
 
     // A workflow is its path, check name and role together. A record names only a check, so it is
     // evidence for the one entry its run's pinned manifest declares for that check on the role the
-    // repository held in that run, and for no other workflow sharing the name.
+    // repository held in that run, and for no other workflow sharing the name. The pin says which
+    // workflow was approved, not which one produced the check: only a record whose producer proved
+    // that before writing it can be a result (see receiptOutcome and verificationOutcome).
     const attributed = (runId: string): AttributedWorkflow | null => {
       const key = `${runId}\n${identity}\n${workflow.checkName}`;
       if (!attribution.has(key)) attribution.set(key, attributedWorkflow(db, projects, runId, identity, workflow.checkName));
@@ -270,7 +287,7 @@ const verificationRecords = (db: Db, identity: string, checkName: string): Candi
       status: row.status,
       reasonCode: row.reasonCode,
     },
-    outcome: verificationOutcome(row.status),
+    outcome: verificationOutcome(row.status, row.reasonCode),
     rowOrder: row.rowOrder,
   }));
 

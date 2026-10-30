@@ -1,5 +1,9 @@
 import type { Db } from "../db/database.ts";
 
+/** GitHub check conclusions that mean the check finished and failed. */
+export const CI_FAILED_CONCLUSIONS: ReadonlySet<string> =
+  new Set(["failure", "timed_out", "cancelled", "action_required", "startup_failure"]);
+
 /** One trusted-CI verification result as `VerificationEngine.collectCi` recorded it. */
 export interface CiVerificationRecord {
   resultId: string;
@@ -18,7 +22,10 @@ export interface CiVerificationRecord {
  * A CI result's command id is the check name (`ciEvidenceSource` maps a check to
  * `commandId: check.name`). Today a row is replaced per candidate snapshot, so this returns the last
  * result of each snapshot. #1258 keeps history for this table; when it lands, switch over here.
- * The row keeps neither the check's conclusion nor its workflow digest.
+ * The row keeps neither the check's conclusion nor its workflow digest. A FAIL row's reason code
+ * says which kind of non-success it was: VERIFICATION_CI_CHECK_FAILED for a finished, failing
+ * conclusion and VERIFICATION_CI_CHECK_PENDING for an unfinished check. Rows written before those
+ * codes existed carry VERIFICATION_COMMAND_FAILED for both.
  */
 export const ciVerificationRecords = (db: Db, repositoryIdentity: string, checkName: string): CiVerificationRecord[] =>
   db.all<{ result_id: string; run_id: string; exact_head: string; ended_at: string;
