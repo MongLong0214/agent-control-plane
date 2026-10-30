@@ -40,13 +40,16 @@ import { GIT_OUTPUT_MAX_BYTES } from "../git/git.ts";
  * by its manifest: it stays in the candidate's patch and is reviewed like any other change, so a task's
  * text imports are bounded by what that patch can carry (`IMPORT_MAX_TEXT_BYTES`). A binary file may be
  * bound by its manifest only when its exact extension and signature identify PNG or TrueType, a strict
- * parse of that format accounts for every file byte (PNG: the standard critical chunks and gAMA/sRGB,
- * nothing after IEND; TrueType: only the standard tables the parser inspects, every byte inside one of
- * them or its padding), and no embedded archive or executable signature appears anywhere in the bytes
- * (`EMBEDDED_SIGNATURES`). Anything else is refused at validation and, re-checked at freeze, stays in
- * the patch; it is never bound. The CTO PLAN manifest authorizes the exact opaque bytes; the parse and
- * the scan are defense in depth, not proof of passivity, non-executability or freedom from polyglots.
- * The reviewer reads the recognized container type.
+ * structural parse of that format places every file byte inside a parsed structure or zero padding (PNG:
+ * the standard critical chunks and gAMA/sRGB, nothing after IEND; TrueType: only the standard tables the
+ * parser inspects, every glyf byte inside a glyph record or its padding), and no embedded archive or
+ * executable signature appears anywhere in the bytes (`EMBEDDED_SIGNATURES`). That is not an inspection
+ * of every byte: field contents such as pixel data, glyph instructions, name strings and metrics are
+ * located and bounded, never interpreted. Anything else is refused at validation and, re-checked at
+ * freeze, stays in the patch with its refusal reason; it is never bound. The CTO PLAN manifest binds the
+ * file's identity (path, size, sha256), not a review of its content; the parse and the scan are defense
+ * in depth, not proof of passivity, non-executability or freedom from polyglots. The reviewer reads the
+ * recognized container type, the inspection's result and limits, and that the content was not reviewed.
  */
 
 /** One imported file: where it lands in the repository, its size in bytes and the sha256 of its bytes. */
@@ -196,7 +199,7 @@ const pngCrc32 = (bytes: Buffer): number => {
   return (crc ^ 0xffffffff) >>> 0;
 };
 
-/** Bounded selected PNG checks. `null` means the recognized container accounts for every file byte. */
+/** Bounded selected PNG checks. `null` means every file byte lies in a parsed chunk; chunk contents are not interpreted. */
 const invalidPng = (bytes: Buffer): string | null => {
   if (bytes.length < 8 || !bytes.subarray(0, 8).equals(PNG_SIGNATURE)) return "the bytes are not a PNG";
   let cursor = 8;
@@ -522,7 +525,10 @@ const invalidPost = (post: Buffer, glyphs: number): string | null => {
   return referenced.size === names ? null : "the TrueType post table holds glyph names no glyph references";
 };
 
-/** A strict TrueType parse: the standard tables only, every byte inside one or its padding, each table inspected. */
+/**
+ * A strict TrueType parse: the standard tables only, every byte inside one or its padding, each table's
+ * structure checked. Field contents such as glyph instructions and name strings are bounded, not interpreted.
+ */
 const invalidTrueType = (bytes: Buffer): string | null => {
   if (bytes.length < 12 || bytes.readUInt32BE(0) !== 0x00010000) return "the bytes are not a TrueType sfnt";
   const count = bytes.readUInt16BE(4);
@@ -572,10 +578,14 @@ const invalidTrueType = (bytes: Buffer): string | null => {
   if (locaWidth === 0 || loca.length !== (glyphs + 1) * locaWidth || byTag.get("hmtx")!.length !== longMetrics * 4 + (glyphs - longMetrics) * 2) {
     return "the TrueType glyph index or metrics are invalid";
   }
+  // The glyph records tile glyf from byte 0: ordered locations make consecutive records contiguous, each
+  // non-empty one is consumed through its padding below, and only zero padding may follow the last. A
+  // first location past 0 would leave the bytes before it in no record (review E3-1).
   let previousLocation = 0;
   const locations: number[] = [];
   for (let index = 0; index <= glyphs; index += 1) {
     const location = locaWidth === 2 ? loca.readUInt16BE(index * 2) * 2 : loca.readUInt32BE(index * 4);
+    if (index === 0 && location !== 0) return "the TrueType glyf table has bytes before its first glyph location that no glyph record covers";
     if (location < previousLocation || location > glyf.length) return "the TrueType glyph locations are invalid";
     locations.push(location);
     previousLocation = location;
@@ -705,6 +715,15 @@ const validatedBinary = (path: string, bytes: Buffer): { type: string } | { why:
   return problem === null ? { type: validation.type } : { why: problem };
 };
 
+/**
+ * What `classifyImport` examines and what it does not, stated for each imported file in the stored review
+ * packet and, in the same words, in the reviewer's prompt.
+ */
+export const IMPORT_INSPECTION_LIMITS =
+  "exact .png/.ttf extension and signature, a bounded structural parse in which every byte lies in a parsed chunk, table, record or zero padding, " +
+  "and a scan for embedded archive and executable signatures; field contents (pixel data, glyph instructions, name strings, metrics) " +
+  "are not interpreted, and neither the parse nor the scan proves the bytes inert";
+
 /** How review can see one imported file, from its bytes and path. */
 export type ImportContent =
   | { kind: "text" }
@@ -713,8 +732,8 @@ export type ImportContent =
 
 /**
  * Text (git reads it as text) is reviewed as the patch it is. Binary bytes are bound by their manifest
- * only as a .png or .ttf whose strict parse accounts for every byte and that carries no embedded
- * archive or executable signature.
+ * only as a .png or .ttf whose strict structural parse places every byte in a parsed structure or zero
+ * padding and that carries no embedded archive or executable signature.
  */
 export const classifyImport = (path: string, bytes: Buffer): ImportContent => {
   const binary = gitReadsAsBinary(bytes);

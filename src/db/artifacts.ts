@@ -708,6 +708,19 @@ const blindReviewEvidenceSchema = z
               path: z.string().min(1),
               digest: DIGEST_SCHEMA,
               method: z.enum(["git-binary-patch", "import-manifest"]),
+              // #1232, review E3-2/E3-3 — a task's declared import: its inspection result, the
+              // inspection's limits and what review was shown of its content, as the prompt states them.
+              importInspection: z
+                .object({
+                  format: z.string().min(1).nullable(),
+                  size: z.number().int().nonnegative(),
+                  sha256: DIGEST_SCHEMA,
+                  result: z.string().min(1),
+                  limits: z.string().min(1),
+                  content: z.string().min(1),
+                })
+                .strict()
+                .optional(),
             })
             .strict(),
         ),

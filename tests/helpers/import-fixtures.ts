@@ -224,6 +224,20 @@ export const ttfWithNameStringBytes = (bytes: Buffer): Buffer => {
   return repairTrueTypeChecksums(font, "name");
 };
 
+/**
+ * Review E3-1: the valid font whose whole glyf table is `prefix` and zero padding, with every glyph
+ * location at the table's end, so no glyph record covers the prefix. With the inert marker it is the
+ * reviewer's 788-byte font.
+ */
+export const ttfWithUnindexedGlyfPrefix = (prefix: Buffer): Buffer => {
+  const glyf = Buffer.alloc((prefix.length + 3) & ~3);
+  prefix.copy(glyf);
+  const glyphs = VALID_TTF.readUInt16BE(tableRecord(VALID_TTF, "maxp").offset + 4);
+  const loca = Buffer.alloc((glyphs + 1) * 2);
+  for (let index = 0; index <= glyphs; index += 1) loca.writeUInt16BE(glyf.length / 2, index * 2);
+  return rebuildTrueType(new Map([["glyf", glyf], ["loca", loca]]));
+};
+
 export const ttfWithNonzeroGlyfPadding = (): Buffer => {
   const font = Buffer.from(VALID_TTF);
   const glyf = tableRecord(font, "glyf");

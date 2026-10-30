@@ -45,6 +45,7 @@ import {
   ttfWithShortGlyphRecords,
   ttfWithSelfComposite,
   ttfWithUncoveredCmapPayload,
+  ttfWithUnindexedGlyfPrefix,
   ttfWithUnreferencedFormat4Glyph,
   ttfWithWrongSimpleBbox,
   validPng,
@@ -475,6 +476,18 @@ describe("#1232 a task imports binary files through its write target", () => {
     expect(taskImport.classifyImport("assets/signed.ttf", ttfWithExtraTable("DSIG", Buffer.alloc(8)))).toMatchObject({
       kind: "refused", why: expect.stringMatching(/TrueType table "DSIG" is not one of the standard tables/),
     });
+  }, 120_000);
+
+  it("W8d a font whose glyph locations start past glyf byte 0 is refused with the reason: the bytes before the first glyph are in no glyph record (review E3-1)", async () => {
+    // The reviewer's inert construction: the marker and zero padding as a 24-byte glyf, every glyph location at 24.
+    const bytes = ttfWithUnindexedGlyfPrefix(INERT_MARKER);
+    expect(bytes.length).toBe(788);
+    const testCase = { name: "a font with an unindexed glyf prefix", path: "assets/unindexed-glyf.ttf", bytes, why: /bytes before its first glyph location/ };
+    expect(taskImport.classifyImport(testCase.path, bytes)).toMatchObject({ kind: "refused", why: expect.stringMatching(testCase.why) });
+    const evidence = await expectRefusedImport(testCase);
+    expect(evidence["refused"]).toEqual([{ path: testCase.path, why: expect.stringMatching(testCase.why) }]);
+    // A font whose glyph records start at glyf byte 0 is still bound.
+    expect(taskImport.classifyImport("assets/fonts/Inter.ttf", VALID_TTF)).toEqual({ kind: "data", type: "font (TrueType)" });
   }, 120_000);
 
   it("W8b a text import past the text limit derived from the patch cap is refused", async () => {

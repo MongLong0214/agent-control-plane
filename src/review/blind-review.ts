@@ -69,9 +69,11 @@ import type { SessionRegistry } from "../session/session-registry.ts";
 import {
   type CandidateSnapshot,
   type SnapshotImport,
+  type SnapshotRefusedImport,
   candidateSnapshotDigest,
   snapshotCoverageTargets,
 } from "../snapshot/candidate-snapshot.ts";
+import { IMPORT_INSPECTION_LIMITS } from "../run/task-import.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
 import type { TaskContract } from "../run/run-engine.ts";
@@ -89,7 +91,67 @@ export interface BinaryArtifact {
   path: string;
   digest: string;
   method: "git-binary-patch" | "import-manifest";
+  /**
+   * #1232, review E3-2/E3-3 — present when the path is a task's declared import: what its inspection
+   * found and what that does not establish, in the words the reviewer's prompt states
+   * (`importInspectionLine` for the file, `importInspectionStatement` once for its kind). A bound import
+   * (`import-manifest`) passed; an import the freeze did not bind is its git patch with the refusal reason.
+   */
+  importInspection?: ImportInspection;
 }
+
+export interface ImportInspection {
+  /** The recognized, structurally checked container type; null when the file was not bound. */
+  format: string | null;
+  /** The manifest's size and sha256. */
+  size: number;
+  sha256: string;
+  /** `passed; bound by its manifest` or `refused: <reason>`. */
+  result: string;
+  limits: string;
+  /** What the reviewer is shown of the content and what the manifest binds. */
+  content: string;
+}
+
+/** #1232 — what a stored packet lists as withheld when a manifest-bound import's bytes are not in the prompt. */
+export const IMPORTED_BINARY_CONTENT_WITHHELD = "raw bytes of manifest-bound binary imports";
+
+const BOUND_IMPORT_CONTENT =
+  `Content not reviewed: ${IMPORTED_BINARY_CONTENT_WITHHELD} are withheld from this packet. ` +
+  "The CTO PLAN manifest authorizes these exact bytes. It binds their identity (path, size, sha256, git blob) only. " +
+  "Reviewer approves path, size, digest, recognized structurally checked container type and placement only, " +
+  "NOT full format conformance, byte safety, passivity, non-executability, or freedom from polyglots.";
+
+const REFUSED_IMPORT_CONTENT =
+  "Not bound by its manifest: the path's patch in the Actual diff is what git produces for it, like any other change.";
+
+const boundImportInspection = (entry: SnapshotImport): ImportInspection => ({
+  format: entry.type,
+  size: entry.size,
+  sha256: entry.sha256,
+  result: "passed; bound by its manifest",
+  limits: IMPORT_INSPECTION_LIMITS,
+  content: BOUND_IMPORT_CONTENT,
+});
+
+const refusedImportInspection = (entry: SnapshotRefusedImport): ImportInspection => ({
+  format: null,
+  size: entry.size,
+  sha256: entry.sha256,
+  result: `refused: ${entry.reason}`,
+  limits: IMPORT_INSPECTION_LIMITS,
+  content: REFUSED_IMPORT_CONTENT,
+});
+
+/** One import's own inspection fields as the reviewer reads them next to the file. */
+const importInspectionLine = (path: string, inspection: ImportInspection): string =>
+  `${path}: ${inspection.format ?? "not bound"}, ${inspection.size} bytes, ${inspection.sha256}. Inspection: ${inspection.result}.`;
+
+/**
+ * The limits and content statement every import of one kind shares, stated once per repository in the
+ * snapshot manifest every chunk carries, so a hundred imports do not repeat it a hundred times.
+ */
+const importInspectionStatement = (content: string): string => `For each: Inspection limits: ${IMPORT_INSPECTION_LIMITS}. ${content}`;
 
 export interface ReviewFinding {
   category: ReviewFindingCategory;
@@ -1153,6 +1215,8 @@ export class BlindReviewGate {
         });
       }
 
+      // #1232 — an import the freeze did not bind is its git patch, and the packet keeps why (review E3-3).
+      const refusedImports = new Map((repo.refusedImports ?? []).map((entry) => [entry.path, entry]));
       for (const section of diff.split(/(?=^diff --git )/m).filter(Boolean)) {
         if (!section.includes("GIT binary patch")) continue;
         const path = /^diff --git a\/(.+?) b\//m.exec(section)?.[1];
@@ -1162,18 +1226,27 @@ export class BlindReviewGate {
             section: section.slice(0, 200),
           });
         }
+        const refused = refusedImports.get(path);
         binaryArtifacts.push({
           repository: repo.identity,
           path,
           digest: sha256(section),
           method: "git-binary-patch",
+          ...(refused === undefined ? {} : { importInspection: refusedImportInspection(refused) }),
         });
       }
 
       // #1232 — each bound import is its manifest entry: one section per file, so chunking and coverage
-      // treat it like any other changed path, and the packet records how it was shown.
+      // treat it like any other changed path, and the packet records how it was shown and what its
+      // inspection did and did not establish (review E3-2).
       for (const entry of repo.imports ?? []) {
-        binaryArtifacts.push({ repository: repo.identity, path: entry.path, digest: entry.sha256, method: "import-manifest" });
+        binaryArtifacts.push({
+          repository: repo.identity,
+          path: entry.path,
+          digest: entry.sha256,
+          method: "import-manifest",
+          importInspection: boundImportInspection(entry),
+        });
       }
       trees.push(await readTrackedTree(record.checkoutPath, repo.identity, repo.candidateHead));
       diffs.push({ identity: repo.identity, diff: diff + (repo.imports ?? []).map(importManifestSection).join(""), files: repo.touchedPaths });
@@ -1865,7 +1938,10 @@ export class BlindReviewGate {
         // they are acceptance judgments, never verification evidence. Their exact set is bound
         // by bootstrapPlan's PLAN and planned-output digests in this existing evidence envelope.
         projectContext: planReview || input.contractChange !== null,
-        withheld: [...LOGICAL_WITHHELD_INPUTS],
+        withheld: [
+          ...LOGICAL_WITHHELD_INPUTS,
+          ...(input.binaryArtifacts.some((artifact) => artifact.method === "import-manifest") ? [IMPORTED_BINARY_CONTENT_WITHHELD] : []),
+        ],
         binaryArtifacts: input.binaryArtifacts,
       },
       coveredRepositories: [
@@ -2655,19 +2731,35 @@ interface ReviewerDiff {
 /**
  * #1232 — one imported file the candidate snapshot binds, as the reviewer reads it in the diff: the
  * `diff --git` header of a new file at its blob, then its manifest entry, detected type first, instead
- * of its bytes. The CTO PLAN manifest authorizes exact opaque, potentially active binary content;
- * selected structural checks are defense in depth and do not make those hidden bytes safe.
+ * of its bytes. The CTO PLAN manifest binds the identity of exact opaque, potentially active binary
+ * content; selected structural checks are defense in depth and do not make those hidden bytes safe.
+ * This line and the snapshot manifest's statement for imports are the packet's `importInspection` for
+ * the path, field for field.
  */
 const importManifestSection = (entry: SnapshotImport): string =>
   `diff --git a/${entry.path} b/${entry.path}\nnew file mode 100644\nindex ${"0".repeat(entry.blob.length)}..${entry.blob}\n` +
-  `Opaque, potentially active binary; raw bytes not shown: ${entry.path}: ${entry.type}, ${entry.size} bytes, ${entry.sha256}, git blob ${entry.blob}, task ${entry.taskId}. ` +
-  "The CTO PLAN manifest authorizes these exact bytes. Reviewer approves path, size, digest, recognized structurally checked container type and placement only, NOT full format conformance, byte safety, passivity, non-executability, or freedom from polyglots.\n";
+  `Opaque, potentially active binary; raw bytes not shown; git blob ${entry.blob}, task ${entry.taskId}: ${importInspectionLine(entry.path, boundImportInspection(entry))}\n`;
 
-/** #1232 — the snapshot as the reviewer reads it: a repository's imports are counted; each is a manifest entry in the diff. */
+/**
+ * #1232 — the snapshot as the reviewer reads it: a repository's imports are counted; each is a manifest
+ * entry in the diff. Each import the freeze did not bind is stated with its refusal, in every chunk.
+ */
 const snapshotForReviewer = (snapshot: CandidateSnapshot): unknown => ({
   ...snapshot,
-  repositories: snapshot.repositories.map(({ imports, ...repository }) =>
-    imports === undefined ? repository : { ...repository, imports: `${imports.length} imported files, each shown in the Actual diff as its manifest entry` }),
+  repositories: snapshot.repositories.map(({ imports, refusedImports, ...repository }) => ({
+    ...repository,
+    ...(imports === undefined
+      ? {}
+      : { imports: `${imports.length} imported files, each shown in the Actual diff as its manifest entry. ${importInspectionStatement(BOUND_IMPORT_CONTENT)}` }),
+    ...(refusedImports === undefined
+      ? {}
+      : {
+          refusedImports: {
+            statement: importInspectionStatement(REFUSED_IMPORT_CONTENT),
+            files: refusedImports.map((entry) => `task ${entry.taskId}: ${importInspectionLine(entry.path, refusedImportInspection(entry))}`),
+          },
+        }),
+  })),
 });
 
 interface ReviewChunkPart extends ReviewerDiff {

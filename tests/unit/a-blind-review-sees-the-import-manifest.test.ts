@@ -21,6 +21,7 @@ import {
   ttfWithActiveInstructions,
   ttfWithExtraTable,
   ttfWithNameStringBytes,
+  ttfWithUnindexedGlyfPrefix,
   VALID_TTF,
   validPng,
   validPngOfSize,
@@ -162,7 +163,41 @@ describe("#1232 freeze and blind review carry a task's import manifest", () => {
     expect(reviewerInput).toContain(manifestLine(imports.find((entry) => entry.path === "src/fonts/Inter.ttf")!, "font (TrueType)"));
     expect(reviewerInput).toContain(`task ${taskId}`);
     // The stored packet says how each binary path was represented.
-    expect(packet!.inputManifest.binaryArtifacts).toEqual(imports.map((entry) => ({ repository: identity, path: entry.path, digest: entry.sha256, method: "import-manifest" })));
+    expect(packet!.inputManifest.binaryArtifacts.map(({ repository, path, digest, method }) => ({ repository, path, digest, method })))
+      .toEqual(imports.map((entry) => ({ repository: identity, path: entry.path, digest: entry.sha256, method: "import-manifest" })));
+  }, 60_000);
+
+  it("W5c the stored packet carries each bound import's format, size, digest, inspection result and limits and that its content was not reviewed, lists the raw bytes as withheld, and the prompt states exactly that (review E3-2)", async () => {
+    const { outcome, reviewerInput, packet, imports, identity } = await reviewImports([
+      { path: "src/logo.png", bytes: PNG },
+      { path: "src/fonts/Inter.ttf", bytes: FONT },
+    ]);
+
+    expect(outcome, JSON.stringify(outcome)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    const artifacts = packet!.inputManifest.binaryArtifacts;
+    expect(artifacts).toEqual(imports.map((entry) => ({
+      repository: identity,
+      path: entry.path,
+      digest: entry.sha256,
+      method: "import-manifest",
+      importInspection: {
+        format: entry.path.endsWith(".png") ? "PNG" : "font (TrueType)",
+        size: entry.size,
+        sha256: entry.sha256,
+        result: "passed; bound by its manifest",
+        limits: expect.stringMatching(/structural parse.*not interpreted.*proves the bytes inert/),
+        content: expect.stringMatching(/^Content not reviewed: .*binds their identity .* only\. .*NOT .*non-executability/),
+      },
+    })));
+    expect(packet!.inputManifest.withheld).toContain("raw bytes of manifest-bound binary imports");
+    // The reviewer reads every stored field in the stored words: each file's own next to it in the diff, the
+    // limits and content statement once in the snapshot manifest (JSON in the prompt), and the withheld item.
+    for (const artifact of artifacts) {
+      const inspection = artifact.importInspection!;
+      expect(reviewerInput, artifact.path).toContain(`${artifact.path}: ${inspection.format}, ${inspection.size} bytes, ${inspection.sha256}. Inspection: ${inspection.result}.`);
+      expect(reviewerInput, artifact.path).toContain(JSON.stringify(`For each: Inspection limits: ${inspection.limits}. ${inspection.content}`).slice(1, -1));
+    }
+    expect(reviewerInput).toContain("raw bytes of manifest-bound binary imports are withheld");
   }, 60_000);
 
   it("W5b active opaque bytes are accepted only with the CTO attestation and exact blind-review warning", async () => {
@@ -276,6 +311,52 @@ describe("#1232 freeze and blind review carry a task's import manifest", () => {
     expect(packet!.inputManifest.binaryArtifacts.map((artifact) => [artifact.path, artifact.method])).toEqual(
       files.map((file) => [file.path, "git-binary-patch"]).sort(),
     );
+  }, 120_000);
+
+  /**
+   * Freezes and reviews `files`, each of which the freeze must refuse to bind: it stays its real binary
+   * patch, and the snapshot, the stored packet and the reviewer's prompt each carry its refusal reason.
+   */
+  const expectRefusedAtFreeze = async (files: ReadonlyArray<Imported & { why: RegExp }>): Promise<void> => {
+    const { outcome, reviewerInput, snapshot, packet, imports, taskId } = await reviewImports(files);
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    const repository = snapshot!.repositories[0]!;
+    expect(repository).not.toHaveProperty("imports");
+    expect(repository.refusedImports).toEqual(files.map((file, index) => ({
+      path: file.path, size: imports[index]!.size, sha256: imports[index]!.sha256, taskId, reason: expect.stringMatching(file.why),
+    })));
+    expect(reviewerInput).not.toContain("bytes not shown");
+    // Each is its real binary patch, and the stored packet says the inspection refused it and why.
+    const artifacts = packet!.inputManifest.binaryArtifacts;
+    expect(artifacts.map((artifact) => [artifact.path, artifact.method])).toEqual(files.map((file) => [file.path, "git-binary-patch"]));
+    expect(packet!.inputManifest.withheld).not.toContain("raw bytes of manifest-bound binary imports");
+    for (const [index, artifact] of artifacts.entries()) {
+      const refused = repository.refusedImports![index]!;
+      expect(artifact.importInspection, artifact.path).toEqual({
+        format: null, size: refused.size, sha256: refused.sha256, result: `refused: ${refused.reason}`,
+        limits: expect.stringMatching(/not interpreted/), content: expect.stringMatching(/^Not bound by its manifest/),
+      });
+      // The prompt states the same fields in the snapshot manifest, which is JSON in the prompt.
+      const inspection = artifact.importInspection!;
+      const stated = `task ${taskId}: ${artifact.path}: not bound, ${inspection.size} bytes, ${inspection.sha256}. Inspection: ${inspection.result}.`;
+      expect(reviewerInput, artifact.path).toContain(JSON.stringify(stated).slice(1, -1));
+      expect(reviewerInput, artifact.path).toContain(JSON.stringify(`For each: Inspection limits: ${inspection.limits}. ${inspection.content}`).slice(1, -1));
+    }
+  };
+
+  it("W10c a PNG the freeze refuses for a bare zip signature stays unbound, and the snapshot, the stored packet and the prompt carry the refusal reason (review E3-3)", async () => {
+    // Inert fixture: a bare zip signature and the marker in stored pixels.
+    await expectRefusedAtFreeze([
+      { path: "src/zip-in-idat.png", bytes: pngWithStoredPixels(Buffer.concat([ZIP_END_OF_DIRECTORY_SIGNATURE, INERT_MARKER])), why: /embedded zip archive .*signature at byte \d+/ },
+    ]);
+  }, 120_000);
+
+  it("W10d a font with glyf bytes before its first glyph location is not bound at freeze, and review reads why (review E3-1)", async () => {
+    // Inert fixture: the marker and zero padding as the whole glyf, every glyph location at its end.
+    await expectRefusedAtFreeze([
+      { path: "src/unindexed-glyf.ttf", bytes: ttfWithUnindexedGlyfPrefix(INERT_MARKER), why: /bytes before its first glyph location/ },
+    ]);
   }, 120_000);
 
   it("W11 the most text a task may import, at its worst-case patch expansion, freezes with the text in the patch", async () => {
