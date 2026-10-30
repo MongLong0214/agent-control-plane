@@ -4,6 +4,7 @@ import { parseGenesis, genesisBundleSchema, genesisPath } from './genesis-bundle
 import {
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -11,6 +12,7 @@ import {
   type Stats,
 } from "node:fs";
 import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { repositoryCheckoutPath } from "../core/repo-factory-paths.ts";
 
@@ -1049,9 +1051,11 @@ export const produceRepoFactoryResult = async (
   /**
    * #1268 — under a required CommitLore the bootstrap's own commits are CommitLore's: its one-call commit
    * with nothing recorded, because no session produced them and there is no transcript to cite, a root
-   * commit included. (An empty genesis commit is the one exception, made below as before.)
+   * commit included. An empty genesis commit, which CommitLore has no command to make, has its exact
+   * message checked by CommitLore's commit-msg check (`validate`) and is then made as before; a refusal
+   * makes no commit. That check is no capture, and nothing is recorded on it. Each is one commit attempt.
    */
-  const commitThroughCommitLore = async (message: string): Promise<Decision<string>> => {
+  const commitThroughCommitLore = async (message: string, options: { empty?: boolean } = {}): Promise<Decision<string | null>> => {
     const attemptOf = input.commitlore?.port?.attempt;
     if (attemptOf === undefined) {
       return deny(ReasonCode.VERIFICATION_GAP, "the approved manifest requires CommitLore, and this deployment's CommitLore cannot make a commit", {
@@ -1062,9 +1066,19 @@ export const produceRepoFactoryResult = async (
     // CommitLore commits with git's own identity lookup, in a child whose global configuration is empty.
     await gitOrCleanup(["config", "user.email", "repo-factory@local"]);
     await gitOrCleanup(["config", "user.name", "Repo Factory"]);
-    const attempt = await attemptOf(localRepoPath);
+    const attempt = await attemptOf(localRepoPath, { gitDir: join(localRepoPath, ".git"), workTree: localRepoPath });
     if (!attempt.allowed) return attempt as Decision<string>;
-    return attempt.value.commitWithoutTranscript({ checkout: localRepoPath, message });
+    const scratch = mkdtempSync(join(tmpdir(), "acp-commitlore-message-"));
+    try {
+      if (options.empty === true) {
+        const considered = await attempt.value.validateMessage({ checkout: localRepoPath, message, scratch });
+        return considered.allowed ? allow(ReasonCode.OK, null) : (considered as Decision<string | null>);
+      }
+      return await attempt.value.commitWithoutTranscript({ checkout: localRepoPath, message, scratch });
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+      attempt.value.dispose();
+    }
   };
 
   // #246 C5 — a create-only plan makes no commit and pushes none: the checkout stays unborn until the
@@ -1205,12 +1219,13 @@ export const produceRepoFactoryResult = async (
           }
           await gitOrCleanup(["add","--",...approvedFiles.map(f => f.path)]);
           // #1268 — a genesis whose approved files add nothing to the autoInit head stages an empty tree change.
-          // CommitLore makes no empty commit and would record nothing on it, so that one is made as before.
+          // CommitLore makes no empty commit: its message gets CommitLore's check, and it is made as before.
           const emptyGenesis = commitloreObservedHere && (await gitOrCleanup(["diff","--cached","--quiet"],{allowFailure:true})).exitCode === 0;
-          if (commitloreObservedHere && !emptyGenesis) {
-            const made = await commitThroughCommitLore(plan.genesis!.commitMessage);
+          if (commitloreObservedHere) {
+            const made = await commitThroughCommitLore(plan.genesis!.commitMessage, { empty: emptyGenesis });
             if (!made.allowed) return made as Decision<string>;
-          } else {
+          }
+          if (!commitloreObservedHere || emptyGenesis) {
             await gitOrCleanup(["-c","user.email=repo-factory@local","-c","user.name=Repo Factory","commit","--allow-empty","-m",plan.genesis!.commitMessage]);
           }
           const head = (await tryRevParse(localRepoPath,"HEAD"))!;

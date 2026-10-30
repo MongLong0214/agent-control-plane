@@ -8,19 +8,24 @@ import type { CommitLoreRun, CommitLoreRunner } from "./commitlore-observation.t
 /**
  * #1268 — CommitLore on the commits ACP makes itself.
  *
- * Every argv here is one the pinned CLI documents for a caller that commits on its own, run through the
- * runner the pin's checks and the newest-release confirmation resolved for this one commit attempt
- * (`commitloreRunner`'s `ready`): nothing here composes a trailer, mints an id or marks a transaction.
+ * Every argv here is one the pinned CLI documents, run through the runner one commit attempt prepared: a
+ * checked copy of the package the pin loads, with the worker's git hardening (`commitloreRunner`'s
+ * `prepare`). Nothing here composes a trailer, mints an id or marks a transaction.
  *
  * - A commit with a transcript (a worker's change, made by `commit-tree` over a private index with hooks
- *   off): `commit --no-commit --transcript --records -m --json` with that index as `GIT_INDEX_FILE`, which
- *   verifies the draft against the transcript and the staged diff all or nothing and binds the result to
- *   HEAD, that diff and the policy; then `prepare-commit-msg` on the message file, the command CommitLore's
- *   own hook runs, which applies a staged record; after the commit exists, `post-commit`, which finalises
- *   consumption against its parent, tree and message; and the transaction read back consumed by it.
+ *   off), with that index as `GIT_INDEX_FILE`: a draft of no records is `commit --no-commit -m --json`,
+ *   which binds "considered, nothing to record" to HEAD, that diff and the policy; a draft with records is
+ *   `capture --transcript --draft --json` (prepare, verify, stage), refused whole when any record does not
+ *   verify, with a survivor it staged removed; then `prepare-commit-msg` on the message file, the command
+ *   CommitLore's own hook runs, which applies the staged record. After the commit exists, `post-commit`
+ *   finalises consumption against its parent, tree and message, and the transaction is read back consumed.
+ *   (`capture`, not `commit --no-commit --records`: under the hardening git runs no hook, so `commit` would
+ *   refuse a record it sees no hook to apply.)
  * - A commit with no transcript (the bootstrap commit, a root commit included, and the genesis commit):
  *   `commit -m --json`, CommitLore's own one-call commit with nothing recorded. No draft is made up for a
  *   commit no session produced.
+ * - A commit CommitLore cannot make or bind (a plumbing merge, an empty commit): `validate --message-file`,
+ *   the check CommitLore's commit-msg hook makes, on the exact message before the commit exists.
  *
  * A refusal before the commit exists leaves no commit; nothing here resets or removes a byte.
  */
@@ -60,7 +65,14 @@ export interface CommitLoreAttempt {
   /** Once the branch is at `commit`, whose message is `committedMessage`: finalise, and read it back. */
   settle(input: { checkout: string; commit: string; committedMessage: string; considered: CommitLoreConsidered }): Promise<Decision<CommitLoreSettled>>;
   /** A commit no session produced: CommitLore makes it with nothing recorded, and names the commit it made. */
-  commitWithoutTranscript(input: { checkout: string; message: string }): Promise<Decision<string>>;
+  commitWithoutTranscript(input: { checkout: string; message: string; scratch: string }): Promise<Decision<string>>;
+  /**
+   * A commit CommitLore has no command to make or bind: its exact message, checked as CommitLore's commit-msg
+   * hook checks it, before the commit exists. Nothing is recorded on it. `scratch` is never the working tree.
+   */
+  validateMessage(input: { checkout: string; message: string; scratch: string }): Promise<Decision<void>>;
+  /** Removes the attempt's copy of the package. */
+  dispose(): void;
 }
 
 const refused = <T>(refusal: string, message: string, evidence: Record<string, unknown> = {}): Decision<T> =>
@@ -109,6 +121,45 @@ const runOrRefuse = async (
   }
 };
 
+/**
+ * `validate --message-file`, the check CommitLore's commit-msg hook makes, on `message` exactly: allowed only
+ * when it exits 0. The message file is written into `scratch`, never the working tree.
+ */
+const validated = async (run: CommitLoreRunner, checkout: string, message: string, scratch: string, index?: string): Promise<Decision<void>> => {
+  const messagePath = join(scratch, "commitlore-checked-message.txt");
+  writeFileSync(messagePath, message.endsWith("\n") ? message : `${message}\n`, { mode: 0o600 });
+  const checked = await runOrRefuse(run, ["validate", "--message-file", messagePath, "--json"], checkout, index === undefined ? undefined : { indexFile: index });
+  if (!checked.allowed) return checked as Decision<void>;
+  if (checked.value.exitCode === 0) return allow(ReasonCode.OK, undefined);
+  let violations: unknown = null;
+  try {
+    violations = (JSON.parse(checked.value.stdout) as { violations?: unknown }).violations ?? null;
+  } catch {
+    violations = null;
+  }
+  return refused("COMMITLORE_MESSAGE_REFUSED", "CommitLore's commit-msg check refused this message, so the commit is not made", {
+    exitCode: checked.value.exitCode,
+    violations,
+    stderr: tail(checked.value.stderr),
+  });
+};
+
+/** What `capture --json` answers: its outcome, the transaction it made, whether it staged, what it refused. */
+const captureAnswer = (run: CommitLoreRun): { outcome: string; nonce: string | null; staged: boolean; rejected: unknown[] } | null => {
+  try {
+    const parsed = JSON.parse(run.stdout) as Record<string, unknown>;
+    if (typeof parsed["outcome"] !== "string") return null;
+    return {
+      outcome: parsed["outcome"],
+      nonce: typeof parsed["nonce"] === "string" ? parsed["nonce"] : null,
+      staged: parsed["staged"] === true,
+      rejected: Array.isArray(parsed["rejected"]) ? parsed["rejected"] : [],
+    };
+  } catch {
+    return null;
+  }
+};
+
 /** Whether a draft is exactly `{"records": []}`: an answer of nothing to record. */
 const recordsNothing = (draft: string): boolean => {
   try {
@@ -141,63 +192,86 @@ const pendingTransactions = (run: CommitLoreRun): Array<{ nonce: string; phase: 
   }
 };
 
-/** The attempt's commands, on `run`, the runner `ready` resolved for this attempt. */
-export const commitloreAttempt = (run: CommitLoreRunner): CommitLoreAttempt => ({
+/** The attempt's commands, on `run`, the runner the attempt prepared; `dispose` removes what it prepared. */
+export const commitloreAttempt = (run: CommitLoreRunner, dispose: () => void = () => {}): CommitLoreAttempt => ({
   async consider({ checkout, index, baseHead, message, transcript, draft, scratch }) {
     const transcriptPath = join(scratch, "commitlore-transcript.txt");
     const draftPath = join(scratch, "commitlore-draft.json");
     const messagePath = join(scratch, "commitlore-message.txt");
     // A draft of no records is the statement `commit` makes with none passed ("the same as omitting
-    // --records"), so it is passed as none: CommitLore then needs no hook in the checkout to bind it.
-    let argv: string[] = ["commit", "--no-commit", "-m", message, "--json"];
-    if (!recordsNothing(draft)) {
-      writeFileSync(transcriptPath, transcript, { mode: 0o600 });
-      writeFileSync(draftPath, draft, { mode: 0o600 });
-      argv = ["commit", "--no-commit", "--transcript", transcriptPath, "--records", draftPath, "-m", message, "--json"];
+    // --records"): it binds the consideration and stages nothing.
+    if (recordsNothing(draft)) {
+      const bound = await runOrRefuse(run, ["commit", "--no-commit", "-m", message, "--json"], checkout, { indexFile: index });
+      if (!bound.allowed) return bound as Decision<CommitLoreConsidered>;
+      const answer = commitAnswer(bound.value);
+      if (answer?.outcome !== "staged" || answer.records !== 0) {
+        return refused("COMMITLORE_NOT_CONSIDERED", `CommitLore did not bind this change (${answer?.outcome ?? "no answer"}); nothing was committed`, {
+          lines: answer?.lines ?? [],
+          exitCode: bound.value.exitCode,
+          stderr: tail(bound.value.stderr),
+        });
+      }
+      const checked = await validated(run, checkout, message, scratch, index);
+      if (!checked.allowed) return checked as Decision<CommitLoreConsidered>;
+      return allow(ReasonCode.OK, { message, outcome: "empty", recordIds: [], nonce: null });
     }
-    const bound = await runOrRefuse(run, argv, checkout, { indexFile: index });
-    if (!bound.allowed) return bound as Decision<CommitLoreConsidered>;
-    const answer = commitAnswer(bound.value);
-    if (answer === null) {
-      return refused("COMMITLORE_NOT_CONSIDERED", "commitlore commit --no-commit gave no answer this client reads; nothing was committed", {
-        exitCode: bound.value.exitCode,
-        stderr: tail(bound.value.stderr),
+
+    writeFileSync(transcriptPath, transcript, { mode: 0o600 });
+    writeFileSync(draftPath, draft, { mode: 0o600 });
+    const captured = await runOrRefuse(run, ["capture", "--transcript", transcriptPath, "--draft", draftPath, "--json"], checkout, { indexFile: index });
+    if (!captured.allowed) return captured as Decision<CommitLoreConsidered>;
+    const answer = captureAnswer(captured.value);
+    // All or nothing: a refused record refuses the commit, and a survivor capture staged beside it is removed.
+    const withdraw = async (): Promise<void> => {
+      if (answer?.staged === true && answer.nonce !== null) await runOrRefuse(run, ["pending", "rm", answer.nonce, "--force"], checkout, { indexFile: index });
+    };
+    if (answer === null || !["staged", "empty", "rejected"].includes(answer.outcome)) {
+      await withdraw();
+      return refused("COMMITLORE_NOT_CONSIDERED", `CommitLore's capture did not complete (${answer?.outcome ?? "no answer"}); nothing was committed`, {
+        exitCode: captured.value.exitCode,
+        stderr: tail(captured.value.stderr),
       });
     }
-    if (answer.outcome === "refused") {
+    if (answer.outcome === "rejected" || answer.rejected.length > 0) {
+      await withdraw();
       return refused("COMMITLORE_RECORD_REFUSED", "a CommitLore record did not verify, so nothing was committed and nothing was bound", {
         rejected: answer.rejected,
-        lines: answer.lines,
       });
     }
-    if (answer.outcome !== "staged") {
-      return refused("COMMITLORE_NOT_CONSIDERED", `CommitLore did not bind this change (${answer.outcome}); nothing was committed`, {
-        lines: answer.lines,
-      });
+    // A draft that parsed to nothing is the same statement as passing none.
+    if (answer.outcome === "empty") {
+      const checked = await validated(run, checkout, message, scratch, index);
+      if (!checked.allowed) return checked as Decision<CommitLoreConsidered>;
+      return allow(ReasonCode.OK, { message, outcome: "empty", recordIds: [], nonce: null });
     }
-    if (answer.records === 0) return allow(ReasonCode.OK, { message, outcome: "empty", recordIds: [], nonce: null });
 
     // A staged record reaches the message through the command CommitLore's own prepare-commit-msg hook runs.
     writeFileSync(messagePath, message.endsWith("\n") ? message : `${message}\n`, { mode: 0o600 });
     const applied = await runOrRefuse(run, ["prepare-commit-msg", messagePath], checkout, { indexFile: index });
-    if (!applied.allowed) return applied as Decision<CommitLoreConsidered>;
+    if (!applied.allowed) {
+      await withdraw();
+      return applied as Decision<CommitLoreConsidered>;
+    }
     const withRecord = readFileSync(messagePath, "utf8");
     const recordIds = recordIdsIn(withRecord.slice(message.length));
-    if (applied.value.exitCode !== 0 || recordIds.length === 0) {
-      return refused("COMMITLORE_RECORD_NOT_APPLIED", "CommitLore staged a record and did not apply it to the message; nothing was committed", {
+    const listed = await runOrRefuse(run, ["pending", "ls", "--json"], checkout, { indexFile: index });
+    const appliedHere = listed.allowed
+      ? (pendingTransactions(listed.value) ?? []).filter((entry) => entry.phase === "applied" && entry.baseHead === baseHead && entry.nonce === answer.nonce)
+      : [];
+    if (applied.value.exitCode !== 0 || recordIds.length === 0 || appliedHere.length !== 1) {
+      return refused("COMMITLORE_RECORD_NOT_APPLIED", "CommitLore staged a record and did not apply it to this message on this base; nothing was committed", {
         exitCode: applied.value.exitCode,
         stderr: tail(applied.value.stderr),
+        nonce: answer.nonce,
       });
     }
-    const listed = await runOrRefuse(run, ["pending", "ls", "--json"], checkout, { indexFile: index });
-    if (!listed.allowed) return listed as Decision<CommitLoreConsidered>;
-    const appliedHere = (pendingTransactions(listed.value) ?? []).filter((entry) => entry.phase === "applied" && entry.baseHead === baseHead);
-    if (appliedHere.length !== 1) {
-      return refused("COMMITLORE_RECORD_NOT_APPLIED", "the applied record's capture transaction is not exactly one on this base; nothing was committed", {
-        applied: appliedHere.map((entry) => entry.nonce),
-      });
+    // The commit-msg hook CommitLore installs would check this message; no hook runs here, so it is asked.
+    const checked = await validated(run, checkout, withRecord, scratch, index);
+    if (!checked.allowed) {
+      await withdraw();
+      return checked as Decision<CommitLoreConsidered>;
     }
-    return allow(ReasonCode.OK, { message: withRecord, outcome: "recorded", recordIds, nonce: appliedHere[0]!.nonce });
+    return allow(ReasonCode.OK, { message: withRecord, outcome: "recorded", recordIds, nonce: answer.nonce });
   },
 
   async settle({ checkout, commit, committedMessage, considered }) {
@@ -230,7 +304,10 @@ export const commitloreAttempt = (run: CommitLoreRunner): CommitLoreAttempt => (
     return allow(ReasonCode.OK, { outcome: considered.outcome, recordIds: considered.recordIds, nonce: considered.nonce });
   },
 
-  async commitWithoutTranscript({ checkout, message }) {
+  async commitWithoutTranscript({ checkout, message, scratch }) {
+    // Git runs no hook under the hardening, so the commit-msg check CommitLore's hook makes is asked first.
+    const checked = await validated(run, checkout, message, scratch);
+    if (!checked.allowed) return checked as Decision<string>;
     const made = await runOrRefuse(run, ["commit", "-m", message, "--json"], checkout);
     if (!made.allowed) return made as Decision<string>;
     const answer = commitAnswer(made.value);
@@ -245,6 +322,12 @@ export const commitloreAttempt = (run: CommitLoreRunner): CommitLoreAttempt => (
     }
     return allow(ReasonCode.OK, answer.commit);
   },
+
+  async validateMessage({ checkout, message, scratch }) {
+    return validated(run, checkout, message, scratch);
+  },
+
+  dispose,
 });
 
 /** The fence a worker's reply carries its CommitLore draft in. */

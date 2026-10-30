@@ -67,6 +67,47 @@ export const GIT_HARDENING: readonly string[] = [
   "-c", "core.askPass=",
 ];
 
+/**
+ * #1268 — `GIT_HARDENING` in the form git reads from its environment (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`,
+ * `GIT_CONFIG_VALUE_<n>`), for a child that runs git itself — CommitLore — and so cannot be handed `-c`.
+ * Git reads these after every configuration file, so they override the repository's own as `-c` does.
+ */
+export const gitHardeningEnvironment = (options: { except?: readonly string[] } = {}): Record<string, string> => {
+  const settings: Array<[string, string]> = [];
+  for (let index = 0; index + 1 < GIT_HARDENING.length; index += 2) {
+    const setting = GIT_HARDENING[index + 1]!;
+    const at = setting.indexOf("=");
+    // `except` names whole settings a caller leaves to the repository; the worker's own git leaves none.
+    if (options.except?.includes(setting.slice(0, at)) === true) continue;
+    settings.push([setting.slice(0, at), setting.slice(at + 1)]);
+  }
+  return Object.fromEntries([
+    ["GIT_CONFIG_COUNT", String(settings.length)],
+    ...settings.flatMap(([key, value], index) => [[`GIT_CONFIG_KEY_${index}`, key], [`GIT_CONFIG_VALUE_${index}`, value]]),
+  ]);
+};
+
+/**
+ * The environment every pinned git child runs in, bar its PATH, HOME and committer: git dir and work tree
+ * passed explicitly, no system or global configuration, no system attributes, no replace refs, no optional
+ * locks, literal pathspecs. `runPinnedGit` adds `GIT_HARDENING` as `-c`; a child that runs git itself adds
+ * `gitHardeningEnvironment` (#1268).
+ */
+export const pinnedGitEnvironment = (input: { gitDir: string; workTree: string; index?: string }): Record<string, string> => ({
+  LC_ALL: "C",
+  GIT_TERMINAL_PROMPT: "0",
+  GIT_PAGER: "cat",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_ATTR_NOSYSTEM: "1",
+  GIT_NO_REPLACE_OBJECTS: "1",
+  GIT_OPTIONAL_LOCKS: "0",
+  GIT_LITERAL_PATHSPECS: "1",
+  GIT_DIR: input.gitDir,
+  GIT_WORK_TREE: input.workTree,
+  ...(input.index ? { GIT_INDEX_FILE: input.index } : {}),
+});
+
 /** The committer the control plane signs worker commits as; no provider, model or session in it. */
 const CONTROL_PLANE_IDENTITY = {
   GIT_AUTHOR_NAME: "agent-control-plane",
@@ -471,18 +512,7 @@ export const runPinnedGit = (
       PATH: process.env["PATH"] ?? "/usr/bin:/bin",
       HOME: join(repo.scratch, "home"),
       XDG_CONFIG_HOME: join(repo.scratch, "home"),
-      LC_ALL: "C",
-      GIT_TERMINAL_PROMPT: "0",
-      GIT_PAGER: "cat",
-      GIT_CONFIG_NOSYSTEM: "1",
-      GIT_CONFIG_GLOBAL: "/dev/null",
-      GIT_ATTR_NOSYSTEM: "1",
-      GIT_NO_REPLACE_OBJECTS: "1",
-      GIT_OPTIONAL_LOCKS: "0",
-      GIT_LITERAL_PATHSPECS: "1",
-      GIT_DIR: repo.gitDir,
-      GIT_WORK_TREE: repo.workTree,
-      ...(options.index ? { GIT_INDEX_FILE: options.index } : {}),
+      ...pinnedGitEnvironment({ gitDir: repo.gitDir, workTree: repo.workTree, ...(options.index ? { index: options.index } : {}) }),
       ...CONTROL_PLANE_IDENTITY,
       ...(options.extraEnv ?? {}),
     };

@@ -142,26 +142,34 @@ class AutoInitHoldsGenesis extends GenesisGitHub {
   }
 }
 
+/** A genesis whose approved files equal GitHub's initialization, produced with `commitlore`, its message `message`. */
+const emptyGenesis = async (commitlore: CommitLorePort, message?: string) => {
+  const f = genesisPlanFixture();
+  const root = tempDir("cl-genesis-empty-");
+  const port = new AutoInitHoldsGenesis(root, f.outputs.files);
+  const plan = executablePlanOf(f.outputs, f.binding.planDigest);
+  if (message !== undefined) plan.genesis = { ...plan.genesis!, commitMessage: message };
+  const result = await produceRepoFactoryResult({
+    plan,
+    workDir: join(root, "work"),
+    approvedFiles: f.outputs.files,
+    github: {
+      port,
+      authority: {
+        owner: "acme",
+        visibility: "public" as const,
+        approvedOperations: f.outputs.githubOperations.map(({ operationId, resourceIdentity, resourceType }) => ({ operationId, resourceIdentity, resourceType })),
+      },
+    },
+    commitlore: { mode: "required", port: commitlore },
+  });
+  return { result, port };
+};
+
 describe("#1268: a genesis that adds nothing to GitHub's initialization", () => {
   it("is committed as before, on the autoInit head, with no CommitLore commit asked for", async () => {
-    const f = genesisPlanFixture();
-    const root = tempDir("cl-genesis-empty-");
-    const port = new AutoInitHoldsGenesis(root, f.outputs.files);
     const committed: string[] = [];
-    const result = await produceRepoFactoryResult({
-      plan: executablePlanOf(f.outputs, f.binding.planDigest),
-      workDir: join(root, "work"),
-      approvedFiles: f.outputs.files,
-      github: {
-        port,
-        authority: {
-          owner: "acme",
-          visibility: "public" as const,
-          approvedOperations: f.outputs.githubOperations.map(({ operationId, resourceIdentity, resourceType }) => ({ operationId, resourceIdentity, resourceType })),
-        },
-      },
-      commitlore: { mode: "required", port: { observe: async () => PASS, attempt: gitCommitAttempt(committed) } },
-    });
+    const { result, port } = await emptyGenesis({ observe: async () => PASS, attempt: gitCommitAttempt(committed) });
     expect(result.allowed, result.allowed ? "" : `${result.message} ${JSON.stringify(result.evidence)}`).toBe(true);
     expect(committed).toEqual([]);
     const genesis = (await git(port.bare!, ["rev-parse", "refs/heads/genesis"])).stdout.trim();
@@ -215,10 +223,10 @@ describe.skipIf(REAL === null)("#1268: CommitLore's own one-call commit, through
   ])("%s: CommitLore makes it with nothing recorded, and binds its consideration to that HEAD", async (_name, parent) => {
     const repo = await repoWith("cl-real-commit-", parent);
     const before = parent ? (await git(repo, ["rev-parse", "HEAD"])).stdout.trim() : null;
-    const attempt = await realPort().attempt!(repo);
+    const attempt = await realPort().attempt!(repo, { gitDir: join(repo, ".git"), workTree: repo });
     expect(attempt.allowed, JSON.stringify(attempt)).toBe(true);
     if (!attempt.allowed) return;
-    const made = await attempt.value.commitWithoutTranscript({ checkout: repo, message: "repo factory bootstrap" });
+    const made = await attempt.value.commitWithoutTranscript({ checkout: repo, message: "repo factory bootstrap", scratch: tempDir("cl-real-message-") });
     expect(made.allowed, JSON.stringify(made)).toBe(true);
     if (!made.allowed) return;
     expect((await git(repo, ["rev-parse", "HEAD"])).stdout.trim()).toBe(made.value);
@@ -229,13 +237,29 @@ describe.skipIf(REAL === null)("#1268: CommitLore's own one-call commit, through
     expect(considered).toMatchObject({ outcome: "empty", records: 0, head: before });
   });
 
+  it.each([
+    ["a malformed trailer", "Create runnable project\n\nRecord-Id: NOT AN ID", false],
+    ["a clean message", "Create runnable project", true],
+  ])("review r2 P1: an empty genesis is considered by CommitLore's commit-msg check on its exact message — %s", async (_name, message, passes) => {
+    const { result, port } = await emptyGenesis({ observe: async () => PASS, attempt: realPort().attempt! }, message);
+    if (passes) {
+      expect(result.allowed, result.allowed ? "" : `${result.message} ${JSON.stringify(result.evidence)}`).toBe(true);
+      const genesis = (await git(port.bare!, ["rev-parse", "refs/heads/genesis"])).stdout.trim();
+      expect((await git(port.bare!, ["rev-list", "--parents", "-n", "1", genesis])).stdout.trim().split(" ").slice(1)).toEqual([port.autoInitHead]);
+      expect((await git(port.bare!, ["log", "-1", "--format=%B", genesis])).stdout).not.toContain("Record-Id:");
+    } else {
+      expect(result, JSON.stringify(result)).toMatchObject({ allowed: false, evidence: { refusal: "COMMITLORE_MESSAGE_REFUSED" } });
+      expect((await git(port.bare!, ["rev-parse", "--verify", "-q", "refs/heads/genesis"], { allowFailure: true })).exitCode).not.toBe(0);
+    }
+  });
+
   it("an empty commit is not one CommitLore makes: it refuses, and no commit is made", async () => {
     const repo = await repoWith("cl-real-empty-", true);
     await git(repo, ["commit", "-q", "-m", "README"]);
     const head = (await git(repo, ["rev-parse", "HEAD"])).stdout.trim();
-    const attempt = await realPort().attempt!(repo);
+    const attempt = await realPort().attempt!(repo, { gitDir: join(repo, ".git"), workTree: repo });
     if (!attempt.allowed) throw new Error(attempt.message);
-    const made = await attempt.value.commitWithoutTranscript({ checkout: repo, message: "nothing staged" });
+    const made = await attempt.value.commitWithoutTranscript({ checkout: repo, message: "nothing staged", scratch: tempDir("cl-real-message-") });
     expect(made).toMatchObject({ allowed: false, evidence: { refusal: "COMMITLORE_COMMIT_REFUSED" } });
     expect((await git(repo, ["rev-parse", "HEAD"])).stdout.trim()).toBe(head);
     expect(existsSync(join(repo, "README.md"))).toBe(true);

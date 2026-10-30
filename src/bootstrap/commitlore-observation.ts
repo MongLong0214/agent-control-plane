@@ -6,12 +6,14 @@ import { basename, join, resolve } from "node:path";
 import { z } from "zod";
 
 import type { ProjectManifest } from "../contracts/manifest.ts";
+import type { Db } from "../db/database.ts";
 import { sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { git } from "../git/git.ts";
 import { runtimeEnvironment } from "../runtime/cli-adapters.ts";
+import { gitHardeningEnvironment, pinnedGitEnvironment } from "../run/worker-git.ts";
 import {
   COMMITLORE_BINARY_VARIABLE,
   COMMITLORE_PIN_IDENTITY_TIMEOUT_MS,
@@ -23,6 +25,7 @@ import {
   verifyCommitLorePin,
 } from "./commitlore-pin.ts";
 import { type CommitLoreAttempt, commitloreAttempt } from "./commitlore-commit.ts";
+import { assertCommitLoreSnapshotUnchanged, disposeCommitLoreSnapshot, snapshotCommitLorePackage } from "./commitlore-snapshot.ts";
 import type { RepoFactoryResult } from "./repo-factory-result.ts";
 import { frameRecord, unframeRecord, writeWholeSync } from "./whole-write.ts";
 
@@ -86,13 +89,13 @@ export interface CommitLorePort {
    * (`harvest --prompt-only`), read in `checkoutPath`. A port without it cannot put a worker's commit
    * through CommitLore.
    */
-  contract?(checkoutPath: string): Promise<Decision<string>>;
+  contract?(checkoutPath: string, git: CommitLoreGitTarget): Promise<Decision<string>>;
   /**
    * #1268 — one commit attempt in `checkoutPath`: the pin's checks and the newest-release confirmation,
    * made for this attempt alone, then its commands (`commitlore-commit.ts`). A port without it cannot put
    * a commit through CommitLore, and a commit that requires CommitLore is then refused, never made without.
    */
-  attempt?(checkoutPath: string): Promise<Decision<CommitLoreAttempt>>;
+  attempt?(checkoutPath: string, git: CommitLoreGitTarget): Promise<Decision<CommitLoreAttempt>>;
 }
 
 /**
@@ -100,6 +103,47 @@ export interface CommitLorePort {
  * values the manifest contract defines are lenient, so an unsupported value is never downgraded.
  */
 export const commitloreRequired = (mode: unknown): boolean => mode !== "preferred" && mode !== "off";
+
+/**
+ * #1268 — whether a run's pinned manifest requires CommitLore of the commits the control plane makes for it.
+ * A pinned manifest that cannot be read is held to requiring it; a run with no pinned manifest has no
+ * contract that asks for it.
+ */
+export const commitloreGoverned = (db: Db, runId: string): boolean => {
+  const run = db.get<{ pinned_manifest_digest: string | null }>(`SELECT pinned_manifest_digest FROM runs WHERE run_id = ?`, [runId]);
+  if (!run?.pinned_manifest_digest) return false;
+  const manifest = db.get<{ content_json: string }>(`SELECT content_json FROM manifests WHERE digest = ?`, [run.pinned_manifest_digest]);
+  let mode: unknown;
+  try {
+    mode = manifest ? (JSON.parse(manifest.content_json) as { commitlore?: { mode?: unknown } }).commitlore?.mode : undefined;
+  } catch {
+    mode = undefined;
+  }
+  return commitloreRequired(mode);
+};
+
+/**
+ * #1268 — one commit the control plane builds and CommitLore has no command to make or bind (a plumbing
+ * merge): a commit attempt on `port` in that repository, CommitLore's commit-msg check on the exact message,
+ * and the attempt's copy removed. A refusal means the commit is not made; nothing is recorded on it.
+ */
+export const checkGeneratedCommitMessage = async (
+  port: CommitLorePort | null,
+  input: { checkout: string; git: CommitLoreGitTarget; message: string; scratch: string },
+): Promise<Decision<void>> => {
+  if (port?.attempt === undefined) {
+    return deny(ReasonCode.VERIFICATION_GAP, "this run's contract requires CommitLore, and this deployment has no CommitLore to consider its commits", {
+      refusal: "COMMITLORE_REQUIRED_UNOBSERVABLE",
+    });
+  }
+  const attempt = await port.attempt(input.checkout, input.git);
+  if (!attempt.allowed) return attempt as Decision<void>;
+  try {
+    return await attempt.value.validateMessage({ checkout: input.checkout, message: input.message, scratch: input.scratch });
+  } finally {
+    attempt.value.dispose();
+  }
+};
 
 export interface CommitLoreRun {
   exitCode: number;
@@ -189,7 +233,47 @@ export const judgeCommitLoreRuns = (init: CommitLoreRun | null, doctor: CommitLo
  */
 export interface CommitLoreRunner {
   (argv: readonly string[], cwd: string, options?: CommitLoreRunOptions): Promise<CommitLoreRun>;
-  readonly ready?: (cwd: string) => Promise<CommitLoreRunner>;
+  /** #1268 — `git`, when given, is the repository the checks run against, under its hardening. */
+  readonly ready?: (cwd: string, git?: CommitLoreGitTarget) => Promise<CommitLoreRunner>;
+  /**
+   * #1268 — a runner for one commit attempt in `cwd` on the repository `git` names: the package the pin
+   * loads, copied (`commitlore-snapshot.ts`), checked with `checked` (the pin's checks and the newest-release
+   * confirmation, against the copy's own version), and every command run from that copy with the worker's
+   * git hardening. `dispose` removes the copy.
+   */
+  readonly prepare?: (cwd: string, git: CommitLoreGitTarget, options: { checked: boolean }) => Promise<PreparedCommitLore>;
+}
+
+/** #1268 — the repository a CommitLore command works on, passed to git explicitly. */
+export interface CommitLoreGitTarget {
+  gitDir: string;
+  workTree: string;
+  /**
+   * The bootstrap observation's `init`, whose job is to install CommitLore's hooks into the repository:
+   * the one hardening setting left out is `core.hooksPath` (`OBSERVATION_HARDENING_EXCEPTION`).
+   */
+  installsHooks?: boolean;
+}
+
+/**
+ * #1268 — the one worker hardening setting the bootstrap observation leaves out: `core.hooksPath=/dev/null`.
+ * Under it `commitlore init` answers `init: 1/7 step(s) could not run — hooks install` and exits 2, because
+ * the hooks path it installs into is /dev/null. Every other setting stays: fsmonitor, the untracked cache,
+ * signing, gc and maintenance, credential helpers and askpass are off, and no system or global config is
+ * read. The checkout is ACP's own, made before any worker turn; a worker never runs in it.
+ */
+export const OBSERVATION_HARDENING_EXCEPTION = "core.hooksPath";
+
+/** #1268 — the git target of a checkout ACP made itself for a bootstrap, its git dir at `.git`. */
+export const observationGitTarget = (checkoutPath: string): CommitLoreGitTarget => ({
+  gitDir: join(checkoutPath, ".git"),
+  workTree: checkoutPath,
+  installsHooks: true,
+});
+
+export interface PreparedCommitLore {
+  readonly run: CommitLoreRunner;
+  readonly dispose: () => void;
 }
 
 /**
@@ -199,6 +283,13 @@ export interface CommitLoreRunner {
  */
 export interface CommitLoreRunOptions {
   indexFile?: string;
+  /**
+   * #1268 — the repository a commit attempt's command works on. Given, the child runs git in the environment
+   * every pinned worker git child has (`pinnedGitEnvironment`), with `GIT_HARDENING` as git reads it from
+   * the environment (`gitHardeningEnvironment`): no hook, fsmonitor, credential or askpass program the
+   * repository names is run by CommitLore's git.
+   */
+  git?: CommitLoreGitTarget;
 }
 
 /**
@@ -249,6 +340,11 @@ export const COMMITLORE_LIMITS: Readonly<CommitLoreLimits> = Object.freeze({
  * - no askpass program (an empty `GIT_ASKPASS` stops git consulting `core.askPass` and `SSH_ASKPASS`) and
  *   no terminal prompt.
  * So a git call that needs a credential fails rather than finding one.
+ *
+ * #1268 — and no ssh program the repository names: `GIT_SSH_COMMAND=ssh`, which git prefers to
+ * `core.sshCommand`, so `init` and `doctor` reaching an `ssh://` remote run the ordinary `ssh` (with the
+ * operator's ssh config) rather than whatever the checkout's config names. Measured with the real CLI: a
+ * marker-writing `core.sshCommand` ran 4 times across `init` and `doctor` without it, and 0 times with it.
  */
 const INJECTED_GIT_CONFIG = /^GIT_CONFIG_(?:PARAMETERS|COUNT|KEY_\d+|VALUE_\d+)$/;
 
@@ -265,6 +361,7 @@ export const commitloreChildEnvironment = (home: string): NodeJS.ProcessEnv => {
     GIT_CONFIG_VALUE_0: "",
     GIT_ASKPASS: "",
     GIT_TERMINAL_PROMPT: "0",
+    GIT_SSH_COMMAND: "ssh",
   };
 };
 
@@ -300,7 +397,13 @@ export const commitloreChildHome = (): string => {
  * the event loop between them, only the promise's own continuation.
  */
 const commitloreChild =
-  (executable: string, limits: Readonly<CommitLoreLimits>, beforeSpawn: () => Promise<void> = async () => {}): CommitLoreRunner =>
+  (
+    executable: string,
+    limits: Readonly<CommitLoreLimits>,
+    beforeSpawn: () => Promise<void> = async () => {},
+    /** #1268 — what precedes `argv` on the command line: the copied bundle, when node runs it. */
+    prefix: readonly string[] = [],
+  ): CommitLoreRunner =>
   async (argv, cwd, options) => {
     const home = commitloreChildHome();
     const removeHome = (): void => {
@@ -311,7 +414,16 @@ const commitloreChild =
         // reason to throw from this listener.
       }
     };
-    const env = { ...commitloreChildEnvironment(home), ...(options?.indexFile === undefined ? {} : { GIT_INDEX_FILE: options.indexFile }) };
+    const env = {
+      ...commitloreChildEnvironment(home),
+      ...(options?.git === undefined
+        ? {}
+        : {
+            ...pinnedGitEnvironment({ gitDir: options.git.gitDir, workTree: options.git.workTree }),
+            ...gitHardeningEnvironment(options.git.installsHooks === true ? { except: [OBSERVATION_HARDENING_EXCEPTION] } : {}),
+          }),
+      ...(options?.indexFile === undefined ? {} : { GIT_INDEX_FILE: options.indexFile }),
+    };
     try {
       await beforeSpawn();
     } catch (error) {
@@ -319,7 +431,7 @@ const commitloreChild =
       throw error as Error;
     }
     return new Promise((resolvePromise, reject) => {
-      const child = spawn(executable, [...argv], {
+      const child = spawn(executable, [...prefix, ...argv], {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
         timeout: limits.timeoutMs,
@@ -436,7 +548,10 @@ export const commitloreRunner = (
   limits: Readonly<CommitLoreLimits> = COMMITLORE_LIMITS,
   pin: string | undefined = process.env[COMMITLORE_BINARY_VARIABLE],
   latest: CommitLoreReleaseLookup = officialCommitLoreRelease,
-): CommitLoreRunner & { readonly ready: (cwd: string) => Promise<CommitLoreRunner> } => {
+): CommitLoreRunner & {
+  readonly ready: (cwd: string, git?: CommitLoreGitTarget) => Promise<CommitLoreRunner>;
+  readonly prepare: NonNullable<CommitLoreRunner["prepare"]>;
+} => {
   const pinned = (): string => {
     const executable = commitlorePin(pin);
     if (!executable.allowed) throw new Error(executable.message);
@@ -444,19 +559,38 @@ export const commitloreRunner = (
   };
   const run = async (argv: readonly string[], cwd: string, options?: CommitLoreRunOptions): Promise<CommitLoreRun> =>
     commitloreChild(pinned(), limits)(argv, cwd, options);
-  const ready = async (cwd: string): Promise<CommitLoreRunner> => {
+  const ready = async (cwd: string, git?: CommitLoreGitTarget): Promise<CommitLoreRunner> => {
     const executable = pinned();
     const bound = await bindCommitLorePin(executable, limits.identityTimeoutMs);
     const unchanged = (): Promise<void> => assertCommitLorePinUnchanged(pinned(), bound, limits.identityTimeoutMs);
     const check = commitloreChild(executable, { ...limits, timeoutMs: limits.checkTimeoutMs }, unchanged);
-    const unsupported = await verifyCommitLorePin(executable, check, cwd, latest);
+    const unsupported = await verifyCommitLorePin(executable, (argv, checkCwd) => check(argv, checkCwd, git === undefined ? undefined : { git }), cwd, latest);
     if (unsupported !== null) throw new Error(unsupported);
     // A change made while the last check ran refuses here, before any command is asked for.
     await unchanged();
     const command = commitloreChild(executable, limits, unchanged);
     return async (argv, commandCwd, options) => command(argv, commandCwd, options);
   };
-  return Object.assign(run, { ready });
+  const prepare = async (cwd: string, git: CommitLoreGitTarget, options: { checked: boolean }): Promise<PreparedCommitLore> => {
+    const executable = pinned();
+    const snapshot = snapshotCommitLorePackage(executable);
+    const dispose = (): void => disposeCommitLoreSnapshot(snapshot);
+    try {
+      const unchanged = async (): Promise<void> => assertCommitLoreSnapshotUnchanged(snapshot);
+      if (options.checked) {
+        const check = commitloreChild(process.execPath, { ...limits, timeoutMs: limits.checkTimeoutMs }, unchanged, [snapshot.entry]);
+        const unsupported = await verifyCommitLorePin(executable, (argv, checkCwd) => check(argv, checkCwd, { git }), cwd, latest, snapshot.version);
+        if (unsupported !== null) throw new Error(unsupported);
+        await unchanged();
+      }
+      const command = commitloreChild(process.execPath, limits, unchanged, [snapshot.entry]);
+      return { run: async (argv, commandCwd, commandOptions) => command(argv, commandCwd, { ...commandOptions, git }), dispose };
+    } catch (error) {
+      dispose();
+      throw error;
+    }
+  };
+  return Object.assign(run, { ready, prepare });
 };
 
 /**
@@ -464,14 +598,18 @@ export const commitloreRunner = (
  * A runner's `ready` is awaited once, before `init`; nothing runs if it refuses, and `init` and `doctor` run
  * through the runner it resolves with.
  *
- * #1268 — `attempt` awaits `ready` once per commit attempt in the same way, and its commands run through the
- * runner it resolves with (`commitloreAttempt`). `contract` prints the static drafting contract through the
- * pin alone: it is text for a prompt, and the attempt that commits is the one that checks the pin.
+ * #1268 — `attempt` prepares a checked copy of the package the pin loads once per commit attempt
+ * (`commitloreRunner`'s `prepare`), and its commands run from that copy (`commitloreAttempt`). `contract`
+ * prints the static drafting contract from an unchecked copy: it is text for a prompt, and the attempt that
+ * commits is the one that checks.
  */
 export const createCommitLoreCliPort = (run: CommitLoreRunner = commitloreRunner()): CommitLorePort => ({
-  async contract(checkoutPath) {
+  async contract(checkoutPath, git) {
+    if (run.prepare === undefined) return unprepared();
+    let prepared: PreparedCommitLore | null = null;
     try {
-      const printed = await run(["harvest", "--prompt-only"], checkoutPath);
+      prepared = await run.prepare(checkoutPath, git, { checked: false });
+      const printed = await prepared.run(["harvest", "--prompt-only"], checkoutPath);
       if (printed.exitCode === 0 && printed.stdout.trim() !== "") return allow(ReasonCode.OK, printed.stdout);
       return deny(ReasonCode.VERIFICATION_GAP, `commitlore harvest --prompt-only exited ${printed.exitCode} without a contract`, {
         refusal: "COMMITLORE_NOT_RUN",
@@ -481,11 +619,15 @@ export const createCommitLoreCliPort = (run: CommitLoreRunner = commitloreRunner
       return deny(ReasonCode.VERIFICATION_GAP, `commitlore harvest could not be run: ${(error as Error).message.slice(0, 300)}`, {
         refusal: "COMMITLORE_NOT_RUN",
       });
+    } finally {
+      prepared?.dispose();
     }
   },
-  async attempt(checkoutPath) {
+  async attempt(checkoutPath, git) {
+    if (run.prepare === undefined) return unprepared();
     try {
-      return allow(ReasonCode.OK, commitloreAttempt(run.ready === undefined ? run : await run.ready(checkoutPath)));
+      const prepared = await run.prepare(checkoutPath, git, { checked: true });
+      return allow(ReasonCode.OK, commitloreAttempt(prepared.run, prepared.dispose));
     } catch (error) {
       return deny(ReasonCode.VERIFICATION_GAP, `commitlore could not be run: ${(error as Error).message.slice(0, 300)}`, {
         refusal: "COMMITLORE_NOT_RUN",
@@ -494,30 +636,39 @@ export const createCommitLoreCliPort = (run: CommitLoreRunner = commitloreRunner
   },
   async observe(checkoutPath) {
     const [initArgv, doctorArgv] = COMMITLORE_OBSERVATION_ARGV as [readonly string[], readonly string[]];
+    // #1268 — every child of the observation runs git under the worker's hardening, bar the hooks path
+    // `init` installs into (`OBSERVATION_HARDENING_EXCEPTION`).
+    const git = observationGitTarget(checkoutPath);
     let command: CommitLoreRunner = run;
     if (run.ready !== undefined) {
       try {
-        command = await run.ready(checkoutPath);
+        command = await run.ready(checkoutPath, git);
       } catch (error) {
         return fail(`commitlore could not be run: ${(error as Error).message.slice(0, 300)}`);
       }
     }
     let init: CommitLoreRun;
     try {
-      init = await command(initArgv, checkoutPath);
+      init = await command(initArgv, checkoutPath, { git });
     } catch (error) {
       return fail(`commitlore init could not be run: ${(error as Error).message.slice(0, 300)}`);
     }
     if (init.exitCode !== 0) return judgeCommitLoreRuns(init, null);
     let doctor: CommitLoreRun;
     try {
-      doctor = await command(doctorArgv, checkoutPath);
+      doctor = await command(doctorArgv, checkoutPath, { git });
     } catch (error) {
       return fail(`commitlore doctor could not be run: ${(error as Error).message.slice(0, 300)}`);
     }
     return judgeCommitLoreRuns(init, doctor);
   },
 });
+
+/** #1268 — a runner that cannot copy and check a package runs no commit attempt. */
+const unprepared = (): Decision<never> =>
+  deny(ReasonCode.VERIFICATION_GAP, "this CommitLore runner cannot run a checked copy of its package, so it makes no commit", {
+    refusal: "COMMITLORE_NOT_RUN",
+  });
 
 const refuse = (refusal: string, message: string, evidence: Record<string, unknown>): Decision<CommitLoreObservation> =>
   deny(ReasonCode.VERIFICATION_GAP, message, { refusal, ...evidence });

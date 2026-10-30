@@ -1,3 +1,4 @@
+import { passingCommitLore } from "./commitlore-attempt.ts";
 import { join } from "node:path";
 
 import { type Clock, ManualClock } from "../../src/core/clock.ts";
@@ -135,7 +136,8 @@ console.log('verification ok');`,
     ...(options.githubKernelOptions ? { githubKernelOptions: options.githubKernelOptions } : {}),
     ...(options.githubAppEnvFile ? { githubAppEnvFile: options.githubAppEnvFile } : {}),
     ...(options.githubAppPrivateKeyPath ? { githubAppPrivateKeyPath: options.githubAppPrivateKeyPath } : {}),
-    ...(options.repoFactory ? { repoFactory: options.repoFactory } : {}),
+    // #1268 — a new project requires CommitLore; without a port of the test's own, a passing double.
+    ...(options.repoFactory ? { repoFactory: { commitlore: passingCommitLore(), ...options.repoFactory } } : {}),
     ...(options.residentProvisioner ? {residentProvisioner:options.residentProvisioner} : {}),
   });
 

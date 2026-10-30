@@ -44,6 +44,9 @@ export const COMMITLORE_BINARY_VARIABLE = "ACP_COMMITLORE_BINARY";
  * `NO_INIT_OPTION`: it gives one, and that usage does not offer an option the observation passes.
  * `RELEASE_UNCONFIRMED`: the newest published stable release could not be confirmed for this observation.
  * `NOT_LATEST`: it was, and the pinned CLI's version is not that release's.
+ * `PACKAGE_MISMATCH`, `UNSUPPORTED_ENTRYPOINT`, `UNSUPPORTED_PACKAGE`: the package a commit attempt copies
+ * and runs (`commitlore-snapshot.ts`) states another version than it answers, cannot be named from the pin,
+ * or is not one package of regular files with a published file list.
  */
 export type CommitLorePinCondition =
   | "NOT_CONFIGURED"
@@ -58,6 +61,9 @@ export type CommitLorePinCondition =
   | "NO_INIT_OPTION"
   | "RELEASE_UNCONFIRMED"
   | "NOT_LATEST"
+  | "PACKAGE_MISMATCH"
+  | "UNSUPPORTED_ENTRYPOINT"
+  | "UNSUPPORTED_PACKAGE"
   | "TOO_LARGE"
   | "REPLACED";
 
@@ -333,12 +339,17 @@ export const judgeCommitLoreLatest = async (pin: string, answer: string, lookup:
  * `cwd`, then that version against the newest stable release `latest` confirms (#1268). Null when all hold;
  * otherwise the first reason, and nothing later is asked. A check that cannot be run at all throws, as `run`
  * does.
+ *
+ * #1268 — `packageVersion`, for a run of a copied package (`commitlore-snapshot.ts`): the version that
+ * package's own `package.json` states. It must be the version the copy answers, and it is what the newest
+ * release is compared with.
  */
 export const verifyCommitLorePin = async (
   pin: string,
   run: CommitLoreRunner,
   cwd: string,
   latest: CommitLoreReleaseLookup,
+  packageVersion?: string,
 ): Promise<string | null> => {
   const [versionArgv, doctorArgv, initArgv] = COMMITLORE_PIN_CHECK_ARGV as [readonly string[], readonly string[], readonly string[]];
   const versionRun = await run(versionArgv, cwd);
@@ -348,7 +359,13 @@ export const verifyCommitLorePin = async (
   if (doctor !== null) return doctor;
   const init = judgeCommitLoreInitCommand(pin, await run(initArgv, cwd));
   if (init !== null) return init;
-  return judgeCommitLoreLatest(pin, versionRun.stdout, latest);
+  if (packageVersion !== undefined && packageVersion !== versionRun.stdout.trim()) {
+    return (
+      `${COMMITLORE_BINARY_VARIABLE} PACKAGE_MISMATCH: the CommitLore package ${pin} runs states version ` +
+      `${JSON.stringify(tail(packageVersion))} and answers ${JSON.stringify(tail(versionRun.stdout))}`
+    );
+  }
+  return judgeCommitLoreLatest(pin, packageVersion ?? versionRun.stdout, latest);
 };
 
 /**

@@ -75,7 +75,11 @@ const storedResult = (prepared: PreparedBootstrapRun): RepoFactoryResult | null 
 
 describe("#246 B3: the bootstrap producer enforces the approved manifest's CommitLore mode", () => {
   it("B3-1a required, no CommitLore observer: refused before anything is consumed, read or written", async () => {
-    const prepared = await prepareBootstrapRun("b3-required-unobservable", { manifest: requiredManifest("b3-required-unobservable"), ops: pushOperations() });
+    const prepared = await prepareBootstrapRun("b3-required-unobservable", {
+      manifest: requiredManifest("b3-required-unobservable"),
+      ops: pushOperations(),
+      commitlore: null,
+    });
     const refused = await produce(prepared);
     expect(refused, JSON.stringify(refused)).toMatchObject({
       allowed: false,
@@ -195,18 +199,23 @@ describe("#246 B3: the bootstrap producer enforces the approved manifest's Commi
     expect(final["warnings"]).toEqual([]);
   });
 
-  it("B3-3 preferred, nothing observed: activates, named NOT_OBSERVED, and the port is never asked", async () => {
+  it("B3-3 (#1268) a new project that prefers CommitLore is refused at activation, before anything is written, and the port is never asked", async () => {
     const commitlore = new FakeCommitLore(() => FAIL);
     const prepared = await prepareBootstrapRun("b3-preferred", {
-      manifest: cleanTreeManifest("b3-preferred"),
+      manifest: cleanTreeManifest("b3-preferred", { commitlore: { mode: "preferred" } }),
       ops: pushOperations(),
       commitlore,
     });
-    const { beforeConfirm, final } = await activateAndConfirm(prepared);
-    expect(beforeConfirm["warnings"]).toEqual([{ commitlore: "NOT_OBSERVED", mode: "preferred" }]);
-    expect(final["warnings"]).toEqual([{ commitlore: "NOT_OBSERVED", mode: "preferred" }]);
-    expect(storedResult(prepared)!.bootstrapVerification.map((row) => row.commandId)).toEqual(["clean-tree"]);
+    const refused = await produce(prepared);
+    expect(refused, JSON.stringify(refused)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.VERIFICATION_GAP,
+      evidence: { stage: "precondition", refusal: "COMMITLORE_MODE_NOT_REQUIRED", commitloreMode: "preferred" },
+    });
+    expect(storedResult(prepared)).toBeNull();
     expect(commitlore.paths).toEqual([]);
+    expect(commitlore.committed).toEqual([]);
+    noGitHubCall(prepared);
   });
 
   it("B3-4 an unsupported mode is refused by the manifest contract, and a missing one is the contract's explicit required (#1268)", () => {

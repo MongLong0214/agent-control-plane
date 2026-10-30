@@ -1,16 +1,16 @@
 import { execFileSync } from "node:child_process";
-import { accessSync, constants, readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { accessSync, constants, cpSync, existsSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { COMMITLORE_LIMITS, type CommitLorePort, commitloreRunner, createCommitLoreCliPort } from "../../src/bootstrap/commitlore-observation.ts";
 import { manifestDigest, projectManifestSchema } from "../../src/contracts/manifest.ts";
 import { WorkerTurnEvent, WorkerTurnRunner, type WorkerTurnOptions } from "../../src/run/worker-turn.ts";
-import { latestRelease } from "../helpers/commitlore-release.ts";
-import { cleanupTempDirs, gitSync, makeCore, tempDir } from "../helpers/fixtures.ts";
+import { latestRelease, stableReleaseAnswer } from "../helpers/commitlore-release.ts";
+import { cleanupTempDirs, commitAll, gitSync, makeCore, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest } from "../helpers/harness.ts";
-import { FakeWorkerAdapter, seedWorkerWorld, type WorkerWorld } from "../helpers/worker-turn-fixture.ts";
+import { FakeWorkerAdapter, recordSeededTarget, seedWorkerWorld, type WorkerWorld } from "../helpers/worker-turn-fixture.ts";
 
 /**
  * #1268 — a worker's change, committed by the control plane with `commit-tree` over a private index and with
@@ -85,11 +85,35 @@ const requiredWorld = (options: { init?: boolean } = {}): WorkerWorld => {
 const realPort = (version = VERSION): CommitLorePort =>
   createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, REAL as string, latestRelease(version)));
 
-const fakeFor = (world: WorkerWorld, reply: string): FakeWorkerAdapter => {
+const fakeFor = (world: WorkerWorld, reply: string, writes: Record<string, string> = {}): FakeWorkerAdapter => {
   const adapter = new FakeWorkerAdapter(world.broker);
-  adapter.script = { writes: { "src/app.js": "module.exports = () => 2;\n" }, reply };
+  adapter.script = { writes: { "src/app.js": "module.exports = () => 2;\n", ...writes }, reply };
   adapters.push(adapter);
   return adapter;
+};
+
+/**
+ * An installation laid out as CommitLore's installer lays one out — the package's published files and a
+ * `# commitlore:wrapper:v1` wrapper that execs node on its bundle — copied from the real CLI's own package,
+ * found the way its wrapper names it.
+ */
+const installedCopy = (): { wrapper: string; bundle: string } => {
+  const target = realpathSync(REAL as string);
+  const entry = target.endsWith(join("dist", "commitlore.mjs"))
+    ? target
+    : /^exec "\$NODE" "([^"\n]+)" "\$@"$/m.exec(readFileSync(target, "utf8"))?.[1];
+  if (entry === undefined) throw new Error("FIXTURE FAILURE: the real CLI is neither CommitLore's wrapper nor its bundle");
+  const root = dirname(dirname(entry));
+  const install = tempDir("acp-1268-install-");
+  const pkg = join(install, "pkg");
+  for (const name of ["package.json", "dist", "spec"]) cpSync(join(root, name), join(pkg, name), { recursive: true });
+  const wrapper = join(install, "commitlore");
+  writeFileSync(
+    wrapper,
+    `#!/bin/sh\n# commitlore:wrapper:v1\nNODE="${process.execPath}"\nexec "$NODE" "${join(pkg, "dist", "commitlore.mjs")}" "$@"\n`,
+    { mode: 0o755 },
+  );
+  return { wrapper, bundle: join(pkg, "dist", "commitlore.mjs") };
 };
 
 const makeRunner = (world: WorkerWorld, adapter: FakeWorkerAdapter, options: WorkerTurnOptions): WorkerTurnRunner =>
@@ -217,6 +241,55 @@ describe.skipIf(REAL === null)("#1268: a worker commit goes through CommitLore (
 
     expect(failedEvidence(world)).toMatchObject({ reason: "COMMITLORE_NOT_CONSIDERED" });
     nothingCommitted(world, base);
+  });
+
+  it("review r2 P1: a worker that rewrites the fsmonitor program the repository names runs nothing through CommitLore's git", async () => {
+    const world = requiredWorld();
+    // The repository names a tracked program as its fsmonitor, and the worker's change rewrites it.
+    writeFileSync(join(world.repoPath, "src", "fsmonitor.sh"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    commitAll(world.repoPath, "an fsmonitor program");
+    recordSeededTarget(world);
+    gitSync(world.repoPath, ["config", "core.fsmonitor", join(world.repoPath, "src", "fsmonitor.sh")]);
+    const marker = join(tempDir("acp-1268-fsmonitor-"), "ran");
+    const adapter = fakeFor(world, `${SAID}\n\n${draft([])}`, {
+      "src/fsmonitor.sh": `#!/bin/sh\necho ran > ${JSON.stringify(marker)}\nexit 1\n`,
+    });
+    await runTurn(world, makeRunner(world, adapter, { commitlore: realPort() }));
+
+    expect(existsSync(marker), "a program the repository named ran inside CommitLore's git").toBe(false);
+    expect(succeededEvidence(world)["commitlore"]).toEqual({ outcome: "empty", recordIds: [], nonce: null });
+  });
+
+  it("an ssh program the repository's config names for its ssh:// remote is not run by the worker's capture", async () => {
+    const world = requiredWorld();
+    const marker = join(tempDir("acp-1268-worker-ssh-"), "ran");
+    const program = join(tempDir("acp-1268-worker-ssh-program-"), "ssh.sh");
+    writeFileSync(program, `#!/bin/sh\necho "$*" >> ${JSON.stringify(marker)}\nexit 1\n`, { mode: 0o755 });
+    gitSync(world.repoPath, ["remote", "add", "origin", "ssh://example.invalid/r.git"]);
+    gitSync(world.repoPath, ["config", "core.sshCommand", program]);
+    // With a remote, capture verifies only against a fetched notes mirror; a local one stands for it here.
+    gitSync(world.repoPath, ["notes", "--ref=commitlore", "add", "-m", "fixture", "HEAD"]);
+    const adapter = fakeFor(world, `${SAID}\n\n${draft([warnRecord("Callers that expected 1 now get 2.")])}`);
+    await runTurn(world, makeRunner(world, adapter, { commitlore: realPort() }));
+
+    expect(existsSync(marker), "the ssh program the repository named ran inside CommitLore's git").toBe(false);
+    expect((succeededEvidence(world)["commitlore"] as { outcome: string }).outcome).toBe("recorded");
+  });
+
+  it("review r2 P1: a package swapped behind an unchanged wrapper during the release lookup is never run; the commit runs the checked copy", async () => {
+    const world = requiredWorld();
+    const { wrapper, bundle } = installedCopy();
+    const marker = join(tempDir("acp-1268-swap-"), "ran");
+    // The wrapper is left as it is; its package is replaced the moment the newest release is asked for.
+    const swapping = async (): Promise<unknown> => {
+      writeFileSync(bundle, `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "ran");\nprocess.exit(1);\n`);
+      return stableReleaseAnswer(VERSION);
+    };
+    const adapter = fakeFor(world, `${SAID}\n\n${draft([])}`);
+    await runTurn(world, makeRunner(world, adapter, { commitlore: createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, wrapper, swapping)) }));
+
+    expect(existsSync(marker), "the swapped package ran").toBe(false);
+    expect(succeededEvidence(world)["commitlore"]).toEqual({ outcome: "empty", recordIds: [], nonce: null });
   });
 
   it("a pin that is not the newest release commits nothing, though its draft would verify", async () => {

@@ -7,7 +7,7 @@ import {
   draftFromReply,
   workerCommitLoreSection,
 } from "../bootstrap/commitlore-commit.ts";
-import { type CommitLorePort, commitloreRequired, createCommitLoreCliPort } from "../bootstrap/commitlore-observation.ts";
+import { type CommitLorePort, commitloreGoverned, createCommitLoreCliPort } from "../bootstrap/commitlore-observation.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { allow, deny, isAcpError, type Decision, type Evidence } from "../core/errors.ts";
@@ -577,7 +577,7 @@ export class WorkerTurnRunner {
       if (!staged.allowed) return staged as Decision<{ executionId: string }>;
       // #1268 — a run whose contract requires CommitLore gets CommitLore's drafting contract into its
       // worker's prompt, or no turn: refused here, before an execution is opened or anything launched.
-      const contract = await this.commitloreContract(facts);
+      const contract = await this.commitloreContract(prepared.value);
       if (this.#stopping) return this.stoppingRefusal(request.taskId);
       if (!contract.allowed) return contract as Decision<{ executionId: string }>;
       const turn: TurnFacts = {
@@ -1656,7 +1656,7 @@ export class WorkerTurnRunner {
    * claimed worktree; null for a run that requires nothing of it. Refused when the run requires it and
    * this deployment has no CommitLore that can commit, or the contract cannot be read.
    */
-  private async commitloreContract(facts: DurableFacts): Promise<Decision<string | null>> {
+  private async commitloreContract(facts: TurnFacts): Promise<Decision<string | null>> {
     if (!commitloreGoverned(this.ports.db, facts.runId)) return allow(ReasonCode.OK, null);
     const port = this.#commitlore;
     if (port === null || port.contract === undefined || port.attempt === undefined) {
@@ -1666,7 +1666,7 @@ export class WorkerTurnRunner {
         taskId: facts.taskId,
       });
     }
-    const contract = await port.contract(facts.claim.worktree);
+    const contract = await port.contract(facts.claim.worktree, { gitDir: facts.repo.gitDir, workTree: facts.repo.workTree });
     if (!contract.allowed) return contract as Decision<string | null>;
     return allow(ReasonCode.OK, contract.value);
   }
@@ -1681,16 +1681,18 @@ export class WorkerTurnRunner {
     facts: TurnFacts,
     worker: { draft: string; transcript: string },
     settled: { value: CommitLoreSettled | null },
-  ): WorkerCommitLoreStep {
+  ): WorkerCommitLoreStep & { close(): void } {
     const port = this.#commitlore;
     let attempt: CommitLoreAttempt | null = null;
     let considered: CommitLoreConsidered | null = null;
     return {
+      close: () => attempt?.dispose(),
       consider: async (index, message) => {
         if (port?.attempt === undefined) {
           return deny(ReasonCode.VERIFICATION_GAP, "this deployment has no CommitLore to commit through", { refusal: "COMMITLORE_REQUIRED_UNOBSERVABLE" });
         }
-        const begun = await port.attempt(facts.claim.worktree);
+        // The worker's own git hardening, on the git dir and work tree pinned before its turn.
+        const begun = await port.attempt(facts.claim.worktree, { gitDir: facts.repo.gitDir, workTree: facts.repo.workTree });
         if (!begun.allowed) return begun as Decision<string>;
         attempt = begun.value;
         const answer = await attempt.consider({
@@ -2444,12 +2446,13 @@ export class WorkerTurnRunner {
 
     await this.#beforeCommit?.();
     const settledCommitLore: { value: CommitLoreSettled | null } = { value: null };
-    const committed = await this.commitVerified(
-      facts,
-      executionId,
-      observed,
-      commitlore === null ? undefined : this.commitloreStep(facts, commitlore, settledCommitLore),
-    );
+    const commitloreStep = commitlore === null ? undefined : this.commitloreStep(facts, commitlore, settledCommitLore);
+    let committed: CommitOutcome;
+    try {
+      committed = await this.commitVerified(facts, executionId, observed, commitloreStep);
+    } finally {
+      commitloreStep?.close();
+    }
     if (!committed.ok && this.authorityFor(executionId).allowed === false) {
       // Authority went while the commit was being made: the live fence refused it (nothing committed)
       // or something after it failed. Either way the turn ends with the daemon, never FAILED on its own.
@@ -3450,23 +3453,6 @@ const workerTaskPrompt = (facts: TurnFacts): string =>
       : ["- Do not run commands, do not commit, and do not touch the .git directory. The control plane verifies your change and commits it."]),
     "- When you are done, reply with a short summary of what you changed.",
   ].join("\n");
-
-/**
- * #1268 — whether a run's pinned manifest requires CommitLore. A pinned manifest that cannot be read is held
- * to requiring it; a run with no pinned manifest has no contract that asks for it.
- */
-const commitloreGoverned = (db: Db, runId: string): boolean => {
-  const run = db.get<{ pinned_manifest_digest: string | null }>(`SELECT pinned_manifest_digest FROM runs WHERE run_id = ?`, [runId]);
-  if (!run?.pinned_manifest_digest) return false;
-  const manifest = db.get<{ content_json: string }>(`SELECT content_json FROM manifests WHERE digest = ?`, [run.pinned_manifest_digest]);
-  let mode: unknown;
-  try {
-    mode = manifest ? (JSON.parse(manifest.content_json) as { commitlore?: { mode?: unknown } }).commitlore?.mode : undefined;
-  } catch {
-    mode = undefined;
-  }
-  return commitloreRequired(mode);
-};
 
 /** A plain subject from the task's title; the commit carries no provider, model or session metadata. */
 const commitMessage = (facts: TurnFacts): string => {

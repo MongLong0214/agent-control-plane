@@ -25,6 +25,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import {
   COMMITLORE_LIMITS,
   COMMITLORE_OBSERVATION_ARGV,
+  OBSERVATION_HARDENING_EXCEPTION,
   commitloreChildEnvironment,
   commitloreChildHome,
   commitloreRunner,
@@ -44,6 +45,7 @@ import {
 } from "../../src/bootstrap/commitlore-pin.ts";
 import { latestRelease, stableReleaseAnswer } from "../helpers/commitlore-release.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { gitHardeningEnvironment, pinnedGitEnvironment } from "../../src/run/worker-git.ts";
 
 /**
  * Slice S16 (#246 B3) — the `commitlore` a required bootstrap runs is the one `ACP_COMMITLORE_BINARY` pins,
@@ -531,6 +533,7 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
     vi.stubEnv("GIT_CONFIG_VALUE_1", "s16-only-count");
     await probeCommitLore(envPort());
     const checks = invocations(pinned.log).filter(({ argv }) => argv[0] === "--version" || argv[1] === "--help");
+    const observationHardening = gitHardeningEnvironment({ except: [OBSERVATION_HARDENING_EXCEPTION] });
     expect(checks.map(({ argv }) => argv.join(" "))).toEqual(["--version", "doctor --help", "init --help"]);
     const constructed = new Set([
       "PATH",
@@ -541,11 +544,12 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
       "LC_ALL",
       "GIT_CONFIG_GLOBAL",
       "GIT_CONFIG_NOSYSTEM",
-      "GIT_CONFIG_COUNT",
-      "GIT_CONFIG_KEY_0",
-      "GIT_CONFIG_VALUE_0",
       "GIT_ASKPASS",
       "GIT_TERMINAL_PROMPT",
+      "GIT_SSH_COMMAND",
+      // #1268 — the worker's git hardening, bar the hooks path init installs into: every value ACP's own.
+      ...Object.keys(pinnedGitEnvironment({ gitDir: "/", workTree: "/" })),
+      ...Object.keys(observationHardening),
     ]);
     for (const { env } of checks) {
       expect(Object.keys(env).filter((key) => !constructed.has(key) && key !== "__CF_USER_TEXT_ENCODING")).toEqual([]);
@@ -557,14 +561,14 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
       expect(home).not.toBe(daemonHome);
       expect(existsSync(home), home).toBe(false);
       expect(env).toMatchObject({
-        GIT_CONFIG_GLOBAL: join(home, ".gitconfig"),
+        GIT_CONFIG_GLOBAL: "/dev/null",
         GIT_CONFIG_NOSYSTEM: "1",
-        GIT_CONFIG_COUNT: "1",
-        GIT_CONFIG_KEY_0: "credential.helper",
-        GIT_CONFIG_VALUE_0: "",
+        ...observationHardening,
         GIT_ASKPASS: "",
         GIT_TERMINAL_PROMPT: "0",
+        GIT_SSH_COMMAND: "ssh",
       });
+      expect(Object.entries(observationHardening)).toContainEqual([expect.stringMatching(/^GIT_CONFIG_KEY_/), "credential.helper"]);
     }
     expect(new Set(checks.map(({ env }) => env["HOME"])).size).toBe(checks.length);
   });

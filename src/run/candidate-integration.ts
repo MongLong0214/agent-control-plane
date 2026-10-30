@@ -54,7 +54,22 @@ export interface IntegratedCandidate {
   integration: SnapshotIntegration;
   declaredParent: string;
   baseSha: string;
+  /** #1268 — how many merge commits CommitLore's commit-msg check passed before they were made (no capture, no record). */
+  commitloreMessageChecked: number;
 }
+
+/**
+ * #1268 — CommitLore's commit-msg check of one merge commit the integration is about to make, in the worktree
+ * it is made in, on its exact message (`checkGeneratedCommitMessage`). A refusal means the commit is not made.
+ * A pass is a message check, not a capture: no session produced the merge, so nothing is recorded on it.
+ * Absent for a run whose contract does not require CommitLore.
+ */
+export type CheckMergeMessage = (input: {
+  checkout: string;
+  git: { gitDir: string; workTree: string };
+  message: string;
+  scratch: string;
+}) => Promise<Decision<void>>;
 
 /** A disposable worktree of the run's repository at `head`, made and torn down through the guard. */
 export type RunWorktree = <T>(
@@ -400,8 +415,9 @@ const exactly = async (repo: PinnedRepository, repositoryIdentity: string, place
  * worktree the verification engine makes and tears down through the guard.
  */
 const buildIntegration = async (
-  input: { purpose: string; inputDigest: string; repositoryIdentity: string; worktree: RunWorktree },
+  input: { purpose: string; inputDigest: string; repositoryIdentity: string; worktree: RunWorktree; checkMessage?: CheckMergeMessage },
   placement: Placement,
+  checked: { count: number } = { count: 0 },
 ): Promise<Decision<string>> => {
   const { baseSha, planned, format } = placement;
   return input.worktree<string>(
@@ -423,7 +439,13 @@ const buildIntegration = async (
         await gitOrThrow(repo, ["update-index", "-z", "--index-info"], { index, input: entries });
         const tree = (await gitOrThrow(repo, ["write-tree"], { index })).trim();
         const date = `${Math.max(await committerEpoch(repo, head), await committerEpoch(repo, step.result.commit))} +0000`;
-        head = (await gitOrThrow(repo, ["commit-tree", tree, "-p", head, "-p", step.result.commit, "--no-gpg-sign", "-m", subjectOf(step.result.title)], {
+        const message = subjectOf(step.result.title);
+        if (input.checkMessage) {
+          const passed = await input.checkMessage({ checkout: repo.workTree, git: { gitDir: repo.gitDir, workTree: repo.workTree }, message, scratch });
+          if (!passed.allowed) return passed as Decision<string>;
+          checked.count += 1;
+        }
+        head = (await gitOrThrow(repo, ["commit-tree", tree, "-p", head, "-p", step.result.commit, "--no-gpg-sign", "-m", message], {
           extraEnv: { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date },
         })).trim();
       }
@@ -446,6 +468,8 @@ export const integrateTaskResults = async (input: {
   repositoryIdentity: string;
   checkoutPath: string;
   worktree: RunWorktree;
+  /** #1268 — given for a run whose contract requires CommitLore. */
+  checkMessage?: CheckMergeMessage;
 }): Promise<Decision<IntegratedCandidate | null>> => {
   const results = succeededTaskResults(input.db, input.runId, input.tasks, input.commits, input.repositoryIdentity);
   if (results.length === 0) return allow(ReasonCode.OK, null);
@@ -485,12 +509,20 @@ export const integrateTaskResults = async (input: {
     tasks: planned.map((step) => ({ taskId: step.result.taskId, commit: step.result.commit })),
   };
   const inputDigest = digestOf({ schema: "agent-control-plane.candidate-integration.v1", runId: input.runId, repositoryIdentity: input.repositoryIdentity, baseSha, tasks: integration.tasks });
+  const checked = { count: 0 };
   const built = await buildIntegration(
-    { purpose: INTEGRATION_WORKTREE_PURPOSE, inputDigest, repositoryIdentity: input.repositoryIdentity, worktree: input.worktree },
+    {
+      purpose: INTEGRATION_WORKTREE_PURPOSE,
+      inputDigest,
+      repositoryIdentity: input.repositoryIdentity,
+      worktree: input.worktree,
+      ...(input.checkMessage === undefined ? {} : { checkMessage: input.checkMessage }),
+    },
     plan.value,
+    checked,
   );
   if (!built.allowed) return built as Decision<null>;
-  return allow(ReasonCode.OK, { head: built.value, integration, declaredParent: plan.value.declaredParent, baseSha });
+  return allow(ReasonCode.OK, { head: built.value, integration, declaredParent: plan.value.declaredParent, baseSha, commitloreMessageChecked: checked.count });
 };
 
 /**
@@ -513,6 +545,8 @@ export const integratePredecessors = async (input: {
   checkoutPath: string;
   baseSha: string;
   worktree: RunWorktree;
+  /** #1268 — given for a run whose contract requires CommitLore. */
+  checkMessage?: CheckMergeMessage;
 }): Promise<Decision<StartsFrom | null>> => {
   const missing = (predecessor: string, missingWhat: string, commit: string | null, repositoryIdentity = input.repositoryIdentity): Decision<never> =>
     deny(ReasonCode.TASK_PREDECESSOR_COMMIT_MISSING, `a task this one depends on has no ${missingWhat} to start from; it is not started at the run's base instead`, {
@@ -590,7 +624,16 @@ export const integratePredecessors = async (input: {
   const placement = plan.value;
   const built = placement.chain
     ? await withPinned<string>(input.checkoutPath, "acp-predecessor-check-", (repo) => exactly(repo, input.repositoryIdentity, placement, placement.planned.at(-1)!.result.commit))
-    : await buildIntegration({ purpose: PREDECESSOR_BASE_WORKTREE_PURPOSE, inputDigest, repositoryIdentity: input.repositoryIdentity, worktree: input.worktree }, placement);
+    : await buildIntegration(
+      {
+        purpose: PREDECESSOR_BASE_WORKTREE_PURPOSE,
+        inputDigest,
+        repositoryIdentity: input.repositoryIdentity,
+        worktree: input.worktree,
+        ...(input.checkMessage === undefined ? {} : { checkMessage: input.checkMessage }),
+      },
+      placement,
+    );
   if (!built.allowed) return built as Decision<never>;
   return allow(ReasonCode.OK, { commit: built.value, predecessors });
 };

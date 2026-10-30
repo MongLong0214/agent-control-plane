@@ -298,7 +298,8 @@ describe("S11-R3: a CommitLore child reaches no credential, through its own git 
     for (const entry of observedHomes) {
       const home = entry["home"] as string;
       expect(home).not.toBe(daemonHome);
-      expect(entry).toMatchObject({ mode: "700", entries: [".gitconfig"], globalConfig: join(home, ".gitconfig"), globalBytes: 0 });
+      // #1268 — under the worker's git hardening the global config is /dev/null: as empty as the home's own.
+      expect(entry).toMatchObject({ mode: "700", entries: [".gitconfig"], globalConfig: "/dev/null", globalBytes: 0 });
       expect(existsSync(home), home).toBe(false);
     }
   });
@@ -315,6 +316,8 @@ describe("S11-R3: a CommitLore child reaches no credential, through its own git 
       GIT_CONFIG_VALUE_0: "",
       GIT_ASKPASS: "",
       GIT_TERMINAL_PROMPT: "0",
+      // #1268 — preferred by git to the repository's core.sshCommand.
+      GIT_SSH_COMMAND: "ssh",
     });
   });
 });

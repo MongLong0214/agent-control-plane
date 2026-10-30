@@ -5,7 +5,14 @@ import { join } from "node:path";
 
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 
-import { COMMITLORE_LIMITS, commitloreRunner, createCommitLoreCliPort, probeCommitLore } from "../../src/bootstrap/commitlore-observation.ts";
+import {
+  COMMITLORE_LIMITS,
+  OBSERVATION_HARDENING_EXCEPTION,
+  commitloreRunner,
+  createCommitLoreCliPort,
+  probeCommitLore,
+} from "../../src/bootstrap/commitlore-observation.ts";
+import { gitHardeningEnvironment, pinnedGitEnvironment } from "../../src/run/worker-git.ts";
 import { latestRelease } from "../helpers/commitlore-release.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
@@ -174,10 +181,11 @@ it("R1-01: CommitLore children receive no daemon authority variables, a known na
     "GIT_CONFIG_NOSYSTEM",
     "GIT_TERMINAL_PROMPT",
     "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_KEY_0",
-    "GIT_CONFIG_VALUE_0",
     "GIT_ASKPASS",
+    "GIT_SSH_COMMAND",
+    // #1268 — the worker's git hardening, bar the hooks path init installs into: every value ACP's own.
+    ...Object.keys(pinnedGitEnvironment({ gitDir: join(root, ".git"), workTree: root })),
+    ...Object.keys(gitHardeningEnvironment({ except: [OBSERVATION_HARDENING_EXCEPTION] })),
   ]);
   expect(Object.keys(observed).filter((key) => !constructed.has(key) && key !== "__CF_USER_TEXT_ENCODING")).toEqual([]);
   // The daemon's PATH is not handed to it (and, since slice S16, is not used to find it either).

@@ -42,7 +42,9 @@ export const genesisBundle = (): GenesisBundle => ({
 
 export function genesisPlanFixture() {
   const genesis = genesisBundle();
+  // #1268 — a bootstrap is a new project, and a new project requires CommitLore.
   const manifest = projectManifestSchema.parse(fixtureManifest("resident-test", {
+    commitlore: { mode: "required" },
     verificationCommands: [{ id: "test", argv: ["node", "test.js"], repositoryRole: "primary", cwd: ".", timeoutSeconds: 30, envAllowlist: [], network: "deny", networkAllowlist: [], required: true, evidenceMode: "LOCAL_COMMAND", maxOutputBytes: 1048576, maxMemoryMb: 1024, maxCpuSeconds: 30 }],
     verificationProfiles: { simple: ["test"], standard: ["test"], guarded: ["test"] },
     ciWorkflows: [{ repositoryRole: "primary", path: ".github/workflows/ci.yml", checkName: "test", approvedDigest: genesis.files[1]!.sha256, unapprovedFirstActivation: false }],

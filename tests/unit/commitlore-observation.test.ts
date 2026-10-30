@@ -168,6 +168,8 @@ describe("review S11-R1-01: the CommitLore child environment is the CP-HI-05 con
         "GIT_CONFIG_KEY_0",
         "GIT_CONFIG_NOSYSTEM",
         "GIT_CONFIG_VALUE_0",
+        // #1268 — git prefers it to the repository's core.sshCommand.
+        "GIT_SSH_COMMAND",
         "GIT_TERMINAL_PROMPT",
         "HOME",
         "LANG",

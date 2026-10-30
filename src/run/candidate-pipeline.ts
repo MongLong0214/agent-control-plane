@@ -1,3 +1,4 @@
+import { type CommitLorePort, commitloreGoverned, checkGeneratedCommitMessage, createCommitLoreCliPort } from "../bootstrap/commitlore-observation.ts";
 import { randomUUID } from "node:crypto";
 
 import {
@@ -50,6 +51,7 @@ import {
   baseRefFor,
   candidateRefFor,
   candidateRefPlan,
+  type CheckMergeMessage,
   integratePredecessors,
   integrateTaskResults,
   lostTaskChanges,
@@ -254,9 +256,21 @@ export class CandidatePipeline {
   ) {}
 
   #continuity: { evaluate?(reason: string): Promise<unknown> } | null = null;
+  /**
+   * #1268 — the CommitLore the merge commit messages of a run whose contract requires it are checked by. Defaults
+   * to the pinned CLI (`createCommitLoreCliPort`); null is a deployment with none, where such a merge is not made.
+   */
+  #commitlore: CommitLorePort | null = createCommitLoreCliPort();
 
-  attach(ports: { continuity?: { evaluate?(reason: string): Promise<unknown> } }): void {
+  attach(ports: { continuity?: { evaluate?(reason: string): Promise<unknown> }; commitlore?: CommitLorePort | null }): void {
     if (ports.continuity) this.#continuity = ports.continuity;
+    if (ports.commitlore !== undefined) this.#commitlore = ports.commitlore;
+  }
+
+  /** #1268 — the message check a run's merge commits get, or none when its contract does not require CommitLore. */
+  private checkMergeMessages(runId: string): CheckMergeMessage | undefined {
+    if (!commitloreGoverned(this.db, runId)) return undefined;
+    return (input) => checkGeneratedCommitMessage(this.#commitlore, input);
   }
 
   /**
@@ -279,6 +293,9 @@ export class CandidatePipeline {
     // missing-commit guard below asks the final candidate for are the same commits (S6-B, S6-C).
     const commits = participants.length === 0 ? [] : succeededTaskCommits(this.db, runId);
     const repositories: SnapshotRepositoryInput[] = [];
+    // #1268 — every merge commit the integration makes has its message checked by CommitLore when the run requires it.
+    const checkMergeMessages = this.checkMergeMessages(runId);
+    const commitloreMessageChecked = new Map<string, number>();
     for (const repo of participants) {
       // S6-C — when the checkout's HEAD does not hold every SUCCEEDED task's commit, the candidate is
       // their integration onto the run's pinned base; a conflict between two tasks refuses the freeze.
@@ -290,8 +307,13 @@ export class CandidatePipeline {
         repositoryIdentity: repo.identity,
         checkoutPath: repo.checkoutPath,
         worktree: (input, use) => this.verification.withRunWorktree(run, input, use),
+        ...(checkMergeMessages === undefined ? {} : { checkMessage: checkMergeMessages }),
       });
       if (!integrated.allowed) return integrated as Decision<CandidateSnapshot>;
+      // Recorded where a check was required or made; a run that requires none keeps its evidence as it was.
+      if (integrated.value !== null && (checkMergeMessages !== undefined || integrated.value.commitloreMessageChecked > 0)) {
+        commitloreMessageChecked.set(repo.identity, integrated.value.commitloreMessageChecked);
+      }
       // The integrated candidate's origin is its tasks' recorded one (S-TB-06), as one task's is below.
       const source = integrated.value === null
         ? await this.sourceAtFreeze(repo.checkoutPath, repo.workBranch, repo.baseBranch, profile, { runId, identity: repo.identity })
@@ -452,6 +474,9 @@ export class CandidatePipeline {
           sourceHead: r.sourceHead ?? null,
           files: r.touchedPaths.length,
           ...(r.integration === undefined ? {} : { integratedTasks: r.integration.tasks.length }),
+          // #1268 — internal execution evidence: how many merge messages CommitLore's commit-msg check passed. It is
+          // no capture and no record; nothing is recorded on a merge no session produced.
+          ...(commitloreMessageChecked.has(r.identity) ? { commitloreMessageChecked: commitloreMessageChecked.get(r.identity)! } : {}),
         })),
         ...(attemptId === undefined ? {} : { attemptId }),
         ...(reviewContextOutcome === null ? {} : { reviewContext: reviewContextOutcome }),
@@ -1204,6 +1229,7 @@ export class CandidatePipeline {
   async predecessorBase(input: Parameters<PredecessorBase>[0]): Promise<Decision<StartsFrom | null>> {
     const run = this.runs.get(input.runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
+    const checkMergeMessages = this.checkMergeMessages(input.runId);
     const built = await integratePredecessors({
       db: this.db,
       runId: input.runId,
@@ -1214,6 +1240,7 @@ export class CandidatePipeline {
       checkoutPath: input.checkoutPath,
       baseSha: input.baseSha,
       worktree: (worktreeInput, use) => this.verification.withRunWorktree(run, worktreeInput, use),
+      ...(checkMergeMessages === undefined ? {} : { checkMessage: checkMergeMessages }),
     });
     if (!built.allowed || built.value === null) return built;
     const ref = baseRefFor(input.runId, input.taskId);
