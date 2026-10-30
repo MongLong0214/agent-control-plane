@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { sha256 } from "../core/digest.ts";
 import type { Clock } from "../core/clock.ts";
+import { MCP_THROWN_REFUSAL_WRITER } from "../core/credential-shapes.ts";
 import { type AcpError, type Decision, acpError, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { credentialBearingField, prohibitedDurableField } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import { registryView } from "../db/registry-view.ts";
 import { McpMutationNotExecuted, runMcpReservedMutation } from "../ingress/ingress-guard.ts";
 
 /** Shape the MCP SDK expects from a tool callback; the index signature is its contract. */
@@ -178,11 +180,14 @@ export const createMcpMutationPort = (source: McpMutationSource): McpMutationPor
 /**
  * A refusal a handler threw, answered as the denial it is (the shape `guarded` gives it) so that it is
  * stored as the call's outcome. Its message and evidence are kept only when they hold no credential
- * shape and no private bulk content; otherwise the reason code alone is.
+ * shape and no private bulk content; otherwise the reason code alone is. #1279 G3-1 — both are free
+ * text: a digest or 64-hex id in them, whole or inside text, is kept only when it names a record the
+ * store holds (`RegistryView.boundReference`) for the run the call names, never for its format alone.
  */
-const thrownRefusal = (error: AcpError): ToolResult => {
+const thrownRefusal = (error: AcpError, db: Db, runId: string | null): ToolResult => {
   const full = { reasonCode: error.reasonCode, message: error.message, evidence: error.evidence };
-  return credentialBearingField(full) === null && prohibitedDurableField(full) === null
+  const site = { writer: MCP_THROWN_REFUSAL_WRITER, runId, registry: registryView(db) };
+  return credentialBearingField(full, 0, [], site) === null && prohibitedDurableField(full) === null
     ? respond(deny(error.reasonCode, error.message, error.evidence))
     : respond(deny(error.reasonCode, "the refusal's message or evidence is not kept: it held credential-shaped or private content", {}));
 };
@@ -232,7 +237,9 @@ export const idempotentMcpMutation = async (
         return await execute(fingerprint);
       } catch (error) {
         // A certified pre-effect failure still releases the key; any other throw leaves the outcome unknown.
-        if (isAcpError(error) && !(error instanceof McpMutationNotExecuted)) return thrownRefusal(error);
+        if (isAcpError(error) && !(error instanceof McpMutationNotExecuted)) {
+          return thrownRefusal(error, source.db, typeof args["runId"] === "string" ? args["runId"] : null);
+        }
         throw error;
       }
     },

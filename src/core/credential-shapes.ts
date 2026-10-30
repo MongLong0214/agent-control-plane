@@ -100,31 +100,85 @@ export const isAcpGeneratedField = (value: string, path: readonly string[]): boo
 
 /**
  * #1254 G-2 — free-text and reviewer fields, per store, by key path (the path and every path under it):
- * a blind reviewer's omitted items, findings and covered files, and the audit copy of its omitted items.
- * Their text is the reviewer's, so a whole value there is never an ACP id by its format: a digest or
- * 64-hex id in such a field, whole or inside text, skips the long-base64 shape only when it names a
- * record the store holds. Every other field keeps the whole-value id rule, the fields typed as digests
- * in the same records (`candidateSnapshotDigest`, `inputManifest.reviewerPromptDigests`) included.
+ * a blind reviewer's omitted items, findings and covered files, and the audit copy of its omitted items;
+ * #1279 G3-1 — and a CEO's rationale, wherever an audit record carries it (ceo/production-gate.ts:
+ * CEO_DECISION, the RUN_TRANSITION it makes, MANIFEST_ACTIVATION_CONSUMER_BOUND).
+ * Their text is the reviewer's or the CEO's, so a whole value there is never an ACP id by its format: a
+ * digest or 64-hex id in such a field, whole or inside text, skips the long-base64 shape only when it
+ * names a record the store holds. Every other field keeps the whole-value id rule, the fields typed as
+ * digests in the same records (`candidateSnapshotDigest`, `inputManifest.reviewerPromptDigests`) included,
+ * except at a `FREE_TEXT_WRITERS` writer, where only its typed fields do.
  */
 const FREE_TEXT_FIELDS: Readonly<Record<EvidenceField["store"], readonly string[]>> = {
   artifact: ["omittedItems", "findings", "coveredFiles"],
-  audit: ["omittedItems"],
+  audit: ["omittedItems", "rationale"],
 };
 
+/** The writer `mcp/shared.ts` names when it checks a refusal a mutation handler threw before storing it. */
+export const MCP_THROWN_REFUSAL_WRITER = "MCP_THROWN_REFUSAL";
+
 /**
- * Writers every field of which is free text, by `<store>:<writer>`: a run's task contract (`run_create`),
- * whose schema types no field as a digest (run/run-engine.ts TaskContract), its `references` included.
+ * #1279 G3-1 — writers whose fields are free text except the ones their schema types as an ACP digest or
+ * id, by `<store>:<writer>`, each with those typed key paths (array positions left out). Only a typed
+ * path keeps the whole-value id rule, and a staged body's; every other field of the writer -- a CTO's or
+ * CEO's prose, and any field none of the writer's records has -- is free text, where a whole digest or
+ * 64-hex id is exempt from the long-base64 shape only when it names a record the store holds. A typed
+ * path is a field's full key path in that writer's records, never a field name alone.
  */
-const FREE_TEXT_WRITERS: ReadonlySet<string> = new Set(["artifact:TASK_CONTRACT"]);
+const FREE_TEXT_WRITERS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  // A run's task contract (`run_create`, run/run-engine.ts TaskContract) types no field, its `references` included.
+  ["artifact:TASK_CONTRACT", new Set<string>()],
+  // A thrown refusal's message and evidence (mcp/shared.ts) type no field: a refusal names what it was handed.
+  [`artifact:${MCP_THROWN_REFUSAL_WRITER}`, new Set<string>()],
+  // A PLAN (mcp/cto-server.ts submitPlan): the digests plan_submit checks or ACP computes and adds
+  // (bootstrap/plan-input-schema.ts, bootstrap/bootstrap-plan.ts planForSubmission, the carried manifest
+  // and genesis bundle, bootstrap/bootstrap-review-evidence.ts, bootstrap/bootstrap-ceo-decisions.ts).
+  // Its summary, risks, repository and verification intents and the rest of its prose are free text.
+  ["artifact:PLAN", new Set([
+    "bootstrapPlanDigest", "projectManifestDigest", "requestDigest", "genesisDigest",
+    "workflowRevisions.fileDigest",
+    "projectManifest.ciWorkflows.approvedDigest", "projectManifest.gateEntries.digest",
+    "genesis.files.sha256", "genesis.files.contentBase64",
+    "reviewEvidence.digest", "reviewEvidence.source.bootstrapPlanDigest", "reviewEvidence.source.bundleSha256",
+    "reviewEvidence.source.candidateDigest", "reviewEvidence.source.attachmentDigest",
+    "reviewEvidence.bundle.contractDigest", "reviewEvidence.bundle.files.sha256",
+    "reviewEvidence.bundle.files.excerpt.originalSha256", "reviewEvidence.bundle.files.bodyBase64",
+    "authenticatedCeoDecisions.digest", "authenticatedCeoDecisions.resolutionDigest",
+    "authenticatedCeoDecisions.source.actorId", "authenticatedCeoDecisions.source.payloadDigest",
+    "authenticatedCeoDecisions.source.contractDigest", "authenticatedCeoDecisions.source.bootstrapPlanDigest",
+    "authenticatedCeoDecisions.source.attachmentDigest",
+  ])],
+  // A HANDOFF, by the records ACP writes as one: a staged or attached bootstrap PLAN input and review
+  // evidence (bootstrap/bootstrap-plan-artifact.ts, bootstrap/bootstrap-review-evidence.ts), a bootstrap
+  // review's context (review/blind-review.ts), an activation's handoff (bootstrap/activation.ts) and a
+  // contract change's readback or its refusal (review/contract-change-review-context.ts). The activation
+  // handoff's status, blockers, queued work, risks and next action are the CTO's prose, free text.
+  ["artifact:HANDOFF", new Set([
+    "sha256", "replacesSha256", "contractDigest", "bootstrapPlanDigest", "candidateDigest", "bodyBase64",
+    "candidateSnapshotDigest", "planDigest",
+    "context.deployment.runtimeSha256", "context.deployment.entrypointSha256", "context.deployment.lifecycleDigest",
+    "context.originalRecords.bundleDigest", "context.originalRecords.source.bootstrapPlanDigest",
+    "context.originalRecords.source.bundleSha256", "context.originalRecords.source.candidateDigest",
+    "context.originalRecords.source.attachmentDigest", "context.originalRecords.files.sha256",
+    "context.originalRecords.files.excerpt.originalSha256", "context.originalRecords.files.bodyBase64",
+    "handoff.activeManifestDigest",
+    "project.activeManifestDigest", "project.registrations.activeManifestDigest",
+    "workflowRevisions.fileDigest", "workflowRevisions.read.observedDigest",
+    // Git object ids ACP read, 64-hex in a SHA-256 repository, and the CTO's stated head of each repository.
+    "repositories.lastObservedHead", "repositories.checkout.head", "repositories.checkout.acceptedHead",
+    "workflowRevisions.read.blobSha", "handoff.repositoryFacts.head",
+  ])],
+]);
 
 const isFreeText = (field: EvidenceField | undefined): boolean => {
   if (field === undefined) return false;
-  if (field.site !== undefined && FREE_TEXT_WRITERS.has(`${field.store}:${field.site.writer}`)) return true;
   const path = field.path.join(".");
+  const typed = field.site === undefined ? undefined : FREE_TEXT_WRITERS.get(`${field.store}:${field.site.writer}`);
+  if (typed !== undefined && !typed.has(path)) return true;
   return FREE_TEXT_FIELDS[field.store].some((root) => path === root || path.startsWith(`${root}.`));
 };
 
-/** A whole ACP id at a field whose schema makes it one: never at a free-text or reviewer field. */
+/** A whole ACP id at a field whose schema makes it one: never at a free-text, reviewer or CEO field. */
 const isWholeAcpId = (text: string, field: EvidenceField | undefined): boolean => !isFreeText(field) && isAcpId(text);
 
 /**
@@ -556,8 +610,8 @@ const GLOBAL = new Map(CREDENTIAL_SHAPES.map((shape) => [shape, new RegExp(shape
  * Given a write site whose store reads its own records, a digest or id anywhere in the text that names
  * one of them skips the long-base64 shape too, and only it; the text around it, the reference itself
  * for every other shape, and any digest the store does not hold, get every shape. At a free-text or
- * reviewer field (`FREE_TEXT_FIELDS`, `FREE_TEXT_WRITERS`) a whole ACP id is not exempt by its format,
- * only as such a bound reference.
+ * reviewer field (`FREE_TEXT_FIELDS`, and every field but a typed one of a `FREE_TEXT_WRITERS` writer) a
+ * whole ACP id is not exempt by its format, only as such a bound reference.
  */
 export const hasCredentialShape = (text: string, field?: EvidenceField): boolean => {
   const kind = serializedKind(field);

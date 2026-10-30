@@ -56,11 +56,12 @@ export interface ContractChangeReviewContext extends FreezeIdentity {
     driftState: string;
     /**
      * The checkout as ACP read it at the freeze, with the drift ACP recomputed from that read
-     * (`RepositoryRegistry.inspect`) and what it was decided on, labelled apart from the stored `driftState`.
+     * (`RepositoryRegistry.inspect`) and what it was decided on, labelled apart from the stored `driftState`:
+     * #1279 G3-2 — `acceptedHead` is the registry head that drift was decided against, as the inspection read it.
      */
     checkout:
       | {
-          status: "READ"; head: string | null; branch: string | null; clean: boolean;
+          status: "READ"; head: string | null; branch: string | null; clean: boolean; acceptedHead: string | null;
           observedDriftState: RepositoryInspection["driftState"]; observedDriftCauses: RepositoryDriftCause[];
         }
       | { status: "UNREADABLE" };
@@ -91,22 +92,32 @@ export const captureContractChangeReviewContext = async (
        FROM audit_events WHERE kind = 'PROJECT_REGISTERED' AND project_id = ? ORDER BY event_id`,
     [input.projectId],
   );
-  const rows = db.all<{
-    repository_id: string; identity: string; repository_role: string | null; registration: string;
-    last_observed_head: string | null; last_observed_at: string | null; drift_state: string;
-  }>(
-    `SELECT repository_id, identity, repository_role, registration, last_observed_head, last_observed_at, drift_state
-       FROM repositories WHERE project_id = ? AND retired_at IS NULL ORDER BY identity`,
+  const listed = db.all<{ repository_id: string }>(
+    `SELECT repository_id FROM repositories WHERE project_id = ? AND retired_at IS NULL ORDER BY identity`,
     [input.projectId],
   );
   const repositoryFacts: ContractChangeReviewContext["repositories"] = [];
-  for (const row of rows) {
+  for (const { repository_id: repositoryId } of listed) {
+    // #1279 G3-2 — one registry state per repository: its row is read in the same synchronous step that starts
+    // its inspection, which reads the record it decides drift on before it awaits git, so a head accepted while
+    // an earlier repository's inspection awaited git is in both or in neither; and the inspection's own baseline
+    // is stored beside its drift (`acceptedHead`).
+    const row = db.get<{
+      identity: string; repository_role: string | null; registration: string;
+      last_observed_head: string | null; last_observed_at: string | null; drift_state: string;
+    }>(
+      `SELECT identity, repository_role, registration, last_observed_head, last_observed_at, drift_state
+         FROM repositories WHERE repository_id = ? AND retired_at IS NULL`,
+      [repositoryId],
+    );
+    if (row === undefined) continue;
     let checkout: ContractChangeReviewContext["repositories"][number]["checkout"] = { status: "UNREADABLE" };
     try {
-      const inspected = await repositories.inspect(row.repository_id);
+      const inspected = await repositories.inspect(repositoryId);
       if (inspected) {
         checkout = {
           status: "READ", head: inspected.observedHead, branch: inspected.branch, clean: inspected.clean,
+          acceptedHead: inspected.acceptedHead,
           observedDriftState: inspected.driftState, observedDriftCauses: inspected.driftCauses,
         };
       }

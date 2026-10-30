@@ -16,7 +16,7 @@ import { buildNoRepositoryCandidateSnapshot, candidateSnapshotDigest } from "../
 import { callCtoToolAsOwner } from "../helpers/bootstrap-plan.ts";
 import { CONTRACT_CHANGE_CONTRACT, WORKFLOW, WORKFLOW_PATH } from "../helpers/contract-change.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeRepo, writeFiles } from "../helpers/fixtures.ts";
-import { createRun, firstManifest, firstPlan, operatorRegisteredProject, revisionsFor, unitTestsWorkflow } from "../helpers/first-activation.ts";
+import { FIRST_IDENTITY, createRun, firstManifest, firstPlan, operatorRegisteredProject, revisionsFor, unitTestsWorkflow } from "../helpers/first-activation.ts";
 import { makeHarness, reviewerPass, type Harness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
@@ -61,19 +61,35 @@ interface FirstActivation {
 }
 
 let projectSeq = 0;
+const SECOND_IDENTITY = "github:acme/second";
 
-/** An operator-registered NULL project, a dispatched first-activation run and its PLAN, not yet submitted. */
+/**
+ * An operator-registered NULL project, a dispatched first-activation run and its PLAN, not yet submitted.
+ * With `secondCheckout`, the project also registers a `secondary` repository there, and M1 names it.
+ */
 const firstActivation = async (
   planText: Record<string, unknown> = PLAN_TEXT,
   workflows: Parameters<typeof firstManifest>[1] = [unitTestsWorkflow],
+  options: { secondCheckout?: string } = {},
 ): Promise<FirstActivation> => {
   const repoPath = makeRepo({ "README.md": "# fixture\n", "verify.js": "console.log('ok')\n", [WORKFLOW_PATH]: WORKFLOW }, "dev");
   const h = makeHarness({ repoPath });
   const projectId = `review-packet-${++projectSeq}`;
   const project = await operatorRegisteredProject(h, projectId);
+  if (options.secondCheckout !== undefined) {
+    const second = await h.cp.repositories.register({
+      checkoutPath: options.secondCheckout, projectId, repositoryRole: "secondary", identity: SECOND_IDENTITY,
+    });
+    if (!second.allowed) throw new Error(`${second.reasonCode}: ${second.message}`);
+  }
   const bound = gitSync(repoPath, ["rev-parse", "HEAD"]);
   const run = await createRun(h, projectId, RunKind.CONTRACT_CHANGE);
-  const m1 = firstManifest(projectId, workflows);
+  const m1 = firstManifest(projectId, workflows, options.secondCheckout === undefined ? {} : {
+    repositories: [
+      { role: "primary", remote: FIRST_IDENTITY, manifestRoot: "." },
+      { role: "secondary", remote: SECOND_IDENTITY, manifestRoot: "." },
+    ],
+  });
   const submitted = createCtoMcpPort(h.cp).submitPlan(run.runId, { ...firstPlan(m1, revisionsFor(m1, bound)), ...planText });
   if (!submitted.allowed) throw new Error(`${submitted.reasonCode}: ${submitted.message}`);
   await h.cp.continuity.evaluate("contract change review packet");
@@ -621,4 +637,128 @@ describe("#1254 sibling: an MCP mutation whose handler throws a refusal keeps th
       expect(await idempotentMcpMutation(h.cp, { actor: "peer" }, "refused-secret", leak, request)).toEqual(first);
     } finally { h.cp.close(); }
   });
+});
+
+describe("#1279 G3: free text needs a bound digest; a readback's drift rests on the head it shows", () => {
+  const thrower = (error: unknown) => () => { throw error; };
+
+  it("G3-1: a thrown refusal is free text: an unbound digest or id in its evidence or message is not stored; a bound one and ACP's ids are", async () => {
+    const r = await firstActivation();
+    try {
+      const request = { toolName: "effect", arguments: { runId: r.run.runId }, authority: () => allow(ReasonCode.OK, {}) };
+      const call = (key: string, error: unknown) => idempotentMcpMutation(r.h.cp, { actor: "peer" }, key, thrower(error), request);
+      const stored = (key: string) => r.h.cp.db.get<{ result_json: string }>(`SELECT result_json FROM inbound_messages WHERE nonce = ?`, [key])!.result_json;
+      const unboundHex = UNBOUND.slice("sha256:".length);
+
+      // The review's repro: the exact unbound 64-hex as a whole evidence value.
+      const repro = await call("g3-evidence", acpError(ReasonCode.INVALID_ARGUMENT, "refused input", { detail: unboundHex }));
+      expect(repro.structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.INVALID_ARGUMENT, evidence: {} });
+      expect(stored("g3-evidence")).not.toContain(unboundHex);
+      // The same as a whole digest, and as a whole message.
+      await call("g3-digest", acpError(ReasonCode.INVALID_ARGUMENT, "refused input", { detail: UNBOUND }));
+      expect(stored("g3-digest")).not.toContain(unboundHex);
+      await call("g3-message", acpError(ReasonCode.INVALID_ARGUMENT, UNBOUND));
+      expect(stored("g3-message")).not.toContain(unboundHex);
+
+      // Bound to the run the call names: kept as thrown, beside ACP's own ids.
+      const evidence = {
+        planDigest: r.planDigest, planHex: r.planDigest.slice("sha256:".length), runId: r.run.runId,
+        taskId: "task_0123456789abcdef01234567", messageId: "msg_0123456789abcdef01234567",
+      };
+      const kept = await call("g3-bound", acpError(ReasonCode.CONFLICT, r.planDigest, evidence));
+      expect(kept.structuredContent).toEqual({ ok: false, reasonCode: ReasonCode.CONFLICT, message: r.planDigest, evidence });
+    } finally { r.h.cp.close(); }
+  }, 60_000);
+
+  it("G3-1: an unbound whole digest in a PLAN's summary, risks or intents is refused; a bound one stores", async () => {
+    const r = await firstActivation();
+    try {
+      const port = createCtoMcpPort(r.h.cp);
+      const plan = (text: Record<string, unknown>) => () => port.submitPlan(r.run.runId, { ...firstPlan(r.m1, revisionsFor(r.m1, r.bound)), ...PLAN_TEXT, ...text });
+      for (const text of [
+        { summary: UNBOUND }, { summary: UNBOUND.slice("sha256:".length) },
+        { risks: [UNBOUND] }, { verificationIntent: [UNBOUND] }, { repositoryIntent: [UNBOUND] },
+      ]) {
+        expect(plan(text), JSON.stringify(text)).toThrow(/PLAN contains a credential/);
+      }
+      expect(plan({ summary: r.planDigest })().allowed).toBe(true);
+      expect(plan({ risks: [r.planDigest.slice("sha256:".length)] })().allowed).toBe(true);
+    } finally { r.h.cp.close(); }
+  }, 60_000);
+
+  it("G3-1: an unbound whole digest in a HANDOFF's note is refused; a bound one stores", async () => {
+    const r = await firstActivation();
+    try {
+      const put = (note: unknown) => () => r.h.cp.artifacts.put(r.run.runId, "HANDOFF", { note });
+      for (const note of [UNBOUND, UNBOUND.slice("sha256:".length), [UNBOUND]]) {
+        expect(put(note), JSON.stringify(note)).toThrow(/HANDOFF contains a credential/);
+      }
+      expect(put(r.planDigest)).not.toThrow();
+      expect(put(r.planDigest.slice("sha256:".length))).not.toThrow();
+    } finally { r.h.cp.close(); }
+  }, 60_000);
+
+  it("G3-1: a CEO's whole rationale is kept only when bound", async () => {
+    const r = await firstActivation();
+    try {
+      const rationale = (text: string) => {
+        expect(r.h.cp.audit.record({ kind: "CEO_DECISION", runId: r.run.runId, evidence: { decision: "FINAL_REVISE", rationale: text } }).allowed).toBe(true);
+        return r.h.cp.audit.byKind("CEO_DECISION").at(-1)!.evidence["rationale"];
+      };
+      expect(rationale(UNBOUND)).toBe("sha256:[redacted]");
+      expect(rationale(UNBOUND.slice("sha256:".length))).toBe("[redacted]");
+      expect(rationale(r.planDigest)).toBe(r.planDigest);
+    } finally { r.h.cp.close(); }
+  }, 60_000);
+
+  it("G3-1 unchanged: ACP's own audit id fields (to, channel, nonce, run, task, message ids) keep a whole 64-hex id", async () => {
+    const r = await firstActivation();
+    try {
+      const ids = {
+        to: hex("a recipient's public key"), channel: hex("a Buzz channel"), nonce: hex("a Buzz event never accepted"),
+        runId: r.run.runId, taskId: "task_0123456789abcdef01234567", messageId: "msg_0123456789abcdef01234567",
+      };
+      expect(r.h.cp.audit.record({ kind: "TEST_ACP_IDS", runId: r.run.runId, evidence: ids }).allowed).toBe(true);
+      expect(r.h.cp.audit.byKind("TEST_ACP_IDS").at(-1)!.evidence).toEqual(ids);
+    } finally { r.h.cp.close(); }
+  }, 60_000);
+
+  it("G3-2: a head accepted while another repository's inspection awaits git: each repository's drift rests on the head its readback shows", async () => {
+    const secondPath = makeRepo({ "README.md": "# second\n" }, "dev");
+    const r = await firstActivation(PLAN_TEXT, [unitTestsWorkflow], { secondCheckout: secondPath });
+    try {
+      const first = r.h.cp.repositories.byIdentity(FIRST_IDENTITY)!;
+      const second = r.h.cp.repositories.byIdentity(SECOND_IDENTITY)!;
+      const registered = second.lastObservedHead;
+      writeFiles(secondPath, { "moved.txt": "moved\n" });
+      const moved = commitAll(secondPath, "moved");
+
+      const inspect = r.h.cp.repositories.inspect.bind(r.h.cp.repositories);
+      vi.spyOn(r.h.cp.repositories, "inspect").mockImplementation(async (id) => {
+        const read = inspect(id);
+        // While the first repository's inspection awaits git, the second repository's new head is accepted.
+        if (id === first.repositoryId) r.h.cp.repositories.acknowledgeHead(second.repositoryId, moved);
+        return read;
+      });
+      const frozen = await r.h.cp.pipeline.freeze(r.run.runId);
+      expect(frozen.allowed, JSON.stringify(frozen)).toBe(true);
+      if (!frozen.allowed) return;
+      const stored = storedContext(r.h, r.run.runId, candidateSnapshotDigest(frozen.value))!;
+      expect(stored.repositories.map((repository) => repository.identity)).toEqual([FIRST_IDENTITY, SECOND_IDENTITY]);
+      expect(registered).not.toBe(moved);
+      for (const repository of stored.repositories) {
+        const { checkout } = repository;
+        expect(checkout.status, repository.identity).toBe("READ");
+        if (checkout.status !== "READ") continue;
+        // The drift agrees with the registry head the readback stores for the repository ...
+        expect(checkout.observedDriftCauses.includes("HEAD_NOT_ACCEPTED_HEAD"), repository.identity).toBe(checkout.head !== repository.lastObservedHead);
+        expect(checkout.observedDriftState === "IN_SYNC", repository.identity).toBe(checkout.head === repository.lastObservedHead && checkout.clean && repository.driftState !== "DRIFTED");
+      }
+      // ... which is the head the inspection decided it against, stored beside it.
+      for (const repository of stored.repositories) {
+        expect(repository.checkout, repository.identity).toMatchObject({ acceptedHead: repository.lastObservedHead });
+      }
+      expect(stored.repositories[1]).toMatchObject({ lastObservedHead: moved, checkout: { head: moved, acceptedHead: moved, observedDriftState: "IN_SYNC" } });
+    } finally { r.h.cp.close(); }
+  }, 60_000);
 });
