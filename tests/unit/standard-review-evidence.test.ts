@@ -488,3 +488,65 @@ describe("review round 1: evidence binds candidate identity, audit text, owner c
     } finally { await f.close(); }
   });
 });
+
+describe("review round 2: the shared credential filter and no reviewer text in any stored result", () => {
+  it("R5 refuses an excerpt the shared credential filter matches, naming the rule and form, never the text", async () => {
+    const f = await fixture();
+    try {
+      const token = ["xoxb", "123456789012345678901234567890"].join("-");
+      const result = await f.stage("slack-shaped", `${MARKER} ${token}`);
+      expect(result).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "slack_token" } });
+      expect(JSON.stringify(result)).not.toContain(token);
+      expect(f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF")).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it("R6 a malformed coverage claim reaches neither the result_submit answer nor its stored result", async () => {
+    const f = await fixture();
+    try {
+      expect(await f.stage("stage-a", MARKER)).toMatchObject({ ok: true });
+      expect(await f.attach("attach-a", MARKER)).toMatchObject({ ok: true });
+      f.h.scripted.script({ match: /Candidate review/, text: pass(f.identity, { coveredFiles: [`${MARKER} is not a key`] }) });
+      const answer = await f.cto("result_submit", { idempotencyKey: "submit-claim", runId: f.run.runId, resultSummary: "app returns 2", recommendation: "merge" });
+      expect(answer).toMatchObject({ ok: true, value: { stage: "REVIEW_UNAVAILABLE", reasonCode: "COVERAGE_INCOMPLETE" } });
+      expect(JSON.stringify(answer)).not.toContain(MARKER);
+      const stored = f.h.cp.db.all<Args>("SELECT * FROM inbound_messages");
+      expect(stored.length).toBeGreaterThan(0);
+      expect(JSON.stringify(stored)).not.toContain(MARKER);
+    } finally { await f.close(); }
+  });
+
+  it("R7 a marker in every reviewer-written field appears in no audit row, stored result, answer, error detail or export", async () => {
+    const f = await fixture();
+    try {
+      expect(await f.stage("stage-a", MARKER)).toMatchObject({ ok: true });
+      expect(await f.attach("attach-a", MARKER)).toMatchObject({ ok: true });
+      const submit = (key: string) => f.cto("result_submit", { idempotencyKey: key, runId: f.run.runId, resultSummary: "app returns 2", recommendation: "merge" });
+      const answers: Args[] = [];
+      // An answer that is not a verdict, then a malformed coverage claim, then a REVISE that writes the marker everywhere.
+      f.h.scripted.script({ match: /Candidate review/, text: `not a verdict: ${MARKER}` });
+      answers.push(await submit("submit-unparsable"));
+      f.h.scripted.script({ match: /Candidate review/, text: pass(f.identity, { coveredFiles: [`${f.identity}:src/app.js`, MARKER] }) });
+      answers.push(await submit("submit-claim"));
+      const echoed = `see ${MARKER}`;
+      f.h.scripted.script({ match: /Candidate review/, text: JSON.stringify({ verdict: "REVISE",
+        coveredFiles: [`${f.identity}:src/app.js`, `${f.identity}:docs/${MARKER}.md`], omittedItems: [echoed], findings: [
+          { category: "correctness", severity: "MAJOR", repository: `${f.identity} ${MARKER}`, path: `src/${MARKER}.js`, summary: echoed, detail: echoed },
+          { category: "method", severity: "MAJOR", repository: f.identity, path: null, summary: echoed, detail: echoed },
+        ] }) });
+      answers.push(await submit("submit-revise"));
+      expect(answers.map((a) => (a["value"] as Args | undefined)?.["stage"])).toEqual(["REVIEW_UNAVAILABLE", "REVIEW_UNAVAILABLE", "REVISION_REQUIRED"]);
+      expect(f.reviews().at(-1)!.content.findings.map((x) => x.summary)).toContain(echoed);
+
+      expect(JSON.stringify(answers)).not.toContain(MARKER);
+      expect(f.h.cp.db.all<Args>("SELECT * FROM audit_events").filter((row) => JSON.stringify(row).includes(MARKER)).map((row) => row["kind"])).toEqual([]);
+      expect(JSON.stringify(f.h.cp.db.all<Args>("SELECT * FROM inbound_messages"))).not.toContain(MARKER);
+      const exported = new RunEvidenceExporter(f.h.cp.db, f.h.cp.artifacts, f.h.clock, f.h.cp.audit).exportRun(f.run.runId);
+      if (!exported.allowed) throw new Error(exported.message);
+      expect(JSON.stringify(exported.value)).not.toContain(MARKER);
+      expect(f.refusals.join("\n")).not.toContain(MARKER);
+      // The run's owner still gets the review whole, so it can revise.
+      expect(JSON.stringify(f.h.cp.db.all<Args>("SELECT payload_json FROM outbox WHERE kind = 'REVISION_REQUEST'"))).toContain(MARKER);
+    } finally { await f.close(); }
+  });
+});

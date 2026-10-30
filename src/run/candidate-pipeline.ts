@@ -10,7 +10,7 @@ import {
 } from "../bootstrap/bootstrap-plan.ts";
 import { collectBootstrapCeoDecisions, frozenBootstrapCeoDecisions } from "../bootstrap/bootstrap-ceo-decisions.ts";
 import { collectBootstrapReviewEvidence } from "../bootstrap/bootstrap-review-evidence.ts";
-import { collectStandardReviewEvidence } from "../review/standard-review-evidence.ts";
+import { collectStandardReviewEvidence, runHadStandardReviewEvidence, withoutReviewerText } from "../review/standard-review-evidence.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
@@ -540,7 +540,13 @@ export class CandidatePipeline {
     const controller = new AbortController();
     this.#attempts.set(attemptId, controller);
     try {
-      return await this.submitResultOnce(input, attemptId, controller.signal);
+      const outcome = await this.submitResultOnce(input, attemptId, controller.signal);
+      // The answer is stored as the mutation's result and returned to the caller: for a run that had private
+      // review evidence it carries counts and digests of what the reviewer wrote, never its words.
+      if (!runHadStandardReviewEvidence({ audit: this.audit }, input.runId)) return outcome;
+      return (outcome.allowed
+        ? { ...outcome, value: withoutReviewerText(outcome.value), evidence: withoutReviewerText(outcome.evidence) }
+        : { ...outcome, evidence: withoutReviewerText(outcome.evidence) }) as Decision<PipelineOutcome>;
     } finally {
       this.#attempts.delete(attemptId);
       this.releaseAttempt(input.runId, attemptId);

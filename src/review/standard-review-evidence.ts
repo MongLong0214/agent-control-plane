@@ -2,6 +2,7 @@ import { z } from "zod";
 import { reviewEvidenceAttachAuthority } from "../bootstrap/bootstrap-review-evidence.ts";
 import { screenPublicText } from "../bootstrap/genesis-bundle.ts";
 import type { Clock } from "../core/clock.ts";
+import { credentialShapeMatch } from "../core/credential-shapes.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { allow, deny, type Decision } from "../core/errors.ts";
 import { BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES } from "../core/mcp-limits.ts";
@@ -82,10 +83,18 @@ const parseStandardBundle = (body: string, input: { runId: string; contractDiges
       return deny(ReasonCode.INVALID_ARGUMENT, `each review evidence file is an excerpt of at most ${STANDARD_REVIEW_EXCERPT_MAX_BYTES} bytes, never its whole source, with no more lines than its ranges`);
     }
   }
-  try {
-    for (const text of [...parsed.data.missing, ...parsed.data.files.flatMap(f => [Buffer.from(f.bodyBase64, "base64").toString("utf8"), f.origin,
-      ...f.excerpt.ranges.flatMap(r => (r.purpose === undefined ? [] : [r.purpose]))])]) screenPublicText(text);
-  } catch { return deny(ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED, "review evidence contains credential-shaped content"); }
+  // Every text the reviewer would read gets the shared credential filter's full rule set (core/credential-shapes.ts),
+  // checked as free text, and the public-text screen; a refusal names the rule and the form, never the text.
+  const texts = [...parsed.data.missing, ...parsed.data.files.flatMap(f => [Buffer.from(f.bodyBase64, "base64").toString("utf8"), f.origin, f.path,
+    ...f.excerpt.ranges.flatMap(r => (r.purpose === undefined ? [] : [r.purpose]))])];
+  for (const text of texts) {
+    const match = credentialShapeMatch(text);
+    if (match !== null) {
+      return deny(ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED, "review evidence contains credential-shaped content", { rule: match.rule, form: match.form });
+    }
+  }
+  try { for (const text of texts) screenPublicText(text); }
+  catch { return deny(ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED, "review evidence contains credential-shaped content", { rule: "public_text_screen", form: "other" }); }
   return allow(ReasonCode.OK, parsed.data);
 };
 
@@ -266,6 +275,33 @@ export const standardReviewEvidenceCurrent = (
 export const currentStandardReviewEvidenceDigest = (source: ReadSource & Pick<Source, "runs">, runId: string): Decision<string | null> => {
   try { return allow(ReasonCode.OK, collectStandardReviewEvidence(source, runId)?.digest ?? null); }
   catch { return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "attached review evidence cannot be read back", { runId }); }
+};
+
+/** Whether CEO-attached private review evidence was ever bound on this run, replaced or current. */
+export const runHadStandardReviewEvidence = (source: Pick<Source, "audit">, runId: string): boolean =>
+  source.audit.forRun(runId).some(e => e.kind === STANDARD_REVIEW_EVIDENCE_ATTACHED);
+
+/**
+ * Every field a reviewer writes that a result or a refusal can carry (review/blind-review.ts ReviewPacket and its
+ * refusals: a malformed coverage claim, the omitted items, the findings and method findings, the coverage and extra
+ * claims and the repositories they name). The verdict is an enum; an unparsable answer, an error or an isolation
+ * detail is already a digest and a length.
+ */
+const REVIEWER_TEXT_FIELDS: ReadonlySet<string> = new Set(["claim", "omittedItems", "findings", "methodFindings", "coveredFiles",
+  "extraClaims", "coveredRepositories"]);
+
+/**
+ * A result or refusal of a run that had private review evidence, with each reviewer-written field replaced by its
+ * count and digest: a reviewer that read the evidence can echo it in any of them. The run's owner still receives
+ * the review whole in its revision request; nothing here is stored or answered with the reviewer's words.
+ */
+export const withoutReviewerText = (value: unknown, key?: string): unknown => {
+  if (key !== undefined && REVIEWER_TEXT_FIELDS.has(key) && (typeof value === "string" || Array.isArray(value))) {
+    return { withheld: "private review evidence", count: Array.isArray(value) ? value.length : 1, digest: digestOf(value) };
+  }
+  if (Array.isArray(value)) return value.map(item => withoutReviewerText(item));
+  if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, withoutReviewerText(v, k)]));
+  return value;
 };
 
 /** Digests the reviewer is shown for the bundle; quoting one is not quoting a credential. */
