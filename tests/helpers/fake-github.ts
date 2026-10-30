@@ -309,29 +309,44 @@ export class FakeGitHub implements GitHubClient {
     this.workflowFiles.set(`${headSha}:${path}`, content);
   }
 
-  /** Add a check with the complete suite → Actions run provenance chain the kernel requires. */
-  setTrustedPostMergeCheck(mergeSha: string, name: string, workflowPath: string): void {
+  /**
+   * Add a check with the complete suite → Actions run provenance chain the kernel requires. The check
+   * and its workflow run both succeed unless `outcome` says otherwise; the added check is returned.
+   */
+  setTrustedPostMergeCheck(
+    mergeSha: string,
+    name: string,
+    workflowPath: string,
+    outcome: {
+      check?: { status: string; conclusion: string | null };
+      run?: { status: string; conclusion: string | null };
+    } = {},
+  ): FakeCheckRun {
     const suiteId = this.#nextId++;
     const actionRunId = this.#nextId++;
+    const check = outcome.check ?? { status: "completed", conclusion: "success" };
+    const run = outcome.run ?? { status: "completed", conclusion: "success" };
     this.#checkSuites.set(suiteId, { head_sha: mergeSha, app: { slug: "github-actions" } });
     this.#actionsRuns.set(actionRunId, {
       check_suite_id: suiteId,
       head_sha: mergeSha,
       path: workflowPath,
-      status: "completed",
-      conclusion: "success",
+      status: run.status,
+      conclusion: run.conclusion,
     });
-    this.checkRuns.push({
+    const added: FakeCheckRun = {
       id: this.#nextId++,
       name,
       head_sha: mergeSha,
-      conclusion: "success",
-      status: "completed",
+      conclusion: check.conclusion,
+      status: check.status,
       app: { slug: "github-actions" },
       check_suite: { id: suiteId },
       details_url: `https://github.test/acme/fixture/actions/runs/${actionRunId}/job/1`,
-      completed_at: "2026-08-12T00:00:00.000Z",
-    });
+      completed_at: check.status === "completed" ? "2026-08-12T00:00:00.000Z" : null,
+    };
+    this.checkRuns.push(added);
+    return added;
   }
 
   readonly #heads = new Map<string, string>();
@@ -341,6 +356,6 @@ export class FakeGitHub implements GitHubClient {
     head_sha: string;
     path: string;
     status: string;
-    conclusion: string;
+    conclusion: string | null;
   }>();
 }

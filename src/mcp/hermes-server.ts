@@ -31,6 +31,7 @@ import type { Doctor } from "../doctor/doctor.ts";
 import type { ExecutionMode, RunPriority } from "../domain/types.ts";
 import { Role, roleKeyFor, RunKind, RunState } from "../domain/types.ts";
 import type { RepairService } from "../doctor/repair.ts";
+import { projectCi } from "../registry/project-ci.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
@@ -168,6 +169,8 @@ export const createHermesMcpPort = (
             repositories: source.repositories.byProject(projectId),
             primaryCto: source.bindings.activePrimaryCto(projectId),
             runs: source.runs.list({ projectId }),
+            // #1257 — read from the manifest and recorded observations; availability does not imply it.
+            ci: projectCi(source.db, source.projects, projectId),
           }
         : null;
     },
@@ -540,7 +543,7 @@ const createHermesServerFromPort = (
   );
   server.registerTool(
     "project_get",
-    { description: "Project identity and active contract.", inputSchema: { projectId: z.string() } },
+    { description: "Project identity, active contract, and CI: declared workflows with their last recorded observation.", inputSchema: { projectId: z.string() } },
     async (args) => read(() => {
       const view = port.projectView(args.projectId);
       return view ? ok(view) : respond(deny(ReasonCode.NOT_FOUND, "unknown project", { projectId: args.projectId }));

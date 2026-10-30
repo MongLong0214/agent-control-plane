@@ -506,6 +506,30 @@ describe("authenticated operator socket (#393/#405)", () => {
     }
   });
 
+  it("reports CI undeclared through the CLI project view instead of letting HEALTHY imply PASS", async () => {
+    const running = await makeStartedOperator();
+    try {
+      expect(running.harness.cp.projects.register({ projectId: "cli-ci-bare", name: "CLI CI bare" }).allowed).toBe(true);
+
+      const listed = await running.daemon.handleOperatorRequest({
+        requestId: "project-list-ci",
+        method: "project.list",
+        params: {},
+      }, running.peer);
+
+      expect(listed).toMatchObject({
+        allowed: true,
+        value: expect.arrayContaining([expect.objectContaining({
+          projectId: "cli-ci-bare",
+          availability: "HEALTHY",
+          ci: { declared: false, reason: "NO_ACTIVE_MANIFEST", manifestDigest: null },
+        })]),
+      });
+    } finally {
+      await running.close();
+    }
+  });
+
   it("registers, queries, and unregisters an actor through the authenticated daemon surface", async () => {
     const running = await makeStartedOperator();
     const actorId = "actor:operator-cto";

@@ -962,6 +962,19 @@ describe("post-merge verification cannot be made vacuous (§24.7)", () => {
     expect(refused.allowed).toBe(false);
     expect(refused.evidence["failed"]).toEqual([{name:"project-ci",conclusion:"untrusted"}]);
   });
+  // #1257 J4 — provenance does not imply a successful run, so post-merge verification asks for one itself.
+  it.each([
+    ["failed", { status: "completed", conclusion: "failure" }],
+    ["is still running", { status: "in_progress", conclusion: null }],
+  ] as const)("#1257: a successful check inside an approved run that %s is not a successful post-merge check", async (_state, run) => {
+    const fixture = await setupTrustedPostMergeFixture();
+    const mergeSha = await mergeForReal(fixture);
+    fixture.github.setTrustedPostMergeCheck(mergeSha, "project-ci", ".github/workflows/ci.yml", { run });
+    const refused = await fixture.harness.cp.github.postMergeVerify(fixture.runId, fixture.identity, mergeSha);
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
+    expect(refused.evidence["failed"]).toEqual([{ name: "project-ci", conclusion: "untrusted" }]);
+  });
   it("refuses check names the pinned manifest does not declare", async () => {
     const fixture = await setup();
     const refused = await fixture.harness.cp.github.postMergeVerify(

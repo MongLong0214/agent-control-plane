@@ -3243,7 +3243,10 @@ export class GitHubKernel {
       if (check.status !== "completed") return { name, conclusion: `incomplete:${check.status}` };
       if (check.conclusion !== "success") return { name, conclusion: check.conclusion ?? "missing" };
       const trusted = await this.assertTrustedWorkflowCheck(runId, repositoryIdentity, mergeCommitSha, check);
-      if (trusted.allowed) return { name, conclusion: "success" };
+      // Provenance names the producer, not the outcome. A successful job inside an approved run that
+      // failed or has not finished is not a successful check, and gets the same refusal as unproven
+      // provenance.
+      if (trusted.allowed) return { name, conclusion: actionsRunSucceeded(trusted.value) ? "success" : "untrusted" };
       // "untrusted" says a check could not be believed and not why, which for the two causes
       // here points in opposite directions: bad provenance is a check somebody may have staged,
       // while an unapproved workflow is a manifest that never recorded a digest (#527). Both are
@@ -3896,16 +3899,17 @@ export class GitHubKernel {
   /**
    * Trust an Actions check only after resolving the actual suite, Actions run and
    * workflow path. A check name and `github-actions` app slug are candidate-controlled
-   * unless this chain proves the approved workflow at the exact commit produced it.
+   * unless this chain proves the approved workflow at the exact commit produced it. It says
+   * who produced the check, not that its run passed: see `actionsRunSucceeded`.
    */
   private async assertTrustedWorkflowCheck(
     runId: string,
     repositoryIdentity: string,
     head: string,
     check: CheckRun,
-  ): Promise<Decision<{ workflowDigest: string }>> {
+  ): Promise<Decision<ProvenActionsCheck>> {
     const manifest = this.pinnedManifest(runId);
-    if (!manifest.allowed) return manifest as Decision<{ workflowDigest: string }>;
+    if (!manifest.allowed) return manifest as Decision<ProvenActionsCheck>;
     // Matched on role as well as name (#512): the digest below is read from this repository, so
     // an entry belonging to a different participant must not be the one it is compared against.
     const role = this.repositoryRoleInRun(runId, repositoryIdentity);
@@ -4039,13 +4043,15 @@ export class GitHubKernel {
         const checks: CiCheck[] = [];
         for (const check of response.check_runs ?? []) {
           if (check.name === GATE_CHECK_NAME) continue; // the gate is not its own evidence
+          // A failed or unfinished approved run is attributed and reported with its conclusion; only
+          // `trustedCiConclusion` decides whether that conclusion is a success.
           const trusted = await this.assertTrustedWorkflowCheck(run.value, identity, head, check);
           if (!trusted.allowed) continue;
           checks.push({
             commandId: check.name,
             repositoryIdentity: identity,
             head: check.head_sha,
-            conclusion: (check.conclusion as CiCheck["conclusion"]) ?? "unknown",
+            conclusion: trustedCiConclusion(check, trusted.value),
             workflowDigest: trusted.value.workflowDigest,
             creatorIdentity: check.app?.slug ?? "unknown",
             completedAt: check.completed_at ?? this.clock.nowIso(),
@@ -4740,12 +4746,48 @@ export interface ApprovedActionsWorkflow {
   approvedDigest: string;
 }
 
+/** GitHub's statuses for an Actions run that has not finished: a later read can still see it conclude. */
+const ACTIONS_RUN_UNFINISHED: ReadonlySet<string> = new Set(["queued", "in_progress", "waiting", "requested", "pending"]);
+
+/** A check the approved workflow's run produced, with that run's own state as GitHub reported it. */
+export interface ProvenActionsCheck {
+  workflowDigest: string;
+  /** `completed` or one of `ACTIONS_RUN_UNFINISHED`; any other status is refused as provenance. */
+  run: { status: string; conclusion: string | null };
+}
+
+/**
+ * Provenance says which workflow run produced a check, never that the run passed. Every caller that
+ * lets a check satisfy a requirement asks this as well: post-merge verification, the genesis CI
+ * observation and merge, and trusted-CI evidence before it reports a success.
+ */
+const actionsRunSucceeded = (proven: ProvenActionsCheck): boolean =>
+  proven.run.status === "completed" && proven.run.conclusion === "success";
+
+/**
+ * A proven check's conclusion as trusted-CI evidence. A check that finished without success keeps its
+ * own conclusion. An unfinished check is `unknown`, which the verification engine records as pending.
+ * A successful check is `success` only inside a run that succeeded: while its run is unfinished it is
+ * `unknown`, and once the run has finished otherwise it takes the run's conclusion.
+ */
+const trustedCiConclusion = (check: CheckRun, proven: ProvenActionsCheck): CiCheck["conclusion"] => {
+  if (check.status !== "completed" || !check.conclusion) return "unknown";
+  if (check.conclusion !== "success") return check.conclusion as CiCheck["conclusion"];
+  if (actionsRunSucceeded(proven)) return "success";
+  if (proven.run.status !== "completed" || !proven.run.conclusion) return "unknown";
+  return proven.run.conclusion as CiCheck["conclusion"];
+};
+
 /**
  * Trust an Actions check only after resolving the actual suite, Actions run and workflow path, at the
  * exact head, and the workflow file's digest at that head. A check name and `github-actions` app slug
  * are candidate-controlled: any workflow in the repository can report a check of any name, so only
  * this chain proves that the approved workflow produced it. Normal kernel merges, the bootstrap
  * genesis verification and the genesis merge all prove a check through this one function.
+ *
+ * The chain is the same whatever the run concluded, so a failed or unfinished run of the approved
+ * workflow is attributed to it as well. The result carries the run's status and conclusion and does
+ * not by itself let a check count as passed: see `actionsRunSucceeded`.
  */
 export async function proveActionsCheckProvenance(
   client: GitHubClient,
@@ -4758,7 +4800,7 @@ export async function proveActionsCheckProvenance(
     /** The digest of the workflow file's bytes at `head`, in the approval's own form. */
     workflowDigest: (target: { owner: string; repo: string }, path: string) => Promise<Decision<string>>;
   },
-): Promise<Decision<{ workflowDigest: string }>> {
+): Promise<Decision<ProvenActionsCheck>> {
   const { head, check, workflow } = input;
   if (!workflow?.approvedDigest || check.head_sha !== head || check.app?.slug !== "github-actions") {
     return deny(ReasonCode.GATE_CREATOR_UNTRUSTED, "check has no approved Actions workflow provenance", {
@@ -4776,7 +4818,7 @@ export async function proveActionsCheckProvenance(
     });
   }
   const target = input.root();
-  if (!target.allowed) return target as Decision<{ workflowDigest: string }>;
+  if (!target.allowed) return target as Decision<ProvenActionsCheck>;
   const { root, owner, repo } = target.value;
   try {
     type RepositoryIdentity = { id?: number; full_name?: string };
@@ -4788,7 +4830,7 @@ export async function proveActionsCheckProvenance(
       ),
     ]);
     // details_url is only an integrator-supplied lookup hint. Prove the returned GitHub identities
-    // and repository before accepting either successful or legitimately pending provenance.
+    // and repository before attributing the check, whatever its run concluded.
     const repositoryName = `${owner}/${repo}`.toLowerCase();
     if (suite.id !== suiteId || run.id !== runId || run.check_suite_id !== suiteId ||
         !Number.isSafeInteger(suite.repository?.id) || (suite.repository?.id ?? 0) < 1 ||
@@ -4797,31 +4839,27 @@ export async function proveActionsCheckProvenance(
         run.repository?.full_name?.toLowerCase() !== repositoryName) {
       return deny(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID, "Actions suite/run identity or repository differs from the check", { checkRunId: check.id });
     }
+    // A run status GitHub does not document is refused rather than read as finished or as pending.
+    const runStatus = run.status ?? "";
     if (
       suite.head_sha !== head ||
       suite.app?.slug !== "github-actions" ||
       run.head_sha !== head ||
       run.path !== workflow.path ||
-      run.status !== "completed" ||
-      run.conclusion !== "success"
+      (runStatus !== "completed" && !ACTIONS_RUN_UNFINISHED.has(runStatus))
     ) {
-      // The approved workflow's own run at this head, still finishing after this job completed, is
-      // the one difference a later read can clear; every other difference is a different producer.
-      const runIncomplete =
-        suite.head_sha === head && suite.app?.slug === "github-actions" && run.head_sha === head &&
-        run.path === workflow.path && ["queued", "in_progress", "waiting", "requested", "pending"].includes(run.status ?? "");
       return deny(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID, "Actions suite or run differs from the required check", {
         checkRunId: check.id,
         suiteHead: suite.head_sha,
         runHead: run.head_sha,
         runPath: run.path ?? null,
-        ...(runIncomplete ? { runIncomplete: true } : {}),
+        runStatus: run.status ?? null,
       });
     }
     const digest = await input.workflowDigest({ owner, repo }, workflow.path);
-    if (!digest.allowed) return digest as Decision<{ workflowDigest: string }>;
+    if (!digest.allowed) return digest as Decision<ProvenActionsCheck>;
     return digest.value === workflow.approvedDigest
-      ? allow(ReasonCode.OK, { workflowDigest: digest.value })
+      ? allow(ReasonCode.OK, { workflowDigest: digest.value, run: { status: runStatus, conclusion: run.conclusion ?? null } })
       : deny(ReasonCode.VERIFICATION_CI_WORKFLOW_DIGEST_MISMATCH, "Actions workflow differs from pinned approval", {
           checkRunId: check.id,
           expected: workflow.approvedDigest,
@@ -4844,9 +4882,10 @@ export type ApprovedWorkflowChecks =
 /**
  * #246 genesis — the required checks of a bootstrap's approved workflows at an exact head, before any
  * project or run exists to pin a manifest: the reviewed PLAN supplies the workflows. Every check of a
- * required name must be completed, successful and proven by `proveActionsCheckProvenance`; a same-name
- * check from any other workflow or app, a failed lane, or a check that cannot be proven refuses. A
- * name with no check yet, or one still running, is pending. Reads only.
+ * required name must be completed, successful and proven by `proveActionsCheckProvenance`, inside an
+ * approved run that succeeded; a same-name check from any other workflow or app, a failed lane or run,
+ * or a check that cannot be proven refuses. A name with no check yet, or one whose check or run is
+ * still running, is pending. Reads only.
  */
 export async function observeApprovedWorkflowChecks(
   client: GitHubClient,
@@ -4888,7 +4927,7 @@ export async function observeApprovedWorkflowChecks(
       continue;
     }
     for (const check of matching) {
-      let proven: Decision<{workflowDigest:string}> = deny(ReasonCode.VERIFICATION_GAP, "check has no approved workflow provenance");
+      let proven: Decision<ProvenActionsCheck> = deny(ReasonCode.VERIFICATION_GAP, "check has no approved workflow provenance");
       for (const approvedWorkflow of approved) {
         proven = await proveActionsCheckProvenance(client, {
           head: input.head,
@@ -4908,17 +4947,21 @@ export async function observeApprovedWorkflowChecks(
             return allow(ReasonCode.OK, sha256(Buffer.from(file.content.replace(/\s/g, ""), "base64")));
           },
         });
-        if (proven.allowed || proven.evidence["runIncomplete"] === true) break;
+        if (proven.allowed) break;
       }
-      if (proven.allowed) {
-        if (check.status !== "completed") pending ??= checkName;
-        continue;
+      if (!proven.allowed) {
+        return { state: "refused", checkName, reasonCode: proven.reasonCode, message: proven.message };
       }
-      if (proven.evidence["runIncomplete"] === true) {
+      // Provenance names the producer, not the outcome: the approved run must itself succeed. A run
+      // still finishing is the one difference a later read can clear.
+      if (ACTIONS_RUN_UNFINISHED.has(proven.value.run.status)) {
         pending ??= checkName;
         continue;
       }
-      return { state: "refused", checkName, reasonCode: proven.reasonCode, message: proven.message };
+      if (!actionsRunSucceeded(proven.value)) {
+        return { state: "refused", checkName, reasonCode: ReasonCode.VERIFICATION_GAP, message: "a required check's approved workflow run did not succeed at this head" };
+      }
+      if (check.status !== "completed") pending ??= checkName;
     }
   }
   return pending === null ? { state: "success" } : { state: "pending", checkName: pending };
