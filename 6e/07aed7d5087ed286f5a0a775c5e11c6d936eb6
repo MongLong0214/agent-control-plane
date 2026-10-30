@@ -1,0 +1,3 @@
+Limit: only publication compares the frozen CTO identity; a REVISE or BLOCK verdict reached after an identity move with no re-freeze is still delivered to the CTO, because that path checks only the PLAN
+Record-Id: r-e12d4225ef0c
+Provenance: inherited 86910f567aa5ac11e54da687f291a6dc5beedd1a
