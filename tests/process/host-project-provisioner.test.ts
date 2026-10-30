@@ -76,13 +76,15 @@ else if(cmd === 'buzz') {
  const key = process.env.BUZZ_PRIVATE_KEY || '', ecdh = require('node:crypto').createECDH('secp256k1');
  const pk = /^[0-9a-f]{64}$/.test(key) ? (ecdh.setPrivateKey(Buffer.from(key,'hex')),ecdh.getPublicKey(null,'compressed').subarray(1).toString('hex')) : fs.readFileSync(a.privateKeyFile.replace('.priv','.pub'),'utf8').trim();
  const archived = s.archivedRooms || [];
+ // With keepRooms a second create leaves the earlier room active with its own members (s.otherRooms).
+ const others = s.otherRooms || [], other = others.find(o => o.room.channel_id === value('--channel'));
  if(args[0] === 'users') out([{pubkey:pk,...${JSON.stringify(profileReadback)}}]);
- else if(args[0] === 'channels' && args[1] === 'search') out([...(s.room ? (s.ambiguous ? [s.room,{...s.room,channel_id:'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'}] : [s.room]) : []),...(args.includes('--include-archived') ? archived : [])]);
- else if(args[0] === 'channels' && args[1] === 'get') {const room=[s.room,...archived].find(r => r && r.channel_id === value('--channel'));if(!room) process.exit(5);out({channel_id:room.channel_id,name:room.name,description:null,created_at:0,pubkey:pk});}
+ else if(args[0] === 'channels' && args[1] === 'search') out([...(s.room ? (s.ambiguous ? [s.room,{...s.room,channel_id:'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'}] : [s.room]) : []),...others.map(o => o.room),...(args.includes('--include-archived') ? archived : [])]);
+ else if(args[0] === 'channels' && args[1] === 'get') {const room=[s.room,...archived,...others.map(o => o.room)].find(r => r && r.channel_id === value('--channel'));if(!room) process.exit(5);out({channel_id:room.channel_id,name:room.name,description:null,created_at:0,pubkey:pk});}
  else if(args[0] === 'channels' && args[1] === 'archive') {if(!process.env.BUZZ_PRIVATE_KEY || process.env.BUZZ_IDENTITY !== a.identityName || !s.room || s.room.channel_id !== value('--channel') || !s.members.some(m => m.pubkey === pk && m.role === 'owner')) process.exit(6);s.archivedRooms=[...archived,{...s.room,archived:true}];s.room=null;s.members=[];out({event_id:'a'.repeat(64),accepted:true,message:''});}
- else if(args[0] === 'channels' && args[1] === 'create') {if(args.includes('--id') || !process.env.BUZZ_PRIVATE_KEY || process.env.BUZZ_IDENTITY !== a.identityName) process.exit(3);const intent=JSON.parse(fs.readFileSync(path.join(process.env.ACP_STATE_DIR,'buzz-room-test.json'),'utf8'));if(intent.name!==value('--name') || intent.pubkey!==pk) process.exit(4);if(s.refuseCreate) {s.refuseCreate=false;save();process.exit(1);}s.creates++;s.room={channel_id:s.creates === 1 ? 'ffffffff-ffff-4fff-8fff-ffffffffffff' : '99999999-9999-4999-8999-999999999999',name:value('--name'),channel_type:value('--type'),visibility:value('--visibility')};s.members=[{pubkey:pk,role:'owner'}];save();if(s.loseCreate) {s.loseCreate=false;save();process.exit(1);}out(s.room);}
+ else if(args[0] === 'channels' && args[1] === 'create') {if(args.includes('--id') || !process.env.BUZZ_PRIVATE_KEY || process.env.BUZZ_IDENTITY !== a.identityName) process.exit(3);const intent=JSON.parse(fs.readFileSync(path.join(process.env.ACP_STATE_DIR,'buzz-room-test.json'),'utf8'));if(intent.name!==value('--name') || intent.pubkey!==pk) process.exit(4);if(s.refuseCreate) {s.refuseCreate=false;save();process.exit(1);}if(s.keepRooms && s.room) s.otherRooms=[...others,{room:s.room,members:s.members}];s.creates++;s.room={channel_id:s.creates === 1 ? 'ffffffff-ffff-4fff-8fff-ffffffffffff' : '99999999-9999-4999-8999-999999999999',name:value('--name'),channel_type:value('--type'),visibility:value('--visibility')};s.members=[{pubkey:pk,role:'owner'}];save();if(s.loseCreate) {s.loseCreate=false;save();process.exit(1);}out(s.room);}
  else if(args[0] === 'channels' && args[1] === 'add-member') {const pubkey=value('--pubkey');s.members=s.members.filter(m=>m.pubkey!==pubkey);s.members.push({pubkey,role:value('--role')});out({});}
- else if(args[0] === 'channels' && args[1] === 'members') out(s.members);
+ else if(args[0] === 'channels' && args[1] === 'members') out(other ? other.members : s.members);
  else if(args[0] === 'messages' && args[1] === 'send') {
   const rosterFile=path.join(root,'.hermes','bridge','required-mentions.json');
   const roster=fs.existsSync(rosterFile) ? JSON.parse(fs.readFileSync(rosterFile,'utf8')) : {channels:{}};
@@ -995,4 +997,63 @@ it('#1251 C6: an intent of this run moved aside with its key is looked up with t
   expect(readFileSync(pubFile,'utf8').trim()).toBe(ownPk);
   expect(await host.invoke('retire',f.a)).toMatchObject({retired:true,buzzRoom:'archived'});
   expect(fakeState(f)).toMatchObject({room:null,archivedRooms:[expect.objectContaining({channel_id:room,archived:true})]});
+});
+
+it('#1251 C7: a room this run created before a retry bound its replacement keeps retirement from archiving only the replacement',async () => {
+  const f = fixture();
+  const root = realpathSync(tempDir('retire-replaced-'));
+  const h = makeHarness({root,residentProvisioner:{home:f.home,script:daemonHost(f)}});
+  try {
+    const run = h.cp.runs.create({kind:RunKind.PROJECT_BOOTSTRAP,executionMode:ExecutionMode.STANDARD,
+      contract:{goal:'bootstrap',why:'owner request',scope:[],nonGoals:[],acceptance:['developable'],priority:'NORMAL',humanGate:[],references:[]}});
+    if (!run.allowed) throw new Error(run.message);
+    const runId = run.value.runId;
+    h.cp.projects.register({projectId:'test',name:'test'});
+    h.cp.residentProjects.attachSubscriber(async () => false);
+    h.cp.residentProjects.remember({runId,candidateSnapshotDigest:'candidate',ceoSessionId:'ceo'},'test',{});
+    const ensure = () => h.cp.residentProjects.ensure({runId,projectId:'test',repositoryIdentity:'github:acme/fixture',repositoryNodeId:'R_node',head:'a'.repeat(40),packet:{}});
+    // The first create lands and its answer is lost; its key is then moved away. The retry moves this run's identity
+    // aside, mints a replacement key and creates a second room, which the daemon binds; the relay keeps both rooms.
+    writeFileSync(join(f.home,'fake.json'),JSON.stringify({members:[],posts:[],creates:0,launches:0,loseCreate:true,keepRooms:true}));
+    await expect(ensure()).rejects.toThrow();
+    const pubFile = f.a.privateKeyFile.replace('.priv','.pub');const firstPk = readFileSync(pubFile,'utf8').trim();
+    renameSync(f.a.privateKeyFile,join(f.home,'lost.priv'));
+    await expect(ensure()).rejects.toThrow();
+    const first = 'ffffffff-ffff-4fff-8fff-ffffffffffff';const replacement = '99999999-9999-4999-8999-999999999999';
+    const allocation = h.cp.residentProjects.allocation(runId)!;
+    expect(allocation).toMatchObject({roomLifecycle:'created-or-unknown',roomId:replacement});
+    expect(fakeState(f)).toMatchObject({creates:2,room:{channel_id:replacement},otherRooms:[{room:{channel_id:first},members:[{pubkey:firstPk,role:'owner'}]}]});
+    expect(fakeState(f).launched).toBeUndefined();
+    const retiredDir = join(root,'retired-buzz-identities');
+    expect(readdirSync(retiredDir)).toHaveLength(1);
+    const dir = join(retiredDir,readdirSync(retiredDir)[0]!);
+    expect(readdirSync(dir).sort()).toEqual(['buzz-key-test.json','buzz-room-test.json','cto-test.pub']);
+    const snapshot = () => ({room:fakeState(f).room,others:fakeState(f).otherRooms,archived:fakeState(f).archivedRooms ?? [],clone:existsSync(f.a.clonePath),
+      moved:readdirSync(dir).sort(),status:h.cp.residentProjects.row(runId)?.status,
+      files:[f.a.privateKeyFile,pubFile,join(root,'buzz-room-test.json'),join(root,'buzz-key-test.json'),join(root,'retired-buzz-room-test.json')].map(file => existsSync(file) ? readFileSync(file,'utf8') : null)});
+    const refuses = async (order:string[]) => {
+      const before = snapshot();
+      const refused = await retireProject(h.cp,'test','operator retirement');
+      expect(refused,JSON.stringify(refused)).toMatchObject({allowed:false,evidence:{projectId:'test',requiredOrder:[...order,'run agentctl project retire test again']}});
+      expect(snapshot()).toEqual(before);
+    };
+    // The earlier room's key is not there to look with: refused before any host write.
+    await refuses([`put the key this run minted (pubkey ${firstPk}) in ${dir} as cto-test.priv; retirement looks for that room with it`]);
+    // With that key back it finds the earlier room still active: refused, naming the owner archive step.
+    renameSync(join(f.home,'lost.priv'),join(dir,'cto-test.priv'));
+    await refuses([`have an owner archive room ${first} (buzz channels archive --channel ${first})`]);
+    // Once an owner archives it, retirement archives the replacement room and leaves no room of this run active.
+    const kept = (fakeState(f).otherRooms as {room:Record<string,unknown>}[])[0]!.room;
+    patchFake(f,{otherRooms:[],archivedRooms:[{...kept,archived:true}]});
+    const retired = await retireProject(h.cp,'test','operator retirement');
+    expect(retired,JSON.stringify(retired)).toMatchObject({allowed:true});
+    expect(h.cp.residentProjects.row(runId)?.status).toBe('RETIRED');
+    expect(fakeState(f)).toMatchObject({room:null,otherRooms:[],archivedRooms:[expect.objectContaining({channel_id:first}),expect.objectContaining({channel_id:replacement})]});
+    expect(existsSync(f.a.clonePath)).toBe(false);
+    // A daemon exit after the host step and before its ledger recorded it: the host retire runs again, changing nothing.
+    const settled = () => ({fake:fakeState(f),identities:readdirSync(retiredDir).sort()});
+    const before = settled();
+    expect(await new ExecFileHostProjectProvisioner(daemonHost(f),f.home,root,30_000,join(root,'state.sqlite')).invoke('retire',allocation)).toMatchObject({retired:true,buzzRoom:'archived'});
+    expect(settled()).toEqual(before);
+  } finally {h.cp.close();}
 });
