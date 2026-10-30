@@ -501,11 +501,21 @@ export interface BootstrapDoor {
 export interface DaemonStartOptions {
   bootstrapDoor?: () => Promise<BootstrapDoor>;
   /**
-   * #1189 D1 — sends the CEO stall notices a refused or parked start enqueued, called while this
+   * #1189 D1 — the route the CEO stall notice of a refused or parked start is sent over, used while this
    * daemon still holds its lock and before it releases it. The caller decides what route that is;
    * omitting it leaves the notice PENDING for the first daemon that starts.
    */
-  stallNotice?: (messageIds: readonly string[]) => Promise<unknown>;
+  stallNotice?: StartStallNoticeRoute;
+}
+
+export type StartStallNoticeRouteState = { started: true } | { started: false; reason: string };
+
+/** #1189 D1 — a route for the stall notice of a start that cannot resume dispatch. */
+export interface StartStallNoticeRoute {
+  /** Called before the start writes its notice: whatever the route needs to predate that notice. */
+  open?: () => StartStallNoticeRouteState;
+  /** Sends the named notices. Its answer and its failure are diagnostics: neither changes the refusal. */
+  deliver: (messageIds: readonly string[]) => Promise<StartStallNoticeRouteState | void>;
 }
 
 /** #1189 D1 — how long a refused or parked start waits for its stall notice to be sent. */
@@ -3676,11 +3686,11 @@ export class Daemon {
 
   /**
    * #1189 D1 — classifies the blocking findings of a start that cannot resume dispatch, writes them
-   * to `health.json`, routes a PERMANENT stall (or a TRANSIENT one whose refusal reaches the crash-loop
-   * threshold) to the CEO once, and — through the caller's
-   * `stallNotice`, while this daemon still holds its lock — sends that notice before the start parks
-   * or refuses. It moves no run. A failure here is recorded on the stall and never changes why the
-   * start was refused.
+   * to `health.json`, states a PERMANENT stall (or a TRANSIENT one whose refusal reaches the crash-loop
+   * threshold) as a CEO incident, and — over the caller's `stallNotice` route, opened before the notice
+   * is written, while this daemon still holds its lock — sends that notice once before the start parks
+   * or refuses. It moves no run. A failure here, of the route or of the send, is recorded on the stall
+   * and never changes why the start was refused.
    */
   private async recordStartStall(
     report: ReconcileReport,
@@ -3688,6 +3698,16 @@ export class Daemon {
     stallNotice: DaemonStartOptions["stallNotice"],
   ): Promise<StartStall | { error: string }> {
     let stall: StartStall;
+    // The route opens before the notice is written (the canonical route's attempt journal must predate
+    // it). A route that cannot open, or throws, is a diagnostic of this stall and never its outcome.
+    let route: StartStallNoticeRouteState | null = null;
+    if (stallNotice) {
+      try {
+        route = stallNotice.open?.() ?? { started: true };
+      } catch (error) {
+        route = { started: false, reason: safeErrorMessage(error) };
+      }
+    }
     try {
       // A refusal is the next crash-loop failure; a park holds its lock and is not one.
       const crashLoop = phase === "REFUSED" &&
@@ -3699,29 +3719,37 @@ export class Daemon {
     this.#startStall = stall;
     this.writeHealth(report);
     const routing = stall.routing;
-    if (stallNotice && (routing.status === "ROUTED" || routing.status === "ALREADY_ROUTED") &&
-        routing.deliveryStatus === "PENDING") {
+    if (!stallNotice || !("messageId" in routing)) return stall;
+    if (route?.started === false) {
+      stall = { ...stall, routing: { ...routing, undelivered: `route not opened: ${route.reason}` } };
+    } else if (routing.delivery.status === "PENDING") {
+      // One send per start, within the budget. Whatever it answers or throws, the start is refused or
+      // parks exactly as it would have, and a notice still PENDING is offered again by the next start.
       let timer: NodeJS.Timeout | undefined;
+      let undelivered: string | null = null;
       try {
-        await Promise.race([
-          stallNotice([routing.messageId]),
-          new Promise<void>((resolve) => {
-            timer = setTimeout(resolve, START_STALL_NOTICE_BUDGET_MS);
+        const sent = await Promise.race([
+          stallNotice.deliver([routing.messageId]),
+          new Promise<"BUDGET">((resolve) => {
+            timer = setTimeout(() => resolve("BUDGET"), START_STALL_NOTICE_BUDGET_MS);
             timer.unref?.();
           }),
         ]);
-      } catch {
-        // An unsent notice stays PENDING and the next start sends it; delivery is not the stall.
+        if (sent === "BUDGET") undelivered = `no answer within ${START_STALL_NOTICE_BUDGET_MS} ms`;
+        else if (sent && !sent.started) undelivered = `route not opened: ${sent.reason}`;
+      } catch (error) {
+        undelivered = `send failed: ${safeErrorMessage(error)}`;
       } finally {
         if (timer) clearTimeout(timer);
       }
-      const delivered = this.cp.db.get<{ status: string }>(
-        `SELECT status FROM outbox WHERE message_id = ?`, [routing.messageId],
-      );
-      stall = { ...stall, routing: { ...routing, deliveryStatus: delivered?.status ?? routing.deliveryStatus } };
-      this.#startStall = stall;
-      this.writeHealth(report);
+      const message = this.cp.outbox.get(routing.messageId);
+      const delivery = message ? { ...outboxDeliveryReadback(message), attempts: message.attempts } : routing.delivery;
+      // A send that returned is an attempt: the readback, not the send, says whether it delivered.
+      if (!delivery.delivered && undelivered === null) undelivered = "this start's send did not deliver it; its outbox records say why";
+      stall = { ...stall, routing: { ...routing, delivery, ...(undelivered ? { undelivered } : {}) } };
     }
+    this.#startStall = stall;
+    this.writeHealth(report);
     return stall;
   }
 

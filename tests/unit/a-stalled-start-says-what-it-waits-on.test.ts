@@ -4,19 +4,20 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { NotificationKind } from "../../src/ceo/production-gate.ts";
-import { StallSource, routeStallToCeo } from "../../src/ceo/stall-notice.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { deliverStartStallNotices, startConfiguredCeoNotificationRoute } from "../../src/daemon/agentcpd.ts";
+import { startConfiguredCeoNotificationRoute, startStallNoticeRoute } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
-import { classifyStartFinding } from "../../src/daemon/start-stall.ts";
+import { classifyStartFinding, describeStartStall } from "../../src/daemon/start-stall.ts";
 import { TERMINAL_RUN_STATES } from "../../src/domain/run-state.ts";
 import { ExecutionMode, Role, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import type { DaemonNoticeBody, DaemonNoticeSendOutcome } from "../../src/runtime/acp-daemon-notice.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { DIGEST, LIVE, GATEWAY, LSTART, TOKEN, adoptedFixture } from "../helpers/adopted-ceo.ts";
-import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
-import { admitInbound, bindCeo, bindWorker, makeHarness, registerFixtureProject, type Harness } from "../helpers/harness.ts";
+import { cleanupTempDirs, gitSync, makeRepo, tempDir } from "../helpers/fixtures.ts";
+import {
+  admitInbound, bindCeo, bindWorker, fixtureManifest, makeHarness, registerFixtureProject, type Harness,
+} from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -142,7 +143,7 @@ describe("#1189 D1: a start refused on a permanent finding", () => {
       const start = async () => {
         const daemon = new Daemon(h.cp, { stateDir });
         return daemon.start({
-          stallNotice: async (messageIds) => { sent.push({ messageIds, lockHeld: daemon.lock.held() }); },
+          stallNotice: { deliver: async (messageIds) => { sent.push({ messageIds, lockHeld: daemon.lock.held() }); } },
         });
       };
 
@@ -168,9 +169,10 @@ describe("#1189 D1: a start refused on a permanent finding", () => {
         { runId: runs.ran, state: "ACTIVE", executionRan: true, openExecutions: [], finalizationAttempt: null },
         { runId: runs.neverRan, state: "QUEUED", executionRan: false, openExecutions: [], finalizationAttempt: null },
       ]));
-      // The notice's own audit row keeps its evidence: nothing in it is a payload the audit log refuses.
-      expect(h.cp.audit.byKind("CEO_NOTIFICATION").at(-1)!.evidence).toMatchObject({
+      // The notice's own delivery record keeps its evidence: nothing in it is a payload the audit log refuses.
+      expect(h.cp.audit.byKind("OWNERLESS_STALL_ROUTED").at(-1)!.evidence).toMatchObject({
         notification: NotificationKind.CRITICAL_SYSTEM_FAILURE, source: "DAEMON_START_STALL", cause: "PERMANENT",
+        incidentClass: "RESOURCE_STALLED", correlation: "ceo-incident:RESOURCE_STALLED:daemon-start", episode: notice!.payload["stallId"],
       });
       // Sent before the lock was let go: the one moment this process may speak for the deployment.
       expect(sent).toEqual([{ messageIds: [notice!.message_id], lockHeld: true }]);
@@ -178,7 +180,7 @@ describe("#1189 D1: a start refused on a permanent finding", () => {
       const stall = health(stateDir)["startStall"] as Record<string, unknown>;
       expect(stall).toMatchObject({
         phase: "REFUSED", cause: "PERMANENT", blockedRunCount: 2,
-        routing: { status: "ROUTED", messageId: notice!.message_id, deliveryStatus: "PENDING" },
+        routing: { status: "ROUTED", messageId: notice!.message_id, delivery: { status: "PENDING", delivered: false, attempts: 0 } },
       });
       const failure = h.cp.audit.byKind("DAEMON_START_FAILED").at(-1)!;
       expect(failure.evidence).toMatchObject({
@@ -276,7 +278,7 @@ describe("#1189 D1: a start refused only on transient findings", () => {
       const stateDir = tempDir("acp-1189-transient-");
       const sent: Array<readonly string[]> = [];
       const refused = await new Daemon(h.cp, { stateDir }).start({
-        stallNotice: async (messageIds) => { sent.push(messageIds); },
+        stallNotice: { deliver: async (messageIds) => { sent.push(messageIds); } },
       });
       expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
       const stall = health(stateDir)["startStall"] as { cause: string; crashLoop: boolean; findings: Array<{ code: string; cause: string }>; routing: unknown };
@@ -300,7 +302,7 @@ describe("#1189 D1: a start refused only on transient findings", () => {
       const refuse = async () => {
         h.clock.advance(10 * 60_000);
         const refused = await new Daemon(h.cp, { stateDir, crashLoopThreshold: 3 }).start({
-          stallNotice: async (messageIds) => { sent.push(messageIds); },
+          stallNotice: { deliver: async (messageIds) => { sent.push(messageIds); } },
         });
         expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
         return health(stateDir)["startStall"] as Record<string, unknown>;
@@ -401,14 +403,14 @@ describe("#1189 A4: a start parked on a contradicted conversation", () => {
       const sent: Array<{ messageIds: readonly string[]; lockHeld: boolean }> = [];
       const starting = daemon.start({
         bootstrapDoor: async () => { opened.push(1); return { close: async () => {} }; },
-        stallNotice: async (messageIds) => { sent.push({ messageIds, lockHeld: daemon.lock.held() }); },
+        stallNotice: { deliver: async (messageIds) => { sent.push({ messageIds, lockHeld: daemon.lock.held() }); } },
       });
       await vi.waitFor(() => expect(opened).toHaveLength(1));
 
       const [notice, ...others] = stallNotices(h);
       expect(others).toEqual([]);
       expect(notice!.payload).toMatchObject({
-        source: "DAEMON_START_STALL", phase: "PARKED", cause: "PERMANENT",
+        source: "DAEMON_START_STALL", phase: "PARKED", cause: "PERMANENT", startRefused: true, acpActionPath: "NOT_RUNNING",
         findings: [{ code: "CANONICAL_TURN_CONTRADICTED", cause: "PERMANENT", repairOwner: "OWNER", basis: "SECURITY" }],
       });
       expect(sent).toEqual([{ messageIds: [notice!.message_id], lockHeld: true }]);
@@ -435,61 +437,300 @@ describe("#1189 D1: the stall notice's route while no daemon serves", () => {
     ACP_HERMES_PROFILE: "test", ACP_HERMES_HOME: "/opt/test/home",
     ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY: "hermes-runtime:test", ACP_HERMES_GATEWAY_API_KEY: "test-key",
   };
+  const LANE = { ACP_TELEGRAM_EXTERNAL_SECRET: "lane-secret" };
+  const PERMANENT = [{ code: "TRUSTED_GATE_CREDENTIAL_MISSING", severity: "ERROR" as const, scope: "github" }];
   const pinned = (lockHeld: () => boolean) => ({
     authorityHeld: lockHeld, processStartToken: () => TOKEN, processStartedAt: () => LSTART,
     identityReader: () => async () => ({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: GATEWAY, process_started_at: TOKEN }),
   });
+  /** The CEO's Gateway settles every notice it is sent. */
+  const accepting = (sent: string[]) => () => async (body: DaemonNoticeBody): Promise<DaemonNoticeSendOutcome> => {
+    sent.push(body.event_id);
+    return { kind: "RESPONDED", status: 200, body: { event_id: body.event_id, payload_digest: body.payload_digest,
+      receipt: { status: "completed", receipt_id: "receipt", session_id: LIVE, lineage_root_digest: DIGEST } } };
+  };
+  const routedId = (stall: ReturnType<typeof describeStartStall>): string => {
+    if (stall.routing.status !== "ROUTED") throw new Error(`not routed: ${JSON.stringify(stall.routing)}`);
+    return stall.routing.messageId;
+  };
+  const enqueueForCeo = (cp: Harness["cp"], idempotencyKey: string): string => {
+    const ceo = cp.bindings.active(roleKeyFor(Role.CEO))!;
+    const queued = cp.outbox.enqueue({ idempotencyKey, roleKey: "CEO", bindingGeneration: ceo.bindingGeneration,
+      targetSessionId: ceo.sessionId, kind: MessageKind.CEO_NOTIFICATION, payload: { question: idempotencyKey } });
+    if (!queued.allowed) throw new Error(queued.message);
+    return queued.value.messageId;
+  };
+  const legacyMarked = (cp: Harness["cp"]): string[] => cp.audit.byKind("CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN")
+    .map((event) => String(event.evidence["messageId"]));
 
   it("sends only the stalled start's notice over the canonical CEO route, and only while the lock is held", async () => {
     const sent: string[] = [];
-    const noticeSenderFactory = () => async (body: DaemonNoticeBody): Promise<DaemonNoticeSendOutcome> => {
-      sent.push(body.event_id);
-      return { kind: "RESPONDED", status: 200, body: { event_id: body.event_id, payload_digest: body.payload_digest,
-        receipt: { status: "completed", receipt_id: "receipt", session_id: LIVE, lineage_root_digest: DIGEST } } };
-    };
     // A deployment whose canonical route has run before: the attempt journal predates these rows.
     const f = adoptedFixture({
       history: (h) => {
-        expect(startConfiguredCeoNotificationRoute(h.cp, { environment: { ACP_TELEGRAM_EXTERNAL_SECRET: "lane-secret" },
-          hermesConfiguration: HERMES, ports: { ...pinned(() => false), noticeSenderFactory } })).toEqual({ started: true });
+        expect(startConfiguredCeoNotificationRoute(h.cp, { environment: LANE, hermesConfiguration: HERMES,
+          ports: { ...pinned(() => false), noticeSenderFactory: accepting(sent) } })).toEqual({ started: true });
       },
     });
     try {
       const cp = f.h.cp;
-      const ceo = cp.bindings.active(roleKeyFor(Role.CEO))!;
-      const other = cp.outbox.enqueue({ idempotencyKey: "an-ordinary-notification", roleKey: "CEO",
-        bindingGeneration: ceo.bindingGeneration, targetSessionId: ceo.sessionId, kind: MessageKind.CEO_NOTIFICATION,
-        payload: { question: "an ordinary notification" } });
-      if (!other.allowed) throw new Error(other.message);
-      const routed = routeStallToCeo(cp, {
-        source: StallSource.DAEMON_START, stallId: "fixture-stall", runId: null, describe: () => ({ cause: "PERMANENT" }),
-      });
-      if (routed.status !== "ROUTED") throw new Error(`not routed: ${JSON.stringify(routed)}`);
-      const options = { environment: { ACP_TELEGRAM_EXTERNAL_SECRET: "lane-secret" }, hermesConfiguration: HERMES };
-      const touched = (messageId: string) => cp.db.all<{ kind: string }>(
-        `SELECT kind FROM audit_events WHERE json_extract(evidence_json, '$.messageId') = ? ORDER BY event_id`, [messageId],
+      const other = enqueueForCeo(cp, "an-ordinary-notification");
+      let lockHeld = false;
+      const route = startStallNoticeRoute(cp, { environment: LANE, hermesConfiguration: HERMES,
+        ports: { ...pinned(() => lockHeld), noticeSenderFactory: accepting(sent) } });
+      expect(route.open!()).toEqual({ started: true });
+      const messageId = routedId(describeStartStall(cp, PERMANENT, "REFUSED", false));
+      const touched = (id: string) => cp.db.all<{ kind: string }>(
+        `SELECT kind FROM audit_events WHERE json_extract(evidence_json, '$.messageId') = ? ORDER BY event_id`, [id],
       ).map((row) => row.kind);
-      const otherBefore = touched(other.value.messageId);
+      const otherBefore = touched(other);
 
       // The lock already let go: the pin refuses, nothing is sent, and the notice waits for the next start.
-      expect(await deliverStartStallNotices(cp, { ...options, ports: { ...pinned(() => false), noticeSenderFactory } },
-        [routed.messageId])).toEqual({ started: true });
+      expect(await route.deliver([messageId])).toEqual({ started: true });
       expect(sent).toEqual([]);
-      expect(cp.outbox.get(routed.messageId)?.status).toBe("PENDING");
+      expect(cp.outbox.get(messageId)?.status).toBe("PENDING");
 
-      expect(await deliverStartStallNotices(cp, { ...options, ports: { ...pinned(() => true), noticeSenderFactory } },
-        [routed.messageId])).toEqual({ started: true });
+      lockHeld = true;
+      expect(await route.deliver([messageId])).toEqual({ started: true });
       expect(sent).toHaveLength(1);
-      expect(cp.outbox.get(routed.messageId)?.status).toBe("ACKED");
+      expect(cp.outbox.get(messageId)?.status).toBe("ACKED");
       // Everything else queued for the CEO waits for the started daemon's own route, untouched: no
       // attempt and no "route unavailable" record is written against it.
-      expect(cp.outbox.get(other.value.messageId)?.status).toBe("PENDING");
-      expect(touched(other.value.messageId)).toEqual(otherBefore);
+      expect(cp.outbox.get(other)?.status).toBe("PENDING");
+      expect(touched(other)).toEqual(otherBefore);
 
-      expect(await deliverStartStallNotices(cp, { environment: {}, hermesConfiguration: HERMES, ports: pinned(() => true) },
-        [routed.messageId])).toEqual({ started: false, reason: "ACP_TELEGRAM_EXTERNAL_SECRET is not configured" });
+      // Without the lane secret the route does not open, and a route that never opened sends nothing.
+      const unopened = startStallNoticeRoute(cp, { environment: {}, hermesConfiguration: HERMES, ports: pinned(() => true) });
+      expect(unopened.open!()).toEqual({ started: false, reason: "ACP_TELEGRAM_EXTERNAL_SECRET is not configured" });
+      expect(await unopened.deliver([messageId])).toMatchObject({ started: false });
     } finally {
       f.h.cp.close();
+    }
+  });
+
+  it("I2-1: on a deployment whose canonical route never ran, the stall notice is sent once, and a notice queued before the attempt journal stays held", async () => {
+    const sent: string[] = [];
+    const f = adoptedFixture();
+    try {
+      const cp = f.h.cp;
+      // Queued before any attempt journal existed: a pre-journal daemon may have sent it, nobody can say.
+      const legacy = enqueueForCeo(cp, "a-pre-journal-notification");
+      const route = startStallNoticeRoute(cp, { environment: LANE, hermesConfiguration: HERMES,
+        ports: { ...pinned(() => true), noticeSenderFactory: accepting(sent) } });
+      expect(route.open!()).toEqual({ started: true });
+      const messageId = routedId(describeStartStall(cp, PERMANENT, "REFUSED", false));
+
+      expect(await route.deliver([messageId])).toEqual({ started: true });
+      expect(sent).toHaveLength(1);
+      expect(cp.outbox.get(messageId)?.status).toBe("ACKED");
+      // Only the row that predates the journal is held as an unknown outcome; the stall notice never was.
+      expect(legacyMarked(cp)).toEqual([legacy]);
+
+      // The started daemon's full route keeps holding it: it is never sent again by this code.
+      expect(startConfiguredCeoNotificationRoute(cp, { environment: LANE, hermesConfiguration: HERMES,
+        ports: { ...pinned(() => true), noticeSenderFactory: accepting(sent) } })).toEqual({ started: true });
+      await cp.outbox.deliverCeoNotifications();
+      expect(sent).toHaveLength(1);
+      expect(cp.outbox.get(legacy)?.status).toBe("PENDING");
+    } finally {
+      f.h.cp.close();
+    }
+  });
+
+  it("a send the CEO's Gateway did not settle is an attempt, not a delivery", async () => {
+    const f = adoptedFixture();
+    try {
+      const cp = f.h.cp;
+      const route = startStallNoticeRoute(cp, { environment: LANE, hermesConfiguration: HERMES, ports: {
+        ...pinned(() => true),
+        noticeSenderFactory: () => async (): Promise<DaemonNoticeSendOutcome> => ({ kind: "RESPONDED", status: 503, body: {} }),
+      } });
+      expect(route.open!()).toEqual({ started: true });
+      const messageId = routedId(describeStartStall(cp, PERMANENT, "REFUSED", false));
+      await route.deliver([messageId]);
+      expect(cp.outbox.get(messageId)).toMatchObject({ status: "PENDING", attempts: 1 });
+      // What the next refused start reports: tried once, not delivered, not completed.
+      expect(describeStartStall(cp, PERMANENT, "REFUSED", false).routing).toMatchObject({
+        status: "ALREADY_ROUTED", messageId, delivery: { status: "PENDING", delivered: false, completed: false, attempts: 1 },
+      });
+    } finally {
+      f.h.cp.close();
+    }
+  });
+
+  it("I2-1: a refused start opens its notice route before it writes the notice, and sends after", async () => {
+    const h = makeHarness();
+    try {
+      bindCeo(h);
+      const order: string[] = [];
+      const refused = await new Daemon(h.cp, { stateDir: tempDir("acp-1189-route-order-") }).start({
+        stallNotice: {
+          open: () => { order.push(`open with ${stallNotices(h).length} notice(s)`); return { started: true }; },
+          deliver: async () => { order.push(`deliver with ${stallNotices(h).length} notice(s)`); },
+        },
+      });
+      expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+      expect(order).toEqual(["open with 0 notice(s)", "deliver with 1 notice(s)"]);
+    } finally {
+      h.cp.close();
+    }
+  });
+});
+
+describe("#1189 D1, CEO ruling 4: the refused start's notice", () => {
+  it("says the start is refused and that ACP's action path is not running", async () => {
+    const h = makeHarness();
+    try {
+      bindCeo(h);
+      expect(await new Daemon(h.cp, { stateDir: tempDir("acp-1189-says-") }).start())
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+      const [notice] = stallNotices(h);
+      expect(notice!.payload).toMatchObject({ phase: "REFUSED", startRefused: true, acpActionPath: "NOT_RUNNING" });
+      expect(notice!.payload["blocker"]).toEqual(expect.stringContaining("the daemon start is refused and ACP's action path is not running"));
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  it("a send that throws, or a route that cannot open, never lets the start proceed or retry: one send per start, the notice stays undelivered and says why", async () => {
+    const h = makeHarness();
+    try {
+      bindCeo(h);
+      const stateDir = tempDir("acp-1189-send-fails-");
+      let sends = 0;
+      const start = (stallNotice: NonNullable<Parameters<Daemon["start"]>[0]>["stallNotice"]) => {
+        const daemon = new Daemon(h.cp, { stateDir });
+        return daemon.start({ stallNotice }).then((result) => ({ result, lockHeld: daemon.lock.held() }));
+      };
+
+      const first = await start({ deliver: async () => { sends += 1; throw new Error("gateway unreachable"); } });
+      expect(first).toEqual({ result: expect.objectContaining({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED }), lockHeld: false });
+      expect(sends).toBe(1);
+      const [notice] = stallNotices(h);
+      expect(notice!.status).toBe("PENDING");
+      expect(health(stateDir)["startStall"]).toMatchObject({ routing: {
+        status: "ROUTED", messageId: notice!.message_id, delivery: { delivered: false, completed: false },
+        undelivered: "send failed: gateway unreachable",
+      } });
+
+      h.clock.advance(10 * 60_000);
+      const second = await start({ open: () => { throw new Error("pin unreadable"); }, deliver: async () => { sends += 1; } });
+      expect(second).toEqual({ result: expect.objectContaining({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED }), lockHeld: false });
+      expect(sends).toBe(1);
+      expect(health(stateDir)["startStall"]).toMatchObject({ routing: {
+        status: "ALREADY_ROUTED", messageId: notice!.message_id, delivery: { delivered: false }, undelivered: "route not opened: pin unreadable",
+      } });
+      expect(stallNotices(h)).toHaveLength(1);
+      expect(h.cp.audit.byKind("DAEMON_STARTED")).toHaveLength(0);
+    } finally {
+      h.cp.close();
+    }
+  });
+});
+
+describe("#1189 D1, I2-2: the start stall is one CEO incident, re-delivered to a CEO that replaced the one it was sent to", () => {
+  it("delivered and ACKed, the CEO replaced: the unresolved stall reaches the new CEO once, and later refusals add nothing", async () => {
+    const h = makeHarness();
+    try {
+      bindCeo(h);
+      const stateDir = tempDir("acp-1189-redeliver-");
+      const refuse = async () => {
+        h.clock.advance(10 * 60_000);
+        expect(await new Daemon(h.cp, { stateDir }).start()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+        return health(stateDir)["startStall"] as Record<string, unknown>;
+      };
+      const targets = () => h.cp.db.all<{ message_id: string; target_session_id: string }>(
+        `SELECT message_id, target_session_id FROM outbox WHERE kind = 'CEO_NOTIFICATION' ORDER BY created_at, rowid`,
+      );
+
+      await refuse();
+      const [first] = stallNotices(h);
+      const ceo = h.cp.bindings.active(roleKeyFor(Role.CEO))!;
+      expect(h.cp.outbox.acknowledge(first!.message_id, ceo.sessionId, ceo.bindingGeneration).allowed).toBe(true);
+      await refuse();
+      // The CEO that ACKed it is not told again.
+      expect(stallNotices(h)).toHaveLength(1);
+
+      expect(h.cp.bindings.revoke(roleKeyFor(Role.CEO), "CEO runtime lost").allowed).toBe(true);
+      const replacement = bindCeo(h);
+      const third = await refuse();
+      const notices = stallNotices(h);
+      expect(notices).toHaveLength(2);
+      const second = notices.find((notice) => notice.message_id !== first!.message_id)!;
+      expect(second.payload).toMatchObject({
+        redelivery: true, source: "DAEMON_START_STALL", stallId: first!.payload["stallId"],
+        correlation: first!.payload["correlation"], episode: first!.payload["episode"],
+      });
+      expect(targets().find((row) => row.message_id === second.message_id)?.target_session_id).toBe(replacement);
+      expect(third).toMatchObject({ routing: { status: "ROUTED", messageId: second.message_id, redelivery: true } });
+
+      await refuse();
+      expect(stallNotices(h)).toHaveLength(2);
+    } finally {
+      h.cp.close();
+    }
+  });
+});
+
+describe("#1189 D1, CEO ruling 3: one crash-loop notice per failure episode", () => {
+  it("a later refusal of the same crash loop on other transient findings adds none, and a crash loop after a successful start is told again", async () => {
+    const h = makeHarness();
+    try {
+      bindCeo(h);
+      h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+      await registerFixtureProject(h);
+      // A second project on its own checkout, healthy for now.
+      const secondRepo = makeRepo();
+      const manifest = fixtureManifest("second-project");
+      const project = h.cp.projects.register({ projectId: "second-project", name: "second", manifest,
+        authorization: h.cp.manifestAuthorizationForTests(manifest) });
+      if (!project.allowed) throw new Error(project.message);
+      const repository = await h.cp.repositories.register({ checkoutPath: secondRepo, projectId: "second-project",
+        repositoryRole: "primary", activeManifestDigest: project.value.activeManifestDigest, identity: "github:acme/second" });
+      if (!repository.allowed) throw new Error(repository.message);
+      const setBare = (repo: string, bare: boolean) => gitSync(repo, ["config", "core.bare", String(bare)]);
+
+      const stateDir = tempDir("acp-1189-crash-episode-");
+      const refuse = async () => {
+        h.clock.advance(10 * 60_000);
+        expect(await new Daemon(h.cp, { stateDir, crashLoopThreshold: 3 }).start())
+          .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+        return health(stateDir)["startStall"] as { cause: string; crashLoop: boolean; stallId: string; findings: Array<{ scope: string }>; routing: { status: string } };
+      };
+
+      setBare(h.repoPath, true);
+      await refuse();
+      await refuse();
+      const third = await refuse();
+      expect(third).toMatchObject({ cause: "TRANSIENT", crashLoop: true, routing: { status: "ROUTED" } });
+      expect(stallNotices(h)).toHaveLength(1);
+
+      // Same failure episode, different transient findings: the crash loop was told, and is not told again.
+      setBare(secondRepo, true);
+      const fourth = await refuse();
+      expect(fourth.findings.length).toBeGreaterThan(third.findings.length);
+      expect(fourth).toMatchObject({ crashLoop: true, stallId: third.stallId, routing: { status: "ALREADY_ROUTED" } });
+      expect(stallNotices(h)).toHaveLength(1);
+
+      // Recovery: a start succeeds, which ends the failure episode.
+      setBare(h.repoPath, false);
+      setBare(secondRepo, false);
+      h.clock.advance(10 * 60_000);
+      const healthy = new Daemon(h.cp, { stateDir, crashLoopThreshold: 3 });
+      expect((await healthy.start()).allowed).toBe(true);
+      await healthy.stop();
+
+      // A new failure after recovery is told again, once its refusals reach the threshold.
+      setBare(h.repoPath, true);
+      await refuse();
+      await refuse();
+      expect(stallNotices(h)).toHaveLength(1);
+      const again = await refuse();
+      expect(again).toMatchObject({ crashLoop: true, routing: { status: "ROUTED" } });
+      expect(again.stallId).not.toBe(third.stallId);
+      expect(stallNotices(h)).toHaveLength(2);
+    } finally {
+      h.cp.close();
     }
   });
 });

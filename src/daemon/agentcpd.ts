@@ -168,7 +168,7 @@ import { digestOf, isDigest, sha256 } from "../core/digest.ts";
 import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
 import type { HolderIdentity } from "../outbox/outbox.ts";
 import { respond, type AuthenticatedMcpPeer, type McpPeerAuthenticator } from "../mcp/shared.ts";
-import type { AuthenticatedOperatorPeer, Daemon } from "./daemon.ts";
+import type { AuthenticatedOperatorPeer, Daemon, StartStallNoticeRoute } from "./daemon.ts";
 import { executeCanonicalSelfClaimOperator } from "./canonical-self-claim-operator.ts";
 import {
   startAdoptedCeoToolListener,
@@ -2944,30 +2944,45 @@ export const startConfiguredCeoNotificationRoute = (
 };
 
 /**
- * #1189 D1 — the stall notice of a start that refused or parked, sent before that start lets its lock
- * go. The canonical notice route needs no daemon socket, only the pinned Hermes CEO target, the lane
- * secret and this daemon's lock (the pin re-checks `authorityHeld` before each send), so it is the one
- * existing route that reaches the CEO while no daemon is serving. It is attached here restricted to the
- * named notices: every other queued CEO notification is not touched and stays PENDING for the started
- * daemon's own route, as it was before. A refused start exits right after; a parked one that promotes
- * attaches the full route at the usual place, which replaces this one.
+ * #1189 D1 — the route a start that refused or parked sends its stall notice over, before that start
+ * lets its lock go. The canonical notice route needs no daemon socket, only the pinned Hermes CEO
+ * target, the lane secret and this daemon's lock (the pin re-checks `authorityHeld` before each send),
+ * so it is the one existing route that reaches the CEO while no daemon is serving.
+ *
+ * `open` runs before the start writes its notice and opens the route's attempt journal: a Hermes notice
+ * still PENDING when the journal opens is held as one a pre-journal daemon may have sent, and the stall
+ * notice written after it is not one of those. `deliver` attaches the transport restricted to the named
+ * notices: every other queued CEO notification is not touched and stays PENDING for the started daemon's
+ * own route, as it was before. A refused start exits right after; a parked one that promotes attaches the
+ * full route at the usual place, which replaces this one.
  */
-export const deliverStartStallNotices = async (
+export const startStallNoticeRoute = (
   cp: ControlPlane,
   options: {
     environment: Readonly<Record<string, string | undefined>>;
     hermesConfiguration: Readonly<Record<string, string | undefined>>;
     ports?: HermesCeoPinPorts & { noticeSenderFactory?: typeof createHermesGatewayDaemonNoticeSender };
   },
-  messageIds: readonly string[],
-): Promise<{ started: true } | { started: false; reason: string }> => {
-  const target = createConfiguredHermesGatewayDaemonNoticeTarget(cp, options.hermesConfiguration, options.ports ?? {});
-  if (!target) return { started: false, reason: "no Hermes adoption configuration" };
-  const laneSecret = options.environment["ACP_TELEGRAM_EXTERNAL_SECRET"]?.trim();
-  if (!laneSecret) return { started: false, reason: "ACP_TELEGRAM_EXTERNAL_SECRET is not configured" };
-  cp.outbox.attachCeoNotificationDelivery(createCeoNotificationSender(target, laneSecret), messageIds);
-  await cp.outbox.deliverCeoNotifications();
-  return { started: true };
+): StartStallNoticeRoute => {
+  let send: ReturnType<typeof createCeoNotificationSender> | null = null;
+  return {
+    open: () => {
+      const target = createConfiguredHermesGatewayDaemonNoticeTarget(cp, options.hermesConfiguration, options.ports ?? {});
+      if (!target) return { started: false, reason: "no Hermes adoption configuration" };
+      const laneSecret = options.environment["ACP_TELEGRAM_EXTERNAL_SECRET"]?.trim();
+      if (!laneSecret) return { started: false, reason: "ACP_TELEGRAM_EXTERNAL_SECRET is not configured" };
+      cp.outbox.startCeoNotificationAttemptJournal();
+      send = createCeoNotificationSender(target, laneSecret);
+      return { started: true };
+    },
+    // Never opened here: a journal opened after the notice was written would hold that notice back.
+    deliver: async (messageIds) => {
+      if (send === null) return { started: false, reason: "the route was not opened before the notice was written" };
+      cp.outbox.attachCeoNotificationDelivery(send, messageIds);
+      await cp.outbox.deliverCeoNotifications();
+      return { started: true };
+    },
+  };
 };
 
 /** The daemon's notice delivery loop, as the composition holds it. */
@@ -5580,11 +5595,11 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         { token: operatorToken, peerId: `cli:${operatorActor}`, actor: operatorActor },
         { mcpToken },
       ),
-    stallNotice: (messageIds) => deliverStartStallNotices(cp, {
+    stallNotice: startStallNoticeRoute(cp, {
       environment: process.env,
       hermesConfiguration: hermesAdoptionConfiguration,
       ports: { authorityHeld: () => daemon.lock.held() },
-    }, messageIds),
+    }),
   });
   if (!started.allowed) {
     process.stderr.write(`${JSON.stringify(started, null, 2)}\n`);

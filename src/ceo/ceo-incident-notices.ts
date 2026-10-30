@@ -101,6 +101,11 @@ export interface Incident {
   /** The audit event the incident opened with; a CEO_DECISION on the run after it resolves the incident. */
   openedEventId?: number | null;
   payload: Record<string, unknown>;
+  /**
+   * Facts that cost something to read (a process-table scan), read only when a notice is enqueued and never
+   * on a pass that delivers nothing; merged over `payload` for that notice and its delivery record.
+   */
+  describe?: () => Record<string, unknown>;
   /** The delivery record's own evidence; by default the payload without `whyItMatters`. */
   record?: Record<string, unknown>;
 }
@@ -337,6 +342,7 @@ export const deliverIncident = (ports: NoticePorts, incident: Incident): Decisio
       if (toCurrent || !rule.redeliverToNewCeo) return covered(status.state, (toCurrent ?? status.deliveries.at(-1))?.messageId ?? null);
     }
     const key = deliveryKey(incident, ceo.bindingGeneration);
+    const payload = incident.describe ? { ...incident.payload, ...incident.describe() } : incident.payload;
     let refusal: { reasonCode: ReasonCode; outcome: "REFUSED" | "UNKNOWN"; error?: string } | null = null;
     try {
       const enqueued = ports.outbox.enqueue({
@@ -349,7 +355,7 @@ export const deliverIncident = (ports: NoticePorts, incident: Incident): Decisio
         payload: {
           notification: rule.notification,
           runId: incident.runId,
-          ...incident.payload,
+          ...payload,
           incidentClass: incident.cls,
           correlation: status.correlation,
           episode: incident.episode,
@@ -381,7 +387,7 @@ export const deliverIncident = (ports: NoticePorts, incident: Incident): Decisio
       redelivery,
     };
     const delivery = { kind: rule.record, runId: incident.runId, roleKey: ceo.roleKey, sessionId: ceo.sessionId };
-    const recorded = ports.audit.record({ ...delivery, evidence: { ...identity, ...(incident.record ?? withoutWhy(incident.payload)) } });
+    const recorded = ports.audit.record({ ...delivery, evidence: { ...identity, ...(incident.record ?? withoutWhy(payload)) } });
     if (!recorded.allowed) {
       const kept = ports.audit.record({ ...delivery, evidence: identity });
       if (!kept.allowed) return kept as unknown as Decision<NoticeDelivery>;

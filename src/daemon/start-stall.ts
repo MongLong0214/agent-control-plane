@@ -1,7 +1,9 @@
-import { StallSource, routeStallToCeo, type StallRouter, type StallRouting } from "../ceo/stall-notice.ts";
+import { IncidentClass, type NoticePorts, deliverIncident } from "../ceo/ceo-incident-notices.ts";
 import { digestOf } from "../core/digest.ts";
+import type { ReasonCode } from "../core/reason-codes.ts";
 import type { Db } from "../db/database.ts";
 import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
+import { outboxDeliveryReadback } from "../outbox/outbox.ts";
 import type { BlockingFinding } from "./daemon.ts";
 
 /**
@@ -18,12 +20,15 @@ import type { BlockingFinding } from "./daemon.ts";
  * - TRANSIENT: a later start may find it gone without anyone acting — a probe that did not complete,
  *   a worker process that was still running, capacity or coverage that returns.
  *
- * A stall with any PERMANENT finding is routed to the CEO as CRITICAL_SYSTEM_FAILURE, once per stall
- * (`routeStallToCeo`). A TRANSIENT-only stall is left to the backoff that retries it until the refusal
- * that reaches the daemon's existing crash-loop threshold: then the backoff has shown it does not clear
- * it, and it is routed the same way, once. Nothing here moves a run: a refused or parked start
- * completes, fails and dispatches nothing, and the blocked runs are reported with whether any execution
- * of theirs was ever started, so whoever resumes them knows which may have effects to check first.
+ * A stall with any PERMANENT finding is routed to the CEO as CRITICAL_SYSTEM_FAILURE. A TRANSIENT-only
+ * stall is left to the backoff that retries it until the refusal that reaches the daemon's existing
+ * crash-loop threshold: then the backoff has shown it does not clear it, and it is routed the same way.
+ * Either is one incident of `ceo-incident-notices.ts` (RESOURCE_STALLED, subject `daemon-start`, episode
+ * the stall's id), which owns its dedup and its re-delivery to a CEO that replaced the one it was sent to.
+ * The notice says the start is refused and that ACP's action path is not running. Nothing here moves a
+ * run: a refused or parked start completes, fails and dispatches nothing, and the blocked runs are
+ * reported with whether any execution of theirs was ever started, so whoever resumes them knows which
+ * may have effects to check first.
  */
 export type StartStallCause = "PERMANENT" | "TRANSIENT";
 
@@ -110,8 +115,29 @@ export interface StartStall {
   blockedRunCount: number;
   /** At most `MAX_REPORTED_RUNS`, oldest first. */
   blockedRuns: StartStallRun[];
-  routing: StallRouting | { status: "NOT_ROUTED_TRANSIENT" };
+  routing: StartStallRouting;
 }
+
+/**
+ * Where the stall's notice stands. `delivery` is the outbox readback (`outboxDeliveryReadback`): a send
+ * attempt is not delivery, and only an ACK is completion. `undelivered` says why this start's send did not
+ * deliver it; the notice stays PENDING and the next start offers it again.
+ */
+export type StartStallRouting =
+  | { status: "NOT_ROUTED_TRANSIENT" }
+  | { status: "NOT_ROUTED"; reasonCode: ReasonCode }
+  | {
+      status: "ROUTED" | "ALREADY_ROUTED";
+      messageId: string;
+      redelivery: boolean;
+      delivery: ReturnType<typeof outboxDeliveryReadback> & { attempts: number };
+      undelivered?: string;
+    };
+
+/** The subject every start-stall incident is about: the daemon's start, not any run. */
+export const START_STALL_SUBJECT = "daemon-start";
+/** The source a start-stall notice names, for its reader. */
+export const START_STALL_SOURCE = "DAEMON_START_STALL";
 
 const MAX_REPORTED_RUNS = 50;
 
@@ -141,14 +167,19 @@ const blockedRunsOf = (db: Db): StartStallRun[] => {
 };
 
 /**
- * One stall is one set of routed findings since the daemon last started: the PERMANENT ones, or for a
- * TRANSIENT-only stall all of them. A later refusal on the same set is the same stall and routes nothing
- * new; a successful start ends it, so the same finding arising after that is a new stall and is told again.
+ * The episode a stall is told in, bounded by the daemon's last successful start: a successful start ends
+ * it, so the same failure arising after that is a new episode and is told again.
+ * - PERMANENT: one episode per set of PERMANENT findings. A later refusal on the same set is the same stall;
+ *   a different set needs a different remedy and is told.
+ * - TRANSIENT at the crash-loop threshold: one episode per failure episode, whatever transient findings each
+ *   refusal of it meets. The crash loop is what is told, and it lasts until a start succeeds.
+ * - TRANSIENT below it: routed to no one, so only health.json carries its id.
  */
-const stallIdOf = (db: Db, findings: readonly ClassifiedStartFinding[], cause: StartStallCause): string => {
+const stallIdOf = (db: Db, findings: readonly ClassifiedStartFinding[], cause: StartStallCause, crashLoop: boolean): string => {
   const lastStart = db.get<{ eventId: number | null }>(
     `SELECT MAX(event_id) AS eventId FROM audit_events WHERE kind = 'DAEMON_STARTED'`,
   )?.eventId ?? null;
+  if (crashLoop) return digestOf({ since: lastStart, cause, crashLoop: true });
   return digestOf({
     since: lastStart,
     cause,
@@ -159,17 +190,29 @@ const stallIdOf = (db: Db, findings: readonly ClassifiedStartFinding[], cause: S
   });
 };
 
+/** What the start-stall incident's delivery answered, with the readback of the notice it names. */
+const routingOf = (ports: NoticePorts, delivered: ReturnType<typeof deliverIncident>): StartStallRouting => {
+  const message = delivered.allowed && delivered.value.messageId !== null ? ports.outbox.get(delivered.value.messageId) : null;
+  if (!delivered.allowed || !message) return { status: "NOT_ROUTED", reasonCode: delivered.reasonCode };
+  return {
+    status: delivered.value.created ? "ROUTED" : "ALREADY_ROUTED",
+    messageId: message.messageId,
+    redelivery: delivered.value.redelivery,
+    delivery: { ...outboxDeliveryReadback(message), attempts: message.attempts },
+  };
+};
+
 /**
  * Classifies, records and — for a PERMANENT stall, or a TRANSIENT one that reached the crash-loop
  * threshold — routes what a start that cannot resume dispatch waits on.
  */
 export const describeStartStall = (
-  router: StallRouter,
+  ports: NoticePorts,
   blockingFindings: readonly BlockingFinding[],
   phase: StartStall["phase"],
   crashLoop: boolean,
 ): StartStall => {
-  const { db } = router;
+  const { db } = ports;
   const findings = blockingFindings
     .map(classifyStartFinding)
     .sort((a, b) => (a.code === b.code ? a.scope.localeCompare(b.scope) : a.code.localeCompare(b.code)));
@@ -177,25 +220,33 @@ export const describeStartStall = (
   const crashLooping = cause === "TRANSIENT" && crashLoop;
   const runs = blockedRunsOf(db);
   const blockedRuns = runs.slice(0, MAX_REPORTED_RUNS);
-  const stallId = stallIdOf(db, findings, cause);
+  const stallId = stallIdOf(db, findings, cause, crashLooping);
   const routing = cause === "TRANSIENT" && !crashLooping
     ? { status: "NOT_ROUTED_TRANSIENT" as const }
-    : routeStallToCeo(router, {
-        source: StallSource.DAEMON_START,
-        stallId,
+    : routingOf(ports, deliverIncident(ports, {
+        cls: IncidentClass.RESOURCE_STALLED,
+        subject: START_STALL_SUBJECT,
         runId: null,
-        describe: () => ({
+        episode: stallId,
+        payload: {
+          source: START_STALL_SOURCE,
+          stallId,
           phase,
           cause,
           crashLoop: crashLooping,
-          blocker: crashLooping
-            ? "the daemon refuses to resume dispatch: its startup doctor keeps blocking on findings the restart backoff has not cleared"
-            : "the daemon refuses to resume dispatch: its startup doctor blocks on findings no restart clears",
+          startRefused: true,
+          acpActionPath: "NOT_RUNNING",
+          blocker: phase === "PARKED"
+            ? "the daemon start is refused: it is parked on its startup doctor, dispatch is not resumed and ACP's action path is not running; only the operator bootstrap door is open"
+            : crashLooping
+              ? "the daemon start is refused and ACP's action path is not running: its startup doctor keeps blocking on findings the restart backoff has not cleared"
+              : "the daemon start is refused and ACP's action path is not running: its startup doctor blocks on findings no restart clears",
           findings,
           blockedRunCount: runs.length,
           blockedRuns,
           runEffect: "no run was completed, failed or dispatched by this start; a run whose execution ran may have effects to check before it runs again",
-        }),
-      });
+          whyItMatters: "until a start succeeds no run is dispatched and no ACP tool acts on the CEO's behalf; the findings name who can clear them",
+        },
+      }));
   return { phase, cause, crashLoop: crashLooping, stallId, findings, blockedRunCount: runs.length, blockedRuns, routing };
 };
