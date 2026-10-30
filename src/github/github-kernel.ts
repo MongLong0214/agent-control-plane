@@ -31,6 +31,7 @@ import {
   type BranchPublishLimits,
   DEFAULT_BRANCH_PUBLISH_LIMITS,
   collectBranchObjects,
+  gitBytes,
 } from "../git/branch-objects.ts";
 import { scanPublication, workflowChanges } from "./branch-publish.ts";
 
@@ -319,6 +320,9 @@ interface PreparedPrIntent {
   sourceHead: string;
   declaredParent: string | null;
 }
+
+/** Where CommitLore keeps a commit's records beside its message; a merge does not move it (#1269). */
+const NOTES_REF = "refs/notes/commitlore";
 
 interface GitHubWriteTarget {
   /** The concrete branch whose claim fences this remote write. */
@@ -2353,6 +2357,7 @@ export class GitHubKernel {
     mergeRepositoryId: string,
     idempotencyKey: string,
     requestDigest: string,
+    carryNotes = false,
   ): Promise<Decision<{ mergeCommitSha: string; replayed: boolean }> | null> {
     if (this.inFlightReservations.has(idempotencyKey)) {
       return deny(ReasonCode.RESOURCE_COLLISION, "merge operation is in flight", { idempotencyKey });
@@ -2484,6 +2489,15 @@ export class GitHubKernel {
       }
       return proof as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
+    // #1269 — the notes are written only on the merge path; a settle reads them and never writes.
+    const notesTarget = carryNotes ? this.writeTarget(input.runId, input.repositoryIdentity, prepared.value.head) : null;
+    const notes = notesTarget && !notesTarget.allowed
+      ? notesTarget
+      : await this.carryCandidateNotes(input, slug.value.owner, slug.value.repo, notesTarget?.value ?? null);
+    if (!notes.allowed) {
+      this.recordPendingMergeProofFailure(input, mergeRepositoryId, idempotencyKey, observedMergeCommitSha, notes);
+      return notes as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+    }
     const finalized = this.finalizeReservedReceipt({
       idempotencyKey,
       requestDigest,
@@ -2537,7 +2551,7 @@ export class GitHubKernel {
         });
       }
       if (!existing.verified) {
-        const settled = await this.reconcilePendingMerge(input, mergeRepositoryId, idempotencyKey, requestDigest);
+        const settled = await this.reconcilePendingMerge(input, mergeRepositoryId, idempotencyKey, requestDigest, true);
         // Proven unmerged after reclaiming the stale crash-era reservation: the merge is evaluated and sent again.
         return settled ?? this.mergeExecute(input);
       }
@@ -2826,6 +2840,11 @@ export class GitHubKernel {
       }
       return proof as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
+    const notes = await this.carryCandidateNotes(input, owner, repo, target.value);
+    if (!notes.allowed) {
+      this.recordPendingMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, notes);
+      return notes as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+    }
 
     const finalized = this.finalizeReservedReceipt({
       idempotencyKey,
@@ -2852,6 +2871,138 @@ export class GitHubKernel {
     // merge commit has passed the pinned post-merge checks.
     this.runs.setRepositoryMergeState(input.runId, mergeRepositoryId, "PENDING");
     return allow(ReasonCode.OK, { mergeCommitSha, replayed: false });
+  }
+
+  /**
+   * #1269 — the candidate's CommitLore notes, on the remote. A merge commit keeps the branch's commits, but
+   * their notes travel only on `refs/notes/commitlore`, which no merge moves. Every note the registered
+   * checkout holds for a commit of base..head must be on the remote ref as the same blob. With a `target`,
+   * the missing ones are written through the Git Data API (their blobs, a tree on the remote notes tree, a
+   * commit on the remote notes commit, then a fast-forward of the ref); without one nothing is written. The
+   * ref is then read back. A remote note that differs is never overwritten, and every failure is a refusal
+   * the caller records as a pending proof failure.
+   */
+  private async carryCandidateNotes(
+    input: MergeInput,
+    owner: string,
+    repo: string,
+    target: GitHubWriteTarget | null,
+  ): Promise<Decision<{ notes: number }>> {
+    const refused = (message: string, evidence: Record<string, unknown> = {}) =>
+      deny<{ notes: number }>(ReasonCode.EVIDENCE_MISSING, message, { phase: "postflight-notes", ref: NOTES_REF, ...evidence });
+    const checkout = this.repositories.byIdentity(input.repositoryIdentity)?.checkoutPath;
+    if (!checkout) return refused("the candidate's checkout is not registered, so its notes cannot be read");
+    const text = async (args: readonly string[]) => (await gitBytes(checkout, args)).stdout.toString("utf8");
+    const owed: Array<{ object: string; blob: string }> = [];
+    try {
+      if ((await text(["for-each-ref", "--format=%(objectname)", NOTES_REF])).trim() !== "") {
+        const listed = new Map((await text(["notes", `--ref=${NOTES_REF}`, "list"])).split("\n").filter(Boolean)
+          .map((line) => [line.split(" ")[1], line.split(" ")[0]] as const));
+        for (const object of (await text(["rev-list", `${input.expectedBaseSha}..${input.exactHeadSha}`])).split("\n").filter(Boolean)) {
+          const blob = listed.get(object);
+          if (blob) owed.push({ object, blob });
+        }
+      }
+    } catch {
+      return refused("the candidate's CommitLore notes could not be read from its checkout");
+    }
+    if (owed.length === 0) return allow(ReasonCode.OK, { notes: 0 });
+
+    const before = await this.remoteNotes(owner, repo);
+    if (!before.allowed) return before as Decision<{ notes: number }>;
+    const differing = owed.filter((note) => before.value.notes.has(note.object) && before.value.notes.get(note.object) !== note.blob);
+    if (differing.length > 0) {
+      return refused("the remote carries a different note for a candidate commit, which is not overwritten", {
+        objects: differing.map((note) => note.object),
+      });
+    }
+    const missing = owed.filter((note) => !before.value.notes.has(note.object));
+    if (missing.length > 0) {
+      if (!target) return refused("the remote does not carry the candidate's notes", { objects: missing.map((note) => note.object) });
+      let contents: Buffer[];
+      try {
+        contents = await Promise.all(missing.map(async (note) => (await gitBytes(checkout, ["cat-file", "blob", note.blob])).stdout));
+      } catch {
+        return refused("a candidate note could not be read from its checkout");
+      }
+      // The remote's own fan-out, so a note lands where git looks for it.
+      const depth = (before.value.paths[0]?.split("/").length ?? 1) - 1;
+      const pathOf = (object: string) =>
+        [...Array.from({ length: depth }, (_, level) => object.slice(level * 2, level * 2 + 2)), object.slice(depth * 2)].join("/");
+      const root = `/repos/${owner}/${repo}/git`;
+      const written = await this.mediate(
+        WriteOperation.PROGRAMMATIC_MERGE,
+        input.runId,
+        input.repositoryIdentity,
+        target,
+        input,
+        async () => {
+          for (const [index, note] of missing.entries()) {
+            const blob = await this.api().request<{ sha?: unknown }>("POST", `${root}/blobs`, {
+              content: contents[index]!.toString("base64"),
+              encoding: "base64",
+            });
+            if (blob?.sha !== note.blob) throw new Error("GitHub answered another blob id for a note");
+          }
+          const tree = await this.api().request<{ sha?: unknown }>("POST", `${root}/trees`, {
+            ...(before.value.tree ? { base_tree: before.value.tree } : {}),
+            tree: missing.map((note) => ({ path: pathOf(note.object), mode: "100644", type: "blob", sha: note.blob })),
+          });
+          const commit = await this.api().request<{ sha?: unknown }>("POST", `${root}/commits`, {
+            message: "Notes added by the control plane",
+            tree: tree?.sha,
+            parents: before.value.commit ? [before.value.commit] : [],
+          });
+          if (typeof commit?.sha !== "string") throw new Error("GitHub answered no notes commit");
+          await (before.value.commit
+            ? this.api().request("PATCH", `${root}/refs/notes/commitlore`, { sha: commit.sha, force: false })
+            : this.api().request("POST", `${root}/refs`, { ref: NOTES_REF, sha: commit.sha }));
+        },
+      );
+      if (!written.allowed) {
+        return refused("the candidate's notes could not be written to the remote", { cause: written.reasonCode });
+      }
+    }
+
+    const after = await this.remoteNotes(owner, repo);
+    if (!after.allowed) return after as Decision<{ notes: number }>;
+    const absent = owed.filter((note) => after.value.notes.get(note.object) !== note.blob);
+    if (absent.length > 0) {
+      return refused("reading the remote notes back does not find every candidate note", { objects: absent.map((note) => note.object) });
+    }
+    return allow(ReasonCode.OK, { notes: owed.length });
+  }
+
+  /** The remote `refs/notes/commitlore`: its commit, tree and notes (object -> blob), or none. */
+  private async remoteNotes(owner: string, repo: string): Promise<Decision<{
+    commit: string | null;
+    tree: string | null;
+    paths: string[];
+    notes: Map<string, string>;
+  }>> {
+    const unreadable = (message: string) =>
+      deny<{ commit: string | null; tree: string | null; paths: string[]; notes: Map<string, string> }>(
+        ReasonCode.EVIDENCE_MISSING, message, { phase: "postflight-notes", ref: NOTES_REF });
+    const ref = await this.readBranchRef(`/repos/${owner}/${repo}/git/ref/notes/commitlore`, NOTES_REF);
+    if (ref.kind === "missing") return allow(ReasonCode.OK, { commit: null, tree: null, paths: [], notes: new Map() });
+    if (ref.kind !== "at") return unreadable("the remote notes ref could not be read");
+    try {
+      const commit = await this.api().request<{ tree?: { sha?: unknown } }>("GET", `/repos/${owner}/${repo}/git/commits/${ref.sha}`);
+      const tree = commit?.tree?.sha;
+      if (typeof tree !== "string") return unreadable("the remote notes commit names no tree");
+      const listed = await this.api().request<{ tree?: unknown; truncated?: unknown }>(
+        "GET",
+        `/repos/${owner}/${repo}/git/trees/${tree}?recursive=1`,
+      );
+      if (!Array.isArray(listed?.tree) || listed.truncated !== false) return unreadable("the remote notes tree did not come back whole");
+      const blobs = (listed.tree as Array<{ path?: unknown; type?: unknown; sha?: unknown }>)
+        .filter((entry) => entry?.type === "blob" && typeof entry.path === "string" && typeof entry.sha === "string");
+      const paths = blobs.map((entry) => entry.path as string);
+      const notes = new Map(blobs.map((entry) => [(entry.path as string).replaceAll("/", ""), entry.sha as string]));
+      return allow(ReasonCode.OK, { commit: ref.sha, tree, paths, notes });
+    } catch {
+      return unreadable("the remote notes could not be read");
+    }
   }
 
   /**

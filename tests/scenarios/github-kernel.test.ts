@@ -2419,6 +2419,42 @@ describe("merge target proof (#350)", () => {
     expect(fixture.github.mergeCount).toBe(1);
     expectPendingMergeProof(fixture);
   });
+
+  /** A record kept only as a CommitLore note on the candidate head, the way a capture stores one. */
+  const noteOnCandidate = (fixture: Fixture): string => {
+    gitSync(fixture.harness.repoPath, ["notes", "--ref=commitlore", "add", "-m", "Limit: a record kept only in a note", fixture.head]);
+    return gitSync(fixture.harness.repoPath, ["notes", "--ref=commitlore", "list", fixture.head]);
+  };
+
+  it("#1269: a merge is proven only once the candidate's CommitLore notes are on the remote notes ref", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const blob = noteOnCandidate(fixture);
+    const merged = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(merged.reasonCode, merged.allowed ? "" : merged.message).toBe(ReasonCode.OK);
+    expect(fixture.github.remoteNoteFor(fixture.head)).toBe(blob);
+  });
+
+  it("#1269: a merge whose notes cannot reach the remote is a pending proof failure, settled later without a second merge", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const blob = noteOnCandidate(fixture);
+    fixture.github.refuseNotesWrite = true;
+    const unproven = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(unproven.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    if (unproven.allowed) throw new Error("expected a merge without its notes on the remote to be unproven");
+    expect(unproven.evidence).toMatchObject({ phase: "postflight-notes", ref: "refs/notes/commitlore" });
+    expect(fixture.github.remoteNoteFor(fixture.head)).toBeUndefined();
+    expect(fixture.github.mergeCount).toBe(1);
+    expectPendingMergeProof(fixture);
+
+    // The next attempt settles the PENDING receipt by reading the merged pull: the notes are carried, no PUT is sent.
+    const settled = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(settled.reasonCode, settled.allowed ? "" : settled.message).toBe(ReasonCode.MERGE_IDEMPOTENT_REPLAY);
+    expect(settled.allowed).toBe(true);
+    expect(fixture.github.remoteNoteFor(fixture.head)).toBe(blob);
+    expect(fixture.github.mergeCount).toBe(1);
+  });
 });
 
 describe("the kernel is on the guard's write path (CP-HI-01)", () => {
