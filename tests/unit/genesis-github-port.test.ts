@@ -16,7 +16,7 @@ function fixture() {
   let merged=false;const calls:Array<{method:string;path:string;body:unknown}>=[];
   const state={provenanceHead:head,suiteId:9 as number | undefined,runId:11 as number | undefined,
     suiteRepository:repository as Partial<typeof repository> | undefined,runRepository:repository as Partial<typeof repository> | undefined,
-    runSuiteId:9 as number | undefined,runStatus:"completed" as string | undefined,checks:[check()],protection,parents:[base,head],pull:{...pr},main:base};
+    runSuiteId:9 as number | undefined,runStatus:"completed" as string | undefined,runConclusion:"success" as string | null,checks:[check()],protection,parents:[base,head],pull:{...pr},main:base};
   const client:GitHubClient={async request<T>(method:"GET"|"POST"|"PATCH"|"PUT"|"DELETE",path:string,body?:unknown):Promise<T> {
     calls.push({method,path,body});const p=path.replace(/^\//,'');let answer:unknown;
     if(method==='PUT') {merged=true;state.main=merge;answer={merged:true,sha:merge};}
@@ -28,7 +28,7 @@ function fixture() {
     else if(p.includes('/contents/')) answer={encoding:'base64',content:Buffer.from(workflow).toString('base64')};
     else if(p.includes('/git/commits/')) answer={parents:state.parents.map(sha=>({sha}))};
     else if(p.includes('/check-suites/9')) answer={id:state.suiteId,repository:state.suiteRepository,head_sha:state.provenanceHead,app:{slug:'github-actions'}};
-    else if(p.includes('/actions/runs/11')) answer={id:state.runId,repository:state.runRepository,check_suite_id:state.runSuiteId,head_sha:state.provenanceHead,path:'.github/workflows/ci.yml',status:state.runStatus,conclusion:'success'};
+    else if(p.includes('/actions/runs/11')) answer={id:state.runId,repository:state.runRepository,check_suite_id:state.runSuiteId,head_sha:state.provenanceHead,path:'.github/workflows/ci.yml',status:state.runStatus,conclusion:state.runConclusion};
     else if(p.endsWith('/git/ref/heads/main')) answer={object:{sha:state.main}};
     else throw new Error('unexpected '+method+' '+path);
     return answer as T;
@@ -127,6 +127,15 @@ describe('genesis production GitHub port and kernel',()=>{
       f.state.runStatus='in_progress';
       expect(await f.port.observeGenesisPostMergeCi!(target,head,workflows,["test"])).toMatchObject({state:'refused'});
     });
+  // #1257 J4 — provenance does not imply a successful run, so the genesis observation and merge ask for one themselves.
+  it('refuses a successful check inside an approved run that failed, and waits on one still running',async()=>{
+    const f=fixture();f.state.runConclusion='failure';
+    await expect(mergeBootstrapGenesis(f.client,{owner:'acme',repo:'fixture',pullNumber:1,headSha:head,baseSha:base,workflows})).rejects.toThrow('genesis exact-head CI refused');
+    expect(f.calls.filter(c=>c.method==='PUT')).toHaveLength(0);
+    expect(await f.port.observeGenesisPostMergeCi!(target,head,workflows,["test"])).toMatchObject({state:'refused'});
+    f.state.runStatus='in_progress';f.state.runConclusion=null;
+    expect(await f.port.observeGenesisPostMergeCi!(target,head,workflows,["test"])).toMatchObject({state:'pending'});
+  });
   it('waits boundedly for exact-head CI and checks workflow bytes',async()=>{
     vi.useFakeTimers();const f=fixture();f.state.checks=[];
     const waiting=f.port.observeGenesisCi!(target,head,workflows);
