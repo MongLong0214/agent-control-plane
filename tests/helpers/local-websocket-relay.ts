@@ -14,7 +14,8 @@ import type { BuzzMentionEvent } from "../../src/buzz/buzz-mention-subscriber.ts
  * connection: `silent` answers and delivers nothing at all, and `noLivePush` still answers every
  * request but stops pushing newly published events to the subscriptions already open on it. A
  * subscription limit and a store-only publish cover the review's other cases: a relay that refuses
- * every probe, and one event the live push skipped while later ones arrived.
+ * every probe, and one event the live push skipped while later ones arrived. `until` and `limit`
+ * are honoured, so a probe that pages is answered page by page.
  */
 export interface LocalRelayConnection {
   readonly socket: Socket;
@@ -109,7 +110,8 @@ const matches = (filter: Record<string, unknown>, event: BuzzMentionEvent): bool
     if (wanted && !tagValues(event, name).some((value) => wanted.includes(value))) return false;
   }
   const since = filter["since"];
-  return typeof since !== "number" || event.created_at >= since;
+  const until = filter["until"];
+  return (typeof since !== "number" || event.created_at >= since) && (typeof until !== "number" || event.created_at <= until);
 };
 
 export const startLocalWebSocketRelay = async (): Promise<LocalWebSocketRelay> => {
@@ -118,6 +120,24 @@ export const startLocalWebSocketRelay = async (): Promise<LocalWebSocketRelay> =
   const server = createServer((_request, response) => {
     response.writeHead(426).end();
   });
+
+  /**
+   * The stored events a `REQ` is answered with. A filter's `limit` keeps its newest that many, as a
+   * relay does; with no limit anywhere, every match in the order stored, as before.
+   */
+  const answer = (filters: readonly Record<string, unknown>[]): BuzzMentionEvent[] => {
+    if (!filters.some((filter) => typeof filter["limit"] === "number")) {
+      return stored.filter((one) => filters.some((filter) => matches(filter, one)));
+    }
+    const picked = new Map<string, BuzzMentionEvent>();
+    for (const filter of filters) {
+      const limit = filter["limit"];
+      const found = stored.filter((one) => matches(filter, one));
+      const kept = typeof limit === "number" ? [...found].sort((a, b) => b.created_at - a.created_at).slice(0, limit) : found;
+      for (const one of kept) picked.set(one.id, one);
+    }
+    return [...picked.values()];
+  };
 
   const say = (connection: LocalRelayConnection, message: unknown[]): void => {
     if (connection.silent || !connection.open) return;
@@ -141,9 +161,7 @@ export const startLocalWebSocketRelay = async (): Promise<LocalWebSocketRelay> =
       }
       connection.requests.push({ id, filters });
       connection.subscriptions.set(id, filters);
-      for (const event of stored.filter((one) => filters.some((filter) => matches(filter, one)))) {
-        say(connection, ["EVENT", id, event]);
-      }
+      for (const event of answer(filters)) say(connection, ["EVENT", id, event]);
       say(connection, ["EOSE", id]);
     } else if (message[0] === "CLOSE") {
       connection.closes.push(message[1] as string);

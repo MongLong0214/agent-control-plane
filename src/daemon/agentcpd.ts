@@ -2317,6 +2317,15 @@ export const createDaemonBuzzMentionSink = (
     },
   };
   const sink: BuzzMentionSink = {
+    // The record that refuses the event's re-admission (#1283): its `(buzz, nonce)` replay slot, or
+    // the role message it became once that slot has expired. Read for the liveness probe only.
+    held: ({ roleKey, eventId }) => {
+      const nonces = [buzzMessageNonce(eventId), buzzMessageNonce(eventId, roleKey)];
+      return cp.db.get(`SELECT 1 FROM inbound_messages WHERE channel = 'buzz' AND nonce IN (?, ?)`, nonces) !== undefined ||
+        cp.db.get(`SELECT 1 FROM outbox WHERE role_key = ? AND kind IN ('OWNER_MESSAGE','PEER_MESSAGE')
+          AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.sourceNonce') END) IN (?, ?)`,
+        [roleKey, ...nonces]) !== undefined;
+    },
     admit: async (request) => {
       const verdict = await messageSink.admit(request);
       if (typeof verdict === "object" && (verdict.admission === "REFUSED" || verdict.admission === "PRECEDES_BINDING")) {
@@ -2352,15 +2361,24 @@ export const createDaemonBuzzMentionSink = (
  * #1283 — an outage of a Buzz mention subscription, routed to the CEO as the one §19.3 notification
  * for it, `CRITICAL_SYSTEM_FAILURE`, beside the subscriber's stderr line.
  *
- * Once per outage: the subscriber reports the first stall of one (an identity unanswered past the
- * bound, or not delivered a stored mention), and nothing more until a probe comes back clean and
- * ends it. The row's idempotency key covers the outage's identity and the second it was found, so
- * one outage is one notice however many replacements it takes, and the next outage is a new one.
- * No run owns it, so it names none. With no live CEO binding `notify` records
- * CEO_NOTIFICATION_BLOCKED and refuses, and this says so on stderr; the subscriber is never stopped
- * by its own report.
+ * The subscriber's incident route: offered the outage's first report until this returns `true`, at
+ * each stall and each health tick while the outage lasts, so a notice refused (no live CEO binding,
+ * say: `notify` records CEO_NOTIFICATION_BLOCKED) is enqueued once a CEO is bound. One notice per
+ * outage: once enqueued it is not offered again, and the row's idempotency key covers the outage's
+ * identity and the second it was found, so the next outage is a new one. No run owns it, so it names
+ * none. A refusal is said on stderr at the first attempt only; the subscriber is never stopped by
+ * its own report.
  */
-const notifyCeoOfBuzzMentionStall = (cp: ControlPlane, report: BuzzMentionStallReport): void => {
+const notifyCeoOfBuzzMentionStall = (cp: ControlPlane, report: BuzzMentionStallReport, attempt: number): boolean => {
+  const refused = (why: string): false => {
+    if (attempt === 1) {
+      process.stderr.write(
+        `Buzz mention subscriber outage for ${report.identity} was not routed to the CEO: ${why}; ` +
+          "it is offered again while the outage lasts\n",
+      );
+    }
+    return false;
+  };
   try {
     const notified = cp.db.tx(() => cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, null, {
       code: "BUZZ_MENTION_SUBSCRIBER_STALE",
@@ -2378,13 +2396,9 @@ const notifyCeoOfBuzzMentionStall = (cp: ControlPlane, report: BuzzMentionStallR
         " The daemon keeps reconnecting from the preserved window, so missed mentions arrive once it answers; " +
         "doctor's BUZZ_MENTION_SUBSCRIBER_STALE finding says whether the outage is still open.",
     }));
-    if (!notified.allowed) {
-      process.stderr.write(`Buzz mention subscriber outage for ${report.identity} was not routed to the CEO: ${notified.reasonCode}\n`);
-    }
+    return notified.allowed ? true : refused(notified.reasonCode);
   } catch (error) {
-    process.stderr.write(
-      `Buzz mention subscriber outage for ${report.identity} was not routed to the CEO: ${error instanceof Error ? error.message : String(error)}\n`,
-    );
+    return refused(error instanceof Error ? error.message : String(error));
   }
 };
 
@@ -2423,10 +2437,8 @@ export const startDaemonBuzzMentionSubscriber = (
     ...(options.openSocket ? { openSocket: options.openSocket } : {}),
     ...(options.scheduler ? { scheduler: options.scheduler } : {}),
     ...(options.reportAdmission ? { reportAdmission: options.reportAdmission } : {}),
-    reportStall: (report) => {
-      (options.reportStall ?? nativeStallReporter)(report);
-      notifyCeoOfBuzzMentionStall(cp, report);
-    },
+    reportStall: options.reportStall ?? nativeStallReporter,
+    routeStall: (report, attempt) => notifyCeoOfBuzzMentionStall(cp, report, attempt),
 
   }, process.env["ACP_BUZZ_RELAY_URL"]);
   // The file remains the deployment baseline; resident allocations are merged dynamically.
