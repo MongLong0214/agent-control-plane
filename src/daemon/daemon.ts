@@ -1783,6 +1783,9 @@ export class Daemon {
         orphanedExecutions.push(row.execution_id);
       }
     }
+    // A receipt's process confirmed gone, however the receipt ended, is recorded released: no runner
+    // exists to do it.
+    this.cp.workerTurns.releaseGoneReceiptProcesses();
 
     // #512 — a run that ended while no daemon ran, or before retirement existed, left its WORKER
     // bindings ACTIVE and their sessions live. Retired here, after the receipts above are settled and
@@ -3176,8 +3179,10 @@ export class Daemon {
       });
       // #1189 — pending reviews follow a recovered CEO, and agent-owned waits take their deadline steps.
       void this.runPeriodic("agent_owned_waits", async () => { await this.sweepAgentOwnedWaits(); });
-      // #512 — and a retired worker's session left live while its process ran is settled on a later tick.
+      // #512 — and a retired worker's session left live while its process ran is settled on a later tick,
+      // after a CTO receipt's process confirmed gone since is recorded released.
       void this.runPeriodic("worker_retirement", async () => {
+        this.cp.workerTurns.releaseGoneReceiptProcesses();
         await this.cp.workerRetirement.reconcile();
       });
       void this.runPeriodic("cto_canonical_switchover_settle", () => this.settleCanonicalSwitchovers());
