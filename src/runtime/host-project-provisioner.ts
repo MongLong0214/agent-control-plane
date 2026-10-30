@@ -8,8 +8,11 @@ export type HostOperation = typeof hostOperations[number];
 export interface ProjectAllocation {
   projectId: string; runId: string; repositoryIdentity: string; repositoryNodeId: string; head: string;
   sessionUuid: string; roomId: string; roomName?: string; clonePath: string; tmuxName: string; socketPath: string;
-  /** Daemon ledger proof: `never-created` means ensure-buzz has never even reached INTENT. */
-  roomLifecycle?: 'never-created' | 'created-or-unknown';
+  /**
+   * Daemon ledger proof: `never-created` means ensure-buzz has never even reached INTENT; `unbound` that it ran but the
+   * daemon recorded no room, so `roomId` is the allocation's placeholder and names no room.
+   */
+  roomLifecycle?: 'never-created' | 'unbound' | 'created-or-unknown';
   retirementPin?: {pid:number;startedAt:string};
   fleetName: string; identityName: string; privateKeyFile: string; bootPacket: string; nonce: string;
 }

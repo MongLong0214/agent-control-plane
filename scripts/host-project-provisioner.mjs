@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Version 1 host boundary. All paths are derived from HOME/ACP_STATE_DIR and a frozen allocation.
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, chmodSync, realpathSync, rmSync, symlinkSync, readlinkSync, lstatSync, openSync, fsyncSync, closeSync, accessSync, constants, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, chmodSync, realpathSync, rmSync, symlinkSync, readlinkSync, lstatSync, openSync, fsyncSync, closeSync, accessSync, constants, statSync, readdirSync } from 'node:fs';
 import { join, resolve, dirname, isAbsolute, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { generateSecretKey, getPublicKey } from 'nostr-tools';
@@ -144,6 +144,12 @@ try {
   const buzz = args => json('buzz',args,{env:buzzEnv()});
   const pub = () => getPublicKey(Buffer.from(readFileSync(a.privateKeyFile,'utf8').trim(),'hex'));
   const pubFile = ceoSigner ? null : a.privateKeyFile.replace(/\.priv$/,'.pub');
+  // The rooms under `name` that `pk` owns: how ensure-buzz finds the room it created, and retirement an unrecorded one.
+  const ownedRooms = (name, pk) => {
+    const channels = buzz(['channels','search','--query',name,'--exact']);
+    check(Array.isArray(channels),'invalid channel search');
+    return channels.filter(c => c.name === name && buzz(['channels','members','--channel',c.channel_id ?? c.id]).some(m => m.pubkey === pk && m.role === 'owner'));
+  };
   const rosterFile = join(home,'.hermes','bridge','required-mentions.json');
   // Mirror canonical_roster.py's version-specific room rules before publishing a roster.
   const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -236,6 +242,34 @@ try {
   // Every refusal here names the order that lets retirement complete; nothing here stops a process it could not verify.
   rerun = `run agentctl project retire ${a.projectId} again`;
   const refuseWithOrder = (why, ...steps) => {throw new RetirementOrderRefusal(why,[...steps,rerun]);};
+  // #1251 C-P2 — an `unbound` allocation: ensure-buzz stopped before the daemon recorded the room it verified, so the
+  // allocation's room id is a placeholder that names no room. Retirement takes the room ensure-buzz itself would find:
+  // this run's room intent, else the one room under the intended name this run's key owns. With this run's key and no
+  // such room there is none: the intent is written before any creation, and only this key creates the room. Once this
+  // run's retirement has finished, its identity has been moved aside (retire's last host step), and the room it settled
+  // is the one that identity's intent names. `record` is the room id the unfinished intent never received.
+  const unboundRoom = () => {
+    const ofThisRun = (record, pk) => object(record) && record.runId === a.runId && record.pubkey === pk;
+    if (!existsSync(a.privateKeyFile)) {
+      const parent = join(state,'retired-buzz-identities');
+      const retired = (existsSync(parent) ? readdirSync(parent) : []).filter(name => name.startsWith(`${a.identityName}.`)).map(name => join(parent,name)).find(dir => {
+        try {return ofThisRun(read(join(dir,basename(keyProvenanceFile))),getPublicKey(Buffer.from(readFileSync(join(dir,basename(a.privateKeyFile)),'utf8').trim(),'hex')));} catch {return false;}
+      });
+      if (retired === undefined) return null;
+      let intent = null;try {intent = read(join(retired,basename(intentFile)));} catch { /* No intent: no room was ever created. */ }
+      return {roomId:object(intent) && typeof intent.roomId === 'string' ? intent.roomId : null,record:null};
+    }
+    const pk = pub();
+    const intent = existsSync(intentFile) ? read(intentFile) : null;
+    if (ofThisRun(intent,pk) && typeof intent.roomId === 'string') return {roomId:intent.roomId,record:null};
+    const name = ofThisRun(intent,pk) ? intent.name : a.roomName ?? a.projectId;
+    const owned = ownedRooms(name,pk).map(room => room.channel_id ?? room.id);
+    if (owned.length > 1) refuseWithOrder(`the Buzz room of ${a.projectId} was never recorded, and ${a.identityName} (${pk}) owns ${owned.length} rooms named ${name}: ${owned.join(', ')}`,
+      `have an owner archive all but one of rooms ${owned.join(', ')} (buzz channels archive --channel <room>); retirement archives the one left`);
+    if (owned.length === 0) return {roomId:null,record:null};
+    check(/^[a-f0-9-]{36}$/.test(owned[0]),'unrecorded room identity');
+    return {roomId:owned[0],record:{...(ofThisRun(intent,pk) ? intent : {name,pubkey:pk,runId:a.runId}),roomId:owned[0]}};
+  };
   const retirementPreflight = () => {
     const requiredOrder = pid => [
       `end the CTO session ${a.sessionUuid}${pid ? ` (pid ${pid})` : ''} yourself: exit it in its own terminal`,
@@ -268,6 +302,8 @@ try {
           throw new RetirementOrderRefusal(`a process names CTO session ${a.sessionUuid} and retirement cannot verify it as the incarnation ACP recorded`,requiredOrder(null));
       }
     }
+    const unbound = a.roomLifecycle === 'unbound' ? unboundRoom() : null;
+    if (unbound?.roomId) a.roomId = unbound.roomId;
     const plannedRoute = existsSync(rosterFile) ? read(rosterFile).channels?.[a.roomId] : undefined;
     if (plannedRoute && plannedRoute.status !== 'retired' && plannedRoute.acp_project_id !== a.projectId)
       refuseWithOrder(`retirement route conflict: the roster routes room ${a.roomId} to project ${plannedRoute.acp_project_id}`,`correct room ${a.roomId}'s entry in ${rosterFile}: it must name project ${a.projectId} or be retired`);
@@ -289,21 +325,25 @@ try {
         return object(receipt) && receipt.version === 1 && receipt.projectId === a.projectId && receipt.roomId === a.roomId && receipt.archived === true;
       } catch { return false; }
     })();
+    // #1251 C-P2 — the placeholder of an unbound allocation is never looked up: it names no room.
+    if (unbound && unbound.roomId === null) return {resident,archive,unbound,room:{state:'none'}};
     const pk = existsSync(a.privateKeyFile) ? pub() : null;
     const room = pk === null ? null : buzz(['channels','get','--channel',a.roomId]);
     if (room !== null) check(object(room) && room.channel_id === a.roomId && typeof room.name === 'string' && room.name.length > 0,'retiring Buzz room readback mismatch');
     const recorded = plannedRoute?.acp_project_id === a.projectId || intentRoom === a.roomId;
-    if (roomArchiveReceipt) return {resident,archive,room:{state:'archived',archiveReceipt:roomArchiveFile}};
-    if (!recorded && room === null && a.roomLifecycle === 'never-created') return {resident,archive,room:{state:'none'}};
+    if (roomArchiveReceipt) return {resident,archive,unbound,room:{state:'archived',archiveReceipt:roomArchiveFile}};
+    if (!recorded && room === null && a.roomLifecycle === 'never-created') return {resident,archive,unbound,room:{state:'none'}};
     const owner = plannedRoute?.peer?.pubkey ?? 'not recorded';
+    if (pk === null && a.roomLifecycle === 'unbound') refuseWithOrder(`the Buzz room of ${a.projectId} was never recorded, and no key for ${a.identityName} is at ${a.privateKeyFile} to find it with`,
+      `put the key ${a.identityName} was provisioned with at ${a.privateKeyFile}; retirement finds the room that key owns, archives it and then moves the key aside`);
     if (pk === null) refuseWithOrder(`Buzz room ${a.roomId} cannot be archived: no key for ${a.identityName} at ${a.privateKeyFile}`,
       `put the key of room ${a.roomId}'s owner (pubkey ${owner} per the roster) at ${a.privateKeyFile}; retirement archives the room with it and then moves it aside`);
     if (room === null) refuseWithOrder(`Buzz room ${a.roomId} is not visible to ${a.identityName} (${pk})`,
       `make ${pk} an owner of room ${a.roomId}, or put the key of its owner (pubkey ${owner} per the roster) at ${a.privateKeyFile}`);
     const members = buzz(['channels','members','--channel',a.roomId]);
     check(Array.isArray(members) && members.every(m => object(m) && typeof m.pubkey === 'string' && typeof m.role === 'string'),'invalid Buzz room roster');
-    if (roomArchived(room.name)) return {resident,archive,room:{state:'archived',name:room.name}};
-    if (members.some(m => m.pubkey === pk && m.role === 'owner')) return {resident,archive,room:{state:'archive',name:room.name}};
+    if (roomArchived(room.name)) return {resident,archive,unbound,room:{state:'archived',name:room.name}};
+    if (members.some(m => m.pubkey === pk && m.role === 'owner')) return {resident,archive,unbound,room:{state:'archive',name:room.name}};
     const owners = members.filter(m => m.role === 'owner').map(m => m.pubkey);
     refuseWithOrder(`Buzz room ${a.roomId} is owned by ${owners.length ? owners.join(', ') : 'no member visible to this identity'}, and ${a.identityName} (${pk}) is ${members.find(m => m.pubkey === pk)?.role ?? 'not a member'}`,
       `have an owner archive room ${a.roomId} (buzz channels archive --channel ${a.roomId}), or make ${pk} an owner of it`);
@@ -396,17 +436,12 @@ try {
       if (!existsSync(intentFile)) atomic(intentFile,JSON.stringify(intended));
       const intent = read(intentFile);
       check(intent.name === intended.name && intent.pubkey === pk && intent.runId === a.runId,'room intent conflict');
-      const ownedRooms = () => {
-        const channels = buzz(['channels','search','--query',intent.name,'--exact']);
-        check(Array.isArray(channels),'invalid channel search');
-        return channels.filter(c => c.name === intent.name && buzz(['channels','members','--channel',c.channel_id ?? c.id]).some(m => m.pubkey === pk && m.role === 'owner'));
-      };
-      let owned = ownedRooms();
+      let owned = ownedRooms(intent.name,pk);
       check(owned.length <= 1,'ambiguous owned room');
       if (!owned.length) {
         check(!intent.roomId,'persisted room disappeared');
         buzz(['channels','create','--name',intent.name,'--type','stream','--visibility','private']);
-        owned = ownedRooms();
+        owned = ownedRooms(intent.name,pk);
       }
       check(owned.length === 1,'room readback missing or ambiguous');
       const room = owned[0]; const roomId = room.channel_id ?? room.id;
@@ -482,7 +517,9 @@ try {
     case 'observe': result = {checkout:checkout(checkoutRequirement),resident:observeResident()}; break;
     case 'verify-retire': retirementPreflight(); result = {retirementVerified:true}; break;
     case 'retire': {
-      const {resident,archive,room} = retirementPreflight();
+      const {resident,archive,room,unbound} = retirementPreflight();
+      // #1251 C-P2 — the unfinished ensure-buzz's intent receives the room it created, as ensure-buzz would have written.
+      if (unbound?.record) {hostChanged = true;atomic(intentFile,JSON.stringify(unbound.record));}
       // #1230 — the room first: nothing else on the host changes, and nothing moves, until its archive is confirmed.
       if (room.state === 'archive') {
         hostChanged = true; // the archive may land even when its answer is lost

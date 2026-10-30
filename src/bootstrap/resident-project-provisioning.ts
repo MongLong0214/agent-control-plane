@@ -43,7 +43,8 @@ export class ResidentProjectProvisioning {
     const value=JSON.parse(row.allocation_json) as Partial<ProjectAllocation>;
     const steps=JSON.parse(row.steps_json) as {roomBinding?:{roomId:string};'ensure-buzz'?:unknown};
     const binding=steps.roomBinding;
-    const roomLifecycle = steps['ensure-buzz'] === undefined && binding === undefined ? 'never-created' : 'created-or-unknown';
+    // #1251 C-P2 — ensure-buzz ran but recorded no room: the allocation's room id is still its placeholder.
+    const roomLifecycle = binding !== undefined ? 'created-or-unknown' : steps['ensure-buzz'] === undefined ? 'never-created' : 'unbound';
     return value.sessionUuid ? {...value,...(binding ? {roomId:binding.roomId} : {}),roomLifecycle} as ProjectAllocation : null;
   }
   async ensure(input:{runId:string;projectId:string;repositoryIdentity:string;repositoryNodeId:string;head:string;packet:unknown}):Promise<ProvisioningEvidence> {

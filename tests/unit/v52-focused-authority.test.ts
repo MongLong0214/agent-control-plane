@@ -1,4 +1,6 @@
 import { afterAll, expect, it, vi } from 'vitest';
+import { join } from 'node:path';
+import { Daemon } from '../../src/daemon/daemon.ts';
 import { buzzMentionSubscriberRegistry } from '../../src/daemon/agentcpd.ts';
 import { CanonicalSessionRegistry } from '../../src/registry/canonical-session-registry.ts';
 import { retireProject } from '../../src/registry/project-retirement.ts';
@@ -75,6 +77,80 @@ it.each([false,true])('#1229: a host retirement refusal reaches the retire resul
     expect(Boolean(h.cp.db.get(`SELECT 1 FROM project_retirements WHERE project_id = ?`,[entry.projectId]))).toBe(hostChanged);
     expect(registry.effective()).toEqual(hostChanged ? [] : [entry]);
   } finally {h.cp.close();}
+});
+
+/** #1251 C-P1 — a daemon that exits while its retirement is awaited; the restart reopens the same database. */
+const retiring = () => {const h = makeHarness();bind(h);new CanonicalSessionRegistry(h.cp.db).grant(entry,null);return h;};
+const restart = (h: Harness) => {h.cp.close();return makeHarness({root:h.root});};
+const sweep = (h: Harness) => new Daemon(h.cp,{stateDir:join(h.root,'daemon')}).resumeResidentProjects();
+const unanswered = () => new Promise<never>(() => {});
+const refusalOrder = [`end the CTO session ${entry.sessionUuid} yourself: exit it in its own terminal`,`run agentctl project retire ${entry.projectId} again`];
+
+it('#1251 C-P1: a daemon exit while the host retire is awaited resumes the retirement exactly once after the restart',async () => {
+  const h = retiring();
+  const first = vi.spyOn(h.cp.residentProjects,'retire').mockImplementation(unanswered);
+  void retireProject(h.cp,entry.projectId,'operator retirement');
+  await vi.waitFor(() => expect(first).toHaveBeenCalledOnce());
+  // This daemon's own sweep never starts a second retirement while the first one awaits the host.
+  await sweep(h);
+  expect(first).toHaveBeenCalledOnce();
+  expect(h.cp.projects.get(entry.projectId)).toMatchObject({suspended:true,retiredAt:null});
+  const r = restart(h);
+  try {
+    const resumed = vi.spyOn(r.cp.residentProjects,'retire').mockResolvedValue(undefined);
+    await sweep(r);
+    expect(resumed).toHaveBeenCalledOnce();
+    expect(resumed).toHaveBeenCalledWith(entry.projectId);
+    expect(r.cp.projects.get(entry.projectId)).toMatchObject({suspended:true,retiredAt:expect.any(String)});
+    expect(r.cp.db.get(`SELECT reason,completed_at FROM project_retirements WHERE project_id = ?`,[entry.projectId])).toEqual({reason:'operator retirement',completed_at:expect.any(String)});
+    expect(new CanonicalSessionRegistry(r.cp.db).effective()).toEqual([]);
+    await sweep(r);
+    expect(resumed).toHaveBeenCalledOnce();
+  } finally {r.cp.close();}
+});
+
+it('#1251 C-P1: a resumed retirement whose host step had begun keeps the project suspended and pending on a no-write refusal',async () => {
+  const h = retiring();
+  const first = vi.spyOn(h.cp.residentProjects,'retire').mockImplementation(unanswered);
+  void retireProject(h.cp,entry.projectId,'operator retirement');
+  await vi.waitFor(() => expect(first).toHaveBeenCalledOnce());
+  const r = restart(h);
+  try {
+    // The resumed attempt wrote nothing, but the first one may have changed the host before the exit.
+    const resumed = vi.spyOn(r.cp.residentProjects,'retire').mockRejectedValue(new HostRetirementRefusal('the CTO session is running',refusalOrder,false));
+    await sweep(r);
+    expect(resumed).toHaveBeenCalledOnce();
+    expect(r.cp.projects.get(entry.projectId)).toMatchObject({suspended:true,retiredAt:null});
+    expect(r.cp.db.get(`SELECT completed_at FROM project_retirements WHERE project_id = ?`,[entry.projectId])).toEqual({completed_at:null});
+    expect(new CanonicalSessionRegistry(r.cp.db).effective()).toEqual([]);
+    resumed.mockResolvedValue(undefined);
+    await sweep(r);
+    expect(resumed).toHaveBeenCalledTimes(2);
+    expect(r.cp.projects.get(entry.projectId)?.retiredAt).toEqual(expect.any(String));
+  } finally {r.cp.close();}
+});
+
+it('#1251 C-P1: a resumed retirement that had not begun the host step takes its suspension back on a no-write refusal',async () => {
+  const h = retiring();
+  // The daemon exits while the project's workers settle, after the suspension and before the host step.
+  const settle = vi.spyOn(h.cp.workerRetirement,'reconcile').mockImplementation(unanswered);
+  const first = vi.spyOn(h.cp.residentProjects,'retire');
+  void retireProject(h.cp,entry.projectId,'operator retirement');
+  await vi.waitFor(() => expect(settle).toHaveBeenCalledOnce());
+  expect(first).not.toHaveBeenCalled();
+  const r = restart(h);
+  try {
+    expect(r.cp.projects.get(entry.projectId)?.suspended).toBe(true);
+    const resumed = vi.spyOn(r.cp.residentProjects,'retire').mockRejectedValue(new HostRetirementRefusal('the CTO session is running',refusalOrder,false));
+    await sweep(r);
+    expect(resumed).toHaveBeenCalledOnce();
+    expect(r.cp.projects.get(entry.projectId)).toMatchObject({suspended:false,retiredAt:null});
+    expect(r.cp.db.get(`SELECT 1 FROM project_retirements WHERE project_id = ?`,[entry.projectId])).toBeUndefined();
+    expect(new CanonicalSessionRegistry(r.cp.db).effective()).toEqual([entry]);
+    // The refusal closed the intent with the suspension: nothing is left for the sweep to resume.
+    await sweep(r);
+    expect(resumed).toHaveBeenCalledOnce();
+  } finally {r.cp.close();}
 });
 
 it('FV52-01: a tombstoned conversation cannot regain admission under a different pubkey or env project',() => {

@@ -11,7 +11,7 @@ import { makeHarness } from '../helpers/harness.ts';
 import { retireProject } from '../../src/registry/project-retirement.ts';
 import { CanonicalSessionRegistry } from '../../src/registry/canonical-session-registry.ts';
 import { SELF_CLAIM_EXECUTOR_KIND, SELF_CLAIM_PROTOCOL } from '../../src/registry/canonical-self-claim.ts';
-import { Role, SessionLifecycle } from '../../src/domain/types.ts';
+import { ExecutionMode, Role, RunKind, SessionLifecycle } from '../../src/domain/types.ts';
 import { digestOf, sha256 } from '../../src/core/digest.ts';
 import Database from 'better-sqlite3';
 import { cleanupTempDirs, tempDir } from '../helpers/fixtures.ts';
@@ -749,4 +749,58 @@ it('#1230 C-4: a retired local route alone does not prove the external room was 
     });
     expect(snapshot()).toEqual(before);
   }
+});
+
+/**
+ * #1251 C-P2 — the daemon's own ledger and protocol class against the packaged script. The wrapper hands the script
+ * the fixture's binaries and writes the allocation the fakes read; the daemon supplies the state directory.
+ */
+const daemonHost = (f:ReturnType<typeof fixture>) => {
+  const wrapper = join(f.home,'host-wrapper.cjs');
+  const env = Object.fromEntries((['HOME','PATH','ACP_HOST_DATABASE_PATH','ACP_BUZZ_BINARY','ACP_CLAUDE_BINARY','ACP_RESOLVED_BUZZ_BINARY','ACP_RESOLVED_CLAUDE_BINARY','CLAUDE_CONFIG_DIR','ACP_BUZZ_ADMISSION_COMMAND','TEST_CLAUDE_PID'] as const).map(key => [key,f.env[key]]));
+  writeFileSync(wrapper,`const {spawnSync} = require('node:child_process'), fs = require('node:fs');
+const input = fs.readFileSync(0,'utf8');
+fs.writeFileSync(${JSON.stringify(join(f.home,'allocation.json'))},JSON.stringify(JSON.parse(input).allocation));
+const child = spawnSync(process.execPath,[${JSON.stringify(f.script)}],{input,encoding:'utf8',timeout:30000,env:{...${JSON.stringify(env)},ACP_STATE_DIR:process.env.ACP_STATE_DIR}});
+process.stdout.write(child.stdout ?? '');process.stderr.write(child.stderr ?? '');process.exit(child.status ?? 1);
+`);
+  return wrapper;
+};
+
+it.each(['profile','create'] as const)('#1251 C-P2: retirement settles the room of an ensure-buzz that stopped before the daemon recorded it (%s)',async failure => {
+  const f = fixture();
+  const root = realpathSync(tempDir('retire-unbound-'));
+  const wrapper = daemonHost(f);
+  const h = makeHarness({root,residentProvisioner:{home:f.home,script:wrapper}});
+  try {
+    const run = h.cp.runs.create({kind:RunKind.PROJECT_BOOTSTRAP,executionMode:ExecutionMode.STANDARD,
+      contract:{goal:'bootstrap',why:'owner request',scope:[],nonGoals:[],acceptance:['developable'],priority:'NORMAL',humanGate:[],references:[]}});
+    if (!run.allowed) throw new Error(run.message);
+    const runId = run.value.runId;
+    h.cp.projects.register({projectId:'test',name:'test'});
+    h.cp.residentProjects.attachSubscriber(async () => false);
+    h.cp.residentProjects.remember({runId,candidateSnapshotDigest:'candidate',ceoSessionId:'ceo'},'test',{});
+    // Buzz fails at profile setup, after this run's key was minted; or it creates the room and its answer is lost.
+    if (failure === 'profile') writeFileSync(join(f.home,'fail-buzz'),'');
+    else writeFileSync(join(f.home,'fake.json'),JSON.stringify({members:[],posts:[],creates:0,launches:0,loseCreate:true}));
+    await expect(h.cp.residentProjects.ensure({runId,projectId:'test',repositoryIdentity:'github:acme/fixture',repositoryNodeId:'R_node',head:'a'.repeat(40),packet:{}})).rejects.toThrow();
+    rmSync(join(f.home,'fail-buzz'),{force:true});
+    const allocation = h.cp.residentProjects.allocation(runId)!;
+    expect(existsSync(f.a.privateKeyFile)).toBe(true);
+    const retired = await retireProject(h.cp,'test','operator retirement');
+    expect(retired,JSON.stringify(retired)).toMatchObject({allowed:true});
+    expect(allocation.roomLifecycle).toBe('unbound');
+    const created = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+    const settled = () => ({creates:fakeState(f).creates,archived:fakeState(f).archivedRooms ?? []});
+    expect(settled()).toEqual(failure === 'profile' ? {creates:0,archived:[]} : {creates:1,archived:[expect.objectContaining({channel_id:created,archived:true})]});
+    expect(h.cp.residentProjects.row(runId)?.status).toBe('RETIRED');
+    expect(existsSync(f.a.privateKeyFile)).toBe(false);
+    expect(existsSync(f.a.clonePath)).toBe(false);
+    if (failure === 'create') expect(JSON.parse(readFileSync(join(root,'retired-buzz-room-test.json'),'utf8'))).toEqual({version:1,projectId:'test',roomId:created,archived:true});
+    // A daemon exit after the host step and before its ledger recorded it: the host retire runs again, changing nothing.
+    const before = settled();
+    const again = await new ExecFileHostProjectProvisioner(wrapper,f.home,root,30_000,join(root,'state.sqlite')).invoke('retire',allocation);
+    expect(again).toMatchObject({retired:true,buzzRoom:failure === 'profile' ? 'none' : 'archived'});
+    expect(settled()).toEqual(before);
+  } finally {h.cp.close();}
 });
