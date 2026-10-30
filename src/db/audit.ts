@@ -1,7 +1,9 @@
 import type { Clock } from "../core/clock.ts";
 import { allow, deny, type Decision, type Evidence } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
-import { hasCredentialShape, redactCredentialShapes, type AcpLocations, type WriteSite } from "../core/credential-shapes.ts";
+import {
+  credentialShapeMatch, hasCredentialShape, redactCredentialShapes, type AcpLocations, type CredentialShapeMatch, type WriteSite,
+} from "../core/credential-shapes.ts";
 import type { Db } from "./database.ts";
 import { registryView } from "./registry-view.ts";
 
@@ -336,18 +338,31 @@ const CREDENTIAL_SHAPED_KEY = "<credential-shaped-key>";
  * credential in evidence at all. Audit records keep using `redact`, where rewriting is the
  * right answer because nothing corroborates an audit row against a produced copy.
  */
+/**
+ * #1307 — what `credentialBearingField` refuses, with the rule that matched and the class of the match
+ * (`CredentialShapeMatch`) so a refusal can say why without the text: `credential_named_key` for a key
+ * whose name is a credential's, `unexaminable_depth` for content deeper than the scan goes.
+ */
+export interface CredentialRefusal extends CredentialShapeMatch {
+  readonly field: string;
+}
+
+const NAMED_KEY = { rule: "credential_named_key", form: "other", inPacket: false } as const;
+const TOO_DEEP = { rule: "unexaminable_depth", form: "other", inPacket: false } as const;
+
 /** `site` is where the content is being stored (`WriteSite`); `holder` is the object `value` sits in. */
-export const credentialBearingField = (
+export const credentialRefusal = (
   value: unknown, depth = 0, path: readonly string[] = [], site?: WriteSite, holder?: unknown,
-): string | null => {
+): CredentialRefusal | null => {
   // Deeper than the scan goes is not "clean": an unexamined subtree must not become evidence.
-  if (depth > MAX_CREDENTIAL_SCAN_DEPTH) return UNEXAMINABLE_DEPTH;
+  if (depth > MAX_CREDENTIAL_SCAN_DEPTH) return { field: UNEXAMINABLE_DEPTH, ...TOO_DEEP };
   if (typeof value === "string") {
-    return hasCredentialShape(value, { path, store: "artifact", ...(site ? { site } : {}), holder }) ? "<value>" : null;
+    const match = credentialShapeMatch(value, { path, store: "artifact", ...(site ? { site } : {}), holder });
+    return match === null ? null : { field: "<value>", ...match };
   }
   if (Array.isArray(value)) {
     for (const item of value) {
-      const found = credentialBearingField(item, depth + 1, path, site, holder);
+      const found = credentialRefusal(item, depth + 1, path, site, holder);
       if (found) return found;
     }
     return null;
@@ -356,9 +371,8 @@ export const credentialBearingField = (
     for (const [key, nested] of Object.entries(value)) {
       // #1279 G4-1 — a key is stored text as much as a value is: read by the rules a value at its path
       // gets, and named by a marker, never by itself, so the refusal does not repeat the credential.
-      if (hasCredentialShape(key, { path: [...path, key], store: "artifact", ...(site ? { site } : {}), holder: value })) {
-        return CREDENTIAL_SHAPED_KEY;
-      }
+      const keyMatch = credentialShapeMatch(key, { path: [...path, key], store: "artifact", ...(site ? { site } : {}), holder: value });
+      if (keyMatch !== null) return { field: CREDENTIAL_SHAPED_KEY, ...keyMatch };
       const normalized = normalizedKey(key);
       if (
         !NOT_A_CREDENTIAL.has(normalized) &&
@@ -366,14 +380,19 @@ export const credentialBearingField = (
         nested != null &&
         nested !== ""
       ) {
-        return key;
+        return { field: key, ...NAMED_KEY };
       }
-      const found = credentialBearingField(nested, depth + 1, [...path, key], site, value);
-      if (found) return found === "<value>" ? key : found;
+      const found = credentialRefusal(nested, depth + 1, [...path, key], site, value);
+      if (found) return found.field === "<value>" ? { ...found, field: key } : found;
     }
   }
   return null;
 };
+
+/** The field `credentialRefusal` names, or null: a key, `<value>`, or a marker that stands in for one. */
+export const credentialBearingField = (
+  value: unknown, depth = 0, path: readonly string[] = [], site?: WriteSite, holder?: unknown,
+): string | null => credentialRefusal(value, depth, path, site, holder)?.field ?? null;
 
 /**
  * Full prompts, transcripts, and reasoning must be rejected at any durable boundary;

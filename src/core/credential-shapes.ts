@@ -18,24 +18,30 @@ import { residentBootPacket, residentClonePath, residentPrivateKeyFile, resident
 /** A run of 60 or more base64 (or hex) characters, inside a line or as a whole value. */
 const LONG_BASE64_RUN = /[A-Za-z0-9+/]{60,}={0,2}/;
 
-/** Unanchored, so each shape is found inside a line as well as as a whole value. */
-const CREDENTIAL_SHAPES: readonly RegExp[] = [
-  /gh[pousr]_[A-Za-z0-9]{16,}/,
-  /\bsk-[A-Za-z0-9_-]{20,}/,
-  /\bnsec1[a-z0-9]{20,}/,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+/**
+ * Unanchored, so each shape is found inside a line as well as as a whole value. Each has a rule id,
+ * which a refusal names in place of the text it matched (`credentialShapeMatch`).
+ */
+const CREDENTIAL_SHAPE_RULES: ReadonlyArray<readonly [rule: string, shape: RegExp]> = [
+  ["github_token", /gh[pousr]_[A-Za-z0-9]{16,}/],
+  ["sk_key", /\bsk-[A-Za-z0-9_-]{20,}/],
+  ["nostr_nsec", /\bnsec1[a-z0-9]{20,}/],
+  ["private_key_block", /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
   // Any length after the prefix: the sandbox refused every value that starts with one.
-  /\bxox[baprs]-[A-Za-z0-9-]*/,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}/,
-  /\bAKIA[0-9A-Z]{16}\b/,
-  /\b\d{8,10}:AA[A-Za-z0-9_-]{30,}/,
-  /\bBearer\s+[A-Za-z0-9._~+/-]{20,}/i,
+  ["slack_token", /\bxox[baprs]-[A-Za-z0-9-]*/],
+  ["github_pat", /\bgithub_pat_[A-Za-z0-9_]{20,}/],
+  ["aws_access_key", /\bAKIA[0-9A-Z]{16}\b/],
+  ["telegram_bot_token", /\b\d{8,10}:AA[A-Za-z0-9_-]{30,}/],
+  ["bearer_token", /\bBearer\s+[A-Za-z0-9._~+/-]{20,}/i],
   // A JWT's header and payload, and its signature when one follows.
-  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*/,
+  ["jwt", /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*/],
   // KEY=VALUE where the key looks secret, as it appears in an environment dump.
-  /\b[A-Z0-9_]*(TOKEN|SECRET|PASSWORD|CREDENTIAL|API_?KEY|PRIVATE_KEY)[A-Z0-9_]*\s*=\s*\S+/,
-  LONG_BASE64_RUN,
+  ["secret_assignment", /\b[A-Z0-9_]*(TOKEN|SECRET|PASSWORD|CREDENTIAL|API_?KEY|PRIVATE_KEY)[A-Z0-9_]*\s*=\s*\S+/],
+  ["long_base64_run", LONG_BASE64_RUN],
 ];
+
+const CREDENTIAL_SHAPES: readonly RegExp[] = CREDENTIAL_SHAPE_RULES.map(([, shape]) => shape);
+const RULE_OF: ReadonlyMap<RegExp, string> = new Map(CREDENTIAL_SHAPE_RULES.map(([rule, shape]) => [shape, rule]));
 
 /** Every shape but the long-base64 run: what an ACP-generated field is still checked against. */
 const GENERATED_FIELD_SHAPES: readonly RegExp[] = CREDENTIAL_SHAPES.filter((shape) => shape !== LONG_BASE64_RUN);
@@ -257,6 +263,23 @@ export interface WriteSite {
   readonly registry?: RegistryView;
   /** The whole record being written: a contract reads facts elsewhere in it (an allocation's repository). */
   readonly record?: unknown;
+  /**
+   * #1307 — the `sha256:<64hex>` digests ACP computed for the one blind review being stored, read from
+   * its own typed fields for that run and candidate (review/blind-review.ts reviewPacketDigests), never
+   * from the prompt's text. At a free-text field, a digest named here skips the long-base64 shape as a
+   * bound reference does (`isBoundRun`), and nothing else. The artifact store sets it only for the
+   * BLIND_REVIEW it is writing, for that review's run and candidate (db/artifacts.ts).
+   */
+  readonly packetDigests?: ReadonlySet<string>;
+}
+
+/** #1307 — what matched when a value is refused: the rule's id and the class of the match, never the value. */
+export interface CredentialShapeMatch {
+  readonly rule: string;
+  /** `sha256-64hex`, `hex64` (bare lowercase), `hex` (other hex), `base64`, or `other`. */
+  readonly form: string;
+  /** Whether the match holds the hex of a digest in the write site's `packetDigests`. */
+  readonly inPacket: boolean;
 }
 
 /**
@@ -299,31 +322,55 @@ const isBoundRun = (text: string, at: number, run: string, bound: BoundTest): bo
   return bound(prefixed ? `${DIGEST_PREFIX}${run}` : run);
 };
 
-const holdsShape = (text: string, shapes: readonly RegExp[], bound?: BoundTest): boolean =>
-  shapes.some((shape) => (shape === LONG_BASE64_RUN && bound !== undefined
-    ? [...text.matchAll(LONG_BASE64_RUNS)].some((match) => !isBoundRun(text, match.index, match[0], bound))
-    : shape.test(text)));
+/** Where a shape matched: the rule, the text it was found in, and the match. Never stored as such. */
+interface ShapeFound { readonly rule: string; readonly text: string; readonly at: number; readonly matched: string }
+
+/** A record nested deeper than a serialized record is read (`recordShape`): refused unexamined. */
+const UNEXAMINED: ShapeFound = { rule: "unexaminable_depth", text: "", at: 0, matched: "" };
+
+/** The first listed shape found in `text`, a long-base64 run that is a bound reference's hex excepted (`isBoundRun`). */
+const shapeIn = (text: string, shapes: readonly RegExp[], bound?: BoundTest): ShapeFound | null => {
+  for (const shape of shapes) {
+    const match = shape === LONG_BASE64_RUN && bound !== undefined
+      ? [...text.matchAll(LONG_BASE64_RUNS)].find((run) => !isBoundRun(text, run.index, run[0], bound))
+      : shape.exec(text);
+    if (match) return { rule: RULE_OF.get(shape)!, text, at: match.index, matched: match[0] };
+  }
+  return null;
+};
+
+const holdsShape = (text: string, shapes: readonly RegExp[], bound?: BoundTest): boolean => shapeIn(text, shapes, bound) !== null;
 
 /**
  * Whether a record's keys or values hold a shape, each value checked by the same field rules as the
  * object it was serialized from, at its path inside the record (a repository path per segment).
  */
-const recordHoldsShape = (value: unknown, depth: number, field: EvidenceField): boolean => {
-  if (typeof value === "string") return fieldHoldsShape(value, field);
-  if (depth > 8) return true;
-  if (Array.isArray(value)) return value.some((item) => recordHoldsShape(item, depth + 1, field));
-  if (value !== null && typeof value === "object") {
-    return Object.entries(value).some(([key, nested]) =>
-      holdsShape(key, CREDENTIAL_SHAPES) || recordHoldsShape(nested, depth + 1, { ...field, path: [...field.path, key] }));
+const recordShape = (value: unknown, depth: number, field: EvidenceField): ShapeFound | null => {
+  if (typeof value === "string") return fieldShape(value, field);
+  if (depth > 8) return UNEXAMINED;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = recordShape(item, depth + 1, field);
+      if (found) return found;
+    }
+    return null;
   }
-  return false;
+  if (value !== null && typeof value === "object") {
+    for (const [key, nested] of Object.entries(value)) {
+      const found = shapeIn(key, CREDENTIAL_SHAPES) ?? recordShape(nested, depth + 1, { ...field, path: [...field.path, key] });
+      if (found) return found;
+    }
+  }
+  return null;
 };
 
-const serializedHoldsShape = (text: string, store: EvidenceField["store"]): boolean => {
+const serializedShape = (text: string, store: EvidenceField["store"]): ShapeFound | null => {
   let record: unknown;
-  try { record = JSON.parse(text); } catch { return holdsShape(text, CREDENTIAL_SHAPES); }
-  return record !== null && typeof record === "object" ? recordHoldsShape(record, 0, { path: [], store }) : holdsShape(text, CREDENTIAL_SHAPES);
+  try { record = JSON.parse(text); } catch { return shapeIn(text, CREDENTIAL_SHAPES); }
+  return record !== null && typeof record === "object" ? recordShape(record, 0, { path: [], store }) : shapeIn(text, CREDENTIAL_SHAPES);
 };
+
+const serializedHoldsShape = (text: string, store: EvidenceField["store"]): boolean => serializedShape(text, store) !== null;
 
 /** Private-use marks around an index stand in for a set-aside token; text that has them already sets nothing aside. */
 const MARK_OPEN = "\uE000";
@@ -334,13 +381,16 @@ const MARKED = /\uE000(\d+)\uE001/g;
  * The bound-reference test for a field written at a site whose store can read its own records: a
  * digest or id in any text there skips the long-base64 shape only when it names a record the store
  * holds (`RegistryView.boundReference`), never for its shape alone (`isBoundRun`). Without such a site,
- * nothing does.
+ * nothing does. #1307 — at a free-text field, so does a digest ACP computed for the packet of the review
+ * being stored (`WriteSite.packetDigests`), prefixed or as its bare hex.
  */
 const boundReferenceOf = (field: EvidenceField | undefined): BoundTest => {
   const registry = field?.site?.registry;
-  if (registry?.boundReference === undefined) return undefined;
+  const packet = isFreeText(field) ? field?.site?.packetDigests : undefined;
+  if (registry?.boundReference === undefined && packet === undefined) return undefined;
   const runId = field?.site?.runId ?? null;
-  return (token) => registry.boundReference!(runId, token);
+  return (token) => registry?.boundReference?.(runId, token) === true ||
+    packet?.has(token.startsWith(DIGEST_PREFIX) ? token : `${DIGEST_PREFIX}${token}`) === true;
 };
 
 const setAside = (text: string, tokens: RegExp | undefined): { text: string; tokens: string[] } => {
@@ -604,8 +654,13 @@ const isVerifiedLocation = (text: string, field: EvidenceField | undefined): boo
   return contract !== undefined && contract(text, field);
 };
 
-const segmentsHoldShape = (text: string, bound: BoundTest): boolean =>
-  text.split("/").some((segment) => holdsShape(segment, CREDENTIAL_SHAPES, bound));
+const segmentsShape = (text: string, bound: BoundTest): ShapeFound | null => {
+  for (const segment of text.split("/")) {
+    const found = shapeIn(segment, CREDENTIAL_SHAPES, bound);
+    if (found) return found;
+  }
+  return null;
+};
 
 const GLOBAL = new Map(CREDENTIAL_SHAPES.map((shape) => [shape, new RegExp(shape.source, `g${shape.flags}`)]));
 
@@ -620,11 +675,31 @@ const GLOBAL = new Map(CREDENTIAL_SHAPES.map((shape) => [shape, new RegExp(shape
  * reviewer field (`FREE_TEXT_FIELDS`, and every field but a typed one of a `FREE_TEXT_WRITERS` writer) a
  * whole ACP id is not exempt by its format, only as such a bound reference.
  */
-export const hasCredentialShape = (text: string, field?: EvidenceField): boolean => {
+export const hasCredentialShape = (text: string, field?: EvidenceField): boolean => credentialShapeMatch(text, field) !== null;
+
+/** The class of what a shape matched (`CredentialShapeMatch.form`), read from the match and the prefix before it. */
+const formOf = ({ text, at, matched }: ShapeFound): string => {
+  if (HEX64_RUN.test(matched)) return at >= DIGEST_PREFIX.length && text.startsWith(DIGEST_PREFIX, at - DIGEST_PREFIX.length) ? "sha256-64hex" : "hex64";
+  if (/^[0-9a-fA-F]+$/.test(matched)) return "hex";
+  if (/^[A-Za-z0-9+/]+={0,2}$/.test(matched)) return "base64";
+  return "other";
+};
+
+/**
+ * #1307 — the shape `hasCredentialShape` finds in `text`, by the same rules, as the rule's id and the
+ * class of what it matched (`CredentialShapeMatch`), or null when it finds none. Never the text.
+ */
+export const credentialShapeMatch = (text: string, field?: EvidenceField): CredentialShapeMatch | null => {
   const kind = serializedKind(field);
-  if (field !== undefined && kind === "jsonl") return text.split("\n").some((line) => serializedHoldsShape(line, field.store));
-  if (field !== undefined && kind === "json") return serializedHoldsShape(text, field.store);
-  return fieldHoldsShape(text, field);
+  let found: ShapeFound | null = null;
+  if (field !== undefined && kind === "jsonl") {
+    for (const line of text.split("\n")) if ((found = serializedShape(line, field.store)) !== null) break;
+  } else if (field !== undefined && kind === "json") found = serializedShape(text, field.store);
+  else found = fieldShape(text, field);
+  if (found === null) return null;
+  const lower = found.matched.toLowerCase();
+  const packet = [...field?.site?.packetDigests ?? []];
+  return { rule: found.rule, form: formOf(found), inPacket: packet.some((digest) => lower.includes(digest.slice(DIGEST_PREFIX.length))) };
 };
 
 /**
@@ -632,12 +707,12 @@ export const hasCredentialShape = (text: string, field?: EvidenceField): boolean
  * and a verified location per segment. A segment's shape is always also the whole value's, so the
  * location's contract is checked only for a value whose whole holds a shape.
  */
-const fieldHoldsShape = (text: string, field: EvidenceField | undefined): boolean => {
+const fieldShape = (text: string, field: EvidenceField | undefined): ShapeFound | null => {
   const aside = setAside(text, tokensFor(field));
   const bound = boundReferenceOf(field);
-  if (isRepositoryPath(text, field)) return segmentsHoldShape(aside.text, bound);
-  if (!holdsShape(aside.text, shapesFor(text, field), bound)) return false;
-  return !isVerifiedLocation(text, field) || segmentsHoldShape(aside.text, bound);
+  if (isRepositoryPath(text, field)) return segmentsShape(aside.text, bound);
+  const whole = shapeIn(aside.text, shapesFor(text, field), bound);
+  return whole === null || !isVerifiedLocation(text, field) ? whole : segmentsShape(aside.text, bound);
 };
 
 /** A long-base64 run replaced with `[redacted]`, unless it is a bound reference's hex (`isBoundRun`). */

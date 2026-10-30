@@ -23,7 +23,7 @@ import {
 import type { DispatchCapacityTarget } from "../capacity/capacity-monitor.ts";
 import type { ProjectManifest } from "../contracts/manifest.ts";
 import type { Clock } from "../core/clock.ts";
-import { digestOf, sha256 } from "../core/digest.ts";
+import { digestOf, isDigest, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { credentialBearingField, type AuditLog } from "../db/audit.ts";
@@ -33,6 +33,7 @@ import {
   reviewPolicyText,
   type ArtifactStore,
   type EvidenceWriter,
+  type ReviewPacketDigests,
 } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import {
@@ -88,7 +89,9 @@ import type { VerificationReport } from "../verify/verification-engine.ts";
 import { currentVerdictPasses, currentVerificationResults } from "../verify/verification-history.ts";
 import type { TaskContract } from "../run/run-engine.ts";
 import { bootstrapPlanTaskRecorded } from "../run/task-graph.ts";
-import { candidateEvidenceSection, readExecutionEvidence, readTrackedTree, type TrackedTreeEvidence } from "./candidate-review-evidence.ts";
+import {
+  candidateEvidenceSection, readExecutionEvidence, readTrackedTree, type ReceiptEvidence, type TrackedTreeEvidence,
+} from "./candidate-review-evidence.ts";
 import { redactCredentialValues } from "../core/credential-shapes.ts";
 import { contractChangeReadbackFor, type ContractChangeReadback } from "./contract-change-review-context.ts";
 
@@ -504,6 +507,38 @@ const unparsableAnswerEvidence = (text: string): Record<string, string | number 
 
 /** A refused field's name as the artifact store reports it: a key of the packet, or its `<value>` marker. */
 const REFUSED_FIELD_NAME = /^[A-Za-z0-9_<>.-]{1,64}$/;
+/** A refusal's rule id or form class as the artifact store reports it (core/credential-shapes.ts). */
+const REFUSAL_CLASS = /^[a-z0-9_-]{1,32}$/;
+
+/**
+ * #1307 — the digests ACP computed for this candidate review's packet, read from its own typed fields
+ * for this run and candidate, never from the prompt's text: the packet digest, the frozen snapshot's
+ * diffDigests, the verification results' outputDigests, and the diffDigest and resultDigest of each
+ * receipt linked to this candidate. A reviewer that quotes one is not quoting a credential
+ * (`WriteSite.packetDigests`). The workflow digests a manifest approves are not among them: those are
+ * bound only once ACP has read the workflow's bytes (db/registry-view.ts).
+ */
+const reviewPacketDigests = (
+  db: Db,
+  request: BlindReviewRequest,
+  snapshotDigest: string,
+  packetDigest: string,
+  receipts: readonly ReceiptEvidence[],
+): ReviewPacketDigests => {
+  const linked = receipts.filter((receipt) => receipt.linked);
+  const resultDigests = linked.length === 0 ? [] : db.all<{ result_digest: string | null }>(
+    `SELECT result_digest FROM task_executions WHERE run_id = ? AND execution_id IN (${linked.map(() => "?").join(", ")})`,
+    [request.runId, ...linked.map((receipt) => receipt.executionId)],
+  ).map((row) => row.result_digest);
+  const digests = [
+    packetDigest,
+    ...request.snapshot.repositories.map((repo) => repo.diffDigest),
+    ...request.verification.results.map((result) => result.outputDigest),
+    ...linked.map((receipt) => receipt.diffDigest),
+    ...resultDigests,
+  ].filter(isDigest);
+  return { runId: request.runId, candidateSnapshotDigest: snapshotDigest, digests: new Set(digests) };
+};
 
 /** Diff size above which a single reviewer context is not trusted to hold everything. */
 const CHUNK_THRESHOLD_CHARS = 120_000;
@@ -718,6 +753,8 @@ export class BlindReviewGate {
         contractChange: change === null ? null : reviewBindingOf(change),
         planReview: false,
         attemptId: request.attemptId,
+        packetDigests: reviewPacketDigests(this.db, request, snapshotDigest,
+          reviewPacketDigest(request, change, reviewPolicies), execution.receipts),
       });
     } finally {
       this.release(reviewers);
@@ -867,6 +904,8 @@ export class BlindReviewGate {
     /** The reviewer read a PLAN's outputs or manifest, not a diff and its verification. */
     planReview: boolean;
     attemptId: string | undefined;
+    /** #1307 — a candidate review's packet digests (`reviewPacketDigests`); absent for a PLAN review. */
+    packetDigests?: ReviewPacketDigests;
   }): Decision<ReviewPacket> {
     const { runId, snapshotDigest, outcome, chunked, expected } = input;
     const authoritativeReviewer = outcome.reviewer;
@@ -918,7 +957,7 @@ export class BlindReviewGate {
     }
 
     const validated = this.validateCoverage(packet, expected);
-    const stored = this.storeReview(validated, authoritativeReviewer, input.attemptId);
+    const stored = this.storeReview(validated, authoritativeReviewer, input.attemptId, input.packetDigests);
     if (!stored.allowed) return stored as Decision<ReviewPacket>;
 
     this.audit.record({
@@ -994,14 +1033,22 @@ export class BlindReviewGate {
    * verdict, and the reviewer and submission it came from. The review then ends without a verdict, as
    * an unavailable one does, so the run stays where it was and a later submission reviews it again.
    */
-  private storeReview(packet: ReviewPacket, reviewer: ReviewerBinding, attemptId: string | undefined): Decision<void> {
+  private storeReview(
+    packet: ReviewPacket, reviewer: ReviewerBinding, attemptId: string | undefined, packetDigests?: ReviewPacketDigests,
+  ): Decision<void> {
     try {
-      this.artifacts.putEvidence(this.evidenceWriter, packet.runId, ArtifactKind.BLIND_REVIEW, packet, packet.candidateSnapshotDigest);
+      this.artifacts.putEvidence(this.evidenceWriter, packet.runId, ArtifactKind.BLIND_REVIEW, packet, packet.candidateSnapshotDigest,
+        packetDigests);
       return allow(ReasonCode.OK, undefined);
     } catch (error) {
       if (!isAcpError(error) || error.reasonCode !== ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED) throw error;
       const named = error.evidence["field"];
       const field = typeof named === "string" && REFUSED_FIELD_NAME.test(named) ? named : null;
+      // #1307 — which rule matched and the class of what it matched, never the text.
+      const classOf = (value: unknown): string | null => (typeof value === "string" && REFUSAL_CLASS.test(value) ? value : null);
+      const rule = classOf(error.evidence["rule"]);
+      const form = classOf(error.evidence["form"]);
+      const inPacket = typeof error.evidence["inPacket"] === "boolean" ? error.evidence["inPacket"] : null;
       const recorded = this.audit.record({
         kind: "BLIND_REVIEW_STORAGE_REFUSED",
         runId: packet.runId,
@@ -1012,6 +1059,9 @@ export class BlindReviewGate {
           candidateSnapshotDigest: packet.candidateSnapshotDigest,
           kind: ArtifactKind.BLIND_REVIEW,
           field,
+          rule,
+          form,
+          inPacket,
           verdict: packet.verdict,
           findings: packet.findings.length,
           generation: reviewer.generation,
@@ -1023,6 +1073,9 @@ export class BlindReviewGate {
         runId: packet.runId,
         kind: ArtifactKind.BLIND_REVIEW,
         field,
+        rule,
+        form,
+        inPacket,
         candidateSnapshotDigest: packet.candidateSnapshotDigest,
         verdict: packet.verdict,
         refusalEventId: recorded.allowed ? recorded.value : null,
