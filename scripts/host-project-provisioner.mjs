@@ -213,6 +213,20 @@ try {
     for (const dir of [archive,...new Set(present.map(dirname))]) {const fd = openSync(dir,'r');try {fsyncSync(fd);} finally {closeSync(fd);}}
     return archive;
   };
+  // #1230 — a key at this identity's path is this run's only when its key record or its room intent names this run and
+  // this key, or the roster binds it to this project on an active route. ensure-buzz moves any other key aside before
+  // it mints; retirement never finds or archives a room with one (#1251 C5-1).
+  const keyOfThisRun = pk => {
+    const roster = existsSync(rosterFile) ? read(rosterFile) : {channels:{}};
+    check(object(roster) && object(roster.channels),'invalid roster channels');
+    const names = file => {
+      if (!existsSync(file)) return false;
+      const record = read(file);
+      return object(record) && record.runId === a.runId && record.pubkey === pk;
+    };
+    return names(keyProvenanceFile) || names(intentFile) ||
+      Object.values(roster.channels).some(room => object(room) && room.acp_project_id === a.projectId && room.peer?.pubkey === pk && room.status !== 'retired');
+  };
   const fleetFile = join(home,'.claude','watchers','fleet','manifest.tsv');
   const sessionFile = join(state,`resident-${a.projectId}.json`);
   const namesSession = command => new RegExp(`(?:^|\\s)--(?:session-id|resume)\\s+${a.sessionUuid}(?:\\s|$)`).test(command);
@@ -248,27 +262,49 @@ try {
   // such room there is none: the intent is written before any creation, and only this key creates the room. Once this
   // run's retirement has finished, its identity has been moved aside (retire's last host step), and the room it settled
   // is the one that identity's intent names. `record` is the room id the unfinished intent never received.
+  // #1251 C5 — `pk` is this run's key at the path, the only key retirement looks a room up or archives it with. Any
+  // other key there is never used (C5-1). Without this run's key, a room intent of this run says a room may exist and
+  // `missing` is how to put that key back; with no intent of this run anywhere on the host, this run created no room:
+  // ensure-buzz writes that intent, naming this run and its key, before any creation, and nothing deletes one. A run
+  // refused before it minted a key is that case, so no key that never existed is ever asked for (C5-2).
   const unboundRoom = () => {
     const ofThisRun = (record, pk) => object(record) && record.runId === a.runId && record.pubkey === pk;
-    if (!existsSync(a.privateKeyFile)) {
-      const parent = join(state,'retired-buzz-identities');
-      const retired = (existsSync(parent) ? readdirSync(parent) : []).filter(name => name.startsWith(`${a.identityName}.`)).map(name => join(parent,name)).find(dir => {
-        try {return ofThisRun(read(join(dir,basename(keyProvenanceFile))),getPublicKey(Buffer.from(readFileSync(join(dir,basename(a.privateKeyFile)),'utf8').trim(),'hex')));} catch {return false;}
-      });
-      if (retired === undefined) return null;
-      let intent = null;try {intent = read(join(retired,basename(intentFile)));} catch { /* No intent: no room was ever created. */ }
-      return {roomId:object(intent) && typeof intent.roomId === 'string' ? intent.roomId : null,record:null};
+    const atPath = existsSync(a.privateKeyFile) ? pub() : null;
+    if (atPath !== null && keyOfThisRun(atPath)) {
+      const pk = atPath;
+      const intent = existsSync(intentFile) ? read(intentFile) : null;
+      if (ofThisRun(intent,pk) && typeof intent.roomId === 'string') return {pk,roomId:intent.roomId,record:null};
+      const name = ofThisRun(intent,pk) ? intent.name : a.roomName ?? a.projectId;
+      const owned = ownedRooms(name,pk).map(room => room.channel_id ?? room.id);
+      if (owned.length > 1) refuseWithOrder(`the Buzz room of ${a.projectId} was never recorded, and ${a.identityName} (${pk}) owns ${owned.length} rooms named ${name}: ${owned.join(', ')}`,
+        `have an owner archive all but one of rooms ${owned.join(', ')} (buzz channels archive --channel <room>); retirement archives the one left`);
+      if (owned.length === 0) return {pk,roomId:null,record:null};
+      check(/^[a-f0-9-]{36}$/.test(owned[0]),'unrecorded room identity');
+      return {pk,roomId:owned[0],record:{...(ofThisRun(intent,pk) ? intent : {name,pubkey:pk,runId:a.runId}),roomId:owned[0]}};
     }
-    const pk = pub();
+    const aside = atPath === null ? [] : [`move the key at ${a.privateKeyFile} (pubkey ${atPath}) aside: this run did not mint it and the roster binds it to no active route of ${a.projectId}`];
+    const parent = join(state,'retired-buzz-identities');
+    let retiredKey = null;
+    const retired = (existsSync(parent) ? readdirSync(parent) : []).filter(name => name.startsWith(`${a.identityName}.`)).map(name => join(parent,name)).find(dir => {
+      try {
+        const key = getPublicKey(Buffer.from(readFileSync(join(dir,basename(a.privateKeyFile)),'utf8').trim(),'hex'));
+        const names = file => {try {return ofThisRun(read(join(dir,basename(file))),key);} catch {return false;}};
+        if (names(keyProvenanceFile) || names(intentFile)) {retiredKey = key;return true;}
+        return false;
+      } catch {return false;}
+    });
+    if (retired !== undefined) {
+      let intent = null;try {intent = read(join(retired,basename(intentFile)));} catch { /* No intent: no room was ever created. */ }
+      return {pk:null,roomId:object(intent) && typeof intent.roomId === 'string' ? intent.roomId : null,record:null,
+        missing:{pubkey:retiredKey,steps:[...aside,`put this run's identity back from ${retired}: its ${basename(a.privateKeyFile)} and ${basename(pubFile)} in ${dirname(a.privateKeyFile)}, its ${basename(keyProvenanceFile)} and ${basename(intentFile)} in ${state}`]}};
+    }
     const intent = existsSync(intentFile) ? read(intentFile) : null;
-    if (ofThisRun(intent,pk) && typeof intent.roomId === 'string') return {roomId:intent.roomId,record:null};
-    const name = ofThisRun(intent,pk) ? intent.name : a.roomName ?? a.projectId;
-    const owned = ownedRooms(name,pk).map(room => room.channel_id ?? room.id);
-    if (owned.length > 1) refuseWithOrder(`the Buzz room of ${a.projectId} was never recorded, and ${a.identityName} (${pk}) owns ${owned.length} rooms named ${name}: ${owned.join(', ')}`,
-      `have an owner archive all but one of rooms ${owned.join(', ')} (buzz channels archive --channel <room>); retirement archives the one left`);
-    if (owned.length === 0) return {roomId:null,record:null};
-    check(/^[a-f0-9-]{36}$/.test(owned[0]),'unrecorded room identity');
-    return {roomId:owned[0],record:{...(ofThisRun(intent,pk) ? intent : {name,pubkey:pk,runId:a.runId}),roomId:owned[0]}};
+    if (object(intent) && intent.runId === a.runId && typeof intent.pubkey === 'string') {
+      const missing = {pubkey:intent.pubkey,steps:[...aside,`put the key this run minted (pubkey ${intent.pubkey}) at ${a.privateKeyFile}`]};
+      if (typeof intent.roomId === 'string') return {pk:null,roomId:intent.roomId,record:null,missing};
+      refuseWithOrder(`the Buzz room of ${a.projectId} was never recorded, and the key this run created it with (pubkey ${intent.pubkey}) is not at ${a.privateKeyFile} to find it with`,...missing.steps);
+    }
+    return {pk:null,roomId:null,record:null};
   };
   const retirementPreflight = () => {
     const requiredOrder = pid => [
@@ -327,15 +363,14 @@ try {
     })();
     // #1251 C-P2 — the placeholder of an unbound allocation is never looked up: it names no room.
     if (unbound && unbound.roomId === null) return {resident,archive,unbound,room:{state:'none'}};
-    const pk = existsSync(a.privateKeyFile) ? pub() : null;
+    const pk = unbound ? unbound.pk : existsSync(a.privateKeyFile) ? pub() : null;
     const room = pk === null ? null : buzz(['channels','get','--channel',a.roomId]);
     if (room !== null) check(object(room) && room.channel_id === a.roomId && typeof room.name === 'string' && room.name.length > 0,'retiring Buzz room readback mismatch');
     const recorded = plannedRoute?.acp_project_id === a.projectId || intentRoom === a.roomId;
     if (roomArchiveReceipt) return {resident,archive,unbound,room:{state:'archived',archiveReceipt:roomArchiveFile}};
     if (!recorded && room === null && a.roomLifecycle === 'never-created') return {resident,archive,unbound,room:{state:'none'}};
     const owner = plannedRoute?.peer?.pubkey ?? 'not recorded';
-    if (pk === null && a.roomLifecycle === 'unbound') refuseWithOrder(`the Buzz room of ${a.projectId} was never recorded, and no key for ${a.identityName} is at ${a.privateKeyFile} to find it with`,
-      `put the key ${a.identityName} was provisioned with at ${a.privateKeyFile}; retirement finds the room that key owns, archives it and then moves the key aside`);
+    if (pk === null && unbound) refuseWithOrder(`Buzz room ${a.roomId} of ${a.projectId} cannot be archived: the key this run minted (pubkey ${unbound.missing.pubkey}) is not at ${a.privateKeyFile}`,...unbound.missing.steps);
     if (pk === null) refuseWithOrder(`Buzz room ${a.roomId} cannot be archived: no key for ${a.identityName} at ${a.privateKeyFile}`,
       `put the key of room ${a.roomId}'s owner (pubkey ${owner} per the roster) at ${a.privateKeyFile}; retirement archives the room with it and then moves it aside`);
     if (room === null) refuseWithOrder(`Buzz room ${a.roomId} is not visible to ${a.identityName} (${pk})`,
@@ -401,21 +436,10 @@ try {
         routeDb.close();
         break;
       }
-      // #1230 — a key at this identity's path is used only when this run minted it (its provenance or its room intent
-      // names this run and this key) or the roster binds it to this project on an active route. Anything else there —
-      // a retired project's identity or a hand-made one under this name — is moved aside and a new key is minted.
+      // #1230 — a key at this identity's path that is not this run's (keyOfThisRun) — a retired project's identity or a
+      // hand-made one under this name — is moved aside and a new key is minted.
       const existingKey = existsSync(a.privateKeyFile) ? pub() : null;
-      if (existingKey !== null) {
-        const roster = existsSync(rosterFile) ? read(rosterFile) : {channels:{}};
-        check(object(roster) && object(roster.channels),'invalid roster channels');
-        const mintedHere = file => {
-          if (!existsSync(file)) return false;
-          const record = read(file);
-          return object(record) && record.runId === a.runId && record.pubkey === existingKey;
-        };
-        const bound = Object.values(roster.channels).some(room => object(room) && room.acp_project_id === a.projectId && room.peer?.pubkey === existingKey && room.status !== 'retired');
-        if (!mintedHere(keyProvenanceFile) && !mintedHere(intentFile) && !bound) moveIdentityAside();
-      } else moveIdentityAside();
+      if (existingKey === null || !keyOfThisRun(existingKey)) moveIdentityAside();
       if (!existsSync(a.privateKeyFile)) {
         const secret = generateSecretKey();
         atomic(a.privateKeyFile,Buffer.from(secret).toString('hex')+'\n');
@@ -540,7 +564,8 @@ try {
         check(readProcessStartToken(resident.pid) !== resident.startedAt,'resident did not stop');
       }
       if (existsSync(a.clonePath)) {mkdirSync(dirname(archive),{recursive:true,mode:0o700});renameSync(a.clonePath,archive);}
-      const identityArchive = moveIdentityAside();
+      // #1251 C5-1 — an unbound allocation moves aside only this run's identity; whatever else is at the path stays as it is.
+      const identityArchive = unbound && unbound.pk === null ? null : moveIdentityAside();
       result = {retired:true,buzzRoom:room.state === 'none' ? 'none' : 'archived',...(existsSync(archive) ? {retirementArchivePath:archive} : {}),...(identityArchive ? {identityArchivePath:identityArchive} : {})}; break;
     }
     default: throw new Error('unknown operation');

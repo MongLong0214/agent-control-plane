@@ -804,3 +804,104 @@ it.each(['profile','create'] as const)('#1251 C-P2: retirement settles the room 
     expect(settled()).toEqual(before);
   } finally {h.cp.close();}
 });
+
+/** #1251 C5 — a bootstrap run through the daemon's ledger whose ensure-buzz the host lock refuses before any key step. */
+const lockRefusedEnsureBuzz = async (f:ReturnType<typeof fixture>, root:string) => {
+  const h = makeHarness({root,residentProvisioner:{home:f.home,script:daemonHost(f)}});
+  const run = h.cp.runs.create({kind:RunKind.PROJECT_BOOTSTRAP,executionMode:ExecutionMode.STANDARD,
+    contract:{goal:'bootstrap',why:'owner request',scope:[],nonGoals:[],acceptance:['developable'],priority:'NORMAL',humanGate:[],references:[]}});
+  if (!run.allowed) throw new Error(run.message);
+  const runId = run.value.runId;
+  h.cp.projects.register({projectId:'test',name:'test'});
+  h.cp.residentProjects.attachSubscriber(async () => false);
+  h.cp.residentProjects.remember({runId,candidateSnapshotDigest:'candidate',ceoSessionId:'ceo'},'test',{});
+  // Another provisioner, alive (this test process), holds the host lock while ensure-buzz runs.
+  const busy = join(f.home,'busy-provisioner');mkdirSync(busy);
+  writeFileSync(join(busy,'owner.json'),JSON.stringify({pid:process.pid,start:readProcessStartToken(process.pid)}));
+  const host = h.cp.hostProjectProvisioner!;const invoke = host.invoke.bind(host);
+  const lock = join(root,'host-provisioner.lock');
+  const refusals:string[] = [];
+  vi.spyOn(host,'invoke').mockImplementation(async (operation,allocation,packet) => {
+    if (operation !== 'ensure-buzz') return invoke(operation,allocation,packet);
+    symlinkSync(busy,lock);
+    try {return await invoke(operation,allocation,packet);} catch (error) {refusals.push(String(error));throw error;} finally {rmSync(lock);}
+  });
+  await expect(h.cp.residentProjects.ensure({runId,projectId:'test',repositoryIdentity:'github:acme/fixture',repositoryNodeId:'R_node',head:'a'.repeat(40),packet:{}})).rejects.toThrow();
+  expect(refusals).toHaveLength(1);
+  vi.mocked(host.invoke).mockRestore();
+  const allocation = h.cp.residentProjects.allocation(runId)!;
+  expect(allocation.roomLifecycle).toBe('unbound');
+  return {h,runId,allocation};
+};
+
+it.each(['older-identity','no-key'] as const)('#1251 C5: retirement after ensure-buzz was refused at the host lock settles no room and needs no key (%s)',async left => {
+  const f = fixture();
+  const root = realpathSync(tempDir('retire-lock-refused-'));
+  const olderRoom = '12345678-1234-4123-8123-123456789abc';
+  const olderKey = '2'.repeat(64);const olderPk = getPublicKey(Buffer.from(olderKey,'hex'));
+  const identity = [f.a.privateKeyFile,f.a.privateKeyFile.replace('.priv','.pub'),join(root,'buzz-key-test.json'),join(root,'buzz-room-test.json')];
+  if (left === 'older-identity') {
+    // C5-1: an older run's key, its records and its same-named room, which that key owns. No roster route binds it here.
+    mkdirSync(root,{recursive:true});
+    writeFileSync(identity[0]!,olderKey+'\n');writeFileSync(identity[1]!,olderPk+'\n');
+    writeFileSync(identity[2]!,JSON.stringify({runId:'run_old',pubkey:olderPk}));
+    writeFileSync(identity[3]!,JSON.stringify({name:'test',pubkey:olderPk,runId:'run_old',roomId:olderRoom}));
+    writeFileSync(join(f.home,'fake.json'),JSON.stringify({members:[{pubkey:olderPk,role:'owner'}],posts:[],creates:0,launches:0,
+      room:{channel_id:olderRoom,name:'test',channel_type:'stream',visibility:'private'}}));
+  }
+  const files = () => identity.map(file => existsSync(file) ? readFileSync(file,'utf8') : null);
+  const before = files();
+  const {h,runId,allocation} = await lockRefusedEnsureBuzz(f,root);
+  try {
+    // The refused ensure-buzz rotated nothing and minted nothing.
+    expect(files()).toEqual(before);
+    const retired = await retireProject(h.cp,'test','operator retirement');
+    expect(retired,JSON.stringify(retired)).toMatchObject({allowed:true});
+    expect(h.cp.residentProjects.row(runId)?.status).toBe('RETIRED');
+    expect((JSON.parse(h.cp.residentProjects.row(runId)!.steps_json) as {retire:{buzzRoom:string}}).retire.buzzRoom).toBe('none');
+    const settled = () => ({room:fakeState(f).room ?? null,archived:fakeState(f).archivedRooms ?? [],creates:fakeState(f).creates,
+      receipt:existsSync(join(root,'retired-buzz-room-test.json')),identities:existsSync(join(root,'retired-buzz-identities')),files:files()});
+    // The older run's room stays active and its identity stays where it was; this run had no room and no key.
+    expect(settled()).toEqual({room:left === 'older-identity' ? expect.objectContaining({channel_id:olderRoom}) : null,archived:[],creates:0,receipt:false,identities:false,files:before});
+    expect(existsSync(f.a.clonePath)).toBe(false);
+    // A daemon exit after the host step and before its ledger recorded it: the host retire runs again, changing nothing.
+    const again = settled();
+    expect(await new ExecFileHostProjectProvisioner(daemonHost(f),f.home,root,30_000,join(root,'state.sqlite')).invoke('retire',allocation)).toMatchObject({retired:true,buzzRoom:'none'});
+    expect(settled()).toEqual(again);
+  } finally {h.cp.close();}
+});
+
+it('#1251 C5-1: a key that replaced the one this run created its room with is never used; retirement names the key it needs',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');
+  // This run's ensure-buzz created its room and lost the answer: the room intent names this run's key and no room yet.
+  patchFake(f,{loseCreate:true});
+  await expect(f.invoke('ensure-buzz')).rejects.toThrow();
+  const pubFile = f.a.privateKeyFile.replace('.priv','.pub');
+  const ownKey = readFileSync(f.a.privateKeyFile,'utf8');const ownPk = readFileSync(pubFile,'utf8').trim();
+  const room = (fakeState(f).room as {channel_id:string}).channel_id;
+  // Another identity under this name is put at the path: this run did not mint it and no route binds it.
+  const otherKey = '3'.repeat(64);const otherPk = getPublicKey(Buffer.from(otherKey,'hex'));
+  writeFileSync(f.a.privateKeyFile,otherKey+'\n');writeFileSync(pubFile,otherPk+'\n');
+  f.a.roomLifecycle = 'unbound';saveAllocation(f);
+  const snapshot = () => ({room:fakeState(f).room,archived:fakeState(f).archivedRooms ?? [],
+    files:[f.a.privateKeyFile,pubFile,join(f.state,'buzz-room-test.json'),join(f.state,'buzz-key-test.json')].map(file => existsSync(file) ? readFileSync(file,'utf8') : null),clone:existsSync(f.a.clonePath)});
+  const before = snapshot();
+  const order = [
+    `move the key at ${f.a.privateKeyFile} (pubkey ${otherPk}) aside: this run did not mint it and the roster binds it to no active route of test`,
+    `put the key this run minted (pubkey ${ownPk}) at ${f.a.privateKeyFile}`,
+    'run agentctl project retire test again',
+  ];
+  const host = new ExecFileHostProjectProvisioner(daemonHost(f),f.home,f.state,30_000,f.database);
+  for (const operation of ['verify-retire','retire'] as const) {
+    const refused = await host.invoke(operation,f.a).then(() => null,(error:unknown) => error);
+    expect(refused).toBeInstanceOf(HostRetirementRefusal);
+    expect(refused,String(refused)).toMatchObject({hostChanged:false,requiredOrder:order});
+    expect(snapshot()).toEqual(before);
+  }
+  // The order is executable: with this run's key back, retirement archives the room it created.
+  renameSync(f.a.privateKeyFile,join(f.home,'other.priv'));renameSync(pubFile,join(f.home,'other.pub'));
+  writeFileSync(f.a.privateKeyFile,ownKey);writeFileSync(pubFile,ownPk+'\n');
+  expect(await host.invoke('retire',f.a)).toMatchObject({retired:true,buzzRoom:'archived'});
+  expect(fakeState(f).archivedRooms).toEqual([expect.objectContaining({channel_id:room,archived:true})]);
+});
