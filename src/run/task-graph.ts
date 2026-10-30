@@ -8,6 +8,7 @@ import type {
 import { canonicalJson, digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny, fail, isAcpError } from "../core/errors.ts";
 import { newTaskId } from "../core/ids.ts";
+import { readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
@@ -225,6 +226,25 @@ export const CLOSED_TO_NEW_TASKS: ReadonlySet<string> = new Set<string>([
   RunState.FAILED,
   RunState.CANCELLED,
 ]);
+
+/**
+ * Whether the process a CTO receipt named is still the one running under its pid. A pid alone is
+ * reused, so liveness is the process's identity: the OS start token read now must equal the one the
+ * receipt recorded when it opened. No recorded start, or a start that differs or cannot be read, is
+ * not that process.
+ */
+export const receiptProcessIsRunning = (
+  db: Db,
+  receipt: { runId: string; executionId: string; pid: number },
+): boolean => {
+  const recorded = db.get<{ started: unknown }>(
+    `SELECT json_extract(evidence_json, '$.workerProcessStartedAt') AS started FROM audit_events
+      WHERE kind = 'TASK_EXECUTION_STARTED' AND run_id = ? AND json_extract(evidence_json, '$.executionId') = ?
+      ORDER BY event_id LIMIT 1`,
+    [receipt.runId, receipt.executionId],
+  )?.started;
+  return typeof recorded === "string" && readProcessStartToken(receipt.pid) === recorded;
+};
 
 export class TaskGraph {
   #capacity: WorkerCapacityGate | null = null;
@@ -488,6 +508,19 @@ export class TaskGraph {
           { taskId: input.taskId, state: task.state },
         );
       }
+      // A receipt that names a worker process binds that process's OS start, not its pid: a pid is
+      // reused, so a restart keeps the receipt RUNNING only while the same process holds it
+      // (`receiptProcessIsRunning`). The admission path refuses a pid whose start cannot be read; the
+      // synchronous primitive records it as unknown, which a restart treats as not running.
+      const workerProcessId = input.workerProcessId ?? null;
+      const workerProcessStartedAt = workerProcessId === null ? null : readProcessStartToken(workerProcessId);
+      if (admitted && workerProcessId !== null && workerProcessStartedAt === null) {
+        return deny(
+          ReasonCode.INVALID_ARGUMENT,
+          "the worker process's start time cannot be read; a receipt names a running process",
+          { taskId: input.taskId, workerProcessId },
+        );
+      }
 
       const attempt = task.attemptCount + 1;
       const executionId = `${input.taskId}#${attempt}`;
@@ -570,7 +603,7 @@ export class TaskGraph {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?)`,
         [
           executionId, input.runId, input.taskId, attempt, input.ownerBindingGeneration,
-          input.workerSessionId, input.workerProcessId ?? null, input.provider, input.model,
+          input.workerSessionId, workerProcessId, input.provider, input.model,
           input.repositoryId ?? null, input.worktreeId ?? null, input.concurrencyWidth ?? null, now,
           input.runtimeManaged === true ? 1 : 0,
         ],
@@ -585,6 +618,7 @@ export class TaskGraph {
         runId: input.runId,
         sessionId: input.workerSessionId,
         evidence: {
+          executionId,
           taskId: input.taskId,
           attempt,
           provider: input.provider,
@@ -592,6 +626,9 @@ export class TaskGraph {
           worktreeId: input.worktreeId ?? null,
           ownerBindingGeneration: input.ownerBindingGeneration,
           runtimeManaged: input.runtimeManaged === true,
+          // The execution row's start column is the runner's alone (CP-HI-06), so a receipt's lives here.
+          pid: workerProcessId,
+          workerProcessStartedAt,
         },
       });
 

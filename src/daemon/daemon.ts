@@ -30,7 +30,7 @@ import {
   CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON,
   CONTINUITY_PAUSE_OWNER_FIELDS,
 } from "../run/run-engine.ts";
-import { BOOTSTRAP_PLAN_TASKS } from "../run/task-graph.ts";
+import { BOOTSTRAP_PLAN_TASKS, receiptProcessIsRunning } from "../run/task-graph.ts";
 import { TASK_WRITE_TARGET_RECORDED, TaskWriteTargets } from "../run/task-write-target.ts";
 import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import {
@@ -1767,11 +1767,15 @@ export class Daemon {
     const orphanedExecutions: string[] = (await this.cp.workerTurns.reconcileAfterRestart())
       .map((orphan) => orphan.executionId);
 
-    // A receipt that says RUNNING across a restart has no live worker behind it.
-    for (const row of this.cp.db.all<{ execution_id: string; worker_process_id: number | null }>(
-      `SELECT execution_id, worker_process_id FROM task_executions WHERE status = 'RUNNING' AND runtime_managed = 0`,
+    // A receipt that says RUNNING across a restart has no live worker behind it, unless the exact
+    // process it named at open still runs: the same pid with the same OS start.
+    for (const row of this.cp.db.all<{ execution_id: string; run_id: string; worker_process_id: number | null }>(
+      `SELECT execution_id, run_id, worker_process_id FROM task_executions WHERE status = 'RUNNING' AND runtime_managed = 0`,
     )) {
-      if (row.worker_process_id == null || !isAlive(row.worker_process_id)) {
+      if (
+        row.worker_process_id == null ||
+        !receiptProcessIsRunning(this.cp.db, { runId: row.run_id, executionId: row.execution_id, pid: row.worker_process_id })
+      ) {
         this.cp.tasks.finishExecution(row.execution_id, {
           status: "ABANDONED",
           failureClass: "infrastructure",
@@ -4100,16 +4104,6 @@ export class Daemon {
     return { complete: !lockRetained };
   }
 }
-
-const isAlive = (pid: number): boolean => {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-};
 
 const parseAuthenticatedOperatorPeer = (
   peer: AuthenticatedOperatorPeer | undefined,
