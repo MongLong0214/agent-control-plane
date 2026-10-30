@@ -171,10 +171,15 @@ export const projectManifestSchema = z
       )
       .min(1)
       .optional(),
+    /**
+     * #1268 — a manifest that does not name a mode requires CommitLore. Every stored manifest was stored
+     * after the schema filled this field in, so the default changes no stored manifest or its digest; one
+     * that says `preferred` or `off` keeps it until a contract change raises it.
+     */
     commitlore: z
-      .object({ mode: z.enum(["required", "preferred", "off"]).default("preferred") })
+      .object({ mode: z.enum(["required", "preferred", "off"]).default("required") })
       .strict()
-      .default({ mode: "preferred" }),
+      .default({ mode: "required" }),
   })
   .strict()
   .superRefine((manifest, ctx) => {

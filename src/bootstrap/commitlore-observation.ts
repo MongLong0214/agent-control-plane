@@ -15,9 +15,11 @@ import { runtimeEnvironment } from "../runtime/cli-adapters.ts";
 import {
   COMMITLORE_BINARY_VARIABLE,
   COMMITLORE_PIN_IDENTITY_TIMEOUT_MS,
+  type CommitLoreReleaseLookup,
   assertCommitLorePinUnchanged,
   bindCommitLorePin,
   commitlorePin,
+  officialCommitLoreRelease,
   verifyCommitLorePin,
 } from "./commitlore-pin.ts";
 import type { RepoFactoryResult } from "./repo-factory-result.ts";
@@ -402,10 +404,16 @@ const commitloreChild =
  * `COMMITLORE_PIN_MAX_BYTES` is refused on its descriptor's size before a byte is read, no reading takes
  * more than that cap plus one byte, and none outlasts `identityTimeoutMs`. Its time is no check's and no
  * command's: each child's bound starts at its own spawn.
+ *
+ * #1268 — after the three checks, `ready` asks `latest` for the newest published stable release and refuses
+ * unless the version the pin answered is that release's (`judgeCommitLoreLatest`). It asks on every call,
+ * never reusing an earlier answer, so each observation confirms its own; the production lookup is bounded by
+ * `COMMITLORE_RELEASE_TIMEOUT_MS`.
  */
 export const commitloreRunner = (
   limits: Readonly<CommitLoreLimits> = COMMITLORE_LIMITS,
   pin: string | undefined = process.env[COMMITLORE_BINARY_VARIABLE],
+  latest: CommitLoreReleaseLookup = officialCommitLoreRelease,
 ): CommitLoreRunner & { readonly ready: (cwd: string) => Promise<CommitLoreRunner> } => {
   const pinned = (): string => {
     const executable = commitlorePin(pin);
@@ -418,7 +426,7 @@ export const commitloreRunner = (
     const bound = await bindCommitLorePin(executable, limits.identityTimeoutMs);
     const unchanged = (): Promise<void> => assertCommitLorePinUnchanged(pinned(), bound, limits.identityTimeoutMs);
     const check = commitloreChild(executable, { ...limits, timeoutMs: limits.checkTimeoutMs }, unchanged);
-    const unsupported = await verifyCommitLorePin(executable, check, cwd);
+    const unsupported = await verifyCommitLorePin(executable, check, cwd, latest);
     if (unsupported !== null) throw new Error(unsupported);
     // A change made while the last check ran refuses here, before any command is asked for.
     await unchanged();

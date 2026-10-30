@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 
 import { COMMITLORE_LIMITS, commitloreRunner, createCommitLoreCliPort, probeCommitLore } from "../../src/bootstrap/commitlore-observation.ts";
+import { latestRelease } from "../helpers/commitlore-release.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 /**
@@ -27,6 +28,8 @@ afterAll(() => {
 });
 
 const root = tempDir("acp-s11-r1-boundaries-");
+/** #1268 — the production port on the pin in the environment; the fakes answer 1.7.3, confirmed as the newest release. */
+const envPort = () => createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, undefined, latestRelease("1.7.3")));
 const ok = JSON.stringify({ schema: "commitlore_doctor.v2", status: "ok", exitCode: 0, checks: [] });
 
 // Slice S16: what the runner asks a pinned CLI before any other command, answered as a supported one does.
@@ -148,7 +151,7 @@ it("R1-01: CommitLore children receive no daemon authority variables, a known na
   for (const key of sentinels) vi.stubEnv(key, `review-only-${key}`);
   vi.stubEnv(unknownName, unknownValue);
 
-  expect((await createCommitLoreCliPort().observe(root)).outcome).toBe("PASS");
+  expect((await envPort().observe(root)).outcome).toBe("PASS");
   const observed = JSON.parse(readFileSync(capture, "utf8")) as Record<string, string>;
   expect(Object.fromEntries(sentinels.map((key) => [key, observed[key] ?? null]))).toEqual(
     Object.fromEntries(sentinels.map((key) => [key, null])),
@@ -202,7 +205,7 @@ it("R1-02: an output-overflowing child cannot keep the observation pending by ig
   // at 5.0-5.1 s under parallel load (s16-r1-fix-evidence/superseded/round-before-overflow-prep).
   prepareFixture(join(bin, "commitlore"), ["--version"]);
   let settled = false;
-  const pending = createCommitLoreCliPort()
+  const pending = envPort()
     .observe(root)
     .then((value) => {
       settled = true;
@@ -326,7 +329,7 @@ const observeExit0 = async (
     return realKill.call(this, signal);
   };
   try {
-    const run = commitloreRunner({ ...COMMITLORE_LIMITS, ...limits }, bin);
+    const run = commitloreRunner({ ...COMMITLORE_LIMITS, ...limits }, bin, latestRelease("1.7.3"));
     const settledWithin = limits.timeoutMs + holdMs + limits.killGraceMs + 3_000;
     const observed = await Promise.race([
       createCommitLoreCliPort(run).observe(root),
@@ -436,7 +439,7 @@ it("lead-3: a successful init that creates a checkout file is refused by the pro
     else console.log(${JSON.stringify(ok)});
   `,
   );
-  expect(await probeCommitLore(createCommitLoreCliPort())).toMatchObject({
+  expect(await probeCommitLore(envPort())).toMatchObject({
     allowed: false,
     evidence: { refusal: "COMMITLORE_CHANGED_CHECKOUT", at: "probe" },
   });

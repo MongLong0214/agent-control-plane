@@ -7,11 +7,17 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
+  COMMITLORE_LIMITS,
   commitloreChildEnvironment,
+  commitloreRunner,
   createCommitLoreCliPort,
   requiredCommitLoreObservation,
 } from "../../src/bootstrap/commitlore-observation.ts";
+import { latestRelease } from "../helpers/commitlore-release.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+
+/** #1268 — the production port on the pin in the environment; the fake answers 1.7.3, confirmed as the newest release. */
+const envPort = () => createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, undefined, latestRelease("1.7.3")));
 
 /**
  * Review S11-R3 (PR #1138, CEO cb5501eb) — no credential reaches a `commitlore` child indirectly: not
@@ -242,7 +248,7 @@ describe("S11-R3: a CommitLore child reaches no credential, through its own git 
     );
     injectDaemonEnvironment();
     resetMarks();
-    observedOutcome = (await createCommitLoreCliPort().observe(repo)).outcome;
+    observedOutcome = (await envPort().observe(repo)).outcome;
     const log = readLog("observed");
     observedHomes = log.filter((entry) => "home" in entry);
     // Every credential request was made, reached git's credential step and found nothing there.
@@ -327,7 +333,7 @@ describe("S11-R3 control: a required CommitLore that cannot reach its remote is 
     fake(name, `process.exit(git(['ls-remote', 'origin']) ?? 1);`);
     injectDaemonEnvironment();
     resetMarks();
-    const decision = await requiredCommitLoreObservation(createCommitLoreCliPort(), repo);
+    const decision = await requiredCommitLoreObservation(envPort(), repo);
     expect(decision).toMatchObject({ allowed: false, evidence: { refusal: "COMMITLORE_REQUIRED_NOT_OBSERVED" } });
     expect(readLog(name).map((entry) => [entry["git"], entry["status"]])).toEqual([["ls-remote origin", 128]]);
     expect(ran()).toEqual([]);

@@ -30,7 +30,8 @@ vi.mock("node:child_process", async (original) => {
     },
   };
 });
-import { createCommitLoreCliPort } from "../../src/bootstrap/commitlore-observation.ts";
+import { COMMITLORE_LIMITS, commitloreRunner, createCommitLoreCliPort } from "../../src/bootstrap/commitlore-observation.ts";
+import { latestRelease } from "../helpers/commitlore-release.ts";
 
 afterEach(() => vi.unstubAllEnvs());
 afterAll(cleanupTempDirs);
@@ -71,7 +72,7 @@ it("R1-02: timeout is refused even if the signalled child exits zero with valid 
   } catch (error) {
     throw new Error(`FIXTURE-PREPARATION FAILURE: the fake's --version did not complete within 30000 ms (${(error as Error).message.split("\n", 1)[0]}); the witness was not judged`);
   }
-  const result = await createCommitLoreCliPort().observe(root);
+  const result = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, undefined, latestRelease("1.7.3"))).observe(root);
   // The review asserted both commands asked for 180 s; at the fix `init` is refused, so only it asks, after
   // the pin's three checks (slice S16: `--version`, `doctor --help`, `init --help`), under the same bound.
   expect(timing.requested).toEqual([180000, 180000, 180000, 180000]);

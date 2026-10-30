@@ -205,18 +205,21 @@ describe("#246 B3: the bootstrap producer enforces the approved manifest's Commi
     expect(commitlore.paths).toEqual([]);
   });
 
-  it("B3-4 an unsupported mode is refused by the manifest contract, and a missing one is the contract's explicit preferred", () => {
+  it("B3-4 an unsupported mode is refused by the manifest contract, and a missing one is the contract's explicit required (#1268)", () => {
     const run = { kind: RunKind.PROJECT_BOOTSTRAP, projectId: null };
     const unsupported = { ...cleanTreeManifest("b3-unsupported"), commitlore: { mode: "mandatory" } } as unknown as ProjectManifest;
     const plan = { ...bootstrapPlan(cleanTreeManifest("b3-unsupported")), projectManifest: unsupported };
     expect(planForSubmission(run, plan), "unsupported").toMatchObject({ allowed: false, evidence: { refusal: "MANIFEST_NOT_PORTABLE" } });
 
-    // Missing: the contract's default fills `preferred` before the digest, so the PLAN that is reviewed
+    // Missing: the contract's default fills `required` (#1268) before the digest, so the PLAN that is reviewed
     // and approved states it; nothing is lowered after approval.
     const { commitlore: _omitted, ...missing } = cleanTreeManifest("b3-missing");
-    const admitted = planForSubmission(run, { ...bootstrapPlan(cleanTreeManifest("b3-missing")), projectManifest: missing });
+    const admitted = planForSubmission(run, {
+      ...bootstrapPlan({ ...cleanTreeManifest("b3-missing"), commitlore: { mode: "required" } }),
+      projectManifest: missing,
+    });
     expect(admitted.allowed).toBe(true);
-    if (admitted.allowed) expect((admitted.value["projectManifest"] as ProjectManifest).commitlore).toEqual({ mode: "preferred" });
+    if (admitted.allowed) expect((admitted.value["projectManifest"] as ProjectManifest).commitlore).toEqual({ mode: "required" });
   });
 
   it("B3-5 no downgrade: a required run refused at the published head stays required, frozen, and is refused again on retry", async () => {

@@ -12,6 +12,7 @@ import {
   probeCommitLore,
   requiredCommitLoreObservation,
 } from "../../src/bootstrap/commitlore-observation.ts";
+import { latestRelease } from "../helpers/commitlore-release.ts";
 import { cleanupTempDirs, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -124,7 +125,7 @@ else refuse();
 };
 
 const argvs = (log: string): string[] => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : []);
-const portAt = (bin: string) => createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, bin));
+const portAt = (bin: string) => createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, bin, latestRelease("1.7.4")));
 // The guard's own question, untrimmed: a leading status column is significant.
 const status = (checkout: string): string =>
   execFileSync("git", ["-C", checkout, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8", timeout: 20_000 });
@@ -144,7 +145,7 @@ describe("R2: the observation's init carries --no-agent-hooks, and a CommitLore 
     const hooksBefore = hooks(checkout);
 
     // The refusal, uncut, as the pin's checks give it.
-    await expect(commitloreRunner(COMMITLORE_LIMITS, cli.bin).ready(checkout)).rejects.toThrow(
+    await expect(commitloreRunner(COMMITLORE_LIMITS, cli.bin, latestRelease("1.7.4")).ready(checkout)).rejects.toThrow(
       `ACP_COMMITLORE_BINARY NO_INIT_OPTION: ${cli.bin} init does not offer --no-agent-hooks, which the observation needs so that it writes nothing into the checkout`,
     );
     expect(argvs(cli.log)).toEqual(CHECKS);
