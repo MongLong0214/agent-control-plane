@@ -24,6 +24,7 @@ import type { BootstrapCompletionChainPort, ProductionGate } from "../ceo/produc
 import type { ManagedManifestWrite, ProjectRegistry } from "../registry/project-registry.ts";
 import { isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
+import { METHOD_REVIEW_STALE, reviewedUnderCurrentMethod } from "../review/frontier-simplify-policy.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import { drivenModeOf } from "../runtime/provisioned-session-runtime.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -536,6 +537,9 @@ export class BootstrapActivation {
       return refuse("activation requires a passing blind review of the bootstrap run", {
         verdict: review?.content.verdict ?? null,
       });
+    }
+    if (!reviewedUnderCurrentMethod(review.content)) {
+      return deny(ReasonCode.EVIDENCE_STALE, METHOD_REVIEW_STALE, { runId, incomplete: ["blindReview"], candidateSnapshotDigest });
     }
     const planArtifact = this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN);
     const current = currentBootstrapPlan(runId, planArtifact);

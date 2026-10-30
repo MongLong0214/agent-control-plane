@@ -341,6 +341,12 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string; witn
     file: "run/run-engine.ts",
     anchor: "  ): Decision<{ run: RunRow; released: boolean; kept: string | null }> {\n    return this.db.txDecision(() => {",
   },
+  {
+    // #1271: a refused later side of a cross-product split is refused after an earlier side's audit write.
+    label: "DogfoodFindingStore.recordAcrossProducts",
+    file: "quality/upstream-dogfood.ts",
+    anchor: "    const [linking, commitloreHalf] = [sides[0]!.data, sides[1]!.data];\n    return this.#deps.db.txDecision(() => {",
+  },
 ];
 
 /** Every EXEMPT and DEFERRED entry, so a marker drifting out of its body is caught for all of them, not just one. */
