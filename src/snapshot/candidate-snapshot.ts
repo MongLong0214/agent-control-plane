@@ -80,6 +80,8 @@ export const snapshotRepositorySchema = z
     repositoryRole: z.string().min(1),
     baseBranch: z.string().min(1),
     baseHead: z.string().regex(/^[0-9a-f]{40}$/),
+    /** Present when `baseHead` is a run-recorded immutable task pin, not the live `baseBranch` ref. */
+    baseHeadPinned: z.literal(true).optional(),
     /**
      * The branch the candidate was required to be cut from, not the mutable PR
      * target. These remain optional only so pre-lineage snapshot artifacts can be
@@ -215,6 +217,8 @@ export interface SnapshotRepositoryInput {
   checkoutPath: string;
   baseBranch: string;
   baseRef?: string;
+  /** The base ref is an exact run-recorded commit; freshness must not re-resolve `baseBranch`. */
+  baseHeadPinned?: true;
   /** Required branch origin, resolved to its exact SHA as part of the freeze. */
   sourceBranch?: string | null;
   /** The exact origin SHA selected by freeze; this ref is never re-resolved here. */
@@ -363,6 +367,7 @@ export const buildCandidateSnapshot = async (
       repositoryRole: input.repositoryRole,
       baseBranch: input.baseBranch,
       baseHead,
+      ...(input.baseHeadPinned === true ? { baseHeadPinned: true as const } : {}),
       sourceBranch,
       sourceHead,
       candidateHead,
@@ -419,6 +424,12 @@ export interface FreshnessProbe {
   identity: string;
   checkoutPath: string;
   /**
+   * #1227 — the resident's clone, when `checkoutPath` is that resident's worker clone
+   * (`residentBaseClone`): the base branch is read there as the current base. Only read. Without
+   * one, a pinned candidate's current base is read in `checkoutPath`.
+   */
+  residentClone?: string | null;
+  /**
    * Manifest digest currently active for this repository. §16.2 stales the snapshot when
    * the manifest changes, not only when the candidate head moves.
    */
@@ -458,16 +469,38 @@ export const verifySnapshotFreshness = async (
       drift.push({ identity: repo.identity, expectedTree: repo.treeDigest, observedTree: tree });
       continue;
     }
-    // A moved base changes what the diff means, even when the candidate head is untouched.
-    const base = await tryRevParse(probe.checkoutPath, repo.baseBranch);
+    // A branch-derived base must not move. A run-recorded task pin is immutable instead: the worker
+    // clone's base branch may intentionally remain older, but the exact pinned object must stay readable.
+    const base = await tryRevParse(probe.checkoutPath, repo.baseHeadPinned === true ? repo.baseHead : repo.baseBranch);
     if (base !== repo.baseHead) {
       drift.push({
         identity: repo.identity,
-        baseBranch: repo.baseBranch,
+        ...(repo.baseHeadPinned === true ? { reason: "pinned base commit is no longer readable" } : { baseBranch: repo.baseBranch }),
         expectedBaseHead: repo.baseHead,
         observedBaseHead: base,
       });
       continue;
+    }
+    // #1227 review r2/r3 (PR #1256, D-P2) — readable is not current: a pinned candidate is held to the
+    // base branch as it stands now, read where the run's base pin read it (`task-write-target.ts`): a
+    // resident's base branch in its clone, since the resident's worker clone keeps its own where the
+    // clone was made, and otherwise the registered checkout's. Read only (no ref, no FETCH_HEAD);
+    // pinned or not, a candidate whose base is no longer that commit is stale.
+    const currentBaseAt = probe.residentClone || (repo.baseHeadPinned === true ? probe.checkoutPath : null);
+    if (currentBaseAt) {
+      const current = await tryRevParse(currentBaseAt, `refs/heads/${repo.baseBranch}`);
+      if (current !== repo.baseHead) {
+        drift.push({
+          identity: repo.identity,
+          reason: probe.residentClone
+            ? "the resident's base branch no longer names the candidate's base"
+            : "the base branch no longer names the candidate's pinned base",
+          baseBranch: repo.baseBranch,
+          expectedBaseHead: repo.baseHead,
+          observedBaseHead: current,
+        });
+        continue;
+      }
     }
     // The frozen source SHA, not the moving source branch ref, is the lineage evidence.
     // Advancing that branch after freeze must therefore not rewrite or stale a candidate.

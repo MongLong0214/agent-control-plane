@@ -755,15 +755,16 @@ export class GitHubKernel {
       "GET",
       `/repos/${owner}/${repo}/pulls/${pull.number}`,
     );
-    if (
-      reread.head.sha !== input.input.exactHeadSha ||
-      reread.head.ref !== input.input.head ||
-      reread.base.ref !== input.input.base ||
-      reread.base.sha !== input.candidate.baseHead
-    ) {
+    if (reread.head.sha !== input.input.exactHeadSha || reread.head.ref !== input.input.head) {
       return deny(ReasonCode.MERGE_HEAD_STALE, "pull request head does not match the candidate head", {
-        expected: input.input.exactHeadSha,
-        observed: { head: reread.head, base: reread.base },
+        expected: { sha: input.input.exactHeadSha, ref: input.input.head },
+        observed: reread.head,
+      });
+    }
+    if (reread.base.ref !== input.input.base || reread.base.sha !== input.candidate.baseHead) {
+      return deny(ReasonCode.MERGE_BASE_STALE, "pull request base does not match the frozen candidate base", {
+        expected: { sha: input.candidate.baseHead, ref: input.input.base },
+        observed: reread.base,
       });
     }
     if (input.input.requireLinkage && !this.hasPrLinkage(reread.body, linkedIssues)) {

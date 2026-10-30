@@ -11,6 +11,7 @@ import { fixedRuntimes } from "../domain/fixed-role-runtime.ts";
 import { type FailureClass, Role, RunKind, SessionLifecycle, TaskState, roleKeyFor } from "../domain/types.ts";
 import { type ManagedWriteGuard, WriteOperation } from "../guard/managed-write-guard.ts";
 import { canonical } from "../guard/workspace-probe.ts";
+import { residentRepository } from "../registry/resident-repositories.ts";
 import { providerHome } from "../runtime/cli-adapters.ts";
 import type { InvocationResult, ProviderAdapter } from "../runtime/provider.ts";
 import { randomUUID } from "node:crypto";
@@ -56,6 +57,7 @@ import {
   ignoredPathState,
   ignoredPathsChanged,
   objectFormatOf,
+  objectStoreIntegrity,
   parentOf,
   pinRepository,
   plumbingWorkerCommit,
@@ -1210,6 +1212,17 @@ export class WorkerTurnRunner {
         worktreeId: worktree,
       });
     }
+    // #1227 — a resident CTO works in its clone, and nothing its tooling leaves there may reach a worker
+    // turn. A repository still registered at that clone runs no worker turn: the daemon moves it to its
+    // dedicated worker checkout on its next pass (registry/worker-checkout.ts), and a turn runs there.
+    const resident = residentRepository(db, repository.repository_id);
+    if (resident && worktree === resident.clonePath) {
+      return deny(
+        ReasonCode.CONFLICT,
+        "the registered checkout is the resident CTO's working directory; worker turns run only in the project's own worker checkout, which the daemon moves the repository to on its next pass",
+        { claimId: request.claimId, worktreeId: worktree, workerCheckout: resident.workerCheckoutPath },
+      );
+    }
     return allow(ReasonCode.OK, {
       claimId: request.claimId,
       repositoryId: repository.repository_id,
@@ -1522,7 +1535,12 @@ export class WorkerTurnRunner {
     // Re-entry: the checkout is on the task's branch already; the preparation that follows reads it.
     if (branch === target.branch) return allow(ReasonCode.OK, undefined);
     let handoff: { runId: string; taskId: string; branch: string } | null = null;
-    if (branch !== facts.claim.baseBranch) {
+    // #1227 — a resident project's worker clone rests detached. Its task branch is cut directly from
+    // the run's pinned commit; no unclaimed base ref is moved. Only that checkout is taken from a
+    // detached HEAD; any other detached checkout is someone's, and is not moved.
+    const dedicated = residentRepository(this.ports.db, facts.claim.repositoryId)?.workerCheckoutPath === worktree;
+    const resting = branch === null && dedicated;
+    if (branch !== facts.claim.baseBranch && !resting) {
       const previous = branch === null ? null : this.finishedTaskBranch(facts, branch);
       if (!previous) {
         return deny(
@@ -1577,7 +1595,7 @@ export class WorkerTurnRunner {
       async () => {
         effect.outcome = await switchToTaskBranch(repo, {
           head,
-          branch: branch!,
+          branch,
           tip,
           to,
           target,
@@ -2173,6 +2191,15 @@ export class WorkerTurnRunner {
       if ((await effectiveConfig(repo)) !== facts.config) {
         return refused("GIT_CONFIG_CHANGED", ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "the repository's effective git configuration changed during the turn");
       }
+      const objects = await objectStoreIntegrity(repo, facts.baseHead);
+      if (objects.exitCode !== 0) {
+        return refused(
+          "GIT_OBJECT_STORE_INVALID",
+          ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
+          "the repository's content-addressed object store failed strict integrity verification before candidate comparison",
+          { error: gitWords(objects) },
+        );
+      }
       const now = await headOf(repo);
       if (now.head !== facts.baseHead || now.branch !== facts.claim.branch) {
         return refused("HEAD_MOVED", ReasonCode.WRITE_EFFECT_FENCE_LOST, "HEAD or the branch moved during the turn");
@@ -2590,7 +2617,8 @@ const switchToTaskBranch = async (
   repo: PinnedRepository,
   input: {
     head: string;
-    branch: string;
+    /** The branch HEAD named when it was read; null for a detached HEAD (#1227: a resident's worker checkout at rest). */
+    branch: string | null;
     tip: string | null;
     to: string;
     target: TaskWriteTarget;
@@ -2660,7 +2688,9 @@ const switchToTaskBranch = async (
             state: `HEAD is left on ${headElsewhere}; the files are ${filesMoved ? `at the task tree ${input.to}` : "as they were"}`,
           });
         } else {
-          const back = await runPinnedGit(repo, ["symbolic-ref", "-m", "agent-control-plane: task branch undone", "HEAD", `refs/heads/${input.branch}`]);
+          const back = input.branch === null
+            ? await runPinnedGit(repo, ["update-ref", "--no-deref", "-m", "agent-control-plane: task branch undone", "HEAD", input.head])
+            : await runPinnedGit(repo, ["symbolic-ref", "-m", "agent-control-plane: task branch undone", "HEAD", `refs/heads/${input.branch}`]);
           if (back.exitCode === 0) {
             headMoved = false;
           } else {
@@ -2687,7 +2717,7 @@ const switchToTaskBranch = async (
             blockers.push({
               step: "recovery incomplete",
               error: `${reverseRefused}${measured.error === null ? "" : `; ${measured.error}`}`,
-              state: `HEAD names ${input.branch} at ${input.head}; the index holds the task tree ${input.to}; the paths the reverse read-tree moved before it stopped are left exactly as they are, not put back`,
+              state: `HEAD names ${input.branch ?? "no branch"} at ${input.head}; the index holds the task tree ${input.to}; the paths the reverse read-tree moved before it stopped are left exactly as they are, not put back`,
               paths: measured.moved.map((path) => path.path),
             });
             recovery = { attemptId: input.attemptId, from: input.to, to: input.head, paths: measured.moved, indexChanged: measured.indexChanged, notOurs: measured.notOurs.slice(0, 50) };
@@ -2705,7 +2735,7 @@ const switchToTaskBranch = async (
               blockers.push({
                 step: "head-forward",
                 error: gitWords(forward),
-                state: `HEAD names ${input.branch} at ${input.head} while the index and files are at the task tree ${input.to}`,
+                state: `HEAD names ${input.branch ?? "no branch"} at ${input.head} while the index and files are at the task tree ${input.to}`,
               });
             }
           }
@@ -2767,6 +2797,8 @@ const switchToTaskBranch = async (
     if (input.tip === null) {
       const intent = record(TASK_BRANCH_CREATING);
       if (!intent.allowed) return refused(`the task branch's creation could not be recorded before it was made; nothing was created: ${intent.message}`);
+    }
+    if (input.tip === null) {
       const created = await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: task branch", branchRef, startOf(input.target), ZERO_OID[input.format]]);
       if (created.exitCode !== 0) {
         // Nothing of this attempt exists: the attempt is resolved, the ref there is someone else's.
@@ -2795,7 +2827,7 @@ const switchToTaskBranch = async (
           blockers.push({
             step: "recovery incomplete",
             error: `${gitWords(moved)}${measured.error === null ? "" : `; ${measured.error}`}`,
-            state: `HEAD names ${input.branch} at ${input.head}; the index holds ${input.head}; ${createdHere ? `${branchRef} is kept at the pinned base, the moved files standing on it; ` : ""}the paths the read-tree moved before it stopped are left exactly as they are, not put back`,
+            state: `HEAD names ${input.branch ?? "no branch"} at ${input.head}; the index holds ${input.head}; ${createdHere ? `${branchRef} is kept at the pinned base, the moved files standing on it; ` : ""}the paths the read-tree moved before it stopped are left exactly as they are, not put back`,
             paths: measured.moved.map((path) => path.path),
           });
           return refused("the checkout's files could not be moved to the task's branch, and some had moved; recovery is incomplete and everything is left exactly as it stands", {

@@ -17,6 +17,7 @@ import {
 } from "../github/confirmed-merge-operation.ts";
 import type { CandidateSnapshot } from "../snapshot/candidate-snapshot.ts";
 import { verifySnapshotFreshness } from "../snapshot/candidate-snapshot.ts";
+import { residentBaseClone } from "../registry/resident-repositories.ts";
 import type { CompletionAuthority } from "../run/run-engine.ts";
 import type {
   ActivatedWorkflowEvidence,
@@ -579,6 +580,7 @@ export class ApprovedRunFinalizer {
       this.cp.runs.repositoriesOf(runId).map((repository) => ({
         identity: repository.identity,
         checkoutPath: repository.checkoutPath,
+        residentClone: residentBaseClone(this.cp.db, repository.repositoryId, repository.checkoutPath),
         activeManifestDigest: repository.activeManifestDigest,
       })),
     );

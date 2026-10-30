@@ -28,6 +28,7 @@ import { currentContractChangeTarget, isContractChangeRun, sameContractChangeBin
 import { firstActivationFactsOf } from "../registry/manifest-activation-grants.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
+import { residentBaseClone } from "../registry/resident-repositories.ts";
 import type { BlindReviewGate, BlindReviewInvoker, ReviewPacket } from "../review/blind-review.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import {
@@ -294,14 +295,16 @@ export class CandidatePipeline {
       const source = integrated.value === null
         ? await this.sourceAtFreeze(repo.checkoutPath, repo.workBranch, repo.baseBranch, profile, { runId, identity: repo.identity })
         : profile
-          ? { sourceBranch: integrated.value.declaredParent, sourceHead: integrated.value.baseSha }
-          : { sourceBranch: null, sourceHead: null };
+          ? { sourceBranch: integrated.value.declaredParent, sourceHead: integrated.value.baseSha, taskBaseHead: integrated.value.baseSha }
+          : { sourceBranch: null, sourceHead: null, taskBaseHead: integrated.value.baseSha };
+      const taskBaseHead = integrated.value?.baseSha ?? source.taskBaseHead;
       repositories.push({
         identity: repo.identity,
         repositoryRole: repo.repositoryRole,
         checkoutPath: repo.checkoutPath,
         baseBranch: repo.baseBranch,
-        baseRef: repo.baseBranch,
+        baseRef: taskBaseHead ?? repo.baseBranch,
+        ...(taskBaseHead === null ? {} : { baseHeadPinned: true as const }),
         sourceBranch: source.sourceBranch,
         sourceHead: source.sourceHead,
         worktreeId: repo.worktreeId,
@@ -1155,11 +1158,15 @@ export class CandidatePipeline {
   /** Re-reads every frozen repository and reports drift (§16.2). */
   private async assertStillFresh(snapshot: CandidateSnapshot): Promise<Decision<CandidateSnapshot>> {
     const probes = snapshot.repositories
-      .map((repo) => ({
-        identity: repo.identity,
-        checkoutPath: this.repositories.byIdentity(repo.identity)?.checkoutPath ?? "",
-        activeManifestDigest: this.repositories.byIdentity(repo.identity)?.activeManifestDigest ?? null,
-      }))
+      .map((repo) => {
+        const record = this.repositories.byIdentity(repo.identity);
+        return {
+          identity: repo.identity,
+          checkoutPath: record?.checkoutPath ?? "",
+          residentClone: record ? residentBaseClone(this.db, record.repositoryId, record.checkoutPath) : null,
+          activeManifestDigest: record?.activeManifestDigest ?? null,
+        };
+      })
       .filter((p) => p.checkoutPath);
     return verifySnapshotFreshness(snapshot, probes);
   }
@@ -1260,11 +1267,10 @@ export class CandidatePipeline {
     targetBranch: string,
     profile: BranchProfile | null,
     scope: { runId: string; identity: string },
-  ): Promise<{ sourceBranch: string | null; sourceHead: string | null }> {
-    if (!profile) return { sourceBranch: null, sourceHead: null };
+  ): Promise<{ sourceBranch: string | null; sourceHead: string | null; taskBaseHead: string | null }> {
     const observedBranch = await currentBranch(checkoutPath);
     const candidateBranch = observedBranch === "HEAD" ? workBranch : observedBranch;
-    if (!candidateBranch) return { sourceBranch: null, sourceHead: null };
+    if (!candidateBranch) return { sourceBranch: null, sourceHead: null, taskBaseHead: null };
 
     // #512 S-TB (c98ea8a3, S-TB-06) — a branch the control plane made for one of this run's tasks has
     // its origin on record: the declared parent and the pinned base commit it was created at. That is
@@ -1275,12 +1281,14 @@ export class CandidatePipeline {
       const candidateHead = await revParse(checkoutPath, "HEAD");
       const ancestor = await mergeBase(checkoutPath, recorded.baseSha, candidateHead);
       return ancestor === recorded.baseSha
-        ? { sourceBranch: recorded.declaredParent, sourceHead: recorded.baseSha }
-        : { sourceBranch: null, sourceHead: null };
+        ? { sourceBranch: profile ? recorded.declaredParent : null, sourceHead: profile ? recorded.baseSha : null, taskBaseHead: recorded.baseSha }
+        : { sourceBranch: null, sourceHead: null, taskBaseHead: null };
     }
 
+    if (!profile) return { sourceBranch: null, sourceHead: null, taskBaseHead: null };
+
     const requiredSource = requiredBaseFor(candidateBranch, profile, targetBranch);
-    if (!requiredSource) return { sourceBranch: null, sourceHead: null };
+    if (!requiredSource) return { sourceBranch: null, sourceHead: null, taskBaseHead: null };
 
     const candidateHead = await revParse(checkoutPath, "HEAD");
     const probes = sourceProbeBranchesFor(candidateBranch, profile, targetBranch);
@@ -1312,11 +1320,11 @@ export class CandidatePipeline {
     if (mostSpecific.length !== 1) {
       // No unique fact exists. Carrying no origin preserves the existing fail-closed PR
       // behavior and prevents a shared ancestor from being silently assigned to dev/main.
-      return { sourceBranch: null, sourceHead: null };
+      return { sourceBranch: null, sourceHead: null, taskBaseHead: null };
     }
     const selected = mostSpecific[0]!;
     // Keep a unique but wrong origin in the digest. assertFrozenSourceLineage then rejects
     // the candidate before any PR write, independently of branch divergence.
-    return { sourceBranch: selected.branch, sourceHead: selected.head };
+    return { sourceBranch: selected.branch, sourceHead: selected.head, taskBaseHead: null };
   }
 }

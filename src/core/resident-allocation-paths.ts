@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 /**
  * The paths a resident project's allocation names, built from the state directory or the resident
@@ -12,6 +12,15 @@ export const residentSessionSocket = (stateDir: string, projectId: string): stri
 /** The clone of the allocation's repository under the resident home: `projects/<name>` of `<owner>/<name>`. */
 export const residentClonePath = (home: string, repositoryIdentity: string): string =>
   join(home, "projects", repositoryIdentity.split("/")[1]!);
+
+/**
+ * #1227 — the checkout a resident project's worker turns use: a separate local clone of the resident's
+ * clone, with its own git dir, beside it under a directory ACP names, so never the resident's cwd and
+ * never inside it; on the same filesystem, so git's local clone hardlinks the objects. Named by the
+ * repository's registry id, so a project provisioned again under the same name never meets an old one.
+ */
+export const residentWorkerCheckoutPath = (clonePath: string, repositoryId: string): string =>
+  join(dirname(clonePath), ".acp-worker-checkouts", repositoryId);
 
 /** Where the resident's Buzz identity key file is: its location, never its contents. */
 export const residentPrivateKeyFile = (home: string, projectId: string): string =>

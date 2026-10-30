@@ -10,6 +10,7 @@ import { bootstrapReservationsHolding } from "../bootstrap/bootstrap-application
 import type { Db } from "../db/database.ts";
 import { git, mergeBase, remoteUrl, toplevel, tryRevParse, withoutRepositoryPrograms } from "../git/git.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
+import { residentWorkerCheckoutPath } from "../core/resident-allocation-paths.ts";
 import type { ProjectRegistry } from "./project-registry.ts";
 
 export interface RepositoryRecord {
@@ -192,11 +193,14 @@ export class RepositoryRegistry {
     }
     // Re-registering the same checkout under the same identity is idempotent: a retried
     // bootstrap or activation must not fail because a previous attempt got this far.
-    // A *different* path for a registered identity is still a conflict.
+    // A *different* path for a registered identity is still a conflict. #1227 — a resident's clone
+    // whose repository the daemon moved to the clone's dedicated worker checkout is the same binding:
+    // a retried activation names the clone, and gets the registration as it stands.
     if (
       existing &&
       existing.registration === "REGISTERED" &&
-      existing.checkoutPath !== rootPath
+      existing.checkoutPath !== rootPath &&
+      existing.checkoutPath !== residentWorkerCheckoutPath(rootPath, existing.repositoryId)
     ) {
       return deny(ReasonCode.CONFLICT, "repository identity already registered", {
         identity,
