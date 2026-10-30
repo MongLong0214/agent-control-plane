@@ -73,7 +73,7 @@ import {
   type ProviderRegistry,
   type ReviewerEgressRecord,
 } from "../runtime/provider.ts";
-import { CODEX_REVIEWER_INPUT_MAX_BYTES, REVIEWER_TRANSPORT_SEPARATOR, reviewerTransportInput } from "../runtime/cli-adapters.ts";
+import { CODEX_REVIEWER_INPUT_MAX_BYTES, REVIEWER_TRANSPORT_SEPARATOR } from "../runtime/cli-adapters.ts";
 import type { PacketReviewerScope } from "../runtime/reviewer-codex-home.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
@@ -1841,19 +1841,22 @@ export class BlindReviewGate {
       if (!capacity.allowed) return capacity as Decision<ReviewOutcome>;
       const adapter = this.providers.requireForRole(reviewer.preference.provider, Role.BLIND_REVIEWER);
       const invocation = this.reviewInvocation(request, reviewer, prompt, `${request.runId}:${reviewer.sessionId}:chunk${index + 1}`);
-      // A lockfile chunk goes only to a reviewer whose model is known to receive its exact bytes whole.
+      const transmitted = transmittedReviewerInput(request.runId, adapter, invocation);
+      if (!transmitted.allowed) return transmitted as Decision<ReviewOutcome>;
+      // A lockfile chunk goes only to a reviewer whose model is known to receive it whole: the bound is
+      // checked against every byte this call transmits, instructions, packet and lockfile, as the adapter
+      // sends them (stdin and any argv value).
       if (lockfileChunk) {
-        const bytes = Buffer.byteLength(reviewerTransportInput(invocation));
+        const sent = adapter.transmittedReviewerInput!(invocation);
+        const bytes = Buffer.byteLength(sent.stdin) + sent.argv.reduce((total, [, value]) => total + Buffer.byteLength(value), 0);
         const limit = adapter.reviewerInputMaxBytes?.(reviewer.preference.model);
         if (limit === undefined || bytes > limit) {
           const bound = limit === undefined ? "declares no input bound for it" : `accepts at most ${limit} bytes`;
           omitted.push(...chunk.filter((part) => part.lockfile !== undefined).map((part) => `${part.identity}:${part.files[0]}: lockfile not reviewed: ` +
-            `its chunk is ${bytes} bytes and the selected reviewer model ${reviewer.preference.provider}/${reviewer.preference.model} ${bound}`));
+            `its review input is ${bytes} bytes and the selected reviewer model ${reviewer.preference.provider}/${reviewer.preference.model} ${bound}`));
           continue;
         }
       }
-      const transmitted = transmittedReviewerInput(request.runId, adapter, invocation);
-      if (!transmitted.allowed) return transmitted as Decision<ReviewOutcome>;
       reviewerInputs.push(transmitted.value);
       const result = await adapter.invoke(invocation);
       const isolation = this.assertIsolationAttested(request.runId, reviewer, result);

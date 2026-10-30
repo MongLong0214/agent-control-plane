@@ -2928,15 +2928,31 @@ export const reviewerTransportInput = (request: Pick<InvocationRequest, "systemP
   request.systemPrompt ? `${request.systemPrompt}${REVIEWER_TRANSPORT_SEPARATOR}${request.prompt}` : request.prompt;
 
 /**
- * The reviewer input bound for GPT-6.1 Sol through `codex exec`, whose packet reviewer input goes on
- * stdin, so no argv limit applies. Codex CLI 0.164.0's model catalogue gives gpt-6.1-sol a 500,000-token
- * context window, 95% of it usable: 475,000 tokens. Less 128,000 tokens for the model's reasoning and
- * answer and 96,000 for the CLI's own instructions and tools (its instructions for this model in that
- * catalogue are 62,023 bytes) leaves 251,000. A byte-level tokenizer's token covers at least one byte,
- * so an input of at most 250,000 UTF-8 bytes is at most 250,000 tokens. Derived, not measured against
- * a live model.
+ * Grounded: Codex CLI 0.164.0's model catalogue gives gpt-6.1-sol `context_window` 500,000 tokens and
+ * `effective_context_window_percent` 95, so 475,000 usable tokens.
  */
-export const CODEX_REVIEWER_INPUT_MAX_BYTES = 250_000;
+const CODEX_GPT_6_1_SOL_USABLE_TOKENS = (500_000 * 95) / 100;
+/**
+ * Grounded: the same catalogue's instructions for gpt-6.1-sol (`model_messages`) measure 62,023 bytes,
+ * and a byte-level tokenizer's token covers at least one byte, so they take at most that many tokens.
+ */
+const CODEX_GPT_6_1_SOL_INSTRUCTION_BYTES = 62_023;
+/** Estimated, not measured: the model's reasoning and answer at xhigh effort. */
+const CODEX_REVIEWER_OUTPUT_RESERVE_TOKENS = 128_000;
+/** Estimated, not measured: the tool definitions and response schema the CLI adds beside its instructions. */
+const CODEX_REVIEWER_TOOL_SCHEMA_RESERVE_TOKENS = 34_000;
+
+/**
+ * The reviewer input bound for GPT-6.1 Sol through `codex exec`, whose packet reviewer input goes on
+ * stdin, so no argv limit applies: the usable window less the CLI's instructions and the two
+ * estimated reserves, rounded down to a thousand. Every input token covers at least one byte, so an
+ * input of at most this many UTF-8 bytes is at most this many tokens. Measured once, for one size on
+ * this path only: a 180,587-byte reviewer input holding a synthetic 154,859-byte lockfile, sent through
+ * codex-cli 0.164.0 to gpt-6.1-sol at xhigh, was answered from its middle and its end (the CLI reported
+ * 118,941 input tokens). Nothing here detects a provider that silently truncates an input.
+ */
+export const CODEX_REVIEWER_INPUT_MAX_BYTES = Math.floor((CODEX_GPT_6_1_SOL_USABLE_TOKENS - CODEX_GPT_6_1_SOL_INSTRUCTION_BYTES -
+  CODEX_REVIEWER_OUTPUT_RESERVE_TOKENS - CODEX_REVIEWER_TOOL_SCHEMA_RESERVE_TOKENS) / 1_000) * 1_000;
 
 /**
  * Codex CLI adapter. Preferred runtime for the blind reviewer (GPT-6.1 Sol at xhigh

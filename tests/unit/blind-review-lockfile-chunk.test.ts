@@ -704,6 +704,31 @@ describe("a review binds each whole lockfile to the candidate in a chunk of its 
     }
   });
 
+  it("checks the reviewer's bound against the whole review input, not the lockfile alone", async () => {
+    const base = lockfileText(30_000, 700);
+    const setup = await prepareCandidate({ [LOCKFILE]: oneLineChange(base) }, { [LOCKFILE]: base });
+    // Room for the lockfile's text and patch, not for the instructions and packet beside them.
+    const bound = base.length + 2_000;
+    Object.assign(setup.harness.scripted, { reviewerInputMaxBytes: (): number => bound });
+    try {
+      setup.harness.scripted.script(
+        { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`, `${setup.identity}:${LOCKFILE}`]), once: false },
+        { match: /Final review/, text: reviewerPass([]) },
+      );
+
+      const result = await setup.invoke();
+
+      expect(result.allowed).toBe(false);
+      expect(setup.harness.scripted.invocations.some((invocation) => invocation.prompt.includes(`Lockfile ${LOCKFILE}`))).toBe(false);
+      const packet = setup.harness.cp.review.latestPacket(setup.run.runId, candidateSnapshotDigest(setup.snapshot));
+      const reason = new RegExp(`^${setup.identity}:${LOCKFILE}: lockfile not reviewed: its review input is (\\d+) bytes and the selected reviewer model \\S+ accepts at most ${bound} bytes$`);
+      const measured = Number(reason.exec(packet?.omittedItems.find((item) => reason.test(item)) ?? "")?.[1]);
+      expect(measured).toBeGreaterThan(bound + 10_000);
+    } finally {
+      setup.harness.cp.close();
+    }
+  });
+
   it("does not send a lockfile chunk to a reviewer that declares no input bound for its model, and refuses PASS", async () => {
     const base = lockfileText(30_000, 700);
     const setup = await prepareCandidate({ [LOCKFILE]: oneLineChange(base) }, { [LOCKFILE]: base });
@@ -721,7 +746,7 @@ describe("a review binds each whole lockfile to the candidate in a chunk of its 
       expect(setup.harness.scripted.invocations.some((invocation) => invocation.prompt.includes(`Lockfile ${LOCKFILE}`))).toBe(false);
       const packet = setup.harness.cp.review.latestPacket(setup.run.runId, candidateSnapshotDigest(setup.snapshot));
       expect(packet?.omittedItems).toEqual(expect.arrayContaining([
-        expect.stringMatching(new RegExp(`^${setup.identity}:${LOCKFILE}: lockfile not reviewed: its chunk is \\d+ bytes and the selected reviewer model \\S+ declares no input bound for it$`)),
+        expect.stringMatching(new RegExp(`^${setup.identity}:${LOCKFILE}: lockfile not reviewed: its review input is \\d+ bytes and the selected reviewer model \\S+ declares no input bound for it$`)),
       ]));
     } finally {
       setup.harness.cp.close();
