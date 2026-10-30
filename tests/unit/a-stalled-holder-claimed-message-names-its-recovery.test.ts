@@ -31,8 +31,11 @@ const waitsOf = (harness: Harness): AgentOwnedWaits =>
     gate: harness.cp.ceo,
   });
 
-/** A CEO, and a READY PRIMARY_CTO for the fixture project with one PEER_MESSAGE queued to it. */
-const ctoWithPeerMessage = async () => {
+/**
+ * A CEO, and a READY PRIMARY_CTO for the fixture project with one PEER_MESSAGE queued to it; with
+ * `olderPushed`, a pushed ESCALATION_REPLY queued to the same CTO a minute before it.
+ */
+const ctoWithPeerMessage = async (options: { olderPushed?: boolean } = {}) => {
   const harness = makeHarness();
   const { projectId } = await registerFixtureProject(harness);
   const ceoSessionId = bindCeo(harness);
@@ -41,6 +44,16 @@ const ctoWithPeerMessage = async () => {
   expect(harness.cp.sessions.transition(cto.sessionId, SessionLifecycle.READY, "test").reasonCode).toBe(ReasonCode.OK);
   const bound = harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: cto.sessionId, projectId });
   if (!bound.allowed) throw new Error(`CTO binding failed: ${bound.message}`);
+  let olderPushedId: string | null = null;
+  if (options.olderPushed === true) {
+    const older = harness.cp.outbox.enqueue({
+      idempotencyKey: "older-pushed", roleKey: ctoRoleKey, bindingGeneration: bound.value.bindingGeneration,
+      targetSessionId: cto.sessionId, runId: null, kind: MessageKind.ESCALATION_REPLY, payload: { note: "pushed" },
+    });
+    if (!older.allowed) throw new Error(`enqueue failed: ${older.message}`);
+    olderPushedId = older.value.messageId;
+    harness.clock.advance(60 * 1000);
+  }
   const nonce = "buzz-message:event-stalled";
   const admitted = { text: "please look at the queue", mention: "npub-cto" };
   harness.cp.db.run(
@@ -57,7 +70,9 @@ const ctoWithPeerMessage = async () => {
     payload: { sourceChannel: "buzz", sourceNonce: nonce, sourcePayloadDigest: digestOf(admitted) },
   });
   if (!queued.allowed) throw new Error(`enqueue failed: ${queued.message}`);
-  return { harness, ceoSessionId, ctoRoleKey, cto, generation: bound.value.bindingGeneration, peerMessageId: queued.value.messageId };
+  return {
+    harness, ceoSessionId, ctoRoleKey, cto, generation: bound.value.bindingGeneration, peerMessageId: queued.value.messageId, olderPushedId,
+  };
 };
 
 const criticalFor = (harness: Harness, resource: string): Record<string, unknown> | undefined =>
@@ -89,6 +104,35 @@ describe("a stalled holder-claimed message names its real recovery", () => {
     expect(recovery).toContain(`session ${cto.sessionId} at binding generation ${generation} of ${ctoRoleKey}`);
     expect(recovery).toContain("which is live (READY, the role's current binding)");
     expect(recovery).not.toContain("retry_outbox");
+    // A role whose stalled messages are all holder-claimed keeps exactly this text.
+    expect(recovery).toBe(
+      "the receiving session claims it (role_owner_message_claim); if its relay or attachment is gone, it reconnects " +
+      "and then claims it. A PEER_MESSAGE is delivered only by its holder's claim, never by the delivery pass, so a " +
+      "delivery retry cannot deliver it; a delivery timeout does not fail the run. It is addressed to session " +
+      `${cto.sessionId} at binding generation ${generation} of ${ctoRoleKey}, which is live (READY, the role's current binding)`,
+    );
+  });
+
+  it("one role's mixed stall names, in its one notice, the retry for the pushed message and the claim for the holder-claimed one", async () => {
+    const { harness, ctoRoleKey, cto, generation, peerMessageId, olderPushedId } = await ctoWithPeerMessage({ olderPushed: true });
+    harness.clock.advance(11 * 60 * 1000);
+    waitsOf(harness).routeWatchdogStalls((await harness.cp.watchdog.tick()).stalls);
+
+    const notices = harness.cp.db.all<{ payload_json: string }>(
+      `SELECT payload_json FROM outbox WHERE kind = 'CEO_NOTIFICATION'
+         AND json_extract(payload_json, '$.notification') = 'CRITICAL_SYSTEM_FAILURE'
+         AND json_extract(payload_json, '$.stall') = 'outbox' AND json_extract(payload_json, '$.owner.role') = ?`,
+      [ctoRoleKey],
+    ).map((row) => JSON.parse(row.payload_json) as Record<string, unknown>);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({
+      resource: olderPushedId, owner: { role: ctoRoleKey, sessionId: cto.sessionId, generation },
+      blocker: expect.stringContaining(`2 messages PENDING past the delivery deadline to ${ctoRoleKey}`),
+    });
+    const recovery = String(notices[0]!["recoveryAction"]);
+    expect(recovery).toContain(`pushed messages 1 (${olderPushedId}): ${PUSHED_RECOVERY}`);
+    expect(recovery).toContain(`Holder-claimed messages 1 (${peerMessageId}): the receiving session claims it (role_owner_message_claim)`);
+    expect(recovery).toContain(`session ${cto.sessionId} at binding generation ${generation} of ${ctoRoleKey}`);
   });
 
   it("names a receiving session that is no longer live as not live", async () => {
@@ -199,6 +243,65 @@ describe("retry_outbox resets only its target's rows", () => {
     })]);
     expect(attemptsOf(harness, expiring)).toBe(2);
     expect(attemptsOf(harness, ceoRow)).toBe(2);
+  });
+
+  it("a roleKey lists the role's expired row as EXPIRED with its expiry, and resets nothing", async () => {
+    const { harness, ctoRoleKey, cto, generation, peerMessageId } = await ctoWithPeerMessage();
+    const task = harness.cp.outbox.enqueue({
+      idempotencyKey: "short-lived-task", roleKey: ctoRoleKey, bindingGeneration: generation, targetSessionId: cto.sessionId,
+      runId: null, kind: MessageKind.TASK_ASSIGN, payload: { note: "short-lived" }, ttlMs: 60_000,
+    });
+    if (!task.allowed) throw new Error(`enqueue failed: ${task.message}`);
+    harness.clock.advance(2 * 60 * 1000);
+    harness.cp.outbox.expireOverdue();
+    expect(harness.cp.outbox.get(task.value.messageId)?.status).toBe("EXPIRED");
+    const expiresAt = task.value.expiresAt;
+
+    const refused = await retry(harness, { roleKey: ctoRoleKey }, true);
+    expect(refused.reasonCode).toBe(ReasonCode.REPAIR_PRECONDITION_UNMET);
+    const evidence = targetEvidence(refused) as { found: boolean; rows: Array<Record<string, unknown>> };
+    expect(evidence.found).toBe(true);
+    expect(evidence.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        messageId: task.value.messageId, status: "EXPIRED", refusal: "EXPIRED", expiresAt,
+        reason: `it expired at ${expiresAt}, and an expired message is never resent`,
+      }),
+      expect.objectContaining({ messageId: peerMessageId, refusal: "HOLDER_CLAIMED" }),
+    ]));
+    expect(harness.cp.outbox.get(task.value.messageId)?.status).toBe("EXPIRED");
+  });
+
+  it("a roleKey selects the role's undelivered rows only: its EXPIRED and PENDING rows, never a delivered one", async () => {
+    const { harness } = await ctoWithPeerMessage();
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    const toCeo = (key: string, ttlMs?: number): string => {
+      const queued = harness.cp.outbox.enqueue({
+        idempotencyKey: key, roleKey: ceo.roleKey, bindingGeneration: ceo.bindingGeneration, targetSessionId: ceo.sessionId,
+        runId: null, kind: MessageKind.TASK_ASSIGN, payload: { key }, ...(ttlMs !== undefined ? { ttlMs } : {}),
+      });
+      if (!queued.allowed) throw new Error(`enqueue failed: ${queued.message}`);
+      return queued.value.messageId;
+    };
+    const acked = toCeo("delivered");
+    expect(harness.cp.outbox.acknowledge(acked, ceo.sessionId, ceo.bindingGeneration).allowed).toBe(true);
+    const expired = toCeo("short-lived", 60_000);
+    const pending = toCeo("failed-once");
+    harness.cp.db.run(`UPDATE outbox SET attempts = 1, last_error = 'transport down' WHERE message_id = ?`, [pending]);
+    harness.clock.advance(2 * 60 * 1000);
+    harness.cp.outbox.expireOverdue();
+    expect([acked, expired, pending].map((id) => harness.cp.outbox.get(id)?.status)).toEqual(["ACKED", "EXPIRED", "PENDING"]);
+
+    const dry = await retry(harness, { roleKey: ceo.roleKey }, true);
+    expect(dry.allowed).toBe(true);
+    if (!dry.allowed) return;
+    const evidence = dry.value.preconditionsChecked[0]!.evidence as { rows: Array<Record<string, unknown>>; eligibleMessageIds: string[] };
+    expect(evidence.rows.map((row) => [row["messageId"], row["refusal"] ?? null]).sort()).toEqual(
+      [[expired, "EXPIRED"], [pending, null]].sort(),
+    );
+    expect(evidence.eligibleMessageIds).toEqual([pending]);
+    // A message id still selects its row whatever its status: a delivered one is reported, not hidden.
+    const delivered = await retry(harness, { messageId: acked }, true);
+    expect(targetEvidence(delivered).rows).toEqual([expect.objectContaining({ messageId: acked, refusal: "NOT_PENDING" })]);
   });
 
   it("with no target it resets every role's retryable rows, as before", async () => {

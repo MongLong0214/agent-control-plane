@@ -823,8 +823,10 @@ export class RepairService {
   }
 
   /**
-   * retry_outbox scoped to a target: the message `messageId` names, or the PENDING rows of `roleKey` (with
-   * both, that message only if it is that role's). Null without a target, which keeps the unscoped reset.
+   * retry_outbox scoped to a target: the message `messageId` names, whatever its status, or the undelivered
+   * rows of `roleKey`, PENDING or EXPIRED, so an expired one is listed and not hidden (with both, that message
+   * only if it is that role's).
+   * Null without a target, which keeps the unscoped reset.
    * Only a row a retry can deliver is reset, and every other target row is listed with why not: a
    * holder-claimed kind is delivered by its holder's claim, never by the delivery pass; an expired row is
    * never resent. The evidence names the target's rows and nothing else.
@@ -834,7 +836,10 @@ export class RepairService {
     const roleKey = request.parameters["roleKey"];
     if (messageId === undefined && roleKey === undefined) return null;
     const now = this.clock.nowIso();
-    const where = [messageId !== undefined ? "message_id = ?" : "status = 'PENDING'", ...(roleKey !== undefined ? ["role_key = ?"] : [])];
+    const where = [
+      messageId !== undefined ? "message_id = ?" : "status IN ('PENDING', 'EXPIRED')",
+      ...(roleKey !== undefined ? ["role_key = ?"] : []),
+    ];
     const rows = this.db.all<{
       message_id: string; kind: string; status: string; attempts: number; expires_at: string;
       role_key: string; binding_generation: number; target_session_id: string;
@@ -850,7 +855,7 @@ export class RepairService {
           reason: `a ${row.kind} is delivered by its holder's claim (role_owner_message_claim), and a retry cannot deliver it`,
         };
       }
-      if (row.status === "EXPIRED" || row.expires_at <= now) {
+      if (row.status === "EXPIRED" || (row.status === "PENDING" && row.expires_at <= now)) {
         return { refusal: "EXPIRED", reason: `it expired at ${row.expires_at}, and an expired message is never resent` };
       }
       if (row.status !== "PENDING") return { refusal: "NOT_PENDING", reason: `it is ${row.status}, not PENDING` };
