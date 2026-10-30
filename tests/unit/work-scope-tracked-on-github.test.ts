@@ -1237,6 +1237,20 @@ describe("#1240 (i) — the genesis resources readback is bound to the exact rep
     ]);
   });
 
+  it("a milestone with no description, and an issue with no body, never stop provisioning: the absent milestone is named, then created", async () => {
+    const github = new IssuesGitHub();
+    Object.assign(github.addMilestone("Someone else's milestone", ""), { description: null });
+    Object.assign(github.addIssue("Someone else's issue", "", null), { body: null });
+    const unmet: GenesisResourceUnmet[] = [];
+    const port = createGitHubApiWritePort({ client: github });
+    expect(await port.observeGenesisResources!(target, bundle, { repositoryNodeId: NODE, unmet })).toBeNull();
+    expect(unmet).toEqual([{ resource: "milestone", key: "m1", problem: "absent" }, { resource: "issue", key: "i1", problem: "absent" }]);
+    await port.ensureGenesisResources!(target, bundle);
+    expect(github.posts("/milestones")).toHaveLength(1);
+    expect(github.posts("/issues")).toHaveLength(1);
+    expect(await port.observeGenesisResources!(target, bundle, { repositoryNodeId: NODE })).toEqual(bundle);
+  });
+
   it("an issue GitHub accepted without its milestone stops acp-genesis-issues naming that link, and a resume creates no second issue", async () => {
     /** The genesis double, with its milestones and issues on the production port over the REST double. */
     class Linked extends GenesisGitHub {

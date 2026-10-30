@@ -375,7 +375,7 @@ const repoPath = (target: GitHubRepositoryTarget): string => `repos/${target.own
 const LIST_PAGE = 100;
 const LIST_PAGE_BOUND = 100;
 
-interface ListedMilestone { number: number; node_id: string; title: string; description: string; url?: unknown }
+interface ListedMilestone { number: number; node_id: string; title: string; description: string | null; url?: unknown }
 interface ListedIssue {
   number: number;
   node_id: string;
@@ -616,7 +616,7 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
         await identified(target, repositoryNodeId!);
       }
       const issues = fullName === null ? listed : listed.filter(i => i.pull_request === undefined);
-      const markedMilestone = (key: string) => milestones.find(m => m.description.endsWith(`<!-- acp-genesis:${key} -->`));
+      const markedMilestone = (key: string) => milestones.find(m => (m.description ?? "").endsWith(`<!-- acp-genesis:${key} -->`));
       // With the repository bound, a link is the milestone's node id; a number alone can name another one.
       const linked = (x: ListedIssue, key: string): boolean => fullName === null
         ? x.milestone?.number === markedMilestone(key)?.number
