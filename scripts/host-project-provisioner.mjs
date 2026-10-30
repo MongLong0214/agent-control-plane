@@ -154,10 +154,28 @@ try {
   const memberOf = (room, keyFile, member) => buzz(['channels','members','--channel',room],keyFile).some(member);
   // The rooms under `name` that `pk` owns: how ensure-buzz finds the room it created.
   const ownedRooms = (name, pk, keyFile) => roomsUnder(name,keyFile,room => memberOf(room,keyFile,m => m.pubkey === pk && m.role === 'owner'));
+  // Whether room `room` is archived: its id among the archived rooms a search under `name`, its current name, returns.
+  const roomArchived = (name, room = a.roomId, keyFile) => {
+    const found = buzz(['channels','search','--query',name,'--exact','--include-archived'],keyFile);
+    check(Array.isArray(found),'invalid channel search');
+    return found.some(c => (c.channel_id ?? c.id) === room && c.archived === true);
+  };
   // #1251 C8 — retirement's view of the rooms a key of this run may have left active: the room recorded for it, and every
   // active room under its name that key is in, as owner or any other role. A key that lost ownership proves nothing about
   // the room's archive; only no active room here settles it.
-  const activeRooms = (name, pk, keyFile, recorded) => roomsUnder(name,keyFile,room => room === recorded || memberOf(room,keyFile,m => m.pubkey === pk));
+  // #1251 C9 — the recorded room is looked up by its id, under whatever name it has now: a rename never hides it (C9-1).
+  // `name` only finds rooms that have no record: one that key is in is this run's unless the roster routes it to another
+  // project, whose room retirement never asks to archive (C9-2).
+  const activeRooms = (name, pk, keyFile, recorded) => {
+    const roster = existsSync(rosterFile) ? read(rosterFile) : {channels:{}};
+    check(object(roster) && object(roster.channels),'invalid roster channels');
+    const elsewhere = room => object(roster.channels[room]) && typeof roster.channels[room].acp_project_id === 'string' && roster.channels[room].acp_project_id !== a.projectId;
+    const found = roomsUnder(name,keyFile,room => room !== recorded && !elsewhere(room) && memberOf(room,keyFile,m => m.pubkey === pk));
+    if (typeof recorded !== 'string') return found;
+    const room = buzz(['channels','get','--channel',recorded],keyFile);
+    check(object(room) && room.channel_id === recorded && typeof room.name === 'string' && room.name.length > 0,'recorded Buzz room readback mismatch');
+    return roomArchived(room.name,recorded,keyFile) ? found : [room,...found];
+  };
   const rosterFile = join(home,'.hermes','bridge','required-mentions.json');
   // Mirror canonical_roster.py's version-specific room rules before publishing a roster.
   const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -266,10 +284,11 @@ try {
   const refuseWithOrder = (why, ...steps) => {throw new RetirementOrderRefusal(why,[...steps,rerun]);};
   // #1251 C-P2 — an `unbound` allocation: ensure-buzz stopped before the daemon recorded the room it verified, so the
   // allocation's room id is a placeholder that names no room. Retirement takes the room ensure-buzz itself would find:
-  // this run's room intent, else the one active room under the intended name this run's key is in, as owner or not (C8). With this run's key and no
-  // such room there is none: the intent is written before any creation, and only this key creates the room. Once this
-  // run's retirement has finished, its identity has been moved aside (retire's last host step), and the room it settled
-  // is the one that identity's intent names. `record` is the room id the unfinished intent never received.
+  // this run's room intent, else the one active room under the intended name this run's key is in, as owner or not (C8),
+  // that the roster routes to no other project (C9). With this run's key and no such room there is none: the intent is
+  // written before any creation, and only this key creates the room. Once this run's retirement has finished, its
+  // identity has been moved aside (retire's last host step), and the room it settled is the one that identity's intent
+  // names. `record` is the room id the unfinished intent never received.
   // #1251 C5 — `pk` is this run's key at the path, the only key retirement looks a room up or archives it with. Any
   // other key there is never used (C5-1). Without this run's key, a room intent of this run says a room may exist and
   // `missing` is how to put that key back; with no intent of this run anywhere on the host, this run created no room:
@@ -417,11 +436,6 @@ try {
     const owners = members.filter(m => m.role === 'owner').map(m => m.pubkey);
     refuseWithOrder(`Buzz room ${a.roomId} is owned by ${owners.length ? owners.join(', ') : 'no member visible to this identity'}, and ${a.identityName} (${pk}) is ${members.find(m => m.pubkey === pk)?.role ?? 'not a member'}`,
       `have an owner archive room ${a.roomId} (buzz channels archive --channel ${a.roomId}), or make ${pk} an owner of it`);
-  };
-  const roomArchived = name => {
-    const found = buzz(['channels','search','--query',name,'--exact','--include-archived']);
-    check(Array.isArray(found),'invalid channel search');
-    return found.some(c => (c.channel_id ?? c.id) === a.roomId && c.archived === true);
   };
   let result = {};
   switch(req.operation) {

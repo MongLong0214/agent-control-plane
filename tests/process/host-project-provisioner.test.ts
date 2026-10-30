@@ -1089,3 +1089,62 @@ it.each(['owner','member'] as const)('#1251 C7: a room this run created before a
     expect(settled()).toEqual(before);
   } finally {h.cp.close();}
 });
+
+/** #1251 C9 — a retry bound a replacement room while the relay kept the room this run's earlier key created: the first
+ * ensure-buzz stopped after recording that room ('recorded') or lost its create answer ('lost'), and its key was moved
+ * away. The retry moved this run's identity aside; the earlier key is then put back with it. */
+const replaced = async (first:'recorded'|'lost') => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');
+  patchFake(f,{keepRooms:true,...(first === 'lost' ? {loseCreate:true} : {})});
+  if (first === 'recorded') setCeoRecipient(f.database,'invalid');
+  await expect(f.invoke('ensure-buzz')).rejects.toThrow();
+  setCeoRecipient(f.database,'d'.repeat(64));
+  const pubFile = f.a.privateKeyFile.replace('.priv','.pub');const firstPk = readFileSync(pubFile,'utf8').trim();
+  const earlier = 'ffffffff-ffff-4fff-8fff-ffffffffffff';const replacement = '99999999-9999-4999-8999-999999999999';
+  expect(JSON.parse(readFileSync(join(f.state,'buzz-room-test.json'),'utf8')).roomId).toBe(first === 'recorded' ? earlier : undefined);
+  renameSync(f.a.privateKeyFile,join(f.home,'lost.priv'));
+  f.a.roomId = ((await f.invoke('ensure-buzz')).buzz as {roomId:string}).roomId;saveAllocation(f);
+  expect(f.a.roomId).toBe(replacement);
+  expect(fakeState(f)).toMatchObject({room:{channel_id:replacement},otherRooms:[{room:{channel_id:earlier,name:'test'},members:[{pubkey:firstPk,role:'owner'}]}]});
+  const retiredDir = join(f.state,'retired-buzz-identities');
+  expect(readdirSync(retiredDir)).toHaveLength(1);
+  renameSync(join(f.home,'lost.priv'),join(retiredDir,readdirSync(retiredDir)[0]!,'cto-test.priv'));
+  const rosterFile = join(f.home,'.hermes','bridge','required-mentions.json');
+  const snapshot = () => ({fake:fakeState(f),clone:existsSync(f.a.clonePath),moved:readdirSync(retiredDir,{recursive:true}).sort(),
+    files:[f.a.privateKeyFile,pubFile,join(f.state,'buzz-room-test.json'),join(f.state,'buzz-key-test.json'),join(f.state,'retired-buzz-room-test.json'),rosterFile].map(file => existsSync(file) ? readFileSync(file,'utf8') : null)});
+  const kept = (fakeState(f).otherRooms as {room:Record<string,unknown>}[])[0]!.room;
+  return {f,firstPk,earlier,replacement,rosterFile,snapshot,kept};
+};
+
+it('#1251 C9-1: the recorded room of an earlier key of this run is found by its id after a rename',async () => {
+  const {f,firstPk,earlier,replacement,snapshot,kept} = await replaced('recorded');
+  // The earlier room is renamed, and its key is demoted to member under another owner: the room is still active.
+  patchFake(f,{otherRooms:[{room:{...kept,name:'renamed'},members:[{pubkey:'c'.repeat(64),role:'owner'},{pubkey:firstPk,role:'member'}]}]});
+  const host = await refusesUnchanged(f,[`have an owner archive room ${earlier} (buzz channels archive --channel ${earlier})`],snapshot);
+  // Once an owner archives it, retirement archives the replacement room and leaves no room of this run active.
+  patchFake(f,{otherRooms:[],archivedRooms:[{...kept,name:'renamed',archived:true}]});
+  expect(await host.invoke('retire',f.a)).toMatchObject({retired:true,buzzRoom:'archived'});
+  expect(fakeState(f)).toMatchObject({room:null,otherRooms:[],archivedRooms:[expect.objectContaining({channel_id:earlier}),expect.objectContaining({channel_id:replacement})]});
+});
+
+it('#1251 C9-2: a same-name room the roster routes to another project is not a room of this run for retirement',async () => {
+  const {f,firstPk,earlier,replacement,rosterFile,snapshot,kept} = await replaced('lost');
+  // The earlier room is archived, and its key is a member of another active room under the same name.
+  const other = '11111111-1111-4111-8111-111111111111';const members = [{pubkey:'e'.repeat(64),role:'owner'},{pubkey:firstPk,role:'member'}];
+  patchFake(f,{otherRooms:[{room:{...kept,channel_id:other},members}],archivedRooms:[{...kept,archived:true}]});
+  const route = (project:string) => {
+    const roster = JSON.parse(readFileSync(rosterFile,'utf8'));
+    writeFileSync(rosterFile,JSON.stringify({...roster,channels:{...roster.channels,[other]:{relay_name:'production',ceo:{pubkey:'d'.repeat(64),handle:'ceo'},
+      peer:{pubkey:'e'.repeat(64),handle:'cto-other'},acp_project_id:project,status:'active',classification:'project'}}},null,2)+'\n');
+  };
+  // Routed to this project, that room is this run's: refused, naming its owner archive step.
+  route('test');
+  await refusesUnchanged(f,[`have an owner archive room ${other} (buzz channels archive --channel ${other})`],snapshot);
+  // Routed to another project, it is not: retirement archives this run's room and leaves that project's room as it was.
+  route('other');
+  const host = new ExecFileHostProjectProvisioner(daemonHost(f),f.home,f.state,30_000,f.database);
+  expect(await host.invoke('retire',f.a)).toMatchObject({retired:true,buzzRoom:'archived'});
+  expect(fakeState(f)).toMatchObject({room:null,otherRooms:[{room:{channel_id:other},members}],
+    archivedRooms:[expect.objectContaining({channel_id:earlier}),expect.objectContaining({channel_id:replacement})]});
+});
