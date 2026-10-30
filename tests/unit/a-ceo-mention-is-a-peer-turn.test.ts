@@ -22,6 +22,7 @@ import {
   ownerMessageLedger,
   createBuzzMessageIngress,
   startDaemonBuzzMentionSubscriber,
+  startLocalMcpListeners,
 } from "../../src/daemon/agentcpd.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import {
@@ -176,6 +177,8 @@ const startPeerFixture = async (
     wakeGate?: Promise<void>;
     /** Binds the CTO with an authenticated canonical conversation target, as the self-claim does. */
     authenticatedCto?: boolean;
+    /** Wakes through the CTO port exactly as the daemon builds it, with no CTO attached to it. */
+    daemonCtoPort?: boolean;
   } = {},
 ) => {
   const owner = newKey();
@@ -239,9 +242,11 @@ const startPeerFixture = async (
     secret: SECRET,
   };
   const wakeGate = options.wakeGate;
+  const listeners = options.daemonCtoPort ? await startLocalMcpListeners(harness.cp, dir, "buzz-peer-mcp-token") : null;
   const ingress = { seam: createBuzzMessageIngress(harness.cp, policy, {
     ceoConversation: new CeoConversationPort(),
     ownerActors: [owner.pubkey],
+    ...(listeners ? { roleConversation: listeners.ctoConversation } : {}),
     ...(wakeGate
       ? {
           roleConversation: {
@@ -347,6 +352,7 @@ const startPeerFixture = async (
     }),
     close: async () => {
       subscriber.close();
+      await listeners?.close();
       harness.cp.close();
     },
   };
@@ -945,6 +951,32 @@ describe("#1038 a bound CEO's Buzz mention is a peer turn for the bound PRIMARY_
       // The owner's message is still the owner's when the CTO reaches it.
       const second = ledger.claim(fixture.holder());
       expect(second.allowed && second.value.claimed).toMatchObject({ text: "주인의 질문", principal: "owner" });
+    } finally {
+      await fixture.close();
+    }
+  });
+});
+
+describe("a peer message's wake that finds no attached CTO is recorded", () => {
+  // The one wake an admission sends is the only push a holder-claimed message gets. A refusal made
+  // before any connection used to return to the admission and be stored nowhere, so a message whose
+  // CTO had no attached session sat PENDING with no trace of why it was never woken for.
+  it("writes ROLE_WAKE_FAILED with ROLE_PEER_ABSENT and leaves the message PENDING with no attempt", async () => {
+    const fixture = await startPeerFixture({ daemonCtoPort: true });
+    try {
+      const event = fixture.mention(fixture.ceo, { text: "CTO, 이 PR 을 검토해 주세요" });
+      await fixture.relayDelivers(event);
+      expect(fixture.subscriber.counters().admitted).toBe(1);
+      expect(fixture.harness.cp.db.all(`SELECT status, attempts FROM outbox WHERE kind = ?`, [MessageKind.PEER_MESSAGE]))
+        .toEqual([{ status: "PENDING", attempts: 0 }]);
+      const failed = fixture.harness.cp.db.all<{ reason_code: string; role_key: string; evidence_json: string }>(
+        `SELECT reason_code, role_key, evidence_json FROM audit_events WHERE kind = 'ROLE_WAKE_FAILED'`,
+        [],
+      );
+      expect(failed.map((row) => ({ ...row, evidence_json: JSON.parse(row.evidence_json) as unknown }))).toEqual([
+        { reason_code: ReasonCode.ROLE_PEER_ABSENT, role_key: fixture.ctoRoleKey, evidence_json: { cause: "mention" } },
+      ]);
+      expect(fixture.harness.cp.db.all(`SELECT 1 FROM audit_events WHERE kind = 'ROLE_WAKE_SENT'`, [])).toEqual([]);
     } finally {
       await fixture.close();
     }
