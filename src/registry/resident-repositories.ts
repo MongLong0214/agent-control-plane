@@ -63,6 +63,18 @@ export const residentRepository = (db: Db, repositoryId: string): ResidentReposi
   residentRepositories(db, repositoryId)[0] ?? null;
 
 /**
+ * Where a repository's base branch is read as its current base: the resident's clone, when the
+ * registered checkout is that resident's worker clone, whose own base branch stays where the clone was
+ * made; null when the registered checkout is its own base. The run's base pin (`task-write-target.ts`)
+ * and every candidate freshness check (`verifySnapshotFreshness`, the CEO confirmation) take this one
+ * answer, so the base a candidate was pinned to and the base it is held to are read in the same place.
+ */
+export const residentBaseClone = (db: Db, repositoryId: string, checkoutPath: string): string | null => {
+  const resident = residentRepository(db, repositoryId);
+  return resident && checkoutPath.length > 0 && canonical(checkoutPath) === resident.workerCheckoutPath ? resident.clonePath : null;
+};
+
+/**
  * Every clone a resident allocation names, whatever its state: the resident's own tree, which no
  * candidate command may read. Once its repository is registered at the worker checkout, no registry
  * row names the clone any more, so a deny list built from the registry alone would leave it open.

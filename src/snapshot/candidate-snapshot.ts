@@ -312,6 +312,11 @@ export interface FreshnessProbe {
   identity: string;
   checkoutPath: string;
   /**
+   * #1227 — the resident's clone, when `checkoutPath` is that resident's worker clone
+   * (`residentBaseClone`): the base branch is read there as the current base. Only read.
+   */
+  residentClone?: string | null;
+  /**
    * Manifest digest currently active for this repository. §16.2 stales the snapshot when
    * the manifest changes, not only when the candidate head moves.
    */
@@ -362,6 +367,23 @@ export const verifySnapshotFreshness = async (
         observedBaseHead: base,
       });
       continue;
+    }
+    // #1227 review r2 (PR #1256, D-P2) — a resident's worker clone keeps its base branch where the clone
+    // was made, so the check above cannot see the resident move its base. The current base is the
+    // resident's base branch in its clone, read only (no ref, no FETCH_HEAD); pinned or not, a candidate
+    // whose base is no longer that commit is stale.
+    if (probe.residentClone) {
+      const current = await tryRevParse(probe.residentClone, `refs/heads/${repo.baseBranch}`);
+      if (current !== repo.baseHead) {
+        drift.push({
+          identity: repo.identity,
+          reason: "the resident's base branch no longer names the candidate's base",
+          baseBranch: repo.baseBranch,
+          expectedBaseHead: repo.baseHead,
+          observedBaseHead: current,
+        });
+        continue;
+      }
     }
     // The frozen source SHA, not the moving source branch ref, is the lineage evidence.
     // Advancing that branch after freeze must therefore not rewrite or stale a candidate.

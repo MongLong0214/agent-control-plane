@@ -17,7 +17,7 @@ import { join } from "node:path";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import { WorktreeAction, WriteOperation, type ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
-import { residentClonePaths } from "../registry/resident-repositories.ts";
+import { residentBaseClone, residentClonePaths } from "../registry/resident-repositories.ts";
 import {
   type CandidateSnapshot,
   candidateSnapshotDigest,
@@ -586,6 +586,7 @@ export class VerificationEngine {
       return {
         identity: repo.identity,
         checkoutPath: record?.checkoutPath ?? "",
+        residentClone: record ? residentBaseClone(this.db, record.repositoryId, record.checkoutPath) : null,
         activeManifestDigest: record?.activeManifestDigest ?? null,
       };
     });

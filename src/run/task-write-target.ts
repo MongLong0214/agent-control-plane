@@ -10,8 +10,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { RunKind, TaskState } from "../domain/types.ts";
 import { classifyBranch, validateBranchContract } from "../github/branch-contract.ts";
-import { canonical } from "../guard/workspace-probe.ts";
-import { residentRepository } from "../registry/resident-repositories.ts";
+import { residentBaseClone } from "../registry/resident-repositories.ts";
 import { type PinnedRepository, pinRepository, runPinnedGit } from "./worker-git.ts";
 
 /**
@@ -615,13 +614,13 @@ export class TaskWriteTargets {
   private async pinnedBase(runId: string, repository: RepositoryFacts): Promise<Decision<string>> {
     const earlier = runBasePin(this.ports.db, runId, repository.identity);
     if (earlier) return allow(ReasonCode.OK, earlier);
-    const resident = residentRepository(this.ports.db, repository.repositoryId);
-    if (resident && canonical(repository.checkoutPath) === resident.workerCheckoutPath) {
-      const read = await this.readBase({ ...repository, checkoutPath: resident.clonePath });
+    const residentClone = residentBaseClone(this.ports.db, repository.repositoryId, repository.checkoutPath);
+    if (residentClone !== null) {
+      const read = await this.readBase({ ...repository, checkoutPath: residentClone });
       if (!read.allowed) return read;
       return this.withRepository(repository, async (repo) => {
         const fetched = await runPinnedGit(repo, [
-          "fetch", "--quiet", "--no-write-fetch-head", "--no-tags", "--no-recurse-submodules", resident.clonePath, `refs/heads/${repository.baseBranch}`,
+          "fetch", "--quiet", "--no-write-fetch-head", "--no-tags", "--no-recurse-submodules", residentClone, `refs/heads/${repository.baseBranch}`,
         ]);
         const present = await runPinnedGit(repo, ["cat-file", "-e", `${read.value}^{commit}`]);
         if (present.exitCode !== 0) {

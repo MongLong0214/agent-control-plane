@@ -28,6 +28,7 @@ import { currentContractChangeTarget, isContractChangeRun, sameContractChangeBin
 import { firstActivationFactsOf } from "../registry/manifest-activation-grants.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
+import { residentBaseClone } from "../registry/resident-repositories.ts";
 import type { BlindReviewGate, BlindReviewInvoker, ReviewPacket } from "../review/blind-review.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import {
@@ -1152,11 +1153,15 @@ export class CandidatePipeline {
   /** Re-reads every frozen repository and reports drift (§16.2). */
   private async assertStillFresh(snapshot: CandidateSnapshot): Promise<Decision<CandidateSnapshot>> {
     const probes = snapshot.repositories
-      .map((repo) => ({
-        identity: repo.identity,
-        checkoutPath: this.repositories.byIdentity(repo.identity)?.checkoutPath ?? "",
-        activeManifestDigest: this.repositories.byIdentity(repo.identity)?.activeManifestDigest ?? null,
-      }))
+      .map((repo) => {
+        const record = this.repositories.byIdentity(repo.identity);
+        return {
+          identity: repo.identity,
+          checkoutPath: record?.checkoutPath ?? "",
+          residentClone: record ? residentBaseClone(this.db, record.repositoryId, record.checkoutPath) : null,
+          activeManifestDigest: record?.activeManifestDigest ?? null,
+        };
+      })
       .filter((p) => p.checkoutPath);
     return verifySnapshotFreshness(snapshot, probes);
   }

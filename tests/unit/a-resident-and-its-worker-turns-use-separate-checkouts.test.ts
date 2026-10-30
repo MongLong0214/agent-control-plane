@@ -8,7 +8,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { ExecutionMode, Role, RunKind } from "../../src/domain/types.ts";
 import { GuardedInvocationWriteBroker } from "../../src/runtime/provider.ts";
-import { verifySnapshotFreshness } from "../../src/snapshot/candidate-snapshot.ts";
+import { type CandidateSnapshot, candidateSnapshotDigest, verifySnapshotFreshness } from "../../src/snapshot/candidate-snapshot.ts";
 import { WorkerTurnRunner } from "../../src/run/worker-turn.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeCore, tempDir, writeFiles } from "../helpers/fixtures.ts";
@@ -494,6 +494,112 @@ describe("#1227 a resident's working directory never reaches a worker turn", () 
         expect(denied).toEqual(expect.arrayContaining([checkout, s.clone]));
         // The resident's own edit to README.md is in neither commit nor the candidate.
         expectResidentFilesUntouched(s.clone);
+      } finally {
+        worker.killAll();
+      }
+    }, { repoPath: residentClone() });
+  });
+});
+
+/** Every freshness check a frozen candidate meets: verification's, the pipeline's own, and the CEO confirmation's. */
+const freshnessChecks = (f: BootstrapRuntimeFixture, s: StandardRun, snapshot: CandidateSnapshot) => {
+  const cp = f.harness.cp;
+  const run = cp.runs.require(s.runId);
+  const commands = commandsForMode(cp.projects.manifest(run.pinnedManifestDigest!)!, run.executionMode);
+  type Answer = { allowed: boolean; reasonCode?: string; evidence?: Record<string, unknown> };
+  return {
+    verify: async (): Promise<Answer> =>
+      (await cp.verification.verify({ runId: s.runId, snapshot, commands, contractDigest: run.contractDigest })) as Answer,
+    pipeline: (): Promise<Answer> =>
+      (cp.pipeline as unknown as { assertStillFresh(snapshot: CandidateSnapshot): Promise<Answer> }).assertStillFresh(snapshot),
+    confirm: (): Answer =>
+      (cp.ceo as unknown as { revalidateCandidateFreshness(runId: string, digest: string): Answer })
+        .revalidateCandidateFreshness(s.runId, candidateSnapshotDigest(snapshot)),
+  };
+};
+
+/** A git dir's refs and FETCH_HEAD: what a read-only check must leave exactly as it found them. */
+const refsAndFetchHead = (repo: string): string => {
+  const fetchHead = join(repo, ".git", "FETCH_HEAD");
+  return `${gitSync(repo, ["for-each-ref", "--format=%(refname) %(objectname)"])}\nFETCH_HEAD ${existsSync(fetchHead) ? readFileSync(fetchHead, "utf8") : "absent"}`;
+};
+
+describe("#1227 review r2 (PR #1256, D-P2): candidate freshness reads the resident's base", () => {
+  it("a candidate frozen in the worker clone goes stale when the resident commits on its dev: every freshness check refuses it, and none writes a ref or FETCH_HEAD in either clone", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const { s, checkout, target, claimId } = await migratedWithClaim(f, "resident-p2");
+      const worker = workerDoing(f);
+      try {
+        const { execution } = await turn(f, s, worker, s.ids["app"]!, claimId, { writes: { "src/app.js": "module.exports = () => 2;\n" } });
+        expect(execution!.status).toBe("SUCCEEDED");
+        const frozen = await cp.pipeline.freeze(s.runId);
+        if (!frozen.allowed) throw new Error(`${frozen.reasonCode}: ${frozen.message}`);
+        const snapshot = frozen.value;
+        expect(snapshot.repositories[0]).toMatchObject({ baseBranch: "dev", baseHead: target.baseSha, baseHeadPinned: true });
+        const checks = freshnessChecks(f, s, snapshot);
+        // Fresh while the resident's dev is the base the candidate was made from.
+        expect(await checks.verify()).toMatchObject({ allowed: true });
+        expect(await checks.pipeline()).toMatchObject({ allowed: true });
+        expect(checks.confirm()).toMatchObject({ allowed: true });
+
+        // The resident commits a README change on its own dev.
+        writeFileSync(join(s.clone, "README.md"), "# the resident moved its base\n");
+        residentGit(s.clone, ["commit", "-q", "-am", "the resident's base moves"]);
+        const movedBase = residentGit(s.clone, ["rev-parse", "refs/heads/dev"]);
+        expect(movedBase).not.toBe(target.baseSha);
+        const before = { resident: gitDirState(s.clone), worker: refsAndFetchHead(checkout) };
+
+        // The candidate keeps the old README, and every freshness check now refuses it as stale.
+        expect(gitSync(checkout, ["show", `${snapshot.repositories[0]!.candidateHead}:README.md`])).toBe("# fixture project");
+        const drift = expect.objectContaining({ identity: IDENTITY, baseBranch: "dev", expectedBaseHead: target.baseSha, observedBaseHead: movedBase });
+        const verified = await checks.verify();
+        expect(verified).toMatchObject({ allowed: false, reasonCode: ReasonCode.SNAPSHOT_STALE });
+        expect(verified.evidence?.["drift"]).toEqual([drift]);
+        const pipeline = await checks.pipeline();
+        expect(pipeline).toMatchObject({ allowed: false, reasonCode: ReasonCode.SNAPSHOT_STALE });
+        expect(pipeline.evidence?.["drift"]).toEqual([drift]);
+        const confirmed = checks.confirm();
+        expect(confirmed).toMatchObject({ allowed: false, reasonCode: ReasonCode.SNAPSHOT_STALE });
+        expect(confirmed.evidence?.["drift"]).toEqual([expect.objectContaining({ identity: IDENTITY, expectedBaseHead: target.baseSha, observedBaseHead: movedBase })]);
+        // The worker clone alone, as a probe that names no resident clone reads it, is unchanged: its pin is still readable.
+        expect((await verifySnapshotFreshness(snapshot, [{ identity: IDENTITY, checkoutPath: checkout }])).allowed).toBe(true);
+
+        // Read only: nothing in the resident's git dir, and no ref or FETCH_HEAD in the worker clone's, was written.
+        expect(gitDirState(s.clone)).toBe(before.resident);
+        expect(refsAndFetchHead(checkout)).toBe(before.worker);
+        expect(gitSync(checkout, ["rev-parse", "refs/heads/dev"])).toBe(target.baseSha);
+      } finally {
+        worker.killAll();
+      }
+    }, { repoPath: residentClone() });
+  });
+
+  it("the CEO confirmation reads the base where freshness does: a resident's dev that advanced before the run is the candidate's base, not drift", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "resident-p2-confirm", [APP]);
+      becomeResident(f, s);
+      const worker = workerDoing(f);
+      try {
+        await daemonPass(f);
+        const checkout = await registeredCheckout(f, s);
+        const workerDev = gitSync(checkout, ["rev-parse", "refs/heads/dev"]);
+        writeFiles(s.clone, { "docs/resident.md": "# resident base commit\n" });
+        residentGit(s.clone, ["add", "docs/resident.md"]);
+        residentGit(s.clone, ["commit", "-q", "-m", "resident advances the task base"]);
+        const residentDev = residentGit(s.clone, ["rev-parse", "refs/heads/dev"]);
+        const target = await provision(f, s, s.ids["app"]!);
+        const { execution } = await turn(f, s, worker, s.ids["app"]!, await claim(f, s, target, checkout), { writes: { "src/app.js": "module.exports = () => 2;\n" } });
+        expect(execution!.status).toBe("SUCCEEDED");
+        const frozen = await cp.pipeline.freeze(s.runId);
+        if (!frozen.allowed) throw new Error(`${frozen.reasonCode}: ${frozen.message}`);
+        expect(frozen.value.repositories[0]).toMatchObject({ baseHead: residentDev, baseHeadPinned: true });
+        // The worker clone's own dev stays where the clone was made; it is not the current base.
+        expect(gitSync(checkout, ["rev-parse", "refs/heads/dev"])).toBe(workerDev);
+        const checks = freshnessChecks(f, s, frozen.value);
+        expect(await checks.pipeline()).toMatchObject({ allowed: true });
+        expect(checks.confirm()).toMatchObject({ allowed: true });
       } finally {
         worker.killAll();
       }
