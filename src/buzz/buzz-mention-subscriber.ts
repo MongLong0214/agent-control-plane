@@ -35,7 +35,7 @@ import type { BuzzPeerBinding } from "../ingress/buzz-message.ts";
  *
  * The same holds for liveness (#1283): the ids of recently delivered events are kept only so a
  * probe can tell whether the subscription delivered what the relay stored. Nothing about admission
- * reads them, and losing one costs a reconnect whose redelivery the seam refuses.
+ * reads them, and losing one costs only that the probe stops judging events that old.
  */
 
 /** The one file this subscriber reads, directly beneath the daemon's own state directory. */
@@ -109,9 +109,11 @@ export const PRECEDES_BINDING_RECORD_LIMIT = 64;
  * The live daemon held an ESTABLISHED connection per identity to a healthy relay, with a clean
  * doctor, for three days while no mention arrived; a restart replayed the two that had been sent.
  * None of those three facts is read here. What is read is an answer on this connection: the
- * subscription's own `EOSE` and events, and the `EOSE` (or `CLOSED`) of a probe `REQ` sent on the
- * daemon's health tick (`checkLiveness`, every 30 seconds). Three ticks, so one slow answer is not
- * a stall, and an identity that stays unanswered past it is `STALE` in health and doctor.
+ * subscription's own `EOSE` and events, and the `EOSE` of a probe `REQ` sent on the daemon's
+ * health tick (`checkLiveness`, every 30 seconds). A probe the relay ends with `CLOSED` (its
+ * subscription limit, say) is not one: it says nothing about delivery, so it ages into a stall
+ * exactly as a probe never answered does. Three ticks, so one slow answer is not a stall, and an
+ * identity that stays unanswered past it is `STALE` in health and doctor.
  */
 export const SUBSCRIPTION_LIVENESS_BOUND_SECONDS = 90;
 
@@ -123,8 +125,20 @@ export const SUBSCRIPTION_LIVENESS_BOUND_SECONDS = 90;
 export const LIVENESS_PROBE_GRACE_SECONDS = 10;
 
 /**
+ * How far before its window, by the events' own `created_at`, a probe also asks.
+ *
+ * The relay filters on the time an author signed, and the window advances on local time, so a
+ * mention signed earlier and published late would otherwise sit behind every later window: stored,
+ * never pushed, never probed (#1283 review). A mention reaching the relay up to this long after it
+ * was signed is still found. The window itself only advances past a probe that came back clean, so
+ * an outage or an exclusion does not move it on.
+ */
+export const LIVENESS_PROBE_LOOKBACK_SECONDS = 600;
+
+/**
  * How many recently delivered event ids one identity keeps. Evidence for the probe's comparison
- * only: nothing about admission reads it, and losing an id costs one reconnect, never a message.
+ * only: nothing about admission reads it. An evicted event is not judged at all, rather than
+ * judged missed, so the limit costs detection of old events in a busy window, never a reconnect.
  */
 const HEARD_EVENT_LIMIT = 256;
 
@@ -728,6 +742,8 @@ export interface BuzzMentionStallReport {
   /** Seconds the connection had gone without an answer when the stall was found. */
   readonly quietSeconds: number;
   readonly boundSeconds: number;
+  /** Local seconds the outage was found: the episode's identity, until a clean probe ends it. */
+  readonly outageSinceSeconds: number;
 }
 
 export type BuzzMentionStallReporter = (report: BuzzMentionStallReport) => void;
@@ -738,10 +754,13 @@ export interface BuzzMentionIdentityLiveness {
   readonly identityPubkey: string;
   readonly roleKey: string | null;
   /**
-   * The three cases a `PARTIAL` admission must not blur. `LIVE`: admitted, and answered within the
-   * bound (or admitted less than the bound ago). `STALE`: admitted, and the relay has not answered
-   * it for at least the bound, on this connection or any replacement: the #1283 defect.
-   * `EXCLUDED`: not connected on purpose, for `exclusionReason` (a CTO with no live session, say).
+   * The three cases a `PARTIAL` admission must not blur. `LIVE`: admitted, answered within the
+   * bound (or admitted less than the bound ago), and not in an outage. `STALE`: admitted, and
+   * either the relay has not answered it for at least the bound, on this connection or any
+   * replacement, or a stall was found and no probe has come back clean since (`outageSinceSeconds`):
+   * the #1283 defect. A replacement's own `EOSE` does not end an outage; it proves the stored query
+   * answers, not that delivery does. `EXCLUDED`: not connected on purpose, for `exclusionReason`
+   * (a CTO with no live session, say).
    */
   readonly state: "LIVE" | "STALE" | "EXCLUDED";
   /** Why it is not connected, as `admission` reports it; `null` unless `EXCLUDED`. */
@@ -753,6 +772,8 @@ export interface BuzzMentionIdentityLiveness {
   /** Stalls found and replaced since this process started. */
   readonly stalls: number;
   readonly lastStall: { readonly atSeconds: number; readonly cause: BuzzMentionStallCause } | null;
+  /** Local seconds the current outage was found; `null` once a probe came back clean. */
+  readonly outageSinceSeconds: number | null;
 }
 
 export interface BuzzMentionLivenessSnapshot {
@@ -972,7 +993,7 @@ const nativeAdmissionReporter: BuzzMentionAdmissionReporter = (change) => {
  * connections and answering nothing is replaced on every bound, and a line per replacement is the
  * silence this report exists to end, spelled differently. Health and doctor carry the rest.
  */
-const nativeStallReporter: BuzzMentionStallReporter = (report) => {
+export const nativeStallReporter: BuzzMentionStallReporter = (report) => {
   process.stderr.write(
     `Buzz mention subscriber: ${report.identity} (${report.identityPubkey}) ` +
       (report.cause === "UNANSWERED"
@@ -1396,19 +1417,34 @@ class BuzzMentionSubscription {
   #answeredAt: number | null = null;
   /** Local seconds this identity last became admitted: the health anchor before any answer. */
   #admittedAt: number | null = null;
-  /** The probe outstanding on the current connection, if any. One at a time. */
-  #probe: { readonly id: string; readonly sentAt: number; missed: boolean } | null = null;
+  /**
+   * The probe outstanding on the current connection, if any. One at a time. `missedFrom` is the
+   * oldest `created_at` among the stored events it returned that the subscription never delivered.
+   */
+  #probe: { readonly id: string; readonly sentAt: number; missedFrom: number | null } | null = null;
   #probes = 0;
   /** A probe's subscription id is this, then its number; it can never equal `#subscriptionId`. */
   readonly #probePrefix = `live-${this.#subscriptionId}-`;
-  /** The next probe's window: stored events from here on should already have been delivered. */
+  /**
+   * The next probe's window, in local seconds: stored events from here on should already have been
+   * delivered. Per identity, not per connection: set when the first connection opens and moved only
+   * by a probe that came back clean, so neither a replacement nor an exclusion skips what no probe
+   * has checked. A probe asks from `LIVENESS_PROBE_LOOKBACK_SECONDS` before it.
+   */
   #probeFrom = 0;
-  /** Event ids the subscription itself delivered, newest last; read only by the probe. */
-  readonly #heard = new Set<string>();
+  /** Whether the current connection's subscription has reached `EOSE`; a probe waits for it. */
+  #caughtUp = false;
+  /** Event ids the subscription itself delivered, with their `created_at`, newest last; read only by the probe. */
+  readonly #heard = new Map<string, number>();
+  /** The newest `created_at` an evicted id had: a probe does not judge an event at or before it. */
+  #heardFloor = Number.NEGATIVE_INFINITY;
   #stalls = 0;
   #lastStall: { readonly atSeconds: number; readonly cause: BuzzMentionStallCause } | null = null;
-  /** Whether the current outage was reported; cleared by the next answer. */
-  #stallReported = false;
+  /**
+   * The outage in progress: found at the first stall, reported once, and ended only by a probe that
+   * comes back clean. A replacement connection's `EOSE` is an answer, not the end of an outage.
+   */
+  #outageSince: number | null = null;
 
   constructor(
     deps: SubscriptionDeps,
@@ -1701,7 +1737,8 @@ class BuzzMentionSubscription {
     // A new connection gets the whole bound to authenticate and reach EOSE, counted from now; a
     // handshake the relay never answers is a stall like any other.
     this.#heardAt = this.#deps.scheduler.nowSeconds();
-    this.#probeFrom = this.#heardAt;
+    if (this.#probeFrom === 0) this.#probeFrom = this.#heardAt;
+    this.#caughtUp = false;
     this.#probe = null;
     // Claimed before the socket exists, so every callback the factory registers is already fenced
     // by the time it can fire.
@@ -1786,6 +1823,7 @@ class BuzzMentionSubscription {
     // queue from the one just dropped now fails the fence.
     this.#generation = 0;
     this.#subscribed = false;
+    this.#caughtUp = false;
     this.#authEventId = null;
     this.#probe = null;
     this.#abandonPublishes();
@@ -1806,6 +1844,7 @@ class BuzzMentionSubscription {
     this.#socket = null;
     this.#generation = 0;
     this.#subscribed = false;
+    this.#caughtUp = false;
     this.#authEventId = null;
     this.#probe = null;
     this.#abandonPublishes();
@@ -1909,17 +1948,20 @@ class BuzzMentionSubscription {
     const now = this.#deps.scheduler.nowSeconds();
     const quiet = now - this.#heardAt;
     if (quiet >= SUBSCRIPTION_LIVENESS_BOUND_SECONDS) {
-      this.#stalled(generation, "UNANSWERED", quiet);
+      // A probe that returned missed events and was then never ended still names them.
+      this.#stalled(generation, "UNANSWERED", quiet, this.#probe?.missedFrom ?? null);
       return;
     }
-    // Before the subscription is open there is nothing to probe; the bound above still covers a
-    // handshake the relay never finishes. One probe at a time: an unanswered one ages into a stall.
-    if (!this.#subscribed || this.#probe !== null) return;
+    // Before the subscription has delivered its stored events there is nothing to compare a probe
+    // with; the bound above still covers a handshake or a backlog the relay never finishes. One
+    // probe at a time: an unanswered or refused one ages into a stall.
+    if (!this.#caughtUp || this.#probe !== null) return;
     this.#probes += 1;
     const id = `${this.#probePrefix}${this.#probes}`;
-    this.#probe = { id, sentAt: now, missed: false };
+    this.#probe = { id, sentAt: now, missedFrom: null };
     try {
-      this.#send(generation, JSON.stringify(["REQ", id, ...this.#filters(this.#probeFrom)]));
+      const from = Math.max(0, this.#probeFrom - LIVENESS_PROBE_LOOKBACK_SECONDS);
+      this.#send(generation, JSON.stringify(["REQ", id, ...this.#filters(from)]));
     } catch {
       // A socket that refuses the write is not a connection anything arrives on.
       this.#reconnect(generation);
@@ -1932,52 +1974,71 @@ class BuzzMentionSubscription {
     const now = this.#deps.scheduler.nowSeconds();
     const anchor = Math.max(this.#answeredAt ?? Number.NEGATIVE_INFINITY, this.#admittedAt ?? Number.NEGATIVE_INFINITY);
     const unanswered = admitted && Number.isFinite(anchor) ? Math.max(0, now - anchor) : null;
+    const stale = (unanswered !== null && unanswered >= SUBSCRIPTION_LIVENESS_BOUND_SECONDS) || this.#outageSince !== null;
     return {
       identity: this.#ordinal,
       identityPubkey: this.#pubkey,
       roleKey: this.#binding?.roleKey ?? null,
-      state: !admitted ? "EXCLUDED" : unanswered !== null && unanswered >= SUBSCRIPTION_LIVENESS_BOUND_SECONDS ? "STALE" : "LIVE",
+      state: !admitted ? "EXCLUDED" : stale ? "STALE" : "LIVE",
       exclusionReason: admitted ? null : (this.#exclusion?.reason ?? BuzzMentionExclusion.SUBSCRIBER_CLOSED),
       answeredAtSeconds: this.#answeredAt,
       unansweredForSeconds: unanswered,
       stalls: this.#stalls,
       lastStall: this.#lastStall,
+      outageSinceSeconds: this.#outageSince,
     };
   }
 
-  /** The relay answered this connection: the stall anchor moves, and the outage, if any, is over. */
+  /** The relay answered this connection: the stall anchor moves. Not, by itself, the end of an outage. */
   #answered(): void {
     const now = this.#deps.scheduler.nowSeconds();
     this.#heardAt = now;
     this.#answeredAt = now;
-    this.#stallReported = false;
   }
 
-  /** Records an event id the subscription delivered, keeping the newest `HEARD_EVENT_LIMIT`. */
-  #hear(eventId: string): void {
-    this.#heard.delete(eventId);
-    this.#heard.add(eventId);
+  /**
+   * Records an event the subscription delivered, keeping the newest `HEARD_EVENT_LIMIT`. An evicted
+   * event's `created_at` raises the floor below which a probe no longer judges what it returns.
+   */
+  #hear(event: { readonly id: string; readonly created_at: number }): void {
+    this.#heard.delete(event.id);
+    this.#heard.set(event.id, event.created_at);
     if (this.#heard.size <= HEARD_EVENT_LIMIT) return;
-    const oldest = this.#heard.values().next().value;
-    if (oldest !== undefined) this.#heard.delete(oldest);
+    const oldest = this.#heard.entries().next().value;
+    if (oldest === undefined) return;
+    this.#heard.delete(oldest[0]);
+    this.#heardFloor = Math.max(this.#heardFloor, oldest[1]);
   }
 
-  /** Counts and reports a stall, then replaces the connection through the ordinary reconnect. */
-  #stalled(generation: number, cause: BuzzMentionStallCause, quietSeconds: number): void {
+  /**
+   * Counts a stall, reports the first of an outage, and replaces the connection through the
+   * ordinary reconnect.
+   *
+   * `missedFrom` is the oldest stored event a probe found undelivered. The preserved window is
+   * moved back to it, because the window is the newest *admitted* event's second: a newer mention
+   * delivered after the missed one would otherwise put the missed one behind the replacement's
+   * request, and it would never be asked for again. Moving back loses nothing and duplicates
+   * nothing: everything between is asked again and the seam refuses what it already holds, as it
+   * does for the inclusive boundary event on every reconnect. Moved here, after the old connection
+   * is fenced and before the replacement asks, so no admission on either can raise it in between.
+   */
+  #stalled(generation: number, cause: BuzzMentionStallCause, quietSeconds: number, missedFrom: number | null): void {
+    const now = this.#deps.scheduler.nowSeconds();
     this.#stalls += 1;
-    this.#lastStall = { atSeconds: this.#deps.scheduler.nowSeconds(), cause };
-    if (!this.#stallReported) {
-      this.#stallReported = true;
-      this.#deps.reportStall({
-        identity: this.#ordinal,
-        identityPubkey: this.#pubkey,
-        roleKey: this.#binding?.roleKey ?? null,
-        cause,
-        quietSeconds,
-        boundSeconds: SUBSCRIPTION_LIVENESS_BOUND_SECONDS,
-      });
-    }
+    this.#lastStall = { atSeconds: now, cause };
     this.#reconnect(generation);
+    if (missedFrom !== null && this.#since !== null) this.#since = Math.min(this.#since, missedFrom);
+    if (this.#outageSince !== null) return;
+    this.#outageSince = now;
+    this.#deps.reportStall({
+      identity: this.#ordinal,
+      identityPubkey: this.#pubkey,
+      roleKey: this.#binding?.roleKey ?? null,
+      cause,
+      quietSeconds,
+      boundSeconds: SUBSCRIPTION_LIVENESS_BOUND_SECONDS,
+      outageSinceSeconds: now,
+    });
   }
 
   /** Whether `id` names one of this connection's probes, current or already ended. */
@@ -1989,7 +2050,8 @@ class BuzzMentionSubscription {
    * A stored event the probe returned. Not admitted from here: the subscription is the one path to
    * the seam, and the probe only asks whether the subscription delivered it. One signed long
    * enough ago that its push should have arrived first, and that the subscription never
-   * delivered, is a mention the subscription missed.
+   * delivered, is a mention the subscription missed. One at or before the evicted floor is not
+   * judged: the subscription may have delivered it and forgotten.
    */
   #onProbeEvent(id: string, raw: unknown): BuzzMentionFrameOutcome {
     const probe = this.#probe;
@@ -1998,23 +2060,32 @@ class BuzzMentionSubscription {
     // hearing it (malformed, or not signed by its author) is not counted against it either.
     const event = plainEventOf(raw);
     if (event === null || !validateEvent(event) || !verifyEvent(event)) return ACCEPTED;
-    if (event.created_at <= probe.sentAt - LIVENESS_PROBE_GRACE_SECONDS && !this.#heard.has(event.id)) {
-      probe.missed = true;
+    if (
+      event.created_at <= probe.sentAt - LIVENESS_PROBE_GRACE_SECONDS &&
+      event.created_at > this.#heardFloor &&
+      !this.#heard.has(event.id)
+    ) {
+      probe.missedFrom = Math.min(probe.missedFrom ?? event.created_at, event.created_at);
     }
     return ACCEPTED;
   }
 
-  /** The relay ended a probe: with `EOSE` (closed here) or with its own `CLOSED`. Either is an answer. */
-  #onProbeEnd(id: string, generation: number, closeIt: boolean): BuzzMentionFrameOutcome {
+  /**
+   * The relay ended a probe with `EOSE`: the one answer that says what the subscription should have
+   * delivered. Clean, it ends the outage, if any, and moves the window on; with a missed event it
+   * is a stall whose replacement asks from that event.
+   */
+  #onProbeEnd(id: string, generation: number): BuzzMentionFrameOutcome {
     const probe = this.#probe;
     if (probe === null || probe.id !== id || !this.#isCurrent(generation)) return ACCEPTED;
     this.#probe = null;
-    if (closeIt) this.#send(generation, JSON.stringify(["CLOSE", id]));
-    if (probe.missed) {
-      this.#stalled(generation, "MISSED_EVENTS", this.#deps.scheduler.nowSeconds() - this.#heardAt);
+    this.#send(generation, JSON.stringify(["CLOSE", id]));
+    if (probe.missedFrom !== null) {
+      this.#stalled(generation, "MISSED_EVENTS", this.#deps.scheduler.nowSeconds() - this.#heardAt, probe.missedFrom);
       return ACCEPTED;
     }
     this.#answered();
+    this.#outageSince = null;
     // The next window overlaps this one by the grace, which this one did not judge.
     this.#probeFrom = Math.max(this.#probeFrom, probe.sentAt - LIVENESS_PROBE_GRACE_SECONDS);
     return ACCEPTED;
@@ -2159,7 +2230,7 @@ class BuzzMentionSubscription {
       this.#reconnect(generation);
       return rejected("frame-not-a-message");
     }
-    if (this.#isProbe(frame[1])) return this.#onProbeEnd(frame[1], generation, true);
+    if (this.#isProbe(frame[1])) return this.#onProbeEnd(frame[1], generation);
     if (frame[1] !== this.#subscriptionId) return rejected("unknown-subscription");
     // The attempt reset says "a connection reached the end of stored events and therefore
     // worked". A stale EOSE says that about a connection that is gone, and would hand the live
@@ -2168,6 +2239,7 @@ class BuzzMentionSubscription {
     this.#attempt = 0;
     if (this.#since === null) this.#since = 0;
     this.#answered();
+    this.#caughtUp = true;
     return ACCEPTED;
   }
 
@@ -2185,8 +2257,11 @@ class BuzzMentionSubscription {
     if (frame.length !== 3 || typeof frame[1] !== "string" || typeof frame[2] !== "string") {
       return rejected("frame-not-a-message");
     }
-    // A probe the relay refused was still answered; the subscription it asked about is not ended.
-    if (this.#isProbe(frame[1])) return this.#onProbeEnd(frame[1], generation, false);
+    // A probe the relay refused (its subscription limit, say) does not end the subscription it asked
+    // about, and is not an answer about it either: it says nothing about delivery. So it stays
+    // outstanding, no second probe follows on this connection, and it ages into a stall exactly as
+    // a probe the relay never answered does.
+    if (this.#isProbe(frame[1])) return ACCEPTED;
     if (frame[1] !== this.#subscriptionId) return rejected("unknown-subscription");
     this.#reconnect(generation);
     return rejected("unknown-subscription");
@@ -2219,7 +2294,7 @@ class BuzzMentionSubscription {
     // copy this module built, and before anything reads a field for meaning.
     if (!validateEvent(event)) return rejected("event-malformed");
     if (!verifyEvent(event)) return rejected("event-signature-invalid");
-    this.#hear(event.id);
+    this.#hear(event);
     const refuseEvent = (reasonCode: BuzzMentionRejection): BuzzMentionFrameOutcome => {
       this.#deps.reportEventRefusal?.({ author: event.pubkey, eventId: event.id, reasonCode });
       return rejected(reasonCode);

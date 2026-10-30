@@ -79,6 +79,7 @@ import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
 import { BuzzBindChallenges, buzzBindContentOf } from "../buzz/buzz-bind-challenge.ts";
 import {
   BUZZ_MENTION_ADDRESSED_TO,
+  nativeStallReporter,
   nativeSubscriberScheduler,
   startBuzzMentionSubscriberFromStateDir,
   type BuzzMentionAdmission,
@@ -88,6 +89,7 @@ import {
   type BuzzMentionIdentityJudgement,
   type BuzzMentionRegistry,
   type BuzzMentionSink,
+  type BuzzMentionStallReport,
   type BuzzMentionStallReporter,
   type BuzzMentionSubscriberHandle,
   type BuzzMentionVerdict,
@@ -97,6 +99,7 @@ import {
 } from "../buzz/buzz-mention-subscriber.ts";
 import { OwnerReplyConsumer, type OwnerReplyTimers } from "../conversation/owner-reply-consumer.ts";
 import type { OwnerIdentity } from "../ceo/owner-authority.ts";
+import { NotificationKind } from "../ceo/production-gate.ts";
 import { canonicalTurnTarget } from "../conversation/canonical-turn-target.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { resolveCeoBuzzIdentity } from "../session/ceo-buzz-identity.ts";
@@ -2345,6 +2348,46 @@ export const createDaemonBuzzMentionSink = (
  * configured-off state, and it is a value rather than a `null` so a caller cannot read "absent"
  * as "running".
  */
+/**
+ * #1283 — an outage of a Buzz mention subscription, routed to the CEO as the one §19.3 notification
+ * for it, `CRITICAL_SYSTEM_FAILURE`, beside the subscriber's stderr line.
+ *
+ * Once per outage: the subscriber reports the first stall of one (an identity unanswered past the
+ * bound, or not delivered a stored mention), and nothing more until a probe comes back clean and
+ * ends it. The row's idempotency key covers the outage's identity and the second it was found, so
+ * one outage is one notice however many replacements it takes, and the next outage is a new one.
+ * No run owns it, so it names none. With no live CEO binding `notify` records
+ * CEO_NOTIFICATION_BLOCKED and refuses, and this says so on stderr; the subscriber is never stopped
+ * by its own report.
+ */
+const notifyCeoOfBuzzMentionStall = (cp: ControlPlane, report: BuzzMentionStallReport): void => {
+  try {
+    const notified = cp.db.tx(() => cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, null, {
+      code: "BUZZ_MENTION_SUBSCRIBER_STALE",
+      identity: report.identity,
+      roleKey: report.roleKey,
+      cause: report.cause,
+      quietSeconds: report.quietSeconds,
+      boundSeconds: report.boundSeconds,
+      outageSinceSeconds: report.outageSinceSeconds,
+      whyItMatters:
+        `Buzz mentions for ${report.roleKey ?? report.identity} are not being delivered: ` +
+        (report.cause === "UNANSWERED"
+          ? `the relay had not answered its subscription for ${report.quietSeconds}s on an open connection.`
+          : "a probe found a stored mention its subscription never delivered.") +
+        " The daemon keeps reconnecting from the preserved window, so missed mentions arrive once it answers; " +
+        "doctor's BUZZ_MENTION_SUBSCRIBER_STALE finding says whether the outage is still open.",
+    }));
+    if (!notified.allowed) {
+      process.stderr.write(`Buzz mention subscriber outage for ${report.identity} was not routed to the CEO: ${notified.reasonCode}\n`);
+    }
+  } catch (error) {
+    process.stderr.write(
+      `Buzz mention subscriber outage for ${report.identity} was not routed to the CEO: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+  }
+};
+
 export const startDaemonBuzzMentionSubscriber = (
   cp: ControlPlane,
   stateDir: string,
@@ -2380,7 +2423,10 @@ export const startDaemonBuzzMentionSubscriber = (
     ...(options.openSocket ? { openSocket: options.openSocket } : {}),
     ...(options.scheduler ? { scheduler: options.scheduler } : {}),
     ...(options.reportAdmission ? { reportAdmission: options.reportAdmission } : {}),
-    ...(options.reportStall ? { reportStall: options.reportStall } : {}),
+    reportStall: (report) => {
+      (options.reportStall ?? nativeStallReporter)(report);
+      notifyCeoOfBuzzMentionStall(cp, report);
+    },
 
   }, process.env["ACP_BUZZ_RELAY_URL"]);
   // The file remains the deployment baseline; resident allocations are merged dynamically.

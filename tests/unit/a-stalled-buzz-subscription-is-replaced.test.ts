@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
 import {
+  LIVENESS_PROBE_LOOKBACK_SECONDS,
   nativeRelaySocketFactory,
   type BuzzMentionEvent,
   type BuzzMentionLivenessSnapshot,
@@ -66,7 +67,7 @@ interface CtoSpec {
 }
 const ONE_CTO: readonly CtoSpec[] = [{ project: PROJECT, room: ROOM, live: true }];
 
-const start = async (ctos: readonly CtoSpec[] = ONE_CTO) => {
+const start = async (ctos: readonly CtoSpec[] = ONE_CTO, options: { readonly ceo?: boolean } = {}) => {
   const relay = await startLocalWebSocketRelay();
   const dir = tempDir("acp-stall-");
   chmodSync(dir, 0o700);
@@ -74,6 +75,12 @@ const start = async (ctos: readonly CtoSpec[] = ONE_CTO) => {
   const keys = ctos.map((_cto, index) => channelKey(dir, `cto-${index}.key`));
   const cto = keys[0]!;
   const h = makeHarness({ ownerIdentities: [{ channel: "buzz", actor: owner.pubkey }] });
+  // A live CEO binding, so a notification has someone to be addressed to.
+  if (options.ceo === true) {
+    const ceo = h.cp.sessions.create({ provider: "scripted", model: "ceo" });
+    expect(h.cp.sessions.transition(ceo.sessionId, SessionLifecycle.READY, "test").allowed).toBe(true);
+    expect(h.cp.bindings.bind({ role: Role.CEO, sessionId: ceo.sessionId }).allowed).toBe(true);
+  }
   ctos.forEach((spec, index) => {
     h.cp.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [spec.project, spec.project, h.cp.clock.nowIso()]);
     // Configured, with no session carrying its identity: excluded by design, as a paused CTO is.
@@ -195,6 +202,14 @@ const start = async (ctos: readonly CtoSpec[] = ONE_CTO) => {
         [ReasonCode.INGRESS_REPLAY_IGNORED, nonce],
       )!.n,
     liveness: (): BuzzMentionLivenessSnapshot | undefined => subscriber.counters().liveness,
+    /** Every CEO notification row, oldest first, with the run it names. */
+    ceoNotices: () =>
+      h.cp.db
+        .all<{ run_id: string | null; payload_json: string }>(
+          `SELECT run_id, payload_json FROM outbox WHERE kind = ? ORDER BY created_at, rowid`,
+          [MessageKind.CEO_NOTIFICATION],
+        )
+        .map((row) => ({ runId: row.run_id, payload: JSON.parse(row.payload_json) as Record<string, unknown> })),
     /** One daemon health tick: thirty seconds pass and the liveness step runs. */
     tick: async (): Promise<void> => {
       h.clock.advance(30_000);
@@ -292,7 +307,11 @@ describe("a Buzz subscription that stops being answered on an open connection (#
       expect(f.stalls).toEqual([
         expect.objectContaining({ identity: "identities[0]", identityPubkey: f.cto.pubkey, roleKey: ROLE_KEY, cause: "UNANSWERED", boundSeconds: 90 }),
       ]);
-      expect(f.liveness()?.identities[0]).toMatchObject({ state: "LIVE", stalls: 1, lastStall: { cause: "UNANSWERED" } });
+      // The replacement's own EOSE is not the end of the outage; the next probe coming back clean is.
+      expect(f.liveness()?.identities[0]).toMatchObject({ state: "STALE", outageSinceSeconds: f.stalls[0]!.outageSinceSeconds });
+      await f.tick();
+      await f.waitFor("a clean probe on the replacement", () => f.relay.connections[1]!.closes.length === 1);
+      expect(f.liveness()?.identities[0]).toMatchObject({ state: "LIVE", stalls: 1, lastStall: { cause: "UNANSWERED" }, outageSinceSeconds: null });
       // And the role message is the one the holder's claim hands over.
       expect(f.completeNextOwnerMessage()).toBe("두 번째 답장");
     } finally {
@@ -339,10 +358,12 @@ describe("a Buzz subscription that stops being answered on an open connection (#
       expect(f.relay.connections).toHaveLength(1);
       const probes = connection.requests.slice(1);
       expect(probes).toHaveLength(6);
-      // The subscription's own two filters, from the window the connection opened at.
+      // The subscription's own two filters, from the window the connection opened at, less the
+      // lookback that finds a mention published after it was signed.
+      const from = f.openedAt - LIVENESS_PROBE_LOOKBACK_SECONDS;
       expect(probes[0]!.filters).toEqual([
-        { kinds: [9], "#p": [f.cto.pubkey], "#h": [ROOM], since: f.openedAt },
-        { kinds: [9], authors: [f.owner.pubkey], "#h": [ROOM], since: f.openedAt },
+        { kinds: [9], "#p": [f.cto.pubkey], "#h": [ROOM], since: from },
+        { kinds: [9], authors: [f.owner.pubkey], "#h": [ROOM], since: from },
       ]);
       // Each probe is closed once the relay ends it; the subscription itself stays open.
       expect(connection.closes).toEqual(probes.map((probe) => probe.id));
@@ -389,6 +410,10 @@ describe("a Buzz subscription that stops being answered on an open connection (#
       await f.tick();
       f.fireTimers();
       await f.waitFor("an answered third connection", () => f.relay.connections[2]?.requests.length === 1);
+      // Answered is not yet delivering: the outage ends when a probe on it comes back clean.
+      expect(d.healthLiveness()).toMatchObject({ staleIdentities: 1, identities: [{ state: "STALE", stalls: 2 }] });
+      await f.tick();
+      await f.waitFor("a clean probe on the third connection", () => f.relay.connections[2]!.closes.length === 1);
       expect(await d.staleFindings()).toEqual([]);
       expect(d.healthLiveness()).toMatchObject({ staleIdentities: 0, identities: [{ state: "LIVE", stalls: 2 }] });
       // One outage, one report, however many connections it took.
@@ -457,6 +482,184 @@ describe("a Buzz subscription that stops being answered on an open connection (#
       ]);
     } finally {
       await d.stop();
+      await f.close();
+    }
+  });
+});
+
+/**
+ * The review of the liveness probe above (#1283, lane-n-fs). Each row is a way the probe could still
+ * leave a mention undelivered while health said LIVE, or leave an outage with nobody told.
+ */
+describe("a stalled Buzz subscription's recovery, under the probe's review (#1283)", () => {
+  it("asks again from a skipped mention even after a newer one was delivered", async () => {
+    const f = await start();
+    try {
+      // The live push skips A; B, signed later, arrives and is admitted, so the window moves to B.
+      const skipped = f.mention("건너뛴 답장");
+      f.relay.publish(skipped, { push: false });
+      f.h.clock.advance(5_000);
+      const newer = f.mention("나중 답장");
+      f.relay.publish(newer);
+      await f.waitFor("the newer mention admitted", () => f.inboundFor(newer.id).length === 1);
+      expect(f.inboundFor(skipped.id)).toHaveLength(0);
+
+      // The probe finds A stored and never delivered; the replacement must ask from A, not from B.
+      await f.tick();
+      await f.waitFor("the probe finding the skipped mention", () => f.stalls.length === 1);
+      f.fireTimers();
+      await f.waitFor("the skipped mention admitted", () => f.inboundFor(skipped.id).length === 1);
+
+      expect(f.stalls).toEqual([expect.objectContaining({ cause: "MISSED_EVENTS" })]);
+      expect(f.relay.connections).toHaveLength(2);
+      expect(f.relay.connections[1]!.requests[0]!.filters[0]).toMatchObject({ since: skipped.created_at });
+      // Each admitted once: B came back with the wider window and the seam refused it.
+      expect(f.inboundFor(skipped.id)).toHaveLength(1);
+      expect(f.inboundFor(newer.id)).toHaveLength(1);
+      expect(f.ownerMessages()).toBe(2);
+      expect(f.wakes).toEqual([newer.id, skipped.id]);
+      expect(f.subscriber.counters().rejections["admission-already-durable"]).toBe(1);
+
+      await f.tick();
+      await f.waitFor("a clean probe on the replacement", () => f.relay.connections[1]!.closes.length === 1);
+      expect(f.liveness()?.identities[0]).toMatchObject({ state: "LIVE", stalls: 1, outageSinceSeconds: null });
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("does not count a probe the relay refuses as an answer", async () => {
+    const f = await start();
+    try {
+      // One subscription per connection, on this one and every replacement: each probe is refused.
+      f.relay.maxSubscriptionsPerConnection = 1;
+      f.relay.connections[0]!.noLivePush = true;
+      f.h.clock.advance(2_000);
+      const missed = f.mention("거절된 프로브");
+      f.relay.publish(missed);
+      await f.settle();
+      expect(f.inboundFor(missed.id)).toHaveLength(0);
+
+      // Within the bound's three ticks the refused connection is a stall like an unanswered one.
+      for (let tick = 0; tick < 3; tick += 1) await f.tick();
+      expect(f.stalls).toEqual([expect.objectContaining({ cause: "UNANSWERED" })]);
+      expect(f.liveness()?.identities[0]).toMatchObject({ state: "STALE", stalls: 1 });
+      // One probe, refused, and no second one sent on the strength of the refusal.
+      expect(f.relay.connections[0]!.refused).toHaveLength(1);
+
+      // The replacement asks from the preserved window, so the mention is delivered; but no probe
+      // has been answered, so the identity is still not LIVE.
+      f.fireTimers();
+      await f.waitFor("the missed mention admitted", () => f.inboundFor(missed.id).length === 1);
+      expect(f.liveness()?.identities[0]).toMatchObject({ state: "STALE", stalls: 1 });
+
+      // Still refused on the replacement: replaced again within the bound, still one report.
+      for (let tick = 0; tick < 3; tick += 1) await f.tick();
+      expect(f.relay.connections[1]!.refused).toHaveLength(1);
+      expect(f.liveness()?.identities[0]).toMatchObject({ state: "STALE", stalls: 2 });
+      expect(f.stalls).toHaveLength(1);
+      expect(f.relay.connections).toHaveLength(2);
+      f.fireTimers();
+      await f.waitFor("a third connection", () => f.relay.connections[2]?.requests.length === 1);
+      expect(f.inboundFor(missed.id)).toHaveLength(1);
+      expect(f.wakes).toEqual([missed.id]);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("finds a mention published long after it was signed", async () => {
+    const f = await start();
+    try {
+      const late = f.mention("늦게 게시된 답장");
+      // Three healthy ticks: every probe comes back clean and the window moves past `late`'s second.
+      const connection = f.relay.connections[0]!;
+      for (let tick = 0; tick < 3; tick += 1) {
+        await f.tick();
+        await f.waitFor(`probe ${tick + 1} answered and closed`, () => connection.closes.length === tick + 1);
+      }
+      expect(f.stalls).toEqual([]);
+
+      // Then it reaches the relay, while the live push has stopped.
+      connection.noLivePush = true;
+      f.relay.publish(late);
+      await f.settle();
+      expect(f.inboundFor(late.id)).toHaveLength(0);
+
+      // The next tick's probe still reaches back to it.
+      await f.tick();
+      await f.waitFor("the probe finding the late mention", () => f.stalls.length === 1);
+      f.fireTimers();
+      await f.waitFor("the late mention admitted", () => f.inboundFor(late.id).length === 1);
+      expect(f.stalls).toEqual([expect.objectContaining({ cause: "MISSED_EVENTS" })]);
+      expect(f.inboundFor(late.id)).toHaveLength(1);
+      expect(f.wakes).toEqual([late.id]);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("tells the CEO once per outage, as a CRITICAL_SYSTEM_FAILURE notice that names no run", async () => {
+    const f = await start(ONE_CTO, { ceo: true });
+    try {
+      await f.tick();
+      expect(f.ceoNotices()).toEqual([]);
+
+      // An outage that two replacements do not cure: one notice.
+      f.relay.connections[0]!.silent = true;
+      f.relay.silentForNewConnections = true;
+      for (let round = 0; round < 2; round += 1) {
+        for (let tick = 0; tick < 3; tick += 1) await f.tick();
+        f.fireTimers();
+        await f.settle();
+      }
+      expect(f.liveness()?.identities[0]).toMatchObject({ state: "STALE", stalls: 2 });
+      expect(f.stalls).toHaveLength(1);
+      const first = {
+        runId: null,
+        payload: expect.objectContaining({
+          notification: "CRITICAL_SYSTEM_FAILURE",
+          runId: null,
+          code: STALE,
+          identity: "identities[0]",
+          roleKey: ROLE_KEY,
+          cause: "UNANSWERED",
+          boundSeconds: 90,
+          outageSinceSeconds: f.stalls[0]!.outageSinceSeconds,
+        }),
+      };
+      expect(f.ceoNotices()).toEqual([first]);
+      // Recorded with no run and its evidence kept, the explanation left to the notice itself.
+      const audit = f.h.cp.db.all<{ run_id: string | null; reason_code: string | null; evidence_json: string }>(
+        `SELECT run_id, reason_code, evidence_json FROM audit_events WHERE kind = 'CEO_NOTIFICATION'`,
+      );
+      expect(audit).toHaveLength(1);
+      expect(audit[0]!.run_id).toBeNull();
+      expect(audit[0]!.reason_code).toBeNull();
+      const evidence = JSON.parse(audit[0]!.evidence_json) as Record<string, unknown>;
+      expect(evidence).toMatchObject({ notification: "CRITICAL_SYSTEM_FAILURE", code: STALE, identity: "identities[0]" });
+      expect(evidence).not.toHaveProperty("whyItMatters");
+
+      // The relay answers again: replaced once more, a probe comes back clean, the outage is over.
+      f.relay.silentForNewConnections = false;
+      for (let tick = 0; tick < 3; tick += 1) await f.tick();
+      f.fireTimers();
+      await f.waitFor("an answered fourth connection", () => f.relay.connections[3]?.requests.length === 1);
+      await f.tick();
+      await f.waitFor("a clean probe on it", () => f.relay.connections[3]!.closes.length === 1);
+      expect(f.liveness()?.identities[0]).toMatchObject({ state: "LIVE", stalls: 3, outageSinceSeconds: null });
+      expect(f.ceoNotices()).toEqual([first]);
+
+      // A second outage is a second notice.
+      f.relay.connections[3]!.silent = true;
+      for (let tick = 0; tick < 3; tick += 1) await f.tick();
+      expect(f.stalls).toHaveLength(2);
+      expect(f.stalls[1]!.outageSinceSeconds).toBeGreaterThan(f.stalls[0]!.outageSinceSeconds);
+      expect(f.ceoNotices()).toEqual([
+        first,
+        { runId: null, payload: expect.objectContaining({ notification: "CRITICAL_SYSTEM_FAILURE", outageSinceSeconds: f.stalls[1]!.outageSinceSeconds }) },
+      ]);
+    } finally {
       await f.close();
     }
   });

@@ -3323,7 +3323,9 @@ export class Daemon {
    * the counters had moved before the outage, so the silent finding was suppressed, the five
    * connections were ESTABLISHED and the relay was healthy, and doctor was clean for three days
    * while no mention was delivered. The subscriber replaces a stalled connection by itself; this
-   * reports only an identity that is still unanswered, so a stall the reconnect cured is not one.
+   * reports an identity that is still unanswered, or whose outage no probe has yet come back clean
+   * on, so a stall the reconnect cured clears on the next health tick and not on the replacement's
+   * own `EOSE`, which proves the stored query answers and not that delivery does.
    */
   private buzzMentionLivenessFindings(): Finding[] {
     const liveness = this.#buzzMentionReceipt?.counters().liveness;
@@ -3345,6 +3347,7 @@ export class Daemon {
           answeredAtSeconds: one.answeredAtSeconds,
           stalls: one.stalls,
           lastStall: one.lastStall,
+          outageSinceSeconds: one.outageSinceSeconds,
         })),
         // The rest of the picture, so a stalled identity beside a deliberately excluded one is not
         // read as one partial-but-healthy subscriber: how many are delivering, and why the

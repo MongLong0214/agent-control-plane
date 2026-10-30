@@ -12,7 +12,9 @@ import type { BuzzMentionEvent } from "../../src/buzz/buzz-mention-subscriber.ts
  *
  * Its point is the two ways a connection can go quiet while TCP stays ESTABLISHED, set per
  * connection: `silent` answers and delivers nothing at all, and `noLivePush` still answers every
- * request but stops pushing newly published events to the subscriptions already open on it.
+ * request but stops pushing newly published events to the subscriptions already open on it. A
+ * subscription limit and a store-only publish cover the review's other cases: a relay that refuses
+ * every probe, and one event the live push skipped while later ones arrived.
  */
 export interface LocalRelayConnection {
   readonly socket: Socket;
@@ -26,6 +28,8 @@ export interface LocalRelayConnection {
   readonly requests: { readonly id: string; readonly filters: readonly Record<string, unknown>[] }[];
   /** Every `CLOSE` this connection received while answering, by subscription id. */
   readonly closes: string[];
+  /** Every `REQ` the relay ended with `CLOSED` for the subscription limit, by subscription id. */
+  readonly refused: string[];
 }
 
 export interface LocalWebSocketRelay {
@@ -34,8 +38,16 @@ export interface LocalWebSocketRelay {
   readonly connections: LocalRelayConnection[];
   /** Connections opened from now on start silent; existing ones are unchanged. */
   silentForNewConnections: boolean;
-  /** Stores an event and pushes it to every matching subscription on an answering connection. */
-  publish(event: BuzzMentionEvent): void;
+  /**
+   * How many subscriptions one connection may hold open, on every connection; `null` for no limit.
+   * A `REQ` past it is ended with `CLOSED` and `restricted: too many subscriptions`, as a relay does.
+   */
+  maxSubscriptionsPerConnection: number | null;
+  /**
+   * Stores an event and pushes it to every matching subscription on an answering connection.
+   * `push: false` stores it only: a request finds it, and no open subscription is told.
+   */
+  publish(event: BuzzMentionEvent, options?: { readonly push?: boolean }): void;
   close(): Promise<void>;
 }
 
@@ -121,6 +133,12 @@ export const startLocalWebSocketRelay = async (): Promise<LocalWebSocketRelay> =
     } else if (message[0] === "REQ") {
       const id = message[1] as string;
       const filters = message.slice(2) as Record<string, unknown>[];
+      const limit = relay.maxSubscriptionsPerConnection;
+      if (limit !== null && !connection.subscriptions.has(id) && connection.subscriptions.size >= limit) {
+        connection.refused.push(id);
+        say(connection, ["CLOSED", id, "restricted: too many subscriptions"]);
+        return;
+      }
       connection.requests.push({ id, filters });
       connection.subscriptions.set(id, filters);
       for (const event of stored.filter((one) => filters.some((filter) => matches(filter, one)))) {
@@ -152,6 +170,7 @@ export const startLocalWebSocketRelay = async (): Promise<LocalWebSocketRelay> =
       subscriptions: new Map(),
       requests: [],
       closes: [],
+      refused: [],
     };
     connections.push(connection);
     const state = { buffer: Buffer.alloc(0) };
@@ -186,8 +205,10 @@ export const startLocalWebSocketRelay = async (): Promise<LocalWebSocketRelay> =
     url: `ws://127.0.0.1:${port}`,
     connections,
     silentForNewConnections: false,
-    publish: (event) => {
+    maxSubscriptionsPerConnection: null,
+    publish: (event, options) => {
       stored.push(event);
+      if (options?.push === false) return;
       for (const connection of connections) {
         if (connection.noLivePush) continue;
         for (const [id, filters] of connection.subscriptions) {
