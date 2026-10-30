@@ -4,6 +4,7 @@ import { ReasonCode } from '../core/reason-codes.ts';
 import { CanonicalSessionRegistry } from './canonical-session-registry.ts';
 import { Role, roleKeyFor } from '../domain/types.ts';
 import { HostRetirementRefusal } from '../runtime/host-project-provisioner.ts';
+import { retirementWaitsForSettlement } from '../ceo/ownerless-stalls.ts';
 
 /**
  * #1251 C-P1 — the retirement's intent, committed in the transaction that suspends the project: its reason and whether
@@ -90,8 +91,14 @@ async function retire(cp:ControlPlane,projectId:string,suspended:boolean,reason:
   }
   const work = cp.db.all<{run_id:string;state:string}>(`SELECT run_id,state FROM runs WHERE (project_id = ? OR run_id IN (SELECT run_id FROM bootstrap_applications WHERE project_id = ?)) AND state NOT IN ('COMPLETED','CANCELLED','FAILED') ORDER BY created_at,run_id`,[projectId,projectId]);
   // Confirmed/merged effects must settle through their own finalizer; cancellation never erases them.
-  const settling = work.filter(r => ['CEO_APPROVED','FINALIZING','MERGING','POST_MERGE_VERIFYING','BLOCKED_POST_MERGE'].includes(r.state)).map(r => r.run_id);
-  if (settling.length > 0) {unmark();return deny(ReasonCode.CONFLICT,`retirement waits for confirmed external effects to settle; ${unchanged()}`,{projectId,settling,requiredOrder:[`let runs ${settling.join(', ')} finish finalizing`,rerun]});}
+  const settling = work.filter(r => ['CEO_APPROVED','FINALIZING','MERGING','POST_MERGE_VERIFYING','BLOCKED_POST_MERGE'].includes(r.state));
+  if (settling.length > 0) {
+    unmark();
+    // A terminal BLOCKED_POST_MERGE run never settles; its held retirement reaches the CEO as its own incident.
+    const held = retirementWaitsForSettlement(cp,projectId,settling);
+    const ids = settling.map(r => r.run_id);
+    return deny(ReasonCode.CONFLICT,`retirement waits for confirmed external effects to settle; ${unchanged()}`,{...held.evidence,projectId,settling:ids,requiredOrder:[`let runs ${ids.join(', ')} finish finalizing`,rerun]});
+  }
   if (pending()) {
     if (!suspended) cp.projects.setSuspended(projectId,true,true);
   } else if (!intent) {

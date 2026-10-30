@@ -117,6 +117,13 @@ export const ReasonCode = {
   OWNER_AUTHORITY_NOT_DELEGABLE: "OWNER_AUTHORITY_NOT_DELEGABLE",
   HUMAN_GATE_REQUIRED: "HUMAN_GATE_REQUIRED",
   HUMAN_GATE_UNSATISFIED: "HUMAN_GATE_UNSATISFIED",
+  /**
+   * #1189 B1 — an OWNER_DECISION_REQUIRED that does not name an owner-only reason from
+   * `OWNER_ONLY_REASONS` and the specific action it blocks.
+   */
+  OWNER_DECISION_REASON_REQUIRED: "OWNER_DECISION_REASON_REQUIRED",
+  /** #1189 B1 — an OWNER_DECISION_REQUIRED whose reason is a judgement the CEO's own authority closes. */
+  OWNER_DECISION_CEO_SCOPE: "OWNER_DECISION_CEO_SCOPE",
 
   // --- CP-HI-08 No Silent Degradation -------------------------------------
   EVIDENCE_MISSING: "EVIDENCE_MISSING",
@@ -925,6 +932,8 @@ export const ReasonCode = {
   OUTBOX_TARGET_NOT_CURRENT: "OUTBOX_TARGET_NOT_CURRENT",
   OUTBOX_DELIVERY_REJECTED: "OUTBOX_DELIVERY_REJECTED",
   OUTBOX_RETRY_POLICY_UNAVAILABLE: "OUTBOX_RETRY_POLICY_UNAVAILABLE",
+  /** #1189 — an incident resolved by evidence on its run: no notice is delivered, and a queued one is withdrawn. */
+  CEO_INCIDENT_RESOLVED: "CEO_INCIDENT_RESOLVED",
 
   // --- claim admission -----------------------------------------------------
   CLAIM_OWNER_NOT_RUN_OWNER: "CLAIM_OWNER_NOT_RUN_OWNER",
