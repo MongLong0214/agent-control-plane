@@ -92,8 +92,13 @@ const persistPassingVerification = (
   return report;
 };
 
-const prepareReviewedInputs = async () => {
+/** `base`: files the run's base commit holds besides the fixture's own. */
+const prepareReviewedInputs = async (base: Record<string, string> = {}) => {
   const harness = makeHarness();
+  if (Object.keys(base).length > 0) {
+    writeFiles(harness.repoPath, base);
+    commitAll(harness.repoPath, "base files");
+  }
   const { projectId, repositoryId, identity } = await registerFixtureProject(harness);
   bindCeo(harness);
   const created = harness.cp.runs.create({
@@ -786,6 +791,64 @@ describe("round-2 blind-review regressions", () => {
 
     expect(result.allowed).toBe(false);
     expect(result.reasonCode).toBe(ReasonCode.COVERAGE_INCOMPLETE);
+  });
+
+  /**
+   * Review lane-e-fs-r8 P1 — a binary file the candidate makes text is git's binary section followed by
+   * the readable text (git.ts `withTextRenderedAsText`). When chunking puts the two in different chunks,
+   * the claim of the chunk holding only the binary section must not cover the readable text.
+   */
+  it.each([
+    { textChunkClaims: false, verdict: "REVISE" },
+    { textChunkClaims: true, verdict: "PASS" },
+  ])("E6-1 the readable text chunked apart from its binary section needs its own coverage (text chunk claims it: $textChunkClaims)", async ({ textChunkClaims, verdict }) => {
+    // Inert comment lines behind one NUL byte in the base; the candidate removes the NUL.
+    const lines = Array.from({ length: 900 }, (_, index) => `// inert comment line ${index + 1} ${"-".repeat(40)}\n`).join("");
+    const setup = await prepareReviewedInputs({ "src/zflip.js": `\0${lines}` });
+    // Sorted before src/zflip.js, the padding leaves room in its chunk for the binary section only.
+    writeFiles(setup.harness.repoPath, { "src/pad.js": `// ${"p".repeat(60_000)}\n`, "src/zflip.js": lines });
+    commitAll(setup.harness.repoPath, "make zflip text and add padding");
+    const frozen = await setup.harness.cp.pipeline.freeze(setup.run.runId);
+    if (!frozen.allowed) throw new Error(frozen.message);
+    const reviewed = { ...setup, snapshot: frozen.value, verification: persistPassingVerification(setup, frozen.value) };
+    const key = (path: string): string => `${setup.identity}:${path}`;
+    setup.harness.scripted.script(
+      { match: /Final review/, text: reviewerPass([]) },
+      // The chunk holding the binary section claims every path it was given.
+      { match: /^GIT binary patch$/m, text: reviewerPass([key("src/app.js"), key("src/pad.js"), key("src/zflip.js")]) },
+      { match: /Review chunk/, text: reviewerPass(textChunkClaims ? [key("src/zflip.js")] : []) },
+    );
+
+    const result = await invokePreparedReview(reviewed);
+
+    const chunks = setup.harness.scripted.invocations.map((call) => call.prompt).filter((prompt) => prompt.startsWith("# Review chunk"));
+    // The repro's shape: the binary section and the readable text reach different chunk reviewers.
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]).toMatch(/^GIT binary patch$/m);
+    expect(chunks[0]).not.toContain("+// inert comment line 1 ");
+    expect(chunks[1]).not.toMatch(/^GIT binary patch$/m);
+    expect(chunks[1]).toContain("+// inert comment line 1 ");
+    expect(chunks[1]).toContain("+// inert comment line 900 ");
+    expect(result.allowed ? "PASS" : result.reasonCode).toBe(textChunkClaims ? "PASS" : ReasonCode.REVIEW_REVISE);
+    const packet = setup.harness.cp.review.latestPacket(setup.run.runId, candidateSnapshotDigest(frozen.value));
+    expect(packet).toMatchObject({ verdict, omittedItems: textChunkClaims ? [] : [key("src/zflip.js")] });
+  }, 120_000);
+
+  it("E6-1 names a renamed or copied section by its destination, the path git lists as changed, when it chunks a diff (review lane-e-fs-r8)", () => {
+    const identity = "github:acme/fixture";
+    const section = (kind: "rename" | "copy", from: string, to: string, body: string): string =>
+      `diff --git a/${from} b/${to}\nsimilarity index 90%\n${kind} from ${from}\n${kind} to ${to}\nindex 1111111..2222222 100644\n--- a/${from}\n+++ b/${to}\n@@ -1 +1 @@\n${body}`;
+    const renamed = section("rename", "src/old.js", "src/new.js", `-${"o".repeat(60)}\n+${"n".repeat(60)}\n`);
+    const copied = section("copy", "src/base.js", "src/copy.js", `-${"b".repeat(60)}\n+${"c".repeat(60)}\n`);
+    const budget = Math.max(renamed.length, copied.length);
+    const parts = __testing.splitDiffs([{ identity, diff: renamed + copied, files: ["src/copy.js", "src/new.js"] }], budget).flat();
+    expect(parts.map((part) => part.files)).toEqual([["src/new.js"], ["src/copy.js"]]);
+
+    // A section larger than the budget is range-split under its destination too.
+    const large = section("rename", "src/old.js", "src/new.js", Array.from({ length: 40 }, (_, index) => `+line ${index}\n`).join(""));
+    const ranges = __testing.splitDiffs([{ identity, diff: large, files: ["src/new.js"] }], 150).flat();
+    expect(ranges.length).toBeGreaterThan(1);
+    expect(ranges.every((part) => part.files.length === 1 && part.files[0] === "src/new.js")).toBe(true);
   });
 
   it("#359 keeps a chunk BLOCK with only MAJOR findings from becoming a final PASS", async () => {
