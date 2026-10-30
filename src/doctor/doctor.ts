@@ -31,6 +31,11 @@ import { HOLDER_CLAIMED_KIND_SQL, type Outbox, sourceNeverSpentSql } from "../ou
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
+import {
+  ORPHAN_RELEASE_CONFIRMATION,
+  ORPHAN_RELEASE_REPAIR_ID,
+  unreleasedWorkerOrphans,
+} from "../run/worker-orphan-release.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
 import { defaultCodexHome, inspectReviewerCodexHome, packetReviewerScope } from "../runtime/reviewer-codex-home.ts";
@@ -506,6 +511,7 @@ export class Doctor {
       findings.push(...this.checkStrandedBootstrapApplications(target ?? null));
       findings.push(...this.checkContractChangeRunsWithoutGrant(target ?? null));
       findings.push(...this.checkWorkers());
+      findings.push(...this.checkUnreleasedWorkerOrphans(target ?? null));
     }
     if (scope === "system" || scope === "session") {
       findings.push(...this.checkSessions(target ?? null, scope));
@@ -872,6 +878,25 @@ export class Doctor {
           // A finalizing CONTRACT_CHANGE refuses every other one of its project (CONTRACT_CHANGE_FINALIZATION_OVERLAP).
           ? `this run was confirmed without an activation grant and cannot complete, and while it is ${run.state} every other CONTRACT_CHANGE of its project is refused at finalization; no action within existing authority unblocks it: it needs an exit transition from ${run.state} (pending), and the CEO is notified with CRITICAL_SYSTEM_FAILURE; the run and its artifacts are kept as recorded`
           : "this run was confirmed without an activation grant and cannot complete; the CEO, notified with CRITICAL_SYSTEM_FAILURE, creates a new CONTRACT_CHANGE run whose PLAN carries the manifest, and this run and its artifacts are kept as recorded (no cancel edge leaves a confirmed run)",
+    }));
+  }
+
+  /**
+   * #1189 A2 — a task an unidentified worker orphan holds: no worker turn of it runs again until the
+   * owner's `release_unidentified_worker_orphan`. Not blocking: only that task waits. The release stays
+   * owner-authorised; this only says the task is held, by which orphan event, and what clears it.
+   */
+  private checkUnreleasedWorkerOrphans(runId: string | null): Finding[] {
+    return unreleasedWorkerOrphans(this.db, runId).map((orphan) => ({
+      code: "WORKER_ORPHAN_UNRELEASED",
+      severity: "ERROR" as const,
+      scope: `run:${orphan.runId}`,
+      blocking: false,
+      confidence: "HIGH" as const,
+      observedEvidence: { taskId: orphan.taskId, executionId: orphan.executionId, orphanEventId: orphan.eventId },
+      recommendedAction:
+        `once nothing of the orphan runs, the owner runs ${ORPHAN_RELEASE_REPAIR_ID} for this execution and orphan event ` +
+        `(confirm=${ORPHAN_RELEASE_CONFIRMATION}) under an owner receipt; until then the task runs no further worker turn`,
     }));
   }
 

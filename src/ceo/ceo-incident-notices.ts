@@ -127,6 +127,11 @@ export interface Incident {
    */
   waitEpisode?: number;
   payload: Record<string, unknown>;
+  /**
+   * Facts that cost something to read (a process-table scan), read only when a notice is enqueued and never
+   * on a pass that delivers nothing; merged over `payload` for that notice and its delivery record.
+   */
+  describe?: () => Record<string, unknown>;
   /** The delivery record's own evidence; by default the payload without `whyItMatters`. */
   record?: Record<string, unknown>;
 }
@@ -163,9 +168,35 @@ export interface NoticeStatus {
  * progress, which is a row of the run as often as an event.
  */
 export interface Resolution {
-  kind: "RUN_GONE" | "RUN_ENDED" | "CEO_DECISION" | "RUN_PROGRESSED";
+  kind: "RUN_GONE" | "RUN_ENDED" | "CEO_DECISION" | "RUN_PROGRESSED" | "DAEMON_STARTED";
   eventId: number | null;
 }
+
+/** #1189 D1 — the subject of the one incident about the daemon's start (a refused or parked start), not any run. */
+export const DAEMON_START_SUBJECT = "daemon-start";
+
+/**
+ * #1189 I3-2 — the daemon-start incident is resolved by a successful start (DAEMON_STARTED) recorded after it
+ * opened (`openedEventId`, else its first delivery record): ACP's action path is running again, so its notice
+ * ("the start is refused and ACP's action path is not running") is stale for every holder, the current one
+ * included (`withdrawResolvedNotices`). A later stall is a new episode (its id is bounded by that start).
+ */
+const daemonStartResolution = (db: Pick<Db, "get">, incident: Incident): Resolution | null => {
+  const opened = incident.openedEventId ?? db.get<{ event_id: number | null }>(
+    `SELECT MIN(event_id) AS event_id FROM audit_events WHERE run_id IS NULL AND kind = ?
+       AND json_extract(evidence_json, '$.correlation') = ? AND json_extract(evidence_json, '$.episode') = ?`,
+    [CLASS_RULES[incident.cls].record, correlationOf(incident.cls, incident.subject), incident.episode],
+  )?.event_id ?? null;
+  if (opened === null) return null;
+  const started = db.get<{ event_id: number }>(
+    `SELECT event_id FROM audit_events WHERE kind = 'DAEMON_STARTED' AND event_id > ? ORDER BY event_id LIMIT 1`,
+    [opened],
+  );
+  return started ? { kind: "DAEMON_STARTED", eventId: started.event_id } : null;
+};
+
+const isDaemonStartIncident = (incident: Incident): boolean =>
+  incident.cls === IncidentClass.RESOURCE_STALLED && incident.subject === DAEMON_START_SUBJECT && incident.runId === null;
 
 /**
  * Whether the run progressed past `episode` (F3-1: its latest progress is no longer the one the episode names).
@@ -277,8 +308,10 @@ const deliveriesOf = (db: Pick<Db, "all">, incident: Incident): NoticeStatus["de
  *   episode's notice stands for all of them, whichever delivered it (H7-1).
  * An incident never delivered has not opened, so only RUN_GONE resolves it. An incident not about a run (a
  * role's stalled messages, a session) has no such evidence; its detector stops stating it when it clears.
+ * The daemon-start incident is the exception: DAEMON_STARTED, a successful start after it opened.
  */
 export const resolutionOf = (db: Pick<Db, "get" | "all">, incident: Incident): Resolution | null => {
+  if (isDaemonStartIncident(incident)) return daemonStartResolution(db, incident);
   if (incident.runId === null || incident.subject !== incident.runId) return null;
   const run = db.get<{ state: RunState }>(`SELECT state FROM runs WHERE run_id = ?`, [incident.runId]);
   if (!run) return { kind: "RUN_GONE", eventId: null };
@@ -358,7 +391,9 @@ const incidentOfNotice = (runId: string | null, payloadJson: string): Incident |
  * addressed to an earlier holder whose incident `resolutionOf` finds resolved is REJECTED, with a
  * CEO_NOTIFICATION_WITHDRAWN record of the evidence. A notice addressed to the current holder stays as it is: a
  * late notice of a decision that holder already made executes nothing (the decision door refuses it again),
- * and one being sent (IN_FLIGHT) is that send's.
+ * and one being sent (IN_FLIGHT) is that send's. A resolved daemon-start notice still PENDING is withdrawn from
+ * the current holder too: it was resolved by no decision of theirs, and delivered late it would state as
+ * current a stall that a successful start ended (#1189 I3-2).
  */
 export const withdrawResolvedNotices = (
   db: Db,
@@ -372,10 +407,11 @@ export const withdrawResolvedNotices = (
   }>(
     `SELECT message_id, run_id, role_key, target_session_id, binding_generation, status, payload_json FROM outbox
       WHERE kind = 'CEO_NOTIFICATION' AND status IN ('PENDING', 'SENT')
-        AND (binding_generation <> ? OR target_session_id <> ?)
+        AND (binding_generation <> ? OR target_session_id <> ?
+          OR (status = 'PENDING' AND json_valid(payload_json) = 1 AND json_extract(payload_json, '$.correlation') = ?))
         AND json_valid(payload_json) = 1 AND json_extract(payload_json, '$.correlation') LIKE 'ceo-incident:%'
       ORDER BY created_at, rowid`,
-    [holder.generation, holder.sessionId],
+    [holder.generation, holder.sessionId, correlationOf(IncidentClass.RESOURCE_STALLED, DAEMON_START_SUBJECT)],
   );
   for (const row of rows) {
     const incident = incidentOfNotice(row.run_id, row.payload_json);
@@ -486,6 +522,7 @@ export const deliverIncident = (ports: NoticePorts, incident: Incident): Decisio
       }
     }
     const key = deliveryKey(incident, ceo.bindingGeneration);
+    const payload = incident.describe ? { ...incident.payload, ...incident.describe() } : incident.payload;
     let refusal: { reasonCode: ReasonCode; outcome: "REFUSED" | "UNKNOWN"; error?: string } | null = null;
     try {
       const enqueued = ports.outbox.enqueue({
@@ -498,7 +535,7 @@ export const deliverIncident = (ports: NoticePorts, incident: Incident): Decisio
         payload: {
           notification: rule.notification,
           runId: incident.runId,
-          ...incident.payload,
+          ...payload,
           incidentClass: incident.cls,
           correlation: status.correlation,
           episode: incident.episode,
@@ -535,8 +572,8 @@ export const deliverIncident = (ports: NoticePorts, incident: Incident): Decisio
       // H6-1 — and the wait it is stated for, whose end ends that statement.
       ...(incident.waitEpisode !== undefined ? { waitEpisode: incident.waitEpisode } : {}),
     };
-    const delivery ={ kind: rule.record, runId: incident.runId, roleKey: ceo.roleKey, sessionId: ceo.sessionId };
-    const recorded = ports.audit.record({ ...delivery, evidence: { ...identity, ...(incident.record ?? withoutWhy(incident.payload)) } });
+    const delivery = { kind: rule.record, runId: incident.runId, roleKey: ceo.roleKey, sessionId: ceo.sessionId };
+    const recorded = ports.audit.record({ ...delivery, evidence: { ...identity, ...(incident.record ?? withoutWhy(payload)) } });
     if (!recorded.allowed) {
       const kept = ports.audit.record({ ...delivery, evidence: identity });
       if (!kept.allowed) return kept as unknown as Decision<NoticeDelivery>;
