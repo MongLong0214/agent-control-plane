@@ -9,6 +9,7 @@ import { registryView } from "../../src/db/registry-view.ts";
 import { RunKind, RunState, type RunRow } from "../../src/domain/types.ts";
 import { createCtoMcpPort } from "../../src/mcp/cto-server.ts";
 import { idempotentMcpMutation, ok } from "../../src/mcp/shared.ts";
+import { CanonicalSessionRegistry } from "../../src/registry/canonical-session-registry.ts";
 import type { ReviewPacket } from "../../src/review/blind-review.ts";
 import type { ContractChangeReviewContext } from "../../src/review/contract-change-review-context.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
@@ -422,6 +423,55 @@ describe("#1255: the CONTRACT_CHANGE first-activation packet carries the PLAN an
       const again = await review(bare);
       expect(again.allowed, JSON.stringify(again)).toBe(true);
       expect(contractChangePrompts(r.h).at(-1)).toContain("MISSING: ACP stored no readback for this candidate");
+    } finally { r.h.cp.close(); }
+  }, 60_000);
+});
+
+describe("the CONTRACT_CHANGE readback carries the project's canonical CTO identity as ACP read it at freeze", () => {
+  it("an entitled project with an ACTIVE PRIMARY_CTO binding: the packet shows the entitlement and the binding with whole ids, as stored", async () => {
+    const r = await firstActivation();
+    try {
+      const actor = hex("the project's canonical CTO actor");
+      const room = "0f5c1a2e-7b3d-4c9e-8a61-2d4f6b8e0c13";
+      const conversation = "6e1b9d4a-3c27-4f85-9b0e-a7d2c5f81e64";
+      const bound = r.h.cp.db.get<{
+        assignment_id: string; role_key: string; actor_id: string; session_id: string; session_incarnation: string;
+        binding_generation: number; created_at: string; current_session_id: string;
+      }>(
+        `SELECT a.assignment_id, a.role_key, a.actor_id, a.session_id, a.session_incarnation, a.binding_generation, a.created_at,
+                c.current_session_id
+           FROM assignments a JOIN conversational_actors c ON c.actor_id = a.actor_id
+          WHERE a.project_id = ? AND a.role = 'PRIMARY_CTO' AND a.status = 'ACTIVE'`,
+        [r.projectId],
+      );
+      expect(bound, "the dispatched run's project has an ACTIVE PRIMARY_CTO binding").toBeDefined();
+      // The bound actor's session speaks as the entitled Buzz actor in the entitled room.
+      r.h.cp.db.run(`UPDATE sessions SET buzz_actor_id = ?, buzz_address = ? WHERE session_id = ?`, [actor, room, bound!.current_session_id]);
+      new CanonicalSessionRegistry(r.h.cp.db).grant({ sessionUuid: conversation, projectId: r.projectId, buzzActorId: actor, buzzAddress: room }, null);
+      const session = r.h.cp.db.get<{ incarnation: string; lifecycle: string }>(
+        `SELECT incarnation, lifecycle FROM sessions WHERE session_id = ?`, [bound!.current_session_id],
+      )!;
+
+      r.h.scripted.script({ match: /Contract change review/, text: reviewerPass([r.coverage]) });
+      const result = await submit(r);
+      expect(result.allowed, JSON.stringify(result)).toBe(true);
+      const prompt = contractChangePrompts(r.h)[0]!;
+      const readback = fencedJsonAfter(prompt, "### ACP readback at the candidate's freeze") as ContractChangeReviewContext;
+      expect(readback).toEqual(storedContext(r.h, r.run.runId, r.h.cp.runs.currentCandidate(r.run.runId)!));
+      expect(readback.project.canonicalSessionEntitlements).toEqual([
+        { sessionUuid: conversation, buzzActorId: actor, buzzAddress: room, revision: 1, revokedAt: null },
+      ]);
+      expect(readback.project.primaryCtoBinding).toEqual({
+        assignmentId: bound!.assignment_id, roleKey: bound!.role_key, actorId: bound!.actor_id,
+        sessionId: bound!.session_id, sessionIncarnation: bound!.session_incarnation,
+        bindingGeneration: bound!.binding_generation, createdAt: bound!.created_at,
+        currentSession: {
+          sessionId: bound!.current_session_id, incarnation: session.incarnation, lifecycle: session.lifecycle,
+          buzzActorId: actor, buzzAddress: room,
+        },
+      });
+      // The 64-hex actor id is shown whole, never cut or redacted.
+      expect(prompt).toContain(`"buzzActorId": "${actor}"`);
     } finally { r.h.cp.close(); }
   }, 60_000);
 });

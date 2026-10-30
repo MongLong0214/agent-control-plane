@@ -9,7 +9,8 @@ import type { RepositoryDriftCause, RepositoryInspection, RepositoryRegistry } f
 
 /**
  * #1255 — what ACP itself reads, when a CONTRACT_CHANGE candidate is frozen, for that candidate's blind
- * review: the project's registration and active manifest, each of its repositories' registration, stored
+ * review: the project's registration and active manifest, its canonical session entitlements and ACTIVE
+ * PRIMARY_CTO binding, each of its repositories' registration, stored
  * observation and checkout as read then, and, for a first activation, each bound workflow revision read
  * at its exact commit the way the finalizer reads it locally. Stored as a HANDOFF artifact bound to the
  * candidate and to the freeze that read it (`freezeId`), so the review shows what held at that freeze
@@ -43,6 +44,22 @@ export interface ContractChangeReviewContext extends FreezeIdentity {
     /** Every PROJECT_REGISTERED record of the project, as stored. */
     registrations: Array<{ eventId: number; at: string; name: string | null; activeManifestDigest: string | null }>;
     bootstrapApplications: number;
+    /**
+     * The project's canonical CTO identity as ACP's own tables held it at the freeze, so a later readback
+     * can show the conversation and actor were preserved: its canonical session entitlement rows, and its
+     * ACTIVE PRIMARY_CTO binding with the session the bound actor ran on then (null when there is none).
+     */
+    canonicalSessionEntitlements: Array<{
+      sessionUuid: string; buzzActorId: string; buzzAddress: string; revision: number; revokedAt: string | null;
+    }>;
+    primaryCtoBinding: {
+      assignmentId: string; roleKey: string; actorId: string;
+      /** The session and incarnation the binding was made on, and its generation. */
+      sessionId: string; sessionIncarnation: string; bindingGeneration: number; createdAt: string;
+      currentSession: {
+        sessionId: string; incarnation: string; lifecycle: string; buzzActorId: string | null; buzzAddress: string | null;
+      } | null;
+    } | null;
   };
   repositories: Array<{
     identity: string;
@@ -90,6 +107,27 @@ export const captureContractChangeReviewContext = async (
             CASE WHEN json_valid(evidence_json) THEN json_extract(evidence_json, '$.name') END AS name,
             CASE WHEN json_valid(evidence_json) THEN json_extract(evidence_json, '$.activeManifestDigest') END AS active
        FROM audit_events WHERE kind = 'PROJECT_REGISTERED' AND project_id = ? ORDER BY event_id`,
+    [input.projectId],
+  );
+  const entitlements = db.all<{
+    session_uuid: string; buzz_actor_id: string; buzz_address: string; revision: number; revoked_at: string | null;
+  }>(
+    `SELECT session_uuid, buzz_actor_id, buzz_address, revision, revoked_at
+       FROM canonical_session_entitlements WHERE project_id = ? ORDER BY session_uuid`,
+    [input.projectId],
+  );
+  const binding = db.get<{
+    assignment_id: string; role_key: string; actor_id: string; session_id: string; session_incarnation: string;
+    binding_generation: number; created_at: string; current_session_id: string | null; current_incarnation: string | null;
+    current_lifecycle: string | null; current_buzz_actor_id: string | null; current_buzz_address: string | null;
+  }>(
+    `SELECT a.assignment_id, a.role_key, a.actor_id, a.session_id, a.session_incarnation, a.binding_generation, a.created_at,
+            s.session_id AS current_session_id, s.incarnation AS current_incarnation, s.lifecycle AS current_lifecycle,
+            s.buzz_actor_id AS current_buzz_actor_id, s.buzz_address AS current_buzz_address
+       FROM assignments a
+       LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+       LEFT JOIN sessions s ON s.session_id = c.current_session_id
+      WHERE a.project_id = ? AND a.role = 'PRIMARY_CTO' AND a.status = 'ACTIVE'`,
     [input.projectId],
   );
   const listed = db.all<{ repository_id: string }>(
@@ -178,6 +216,20 @@ export const captureContractChangeReviewContext = async (
       bootstrapApplications: db.get<{ n: number }>(
         `SELECT COUNT(*) AS n FROM bootstrap_applications WHERE project_id = ?`, [input.projectId],
       )?.n ?? 0,
+      canonicalSessionEntitlements: entitlements.map((row) => ({
+        sessionUuid: row.session_uuid, buzzActorId: row.buzz_actor_id, buzzAddress: row.buzz_address,
+        revision: row.revision, revokedAt: row.revoked_at,
+      })),
+      primaryCtoBinding: binding === undefined ? null : {
+        assignmentId: binding.assignment_id, roleKey: binding.role_key, actorId: binding.actor_id,
+        sessionId: binding.session_id, sessionIncarnation: binding.session_incarnation,
+        bindingGeneration: binding.binding_generation, createdAt: binding.created_at,
+        currentSession: binding.current_session_id === null ? null : {
+          sessionId: binding.current_session_id, incarnation: binding.current_incarnation!,
+          lifecycle: binding.current_lifecycle!, buzzActorId: binding.current_buzz_actor_id,
+          buzzAddress: binding.current_buzz_address,
+        },
+      },
     },
     repositories: repositoryFacts,
     workflowRevisions,

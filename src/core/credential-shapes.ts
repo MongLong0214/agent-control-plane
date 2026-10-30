@@ -163,6 +163,9 @@ const FREE_TEXT_WRITERS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
     "context.originalRecords.files.excerpt.originalSha256", "context.originalRecords.files.bodyBase64",
     "handoff.activeManifestDigest",
     "project.activeManifestDigest", "project.registrations.activeManifestDigest",
+    // The Buzz actor id (a 64-hex public key) of the project's canonical session entitlement and of its
+    // PRIMARY_CTO binding's current session, as a contract change's readback reads them.
+    "project.canonicalSessionEntitlements.buzzActorId", "project.primaryCtoBinding.currentSession.buzzActorId",
     "workflowRevisions.fileDigest", "workflowRevisions.read.observedDigest",
     // Git object ids ACP read, 64-hex in a SHA-256 repository, and the CTO's stated head of each repository.
     "repositories.lastObservedHead", "repositories.checkout.head", "repositories.checkout.acceptedHead",
