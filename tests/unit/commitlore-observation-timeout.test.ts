@@ -5,7 +5,7 @@ import { basename, join } from "node:path";
 
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 
-import { writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
+import { hostGitDirectory, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 /**
@@ -61,7 +61,7 @@ it("R1-02: timeout is refused even if the signalled child exits zero with valid 
     setInterval(() => {}, 1000);
   `,
   );
-  vi.stubEnv("PATH", `${dir}:/usr/bin:/bin`);
+  vi.stubEnv("PATH", `${dir}:${hostGitDirectory()}:/usr/bin:/bin`);
   vi.stubEnv("ACP_COMMITLORE_BINARY", join(dir, "commitlore"));
   // CEO 19aabbda (C-2): fixture preparation, bounded and before the observation. Every spawn here runs under
   // the shortened 1.5 s, and since slice S16 the first is the `--version` check: the newly written fake is

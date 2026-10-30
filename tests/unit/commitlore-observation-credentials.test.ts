@@ -14,7 +14,7 @@ import {
   requiredCommitLoreObservation,
 } from "../../src/bootstrap/commitlore-observation.ts";
 import { latestRelease } from "../helpers/commitlore-release.ts";
-import { writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
+import { hostGitDirectory, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 /** #1268 — the production port on the pin in the environment; the fake answers 1.7.3, confirmed as the newest release. */
@@ -144,7 +144,7 @@ const fake = (name: string, body: string): void => {
   `;
   // #1268 — installed as the installer installs it: a run copies the package its wrapper names.
   writeCommitLoreInstall(dir, `${prelude}\n${body}`);
-  vi.stubEnv("PATH", `${dir}:/usr/bin:/bin`);
+  vi.stubEnv("PATH", `${dir}:${hostGitDirectory()}:/usr/bin:/bin`);
   vi.stubEnv("ACP_COMMITLORE_BINARY", join(dir, "commitlore"));
 };
 

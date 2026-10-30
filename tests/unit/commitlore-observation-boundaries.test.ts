@@ -14,7 +14,7 @@ import {
   probeCommitLore,
 } from "../../src/bootstrap/commitlore-observation.ts";
 import { latestRelease } from "../helpers/commitlore-release.ts";
-import { writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
+import { hostGitDirectory, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 /**
@@ -54,7 +54,7 @@ const fake = (name: string, body: string): string => {
   const dir = tempDir(`acp-s11-r1-${name}-`);
   // #1268 — installed as the installer installs it: a run copies the package its wrapper names.
   writeCommitLoreInstall(dir, `${PIN_CHECKS}\n${body}\n}`);
-  vi.stubEnv("PATH", `${dir}:/usr/bin:/bin`);
+  vi.stubEnv("PATH", `${dir}:${hostGitDirectory()}:/usr/bin:/bin`);
   vi.stubEnv("ACP_COMMITLORE_BINARY", join(dir, "commitlore"));
   return dir;
 };

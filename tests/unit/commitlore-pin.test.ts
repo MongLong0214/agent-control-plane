@@ -43,7 +43,7 @@ import {
   judgeCommitLoreVersion,
 } from "../../src/bootstrap/commitlore-pin.ts";
 import { latestRelease, stableReleaseAnswer } from "../helpers/commitlore-release.ts";
-import { packageVersionFor, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
+import { hostGitDirectory, packageVersionFor, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 /**
@@ -287,7 +287,7 @@ const argvs = (log: string): string[] => invocations(log).map(({ argv }) => argv
 /** A working `commitlore` first on this process's PATH: what a PATH search would find and pass with. */
 const workingOnPath = () => {
   const onPath = fake("on-path");
-  vi.stubEnv("PATH", `${onPath.dir}:/usr/bin:/bin`);
+  vi.stubEnv("PATH", `${onPath.dir}:${hostGitDirectory()}:/usr/bin:/bin`);
   return onPath;
 };
 
@@ -431,7 +431,7 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
 
   it("the pin, not PATH, is what runs: a failing CLI first on PATH does not answer for a working pin", async () => {
     const onPath = fake("failing-on-path", { doctorReport: FAILED_REPORT, doctorExit: 1 });
-    vi.stubEnv("PATH", `${onPath.dir}:/usr/bin:/bin`);
+    vi.stubEnv("PATH", `${onPath.dir}:${hostGitDirectory()}:/usr/bin:/bin`);
     const pinned = fake("pinned");
     vi.stubEnv(VARIABLE, pinned.bin);
     expect(await probeCommitLore(envPort())).toMatchObject({ allowed: true, value: { outcome: "PASS" } });

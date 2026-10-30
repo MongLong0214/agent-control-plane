@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { accessSync, constants, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import {
   COMMITLORE_LIMITS,
@@ -14,7 +14,7 @@ import {
 } from "../../src/bootstrap/commitlore-observation.ts";
 import { GIT_HARDENING, gitHardeningEnvironment } from "../../src/run/worker-git.ts";
 import { EMPTY_TREE, gitIgnoresAttrSource } from "../../src/bootstrap/commitlore-snapshot.ts";
-import { installedCopyOf, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
+import { hostGitDirectory, installedCopyOf, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { latestRelease, stableReleaseAnswer } from "../helpers/commitlore-release.ts";
 import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
 
@@ -69,7 +69,26 @@ describe("#1268 review r3: attribute-selected programs and the package the obser
       { mode: 0o755 },
     );
     expect(await gitIgnoresAttrSource(`${dir}:/usr/bin:/bin`)).toMatch(/does not honour GIT_ATTR_SOURCE \(it answered "probe: diff: acpprobe"\)/);
-    expect(await gitIgnoresAttrSource("/usr/bin:/bin")).toBeNull();
+    // The host's git (the first on this process's PATH, which a CommitLore run uses unless a witness says otherwise) honours it.
+    expect(await gitIgnoresAttrSource(`${hostGitDirectory()}:/usr/bin:/bin`)).toBeNull();
+
+    // As the git ACP runs, first on the daemon's PATH, it is the git a CommitLore child would run: the run is refused
+    // before its CLI is started at all.
+    const cli = tempDir("acp-1268-old-git-cli-");
+    const started = join(cli, "started.log");
+    const { wrapper } = writeCommitLoreInstall(cli, `require('node:fs').appendFileSync(${JSON.stringify(started)}, process.argv.slice(2).join(' ') + '\\n');`);
+    const checkout = makeRepo({ "README.md": "# observed\n" });
+    vi.stubEnv("PATH", `${dir}:/usr/bin:/bin`);
+    try {
+      const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, wrapper, latestRelease("1.7.3"))).observe(checkout);
+      expect(observed).toMatchObject({
+        outcome: "FAIL",
+        detail: expect.stringContaining('ACP_COMMITLORE_BINARY UNSUPPORTED_GIT: the git CommitLore would run does not honour GIT_ATTR_SOURCE (it answered "probe: diff: acpprobe")'),
+      });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(existsSync(started)).toBe(false);
   });
 
   it("an observation in a sha256 repository reads attributes from the sha256 empty tree", async () => {

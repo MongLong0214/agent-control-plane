@@ -1,5 +1,7 @@
-import { cpSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { accessSync, constants, cpSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join } from "node:path";
+
+import { tempDir } from "./fixtures.ts";
 
 /**
  * #1268 — a CommitLore installation laid out as CommitLore's installer lays one out, for a fixture CLI: a package
@@ -54,4 +56,28 @@ export const installedCopyOf = (real: string, install: string): { wrapper: strin
     mode: 0o755,
   });
   return { wrapper, bundle: join(pkg, "dist", "commitlore.mjs") };
+};
+
+/** The PATH this test process started with, before any witness stubbed it. */
+const STARTING_PATH = process.env["PATH"] ?? "";
+
+/**
+ * #1268 — a directory holding only a link to the first `git` on the PATH this process started with. A witness that
+ * stubs the daemon's PATH names it ahead of the system directories, so the daemon's own git (which a CommitLore
+ * child runs) stays the host's git rather than whatever `/usr/bin/git` is: on CI's runner that one is older than
+ * `GIT_ATTR_SOURCE`, and every CommitLore run on it is refused. Nothing else from that directory comes with it.
+ */
+export const hostGitDirectory = (): string => {
+  for (const directory of STARTING_PATH.split(":").filter(isAbsolute)) {
+    const git = join(directory, "git");
+    try {
+      accessSync(git, constants.X_OK);
+    } catch {
+      continue;
+    }
+    const linked = tempDir("acp-host-git-");
+    symlinkSync(git, join(linked, "git"));
+    return linked;
+  }
+  throw new Error("FIXTURE FAILURE: no git on this process's PATH");
 };
