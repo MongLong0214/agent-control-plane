@@ -578,7 +578,7 @@ export class ApprovedRunFinalizer {
           retriesUsed: followUp.retriesUsed,
           budget: followUp.budget,
           owner: FOLLOW_UP_OWNER,
-          action: "the follow-up retries are spent: the run stays BLOCKED_POST_MERGE with its merged commits, receipts and compensation plan, and its owner decides the recovery",
+          action: "the follow-up retries are spent: the run stays BLOCKED_POST_MERGE with its merged commits, receipts and compensation plan; the CEO is responsible for the follow-up decision, and the run's execution owner and authority are unchanged",
         },
       });
     });
@@ -971,8 +971,14 @@ export class ApprovedRunFinalizer {
       });
     }
     const merges = this.durableMergeReceipts(runId);
-    if (merges.length > 0) {
-      const compensation = merges.map((receipt) => {
+    // #1189 B15 — a manifest activation recorded for a run that is not COMPLETED (a legacy CONTRACT_CHANGE
+    // confirmed before grants) is an applied effect like a merge: it is blocked for recovery, not released.
+    const activations = this.cp.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_events WHERE run_id = ? AND kind = 'PROJECT_MANIFEST_ACTIVATED'`,
+      [runId],
+    )?.n ?? 0;
+    if (merges.length > 0 || activations > 0) {
+      const compensation: Array<Record<string, unknown>> = merges.map((receipt) => {
         const sha = this.mergeSha(receipt);
         const prepared = sha
           ? this.cp.github.rollbackPrepare(runId, receipt.repository_identity, sha, "halt")
@@ -986,6 +992,9 @@ export class ApprovedRunFinalizer {
           requiredAction: sha ? "halt and review rollback plan" : "reconcile pending merge receipt before compensation",
         };
       });
+      if (activations > 0) {
+        compensation.push({ effect: "PROJECT_MANIFEST_ACTIVATED", activations, requiredAction: "halt and review the manifest activation" });
+      }
       const run = this.cp.runs.get(runId);
       if (run?.state === RunState.MERGING || run?.state === RunState.POST_MERGE_VERIFYING) {
         const blocked = this.cp.runs.transition(
@@ -1011,8 +1020,9 @@ export class ApprovedRunFinalizer {
       this.cp.audit.record({
         kind: "FINALIZATION_BLOCKED_POST_MERGE",
         runId,
+        roleKey: FOLLOW_UP_OWNER,
         reasonCode: ReasonCode.FINALIZATION_COMPENSATION_REQUIRED,
-        evidence: { attemptId, failureReasonCode: failure.reasonCode, compensation },
+        evidence: { attemptId, failureReasonCode: failure.reasonCode, compensation, owner: FOLLOW_UP_OWNER },
       });
       // #1189 B13 — a block whose cause is a follow-up step only is marked so, in its own small record.
       const followUpCause = followUpCauseOf(failure.reasonCode, failure.evidence);
@@ -1021,7 +1031,7 @@ export class ApprovedRunFinalizer {
       }
       return deny(
         ReasonCode.FINALIZATION_COMPENSATION_REQUIRED,
-        "a merge may have occurred; run is blocked with a compensation plan",
+        "a merge or activation may have occurred; run is blocked with a compensation plan",
         { runId, attemptId, failureReasonCode: failure.reasonCode, compensation },
       );
     }

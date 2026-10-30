@@ -3,14 +3,16 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
 import { manifestDigest } from "../../src/contracts/manifest.ts";
 import { sha256 } from "../../src/core/digest.ts";
-import { deny, isAcpError } from "../../src/core/errors.ts";
+import { acpError, deny, isAcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ApprovedRunFinalizer } from "../../src/daemon/finalizer.ts";
+import { followUpCauseOf } from "../../src/daemon/post-merge-follow-up.ts";
 import { Role, RunKind, RunState, roleKeyFor } from "../../src/domain/types.ts";
+import { workflowDigestAtCommit } from "../../src/github/workflow-digest-at-commit.ts";
 import { retireProject } from "../../src/registry/project-retirement.ts";
 import { WORKFLOW, WORKFLOW_PATH, dispatchRun, normalized, stricter, type DispatchedRun } from "../helpers/contract-change.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
-import { cleanupTempDirs, commitAll, writeFiles } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, makeRepo, writeFiles } from "../helpers/fixtures.ts";
 import {
   applyPassingChange,
   bindWorker,
@@ -320,8 +322,14 @@ describe("B14 — a run at CEO review is cancelled directly; the cancel and its 
 
   it("CONFIRM first (guard): the cancel after it is refused, and the run finalizes as confirmed", async () => {
     const { github, harness, driven } = await reviewedRun();
+    const claims = () => harness.cp.db.all<{ claim_id: string; status: string }>(
+      `SELECT claim_id, status FROM resource_claims WHERE run_id = ? ORDER BY claim_id`, [driven.runId]);
     expect(confirmIn(harness, driven.runId, driven.candidateSnapshotDigest)).toMatchObject({ allowed: true, value: { state: RunState.CEO_APPROVED } });
+    const held = claims();
+    expect(held.some((claim) => claim.status === "HELD")).toBe(true);
     expect(harness.cp.runs.cancel(driven.runId, "too late")).toMatchObject({ allowed: false, reasonCode: ReasonCode.RUN_TRANSITION_ILLEGAL });
+    // The refused cancel releases nothing the confirmed run still needs.
+    expect(claims()).toEqual(held);
     expect(await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId)).toMatchObject({ allowed: true });
     expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
     expect(github.mergeCount).toBe(1);
@@ -417,6 +425,33 @@ describe("B15 — a CONTRACT_CHANGE confirmed without an activation grant is can
     expect(h.cp.runs.require(granted.run.runId).state).toBe(RunState.CEO_APPROVED);
     expect(grantsOf(h, granted.run.runId)).toHaveLength(1);
   });
+
+  it("an activation already applied with no grant and no merge is not cancelled: the finalizer records the recovery block with its owner, once, and never releases the run for another attempt", async () => {
+    const h = makeHarness();
+    const { projectId } = await registerFixtureProject(h, "cc-b15-activated");
+    const { run } = await legacyApproved(h, projectId);
+    // Raw history only: a manifest activation recorded for a run confirmed before grants existed.
+    h.cp.audit.record({ kind: "PROJECT_MANIFEST_ACTIVATED", runId: run.runId, projectId, evidence: { legacy: true } });
+    expect(h.cp.runs.cancel(run.runId, "withdraw the legacy change")).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.FINALIZATION_COMPENSATION_REQUIRED, evidence: { classification: "APPLIED" },
+    });
+
+    expect(await new ApprovedRunFinalizer(h.cp).finalizeApprovedRun(run.runId)).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.FINALIZATION_COMPENSATION_REQUIRED,
+    });
+    expect(await new ApprovedRunFinalizer(h.cp).finalizeApprovedRun(run.runId)).toMatchObject({ allowed: false });
+    expect(attemptOf(h, run.runId)).toMatchObject({ state: "BLOCKED", failure_reason: expect.any(String) });
+    const blocks = h.cp.audit.forRun(run.runId).filter((entry) => entry.kind === "FINALIZATION_BLOCKED_POST_MERGE");
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({
+      roleKey: "CEO",
+      evidence: { owner: "CEO", compensation: [{ effect: "PROJECT_MANIFEST_ACTIVATED", activations: 1, requiredAction: expect.any(String) }] },
+    });
+    // The applied effect is kept: the run is still refused the cancel, and no grant was issued for it.
+    expect(h.cp.runs.require(run.runId).state).toBe(RunState.CEO_APPROVED);
+    expect(h.cp.runs.cancel(run.runId, "withdraw the legacy change")).toMatchObject({ allowed: false, evidence: { classification: "APPLIED" } });
+    expect(grantsOf(h, run.runId)).toEqual([]);
+  });
 });
 
 describe("B13 — only the follow-up of a verified merge is retried, on the same merge, within its budget", () => {
@@ -500,6 +535,13 @@ describe("B13 — only the follow-up of a verified merge is retried, on the same
 
   it("a spent budget leaves the run blocked with its blocker and its owner recorded once", async () => {
     const { github, harness, driven } = await mergedRun("missing");
+    const ownership = () => ({
+      run: harness.cp.db.get(`SELECT owner_session_id, owner_binding_generation, owner_session_incarnation, owner_role_key
+                                FROM runs WHERE run_id = ?`, [driven.runId]),
+      ceo: harness.cp.bindings.active(roleKeyFor(Role.CEO)),
+      owner: harness.cp.bindings.active(harness.cp.runs.require(driven.runId).ownerRoleKey!),
+    });
+    const before = ownership();
     for (let retry = 1; retry <= 3; retry += 1) {
       expect(await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId)).toMatchObject({ allowed: false });
       expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.BLOCKED_POST_MERGE);
@@ -515,18 +557,136 @@ describe("B13 — only the follow-up of a verified merge is retried, on the same
     expect(exhausted).toHaveLength(1);
     expect(exhausted[0]).toMatchObject({ roleKey: "CEO", evidence: { owner: "CEO", blocker: INCOMPLETE, cause: INCOMPLETE, retriesUsed: 3, budget: 3 } });
     expect(github.mergeCount).toBe(1);
+    // The CEO is recorded as responsible for the follow-up decision; nothing moves the run's execution owner
+    // or any binding, and the finalizer holds no lease on it.
+    expect(ownership()).toEqual(before);
+    expect(attemptOf(harness, driven.runId)?.state).toBe("BLOCKED");
+  });
+
+  it("the budget is durable: retries taken before a restart count after it", async () => {
+    const { github, harness, driven } = await mergedRun("missing");
+    for (let retry = 1; retry <= 2; retry += 1) {
+      expect(await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId)).toMatchObject({ allowed: false });
+    }
+    expect(resumes(harness, driven.runId)).toHaveLength(2);
+    harness.cp.close();
+    const restarted = makeHarness({ root: harness.root, repoPath: harness.repoPath, clock: harness.clock, githubClient: github });
+    try {
+      expect(await new ApprovedRunFinalizer(restarted.cp).finalizeApprovedRun(driven.runId)).toMatchObject({ allowed: false });
+      expect(resumes(restarted, driven.runId)).toHaveLength(3);
+      expect(await new ApprovedRunFinalizer(restarted.cp).finalizeApprovedRun(driven.runId)).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.FINALIZATION_COMPENSATION_REQUIRED, evidence: { followUp: { refusal: "BUDGET_EXHAUSTED", retriesUsed: 3, budget: 3 } },
+      });
+      expect(resumes(restarted, driven.runId)).toHaveLength(3);
+      expect(restarted.cp.runs.require(driven.runId).state).toBe(RunState.BLOCKED_POST_MERGE);
+      expect(github.mergeCount).toBe(1);
+    } finally {
+      restarted.cp.close();
+    }
+  });
+
+  it("a permission error on the activation read is permanent: never retried, the grant unconsumed and the active manifest unmoved", async () => {
+    const { github, h, registered, run } = await confirmedRepositoryContractChange("cc-b13-permission");
+    const read = h.cp.github.workflowDigestAt.bind(h.cp.github);
+    let reads = 0;
+    vi.spyOn(h.cp.github, "workflowDigestAt").mockImplementation(async (...args) => {
+      reads += 1;
+      return reads === 3
+        ? deny(ReasonCode.PROBE_FAILED, "could not read the exact workflow file", { outcome: "answered", status: 403 })
+        : read(...args);
+    });
+    expect(await new ApprovedRunFinalizer(h.cp).finalizeApprovedRun(run.runId)).toMatchObject({ allowed: false });
+    expect(h.cp.runs.require(run.runId).state).toBe(RunState.BLOCKED_POST_MERGE);
+    expect(h.cp.audit.forRun(run.runId).filter((entry) => entry.kind === "FINALIZATION_FOLLOW_UP_RETRYABLE")).toEqual([]);
+    for (let pass = 0; pass < 2; pass += 1) {
+      expect(await new ApprovedRunFinalizer(h.cp).finalizeApprovedRun(run.runId)).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.FINALIZATION_COMPENSATION_REQUIRED, evidence: { followUp: { cause: null, refusal: "NOT_RETRYABLE" } },
+      });
+    }
+    expect(resumes(h, run.runId)).toEqual([]);
+    expect(grantsOf(h, run.runId)).toEqual([expect.objectContaining({ consumed_at: null })]);
+    expect(h.cp.projects.require(registered.projectId).activeManifestDigest).toBe(run.baseDigest);
+    expect(github.mergeCount).toBe(1);
+  });
+
+  it("an unknown merge outcome is never retried: a block whose run holds a merge request never read back is refused, and nothing merges again", async () => {
+    const { github, harness, driven } = await mergedRun("missing");
+    // Raw history only: a merge request of the run whose outcome was never read back (a PENDING receipt).
+    legacyMergeReceipt(harness, driven.runId, false);
+    for (let pass = 0; pass < 2; pass += 1) {
+      expect(await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId)).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.FINALIZATION_COMPENSATION_REQUIRED, evidence: { followUp: { cause: INCOMPLETE, refusal: "MERGES_INCOMPLETE" } },
+      });
+    }
+    expect(resumes(harness, driven.runId)).toEqual([]);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.BLOCKED_POST_MERGE);
+    expect(github.mergeCount).toBe(1);
+  });
+
+  it("only an unheard read, a server error or a rate limit is transient; a permission error, any other answer and a local read are permanent", async () => {
+    const activationRefused = (cause: { reasonCode: string; evidence: Record<string, unknown> }) =>
+      followUpCauseOf(ReasonCode.MANIFEST_ACTIVATION_REFUSED, {
+        refusal: { reasonCode: ReasonCode.MANIFEST_ACTIVATION_WORKFLOW_UNVERIFIED, evidence: { cause } },
+      });
+    const probe = (evidence: Record<string, unknown>) => activationRefused({ reasonCode: ReasonCode.PROBE_FAILED, evidence });
+    const exact = (evidence: Record<string, unknown>) => activationRefused({
+      reasonCode: ReasonCode.MANIFEST_ACTIVATION_WORKFLOW_UNVERIFIED, evidence: { refusal: "EXACT_READ_OBJECT_UNREADABLE", ...evidence },
+    });
+    const TRANSIENT = "ACTIVATION_READ_TRANSIENT";
+    expect({
+      unheard: probe({ outcome: "unheard" }),
+      serverError: probe({ status: 502 }),
+      rateLimited: probe({ outcome: "answered", status: 429 }),
+      unauthorized: probe({ outcome: "answered", status: 401 }),
+      forbidden: probe({ outcome: "answered", status: 403 }),
+      notFound: probe({ outcome: "answered", status: 404 }),
+      notAFile: probe({ repositoryIdentity: "github:acme/fixture", head: "a".repeat(40), path: WORKFLOW_PATH }),
+      exactUnheard: exact({ readVia: "GITHUB", outcome: "unheard" }),
+      exactForbidden: exact({ readVia: "GITHUB", outcome: "answered", status: 403 }),
+      exactLocal: exact({ readVia: "LOCAL" }),
+      bytesNotApproved: followUpCauseOf(ReasonCode.MANIFEST_ACTIVATION_REFUSED, {
+        refusal: { reasonCode: ReasonCode.MANIFEST_ACTIVATION_WORKFLOW_UNVERIFIED, evidence: { observedDigest: "sha256:other" } },
+      }),
+    }).toEqual({
+      unheard: TRANSIENT, serverError: TRANSIENT, rateLimited: TRANSIENT,
+      unauthorized: null, forbidden: null, notFound: null, notAFile: null,
+      exactUnheard: TRANSIENT, exactForbidden: null, exactLocal: null, bytesNotApproved: null,
+    });
+
+    // The exact-commit reader records whether GitHub answered, so its 403 is read as permanent.
+    const checkout = makeRepo({ "README.md": "# fixture\n" });
+    const readWith = (failure: Error) => workflowDigestAtCommit(
+      {
+        repositories: { byIdentity: () => ({ checkoutPath: checkout, projectId: "prj_exact", registration: "REGISTERED" }) },
+        client: { request: async () => { throw failure; } },
+      },
+      { repositoryIdentity: "github:acme/fixture", projectId: "prj_exact", commitSha: "f".repeat(40), path: WORKFLOW_PATH, defaultBranch: "dev" },
+    );
+    const forbidden = await readWith(acpError(ReasonCode.PROBE_FAILED, "GitHub refused the read", { status: 403 }));
+    const unheard = await readWith(new Error("socket hang up"));
+    expect(forbidden).toMatchObject({ allowed: false, evidence: { refusal: "EXACT_READ_OBJECT_UNREADABLE", readVia: "GITHUB", outcome: "answered", status: 403 } });
+    expect(unheard).toMatchObject({ allowed: false, evidence: { refusal: "EXACT_READ_OBJECT_UNREADABLE", readVia: "GITHUB", outcome: "unheard" } });
+    expect(activationRefused({ reasonCode: forbidden.reasonCode, evidence: forbidden.evidence })).toBeNull();
+    expect(activationRefused({ reasonCode: unheard.reasonCode, evidence: unheard.evidence })).toBe(TRANSIENT);
   });
 });
 
 describe("A10 — retirement proceeds only when nothing a terminal block holds is still open", () => {
-  it("settled: a block with a real check FAIL and nothing open lets the owner's retirement proceed; the run and its merged facts are kept", async () => {
+  it("a block with a real check FAIL and its owner recorded is not settled: retirement waits, naming the unresolved compensation and the recovery no one took over; the run and its merged facts are kept", async () => {
     const { github, harness, driven } = await mergedRun("failure");
     const facts = mergedFacts(harness, driven.runId);
     const attempt = attemptOf(harness, driven.runId);
     vi.spyOn(harness.cp.residentProjects, "retire").mockResolvedValue(undefined as never);
     const retired = await retireProject(harness.cp, driven.projectId, "the owner retires the project");
-    expect(retired, JSON.stringify(retired)).toMatchObject({ allowed: true, value: { projectId: driven.projectId } });
-    expect(harness.cp.projects.get(driven.projectId)?.retiredAt).toEqual(expect.any(String));
+    expect(retired, JSON.stringify(retired)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CONFLICT,
+      evidence: { waitingOn: [{ runId: driven.runId, state: RunState.BLOCKED_POST_MERGE, open: ["COMPENSATION_UNRESOLVED", "RECOVERY_NOT_HANDED_OVER"] }] },
+    });
+    // Its blocker is recorded with its owner, and that alone does not settle it.
+    expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_BLOCKED_POST_MERGE"))
+      .toEqual([expect.objectContaining({ roleKey: "CEO", evidence: expect.objectContaining({ owner: "CEO" }) })]);
+    expect(harness.cp.projects.get(driven.projectId)?.retiredAt ?? null).toBeNull();
     expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.BLOCKED_POST_MERGE);
     expect(attemptOf(harness, driven.runId)).toEqual(attempt);
     expect(mergedFacts(harness, driven.runId)).toEqual(facts);
@@ -539,9 +699,43 @@ describe("A10 — retirement proceeds only when nothing a terminal block holds i
     expect(await retireProject(harness.cp, driven.projectId, "the owner retires the project")).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.CONFLICT,
-      evidence: { waitingOn: [{ runId: driven.runId, state: RunState.BLOCKED_POST_MERGE, open: ["FOLLOW_UP_RETRY_PENDING"] }] },
+      evidence: {
+        waitingOn: [{
+          runId: driven.runId,
+          state: RunState.BLOCKED_POST_MERGE,
+          open: ["FOLLOW_UP_RETRY_PENDING", "COMPENSATION_UNRESOLVED", "RECOVERY_NOT_HANDED_OVER"],
+        }],
+      },
     });
     expect(harness.cp.projects.get(driven.projectId)?.retiredAt ?? null).toBeNull();
     expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.BLOCKED_POST_MERGE);
+  });
+
+  it("open (the review's reproduction): a contract change blocked after an applied merge, with its grant unconsumed and a rollback action outstanding, holds retirement", async () => {
+    const h = makeHarness();
+    const { projectId } = await registerFixtureProject(h, "a10-open-grant");
+    const { run, candidate } = await readyContractChange(h, projectId);
+    await h.cp.continuity.evaluate("confirm the contract change");
+    expect((await decideThroughHermes(h, { runId: run.runId, decision: "CONFIRM", candidateSnapshotDigest: candidate })).allowed).toBe(true);
+    // Raw history only: the failed finalization the review seeded — a lease, an applied merge, a block with its rollback action.
+    const finalizer = new ApprovedRunFinalizer(h.cp) as unknown as { acquireAttempt(runId: string, candidate: string): { allowed: boolean } };
+    expect(finalizer.acquireAttempt(run.runId, candidate).allowed).toBe(true);
+    for (const state of [RunState.MERGING, RunState.POST_MERGE_VERIFYING, RunState.BLOCKED_POST_MERGE]) {
+      expect(h.cp.runs.transition(run.runId, state, "seed a failed finalization").allowed).toBe(true);
+    }
+    legacyMergeReceipt(h, run.runId, true);
+    h.cp.db.run(`UPDATE finalization_attempts SET state = 'BLOCKED', failure_reason = ?, compensation_plan_json = ? WHERE run_id = ?`,
+      [ReasonCode.POST_MERGE_VERIFICATION_FAILED, JSON.stringify([{ requiredAction: "halt and review rollback plan" }]), run.runId]);
+    vi.spyOn(h.cp.residentProjects, "retire").mockResolvedValue(undefined as never);
+    const retired = await retireProject(h.cp, projectId, "the owner retires the project");
+    expect(retired, JSON.stringify(retired)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CONFLICT,
+      evidence: {
+        waitingOn: [{ runId: run.runId, state: RunState.BLOCKED_POST_MERGE, open: ["GRANT_UNCONSUMED", "COMPENSATION_UNRESOLVED", "RECOVERY_NOT_HANDED_OVER"] }],
+      },
+    });
+    expect(h.cp.projects.get(projectId)?.retiredAt ?? null).toBeNull();
+    expect(grantsOf(h, run.runId)).toEqual([expect.objectContaining({ consumed_at: null })]);
   });
 });
