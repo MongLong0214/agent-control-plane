@@ -92,11 +92,40 @@ const isAcpId = (value: string): boolean =>
  * A value of a field ACP generates, validated by its exact shape, which has the long-base64 shape
  * by construction: a whole `ACP_ID_FORMATS` id, or a staged file's canonical base64 bytes at its
  * known key path. Only these skip the long-base64 shape, and only that one; every other string --
- * free text included, and an id or digest inside it -- is checked against every shape, except a
- * digest or id inside it that names a record the store holds (`REFERENCE_TOKEN`, `boundReference`).
+ * free text included, and an id or digest inside it -- is checked against every shape, except that
+ * a digest or id in it that names a record the store holds skips the long-base64 shape (`isBoundRun`).
  */
 export const isAcpGeneratedField = (value: string, path: readonly string[]): boolean =>
   isAcpId(value) || (STAGED_BODY_PATHS.has(path.join(".")) && isCanonicalBase64(value));
+
+/**
+ * #1254 G-2 — free-text and reviewer fields, per store, by key path (the path and every path under it):
+ * a blind reviewer's omitted items, findings and covered files, and the audit copy of its omitted items.
+ * Their text is the reviewer's, so a whole value there is never an ACP id by its format: a digest or
+ * 64-hex id in such a field, whole or inside text, skips the long-base64 shape only when it names a
+ * record the store holds. Every other field keeps the whole-value id rule, the fields typed as digests
+ * in the same records (`candidateSnapshotDigest`, `inputManifest.reviewerPromptDigests`) included.
+ */
+const FREE_TEXT_FIELDS: Readonly<Record<EvidenceField["store"], readonly string[]>> = {
+  artifact: ["omittedItems", "findings", "coveredFiles"],
+  audit: ["omittedItems"],
+};
+
+/**
+ * Writers every field of which is free text, by `<store>:<writer>`: a run's task contract (`run_create`),
+ * whose schema types no field as a digest (run/run-engine.ts TaskContract), its `references` included.
+ */
+const FREE_TEXT_WRITERS: ReadonlySet<string> = new Set(["artifact:TASK_CONTRACT"]);
+
+const isFreeText = (field: EvidenceField | undefined): boolean => {
+  if (field === undefined) return false;
+  if (field.site !== undefined && FREE_TEXT_WRITERS.has(`${field.store}:${field.site.writer}`)) return true;
+  const path = field.path.join(".");
+  return FREE_TEXT_FIELDS[field.store].some((root) => path === root || path.startsWith(`${root}.`));
+};
+
+/** A whole ACP id at a field whose schema makes it one: never at a free-text or reviewer field. */
+const isWholeAcpId = (text: string, field: EvidenceField | undefined): boolean => !isFreeText(field) && isAcpId(text);
 
 /**
  * Key paths at which an evidence string is itself records ACP serialized, read field by field: each
@@ -153,9 +182,11 @@ export interface RegistryView {
   runWorktrees(runId: string, identity: string): readonly string[];
   /**
    * Whether `token`, a `sha256:<64hex>` digest or a bare 64-hex id, names a record the store already
-   * holds: for `sha256:`, a digest of one of the run's own records (an artifact, its candidate, its PLAN's
-   * manifest and workflow revisions, its contract or pin, its project's active manifest) or a stored
-   * manifest; for bare hex, the same digest's hex or a Buzz event the store accepted.
+   * holds, by a digest ACP itself computed or observed (db/registry-view.ts): for `sha256:`, a digest of
+   * one of the run's own records (an artifact, a frozen candidate and what it binds, the manifest a PLAN
+   * carries, its contract or pin, its project's active manifest, a workflow's bytes ACP read) or a stored
+   * manifest; for bare hex, the same digest's hex or a Buzz event the store accepted. A digest a PLAN
+   * only declares is none of these.
    */
   boundReference?(runId: string | null, token: string): boolean;
 }
@@ -189,10 +220,35 @@ export interface EvidenceField {
 
 export const REDACTED = "[redacted]";
 
-const shapesFor = (value: string, path: readonly string[] | undefined): readonly RegExp[] =>
-  path !== undefined && isAcpGeneratedField(value, path) ? GENERATED_FIELD_SHAPES : CREDENTIAL_SHAPES;
+const shapesFor = (value: string, field: EvidenceField | undefined): readonly RegExp[] =>
+  field !== undefined && !isFreeText(field) && isAcpGeneratedField(value, field.path) ? GENERATED_FIELD_SHAPES : CREDENTIAL_SHAPES;
 
-const holdsShape = (text: string, shapes: readonly RegExp[]): boolean => shapes.some((shape) => shape.test(text));
+/** Whether a string names a record the store holds (`RegistryView.boundReference`), or nothing when no store is asked. */
+type BoundTest = ((token: string) => boolean) | undefined;
+
+const LONG_BASE64_RUNS = new RegExp(LONG_BASE64_RUN.source, "g");
+const HEX64_RUN = /^[0-9a-f]{64}$/;
+const DIGEST_PREFIX = "sha256:";
+const BASE64_CHARACTER = /[A-Za-z0-9+/]/;
+
+/**
+ * #1254 G-1 — whether a long-base64 run, found at `at` in `text`, is exactly the hex of a digest or 64-hex
+ * id standing on its own there (`sha256:<hex>` or bare `<hex>`, nothing of the long-base64 alphabet on
+ * either side) that names a record the store holds. Such a run is exempt from the long-base64 shape and
+ * from nothing else: every other shape is found in the text as written, the reference included, so
+ * `ghp_<a bound digest's hex>` is still a GitHub token. A run is maximal, so the alphabet never touches it.
+ */
+const isBoundRun = (text: string, at: number, run: string, bound: BoundTest): boolean => {
+  if (bound === undefined || !HEX64_RUN.test(run)) return false;
+  const prefix = at - DIGEST_PREFIX.length;
+  const prefixed = prefix >= 0 && text.startsWith(DIGEST_PREFIX, prefix) && !BASE64_CHARACTER.test(text.charAt(prefix - 1));
+  return bound(prefixed ? `${DIGEST_PREFIX}${run}` : run);
+};
+
+const holdsShape = (text: string, shapes: readonly RegExp[], bound?: BoundTest): boolean =>
+  shapes.some((shape) => (shape === LONG_BASE64_RUN && bound !== undefined
+    ? [...text.matchAll(LONG_BASE64_RUNS)].some((match) => !isBoundRun(text, match.index, match[0], bound))
+    : shape.test(text)));
 
 /**
  * Whether a record's keys or values hold a shape, each value checked by the same field rules as the
@@ -221,45 +277,22 @@ const MARK_CLOSE = "\uE001";
 const MARKED = /\uE000(\d+)\uE001/g;
 
 /**
- * A digest or 64-hex id standing on its own inside text: nothing of the long-base64 alphabet on either
- * side, so setting it aside can never split a longer run into shorter ones.
- */
-const REFERENCE_TOKEN = /(?<![A-Za-z0-9+/])(?:sha256:)?[0-9a-f]{64}(?![A-Za-z0-9+/=])/g;
-
-/**
  * The bound-reference test for a field written at a site whose store can read its own records: a
- * digest or id in any text there is set aside only when it names a record the store holds
- * (`RegistryView.boundReference`), never for its shape alone. Without such a site, nothing is.
+ * digest or id in any text there skips the long-base64 shape only when it names a record the store
+ * holds (`RegistryView.boundReference`), never for its shape alone (`isBoundRun`). Without such a site,
+ * nothing does.
  */
-const boundReferenceOf = (field: EvidenceField | undefined): ((token: string) => boolean) | undefined => {
+const boundReferenceOf = (field: EvidenceField | undefined): BoundTest => {
   const registry = field?.site?.registry;
   if (registry?.boundReference === undefined) return undefined;
   const runId = field?.site?.runId ?? null;
   return (token) => registry.boundReference!(runId, token);
 };
 
-const setAside = (
-  text: string, tokens: RegExp | undefined, bound?: (token: string) => boolean,
-): { text: string; tokens: string[] } => {
-  if ((tokens === undefined && bound === undefined) || text.includes(MARK_OPEN) || text.includes(MARK_CLOSE)) return { text, tokens: [] };
+const setAside = (text: string, tokens: RegExp | undefined): { text: string; tokens: string[] } => {
+  if (tokens === undefined || text.includes(MARK_OPEN) || text.includes(MARK_CLOSE)) return { text, tokens: [] };
   const kept: string[] = [];
-  const mark = (token: string): string => `${MARK_OPEN}${kept.push(token) - 1}${MARK_CLOSE}`;
-  let out = tokens === undefined ? text : text.replace(tokens, mark);
-  if (bound !== undefined) out = out.replace(REFERENCE_TOKEN, (token) => (bound(token) ? mark(token) : token));
-  return { text: out, tokens: kept };
-};
-
-/**
- * What is set aside in `text` at `field`: its listed audit tokens, and the digests and ids that name a
- * record the store holds. The store is asked only for text that holds a shape without that, so text
- * with no shape, a whole ACP id among it, costs no lookup.
- */
-const asideFor = (text: string, field: EvidenceField | undefined): { text: string; tokens: string[] } => {
-  const listed = setAside(text, tokensFor(field));
-  const bound = boundReferenceOf(field);
-  return bound === undefined || !holdsShape(listed.text, shapesFor(text, field?.path))
-    ? listed
-    : setAside(text, tokensFor(field), bound);
+  return { text: text.replace(tokens, (token) => `${MARK_OPEN}${kept.push(token) - 1}${MARK_CLOSE}`), tokens: kept };
 };
 
 const putBack = (text: string, tokens: readonly string[]): string =>
@@ -313,8 +346,9 @@ const REPOSITORY_PATH_FIELDS: Readonly<Record<EvidenceField["store"], ReadonlySe
  * that refuse absolute paths, `..` and control characters are separate and unchanged.
  */
 const isRepositoryPath = (text: string, field: EvidenceField | undefined): boolean =>
-  // A whole-value ACP id there (`<project>:#manifest/sha256:<hex>`) keeps the id rule it has today.
-  field !== undefined && !isAcpId(text) && REPOSITORY_PATH_FIELDS[field.store].has(field.path.join("."));
+  // A whole-value ACP id there (`<project>:#manifest/sha256:<hex>`) keeps the id rule it has today,
+  // except at a free-text or reviewer field, where it is a path like any other (`FREE_TEXT_FIELDS`).
+  field !== undefined && !isWholeAcpId(text, field) && REPOSITORY_PATH_FIELDS[field.store].has(field.path.join("."));
 
 /** Whether a value is the location its writer's contract makes: given the value, its field and write site. */
 type LocationContract = (text: string, field: EvidenceField) => boolean;
@@ -509,7 +543,8 @@ const isVerifiedLocation = (text: string, field: EvidenceField | undefined): boo
   return contract !== undefined && contract(text, field);
 };
 
-const segmentsHoldShape = (text: string): boolean => text.split("/").some((segment) => holdsShape(segment, CREDENTIAL_SHAPES));
+const segmentsHoldShape = (text: string, bound: BoundTest): boolean =>
+  text.split("/").some((segment) => holdsShape(segment, CREDENTIAL_SHAPES, bound));
 
 const GLOBAL = new Map(CREDENTIAL_SHAPES.map((shape) => [shape, new RegExp(shape.source, `g${shape.flags}`)]));
 
@@ -519,7 +554,10 @@ const GLOBAL = new Map(CREDENTIAL_SHAPES.map((shape) => [shape, new RegExp(shape
  * and an `AUDIT_TOKENS` token inside its audit field, skip the long-base64 shape, and reads a
  * `REPOSITORY_PATH_FIELDS` path, and a value that meets its `VERIFIED_LOCATIONS` contract, per segment.
  * Given a write site whose store reads its own records, a digest or id anywhere in the text that names
- * one of them is set aside too; the text around it, and any digest the store does not hold, gets every shape.
+ * one of them skips the long-base64 shape too, and only it; the text around it, the reference itself
+ * for every other shape, and any digest the store does not hold, get every shape. At a free-text or
+ * reviewer field (`FREE_TEXT_FIELDS`, `FREE_TEXT_WRITERS`) a whole ACP id is not exempt by its format,
+ * only as such a bound reference.
  */
 export const hasCredentialShape = (text: string, field?: EvidenceField): boolean => {
   const kind = serializedKind(field);
@@ -534,22 +572,30 @@ export const hasCredentialShape = (text: string, field?: EvidenceField): boolean
  * location's contract is checked only for a value whose whole holds a shape.
  */
 const fieldHoldsShape = (text: string, field: EvidenceField | undefined): boolean => {
-  const aside = asideFor(text, field);
-  if (isRepositoryPath(text, field)) return segmentsHoldShape(aside.text);
-  if (!holdsShape(aside.text, shapesFor(text, field?.path))) return false;
-  return !isVerifiedLocation(text, field) || segmentsHoldShape(aside.text);
+  const aside = setAside(text, tokensFor(field));
+  const bound = boundReferenceOf(field);
+  if (isRepositoryPath(text, field)) return segmentsHoldShape(aside.text, bound);
+  if (!holdsShape(aside.text, shapesFor(text, field), bound)) return false;
+  return !isVerifiedLocation(text, field) || segmentsHoldShape(aside.text, bound);
 };
 
-const redactWith = (text: string, shapes: readonly RegExp[]): string => {
+/** A long-base64 run replaced with `[redacted]`, unless it is a bound reference's hex (`isBoundRun`). */
+const redactRuns = (text: string, bound: BoundTest): string =>
+  text.replace(LONG_BASE64_RUNS, (run: string, at: number, whole: string) => (isBoundRun(whole, at, run, bound) ? run : REDACTED));
+
+const redactWith = (text: string, shapes: readonly RegExp[], bound?: BoundTest): string => {
   let out = text;
   for (let pass = 0; pass < 16; pass += 1) {
-    if (!holdsShape(out, shapes)) return out;
-    for (const shape of shapes) out = out.replace(GLOBAL.get(shape)!, REDACTED);
+    if (!holdsShape(out, shapes, bound)) return out;
+    for (const shape of shapes) {
+      out = shape === LONG_BASE64_RUN && bound !== undefined ? redactRuns(out, bound) : out.replace(GLOBAL.get(shape)!, REDACTED);
+    }
   }
-  return holdsShape(out, shapes) ? REDACTED : out;
+  return holdsShape(out, shapes, bound) ? REDACTED : out;
 };
 
-const redactSegments = (text: string): string => text.split("/").map((segment) => redactWith(segment, CREDENTIAL_SHAPES)).join("/");
+const redactSegments = (text: string, bound?: BoundTest): string =>
+  text.split("/").map((segment) => redactWith(segment, CREDENTIAL_SHAPES, bound)).join("/");
 
 /**
  * Every listed shape replaced with `[redacted]`, repeated until none is found: one replacement can
@@ -565,10 +611,11 @@ export const redactCredentialShapes = (text: string, field?: EvidenceField): str
     (field !== undefined && serializedHoldsShape(record, field.store) ? redactWith(record, CREDENTIAL_SHAPES) : record);
   if (kind === "jsonl") return text.split("\n").map(asRecord).join("\n");
   if (kind === "json") return asRecord(text);
-  const aside = asideFor(text, field);
-  const shapes = shapesFor(text, field?.path);
-  const perSegment = isRepositoryPath(text, field) || (holdsShape(aside.text, shapes) && isVerifiedLocation(text, field));
-  return putBack(perSegment ? redactSegments(aside.text) : redactWith(aside.text, shapes), aside.tokens);
+  const aside = setAside(text, tokensFor(field));
+  const bound = boundReferenceOf(field);
+  const shapes = shapesFor(text, field);
+  const perSegment = isRepositoryPath(text, field) || (holdsShape(aside.text, shapes, bound) && isVerifiedLocation(text, field));
+  return putBack(perSegment ? redactSegments(aside.text, bound) : redactWith(aside.text, shapes, bound), aside.tokens);
 };
 
 /**
@@ -576,19 +623,15 @@ export const redactCredentialShapes = (text: string, field?: EvidenceField): str
  * text ACP derives from an outside answer before it stores it: a reviewer's findings, API facts.
  * `at` is where `value` will sit in the stored evidence: a `REPOSITORY_PATH_FIELDS` path inside it
  * is redacted per segment, and every other string is read whole as free text, where a digest or id
- * that names a record the store holds (`at.site`) is kept. Whether anything was replaced is returned
- * so the caller can mark the removal.
+ * that names a record the store holds (`at.site`) is kept from the long-base64 shape alone. Whether
+ * anything was replaced is returned so the caller can mark the removal.
  */
 export const redactCredentialValues = <T>(value: T, at: EvidenceField): { value: T; redacted: boolean } => {
   let redacted = false;
   const bound = boundReferenceOf(at);
-  const freeText = (text: string): string => {
-    const aside = bound !== undefined && holdsShape(text, CREDENTIAL_SHAPES) ? setAside(text, undefined, bound) : setAside(text, undefined);
-    return putBack(redactWith(aside.text, CREDENTIAL_SHAPES), aside.tokens);
-  };
   const walk = (node: unknown, depth: number, path: readonly string[]): unknown => {
     if (typeof node === "string") {
-      const out = isRepositoryPath(node, { path, store: at.store }) ? redactSegments(node) : freeText(node);
+      const out = isRepositoryPath(node, { path, store: at.store }) ? redactSegments(node, bound) : redactWith(node, CREDENTIAL_SHAPES, bound);
       if (out !== node) redacted = true;
       return out;
     }

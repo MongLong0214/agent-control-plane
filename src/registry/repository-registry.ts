@@ -40,7 +40,15 @@ export interface RepositoryInspection {
   observedAt: string;
   clean: boolean;
   driftState: RepositoryRecord["driftState"];
+  /**
+   * #1255 G-5 — what `driftState` was decided on, every one that held: the registry already recorded
+   * DRIFTED, HEAD could not be read, HEAD is not the accepted head, or the checkout has uncommitted
+   * changes. Empty exactly when `driftState` is IN_SYNC.
+   */
+  driftCauses: RepositoryDriftCause[];
 }
+
+export type RepositoryDriftCause = "REGISTRY_RECORDED_DRIFTED" | "HEAD_UNREADABLE" | "HEAD_NOT_ACCEPTED_HEAD" | "UNCOMMITTED_CHANGES";
 
 /**
  * PRD §9.2 / Integration §11 — the machine-local binding SSOT.
@@ -403,6 +411,12 @@ export class RepositoryRegistry {
         : observedHead === record.lastObservedHead && clean
           ? "IN_SYNC"
           : "DRIFTED";
+    const driftCauses: RepositoryDriftCause[] = [
+      ...(record.driftState === "DRIFTED" ? ["REGISTRY_RECORDED_DRIFTED" as const] : []),
+      ...(observedHead === null ? ["HEAD_UNREADABLE" as const] : []),
+      ...(observedHead !== null && observedHead !== record.lastObservedHead ? ["HEAD_NOT_ACCEPTED_HEAD" as const] : []),
+      ...(observedHead !== null && !clean ? ["UNCOMMITTED_CHANGES" as const] : []),
+    ];
     return {
       repositoryId,
       checkoutPath: record.checkoutPath,
@@ -412,6 +426,7 @@ export class RepositoryRegistry {
       observedAt: this.clock.nowIso(),
       clean,
       driftState,
+      driftCauses,
     };
   }
 

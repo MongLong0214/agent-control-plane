@@ -4,6 +4,8 @@ import { manifestDigest, type ProjectManifest } from "../../src/contracts/manife
 import { sha256 } from "../../src/core/digest.ts";
 import { acpError, allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { credentialBearingField } from "../../src/db/audit.ts";
+import { registryView } from "../../src/db/registry-view.ts";
 import { RunKind, RunState, type RunRow } from "../../src/domain/types.ts";
 import { createCtoMcpPort } from "../../src/mcp/cto-server.ts";
 import { idempotentMcpMutation, ok } from "../../src/mcp/shared.ts";
@@ -14,7 +16,7 @@ import { buildNoRepositoryCandidateSnapshot, candidateSnapshotDigest } from "../
 import { callCtoToolAsOwner } from "../helpers/bootstrap-plan.ts";
 import { CONTRACT_CHANGE_CONTRACT, WORKFLOW, WORKFLOW_PATH } from "../helpers/contract-change.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeRepo, writeFiles } from "../helpers/fixtures.ts";
-import { createRun, firstManifest, firstPlan, operatorRegisteredProject, revisionsFor } from "../helpers/first-activation.ts";
+import { createRun, firstManifest, firstPlan, operatorRegisteredProject, revisionsFor, unitTestsWorkflow } from "../helpers/first-activation.ts";
 import { makeHarness, reviewerPass, type Harness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
@@ -61,14 +63,17 @@ interface FirstActivation {
 let projectSeq = 0;
 
 /** An operator-registered NULL project, a dispatched first-activation run and its PLAN, not yet submitted. */
-const firstActivation = async (planText: Record<string, unknown> = PLAN_TEXT): Promise<FirstActivation> => {
+const firstActivation = async (
+  planText: Record<string, unknown> = PLAN_TEXT,
+  workflows: Parameters<typeof firstManifest>[1] = [unitTestsWorkflow],
+): Promise<FirstActivation> => {
   const repoPath = makeRepo({ "README.md": "# fixture\n", "verify.js": "console.log('ok')\n", [WORKFLOW_PATH]: WORKFLOW }, "dev");
   const h = makeHarness({ repoPath });
   const projectId = `review-packet-${++projectSeq}`;
   const project = await operatorRegisteredProject(h, projectId);
   const bound = gitSync(repoPath, ["rev-parse", "HEAD"]);
   const run = await createRun(h, projectId, RunKind.CONTRACT_CHANGE);
-  const m1 = firstManifest(projectId);
+  const m1 = firstManifest(projectId, workflows);
   const submitted = createCtoMcpPort(h.cp).submitPlan(run.runId, { ...firstPlan(m1, revisionsFor(m1, bound)), ...planText });
   if (!submitted.allowed) throw new Error(`${submitted.reasonCode}: ${submitted.message}`);
   await h.cp.continuity.evaluate("contract change review packet");
@@ -212,7 +217,7 @@ describe("#1254: a digest or id in text is set aside only when it names a record
       const contractDigest = r.h.cp.runs.require(r.run.runId).contractDigest;
       for (const note of [
         `PLAN ${r.planDigest}, contract ${contractDigest}.`,
-        `manifest ${manifestDigest(r.m1)} and workflow ${sha256(WORKFLOW)}`,
+        `manifest ${manifestDigest(r.m1)}`,
         `PLAN by bare hex ${r.planDigest.slice("sha256:".length)}`,
         `Buzz event ${eventId}`,
       ]) {
@@ -224,6 +229,8 @@ describe("#1254: a digest or id in text is set aside only when it names a record
         `exposed=${hex("not an id")}`,
         `${r.planDigest} ${TOKEN}`,
         `Buzz event ${hex("an event never accepted")}`,
+        // G-3: the PLAN declares this workflow digest, and ACP has not read the workflow yet (no freeze).
+        `workflow ${sha256(WORKFLOW)}`,
       ]) {
         expect(put(r.run.runId, note), note).toThrow(/contains a credential/);
       }
@@ -399,6 +406,178 @@ describe("#1255: the CONTRACT_CHANGE first-activation packet carries the PLAN an
       const again = await review(bare);
       expect(again.allowed, JSON.stringify(again)).toBe(true);
       expect(contractChangePrompts(r.h).at(-1)).toContain("MISSING: ACP stored no readback for this candidate");
+    } finally { r.h.cp.close(); }
+  }, 60_000);
+});
+
+/** The run's audit rows of one kind. */
+const auditOf = (r: FirstActivation, kind: string) => r.h.cp.audit.forRun(r.run.runId).filter((row) => row.kind === kind);
+
+/** Reviews the run's current candidate with a passing answer and returns the readback section of its prompt. */
+const reviewCurrent = async (r: FirstActivation, snapshot: Parameters<typeof candidateSnapshotDigest>[0]): Promise<string> => {
+  const contract = r.h.cp.artifacts.latest<TaskContract>(r.run.runId, "TASK_CONTRACT")!.content;
+  r.h.scripted.script({ match: /Contract change review/, text: reviewerPass([r.coverage]) });
+  const reviewed = await r.h.cp.review.controlPlaneInvoker()({
+    kind: "CONTRACT_CHANGE", runId: r.run.runId, snapshot, contract, contractDigest: r.run.contractDigest,
+  });
+  expect(reviewed.allowed, JSON.stringify(reviewed)).toBe(true);
+  const prompt = contractChangePrompts(r.h).at(-1)!;
+  return prompt.slice(prompt.indexOf("### ACP readback at the candidate's freeze"));
+};
+
+describe("#1279 G-1..G-6: counterexamples to the restored #1254/#1255 change", () => {
+  it("G-1: a bound digest's hex skips the long-base64 shape only: `ghp_<bound hex>` is refused in artifact text and a review, and redacted in audit text", async () => {
+    const r = await firstActivation();
+    try {
+      const boundHex = r.planDigest.slice("sha256:".length);
+      const ghp = `ghp_${boundHex}`;
+      const put = (note: string) => () => r.h.cp.artifacts.put(r.run.runId, "HANDOFF", { note });
+      expect(put(`PLAN ${boundHex}`)).not.toThrow();
+      expect(put(`see ${ghp}`)).toThrow(/contains a credential/);
+      expect(put(`Authorization: Bearer ${boundHex}`)).toThrow(/contains a credential/);
+      expect(r.h.cp.audit.record({ kind: "TEST_RATIONALE", runId: r.run.runId, evidence: { rationale: `confirm ${ghp}` } }).allowed).toBe(true);
+      expect(r.h.cp.audit.byKind("TEST_RATIONALE").at(-1)!.evidence["rationale"]).toBe("confirm [redacted]");
+
+      r.h.scripted.script({ match: /Contract change review/, text: blocking(r, `the PLAN ${ghp}`, "evidence is missing") });
+      const refused = await submit(r);
+      expect(refused.allowed && refused.value, JSON.stringify(refused)).toMatchObject({ stage: "REVIEW_UNAVAILABLE", reasonCode: ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED });
+      expect(auditOf(r, "BLIND_REVIEW_STORAGE_REFUSED").map((row) => row.evidence["field"])).toEqual(["omittedItems"]);
+      expect(r.h.cp.artifacts.list(r.run.runId, "BLIND_REVIEW")).toEqual([]);
+      expect(JSON.stringify(r.h.cp.audit.forRun(r.run.runId))).not.toContain(ghp);
+    } finally { r.h.cp.close(); }
+  }, 60_000);
+
+  it("G-2: a whole digest in a reviewer's field is exempt only when bound; a field typed as a digest keeps the whole-value rule", async () => {
+    const r = await firstActivation();
+    try {
+      // The store's own check, at the BLIND_REVIEW write site of this run.
+      const site = { writer: "BLIND_REVIEW", runId: r.run.runId, registry: registryView(r.h.cp.db) };
+      const field = (record: Record<string, unknown>) => credentialBearingField(record, 0, [], site);
+      expect(field({ omittedItems: [UNBOUND] })).toBe("omittedItems");
+      expect(field({ omittedItems: [UNBOUND.slice("sha256:".length)] })).toBe("omittedItems");
+      expect(field({ findings: [{ detail: UNBOUND }] })).toBe("detail");
+      expect(field({ coveredFiles: [UNBOUND] })).toBe("coveredFiles");
+      expect(field({ omittedItems: [r.planDigest] })).toBeNull();
+      expect(field({ coveredFiles: [r.coverage] })).toBeNull();
+      expect(field({ candidateSnapshotDigest: UNBOUND, inputManifest: { reviewerPromptDigests: [UNBOUND] } })).toBeNull();
+
+      // End to end: an unbound digest as a whole omitted item refuses the review; the bound one is stored.
+      r.h.scripted.script({ match: /Contract change review/, text: blocking(r, UNBOUND, "evidence is missing") });
+      const refused = await submit(r);
+      expect(refused.allowed && refused.value, JSON.stringify(refused)).toMatchObject({ stage: "REVIEW_UNAVAILABLE", reasonCode: ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED });
+      expect(auditOf(r, "BLIND_REVIEW_STORAGE_REFUSED").map((row) => row.evidence["field"])).toEqual(["omittedItems"]);
+      expect(r.h.cp.artifacts.list(r.run.runId, "BLIND_REVIEW")).toEqual([]);
+
+      r.h.scripted.script({ match: /Contract change review/, text: blocking(r, r.planDigest, "evidence is missing") });
+      const stored = await submit(r);
+      expect(stored.allowed && stored.value.stage, JSON.stringify(stored)).toBe("REVISION_REQUIRED");
+      const packet = r.h.cp.artifacts.list<ReviewPacket>(r.run.runId, "BLIND_REVIEW").at(-1)!.content;
+      expect(packet.omittedItems).toEqual([r.planDigest]);
+
+      // run_create: a task contract types no field as a digest, so a whole 64-hex reference is one only when bound.
+      const eventId = hex("a Buzz event a run was asked from, named whole");
+      r.h.cp.db.run(`INSERT INTO buzz_events (event_id, payload_json) VALUES (?, ?)`, [eventId, "{}"]);
+      const create = (references: string[]) => {
+        try {
+          return r.h.cp.runs.create({
+            projectId: r.projectId, kind: RunKind.CONTRACT_CHANGE, executionMode: r.run.executionMode,
+            contract: { ...CONTRACT_CHANGE_CONTRACT, references }, repositories: [],
+          }).allowed;
+        } catch { return false; }
+      };
+      expect(create([eventId])).toBe(true);
+      expect(create([hex("an event never accepted, named whole")])).toBe(false);
+      expect(create([UNBOUND])).toBe(false);
+    } finally { r.h.cp.close(); }
+  }, 60_000);
+
+  it("G-3: a workflow digest the PLAN only declares binds nothing; the bytes ACP read at the bound commit do", async () => {
+    const declared = sha256("workflow bytes a PLAN declared and ACP never read");
+    const r = await firstActivation(PLAN_TEXT, [{ ...unitTestsWorkflow, approvedDigest: declared }]);
+    try {
+      const plan = r.h.cp.artifacts.latest<{ workflowRevisions: Array<{ fileDigest: string }> }>(r.run.runId, "PLAN")!.content;
+      expect(plan.workflowRevisions[0]!.fileDigest).toBe(declared);
+      const put = (note: string) => () => r.h.cp.artifacts.put(r.run.runId, "HANDOFF", { note });
+      expect(put(`workflow ${declared}`)).toThrow(/contains a credential/);
+      expect(put(`workflow ${declared.slice("sha256:".length)}`)).toThrow(/contains a credential/);
+      // The manifest the PLAN carries is hashed by ACP and checked against the digest the PLAN names.
+      expect(put(`manifest ${manifestDigest(r.m1)}`)).not.toThrow();
+
+      // A freeze reads the workflow at the bound commit: its real bytes' digest is now a record, the declared one is not.
+      const frozen = await r.h.cp.pipeline.freeze(r.run.runId);
+      expect(frozen.allowed, JSON.stringify(frozen)).toBe(true);
+      expect(put(`workflow ${sha256(WORKFLOW)}`)).not.toThrow();
+      expect(put(`workflow ${declared}`)).toThrow(/contains a credential/);
+    } finally { r.h.cp.close(); }
+  }, 60_000);
+
+  it("G-4: a token in a finding's detail refuses the review before anything is stored and records the refusal", async () => {
+    const r = await firstActivation();
+    try {
+      r.h.scripted.script({ match: /Contract change review/, text: blocking(r, "the registration facts", `the log printed ${TOKEN}`) });
+      const refused = await submit(r);
+      expect(refused.allowed && refused.value, JSON.stringify(refused)).toMatchObject({ stage: "REVIEW_UNAVAILABLE", reasonCode: ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED });
+      expect(r.h.cp.artifacts.list(r.run.runId, "BLIND_REVIEW")).toEqual([]);
+      const refusal = auditOf(r, "BLIND_REVIEW_STORAGE_REFUSED");
+      expect(refusal).toHaveLength(1);
+      expect(refusal[0]!.evidence).toMatchObject({
+        candidateSnapshotDigest: r.h.cp.runs.currentCandidate(r.run.runId)!, kind: "BLIND_REVIEW", field: "detail", verdict: "BLOCK", findings: 1,
+      });
+      expect(auditOf(r, "BLIND_REVIEW_COMPLETED")).toEqual([]);
+      expect(auditOf(r, "BLIND_REVIEW_UNAVAILABLE")).toHaveLength(1);
+      expect(r.h.cp.runs.require(r.run.runId).state).toBe(RunState.ACTIVE);
+      expect(JSON.stringify(r.h.cp.audit.forRun(r.run.runId))).not.toContain(TOKEN);
+    } finally { r.h.cp.close(); }
+  }, 60_000);
+
+  it("G-5: HEAD advanced before the freeze: the readback shows the recomputed DRIFTED and its cause beside the stored value", async () => {
+    const r = await firstActivation();
+    try {
+      writeFiles(r.repoPath, { "before-freeze.txt": "moved before the freeze\n" });
+      const moved = commitAll(r.repoPath, "moved before the freeze");
+      const frozen = await r.h.cp.pipeline.freeze(r.run.runId);
+      expect(frozen.allowed, JSON.stringify(frozen)).toBe(true);
+      if (!frozen.allowed) return;
+      const section = await reviewCurrent(r, frozen.value);
+      const readback = fencedJsonAfter(section, "### ACP readback at the candidate's freeze") as ContractChangeReviewContext;
+      expect(readback.repositories[0]).toMatchObject({
+        lastObservedHead: r.bound,
+        driftState: "IN_SYNC",
+        checkout: { status: "READ", head: moved, branch: "dev", clean: true, observedDriftState: "DRIFTED", observedDriftCauses: ["HEAD_NOT_ACCEPTED_HEAD"] },
+      });
+      expect(section).toContain("observedDriftState and observedDriftCauses are the drift ACP recomputed");
+    } finally { r.h.cp.close(); }
+  }, 60_000);
+
+  it("G-6: freeze, a credential-shaped branch, freeze again: the readback is named missing with its refusal, never the first freeze's", async () => {
+    const r = await firstActivation();
+    try {
+      const first = await r.h.cp.pipeline.freeze(r.run.runId);
+      expect(first.allowed, JSON.stringify(first)).toBe(true);
+      if (!first.allowed) return;
+      const candidate = candidateSnapshotDigest(first.value);
+      const earlier = storedContext(r.h, r.run.runId, candidate)!;
+      expect(earlier.repositories[0]!.checkout).toMatchObject({ status: "READ", branch: "dev" });
+
+      gitSync(r.repoPath, ["checkout", "-q", "-b", TOKEN]);
+      const second = await r.h.cp.pipeline.freeze(r.run.runId);
+      expect(second.allowed, JSON.stringify(second)).toBe(true);
+      if (!second.allowed) return;
+      expect(candidateSnapshotDigest(second.value)).toBe(candidate);
+
+      const section = await reviewCurrent(r, second.value);
+      expect(section).toContain("MISSING: ACP stored no readback for this candidate: the readback ACP read at its latest freeze");
+      expect(section).toContain(`refused at storage (${ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED}, field branch)`);
+      expect(section).not.toContain(earlier.freezeId);
+      expect(section).not.toContain(TOKEN);
+
+      // Each freeze names what it stored for the readback; the refused one holds none of the refused text.
+      const frozen = auditOf(r, "CANDIDATE_FROZEN").map((row) => row.evidence["reviewContext"]);
+      expect(frozen).toMatchObject([
+        { status: "STORED", freezeId: earlier.freezeId },
+        { status: "REFUSED", reasonCode: ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED, field: "branch" },
+      ]);
+      expect(JSON.stringify(r.h.cp.artifacts.list(r.run.runId, "HANDOFF"))).not.toContain(TOKEN);
     } finally { r.h.cp.close(); }
   }, 60_000);
 });

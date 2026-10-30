@@ -11,7 +11,7 @@ import { collectBootstrapCeoDecisions, frozenBootstrapCeoDecisions } from "../bo
 import { collectBootstrapReviewEvidence } from "../bootstrap/bootstrap-review-evidence.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, type Evidence, allow, deny, isAcpError } from "../core/errors.ts";
+import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { commandsForMode, type BranchProfile } from "../contracts/manifest.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
@@ -29,7 +29,7 @@ import { firstActivationFactsOf } from "../registry/manifest-activation-grants.t
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { BlindReviewGate, BlindReviewInvoker, ReviewPacket } from "../review/blind-review.ts";
-import { captureContractChangeReviewContext } from "../review/contract-change-review-context.ts";
+import { captureContractChangeReviewContext, storeContractChangeReviewContext } from "../review/contract-change-review-context.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import {
   type CandidateSnapshot,
@@ -404,23 +404,22 @@ export class CandidatePipeline {
     }
 
     // #1255 — what a CONTRACT_CHANGE candidate's review is shown beside its PLAN, read by ACP now, at the
-    // freeze, and bound to this candidate, so the review sees what held when the candidate was frozen.
+    // freeze, and bound to this candidate and this freeze, so the review sees what held when it was frozen.
     const reviewContext = contractChange === undefined || run.projectId === null
       ? null
       : await captureContractChangeReviewContext(
           { db: this.db, repositories: this.repositories, clock: this.clock },
-          { runId, projectId: run.projectId, candidateSnapshotDigest: digest, planDigest: contractChange.planDigest, workflowRevisions: boundRevisions },
+          {
+            runId, projectId: run.projectId, candidateSnapshotDigest: digest, planDigest: contractChange.planDigest,
+            workflowRevisions: boundRevisions,
+            freezeId: `freeze_${randomUUID().replace(/-/g, "").slice(0, 24)}`, attemptId: attemptId ?? null,
+          },
         );
 
     this.artifacts.put(runId, ArtifactKind.CANDIDATE_SNAPSHOT, snapshot, digest);
-    if (reviewContext !== null) {
-      try {
-        this.artifacts.put(runId, ArtifactKind.HANDOFF, reviewContext, digest);
-      } catch (error) {
-        // Not stored, the readback is absent, and the review packet names it as missing.
-        if (!isAcpError(error)) throw error;
-      }
-    }
+    // G-6 — a readback the store refuses is replaced by this freeze's refusal row, so the review names it
+    // missing with the refusal rather than showing an earlier freeze's readback of the same candidate.
+    const reviewContextOutcome = reviewContext === null ? null : storeContractChangeReviewContext(this.artifacts, reviewContext);
     // One transaction records the new candidate and stales everything bound to an older
     // one, so no window exists in which superseded evidence still reads as current.
     this.runs.promoteCandidate(runId, digest);
@@ -447,6 +446,7 @@ export class CandidatePipeline {
           ...(r.integration === undefined ? {} : { integratedTasks: r.integration.tasks.length }),
         })),
         ...(attemptId === undefined ? {} : { attemptId }),
+        ...(reviewContextOutcome === null ? {} : { reviewContext: reviewContextOutcome }),
       },
     });
     return allow(ReasonCode.OK, snapshot);

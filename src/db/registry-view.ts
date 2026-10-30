@@ -1,4 +1,5 @@
 import type { RegistryView } from "../core/credential-shapes.ts";
+import { digestOf } from "../core/digest.ts";
 import type { Db } from "./database.ts";
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
@@ -10,18 +11,25 @@ const member = (value: unknown, key: string): unknown =>
 const entries = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
 
 /**
- * The digests a run's PLAN declares for the records it names: its manifest, and each workflow's
- * revision and approved digest. Each is a whole-value field of a stored PLAN.
+ * #1254 G-3 — the one digest a stored PLAN contributes: the digest ACP computes, here, of the manifest
+ * the PLAN carries, and only when it is the digest the PLAN names, which is what plan_submit checked
+ * before it stored the PLAN (bootstrap/bootstrap-plan.ts planForSubmission, registry/contract-change-plan.ts).
+ * A digest the PLAN only declares binds nothing: a workflow revision's `fileDigest`, a manifest
+ * workflow's `approvedDigest`, and a `projectManifestDigest` with no manifest carried are the CTO's
+ * statements, not records. A workflow's bytes count once ACP read them (`reviewContextReferences`).
  */
-const planReferences = (plan: unknown): unknown[] => [
-  member(plan, "projectManifestDigest"),
-  ...entries(member(plan, "workflowRevisions")).map((revision) => member(revision, "fileDigest")),
-  ...entries(member(member(plan, "projectManifest"), "ciWorkflows")).map((workflow) => member(workflow, "approvedDigest")),
-];
+const planReferences = (plan: unknown): unknown[] => {
+  const manifest = member(plan, "projectManifest");
+  if (manifest === null || typeof manifest !== "object" || Array.isArray(manifest)) return [];
+  let computed: string;
+  try { computed = digestOf(manifest); } catch { return []; }
+  return computed === member(plan, "projectManifestDigest") ? [computed] : [];
+};
 
 /**
  * The digests of what ACP read for a CONTRACT_CHANGE candidate's review (review/contract-change-review-context.ts):
- * each bound workflow revision's observed bytes and the project's active manifest.
+ * each bound workflow revision's bytes as ACP read them at the bound commit (`read.observedDigest`, never the
+ * revision's declared `fileDigest` beside it) and the project's active manifest as ACP read it.
  */
 const REVIEW_CONTEXT_SCHEMA = "acp.contract-change-review-context.v1";
 const reviewContextReferences = (context: unknown): unknown[] => [
@@ -29,7 +37,11 @@ const reviewContextReferences = (context: unknown): unknown[] => [
   ...entries(member(context, "workflowRevisions")).map((revision) => member(member(revision, "read"), "observedDigest")),
 ];
 
-/** The digests a stored candidate binds: its contract change's or bootstrap PLAN's, as ACP computed them. */
+/**
+ * The digests a stored candidate binds: its contract change's or bootstrap PLAN's, as ACP computed them at
+ * the freeze (the PLAN artifact's digest, the carried manifest's checked digest, the pin, the digest of the
+ * normalized revisions or planned outputs). The artifact store refuses a candidate whose digest does not address it.
+ */
 const candidateReferences = (snapshot: unknown): unknown[] =>
   ["contractChange", "bootstrapPlan"].flatMap((key) => {
     const binding = member(snapshot, key);
@@ -37,9 +49,12 @@ const candidateReferences = (snapshot: unknown): unknown[] =>
   });
 
 /**
- * Every digest of a record the run has, read from the store's own rows: each artifact's digest and
- * candidate, the run's contract, pin and current candidate, its project's active manifest, what its
- * PLANs and candidates name by digest, and the workflow bytes ACP read for its review.
+ * Every digest of a record the run has, each one ACP itself computed or observed, read from the store's
+ * own rows: each artifact's digest (computed by the artifact store over its content), each frozen
+ * candidate's digest (checked to address it) and what that candidate binds, the run's contract, pin and
+ * current candidate, its project's active manifest, the manifest a stored PLAN carries, and the workflow
+ * bytes ACP read for its review. Another row's `candidate_snapshot_digest` counts only as the frozen
+ * candidate it names, which is already here.
  */
 const runReferences = (db: Db, runId: string): ReadonlySet<string> => {
   const found = new Set<string>();
@@ -56,7 +71,7 @@ const runReferences = (db: Db, runId: string): ReadonlySet<string> => {
   );
   for (const row of rows) {
     add(row.digest);
-    add(row.candidate_snapshot_digest);
+    if (row.kind === "CANDIDATE_SNAPSHOT") add(row.candidate_snapshot_digest);
     if (row.content_json === null) continue;
     let content: unknown;
     try { content = JSON.parse(row.content_json); } catch { continue; }

@@ -29,7 +29,6 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { credentialBearingField, type AuditLog } from "../db/audit.ts";
 import { EVIDENCE_PRODUCERS, type ArtifactStore, type EvidenceWriter } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
-import { registryView } from "../db/registry-view.ts";
 import {
   ArtifactKind,
   type ExecutionMode,
@@ -77,8 +76,7 @@ import type { VerificationReport } from "../verify/verification-engine.ts";
 import type { TaskContract } from "../run/run-engine.ts";
 import { bootstrapPlanTaskRecorded } from "../run/task-graph.ts";
 import { candidateEvidenceSection, readExecutionEvidence, readTrackedTree, type TrackedTreeEvidence } from "./candidate-review-evidence.ts";
-import { storedContractChangeReviewContext, type ContractChangeReviewContext } from "./contract-change-review-context.ts";
-import { redactCredentialValues, type WriteSite } from "../core/credential-shapes.ts";
+import { contractChangeReadbackFor, type ContractChangeReadback } from "./contract-change-review-context.ts";
 
 export interface ReviewFinding {
   category: ReviewFindingCategory;
@@ -88,23 +86,12 @@ export interface ReviewFinding {
   summary: string;
   detail: string;
   /**
-   * Present only when ACP replaced credential-shaped text in this finding with `[redacted]` before
-   * storing the packet. The verdict is the reviewer's; what the finding no longer shows stays unproven.
+   * Present only on a packet stored before #1254 G-4, when ACP replaced credential-shaped text in this
+   * finding with `[redacted]` before storing it. Findings are now stored as the reviewer wrote them,
+   * and a finding the artifact store refuses refuses the review (`storeReview`).
    */
   redacted?: true;
 }
-
-/**
- * A reviewer's findings as ACP stores them: every string redacted through the shared credential
- * shapes (core/credential-shapes.ts), and each finding that lost text marked. The reviewer's own
- * answer is kept nowhere but as a digest, so this derived copy is the only stored text. A digest or id
- * in it that names a record the store holds for the run (`site`) is kept.
- */
-const storedFindings = (findings: readonly ReviewFinding[], site: WriteSite): ReviewFinding[] =>
-  findings.map((finding) => {
-    const { value, redacted } = redactCredentialValues(finding, { path: ["findings"], store: "artifact", site });
-    return redacted ? { ...value, redacted: true } : finding;
-  });
 
 export interface BootstrapReviewContext {
   deployment: BootstrapRuntimeObservation | null;
@@ -290,8 +277,8 @@ interface TrustedContractChange {
   target: { identity: string; path: string };
   /** #1255 — the stored PLAN the binding names, as its CTO wrote it. */
   plan: Record<string, unknown>;
-  /** #1255 — ACP's readback captured when the candidate was frozen; null when none was stored. */
-  context: ContractChangeReviewContext | null;
+  /** #1255 — ACP's readback captured at the candidate's latest freeze, or why there is none (G-6). */
+  readback: ContractChangeReadback;
 }
 
 /** A CONTRACT_CHANGE request once its run, candidate, contract and change have been reloaded. */
@@ -2026,9 +2013,10 @@ export class BlindReviewGate {
       coveredFiles: [...new Set(input.raw.coveredFiles)],
       omittedItems: [...new Set(input.raw.omittedItems)],
       verdict: input.raw.verdict,
-      findings: storedFindings(input.raw.findings, {
-        writer: ArtifactKind.BLIND_REVIEW, runId: input.request.runId, registry: registryView(this.db),
-      }),
+      // #1254 G-4 — the findings as the reviewer wrote them. The artifact store checks them, like every
+      // other field of the packet, before anything is stored, so a credential in a finding refuses the
+      // review through `storeReview`'s refusal record instead of being rewritten into a stored verdict.
+      findings: [...input.raw.findings],
       chunked: input.chunked,
       ...(input.bootstrapPlan === null ? {} : { bootstrapPlan: input.bootstrapPlan }),
       ...(input.bootstrapPlanIntentDigest === undefined ? {} : { bootstrapPlanIntentDigest: input.bootstrapPlanIntentDigest }),
@@ -2309,7 +2297,7 @@ export class BlindReviewGate {
       target: contractChangeCoverageTarget(run.project_id, current.value.binding),
       // The binding's PLAN digest is this artifact's: `currentContractChangeTarget` read it from here.
       plan: planArtifact!.content as Record<string, unknown>,
-      context: storedContractChangeReviewContext(this.artifacts, runId, candidateSnapshotDigest(snapshot)),
+      readback: contractChangeReadbackFor(this.db, runId, candidateSnapshotDigest(snapshot)),
     });
   }
 
@@ -2655,16 +2643,17 @@ const contractChangePlanSection = (change: TrustedContractChange): string[] => {
 /** #1255 — what ACP read when the candidate was frozen, or that nothing was stored for it. */
 const contractChangeReadbackSection = (change: TrustedContractChange): string[] => [
   "### ACP readback at the candidate's freeze",
-  ...(change.context === null
-    ? ["MISSING: ACP stored no readback for this candidate, so the project, repository and workflow readback is not available.", ""]
+  ...(change.readback.status === "MISSING"
+    ? [`MISSING: ACP stored no readback for this candidate: ${change.readback.reason}. The project, repository and workflow readback is not available.`, ""]
     : [
-        `Read by ACP when this candidate was frozen (${change.context.capturedAt}) and bound to candidate ${change.context.candidateSnapshotDigest};`,
-        "not written by the CTO. For each repository, checkout is the registered checkout as read then, and driftState,",
-        "lastObservedHead and lastObservedAt are the registry's stored values. For each bound workflow revision, read is",
-        "the exact local read of that commit's file with replacement objects off; ABSENT means the object was not in the",
-        "checkout and was not read another way.",
+        `Read by ACP at this candidate's latest freeze (${change.readback.context.freezeId}, ${change.readback.context.capturedAt}) and bound to candidate`,
+        `${change.readback.context.candidateSnapshotDigest}; not written by the CTO. For each repository, driftState, lastObservedHead and`,
+        "lastObservedAt are the registry's stored values; checkout is the registered checkout as ACP read it then, and its",
+        "observedDriftState and observedDriftCauses are the drift ACP recomputed from that read and what it rested on. For",
+        "each bound workflow revision, read is the exact local read of that commit's file with replacement objects off;",
+        "ABSENT means the object was not in the checkout and was not read another way.",
         "```json",
-        JSON.stringify(change.context, null, 2),
+        JSON.stringify(change.readback.context, null, 2),
         "```",
         "",
       ]),
