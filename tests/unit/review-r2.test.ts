@@ -182,23 +182,27 @@ it("re-reviews the same candidate after an accepted 55,000-character MINOR findi
   }
 });
 
-it("stores a finding's credential-shaped text redacted and marked, keeping its other text, path and the verdict", async () => {
+it("#1254 G-4: a finding's credential-shaped text refuses the review at storage; the refusal is recorded without it", async () => {
   const setup = await prepareReviewedInputs();
   try {
     const run = "Ab9+/Zq7".repeat(10);
     const digest = `sha256:${"0123456789abcdef".repeat(4)}`;
+    const token = `ghp_${"A1b2C3d4".repeat(5)}`;
     const finding = { category: "correctness", severity: "MINOR", repository: setup.identity, path: "src/app.js",
-      summary: "nonblocking observation", detail: `the log printed ghp_${"A1b2C3d4".repeat(5)} next to ${run}; see ${digest}` };
+      summary: "nonblocking observation", detail: `the log printed ${token} next to ${run}; see ${digest}` };
     const plain = { ...finding, summary: "second observation", detail: "nothing secret here" };
     const reviewed = await directReview(setup, JSON.stringify({ verdict: "PASS",
       coveredFiles: [`${setup.identity}:src/app.js`], omittedItems: [], findings: [finding, plain] }));
-    expect(reviewed, JSON.stringify(reviewed)).toMatchObject({ allowed: true, value: { verdict: "PASS" } });
-    const stored = setup.harness.cp.artifacts.list<ReviewPacket>(setup.run.runId, "BLIND_REVIEW")[0]!.content.findings;
-    // Free text gets every shape, an embedded digest included; the unredacted finding is stored as returned.
-    expect(stored).toEqual([
-      { ...finding, detail: "the log printed [redacted] next to [redacted]; see sha256:[redacted]", redacted: true },
-      plain,
-    ]);
+    // Checked as the reviewer wrote it, before anything is stored: no review is stored, rewritten or kept raw.
+    expect(reviewed, JSON.stringify(reviewed)).toMatchObject({ allowed: false, reasonCode: ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED });
+    expect(setup.harness.cp.artifacts.list<ReviewPacket>(setup.run.runId, "BLIND_REVIEW")).toEqual([]);
+    const audit = setup.harness.cp.audit.forRun(setup.run.runId);
+    const refusal = audit.filter((row) => row.kind === "BLIND_REVIEW_STORAGE_REFUSED");
+    expect(refusal).toHaveLength(1);
+    expect(refusal[0]!.evidence).toMatchObject({ candidateSnapshotDigest: candidateSnapshotDigest(setup.snapshot), kind: "BLIND_REVIEW", field: "detail", verdict: "PASS", findings: 2 });
+    expect(audit.filter((row) => row.kind === "BLIND_REVIEW_COMPLETED")).toEqual([]);
+    expect(JSON.stringify(audit)).not.toContain(token);
+    expect(JSON.stringify(audit)).not.toContain(run);
   } finally {
     setup.harness.cp.close();
   }

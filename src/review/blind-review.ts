@@ -24,7 +24,7 @@ import type { DispatchCapacityTarget } from "../capacity/capacity-monitor.ts";
 import type { ProjectManifest } from "../contracts/manifest.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { credentialBearingField, type AuditLog } from "../db/audit.ts";
 import {
@@ -89,6 +89,7 @@ import type { TaskContract } from "../run/run-engine.ts";
 import { bootstrapPlanTaskRecorded } from "../run/task-graph.ts";
 import { candidateEvidenceSection, readExecutionEvidence, readTrackedTree, type TrackedTreeEvidence } from "./candidate-review-evidence.ts";
 import { redactCredentialValues } from "../core/credential-shapes.ts";
+import { contractChangeReadbackFor, type ContractChangeReadback } from "./contract-change-review-context.ts";
 
 /**
  * How a path without a textual diff reached the reviewer: git's binary patch, immutable and
@@ -170,22 +171,12 @@ export interface ReviewFinding {
   summary: string;
   detail: string;
   /**
-   * Present only when ACP replaced credential-shaped text in this finding with `[redacted]` before
-   * storing the packet. The verdict is the reviewer's; what the finding no longer shows stays unproven.
+   * Present only on a packet stored before #1254 G-4, when ACP replaced credential-shaped text in this
+   * finding with `[redacted]` before storing it. Findings are now stored as the reviewer wrote them,
+   * and a finding the artifact store refuses refuses the review (`storeReview`).
    */
   redacted?: true;
 }
-
-/**
- * A reviewer's findings as ACP stores them: every string redacted through the shared credential
- * shapes (core/credential-shapes.ts), and each finding that lost text marked. The reviewer's own
- * answer is kept nowhere but as a digest, so this derived copy is the only stored text.
- */
-const storedFindings = (findings: readonly ReviewFinding[]): ReviewFinding[] =>
-  findings.map((finding) => {
-    const { value, redacted } = redactCredentialValues(finding, { path: ["findings"], store: "artifact" });
-    return redacted ? { ...value, redacted: true } : finding;
-  });
 
 /** Extra claims are reviewer text: redacted per path segment, so a shaped one cannot refuse the packet. */
 const storedExtraClaims = (claims: readonly string[]): string[] =>
@@ -310,6 +301,8 @@ export interface BlindReviewRequest {
   contract: TaskContract;
   contractDigest: string;
   verification: VerificationReport;
+  /** The submission this review belongs to, named in a refused review's record (`storeReview`). */
+  attemptId?: string;
 }
 
 /**
@@ -329,6 +322,7 @@ export interface BootstrapPlanReviewRequest {
   contractDigest: string;
   plannedOutputs?: unknown;
   manifest?: unknown;
+  attemptId?: string;
 }
 
 /**
@@ -346,6 +340,7 @@ export interface ContractChangeReviewRequest {
   contractDigest: string;
   manifest?: unknown;
   baseManifest?: unknown;
+  attemptId?: string;
 }
 
 /** The composition root supplies the capacity admission that reviewer allocation needs. */
@@ -390,6 +385,10 @@ interface TrustedContractChange {
   workflowRevisions?: WorkflowRevision[];
   /** `<projectId>:#manifest/<manifestDigest>`, the coverage item the reviewer must account for. */
   target: { identity: string; path: string };
+  /** #1255 — the stored PLAN the binding names, as its CTO wrote it. */
+  plan: Record<string, unknown>;
+  /** #1255 — ACP's readback captured at the candidate's latest freeze, or why there is none (G-6). */
+  readback: ContractChangeReadback;
 }
 
 /** A CONTRACT_CHANGE request once its run, candidate, contract and change have been reloaded. */
@@ -501,6 +500,9 @@ const unparsableAnswerEvidence = (text: string): Record<string, string | number 
   problem: "VERDICT_UNPARSABLE",
   ...textDigestEvidence("answer", text),
 });
+
+/** A refused field's name as the artifact store reports it: a key of the packet, or its `<value>` marker. */
+const REFUSED_FIELD_NAME = /^[A-Za-z0-9_<>.-]{1,64}$/;
 
 /** Diff size above which a single reviewer context is not trusted to hold everything. */
 const CHUNK_THRESHOLD_CHARS = 120_000;
@@ -714,6 +716,7 @@ export class BlindReviewGate {
         bootstrapPlan: null,
         contractChange: change === null ? null : reviewBindingOf(change),
         planReview: false,
+        attemptId: request.attemptId,
       });
     } finally {
       this.release(reviewers);
@@ -787,6 +790,7 @@ export class BlindReviewGate {
         bootstrapPlanIntentDigest: inputs.intentDigest,
         contractChange: null,
         planReview: true,
+        attemptId: request.attemptId,
       });
     } finally {
       this.release(reviewers);
@@ -833,6 +837,7 @@ export class BlindReviewGate {
         bootstrapPlan: null,
         contractChange: reviewBindingOf(inputs.change),
         planReview: true,
+        attemptId: request.attemptId,
       });
     } finally {
       this.release(reviewers);
@@ -860,6 +865,7 @@ export class BlindReviewGate {
     contractChange: ContractChangeReviewBinding | null;
     /** The reviewer read a PLAN's outputs or manifest, not a diff and its verification. */
     planReview: boolean;
+    attemptId: string | undefined;
   }): Decision<ReviewPacket> {
     const { runId, snapshotDigest, outcome, chunked, expected } = input;
     const authoritativeReviewer = outcome.reviewer;
@@ -911,13 +917,8 @@ export class BlindReviewGate {
     }
 
     const validated = this.validateCoverage(packet, expected);
-    this.artifacts.putEvidence(
-      this.evidenceWriter,
-      runId,
-      ArtifactKind.BLIND_REVIEW,
-      validated,
-      snapshotDigest,
-    );
+    const stored = this.storeReview(validated, authoritativeReviewer, input.attemptId);
+    if (!stored.allowed) return stored as Decision<ReviewPacket>;
 
     this.audit.record({
       kind: "BLIND_REVIEW_COMPLETED",
@@ -983,6 +984,49 @@ export class BlindReviewGate {
       });
     }
     return allow(ReasonCode.REVIEW_PASS, validated);
+  }
+
+  /**
+   * #1254 — the packet stored as BLIND_REVIEW evidence. Content the store refuses to keep (a credential
+   * in a reviewer's text) is not stored, rewritten or kept raw; the refusal is recorded with what
+   * identifies the review and never with its text: the candidate, the refused kind and field, the
+   * verdict, and the reviewer and submission it came from. The review then ends without a verdict, as
+   * an unavailable one does, so the run stays where it was and a later submission reviews it again.
+   */
+  private storeReview(packet: ReviewPacket, reviewer: ReviewerBinding, attemptId: string | undefined): Decision<void> {
+    try {
+      this.artifacts.putEvidence(this.evidenceWriter, packet.runId, ArtifactKind.BLIND_REVIEW, packet, packet.candidateSnapshotDigest);
+      return allow(ReasonCode.OK, undefined);
+    } catch (error) {
+      if (!isAcpError(error) || error.reasonCode !== ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED) throw error;
+      const named = error.evidence["field"];
+      const field = typeof named === "string" && REFUSED_FIELD_NAME.test(named) ? named : null;
+      const recorded = this.audit.record({
+        kind: "BLIND_REVIEW_STORAGE_REFUSED",
+        runId: packet.runId,
+        sessionId: reviewer.sessionId,
+        roleKey: reviewer.roleKey,
+        reasonCode: error.reasonCode,
+        evidence: {
+          candidateSnapshotDigest: packet.candidateSnapshotDigest,
+          kind: ArtifactKind.BLIND_REVIEW,
+          field,
+          verdict: packet.verdict,
+          findings: packet.findings.length,
+          generation: reviewer.generation,
+          providerSessionId: packet.reviewerProviderSessionId,
+          attemptId: attemptId ?? null,
+        },
+      });
+      return deny(error.reasonCode, error.message, {
+        runId: packet.runId,
+        kind: ArtifactKind.BLIND_REVIEW,
+        field,
+        candidateSnapshotDigest: packet.candidateSnapshotDigest,
+        verdict: packet.verdict,
+        refusalEventId: recorded.allowed ? recorded.value : null,
+      });
+    }
   }
 
   /**
@@ -2026,7 +2070,8 @@ export class BlindReviewGate {
       "# Contract change review",
       "",
       "This run changes the project's contract and joins no repository. Below are the manifest it",
-      "proposes and the base manifest it would replace. The task contract supplies requirements.",
+      "proposes, the base manifest it would replace, the CTO's PLAN, and what ACP read when the candidate",
+      "was frozen. The task contract supplies requirements.",
       "",
       "## Task contract",
       `Goal: ${contract.goal}`,
@@ -2127,7 +2172,10 @@ export class BlindReviewGate {
       ...(input.extraClaims.length === 0 ? {} : { extraClaims: storedExtraClaims(input.extraClaims) }),
       omittedItems: [...new Set(input.raw.omittedItems)],
       verdict: input.raw.verdict,
-      findings: storedFindings(input.raw.findings),
+      // #1254 G-4 — the findings as the reviewer wrote them. The artifact store checks them, like every
+      // other field of the packet, before anything is stored, so a credential in a finding refuses the
+      // review through `storeReview`'s refusal record instead of being rewritten into a stored verdict.
+      findings: [...input.raw.findings],
       chunked: input.chunked,
       ...(input.bootstrapPlan === null ? {} : { bootstrapPlan: input.bootstrapPlan }),
       ...(input.bootstrapPlanIntentDigest === undefined ? {} : { bootstrapPlanIntentDigest: input.bootstrapPlanIntentDigest }),
@@ -2383,9 +2431,10 @@ export class BlindReviewGate {
     }
     // #512 (v45) — or a first activation, judged against the project as it stands now.
     const facts = { runId: run.run_id, kind: run.kind, projectId: run.project_id, pinnedManifestDigest: run.pinned_manifest_digest };
+    const planArtifact = this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN);
     const current = currentContractChangeTarget(
       facts,
-      this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN),
+      planArtifact,
       (digest) => storedManifest(this.db, digest),
       firstActivationFactsOf(this.db, facts),
     );
@@ -2405,6 +2454,9 @@ export class BlindReviewGate {
       workflowEvidence: current.value.workflowEvidence,
       ...(current.value.firstActivation ? { workflowRevisions: current.value.workflowRevisions } : {}),
       target: contractChangeCoverageTarget(run.project_id, current.value.binding),
+      // The binding's PLAN digest is this artifact's: `currentContractChangeTarget` read it from here.
+      plan: planArtifact!.content as Record<string, unknown>,
+      readback: contractChangeReadbackFor(this.db, runId, candidateSnapshotDigest(snapshot)),
     });
   }
 
@@ -2718,6 +2770,88 @@ const contractChangeSection = (change: TrustedContractChange): string[] => [
         "",
       ]
     : []),
+  ...contractChangePlanSection(change),
+  ...contractChangeReadbackSection(change),
+];
+
+/** #1255 — the PLAN fields a CONTRACT_CHANGE reviewer is shown, in this order; its manifest is shown above. */
+const CONTRACT_CHANGE_PLAN_FIELDS = [
+  "summary", "firstActivation", "repositoryContentChange", "risks", "verificationIntent", "repositoryIntent",
+  "knownConflicts", "dependencies", "removedOverengineering", "workflowRevisions", "projectManifestDigest",
+] as const;
+
+/** The size above which a PLAN field that is neither text nor a list of text is not shown. */
+const PLAN_STRUCTURED_FIELD_CHARS = 8_000;
+/** The most the shown PLAN fields take together, as JSON; a field that would pass it is named, not shown. */
+const PLAN_SECTION_CHARS = 24_000;
+
+/**
+ * Why a PLAN field is not shown, or null when it is: text and lists of text within the bootstrap PLAN
+ * intent bounds, anything else within `PLAN_STRUCTURED_FIELD_CHARS` as JSON. Nothing is truncated.
+ */
+const planFieldOverBound = (field: string, value: unknown): string | null => {
+  const bounds = BOOTSTRAP_PLAN_INTENT_BOUNDS;
+  if (typeof value === "string") {
+    return value.length > bounds.summaryChars ? `${field}: ${value.length} characters, bound ${bounds.summaryChars}` : null;
+  }
+  if (Array.isArray(value) && value.every((item) => typeof item === "string")) {
+    if (value.length > bounds.listItems) return `${field}: ${value.length} items, bound ${bounds.listItems}`;
+    const long = (value as string[]).findIndex((item) => item.length > bounds.itemChars);
+    return long < 0 ? null : `${field}[${long}]: ${(value as string[])[long]!.length} characters, bound ${bounds.itemChars}`;
+  }
+  const size = JSON.stringify(value)?.length ?? 0;
+  return size > PLAN_STRUCTURED_FIELD_CHARS ? `${field}: ${size} characters as JSON, bound ${PLAN_STRUCTURED_FIELD_CHARS}` : null;
+};
+
+/** #1255 — the stored PLAN, labelled as its CTO's account; a field over its bound is named, never cut. */
+const contractChangePlanSection = (change: TrustedContractChange): string[] => {
+  const shown: Record<string, unknown> = {};
+  const overBound: string[] = [];
+  for (const field of CONTRACT_CHANGE_PLAN_FIELDS) {
+    if (!Object.hasOwn(change.plan, field)) continue;
+    const over = planFieldOverBound(field, change.plan[field]);
+    if (over !== null) {
+      overBound.push(over);
+      continue;
+    }
+    const size = JSON.stringify({ ...shown, [field]: change.plan[field] }, null, 2).length;
+    if (size > PLAN_SECTION_CHARS) overBound.push(`${field}: the PLAN section would be ${size} characters, bound ${PLAN_SECTION_CHARS}`);
+    else shown[field] = change.plan[field];
+  }
+  const listed = new Set<string>([...CONTRACT_CHANGE_PLAN_FIELDS, "projectManifest"]);
+  const other = Object.keys(change.plan).filter((key) => !listed.has(key)).sort();
+  return [
+    "### The CTO's PLAN",
+    `The PLAN artifact this candidate names (digest ${change.binding.planDigest}), written by the run's CTO. Each field`,
+    "below is exactly as stored. It is the CTO's account of the change: ACP has not verified what it states.",
+    "Its projectManifest is the proposed manifest shown above.",
+    "```json",
+    JSON.stringify(shown, null, 2),
+    "```",
+    `Not shown, over the packet bound (not truncated): ${overBound.length === 0 ? "none" : overBound.join("; ")}`,
+    ...(other.length === 0 ? [] : [`Other PLAN fields, not shown: ${other.join(", ")}`]),
+    "",
+  ];
+};
+
+/** #1255 — what ACP read when the candidate was frozen, or that nothing was stored for it. */
+const contractChangeReadbackSection = (change: TrustedContractChange): string[] => [
+  "### ACP readback at the candidate's freeze",
+  ...(change.readback.status === "MISSING"
+    ? [`MISSING: ACP stored no readback for this candidate: ${change.readback.reason}. The project, repository and workflow readback is not available.`, ""]
+    : [
+        `Read by ACP at this candidate's latest freeze (${change.readback.context.freezeId}, ${change.readback.context.capturedAt}) and bound to candidate`,
+        `${change.readback.context.candidateSnapshotDigest}; not written by the CTO. For each repository, driftState, lastObservedHead and`,
+        "lastObservedAt are the registry's stored values; checkout is the registered checkout as ACP read it then, and its",
+        "observedDriftState and observedDriftCauses are the drift ACP recomputed from that read against its acceptedHead, the",
+        "registry head the inspection read, and what it rested on. For",
+        "each bound workflow revision, read is the exact local read of that commit's file with replacement objects off;",
+        "ABSENT means the object was not in the checkout and was not read another way.",
+        "```json",
+        JSON.stringify(change.readback.context, null, 2),
+        "```",
+        "",
+      ]),
 ];
 
 /** What a CONTRACT_CHANGE review records it judged: the binding, the workflows, and a first activation's revisions. */
