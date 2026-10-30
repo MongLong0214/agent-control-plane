@@ -1219,7 +1219,10 @@ export class BlindReviewGate {
       const refusedImports = new Map((repo.refusedImports ?? []).map((entry) => [entry.path, entry]));
       for (const section of diff.split(/(?=^diff --git )/m).filter(Boolean)) {
         if (!section.includes("GIT binary patch")) continue;
-        const path = /^diff --git a\/(.+?) b\//m.exec(section)?.[1];
+        // Review lane-e-fs-r7 E5 — a renamed or copied pair's patch writes its destination, the path an
+        // import is declared at and the one git lists as changed; its `a/` path is the source.
+        const header = section.slice(0, section.indexOf("GIT binary patch"));
+        const path = /^(?:rename|copy) to (.+)$/m.exec(header)?.[1] ?? /^diff --git a\/(.+?) b\//m.exec(section)?.[1];
         if (!path || !repo.touchedPaths.includes(path)) {
           return deny(ReasonCode.EVIDENCE_MISSING, "binary patch cannot be bound to a touched path", {
             identity: repo.identity,

@@ -424,4 +424,45 @@ describe("#1232 freeze and blind review carry a task's import manifest", () => {
     expect(packet!.inputManifest.binaryArtifacts.map(({ repository, path, method }) => ({ repository, path, method })))
       .toEqual([{ repository: identity, path: "src/tool.bin", method: "git-binary-patch" }]);
   }, 120_000);
+
+  /** Inert lines behind one NUL byte: binary to git, and the source git pairs a near copy of them with. */
+  const INERT_LINES = Array.from({ length: 100 }, (_, index) => `inert line ${index + 1}\n`).join("");
+  const COPIES = { base: { "src/old.dat": `\0${INERT_LINES}` }, worker: [{ path: "src/old.dat", bytes: Buffer.from(`\0${INERT_LINES}one more\n`) }], config: [["diff.renames", "copies"]] } as const;
+
+  it("W12d an imported text file git pairs as a copy of a binary file reaches the reviewer as its readable content (review lane-e-fs-r7 E5)", async () => {
+    // The reviewer's repro: a 98% copy of a binary base file, imported as text with the inert marker.
+    const marker = INERT_MARKER.toString("ascii");
+    const files = [{ path: "src/imported.js", bytes: Buffer.from(`${INERT_LINES}${marker}\n`) }];
+
+    const { outcome, reviewerInput, snapshot, packet, identity } = await reviewImports(files, COPIES);
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    expect(reviewerInput).toContain("copy to src/imported.js");
+    // Text: neither bound nor refused, and every line of it is in the prompt.
+    expect(snapshot!.repositories[0]).not.toHaveProperty("imports");
+    expect(snapshot!.repositories[0]).not.toHaveProperty("refusedImports");
+    expect(reviewerInput).toContain(`+${marker}`);
+    expect(reviewerInput).toContain("+inert line 1\n+inert line 2\n");
+    // The copy's binary patch is the destination's, and the source's own change is its own.
+    expect(packet!.inputManifest.binaryArtifacts.map(({ repository, path, method }) => ({ repository, path, method }))).toEqual([
+      { repository: identity, path: "src/imported.js", method: "git-binary-patch" },
+      { repository: identity, path: "src/old.dat", method: "git-binary-patch" },
+    ]);
+  }, 120_000);
+
+  it("W12e a refused binary import git pairs as a copy is recorded at its own path with its refusal, not at the copy's source (review lane-e-fs-r7 E5, blind-review section path)", async () => {
+    const files = [{ path: "src/imported.dat", bytes: Buffer.from(`\0${INERT_LINES}${INERT_MARKER.toString("ascii")}\n`) }];
+
+    const { outcome, snapshot, packet, imports, taskId } = await reviewImports(files, COPIES);
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    const refused = snapshot!.repositories[0]!.refusedImports;
+    expect(refused?.map((entry) => entry.path)).toEqual(["src/imported.dat"]);
+    expect(packet!.inputManifest.binaryArtifacts.map((artifact) => [artifact.path, artifact.importInspection?.result ?? null])).toEqual([
+      ["src/imported.dat", `refused: ${refused![0]!.reason}`],
+      ["src/old.dat", null],
+    ]);
+    expect(packet!.inputManifest.binaryArtifacts[0]!.importInspection).toMatchObject({ size: imports[0]!.size, sha256: imports[0]!.sha256 });
+    expect(taskId).toBe(refused![0]!.taskId);
+  }, 120_000);
 });

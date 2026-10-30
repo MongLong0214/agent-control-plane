@@ -454,20 +454,29 @@ const sectionHeader = (section: string): string => {
   return body === null ? section : section.slice(0, body.index);
 };
 
+/** The two ids an `index <old>..<new>` header line names; a side that does not exist is all zeros. */
+const indexIds = (header: string): string[] => /^index ([0-9a-f]+)\.\.([0-9a-f]+)/m.exec(header)?.slice(1) ?? [];
+
 /** The blob ids an `index <old>..<new>` header line names, less the all-zero id of a side that does not exist. */
-const headerBlobs = (header: string): string[] =>
-  (/^index ([0-9a-f]+)\.\.([0-9a-f]+)/m.exec(header)?.slice(1) ?? []).filter((id) => !/^0+$/.test(id));
+const headerBlobs = (header: string): string[] => indexIds(header).filter((id) => !/^0+$/.test(id));
 
 /**
- * Whether git's content check reads a blob as text. A blob larger than `GIT_OUTPUT_MAX_BYTES` is not
+ * For a blob git's content check reads as text, the bytes its lines take in a patch that adds it (each
+ * line gains its `+`); null for one it reads as binary. A blob larger than `GIT_OUTPUT_MAX_BYTES` is not
  * read: its text could not pass through this wrapper, so it is left as git rendered it.
  */
-const blobIsText = async (cwd: string, id: string): Promise<boolean> => {
+const textPatchBytes = async (cwd: string, id: string): Promise<number | null> => {
   const size = Number((await git(cwd, ["--no-replace-objects", "cat-file", "-s", id], { allowFailure: true })).stdout.trim());
-  if (!Number.isSafeInteger(size) || size > GIT_OUTPUT_MAX_BYTES) return false;
+  if (!Number.isSafeInteger(size) || size > GIT_OUTPUT_MAX_BYTES) return null;
   const bytes = await readBlob(cwd, id);
-  return bytes !== null && !gitReadsAsBinary(bytes);
+  if (bytes === null || gitReadsAsBinary(bytes)) return null;
+  let lines = 1;
+  for (let at = bytes.indexOf(0x0a); at !== -1; at = bytes.indexOf(0x0a, at + 1)) lines += 1;
+  return bytes.length + lines;
 };
+
+/** The tree with no entries, in the object format of `id`: what a file is diffed from to show it whole. */
+const emptyTreeLike = (id: string): string => createHash(id.length === 64 ? "sha256" : "sha1").update("tree 0\0").digest("hex");
 
 /**
  * Review lane-e-fs-r6 P1 (#1232) — the patch with every section git rendered as a binary patch only
@@ -484,26 +493,47 @@ const blobIsText = async (cwd: string, id: string): Promise<boolean> => {
  * whole patch. Each replacement has the replaced section's header line for line; a section with no
  * such counterpart refuses the patch rather than leave the text unreadable. The result is still at most
  * `GIT_OUTPUT_MAX_BYTES`, like every patch read through this wrapper.
+ *
+ * Review lane-e-fs-r7 E5 — a section that pairs a text candidate blob with a binary one (a copy or a
+ * rename git detected from binary content, or a binary file the candidate made text) is a binary patch
+ * whatever the attributes say, and an every-blob-is-text rule never reaches it. That section is kept as
+ * git wrote it, so its binary side stays its binary patch, and the candidate's text follows it whole, as
+ * git shows that file added (from the empty tree, `--text`), independent of what git paired it with. A
+ * section with no such text refuses the patch, and so does text that would take the patch past
+ * `GIT_OUTPUT_MAX_BYTES`. A section whose candidate blob is binary keeps git's binary patch alone: its
+ * text side, if any, is base content.
  */
 const withTextRenderedAsText = async (cwd: string, base: string, head: string, pathspec: readonly string[], patch: string): Promise<string> => {
   const sections = patchSections(patch);
   const textBlobs = new Set<string>();
   const hidden = new Set<string>();
-  const checked = new Map<string, boolean>();
+  /** `<old>..<new>` of each section pairing a binary blob with a text candidate blob, and that text's patch bytes. */
+  const besideBinary = new Map<string, number>();
+  const checked = new Map<string, number | null>();
   for (const section of sections) {
     if (!BINARY_BODY.test(section)) continue;
-    const blobs = headerBlobs(sectionHeader(section));
-    for (const id of blobs) if (!checked.has(id)) checked.set(id, await blobIsText(cwd, id));
-    if (blobs.length === 0 || !blobs.every((id) => checked.get(id) === true)) continue;
-    hidden.add(sectionHeader(section));
-    for (const id of blobs) textBlobs.add(id);
+    const header = sectionHeader(section);
+    const blobs = headerBlobs(header);
+    for (const id of blobs) if (!checked.has(id)) checked.set(id, await textPatchBytes(cwd, id));
+    if (blobs.length === 0) continue;
+    if (blobs.every((id) => checked.get(id) != null)) {
+      hidden.add(header);
+      for (const id of blobs) textBlobs.add(id);
+      continue;
+    }
+    const [oldId = "", newId = ""] = indexIds(header);
+    const text = checked.get(newId);
+    if (blobs.length === 2 && text != null) besideBinary.set(`${oldId}..${newId}`, text);
   }
-  if (hidden.size === 0) return patch;
+  if (hidden.size === 0 && besideBinary.size === 0) return patch;
 
   // The file pairs behind those sections, in raw form so each path is exact (NUL-separated, unquoted).
   const raw = (await git(cwd, ["diff", "--raw", "-z", "--no-abbrev", ...PATCH_WITHOUT_PROGRAMS, `${base}..${head}`, ...pathspec])).stdout.split("\0");
   const unpaired: string[] = [];
   const paired: string[][] = [];
+  /** For each `besideBinary` pair, the candidate path of each file pair git wrote with it, in git's order. */
+  const candidatePaths = new Map<string, string[]>();
+  let besideBinaryBytes = 0;
   for (let at = 0; at < raw.length; ) {
     const meta = raw[at] ?? "";
     if (!meta.startsWith(":")) {
@@ -514,13 +544,24 @@ const withTextRenderedAsText = async (cwd: string, base: string, head: string, p
     const count = /^[RC]/.test(status) ? 2 : 1;
     const paths = raw.slice(at + 1, at + 1 + count);
     at += 1 + count;
+    const pair = `${oldBlob}..${newBlob}`;
+    const text = besideBinary.get(pair);
+    const candidatePath = paths.at(-1);
+    if (text !== undefined && candidatePath !== undefined) {
+      candidatePaths.set(pair, [...(candidatePaths.get(pair) ?? []), candidatePath]);
+      besideBinaryBytes += text;
+    }
     if (!textBlobs.has(oldBlob) && !textBlobs.has(newBlob)) continue;
     if (count === 2) paired.push(paths);
     else unpaired.push(...paths);
   }
-  const textRead = async (renames: boolean, paths: readonly string[]): Promise<string> =>
+  // Each text shown beside its binary pair adds at least its lines; past the cap it cannot be shown.
+  if (Buffer.byteLength(patch) + besideBinaryBytes > GIT_OUTPUT_MAX_BYTES) {
+    return fail(ReasonCode.EVIDENCE_MISSING, `the patch with the text git pairs with binary content shown as text exceeds ${GIT_OUTPUT_MAX_BYTES} bytes`, { cwd, base, head });
+  }
+  const textRead = async (renames: boolean, paths: readonly string[], range: readonly string[] = [`${base}..${head}`]): Promise<string> =>
     (await git(cwd, [
-      "diff", "--no-color", ...PATCH_WITHOUT_PROGRAMS, "--full-index", "--binary", "--text", ...(renames ? [] : ["--no-renames"]), `${base}..${head}`,
+      "diff", "--no-color", ...PATCH_WITHOUT_PROGRAMS, "--full-index", "--binary", "--text", ...(renames ? [] : ["--no-renames"]), ...range,
       "--", ...paths.map((path) => `:(top,literal)${path}`),
     ])).stdout;
   const rendered = new Map<string, string>();
@@ -530,10 +571,36 @@ const withTextRenderedAsText = async (cwd: string, base: string, head: string, p
   for (const output of outputs) {
     for (const section of patchSections(output)) if (!BINARY_BODY.test(section)) rendered.set(sectionHeader(section), section);
   }
+  /** Each candidate text shown beside its binary pair: the file as git shows it added, one section naming exactly that blob. */
+  const wholeText = new Map<string, string[]>();
+  for (const [pair, paths] of candidatePaths) {
+    const newId = pair.slice(pair.indexOf("..") + 2);
+    for (const path of paths) {
+      const added = patchSections(await textRead(false, [path], [emptyTreeLike(newId), head]));
+      const [section] = added;
+      if (added.length !== 1 || section === undefined || BINARY_BODY.test(section) || headerBlobs(sectionHeader(section)).join() !== newId) {
+        return fail(ReasonCode.EVIDENCE_MISSING, "a text file git pairs with binary content could not be shown as text, so its content cannot be reviewed", {
+          cwd, base, head, path: path.slice(0, 400),
+        });
+      }
+      wholeText.set(pair, [...(wholeText.get(pair) ?? []), section]);
+    }
+  }
 
   const shown = sections.map((section) => {
     const header = sectionHeader(section);
-    if (!BINARY_BODY.test(section) || !hidden.has(header)) return section;
+    if (!BINARY_BODY.test(section)) return section;
+    if (!hidden.has(header)) {
+      const pair = indexIds(header).join("..");
+      if (!besideBinary.has(pair)) return section;
+      const text = wholeText.get(pair)?.shift();
+      if (text === undefined) {
+        return fail(ReasonCode.EVIDENCE_MISSING, "a text file git pairs with binary content has no text rendering, so its content cannot be reviewed", {
+          cwd, base, head, header: header.slice(0, 400),
+        });
+      }
+      return section + text;
+    }
     const text = rendered.get(header);
     if (text === undefined) {
       return fail(ReasonCode.EVIDENCE_MISSING, "a text file git renders as a binary patch could not be rendered as text, so its content cannot be reviewed", {
@@ -551,7 +618,8 @@ const withTextRenderedAsText = async (cwd: string, base: string, head: string, p
 /**
  * The exact patch between two commits: the bytes the freeze digests and the blind reviewer reads,
  * so what is reviewed is what was frozen. Text is shown as text whatever the repository's attributes
- * say (`withTextRenderedAsText`); binary content stays git's binary patch.
+ * say or whatever binary content git pairs it with (`withTextRenderedAsText`); binary content stays
+ * git's binary patch.
  *
  * #1232 — `withheld` names files the candidate snapshot binds by blob and sha256 instead (a task's
  * imported files): each is left out of the patch by an exact, literal, root-relative pathspec, so
