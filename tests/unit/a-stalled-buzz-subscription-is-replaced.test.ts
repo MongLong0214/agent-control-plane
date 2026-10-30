@@ -130,13 +130,15 @@ const start = async (ctos: readonly CtoSpec[] = ONE_CTO, options: { readonly ceo
   h.clock.advance(1_000);
   const openedAt = nowSeconds();
   const stalls: BuzzMentionStallReport[] = [];
-  const subscriber = startDaemonBuzzMentionSubscriber(h.cp, dir, policy, { seam }, {
+  const startSubscriber = () => startDaemonBuzzMentionSubscriber(h.cp, dir, policy, { seam }, {
     // The configured relay is a `wss` address; the socket dials the local server instead.
     openSocket: (_url, handlers) => nativeRelaySocketFactory(relay.url, handlers),
     scheduler,
     reportAdmission: () => undefined,
     reportStall: (report) => stalls.push(report),
   });
+  // Replaced by `restart`: a new subscriber over the same control plane, with nothing in memory.
+  let subscriber = startSubscriber();
 
   /** Lets the sockets and the subscriber's frame queue run for a moment. */
   const settle = async (): Promise<void> => {
@@ -167,7 +169,21 @@ const start = async (ctos: readonly CtoSpec[] = ONE_CTO, options: { readonly ceo
   return {
     h,
     relay,
-    subscriber,
+    get subscriber() {
+      return subscriber;
+    },
+    /**
+     * The daemon restarts: this subscriber is closed, `downForMs` passes, and a new one starts over
+     * the same control plane and database, holding nothing the old one kept in memory.
+     */
+    restart: async (downForMs = 0): Promise<void> => {
+      subscriber.close();
+      timers.clear();
+      h.clock.advance(downForMs);
+      const before = relay.connections.length;
+      subscriber = startSubscriber();
+      await waitFor("the restarted subscription", () => relay.connections.slice(before).filter((one) => one.requests.length >= 1).length === liveCtos);
+    },
     wakes,
     stalls,
     openedAt,
@@ -313,7 +329,8 @@ describe("a Buzz subscription that stops being answered on an open connection (#
       // The replacement's own EOSE is not the end of the outage; the next probe coming back clean is.
       expect(f.liveness()?.identities[0]).toMatchObject({ state: "STALE", outageSinceSeconds: f.stalls[0]!.outageSinceSeconds });
       await f.tick();
-      await f.waitFor("a clean probe on the replacement", () => f.relay.connections[1]!.closes.length === 1);
+      // Its head check, then its sweep's page, both answered and clean.
+      await f.waitFor("a clean probe on the replacement", () => f.relay.connections[1]!.closes.length === 2);
       expect(f.liveness()?.identities[0]).toMatchObject({ state: "LIVE", stalls: 1, lastStall: { cause: "UNANSWERED" }, outageSinceSeconds: null });
       // And the role message is the one the holder's claim hands over.
       expect(f.completeNextOwnerMessage()).toBe("두 번째 답장");
@@ -355,12 +372,13 @@ describe("a Buzz subscription that stops being answered on an open connection (#
       const connection = f.relay.connections[0]!;
       for (let tick = 0; tick < 6; tick += 1) {
         await f.tick();
-        await f.waitFor(`probe ${tick + 1} answered and closed`, () => connection.closes.length === tick + 1);
+        // Each tick's head check, and the sweep's page that follows it.
+        await f.waitFor(`probe ${tick + 1} answered and closed`, () => connection.closes.length === 2 * (tick + 1));
       }
 
       expect(f.relay.connections).toHaveLength(1);
       const probes = connection.requests.slice(1);
-      expect(probes).toHaveLength(6);
+      expect(probes).toHaveLength(12);
       // The subscription's own two filters, from the probe's floor: the window its first backlog's
       // durable answers left, here nothing at all. One page each, bounded by the page limit.
       expect(probes[0]!.filters).toEqual([
@@ -415,7 +433,7 @@ describe("a Buzz subscription that stops being answered on an open connection (#
       // Answered is not yet delivering: the outage ends when a probe on it comes back clean.
       expect(d.healthLiveness()).toMatchObject({ staleIdentities: 1, identities: [{ state: "STALE", stalls: 2 }] });
       await f.tick();
-      await f.waitFor("a clean probe on the third connection", () => f.relay.connections[2]!.closes.length === 1);
+      await f.waitFor("a clean probe on the third connection", () => f.relay.connections[2]!.closes.length === 2);
       expect(await d.staleFindings()).toEqual([]);
       expect(d.healthLiveness()).toMatchObject({ staleIdentities: 0, identities: [{ state: "LIVE", stalls: 2 }] });
       // One outage, one report, however many connections it took.
@@ -523,7 +541,7 @@ describe("a stalled Buzz subscription's recovery, under the probe's review (#128
       expect(f.subscriber.counters().rejections["admission-already-durable"]).toBe(1);
 
       await f.tick();
-      await f.waitFor("a clean probe on the replacement", () => f.relay.connections[1]!.closes.length === 1);
+      await f.waitFor("a clean probe on the replacement", () => f.relay.connections[1]!.closes.length === 2);
       expect(f.liveness()?.identities[0]).toMatchObject({ state: "LIVE", stalls: 1, outageSinceSeconds: null });
     } finally {
       await f.close();
@@ -578,7 +596,8 @@ describe("a stalled Buzz subscription's recovery, under the probe's review (#128
       const connection = f.relay.connections[0]!;
       for (let tick = 0; tick < 3; tick += 1) {
         await f.tick();
-        await f.waitFor(`probe ${tick + 1} answered and closed`, () => connection.closes.length === tick + 1);
+        // Its head check and its sweep's page.
+        await f.waitFor(`probe ${tick + 1} answered and closed`, () => connection.closes.length === 2 * (tick + 1));
       }
       expect(f.stalls).toEqual([]);
 
@@ -648,7 +667,7 @@ describe("a stalled Buzz subscription's recovery, under the probe's review (#128
       f.fireTimers();
       await f.waitFor("an answered fourth connection", () => f.relay.connections[3]?.requests.length === 1);
       await f.tick();
-      await f.waitFor("a clean probe on it", () => f.relay.connections[3]!.closes.length === 1);
+      await f.waitFor("a clean probe on it", () => f.relay.connections[3]!.closes.length === 2);
       expect(f.liveness()?.identities[0]).toMatchObject({ state: "LIVE", stalls: 3, outageSinceSeconds: null });
       expect(f.ceoNotices()).toEqual([first]);
 
@@ -674,13 +693,31 @@ describe("a stalled Buzz subscription's recovery, under the probe's review (#128
 /** The control plane's clock, in the whole seconds the subscriber reads. */
 const nowSeconds = (f: Awaited<ReturnType<typeof start>>): number => Math.floor(f.h.clock.now().getTime() / 1000);
 
-/** One tick, then until its probe page has been answered (or a stall found). */
+/** Stalls found so far, across identities and outages: `stalls` holds an outage's first one only. */
+const stallCount = (f: Awaited<ReturnType<typeof start>>): number =>
+  (f.liveness()?.identities ?? []).reduce((sum, one) => sum + one.stalls, 0);
+
+/**
+ * One tick, then until every probe it sent has been answered and closed (or a stall found). A tick's
+ * probe may be followed by another once it is answered, so this waits for the connection to go quiet.
+ */
 const probeTick = async (f: Awaited<ReturnType<typeof start>>, label: string): Promise<void> => {
   const connection = f.relay.connections.at(-1)!;
   const closes = connection.closes.length;
-  const stalls = f.stalls.length;
+  const stalls = stallCount(f);
   await f.tick();
-  await f.waitFor(label, () => connection.closes.length > closes || f.stalls.length > stalls, 10_000);
+  const quiet = (): boolean => connection.closes.length > closes && connection.closes.length === connection.requests.length - 1;
+  await f.waitFor(label, () => quiet() || stallCount(f) > stalls, 10_000);
+  await f.waitFor(label, () => quiet() || stallCount(f) > stalls, 10_000);
+};
+
+/** The probe pages of one connection's historical sweeps, oldest first: not its head checks. */
+const sweepPages = (connection: { readonly requests: readonly { readonly id: string; readonly filters: readonly Record<string, unknown>[] }[] }) =>
+  connection.requests.filter((one) => /^live-[0-9a-f]+-s\d+$/u.test(one.id));
+
+/** Moves the control plane's clock to `second`. */
+const jumpTo = (f: Awaited<ReturnType<typeof start>>, second: number): void => {
+  f.h.clock.advance((second - nowSeconds(f)) * 1000);
 };
 
 describe("a stalled Buzz subscription's evidence, under the probe's second review (#1283)", () => {
@@ -701,7 +738,7 @@ describe("a stalled Buzz subscription's evidence, under the probe's second revie
       // an evicted id. The probe pages back past the 257 and finds A undelivered.
       for (let tick = 0; tick < 4 && f.stalls.length === 0; tick += 1) await probeTick(f, `probe ${tick + 1} answered`);
       expect(f.stalls).toEqual([expect.objectContaining({ cause: "MISSED_EVENTS" })]);
-      expect(f.relay.connections[0]!.requests.slice(1).map((one) => one.filters[0]!["until"])).toEqual([undefined, skipped.created_at + 58]);
+      expect(sweepPages(f.relay.connections[0]!).map((one) => one.filters[0]!["until"])).toEqual([undefined, skipped.created_at + 58]);
 
       f.fireTimers();
       await f.waitFor("the skipped mention admitted", () => f.inboundFor(skipped.id).length === 1, 30_000);
@@ -738,8 +775,9 @@ describe("a stalled Buzz subscription's evidence, under the probe's second revie
 
       for (let tick = 0; tick < 4 && f.stalls.length === 0; tick += 1) await probeTick(f, `late probe ${tick + 1} answered`);
       expect(f.stalls).toEqual([expect.objectContaining({ cause: "MISSED_EVENTS" })]);
-      // The probe asked from a day back, the lookback guarantee, not from ten minutes back.
-      expect(connection.requests.at(-1)!.filters[0]).toMatchObject({ since: nowSeconds(f) - LIVENESS_PROBE_LOOKBACK_GUARANTEE_SECONDS });
+      // The probe asked from a day before the last clean sweep began (the previous tick), the lookback
+      // guarantee, not from ten minutes back.
+      expect(connection.requests.at(-1)!.filters[0]).toMatchObject({ since: nowSeconds(f) - 30 - LIVENESS_PROBE_LOOKBACK_GUARANTEE_SECONDS });
       f.fireTimers();
       await f.waitFor("the late mention admitted", () => f.inboundFor(late.id).length === 1);
       expect(f.inboundFor(late.id)).toHaveLength(1);
@@ -791,6 +829,31 @@ describe("a stalled Buzz subscription's evidence, under the probe's second revie
   });
 });
 
+/** A 90-second outage on the current connection, then a replacement whose sweep comes back clean. */
+const outageAndRecovery = async (f: Awaited<ReturnType<typeof start>>, label: string): Promise<void> => {
+  const stalls = f.stalls.length;
+  const connections = f.relay.connections.length;
+  f.relay.connections.at(-1)!.silent = true;
+  for (let tick = 0; tick < 3; tick += 1) await f.tick();
+  expect(f.stalls).toHaveLength(stalls + 1);
+  expect(f.liveness()?.identities[0]).toMatchObject({ state: "STALE" });
+  f.fireTimers();
+  await f.waitFor(`${label}: an answered replacement`, () => f.relay.connections[connections]?.requests.length === 1);
+  await probeTick(f, `${label}: a clean sweep on it`);
+  expect(f.liveness()?.identities[0]).toMatchObject({ state: "LIVE", outageSinceSeconds: null });
+};
+
+/** The CEO notice an outage's report is owed. */
+const noticeOf = (report: BuzzMentionStallReport) => ({
+  runId: null,
+  payload: expect.objectContaining({
+    notification: "CRITICAL_SYSTEM_FAILURE",
+    code: STALE,
+    identity: report.identity,
+    outageSinceSeconds: report.outageSinceSeconds,
+  }),
+});
+
 /**
  * The third review of the probe (#1283, lane-n-fs-r3): a second a page cannot get past, a floor
  * moved past a mention not yet published, and an outage's notice dropped by its recovery.
@@ -812,15 +875,15 @@ describe("a stalled Buzz subscription's evidence, under the probe's third review
       expect(f.inboundFor(hidden.id)).toHaveLength(0);
 
       for (let tick = 0; tick < 6 && f.stalls.length === 0; tick += 1) await probeTick(f, `probe ${tick + 1} answered`);
-      // The sweep could not get past that second, so it is not clean: the identity is STALE and
-      // replaced, asking from that second.
+      // The sweep could not get past that second, so it is not clean: it went on below it, and at its
+      // floor the identity is STALE and replaced, asking from that floor.
       expect(f.stalls).toEqual([expect.objectContaining({ cause: "UNCERTIFIED" })]);
       expect(f.liveness()?.identities[0]).toMatchObject({ state: "STALE", outageSinceSeconds: f.stalls[0]!.outageSinceSeconds });
-      const connection = f.relay.connections[0]!;
-      expect(connection.requests.slice(1).map((one) => one.filters[0]!["until"])).toEqual([undefined, hidden.created_at]);
+      const pages = sweepPages(f.relay.connections[0]!);
+      expect(pages.map((one) => one.filters[0]!["until"])).toEqual([undefined, hidden.created_at, hidden.created_at - 1]);
       f.fireTimers();
       await f.waitFor("the hidden mention admitted", () => f.inboundFor(hidden.id).length === 1, 30_000);
-      expect(f.relay.connections[1]!.requests[0]!.filters[0]).toMatchObject({ since: hidden.created_at });
+      expect(f.relay.connections[1]!.requests[0]!.filters[0]).toMatchObject({ since: pages[0]!.filters[0]!["since"] });
       expect(f.ownerMessages()).toBe(LIVENESS_PROBE_PAGE_LIMIT + 1);
       expect(f.wakes.filter((id) => id === hidden.id)).toHaveLength(1);
     } finally {
@@ -841,7 +904,8 @@ describe("a stalled Buzz subscription's evidence, under the probe's third review
       await probeTick(f, "a clean sweep");
       expect(f.stalls).toEqual([]);
       const connection = f.relay.connections[0]!;
-      expect(connection.closes).toHaveLength(1);
+      // Its head check and the sweep's one page.
+      expect(connection.closes).toHaveLength(2);
 
       // The older mention reaches the relay only now, while the live push has stopped.
       connection.noLivePush = true;
@@ -851,8 +915,8 @@ describe("a stalled Buzz subscription's evidence, under the probe's third review
 
       for (let tick = 0; tick < 4 && f.stalls.length === 0; tick += 1) await probeTick(f, `late probe ${tick + 1} answered`);
       expect(f.stalls).toEqual([expect.objectContaining({ cause: "MISSED_EVENTS" })]);
-      // The probe asked from a day back, not from the newer admission.
-      expect(connection.requests.at(-1)!.filters[0]).toMatchObject({ since: nowSeconds(f) - LIVENESS_PROBE_LOOKBACK_GUARANTEE_SECONDS });
+      // The probe asked from a day before the clean sweep began, not from the newer admission.
+      expect(connection.requests.at(-1)!.filters[0]).toMatchObject({ since: nowSeconds(f) - 30 - LIVENESS_PROBE_LOOKBACK_GUARANTEE_SECONDS });
       f.fireTimers();
       await f.waitFor("the early mention admitted", () => f.inboundFor(early.id).length === 1);
       expect(f.relay.connections[1]!.requests[0]!.filters[0]).toMatchObject({ since: early.created_at });
@@ -861,29 +925,6 @@ describe("a stalled Buzz subscription's evidence, under the probe's third review
     } finally {
       await f.close();
     }
-  });
-
-  /** A 90-second outage on the current connection, then a replacement whose sweep comes back clean. */
-  const outageAndRecovery = async (f: Awaited<ReturnType<typeof start>>, label: string): Promise<void> => {
-    const stalls = f.stalls.length;
-    const connections = f.relay.connections.length;
-    f.relay.connections.at(-1)!.silent = true;
-    for (let tick = 0; tick < 3; tick += 1) await f.tick();
-    expect(f.stalls).toHaveLength(stalls + 1);
-    expect(f.liveness()?.identities[0]).toMatchObject({ state: "STALE" });
-    f.fireTimers();
-    await f.waitFor(`${label}: an answered replacement`, () => f.relay.connections[connections]?.requests.length === 1);
-    await probeTick(f, `${label}: a clean sweep on it`);
-    expect(f.liveness()?.identities[0]).toMatchObject({ state: "LIVE", outageSinceSeconds: null });
-  };
-  const noticeOf = (report: BuzzMentionStallReport) => ({
-    runId: null,
-    payload: expect.objectContaining({
-      notification: "CRITICAL_SYSTEM_FAILURE",
-      code: STALE,
-      identity: report.identity,
-      outageSinceSeconds: report.outageSinceSeconds,
-    }),
   });
 
   it("keeps an outage's refused notice owed after it recovers, and enqueues it once when a CEO is bound", async () => {
@@ -916,6 +957,190 @@ describe("a stalled Buzz subscription's evidence, under the probe's third review
       bindCeo(f.h);
       for (let tick = 0; tick < 3; tick += 1) await f.tick();
       expect(f.ceoNotices()).toEqual([noticeOf(f.stalls[0]!), noticeOf(f.stalls[1]!)]);
+    } finally {
+      await f.close();
+    }
+  });
+});
+
+/**
+ * The fourth review of the probe (#1283, lane-n-fs-r4): a saturated second that kept an older
+ * mention out of reach, a lookback measured from the probe rather than from publication, a sweep
+ * through history that kept a current stall from being seen, and an owed notice kept in memory only.
+ */
+describe("a stalled Buzz subscription's evidence, under the probe's fourth review (#1283)", () => {
+  it("pages past a second holding more than a page, so an older mention the push skipped is still found", async () => {
+    const f = await start();
+    try {
+      // A is signed; a full page of mentions follows one second later, all pushed and admitted.
+      const older = f.mention("포화된 초보다 먼저 서명된 답장");
+      f.h.clock.advance(1_000);
+      const second = nowSeconds(f);
+      for (let n = 0; n < LIVENESS_PROBE_PAGE_LIMIT; n += 1) f.relay.publish(f.mention(`한 초에 몰린 답장 ${n}`));
+      await f.waitFor("the mentions admitted", () => f.ownerMessages() === LIVENESS_PROBE_PAGE_LIMIT, 30_000);
+      // Then A is stored, and never pushed.
+      f.relay.publish(older, { push: false });
+      await f.settle();
+      expect(f.inboundFor(older.id)).toHaveLength(0);
+
+      // The sweep pages from the newest, asks the saturated second again, and goes on below it to A.
+      for (let tick = 0; tick < 4 && f.stalls.length === 0; tick += 1) await probeTick(f, `probe ${tick + 1} answered`);
+      expect(f.stalls).toEqual([expect.objectContaining({ cause: "MISSED_EVENTS" })]);
+      const first = f.relay.connections[0]!;
+      expect(sweepPages(first).map((one) => one.filters[0]!["until"])).toEqual([undefined, second, second - 1]);
+      f.fireTimers();
+      await f.waitFor("the older mention admitted", () => f.inboundFor(older.id).length === 1, 30_000);
+      expect(f.relay.connections[1]!.requests[0]!.filters[0]).toMatchObject({ since: older.created_at });
+      expect(f.wakes.filter((id) => id === older.id)).toHaveLength(1);
+      expect(f.ownerMessages()).toBe(LIVENESS_PROBE_PAGE_LIMIT + 1);
+
+      // The saturated second still cannot be shown delivered: the next sweep pages past it again,
+      // finds nothing missed, and ends UNCERTIFIED. The identity stays STALE, and its replacement
+      // asks from that sweep's floor, not from the saturated second.
+      const stalls = stallCount(f);
+      for (let tick = 0; tick < 6 && stallCount(f) === stalls; tick += 1) await probeTick(f, `replacement probe ${tick + 1} answered`);
+      expect(f.liveness()?.identities[0]).toMatchObject({ state: "STALE", lastStall: { cause: "UNCERTIFIED" } });
+      const floor = sweepPages(f.relay.connections[1]!).at(-1)!.filters[0]!["since"] as number;
+      expect(floor).toBeLessThan(second);
+      f.fireTimers();
+      await f.waitFor("a third connection", () => f.relay.connections[2]?.requests.length === 1, 30_000);
+      expect(f.relay.connections[2]!.requests[0]!.filters[0]).toMatchObject({ since: floor });
+      expect(f.inboundFor(older.id)).toHaveLength(1);
+    } finally {
+      await f.close();
+    }
+  }, 120_000);
+
+  it("finds a mention published 86,399 s after it was signed, while live push is stopped", async () => {
+    const f = await start();
+    try {
+      const early = f.mention("서명하고 하루에서 1초 모자라게 게시된 답장");
+      f.h.clock.advance(1_000);
+      const newer = f.mention("먼저 온 답장");
+      f.relay.publish(newer);
+      await f.waitFor("the newer mention admitted", () => f.inboundFor(newer.id).length === 1);
+      await probeTick(f, "a clean sweep");
+      expect(f.stalls).toEqual([]);
+
+      // A day less one second after `early` was signed, the connection is still answered: a mention
+      // signed then is pushed and admitted. Then the live push stops and `early` reaches the relay.
+      jumpTo(f, early.created_at + LIVENESS_PROBE_LOOKBACK_GUARANTEE_SECONDS - 1);
+      const current = f.mention("방금 온 답장");
+      f.relay.publish(current);
+      await f.waitFor("the current mention admitted", () => f.inboundFor(current.id).length === 1);
+      const connection = f.relay.connections[0]!;
+      connection.noLivePush = true;
+      f.relay.publish(early);
+      await f.settle();
+      expect(f.inboundFor(early.id)).toHaveLength(0);
+
+      // Inside the guarantee: the next probe still reaches back to it, though it is now more than a
+      // day older than the probe.
+      for (let tick = 0; tick < 3 && f.stalls.length === 0; tick += 1) await probeTick(f, `probe ${tick + 1} answered`);
+      expect(f.stalls).toEqual([expect.objectContaining({ cause: "MISSED_EVENTS" })]);
+      f.fireTimers();
+      await f.waitFor("the early mention admitted", () => f.inboundFor(early.id).length === 1);
+      expect(f.relay.connections[1]!.requests[0]!.filters[0]).toMatchObject({ since: early.created_at });
+      expect(f.inboundFor(early.id)).toHaveLength(1);
+      expect(f.wakes).toEqual([newer.id, current.id, early.id]);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("claims nothing for a mention published a day and an hour after it was signed: it is outside the guarantee", async () => {
+    const f = await start();
+    try {
+      const stale = f.mention("서명하고 하루 한 시간 뒤 게시된 답장");
+      f.h.clock.advance(1_000);
+      const newer = f.mention("먼저 온 답장");
+      f.relay.publish(newer);
+      await f.waitFor("the newer mention admitted", () => f.inboundFor(newer.id).length === 1);
+      await probeTick(f, "a clean sweep");
+
+      // A day and an hour on, the connection is still answered and a sweep comes back clean.
+      jumpTo(f, stale.created_at + LIVENESS_PROBE_LOOKBACK_GUARANTEE_SECONDS + 3_600);
+      const current = f.mention("방금 온 답장");
+      f.relay.publish(current);
+      await f.waitFor("the current mention admitted", () => f.inboundFor(current.id).length === 1);
+      await probeTick(f, "a clean sweep a day and an hour on");
+      expect(f.stalls).toEqual([]);
+
+      // Only now does `stale` reach the relay, with the live push stopped.
+      const connection = f.relay.connections[0]!;
+      connection.noLivePush = true;
+      f.relay.publish(stale);
+      for (let tick = 0; tick < 3; tick += 1) await probeTick(f, `probe ${tick + 1} answered`);
+
+      // Each sweep asks from a day before the last clean sweep began, which here is the previous
+      // tick: 24 h plus the probe's latency. `stale` was signed an hour before even that.
+      const since = nowSeconds(f) - 30 - LIVENESS_PROBE_LOOKBACK_GUARANTEE_SECONDS;
+      // The tick's last request is its sweep page.
+      expect(connection.requests.at(-1)!.filters[0]).toMatchObject({ since });
+      expect(stale.created_at).toBeLessThan(since - 3_600);
+      // Outside the guarantee, and nothing says otherwise: no stall is claimed for it, and it is not admitted.
+      expect(f.stalls).toEqual([]);
+      expect(f.inboundFor(stale.id)).toHaveLength(0);
+      expect(f.wakes).toEqual([newer.id, current.id]);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("checks the newest page on every tick, so a sweep through a long history cannot hide a stall past the bound", async () => {
+    const f = await start();
+    try {
+      // 800 mentions, one second apart, all pushed and admitted: a sweep takes five pages.
+      for (let n = 0; n < 4 * LIVENESS_PROBE_PAGE_LIMIT; n += 1) {
+        f.h.clock.advance(1_000);
+        f.relay.publish(f.mention(`지난 답장 ${n}`));
+      }
+      await f.waitFor("the mentions admitted", () => f.ownerMessages() === 4 * LIVENESS_PROBE_PAGE_LIMIT, 90_000);
+      // One clean sweep through all of it, then the first page of the next one.
+      for (let tick = 0; tick < 6; tick += 1) await probeTick(f, `probe ${tick + 1} answered`);
+      expect(f.stalls).toEqual([]);
+
+      // The live push stops right after that page, and a mention is published.
+      const connection = f.relay.connections[0]!;
+      connection.noLivePush = true;
+      const missed = f.mention("긴 기록 뒤에 묻힌 답장");
+      f.relay.publish(missed);
+      await f.settle();
+
+      // Found within the 90-second bound, while the sweep still has four pages of history to go.
+      for (let tick = 0; tick < 3 && f.stalls.length === 0; tick += 1) await probeTick(f, `late probe ${tick + 1} answered`);
+      expect(f.stalls).toEqual([expect.objectContaining({ cause: "MISSED_EVENTS" })]);
+      expect(f.liveness()?.identities[0]).toMatchObject({ state: "STALE" });
+      f.fireTimers();
+      await f.waitFor("the missed mention admitted", () => f.inboundFor(missed.id).length === 1, 60_000);
+      expect(f.wakes.filter((id) => id === missed.id)).toHaveLength(1);
+    } finally {
+      await f.close();
+    }
+  }, 240_000);
+
+  it("keeps an outage's refused notice owed across a restart and a day's downtime, and enqueues it once when a CEO is bound", async () => {
+    const f = await start();
+    try {
+      await outageAndRecovery(f, "the outage");
+      expect(f.ceoNotices()).toEqual([]);
+      const outage = f.stalls[0]!;
+
+      // The daemon is down for a day and an hour, then restarts with nothing in memory.
+      await f.restart(LIVENESS_PROBE_LOOKBACK_GUARANTEE_SECONDS * 1000 + 3_600_000);
+      for (let tick = 0; tick < 2; tick += 1) await f.tick();
+      expect(f.ceoNotices()).toEqual([]);
+
+      // A CEO is bound: the notice the outage is still owed is enqueued, once.
+      bindCeo(f.h);
+      for (let tick = 0; tick < 3; tick += 1) await f.tick();
+      expect(f.ceoNotices()).toEqual([noticeOf(outage)]);
+
+      // Taken is durable too: another restart does not send it again.
+      await f.restart();
+      for (let tick = 0; tick < 3; tick += 1) await f.tick();
+      expect(f.ceoNotices()).toEqual([noticeOf(outage)]);
+      expect(f.stalls).toHaveLength(1);
     } finally {
       await f.close();
     }

@@ -91,6 +91,7 @@ import {
   type BuzzMentionSink,
   type BuzzMentionStallReport,
   type BuzzMentionStallReporter,
+  type BuzzMentionStallRouter,
   type BuzzMentionSubscriberHandle,
   type BuzzMentionVerdict,
   type BuzzRelaySocketFactory,
@@ -2357,51 +2358,161 @@ export const createDaemonBuzzMentionSink = (
  * configured-off state, and it is a value rather than a `null` so a caller cannot read "absent"
  * as "running".
  */
+/** The audit kind that records an outage's CEO notice as owed (#1283); the notice itself is `CEO_NOTIFICATION`. */
+const BUZZ_MENTION_STALL_NOTICE_OWED = "BUZZ_MENTION_STALL_NOTICE_OWED";
+
+/** What an outage's notice says, from the fields its owed record keeps. */
+type BuzzMentionStallNotice = Pick<
+  BuzzMentionStallReport,
+  "identity" | "roleKey" | "cause" | "quietSeconds" | "boundSeconds" | "outageSinceSeconds"
+>;
+
+/**
+ * The notice's payload. One function for the first offer and every retry, so a notice delivered after
+ * a restart says what it would have said at once, under the same outbox idempotency key.
+ */
+const buzzMentionStallNoticePayload = (notice: BuzzMentionStallNotice): Record<string, unknown> => ({
+  code: "BUZZ_MENTION_SUBSCRIBER_STALE",
+  identity: notice.identity,
+  roleKey: notice.roleKey,
+  cause: notice.cause,
+  quietSeconds: notice.quietSeconds,
+  boundSeconds: notice.boundSeconds,
+  outageSinceSeconds: notice.outageSinceSeconds,
+  whyItMatters:
+    `Buzz mentions for ${notice.roleKey ?? notice.identity} are not being delivered: ` +
+    (notice.cause === "UNANSWERED"
+      ? `the relay had not answered its subscription for ${notice.quietSeconds}s on an open connection.`
+      : notice.cause === "MISSED_EVENTS"
+        ? "a probe found a stored mention its subscription never delivered."
+        : "a probe met a second holding more than a full page of stored mentions, so their delivery could not be shown.") +
+    " The daemon keeps reconnecting from the preserved window, so missed mentions arrive once it answers; " +
+    "doctor's BUZZ_MENTION_SUBSCRIBER_STALE finding says whether the outage is still open.",
+});
+
+/**
+ * Every outage notice owed and not yet taken, oldest first: an owed record with no `CEO_NOTIFICATION`
+ * for the same identity and outage. Both are append-only audit rows, so this answer survives a restart
+ * and any length of downtime, and an outage, once noticed, is never owed again. The role is read from
+ * the owed row's own column, because audit evidence redacts every `*Key` field. A notice is written
+ * after its owed row, so only notices from then on are asked: the `(kind, at)` index's range, not every
+ * notice ever, on each health tick. (Were the wall clock set back in between, the notice would be
+ * offered once more; the outbox's idempotency key keeps that to the one row.)
+ */
+const owedBuzzMentionStallNotices = (cp: ControlPlane, only?: BuzzMentionStallNotice): BuzzMentionStallNotice[] =>
+  cp.db
+    .all<{ role_key: string | null; evidence_json: string }>(
+      `SELECT o.role_key, o.evidence_json FROM audit_events o
+        WHERE o.kind = ?
+          AND json_extract(o.evidence_json, '$.outageSinceSeconds') IS NOT NULL
+          AND (? IS NULL OR (json_extract(o.evidence_json, '$.identity') = ?
+                             AND json_extract(o.evidence_json, '$.outageSinceSeconds') = ?))
+          AND NOT EXISTS (
+            SELECT 1 FROM audit_events n
+             WHERE n.kind = 'CEO_NOTIFICATION' AND n.at >= o.at
+               AND json_extract(n.evidence_json, '$.code') = json_extract(o.evidence_json, '$.code')
+               AND json_extract(n.evidence_json, '$.identity') = json_extract(o.evidence_json, '$.identity')
+               AND json_extract(n.evidence_json, '$.outageSinceSeconds') = json_extract(o.evidence_json, '$.outageSinceSeconds'))
+        ORDER BY o.event_id`,
+      [BUZZ_MENTION_STALL_NOTICE_OWED, only?.identity ?? null, only?.identity ?? null, only?.outageSinceSeconds ?? null],
+    )
+    .map((row) => {
+      const evidence = JSON.parse(row.evidence_json) as Record<string, unknown>;
+      return {
+        identity: String(evidence["identity"]),
+        roleKey: row.role_key,
+        cause: evidence["cause"] as BuzzMentionStallReport["cause"],
+        quietSeconds: Number(evidence["quietSeconds"]),
+        boundSeconds: Number(evidence["boundSeconds"]),
+        outageSinceSeconds: Number(evidence["outageSinceSeconds"]),
+      };
+    })
+    // One per outage, even were it recorded owed twice.
+    .filter((one, index, all) =>
+      all.findIndex((other) => other.identity === one.identity && other.outageSinceSeconds === one.outageSinceSeconds) === index);
+
 /**
  * #1283 — an outage of a Buzz mention subscription, routed to the CEO as the one §19.3 notification
  * for it, `CRITICAL_SYSTEM_FAILURE`, beside the subscriber's stderr line.
  *
- * The subscriber's incident route: offered the outage's first report until this returns `true`, at
- * each stall and each health tick, after the outage has ended too, so a notice refused (no live CEO
- * binding, say: `notify` records CEO_NOTIFICATION_BLOCKED) is enqueued once a CEO is bound. One notice
- * per outage: once enqueued it is not offered again, and the row's idempotency key covers the outage's
- * identity and the second it was found, so the next outage is a new one. No run owns it, so it names
- * none. A refusal is said on stderr at the first attempt only; the subscriber is never stopped by
- * its own report.
+ * The subscriber's incident route. An outage's first report is recorded as owed
+ * (`BUZZ_MENTION_STALL_NOTICE_OWED`, an audit row) before it is offered, so the debt is durable from
+ * the moment the outage is found: refused (no live CEO binding, say: `notify` records
+ * CEO_NOTIFICATION_BLOCKED), it stays owed through recovery, a restart and any downtime, and on every
+ * health tick from then on, while a CEO is bound, each notice still owed is enqueued. One notice per
+ * outage: the owed record is matched against the `CEO_NOTIFICATION` audit row `notify` writes with the
+ * outbox row, in the same transaction as the enqueue, and the outbox row's idempotency key covers the
+ * outage's identity and the second it was found. No run owns it, so it names none. A refusal is said
+ * on stderr at the first offer only; a retry with no CEO bound writes nothing; the subscriber is never
+ * stopped by its own report.
  */
-const notifyCeoOfBuzzMentionStall = (cp: ControlPlane, report: BuzzMentionStallReport, attempt: number): boolean => {
-  const refused = (why: string): false => {
-    if (attempt === 1) {
+const buzzMentionStallRoute = (cp: ControlPlane): BuzzMentionStallRouter => {
+  /** Enqueues `notice` unless it is no longer owed; `recorded: false` is a first offer whose owed row could not be written. */
+  const deliver = (notice: BuzzMentionStallNotice, first: boolean, recorded = true): void => {
+    const refused = (why: string): void => {
+      if (!first) return;
       process.stderr.write(
-        `Buzz mention subscriber outage for ${report.identity} was not routed to the CEO: ${why}; ` +
-          "it is offered again until it is taken\n",
+        `Buzz mention subscriber outage for ${notice.identity} was not routed to the CEO: ${why}; ` +
+          "it stays owed, and is offered again on every health tick until it is taken\n",
       );
+    };
+    try {
+      const notified = cp.db.tx(() => recorded && owedBuzzMentionStallNotices(cp, notice).length === 0
+        ? null
+        : cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, null, buzzMentionStallNoticePayload(notice)));
+      if (notified !== null && !notified.allowed) refused(notified.reasonCode);
+    } catch (error) {
+      refused(error instanceof Error ? error.message : String(error));
     }
-    return false;
   };
-  try {
-    const notified = cp.db.tx(() => cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, null, {
-      code: "BUZZ_MENTION_SUBSCRIBER_STALE",
-      identity: report.identity,
-      roleKey: report.roleKey,
-      cause: report.cause,
-      quietSeconds: report.quietSeconds,
-      boundSeconds: report.boundSeconds,
-      outageSinceSeconds: report.outageSinceSeconds,
-      whyItMatters:
-        `Buzz mentions for ${report.roleKey ?? report.identity} are not being delivered: ` +
-        (report.cause === "UNANSWERED"
-          ? `the relay had not answered its subscription for ${report.quietSeconds}s on an open connection.`
-          : report.cause === "MISSED_EVENTS"
-            ? "a probe found a stored mention its subscription never delivered."
-            : "a probe could not page past one second holding a full page of stored mentions, so their delivery could not be shown.") +
-        " The daemon keeps reconnecting from the preserved window, so missed mentions arrive once it answers; " +
-        "doctor's BUZZ_MENTION_SUBSCRIBER_STALE finding says whether the outage is still open.",
-    }));
-    return notified.allowed ? true : refused(notified.reasonCode);
-  } catch (error) {
-    return refused(error instanceof Error ? error.message : String(error));
-  }
+  return {
+    offer: (report) => {
+      const notice: BuzzMentionStallNotice = {
+        identity: report.identity,
+        roleKey: report.roleKey,
+        cause: report.cause,
+        quietSeconds: report.quietSeconds,
+        boundSeconds: report.boundSeconds,
+        outageSinceSeconds: report.outageSinceSeconds,
+      };
+      let recorded = false;
+      try {
+        // Its own transaction, so the debt is recorded even if delivering it then fails.
+        const owed = cp.audit.record({
+          kind: BUZZ_MENTION_STALL_NOTICE_OWED,
+          runId: null,
+          roleKey: notice.roleKey,
+          evidence: {
+            code: "BUZZ_MENTION_SUBSCRIBER_STALE",
+            identity: notice.identity,
+            cause: notice.cause,
+            quietSeconds: notice.quietSeconds,
+            boundSeconds: notice.boundSeconds,
+            outageSinceSeconds: notice.outageSinceSeconds,
+          },
+        });
+        recorded = owed.allowed;
+        if (!owed.allowed) {
+          process.stderr.write(
+            `Buzz mention subscriber outage for ${notice.identity} could not be recorded as owed to the CEO: ` +
+              `${owed.reasonCode}\n`,
+          );
+        }
+      } catch (error) {
+        process.stderr.write(
+          `Buzz mention subscriber outage for ${notice.identity} could not be recorded as owed to the CEO: ` +
+            `${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      }
+      // Unrecorded, it is offered this once, as it would have been before it could be owed.
+      deliver(notice, true, recorded);
+    },
+    retry: () => {
+      // With no CEO bound nothing can take a notice, and asking would only record that again.
+      if (!cp.bindings.active(roleKeyFor(Role.CEO))) return;
+      for (const notice of owedBuzzMentionStallNotices(cp)) deliver(notice, false);
+    },
+  };
 };
 
 export const startDaemonBuzzMentionSubscriber = (
@@ -2440,7 +2551,7 @@ export const startDaemonBuzzMentionSubscriber = (
     ...(options.scheduler ? { scheduler: options.scheduler } : {}),
     ...(options.reportAdmission ? { reportAdmission: options.reportAdmission } : {}),
     reportStall: options.reportStall ?? nativeStallReporter,
-    routeStall: (report, attempt) => notifyCeoOfBuzzMentionStall(cp, report, attempt),
+    routeStall: buzzMentionStallRoute(cp),
 
   }, process.env["ACP_BUZZ_RELAY_URL"]);
   // The file remains the deployment baseline; resident allocations are merged dynamically.
