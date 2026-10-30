@@ -135,6 +135,39 @@ describe("a stalled holder-claimed message names its real recovery", () => {
     expect(recovery).toContain(`session ${cto.sessionId} at binding generation ${generation} of ${ctoRoleKey}`);
   });
 
+  it("a holder-claimed message that stalls after its role's notice went out reaches the CEO as a new notice, once", async () => {
+    const { harness, ctoRoleKey, cto, generation, peerMessageId, olderPushedId } = await ctoWithPeerMessage({ olderPushed: true });
+    const waits = waitsOf(harness);
+    const roleNotices = () => harness.cp.db.all<{ payload_json: string }>(
+      `SELECT payload_json FROM outbox WHERE kind = 'CEO_NOTIFICATION'
+         AND json_extract(payload_json, '$.notification') = 'CRITICAL_SYSTEM_FAILURE'
+         AND json_extract(payload_json, '$.stall') = 'outbox' AND json_extract(payload_json, '$.owner.role') = ?
+       ORDER BY created_at, message_id`,
+      [ctoRoleKey],
+    ).map((row) => JSON.parse(row.payload_json) as Record<string, unknown>);
+
+    // 10.5 minutes after the pushed message: only it is stalled, and its notice gives the retry.
+    harness.clock.advance(9.5 * 60 * 1000);
+    waits.routeWatchdogStalls((await harness.cp.watchdog.tick()).stalls);
+    expect(roleNotices()).toEqual([expect.objectContaining({ resource: olderPushedId, recoveryAction: PUSHED_RECOVERY })]);
+
+    // 12.5 minutes: the peer message is stalled too; the claim reaches the CEO, with the peer row's target.
+    harness.clock.advance(2 * 60 * 1000);
+    waits.routeWatchdogStalls((await harness.cp.watchdog.tick()).stalls);
+    const notices = roleNotices();
+    expect(notices).toHaveLength(2);
+    expect(notices[1]).toMatchObject({ resource: olderPushedId, owner: { role: ctoRoleKey, sessionId: cto.sessionId, generation } });
+    const recovery = String(notices[1]!["recoveryAction"]);
+    expect(recovery).toContain(`Holder-claimed messages 1 (${peerMessageId}): the receiving session claims it (role_owner_message_claim)`);
+    expect(recovery).toContain(`session ${cto.sessionId} at binding generation ${generation} of ${ctoRoleKey}`);
+
+    // The same composition again: nothing new.
+    harness.clock.advance(60 * 1000);
+    const again = waits.routeWatchdogStalls((await harness.cp.watchdog.tick()).stalls);
+    expect(again.filter((entry) => entry.kind === "outbox" && entry.messageId !== null)).toEqual([]);
+    expect(roleNotices()).toHaveLength(2);
+  });
+
   it("names a receiving session that is no longer live as not live", async () => {
     const { harness, cto, peerMessageId } = await ctoWithPeerMessage();
     harness.cp.db.run(`UPDATE sessions SET lifecycle = 'STOPPED' WHERE session_id = ?`, [cto.sessionId]);

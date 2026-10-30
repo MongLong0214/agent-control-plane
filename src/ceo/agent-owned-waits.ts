@@ -398,7 +398,7 @@ export class AgentOwnedWaits {
     const keyOf = (stall: WatchdogStall): string => `${stall.kind}:${stall.id}:${stall.since}`;
     const owedStalls = this.#owedStalls();
     const owedByKey = new Map(owedStalls.map(({ stall, episode }) => [keyOf(stall), { episode }]));
-    const routeOne = (stall: WatchdogStall, blocker: string, recovery?: Pick<OwnerlessStall, "owner" | "recoveryAction">): void => {
+    const routeOne = (stall: WatchdogStall, blocker: string, recovery?: Pick<OwnerlessStall, "owner" | "recoveryAction" | "episode">): void => {
       const route = WATCHDOG_STALL_ROUTES[stall.kind];
       const key = keyOf(stall);
       if (!route || asked.has(key)) return;
@@ -412,10 +412,11 @@ export class AgentOwnedWaits {
         source: "WATCHDOG",
         kind: stall.kind,
         id: stall.id,
-        episode: stall.since,
+        episode: recovery?.episode ?? stall.since,
         runId: stall.runId,
         since: stall.since,
-        ...(recovery ?? { owner: this.#stallOwner(stall), recoveryAction: route.recoveryAction }),
+        owner: recovery?.owner ?? this.#stallOwner(stall),
+        recoveryAction: recovery?.recoveryAction ?? route.recoveryAction,
         blocker,
         effects: route.effects,
         deliveryTimeout: stall.kind === "outbox",
@@ -453,7 +454,7 @@ export class AgentOwnedWaits {
     }
     for (const [role, { stall, count, group }] of oldestByRole) {
       routeOne(stall, `${count} ${WATCHDOG_STALL_ROUTES["outbox"]!.what} to ${role}; the oldest is ${stall.id}, since ${stall.since}`,
-        this.#deliveryRecovery(group));
+        this.#deliveryRecovery(group, stall.since));
     }
     for (const { stall: owed } of owedStalls) {
       routeOne(owed, `${WATCHDOG_STALL_ROUTES[owed.kind]?.what ?? owed.kind}: ${owed.kind} ${owed.id}, since ${owed.since}`);
@@ -503,23 +504,28 @@ export class AgentOwnedWaits {
 
   /**
    * The recovery of one role's stalled messages, which share one notice: every recovery their kinds need.
-   * Undefined when none is holder-claimed, which keeps the route's retry. With only holder-claimed ones, the
-   * claim of the oldest of them; with both, the retry for the pushed ones and the claim for the holder-claimed
-   * ones, each naming its messages, and the session and generation are the holder-claimed row's.
+   * Undefined when none is holder-claimed, which keeps the route's retry and its episode, when the oldest was
+   * queued (`since`). With only holder-claimed ones, the claim of the oldest of them; with both, the retry for
+   * the pushed ones and the claim for the holder-claimed ones, each naming its messages, and the session and
+   * generation are the holder-claimed row's. Either way the episode also names that composition and target, so
+   * a change of them reaches the CEO as a new notice, once, and an unchanged one is the notice it already has.
+   * It is joined with `#`, never `|`, so it is not a prefix of another episode's delivery keys.
    */
-  #deliveryRecovery(group: readonly WatchdogStall[]): Pick<OwnerlessStall, "owner" | "recoveryAction"> | undefined {
+  #deliveryRecovery(group: readonly WatchdogStall[], since: string): Pick<OwnerlessStall, "owner" | "recoveryAction" | "episode"> | undefined {
     const isHeld = (stall: WatchdogStall): boolean => (HOLDER_CLAIMED_KINDS as ReadonlySet<string>).has(stall.messageKind ?? "");
     const held = group.filter(isHeld);
     if (held.length === 0) return undefined;
     const claim = this.#holderClaimedStall(held.reduce((a, b) => Date.parse(b.since) < Date.parse(a.since) ? b : a));
     const pushed = group.filter((stall) => !isHeld(stall));
-    if (pushed.length === 0) return claim;
+    const episode = `${since}#${pushed.length === 0 ? "held" : "mixed"}:${claim.owner.sessionId ?? "unknown"}@g${claim.owner.generation ?? "unknown"}`;
+    if (pushed.length === 0) return { ...claim, episode };
     const named = (stalls: readonly WatchdogStall[]): string =>
       `${stalls.length} (${stalls.slice(0, 10).map((stall) => stall.id).join(", ")}${stalls.length > 10 ? `, and ${stalls.length - 10} more` : ""})`;
     return {
       owner: claim.owner,
       recoveryAction: `pushed messages ${named(pushed)}: ${WATCHDOG_STALL_ROUTES["outbox"]!.recoveryAction}. ` +
         `Holder-claimed messages ${named(held)}: ${claim.recoveryAction}`,
+      episode,
     };
   }
 
