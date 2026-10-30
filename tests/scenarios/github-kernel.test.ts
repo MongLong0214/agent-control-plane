@@ -106,7 +106,7 @@ const reflectMergedBase = (github: FakeGitHub): void => {
  * The kernel refuses to publish a gate for digests it cannot resolve, which means these
  * scenarios cannot be set up with placeholder digests.
  */
-const setup = async (options: { finalization?: boolean } = {}): Promise<Fixture> => {
+const setup = async (options: { finalization?: boolean; approvedWorkflow?: string } = {}): Promise<Fixture> => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
   const harness = makeHarness({ githubClient: github });
@@ -128,10 +128,18 @@ const setup = async (options: { finalization?: boolean } = {}): Promise<Fixture>
     trustedCreators: async () => ["github-actions"],
   });
 
+  // With `approvedWorkflow`, the workflow file is committed before the candidate and the manifest
+  // approves its digest, so the production CI source can prove a check against it.
+  if (options.approvedWorkflow !== undefined) {
+    writeFiles(harness.repoPath, { [CI_WORKFLOWS[0]!.path]: options.approvedWorkflow });
+    commitAll(harness.repoPath, "add approved CI workflow");
+  }
   const driven = await driveToReviewedCandidate(harness, {
     workBranch: "feature/F1-thing",
     manifestOverrides: {
-      ciWorkflows: CI_WORKFLOWS,
+      ciWorkflows: options.approvedWorkflow === undefined
+        ? CI_WORKFLOWS
+        : [{ ...CI_WORKFLOWS[0]!, approvedDigest: sha256(options.approvedWorkflow), unapprovedFirstActivation: false }],
       verificationProfiles: { simple: ["project-ci"], standard: ["project-ci"], guarded: ["project-ci"] },
       verificationCommands: TRUSTED_CI_COMMANDS,
     },
@@ -2638,6 +2646,131 @@ describe("trusted CI evidence (CP-S29)", () => {
         latestNonResult: { reason: "PENDING", commitSha: repo.candidateHead, source } }
       : { unobserved: false, unobservedReason: null, latestNonResult: null,
         lastObserved: { result: "FAIL", commitSha: repo.candidateHead, source } });
+  });
+
+  // #1257 J4 — the same distinction through the production CI source reading simulated GitHub answers.
+  // App, suite, workflow run, workflow path and the workflow digest at the head are proven whatever the
+  // run concluded, so a failed or unfinished approved run reaches the writer with its conclusion.
+  describe("through the production CI source", () => {
+    const APPROVED_WORKFLOW = "name: project-ci\non: [push]\njobs:\n  project-ci:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node verify.js\n";
+    const WORKFLOW_PATH = CI_WORKFLOWS[0]!.path;
+
+    const productionSource = async () => {
+      const fixture = await setup({ finalization: false, approvedWorkflow: APPROVED_WORKFLOW });
+      const snapshot = await frozen(fixture);
+      fixture.harness.cp.verification.attachCi(fixture.harness.cp.github.ciEvidenceSource());
+      const verify = async () => {
+        const verified = await fixture.harness.cp.verification.verify({
+          runId: fixture.runId,
+          snapshot,
+          commands: TRUSTED_CI_COMMANDS,
+          contractDigest: snapshot.contractDigest,
+        });
+        const row = fixture.harness.cp.verification.latestReport(fixture.runId, candidateSnapshotDigest(snapshot))!.results[0];
+        const projectId = fixture.harness.cp.runs.require(fixture.runId).projectId!;
+        const ci = createHermesMcpPort(fixture.harness.cp).projectView(projectId)?.ci;
+        if (!ci?.declared) throw new Error("expected a declared CI section");
+        return { verified, row, workflow: ci.workflows[0]! };
+      };
+      return { fixture, snapshot, head: snapshot.repositories[0]!.candidateHead, verify };
+    };
+
+    it("#1257: a failed run of the approved workflow is an observed FAIL attributed to that workflow", async () => {
+      const { fixture, head, verify } = await productionSource();
+      fixture.github.setTrustedPostMergeCheck(head, "project-ci", WORKFLOW_PATH, {
+        check: { status: "completed", conclusion: "failure" },
+        run: { status: "completed", conclusion: "failure" },
+      });
+
+      const { verified, row, workflow } = await verify();
+      expect(verified.allowed).toBe(false);
+      expect(row).toMatchObject({ status: "FAIL", reasonCode: ReasonCode.VERIFICATION_CI_CHECK_FAILED });
+      // A trusted-CI row is written only after the source proved the check against this workflow.
+      expect(workflow).toMatchObject({
+        path: WORKFLOW_PATH,
+        approvedDigest: sha256(APPROVED_WORKFLOW),
+        unobserved: false,
+        unobservedReason: null,
+        latestNonResult: null,
+        lastObserved: {
+          result: "FAIL",
+          commitSha: head,
+          source: { kind: "CI_VERIFICATION_RESULT", runId: fixture.runId, status: "FAIL", reasonCode: ReasonCode.VERIFICATION_CI_CHECK_FAILED },
+        },
+      });
+    });
+
+    it.each([
+      ["a running check in a running run", { status: "in_progress", conclusion: null }],
+      ["a successful check in a run still running", { status: "completed", conclusion: "success" }],
+    ] as const)("#1257: %s of the approved workflow is PENDING, never a PASS", async (_shape, check) => {
+      const { fixture, head, verify } = await productionSource();
+      fixture.github.setTrustedPostMergeCheck(head, "project-ci", WORKFLOW_PATH, {
+        check,
+        run: { status: "in_progress", conclusion: null },
+      });
+
+      const { verified, row, workflow } = await verify();
+      expect(verified.allowed).toBe(false);
+      expect(row).toMatchObject({ status: "FAIL", reasonCode: ReasonCode.VERIFICATION_CI_CHECK_PENDING });
+      expect(workflow).toMatchObject({
+        lastObserved: null,
+        unobserved: true,
+        unobservedReason: "PENDING",
+        latestNonResult: {
+          reason: "PENDING",
+          commitSha: head,
+          source: { kind: "CI_VERIFICATION_RESULT", runId: fixture.runId, status: "FAIL", reasonCode: ReasonCode.VERIFICATION_CI_CHECK_PENDING },
+        },
+      });
+    });
+
+    it("#1257: a failing check another app published is not attributed, even naming the approved run; the approved run's own is", async () => {
+      const { fixture, head, verify } = await productionSource();
+      const check = fixture.github.setTrustedPostMergeCheck(head, "project-ci", WORKFLOW_PATH, {
+        check: { status: "completed", conclusion: "failure" },
+        run: { status: "completed", conclusion: "failure" },
+      });
+      // The same suite, run and workflow file, published by an app other than GitHub Actions.
+      check.app = { slug: "untrusted-app" };
+
+      const forged = await verify();
+      expect(forged.row).toMatchObject({ status: "ERROR", reasonCode: ReasonCode.EVIDENCE_MISSING });
+      expect(forged.workflow).toMatchObject({ lastObserved: null, unobserved: true, unobservedReason: "NOT_A_RESULT" });
+
+      check.app = { slug: "github-actions" };
+      const attributed = await verify();
+      expect(attributed.workflow).toMatchObject({
+        unobserved: false,
+        lastObserved: { result: "FAIL", commitSha: head, source: { reasonCode: ReasonCode.VERIFICATION_CI_CHECK_FAILED } },
+      });
+    });
+
+    it("#1257: a successful check inside a failed approved run does not satisfy the required check, and the gate refuses", async () => {
+      const { fixture, snapshot, head, verify } = await productionSource();
+      fixture.github.setTrustedPostMergeCheck(head, "project-ci", WORKFLOW_PATH, {
+        check: { status: "completed", conclusion: "success" },
+        run: { status: "completed", conclusion: "failure" },
+      });
+
+      const { verified, row, workflow } = await verify();
+      expect(verified.allowed).toBe(false);
+      expect(row).toMatchObject({ status: "FAIL", reasonCode: ReasonCode.VERIFICATION_CI_CHECK_FAILED });
+      expect(workflow.lastObserved).toMatchObject({ result: "FAIL", commitSha: head });
+
+      const report = fixture.harness.cp.artifacts.latestForSnapshot<{ status: string }>(
+        fixture.runId,
+        "VERIFICATION",
+        candidateSnapshotDigest(snapshot),
+      )!;
+      expect(report.content.status).toBe("FAIL");
+      const refused = await fixture.harness.cp.github.gatePublish(
+        { ...fixture.payload, verificationDigest: report.digest },
+        fixture.identity,
+      );
+      expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.GATE_EVIDENCE_NOT_BACKED });
+      expect(fixture.github.checkRuns.filter((published) => published.name === GATE_CHECK_NAME)).toHaveLength(0);
+    });
   });
 
   it("a CI result belonging to another repository is not evidence for this one", async () => {
