@@ -25,6 +25,7 @@ import {
   verifySnapshotFreshness,
 } from "../snapshot/candidate-snapshot.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
+import { CI_FAILED_CONCLUSIONS } from "./ci-verification-records.ts";
 import { gateResolutionPreload } from "./gate-resolution-hook.ts";
 import { type SandboxEnforcement, runSandboxed } from "./sandbox.ts";
 import type { WorktreeAuthorization, WorktreeManager } from "./worktree.ts";
@@ -50,6 +51,17 @@ export interface CiEvidenceSource {
   approvedWorkflowDigests(repositoryIdentity: string): Promise<string[]>;
   trustedCreators(): Promise<string[]>;
 }
+
+/**
+ * #1257 — the reason a trusted check's FAIL row keeps, so a reader can tell a finished failure from
+ * a check that had not finished. `unknown` is what the port reports when GitHub gave no conclusion,
+ * which it does until the check completes. Any other non-success (`neutral`, `skipped`, a value not
+ * listed) keeps the general code. The row's status stays FAIL in every case, so the gate is unchanged.
+ */
+const ciNonSuccessReason = (conclusion: string): ReasonCode =>
+  CI_FAILED_CONCLUSIONS.has(conclusion) ? ReasonCode.VERIFICATION_CI_CHECK_FAILED
+    : conclusion === "unknown" ? ReasonCode.VERIFICATION_CI_CHECK_PENDING
+      : ReasonCode.VERIFICATION_COMMAND_FAILED;
 
 export interface VerificationResultRecord {
   commandId: string;
@@ -1142,7 +1154,7 @@ export class VerificationEngine {
       startedAt: match.completedAt,
       endedAt: match.completedAt,
       status: match.conclusion === "success" ? "PASS" : "FAIL",
-      reasonCode: match.conclusion === "success" ? null : ReasonCode.VERIFICATION_COMMAND_FAILED,
+      reasonCode: match.conclusion === "success" ? null : ciNonSuccessReason(match.conclusion),
       outputDigest: digestOf(match),
     };
     this.writeResultRow(runId, snapshotDigest, record);

@@ -1,4 +1,5 @@
 import { resumeRetirements, retireProject } from '../registry/project-retirement.ts';
+import { projectCi } from '../registry/project-ci.ts';
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -962,6 +963,7 @@ export class Daemon {
             this.cp.projects.list().map((project) => ({
               ...project,
               repositories: this.cp.repositories.byProject(project.projectId).map((repository) => repository.identity),
+              ci: projectCi(this.cp.db, this.cp.projects, project.projectId),
             })),
           );
 
