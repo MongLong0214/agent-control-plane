@@ -507,6 +507,21 @@ const REFUSED_FIELD_NAME = /^[A-Za-z0-9_<>.-]{1,64}$/;
 
 /** Diff size above which a single reviewer context is not trusted to hold everything. */
 const CHUNK_THRESHOLD_CHARS = 120_000;
+/**
+ * The cap on the complete reviewer input (instructions, packet metadata, chunk envelope and the
+ * patch) of a chunk that holds one lockfile whole. A lockfile cut into byte ranges gives every
+ * reviewer an incomplete file, which each then reports as incomplete coverage; a lockfile that does
+ * not fit whole under this cap is an omitted item, never cut. No reviewer-model input limit is
+ * declared in this code, so this is a fixed, bounded cap: about 90-120K tokens, inside the reviewer
+ * model's input window. It holds a 160K-char lockfile patch beside the most metadata a chunk carries
+ * (`CHUNK_THRESHOLD_CHARS` - 4,096 - `EVIDENCE_DIFF_RESERVE_CHARS`, about 84K).
+ */
+const LOCKFILE_CHUNK_THRESHOLD_CHARS = 3 * CHUNK_THRESHOLD_CHARS;
+/** Lockfile base names. `bun.lockb` is binary and is not among them. */
+const LOCKFILE_NAMES: ReadonlySet<string> = new Set([
+  "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "Cargo.lock",
+  "poetry.lock", "uv.lock", "Gemfile.lock", "go.sum",
+]);
 /** Room kept for the change itself before the packet's tree and task listings take any. */
 const EVIDENCE_DIFF_RESERVE_CHARS = 32_000;
 const REVIEW_TIMEOUT_MS = 20 * 60 * 1000;
@@ -1660,15 +1675,16 @@ export class BlindReviewGate {
     // A chunk adds repository/file fences and the chunk heading beyond the empty-prompt
     // measurement. Reserve a bounded envelope so the complete serialized prompt, not only
     // the patch body, remains inside the review budget.
-    const chunkBudget = CHUNK_THRESHOLD_CHARS - this.promptOverhead(request, change, evidenceSection, reviewPolicies) - 4_096;
+    const overhead = this.promptOverhead(request, change, evidenceSection, reviewPolicies);
+    const chunkBudget = CHUNK_THRESHOLD_CHARS - overhead - 4_096;
     if (chunkBudget <= 0) {
       return deny(ReasonCode.EVIDENCE_MISSING, "review prompt metadata exceeds the reviewer context budget", {
         runId: request.runId,
-        overhead: this.promptOverhead(request, change, evidenceSection, reviewPolicies),
+        overhead,
         budget: CHUNK_THRESHOLD_CHARS,
       });
     }
-    const chunks = splitDiffs(diffs, chunkBudget);
+    const { chunks, omitted: unfitLockfiles } = splitDiffs(diffs, chunkBudget, LOCKFILE_CHUNK_THRESHOLD_CHARS - overhead - 4_096);
     // #246 B2-a — every chunk prompt carries the contract change; the first chunk's reviewer is the
     // one that may claim the manifest, so the reducer can tell whether any reviewer covered it.
     if (change !== null && chunks.length > 0) {
@@ -1688,7 +1704,7 @@ export class BlindReviewGate {
       for (const target of part.coverageTargets) expectedSlices.set(target.slice, target.file);
     }
     const findings: ReviewFinding[] = [];
-    const omitted: string[] = [];
+    const omitted: string[] = [...unfitLockfiles];
     const chunkReviewers: ChunkReviewerEvidence[] = [];
     const egressEvidence: ReviewerEgressRecord[] = [];
     const reviewerInputs: TransmittedReviewerInput[] = [];
@@ -1696,12 +1712,13 @@ export class BlindReviewGate {
 
     for (const [index, chunk] of chunks.entries()) {
       const prompt = this.buildPrompt(request, chunk, { chunk: index + 1, of: chunks.length }, change, evidenceSection, reviewPolicies);
-      if (prompt.length + REVIEWER_TRANSPORT_OVERHEAD_CHARS > CHUNK_THRESHOLD_CHARS) {
+      const cap = chunk.some((part) => part.lockfileBinding !== undefined) ? LOCKFILE_CHUNK_THRESHOLD_CHARS : CHUNK_THRESHOLD_CHARS;
+      if (prompt.length + REVIEWER_TRANSPORT_OVERHEAD_CHARS > cap) {
         return deny(ReasonCode.EVIDENCE_MISSING, "a review chunk exceeds the context budget", {
           runId: request.runId,
           chunk: index + 1,
           length: prompt.length,
-          budget: CHUNK_THRESHOLD_CHARS,
+          budget: cap,
         });
       }
       // CP-HI-04 / ADR-0006: every chunk is a fresh provider session and a fresh
@@ -1911,7 +1928,7 @@ export class BlindReviewGate {
 
   private buildPrompt(
     request: BlindReviewRequest,
-    diffs: ReviewerDiff[],
+    diffs: readonly ReviewChunkInput[],
     chunk?: { chunk: number; of: number },
     change: TrustedContractChange | null = null,
     evidenceSection: readonly string[] = [],
@@ -1951,7 +1968,8 @@ export class BlindReviewGate {
     ];
 
     for (const repo of diffs) {
-      sections.push(`### ${repo.identity}`, "Files:", ...repo.files.map((f) => `- ${f}`), "```diff", repo.diff, "```");
+      const lockfile = "lockfileBinding" in repo && repo.lockfileBinding !== undefined ? [repo.lockfileBinding] : [];
+      sections.push(`### ${repo.identity}`, "Files:", ...repo.files.map((f) => `- ${f}`), ...lockfile, "```diff", repo.diff, "```");
     }
 
     sections.push(
@@ -3165,6 +3183,8 @@ const snapshotForReviewer = (snapshot: CandidateSnapshot): unknown => ({
 
 interface ReviewChunkPart extends ReviewerDiff {
   coverageTargets: SliceCoverageTarget[];
+  /** A whole lockfile's statement of its path, candidate blob and base blob, shown above its patch. */
+  lockfileBinding?: string;
 }
 
 type ReviewChunkInput = ReviewChunkPart | ReviewerDiff;
@@ -3237,15 +3257,25 @@ const dedupeFindings = (findings: ReviewFinding[]): ReviewFinding[] => {
   });
 };
 
+/**
+ * Chunks of at most `budget` diff chars each. A lockfile too large for a chunk goes whole into a
+ * chunk of its own when it fits `lockfileBudget`; one that does not is returned in `omitted`.
+ */
 const splitDiffs = (
   diffs: ReviewerDiff[],
   budget: number,
-): ReviewChunkPart[][] => {
+  lockfileBudget = budget,
+): { chunks: ReviewChunkPart[][]; omitted: string[] } => {
   const chunks: ReviewChunkPart[][] = [];
+  const omitted: string[] = [];
   let current: ReviewChunkPart[] = [];
   let size = 0;
   for (const repo of diffs) {
-    for (const part of splitByFile(repo, budget)) {
+    for (const part of splitByFile(repo, budget, lockfileBudget, omitted)) {
+      if (part.lockfileBinding !== undefined) {
+        chunks.push([part]);
+        continue;
+      }
       if (size + part.diff.length > budget && current.length > 0) {
         chunks.push(current);
         current = [];
@@ -3256,7 +3286,7 @@ const splitDiffs = (
     }
   }
   if (current.length > 0) chunks.push(current);
-  return chunks.length > 0 ? chunks : [[]];
+  return { chunks: chunks.length > 0 ? chunks : [[]], omitted };
 };
 
 /**
@@ -3265,8 +3295,32 @@ const splitDiffs = (
  * `a/` path. Read from the section's header lines only.
  */
 const sectionPath = (section: string): string | undefined => {
-  const header = section.slice(0, /^(?:--- |@@ |GIT binary patch$|Binary files )/m.exec(section)?.index ?? section.length);
+  const header = sectionHeader(section);
   return /^(?:rename|copy) to (.+)$/m.exec(header)?.[1] ?? /^diff --git a\/(\S+) b\//m.exec(header)?.[1];
+};
+
+/** A patch section's header lines, before its content. */
+const sectionHeader = (section: string): string =>
+  section.slice(0, /^(?:--- |@@ |GIT binary patch$|Binary files )/m.exec(section)?.index ?? section.length);
+
+const isLockfile = (path: string): boolean => LOCKFILE_NAMES.has(path.slice(path.lastIndexOf("/") + 1));
+
+/**
+ * A lockfile's whole patch section as one part, bound to the candidate by its path and the full-index
+ * blob ids git wrote (the candidate blob is git's digest of the file's full bytes), or, when that part
+ * does not fit `budget`, the omitted item that says so. A lockfile is never cut into ranges.
+ */
+const lockfilePart = (identity: string, target: SectionTarget, section: string, budget: number): ReviewChunkPart | string => {
+  const key = `${identity}:${target.path}`;
+  const blobs = /^index ([0-9a-f]+)\.\.([0-9a-f]+)/m.exec(sectionHeader(section));
+  if (!blobs) return `${key}: lockfile not reviewed: its patch names no base and candidate blob to bind it to the candidate`;
+  const binding = `Lockfile ${target.path}, reviewed whole in this chunk: candidate blob ${blobs[2]} (git's digest of its full bytes), ` +
+    `base blob ${blobs[1]}. The patch below is its complete patch, not a range.`;
+  if (binding.length + section.length > budget) {
+    return `${key}: lockfile not reviewed: its whole patch (${section.length} chars) exceeds the ${budget - binding.length} chars ` +
+      "one lockfile review chunk holds; a lockfile is not cut into ranges";
+  }
+  return { ...wholeFilePart(identity, section, [target]), lockfileBinding: binding };
 };
 
 /** One patch section's coverage: the path it changes and its position in the repository's patch. */
@@ -3275,10 +3329,15 @@ interface SectionTarget {
   section: number;
 }
 
-/** Split on file boundaries first, then bounded ranges when one file alone is oversized. */
+/**
+ * Split on file boundaries first, then bounded ranges when one file alone is oversized, except a
+ * lockfile, which stays whole (`lockfilePart`); a lockfile that cannot is added to `omitted`.
+ */
 const splitByFile = (
   repo: ReviewerDiff,
   budget: number,
+  lockfileBudget: number,
+  omitted: string[],
 ): ReviewChunkPart[] => {
   if (repo.diff.length <= budget) return [wholeFilePart(repo.identity, repo.diff, repo.files.map((path) => ({ path, section: 0 })))];
   const sections = repo.diff.split(/(?=^diff --git )/m).filter(Boolean);
@@ -3297,6 +3356,12 @@ const splitByFile = (
         // A malformed patch cannot be attributed to a touched path, so do not pretend a
         // range split supplies reviewable evidence for it.
         return [wholeFilePart(repo.identity, repo.diff, [])];
+      }
+      if (isLockfile(named)) {
+        const whole = lockfilePart(repo.identity, { path: named, section: index }, section, lockfileBudget);
+        if (typeof whole === "string") omitted.push(whole);
+        else parts.push(whole);
+        continue;
       }
       parts.push(...splitOversizedSection(repo.identity, { path: named, section: index }, section, budget));
       continue;
@@ -3351,4 +3416,4 @@ const splitOversizedSection = (
   return parts;
 };
 
-export const __testing = { splitDiffs, parseVerdict, worseVerdict, validateChunkCoverage, VERDICT_SCHEMA };
+export const __testing = { splitDiffs, parseVerdict, worseVerdict, validateChunkCoverage, VERDICT_SCHEMA, LOCKFILE_CHUNK_THRESHOLD_CHARS };
