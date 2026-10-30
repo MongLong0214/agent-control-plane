@@ -37,7 +37,8 @@ import { FRONTIER_SIMPLIFY_DIGEST } from "../review/frontier-simplify-policy.ts"
  *
  * - A frontier-simplify finding is accepted only from the check that produced it: a `method` finding in a
  *   BLIND_REVIEW artifact the blind-review gate stored, bound to that review's candidate, contract and
- *   reviewer session. Nothing a caller declares on its own is recorded for frontier-simplify.
+ *   reviewer session. Nothing a caller declares on its own is recorded for frontier-simplify. A method
+ *   finding never weighs on the candidate: the review keeps it apart from the candidate's findings.
  *
  * Storage is the state database's audit log, append-only: one `UPSTREAM_DOGFOOD_FINDING` row per finding
  * (its initial state included) and one `UPSTREAM_DOGFOOD_STATE` row per later state. The current state
@@ -108,20 +109,28 @@ type DogfoodFinding = z.output<typeof dogfoodFindingSchema>;
 // ---------------------------------------------------------------------------
 
 const PATH_END = "[^\\s`'\"<>)\\]]*";
+/**
+ * Every absolute path: home-relative, drive-rooted, or rooted at `/` anywhere but inside a URL or a
+ * relative path. Each is private unless `PUBLIC_PATHS` names it.
+ */
 const LOCAL_PATH = new RegExp(
-  `(?:~|\\$\\{?HOME\\}?)\\/${PATH_END}|(?<![A-Za-z0-9._~-])\\/(?:Users|home|private|var|tmp|opt|root|Volumes)\\/${PATH_END}|\\b[A-Za-z]:\\\\${PATH_END}`,
+  `(?:~|\\$\\{?HOME\\}?)\\/${PATH_END}|(?<![A-Za-z0-9._~:/\\\\-])\\/[A-Za-z0-9._~-]${PATH_END}|\\b[A-Za-z]:\\\\${PATH_END}`,
   "g",
 );
+/** The only absolute paths that name nothing about a machine or its owner. */
+const PUBLIC_PATHS: ReadonlySet<string> = new Set(["/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr"]);
+const isPublicPath = (path: string): boolean => PUBLIC_PATHS.has(path.replace(/[.,;:!?]+$/, ""));
+const hasPrivatePath = (value: string): boolean => [...value.matchAll(LOCAL_PATH)].some(([path]) => !isPublicPath(path));
 const EMAIL = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
 const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
 const SESSION_ID = /\b(?:ses|sess|session)_[A-Za-z0-9]{8,}/g;
 const RUN_ID = /\brun_[0-9a-f]{24}\b/g;
 const MENTION = /(^|[^\w`])@([A-Za-z0-9][A-Za-z0-9-]*)/g;
 
-/** Credentials, local paths, addresses and run or session ids replaced. */
+/** Credentials, private paths, addresses and run or session ids replaced. */
 export const scrubPublicText = (value: string): string =>
   redactCredentialShapes(value)
-    .replace(LOCAL_PATH, "<local-path>")
+    .replace(LOCAL_PATH, (path) => (isPublicPath(path) ? path : "<local-path>"))
     .replace(EMAIL, "<email>")
     .replace(UUID, "<id>")
     .replace(SESSION_ID, "<id>")
@@ -130,8 +139,9 @@ export const scrubPublicText = (value: string): string =>
 /** A mention in prose notifies someone upstream; as code it does not. Evidence is fenced already. */
 const inertMentions = (value: string): string => value.replace(MENTION, "$1`@$2`");
 
-/** The publication scan's rules and the credential shapes both find nothing. */
-export const isPublicSafe = (value: string): boolean => publicTextRefusals(value).length === 0 && !hasCredentialShape(value);
+/** The publication scan's rules, the credential shapes and the private-path rule all find nothing. */
+export const isPublicSafe = (value: string): boolean =>
+  publicTextRefusals(value).length === 0 && !hasCredentialShape(value) && !hasPrivatePath(value);
 
 const SUMMARY_FIELDS = ["title", "problem", "expected", "actual", "reproduction", "impact", "workaround"] as const;
 type SummaryField = (typeof SUMMARY_FIELDS)[number];
@@ -350,11 +360,14 @@ const reviewPacketSchema = z
     candidateSnapshotDigest: z.string(),
     contractDigest: z.string(),
     reviewerSessionId: z.string().min(1),
-    findings: z.array(
-      z.object({ category: z.string(), severity: z.string(), summary: z.string(), detail: z.string() }).passthrough(),
-    ),
+    methodFindings: z
+      .array(z.object({ category: z.literal("method"), severity: z.string(), summary: z.string(), detail: z.string() }).passthrough())
+      .default([]),
   })
   .passthrough();
+
+/** A stored review the gate wrote, read for its method findings. */
+type BoundReview = { artifactId: string; packet: z.output<typeof reviewPacketSchema> };
 
 const FRONTIER_SIMPLIFY_REVISION = FRONTIER_SIMPLIFY_DIGEST.replace(/^sha256:/, "").slice(0, 12);
 
@@ -413,7 +426,9 @@ export class DogfoodFindingStore {
   /**
    * Records a CommitLore finding, idempotently: the same finding with the same public evidence is one
    * record, so a restart, a retry or a second project meeting it adds nothing. A frontier-simplify
-   * finding is refused here: it is accepted only through `recordReviewMethodFindings`. Never throws: a
+   * finding is refused here: it is accepted only through `recordReviewMethodFindings` and
+   * `recordAcrossProducts`, bound to the stored review. A finding recorded again whose cause is now
+   * established as the product's releases a record kept back only for its cause. Never throws: a
    * failure to record is a refusal, never the outcome of the work that found it.
    */
   record(input: unknown, origin: DogfoodOrigin): Decision<DogfoodRecord> {
@@ -440,48 +455,104 @@ export class DogfoodFindingStore {
    * records nothing; no other statement about frontier-simplify is ever recorded.
    */
   recordReviewMethodFindings(runId: string, artifactId: string): Decision<DogfoodRecord[]> {
-    const unbound = (why: string) =>
-      deny<DogfoodRecord[]>(ReasonCode.VERIFICATION_GAP, `the review's method findings cannot be bound: ${why}`, {
-        refusal: FRONTIER_SIMPLIFY_EVIDENCE_UNBOUND,
-        runId,
-        artifactId,
-      });
+    const review = this.#boundReview(runId, artifactId);
+    if (!review.allowed) return review as Decision<never>;
+    const recorded: DogfoodRecord[] = [];
+    let refused = 0;
+    review.value.packet.methodFindings.forEach((_, findingIndex) => {
+      const stored = this.#storeMethodFinding(review.value, findingIndex);
+      if (stored.allowed) recorded.push(stored.value);
+      else refused += 1;
+    });
+    return allow(ReasonCode.OK, recorded, { refused });
+  }
+
+  /**
+   * A stored review's method finding that is CommitLore's too, split so each tracker gets its own side
+   * (`splitAcrossProducts`): the frontier-simplify side is the review's own record of that finding, the
+   * CommitLore side the caller's statement of CommitLore's part, and each names the other. Both are bound
+   * to the review; refused, like `recordReviewMethodFindings`, unless the gate stored it.
+   */
+  recordAcrossProducts(
+    review: { runId: string; artifactId: string; findingIndex: number },
+    commitlore: { signature: string; expected: string; productRevision: string },
+    origin: DogfoodOrigin,
+  ): Decision<[DogfoodRecord, DogfoodRecord]> {
+    const bound = this.#boundReview(review.runId, review.artifactId);
+    if (!bound.allowed) return bound as Decision<never>;
+    if (bound.value.packet.methodFindings[review.findingIndex] === undefined) {
+      return this.#unbound(review.runId, review.artifactId, "the review has no method finding at that index") as Decision<never>;
+    }
+    const own = this.#methodFindingInput(bound.value, review.findingIndex);
+    const { product: _product, signature, expected, productRevision, related: _related, ...shared } = own;
+    let halves: [DogfoodFindingInput, DogfoodFindingInput];
+    try {
+      halves = splitAcrossProducts(shared, [
+        { product: "frontier-simplify", signature, expected, productRevision },
+        { product: "commitlore", ...commitlore },
+      ]);
+    } catch (error) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "the finding could not be split", { message: (error as Error).message.slice(0, 300) });
+    }
+    const binding = this.#binding(bound.value, review.findingIndex);
+    const sides = halves.map((half) => dogfoodFindingSchema.safeParse(half));
+    if (!sides[0]!.success || !sides[1]!.success) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "the CommitLore side is not a dogfood finding this store records", {});
+    }
+    const methodSide = this.#store(sides[0]!.data, binding, { runId: review.runId, actor: "blind-review-gate" });
+    if (!methodSide.allowed) return methodSide as Decision<never>;
+    const commitloreSide = this.#store(sides[1]!.data, binding, origin);
+    if (!commitloreSide.allowed) return commitloreSide as Decision<never>;
+    return allow(ReasonCode.OK, [methodSide.value, commitloreSide.value]);
+  }
+
+  #unbound(runId: string, artifactId: string, why: string): Decision<never> {
+    return deny(ReasonCode.VERIFICATION_GAP, `the review's method findings cannot be bound: ${why}`, {
+      refusal: FRONTIER_SIMPLIFY_EVIDENCE_UNBOUND,
+      runId,
+      artifactId,
+    });
+  }
+
+  /** The BLIND_REVIEW the blind-review gate stored for this run and candidate, or the refusal to bind to it. */
+  #boundReview(runId: string, artifactId: string): Decision<BoundReview> {
     let artifacts: ReturnType<ArtifactStore["list"]>;
     try {
       artifacts = this.#deps.artifacts.list(runId, ArtifactKind.BLIND_REVIEW);
     } catch {
-      return unbound("the run's reviews could not be read");
+      return this.#unbound(runId, artifactId, "the run's reviews could not be read");
     }
     const artifact = artifacts.find((candidate) => candidate.artifactId === artifactId);
-    if (artifact === undefined) return unbound("no stored review of this run has that id");
+    if (artifact === undefined) return this.#unbound(runId, artifactId, "no stored review of this run has that id");
     if (artifact.producedBy !== "blind-review-gate" || artifact.candidateSnapshotDigest === null) {
-      return unbound("the artifact is not a review the blind-review gate stored");
+      return this.#unbound(runId, artifactId, "the artifact is not a review the blind-review gate stored");
     }
     const packet = reviewPacketSchema.safeParse(artifact.content);
     if (!packet.success || packet.data.runId !== runId || packet.data.candidateSnapshotDigest !== artifact.candidateSnapshotDigest) {
-      return unbound("the stored review does not name this run and candidate");
+      return this.#unbound(runId, artifactId, "the stored review does not name this run and candidate");
     }
-    const recorded: DogfoodRecord[] = [];
-    let refused = 0;
-    packet.data.findings.forEach((finding, findingIndex) => {
-      if (finding.category !== "method") return;
-      const input = dogfoodFindingSchema.safeParse(
-        reviewMethodFinding(finding, `blind review ${artifact.artifactId}, finding ${findingIndex}`),
-      );
-      const stored = input.success
-        ? this.#store(input.data, {
-            runId,
-            artifactId: artifact.artifactId,
-            candidateSnapshotDigest: packet.data.candidateSnapshotDigest,
-            contractDigest: packet.data.contractDigest,
-            reviewerSessionId: packet.data.reviewerSessionId,
-            findingIndex,
-          }, { runId, actor: "blind-review-gate" })
-        : null;
-      if (stored?.allowed) recorded.push(stored.value);
-      else refused += 1;
-    });
-    return allow(ReasonCode.OK, recorded, { refused });
+    return allow(ReasonCode.OK, { artifactId: artifact.artifactId, packet: packet.data });
+  }
+
+  #binding(review: BoundReview, findingIndex: number): ReviewBinding {
+    return {
+      runId: review.packet.runId,
+      artifactId: review.artifactId,
+      candidateSnapshotDigest: review.packet.candidateSnapshotDigest,
+      contractDigest: review.packet.contractDigest,
+      reviewerSessionId: review.packet.reviewerSessionId,
+      findingIndex,
+    };
+  }
+
+  #methodFindingInput(review: BoundReview, findingIndex: number): DogfoodFindingInput {
+    return reviewMethodFinding(review.packet.methodFindings[findingIndex]!, `blind review ${review.artifactId}, method finding ${findingIndex}`);
+  }
+
+  #storeMethodFinding(review: BoundReview, findingIndex: number): Decision<DogfoodRecord> {
+    const input = dogfoodFindingSchema.safeParse(this.#methodFindingInput(review, findingIndex));
+    if (!input.success) return deny(ReasonCode.INVALID_ARGUMENT, "the method finding is not a dogfood finding this store records", {});
+    return this.#store(input.data, this.#binding(review, findingIndex), { runId: review.packet.runId, actor: "blind-review-gate" });
   }
 
   #store(finding: DogfoodFinding, binding: ReviewBinding | null, origin: DogfoodOrigin): Decision<DogfoodRecord> {
@@ -492,6 +563,7 @@ export class DogfoodFindingStore {
         canonicalJson({
           key,
           revision: finding.productRevision,
+          problem: normalise(payload.fields.problem),
           actual: normalise(payload.fields.actual),
           evidence: payload.evidence,
           withheld: payload.evidenceWithheld,
@@ -500,9 +572,15 @@ export class DogfoodFindingStore {
       const id = `${key}-${evidenceKey}`;
       return this.#deps.db.tx(() => {
         const existing = this.get(id);
-        if (existing !== null) return allow(ReasonCode.OK, existing, { replayed: true });
         const now = this.#clock.nowIso();
         const reason = triage(finding, unsafe);
+        if (existing !== null) {
+          // A cause established since (undetermined, then product) releases what was kept back for its cause.
+          const held = existing.state.status === "NOT_REPORTED" && existing.state.reason !== "NOT_PUBLIC_SAFE";
+          if (!held || reason !== null) return allow(ReasonCode.OK, existing, { replayed: true });
+          const released = this.transition(existing, { status: "QUEUED", attempts: 0, nextAttemptAt: now, lastError: null }, origin.actor);
+          return allow(ReasonCode.OK, released, { replayed: true, released: true });
+        }
         const record: DogfoodRecord = {
           id,
           key,
@@ -587,13 +665,13 @@ export class DogfoodFindingStore {
   }
 
   /** Moves a record from the state it was read in; a record that moved meanwhile is left alone. */
-  transition(record: DogfoodRecord, state: DogfoodState): DogfoodRecord {
+  transition(record: DogfoodRecord, state: DogfoodState, actor = "upstream-dogfood-reporter"): DogfoodRecord {
     return this.#deps.db.tx(() => {
       const current = this.get(record.id);
       if (current === null || canonicalJson(current.state) !== canonicalJson(record.state)) {
         throw acpError(ReasonCode.INVALID_ARGUMENT, "the dogfood record changed under this transition", { id: record.id });
       }
-      this.#append({ kind: DOGFOOD_STATE_KIND, runId: current.binding?.runId ?? null, actor: "upstream-dogfood-reporter", evidence: { findingId: record.id, state } });
+      this.#append({ kind: DOGFOOD_STATE_KIND, runId: current.binding?.runId ?? null, actor, evidence: { findingId: record.id, state } });
       return { ...current, state };
     });
   }
@@ -841,7 +919,9 @@ const footer = (record: DogfoodRecord): string[] => [
   `Reported from agent-control-plane's use of ${record.product}. Correlation: \`${keyToken(record.key)}\` \`${evidenceToken(record.evidenceKey)}\``,
 ];
 
-const issueBody = (record: DogfoodRecord, extra: { previous?: UpstreamIssue; related?: string | null }): string => {
+type Counterpart = { product: DogfoodProduct; key: string; url: string | null };
+
+const issueBody = (record: DogfoodRecord, extra: { previous?: UpstreamIssue; related: Counterpart | null }): string => {
   const { fields } = record.public;
   const lines = [
     record.kind === "improvement" ? "## Use case" : "## Problem",
@@ -859,14 +939,23 @@ const issueBody = (record: DogfoodRecord, extra: { previous?: UpstreamIssue; rel
     fields.workaround,
   ];
   if (extra.previous) lines.push("", "## Regression", `Previously reported as ${extra.previous.url}, which is closed; this is a new observation at the revision above.`);
-  if (record.related) {
-    lines.push("", "## Related", `The ${record.related.product} side of this finding: ${extra.related ?? `correlation \`${keyToken(record.related.key)}\` in ${UPSTREAM_REPOSITORIES[record.related.product]}`}.`);
+  const related = extra.related;
+  if (related) {
+    lines.push("", "## Related", `The ${related.product} side of this finding: ${related.url ?? `correlation \`${keyToken(related.key)}\` in ${UPSTREAM_REPOSITORIES[related.product]}`}.`);
   }
   return [...lines, ...footer(record)].join("\n");
 };
 
 const commentBody = (record: DogfoodRecord): string =>
-  ["New observation of this finding.", "", ...observationSection(record), ...footer(record)].join("\n");
+  [
+    "New observation of this finding.",
+    "",
+    record.kind === "improvement" ? "## Use case" : "## Problem",
+    record.public.fields.problem,
+    "",
+    ...observationSection(record),
+    ...footer(record),
+  ].join("\n");
 
 type Plan =
   | { action: "created" }
@@ -912,8 +1001,8 @@ const errorText = (error: unknown): string => {
 
 /**
  * Reports due findings. One pass per record: read the tracker for the finding's token, link what is
- * there, otherwise store the intent and write once, then read the write back. In-process claims keep two
- * passes off one record; the daemon is the single writer. Nothing a pass meets escapes it: a failure is
+ * there, otherwise store the intent and write once, then read the write back. In-process claims on the
+ * finding key keep two passes off one finding; the daemon is the single writer. Nothing a pass meets escapes it: a failure is
  * the record's state, never the caller's exception, so no other work waits on a tracker.
  */
 export class UpstreamDogfoodReporter {
@@ -960,8 +1049,9 @@ export class UpstreamDogfoodReporter {
       return summary;
     }
     for (const record of due) {
-      if (this.#claims.has(record.id)) continue;
-      this.#claims.add(record.id);
+      // Claimed by the finding, not the observation: two observations of one finding share its issue.
+      if (this.#claims.has(record.key)) continue;
+      this.#claims.add(record.key);
       try {
         const after = await this.#pass(record, publisher);
         const status = after.state.status;
@@ -971,7 +1061,7 @@ export class UpstreamDogfoodReporter {
       } catch {
         summary.waiting.push(record.id);
       } finally {
-        this.#claims.delete(record.id);
+        this.#claims.delete(record.key);
       }
     }
     return summary;
@@ -1001,7 +1091,7 @@ export class UpstreamDogfoodReporter {
     const body =
       plan.action === "commented"
         ? commentBody(record)
-        : issueBody(record, { ...(plan.action === "regression" ? { previous: plan.previous } : {}), related: this.#relatedUrl(record) });
+        : issueBody(record, { ...(plan.action === "regression" ? { previous: plan.previous } : {}), related: this.#counterpart(record) });
     // The publication scan's last word on the exact text, before anything is stored as sent.
     if (!isPublicSafe(body) || !isPublicSafe(title)) {
       return this.store.transition(record, { status: "UNPUBLISHED", attempts: attempt, reason: "NOT_PUBLIC_SAFE", lastError: null, at: now });
@@ -1034,7 +1124,22 @@ export class UpstreamDogfoodReporter {
   async #locate(record: DogfoodRecord, repository: string, port: UpstreamIssuePort): Promise<Located> {
     const token = keyToken(record.key);
     const evidence = evidenceToken(record.evidenceKey);
-    const issues = (await port.findIssues(repository, token)).filter((issue) => issue.body.includes(token));
+    // Discovery only names candidates; each is read exactly, and only what that read shows decides.
+    const issues: UpstreamIssue[] = [];
+    for (const found of await port.findIssues(repository, token)) {
+      let read: UpstreamIssue;
+      try {
+        read = await port.readIssue(repository, found.number);
+      } catch (error) {
+        // An issue the index still lists but GitHub no longer has is no candidate.
+        const status = refusedStatus(error);
+        if (status === 404 || status === 410) continue;
+        throw error;
+      }
+      if (read.number === found.number && read.url.startsWith(`https://github.com/${repository}/issues/${found.number}`) && read.body.includes(token)) {
+        issues.push(read);
+      }
+    }
     const carrying = issues.find((issue) => issue.body.includes(evidence));
     if (carrying) return { linked: { issue: carrying, comment: null } };
     const comments = new Map<number, UpstreamComment[]>();
@@ -1047,13 +1152,13 @@ export class UpstreamDogfoodReporter {
     const open = issues.find((issue) => issue.state === "open");
     if (open) return { plan: { action: "commented", issue: open } };
     if (issues.length === 0) return { plan: { action: "created" } };
-    // Every issue for this finding is closed. One that already records this revision is this
-    // observation's issue and is linked as it is; a new revision is a regression.
+    // Every issue for this finding is closed. New evidence at a revision one of them records is posted
+    // there; a new revision is a regression.
     const line = revisionLine(record.revision);
     const sameRevision = issues.find(
       (issue) => issue.body.includes(line) || (comments.get(issue.number) ?? []).some((comment) => comment.body.includes(line)),
     );
-    if (sameRevision) return { linked: { issue: sameRevision, comment: null } };
+    if (sameRevision) return { plan: { action: "commented", issue: sameRevision } };
     return { plan: { action: "regression", previous: issues[issues.length - 1]! } };
   }
 
@@ -1075,16 +1180,20 @@ export class UpstreamDogfoodReporter {
     );
   }
 
-  #relatedUrl(record: DogfoodRecord): string | null {
-    if (record.related === null) return null;
-    const related = record.related;
+  /**
+   * The other side of a finding split across products: the one this record names, or the one naming it
+   * (a review's own record is stored before its CommitLore side is), with its issue once linked.
+   */
+  #counterpart(record: DogfoodRecord): Counterpart | null {
     try {
-      const linked = this.store
-        .list()
-        .records.find((other) => other.product === related.product && other.key === related.key && other.state.status === "LINKED");
-      return linked && linked.state.status === "LINKED" ? linked.state.url : null;
+      const records = this.store.list().records;
+      const naming = records.find((other) => other.related?.product === record.product && other.related.key === record.key);
+      const side = record.related ?? (naming ? { product: naming.product, key: naming.key } : null);
+      if (side === null) return null;
+      const linked = records.find((other) => other.product === side.product && other.key === side.key && other.state.status === "LINKED");
+      return { ...side, url: linked?.state.status === "LINKED" ? linked.state.url : null };
     } catch {
-      return null;
+      return record.related === null ? null : { ...record.related, url: null };
     }
   }
 

@@ -5,7 +5,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanTreeManifest, bootstrapOperations } from "../helpers/bootstrap-plan.ts";
 import { type Operation, noGitHubCall, ownerApprovalFor, prepareBootstrapRun } from "../helpers/bootstrap-runner.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { driveToReviewedCandidate, makeHarness } from "../helpers/harness.ts";
+import { approveReviewedCandidateForFinalization, driveToReviewedCandidate, makeHarness } from "../helpers/harness.ts";
 
 /**
  * #1271 — upstream dogfood findings are recorded in ACP's own storage (the state database's audit log) by
@@ -120,5 +120,26 @@ describe("a dogfood finding is recorded in ACP storage by its production produce
         state: { status: "QUEUED" },
       },
     });
+  });
+
+  it("a method finding, even a BLOCKER, is a dogfood record only: the candidate's review passes the production gate", async () => {
+    const harness = makeHarness();
+    const reviewed = await driveToReviewedCandidate(harness, {
+      projectId: "dogfood-method-blocker",
+      reviewerFindings: [{
+        category: "method",
+        severity: "BLOCKER",
+        repository: "github:acme/fixture",
+        path: null,
+        summary: "The method names no rule for when a review round may stop",
+        detail: "Nothing in the method ends a round, so a reviewer can hold any candidate indefinitely.",
+      }],
+    });
+    await expect(approveReviewedCandidateForFinalization(harness, reviewed, { bypassCeoConfirmation: true })).resolves.toBeUndefined();
+    const review = harness.cp.artifacts.latestForSnapshot<{ findings: Array<{ category: string }> }>(
+      reviewed.runId, "BLIND_REVIEW", reviewed.candidateSnapshotDigest,
+    )!;
+    expect(review.content.findings.filter((finding) => finding.category === "method")).toEqual([]);
+    expect(harness.cp.audit.byKind(FINDING_KIND)).toHaveLength(1);
   });
 });

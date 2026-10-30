@@ -14,6 +14,7 @@ import {
   commitloreObservationFinding,
   findingKey,
   githubUpstreamIssuePort,
+  isPublicSafe,
   splitAcrossProducts,
 } from "../../src/quality/upstream-dogfood.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
@@ -45,6 +46,8 @@ class FakeTracker implements GitHubClient {
   loseAnswer: RegExp[] = [];
   /** The search index has not seen anything yet. */
   searchLags = false;
+  /** The search index still holds these bodies, by issue number, after the issues were edited. */
+  staleSearch = new Map<number, string>();
   /** Runs on each issue the tracker creates, as an edit by someone else would. */
   onCreate: ((issue: FakeIssue) => void) | null = null;
   #next = 1;
@@ -71,6 +74,13 @@ class FakeTracker implements GitHubClient {
     return this.calls.filter((call) => call.startsWith("POST"));
   }
 
+  /** An issue someone else already filed. */
+  seed(repo: string, body: string): FakeIssue {
+    const issue: FakeIssue = { number: this.#next++, state: "open", title: "Filed elsewhere", body, repo, comments: [] };
+    this.issues.push(issue);
+    return issue;
+  }
+
   #raw(issue: FakeIssue) {
     return {
       number: issue.number,
@@ -91,7 +101,8 @@ class FakeTracker implements GitHubClient {
     if (method === "GET" && url.pathname === "/search/issues") {
       if (this.searchLags) return { items: [] };
       const [token, repo] = url.searchParams.get("q")!.split(" ");
-      return { items: this.issues.filter((issue) => `repo:${issue.repo}` === repo && issue.body.includes(token!)).map((issue) => this.#raw(issue)) };
+      const indexed = this.issues.map((issue) => ({ ...issue, body: this.staleSearch.get(issue.number) ?? issue.body }));
+      return { items: indexed.filter((issue) => `repo:${issue.repo}` === repo && issue.body.includes(token!)).map((issue) => this.#raw(issue)) };
     }
     const list = /^\/repos\/([^/]+\/[^/]+)\/issues$/.exec(url.pathname);
     if (list && method === "GET") {
@@ -283,16 +294,18 @@ describe("a dogfood finding reaches its own upstream tracker once, and is read b
     expect(tracker.writes()).toHaveLength(2);
   });
 
-  it("a closed issue: the revision it records links as it is, a new revision opens a regression naming it", async () => {
+  it("a closed issue: new evidence at the revision it records is posted to it, a new revision opens a regression naming it", async () => {
     const { tracker, store, reporter } = setup();
     recorded(store, finding({ kind: "defect", productRevision: "rev-a" }));
     await reporter().reportDue();
     tracker.issues[0]!.state = "closed";
 
+    // A matching revision is not proof that this evidence is upstream: it is posted, then linked.
     const stale = recorded(store, finding({ kind: "defect", productRevision: "rev-a", actual: "Seen again on the old revision." }));
     await reporter().reportDue();
-    expect(store.get(stale.id)!.state).toMatchObject({ status: "LINKED", action: "existing", issueNumber: 1 });
-    expect(tracker.writes()).toHaveLength(1);
+    expect(store.get(stale.id)!.state).toMatchObject({ status: "LINKED", action: "commented", issueNumber: 1 });
+    expect(tracker.issues[0]!.comments.map((comment) => comment.body.includes(`acpevidence${stale.evidenceKey}`))).toEqual([true]);
+    expect(tracker.writes()).toHaveLength(2);
 
     const regression = recorded(store, finding({ kind: "defect", productRevision: "rev-b" }));
     await reporter().reportDue();
@@ -302,21 +315,45 @@ describe("a dogfood finding reaches its own upstream tracker once, and is read b
     expect(store.get(regression.id)!.state).toMatchObject({ status: "LINKED", action: "regression", issueNumber: 2 });
   });
 
-  it("a finding across both products is split; the CommitLore side names the other, which only a stored review may record", async () => {
-    const { tracker, store, reporter } = setup();
-    const [commitlore, frontier] = splitAcrossProducts(
-      { ...finding(), kind: "defect" },
-      [
-        { product: "commitlore", signature: "capture.rejects-review-record", expected: "CommitLore accepts the record the method asks for.", productRevision: "1.7.5" },
-        { product: "frontier-simplify", signature: "method.asks-unrecordable-record", expected: "The method asks only for a record CommitLore accepts.", productRevision: "0d788506" },
-      ],
-    );
-    recorded(store, commitlore);
-    expect(store.record(frontier, ORIGIN)).toMatchObject({ allowed: false, evidence: { refusal: "FRONTIER_SIMPLIFY_EVIDENCE_UNBOUND" } });
+  it("a finding across both products is split, each side to its own tracker, cross-linked, the frontier-simplify side bound to its review", async () => {
+    const { harness, tracker, store, reporter } = setup();
+    const reviewed = await driveToReviewedCandidate(harness, {
+      reviewerFindings: [{
+        category: "method",
+        severity: "MAJOR",
+        repository: "github:acme/fixture",
+        path: null,
+        summary: "The method asks for a review record CommitLore rejects",
+        detail: "The method asks for a Ruled-out line without an alternative, which the CommitLore verifier refuses.",
+      }],
+    });
+    const review = harness.cp.artifacts.latestForSnapshot(reviewed.runId, "BLIND_REVIEW", reviewed.candidateSnapshotDigest)!;
+    const side = { signature: "capture.rejects-review-record", expected: "CommitLore accepts the record the method asks for.", productRevision: "1.7.5" };
+    // Unbound, the frontier-simplify half is refused; bound to the review's method finding, both are kept.
+    const [, unbound] = splitAcrossProducts({ ...finding(), kind: "defect" }, [
+      { product: "commitlore", ...side },
+      { product: "frontier-simplify", signature: "method.asks-unrecordable-record", expected: "The method asks only for a record CommitLore accepts.", productRevision: "0d788506" },
+    ]);
+    expect(store.record(unbound, ORIGIN)).toMatchObject({ allowed: false, evidence: { refusal: "FRONTIER_SIMPLIFY_EVIDENCE_UNBOUND" } });
+    expect(store.recordAcrossProducts({ runId: reviewed.runId, artifactId: "art_missing", findingIndex: 0 }, side, ORIGIN))
+      .toMatchObject({ allowed: false, evidence: { refusal: "FRONTIER_SIMPLIFY_EVIDENCE_UNBOUND" } });
+    const split = store.recordAcrossProducts({ runId: reviewed.runId, artifactId: review.artifactId, findingIndex: 0 }, side, ORIGIN);
+    if (!split.allowed) throw new Error(split.message);
+    const [right, left] = split.value;
+    expect([right.product, left.product]).toEqual(["frontier-simplify", "commitlore"]);
+    expect(right.binding).toMatchObject({ artifactId: review.artifactId, findingIndex: 0 });
+    // The review's own record is the frontier-simplify side: one finding, one record.
+    expect(store.list().records.filter((record) => record.product === "frontier-simplify")).toHaveLength(1);
+
     await reporter().reportDue();
-    expect(tracker.issues.map((issue) => issue.repo)).toEqual([CL]);
-    expect(tracker.issues[0]!.body).toContain("## Related");
-    expect(tracker.issues[0]!.body).toContain(`acpdogfood${findingKey(frontier)}\` in ${FS}`);
+    expect(tracker.issues.map((issue) => issue.repo).sort()).toEqual([CL, FS].sort());
+    const bodyOf = (repo: string) => tracker.issues.find((issue) => issue.repo === repo)!.body;
+    expect(bodyOf(CL)).toContain("## Related");
+    expect(bodyOf(FS)).toContain("## Related");
+    expect(bodyOf(CL)).toMatch(new RegExp(`acpdogfood${right.key}|github\\.com/${FS}/issues/`));
+    expect(bodyOf(FS)).toMatch(new RegExp(`acpdogfood${left.key}|github\\.com/${CL}/issues/`));
+    // The side reported second names the first by its URL.
+    expect([bodyOf(CL), bodyOf(FS)].some((body) => /https:\/\/github\.com\/MongLong0214\/[a-z-]+\/issues\/\d+\./.test(body))).toBe(true);
   });
 
   it("secrets, local paths, ids and the private reference never reach the tracker or the stored record", async () => {
@@ -445,5 +482,79 @@ describe("a dogfood finding reaches its own upstream tracker once, and is read b
     expect(summary.waiting).toEqual([stuck.id]);
     expect(summary.unreadable).toEqual([`audit:${unreadable.allowed ? unreadable.value : "?"}`]);
     expect(store.get(stuck.id)!.state).toMatchObject({ status: "QUEUED", attempts: 1, lastError: "no answer from GitHub" });
+  });
+
+  it("two method findings with one summary and different details are two records, and the second detail reaches the tracker", async () => {
+    const { harness, tracker, store, reporter } = setup();
+    const method = (detail: string) => ({
+      category: "method", severity: "MINOR", repository: "github:acme/fixture", path: null, summary: "State when a review round may stop", detail,
+    });
+    await driveToReviewedCandidate(harness, {
+      reviewerFindings: [
+        method("Round three re-raised a finding round two had answered."),
+        method("Round four reopened a scope question the contract had already settled."),
+      ],
+    });
+    const records = store.list().records;
+    expect(records).toHaveLength(2);
+    expect(new Set(records.map((record) => record.key)).size).toBe(1);
+    await reporter().reportDue();
+    expect(tracker.issues).toHaveLength(1);
+    const upstream = [tracker.issues[0]!.body, ...tracker.issues[0]!.comments.map((comment) => comment.body)].join("\n");
+    expect(upstream).toContain("Round three re-raised a finding round two had answered.");
+    expect(upstream).toContain("Round four reopened a scope question the contract had already settled.");
+  });
+
+  it("an absolute path outside the public allowlist is private: scrubbed before storage, and refused by the publication check", async () => {
+    const { tracker, store, reporter } = setup();
+    const record = recorded(store, finding({
+      title: "Capture of /workspace/private-customer/project stalls",
+      actual: "Failed reading /workspace/private-customer/project/errors.log; output went to /dev/null.",
+    }));
+    await reporter().reportDue();
+    expect(store.get(record.id)!.state.status).toBe("LINKED");
+    const [issue] = tracker.issues;
+    expect(issue!.title + issue!.body).not.toContain("private-customer");
+    expect(issue!.body).toContain("/dev/null");
+    expect(isPublicSafe("Failed reading /workspace/private-customer/project/errors.log")).toBe(false);
+    expect(isPublicSafe("See https://github.com/MongLong0214/commitlore/issues/1 and /dev/null.")).toBe(true);
+  });
+
+  it("concurrent passes over two observations of one finding write one issue and one comment", async () => {
+    const { tracker, store, reporter } = setup();
+    const first = recorded(store, finding());
+    const second = recorded(store, finding({ productRevision: "1.7.6" }));
+    expect(second.key).toBe(first.key);
+    const shared = reporter();
+    await Promise.all([shared.reportDue(), shared.reportDue()]);
+    await shared.reportDue();
+    expect(tracker.issues).toHaveLength(1);
+    expect(tracker.issues[0]!.comments).toHaveLength(1);
+    expect([first, second].map((record) => store.get(record.id)!.state.status)).toEqual(["LINKED", "LINKED"]);
+  });
+
+  it("discovery is not readback: an issue the search index still shows with the tokens is read exactly before it is linked", async () => {
+    const { tracker, store, reporter } = setup();
+    const record = recorded(store, finding());
+    const carried = `Filed by hand. acpdogfood${record.key} acpevidence${record.evidenceKey}`;
+    const edited = tracker.seed(CL, carried);
+    tracker.staleSearch.set(edited.number, carried);
+    edited.body = "The correlation was edited away.";
+    await reporter().reportDue();
+    expect(tracker.calls).toContain(`GET /repos/${CL}/issues/${edited.number}`);
+    const state = store.get(record.id)!.state;
+    expect(state.status === "LINKED" && state.issueNumber).not.toBe(edited.number);
+  });
+
+  it("a finding kept back for an undetermined cause is released when the same evidence is recorded as a product defect", async () => {
+    const { tracker, store, reporter } = setup();
+    const undetermined = recorded(store, finding({ kind: "defect", cause: "undetermined" }));
+    expect(undetermined.state).toMatchObject({ status: "NOT_REPORTED", reason: "CAUSE_UNDETERMINED" });
+    const product = recorded(store, finding({ kind: "defect", cause: "product" }));
+    expect(product.id).toBe(undetermined.id);
+    expect(store.get(product.id)!.state.status).toBe("QUEUED");
+    await reporter().reportDue();
+    expect(tracker.issues).toHaveLength(1);
+    expect(store.get(product.id)!.state).toMatchObject({ status: "LINKED", action: "created" });
   });
 });

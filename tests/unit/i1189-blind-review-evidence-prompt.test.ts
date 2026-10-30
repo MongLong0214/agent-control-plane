@@ -535,7 +535,7 @@ describe("#1189 §2.B: the verdict shape and the reviewer's means are unchanged"
               // #1271 added `method`: a finding about the frontier-simplify method itself, recorded upstream.
               category: {
                 type: "string",
-                description: "method: a defect or gap in the frontier-simplify review method itself, not in the candidate.",
+                description: "method: a defect or gap in the frontier-simplify review method itself, not in the candidate. It is recorded for frontier-simplify and is never a reason for the verdict.",
                 enum: ["correctness", "regression", "security", "scope", "performance", "maintainability", "evidence", "freshness", "source", "method"],
               },
               severity: { type: "string", enum: ["INFO", "MINOR", "MAJOR", "BLOCKER"] },
