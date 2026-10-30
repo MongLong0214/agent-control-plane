@@ -168,7 +168,11 @@ try {
   // project, whose room retirement never asks to archive (C9-2).
   // #1251 C10 — a recorded room this key cannot read (`channels get` answers null: an archived room it lost membership
   // of, or one that was deleted) is never treated as settled either; it refuses, naming the room and how an owner
-  // restores visibility or confirms its fate, before any host write.
+  // restores visibility, before any host write.
+  // #1251 C11 — the only remedy offered is one that actually changes what this key's rerun will see: restoring its
+  // membership. An owner reading the room with their own key proves nothing to a rerun, which still queries with this
+  // key; offering it as an alternative left an identical refusal (C11-1). If membership cannot be restored (the room
+  // was deleted), say so plainly and name a CEO decision, not a rerun — never pass the refusal through as settled.
   const activeRooms = (name, pk, keyFile, recorded) => {
     const roster = existsSync(rosterFile) ? read(rosterFile) : {channels:{}};
     check(object(roster) && object(roster.channels),'invalid roster channels');
@@ -177,9 +181,8 @@ try {
     if (typeof recorded !== 'string') return found;
     const room = buzz(['channels','get','--channel',recorded],keyFile);
     if (!(object(room) && room.channel_id === recorded && typeof room.name === 'string' && room.name.length > 0))
-      refuseWithOrder(`this run's earlier key (pubkey ${pk}), moved aside to ${dirname(keyFile)}, cannot read its recorded Buzz room ${recorded}: it may have lost membership of that room, archived or not, or the room may have been deleted`,
-        `have an owner add pubkey ${pk} back to room ${recorded} as a member (buzz channels add-member --channel ${recorded} --pubkey ${pk} --role member) so retirement can read it and verify its archive`,
-        `or have an owner confirm room ${recorded}'s archive or deletion directly with its owner key (buzz channels get --channel ${recorded})`);
+      refuseWithOrder(`this run's earlier key (pubkey ${pk}), moved aside to ${dirname(keyFile)}, cannot read its recorded Buzz room ${recorded}: it may have lost membership of that room, archived or not, or the room may have been deleted, in which case retirement cannot verify it and this needs a CEO decision, not a rerun`,
+        `have an owner add pubkey ${pk} back to room ${recorded} as a member (buzz channels add-member --channel ${recorded} --pubkey ${pk} --role member) so retirement can read it and verify its archive`);
     return roomArchived(room.name,recorded,keyFile) ? found : [room,...found];
   };
   const rosterFile = join(home,'.hermes','bridge','required-mentions.json');

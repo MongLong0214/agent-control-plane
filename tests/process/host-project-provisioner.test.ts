@@ -1159,14 +1159,13 @@ it('#1251 C10: an earlier key that cannot read its recorded room is refused with
   const before = snapshot();
   const order = [
     `have an owner add pubkey ${firstPk} back to room ${earlier} as a member (buzz channels add-member --channel ${earlier} --pubkey ${firstPk} --role member) so retirement can read it and verify its archive`,
-    `or have an owner confirm room ${earlier}'s archive or deletion directly with its owner key (buzz channels get --channel ${earlier})`,
     'run agentctl project retire test again',
   ];
   for (const operation of ['verify-retire','retire'] as const) {
     const refused = await host.invoke(operation,f.a).then(result => result,(error:unknown) => error);
     expect(refused).toBeInstanceOf(HostRetirementRefusal);
     expect(refused,String(refused)).toMatchObject({hostChanged:false,requiredOrder:order,
-      reason:`this run's earlier key (pubkey ${firstPk}), moved aside to ${dir}, cannot read its recorded Buzz room ${earlier}: it may have lost membership of that room, archived or not, or the room may have been deleted`});
+      reason:`this run's earlier key (pubkey ${firstPk}), moved aside to ${dir}, cannot read its recorded Buzz room ${earlier}: it may have lost membership of that room, archived or not, or the room may have been deleted, in which case retirement cannot verify it and this needs a CEO decision, not a rerun`});
     expect(snapshot()).toEqual(before);
   }
   // The order is executable: once the key can read it again, retirement finds it still active and asks for its archive.
