@@ -1,6 +1,6 @@
 import { afterAll, expect, it, vi } from 'vitest';
 import { mkdirSync, readFileSync, rmSync, writeFileSync, realpathSync, statSync, symlinkSync, chmodSync, existsSync, readdirSync, renameSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { getPublicKey } from 'nostr-tools';
@@ -72,13 +72,15 @@ else if(cmd === 'tmux') {
 else if(cmd === 'ps') {if(args[0] === '-p') out(s.pinCommand || '');else if(args[0] === '-o' && args[1] === 'lstart=') out(s.lstart || '');else if(s.launched) {if(args.includes('command=')) out('claude --session-id '+a.sessionUuid);else out(process.env.TEST_CLAUDE_PID+' 999999 Thu Oct 22 01:00:00 2026 claude --session-id '+a.sessionUuid+'\\n999999 1 Thu Oct 22 01:00:00 2026 tmux');}}
 else if(cmd === 'lsof') out('n'+(s.cwd || a.clonePath)+'\\n');
 else if(cmd === 'buzz') {
- const pk = fs.readFileSync(a.privateKeyFile.replace('.priv','.pub'),'utf8').trim();
+ // Buzz knows its caller by the key it signs with, which need not be the one at the identity's path.
+ const key = process.env.BUZZ_PRIVATE_KEY || '', ecdh = require('node:crypto').createECDH('secp256k1');
+ const pk = /^[0-9a-f]{64}$/.test(key) ? (ecdh.setPrivateKey(Buffer.from(key,'hex')),ecdh.getPublicKey(null,'compressed').subarray(1).toString('hex')) : fs.readFileSync(a.privateKeyFile.replace('.priv','.pub'),'utf8').trim();
  const archived = s.archivedRooms || [];
  if(args[0] === 'users') out([{pubkey:pk,...${JSON.stringify(profileReadback)}}]);
  else if(args[0] === 'channels' && args[1] === 'search') out([...(s.room ? (s.ambiguous ? [s.room,{...s.room,channel_id:'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'}] : [s.room]) : []),...(args.includes('--include-archived') ? archived : [])]);
  else if(args[0] === 'channels' && args[1] === 'get') {const room=[s.room,...archived].find(r => r && r.channel_id === value('--channel'));if(!room) process.exit(5);out({channel_id:room.channel_id,name:room.name,description:null,created_at:0,pubkey:pk});}
  else if(args[0] === 'channels' && args[1] === 'archive') {if(!process.env.BUZZ_PRIVATE_KEY || process.env.BUZZ_IDENTITY !== a.identityName || !s.room || s.room.channel_id !== value('--channel') || !s.members.some(m => m.pubkey === pk && m.role === 'owner')) process.exit(6);s.archivedRooms=[...archived,{...s.room,archived:true}];s.room=null;s.members=[];out({event_id:'a'.repeat(64),accepted:true,message:''});}
- else if(args[0] === 'channels' && args[1] === 'create') {if(args.includes('--id') || !process.env.BUZZ_PRIVATE_KEY || process.env.BUZZ_IDENTITY !== a.identityName) process.exit(3);const intent=JSON.parse(fs.readFileSync(path.join(process.env.ACP_STATE_DIR,'buzz-room-test.json'),'utf8'));if(intent.name!==value('--name') || intent.pubkey!==pk) process.exit(4);s.creates++;s.room={channel_id:s.creates === 1 ? 'ffffffff-ffff-4fff-8fff-ffffffffffff' : '99999999-9999-4999-8999-999999999999',name:value('--name'),channel_type:value('--type'),visibility:value('--visibility')};s.members=[{pubkey:pk,role:'owner'}];save();if(s.loseCreate) {s.loseCreate=false;save();process.exit(1);}out(s.room);}
+ else if(args[0] === 'channels' && args[1] === 'create') {if(args.includes('--id') || !process.env.BUZZ_PRIVATE_KEY || process.env.BUZZ_IDENTITY !== a.identityName) process.exit(3);const intent=JSON.parse(fs.readFileSync(path.join(process.env.ACP_STATE_DIR,'buzz-room-test.json'),'utf8'));if(intent.name!==value('--name') || intent.pubkey!==pk) process.exit(4);if(s.refuseCreate) {s.refuseCreate=false;save();process.exit(1);}s.creates++;s.room={channel_id:s.creates === 1 ? 'ffffffff-ffff-4fff-8fff-ffffffffffff' : '99999999-9999-4999-8999-999999999999',name:value('--name'),channel_type:value('--type'),visibility:value('--visibility')};s.members=[{pubkey:pk,role:'owner'}];save();if(s.loseCreate) {s.loseCreate=false;save();process.exit(1);}out(s.room);}
  else if(args[0] === 'channels' && args[1] === 'add-member') {const pubkey=value('--pubkey');s.members=s.members.filter(m=>m.pubkey!==pubkey);s.members.push({pubkey,role:value('--role')});out({});}
  else if(args[0] === 'channels' && args[1] === 'members') out(s.members);
  else if(args[0] === 'messages' && args[1] === 'send') {
@@ -767,7 +769,7 @@ process.stdout.write(child.stdout ?? '');process.stderr.write(child.stderr ?? ''
   return wrapper;
 };
 
-it.each(['profile','create'] as const)('#1251 C-P2: retirement settles the room of an ensure-buzz that stopped before the daemon recorded it (%s)',async failure => {
+it.each(['profile','create','refused-create'] as const)('#1251 C-P2: retirement settles the room of an ensure-buzz that stopped before the daemon recorded it (%s)',async failure => {
   const f = fixture();
   const root = realpathSync(tempDir('retire-unbound-'));
   const wrapper = daemonHost(f);
@@ -780,9 +782,10 @@ it.each(['profile','create'] as const)('#1251 C-P2: retirement settles the room 
     h.cp.projects.register({projectId:'test',name:'test'});
     h.cp.residentProjects.attachSubscriber(async () => false);
     h.cp.residentProjects.remember({runId,candidateSnapshotDigest:'candidate',ceoSessionId:'ceo'},'test',{});
-    // Buzz fails at profile setup, after this run's key was minted; or it creates the room and its answer is lost.
+    // Buzz fails at profile setup, after this run's key was minted; or it creates the room and its answer is lost; or,
+    // after the room intent was written, it refuses the create and no room exists.
     if (failure === 'profile') writeFileSync(join(f.home,'fail-buzz'),'');
-    else writeFileSync(join(f.home,'fake.json'),JSON.stringify({members:[],posts:[],creates:0,launches:0,loseCreate:true}));
+    else writeFileSync(join(f.home,'fake.json'),JSON.stringify({members:[],posts:[],creates:0,launches:0,...(failure === 'create' ? {loseCreate:true} : {refuseCreate:true})}));
     await expect(h.cp.residentProjects.ensure({runId,projectId:'test',repositoryIdentity:'github:acme/fixture',repositoryNodeId:'R_node',head:'a'.repeat(40),packet:{}})).rejects.toThrow();
     rmSync(join(f.home,'fail-buzz'),{force:true});
     const allocation = h.cp.residentProjects.allocation(runId)!;
@@ -792,15 +795,16 @@ it.each(['profile','create'] as const)('#1251 C-P2: retirement settles the room 
     expect(allocation.roomLifecycle).toBe('unbound');
     const created = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
     const settled = () => ({creates:fakeState(f).creates,archived:fakeState(f).archivedRooms ?? []});
-    expect(settled()).toEqual(failure === 'profile' ? {creates:0,archived:[]} : {creates:1,archived:[expect.objectContaining({channel_id:created,archived:true})]});
+    expect(settled()).toEqual(failure === 'create' ? {creates:1,archived:[expect.objectContaining({channel_id:created,archived:true})]} : {creates:0,archived:[]});
     expect(h.cp.residentProjects.row(runId)?.status).toBe('RETIRED');
     expect(existsSync(f.a.privateKeyFile)).toBe(false);
     expect(existsSync(f.a.clonePath)).toBe(false);
     if (failure === 'create') expect(JSON.parse(readFileSync(join(root,'retired-buzz-room-test.json'),'utf8'))).toEqual({version:1,projectId:'test',roomId:created,archived:true});
     // A daemon exit after the host step and before its ledger recorded it: the host retire runs again, changing nothing.
+    // After a refused create, the moved-aside intent is looked up again with the key moved aside with it (#1251 C6).
     const before = settled();
     const again = await new ExecFileHostProjectProvisioner(wrapper,f.home,root,30_000,join(root,'state.sqlite')).invoke('retire',allocation);
-    expect(again).toMatchObject({retired:true,buzzRoom:failure === 'profile' ? 'none' : 'archived'});
+    expect(again).toMatchObject({retired:true,buzzRoom:failure === 'create' ? 'archived' : 'none'});
     expect(settled()).toEqual(before);
   } finally {h.cp.close();}
 });
@@ -904,4 +908,91 @@ it('#1251 C5-1: a key that replaced the one this run created its room with is ne
   writeFileSync(f.a.privateKeyFile,ownKey);writeFileSync(pubFile,ownPk+'\n');
   expect(await host.invoke('retire',f.a)).toMatchObject({retired:true,buzzRoom:'archived'});
   expect(fakeState(f).archivedRooms).toEqual([expect.objectContaining({channel_id:room,archived:true})]);
+});
+
+/** #1251 C6 — this run's ensure-buzz created its room and lost the answer: its intent names this run's key and no room. */
+const lostCreate = async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');
+  patchFake(f,{loseCreate:true});
+  await expect(f.invoke('ensure-buzz')).rejects.toThrow();
+  const pubFile = f.a.privateKeyFile.replace('.priv','.pub');
+  const room = (fakeState(f).room as {channel_id:string}).channel_id;
+  return {f,pubFile,room,ownPk:readFileSync(pubFile,'utf8').trim(),retiredDir:join(f.state,'retired-buzz-identities'),
+    identity:[pubFile,join(f.state,'buzz-room-test.json'),join(f.state,'buzz-key-test.json')]};
+};
+const refusesUnchanged = async (f:ReturnType<typeof fixture>, order:string[], snapshot:() => unknown) => {
+  const host = new ExecFileHostProjectProvisioner(daemonHost(f),f.home,f.state,30_000,f.database);
+  const before = snapshot();
+  for (const operation of ['verify-retire','retire'] as const) {
+    const refused = await host.invoke(operation,f.a).then(result => result,(error:unknown) => error);
+    expect(refused).toBeInstanceOf(HostRetirementRefusal);
+    expect(refused,String(refused)).toMatchObject({hostChanged:false,requiredOrder:[...order,'run agentctl project retire test again']});
+    expect(snapshot()).toEqual(before);
+  }
+  return host;
+};
+
+it.each(['interrupted','replaced'] as const)('#1251 C6: an intent of this run moved aside without its key keeps retirement from settling no room (%s)',async variant => {
+  const {f,room,ownPk,retiredDir,identity} = await lostCreate();
+  // The key is moved away. An ensure-buzz retry moves this run's surviving identity aside and is interrupted before it
+  // mints a replacement key (the state its moveIdentityAside leaves), or mints one and stops at the profile step.
+  renameSync(f.a.privateKeyFile,join(f.home,'lost.priv'));
+  if (variant === 'interrupted') {
+    const moved = join(retiredDir,'cto-test.2026-10-30T00-00-00-000Z.c6c6c6c6');mkdirSync(moved,{recursive:true,mode:0o700});
+    for (const file of identity) renameSync(file,join(moved,basename(file)));
+  } else {
+    writeFileSync(join(f.home,'fail-buzz'),'');
+    await expect(f.invoke('ensure-buzz')).rejects.toThrow();
+    rmSync(join(f.home,'fail-buzz'));
+  }
+  expect(readdirSync(retiredDir)).toHaveLength(1);
+  const dir = join(retiredDir,readdirSync(retiredDir)[0]!);
+  expect(readdirSync(dir).sort()).toEqual(['buzz-key-test.json','buzz-room-test.json','cto-test.pub']);
+  f.a.roomLifecycle = 'unbound';saveAllocation(f);
+  const snapshot = () => ({room:fakeState(f).room,archived:fakeState(f).archivedRooms ?? [],clone:existsSync(f.a.clonePath),moved:readdirSync(dir).sort(),
+    files:[f.a.privateKeyFile,...identity,join(f.state,'retired-buzz-room-test.json')].map(file => existsSync(file) ? readFileSync(file,'utf8') : null)});
+  const host = await refusesUnchanged(f,variant === 'interrupted'
+    ? [`put this run's identity back from ${dir}: its cto-test.pub in ${dirname(f.a.privateKeyFile)}, its buzz-key-test.json and buzz-room-test.json in ${f.state}, and the key this run minted (pubkey ${ownPk}), which is not with them, at ${f.a.privateKeyFile}`]
+    : [`put the key this run minted (pubkey ${ownPk}) in ${dir} as cto-test.priv; retirement looks for that room with it`],snapshot);
+  expect(fakeState(f).room).toMatchObject({channel_id:room});
+  // The order is executable, and retirement leaves no room of this run active.
+  if (variant === 'interrupted') {
+    for (const file of identity) renameSync(join(dir,basename(file)),file);
+    renameSync(join(f.home,'lost.priv'),f.a.privateKeyFile);
+    expect(await host.invoke('retire',f.a)).toMatchObject({retired:true,buzzRoom:'archived'});
+  } else {
+    renameSync(join(f.home,'lost.priv'),join(dir,'cto-test.priv'));
+    await refusesUnchanged(f,[`have an owner archive room ${room} (buzz channels archive --channel ${room})`],snapshot);
+    const active = fakeState(f).room as Record<string,unknown>;
+    patchFake(f,{room:null,members:[],archivedRooms:[{...active,archived:true}]});
+    expect(await host.invoke('retire',f.a)).toMatchObject({retired:true});
+  }
+  expect(fakeState(f)).toMatchObject({room:null,archivedRooms:[expect.objectContaining({channel_id:room,archived:true})]});
+});
+
+it('#1251 C6: an intent of this run moved aside with its key is looked up with that key before retirement settles no room',async () => {
+  const {f,pubFile,room,ownPk,retiredDir,identity} = await lostCreate();
+  // A later run's ensure-buzz under the same identity name moves this run's whole identity aside, key included, and
+  // stops at the profile step: its own key, which no route binds, is left at the path.
+  f.a.runId = 'run_next';writeFileSync(join(f.home,'fail-buzz'),'');
+  await expect(f.invoke('ensure-buzz')).rejects.toThrow();
+  rmSync(join(f.home,'fail-buzz'));
+  f.a.runId = 'run_test';f.a.roomLifecycle = 'unbound';saveAllocation(f);
+  const dir = join(retiredDir,readdirSync(retiredDir)[0]!);
+  expect(readdirSync(dir).sort()).toEqual(['buzz-key-test.json','buzz-room-test.json','cto-test.priv','cto-test.pub']);
+  const nextPk = readFileSync(pubFile,'utf8').trim();
+  const snapshot = () => ({room:fakeState(f).room,archived:fakeState(f).archivedRooms ?? [],clone:existsSync(f.a.clonePath),moved:readdirSync(dir).sort(),
+    files:[f.a.privateKeyFile,...identity].map(file => existsSync(file) ? readFileSync(file,'utf8') : null)});
+  const host = await refusesUnchanged(f,[
+    `move the key at ${f.a.privateKeyFile} (pubkey ${nextPk}) aside: this run did not mint it and the roster binds it to no active route of test`,
+    `put this run's identity back from ${dir}: its cto-test.priv and cto-test.pub in ${dirname(f.a.privateKeyFile)}, its buzz-key-test.json and buzz-room-test.json in ${f.state}`,
+  ],snapshot);
+  expect(fakeState(f).room).toMatchObject({channel_id:room});
+  // The order is executable: with this run's identity back, retirement archives the room it created.
+  renameSync(f.a.privateKeyFile,join(f.home,'next.priv'));renameSync(pubFile,join(f.home,'next.pub'));
+  for (const file of [f.a.privateKeyFile,...identity]) renameSync(join(dir,basename(file)),file);
+  expect(readFileSync(pubFile,'utf8').trim()).toBe(ownPk);
+  expect(await host.invoke('retire',f.a)).toMatchObject({retired:true,buzzRoom:'archived'});
+  expect(fakeState(f)).toMatchObject({room:null,archivedRooms:[expect.objectContaining({channel_id:room,archived:true})]});
 });

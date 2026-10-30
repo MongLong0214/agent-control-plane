@@ -140,15 +140,16 @@ try {
     }
     return {path:a.clonePath,origin,head,repositoryNodeId:a.repositoryNodeId};
   };
-  const buzzEnv = () => ({...process.env,BUZZ_IDENTITY:a.identityName,BUZZ_PRIVATE_KEY:readFileSync(a.privateKeyFile,'utf8').trim()});
-  const buzz = args => json('buzz',args,{env:buzzEnv()});
+  const buzzEnv = (keyFile = a.privateKeyFile) => ({...process.env,BUZZ_IDENTITY:a.identityName,BUZZ_PRIVATE_KEY:readFileSync(keyFile,'utf8').trim()});
+  const buzz = (args, keyFile) => json('buzz',args,{env:buzzEnv(keyFile)});
   const pub = () => getPublicKey(Buffer.from(readFileSync(a.privateKeyFile,'utf8').trim(),'hex'));
   const pubFile = ceoSigner ? null : a.privateKeyFile.replace(/\.priv$/,'.pub');
   // The rooms under `name` that `pk` owns: how ensure-buzz finds the room it created, and retirement an unrecorded one.
-  const ownedRooms = (name, pk) => {
-    const channels = buzz(['channels','search','--query',name,'--exact']);
+  // Asked as the key in `keyFile`: this identity's path, or a key of this run moved aside with its records (#1251 C6).
+  const ownedRooms = (name, pk, keyFile) => {
+    const channels = buzz(['channels','search','--query',name,'--exact'],keyFile);
     check(Array.isArray(channels),'invalid channel search');
-    return channels.filter(c => c.name === name && buzz(['channels','members','--channel',c.channel_id ?? c.id]).some(m => m.pubkey === pk && m.role === 'owner'));
+    return channels.filter(c => c.name === name && buzz(['channels','members','--channel',c.channel_id ?? c.id],keyFile).some(m => m.pubkey === pk && m.role === 'owner'));
   };
   const rosterFile = join(home,'.hermes','bridge','required-mentions.json');
   // Mirror canonical_roster.py's version-specific room rules before publishing a roster.
@@ -267,11 +268,34 @@ try {
   // `missing` is how to put that key back; with no intent of this run anywhere on the host, this run created no room:
   // ensure-buzz writes that intent, naming this run and its key, before any creation, and nothing deletes one. A run
   // refused before it minted a key is that case, so no key that never existed is ever asked for (C5-2).
+  // #1251 C6 — an identity of this run moved aside is found by its own key record or room intent, whether or not its key
+  // is still with it; a key there is used only when it is the key those records name. Its intent says a room may exist,
+  // and only that key can say none does: with it retirement looks the room up, without it retirement refuses.
   const unboundRoom = () => {
     const ofThisRun = (record, pk) => object(record) && record.runId === a.runId && record.pubkey === pk;
     const atPath = existsSync(a.privateKeyFile) ? pub() : null;
+    const parent = join(state,'retired-buzz-identities');
+    const readIn = (dir, file) => {try {return read(join(dir,basename(file)));} catch {return null;}};
+    const moved = (existsSync(parent) ? readdirSync(parent) : []).filter(name => name.startsWith(`${a.identityName}.`)).sort().flatMap(name => {
+      const dir = join(parent,name);const records = [readIn(dir,keyProvenanceFile),readIn(dir,intentFile)];
+      const pubkey = records.find(record => object(record) && record.runId === a.runId && typeof record.pubkey === 'string')?.pubkey;
+      if (pubkey === undefined) return [];
+      const keyFile = join(dir,basename(a.privateKeyFile));
+      let key = null;try {key = getPublicKey(Buffer.from(readFileSync(keyFile,'utf8').trim(),'hex'));} catch { /* Its key is not with it. */ }
+      return [{dir,pubkey,intent:ofThisRun(records[1],pubkey) ? records[1] : null,keyFile:key === pubkey ? keyFile : null}];
+    });
+    // The active rooms an intent's own key owns under its name; null when that key is not here to look with.
+    const roomsOf = m => m.keyFile === null ? null : ownedRooms(m.intent.name,m.pubkey,m.keyFile).map(room => room.channel_id ?? room.id);
     if (atPath !== null && keyOfThisRun(atPath)) {
       const pk = atPath;
+      // An earlier key of this run, moved aside with its intent, settles the room it may have created before this key does.
+      for (const m of moved.filter(m => m.intent !== null && m.pubkey !== pk)) {
+        const rooms = roomsOf(m);
+        if (rooms === null) refuseWithOrder(`this run's earlier key (pubkey ${m.pubkey}), moved aside to ${m.dir} with the intent of a Buzz room named ${m.intent.name}, is not there to find that room with`,
+          `put the key this run minted (pubkey ${m.pubkey}) in ${m.dir} as ${basename(a.privateKeyFile)}; retirement looks for that room with it`);
+        if (rooms.length) refuseWithOrder(`this run's earlier key (pubkey ${m.pubkey}), moved aside to ${m.dir}, owns Buzz room${rooms.length > 1 ? 's' : ''} ${rooms.join(', ')}`,
+          ...rooms.map(room => `have an owner archive room ${room} (buzz channels archive --channel ${room})`));
+      }
       const intent = existsSync(intentFile) ? read(intentFile) : null;
       if (ofThisRun(intent,pk) && typeof intent.roomId === 'string') return {pk,roomId:intent.roomId,record:null};
       const name = ofThisRun(intent,pk) ? intent.name : a.roomName ?? a.projectId;
@@ -283,27 +307,18 @@ try {
       return {pk,roomId:owned[0],record:{...(ofThisRun(intent,pk) ? intent : {name,pubkey:pk,runId:a.runId}),roomId:owned[0]}};
     }
     const aside = atPath === null ? [] : [`move the key at ${a.privateKeyFile} (pubkey ${atPath}) aside: this run did not mint it and the roster binds it to no active route of ${a.projectId}`];
-    const parent = join(state,'retired-buzz-identities');
-    let retiredKey = null;
-    const retired = (existsSync(parent) ? readdirSync(parent) : []).filter(name => name.startsWith(`${a.identityName}.`)).map(name => join(parent,name)).find(dir => {
-      try {
-        const key = getPublicKey(Buffer.from(readFileSync(join(dir,basename(a.privateKeyFile)),'utf8').trim(),'hex'));
-        const names = file => {try {return ofThisRun(read(join(dir,basename(file))),key);} catch {return false;}};
-        if (names(keyProvenanceFile) || names(intentFile)) {retiredKey = key;return true;}
-        return false;
-      } catch {return false;}
-    });
-    if (retired !== undefined) {
-      let intent = null;try {intent = read(join(retired,basename(intentFile)));} catch { /* No intent: no room was ever created. */ }
-      return {pk:null,roomId:object(intent) && typeof intent.roomId === 'string' ? intent.roomId : null,record:null,
-        missing:{pubkey:retiredKey,steps:[...aside,`put this run's identity back from ${retired}: its ${basename(a.privateKeyFile)} and ${basename(pubFile)} in ${dirname(a.privateKeyFile)}, its ${basename(keyProvenanceFile)} and ${basename(intentFile)} in ${state}`]}};
+    // Every room intent of this run on the host, moved aside or in place (`dir` null).
+    const live = existsSync(intentFile) ? read(intentFile) : null;
+    const intents = [...moved.filter(m => m.intent !== null),...(object(live) && live.runId === a.runId && typeof live.pubkey === 'string' ? [{dir:null,pubkey:live.pubkey,intent:live,keyFile:null}] : [])];
+    const steps = m => [...aside,m.dir === null ? `put the key this run minted (pubkey ${m.pubkey}) at ${a.privateKeyFile}` :
+      `put this run's identity back from ${m.dir}: its ${m.keyFile === null ? '' : `${basename(a.privateKeyFile)} and `}${basename(pubFile)} in ${dirname(a.privateKeyFile)}, its ${basename(keyProvenanceFile)} and ${basename(intentFile)} in ${state}${m.keyFile === null ? `, and the key this run minted (pubkey ${m.pubkey}), which is not with them, at ${a.privateKeyFile}` : ''}`];
+    for (const m of intents.filter(m => typeof m.intent.roomId !== 'string')) {
+      const rooms = roomsOf(m);
+      if (rooms === null) refuseWithOrder(`the Buzz room of ${a.projectId} was never recorded, and the key this run created it with (pubkey ${m.pubkey}) is not ${m.dir === null ? `at ${a.privateKeyFile}` : `in ${m.dir}`} to find it with`,...steps(m));
+      if (rooms.length) refuseWithOrder(`the Buzz room of ${a.projectId} was never recorded, and this run's key moved aside to ${m.dir} (pubkey ${m.pubkey}) owns room${rooms.length > 1 ? 's' : ''} ${rooms.join(', ')}`,...steps(m));
     }
-    const intent = existsSync(intentFile) ? read(intentFile) : null;
-    if (object(intent) && intent.runId === a.runId && typeof intent.pubkey === 'string') {
-      const missing = {pubkey:intent.pubkey,steps:[...aside,`put the key this run minted (pubkey ${intent.pubkey}) at ${a.privateKeyFile}`]};
-      if (typeof intent.roomId === 'string') return {pk:null,roomId:intent.roomId,record:null,missing};
-      refuseWithOrder(`the Buzz room of ${a.projectId} was never recorded, and the key this run created it with (pubkey ${intent.pubkey}) is not at ${a.privateKeyFile} to find it with`,...missing.steps);
-    }
+    const recorded = intents.find(m => typeof m.intent.roomId === 'string');
+    if (recorded) return {pk:null,roomId:recorded.intent.roomId,record:null,missing:{pubkey:recorded.pubkey,steps:steps(recorded)}};
     return {pk:null,roomId:null,record:null};
   };
   const retirementPreflight = () => {
