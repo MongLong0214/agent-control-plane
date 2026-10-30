@@ -200,6 +200,18 @@ export const ReasonCode = {
    * write target is refused, never recorded at the run's base instead.
    */
   TASK_PREDECESSORS_OVERLAP: "TASK_PREDECESSORS_OVERLAP",
+  /**
+   * #1232 — a file a task imports is not the bytes its manifest entry declares: the staged file has
+   * another size or sha256, so nothing is imported; or the worker's turn changed an imported file, so
+   * nothing is committed.
+   */
+  IMPORT_DIGEST_MISMATCH: "IMPORT_DIGEST_MISMATCH",
+  /**
+   * #1232 — an opaque import failed its CTO-attested manifest/container policy: a top-level signature
+   * is policy-refused, a recognized PNG/TrueType container fails selected bounded checks, or text
+   * imports exceed what their review patch can carry. Refusal does not imply accepted bytes are safe.
+   */
+  IMPORT_CONTENT_REFUSED: "IMPORT_CONTENT_REFUSED",
   TASK_RECEIPT_MISSING: "TASK_RECEIPT_MISSING",
   TASK_RESULT_COUNT_MISMATCH: "TASK_RESULT_COUNT_MISMATCH",
 

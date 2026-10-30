@@ -1,0 +1,1109 @@
+import {
+  type Stats,
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  rmdirSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
+import { join } from "node:path";
+import { inflateSync } from "node:zlib";
+
+import { sha256 } from "../core/digest.ts";
+import { type Decision, allow, deny } from "../core/errors.ts";
+import { ReasonCode } from "../core/reason-codes.ts";
+import { GIT_OUTPUT_MAX_BYTES, gitReadsAsBinary } from "../git/git.ts";
+
+/**
+ * #1232 — files the CTO imports into a STANDARD_WORK task's write target.
+ *
+ * A worker writes only through its provider's patch tool inside the claimed checkout, so it cannot
+ * add a font or an image, or reproduce a large generated file byte for byte. The task's recorded
+ * write target may therefore carry `imports`: a manifest whose entries each name a path inside the
+ * target's paths, the file's size and its sha256. The CTO stages the bytes in the task's staging
+ * directory under the ACP state root, `<importRoot>/<runId>/<taskId>/<sha256 hex>`, so a source is
+ * named by its digest and never by a host path.
+ *
+ * Before the task's worker is launched, the control plane reads every staged file once, checks its
+ * size and every byte's sha256 against the manifest and every destination in the checkout, and only
+ * then writes the bytes it read, create-only, through the Managed Write Guard. A missing, mismatched or
+ * symlinked source, a path outside the target or a destination that is a symlink or already exists
+ * refuses the whole import before anything is written. The files are committed with the worker's
+ * change, and the success receipt binds the manifest.
+ *
+ * What review sees depends on the content (`classifyImport`). A file git reads as text is never bound
+ * by its manifest: it stays in the candidate's patch and is reviewed like any other change, so a task's
+ * text imports are bounded by what that patch can carry (`IMPORT_MAX_TEXT_BYTES`). A binary file may be
+ * bound by its manifest only when its exact extension and signature identify PNG or TrueType, a strict
+ * structural parse of that format places every file byte inside a parsed structure or zero padding (PNG:
+ * the standard critical chunks and gAMA/sRGB, nothing after IEND; TrueType: only the standard tables the
+ * parser inspects, every glyf byte inside a glyph record or its padding), and no embedded archive or
+ * executable signature appears anywhere in the bytes (`EMBEDDED_SIGNATURES`). That is not an inspection
+ * of every byte: field contents such as pixel data, glyph instructions, name strings and metrics are
+ * located and bounded, never interpreted. Anything else is refused at validation and, re-checked at
+ * freeze, stays in the patch with its refusal reason; it is never bound. The CTO PLAN manifest binds the
+ * file's identity (path, size, sha256), not a review of its content; the parse and the scan are defense
+ * in depth, not proof of passivity, non-executability or freedom from polyglots. The reviewer reads the
+ * recognized container type, the inspection's result and limits, and that the content was not reviewed.
+ */
+
+/** One imported file: where it lands in the repository, its size in bytes and the sha256 of its bytes. */
+export interface TaskImport {
+  path: string;
+  size: number;
+  /** `sha256:<64 lowercase hex>` of the file's bytes. */
+  sha256: string;
+}
+
+/** The bytes of one import, read from its staging directory and verified against its entry. */
+export interface StagedImport extends TaskImport {
+  bytes: Buffer;
+}
+
+export const IMPORT_MAX_FILES = 100;
+/**
+ * 50 MiB, GitHub's warning size, and never more than the git wrapper can hand back whole: the freeze
+ * reads each imported blob through it to bind the file by sha256 (`buildCandidateSnapshot`), and the
+ * receipt check in review reads it again. An opaque, potentially active binary import's patch is
+ * never materialised; a text import's is, and `IMPORT_MAX_TEXT_BYTES` bounds that.
+ */
+export const IMPORT_MAX_FILE_BYTES = Math.min(50 * 1024 * 1024, GIT_OUTPUT_MAX_BYTES);
+/** The bytes one task imports, held in memory once while they are verified and written. */
+export const IMPORT_MAX_TOTAL_BYTES = 4 * IMPORT_MAX_FILE_BYTES;
+/** The audit log keeps an unlisted string field only up to 200 characters, and an entry's path is one. */
+const IMPORT_PATH_MAX_CHARS = 200;
+/**
+ * The most patch one new text file adds besides its lines: `diff --git a/<path> b/<path>`, the mode and
+ * full-index lines, `--- /dev/null`, `+++ b/<path>`, the hunk header and a no-newline marker.
+ */
+const TEXT_PATCH_HEADER_BYTES = 3 * IMPORT_PATH_MAX_CHARS + 256;
+/**
+ * The text one task may import, all files together. A new text file of n bytes is at most 2n bytes of
+ * patch (were every byte a newline, each would become `+\n`) plus its header, and the candidate's whole
+ * patch is read through the git wrapper, which hands back at most `GIT_OUTPUT_MAX_BYTES`. One task's
+ * text imports may take half of that; the other half is left to everything else the candidate changes.
+ * Review carries any text the patch carries, chunked and range-split. A text file is one git's own
+ * content check reads as text (`gitReadsAsBinary`), and the patch shows it as text whatever the
+ * repository's attributes say (`diffPatch`), so a `-diff` or `binary` rule does not turn it into a
+ * binary patch the reviewer cannot read (review lane-e-fs-r6 P1).
+ */
+export const IMPORT_MAX_TEXT_BYTES = Math.floor((GIT_OUTPUT_MAX_BYTES / 2 - IMPORT_MAX_FILES * TEXT_PATCH_HEADER_BYTES) / 2);
+
+interface Format {
+  name: string;
+  /** Every signature must match: `[offset, bytes]`. */
+  signatures: ReadonlyArray<readonly [number, Buffer]>;
+  /** Matched only in content git reads as binary (a text script's shebang is reviewed as text). */
+  binaryOnly?: boolean;
+}
+
+const format = (name: string, ...signatures: Array<readonly [number, string | number[]]>): Format => ({
+  name,
+  signatures: signatures.map(([offset, bytes]) => [offset, typeof bytes === "string" ? Buffer.from(bytes, "latin1") : Buffer.from(bytes)] as const),
+});
+
+const matches = (bytes: Buffer, candidate: Format): boolean =>
+  candidate.signatures.every(([offset, signature]) =>
+    bytes.length >= offset + signature.length && bytes.subarray(offset, offset + signature.length).equals(signature));
+
+/** Top-level native/loadable signatures and archives refused as defense-in-depth policy. */
+const REFUSED_FORMATS: readonly Format[] = [
+  format("ELF executable or library", [0, [0x7f, 0x45, 0x4c, 0x46]]),
+  ...[[0xfe, 0xed, 0xfa, 0xce], [0xfe, 0xed, 0xfa, 0xcf], [0xce, 0xfa, 0xed, 0xfe], [0xcf, 0xfa, 0xed, 0xfe]]
+    .map((magic) => format("Mach-O executable or library", [0, magic])),
+  format("Mach-O universal binary or Java class", [0, [0xca, 0xfe, 0xba, 0xbe]]),
+  format("Mach-O universal binary", [0, [0xca, 0xfe, 0xba, 0xbf]]),
+  format("Mach-O universal binary", [0, [0xbe, 0xba, 0xfe, 0xca]]),
+  format("PE or DOS executable", [0, "MZ"]),
+  format("WebAssembly module", [0, [0x00, 0x61, 0x73, 0x6d]]),
+  { ...format("script with a shebang", [0, "#!"]), binaryOnly: true },
+  format("Dalvik executable", [0, "dex\n"]),
+  format("Lua bytecode", [0, [0x1b, 0x4c, 0x75, 0x61]]),
+  ...["PK\x03\x04", "PK\x05\x06", "PK\x07\x08"].map((magic) => format("zip archive (JAR, APK and wheel included)", [0, magic])),
+  format("gzip archive", [0, [0x1f, 0x8b]]),
+  format("compress archive", [0, [0x1f, 0x9d]]),
+  format("bzip2 archive", [0, "BZh"]),
+  format("xz archive", [0, [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]]),
+  format("zstd archive", [0, [0x28, 0xb5, 0x2f, 0xfd]]),
+  format("7z archive", [0, [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]]),
+  format("RAR archive", [0, "Rar!\x1a\x07"]),
+  format("lzip archive", [0, "LZIP"]),
+  format("LZ4 archive", [0, [0x04, 0x22, 0x4d, 0x18]]),
+  format("cabinet archive", [0, "MSCF"]),
+  format("ar archive (.deb and static libraries included)", [0, "!<arch>\n"]),
+  format("xar archive", [0, "xar!"]),
+  format("RPM package", [0, [0xed, 0xab, 0xee, 0xdb]]),
+  ...["070707", "070701", "070702"].map((magic) => format("cpio archive", [0, magic])),
+  format("cpio archive", [0, [0xc7, 0x71]]),
+  format("cpio archive", [0, [0x71, 0xc7]]),
+  format("tar archive", [257, "ustar"]),
+];
+
+const caseVariants = (text: string): string[] =>
+  [...text].reduce<string[]>((variants, char) => variants.flatMap((prefix) => [...new Set([prefix + char.toLowerCase(), prefix + char.toUpperCase()])]), [""]);
+
+/**
+ * Signatures refused anywhere in a binary's bytes, on top of its strict parse. An interpreter given a
+ * polyglot finds what it runs on its own: Python a zip's `__main__.py` through its end-of-central-directory
+ * record, `perl -x` and `ruby -x` a line starting `#!`, PHP any `<?php` or `<?=` block. So every
+ * top-level signature above of four or more bytes, every zip record, a gzip member header, a tar header,
+ * a bzip2 block, a shebang line and a PHP open tag. Shorter top-level magics (`MZ`, `#!` mid-line,
+ * compress, binary cpio) are not scanned: two bytes recur by chance in compressed pixels and font data.
+ */
+const EMBEDDED_SIGNATURES: ReadonlyArray<{ name: string; bytes: Buffer }> = [
+  ...REFUSED_FORMATS.flatMap(({ name, signatures }) =>
+    signatures.length === 1 && signatures[0]![0] === 0 && signatures[0]![1].length >= 4 ? [{ name, bytes: signatures[0]![1] }] : []),
+  ...[[1, 2], [6, 6], [6, 7]].map(([kind, record]) => ({ name: "zip archive record", bytes: Buffer.from([0x50, 0x4b, kind!, record!]) })),
+  // RFC 1952: deflate, and the reserved flag bits a compliant reader refuses are clear.
+  ...Array.from({ length: 0x20 }, (_, flags) => ({ name: "gzip member header", bytes: Buffer.from([0x1f, 0x8b, 0x08, flags]) })),
+  ...["ustar\x00", "ustar  \x00"].map((magic) => ({ name: "tar archive header", bytes: Buffer.from(magic, "latin1") })),
+  ...[1, 2, 3, 4, 5, 6, 7, 8, 9].map((level) => ({ name: "bzip2 stream", bytes: Buffer.from(`BZh${level}1AY&SY`, "latin1") })),
+  { name: "shebang line", bytes: Buffer.from("\n#!", "latin1") },
+  ...[...caseVariants("<?php"), "<?="].map((tag) => ({ name: "PHP open tag", bytes: Buffer.from(tag, "latin1") })),
+];
+
+/** Every signature is at least three bytes; a position is compared only when its first two bytes begin one. */
+const SIGNATURE_PREFIXES = new Uint8Array(0x10000);
+for (const signature of EMBEDDED_SIGNATURES) SIGNATURE_PREFIXES[(signature.bytes[0]! << 8) | signature.bytes[1]!] = 1;
+
+/** The first embedded archive or executable signature in `bytes`, named with its offset, or null. One pass. */
+const embeddedSignature = (bytes: Buffer): string | null => {
+  for (let at = 0; at + 1 < bytes.length; at += 1) {
+    if (SIGNATURE_PREFIXES[(bytes[at]! << 8) | bytes[at + 1]!] === 0) continue;
+    const found = EMBEDDED_SIGNATURES.find((signature) => bytes.subarray(at, at + signature.bytes.length).equals(signature.bytes));
+    if (found !== undefined) return `an embedded ${found.name} signature at byte ${at}`;
+  }
+  return null;
+};
+
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const PNG_CRC_TABLE = Uint32Array.from({ length: 256 }, (_, index) => {
+  let value = index;
+  for (let bit = 0; bit < 8; bit += 1) value = (value >>> 1) ^ (value & 1 ? 0xedb88320 : 0);
+  return value >>> 0;
+});
+
+const pngCrc32 = (bytes: Buffer): number => {
+  let crc = 0xffffffff;
+  for (const byte of bytes) crc = (crc >>> 8) ^ PNG_CRC_TABLE[(crc ^ byte) & 0xff]!;
+  return (crc ^ 0xffffffff) >>> 0;
+};
+
+/** Bounded selected PNG checks. `null` means every file byte lies in a parsed chunk; chunk contents are not interpreted. */
+const invalidPng = (bytes: Buffer): string | null => {
+  if (bytes.length < 8 || !bytes.subarray(0, 8).equals(PNG_SIGNATURE)) return "the bytes are not a PNG";
+  let cursor = 8;
+  let width = 0;
+  let height = 0;
+  let bitsPerPixel = 0;
+  let bitDepth = 0;
+  let colorType = 0;
+  let sawHeader = false;
+  let sawPalette = false;
+  let sawData = false;
+  let sawEnd = false;
+  let gamma: number | null = null;
+  let sawSrgb = false;
+  const compressed: Buffer[] = [];
+  while (cursor < bytes.length) {
+    if (bytes.length - cursor < 12) return "the PNG ends inside a chunk";
+    const length = bytes.readUInt32BE(cursor);
+    if (length > 0x7fffffff || length > bytes.length - cursor - 12) return "a PNG chunk length leaves the file";
+    const typeBytes = bytes.subarray(cursor + 4, cursor + 8);
+    if (![...typeBytes].every((byte) => (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)) || (typeBytes[2]! & 0x20) !== 0) {
+      return "a PNG chunk type is invalid";
+    }
+    const type = typeBytes.toString("ascii");
+    const data = bytes.subarray(cursor + 8, cursor + 8 + length);
+    if (pngCrc32(bytes.subarray(cursor + 4, cursor + 8 + length)) !== bytes.readUInt32BE(cursor + 8 + length)) return `the PNG ${type} checksum is invalid`;
+    cursor += 12 + length;
+    if (!sawHeader && type !== "IHDR") return "the PNG does not begin with IHDR";
+    if (type === "IHDR") {
+      if (sawHeader || length !== 13) return "the PNG has an invalid IHDR";
+      width = data.readUInt32BE(0);
+      height = data.readUInt32BE(4);
+      const depth = data[8]!;
+      const color = data[9]!;
+      const channels = new Map([[0, 1], [2, 3], [3, 1], [4, 2], [6, 4]]).get(color);
+      const depths = new Map([[0, [1, 2, 4, 8, 16]], [2, [8, 16]], [3, [1, 2, 4, 8]], [4, [8, 16]], [6, [8, 16]]]).get(color);
+      if (width === 0 || height === 0 || channels === undefined || !depths?.includes(depth) || data[10] !== 0 || data[11] !== 0 || data[12] !== 0) {
+        return "the PNG IHDR fields are unsupported or invalid";
+      }
+      bitsPerPixel = channels * depth;
+      bitDepth = depth;
+      colorType = color;
+      sawHeader = true;
+    } else if (type === "PLTE") {
+      const paletteLimit = colorType === 3 ? 3 * 2 ** bitDepth : 768;
+      if (sawPalette || sawData || colorType === 0 || colorType === 4 || length === 0 || length % 3 !== 0 || length > paletteLimit) {
+        return "the PNG has an invalid PLTE";
+      }
+      sawPalette = true;
+    } else if (type === "IDAT") {
+      if (sawEnd || (colorType === 3 && !sawPalette)) return "the PNG IDAT chunks lack the required palette or follow IEND";
+      sawData = true;
+      compressed.push(data);
+    } else if (type === "IEND") {
+      if (!sawData || sawEnd || length !== 0 || cursor !== bytes.length) return "the PNG has an invalid IEND or trailing bytes";
+      sawEnd = true;
+    } else if (type === "gAMA") {
+      if (gamma !== null || sawPalette || sawData || length !== 4 || data.readUInt32BE(0) === 0) return "the PNG has an invalid gAMA";
+      gamma = data.readUInt32BE(0);
+      if (sawSrgb && gamma !== 45_455) return "the PNG gAMA conflicts with sRGB";
+    } else if (type === "sRGB") {
+      if (sawSrgb || sawPalette || sawData || length !== 1 || data[0]! > 3 || (gamma !== null && gamma !== 45_455)) return "the PNG has an invalid sRGB";
+      sawSrgb = true;
+    } else {
+      return (typeBytes[0]! & 0x20) === 0
+        ? `the PNG has an unknown critical chunk ${type}`
+        : `the PNG ancillary chunk ${type} is not in the selected structural-check allowlist`;
+    }
+  }
+  if (!sawEnd) return "the PNG has no IEND";
+  const rowBytes = Math.ceil((width * bitsPerPixel) / 8);
+  const decodedLength = height * (rowBytes + 1);
+  if (!Number.isSafeInteger(decodedLength) || decodedLength > IMPORT_MAX_TOTAL_BYTES) return "the decoded PNG exceeds the import bound";
+  try {
+    const encoded = Buffer.concat(compressed);
+    // Node returns this documented shape for `info: true`; @types/node still declares only Buffer.
+    const inflated = inflateSync(encoded, { maxOutputLength: decodedLength, info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten: number };
+    };
+    const decoded = inflated.buffer;
+    if (inflated.engine.bytesWritten !== encoded.length) return "the PNG pixel stream has trailing compressed bytes";
+    if (decoded.length !== decodedLength) return "the PNG pixel stream has the wrong length";
+    for (let offset = 0; offset < decoded.length; offset += rowBytes + 1) if (decoded[offset]! > 4) return "the PNG has an invalid row filter";
+  } catch {
+    return "the PNG pixel stream does not decode within its bound";
+  }
+  return null;
+};
+
+const sfntChecksum = (bytes: Buffer, zeroAdjustment = false): number => {
+  let sum = 0;
+  for (let offset = 0; offset < bytes.length; offset += 4) {
+    let word = 0;
+    for (let byte = 0; byte < 4; byte += 1) {
+      const position = offset + byte;
+      const value = zeroAdjustment && position >= 8 && position < 12 ? 0 : (bytes[position] ?? 0);
+      word = ((word << 8) | value) >>> 0;
+    }
+    sum = (sum + word) >>> 0;
+  }
+  return sum;
+};
+
+interface SfntTable { tag: string; checksum: number; offset: number; length: number; bytes: Buffer }
+
+const hasOnlyGlyphPadding = (glyph: Buffer, cursor: number): boolean =>
+  glyph.length - cursor <= 3 && [...glyph.subarray(cursor)].every((byte) => byte === 0);
+
+interface GlyphLimits {
+  maxPoints: number;
+  maxContours: number;
+  maxInstructions: number;
+  maxComponents: number;
+}
+
+interface GlyphShape {
+  composite: boolean;
+  points: number;
+  contours: number;
+  components: number[];
+}
+
+/** Validates one non-empty simple or composite `glyf` record and consumes it through zero padding. */
+const invalidGlyph = (glyph: Buffer, glyphCount: number, limits: GlyphLimits, shape: GlyphShape): string | null => {
+  if (glyph.length < 10) return "a non-empty TrueType glyph is shorter than its header";
+  const contours = glyph.readInt16BE(0);
+  let cursor = 10;
+  if (contours >= 0) {
+    shape.contours = contours;
+    if (contours > limits.maxContours) return "a simple TrueType glyph exceeds maxp.maxContours";
+    if (cursor + contours * 2 + 2 > glyph.length) return "a simple TrueType glyph ends inside its contour endpoints";
+    let lastPoint = -1;
+    for (let contour = 0; contour < contours; contour += 1) {
+      const endpoint = glyph.readUInt16BE(cursor);
+      cursor += 2;
+      if (endpoint <= lastPoint) return "a simple TrueType glyph has unordered contour endpoints";
+      lastPoint = endpoint;
+    }
+    const instructions = glyph.readUInt16BE(cursor);
+    cursor += 2;
+    if (instructions > glyph.length - cursor) return "a simple TrueType glyph ends inside its instructions";
+    if (instructions > limits.maxInstructions) return "a simple TrueType glyph exceeds maxp.maxSizeOfInstructions";
+    cursor += instructions;
+    const points = lastPoint + 1;
+    shape.points = points;
+    if (points > limits.maxPoints) return "a simple TrueType glyph exceeds maxp.maxPoints";
+    const pointFlags: number[] = [];
+    while (pointFlags.length < points) {
+      if (cursor >= glyph.length) return "a simple TrueType glyph ends inside its flags";
+      const flag = glyph[cursor++]!;
+      if ((flag & 0x80) !== 0) return "a simple TrueType glyph sets a reserved flag";
+      let repeats = 1;
+      if ((flag & 0x08) !== 0) {
+        if (cursor >= glyph.length) return "a simple TrueType glyph lacks its flag repeat count";
+        repeats += glyph[cursor++]!;
+      }
+      if (pointFlags.length + repeats > points) return "a simple TrueType glyph repeats flags past its point count";
+      for (let repeat = 0; repeat < repeats; repeat += 1) pointFlags.push(flag);
+    }
+    const xs: number[] = [];
+    let x = 0;
+    for (const flag of pointFlags) {
+      if ((flag & 0x02) !== 0) {
+        if (cursor >= glyph.length) return "a simple TrueType glyph ends inside its x coordinates";
+        const distance = glyph[cursor++]!;
+        x += (flag & 0x10) !== 0 ? distance : -distance;
+      } else if ((flag & 0x10) === 0) {
+        if (cursor + 2 > glyph.length) return "a simple TrueType glyph ends inside its x coordinates";
+        x += glyph.readInt16BE(cursor);
+        cursor += 2;
+      }
+      xs.push(x);
+    }
+    const ys: number[] = [];
+    let y = 0;
+    for (const flag of pointFlags) {
+      if ((flag & 0x04) !== 0) {
+        if (cursor >= glyph.length) return "a simple TrueType glyph ends inside its y coordinates";
+        const distance = glyph[cursor++]!;
+        y += (flag & 0x20) !== 0 ? distance : -distance;
+      } else if ((flag & 0x20) === 0) {
+        if (cursor + 2 > glyph.length) return "a simple TrueType glyph ends inside its y coordinates";
+        y += glyph.readInt16BE(cursor);
+        cursor += 2;
+      }
+      ys.push(y);
+    }
+    if (!hasOnlyGlyphPadding(glyph, cursor)) return "a simple TrueType glyph has hidden trailing bytes";
+    const declaredBox = [glyph.readInt16BE(2), glyph.readInt16BE(4), glyph.readInt16BE(6), glyph.readInt16BE(8)];
+    const observedBox = [0, 0, 0, 0];
+    if (points > 0) {
+      observedBox[0] = observedBox[2] = xs[0]!;
+      observedBox[1] = observedBox[3] = ys[0]!;
+      for (let point = 1; point < points; point += 1) {
+        observedBox[0] = Math.min(observedBox[0]!, xs[point]!);
+        observedBox[1] = Math.min(observedBox[1]!, ys[point]!);
+        observedBox[2] = Math.max(observedBox[2]!, xs[point]!);
+        observedBox[3] = Math.max(observedBox[3]!, ys[point]!);
+      }
+    }
+    if (declaredBox.some((value, index) => value !== observedBox[index])) return "a simple TrueType glyph bounding box does not match its decoded points";
+    return null;
+  }
+  if (contours !== -1) return "a composite TrueType glyph has an invalid contour marker";
+  shape.composite = true;
+  let flags = 0;
+  do {
+    if (cursor + 4 > glyph.length) return "a composite TrueType glyph ends inside a component";
+    flags = glyph.readUInt16BE(cursor);
+    if ((flags & ~0x1fef) !== 0) return "a composite TrueType glyph sets a reserved flag";
+    if ((flags & 0x1800) === 0x1800) return "a composite TrueType glyph sets both scaled and unscaled offset flags";
+    if ((flags & 0x0002) === 0) return "point-matched composite glyph arguments are outside the admitted structural subset";
+    if ((flags & 0x0020) !== 0 && (flags & 0x0100) !== 0) return "a nonfinal composite component claims instructions";
+    const componentGlyph = glyph.readUInt16BE(cursor + 2);
+    cursor += 4;
+    if (componentGlyph >= glyphCount) return "a composite TrueType glyph names a missing component";
+    shape.components.push(componentGlyph);
+    if (shape.components.length > limits.maxComponents) return "a composite TrueType glyph exceeds maxp.maxComponentElements";
+    cursor += (flags & 0x0001) !== 0 ? 4 : 2;
+    const transforms = [(flags & 0x0008) !== 0, (flags & 0x0040) !== 0, (flags & 0x0080) !== 0].filter(Boolean).length;
+    if (transforms > 1) return "a composite TrueType glyph has conflicting transforms";
+    if ((flags & 0x0008) !== 0) cursor += 2;
+    else if ((flags & 0x0040) !== 0) cursor += 4;
+    else if ((flags & 0x0080) !== 0) cursor += 8;
+    if (cursor > glyph.length) return "a composite TrueType glyph ends inside its arguments or transform";
+  } while ((flags & 0x0020) !== 0);
+  if ((flags & 0x0100) !== 0) {
+    if (cursor + 2 > glyph.length) return "a composite TrueType glyph lacks its instruction length";
+    const instructions = glyph.readUInt16BE(cursor);
+    cursor += 2;
+    if (instructions > glyph.length - cursor) return "a composite TrueType glyph ends inside its instructions";
+    if (instructions > limits.maxInstructions) return "a composite TrueType glyph exceeds maxp.maxSizeOfInstructions";
+    cursor += instructions;
+  }
+  return hasOnlyGlyphPadding(glyph, cursor) ? null : "a composite TrueType glyph has hidden trailing bytes";
+};
+
+/** The admitted cmap subset: format 4 with bounded arrays, mapped glyphs and byte coverage. */
+const invalidCmapFormat4 = (subtable: Buffer, glyphCount: number): string | null => {
+  if (subtable.length < 24 || subtable.readUInt16BE(0) !== 4 || subtable.readUInt16BE(2) !== subtable.length || subtable.length % 2 !== 0) {
+    return "the TrueType cmap format-4 length is invalid";
+  }
+  const segmentBytes = subtable.readUInt16BE(6);
+  if (segmentBytes === 0 || segmentBytes % 2 !== 0) return "the TrueType cmap format-4 segment count is invalid";
+  const segments = segmentBytes / 2;
+  const minimumLength = 16 + segments * 8;
+  if (minimumLength > subtable.length) return "the TrueType cmap format-4 arrays leave the subtable";
+  const power = 2 ** Math.floor(Math.log2(segments));
+  if (subtable.readUInt16BE(8) !== power * 2 || subtable.readUInt16BE(10) !== Math.log2(power) || subtable.readUInt16BE(12) !== segmentBytes - power * 2) {
+    return "the TrueType cmap format-4 search fields are invalid";
+  }
+  const endCodes = 14;
+  const reserved = endCodes + segments * 2;
+  const startCodes = reserved + 2;
+  const deltas = startCodes + segments * 2;
+  const rangeOffsets = deltas + segments * 2;
+  const glyphArray = rangeOffsets + segments * 2;
+  if (subtable.readUInt16BE(reserved) !== 0) return "the TrueType cmap format-4 reserved word is nonzero";
+  let previousEnd = -1;
+  const usedGlyphWords = new Set<number>();
+  for (let index = 0; index < segments; index += 1) {
+    const end = subtable.readUInt16BE(endCodes + index * 2);
+    const start = subtable.readUInt16BE(startCodes + index * 2);
+    if (start > end || start <= previousEnd) return "the TrueType cmap format-4 segments overlap or are unordered";
+    previousEnd = end;
+    const rangeOffsetWord = rangeOffsets + index * 2;
+    const rangeOffset = subtable.readUInt16BE(rangeOffsetWord);
+    const delta = subtable.readInt16BE(deltas + index * 2);
+    if (rangeOffset % 2 !== 0) return "the TrueType cmap format-4 glyph offset is unaligned";
+    if (rangeOffset !== 0) {
+      const firstGlyph = rangeOffsetWord + rangeOffset;
+      const lastGlyph = firstGlyph + (end - start) * 2;
+      if (firstGlyph < glyphArray || lastGlyph + 2 > subtable.length) return "the TrueType cmap format-4 glyph range leaves the subtable";
+    }
+    for (let code = start; code <= end; code += 1) {
+      let glyph = (code + delta) & 0xffff;
+      if (rangeOffset !== 0) {
+        const glyphWord = rangeOffsetWord + rangeOffset + (code - start) * 2;
+        usedGlyphWords.add(glyphWord);
+        glyph = subtable.readUInt16BE(glyphWord);
+        if (glyph !== 0) glyph = (glyph + delta) & 0xffff;
+      }
+      if (glyph >= glyphCount) return "the TrueType cmap format-4 map names a missing glyph";
+    }
+  }
+  if (subtable.readUInt16BE(endCodes + (segments - 1) * 2) !== 0xffff || subtable.readUInt16BE(startCodes + (segments - 1) * 2) !== 0xffff) {
+    return "the TrueType cmap format-4 map lacks its terminal segment";
+  }
+  for (let offset = glyphArray; offset < subtable.length; offset += 2) {
+    if (!usedGlyphWords.has(offset)) return "the TrueType cmap format-4 glyph array contains unreferenced bytes";
+  }
+  return null;
+};
+
+/**
+ * The standard tables a TrueType import may hold: the required ones, each of which the parse below
+ * inspects. Any other table, registered or not, is bytes nothing here accounts for.
+ */
+const TRUETYPE_TABLES = ["OS/2", "cmap", "glyf", "head", "hhea", "hmtx", "loca", "maxp", "name", "post"];
+/** The exact length of each OS/2 table version. */
+const OS2_LENGTHS = new Map([[0, 78], [1, 86], [2, 96], [3, 96], [4, 96], [5, 100]]);
+
+/** A `post` table of version 1.0 or 3.0 (header only) or 2.0 whose glyph names it references exactly. */
+const invalidPost = (post: Buffer, glyphs: number): string | null => {
+  if (post.length < 32) return "the TrueType post table is truncated";
+  const version = post.readUInt32BE(0);
+  if (version === 0x00010000 || version === 0x00030000) return post.length === 32 ? null : "the TrueType post table has bytes past its header";
+  if (version !== 0x00020000) return "the TrueType post version is unsupported";
+  if (post.length < 34 || post.readUInt16BE(32) !== glyphs || 34 + glyphs * 2 > post.length) return "the TrueType post glyph-name index is invalid";
+  let names = 0;
+  for (let cursor = 34 + glyphs * 2; cursor < post.length; cursor += 1 + post[cursor]!) {
+    if (cursor + 1 + post[cursor]! > post.length) return "a TrueType post glyph name leaves its table";
+    names += 1;
+  }
+  const referenced = new Set<number>();
+  for (let glyph = 0; glyph < glyphs; glyph += 1) {
+    const index = post.readUInt16BE(34 + glyph * 2);
+    if (index < 258) continue;
+    if (index - 258 >= names) return "a TrueType post index names a missing glyph name";
+    referenced.add(index - 258);
+  }
+  return referenced.size === names ? null : "the TrueType post table holds glyph names no glyph references";
+};
+
+/**
+ * A strict TrueType parse: the standard tables only, every byte inside one or its padding, each table's
+ * structure checked. Field contents such as glyph instructions and name strings are bounded, not interpreted.
+ */
+const invalidTrueType = (bytes: Buffer): string | null => {
+  if (bytes.length < 12 || bytes.readUInt32BE(0) !== 0x00010000) return "the bytes are not a TrueType sfnt";
+  const count = bytes.readUInt16BE(4);
+  if (count === 0 || count > 4095 || 12 + count * 16 > bytes.length) return "the TrueType table directory is invalid";
+  const power = 2 ** Math.floor(Math.log2(count));
+  if (bytes.readUInt16BE(6) !== power * 16 || bytes.readUInt16BE(8) !== Math.log2(power) || bytes.readUInt16BE(10) !== count * 16 - power * 16) {
+    return "the TrueType table search fields are invalid";
+  }
+  const tables: SfntTable[] = [];
+  let previousTag = "";
+  for (let index = 0; index < count; index += 1) {
+    const at = 12 + index * 16;
+    const tagBytes = bytes.subarray(at, at + 4);
+    if (![...tagBytes].every((byte) => byte >= 0x20 && byte <= 0x7e)) return "a TrueType table tag is invalid";
+    const tag = tagBytes.toString("ascii");
+    if (!TRUETYPE_TABLES.includes(tag)) return `the TrueType table "${tag}" is not one of the standard tables the parse inspects (${TRUETYPE_TABLES.join(", ")})`;
+    const checksum = bytes.readUInt32BE(at + 4);
+    const offset = bytes.readUInt32BE(at + 8);
+    const length = bytes.readUInt32BE(at + 12);
+    if (tag <= previousTag || length === 0 || offset % 4 !== 0 || offset < 12 + count * 16 || length > bytes.length - offset) {
+      return "a TrueType table record is invalid";
+    }
+    previousTag = tag;
+    tables.push({ tag, checksum, offset, length, bytes: bytes.subarray(offset, offset + length) });
+  }
+  let expectedOffset = (12 + count * 16 + 3) & ~3;
+  for (const table of [...tables].sort((left, right) => left.offset - right.offset)) {
+    if (table.offset !== expectedOffset || sfntChecksum(table.bytes, table.tag === "head") !== table.checksum) return "the TrueType tables overlap, have gaps or fail checksum";
+    expectedOffset = (table.offset + table.length + 3) & ~3;
+    if ([...bytes.subarray(table.offset + table.length, expectedOffset)].some((byte) => byte !== 0)) return "the TrueType table padding is nonzero";
+  }
+  if (expectedOffset !== bytes.length || sfntChecksum(bytes) !== 0xb1b0afba) return "the TrueType file has trailing bytes or an invalid whole-font checksum";
+  const byTag = new Map(tables.map((table) => [table.tag, table]));
+  if (TRUETYPE_TABLES.some((tag) => !byTag.has(tag))) return "the TrueType font lacks a required table";
+  const head = byTag.get("head")!.bytes;
+  const hhea = byTag.get("hhea")!.bytes;
+  const maxp = byTag.get("maxp")!.bytes;
+  if (head.length !== 54 || head.readUInt32BE(0) !== 0x00010000 || head.readUInt32BE(12) !== 0x5f0f3cf5 || head.readUInt16BE(18) < 16) return "the TrueType head table is invalid";
+  if (maxp.length !== 32 || maxp.readUInt32BE(0) !== 0x00010000 || maxp.readUInt16BE(4) === 0) return "the TrueType maxp table is invalid";
+  const glyphs = maxp.readUInt16BE(4);
+  if (hhea.length !== 36 || hhea.readUInt32BE(0) !== 0x00010000 || hhea.readUInt16BE(34) === 0 || hhea.readUInt16BE(34) > glyphs) return "the TrueType hhea table is invalid";
+  const longMetrics = hhea.readUInt16BE(34);
+  const loca = byTag.get("loca")!.bytes;
+  const glyf = byTag.get("glyf")!.bytes;
+  const longLoca = head.readInt16BE(50);
+  const locaWidth = longLoca === 0 ? 2 : longLoca === 1 ? 4 : 0;
+  if (locaWidth === 0 || loca.length !== (glyphs + 1) * locaWidth || byTag.get("hmtx")!.length !== longMetrics * 4 + (glyphs - longMetrics) * 2) {
+    return "the TrueType glyph index or metrics are invalid";
+  }
+  // The glyph records tile glyf from byte 0: ordered locations make consecutive records contiguous, each
+  // non-empty one is consumed through its padding below, and only zero padding may follow the last. A
+  // first location past 0 would leave the bytes before it in no record (review E3-1).
+  let previousLocation = 0;
+  const locations: number[] = [];
+  for (let index = 0; index <= glyphs; index += 1) {
+    const location = locaWidth === 2 ? loca.readUInt16BE(index * 2) * 2 : loca.readUInt32BE(index * 4);
+    if (index === 0 && location !== 0) return "the TrueType glyf table has bytes before its first glyph location that no glyph record covers";
+    if (location < previousLocation || location > glyf.length) return "the TrueType glyph locations are invalid";
+    locations.push(location);
+    previousLocation = location;
+  }
+  const limits: GlyphLimits = {
+    maxPoints: maxp.readUInt16BE(6),
+    maxContours: maxp.readUInt16BE(8),
+    maxInstructions: maxp.readUInt16BE(26),
+    maxComponents: maxp.readUInt16BE(28),
+  };
+  const shapes = Array.from({ length: glyphs }, (): GlyphShape => ({ composite: false, points: 0, contours: 0, components: [] }));
+  for (let index = 0; index < glyphs; index += 1) {
+    const start = locations[index]!;
+    const end = locations[index + 1]!;
+    if (end > start) {
+      const problem = invalidGlyph(glyf.subarray(start, end), glyphs, limits, shapes[index]!);
+      if (problem !== null) return problem;
+    }
+  }
+  const active = new Uint8Array(glyphs);
+  const remainingDepth = new Int16Array(glyphs);
+  remainingDepth.fill(-1);
+  const visitComposite = (glyph: number, depth: number): string | null => {
+    if (depth > 32) return "the TrueType composite glyph graph exceeds depth 32";
+    if (active[glyph] === 1) return "the TrueType composite glyph graph contains a cycle";
+    if (remainingDepth[glyph]! >= 0) return depth + remainingDepth[glyph]! > 32 ? "the TrueType composite glyph graph exceeds depth 32" : null;
+    active[glyph] = 1;
+    let longest = 0;
+    for (const component of shapes[glyph]!.components) {
+      const problem = visitComposite(component, depth + 1);
+      if (problem !== null) return problem;
+      longest = Math.max(longest, 1 + remainingDepth[component]!);
+    }
+    active[glyph] = 0;
+    remainingDepth[glyph] = longest;
+    return depth + longest > 32 ? "the TrueType composite glyph graph exceeds depth 32" : null;
+  };
+  for (let glyph = 0; glyph < glyphs; glyph += 1) {
+    const problem = visitComposite(glyph, 0);
+    if (problem !== null) return problem;
+  }
+  const declaredDepth = maxp.readUInt16BE(30);
+  if ([...remainingDepth].some((depth) => depth > declaredDepth)) return "the TrueType composite graph exceeds maxp.maxComponentDepth";
+  const totals = shapes.map((shape) => ({ points: shape.points, contours: shape.contours }));
+  const aggregated = new Uint8Array(glyphs);
+  const aggregateComposite = (glyph: number): { points: number; contours: number } => {
+    const shape = shapes[glyph]!;
+    if (!shape.composite || aggregated[glyph] === 1) return totals[glyph]!;
+    let points = 0;
+    let contours = 0;
+    for (const component of shape.components) {
+      const total = aggregateComposite(component);
+      points = Math.min(0x10000, points + total.points);
+      contours = Math.min(0x10000, contours + total.contours);
+    }
+    totals[glyph] = { points, contours };
+    aggregated[glyph] = 1;
+    return totals[glyph]!;
+  };
+  for (let glyph = 0; glyph < glyphs; glyph += 1) {
+    if (!shapes[glyph]!.composite) continue;
+    const total = aggregateComposite(glyph);
+    if (total.points > maxp.readUInt16BE(10) || total.contours > maxp.readUInt16BE(12)) {
+      return "a TrueType composite glyph exceeds maxp composite point or contour limits";
+    }
+  }
+  const glyfPadding = glyf.subarray(previousLocation);
+  if (glyfPadding.length > 3 || [...glyfPadding].some((byte) => byte !== 0)) return "the TrueType glyf endpoint leaves non-padding bytes unindexed";
+  const cmap = byTag.get("cmap")!.bytes;
+  const name = byTag.get("name")!.bytes;
+  const cmapCount = cmap.length >= 4 ? cmap.readUInt16BE(2) : 0;
+  const cmapDirectoryEnd = 4 + cmapCount * 8;
+  if (cmap.length < 12 || cmap.readUInt16BE(0) !== 0 || cmapCount === 0 || cmapDirectoryEnd > cmap.length) return "the TrueType cmap table is invalid";
+  const cmapSubtables = new Map<number, number>();
+  for (let index = 0; index < cmapCount; index += 1) {
+    const subtableOffset = cmap.readUInt32BE(4 + index * 8 + 4);
+    if (subtableOffset < cmapDirectoryEnd || subtableOffset + 4 > cmap.length) return "a TrueType cmap subtable offset is invalid";
+    const formatNumber = cmap.readUInt16BE(subtableOffset);
+    if (formatNumber !== 4) return "the TrueType cmap format is unsupported";
+    const subtableLength = cmap.readUInt16BE(subtableOffset + 2);
+    if (subtableLength > cmap.length - subtableOffset) return "a TrueType cmap subtable length is invalid";
+    const previousLength = cmapSubtables.get(subtableOffset);
+    if (previousLength !== undefined && previousLength !== subtableLength) return "shared TrueType cmap records disagree about subtable length";
+    cmapSubtables.set(subtableOffset, subtableLength);
+    if (previousLength === undefined) {
+      const problem = invalidCmapFormat4(cmap.subarray(subtableOffset, subtableOffset + subtableLength), glyphs);
+      if (problem !== null) return problem;
+    }
+  }
+  let cmapCursor = cmapDirectoryEnd;
+  for (const [offset, length] of [...cmapSubtables].sort(([left], [right]) => left - right)) {
+    if (offset !== cmapCursor) return "the TrueType cmap has overlap, gaps or hidden bytes";
+    cmapCursor = offset + length;
+  }
+  if (cmapCursor !== cmap.length) return "the TrueType cmap has trailing hidden bytes";
+  const nameCount = name.length >= 6 ? name.readUInt16BE(2) : 0;
+  const nameRecordsEnd = 6 + nameCount * 12;
+  const stringsOffset = name.length >= 6 ? name.readUInt16BE(4) : 0;
+  if (name.length < 6 || name.readUInt16BE(0) !== 0 || nameCount === 0 || nameRecordsEnd > name.length || stringsOffset !== nameRecordsEnd) {
+    return "the TrueType name table is invalid";
+  }
+  const nameStorage = new Uint8Array(name.length - stringsOffset);
+  for (let index = 0; index < nameCount; index += 1) {
+    const record = 6 + index * 12;
+    const stringLength = name.readUInt16BE(record + 8);
+    const stringOffset = name.readUInt16BE(record + 10);
+    if (stringOffset > name.length - stringsOffset || stringLength > name.length - stringsOffset - stringOffset) {
+      return "a TrueType name string leaves its table";
+    }
+    nameStorage.fill(1, stringOffset, stringOffset + stringLength);
+  }
+  if (nameStorage.includes(0)) return "the TrueType name storage holds bytes no name record references";
+  const os2 = byTag.get("OS/2")!.bytes;
+  if (os2.length < 2 || OS2_LENGTHS.get(os2.readUInt16BE(0)) !== os2.length) return "the TrueType OS/2 table is not the exact length of its version";
+  return invalidPost(byTag.get("post")!.bytes, glyphs);
+};
+
+const validatedBinary = (path: string, bytes: Buffer): { type: string } | { why: string } => {
+  const extension = path.slice(path.lastIndexOf("."));
+  const validation = extension === ".png"
+    ? { type: "PNG", problem: invalidPng(bytes) }
+    : extension === ".ttf"
+      ? { type: "font (TrueType)", problem: invalidTrueType(bytes) }
+      : null;
+  if (validation === null) return { why: "the path does not have a recognized image or font extension (.png or .ttf)" };
+  const problem = validation.problem ?? embeddedSignature(bytes);
+  return problem === null ? { type: validation.type } : { why: problem };
+};
+
+/**
+ * What `classifyImport` examines and what it does not, stated for each imported file in the stored review
+ * packet and, in the same words, in the reviewer's prompt.
+ */
+export const IMPORT_INSPECTION_LIMITS =
+  "exact .png/.ttf extension and signature, a bounded structural parse in which every byte lies in a parsed chunk, table, record or zero padding, " +
+  "and a scan for embedded archive and executable signatures; field contents (pixel data, glyph instructions, name strings, metrics) " +
+  "are not interpreted, and neither the parse nor the scan proves the bytes inert";
+
+/** How review can see one imported file, from its bytes and path. */
+export type ImportContent =
+  | { kind: "text" }
+  | { kind: "data"; type: string }
+  | { kind: "refused"; why: string };
+
+/**
+ * Text (git reads it as text) is reviewed as the patch it is. Binary bytes are bound by their manifest
+ * only as a .png or .ttf whose strict structural parse places every byte in a parsed structure or zero
+ * padding and that carries no embedded archive or executable signature.
+ */
+export const classifyImport = (path: string, bytes: Buffer): ImportContent => {
+  const binary = gitReadsAsBinary(bytes);
+  const refused = REFUSED_FORMATS.find((candidate) => (binary || candidate.binaryOnly !== true) && matches(bytes, candidate));
+  if (refused !== undefined) return { kind: "refused", why: `${refused.name}: top-level signature refused by binary-import policy` };
+  if (!binary) return { kind: "text" };
+  const validated = validatedBinary(path, bytes);
+  return "type" in validated
+    ? { kind: "data", type: validated.type }
+    : { kind: "refused", why: `binary bytes are not a strictly parsed .png/.ttf free of embedded archive or executable signatures: ${validated.why}` };
+};
+
+const DIGEST = /^sha256:[0-9a-f]{64}$/;
+/**
+ * A path segment an import may use: ASCII letters, digits and `._@+-`. Nothing here is a glob, a
+ * separator, a control character or a character a filesystem may normalise into another name.
+ */
+const SEGMENT = /^[A-Za-z0-9._@+-]+$/;
+/** `.git`, in any case and with any trailing dots, names the git dir on a case-insensitive filesystem. */
+const GIT_DIR_SEGMENT = /^\.git\.*$/i;
+const RUN_OR_TASK_ID = /^[A-Za-z0-9_-]+$/;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const insideAny = (path: string, roots: readonly string[]): boolean =>
+  roots.some((root) => root === "." || path === root || path.startsWith(`${root}/`));
+
+const isImportPath = (path: unknown): path is string =>
+  typeof path === "string" &&
+  path.length > 0 &&
+  path.length <= IMPORT_PATH_MAX_CHARS &&
+  path.split("/").every((segment) => SEGMENT.test(segment) && segment !== "." && segment !== ".." && !GIT_DIR_SEGMENT.test(segment));
+
+const byPath = (a: { path: string }, b: { path: string }): number => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+
+/**
+ * A declared import manifest, checked and sorted by path, or why it is refused: 1 to IMPORT_MAX_FILES
+ * entries of exactly `{path, size, sha256}`; each path repository-relative in normal form, no `.git`
+ * segment, inside one of the write target's `paths`; no path twice or below another; each size and
+ * the total within their limits.
+ */
+export const parseImportManifest = (declared: unknown, paths: readonly string[]): Decision<TaskImport[]> => {
+  if (!Array.isArray(declared) || declared.length === 0 || declared.length > IMPORT_MAX_FILES) {
+    return deny(ReasonCode.INVALID_ARGUMENT, `the write target's imports must list 1 to ${IMPORT_MAX_FILES} files`, {
+      reason: "IMPORT_MANIFEST_INVALID",
+      count: Array.isArray(declared) ? declared.length : null,
+    });
+  }
+  const imports: TaskImport[] = [];
+  const invalid: Array<string | number> = [];
+  for (const [index, item] of declared.entries()) {
+    const shaped = isRecord(item) && Object.keys(item).sort().join(",") === "path,sha256,size";
+    if (
+      !shaped ||
+      !isImportPath(item["path"]) ||
+      !Number.isSafeInteger(item["size"]) ||
+      (item["size"] as number) < 0 ||
+      (item["size"] as number) > IMPORT_MAX_FILE_BYTES ||
+      typeof item["sha256"] !== "string" ||
+      !DIGEST.test(item["sha256"])
+    ) {
+      invalid.push(isRecord(item) && typeof item["path"] === "string" && item["path"].length <= IMPORT_PATH_MAX_CHARS ? item["path"] : index);
+      continue;
+    }
+    imports.push({ path: item["path"], size: item["size"] as number, sha256: item["sha256"] });
+  }
+  if (invalid.length > 0) {
+    return deny(
+      ReasonCode.INVALID_ARGUMENT,
+      `an import entry must be exactly {path, size, sha256}: a repository-relative path of [A-Za-z0-9._@+-] segments with no '.', '..' or .git segment, a size of at most ${IMPORT_MAX_FILE_BYTES} bytes and a sha256:<64 hex> digest`,
+      { reason: "IMPORT_MANIFEST_INVALID", invalid: invalid.slice(0, 50) },
+    );
+  }
+  imports.sort(byPath);
+  const overlapping = imports
+    .filter((entry, index) => imports.some((other, at) => at !== index && (other.path === entry.path || entry.path.startsWith(`${other.path}/`))))
+    .map((entry) => entry.path);
+  if (overlapping.length > 0) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "an import path is listed twice or lies below another import path", {
+      reason: "IMPORT_MANIFEST_INVALID",
+      overlapping: [...new Set(overlapping)].slice(0, 50),
+    });
+  }
+  const outOfScope = imports.filter((entry) => !insideAny(entry.path, paths)).map((entry) => entry.path);
+  if (outOfScope.length > 0) {
+    return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "an import path lies outside the task's write-target paths", {
+      reason: "IMPORT_OUT_OF_SCOPE",
+      outOfScope: outOfScope.slice(0, 50),
+      paths: [...paths],
+    });
+  }
+  const total = imports.reduce((sum, entry) => sum + entry.size, 0);
+  if (total > IMPORT_MAX_TOTAL_BYTES) {
+    return deny(ReasonCode.INVALID_ARGUMENT, `a task imports at most ${IMPORT_MAX_TOTAL_BYTES} bytes`, { reason: "IMPORT_MANIFEST_INVALID", total });
+  }
+  return allow(ReasonCode.OK, imports);
+};
+
+/** The staging directory of one task, under the ACP-owned import root. */
+export const importStagingDir = (root: string, runId: string, taskId: string): string => join(root, runId, taskId);
+
+const lstatOrNull = (path: string): Stats | null => {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR") return null;
+    throw error;
+  }
+};
+
+/** Why a staging directory is not one this daemon's user owns alone, or null when it is. */
+const unownedDirectory = (stat: Stats): string | null => {
+  if (stat.isSymbolicLink()) return "a symbolic link";
+  if (!stat.isDirectory()) return "not a directory";
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) return "owned by another user";
+  if ((stat.mode & 0o022) !== 0) return "writable by group or others";
+  return null;
+};
+
+/** Reads one staged file without following a symlink or blocking on a fifo, and only up to its declared size. */
+const readStaged = (path: string, size: number): { bytes: Buffer } | { problem: "missing" | "mismatch" | string } => {
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { problem: "missing" };
+    return { problem: code === "ELOOP" ? "a symbolic link" : `unreadable (${code ?? "error"})` };
+  }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return { problem: "not a regular file" };
+    if (stat.size !== size) return { problem: "mismatch" };
+    const bytes = Buffer.alloc(size);
+    let offset = 0;
+    while (offset < size) {
+      const read = readSync(fd, bytes, offset, size - offset, offset);
+      if (read === 0) return { problem: "mismatch" };
+      offset += read;
+    }
+    // Grown since the stat: not the declared size, so not the declared bytes.
+    if (readSync(fd, Buffer.alloc(1), 0, 1, size) !== 0) return { problem: "mismatch" };
+    return { bytes };
+  } finally {
+    closeSync(fd);
+  }
+};
+
+/**
+ * Every import's bytes, read once from the task's staging directory and verified against its entry,
+ * or the refusal naming every file that is missing, insecure or not the declared bytes. The root, the
+ * run's and the task's directories must be real directories this daemon's user owns and only it can
+ * write; a staged file must be a regular file, not a symlink, named by the hex of its sha256.
+ */
+export const readStagedImports = (input: {
+  root: string | null;
+  runId: string;
+  taskId: string;
+  imports: readonly TaskImport[];
+}): Decision<StagedImport[]> => {
+  if (input.root === null) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "this control plane has no import staging root, so a task that declares imports is not run", {
+      reason: "IMPORT_STAGING_UNCONFIGURED",
+    });
+  }
+  if (!RUN_OR_TASK_ID.test(input.runId) || !RUN_OR_TASK_ID.test(input.taskId)) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "the run or task id cannot name a staging directory", { reason: "IMPORT_STAGING_INVALID" });
+  }
+  const stagingDir = importStagingDir(input.root, input.runId, input.taskId);
+  for (const dir of [input.root, join(input.root, input.runId), stagingDir]) {
+    const stat = lstatOrNull(dir);
+    if (stat === null) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "the task's import staging directory does not exist; stage each file there under the hex of its sha256", {
+        reason: "IMPORT_SOURCE_MISSING",
+        stagingDir,
+        missing: input.imports.map((entry) => entry.path).slice(0, 50),
+      });
+    }
+    const problem = unownedDirectory(stat);
+    if (problem !== null) {
+      return deny(ReasonCode.STATE_PATH_INSECURE, `the import staging directory ${dir} is ${problem}`, {
+        reason: "IMPORT_STAGING_INSECURE",
+        stagingDir,
+        problem,
+      });
+    }
+  }
+  const staged: StagedImport[] = [];
+  const missing: string[] = [];
+  const mismatched: string[] = [];
+  const insecure: Array<{ path: string; problem: string }> = [];
+  for (const entry of input.imports) {
+    const read = readStaged(join(stagingDir, entry.sha256.slice("sha256:".length)), entry.size);
+    if ("problem" in read) {
+      if (read.problem === "missing") missing.push(entry.path);
+      else if (read.problem === "mismatch") mismatched.push(entry.path);
+      else insecure.push({ path: entry.path, problem: read.problem });
+      continue;
+    }
+    if (sha256(read.bytes) !== entry.sha256) {
+      mismatched.push(entry.path);
+      continue;
+    }
+    staged.push({ ...entry, bytes: read.bytes });
+  }
+  const named = { stagingDir, missing: missing.slice(0, 50), mismatched: mismatched.slice(0, 50), insecure: insecure.slice(0, 50) };
+  const refused: Array<{ path: string; why: string }> = [];
+  const text: StagedImport[] = [];
+  for (const entry of staged) {
+    const content = classifyImport(entry.path, entry.bytes);
+    if (content.kind === "refused") refused.push({ path: entry.path, why: content.why });
+    else if (content.kind === "text") text.push(entry);
+  }
+  const textBytes = text.reduce((sum, entry) => sum + entry.size, 0);
+  if (insecure.length > 0) {
+    return deny(ReasonCode.STATE_PATH_INSECURE, "a staged import is not a regular file in its staging directory; nothing is imported", {
+      reason: "IMPORT_SOURCE_INSECURE",
+      ...named,
+    });
+  }
+  if (mismatched.length > 0) {
+    return deny(ReasonCode.IMPORT_DIGEST_MISMATCH, "a staged import is not the size or sha256 its manifest entry declares; nothing is imported", {
+      reason: "IMPORT_DIGEST_MISMATCH",
+      ...named,
+    });
+  }
+  if (missing.length > 0) {
+    return deny(ReasonCode.EVIDENCE_MISSING, "a manifest entry has no staged file; nothing is imported", { reason: "IMPORT_SOURCE_MISSING", ...named });
+  }
+  if (refused.length > 0) {
+    return deny(ReasonCode.IMPORT_CONTENT_REFUSED, "a binary import is not a strictly parsed .png/.ttf free of embedded archive or executable signatures; nothing is imported", {
+      reason: "IMPORT_NOT_REVIEWABLE",
+      refused: refused.slice(0, 50),
+    });
+  }
+  if (textBytes > IMPORT_MAX_TEXT_BYTES) {
+    return deny(ReasonCode.IMPORT_CONTENT_REFUSED, `a task imports at most ${IMPORT_MAX_TEXT_BYTES} bytes of text, which review reads as patch; nothing is imported`, {
+      reason: "IMPORT_TEXT_TOO_LARGE",
+      textBytes,
+      limit: IMPORT_MAX_TEXT_BYTES,
+      text: text.map((entry) => entry.path).slice(0, 50),
+    });
+  }
+  return allow(ReasonCode.OK, staged);
+};
+
+/**
+ * Whether every import can be created in the checkout: no directory on its path is a symlink or a
+ * file, and nothing stands at the path itself. An import never replaces a file.
+ */
+export const checkImportDestinations = (worktree: string, imports: readonly TaskImport[]): Decision<void> => {
+  const symlinked: string[] = [];
+  const occupied: string[] = [];
+  for (const entry of imports) {
+    let cursor = worktree;
+    let blocked = false;
+    for (const segment of entry.path.split("/").slice(0, -1)) {
+      cursor = join(cursor, segment);
+      const stat = lstatOrNull(cursor);
+      if (stat === null) break;
+      if (stat.isSymbolicLink()) {
+        symlinked.push(entry.path);
+        blocked = true;
+        break;
+      }
+      if (!stat.isDirectory()) {
+        occupied.push(entry.path);
+        blocked = true;
+        break;
+      }
+    }
+    if (!blocked && lstatOrNull(join(worktree, entry.path)) !== null) occupied.push(entry.path);
+  }
+  if (symlinked.length > 0) {
+    return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "a directory on an import's path is a symbolic link; nothing is imported", {
+      reason: "IMPORT_DESTINATION_SYMLINK",
+      symlinked: symlinked.slice(0, 50),
+    });
+  }
+  if (occupied.length > 0) {
+    return deny(ReasonCode.CONFLICT, "something already stands at an import's path or one of its directories; an import only adds files", {
+      reason: "IMPORT_DESTINATION_EXISTS",
+      occupied: occupied.slice(0, 50),
+    });
+  }
+  return allow(ReasonCode.OK, undefined);
+};
+
+/** What one import attempt created, each with the identity it was created with. */
+export interface WrittenImports {
+  files: Array<{ path: string; dev: number; ino: number }>;
+  directories: Array<{ path: string; dev: number; ino: number }>;
+}
+
+/**
+ * Creates every import in the checkout: missing directories one at a time, each file create-only
+ * (`O_EXCL`, never through a symlink) with exactly the verified bytes. Stops at the first error and
+ * returns what it created, so the caller can take back exactly that.
+ */
+export const writeImports = (worktree: string, staged: readonly StagedImport[]): { written: WrittenImports; error: string | null } => {
+  const written: WrittenImports = { files: [], directories: [] };
+  try {
+    for (const entry of staged) {
+      const segments = entry.path.split("/");
+      let relative = "";
+      for (const segment of segments.slice(0, -1)) {
+        relative = relative ? `${relative}/${segment}` : segment;
+        const full = join(worktree, relative);
+        const stat = lstatOrNull(full);
+        if (stat === null) {
+          mkdirSync(full, { mode: 0o755 });
+          const made = lstatSync(full);
+          written.directories.push({ path: relative, dev: made.dev, ino: made.ino });
+        } else if (stat.isSymbolicLink() || !stat.isDirectory()) {
+          throw new Error(`${relative} is not a directory`);
+        }
+      }
+      const fd = openSync(join(worktree, entry.path), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
+      try {
+        const made = fstatSync(fd);
+        written.files.push({ path: entry.path, dev: made.dev, ino: made.ino });
+        let offset = 0;
+        while (offset < entry.bytes.length) offset += writeSync(fd, entry.bytes, offset, entry.bytes.length - offset, offset);
+      } finally {
+        closeSync(fd);
+      }
+    }
+    return { written, error: null };
+  } catch (error) {
+    return { written, error: (error instanceof Error ? error.message : String(error)).slice(0, 300) };
+  }
+};
+
+/**
+ * Takes back what one import attempt created: a file or directory is removed only while it is still
+ * the one this attempt created (same device and inode), and a directory only when empty. Returns the
+ * paths left in place.
+ */
+export const undoImports = (worktree: string, written: WrittenImports): string[] => {
+  const left: string[] = [];
+  const same = (path: string, created: { dev: number; ino: number }, kind: "file" | "directory"): boolean => {
+    const stat = lstatOrNull(join(worktree, path));
+    return stat !== null && stat.dev === created.dev && stat.ino === created.ino && (kind === "file" ? stat.isFile() : stat.isDirectory());
+  };
+  for (const file of [...written.files].reverse()) {
+    try {
+      if (same(file.path, file, "file")) unlinkSync(join(worktree, file.path));
+      else if (lstatOrNull(join(worktree, file.path)) !== null) left.push(file.path);
+    } catch {
+      left.push(file.path);
+    }
+  }
+  for (const directory of [...written.directories].reverse()) {
+    try {
+      if (same(directory.path, directory, "directory")) rmdirSync(join(worktree, directory.path));
+      else if (lstatOrNull(join(worktree, directory.path)) !== null) left.push(directory.path);
+    } catch {
+      left.push(directory.path);
+    }
+  }
+  return left;
+};
+
+/**
+ * The imports a scan of the checkout against its base (`scanAgainst` entries) does not show as
+ * imported: each must be a regular 100644 file with its CTO-authorized declared sha256. After the import
+ * this names one git does not see (an ignored path, say); after a turn, one the worker changed.
+ */
+export const importsNotHeld = (
+  imports: readonly TaskImport[],
+  entries: readonly { path: string; mode: string | null; sha256: string | null }[],
+): string[] => {
+  const scanned = new Map(entries.map((entry) => [entry.path, entry]));
+  return imports
+    .filter((entry) => scanned.get(entry.path)?.mode !== "100644" || scanned.get(entry.path)?.sha256 !== entry.sha256)
+    .map((entry) => entry.path);
+};
