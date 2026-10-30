@@ -10,7 +10,6 @@ import {
   IncidentClass,
   type NoticeDelivery,
   deliverIncident,
-  noticeStatus,
   runEpisode,
 } from "./ceo-incident-notices.ts";
 
@@ -249,18 +248,25 @@ export const routeOwnerlessStalls = (cp: StallPorts): StallRouting[] => {
 
 /**
  * A retirement refused because confirmed external effects have not settled names the runs it waits on. A
- * run terminal in BLOCKED_POST_MERGE never settles; once that run's stall has reached the CEO, the held
- * retirement does too, as its own RETIREMENT_HELD incident. Treating such a run as settled is a pending
- * transition, so the refusal stands.
+ * run terminal in BLOCKED_POST_MERGE never settles, so the refusal itself delivers the held retirement to the
+ * CEO as its own RETIREMENT_HELD incident, once per episode of that run. Treating such a run as settled is a
+ * pending transition, so the refusal stands. The refusal keeps nothing (#1251): the caller has taken back
+ * what the request took, nothing retries it, and the notice states what the refusal left, read after it.
  */
 export const retirementWaitsForSettlement = (
   cp: StallPorts,
   projectId: string,
   settling: ReadonlyArray<{ run_id: string; state: string }>,
 ): Decision<never> => {
+  const pending = cp.db.get(`SELECT 1 FROM project_retirements WHERE project_id = ? AND completed_at IS NULL`, [projectId]) !== undefined;
+  const suspended = cp.db.get<{ suspended: number }>(`SELECT suspended FROM projects WHERE project_id = ?`, [projectId])?.suspended === 1;
+  const left = pending
+    ? "the retirement was refused; the retirement request an earlier attempt left pending keeps the project suspended " +
+      "and is asked again on every daemon pass"
+    : `the retirement was refused and nothing was changed; the project is ${suspended ? "suspended as it was before the request" : "not suspended"} ` +
+      "and no retirement request is pending, so it must be requested again once this transition exists";
   for (const run of settling) {
     if (run.state !== RunState.BLOCKED_POST_MERGE) continue;
-    if (noticeStatus(cp, runStalled(cp, run.run_id, {})).state === "NOT_ENQUEUED") continue;
     deliverIncident(cp, {
       cls: IncidentClass.RETIREMENT_HELD,
       subject: run.run_id,
@@ -274,9 +280,7 @@ export const retirementWaitsForSettlement = (
         reason:
           "the project's retirement waits for confirmed external effects to settle, and this run is terminal in " +
           "BLOCKED_POST_MERGE, which nothing settles",
-        action:
-          "none within existing authority: the project stays suspended and its retirement request stays pending, asked " +
-          "again on every daemon pass; see needsTransition",
+        action: `none within existing authority: ${left}; see needsTransition`,
         needsTransition:
           "retirement over a terminal BLOCKED_POST_MERGE run whose merged effects are kept, treated as settled for retirement (pending)",
         detail:

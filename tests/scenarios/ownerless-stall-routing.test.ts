@@ -8,7 +8,7 @@ import { Daemon } from "../../src/daemon/daemon.ts";
 import { ApprovedRunFinalizer } from "../../src/daemon/finalizer.ts";
 import { Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { routeOwnerlessStalls } from "../../src/ceo/ownerless-stalls.ts";
-import { retireProject } from "../../src/registry/project-retirement.ts";
+import { resumeRetirements, retireProject } from "../../src/registry/project-retirement.ts";
 import { bootstrapPlan, cleanTreeManifest, reviewBootstrapPlan } from "../helpers/bootstrap-plan.ts";
 import { dispatchRun, normalized } from "../helpers/contract-change.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
@@ -327,6 +327,51 @@ describe("an owner retirement held by a terminal BLOCKED_POST_MERGE run", () => 
     } finally {
       await daemon.stop();
     }
+  });
+
+  it("requested before the run's own stall is routed, the refusal delivers the notice, whose text states what the refusal left: nothing suspended, nothing pending, nothing retried", async () => {
+    const { routePostMergeStall } = await import("../../src/ceo/ownerless-stalls.ts");
+    const { github, harness, driven } = await confirmedRun();
+    const blocked = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+    expect(blocked.reasonCode).toBe(ReasonCode.FINALIZATION_COMPENSATION_REQUIRED);
+    const facts = mergedFacts(harness, driven.runId);
+    expect(facts.run.state).toBe(RunState.BLOCKED_POST_MERGE);
+    // The run's own stall is not routed yet: no notice of any kind for it.
+    expect(criticalNotices(harness, driven.runId)).toEqual([]);
+    const held = () => criticalNotices(harness, driven.runId).filter((notice) => notice.payload["stall"] === "PROJECT_RETIREMENT_HELD");
+    /** What a refused retirement leaves: no suspension, no pending retirement, no intent for a sweep to resume. */
+    const left = () => ({
+      suspended: harness.cp.projects.get(driven.projectId)?.suspended,
+      pending: harness.cp.db.all(`SELECT project_id FROM project_retirements WHERE project_id = ?`, [driven.projectId]),
+      intents: harness.cp.db.all(`SELECT kind FROM audit_events WHERE kind = 'PROJECT_RETIREMENT_INTENT' AND project_id = ?`, [driven.projectId]),
+    });
+    const nothingLeft = { suspended: false, pending: [], intents: [] };
+
+    expect(await retireProject(harness.cp, driven.projectId, "retire the project")).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CONFLICT,
+      evidence: { projectId: driven.projectId, waitingOn: [{ runId: driven.runId, state: RunState.BLOCKED_POST_MERGE }] },
+    });
+    expect(left()).toEqual(nothingLeft);
+    expect(held()).toHaveLength(1);
+    const payload = held()[0]!.payload;
+    expect(payload).toMatchObject({ owner: "CEO", projectId: driven.projectId, state: RunState.BLOCKED_POST_MERGE });
+    expect(payload["action"]).toEqual(expect.stringContaining("none within existing authority"));
+    expect(payload["needsTransition"]).toEqual(expect.stringMatching(/settled for retirement \(pending\)$/));
+    // The text states the refusal as it is: refused, nothing changed, not suspended, no request pending, ask again.
+    const said = [payload["reason"], payload["action"], payload["needsTransition"]].join(" ");
+    expect(said).toEqual(expect.stringContaining("refused and nothing was changed"));
+    expect(said).toEqual(expect.stringContaining("the project is not suspended and no retirement request is pending"));
+    expect(said).toEqual(expect.stringContaining("requested again once this transition exists"));
+    expect(said).not.toMatch(/stays suspended|stays pending|every daemon pass/);
+
+    // The stall routed later and the daemon's sweep: nothing retries the refused retirement, and nothing is sent twice.
+    expect(routePostMergeStall(harness.cp, driven.runId)).toMatchObject({ allowed: true, value: { created: true } });
+    await resumeRetirements(harness.cp);
+    expect(held()).toHaveLength(1);
+    expect(left()).toEqual(nothingLeft);
+    expect(mergedFacts(harness, driven.runId)).toEqual(facts);
+    expect(github.mergeCount).toBe(1);
   });
 });
 
