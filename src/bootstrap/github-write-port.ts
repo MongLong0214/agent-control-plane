@@ -104,6 +104,12 @@ export interface WorkMilestone { number: number; nodeId: string; title: string; 
 export interface WorkIssue { number: number; nodeId: string; title: string; body: string; milestone: { number: number; nodeId: string } | null }
 /** #1240 — every milestone and issue of the repository at `repositoryNodeId`, all pages. */
 export interface WorkResources { repositoryNodeId: string; milestones: WorkMilestone[]; issues: WorkIssue[] }
+/**
+ * #1240 — a planned genesis label, milestone or issue a readback did not find as planned: nothing carries
+ * its name or marker (`absent`), something does but differs (`differs`), or the issue does not link its
+ * planned milestone (`milestone`).
+ */
+export interface GenesisResourceUnmet { resource: "label" | "milestone" | "issue"; key: string; problem: "absent" | "differs" | "milestone" }
 
 export interface GitHubWritePort {
   observeRepository(target: GitHubRepositoryTarget): Promise<ObservedRepository | null>;
@@ -137,9 +143,10 @@ export interface GitHubWritePort {
   /**
    * #1240 — with `repositoryNodeId`, the readback is the repository's at that node id, read before and
    * after the lists, and every listed milestone and issue must name that repository (an answer naming
-   * another is thrown, never matched); an issue's milestone is judged by the milestone's node id.
+   * another is thrown, never matched); an issue's milestone is judged by the milestone's node id. A
+   * readback that answers null pushes each planned item it did not find as planned onto `unmet`.
    */
-  observeGenesisResources?(target: GitHubRepositoryTarget, bundle: Pick<GenesisBundle, 'labels' | 'milestones' | 'issues'>, options?: { repositoryNodeId?: string }): Promise<Record<string, unknown> | null>;
+  observeGenesisResources?(target: GitHubRepositoryTarget, bundle: Pick<GenesisBundle, 'labels' | 'milestones' | 'issues'>, options?: { repositoryNodeId?: string; unmet?: GenesisResourceUnmet[] }): Promise<Record<string, unknown> | null>;
   /**
    * #1240 — a readback for a STANDARD_WORK run's work units: every milestone and issue (pull requests
    * excluded) on every page, the repository read at `repositoryNodeId` before and after the lists, and
@@ -614,9 +621,26 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
       const linked = (x: ListedIssue, key: string): boolean => fullName === null
         ? x.milestone?.number === markedMilestone(key)?.number
         : x.milestone != null && x.milestone.node_id === markedMilestone(key)?.node_id;
-      if (!bundle.labels.every(l => labels.some(x => x.name === l.name && sameIgnoringCase(x.color, l.color) && (x.description ?? '') === l.description))) return null;
-      if (!bundle.milestones.every(m => milestones.some(x => x.title === m.title && x.description === `${m.description}\n<!-- acp-genesis:${m.key} -->`))) return null;
-      if (!bundle.issues.every(i => issues.some(x => x.title === i.title && x.body === `${i.body}\n<!-- acp-genesis:${i.key} -->` && canonicalLabels(x.labels.map(l => l.name)) === canonicalLabels(i.labels) && (i.milestoneKey === null ? x.milestone === null : linked(x, i.milestoneKey))))) return null;
+      // #1240 — each planned item not found as planned is named, so a failed readback says what is unmet.
+      const unmet: GenesisResourceUnmet[] = [];
+      for (const l of bundle.labels) {
+        if (labels.some(x => x.name === l.name && sameIgnoringCase(x.color, l.color) && (x.description ?? '') === l.description)) continue;
+        unmet.push({ resource: "label", key: l.name, problem: labels.some(x => sameIgnoringCase(x.name, l.name)) ? "differs" : "absent" });
+      }
+      for (const m of bundle.milestones) {
+        if (milestones.some(x => x.title === m.title && x.description === `${m.description}\n<!-- acp-genesis:${m.key} -->`)) continue;
+        unmet.push({ resource: "milestone", key: m.key, problem: markedMilestone(m.key) ? "differs" : "absent" });
+      }
+      for (const i of bundle.issues) {
+        const marked = issues.filter(x => (x.body ?? "").endsWith(`<!-- acp-genesis:${i.key} -->`));
+        const same = marked.filter(x => x.title === i.title && x.body === `${i.body}\n<!-- acp-genesis:${i.key} -->` && canonicalLabels(x.labels.map(l => l.name)) === canonicalLabels(i.labels));
+        if (same.some(x => i.milestoneKey === null ? x.milestone === null : linked(x, i.milestoneKey))) continue;
+        unmet.push({ resource: "issue", key: i.key, problem: same.length > 0 ? "milestone" : marked.length > 0 ? "differs" : "absent" });
+      }
+      if (unmet.length > 0) {
+        options?.unmet?.push(...unmet);
+        return null;
+      }
       return { labels:bundle.labels, milestones:bundle.milestones, issues:bundle.issues };
     },
     async observeWorkResources(target, repositoryNodeId) {

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { executablePlanOf, planForSubmission } from "../../src/bootstrap/bootstrap-plan.ts";
 import { createBootstrapGitHubWritePort } from "../../src/bootstrap/bootstrap-write-guard.ts";
 import { type GenesisBundle, parseGenesis } from "../../src/bootstrap/genesis-bundle.ts";
-import { createGitHubApiWritePort, type GitHubRepositoryTarget } from "../../src/bootstrap/github-write-port.ts";
+import { createGitHubApiWritePort, type GenesisResourceUnmet, type GitHubRepositoryTarget } from "../../src/bootstrap/github-write-port.ts";
 import { produceRepoFactoryResult } from "../../src/bootstrap/repo-factory-producer.ts";
 import { acpError, allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -1189,7 +1189,7 @@ describe("#1240 (i) — the genesis resources readback is bound to the exact rep
     class Recording extends GenesisGitHub {
       readonly bound: unknown[] = [];
       override async observeGenesisResources(t: GitHubRepositoryTarget, b: Pick<GenesisBundle, "labels" | "milestones" | "issues">, options?: { repositoryNodeId?: string }) {
-        this.bound.push(options);
+        this.bound.push({ repositoryNodeId: options?.repositoryNodeId });
         return super.observeGenesisResources(t, b);
       }
     }
@@ -1217,6 +1217,60 @@ describe("#1240 (i) — the genesis resources readback is bound to the exact rep
     await port.ensureGenesisResources!(target, bundle);
     expect(github.posts("/issues")).toHaveLength(0);
     expect(await port.observeGenesisResources!(target, bundle, { repositoryNodeId: NODE })).toEqual(bundle);
+  });
+
+  it("a readback that is not as planned names each unmet item: an absent milestone, an absent issue, a mis-linked issue", async () => {
+    const github = genesisRepository();
+    github.issues[1]!.milestone = { ...github.milestoneRef(github.milestones[0]!), node_id: "MI_elsewhere" };
+    const planned = {
+      labels: [],
+      milestones: [...bundle.milestones, { key: "m2", title: "Second product increment", description: "The second product increment" }],
+      issues: [...bundle.issues, { key: "i2", title: "Ship the second increment", body: "What the second increment delivers", labels: [], milestoneKey: "m2" }],
+    };
+    const unmet: GenesisResourceUnmet[] = [];
+    const port = createGitHubApiWritePort({ client: github });
+    expect(await port.observeGenesisResources!(target, planned, { repositoryNodeId: NODE, unmet })).toBeNull();
+    expect(unmet).toEqual([
+      { resource: "milestone", key: "m2", problem: "absent" },
+      { resource: "issue", key: "i1", problem: "milestone" },
+      { resource: "issue", key: "i2", problem: "absent" },
+    ]);
+  });
+
+  it("an issue GitHub accepted without its milestone stops acp-genesis-issues naming that link, and a resume creates no second issue", async () => {
+    /** The genesis double, with its milestones and issues on the production port over the REST double. */
+    class Linked extends GenesisGitHub {
+      readonly issuesRest = new IssuesGitHub();
+      private readonly api = createGitHubApiWritePort({ client: this.issuesRest });
+      override async ensureGenesisResources(t: GitHubRepositoryTarget, b: Pick<GenesisBundle, "labels" | "milestones" | "issues">) {
+        this.issuesRest.nodeId = this.repository(t.owner, t.name)!.nodeId;
+        await this.api.ensureGenesisResources!(t, b);
+      }
+      override async observeGenesisResources(t: GitHubRepositoryTarget, b: Pick<GenesisBundle, "labels" | "milestones" | "issues">, options?: { repositoryNodeId?: string }) {
+        this.issuesRest.nodeId = this.repository(t.owner, t.name)!.nodeId;
+        return (await this.api.observeGenesisResources!(t, b, options)) === null ? null : b;
+      }
+    }
+    const unlabelled = { ...genesisBundle(), labels: [], issues: genesisBundle().issues.map((issue) => ({ ...issue, labels: [] })) };
+    const f = genesisPlanFixture(unlabelled);
+    const root = tempDir("genesis-unmet-readback-");
+    const port = new Linked(root);
+    port.issuesRest.dropMilestone = true;
+    const produce = () => produceRepoFactoryResult({
+      plan: executablePlanOf(f.outputs, f.binding.planDigest),
+      workDir: join(root, "work"),
+      approvedFiles: f.outputs.files,
+      github: { port, authority: { owner: OWNER, visibility: "public" as const, approvedOperations: f.outputs.githubOperations.map(({ operationId, resourceIdentity, resourceType }) => ({ operationId, resourceIdentity, resourceType })) } },
+    });
+    const first = await produce();
+    expect(first.allowed).toBe(false);
+    expect(first.evidence).toMatchObject({ refusal: "REREAD_MISMATCH", failedOperationId: "acp-genesis-issues", unmet: [{ resource: "issue", key: "i1", problem: "milestone" }] });
+    port.issuesRest.dropMilestone = false;
+    const resumed = await produce();
+    expect(resumed.allowed).toBe(false);
+    expect(resumed.evidence).toMatchObject({ failedOperationId: "acp-genesis-issues", unmet: [{ resource: "issue", key: "i1", problem: "milestone" }] });
+    expect(port.issuesRest.posts("/issues")).toHaveLength(1);
+    expect(port.issuesRest.posts("/milestones")).toHaveLength(1);
   });
 });
 
