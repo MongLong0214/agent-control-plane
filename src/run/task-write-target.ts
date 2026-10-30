@@ -10,6 +10,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { RunKind, TaskState } from "../domain/types.ts";
 import { classifyBranch, validateBranchContract } from "../github/branch-contract.ts";
+import { residentBaseClone } from "../registry/resident-repositories.ts";
 import { type TaskImport, parseImportManifest } from "./task-import.ts";
 import { type PinnedRepository, pinRepository, runPinnedGit } from "./worker-git.ts";
 
@@ -339,6 +340,7 @@ export interface TaskWriteTargetPorts {
 }
 
 interface RepositoryFacts {
+  repositoryId: string;
   identity: string;
   checkoutPath: string;
   baseBranch: string;
@@ -481,8 +483,8 @@ export class TaskWriteTargets {
     const derivedFields: string[] = ["declaredParent", "baseSha"];
 
     // The repository: the one the PLAN named, or the run's only one.
-    const repositories = db.all<{ identity: string; checkoutPath: string; baseBranch: string }>(
-      `SELECT r.identity, r.checkout_path AS checkoutPath, rr.base_branch AS baseBranch
+    const repositories = db.all<{ repositoryId: string; identity: string; checkoutPath: string; baseBranch: string }>(
+      `SELECT r.repository_id AS repositoryId, r.identity, r.checkout_path AS checkoutPath, rr.base_branch AS baseBranch
          FROM run_repositories rr JOIN repositories r ON r.repository_id = rr.repository_id
         WHERE rr.run_id = ? ORDER BY rr.merge_order, r.identity`,
       [runId],
@@ -591,7 +593,7 @@ export class TaskWriteTargets {
         declaredParent: branch.value.declaredParent,
         ...(imports ? { imports } : {}),
       },
-      repository: { identity: chosen.identity, checkoutPath: chosen.checkoutPath, baseBranch: chosen.baseBranch },
+      repository: { repositoryId: chosen.repositoryId, identity: chosen.identity, checkoutPath: chosen.checkoutPath, baseBranch: chosen.baseBranch },
       declared,
       derivedFields: derivedFields.sort(),
       branchClass: branch.value.branchClass,
@@ -625,10 +627,40 @@ export class TaskWriteTargets {
    * and repository, or else the commit its base branch names in the registered checkout right now.
    * Every later task of the run reads the pin, never the branch name again; `ensure` settles a
    * concurrent first pin inside its transaction.
+   *
+   * #1227 — a resident's repository is registered at its worker clone, whose base branch only follows
+   * pins (`WorkerTurnRunner`): the base is read where the resident keeps it, its clone, which is only
+   * read, and its objects are fetched into the worker clone by that name. The fetch writes objects
+   * alone (no ref, no FETCH_HEAD), which a worker turn's git-dir baseline does not hold.
    */
   private async pinnedBase(runId: string, repository: RepositoryFacts): Promise<Decision<string>> {
     const earlier = runBasePin(this.ports.db, runId, repository.identity);
     if (earlier) return allow(ReasonCode.OK, earlier);
+    const residentClone = residentBaseClone(this.ports.db, repository.repositoryId, repository.checkoutPath);
+    if (residentClone !== null) {
+      const read = await this.readBase({ ...repository, checkoutPath: residentClone });
+      if (!read.allowed) return read;
+      return this.withRepository(repository, async (repo) => {
+        const fetched = await runPinnedGit(repo, [
+          "fetch", "--quiet", "--no-write-fetch-head", "--no-tags", "--no-recurse-submodules", residentClone, `refs/heads/${repository.baseBranch}`,
+        ]);
+        const present = await runPinnedGit(repo, ["cat-file", "-e", `${read.value}^{commit}`]);
+        if (present.exitCode !== 0) {
+          return deny(ReasonCode.NOT_FOUND, "the run's base commit, read in the resident's clone, could not be brought into the worker checkout", {
+            repositoryIdentity: repository.identity,
+            baseBranch: repository.baseBranch,
+            baseSha: read.value,
+            fetchExitCode: fetched.exitCode,
+          });
+        }
+        return read;
+      });
+    }
+    return this.readBase(repository);
+  }
+
+  /** The commit the base branch names in `repository.checkoutPath` right now. */
+  private async readBase(repository: RepositoryFacts): Promise<Decision<string>> {
     return this.withRepository(repository, async (repo) => {
       const read = await runPinnedGit(repo, ["rev-parse", "--verify", "-q", `refs/heads/${repository.baseBranch}^{commit}`]);
       const sha = read.stdout.trim();

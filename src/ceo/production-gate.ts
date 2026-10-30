@@ -43,6 +43,7 @@ import { type HermesAdmittedTurn, hermesTurnEvidence } from "../mcp/hermes-prove
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
 import type { ContinuityGate } from "../run/run-engine.ts";
+import { residentBaseClone } from "../registry/resident-repositories.ts";
 import {
   candidateSnapshotDigest,
   candidateSnapshotSchema,
@@ -1253,9 +1254,9 @@ export class ProductionGate {
         drift.push({ identity: frozen.identity, reason: "repository no longer participates in run" });
         continue;
       }
-      const git = (args: string[]): string | null => {
+      const git = (args: string[], cwd = participant.checkoutPath): string | null => {
         try {
-          return execFileSync("git", ["-C", participant.checkoutPath, ...args], {
+          return execFileSync("git", ["-C", cwd, ...args], {
             encoding: "utf8",
             stdio: ["ignore", "pipe", "ignore"],
             // A read of a participant checkout cannot be allowed to hold the gate open. An index
@@ -1271,7 +1272,12 @@ export class ProductionGate {
       // freshness does; one helper answers both.
       const expectedHead = expectedCheckoutHead(frozen);
       const tree = git(["rev-parse", `${frozen.candidateHead}^{tree}`]);
-      const base = git(["rev-parse", frozen.baseBranch]);
+      // #1227 review r2 (PR #1256, D-P2) — a resident's worker clone keeps its base branch where the clone
+      // was made; the current base is the resident's, read only in its clone, as snapshot freshness reads it.
+      const residentClone = residentBaseClone(this.db, participant.repositoryId, participant.checkoutPath);
+      const base = residentClone === null
+        ? git(["rev-parse", frozen.baseBranch])
+        : git(["rev-parse", "--verify", `refs/heads/${frozen.baseBranch}^{commit}`], residentClone);
       const status = git(["status", "--porcelain", "--untracked-files=all"]);
       if (head !== expectedHead) {
         drift.push({ identity: frozen.identity, expectedHead, observedHead: head });

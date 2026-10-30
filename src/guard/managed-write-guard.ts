@@ -156,7 +156,11 @@ class DaemonFinalizerAuthorityToken {
 /** Opaque capability accepted only for the fenced post-approval GitHub write set. */
 export type DaemonFinalizerAuthority = DaemonFinalizerAuthorityToken;
 
-/** Opaque capability held only by the doctor repair composition path. */
+/**
+ * Opaque capability the composition root holds for repository repairs outside a run: the doctor's
+ * removal of a stranded worktree, and the move of a resident project's worker turns to their own
+ * checkout (#1227, registry/worker-checkout.ts).
+ */
 class RepairWorktreeAuthorityToken {
   readonly #mint: symbol;
   readonly #guard: ManagedWriteGuard;
@@ -243,7 +247,11 @@ export interface GuardRequest {
   daemonFinalizerAuthority?: DaemonFinalizerAuthority | null;
   /** Only the composition root may authorize a runless initial manifest registration. */
   bootstrapManifestAuthority?: BootstrapManifestAuthority | null;
-  /** Only the doctor repair path may destroy a stranded worktree outside a run. */
+  /**
+   * Only the composition root's repository repairs may run a GIT_WORKTREE effect outside a run, and only
+   * for a registered repository's checkout: the doctor's removal of a stranded worktree, and the adding of
+   * a resident project's worker checkout beside its clone (#1227).
+   */
   repairWorktreeAuthority?: RepairWorktreeAuthority | null;
 }
 

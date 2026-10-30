@@ -17,6 +17,7 @@ import { join } from "node:path";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import { WorktreeAction, WriteOperation, type ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
+import { residentBaseClone, residentClonePaths } from "../registry/resident-repositories.ts";
 import {
   type CandidateSnapshot,
   candidateSnapshotDigest,
@@ -597,6 +598,7 @@ export class VerificationEngine {
       return {
         identity: repo.identity,
         checkoutPath: record?.checkoutPath ?? "",
+        residentClone: record ? residentBaseClone(this.db, record.repositoryId, record.checkoutPath) : null,
         activeManifestDigest: record?.activeManifestDigest ?? null,
       };
     });
@@ -1379,13 +1381,17 @@ export class VerificationEngine {
     );
   }
 
-  /** Absolute paths a candidate command must not read (§33.3). */
+  /**
+   * Absolute paths a candidate command must not read (§33.3). #1227 — a resident's clone too: once its
+   * repository is registered at the worker checkout no registry row names the clone, and it is still
+   * the resident's own tree.
+   */
   private denyReadPaths(ownCheckout: string): string[] {
     const others = this.repositories
       .list()
       .map((r) => r.checkoutPath)
       .filter(Boolean);
-    return [...new Set([ownCheckout, ...others, ...this.extraDenyReadPaths])];
+    return [...new Set([ownCheckout, ...others, ...residentClonePaths(this.db), ...this.extraDenyReadPaths])];
   }
 
   /** Wired by the composition root: the secret store and state directory. */
