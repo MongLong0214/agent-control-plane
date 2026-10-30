@@ -915,4 +915,26 @@ describe("a same-key CONFIRM replay of a resumable bootstrap refusal answers fro
     expect(produce).toHaveBeenCalledTimes(1);
     expect(wired.github.writes).toEqual([]);
   });
+
+  it("F3: a cancelled run's release in doubt is the answer, and the run is not resumable", async () => {
+    const wired = await wire("p2-replay-release-in-doubt");
+    const { produce, applications } = await confirmReservedResumable(wired, "p2-release-in-doubt");
+    // The run is cancelled the way the state machine allows at CEO review: handed to the owner, then cancelled.
+    await wired.harness.cp.continuity.evaluate("bootstrap cancellation");
+    expect(wired.harness.cp.ceo.submitCeoDecision({ ...confirmation(wired), decision: "OWNER_DECISION_REQUIRED" }).allowed).toBe(true);
+    expect(wired.harness.cp.runs.cancel(wired.runId, "the bootstrap is abandoned").allowed).toBe(true);
+    const inDoubt = { runId: wired.runId, inDoubt: true, cause: "UNRESOLVED_REQUEST", ledgerPath: "ledger.json", pending: ["genesis-bootstrap"], receipted: [] };
+    wired.harness.cp.bootstrapProducer.recordReleaseInDoubt(wired.runId, inDoubt);
+    expect(applications.get(wired.runId)).toMatchObject({ phase: "RESERVED", lastRefusal: { refusal: "RELEASE_IN_DOUBT" } });
+
+    const replay = await door(wired, "p2-release-in-doubt");
+    expect(replay.structuredContent).toMatchObject({
+      ok: false,
+      reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
+      evidence: { ...inDoubt, stage: "release", refusal: "RELEASE_IN_DOUBT", resumable: false, application: { phase: "RESERVED", attempts: 1 } },
+    });
+    expect(JSON.stringify(replay.structuredContent)).not.toContain("GENESIS_POST_MERGE_CI_PENDING");
+    expect(produce).toHaveBeenCalledTimes(1);
+    expect(wired.github.writes).toEqual([]);
+  });
 });

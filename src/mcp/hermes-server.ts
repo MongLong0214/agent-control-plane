@@ -30,6 +30,7 @@ import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
 import type { ExecutionMode, RunPriority } from "../domain/types.ts";
 import { Role, roleKeyFor, RunKind, RunState } from "../domain/types.ts";
+import { isTerminal } from "../domain/run-state.ts";
 import type { RepairService } from "../doctor/repair.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
@@ -299,16 +300,23 @@ export const createHermesMcpPort = (
           application: status,
         }));
       }
-      // Every attempt records the refusal it answers with, and only a later refusal replaces the record:
-      // it is the newest refusal, whichever attempt has started since.
+      // Every attempt records the refusal it answers with, and only a later record replaces it: it is the
+      // newest answer, whichever attempt has started since. A record that is no refusal (a release in
+      // doubt) is reported as recorded.
       const recorded = refusalOf(latest);
-      const current = recorded === null ? answered : {
-        ...recorded,
-        evidence: { ...(latest?.["stage"] === undefined ? {} : { stage: latest["stage"] }), ...recorded.evidence },
-      };
+      const current = recorded !== null
+        ? { ...recorded, evidence: { ...(latest?.["stage"] === undefined ? {} : { stage: latest["stage"] }), ...recorded.evidence } }
+        : latest !== null
+          ? {
+              reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
+              message: "this bootstrap run's application holds a later record than this CONFIRM's answer, reported as recorded",
+              evidence: latest,
+            }
+          : answered;
       return respond(deny(current.reasonCode, current.message, {
         ...current.evidence,
-        resumable: current.evidence["resumable"] !== false,
+        // A run that has ended is not re-driven, whatever its last refusal said.
+        resumable: !isTerminal(run.state) && current.evidence["resumable"] !== false,
         application: status,
       }));
     },
