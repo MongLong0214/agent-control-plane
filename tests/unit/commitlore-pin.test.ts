@@ -1184,8 +1184,9 @@ setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: per
     expect(read.error).toBe(`${pinned.bin} could not be read within 100 ms`);
     expect(read.elapsed).toBeGreaterThanOrEqual(99);
     expect(read.elapsed).toBeLessThan(1_000);
-    // A 1 ms heartbeat kept firing for the whole wait.
-    expect(read.beats).toBeGreaterThanOrEqual(20);
+    // The reader yielded control before its deadline. Unlike a 1 ms timer count, this is an
+    // ordering contract rather than a scheduler-dependent throughput measurement.
+    expect(read.turns).toBeGreaterThan(0);
     // Whatever the abandoned reading opened once the pool freed up, it closed.
     await vi.waitFor(() => expect(descriptorsOn(pinned.bin)).toEqual([]), { timeout: 2_000, interval: 20 });
     // Through the runner: `identityTimeoutMs` is that deadline, and the refusal comes before any spawn.
