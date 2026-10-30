@@ -120,18 +120,19 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
       "VERIFICATION",
       driven.candidateSnapshotDigest,
     )!.content;
-    const reviewPolicy = {
+    const shown = {
       repository: driven.identity,
       path: "REVIEW.md",
       revision: driven.candidateHead,
       digest: sha256(policy),
       content: policy,
     };
+    const reviewPolicy = { ...shown, contentBase64: Buffer.from(policy, "utf8").toString("base64") };
 
     expect(packet.inputManifest.reviewPolicies).toEqual([reviewPolicy]);
     expect(packet.inputManifest.reviewerPromptDigests).toEqual([transmittedDigest(harness, prompt)]);
     expect(prompt).toContain("## Repository-owned review requirements");
-    expect(prompt).toContain(JSON.stringify([reviewPolicy], null, 2));
+    expect(prompt).toContain(JSON.stringify([shown], null, 2));
     expect(prompt).toContain(`Packet digest: ${digestOf({
       candidateSnapshotDigest: driven.candidateSnapshotDigest,
       contractDigest: driven.contractDigest,
@@ -143,7 +144,7 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
     writeFiles(harness.repoPath, { "REVIEW.md": "working-tree-only replacement\n" });
     await reReview(harness, driven.runId, "CANDIDATE");
     const secondPrompt = promptsStartingWith(harness, "# Candidate review").at(-1)!;
-    expect(secondPrompt).toContain(JSON.stringify([reviewPolicy], null, 2));
+    expect(secondPrompt).toContain(JSON.stringify([shown], null, 2));
     expect(secondPrompt).not.toContain("working-tree-only replacement");
   });
 
@@ -157,17 +158,41 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
 
     const driven = await driveToReviewedCandidate(harness);
     const packet = harness.cp.review.latestPacket(driven.runId, driven.candidateSnapshotDigest)!;
-    const reviewPolicy = {
+    const shown = {
       repository: driven.identity,
       path: "REVIEW.md",
       revision: driven.candidateHead,
       digest: sha256(committed),
       content: policy,
     };
-    expect(packet.inputManifest.reviewPolicies).toEqual([reviewPolicy]);
+    expect(packet.inputManifest.reviewPolicies).toEqual([{ ...shown, contentBase64: committed.toString("base64") }]);
     const [bound] = packet.inputManifest.reviewPolicies;
     expect(sha256(Buffer.from(bound!.content, "utf8"))).toBe(bound!.digest);
-    expect(promptsStartingWith(harness, "# Candidate review")[0]).toContain(JSON.stringify([reviewPolicy], null, 2));
+    expect(promptsStartingWith(harness, "# Candidate review")[0]).toContain(JSON.stringify([shown], null, 2));
+  });
+
+  /**
+   * #1274 — every string the artifact store keeps goes through `canonicalJson`, which turns CRLF and a
+   * bare CR into LF. The policy's bytes are kept beside its text, so the stored record still holds the
+   * exact bytes its digest hashes after the row is read back.
+   */
+  it.each([
+    ["CRLF", "# Review\r\n\r\n- Line endings are part of the committed file.\r\n"],
+    ["mixed", "# Review\r\n\n- One CRLF, one LF,\r- one bare CR, all committed as written.\n"],
+  ])("#1274: a %s REVIEW.md read back from storage is the bytes its digest hashes", async (_endings, policy) => {
+    const harness = makeHarness();
+    writeFiles(harness.repoPath, { "REVIEW.md": policy });
+    commitAll(harness.repoPath, "add project review requirements with their own line endings");
+    const committed = readFileSync(join(harness.repoPath, "REVIEW.md"));
+    expect(committed.equals(Buffer.from(policy, "utf8"))).toBe(true);
+
+    const driven = await driveToReviewedCandidate(harness);
+    // `latestPacket` reads the stored row: `canonicalJson` on the way in, `JSON.parse` on the way out.
+    const [stored] = harness.cp.review.latestPacket(driven.runId, driven.candidateSnapshotDigest)!.inputManifest.reviewPolicies;
+    expect(stored).toMatchObject({ digest: sha256(committed), contentBase64: committed.toString("base64") });
+    expect(sha256(Buffer.from(stored!.contentBase64, "base64"))).toBe(stored!.digest);
+    // The reviewer is shown the policy text with its own line endings.
+    expect(promptsStartingWith(harness, "# Candidate review")[0]).toContain(JSON.stringify(policy));
   });
 
   it("#1274: refuses a REVIEW.md that is only a byte-order mark as empty, before any reviewer is asked", async () => {
@@ -191,7 +216,12 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
       ...packet,
       inputManifest: {
         ...packet.inputManifest,
-        reviewPolicies: packet.inputManifest.reviewPolicies.map((policy) => ({ ...policy, content, digest: sha256(content) })),
+        reviewPolicies: packet.inputManifest.reviewPolicies.map((policy) => ({
+          ...policy,
+          content,
+          digest: sha256(content),
+          contentBase64: Buffer.from(content, "utf8").toString("base64"),
+        })),
       },
     });
     const store = (content: string) => harness.cp.artifacts.putEvidence(
@@ -205,6 +235,33 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
     expect(() => store("\uFEFF")).toThrow("BLIND_REVIEW has an invalid evidence envelope");
     expect(() => store("")).toThrow("BLIND_REVIEW has an invalid evidence envelope");
     expect(store("\uFEFF# Review\n").content.inputManifest.reviewPolicies[0]!.content).toBe("\uFEFF# Review\n");
+  });
+
+  it("#1274: the BLIND_REVIEW schema refuses policy bytes that are not the checked text or not what the digest hashes", async () => {
+    const harness = makeHarness();
+    writeFiles(harness.repoPath, { "REVIEW.md": "# Review\r\n" });
+    commitAll(harness.repoPath, "add project review requirements");
+    const driven = await driveToReviewedCandidate(harness);
+    const packet = harness.cp.review.latestPacket(driven.runId, driven.candidateSnapshotDigest)!;
+    const store = (change: Partial<ReviewPacket["inputManifest"]["reviewPolicies"][number]>) => harness.cp.artifacts.putEvidence(
+      harness.cp.evidenceWritersForTests().BLIND_REVIEW,
+      driven.runId,
+      ArtifactKind.BLIND_REVIEW,
+      {
+        ...packet,
+        inputManifest: {
+          ...packet.inputManifest,
+          reviewPolicies: packet.inputManifest.reviewPolicies.map((policy) => ({ ...policy, content: "# Review\r\n", ...change })),
+        },
+      },
+      driven.candidateSnapshotDigest,
+    );
+    const other = Buffer.from("# Other\r\n", "utf8");
+
+    // The bytes are exempt from the long-base64 credential shape only because they must decode to `content`.
+    expect(() => store({ contentBase64: other.toString("base64") })).toThrow("BLIND_REVIEW has an invalid evidence envelope");
+    expect(() => store({ digest: sha256(other) })).toThrow("BLIND_REVIEW has an invalid evidence envelope");
+    expect(store({}).content.inputManifest.reviewPolicies[0]!.contentBase64).toBe(Buffer.from("# Review\r\n").toString("base64"));
   });
 
   it("candidate first review and re-review use only the original canonical method", async () => {

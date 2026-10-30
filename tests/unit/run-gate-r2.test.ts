@@ -147,6 +147,7 @@ const evidenceReadyRun = async (
       binaryArtifacts: [],
       reviewPolicies: [],
       reviewerPromptDigests: [digestOf("review prompt")],
+      reviewerInputRepresentations: ["stdin"],
       withheld: [],
     },
     coveredRepositories: [repository.identity],

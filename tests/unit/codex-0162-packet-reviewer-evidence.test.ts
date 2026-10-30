@@ -9,8 +9,8 @@ import { credentialBearingField, prohibitedDurableField } from "../../src/db/aud
 import { ArtifactKind, ExecutionMode, Role, RunState } from "../../src/domain/types.ts";
 import { __testing as reviewTesting, type ReviewPacket } from "../../src/review/blind-review.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
-import { CodexCliAdapter, __testing } from "../../src/runtime/cli-adapters.ts";
-import type { InvocationRequest, InvocationResult, SessionHandle, SessionSpec } from "../../src/runtime/provider.ts";
+import { ClaudeCliAdapter, CodexCliAdapter, __testing } from "../../src/runtime/cli-adapters.ts";
+import type { InvocationRequest, InvocationResult, SessionHandle, SessionSpec, TransmittedInput } from "../../src/runtime/provider.ts";
 import { BOOTSTRAP_REVIEW_RETRY_WAKE } from "../../src/runtime/provisioned-session-runtime.ts";
 import { provisionReviewerCodexHome } from "../../src/runtime/reviewer-codex-home.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
@@ -134,6 +134,9 @@ class CodexPacketReviewer extends TestProductionAdapter {
     const result = await this.real.invoke(request);
     this.results.push(result);
     return result;
+  }
+  override transmittedReviewerInput(request: Pick<InvocationRequest, "systemPrompt" | "prompt">): TransmittedInput {
+    return this.real.transmittedReviewerInput(request);
   }
 }
 
@@ -378,6 +381,114 @@ describe("the stored reviewer-input digests are the digests of the bytes the Cod
       }
       const packet = harness.cp.artifacts.latest<ReviewPacket>(runId, ArtifactKind.BLIND_REVIEW)!.content;
       expect(packet.inputManifest.reviewerPromptDigests).toEqual(prompts.map((sent) => sha256(Buffer.from(sent, "utf8"))));
+      expect(packet.inputManifest.reviewerInputRepresentations).toEqual(prompts.map(() => "stdin"));
+    } finally {
+      harness.cp.close();
+    }
+  });
+});
+
+/** A real ClaudeCliAdapter for the reviewer's invocation and its declared input; the scripted base keeps capacity. */
+class ClaudePacketReviewer extends TestProductionAdapter {
+  readonly supportsReviewerIsolation = true;
+  constructor(clock: Clock, private readonly real: ClaudeCliAdapter) { super(clock, "claude"); }
+  override async startSession(spec: SessionSpec): Promise<SessionHandle> {
+    return spec.isolation ? this.real.startSession(spec) : super.startSession(spec);
+  }
+  override async invoke(request: InvocationRequest): Promise<InvocationResult> {
+    return request.isolation ? this.real.invoke(request) : super.invoke(request);
+  }
+  override transmittedReviewerInput(request: Pick<InvocationRequest, "systemPrompt" | "prompt">): TransmittedInput {
+    return this.real.transmittedReviewerInput(request);
+  }
+}
+
+/**
+ * runCli at the Claude CLI's spawn boundary: records the `--append-system-prompt` argv value and the
+ * stdin of every call, and answers in the `--output-format json` envelope under the session it was given.
+ */
+const stubClaude = (answer: (prompt: string) => string) => {
+  const sent: Array<{ systemPrompt: string | undefined; stdin: string }> = [];
+  __testing.setRunCli(async (_file, args, options) => {
+    const stdin = String(options.stdin ?? "");
+    const system = args.indexOf("--append-system-prompt");
+    sent.push({ systemPrompt: system === -1 ? undefined : args[system + 1], stdin });
+    const session = args[Math.max(args.indexOf("--session-id"), args.indexOf("--resume")) + 1];
+    return {
+      stdout: JSON.stringify({ type: "result", subtype: "success", is_error: false, result: answer(stdin), session_id: session }),
+      stderr: "",
+      exitCode: 0,
+      timedOut: false,
+      isolationEnforced: true,
+      egressEvidence: testReviewerEgressEvidence("claude"),
+    };
+  });
+  return { sent };
+};
+
+/**
+ * #1274 — the Claude fallback sends the system instructions as the `--append-system-prompt` argv value
+ * and the prompt on stdin. Each stored digest covers those two values as passed, joined by NUL (which
+ * no argv value can contain), and the packet names that representation beside it.
+ */
+describe("the stored reviewer-input digests are the digests of what the Claude adapter passes", () => {
+  it.each([false, true])("argv system prompt and stdin prompt, for every reviewer invocation (chunked=%s)", async (large) => {
+    const harness = makeHarness({ reviewer: { preferred: { provider: "claude", model: "opus", effort: null }, fallbacks: [] } });
+    const real = new ClaudeCliAdapter({
+      clock: new ManualClock("2026-10-30T00:00:00.000Z"),
+      capacityFile: join(tempDir("acp-1274-claude-"), "claude.json"),
+      binary: join(tempDir("acp-1274-claude-bin-"), "claude-stub"),
+    });
+    harness.cp.providers.registerForRole(new ClaudePacketReviewer(harness.clock, real), Role.BLIND_REVIEWER);
+    try {
+      const { sent } = stubClaude((prompt) => JSON.stringify({
+        verdict: "PASS",
+        coveredFiles: /# Final review/.test(prompt) ? [] : ["github:acme/fixture:src/app.js"],
+        omittedItems: [],
+        findings: [],
+      }));
+      const { runId, outcome } = await submit(harness, { large });
+      expect(outcome).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+      if (large) {
+        expect(sent.filter(({ stdin }) => stdin.includes("# Review chunk ")).length).toBeGreaterThan(1);
+        expect(sent.at(-1)!.stdin).toContain("# Final review");
+      } else {
+        expect(sent).toHaveLength(1);
+      }
+      for (const call of sent) expect(call.systemPrompt).toBeTruthy();
+      const packet = harness.cp.artifacts.latest<ReviewPacket>(runId, ArtifactKind.BLIND_REVIEW)!.content;
+      expect(packet.inputManifest.reviewerPromptDigests).toEqual(
+        sent.map(({ systemPrompt, stdin }) => sha256(Buffer.from(`${systemPrompt}\u0000${stdin}`, "utf8"))),
+      );
+      expect(packet.inputManifest.reviewerInputRepresentations).toEqual(sent.map(() => "argv --append-system-prompt + stdin"));
+    } finally {
+      harness.cp.close();
+    }
+  });
+
+  it("refuses a reviewer whose adapter does not declare what it transmits, before it is asked", async () => {
+    const harness = makeHarness({ reviewer: { preferred: { provider: "claude", model: "opus", effort: null }, fallbacks: [] } });
+    const real = new ClaudeCliAdapter({
+      clock: new ManualClock("2026-10-30T00:00:00.000Z"),
+      capacityFile: join(tempDir("acp-1274-claude-"), "claude.json"),
+      binary: join(tempDir("acp-1274-claude-bin-"), "claude-stub"),
+    });
+    const reviewer = new ClaudePacketReviewer(harness.clock, real);
+    Object.defineProperty(reviewer, "transmittedReviewerInput", { value: undefined });
+    harness.cp.providers.registerForRole(reviewer, Role.BLIND_REVIEWER);
+    try {
+      const { sent } = stubClaude(() => JSON.stringify({ verdict: "PASS", coveredFiles: [], omittedItems: [], findings: [] }));
+      const { runId, outcome } = await submit(harness);
+      expect(outcome).toMatchObject({
+        allowed: true,
+        value: {
+          stage: "REVIEW_UNAVAILABLE",
+          reasonCode: ReasonCode.EVIDENCE_MISSING,
+          detail: { message: "reviewer adapter does not declare the input it transmits" },
+        },
+      });
+      expect(sent).toHaveLength(0);
+      expect(harness.cp.artifacts.latest(runId, ArtifactKind.BLIND_REVIEW)).toBeNull();
     } finally {
       harness.cp.close();
     }

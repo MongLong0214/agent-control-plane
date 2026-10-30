@@ -483,6 +483,7 @@ describe("one safe project run, end to end", () => {
           binaryArtifacts: [],
           reviewPolicies: [],
           reviewerPromptDigests: [digestOf("review prompt")],
+          reviewerInputRepresentations: ["stdin"],
         },
         coveredRepositories: [identity],
         coveredFiles: [`${identity}:src/app.js`],
