@@ -244,6 +244,11 @@ describe("RF-REVIEW-02: a PLAN replaced while it is judged gets no ready packet"
         reasonCode: ReasonCode.EVIDENCE_STALE,
         evidence: { candidate: p1.value.binding, current: p2.value.binding },
       });
+      // Both refusals are on record: the gate's of P1's answer, naming its reviewer, and the pipeline's of the candidate.
+      expect(f.harness.cp.audit.forRun(run.runId).filter((row) => row.kind === "BLIND_REVIEW_REJECTED")).toMatchObject([
+        { reasonCode: ReasonCode.EVIDENCE_STALE, evidence: { candidateSnapshotDigest: s1, stale: "REVIEW_INPUTS", reviewerRoleBindingGeneration: expect.any(Number) } },
+        { reasonCode: ReasonCode.EVIDENCE_STALE, evidence: { candidateSnapshotDigest: s1, stale: "AFTER_REVIEW", reviewReasonCode: ReasonCode.EVIDENCE_STALE } },
+      ]);
 
       // A fresh review of P2 is what makes the run ready: a new candidate, a new reviewer prompt
       // naming P2's planned outputs, and a packet for that candidate alone.
@@ -294,6 +299,11 @@ describe("RF-REVIEW-02: a PLAN replaced while it is judged gets no ready packet"
       expect(packets(f, run)).toEqual([]);
       // P1's PASS was stored while P1 was still the PLAN; it is P1's, and it is on record.
       expect(f.harness.cp.artifacts.latestForSnapshot<{ verdict: string }>(run.runId, "BLIND_REVIEW", s1)?.content.verdict).toBe("PASS");
+      // The refusal of that PASS at publication is on record.
+      expect(f.harness.cp.audit.forRun(run.runId).filter((row) => row.kind === "BLIND_REVIEW_REJECTED")).toMatchObject([{
+        reasonCode: ReasonCode.EVIDENCE_STALE,
+        evidence: { candidateSnapshotDigest: s1, stale: "PLAN_AT_PUBLICATION", reviewReasonCode: ReasonCode.REVIEW_PASS, reviewerRoleBindingGeneration: expect.any(Number) },
+      }]);
 
       // The production gate's own door, for that candidate: refused, with nothing written.
       vi.restoreAllMocks();
@@ -345,6 +355,11 @@ describe("RF-REVIEW-02: a PLAN replaced while it is judged gets no ready packet"
         value: { stage: "CANDIDATE_STALE", reasonCode: ReasonCode.EVIDENCE_STALE },
       });
       expect(f.harness.cp.audit.forRun(run.runId).filter((row) => row.kind === "BLIND_REVIEW_UNAVAILABLE")).toEqual([]);
+      // The stale refusal itself is on record; no reviewer answered, so it names none.
+      expect(f.harness.cp.audit.forRun(run.runId).filter((row) => row.kind === "BLIND_REVIEW_REJECTED")).toMatchObject([{
+        reasonCode: ReasonCode.EVIDENCE_STALE,
+        evidence: { stale: "AFTER_REVIEW", attemptId: expect.stringMatching(/^attempt_/), reviewerRoleBindingGeneration: null },
+      }]);
       expect(f.harness.cp.outbox.listByRun(run.runId).filter((message) => message.kind === "REVISION_REQUEST")).toEqual([]);
       expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.ACTIVE);
       expect(packets(f, run)).toEqual([]);

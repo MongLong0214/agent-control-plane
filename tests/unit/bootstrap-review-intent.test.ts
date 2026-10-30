@@ -232,6 +232,11 @@ describe("a stale PLAN intent or review packet is refused", () => {
     expect(replanned).toBe(true);
     expect(result.body, result.text).toMatchObject({ ok: true, value: { stage: "REVIEW_UNAVAILABLE", reasonCode: ReasonCode.EVIDENCE_STALE } });
     expect(h.cp.artifacts.list(runId, "BLIND_REVIEW")).toEqual([]);
+    // The answer the gate did not keep is on record, with the reviewer who gave it.
+    expect(h.cp.audit.forRun(runId).filter((row) => row.kind === "BLIND_REVIEW_REJECTED")).toMatchObject([{
+      reasonCode: ReasonCode.EVIDENCE_STALE,
+      evidence: { stale: "REVIEW_INTENT", attemptId: expect.stringMatching(/^attempt_/), reviewerRoleBindingGeneration: expect.any(Number) },
+    }]);
     expect(h.cp.artifacts.list(runId, "PRODUCTION_READY_PACKET")).toEqual([]);
     expect(h.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
   });

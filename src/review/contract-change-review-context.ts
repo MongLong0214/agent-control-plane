@@ -6,10 +6,12 @@ import { ArtifactKind } from "../domain/types.ts";
 import { workflowDigestAtCommitLocal, type LocalWorkflowRead } from "../github/workflow-digest-at-commit.ts";
 import type { WorkflowRevision } from "../registry/contract-change-plan.ts";
 import type { RepositoryDriftCause, RepositoryInspection, RepositoryRegistry } from "../registry/repository-registry.ts";
+import type { SnapshotCanonicalCtoIdentity } from "../snapshot/candidate-snapshot.ts";
 
 /**
  * #1255 — what ACP itself reads, when a CONTRACT_CHANGE candidate is frozen, for that candidate's blind
- * review: the project's registration and active manifest, each of its repositories' registration, stored
+ * review: the project's registration and active manifest, its canonical session entitlements and ACTIVE
+ * PRIMARY_CTO binding, each of its repositories' registration, stored
  * observation and checkout as read then, and, for a first activation, each bound workflow revision read
  * at its exact commit the way the finalizer reads it locally. Stored as a HANDOFF artifact bound to the
  * candidate and to the freeze that read it (`freezeId`), so the review shows what held at that freeze
@@ -43,7 +45,7 @@ export interface ContractChangeReviewContext extends FreezeIdentity {
     /** Every PROJECT_REGISTERED record of the project, as stored. */
     registrations: Array<{ eventId: number; at: string; name: string | null; activeManifestDigest: string | null }>;
     bootstrapApplications: number;
-  };
+  } & SnapshotCanonicalCtoIdentity;
   repositories: Array<{
     identity: string;
     role: string | null;
@@ -70,6 +72,52 @@ export interface ContractChangeReviewContext extends FreezeIdentity {
   workflowRevisions: Array<WorkflowRevision & { read: LocalWorkflowRead | { status: "UNREADABLE" } }>;
 }
 
+/**
+ * The project's canonical CTO identity as ACP's own tables hold it now: its canonical session entitlement
+ * rows, and its ACTIVE PRIMARY_CTO binding with the session the bound actor runs on (null when there is
+ * none). Read once at a CONTRACT_CHANGE freeze into the candidate snapshot, so the review and every later
+ * readback compare against the baseline the candidate's digest covers.
+ */
+export const readCanonicalCtoIdentity = (db: Pick<Db, "get" | "all">, projectId: string): SnapshotCanonicalCtoIdentity => {
+  const entitlements = db.all<{
+    session_uuid: string; buzz_actor_id: string; buzz_address: string; revision: number; revoked_at: string | null;
+  }>(
+    `SELECT session_uuid, buzz_actor_id, buzz_address, revision, revoked_at
+       FROM canonical_session_entitlements WHERE project_id = ? ORDER BY session_uuid`,
+    [projectId],
+  );
+  const binding = db.get<{
+    assignment_id: string; role_key: string; actor_id: string; session_id: string; session_incarnation: string;
+    binding_generation: number; created_at: string; current_session_id: string | null; current_incarnation: string | null;
+    current_lifecycle: string | null; current_buzz_actor_id: string | null; current_buzz_address: string | null;
+  }>(
+    `SELECT a.assignment_id, a.role_key, a.actor_id, a.session_id, a.session_incarnation, a.binding_generation, a.created_at,
+            s.session_id AS current_session_id, s.incarnation AS current_incarnation, s.lifecycle AS current_lifecycle,
+            s.buzz_actor_id AS current_buzz_actor_id, s.buzz_address AS current_buzz_address
+       FROM assignments a
+       LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+       LEFT JOIN sessions s ON s.session_id = c.current_session_id
+      WHERE a.project_id = ? AND a.role = 'PRIMARY_CTO' AND a.status = 'ACTIVE'`,
+    [projectId],
+  );
+  return {
+    canonicalSessionEntitlements: entitlements.map((row) => ({
+      sessionUuid: row.session_uuid, buzzActorId: row.buzz_actor_id, buzzAddress: row.buzz_address,
+      revision: row.revision, revokedAt: row.revoked_at,
+    })),
+    primaryCtoBinding: binding === undefined ? null : {
+      assignmentId: binding.assignment_id, roleKey: binding.role_key, actorId: binding.actor_id,
+      sessionId: binding.session_id, sessionIncarnation: binding.session_incarnation,
+      bindingGeneration: binding.binding_generation, createdAt: binding.created_at,
+      currentSession: binding.current_session_id === null ? null : {
+        sessionId: binding.current_session_id, incarnation: binding.current_incarnation!,
+        lifecycle: binding.current_lifecycle!, buzzActorId: binding.current_buzz_actor_id,
+        buzzAddress: binding.current_buzz_address,
+      },
+    },
+  };
+};
+
 export const captureContractChangeReviewContext = async (
   ports: {
     db: Pick<Db, "get" | "all">;
@@ -82,6 +130,8 @@ export const captureContractChangeReviewContext = async (
     candidateSnapshotDigest: string;
     planDigest: string;
     workflowRevisions: readonly WorkflowRevision[];
+    /** The candidate's own baseline (`readCanonicalCtoIdentity`), shown as the candidate holds it. */
+    canonicalCtoIdentity: SnapshotCanonicalCtoIdentity;
   },
 ): Promise<ContractChangeReviewContext> => {
   const { db, repositories } = ports;
@@ -178,6 +228,7 @@ export const captureContractChangeReviewContext = async (
       bootstrapApplications: db.get<{ n: number }>(
         `SELECT COUNT(*) AS n FROM bootstrap_applications WHERE project_id = ?`, [input.projectId],
       )?.n ?? 0,
+      ...input.canonicalCtoIdentity,
     },
     repositories: repositoryFacts,
     workflowRevisions,

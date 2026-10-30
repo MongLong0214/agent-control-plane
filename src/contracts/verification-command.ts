@@ -8,7 +8,7 @@ import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "no
  * Both systems share this shape and there is exactly one implementation of it — a
  * second, subtly different copy is forbidden by Integration §2.2.
  */
-export const verificationCommandSchema = z
+const verificationCommandShape = z
   .object({
     id: z.string().min(1).regex(/^[a-z0-9][a-z0-9-]*$/, "command id must be kebab-case"),
     argv: z.array(z.string().min(1)).min(1),
@@ -31,49 +31,68 @@ export const verificationCommandSchema = z
     /** Absent means the command timeout is also its hard CPU budget. */
     maxCpuSeconds: z.number().int().positive().max(24 * 3600).optional(),
   })
-  .strict()
-  .superRefine((cmd, ctx) => {
-    // Integration §12 — refuse a contract that directly names a shell, launcher, pipe,
-    // redirection or substitution. This is defence in depth against a contract that
-    // declares a shell, not a claim that an allowlisted interpreter cannot execute one.
-    if (isVerificationCommandRefused(cmd.argv)) {
+  .strict();
+
+/**
+ * The contract checks. `executables` is what argv[0] is checked against beyond the allowlist below;
+ * `null` leaves that check to a caller that knows the command's project (#1253).
+ */
+const checkVerificationCommand = (
+  cmd: z.infer<typeof verificationCommandShape>,
+  ctx: z.RefinementCtx,
+  executables: readonly string[] | null,
+): void => {
+  // Integration §12 — refuse a contract that directly names a shell, launcher, pipe,
+  // redirection or substitution. This is defence in depth against a contract that
+  // declares a shell, not a claim that an allowlisted interpreter cannot execute one.
+  if (executables !== null && isVerificationCommandRefused(cmd.argv, { executables })) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: verificationExecutableRefusalMessage(cmd.argv, { executables }),
+      path: ["argv", 0],
+    });
+  }
+  for (const [i, arg] of cmd.argv.entries()) {
+    if (/[|;&><`$\n]/.test(arg) && !isSafeLiteral(arg)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: verificationExecutableRefusalMessage(cmd.argv),
-        path: ["argv", 0],
+        message: `argv[${i}] contains shell metacharacters; argv is executed without a shell`,
+        path: ["argv", i],
       });
     }
-    for (const [i, arg] of cmd.argv.entries()) {
-      if (/[|;&><`$\n]/.test(arg) && !isSafeLiteral(arg)) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `argv[${i}] contains shell metacharacters; argv is executed without a shell`,
-          path: ["argv", i],
-        });
-      }
-    }
-    if (!isPortableRelativePath(cmd.cwd)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "cwd must be repository-relative and must not escape the repository",
-        path: ["cwd"],
-      });
-    }
-    if (cmd.network === "allowlist") {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "network=allowlist is not production-supported: no runtime backend can enforce it",
-        path: ["network"],
-      });
-    }
-    if (cmd.network !== "allowlist" && cmd.networkAllowlist.length > 0) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "networkAllowlist is unsupported unless a future enforceable network backend is installed",
-        path: ["networkAllowlist"],
-      });
-    }
-  });
+  }
+  if (!isPortableRelativePath(cmd.cwd)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "cwd must be repository-relative and must not escape the repository",
+      path: ["cwd"],
+    });
+  }
+  if (cmd.network === "allowlist") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "network=allowlist is not production-supported: no runtime backend can enforce it",
+      path: ["network"],
+    });
+  }
+  if (cmd.network !== "allowlist" && cmd.networkAllowlist.length > 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "networkAllowlist is unsupported unless a future enforceable network backend is installed",
+      path: ["networkAllowlist"],
+    });
+  }
+};
+
+export const verificationCommandSchema = verificationCommandShape.superRefine((cmd, ctx) =>
+  checkVerificationCommand(cmd, ctx, []));
+
+/**
+ * A command inside a project manifest (#1253): every check above except argv[0]'s, which the
+ * manifest makes itself against the executables it declares in `verificationExecutables`.
+ */
+export const manifestVerificationCommandSchema = verificationCommandShape.superRefine((cmd, ctx) =>
+  checkVerificationCommand(cmd, ctx, null));
 
 export type VerificationCommand = z.infer<typeof verificationCommandSchema>;
 
@@ -105,6 +124,17 @@ export const ALLOWED_VERIFICATION_EXECUTABLES: ReadonlySet<string> = new Set([
   "git",
 ]);
 
+/**
+ * The executables a project may add to the allowlist above for its own commands only, by naming them
+ * in its manifest's `verificationExecutables` (#1253). A name here admits nothing by itself: a
+ * command is checked against it only when the manifest pinned for its run declares it, so no other
+ * project's commands gain it. Like the allowlist above, this is defence in depth, not the boundary.
+ *
+ * Empty: no executable is addable yet, so a manifest that declares one is refused. Adding a name
+ * here is a policy change in its own right, not part of the mechanism.
+ */
+export const PROJECT_VERIFICATION_EXECUTABLES: ReadonlySet<string> = new Set<string>();
+
 const SYSTEM_EXECUTABLE_ROOTS = [
   "/usr/local/bin",
   "/usr/local/sbin",
@@ -121,6 +151,11 @@ export interface VerificationExecutableResolutionOptions {
   path?: string;
   /** Repository/toolchain roots available to the sandbox. */
   additionalRoots?: readonly string[];
+  /**
+   * The executables the command's project declares (`verificationExecutables`, #1253). Only names in
+   * PROJECT_VERIFICATION_EXECUTABLES count; absent means the allowlist alone.
+   */
+  executables?: readonly string[];
 }
 
 export interface VerificationExecutableResolution {
@@ -229,11 +264,16 @@ const candidateFor = (
   return null;
 };
 
+const allowedNames = (options: VerificationExecutableResolutionOptions): ReadonlySet<string> => {
+  const declared = (options.executables ?? []).filter((name) => PROJECT_VERIFICATION_EXECUTABLES.has(name));
+  return declared.length === 0 ? ALLOWED_VERIFICATION_EXECUTABLES : new Set([...ALLOWED_VERIFICATION_EXECUTABLES, ...declared]);
+};
+
 const allowedTargetPaths = (
   options: VerificationExecutableResolutionOptions,
 ): ReadonlySet<string> => {
   const targets = new Set<string>();
-  for (const name of ALLOWED_VERIFICATION_EXECUTABLES) {
+  for (const name of allowedNames(options)) {
     for (const root of verificationExecutableSearchPath(options.additionalRoots, options.path)) {
       const candidate = join(root, name);
       if (!isExecutableFile(candidate)) continue;
@@ -259,7 +299,7 @@ export const resolveVerificationExecutable = (
   // permitted-root half — so a symlink restored exactly the launcher form P1-15 was filed
   // for. Both halves now describe the resolved binary.
   const resolvedName = resolvedPath !== null ? executableName(resolvedPath) : null;
-  const namedAllowed = resolvedName !== null && ALLOWED_VERIFICATION_EXECUTABLES.has(resolvedName);
+  const namedAllowed = resolvedName !== null && allowedNames(options).has(resolvedName);
   const targetAllowed = resolvedPath !== null && allowedTargetPaths(options).has(resolvedPath);
   return {
     name: executableName(argv0),

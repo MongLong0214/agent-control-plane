@@ -40,8 +40,7 @@ export const genesisBundle = (): GenesisBundle => ({
   productIntent: { summary: "An immediately developable product", references: ["https://example.test/design"], ownerInstructions: ["Preserve this intent"] },
 });
 
-export function genesisPlanFixture() {
-  const genesis = genesisBundle();
+export function genesisPlanFixture(genesis: GenesisBundle = genesisBundle()) {
   const manifest = projectManifestSchema.parse(fixtureManifest("resident-test", {
     verificationCommands: [{ id: "test", argv: ["node", "test.js"], repositoryRole: "primary", cwd: ".", timeoutSeconds: 30, envAllowlist: [], network: "deny", networkAllowlist: [], required: true, evidenceMode: "LOCAL_COMMAND", maxOutputBytes: 1048576, maxMemoryMb: 1024, maxCpuSeconds: 30 }],
     verificationProfiles: { simple: ["test"], standard: ["test"], guarded: ["test"] },

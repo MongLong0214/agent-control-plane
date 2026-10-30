@@ -703,7 +703,9 @@ export class BlindReviewGate {
       // a verdict on a PLAN the run no longer has is stale and is not stored. `settle` does not await.
       if (change !== null) {
         const stillCurrent = this.contractChangeForCandidate(request.runId, request.snapshot);
-        if (!stillCurrent.allowed) return stillCurrent as Decision<ReviewPacket>;
+        if (!stillCurrent.allowed) {
+          return this.verdictNotKept("REVIEW_INPUTS", outcome.value.reviewer, request.runId, snapshotDigest, request.attemptId, stillCurrent);
+        }
       }
       return this.settle({
         runId: request.runId,
@@ -768,7 +770,9 @@ export class BlindReviewGate {
       // only a review of the current PLAN can make its candidate ready. `settle` does not await, so
       // nothing can replace the PLAN between this reload and the packet it stores.
       const stillCurrent = this.trustedBootstrapPlanInputs(request, snapshotDigest);
-      if (!stillCurrent.allowed) return stillCurrent as Decision<ReviewPacket>;
+      if (!stillCurrent.allowed) {
+        return this.verdictNotKept("REVIEW_INPUTS", outcome.value.reviewer, inputs.runId, snapshotDigest, request.attemptId, stillCurrent);
+      }
       // The same PLAN can be submitted again with another task, which no binding digest covers: a
       // verdict on an intent the run no longer has is stale too.
       const intentCurrent = bootstrapReviewIntentCurrent({
@@ -777,7 +781,9 @@ export class BlindReviewGate {
         planArtifact: this.artifacts.latest<unknown>(inputs.runId, ArtifactKind.PLAN),
         tasks: bootstrapPlanIntentTasks(this.db, inputs.runId),
       });
-      if (!intentCurrent.allowed) return intentCurrent as Decision<ReviewPacket>;
+      if (!intentCurrent.allowed) {
+        return this.verdictNotKept("REVIEW_INTENT", outcome.value.reviewer, inputs.runId, snapshotDigest, request.attemptId, intentCurrent);
+      }
       return this.settle({
         runId: inputs.runId,
         contractDigest: inputs.contractDigest,
@@ -825,7 +831,9 @@ export class BlindReviewGate {
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
       // As for a bootstrap PLAN: reloaded after the reviewer answered, before the verdict is kept.
       const stillCurrent = this.trustedContractChangeInputs(request, snapshotDigest);
-      if (!stillCurrent.allowed) return stillCurrent as Decision<ReviewPacket>;
+      if (!stillCurrent.allowed) {
+        return this.verdictNotKept("REVIEW_INPUTS", outcome.value.reviewer, inputs.runId, snapshotDigest, request.attemptId, stillCurrent);
+      }
       return this.settle({
         runId: inputs.runId,
         contractDigest: inputs.contractDigest,
@@ -874,11 +882,12 @@ export class BlindReviewGate {
     // A reviewer binding is a fencing token. If something replaced it while the
     // provider was working, its verdict is no longer attributable to the active role.
     if (!this.bindings.isCurrent(authoritativeReviewer.roleKey, authoritativeReviewer.generation)) {
-      return deny(ReasonCode.BINDING_GENERATION_STALE, "reviewer binding changed during review", {
-        runId,
-        roleKey: authoritativeReviewer.roleKey,
-        generation: authoritativeReviewer.generation,
-      });
+      return this.verdictNotKept("REVIEWER_BINDING", authoritativeReviewer, runId, snapshotDigest, input.attemptId,
+        deny(ReasonCode.BINDING_GENERATION_STALE, "reviewer binding changed during review", {
+          runId,
+          roleKey: authoritativeReviewer.roleKey,
+          generation: authoritativeReviewer.generation,
+        }));
     }
 
     const packet = this.assemble({
@@ -985,6 +994,36 @@ export class BlindReviewGate {
       });
     }
     return allow(ReasonCode.REVIEW_PASS, validated);
+  }
+
+  /**
+   * A reviewer answered and its verdict is not kept, because its binding was replaced while it worked
+   * or what it judged is no longer the run's. The refusal returned is unchanged; this row is why no
+   * BLIND_REVIEW exists for that answer: which check refused it (`stale`), the candidate, the submission
+   * attempt and the reviewer's binding generation, never the answer itself.
+   */
+  private verdictNotKept(
+    stale: "REVIEWER_BINDING" | "REVIEW_INPUTS" | "REVIEW_INTENT",
+    reviewer: ReviewerBinding,
+    runId: string,
+    snapshotDigest: string,
+    attemptId: string | undefined,
+    refusal: Decision<unknown>,
+  ): Decision<ReviewPacket> {
+    this.audit.record({
+      kind: "BLIND_REVIEW_REJECTED",
+      runId,
+      sessionId: reviewer.sessionId,
+      roleKey: reviewer.roleKey,
+      reasonCode: refusal.reasonCode,
+      evidence: {
+        candidateSnapshotDigest: snapshotDigest,
+        attemptId: attemptId ?? null,
+        stale,
+        reviewerRoleBindingGeneration: reviewer.generation,
+      },
+    });
+    return refusal as Decision<ReviewPacket>;
   }
 
   /**
@@ -2836,7 +2875,10 @@ const contractChangeReadbackSection = (change: TrustedContractChange): string[] 
         `${change.readback.context.candidateSnapshotDigest}; not written by the CTO. For each repository, driftState, lastObservedHead and`,
         "lastObservedAt are the registry's stored values; checkout is the registered checkout as ACP read it then, and its",
         "observedDriftState and observedDriftCauses are the drift ACP recomputed from that read against its acceptedHead, the",
-        "registry head the inspection read, and what it rested on. For",
+        "registry head the inspection read, and what it rested on. The project's canonicalSessionEntitlements and",
+        "primaryCtoBinding are its canonical CTO conversation entitlements and ACTIVE PRIMARY_CTO binding, with the",
+        "session the bound actor ran on, as ACP's own tables held them at the freeze (null: no ACTIVE binding); the",
+        "candidate snapshot holds the same baseline and its digest covers it, so a changed identity is another candidate. For",
         "each bound workflow revision, read is the exact local read of that commit's file with replacement objects off;",
         "ABSENT means the object was not in the checkout and was not read another way.",
         "```json",

@@ -344,7 +344,11 @@ const constituteHermesAuthority = async (
   // wherever the job happened to start, which is not a routing fact anyone chose — and the
   // workdir immutability trigger makes whatever lands here permanent, so a cwd recorded once
   // could never be corrected. P1-06 moved the CTO and continuity sites; this is the last one.
-  const created = cp.sessions.create({
+  // The runtime's native start is pinned beside the lstart, as CTO launch and continuity
+  // provisioning do: a runtime that proves inside its own start second gets a row the lstart
+  // alone cannot tell from a successor on the pid, and the keep for an unread provider would
+  // otherwise revoke the CEO when its coverage hold ends.
+  const created = cp.sessions.createWithPinnedStart({
     provider: "hermes",
     model: request.model,
     osPid: child.pid ?? null,

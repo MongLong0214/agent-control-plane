@@ -28,6 +28,7 @@ import {
 } from "../run/worker-orphan-release.ts";
 import { WorkerTurnEvent } from "../run/worker-turn.ts";
 import { CONTINUITY_HOLD_NON_MOVEMENT_KINDS, isRecordedMovement } from "../run/run-engine.ts";
+import { receiptProcessIsRunning } from "../run/task-graph.ts";
 import {
   type RepairWorktreeAuthority,
   type ManagedWriteGuard,
@@ -517,15 +518,18 @@ export class RepairService {
         };
       }
       case "abandon_dead_executions": {
-        const running = this.db.all<{ execution_id: string; worker_process_id: number | null }>(
-          `SELECT execution_id, worker_process_id FROM task_executions WHERE status = 'RUNNING'`,
+        const running = this.db.all<{ execution_id: string; run_id: string; worker_process_id: number | null; runtime_managed: number }>(
+          `SELECT execution_id, run_id, worker_process_id, runtime_managed FROM task_executions WHERE status = 'RUNNING'`,
         );
         const dead = running.filter(
           (execution) =>
             execution.worker_process_id !== null &&
             Number.isInteger(execution.worker_process_id) &&
             execution.worker_process_id > 0 &&
-            !alive(execution.worker_process_id),
+            // A CTO receipt's process is the one it named at open, pid and OS start; a reused pid is not it.
+            !(execution.runtime_managed === 0
+              ? receiptProcessIsRunning(this.db, { runId: execution.run_id, executionId: execution.execution_id, pid: execution.worker_process_id })
+              : alive(execution.worker_process_id)),
         );
         const evidence = {
           running: running.map((execution) => ({

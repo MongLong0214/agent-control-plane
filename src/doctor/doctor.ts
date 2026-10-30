@@ -36,7 +36,7 @@ import {
   ORPHAN_RELEASE_REPAIR_ID,
   unreleasedWorkerOrphans,
 } from "../run/worker-orphan-release.ts";
-import type { TaskGraph } from "../run/task-graph.ts";
+import { receiptProcessIsRunning, type TaskGraph } from "../run/task-graph.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
 import { defaultCodexHome, inspectReviewerCodexHome, packetReviewerScope } from "../runtime/reviewer-codex-home.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -909,7 +909,8 @@ export class Doctor {
       worker_process_id: number | null;
       worker_session_id: string | null;
       started_at: string;
-    }>(`SELECT execution_id, run_id, worker_process_id, worker_session_id, started_at
+      runtime_managed: number;
+    }>(`SELECT execution_id, run_id, worker_process_id, worker_session_id, started_at, runtime_managed
           FROM task_executions WHERE status = 'RUNNING'`);
 
     for (const execution of running) {
@@ -923,8 +924,11 @@ export class Doctor {
         hasProcessIdentity &&
         Number.isInteger(pid) &&
         pid > 0;
+      // A CTO receipt's process is the one it named at open, pid and OS start; a reused pid is not it.
       const processAlive = hasValidProcessIdentity
-        ? isProcessAlive(pid!)
+        ? execution.runtime_managed === 0
+          ? receiptProcessIsRunning(this.db, { runId: execution.run_id, executionId: execution.execution_id, pid: pid! })
+          : isProcessAlive(pid!)
         : null;
 
       if (!hasSessionIdentity && !hasProcessIdentity) {
