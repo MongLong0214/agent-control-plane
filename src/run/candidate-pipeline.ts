@@ -10,10 +10,10 @@ import {
 } from "../bootstrap/bootstrap-plan.ts";
 import { collectBootstrapCeoDecisions, frozenBootstrapCeoDecisions } from "../bootstrap/bootstrap-ceo-decisions.ts";
 import { collectBootstrapReviewEvidence } from "../bootstrap/bootstrap-review-evidence.ts";
-import { collectStandardReviewEvidence, runHadStandardReviewEvidence, withoutReviewerText } from "../review/standard-review-evidence.ts";
+import { collectStandardReviewEvidence, privateEvidenceAnswer, runHadStandardReviewEvidence } from "../review/standard-review-evidence.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
+import { type Decision, type Evidence, acpError, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { commandsForMode, type BranchProfile } from "../contracts/manifest.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
@@ -166,7 +166,9 @@ const revisionAuditEvidence = (
     findingsBySeverity: Object.fromEntries(
       FINDING_SEVERITIES.map((severity) => [severity, findings.filter((finding) => finding.severity === severity).length]),
     ),
-    findingDigests: findings.slice(0, MAX_AUDITED_FINDING_DIGESTS).map((finding) => digestOf(finding)),
+    // A review that read private evidence keeps no digest of its reviewer's text here: a short text is guessable from one.
+    ...(packet.inputManifest?.reviewEvidence === undefined
+      ? { findingDigests: findings.slice(0, MAX_AUDITED_FINDING_DIGESTS).map((finding) => digestOf(finding)) } : {}),
     coveredFiles: packet.coveredFiles.length,
     omittedItems: packet.omittedItems.length,
     ...(planDigest === undefined ? {} : { planDigest: boundedScalar(planDigest) ?? null }),
@@ -540,13 +542,18 @@ export class CandidatePipeline {
     const controller = new AbortController();
     this.#attempts.set(attemptId, controller);
     try {
-      const outcome = await this.submitResultOnce(input, attemptId, controller.signal);
-      // The answer is stored as the mutation's result and returned to the caller: for a run that had private
-      // review evidence it carries counts and digests of what the reviewer wrote, never its words.
+      // The answer is stored as the mutation's result and returned to the caller. For a run that had private review
+      // evidence it is rebuilt from values of known provenance, before it is serialized or stored, and so is a thrown
+      // refusal (`privateEvidenceAnswer`); any other run's answer is exactly as before.
+      let outcome: Decision<PipelineOutcome>;
+      try { outcome = await this.submitResultOnce(input, attemptId, controller.signal); }
+      catch (error) {
+        if (!isAcpError(error) || !runHadStandardReviewEvidence({ audit: this.audit }, input.runId)) throw error;
+        const refused = privateEvidenceAnswer({ artifacts: this.artifacts, audit: this.audit }, input.runId, deny(error.reasonCode, error.message, error.evidence));
+        throw acpError(refused.reasonCode, refused.allowed ? "" : refused.message, refused.evidence);
+      }
       if (!runHadStandardReviewEvidence({ audit: this.audit }, input.runId)) return outcome;
-      return (outcome.allowed
-        ? { ...outcome, value: withoutReviewerText(outcome.value), evidence: withoutReviewerText(outcome.evidence) }
-        : { ...outcome, evidence: withoutReviewerText(outcome.evidence) }) as Decision<PipelineOutcome>;
+      return privateEvidenceAnswer({ artifacts: this.artifacts, audit: this.audit }, input.runId, outcome);
     } finally {
       this.#attempts.delete(attemptId);
       this.releaseAttempt(input.runId, attemptId);

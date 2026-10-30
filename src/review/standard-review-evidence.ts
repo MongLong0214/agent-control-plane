@@ -3,6 +3,7 @@ import { reviewEvidenceAttachAuthority } from "../bootstrap/bootstrap-review-evi
 import { screenPublicText } from "../bootstrap/genesis-bundle.ts";
 import type { Clock } from "../core/clock.ts";
 import { credentialShapeMatch } from "../core/credential-shapes.ts";
+import { MAX_CREDENTIAL_SCAN_DEPTH } from "../db/audit.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { allow, deny, type Decision } from "../core/errors.ts";
 import { BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES } from "../core/mcp-limits.ts";
@@ -57,6 +58,52 @@ const standardBundleSchema = z.object({
 }).strict();
 export type StandardReviewEvidenceBundle = z.infer<typeof standardBundleSchema>;
 
+/** The scan's bounds: content past either is refused as unexaminable, never passed unread. */
+export const STANDARD_REVIEW_SCAN_MAX_DEPTH = MAX_CREDENTIAL_SCAN_DEPTH;
+export const STANDARD_REVIEW_SCAN_MAX_VALUES = 20_000;
+const WHOLE_DIGEST = /^sha256:[0-9a-f]{64}$/;
+const CANONICAL_BASE64 = /^[A-Za-z0-9+/]{60,}={0,2}$/;
+type ScanRefusal = { rule: string; form: string };
+
+/**
+ * One string or object key through the shared credential rules (core/credential-shapes.ts) and the public-text
+ * screen, by its form and never its name: a canonical base64 value that decodes to UTF-8 (a staged body) is
+ * checked as the text it carries, and a whole `sha256:<64hex>` digest is a digest, not a long base64 run.
+ */
+const textRefusal = (text: string): ScanRefusal | null => {
+  let subject = text;
+  if (CANONICAL_BASE64.test(text)) {
+    const bytes = Buffer.from(text, "base64");
+    const decoded = bytes.toString("utf8");
+    if (bytes.toString("base64") === text && Buffer.from(decoded, "utf8").equals(bytes)) subject = decoded;
+  }
+  if (WHOLE_DIGEST.test(subject)) return null;
+  const match = credentialShapeMatch(subject);
+  if (match !== null) return { rule: match.rule, form: match.form };
+  try { screenPublicText(subject); } catch { return { rule: "public_text_screen", form: "other" }; }
+  return null;
+};
+
+/** Every string and every object key of the bundle, at any depth, with no field list; bounded, and refused past the bound. */
+const scanBundle = (root: unknown): ScanRefusal | null => {
+  let values = 0;
+  const visit = (value: unknown, depth: number): ScanRefusal | null => {
+    if (depth > STANDARD_REVIEW_SCAN_MAX_DEPTH) return { rule: "unexaminable_depth", form: "structure" };
+    if ((values += 1) > STANDARD_REVIEW_SCAN_MAX_VALUES) return { rule: "unexaminable_size", form: "structure" };
+    if (typeof value === "string") return textRefusal(value);
+    if (Array.isArray(value)) {
+      for (const item of value) { const found = visit(item, depth + 1); if (found) return found; }
+    } else if (value !== null && typeof value === "object") {
+      for (const [key, item] of Object.entries(value)) {
+        const found = textRefusal(key) ?? visit(item, depth + 1);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+  return visit(root, 0);
+};
+
 const lineCount = (text: string): number => (text === "" ? 0 : text.split("\n").length - (text.endsWith("\n") ? 1 : 0));
 
 /** The exact staged bytes as a STANDARD bundle bound to this run and contract, or the refusal; never echoes content. */
@@ -68,6 +115,9 @@ const parseStandardBundle = (body: string, input: { runId: string; contractDiges
   if (sha256(bytes) !== input.expectedSha256) return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "review evidence bundle hash differs");
   let value: unknown;
   try { value = JSON.parse(body); } catch { return deny(ReasonCode.INVALID_ARGUMENT, "review evidence bundle must be JSON"); }
+  // Before any shape is checked: the refusal names the rule and the form, never the text it matched.
+  const refused = scanBundle(value);
+  if (refused !== null) return deny(ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED, "review evidence holds credential-shaped or unexaminable content", refused);
   const parsed = standardBundleSchema.safeParse(value);
   if (!parsed.success || parsed.data.runId !== input.runId || parsed.data.contractDigest !== input.contractDigest) {
     return deny(ReasonCode.INVALID_ARGUMENT, `review evidence must bind this run and contract and list MISSING items; each file is a declared excerpt (origin, excerpt.originalSha256 and line ranges) of at most ${STANDARD_REVIEW_EXCERPT_MAX_BYTES} bytes, never its whole source, with no more lines than its ranges`);
@@ -83,18 +133,6 @@ const parseStandardBundle = (body: string, input: { runId: string; contractDiges
       return deny(ReasonCode.INVALID_ARGUMENT, `each review evidence file is an excerpt of at most ${STANDARD_REVIEW_EXCERPT_MAX_BYTES} bytes, never its whole source, with no more lines than its ranges`);
     }
   }
-  // Every text the reviewer would read gets the shared credential filter's full rule set (core/credential-shapes.ts),
-  // checked as free text, and the public-text screen; a refusal names the rule and the form, never the text.
-  const texts = [...parsed.data.missing, ...parsed.data.files.flatMap(f => [Buffer.from(f.bodyBase64, "base64").toString("utf8"), f.origin, f.path,
-    ...f.excerpt.ranges.flatMap(r => (r.purpose === undefined ? [] : [r.purpose]))])];
-  for (const text of texts) {
-    const match = credentialShapeMatch(text);
-    if (match !== null) {
-      return deny(ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED, "review evidence contains credential-shaped content", { rule: match.rule, form: match.form });
-    }
-  }
-  try { for (const text of texts) screenPublicText(text); }
-  catch { return deny(ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED, "review evidence contains credential-shaped content", { rule: "public_text_screen", form: "other" }); }
   return allow(ReasonCode.OK, parsed.data);
 };
 
@@ -281,27 +319,77 @@ export const currentStandardReviewEvidenceDigest = (source: ReadSource & Pick<So
 export const runHadStandardReviewEvidence = (source: Pick<Source, "audit">, runId: string): boolean =>
   source.audit.forRun(runId).some(e => e.kind === STANDARD_REVIEW_EVIDENCE_ATTACHED);
 
-/**
- * Every field a reviewer writes that a result or a refusal can carry (review/blind-review.ts ReviewPacket and its
- * refusals: a malformed coverage claim, the omitted items, the findings and method findings, the coverage and extra
- * claims and the repositories they name). The verdict is an enum; an unparsable answer, an error or an isolation
- * detail is already a digest and a length.
- */
-const REVIEWER_TEXT_FIELDS: ReadonlySet<string> = new Set(["claim", "omittedItems", "findings", "methodFindings", "coveredFiles",
-  "extraClaims", "coveredRepositories"]);
+const VERDICTS: ReadonlySet<string> = new Set(["PASS", "REVISE", "BLOCK"]);
+const SEVERITIES = ["INFO", "MINOR", "MAJOR", "BLOCKER"] as const;
+const STAGES: ReadonlySet<string> = new Set(["COMPLETED_REVIEW", "REVISION_REQUIRED", "VERIFICATION_FAILED", "REVIEW_UNAVAILABLE", "CANDIDATE_STALE"]);
+const VERIFICATION_STATUSES: ReadonlySet<string> = new Set(["PASS", "FAIL", "INCOMPLETE"]);
+const REASON_CODES: ReadonlySet<string> = new Set(Object.values(ReasonCode));
+/** Why a private-evidence run's answer is this projection: a fixed reason, never a text from the run. */
+export const PRIVATE_EVIDENCE_ANSWER_NOTE = "This run has CEO-attached private review evidence, so its answers keep only ACP-issued ids, ACP-computed digests, counts and fixed enums. The review itself stays in ACP's private record and in the revision request to the run's owner.";
+export const PRIVATE_EVIDENCE_REFUSAL_MESSAGE = "refused; the reason code and the counts below decide the next step, and any other text of this answer is withheld because the run has private review evidence";
+
+const recordOf = (value: unknown): Record<string, unknown> | null =>
+  value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+const countOf = (value: unknown): number | null => (Array.isArray(value) ? value.length : typeof value === "number" && Number.isInteger(value) ? value : null);
+const member = (value: unknown, set: ReadonlySet<string>): string | null => (typeof value === "string" && set.has(value) ? value : null);
+/** Strings and object keys anywhere in the original answer: what the projection withheld is counted, never shown. */
+const stringsIn = (value: unknown, depth = 0): number => {
+  if (depth > MAX_CREDENTIAL_SCAN_DEPTH) return 1;
+  if (typeof value === "string") return 1;
+  if (Array.isArray(value)) return value.reduce((sum: number, item) => sum + stringsIn(item, depth + 1), 0);
+  const record = recordOf(value);
+  return record === null ? 0 : Object.entries(record).reduce((sum, [, item]) => sum + 1 + stringsIn(item, depth + 1), 0);
+};
+const reviewCounts = (packet: Record<string, unknown> | null) => {
+  if (packet === null) return null;
+  const findings = Array.isArray(packet["findings"]) ? packet["findings"] : [];
+  return {
+    verdict: member(packet["verdict"], VERDICTS),
+    findings: countOf(packet["findings"]),
+    findingsBySeverity: Object.fromEntries(SEVERITIES.map(severity => [severity, findings.filter(f => recordOf(f)?.["severity"] === severity).length])),
+    omittedItems: countOf(packet["omittedItems"]),
+    coveredFiles: countOf(packet["coveredFiles"]),
+    extraClaims: countOf(packet["extraClaims"]) ?? 0,
+    methodFindings: countOf(packet["methodFindings"]) ?? 0,
+  };
+};
 
 /**
- * A result or refusal of a run that had private review evidence, with each reviewer-written field replaced by its
- * count and digest: a reviewer that read the evidence can echo it in any of them. The run's owner still receives
- * the review whole in its revision request; nothing here is stored or answered with the reviewer's words.
+ * The answer `result_submit` gives, and the mutation store keeps, for a run that ever had private review evidence:
+ * rebuilt from values whose provenance ACP knows, never copied by field name. The run id is the run's own; a digest
+ * is kept only when it names one of this run's frozen candidates; the reason code, stage, verdict, severities and
+ * verification status only when they are members of their fixed sets; and every review or report becomes counts.
+ * Nothing else of the original answer -- no string, no object key, however deeply nested -- is carried; the number
+ * withheld is. Success and failure stay distinct (`outcome`, `stage`, `reasonCode`); the transport's own in-flight
+ * and outcome-unknown answers never pass through here.
  */
-export const withoutReviewerText = (value: unknown, key?: string): unknown => {
-  if (key !== undefined && REVIEWER_TEXT_FIELDS.has(key) && (typeof value === "string" || Array.isArray(value))) {
-    return { withheld: "private review evidence", count: Array.isArray(value) ? value.length : 1, digest: digestOf(value) };
-  }
-  if (Array.isArray(value)) return value.map(item => withoutReviewerText(item));
-  if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, withoutReviewerText(v, k)]));
-  return value;
+export const privateEvidenceAnswer = <T>(source: ReadSource, runId: string, answer: Decision<T>): Decision<T> => {
+  const frozen = new Set(source.artifacts.list(runId, ArtifactKind.CANDIDATE_SNAPSHOT).map(a => a.candidateSnapshotDigest ?? a.digest));
+  const value = answer.allowed ? recordOf(answer.value) : null;
+  const evidence = recordOf(answer.evidence);
+  const candidate = [value?.["snapshotDigest"], evidence?.["candidateSnapshotDigest"]].find(d => typeof d === "string" && frozen.has(d)) ?? null;
+  const stage = member(value?.["stage"], STAGES);
+  const report = recordOf(value?.["report"]);
+  const ready = recordOf(value?.["packet"]);
+  const readyReview = recordOf(ready?.["blindReview"]);
+  const projection = {
+    privateReviewEvidence: true,
+    outcome: answer.allowed && stage === "COMPLETED_REVIEW" ? "SUCCEEDED" : "NOT_COMPLETED",
+    // An outcome names its own reason (a revision's REVIEW_REVISE, an unavailable review's cause) inside an OK answer.
+    reasonCode: member(value?.["reasonCode"], REASON_CODES) ?? member(answer.reasonCode, REASON_CODES),
+    runId,
+    candidateSnapshotDigest: candidate,
+    ...(stage === null ? {} : { stage }),
+    ...(recordOf(value?.["review"]) === null && recordOf(evidence?.["packet"]) === null ? {}
+      : { review: reviewCounts(recordOf(value?.["review"]) ?? recordOf(evidence?.["packet"])) }),
+    ...(readyReview === null ? {} : { blindReview: { verdict: member(readyReview["verdict"], VERDICTS), findings: countOf(readyReview["findings"]),
+      omittedItems: countOf(readyReview["omittedItems"]), coveredFiles: countOf(readyReview["coveredFiles"]) } }),
+    ...(report === null ? {} : { verification: { status: member(report["status"], VERIFICATION_STATUSES), results: countOf(report["results"]), gaps: countOf(report["gaps"]) } }),
+    withheldStrings: stringsIn(answer.allowed ? answer.value : answer.message) + stringsIn(answer.evidence),
+    note: PRIVATE_EVIDENCE_ANSWER_NOTE,
+  };
+  const code = REASON_CODES.has(answer.reasonCode) ? answer.reasonCode : ReasonCode.EVIDENCE_MISSING;
+  return answer.allowed ? allow(code, projection as unknown as T) : deny<T>(code, PRIVATE_EVIDENCE_REFUSAL_MESSAGE, projection);
 };
 
 /** Digests the reviewer is shown for the bundle; quoting one is not quoting a credential. */

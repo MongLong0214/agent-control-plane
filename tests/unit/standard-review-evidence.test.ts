@@ -15,6 +15,7 @@ import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { HERMES_PROVENANCE_META_KEY } from "../../src/mcp/hermes-provenance.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { DogfoodFindingStore, UpstreamDogfoodReporter, type UpstreamIssuePort } from "../../src/quality/upstream-dogfood.ts";
+import { privateEvidenceAnswer } from "../../src/review/standard-review-evidence.ts";
 import type { ReviewPacket } from "../../src/review/blind-review.ts";
 import type { CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
@@ -413,7 +414,8 @@ describe("review round 1: evidence binds candidate identity, audit text, owner c
       const rows = f.h.cp.db.all<Args>("SELECT * FROM audit_events");
       expect(rows.filter((row) => JSON.stringify(row).includes(MARKER)).map((row) => row["kind"])).toEqual([]);
       const completed = f.h.cp.audit.byKind("BLIND_REVIEW_COMPLETED").at(-1)!;
-      expect(completed.evidence).toMatchObject({ omittedItems: 1, omittedItemsDigest: digestOf([echoed]), findings: 1 });
+      expect(completed.evidence).toMatchObject({ omittedItems: 1, findings: 1 });
+      expect(completed.evidence).not.toHaveProperty("omittedItemsDigest");
     } finally { await f.close(); }
   });
 
@@ -480,7 +482,7 @@ describe("review round 1: evidence binds candidate identity, audit text, owner c
       expect(await stageFiles("more-lines-than-ranges", [fileFor(conversation)])).toMatchObject({ ok: false, reasonCode: "INVALID_ARGUMENT" });
       const whole = fileFor("## result\nall of it\n");
       expect(await stageFiles("whole-source", [{ ...whole, excerpt: { ...EXCERPT, originalSha256: whole.sha256 } }])).toMatchObject({ ok: false, reasonCode: "INVALID_ARGUMENT" });
-      const oversized = `${"x".repeat(17_000)}\n`;
+      const oversized = `${"an unrelated word ".repeat(1_000)}\n`;
       expect(await stageFiles("oversized", [fileFor(oversized)])).toMatchObject({ ok: false, reasonCode: "INVALID_ARGUMENT" });
       expect(f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF")).toEqual([]);
       for (const refusal of f.refusals) expect(refusal).not.toContain(MARKER);
@@ -547,6 +549,174 @@ describe("review round 2: the shared credential filter and no reviewer text in a
       expect(f.refusals.join("\n")).not.toContain(MARKER);
       // The run's owner still gets the review whole, so it can revise.
       expect(JSON.stringify(f.h.cp.db.all<Args>("SELECT payload_json FROM outbox WHERE kind = 'REVISION_REQUEST'"))).toContain(MARKER);
+    } finally { await f.close(); }
+  });
+});
+
+describe("review round 3: answers kept by provenance, and every string and key of a bundle scanned", () => {
+  const submitVia = (f: Awaited<ReturnType<typeof fixture>>, key: string) =>
+    f.cto("result_submit", { idempotencyKey: key, runId: f.run.runId, resultSummary: "app returns 2", recommendation: "merge" });
+  const stored = (f: Awaited<ReturnType<typeof fixture>>) => JSON.stringify(f.h.cp.db.all<Args>("SELECT * FROM inbound_messages"));
+  const audited = (f: Awaited<ReturnType<typeof fixture>>) => JSON.stringify(f.h.cp.db.all<Args>("SELECT * FROM audit_events"));
+  const TOKEN = ["xoxb", "123456789012345678901234567890"].join("-");
+
+  it("R8 a PASS with a BLOCKER finding refuses without its summary in the answer or the stored result", async () => {
+    const f = await fixture();
+    try {
+      expect(await f.stage("stage-a", MARKER)).toMatchObject({ ok: true });
+      expect(await f.attach("attach-a", MARKER)).toMatchObject({ ok: true });
+      f.h.scripted.script({ match: /Candidate review/, text: pass(f.identity, { findings: [
+        { category: "correctness", severity: "BLOCKER", repository: f.identity, path: "src/app.js", summary: `blocks: ${MARKER}`, detail: MARKER }] }) });
+      const answer = await submitVia(f, "submit-blocker");
+      expect(answer).toMatchObject({ ok: false, reasonCode: "REVIEW_BLOCK", evidence: { privateReviewEvidence: true, outcome: "NOT_COMPLETED", reasonCode: "REVIEW_BLOCK" } });
+      expect(JSON.stringify(answer)).not.toContain(MARKER);
+      expect(stored(f)).not.toContain(MARKER);
+      expect(audited(f)).not.toContain(MARKER);
+    } finally { await f.close(); }
+  });
+
+  it("R9 a credential shape in files[].github.repositoryIdentity is refused, naming the rule only", async () => {
+    const f = await fixture();
+    try {
+      const file = { ...fileFor("## result\nthe change\n"), github: { repositoryIdentity: `github:acme/${TOKEN}`, pullNumber: 1, sha: "a".repeat(40) } };
+      const body = bundleFor(f.run.runId, f.run.contractDigest, "", [file]);
+      const answer = await f.stage("github-token", "", { evidenceBody: body, expectedSha256: sha256(body) });
+      expect(answer).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "slack_token" } });
+      expect(JSON.stringify(answer)).not.toContain(TOKEN);
+      expect(f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF")).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it("R10 a token in any string or key of the bundle, at any depth, is refused without being re-quoted", async () => {
+    const f = await fixture();
+    try {
+      const base = JSON.parse(bundleFor(f.run.runId, f.run.contractDigest, "the change", [{ ...fileFor("## result\nthe change\n", { ...EXCERPT,
+        ranges: [{ section: "excerpt", purpose: "owner allowlist entry", startLine: 3, endLine: 4 }] }),
+        github: { repositoryIdentity: "github:acme/fixture", pullNumber: 1, sha: "a".repeat(40) } }])) as Args;
+      const variants: Array<{ where: string; bundle: unknown }> = [];
+      const walk = (node: unknown, path: Array<string | number>): void => {
+        if (typeof node === "string") {
+          const injected = path.at(-1) === "bodyBase64" ? Buffer.from(`${Buffer.from(node, "base64").toString("utf8")}${TOKEN}\n`).toString("base64") : `${node} ${TOKEN}`;
+          const copy = structuredClone(base);
+          let at: Args = copy;
+          for (const step of path.slice(0, -1)) at = at[step as string] as Args;
+          at[path.at(-1) as string] = injected;
+          variants.push({ where: path.join("."), bundle: copy });
+        } else if (node !== null && typeof node === "object") {
+          const copy = structuredClone(base);
+          let at: Args = copy;
+          for (const step of path) at = at[step as string] as Args;
+          if (!Array.isArray(at)) { at[TOKEN] = "x"; variants.push({ where: `${path.join(".")}.<key>`, bundle: copy }); }
+          for (const [key, child] of Object.entries(node)) walk(child, [...path, Array.isArray(node) ? Number(key) : key]);
+        }
+      };
+      walk(base, []);
+      expect(variants.length).toBeGreaterThanOrEqual(15);
+      for (const { where, bundle } of variants) {
+        const body = JSON.stringify(bundle);
+        const answer = await f.stage(`token-${where}`, "", { evidenceBody: body, expectedSha256: sha256(body) });
+        expect(answer, where).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED" });
+        expect(JSON.stringify(answer), where).not.toContain(TOKEN);
+      }
+      // Past the scan's depth or size bound the bundle is refused as unexaminable, never passed unread.
+      let deep: unknown = TOKEN;
+      for (let i = 0; i < 40; i += 1) deep = { next: deep };
+      const tooDeep = JSON.stringify({ ...base, deep });
+      expect(await f.stage("too-deep", "", { evidenceBody: tooDeep, expectedSha256: sha256(tooDeep) }))
+        .toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "unexaminable_depth" } });
+      const tooMany = JSON.stringify({ ...base, many: Array.from({ length: 25_000 }, () => "x") });
+      expect(await f.stage("too-many", "", { evidenceBody: tooMany, expectedSha256: sha256(tooMany) }))
+        .toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "unexaminable_size" } });
+      expect(f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF")).toEqual([]);
+      expect(f.refusals.join("\n")).not.toContain(TOKEN);
+      expect(await f.stage("clean", "the change")).toMatchObject({ ok: true });
+    } finally { await f.close(); }
+  });
+
+  it("R11 a marker in every string of a reviewer answer, blockers and nested fields included, survives in no answer, stored result or audit row", async () => {
+    const f = await fixture();
+    try {
+      expect(await f.stage("stage-a", MARKER)).toMatchObject({ ok: true });
+      expect(await f.attach("attach-a", MARKER)).toMatchObject({ ok: true });
+      // A PASS whose BLOCKER finding the production gate refuses: the blockers path, then every other string.
+      const template = { verdict: "PASS", coveredFiles: [`${f.identity}:src/app.js`, `${f.identity}:docs/notes.md`], omittedItems: [] as string[], findings: [
+        { category: "correctness", severity: "BLOCKER", repository: f.identity, path: "src/app.js", summary: "blocks", detail: "blocks detail" },
+        { category: "method", severity: "MINOR", repository: f.identity, path: "docs/notes.md", summary: "method", detail: "method detail" }] };
+      const answers: Args[] = [];
+      const inject = async (node: unknown, path: Array<string | number>): Promise<void> => {
+        if (typeof node === "string") {
+          const copy = structuredClone(template) as unknown as Args;
+          let at: Args = copy;
+          for (const step of path.slice(0, -1)) at = at[step as string] as Args;
+          at[path.at(-1) as string] = `${node} ${MARKER}`;
+          f.h.scripted.script({ match: /Candidate review/, text: JSON.stringify(copy) });
+          answers.push(await submitVia(f, `submit-${path.join(".")}`));
+          return;
+        }
+        if (node !== null && typeof node === "object") for (const [key, child] of Object.entries(node)) await inject(child, [...path, Array.isArray(node) ? Number(key) : key]);
+      };
+      await inject(template, []);
+      f.h.scripted.script({ match: /Candidate review/, text: JSON.stringify({ ...template, omittedItems: [MARKER] }) });
+      answers.push(await submitVia(f, "submit-omitted"));
+      expect(answers.length).toBeGreaterThanOrEqual(16);
+      expect(answers.filter((answer) => answer["reasonCode"] === "REVIEW_BLOCK").length).toBeGreaterThan(0);
+      for (const answer of answers) expect(JSON.stringify(answer)).not.toContain(MARKER);
+      expect(stored(f)).not.toContain(MARKER);
+      expect(audited(f)).not.toContain(MARKER);
+      // The review itself stays in the private record.
+      expect(JSON.stringify(f.reviews().map((r) => r.content.findings))).toContain(MARKER);
+    } finally { await f.close(); }
+  });
+
+  it("R12 ids, reasons, stages, digests and keys that hold a marker do not survive; a forged digest is dropped", () => {
+    const h = makeHarness();
+    try {
+      const forged = `sha256:${"0".repeat(64)}`;
+      const nested = { [MARKER]: { [MARKER]: MARKER }, runId: MARKER, attemptId: MARKER, reasonCode: MARKER, candidateSnapshotDigest: forged };
+      const allowed = privateEvidenceAnswer({ artifacts: h.cp.artifacts, audit: h.cp.audit }, "run_0123456789abcdef01234567",
+        allow(ReasonCode.OK, { stage: MARKER, snapshotDigest: forged, review: { verdict: MARKER, findings: [{ severity: MARKER }] },
+          report: { status: MARKER }, ...nested }, nested));
+      const refused = privateEvidenceAnswer({ artifacts: h.cp.artifacts, audit: h.cp.audit }, "run_0123456789abcdef01234567",
+        deny(ReasonCode.REVIEW_BLOCK, `blocked: ${MARKER}`, { blockers: [MARKER], ...nested }));
+      for (const answer of [allowed, refused]) {
+        expect(JSON.stringify(answer)).not.toContain(MARKER);
+        expect(JSON.stringify(answer)).not.toContain(forged);
+      }
+      expect(allowed).toMatchObject({ allowed: true, value: { runId: "run_0123456789abcdef01234567", reasonCode: "OK", review: { verdict: null, findings: 1 } } });
+      expect(refused).toMatchObject({ allowed: false, reasonCode: "REVIEW_BLOCK", evidence: { reasonCode: "REVIEW_BLOCK", outcome: "NOT_COMPLETED" } });
+    } finally { h.cp.close(); }
+  });
+
+  it("R13 success, failure, in flight and outcome unknown stay distinct after redaction, and a run without evidence answers as before", async () => {
+    const plain = await fixture();
+    try {
+      plain.h.scripted.script({ match: /Candidate review/, text: JSON.stringify({ verdict: "REVISE", coveredFiles: [`${plain.identity}:src/app.js`], omittedItems: [],
+        findings: [{ category: "correctness", severity: "MAJOR", repository: plain.identity, path: "src/app.js", summary: "plain finding", detail: "plain detail" }] }) });
+      const answer = await submitVia(plain, "plain-revise");
+      expect(answer).toMatchObject({ ok: true, value: { stage: "REVISION_REQUIRED", review: { findings: [{ summary: "plain finding" }] } } });
+      expect(JSON.stringify(answer)).not.toContain("privateReviewEvidence");
+    } finally { await plain.close(); }
+
+    const f = await fixture();
+    try {
+      expect(await f.stage("stage-a", MARKER)).toMatchObject({ ok: true });
+      expect(await f.attach("attach-a", MARKER)).toMatchObject({ ok: true });
+      const thrown = vi.spyOn(f.h.cp.pipeline, "submitResult").mockRejectedValueOnce(new Error("transport lost"));
+      await submitVia(f, "unknown");
+      thrown.mockRestore();
+      expect(await submitVia(f, "unknown")).toMatchObject({ ok: false, reasonCode: "MCP_MUTATION_OUTCOME_UNKNOWN" });
+
+      f.h.scripted.script({ match: /Candidate review/, text: JSON.stringify({ verdict: "REVISE", coveredFiles: [`${f.identity}:src/app.js`], omittedItems: [],
+        findings: [{ category: "correctness", severity: "MAJOR", repository: f.identity, path: "src/app.js", summary: MARKER, detail: MARKER }] }) });
+      expect(await submitVia(f, "failure")).toMatchObject({ ok: true, value: { outcome: "NOT_COMPLETED", stage: "REVISION_REQUIRED", reasonCode: "REVIEW_REVISE",
+        review: { verdict: "REVISE", findings: 1, findingsBySeverity: { MAJOR: 1 } } } });
+
+      f.h.scripted.script({ match: /Candidate review/, text: pass(f.identity), delayMs: 1_500 });
+      const pending = submitVia(f, "success");
+      for (let i = 0; i < 400 && f.reviewerInputs().length < 2; i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(await submitVia(f, "success")).toMatchObject({ ok: true, reasonCode: "MCP_MUTATION_IN_FLIGHT", value: { inFlight: true } });
+      expect(await pending).toMatchObject({ ok: true, value: { outcome: "SUCCEEDED", stage: "COMPLETED_REVIEW", blindReview: { verdict: "PASS" } } });
+      expect(f.refusals.join("\n")).not.toContain(MARKER);
     } finally { await f.close(); }
   });
 });

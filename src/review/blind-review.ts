@@ -1076,10 +1076,10 @@ export class BlindReviewGate {
         effort: authoritativeReviewer.preference.effort,
         coveredFiles: validated.coveredFiles.length,
         // A reviewer that read private evidence can echo it in any text it returns: its omissions are a count
-        // and a digest here, never its words (the findings are already a count).
+        // here, never its words nor a digest a short text could be guessed from (the findings are already a count).
         ...(validated.inputManifest.reviewEvidence === undefined
           ? { omittedItems: validated.omittedItems }
-          : { omittedItems: validated.omittedItems.length, omittedItemsDigest: digestOf(validated.omittedItems) }),
+          : { omittedItems: validated.omittedItems.length }),
         chunked,
         findings: validated.findings.length,
         egressRecords: validated.egressEvidence.length,
