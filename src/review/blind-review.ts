@@ -848,14 +848,16 @@ export class BlindReviewGate {
         runtimeEventId: context.deployment?.eventId ?? null, payloadDigest: digestOf(context) } });
     if (!inputRecord.allowed) return inputRecord as Decision<ReviewPacket>;
     const expected = bootstrapPlanCoverageTargets(inputs.outputs);
+    // The reviewer's session and invocation stop when the submission no longer holds the run.
+    const subject = { ...inputs, ...(request.signal === undefined ? {} : { signal: request.signal }) };
 
     const reviewers: ReviewerBinding[] = [];
     try {
-      const reviewer = await this.constituteReviewer(inputs);
+      const reviewer = await this.constituteReviewer(subject);
       if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
       reviewers.push(reviewer.value);
       const outcome = await this.singleReview(
-        { ...inputs, ...(request.signal === undefined ? {} : { signal: request.signal }) },
+        subject,
         this.buildBootstrapPlanPrompt(inputs, expected, context),
         reviewer.value,
         expected,
@@ -915,14 +917,15 @@ export class BlindReviewGate {
     const inputs = trusted.value;
     const expected = [inputs.change.target];
     if (request.progress?.("FINAL_REVIEW_STARTED") === false) return attemptLeaseLost(request.runId, request.attemptId);
+    const subject = { ...inputs, ...(request.signal === undefined ? {} : { signal: request.signal }) };
 
     const reviewers: ReviewerBinding[] = [];
     try {
-      const reviewer = await this.constituteReviewer(inputs);
+      const reviewer = await this.constituteReviewer(subject);
       if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
       reviewers.push(reviewer.value);
       const outcome = await this.singleReview(
-        { ...inputs, ...(request.signal === undefined ? {} : { signal: request.signal }) },
+        subject,
         this.buildContractChangePrompt(inputs, expected),
         reviewer.value,
         expected,
@@ -1343,6 +1346,7 @@ export class BlindReviewGate {
           workdir,
           purpose,
           isolation: this.reviewerIsolation(request, workdir),
+          ...(request.signal === undefined ? {} : { signal: request.signal }),
         });
       } catch (error) {
         rmSync(workdir, { recursive: true, force: true });

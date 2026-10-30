@@ -411,6 +411,8 @@ export interface SessionSpec {
    * will later produce the answer.
    */
   isolation?: InvocationRequest["isolation"];
+  /** Aborting stops a runtime that spawns to constitute the session (a reviewer handshake). */
+  signal?: AbortSignal;
   /**
    * Records that a future invocation may request a managed write. It is intentionally
    * descriptive only: session creation never grants filesystem access, and every effect

@@ -268,6 +268,13 @@ describe("work an attempt started stops when ACP releases it, and what comes bac
       const of = /# Review chunk \d+ of (\d+)/.exec(prompt);
       return of ? 119.2 / Number(of[1]) : 1;
     }, () => h.cp.watchdog.tick());
+    // Each reviewer session is constituted under the attempt's signal too (a handshake that spawns).
+    const sessions: Array<AbortSignal | undefined> = [];
+    const startSession = h.scripted.startSession.bind(h.scripted);
+    h.scripted.startSession = async (spec) => {
+      sessions.push(spec.signal);
+      return startSession(spec);
+    };
 
     const outcome = await h.cp.pipeline.submitResult(submission(run));
 
@@ -275,6 +282,8 @@ describe("work an attempt started stops when ACP releases it, and what comes bac
     expect(chunks).toBeGreaterThanOrEqual(4);
     expect(prompts(h, /Final review/)).toBe(1);
     expect(stopped).toEqual([...Array<boolean>(chunks).fill(false), true]);
+    expect(sessions).toHaveLength(chunks + 1);
+    expect(sessions.every((signal) => signal?.aborted === true)).toBe(true);
     expect(outcome).toMatchObject({ allowed: false, reasonCode: ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE });
     expect(attemptRow(h, runId).state).toBe("RELEASED");
     expect(h.cp.artifacts.latest(runId, ArtifactKind.BLIND_REVIEW)).toBeNull();

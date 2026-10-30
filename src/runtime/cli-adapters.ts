@@ -3496,6 +3496,8 @@ export class CodexCliAdapter implements ProviderAdapter {
       reviewerEgress: this.#reviewerEgress,
       reviewerProvider: this.provider,
       reviewerEgressPhase: "session-bootstrap",
+      // Aborting ends the handshake's process group through runCli's own end path.
+      ...(spec.signal === undefined ? {} : { signal: spec.signal }),
     });
     if (!result.isolationEnforced || !result.egressEvidence || result.egressEvidence.length === 0) {
       throw new ProviderSessionProvisionError(
@@ -3592,6 +3594,8 @@ export class CodexCliAdapter implements ProviderAdapter {
       reviewerEgress: this.#reviewerEgress,
       reviewerProvider: this.provider,
       reviewerEgressPhase: "reviewer-invocation",
+      // Aborting ends the reviewer's process group through runCli's own end path.
+      ...(request.signal === undefined ? {} : { signal: request.signal }),
     }).finally(() => { constituted.busy = false; });
     const observedSessionId = codexThreadId(result.stdout);
     const sessionMatches = !observedSessionId || observedSessionId === expectedSessionId;
