@@ -512,7 +512,7 @@ pnpm gates           # CI verify 순서를 로컬에서 실행
 - 로컬 테스트, 픽스처, 모델링한 어댑터, 템플릿을 GitHub·Buzz·Telegram·launchd·프로바이더·오너의 실환경 증거처럼 내세우지 마세요.
 - 커밋 메시지에는 외부 작업 세션 페이지 링크를 넣을 수 없습니다. `commit-msg` 훅과 `pnpm trailers`가 이를 거부합니다.
 - 풀 리퀘스트는 `pnpm merge <number> --subject <text> --body-file <path>`([`scripts/merge-pr.mjs`](scripts/merge-pr.mjs))로 머지합니다.
-  이 스크립트는 정확한 head에서 필수 `verify` 실행 결과를 확인하고, 일반 squash 머지였다면 사라졌을 커밋 기록을 보존합니다.
+  이 스크립트는 정확한 head에서 필수 `verify` 실행 결과를 확인하고, 일반 merge commit으로만 머지한 뒤 부모·tree·브랜치 커밋의 CommitLore notes가 origin에 있는지 다시 읽어 확인합니다.
 
 ## 라이선스
 

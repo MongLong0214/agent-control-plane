@@ -170,6 +170,8 @@ export const ReviewFindingCategory = {
   evidence: "evidence",
   freshness: "freshness",
   source: "source",
+  /** #1271 — a defect or gap in the frontier-simplify review method itself, not in the candidate. */
+  method: "method",
 } as const;
 export type ReviewFindingCategory =
   (typeof ReviewFindingCategory)[keyof typeof ReviewFindingCategory];

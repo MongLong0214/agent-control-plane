@@ -1,12 +1,12 @@
 name: CommitLore squash inheritance
 
 # A squash merge replaces a branch's commits with one that does not carry their trailers, and
-# GitHub performs that merge on its own servers where no local hook runs. `merge-pr.mjs` handles
-# the merges this repository makes deliberately — it calls `commitlore squash-preserve` before
-# merging — but the **Squash and merge** button is enabled (`allow_squash_merge: true`), and a
-# press of it drops the branch's records silently while showing the author a green merge. This
-# action is the only thing with what it needs at that moment: the pull request, its commits, and
-# the commit they were squashed into. Filed as #829.
+# GitHub performs that merge on its own servers where no local hook runs. Pull requests merge as
+# merge commits since #1269 (`merge-pr.mjs`), which keep every branch commit, and for a merge commit
+# this action does nothing. It stays for a squash that still lands while the repository allows the
+# **Squash and merge** button: a press of it drops the branch's records silently while showing the
+# author a green merge, and this action is the only thing with what it needs at that moment: the
+# pull request, its commits, and the commit they were squashed into. Filed as #829.
 #
 # Measured on this repository before adding it: two `Follows:` references already dangle
 # (`commitlore stale`), and both parents exist only on pre-squash branch commits unreachable from

@@ -551,7 +551,8 @@ pnpm gates           # the CI verify sequence, locally
   `pnpm trailers` refuse them.
 - Pull requests are merged with `pnpm merge <number> --subject <text> --body-file <path>`
   ([`scripts/merge-pr.mjs`](scripts/merge-pr.mjs)), which checks the required `verify` run on the
-  exact head and preserves commit records that a plain squash merge would drop.
+  exact head, merges it as a merge commit and nothing else, and reads the merge back: its parents,
+  its tree, and the branch's CommitLore notes on origin.
 
 ## License
 

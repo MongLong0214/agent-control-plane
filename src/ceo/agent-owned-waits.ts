@@ -7,7 +7,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { OWNERLESS_STALL_OWED, OWNERLESS_STALL_ROUTED, type WatchdogStall } from "../doctor/watchdog.ts";
 import { ArtifactKind, Role, RunState, roleKeyFor, type RoleBinding, type RunRow } from "../domain/types.ts";
-import { MessageKind } from "../outbox/envelope.ts";
+import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -393,12 +393,12 @@ export class AgentOwnedWaits {
    */
   routeWatchdogStalls(stalls: readonly WatchdogStall[]): Array<{ kind: string; id: string; messageId: string | null; reasonCode: string }> {
     const routed: Array<{ kind: string; id: string; messageId: string | null; reasonCode: string }> = [];
-    const oldestByRole = new Map<string, { stall: WatchdogStall; count: number }>();
+    const oldestByRole = new Map<string, { stall: WatchdogStall; count: number; group: WatchdogStall[] }>();
     const asked = new Set<string>();
     const keyOf = (stall: WatchdogStall): string => `${stall.kind}:${stall.id}:${stall.since}`;
     const owedStalls = this.#owedStalls();
     const owedByKey = new Map(owedStalls.map(({ stall, episode }) => [keyOf(stall), { episode }]));
-    const routeOne = (stall: WatchdogStall, blocker: string): void => {
+    const routeOne = (stall: WatchdogStall, blocker: string, recovery?: Pick<OwnerlessStall, "owner" | "recoveryAction" | "episode">): void => {
       const route = WATCHDOG_STALL_ROUTES[stall.kind];
       const key = keyOf(stall);
       if (!route || asked.has(key)) return;
@@ -412,11 +412,11 @@ export class AgentOwnedWaits {
         source: "WATCHDOG",
         kind: stall.kind,
         id: stall.id,
-        episode: stall.since,
+        episode: recovery?.episode ?? stall.since,
         runId: stall.runId,
         since: stall.since,
-        owner: this.#stallOwner(stall),
-        recoveryAction: route.recoveryAction,
+        owner: recovery?.owner ?? this.#stallOwner(stall),
+        recoveryAction: recovery?.recoveryAction ?? route.recoveryAction,
         blocker,
         effects: route.effects,
         deliveryTimeout: stall.kind === "outbox",
@@ -443,14 +443,18 @@ export class AgentOwnedWaits {
         if (stall.messageKind === MessageKind.CEO_NOTIFICATION) continue;
         const role = stall.roleKey ?? "unknown";
         const held = oldestByRole.get(role);
-        if (!held) oldestByRole.set(role, { stall, count: 1 });
-        else oldestByRole.set(role, { stall: Date.parse(stall.since) < Date.parse(held.stall.since) ? stall : held.stall, count: held.count + 1 });
+        if (!held) oldestByRole.set(role, { stall, count: 1, group: [stall] });
+        else {
+          held.group.push(stall);
+          oldestByRole.set(role, { stall: Date.parse(stall.since) < Date.parse(held.stall.since) ? stall : held.stall, count: held.count + 1, group: held.group });
+        }
         continue;
       }
       routeOne(stall, `${WATCHDOG_STALL_ROUTES[stall.kind]?.what ?? stall.kind}: ${stall.kind} ${stall.id}, since ${stall.since}`);
     }
-    for (const [role, { stall, count }] of oldestByRole) {
-      routeOne(stall, `${count} ${WATCHDOG_STALL_ROUTES["outbox"]!.what} to ${role}; the oldest is ${stall.id}, since ${stall.since}`);
+    for (const [role, { stall, count, group }] of oldestByRole) {
+      routeOne(stall, `${count} ${WATCHDOG_STALL_ROUTES["outbox"]!.what} to ${role}; the oldest is ${stall.id}, since ${stall.since}`,
+        this.#deliveryRecovery(group, stall.since));
     }
     for (const { stall: owed } of owedStalls) {
       routeOne(owed, `${WATCHDOG_STALL_ROUTES[owed.kind]?.what ?? owed.kind}: ${owed.kind} ${owed.id}, since ${owed.since}`);
@@ -496,6 +500,66 @@ export class AgentOwnedWaits {
       runId: stall.runId,
       evidence: { source: "WATCHDOG", kind: stall.kind, target: stall.id, since: stall.since, ...outcome },
     });
+  }
+
+  /**
+   * The recovery of one role's stalled messages, which share one notice: every recovery their kinds need.
+   * Undefined when none is holder-claimed, which keeps the route's retry and its episode, when the oldest was
+   * queued (`since`). With only holder-claimed ones, the claim of the oldest of them; with both, the retry for
+   * the pushed ones and the claim for the holder-claimed ones, each naming its messages, and the session and
+   * generation are the holder-claimed row's. Either way the episode also names that composition and target, so
+   * a change of them reaches the CEO as a new notice, once, and an unchanged one is the notice it already has.
+   * It is joined with `#`, never `|`, so it is not a prefix of another episode's delivery keys.
+   */
+  #deliveryRecovery(group: readonly WatchdogStall[], since: string): Pick<OwnerlessStall, "owner" | "recoveryAction" | "episode"> | undefined {
+    const isHeld = (stall: WatchdogStall): boolean => (HOLDER_CLAIMED_KINDS as ReadonlySet<string>).has(stall.messageKind ?? "");
+    const held = group.filter(isHeld);
+    if (held.length === 0) return undefined;
+    const claim = this.#holderClaimedStall(held.reduce((a, b) => Date.parse(b.since) < Date.parse(a.since) ? b : a));
+    const pushed = group.filter((stall) => !isHeld(stall));
+    const episode = `${since}#${pushed.length === 0 ? "held" : "mixed"}:${claim.owner.sessionId ?? "unknown"}@g${claim.owner.generation ?? "unknown"}`;
+    if (pushed.length === 0) return { ...claim, episode };
+    const named = (stalls: readonly WatchdogStall[]): string =>
+      `${stalls.length} (${stalls.slice(0, 10).map((stall) => stall.id).join(", ")}${stalls.length > 10 ? `, and ${stalls.length - 10} more` : ""})`;
+    return {
+      owner: claim.owner,
+      recoveryAction: `pushed messages ${named(pushed)}: ${WATCHDOG_STALL_ROUTES["outbox"]!.recoveryAction}. ` +
+        `Holder-claimed messages ${named(held)}: ${claim.recoveryAction}`,
+      episode,
+    };
+  }
+
+  /**
+   * A stalled message of a holder-claimed kind (`HOLDER_CLAIMED_KINDS`) is never pushed: the delivery pass
+   * does not pick it up and a delivery retry cannot deliver it, so its recovery is its receiving session's
+   * claim. It names the session and binding generation the row is addressed to, and whether that session is
+   * live.
+   */
+  #holderClaimedStall(stall: WatchdogStall): Pick<OwnerlessStall, "owner" | "recoveryAction"> {
+    const row = this.ports.db.get<{ role_key: string; binding_generation: number; target_session_id: string; lifecycle: string | null }>(
+      `SELECT o.role_key, o.binding_generation, o.target_session_id, s.lifecycle
+         FROM outbox o LEFT JOIN sessions s ON s.session_id = o.target_session_id
+        WHERE o.message_id = ?`,
+      [stall.id],
+    );
+    const role = row?.role_key ?? stall.roleKey ?? null;
+    const claim = `the receiving session claims it (role_owner_message_claim); if its relay or attachment is gone, ` +
+      `it reconnects and then claims it. A ${stall.messageKind} is delivered only by its holder's claim, never by the ` +
+      `delivery pass, so a delivery retry cannot deliver it; a delivery timeout does not fail the run`;
+    if (!row) return { owner: { role, sessionId: null, generation: null }, recoveryAction: `${claim}. Its row is no longer readable` };
+    const current = this.ports.bindings.active(row.role_key);
+    const isCurrent = current?.bindingGeneration === row.binding_generation && current.sessionId === row.target_session_id;
+    const ready = row.lifecycle === "READY" || row.lifecycle === "DRAINING";
+    const liveness = ready && isCurrent
+      ? `live (${row.lifecycle}, the role's current binding)`
+      : `not live (session ${row.lifecycle ?? "unknown"}; ${current
+        ? `the role's current binding is generation ${current.bindingGeneration}, session ${current.sessionId}`
+        : "the role has no current binding"})`;
+    return {
+      owner: { role: row.role_key, sessionId: row.target_session_id, generation: row.binding_generation },
+      recoveryAction: `${claim}. It is addressed to session ${row.target_session_id} at binding generation ` +
+        `${row.binding_generation} of ${row.role_key}, which is ${liveness}`,
+    };
   }
 
   #stallOwner(stall: WatchdogStall): OwnerlessStall["owner"] {

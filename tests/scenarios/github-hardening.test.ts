@@ -19,7 +19,6 @@ import {
   approveReviewedCandidateForFinalization,
   type Harness,
   driveToReviewedCandidate,
-  fixtureManifest,
   installDaemonFinalizerGitHubFixture,
   makeHarness,
   ownerDecisionReceipt,
@@ -85,20 +84,10 @@ const reflectMergedBase = (github: FakeGitHub): void => {
   };
 };
 
-/**
- * The pinned profile with only the merge strategy moved, derived from the fixture default rather
- * than restated: a second copy of the profile would let the two drift and still read as pinned.
- */
-const branchProfileWith = (mergeStrategy: "merge_commit" | "squash") => ({
-  ...fixtureManifest("strategy-probe").branchProfile,
-  mergeStrategy,
-});
-
 const setup = async (options: {
   declareChecks?: boolean;
   humanGate?: readonly string[];
   allowUnsatisfiedHumanGate?: boolean;
-  mergeStrategy?: "merge_commit" | "squash";
 } = {}): Promise<Fixture> => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
@@ -110,7 +99,6 @@ const setup = async (options: {
     humanGate: options.humanGate,
     manifestOverrides: {
       ...(options.declareChecks === false ? {} : { ciWorkflows: CI_WORKFLOWS }),
-      ...(options.mergeStrategy ? { branchProfile: branchProfileWith(options.mergeStrategy) } : {}),
     },
   });
 
@@ -203,6 +191,7 @@ const reflectMergeToCandidate = (
     if (merge.merged !== true || !pull) return response;
     (pull as typeof pull & { merge_commit_sha?: string }).merge_commit_sha = mergeSha;
     github.commitParents.set(mergeSha, [evaluatedBase, candidateHead]);
+    github.commitTrees.set(mergeSha, github.treeOf(candidateHead));
     github.setBranch(pull.base.ref, mergeSha);
     return { ...(response as object), sha: mergeSha } as T;
   };
@@ -337,17 +326,13 @@ const mergeForReal = async (fixture: Fixture) => {
   return merged.value.mergeCommitSha;
 };
 
-const mergeInput = (
-  fixture: Fixture,
-  pullNumber: number,
-  mergeStrategy: "merge_commit" | "squash" = "merge_commit",
-) => ({
+const mergeInput = (fixture: Fixture, pullNumber: number) => ({
   runId: fixture.runId,
   repositoryIdentity: fixture.identity,
   pullNumber,
   exactHeadSha: fixture.head,
   expectedBaseSha: fixture.base,
-  mergeStrategy,
+  mergeStrategy: "merge_commit" as const,
   ownerSessionId: fixture.caller.ownerSessionId,
   ownerBindingGeneration: fixture.caller.ownerBindingGeneration,
 });
@@ -1432,81 +1417,13 @@ describe("round-2 review: post-merge coverage and receipts", () => {
   });
 });
 
-/**
- * What the daemon actually puts on the wire when it squashes.
- *
- * A composer that is correct and not wired to the request is the failure this whole effort is
- * about: one side prepared, the other side never traversing it. So these read the recorded PUT
- * body rather than the composer's return value.
- */
-describe("the outgoing squash message is stated by the daemon, not composed by GitHub", () => {
-  const SESSION_URL = "https://claude.ai/code/session_0000000000000000000000";
-
-  /**
-   * The branch's commit messages, in the two shapes that reach `main` today.
-   *
-   * The record-carrying commit is the branch's last: a squash keeps as trailers only its last
-   * paragraph, so a record in an earlier commit is kept only by a notes mirror, which this daemon
-   * does not write, and it refuses that squash before merging (S9-R1). Carried this way the record
-   * sits in the squash's own trailer block, which is what the merge-records gate reads.
-   */
+/** What the daemon actually puts on the wire when it merges: the recorded PUT body, not a composer's value. */
+describe("a pull request merges as a merge commit, whose message GitHub composes (#1269)", () => {
+  /** Commits that would have had to be composed into a squash message; a merge commit keeps them as they are. */
   const BRANCH_COMMITS = [
-    {
-      message:
-        "docs: the second change\n\n" +
-        "The capture flow could not run, so the context is in this prose.\n" +
-        `Claude-Session: ${SESSION_URL}\n`,
-    },
-    {
-      message:
-        "feat: the first change\n\n" +
-        "why the first change was made.\n\n" +
-        "Limit: the first commit's record\n" +
-        "Record-Id: r-111111111111\n" +
-        `X-Claude-Session: ${SESSION_URL}\n`,
-    },
+    { message: "docs: the second change\n\nwhy the second change was made.\n" },
+    { message: "feat: the first change\n\nLimit: the first commit's record\nRecord-Id: r-111111111111\n" },
   ];
-
-  const mergedPutBody = async (): Promise<{ sha: string; merge_method: string; commit_message?: string }> => {
-    const fixture = await setup({ mergeStrategy: "squash" });
-    const pullNumber = await openPullWithGate(fixture);
-    fixture.github.setPullCommits(pullNumber, BRANCH_COMMITS);
-
-    const merged = await fixture.harness.cp.github.mergeExecute(
-      mergeInput(fixture, pullNumber, "squash"),
-    );
-    if (!merged.allowed) throw new Error(`${merged.reasonCode}: ${merged.message}`);
-
-    const put = fixture.github.calls.filter(
-      (call) => call.method === "PUT" && /\/pulls\/\d+\/merge$/.test(call.path),
-    );
-    expect(put).toHaveLength(1);
-    return put[0]!.body as { sha: string; merge_method: string; commit_message?: string };
-  };
-
-  it("sends a commit_message rather than leaving the composition to COMMIT_MESSAGES", async () => {
-    const body = await mergedPutBody();
-    // The whole defect in one assertion: today the body is `{ sha, merge_method }`, so GitHub
-    // composes the message from the branch's commits and whatever they say lands in `main`.
-    expect(typeof body.commit_message).toBe("string");
-    expect(body.merge_method).toBe("squash");
-  });
-
-  it("publishes no session metadata, in trailer form or in prose form", async () => {
-    const body = await mergedPutBody();
-    expect(body.commit_message).not.toContain("session_0000000000000000000000");
-    expect(body.commit_message).not.toContain("X-Claude-Session");
-    expect(body.commit_message).not.toContain("Claude-Session");
-  });
-
-  it("still carries every record line the branch wrote", async () => {
-    const body = await mergedPutBody();
-    // The other direction, with equal force. Composing our own message is exactly how 129 of 132
-    // record lines were lost once already.
-    expect(body.commit_message).toContain("Limit: the first commit's record");
-    expect(body.commit_message).toContain("Record-Id: r-111111111111");
-    expect(body.commit_message).toContain("The capture flow could not run");
-  });
 
   it("leaves a merge_commit strategy's request body exactly as it was", async () => {
     // Scope, stated where it can fail. A merge commit's message is not composed from the branch's
@@ -1525,5 +1442,6 @@ describe("the outgoing squash message is stated by the daemon, not composed by G
       (call) => call.method === "PUT" && /\/pulls\/\d+\/merge$/.test(call.path),
     );
     expect(Object.keys(put!.body as object).sort()).toEqual(["merge_method", "sha"]);
+    expect(put!.body).toEqual({ sha: fixture.head, merge_method: "merge" });
   });
 });

@@ -1,32 +1,28 @@
 /**
- * `pnpm merge` writes the head it checked into the squash as `Merged-Head: <sha>`, hands GitHub the
- * same sha as `--match-head-commit`, and reads the merge back -- the trailer, the tree and the
- * records -- failing loudly on any mismatch, because the merge itself cannot be undone.
- *
- * `scripts/verify-merge-preserved-records.mjs` reads a squash's branch up to that trailer and
- * nothing else (narrow review 5 showed the pull request's `head.sha` and every corroboration of it
- * accept a rewritten or rolled-back head), so a merge without it is unverifiable on `main`.
+ * `pnpm merge` merges a pull request as a merge commit and nothing else (#1269), hands GitHub the head
+ * whose CI it checked as `--match-head-commit`, and reads the merge back -- its two parents, its tree
+ * and the branch's CommitLore notes on origin -- failing loudly on any mismatch, because the merge
+ * itself cannot be undone.
  *
  * These run the real script against a real repository whose `origin` is a local bare repository.
- * The `gh` stand-in composes the squash there the way GitHub does -- subject, blank line, body;
- * the head merged onto the base -- and can be told to compose it wrongly. The `commitlore`
- * stand-in leaves the draft as it is and mirrors the branch's records onto the merge as a note,
- * which is what `squash-preserve --target` does. `GIT_DIR` points every git call, the script's and
- * the gate's, at the fixture.
+ * The `gh` stand-in is a repository that allows merge commits only: it refuses any other method,
+ * and composes the merge in the bare origin the way GitHub does -- the base and the head as
+ * parents, their merged tree, subject and body as the message -- and can be told to compose it
+ * wrongly. The `commitlore` stand-in validates nothing and pushes the notes ref on `sync`. `GIT_DIR`
+ * points every git call at the fixture.
  */
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { fakeGitHub } from "../helpers/fake-github-pulls.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
 
 const ROOT = process.cwd();
-const LIMIT = "Limit: the first half's record, which a squash strands mid-message";
-const WARN = "Warn: the second half's record, in the last paragraph";
+const LIMIT = "Limit: the first half's record";
+const WARN = "Warn: the second half's record";
 
 const IDENTITY = {
   GIT_AUTHOR_NAME: "fixture", GIT_AUTHOR_EMAIL: "fixture@example.invalid",
@@ -37,7 +33,7 @@ const git = (cwd: string, ...args: readonly string[]): string =>
   execFileSync("git", ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", ...args],
     { cwd, encoding: "utf8", timeout: 30_000, env: { ...process.env, ...IDENTITY, GIT_DIR: undefined, GIT_WORK_TREE: undefined } }).trim();
 
-/** As `gh`: the pull request, its one green run, the merge composed in the bare origin, and the REST read-back. */
+/** As `gh`: the pull request, its one green run, the base-to-head compare, a merge-commit-only merge composed in the bare origin, and the REST read-back. */
 const GH = String.raw`
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
@@ -52,26 +48,28 @@ const origin = (...a) => execFileSync("git", ["--git-dir", world.origin, ...a], 
 const state = fs.existsSync(world.state) ? JSON.parse(fs.readFileSync(world.state, "utf8")) : {};
 if (args[0] === "pr" && args[1] === "view") {
   process.stdout.write(JSON.stringify({ state: "OPEN", mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", title: "fixture",
-    baseRefOid: world.base, headRefOid: world.headRefOid ?? world.head, statusCheckRollup: [] }));
+    baseRefOid: world.baseRefOid ?? world.base, headRefOid: world.headRefOid ?? world.head, statusCheckRollup: [] }));
 } else if (args[0] === "run" && args[1] === "list") {
   process.stdout.write(JSON.stringify([{ databaseId: 1, attempt: 1, status: "completed", headSha: world.head }].filter((r) => r.headSha === flag("--commit"))));
 } else if (args[0] === "run" && args[1] === "view") {
   process.stdout.write(JSON.stringify({ jobs: [{ name: "verify", status: "completed", conclusion: "success" }] }));
 } else if (args[0] === "pr" && args[1] === "merge") {
+  if (!args.includes("--merge") || args.includes("--squash") || args.includes("--rebase")) {
+    process.stderr.write("Merge method not allowed on this repository: merge commits only\n"); process.exit(1);
+  }
   if (flag("--match-head-commit") !== world.head) { process.stderr.write("Head branch was modified\n"); process.exit(1); }
-  const body = fs.readFileSync(flag("--body-file"), "utf8");
-  fs.writeFileSync(world.sentBody, body);
-  let message = flag("--subject") + "\n\n" + body;
-  const named = "Merged-Head: " + world.head;
-  if (world.tamper === "drop-trailer") message = message.replace(named + "\n\n", "");
-  if (world.tamper === "other-head") message = message.replace(named, "Merged-Head: " + world.first);
-  if (world.tamper === "duplicate-trailer") message = message + "\n" + named + "\n";
-  fs.writeFileSync(world.composed, message);
-  const tree = origin("merge-tree", "--write-tree", "refs/heads/main", world.tamper === "tree" ? world.first : world.head).split("\n")[0];
-  const parents = world.tamper === "merge-commit" ? ["-p", "refs/heads/main", "-p", world.head] : ["-p", "refs/heads/main"];
-  const squash = origin("commit-tree", tree, ...parents, "-F", world.composed);
-  origin("update-ref", "refs/heads/main", squash);
-  fs.writeFileSync(world.state, JSON.stringify({ merged: squash }));
+  fs.writeFileSync(world.composed, flag("--subject") + "\n\n" + fs.readFileSync(flag("--body-file"), "utf8"));
+  const firstParent = world.tamper === "base" ? world.first : "refs/heads/main";
+  const tree = origin("merge-tree", "--write-tree", firstParent, world.tamper === "tree" ? world.first : world.head).split("\n")[0];
+  const parents = world.tamper === "squash" ? ["-p", firstParent] : ["-p", firstParent, "-p", world.head];
+  const merged = origin("commit-tree", tree, ...parents, "-F", world.composed);
+  origin("update-ref", "refs/heads/main", merged);
+  fs.writeFileSync(world.state, JSON.stringify({ merged }));
+} else if (args[0] === "api" && /\/compare\/[0-9a-f]+\.\.\.[0-9a-f]+$/.test(args[1])) {
+  const [base, head] = args[1].split("/compare/")[1].split("...");
+  let contained = true;
+  try { origin("merge-base", "--is-ancestor", base, head); } catch { contained = false; }
+  process.stdout.write(JSON.stringify({ status: contained ? "ahead" : "diverged" }));
 } else if (args[0] === "api" && args.includes("--include") && /\/pulls\/\d+$/.test(args[args.length - 1])) {
   const merged = state.merged !== undefined && world.apiMerged !== false;
   process.stdout.write("HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n" +
@@ -79,31 +77,26 @@ if (args[0] === "pr" && args[1] === "view") {
 } else process.exit(2);
 `;
 
-/** As `commitlore`: the draft is left alone; `--target` mirrors every branch record onto the merge as a note. */
+/** As `commitlore`: `validate` accepts; `sync` pushes the notes ref unless the world says it cannot. */
 const COMMITLORE = String.raw`
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const world = JSON.parse(fs.readFileSync(process.env.MERGE_WORLD, "utf8"));
 const args = process.argv.slice(2);
-const git = (a, input) => execFileSync("git", a, { encoding: "utf8", input, timeout: 30000 });
-if (args[0] === "squash-preserve" && args.includes("--target")) {
-  if (world.noNotes) { process.stdout.write("could not write the note\n"); process.exit(1); }
-  const lines = [];
-  for (const sha of git(["rev-list", "--reverse", args[1]]).split("\n").filter(Boolean)) {
-    const parsed = git(["interpret-trailers", "--parse"], git(["log", "-1", "--format=%B", sha]));
-    lines.push(...parsed.split("\n").filter((line) => /^(Limit|Warn):/.test(line)));
-  }
-  git(["notes", "--ref=commitlore", "add", "-f", "-m", lines.join("\n"), args[args.indexOf("--target") + 1]]);
-  process.stdout.write(lines.length + " record(s) mirrored\n");
-} else if (!["squash-preserve", "validate", "sync"].includes(args[0])) process.exit(2);
+if (args[0] === "sync") {
+  if (world.noSync) { process.stdout.write("the records for these commits are still only local\n"); process.exit(1); }
+  execFileSync("git", ["push", "--quiet", "origin", "refs/notes/commitlore"], { timeout: 30000 });
+} else if (args[0] !== "validate") process.exit(2);
 `;
 
 interface Options {
-  readonly tamper?: "drop-trailer" | "other-head" | "duplicate-trailer" | "tree" | "merge-commit";
-  readonly noNotes?: boolean;
+  readonly tamper?: "squash" | "base" | "tree";
+  readonly noSync?: boolean;
   readonly apiMerged?: boolean;
   readonly headRefOid?: string;
-  readonly body?: string;
+  readonly baseRefOid?: string;
+  /** The base gains a commit after the head's green run, so the head no longer contains the base tip. */
+  readonly advanceBase?: boolean;
 }
 
 const mergeWorld = (options: Options = {}) => {
@@ -126,19 +119,30 @@ const mergeWorld = (options: Options = {}) => {
   git(work, "add", "--all");
   git(work, "commit", "--quiet", "--no-verify", "-m", `feat: the second half\n\n${WARN}`);
   const head = git(work, "rev-parse", "HEAD");
+  git(work, "notes", "--ref=commitlore", "add", "-m", LIMIT, first);
   git(work, "push", "--quiet", "--no-verify", "origin", "main", "feature");
-
+  let baseRefOid = options.baseRefOid;
+  if (options.advanceBase) {
+    const other = join(dir, "other");
+    git(dir, "clone", "--quiet", "-b", "main", origin, other);
+    writeFileSync(join(other, "c.txt"), "the base moves on\n");
+    git(other, "add", "--all");
+    git(other, "commit", "--quiet", "--no-verify", "-m", "the base moves on");
+    git(other, "push", "--quiet", "--no-verify", "origin", "main");
+    baseRefOid = git(other, "rev-parse", "HEAD");
+  }
   const bin = join(dir, "bin");
   mkdirSync(bin);
   writeFileSync(join(bin, "gh"), `#!${process.execPath}\n${GH}`);
   writeFileSync(join(bin, "commitlore"), `#!${process.execPath}\n${COMMITLORE}`);
   chmodSync(join(bin, "gh"), 0o755);
   chmodSync(join(bin, "commitlore"), 0o755);
-  writeFileSync(join(dir, "body"), options.body ?? "Summary.\n");
-  const files = { log: join(dir, "gh.log"), state: join(dir, "state.json"), composed: join(dir, "composed"), sentBody: join(dir, "sent-body") };
+  writeFileSync(join(dir, "body"), "Summary.\n");
+  const files = { log: join(dir, "gh.log"), state: join(dir, "state.json"), composed: join(dir, "composed") };
   writeFileSync(join(dir, "world.json"), JSON.stringify({
     origin, base, first, head, number: 8, ...files,
-    tamper: options.tamper, noNotes: options.noNotes ?? false, apiMerged: options.apiMerged, headRefOid: options.headRefOid,
+    tamper: options.tamper, noSync: options.noSync ?? false, apiMerged: options.apiMerged,
+    headRefOid: options.headRefOid, baseRefOid,
   }));
   return { dir, origin, work, base, first, head, files };
 };
@@ -151,7 +155,7 @@ const merge = (w: MergeWorld, extra: readonly string[] = []) => {
   let status = 0;
   let stdout: string;
   try {
-    stdout = execFileSync(process.execPath, [join(ROOT, "scripts/merge-pr.mjs"), "8", "--subject", "feat: both halves (#8)",
+    stdout = execFileSync(process.execPath, [join(ROOT, "scripts/merge-pr.mjs"), "8", "--subject", "Merge pull request #8",
       "--body-file", join(w.dir, "body"), ...extra], {
       cwd: ROOT, encoding: "utf8", timeout: 120_000,
       env: { ...inherited, ...IDENTITY, PATH: `${join(w.dir, "bin")}:${process.env["PATH"] ?? ""}`, MERGE_WORLD: join(w.dir, "world.json"),
@@ -177,58 +181,45 @@ const expectLoud = (result: ReturnType<typeof merge>, fragment: string): void =>
   expect(result.status, result.stdout).toBe(1);
 };
 
-describe("a merge names the head it checked, and is read back", () => {
-  it("writes Merged-Head as the head CI was checked on, passes the same sha to --match-head-commit, and reads it back", () => {
+describe("a pull request merges as a merge commit, and is read back as one", () => {
+  it("asks GitHub for a merge commit of the checked head, and reads back its parents, tree, records and notes", () => {
     const w = mergeWorld();
     const result = merge(w);
     expect(result.status, result.stdout).toBe(0);
     expect(result.merges).toHaveLength(1);
-    expect(result.merges[0]).toEqual(expect.arrayContaining(["--match-head-commit", w.head]));
-    expect(readFileSync(w.files.sentBody, "utf8").startsWith(`Merged-Head: ${w.head}\n\nSummary.`)).toBe(true);
+    expect(result.merges[0]).toEqual(expect.arrayContaining(["--merge", "--match-head-commit", w.head]));
+    expect(result.merges[0]).not.toContain("--squash");
     const merged = result.merged ?? "";
-    const message = git(w.work, "--git-dir", w.origin, "log", "-1", "--format=%B", merged);
-    expect(message.split("\n").filter((line) => /merged-head/iu.test(line))).toEqual([`Merged-Head: ${w.head}`]);
-    expect(result.stdout).toContain(`read back ${merged.slice(0, 7)}: Merged-Head ${w.head.slice(0, 7)}`);
-    expect(result.stdout).toContain("2 record line(s) all reachable");
+    expect(git(w.work, "--git-dir", w.origin, "rev-list", "--parents", "-n", "1", merged).split(" ").slice(1)).toEqual([w.base, w.head]);
+    expect(readFileSync(w.files.composed, "utf8")).toBe("Merge pull request #8\n\nSummary.\n");
+    expect(git(w.work, "--git-dir", w.origin, "notes", "--ref=commitlore", "show", w.first)).toBe(LIMIT);
+    expect(result.stdout).toContain(`read back ${merged.slice(0, 7)}: parents ${w.base.slice(0, 7)} and ${w.head.slice(0, 7)}`);
+    expect(result.stdout).toContain("2 record line(s) kept on 2 branch commit(s), 1 note(s) on origin");
     expect(result.stdout).toContain(`RESULT: PASS — #8 merged at ${w.head.slice(0, 7)}.`);
-
-    // And the gate CI runs on `main` agrees, from GitHub's answer and the trailer alone.
-    const env = fakeGitHub(w.dir, { 8: { merged: true, mergeCommit: merged, head: w.first } });
-    const gate = execFileSync(process.execPath, [join(ROOT, "scripts/verify-merge-preserved-records.mjs"), `${w.base}..${merged}`],
-      { cwd: w.work, env, encoding: "utf8", timeout: 60_000 });
-    expect(gate).toContain(`#8  2 record line(s) on the branch, all reachable from ${merged.slice(0, 8)} (the branch read up to its merge-time head ${w.head.slice(0, 8)})`);
-    expect(gate).toContain("RESULT: PASS");
   });
 
-  it("fails loudly when the merge commit does not carry the trailer", () => {
-    expectLoud(merge(mergeWorld({ tamper: "drop-trailer" })), "carries no Merged-Head trailer");
+  it("fails loudly when GitHub made a single-parent commit rather than a merge commit", () => {
+    const w = mergeWorld({ tamper: "squash" });
+    const result = merge(w);
+    expectLoud(result, `${(result.merged ?? "").slice(0, 8)}'s parents are [${w.base.slice(0, 8)}], not the base and head checked`);
+    expect(result.stdout).toContain(`the head checked, ${w.head.slice(0, 8)}, is not an ancestor`);
   });
 
-  it("fails loudly when the trailer names another head", () => {
-    const w = mergeWorld({ tamper: "other-head" });
-    expectLoud(merge(w), `its Merged-Head is ${w.first.slice(0, 8)}, not the head checked, ${w.head.slice(0, 8)}`);
+  it("fails loudly when the merge landed on a base other than the one read before it", () => {
+    const w = mergeWorld({ tamper: "base" });
+    expectLoud(merge(w), `not the base and head checked, [${w.base.slice(0, 8)}, ${w.head.slice(0, 8)}]`);
   });
 
-  it("fails loudly when the merge commit carries the trailer twice", () => {
-    expectLoud(merge(mergeWorld({ tamper: "duplicate-trailer" })), "carries 2 duplicate Merged-Head trailers");
-  });
-
-  it("fails loudly when the merge commit's tree is not the checked head merged onto its parent", () => {
+  it("fails loudly when the merge commit's tree is not the checked head merged onto the base", () => {
     const w = mergeWorld({ tamper: "tree" });
-    expectLoud(merge(w), `is not ${w.head.slice(0, 8)} merged onto its parent ${w.base.slice(0, 8)}`);
+    expectLoud(merge(w), `is not ${w.head.slice(0, 8)} merged onto ${w.base.slice(0, 8)}`);
   });
 
-  it("fails loudly when GitHub made a merge commit rather than a squash", () => {
-    const w = mergeWorld({ tamper: "merge-commit" });
+  it("fails loudly when a branch commit's note did not reach origin", () => {
+    const w = mergeWorld({ noSync: true });
     const result = merge(w);
-    expectLoud(result, `${(result.merged ?? "").slice(0, 8)} has 2 parent(s), not the one a squash has`);
-  });
-
-  it("fails loudly when a branch record is reachable from the merge neither as a trailer nor in its note", () => {
-    const w = mergeWorld({ noNotes: true });
-    const result = merge(w);
-    expect(result.stdout).toContain("WARN  the note for");
-    expectLoud(result, `it does not keep ${w.first.slice(0, 8)}'s record line "${LIMIT}"`);
+    expect(result.stdout).toContain("WARN  `commitlore sync` failed");
+    expectLoud(result, `origin does not carry ${w.first.slice(0, 8)}'s CommitLore note`);
   });
 
   it("fails loudly when GitHub does not report the pull request merged", () => {
@@ -236,27 +227,34 @@ describe("a merge names the head it checked, and is read back", () => {
   });
 });
 
-describe("a merge whose message cannot name the checked head is refused before it exists", () => {
-  it("when the body already carries a Merged-Head line", () => {
-    const w = mergeWorld({ body: `Summary.\n\nMerged-Head: ${"c".repeat(40)}\n` });
-    const result = merge(w);
-    expect(result.merges, result.stdout).toEqual([]);
-    expect(result.stdout).toContain("the merge message carries 2 conflicting Merged-Head trailers");
-    expect(result.stdout).toContain("Refusing before it becomes history.");
-    expect(result.status).toBe(1);
-  });
-
+describe("a merge that cannot be read back is refused before it exists", () => {
   it("when GitHub's head is not one full sha", () => {
-    const w = mergeWorld({ headRefOid: "main" });
-    const result = merge(w);
+    const result = merge(mergeWorld({ headRefOid: "main" }));
     expect(result.merges, result.stdout).toEqual([]);
     expect(result.stdout).toContain("#8's head from GitHub is not one full commit sha (main).");
     expect(result.status).toBe(1);
   });
 
+  it("when GitHub's base is not one full sha", () => {
+    const result = merge(mergeWorld({ baseRefOid: "main" }));
+    expect(result.merges, result.stdout).toEqual([]);
+    expect(result.stdout).toContain("#8's base from GitHub is not one full commit sha (main).");
+    expect(result.status).toBe(1);
+  });
+
+  it("when the base gained a commit after the head's green run: the head does not contain it, so CI never checked the merge's tree", () => {
+    const w = mergeWorld({ advanceBase: true });
+    const result = merge(w);
+    expect(result.merges, result.stdout).toEqual([]);
+    expect(result.merged).toBeUndefined();
+    expect(result.stdout).toContain(`#8's head ${w.head.slice(0, 7)} does not contain the base`);
+    expect(result.stdout).toContain("Update the branch, re-run CI.");
+    expect(result.stdout).not.toContain("RESULT: PASS — #8 merged");
+    expect(result.status).toBe(1);
+  });
+
   it("and a dry run merges nothing", () => {
-    const w = mergeWorld();
-    const result = merge(w, ["--dry-run"]);
+    const result = merge(mergeWorld(), ["--dry-run"]);
     expect(result.merges, result.stdout).toEqual([]);
     expect(result.stdout).toContain("RESULT: PASS — checks only, nothing merged (--dry-run).");
     expect(result.status).toBe(0);
