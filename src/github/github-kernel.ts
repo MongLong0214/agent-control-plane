@@ -17,6 +17,7 @@ import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { CiCheck, CiEvidenceSource, VerificationReport } from "../verify/verification-engine.ts";
 import type { ReviewPacket } from "../review/blind-review.ts";
+import { METHOD_REVIEW_STALE, reviewedUnderCurrentMethod } from "../review/frontier-simplify-policy.ts";
 import type { CandidateSnapshot } from "../snapshot/candidate-snapshot.ts";
 import { EVIDENCE_PRODUCERS, OWNER_DECIDE_AGAIN_MESSAGE, ownerDecideAgainEvidence } from "../db/artifacts.ts";
 import {
@@ -1802,6 +1803,9 @@ export class GitHubKernel {
             : null,
         },
       );
+    }
+    if (!reviewedUnderCurrentMethod(review.content)) {
+      return deny(ReasonCode.EVIDENCE_STALE, METHOD_REVIEW_STALE, { runId: payload.runId, digest: payload.blindReviewDigest });
     }
 
     const humanGate = this.assertGatePayloadHumanGateStatus(payload);

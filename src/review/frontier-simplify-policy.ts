@@ -16,6 +16,17 @@ export const FRONTIER_SIMPLIFY_SOURCE = Object.freeze({
 });
 export type FrontierSimplifySource = { -readonly [K in keyof typeof FRONTIER_SIMPLIFY_SOURCE]: string };
 
+/**
+ * Whether a stored review packet records that its reviewers were given this method. A PASS that records
+ * none, or another source, predates the method's delivery check; CONFIRM, merge and activation read it as
+ * stale and the candidate needs a fresh review. The stored packet itself is never changed.
+ */
+export const METHOD_REVIEW_STALE = "the blind review does not record the current frontier-simplify method; the candidate needs a fresh review";
+export const reviewedUnderCurrentMethod = (packet: unknown): boolean => {
+  const methodology = (packet as { inputManifest?: { methodology?: Record<string, unknown> } } | null)?.inputManifest?.methodology;
+  return methodology != null && Object.entries(FRONTIER_SIMPLIFY_SOURCE).every(([key, value]) => methodology[key] === value);
+};
+
 // The shipped asset must be the vendored bytes: a missing or altered file stops every consumer at load
 // rather than handing any of them a different method under this source's name.
 const method = readFileSync(new URL("./frontier-simplify.md", import.meta.url), "utf8");

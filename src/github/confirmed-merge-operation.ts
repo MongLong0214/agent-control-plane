@@ -6,6 +6,7 @@ import { ArtifactKind, RunState } from "../domain/types.ts";
 import type { DaemonFinalizerAuthority } from "../guard/managed-write-guard.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ReviewPacket } from "../review/blind-review.ts";
+import { METHOD_REVIEW_STALE, reviewedUnderCurrentMethod } from "../review/frontier-simplify-policy.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { CandidateSnapshot } from "../snapshot/candidate-snapshot.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
@@ -154,6 +155,9 @@ export const deriveConfirmedMergePlan = (
       verification: Boolean(verification),
       review: Boolean(review),
     });
+  }
+  if (!reviewedUnderCurrentMethod(review.content)) {
+    return deny(ReasonCode.EVIDENCE_STALE, METHOD_REVIEW_STALE, { runId: input.runId, candidateSnapshotDigest: candidateDigest });
   }
   const manifest = ports.projects.manifest(run.pinnedManifestDigest);
   if (!manifest?.branchProfile) {
