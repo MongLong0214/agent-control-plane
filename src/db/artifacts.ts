@@ -770,6 +770,15 @@ const blindReviewEvidenceSchema = z
         ),
         reviewerPromptDigests: z.array(DIGEST_SCHEMA).min(1),
         reviewerInputRepresentations: z.array(z.string().min(1)).min(1),
+        // #1270 — the frontier-simplify source every reviewer input carried; a packet without it is no review.
+        methodology: z
+          .object({
+            repository: z.string().min(1),
+            revision: z.string().regex(/^[0-9a-f]{40}$/),
+            path: z.string().min(1),
+            digest: DIGEST_SCHEMA,
+          })
+          .strict(),
       })
       .strict(),
     coveredRepositories: z.array(z.string()),
