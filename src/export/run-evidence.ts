@@ -744,7 +744,10 @@ const exportArtifacts = (artifacts: readonly StoredArtifact[]): RunEvidenceExpor
     // and omit the whole content; new PLANs carry only a private-artifact reference.
     const legacyReviewBundle = artifact.kind === "PLAN"
       && asRecord(asRecord(artifact.content)?.["reviewEvidence"])?.["bundle"] !== undefined;
-    const reason = legacyReviewBundle ? "PRIVATE_BULK_CONTENT" : exclusionReason(artifact.content, {
+    // A review that read CEO-attached private evidence can re-quote it in its reviewer's text: omitted whole.
+    const privateEvidenceReview = artifact.kind === "BLIND_REVIEW"
+      && asRecord(asRecord(artifact.content)?.["inputManifest"])?.["reviewEvidence"] !== undefined;
+    const reason = legacyReviewBundle || privateEvidenceReview ? "PRIVATE_BULK_CONTENT" : exclusionReason(artifact.content, {
       required: !NON_EXPORTABLE_ARTIFACT_CONTENT.has(artifact.kind),
     });
     if (reason) {

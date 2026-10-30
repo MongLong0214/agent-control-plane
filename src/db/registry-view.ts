@@ -43,7 +43,7 @@ const reviewContextReferences = (context: unknown): unknown[] => [
  * normalized revisions or planned outputs). The artifact store refuses a candidate whose digest does not address it.
  */
 const candidateReferences = (snapshot: unknown): unknown[] =>
-  ["contractChange", "bootstrapPlan"].flatMap((key) => {
+  ["contractChange", "bootstrapPlan", "reviewEvidence"].flatMap((key) => {
     const binding = member(snapshot, key);
     return binding !== null && typeof binding === "object" ? Object.values(binding as Record<string, unknown>) : [];
   });

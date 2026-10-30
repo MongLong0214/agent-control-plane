@@ -10,6 +10,7 @@ import {
 } from "../bootstrap/bootstrap-plan.ts";
 import { collectBootstrapCeoDecisions, frozenBootstrapCeoDecisions } from "../bootstrap/bootstrap-ceo-decisions.ts";
 import { collectBootstrapReviewEvidence } from "../bootstrap/bootstrap-review-evidence.ts";
+import { collectStandardReviewEvidence } from "../review/standard-review-evidence.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
@@ -19,7 +20,7 @@ import type { VerificationCommand } from "../contracts/verification-command.ts";
 import { EVIDENCE_PRODUCERS, type ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { ArtifactKind, type RunRow, RunState } from "../domain/types.ts";
+import { ArtifactKind, RunKind, type RunRow, RunState } from "../domain/types.ts";
 import { requiredBaseFor, sourceProbeBranchesFor } from "../github/branch-contract.ts";
 import { currentBranch, mergeBase, revParse, tryRevParse } from "../git/git.ts";
 import { MessageKind } from "../outbox/envelope.ts";
@@ -36,6 +37,7 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
 import {
   type CandidateSnapshot,
   type SnapshotRepositoryInput,
+  type SnapshotReviewEvidence,
   buildCandidateSnapshot,
   buildNoRepositoryCandidateSnapshot,
   candidateSnapshotDigest,
@@ -391,6 +393,14 @@ export class CandidatePipeline {
       ? undefined
       : readCanonicalCtoIdentity(this.db, run.projectId);
 
+    // A STANDARD_WORK candidate is frozen with the review evidence the CEO has bound now, digests only
+    // (review/standard-review-evidence.ts). A selection that cannot be read back intact refuses the freeze.
+    let reviewEvidence: SnapshotReviewEvidence | null = null;
+    if (run.kind === RunKind.STANDARD_WORK && participants.length > 0) {
+      try { reviewEvidence = collectStandardReviewEvidence({ artifacts: this.artifacts, audit: this.audit, runs: this.runs }, runId); }
+      catch { return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "attached review evidence cannot be frozen", { runId }); }
+    }
+
     const snapshot = participants.length === 0
       ? buildNoRepositoryCandidateSnapshot(
           {
@@ -409,6 +419,7 @@ export class CandidatePipeline {
             repositories,
             ...(contractChange === undefined ? {} : { contractChange }),
             ...(canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity }),
+            ...(reviewEvidence === null ? {} : { reviewEvidence }),
           },
           this.clock,
         );

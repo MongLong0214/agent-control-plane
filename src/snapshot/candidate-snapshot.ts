@@ -201,6 +201,21 @@ export const snapshotCanonicalCtoIdentitySchema = z
 
 export type SnapshotCanonicalCtoIdentity = z.infer<typeof snapshotCanonicalCtoIdentitySchema>;
 
+const SNAPSHOT_DIGEST = z.string().regex(/^sha256:[0-9a-f]{64}$/);
+/**
+ * The private review evidence a STANDARD_WORK candidate was frozen with (review/standard-review-evidence.ts):
+ * digests only. The bundle's bytes stay in the run's private HANDOFF artifacts.
+ */
+export const snapshotReviewEvidenceSchema = z
+  .object({
+    digest: SNAPSHOT_DIGEST,
+    bundleSha256: SNAPSHOT_DIGEST,
+    candidateDigest: SNAPSHOT_DIGEST,
+    attachmentDigest: SNAPSHOT_DIGEST,
+  })
+  .strict();
+export type SnapshotReviewEvidence = z.infer<typeof snapshotReviewEvidenceSchema>;
+
 export const candidateSnapshotSchema = z
   .object({
     schema: z.literal(CANDIDATE_SNAPSHOT_SCHEMA_ID),
@@ -217,10 +232,19 @@ export const candidateSnapshotSchema = z
     contractChange: snapshotContractChangeSchema.optional(),
     /** Present only on a CONTRACT_CHANGE candidate of a project; every other snapshot omits the key. */
     canonicalCtoIdentity: snapshotCanonicalCtoIdentitySchema.optional(),
+    /** Present only on a STANDARD_WORK candidate frozen with CEO-attached review evidence. */
+    reviewEvidence: snapshotReviewEvidenceSchema.optional(),
     createdAt: z.string().min(1),
   })
   .strict()
   .superRefine((snapshot, ctx) => {
+    if (snapshot.reviewEvidence !== undefined && (snapshot.bootstrapPlan !== undefined || snapshot.contractChange !== undefined)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "only a STANDARD_WORK candidate carries review evidence",
+        path: ["reviewEvidence"],
+      });
+    }
     if (snapshot.bootstrapPlan !== undefined && snapshot.contractChange !== undefined) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -382,6 +406,7 @@ export const buildCandidateSnapshot = async (
     repositories: readonly SnapshotRepositoryInput[];
     contractChange?: SnapshotContractChange;
     canonicalCtoIdentity?: SnapshotCanonicalCtoIdentity;
+    reviewEvidence?: SnapshotReviewEvidence;
   },
   clock: Clock,
 ): Promise<CandidateSnapshot> => {
@@ -440,6 +465,7 @@ export const buildCandidateSnapshot = async (
     repositories,
     ...(params.contractChange === undefined ? {} : { contractChange: params.contractChange }),
     ...(params.canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity: params.canonicalCtoIdentity }),
+    ...(params.reviewEvidence === undefined ? {} : { reviewEvidence: params.reviewEvidence }),
     createdAt: clock.nowIso(),
   });
 };

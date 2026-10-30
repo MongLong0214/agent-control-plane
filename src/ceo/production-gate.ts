@@ -55,6 +55,7 @@ import type { VerificationReport } from "../verify/verification-engine.ts";
 import { currentVerdictPasses, currentVerificationResults } from "../verify/verification-history.ts";
 import type { ContinuityGate } from "../run/run-engine.ts";
 import { residentBaseClone } from "../registry/resident-repositories.ts";
+import { standardReviewEvidenceCurrent } from "../review/standard-review-evidence.ts";
 import {
   candidateSnapshotDigest,
   candidateSnapshotSchema,
@@ -976,6 +977,15 @@ export class ProductionGate {
           reviewDigest: packet.content.blindReview.digest,
         });
       }
+    }
+
+    // A STANDARD_WORK candidate's review and approval rest on the private review evidence it was frozen
+    // with: evidence the CEO attached or replaced since leaves them stale for CONFIRM.
+    if (input.decision === "CONFIRM" && run.kind === RunKind.STANDARD_WORK) {
+      const frozen = this.artifacts.latestForSnapshot<CandidateSnapshot>(input.runId, ArtifactKind.CANDIDATE_SNAPSHOT, input.candidateSnapshotDigest);
+      const current = standardReviewEvidenceCurrent({ artifacts: this.artifacts, audit: this.audit, runs: this.runs },
+        { runId: input.runId, reviewEvidence: frozen?.content.reviewEvidence });
+      if (!current.allowed) return current as Decision<{ isBootstrap: boolean }>;
     }
 
     // The decision is an exercise of the CEO role, so the session must currently hold it.

@@ -388,11 +388,20 @@ const reviewPacketSchema = z
     methodFindings: z
       .array(z.object({ category: z.literal("method"), severity: z.string(), summary: z.string(), detail: z.string() }).passthrough())
       .default([]),
+    inputManifest: z.object({ reviewEvidence: z.unknown().optional() }).passthrough().optional(),
   })
   .passthrough();
 
 /** A stored review the gate wrote, read for its method findings. */
 type BoundReview = { artifactId: string; packet: z.output<typeof reviewPacketSchema> };
+
+/**
+ * A review whose reviewer read CEO-attached private evidence (review/standard-review-evidence.ts) can
+ * re-quote it in any text it returns: its method findings keep no reviewer text and are held, never sent
+ * by the reporter. A public-safe note about one goes upstream only through a separately approved path.
+ */
+const readPrivateEvidence = (review: BoundReview): boolean => review.packet.inputManifest?.reviewEvidence !== undefined;
+const PRIVATE_EVIDENCE_WITHHELD = "Withheld: this review read private evidence, so the reviewer's text stays in the stored review only.";
 
 const FRONTIER_SIMPLIFY_REVISION = FRONTIER_SIMPLIFY_DIGEST.replace(/^sha256:/, "").slice(0, 12);
 
@@ -511,6 +520,11 @@ export class DogfoodFindingStore {
     if (bound.value.packet.methodFindings[review.findingIndex] === undefined) {
       return this.#unbound(review.runId, review.artifactId, "the review has no method finding at that index") as Decision<never>;
     }
+    if (readPrivateEvidence(bound.value)) {
+      return deny(ReasonCode.CONFLICT, "the review read private evidence; its method findings stay held and are not linked or sent", {
+        runId: review.runId, artifactId: review.artifactId,
+      });
+    }
     const own = this.#methodFindingInput(bound.value, review.findingIndex);
     const { product: _product, signature, expected, productRevision, related: _related, ...shared } = own;
     let halves: [DogfoodFindingInput, DogfoodFindingInput];
@@ -582,16 +596,21 @@ export class DogfoodFindingStore {
   }
 
   #methodFindingInput(review: BoundReview, findingIndex: number): DogfoodFindingInput {
-    return reviewMethodFinding(review.packet.methodFindings[findingIndex]!, `blind review ${review.artifactId}, method finding ${findingIndex}`);
+    const finding = reviewMethodFinding(review.packet.methodFindings[findingIndex]!, `blind review ${review.artifactId}, method finding ${findingIndex}`);
+    if (!readPrivateEvidence(review)) return finding;
+    // The signature is a digest of the reviewer's summary, never its text; every free-text field is withheld.
+    return { ...finding, title: "frontier-simplify method finding (withheld: private review evidence)", problem: PRIVATE_EVIDENCE_WITHHELD,
+      actual: PRIVATE_EVIDENCE_WITHHELD };
   }
 
   #storeMethodFinding(review: BoundReview, findingIndex: number): Decision<DogfoodRecord> {
     const input = dogfoodFindingSchema.safeParse(this.#methodFindingInput(review, findingIndex));
     if (!input.success) return deny(ReasonCode.INVALID_ARGUMENT, "the method finding is not a dogfood finding this store records", {});
-    return this.#store(input.data, this.#binding(review, findingIndex), { runId: review.packet.runId, actor: "blind-review-gate" });
+    return this.#store(input.data, this.#binding(review, findingIndex), { runId: review.packet.runId, actor: "blind-review-gate" },
+      readPrivateEvidence(review) ? "NOT_PUBLIC_SAFE" : null);
   }
 
-  #store(finding: DogfoodFinding, binding: ReviewBinding | null, origin: DogfoodOrigin): Decision<DogfoodRecord> {
+  #store(finding: DogfoodFinding, binding: ReviewBinding | null, origin: DogfoodOrigin, hold: NotReportedReason | null = null): Decision<DogfoodRecord> {
     try {
       const key = findingKey(finding);
       const { payload, unsafe } = publicPayload(finding);
@@ -611,7 +630,7 @@ export class DogfoodFindingStore {
       return this.#deps.db.tx(() => {
         const existing = this.get(id);
         const now = this.#clock.nowIso();
-        const reason = triage(finding, unsafe);
+        const reason = hold ?? triage(finding, unsafe);
         if (existing !== null) {
           // A cause established since (undetermined, then product) releases what was kept back for its cause.
           const held = existing.state.status === "NOT_REPORTED" && existing.state.reason !== "NOT_PUBLIC_SAFE";
