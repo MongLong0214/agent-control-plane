@@ -8,7 +8,7 @@ import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { Role, RunState } from "../domain/types.ts";
+import { Role, RunState, roleKeyFor } from "../domain/types.ts";
 import { type WorkspaceProbe, isWithin } from "./workspace-probe.ts";
 
 /**
@@ -1888,7 +1888,7 @@ export class ManagedWriteGuard {
           AND (run_id = ?
                OR task_id IN (SELECT task_id FROM tasks WHERE run_id = ?)
                OR (role = 'PRIMARY_CTO' AND project_id IS NOT NULL AND project_id = ?))`,
-      [request.sessionId, run.run_id, run.run_id, run.project_id],
+      [request.sessionId, run.run_id, run.run_id, run.project_id ?? this.adoptedManifestScope(run, request)],
     );
 
     if (bindings.length === 0) {
@@ -1943,6 +1943,18 @@ export class ManagedWriteGuard {
       role: matching.role,
       generation: matching.binding_generation,
     });
+  }
+
+  /**
+   * A project-less PROJECT_BOOTSTRAP run created with the explicit canonical-CTO adoption is owned by
+   * that project's PRIMARY_CTO, not by a run-scoped role, so its one project-natured write — the
+   * manifest of the adopted project, at activation — is scoped by the owner pin itself: a MANIFEST_CHANGE
+   * naming exactly the project whose PRIMARY_CTO the run is pinned to (and the caller fenced above as
+   * that pin's current binding). Null, the scope every other project-less run has, otherwise.
+   */
+  private adoptedManifestScope(run: RunAuthRow, request: GuardRequest): string | null {
+    if (request.operation !== WriteOperation.MANIFEST_CHANGE || !request.projectId) return null;
+    return run.owner_role_key === roleKeyFor(Role.PRIMARY_CTO, { projectId: request.projectId }) ? request.projectId : null;
   }
 
   private authorizeManifestProject(run: RunAuthRow, projectId: string): Decision<void> {

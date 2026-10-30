@@ -55,6 +55,8 @@ import {
   type RepoFactoryPlanFixture,
 } from "./repo-factory-producer.ts";
 import { type ExternalWriteReceipt, parseRepoFactoryResult, type RepoFactoryResult } from "./repo-factory-result.ts";
+import type { CanonicalCtoBootstrapAdoptions } from "./canonical-cto-bootstrap-adoption.ts";
+import { type CanonicalCtoBootstrapAdoption, recordedBootstrapAdoption } from "./bootstrap-adoption-input.ts";
 
 /** GitHub write scope recorded in the recovery ledger. */
 export const REPO_FACTORY_GITHUB_WRITE_OPERATION = "repo_factory_github_write";
@@ -175,6 +177,11 @@ export interface RepoFactoryBootstrapRunnerDeps {
    * refused before anything is consumed or written, and one that prefers it or turns it off is unaffected.
    */
   commitlore?: CommitLorePort | null;
+  /**
+   * The explicit canonical-CTO adoption's validator. A run created with the adoption is refused before
+   * anything is consumed or written when this is absent; it never falls back to a resident.
+   */
+  adoptions?: Pick<CanonicalCtoBootstrapAdoptions, "recorded" | "validate" | "pinHolds" | "targetHolds"> | null;
 }
 
 type Stage = "precondition" | "approval" | "production" | "activation";
@@ -430,8 +437,12 @@ export class RepoFactoryBootstrapRunner {
       if (!ready.allowed) return ready;
     }
     if (this.deps.bootstrap.residentGenesisRequired && !current.value.outputs.genesis) return deny(ReasonCode.INVALID_ARGUMENT,"bootstrap requires an inline genesis bundle and resident CTO",{});
+    // A bootstrap created with the explicit canonical-CTO adoption records no resident provisioning
+    // intent: its PRIMARY_CTO is the adopted conversation, so nothing here may launch one, now or on a
+    // daemon resume. Its own checks run in `apply`, before anything is consumed or written.
+    const adopting = this.adoptionOf(confirmation.runId) !== null;
     if (current.value.outputs.genesis) {
-      if (!this.deps.residentProjects?.configured()) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"resident host provisioner/subscriber is not configured",{});
+      if (!adopting && !this.deps.residentProjects?.configured()) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"resident host provisioner/subscriber is not configured",{});
       const reviewed = this.deps.bootstrap.reviewForConfirmation(confirmation.runId,confirmation.candidateSnapshotDigest);
       if (!reviewed.allowed) return reviewed as Decision<ACPBootstrapActivationResult>;
     }
@@ -442,7 +453,7 @@ export class RepoFactoryBootstrapRunner {
       approvedManifest: scope.value.approvedManifest,
       projectName: scope.value.projectName,
       handoff: current.value.outputs.handoff,
-      ...(current.value.outputs.genesis ? {rememberConfirmation: (): Decision<void> => {
+      ...(current.value.outputs.genesis && !adopting ? {rememberConfirmation: (): Decision<void> => {
         try {this.deps.residentProjects?.remember(confirmation,projectId,binding);return allow(ReasonCode.OK,undefined);}
         catch {return deny(ReasonCode.CONFLICT,"confirmed provisioning intent conflicts with stored tuple",{});}
       }} : {}),
@@ -561,6 +572,14 @@ export class RepoFactoryBootstrapRunner {
     // #246 C3 — the run's owner pin is its ACTIVE BOOTSTRAP_CTO, and the CONFIRM is the CEO's.
     const pinned = this.assertOwnerPin(run);
     if (!pinned.allowed) return atStage(pinned as Decision<ACPBootstrapActivationResult>, "precondition");
+    // An adopting bootstrap's target, asked in full before the approval is consumed or GitHub is read:
+    // the adopted CTO is still the live, authenticated, entitled holder at the adopted generation, and
+    // the manifest names its own manifest-less project with no other repository bound.
+    const adoption = this.adoptionOf(runId);
+    if (adoption) {
+      const adopted = this.adoptionTargetHolds(adoption, input.approvedManifest, outputs.target.repositoryIdentity);
+      if (!adopted.allowed) return atStage(adopted as Decision<ACPBootstrapActivationResult>, "precondition");
+    }
     const ceo = this.deps.ceo.assertCeoDecisionAdmissible({
       runId,
       decision: "CONFIRM",
@@ -648,7 +667,7 @@ export class RepoFactoryBootstrapRunner {
         );
       }
     }
-    const held = this.reservationConflicts(reservation, existing);
+    const held = this.reservationConflicts(reservation, existing, adoption);
     if (!held.allowed) return held as Decision<ACPBootstrapActivationResult>;
 
     // Review 1076-R1-04 — what was admitted above is admitted again, synchronously, wherever it is
@@ -718,7 +737,7 @@ export class RepoFactoryBootstrapRunner {
       const reserved = this.deps.db.txDecision(() => {
         const applicable = authorityHolds();
         if (!applicable.allowed) return applicable as Decision<BootstrapApplication>;
-        const fresh = this.reservationConflicts(reservation, null);
+        const fresh = this.reservationConflicts(reservation, null, adoption);
         if (!fresh.allowed) return fresh as Decision<BootstrapApplication>;
         const remembered = remember();
         if (!remembered.allowed) return remembered as Decision<BootstrapApplication>;
@@ -1365,8 +1384,44 @@ export class RepoFactoryBootstrapRunner {
     });
   }
 
-  /** #246 C3 — the run's owner pin is its ACTIVE BOOTSTRAP_CTO, at the pinned generation. */
+  /**
+   * The adoption a run was created with, or null. A run with one and no validator attached is answered
+   * as adopting, so its doors refuse rather than treat it as a default bootstrap.
+   */
+  private adoptionOf(runId: string): CanonicalCtoBootstrapAdoption | null {
+    return this.deps.adoptions?.recorded(runId) ?? recordedBootstrapAdoption(this.deps.db, runId);
+  }
+
+  /** The adopted CTO and its project, in full (process included), for the runner's pre-write checks. */
+  private adoptionTargetHolds(adoption: CanonicalCtoBootstrapAdoption, manifest: ProjectManifest, repositoryIdentity: string): Decision<void> {
+    const adoptions = this.deps.adoptions;
+    if (!adoptions) {
+      return deny(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE, "no canonical CTO adoption validator is configured; an adopting bootstrap writes nothing", {
+        refusal: "ADOPTION_UNAVAILABLE",
+      });
+    }
+    const validated = adoptions.validate(adoption);
+    if (!validated.allowed) return validated as Decision<void>;
+    return adoptions.targetHolds(adoption, {
+      manifestProjectId: manifest.projectId,
+      approvedManifestDigest: manifestDigest(manifest),
+      repositoryIdentity,
+    });
+  }
+
+  /**
+   * #246 C3 — the run's owner pin is its ACTIVE BOOTSTRAP_CTO, at the pinned generation; for a run
+   * created with the canonical-CTO adoption, exactly the adopted PRIMARY_CTO binding at its generation.
+   */
   private assertOwnerPin(run: RunRow): Decision<void> {
+    const adoption = this.adoptionOf(run.runId);
+    if (adoption) {
+      if (!this.deps.adoptions) {
+        return deny(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE, "no canonical CTO adoption validator is configured", { refusal: "ADOPTION_UNAVAILABLE", runId: run.runId });
+      }
+      const pinned = this.deps.adoptions.pinHolds(run, adoption);
+      return pinned.allowed ? allow(ReasonCode.OK, undefined) : (pinned as Decision<void>);
+    }
     const roleKey = roleKeyFor(Role.BOOTSTRAP_CTO, { runId: run.runId });
     if (run.ownerSessionId === null || run.ownerBindingGeneration === null || run.ownerRoleKey !== roleKey) {
       return deny(ReasonCode.RUN_OWNER_NOT_PINNED, "the bootstrap run's owner is not pinned to its BOOTSTRAP_CTO", {
@@ -1404,6 +1459,7 @@ export class RepoFactoryBootstrapRunner {
   private reservationConflicts(
     reservation: BootstrapApplicationReservation,
     existing: BootstrapApplication | null,
+    adoption: CanonicalCtoBootstrapAdoption | null = null,
   ): Decision<void> {
     const { runId, projectId, repositoryIdentity } = reservation;
     const others = this.deps.applications.heldByOthers(runId, { projectId, repositoryIdentity });
@@ -1422,7 +1478,10 @@ export class RepoFactoryBootstrapRunner {
       );
     }
     const ownActivation = existing?.phase === "WRITTEN";
-    if (this.deps.projects.get(projectId) !== null && !ownActivation) {
+    // An adopting bootstrap reserves its CTO's own registered project, which `adoptionTargetHolds`
+    // showed manifest-less; any other registered project is refused as before.
+    const adoptedProject = adoption !== null && adoption.projectId === projectId && this.deps.projects.get(projectId)?.activeManifestDigest === null;
+    if (this.deps.projects.get(projectId) !== null && !ownActivation && !adoptedProject) {
       return deny(ReasonCode.PROJECT_EXISTS, "the project the manifest names is already registered", {
         stage: "precondition",
         refusal: "PROJECT_EXISTS",

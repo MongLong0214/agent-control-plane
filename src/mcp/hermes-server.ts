@@ -591,6 +591,11 @@ const createHermesServerFromPort = (
           repositoryId: z.string(), repositoryRole: z.string().default("primary"),
           baseBranch: z.string(), mergeOrder: z.number().int().optional(),
         })).default([]),
+        // PROJECT_BOOTSTRAP only: the exact canonical CTO (project, ACP session, binding generation) that
+        // owns the run instead of a spawned BOOTSTRAP_CTO. Validated before anything is stored.
+        adoptCanonicalCto: z.object({
+          projectId: z.string().min(1), sessionId: z.string().min(1), bindingGeneration: z.number().int().positive(),
+        }).strict().optional(),
       },
     },
     async (args, extra) => write("run_create", args, extra, () => respond(port.createRun({
@@ -600,6 +605,7 @@ const createHermesServerFromPort = (
       contract: args.contract,
       repositories: args.repositories,
       hermesTurn: admittedTurnOf(extra),
+      ...(args.adoptCanonicalCto ? { adoptCanonicalCto: args.adoptCanonicalCto } : {}),
     }))),
   );
 
