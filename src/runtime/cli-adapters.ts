@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import {
   accessSync,
+  chmodSync,
   constants,
   existsSync,
   lstatSync,
@@ -2955,6 +2956,7 @@ const turnScratchListing = (root: string): TurnScratchListing => {
   const paths: string[] = [];
   let bytes = 0;
   let visited = 0;
+  let unread = false;
   const pending = [""];
   while (pending.length > 0 && visited < TURN_SCRATCH_WALK_LIMIT) {
     const directory = pending.pop()!;
@@ -2962,6 +2964,7 @@ const turnScratchListing = (root: string): TurnScratchListing => {
     try {
       entries = readdirSync(join(root, directory));
     } catch {
+      unread = true;
       continue;
     }
     for (const name of entries) {
@@ -2986,8 +2989,56 @@ const turnScratchListing = (root: string): TurnScratchListing => {
     files: paths.length,
     bytes,
     paths: paths.slice(0, TURN_SCRATCH_PATHS),
-    complete: pending.length === 0 && visited < TURN_SCRATCH_WALK_LIMIT,
+    complete: !unread && pending.length === 0 && visited < TURN_SCRATCH_WALK_LIMIT,
   };
+};
+
+const errorCode = (error: unknown): string =>
+  typeof (error as NodeJS.ErrnoException | null)?.code === "string" ? (error as NodeJS.ErrnoException).code! : "UNKNOWN";
+
+/**
+ * Gives the owner read, write and search on `root` and everything under it, so it can be removed.
+ * A symbolic link is never followed or changed; nothing outside `root` is touched. Bounded like the
+ * listing; a failure on one entry leaves the rest to the removal.
+ */
+const restoreOwnerAccess = (root: string): void => {
+  let visited = 0;
+  const pending = [""];
+  while (pending.length > 0 && visited < TURN_SCRATCH_WALK_LIMIT) {
+    const relative = pending.pop()!;
+    const path = relative === "" ? root : join(root, relative);
+    visited += 1;
+    try {
+      const entry = lstatSync(path);
+      if (entry.isSymbolicLink()) continue;
+      chmodSync(path, (entry.mode & 0o7777) | 0o700);
+      if (entry.isDirectory()) {
+        for (const name of readdirSync(path)) pending.push(relative === "" ? name : `${relative}/${name}`);
+      }
+    } catch {
+      // Left to the removal, which reports what remains.
+    }
+  }
+};
+
+/**
+ * Removes a turn's scratch. A failed removal never replaces the turn's outcome: it is retried once
+ * with owner access restored inside the scratch, and the result is a note — the path, the error code
+ * and whether the directory was left — never its contents. Undefined when the first removal worked.
+ */
+const removeTurnScratch = (root: string): TurnScratchListing["cleanup"] => {
+  try {
+    rmSync(root, { recursive: true, force: true });
+    return undefined;
+  } catch (first) {
+    restoreOwnerAccess(root);
+    try {
+      rmSync(root, { recursive: true, force: true });
+      return { path: root, code: errorCode(first), left: false };
+    } catch (second) {
+      return { path: root, code: errorCode(second), left: true };
+    }
+  }
 };
 
 /**
@@ -3189,14 +3240,18 @@ export class CodexCliAdapter implements ProviderAdapter {
     const turnTemp = realpathSync(acpScratchDir("acp-codex-turn-"));
     // Listed on every exit path once the invocation has ended, before the directory is removed: with
     // the result, a broker refusal and a timeout included, or with the error the invocation threw.
+    // The removal cannot replace either; a failed one is noted on the listing.
+    let outcome: { result: InvocationResult } | { thrown: unknown };
     try {
-      const result = await this.invokeExec(request, started, turnTemp);
-      return { ...result, turnScratch: turnScratchListing(turnTemp) };
+      outcome = { result: await this.invokeExec(request, started, turnTemp) };
     } catch (error) {
-      throw new TurnScratchThrown(error, turnScratchListing(turnTemp));
-    } finally {
-      rmSync(turnTemp, { recursive: true, force: true });
+      outcome = { thrown: error };
     }
+    const listing = turnScratchListing(turnTemp);
+    const cleanup = removeTurnScratch(turnTemp);
+    const turnScratch = cleanup === undefined ? listing : { ...listing, cleanup };
+    if ("thrown" in outcome) throw new TurnScratchThrown(outcome.thrown, turnScratch);
+    return { ...outcome.result, turnScratch };
   }
 
   private async invokeExec(request: InvocationRequest, started: number, turnTemp: string | undefined): Promise<InvocationResult> {

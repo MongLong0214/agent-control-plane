@@ -326,8 +326,13 @@ export interface TurnScratchListing {
   files: number;
   bytes: number;
   paths: string[];
-  /** False when the walk stopped at its entry limit, so the counts are a lower bound. */
+  /** False when the walk stopped at its entry limit or could not read a directory: the counts are a lower bound. */
   complete: boolean;
+  /**
+   * Present only when removing the directory failed: its path, the error code, and whether it was
+   * left behind after a second attempt with its owner permissions restored.
+   */
+  cleanup?: { path: string; code: string; left: boolean };
 }
 
 /** A GPT worker turn's invocation threw: the error it threw, and what the turn left in its scratch. */

@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
@@ -25,16 +25,27 @@ afterAll(cleanupTempDirs);
 
 const STUB = String.raw`
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const here = dirname(process.argv[1]);
 const fixture = (name) => readFileSync(join(here, name), "utf8").trim();
-if (fixture("mode") === "revoke" || fixture("mode") === "throw") {
+const mode = fixture("mode");
+if (mode !== "ok" && mode !== "fail") {
   // Leaves a file in the scratch, lets the test revoke the worker's binding when asked to, then fails.
-  writeFileSync(join(process.env.TMPDIR, "cache-evidence.txt"), "written before the binding was revoked\n");
+  // "chmod" leaves the scratch unremovable until its permissions are restored; "uchg" leaves it
+  // unremovable for good, with an immutable file inside.
+  const evidence = join(process.env.TMPDIR, "cache-evidence.txt");
+  writeFileSync(evidence, "written before the turn ended\n");
   writeFileSync(join(here, "tmpdir"), process.env.TMPDIR);
   writeFileSync(join(here, "ready"), "");
+  if (mode === "uchg") spawnSync("/usr/bin/chflags", ["uchg", evidence], { timeout: 5000 });
+  if (mode.startsWith("chmod")) {
+    // A link out of the scratch, to a directory whose permissions the cleanup must not change.
+    mkdirSync(join(here, "outside"), { mode: 0o500 });
+    symlinkSync(join(here, "outside"), join(process.env.TMPDIR, "outside-link"));
+    chmodSync(process.env.TMPDIR, 0o500);
+  }
   const until = Date.now() + 20000;
   while (fixture("mode") === "revoke" && !existsSync(join(here, "revoked")) && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
   process.exit(1);
@@ -108,7 +119,7 @@ if (status.status === compile.constants.compileCacheStatus.FAILED || status.dire
 }
 `;
 
-type Mode = "ok" | "fail" | "revoke" | "throw";
+type Mode = "ok" | "fail" | "revoke" | "throw" | "chmod" | "chmod-throw" | "uchg";
 
 const stubCodex = (root: string, mode: Mode, sibling: string, slashTmp: string): string => {
   const binary = join(root, "codex");
@@ -150,7 +161,7 @@ const runTurn = async (mode: Mode) => {
     clock: core.clock,
     capacityFile: join(root, "capacity.json"),
     binary: stubCodex(root, mode, sibling, slashTmp),
-    managedWriteBroker: mode === "throw"
+    managedWriteBroker: mode === "throw" || mode === "chmod-throw"
       ? {
         authorize: async (write, effect) => {
           await world.broker.authorize(write, effect);
@@ -217,7 +228,8 @@ const runTurn = async (mode: Mode) => {
       described,
       stub,
       answers,
-      revokedScratch: mode === "revoke" || mode === "throw" ? readFileSync(join(root, "tmpdir"), "utf8") : null,
+      root,
+      revokedScratch: existsSync(join(root, "tmpdir")) ? readFileSync(join(root, "tmpdir"), "utf8") : null,
       sibling,
       slashTmpWritten: existsSync(slashTmp),
       checkout: gitSync(world.repoPath, ["status", "--porcelain", "--ignored", "--untracked-files=all"]),
@@ -330,5 +342,62 @@ describe("a gpt worker turn has a private scratch outside the checkout", () => {
     expect(failed[0]!.evidence["error"]).toBe("the broker failed after the turn ran");
     expect((failed[0]!.evidence["turnScratch"] as { paths: string[] } | undefined)?.paths).toContain("cache-evidence.txt");
     expect(existsSync(turn.revokedScratch!)).toBe(false);
+  });
+});
+
+interface RecordedCleanup { paths: string[]; cleanup?: { path: string; code: string; left: boolean } }
+
+/** The failure event's scratch record: what the turn wrote, and the note its failed removal left. */
+const failureScratch = (turn: Turn): RecordedCleanup => {
+  const failed = turn.world.audit.byKind("TASK_WORKER_TURN_FAILED");
+  expect(failed, turn.described).toHaveLength(1);
+  return failed[0]!.evidence["turnScratch"] as RecordedCleanup;
+};
+
+describe("a scratch that cannot be removed never replaces the turn's outcome", () => {
+  it("keeps a returned result, notes the failed removal, and removes the scratch once its permissions are restored", async () => {
+    const turn = await runTurn("chmod");
+    rmSync(turn.sibling, { recursive: true, force: true });
+    expect(turn.execution.status, turn.described).toBe("FAILED");
+    expect(turn.answers).toHaveLength(1);
+    expect(turn.answers[0]!.exitCode).toBe(1);
+    expect(turn.answers[0]!.error ?? "").not.toContain("EACCES");
+    const recorded = failureScratch(turn);
+    expect(recorded.paths).toContain("cache-evidence.txt");
+    expect(recorded.cleanup).toEqual({ path: turn.revokedScratch, code: "EACCES", left: false });
+    expect(turn.answers[0]!.turnScratch?.cleanup).toEqual(recorded.cleanup);
+    expect(existsSync(turn.revokedScratch!)).toBe(false);
+    expect(statSync(join(turn.root, "outside")).mode & 0o777).toBe(0o500);
+  });
+
+  it("keeps the thrown error, notes the failed removal, and removes the scratch once its permissions are restored", async () => {
+    const turn = await runTurn("chmod-throw");
+    rmSync(turn.sibling, { recursive: true, force: true });
+    expect(turn.execution.status, turn.described).toBe("FAILED");
+    expect(turn.answers).toEqual([]);
+    const failed = turn.world.audit.byKind("TASK_WORKER_TURN_FAILED");
+    expect(failed[0]!.evidence["error"]).toBe("the broker failed after the turn ran");
+    const recorded = failureScratch(turn);
+    expect(recorded.paths).toContain("cache-evidence.txt");
+    expect(recorded.cleanup).toEqual({ path: turn.revokedScratch, code: "EACCES", left: false });
+    expect(existsSync(turn.revokedScratch!)).toBe(false);
+  });
+
+  it("records a scratch it could not remove at all as left, and keeps the outcome", async () => {
+    const turn = await runTurn("uchg");
+    rmSync(turn.sibling, { recursive: true, force: true });
+    const scratch = turn.revokedScratch!;
+    try {
+      expect(turn.execution.status, turn.described).toBe("FAILED");
+      expect(turn.answers).toHaveLength(1);
+      expect(turn.answers[0]!.exitCode).toBe(1);
+      const recorded = failureScratch(turn);
+      expect(recorded.paths).toContain("cache-evidence.txt");
+      expect(recorded.cleanup).toEqual({ path: scratch, code: "EPERM", left: true });
+      expect(existsSync(join(scratch, "cache-evidence.txt"))).toBe(true);
+    } finally {
+      spawnSync("/usr/bin/chflags", ["-R", "nouchg", scratch], { timeout: 5000 });
+      rmSync(scratch, { recursive: true, force: true });
+    }
   });
 });
