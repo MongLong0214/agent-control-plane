@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { acpError } from "../../src/core/errors.ts";
 import { sha256 } from "../../src/core/digest.ts";
@@ -7,7 +7,7 @@ import { Daemon } from "../../src/daemon/daemon.ts";
 import { RunState, Role, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
-import { cleanupTempDirs, commitAll, tempDir, writeFiles } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, gitSync, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { bindCeo, driveToReviewedCandidate, makeHarness } from "../helpers/harness.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
 
@@ -61,7 +61,13 @@ const githubFor = (options: { before?: Hook; after?: Hook } = {}) => {
   return github;
 };
 
-const approved = async (options: { before?: Hook; after?: Hook; manifest?: Partial<ProjectManifest> } = {}) => {
+const approved = async (options: {
+  before?: Hook;
+  after?: Hook;
+  manifest?: Partial<ProjectManifest>;
+  /** A contract admitted before #1269 pinned this strategy; no manifest is admitted with it now. */
+  pinnedMergeStrategy?: ProjectManifest["branchProfile"]["mergeStrategy"];
+} = {}) => {
   const github = githubFor(options);
   const harness = makeHarness({ githubClient: github });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
@@ -79,6 +85,14 @@ const approved = async (options: { before?: Hook; after?: Hook; manifest?: Parti
   github.setBranch(driven.workBranch, driven.candidateHead);
   github.nextMergeSha = driven.candidateHead;
   github.onMerge = ({ mergeSha }) => github.setTrustedPostMergeCheck(mergeSha, "project-ci", WORKFLOW_PATH);
+  const legacy = options.pinnedMergeStrategy;
+  if (legacy !== undefined) {
+    const stored = harness.cp.projects.manifest.bind(harness.cp.projects);
+    vi.spyOn(harness.cp.projects, "manifest").mockImplementation((digest) => {
+      const pinned = stored(digest);
+      return pinned ? { ...pinned, branchProfile: { ...pinned.branchProfile, mergeStrategy: legacy } } : null;
+    });
+  }
   const claimed = harness.cp.claims.acquire({
     runId: driven.runId,
     ownerSessionId: driven.ownerSessionId,
@@ -402,15 +416,8 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     await daemon.stop();
   });
 
-  it("an unrecoverable refusal ends FAILED with its reason: a pinned fast-forward strategy GitHub's merge API cannot perform", async () => {
-    const fixture = await approved({
-      manifest: {
-        branchProfile: {
-          longLived: ["main", "dev"], defaultBranch: "dev", updateStrategy: "rebase_before_review",
-          mergeStrategy: "fast_forward", releaseTagPolicy: "semver", releaseBranchCleanup: "keep",
-        },
-      },
-    });
+  it.each(["fast_forward", "squash", "rebase"] as const)("an unrecoverable refusal ends FAILED with its reason: a pinned %s contract, which is not a merge commit", async (strategy) => {
+    const fixture = await approved({ pinnedMergeStrategy: strategy });
     const { harness, driven, daemon } = fixture;
     const started = await daemon.start();
     expect(started.allowed).toBe(true);
@@ -423,7 +430,7 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     expect(invalidated[0]!.evidence).toMatchObject({ disposition: "UNRECOVERABLE", candidateSnapshotDigest: driven.candidateSnapshotDigest });
     // FAILED on GitHub's own read that the pull request is unmerged, not on the absence of a receipt alone.
     const refused = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_ATTEMPT_FAILED").at(-1)!;
-    expect(refused.evidence).toMatchObject({ mergeStrategy: "fast_forward", pullMerged: false, disposition: "UNRECOVERABLE" });
+    expect(refused.evidence).toMatchObject({ mergeStrategy: strategy, pullMerged: false, disposition: "UNRECOVERABLE" });
     const notices = outboxOf(fixture, "CEO_NOTIFICATION").filter((notice) => notice.payload.notification === "CRITICAL_SYSTEM_FAILURE");
     expect(notices).toHaveLength(1);
     expect(notices[0]!.payload).toMatchObject({ failureReasonCode: ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED, failureClass: "UNRECOVERABLE" });
@@ -535,6 +542,210 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
       expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === kind), kind).toHaveLength(0);
     }
     expect(outboxOf(fixture, "REVISION_REQUEST")).toHaveLength(0);
+    await daemon.stop();
+  });
+
+  /** A record kept only as a CommitLore note on the candidate head, the way a capture stores one; its blob id. */
+  const noteOnCandidate = ({ harness, driven }: Fixture): string => {
+    gitSync(harness.repoPath, ["notes", "--ref=commitlore", "add", "-m", "Limit: a record kept only in a note", driven.candidateHead]);
+    return gitSync(harness.repoPath, ["notes", "--ref=commitlore", "list", driven.candidateHead]);
+  };
+  const isNotesRefWrite = (method: HttpMethod, path: string, body?: unknown): boolean =>
+    (method === "PATCH" && /\/git\/refs\/notes\/commitlore$/.test(path)) ||
+    (method === "POST" && /\/git\/refs$/.test(path) && (body as { ref?: unknown } | undefined)?.ref === "refs/notes/commitlore");
+  const unheard = (method: HttpMethod): never => {
+    throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method });
+  };
+  const mergeReceipts = (fixture: Fixture) => fixture.harness.cp.db.all<{ status: string; verified: number }>(
+    "SELECT status, verified FROM github_receipts WHERE run_id = ? AND operation = 'merge_execute'", [fixture.driven.runId],
+  );
+  const lastBlock = (fixture: Fixture) => fixture.harness.cp.audit.forRun(fixture.driven.runId)
+    .filter((entry) => entry.kind === "RUN_TRANSITION" && entry.evidence.to === RunState.BLOCKED_POST_MERGE).at(-1)?.evidence;
+  /** Merged and proven, its notes not on the remote: held MERGING as MERGE_NOTES_PENDING, refused `refusals` times so far. */
+  const expectNotesHeld = (fixture: Fixture, refusals: number): void => {
+    const { harness, driven } = fixture;
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.MERGING);
+    expect(mergeReceipts(fixture)).toEqual([{ status: "PENDING", verified: 0 }]);
+    expect(transitions(fixture).some(([, to]) => to === RunState.BLOCKED_POST_MERGE)).toBe(false);
+    expect(harness.cp.claims.heldByRun(driven.runId).map((claim) => claim.branch)).toContain(driven.workBranch);
+    const counted = harness.cp.audit.forRun(driven.runId).filter((entry) =>
+      entry.kind === "FINALIZATION_RETRY_SCHEDULED" && entry.evidence.failureCause === "MERGE_NOTES_PENDING");
+    expect(counted).toHaveLength(refusals);
+    expect(counted.at(-1)!.reasonCode).toBe(ReasonCode.MERGE_NOTES_PENDING);
+    expect(counted.at(-1)!.evidence).toMatchObject({ failureClass: "MERGE_NOTES_PENDING", refusals });
+    expect(fixture.github.mergeCount).toBe(1);
+  };
+  const restarted = (fixture: Fixture) =>
+    new Daemon(fixture.harness.cp, { stateDir: tempDir("acp-b5-restart-"), watchdogIntervalMs: 24 * 60 * MINUTE });
+
+  it("#1269: a merge whose answer was lost is settled by the daemon's next attempt, which carries the candidate's CommitLore notes to the remote without a second merge", async () => {
+    let lose = true;
+    const fixture = await approved({
+      after: (method, path) => {
+        if (isMergePut(method, path) && lose) {
+          lose = false;
+          throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method });
+        }
+      },
+    });
+    const { harness, driven, daemon } = fixture;
+    const blob = noteOnCandidate(fixture);
+    expect((await daemon.start()).allowed).toBe(true);
+    expectHeld(fixture, { outcome: "unheard" });
+    expect(fixture.github.remoteNoteFor(driven.candidateHead)).toBeUndefined();
+    harness.clock.advance(MINUTE);
+    await daemon.resumeApprovedRuns();
+    expect(fixture.github.remoteNoteFor(driven.candidateHead)).toBe(blob);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+    expect(mergePuts(fixture)).toBe(1);
+    expect(fixture.github.mergeCount).toBe(1);
+    await daemon.stop();
+  });
+
+  it("#1269: a merge whose notes upload failed stays MERGING with its receipt PENDING and its claim held; once the transport is back the next attempt carries the notes, without a second merge, and only then completes and releases the claim", async () => {
+    let down = true;
+    const fixture = await approved({ before: (method, path, body) => { if (down && isNotesRefWrite(method, path, body)) unheard(method); } });
+    const { harness, driven, daemon } = fixture;
+    const blob = noteOnCandidate(fixture);
+    expect((await daemon.start()).allowed).toBe(true);
+    expectNotesHeld(fixture, 1);
+    expect(fixture.github.remoteNoteFor(driven.candidateHead)).toBeUndefined();
+    down = false;
+    harness.clock.advance(MINUTE);
+    await daemon.resumeApprovedRuns();
+    expect(fixture.github.remoteNoteFor(driven.candidateHead)).toBe(blob);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+    expect(mergeReceipts(fixture)).toEqual([{ status: "APPLIED", verified: 1 }]);
+    // The notes are read back and the receipt proven before the run ends, and the run ends before its claim goes.
+    const kinds = harness.cp.audit.forRun(driven.runId).map((entry) => entry.kind === "RUN_TRANSITION" ? `TO_${String(entry.evidence.to)}` : entry.kind);
+    expect(kinds.indexOf("TO_COMPLETED")).toBeLessThan(kinds.lastIndexOf("CLAIM_RELEASED"));
+    expect(harness.cp.claims.heldByRun(driven.runId)).toEqual([]);
+    expect(transitions(fixture).some(([, to]) => to === RunState.BLOCKED_POST_MERGE)).toBe(false);
+    expect(mergePuts(fixture)).toBe(1);
+    expect(fixture.github.mergeCount).toBe(1);
+    await daemon.stop();
+  });
+
+  it("#1269: across restarts and a lost answer the notes are carried once: the retry count is not reset, the remote's other notes are kept, nothing is overwritten and nothing merges twice", async () => {
+    let down = true;
+    let loseRef = false;
+    const fixture = await approved({
+      before: (method, path, body) => { if (down && isNotesRefWrite(method, path, body)) unheard(method); },
+      after: (method, path, body) => {
+        if (loseRef && isNotesRefWrite(method, path, body)) {
+          loseRef = false;
+          unheard(method);
+        }
+      },
+    });
+    const { harness, driven, daemon, github } = fixture;
+    // The remote already carries a note of another commit, which nothing here may drop or rewrite.
+    const [keptTree, keptCommit, keptBlob] = ["1".repeat(40), "2".repeat(40), "3".repeat(40)];
+    github.notesTrees.set(keptTree, new Map([[driven.baseHead, keptBlob]]));
+    github.notesCommits.set(keptCommit, { tree: keptTree, parents: [] });
+    github.notesRef = keptCommit;
+    const blob = noteOnCandidate(fixture);
+    expect((await daemon.start()).allowed).toBe(true);
+    expectNotesHeld(fixture, 1);
+    await daemon.stop();
+    // A restart before the retry is due attempts nothing, and the count it resumes is the durable one.
+    let calls = github.calls.length;
+    let daemonNow = restarted(fixture);
+    expect((await daemonNow.start()).allowed).toBe(true);
+    expect(github.calls).toHaveLength(calls);
+    harness.clock.advance(MINUTE);
+    await daemonNow.resumeApprovedRuns();
+    expectNotesHeld(fixture, 2);
+    // The transport is back, but the answer to the notes ref update is lost: the notes landed, the run was not told.
+    down = false;
+    loseRef = true;
+    harness.clock.advance(2 * MINUTE);
+    await daemonNow.resumeApprovedRuns();
+    expectNotesHeld(fixture, 3);
+    expect(github.remoteNoteFor(driven.candidateHead)).toBe(blob);
+    await daemonNow.stop();
+    calls = github.calls.length;
+    daemonNow = restarted(fixture);
+    expect((await daemonNow.start()).allowed).toBe(true);
+    expect(github.calls).toHaveLength(calls);
+    harness.clock.advance(4 * MINUTE);
+    await daemonNow.resumeApprovedRuns();
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+    expect(mergeReceipts(fixture)).toEqual([{ status: "APPLIED", verified: 1 }]);
+    expect(github.remoteNoteFor(driven.candidateHead)).toBe(blob);
+    expect(github.remoteNoteFor(driven.baseHead)).toBe(keptBlob);
+    // One notes commit on top of the remote's own, moved there once and only fast-forward.
+    expect(github.notesCommits.get(github.notesRef!)?.parents).toEqual([keptCommit]);
+    const refWrites = github.calls.filter((call) => isNotesRefWrite(call.method as HttpMethod, call.path, call.body));
+    expect(refWrites).toHaveLength(1);
+    expect(refWrites[0]!.body).toMatchObject({ force: false });
+    expect(github.mergeCount).toBe(1);
+    await daemonNow.stop();
+  });
+
+  it("#1269: notes that never reach the remote use the 5 retries, then the CEO is told once; the run stays MERGING with its receipt PENDING and its owner, and nothing retries it again, a restart included", async () => {
+    const fixture = await approved({ before: (method, path, body) => { if (isNotesRefWrite(method, path, body)) unheard(method); } });
+    const { harness, driven, daemon, github } = fixture;
+    noteOnCandidate(fixture);
+    const owner = harness.cp.runs.require(driven.runId).ownerSessionId;
+    // The run's claims would lapse within the retries on their own: they are kept, on the same targets, while it is held.
+    harness.cp.db.run("UPDATE resource_claims SET expires_at = ? WHERE run_id = ? AND status = 'HELD'",
+      [new Date(harness.clock.now().getTime() + 3 * MINUTE).toISOString(), driven.runId]);
+    const claimed = harness.cp.claims.heldByRun(driven.runId).map((claim) => claim.claimId).sort();
+    expect((await daemon.start()).allowed).toBe(true);
+    for (const delay of [1, 2, 4, 8, 16]) {
+      harness.clock.advance(delay * MINUTE);
+      await daemon.resumeApprovedRuns();
+    }
+    expectNotesHeld(fixture, 5);
+    expect(harness.cp.claims.heldByRun(driven.runId).map((claim) => claim.claimId).sort()).toEqual(claimed);
+    const exhausted = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_RETRIES_EXHAUSTED");
+    expect(exhausted).toHaveLength(1);
+    expect(exhausted[0]!.evidence).toMatchObject({
+      failureClass: "MERGE_NOTES_PENDING", failureCause: "MERGE_NOTES_PENDING", refusals: 6, retries: 5, retryCap: 5, limit: "FAILURE",
+    });
+    const handed = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_HANDED_OFF");
+    expect(handed).toHaveLength(1);
+    expect(handed[0]!.evidence).toMatchObject({ failureClass: "MERGE_NOTES_PENDING", owner: "CEO", delivered: true });
+    expect(harness.cp.runs.require(driven.runId).ownerSessionId).toBe(owner);
+    expect(github.remoteNoteFor(driven.candidateHead)).toBeUndefined();
+    const calls = github.calls.length;
+    harness.clock.advance(60 * MINUTE);
+    await daemon.resumeApprovedRuns();
+    await daemon.stop();
+    const daemonNow = restarted(fixture);
+    expect((await daemonNow.start()).allowed).toBe(true);
+    expect(github.calls).toHaveLength(calls);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.MERGING);
+    expect(mergeReceipts(fixture)).toEqual([{ status: "PENDING", verified: 0 }]);
+    expect(github.mergeCount).toBe(1);
+    await daemonNow.stop();
+  });
+
+  it.each([
+    ["merge commit", (pull: { merge_commit_sha?: string | null }) => { pull.merge_commit_sha = "e".repeat(40); }, ReasonCode.RESOURCE_COLLISION],
+    ["candidate head", (pull: { head: { sha: string } }) => { pull.head.sha = "e".repeat(40); }, ReasonCode.MERGE_HEAD_STALE],
+  ] as const)("#1269: a notes retry whose read-back names another %s than the proven merge is refused and blocked: no notes, no merge, the receipt kept PENDING", async (_label, rewrite, reasonCode) => {
+    let down = true;
+    const fixture = await approved({ before: (method, path, body) => { if (down && isNotesRefWrite(method, path, body)) unheard(method); } });
+    const { harness, driven, daemon, github } = fixture;
+    noteOnCandidate(fixture);
+    expect((await daemon.start()).allowed).toBe(true);
+    expectNotesHeld(fixture, 1);
+    rewrite(github.pulls[0]! as never);
+    down = false;
+    harness.clock.advance(MINUTE);
+    await daemon.resumeApprovedRuns();
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.BLOCKED_POST_MERGE);
+    expect(lastBlock(fixture)).toMatchObject({ failureReasonCode: reasonCode, failure: { phase: "reconcile-pull", observed: "e".repeat(40) } });
+    expect(github.remoteNoteFor(driven.candidateHead)).toBeUndefined();
+    expect(mergeReceipts(fixture)).toEqual([{ status: "PENDING", verified: 0 }]);
+    const calls = github.calls.length;
+    harness.clock.advance(MINUTE);
+    await daemon.resumeApprovedRuns();
+    expect(github.calls).toHaveLength(calls);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.BLOCKED_POST_MERGE);
+    expect(github.mergeCount).toBe(1);
     await daemon.stop();
   });
 
@@ -689,12 +900,7 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     let gated = false;
     let reads = 0;
     const fixture = await approved({
-      manifest: {
-        branchProfile: {
-          longLived: ["main", "dev"], defaultBranch: "dev", updateStrategy: "rebase_before_review",
-          mergeStrategy: "fast_forward", releaseTagPolicy: "semver", releaseBranchCleanup: "keep",
-        },
-      },
+      pinnedMergeStrategy: "fast_forward",
       // After the gate, the merge evaluation reads the pull once; the second read is the fast-forward refusal's.
       before: (method, path) => {
         if (method === "POST" && path.endsWith("/check-runs")) gated = true;

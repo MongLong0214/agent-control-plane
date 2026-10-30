@@ -479,6 +479,20 @@ export class ClaimRegistry {
     });
   }
 
+  /**
+   * #1269 — a run held for a pending effect on a repository keeps the claims it already holds there until `until`.
+   * Only its own HELD, unexpired claims under its current owner generation are extended: none is shortened,
+   * revived, moved or created, so the target stays the run's alone while the effect is retried, and nothing more.
+   */
+  holdThrough(runId: string, repositoryIdentity: string, until: string): number {
+    return this.db.run(
+      `UPDATE resource_claims SET expires_at = ?
+        WHERE run_id = ? AND repository_identity = ? AND status = 'HELD' AND expires_at > ? AND expires_at < ?
+          AND owner_binding_generation = (SELECT owner_binding_generation FROM runs WHERE run_id = ?)`,
+      [until, runId, repositoryIdentity, this.clock.nowIso(), until, runId],
+    ).changes;
+  }
+
   releaseRun(runId: string): number {
     const changes = this.db.run(
       `UPDATE resource_claims SET status = 'RELEASED', released_at = ?

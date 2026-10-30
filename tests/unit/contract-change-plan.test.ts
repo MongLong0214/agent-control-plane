@@ -51,6 +51,27 @@ describe("contractChangePlanForSubmission", () => {
   });
 });
 
+describe("a contract pinned before merge commits only (#1269)", () => {
+  const legacy: ProjectManifest = projectManifestSchema.parse({ ...base, branchProfile: { ...base.branchProfile, mergeStrategy: "squash" } });
+  const legacyDigest = manifestDigest(legacy);
+  const legacyRun = { ...run, pinnedManifestDigest: legacyDigest };
+  const legacyLookup = (digest: string) => (digest === legacyDigest ? legacy : null);
+
+  it("is read back as the base, so a contract change can migrate it to a merge commit under a new digest", () => {
+    const migrated = projectManifestSchema.parse({ ...legacy, branchProfile: { ...legacy.branchProfile, mergeStrategy: "merge_commit" } });
+    const admitted = contractChangePlanForSubmission(legacyRun, plan(migrated), legacyLookup);
+    expect(admitted.allowed, JSON.stringify(admitted.evidence)).toBe(true);
+    expect(manifestDigest(migrated)).not.toBe(legacyDigest);
+  });
+
+  it("is not carried forward: a proposal that keeps the old strategy is refused", () => {
+    const kept = projectManifestSchema.parse({ ...legacy, postMergeCommands: ["verify"] });
+    const refused = contractChangePlanForSubmission(legacyRun, plan(kept), legacyLookup);
+    expect(refused.allowed).toBe(false);
+    expect(refused.evidence["issues"]).toEqual([expect.objectContaining({ path: "branchProfile.mergeStrategy", refusal: "MERGE_COMMIT_ONLY" })]);
+  });
+});
+
 describe("currentContractChangePlan", () => {
   it("binds the stored PLAN by digest and re-validates it; a PLAN stored without a manifest has no candidate", () => {
     const current = currentContractChangePlan(run, { digest: "sha256:plan", content: plan() }, lookup);

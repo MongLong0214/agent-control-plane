@@ -18,7 +18,6 @@ import { FakeGitHub, type FakePull } from "../helpers/fake-github.ts";
 import {
   approveReviewedCandidateForFinalization,
   driveToReviewedCandidate,
-  fixtureManifest,
   type Harness,
   makeHarness,
   ownerDecisionReceipt,
@@ -90,22 +89,6 @@ const afterFirstGatePublished = (github: FakeGitHub, effect: () => void): void =
   };
 };
 
-/** A squash is composed from the pull's commits: the opened pull carries the candidate commit as its one commit. */
-const giveOpenedPullItsCommit = (github: FakeGitHub): void => {
-  const request = github.request.bind(github);
-  github.request = async <T>(
-    method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
-    path: string,
-    body?: unknown,
-  ): Promise<T> => {
-    const response = await request<T>(method, path, body);
-    if (method === "POST" && /\/pulls$/.test(path)) {
-      github.setPullCommits((response as FakePull).number, [{ message: "make app() return 2\n" }]);
-    }
-    return response;
-  };
-};
-
 /**
  * Runs `effect` on the first read of a single pull request after the `nth` production-gate check run was
  * accepted: in a daemon attempt, the read that opens the merge evaluation, after that gate's publication
@@ -159,13 +142,10 @@ const approvedHumanGatedRun = async (
   options: {
     approve?: (harness: Harness, runId: string, items: readonly string[]) => void;
     prune?: boolean;
-    /** FD-R1-RACE — the pinned profile with only its merge strategy moved to squash. */
-    squash?: boolean;
   } = {},
 ) => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
-  if (options.squash) giveOpenedPullItsCommit(github);
   const harness = makeHarness({ githubClient: github });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
   writeFiles(harness.repoPath, { [WORKFLOW_PATH]: WORKFLOW });
@@ -175,7 +155,6 @@ const approvedHumanGatedRun = async (
     humanGate: ITEMS,
     manifestOverrides: {
       ciWorkflows: [{ path: WORKFLOW_PATH, checkName: "project-ci", approvedDigest: sha256(WORKFLOW), unapprovedFirstActivation: false, repositoryRole: "primary" }],
-      ...(options.squash ? { branchProfile: { ...fixtureManifest("strategy-probe").branchProfile, mergeStrategy: "squash" as const } } : {}),
     },
   });
   github.setBranch("dev", driven.baseHead);
@@ -278,10 +257,10 @@ const writeLog = (fixture: Fixture): string[] =>
 
 /**
  * FD-R1-RACE — runs `change` once, during the last read the kernel awaits before its first merge PUT
- * could be sent, after the gate was selected and evaluated: the preflight's pull read for a merge
- * commit, the read of the commits a squash message is composed from for a squash.
+ * could be sent, after the gate was selected and evaluated: the compare that checks the head contains
+ * the base.
  */
-const duringMergePreparation = (fixture: Fixture, read: "preflight" | "squash commits", change: () => void): void => {
+const duringMergePreparation = (fixture: Fixture, change: () => void): void => {
   const { github } = fixture;
   const request = github.request.bind(github);
   let gateSelected = false;
@@ -295,7 +274,7 @@ const duringMergePreparation = (fixture: Fixture, read: "preflight" | "squash co
     if (method !== "GET" || fired) return response;
     if (/\/commits\/[^/]+\/check-runs/.test(path) && fixture.harness.cp.runs.require(fixture.driven.runId).state === RunState.MERGING) {
       gateSelected = true;
-    } else if (gateSelected && (read === "preflight" ? /\/pulls\/\d+$/ : /\/pulls\/\d+\/commits\?/).test(path)) {
+    } else if (gateSelected && /\/compare\/[0-9a-f]{40}\.\.\./.test(path)) {
       fired = true;
       change();
     }
@@ -579,26 +558,20 @@ describe("FD-R1-RACE: a change while the kernel awaits its last read before the 
     "candidate replacement": (fixture: Fixture) =>
       fixture.harness.cp.runs.promoteCandidate(fixture.driven.runId, digestOf({ replacedDuringMergePreparation: true })),
   } as const;
-  const strategies = [
-    ["merge commit", false, "preflight"],
-    ["squash", true, "squash commits"],
-  ] as const;
-
-  it("FD-R1-RACE control: with nothing changed, the squash strategy merges through the daemon as the merge-commit one does", async () => {
-    const fixture = await approvedHumanGatedRun({ squash: true });
+  it("FD-R1-RACE control: with nothing changed, the merge request is a merge commit", async () => {
+    const fixture = await approvedHumanGatedRun();
     expect(await outcomeOf(fixture)).toEqual(COMPLETED_ONCE);
     expect(fixture.github.calls.filter((call) => call.method === "PUT").map((call) => (call.body as { merge_method?: unknown }).merge_method))
-      .toEqual(["squash"]);
+      .toEqual(["merge"]);
   });
 
-  it.each(strategies.flatMap(([strategy, squash, read]) =>
-    (Object.keys(changes) as Array<keyof typeof changes>).map((change) => [strategy, change, squash, read] as const)))(
-    "FD-R1-RACE %s: a %s during the merge's last awaited read sends no PUT for the evaluated binding",
-    async (_strategy, change, squash, read) => {
-      const fixture = await approvedHumanGatedRun({ squash });
+  it.each(Object.keys(changes) as Array<keyof typeof changes>)(
+    "FD-R1-RACE merge commit: a %s during the merge's last awaited read sends no PUT for the evaluated binding",
+    async (change) => {
+      const fixture = await approvedHumanGatedRun();
       const { harness, driven, github } = fixture;
       let changed = false;
-      duringMergePreparation(fixture, read, () => {
+      duringMergePreparation(fixture, () => {
         changes[change](fixture);
         changed = true;
       });
@@ -762,17 +735,12 @@ describe("FD-R2: the transport checks the gate payload again once it holds its i
     "approval again": ReasonCode.HUMAN_GATE_UNSATISFIED,
     "candidate replacement": ReasonCode.SNAPSHOT_STALE,
   } as const;
-  const strategies = [
-    ["merge commit", false, "preflight"],
-    ["squash", true, "squash commits"],
-  ] as const;
-
-  it.each(strategies)(
-    "FD-R2 control %s: the token expires during the merge's last awaited read and nothing changes; the run merges once",
-    async (_strategy, squash, read) => {
-      const fixture = await approvedHumanGatedRun({ squash });
+  it(
+    "FD-R2 control merge commit: the token expires during the merge's last awaited read and nothing changes; the run merges once",
+    async () => {
+      const fixture = await approvedHumanGatedRun();
       const transport = await realTransport(fixture);
-      duringMergePreparation(fixture, read, () => transport.expireTokenThen(() => undefined));
+      duringMergePreparation(fixture, () => transport.expireTokenThen(() => undefined));
 
       expect(await outcomeOf(fixture)).toEqual(COMPLETED_ONCE);
       expect(transport.events).toContain("token refresh");
@@ -780,12 +748,12 @@ describe("FD-R2: the transport checks the gate payload again once it holds its i
     },
   );
 
-  it.each(strategies)(
-    "FD-R2 every send %s: each gate POST and merge PUT leaves right after the transport's check of its payload, the refreshed token's PUT included",
-    async (_strategy, squash, read) => {
-      const fixture = await approvedHumanGatedRun({ squash });
+  it(
+    "FD-R2 every send merge commit: each gate POST and merge PUT leaves right after the transport's check of its payload, the refreshed token's PUT included",
+    async () => {
+      const fixture = await approvedHumanGatedRun();
       const transport = await realTransport(fixture);
-      duringMergePreparation(fixture, read, () => transport.expireTokenThen(() => undefined));
+      duringMergePreparation(fixture, () => transport.expireTokenThen(() => undefined));
 
       expect(await outcomeOf(fixture)).toEqual(COMPLETED_ONCE);
       expect(dispatchedAfter(transport.events)).toEqual(["verified -> gate POST", "verified -> merge PUT"]);
@@ -793,15 +761,14 @@ describe("FD-R2: the transport checks the gate payload again once it holds its i
     },
   );
 
-  it.each(strategies.flatMap(([strategy, squash, read]) =>
-    (Object.keys(changes) as Array<keyof typeof changes>).map((change) => [strategy, change, squash, read] as const)))(
-    "FD-R2 %s: a %s while the transport refreshes its token after the kernel's last check sends no PUT for the evaluated binding",
-    async (_strategy, change, squash, read) => {
-      const fixture = await approvedHumanGatedRun({ squash });
+  it.each(Object.keys(changes) as Array<keyof typeof changes>)(
+    "FD-R2 merge commit: a %s while the transport refreshes its token after the kernel's last check sends no PUT for the evaluated binding",
+    async (change) => {
+      const fixture = await approvedHumanGatedRun();
       const { harness, driven, github } = fixture;
       const transport = await realTransport(fixture);
       let changed = false;
-      duringMergePreparation(fixture, read, () => transport.expireTokenThen(() => {
+      duringMergePreparation(fixture, () => transport.expireTokenThen(() => {
         changes[change](fixture);
         changed = true;
       }));
@@ -1113,9 +1080,8 @@ const nativeTransport = async (
 
 describe("FIX-FD-REDIRECT: the transport sends each gate POST and merge PUT once and follows no redirect", () => {
   const sites = [
-    ["gate POST", "gate POST", false],
-    ["merge commit PUT", "merge PUT", false],
-    ["squash PUT", "merge PUT", true],
+    ["gate POST", "gate POST"],
+    ["merge commit PUT", "merge PUT"],
   ] as const;
 
   it("FIX-FD-REDIRECT control: GitHub answers 2xx over the native transport; each write is sent once and the run merges once", async () => {
@@ -1133,8 +1099,8 @@ describe("FIX-FD-REDIRECT: the transport sends each gate POST and merge PUT once
 
   it.each(sites)(
     "FIX-FD-REDIRECT %s: an authenticated owner refusal, then a same-origin 307 answer: the write was sent once, nothing is sent to the redirect target, and the run does not complete",
-    async (_site, write, squash) => {
-      const fixture = await approvedHumanGatedRun({ squash });
+    async (_site, write) => {
+      const fixture = await approvedHumanGatedRun();
       const { harness, driven, github } = fixture;
       let changed = false;
       const transport = await nativeTransport(fixture, {
@@ -1165,8 +1131,8 @@ describe("FIX-FD-REDIRECT: the transport sends each gate POST and merge PUT once
 
   it.each(sites)(
     "FIX-FD-REDIRECT %s with nothing changed: a 307 answer is still not followed, and the run fails closed instead of completing",
-    async (_site, write, squash) => {
-      const fixture = await approvedHumanGatedRun({ squash });
+    async (_site, write) => {
+      const fixture = await approvedHumanGatedRun();
       const { harness, driven, github } = fixture;
       const transport = await nativeTransport(fixture, { redirect: write });
       try {
