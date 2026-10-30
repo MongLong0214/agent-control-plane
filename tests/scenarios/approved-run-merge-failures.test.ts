@@ -8,7 +8,7 @@ import { RunState, Role, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
 import { cleanupTempDirs, commitAll, tempDir, writeFiles } from "../helpers/fixtures.ts";
-import { driveToReviewedCandidate, makeHarness } from "../helpers/harness.ts";
+import { bindCeo, driveToReviewedCandidate, makeHarness } from "../helpers/harness.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
 
 afterAll(cleanupTempDirs);
@@ -499,7 +499,7 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     await daemon.stop();
   });
 
-  it("a merge request whose answer was lost after GitHub merged it is held: never sent again, never revised or failed, and handed to the CEO at the cap", async () => {
+  it("a merge request whose answer was lost after GitHub merged it is proven merged by the next attempt's first read, though its pull is closed: never sent again, revised, failed or released", async () => {
     let lose = true;
     const fixture = await approved({
       after: (method, path) => {
@@ -513,21 +513,101 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     expect((await daemon.start()).allowed).toBe(true);
     expect(fixture.github.mergeCount).toBe(1);
     expectHeld(fixture, { outcome: "unheard" });
-    // The PR is closed now, so the retries are refused before the merge step (a cached PR must be open); none
-    // of them sends the merge again, and the run is not returned or failed while the receipt is open.
-    for (let sweep = 0; sweep < 8; sweep += 1) {
+    expect(fixture.github.pulls.map((pull) => [pull.state, pull.merged])).toEqual([["closed", true]]);
+    const callsBefore = fixture.github.calls.length;
+    harness.clock.advance(MINUTE);
+    await daemon.resumeApprovedRuns();
+    // The pending receipt is settled by a read of the pull before anything is published, prepared or gated
+    // again: a closed pull that GitHub reports merged is this run's merge, not a closed pull request.
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+    const after = fixture.github.calls.slice(callsBefore);
+    expect(after[0]!.method).toBe("GET");
+    expect(after[0]!.path).toMatch(/\/pulls\/\d+$/);
+    expect(after.filter((call) => call.method !== "GET")).toEqual([]);
+    expect(transitions(fixture).slice(-2)).toEqual([[RunState.MERGING, RunState.POST_MERGE_VERIFYING], [RunState.POST_MERGE_VERIFYING, RunState.COMPLETED]]);
+    expect(mergePuts(fixture)).toBe(1);
+    expect(fixture.github.mergeCount).toBe(1);
+    expect(fixture.harness.cp.db.all<{ status: string; verified: number }>(
+      "SELECT status, verified FROM github_receipts WHERE run_id = ? AND operation = 'merge_execute'", [driven.runId],
+    )).toEqual([{ status: "APPLIED", verified: 1 }]);
+    expect(failedAttempts(fixture)).toBe(1);
+    for (const kind of ["CEO_APPROVAL_INVALIDATED", "FINALIZATION_HANDED_OFF", "FINALIZATION_BLOCKED_POST_MERGE"]) {
+      expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === kind), kind).toHaveLength(0);
+    }
+    expect(outboxOf(fixture, "REVISION_REQUEST")).toHaveLength(0);
+    await daemon.stop();
+  });
+
+  it("a merge request held unknown whose base then moved, unmerged, is reconciled before anything is replayed: the read proves it unmerged and it returns for revision as a stale base", async () => {
+    let fail = true;
+    let fixture: Fixture | null = null;
+    fixture = await approved({
+      before: (method, path, body) => {
+        if (isMergePut(method, path) && fail) {
+          fail = false;
+          fixture!.github.calls.push({ method, path, body });
+          throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method, status: 502 });
+        }
+      },
+    });
+    const { harness, driven, daemon } = fixture;
+    expect((await daemon.start()).allowed).toBe(true);
+    expectHeld(fixture, { status: 502, outcome: "answered" });
+    fixture.github.setBranch("dev", "c".repeat(40));
+    for (const pull of fixture.github.pulls) pull.base.sha = "c".repeat(40);
+    const callsBefore = fixture.github.calls.length;
+    harness.clock.advance(MINUTE);
+    await daemon.resumeApprovedRuns();
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.ACTIVE);
+    const after = fixture.github.calls.slice(callsBefore);
+    expect(after[0]!.method).toBe("GET");
+    expect(after[0]!.path).toMatch(/\/pulls\/\d+$/);
+    expect(after.filter((call) => call.method !== "GET")).toEqual([]);
+    expect(mergePuts(fixture)).toBe(1);
+    expect(fixture.github.mergeCount).toBe(0);
+    expect(transitions(fixture).slice(-2)).toEqual([[RunState.MERGING, RunState.REVISION_REQUIRED], [RunState.REVISION_REQUIRED, RunState.ACTIVE]]);
+    const invalidated = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CEO_APPROVAL_INVALIDATED");
+    expect(invalidated).toHaveLength(1);
+    expect(invalidated[0]!.reasonCode).toBe(ReasonCode.MERGE_BASE_STALE);
+    expect(outboxOf(fixture, "REVISION_REQUEST")).toHaveLength(1);
+    expect(pendingMergeReceipts(fixture)).toEqual([]);
+    await daemon.stop();
+  });
+
+  it("a cap reached while no CEO is bound keeps its notice owed, without retrying the run: once a CEO is bound the next sweep sends it, exactly once", async () => {
+    const fixture = await approved();
+    const { harness, driven, daemon } = fixture;
+    for (const claim of harness.cp.db.all<{ claim_id: string }>("SELECT claim_id FROM resource_claims WHERE run_id = ? AND status = 'HELD'", [driven.runId])) {
+      expect(harness.cp.claims.release(claim.claim_id, driven.runId).allowed).toBe(true);
+    }
+    expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "the CEO seat is vacated").allowed).toBe(true);
+    expect((await daemon.start()).allowed).toBe(true);
+    const handedOff = () => harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_HANDED_OFF");
+    const notices = () => outboxOf(fixture, "CEO_NOTIFICATION").filter((notice) => notice.payload.notification === "CRITICAL_SYSTEM_FAILURE");
+    expect(handedOff().map((entry) => entry.evidence.delivered)).toEqual([false]);
+    expect(notices()).toHaveLength(0);
+    // No CEO yet: the sweeps neither retry the run nor enqueue anything.
+    for (let sweep = 0; sweep < 3; sweep += 1) {
       harness.clock.advance(60 * MINUTE);
       await daemon.resumeApprovedRuns();
     }
-    expect(failedAttempts(fixture)).toBe(6);
-    expect(mergePuts(fixture)).toBe(1);
-    expect(fixture.github.mergeCount).toBe(1);
-    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.MERGING);
-    expect(pendingMergeReceipts(fixture)).toEqual(["PENDING"]);
-    expect(transitions(fixture).some(([, to]) => to === RunState.FAILED || to === RunState.REVISION_REQUIRED)).toBe(false);
-    const handed = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_HANDED_OFF");
-    expect(handed).toHaveLength(1);
-    expect(handed[0]!.evidence).toMatchObject({ failureClass: "MERGE_OUTCOME_UNKNOWN", owner: "CEO", retries: 5, delivered: true });
+    expect(notices()).toHaveLength(0);
+    const ceoSessionId = bindCeo(harness);
+    for (let sweep = 0; sweep < 3; sweep += 1) {
+      harness.clock.advance(60 * MINUTE);
+      await daemon.resumeApprovedRuns();
+    }
+    expect(notices()).toHaveLength(1);
+    expect(notices()[0]!.target).toBe(ceoSessionId);
+    expect(notices()[0]!.payload).toMatchObject({
+      runId: driven.runId, candidateSnapshotDigest: driven.candidateSnapshotDigest, failureReasonCode: ReasonCode.MERGE_CLAIM_INVALID,
+      failureClass: "AUTHORITY_RECOVERY", owner: "CEO", retries: 0, retryCap: 5, blocker: expect.stringMatching(/^MERGE_CLAIM_INVALID: /),
+    });
+    expect(handedOff().map((entry) => entry.evidence.delivered)).toEqual([false, true]);
+    // The run itself stays capped: one refusal in all, nothing sent to GitHub, still approved.
+    expect(failedAttempts(fixture)).toBe(1);
+    expect(fixture.github.mergeCount).toBe(0);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
     await daemon.stop();
   });
 

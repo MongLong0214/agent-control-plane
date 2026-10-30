@@ -2200,14 +2200,18 @@ export class Daemon {
    * whose last attempt was refused before anything merged waits out that refusal's backoff, and one that
    * reached its retry cap is not tried again (`ApprovedRunFinalizer.retryDue`): both are durable, so a
    * restart neither shortens the wait nor restarts the count. Only an explicit `finalizeApprovedRun` (the one a
-   * CONFIRM triggers) skips the wait; its refusals still count.
+   * CONFIRM triggers) skips the wait; its refusals still count. A cap notice no CEO could take is still owed,
+   * and a pass over a run it does not retry sends it once a CEO is bound.
    */
   async resumeApprovedRuns(): Promise<string[]> {
     const resumed: string[] = [];
     const states = [RunState.CEO_APPROVED, RunState.MERGING, RunState.POST_MERGE_VERIFYING, RunState.BLOCKED_POST_MERGE];
     for (const state of states) {
       for (const run of this.cp.runs.list({ state })) {
-        if (!this.#finalizer.retryDue(run.runId)) continue;
+        if (!this.#finalizer.retryDue(run.runId)) {
+          this.#finalizer.deliverOwedHandOff(run.runId);
+          continue;
+        }
         const finalized = await this.finalizeApprovedRun(run.runId);
         if (finalized.allowed) resumed.push(run.runId);
       }

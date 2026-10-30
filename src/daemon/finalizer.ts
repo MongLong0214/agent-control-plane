@@ -4,7 +4,7 @@ import type { ControlPlane } from "../app/control-plane.ts";
 import { NotificationKind } from "../ceo/production-gate.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { ArtifactKind, RunKind, RunState } from "../domain/types.ts";
+import { ArtifactKind, Role, RunKind, RunState, roleKeyFor } from "../domain/types.ts";
 import { currentBranch } from "../git/git.ts";
 import type { DaemonFinalizerAuthority } from "../guard/managed-write-guard.ts";
 import {
@@ -51,6 +51,14 @@ type RetryClass = "TRANSIENT" | "UNCLASSIFIED" | "OWNER_ACTION" | "AUTHORITY_REC
 const RETRIES_STOPPED =
   "The daemon no longer retries this candidate automatically, a restart included; it stays approved until it is cancelled " +
   "or, for a CONTRACT_CHANGE, re-entered with a CONFIRM";
+
+const HAND_OFF_WHY = "a CEO-approved run keeps being refused before its merge; it stays approved, and the daemon has stopped retrying it";
+
+/** What a cap's notice carries besides `whyItMatters`; its FINALIZATION_HANDED_OFF record keeps each of them. */
+const HAND_OFF_NOTICE_FIELDS = [
+  "candidateSnapshotDigest", "failureReasonCode", "failureClass", "failureCause", "limit", "owner", "action", "blocker",
+  "retries", "retryCap", "reason",
+] as const;
 
 /**
  * What becomes of an approved run whose finalization was refused before any merge receipt existed. A retried
@@ -165,8 +173,8 @@ const classifyPreMergeRefusal = (kind: RunKind, failure: Decision<unknown>): Pre
  * #1189 B5 (CEO rulings 4 and 5) — a merge request that was sent and came back with an error status (a 405
  * included) or with nothing: whether it merged is unknown, and its PENDING receipt holds it (the kernel's
  * MERGE_OUTCOME_UNKNOWN). Every refusal while it is open counts as this one failure, and it is never sent for
- * revision or FAILED: the next attempt's merge step re-reads the pull before any second merge request, and only
- * a read that shows it unmerged turns it into a refusal made before any merge.
+ * revision or FAILED: the next attempt re-reads the pull before it replays anything or sends a second merge
+ * request, and only a read that shows it unmerged turns it into a refusal made before any merge.
  */
 const UNKNOWN_MERGE_ROUTE: RetryRoute = {
   disposition: "RETRY",
@@ -236,7 +244,8 @@ export interface DaemonFinalizationAuthorities {
 interface PlannedRepository {
   plan: ConfirmedMergePlan;
   pullNumber: number;
-  pullUrl: string;
+  /** This run's merge of the pull is already proven: nothing is published, prepared or gated for it again. */
+  merged: boolean;
 }
 
 /**
@@ -408,8 +417,28 @@ export class ApprovedRunFinalizer {
       const plans = await this.reconfirmAndPlan(runId, candidateDigest, consumer);
       if (!plans.allowed) return this.handleFailure(runId, attemptId, plans as Decision<unknown>);
 
+      // #1189 B5 — a merge request this run already sent is settled before anything is replayed: the replay
+      // would read the pull it may have merged (GitHub closes a merged pull) or whose base has moved, and refuse
+      // before the merge step could reconcile it. The kernel's merge step re-reads the pull first: merged, the
+      // merge is proven and its receipt kept; unmerged, the reservation goes and the merge is evaluated again,
+      // so a moved base or a conflict is refused as before any merge. A merged pull is never treated as closed.
+      if (this.cp.runs.require(runId).state === RunState.MERGING) {
+        for (const plan of plans.value) {
+          const receipt = this.mergeReceiptPull(runId, plan.repositoryIdentity);
+          if (receipt?.status !== "PENDING") continue;
+          this.touchAttempt(runId, attemptId, `RECONCILE_MERGE:${plan.repositoryIdentity}`);
+          const settled = await executePreparedConfirmedMerge(this.#ports, plan, receipt.pullNumber);
+          if (!settled.allowed) return this.handleFailure(runId, attemptId, settled as Decision<unknown>);
+        }
+      }
+
       const prepared: PlannedRepository[] = [];
       for (const plan of plans.value) {
+        const receipt = this.mergeReceiptPull(runId, plan.repositoryIdentity);
+        if (receipt?.status === "APPLIED" && receipt.verified === 1) {
+          prepared.push({ plan, pullNumber: receipt.pullNumber, merged: true });
+          continue;
+        }
         // #512 S-PUSH — the candidate branch reaches GitHub before its PR is prepared. Create-only: a
         // branch already at the exact candidate is reconciled, any other commit refuses (D4).
         this.touchAttempt(runId, attemptId, `PUBLISH_BRANCH:${plan.repositoryIdentity}`);
@@ -418,12 +447,13 @@ export class ApprovedRunFinalizer {
         this.touchAttempt(runId, attemptId, `PREPARE_PR:${plan.repositoryIdentity}`);
         const pr = await prepareConfirmedMerge(this.#ports, plan);
         if (!pr.allowed) return this.handleFailure(runId, attemptId, pr as Decision<unknown>);
-        prepared.push({ plan, pullNumber: pr.value.pullNumber, pullUrl: pr.value.url });
+        prepared.push({ plan, pullNumber: pr.value.pullNumber, merged: false });
       }
 
       // Gate publication is deliberately a separate all-repository phase. No irreversible
       // merge starts until every target has a durable PR intent and trusted gate receipt.
       for (const repository of prepared) {
+        if (repository.merged) continue;
         this.touchAttempt(runId, attemptId, `PUBLISH_GATE:${repository.plan.repositoryIdentity}`);
         const gate = await publishConfirmedMergeGate(this.#ports, repository.plan);
         if (!gate.allowed) return this.handleFailure(runId, attemptId, gate as Decision<unknown>);
@@ -611,6 +641,33 @@ export class ApprovedRunFinalizer {
     if (!latest || latest.candidateSnapshotDigest !== this.cp.runs.currentCandidate(runId)) return true;
     if (latest.retryNotBefore === null) return false;
     return this.cp.clock.now().getTime() >= Date.parse(latest.retryNotBefore);
+  }
+
+  /**
+   * #1189 B5 — a cap's notice that could not be enqueued (no CEO was bound to take it) is still owed. The sweep
+   * asks for it on each pass over a run it does not retry; it is enqueued once a CEO is bound, and only once. The
+   * run itself is not retried for it, and while no CEO is bound nothing is attempted or recorded.
+   */
+  deliverOwedHandOff(runId: string): void {
+    const run = this.cp.runs.get(runId);
+    if (!run || (run.state !== RunState.CEO_APPROVED && run.state !== RunState.MERGING)) return;
+    const candidateDigest = this.cp.runs.currentCandidate(runId);
+    if (!candidateDigest || !this.cp.bindings.active(roleKeyFor(Role.CEO))) return;
+    for (const entry of this.cp.audit.forRun(runId)) {
+      const { candidateSnapshotDigest, delivered, limit, failureCause } = entry.evidence;
+      if (entry.kind !== "FINALIZATION_HANDED_OFF" || candidateSnapshotDigest !== candidateDigest || delivered !== false ||
+          (limit !== "FAILURE" && limit !== "CANDIDATE") || typeof failureCause !== "string" ||
+          this.handedOff(runId, candidateDigest, limit, failureCause)) continue;
+      const notice = Object.fromEntries(HAND_OFF_NOTICE_FIELDS.map((field) => [field, entry.evidence[field] ?? null]));
+      const notified = this.cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, runId, { ...notice, whyItMatters: HAND_OFF_WHY });
+      if (!notified.allowed) return;
+      this.cp.audit.record({
+        kind: "FINALIZATION_HANDED_OFF",
+        runId,
+        reasonCode: entry.reasonCode as ReasonCode | null,
+        evidence: { ...entry.evidence, delivered: true, owedFrom: entry.at },
+      });
+    }
   }
 
   private wasPostMergeResumed(runId: string): boolean {
@@ -1091,8 +1148,8 @@ export class ApprovedRunFinalizer {
     }
     const merges = this.durableMergeReceipts(runId);
     // #1189 B5 (CEO ruling 4) — a merge request whose outcome is unknown is held, not settled: the run stays
-    // MERGING, so the next attempt's merge step reconciles its PENDING receipt, rather than BLOCKED_POST_MERGE,
-    // whose recovery reads only proven receipts.
+    // MERGING, so the next attempt reconciles its PENDING receipt before anything else, rather than
+    // BLOCKED_POST_MERGE, whose recovery reads only proven receipts.
     const unknown = merges.length > 0 && this.mergeOutcomeUnknown(runId);
     if (merges.length > 0 && !unknown) {
       const compensation = merges.map((receipt) => {
@@ -1262,7 +1319,8 @@ export class ApprovedRunFinalizer {
     }
 
     // A cap: nothing retries the run automatically any more, and the owner of the fix hears of it once (per
-    // failure, and once for the candidate's total), which the hand-off record keeps across restarts.
+    // failure, and once for the candidate's total), which the hand-off record keeps across restarts. A notice
+    // that could not be enqueued stays owed (`deliverOwedHandOff`).
     if (!this.handedOff(runId, candidateDigest, limit, route.failureCause)) {
       const handoff = {
         candidateSnapshotDigest: candidateDigest,
@@ -1275,14 +1333,11 @@ export class ApprovedRunFinalizer {
           ? `this candidate used its ${FINALIZATION_RETRY_CAP} automatic retries across different failures without merging; inspect its refusals and decide how the run proceeds`
           : route.action}. ${RETRIES_STOPPED}`,
         blocker: blockerOf(failure),
-      };
-      const notified = this.cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, runId, {
-        ...handoff,
         retries,
         retryCap: FINALIZATION_RETRY_CAP,
         reason: failure.message,
-        whyItMatters: "a CEO-approved run keeps being refused before its merge; it stays approved, and the daemon has stopped retrying it",
-      });
+      };
+      const notified = this.cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, runId, { ...handoff, whyItMatters: HAND_OFF_WHY });
       this.cp.audit.record({
         kind: "FINALIZATION_HANDED_OFF",
         runId,
@@ -1362,8 +1417,8 @@ export class ApprovedRunFinalizer {
    * #1189 B5 — whether every merge receipt the MERGING run holds is a PENDING reservation whose merge request
    * was sent and came back with an error status or nothing (the kernel's MERGE_OUTCOME_UNKNOWN, recorded no
    * earlier than the reservation), with nothing acknowledging a merge of that repository (MERGE_EXECUTED, or a
-   * drift record naming a merge commit). Such an outcome is still open, and the existing reconciliation of a
-   * PENDING receipt at the next merge step decides it: it re-reads the pull before any second merge request.
+   * drift record naming a merge commit). Such an outcome is still open, and the next attempt's reconciliation of
+   * its PENDING receipt, ahead of any replay, decides it: it re-reads the pull before any second merge request.
    */
   private mergeOutcomeUnknown(runId: string): boolean {
     if (this.cp.runs.get(runId)?.state !== RunState.MERGING) return false;
@@ -1449,6 +1504,28 @@ export class ApprovedRunFinalizer {
         ORDER BY created_at DESC, receipt_id DESC LIMIT 1`,
       [runId, repositoryIdentity],
     ) ?? null;
+  }
+
+  /**
+   * #1189 B5 — the newest merge receipt of this repository, with the pull it reserved, read from its exact key
+   * (`merge_execute:<repository>:<pull>`); null when there is none or the key names no pull.
+   */
+  private mergeReceiptPull(
+    runId: string,
+    repositoryIdentity: string,
+  ): { status: string; verified: number; pullNumber: number } | null {
+    const row = this.cp.db.get<{ idempotency_key: string; status: string; verified: number }>(
+      `SELECT idempotency_key, status, verified
+         FROM github_receipts
+        WHERE run_id = ? AND repository_identity = ? AND operation = 'merge_execute'
+        ORDER BY created_at DESC, receipt_id DESC LIMIT 1`,
+      [runId, repositoryIdentity],
+    );
+    const prefix = `merge_execute:${repositoryIdentity}:`;
+    if (!row?.idempotency_key.startsWith(prefix)) return null;
+    const pull = row.idempotency_key.slice(prefix.length);
+    if (!/^[1-9]\d*$/.test(pull)) return null;
+    return { status: row.status, verified: row.verified, pullNumber: Number(pull) };
   }
 
   private mergeSha(receipt: DurableMergeReceipt): string | null {
