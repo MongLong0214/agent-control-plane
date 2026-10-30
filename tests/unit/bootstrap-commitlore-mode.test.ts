@@ -17,6 +17,7 @@ import {
   prepareBootstrapRun,
   writesOf,
 } from "../helpers/bootstrap-runner.ts";
+import { gitCommitAttempt } from "../helpers/commitlore-attempt.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 
 /**
@@ -54,6 +55,9 @@ const FAIL: CommitLoreObservation = {
 /** A CommitLore double answering the n-th observation (1-based) with `answer(n)`, recording each path. */
 class FakeCommitLore implements CommitLorePort {
   readonly paths: string[] = [];
+  /** #1268 — the bootstrap's own commits, made by this double with plain git (`gitCommitAttempt`). */
+  readonly committed: string[] = [];
+  readonly attempt = gitCommitAttempt(this.committed);
   constructor(private readonly answer: (call: number) => CommitLoreObservation = () => PASS) {}
   async observe(checkoutPath: string): Promise<CommitLoreObservation> {
     this.paths.push(checkoutPath);
@@ -71,7 +75,11 @@ const storedResult = (prepared: PreparedBootstrapRun): RepoFactoryResult | null 
 
 describe("#246 B3: the bootstrap producer enforces the approved manifest's CommitLore mode", () => {
   it("B3-1a required, no CommitLore observer: refused before anything is consumed, read or written", async () => {
-    const prepared = await prepareBootstrapRun("b3-required-unobservable", { manifest: requiredManifest("b3-required-unobservable"), ops: pushOperations() });
+    const prepared = await prepareBootstrapRun("b3-required-unobservable", {
+      manifest: requiredManifest("b3-required-unobservable"),
+      ops: pushOperations(),
+      commitlore: null,
+    });
     const refused = await produce(prepared);
     expect(refused, JSON.stringify(refused)).toMatchObject({
       allowed: false,
@@ -191,32 +199,40 @@ describe("#246 B3: the bootstrap producer enforces the approved manifest's Commi
     expect(final["warnings"]).toEqual([]);
   });
 
-  it("B3-3 preferred, nothing observed: activates, named NOT_OBSERVED, and the port is never asked", async () => {
+  it("B3-3 (#1268) a new project that prefers CommitLore is refused at activation, before anything is written, and the port is never asked", async () => {
     const commitlore = new FakeCommitLore(() => FAIL);
     const prepared = await prepareBootstrapRun("b3-preferred", {
-      manifest: cleanTreeManifest("b3-preferred"),
+      manifest: cleanTreeManifest("b3-preferred", { commitlore: { mode: "preferred" } }),
       ops: pushOperations(),
       commitlore,
     });
-    const { beforeConfirm, final } = await activateAndConfirm(prepared);
-    expect(beforeConfirm["warnings"]).toEqual([{ commitlore: "NOT_OBSERVED", mode: "preferred" }]);
-    expect(final["warnings"]).toEqual([{ commitlore: "NOT_OBSERVED", mode: "preferred" }]);
-    expect(storedResult(prepared)!.bootstrapVerification.map((row) => row.commandId)).toEqual(["clean-tree"]);
+    const refused = await produce(prepared);
+    expect(refused, JSON.stringify(refused)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.VERIFICATION_GAP,
+      evidence: { stage: "precondition", refusal: "COMMITLORE_MODE_NOT_REQUIRED", commitloreMode: "preferred" },
+    });
+    expect(storedResult(prepared)).toBeNull();
     expect(commitlore.paths).toEqual([]);
+    expect(commitlore.committed).toEqual([]);
+    noGitHubCall(prepared);
   });
 
-  it("B3-4 an unsupported mode is refused by the manifest contract, and a missing one is the contract's explicit preferred", () => {
+  it("B3-4 an unsupported mode is refused by the manifest contract, and a missing one is the contract's explicit required (#1268)", () => {
     const run = { kind: RunKind.PROJECT_BOOTSTRAP, projectId: null };
     const unsupported = { ...cleanTreeManifest("b3-unsupported"), commitlore: { mode: "mandatory" } } as unknown as ProjectManifest;
     const plan = { ...bootstrapPlan(cleanTreeManifest("b3-unsupported")), projectManifest: unsupported };
     expect(planForSubmission(run, plan), "unsupported").toMatchObject({ allowed: false, evidence: { refusal: "MANIFEST_NOT_PORTABLE" } });
 
-    // Missing: the contract's default fills `preferred` before the digest, so the PLAN that is reviewed
+    // Missing: the contract's default fills `required` (#1268) before the digest, so the PLAN that is reviewed
     // and approved states it; nothing is lowered after approval.
     const { commitlore: _omitted, ...missing } = cleanTreeManifest("b3-missing");
-    const admitted = planForSubmission(run, { ...bootstrapPlan(cleanTreeManifest("b3-missing")), projectManifest: missing });
+    const admitted = planForSubmission(run, {
+      ...bootstrapPlan({ ...cleanTreeManifest("b3-missing"), commitlore: { mode: "required" } }),
+      projectManifest: missing,
+    });
     expect(admitted.allowed).toBe(true);
-    if (admitted.allowed) expect((admitted.value["projectManifest"] as ProjectManifest).commitlore).toEqual({ mode: "preferred" });
+    if (admitted.allowed) expect((admitted.value["projectManifest"] as ProjectManifest).commitlore).toEqual({ mode: "required" });
   });
 
   it("B3-5 no downgrade: a required run refused at the published head stays required, frozen, and is refused again on retry", async () => {

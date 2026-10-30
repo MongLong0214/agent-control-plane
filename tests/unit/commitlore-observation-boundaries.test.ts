@@ -1,11 +1,20 @@
 import { ChildProcess, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 
-import { COMMITLORE_LIMITS, commitloreRunner, createCommitLoreCliPort, probeCommitLore } from "../../src/bootstrap/commitlore-observation.ts";
+import {
+  COMMITLORE_LIMITS,
+  commitloreChildEnvironment,
+  commitloreRunner,
+  createCommitLoreCliPort,
+  observationGitTarget,
+  probeCommitLore,
+} from "../../src/bootstrap/commitlore-observation.ts";
+import { latestRelease } from "../helpers/commitlore-release.ts";
+import { hostGitDirectory, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 /**
@@ -27,6 +36,8 @@ afterAll(() => {
 });
 
 const root = tempDir("acp-s11-r1-boundaries-");
+/** #1268 — the production port on the pin in the environment; the fakes answer 1.7.3, confirmed as the newest release. */
+const envPort = () => createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, undefined, latestRelease("1.7.3")));
 const ok = JSON.stringify({ schema: "commitlore_doctor.v2", status: "ok", exitCode: 0, checks: [] });
 
 // Slice S16: what the runner asks a pinned CLI before any other command, answered as a supported one does.
@@ -41,9 +52,9 @@ else {`;
  */
 const fake = (name: string, body: string): string => {
   const dir = tempDir(`acp-s11-r1-${name}-`);
-  writeFileSync(join(dir, "package.json"), '{"type":"commonjs"}');
-  writeFileSync(join(dir, "commitlore"), `#!${process.execPath}\n${PIN_CHECKS}\n${body}\n}\n`, { mode: 0o700 });
-  vi.stubEnv("PATH", `${dir}:/usr/bin:/bin`);
+  // #1268 — installed as the installer installs it: a run copies the package its wrapper names.
+  writeCommitLoreInstall(dir, `${PIN_CHECKS}\n${body}\n}`);
+  vi.stubEnv("PATH", `${dir}:${hostGitDirectory()}:/usr/bin:/bin`);
   vi.stubEnv("ACP_COMMITLORE_BINARY", join(dir, "commitlore"));
   return dir;
 };
@@ -148,7 +159,7 @@ it("R1-01: CommitLore children receive no daemon authority variables, a known na
   for (const key of sentinels) vi.stubEnv(key, `review-only-${key}`);
   vi.stubEnv(unknownName, unknownValue);
 
-  expect((await createCommitLoreCliPort().observe(root)).outcome).toBe("PASS");
+  expect((await envPort().observe(root)).outcome).toBe("PASS");
   const observed = JSON.parse(readFileSync(capture, "utf8")) as Record<string, string>;
   expect(Object.fromEntries(sentinels.map((key) => [key, observed[key] ?? null]))).toEqual(
     Object.fromEntries(sentinels.map((key) => [key, null])),
@@ -171,10 +182,11 @@ it("R1-01: CommitLore children receive no daemon authority variables, a known na
     "GIT_CONFIG_NOSYSTEM",
     "GIT_TERMINAL_PROMPT",
     "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_KEY_0",
-    "GIT_CONFIG_VALUE_0",
     "GIT_ASKPASS",
+    "GIT_SSH_COMMAND",
+    // #1268 — the worker's git hardening bar the hooks path init installs into, the empty attribute source and
+    // no external diff: every value ACP's own.
+    ...Object.keys(commitloreChildEnvironment(root, observationGitTarget(root))).filter((key) => key.startsWith("GIT_")),
   ]);
   expect(Object.keys(observed).filter((key) => !constructed.has(key) && key !== "__CF_USER_TEXT_ENCODING")).toEqual([]);
   // The daemon's PATH is not handed to it (and, since slice S16, is not used to find it either).
@@ -202,7 +214,7 @@ it("R1-02: an output-overflowing child cannot keep the observation pending by ig
   // at 5.0-5.1 s under parallel load (s16-r1-fix-evidence/superseded/round-before-overflow-prep).
   prepareFixture(join(bin, "commitlore"), ["--version"]);
   let settled = false;
-  const pending = createCommitLoreCliPort()
+  const pending = envPort()
     .observe(root)
     .then((value) => {
       settled = true;
@@ -317,7 +329,8 @@ const observeExit0 = async (
   ChildProcess.prototype.kill = function (this: ChildProcess, signal?: NodeJS.Signals | number): boolean {
     if (this.pid !== undefined && this.exitCode === null && this.signalCode === null) {
       const pid = this.pid;
-      events.push({ kind: "signal", at: now(), pid, command: this.spawnargs[1] ?? "", armed: armedPids().includes(String(pid)) });
+      // #1268 — node runs the copied bundle: the command follows the bundle's path.
+      events.push({ kind: "signal", at: now(), pid, command: this.spawnargs[2] ?? "", armed: armedPids().includes(String(pid)) });
       if (!seen.has(this)) {
         seen.add(this);
         this.once("exit", (code, exitSignal) => events.push({ kind: "exit", at: now(), pid, code, signal: exitSignal }));
@@ -326,7 +339,7 @@ const observeExit0 = async (
     return realKill.call(this, signal);
   };
   try {
-    const run = commitloreRunner({ ...COMMITLORE_LIMITS, ...limits }, bin);
+    const run = commitloreRunner({ ...COMMITLORE_LIMITS, ...limits }, bin, latestRelease("1.7.3"));
     const settledWithin = limits.timeoutMs + holdMs + limits.killGraceMs + 3_000;
     const observed = await Promise.race([
       createCommitLoreCliPort(run).observe(root),
@@ -436,7 +449,7 @@ it("lead-3: a successful init that creates a checkout file is refused by the pro
     else console.log(${JSON.stringify(ok)});
   `,
   );
-  expect(await probeCommitLore(createCommitLoreCliPort())).toMatchObject({
+  expect(await probeCommitLore(envPort())).toMatchObject({
     allowed: false,
     evidence: { refusal: "COMMITLORE_CHANGED_CHECKOUT", at: "probe" },
   });

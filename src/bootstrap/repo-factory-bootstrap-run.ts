@@ -19,7 +19,7 @@ import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
-import type { ACPBootstrapActivationResult, BootstrapActivation } from "./activation.ts";
+import { type ACPBootstrapActivationResult, type BootstrapActivation, newProjectCommitLore } from "./activation.ts";
 import { type GroupMember, processGroupEmpty, processGroupMembership } from "./attempt-writer-group.ts";
 import { type BootstrapWriteRequest, runUnderWriteGuard } from "./bootstrap-write-guard.ts";
 import { type CommitLoreObservation, type CommitLorePort, commitloreRequired, probeCommitLore, verifyCommitLoreBinding } from "./commitlore-observation.ts";
@@ -708,6 +708,13 @@ export class RepoFactoryBootstrapRunner {
       // owner's approval is consumed or GitHub is read or written: no observer, or a probe that does not
       // pass, refuses here, and a new run reserves nothing. The PLAN stays as approved; nothing lowers its
       // mode. The observation the result reports is made again in the checkout, at the published head.
+      // #1268 — and a new project's manifest that does not require CommitLore activates nothing, so it is
+      // refused here, before anything is consumed, read or written, as activation would refuse it after.
+      const newProject = newProjectCommitLore(input.approvedManifest);
+      if (!newProject.allowed) {
+        if (existing !== null) this.deps.applications.recordRefusal(runId, refusalRecord(newProject, "precondition"));
+        return atStage(newProject as Decision<ACPBootstrapActivationResult>, "precondition");
+      }
       if (commitloreRequired(commitlore.mode)) {
         const probed = await probeCommitLore(commitlore.port);
         if (!probed.allowed) {

@@ -1,5 +1,6 @@
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
+import { createCommitLoreCliPort } from "../../src/bootstrap/commitlore-observation.ts";
 import { COMMITLORE_BINARY_VARIABLE } from "../../src/bootstrap/commitlore-pin.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanTreeManifest, bootstrapOperations } from "../helpers/bootstrap-plan.ts";
@@ -48,6 +49,8 @@ describe("a dogfood finding is recorded in ACP storage by its production produce
     const prepared = await prepareBootstrapRun("dogfood-probe", {
       manifest: cleanTreeManifest("dogfood-probe", { commitlore: { mode: "required" } }),
       ops: bootstrapOperations() as Operation[],
+      // The production port, which finds no pinned CLI.
+      commitlore: createCommitLoreCliPort(),
     });
     const { harness } = prepared;
     const input = { ...prepared.input, ownerApproval: ownerApprovalFor(prepared) };
