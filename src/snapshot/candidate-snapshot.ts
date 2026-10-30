@@ -331,7 +331,8 @@ export const duplicateRepositoryRoles = (
  * a re-plan is a different candidate. A snapshot without `bootstrapPlan` digests exactly the four
  * fields it always did — the key is left out, not set to null — so no existing digest moves. The
  * same holds for a CONTRACT_CHANGE candidate's `contractChange` (#246 B2-a) and its canonical CTO
- * identity baseline (`canonicalCtoIdentity`).
+ * identity baseline (`canonicalCtoIdentity`), and a STANDARD_WORK candidate's private review evidence
+ * (`reviewEvidence`): a candidate frozen with other evidence is a different candidate, reviewed again.
  */
 export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
   digestOf({
@@ -342,6 +343,7 @@ export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
     ...(snapshot.bootstrapPlan === undefined ? {} : { bootstrapPlan: snapshot.bootstrapPlan }),
     ...(snapshot.contractChange === undefined ? {} : { contractChange: snapshot.contractChange }),
     ...(snapshot.canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity: snapshot.canonicalCtoIdentity }),
+    ...(snapshot.reviewEvidence === undefined ? {} : { reviewEvidence: snapshot.reviewEvidence }),
   });
 
 /**

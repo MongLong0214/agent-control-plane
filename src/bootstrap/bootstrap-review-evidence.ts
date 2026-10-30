@@ -55,8 +55,7 @@ export interface FrozenReviewEvidence {
 export type FrozenReviewEvidenceReference = Omit<FrozenReviewEvidence, "bundle">;
 const referenceOf = ({ bundle: _bundle, ...reference }: FrozenReviewEvidence): FrozenReviewEvidenceReference => reference;
 
-/** Also the bundle check of a STANDARD_WORK run's review evidence (review/standard-review-evidence.ts). */
-export const parseBundle = (body: string, input: Pick<ReviewEvidenceInput, "runId" | "contractDigest" | "expectedSha256">): Decision<ReviewEvidenceBundle> => {
+const parseBundle = (body: string, input: ReviewEvidenceInput): Decision<ReviewEvidenceBundle> => {
   const bytes = Buffer.from(body, "utf8");
   if (bytes.length > BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES || bytes.toString("utf8") !== body) {
     return deny(ReasonCode.INVALID_ARGUMENT, `review evidence bundle exceeds the ${BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES}-byte UTF-8 staging limit; no automatic summaries, split uploads or external references. Explicit excerpts must identify the original digest and line ranges and preserve failure, fix and result sections`);
@@ -232,7 +231,7 @@ const redactedFacts = (verification: ReviewRecordVerification): ReviewRecordVeri
   }),
 });
 
-export async function originalReviewRecords<S>(record: { bundle: ReviewEvidenceBundle; source: S; digest: string } | null,
+export async function originalReviewRecords(record: FrozenReviewEvidence | null,
   verify?: (file: ReviewEvidenceFile) => Promise<ReviewRecordVerification>) {
   if (!record) return null;
   const files = [];

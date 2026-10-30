@@ -20,7 +20,7 @@ import type { CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts
 import { FakeGitHub } from "../helpers/fake-github.ts";
 import { GitDataGitHub, bareRemoteAt } from "../helpers/git-data-github.ts";
 import { cleanupTempDirs, commitAll, tempDir, writeFiles } from "../helpers/fixtures.ts";
-import { applyPassingChange, bindCeo, bindWorker, dispatchBootstrapRun, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import { applyPassingChange, bindCeo, bindWorker, dispatchBootstrapRun, makeHarness, ownerDecisionReceipt, registerFixtureProject } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -36,15 +36,18 @@ const WORKFLOW = "name: project-ci\non: [push]\njobs:\n  test:\n    runs-on: ubu
 const GIT_DATA = /\/git\/(?:blobs|trees|commits|refs)$|\/git\/ref\/heads\/|\/branches\?/;
 type HttpMethod = "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
 
-const bundleFor = (runId: string, contractDigest: string, text: string) => {
-  const body = `## result\n${text}\n`;
+const SOURCE = "a synthetic private source the excerpt is cut from";
+const EXCERPT = { originalSha256: sha256(SOURCE), omitted: true, ranges: [
+  { section: "failure", startLine: 4, endLine: 4 }, { section: "fix", startLine: 9, endLine: 9 }, { section: "result", startLine: 12, endLine: 12 }] };
+const fileFor = (body: string, excerpt: Args | undefined = EXCERPT) => {
   const bytes = Buffer.from(body, "utf8");
-  return JSON.stringify({ runId, contractDigest, missing: ["the owner's full original thread"], files: [{
-    path: "handoff/excerpt.md", sha256: sha256(bytes), origin: "private handoff, synthetic", grade: "review-original", bodyBase64: bytes.toString("base64"),
-  }] });
+  return { path: "handoff/excerpt.md", sha256: sha256(bytes), origin: "private handoff, synthetic", grade: "review-original",
+    bodyBase64: bytes.toString("base64"), ...(excerpt ? { excerpt } : {}) };
 };
+const bundleFor = (runId: string, contractDigest: string, text: string, files: Args[] = [fileFor(`## result\n${text}\n`)]) =>
+  JSON.stringify({ runId, contractDigest, missing: ["the rest of the source"], files });
 
-async function fixture(options: { finalization?: boolean } = {}) {
+async function fixture(options: { finalization?: boolean; humanGate?: string[] } = {}) {
   const github = new FakeGitHub();
   const log: Array<{ method: HttpMethod; path: string; body?: unknown }> = [];
   const holder: { gitData: GitDataGitHub | null } = { gitData: null };
@@ -68,7 +71,7 @@ async function fixture(options: { finalization?: boolean } = {}) {
     : {});
   const ceo = bindCeo(h);
   const contract = { goal: "make app() return 2", why: "downstream callers expect 2", scope: ["src/app.js"], nonGoals: [],
-    acceptance: ["verify.js exits 0"], priority: "NORMAL" as const, humanGate: [], references: [] };
+    acceptance: ["verify.js exits 0"], priority: "NORMAL" as const, humanGate: options.humanGate ?? [], references: [] };
   const created = h.cp.runs.create({ projectId, executionMode: ExecutionMode.STANDARD, contract,
     repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }] });
   if (!created.allowed) throw new Error(created.message);
@@ -369,6 +372,119 @@ describe("derived outputs of a review that read private evidence", () => {
 
       expect(f.refusals.length).toBe(0);
       expect(f.h.cp.bindings.active(roleKeyFor(Role.CEO))?.sessionId).toBe(f.ceo);
+    } finally { await f.close(); }
+  });
+});
+
+describe("review round 1: evidence binds candidate identity, audit text, owner consent and excerpt size", () => {
+  it("R1 a re-freeze after a replacement is a new candidate, and the earlier review's packet confirms neither", async () => {
+    const f = await fixture();
+    try {
+      expect(await f.stage("stage-a", MARKER)).toMatchObject({ ok: true });
+      expect(await f.attach("attach-a", MARKER)).toMatchObject({ ok: true });
+      f.h.scripted.script({ match: /Candidate review/, text: pass(f.identity) });
+      expect(await f.submit()).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+      const reviewed = f.h.cp.runs.currentCandidate(f.run.runId)!;
+      expect(await f.stage("stage-b", `${MARKER} second`)).toMatchObject({ ok: true });
+      expect(await f.attach("attach-b", `${MARKER} second`, { replacesSha256: sha256(bundleFor(f.run.runId, f.run.contractDigest, MARKER)) })).toMatchObject({ ok: true });
+      expect(f.confirm(reviewed)).toMatchObject({ allowed: false, reasonCode: "EVIDENCE_STALE" });
+      const refrozen = await f.h.cp.pipeline.freeze(f.run.runId);
+      if (!refrozen.allowed) throw new Error(refrozen.message);
+      const current = f.h.cp.runs.currentCandidate(f.run.runId)!;
+      expect(current).not.toBe(reviewed);
+      expect(f.confirm(current)).toMatchObject({ allowed: false });
+      expect(f.confirm(reviewed)).toMatchObject({ allowed: false });
+      expect(f.h.cp.runs.require(f.run.runId).state).not.toBe(RunState.CEO_APPROVED);
+    } finally { await f.close(); }
+  });
+
+  it("R2 omissions and findings that echo private evidence never reach the audit log", async () => {
+    const f = await fixture();
+    try {
+      expect(await f.stage("stage-a", MARKER)).toMatchObject({ ok: true });
+      expect(await f.attach("attach-a", MARKER)).toMatchObject({ ok: true });
+      const echoed = `see ${MARKER}`;
+      f.h.scripted.script({ match: /Candidate review/, text: pass(f.identity, { omittedItems: [echoed], findings: [
+        { category: "correctness", severity: "MAJOR", repository: f.identity, path: "src/app.js", summary: echoed, detail: echoed },
+        { category: "method", severity: "MAJOR", repository: f.identity, path: null, summary: echoed, detail: echoed },
+      ] }) });
+      const outcome = await f.submit();
+      expect(outcome.allowed).toBe(true);
+      const rows = f.h.cp.db.all<Args>("SELECT * FROM audit_events");
+      expect(rows.filter((row) => JSON.stringify(row).includes(MARKER)).map((row) => row["kind"])).toEqual([]);
+      const completed = f.h.cp.audit.byKind("BLIND_REVIEW_COMPLETED").at(-1)!;
+      expect(completed.evidence).toMatchObject({ omittedItems: 1, omittedItemsDigest: digestOf([echoed]), findings: 1 });
+    } finally { await f.close(); }
+  });
+
+  it("R3 owner consent given under replaced evidence does not count for CONFIRM; consent under the current evidence does", async () => {
+    const item = "irreversible production action";
+    const f = await fixture({ humanGate: [item] });
+    try {
+      expect(await f.stage("stage-a", MARKER)).toMatchObject({ ok: true });
+      expect(await f.attach("attach-a", MARKER)).toMatchObject({ ok: true });
+      f.h.scripted.script({ match: /Candidate review/, text: pass(f.identity) });
+      expect(await f.submit()).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+      const underA = f.h.cp.runs.currentCandidate(f.run.runId)!;
+      expect(f.h.cp.ceo.humanGateStatus(f.run.runId)).toMatchObject({ required: true, satisfied: false });
+      const consent = (note: string) => f.h.cp.ceo.recordOwnerDecision({ runId: f.run.runId, item, approved: true, note,
+        receipt: ownerDecisionReceipt(f.h, f.run.runId, item, true, note) });
+      expect(consent("yes under A")).toMatchObject({ allowed: true });
+      expect(f.h.cp.ceo.humanGateStatus(f.run.runId).satisfied).toBe(true);
+
+      expect(await f.stage("stage-b", `${MARKER} second`)).toMatchObject({ ok: true });
+      expect(await f.attach("attach-b", `${MARKER} second`, { replacesSha256: sha256(bundleFor(f.run.runId, f.run.contractDigest, MARKER)) })).toMatchObject({ ok: true });
+      expect(f.h.cp.ceo.submitCeoDecision({ runId: f.run.runId, decision: "FINAL_REVISE", candidateSnapshotDigest: underA, ceoSessionId: f.ceo,
+        rationale: "review again with the replaced evidence" })).toMatchObject({ allowed: true });
+      const redispatched = await f.h.cp.runs.dispatch(f.run.runId);
+      if (!redispatched.allowed) throw new Error(redispatched.message);
+      f.h.scripted.script({ match: /Candidate review/, text: pass(f.identity) });
+      expect(await f.submit()).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+      const underB = f.h.cp.runs.currentCandidate(f.run.runId)!;
+      expect(f.reviews().at(-1)!.content.inputManifest.reviewEvidence?.bundleSha256).toBe(sha256(bundleFor(f.run.runId, f.run.contractDigest, `${MARKER} second`)));
+
+      expect(f.h.cp.ceo.humanGateStatus(f.run.runId).satisfied).toBe(false);
+      expect(f.confirm(underB)).toMatchObject({ allowed: false, reasonCode: "HUMAN_GATE_UNSATISFIED" });
+      expect(consent("yes under B")).toMatchObject({ allowed: true });
+      expect(f.confirm(underB)).toMatchObject({ allowed: true });
+    } finally { await f.close(); }
+  });
+
+  it("R4b accepts allowlist-style excerpts labelled with the neutral excerpt range kind and a short purpose", async () => {
+    const f = await fixture();
+    try {
+      const allowlist = (path: string, line: number, text: string) => ({ ...fileFor(`${text}\n`, { originalSha256: sha256(SOURCE), omitted: true,
+        ranges: [{ section: "excerpt", purpose: "owner allowlist entry", startLine: line, endLine: line }] }), path });
+      const evidenceBody = bundleFor(f.run.runId, f.run.contractDigest, "", [
+        allowlist("handoff/allow-1.md", 12, `${MARKER} allowed path one`), allowlist("handoff/allow-2.md", 40, `${MARKER} allowed path two`)]);
+      expect(await f.stage("allowlist", "", { evidenceBody, expectedSha256: sha256(evidenceBody) })).toMatchObject({ ok: true });
+      expect(await f.attach("attach-allowlist", "", { expectedSha256: sha256(evidenceBody) })).toMatchObject({ ok: true });
+      f.h.scripted.script({ match: /Candidate review/, text: pass(f.identity) });
+      expect(await f.submit()).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+      const [input] = f.reviewerInputs();
+      expect(input).toContain(`${MARKER} allowed path one`);
+      expect(input).toContain(`${MARKER} allowed path two`);
+      expect(input).toContain('"section":"excerpt","purpose":"owner allowlist entry"');
+    } finally { await f.close(); }
+  });
+
+  it("R4 refuses a whole source, a file without an excerpt declaration, and an excerpt over its size or line bound", async () => {
+    const f = await fixture();
+    try {
+      const conversation = Array.from({ length: 40 }, (_, i) => `owner, turn ${i}: ${i === 7 ? MARKER : "an unrelated private passage"}`).join("\n") + "\n";
+      const stageFiles = (key: string, files: Args[]) => {
+        const evidenceBody = bundleFor(f.run.runId, f.run.contractDigest, "", files);
+        return f.stage(key, "", { evidenceBody, expectedSha256: sha256(evidenceBody) });
+      };
+      expect(await stageFiles("no-excerpt", [fileFor(conversation, undefined)])).toMatchObject({ ok: false, reasonCode: "INVALID_ARGUMENT" });
+      expect(await stageFiles("more-lines-than-ranges", [fileFor(conversation)])).toMatchObject({ ok: false, reasonCode: "INVALID_ARGUMENT" });
+      const whole = fileFor("## result\nall of it\n");
+      expect(await stageFiles("whole-source", [{ ...whole, excerpt: { ...EXCERPT, originalSha256: whole.sha256 } }])).toMatchObject({ ok: false, reasonCode: "INVALID_ARGUMENT" });
+      const oversized = `${"x".repeat(17_000)}\n`;
+      expect(await stageFiles("oversized", [fileFor(oversized)])).toMatchObject({ ok: false, reasonCode: "INVALID_ARGUMENT" });
+      expect(f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF")).toEqual([]);
+      for (const refusal of f.refusals) expect(refusal).not.toContain(MARKER);
+      expect(await f.stage("excerpt", MARKER)).toMatchObject({ ok: true });
     } finally { await f.close(); }
   });
 });

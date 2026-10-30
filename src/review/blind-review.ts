@@ -756,8 +756,7 @@ export class BlindReviewGate {
     let reviewEvidence: FrozenStandardReviewEvidence | null;
     try { reviewEvidence = frozenStandardReviewEvidence({ artifacts: this.artifacts, audit: this.audit }, request.snapshot); }
     catch { return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "frozen review evidence failed validation", { runId: request.runId }); }
-    const originals = await originalReviewRecords(reviewEvidence, this.#verifyOriginalRecord);
-    const privateEvidence = originals === null ? [] : standardReviewEvidenceSection(originals);
+    const privateEvidence = reviewEvidence === null ? [] : standardReviewEvidenceSection(reviewEvidence);
 
     const expected = candidateCoverageTargets(request.snapshot, change);
     const reviewers: ReviewerBinding[] = [];
@@ -1076,7 +1075,11 @@ export class BlindReviewGate {
         model: authoritativeReviewer.preference.model,
         effort: authoritativeReviewer.preference.effort,
         coveredFiles: validated.coveredFiles.length,
-        omittedItems: validated.omittedItems,
+        // A reviewer that read private evidence can echo it in any text it returns: its omissions are a count
+        // and a digest here, never its words (the findings are already a count).
+        ...(validated.inputManifest.reviewEvidence === undefined
+          ? { omittedItems: validated.omittedItems }
+          : { omittedItems: validated.omittedItems.length, omittedItemsDigest: digestOf(validated.omittedItems) }),
         chunked,
         findings: validated.findings.length,
         egressRecords: validated.egressEvidence.length,
