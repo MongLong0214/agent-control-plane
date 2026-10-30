@@ -574,6 +574,54 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     await daemon.stop();
   });
 
+  for (const [field, rewrite] of [
+    ["body", (pull: { body?: string | null }) => { pull.body = "Closes #999"; }],
+    ["title", (pull: { title?: string }) => { pull.title = "Closes #999"; }],
+  ] as const) {
+    it(`a merge request held unknown whose pull ${field} was rewritten while unmerged is never sent again by its settlement: the read releases it, and preparation refuses the rewritten pull as on the ordinary path`, async () => {
+      let fail = true;
+      let fixture: Fixture | null = null;
+      fixture = await approved({
+        before: (method, path, body) => {
+          if (isMergePut(method, path) && fail) {
+            fail = false;
+            fixture!.github.calls.push({ method, path, body });
+            throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method, status: 502 });
+          }
+        },
+      });
+      const { harness, driven, daemon } = fixture;
+      expect((await daemon.start()).allowed).toBe(true);
+      expectHeld(fixture, { status: 502, outcome: "answered" });
+      for (const pull of fixture.github.pulls) rewrite(pull);
+      const callsBefore = fixture.github.calls.length;
+      for (let sweep = 0; sweep < 2; sweep += 1) {
+        harness.clock.advance(2 * MINUTE);
+        await daemon.resumeApprovedRuns();
+      }
+      const after = fixture.github.calls.slice(callsBefore);
+      expect(after[0]!.method).toBe("GET");
+      expect(after[0]!.path).toMatch(/\/pulls\/\d+$/);
+      expect(after.filter((call) => call.method !== "GET")).toEqual([]);
+      expect(mergePuts(fixture)).toBe(1);
+      expect(fixture.github.mergeCount).toBe(0);
+      // Proven unmerged, nothing was applied: the reservation is gone, and the pull it named is refused by
+      // preparation's live re-read, as an ordinary attempt refuses it.
+      expect(pendingMergeReceipts(fixture)).toEqual([]);
+      const refusals = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_ATTEMPT_FAILED").slice(1);
+      expect(refusals.length).toBeGreaterThan(0);
+      for (const refused of refusals) {
+        expect(refused.reasonCode).toBe(ReasonCode.RESOURCE_COLLISION);
+        expect(refused.evidence).toMatchObject({
+          disposition: "RETRY", failureClass: "UNCLASSIFIED", pullNumber: fixture.github.pulls[0]!.number,
+        });
+      }
+      expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.MERGING);
+      expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_BLOCKED_POST_MERGE")).toHaveLength(0);
+      await daemon.stop();
+    });
+  }
+
   it("a cap reached while no CEO is bound keeps its notice owed, without retrying the run: once a CEO is bound the next sweep sends it, exactly once", async () => {
     const fixture = await approved();
     const { harness, driven, daemon } = fixture;

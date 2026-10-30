@@ -418,16 +418,17 @@ export class ApprovedRunFinalizer {
       if (!plans.allowed) return this.handleFailure(runId, attemptId, plans as Decision<unknown>);
 
       // #1189 B5 — a merge request this run already sent is settled before anything is replayed: the replay
-      // would read the pull it may have merged (GitHub closes a merged pull) or whose base has moved, and refuse
-      // before the merge step could reconcile it. The kernel's merge step re-reads the pull first: merged, the
-      // merge is proven and its receipt kept; unmerged, the reservation goes and the merge is evaluated again,
-      // so a moved base or a conflict is refused as before any merge. A merged pull is never treated as closed.
+      // would read the pull it may have merged (GitHub closes a merged pull) and refuse it as closed. Settlement
+      // only reads the pull and records what the read establishes: merged, the merge is proven and its receipt
+      // kept; unmerged, nothing was applied and the reservation goes, and the ordinary path below publishes,
+      // prepares (re-reading the pull's title and body), gates and evaluates before any new merge request; a read
+      // that cannot tell keeps the receipt PENDING and the run held. A merged pull is never treated as closed.
       if (this.cp.runs.require(runId).state === RunState.MERGING) {
         for (const plan of plans.value) {
           const receipt = this.mergeReceiptPull(runId, plan.repositoryIdentity);
           if (receipt?.status !== "PENDING") continue;
           this.touchAttempt(runId, attemptId, `RECONCILE_MERGE:${plan.repositoryIdentity}`);
-          const settled = await executePreparedConfirmedMerge(this.#ports, plan, receipt.pullNumber);
+          const settled = await this.cp.github.mergeSettle({ ...plan.merge, pullNumber: receipt.pullNumber });
           if (!settled.allowed) return this.handleFailure(runId, attemptId, settled as Decision<unknown>);
         }
       }
