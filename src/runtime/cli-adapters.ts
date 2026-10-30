@@ -1,9 +1,11 @@
 import { spawn } from "node:child_process";
 import {
   accessSync,
+  chmodSync,
   constants,
   existsSync,
   lstatSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -48,6 +50,8 @@ import {
   type InvocationResult,
   type ProviderAdapter,
   type TransmittedInput,
+  type TurnScratchListing,
+  TurnScratchThrown,
   ProviderSessionProvisionError,
   REVIEWER_EGRESS_DENY_PROBE_ENDPOINTS,
   type ReviewerEgressConfig,
@@ -800,6 +804,12 @@ const productionRunCli = async (
     workerTurn?: boolean;
     /** #1246 — with `workerTurn`: git configuration the child's git applies over the repository's. */
     gitConfig?: Readonly<Record<string, string>>;
+    /**
+     * With `"codex-workspace-write"`: the turn's private temporary directory, the one writable root
+     * its sandbox adds to the checkout. The child's TMPDIR and the caches that do not follow TMPDIR
+     * point into it.
+     */
+    turnTemp?: string;
   },
 ): Promise<{
   stdout: string;
@@ -881,6 +891,14 @@ const productionRunCli = async (
         environment[`GIT_CONFIG_KEY_${index}`] = key;
         environment[`GIT_CONFIG_VALUE_${index}`] = value;
       });
+    }
+    // Set after the allowlist, so an inherited value cannot point a tool back at the checkout. Node's
+    // compile cache otherwise follows TMPDIR; xcrun keeps `xcrun_db` in the per-user temp directory
+    // unless `xcrun_db` names an absolute path.
+    if (codexWorkspaceWrite && options.turnTemp !== undefined) {
+      environment["TMPDIR"] = options.turnTemp;
+      environment["NODE_COMPILE_CACHE"] = join(options.turnTemp, "node-compile-cache");
+      environment["xcrun_db"] = join(options.turnTemp, "xcrun_db");
     }
     if (egress) {
       // The child receives only the loopback proxy route. Do not let a caller-supplied
@@ -2927,6 +2945,103 @@ export const REVIEWER_TRANSPORT_SEPARATOR = "\n\n---\n\n";
 export const reviewerTransportInput = (request: Pick<InvocationRequest, "systemPrompt" | "prompt">): string =>
   request.systemPrompt ? `${request.systemPrompt}${REVIEWER_TRANSPORT_SEPARATOR}${request.prompt}` : request.prompt;
 
+const TURN_SCRATCH_PATHS = 50;
+const TURN_SCRATCH_WALK_LIMIT = 10_000;
+
+/**
+ * What a GPT worker turn left in its temporary directory: file count, bytes and the first sorted
+ * relative paths. Bounded, and a symbolic link is counted as a file, never followed.
+ */
+const turnScratchListing = (root: string): TurnScratchListing => {
+  const paths: string[] = [];
+  let bytes = 0;
+  let visited = 0;
+  let unread = false;
+  const pending = [""];
+  while (pending.length > 0 && visited < TURN_SCRATCH_WALK_LIMIT) {
+    const directory = pending.pop()!;
+    let entries: string[] = [];
+    try {
+      entries = readdirSync(join(root, directory));
+    } catch {
+      unread = true;
+      continue;
+    }
+    for (const name of entries) {
+      if (visited >= TURN_SCRATCH_WALK_LIMIT) break;
+      visited += 1;
+      const path = directory === "" ? name : `${directory}/${name}`;
+      try {
+        const entry = lstatSync(join(root, path));
+        if (entry.isDirectory()) {
+          pending.push(path);
+          continue;
+        }
+        bytes += entry.size;
+      } catch {
+        // Gone since it was listed; still named.
+      }
+      paths.push(path);
+    }
+  }
+  paths.sort();
+  return {
+    files: paths.length,
+    bytes,
+    paths: paths.slice(0, TURN_SCRATCH_PATHS),
+    complete: !unread && pending.length === 0 && visited < TURN_SCRATCH_WALK_LIMIT,
+  };
+};
+
+const errorCode = (error: unknown): string =>
+  typeof (error as NodeJS.ErrnoException | null)?.code === "string" ? (error as NodeJS.ErrnoException).code! : "UNKNOWN";
+
+/**
+ * Gives the owner read, write and search on `root` and every directory under it, so it can be
+ * removed. No file's mode is changed, a symbolic link is never followed or changed, and nothing
+ * outside `root` is touched. Bounded like the listing; a failure on one entry leaves the rest to the
+ * removal.
+ */
+const restoreOwnerAccess = (root: string): void => {
+  let visited = 0;
+  const pending = [""];
+  while (pending.length > 0 && visited < TURN_SCRATCH_WALK_LIMIT) {
+    const relative = pending.pop()!;
+    const path = relative === "" ? root : join(root, relative);
+    visited += 1;
+    try {
+      // Directories only, never through a link: removing a file needs write permission on its
+      // directory, not on the file, and a file here may be a hard link to one in the checkout.
+      const entry = lstatSync(path);
+      if (!entry.isDirectory()) continue;
+      chmodSync(path, (entry.mode & 0o7777) | 0o700);
+      for (const name of readdirSync(path)) pending.push(relative === "" ? name : `${relative}/${name}`);
+    } catch {
+      // Left to the removal, which reports what remains.
+    }
+  }
+};
+
+/**
+ * Removes a turn's scratch. A failed removal never replaces the turn's outcome: it is retried once
+ * with owner access restored inside the scratch, and the result is a note — the path, the error code
+ * and whether the directory was left — never its contents. Undefined when the first removal worked.
+ */
+const removeTurnScratch = (root: string): TurnScratchListing["cleanup"] => {
+  try {
+    rmSync(root, { recursive: true, force: true });
+    return undefined;
+  } catch (first) {
+    restoreOwnerAccess(root);
+    try {
+      rmSync(root, { recursive: true, force: true });
+      return { path: root, code: errorCode(first), left: false };
+    } catch (second) {
+      return { path: root, code: errorCode(second), left: true };
+    }
+  }
+};
+
 /**
  * Grounded: Codex CLI 0.164.0's model catalogue gives gpt-6.1-sol `context_window` 500,000 tokens and
  * `effective_context_window_percent` 95, so 475,000 usable tokens.
@@ -3148,6 +3263,31 @@ export class CodexCliAdapter implements ProviderAdapter {
     if (request.isolation) {
       return this.invokePacketReviewer(request, started);
     }
+    // Only a GPT worker turn drops the outer profile; see `invokeExec`. It gets its own temporary
+    // directory, created per execution, outside the checkout and apart from the `-o` scratch, and
+    // removed here on every exit path. Nothing else removes or reuses it.
+    const gptWorkerTurn = request.readOnly === false
+      && request.externalSessionId !== undefined
+      && request.onSpawn !== undefined;
+    if (!gptWorkerTurn) return this.invokeExec(request, started, undefined);
+    const turnTemp = realpathSync(acpScratchDir("acp-codex-turn-"));
+    // Listed on every exit path once the invocation has ended, before the directory is removed: with
+    // the result, a broker refusal and a timeout included, or with the error the invocation threw.
+    // The removal cannot replace either; a failed one is noted on the listing.
+    let outcome: { result: InvocationResult } | { thrown: unknown };
+    try {
+      outcome = { result: await this.invokeExec(request, started, turnTemp) };
+    } catch (error) {
+      outcome = { thrown: error };
+    }
+    const listing = turnScratchListing(turnTemp);
+    const cleanup = removeTurnScratch(turnTemp);
+    const turnScratch = cleanup === undefined ? listing : { ...listing, cleanup };
+    if ("thrown" in outcome) throw new TurnScratchThrown(outcome.thrown, turnScratch);
+    return { ...outcome.result, turnScratch };
+  }
+
+  private async invokeExec(request: InvocationRequest, started: number, turnTemp: string | undefined): Promise<InvocationResult> {
     // Resolved: seatbelt matches real paths, and this directory is the one the child must be
     // able to write `-o` into. It is not the checkout; the guard still names that.
     const scratch = realpathSync(acpScratchDir("acp-codex-"));
@@ -3162,23 +3302,23 @@ export class CodexCliAdapter implements ProviderAdapter {
     args.push("-s", request.readOnly ? "read-only" : "workspace-write");
     // Only a GPT worker turn drops the outer profile. Codex `workspace-write` otherwise also
     // opens /tmp and $TMPDIR, and network follows `[sandbox_workspace_write]`. These keys are
-    // that table (codex 0.163.0): the checkout is the only writable root, and network is off.
+    // that table (codex 0.163.0): the checkout and the turn's own temporary directory are the only
+    // writable roots, and network is off. Without that directory the checkout was the only place
+    // a tool's temporary files and caches could land, and the turn was refused for them.
     // `--ignore-user-config` skips only `$CODEX_HOME/config.toml`. A project `.codex/config.toml`
-    // or a profile can still grant `writable_roots`, so the worker pins that list to empty on
-    // the `-c` layer, which overrides those surviving layers. Login probes, read-only exec, and
+    // or a profile can still grant `writable_roots`, so the worker pins that list on the `-c`
+    // layer, which overrides those surviving layers. Login probes, read-only exec, and
     // a writable exec that forgot `onSpawn` do not get them. `-o` stays in ACP scratch, outside
     // the checkout. The parent Codex process writes that file after the turn; the path is not a
     // workspace-write root and is not passed with `--add-dir`, so a sandboxed shell cannot write
     // it. The ACP parent reads the file after the child exits.
-    const gptWorkerTurn = request.readOnly === false
-      && request.externalSessionId !== undefined
-      && request.onSpawn !== undefined;
+    const gptWorkerTurn = turnTemp !== undefined;
     if (gptWorkerTurn) {
       args.push(
         "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
         "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
         "-c", "sandbox_workspace_write.network_access=false",
-        "-c", "sandbox_workspace_write.writable_roots=[]",
+        "-c", `sandbox_workspace_write.writable_roots=${JSON.stringify([turnTemp])}`,
       );
     }
     // Codex rejects `--session-id`. The worker session is the argv element after `--thread-source`,
@@ -3210,7 +3350,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       // fails closed. The broker still authorises the checkout before launch.
       writablePaths: [...writablePaths, ...this.codexWritableRoots(scratch)],
       readablePaths: { subtrees: this.codexWritableRoots(scratch) },
-      ...(gptWorkerTurn ? { sandbox: "codex-workspace-write" as const, workerTurn: true, gitConfig: request.gitConfig } : {}),
+      ...(gptWorkerTurn ? { sandbox: "codex-workspace-write" as const, workerTurn: true, gitConfig: request.gitConfig, turnTemp } : {}),
       ...(tracked ? { onSpawn: request.onSpawn, signal: request.signal, reapProcessGroup: true as const } : {}),
     });
     let result: Awaited<ReturnType<typeof runCli>>;
