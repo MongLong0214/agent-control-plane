@@ -18,9 +18,10 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
  * wake, an agent-owned wait's CEO escalation, a CTO escalation — states its incident here, and none of them
  * enqueues the notice itself.
  *
- * An incident is open while its detector still finds it and no CEO decision was recorded on its run after it
- * opened. A run that left the blocked state, or a stall that cleared, is no longer stated, so nothing more is
- * delivered for it; an ACK is receipt, never resolution.
+ * An incident is open while its detector still finds it and `resolutionOf` finds no evidence that closed it: its
+ * run gone, its run ended, or a CEO decision recorded on its run, each after it opened. A stall that cleared is no
+ * longer stated, so nothing more is delivered for it; an ACK is receipt, never resolution. A notice of a resolved
+ * incident is withdrawn rather than carried to a CEO it was not addressed to (`withdrawResolvedNotices`).
  *
  * Two notices keep their own owners: a candidate's READY_FOR_CEO_REVIEW (`ProductionGate.buildPacket`, and
  * its re-delivery after a CEO recovery, deduplicated by the decision and the candidate, in
@@ -119,8 +120,8 @@ export const runEpisode = (db: Pick<Db, "get">, runId: string): string => runPro
  * - ENQUEUED: a notice is queued or sent and not yet ACKed (it follows the CEO role's holder);
  * - ACKED: a CEO acknowledged receipt. That is not a resolution;
  * - REJECTED: every notice was refused by its transport or expired;
- * - RESOLVED: evidence closed it, a CEO_DECISION on the run since it opened. The detectors decide the rest
- *   of resolution: an incident whose run left its state or whose stall cleared is no longer stated.
+ * - RESOLVED: evidence closed it (`resolutionOf`). The detectors decide the rest: a stall that cleared is no
+ *   longer stated.
  */
 export type NoticeState = "NOT_ENQUEUED" | "ENQUEUED" | "ACKED" | "REJECTED" | "RESOLVED";
 
@@ -128,7 +129,13 @@ export interface NoticeStatus {
   state: NoticeState;
   correlation: string;
   deliveries: Array<{ messageId: string; status: string; generation: number }>;
-  resolvedBy: { kind: "CEO_DECISION"; eventId: number } | null;
+  resolvedBy: Resolution | null;
+}
+
+/** The evidence that closed an incident, and the audit event that is it (none for a run that is gone). */
+export interface Resolution {
+  kind: "RUN_GONE" | "RUN_ENDED" | "CEO_DECISION";
+  eventId: number | null;
 }
 
 export interface NoticeDelivery {
@@ -151,26 +158,48 @@ const deliveriesOf = (db: Pick<Db, "all">, incident: Incident): NoticeStatus["de
   ).map((row) => ({ messageId: row.message_id, status: row.status, generation: row.binding_generation }));
 };
 
-/** The CEO decision on the run since the incident opened (or since its first notice), if any. */
-const decisionSince = (db: Pick<Db, "get">, incident: Incident): number | null => {
-  if (incident.runId === null) return null;
+/**
+ * The one definition of an incident's resolution, asked by every path that would hand its notice to a CEO:
+ * `deliverIncident` before it delivers, `retryDeferredNotices` before it retries, and the outbox
+ * (`withdrawResolvedNotices`) before it carries a notice to a CEO it was not addressed to. An incident about
+ * a run is resolved by evidence on that run:
+ * - RUN_GONE: the run no longer exists;
+ * - CEO_DECISION: a CEO decision was recorded on the run after the incident opened (`openedEventId`, else
+ *   its first delivery record);
+ * - RUN_ENDED: the run is terminal and a RUN_TRANSITION followed the opening, so it ended since (cancelled,
+ *   failed, completed). A run already terminal when its incident opened, as BLOCKED_POST_MERGE is, is not.
+ * An incident never delivered has not opened, so only RUN_GONE resolves it. An incident not about a run (a
+ * role's stalled messages, a session) has no such evidence; its detector stops stating it when it clears.
+ */
+export const resolutionOf = (db: Pick<Db, "get">, incident: Incident): Resolution | null => {
+  if (incident.runId === null || incident.subject !== incident.runId) return null;
+  const run = db.get<{ state: RunState }>(`SELECT state FROM runs WHERE run_id = ?`, [incident.runId]);
+  if (!run) return { kind: "RUN_GONE", eventId: null };
   const opened = incident.openedEventId ?? db.get<{ event_id: number | null }>(
     `SELECT MIN(event_id) AS event_id FROM audit_events WHERE run_id = ? AND kind = ?
        AND json_extract(evidence_json, '$.correlation') = ? AND json_extract(evidence_json, '$.episode') = ?`,
     [incident.runId, CLASS_RULES[incident.cls].record, correlationOf(incident.cls, incident.subject), incident.episode],
   )?.event_id ?? null;
   if (opened === null) return null;
-  return db.get<{ event_id: number }>(
+  const decided = db.get<{ event_id: number }>(
     `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CEO_DECISION' AND event_id > ?
       ORDER BY event_id LIMIT 1`,
     [incident.runId, opened],
-  )?.event_id ?? null;
+  );
+  if (decided) return { kind: "CEO_DECISION", eventId: decided.event_id };
+  if (!isTerminal(run.state)) return null;
+  const ended = db.get<{ event_id: number }>(
+    `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'RUN_TRANSITION' AND event_id > ?
+      ORDER BY event_id DESC LIMIT 1`,
+    [incident.runId, opened],
+  );
+  return ended ? { kind: "RUN_ENDED", eventId: ended.event_id } : null;
 };
 
 export const noticeStatus = (ports: Pick<NoticePorts, "db">, incident: Incident): NoticeStatus => {
   const deliveries = deliveriesOf(ports.db, incident);
-  const decided = decisionSince(ports.db, incident);
-  const state: NoticeState = decided !== null ? "RESOLVED"
+  const resolution = resolutionOf(ports.db, incident);
+  const state: NoticeState = resolution !== null ? "RESOLVED"
     : deliveries.length === 0 ? "NOT_ENQUEUED"
       : deliveries.some((delivery) => UNSETTLED.has(delivery.status)) ? "ENQUEUED"
         : deliveries.some((delivery) => delivery.status === "ACKED") ? "ACKED"
@@ -179,8 +208,91 @@ export const noticeStatus = (ports: Pick<NoticePorts, "db">, incident: Incident)
     state,
     correlation: correlationOf(incident.cls, incident.subject),
     deliveries,
-    resolvedBy: decided === null ? null : { kind: "CEO_DECISION", eventId: decided },
+    resolvedBy: resolution,
   };
+};
+
+/** The record of a queued notice withdrawn because its incident was resolved (`withdrawResolvedNotices`). */
+export const CEO_NOTIFICATION_WITHDRAWN = "CEO_NOTIFICATION_WITHDRAWN";
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** The incident a queued notice was delivered for, read back from the fields `deliverIncident` wrote on it. */
+const incidentOfNotice = (runId: string | null, payloadJson: string): Incident | null => {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(payloadJson);
+  } catch {
+    return null;
+  }
+  if (!isRecord(payload)) return null;
+  const [cls, correlation, episode] = [payload["incidentClass"], payload["correlation"], payload["episode"]];
+  if (typeof cls !== "string" || !(cls in CLASS_RULES) || typeof correlation !== "string" || typeof episode !== "string") return null;
+  const prefix = correlationOf(cls as IncidentClass, "");
+  if (!correlation.startsWith(prefix)) return null;
+  return { cls: cls as IncidentClass, subject: correlation.slice(prefix.length), runId, episode, payload: {} };
+};
+
+/**
+ * #1189 — a resolved incident's notice is not carried to a CEO it was not addressed to. Before the outbox moves
+ * its unACKed CEO notices to the role's current holder, every incident notice still owed (PENDING or SENT) and
+ * addressed to an earlier holder whose incident `resolutionOf` finds resolved is REJECTED, with a
+ * CEO_NOTIFICATION_WITHDRAWN record of the evidence. A notice addressed to the current holder stays as it is: a
+ * late notice of a decision that holder already made executes nothing (the decision door refuses it again),
+ * and one being sent (IN_FLIGHT) is that send's.
+ */
+export const withdrawResolvedNotices = (
+  db: Db,
+  audit: AuditLog,
+  holder: { generation: number; sessionId: string },
+): string[] => {
+  const withdrawn: string[] = [];
+  const rows = db.all<{
+    message_id: string; run_id: string | null; role_key: string; target_session_id: string;
+    binding_generation: number; status: string; payload_json: string;
+  }>(
+    `SELECT message_id, run_id, role_key, target_session_id, binding_generation, status, payload_json FROM outbox
+      WHERE kind = 'CEO_NOTIFICATION' AND status IN ('PENDING', 'SENT')
+        AND (binding_generation <> ? OR target_session_id <> ?)
+        AND json_valid(payload_json) = 1 AND json_extract(payload_json, '$.correlation') LIKE 'ceo-incident:%'
+      ORDER BY created_at, rowid`,
+    [holder.generation, holder.sessionId],
+  );
+  for (const row of rows) {
+    const incident = incidentOfNotice(row.run_id, row.payload_json);
+    const resolution = incident === null ? null : resolutionOf(db, incident);
+    if (incident === null || resolution === null) continue;
+    db.tx(() => {
+      const changed = db.run(
+        `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
+                           retry_eligible = 0, next_attempt_at = NULL
+          WHERE message_id = ? AND status IN ('PENDING', 'SENT')`,
+        [ReasonCode.CEO_INCIDENT_RESOLVED, row.message_id],
+      ).changes;
+      if (changed !== 1) return;
+      audit.record({
+        kind: CEO_NOTIFICATION_WITHDRAWN,
+        reasonCode: ReasonCode.CEO_INCIDENT_RESOLVED,
+        runId: row.run_id,
+        roleKey: row.role_key,
+        sessionId: row.target_session_id,
+        evidence: {
+          messageId: row.message_id,
+          status: row.status,
+          fromGeneration: row.binding_generation,
+          toGeneration: holder.generation,
+          incidentClass: incident.cls,
+          correlation: correlationOf(incident.cls, incident.subject),
+          episode: incident.episode,
+          resolvedBy: resolution.kind,
+          resolvingEventId: resolution.eventId,
+        },
+      });
+      withdrawn.push(row.message_id);
+    });
+  }
+  return withdrawn;
 };
 
 const withoutWhy = (payload: Record<string, unknown>): Record<string, unknown> => {
@@ -206,7 +318,9 @@ const covered = (state: NoticeState, messageId: string | null): Decision<NoticeD
 export const deliverIncident = (ports: NoticePorts, incident: Incident): Decision<NoticeDelivery> =>
   ports.db.txDecision(() => {
     const status = noticeStatus(ports, incident);
-    if (status.state === "RESOLVED") return covered("RESOLVED", null);
+    if (status.state === "RESOLVED") {
+      return allow(ReasonCode.CEO_INCIDENT_RESOLVED, { state: "RESOLVED", messageId: null, created: false, redelivery: false });
+    }
     const live = status.deliveries.find((delivery) => UNSETTLED.has(delivery.status));
     if (live) return covered("ENQUEUED", live.messageId);
     const ceo = ports.bindings.active(roleKeyFor(Role.CEO));
@@ -299,13 +413,7 @@ export const deferIncidentNotice = (ports: Pick<NoticePorts, "audit">, incident:
   });
 };
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
-
-/**
- * Every deferred notice whose incident is still open, delivered once. An incident is closed when its run
- * is gone or terminal, or (in `deliverIncident`) when a CEO decision on the run followed it.
- */
+/** Every deferred notice whose incident is still open (`resolutionOf`), delivered once. */
 export const retryDeferredNotices = (ports: NoticePorts): Array<{ correlation: string; episode: string; delivery: Decision<NoticeDelivery> }> => {
   const results: Array<{ correlation: string; episode: string; delivery: Decision<NoticeDelivery> }> = [];
   for (const row of ports.db.all<{ run_id: string | null; evidence_json: string }>(
@@ -323,10 +431,6 @@ export const retryDeferredNotices = (ports: NoticePorts): Array<{ correlation: s
     const subject = deferred["subject"];
     const episode = deferred["episode"];
     if (typeof cls !== "string" || !(cls in CLASS_RULES) || typeof subject !== "string" || typeof episode !== "string") continue;
-    if (row.run_id !== null) {
-      const run = ports.db.get<{ state: RunState }>(`SELECT state FROM runs WHERE run_id = ?`, [row.run_id]);
-      if (!run || isTerminal(run.state)) continue;
-    }
     const opened = deferred["openedEventId"];
     const incident: Incident = {
       cls: cls as IncidentClass,

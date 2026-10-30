@@ -916,6 +916,8 @@ export const ReasonCode = {
   OUTBOX_TARGET_NOT_CURRENT: "OUTBOX_TARGET_NOT_CURRENT",
   OUTBOX_DELIVERY_REJECTED: "OUTBOX_DELIVERY_REJECTED",
   OUTBOX_RETRY_POLICY_UNAVAILABLE: "OUTBOX_RETRY_POLICY_UNAVAILABLE",
+  /** #1189 — an incident resolved by evidence on its run: no notice is delivered, and a queued one is withdrawn. */
+  CEO_INCIDENT_RESOLVED: "CEO_INCIDENT_RESOLVED",
 
   // --- claim admission -----------------------------------------------------
   CLAIM_OWNER_NOT_RUN_OWNER: "CLAIM_OWNER_NOT_RUN_OWNER",

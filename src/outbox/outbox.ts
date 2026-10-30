@@ -1,4 +1,5 @@
 import { resumeReviewAttachmentMatches } from "../bootstrap/bootstrap-plan-artifact.ts";
+import { withdrawResolvedNotices } from "../ceo/ceo-incident-notices.ts";
 import { buzzPolicyHoldReason, ceoBuzzHistoryIsPrePost, isBuzzSignerRefusal, type BuzzPolicyBinding, type BuzzPolicyReadiness } from "./ceo-buzz-signer.ts";
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
@@ -1098,14 +1099,19 @@ export class Outbox {
    * rebind, or a stopped runtime replaced), so a route the current CEO has is the route every
    * unsettled notification has. One the Buzz transport accepted for a holder that has since gone
    * (SENT, never ACKed) goes back to deliverable with its message id and is delivered to the new
-   * holder — at-least-once, deduplicated by the id (ACP-R2-01).
+   * holder — at-least-once, deduplicated by the id (ACP-R2-01). An incident's notice is first asked
+   * whether its incident was resolved meanwhile; one that was is withdrawn rather than carried to the new
+   * holder, by the incident module's own definition of resolution (`withdrawResolvedNotices`, #1189), here
+   * and on the binding paths that carry it (`adoptHolderMessages`, `retargetOrReject`).
    */
   #readdressCeoNotifications(): void {
     const current = this.db.get<{ generation: number; session: string }>(`SELECT a.binding_generation AS generation,
       ${CURRENT_HOLDER_SESSION} AS session FROM assignments a ${HOLDER_ACTOR_JOIN}
       WHERE a.role_key = 'CEO' AND a.status = 'ACTIVE'`);
+    if (!current) return;
+    withdrawResolvedNotices(this.db, this.audit, { generation: current.generation, sessionId: current.session });
     // A new target is a new route: a failure recorded against the previous one no longer holds it.
-    if (current) readdressCeoNotifications(this.db, current.generation, current.session);
+    readdressCeoNotifications(this.db, current.generation, current.session);
   }
 
   /**
@@ -2483,8 +2489,12 @@ export class Outbox {
    * requires the exact current holder; a crash before ACK preserves the original message ID.
    */
   adoptHolderMessages(roleKey: string, generation: number, sessionId: string, deferCanonicalPeers = false): void {
-    // A CEO notification SENT to the previous holder and never ACKed is delivered again to this one.
-    if (roleKey === "CEO") readdressCeoNotifications(this.db, generation, sessionId);
+    // A CEO notification SENT to the previous holder and never ACKed is delivered again to this one, unless
+    // its incident was resolved meanwhile (#1189): that one is withdrawn rather than carried.
+    if (roleKey === "CEO") {
+      withdrawResolvedNotices(this.db, this.audit, { generation, sessionId });
+      readdressCeoNotifications(this.db, generation, sessionId);
+    }
     this.db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?,
       reason_code = CASE WHEN kind = 'CEO_NOTIFICATION' AND reason_code IN
         ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED','BUZZ_LOCAL_SEND_POLICY_REFUSED','BUZZ_SEND_POLICY_BINDING_UNVERIFIED') THEN reason_code ELSE ? END
@@ -2549,6 +2559,10 @@ export class Outbox {
     } = {},
   ): { retargeted: string[]; rejected: string[] } {
     const now = this.clock.nowIso();
+    // #1189 — a resolved incident's CEO notice is withdrawn rather than carried to the new holder.
+    if (roleKey === "CEO" && toGeneration !== fromGeneration) {
+      withdrawResolvedNotices(this.db, this.audit, { generation: toGeneration, sessionId: toSessionId });
+    }
     const pending = this.db.all<RawOutbox>(
       `SELECT * FROM outbox WHERE role_key = ? AND binding_generation = ?
         AND (

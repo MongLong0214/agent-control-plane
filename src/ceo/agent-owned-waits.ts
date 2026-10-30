@@ -11,7 +11,7 @@ import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
-import { type Incident, IncidentClass, NotificationKind, deliverIncident, runEpisode } from "./ceo-incident-notices.ts";
+import { type Incident, IncidentClass, type NoticeState, NotificationKind, deliverIncident, runEpisode } from "./ceo-incident-notices.ts";
 import type { ProductionGate } from "./production-gate.ts";
 
 /**
@@ -117,6 +117,16 @@ export interface OwnerlessStall {
   /** NONE_STARTED: proven not started. MAY_HAVE_RUN / UNKNOWN: check its effects before re-running. */
   effects: "NONE_STARTED" | "NONE" | "MAY_HAVE_RUN" | "UNKNOWN";
   deliveryTimeout: boolean;
+  /** A stall of a run stated again in the incident episode it was first routed in; absent, the run's current one. */
+  incidentEpisode?: string;
+}
+
+/** What routing one ownerless stall did: see `AgentOwnedWaits.routeOwnerlessStall`. */
+export interface RoutedStall {
+  messageId: string | null;
+  routed: boolean;
+  state: NoticeState;
+  episode: string;
 }
 
 export interface AgentOwnedWaitsPorts {
@@ -191,7 +201,7 @@ const stallIncident = (db: Db, stall: OwnerlessStall): Incident => {
   const placed = stall.kind === "outbox"
     ? { cls: IncidentClass.DELIVERY_STALLED, subject: stall.owner.role ?? "unknown", episode: stall.episode }
     : stall.runId !== null
-      ? { cls: IncidentClass.RUN_STALLED, subject: stall.runId, episode: runEpisode(db, stall.runId) }
+      ? { cls: IncidentClass.RUN_STALLED, subject: stall.runId, episode: stall.incidentEpisode ?? runEpisode(db, stall.runId) }
       : { cls: IncidentClass.RESOURCE_STALLED, subject: `${stall.kind}:${stall.id}`, episode: stall.episode };
   return {
     ...placed,
@@ -333,30 +343,43 @@ export class AgentOwnedWaits {
    * `ceo-incident-notices.ts`: once per incident episode and CEO generation, with its delivery record
    * (OWNERLESS_STALL_ROUTED). With no CEO bound (or its session not READY) nothing is written and the next
    * pass asks again. `routed` is whether this call delivered a notice; `messageId` is the notice that covers
-   * the stall, delivered now or before.
+   * the stall, delivered now or before; `state` is what the CEO has of it, in the incident `episode`.
    */
-  routeOwnerlessStall(stall: OwnerlessStall): Decision<{ messageId: string | null; routed: boolean }> {
-    const delivered = deliverIncident(this.ports, stallIncident(this.ports.db, stall));
-    if (!delivered.allowed) return delivered as unknown as Decision<{ messageId: string | null; routed: boolean }>;
-    return allow(delivered.reasonCode, { messageId: delivered.value.messageId, routed: delivered.value.created });
+  routeOwnerlessStall(stall: OwnerlessStall): Decision<RoutedStall> {
+    const incident = stallIncident(this.ports.db, stall);
+    const delivered = deliverIncident(this.ports, incident);
+    if (!delivered.allowed) return delivered as unknown as Decision<RoutedStall>;
+    return allow(delivered.reasonCode, {
+      messageId: delivered.value.messageId,
+      routed: delivered.value.created,
+      state: delivered.value.state,
+      episode: incident.episode,
+    });
   }
 
   /**
    * C2 — the watchdog's overdue resources, routed to the CEO. A stalled CEO notice is never routed (it is
    * already addressed to the CEO, and routing it would only add another notice to the same stuck route),
    * and the other stalled messages are routed one notice per role, keyed by that role's oldest one.
-   * F3-2 — then every stall the watchdog recorded as owed (`OWNERLESS_STALL_OWED`) and nobody has been
-   * told of yet: a stall seen once, such as a reclaimed attempt, reaches the CEO when it is back, once.
+   * F3-2 — then every stall the watchdog recorded as owed (`OWNERLESS_STALL_OWED`): a stall seen once, such
+   * as a reclaimed attempt, reaches the CEO when it is back, once. H3-2 — it is stated again on every pass, in
+   * the incident episode it was first routed in, until it is settled, so a CEO generation that has not had it
+   * is told once while it is open. It is settled when its run moved on since (F3-1's positive progress: the
+   * stall cleared), or when `resolutionOf` closed its incident.
    */
   routeWatchdogStalls(stalls: readonly WatchdogStall[]): Array<{ kind: string; id: string; messageId: string | null; reasonCode: string }> {
     const routed: Array<{ kind: string; id: string; messageId: string | null; reasonCode: string }> = [];
     const oldestByRole = new Map<string, { stall: WatchdogStall; count: number }>();
     const asked = new Set<string>();
-    const routeOne = (stall: WatchdogStall, blocker: string, owed = false): void => {
+    const routeOne = (stall: WatchdogStall, blocker: string, owed: { episode: string | null } | null = null): void => {
       const route = WATCHDOG_STALL_ROUTES[stall.kind];
       const key = `${stall.kind}:${stall.id}:${stall.since}`;
       if (!route || asked.has(key)) return;
       asked.add(key);
+      if (owed?.episode != null && stall.runId !== null && runEpisode(this.ports.db, stall.runId) !== owed.episode) {
+        this.#settleOwed(stall, { settled: "RUN_PROGRESSED" });
+        return;
+      }
       const decision = this.routeOwnerlessStall({
         source: "WATCHDOG",
         kind: stall.kind,
@@ -369,15 +392,15 @@ export class AgentOwnedWaits {
         blocker,
         effects: route.effects,
         deliveryTimeout: stall.kind === "outbox",
+        ...(owed?.episode != null ? { incidentEpisode: owed.episode } : {}),
       });
-      // An owed stall its run's notice already covers (this episode, this CEO), or whose incident a CEO decision
-      // resolved, is answered here so the owed record is not asked again: nothing more is owed for it.
-      if (owed && decision.allowed && !decision.value.routed) {
-        this.ports.audit.record({
-          kind: OWNERLESS_STALL_ROUTED,
-          runId: stall.runId,
-          evidence: { source: "WATCHDOG", kind: stall.kind, target: stall.id, since: stall.since, messageId: decision.value.messageId, covered: true },
-        });
+      if (owed && decision.allowed) {
+        if (decision.value.state === "RESOLVED") {
+          this.#settleOwed(stall, { settled: "RESOLVED" });
+        } else if (owed.episode === null && !decision.value.routed) {
+          // Its run's notice for this episode already covers it: the episode it is stated in from now on.
+          this.#settleOwed(stall, { covered: true, messageId: decision.value.messageId, episode: decision.value.episode });
+        }
       }
       routed.push({
         kind: stall.kind,
@@ -400,29 +423,49 @@ export class AgentOwnedWaits {
     for (const [role, { stall, count }] of oldestByRole) {
       routeOne(stall, `${count} ${WATCHDOG_STALL_ROUTES["outbox"]!.what} to ${role}; the oldest is ${stall.id}, since ${stall.since}`);
     }
-    for (const owed of this.#owedStalls()) {
-      routeOne(owed, `${WATCHDOG_STALL_ROUTES[owed.kind]?.what ?? owed.kind}: ${owed.kind} ${owed.id}, since ${owed.since}`, true);
+    for (const { stall: owed, episode } of this.#owedStalls()) {
+      routeOne(owed, `${WATCHDOG_STALL_ROUTES[owed.kind]?.what ?? owed.kind}: ${owed.kind} ${owed.id}, since ${owed.since}`, { episode });
     }
     return routed;
   }
 
-  /** The owed stalls no routed record answers yet. */
-  #owedStalls(): WatchdogStall[] {
-    return this.ports.db.all<{ run_id: string | null; evidence_json: string }>(
-      `SELECT owed.run_id, owed.evidence_json FROM audit_events owed
+  /**
+   * The owed stalls not settled yet, each with the incident episode it was first routed in (null before that).
+   * A stall whose routed records name no episode was routed before episodes were recorded, and is answered, as
+   * it was then.
+   */
+  #owedStalls(): Array<{ stall: WatchdogStall; episode: string | null }> {
+    const sameStall = (alias: string): string => `${alias}.kind = '${OWNERLESS_STALL_ROUTED}'
+      AND json_extract(${alias}.evidence_json, '$.kind') = json_extract(owed.evidence_json, '$.kind')
+      AND json_extract(${alias}.evidence_json, '$.target') = json_extract(owed.evidence_json, '$.target')
+      AND json_extract(${alias}.evidence_json, '$.since') = json_extract(owed.evidence_json, '$.since')`;
+    return this.ports.db.all<{ run_id: string | null; evidence_json: string; episode: string | null; routed: number }>(
+      `SELECT owed.run_id, owed.evidence_json,
+              (SELECT json_extract(pin.evidence_json, '$.episode') FROM audit_events pin
+                WHERE ${sameStall("pin")} AND json_extract(pin.evidence_json, '$.episode') IS NOT NULL
+                ORDER BY pin.event_id LIMIT 1) AS episode,
+              EXISTS (SELECT 1 FROM audit_events any_route WHERE ${sameStall("any_route")}) AS routed
+        FROM audit_events owed
         WHERE owed.kind = ?
-          AND NOT EXISTS (SELECT 1 FROM audit_events routed WHERE routed.kind = ?
-            AND json_extract(routed.evidence_json, '$.kind') = json_extract(owed.evidence_json, '$.kind')
-            AND json_extract(routed.evidence_json, '$.target') = json_extract(owed.evidence_json, '$.target')
-            AND json_extract(routed.evidence_json, '$.since') = json_extract(owed.evidence_json, '$.since'))
+          AND NOT EXISTS (SELECT 1 FROM audit_events settled WHERE ${sameStall("settled")}
+                            AND json_extract(settled.evidence_json, '$.settled') IS NOT NULL)
         ORDER BY owed.event_id`,
-      [OWNERLESS_STALL_OWED, OWNERLESS_STALL_ROUTED],
+      [OWNERLESS_STALL_OWED],
     ).flatMap((row) => {
       const evidence = evidenceOf(row.evidence_json) ?? {};
       const [kind, id, since] = [evidence["kind"], evidence["target"], evidence["since"]];
-      return typeof kind === "string" && typeof id === "string" && typeof since === "string"
-        ? [{ kind, id, runId: row.run_id, since }]
-        : [];
+      if (typeof kind !== "string" || typeof id !== "string" || typeof since !== "string") return [];
+      if (row.routed === 1 && row.episode === null) return [];
+      return [{ stall: { kind, id, runId: row.run_id, since }, episode: row.episode }];
+    });
+  }
+
+  /** An owed stall's own routed record: the episode it is stated in, or why it is settled. */
+  #settleOwed(stall: WatchdogStall, outcome: Record<string, unknown>): void {
+    this.ports.audit.record({
+      kind: OWNERLESS_STALL_ROUTED,
+      runId: stall.runId,
+      evidence: { source: "WATCHDOG", kind: stall.kind, target: stall.id, since: stall.since, ...outcome },
     });
   }
 

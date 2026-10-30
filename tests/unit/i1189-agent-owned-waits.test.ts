@@ -610,6 +610,60 @@ describe("#1189 B12/C2 — a stall nobody watches reaches the CEO as CRITICAL_SY
     expect(attemptNotices()).toHaveLength(1);
   });
 
+  it("H3-2: a reclaimed attempt still unresolved reaches a replacement CEO once after its notice was ACKed; once the run moved on, no later CEO is told", async () => {
+    const harness = makeHarness();
+    const run = await activeRun(harness);
+    const waits = waitsOf(harness);
+    harness.cp.db.run(
+      `INSERT INTO candidate_pipeline_attempts
+         (run_id, attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, started_at, deadline_at, released_at)
+       VALUES (?, 'attempt_crashed', ?, ?, NULL, 'RUNNING', ?, ?, NULL)`,
+      [
+        run.runId, run.ownerSessionId, run.ownerBindingGeneration,
+        new Date(harness.clock.now().getTime() - 31 * 60 * 1000).toISOString(),
+        new Date(harness.clock.now().getTime() - 60_000).toISOString(),
+      ],
+    );
+    const attemptNotices = () => ceoNotices(harness, run.runId).filter((message) =>
+      payloadOf(message)["notification"] === "CRITICAL_SYSTEM_FAILURE" && payloadOf(message)["stall"] === "candidate_pipeline_attempt");
+    const routingPass = async (): Promise<void> => {
+      waits.routeWatchdogStalls((await harness.cp.watchdog.tick()).stalls);
+    };
+    const acknowledge = (message: OutboxMessage | undefined): void => {
+      const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+      expect(harness.cp.outbox.acknowledge(message!.messageId, ceo.sessionId, ceo.bindingGeneration).allowed).toBe(true);
+    };
+
+    await routingPass();
+    const [first] = attemptNotices();
+    expect(attemptNotices()).toHaveLength(1);
+    acknowledge(first);
+    await routingPass();
+    // An ACK is a receipt: the CEO that ACKed it is not told again.
+    expect(attemptNotices()).toHaveLength(1);
+
+    const replacement = recoverCeo(harness);
+    for (let pass = 0; pass < 3; pass += 1) await routingPass();
+    expect(attemptNotices()).toHaveLength(2);
+    const second = attemptNotices().find((message) => message.messageId !== first!.messageId);
+    expect(second).toMatchObject({ targetSessionId: replacement });
+    expect(payloadOf(second)).toMatchObject({
+      redelivery: true,
+      correlation: payloadOf(first)["correlation"],
+      episode: payloadOf(first)["episode"],
+      resource: "attempt_crashed",
+    });
+
+    // The run's CTO moves the run on (its task graph): the stall cleared, and a CEO bound after that is told nothing.
+    acknowledge(second);
+    harness.clock.advance(60_000);
+    expect(harness.cp.tasks.submit(run.runId, [{ key: "impl", title: "change app()", category: "implementation" }]).allowed).toBe(true);
+    recoverCeo(harness);
+    for (let pass = 0; pass < 3; pass += 1) await routingPass();
+    expect(attemptNotices()).toHaveLength(2);
+    expect(harness.cp.runs.require(run.runId).state).toBe(RunState.ACTIVE);
+  });
+
   it("with no CEO bound nothing is written, and the next pass routes it once the CEO is back", async () => {
     const harness = makeHarness();
     await activeRun(harness);

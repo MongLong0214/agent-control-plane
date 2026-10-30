@@ -550,11 +550,12 @@ describe("round 2, item 1 — an ACK is not a resolution: an unresolved incident
       expect.objectContaining({ status: "ACKED" }),
       expect.objectContaining({ targetSessionId: replacement, payload: expect.objectContaining({ redelivery: true }) }),
     ]));
-    // What the CEO has of each: an ACK is a receipt, the open one is ENQUEUED to the new CEO.
+    // What the CEO has of each: an ACK is a receipt, the open one is ENQUEUED to the new CEO, and the cancelled
+    // run's is RESOLVED by the run having ended since it opened.
     const { noticeStatus, IncidentClass, runEpisode } = await import("../../src/ceo/ceo-incident-notices.ts");
     const incident = (runId: string) => ({ cls: IncidentClass.RUN_STALLED, subject: runId, runId, episode: runEpisode(h.cp.db, runId), payload: {} });
     expect(noticeStatus(h.cp, incident(open.runId)).state).toBe("ENQUEUED");
-    expect(noticeStatus(h.cp, incident(closed.runId)).state).toBe("ACKED");
+    expect(noticeStatus(h.cp, incident(closed.runId))).toMatchObject({ state: "RESOLVED", resolvedBy: { kind: "RUN_ENDED" } });
   });
 
   it("a CTO escalation the CEO decided before its deferred notice went out is never delivered; the undecided one is, once", async () => {
@@ -712,5 +713,78 @@ describe("H-2 — the reviewer's probe: one ACTIVE CONTRACT_CHANGE with no manif
     const notices = criticalNotices(h, run.runId);
     expect(notices).toHaveLength(1);
     expect(notices[0]!.payload).toMatchObject({ correlation: `ceo-incident:RUN_STALLED:${run.runId}` });
+  });
+});
+
+/** A CEO session the generic Buzz sweep can deliver to: its room, and who it is in that room. */
+const withBuzzRoute = (h: Harness, sessionId: string): string => {
+  h.cp.db.run(`UPDATE sessions SET buzz_address = 'ceo-room', buzz_actor_id = 'actor:ceo' WHERE session_id = ?`, [sessionId]);
+  return sessionId;
+};
+
+const withdrawals = (h: Harness, runId: string) =>
+  h.cp.audit.forRun(runId).filter((entry) => entry.kind === "CEO_NOTIFICATION_WITHDRAWN");
+
+describe("H3-1 — a resolved incident's queued notice is handed to no CEO, by the resolution deliverIncident uses", () => {
+  it("the run cancelled: a replacement CEO can claim nothing of it, while the open run's notice follows the replacement", async () => {
+    const h = makeHarness();
+    const open = await manifestlessContractChange(h, "cc-queued");
+    const cancelled = await manifestlessContractChange(h, "cc-queued");
+    routeOwnerlessStalls(h.cp);
+    const [queued] = criticalNotices(h, cancelled.runId);
+    expect(queued).toMatchObject({ status: "PENDING" });
+    expect(h.cp.runs.cancel(cancelled.runId, "replaced by a CONTRACT_CHANGE carrying its manifest").allowed).toBe(true);
+
+    const replacement = withBuzzRoute(h, replaceCeo(h));
+    const claimed = h.cp.outbox.claimDeliverable().filter((message) => message.kind === "CEO_NOTIFICATION");
+    expect(claimed.filter((message) => message.runId === cancelled.runId)).toEqual([]);
+    expect(claimed.filter((message) => message.runId === open.runId)).toEqual([
+      expect.objectContaining({ kind: "CEO_NOTIFICATION", targetSessionId: replacement }),
+    ]);
+    expect(criticalNotices(h, cancelled.runId)).toEqual([expect.objectContaining({ messageId: queued!.messageId, status: "REJECTED" })]);
+    expect(withdrawals(h, cancelled.runId)).toEqual([expect.objectContaining({
+      evidence: expect.objectContaining({ messageId: queued!.messageId, correlation: queued!.payload["correlation"], resolvedBy: "RUN_ENDED" }),
+    })]);
+
+    // Later passes neither deliver it nor withdraw it twice.
+    routeOwnerlessStalls(h.cp);
+    expect(h.cp.outbox.claimDeliverable().filter((message) => message.runId === cancelled.runId && message.kind === "CEO_NOTIFICATION")).toEqual([]);
+    expect(criticalNotices(h, cancelled.runId)).toHaveLength(1);
+    expect(withdrawals(h, cancelled.runId)).toHaveLength(1);
+  });
+
+  it("a CEO decision recorded on the run: a replacement CEO can claim neither the escalation's notice nor the run's CRITICAL_SYSTEM_FAILURE", async () => {
+    const { IncidentClass, deliverIncident, noticeStatus, runEpisode } = await import("../../src/ceo/ceo-incident-notices.ts");
+    const h = makeHarness();
+    const { projectId } = await registerFixtureProject(h, "decided-queued");
+    const run = await dispatchRun(h, projectId, RunKind.STANDARD_WORK);
+    const opened = h.cp.ceo.openEscalation({
+      runId: run.runId, question: "v1 or v2?", options: ["v1", "v2"], ctoRecommendation: "v2",
+      whyItMatters: "the importer cannot target both", blocksCriticalPath: true,
+      openedBySessionId: run.ownerSessionId, openedAt: h.clock.nowIso(),
+    });
+    expect(opened).toMatchObject({ allowed: true, value: { state: RunState.BLOCKED } });
+    const stalled = {
+      cls: IncidentClass.RUN_STALLED, subject: run.runId, runId: run.runId, episode: runEpisode(h.cp.db, run.runId),
+      payload: { stall: "BLOCKED_ON_ESCALATION" },
+    };
+    expect(deliverIncident(h.cp, stalled)).toMatchObject({ allowed: true, value: { created: true } });
+    const ceoNotices = () => h.cp.outbox.listByRun(run.runId).filter((message) => message.kind === "CEO_NOTIFICATION");
+    const queued = ceoNotices();
+    expect(queued.map((message) => [(message.payload as Record<string, unknown>)["notification"], message.status]).sort()).toEqual([
+      [CRITICAL, "PENDING"], ["TRUE_ESCALATION", "PENDING"],
+    ]);
+
+    const ceo = h.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    const escalationId = opened.allowed ? opened.value.escalationId! : -1;
+    expect(h.cp.ceo.resolveEscalation(run.runId, "v2", ceo.sessionId, { escalationId })).toMatchObject({ allowed: true });
+    expect(noticeStatus(h.cp, stalled)).toMatchObject({ state: "RESOLVED", resolvedBy: { kind: "CEO_DECISION" } });
+
+    withBuzzRoute(h, replaceCeo(h));
+    expect(h.cp.outbox.claimDeliverable().filter((message) => message.runId === run.runId && message.kind === "CEO_NOTIFICATION")).toEqual([]);
+    expect(ceoNotices().map((message) => [message.messageId, message.status]).sort()).toEqual(
+      queued.map((message) => [message.messageId, "REJECTED"]).sort(),
+    );
+    expect(withdrawals(h, run.runId).map((entry) => entry.evidence["resolvedBy"])).toEqual(["CEO_DECISION", "CEO_DECISION"]);
   });
 });
