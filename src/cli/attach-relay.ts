@@ -1002,16 +1002,119 @@ export const runAttachRelay = async (
  *
  * It still never reconnects, but for a different reason than the CTO relay: there is no
  * credential to reuse. A respawn is simply a new connection, admitted or refused on the same facts
- * as the first one, and Hermes is what respawns it.
+ * as the first one, and Hermes is what respawns it. Only the **first** connect waits
+ * (`connectWhenReady`), because Hermes respawns the relay on the CEO's next tool call and retries
+ * that call once: a call that lands while the daemon restarts would otherwise fail outright.
  */
-export const runAdoptedCeoAttachRelay = (
-  options: { toolSocketPath: string },
+export const runAdoptedCeoAttachRelay = async (
+  options: { toolSocketPath: string; initialConnect?: Partial<InitialConnectPolicy> },
   io: AttachRelayIo,
 ): Promise<number> => {
-  // The client's bytes wait until the socket is connected, so none is lost to a closed pipe.
-  io.stdin.pause();
-  return pipeStdioToSocket(createConnection(options.toolSocketPath), io, { handshake: () => undefined });
+  const policy: InitialConnectPolicy = { ...ADOPTED_CEO_INITIAL_CONNECT, ...options.initialConnect };
+  const ready = await connectWhenReady(options.toolSocketPath, policy, io);
+  if ("exit" in ready) return ready.exit;
+  return pipeStdioToSocket(ready.socket, io, NO_HANDSHAKE);
 };
+
+/**
+ * How long, and how many times, the adopted CEO's relay tries its first connection while the tool
+ * socket is not there yet. Both bounds hold; whichever is reached first ends the wait with
+ * `UNAVAILABLE`, which is what the first failure meant before there was a wait.
+ */
+export interface InitialConnectPolicy {
+  maxWaitMs: number;
+  maxAttempts: number;
+  retryDelayMs: number;
+}
+
+export const ADOPTED_CEO_INITIAL_CONNECT: InitialConnectPolicy = {
+  maxWaitMs: 10_000,
+  maxAttempts: 40,
+  retryDelayMs: 250,
+};
+
+/**
+ * The only connect errors that mean "not there yet": no socket at the path (`ENOENT`), or a path
+ * nothing listens on (`ECONNREFUSED`) — a daemon that is restarting. Anything else, a permission
+ * error above all, is final at once and is never waited out.
+ */
+const NOT_YET_LISTENING = new Set(["ENOENT", "ECONNREFUSED"]);
+
+/**
+ * Connects to `path`, retrying only while it is not yet listening, within `policy`.
+ *
+ * The client's stdin is read while this waits, so its end is seen: a client that goes away ends
+ * the wait with `OK` and nothing connects afterwards. What it wrote is held and put back in front
+ * of stdin, in order, before the connected socket is handed to the pipe, so no byte is lost. Past
+ * the daemon's own line ceiling stdin is paused instead of held, which bounds the buffer.
+ */
+const connectWhenReady = (
+  path: string,
+  policy: InitialConnectPolicy,
+  io: AttachRelayIo,
+): Promise<{ socket: Socket } | { exit: number }> =>
+  new Promise((resolve) => {
+    const deadline = Date.now() + policy.maxWaitMs;
+    const held: Buffer[] = [];
+    let heldBytes = 0;
+    let attempts = 0;
+    let waiting = false;
+    let done = false;
+    let attempt: Socket | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    const hold = (chunk: Buffer): void => {
+      held.push(chunk);
+      heldBytes += chunk.length;
+      if (heldBytes > MAX_LINE_BYTES) io.stdin.pause();
+    };
+    const ended = (): void => stop({ exit: ATTACH_EXIT.OK });
+    const broken = (): void => stop({ exit: ATTACH_EXIT.STREAM_CLOSED });
+    const stop = (outcome: { socket: Socket } | { exit: number }): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      io.stdin.removeListener("data", hold);
+      io.stdin.removeListener("end", ended);
+      io.stdin.removeListener("error", broken);
+      io.stdin.removeListener("close", broken);
+      io.stdin.pause();
+      if ("socket" in outcome) {
+        if (held.length > 0) io.stdin.unshift(Buffer.concat(held));
+      } else {
+        attempt?.destroy();
+      }
+      resolve(outcome);
+    };
+    const connect = (): void => {
+      attempts += 1;
+      const socket = createConnection(path);
+      attempt = socket;
+      const failed = (error: NodeJS.ErrnoException): void => {
+        if (done) return;
+        const remaining = deadline - Date.now();
+        if (!NOT_YET_LISTENING.has(error.code ?? "") || attempts >= policy.maxAttempts || remaining <= 0) {
+          io.stderr.write("attach: mcp socket unavailable\n");
+          stop({ exit: ATTACH_EXIT.UNAVAILABLE });
+          return;
+        }
+        if (!waiting) {
+          waiting = true;
+          io.stderr.write("attach: mcp socket waiting\n");
+        }
+        timer = setTimeout(connect, Math.min(policy.retryDelayMs, remaining));
+      };
+      socket.once("error", failed);
+      socket.once("connect", () => {
+        socket.removeListener("error", failed);
+        stop({ socket });
+      });
+    };
+    io.stdin.on("data", hold);
+    io.stdin.once("end", ended);
+    io.stdin.once("error", broken);
+    io.stdin.once("close", broken);
+    connect();
+  });
 
 /**
  * The byte pipe every relay shares: once `socket` is connected — now, or when it connects — let
