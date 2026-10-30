@@ -4,7 +4,7 @@ import { manifestDigest, type ProjectManifest } from "../../src/contracts/manife
 import { sha256 } from "../../src/core/digest.ts";
 import { acpError, allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { credentialBearingField } from "../../src/db/audit.ts";
+import { credentialBearingField, prohibitedDurableField } from "../../src/db/audit.ts";
 import { registryView } from "../../src/db/registry-view.ts";
 import { RunKind, RunState, type RunRow } from "../../src/domain/types.ts";
 import { createCtoMcpPort } from "../../src/mcp/cto-server.ts";
@@ -761,4 +761,57 @@ describe("#1279 G3: free text needs a bound digest; a readback's drift rests on 
       expect(stored.repositories[1]).toMatchObject({ lastObservedHead: moved, checkout: { head: moved, acceptedHead: moved, observedDriftState: "IN_SYNC" } });
     } finally { r.h.cp.close(); }
   }, 60_000);
+});
+
+describe("#1279 G4: a refusal's keys are text it stores, and content past the scan is not clean", () => {
+  const request = { toolName: "effect", arguments: {}, authority: () => allow(ReasonCode.OK, {}) };
+  /** `leaf` inside `levels` objects, each holding the next at `detail`. */
+  const nested = (levels: number, leaf: Record<string, unknown>): Record<string, unknown> => {
+    let value = leaf;
+    for (let level = 0; level < levels; level += 1) value = { detail: value };
+    return value;
+  };
+  const storedResult = (h: Harness, key: string): string =>
+    h.cp.db.get<{ result_json: string }>(`SELECT result_json FROM inbound_messages WHERE nonce = ?`, [key])!.result_json;
+
+  it("G4-1: a token as an evidence key is neither stored nor replayed; the refusal keeps its reason code", async () => {
+    const h = makeHarness();
+    let runs = 0;
+    const refuse = () => { runs += 1; throw acpError(ReasonCode.INVALID_ARGUMENT, "refused input", { [TOKEN]: "refused" }); };
+    try {
+      const first = await idempotentMcpMutation(h.cp, { actor: "peer" }, "g4-key", refuse, request);
+      expect(first.structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.INVALID_ARGUMENT, evidence: {} });
+      expect(JSON.stringify(first)).not.toContain(TOKEN);
+      expect(storedResult(h, "g4-key")).not.toContain(TOKEN);
+      const replay = await idempotentMcpMutation(h.cp, { actor: "peer" }, "g4-key", refuse, request);
+      expect(replay).toEqual(first);
+      expect(runs).toBe(1);
+      // The shared detector finds such a key at any depth and names it without repeating it.
+      const found = credentialBearingField({ evidence: { outer: { [TOKEN]: "refused" } } });
+      expect(found).not.toBeNull();
+      expect(found).not.toContain(TOKEN);
+      // A key is read by the field rules a value at its path gets: a whole ACP digest keying a typed record stays storable.
+      expect(credentialBearingField({ byDigest: { [UNBOUND]: 1 } })).toBeNull();
+    } finally { h.cp.close(); }
+  });
+
+  it("G4-2: raw output nested past the old depth-8 scan is not stored; content past any scan is unsafe", async () => {
+    const h = makeHarness();
+    const PRIVATE = "private model output that must not be stored";
+    let runs = 0;
+    const refuse = () => {
+      runs += 1;
+      throw acpError(ReasonCode.INVALID_ARGUMENT, "refused input", nested(8, { rawOutput: PRIVATE }));
+    };
+    try {
+      const first = await idempotentMcpMutation(h.cp, { actor: "peer" }, "g4-depth", refuse, request);
+      expect(first.structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.INVALID_ARGUMENT, evidence: {} });
+      expect(storedResult(h, "g4-depth")).not.toContain(PRIVATE);
+      expect(await idempotentMcpMutation(h.cp, { actor: "peer" }, "g4-depth", refuse, request)).toEqual(first);
+      expect(runs).toBe(1);
+      // Deeper than the scan goes is refused rather than treated as examined and clean.
+      expect(prohibitedDurableField(nested(40, { note: "never examined" }))).not.toBeNull();
+      expect(prohibitedDurableField(nested(8, { note: "examined" }))).toBeNull();
+    } finally { h.cp.close(); }
+  });
 });

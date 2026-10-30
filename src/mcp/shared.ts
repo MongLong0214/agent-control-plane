@@ -180,7 +180,8 @@ export const createMcpMutationPort = (source: McpMutationSource): McpMutationPor
 /**
  * A refusal a handler threw, answered as the denial it is (the shape `guarded` gives it) so that it is
  * stored as the call's outcome. Its message and evidence are kept only when they hold no credential
- * shape and no private bulk content; otherwise the reason code alone is. #1279 G3-1 — both are free
+ * shape and no private bulk content, in a key or a value, and nest no deeper than the scans read
+ * (#1279 G4); otherwise the reason code alone is. #1279 G3-1 — both are free
  * text: a digest or 64-hex id in them, whole or inside text, is kept only when it names a record the
  * store holds (`RegistryView.boundReference`) for the run the call names, never for its format alone.
  */
