@@ -339,6 +339,8 @@ export interface BlindReviewRequest {
   attemptId?: string;
   /** The submission's lease, renewed on each real step of this review. */
   progress?: ReviewProgress;
+  /** Aborted when the submission no longer holds the run: every reviewer invocation it starts is stopped. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -360,6 +362,7 @@ export interface BootstrapPlanReviewRequest {
   manifest?: unknown;
   attemptId?: string;
   progress?: ReviewProgress;
+  signal?: AbortSignal;
 }
 
 /**
@@ -379,6 +382,7 @@ export interface ContractChangeReviewRequest {
   baseManifest?: unknown;
   attemptId?: string;
   progress?: ReviewProgress;
+  signal?: AbortSignal;
 }
 
 /** The composition root supplies the capacity admission that reviewer allocation needs. */
@@ -392,7 +396,7 @@ export type BlindReviewInvoker = (
 ) => Promise<Decision<ReviewPacket>>;
 
 /** What every reviewer constituted for a run needs to know about the request. */
-type ReviewSubject = Pick<BlindReviewRequest, "runId" | "snapshot">;
+type ReviewSubject = Pick<BlindReviewRequest, "runId" | "snapshot" | "signal">;
 
 /** A BOOTSTRAP_PLAN request once its trusted inputs have been reloaded. */
 interface TrustedBootstrapPlanReview {
@@ -817,6 +821,9 @@ export class BlindReviewGate {
       lifecycle: bootstrapCodeGuarantees(),
       originalRecords: await originalReviewRecords(inputs.reviewEvidence, this.#verifyOriginalRecord),
     };
+    // The review starting is real progress, after its preparation: an attempt that no longer holds the
+    // run starts no reviewer and records no review context.
+    if (request.progress?.("FINAL_REVIEW_STARTED") === false) return attemptLeaseLost(request.runId, request.attemptId);
     // The existing BLIND_REVIEW envelope is closed. Persist its private inputs in the same
     // typed HANDOFF artifact path as stage/attach, bound to this candidate and an ACP audit.
     const privateInputs = this.artifacts.put(inputs.runId, ArtifactKind.HANDOFF,
@@ -833,7 +840,7 @@ export class BlindReviewGate {
       if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
       reviewers.push(reviewer.value);
       const outcome = await this.singleReview(
-        inputs,
+        { ...inputs, ...(request.signal === undefined ? {} : { signal: request.signal }) },
         this.buildBootstrapPlanPrompt(inputs, expected, context),
         reviewer.value,
         expected,
@@ -892,6 +899,7 @@ export class BlindReviewGate {
     if (!trusted.allowed) return trusted as Decision<ReviewPacket>;
     const inputs = trusted.value;
     const expected = [inputs.change.target];
+    if (request.progress?.("FINAL_REVIEW_STARTED") === false) return attemptLeaseLost(request.runId, request.attemptId);
 
     const reviewers: ReviewerBinding[] = [];
     try {
@@ -899,7 +907,7 @@ export class BlindReviewGate {
       if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
       reviewers.push(reviewer.value);
       const outcome = await this.singleReview(
-        inputs,
+        { ...inputs, ...(request.signal === undefined ? {} : { signal: request.signal }) },
         this.buildContractChangePrompt(inputs, expected),
         reviewer.value,
         expected,
@@ -1631,6 +1639,7 @@ export class BlindReviewGate {
       correlationId,
       externalSessionId: reviewer.externalSessionId,
       isolation: this.reviewerIsolation(request, reviewer.workdir),
+      ...(request.signal === undefined ? {} : { signal: request.signal }),
     };
   }
 

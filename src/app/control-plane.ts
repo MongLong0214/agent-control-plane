@@ -717,6 +717,8 @@ export class ControlPlane {
         },
       );
       this.watchdog = new Watchdog(this.db, this.clock, this.audit, this.doctor, this.claims, this.outbox);
+      // An attempt the watchdog releases has its reviewer and verification children stopped.
+      this.watchdog.attach({ attemptReleased: (attemptId) => this.pipeline.abortAttempt(attemptId) });
       this.bootstrapApplications = new BootstrapApplications(this.db, this.clock, this.audit);
       const hostScript = config.residentProvisioner?.script ?? process.env["ACP_HOST_PROJECT_PROVISIONER"];
       this.hostProjectProvisioner = config.residentProvisioner?.port ?? (hostScript

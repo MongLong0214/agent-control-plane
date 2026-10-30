@@ -46,6 +46,11 @@ export interface SandboxRequest {
    * in PROJECT_VERIFICATION_EXECUTABLES count. Absent means the allowlist alone.
    */
   executables?: readonly string[];
+  /**
+   * Aborting stops the command as its timeout does: the candidate's tree is signalled, then killed.
+   * Its submission no longer holds the run, so nothing waits on the outcome.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -1257,7 +1262,8 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     return sample;
   };
 
-  const timer = setTimeout(() => {
+  const stopCandidate = (): void => {
+    if (timedOut || closed) return;
     timedOut = true;
     void killKnownTargets("SIGTERM").then((killed) => {
       if (!killed) markContainmentLost("timeout cleanup could not signal every observed candidate");
@@ -1269,7 +1275,10 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
       }, 5_000);
       escalation.unref();
     });
-  }, command.timeoutSeconds * 1000);
+  };
+  const timer = setTimeout(stopCandidate, command.timeoutSeconds * 1000);
+  request.signal?.addEventListener("abort", stopCandidate, { once: true });
+  if (request.signal?.aborted) stopCandidate();
 
   identity = await identityAttempt;
 
@@ -1285,6 +1294,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
 
   closed = true;
   clearTimeout(timer);
+  request.signal?.removeEventListener("abort", stopCandidate);
   if (escalation) clearTimeout(escalation);
   if (drainWatch) clearTimeout(drainWatch);
   clearInterval(memoryPoll);

@@ -1,20 +1,31 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
+import { manifestDigest, type ProjectManifest } from "../../src/contracts/manifest.ts";
+import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ArtifactKind, ExecutionMode, RunState, type RunRow } from "../../src/domain/types.ts";
+import { ArtifactKind, ExecutionMode, RunKind, RunState, type RunRow } from "../../src/domain/types.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
+import { progressNotifier } from "../../src/mcp/shared.ts";
 import type { InvocationRequest, InvocationResult } from "../../src/runtime/provider.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
-import { cleanupTempDirs, commitAll, writeFiles } from "../helpers/fixtures.ts";
+import { runSandboxed } from "../../src/verify/sandbox.ts";
+import { bootstrapCoverageKeys, submitBootstrapPlan } from "../helpers/bootstrap-plan.ts";
+import { WORKFLOW, WORKFLOW_PATH } from "../helpers/contract-change.ts";
+import { cleanupTempDirs, commitAll, gitSync, makeRepo, writeFiles } from "../helpers/fixtures.ts";
+import { createRun, firstManifest, firstPlan, operatorRegisteredProject, revisionsFor } from "../helpers/first-activation.ts";
+import { genesisPlanFixture } from "../helpers/genesis-github.ts";
 import {
   type Harness,
   applyPassingChange,
   bindCeo,
   bindWorker,
+  dispatchBootstrapRun,
+  fixtureManifest,
   makeHarness,
   registerFixtureProject,
   reviewerPass,
@@ -46,9 +57,9 @@ const CONTRACT: TaskContract = {
 /** A change over the single-context budget, so its review is chunked. */
 const large = (chars: number): string => `module.exports = () => 2;\n// ${"x".repeat(chars)}\n`;
 
-const prepare = async (content?: string) => {
+const prepare = async (content?: string, manifest: Partial<ProjectManifest> = {}) => {
   const h = makeHarness();
-  const { projectId, repositoryId, identity } = await registerFixtureProject(h);
+  const { projectId, repositoryId, identity } = await registerFixtureProject(h, "fixture-project", manifest);
   bindCeo(h);
   const created = h.cp.runs.create({
     projectId,
@@ -90,15 +101,25 @@ const submission = (run: RunRow) => ({
   recommendation: "merge",
 });
 
-/** Each reviewer answer takes `minutes(prompt)` of fake time; the watchdog sweeps as it comes back. */
-const pace = (h: Harness, minutes: (prompt: string) => number): void => {
+/**
+ * Each reviewer answer takes `minutes(prompt)` of fake time and the watchdog sweeps before it comes back.
+ * Answers, per invocation, whether its signal had stopped it by then.
+ */
+const pace = (
+  h: Harness,
+  minutes: (prompt: string) => number,
+  sweep: () => unknown = () => h.cp.pipeline.reclaimExpiredAttempts(),
+): boolean[] => {
+  const stopped: boolean[] = [];
   const invoke = h.scripted.invoke.bind(h.scripted);
   h.scripted.invoke = async (request: InvocationRequest): Promise<InvocationResult> => {
     const answer = await invoke(request);
     h.clock.advance(minutes(request.prompt) * MINUTE);
-    h.cp.pipeline.reclaimExpiredAttempts();
+    await sweep();
+    stopped.push(request.signal?.aborted === true);
     return answer;
   };
+  return stopped;
 };
 
 const attemptRow = (h: Harness, runId: string) =>
@@ -151,12 +172,14 @@ describe("a candidate submission's attempt lease follows its real progress", () 
       { match: /Review chunk/, text: reviewerPass([covered]), once: false },
       { match: /Final review/, text: reviewerPass([]) },
     );
-    pace(h, () => 31);
+    const stopped = pace(h, () => 31);
     const steps: string[] = [];
 
     const outcome = await h.cp.pipeline.submitResult({ ...submission(run), onProgress: (step) => steps.push(step) });
 
     expect(outcome).toMatchObject({ allowed: false, reasonCode: ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE });
+    // The release stopped the chunk reviewer still running, and its late answer fed nothing.
+    expect(stopped).toEqual([true]);
     // Released by the sweep during the first chunk; the chunk's completion after it renewed nothing.
     const row = attemptRow(h, runId);
     expect(row.state).toBe("RELEASED");
@@ -232,6 +255,134 @@ describe("a candidate submission's attempt lease follows its real progress", () 
     expectNothingApplied(h, runId);
   });
 });
+
+describe("work an attempt started stops when ACP releases it, and what comes back late is not applied", () => {
+  it("at the cap the watchdog's release stops the final reviewer still running, and no verdict is applied", async () => {
+    const { h, run, runId, covered } = await prepare(large(600_000));
+    h.scripted.script(
+      { match: /Review chunk/, text: reviewerPass([covered]), once: false },
+      { match: /Final review/, text: reviewerPass([]) },
+    );
+    // The chunks take 119.2 minutes in all, so the final review starts then; the watchdog runs past 120.
+    const stopped = pace(h, (prompt) => {
+      const of = /# Review chunk \d+ of (\d+)/.exec(prompt);
+      return of ? 119.2 / Number(of[1]) : 1;
+    }, () => h.cp.watchdog.tick());
+
+    const outcome = await h.cp.pipeline.submitResult(submission(run));
+
+    const chunks = prompts(h, /Review chunk/);
+    expect(chunks).toBeGreaterThanOrEqual(4);
+    expect(prompts(h, /Final review/)).toBe(1);
+    expect(stopped).toEqual([...Array<boolean>(chunks).fill(false), true]);
+    expect(outcome).toMatchObject({ allowed: false, reasonCode: ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE });
+    expect(attemptRow(h, runId).state).toBe("RELEASED");
+    expect(h.cp.artifacts.latest(runId, ArtifactKind.BLIND_REVIEW)).toBeNull();
+    expectNothingApplied(h, runId);
+  });
+
+  it("an attempt released during its first verification command records none of its result, stops it, and starts no second command", async () => {
+    const verify = fixtureManifest("fixture-project").verificationCommands[0]!;
+    const { h, run, runId } = await prepare(undefined, {
+      verificationProfiles: { simple: ["verify", "verify-again"], standard: ["verify", "verify-again"], guarded: ["verify", "verify-again"] },
+      verificationCommands: [verify, { ...verify, id: "verify-again" }],
+    });
+    const engine = h.cp.verification as unknown as { runLocal: (...args: unknown[]) => Promise<unknown> };
+    const runLocal = engine.runLocal.bind(h.cp.verification);
+    const stopped: boolean[] = [];
+    engine.runLocal = async (...args: unknown[]) => {
+      const result = await runLocal(...args);
+      h.clock.advance(31 * MINUTE);
+      h.cp.pipeline.reclaimExpiredAttempts();
+      const signal = args.at(-1);
+      stopped.push(signal instanceof AbortSignal && signal.aborted);
+      return result;
+    };
+
+    const outcome = await h.cp.pipeline.submitResult(submission(run));
+
+    expect(stopped).toEqual([true]);
+    expect(outcome).toMatchObject({ allowed: false, reasonCode: ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE });
+    expect(h.cp.db.all("SELECT result_id FROM verification_results WHERE run_id = ?", [runId])).toEqual([]);
+    expect(h.cp.artifacts.latest(runId, ArtifactKind.VERIFICATION)).toBeNull();
+    expect(h.scripted.invocations).toEqual([]);
+    expectNothingApplied(h, runId);
+  });
+
+  it("a verification command whose submission no longer holds the run is stopped", async () => {
+    const repository = makeRepo({ "slow.js": "setTimeout(() => {}, 60000);\n" });
+    const controller = new AbortController();
+    const started = Date.now();
+    setTimeout(() => controller.abort(), 1_000).unref();
+    const outcome = await runSandboxed({
+      command: parseVerificationCommand({ id: "slow", argv: ["node", "slow.js"], timeoutSeconds: 120 }),
+      worktreePath: repository,
+      denyReadPaths: [],
+      signal: controller.signal,
+    });
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(outcome.status).not.toBe("PASS");
+  }, 30_000);
+
+  it.each(["CONTRACT_CHANGE", "BOOTSTRAP_PLAN"] as const)(
+    "a %s review renews its attempt when it starts: 25 minutes of preparation and a 10-minute review keep it, with a progress notice",
+    async (kind) => {
+      const { h, run, runId } = kind === "CONTRACT_CHANGE" ? await contractChangeRun() : await bootstrapPlanRun();
+      const freeze = h.cp.pipeline.freeze.bind(h.cp.pipeline);
+      h.cp.pipeline.freeze = async (...args: Parameters<typeof freeze>) => {
+        const frozen = await freeze(...args);
+        h.clock.advance(25 * MINUTE);
+        return frozen;
+      };
+      pace(h, () => 10);
+      const steps: string[] = [];
+
+      const outcome = await h.cp.pipeline.submitResult({ ...submission(run), onProgress: (step) => steps.push(step) });
+
+      expect(outcome).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+      expect(steps).toEqual(["FINAL_REVIEW_STARTED", "FINAL_REVIEW_ENDED"]);
+      expect(reclaimed(h, runId)).toEqual([]);
+    },
+  );
+});
+
+/** A dispatched no-repository CONTRACT_CHANGE (a first activation) with its PLAN, and a passing reviewer for it. */
+const contractChangeRun = async () => {
+  const repoPath = makeRepo({ "README.md": "# fixture\n", "verify.js": "console.log('ok')\n", [WORKFLOW_PATH]: WORKFLOW }, "dev");
+  const h = makeHarness({ repoPath });
+  const projectId = "long-review-activation";
+  await operatorRegisteredProject(h, projectId);
+  const bound = gitSync(repoPath, ["rev-parse", "HEAD"]);
+  const run = await createRun(h, projectId, RunKind.CONTRACT_CHANGE);
+  const manifest = firstManifest(projectId);
+  const submitted = createCtoMcpPort(h.cp).submitPlan(run.runId, {
+    ...firstPlan(manifest, revisionsFor(manifest, bound)),
+    summary: "Activate the project's first manifest.",
+    repositoryContentChange: false,
+    risks: [],
+    verificationIntent: ["The project's CI check stays the quality bar."],
+  });
+  if (!submitted.allowed) throw new Error(`${submitted.reasonCode}: ${submitted.message}`);
+  await h.cp.continuity.evaluate("long contract change review");
+  h.scripted.script({ match: /Contract change review/, text: reviewerPass([`${projectId}:#manifest/${manifestDigest(manifest)}`]) });
+  return { h, run, runId: run.runId };
+};
+
+/** A dispatched project-less bootstrap run with its PLAN, and a passing reviewer for it. */
+const bootstrapPlanRun = async () => {
+  const h = makeHarness();
+  bindCeo(h);
+  const created = h.cp.runs.create({
+    kind: RunKind.PROJECT_BOOTSTRAP,
+    executionMode: ExecutionMode.STANDARD,
+    contract: { goal: "bootstrap", why: "review", scope: [], nonGoals: [], acceptance: ["done"], priority: "NORMAL", humanGate: [], references: [] },
+  });
+  if (!created.allowed) throw new Error(created.message);
+  const run = await dispatchBootstrapRun(h.cp, h.clock, created.value.runId);
+  await submitBootstrapPlan(h, run.runId, genesisPlanFixture().artifact.content);
+  h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(h, run.runId)) });
+  return { h, run, runId: run.runId };
+};
 
 /** One MCP connection as the run's owning CTO session, and every message its server sends. */
 const connect = async (h: Harness, run: RunRow) => {
@@ -350,4 +501,101 @@ describe("result_submit over MCP", () => {
       await again.close();
     }
   });
+
+  it("after a daemon restart mid-review the same key runs no second pipeline, a new key is refused while the attempt holds, and a stored result stays retrievable", async () => {
+    const { h, run, covered } = await prepare();
+    // A first submission completes before the restart: a revision, so the run stays ACTIVE.
+    h.scripted.script({ match: /Candidate review/, text: reviewerRevise([covered], "a finding") });
+    const before = await connect(h, run);
+    const done = await before.client.callTool(resultSubmit(run, "finished-before-the-restart"));
+    await before.close();
+    expect(done.structuredContent).toMatchObject({ ok: true, value: { stage: "REVISION_REQUIRED" } });
+
+    // A second one is mid-review when the daemon goes: its process, and that review, end with it.
+    h.scripted.script({ match: /Candidate review/, text: reviewerPass([covered]) });
+    let entered!: () => void;
+    const reviewing = new Promise<void>((resolve) => { entered = resolve; });
+    const invoke = h.scripted.invoke.bind(h.scripted);
+    h.scripted.invoke = async (request: InvocationRequest): Promise<InvocationResult> => {
+      entered();
+      await new Promise<never>(() => undefined);
+      return invoke(request);
+    };
+    const during = await connect(h, run);
+    void during.client.callTool(resultSubmit(run, "running-at-the-restart")).catch(() => undefined);
+    await reviewing;
+    await during.close();
+    h.cp.close();
+
+    // A new control plane on the same database: nothing of the first one's memory.
+    const restarted = makeHarness({ root: h.root, repoPath: h.repoPath, clock: h.clock });
+    const submit = vi.spyOn(restarted.cp.pipeline, "submitResult");
+    const after = await connect(restarted, run);
+    const frozen = () => restarted.cp.audit.forRun(run.runId).filter((row) => row.kind === "CANDIDATE_FROZEN").length;
+    try {
+      // The stored result is still the key's answer.
+      expect((await after.client.callTool(resultSubmit(run, "finished-before-the-restart"))).structuredContent)
+        .toEqual(done.structuredContent);
+      // The interrupted key never runs again: its outcome is unknown, not re-executed.
+      const interrupted = await after.client.callTool(resultSubmit(run, "running-at-the-restart"));
+      expect(interrupted.structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.MCP_MUTATION_OUTCOME_UNKNOWN });
+      expect(submit).not.toHaveBeenCalled();
+      // A new key is refused while the interrupted attempt still holds the run.
+      const newKey = await after.client.callTool(resultSubmit(run, "a-new-key-at-once"));
+      expect(newKey.structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
+      expect(frozen()).toBe(2);
+      expect(restarted.scripted.invocations).toEqual([]);
+      // Its lease lapses unrenewed and the watchdog reclaims it; the interrupted key still runs nothing.
+      restarted.clock.advance(31 * MINUTE);
+      await restarted.cp.watchdog.tick();
+      expect(restarted.cp.db.get<{ state: string }>("SELECT state FROM candidate_pipeline_attempts WHERE run_id = ?", [run.runId])?.state)
+        .toBe("RELEASED");
+      expect((await after.client.callTool(resultSubmit(run, "running-at-the-restart"))).structuredContent)
+        .toMatchObject({ ok: false, reasonCode: ReasonCode.MCP_MUTATION_OUTCOME_UNKNOWN });
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(frozen()).toBe(2);
+    } finally {
+      await after.close();
+      restarted.cp.close();
+    }
+  });
+});
+
+describe("an MCP SDK client receiving progress notices", () => {
+  /** A tool that runs five seconds, sending a progress notice each second when its caller asked for them. */
+  const slowServer = (): McpServer => {
+    const server = new McpServer({ name: "slow", version: "1" });
+    server.registerTool("slow", { description: "runs five seconds" }, async (extra) => {
+      const notify = progressNotifier(extra);
+      for (let second = 1; second <= 5; second += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        notify?.(`second ${second}`);
+      }
+      return { content: [{ type: "text" as const, text: "done" }] };
+    });
+    return server;
+  };
+  const call = async (options: Parameters<Client["callTool"]>[2]) => {
+    const server = slowServer();
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const client = new Client({ name: "progress-receiver", version: "1" });
+    await client.connect(clientTransport);
+    try {
+      return await client.callTool({ name: "slow", arguments: {} }, undefined, options).catch((error: unknown) => error);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  };
+
+  it("does not time out at 2 seconds while a notice arrives every second, and does without them", async () => {
+    const notices: number[] = [];
+    const kept = await call({ timeout: 2_000, resetTimeoutOnProgress: true, onprogress: (notice) => notices.push(notice.progress) });
+    expect(kept).toMatchObject({ content: [{ type: "text", text: "done" }] });
+    expect(notices).toEqual([1, 2, 3, 4, 5]);
+    const silent = await call({ timeout: 2_000, resetTimeoutOnProgress: true });
+    expect(silent).toBeInstanceOf(Error);
+    expect(String(silent)).toMatch(/timed out/i);
+  }, 20_000);
 });

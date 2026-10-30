@@ -95,6 +95,13 @@ export class Watchdog {
     private readonly deadlines: WatchdogDeadlines = DEFAULT_DEADLINES,
   ) {}
 
+  #attemptReleased: ((attemptId: string) => void) | null = null;
+
+  /** Told of each candidate pipeline attempt this watchdog releases, once the release commits, to stop its work. */
+  attach(ports: { attemptReleased?: (attemptId: string) => void }): void {
+    if (ports.attemptReleased) this.#attemptReleased = ports.attemptReleased;
+  }
+
   async tick(): Promise<WatchdogTick> {
     const nowIso = this.clock.nowIso();
     const now = new Date(nowIso).getTime();
@@ -174,6 +181,8 @@ export class Watchdog {
           [nowIso, attempt.run_id, attempt.attempt_id, attempt.deadline_at, nowIso],
         );
         if (released.changes === 1) {
+          const stop = this.#attemptReleased;
+          if (stop) this.db.afterCommit(() => stop(attempt.attempt_id));
           this.audit.record({
             kind: OWNERLESS_STALL_OWED,
             runId: attempt.run_id,

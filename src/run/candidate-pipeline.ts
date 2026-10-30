@@ -268,6 +268,8 @@ export class CandidatePipeline {
   ) {}
 
   #continuity: { evaluate?(reason: string): Promise<unknown> } | null = null;
+  /** The attempts this process runs, each with what stops its reviewer and verification children. */
+  readonly #attempts = new Map<string, AbortController>();
 
   attach(ports: { continuity?: { evaluate?(reason: string): Promise<unknown> } }): void {
     if (ports.continuity) this.#continuity = ports.continuity;
@@ -498,14 +500,26 @@ export class CandidatePipeline {
     const attemptId = `attempt_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
     const acquired = this.acquireAttempt(input, attemptId);
     if (!acquired.allowed) return acquired as Decision<PipelineOutcome>;
+    const controller = new AbortController();
+    this.#attempts.set(attemptId, controller);
     try {
-      return await this.submitResultOnce(input, attemptId);
+      return await this.submitResultOnce(input, attemptId, controller.signal);
     } finally {
+      this.#attempts.delete(attemptId);
       this.releaseAttempt(input.runId, attemptId);
     }
   }
 
-  private async submitResultOnce(input: SubmitResultInput, attemptId: string): Promise<Decision<PipelineOutcome>> {
+  /**
+   * Stops what an attempt this process runs has in flight (its reviewer and verification children)
+   * once ACP no longer lets it hold the run: a watchdog or acquisition reclaim, the cap, a refused
+   * renewal. What those children still return is fenced off by the same hold.
+   */
+  abortAttempt(attemptId: string): void {
+    this.#attempts.get(attemptId)?.abort();
+  }
+
+  private async submitResultOnce(input: SubmitResultInput, attemptId: string, signal: AbortSignal): Promise<Decision<PipelineOutcome>> {
     const owner = this.runs.assertOwner(
       input.runId,
       input.ownerSessionId,
@@ -550,6 +564,7 @@ export class CandidatePipeline {
           contractDigest: run.contractDigest,
           attemptId,
           progress,
+          signal,
         });
         reviewedPlan = reviewed;
         // Review rounds 1 and 2 (RF-REVIEW-02) — the review is asynchronous, and `plan_submit` can
@@ -560,7 +575,7 @@ export class CandidatePipeline {
         // (`unpassedReview`), and the packet (below) — never only once after the review.
         // A verdict rests on the review the gate stored, whose intent must still be the run's too
         // (BPI-R1-01): a task replaced during the await keeps the PLAN binding and changes only that.
-        const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, (verdict) =>
+        const unpassed = await this.unpassedReview(input, snapshotDigest, reviewed, attemptId, (verdict) =>
           this.bootstrapPlanStillCurrent(input.runId, snapshot, verdict ? snapshotDigest : null),
         );
         if (unpassed !== null) return unpassed;
@@ -580,9 +595,10 @@ export class CandidatePipeline {
           contractDigest: run.contractDigest,
           attemptId,
           progress,
+          signal,
         });
         reviewedPlan = reviewed;
-        const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, () =>
+        const unpassed = await this.unpassedReview(input, snapshotDigest, reviewed, attemptId, () =>
           this.contractChangePlanStillCurrent(input.runId, snapshot),
         );
         if (unpassed !== null) return unpassed;
@@ -612,8 +628,7 @@ export class CandidatePipeline {
           const superseded = this.supersededAtPublication(run, snapshot, snapshotDigest, attemptId, reviewedPlan);
           if (superseded !== null) return superseded;
         }
-        if (!this.attemptHolds(input.runId, attemptId)) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewedPlan);
-        const built = this.ceo.buildPacket({
+        const built = this.applyHolding(input, attemptId, () => this.ceo.buildPacket({
           runId: input.runId,
           candidateSnapshotDigest: snapshotDigest,
           sourceReadLeaseId: sourceReadLease.value.leaseId,
@@ -627,7 +642,8 @@ export class CandidatePipeline {
             approvedByGeneration: input.ownerBindingGeneration,
             approvedAt: this.clock.nowIso(),
           },
-        } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string });
+        } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string }));
+        if (built === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewedPlan);
         if (!built.allowed) return built as Decision<PipelineOutcome>;
         return allow(ReasonCode.OK, {
           stage: "COMPLETED_REVIEW",
@@ -652,10 +668,11 @@ export class CandidatePipeline {
       pinnedManifestDigest: run.pinnedManifestDigest,
       executionMode: run.executionMode,
       runScoped: Boolean(input.runScopedCommands),
-      progress: () => { progress("VERIFICATION_COMMAND_COMPLETED"); },
+      attempt: { holds: () => this.attemptHolds(input, attemptId), progress: () => progress("VERIFICATION_COMMAND_COMPLETED"), signal },
     });
 
     if (!verified.allowed) {
+      if (verified.reasonCode === ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
       const report =
         this.verification.latestReport(input.runId, snapshotDigest) ??
         ({
@@ -672,12 +689,12 @@ export class CandidatePipeline {
 
       // §34.2 — a failed verification returns to CTO revision with the evidence still
       // bound to the candidate that failed.
-      if (!this.attemptHolds(input.runId, attemptId)) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
-      const returned = this.returnToCto(input.runId, verified.reasonCode, {
+      const returned = this.applyHolding(input, attemptId, () => this.returnToCto(input.runId, verified.reasonCode, {
         stage: "verification",
         candidateSnapshotDigest: snapshotDigest,
         report,
-      }, attemptId);
+      }, attemptId));
+      if (returned === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
       if (!returned.allowed) return returned as Decision<PipelineOutcome>;
       return allow(ReasonCode.OK, {
         stage: "VERIFICATION_FAILED",
@@ -702,7 +719,7 @@ export class CandidatePipeline {
     if (!contract.allowed) return contract as Decision<PipelineOutcome>;
 
     // §18.2 — automatic, immediately after verification passes.
-    if (!this.attemptHolds(input.runId, attemptId)) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
+    if (!this.attemptHolds(input, attemptId)) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
     const reviewed = await this.invokeReview({
       runId: input.runId,
       projectId: run.projectId,
@@ -713,13 +730,14 @@ export class CandidatePipeline {
       verification: verified.value,
       attemptId,
       progress,
+      signal,
     });
 
     // #246 B2-a — a CONTRACT_CHANGE candidate's verdict is for the PLAN it names; one replaced since
     // gets no revision request. Any other candidate's verdict is delivered as before.
     const unpassed = snapshot.contractChange === undefined
-      ? await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId)
-      : await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, () =>
+      ? await this.unpassedReview(input, snapshotDigest, reviewed, attemptId)
+      : await this.unpassedReview(input, snapshotDigest, reviewed, attemptId, () =>
           this.contractChangePlanStillCurrent(input.runId, snapshot),
         );
     if (unpassed !== null) return unpassed;
@@ -755,9 +773,8 @@ export class CandidatePipeline {
       }
       const superseded = this.supersededAtPublication(run, snapshot, snapshotDigest, attemptId, reviewed);
       if (superseded !== null) return superseded;
-      if (!this.attemptHolds(input.runId, attemptId)) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewed);
 
-      const built = this.ceo.buildPacket({
+      const built = this.applyHolding(input, attemptId, () => this.ceo.buildPacket({
         runId: input.runId,
         candidateSnapshotDigest: snapshotDigest,
         sourceReadLeaseId: sourceReadLease.value.leaseId,
@@ -771,7 +788,8 @@ export class CandidatePipeline {
           approvedByGeneration: input.ownerBindingGeneration,
           approvedAt: this.clock.nowIso(),
         },
-      } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string });
+      } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string }));
+      if (built === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewed);
       if (!built.allowed) return built as Decision<PipelineOutcome>;
 
       return allow(ReasonCode.OK, {
@@ -860,7 +878,7 @@ export class CandidatePipeline {
    * run to its CTO, and an assurance failure waits (§18.6, §18.7).
    */
   private async unpassedReview(
-    runId: string,
+    input: SubmitResultInput,
     snapshotDigest: string,
     reviewed: Decision<ReviewPacket>,
     /** The submission this review belongs to: its revision is delivered once per attempt. */
@@ -873,12 +891,15 @@ export class CandidatePipeline {
     stillCurrent: (verdict: boolean) => Decision<void> = () => allow(ReasonCode.OK, undefined),
   ): Promise<Decision<PipelineOutcome> | null> {
     if (reviewed.allowed) return null;
-    // A submission whose attempt no longer holds the run applies no outcome, before and after the await.
-    if (!this.attemptHolds(runId, attemptId)) return this.attemptLost(runId, attemptId, snapshotDigest, reviewed);
+    const runId = input.runId;
+    // A submission whose attempt no longer holds the run applies no outcome: not here, and not after
+    // the await below, where what it writes is written only in a transaction that holds it.
+    if (reviewed.reasonCode === ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE || !this.attemptHolds(input, attemptId)) {
+      return this.attemptLost(runId, attemptId, snapshotDigest, reviewed);
+    }
     // §18.7 is an assurance decision too. Re-evaluate continuity before deciding
     // whether a provider/isolation failure waits or moves the system into SURVIVAL.
     if (this.#continuity?.evaluate) await this.#continuity.evaluate("blind-review-unavailable");
-    if (!this.attemptHolds(runId, attemptId)) return this.attemptLost(runId, attemptId, snapshotDigest, reviewed);
     // #246 C2, review round 2 (RF-REVIEW-02) — the review and the evaluation above were awaited, and
     // a bootstrap PLAN replaced during either makes this outcome stale: no revision request and no
     // unavailable-review record is produced for it. Nothing below awaits before either is written.
@@ -897,12 +918,16 @@ export class CandidatePipeline {
     }
 
     if (!isVerdict) {
-      this.audit.record({
-        kind: "BLIND_REVIEW_UNAVAILABLE",
-        runId,
-        reasonCode: reviewed.reasonCode,
-        evidence: unavailableReviewEvidence(snapshotDigest, reviewed.evidence, attemptId),
+      const recorded = this.applyHolding(input, attemptId, () => {
+        this.audit.record({
+          kind: "BLIND_REVIEW_UNAVAILABLE",
+          runId,
+          reasonCode: reviewed.reasonCode,
+          evidence: unavailableReviewEvidence(snapshotDigest, reviewed.evidence, attemptId),
+        });
+        return allow(ReasonCode.OK, undefined);
       });
+      if (recorded === null) return this.attemptLost(runId, attemptId, snapshotDigest, reviewed);
       return allow(ReasonCode.OK, {
         stage: "REVIEW_UNAVAILABLE",
         reasonCode: reviewed.reasonCode,
@@ -911,11 +936,12 @@ export class CandidatePipeline {
       });
     }
 
-    const returned = this.returnToCto(runId, reviewed.reasonCode, {
+    const returned = this.applyHolding(input, attemptId, () => this.returnToCto(runId, reviewed.reasonCode, {
       stage: "blind-review",
       candidateSnapshotDigest: snapshotDigest,
       ...reviewed.evidence,
-    }, attemptId);
+    }, attemptId));
+    if (returned === null) return this.attemptLost(runId, attemptId, snapshotDigest, reviewed);
     if (!returned.allowed) return returned as Decision<PipelineOutcome>;
     const packet = this.review.latestPacket(runId, snapshotDigest);
     return allow(ReasonCode.OK, {
@@ -1035,6 +1061,7 @@ export class CandidatePipeline {
       );
       if (inserted.changes === 1) {
         if (prior?.state === "RUNNING" && prior.deadline_at <= startedAt) {
+          this.db.afterCommit(() => this.abortAttempt(prior.attempt_id));
           this.recordAttemptReclaimed({
             runId: input.runId,
             attemptId: prior.attempt_id,
@@ -1097,6 +1124,7 @@ export class CandidatePipeline {
           [releasedAt, attempt.run_id, attempt.attempt_id, releasedAt],
         );
         if (released.changes !== 1) continue;
+        this.db.afterCommit(() => this.abortAttempt(attempt.attempt_id));
         const startedAt = new Date(attempt.started_at).getTime();
         const reclaimedAttempt = {
           runId: attempt.run_id,
@@ -1148,21 +1176,19 @@ export class CandidatePipeline {
   }
 
   /**
-   * Renews this attempt's lease on a real step, and only while the attempt still holds it: RUNNING,
-   * unexpired, and its owner still the run's current one. A RELEASED or expired attempt is never revived,
-   * and no deadline is set past the cap from acquisition. A compare-and-set on the attempt and the deadline
-   * it read; true while the attempt holds the run. The caller is told only of a renewal that committed.
+   * Renews this attempt's lease on a real step, and only while the attempt still holds the run
+   * (`attemptHolds`): a RELEASED or expired attempt is never revived, and no deadline is set past the cap
+   * from acquisition. A compare-and-set on the attempt and the deadline it read; true while the attempt
+   * holds the run, and the caller is told only of a renewal that committed.
    */
   private renewAttempt(input: SubmitResultInput, attemptId: string, step: SubmissionProgressStep): boolean {
     return this.db.tx(() => {
+      if (!this.attemptHolds(input, attemptId)) return false;
       const now = this.clock.now();
       const held = this.db.get<{ started_at: string; deadline_at: string }>(
-        `SELECT started_at, deadline_at FROM candidate_pipeline_attempts
-          WHERE run_id = ? AND attempt_id = ? AND owner_session_id = ? AND owner_binding_generation = ?
-            AND state = 'RUNNING' AND deadline_at > ?`,
-        [input.runId, attemptId, input.ownerSessionId, input.ownerBindingGeneration, now.toISOString()],
-      );
-      if (!held || !this.runs.assertOwner(input.runId, input.ownerSessionId, input.ownerBindingGeneration).allowed) return false;
+        `SELECT started_at, deadline_at FROM candidate_pipeline_attempts WHERE run_id = ? AND attempt_id = ?`,
+        [input.runId, attemptId],
+      )!;
       const renewal = Math.min(now.getTime() + ATTEMPT_LEASE_TTL_MS, new Date(held.started_at).getTime() + ATTEMPT_LEASE_CAP_MS);
       const deadlineAt = new Date(Math.max(renewal, new Date(held.deadline_at).getTime())).toISOString();
       const renewed = this.db.run(
@@ -1170,23 +1196,48 @@ export class CandidatePipeline {
           WHERE run_id = ? AND attempt_id = ? AND state = 'RUNNING' AND deadline_at = ?`,
         [deadlineAt, input.runId, attemptId, held.deadline_at],
       ).changes === 1;
-      if (renewed && input.onProgress) {
-        const notify = input.onProgress;
+      if (!renewed) {
+        this.abortAttempt(attemptId);
+        return false;
+      }
+      const notify = input.onProgress;
+      if (notify) {
         this.db.afterCommit(() => {
           try { notify(step); } catch { /* a notice that fails never decides the submission */ }
         });
       }
-      return renewed;
+      return true;
     });
   }
 
-  /** Whether this attempt still holds the run, asked with nothing awaited between it and the outcome it gates. */
-  private attemptHolds(runId: string, attemptId: string): boolean {
-    return this.db.get<{ n: number }>(
+  /**
+   * Whether this attempt still holds the run: RUNNING, unexpired, and its owner still the run's current
+   * one. An attempt found not to hold it is stopped (`abortAttempt`).
+   */
+  private attemptHolds(input: SubmitResultInput, attemptId: string): boolean {
+    const holds = this.db.get<{ n: number }>(
       `SELECT 1 AS n FROM candidate_pipeline_attempts
-        WHERE run_id = ? AND attempt_id = ? AND state = 'RUNNING' AND deadline_at > ?`,
-      [runId, attemptId, this.clock.nowIso()],
-    ) !== undefined;
+        WHERE run_id = ? AND attempt_id = ? AND owner_session_id = ? AND owner_binding_generation = ?
+          AND state = 'RUNNING' AND deadline_at > ?`,
+      [input.runId, attemptId, input.ownerSessionId, input.ownerBindingGeneration, this.clock.nowIso()],
+    ) !== undefined && this.runs.assertOwner(input.runId, input.ownerSessionId, input.ownerBindingGeneration).allowed;
+    if (!holds) this.abortAttempt(attemptId);
+    return holds;
+  }
+
+  /**
+   * Applies an attempt's outcome (a revision request, an unavailable-review row, the packet) only while
+   * the attempt holds the run: the check and the writes are one transaction. Null, with nothing applied,
+   * when it no longer holds; otherwise what `apply` answered, a denial rolling back what it wrote.
+   */
+  private applyHolding<T>(input: SubmitResultInput, attemptId: string, apply: () => Decision<T>): Decision<T> | null {
+    let lost = false;
+    const applied = this.db.txDecision(() => {
+      if (this.attemptHolds(input, attemptId)) return apply();
+      lost = true;
+      return deny<T>(ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE, "the attempt no longer holds the run", { runId: input.runId, attemptId });
+    });
+    return lost ? null : applied;
   }
 
   /**
