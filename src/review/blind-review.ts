@@ -68,15 +68,90 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 import {
   type CandidateSnapshot,
+  type SnapshotImport,
+  type SnapshotRefusedImport,
   candidateSnapshotDigest,
   snapshotCoverageTargets,
 } from "../snapshot/candidate-snapshot.ts";
+import { IMPORT_INSPECTION_LIMITS } from "../run/task-import.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
 import type { TaskContract } from "../run/run-engine.ts";
 import { bootstrapPlanTaskRecorded } from "../run/task-graph.ts";
 import { candidateEvidenceSection, readExecutionEvidence, readTrackedTree, type TrackedTreeEvidence } from "./candidate-review-evidence.ts";
 import { redactCredentialValues } from "../core/credential-shapes.ts";
+
+/**
+ * How a path without a textual diff reached the reviewer: git's binary patch, immutable and
+ * digest-bound, or (#1232) for a task's imported file the candidate snapshot binds by blob and
+ * sha256, its manifest entry, whose digest is the file's sha256.
+ */
+export interface BinaryArtifact {
+  repository: string;
+  path: string;
+  digest: string;
+  method: "git-binary-patch" | "import-manifest";
+  /**
+   * #1232, review E3-2/E3-3 — present when the path is a task's declared import: what its inspection
+   * found and what that does not establish, in the words the reviewer's prompt states
+   * (`importInspectionLine` for the file, `importInspectionStatement` once for its kind). A bound import
+   * (`import-manifest`) passed; an import the freeze did not bind is its git patch with the refusal reason.
+   */
+  importInspection?: ImportInspection;
+}
+
+export interface ImportInspection {
+  /** The recognized, structurally checked container type; null when the file was not bound. */
+  format: string | null;
+  /** The manifest's size and sha256. */
+  size: number;
+  sha256: string;
+  /** `passed; bound by its manifest` or `refused: <reason>`. */
+  result: string;
+  limits: string;
+  /** What the reviewer is shown of the content and what the manifest binds. */
+  content: string;
+}
+
+/** #1232 — what a stored packet lists as withheld when a manifest-bound import's bytes are not in the prompt. */
+export const IMPORTED_BINARY_CONTENT_WITHHELD = "raw bytes of manifest-bound binary imports";
+
+const BOUND_IMPORT_CONTENT =
+  `Content not reviewed: ${IMPORTED_BINARY_CONTENT_WITHHELD} are withheld from this packet. ` +
+  "The CTO PLAN manifest authorizes these exact bytes. It binds their identity (path, size, sha256, git blob) only. " +
+  "Reviewer approves path, size, digest, recognized structurally checked container type and placement only, " +
+  "NOT full format conformance, byte safety, passivity, non-executability, or freedom from polyglots.";
+
+const REFUSED_IMPORT_CONTENT =
+  "Not bound by its manifest: the path's patch in the Actual diff is what git produces for it, like any other change.";
+
+const boundImportInspection = (entry: SnapshotImport): ImportInspection => ({
+  format: entry.type,
+  size: entry.size,
+  sha256: entry.sha256,
+  result: "passed; bound by its manifest",
+  limits: IMPORT_INSPECTION_LIMITS,
+  content: BOUND_IMPORT_CONTENT,
+});
+
+const refusedImportInspection = (entry: SnapshotRefusedImport): ImportInspection => ({
+  format: null,
+  size: entry.size,
+  sha256: entry.sha256,
+  result: `refused: ${entry.reason}`,
+  limits: IMPORT_INSPECTION_LIMITS,
+  content: REFUSED_IMPORT_CONTENT,
+});
+
+/** One import's own inspection fields as the reviewer reads them next to the file. */
+const importInspectionLine = (path: string, inspection: ImportInspection): string =>
+  `${path}: ${inspection.format ?? "not bound"}, ${inspection.size} bytes, ${inspection.sha256}. Inspection: ${inspection.result}.`;
+
+/**
+ * The limits and content statement every import of one kind shares, stated once per repository in the
+ * snapshot manifest every chunk carries, so a hundred imports do not repeat it a hundred times.
+ */
+const importInspectionStatement = (content: string): string => `For each: Inspection limits: ${IMPORT_INSPECTION_LIMITS}. ${content}`;
 
 export interface ReviewFinding {
   category: ReviewFindingCategory;
@@ -140,7 +215,7 @@ export interface ReviewPacket {
     /** §18.3 — what was deliberately withheld from the reviewer. */
     withheld: string[];
     /** Immutable representations supplied for binary paths. */
-    binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
+    binaryArtifacts: BinaryArtifact[];
   };
   coveredRepositories: string[];
   coveredFiles: string[];
@@ -726,7 +801,7 @@ export class BlindReviewGate {
     outcome: ReviewOutcome;
     chunked: boolean;
     expected: Array<{ identity: string; path: string }>;
-    binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
+    binaryArtifacts: BinaryArtifact[];
     bootstrapPlan: BootstrapPlanBinding | null;
     /** A BOOTSTRAP_PLAN review's intent digest; absent for every other review. */
     bootstrapPlanIntentDigest?: string;
@@ -1118,17 +1193,12 @@ export class BlindReviewGate {
     Decision<{
       diffs: ReviewerDiff[];
       trees: TrackedTreeEvidence[];
-      binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
+      binaryArtifacts: BinaryArtifact[];
     }>
   > {
     const diffs: ReviewerDiff[] = [];
     const trees: TrackedTreeEvidence[] = [];
-    const binaryArtifacts: Array<{
-      repository: string;
-      path: string;
-      digest: string;
-      method: "git-binary-patch";
-    }> = [];
+    const binaryArtifacts: BinaryArtifact[] = [];
 
     for (const repo of snapshot.repositories) {
       const record = this.repositories.byIdentity(repo.identity);
@@ -1144,7 +1214,9 @@ export class BlindReviewGate {
       // and a moved gitlink as one `Subproject commit` line. This read used to pass `--no-ext-diff`
       // alone, so a candidate's `diff=<driver>` textconv and, under `diff.submodule=diff`, a populated
       // nested repository's own textconv and external diff ran while the reviewer's diff was built.
-      const diff = await diffPatch(record.checkoutPath, repo.baseHead, repo.candidateHead);
+      // #1232 — the imported files the snapshot binds by blob and sha256 are left out, as the freeze left them out.
+      const withheld = (repo.imports ?? []).map((entry) => entry.path);
+      const diff = await diffPatch(record.checkoutPath, repo.baseHead, repo.candidateHead, withheld);
       // The diff must be the one the frozen candidate describes, and these are the bytes reviewed.
       const observedDigest = sha256(diff);
       if (observedDigest !== repo.diffDigest) {
@@ -1155,25 +1227,44 @@ export class BlindReviewGate {
         });
       }
 
+      // #1232 — an import the freeze did not bind is its git patch, and the packet keeps why (review E3-3).
+      const refusedImports = new Map((repo.refusedImports ?? []).map((entry) => [entry.path, entry]));
       for (const section of diff.split(/(?=^diff --git )/m).filter(Boolean)) {
         if (!section.includes("GIT binary patch")) continue;
-        const path = /^diff --git a\/(.+?) b\//m.exec(section)?.[1];
+        // Review lane-e-fs-r7 E5 — a renamed or copied pair's patch writes its destination, the path an
+        // import is declared at and the one git lists as changed; its `a/` path is the source.
+        const header = section.slice(0, section.indexOf("GIT binary patch"));
+        const path = /^(?:rename|copy) to (.+)$/m.exec(header)?.[1] ?? /^diff --git a\/(.+?) b\//m.exec(section)?.[1];
         if (!path || !repo.touchedPaths.includes(path)) {
           return deny(ReasonCode.EVIDENCE_MISSING, "binary patch cannot be bound to a touched path", {
             identity: repo.identity,
             section: section.slice(0, 200),
           });
         }
+        const refused = refusedImports.get(path);
         binaryArtifacts.push({
           repository: repo.identity,
           path,
           digest: sha256(section),
           method: "git-binary-patch",
+          ...(refused === undefined ? {} : { importInspection: refusedImportInspection(refused) }),
         });
       }
 
+      // #1232 — each bound import is its manifest entry: one section per file, so chunking and coverage
+      // treat it like any other changed path, and the packet records how it was shown and what its
+      // inspection did and did not establish (review E3-2).
+      for (const entry of repo.imports ?? []) {
+        binaryArtifacts.push({
+          repository: repo.identity,
+          path: entry.path,
+          digest: entry.sha256,
+          method: "import-manifest",
+          importInspection: boundImportInspection(entry),
+        });
+      }
       trees.push(await readTrackedTree(record.checkoutPath, repo.identity, repo.candidateHead));
-      diffs.push({ identity: repo.identity, diff, files: repo.touchedPaths });
+      diffs.push({ identity: repo.identity, diff: diff + (repo.imports ?? []).map(importManifestSection).join(""), files: repo.touchedPaths });
     }
 
     return allow(ReasonCode.OK, { diffs, binaryArtifacts, trees });
@@ -1374,7 +1465,7 @@ export class BlindReviewGate {
         identity: change.target.identity,
         diff: "",
         files: [change.target.path],
-        coverageTargets: [{ file: key, slice: `${key}:whole` }],
+        coverageTargets: [{ file: key, slice: sliceKey(change.target.identity, change.target.path, 0, "whole") }],
       });
     }
     const coveredFiles = new Set<string>();
@@ -1620,7 +1711,7 @@ export class BlindReviewGate {
       "",
       "## Candidate snapshot manifest",
       "```json",
-      JSON.stringify(request.snapshot, null, 2),
+      JSON.stringify(snapshotForReviewer(request.snapshot), null, 2),
       "```",
       "",
       "## Packet identity and required coverage",
@@ -1844,7 +1935,7 @@ export class BlindReviewGate {
     raw: RawVerdict;
     providerSessionId: string | null;
     expected: Array<{ identity: string; path: string }>;
-    binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
+    binaryArtifacts: BinaryArtifact[];
     egressEvidence: ReviewerEgressRecord[];
     extraClaims: readonly string[];
     /** A BOOTSTRAP_PLAN review's binding; null for a candidate review, whose packet has no such key. */
@@ -1878,7 +1969,10 @@ export class BlindReviewGate {
         // they are acceptance judgments, never verification evidence. Their exact set is bound
         // by bootstrapPlan's PLAN and planned-output digests in this existing evidence envelope.
         projectContext: planReview || input.contractChange !== null,
-        withheld: [...LOGICAL_WITHHELD_INPUTS],
+        withheld: [
+          ...LOGICAL_WITHHELD_INPUTS,
+          ...(input.binaryArtifacts.some((artifact) => artifact.method === "import-manifest") ? [IMPORTED_BINARY_CONTENT_WITHHELD] : []),
+        ],
         binaryArtifacts: input.binaryArtifacts,
       },
       coveredRepositories: [
@@ -2658,15 +2752,58 @@ const splitCoverageKey = (key: string): { identity: string; path: string } | nul
 interface SliceCoverageTarget {
   /** The public `<repository>:<path>` claim a reviewer is allowed to make. */
   file: string;
-  /** Internal, unique identity for the exact diff range that supplied that path. */
+  /** Internal, unique identity for the exact diff range that supplied that path (`sliceKey`). */
   slice: string;
 }
+
+/**
+ * A slice's identity: its repository, path, patch section and range, as one unambiguous key whatever a
+ * path holds. Review lane-e-fs-r8 P1 — the section is part of it because one path can have several
+ * sections (git's binary section then its readable text, `withTextRenderedAsText`); keyed by path
+ * alone, the chunk holding one of them covered the other wherever chunking put it.
+ */
+const sliceKey = (identity: string, path: string, section: number, range: number | "whole"): string =>
+  JSON.stringify([identity, path, section, range]);
 
 interface ReviewerDiff {
   identity: string;
   diff: string;
   files: string[];
 }
+
+/**
+ * #1232 — one imported file the candidate snapshot binds, as the reviewer reads it in the diff: the
+ * `diff --git` header of a new file at its blob, then its manifest entry, detected type first, instead
+ * of its bytes. The CTO PLAN manifest binds the identity of exact opaque, potentially active binary
+ * content; selected structural checks are defense in depth and do not make those hidden bytes safe.
+ * This line and the snapshot manifest's statement for imports are the packet's `importInspection` for
+ * the path, field for field.
+ */
+const importManifestSection = (entry: SnapshotImport): string =>
+  `diff --git a/${entry.path} b/${entry.path}\nnew file mode 100644\nindex ${"0".repeat(entry.blob.length)}..${entry.blob}\n` +
+  `Opaque, potentially active binary; raw bytes not shown; git blob ${entry.blob}, task ${entry.taskId}: ${importInspectionLine(entry.path, boundImportInspection(entry))}\n`;
+
+/**
+ * #1232 — the snapshot as the reviewer reads it: a repository's imports are counted; each is a manifest
+ * entry in the diff. Each import the freeze did not bind is stated with its refusal, in every chunk.
+ */
+const snapshotForReviewer = (snapshot: CandidateSnapshot): unknown => ({
+  ...snapshot,
+  repositories: snapshot.repositories.map(({ imports, refusedImports, ...repository }) => ({
+    ...repository,
+    ...(imports === undefined
+      ? {}
+      : { imports: `${imports.length} imported files, each shown in the Actual diff as its manifest entry. ${importInspectionStatement(BOUND_IMPORT_CONTENT)}` }),
+    ...(refusedImports === undefined
+      ? {}
+      : {
+          refusedImports: {
+            statement: importInspectionStatement(REFUSED_IMPORT_CONTENT),
+            files: refusedImports.map((entry) => `task ${entry.taskId}: ${importInspectionLine(entry.path, refusedImportInspection(entry))}`),
+          },
+        }),
+  })),
+});
 
 interface ReviewChunkPart extends ReviewerDiff {
   coverageTargets: SliceCoverageTarget[];
@@ -2681,7 +2818,7 @@ const coverageTargetsFor = (part: ReviewChunkInput): SliceCoverageTarget[] =>
         file: `${part.identity}:${path}`,
         // The fallback exists only for the direct unit helper. Production chunks always
         // carry the explicit range identity generated by splitDiffs.
-        slice: `${part.identity}:${path}:whole`,
+        slice: sliceKey(part.identity, path, 0, "whole"),
       }));
 
 /**
@@ -2764,57 +2901,74 @@ const splitDiffs = (
   return chunks.length > 0 ? chunks : [[]];
 };
 
+/**
+ * The path a patch section changes, as git lists it among the changed paths: a rename's or copy's
+ * destination (review lane-e-fs-r8 — its `a/` path is the source, which git does not list), else its
+ * `a/` path. Read from the section's header lines only.
+ */
+const sectionPath = (section: string): string | undefined => {
+  const header = section.slice(0, /^(?:--- |@@ |GIT binary patch$|Binary files )/m.exec(section)?.index ?? section.length);
+  return /^(?:rename|copy) to (.+)$/m.exec(header)?.[1] ?? /^diff --git a\/(\S+) b\//m.exec(header)?.[1];
+};
+
+/** One patch section's coverage: the path it changes and its position in the repository's patch. */
+interface SectionTarget {
+  path: string;
+  section: number;
+}
+
 /** Split on file boundaries first, then bounded ranges when one file alone is oversized. */
 const splitByFile = (
   repo: ReviewerDiff,
   budget: number,
 ): ReviewChunkPart[] => {
-  if (repo.diff.length <= budget) return [wholeFilePart(repo.identity, repo.diff, repo.files)];
+  if (repo.diff.length <= budget) return [wholeFilePart(repo.identity, repo.diff, repo.files.map((path) => ({ path, section: 0 })))];
   const sections = repo.diff.split(/(?=^diff --git )/m).filter(Boolean);
   const parts: ReviewChunkPart[] = [];
   let buffer = "";
-  let files: string[] = [];
-  for (const section of sections) {
-    const named = /^diff --git a\/(\S+) b\//m.exec(section)?.[1];
+  let targets: SectionTarget[] = [];
+  for (const [index, section] of sections.entries()) {
+    const named = sectionPath(section);
     if (section.length > budget) {
       if (buffer.length > 0) {
-        parts.push(wholeFilePart(repo.identity, buffer, files));
+        parts.push(wholeFilePart(repo.identity, buffer, targets));
         buffer = "";
-        files = [];
+        targets = [];
       }
       if (!named) {
         // A malformed patch cannot be attributed to a touched path, so do not pretend a
         // range split supplies reviewable evidence for it.
         return [wholeFilePart(repo.identity, repo.diff, [])];
       }
-      parts.push(...splitOversizedSection(repo.identity, named, section, budget));
+      parts.push(...splitOversizedSection(repo.identity, { path: named, section: index }, section, budget));
       continue;
     }
     if (buffer.length + section.length > budget && buffer.length > 0) {
-      parts.push(wholeFilePart(repo.identity, buffer, files));
+      parts.push(wholeFilePart(repo.identity, buffer, targets));
       buffer = "";
-      files = [];
+      targets = [];
     }
     buffer += section;
-    if (named) files.push(named);
+    if (named) targets.push({ path: named, section: index });
   }
-  if (buffer.length > 0) parts.push(wholeFilePart(repo.identity, buffer, files));
+  if (buffer.length > 0) parts.push(wholeFilePart(repo.identity, buffer, targets));
   return parts;
 };
 
-const wholeFilePart = (identity: string, diff: string, files: string[]): ReviewChunkPart => ({
+/** A part holding whole sections; each section is its own slice, so each needs the claim of the chunk that holds it. */
+const wholeFilePart = (identity: string, diff: string, targets: readonly SectionTarget[]): ReviewChunkPart => ({
   identity,
   diff,
-  files,
-  coverageTargets: files.map((path) => ({
+  files: [...new Set(targets.map((target) => target.path))],
+  coverageTargets: targets.map(({ path, section }) => ({
     file: `${identity}:${path}`,
-    slice: `${identity}:${path}:whole`,
+    slice: sliceKey(identity, path, section, "whole"),
   })),
 });
 
 const splitOversizedSection = (
   identity: string,
-  path: string,
+  target: SectionTarget,
   section: string,
   budget: number,
 ): ReviewChunkPart[] => {
@@ -2822,17 +2976,17 @@ const splitOversizedSection = (
   const header = headerEnd > 0 ? section.slice(0, headerEnd) : "";
   const payload = section.slice(header.length);
   const capacity = budget - header.length;
-  if (capacity <= 0) return [wholeFilePart(identity, section, [path])];
+  if (capacity <= 0) return [wholeFilePart(identity, section, [target])];
 
   const parts: ReviewChunkPart[] = [];
   for (let offset = 0; offset < payload.length; offset += capacity) {
     parts.push({
       identity,
       diff: `${header}${payload.slice(offset, offset + capacity)}`,
-      files: [path],
+      files: [target.path],
       coverageTargets: [{
-        file: `${identity}:${path}`,
-        slice: `${identity}:${path}:range:${offset}`,
+        file: `${identity}:${target.path}`,
+        slice: sliceKey(identity, target.path, target.section, offset),
       }],
     });
   }
