@@ -314,6 +314,32 @@ export interface InvocationResult {
   effortAttested?: boolean;
   /** #1104 — present when the invocation's own process group was not confirmed ended; `ok` is then false. */
   processGroup?: UnendedProcessGroup;
+  /**
+   * A GPT worker turn only: what the turn left in its private temporary directory, read after its
+   * process ended and before the directory was removed. Diagnostic; never part of the change scan.
+   */
+  turnScratch?: TurnScratchListing;
+}
+
+/** Files under a turn's temporary directory: counts, and the first sorted relative paths. */
+export interface TurnScratchListing {
+  files: number;
+  bytes: number;
+  paths: string[];
+  /** False when the walk stopped at its entry limit or could not read a directory: the counts are a lower bound. */
+  complete: boolean;
+  /**
+   * Present only when removing the directory failed: its path, the error code, and whether it was
+   * left behind after a second attempt with its owner permissions restored.
+   */
+  cleanup?: { path: string; code: string; left: boolean };
+}
+
+/** A GPT worker turn's invocation threw: the error it threw, and what the turn left in its scratch. */
+export class TurnScratchThrown extends Error {
+  constructor(readonly thrown: unknown, readonly turnScratch: TurnScratchListing) {
+    super(thrown instanceof Error ? thrown.message : String(thrown));
+  }
 }
 
 /**
