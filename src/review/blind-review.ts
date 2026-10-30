@@ -46,7 +46,7 @@ import {
   SessionLifecycle,
   roleKeyFor,
 } from "../domain/types.ts";
-import { diffPatch, git, readBlob } from "../git/git.ts";
+import { PATCH_WITHOUT_PROGRAMS, diffPatch, git, readBlob } from "../git/git.ts";
 import { canonical } from "../guard/workspace-probe.ts";
 import {
   type AnyContractChangeBinding,
@@ -748,29 +748,20 @@ export class BlindReviewGate {
       const evidenceRoom = CHUNK_THRESHOLD_CHARS - 4_096 - Math.min(diffShare, EVIDENCE_DIFF_RESERVE_CHARS) - bareOverhead;
       const evidenceSection = candidateEvidenceSection(this.db, request.runId, trees, execution, evidenceRoom);
 
-      // A lockfile is shown as `lockfilePart` shows it in a chunk, a modified one with its full
-      // candidate text, under the same cap; one that cannot be is an omitted item.
-      const candidateTexts = await this.modifiedLockfileTexts(diffs);
-      const lockfileBudget = LOCKFILE_CHUNK_THRESHOLD_CHARS - this.promptOverhead(request, change, evidenceSection, reviewPolicies) - 4_096;
-      const shown = splitDiffs(diffs, Number.POSITIVE_INFINITY, lockfileBudget, candidateTexts);
-
       // Measure the complete input, including diff framing and system instructions, and send
-      // this same rendered prompt if it fits.
-      const prompt = this.buildPrompt(request, shown.chunks.flat(), undefined, change, evidenceSection, reviewPolicies);
-      const chunked = prompt.length + REVIEWER_TRANSPORT_OVERHEAD_CHARS > CHUNK_THRESHOLD_CHARS;
+      // this same rendered prompt if it fits. A lockfile is only ever reviewed in a chunk of its own.
+      const prompt = this.buildPrompt(request, diffs, undefined, change, evidenceSection, reviewPolicies);
+      const chunked = prompt.length + REVIEWER_TRANSPORT_OVERHEAD_CHARS > CHUNK_THRESHOLD_CHARS ||
+        diffs.some((repo) => (repo.lockfiles?.length ?? 0) > 0);
 
       let outcome: Decision<ReviewOutcome>;
       if (chunked) {
-        outcome = await this.chunkedReview(request, diffs, rememberReviewer, change, evidenceSection, reviewPolicies, candidateTexts);
+        outcome = await this.chunkedReview(request, diffs, rememberReviewer, change, evidenceSection, reviewPolicies);
       } else {
         const reviewer = await this.constituteReviewer(request);
         if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
         rememberReviewer(reviewer.value);
         outcome = await this.singleReview(request, prompt, reviewer.value, expected);
-        if (outcome.allowed && shown.omitted.length > 0) {
-          const { verdict } = outcome.value;
-          outcome = allow(outcome.reasonCode, { ...outcome.value, verdict: { ...verdict, omittedItems: [...new Set([...verdict.omittedItems, ...shown.omitted])] } });
-        }
       }
 
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
@@ -1595,7 +1586,13 @@ export class BlindReviewGate {
         });
       }
       trees.push(await readTrackedTree(record.checkoutPath, repo.identity, repo.candidateHead));
-      diffs.push({ identity: repo.identity, diff: diff + (repo.imports ?? []).map(importManifestSection).join(""), files: repo.touchedPaths });
+      const lockfiles = await lockfileChanges(record.checkoutPath, repo, diff, withheld);
+      diffs.push({
+        identity: repo.identity,
+        diff: diff + (repo.imports ?? []).map(importManifestSection).join(""),
+        files: repo.touchedPaths,
+        ...(lockfiles.length === 0 ? {} : { lockfiles }),
+      });
     }
 
     return allow(ReasonCode.OK, { diffs, binaryArtifacts, trees });
@@ -1765,26 +1762,6 @@ export class BlindReviewGate {
   }
 
   /**
-   * Each modified lockfile's full candidate text, keyed by its candidate blob: read by the id the frozen
-   * patch names, an object `readBlob` re-derives from the bytes, and kept only when it is UTF-8 text.
-   */
-  private async modifiedLockfileTexts(diffs: readonly ReviewerDiff[]): Promise<Map<string, string>> {
-    const texts = new Map<string, string>();
-    for (const repo of diffs) {
-      const checkout = this.repositories.byIdentity(repo.identity)?.checkoutPath;
-      if (checkout === undefined) continue;
-      for (const section of repo.diff.split(/(?=^diff --git )/m)) {
-        const lockfile = lockfileSectionOf(section);
-        if (lockfile?.base == null || lockfile.candidate === null || texts.has(lockfile.candidate)) continue;
-        const bytes = await readBlob(checkout, lockfile.candidate);
-        const text = bytes?.toString("utf8");
-        if (bytes && text !== undefined && Buffer.from(text, "utf8").equals(bytes)) texts.set(lockfile.candidate, text);
-      }
-    }
-    return texts;
-  }
-
-  /**
    * §18.5 — chunk reviewers, then a coverage reducer that verifies every file was seen
    * at least once, finding dedupe, and a final fresh reviewer over the reduced set.
    */
@@ -1795,7 +1772,6 @@ export class BlindReviewGate {
     change: TrustedContractChange | null = null,
     evidenceSection: readonly string[] = [],
     reviewPolicies: readonly RepositoryReviewPolicy[] = [],
-    candidateTexts: ReadonlyMap<string, string> = new Map(),
   ): Promise<Decision<ReviewOutcome>> {
     // A chunk adds repository/file fences and the chunk heading beyond the empty-prompt
     // measurement. Reserve a bounded envelope so the complete serialized prompt, not only
@@ -1809,7 +1785,7 @@ export class BlindReviewGate {
         budget: CHUNK_THRESHOLD_CHARS,
       });
     }
-    const { chunks, omitted: unfitLockfiles } = splitDiffs(diffs, chunkBudget, LOCKFILE_CHUNK_THRESHOLD_CHARS - overhead - 4_096, candidateTexts);
+    const { chunks, omitted: unfitLockfiles } = splitDiffs(diffs, chunkBudget, LOCKFILE_CHUNK_THRESHOLD_CHARS - overhead - 4_096);
     // #246 B2-a — every chunk prompt carries the contract change; the first chunk's reviewer is the
     // one that may claim the manifest, so the reducer can tell whether any reviewer covered it.
     if (change !== null && chunks.length > 0) {
@@ -3282,6 +3258,8 @@ interface ReviewerDiff {
   identity: string;
   diff: string;
   files: string[];
+  /** The lockfiles this diff changes (`lockfileChanges`); each is reviewed in a chunk of its own. */
+  lockfiles?: LockfileChange[];
 }
 
 /**
@@ -3395,26 +3373,27 @@ const dedupeFindings = (findings: ReviewFinding[]): ReviewFinding[] => {
 };
 
 /**
- * Chunks of at most `budget` diff chars each. Each lockfile goes whole into a chunk of its own when it
- * fits `lockfileBudget` (a modified one with its full candidate text from `candidateTexts`, keyed by
- * blob id); one that does not is returned in `omitted`.
+ * Chunks of at most `budget` diff chars each. Each lockfile a diff changes goes whole into a chunk of
+ * its own when it fits `lockfileBudget`; one that does not is returned in `omitted`.
  */
 const splitDiffs = (
   diffs: ReviewerDiff[],
   budget: number,
   lockfileBudget = budget,
-  candidateTexts: ReadonlyMap<string, string> = new Map(),
 ): { chunks: ReviewChunkPart[][]; omitted: string[] } => {
   const chunks: ReviewChunkPart[][] = [];
   const omitted: string[] = [];
   let current: ReviewChunkPart[] = [];
   let size = 0;
   for (const repo of diffs) {
-    for (const part of splitByFile(repo, budget, { budget: lockfileBudget, texts: candidateTexts }, omitted)) {
-      if (part.lockfile !== undefined) {
-        chunks.push([part]);
-        continue;
-      }
+    for (const lockfile of repo.lockfiles ?? []) {
+      const whole = lockfilePart(repo.identity, lockfile, lockfileBudget);
+      if (typeof whole === "string") omitted.push(whole);
+      else chunks.push([whole]);
+    }
+    const rest = withoutLockfiles(repo);
+    if (rest === null) continue;
+    for (const part of splitByFile(rest, budget)) {
       if (size + part.diff.length > budget && current.length > 0) {
         chunks.push(current);
         current = [];
@@ -3431,14 +3410,112 @@ const splitDiffs = (
 /**
  * The path a patch section changes, as git lists it among the changed paths: a rename's or copy's
  * destination (review lane-e-fs-r8 — its `a/` path is the source, which git does not list), else its
- * `a/` path; C-quoted, as git lists it, where git quotes it. Read from the section's header lines only.
+ * `a/` path. Read from the section's header lines only.
  */
 const sectionPath = (section: string): string | undefined => {
-  const header = sectionHeader(section);
-  const moved = /^(?:rename|copy) to (.+)$/m.exec(header)?.[1];
-  if (moved !== undefined) return moved;
-  const source = /^diff --git ("a\/(?:[^"\\]|\\.)*"|a\/\S+) "?b\//m.exec(header)?.[1];
-  return source === undefined ? undefined : source.startsWith('"') ? `"${source.slice(3)}` : source.slice(2);
+  const header = section.slice(0, /^(?:--- |@@ |GIT binary patch$|Binary files )/m.exec(section)?.index ?? section.length);
+  return /^(?:rename|copy) to (.+)$/m.exec(header)?.[1] ?? /^diff --git a\/(\S+) b\//m.exec(header)?.[1];
+};
+
+/**
+ * A lockfile the candidate changes, from git's raw diff of the frozen base and candidate commits, with
+ * the patch git writes for exactly its paths when that is a whole section of the frozen patch.
+ */
+interface LockfileChange {
+  /** The path as the candidate snapshot lists it: the coverage key. */
+  listed: string;
+  /** Its path (the deleted path for a deletion), and the source path of a rename or copy, unquoted. */
+  path: string;
+  from: string | null;
+  /** Git's raw status letter: A, M, D, R, C or T. */
+  status: string;
+  /** Blob ids; null for a side that does not exist. */
+  base: string | null;
+  candidate: string | null;
+  section: string | null;
+  /** Its full candidate text, read by `candidate`, when it is shown: null when that is not UTF-8 text or could not be read. */
+  text: string | null;
+}
+
+const isLockfile = (path: string): boolean => LOCKFILE_NAMES.has(path.slice(path.lastIndexOf("/") + 1));
+
+/** Where `section` sits in `diff` as whole sections, from a line start to the next section or the end; -1 if nowhere. */
+const sectionAt = (diff: string, section: string): number => {
+  for (let at = diff.indexOf(section); at !== -1; at = diff.indexOf(section, at + 1)) {
+    const end = at + section.length;
+    if ((at === 0 || diff[at - 1] === "\n") && (end === diff.length || diff.startsWith("diff --git ", end))) return at;
+  }
+  return -1;
+};
+
+/**
+ * Each lockfile the frozen candidate changes: `git diff --raw -z` names its status, its exact paths and
+ * its blobs, rename-only changes included; its section is git's own patch of those paths. Both are read
+ * the way `diffPatch` reads the frozen patch, with no rename or copy option of their own, so the
+ * repository's `diff.renames` decides for all three: with renames off a renamed lockfile is a deletion
+ * and an addition, each a lockfile. A section is kept only where it is a whole section of `diff`. A
+ * lockfile is told by the base name of its path, the deleted path for a deletion.
+ */
+const lockfileChanges = async (
+  cwd: string,
+  repo: { baseHead: string; candidateHead: string; touchedPaths: readonly string[] },
+  diff: string,
+  withheld: readonly string[],
+): Promise<LockfileChange[]> => {
+  const range = `${repo.baseHead}..${repo.candidateHead}`;
+  const excluded = withheld.length === 0 ? [] : ["--", ":(top)", ...withheld.map((path) => `:(top,exclude,literal)${path}`)];
+  const raw = (await git(cwd, ["diff", "--raw", "-z", "--no-abbrev", ...PATCH_WITHOUT_PROGRAMS, range, ...excluded])).stdout.split("\0");
+  const blob = (id: string): string | null => (/^0+$/.test(id) ? null : id);
+  const changes: LockfileChange[] = [];
+  for (let at = 0; at < raw.length; ) {
+    const meta = raw[at] ?? "";
+    if (!meta.startsWith(":")) {
+      at += 1;
+      continue;
+    }
+    const [, , oldBlob = "", newBlob = "", status = ""] = meta.slice(1).split(" ");
+    const paths = raw.slice(at + 1, at + 1 + (/^[RC]/.test(status) ? 2 : 1));
+    at += 1 + paths.length;
+    const path = paths.at(-1);
+    if (path === undefined || !isLockfile(path)) continue;
+    const base = blob(oldBlob);
+    const candidate = blob(newBlob);
+    const own = (await git(cwd, [
+      "diff", "--no-color", ...PATCH_WITHOUT_PROGRAMS, "--full-index", "--binary", range, "--", ...paths.map((each) => `:(top,literal)${each}`),
+    ])).stdout;
+    const section = own !== "" && sectionAt(diff, own) !== -1 ? own : null;
+    let text: string | null = null;
+    if (candidate !== null && (base !== null || section === null)) {
+      const bytes = await readBlob(cwd, candidate);
+      const decoded = bytes?.toString("utf8");
+      text = bytes && decoded !== undefined && Buffer.from(decoded, "utf8").equals(bytes) ? decoded : null;
+    }
+    changes.push({
+      listed: repo.touchedPaths.find((touched) => gitPath(touched) === path) ?? path,
+      path,
+      from: paths.length === 2 ? paths[0]! : null,
+      status: status.slice(0, 1),
+      base,
+      candidate,
+      section,
+      text,
+    });
+  }
+  return changes;
+};
+
+/** A diff less its lockfiles' sections and paths; null when nothing else is left. */
+const withoutLockfiles = (repo: ReviewerDiff): ReviewerDiff | null => {
+  const lockfiles = repo.lockfiles ?? [];
+  if (lockfiles.length === 0) return repo;
+  let diff = repo.diff;
+  for (const { section } of lockfiles) {
+    const at = section === null ? -1 : sectionAt(diff, section);
+    if (at !== -1) diff = diff.slice(0, at) + diff.slice(at + section!.length);
+  }
+  const listed = new Set(lockfiles.map((lockfile) => lockfile.listed));
+  const files = repo.files.filter((path) => !listed.has(path));
+  return diff === "" && files.length === 0 ? null : { identity: repo.identity, diff, files };
 };
 
 /** A patch section's header lines, before its content. */
@@ -3447,7 +3524,7 @@ const sectionHeader = (section: string): string =>
 
 const GIT_QUOTE_ESCAPES: Readonly<Record<string, number>> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
 
-/** A path as git writes it in a patch header, decoded: git C-quotes one with special or non-ASCII bytes, as octal escapes. */
+/** A path as git lists it, decoded: git C-quotes one with special or non-ASCII bytes, as octal escapes. */
 const gitPath = (written: string): string => {
   if (!written.startsWith('"') || !written.endsWith('"') || written.length < 2) return written;
   const bytes: number[] = [];
@@ -3466,26 +3543,6 @@ const gitPath = (written: string): string => {
   return Buffer.from(bytes).toString("utf8");
 };
 
-/**
- * A lockfile's patch section: its path as git lists it, the same path decoded, and the full-index blob
- * ids git wrote, null for a side that does not exist.
- */
-interface LockfileSection {
-  path: string;
-  name: string;
-  base: string | null;
-  candidate: string | null;
-}
-
-const lockfileSectionOf = (section: string): LockfileSection | null => {
-  const path = sectionPath(section);
-  const name = path === undefined ? undefined : gitPath(path);
-  if (path === undefined || name === undefined || !LOCKFILE_NAMES.has(name.slice(name.lastIndexOf("/") + 1))) return null;
-  const [base, candidate] = /^index ([0-9a-f]+)\.\.([0-9a-f]+)/m.exec(sectionHeader(section))?.slice(1) ?? [];
-  const blob = (id: string | undefined): string | null => (id === undefined || /^0+$/.test(id) ? null : id);
-  return { path, name, base: blob(base), candidate: blob(candidate) };
-};
-
 /** A patch with its content lines left out: its header, its file lines and each hunk's changed line ranges. */
 const changedRanges = (section: string): string => {
   const header = sectionHeader(section);
@@ -3493,44 +3550,52 @@ const changedRanges = (section: string): string => {
   return header + files + (section.match(/^@@ [^\n]*\n/gm) ?? []).join("");
 };
 
+const LOCKFILE_STATUS: Readonly<Record<string, string>> = { A: "added", M: "modified", D: "deleted", R: "renamed", C: "copied", T: "changed in type" };
+
 /**
- * A lockfile as one part, never cut into ranges, bound to the candidate by its path and blob ids (a
- * candidate blob is git's digest of the file's full bytes). An added lockfile's patch is its full text.
- * A modified one is its full candidate text, then its change as the patch or, when that does not fit
- * beside the text, as the patch's changed line ranges. A deleted one is its deletion patch. A lockfile
- * that does not fit `lockfiles.budget`, or whose candidate text is not in `lockfiles.texts`, is the
- * omitted item that says so.
+ * A lockfile as one part of its own, never cut into ranges, bound to the candidate by its paths and
+ * blob ids (a candidate blob is git's digest of the file's full bytes). An added lockfile shown by its
+ * patch is that patch, its full text. Any other lockfile with a candidate side, a rename-only one
+ * included, is its full candidate text, then its change as its patch or, when that does not fit beside
+ * the text, as the patch's changed line ranges. A deleted one is its deletion patch. A lockfile that
+ * does not fit `budget`, or whose text or patch is not there to show, is the omitted item that says so.
  */
-const lockfilePart = (
-  identity: string,
-  index: number,
-  { path, name, base, candidate }: LockfileSection,
-  section: string,
-  lockfiles: { budget: number; texts: ReadonlyMap<string, string> },
-): ReviewChunkPart | string => {
-  const key = `${identity}:${path}`;
-  const part = (lockfile: string, diff: string): ReviewChunkPart => ({ ...wholeFilePart(identity, diff, [{ path, section: index }]), lockfile });
+const lockfilePart = (identity: string, change: LockfileChange, budget: number): ReviewChunkPart | string => {
+  const { listed, path, from, status, base, candidate, section, text } = change;
+  const key = `${identity}:${listed}`;
+  const part = (lockfile: string, diff: string): ReviewChunkPart => ({
+    identity,
+    diff,
+    files: [listed],
+    coverageTargets: [{ file: key, slice: sliceKey(identity, listed, -1, "whole") }],
+    lockfile,
+  });
+  const named = `Lockfile ${path}${from === null ? "" : ` (from ${from})`}, ${LOCKFILE_STATUS[status] ?? status}`;
   const forms: ReviewChunkPart[] = [];
-  if (base !== null && candidate !== null) {
-    const text = lockfiles.texts.get(candidate);
-    if (text === undefined) return `${key}: lockfile not reviewed: its full candidate text, blob ${candidate}, could not be read from the frozen candidate as UTF-8 text`;
-    const shown = (change: string): string =>
-      `Lockfile ${name}, modified, reviewed whole in this chunk: its full candidate text follows, candidate blob ${candidate} ` +
-      `(git's digest of its full bytes); then its change from base blob ${base} as ${change}.\n\`\`\`text\n${text}\n\`\`\``;
-    forms.push(
-      part(shown("its complete patch"), section),
-      part(shown("the changed line ranges of its patch, whose full form does not fit beside the text"), changedRanges(section)),
-    );
+  if (candidate !== null && (base !== null || section === null)) {
+    if (text === null) return `${key}: lockfile not reviewed: its full candidate text, blob ${candidate}, could not be read from the frozen candidate as UTF-8 text`;
+    const shown = (then: string): string =>
+      `${named}, reviewed whole in this chunk: its full candidate text follows, candidate blob ${candidate} (git's digest of its full bytes), ` +
+      `base blob ${base ?? "none"}; then ${then}.\n\`\`\`text\n${text}\n\`\`\``;
+    if (section === null) {
+      forms.push(part(shown("no patch: git's patch of its paths is not a whole section of the frozen patch"), ""));
+    } else {
+      forms.push(
+        part(shown("its change, as its complete patch"), section),
+        part(shown("its change, as the changed line ranges of its patch, whose full form does not fit beside the text"), changedRanges(section)),
+      );
+    }
   } else if (candidate !== null) {
-    forms.push(part(`Lockfile ${name}, added, reviewed whole in this chunk: the patch below adds its full text, candidate blob ${candidate} (git's digest of its full bytes).`, section));
+    forms.push(part(`${named}, reviewed whole in this chunk: the patch below adds its full text, candidate blob ${candidate} (git's digest of its full bytes).`, section!));
   } else {
-    forms.push(part(base !== null ? `Lockfile ${name}, deleted: the patch below removes it, base blob ${base}.` : `Lockfile ${name}: the patch below changes no content.`, section));
+    if (section === null) return `${key}: lockfile not reviewed: its deletion patch is not a whole section of the frozen patch`;
+    forms.push(part(`${named}: the patch below removes it, base blob ${base}.`, section));
   }
   const size = (form: ReviewChunkPart): number => (form.lockfile?.length ?? 0) + form.diff.length;
-  const fitting = forms.find((form) => size(form) <= lockfiles.budget);
+  const fitting = forms.find((form) => size(form) <= budget);
   if (fitting !== undefined) return fitting;
   return `${key}: lockfile not reviewed: shown whole it needs ${Math.min(...forms.map(size))} chars, more than the ` +
-    `${lockfiles.budget} chars one lockfile review chunk holds; a lockfile is not cut into ranges`;
+    `${budget} chars one lockfile review chunk holds; a lockfile is not cut into ranges`;
 };
 
 /** One patch section's coverage: the path it changes and its position in the repository's patch. */
@@ -3539,32 +3604,17 @@ interface SectionTarget {
   section: number;
 }
 
-/**
- * Split on file boundaries first, then bounded ranges when one file alone is oversized, except a
- * lockfile, which is one part of its own whatever its size (`lockfilePart`); a lockfile that cannot
- * be is added to `omitted`.
- */
+/** Split on file boundaries first, then bounded ranges when one file alone is oversized. */
 const splitByFile = (
   repo: ReviewerDiff,
   budget: number,
-  lockfiles: { budget: number; texts: ReadonlyMap<string, string> },
-  omitted: string[],
 ): ReviewChunkPart[] => {
+  if (repo.diff.length <= budget) return [wholeFilePart(repo.identity, repo.diff, repo.files.map((path) => ({ path, section: 0 })))];
   const sections = repo.diff.split(/(?=^diff --git )/m).filter(Boolean);
-  if (repo.diff.length <= budget && !sections.some((section) => lockfileSectionOf(section) !== null)) {
-    return [wholeFilePart(repo.identity, repo.diff, repo.files.map((path) => ({ path, section: 0 })))];
-  }
   const parts: ReviewChunkPart[] = [];
   let buffer = "";
   let targets: SectionTarget[] = [];
   for (const [index, section] of sections.entries()) {
-    const lockfile = lockfileSectionOf(section);
-    if (lockfile !== null) {
-      const whole = lockfilePart(repo.identity, index, lockfile, section, lockfiles);
-      if (typeof whole === "string") omitted.push(whole);
-      else parts.push(whole);
-      continue;
-    }
     const named = sectionPath(section);
     if (section.length > budget) {
       if (buffer.length > 0) {
