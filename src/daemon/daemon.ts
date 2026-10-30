@@ -1479,6 +1479,10 @@ export class Daemon {
     );
 
     try {
+      // #1189 I3-1 — the CEO notice attempt journal's boundary, before this start can write any notice and
+      // whatever route its notices have: it is a local record and needs no transport, target or lane secret.
+      // A notice written from here on is one no pre-journal daemon saw; one still PENDING now stays held.
+      this.cp.outbox.startCeoNotificationAttemptJournal();
       this.installContinuityCoordinator();
       await this.refreshCapacitySensors();
       let report = await this.reconcile();

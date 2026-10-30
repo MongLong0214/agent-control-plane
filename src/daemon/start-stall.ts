@@ -1,4 +1,4 @@
-import { IncidentClass, type NoticePorts, deliverIncident } from "../ceo/ceo-incident-notices.ts";
+import { DAEMON_START_SUBJECT, IncidentClass, type NoticePorts, deliverIncident } from "../ceo/ceo-incident-notices.ts";
 import { digestOf } from "../core/digest.ts";
 import type { ReasonCode } from "../core/reason-codes.ts";
 import type { Db } from "../db/database.ts";
@@ -134,8 +134,12 @@ export type StartStallRouting =
       undelivered?: string;
     };
 
-/** The subject every start-stall incident is about: the daemon's start, not any run. */
-export const START_STALL_SUBJECT = "daemon-start";
+/**
+ * The subject every start-stall incident is about: the daemon's start, not any run. A successful start after
+ * the incident opened resolves it (`resolutionOf`, DAEMON_STARTED): a notice of it still PENDING is withdrawn,
+ * not delivered late (`withdrawResolvedNotices`).
+ */
+export const START_STALL_SUBJECT = DAEMON_START_SUBJECT;
 /** The source a start-stall notice names, for its reader. */
 export const START_STALL_SOURCE = "DAEMON_START_STALL";
 

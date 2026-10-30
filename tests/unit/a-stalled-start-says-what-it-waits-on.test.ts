@@ -575,6 +575,148 @@ describe("#1189 D1: the stall notice's route while no daemon serves", () => {
       h.cp.close();
     }
   });
+
+  /**
+   * A start of this daemon over the composition's stall route, in the given environment. The CEO's Gateway
+   * process is live for the doctor (its pid is the fixture's), so what blocks is the missing credential alone.
+   */
+  const startOver = async (f: ReturnType<typeof adoptedFixture>, stateDir: string, environment: Record<string, string>, sent: string[]) => {
+    const realKill = process.kill.bind(process);
+    const kill = vi.spyOn(process, "kill").mockImplementation((pid, sig) => (pid === GATEWAY && sig === 0 ? true : realKill(pid, sig)));
+    try {
+      const daemon = new Daemon(f.h.cp, { stateDir });
+      const result = await daemon.start({ stallNotice: startStallNoticeRoute(f.h.cp, { environment, hermesConfiguration: HERMES,
+        ports: { ...pinned(() => daemon.lock.held()), noticeSenderFactory: accepting(sent) } }) });
+      return { daemon, result };
+    } finally {
+      kill.mockRestore();
+    }
+  };
+
+  it("I3-1: a start refused while the lane secret is missing establishes the attempt journal before its notice, and the next start, with the secret restored, sends that notice exactly once", async () => {
+    const sent: string[] = [];
+    const f = adoptedFixture();
+    try {
+      const cp = f.h.cp;
+      // Queued before any journal-aware code ran: a pre-journal daemon may have sent it, nobody can say.
+      const legacy = enqueueForCeo(cp, "a-pre-journal-notification");
+      const stateDir = tempDir("acp-1189-secret-restored-");
+
+      const first = await startOver(f, stateDir, {}, sent);
+      expect(first.result).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+      const [notice, ...others] = stallNotices(f.h);
+      expect(others).toEqual([]);
+      expect(health(stateDir)["startStall"]).toMatchObject({ routing: { status: "ROUTED", messageId: notice!.message_id,
+        undelivered: "route not opened: ACP_TELEGRAM_EXTERNAL_SECRET is not configured" } });
+      expect(sent).toEqual([]);
+
+      f.h.clock.advance(10 * 60_000);
+      const second = await startOver(f, stateDir, LANE, sent);
+      expect(second.result).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+      expect(sent).toHaveLength(1);
+      expect(cp.outbox.get(notice!.message_id)?.status).toBe("ACKED");
+      expect(health(stateDir)["startStall"]).toMatchObject({ routing: { status: "ALREADY_ROUTED", messageId: notice!.message_id,
+        delivery: { delivered: true } } });
+      // The genuinely uncertain row stays held; the stall notice, written after the boundary, never was.
+      expect(legacyMarked(cp)).toEqual([legacy]);
+      expect(cp.outbox.get(legacy)?.status).toBe("PENDING");
+    } finally {
+      f.h.cp.close();
+    }
+  });
+
+  it("I3-1: the route's open establishes the boundary before it asks for the lane secret", async () => {
+    const sent: string[] = [];
+    const f = adoptedFixture();
+    try {
+      const cp = f.h.cp;
+      const unconfigured = startStallNoticeRoute(cp, { environment: {}, hermesConfiguration: HERMES,
+        ports: { ...pinned(() => true), noticeSenderFactory: accepting(sent) } });
+      expect(unconfigured.open!()).toEqual({ started: false, reason: "ACP_TELEGRAM_EXTERNAL_SECRET is not configured" });
+      const messageId = routedId(describeStartStall(cp, PERMANENT, "REFUSED", false));
+
+      const restored = startStallNoticeRoute(cp, { environment: LANE, hermesConfiguration: HERMES,
+        ports: { ...pinned(() => true), noticeSenderFactory: accepting(sent) } });
+      expect(restored.open!()).toEqual({ started: true });
+      expect(await restored.deliver([messageId])).toEqual({ started: true });
+      expect(sent).toHaveLength(1);
+      expect(cp.outbox.get(messageId)?.status).toBe("ACKED");
+      expect(legacyMarked(cp)).toEqual([]);
+    } finally {
+      f.h.cp.close();
+    }
+  });
+
+  it("I3-1: a daemon that started without the lane secret: what it queued is sent once, after a restart restores the secret", async () => {
+    const sent: string[] = [];
+    const f = adoptedFixture();
+    try {
+      const cp = f.h.cp;
+      cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+      const stateDir = tempDir("acp-1189-started-without-secret-");
+      const first = await startOver(f, stateDir, {}, sent);
+      expect(first.result.allowed).toBe(true);
+      expect(startConfiguredCeoNotificationRoute(cp, { environment: {}, hermesConfiguration: HERMES,
+        ports: { ...pinned(() => first.daemon.lock.held()), noticeSenderFactory: accepting(sent) } }))
+        .toEqual({ started: false, reason: "ACP_TELEGRAM_EXTERNAL_SECRET is not configured" });
+      const queued = enqueueForCeo(cp, "queued-while-the-secret-was-missing");
+      await first.daemon.stop();
+
+      const second = await startOver(f, stateDir, LANE, sent);
+      expect(second.result.allowed).toBe(true);
+      try {
+        expect(startConfiguredCeoNotificationRoute(cp, { environment: LANE, hermesConfiguration: HERMES,
+          ports: { ...pinned(() => second.daemon.lock.held()), noticeSenderFactory: accepting(sent) } })).toEqual({ started: true });
+        await cp.outbox.deliverCeoNotifications();
+        expect(sent).toHaveLength(1);
+        expect(cp.outbox.get(queued)?.status).toBe("ACKED");
+        expect(legacyMarked(cp)).toEqual([]);
+      } finally {
+        await second.daemon.stop();
+      }
+    } finally {
+      f.h.cp.close();
+    }
+  });
+
+  it("I3-2: a successful start resolves the refused start's incident: a canonical route attached after it does not deliver the stale claim", async () => {
+    const sent: string[] = [];
+    // A deployment whose canonical route has run before: the attempt journal predates the stall notice.
+    const f = adoptedFixture({
+      history: (h) => {
+        expect(startConfiguredCeoNotificationRoute(h.cp, { environment: LANE, hermesConfiguration: HERMES,
+          ports: { ...pinned(() => false), noticeSenderFactory: accepting(sent) } })).toEqual({ started: true });
+      },
+    });
+    try {
+      const cp = f.h.cp;
+      const stateDir = tempDir("acp-1189-late-attach-");
+      expect((await startOver(f, stateDir, {}, sent)).result).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+      const [notice] = stallNotices(f.h);
+      expect(notice!.status).toBe("PENDING");
+
+      // The owner repairs the credential and the next start succeeds: ACP's action path is running again.
+      cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+      f.h.clock.advance(10 * 60_000);
+      const healthy = await startOver(f, stateDir, LANE, sent);
+      expect(healthy.result.allowed).toBe(true);
+      try {
+        // The composition attaches the full route only after the start returned.
+        expect(startConfiguredCeoNotificationRoute(cp, { environment: LANE, hermesConfiguration: HERMES,
+          ports: { ...pinned(() => healthy.daemon.lock.held()), noticeSenderFactory: accepting(sent) } })).toEqual({ started: true });
+        await cp.outbox.deliverCeoNotifications();
+        expect(sent).toEqual([]);
+        expect(cp.outbox.get(notice!.message_id)?.status).toBe("REJECTED");
+        expect(cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN").map((event) => event.evidence)).toMatchObject([
+          { messageId: notice!.message_id, resolvedBy: "DAEMON_STARTED" },
+        ]);
+      } finally {
+        await healthy.daemon.stop();
+      }
+    } finally {
+      f.h.cp.close();
+    }
+  });
 });
 
 describe("#1189 D1, CEO ruling 4: the refused start's notice", () => {
@@ -666,6 +808,35 @@ describe("#1189 D1, I2-2: the start stall is one CEO incident, re-delivered to a
 
       await refuse();
       expect(stallNotices(h)).toHaveLength(2);
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  it("I3-2: refused, repaired, started, then the CEO replaced: the recovered stall's notice is withdrawn and nothing is claimable for the new CEO", async () => {
+    const h = makeHarness();
+    try {
+      bindCeo(h);
+      const stateDir = tempDir("acp-1189-recovered-");
+      expect(await new Daemon(h.cp, { stateDir }).start()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+      const [notice] = stallNotices(h);
+      expect(notice!.status).toBe("PENDING");
+
+      h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+      h.clock.advance(10 * 60_000);
+      const healthy = new Daemon(h.cp, { stateDir });
+      expect((await healthy.start()).allowed).toBe(true);
+      await healthy.stop();
+
+      expect(h.cp.bindings.revoke(roleKeyFor(Role.CEO), "CEO runtime lost").allowed).toBe(true);
+      // The replacement is reachable over the generic Buzz sweep: whatever it is owed is claimable.
+      h.cp.db.run(`UPDATE sessions SET buzz_address = 'ceo-room', buzz_actor_id = 'actor:ceo' WHERE session_id = ?`, [bindCeo(h)]);
+      expect(h.cp.outbox.claimDeliverable().filter((message) => message.kind === MessageKind.CEO_NOTIFICATION)).toEqual([]);
+      expect(stallNotices(h).map((row) => ({ messageId: row.message_id, status: row.status })))
+        .toEqual([{ messageId: notice!.message_id, status: "REJECTED" }]);
+      expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN").map((event) => event.evidence)).toMatchObject([
+        { messageId: notice!.message_id, resolvedBy: "DAEMON_STARTED" },
+      ]);
     } finally {
       h.cp.close();
     }

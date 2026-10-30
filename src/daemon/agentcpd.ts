@@ -2949,10 +2949,12 @@ export const startConfiguredCeoNotificationRoute = (
  * target, the lane secret and this daemon's lock (the pin re-checks `authorityHeld` before each send),
  * so it is the one existing route that reaches the CEO while no daemon is serving.
  *
- * `open` runs before the start writes its notice and opens the route's attempt journal: a Hermes notice
- * still PENDING when the journal opens is held as one a pre-journal daemon may have sent, and the stall
- * notice written after it is not one of those. `deliver` attaches the transport restricted to the named
- * notices: every other queued CEO notification is not touched and stays PENDING for the started daemon's
+ * `open` runs before the start writes its notice and opens the route's attempt journal first, whatever the
+ * route's configuration: the journal's boundary is a local record and needs neither the Hermes target nor
+ * the lane secret, so a notice a start writes while either is missing is written after it (#1189 I3-1). A
+ * Hermes notice still PENDING when the journal opens is held as one a pre-journal daemon may have sent,
+ * and the stall notice written after it is not one of those. `deliver` attaches the transport restricted
+ * to the named notices: every other queued CEO notification is not touched and stays PENDING for the started daemon's
  * own route, as it was before. A refused start exits right after; a parked one that promotes attaches the
  * full route at the usual place, which replaces this one.
  */
@@ -2967,11 +2969,11 @@ export const startStallNoticeRoute = (
   let send: ReturnType<typeof createCeoNotificationSender> | null = null;
   return {
     open: () => {
+      cp.outbox.startCeoNotificationAttemptJournal();
       const target = createConfiguredHermesGatewayDaemonNoticeTarget(cp, options.hermesConfiguration, options.ports ?? {});
       if (!target) return { started: false, reason: "no Hermes adoption configuration" };
       const laneSecret = options.environment["ACP_TELEGRAM_EXTERNAL_SECRET"]?.trim();
       if (!laneSecret) return { started: false, reason: "ACP_TELEGRAM_EXTERNAL_SECRET is not configured" };
-      cp.outbox.startCeoNotificationAttemptJournal();
       send = createCeoNotificationSender(target, laneSecret);
       return { started: true };
     },

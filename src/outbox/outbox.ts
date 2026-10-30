@@ -1072,8 +1072,9 @@ export class Outbox {
    * Opens the canonical route's attempt journal, once per database: every Hermes CEO notification still
    * PENDING at that moment is recorded CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN, because a pre-journal daemon
    * may have sent it without counting the attempt, and every later attempt is journaled per row. Attaching
-   * the transport opens it. #1189 D1 — a start that refused opens it before it writes its stall notice, so
-   * that notice, which no pre-journal daemon ever saw, is not taken for one that may have been sent.
+   * the transport opens it. #1189 D1, I3-1 — a daemon start opens it once it holds its lock, before it can
+   * write any notice and whatever transport is configured, so a notice it writes (a refused start's stall
+   * notice among them), which no pre-journal daemon ever saw, is not taken for one that may have been sent.
    */
   startCeoNotificationAttemptJournal(): void {
     this.db.tx(() => {
