@@ -1362,21 +1362,29 @@ export class VerificationEngine {
     });
   }
 
+  /**
+   * #1258 — appends this finished execution as its input's next attempt. An earlier row, FAIL or PASS,
+   * is never replaced; `currentVerificationResults` decides which one is current. The attempt is read
+   * and written in one statement, so two writers cannot take the same one.
+   */
   private writeResultRow(
     runId: string,
     snapshotDigest: string,
     record: VerificationResultRecord,
   ): void {
     this.db.run(
-      `INSERT OR REPLACE INTO verification_results
-         (result_id, run_id, candidate_snapshot_digest, command_id, repository_identity, source,
+      `INSERT INTO verification_results
+         (result_id, run_id, candidate_snapshot_digest, command_id, repository_identity, source, attempt,
           exact_head, started_at, ended_at, exit_code, output_digest, output_truncated, status, reason_code)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       SELECT ? || ':' || next.attempt, ?, ?, ?, ?, ?, next.attempt, ?, ?, ?, ?, ?, ?, ?, ?
+         FROM (SELECT COALESCE(MAX(attempt), 0) + 1 AS attempt FROM verification_results
+                WHERE candidate_snapshot_digest = ? AND command_id = ? AND repository_identity = ? AND source = ?) AS next`,
       [
         `${snapshotDigest}:${record.commandId}:${record.repositoryIdentity}:${record.source}`,
         runId, snapshotDigest, record.commandId, record.repositoryIdentity, record.source,
         record.exactHead, record.startedAt, record.endedAt, record.exitCode, record.outputDigest,
         record.outputTruncated ? 1 : 0, record.status, record.reasonCode,
+        snapshotDigest, record.commandId, record.repositoryIdentity, record.source,
       ],
     );
   }

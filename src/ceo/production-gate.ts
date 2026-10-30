@@ -51,6 +51,7 @@ import type { CeoDecisionIngress, ManifestActivationGrants } from "../registry/m
 import { type HermesAdmittedTurn, hermesTurnEvidence } from "../mcp/hermes-provenance.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
+import { currentVerdictPasses, currentVerificationResults } from "../verify/verification-history.ts";
 import type { ContinuityGate } from "../run/run-engine.ts";
 import { residentBaseClone } from "../registry/resident-repositories.ts";
 import {
@@ -1099,34 +1100,34 @@ export class ProductionGate {
   }
 
   /**
-   * §17.6/§17.7 — the report must match the rows. Every required command needs a PASS row
-   * for this exact candidate, and no row for it may be anything other than PASS.
+   * §17.6/§17.7 — the report must match the rows. Every required command needs a current PASS
+   * row for this exact candidate, and no current row for it may be anything other than PASS.
+   * #1258: an input's current row is its latest execution (`currentVerificationResults`); its
+   * earlier executions stay in the history and decide nothing here.
    */
   private corroborateVerification(
     runId: string,
     candidateSnapshotDigest: string,
     report: VerificationReport,
   ): Decision<void> {
-    const rows = this.db.all<{
-      command_id: string;
-      repository_identity: string;
-      source: string;
-      exact_head: string;
-      status: string;
-      output_digest: string;
-    }>(
-      `SELECT command_id, repository_identity, source, exact_head, status, output_digest
-         FROM verification_results
-        WHERE run_id = ? AND candidate_snapshot_digest = ?`,
-      [runId, candidateSnapshotDigest],
-    );
+    const rows = currentVerificationResults(this.db, runId, candidateSnapshotDigest);
     if (rows.length === 0) {
       return deny(ReasonCode.EVIDENCE_MISSING, "no verification result rows for this candidate", {
         runId,
         candidateSnapshotDigest,
       });
     }
-    const failing = rows.filter((r) => r.status !== "PASS");
+    const failing = rows
+      .filter((r) => !currentVerdictPasses(r))
+      .map((r) => ({
+        command_id: r.command_id,
+        repository_identity: r.repository_identity,
+        source: r.source,
+        exact_head: r.exact_head,
+        status: r.status,
+        output_digest: r.output_digest,
+        attempt: r.attempt,
+      }));
     if (failing.length > 0) {
       return deny(ReasonCode.VERIFICATION_COMMAND_FAILED, "verification rows contradict the report", {
         runId,
