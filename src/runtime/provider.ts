@@ -330,6 +330,13 @@ export interface TurnScratchListing {
   complete: boolean;
 }
 
+/** A GPT worker turn's invocation threw: the error it threw, and what the turn left in its scratch. */
+export class TurnScratchThrown extends Error {
+  constructor(readonly thrown: unknown, readonly turnScratch: TurnScratchListing) {
+    super(thrown instanceof Error ? thrown.message : String(thrown));
+  }
+}
+
 /**
  * #1104 — an invocation's own process group that its cleanup could not confirm ended. Nothing more is
  * signalled to it; it is named so that the caller refuses the completion and says what may be left.

@@ -6,7 +6,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { acpScratchDir } from "../../src/core/scratch-root.ts";
 import { WorkerTurnRunner } from "../../src/run/worker-turn.ts";
 import { CodexCliAdapter } from "../../src/runtime/cli-adapters.ts";
-import type { InvocationRequest, ProviderAdapter } from "../../src/runtime/provider.ts";
+import type { InvocationRequest, InvocationResult, ProviderAdapter } from "../../src/runtime/provider.ts";
 import { cleanupTempDirs, gitSync, makeCore, tempDir } from "../helpers/fixtures.ts";
 import { seedWorkerWorld } from "../helpers/worker-turn-fixture.ts";
 
@@ -25,11 +25,20 @@ afterAll(cleanupTempDirs);
 
 const STUB = String.raw`
 import { spawnSync } from "node:child_process";
-import { readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const here = dirname(process.argv[1]);
 const fixture = (name) => readFileSync(join(here, name), "utf8").trim();
+if (fixture("mode") === "revoke" || fixture("mode") === "throw") {
+  // Leaves a file in the scratch, lets the test revoke the worker's binding when asked to, then fails.
+  writeFileSync(join(process.env.TMPDIR, "cache-evidence.txt"), "written before the binding was revoked\n");
+  writeFileSync(join(here, "tmpdir"), process.env.TMPDIR);
+  writeFileSync(join(here, "ready"), "");
+  const until = Date.now() + 20000;
+  while (fixture("mode") === "revoke" && !existsSync(join(here, "revoked")) && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  process.exit(1);
+}
 const args = process.argv.slice(2);
 const out = args[args.indexOf("-o") + 1];
 const setting = (key) => {
@@ -99,7 +108,9 @@ if (status.status === compile.constants.compileCacheStatus.FAILED || status.dire
 }
 `;
 
-const stubCodex = (root: string, mode: "ok" | "fail", sibling: string, slashTmp: string): string => {
+type Mode = "ok" | "fail" | "revoke" | "throw";
+
+const stubCodex = (root: string, mode: Mode, sibling: string, slashTmp: string): string => {
   const binary = join(root, "codex");
   writeFileSync(join(root, "mode"), mode);
   writeFileSync(join(root, "sibling"), sibling);
@@ -126,7 +137,7 @@ interface StubReport {
   stderr: string;
 }
 
-const runTurn = async (mode: "ok" | "fail") => {
+const runTurn = async (mode: Mode) => {
   const core = makeCore();
   const world = seedWorkerWorld(core);
   world.db.run("UPDATE sessions SET provider = 'gpt', model = 'gpt-6.1-sol' WHERE session_id = ?", [world.worker.sessionId]);
@@ -139,9 +150,17 @@ const runTurn = async (mode: "ok" | "fail") => {
     clock: core.clock,
     capacityFile: join(root, "capacity.json"),
     binary: stubCodex(root, mode, sibling, slashTmp),
-    managedWriteBroker: world.broker,
+    managedWriteBroker: mode === "throw"
+      ? {
+        authorize: async (write, effect) => {
+          await world.broker.authorize(write, effect);
+          throw new Error("the broker failed after the turn ran");
+        },
+      }
+      : world.broker,
   });
   const texts: string[] = [];
+  const answers: InvocationResult[] = [];
   const runner = new WorkerTurnRunner(
     {
       db: world.db,
@@ -156,12 +175,27 @@ const runTurn = async (mode: "ok" | "fail") => {
         invoke: async (request: InvocationRequest) => {
           const answer = await codex.invoke(request);
           texts.push(answer.text);
+          answers.push(answer);
           return answer;
         },
       }) as unknown as ProviderAdapter,
     },
     { pollMs: 20 },
   );
+  // The worker's binding is revoked while its turn runs, so the broker refuses once the turn ends.
+  const revokeWhenReady = async (): Promise<void> => {
+    const until = Date.now() + 25_000;
+    while (!existsSync(join(root, "ready"))) {
+      if (Date.now() > until) throw new Error("the stub never wrote into its scratch");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    world.db.run(
+      `UPDATE assignments SET status = 'REVOKED', revoked_at = ?, revoked_reason = 'revoked while the turn ran'
+        WHERE role = 'WORKER' AND task_id = ? AND status = 'ACTIVE'`,
+      [new Date().toISOString(), world.taskId],
+    );
+    writeFileSync(join(root, "revoked"), "");
+  };
   try {
     const started = await runner.start({
       runId: world.runId,
@@ -173,15 +207,17 @@ const runTurn = async (mode: "ok" | "fail") => {
     });
     expect(started, JSON.stringify(started)).toMatchObject({ allowed: true });
     if (!started.allowed) throw new Error("the turn did not start");
-    await runner.settled(started.value.executionId);
+    await Promise.all([runner.settled(started.value.executionId), mode === "revoke" ? revokeWhenReady() : undefined]);
     const execution = world.tasks.execution(started.value.executionId)!;
     const described = JSON.stringify(runner.describe(execution.executionId, world.runId));
-    const stub = JSON.parse(texts[0] ?? "{}") as StubReport;
+    const stub = JSON.parse(texts[0] || "{}") as StubReport;
     return {
       world,
       execution,
       described,
       stub,
+      answers,
+      revokedScratch: mode === "revoke" || mode === "throw" ? readFileSync(join(root, "tmpdir"), "utf8") : null,
       sibling,
       slashTmpWritten: existsSync(slashTmp),
       checkout: gitSync(world.repoPath, ["status", "--porcelain", "--ignored", "--untracked-files=all"]),
@@ -266,5 +302,33 @@ describe("a gpt worker turn has a private scratch outside the checkout", () => {
     expect(failed).toHaveLength(1);
     expect(failed[0]!.evidence["paths"]).toEqual([]);
     expectRecordedScratch(turn, failed[0]!.evidence);
+  });
+
+  it("records what the turn wrote to its scratch when the broker refuses after the turn ran, then removes it", async () => {
+    const turn = await runTurn("revoke");
+    rmSync(turn.sibling, { recursive: true, force: true });
+    expect(turn.execution.status, turn.described).not.toBe("SUCCEEDED");
+    const answer = turn.answers[0]!;
+    expect(answer.ok).toBe(false);
+    expect(answer.error).toContain("BINDING_REVOKED");
+    expect(answer.turnScratch?.paths).toContain("cache-evidence.txt");
+    const recorded = turn.world.audit.forRun(turn.world.runId).filter((event) =>
+      event.evidence["executionId"] === turn.execution.executionId && event.evidence["turnScratch"] !== undefined);
+    expect(recorded.length, turn.described).toBeGreaterThan(0);
+    expect((recorded[0]!.evidence["turnScratch"] as { paths: string[] }).paths).toContain("cache-evidence.txt");
+    expect(turn.revokedScratch).toMatch(/\/acp-codex-turn-[^/]+$/);
+    expect(existsSync(turn.revokedScratch!)).toBe(false);
+  });
+
+  it("records the scratch with the error when the invocation throws, then removes it", async () => {
+    const turn = await runTurn("throw");
+    rmSync(turn.sibling, { recursive: true, force: true });
+    expect(turn.execution.status, turn.described).toBe("FAILED");
+    expect(turn.answers).toEqual([]);
+    const failed = turn.world.audit.byKind("TASK_WORKER_TURN_FAILED");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]!.evidence["error"]).toBe("the broker failed after the turn ran");
+    expect((failed[0]!.evidence["turnScratch"] as { paths: string[] } | undefined)?.paths).toContain("cache-evidence.txt");
+    expect(existsSync(turn.revokedScratch!)).toBe(false);
   });
 });

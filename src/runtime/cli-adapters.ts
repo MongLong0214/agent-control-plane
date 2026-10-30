@@ -50,6 +50,7 @@ import {
   type ProviderAdapter,
   type TransmittedInput,
   type TurnScratchListing,
+  TurnScratchThrown,
   ProviderSessionProvisionError,
   REVIEWER_EGRESS_DENY_PROBE_ENDPOINTS,
   type ReviewerEgressConfig,
@@ -3184,11 +3185,17 @@ export class CodexCliAdapter implements ProviderAdapter {
     const gptWorkerTurn = request.readOnly === false
       && request.externalSessionId !== undefined
       && request.onSpawn !== undefined;
-    const turnTemp = gptWorkerTurn ? realpathSync(acpScratchDir("acp-codex-turn-")) : undefined;
+    if (!gptWorkerTurn) return this.invokeExec(request, started, undefined);
+    const turnTemp = realpathSync(acpScratchDir("acp-codex-turn-"));
+    // Listed on every exit path once the invocation has ended, before the directory is removed: with
+    // the result, a broker refusal and a timeout included, or with the error the invocation threw.
     try {
-      return await this.invokeExec(request, started, turnTemp);
+      const result = await this.invokeExec(request, started, turnTemp);
+      return { ...result, turnScratch: turnScratchListing(turnTemp) };
+    } catch (error) {
+      throw new TurnScratchThrown(error, turnScratchListing(turnTemp));
     } finally {
-      if (turnTemp !== undefined) rmSync(turnTemp, { recursive: true, force: true });
+      rmSync(turnTemp, { recursive: true, force: true });
     }
   }
 
@@ -3296,8 +3303,6 @@ export class CodexCliAdapter implements ProviderAdapter {
 
     const text = existsSync(lastMessage) ? readFileSync(lastMessage, "utf8") : result.stdout;
     rmSync(scratch, { recursive: true, force: true });
-    // Read once the child has exited, before `invoke` removes the directory.
-    const turnScratch = turnTemp === undefined ? undefined : turnScratchListing(turnTemp);
     const reported = /session[_ ]id[:=]\s*([0-9a-f-]{16,})/i.exec(result.stdout)?.[1] ?? null;
     // A one-shot `exec` does not echo the control plane's session id. The turn that launched this
     // answer already named that id, and a thread id in stdout must not fail the turn's match.
@@ -3319,7 +3324,6 @@ export class CodexCliAdapter implements ProviderAdapter {
             ? null
             : result.stderr.slice(0, 2000),
       ...(unended === undefined ? {} : { processGroup: unended }),
-      ...(turnScratch === undefined ? {} : { turnScratch }),
       providerSessionId: request.externalSessionId ?? reported,
       isolationAttested: false,
     };
