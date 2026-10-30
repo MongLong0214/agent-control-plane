@@ -27,7 +27,7 @@ import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { credentialBearingField, type AuditLog } from "../db/audit.ts";
-import { EVIDENCE_PRODUCERS, type ArtifactStore, type EvidenceWriter } from "../db/artifacts.ts";
+import { EVIDENCE_PRODUCERS, reviewPolicyDeclaresContent, type ArtifactStore, type EvidenceWriter } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import {
   ArtifactKind,
@@ -62,7 +62,7 @@ import {
   type ProviderRegistry,
   type ReviewerEgressRecord,
 } from "../runtime/provider.ts";
-import { REVIEWER_TRANSPORT_SEPARATOR } from "../runtime/cli-adapters.ts";
+import { REVIEWER_TRANSPORT_SEPARATOR, reviewerTransportInput } from "../runtime/cli-adapters.ts";
 import type { PacketReviewerScope } from "../runtime/reviewer-codex-home.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
@@ -139,7 +139,10 @@ export interface ReviewPacket {
     binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
     /** Exact repository-owned requirements read from each frozen candidate, never its working tree. */
     reviewPolicies: RepositoryReviewPolicy[];
-    /** Digests of the complete prompts actually sent, in invocation order. */
+    /**
+     * Digests of each reviewer's complete transmitted input (system instructions, separator and
+     * prompt, `reviewerTransportInput`), in invocation order.
+     */
     reviewerPromptDigests: string[];
   };
   coveredRepositories: string[];
@@ -167,7 +170,10 @@ export interface ReviewPacket {
   createdAt: string;
 }
 
-/** One repository's optional conventional review requirements, bound to the reviewed commit. */
+/**
+ * One repository's optional conventional review requirements, bound to the reviewed commit. `content`
+ * is the blob decoded byte for byte (a leading byte-order mark kept), so it hashes to `digest`.
+ */
 export interface RepositoryReviewPolicy {
   repository: string;
   path: "REVIEW.md";
@@ -1125,7 +1131,9 @@ export class BlindReviewGate {
    * A working-tree read would let an unrelated local edit change what the reviewer sees without
    * changing the candidate identity. Missing files remain backward-compatible; once a repository
    * supplies REVIEW.md, an unreadable, non-regular, empty, non-UTF-8 or oversized file refuses the
-   * review instead of silently dropping a declared policy.
+   * review instead of silently dropping a declared policy. A file that is only a byte-order mark is
+   * empty and refused too, rather than treated as absent: the repository committed the file, and
+   * dropping it would review the candidate without the policy it declared (#1274).
    */
   private async collectReviewPolicies(snapshot: CandidateSnapshot): Promise<Decision<RepositoryReviewPolicy[]>> {
     const policies: RepositoryReviewPolicy[] = [];
@@ -1163,9 +1171,19 @@ export class BlindReviewGate {
       }
       let content: string;
       try {
-        content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        // `ignoreBOM` keeps a leading byte-order mark, so the content is exactly the blob the digest
+        // below hashes; the default decoder drops it and the two disagree (#1274).
+        content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
       } catch {
         return deny(ReasonCode.EVIDENCE_MISSING, "repository review policy is not valid UTF-8", {
+          identity: repository.identity,
+          revision: repository.candidateHead,
+          path: REVIEW_POLICY_PATH,
+          digest: sha256(bytes),
+        });
+      }
+      if (!reviewPolicyDeclaresContent(content)) {
+        return deny(ReasonCode.EVIDENCE_MISSING, "repository review policy is empty", {
           identity: repository.identity,
           revision: repository.candidateHead,
           path: REVIEW_POLICY_PATH,
@@ -1378,12 +1396,8 @@ export class BlindReviewGate {
     const adapter = this.providers.requireForRole(reviewer.preference.provider, Role.BLIND_REVIEWER);
     const capacity = await this.admitReviewer(reviewer.preference.provider);
     if (!capacity.allowed) return capacity as Decision<ReviewOutcome>;
-    const result = await adapter.invoke(this.reviewInvocation(
-      request,
-      reviewer,
-      prompt,
-      `${request.runId}:${reviewer.sessionId}`,
-    ));
+    const invocation = this.reviewInvocation(request, reviewer, prompt, `${request.runId}:${reviewer.sessionId}`);
+    const result = await adapter.invoke(invocation);
     const isolation = this.assertIsolationAttested(request.runId, reviewer, result);
     if (!isolation.allowed) return isolation as Decision<ReviewOutcome>;
 
@@ -1414,7 +1428,7 @@ export class BlindReviewGate {
       reviewer,
       chunkReviewers: [],
       egressEvidence: isolation.value,
-      promptDigests: [sha256(prompt)],
+      promptDigests: [sha256(reviewerTransportInput(invocation))],
     });
   }
 
@@ -1487,13 +1501,9 @@ export class BlindReviewGate {
       const capacity = await this.admitReviewer(reviewer.preference.provider);
       if (!capacity.allowed) return capacity as Decision<ReviewOutcome>;
       const adapter = this.providers.requireForRole(reviewer.preference.provider, Role.BLIND_REVIEWER);
-      promptDigests.push(sha256(prompt));
-      const result = await adapter.invoke(this.reviewInvocation(
-        request,
-        reviewer,
-        prompt,
-        `${request.runId}:${reviewer.sessionId}:chunk${index + 1}`,
-      ));
+      const invocation = this.reviewInvocation(request, reviewer, prompt, `${request.runId}:${reviewer.sessionId}:chunk${index + 1}`);
+      promptDigests.push(sha256(reviewerTransportInput(invocation)));
+      const result = await adapter.invoke(invocation);
       const isolation = this.assertIsolationAttested(request.runId, reviewer, result);
       if (!isolation.allowed) return isolation as Decision<ReviewOutcome>;
       egressEvidence.push(...isolation.value);
@@ -1577,15 +1587,15 @@ export class BlindReviewGate {
     if (!finalCapacity.allowed) {
       return finalCapacity as Decision<ReviewOutcome>;
     }
-    const finalResult = await this.providers.requireForRole(finalReviewer.value.preference.provider, Role.BLIND_REVIEWER).invoke(
-      this.reviewInvocation(
-        request,
-        finalReviewer.value,
-        finalPrompt,
-        `${request.runId}:${finalReviewer.value.sessionId}:final`,
-      ),
+    const finalInvocation = this.reviewInvocation(
+      request,
+      finalReviewer.value,
+      finalPrompt,
+      `${request.runId}:${finalReviewer.value.sessionId}:final`,
     );
-    promptDigests.push(sha256(finalPrompt));
+    promptDigests.push(sha256(reviewerTransportInput(finalInvocation)));
+    const finalResult = await this.providers.requireForRole(finalReviewer.value.preference.provider, Role.BLIND_REVIEWER)
+      .invoke(finalInvocation);
     const finalIsolation = this.assertIsolationAttested(request.runId, finalReviewer.value, finalResult);
     if (!finalIsolation.allowed) {
       return finalIsolation as Decision<ReviewOutcome>;
@@ -2461,7 +2471,7 @@ interface ReviewOutcome {
   chunkReviewers: ChunkReviewerEvidence[];
   /** Every provider process whose proxy record is bound into the authoritative packet. */
   egressEvidence: ReviewerEgressRecord[];
-  /** Complete prompt bytes committed in invocation order; no provider answer is used as proof. */
+  /** Complete transmitted reviewer input committed in invocation order; no provider answer is used as proof. */
   promptDigests: string[];
 }
 

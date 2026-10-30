@@ -7,7 +7,7 @@ import { sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { credentialBearingField, prohibitedDurableField } from "../../src/db/audit.ts";
 import { ArtifactKind, ExecutionMode, Role, RunState } from "../../src/domain/types.ts";
-import { __testing as reviewTesting } from "../../src/review/blind-review.ts";
+import { __testing as reviewTesting, type ReviewPacket } from "../../src/review/blind-review.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { CodexCliAdapter, __testing } from "../../src/runtime/cli-adapters.ts";
 import type { InvocationRequest, InvocationResult, SessionHandle, SessionSpec } from "../../src/runtime/provider.ts";
@@ -350,6 +350,37 @@ describe("a codex-cli 0.162 packet review through the real candidate gate", () =
     expect(prohibitedDurableField({ transcript: ["synthetic turn"] })).toBe("transcript");
     expect(prohibitedDurableField({ usage: { reasoning_output_tokens: 4 } })).toBe("reasoning_output_tokens");
     expect(credentialBearingField({ apiKey: "placeholder-not-a-secret" })).toBe("apiKey");
+  });
+});
+
+/**
+ * #1274 — the packet's reviewer-input digests are the digests of the bytes the Codex adapter writes
+ * to the reviewer CLI's stdin: system instructions, separator and prompt. A digest of the prompt
+ * alone left the instructions every reviewer received outside the record.
+ */
+describe("the stored reviewer-input digests are the digests of the bytes the Codex adapter sends", () => {
+  it.each([false, true])("for every reviewer invocation of a review (chunked=%s)", async (large) => {
+    const { harness } = setup({ shared: true });
+    try {
+      const { prompts } = stubProvider([(prompt) => JSON.stringify({
+        verdict: "PASS",
+        coveredFiles: /# Final review/.test(prompt) ? [] : ["github:acme/fixture:src/app.js"],
+        omittedItems: [],
+        findings: [],
+      })]);
+      const { runId, outcome } = await submit(harness, { large });
+      expect(outcome).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+      if (large) {
+        expect(prompts.filter((prompt) => prompt.includes("# Review chunk ")).length).toBeGreaterThan(1);
+        expect(prompts.at(-1)).toContain("# Final review");
+      } else {
+        expect(prompts).toHaveLength(1);
+      }
+      const packet = harness.cp.artifacts.latest<ReviewPacket>(runId, ArtifactKind.BLIND_REVIEW)!.content;
+      expect(packet.inputManifest.reviewerPromptDigests).toEqual(prompts.map((sent) => sha256(Buffer.from(sent, "utf8"))));
+    } finally {
+      harness.cp.close();
+    }
   });
 });
 

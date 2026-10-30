@@ -77,6 +77,14 @@ export const ownerDecideAgainEvidence = (items: readonly string[]): { decideAgai
 });
 
 /**
+ * Whether a repository REVIEW.md's decoded content declares anything (#1274). The content keeps a
+ * leading byte-order mark so it hashes to the policy digest; a file that is only that mark is as
+ * empty as a zero-byte one. Review collection refuses such a file and the BLIND_REVIEW schema
+ * refuses such content, both through this one rule.
+ */
+export const reviewPolicyDeclaresContent = (content: string): boolean => content.replace(/^\uFEFF/, "") !== "";
+
+/**
  * The only secret in this module. It is never exported and never stored on a token, so the
  * sole route to a constructed capability is `ArtifactStore.issueEvidenceWriters`. Symbol
  * identity — not the description — is what the constructor compares, so re-creating
@@ -717,7 +725,7 @@ const blindReviewEvidenceSchema = z
               path: z.literal("REVIEW.md"),
               revision: z.string().regex(/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/),
               digest: DIGEST_SCHEMA,
-              content: z.string().min(1).max(16_384),
+              content: z.string().max(16_384).refine(reviewPolicyDeclaresContent),
             })
             .strict(),
         ),

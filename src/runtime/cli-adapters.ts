@@ -2906,6 +2906,14 @@ type CodexReviewerHome =
 export const REVIEWER_TRANSPORT_SEPARATOR = "\n\n---\n\n";
 
 /**
+ * The single string the Codex CLI receives for a request. The adapter sends exactly this, and the
+ * blind-review gate stores the SHA-256 of this same string as each reviewer's input digest, so the
+ * recorded digest covers the system instructions as well as the prompt (#1274).
+ */
+export const reviewerTransportInput = (request: Pick<InvocationRequest, "systemPrompt" | "prompt">): string =>
+  request.systemPrompt ? `${request.systemPrompt}${REVIEWER_TRANSPORT_SEPARATOR}${request.prompt}` : request.prompt;
+
+/**
  * Codex CLI adapter. Preferred runtime for the blind reviewer (GPT-6.1 Sol at xhigh
  * effort, §18.1) and for mechanical worker tasks.
  */
@@ -3132,9 +3140,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       args.push("--output-schema", schemaFile);
     }
 
-    const prompt = request.systemPrompt
-      ? `${request.systemPrompt}${REVIEWER_TRANSPORT_SEPARATOR}${request.prompt}`
-      : request.prompt;
+    const prompt = reviewerTransportInput(request);
 
     // A worker turn names its child and ends that child's group. Any other one-shot exec keeps
     // the previous launch: no spawn callback and no reap.
@@ -3388,7 +3394,7 @@ export class CodexCliAdapter implements ProviderAdapter {
     const result = await runCli(nativeBinary, args, {
       cwd: request.workdir,
       timeoutMs: request.timeoutMs,
-      stdin: request.systemPrompt ? `${request.systemPrompt}${REVIEWER_TRANSPORT_SEPARATOR}${request.prompt}` : request.prompt,
+      stdin: reviewerTransportInput(request),
       isolation: request.isolation,
       ...this.reviewerHomeOptions(constituted.home, request.workdir),
       reviewerExecutablePaths: codexReviewerExecutables(this.#binary),

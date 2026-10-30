@@ -1,13 +1,16 @@
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { manifestDigest } from "../../src/contracts/manifest.ts";
 import { digestOf, sha256 } from "../../src/core/digest.ts";
-import { ExecutionMode, RunKind } from "../../src/domain/types.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { ArtifactKind, ExecutionMode, RunKind } from "../../src/domain/types.ts";
 import type { CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
 import type { VerificationReport } from "../../src/verify/verification-engine.ts";
 import type { ReviewPacket } from "../../src/review/blind-review.ts";
 import { __testing } from "../../src/review/blind-review.ts";
+import { REVIEWER_TRANSPORT_SEPARATOR } from "../../src/runtime/cli-adapters.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { bootstrapCoverageKeys, bootstrapPlan, cleanTreeManifest, submitBootstrapPlan } from "../helpers/bootstrap-plan.ts";
 import { dispatchRun, stricter } from "../helpers/contract-change.ts";
@@ -61,6 +64,16 @@ const expectEvidenceStandard = (prompt: string): void => {
 
 const promptsStartingWith = (harness: ReturnType<typeof makeHarness>, heading: string): string[] =>
   harness.scripted.invocations.map((call) => call.prompt).filter((prompt) => prompt.startsWith(heading));
+
+/**
+ * #1274 — what a packet records for a reviewer call: the digest of its complete transmitted input,
+ * system instructions and prompt joined as the Codex adapter sends them.
+ */
+const transmittedDigest = (harness: ReturnType<typeof makeHarness>, prompt: string): string => {
+  const call = harness.scripted.invocations.find((invocation) => invocation.prompt === prompt)!;
+  expect(call.systemPrompt).toBeTruthy();
+  return sha256(`${call.systemPrompt}${REVIEWER_TRANSPORT_SEPARATOR}${call.prompt}`);
+};
 
 const reReview = async (h: ReturnType<typeof makeHarness>, runId: string, kind: "CANDIDATE" | "BOOTSTRAP_PLAN" | "CONTRACT_CHANGE") => {
   const snapshot = h.cp.artifacts.latest<CandidateSnapshot>(runId, "CANDIDATE_SNAPSHOT")!.content;
@@ -116,7 +129,7 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
     };
 
     expect(packet.inputManifest.reviewPolicies).toEqual([reviewPolicy]);
-    expect(packet.inputManifest.reviewerPromptDigests).toEqual([sha256(prompt)]);
+    expect(packet.inputManifest.reviewerPromptDigests).toEqual([transmittedDigest(harness, prompt)]);
     expect(prompt).toContain("## Repository-owned review requirements");
     expect(prompt).toContain(JSON.stringify([reviewPolicy], null, 2));
     expect(prompt).toContain(`Packet digest: ${digestOf({
@@ -132,6 +145,66 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
     const secondPrompt = promptsStartingWith(harness, "# Candidate review").at(-1)!;
     expect(secondPrompt).toContain(JSON.stringify([reviewPolicy], null, 2));
     expect(secondPrompt).not.toContain("working-tree-only replacement");
+  });
+
+  it("#1274: keeps a REVIEW.md byte-order mark, so the bound content is exactly the bytes its digest hashes", async () => {
+    const harness = makeHarness();
+    const policy = "\uFEFF# Review\n\n- A byte-order mark is part of the committed file.\n";
+    writeFiles(harness.repoPath, { "REVIEW.md": policy });
+    commitAll(harness.repoPath, "add project review requirements with a byte-order mark");
+    const committed = readFileSync(join(harness.repoPath, "REVIEW.md"));
+    expect([...committed.subarray(0, 3)]).toEqual([0xef, 0xbb, 0xbf]);
+
+    const driven = await driveToReviewedCandidate(harness);
+    const packet = harness.cp.review.latestPacket(driven.runId, driven.candidateSnapshotDigest)!;
+    const reviewPolicy = {
+      repository: driven.identity,
+      path: "REVIEW.md",
+      revision: driven.candidateHead,
+      digest: sha256(committed),
+      content: policy,
+    };
+    expect(packet.inputManifest.reviewPolicies).toEqual([reviewPolicy]);
+    const [bound] = packet.inputManifest.reviewPolicies;
+    expect(sha256(Buffer.from(bound!.content, "utf8"))).toBe(bound!.digest);
+    expect(promptsStartingWith(harness, "# Candidate review")[0]).toContain(JSON.stringify([reviewPolicy], null, 2));
+  });
+
+  it("#1274: refuses a REVIEW.md that is only a byte-order mark as empty, before any reviewer is asked", async () => {
+    const harness = makeHarness();
+    writeFiles(harness.repoPath, { "REVIEW.md": "\uFEFF" });
+    commitAll(harness.repoPath, "add an empty review requirements file");
+
+    await expect(driveToReviewedCandidate(harness)).rejects.toThrow(
+      `${ReasonCode.EVIDENCE_MISSING}: repository review policy is empty`,
+    );
+    expect(harness.scripted.invocations.filter((call) => call.prompt.startsWith("# Candidate review"))).toEqual([]);
+  });
+
+  it("#1274: the BLIND_REVIEW schema refuses review-policy content that is only a byte-order mark, as collection does", async () => {
+    const harness = makeHarness();
+    writeFiles(harness.repoPath, { "REVIEW.md": "# Review\n" });
+    commitAll(harness.repoPath, "add project review requirements");
+    const driven = await driveToReviewedCandidate(harness);
+    const packet = harness.cp.review.latestPacket(driven.runId, driven.candidateSnapshotDigest)!;
+    const withContent = (content: string): ReviewPacket => ({
+      ...packet,
+      inputManifest: {
+        ...packet.inputManifest,
+        reviewPolicies: packet.inputManifest.reviewPolicies.map((policy) => ({ ...policy, content, digest: sha256(content) })),
+      },
+    });
+    const store = (content: string) => harness.cp.artifacts.putEvidence(
+      harness.cp.evidenceWritersForTests().BLIND_REVIEW,
+      driven.runId,
+      ArtifactKind.BLIND_REVIEW,
+      withContent(content),
+      driven.candidateSnapshotDigest,
+    );
+
+    expect(() => store("\uFEFF")).toThrow("BLIND_REVIEW has an invalid evidence envelope");
+    expect(() => store("")).toThrow("BLIND_REVIEW has an invalid evidence envelope");
+    expect(store("\uFEFF# Review\n").content.inputManifest.reviewPolicies[0]!.content).toBe("\uFEFF# Review\n");
   });
 
   it("candidate first review and re-review use only the original canonical method", async () => {
@@ -220,7 +293,7 @@ describe("#1189 §2.B: the reviewer prompt asks for checkable evidence", () => {
       expect(prompt.length).toBeLessThanOrEqual(120_000);
     }
     const packet = harness.cp.review.latestPacket(runId, harness.cp.runs.currentCandidate(runId)!)!;
-    expect(packet.inputManifest.reviewerPromptDigests).toEqual(prompts.map(sha256));
+    expect(packet.inputManifest.reviewerPromptDigests).toEqual(prompts.map((prompt) => transmittedDigest(harness, prompt)));
     await reReview(harness, runId, "CANDIDATE");
   });
 
