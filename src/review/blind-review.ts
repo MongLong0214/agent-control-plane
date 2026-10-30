@@ -308,6 +308,23 @@ export interface ReviewerPreference {
   effort: string | null;
 }
 
+/** A real step of a review, on which the submission that asked for it renews its attempt lease. */
+export type ReviewProgressStep = "REVIEW_CHUNK_COMPLETED" | "FINAL_REVIEW_STARTED" | "FINAL_REVIEW_ENDED";
+
+/**
+ * Renews the submission's attempt lease on a real step, and answers whether the attempt still holds
+ * the run. False once it does not (released, expired or at its cap): the review stops there, and a
+ * verdict reached after it is not stored.
+ */
+export type ReviewProgress = (step: ReviewProgressStep) => boolean;
+
+/** The refusal of a review whose submission's attempt no longer holds the run. */
+const attemptLeaseLost = <T>(runId: string, attemptId: string | undefined): Decision<T> =>
+  deny<T>(ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE, "the submission's attempt no longer holds the run, so its review stopped", {
+    runId,
+    attemptId: attemptId ?? null,
+  });
+
 export interface BlindReviewRequest {
   /** A candidate review: the frozen repositories' diffs and their verification. The default. */
   kind?: "CANDIDATE";
@@ -320,6 +337,8 @@ export interface BlindReviewRequest {
   verification: VerificationReport;
   /** The submission this review belongs to, named in a refused review's record (`storeReview`). */
   attemptId?: string;
+  /** The submission's lease, renewed on each real step of this review. */
+  progress?: ReviewProgress;
 }
 
 /**
@@ -340,6 +359,7 @@ export interface BootstrapPlanReviewRequest {
   plannedOutputs?: unknown;
   manifest?: unknown;
   attemptId?: string;
+  progress?: ReviewProgress;
 }
 
 /**
@@ -358,6 +378,7 @@ export interface ContractChangeReviewRequest {
   manifest?: unknown;
   baseManifest?: unknown;
   attemptId?: string;
+  progress?: ReviewProgress;
 }
 
 /** The composition root supplies the capacity admission that reviewer allocation needs. */
@@ -742,6 +763,7 @@ export class BlindReviewGate {
       if (chunked) {
         outcome = await this.chunkedReview(request, diffs, rememberReviewer, change, evidenceSection, reviewPolicies);
       } else {
+        if (request.progress?.("FINAL_REVIEW_STARTED") === false) return attemptLeaseLost(request.runId, request.attemptId);
         const reviewer = await this.constituteReviewer(request);
         if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
         rememberReviewer(reviewer.value);
@@ -770,6 +792,7 @@ export class BlindReviewGate {
         contractChange: change === null ? null : reviewBindingOf(change),
         planReview: false,
         attemptId: request.attemptId,
+        progress: request.progress,
         packetDigests: reviewPacketDigests(this.db, request, snapshotDigest,
           reviewPacketDigest(request, change, reviewPolicies), execution.receipts),
       });
@@ -850,6 +873,7 @@ export class BlindReviewGate {
         contractChange: null,
         planReview: true,
         attemptId: request.attemptId,
+        progress: request.progress,
       });
     } finally {
       this.release(reviewers);
@@ -899,6 +923,7 @@ export class BlindReviewGate {
         contractChange: reviewBindingOf(inputs.change),
         planReview: true,
         attemptId: request.attemptId,
+        progress: request.progress,
       });
     } finally {
       this.release(reviewers);
@@ -927,6 +952,8 @@ export class BlindReviewGate {
     /** The reviewer read a PLAN's outputs or manifest, not a diff and its verification. */
     planReview: boolean;
     attemptId: string | undefined;
+    /** The submission's lease: the final review ending renews it as the packet is stored. */
+    progress?: ReviewProgress | undefined;
     /** #1307 — a candidate review's packet digests (`reviewPacketDigests`); absent for a PLAN review. */
     packetDigests?: ReviewPacketDigests;
   }): Decision<ReviewPacket> {
@@ -981,7 +1008,7 @@ export class BlindReviewGate {
     }
 
     const validated = this.validateCoverage(packet, expected);
-    const stored = this.storeReview(validated, authoritativeReviewer, input.attemptId, input.packetDigests);
+    const stored = this.storeReview(validated, authoritativeReviewer, input.attemptId, input.packetDigests, input.progress);
     if (!stored.allowed) return stored as Decision<ReviewPacket>;
 
     this.audit.record({
@@ -1068,13 +1095,14 @@ export class BlindReviewGate {
   }
 
   /**
-   * A reviewer answered and its verdict is not kept, because its binding was replaced while it worked
-   * or what it judged is no longer the run's. The refusal returned is unchanged; this row is why no
+   * A reviewer answered and its verdict is not kept, because its binding was replaced while it worked,
+   * what it judged is no longer the run's, or the submission that asked for it no longer holds the run
+   * (`ATTEMPT_LEASE`). The refusal returned is unchanged; this row is why no
    * BLIND_REVIEW exists for that answer: which check refused it (`stale`), the candidate, the submission
    * attempt and the reviewer's binding generation, never the answer itself.
    */
   private verdictNotKept(
-    stale: "REVIEWER_BINDING" | "REVIEW_INPUTS" | "REVIEW_INTENT",
+    stale: "REVIEWER_BINDING" | "REVIEW_INPUTS" | "REVIEW_INTENT" | "ATTEMPT_LEASE",
     reviewer: ReviewerBinding,
     runId: string,
     snapshotDigest: string,
@@ -1106,19 +1134,28 @@ export class BlindReviewGate {
    */
   private storeReview(
     packet: ReviewPacket, reviewer: ReviewerBinding, attemptId: string | undefined, packetDigests?: ReviewPacketDigests,
+    progress?: ReviewProgress,
   ): Decision<void> {
     try {
       // #1271 — the review and the frontier-simplify findings its reviewer returned are kept in one
       // transaction, bound to this review: a method finding exists exactly when the review carrying it does.
       // Recording one never fails the review; a finding the store refuses is left out.
-      this.db.tx(() => {
+      const kept = this.db.tx(() => {
+        // The final review ending renews the submission's lease in this same transaction, a compare-and-set
+        // on its attempt and deadline: an attempt released or capped while the reviewer worked stores nothing.
+        if (progress !== undefined && !progress("FINAL_REVIEW_ENDED")) return false;
         const stored = this.artifacts.putEvidence(this.evidenceWriter, packet.runId, ArtifactKind.BLIND_REVIEW, packet, packet.candidateSnapshotDigest,
           packetDigests);
         if (packet.methodFindings !== undefined) {
           new DogfoodFindingStore({ db: this.db, audit: this.audit, artifacts: this.artifacts, clock: this.clock })
             .recordReviewMethodFindings(packet.runId, stored.artifactId);
         }
+        return true;
       });
+      if (!kept) {
+        return this.verdictNotKept("ATTEMPT_LEASE", reviewer, packet.runId, packet.candidateSnapshotDigest, attemptId,
+          attemptLeaseLost(packet.runId, attemptId)) as Decision<void>;
+      }
       return allow(ReasonCode.OK, undefined);
     } catch (error) {
       if (!isAcpError(error) || error.reasonCode !== ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED) throw error;
@@ -1860,6 +1897,9 @@ export class BlindReviewGate {
       omitted.push(...parsed.omittedItems);
       findings.push(...parsed.findings);
       worst = worseVerdict(worst, parsed.verdict);
+      // A completed chunk is real progress. An attempt that no longer holds the run stops here rather
+      // than reviewing on for no one.
+      if (request.progress?.("REVIEW_CHUNK_COMPLETED") === false) return attemptLeaseLost(request.runId, request.attemptId);
     }
 
     // Coverage reducer: every touched file must have been seen by at least one chunk,
@@ -1881,6 +1921,7 @@ export class BlindReviewGate {
 
     // §18.5 — the reduced result is not the verdict. A *final fresh reviewer* judges it,
     // and only that judgement is authoritative.
+    if (request.progress?.("FINAL_REVIEW_STARTED") === false) return attemptLeaseLost(request.runId, request.attemptId);
     const finalReviewer = await this.constituteReviewer(request, "blind-review-final");
     if (!finalReviewer.allowed) return finalReviewer as Decision<never>;
     rememberReviewer(finalReviewer.value);

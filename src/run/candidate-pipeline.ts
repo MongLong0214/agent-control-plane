@@ -29,7 +29,7 @@ import { firstActivationFactsOf } from "../registry/manifest-activation-grants.t
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import { residentBaseClone } from "../registry/resident-repositories.ts";
-import type { BlindReviewGate, BlindReviewInvoker, ReviewPacket } from "../review/blind-review.ts";
+import type { BlindReviewGate, BlindReviewInvoker, ReviewPacket, ReviewProgressStep } from "../review/blind-review.ts";
 import { captureContractChangeReviewContext, readCanonicalCtoIdentity, storeContractChangeReviewContext } from "../review/contract-change-review-context.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import {
@@ -60,7 +60,13 @@ import type { TaskGraph } from "./task-graph.ts";
 import { type PredecessorBase, type StartsFrom, recordedTargetForBranch } from "./task-write-target.ts";
 import type { ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 
+/** An attempt's lease: set at acquisition, and renewed to this from now on each real step. */
 const ATTEMPT_LEASE_TTL_MS = 30 * 60 * 1000;
+/**
+ * However it progresses, an attempt holds the run at most this long from acquisition: no renewal sets a
+ * deadline past it, so at the cap the lease lapses and is reclaimed as an unrenewed one is.
+ */
+const ATTEMPT_LEASE_CAP_MS = 120 * 60 * 1000;
 
 /**
  * The BLIND_REVIEW_UNAVAILABLE row, built field by field and never spread from the denial. A denial
@@ -175,7 +181,15 @@ export interface SubmitResultInput {
    * project manifest (§17.5); otherwise the pinned contract's commands win.
    */
   runScopedCommands?: readonly VerificationCommand[];
+  /**
+   * Told of each real step once it has renewed the attempt's lease: a verification command, a review
+   * chunk, the final review starting and ending. What it does never decides the submission.
+   */
+  onProgress?: (step: SubmissionProgressStep) => void;
 }
+
+/** A real step of a submission: the only thing that renews its attempt lease. */
+export type SubmissionProgressStep = "VERIFICATION_COMMAND_COMPLETED" | ReviewProgressStep;
 
 export type PipelineOutcome =
   | { stage: "COMPLETED_REVIEW"; packet: ProductionReadyPacket; snapshotDigest: string }
@@ -513,6 +527,7 @@ export class CandidatePipeline {
     const snapshotDigest = candidateSnapshotDigest(snapshot);
     const boundAttempt = this.bindAttemptCandidate(input.runId, attemptId, snapshotDigest);
     if (!boundAttempt.allowed) return boundAttempt as Decision<PipelineOutcome>;
+    const progress = (step: SubmissionProgressStep): boolean => this.renewAttempt(input, attemptId, step);
 
     // No repository means no source, verification command, or blind-review input exists to
     // inspect. Publish the explicit no-op packet through the same production gate, then let
@@ -534,6 +549,7 @@ export class CandidatePipeline {
           contract: contract.value,
           contractDigest: run.contractDigest,
           attemptId,
+          progress,
         });
         reviewedPlan = reviewed;
         // Review rounds 1 and 2 (RF-REVIEW-02) — the review is asynchronous, and `plan_submit` can
@@ -563,6 +579,7 @@ export class CandidatePipeline {
           contract: contract.value,
           contractDigest: run.contractDigest,
           attemptId,
+          progress,
         });
         reviewedPlan = reviewed;
         const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, () =>
@@ -595,6 +612,7 @@ export class CandidatePipeline {
           const superseded = this.supersededAtPublication(run, snapshot, snapshotDigest, attemptId, reviewedPlan);
           if (superseded !== null) return superseded;
         }
+        if (!this.attemptHolds(input.runId, attemptId)) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewedPlan);
         const built = this.ceo.buildPacket({
           runId: input.runId,
           candidateSnapshotDigest: snapshotDigest,
@@ -634,6 +652,7 @@ export class CandidatePipeline {
       pinnedManifestDigest: run.pinnedManifestDigest,
       executionMode: run.executionMode,
       runScoped: Boolean(input.runScopedCommands),
+      progress: () => { progress("VERIFICATION_COMMAND_COMPLETED"); },
     });
 
     if (!verified.allowed) {
@@ -653,6 +672,7 @@ export class CandidatePipeline {
 
       // §34.2 — a failed verification returns to CTO revision with the evidence still
       // bound to the candidate that failed.
+      if (!this.attemptHolds(input.runId, attemptId)) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
       const returned = this.returnToCto(input.runId, verified.reasonCode, {
         stage: "verification",
         candidateSnapshotDigest: snapshotDigest,
@@ -682,6 +702,7 @@ export class CandidatePipeline {
     if (!contract.allowed) return contract as Decision<PipelineOutcome>;
 
     // §18.2 — automatic, immediately after verification passes.
+    if (!this.attemptHolds(input.runId, attemptId)) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
     const reviewed = await this.invokeReview({
       runId: input.runId,
       projectId: run.projectId,
@@ -691,6 +712,7 @@ export class CandidatePipeline {
       contractDigest: run.contractDigest,
       verification: verified.value,
       attemptId,
+      progress,
     });
 
     // #246 B2-a — a CONTRACT_CHANGE candidate's verdict is for the PLAN it names; one replaced since
@@ -733,6 +755,7 @@ export class CandidatePipeline {
       }
       const superseded = this.supersededAtPublication(run, snapshot, snapshotDigest, attemptId, reviewed);
       if (superseded !== null) return superseded;
+      if (!this.attemptHolds(input.runId, attemptId)) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewed);
 
       const built = this.ceo.buildPacket({
         runId: input.runId,
@@ -850,9 +873,12 @@ export class CandidatePipeline {
     stillCurrent: (verdict: boolean) => Decision<void> = () => allow(ReasonCode.OK, undefined),
   ): Promise<Decision<PipelineOutcome> | null> {
     if (reviewed.allowed) return null;
+    // A submission whose attempt no longer holds the run applies no outcome, before and after the await.
+    if (!this.attemptHolds(runId, attemptId)) return this.attemptLost(runId, attemptId, snapshotDigest, reviewed);
     // §18.7 is an assurance decision too. Re-evaluate continuity before deciding
     // whether a provider/isolation failure waits or moves the system into SURVIVAL.
     if (this.#continuity?.evaluate) await this.#continuity.evaluate("blind-review-unavailable");
+    if (!this.attemptHolds(runId, attemptId)) return this.attemptLost(runId, attemptId, snapshotDigest, reviewed);
     // #246 C2, review round 2 (RF-REVIEW-02) — the review and the evaluation above were awaited, and
     // a bootstrap PLAN replaced during either makes this outcome stale: no revision request and no
     // unavailable-review record is produced for it. Nothing below awaits before either is written.
@@ -911,7 +937,7 @@ export class CandidatePipeline {
     runId: string,
     snapshotDigest: string,
     attemptId: string,
-    stale: "AFTER_REVIEW" | "SOURCE_AT_PUBLICATION" | "PLAN_AT_PUBLICATION" | "CANDIDATE_AT_PUBLICATION",
+    stale: "AFTER_REVIEW" | "SOURCE_AT_PUBLICATION" | "PLAN_AT_PUBLICATION" | "CANDIDATE_AT_PUBLICATION" | "ATTEMPT_LEASE",
     refusal: Decision<unknown>,
     reviewed: Decision<ReviewPacket> | null,
   ): void {
@@ -1119,6 +1145,70 @@ export class CandidatePipeline {
           attemptId,
           candidateDigest,
         });
+  }
+
+  /**
+   * Renews this attempt's lease on a real step, and only while the attempt still holds it: RUNNING,
+   * unexpired, and its owner still the run's current one. A RELEASED or expired attempt is never revived,
+   * and no deadline is set past the cap from acquisition. A compare-and-set on the attempt and the deadline
+   * it read; true while the attempt holds the run. The caller is told only of a renewal that committed.
+   */
+  private renewAttempt(input: SubmitResultInput, attemptId: string, step: SubmissionProgressStep): boolean {
+    return this.db.tx(() => {
+      const now = this.clock.now();
+      const held = this.db.get<{ started_at: string; deadline_at: string }>(
+        `SELECT started_at, deadline_at FROM candidate_pipeline_attempts
+          WHERE run_id = ? AND attempt_id = ? AND owner_session_id = ? AND owner_binding_generation = ?
+            AND state = 'RUNNING' AND deadline_at > ?`,
+        [input.runId, attemptId, input.ownerSessionId, input.ownerBindingGeneration, now.toISOString()],
+      );
+      if (!held || !this.runs.assertOwner(input.runId, input.ownerSessionId, input.ownerBindingGeneration).allowed) return false;
+      const renewal = Math.min(now.getTime() + ATTEMPT_LEASE_TTL_MS, new Date(held.started_at).getTime() + ATTEMPT_LEASE_CAP_MS);
+      const deadlineAt = new Date(Math.max(renewal, new Date(held.deadline_at).getTime())).toISOString();
+      const renewed = this.db.run(
+        `UPDATE candidate_pipeline_attempts SET deadline_at = ?
+          WHERE run_id = ? AND attempt_id = ? AND state = 'RUNNING' AND deadline_at = ?`,
+        [deadlineAt, input.runId, attemptId, held.deadline_at],
+      ).changes === 1;
+      if (renewed && input.onProgress) {
+        const notify = input.onProgress;
+        this.db.afterCommit(() => {
+          try { notify(step); } catch { /* a notice that fails never decides the submission */ }
+        });
+      }
+      return renewed;
+    });
+  }
+
+  /** Whether this attempt still holds the run, asked with nothing awaited between it and the outcome it gates. */
+  private attemptHolds(runId: string, attemptId: string): boolean {
+    return this.db.get<{ n: number }>(
+      `SELECT 1 AS n FROM candidate_pipeline_attempts
+        WHERE run_id = ? AND attempt_id = ? AND state = 'RUNNING' AND deadline_at > ?`,
+      [runId, attemptId, this.clock.nowIso()],
+    ) !== undefined;
+  }
+
+  /**
+   * The answer of a submission whose attempt no longer holds the run (released, expired or at its cap):
+   * its outcome is not applied, and a review that answered is recorded as refused for it.
+   */
+  private attemptLost(
+    runId: string,
+    attemptId: string,
+    snapshotDigest: string,
+    reviewed: Decision<ReviewPacket> | null,
+  ): Decision<PipelineOutcome> {
+    const refusal = deny<PipelineOutcome>(
+      ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
+      "this submission's attempt no longer holds the run (released, expired or at its cap), so its outcome is not applied; submit the result again with a new idempotencyKey",
+      { runId, attemptId, candidateSnapshotDigest: snapshotDigest },
+    );
+    // A review the gate ended for this same reason reached no verdict, or recorded the one it did not keep.
+    if (reviewed !== null && reviewed.reasonCode !== ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE) {
+      this.recordStaleAfterReview(runId, snapshotDigest, attemptId, "ATTEMPT_LEASE", refusal, reviewed);
+    }
+    return refusal;
   }
 
   private releaseAttempt(runId: string, attemptId: string): void {

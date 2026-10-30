@@ -202,6 +202,8 @@ export interface VerifyOptions {
   executionMode?: "SIMPLE" | "STANDARD" | "GUARDED";
   /** Commands the CTO proposed for an unregistered repository (§17.5). */
   runScoped?: boolean;
+  /** Called once each command's evidence is in: real progress for the submission waiting on it. */
+  progress?: () => void;
 }
 
 const memoryEvidenceReason = (
@@ -662,6 +664,7 @@ export class VerificationEngine {
       if (command.evidenceMode !== "LOCAL_COMMAND") {
         results.push(await this.collectCi(runId, snapshotDigest, command, repo.identity, repo.candidateHead));
       }
+      options.progress?.();
     }
 
     // §16.2 — the commands ran against a detached worktree, but the source may have moved

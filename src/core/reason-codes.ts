@@ -486,6 +486,11 @@ export const ReasonCode = {
    */
   MCP_REPLAY_UNVERIFIABLE: "MCP_REPLAY_UNVERIFIABLE",
   MCP_MUTATION_OUTCOME_UNKNOWN: "MCP_MUTATION_OUTCOME_UNKNOWN",
+  /**
+   * A replay of a key whose first call is still running in this process, for a mutation that answers
+   * so (`result_submit`): nothing ran again, and the same key answers the stored result once it is done.
+   */
+  MCP_MUTATION_IN_FLIGHT: "MCP_MUTATION_IN_FLIGHT",
   MCP_PEER_UNAUTHENTICATED: "MCP_PEER_UNAUTHENTICATED",
   /**
    * #1037 — a mutation on the adopted CEO's tool channel whose caller provenance is not the owner's
