@@ -504,6 +504,46 @@ describe("host-anchored redacted run-evidence export", () => {
     expect(verifyRunEvidenceExport(reseal(leaked), harness.cp.db)).toBe(false);
   });
 
+  it("#1279 G4-2: an unsafe field nested past the old scan depth is still excluded, never exported as examined", () => {
+    const harness = makeHarness();
+    const created = harness.cp.runs.create({ executionMode: ExecutionMode.STANDARD, contract });
+    expect(created.allowed).toBe(true);
+    if (!created.allowed) return;
+    /** `leaf` inside `levels` objects, each holding the next at `detail`. */
+    const nested = (levels: number, leaf: Record<string, unknown>): Record<string, unknown> => {
+      let value = leaf;
+      for (let level = 0; level < levels; level += 1) value = { detail: value };
+      return value;
+    };
+    // Each sits one level past where its scanner stopped (the bulk-content scan at 8, the env and source scans at 12).
+    const deep = {
+      artifact_deep_private: { content: nested(9, { privateTranscript: "deep transcript text" }), reason: "PRIVATE_BULK_CONTENT" },
+      artifact_deep_env: { content: nested(13, { env: { CI: "true", PATH: "/usr/bin" } }), reason: "RAW_ENV_OR_HEADER_COLLECTION" },
+      artifact_deep_diff: { content: nested(13, { diff: "+deep private implementation" }), reason: "SOURCE_CODE_OR_PATCH_CONTENT" },
+    } as const;
+    for (const [artifactId, { content }] of Object.entries(deep)) {
+      harness.cp.db.run(
+        `INSERT INTO run_artifacts
+           (artifact_id, run_id, kind, digest, candidate_snapshot_digest, content_json, produced_by, created_at)
+         VALUES (?, ?, 'PLAN', ?, NULL, ?, 'legacy-import', ?)`,
+        [artifactId, created.value.runId, digestOf(content), canonicalJson(content), harness.clock.nowIso()],
+      );
+    }
+
+    const exported = exporterFor(harness).exportRun(created.value.runId);
+    expect(exported.allowed).toBe(true);
+    if (!exported.allowed) return;
+    for (const [artifactId, { content, reason }] of Object.entries(deep)) {
+      expect(exported.value.artifactManifest.omittedFields).toContainEqual({
+        subject: "artifact", subjectId: artifactId, field: "content", reason, sourceDigest: digestOf(content),
+      });
+    }
+    const text = JSON.stringify(exported.value);
+    expect(text).not.toContain("deep transcript text");
+    expect(text).not.toContain("/usr/bin");
+    expect(text).not.toContain("deep private implementation");
+  });
+
   it("fails closed instead of silently skipping a malformed baseline source record", () => {
     const harness = makeHarness();
     const created = harness.cp.runs.create({ executionMode: ExecutionMode.STANDARD, contract });
@@ -1114,6 +1154,9 @@ describe("baseline boundary contracts", () => {
       "v50-post-merge-verification-reentry",
       "v51-durable-recipient-delivery",
       "v52-resident-project-provisioning",
+      "v53-verification-result-history",
+      "v54-run-state-exits",
+      "v55-approved-run-revision-reentry",
     ]);
   });
 

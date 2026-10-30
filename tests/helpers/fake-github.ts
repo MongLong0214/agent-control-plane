@@ -11,6 +11,8 @@ export interface FakePull {
   commits?: number;
   body?: string | null;
   merge_commit_sha?: string | null;
+  /** GitHub's mergeability; absent and null both mean not yet computed. */
+  mergeable?: boolean | null;
 }
 
 export interface FakeCheckRun {

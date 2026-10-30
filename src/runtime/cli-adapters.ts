@@ -47,6 +47,7 @@ import {
   type InvocationRequest,
   type InvocationResult,
   type ProviderAdapter,
+  type TransmittedInput,
   ProviderSessionProvisionError,
   REVIEWER_EGRESS_DENY_PROBE_ENDPOINTS,
   type ReviewerEgressConfig,
@@ -2258,6 +2259,15 @@ const refusedInvocation = (
 });
 
 /**
+ * What the Claude CLI is given for a request: system instructions as the `--append-system-prompt` argv
+ * value and the prompt on stdin (#1274). `invoke` builds both from this, for every role.
+ */
+const claudeTransmittedInput = (request: Pick<InvocationRequest, "systemPrompt" | "prompt">): TransmittedInput => ({
+  argv: request.systemPrompt ? [["--append-system-prompt", request.systemPrompt]] : [],
+  stdin: request.prompt,
+});
+
+/**
  * Claude Code headless adapter. Used for CTO sessions and, under continuity fallback,
  * for acting CEO and blind reviewer roles (§15.4).
  */
@@ -2350,8 +2360,13 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     /* headless invocations own no long-lived process */
   }
 
+  transmittedReviewerInput(request: Pick<InvocationRequest, "systemPrompt" | "prompt">): TransmittedInput {
+    return claudeTransmittedInput(request);
+  }
+
   async invoke(request: InvocationRequest): Promise<InvocationResult> {
     const started = Date.now();
+    const input = claudeTransmittedInput(request);
     const args = [
       "-p",
       "--output-format",
@@ -2397,7 +2412,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
         String(request.maxBudgetUsd ?? 5),
       );
     }
-    if (request.systemPrompt) args.push("--append-system-prompt", request.systemPrompt);
+    for (const [option, value] of input.argv) args.push(option, value);
 
     // The prompt goes over stdin rather than as a positional argument: several of the
     // CLI's options are variadic, and a trailing positional is liable to be swallowed by
@@ -2405,7 +2420,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     const execute = (writablePaths: readonly string[], cwd = request.workdir) => runCli(this.#binary, args, {
       cwd,
       timeoutMs: request.timeoutMs,
-      stdin: request.prompt,
+      stdin: input.stdin,
       environmentAllowlist: this.#environmentAllowlist,
       denyReadPaths: this.#denyReadPaths,
       providerCredentialDir: this.#providerCredentialDir,
@@ -2906,6 +2921,13 @@ type CodexReviewerHome =
 export const REVIEWER_TRANSPORT_SEPARATOR = "\n\n---\n\n";
 
 /**
+ * The single string the Codex CLI receives for a request: system instructions, separator and prompt.
+ * A packet reviewer's copy goes on stdin (`CodexCliAdapter.transmittedReviewerInput`) (#1274).
+ */
+export const reviewerTransportInput = (request: Pick<InvocationRequest, "systemPrompt" | "prompt">): string =>
+  request.systemPrompt ? `${request.systemPrompt}${REVIEWER_TRANSPORT_SEPARATOR}${request.prompt}` : request.prompt;
+
+/**
  * Codex CLI adapter. Preferred runtime for the blind reviewer (GPT-6.1 Sol at xhigh
  * effort, §18.1) and for mechanical worker tasks.
  */
@@ -3069,6 +3091,11 @@ export class CodexCliAdapter implements ProviderAdapter {
     this.#workerSessions.delete(handle.externalSessionId);
   }
 
+  /** A packet reviewer's request reaches `codex exec resume` as one string on stdin (`invokePacketReviewer`). */
+  transmittedReviewerInput(request: Pick<InvocationRequest, "systemPrompt" | "prompt">): TransmittedInput {
+    return { argv: [], stdin: reviewerTransportInput(request) };
+  }
+
   /**
    * The account the capacity collector reads. The child receives it as `codexHome` on `runCli`,
    * which `runtimeEnvironment` writes onto that child's environment. The process environment is
@@ -3132,9 +3159,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       args.push("--output-schema", schemaFile);
     }
 
-    const prompt = request.systemPrompt
-      ? `${request.systemPrompt}${REVIEWER_TRANSPORT_SEPARATOR}${request.prompt}`
-      : request.prompt;
+    const prompt = reviewerTransportInput(request);
 
     // A worker turn names its child and ends that child's group. Any other one-shot exec keeps
     // the previous launch: no spawn callback and no reap.
@@ -3388,7 +3413,7 @@ export class CodexCliAdapter implements ProviderAdapter {
     const result = await runCli(nativeBinary, args, {
       cwd: request.workdir,
       timeoutMs: request.timeoutMs,
-      stdin: request.systemPrompt ? `${request.systemPrompt}${REVIEWER_TRANSPORT_SEPARATOR}${request.prompt}` : request.prompt,
+      stdin: this.transmittedReviewerInput(request).stdin,
       isolation: request.isolation,
       ...this.reviewerHomeOptions(constituted.home, request.workdir),
       reviewerExecutablePaths: codexReviewerExecutables(this.#binary),

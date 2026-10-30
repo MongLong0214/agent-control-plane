@@ -4,6 +4,8 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { ControlPlane } from "../app/control-plane.ts";
+import { retryDeferredNotices } from "../ceo/ceo-incident-notices.ts";
+import { routeOwnerlessStalls, routePostMergeStall } from "../ceo/ownerless-stalls.ts";
 import { outboxDeliveryReadback } from "../outbox/outbox.ts";
 import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../capacity/capacity-monitor.ts";
 import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
@@ -35,6 +37,7 @@ import {
   BOOTSTRAP_PLAN_RECOVERY_WAKE,
   BOOTSTRAP_RESULT_RECOVERY_WAKE,
   BOOTSTRAP_REVIEW_RETRY_WAKE,
+  SESSION_WAKE_TRIGGER_COMPLETED,
   ProvisionedSessionRuntime,
   planRecoveryTriggerId,
   planRecoveryTriggerKind,
@@ -58,6 +61,8 @@ import {
 } from "../doctor/doctor.ts";
 import { isProjectlessBootstrap } from "../bootstrap/bootstrap-plan.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
+import { describeStartStall, type StartStall } from "./start-stall.ts";
+import { routeUnreleasedWorkerOrphans } from "../run/worker-orphan-routing.ts";
 import {
   ArtifactKind,
   Role,
@@ -77,6 +82,12 @@ import {
   ownerApprovalPayload,
 } from "../ingress/ingress-guard.ts";
 import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
+import {
+  AgentOwnedWaits,
+  type AgentWaitDeadlines,
+  type AgentWaitSweepReport,
+  DEFAULT_AGENT_WAIT_DEADLINES,
+} from "../ceo/agent-owned-waits.ts";
 import { ROLE_ATTACHMENT_OPERATION, RoleAttachmentCredentials } from "../session/role-attachment-credentials.ts";
 import type { SessionRecord } from "../session/session-registry.ts";
 import type { BuzzAdapter } from "../buzz/buzz-adapter.ts";
@@ -295,6 +306,12 @@ export interface DaemonOptions {
    * refresh interval; see `assertDoctorFreshnessOrdering`.
    */
   doctorFreshnessMs?: number;
+  /**
+   * #1189 B4/B6/B7/B10 — how long an agent-owned wait (an unresolved escalation, a CEO review, a
+   * FINAL_REVISE not dispatched again, a continuity hold) sits before its next deadline step. Each kind
+   * falls back to `DEFAULT_AGENT_WAIT_DEADLINES`.
+   */
+  agentWaitDeadlines?: Partial<AgentWaitDeadlines>;
 }
 
 /**
@@ -485,7 +502,26 @@ export interface BootstrapDoor {
 
 export interface DaemonStartOptions {
   bootstrapDoor?: () => Promise<BootstrapDoor>;
+  /**
+   * #1189 D1 — the route the CEO stall notice of a refused or parked start is sent over, used while this
+   * daemon still holds its lock and before it releases it. The caller decides what route that is;
+   * omitting it leaves the notice PENDING for the first daemon that starts.
+   */
+  stallNotice?: StartStallNoticeRoute;
 }
+
+export type StartStallNoticeRouteState = { started: true } | { started: false; reason: string };
+
+/** #1189 D1 — a route for the stall notice of a start that cannot resume dispatch. */
+export interface StartStallNoticeRoute {
+  /** Called before the start writes its notice: whatever the route needs to predate that notice. */
+  open?: () => StartStallNoticeRouteState;
+  /** Sends the named notices. Its answer and its failure are diagnostics: neither changes the refusal. */
+  deliver: (messageIds: readonly string[]) => Promise<StartStallNoticeRouteState | void>;
+}
+
+/** #1189 D1 — how long a refused or parked start waits for its stall notice to be sent. */
+const START_STALL_NOTICE_BUDGET_MS = 15_000;
 
 export interface OperatorRequest {
   requestId: string;
@@ -628,6 +664,8 @@ export class Daemon {
   #startedAt: string | null = null;
   #mode: DaemonMode = "NORMAL";
   #bootstrapBlocking: BlockingFinding[] = [];
+  /** #1189 D1 — what this start is stalled on, in `health.json` until a start succeeds. */
+  #startStall: StartStall | null = null;
   // A counter, not a one-shot waiter: an observation can land while the park is inside its
   // re-check, and a signal delivered to nobody must not be discarded. The park compares the
   // counter against what it last consumed, so it only sleeps when nothing is outstanding.
@@ -695,6 +733,8 @@ export class Daemon {
    * again. Process memory only: a restarted daemon tries once more.
    */
   readonly #refusedTargets = new Set<string>();
+  /** #1189 — the agent-owned waits' deadlines, the pending-review re-delivery and the ownerless stall routing. */
+  readonly #agentWaits: AgentOwnedWaits;
 
   constructor(
     private readonly cp: ControlPlane,
@@ -707,6 +747,13 @@ export class Daemon {
     this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.clock);
     this.#finalizer = new ApprovedRunFinalizer(cp, undefined, authorities);
     this.#evidenceExporter = new RunEvidenceExporter(cp.db, cp.artifacts, cp.clock, cp.audit);
+    this.#agentWaits = new AgentOwnedWaits(
+      {
+        db: cp.db, clock: cp.clock, audit: cp.audit, runs: cp.runs, bindings: cp.bindings,
+        outbox: cp.outbox, artifacts: cp.artifacts, gate: cp.ceo,
+      },
+      { ...DEFAULT_AGENT_WAIT_DEADLINES, ...options.agentWaitDeadlines },
+    );
     // Nothing is registered with `cp.doctor` here. A constructed daemon is not yet the live one: a
     // second `Daemon` over the same control plane that `start()` then refuses the lock would, if it
     // registered here, replace the supplier of the daemon that does hold the lock, and that
@@ -1435,6 +1482,10 @@ export class Daemon {
     );
 
     try {
+      // #1189 I3-1 — the CEO notice attempt journal's boundary, before this start can write any notice and
+      // whatever route its notices have: it is a local record and needs no transport, target or lane secret.
+      // A notice written from here on is one no pre-journal daemon saw; one still PENDING now stays held.
+      this.cp.outbox.startCeoNotificationAttemptJournal();
       this.installContinuityCoordinator();
       await this.refreshCapacitySensors();
       let report = await this.reconcile();
@@ -1443,13 +1494,16 @@ export class Daemon {
       if (report.doctorStatus === "BLOCKED" || report.doctorStatus === "ERROR") {
         const reasonCode =
           report.doctorStatus === "BLOCKED" ? ReasonCode.DOCTOR_BLOCKED : ReasonCode.DOCTOR_ERROR;
+        const parks = options.bootstrapDoor !== undefined && canParkForBootstrap(report.blockingFindings);
+        // #1189 D1 — before it parks or refuses, while it still holds the lock: what it waits on.
+        const stall = await this.recordStartStall(report, parks ? "PARKED" : "REFUSED", options.stallNotice);
 
-        if (options.bootstrapDoor && canParkForBootstrap(report.blockingFindings)) {
+        if (parks && options.bootstrapDoor) {
           const promoted = await this.parkForBootstrap(report, options.bootstrapDoor);
           if (promoted) {
             report = promoted;
           } else {
-            this.recordStartupFailure(reasonCode, { reconcile: report });
+            this.recordStartupFailure(reasonCode, { reconcile: report, stall });
             this.uninstallContinuityCoordinator();
             this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
             this.lock.release();
@@ -1457,7 +1511,7 @@ export class Daemon {
             return deny(reasonCode, "startup doctor did not permit dispatch resume", { reconcile: report });
           }
         } else {
-          this.recordStartupFailure(reasonCode, { reconcile: report });
+          this.recordStartupFailure(reasonCode, { reconcile: report, stall });
           this.uninstallContinuityCoordinator();
           this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
           this.lock.release();
@@ -1472,6 +1526,10 @@ export class Daemon {
       report.resumedRuns = await this.resumeQueuedRuns();
       report.resumedFinalizations = await this.resumeApprovedRuns();
       await this.resumeResidentProjects();
+      // #1189 — a stranded bootstrap application or a CONTRACT_CHANGE run that cannot finish is routed to
+      // the CEO once each, and a notice the outbox refused while its fact was kept is delivered; the watchdog
+      // repeats the pass, and an incident already told to the current CEO sends nothing more.
+      await this.runPeriodic("ownerless_stall_routing", async () => { this.routeCeoIncidents(); });
       // Issue #246 — a bootstrap run that ended while no daemon was running left its BOOTSTRAP_CTO
       // bound or its session running; the watchdog repeats this, through the same backoff.
       await this.runPeriodic("bootstrap_cto_reclaim", () => this.reclaimBootstrapCtos());
@@ -1489,6 +1547,9 @@ export class Daemon {
         await this.recordStandardWorkTargets();
         this.wakeStandardWorkContinuation();
       });
+      // #1189 — a CEO recovered while no daemon ran is given the reviews still pending, and a wait whose
+      // deadline passed meanwhile takes its next step.
+      await this.runPeriodic("agent_owned_waits", async () => { await this.sweepAgentOwnedWaits(); });
       // #639 contract 6, at the moment it matters most: right after a restart, before the first
       // periodic sweep would otherwise get to it. This genuinely runs and asks — it is not a
       // no-op by omission — but two independent facts limit it today, both stated in full in
@@ -1505,6 +1566,7 @@ export class Daemon {
       // through `runPeriodic` for the same backoff/audit treatment the timer gets, rather than a
       // bare `void` that would let a repeatedly-failing sweep fail silently forever.
       void this.runPeriodic("turn_reconcile", () => this.runTurnReconcile());
+      this.#startStall = null;
       this.writeHealth(report);
       this.startTimers();
       this.clearCrashLoop();
@@ -2075,11 +2137,15 @@ export class Daemon {
    * engine decides, per run, whether the wait is continuity's own and nothing has moved since, and
    * answers `released: false` for every other one; a refusal here changes nothing and the next pass
    * asks again.
+   *
+   * #1189 — a wait continuity placed for a role that is not the run's owner (the CEO's, whose loss pauses
+   * every run) is handed back too, once `binding` covers that role again; the run engine decides that one
+   * by the pause's own record (`RunEngine.releaseHeldRoleReviewHold`).
    */
   private releaseContinuityReviewHolds(binding: RoleBinding): void {
     for (const run of this.cp.runs.list({ state: RunState.AWAITING_HUMAN })) {
-      if (run.ownerRoleKey !== binding.roleKey) continue;
-      this.cp.runs.releaseContinuityReviewHold(run.runId, binding);
+      if (run.ownerRoleKey === binding.roleKey) this.cp.runs.releaseContinuityReviewHold(run.runId, binding);
+      else this.cp.runs.releaseHeldRoleReviewHold(run.runId, binding);
     }
   }
 
@@ -2184,6 +2250,12 @@ export class Daemon {
     }
   }
 
+  /** #1189 — the ownerless stalls this daemon detects, and the CEO notices deferred while their facts were kept. */
+  private routeCeoIncidents(): void {
+    routeOwnerlessStalls(this.cp);
+    retryDeferredNotices(this.cp);
+  }
+
   /** Recover CEO-approved work after the durable lease and GitHub receipt reconciliations. */
   async resumeResidentProjects(): Promise<void> {
     // #1251 C-P1 — pending retirements and the retirement intents a daemon exit left open.
@@ -2204,14 +2276,38 @@ export class Daemon {
     await this.cp.workerCheckouts.ensureAll();
   }
 
-  private async resumeApprovedRuns(): Promise<string[]> {
+  /**
+   * The finalization sweep, once at start and then on every watchdog tick. #1189 B5 (CEO ruling 5) — a run
+   * whose last attempt was refused before anything merged waits out that refusal's backoff, and one that
+   * reached its retry cap is not tried again (`ApprovedRunFinalizer.retryDue`): both are durable, so a
+   * restart neither shortens the wait nor restarts the count. Only an explicit `finalizeApprovedRun` (the one a
+   * CONFIRM triggers) skips the wait; its refusals still count. A cap notice no CEO could take is still owed,
+   * and a pass over a run it does not retry sends it once a CEO is bound.
+   */
+  async resumeApprovedRuns(): Promise<string[]> {
     const resumed: string[] = [];
+    const stalled: string[] = [];
     const states = [RunState.CEO_APPROVED, RunState.MERGING, RunState.POST_MERGE_VERIFYING, RunState.BLOCKED_POST_MERGE];
     for (const state of states) {
       for (const run of this.cp.runs.list({ state })) {
+        if (!this.#finalizer.retryDue(run.runId)) {
+          this.#finalizer.deliverOwedHandOff(run.runId);
+          continue;
+        }
         const finalized = await this.finalizeApprovedRun(run.runId);
         if (finalized.allowed) resumed.push(run.runId);
+        // A run blocked earlier in this pass is listed again here, so its first refusal is seen at once.
+        else if (state === RunState.BLOCKED_POST_MERGE && finalized.reasonCode === ReasonCode.FINALIZATION_COMPENSATION_REQUIRED) {
+          stalled.push(run.runId);
+        }
       }
+    }
+    // #1189 — a block the finalizer will not resume is routed to the CEO, once per finalization attempt;
+    // the run, its merges and its compensation plan stay as recorded.
+    if (stalled.length > 0) {
+      await this.runPeriodic("post_merge_stall_routing", async () => {
+        for (const runId of stalled) routePostMergeStall(this.cp, runId);
+      });
     }
     return resumed;
   }
@@ -2369,8 +2465,11 @@ export class Daemon {
    *
    * The same pass also makes the review retry (`#bootstrapReviewRetry`): a result submitted for the
    * current PLAN whose candidate's latest review ended unavailable wakes the owner once per (run,
-   * owner binding generation, candidate) to submit that result again, under the same runtime
-   * conditions, marked by a `BOOTSTRAP_REVIEW_RETRY_WAKE` audit event.
+   * candidate) to submit that result again, under the same runtime
+   * conditions, marked by a `BOOTSTRAP_REVIEW_RETRY_WAKE` audit event. A failed/refused turn or a
+   * restart or owner-generation recovery after admission re-presents that exact trigger; only its durable
+   * `SESSION_WAKE_TRIGGER_COMPLETED` settlement spends the retry. If the review is still unavailable
+   * after that completed turn, the run fails explicitly instead of waiting for a person.
    */
   wakeBootstrapResultRecovery(): BootstrapResultRecoveryReport {
     const woken: BootstrapResultRecoveryReport["woken"] = [];
@@ -2395,6 +2494,62 @@ export class Daemon {
       const resultStage = this.#bootstrapResultOwnerStands(runId, owner, planDigest);
       const retry = resultStage ? null : this.#bootstrapReviewRetry(runId, owner, planDigest);
       if (!resultStage && retry === null) continue;
+      if (retry !== null) {
+        const retryWake = this.cp.db.get<{ trigger_id: unknown; binding_generation: unknown }>(
+          `SELECT json_extract(evidence_json, '$.triggerId') AS trigger_id,
+                  json_extract(evidence_json, '$.bindingGeneration') AS binding_generation
+             FROM audit_events
+            WHERE kind = ? AND run_id = ?
+              AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?
+            ORDER BY event_id
+            LIMIT 1`,
+          [BOOTSTRAP_REVIEW_RETRY_WAKE, runId, retry.candidateSnapshotDigest],
+        );
+        if (typeof retryWake?.trigger_id === "string") {
+          const completed = this.cp.db.get<{ n: number }>(
+            `SELECT 1 AS n FROM audit_events
+              WHERE kind = ? AND json_extract(evidence_json, '$.triggerId') = ?
+              LIMIT 1`,
+            [SESSION_WAKE_TRIGGER_COMPLETED, retryWake.trigger_id],
+          );
+          if (completed) {
+            // The exact admitted retry turn completed, but the candidate's latest review is still
+            // unavailable. Its finite review-recovery budget is spent; do not create a human wait.
+            this.cp.runs.transition(
+              runId,
+              RunState.FAILED,
+              "bootstrap blind review remained unavailable after its bounded retry",
+              {
+                failureClass: "BLIND_REVIEW_RETRY_EXHAUSTED",
+                bindingGeneration: owner.bindingGeneration,
+                retryBindingGeneration: retryWake.binding_generation,
+                planDigest,
+                candidateSnapshotDigest: retry.candidateSnapshotDigest,
+                unavailableEventId: retry.unavailableEventId,
+                triggerId: retryWake.trigger_id,
+              },
+            );
+            continue;
+          }
+          // Admission is durable but a failed/refused turn, or a daemon restart before settlement,
+          // is not a spent retry. Re-present the same deterministic trigger; the runtime coalesces
+          // an in-progress copy and releases a failed one.
+          if (
+            !runtime.drivesSession(owner.sessionId, Role.BOOTSTRAP_CTO) ||
+            !runtime.holds(owner.sessionId) ||
+            !runtime.attachedToDaemon() ||
+            runtime.turnInProgress(owner.sessionId)
+          ) {
+            continue;
+          }
+          runtime.wake(owner.roleKey, [{
+            id: retryWake.trigger_id,
+            kind: reviewRetryTriggerKind(runId),
+            stillAdmissible: () => this.#bootstrapReviewRetry(runId, owner, planDigest) !== null,
+          }]);
+          continue;
+        }
+      }
       if (
         !runtime.drivesSession(owner.sessionId, Role.BOOTSTRAP_CTO) ||
         !runtime.holds(owner.sessionId) ||
@@ -2404,18 +2559,6 @@ export class Daemon {
         continue;
       }
       if (retry !== null) {
-        // One official retry per (run, owner generation, candidate): a retry whose own review is
-        // unavailable again records a new unavailable event, and keying on that alone would wake the
-        // owner on every tick for as long as the reviewer stays down.
-        const alreadyRetried = this.cp.db.get<{ n: number }>(
-          `SELECT 1 AS n FROM audit_events
-            WHERE kind = ? AND run_id = ?
-              AND json_extract(evidence_json, '$.bindingGeneration') = ?
-              AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?
-            LIMIT 1`,
-          [BOOTSTRAP_REVIEW_RETRY_WAKE, runId, owner.bindingGeneration, retry.candidateSnapshotDigest],
-        );
-        if (alreadyRetried) continue;
         const triggerId = reviewRetryTriggerId(
           runId, owner.bindingGeneration, retry.candidateSnapshotDigest, retry.unavailableEventId,
         );
@@ -2779,7 +2922,31 @@ export class Daemon {
       if (marked(STANDARD_WORK_CONTINUATION_WAKE)) {
         // The one wake this state earned has run, or was dropped, and the state is unchanged: the
         // owner made no progress on it. That is left as an explicit blocker, once, and never re-woken.
-        if (marked(STANDARD_WORK_CONTINUATION_STALLED)) continue;
+        // #1189 B12 — and no agent watches that blocker, so it goes to the CEO as CRITICAL_SYSTEM_FAILURE,
+        // once per stalled state; a pass with no CEO to tell asks again on the next one.
+        const routeStall = (): void => {
+          this.#agentWaits.routeOwnerlessStall({
+            source: "STANDARD_WORK_CONTINUATION",
+            kind: "standard_work_continuation",
+            id: `${runId}:${tuple.taskId}`,
+            episode: `${tuple.taskState}:${tuple.messageId}`,
+            runId,
+            since: null,
+            owner: { role: owner.roleKey, sessionId: owner.sessionId, generation: owner.bindingGeneration },
+            recoveryAction:
+              "replace the run's PRIMARY_CTO (cto_replace) so the READY task is staffed and run, or cancel the run (run_cancel); " +
+              "the task has no execution and no attempt, so nothing it would do has run and nothing needs checking first",
+            blocker:
+              `task ${tuple.taskId} is READY (${tuple.taskState}) with no execution after its one continuation wake, ` +
+              "and its CTO is not woken again",
+            effects: "NONE_STARTED",
+            deliveryTimeout: false,
+          });
+        };
+        if (marked(STANDARD_WORK_CONTINUATION_STALLED)) {
+          routeStall();
+          continue;
+        }
         this.cp.audit.record({
           kind: STANDARD_WORK_CONTINUATION_STALLED,
           reasonCode: ReasonCode.WORKER_BINDING_REQUIRED,
@@ -2798,6 +2965,7 @@ export class Daemon {
         report.stalled.push({
           runId, roleKey: owner.roleKey, bindingGeneration: tuple.bindingGeneration, taskId: tuple.taskId, taskState: tuple.taskState,
         });
+        routeStall();
         continue;
       }
       if (
@@ -2941,6 +3109,18 @@ export class Daemon {
     return this.cp.sessions.get(owner.sessionId)?.lifecycle === SessionLifecycle.READY;
   }
 
+  /**
+   * #1189 B4/B6/B7/B10 (CEO ruling 4) — every pending review is delivered to the CEO role's current holder
+   * when it does not have it and no decision exists for it, then every agent-owned wait past its deadline
+   * takes its next step: re-notify, reassign or a recovery attempt, CEO escalation. A continuity hold's
+   * recovery attempt is this daemon's own continuity reconcile. Nothing here moves a run to FAILED.
+   */
+  async sweepAgentOwnedWaits(): Promise<AgentWaitSweepReport & { redelivered: Array<{ runId: string; messageId: string }> }> {
+    const redelivered = this.#agentWaits.redeliverPendingReviews();
+    const swept = await this.#agentWaits.sweep(() => this.reconcileContinuity("agent-owned wait deadline"));
+    return { ...swept, redelivered };
+  }
+
   private startTimers(): void {
     const watchdogMs = this.options.watchdogIntervalMs ?? 60_000;
     const deliveryMs = this.options.deliveryIntervalMs ?? 5_000;
@@ -2971,6 +3151,9 @@ export class Daemon {
           // an interrupted callback without requiring a daemon restart.
           const finalized = await this.resumeApprovedRuns();
           await this.resumeResidentProjects();
+          // #1189 C2 — what the watchdog found overdue is routed to the CEO, once per stall; after the
+          // recovery sweeps, so a routing that cannot be written never costs them their tick.
+          this.#agentWaits.routeWatchdogStalls(tick.stalls);
           if (tick.overdue.length > 0 || finalized.length > 0) this.writeHealth(null);
         }).finally(() => { watchdogRunning = false; });
       }
@@ -2987,11 +3170,18 @@ export class Daemon {
         await this.recordStandardWorkTargets();
         this.wakeStandardWorkContinuation();
       });
+      // #1189 — pending reviews follow a recovered CEO, and agent-owned waits take their deadline steps.
+      void this.runPeriodic("agent_owned_waits", async () => { await this.sweepAgentOwnedWaits(); });
       // #512 — and a retired worker's session left live while its process ran is settled on a later tick.
       void this.runPeriodic("worker_retirement", async () => {
         await this.cp.workerRetirement.reconcile();
       });
       void this.runPeriodic("cto_canonical_switchover_settle", () => this.settleCanonicalSwitchovers());
+      // #1189 A2 — a task an unidentified worker orphan holds is told to the CEO once, with the machine check.
+      void this.runPeriodic("worker_orphan_routing", async () => {
+        routeUnreleasedWorkerOrphans(this.cp);
+      });
+      void this.runPeriodic("ownerless_stall_routing", async () => { this.routeCeoIncidents(); });
     }, watchdogMs);
     watchdog.unref();
     this.#timers.push(watchdog);
@@ -3320,8 +3510,59 @@ export class Daemon {
     return [
       ...this.telegramIngressFindings(),
       ...this.buzzMentionSubscriberFindings(),
+      ...this.buzzMentionLivenessFindings(),
       ...this.unwakeableBindingFindings(),
     ];
+  }
+
+  /**
+   * #1283 — an admitted identity whose subscription the relay has not answered within the bound.
+   *
+   * Separate from the silent finding, and read whatever `framesHandled` says: on the live daemon
+   * the counters had moved before the outage, so the silent finding was suppressed, the five
+   * connections were ESTABLISHED and the relay was healthy, and doctor was clean for three days
+   * while no mention was delivered. The subscriber replaces a stalled connection by itself; this
+   * reports an identity that is still unanswered, or whose outage no probe has yet come back clean
+   * on, so a stall the reconnect cured clears on the next health tick and not on the replacement's
+   * own `EOSE`, which proves the stored query answers and not that delivery does.
+   */
+  private buzzMentionLivenessFindings(): Finding[] {
+    const liveness = this.#buzzMentionReceipt?.counters().liveness;
+    const stale = liveness?.identities.filter((one) => one.state === "STALE") ?? [];
+    if (liveness === undefined || stale.length === 0) return [];
+    return [{
+      code: "BUZZ_MENTION_SUBSCRIBER_STALE",
+      severity: "ERROR",
+      scope: "buzz",
+      blocking: false,
+      confidence: "HIGH",
+      observedEvidence: {
+        boundSeconds: liveness.boundSeconds,
+        staleIdentities: stale.map((one) => ({
+          identity: one.identity,
+          identityPubkey: one.identityPubkey,
+          roleKey: one.roleKey,
+          unansweredForSeconds: one.unansweredForSeconds,
+          answeredAtSeconds: one.answeredAtSeconds,
+          stalls: one.stalls,
+          lastStall: one.lastStall,
+          outageSinceSeconds: one.outageSinceSeconds,
+        })),
+        // The rest of the picture, so a stalled identity beside a deliberately excluded one is not
+        // read as one partial-but-healthy subscriber: how many are delivering, and why the
+        // excluded ones are not connected at all.
+        liveIdentities: liveness.identities.filter((one) => one.state === "LIVE").length,
+        excludedIdentities: liveness.identities
+          .filter((one) => one.state === "EXCLUDED")
+          .map((one) => ({ identity: one.identity, reason: one.exclusionReason })),
+      },
+      recommendedAction:
+        "the relay has not answered these identities' subscriptions within the bound, and reconnecting " +
+        "has not restored them, so their mentions are not being delivered; an ESTABLISHED connection or a " +
+        "healthy relay does not contradict this. Check the path to the relay. The subscriber keeps " +
+        "reconnecting from its preserved window, so the missed mentions are delivered once it answers; " +
+        "a daemon restart is not needed for that",
+    }];
   }
 
   private buzzMentionSubscriberFindings(): Finding[] {
@@ -3441,6 +3682,7 @@ export class Daemon {
       continuityMode: this.cp.continuity.mode(),
       mode: this.#mode,
       blockingFindings: this.#bootstrapBlocking,
+      startStall: this.#startStall,
       lockHeld: this.lock.held(),
       runs: {
         queued: this.cp.runs.list({ state: RunState.QUEUED }).length,
@@ -3568,6 +3810,75 @@ export class Daemon {
       reasonCode,
       evidence: { ...next, threshold, backoffSeconds, ...evidence },
     });
+  }
+
+  /**
+   * #1189 D1 — classifies the blocking findings of a start that cannot resume dispatch, writes them
+   * to `health.json`, states a PERMANENT stall (or a TRANSIENT one whose refusal reaches the crash-loop
+   * threshold) as a CEO incident, and — over the caller's `stallNotice` route, opened before the notice
+   * is written, while this daemon still holds its lock — sends that notice once before the start parks
+   * or refuses. It moves no run. A failure here, of the route or of the send, is recorded on the stall
+   * and never changes why the start was refused.
+   */
+  private async recordStartStall(
+    report: ReconcileReport,
+    phase: StartStall["phase"],
+    stallNotice: DaemonStartOptions["stallNotice"],
+  ): Promise<StartStall | { error: string }> {
+    let stall: StartStall;
+    // The route opens before the notice is written (the canonical route's attempt journal must predate
+    // it). A route that cannot open, or throws, is a diagnostic of this stall and never its outcome.
+    let route: StartStallNoticeRouteState | null = null;
+    if (stallNotice) {
+      try {
+        route = stallNotice.open?.() ?? { started: true };
+      } catch (error) {
+        route = { started: false, reason: safeErrorMessage(error) };
+      }
+    }
+    try {
+      // A refusal is the next crash-loop failure; a park holds its lock and is not one.
+      const crashLoop = phase === "REFUSED" &&
+        this.readCrashLoop().failures + 1 >= (this.options.crashLoopThreshold ?? 3);
+      stall = describeStartStall(this.cp, report.blockingFindings, phase, crashLoop);
+    } catch (error) {
+      return { error: safeErrorMessage(error) };
+    }
+    this.#startStall = stall;
+    this.writeHealth(report);
+    const routing = stall.routing;
+    if (!stallNotice || !("messageId" in routing)) return stall;
+    if (route?.started === false) {
+      stall = { ...stall, routing: { ...routing, undelivered: `route not opened: ${route.reason}` } };
+    } else if (routing.delivery.status === "PENDING") {
+      // One send per start, within the budget. Whatever it answers or throws, the start is refused or
+      // parks exactly as it would have, and a notice still PENDING is offered again by the next start.
+      let timer: NodeJS.Timeout | undefined;
+      let undelivered: string | null = null;
+      try {
+        const sent = await Promise.race([
+          stallNotice.deliver([routing.messageId]),
+          new Promise<"BUDGET">((resolve) => {
+            timer = setTimeout(() => resolve("BUDGET"), START_STALL_NOTICE_BUDGET_MS);
+            timer.unref?.();
+          }),
+        ]);
+        if (sent === "BUDGET") undelivered = `no answer within ${START_STALL_NOTICE_BUDGET_MS} ms`;
+        else if (sent && !sent.started) undelivered = `route not opened: ${sent.reason}`;
+      } catch (error) {
+        undelivered = `send failed: ${safeErrorMessage(error)}`;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      const message = this.cp.outbox.get(routing.messageId);
+      const delivery = message ? { ...outboxDeliveryReadback(message), attempts: message.attempts } : routing.delivery;
+      // A send that returned is an attempt: the readback, not the send, says whether it delivered.
+      if (!delivery.delivered && undelivered === null) undelivered = "this start's send did not deliver it; its outbox records say why";
+      stall = { ...stall, routing: { ...routing, delivery, ...(undelivered ? { undelivered } : {}) } };
+    }
+    this.#startStall = stall;
+    this.writeHealth(report);
+    return stall;
   }
 
   private recordLockContention(evidence: Record<string, unknown>): void {

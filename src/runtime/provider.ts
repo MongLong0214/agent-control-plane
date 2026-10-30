@@ -1,5 +1,6 @@
 import type { Role } from "../domain/types.ts";
 
+import { sha256 } from "../core/digest.ts";
 import { deny, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { ManagedWriteGuard, WriteOperation } from "../guard/managed-write-guard.ts";
@@ -476,6 +477,27 @@ export interface CapacityReading {
 }
 
 /**
+ * What a provider CLI is given for one request (#1274): each argv option that carries request text,
+ * as `[option, value]` in argv order, and the bytes written to its stdin. An adapter that declares this
+ * builds its process input from the same value, so a digest of it is a digest of what was sent.
+ */
+export interface TransmittedInput {
+  readonly argv: ReadonlyArray<readonly [option: string, value: string]>;
+  readonly stdin: string;
+}
+
+/** Names the channels a `TransmittedInput` uses, in order: `stdin`, `argv --append-system-prompt + stdin`. */
+export const transmittedInputRepresentation = (input: TransmittedInput): string =>
+  [...input.argv.map(([option]) => `argv ${option}`), "stdin"].join(" + ");
+
+/**
+ * SHA-256 of each argv value, then stdin, joined by NUL. No argv value can contain NUL, so the parts
+ * are recoverable; with no argv value this is the digest of the stdin bytes alone.
+ */
+export const transmittedInputDigest = (input: TransmittedInput): string =>
+  sha256([...input.argv.map(([, value]) => value), input.stdin].join("\u0000"));
+
+/**
  * A provider runtime. Adapters hide collection differences (§40 Maintainability) so the
  * continuity kernel never branches on which provider it is talking to.
  */
@@ -513,6 +535,12 @@ export interface ProviderAdapter {
   startSession(spec: SessionSpec): Promise<SessionHandle>;
   stopSession(handle: SessionHandle): Promise<void>;
   invoke(request: InvocationRequest): Promise<InvocationResult>;
+  /**
+   * #1274 — exactly what `invoke` transmits for a packet reviewer's system instructions and prompt. A
+   * blind review stores its digest and representation for each reviewer call, so an adapter without it
+   * is refused as a reviewer rather than assumed to send what another adapter sends.
+   */
+  transmittedReviewerInput?(request: Pick<InvocationRequest, "systemPrompt" | "prompt">): TransmittedInput;
   /** Cheap liveness check for an existing critical session (§14.3). */
   probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE">;
   /**
@@ -634,6 +662,11 @@ class CapacityObservedAdapter implements ProviderAdapter {
       await this.observe("PROVIDER_SWITCH_OR_FAILURE");
       throw err;
     }
+  }
+
+  /** Present exactly when the wrapped adapter declares it, so a review digests that adapter's own input. */
+  get transmittedReviewerInput(): ProviderAdapter["transmittedReviewerInput"] {
+    return this.inner.transmittedReviewerInput?.bind(this.inner);
   }
 
   async probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {

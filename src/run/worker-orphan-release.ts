@@ -1,6 +1,7 @@
 import { digestOf } from "../core/digest.ts";
 import { redact } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 
 /**
  * #1096 — the one way an unidentified worker orphan (a launch the guard admitted whose pid was never
@@ -177,6 +178,26 @@ export const unresolvedUnidentifiedOrphans = (
     if (!orphanResolutionVerified(db, orphan)) unresolved.push(orphan);
   }
   return unresolved;
+};
+
+/**
+ * #1189 A2 — every unidentified orphan that still holds its task, of a task that may still run (its
+ * run has not ended and the task neither SUCCEEDED nor was CANCELLED), or only those of `runId`, oldest
+ * first: the tasks that run no further worker turn until the owner's release.
+ */
+export const unreleasedWorkerOrphans = (db: Db, runId: string | null = null): Array<UnidentifiedOrphan & { runId: string }> => {
+  const tasks = db.all<{ task_id: string; run_id: string }>(
+    `SELECT t.task_id, t.run_id FROM tasks t JOIN runs r ON r.run_id = t.run_id
+      WHERE t.task_id IN (SELECT json_extract(evidence_json, '$.taskId') FROM audit_events WHERE kind = ?)
+        AND t.state NOT IN ('SUCCEEDED', 'CANCELLED')
+        AND r.state NOT IN (${TERMINAL_RUN_STATES.map(() => "?").join(", ")})
+        AND (? IS NULL OR t.run_id = ?)
+      ORDER BY t.task_id`,
+    [ORPHAN_UNIDENTIFIED_EVENT, ...TERMINAL_RUN_STATES, runId, runId],
+  );
+  return tasks
+    .flatMap((task) => unresolvedUnidentifiedOrphans(db, { taskId: task.task_id }).map((orphan) => ({ ...orphan, runId: task.run_id })))
+    .sort((a, b) => a.eventId - b.eventId);
 };
 
 /**

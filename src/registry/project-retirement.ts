@@ -4,6 +4,8 @@ import { ReasonCode } from '../core/reason-codes.ts';
 import { CanonicalSessionRegistry } from './canonical-session-registry.ts';
 import { Role, roleKeyFor } from '../domain/types.ts';
 import { HostRetirementRefusal } from '../runtime/host-project-provisioner.ts';
+import { retirementWaitsForSettlement } from '../ceo/ownerless-stalls.ts';
+import { openPostMergeResponsibility } from '../daemon/post-merge-follow-up.ts';
 
 /**
  * #1251 C-P1 — the retirement's intent, committed in the transaction that suspends the project: its reason and whether
@@ -90,8 +92,16 @@ async function retire(cp:ControlPlane,projectId:string,suspended:boolean,reason:
   }
   const work = cp.db.all<{run_id:string;state:string}>(`SELECT run_id,state FROM runs WHERE (project_id = ? OR run_id IN (SELECT run_id FROM bootstrap_applications WHERE project_id = ?)) AND state NOT IN ('COMPLETED','CANCELLED','FAILED') ORDER BY created_at,run_id`,[projectId,projectId]);
   // Confirmed/merged effects must settle through their own finalizer; cancellation never erases them.
-  const settling = work.filter(r => ['CEO_APPROVED','FINALIZING','MERGING','POST_MERGE_VERIFYING','BLOCKED_POST_MERGE'].includes(r.state)).map(r => r.run_id);
-  if (settling.length > 0) {unmark();return deny(ReasonCode.CONFLICT,`retirement waits for confirmed external effects to settle; ${unchanged()}`,{projectId,settling,requiredOrder:[`let runs ${settling.join(', ')} finish finalizing`,rerun]});}
+  // #1189 A10 (CEO ruling 3) — a BLOCKED_POST_MERGE run holds retirement while it holds open recovery responsibility, named in the refusal. With no recovery handover record in this code, that is every one of them; one that settled would be kept as it is, never cancelled.
+  // A run still in a finalizing state always holds it, and the refusal names what it holds open from evidence, not from its state name: a CEO_APPROVED run blocked for recovery (B15) is not an ordinary finalization in flight.
+  const waitingOn = work.flatMap(r => r.state === 'BLOCKED_POST_MERGE' ? ((open: string[]) => open.length > 0 ? [{runId:r.run_id,state:r.state,open}] : [])(openPostMergeResponsibility(cp.db,r.run_id)) : ['CEO_APPROVED','FINALIZING','MERGING','POST_MERGE_VERIFYING'].includes(r.state) ? ((open: string[]) => [{runId:r.run_id,state:r.state,...(open.length > 0 ? {open} : {})}])(openPostMergeResponsibility(cp.db,r.run_id)) : []);
+  if (waitingOn.length > 0) {
+    unmark();
+    // A terminal BLOCKED_POST_MERGE run never settles; its held retirement reaches the CEO as its own incident.
+    const held = retirementWaitsForSettlement(cp,projectId,work.filter(r => waitingOn.some(w => w.runId === r.run_id)));
+    const ids = waitingOn.map(w => w.runId);
+    return deny(ReasonCode.CONFLICT,`retirement waits for confirmed external effects to settle; ${unchanged()}`,{...held.evidence,projectId,waitingOn,settling:ids,requiredOrder:[`let runs ${ids.join(', ')} finish finalizing`,rerun]});
+  }
   if (pending()) {
     if (!suspended) cp.projects.setSuspended(projectId,true,true);
   } else if (!intent) {
@@ -105,6 +115,8 @@ async function retire(cp:ControlPlane,projectId:string,suspended:boolean,reason:
   }
   const cancelledRuns:string[] = [];
   for (const run of work) {
+    // A settled terminal block is kept as it is, never cancelled.
+    if (run.state === 'BLOCKED_POST_MERGE') continue;
     const cancelled = cp.runs.cancel(run.run_id,`project retirement: ${reason}`);
     if (!cancelled.allowed) {unmark();return deny(cancelled.reasonCode,`${cancelled.message}; retirement stopped before the host step`,{...cancelled.evidence,projectId,cancelledRuns,requiredOrder:[rerun]});}
     cancelledRuns.push(run.run_id);

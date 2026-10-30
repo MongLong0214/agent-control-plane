@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { sha256 } from "../core/digest.ts";
 import type { Clock } from "../core/clock.ts";
-import { type Decision, acpError, allow, deny, isAcpError } from "../core/errors.ts";
+import { MCP_THROWN_REFUSAL_WRITER } from "../core/credential-shapes.ts";
+import { type AcpError, type Decision, acpError, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { credentialBearingField, prohibitedDurableField } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { runMcpReservedMutation } from "../ingress/ingress-guard.ts";
+import { registryView } from "../db/registry-view.ts";
+import { McpMutationNotExecuted, runMcpReservedMutation } from "../ingress/ingress-guard.ts";
 
 /** Shape the MCP SDK expects from a tool callback; the index signature is its contract. */
 export interface ToolResult {
@@ -109,9 +112,15 @@ export interface McpMutationRequest {
   /**
    * Domain receipt recovery. `reservationVerified` is true only after current authority and
    * the stored reservation's request/principal fingerprint pass. Before reservation, a
-   * domain receipt must independently prove the key and request it recovers.
+   * domain receipt must independently prove the key and request it recovers. On the replay of a
+   * stored result, `storedResult` is that result.
    */
-  durableReplay?: (fingerprint: string, reservationVerified: boolean) => ToolResult | null;
+  durableReplay?: (fingerprint: string, reservationVerified: boolean, storedResult?: ToolResult) => ToolResult | null;
+  /**
+   * Opt-in: on the replay of a stored result, a non-error `durableReplay` answer replaces it too,
+   * not only a refusal. For a stored answer that names a state the domain can still leave.
+   */
+  durableReplaySupersedesStored?: boolean;
   /** Extra domain validation for settled handoff ACKs; never the mutation handler. */
   replayAuthority?: () => Decision<unknown>;
 }
@@ -175,8 +184,26 @@ export const createMcpMutationPort = (source: McpMutationSource): McpMutationPor
   });
 
 /**
+ * A refusal a handler threw, answered as the denial it is (the shape `guarded` gives it) so that it is
+ * stored as the call's outcome. Its message and evidence are kept only when they hold no credential
+ * shape and no private bulk content, in a key or a value, and nest no deeper than the scans read
+ * (#1279 G4); otherwise the reason code alone is. #1279 G3-1 — both are free
+ * text: a digest or 64-hex id in them, whole or inside text, is kept only when it names a record the
+ * store holds (`RegistryView.boundReference`) for the run the call names, never for its format alone.
+ */
+const thrownRefusal = (error: AcpError, db: Db, runId: string | null): ToolResult => {
+  const full = { reasonCode: error.reasonCode, message: error.message, evidence: error.evidence };
+  const site = { writer: MCP_THROWN_REFUSAL_WRITER, runId, registry: registryView(db) };
+  return credentialBearingField(full, 0, [], site) === null && prohibitedDurableField(full) === null
+    ? respond(deny(error.reasonCode, error.message, error.evidence))
+    : respond(deny(error.reasonCode, "the refusal's message or evidence is not kept: it held credential-shaped or private content", {}));
+};
+
+/**
  * Reserves a mutation key before executing it. A completed retry returns exactly the
  * durable first response only for the same request/principal under current authority.
+ * A refusal the handler throws (an ACP reason code) is a completed response like a returned one,
+ * stored and replayed, so a refused call's key answers that refusal rather than an unknown outcome.
  * Only a certified pre-effect failure releases its reservation. An abandoned reservation
  * has an unknown outcome and is never re-executed, regardless of elapsed time.
  */
@@ -212,7 +239,17 @@ export const idempotentMcpMutation = async (
   // The receipt is the proof; do not mint a new fingerprint over recovered history.
   if (recovered) return recovered;
   const reservation = await runMcpReservedMutation(
-    source.db, peer.actor, idempotencyKey, source.clock.nowIso(), () => execute(fingerprint),
+    source.db, peer.actor, idempotencyKey, source.clock.nowIso(), async () => {
+      try {
+        return await execute(fingerprint);
+      } catch (error) {
+        // A certified pre-effect failure still releases the key; any other throw leaves the outcome unknown.
+        if (isAcpError(error) && !(error instanceof McpMutationNotExecuted)) {
+          return thrownRefusal(error, source.db, typeof args["runId"] === "string" ? args["runId"] : null);
+        }
+        throw error;
+      }
+    },
     pendingJson, result => {
       const stored = source.db.run(
         `UPDATE inbound_messages SET result_json = ? WHERE channel = 'mcp' AND nonce = ? AND actor = ?
@@ -257,8 +294,8 @@ export const idempotentMcpMutation = async (
     }
     const replayAuthority = request.replayAuthority?.();
     if (replayAuthority && !replayAuthority.allowed) return respond(replayAuthority);
-    const durable = request.durableReplay?.(fingerprint, true);
-    if (durable?.isError) return durable;
+    const durable = request.durableReplay?.(fingerprint, true, stored.result);
+    if (durable && (durable.isError || request.durableReplaySupersedesStored === true)) return durable;
     return stored.result;
   }
   return reservation.result;

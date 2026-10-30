@@ -2,7 +2,9 @@ import type { Clock } from "../core/clock.ts";
 import { canonicalJson, digestOf, isDigest } from "../core/digest.ts";
 import { allow, deny, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { AuditLog, credentialBearingField, prohibitedDurableField } from "../db/audit.ts";
+import {
+  AuditLog, credentialBearingField, MAX_CREDENTIAL_SCAN_DEPTH, prohibitedDurableField, UNEXAMINABLE_DEPTH,
+} from "../db/audit.ts";
 import {
   ArtifactStore,
   artifactDigestMatches,
@@ -226,7 +228,9 @@ const NON_EXPORTABLE_ARTIFACT_CONTENT: ReadonlySet<string> = new Set([
 ]);
 
 const sourceBearingField = (value: unknown, depth = 0): string | null => {
-  if (depth > 12 || value == null) return null;
+  if (value == null) return null;
+  // #1279 G4-2 — the bound every durable-content scan shares; an object past it is not clean.
+  if (depth > MAX_CREDENTIAL_SCAN_DEPTH && typeof value === "object") return UNEXAMINABLE_DEPTH;
   if (Array.isArray(value)) {
     for (const item of value) {
       const found = sourceBearingField(item, depth + 1);
@@ -249,7 +253,9 @@ const sourceBearingField = (value: unknown, depth = 0): string | null => {
 };
 
 const privateCollectionField = (value: unknown, depth = 0): string | null => {
-  if (depth > 12 || value == null) return null;
+  if (value == null) return null;
+  // #1279 G4-2 — the bound every durable-content scan shares; an object past it is not clean.
+  if (depth > MAX_CREDENTIAL_SCAN_DEPTH && typeof value === "object") return UNEXAMINABLE_DEPTH;
   if (Array.isArray(value)) {
     for (const item of value) {
       const found = privateCollectionField(item, depth + 1);

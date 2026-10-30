@@ -1,3 +1,5 @@
+import { join } from "node:path";
+
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { currentBootstrapPlan } from "../../src/bootstrap/bootstrap-plan.ts";
@@ -6,6 +8,7 @@ import type { RepairRequest } from "../../src/doctor/repair.ts";
 import { deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { RunKind, RunState } from "../../src/domain/types.ts";
+import { type GuardOperation, ReadOperation, WriteOperation } from "../../src/guard/managed-write-guard.ts";
 import { bootstrapPlan, cleanTreeManifest, reviewBootstrapPlan, submitBootstrapPlan } from "../helpers/bootstrap-plan.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { bindWorkerForTask, dispatchBootstrapRun, makeHarness } from "../helpers/harness.ts";
@@ -38,14 +41,30 @@ const snapshot = (f: Fixture) => ({
 });
 
 describe("atomic run cancel", () => {
-  it("refuses CEO-review bootstrap cancellation without changing any state or audit", async () => {
+  // #1189 B14 — a CEO-review bootstrap may be cancelled now, but not once what its application wrote has
+  // landed; that refusal, like every refusal, changes no state and records nothing.
+  it("refuses a CEO-review bootstrap cancel whose application is WRITTEN without changing any state or audit", async () => {
     const f = await fixture();
     try {
+      reserve(f);
+      expect(f.cp.bootstrapApplications.markWritten(f.runId)).toMatchObject({ allowed: true });
       const before = snapshot(f);
-      expect(f.cp.runs.cancel(f.runId, "operator cancel")).toMatchObject({ allowed: false, reasonCode: ReasonCode.RUN_TRANSITION_ILLEGAL });
+      expect(f.cp.runs.cancel(f.runId, "operator cancel")).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS, evidence: { classification: "APPLIED" },
+      });
       expect(snapshot(f)).toEqual(before);
       expect(f.cp.tasks.require(f.taskId).state).toBe("READY");
       expect(f.cp.audit.byKind("TASK_GRAPH_CANCELLED")).toEqual([]);
+      expect(f.cp.bootstrapApplications.get(f.runId)).toMatchObject({ phase: "WRITTEN" });
+    } finally { f.cp.close(); }
+  });
+
+  it("cancels a CEO-review bootstrap with no application: its graph and the run, in one transaction", async () => {
+    const f = await fixture();
+    try {
+      expect(f.cp.runs.cancel(f.runId, "operator cancel")).toMatchObject({ allowed: true, value: { state: RunState.CANCELLED } });
+      expect(f.cp.tasks.require(f.taskId).state).toBe("CANCELLED");
+      expect(f.cp.audit.byKind("TASK_GRAPH_CANCELLED")).toHaveLength(1);
     } finally { f.cp.close(); }
   });
 
@@ -92,8 +111,8 @@ const request = (f: Fixture, dryRun = false): RepairRequest => ({
   operationId: repairId, parameters: { runId: f.runId, taskId: f.taskId, cancelReasonSha256 }, authorizedBy: "HERMES", dryRun,
 });
 
-const damaged = async (auditChanges: number | null = 1, otherTask = false) => {
-  const f = await fixture(true, otherTask);
+/** The frozen application a bootstrap CONFIRM reserves, written through the application record's own API. */
+const reserve = (f: Fixture): void => {
   const plan = currentBootstrapPlan(f.runId, f.cp.artifacts.latest(f.runId, "PLAN"));
   if (!plan.allowed) throw new Error(plan.message);
   const candidate = f.cp.runs.currentCandidate(f.runId)!;
@@ -103,6 +122,11 @@ const damaged = async (auditChanges: number | null = 1, otherTask = false) => {
     manifestDigest: plan.value.binding.projectManifestDigest, plannedOutputsDigest: plan.value.binding.plannedOutputsDigest,
     candidateSnapshotDigest: candidate, reviewDigest: "sha256:review", approvalDigest: "sha256:scope",
   }, { writer: null })).toMatchObject({ allowed: true });
+};
+
+const damaged = async (auditChanges: number | null = 1, otherTask = false) => {
+  const f = await fixture(true, otherTask);
+  reserve(f);
   f.clock.advance(1000);
   // The pre-fix path: committed task cancellation followed by a refused run transition.
   if (auditChanges === 1) f.cp.tasks.cancelAll(f.runId, cancelReason);
@@ -110,7 +134,9 @@ const damaged = async (auditChanges: number | null = 1, otherTask = false) => {
     f.cp.db.run("UPDATE tasks SET state = 'CANCELLED', updated_at = ? WHERE task_id = ?", [f.clock.nowIso(), f.taskId]);
     if (auditChanges !== null) f.cp.audit.record({ kind: "TASK_GRAPH_CANCELLED", runId: f.runId, evidence: { reason: cancelReason, changes: auditChanges } });
   }
-  expect(f.cp.runs.transition(f.runId, RunState.CANCELLED, "operator cancel")).toMatchObject({ allowed: false });
+  // The pre-fix build then refused the run's transition (a CEO-review run had no CANCELLED edge), so the
+  // run stayed at CEO review with its task cancelled. #1189 B14 opened that edge; the damage it left stays.
+  expect(f.cp.runs.require(f.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
   return f;
 };
 
@@ -238,6 +264,61 @@ describe("restore_refused_cancel_bootstrap_task", () => {
       const before = unchangedRows(f);
       expect(await f.cp.repair.execute(request(f))).toMatchObject({ allowed: false, evidence: { refusal: "NO_LATER_TASK_CHANGE" } });
       expect(unchangedRows(f)).toEqual(before);
+    } finally { f.cp.close(); }
+  });
+
+  // #1213 — a later audit naming the task disqualifies the restore only when it changed something.
+  const guardEvaluation = (f: Fixture, operation: GuardOperation) => f.cp.guard.evaluate({
+    operation, targetPath: join(f.repoPath, "README.md"), runId: f.runId, taskId: f.taskId,
+  });
+  const laterEvents: Array<{ name: string; blocks: boolean; write: (f: Fixture) => void }> = [
+    { name: "an allowed FILE_READ", blocks: false, write: f => {
+      expect(guardEvaluation(f, ReadOperation.FILE_READ)).toMatchObject({ allowed: true });
+    } },
+    { name: "a refused FILE_MUTATION", blocks: false, write: f => {
+      expect(guardEvaluation(f, WriteOperation.FILE_MUTATION)).toMatchObject({ allowed: false });
+    } },
+    { name: "an ignored late result", blocks: false, write: f => {
+      f.cp.audit.record({ kind: "TASK_EXECUTION_LATE_RESULT_IGNORED", runId: f.runId, evidence: { taskId: f.taskId } });
+    } },
+    { name: "a task execution start", blocks: true, write: f => {
+      f.cp.audit.record({ kind: "TASK_EXECUTION_STARTED", runId: f.runId, evidence: { taskId: f.taskId } });
+    } },
+    { name: "an applied write grant", blocks: true, write: f => {
+      f.cp.audit.record({ kind: "MANAGED_WRITE_GUARD", runId: f.runId,
+        evidence: { operation: WriteOperation.FILE_MUTATION, taskId: f.taskId, allowed: true } });
+    } },
+    { name: "an unknown kind", blocks: true, write: f => {
+      f.cp.audit.record({ kind: "TASK_REOPENED_BY_A_NEW_WRITER", runId: f.runId, evidence: { taskId: f.taskId } });
+    } },
+    ...[
+      "SESSION_TURN_REFUSED", "INGRESS_REFUSED", "BRANCH_PUBLISH_REFUSED", "BOOTSTRAP_CTO_RECOVERY_REFUSED",
+      "PRIMARY_CTO_RECOVERY_REFUSED", "HERMES_CEO_AUTO_ADOPTION_REFUSED", "CEO_NOTIFICATION_BUZZ_REFUSED",
+      "NEW_TASK_WRITER_REFUSED",
+    ].map(kind => ({
+      name: `a ${kind === "NEW_TASK_WRITER_REFUSED" ? "refusal of a kind src does not record" : "recorded refusal"} ${kind}`,
+      blocks: kind === "NEW_TASK_WRITER_REFUSED", write: (f: Fixture) => {
+        f.cp.audit.record({ kind, runId: f.runId, reasonCode: ReasonCode.CONFLICT, evidence: { taskId: f.taskId } });
+      },
+    })),
+  ];
+  it.each(laterEvents)("a later audit naming the task, $name, blocks the restore: $blocks", async ({ blocks, write }) => {
+    const f = await damaged();
+    try {
+      f.clock.advance(1000);
+      write(f);
+      expect(f.cp.audit.forRun(f.runId).at(-1)!.evidence["taskId"]).toBe(f.taskId);
+      const before = unchangedRows(f);
+      for (const dryRun of [true, false]) {
+        const result = await f.cp.repair.execute(request(f, dryRun));
+        if (blocks) {
+          expect(result, JSON.stringify(result)).toMatchObject({ allowed: false, evidence: { refusal: "NO_LATER_TASK_CHANGE" } });
+          expect(unchangedRows(f)).toEqual(before);
+        } else {
+          expect(result, JSON.stringify(result)).toMatchObject({ allowed: true, value: { dryRun, changes: 1 } });
+        }
+      }
+      expect(f.cp.tasks.require(f.taskId).state).toBe(blocks ? "CANCELLED" : "READY");
     } finally { f.cp.close(); }
   });
 

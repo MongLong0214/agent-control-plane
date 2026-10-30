@@ -17,6 +17,20 @@ export interface AuditRecord {
 }
 
 /**
+ * #1213 — refusal kinds (`_REFUSED`, the repository's naming for a record of a refusal) that src records
+ * and whose record naming a task does not block the bootstrap task restore. Omission is safe: a refusal
+ * kind missing from this list blocks the restore, which fails closed, so the list never has to be complete.
+ * Add a kind only when a refusal that names a task should not block.
+ */
+export const RECORDED_REFUSAL_KINDS: ReadonlySet<string> = new Set([
+  "BOOTSTRAP_CTO_RECOVERY_REFUSED", "BRANCH_PUBLISH_REFUSED", "BUZZ_MENTION_REFUSED", "BUZZ_PEER_REFUSED",
+  "CANONICAL_CTO_RESTORE_REFUSED", "CANONICAL_SELF_CLAIM_REFUSED", "CEO_NOTIFICATION_BUZZ_REFUSED",
+  "DAEMON_START_REFUSED", "HERMES_CEO_AUTO_ADOPTION_REFUSED", "INGRESS_REFUSED", "MERGE_REFUSED",
+  "PRIMARY_CTO_RECOVERY_REFUSED", "REPAIR_REFUSED", "SESSION_BUZZ_ACTOR_BIND_REFUSED", "SESSION_TURN_REFUSED",
+  "TASK_WORKER_TURN_LATE_RESULT_REFUSED",
+]);
+
+/**
  * Append-only authority log. Deliberately not a hash chain and not the state SSOT
  * (PRD §30.4) — it records who decided what, with the evidence, so a denial can be
  * explained after the fact.
@@ -300,8 +314,18 @@ const NOT_A_CREDENTIAL: ReadonlySet<string> = new Set([
   "rolekey", "idempotencykey", "sortkey", "cachekey", "operationkey", "claimkey",
 ]);
 
-/** Depth beyond which content is refused rather than examined; see `credentialBearingField`. */
-const MAX_CREDENTIAL_SCAN_DEPTH = 24;
+/**
+ * Depth beyond which content is refused rather than examined, by every durable-content scan
+ * (`credentialBearingField`, `prohibitedDurableField`, and export/run-evidence.ts's): one bound,
+ * so no scan stops where another still reads, and none treats what it did not read as clean.
+ */
+export const MAX_CREDENTIAL_SCAN_DEPTH = 24;
+
+/** What a scan names for content it did not examine: a subtree deeper than `MAX_CREDENTIAL_SCAN_DEPTH`. */
+export const UNEXAMINABLE_DEPTH = "<unexaminable-depth>";
+
+/** What `credentialBearingField` names for a key that holds a credential shape, in place of the key. */
+const CREDENTIAL_SHAPED_KEY = "<credential-shaped-key>";
 
 /**
  * A credential inside content that is about to become *evidence*.
@@ -317,7 +341,7 @@ export const credentialBearingField = (
   value: unknown, depth = 0, path: readonly string[] = [], site?: WriteSite, holder?: unknown,
 ): string | null => {
   // Deeper than the scan goes is not "clean": an unexamined subtree must not become evidence.
-  if (depth > MAX_CREDENTIAL_SCAN_DEPTH) return "<unexaminable-depth>";
+  if (depth > MAX_CREDENTIAL_SCAN_DEPTH) return UNEXAMINABLE_DEPTH;
   if (typeof value === "string") {
     return hasCredentialShape(value, { path, store: "artifact", ...(site ? { site } : {}), holder }) ? "<value>" : null;
   }
@@ -330,6 +354,11 @@ export const credentialBearingField = (
   }
   if (value && typeof value === "object") {
     for (const [key, nested] of Object.entries(value)) {
+      // #1279 G4-1 — a key is stored text as much as a value is: read by the rules a value at its path
+      // gets, and named by a marker, never by itself, so the refusal does not repeat the credential.
+      if (hasCredentialShape(key, { path: [...path, key], store: "artifact", ...(site ? { site } : {}), holder: value })) {
+        return CREDENTIAL_SHAPED_KEY;
+      }
       const normalized = normalizedKey(key);
       if (
         !NOT_A_CREDENTIAL.has(normalized) &&
@@ -352,7 +381,9 @@ export const credentialBearingField = (
  * whose digest would otherwise purport to address the original private payload.
  */
 export const prohibitedDurableField = (value: unknown, depth = 0): string | null => {
-  if (depth > 8 || !value || typeof value !== "object") return null;
+  if (!value || typeof value !== "object") return null;
+  // #1279 G4-2 — an object deeper than the scan goes is not "clean": it may hold a transcript.
+  if (depth > MAX_CREDENTIAL_SCAN_DEPTH) return UNEXAMINABLE_DEPTH;
   if (Array.isArray(value)) {
     for (const item of value) {
       const found = prohibitedDurableField(item, depth + 1);

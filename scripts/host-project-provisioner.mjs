@@ -9,6 +9,7 @@ import Database from 'better-sqlite3';
 import { currentCanonicalCeoBuzzRoute, daemonBuzzSigner } from '../src/outbox/ceo-buzz-signer.ts';
 import { canonicalJson } from '../src/core/digest.ts';
 import { readProcessStartToken } from '../src/core/process-argv.ts';
+import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText, recordedResidentExitStatus } from '../src/runtime/host-provisioner-reason.ts';
 const home = process.env.HOME;
 const state = process.env.ACP_STATE_DIR;
 class ProvisionerRefusal extends Error {}
@@ -16,6 +17,8 @@ class ProvisionerRefusal extends Error {}
 class RetirementOrderRefusal extends ProvisionerRefusal {
   constructor(message, requiredOrder) {super(message);this.requiredOrder = requiredOrder;}
 }
+// The current launch's recorded claude exit, as opposed to claude failing in this operation's own calls.
+class RecordedExitRefusal extends ProvisionerRefusal {}
 class ProvisionerExecutionFailure extends Error {
   constructor(message, error) {super(message);this.stderr = error.stderr;}
 }
@@ -28,16 +31,16 @@ const resolvedBinary = bin => {
   const name = bin.toUpperCase();
   // Match the launcher's nonempty operator pin, then its install-time answer. Never search PATH.
   const value = process.env[`ACP_${name}_BINARY`] || process.env[`ACP_RESOLVED_${name}_BINARY`];
-  const why = reason => `${bin} in ${operation}: ${reason}`;
-  check(value, why('missing binary variable'));
-  check(isAbsolute(value), why('binary path is not absolute'));
+  const why = kind => formatHostProvisionerReason({binary:bin,operation,kind});
+  check(value, why(hostReasonKind.missingVariable));
+  check(isAbsolute(value), why(hostReasonKind.relativePath));
   let target;
   try {target = realpathSync(value);} catch (error) {
-    throw new ProvisionerRefusal(why(error.code === 'ENOENT' || error.code === 'ENOTDIR' ? 'binary is missing' : 'binary is not executable'));
+    throw new ProvisionerRefusal(why(error.code === 'ENOENT' || error.code === 'ENOTDIR' ? hostReasonKind.missing : hostReasonKind.notExecutable));
   }
-  try {check(statSync(target).isFile(), why('binary is not an executable regular file'));accessSync(target,constants.X_OK);} catch (error) {
+  try {check(statSync(target).isFile(), why(hostReasonKind.notRegularFile));accessSync(target,constants.X_OK);} catch (error) {
     if (error instanceof ProvisionerRefusal) throw error;
-    throw new ProvisionerRefusal(why('binary is not executable'));
+    throw new ProvisionerRefusal(why(hostReasonKind.notExecutable));
   }
   // Keep the stable install name: provider updaters may repoint it between operations.
   return value;
@@ -47,10 +50,11 @@ const run = (bin, args, opts = {}) => {
   const executable = pinned ? resolvedBinary(bin) : bin;
   try {return execFileSync(executable, args, { encoding:'utf8', timeout:30_000, maxBuffer:2_000_000, stdio:['pipe','pipe','pipe'], ...opts });} catch (error) {
     if (!pinned) throw error;
-    const reason = Number.isInteger(error.status) ? `non-zero exit with exit code ${error.status}` :
-      error.code === 'ENOENT' ? 'binary is missing (ENOENT)' : error.code === 'EACCES' ? 'binary is not executable' :
-      error.code === 'ETIMEDOUT' ? 'execution timed out' : 'execution failed';
-    throw new ProvisionerExecutionFailure(`${bin} in ${operation}: ${reason}`,error);
+    const exited = Number.isInteger(error.status);
+    const kind = exited ? hostReasonKind.nonZeroExit :
+      error.code === 'ENOENT' ? hostReasonKind.missingAtExecution : error.code === 'EACCES' ? hostReasonKind.notExecutable :
+      error.code === 'ETIMEDOUT' ? hostReasonKind.timedOut : hostReasonKind.failed;
+    throw new ProvisionerExecutionFailure(formatHostProvisionerReason({binary:bin,operation,kind,...(exited ? {exitCode:error.status} : {})}),error);
   }
 };
 const json = (bin, args, opts) => JSON.parse(run(bin,args,opts));
@@ -446,6 +450,30 @@ try {
     refuseWithOrder(`Buzz room ${a.roomId} is owned by ${owners.length ? owners.join(', ') : 'no member visible to this identity'}, and ${a.identityName} (${pk}) is ${members.find(m => m.pubkey === pk)?.role ?? 'not a member'}`,
       `have an owner archive room ${a.roomId} (buzz channels archive --channel ${a.roomId}), or make ${pk} an owner of it`);
   };
+  // Each launch gets a fresh id: the marker names the launch tmux was last started with, and that launch's
+  // launcher records claude's exit status under the same id.
+  const launchMarker = join(state,`launched-${a.projectId}`);
+  const exitRecord = join(state,`resident-${a.projectId}.exit.json`);
+  const recordedLaunchExit = (reasonOperation = operation) => {
+    try {
+      const marker = read(launchMarker); const record = read(exitRecord);
+      if (marker.sessionUuid !== a.sessionUuid || typeof marker.launch !== 'string' || record.launch !== marker.launch) return null;
+      const reason = hostProvisionerReason('claude',reasonOperation,record.exitCode === 0 ? hostReasonKind.exited : hostReasonKind.nonZeroExit,record.exitCode);
+      if (!reason) return null;
+      return {marker,reason};
+    } catch {return null;}
+  };
+  // A resident that cannot be observed is explained by claude's recorded exit only when the record names the
+  // current launch and that launch was this allocation's session; a record left by an earlier launch or by
+  // another session of the project says nothing about this one. A record is never taken for a running
+  // resident: only observeResident reports one.
+  const observeLaunch = () => {
+    try {return observeResident();} catch (error) {
+      const recorded = recordedLaunchExit();
+      if (!recorded) throw error;
+      throw new RecordedExitRefusal(formatHostProvisionerReason(recorded.reason));
+    }
+  };
   let result = {};
   switch(req.operation) {
     case 'ensure-checkout': {
@@ -548,6 +576,12 @@ try {
     case 'ensure-routing': {
       result = {routing:ensureRouting(a.roomId)}; break;
     }
+    case 'acknowledge-resident-exit': {
+      const recorded = recordedLaunchExit('ensure-resident');
+      check(recorded && canonicalJson(req.packet?.residentExitReason) === canonicalJson(recorded.reason),'resident exit acknowledgment mismatch');
+      if (recorded.marker.exitReported !== true) atomic(launchMarker,JSON.stringify({...recorded.marker,exitReported:true}));
+      result = {}; break;
+    }
     case 'ensure-resident': {
       // Also the fleet watcher's recovery path after a CTO dies: it relaunches over unfinished work.
       const observedCheckout = checkout(checkoutRequirement);
@@ -578,25 +612,44 @@ try {
       if (!existing) atomic(fleetFile,[...lines,line].join('\n')+'\n');
       let alive = false; try { observeResident(); alive = true; } catch { /* A tmux shell alone is never health. */ }
       if (!alive) {
-        const marker = join(state,`launched-${a.projectId}`);
+        // Keep surfacing a completed launch's exact exit until its caller acknowledges that the reason is
+        // durable on its side: the daemon after its ledger commit, the fleet watcher (the only recovery for
+        // a completed row) after its log line. The record and marker remain untouched while a response may be lost.
+        const priorExit = recordedLaunchExit();
+        if (priorExit && priorExit.marker.exitReported !== true) {
+          throw new RecordedExitRefusal(formatHostProvisionerReason(priorExit.reason));
+        }
+        const launch = randomUUID();
         const launcher = join(state,`resident-${a.projectId}.sh`);
         const quote = v => `'${String(v).replaceAll("'", "'\\''")}'`;
         const args = [resolvedBinary('claude'),'--model','opus',(existsSync(sessionFile) || existsSync(join(home,'.claude','projects',a.clonePath.replaceAll('/','-'),`${a.sessionUuid}.jsonl`))) ? '--resume' : '--session-id',a.sessionUuid,'--name',`${a.projectId} CTO`,'--remote-control',`${a.projectId} CTO`,'--messaging-socket-path',a.socketPath,'--permission-mode','bypassPermissions','--dangerously-skip-permissions',`You are ${a.projectId} CTO. Connect to acp-cto, read role_dispatch_pending, and acknowledge the bootstrap handoff with handoff_ack. The handoff contains the approved genesis bytes and product intent.`];
-        atomic(launcher,`#!/bin/sh\nunset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\nexport ACP_STATE_DIR=${quote(state)}\nBUZZ_PRIVATE_KEY=$(cat ${quote(a.privateKeyFile)}) || exit 1\nexport BUZZ_PRIVATE_KEY\ncd ${quote(a.clonePath)} || exit 1\nexport PATH="$PATH":${quote(join(home,'.local','bin'))}\nexec ${args.map(quote).join(' ')}\n`,0o700);
+        atomic(launcher,`#!/bin/sh\nunset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\nexport ACP_STATE_DIR=${quote(state)}\nBUZZ_PRIVATE_KEY=$(cat ${quote(a.privateKeyFile)}) || exit 1\nexport BUZZ_PRIVATE_KEY\ncd ${quote(a.clonePath)} || exit 1\nexport PATH="$PATH":${quote(join(home,'.local','bin'))}\n${args.map(quote).join(' ')}\n`+
+          // Claude's exit status alone, bound to this launch and renamed into place whole; never its output or environment.
+          `status=$?\numask 077\nrecord=$(mktemp ${quote(`${exitRecord}.XXXXXX`)}) && printf '{"launch":"%s","exitCode":%d}\\n' ${quote(launch)} "$status" > "$record" && mv -f "$record" ${quote(exitRecord)}\nexit "$status"\n`,0o700);
         // Refuse a duplicate Claude even when RC is still registering. Never kill an unverified pane.
         const ps = run('ps',['-axo','command=']); check(!ps.split('\n').some(l => namesSession(l)),'resident awaits RC');
         let hasPane = false;try {run('tmux',['has-session','-t',a.tmuxName]);hasPane = true;} catch(e) {if (!e.status) throw e;}
         if (hasPane) {
-          const pane = run('tmux',['display-message','-p','-t',a.tmuxName,'#{pane_current_path}\t#{pane_start_command}']).trim();
-          check(pane === `${a.clonePath}\t${launcher}`,'unverified tmux pane cannot be replaced');
+          // One free-text field per read: for a client without a UTF-8 locale tmux prints a tab separator as '_'.
+          // A dead pane (remain-on-exit) has no current path to report; its start command still names the launcher.
+          const pane = format => run('tmux',['display-message','-p','-t',a.tmuxName,format]).replace(/\n$/,'');
+          const [dead,windows,panes] = pane('#{pane_dead} #{session_windows} #{window_panes}').split(' ');
+          check(windows === '1' && panes === '1' && pane('#{pane_start_command}') === launcher && (dead === '1' || pane('#{pane_current_path}') === a.clonePath),'unverified tmux pane cannot be replaced');
+          // A live launcher writes the exit record before its tmux command ends. Replacing its marker
+          // while it is still settling creates a check/rotate race that can orphan that record.
+          check(dead === '1','resident launcher is still settling');
+          // A dead pane is a launcher that has ended: its record is final and removing the pane stops nothing.
           run('tmux',['kill-session','-t',a.tmuxName]);
         }
-        atomic(marker,a.sessionUuid); run('tmux',['new-session','-d','-s',a.tmuxName,launcher]);
+        const completedExit = recordedLaunchExit();
+        if (completedExit && completedExit.marker.exitReported !== true)
+          throw new RecordedExitRefusal(formatHostProvisionerReason(completedExit.reason));
+        atomic(launchMarker,JSON.stringify({sessionUuid:a.sessionUuid,launch})); run('tmux',['new-session','-d','-s',a.tmuxName,launcher]);
       }
-      result = {fleet:true,checkout:observedCheckout,resident:observeResident()}; break;
+      result = {fleet:true,checkout:observedCheckout,resident:observeLaunch()}; break;
     }
     // Activation's readback: the bootstrap requirement holds until the CTO has been observed on the clone.
-    case 'observe': result = {checkout:checkout(checkoutRequirement),resident:observeResident()}; break;
+    case 'observe': result = {checkout:checkout(checkoutRequirement),resident:observeLaunch()}; break;
     case 'verify-retire': retirementPreflight(); result = {retirementVerified:true}; break;
     case 'retire': {
       const {resident,archive,room,unbound} = retirementPreflight();
@@ -642,7 +695,7 @@ try {
     }
     process.stderr.write(JSON.stringify({ceoBuzzSignerFailure:failure}));
   } else {
-    process.stderr.write(`host project provisioner refused operation${error instanceof ProvisionerRefusal || error instanceof ProvisionerExecutionFailure ? ': '+error.message : ''}\n`);
+    process.stderr.write(hostRefusalText(error instanceof ProvisionerRefusal || error instanceof ProvisionerExecutionFailure ? error.message : undefined));
     // The one structured line the daemon reads back for a retirement: whether the host changed anything before it
     // stopped, the provisioner's own reason and the order that lets retirement complete.
     if (operation === 'retire' || operation === 'verify-retire') process.stderr.write(JSON.stringify({retirementOutcome:{
@@ -651,6 +704,6 @@ try {
       requiredOrder:error instanceof RetirementOrderRefusal ? error.requiredOrder : [rerun],
     }})+'\n');
   }
-  process.exitCode = 1;
+  process.exitCode = error instanceof RecordedExitRefusal ? recordedResidentExitStatus : 1;
 }
 finally {if (locked && readlinkSync(lock) === ownLock) rmSync(lock,{force:true});if (ownLock) rmSync(ownLock,{recursive:true,force:true});}

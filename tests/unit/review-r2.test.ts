@@ -182,23 +182,27 @@ it("re-reviews the same candidate after an accepted 55,000-character MINOR findi
   }
 });
 
-it("stores a finding's credential-shaped text redacted and marked, keeping its other text, path and the verdict", async () => {
+it("#1254 G-4: a finding's credential-shaped text refuses the review at storage; the refusal is recorded without it", async () => {
   const setup = await prepareReviewedInputs();
   try {
     const run = "Ab9+/Zq7".repeat(10);
     const digest = `sha256:${"0123456789abcdef".repeat(4)}`;
+    const token = `ghp_${"A1b2C3d4".repeat(5)}`;
     const finding = { category: "correctness", severity: "MINOR", repository: setup.identity, path: "src/app.js",
-      summary: "nonblocking observation", detail: `the log printed ghp_${"A1b2C3d4".repeat(5)} next to ${run}; see ${digest}` };
+      summary: "nonblocking observation", detail: `the log printed ${token} next to ${run}; see ${digest}` };
     const plain = { ...finding, summary: "second observation", detail: "nothing secret here" };
     const reviewed = await directReview(setup, JSON.stringify({ verdict: "PASS",
       coveredFiles: [`${setup.identity}:src/app.js`], omittedItems: [], findings: [finding, plain] }));
-    expect(reviewed, JSON.stringify(reviewed)).toMatchObject({ allowed: true, value: { verdict: "PASS" } });
-    const stored = setup.harness.cp.artifacts.list<ReviewPacket>(setup.run.runId, "BLIND_REVIEW")[0]!.content.findings;
-    // Free text gets every shape, an embedded digest included; the unredacted finding is stored as returned.
-    expect(stored).toEqual([
-      { ...finding, detail: "the log printed [redacted] next to [redacted]; see sha256:[redacted]", redacted: true },
-      plain,
-    ]);
+    // Checked as the reviewer wrote it, before anything is stored: no review is stored, rewritten or kept raw.
+    expect(reviewed, JSON.stringify(reviewed)).toMatchObject({ allowed: false, reasonCode: ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED });
+    expect(setup.harness.cp.artifacts.list<ReviewPacket>(setup.run.runId, "BLIND_REVIEW")).toEqual([]);
+    const audit = setup.harness.cp.audit.forRun(setup.run.runId);
+    const refusal = audit.filter((row) => row.kind === "BLIND_REVIEW_STORAGE_REFUSED");
+    expect(refusal).toHaveLength(1);
+    expect(refusal[0]!.evidence).toMatchObject({ candidateSnapshotDigest: candidateSnapshotDigest(setup.snapshot), kind: "BLIND_REVIEW", field: "detail", verdict: "PASS", findings: 2 });
+    expect(audit.filter((row) => row.kind === "BLIND_REVIEW_COMPLETED")).toEqual([]);
+    expect(JSON.stringify(audit)).not.toContain(token);
+    expect(JSON.stringify(audit)).not.toContain(run);
   } finally {
     setup.harness.cp.close();
   }
@@ -670,6 +674,38 @@ describe("round-2 blind-review regressions", () => {
     });
     expect(result.allowed).toBe(false);
     expect(result.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    expect(setup.harness.cp.review.latestPacket(setup.run.runId, candidateSnapshotDigest(setup.snapshot))).toBeNull();
+  });
+
+  /** #1258 — one more execution of the fixture's one input, beside the PASS the fixture wrote. */
+  const recordExecution = (setup: Awaited<ReturnType<typeof prepareReviewedInputs>>, attempt: number, status: "PASS" | "FAIL") => {
+    const digest = candidateSnapshotDigest(setup.snapshot);
+    const result = setup.verification.results[0]!;
+    setup.harness.cp.db.run(
+      `INSERT INTO verification_results
+         (result_id, run_id, candidate_snapshot_digest, command_id, repository_identity, source, attempt,
+          exact_head, started_at, ended_at, exit_code, output_digest, output_truncated, status, reason_code)
+       VALUES (?, ?, ?, ?, ?, 'local', ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+      [`${digest}:${result.commandId}:${result.repositoryIdentity}:local:${attempt}`, setup.run.runId, digest, result.commandId,
+        result.repositoryIdentity, attempt, result.exactHead, result.startedAt, result.endedAt, status === "PASS" ? 0 : 1,
+        `sha256:execution-${attempt}`, status, status === "PASS" ? null : ReasonCode.VERIFICATION_COMMAND_FAILED],
+    );
+  };
+
+  it("#1258 admits review when an earlier execution of the input failed and its latest passed", async () => {
+    const setup = await prepareReviewedInputs();
+    // The fixture's PASS becomes the input's second execution, after a FAIL on the same candidate.
+    setup.harness.cp.db.run(`UPDATE verification_results SET attempt = 2 WHERE run_id = ?`, [setup.run.runId]);
+    recordExecution(setup, 1, "FAIL");
+    const reviewed = await directReview(setup);
+    expect(reviewed, JSON.stringify(reviewed)).toMatchObject({ allowed: true, value: { verdict: "PASS" } });
+  });
+
+  it("#1258 refuses review when the input's latest execution failed after an earlier PASS", async () => {
+    const setup = await prepareReviewedInputs();
+    recordExecution(setup, 2, "FAIL");
+    const reviewed = await directReview(setup);
+    expect(reviewed).toMatchObject({ allowed: false, reasonCode: ReasonCode.EVIDENCE_MISSING });
     expect(setup.harness.cp.review.latestPacket(setup.run.runId, candidateSnapshotDigest(setup.snapshot))).toBeNull();
   });
 

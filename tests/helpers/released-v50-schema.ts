@@ -21,8 +21,41 @@ export const takeBackV50 = (raw: Database.Database): void => {
   }
 };
 
+/** The only definitions v55 replaces, named independently of the migration. */
+export const V55_CHANGED_GUARDS = ["runs_state_transition_guard", "runs_state_transition_authority_guard"];
+
+/** A fixture built from a current database that claims to predate v55 holds v54's state guards. */
+export const takeBackV55 = (raw: Database.Database): void => {
+  const snapshot = readFileSync(new URL("../../src/db/schema-v54.sql", import.meta.url), "utf8");
+  for (const name of V55_CHANGED_GUARDS) {
+    const ddl = new RegExp(`CREATE TRIGGER IF NOT EXISTS ${name}\\n[\\s\\S]*?\\nEND;`).exec(snapshot)?.[0];
+    if (!ddl) throw new Error(`${name} is absent from the v54 snapshot`);
+    raw.exec(`DROP TRIGGER IF EXISTS ${name}`);
+    raw.exec(ddl);
+  }
+};
+
+/** The definitions v54 replaces, and the one it adds, named independently of the migration. */
+export const V54_CHANGED_GUARDS = ["runs_state_transition_guard", "runs_state_transition_authority_guard"];
+export const V54_ADDED_TRIGGERS = ["runs_cancel_after_approval_requires_no_grant"];
+
+/** A fixture built from a current database that claims to predate v54 holds v53's state guards and not v54's guard. */
+export const takeBackV54 = (raw: Database.Database): void => {
+  const snapshot = readFileSync(new URL("../../src/db/schema-v53.sql", import.meta.url), "utf8");
+  for (const name of V54_ADDED_TRIGGERS) raw.exec(`DROP TRIGGER IF EXISTS ${name}`);
+  for (const name of V54_CHANGED_GUARDS) {
+    const ddl = new RegExp(`CREATE TRIGGER IF NOT EXISTS ${name}\\n[\\s\\S]*?\\nEND;`).exec(snapshot)?.[0];
+    if (!ddl) throw new Error(`${name} is absent from the v53 snapshot`);
+    raw.exec(`DROP TRIGGER IF EXISTS ${name}`);
+    raw.exec(ddl);
+  }
+};
+
 /** Historical fixtures must remove v52's additive objects and restore the three parent definitions v51 left. */
 export const takeBackV52 = (raw: Database.Database): void => {
+  takeBackV55(raw);
+  takeBackV54(raw);
+  takeBackV53(raw);
   if (!(raw.prepare('PRAGMA table_info(projects)').all() as {name:string}[]).some(c => c.name === 'retired_at')) return;
   const snapshot = readFileSync(new URL('../../src/db/schema-v51.sql',import.meta.url),'utf8');
   raw.pragma('foreign_keys = OFF');raw.pragma('legacy_alter_table = ON');
@@ -45,3 +78,16 @@ export const takeBackV52 = (raw: Database.Database): void => {
 };
 
 export const V52_ADDED_TRIGGERS = ["resident_project_provisioning", "canonical_session_entitlements", "project_retirements"].flatMap(table => ["identity_immutable", "no_replace", "no_delete"].map(suffix => `${table}_${suffix}`));
+
+/** #1258 — historical fixtures restore v52's verification_results: v53's attempt column and wider key go, every row and rowid stays. */
+export const takeBackV53 = (raw: Database.Database): void => {
+  if (!(raw.prepare("PRAGMA table_info(verification_results)").all() as { name: string }[]).some((c) => c.name === "attempt")) return;
+  const snapshot = readFileSync(new URL("../../src/db/schema-v52.sql", import.meta.url), "utf8");
+  const ddl = /CREATE TABLE IF NOT EXISTS verification_results \([\s\S]*?\n\);/.exec(snapshot)?.[0];
+  if (!ddl) throw new Error("v52 verification_results missing");
+  raw.exec("ALTER TABLE verification_results RENAME TO verification_results_v53_fixture");
+  raw.exec(ddl);
+  const list = (raw.prepare("PRAGMA table_info(verification_results)").all() as { name: string }[]).map((c) => `"${c.name}"`).join(",");
+  raw.exec(`INSERT INTO verification_results (rowid, ${list}) SELECT rowid, ${list} FROM verification_results_v53_fixture;
+    DROP TABLE verification_results_v53_fixture`);
+};

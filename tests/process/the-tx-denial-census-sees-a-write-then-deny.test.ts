@@ -105,6 +105,11 @@ const DOOR_R1_TEST = "tests/unit/ceo-escalation-resolve-door-r1.test.ts";
 
 const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string; witnesses?: RollbackWitness[] }> = [
   {
+    label: "deliverIncident",
+    file: "ceo/ceo-incident-notices.ts",
+    anchor: "export const deliverIncident = (ports: NoticePorts, incident: Incident): Decision<NoticeDelivery> =>\n  ports.db.txDecision(() => {",
+  },
+  {
     label: "acknowledgeCeoNotification",
     file: "outbox/ceo-notification-ack.ts",
     anchor: "): Decision<AckResult> => source.db.txDecision(() => {",
@@ -217,6 +222,17 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string; witn
     label: "RunEngine.invalidateCandidate",
     file: "run/run-engine.ts",
     anchor: "  ): Decision<RunRow> {\n    return this.db.txDecision(() => {\n      const run = this.require(runId);",
+  },
+  {
+    // #1189 B5 — a refused REVISION_REQUIRED edge takes back the CEO_APPROVAL_INVALIDATED record and the
+    // candidate's invalidation written before it.
+    label: "RunEngine.returnApprovedCandidate",
+    file: "run/run-engine.ts",
+    anchor: "  returnApprovedCandidate(runId: string, input: ApprovedCandidateReturn): Decision<RunRow> {\n    return this.db.txDecision(() => {",
+    witnesses: [{
+      file: "tests/scenarios/approved-run-merge-failures.test.ts",
+      title: "a refusal after the approval's invalidation was recorded rolls the whole return back: the run stays approved with its candidate current",
+    }],
   },
   {
     // #246 C1 — dispatch binds a staffed BOOTSTRAP_CTO in this transaction before it can refuse;

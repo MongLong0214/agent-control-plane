@@ -32,7 +32,7 @@ export const RECEIPT_BYTES_SHA256 =
   "aa90c6af77754fce9861cb4f57501879c24f66f5616cf46225c5375adfd2a19d";
 
 /**
- * `src/db/migrations.ts`, its historical schema snapshots (v37, v44, v45, v46, v47, v48, v49, v50 and v51), and
+ * `src/db/migrations.ts`, its historical schema snapshots (v37, v44, v45, v46, v47, v48, v49, v50, v51 and v52), and
  * `tests/fixtures/schema-v25-lineage.sql` are append-only, frozen inputs: pinning their exact
  * bytes here means a coordinated edit changes the value a reader compares against, not merely
  * the file being read. These digests are not recomputed from the files they describe: a pin a run
@@ -55,11 +55,23 @@ export const RECEIPT_BYTES_SHA256 =
  *
  * `src/db/schema-v51.sql` is likewise `git show 3915f78c:src/db/schema.sql` (v51's final review head, frozen as
  * v52's prerequisite), and carries that file's git blob id.
+ *
+ * `src/db/schema-v52.sql` is likewise `git show 372c6669:src/db/schema.sql` (v52's squash merge, unchanged through
+ * 5d45ae8b, frozen as v53's prerequisite for #1258), and carries that file's git blob id.
+ *
+ * `src/db/schema-v53.sql` is likewise `git show 24d49f94:src/db/schema.sql` (#1258's v53, frozen as the
+ * prerequisite of #1189's v54 run-state exits step), and carries that file's git blob id.
+ *
+ * `src/db/schema-v54.sql` is likewise `git show 0c15e2f3:src/db/schema.sql` (#1189's v54 run-state exits, frozen
+ * as the prerequisite of #1189 B5's v55 approved-run revision re-entry), and carries that file's git blob id.
  */
 export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob?: string }> = [
   {
     path: "src/db/migrations.ts",
-    sha256: "6f2b136bbe4b14e1e067b4f913d00b8647c2ff3332b96e2041ed3b670cc32c3d",
+    // v53 appends verification history and freezes v52's released schema; #1189's v54 run-state exits
+    // step freezes v53's, and #1189 B5's v55 (the two state guards) freezes v54's. Replayed lineage and
+    // compiled upgrades still bind the unchanged historical SQL, trace and receipt pins below.
+    sha256: "1a0985c2ad8f1953b799dc8d11ede590ae7bc72ece9dc8a692b133c2829c0e14",
   },
   {
     path: "src/db/schema-v37.sql",
@@ -102,6 +114,21 @@ export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob
     path: "src/db/schema-v51.sql",
     sha256: "f0d20b4a1bcd369a177e309eaae0659fb03485d32435c38cd68604a866e297cf",
     gitBlob: "dfb804d372e85e276b2735f0bb2367b3724d81ff",
+  },
+  {
+    path: "src/db/schema-v52.sql",
+    sha256: "f0d5f8ac7272a1d26a092f99e4dc75c97a24fe75cdf46f5707e4a54d294b5dc1",
+    gitBlob: "4d92c12346efdb6096955d66fd83933c3a3a9eb5",
+  },
+  {
+    path: "src/db/schema-v53.sql",
+    sha256: "404b748e9a33b4573f971be6b56ce22cd7fbd8899b909ad31a11613737f49cd5",
+    gitBlob: "9d37653bd7129313560f8c5259587a4d02844a06",
+  },
+  {
+    path: "src/db/schema-v54.sql",
+    sha256: "d239afdd0e884ea2d451a4bee3fb81757d02273b464b95822408ac7b59219814",
+    gitBlob: "a99a02be889d4d404b8d5a590a8eab3ed71ea383",
   },
   {
     path: "tests/fixtures/schema-v13.sql",

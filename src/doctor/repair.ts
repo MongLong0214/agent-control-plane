@@ -6,7 +6,7 @@ import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
-import { type AuditLog, type AuditRow, redact } from "../db/audit.ts";
+import { type AuditLog, type AuditRow, RECORDED_REFUSAL_KINDS, redact } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, type RunState } from "../domain/types.ts";
@@ -27,9 +27,11 @@ import {
   unresolvedUnidentifiedOrphans,
 } from "../run/worker-orphan-release.ts";
 import { WorkerTurnEvent } from "../run/worker-turn.ts";
+import { CONTINUITY_HOLD_NON_MOVEMENT_KINDS, isRecordedMovement } from "../run/run-engine.ts";
 import {
   type RepairWorktreeAuthority,
   type ManagedWriteGuard,
+  ReadOperation,
   WorktreeAction,
   WriteOperation,
 } from "../guard/managed-write-guard.ts";
@@ -46,6 +48,9 @@ export type RepairAuthorization = "HERMES" | "OWNER";
 // default. The run-state machine is the single authority for deciding which states
 // are terminal and can release a verification tree.
 const VERIFICATION_WORKTREE_OWNER_RELEASE_STATES = TERMINAL_RUN_STATES;
+
+/** The guard's read operations, which it decides DIRECT without a grant to hold or consume. */
+const READ_OPERATIONS: ReadonlySet<unknown> = new Set(Object.values(ReadOperation));
 
 /** The exact admitted ingress operation used for owner-authorised repair. */
 export const REPAIR_OWNER_APPROVAL_OPERATION = "repair_execute";
@@ -429,11 +434,23 @@ export class RepairService {
     const otherLiveTasks = tasks.filter(row => row.task_id !== taskId && row.state !== "CANCELLED");
     const namesTask = (value: unknown): boolean => value === taskId ||
       (value !== null && typeof value === "object" && Object.values(value).some(namesTask));
+    // #1213 — a later record naming the task disqualifies the restore only if it may have changed something.
+    // It did not when it is a refusal of a kind src records (`RECORDED_REFUSAL_KINDS`; none of their paths
+    // changes a task or an execution), when the continuity-hold classification records its kind only as a
+    // refusal, deferral or ignored input, or reads its outcome as not applied (a refused guard evaluation),
+    // or when it is a guard evaluation of a read. Every other kind, an unknown or later one included, counts
+    // as a change.
+    const mayHaveChanged = (event: AuditRow): boolean =>
+      !RECORDED_REFUSAL_KINDS.has(event.kind) &&
+      !CONTINUITY_HOLD_NON_MOVEMENT_KINDS.includes(event.kind) &&
+      !(event.kind === "MANAGED_WRITE_GUARD" && READ_OPERATIONS.has(event.evidence["operation"])) &&
+      isRecordedMovement({ kind: event.kind, reason_code: event.reasonCode, evidence_json: JSON.stringify(event.evidence) });
     // This repair's own reports name the task but are not subsequent task activity.
     // The one READY write is accepted only through alreadyRestored's receipt/timestamp check.
     const laterTaskEvents = events.filter(event => cancellation !== undefined && event.eventId > cancellation.eventId &&
       !(event.evidence["operationId"] === operation.id &&
-        ["REPAIR_DRY_RUN", "REPAIR_EXECUTED", "REPAIR_REFUSED"].includes(event.kind)) && namesTask(event.evidence));
+        ["REPAIR_DRY_RUN", "REPAIR_EXECUTED", "REPAIR_REFUSED"].includes(event.kind)) &&
+      namesTask(event.evidence) && mayHaveChanged(event));
     // Never copy event payloads (especially reason text) into repair reports or refusals.
     const eventEvidence = (event: AuditRow) => ({
       eventId: event.eventId, at: event.at, kind: event.kind, digest: digestOf(event.evidence),
@@ -696,13 +713,7 @@ export class RepairService {
           `SELECT task_id, status, worker_process_id, worker_session_id FROM task_executions WHERE execution_id = ?`,
           [executionId],
         );
-        const incarnation = execution
-          ? this.db.get<{ incarnation: string }>(`SELECT incarnation FROM sessions WHERE session_id = ?`, [execution.worker_session_id])?.incarnation
-          : undefined;
-        // Claude carries the session as `--session-id <id>`. A Codex worker carries the same id as
-        // the argv element after `--thread-source`. Either way it is one whole argument.
-        const workerSessionId = incarnation?.split("#", 1)[0] ?? "";
-        const scan = workerSessionId === "" ? { carriers: [], error: "the worker session's id is unknown" } : processesCarrying(workerSessionId);
+        const scan = liveWorkerSessionCarriers(this.db, execution?.worker_session_id ?? null);
         const confirmation = request.parameters["confirm"] ?? null;
         const evidence = {
           executionId,
@@ -895,6 +906,24 @@ const alive = (pid: number): boolean => {
   } catch {
     return false;
   }
+};
+
+/**
+ * #1096 — the release's machine precondition: the live processes whose command line carries the
+ * worker session's id. It observes and signals nothing. #1189 A2 — exported so the daemon can run
+ * the same check when it routes a held task to the CEO; the release itself stays owner-authorised.
+ */
+export const liveWorkerSessionCarriers = (
+  db: Db,
+  workerSessionId: string | null,
+): { carriers: number[]; error: string | null } => {
+  const incarnation = workerSessionId
+    ? db.get<{ incarnation: string }>(`SELECT incarnation FROM sessions WHERE session_id = ?`, [workerSessionId])?.incarnation
+    : undefined;
+  // Claude carries the session as `--session-id <id>`. A Codex worker carries the same id as
+  // the argv element after `--thread-source`. Either way it is one whole argument.
+  const token = incarnation?.split("#", 1)[0] ?? "";
+  return token === "" ? { carriers: [], error: "the worker session's id is unknown" } : processesCarrying(token);
 };
 
 /**

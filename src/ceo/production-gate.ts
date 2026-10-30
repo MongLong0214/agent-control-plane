@@ -1,6 +1,15 @@
 import { execFileSync } from "node:child_process";
 
+import {
+  IncidentClass,
+  type NoticePorts,
+  NotificationKind,
+  deferIncidentNotice,
+  deliverIncident,
+  enqueueAdHocNotice,
+} from "./ceo-incident-notices.ts";
 import { deriveHumanGate } from "./human-gate.ts";
+import { admitOwnerDecisionReason } from "./owner-decision-reason.ts";
 import {
   bootstrapPlanIntentTasks,
   bootstrapReviewIntentCurrent,
@@ -42,6 +51,7 @@ import type { CeoDecisionIngress, ManifestActivationGrants } from "../registry/m
 import { type HermesAdmittedTurn, hermesTurnEvidence } from "../mcp/hermes-provenance.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
+import { currentVerdictPasses, currentVerificationResults } from "../verify/verification-history.ts";
 import type { ContinuityGate } from "../run/run-engine.ts";
 import { residentBaseClone } from "../registry/resident-repositories.ts";
 import {
@@ -168,13 +178,8 @@ export interface SourceReadLeasePort {
   ): Decision<void>;
 }
 
-/** PRD §19.3 — the only three automatic Hermes notifications. */
-export const NotificationKind = {
-  READY_FOR_CEO_REVIEW: "READY_FOR_CEO_REVIEW",
-  TRUE_ESCALATION: "TRUE_ESCALATION",
-  CRITICAL_SYSTEM_FAILURE: "CRITICAL_SYSTEM_FAILURE",
-} as const;
-export type NotificationKind = (typeof NotificationKind)[keyof typeof NotificationKind];
+/** PRD §19.3 — the only three automatic Hermes notifications, owned with their delivery by `ceo-incident-notices.ts`. */
+export { NotificationKind };
 
 /**
  * The operation an owner-decision receipt must name. The ingress router mints receipts per
@@ -218,6 +223,13 @@ export interface CeoDecisionInput {
   ingress?: CeoDecisionIngress;
   /** The Hermes turn the CEO door admitted this call for, recorded in the decision's audit row. */
   hermesTurn?: HermesAdmittedTurn;
+  /**
+   * #1189 B1 — an OWNER_DECISION_REQUIRED names its owner-only reason (a key of `OWNER_ONLY_REASONS`)
+   * and the specific action that reason blocks; both are recorded with the decision. Ignored for the
+   * other decisions.
+   */
+  ownerReason?: string;
+  blockedAction?: string;
 }
 
 /** #246 B2-b — the grant authority a CONTRACT_CHANGE CONFIRM admits against and issues through. */
@@ -642,6 +654,10 @@ export class ProductionGate {
         : input.decision === "FINAL_REVISE"
           ? RunState.REVISION_REQUIRED
           : RunState.AWAITING_HUMAN;
+    // #1189 B1 — admitted above; what the owner is asked, and why, travels with the decision's records.
+    const ownerDecisionEvidence = input.decision === "OWNER_DECISION_REQUIRED"
+      ? { ownerReason: input.ownerReason?.trim() ?? null, blockedAction: input.blockedAction?.trim() ?? null }
+      : {};
 
     try {
       return this.db.tx(() => {
@@ -693,7 +709,7 @@ export class ProductionGate {
           input.runId,
           target,
           `CEO ${input.decision}`,
-          { candidateSnapshotDigest: input.candidateSnapshotDigest, rationale: input.rationale },
+          { candidateSnapshotDigest: input.candidateSnapshotDigest, rationale: input.rationale, ...ownerDecisionEvidence },
           isBootstrap && input.decision === "CONFIRM"
             ? this.completion.bootstrapActivation
             : undefined,
@@ -757,6 +773,7 @@ export class ProductionGate {
             decision: input.decision,
             candidateSnapshotDigest: input.candidateSnapshotDigest,
             rationale: input.rationale,
+            ...ownerDecisionEvidence,
             // Traceability only; the grant row is what activation reads, never this.
             ...(grantDigest === null ? {} : { manifestActivationGrantDigest: grantDigest }),
             ...(firstActivation ? { manifestActivation: "FIRST" } : {}),
@@ -950,6 +967,14 @@ export class ProductionGate {
     const independence = this.bindings.assertFinalCeoIndependence(input.runId, input.ceoSessionId);
     if (!independence.allowed) return independence as Decision<{ isBootstrap: boolean }>;
 
+    // #1189 B1 (CEO ruling 3) — with a human gate or without one, the owner is asked only for an
+    // owner-only reason and the action it blocks; a CEO-scope judgement is refused with the CEO's own
+    // path. A refusal changes nothing: the run stays at review for the CEO's next decision.
+    if (input.decision === "OWNER_DECISION_REQUIRED") {
+      const reason = admitOwnerDecisionReason(input.runId, input);
+      if (!reason.allowed) return reason as Decision<{ isBootstrap: boolean }>;
+    }
+
     // Issue #246 PR-C slice C3 — a bootstrap CONFIRM sets off the Repo Factory GitHub writes, and
     // only the runner's full path performs them: the pre-write checks, the reservation, an attempt
     // recorded before every external write, WRITTEN with the result, then activation. The decision
@@ -1075,34 +1100,34 @@ export class ProductionGate {
   }
 
   /**
-   * §17.6/§17.7 — the report must match the rows. Every required command needs a PASS row
-   * for this exact candidate, and no row for it may be anything other than PASS.
+   * §17.6/§17.7 — the report must match the rows. Every required command needs a current PASS
+   * row for this exact candidate, and no current row for it may be anything other than PASS.
+   * #1258: an input's current row is its latest execution (`currentVerificationResults`); its
+   * earlier executions stay in the history and decide nothing here.
    */
   private corroborateVerification(
     runId: string,
     candidateSnapshotDigest: string,
     report: VerificationReport,
   ): Decision<void> {
-    const rows = this.db.all<{
-      command_id: string;
-      repository_identity: string;
-      source: string;
-      exact_head: string;
-      status: string;
-      output_digest: string;
-    }>(
-      `SELECT command_id, repository_identity, source, exact_head, status, output_digest
-         FROM verification_results
-        WHERE run_id = ? AND candidate_snapshot_digest = ?`,
-      [runId, candidateSnapshotDigest],
-    );
+    const rows = currentVerificationResults(this.db, runId, candidateSnapshotDigest);
     if (rows.length === 0) {
       return deny(ReasonCode.EVIDENCE_MISSING, "no verification result rows for this candidate", {
         runId,
         candidateSnapshotDigest,
       });
     }
-    const failing = rows.filter((r) => r.status !== "PASS");
+    const failing = rows
+      .filter((r) => !currentVerdictPasses(r))
+      .map((r) => ({
+        command_id: r.command_id,
+        repository_identity: r.repository_identity,
+        source: r.source,
+        exact_head: r.exact_head,
+        status: r.status,
+        output_digest: r.output_digest,
+        attempt: r.attempt,
+      }));
     if (failing.length > 0) {
       return deny(ReasonCode.VERIFICATION_COMMAND_FAILED, "verification rows contradict the report", {
         runId,
@@ -1853,15 +1878,38 @@ export class ProductionGate {
       });
       const escalationId = recorded.allowed ? recorded.value : null;
 
-      const notified = this.notify(NotificationKind.TRUE_ESCALATION, escalation.runId, {
+      const notice = {
         ...(escalationId === null ? {} : { escalationId }),
         question: escalation.question,
         options: escalation.options,
         recommendation: escalation.ctoRecommendation,
         whyItMatters: escalation.whyItMatters,
         blocksCriticalPath: escalation.blocksCriticalPath,
-      });
-      if (!notified.allowed) return notified as Decision<{ state: RunState; escalationId: number | null }>;
+      };
+      if (!this.bindings.active(roleKeyFor(Role.CEO))) {
+        return deny(ReasonCode.GATE_AUTHORITY_DENIED, "no CEO binding can receive notification", {
+          runId: escalation.runId,
+          notification: NotificationKind.TRUE_ESCALATION,
+        });
+      }
+      if (escalationId === null) {
+        // No escalation record to deliver it from later: a notice the outbox refuses refuses the opening.
+        const notified = this.notify(NotificationKind.TRUE_ESCALATION, escalation.runId, notice);
+        if (!notified.allowed) return notified as Decision<{ state: RunState; escalationId: number | null }>;
+      } else {
+        // #1189 round 2, item 2 — a bound CEO whose session would not take the notice keeps the escalation
+        // open with its notice deferred; the daemon's next pass delivers it, once.
+        const incident = {
+          cls: IncidentClass.CTO_ESCALATION,
+          subject: escalation.runId,
+          runId: escalation.runId,
+          episode: String(escalationId),
+          openedEventId: escalationId,
+          payload: notice,
+        };
+        const delivered = deliverIncident(this.#notices, incident);
+        if (!delivered.allowed) deferIncidentNotice(this.#notices, incident, delivered);
+      }
 
       if (!escalation.blocksCriticalPath) return allow(ReasonCode.OK, { state: run.state, escalationId });
 
@@ -2074,45 +2122,20 @@ export class ProductionGate {
   }
 
   /**
-   * §19.3 — routine worker, test and review churn never reaches Hermes. Only the three
-   * documented notification kinds are emitted, and this is the only emitter.
+   * §19.3 — routine worker, test and review churn never reaches Hermes. Only the three documented
+   * notification kinds are emitted, and only through `ceo-incident-notices.ts`. A notification no incident
+   * states is keyed by its payload; a refused enqueue is returned, never dropped.
+   *
+   * `runId` is `null` for a `CRITICAL_SYSTEM_FAILURE` that belongs to no run, such as a Buzz mention
+   * subscription that stopped delivering (#1283). The CEO notification row, its delivery and its
+   * acknowledgement already carry a null run; only this signature did not.
    */
-  notify(kind: NotificationKind, runId: string, payload: Record<string, unknown>): Decision<void> {
-    // Audit evidence is intentionally a reviewed, bounded vocabulary. The delivery needs
-    // the full explanation, but persisting its unreviewed field name causes AuditLog to
-    // replace the whole evidence payload and makes the notification impossible to trace.
-    const { whyItMatters: _whyItMatters, ...auditPayload } = payload;
-    const auditEvidence = { notification: kind, ...auditPayload };
-    const ceo = this.bindings.active(roleKeyFor(Role.CEO));
-    if (!ceo) {
-      this.audit.record({
-        kind: "CEO_NOTIFICATION_BLOCKED",
-        runId,
-        reasonCode: ReasonCode.GATE_AUTHORITY_DENIED,
-        roleKey: "CEO",
-        evidence: auditEvidence,
-      });
-      return deny(ReasonCode.GATE_AUTHORITY_DENIED, "no CEO binding can receive notification", {
-        runId,
-        notification: kind,
-      });
-    }
-    this.audit.record({
-      kind: "CEO_NOTIFICATION",
-      runId,
-      roleKey: ceo.roleKey,
-      evidence: auditEvidence,
-    });
-    this.outbox.enqueue({
-      idempotencyKey: `notify:${kind}:${runId}:${digestOf(payload)}`,
-      roleKey: ceo.roleKey,
-      bindingGeneration: ceo.bindingGeneration,
-      targetSessionId: ceo.sessionId,
-      runId,
-      kind: MessageKind.CEO_NOTIFICATION,
-      payload: { notification: kind, runId, ...payload },
-    });
-    return allow(ReasonCode.OK, undefined);
+  notify(kind: NotificationKind, runId: string | null, payload: Record<string, unknown>): Decision<void> {
+    return enqueueAdHocNotice(this.#notices, kind, runId, payload);
+  }
+
+  get #notices(): NoticePorts {
+    return { db: this.db, audit: this.audit, outbox: this.outbox, bindings: this.bindings };
   }
 
   packet(runId: string, candidateSnapshotDigest: string): ProductionReadyPacket | null {

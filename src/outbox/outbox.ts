@@ -1,4 +1,5 @@
 import { resumeReviewAttachmentMatches } from "../bootstrap/bootstrap-plan-artifact.ts";
+import { withdrawResolvedNotices } from "../ceo/ceo-incident-notices.ts";
 import { buzzPolicyHoldReason, ceoBuzzHistoryIsPrePost, isBuzzSignerRefusal, type BuzzPolicyBinding, type BuzzPolicyReadiness } from "./ceo-buzz-signer.ts";
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
@@ -1063,15 +1064,19 @@ export class Outbox {
   }
 
   #ceoDelivery: ((message: OutboxMessage, attempt: CeoNoticeAttempt) => Promise<Decision<void>>) | null = null;
+  #ceoDeliveryOnly: ReadonlySet<string> | null = null;
   #ceoDelivering: Promise<void> | null = null;
   #ceoPending = false;
 
   /**
-   * Installs the canonical notice transport. Its configuration alone does not prove receiver
-   * support: the per-row journal decides whether a verified Buzz route may take over. Startup,
-   * enqueue, binding adoption and authenticated CEO traffic are delivery events.
+   * Opens the canonical route's attempt journal, once per database: every Hermes CEO notification still
+   * PENDING at that moment is recorded CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN, because a pre-journal daemon
+   * may have sent it without counting the attempt, and every later attempt is journaled per row. Attaching
+   * the transport opens it. #1189 D1, I3-1 — a daemon start opens it once it holds its lock, before it can
+   * write any notice and whatever transport is configured, so a notice it writes (a refused start's stall
+   * notice among them), which no pre-journal daemon ever saw, is not taken for one that may have been sent.
    */
-  attachCeoNotificationDelivery(send: (message: OutboxMessage, attempt: CeoNoticeAttempt) => Promise<Decision<void>>): void {
+  startCeoNotificationAttemptJournal(): void {
     this.db.tx(() => {
       if (this.db.get("SELECT 1 FROM audit_events WHERE kind = 'CEO_NOTIFICATION_ATTEMPT_JOURNAL_STARTED'")) return;
       // A pre-upgrade crash could have dispatched without incrementing attempts. Absence of an
@@ -1088,7 +1093,24 @@ export class Outbox {
       const started = this.audit.record({ kind: "CEO_NOTIFICATION_ATTEMPT_JOURNAL_STARTED", reasonCode: ReasonCode.OK });
       if (!started.allowed) throw new Error("CEO attempt journal boundary was not recorded");
     });
+  }
+
+  /**
+   * Installs the canonical notice transport. Its configuration alone does not prove receiver
+   * support: the per-row journal decides whether a verified Buzz route may take over. Startup,
+   * enqueue, binding adoption and authenticated CEO traffic are delivery events.
+   *
+   * `only` restricts the transport to the named messages until the next attach: every other row is
+   * left exactly as it was, unread by the transport and with nothing recorded against it (#1189 D1,
+   * a start that refused sends its own stall notice and nothing else).
+   */
+  attachCeoNotificationDelivery(
+    send: (message: OutboxMessage, attempt: CeoNoticeAttempt) => Promise<Decision<void>>,
+    only?: readonly string[],
+  ): void {
+    this.startCeoNotificationAttemptJournal();
     this.#ceoDelivery = send;
+    this.#ceoDeliveryOnly = only ? new Set(only) : null;
     void this.deliverCeoNotifications();
   }
 
@@ -1098,14 +1120,19 @@ export class Outbox {
    * rebind, or a stopped runtime replaced), so a route the current CEO has is the route every
    * unsettled notification has. One the Buzz transport accepted for a holder that has since gone
    * (SENT, never ACKed) goes back to deliverable with its message id and is delivered to the new
-   * holder — at-least-once, deduplicated by the id (ACP-R2-01).
+   * holder — at-least-once, deduplicated by the id (ACP-R2-01). An incident's notice is first asked
+   * whether its incident was resolved meanwhile; one that was is withdrawn rather than carried to the new
+   * holder, by the incident module's own definition of resolution (`withdrawResolvedNotices`, #1189), here
+   * and on the binding paths that carry it (`adoptHolderMessages`, `retargetOrReject`).
    */
   #readdressCeoNotifications(): void {
     const current = this.db.get<{ generation: number; session: string }>(`SELECT a.binding_generation AS generation,
       ${CURRENT_HOLDER_SESSION} AS session FROM assignments a ${HOLDER_ACTOR_JOIN}
       WHERE a.role_key = 'CEO' AND a.status = 'ACTIVE'`);
+    if (!current) return;
+    withdrawResolvedNotices(this.db, this.audit, { generation: current.generation, sessionId: current.session });
     // A new target is a new route: a failure recorded against the previous one no longer holds it.
-    if (current) readdressCeoNotifications(this.db, current.generation, current.session);
+    readdressCeoNotifications(this.db, current.generation, current.session);
   }
 
   /**
@@ -1173,6 +1200,7 @@ export class Outbox {
       return Promise.resolve();
     }
     const send = this.#ceoDelivery;
+    const only = this.#ceoDeliveryOnly;
     const run = (async () => {
       do {
         this.#ceoPending = false;
@@ -1184,6 +1212,7 @@ export class Outbox {
             AND ${ceoCanonicalRouteSql("o", true)}
           ORDER BY o.created_at, o.rowid`);
         for (const row of rows) {
+          if (only && !only.has(row.message_id)) continue;
           let accepted = false;
           let unavailable = false;
           let reasonCode: ReasonCode = ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED;
@@ -2483,8 +2512,12 @@ export class Outbox {
    * requires the exact current holder; a crash before ACK preserves the original message ID.
    */
   adoptHolderMessages(roleKey: string, generation: number, sessionId: string, deferCanonicalPeers = false): void {
-    // A CEO notification SENT to the previous holder and never ACKed is delivered again to this one.
-    if (roleKey === "CEO") readdressCeoNotifications(this.db, generation, sessionId);
+    // A CEO notification SENT to the previous holder and never ACKed is delivered again to this one, unless
+    // its incident was resolved meanwhile (#1189): that one is withdrawn rather than carried.
+    if (roleKey === "CEO") {
+      withdrawResolvedNotices(this.db, this.audit, { generation, sessionId });
+      readdressCeoNotifications(this.db, generation, sessionId);
+    }
     this.db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?,
       reason_code = CASE WHEN kind = 'CEO_NOTIFICATION' AND reason_code IN
         ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED','BUZZ_LOCAL_SEND_POLICY_REFUSED','BUZZ_SEND_POLICY_BINDING_UNVERIFIED') THEN reason_code ELSE ? END
@@ -2549,6 +2582,10 @@ export class Outbox {
     } = {},
   ): { retargeted: string[]; rejected: string[] } {
     const now = this.clock.nowIso();
+    // #1189 — a resolved incident's CEO notice is withdrawn rather than carried to the new holder.
+    if (roleKey === "CEO" && toGeneration !== fromGeneration) {
+      withdrawResolvedNotices(this.db, this.audit, { generation: toGeneration, sessionId: toSessionId });
+    }
     const pending = this.db.all<RawOutbox>(
       `SELECT * FROM outbox WHERE role_key = ? AND binding_generation = ?
         AND (

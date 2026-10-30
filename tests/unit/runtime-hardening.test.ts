@@ -611,6 +611,8 @@ describe("a completed run's work is sealed (§34.3)", () => {
       candidateSnapshotDigest: driven.candidateSnapshotDigest,
       ceoSessionId: ceo.sessionId,
       rationale: "the owner must decide the release condition",
+      ownerReason: "UNDELEGATED_PUBLIC_RELEASE",
+      blockedAction: "release the candidate",
     });
     expect(escalated.allowed).toBe(true);
     expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.AWAITING_HUMAN);

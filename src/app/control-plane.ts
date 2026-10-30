@@ -74,6 +74,7 @@ import { BootstrapActivation } from "../bootstrap/activation.ts";
 import type { GitHubWritePort } from "../bootstrap/github-write-port.ts";
 import { createBootstrapGitHubWritePort } from "../bootstrap/bootstrap-write-guard.ts";
 import { type CommitLorePort, createCommitLoreCliPort } from "../bootstrap/commitlore-observation.ts";
+import { releaseCancelledBootstrapReservation } from "../bootstrap/cancelled-reservation-release.ts";
 import { RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { Daemon, type DaemonOptions } from "../daemon/daemon.ts";
@@ -614,6 +615,9 @@ export class ControlPlane {
         // #1242 — a dependent task's base, when its target is first recorded at its run; the pipeline is built below.
         predecessorBase: (input) => this.pipeline.predecessorBase(input),
       }, config.importRoot === undefined ? {} : { importRoot: config.importRoot });
+      // S2 — a run's claim on its checkout passes to its next claim only when the runner says nothing
+      // a turn of that run started can still write the checkout.
+      this.claims.attach({ checkoutWriter: (runId, worktreeId) => this.workerTurns.checkoutWriter(runId, worktreeId) });
       // The shared packet-reviewer predicate, read from the raw reviewer adapter (the registry hands
       // out only wrapped ones): the gate may pass over its preferred reviewer only when this says
       // UNCONFIGURED. Only the Codex adapter has such a scope.
@@ -856,6 +860,19 @@ export class ControlPlane {
       this.bootstrap.attachCompletionChain(this.bootstrapProducer);
       // #246 C3 — the reservation release is a repair the bootstrap runner verifies and performs.
       this.repair.attach({ ownerAuthority: this.ownerAuthority, bootstrapRecovery: this.bootstrapProducer });
+      // #1189 B14 — a bootstrap at CEO review is not cancelled while its CONFIRM's application runs, and a
+      // cancelled one's reservation is released once its cancel commits, by that same proof.
+      this.runs.attach({
+        cancelSettlement: {
+          applicationInFlight: (runId) => this.bootstrapProducer.applicationInFlight(runId),
+          afterBootstrapCancel: (runId) => {
+            releaseCancelledBootstrapReservation(
+              { runner: this.bootstrapProducer, applications: this.bootstrapApplications, audit: this.audit },
+              runId,
+            );
+          },
+        },
+      });
       this.ceo.attach({
         ownerAuthority: this.ownerAuthority,
         bootstrapActivation: {

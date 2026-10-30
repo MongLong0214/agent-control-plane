@@ -8,7 +8,7 @@ import {
   BOOTSTRAP_PLAN_MAX_BYTES, type BootstrapPlanAttachInput, bootstrapReviewResumeAccess,
   replayBootstrapReviewResume, resumeBootstrapReview, type BootstrapReviewResumeInput,
 } from "../bootstrap/bootstrap-plan-artifact.ts";
-import type { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
+import { bootstrapApplicationOf, type BootstrapApplicationPhase, type BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Outbox } from "../outbox/outbox.ts";
@@ -23,13 +23,15 @@ import {
 } from "../ceo/production-gate.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { Clock } from "../core/clock.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
-import { ReasonCode } from "../core/reason-codes.ts";
+import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
+import { isReasonCode, ReasonCode } from "../core/reason-codes.ts";
 import type { CtoLifecycle } from "../cto/cto-lifecycle.ts";
+import { OWNER_ONLY_REASONS } from "../ceo/owner-decision-reason.ts";
 import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
 import type { ExecutionMode, RunPriority } from "../domain/types.ts";
 import { Role, roleKeyFor, RunKind, RunState } from "../domain/types.ts";
+import { isTerminal } from "../domain/run-state.ts";
 import type { RepairService } from "../doctor/repair.ts";
 import { projectCi } from "../registry/project-ci.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
@@ -100,6 +102,33 @@ export interface HermesMcpSource extends McpMutationSource {
 
 /** Only ports constructed below may be attached to an MCP server. */
 const HERMES_MCP_PORTS = new WeakSet<object>();
+
+/** The refusal a stored MCP body or a `last_refusal_json` record carries, or null when it carries none. */
+const refusalOf = (value: Record<string, unknown> | null | undefined): { reasonCode: ReasonCode; message: string; evidence: Evidence } | null => {
+  const reasonCode = value?.["reasonCode"];
+  const message = value?.["message"];
+  const evidence = value?.["evidence"];
+  return typeof reasonCode === "string" && isReasonCode(reasonCode) && typeof message === "string"
+    && typeof evidence === "object" && evidence !== null && !Array.isArray(evidence)
+    ? { reasonCode, message, evidence: evidence as Evidence }
+    : null;
+};
+
+/** A replay's answer for an application in a terminal phase that is not this CONFIRM's completion. */
+const TERMINAL_APPLICATION_REFUSALS: Partial<Record<BootstrapApplicationPhase, { reasonCode: ReasonCode; message: string }>> = {
+  STRANDED: {
+    reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_STRANDED,
+    message: "this bootstrap run's application is STRANDED: what GitHub holds could not be attributed to it, and a person resolves it",
+  },
+  RELEASED: {
+    reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
+    message: "this bootstrap run's application is RELEASED: its reservation ended with no external effect, and nothing is applied",
+  },
+  COMPLETED: {
+    reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
+    message: "this bootstrap run's application is COMPLETED for another candidate than this CONFIRM's",
+  },
+};
 
 /**
  * Builds function-only Hermes operations. The returned object deliberately exposes neither a
@@ -239,7 +268,63 @@ export const createHermesMcpPort = (
       }
       return decision;
     },
-    executeRepair: (input: Parameters<RepairService["execute"]>[0]) => source.repair.execute(input),
+    /**
+     * A same-key replay of a PROJECT_BOOTSTRAP CONFIRM whose stored answer is a resumable refusal. The
+     * daemon re-drives that confirmation on its own, so the stored bytes go stale: the replay answers from
+     * the run and its application as they stand. It only reads; the runner, GitHub and git are not asked
+     * again. Null keeps the stored answer, as for every other replay.
+     */
+    replayResumableBootstrapConfirm: (
+      input: Pick<CeoDecisionInput, "runId" | "decision" | "candidateSnapshotDigest">,
+      stored: ToolResult,
+    ): ToolResult | null => {
+      const body = stored.structuredContent;
+      const answered = body?.["ok"] === false ? refusalOf(body) : null;
+      if (input.decision !== "CONFIRM" || !answered || answered.evidence["resumable"] !== true) return null;
+      const run = source.runs.get(input.runId);
+      if (run?.kind !== RunKind.PROJECT_BOOTSTRAP) return null;
+      const application = bootstrapApplicationOf(source.db, input.runId);
+      if (application === null) return null;
+      // The application completes only in the transaction of a CONFIRM of its own candidate.
+      if (run.state === RunState.COMPLETED && application.phase === "COMPLETED"
+        && application.candidateSnapshotDigest === input.candidateSnapshotDigest) {
+        return respond(allow(ReasonCode.OK, { state: RunState.COMPLETED }));
+      }
+      const status = { phase: application.phase, attempts: application.attempts };
+      const latest = application.lastRefusal;
+      const terminal = TERMINAL_APPLICATION_REFUSALS[application.phase];
+      if (terminal) {
+        // A STRANDED or RELEASED row's record is its cause and the recovery a person performs; a COMPLETED
+        // row's is the refusal it met before completing, not its answer.
+        return respond(deny(terminal.reasonCode, terminal.message, {
+          refusal: `BOOTSTRAP_APPLICATION_${application.phase}`,
+          runId: input.runId,
+          ...(application.phase === "COMPLETED" ? { reserved: application.candidateSnapshotDigest } : latest ?? {}),
+          resumable: false,
+          application: status,
+        }));
+      }
+      // Every attempt records the refusal it answers with, and only a later record replaces it: it is the
+      // newest answer, whichever attempt has started since. A record that is no refusal (a release in
+      // doubt) is reported as recorded.
+      const recorded = refusalOf(latest);
+      const current = recorded !== null
+        ? { ...recorded, evidence: { ...(latest?.["stage"] === undefined ? {} : { stage: latest["stage"] }), ...recorded.evidence } }
+        : latest !== null
+          ? {
+              reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
+              message: "this bootstrap run's application holds a later record than this CONFIRM's answer, reported as recorded",
+              evidence: latest,
+            }
+          : answered;
+      return respond(deny(current.reasonCode, current.message, {
+        ...current.evidence,
+        // A run that has ended is not re-driven, whatever its last refusal said.
+        resumable: !isTerminal(run.state) && current.evidence["resumable"] !== false,
+        application: status,
+      }));
+    },
+    executeRepair:(input: Parameters<RepairService["execute"]>[0]) => source.repair.execute(input),
     resolveEscalation: (
       runId: string, escalationId: number, resolution: string, ceoSessionId: string, idempotencyKey: string,
       hermesTurn?: HermesAdmittedTurn,
@@ -383,12 +468,14 @@ const createHermesServerFromPort = (
     extra: unknown,
     execute: (fingerprint: string) => Promise<ToolResult> | ToolResult,
     durableReplay?: McpMutationRequest["durableReplay"],
+    durableReplaySupersedesStored = false,
   ) => guarded(async () => {
     const peer = authenticateMcpPeer(authenticate);
     if (!peer.allowed) return respond(peer);
     return port.mutation.execute(peer.value, args.idempotencyKey, execute, {
       toolName, arguments: args,
       ...(durableReplay === undefined ? {} : { durableReplay }),
+      ...(durableReplaySupersedesStored ? { durableReplaySupersedesStored } : {}),
       authority: () => {
         const current = authenticateMcpPeer(authenticate);
         const authority = current.allowed ? port.peerAuthority(peer.value) : current;
@@ -584,7 +671,16 @@ const createHermesServerFromPort = (
   );
   server.registerTool(
     "ceo_decision_submit",
-    { description: "Submit the CEO's final decision.", inputSchema: { ...mutation, runId: z.string(), decision: z.enum(["CONFIRM", "FINAL_REVISE", "OWNER_DECISION_REQUIRED"]), candidateSnapshotDigest: z.string(), ceoSessionId: z.string(), rationale: z.string() } },
+    {
+      description:
+        "Submit the CEO's final decision. OWNER_DECISION_REQUIRED hands the run to the owner only for an owner-only reason: " +
+        `ownerReason is one of ${Object.keys(OWNER_ONLY_REASONS).join(", ")} (PRD §21), and blockedAction names the specific action it blocks. ` +
+        "A judgement within the CEO's authority (candidate quality, technical approach, priority, uncertainty, recovery, staffing, cancellation) is refused with the CEO's own path.",
+      inputSchema: {
+        ...mutation, runId: z.string(), decision: z.enum(["CONFIRM", "FINAL_REVISE", "OWNER_DECISION_REQUIRED"]), candidateSnapshotDigest: z.string(), ceoSessionId: z.string(), rationale: z.string(),
+        ownerReason: z.string().optional(), blockedAction: z.string().optional(),
+      },
+    },
     async (args, extra) => write("ceo_decision_submit", args, extra, async () => {
       // #246 B2-b — the door's authenticated session travels with the decision, never an argument, so a
       // CONTRACT_CHANGE grant is issued, or its consumer re-bound, only when it is the CEO session the call
@@ -596,8 +692,16 @@ const createHermesServerFromPort = (
         sessionIncarnation: peer.allowed ? peer.value.sessionIncarnation ?? null : null,
         idempotencyKey: args.idempotencyKey,
       };
-      return respond(await port.submitCeoDecision({ runId: args.runId, decision: args.decision, candidateSnapshotDigest: args.candidateSnapshotDigest, ceoSessionId: args.ceoSessionId, rationale: args.rationale, ingress, hermesTurn: admittedTurnOf(extra) }));
-    }),
+      return respond(await port.submitCeoDecision({ runId: args.runId, decision: args.decision, candidateSnapshotDigest: args.candidateSnapshotDigest, ceoSessionId: args.ceoSessionId, rationale: args.rationale,
+        ...(args.ownerReason === undefined ? {} : { ownerReason: args.ownerReason }),
+        ...(args.blockedAction === undefined ? {} : { blockedAction: args.blockedAction }),
+        ingress, hermesTurn: admittedTurnOf(extra) }));
+    },
+    // A resumable bootstrap refusal is not this key's last word: its replay, after the same request and
+    // current authority passed, answers from durable state. Every other stored answer replays unchanged.
+    (_fingerprint, reservationVerified, stored) =>
+      reservationVerified && stored !== undefined ? port.replayResumableBootstrapConfirm(args, stored) : null,
+    true),
   );
 
   server.registerTool(

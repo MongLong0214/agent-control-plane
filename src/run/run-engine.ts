@@ -1,5 +1,9 @@
 import type { DispatchCapacityTarget } from "../capacity/capacity-monitor.ts";
-import { isContinuityRevocationReason } from "../continuity/continuity-kernel.ts";
+import {
+  CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX,
+  CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON,
+  isContinuityRevocationReason,
+} from "../continuity/continuity-kernel.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
@@ -17,6 +21,7 @@ import {
 } from "../export/baseline-contract.ts";
 import { BaselineRecorder } from "../export/baseline-recorder.ts";
 import { canTransition, isTerminal } from "../domain/run-state.ts";
+import { admitPostApprovalCancel, admitReviewedBootstrapCancel } from "./post-approval-cancel.ts";
 import {
   ArtifactKind,
   type ContinuityMode,
@@ -108,6 +113,15 @@ export interface CompletionAuthoritySet {
 
 const ISSUED_COMPLETION_AUTHORITIES = new Set<string>();
 
+/** #1189 B5 — the refusal `RunEngine.returnApprovedCandidate` sends an approved candidate back for. */
+export interface ApprovedCandidateReturn {
+  candidateSnapshotDigest: string;
+  attemptId: string;
+  reasonCode: ReasonCode;
+  reason: string;
+  unrecoverable: boolean;
+}
+
 export interface CreateRunInput {
   projectId?: string | null;
   kind?: RunKind;
@@ -161,6 +175,17 @@ export interface BootstrapCtoProvisioner {
  */
 export interface WorkerRetirementPort {
   retireRun(runId: string, state: RunState): unknown;
+}
+
+/**
+ * #1189 B14 — the bootstrap runner, as a cancel of a PROJECT_BOOTSTRAP run at CEO review asks it.
+ * `applicationInFlight` is asked synchronously inside the cancel's transaction; `afterBootstrapCancel`
+ * runs only after that transaction commits, releases the reservation through the existing release path
+ * (which re-proves that no external effect happened), and never throws into the cancel.
+ */
+export interface CancelSettlementPort {
+  applicationInFlight(runId: string): boolean;
+  afterBootstrapCancel(runId: string): void;
 }
 
 /** A session `ensure` staffed: freshly spawned and unbound, or the live binding it reuses. */
@@ -270,6 +295,19 @@ const isContinuityPauseReason = (reason: unknown): reason is string =>
     reason.startsWith(CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX) ||
     reason === CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON);
 
+/** The revocation row paired with each reason `pauseAffectedRuns` records for the same loss. */
+const continuityRevocationReasonForPause = (reason: unknown): string | null => {
+  if (typeof reason !== "string") return null;
+  if (isContinuityRevocationReason(reason)) return reason;
+  if (reason.startsWith(CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX)) {
+    return `${CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX}${reason.slice(CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX.length)}`;
+  }
+  if (reason === CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON) {
+    return CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON;
+  }
+  return null;
+};
+
 /** S-HOLD — a RUN_TRANSITION's evidence is continuity's own pause of an ACTIVE run, for `stateReason`. */
 const isContinuityPause = (evidence: Record<string, unknown> | null, stateReason: string | null): boolean =>
   evidence !== null &&
@@ -283,16 +321,11 @@ const isContinuityPause = (evidence: Record<string, unknown> | null, stateReason
  * and their replies, claims, leases, guards, bindings it scopes, wakes and finalization. One of these
  * after continuity's pause keeps the hold. Classified by what each emission site records, not by name
  * (#1162 r3): a kind every site of which records only a refusal, a deferral or an ignored input is not
- * listed (OUTBOX_ACK_REJECTED, GATE_REJECTED, MERGE_REFUSED, REPAIR_REFUSED, REPAIR_DRY_RUN,
- * CTO_DISPATCH_REFUSED_CANONICAL, CTO_SESSION_PROBE_FAILED, WORKER_PROBE_GROUP_UNCONFIRMED,
- * CEO_NOTIFICATION_BLOCKED, BLIND_REVIEW_MANUAL_DENIED, BLIND_REVIEW_REJECTED, RUN_DISPATCH_DEFERRED,
- * TASK_EXECUTION_LATE_RESULT_IGNORED, TASK_WORKER_TURN_LATE_RESULT_REFUSED, WORKER_RETIREMENT_DEFERRED,
- * BOOTSTRAP_CTO_RECLAIM_DEFERRED, WORKER_SESSION_STOP_FAILED, STANDARD_WORK_CONTINUATION_STALLED) and never
- * keeps it; a kind whose sites record both outcomes is movement only for the applied one
- * (`isRecordedMovement`). The S-TB branch records are movement too. A writer that leaves
- * no record, or a record of a kind added later, is still caught by the row snapshot (`#holdSnapshot`) or,
- * for a pause that predates it, by the row times. A kind whose effect was unclear is listed: listing keeps
- * the hold, the safe side.
+ * listed (`CONTINUITY_HOLD_NON_MOVEMENT_KINDS`) and never keeps it; a kind whose sites record both
+ * outcomes is movement only for the applied one (`isRecordedMovement`). The S-TB branch records are
+ * movement too. A writer that leaves no record, or a record of a kind added later, is still caught by the
+ * row snapshot (`#holdSnapshot`) or, for a pause that predates it, by the row times. A kind whose effect was
+ * unclear is listed: listing keeps the hold, the safe side.
  */
 const CONTINUITY_HOLD_MUTATING_KINDS: readonly string[] = [
   "RUN_CREATED", "DISPATCHED", "RUN_TRANSITION", "RUN_PRIORITY_SET", "RUN_OWNER_RENEWED",
@@ -331,12 +364,24 @@ const CONTINUITY_HOLD_MUTATING_KINDS: readonly string[] = [
 ];
 
 /**
+ * #1162 r3 — the kinds every emission site of which records only a refusal, a deferral or an ignored
+ * input, so they are not movement. A kind absent from both lists is not classified here.
+ */
+export const CONTINUITY_HOLD_NON_MOVEMENT_KINDS: readonly string[] = [
+  "OUTBOX_ACK_REJECTED", "GATE_REJECTED", "MERGE_REFUSED", "REPAIR_REFUSED", "REPAIR_DRY_RUN",
+  "CTO_DISPATCH_REFUSED_CANONICAL", "CTO_SESSION_PROBE_FAILED", "WORKER_PROBE_GROUP_UNCONFIRMED",
+  "CEO_NOTIFICATION_BLOCKED", "BLIND_REVIEW_MANUAL_DENIED", "BLIND_REVIEW_REJECTED", "RUN_DISPATCH_DEFERRED",
+  "TASK_EXECUTION_LATE_RESULT_IGNORED", "TASK_WORKER_TURN_LATE_RESULT_REFUSED", "WORKER_RETIREMENT_DEFERRED",
+  "BOOTSTRAP_CTO_RECLAIM_DEFERRED", "WORKER_SESSION_STOP_FAILED", "STANDARD_WORK_CONTINUATION_STALLED",
+];
+
+/**
  * #1162 r3 — whether a listed record is movement by its recorded outcome. The two listed kinds whose sites
  * record both outcomes count only the applied one: a MANAGED_WRITE_GUARD evaluation whose evidence says
  * `allowed: false` granted nothing, and a PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP that could not stop its session
  * (SESSION_STOP_FAILED) changed nothing. An outcome that cannot be read counts as movement.
  */
-const isRecordedMovement = (row: { kind: string; reason_code: string | null; evidence_json: string }): boolean => {
+export const isRecordedMovement = (row: { kind: string; reason_code: string | null; evidence_json: string }): boolean => {
   if (row.kind === "MANAGED_WRITE_GUARD") return auditEvidence(row.evidence_json)?.["allowed"] !== false;
   if (row.kind === "PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP") return row.reason_code !== ReasonCode.SESSION_STOP_FAILED;
   return true;
@@ -373,6 +418,7 @@ export class RunEngine {
   #cto: CtoProvisioner | null = null;
   #bootstrapCto: BootstrapCtoProvisioner | null = null;
   #workerRetirement: WorkerRetirementPort | null = null;
+  #cancelSettlement: CancelSettlementPort | null = null;
   #capacity: CapacityGate | null = null;
   #continuity: ContinuityGate | null = null;
   #ceoReview: CeoReviewGate | null = null;
@@ -402,6 +448,7 @@ export class RunEngine {
     cto?: CtoProvisioner;
     bootstrapCto?: BootstrapCtoProvisioner;
     workerRetirement?: WorkerRetirementPort;
+    cancelSettlement?: CancelSettlementPort;
     capacity?: CapacityGate;
     continuity?: ContinuityGate;
     ceoReview?: CeoReviewGate;
@@ -409,6 +456,7 @@ export class RunEngine {
     if (ports.cto) this.#cto = ports.cto;
     if (ports.bootstrapCto) this.#bootstrapCto = ports.bootstrapCto;
     if (ports.workerRetirement) this.#workerRetirement = ports.workerRetirement;
+    if (ports.cancelSettlement) this.#cancelSettlement = ports.cancelSettlement;
     if (ports.capacity) this.#capacity = ports.capacity;
     if (ports.continuity) this.#continuity = ports.continuity;
     if (ports.ceoReview) this.#ceoReview = ports.ceoReview;
@@ -1178,8 +1226,22 @@ export class RunEngine {
       if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
       const check = canTransition(run.state, RunState.CANCELLED, run.kind);
       if (!check.allowed) return check as Decision<RunRow>;
+      // #1189 B15 — past CEO approval only confirmed non-application is cancelled, judged in this transaction.
+      // B14 — a PROJECT_BOOTSTRAP at CEO review is cancelled only while no CONFIRM's application of it is
+      // in flight and nothing it wrote has landed (WRITTEN), asked in this transaction too.
+      const settlement = this.#cancelSettlement;
+      const reviewedBootstrap = run.kind === RunKind.PROJECT_BOOTSTRAP && run.state === RunState.READY_FOR_CEO_REVIEW;
+      const admitted = reviewedBootstrap
+        ? admitReviewedBootstrapCancel(this.db, run, settlement?.applicationInFlight(runId) ?? false)
+        : admitPostApprovalCancel(this.db, run);
+      if (!admitted.allowed) return admitted as Decision<RunRow>;
       this.tasks.cancelAll(runId, reason);
-      return this.transition(runId, RunState.CANCELLED, reason);
+      const cancelled = this.transition(runId, RunState.CANCELLED, reason, admitted.value);
+      // A frozen bootstrap's reservation is released only once this cancel has committed, and only on proof.
+      if (cancelled.allowed && reviewedBootstrap && settlement) {
+        this.db.afterCommit(() => settlement.afterBootstrapCancel(runId));
+      }
+      return cancelled;
     });
   }
 
@@ -1422,6 +1484,99 @@ export class RunEngine {
           });
         }
       }
+      return allow(ReasonCode.OK, this.require(runId));
+    });
+  }
+
+  /**
+   * #1189 B5 — an approved candidate the daemon finalizer was refused before anything merged, and that will
+   * not merge as it is, leaves CEO approval in one transaction: the approval is recorded as invalidated
+   * (CEO_APPROVAL_INVALIDATED, naming the CONFIRM it voids), the candidate and every artifact bound to it are
+   * invalidated as `invalidateCandidate` does, so that CONFIRM names nothing current, and the run moves
+   * CEO_APPROVED or MERGING → REVISION_REQUIRED. A revision then goes → ACTIVE with a REVISION_REQUEST to the
+   * pinned owner while that owner is current, and otherwise waits in REVISION_REQUIRED for a dispatch; an
+   * unrecoverable refusal ends → FAILED with its reason. Only the refused candidate is ever invalidated, and
+   * never while the run holds a merge_execute receipt: a merge that may have landed stays on the post-merge
+   * path. That receipt check is this method's alone; the schema v55 guard opens the edge and reads no receipt.
+   * A refusal anywhere in the body (an audit, the state edges, the request) rolls back every write before it.
+   */
+  returnApprovedCandidate(runId: string, input: ApprovedCandidateReturn): Decision<RunRow> {
+    return this.db.txDecision(() => {
+      const run = this.require(runId);
+      if (run.state !== RunState.CEO_APPROVED && run.state !== RunState.MERGING) {
+        return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, `an approved candidate is returned only from CEO_APPROVED or MERGING, not ${run.state}`, {
+          runId,
+          state: run.state,
+        });
+      }
+      if (this.currentCandidate(runId) !== input.candidateSnapshotDigest) {
+        return deny(ReasonCode.EVIDENCE_STALE, "the refused candidate is no longer the run's current candidate", {
+          runId,
+          candidateSnapshotDigest: input.candidateSnapshotDigest,
+          currentCandidateSnapshotDigest: this.currentCandidate(runId),
+        });
+      }
+      if (this.db.get(`SELECT 1 AS held FROM github_receipts WHERE run_id = ? AND operation = 'merge_execute' LIMIT 1`, [runId])) {
+        return deny(ReasonCode.FINALIZATION_COMPENSATION_REQUIRED, "a merge may have landed, so the approval stays on the post-merge path", {
+          runId,
+        });
+      }
+      const disposition = input.unrecoverable ? "UNRECOVERABLE" : "REVISION";
+      const confirmed = this.audit.forRun(runId).reverse().find((entry) =>
+        entry.kind === "CEO_DECISION" &&
+        entry.evidence.decision === "CONFIRM" &&
+        entry.evidence.candidateSnapshotDigest === input.candidateSnapshotDigest);
+      const invalidated = this.audit.record({
+        kind: "CEO_APPROVAL_INVALIDATED",
+        runId,
+        projectId: run.projectId,
+        reasonCode: input.reasonCode,
+        evidence: {
+          from: run.state,
+          candidateSnapshotDigest: input.candidateSnapshotDigest,
+          attemptId: input.attemptId,
+          disposition,
+          approvedBy: confirmed?.sessionId ?? null,
+          approvedAt: confirmed?.at ?? null,
+          reason: input.reason,
+        },
+      });
+      if (!invalidated.allowed) return invalidated as Decision<RunRow>;
+      const evidence = {
+        candidateSnapshotDigest: input.candidateSnapshotDigest,
+        attemptId: input.attemptId,
+        failureReasonCode: input.reasonCode,
+        disposition,
+      };
+      this.invalidateCandidateInTx(runId, input.reason, evidence);
+      const revision = this.transition(runId, RunState.REVISION_REQUIRED, input.reason, evidence);
+      if (!revision.allowed) return revision;
+      if (input.unrecoverable) return this.transition(runId, RunState.FAILED, input.reason, evidence);
+      if (!run.ownerSessionId || run.ownerBindingGeneration == null || !run.ownerRoleKey ||
+          !this.assertOwner(runId, run.ownerSessionId, run.ownerBindingGeneration).allowed) {
+        return allow(ReasonCode.OK, this.require(runId));
+      }
+      const resumed = this.transition(runId, RunState.ACTIVE, "approved candidate returned for revision", evidence);
+      if (!resumed.allowed) return resumed;
+      // One request per revision cycle (the REVISION_REQUIRED edge above counted it), as a CEO FINAL_REVISE's is;
+      // a request the outbox refuses undoes the whole return, so the run is never ACTIVE with nobody told.
+      const requested = this.outbox.enqueue({
+        idempotencyKey: `approved-candidate-returned:${runId}:r${revision.value.revisionCount}:${input.candidateSnapshotDigest}`,
+        roleKey: run.ownerRoleKey,
+        bindingGeneration: run.ownerBindingGeneration,
+        targetSessionId: run.ownerSessionId,
+        runId,
+        kind: MessageKind.REVISION_REQUEST,
+        payload: {
+          runId,
+          reasonCode: input.reasonCode,
+          candidateSnapshotDigest: input.candidateSnapshotDigest,
+          reason: input.reason,
+          action: "fix the refusal and freeze a new candidate; it is verified, reviewed and confirmed again. " +
+            "A branch already published at the refused candidate is never moved, so publish the new one on a new branch.",
+        },
+      });
+      if (!requested.allowed) return requested as Decision<RunRow>;
       return allow(ReasonCode.OK, this.require(runId));
     });
   }
@@ -1792,6 +1947,36 @@ export class RunEngine {
   }
 
   /**
+   * #1189 — continuity's own wait at CEO review for a role that is not the run's owner (a CEO loss pauses
+   * every run), handed back once `held` covers that role again. `releaseContinuityReviewHold` above answers
+   * only the owner's role, so before this a run paused for the CEO stayed AWAITING_HUMAN after the CEO was
+   * re-adopted, and only an owner decision or a cancel moved it.
+   *
+   * The hand-back is the same one (`#releaseContinuityReviewHold`): AWAITING_HUMAN → ACTIVE →
+   * READY_FOR_CEO_REVIEW, the owner pin kept exactly as it is, the same candidate and packet, nothing
+   * dispatched. Released only for the wait `#heldRoleReviewHold` reads; every other wait answers
+   * `released: false` and nothing is written.
+   */
+  releaseHeldRoleReviewHold(runId: string, held: RoleBinding): Decision<{ run: RunRow; released: boolean }> {
+    return this.db.txDecision(() => {
+      const run = this.get(runId);
+      if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+      const hold = this.#heldRoleReviewHold(run, held);
+      if (!hold || run.ownerRoleKey === null || run.ownerSessionId === null ||
+          run.ownerSessionIncarnation === null || run.ownerBindingGeneration === null) {
+        return allow(ReasonCode.OK, { run, released: false });
+      }
+      this.#releaseContinuityReviewHold(run, hold, {
+        roleKey: run.ownerRoleKey,
+        sessionId: run.ownerSessionId,
+        incarnation: run.ownerSessionIncarnation,
+        generation: run.ownerBindingGeneration,
+      }, { continuityRelease: held.roleKey, heldGeneration: held.bindingGeneration });
+      return allow(ReasonCode.OK, { run: this.require(runId), released: true });
+    });
+  }
+
+  /**
    * S-HOLD — continuity's own BLOCKED hold on a STANDARD_WORK run, handed back once the role it held the
    * run for is covered again by `held`. Before this, the only doors out of that hold were a bootstrap
    * CTO's recovery and the review-wait release, so one CEO session restart left every ACTIVE STANDARD_WORK
@@ -2098,7 +2283,7 @@ export class RunEngine {
     if (recorded && (paused["continuityHold"] !== owner.roleKey || paused["candidateSnapshotDigest"] !== candidate)) {
       return null;
     }
-    const episode = this.#lossEpisode(run, pause.event_id, paused["reason"], owner.roleKey);
+    const episode = this.#lossEpisode(run, pause.event_id, paused["reason"], owner.roleKey, false);
     if (!episode) return null;
     const pausedOwner = recorded ? recordedPauseOwner(paused) : this.#legacyPausedOwner(run, pause.event_id, episode);
     if (!pausedOwner) return null;
@@ -2124,20 +2309,112 @@ export class RunEngine {
   }
 
   /**
+   * #1189 — continuity's own wait at CEO review for `held`'s role, which is not the run's owner, or null.
+   * Reads only, inside the transaction that would release it. Every one of these must hold:
+   *
+   * - the run's latest RUN_TRANSITION is continuity's pause READY_FOR_CEO_REVIEW → AWAITING_HUMAN
+   *   (PAUSE_NEW_WORK, one of continuity's pause reasons) whose `continuityHold` names `held.roleKey`
+   *   and the current candidate, and the one before it entered READY_FOR_CEO_REVIEW with that candidate.
+   *   A pause written before `continuityHold` existed names no role and is kept. Its reconcile pass must
+   *   also have completed its own loss episode, in which `held.roleKey` was revoked or deferred once, for
+   *   the pause's loss; another role lost in that pass for the same reason does not make it ambiguous.
+   *   An interrupted pause cannot borrow a later pass;
+   * - the run's owner pin is the same session and incarnation the pause recorded
+   *   (`CONTINUITY_PAUSE_OWNER_FIELDS`), at that generation or a later renewal, and it is still its role's
+   *   active binding on a READY session: the owner did not move under the wait;
+   * - `held` is its role's active binding (assignment and generation) on a READY session;
+   * - no candidate was promoted or invalidated since the run entered review, no CEO or owner decision was
+   *   recorded since the pause, the candidate's PRODUCTION_READY_PACKET is current, and the human gate
+   *   is satisfied (`CeoReviewGate`).
+   *
+   * Trust limit: as for `#continuityReviewHold`, these facts are read from `audit_events`, which a same-uid
+   * raw SQLite writer could forge.
+   */
+  #heldRoleReviewHold(run: RunRow, held: RoleBinding): ContinuityReviewHold | null {
+    if (run.state !== RunState.AWAITING_HUMAN) return null;
+    if (run.ownerRoleKey === null || run.ownerRoleKey === held.roleKey) return null;
+    const [pause, entered] = this.db.all<{ event_id: number; evidence_json: string }>(
+      `SELECT event_id, evidence_json FROM audit_events
+        WHERE kind = 'RUN_TRANSITION' AND run_id = ?
+        ORDER BY event_id DESC LIMIT 2`,
+      [run.runId],
+    );
+    if (!pause || !entered) return null;
+    const paused = auditEvidence(pause.evidence_json);
+    const review = auditEvidence(entered.evidence_json);
+    if (!paused || !review) return null;
+    if (paused["from"] !== RunState.READY_FOR_CEO_REVIEW || paused["to"] !== RunState.AWAITING_HUMAN) return null;
+    if (paused["continuityAction"] !== "PAUSE_NEW_WORK" || !isContinuityPauseReason(paused["reason"])) return null;
+    if (paused["continuityHold"] !== held.roleKey) return null;
+    if (review["to"] !== RunState.READY_FOR_CEO_REVIEW) return null;
+    const candidate = this.currentCandidate(run.runId);
+    if (candidate === null || review["candidateSnapshotDigest"] !== candidate || paused["candidateSnapshotDigest"] !== candidate) {
+      return null;
+    }
+    const revocationReason = continuityRevocationReasonForPause(paused["reason"]);
+    if (!revocationReason) return null;
+    // The pause's `continuityHold` names `held.roleKey` (checked above): the episode is that role's loss.
+    const episode = this.#lossEpisode(run, pause.event_id, revocationReason, held.roleKey, true);
+    if (!episode) return null;
+    const pausedOwner = recordedPauseOwner(paused);
+    if (!pausedOwner || run.ownerSessionId === null || run.ownerSessionIncarnation === null ||
+        run.ownerBindingGeneration === null || !this.#sameOwner(pausedOwner, {
+          roleKey: run.ownerRoleKey,
+          sessionId: run.ownerSessionId,
+          incarnation: run.ownerSessionIncarnation,
+          generation: run.ownerBindingGeneration,
+        })) {
+      return null;
+    }
+    const owner = this.#activeBindingNow(run.ownerRoleKey);
+    if (
+      !owner?.ready ||
+      owner.boundSessionId !== run.ownerSessionId ||
+      owner.boundIncarnation !== run.ownerSessionIncarnation ||
+      owner.generation !== run.ownerBindingGeneration
+    ) {
+      return null;
+    }
+    const covering = this.#activeBindingNow(held.roleKey);
+    if (!covering?.ready || covering.assignmentId !== held.assignmentId || covering.generation !== held.bindingGeneration) {
+      return null;
+    }
+    const moved = this.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_events
+        WHERE run_id = ?
+          AND ((kind IN ('CANDIDATE_PROMOTED', 'CANDIDATE_INVALIDATED') AND event_id > ?)
+            OR (kind IN ('CEO_DECISION', 'OWNER_DECISION') AND event_id > ?))`,
+      [run.runId, entered.event_id, pause.event_id],
+    );
+    if ((moved?.n ?? 1) !== 0) return null;
+    const packet = this.artifacts.latestForSnapshot<{ runId?: unknown; candidateSnapshotDigest?: unknown }>(
+      run.runId,
+      ArtifactKind.PRODUCTION_READY_PACKET,
+      candidate,
+    );
+    if (packet?.content.runId !== run.runId || packet.content.candidateSnapshotDigest !== candidate) return null;
+    if (this.#ceoReview?.humanGateStatus(run.runId).satisfied !== true) return null;
+    return { pauseEventId: pause.event_id, candidateSnapshotDigest: candidate };
+  }
+
+  /**
    * The loss a pause answered, read from its own reconcile pass: the rows after the pause up to the
    * first CONTINUITY_RECONCILED after it, the record the pass writes when it finishes.
    *
    *   (a) that CONTINUITY_RECONCILED exists, and (b) its `pausedRuns` names the run exactly once — a
    *       pass that never finished, or a later one that paused nothing of this run, is no episode;
    *   (c) the revocation's (BINDING_REVOKED) or deferral's (CONTINUITY_REVOKE_DEFERRED) reason is the
-   *       pause's own loss reason, and one of continuity's;
-   *   (d) it is the only such row in the window for any role whose loss pauses this run (the CEO, a
-   *       role of the run, of its project or of one of its tasks), and the only row of any reason for
-   *       `roleKey`: two candidates leave the pause's role ambiguous;
+   *       pause's own loss reason, and one of continuity's, for a role whose loss pauses this run (the
+   *       CEO, a role of the run, of its project or of one of its tasks);
+   *   (d) it is the only row of any reason for `roleKey` in the window. Unless the caller identified
+   *       the pause's role by the pause's own `continuityHold` (`holdNamesRole`), it must also be the
+   *       only row of (c) for any role: two candidates leave the pause's role ambiguous. The held-role
+   *       release passes `holdNamesRole`, so another role lost in the same pass for the same reason
+   *       (the CEO and the run's reviewer both refused failover) does not strand the CEO's wait;
    *   (e) it names the session and the generation it took the role from (`session_id`,
    *       `evidence.generation`) — the caller checks those against the pause's owner.
    */
-  #lossEpisode(run: RunRow, pauseEventId: number, lossReason: unknown, roleKey: string): ContinuityLossEpisode | null {
+  #lossEpisode(run: RunRow, pauseEventId: number, lossReason: unknown, roleKey: string, holdNamesRole: boolean): ContinuityLossEpisode | null {
     if (typeof lossReason !== "string" || !isContinuityRevocationReason(lossReason)) return null;
     const closed = this.db.get<{ event_id: number; evidence_json: string }>(
       `SELECT event_id, evidence_json FROM audit_events
@@ -2159,15 +2436,15 @@ export class RunEngine {
         ORDER BY event_id`,
       [pauseEventId, closed.event_id],
     );
-    const sameLoss = window.filter((row) =>
+    const isSameLoss = (row: { role_key: string | null; evidence_json: string }): boolean =>
       row.role_key !== null &&
       this.#lossPauses(run, row.role_key) &&
-      auditEvidence(row.evidence_json)?.["reason"] === lossReason,
-    );
-    if (sameLoss.length !== 1) return null;
-    const [revocation] = sameLoss;
-    if (revocation?.role_key !== roleKey) return null;
-    if (window.filter((row) => row.role_key === roleKey).length !== 1) return null;
+      auditEvidence(row.evidence_json)?.["reason"] === lossReason;
+    const own = window.filter((row) => row.role_key === roleKey);
+    if (own.length !== 1) return null;
+    const [revocation] = own;
+    if (!revocation || !isSameLoss(revocation)) return null;
+    if (!holdNamesRole && window.filter(isSameLoss).length !== 1) return null;
     const generation = auditEvidence(revocation.evidence_json)?.["generation"];
     if (revocation.session_id === null || typeof generation !== "number" || !Number.isInteger(generation)) return null;
     return { sessionId: revocation.session_id, generation };

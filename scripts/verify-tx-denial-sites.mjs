@@ -144,6 +144,9 @@ const DENY_PATTERN =
  * owning same-file definition; `label` is the stable operator-facing identity printed below.
  */
 const EXPECTED_CONVERTED_SITES = [
+  // A CEO incident notice's enqueue is atomic with its delivery record and rolls back on denial; every
+  // stall router (the watchdog's, the agent-owned waits', the ownerless stalls') delivers through it.
+  { file: "ceo/ceo-incident-notices.ts", symbol: "deliverIncident", label: "deliverIncident", evidence: "direct" },
   // The receipt transition and audit must both roll back if the audit refuses.
   { file: "outbox/ceo-notification-ack.ts", symbol: "acknowledgeCeoNotification", label: "acknowledgeCeoNotification", evidence: "direct" },
   // The selected artifact must roll back if its attachment audit refuses, preserving the prior selection.
@@ -160,6 +163,10 @@ const EXPECTED_CONVERTED_SITES = [
   { file: "cto/cto-lifecycle.ts", symbol: "suspendProject", label: "CtoLifecycle.suspendProject (prepare)", evidence: "direct" },
   { file: "daemon/finalizer.ts", symbol: "acquireAttempt", label: "DaemonFinalizer lease acquisition", evidence: "direct" },
   { file: "run/run-engine.ts", symbol: "invalidateCandidate", label: "RunEngine.invalidateCandidate", evidence: "direct" },
+  // #1189 B5 — the approval's invalidation record, the candidate's invalidation and the REVISION_REQUIRED edge
+  // must all roll back if a later edge or the owner's REVISION_REQUEST is refused: an approval recorded as
+  // void while the run still holds it, or a run ACTIVE with nobody told, is worse than the retried refusal.
+  { file: "run/run-engine.ts", symbol: "returnApprovedCandidate", label: "RunEngine.returnApprovedCandidate", evidence: "direct" },
   // #246 C1 — dispatch's transaction now binds a staffed BOOTSTRAP_CTO before it pins and enqueues,
   // and can refuse after that bind (the bootstrap staffing re-check, the state edge). It was an
   // exemption while nothing in it wrote before a returned denial; the bind is such a write.

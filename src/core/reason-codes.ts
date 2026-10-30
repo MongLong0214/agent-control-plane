@@ -117,6 +117,13 @@ export const ReasonCode = {
   OWNER_AUTHORITY_NOT_DELEGABLE: "OWNER_AUTHORITY_NOT_DELEGABLE",
   HUMAN_GATE_REQUIRED: "HUMAN_GATE_REQUIRED",
   HUMAN_GATE_UNSATISFIED: "HUMAN_GATE_UNSATISFIED",
+  /**
+   * #1189 B1 — an OWNER_DECISION_REQUIRED that does not name an owner-only reason from
+   * `OWNER_ONLY_REASONS` and the specific action it blocks.
+   */
+  OWNER_DECISION_REASON_REQUIRED: "OWNER_DECISION_REASON_REQUIRED",
+  /** #1189 B1 — an OWNER_DECISION_REQUIRED whose reason is a judgement the CEO's own authority closes. */
+  OWNER_DECISION_CEO_SCOPE: "OWNER_DECISION_CEO_SCOPE",
 
   // --- CP-HI-08 No Silent Degradation -------------------------------------
   EVIDENCE_MISSING: "EVIDENCE_MISSING",
@@ -394,9 +401,26 @@ export const ReasonCode = {
   MERGE_BRANCH_PROFILE_UNSATISFIED: "MERGE_BRANCH_PROFILE_UNSATISFIED",
   MERGE_CLAIM_INVALID: "MERGE_CLAIM_INVALID",
   MERGE_ORDER_VIOLATION: "MERGE_ORDER_VIOLATION",
+  // #1189 B5 — GitHub says the pull does not merge cleanly, or a check the pinned manifest declares already
+  // failed on the candidate head; both refuse before any merge reservation, and the candidate goes back.
+  MERGE_CONFLICT: "MERGE_CONFLICT",
+  MERGE_CHECK_FAILED: "MERGE_CHECK_FAILED",
   GATE_EVIDENCE_NOT_BACKED: "GATE_EVIDENCE_NOT_BACKED",
   POST_MERGE_CHECKS_NOT_DECLARED: "POST_MERGE_CHECKS_NOT_DECLARED",
   POST_MERGE_VERIFICATION_FAILED: "POST_MERGE_VERIFICATION_FAILED",
+  /**
+   * #1189 B13 — the bounded post-merge wait ended with every failing declared check still missing or
+   * incomplete: no answer, so no receipt is written and the merge state stays pending. The run ends
+   * BLOCKED_POST_MERGE naming this, and the finalizer may retry the lookup on the same merge, within
+   * its budget. A check that answered anything but success is POST_MERGE_VERIFICATION_FAILED.
+   */
+  POST_MERGE_CHECKS_INCOMPLETE: "POST_MERGE_CHECKS_INCOMPLETE",
+  /**
+   * #1189 B15 — a CONTRACT_CHANGE confirmed without an activation grant was not cancelled: that its
+   * approval was never applied could not be confirmed. `evidence.classification` names why: a
+   * finalization in flight, an external effect whose outcome is unknown, or a grant record in error.
+   */
+  CANCEL_NON_APPLICATION_UNCONFIRMED: "CANCEL_NON_APPLICATION_UNCONFIRMED",
   DEPENDENT_MERGE_BLOCKED: "DEPENDENT_MERGE_BLOCKED",
   RELEASE_TAG_SEMVER_MISMATCH: "RELEASE_TAG_SEMVER_MISMATCH",
   RELEASE_TAG_COMMIT_NOT_ACCEPTED: "RELEASE_TAG_COMMIT_NOT_ACCEPTED",
@@ -925,6 +949,8 @@ export const ReasonCode = {
   OUTBOX_TARGET_NOT_CURRENT: "OUTBOX_TARGET_NOT_CURRENT",
   OUTBOX_DELIVERY_REJECTED: "OUTBOX_DELIVERY_REJECTED",
   OUTBOX_RETRY_POLICY_UNAVAILABLE: "OUTBOX_RETRY_POLICY_UNAVAILABLE",
+  /** #1189 — an incident resolved by evidence on its run: no notice is delivered, and a queued one is withdrawn. */
+  CEO_INCIDENT_RESOLVED: "CEO_INCIDENT_RESOLVED",
 
   // --- claim admission -----------------------------------------------------
   CLAIM_OWNER_NOT_RUN_OWNER: "CLAIM_OWNER_NOT_RUN_OWNER",
