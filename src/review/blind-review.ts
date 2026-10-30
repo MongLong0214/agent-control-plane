@@ -1,4 +1,4 @@
-import { frontierReviewPolicy } from "./frontier-simplify-policy.ts";
+import { FRONTIER_SIMPLIFY_SOURCE, frontierReviewPolicy, type FrontierSimplifySource } from "./frontier-simplify-policy.ts";
 import { frozenBootstrapReviewEvidence, originalReviewRecords, type FrozenReviewEvidence, type ReviewEvidenceFile } from "../bootstrap/bootstrap-review-evidence.ts";
 import type { ReviewRecordVerification } from "../bootstrap/bootstrap-review-evidence-github.ts";
 import { bootstrapServingRuntime, bootstrapCodeGuarantees, type BootstrapRuntimeObservation } from "../bootstrap/bootstrap-runtime-observation.ts";
@@ -229,6 +229,11 @@ export interface ReviewPacket {
      * `stdin` for Codex's joined string, `argv --append-system-prompt + stdin` for Claude.
      */
     reviewerInputRepresentations: string[];
+    /**
+     * #1270 — the review method every input above carried whole: the vendored frontier-simplify file's
+     * upstream repository, revision, path and digest. The candidate's REVIEW.md is never this.
+     */
+    methodology: FrontierSimplifySource;
   };
   coveredRepositories: string[];
   coveredFiles: string[];
@@ -479,6 +484,7 @@ const REVIEWER_TRANSPORT_OVERHEAD_CHARS = REVIEWER_TRANSPORT_INSTRUCTIONS.length
 
 /** Packet capabilities and the existing wire envelope, not review methodology. */
 const REVIEW_INPUT_STATEMENT =
+  "ACP's own reviewer contract, not part of frontier-simplify: " +
   "Return the existing ACP JSON envelope; findings.detail carries the finding text and omittedItems lists coverage limitations. " +
   "This is a packet-only invocation with no tools or disposable candidate checkout. The Actual diff and Files sections " +
   "are inline inputs. Unavailable evidence remains unavailable; " +
@@ -2161,6 +2167,7 @@ export class BlindReviewGate {
         reviewPolicies: input.reviewPolicies,
         reviewerPromptDigests: input.reviewerInputs.map(({ digest }) => digest),
         reviewerInputRepresentations: input.reviewerInputs.map(({ representation }) => representation),
+        methodology: { ...FRONTIER_SIMPLIFY_SOURCE },
       },
       coveredRepositories: [
         ...new Set(
@@ -2689,6 +2696,15 @@ const transmittedReviewerInput = (
   const input = adapter.transmittedReviewerInput?.(invocation);
   if (!input) {
     return deny(ReasonCode.EVIDENCE_MISSING, "reviewer adapter does not declare the input it transmits", {
+      runId,
+      provider: adapter.provider,
+    });
+  }
+  // #1270 — a reviewer whose transmitted input lost the method, or any part of it, is not asked: its
+  // verdict would not be a frontier-simplify review, so the review is unavailable rather than a PASS.
+  const method = frontierReviewPolicy();
+  if (![...input.argv.map(([, value]) => value), input.stdin].some((channel) => channel.includes(method))) {
+    return deny(ReasonCode.EVIDENCE_MISSING, "reviewer input does not carry the whole frontier-simplify method", {
       runId,
       provider: adapter.provider,
     });
