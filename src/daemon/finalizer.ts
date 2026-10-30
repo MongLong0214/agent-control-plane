@@ -206,6 +206,23 @@ const NOTES_PENDING_ROUTE: RetryRoute = {
     "its PENDING merge receipt stays until they do: restore the notes transport, or carry the notes and settle that receipt",
 };
 
+/**
+ * #1269 — a merge proven but for its notes whose run no longer holds the claim its notes are written under (the
+ * daemon was down past the claim's hold, or it was released): the lapsed claim is not revived and no transport is
+ * tried, so no automatic retry is left. The CEO is told the ownership needs recovery; the receipt stays PENDING,
+ * the run MERGING, and the target closed to other runs (`standingClaimSql`).
+ */
+const NOTES_OWNERSHIP_ROUTE: RetryRoute = {
+  disposition: "RETRY",
+  failureClass: "AUTHORITY_RECOVERY",
+  failureCause: "MERGE_NOTES_OWNERSHIP",
+  retries: 0,
+  owner: "CEO",
+  action: "ownership recovery needed: the pull request is merged and proven and its candidate's CommitLore notes are not on the remote, " +
+    "but the run no longer holds the claim its notes are written under; the lapsed claim is not revived and its target stays closed " +
+    "to other runs: recover the run's ownership of that target, or resolve the pending notes",
+};
+
 const retryDelayMs = (refusals: number): number =>
   Math.min(FINALIZATION_RETRY_BASE_MS * 2 ** (refusals - 1), FINALIZATION_RETRY_CEILING_MS);
 
@@ -451,6 +468,15 @@ export class ApprovedRunFinalizer {
           // #1269 — a merge proven but for its notes is settled only as that merge: the pull must read back merged
           // at the merge commit recorded for it, and then only its notes are carried.
           const proven = this.notesPendingMerge(runId, plan.repositoryIdentity, receipt.pullNumber);
+          // The notes are written under the run's own claim on its branch. A claim found lapsed is not revived and
+          // no transport is tried: the ownership of the target needs recovery (NOTES_OWNERSHIP_ROUTE).
+          if (proven !== null && !this.holdsBranchClaim(runId, plan.repositoryIdentity, plan.prepare.head)) {
+            return this.handleFailure(runId, attemptId, deny(ReasonCode.MERGE_CLAIM_INVALID,
+              "ownership recovery needed: the run no longer holds the claim its pending notes are written under", {
+                runId, repositoryIdentity: plan.repositoryIdentity, pullNumber: receipt.pullNumber, branch: plan.prepare.head,
+                mergeCommitSha: proven, phase: "notes-ownership",
+              }));
+          }
           const settled = await this.cp.github.mergeSettle({ ...plan.merge, pullNumber: receipt.pullNumber }, proven);
           if (!settled.allowed) return this.handleFailure(runId, attemptId, settled as Decision<unknown>);
         }
@@ -1328,8 +1354,11 @@ export class ApprovedRunFinalizer {
       });
       return failure as Decision<FinalizationResult>;
     }
+    // A notes write the guard refused for want of the claim is the same ownership loss, never a counted retry.
+    const ownershipLost = failure.reasonCode === ReasonCode.MERGE_CLAIM_INVALID ||
+      (failure.evidence as Record<string, unknown>)["cause"] === ReasonCode.WRITE_PATH_NOT_CLAIMED;
     let route = heldMerge === "MERGE_OUTCOME_UNKNOWN" ? UNKNOWN_MERGE_ROUTE
-      : heldMerge === "MERGE_NOTES_PENDING" ? NOTES_PENDING_ROUTE
+      : heldMerge === "MERGE_NOTES_PENDING" ? (ownershipLost ? NOTES_OWNERSHIP_ROUTE : NOTES_PENDING_ROUTE)
       : classifyPreMergeRefusal(run.kind, failure);
     this.cp.audit.record({
       kind: "FINALIZATION_ATTEMPT_FAILED",
@@ -1587,6 +1616,13 @@ export class ApprovedRunFinalizer {
       latest.evidence["pullNumber"] === pullNumber && typeof sha === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(sha)
       ? sha
       : null;
+  }
+
+  /** Whether the run still holds, under its current owner generation, the claim on `branch` its GitHub writes need. */
+  private holdsBranchClaim(runId: string, repositoryIdentity: string, branch: string): boolean {
+    const generation = this.cp.runs.get(runId)?.ownerBindingGeneration;
+    return this.cp.claims.heldByRun(runId).some((claim) =>
+      claim.repositoryIdentity === repositoryIdentity && claim.branch === branch && claim.ownerBindingGeneration === generation);
   }
 
   private touchAttempt(runId: string, attemptId: string, step: string): void {

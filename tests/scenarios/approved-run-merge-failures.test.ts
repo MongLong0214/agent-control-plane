@@ -4,7 +4,7 @@ import { acpError } from "../../src/core/errors.ts";
 import { sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
-import { RunState, Role, roleKeyFor } from "../../src/domain/types.ts";
+import { ExecutionMode, RunState, Role, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
 import { cleanupTempDirs, commitAll, gitSync, tempDir, writeFiles } from "../helpers/fixtures.ts";
@@ -577,6 +577,32 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
   };
   const restarted = (fixture: Fixture) =>
     new Daemon(fixture.harness.cp, { stateDir: tempDir("acp-b5-restart-"), watchdogIntervalMs: 24 * 60 * MINUTE });
+  /** Another run of the same project and repository, ACTIVE under its CTO: what may ask for the same target. */
+  const anotherRun = async ({ harness, driven }: Fixture) => {
+    const created = harness.cp.runs.create({
+      projectId: driven.projectId,
+      executionMode: ExecutionMode.STANDARD,
+      contract: { goal: "another change", why: "another reason", scope: ["src/other.js"], nonGoals: [], acceptance: ["verify.js exits 0"],
+        priority: "NORMAL", humanGate: [], references: [] },
+      repositories: [{ repositoryId: driven.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    });
+    if (!created.allowed) throw new Error(created.message);
+    const dispatched = await harness.cp.runs.dispatch(created.value.runId);
+    if (!dispatched.allowed) throw new Error(`${dispatched.reasonCode}: ${dispatched.message}`);
+    const run = dispatched.value;
+    return (branch: string) => harness.cp.claims.acquire({
+      runId: run.runId, ownerSessionId: run.ownerSessionId!, ownerBindingGeneration: run.ownerBindingGeneration!,
+      ownerRoleKey: run.ownerRoleKey!, repositoryIdentity: driven.identity, branch,
+    });
+  };
+  /** The notes-pending run's target stays closed to another run; an unrelated target of the same repository does not. */
+  const expectTargetClosed = async (fixture: Fixture): Promise<void> => {
+    const claim = await anotherRun(fixture);
+    const refused = claim(fixture.driven.workBranch);
+    expect(refused.reasonCode).toBe(ReasonCode.CLAIM_BRANCH_CONFLICT);
+    expect(refused.allowed === false && refused.evidence).toMatchObject({ heldByRun: fixture.driven.runId });
+    expect(claim("feature/unrelated").allowed).toBe(true);
+  };
 
   it("#1269: a merge whose answer was lost is settled by the daemon's next attempt, which carries the candidate's CommitLore notes to the remote without a second merge", async () => {
     let lose = true;
@@ -713,11 +739,57 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     harness.clock.advance(60 * MINUTE);
     await daemon.resumeApprovedRuns();
     await daemon.stop();
+    // Past every claim lease too: the restart attempts nothing, and the target stays closed to other runs.
+    harness.clock.advance(3 * 60 * MINUTE);
     const daemonNow = restarted(fixture);
     expect((await daemonNow.start()).allowed).toBe(true);
     expect(github.calls).toHaveLength(calls);
     expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.MERGING);
     expect(mergeReceipts(fixture)).toEqual([{ status: "PENDING", verified: 0 }]);
+    expect(harness.cp.claims.heldByRun(driven.runId).map((claim) => claim.branch)).not.toContain(driven.workBranch);
+    await expectTargetClosed(fixture);
+    expect(github.mergeCount).toBe(1);
+    await daemonNow.stop();
+  });
+
+  it("#1269: a notes retry that finds its claim lapsed (the daemon was down past the hold) sends nothing, revives nothing and tells the CEO ownership recovery is needed, once; the target stays closed to other runs and an unrelated one does not", async () => {
+    let down = true;
+    const fixture = await approved({ before: (method, path, body) => { if (down && isNotesRefWrite(method, path, body)) unheard(method); } });
+    const { harness, driven, daemon, github } = fixture;
+    noteOnCandidate(fixture);
+    expect((await daemon.start()).allowed).toBe(true);
+    expectNotesHeld(fixture, 1);
+    await daemon.stop();
+    harness.clock.advance(3 * 60 * MINUTE);
+    down = false;
+    const writes = () => github.calls.filter((call) => call.method !== "GET").length;
+    const before = writes();
+    let daemonNow = restarted(fixture);
+    expect((await daemonNow.start()).allowed).toBe(true);
+    expect(writes()).toBe(before);
+    expect(github.remoteNoteFor(driven.candidateHead)).toBeUndefined();
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.MERGING);
+    expect(mergeReceipts(fixture)).toEqual([{ status: "PENDING", verified: 0 }]);
+    expect(harness.cp.claims.heldByRun(driven.runId).map((claim) => claim.branch)).not.toContain(driven.workBranch);
+    expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CLAIM_RENEWED_FOR_FINALIZATION")).toEqual([]);
+    // Not a counted notes retry: one ownership hand-off, no automatic retry left.
+    expect(harness.cp.audit.forRun(driven.runId).filter((entry) =>
+      entry.kind === "FINALIZATION_RETRY_SCHEDULED" && entry.evidence.failureCause === "MERGE_NOTES_PENDING")).toHaveLength(1);
+    const handed = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_HANDED_OFF");
+    expect(handed).toHaveLength(1);
+    expect(handed[0]!.reasonCode).toBe(ReasonCode.MERGE_CLAIM_INVALID);
+    expect(handed[0]!.evidence).toMatchObject({ failureClass: "AUTHORITY_RECOVERY", failureCause: "MERGE_NOTES_OWNERSHIP", owner: "CEO", delivered: true });
+    const notices = outboxOf(fixture, "CEO_NOTIFICATION").filter((notice) => notice.payload.notification === "CRITICAL_SYSTEM_FAILURE");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.payload.action).toEqual(expect.stringContaining("ownership recovery needed"));
+    const calls = github.calls.length;
+    harness.clock.advance(60 * MINUTE);
+    await daemonNow.resumeApprovedRuns();
+    await daemonNow.stop();
+    daemonNow = restarted(fixture);
+    expect((await daemonNow.start()).allowed).toBe(true);
+    expect(github.calls).toHaveLength(calls);
+    await expectTargetClosed(fixture);
     expect(github.mergeCount).toBe(1);
     await daemonNow.stop();
   });
