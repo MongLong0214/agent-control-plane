@@ -3498,8 +3498,59 @@ export class Daemon {
     return [
       ...this.telegramIngressFindings(),
       ...this.buzzMentionSubscriberFindings(),
+      ...this.buzzMentionLivenessFindings(),
       ...this.unwakeableBindingFindings(),
     ];
+  }
+
+  /**
+   * #1283 — an admitted identity whose subscription the relay has not answered within the bound.
+   *
+   * Separate from the silent finding, and read whatever `framesHandled` says: on the live daemon
+   * the counters had moved before the outage, so the silent finding was suppressed, the five
+   * connections were ESTABLISHED and the relay was healthy, and doctor was clean for three days
+   * while no mention was delivered. The subscriber replaces a stalled connection by itself; this
+   * reports an identity that is still unanswered, or whose outage no probe has yet come back clean
+   * on, so a stall the reconnect cured clears on the next health tick and not on the replacement's
+   * own `EOSE`, which proves the stored query answers and not that delivery does.
+   */
+  private buzzMentionLivenessFindings(): Finding[] {
+    const liveness = this.#buzzMentionReceipt?.counters().liveness;
+    const stale = liveness?.identities.filter((one) => one.state === "STALE") ?? [];
+    if (liveness === undefined || stale.length === 0) return [];
+    return [{
+      code: "BUZZ_MENTION_SUBSCRIBER_STALE",
+      severity: "ERROR",
+      scope: "buzz",
+      blocking: false,
+      confidence: "HIGH",
+      observedEvidence: {
+        boundSeconds: liveness.boundSeconds,
+        staleIdentities: stale.map((one) => ({
+          identity: one.identity,
+          identityPubkey: one.identityPubkey,
+          roleKey: one.roleKey,
+          unansweredForSeconds: one.unansweredForSeconds,
+          answeredAtSeconds: one.answeredAtSeconds,
+          stalls: one.stalls,
+          lastStall: one.lastStall,
+          outageSinceSeconds: one.outageSinceSeconds,
+        })),
+        // The rest of the picture, so a stalled identity beside a deliberately excluded one is not
+        // read as one partial-but-healthy subscriber: how many are delivering, and why the
+        // excluded ones are not connected at all.
+        liveIdentities: liveness.identities.filter((one) => one.state === "LIVE").length,
+        excludedIdentities: liveness.identities
+          .filter((one) => one.state === "EXCLUDED")
+          .map((one) => ({ identity: one.identity, reason: one.exclusionReason })),
+      },
+      recommendedAction:
+        "the relay has not answered these identities' subscriptions within the bound, and reconnecting " +
+        "has not restored them, so their mentions are not being delivered; an ESTABLISHED connection or a " +
+        "healthy relay does not contradict this. Check the path to the relay. The subscriber keeps " +
+        "reconnecting from its preserved window, so the missed mentions are delivered once it answers; " +
+        "a daemon restart is not needed for that",
+    }];
   }
 
   private buzzMentionSubscriberFindings(): Finding[] {

@@ -649,7 +649,7 @@ export const retryDeferredNotices = (ports: NoticePorts): Array<{ correlation: s
 export const enqueueAdHocNotice = (
   ports: NoticePorts,
   kind: NotificationKind,
-  runId: string,
+  runId: string | null,
   payload: Record<string, unknown>,
 ): Decision<void> => {
   const auditEvidence = { notification: kind, ...withoutWhy(payload) };

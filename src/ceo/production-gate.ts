@@ -2125,8 +2125,12 @@ export class ProductionGate {
    * §19.3 — routine worker, test and review churn never reaches Hermes. Only the three documented
    * notification kinds are emitted, and only through `ceo-incident-notices.ts`. A notification no incident
    * states is keyed by its payload; a refused enqueue is returned, never dropped.
+   *
+   * `runId` is `null` for a `CRITICAL_SYSTEM_FAILURE` that belongs to no run, such as a Buzz mention
+   * subscription that stopped delivering (#1283). The CEO notification row, its delivery and its
+   * acknowledgement already carry a null run; only this signature did not.
    */
-  notify(kind: NotificationKind, runId: string, payload: Record<string, unknown>): Decision<void> {
+  notify(kind: NotificationKind, runId: string | null, payload: Record<string, unknown>): Decision<void> {
     return enqueueAdHocNotice(this.#notices, kind, runId, payload);
   }
 
