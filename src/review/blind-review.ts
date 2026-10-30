@@ -980,6 +980,23 @@ export class BlindReviewGate {
       },
     });
 
+    // #1271 — a REVISE or BLOCK whose only grounds are method findings judges the review method, not the
+    // candidate: it is no revision request and no PASS. The candidate waits for a fresh review, as after an
+    // unavailable one; the method findings are recorded with the review. A verdict with no findings at
+    // all, or with any finding about the candidate, is unchanged.
+    if (
+      validated.verdict !== "PASS" &&
+      validated.findings.length === 0 &&
+      validated.omittedItems.length === 0 &&
+      validated.methodFindings !== undefined
+    ) {
+      return deny(ReasonCode.REVIEW_REQUIRED, `blind review returned ${validated.verdict} on method findings alone; the candidate needs a fresh review`, {
+        runId,
+        problem: "METHOD_FINDINGS_ONLY",
+        verdict: validated.verdict,
+        methodFindings: validated.methodFindings.length,
+      });
+    }
     if (validated.verdict !== "PASS") {
       return deny(
         validated.verdict === "REVISE" ? ReasonCode.REVIEW_REVISE : ReasonCode.REVIEW_BLOCK,

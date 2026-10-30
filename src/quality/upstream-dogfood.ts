@@ -108,19 +108,45 @@ type DogfoodFinding = z.output<typeof dogfoodFindingSchema>;
 // Public text
 // ---------------------------------------------------------------------------
 
-const PATH_END = "[^\\s`'\"<>)\\]]*";
-/**
- * Every absolute path: home-relative, drive-rooted, or rooted at `/` anywhere but inside a URL or a
- * relative path. Each is private unless `PUBLIC_PATHS` names it.
- */
-const LOCAL_PATH = new RegExp(
-  `(?:~|\\$\\{?HOME\\}?)\\/${PATH_END}|(?<![A-Za-z0-9._~:/\\\\-])\\/[A-Za-z0-9._~-]${PATH_END}|\\b[A-Za-z]:\\\\${PATH_END}`,
-  "g",
+/** A run of text that may be a path or a URI: everything between whitespace and the marks no path is written with. */
+const TOKEN = /[^\s`'"<>()[\]{}|,;=]+/g;
+const TRAILING_MARKS = /[.,:;!?]+$/;
+const SEPARATOR = /[\\/]/;
+/** Segments joined by `/` or `\`, optionally ending in the line and column or line range a finding names. */
+const RELATIVE_PATH = /^(?:[A-Za-z0-9._@+*-]+[\\/])*[A-Za-z0-9._@+*-]+[\\/]?(?::\d+(?::\d+)?|#L\d+(?:-L\d+)?)?$/;
+const LOCATION_SUFFIX = /(?::\d+(?::\d+)?|#L\d+(?:-L\d+)?)$/;
+/** A link into one of the two upstream trackers: the reporter writes these itself. */
+const UPSTREAM_LINK = new RegExp(
+  `^https://github\\.com/(?:${[...UPSTREAM_SET].map((repository) => repository.replace(/[.-]/g, "\\$&")).join("|")})(?:/issues/\\d+(?:#issuecomment-\\d+)?)?$`,
 );
-/** The only absolute paths that name nothing about a machine or its owner. */
-const PUBLIC_PATHS: ReadonlySet<string> = new Set(["/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr"]);
-const isPublicPath = (path: string): boolean => PUBLIC_PATHS.has(path.replace(/[.,;:!?]+$/, ""));
-const hasPrivatePath = (value: string): boolean => [...value.matchAll(LOCAL_PATH)].some(([path]) => !isPublicPath(path));
+
+/**
+ * Whether a path-shaped token is private, decided by reading it as a path. Public is only a path
+ * relative to a repository that stays inside it once its `.` and `..` segments are resolved, and a
+ * link into an upstream tracker. Everything else that has a separator is private: an absolute path, a
+ * URI of any scheme (`file:` included), a drive, home or UNC path, a path glued to the word before it,
+ * and a path whose `..` segments leave the repository.
+ */
+const isPrivatePath = (token: string): boolean => {
+  if (!SEPARATOR.test(token) || /^[\\/]+$/.test(token)) return false;
+  if (UPSTREAM_LINK.test(token)) return false;
+  if (!RELATIVE_PATH.test(token)) return true;
+  let depth = 0;
+  for (const segment of token.replace(LOCATION_SUFFIX, "").split(SEPARATOR)) {
+    if (segment === "..") depth -= 1;
+    else if (segment !== "." && segment !== "") depth += 1;
+    if (depth < 0) return true;
+  }
+  return false;
+};
+
+const withoutTrailingMarks = (token: string): string => token.replace(TRAILING_MARKS, "");
+const scrubPaths = (value: string): string =>
+  value.replace(TOKEN, (token) => {
+    const path = withoutTrailingMarks(token);
+    return isPrivatePath(path) ? `<private-path>${token.slice(path.length)}` : token;
+  });
+const hasPrivatePath = (value: string): boolean => [...value.matchAll(TOKEN)].some(([token]) => isPrivatePath(withoutTrailingMarks(token)));
 const EMAIL = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
 const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
 const SESSION_ID = /\b(?:ses|sess|session)_[A-Za-z0-9]{8,}/g;
@@ -129,8 +155,7 @@ const MENTION = /(^|[^\w`])@([A-Za-z0-9][A-Za-z0-9-]*)/g;
 
 /** Credentials, private paths, addresses and run or session ids replaced. */
 export const scrubPublicText = (value: string): string =>
-  redactCredentialShapes(value)
-    .replace(LOCAL_PATH, (path) => (isPublicPath(path) ? path : "<local-path>"))
+  scrubPaths(redactCredentialShapes(value))
     .replace(EMAIL, "<email>")
     .replace(UUID, "<id>")
     .replace(SESSION_ID, "<id>")
@@ -401,7 +426,7 @@ const reviewMethodFinding = (
 };
 
 export interface DogfoodStoreDeps {
-  db: Pick<Db, "tx" | "all">;
+  db: Pick<Db, "tx" | "txDecision" | "all">;
   audit: Pick<AuditLog, "record">;
   artifacts: Pick<ArtifactStore, "list">;
   clock?: Clock;
@@ -471,7 +496,10 @@ export class DogfoodFindingStore {
    * A stored review's method finding that is CommitLore's too, split so each tracker gets its own side
    * (`splitAcrossProducts`): the frontier-simplify side is the review's own record of that finding, the
    * CommitLore side the caller's statement of CommitLore's part, and each names the other. Both are bound
-   * to the review; refused, like `recordReviewMethodFindings`, unless the gate stored it.
+   * to the review; refused, like `recordReviewMethodFindings`, unless the gate stored it. A
+   * frontier-simplify issue still to be written names the CommitLore side itself; one already written, or
+   * possibly written, gets a linking item queued for it: that side again, naming CommitLore's. Recording
+   * the same split again adds nothing, and nothing here sends anything.
    */
   recordAcrossProducts(
     review: { runId: string; artifactId: string; findingIndex: number },
@@ -499,11 +527,19 @@ export class DogfoodFindingStore {
     if (!sides[0]!.success || !sides[1]!.success) {
       return deny(ReasonCode.INVALID_ARGUMENT, "the CommitLore side is not a dogfood finding this store records", {});
     }
-    const methodSide = this.#store(sides[0]!.data, binding, { runId: review.runId, actor: "blind-review-gate" });
-    if (!methodSide.allowed) return methodSide as Decision<never>;
-    const commitloreSide = this.#store(sides[1]!.data, binding, origin);
-    if (!commitloreSide.allowed) return commitloreSide as Decision<never>;
-    return allow(ReasonCode.OK, [methodSide.value, commitloreSide.value]);
+    const [linking, commitloreHalf] = [sides[0]!.data, sides[1]!.data];
+    return this.#deps.db.txDecision(() => {
+      const methodSide = this.#storeMethodFinding(bound.value, review.findingIndex);
+      if (!methodSide.allowed) return methodSide as Decision<never>;
+      const commitloreSide = this.#store(commitloreHalf, binding, origin);
+      if (!commitloreSide.allowed) return commitloreSide as Decision<never>;
+      const written = methodSide.value.state.status === "LINKED" || methodSide.value.state.status === "IN_DOUBT";
+      if (written && commitloreSide.evidence["replayed"] === false) {
+        const queued = this.#store(linking, binding, { runId: review.runId, actor: "blind-review-gate" });
+        if (!queued.allowed) return queued as Decision<never>;
+      }
+      return allow(ReasonCode.OK, [methodSide.value, commitloreSide.value] as [DogfoodRecord, DogfoodRecord]);
+    });
   }
 
   #unbound(runId: string, artifactId: string, why: string): Decision<never> {
@@ -567,6 +603,8 @@ export class DogfoodFindingStore {
           actual: normalise(payload.fields.actual),
           evidence: payload.evidence,
           withheld: payload.evidenceWithheld,
+          // A side that names the other product's is apart from the same finding naming none.
+          related: finding.related?.key ?? null,
         }),
       ).slice(0, 16);
       const id = `${key}-${evidenceKey}`;
@@ -921,6 +959,11 @@ const footer = (record: DogfoodRecord): string[] => [
 
 type Counterpart = { product: DogfoodProduct; key: string; url: string | null };
 
+const relatedSection = (related: Counterpart | null): string[] =>
+  related === null
+    ? []
+    : ["", "## Related", `The ${related.product} side of this finding: ${related.url ?? `correlation \`${keyToken(related.key)}\` in ${UPSTREAM_REPOSITORIES[related.product]}`}.`];
+
 const issueBody = (record: DogfoodRecord, extra: { previous?: UpstreamIssue; related: Counterpart | null }): string => {
   const { fields } = record.public;
   const lines = [
@@ -939,14 +982,10 @@ const issueBody = (record: DogfoodRecord, extra: { previous?: UpstreamIssue; rel
     fields.workaround,
   ];
   if (extra.previous) lines.push("", "## Regression", `Previously reported as ${extra.previous.url}, which is closed; this is a new observation at the revision above.`);
-  const related = extra.related;
-  if (related) {
-    lines.push("", "## Related", `The ${related.product} side of this finding: ${related.url ?? `correlation \`${keyToken(related.key)}\` in ${UPSTREAM_REPOSITORIES[related.product]}`}.`);
-  }
-  return [...lines, ...footer(record)].join("\n");
+  return [...lines, ...relatedSection(extra.related), ...footer(record)].join("\n");
 };
 
-const commentBody = (record: DogfoodRecord): string =>
+const commentBody = (record: DogfoodRecord, related: Counterpart | null): string =>
   [
     "New observation of this finding.",
     "",
@@ -954,6 +993,7 @@ const commentBody = (record: DogfoodRecord): string =>
     record.public.fields.problem,
     "",
     ...observationSection(record),
+    ...relatedSection(related),
     ...footer(record),
   ].join("\n");
 
@@ -1090,7 +1130,7 @@ export class UpstreamDogfoodReporter {
     const title = plan.action === "regression" ? `Regression: ${record.public.fields.title}`.slice(0, 256) : record.public.fields.title;
     const body =
       plan.action === "commented"
-        ? commentBody(record)
+        ? commentBody(record, record.related === null ? null : this.#counterpart(record))
         : issueBody(record, { ...(plan.action === "regression" ? { previous: plan.previous } : {}), related: this.#counterpart(record) });
     // The publication scan's last word on the exact text, before anything is stored as sent.
     if (!isPublicSafe(body) || !isPublicSafe(title)) {

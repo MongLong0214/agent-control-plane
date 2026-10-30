@@ -15,6 +15,7 @@ import {
   findingKey,
   githubUpstreamIssuePort,
   isPublicSafe,
+  scrubPublicText,
   splitAcrossProducts,
 } from "../../src/quality/upstream-dogfood.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
@@ -162,6 +163,17 @@ const finding = (over: Partial<DogfoodFindingInput> = {}): DogfoodFindingInput =
 });
 
 const ORIGIN = { runId: null, actor: "test-boundary" };
+
+/** A reviewer's method finding that is CommitLore's too, and CommitLore's side of it. */
+const CROSS_METHOD_FINDING = {
+  category: "method",
+  severity: "MAJOR",
+  repository: "github:acme/fixture",
+  path: null,
+  summary: "The method asks for a review record CommitLore rejects",
+  detail: "The method asks for a Ruled-out line without an alternative, which the CommitLore verifier refuses.",
+};
+const CROSS_SIDE = { signature: "capture.rejects-review-record", expected: "CommitLore accepts the record the method asks for.", productRevision: "1.7.5" };
 
 const setup = (options: { maxAttempts?: number; publishing?: boolean } = {}) => {
   const harness = makeHarness();
@@ -505,19 +517,44 @@ describe("a dogfood finding reaches its own upstream tracker once, and is read b
     expect(upstream).toContain("Round four reopened a scope question the contract had already settled.");
   });
 
-  it("an absolute path outside the public allowlist is private: scrubbed before storage, and refused by the publication check", async () => {
+  it("only a repository-relative path that stays inside the repository is public: every other path is scrubbed before storage and refused by the publication check", async () => {
+    // The reviewer's bypasses, glued forms included, and each other non-repository form.
+    const blocked = [
+      "C:/work/private-customer/errors.log",
+      "file:///workspace/private-customer/errors.log",
+      "Failed:/workspace/private-customer/errors.log",
+      "/workspace/private-customer/project/errors.log",
+      "~/private-customer/notes.txt",
+      "C:\\private-customer\\errors.log",
+      "\\\\host\\private-customer\\errors.log",
+      "https://example.com/private-customer/errors.log",
+      "../private-customer/errors.log",
+      "src/../../private-customer/errors.log",
+    ];
+    const kept = ["src/a.ts", "./src/a.ts:12", "src/lib/../a.ts", "docs/guide.md"];
+    for (const value of blocked) {
+      expect(isPublicSafe(`Failed reading ${value} today.`), value).toBe(false);
+      expect(scrubPublicText(`Failed reading ${value} today.`), value).not.toContain("private-customer");
+    }
+    for (const value of kept) {
+      expect(isPublicSafe(`The change is in ${value}, as planned.`), value).toBe(true);
+      expect(scrubPublicText(`The change is in ${value}, as planned.`)).toBe(`The change is in ${value}, as planned.`);
+    }
+    // No absolute path is excepted; a link into an upstream tracker is the reporter's own and is kept.
+    expect(isPublicSafe("Output went to /dev/null.")).toBe(false);
+    expect(isPublicSafe("See https://github.com/MongLong0214/commitlore/issues/1 and src/a.ts.")).toBe(true);
+
+    // Through the real reporter and port, publishing on: what reaches the tracker.
     const { tracker, store, reporter } = setup();
     const record = recorded(store, finding({
       title: "Capture of /workspace/private-customer/project stalls",
-      actual: "Failed reading /workspace/private-customer/project/errors.log; output went to /dev/null.",
+      actual: `Failed reading ${blocked.join(" and ")}; the change is in ${kept.join(" and ")}.`,
     }));
     await reporter().reportDue();
     expect(store.get(record.id)!.state.status).toBe("LINKED");
     const [issue] = tracker.issues;
     expect(issue!.title + issue!.body).not.toContain("private-customer");
-    expect(issue!.body).toContain("/dev/null");
-    expect(isPublicSafe("Failed reading /workspace/private-customer/project/errors.log")).toBe(false);
-    expect(isPublicSafe("See https://github.com/MongLong0214/commitlore/issues/1 and /dev/null.")).toBe(true);
+    for (const value of kept) expect(issue!.body).toContain(value);
   });
 
   it("concurrent passes over two observations of one finding write one issue and one comment", async () => {
@@ -544,6 +581,52 @@ describe("a dogfood finding reaches its own upstream tracker once, and is read b
     expect(tracker.calls).toContain(`GET /repos/${CL}/issues/${edited.number}`);
     const state = store.get(record.id)!.state;
     expect(state.status === "LINKED" && state.issueNumber).not.toBe(edited.number);
+  });
+
+  it("a CommitLore side added after the frontier-simplify issue is linked queues one linking item and sends nothing", async () => {
+    const { harness, clock, tracker, store, reporter } = setup();
+    const reviewed = await driveToReviewedCandidate(harness, { reviewerFindings: [CROSS_METHOD_FINDING] });
+    await reporter().reportDue();
+    const [own] = store.list().records;
+    expect(own!.state.status).toBe("LINKED");
+    const review = harness.cp.artifacts.latestForSnapshot(reviewed.runId, "BLIND_REVIEW", reviewed.candidateSnapshotDigest)!;
+    const ref = { runId: reviewed.runId, artifactId: review.artifactId, findingIndex: 0 };
+    const sent = tracker.calls.length;
+
+    const split = store.recordAcrossProducts(ref, CROSS_SIDE, ORIGIN);
+    if (!split.allowed) throw new Error(split.message);
+    const commitloreKey = split.value[1].key;
+    const linking = () =>
+      store.list().records.filter((record) => record.product === "frontier-simplify" && record.key === own!.key && record.related?.key === commitloreKey);
+    expect(linking().map((record) => record.state.status)).toEqual(["QUEUED"]);
+
+    // Reprocessing adds nothing; with publishing off, nothing is sent.
+    const rows = harness.cp.audit.byKind(DOGFOOD_FINDING_KIND).length;
+    expect(store.recordAcrossProducts(ref, CROSS_SIDE, ORIGIN).allowed).toBe(true);
+    expect(harness.cp.audit.byKind(DOGFOOD_FINDING_KIND)).toHaveLength(rows);
+    const off = await new UpstreamDogfoodReporter(store, null, { clock }).reportDue();
+    expect(off.publishing).toBe("disabled");
+    expect(off.waiting).toContain(linking()[0]!.id);
+    expect(tracker.calls).toHaveLength(sent);
+    expect(linking()).toHaveLength(1);
+  });
+
+  it("the queued linking item, once publishing is on, makes the two issues name each other, and a second pass posts nothing", async () => {
+    const { harness, tracker, store, reporter } = setup();
+    const reviewed = await driveToReviewedCandidate(harness, { reviewerFindings: [CROSS_METHOD_FINDING] });
+    await reporter().reportDue();
+    const review = harness.cp.artifacts.latestForSnapshot(reviewed.runId, "BLIND_REVIEW", reviewed.candidateSnapshotDigest)!;
+    expect(store.recordAcrossProducts({ runId: reviewed.runId, artifactId: review.artifactId, findingIndex: 0 }, CROSS_SIDE, ORIGIN).allowed).toBe(true);
+    await reporter().reportDue();
+    const fs = tracker.issues.find((issue) => issue.repo === FS)!;
+    const cl = tracker.issues.find((issue) => issue.repo === CL)!;
+    expect(cl.body).toContain(`https://github.com/${FS}/issues/${fs.number}`);
+    expect(fs.comments.map((comment) => comment.body.includes(`https://github.com/${CL}/issues/${cl.number}`))).toEqual([true]);
+    const writes = tracker.writes().length;
+    await reporter().reportDue();
+    expect(store.recordAcrossProducts({ runId: reviewed.runId, artifactId: review.artifactId, findingIndex: 0 }, CROSS_SIDE, ORIGIN).allowed).toBe(true);
+    await reporter().reportDue();
+    expect(tracker.writes()).toHaveLength(writes);
   });
 
   it("a finding kept back for an undetermined cause is released when the same evidence is recorded as a product defect", async () => {
