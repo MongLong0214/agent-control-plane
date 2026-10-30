@@ -113,7 +113,10 @@ it("restarts a Codex worker from its real --thread-source launch and still requi
   expect(matched.argv).toContain("sandbox_workspace_write.exclude_slash_tmp=true");
   expect(matched.argv).toContain("sandbox_workspace_write.exclude_tmpdir_env_var=true");
   expect(matched.argv).toContain("sandbox_workspace_write.network_access=false");
-  expect(matched.argv).toContain("sandbox_workspace_write.writable_roots=[]");
+  // The one writable root besides the checkout is the turn's own temporary directory.
+  expect(matched.argv.filter((arg) => arg.startsWith("sandbox_workspace_write.writable_roots="))).toEqual([
+    expect.stringMatching(/^sandbox_workspace_write\.writable_roots=\["[^"]+\/acp-codex-turn-[^"/]+"\]$/),
+  ]);
   expect(matched.codexHome).toContain("/home");
 
   const mismatched = await reconcileCodexLaunch(({ token }) => { token.value = "darwin-tv:9999.000009"; });
@@ -138,7 +141,8 @@ it("pins the configured Codex home on the login probe and keeps the outer profil
   __testing.setRunCli(async (_file, args, options) => {
     expect(args).not.toContain("sandbox_workspace_write.exclude_slash_tmp=true");
     expect(args).not.toContain("sandbox_workspace_write.network_access=false");
-    expect(args).not.toContain("sandbox_workspace_write.writable_roots=[]");
+    expect(args.some((arg) => arg.startsWith("sandbox_workspace_write.writable_roots="))).toBe(false);
+    expect(options.turnTemp).toBeUndefined();
     seen.push({
       command: args.slice(0, 2).join(" "),
       sandbox: options.sandbox ?? "outer-profile",
@@ -174,7 +178,8 @@ it("pins the configured Codex home on the login probe and keeps the outer profil
     expect(args).toContain("sandbox_workspace_write.exclude_slash_tmp=true");
     expect(args).toContain("sandbox_workspace_write.exclude_tmpdir_env_var=true");
     expect(args).toContain("sandbox_workspace_write.network_access=false");
-    expect(args).toContain("sandbox_workspace_write.writable_roots=[]");
+    expect(options.turnTemp).toMatch(/\/acp-codex-turn-[^/]+$/);
+    expect(args).toContain(`sandbox_workspace_write.writable_roots=${JSON.stringify([options.turnTemp])}`);
     expect(args[args.indexOf("--thread-source") + 1]).toBe(session);
     expect(options.codexHome).toBe(account);
     return ok;

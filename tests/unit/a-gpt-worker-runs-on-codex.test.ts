@@ -300,7 +300,9 @@ describe("a worker turn runs on the bound session", () => {
     expect(report.args).toContain("sandbox_workspace_write.exclude_slash_tmp=true");
     expect(report.args).toContain("sandbox_workspace_write.exclude_tmpdir_env_var=true");
     expect(report.args).toContain("sandbox_workspace_write.network_access=false");
-    expect(report.args).toContain("sandbox_workspace_write.writable_roots=[]");
+    expect(report.args.filter((arg) => arg.startsWith("sandbox_workspace_write.writable_roots="))).toEqual([
+      expect.stringMatching(/^sandbox_workspace_write\.writable_roots=\["[^"]+\/acp-codex-turn-[^"/]+"\]$/),
+    ]);
     expect(report.args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
     expect(report.args[report.args.indexOf("--thread-source") + 1]).toBe(world.worker.externalSessionId);
     expect(report.stdin).toBe("");

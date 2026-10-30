@@ -23,7 +23,7 @@ import { type ManagedWriteGuard, WriteOperation } from "../guard/managed-write-g
 import { canonical } from "../guard/workspace-probe.ts";
 import { residentRepository } from "../registry/resident-repositories.ts";
 import { providerHome } from "../runtime/cli-adapters.ts";
-import type { InvocationResult, ProviderAdapter } from "../runtime/provider.ts";
+import { type InvocationResult, type ProviderAdapter, type TurnScratchListing, TurnScratchThrown } from "../runtime/provider.ts";
 import { randomUUID } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
@@ -2215,6 +2215,7 @@ export class WorkerTurnRunner {
     let spawned = false;
     let result: InvocationResult | null = null;
     let thrown: string | null = null;
+    let thrownScratch: TurnScratchListing | null = null;
     let launchRecorded = false;
     const timer = setTimeout(() => {
       timedOut = true;
@@ -2271,7 +2272,8 @@ export class WorkerTurnRunner {
         signal: controller.signal,
       });
     } catch (error) {
-      thrown = errorText(error);
+      thrown = errorText(error instanceof TurnScratchThrown ? error.thrown : error);
+      if (error instanceof TurnScratchThrown) thrownScratch = error.turnScratch;
     } finally {
       clearTimeout(timer);
       clearInterval(poll);
@@ -2281,7 +2283,7 @@ export class WorkerTurnRunner {
     const processGone = await this.settleProcess(executionId);
     if (launchRecorded) this.recordLaunchEnd(facts, executionId, result);
     try {
-      await this.conclude(facts, executionId, { result, thrown, spawned, timedOut, stopped, processGone, stopping: inFlight.stopping });
+      await this.conclude(facts, executionId, { result, thrown, thrownScratch, spawned, timedOut, stopped, processGone, stopping: inFlight.stopping });
     } catch (error) {
       // The runner must leave a record even when its own evaluation fails; the bytes stay as they are.
       this.fail(facts, executionId, "FAILED", "infrastructure", {
@@ -2291,6 +2293,7 @@ export class WorkerTurnRunner {
         exitCode: result?.exitCode ?? null,
         stdoutSha256: result ? sha256(result.stdout ?? result.text) : null,
         diffDigest: null,
+        ...((result?.turnScratch ?? thrownScratch) ? { turnScratch: result?.turnScratch ?? thrownScratch } : {}),
       });
     }
   }
@@ -2301,6 +2304,7 @@ export class WorkerTurnRunner {
     turn: {
       result: InvocationResult | null;
       thrown: string | null;
+      thrownScratch: TurnScratchListing | null;
       spawned: boolean;
       timedOut: boolean;
       stopped: boolean;
@@ -2320,6 +2324,8 @@ export class WorkerTurnRunner {
       // S2 — kept on every outcome, a late one included: a group its cleanup did not confirm ended keeps
       // the checkout from the run's next task (`settledWriter`) until it is seen gone.
       ...(result?.processGroup ? { processGroup: result.processGroup } : {}),
+      // What a GPT worker turn wrote to its private temporary directory, which is already removed.
+      ...((result?.turnScratch ?? turn.thrownScratch) ? { turnScratch: result?.turnScratch ?? turn.thrownScratch } : {}),
     };
     // Observed for every outcome whose writer is gone, so a failure keeps the digest of whatever the
     // turn left behind. A writer that may still be running is not read at all.
@@ -2522,6 +2528,8 @@ export class WorkerTurnRunner {
             ...(ignoredChanges ? { ignoredChanges } : {}),
             // #1268 — what CommitLore recorded on the commit, read back from it: nothing, or its records.
             ...(settledCommitLore.value ? { commitlore: settledCommitLore.value } : {}),
+            // Also not an input of the digest.
+            ...(result.turnScratch ? { turnScratch: result.turnScratch } : {}),
           },
         });
         if (!recorded.allowed) {
