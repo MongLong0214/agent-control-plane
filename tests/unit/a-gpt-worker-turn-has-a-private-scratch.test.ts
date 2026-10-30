@@ -25,7 +25,7 @@ afterAll(cleanupTempDirs);
 
 const STUB = String.raw`
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const here = dirname(process.argv[1]);
@@ -43,6 +43,8 @@ if (mode !== "ok" && mode !== "fail") {
   if (mode.startsWith("chmod")) {
     // A link out of the scratch, to a directory whose permissions the cleanup must not change.
     mkdirSync(join(here, "outside"), { mode: 0o500 });
+    // A hard link to a checkout file: the same inode, so a chmod on it would change the checkout.
+    if (mode === "chmod-hardlink") linkSync(join(process.cwd(), "src", "app.js"), join(process.env.TMPDIR, "app-link.js"));
     symlinkSync(join(here, "outside"), join(process.env.TMPDIR, "outside-link"));
     chmodSync(process.env.TMPDIR, 0o500);
   }
@@ -119,7 +121,7 @@ if (status.status === compile.constants.compileCacheStatus.FAILED || status.dire
 }
 `;
 
-type Mode = "ok" | "fail" | "revoke" | "throw" | "chmod" | "chmod-throw" | "uchg";
+type Mode = "ok" | "fail" | "revoke" | "throw" | "chmod" | "chmod-throw" | "chmod-hardlink" | "uchg";
 
 const stubCodex = (root: string, mode: Mode, sibling: string, slashTmp: string): string => {
   const binary = join(root, "codex");
@@ -170,6 +172,8 @@ const runTurn = async (mode: Mode) => {
       }
       : world.broker,
   });
+  const appMode = (): number => statSync(join(world.repoPath, "src", "app.js")).mode & 0o7777;
+  const appModeBefore = appMode();
   const texts: string[] = [];
   const answers: InvocationResult[] = [];
   const runner = new WorkerTurnRunner(
@@ -229,6 +233,8 @@ const runTurn = async (mode: Mode) => {
       stub,
       answers,
       root,
+      appModeBefore,
+      appModeAfter: appMode(),
       revokedScratch: existsSync(join(root, "tmpdir")) ? readFileSync(join(root, "tmpdir"), "utf8") : null,
       sibling,
       slashTmpWritten: existsSync(slashTmp),
@@ -381,6 +387,22 @@ describe("a scratch that cannot be removed never replaces the turn's outcome", (
     expect(recorded.paths).toContain("cache-evidence.txt");
     expect(recorded.cleanup).toEqual({ path: turn.revokedScratch, code: "EACCES", left: false });
     expect(existsSync(turn.revokedScratch!)).toBe(false);
+  });
+
+  it("restores access on directories only, so a hard link to a checkout file leaves that file's mode alone", async () => {
+    const turn = await runTurn("chmod-hardlink");
+    rmSync(turn.sibling, { recursive: true, force: true });
+    expect(turn.execution.status, turn.described).toBe("FAILED");
+    expect(turn.answers).toHaveLength(1);
+    expect(turn.answers[0]!.exitCode).toBe(1);
+    const recorded = failureScratch(turn);
+    expect(recorded.paths).toContain("app-link.js");
+    expect(recorded.cleanup).toEqual({ path: turn.revokedScratch, code: "EACCES", left: false });
+    expect(existsSync(turn.revokedScratch!)).toBe(false);
+    // Not executable before, so any owner chmod on the shared inode would show.
+    expect(turn.appModeBefore & 0o700).not.toBe(0o700);
+    expect(turn.appModeAfter).toBe(turn.appModeBefore);
+    expect(turn.checkout).toBe("");
   });
 
   it("records a scratch it could not remove at all as left, and keeps the outcome", async () => {

@@ -2997,9 +2997,10 @@ const errorCode = (error: unknown): string =>
   typeof (error as NodeJS.ErrnoException | null)?.code === "string" ? (error as NodeJS.ErrnoException).code! : "UNKNOWN";
 
 /**
- * Gives the owner read, write and search on `root` and everything under it, so it can be removed.
- * A symbolic link is never followed or changed; nothing outside `root` is touched. Bounded like the
- * listing; a failure on one entry leaves the rest to the removal.
+ * Gives the owner read, write and search on `root` and every directory under it, so it can be
+ * removed. No file's mode is changed, a symbolic link is never followed or changed, and nothing
+ * outside `root` is touched. Bounded like the listing; a failure on one entry leaves the rest to the
+ * removal.
  */
 const restoreOwnerAccess = (root: string): void => {
   let visited = 0;
@@ -3009,12 +3010,12 @@ const restoreOwnerAccess = (root: string): void => {
     const path = relative === "" ? root : join(root, relative);
     visited += 1;
     try {
+      // Directories only, never through a link: removing a file needs write permission on its
+      // directory, not on the file, and a file here may be a hard link to one in the checkout.
       const entry = lstatSync(path);
-      if (entry.isSymbolicLink()) continue;
+      if (!entry.isDirectory()) continue;
       chmodSync(path, (entry.mode & 0o7777) | 0o700);
-      if (entry.isDirectory()) {
-        for (const name of readdirSync(path)) pending.push(relative === "" ? name : `${relative}/${name}`);
-      }
+      for (const name of readdirSync(path)) pending.push(relative === "" ? name : `${relative}/${name}`);
     } catch {
       // Left to the removal, which reports what remains.
     }
