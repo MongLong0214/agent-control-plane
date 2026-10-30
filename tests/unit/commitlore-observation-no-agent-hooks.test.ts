@@ -13,6 +13,7 @@ import {
   requiredCommitLoreObservation,
 } from "../../src/bootstrap/commitlore-observation.ts";
 import { latestRelease } from "../helpers/commitlore-release.ts";
+import { writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -97,13 +98,11 @@ interface FakeOptions {
  */
 const fake = (name: string, { offersNoAgentHooks, writesIntoTreeAnyway = false, initHelp }: FakeOptions): { bin: string; log: string } => {
   const dir = tempDir(`acp-r2-${name}-`);
-  const bin = join(dir, "commitlore");
   const log = join(dir, "argv.log");
-  writeFileSync(join(dir, "package.json"), '{"type":"commonjs"}');
-  writeFileSync(
-    bin,
-    `#!${process.execPath}
-const fs = require('node:fs');
+  // #1268 — installed as the installer installs it: a run copies the package its wrapper names.
+  const { wrapper: bin } = writeCommitLoreInstall(
+    dir,
+    `const fs = require('node:fs');
 const argv = process.argv.slice(2).join(' ');
 fs.appendFileSync(${JSON.stringify(log)}, argv + '\\n');
 const answer = (text, code) => process.stdout.write(text, () => process.exit(code));
@@ -119,7 +118,7 @@ else if (argv === ${JSON.stringify(INIT)} && ${offersNoAgentHooks}) { gitHook();
 else if (argv === 'doctor --json') answer(${JSON.stringify(`${DEGRADED_REPORT}\n`)}, 0);
 else refuse();
 `,
-    { mode: 0o700 },
+    { version: "1.7.4" },
   );
   return { bin, log };
 };
@@ -145,7 +144,7 @@ describe("R2: the observation's init carries --no-agent-hooks, and a CommitLore 
     const hooksBefore = hooks(checkout);
 
     // The refusal, uncut, as the pin's checks give it.
-    await expect(commitloreRunner(COMMITLORE_LIMITS, cli.bin, latestRelease("1.7.4")).ready(checkout)).rejects.toThrow(
+    await expect(commitloreRunner(COMMITLORE_LIMITS, cli.bin, latestRelease("1.7.4")).prepare(checkout, { gitDir: join(checkout, ".git"), workTree: checkout }, { checked: true })).rejects.toThrow(
       `ACP_COMMITLORE_BINARY NO_INIT_OPTION: ${cli.bin} init does not offer --no-agent-hooks, which the observation needs so that it writes nothing into the checkout`,
     );
     expect(argvs(cli.log)).toEqual(CHECKS);

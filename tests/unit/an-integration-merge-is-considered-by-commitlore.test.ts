@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
@@ -10,9 +10,10 @@ import { ExecutionMode, Role, RunKind } from "../../src/domain/types.ts";
 import type * as Integration from "../../src/run/candidate-integration.ts";
 import { CANDIDATE_REF_NAMESPACE } from "../../src/run/candidate-integration.ts";
 import { GuardedInvocationWriteBroker } from "../../src/runtime/provider.ts";
+import { writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { latestRelease } from "../helpers/commitlore-release.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
-import { cleanupTempDirs, gitSync } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import { registerFixtureProject } from "../helpers/harness.ts";
 import { FakeWorkerAdapter, type FakeTurnScript } from "../helpers/worker-turn-fixture.ts";
 
@@ -184,7 +185,109 @@ describe("#1268 review r2 P1: an integration merge commit's message is checked b
       expect(gitSync(s.repo, ["rev-list", "--parents", "-n", "1", head]).split(" ").slice(1)).toHaveLength(2);
       expect(gitSync(s.repo, ["log", "-1", "--format=%B", head])).not.toContain("Record-Id:");
       const evidence = f.harness.cp.audit.byKind("CANDIDATE_FROZEN").filter((row) => row.runId === s.runId).at(-1)?.evidence;
-      expect((evidence?.["repositories"] as Array<Record<string, unknown>>)[0]).toMatchObject({ integratedTasks: 2, commitloreMessageChecked: 1 });
+      const parents = gitSync(s.repo, ["rev-list", "--parents", "-n", "1", head]).split(" ").slice(1);
+      expect((evidence?.["repositories"] as Array<Record<string, unknown>>)[0]).toMatchObject({
+        integratedTasks: 2,
+        commitloreMergeChecks: [{ commit: head, parents, tree: gitSync(s.repo, ["rev-parse", `${head}^{tree}`]) }],
+      });
+    });
+  }, 180_000);
+
+  /**
+   * The reviewer's instrumentation: a CommitLore whose `validate` reports what its git sees — the index it was
+   * given, the staged diff against the worktree's HEAD, the git dir — and, in `tamper` mode, adds a path to that
+   * index while it checks. Its other answers are a supported CLI's.
+   */
+  const instrumented = (mode: "observe" | "tamper") => {
+    const dir = tempDir("acp-1268-merge-instrument-");
+    const log = join(dir, "validate.jsonl");
+    const { wrapper } = writeCommitLoreInstall(
+      dir,
+      `const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+const argv = process.argv.slice(2);
+const answer = (text) => process.stdout.write(text, () => process.exit(0));
+if (argv.join(' ') === '--version') return answer('1.7.3\\n');
+if (argv.join(' ') === 'doctor --help') return answer('Usage: commitlore doctor [options]\\n\\nOptions:\\n  --json  emit the report as JSON\\n');
+if (argv.join(' ') === 'init --help') return answer('Usage: commitlore init [options]\\n\\nOptions:\\n  --mcp-scope <scope>  where\\n  --no-unattended      off\\n  --no-agent-hooks     nothing in the tree\\n');
+if (argv[0] !== 'validate') return process.stderr.write('unknown ' + argv.join(' ') + '\\n', () => process.exit(2));
+const git = (args, input) => spawnSync('git', args, { env: process.env, input: input ?? '', encoding: 'utf8', timeout: 20000 });
+const staged = git(['diff', '--cached', '--name-only']).stdout.split('\\n').filter(Boolean);
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ indexFile: process.env.GIT_INDEX_FILE ?? null, gitDir: process.env.GIT_DIR ?? null, staged, message: fs.readFileSync(argv[argv.indexOf('--message-file') + 1], 'utf8') }) + '\\n');
+if (${JSON.stringify(mode)} === 'tamper') {
+  const blob = git(['hash-object', '-w', '--stdin'], 'stray\\n').stdout.trim();
+  git(['update-index', '--add', '--cacheinfo', '100644,' + blob + ',stray.txt']);
+}
+answer(JSON.stringify({ examined: 1, checks: [], violations: [], secrets: [] }) + '\\n');
+`,
+      { version: "1.7.3" },
+    );
+    const port = createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, wrapper, latestRelease("1.7.3")));
+    const seen = (): Array<{ indexFile: string | null; gitDir: string | null; staged: string[]; message: string }> =>
+      existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
+    return { port, seen };
+  };
+
+  it("review r3 P1: the check runs with the merge's own index, whose staged diff is the merge's change; the evidence binds its parents and tree", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await twoTasks(f, "cl-merge-instrumented");
+      const { port, seen } = instrumented("observe");
+      injected.consider = (input) => checkGeneratedCommitMessage(port, input);
+      const frozen = await f.harness.cp.pipeline.freeze(s.runId);
+      if (!frozen.allowed) throw new Error(`${frozen.reasonCode}: ${frozen.message} ${JSON.stringify(frozen.evidence)}`);
+      const head = frozen.value.repositories[0]!.candidateHead;
+      const [check] = seen();
+      expect(seen()).toHaveLength(1);
+      // Not the registered checkout's empty staged diff: the integration's private index, staging both tasks.
+      expect(check!.indexFile).toMatch(/integration\.index$/);
+      expect(check!.gitDir).not.toBe(join(s.checkoutPath, ".git"));
+      expect(check!.staged.sort()).toEqual(["README.md", "src/app.js"]);
+      expect(check!.message.trim()).toMatch(/^Integrate: /);
+      const parents = gitSync(s.repo, ["rev-list", "--parents", "-n", "1", head]).split(" ").slice(1);
+      const evidence = f.harness.cp.audit.byKind("CANDIDATE_FROZEN").filter((row) => row.runId === s.runId).at(-1)?.evidence;
+      expect((evidence?.["repositories"] as Array<Record<string, unknown>>)[0]).toMatchObject({
+        commitloreMergeChecks: [{ commit: head, parents, tree: gitSync(s.repo, ["rev-parse", `${head}^{tree}`]) }],
+      });
+    });
+  }, 180_000);
+
+  it("review r3 P1 input-swap controls: a check after which the index, a parent's value or order, the tree or the message differs is refused before the merge is made", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await twoTasks(f, "cl-merge-swaps");
+      const controls: Array<[string, (input: Parameters<Integration.CheckMergeMessage>[0]) => void, string]> = [
+        ["reorders the parents", (input) => input.parents.reverse(), "parents"],
+        ["replaces a parent", (input) => { input.parents[1] = input.parents[0]; }, "parents"],
+        ["changes the tree", (input) => { input.tree = "0".repeat(40); }, "tree"],
+        ["changes the message", (input) => { input.message = `${input.message} (changed)`; }, "message"],
+        ["swaps the index for another", (input) => { input.index = `${input.index}.other`; }, "index"],
+      ];
+      for (const [name, swap, field] of controls) {
+        injected.consider = async (input) => {
+          swap(input);
+          return allow(ReasonCode.OK, undefined);
+        };
+        const frozen = await f.harness.cp.pipeline.freeze(s.runId);
+        expect(frozen, `${name}: ${JSON.stringify(frozen)}`).toMatchObject({ allowed: false, evidence: { refusal: "COMMITLORE_MERGE_UNBOUND", observed: { differing: [field] } } });
+        expect(candidateRefsOf(s.repo, s.runId), name).toBe("");
+      }
+      // Control: the same check, swapping nothing, passes, and the merge is the one it was bound to.
+      injected.consider = async () => allow(ReasonCode.OK, undefined);
+      const frozen = await f.harness.cp.pipeline.freeze(s.runId);
+      if (!frozen.allowed) throw new Error(`${frozen.reasonCode}: ${frozen.message}`);
+      expect(f.harness.cp.audit.byKind("CANDIDATE_FROZEN").filter((row) => row.runId === s.runId)).toHaveLength(1);
+    });
+  }, 300_000);
+
+  it("review r3 P1: a merge whose tree is not the one its check was bound to is refused at freeze, and no candidate is kept", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await twoTasks(f, "cl-merge-tampered");
+      const { port, seen } = instrumented("tamper");
+      injected.consider = (input) => checkGeneratedCommitMessage(port, input);
+      const frozen = await f.harness.cp.pipeline.freeze(s.runId);
+      expect(frozen, JSON.stringify(frozen)).toMatchObject({ allowed: false, evidence: { refusal: "COMMITLORE_MERGE_UNBOUND", observed: { differing: ["index", "tree"] } } });
+      expect(seen()).toHaveLength(1);
+      expect(candidateRefsOf(s.repo, s.runId)).toBe("");
+      expect(f.harness.cp.audit.byKind("CANDIDATE_FROZEN").filter((row) => row.runId === s.runId)).toEqual([]);
     });
   }, 180_000);
 });

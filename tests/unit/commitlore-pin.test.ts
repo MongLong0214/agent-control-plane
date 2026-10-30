@@ -25,7 +25,6 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import {
   COMMITLORE_LIMITS,
   COMMITLORE_OBSERVATION_ARGV,
-  OBSERVATION_HARDENING_EXCEPTION,
   commitloreChildEnvironment,
   commitloreChildHome,
   commitloreRunner,
@@ -44,8 +43,8 @@ import {
   judgeCommitLoreVersion,
 } from "../../src/bootstrap/commitlore-pin.ts";
 import { latestRelease, stableReleaseAnswer } from "../helpers/commitlore-release.ts";
+import { packageVersionFor, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { gitHardeningEnvironment, pinnedGitEnvironment } from "../../src/run/worker-git.ts";
 
 /**
  * Slice S16 (#246 B3) — the `commitlore` a required bootstrap runs is the one `ACP_COMMITLORE_BINARY` pins,
@@ -227,10 +226,13 @@ interface FakeOptions {
   mode?: number;
 }
 
-/** A fake `commitlore` in a directory of its own; every invocation appends its argv and environment to `log`. */
-const fake = (name: string, options: FakeOptions = {}): { dir: string; bin: string; log: string } => {
+/**
+ * A fake `commitlore` in a directory of its own, installed as CommitLore's installer installs it (#1268: a run
+ * copies the package its wrapper names, so a fixture is a package): `bin` is the wrapper, `bundle` the program.
+ * Every invocation appends its argv and environment to `log`.
+ */
+const fake = (name: string, options: FakeOptions = {}): { dir: string; bin: string; log: string; bundle: string } => {
   const dir = tempDir(`acp-s16-${name}-`);
-  const bin = join(dir, "commitlore");
   const log = join(dir, "invocations.jsonl");
   const {
     version = "1.7.3\n",
@@ -249,11 +251,9 @@ const fake = (name: string, options: FakeOptions = {}): { dir: string; bin: stri
   } = options;
   const unknownAnswer =
     unknown === "root-usage" ? `answer(${JSON.stringify(ROOT_USAGE)}, 0)` : `process.stderr.write("error: unknown command or option '" + argv.join(' ') + "'\\n", () => process.exit(2))`;
-  writeFileSync(join(dir, "package.json"), '{"type":"commonjs"}');
-  writeFileSync(
-    bin,
-    `#!${process.execPath}
-const fs = require('node:fs');
+  const installed = writeCommitLoreInstall(
+    dir,
+    `const fs = require('node:fs');
 const argv = process.argv.slice(2);
 const [command, flag] = argv;
 fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv, env: process.env, origin: performance.timeOrigin, first: performance.timeOrigin + performance.now() }) + '\\n');
@@ -266,9 +266,9 @@ else if (command === 'init' && flag === '--help' && argv.length === 2) ${hasInit
 else if (${hasInit} && argv.join(' ') === ${JSON.stringify(INIT)}) answer('', ${initExit});
 else ${unknownAnswer};
 `,
-    { mode: options.mode ?? 0o700 },
+    { version: packageVersionFor(version), mode: options.mode ?? 0o700 },
   );
-  return { dir, bin, log };
+  return { dir, bin: installed.wrapper, log, bundle: installed.bundle };
 };
 
 const invocations = (log: string): Array<{ argv: string[]; env: Record<string, string>; origin: number; first: number }> => {
@@ -533,7 +533,11 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
     vi.stubEnv("GIT_CONFIG_VALUE_1", "s16-only-count");
     await probeCommitLore(envPort());
     const checks = invocations(pinned.log).filter(({ argv }) => argv[0] === "--version" || argv[1] === "--help");
-    const observationHardening = gitHardeningEnvironment({ except: [OBSERVATION_HARDENING_EXCEPTION] });
+    // #1268 — the observation's environment: the worker's git hardening bar the hooks path and the empty attribute
+    // source, on top of S11-R3's controls.
+    const observationEnvironment = commitloreChildEnvironment("/", { gitDir: "/", workTree: "/", installsHooks: true });
+    const observationHardening = Object.fromEntries(Object.entries(observationEnvironment).filter(([key]) => /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/.test(key)));
+    expect(Object.values(observationHardening)).toEqual(expect.arrayContaining(["credential.helper", "core.fsmonitor"]));
     expect(checks.map(({ argv }) => argv.join(" "))).toEqual(["--version", "doctor --help", "init --help"]);
     const constructed = new Set([
       "PATH",
@@ -548,8 +552,7 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
       "GIT_TERMINAL_PROMPT",
       "GIT_SSH_COMMAND",
       // #1268 — the worker's git hardening, bar the hooks path init installs into: every value ACP's own.
-      ...Object.keys(pinnedGitEnvironment({ gitDir: "/", workTree: "/" })),
-      ...Object.keys(observationHardening),
+      ...Object.keys(observationEnvironment).filter((key) => key.startsWith("GIT_")),
     ]);
     for (const { env } of checks) {
       expect(Object.keys(env).filter((key) => !constructed.has(key) && key !== "__CF_USER_TEXT_ENCODING")).toEqual([]);
@@ -567,6 +570,7 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
         GIT_ASKPASS: "",
         GIT_TERMINAL_PROMPT: "0",
         GIT_SSH_COMMAND: "ssh",
+        GIT_ATTR_SOURCE: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
       });
       expect(Object.entries(observationHardening)).toContainEqual([expect.stringMatching(/^GIT_CONFIG_KEY_/), "credential.helper"]);
     }
@@ -735,7 +739,8 @@ describe("S16-R1-02: every spawn after the checks is preceded by a re-check that
     const bad = uncheckedTarget();
     const good = fake("renamed-over", {});
     const pin = good.bin;
-    writeFileSync(pin, readFileSync(pin, "utf8").replace("const answer =", `if (argv.join(' ') === 'doctor --help') { ${renameOver(pin, bad.bin)} }\nconst answer =`), { mode: 0o700 });
+    // The program is the package's bundle (#1268); the pin it renames over is the wrapper.
+    writeFileSync(good.bundle, readFileSync(good.bundle, "utf8").replace("const answer =", `if (argv.join(' ') === 'doctor --help') { ${renameOver(pin, bad.bin)} }\nconst answer =`), { mode: 0o700 });
     const probed = await observeAt(pin);
     expect(probed).toMatchObject({ allowed: false, evidence: { observation: { outcome: "FAIL", detail: expect.stringContaining(`${VARIABLE} REPLACED`) } } });
     expect(argvs(bad.log)).toEqual([]);
@@ -756,7 +761,7 @@ describe("S16-R1-02: every spawn after the checks is preceded by a re-check that
     const good = fake("changed", {});
     const target = linked ? pin : good.bin;
     const code = how === "rewrite" ? rewrite(target, bad.bin) : how === "touch" ? touch(target) : swapLink(target, bad.bin);
-    writeFileSync(good.bin, readFileSync(good.bin, "utf8").replace("const answer =", `if (argv.join(' ') === ${JSON.stringify(when)}) { ${code} }\nconst answer =`), { mode: 0o700 });
+    writeFileSync(good.bundle, readFileSync(good.bundle, "utf8").replace("const answer =", `if (argv.join(' ') === ${JSON.stringify(when)}) { ${code} }\nconst answer =`), { mode: 0o700 });
     if (linked) symlinkSync(good.bin, pin);
     const probed = await observeAt(target);
     expect(probed).toMatchObject({ allowed: false, evidence: { observation: { outcome: "FAIL", detail: expect.stringContaining(`${VARIABLE} REPLACED`) } } });
@@ -788,33 +793,35 @@ describe("S16-R1-02: every spawn after the checks is preceded by a re-check that
 });
 
 /**
- * A `commitlore` that is a `/bin/sh` script: what it answers is fixed when it is written, before any clock
- * starts, so a command it answers costs a shell's start and a `printf`, not an interpreter's start-up. The
- * `--version` check sleeps `versionDelay` seconds first. Each invocation appends its argv to `log`.
+ * A `commitlore` whose answers are fixed when it is written, before any clock starts: a command costs the
+ * interpreter's start and one write. (It was a `/bin/sh` script; #1268 runs a copy of the package the wrapper
+ * names with node, so it is a bundle now.) The `--version` check waits `versionDelay` seconds first. Each
+ * invocation appends its argv to `log`.
  */
 const shellFake = (name: string, { versionDelay = "0" }: { versionDelay?: string } = {}): { dir: string; bin: string; log: string } => {
   const dir = tempDir(`acp-s16-${name}-`);
-  const bin = join(dir, "commitlore");
   const log = join(dir, "invocations.txt");
-  const quoted = (text: string): string => `'${text.replace(/'/g, `'\\''`)}'`;
-  writeFileSync(
-    bin,
-    [
-      "#!/bin/sh",
-      `printf '%s\\n' "$*" >> ${quoted(log)}`,
-      'case "$*" in',
-      `  "--version") sleep ${versionDelay}; printf '1.7.3\\n' ;;`,
-      `  "doctor --help") printf '%s' ${quoted(DOCTOR_USAGE)} ;;`,
-      `  "init --help") printf '%s' ${quoted(INIT_USAGE)} ;;`,
-      `  "${INIT}") : ;;`,
-      `  "doctor --json") printf '%s\\n' ${quoted(OK_REPORT)} ;;`,
-      `  *) printf "error: unknown command or option '%s'\\n" "$*" >&2; exit 2 ;;`,
-      "esac",
-      "",
-    ].join("\n"),
-    { mode: 0o700 },
+  const answers: Record<string, string> = {
+    "--version": "1.7.3\n",
+    "doctor --help": DOCTOR_USAGE,
+    "init --help": INIT_USAGE,
+    [INIT]: "",
+    "doctor --json": `${OK_REPORT}\n`,
+  };
+  const installed = writeCommitLoreInstall(
+    dir,
+    `const fs = require('node:fs');
+const argv = process.argv.slice(2).join(' ');
+fs.appendFileSync(${JSON.stringify(log)}, argv + '\\n');
+const answers = ${JSON.stringify(answers)};
+const answer = () => {
+  if (!(argv in answers)) return process.stderr.write("error: unknown command or option '" + argv + "'\\n", () => process.exit(2));
+  process.stdout.write(answers[argv], () => process.exit(0));
+};
+if (argv === '--version') setTimeout(answer, ${Math.round(Number(versionDelay) * 1000)}); else answer();
+`,
   );
-  return { dir, bin, log };
+  return { dir, bin: installed.wrapper, log };
 };
 const shellArgvs = (log: string): string[] => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : []);
 
@@ -893,15 +900,16 @@ describe("S16: the real CLI (ACP_TEST_REAL_COMMITLORE, else the first on PATH) i
     expect(usage.exitCode).toBe(0);
     expect(branchFor(usage.stdout)).toBe(REAL_BRANCH);
     if (offersNoAgentHooks(usage.stdout)) {
-      // The pin is passed, not found: its checks, `--version`, `doctor --help` and `init --help`, pass, and so
-      // does a run through the runner they bound.
-      const checked = await run.ready(repo);
-      const answered = await checked(["--version"], repo);
+      // The pin is passed, not found: its checks, `--version`, `doctor --help` and `init --help`, pass on the
+      // copy of the package it loads (#1268), and so does a run through the runner they prepared.
+      const prepared = await run.prepare(repo, { gitDir: join(repo, ".git"), workTree: repo }, { checked: true });
+      const answered = await prepared.run(["--version"], repo);
+      prepared.dispose();
       expect(answered.exitCode).toBe(0);
       expect(answered.stdout.trim()).toMatch(/^1\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
     } else {
       // A release whose init does not offer --no-agent-hooks (1.7.4) is refused at its checks, before any init.
-      await expect(run.ready(repo)).rejects.toThrow(new RegExp(`^${VARIABLE} NO_INIT_OPTION: .* init does not offer --no-agent-hooks, `));
+      await expect(run.prepare(repo, { gitDir: join(repo, ".git"), workTree: repo }, { checked: true })).rejects.toThrow(new RegExp(`^${VARIABLE} NO_INIT_OPTION: .* init does not offer --no-agent-hooks, `));
     }
     expect(readdirSync(home)).toEqual([]);
     const status = execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: repo, encoding: "utf8", timeout: 20_000 });
@@ -1117,7 +1125,13 @@ setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: per
 
   it("growth during the check: a pin that makes itself 1 TiB (sparse) during doctor --help is refused before init --help spawns, at once, while the heartbeat fires", async () => {
     // The reviewer's growth case, its paths aside: the CLI the pin is grows its own file during a check.
-    const pinned = fake("grow-during-check", { during: { argv: "doctor --help", code: `fs.truncateSync(process.argv[1], ${TIB});` } });
+    // The pin is the wrapper; the program that grows it is the bundle, run from a copy (#1268).
+    const pinned = fake("grow-during-check");
+    writeFileSync(
+      pinned.bundle,
+      readFileSync(pinned.bundle, "utf8").replace("const answer =", `if (argv.join(' ') === 'doctor --help') { fs.truncateSync(${JSON.stringify(pinned.bin)}, ${TIB}); }\nconst answer =`),
+      { mode: 0o700 },
+    );
     // Bounded preparation before the watchdog starts (`prepareFixture`): the new file's cold first exec.
     prepareFixture(pinned.bin, ["--version"], pinned.log);
     try {
@@ -1223,15 +1237,15 @@ setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: per
     const wrapper = join(tempDir("acp-s16-r2-wrapper-"), "commitlore");
     writeFileSync(
       wrapper,
-      `#!/bin/sh\n# commitlore:wrapper:v1\n# Installed by install.sh. Edits are lost on reinstall.\nNODE="${process.execPath}"\n[ -x "$NODE" ] || NODE=node\nexec "$NODE" "${bundle.bin}" "$@"\n`,
+      `#!/bin/sh\n# commitlore:wrapper:v1\n# Installed by install.sh. Edits are lost on reinstall.\nNODE="${process.execPath}"\n[ -x "$NODE" ] || NODE=node\nexec "$NODE" "${bundle.bundle}" "$@"\n`,
       { mode: 0o700 },
     );
     // The release bundle pinned directly, at the size of the 1.7.4 bundle (written out: 1.5 MB is no large file).
     const bundled = fake("control-bundle-sized");
-    appendFileSync(bundled.bin, `/*${" ".repeat(1_571_351 - statSync(bundled.bin).size - 5)}*/\n`);
+    appendFileSync(bundled.bundle, `/*${" ".repeat(1_571_351 - statSync(bundled.bundle).size - 5)}*/\n`);
     for (const [pin, ran, minimumTurns] of [
       [wrapper, bundle.log, 1],
-      [bundled.bin, bundled.log, 16],
+      [bundled.bundle, bundled.log, 16],
     ] as const) {
       const read = await duringCheck(() => commitlorePinIdentity(pin));
       expect(read.turns).toBeGreaterThanOrEqual(minimumTurns);
@@ -1242,7 +1256,7 @@ setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: per
       expect(argvs(ran)).toEqual(OBSERVATION);
     }
     expect(statSync(wrapper).size).toBeLessThan(4_096);
-    expect(statSync(bundled.bin).size).toBe(1_571_351);
+    expect(statSync(bundled.bundle).size).toBe(1_571_351);
     witnessed("S16-R2-01 normal-entrypoint control asserted");
   });
 });

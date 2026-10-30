@@ -1,7 +1,7 @@
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
-import { digestOf } from "../core/digest.ts";
+import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { acpScratchDir } from "../core/scratch-root.ts";
@@ -54,8 +54,19 @@ export interface IntegratedCandidate {
   integration: SnapshotIntegration;
   declaredParent: string;
   baseSha: string;
-  /** #1268 — how many merge commits CommitLore's commit-msg check passed before they were made (no capture, no record). */
-  commitloreMessageChecked: number;
+  /**
+   * #1268 — internal execution evidence, one per merge commit the integration made: the parents and tree
+   * CommitLore's commit-msg check was bound to, and the commit made with exactly them. No capture, no record.
+   */
+  commitloreMergeChecks: MergeCheckBinding[];
+}
+
+/** #1268 — a merge commit and the parents, tree and message its CommitLore check was bound to; the commit has exactly them. */
+export interface MergeCheckBinding {
+  commit: string;
+  parents: [string, string];
+  tree: string;
+  messageDigest: string;
 }
 
 /**
@@ -66,9 +77,14 @@ export interface IntegratedCandidate {
  */
 export type CheckMergeMessage = (input: {
   checkout: string;
-  git: { gitDir: string; workTree: string };
+  git: { gitDir: string; workTree: string; objectFormat: "sha1" | "sha256" };
   message: string;
   scratch: string;
+  /** The integration's private index, staging exactly `tree`: the index the check runs with. */
+  index: string;
+  /** The merge's parents, in order, and the tree it will have. */
+  parents: [string, string];
+  tree: string;
 }) => Promise<Decision<void>>;
 
 /** A disposable worktree of the run's repository at `head`, made and torn down through the guard. */
@@ -411,13 +427,29 @@ const exactly = async (repo: PinnedRepository, repositoryIdentity: string, place
 };
 
 /**
+ * #1268 — a merge whose index, parents (values and order), tree or message are not what its CommitLore check
+ * was bound to is not made, or not kept.
+ */
+const unbound = (
+  repositoryIdentity: string,
+  bound: { indexDigest: string; parents: readonly [string, string]; tree: string; message: string },
+  observed: Record<string, unknown>,
+): Decision<never> =>
+  deny(ReasonCode.VERIFICATION_GAP, "the merge is not the one its CommitLore check was bound to; nothing was built on it", {
+    refusal: "COMMITLORE_MERGE_UNBOUND",
+    repositoryIdentity,
+    bound: { indexDigest: bound.indexDigest, parents: [...bound.parents], tree: bound.tree, messageDigest: sha256(bound.message) },
+    observed,
+  });
+
+/**
  * The integrated commit of a placement, written as plumbing over a private index, in a disposable
  * worktree the verification engine makes and tears down through the guard.
  */
 const buildIntegration = async (
   input: { purpose: string; inputDigest: string; repositoryIdentity: string; worktree: RunWorktree; checkMessage?: CheckMergeMessage },
   placement: Placement,
-  checked: { count: number } = { count: 0 },
+  checked: MergeCheckBinding[] = [],
 ): Promise<Decision<string>> => {
   const { baseSha, planned, format } = placement;
   return input.worktree<string>(
@@ -440,14 +472,60 @@ const buildIntegration = async (
         const tree = (await gitOrThrow(repo, ["write-tree"], { index })).trim();
         const date = `${Math.max(await committerEpoch(repo, head), await committerEpoch(repo, step.result.commit))} +0000`;
         const message = subjectOf(step.result.title);
+        // #1268 — what the check is bound to, fixed before it runs: this merge's index (its path and bytes), its
+        // parents in order, its tree and its message. The commit is made from these values, never from what the
+        // check was handed, and any of them that is not the same after the check refuses the merge.
+        const bound = Object.freeze({
+          index,
+          indexDigest: sha256(readFileSync(index)),
+          parents: Object.freeze([head, step.result.commit] as [string, string]),
+          tree,
+          message,
+        });
         if (input.checkMessage) {
-          const passed = await input.checkMessage({ checkout: repo.workTree, git: { gitDir: repo.gitDir, workTree: repo.workTree }, message, scratch });
+          // The check is handed copies, and what it holds after it ran is compared with the bound values.
+          const handed = {
+            checkout: repo.workTree,
+            git: { gitDir: repo.gitDir, workTree: repo.workTree, objectFormat: format },
+            scratch,
+            index,
+            parents: [bound.parents[0], bound.parents[1]] as [string, string],
+            tree,
+            message,
+          };
+          const passed = await input.checkMessage(handed);
           if (!passed.allowed) return passed as Decision<string>;
-          checked.count += 1;
+          const after = {
+            index: handed.index,
+            indexDigest: sha256(readFileSync(bound.index)),
+            parents: handed.parents,
+            tree: (await gitOrThrow(repo, ["write-tree"], { index: bound.index })).trim(),
+            handedTree: handed.tree,
+            message: handed.message,
+          };
+          const differing = [
+            after.index !== bound.index || after.indexDigest !== bound.indexDigest ? "index" : null,
+            after.parents.length !== 2 || after.parents[0] !== bound.parents[0] || after.parents[1] !== bound.parents[1] ? "parents" : null,
+            after.tree !== bound.tree || after.handedTree !== bound.tree ? "tree" : null,
+            after.message !== bound.message ? "message" : null,
+          ].filter((field): field is string => field !== null);
+          if (differing.length > 0) return unbound(input.repositoryIdentity, bound, { differing });
         }
-        head = (await gitOrThrow(repo, ["commit-tree", tree, "-p", head, "-p", step.result.commit, "--no-gpg-sign", "-m", message], {
+        const commit = (await gitOrThrow(repo, ["commit-tree", bound.tree, "-p", bound.parents[0], "-p", bound.parents[1], "--no-gpg-sign", "-m", bound.message], {
           extraEnv: { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date },
         })).trim();
+        if (input.checkMessage) {
+          // Read back: the commit made has exactly the parents, in order, the tree and the message the check was bound to.
+          const made = (await gitOrThrow(repo, ["rev-list", "--parents", "-n", "1", commit])).trim().split(" ").slice(1);
+          const raw = await gitOrThrow(repo, ["cat-file", "commit", commit]);
+          const madeTree = /^tree ([0-9a-f]+)$/m.exec(raw)?.[1] ?? null;
+          const madeMessage = raw.slice(raw.indexOf("\n\n") + 2).trimEnd();
+          if (made.length !== 2 || made[0] !== bound.parents[0] || made[1] !== bound.parents[1] || madeTree !== bound.tree || madeMessage !== bound.message.trimEnd()) {
+            return unbound(input.repositoryIdentity, bound, { differing: ["commit"], parents: made, tree: madeTree, commit });
+          }
+          checked.push({ commit, parents: [bound.parents[0], bound.parents[1]], tree: bound.tree, messageDigest: sha256(bound.message) });
+        }
+        head = commit;
       }
       return exactly(repo, input.repositoryIdentity, placement, head);
     }),
@@ -509,7 +587,7 @@ export const integrateTaskResults = async (input: {
     tasks: planned.map((step) => ({ taskId: step.result.taskId, commit: step.result.commit })),
   };
   const inputDigest = digestOf({ schema: "agent-control-plane.candidate-integration.v1", runId: input.runId, repositoryIdentity: input.repositoryIdentity, baseSha, tasks: integration.tasks });
-  const checked = { count: 0 };
+  const checked: MergeCheckBinding[] = [];
   const built = await buildIntegration(
     {
       purpose: INTEGRATION_WORKTREE_PURPOSE,
@@ -522,7 +600,7 @@ export const integrateTaskResults = async (input: {
     checked,
   );
   if (!built.allowed) return built as Decision<null>;
-  return allow(ReasonCode.OK, { head: built.value, integration, declaredParent: plan.value.declaredParent, baseSha, commitloreMessageChecked: checked.count });
+  return allow(ReasonCode.OK, { head: built.value, integration, declaredParent: plan.value.declaredParent, baseSha, commitloreMergeChecks: checked });
 };
 
 /**

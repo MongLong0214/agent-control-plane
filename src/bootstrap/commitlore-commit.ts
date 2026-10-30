@@ -70,7 +70,7 @@ export interface CommitLoreAttempt {
    * A commit CommitLore has no command to make or bind: its exact message, checked as CommitLore's commit-msg
    * hook checks it, before the commit exists. Nothing is recorded on it. `scratch` is never the working tree.
    */
-  validateMessage(input: { checkout: string; message: string; scratch: string }): Promise<Decision<void>>;
+  validateMessage(input: { checkout: string; message: string; scratch: string; index?: string }): Promise<Decision<void>>;
   /** Removes the attempt's copy of the package. */
   dispose(): void;
 }
@@ -323,8 +323,8 @@ export const commitloreAttempt = (run: CommitLoreRunner, dispose: () => void = (
     return allow(ReasonCode.OK, answer.commit);
   },
 
-  async validateMessage({ checkout, message, scratch }) {
-    return validated(run, checkout, message, scratch);
+  async validateMessage({ checkout, message, scratch, index }) {
+    return validated(run, checkout, message, scratch, index);
   },
 
   dispose,

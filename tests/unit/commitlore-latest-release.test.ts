@@ -16,6 +16,7 @@ import {
 import * as pin from "../../src/bootstrap/commitlore-pin.ts";
 import type { RepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
 import { manifestDigest, projectManifestSchema } from "../../src/contracts/manifest.ts";
+import { packageVersionFor, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { latestRelease, stableReleaseAnswer } from "../helpers/commitlore-release.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
@@ -42,13 +43,11 @@ const OK_REPORT = JSON.stringify({ schema: "commitlore_doctor.v2", status: "ok",
 /** A pinned CLI answering `version`; every invocation's argv is appended to its log. */
 const cli = (name: string, version: string): { bin: string; log: string } => {
   const dir = tempDir(`acp-1268-${name}-`);
-  const bin = join(dir, "commitlore");
   const log = join(dir, "argv.log");
-  writeFileSync(join(dir, "package.json"), '{"type":"commonjs"}');
-  writeFileSync(
-    bin,
-    `#!${process.execPath}
-const argv = process.argv.slice(2).join(" ");
+  // #1268 — installed as the installer installs it: a run copies the package its wrapper names.
+  const bin = writeCommitLoreInstall(
+    dir,
+    `const argv = process.argv.slice(2).join(" ");
 require("node:fs").appendFileSync(${JSON.stringify(log)}, argv + "\\n");
 const answer = (text) => process.stdout.write(text, () => process.exit(0));
 if (argv === "--version") answer(${JSON.stringify(`${version}\n`)});
@@ -58,8 +57,8 @@ else if (argv === ${JSON.stringify(INIT)}) answer("");
 else if (argv === "doctor --json") answer(${JSON.stringify(OK_REPORT)});
 else process.stderr.write("unknown " + argv + "\\n", () => process.exit(2));
 `,
-    { mode: 0o700 },
-  );
+    { version: packageVersionFor(version) },
+  ).wrapper;
   // Executed once before any witness, so a cold first exec is no part of what is judged.
   execFileSync(bin, ["--version"], { stdio: "ignore", timeout: 30_000 });
   writeFileSync(log, "");
@@ -85,7 +84,8 @@ describe("#1268: the pinned CLI must be the newest published stable CommitLore r
 
   it("a pin newer than the newest release is no published release, and is refused NOT_LATEST too", async () => {
     const ahead = cli("ahead", "1.7.6");
-    await expect(commitloreRunner(COMMITLORE_LIMITS, ahead.bin, latestRelease("1.7.5")).ready(tempDir("acp-1268-ahead-"))).rejects.toThrow(
+    const checkout = tempDir("acp-1268-ahead-");
+    await expect(commitloreRunner(COMMITLORE_LIMITS, ahead.bin, latestRelease("1.7.5")).prepare(checkout, { gitDir: join(checkout, ".git"), workTree: checkout }, { checked: true })).rejects.toThrow(
       /^ACP_COMMITLORE_BINARY NOT_LATEST: .* --version answered "1\.7\.6", and the newest published stable release of MongLong0214\/commitlore is v1\.7\.5/,
     );
   });

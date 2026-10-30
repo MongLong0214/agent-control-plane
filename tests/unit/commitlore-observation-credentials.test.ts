@@ -14,6 +14,7 @@ import {
   requiredCommitLoreObservation,
 } from "../../src/bootstrap/commitlore-observation.ts";
 import { latestRelease } from "../helpers/commitlore-release.ts";
+import { writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 /** #1268 — the production port on the pin in the environment; the fake answers 1.7.3, confirmed as the newest release. */
@@ -123,7 +124,6 @@ const injectDaemonEnvironment = (): void => {
  */
 const fake = (name: string, body: string): void => {
   const dir = tempDir(`acp-s11-r3-${name}-`);
-  writeFileSync(join(dir, "package.json"), '{"type":"commonjs"}');
   const prelude = `
     if (process.argv[2] === '--version') { process.stdout.write('1.7.3\\n'); return; }
     if (process.argv[2] === 'doctor' && process.argv[3] === '--help') { process.stdout.write('Usage: commitlore doctor [options]\\n\\nOptions:\\n  --json  emit the report as JSON\\n'); return; }
@@ -142,7 +142,8 @@ const fake = (name: string, body: string): void => {
     };
     const fill = 'protocol=http\\nhost=127.0.0.1:${port}\\n\\n';
   `;
-  writeFileSync(join(dir, "commitlore"), `#!${process.execPath}\n${prelude}\n${body}\n`, { mode: 0o700 });
+  // #1268 — installed as the installer installs it: a run copies the package its wrapper names.
+  writeCommitLoreInstall(dir, `${prelude}\n${body}`);
   vi.stubEnv("PATH", `${dir}:/usr/bin:/bin`);
   vi.stubEnv("ACP_COMMITLORE_BINARY", join(dir, "commitlore"));
 };
@@ -318,6 +319,8 @@ describe("S11-R3: a CommitLore child reaches no credential, through its own git 
       GIT_TERMINAL_PROMPT: "0",
       // #1268 — preferred by git to the repository's core.sshCommand.
       GIT_SSH_COMMAND: "ssh",
+      // #1268 — attributes from the empty tree: no work-tree .gitattributes selects a driver.
+      GIT_ATTR_SOURCE: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
     });
   });
 });

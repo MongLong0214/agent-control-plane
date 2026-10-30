@@ -1666,7 +1666,7 @@ export class WorkerTurnRunner {
         taskId: facts.taskId,
       });
     }
-    const contract = await port.contract(facts.claim.worktree, { gitDir: facts.repo.gitDir, workTree: facts.repo.workTree });
+    const contract = await port.contract(facts.claim.worktree, { gitDir: facts.repo.gitDir, workTree: facts.repo.workTree, objectFormat: facts.objectFormat });
     if (!contract.allowed) return contract as Decision<string | null>;
     return allow(ReasonCode.OK, contract.value);
   }
@@ -1692,7 +1692,7 @@ export class WorkerTurnRunner {
           return deny(ReasonCode.VERIFICATION_GAP, "this deployment has no CommitLore to commit through", { refusal: "COMMITLORE_REQUIRED_UNOBSERVABLE" });
         }
         // The worker's own git hardening, on the git dir and work tree pinned before its turn.
-        const begun = await port.attempt(facts.claim.worktree, { gitDir: facts.repo.gitDir, workTree: facts.repo.workTree });
+        const begun = await port.attempt(facts.claim.worktree, { gitDir: facts.repo.gitDir, workTree: facts.repo.workTree, objectFormat: facts.objectFormat });
         if (!begun.allowed) return begun as Decision<string>;
         attempt = begun.value;
         const answer = await attempt.consider({

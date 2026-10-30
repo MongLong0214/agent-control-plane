@@ -52,6 +52,7 @@ import {
   candidateRefFor,
   candidateRefPlan,
   type CheckMergeMessage,
+  type MergeCheckBinding,
   integratePredecessors,
   integrateTaskResults,
   lostTaskChanges,
@@ -295,7 +296,7 @@ export class CandidatePipeline {
     const repositories: SnapshotRepositoryInput[] = [];
     // #1268 — every merge commit the integration makes has its message checked by CommitLore when the run requires it.
     const checkMergeMessages = this.checkMergeMessages(runId);
-    const commitloreMessageChecked = new Map<string, number>();
+    const commitloreMergeChecks = new Map<string, MergeCheckBinding[]>();
     for (const repo of participants) {
       // S6-C — when the checkout's HEAD does not hold every SUCCEEDED task's commit, the candidate is
       // their integration onto the run's pinned base; a conflict between two tasks refuses the freeze.
@@ -311,8 +312,8 @@ export class CandidatePipeline {
       });
       if (!integrated.allowed) return integrated as Decision<CandidateSnapshot>;
       // Recorded where a check was required or made; a run that requires none keeps its evidence as it was.
-      if (integrated.value !== null && (checkMergeMessages !== undefined || integrated.value.commitloreMessageChecked > 0)) {
-        commitloreMessageChecked.set(repo.identity, integrated.value.commitloreMessageChecked);
+      if (integrated.value !== null && (checkMergeMessages !== undefined || integrated.value.commitloreMergeChecks.length > 0)) {
+        commitloreMergeChecks.set(repo.identity, integrated.value.commitloreMergeChecks);
       }
       // The integrated candidate's origin is its tasks' recorded one (S-TB-06), as one task's is below.
       const source = integrated.value === null
@@ -474,9 +475,9 @@ export class CandidatePipeline {
           sourceHead: r.sourceHead ?? null,
           files: r.touchedPaths.length,
           ...(r.integration === undefined ? {} : { integratedTasks: r.integration.tasks.length }),
-          // #1268 — internal execution evidence: how many merge messages CommitLore's commit-msg check passed. It is
-          // no capture and no record; nothing is recorded on a merge no session produced.
-          ...(commitloreMessageChecked.has(r.identity) ? { commitloreMessageChecked: commitloreMessageChecked.get(r.identity)! } : {}),
+          // #1268 — internal execution evidence: each merge whose message CommitLore's commit-msg check passed, with
+          // the parents and tree that check was bound to. No capture and no record: no session produced a merge.
+          ...(commitloreMergeChecks.has(r.identity) ? { commitloreMergeChecks: commitloreMergeChecks.get(r.identity)! } : {}),
         })),
         ...(attemptId === undefined ? {} : { attemptId }),
         ...(reviewContextOutcome === null ? {} : { reviewContext: reviewContextOutcome }),

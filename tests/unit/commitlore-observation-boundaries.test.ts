@@ -1,19 +1,20 @@
 import { ChildProcess, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 
 import {
   COMMITLORE_LIMITS,
-  OBSERVATION_HARDENING_EXCEPTION,
+  commitloreChildEnvironment,
   commitloreRunner,
   createCommitLoreCliPort,
+  observationGitTarget,
   probeCommitLore,
 } from "../../src/bootstrap/commitlore-observation.ts";
-import { gitHardeningEnvironment, pinnedGitEnvironment } from "../../src/run/worker-git.ts";
 import { latestRelease } from "../helpers/commitlore-release.ts";
+import { writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 /**
@@ -51,8 +52,8 @@ else {`;
  */
 const fake = (name: string, body: string): string => {
   const dir = tempDir(`acp-s11-r1-${name}-`);
-  writeFileSync(join(dir, "package.json"), '{"type":"commonjs"}');
-  writeFileSync(join(dir, "commitlore"), `#!${process.execPath}\n${PIN_CHECKS}\n${body}\n}\n`, { mode: 0o700 });
+  // #1268 — installed as the installer installs it: a run copies the package its wrapper names.
+  writeCommitLoreInstall(dir, `${PIN_CHECKS}\n${body}\n}`);
   vi.stubEnv("PATH", `${dir}:/usr/bin:/bin`);
   vi.stubEnv("ACP_COMMITLORE_BINARY", join(dir, "commitlore"));
   return dir;
@@ -183,9 +184,9 @@ it("R1-01: CommitLore children receive no daemon authority variables, a known na
     "GIT_CONFIG_GLOBAL",
     "GIT_ASKPASS",
     "GIT_SSH_COMMAND",
-    // #1268 — the worker's git hardening, bar the hooks path init installs into: every value ACP's own.
-    ...Object.keys(pinnedGitEnvironment({ gitDir: join(root, ".git"), workTree: root })),
-    ...Object.keys(gitHardeningEnvironment({ except: [OBSERVATION_HARDENING_EXCEPTION] })),
+    // #1268 — the worker's git hardening bar the hooks path init installs into, the empty attribute source and
+    // no external diff: every value ACP's own.
+    ...Object.keys(commitloreChildEnvironment(root, observationGitTarget(root))).filter((key) => key.startsWith("GIT_")),
   ]);
   expect(Object.keys(observed).filter((key) => !constructed.has(key) && key !== "__CF_USER_TEXT_ENCODING")).toEqual([]);
   // The daemon's PATH is not handed to it (and, since slice S16, is not used to find it either).
@@ -328,7 +329,8 @@ const observeExit0 = async (
   ChildProcess.prototype.kill = function (this: ChildProcess, signal?: NodeJS.Signals | number): boolean {
     if (this.pid !== undefined && this.exitCode === null && this.signalCode === null) {
       const pid = this.pid;
-      events.push({ kind: "signal", at: now(), pid, command: this.spawnargs[1] ?? "", armed: armedPids().includes(String(pid)) });
+      // #1268 — node runs the copied bundle: the command follows the bundle's path.
+      events.push({ kind: "signal", at: now(), pid, command: this.spawnargs[2] ?? "", armed: armedPids().includes(String(pid)) });
       if (!seen.has(this)) {
         seen.add(this);
         this.once("exit", (code, exitSignal) => events.push({ kind: "exit", at: now(), pid, code, signal: exitSignal }));

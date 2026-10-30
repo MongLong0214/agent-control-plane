@@ -1,12 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { accessSync, constants, cpSync, existsSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { accessSync, constants, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { COMMITLORE_LIMITS, type CommitLorePort, commitloreRunner, createCommitLoreCliPort } from "../../src/bootstrap/commitlore-observation.ts";
 import { manifestDigest, projectManifestSchema } from "../../src/contracts/manifest.ts";
 import { WorkerTurnEvent, WorkerTurnRunner, type WorkerTurnOptions } from "../../src/run/worker-turn.ts";
+import { installedCopyOf } from "../helpers/commitlore-install.ts";
 import { latestRelease, stableReleaseAnswer } from "../helpers/commitlore-release.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeCore, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest } from "../helpers/harness.ts";
@@ -92,29 +93,8 @@ const fakeFor = (world: WorkerWorld, reply: string, writes: Record<string, strin
   return adapter;
 };
 
-/**
- * An installation laid out as CommitLore's installer lays one out — the package's published files and a
- * `# commitlore:wrapper:v1` wrapper that execs node on its bundle — copied from the real CLI's own package,
- * found the way its wrapper names it.
- */
-const installedCopy = (): { wrapper: string; bundle: string } => {
-  const target = realpathSync(REAL as string);
-  const entry = target.endsWith(join("dist", "commitlore.mjs"))
-    ? target
-    : /^exec "\$NODE" "([^"\n]+)" "\$@"$/m.exec(readFileSync(target, "utf8"))?.[1];
-  if (entry === undefined) throw new Error("FIXTURE FAILURE: the real CLI is neither CommitLore's wrapper nor its bundle");
-  const root = dirname(dirname(entry));
-  const install = tempDir("acp-1268-install-");
-  const pkg = join(install, "pkg");
-  for (const name of ["package.json", "dist", "spec"]) cpSync(join(root, name), join(pkg, name), { recursive: true });
-  const wrapper = join(install, "commitlore");
-  writeFileSync(
-    wrapper,
-    `#!/bin/sh\n# commitlore:wrapper:v1\nNODE="${process.execPath}"\nexec "$NODE" "${join(pkg, "dist", "commitlore.mjs")}" "$@"\n`,
-    { mode: 0o755 },
-  );
-  return { wrapper, bundle: join(pkg, "dist", "commitlore.mjs") };
-};
+/** A copy of the real CLI's installation (`installedCopyOf`), in this run's temporary tree. */
+const installedCopy = (): { wrapper: string; bundle: string } => installedCopyOf(REAL as string, tempDir("acp-1268-install-"));
 
 const makeRunner = (world: WorkerWorld, adapter: FakeWorkerAdapter, options: WorkerTurnOptions): WorkerTurnRunner =>
   new WorkerTurnRunner(
@@ -258,6 +238,78 @@ describe.skipIf(REAL === null)("#1268: a worker commit goes through CommitLore (
 
     expect(existsSync(marker), "a program the repository named ran inside CommitLore's git").toBe(false);
     expect(succeededEvidence(world)["commitlore"]).toEqual({ outcome: "empty", recordIds: [], nonce: null });
+  });
+
+  it("review r3 P1: a textconv program the work tree's .gitattributes selects, rewritten by the worker, is not run by the capture's git diff", async () => {
+    const world = requiredWorld();
+    // The reviewer's case: a tracked .gitattributes names a diff driver, the repository's config names a
+    // tracked script as its textconv, and the worker rewrites that script and submits a valid record.
+    writeFileSync(join(world.repoPath, ".gitattributes"), "* diff=workerconv\n");
+    writeFileSync(join(world.repoPath, "src", "conv.sh"), "#!/bin/sh\ncat \"$1\"\n", { mode: 0o755 });
+    commitAll(world.repoPath, "a diff driver");
+    recordSeededTarget(world);
+    gitSync(world.repoPath, ["config", "diff.workerconv.textconv", join(world.repoPath, "src", "conv.sh")]);
+    const marker = join(tempDir("acp-1268-textconv-"), "ran");
+    const adapter = fakeFor(world, `${SAID}\n\n${draft([warnRecord("Callers that expected 1 now get 2.")])}`, {
+      "src/conv.sh": `#!/bin/sh\necho ran >> ${JSON.stringify(marker)}\ncat "$1"\n`,
+    });
+    await runTurn(world, makeRunner(world, adapter, { commitlore: realPort() }));
+
+    expect(existsSync(marker), "a textconv program the work tree selected ran inside CommitLore's git").toBe(false);
+    expect((succeededEvidence(world)["commitlore"] as { outcome: string }).outcome).toBe("recorded");
+  });
+
+  it.each([
+    ["info/attributes", "info"],
+    ["a core.attributesFile the worker can rewrite", "attributesFile"],
+  ] as const)("review r3 P1: the reviewer's textconv case with the diff driver named in %s is refused before CommitLore runs, and nothing runs", async (_name, where) => {
+    const world = requiredWorld();
+    writeFileSync(join(world.repoPath, "src", "conv.sh"), "#!/bin/sh\ncat \"$1\"\n", { mode: 0o755 });
+    if (where === "attributesFile") writeFileSync(join(world.repoPath, "src", "attributes"), "* diff=workerconv\n");
+    commitAll(world.repoPath, "a diff driver");
+    recordSeededTarget(world);
+    gitSync(world.repoPath, ["config", "diff.workerconv.textconv", join(world.repoPath, "src", "conv.sh")]);
+    if (where === "info") writeFileSync(join(world.mainRepoPath, ".git", "info", "attributes"), "* diff=workerconv\n");
+    else gitSync(world.repoPath, ["config", "core.attributesFile", join(world.repoPath, "src", "attributes")]);
+    const marker = join(tempDir("acp-1268-attribute-source-"), "ran");
+    const adapter = fakeFor(world, `${SAID}\n\n${draft([warnRecord("Callers that expected 1 now get 2.")])}`, {
+      "src/conv.sh": `#!/bin/sh\necho ran >> ${JSON.stringify(marker)}\ncat "$1"\n`,
+      ...(where === "attributesFile" ? { "src/attributes": "* diff=workerconv\n# rewritten\n" } : {}),
+    });
+    const runner = makeRunner(world, adapter, { commitlore: realPort() });
+    const started = await runner.start({
+      runId: world.runId,
+      taskId: world.taskId,
+      claimId: world.claimId,
+      ownerSessionId: world.cto.sessionId,
+      ownerBindingGeneration: world.cto.generation,
+    });
+    if (started.allowed) await runner.settled(started.value.executionId);
+    expect(existsSync(marker), "a textconv program an attribute source selected ran inside CommitLore's git").toBe(false);
+    expect(started).toMatchObject({ allowed: false, message: expect.stringContaining("ACP_COMMITLORE_BINARY UNSUPPORTED_REPOSITORY") });
+  });
+
+  it("an external diff program the repository's config names is never run: CommitLore's git cannot be kept from it, so the turn is refused", async () => {
+    const world = requiredWorld();
+    writeFileSync(join(world.repoPath, "src", "ext.sh"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    commitAll(world.repoPath, "an external diff program");
+    recordSeededTarget(world);
+    gitSync(world.repoPath, ["config", "diff.external", join(world.repoPath, "src", "ext.sh")]);
+    const marker = join(tempDir("acp-1268-external-diff-"), "ran");
+    const adapter = fakeFor(world, `${SAID}\n\n${draft([warnRecord("Callers that expected 1 now get 2.")])}`, {
+      "src/ext.sh": `#!/bin/sh\necho ran >> ${JSON.stringify(marker)}\n`,
+    });
+    const runner = makeRunner(world, adapter, { commitlore: realPort() });
+    const started = await runner.start({
+      runId: world.runId,
+      taskId: world.taskId,
+      claimId: world.claimId,
+      ownerSessionId: world.cto.sessionId,
+      ownerBindingGeneration: world.cto.generation,
+    });
+    if (started.allowed) await runner.settled(started.value.executionId);
+    expect(existsSync(marker), "the external diff program ran inside CommitLore's git").toBe(false);
+    expect(started).toMatchObject({ allowed: false, message: expect.stringContaining("ACP_COMMITLORE_BINARY UNSUPPORTED_REPOSITORY") });
   });
 
   it("an ssh program the repository's config names for its ssh:// remote is not run by the worker's capture", async () => {
