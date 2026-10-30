@@ -2313,8 +2313,12 @@ export class GitHubKernel {
    * branch, pull request and gate have been published and validated again. A merged pull's proof includes its
    * candidate's CommitLore notes on the remote, carried here as `mergeExecute` carries them (#1269). `merged` is
    * true only when a receipt proves the merge; with no receipt there is nothing to settle.
+   *
+   * #1269 — `provenMergeCommitSha` is the merge commit an earlier proof of this receipt read back before only its
+   * notes failed. With it, the pull must read back merged at exactly that commit; an unmerged read or another
+   * commit is refused and the receipt kept PENDING, never released.
    */
-  async mergeSettle(input: MergeInput): Promise<Decision<{ merged: boolean }>> {
+  async mergeSettle(input: MergeInput, provenMergeCommitSha: string | null = null): Promise<Decision<{ merged: boolean }>> {
     const authority = this.assertAuthority(input.runId, input.repositoryIdentity, input);
     if (!authority.allowed) return authority as Decision<{ merged: boolean }>;
     const repositoryId = this.mergeRepositoryId(input.runId, input.repositoryIdentity);
@@ -2331,7 +2335,7 @@ export class GitHubKernel {
       });
     }
     if (existing.verified) return allow(ReasonCode.OK, { merged: true });
-    const settled = await this.reconcilePendingMerge(input, repositoryId.value, idempotencyKey, requestDigest);
+    const settled = await this.reconcilePendingMerge(input, repositoryId.value, idempotencyKey, requestDigest, provenMergeCommitSha);
     if (settled === null) return allow(ReasonCode.OK, { merged: false });
     return settled.allowed ? allow(settled.reasonCode, { merged: true }) : settled as Decision<{ merged: boolean }>;
   }
@@ -2358,6 +2362,7 @@ export class GitHubKernel {
     mergeRepositoryId: string,
     idempotencyKey: string,
     requestDigest: string,
+    provenMergeCommitSha: string | null = null,
   ): Promise<Decision<{ mergeCommitSha: string; replayed: boolean }> | null> {
     if (this.inFlightReservations.has(idempotencyKey)) {
       return deny(ReasonCode.RESOURCE_COLLISION, "merge operation is in flight", { idempotencyKey });
@@ -2382,7 +2387,16 @@ export class GitHubKernel {
       return unavailable as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
     const observedMerged = (pull as unknown as { merged?: unknown }).merged;
-    if (observedMerged === false) {
+    if (observedMerged === false && provenMergeCommitSha !== null) {
+      const contradicted = deny(ReasonCode.RESOURCE_COLLISION, "a pull whose merge was proven reads back unmerged", {
+        pullNumber: input.pullNumber,
+        phase: "reconcile-pull",
+        expected: provenMergeCommitSha,
+        observed: null,
+      });
+      this.recordPendingMergeProofFailure(input, mergeRepositoryId, idempotencyKey, null, contradicted);
+      return contradicted as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+    } else if (observedMerged === false) {
       // The pull is still open, so the reserved PUT did not merge it: nothing was applied, and the stale
       // reservation is released. Whether a merge is requested again is the caller's decision.
       this.releaseReservation(idempotencyKey, requestDigest);
@@ -2416,6 +2430,16 @@ export class GitHubKernel {
       });
       this.recordPendingMergeProofFailure(input, mergeRepositoryId, idempotencyKey, null, unavailable);
       return unavailable as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+    }
+    if (provenMergeCommitSha !== null && observedMergeCommitSha !== provenMergeCommitSha) {
+      const other = deny(ReasonCode.RESOURCE_COLLISION, "pending merge pull names another merge commit than the one proven", {
+        pullNumber: input.pullNumber,
+        phase: "reconcile-pull",
+        expected: provenMergeCommitSha,
+        observed: observedMergeCommitSha,
+      });
+      this.recordPendingMergeProofFailure(input, mergeRepositoryId, idempotencyKey, observedMergeCommitSha, other);
+      return other as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
     const observedHead = (pull as unknown as { head?: { sha?: unknown } }).head?.sha;
     const observedHeadSha =
@@ -2495,10 +2519,7 @@ export class GitHubKernel {
     const notes = notesTarget.allowed
       ? await this.carryCandidateNotes(input, slug.value.owner, slug.value.repo, notesTarget.value)
       : notesTarget;
-    if (!notes.allowed) {
-      this.recordPendingMergeProofFailure(input, mergeRepositoryId, idempotencyKey, observedMergeCommitSha, notes);
-      return notes as Decision<{ mergeCommitSha: string; replayed: boolean }>;
-    }
+    if (!notes.allowed) return this.recordNotesPending(input, mergeRepositoryId, idempotencyKey, observedMergeCommitSha, notes);
     const finalized = this.finalizeReservedReceipt({
       idempotencyKey,
       requestDigest,
@@ -2842,10 +2863,7 @@ export class GitHubKernel {
       return proof as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
     const notes = await this.carryCandidateNotes(input, owner, repo, target.value);
-    if (!notes.allowed) {
-      this.recordPendingMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, notes);
-      return notes as Decision<{ mergeCommitSha: string; replayed: boolean }>;
-    }
+    if (!notes.allowed) return this.recordNotesPending(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, notes);
 
     const finalized = this.finalizeReservedReceipt({
       idempotencyKey,
@@ -2872,6 +2890,39 @@ export class GitHubKernel {
     // merge commit has passed the pinned post-merge checks.
     this.runs.setRepositoryMergeState(input.runId, mergeRepositoryId, "PENDING");
     return allow(ReasonCode.OK, { mergeCommitSha, replayed: false });
+  }
+
+  /**
+   * #1269 — the merge is proven (its pull, parents, tree and base ref read back) and only its candidate's notes
+   * are not on the remote: MERGE_NOTES_PENDING, a fact of its own and never an unknown merge outcome. The receipt
+   * stays PENDING; the record names the proven merge (repository, pull, head, merge commit), the one merge a later
+   * settlement may finish, and only by carrying its notes (`mergeSettle` with that merge commit).
+   */
+  private recordNotesPending(
+    input: MergeInput,
+    repositoryId: string,
+    idempotencyKey: string,
+    mergeCommitSha: string,
+    notes: Decision<unknown>,
+  ): Decision<{ mergeCommitSha: string; replayed: boolean }> {
+    this.markMergeUnproven(input, repositoryId, idempotencyKey);
+    const merge = {
+      repositoryIdentity: input.repositoryIdentity,
+      pullNumber: input.pullNumber,
+      exactHead: input.exactHeadSha,
+      mergeCommitSha,
+      notesReasonCode: notes.reasonCode,
+    };
+    this.audit.record({
+      kind: "MERGE_NOTES_PENDING",
+      runId: input.runId,
+      reasonCode: ReasonCode.MERGE_NOTES_PENDING,
+      evidence: { ...merge, detail: notes.allowed ? "" : notes.message },
+    });
+    return deny(ReasonCode.MERGE_NOTES_PENDING, "the merge is proven, but its candidate's CommitLore notes are not on the remote yet", {
+      ...notes.evidence,
+      ...merge,
+    });
   }
 
   /**

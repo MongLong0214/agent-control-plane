@@ -2435,15 +2435,17 @@ describe("merge target proof (#350)", () => {
     expect(fixture.github.remoteNoteFor(fixture.head)).toBe(blob);
   });
 
-  it("#1269: a merge whose notes cannot reach the remote is a pending proof failure, settled later without a second merge", async () => {
+  it("#1269: a merge whose notes cannot reach the remote is MERGE_NOTES_PENDING, naming the proven merge, and is settled later without a second merge", async () => {
     const fixture = await setup();
     const pullNumber = await openPreparedPull(fixture);
     const blob = noteOnCandidate(fixture);
     fixture.github.refuseNotesWrite = true;
     const unproven = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
-    expect(unproven.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    expect(unproven.reasonCode).toBe(ReasonCode.MERGE_NOTES_PENDING);
     if (unproven.allowed) throw new Error("expected a merge without its notes on the remote to be unproven");
-    expect(unproven.evidence).toMatchObject({ phase: "postflight-notes", ref: "refs/notes/commitlore" });
+    const named = { repositoryIdentity: fixture.identity, pullNumber, exactHead: fixture.head, mergeCommitSha: fixture.github.pulls[0]!.merge_commit_sha };
+    expect(unproven.evidence).toMatchObject({ phase: "postflight-notes", ref: "refs/notes/commitlore", ...named });
+    expect(fixture.harness.cp.audit.byKind("MERGE_NOTES_PENDING").map((entry) => entry.evidence)).toEqual([expect.objectContaining(named)]);
     expect(fixture.github.remoteNoteFor(fixture.head)).toBeUndefined();
     expect(fixture.github.mergeCount).toBe(1);
     expectPendingMergeProof(fixture);
