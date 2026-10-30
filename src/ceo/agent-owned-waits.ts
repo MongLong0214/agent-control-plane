@@ -11,7 +11,7 @@ import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
-import { type Incident, IncidentClass, type NoticeState, NotificationKind, deliverIncident, runEpisode } from "./ceo-incident-notices.ts";
+import { type Incident, IncidentClass, type NoticeState, NotificationKind, deliverIncident, runEpisode, runProgressedPast } from "./ceo-incident-notices.ts";
 import type { ProductionGate } from "./production-gate.ts";
 
 /**
@@ -119,6 +119,11 @@ export interface OwnerlessStall {
   deliveryTimeout: boolean;
   /** A stall of a run stated again in the incident episode it was first routed in; absent, the run's current one. */
   incidentEpisode?: string;
+  /**
+   * A stall of a run its detector settles when the run progresses past its episode (an owed stall: a reclaimed
+   * attempt), so that progress also resolves its incident (`Incident.settlesOnProgress`). Absent, it does not.
+   */
+  settlesOnProgress?: boolean;
 }
 
 /** What routing one ownerless stall did: see `AgentOwnedWaits.routeOwnerlessStall`. */
@@ -205,6 +210,7 @@ const stallIncident = (db: Db, stall: OwnerlessStall): Incident => {
       : { cls: IncidentClass.RESOURCE_STALLED, subject: `${stall.kind}:${stall.id}`, episode: stall.episode };
   return {
     ...placed,
+    ...(stall.settlesOnProgress === true && placed.cls === IncidentClass.RUN_STALLED ? { settlesOnProgress: true } : {}),
     runId: stall.runId,
     payload: {
       stall: stall.kind,
@@ -365,18 +371,25 @@ export class AgentOwnedWaits {
    * as a reclaimed attempt, reaches the CEO when it is back, once. H3-2 — it is stated again on every pass, in
    * the incident episode it was first routed in, until it is settled, so a CEO generation that has not had it
    * is told once while it is open. It is settled when its run moved on since (F3-1's positive progress: the
-   * stall cleared), or when `resolutionOf` closed its incident.
+   * stall cleared), or when `resolutionOf` closed its incident; its incident says so (`settlesOnProgress`), so
+   * the same progress also resolves its notice wherever it is asked. H4-2 — an owed stall the watchdog found
+   * on this pass is routed as owed the first time: when the run's existing notice covers it, the episode it is
+   * stated in from then on is recorded at once, before any progress can move the run's episode on.
    */
   routeWatchdogStalls(stalls: readonly WatchdogStall[]): Array<{ kind: string; id: string; messageId: string | null; reasonCode: string }> {
     const routed: Array<{ kind: string; id: string; messageId: string | null; reasonCode: string }> = [];
     const oldestByRole = new Map<string, { stall: WatchdogStall; count: number }>();
     const asked = new Set<string>();
-    const routeOne = (stall: WatchdogStall, blocker: string, owed: { episode: string | null } | null = null): void => {
+    const keyOf = (stall: WatchdogStall): string => `${stall.kind}:${stall.id}:${stall.since}`;
+    const owedStalls = this.#owedStalls();
+    const owedByKey = new Map(owedStalls.map(({ stall, episode }) => [keyOf(stall), { episode }]));
+    const routeOne = (stall: WatchdogStall, blocker: string): void => {
       const route = WATCHDOG_STALL_ROUTES[stall.kind];
-      const key = `${stall.kind}:${stall.id}:${stall.since}`;
+      const key = keyOf(stall);
       if (!route || asked.has(key)) return;
       asked.add(key);
-      if (owed?.episode != null && stall.runId !== null && runEpisode(this.ports.db, stall.runId) !== owed.episode) {
+      const owed = owedByKey.get(key) ?? null;
+      if (owed?.episode != null && stall.runId !== null && runProgressedPast(this.ports.db, stall.runId, owed.episode)) {
         this.#settleOwed(stall, { settled: "RUN_PROGRESSED" });
         return;
       }
@@ -393,6 +406,7 @@ export class AgentOwnedWaits {
         effects: route.effects,
         deliveryTimeout: stall.kind === "outbox",
         ...(owed?.episode != null ? { incidentEpisode: owed.episode } : {}),
+        ...(owed ? { settlesOnProgress: true } : {}),
       });
       if (owed && decision.allowed) {
         if (decision.value.state === "RESOLVED") {
@@ -423,8 +437,8 @@ export class AgentOwnedWaits {
     for (const [role, { stall, count }] of oldestByRole) {
       routeOne(stall, `${count} ${WATCHDOG_STALL_ROUTES["outbox"]!.what} to ${role}; the oldest is ${stall.id}, since ${stall.since}`);
     }
-    for (const { stall: owed, episode } of this.#owedStalls()) {
-      routeOne(owed, `${WATCHDOG_STALL_ROUTES[owed.kind]?.what ?? owed.kind}: ${owed.kind} ${owed.id}, since ${owed.since}`, { episode });
+    for (const { stall: owed } of owedStalls) {
+      routeOne(owed, `${WATCHDOG_STALL_ROUTES[owed.kind]?.what ?? owed.kind}: ${owed.kind} ${owed.id}, since ${owed.since}`);
     }
     return routed;
   }

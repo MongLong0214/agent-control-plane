@@ -10,7 +10,7 @@ import {
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { OWNERLESS_STALL_ROUTED, type WatchdogTick } from "../../src/doctor/watchdog.ts";
-import { ExecutionMode, Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, type RunRow, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import type { OutboxMessage } from "../../src/outbox/outbox.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -65,6 +65,32 @@ const recoverCeo = (harness: Harness): string => {
   expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "CEO runtime lost").allowed).toBe(true);
   return bindCeo(harness);
 };
+
+/** A CEO session the generic Buzz sweep can deliver to: its room, and who it is in that room. */
+const withBuzzRoute = (harness: Harness, sessionId: string): string => {
+  harness.cp.db.run(`UPDATE sessions SET buzz_address = 'ceo-room', buzz_actor_id = 'actor:ceo' WHERE session_id = ?`, [sessionId]);
+  return sessionId;
+};
+
+/** A candidate pipeline attempt left RUNNING by a crashed CTO, started before the run's last progress. */
+const insertAttempt = (harness: Harness, run: Pick<RunRow, "runId" | "ownerSessionId" | "ownerBindingGeneration">, at: { deadlineInMs: number }): void => {
+  harness.cp.db.run(
+    `INSERT INTO candidate_pipeline_attempts
+       (run_id, attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, started_at, deadline_at, released_at)
+     VALUES (?, 'attempt_crashed', ?, ?, NULL, 'RUNNING', ?, ?, NULL)`,
+    [
+      run.runId, run.ownerSessionId, run.ownerBindingGeneration,
+      new Date(harness.clock.now().getTime() - 31 * 60 * 1000).toISOString(),
+      new Date(harness.clock.now().getTime() + at.deadlineInMs).toISOString(),
+    ],
+  );
+};
+
+/** The owed stalls' settlements on the run (an OWNERLESS_STALL_ROUTED that says why it is settled). */
+const stallSettlements = (harness: Harness, runId: string): Array<Record<string, unknown>> =>
+  harness.cp.audit.forRun(runId)
+    .filter((entry) => entry.kind === OWNERLESS_STALL_ROUTED && entry.evidence["settled"] !== undefined)
+    .map((entry) => entry.evidence);
 
 const ceoDecisions = (harness: Harness, runId: string) =>
   harness.cp.audit.forRun(runId).filter((entry) => entry.kind === "CEO_DECISION");
@@ -662,6 +688,84 @@ describe("#1189 B12/C2 — a stall nobody watches reaches the CEO as CRITICAL_SY
     for (let pass = 0; pass < 3; pass += 1) await routingPass();
     expect(attemptNotices()).toHaveLength(2);
     expect(harness.cp.runs.require(run.runId).state).toBe(RunState.ACTIVE);
+  });
+
+  it("H4-1: a reclaimed attempt's queued notice, settled by its run's progress, is handed to no replacement CEO; an incident its detector does not settle on progress stays open", async () => {
+    const { IncidentClass, resolutionOf } = await import("../../src/ceo/ceo-incident-notices.ts");
+    const harness = makeHarness();
+    const run = await activeRun(harness);
+    const waits = waitsOf(harness);
+    insertAttempt(harness, run, { deadlineInMs: -60_000 });
+    const attemptNotices = () => ceoNotices(harness, run.runId).filter((message) =>
+      payloadOf(message)["notification"] === "CRITICAL_SYSTEM_FAILURE" && payloadOf(message)["stall"] === "candidate_pipeline_attempt");
+    const routingPass = async (): Promise<void> => {
+      waits.routeWatchdogStalls((await harness.cp.watchdog.tick()).stalls);
+    };
+
+    await routingPass();
+    const [queued] = attemptNotices();
+    expect(attemptNotices()).toEqual([expect.objectContaining({ status: "PENDING" })]);
+
+    // The run's CTO moves the run on before the CEO takes the notice: the next pass settles the stall.
+    harness.clock.advance(60_000);
+    expect(harness.cp.tasks.submit(run.runId, [{ key: "impl", title: "change app()", category: "implementation" }]).allowed).toBe(true);
+    await routingPass();
+    expect(stallSettlements(harness, run.runId)).toEqual([expect.objectContaining({ target: "attempt_crashed", settled: "RUN_PROGRESSED" })]);
+
+    const replacement = withBuzzRoute(harness, recoverCeo(harness));
+    expect(harness.cp.outbox.claimDeliverable().filter((message) => message.runId === run.runId && message.kind === MessageKind.CEO_NOTIFICATION)).toEqual([]);
+    expect(attemptNotices()).toEqual([expect.objectContaining({ messageId: queued!.messageId, status: "REJECTED" })]);
+    expect(harness.cp.audit.forRun(run.runId).filter((entry) => entry.kind === "CEO_NOTIFICATION_WITHDRAWN")).toEqual([
+      expect.objectContaining({ evidence: expect.objectContaining({ messageId: queued!.messageId, resolvedBy: "RUN_PROGRESSED" }) }),
+    ]);
+
+    // Later passes tell the replacement nothing of it.
+    for (let pass = 0; pass < 3; pass += 1) await routingPass();
+    expect(attemptNotices()).toHaveLength(1);
+    expect(ceoNotices(harness, run.runId).filter((message) => message.targetSessionId === replacement)).toEqual([]);
+
+    // The one definition of resolution says so for the incident whose detector settles on progress only: the
+    // same run, correlation and episode stated by a detector that does not (an agent-owned wait's escalation,
+    // pinned to the episode it opened in) is not closed by the run's progress.
+    const episode = payloadOf(queued)["episode"] as string;
+    const stated = { cls: IncidentClass.RUN_STALLED, subject: run.runId, runId: run.runId, episode, payload: {} };
+    expect(resolutionOf(harness.cp.db, { ...stated, settlesOnProgress: true })).toMatchObject({ kind: "RUN_PROGRESSED" });
+    expect(resolutionOf(harness.cp.db, stated)).toBeNull();
+  });
+
+  it("H4-2: a reclaimed attempt covered by its run's ACKed stall notice is settled by the run's progress, never told as a new episode", async () => {
+    const harness = makeHarness();
+    const run = await activeRun(harness);
+    const waits = waitsOf(harness);
+    insertAttempt(harness, run, { deadlineInMs: 150 * 60 * 1000 });
+    // The run's RUN_STALLED notices; its messages left undelivered in this fixture are a DELIVERY_STALLED of their own.
+    const critical = () => ceoNotices(harness, run.runId).filter((message) => payloadOf(message)["incidentClass"] === "RUN_STALLED");
+    const routingPass = async (): Promise<WatchdogTick> => {
+      const tick = await harness.cp.watchdog.tick();
+      waits.routeWatchdogStalls(tick.stalls);
+      return tick;
+    };
+
+    // The run idles past its deadline: its RUN_STALLED notice, which the CEO ACKs.
+    harness.clock.advance(121 * 60 * 1000);
+    await routingPass();
+    const [runStall] = critical();
+    expect(critical()).toEqual([expect.objectContaining({ payload: expect.objectContaining({ stall: "run" }) })]);
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    expect(harness.cp.outbox.acknowledge(runStall!.messageId, ceo.sessionId, ceo.bindingGeneration).allowed).toBe(true);
+
+    // The attempt passes its deadline in the same episode: reclaimed, and covered by the ACKed notice.
+    harness.clock.advance(30 * 60 * 1000);
+    const reclaiming = await routingPass();
+    expect(reclaiming.stalls).toContainEqual(expect.objectContaining({ kind: "candidate_pipeline_attempt", id: "attempt_crashed" }));
+    expect(critical()).toHaveLength(1);
+
+    // The run's CTO moves the run on before the next pass.
+    harness.clock.advance(60_000);
+    expect(harness.cp.tasks.submit(run.runId, [{ key: "impl", title: "change app()", category: "implementation" }]).allowed).toBe(true);
+    for (let pass = 0; pass < 3; pass += 1) await routingPass();
+    expect(critical()).toEqual([expect.objectContaining({ messageId: runStall!.messageId })]);
+    expect(stallSettlements(harness, run.runId)).toEqual([expect.objectContaining({ target: "attempt_crashed", settled: "RUN_PROGRESSED" })]);
   });
 
   it("with no CEO bound nothing is written, and the next pass routes it once the CEO is back", async () => {
