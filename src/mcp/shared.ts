@@ -109,9 +109,15 @@ export interface McpMutationRequest {
   /**
    * Domain receipt recovery. `reservationVerified` is true only after current authority and
    * the stored reservation's request/principal fingerprint pass. Before reservation, a
-   * domain receipt must independently prove the key and request it recovers.
+   * domain receipt must independently prove the key and request it recovers. On the replay of a
+   * stored result, `storedResult` is that result.
    */
-  durableReplay?: (fingerprint: string, reservationVerified: boolean) => ToolResult | null;
+  durableReplay?: (fingerprint: string, reservationVerified: boolean, storedResult?: ToolResult) => ToolResult | null;
+  /**
+   * Opt-in: on the replay of a stored result, a non-error `durableReplay` answer replaces it too,
+   * not only a refusal. For a stored answer that names a state the domain can still leave.
+   */
+  durableReplaySupersedesStored?: boolean;
   /** Extra domain validation for settled handoff ACKs; never the mutation handler. */
   replayAuthority?: () => Decision<unknown>;
 }
@@ -257,8 +263,8 @@ export const idempotentMcpMutation = async (
     }
     const replayAuthority = request.replayAuthority?.();
     if (replayAuthority && !replayAuthority.allowed) return respond(replayAuthority);
-    const durable = request.durableReplay?.(fingerprint, true);
-    if (durable?.isError) return durable;
+    const durable = request.durableReplay?.(fingerprint, true, stored.result);
+    if (durable && (durable.isError || request.durableReplaySupersedesStored === true)) return durable;
     return stored.result;
   }
   return reservation.result;

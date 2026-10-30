@@ -12,7 +12,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { defaultConfig } from "../../src/app/control-plane.ts";
 import type { GitHubWritePort } from "../../src/bootstrap/github-write-port.ts";
 import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
-import { allow } from "../../src/core/errors.ts";
+import { allow, deny } from "../../src/core/errors.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
@@ -21,6 +21,7 @@ import { Daemon } from "../../src/daemon/daemon.ts";
 import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
+import { respond } from "../../src/mcp/shared.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github-write-port.ts";
 import { TEST_MCP_TOKEN, bindCeo, dispatchBootstrapRun, fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
@@ -657,5 +658,154 @@ describe("#246 C3: every bootstrap CONFIRM door goes through the same path", () 
     expect(applied).toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
     expect(wired.github.writes.map((write) => write.method)).toContain("createRepository");
     expect(wired.harness.cp.bootstrapApplications.get(wired.runId)).toMatchObject({ phase: "WRITTEN" });
+  });
+});
+
+/**
+ * A same-key CEO CONFIRM replay of a resumable PROJECT_BOOTSTRAP refusal. The daemon re-drives that
+ * confirmation on its own, so the answer stored under the key can go stale; its replay answers from the
+ * run and its application as they stand, and never runs the runner again. A refusal that is not
+ * resumable, and a changed request under the same key, replay exactly as before.
+ */
+describe("a same-key CONFIRM replay of a resumable bootstrap refusal answers from durable state", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  /** The resumable refusal shape: merged-main CI still pending at the merge head, re-drivable. */
+  const resumableRefusal = deny<never>(ReasonCode.VERIFICATION_GAP, "required CI is pending at exact merge SHA; re-drive this step", {
+    stage: "production",
+    refusal: "GENESIS_POST_MERGE_CI_PENDING",
+    failedOperationId: "genesis-bootstrap",
+    completedOperationIds: [],
+    pendingOperationIds: [],
+    rollback: "none",
+    resumable: true,
+  });
+
+  const confirmation = (wired: Wired) => ({
+    runId: wired.runId,
+    candidateSnapshotDigest: wired.snapshotDigest,
+    ceoSessionId: wired.ceoSessionId,
+    rationale: "issue #246 wiring",
+  });
+
+  /** The door's whole answer, as Hermes receives it from the registered tool. */
+  const door = async (wired: Wired, key: string, candidateSnapshotDigest = wired.snapshotDigest) => {
+    await wired.harness.cp.continuity.evaluate("bootstrap confirmation");
+    return registeredTools(hermesServer(wired.harness))["ceo_decision_submit"]!.handler({
+      idempotencyKey: key,
+      ...confirmation(wired),
+      candidateSnapshotDigest,
+      decision: "CONFIRM",
+    });
+  };
+
+  const storedResult = (wired: Wired, key: string): unknown => {
+    const row = wired.harness.cp.db.get<{ result_json: string }>(
+      "SELECT result_json FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?",
+      [key],
+    );
+    return (JSON.parse(row!.result_json) as { result: unknown }).result;
+  };
+
+  /**
+   * The CONFIRM through the door runs the real runner once — the writes, WRITTEN, activation awaiting the
+   * incoming CTO's acknowledgement — and the door answers with the resumable refusal. The spy counts every
+   * call of the runner's entry from here on; the daemon's own re-drive goes through `runner` directly.
+   */
+  const confirmAnsweredResumable = async (wired: Wired, key: string) => {
+    const producer = wired.harness.cp.bootstrapProducer;
+    const runner = producer.produceAndActivateApproved.bind(producer);
+    const seen: { attempt?: Awaited<ReturnType<typeof runner>> } = {};
+    const produce = vi.spyOn(producer, "produceAndActivateApproved").mockImplementationOnce(async (input) => {
+      seen.attempt = await runner(input);
+      return resumableRefusal;
+    });
+    const first = await door(wired, key);
+    expect(first.structuredContent).toMatchObject({ ok: false, evidence: { refusal: "GENESIS_POST_MERGE_CI_PENDING", resumable: true } });
+    expect(seen.attempt).toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+    expect(wired.harness.cp.bootstrapApplications.get(wired.runId)).toMatchObject({ phase: "WRITTEN", attempts: 1 });
+    return { runner, produce, first, handoffId: seen.attempt!.evidence["pendingHandoffId"] as string };
+  };
+
+  /** The daemon's re-drive of the same confirmation: acknowledged, activated, and decided COMPLETED. */
+  const completeByRedrive = async (
+    wired: Wired,
+    projectId: string,
+    runner: (input: ReturnType<typeof confirmation>) => Promise<{ allowed: boolean }>,
+    handoffId: string,
+  ): Promise<void> => {
+    const primary = wired.harness.cp.bindings.activePrimaryCto(projectId);
+    if (!primary) throw new Error("activation bound no primary CTO");
+    expect((await acknowledgeBootstrapHandoff(wired.harness, handoffId, primary.sessionId)).allowed).toBe(true);
+    expect((await runner(confirmation(wired))).allowed).toBe(true);
+    await wired.harness.cp.continuity.evaluate("bootstrap confirmation");
+    expect(wired.harness.cp.ceo.submitCeoDecision({ ...confirmation(wired), decision: "CONFIRM" }))
+      .toMatchObject({ allowed: true, value: { state: RunState.COMPLETED } });
+    expect(wired.harness.cp.bootstrapApplications.get(wired.runId)).toMatchObject({ phase: "COMPLETED" });
+  };
+
+  it("W1: the run since COMPLETED by the same CONFIRM — the replay answers the decision's success and runs nothing", async () => {
+    const wired = await wire("p2-replay-completed");
+    const { runner, produce, handoffId } = await confirmAnsweredResumable(wired, "p2-completed");
+    await completeByRedrive(wired, "p2-replay-completed", runner, handoffId);
+    const writes = wired.github.writes.length;
+    const stored = storedResult(wired, "p2-completed");
+
+    const replay = await door(wired, "p2-completed");
+    expect(replay).toEqual(respond(allow(ReasonCode.OK, { state: RunState.COMPLETED })));
+    expect(produce).toHaveBeenCalledTimes(1);
+    expect(wired.github.writes).toHaveLength(writes);
+    expect(storedResult(wired, "p2-completed")).toEqual(stored);
+  });
+
+  it("W2: the application still WRITTEN with a newer refusal — the replay answers that refusal and the state, not the stored bytes", async () => {
+    const wired = await wire("p2-replay-current");
+    const { runner, produce, first } = await confirmAnsweredResumable(wired, "p2-current");
+    const stored = storedResult(wired, "p2-current");
+    expect(stored).toEqual(first);
+    // The daemon's re-drive meets a newer refusal: activation still awaits the acknowledgement.
+    const redriven = await runner(confirmation(wired));
+    if (redriven.allowed) throw new Error("the re-drive was expected to refuse");
+    const writes = wired.github.writes.length;
+
+    const replay = await door(wired, "p2-current");
+    expect(replay).not.toEqual(stored);
+    expect(replay.structuredContent).toEqual({
+      ok: false,
+      reasonCode: redriven.reasonCode,
+      message: redriven.message,
+      evidence: { ...redriven.evidence, resumable: true, application: { phase: "WRITTEN", attempts: 1 } },
+    });
+    expect(produce).toHaveBeenCalledTimes(1);
+    expect(wired.github.writes).toHaveLength(writes);
+    expect(storedResult(wired, "p2-current")).toEqual(stored);
+  });
+
+  it("W3: a refusal that is not resumable replays byte-identical, even after the run completed", async () => {
+    const wired = await wire("p2-replay-permanent");
+    const producer = wired.harness.cp.bootstrapProducer;
+    const runner = producer.produceAndActivateApproved.bind(producer);
+    const produce = vi.spyOn(producer, "produceAndActivateApproved");
+    const first = await door(wired, "p2-permanent");
+    expect(first.structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+    const evidence = first.structuredContent!["evidence"] as Record<string, unknown>;
+    expect(evidence["resumable"]).toBeUndefined();
+    await completeByRedrive(wired, "p2-replay-permanent", runner, evidence["pendingHandoffId"] as string);
+
+    const replay = await door(wired, "p2-permanent");
+    expect(replay).toEqual(storedResult(wired, "p2-permanent"));
+    expect(replay).toEqual(first);
+    expect(produce).toHaveBeenCalledTimes(1);
+  });
+
+  it("W3: a different candidate under the same key is still a CONFLICT, and runs nothing", async () => {
+    const wired = await wire("p2-replay-conflict");
+    const { produce } = await confirmAnsweredResumable(wired, "p2-conflict");
+    const stored = storedResult(wired, "p2-conflict");
+
+    const changed = await door(wired, "p2-conflict", "candidate-b");
+    expect(changed.structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
+    expect(produce).toHaveBeenCalledTimes(1);
+    expect(storedResult(wired, "p2-conflict")).toEqual(stored);
   });
 });
