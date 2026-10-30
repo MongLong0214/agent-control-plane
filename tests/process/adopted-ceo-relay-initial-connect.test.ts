@@ -30,12 +30,15 @@ const CLI_ENTRY = join(process.cwd(), "src", "cli", "agentctl.ts");
 
 const roots: string[] = [];
 const servers: Server[] = [];
+const accepted: Socket[] = [];
 const children: ChildProcess[] = [];
 
 afterEach(async () => {
   for (const child of children.splice(0)) {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
   }
+  // A relay that wrongly stayed connected must fail its assertion, not hang the server's close.
+  for (const socket of accepted.splice(0)) socket.destroy();
   await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
   for (const root of roots.splice(0)) {
     chmodSync(root, 0o700);
@@ -51,6 +54,14 @@ const socketPath = (): string => {
 };
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Holds the event loop, as a busy host would: no timer and no I/O callback runs meanwhile. */
+const block = (ms: number): void => {
+  const until = performance.now() + ms;
+  while (performance.now() < until) {
+    // spin
+  }
+};
 
 const settles = async (exit: Promise<number>, budgetMs = 10_000): Promise<number | "did-not-settle"> => {
   let timer: NodeJS.Timeout | undefined;
@@ -86,6 +97,7 @@ const serve = (path: string, onLine: (line: string, socket: Socket) => void): Pr
     let received = "";
     const server = createServer((socket) => {
       connections += 1;
+      accepted.push(socket);
       let pending = "";
       socket.on("error", () => undefined);
       socket.on("data", (chunk: Buffer) => {
@@ -108,7 +120,11 @@ const answer = (line: string, socket: Socket): void => {
   socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, result: { tools: [] } })}\n`);
 };
 
-const relay = (toolSocketPath: string, initialConnect?: Partial<InitialConnectPolicy>) => {
+const relay = (
+  toolSocketPath: string,
+  initialConnect?: Partial<InitialConnectPolicy>,
+  onStderr?: (text: string) => void,
+) => {
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const stderr = new PassThrough();
@@ -119,8 +135,9 @@ const relay = (toolSocketPath: string, initialConnect?: Partial<InitialConnectPo
   });
   stderr.on("data", (chunk: Buffer) => {
     err += chunk.toString("utf8");
+    onStderr?.(chunk.toString("utf8"));
   });
-  const started = Date.now();
+  const started = performance.now();
   const exit = runAdoptedCeoAttachRelay(
     initialConnect === undefined ? { toolSocketPath } : { toolSocketPath, initialConnect },
     { stdin, stdout, stderr },
@@ -161,7 +178,7 @@ describe("the adopted CEO relay's first connect", () => {
   it("exits UNAVAILABLE once the time bound passes for a socket that never appears", async () => {
     const r = relay(socketPath(), { maxWaitMs: 1_000, maxAttempts: 1_000, retryDelayMs: 50 });
     expect(await settles(r.exit, 5_000)).toBe(ATTACH_EXIT.UNAVAILABLE);
-    expect(Date.now() - r.started).toBeGreaterThanOrEqual(1_000);
+    expect(performance.now() - r.started).toBeGreaterThanOrEqual(1_000);
     expect(r.err()).toBe("attach: mcp socket waiting\nattach: mcp socket unavailable\n");
     expect(r.out()).toBe("");
   });
@@ -169,9 +186,46 @@ describe("the adopted CEO relay's first connect", () => {
   it("exits UNAVAILABLE once the attempt bound is reached, well before the time bound", async () => {
     const r = relay(socketPath(), { maxWaitMs: 60_000, maxAttempts: 3, retryDelayMs: 100 });
     expect(await settles(r.exit, 5_000)).toBe(ATTACH_EXIT.UNAVAILABLE);
-    const elapsed = Date.now() - r.started;
+    const elapsed = performance.now() - r.started;
     expect(elapsed).toBeGreaterThanOrEqual(200);
     expect(elapsed).toBeLessThan(5_000);
+  });
+
+  it("does not attempt a connect whose retry timer ran past the deadline", async () => {
+    const path = socketPath();
+    const r = relay(path, { maxWaitMs: 100, maxAttempts: 1_000, retryDelayMs: 50 });
+    r.stdin.write(request(1));
+    await sleep(20);
+    block(200);
+    // Bound before this test yields, so the overdue retry finds a listener.
+    const daemon = serve(path, answer);
+    expect(await settles(r.exit, 5_000)).toBe(ATTACH_EXIT.UNAVAILABLE);
+    await sleep(300);
+    expect((await daemon).connections()).toBe(0);
+    expect((await daemon).received()).toBe("");
+    expect(r.out()).toBe("");
+  });
+
+  it("refuses a connection that completes past the deadline, and writes none of the held bytes to it", async () => {
+    const path = socketPath();
+    let daemon: Promise<FakeDaemon> | undefined;
+    const r = relay(path, { maxWaitMs: 100, maxAttempts: 1_000, retryDelayMs: 50 }, (line) => {
+      if (!line.includes("waiting")) return;
+      // After the relay has armed its retry: the listener appears, and the event loop blocks right
+      // after that retry starts its connect, so the connect completes only past the deadline.
+      queueMicrotask(() => {
+        daemon = serve(path, answer);
+        setTimeout(() => block(200), 50);
+      });
+    });
+    r.stdin.write(request(1));
+    expect(await settles(r.exit, 5_000)).toBe(ATTACH_EXIT.UNAVAILABLE);
+    await sleep(300);
+    expect(daemon).toBeDefined();
+    expect((await daemon!).connections()).toBe(1);
+    expect((await daemon!).received()).toBe("");
+    expect(r.out()).toBe("");
+    expect(r.err()).toBe("attach: mcp socket waiting\nattach: mcp socket unavailable\n");
   });
 
   it("exits UNAVAILABLE at once on a permission error, never waiting it out", async () => {
@@ -182,7 +236,7 @@ describe("the adopted CEO relay's first connect", () => {
     try {
       const r = relay(join(locked, "tools.sock"));
       expect(await settles(r.exit, 2_000)).toBe(ATTACH_EXIT.UNAVAILABLE);
-      expect(Date.now() - r.started).toBeLessThan(1_000);
+      expect(performance.now() - r.started).toBeLessThan(1_000);
       expect(r.err()).toBe("attach: mcp socket unavailable\n");
     } finally {
       chmodSync(locked, 0o700);

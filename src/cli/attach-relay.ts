@@ -1054,7 +1054,7 @@ const connectWhenReady = (
   io: AttachRelayIo,
 ): Promise<{ socket: Socket } | { exit: number }> =>
   new Promise((resolve) => {
-    const deadline = Date.now() + policy.maxWaitMs;
+    const deadline = performance.now() + policy.maxWaitMs;
     const held: Buffer[] = [];
     let heldBytes = 0;
     let attempts = 0;
@@ -1085,27 +1085,32 @@ const connectWhenReady = (
       }
       resolve(outcome);
     };
+    // Checked before every attempt, before every retry is scheduled, and once more after a connect
+    // succeeds: a timer or a connect completion can run late, and a connection made past the
+    // deadline is refused here, before any held byte is written to it.
+    const expired = (): boolean => attempts >= policy.maxAttempts || performance.now() > deadline;
+    const unavailable = (): void => {
+      io.stderr.write("attach: mcp socket unavailable\n");
+      stop({ exit: ATTACH_EXIT.UNAVAILABLE });
+    };
     const connect = (): void => {
+      if (expired()) return unavailable();
       attempts += 1;
       const socket = createConnection(path);
       attempt = socket;
       const failed = (error: NodeJS.ErrnoException): void => {
         if (done) return;
-        const remaining = deadline - Date.now();
-        if (!NOT_YET_LISTENING.has(error.code ?? "") || attempts >= policy.maxAttempts || remaining <= 0) {
-          io.stderr.write("attach: mcp socket unavailable\n");
-          stop({ exit: ATTACH_EXIT.UNAVAILABLE });
-          return;
-        }
+        if (!NOT_YET_LISTENING.has(error.code ?? "") || expired()) return unavailable();
         if (!waiting) {
           waiting = true;
           io.stderr.write("attach: mcp socket waiting\n");
         }
-        timer = setTimeout(connect, Math.min(policy.retryDelayMs, remaining));
+        timer = setTimeout(connect, Math.min(policy.retryDelayMs, Math.max(0, deadline - performance.now())));
       };
       socket.once("error", failed);
       socket.once("connect", () => {
         socket.removeListener("error", failed);
+        if (performance.now() > deadline) return unavailable();
         stop({ socket });
       });
     };
