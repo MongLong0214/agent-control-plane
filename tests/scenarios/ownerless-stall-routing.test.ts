@@ -432,7 +432,7 @@ describe("a CONTRACT_CHANGE run the activation path cannot finish reaches the CE
         state: RunState.CEO_APPROVED,
         cause: "CONFIRMED_WITHOUT_GRANT",
       });
-      expect(notices[0]!.payload["action"]).toEqual(expect.stringContaining("no cancel edge leaves CEO_APPROVED"));
+      expect(notices[0]!.payload["action"]).toEqual(expect.stringContaining("cancel it with run_cancel"));
     }
     expect(h.cp.runs.require(run.runId).state).toBe(RunState.CEO_APPROVED);
     expect(h.cp.artifacts.list(run.runId)).toHaveLength(artifacts);

@@ -206,10 +206,11 @@ const V52_COLUMNS = "rowid, result_id, run_id, candidate_snapshot_digest, comman
 
 describe("#1258 v53 migrates a v52 database's verification rows without losing one", () => {
   it("chains v53 after v52 and leaves v52's released checksum where it was", () => {
-    expect(SCHEMA_VERSION).toBe(53);
-    expect(MIGRATIONS.slice(-2).map((step) => [step.id, step.fromVersion, step.toVersion])).toEqual([
+    expect(SCHEMA_VERSION).toBe(54);
+    expect(MIGRATIONS.slice(-3).map((step) => [step.id, step.fromVersion, step.toVersion])).toEqual([
       ["v52-resident-project-provisioning", 51, 52],
       ["v53-verification-result-history", 52, 53],
+      ["v54-run-state-exits", 53, 54],
     ]);
     // What a v52 database's receipt holds: schema.sql as v52 was released.
     expect(MIGRATIONS.find((step) => step.toVersion === 52)!.checksum())
@@ -230,7 +231,7 @@ describe("#1258 v53 migrates a v52 database's verification rows without losing o
     approveMigration(path, "v52 → v53 verification history witness");
     new Db(path).close();
 
-    expect(userVersionOf(path)).toBe(53);
+    expect(userVersionOf(path)).toBe(54);
     // Every table, verification_results included, holds exactly what it held at v52 (the attempt column aside).
     const after = contentDigests(path, 52);
     const { schema_migrations: receiptsBefore, ...restBefore } = before.tables;
@@ -247,6 +248,7 @@ describe("#1258 v53 migrates a v52 database's verification rows without losing o
         .toEqual([
           { version: 52, migration_id: "v52-resident-project-provisioning", checksum: MIGRATIONS.find((step) => step.toVersion === 52)!.checksum() },
           { version: 53, migration_id: "v53-verification-result-history", checksum: MIGRATIONS.find((step) => step.toVersion === 53)!.checksum() },
+          { version: 54, migration_id: "v54-run-state-exits", checksum: MIGRATIONS.find((step) => step.toVersion === 54)!.checksum() },
         ]);
       expect(raw.prepare("SELECT name FROM sqlite_schema WHERE name LIKE '%_v53_prior'").all()).toEqual([]);
     } finally {

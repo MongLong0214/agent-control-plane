@@ -74,6 +74,7 @@ import { BootstrapActivation } from "../bootstrap/activation.ts";
 import type { GitHubWritePort } from "../bootstrap/github-write-port.ts";
 import { createBootstrapGitHubWritePort } from "../bootstrap/bootstrap-write-guard.ts";
 import { type CommitLorePort, createCommitLoreCliPort } from "../bootstrap/commitlore-observation.ts";
+import { releaseCancelledBootstrapReservation } from "../bootstrap/cancelled-reservation-release.ts";
 import { RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { Daemon, type DaemonOptions } from "../daemon/daemon.ts";
@@ -859,6 +860,19 @@ export class ControlPlane {
       this.bootstrap.attachCompletionChain(this.bootstrapProducer);
       // #246 C3 — the reservation release is a repair the bootstrap runner verifies and performs.
       this.repair.attach({ ownerAuthority: this.ownerAuthority, bootstrapRecovery: this.bootstrapProducer });
+      // #1189 B14 — a bootstrap at CEO review is not cancelled while its CONFIRM's application runs, and a
+      // cancelled one's reservation is released once its cancel commits, by that same proof.
+      this.runs.attach({
+        cancelSettlement: {
+          applicationInFlight: (runId) => this.bootstrapProducer.applicationInFlight(runId),
+          afterBootstrapCancel: (runId) => {
+            releaseCancelledBootstrapReservation(
+              { runner: this.bootstrapProducer, applications: this.bootstrapApplications, audit: this.audit },
+              runId,
+            );
+          },
+        },
+      });
       this.ceo.attach({
         ownerAuthority: this.ownerAuthority,
         bootstrapActivation: {

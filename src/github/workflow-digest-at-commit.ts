@@ -3,7 +3,7 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { parseGitHubIdentity } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { git, withoutRepositoryPrograms } from "../git/git.ts";
-import type { GitHubClient } from "./github-kernel.ts";
+import { type GitHubClient, transportOutcome } from "./github-kernel.ts";
 
 /**
  * #512 (v45) — the exact-commit reader: the sha256 of one workflow file's bytes at one exact commit
@@ -166,6 +166,8 @@ const readRemote = async (
     return refused(ExactReadRefusal.OBJECT_UNREADABLE, "GitHub did not return the bound commit object", {
       ...evidence,
       error: error instanceof Error ? error.message : String(error),
+      // #1189 B13 — whether GitHub answered (a permission error is permanent) or went unheard.
+      ...transportOutcome(error),
     });
   }
   const tree = isRecord(commit) && isRecord(commit["tree"]) ? commit["tree"]["sha"] : undefined;
@@ -189,6 +191,7 @@ const readRemote = async (
         ...evidence,
         tree: current,
         error: error instanceof Error ? error.message : String(error),
+        ...transportOutcome(error),
       });
     }
     if (!isRecord(listing) || listing["sha"] !== current || !Array.isArray(listing["tree"])) {
@@ -213,6 +216,7 @@ const readRemote = async (
       ...evidence,
       blobSha: current,
       error: error instanceof Error ? error.message : String(error),
+      ...transportOutcome(error),
     });
   }
   if (!isRecord(blob) || blob["sha"] !== current || blob["encoding"] !== "base64" || typeof blob["content"] !== "string") {

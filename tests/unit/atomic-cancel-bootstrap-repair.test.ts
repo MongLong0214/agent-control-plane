@@ -41,14 +41,30 @@ const snapshot = (f: Fixture) => ({
 });
 
 describe("atomic run cancel", () => {
-  it("refuses CEO-review bootstrap cancellation without changing any state or audit", async () => {
+  // #1189 B14 — a CEO-review bootstrap may be cancelled now, but not once what its application wrote has
+  // landed; that refusal, like every refusal, changes no state and records nothing.
+  it("refuses a CEO-review bootstrap cancel whose application is WRITTEN without changing any state or audit", async () => {
     const f = await fixture();
     try {
+      reserve(f);
+      expect(f.cp.bootstrapApplications.markWritten(f.runId)).toMatchObject({ allowed: true });
       const before = snapshot(f);
-      expect(f.cp.runs.cancel(f.runId, "operator cancel")).toMatchObject({ allowed: false, reasonCode: ReasonCode.RUN_TRANSITION_ILLEGAL });
+      expect(f.cp.runs.cancel(f.runId, "operator cancel")).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS, evidence: { classification: "APPLIED" },
+      });
       expect(snapshot(f)).toEqual(before);
       expect(f.cp.tasks.require(f.taskId).state).toBe("READY");
       expect(f.cp.audit.byKind("TASK_GRAPH_CANCELLED")).toEqual([]);
+      expect(f.cp.bootstrapApplications.get(f.runId)).toMatchObject({ phase: "WRITTEN" });
+    } finally { f.cp.close(); }
+  });
+
+  it("cancels a CEO-review bootstrap with no application: its graph and the run, in one transaction", async () => {
+    const f = await fixture();
+    try {
+      expect(f.cp.runs.cancel(f.runId, "operator cancel")).toMatchObject({ allowed: true, value: { state: RunState.CANCELLED } });
+      expect(f.cp.tasks.require(f.taskId).state).toBe("CANCELLED");
+      expect(f.cp.audit.byKind("TASK_GRAPH_CANCELLED")).toHaveLength(1);
     } finally { f.cp.close(); }
   });
 
@@ -95,8 +111,8 @@ const request = (f: Fixture, dryRun = false): RepairRequest => ({
   operationId: repairId, parameters: { runId: f.runId, taskId: f.taskId, cancelReasonSha256 }, authorizedBy: "HERMES", dryRun,
 });
 
-const damaged = async (auditChanges: number | null = 1, otherTask = false) => {
-  const f = await fixture(true, otherTask);
+/** The frozen application a bootstrap CONFIRM reserves, written through the application record's own API. */
+const reserve = (f: Fixture): void => {
   const plan = currentBootstrapPlan(f.runId, f.cp.artifacts.latest(f.runId, "PLAN"));
   if (!plan.allowed) throw new Error(plan.message);
   const candidate = f.cp.runs.currentCandidate(f.runId)!;
@@ -106,6 +122,11 @@ const damaged = async (auditChanges: number | null = 1, otherTask = false) => {
     manifestDigest: plan.value.binding.projectManifestDigest, plannedOutputsDigest: plan.value.binding.plannedOutputsDigest,
     candidateSnapshotDigest: candidate, reviewDigest: "sha256:review", approvalDigest: "sha256:scope",
   }, { writer: null })).toMatchObject({ allowed: true });
+};
+
+const damaged = async (auditChanges: number | null = 1, otherTask = false) => {
+  const f = await fixture(true, otherTask);
+  reserve(f);
   f.clock.advance(1000);
   // The pre-fix path: committed task cancellation followed by a refused run transition.
   if (auditChanges === 1) f.cp.tasks.cancelAll(f.runId, cancelReason);
@@ -113,7 +134,9 @@ const damaged = async (auditChanges: number | null = 1, otherTask = false) => {
     f.cp.db.run("UPDATE tasks SET state = 'CANCELLED', updated_at = ? WHERE task_id = ?", [f.clock.nowIso(), f.taskId]);
     if (auditChanges !== null) f.cp.audit.record({ kind: "TASK_GRAPH_CANCELLED", runId: f.runId, evidence: { reason: cancelReason, changes: auditChanges } });
   }
-  expect(f.cp.runs.transition(f.runId, RunState.CANCELLED, "operator cancel")).toMatchObject({ allowed: false });
+  // The pre-fix build then refused the run's transition (a CEO-review run had no CANCELLED edge), so the
+  // run stayed at CEO review with its task cancelled. #1189 B14 opened that edge; the damage it left stays.
+  expect(f.cp.runs.require(f.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
   return f;
 };
 

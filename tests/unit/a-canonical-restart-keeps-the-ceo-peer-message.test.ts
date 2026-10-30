@@ -1488,7 +1488,7 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     const migrated = openDb(path);
     try {
       // v41 (#512), v42 (#246 C1b), v43 (#246 C3), v44 (#246 B2-b), v45 (#512), v46 (#1094), v47 and v48 (SEC-OD1) v49 (#512 S-PUSH), and v50 (post-merge recovery) follow on the same approved chain.
-      expect(SCHEMA_VERSION).toBe(53);
+      expect(SCHEMA_VERSION).toBe(54);
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(migrated.all<{ version: number; migration_id: string }>(
         `SELECT version, migration_id FROM schema_migrations WHERE version >= 38 ORDER BY version`,
@@ -1509,6 +1509,7 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
         { version: 51, migration_id: "v51-durable-recipient-delivery" },
         { version: 52, migration_id: "v52-resident-project-provisioning" },
         { version: 53, migration_id: "v53-verification-result-history" },
+        { version: 54, migration_id: "v54-run-state-exits" },
       ]);
       expect(migrated.all<{ name: string }>(
         `SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'peer_message_carries' ORDER BY name`,

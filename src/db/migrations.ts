@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 53;
+export const SCHEMA_VERSION = 54;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -22,6 +22,7 @@ const v49SchemaPath = fileURLToPath(new URL("./schema-v49.sql", import.meta.url)
 const v50SchemaPath = fileURLToPath(new URL("./schema-v50.sql", import.meta.url)); // released v50 reads only this
 const v51SchemaPath = fileURLToPath(new URL("./schema-v51.sql", import.meta.url)); // released v51 reads only this
 const v52SchemaPath = fileURLToPath(new URL("./schema-v52.sql", import.meta.url)); // released v52 reads only this
+const v53SchemaPath = fileURLToPath(new URL("./schema-v53.sql", import.meta.url)); // released v53 reads only this
 export const schemaSql = (): string => readFileSync(schemaPath, "utf8");
 const historicalSchemaSql = (): string => readFileSync(historicalSchemaPath, "utf8");
 const schemaSqlAt = (version: number): string =>
@@ -34,7 +35,8 @@ const schemaSqlAt = (version: number): string =>
               : version <= 49 ? readFileSync(v49SchemaPath, "utf8")
                 : version <= 50 ? readFileSync(v50SchemaPath, "utf8")
                   : version <= 51 ? readFileSync(v51SchemaPath, "utf8")
-                    : version <= LATEST_FROZEN_VERSION ? readFileSync(v52SchemaPath, "utf8") : schemaSql();
+                    : version <= 52 ? readFileSync(v52SchemaPath, "utf8")
+                      : version <= LATEST_FROZEN_VERSION ? readFileSync(v53SchemaPath, "utf8") : schemaSql();
 
 /** Connection PRAGMAs are established by Db before any migration transaction begins. */
 export const schemaDdl = (): string =>
@@ -4300,6 +4302,33 @@ const v53: SchemaMigration = {
   checksum: () => migrationChecksum("v53-verification-result-history", 53),
 };
 
+/**
+ * #1189 — v54 opens the cancel exits the CEO ruled on, as v50 did for its one edge: it replaces the two
+ * state guards (READY_FOR_CEO_REVIEW → CANCELLED; CEO_APPROVED, MERGING and POST_MERGE_VERIFYING →
+ * CANCELLED) and adds `runs_cancel_after_approval_requires_no_grant`, which admits the post-approval
+ * cancel only for a CONTRACT_CHANGE holding no activation grant. It names no other object and moves no
+ * row, so it can be renumbered behind another step that replaces the same two guards: only `version`,
+ * the id and the prior version below change.
+ */
+const V54_REPLACED_GUARDS = ["runs_state_transition_guard", "runs_state_transition_authority_guard"] as const;
+const V54_ADDED_TRIGGERS = ["runs_cancel_after_approval_requires_no_grant"] as const;
+const v54: SchemaMigration = {
+  id: "v54-run-state-exits",
+  fromVersion: 53,
+  toVersion: 54,
+  apply(raw) {
+    const objects = [
+      ...stepTriggerObjects(54, V54_REPLACED_GUARDS, { version: 53, names: V54_REPLACED_GUARDS }),
+      ...stepTriggerObjects(54, V54_ADDED_TRIGGERS),
+    ];
+    assertStepNames(raw, 54, objects, "before");
+    raw.exec(dropsFor([...V54_REPLACED_GUARDS, ...V54_ADDED_TRIGGERS]));
+    raw.exec(triggerDdlFor([...V54_REPLACED_GUARDS, ...V54_ADDED_TRIGGERS], 54));
+    assertStepNames(raw, 54, objects, "after");
+  },
+  checksum: () => migrationChecksum("v54-run-state-exits", 54),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -4343,6 +4372,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v51,
   v52,
   v53,
+  v54,
 ]);
 
 interface RequiredTrigger {
@@ -4543,6 +4573,8 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "projects_no_replace", sentinel: "PROJECT_NO_REPLACE", introducedIn: 44 },
   { name: "projects_active_manifest_moves_by_grant", sentinel: "MANIFEST_ACTIVATION_AUTHORITY_DENIED", introducedIn: 44 },
   { name: "runs_contract_change_completes_activated", sentinel: "CONTRACT_CHANGE_NOT_ACTIVATED", introducedIn: 44 },
+  // #1189 B15 — v54 alone installs it.
+  { name: "runs_cancel_after_approval_requires_no_grant", sentinel: "RUN_STATE_TRANSITION_ILLEGAL", introducedIn: 54 },
   { name: "manifest_first_activation_grants_born_unconsumed", sentinel: "MANIFEST_GRANT_IMMUTABLE", introducedIn: 45 },
   { name: "manifest_first_activation_grants_born_on_null", sentinel: "MANIFEST_FIRST_ACTIVATION_DENIED", introducedIn: 45 },
   { name: "manifest_first_activation_grants_no_replace", sentinel: "MANIFEST_GRANT_NO_REPLACE", introducedIn: 45 },
@@ -4710,6 +4742,7 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * #1258: v52 is frozen as v53's prerequisite in schema-v52.sql, byte-identical to schema.sql at 372c6669
  * (blob 4d92c123, unchanged through 5d45ae8b), and its step now reads that snapshot rather than the live
  * file, so a later schema edit cannot change what a database receives at its v52 step.
+ * v53 is frozen as v54's prerequisite in schema-v53.sql, byte-identical to schema.sql at 24d49f94.
  * v51 is frozen as v52's prerequisite in schema-v51.sql, byte-identical to schema.sql at 3915f78c; v50 is
  * frozen as v51's prerequisite in schema-v50.sql.
  * v49 is frozen as v50's prerequisite in schema-v49.sql, byte-identical to a620b8d2.
@@ -4718,7 +4751,7 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * cannot leak back into what a database receives at its v48 step, and v48's checksum is the value the
  * pre-freeze build computed.
  */
-const LATEST_FROZEN_VERSION = 52;
+const LATEST_FROZEN_VERSION = 53;
 
 /**
  * The last version whose stored receipt is compared by value (`receiptMismatches`). It stays at 47 when

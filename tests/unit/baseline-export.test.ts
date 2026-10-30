@@ -1155,6 +1155,7 @@ describe("baseline boundary contracts", () => {
       "v51-durable-recipient-delivery",
       "v52-resident-project-provisioning",
       "v53-verification-result-history",
+      "v54-run-state-exits",
     ]);
   });
 
