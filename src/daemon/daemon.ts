@@ -2105,11 +2105,15 @@ export class Daemon {
    * engine decides, per run, whether the wait is continuity's own and nothing has moved since, and
    * answers `released: false` for every other one; a refusal here changes nothing and the next pass
    * asks again.
+   *
+   * #1189 — a wait continuity placed for a role that is not the run's owner (the CEO's, whose loss pauses
+   * every run) is handed back too, once `binding` covers that role again; the run engine decides that one
+   * by the pause's own record (`RunEngine.releaseHeldRoleReviewHold`).
    */
   private releaseContinuityReviewHolds(binding: RoleBinding): void {
     for (const run of this.cp.runs.list({ state: RunState.AWAITING_HUMAN })) {
-      if (run.ownerRoleKey !== binding.roleKey) continue;
-      this.cp.runs.releaseContinuityReviewHold(run.runId, binding);
+      if (run.ownerRoleKey === binding.roleKey) this.cp.runs.releaseContinuityReviewHold(run.runId, binding);
+      else this.cp.runs.releaseHeldRoleReviewHold(run.runId, binding);
     }
   }
 
