@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { basename, posix } from "node:path";
 
 import { redactCredentialShapes, withholdCutFragment } from "../core/credential-shapes.ts";
@@ -6,8 +5,9 @@ import { digestOf, sha256 } from "../core/digest.ts";
 import { type ProjectManifest, commandsForMode } from "../contracts/manifest.ts";
 import type { Db } from "../db/database.ts";
 import { RunKind } from "../domain/types.ts";
-import { git } from "../git/git.ts";
+import { git, readBlob } from "../git/git.ts";
 import { storedManifest } from "../registry/contract-change-plan.ts";
+import type { TaskImport } from "../run/task-import.ts";
 import { WorkerTurnEvent, workerDiffDigest, workerSuccessDigest } from "../run/worker-turn.ts";
 import type { CandidateSnapshot } from "../snapshot/candidate-snapshot.ts";
 import type { VerificationReport, VerificationResultRecord } from "../verify/verification-engine.ts";
@@ -265,23 +265,10 @@ export interface ExecutionEvidenceInput {
   checkoutOf: (identity: string) => string | null;
 }
 
-/**
- * The exact bytes of one blob, or null. Read as `latin1`, one character per byte, so binary content
- * survives; the object id is re-derived from those bytes, and only when it equals the id git named
- * are they the committed bytes.
- */
-const blobBytes = async (checkoutPath: string, id: string): Promise<Buffer | null> => {
-  if (!OBJECT_ID.test(id)) return null;
-  const blob = await git(checkoutPath, ["--no-replace-objects", "cat-file", "blob", id], { allowFailure: true, encoding: "latin1" });
-  if (blob.exitCode !== 0) return null;
-  const bytes = Buffer.from(blob.stdout, "latin1");
-  const format = id.length === 64 ? "sha256" : "sha1";
-  return createHash(format).update(`blob ${bytes.length}\0`).update(bytes).digest("hex") === id ? bytes : null;
-};
 
 /** A blob's bytes as text, or null when they are not valid UTF-8 (a config file must be text). */
 const exactBlobText = async (checkoutPath: string, id: string): Promise<string | null> => {
-  const bytes = await blobBytes(checkoutPath, id);
+  const bytes = await readBlob(checkoutPath, id);
   if (bytes === null) return null;
   try { return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); } catch { return null; }
 };
@@ -528,7 +515,7 @@ const recomputedDiffDigest = async (checkoutPath: string, base: string, entries:
       return { problem: `diffDigest was not recomputed: ${entry.path} is a mode ${entry.mode} entry, which no worker receipt records` };
     }
     // The committed bytes, hashed as the worker hashes the file it committed (worker-git.ts).
-    const bytes = await blobBytes(checkoutPath, entry.blob);
+    const bytes = await readBlob(checkoutPath, entry.blob);
     if (bytes === null) return { problem: `diffDigest was not recomputed: the committed bytes of ${entry.path} could not be read` };
     digested.push({ path: entry.path, mode: entry.mode as "100644" | "100755" | "120000", sha256: sha256(bytes), blob: entry.blob });
   }
@@ -542,6 +529,21 @@ const sameSet = (left: readonly string[], right: readonly string[]): boolean => 
 };
 
 const stringOrNull = (value: unknown): string | null => (typeof value === "string" ? value : null);
+
+/** Whether a success record's inputs, its import manifest included when it has one, reproduce `resultDigest`. */
+const reproducesResult = (resultDigest: string | null, e: Record<string, unknown>): boolean => {
+  if (resultDigest === null || e["resultDigest"] !== resultDigest) return false;
+  try {
+    return workerSuccessDigest({
+      executionId: String(e["executionId"]), workerSessionId: String(e["workerSessionId"]),
+      sessionIncarnation: String(e["sessionIncarnation"]), providerSessionId: String(e["providerSessionId"]),
+      exitCode: Number(e["exitCode"]), stdoutSha256: String(e["stdoutSha256"]),
+      commitHead: String(e["commitHead"]), diffDigest: String(e["diffDigest"]),
+      // The manifest exactly as recorded: the digest was computed over it.
+      ...(e["imports"] === undefined ? {} : { imports: e["imports"] as TaskImport[] }),
+    }) === resultDigest;
+  } catch { return false; }
+};
 
 /**
  * The daemon's task execution -> commit receipts for this candidate. A receipt is linked only when
@@ -578,18 +580,7 @@ const receiptEvidence = async (db: Db, input: ExecutionEvidenceInput): Promise<P
     const own = events.get(execution.execution_id) ?? [];
     const succeeded = own.filter((event) => event.kind === WorkerTurnEvent.SUCCEEDED);
     // Among this execution's success records, the one whose inputs reproduce its resultDigest.
-    const reproducing = succeeded.find((event) => {
-      const e = event.evidence;
-      if (execution.result_digest === null || e["resultDigest"] !== execution.result_digest) return false;
-      try {
-        return workerSuccessDigest({
-          executionId: String(e["executionId"]), workerSessionId: String(e["workerSessionId"]),
-          sessionIncarnation: String(e["sessionIncarnation"]), providerSessionId: String(e["providerSessionId"]),
-          exitCode: Number(e["exitCode"]), stdoutSha256: String(e["stdoutSha256"]),
-          commitHead: String(e["commitHead"]), diffDigest: String(e["diffDigest"]),
-        }) === execution.result_digest;
-      } catch { return false; }
-    });
+    const reproducing = succeeded.find((event) => reproducesResult(execution.result_digest, event.evidence));
     const record = reproducing ?? succeeded.at(-1) ?? own.filter((event) => typeof event.evidence["commitHead"] === "string").at(-1) ?? null;
     const commitHead = stringOrNull(record?.evidence["commitHead"]);
     if (execution.status !== "SUCCEEDED" && (commitHead === null || !candidateHeads.has(commitHead))) continue;

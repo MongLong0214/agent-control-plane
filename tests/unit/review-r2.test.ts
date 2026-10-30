@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { sha256 } from "../../src/core/digest.ts";
+import { hasCredentialShape } from "../../src/core/credential-shapes.ts";
 import { artifactDigestMatches } from "../../src/db/artifacts.ts";
 import { ExecutionMode, Role, roleKeyFor } from "../../src/domain/types.ts";
 import { BlindReviewGate, REVIEWER_FALLBACK_SCOPE_UNCONFIGURED, __testing, type ReviewPacket } from "../../src/review/blind-review.ts";
@@ -92,8 +93,13 @@ const persistPassingVerification = (
   return report;
 };
 
-const prepareReviewedInputs = async () => {
+/** `base`: files the run's base commit holds besides the fixture's own. */
+const prepareReviewedInputs = async (base: Record<string, string> = {}) => {
   const harness = makeHarness();
+  if (Object.keys(base).length > 0) {
+    writeFiles(harness.repoPath, base);
+    commitAll(harness.repoPath, "base files");
+  }
   const { projectId, repositoryId, identity } = await registerFixtureProject(harness);
   bindCeo(harness);
   const created = harness.cp.runs.create({
@@ -775,10 +781,53 @@ describe("round-2 blind-review regressions", () => {
     });
   });
 
-  it("#129 rejects an out-of-chunk coverage claim through the chunked review gate", async () => {
+  it("#1259 keeps a chunked review whose reviewer also claims a file outside its chunk, recording that claim uncredited", async () => {
+    const setup = await prepareLargeReviewedInputs();
+    const assigned = `${setup.identity}:src/app.js`;
+    const extra = `${setup.identity}:package.json`;
+    expect(setup.snapshot.repositories.flatMap((repository) => repository.touchedPaths)).not.toContain("package.json");
+    setup.harness.scripted.script(
+      { match: /Review chunk/, text: reviewerPass([assigned, extra]), once: false },
+      { match: /Final review/, text: reviewerPass([]) },
+    );
+
+    const result = await invokePreparedReview(setup);
+
+    if (!result.allowed) throw new Error(`${result.reasonCode}: ${result.message}`);
+    expect(result.value).toMatchObject({ chunked: true, verdict: "PASS", omittedItems: [] });
+    expect(result.value.coveredFiles).toEqual([assigned]);
+    expect(result.value.extraClaims).toEqual([extra]);
+    const stored = setup.harness.cp.review.latestPacket(setup.run.runId, candidateSnapshotDigest(setup.snapshot));
+    expect(stored?.coveredFiles).toEqual([assigned]);
+    expect(stored?.extraClaims).toEqual([extra]);
+  });
+
+  it("#1259 an extra claim does not cover an assigned slice its chunk reviewer left unclaimed", async () => {
+    const setup = await prepareLargeReviewedInputs();
+    const assigned = `${setup.identity}:src/app.js`;
+    const extra = `${setup.identity}:package.json`;
+    // Chunk 1 claims its slice; every later chunk claims only the file outside it.
+    setup.harness.scripted.script(
+      { match: /Review chunk 1 of/, text: reviewerPass([assigned]) },
+      { match: /Review chunk/, text: reviewerPass([extra]), once: false },
+      { match: /Final review/, text: reviewerPass([]) },
+    );
+
+    const result = await invokePreparedReview(setup);
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.REVIEW_REVISE);
+    const stored = setup.harness.cp.review.latestPacket(setup.run.runId, candidateSnapshotDigest(setup.snapshot));
+    expect(stored?.verdict).toBe("REVISE");
+    expect(stored?.omittedItems).toContain(assigned);
+    expect(stored?.coveredFiles).toEqual([assigned]);
+    expect(stored?.extraClaims).toEqual([extra]);
+  });
+
+  it("#1259 still refuses a chunk claim that is not <identity>:<path>, naming it as malformed", async () => {
     const setup = await prepareLargeReviewedInputs();
     setup.harness.scripted.script(
-      { match: /Review chunk/, text: reviewerPass([`${setup.identity}:not-in-this-chunk.ts`]), once: false },
+      { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`, "package.json"]), once: false },
       { match: /Final review/, text: reviewerPass([]) },
     );
 
@@ -786,6 +835,135 @@ describe("round-2 blind-review regressions", () => {
 
     expect(result.allowed).toBe(false);
     expect(result.reasonCode).toBe(ReasonCode.COVERAGE_INCOMPLETE);
+    expect(result.allowed ? null : result.message).toMatch(/not <identity>:<path>/);
+    expect(result.evidence).toMatchObject({ claim: "package.json" });
+    expect(setup.harness.cp.review.latestPacket(setup.run.runId, candidateSnapshotDigest(setup.snapshot))).toBeNull();
+  });
+
+  it("#1259 a single review records a claim outside its coverage items the same way, uncredited", async () => {
+    const setup = await prepareReviewedInputs();
+    const assigned = `${setup.identity}:src/app.js`;
+    const extra = `${setup.identity}:package.json`;
+
+    const result = await directReview(setup, reviewerPass([assigned, extra]));
+
+    if (!result.allowed) throw new Error(`${result.reasonCode}: ${result.message}`);
+    expect(result.value.chunked).toBe(false);
+    expect(result.value.coveredFiles).toEqual([assigned]);
+    expect(result.value.extraClaims).toEqual([extra]);
+  });
+
+  it("#1259 a single review refuses a claim that is not <identity>:<path>, as a chunk review does", async () => {
+    const setup = await prepareReviewedInputs();
+
+    const result = await directReview(setup, reviewerPass([`${setup.identity}:src/app.js`, "src/app.js"]));
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.COVERAGE_INCOMPLETE);
+    expect(result.evidence).toMatchObject({ claim: "src/app.js" });
+  });
+
+  it("#1259 stores extra claims as repository paths: a long path is kept, a credential-shaped one is redacted", async () => {
+    const setup = await prepareLargeReviewedInputs();
+    const assigned = `${setup.identity}:src/app.js`;
+    // One unbroken run of the base64 alphabet, `/` included, longer than the long-base64 shape: as a
+    // whole value it is credential-shaped, while no `/`-separated segment of it is.
+    const longPath = `${setup.identity}:src/main/java/org/apache/commons/collections/iterators/ObjectArrayIterator.java`;
+    const plain = `${setup.identity}:package.json`;
+    const secret = `ghp_${"A1b2C3d4".repeat(5)}`;
+    const shaped = `${setup.identity}:${secret}.txt`;
+    expect(hasCredentialShape(plain)).toBe(false);
+    expect(hasCredentialShape(plain, { path: ["extraClaims"], store: "artifact" })).toBe(false);
+    expect(hasCredentialShape(longPath)).toBe(true);
+    expect(hasCredentialShape(longPath, { path: ["extraClaims"], store: "artifact" })).toBe(false);
+    setup.harness.scripted.script(
+      { match: /Review chunk/, text: reviewerPass([assigned, plain, longPath, shaped]), once: false },
+      { match: /Final review/, text: reviewerPass([]) },
+    );
+
+    const result = await invokePreparedReview(setup);
+
+    if (!result.allowed) throw new Error(`${result.reasonCode}: ${result.message}`);
+    const stored = setup.harness.cp.artifacts.list<ReviewPacket>(setup.run.runId, "BLIND_REVIEW")[0]!;
+    expect(stored.content.coveredFiles).toEqual([assigned]);
+    expect(stored.content.extraClaims).toEqual([plain, longPath, `${setup.identity}:[redacted].txt`]);
+    expect(JSON.stringify(stored.content)).not.toContain(secret);
+    expect(artifactDigestMatches(stored)).toBe(true);
+  });
+
+  it("#1259 tells each chunk reviewer to list only the files in its own chunk", async () => {
+    const setup = await prepareLargeReviewedInputs();
+    setup.harness.scripted.script(
+      { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`]), once: false },
+      { match: /Final review/, text: reviewerPass([]) },
+    );
+
+    const result = await invokePreparedReview(setup);
+
+    if (!result.allowed) throw new Error(`${result.reasonCode}: ${result.message}`);
+    const chunkPrompts = setup.harness.scripted.invocations.filter((call) => /Review chunk/.test(call.prompt));
+    expect(chunkPrompts.length).toBeGreaterThan(1);
+    for (const call of chunkPrompts) {
+      expect(call.prompt).toContain("In this chunk, `coveredFiles` lists only files named under \"## Actual diff\" above");
+    }
+  });
+
+  /**
+   * Review lane-e-fs-r8 P1 — a binary file the candidate makes text is git's binary section followed by
+   * the readable text (git.ts `withTextRenderedAsText`). When chunking puts the two in different chunks,
+   * the claim of the chunk holding only the binary section must not cover the readable text.
+   */
+  it.each([
+    { textChunkClaims: false, verdict: "REVISE" },
+    { textChunkClaims: true, verdict: "PASS" },
+  ])("E6-1 the readable text chunked apart from its binary section needs its own coverage (text chunk claims it: $textChunkClaims)", async ({ textChunkClaims, verdict }) => {
+    // Inert comment lines behind one NUL byte in the base; the candidate removes the NUL.
+    const lines = Array.from({ length: 900 }, (_, index) => `// inert comment line ${index + 1} ${"-".repeat(40)}\n`).join("");
+    const setup = await prepareReviewedInputs({ "src/zflip.js": `\0${lines}` });
+    // Sorted before src/zflip.js, the padding leaves room in its chunk for the binary section only.
+    writeFiles(setup.harness.repoPath, { "src/pad.js": `// ${"p".repeat(60_000)}\n`, "src/zflip.js": lines });
+    commitAll(setup.harness.repoPath, "make zflip text and add padding");
+    const frozen = await setup.harness.cp.pipeline.freeze(setup.run.runId);
+    if (!frozen.allowed) throw new Error(frozen.message);
+    const reviewed = { ...setup, snapshot: frozen.value, verification: persistPassingVerification(setup, frozen.value) };
+    const key = (path: string): string => `${setup.identity}:${path}`;
+    setup.harness.scripted.script(
+      { match: /Final review/, text: reviewerPass([]) },
+      // The chunk holding the binary section claims every path it was given.
+      { match: /^GIT binary patch$/m, text: reviewerPass([key("src/app.js"), key("src/pad.js"), key("src/zflip.js")]) },
+      { match: /Review chunk/, text: reviewerPass(textChunkClaims ? [key("src/zflip.js")] : []) },
+    );
+
+    const result = await invokePreparedReview(reviewed);
+
+    const chunks = setup.harness.scripted.invocations.map((call) => call.prompt).filter((prompt) => prompt.startsWith("# Review chunk"));
+    // The repro's shape: the binary section and the readable text reach different chunk reviewers.
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]).toMatch(/^GIT binary patch$/m);
+    expect(chunks[0]).not.toContain("+// inert comment line 1 ");
+    expect(chunks[1]).not.toMatch(/^GIT binary patch$/m);
+    expect(chunks[1]).toContain("+// inert comment line 1 ");
+    expect(chunks[1]).toContain("+// inert comment line 900 ");
+    expect(result.allowed ? "PASS" : result.reasonCode).toBe(textChunkClaims ? "PASS" : ReasonCode.REVIEW_REVISE);
+    const packet = setup.harness.cp.review.latestPacket(setup.run.runId, candidateSnapshotDigest(frozen.value));
+    expect(packet).toMatchObject({ verdict, omittedItems: textChunkClaims ? [] : [key("src/zflip.js")] });
+  }, 120_000);
+
+  it("E6-1 names a renamed or copied section by its destination, the path git lists as changed, when it chunks a diff (review lane-e-fs-r8)", () => {
+    const identity = "github:acme/fixture";
+    const section = (kind: "rename" | "copy", from: string, to: string, body: string): string =>
+      `diff --git a/${from} b/${to}\nsimilarity index 90%\n${kind} from ${from}\n${kind} to ${to}\nindex 1111111..2222222 100644\n--- a/${from}\n+++ b/${to}\n@@ -1 +1 @@\n${body}`;
+    const renamed = section("rename", "src/old.js", "src/new.js", `-${"o".repeat(60)}\n+${"n".repeat(60)}\n`);
+    const copied = section("copy", "src/base.js", "src/copy.js", `-${"b".repeat(60)}\n+${"c".repeat(60)}\n`);
+    const budget = Math.max(renamed.length, copied.length);
+    const parts = __testing.splitDiffs([{ identity, diff: renamed + copied, files: ["src/copy.js", "src/new.js"] }], budget).flat();
+    expect(parts.map((part) => part.files)).toEqual([["src/new.js"], ["src/copy.js"]]);
+
+    // A section larger than the budget is range-split under its destination too.
+    const large = section("rename", "src/old.js", "src/new.js", Array.from({ length: 40 }, (_, index) => `+line ${index}\n`).join(""));
+    const ranges = __testing.splitDiffs([{ identity, diff: large, files: ["src/new.js"] }], 150).flat();
+    expect(ranges.length).toBeGreaterThan(1);
+    expect(ranges.every((part) => part.files.length === 1 && part.files[0] === "src/new.js")).toBe(true);
   });
 
   it("#359 keeps a chunk BLOCK with only MAJOR findings from becoming a final PASS", async () => {

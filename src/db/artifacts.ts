@@ -699,14 +699,28 @@ const blindReviewEvidenceSchema = z
         withheld: z.array(z.string()),
         // A binary change has no textual diff, so the reviewer receives a digest-bound
         // patch artifact instead. Recording which ones were supplied is what separates
-        // "reviewed the binary" from "omitted it".
+        // "reviewed the binary" from "omitted it". #1232 — a task's imported file whose frozen
+        // bytes are its manifest entry is supplied as that entry, its digest the file's sha256.
         binaryArtifacts: z.array(
           z
             .object({
               repository: z.string().min(1),
               path: z.string().min(1),
               digest: DIGEST_SCHEMA,
-              method: z.literal("git-binary-patch"),
+              method: z.enum(["git-binary-patch", "import-manifest"]),
+              // #1232, review E3-2/E3-3 — a task's declared import: its inspection result, the
+              // inspection's limits and what review was shown of its content, as the prompt states them.
+              importInspection: z
+                .object({
+                  format: z.string().min(1).nullable(),
+                  size: z.number().int().nonnegative(),
+                  sha256: DIGEST_SCHEMA,
+                  result: z.string().min(1),
+                  limits: z.string().min(1),
+                  content: z.string().min(1),
+                })
+                .strict()
+                .optional(),
             })
             .strict(),
         ),
@@ -714,6 +728,8 @@ const blindReviewEvidenceSchema = z
       .strict(),
     coveredRepositories: z.array(z.string()),
     coveredFiles: z.array(z.string()),
+    // #1259 — well-formed claims for items the reviewer was not assigned: recorded, never credited.
+    extraClaims: z.array(z.string()).min(1).optional(),
     omittedItems: z.array(z.string()),
     verdict: z.enum(["PASS", "REVISE", "BLOCK"]),
     findings: z.array(z.object({}).passthrough()),

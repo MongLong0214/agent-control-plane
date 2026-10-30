@@ -19,6 +19,17 @@ import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { ExecutionRecord, TaskGraph } from "./task-graph.ts";
 import {
+  type StagedImport,
+  type TaskImport,
+  type WrittenImports,
+  checkImportDestinations,
+  importsNotHeld,
+  parseImportManifest,
+  readStagedImports,
+  undoImports,
+  writeImports,
+} from "./task-import.ts";
+import {
   TASK_BRANCH_CREATED,
   TASK_BRANCH_CREATING,
   TASK_BRANCH_CREATION_UNDONE,
@@ -144,6 +155,12 @@ export interface WorkerSuccessDigestInputs {
   stdoutSha256: string;
   commitHead: string;
   diffDigest: string;
+  /**
+   * #1232 — the task's CTO PLAN import attestation, present only when the turn imported files: each
+   * opaque, potentially active file's path, size and sha256, so the receipt digest binds its exact
+   * identity without claiming byte safety or passivity. Absent, the digest is computed as before.
+   */
+  imports?: TaskImport[];
 }
 
 /** The digest of a worker's change: base commit plus each changed path's mode and content hash. */
@@ -209,6 +226,11 @@ export interface WorkerTurnOptions {
   scratchDir?: (prefix: string) => string;
   /** How long a finished turn waits for its process group to go before killing it, and again after. */
   processSettleMs?: number;
+  /**
+   * #1232 — the ACP-owned root task imports are staged under (`<importRoot>/<runId>/<taskId>/<sha256
+   * hex>`). Without one, a task whose write target declares imports is refused before it starts.
+   */
+  importRoot?: string;
 }
 
 /** Ports the runner needs; the composition root supplies them, none is a service it could misuse. */
@@ -277,6 +299,8 @@ interface TurnFacts extends DurableFacts {
   stagedBaseline: string;
   /** #1097 — every ignored path's state before the turn (`ignoredPathState`), or why it could not be read. */
   ignoredBaseline: IgnoredReading;
+  /** #1232 — the files imported before this turn's worker ran, as its write target declares them; empty for most tasks. */
+  imports: readonly TaskImport[];
 }
 
 /** #1097 — a reading of the worktree's ignored paths; a failed one is kept as its error, never as empty. */
@@ -417,6 +441,7 @@ export class WorkerTurnRunner {
   readonly #beforeCommit: (() => void | Promise<void>) | undefined;
   readonly #scratchDir: (prefix: string) => string;
   readonly #processSettleMs: number;
+  readonly #importRoot: string | null;
   #stopping = false;
 
   constructor(private readonly ports: WorkerTurnPorts, options: WorkerTurnOptions = {}) {
@@ -426,6 +451,7 @@ export class WorkerTurnRunner {
     this.#beforeCommit = options.beforeCommit;
     this.#scratchDir = options.scratchDir ?? acpScratchDir;
     this.#processSettleMs = options.processSettleMs ?? DEFAULT_PROCESS_SETTLE_MS;
+    this.#importRoot = options.importRoot ?? null;
   }
 
   /**
@@ -499,8 +525,12 @@ export class WorkerTurnRunner {
       const prepared = await this.prepareWorktree(facts, scratch);
       if (this.#stopping) return this.stoppingRefusal(request.taskId);
       if (!prepared.allowed) return prepared as Decision<{ executionId: string }>;
-      const turn = prepared.value;
-      preparedRepo = turn.repo;
+      preparedRepo = prepared.value.repo;
+      // #1232 — a task's imports are read and verified, every byte and every destination, before
+      // anything is opened or written: a refusal here leaves no execution and no file behind.
+      const staged = this.stageImports(prepared.value);
+      if (!staged.allowed) return staged as Decision<{ executionId: string }>;
+      const turn: TurnFacts = { ...prepared.value, imports: staged.value.map(({ bytes: _bytes, ...entry }) => entry) };
       const started = await this.ports.tasks.startWorkerExecution({
         runId: turn.runId,
         taskId: turn.taskId,
@@ -537,6 +567,24 @@ export class WorkerTurnRunner {
           timeoutMs,
         },
       });
+      // #1232 — the verified bytes are written under this execution's receipt, before its worker launches.
+      if (staged.value.length > 0) {
+        let imported: Decision<void>;
+        try {
+          imported = await this.importFiles(turn, executionId, staged.value);
+        } catch (error) {
+          imported = deny(ReasonCode.INTERNAL_ERROR, "the import could not be completed", { reason: "IMPORT_NOT_WRITTEN", error: errorText(error).slice(0, 300) });
+        }
+        if (!imported.allowed) {
+          this.fail(turn, executionId, "FAILED", "infrastructure", {
+            reason: "IMPORT_NOT_WRITTEN",
+            ...imported.evidence,
+            reasonCode: imported.reasonCode,
+            detail: imported.message,
+          });
+          return deny(imported.reasonCode, imported.message, { ...imported.evidence, executionId });
+        }
+      }
       launched = true;
       const turnScratch = scratch;
       const inFlight: InFlightTurn = {
@@ -1275,6 +1323,7 @@ export class WorkerTurnRunner {
         ignoredBaseline,
         workerGitConfig: await workerGitConfig(repo, providerHome()),
         gitDirEntries: gitDirEntries(repo),
+        imports: [],
       });
     } catch (error) {
       return deny(ReasonCode.PROBE_FAILED, "the claimed worktree could not be inspected", {
@@ -1282,6 +1331,108 @@ export class WorkerTurnRunner {
         error: errorText(error).slice(0, 500),
       });
     }
+  }
+
+  /**
+   * #1232 — the files a task's write target imports, read from its staging directory and verified
+   * against the manifest, or why none is imported. The manifest is checked again here (the record is
+   * read from the database), no import may be agent configuration (`isAgentConfiguration`), and every
+   * destination must be creatable in the claimed checkout. Nothing is written.
+   */
+  private stageImports(facts: TurnFacts): Decision<StagedImport[]> {
+    const declared = facts.writeTarget?.imports;
+    if (declared === undefined) return allow(ReasonCode.OK, []);
+    // The claim's owned paths are the target's paths (`matchesWriteTarget`), so this is the claim's scope too.
+    const manifest = parseImportManifest(declared, facts.writeTarget!.paths);
+    if (!manifest.allowed) return manifest as Decision<never>;
+    const configuration = manifest.value.filter((entry) => isAgentConfiguration(entry.path)).map((entry) => entry.path);
+    if (configuration.length > 0) {
+      return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "an import would be agent configuration a later turn's CLI loads; nothing is imported", {
+        reason: "IMPORT_OUT_OF_SCOPE",
+        outOfScope: configuration,
+      });
+    }
+    const destinations = checkImportDestinations(facts.claim.worktree, manifest.value);
+    if (!destinations.allowed) return destinations as Decision<never>;
+    return readStagedImports({ root: this.#importRoot, runId: facts.runId, taskId: facts.taskId, imports: manifest.value });
+  }
+
+  /**
+   * #1232 — writes the verified imports into the claimed checkout as one FILE_MUTATION the Managed
+   * Write Guard grants this execution's receipt, then scans the checkout: it must show exactly the
+   * imports, each with its sha256, and nothing else. On any failure inside the grant it takes back
+   * what it created (`undoImports`) and names whatever it could not.
+   */
+  private async importFiles(facts: TurnFacts, executionId: string, staged: readonly StagedImport[]): Promise<Decision<void>> {
+    const worktree = facts.claim.worktree;
+    const state: { outcome: Decision<void>; written: WrittenImports | null } = {
+      outcome: deny(ReasonCode.INTERNAL_ERROR, "the import effect did not run", { reason: "IMPORT_NOT_REACHED" }),
+      written: null,
+    };
+    const takeBack = (written: WrittenImports, reasonCode: ReasonCode, message: string, evidence: Evidence): Decision<void> => {
+      const left = undoImports(worktree, written);
+      return deny(reasonCode, message, { ...evidence, ...(left.length > 0 ? { leftInPlace: left.slice(0, 50) } : {}) });
+    };
+    const authorised = await this.ports.guard.authorize(
+      {
+        operation: WriteOperation.FILE_MUTATION,
+        targetPath: worktree,
+        repositoryIdentity: facts.claim.repositoryIdentity,
+        targetBranch: facts.claim.branch,
+        assignedWorktreeId: worktree,
+        taskId: facts.taskId,
+        taskReceiptId: executionId,
+        runId: facts.runId,
+        sessionId: facts.worker.sessionId,
+        sessionIncarnation: facts.worker.incarnation,
+        bindingGeneration: facts.worker.generation,
+        actor: "task-import",
+      },
+      async () => {
+        // Read again inside the grant: nothing may have come to stand where an import goes.
+        const destinations = checkImportDestinations(worktree, staged);
+        if (!destinations.allowed) {
+          state.outcome = destinations;
+          return;
+        }
+        const { written, error } = writeImports(worktree, staged);
+        state.written = written;
+        if (error !== null) {
+          state.outcome = takeBack(written, ReasonCode.INTERNAL_ERROR, "an imported file could not be written", { reason: "IMPORT_WRITE_FAILED", error });
+          return;
+        }
+        let scan: Awaited<ReturnType<typeof scanAgainst>>;
+        try {
+          scan = await scanAgainst(facts.repo, facts.baseHead, facts.objectFormat, "import");
+        } catch (failure) {
+          state.outcome = takeBack(written, ReasonCode.PROBE_FAILED, "the checkout could not be read after the import", {
+            reason: "IMPORT_NOT_TRACKED",
+            error: errorText(failure).slice(0, 300),
+          });
+          return;
+        }
+        const notShown = importsNotHeld(staged, scan.entries);
+        const imported = new Set(staged.map((entry) => entry.path));
+        const unexpected = [...scan.entries.map((entry) => entry.path).filter((path) => !imported.has(path)), ...scan.unsafe];
+        if (notShown.length > 0 || unexpected.length > 0) {
+          state.outcome = takeBack(written, ReasonCode.CONFLICT, "after the import the checkout does not show exactly the imported files; an ignored import path is never committed", {
+            reason: "IMPORT_NOT_TRACKED",
+            notShown: notShown.slice(0, 50),
+            unexpected: unexpected.slice(0, 50),
+          });
+          return;
+        }
+        state.outcome = allow(ReasonCode.OK, undefined);
+      },
+    );
+    if (!authorised.allowed) {
+      // Refused before the effect, nothing was written; refused after it, the files stand and are named.
+      return deny(authorised.reasonCode, `the import was not authorised: ${authorised.message}`, {
+        reason: "IMPORT_DENIED",
+        written: (state.written?.files ?? []).map((file) => file.path).slice(0, 50),
+      });
+    }
+    return state.outcome;
   }
 
   /**
@@ -1765,6 +1916,18 @@ export class WorkerTurnRunner {
       });
       return;
     }
+    // #1232 — the imported files are committed exactly as imported: a turn that changed, removed or
+    // re-moded one is not committed at all.
+    const altered = importsNotHeld(facts.imports, observed.entries);
+    if (altered.length > 0) {
+      this.fail(facts, executionId, "FAILED", "contract", {
+        ...evidence,
+        reason: "IMPORT_ALTERED",
+        reasonCode: ReasonCode.IMPORT_DIGEST_MISMATCH,
+        altered,
+      });
+      return;
+    }
     if (observed.entries.length === 0 || !observed.diffDigest) {
       this.fail(facts, executionId, "FAILED", "contract", { ...evidence, reason: "NO_CHANGE", reasonCode: ReasonCode.EVIDENCE_MISSING });
       return;
@@ -1806,6 +1969,7 @@ export class WorkerTurnRunner {
       stdoutSha256: stdoutSha256!,
       commitHead: committed.head,
       diffDigest: observed.diffDigest,
+      ...(facts.imports.length > 0 ? { imports: [...facts.imports] } : {}),
     };
     const resultDigest = workerSuccessDigest(inputs);
     // A holder, not a `let`: the transaction body assigns it, and a narrowed local would hide that.

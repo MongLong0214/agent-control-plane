@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 
 import { sha256 } from "../core/digest.ts";
@@ -15,6 +16,12 @@ import { canonical } from "../guard/workspace-probe.ts";
 const exec = promisify(execFile);
 
 const MAX_BUFFER = 64 * 1024 * 1024;
+
+/**
+ * The most a git command run through this wrapper may write to stdout. Anything read whole through
+ * it -- a patch, a blob -- must fit; #1232's per-file import limit is derived from this.
+ */
+export const GIT_OUTPUT_MAX_BYTES = MAX_BUFFER;
 
 export interface GitResult {
   stdout: string;
@@ -429,16 +436,236 @@ export const mergeBase = async (cwd: string, a: string, b: string): Promise<stri
 const PATCH_WITHOUT_PROGRAMS = ["--no-ext-diff", "--no-textconv", "--submodule=short"] as const;
 
 /**
- * The exact patch between two commits: the bytes the freeze digests and the blind reviewer reads,
- * so what is reviewed is what was frozen.
+ * Git's own text/binary decision on content (`buffer_is_binary` in git's xdiff-interface.c): a NUL byte
+ * within the first 8000 bytes makes a blob binary. No attribute is consulted; this is what git decides
+ * when no `diff` attribute or driver decides for it.
  */
-export const diffPatch = async (cwd: string, base: string, head: string): Promise<string> =>
-  (await git(cwd, ["diff", "--no-color", ...PATCH_WITHOUT_PROGRAMS, "--full-index", "--binary", `${base}..${head}`]))
-    .stdout;
+const GIT_BINARY_PROBE_BYTES = 8000;
+export const gitReadsAsBinary = (bytes: Buffer): boolean => bytes.subarray(0, GIT_BINARY_PROBE_BYTES).includes(0);
 
-/** Stable digest of the exact patch between two commits. */
-export const diffDigest = async (cwd: string, base: string, head: string): Promise<string> =>
-  sha256(await diffPatch(cwd, base, head));
+/** One `diff --git` section per file pair; joined, they are the patch byte for byte. */
+const patchSections = (patch: string): string[] => patch.split(/(?=^diff --git )/m).filter(Boolean);
+
+const BINARY_BODY = /^GIT binary patch$/m;
+
+/** A section's lines before its content: one file pair's header, the same in its text and binary renderings. */
+const sectionHeader = (section: string): string => {
+  const body = /^(?:--- |GIT binary patch$)/m.exec(section);
+  return body === null ? section : section.slice(0, body.index);
+};
+
+/** The two ids an `index <old>..<new>` header line names; a side that does not exist is all zeros. */
+const indexIds = (header: string): string[] => /^index ([0-9a-f]+)\.\.([0-9a-f]+)/m.exec(header)?.slice(1) ?? [];
+
+/** The blob ids an `index <old>..<new>` header line names, less the all-zero id of a side that does not exist. */
+const headerBlobs = (header: string): string[] => indexIds(header).filter((id) => !/^0+$/.test(id));
+
+/**
+ * For a blob git's content check reads as text, the bytes its lines take in a patch that adds it (each
+ * line gains its `+`); null for one it reads as binary. A blob larger than `GIT_OUTPUT_MAX_BYTES` is not
+ * read: its text could not pass through this wrapper, so it is left as git rendered it.
+ */
+const textPatchBytes = async (cwd: string, id: string): Promise<number | null> => {
+  const size = Number((await git(cwd, ["--no-replace-objects", "cat-file", "-s", id], { allowFailure: true })).stdout.trim());
+  if (!Number.isSafeInteger(size) || size > GIT_OUTPUT_MAX_BYTES) return null;
+  const bytes = await readBlob(cwd, id);
+  if (bytes === null || gitReadsAsBinary(bytes)) return null;
+  let lines = 1;
+  for (let at = bytes.indexOf(0x0a); at !== -1; at = bytes.indexOf(0x0a, at + 1)) lines += 1;
+  return bytes.length + lines;
+};
+
+/** The tree with no entries, in the object format of `id`: what a file is diffed from to show it whole. */
+const emptyTreeLike = (id: string): string => createHash(id.length === 64 ? "sha256" : "sha1").update("tree 0\0").digest("hex");
+
+/**
+ * Review lane-e-fs-r6 P1 (#1232) — the patch with every section git rendered as a binary patch only
+ * because of an attribute (`-diff`, `binary`, or a `diff=<driver>` whose configuration says `binary`)
+ * rendered again as text: a section is re-rendered when every blob its index line names is text to git's
+ * own content check (`gitReadsAsBinary`). The candidate commits its `.gitattributes`, so without this a
+ * one-line rule turns a worker's or an imported text file into compressed base85 the reviewer cannot
+ * read. A section whose content is binary keeps git's binary patch, and a patch with no text section
+ * behind a binary patch is returned unchanged, byte for byte.
+ *
+ * The text rendering is git's own, with `--text` and the same options, read for exactly those file
+ * pairs (`--raw` names their paths): one read with `--no-renames` for the pairs git did not pair, and
+ * one per renamed or copied pair over its two paths, so rename detection pairs them as it did in the
+ * whole patch. Each replacement has the replaced section's header line for line; a section with no
+ * such counterpart refuses the patch rather than leave the text unreadable. The result is still at most
+ * `GIT_OUTPUT_MAX_BYTES`, like every patch read through this wrapper.
+ *
+ * Review lane-e-fs-r7 E5 — a section that pairs a text candidate blob with a binary one (a copy or a
+ * rename git detected from binary content, or a binary file the candidate made text) is a binary patch
+ * whatever the attributes say, and an every-blob-is-text rule never reaches it. That section is kept as
+ * git wrote it, so its binary side stays its binary patch, and the candidate's text follows it whole, as
+ * git shows that file added (from the empty tree, `--text`), independent of what git paired it with. A
+ * section with no such text refuses the patch, and so does text that would take the patch past
+ * `GIT_OUTPUT_MAX_BYTES`. A section whose candidate blob is binary keeps git's binary patch alone: its
+ * text side, if any, is base content.
+ */
+const withTextRenderedAsText = async (cwd: string, base: string, head: string, pathspec: readonly string[], patch: string): Promise<string> => {
+  const sections = patchSections(patch);
+  const textBlobs = new Set<string>();
+  const hidden = new Set<string>();
+  /** `<old>..<new>` of each section pairing a binary blob with a text candidate blob, and that text's patch bytes. */
+  const besideBinary = new Map<string, number>();
+  const checked = new Map<string, number | null>();
+  for (const section of sections) {
+    if (!BINARY_BODY.test(section)) continue;
+    const header = sectionHeader(section);
+    const blobs = headerBlobs(header);
+    for (const id of blobs) if (!checked.has(id)) checked.set(id, await textPatchBytes(cwd, id));
+    if (blobs.length === 0) continue;
+    if (blobs.every((id) => checked.get(id) != null)) {
+      hidden.add(header);
+      for (const id of blobs) textBlobs.add(id);
+      continue;
+    }
+    const [oldId = "", newId = ""] = indexIds(header);
+    const text = checked.get(newId);
+    if (blobs.length === 2 && text != null) besideBinary.set(`${oldId}..${newId}`, text);
+  }
+  if (hidden.size === 0 && besideBinary.size === 0) return patch;
+
+  // The file pairs behind those sections, in raw form so each path is exact (NUL-separated, unquoted).
+  const raw = (await git(cwd, ["diff", "--raw", "-z", "--no-abbrev", ...PATCH_WITHOUT_PROGRAMS, `${base}..${head}`, ...pathspec])).stdout.split("\0");
+  const unpaired: string[] = [];
+  const paired: string[][] = [];
+  /** For each `besideBinary` pair, the candidate path of each file pair git wrote with it, in git's order. */
+  const candidatePaths = new Map<string, string[]>();
+  let besideBinaryBytes = 0;
+  for (let at = 0; at < raw.length; ) {
+    const meta = raw[at] ?? "";
+    if (!meta.startsWith(":")) {
+      at += 1;
+      continue;
+    }
+    const [, , oldBlob = "", newBlob = "", status = ""] = meta.slice(1).split(" ");
+    const count = /^[RC]/.test(status) ? 2 : 1;
+    const paths = raw.slice(at + 1, at + 1 + count);
+    at += 1 + count;
+    const pair = `${oldBlob}..${newBlob}`;
+    const text = besideBinary.get(pair);
+    const candidatePath = paths.at(-1);
+    if (text !== undefined && candidatePath !== undefined) {
+      candidatePaths.set(pair, [...(candidatePaths.get(pair) ?? []), candidatePath]);
+      besideBinaryBytes += text;
+    }
+    if (!textBlobs.has(oldBlob) && !textBlobs.has(newBlob)) continue;
+    if (count === 2) paired.push(paths);
+    else unpaired.push(...paths);
+  }
+  // Each text shown beside its binary pair adds at least its lines; past the cap it cannot be shown.
+  if (Buffer.byteLength(patch) + besideBinaryBytes > GIT_OUTPUT_MAX_BYTES) {
+    return fail(ReasonCode.EVIDENCE_MISSING, `the patch with the text git pairs with binary content shown as text exceeds ${GIT_OUTPUT_MAX_BYTES} bytes`, { cwd, base, head });
+  }
+  const textRead = async (renames: boolean, paths: readonly string[], range: readonly string[] = [`${base}..${head}`]): Promise<string> =>
+    (await git(cwd, [
+      "diff", "--no-color", ...PATCH_WITHOUT_PROGRAMS, "--full-index", "--binary", "--text", ...(renames ? [] : ["--no-renames"]), ...range,
+      "--", ...paths.map((path) => `:(top,literal)${path}`),
+    ])).stdout;
+  const rendered = new Map<string, string>();
+  const outputs: string[] = [];
+  if (unpaired.length > 0) outputs.push(await textRead(false, unpaired));
+  for (const paths of paired) outputs.push(await textRead(true, paths));
+  for (const output of outputs) {
+    for (const section of patchSections(output)) if (!BINARY_BODY.test(section)) rendered.set(sectionHeader(section), section);
+  }
+  /** Each candidate text shown beside its binary pair: the file as git shows it added, one section naming exactly that blob. */
+  const wholeText = new Map<string, string[]>();
+  for (const [pair, paths] of candidatePaths) {
+    const newId = pair.slice(pair.indexOf("..") + 2);
+    for (const path of paths) {
+      const added = patchSections(await textRead(false, [path], [emptyTreeLike(newId), head]));
+      const [section] = added;
+      if (added.length !== 1 || section === undefined || BINARY_BODY.test(section) || headerBlobs(sectionHeader(section)).join() !== newId) {
+        return fail(ReasonCode.EVIDENCE_MISSING, "a text file git pairs with binary content could not be shown as text, so its content cannot be reviewed", {
+          cwd, base, head, path: path.slice(0, 400),
+        });
+      }
+      wholeText.set(pair, [...(wholeText.get(pair) ?? []), section]);
+    }
+  }
+
+  const shown = sections.map((section) => {
+    const header = sectionHeader(section);
+    if (!BINARY_BODY.test(section)) return section;
+    if (!hidden.has(header)) {
+      const pair = indexIds(header).join("..");
+      if (!besideBinary.has(pair)) return section;
+      const text = wholeText.get(pair)?.shift();
+      if (text === undefined) {
+        return fail(ReasonCode.EVIDENCE_MISSING, "a text file git pairs with binary content has no text rendering, so its content cannot be reviewed", {
+          cwd, base, head, header: header.slice(0, 400),
+        });
+      }
+      return section + text;
+    }
+    const text = rendered.get(header);
+    if (text === undefined) {
+      return fail(ReasonCode.EVIDENCE_MISSING, "a text file git renders as a binary patch could not be rendered as text, so its content cannot be reviewed", {
+        cwd, base, head, header: header.slice(0, 400),
+      });
+    }
+    return text;
+  }).join("");
+  if (Buffer.byteLength(shown) > GIT_OUTPUT_MAX_BYTES) {
+    return fail(ReasonCode.EVIDENCE_MISSING, `the patch with its text shown as text exceeds ${GIT_OUTPUT_MAX_BYTES} bytes`, { cwd, base, head });
+  }
+  return shown;
+};
+
+/**
+ * The exact patch between two commits: the bytes the freeze digests and the blind reviewer reads,
+ * so what is reviewed is what was frozen. Text is shown as text whatever the repository's attributes
+ * say or whatever binary content git pairs it with (`withTextRenderedAsText`); binary content stays
+ * git's binary patch.
+ *
+ * #1232 — `withheld` names files the candidate snapshot binds by blob and sha256 instead (a task's
+ * imported files): each is left out of the patch by an exact, literal, root-relative pathspec, so
+ * their bytes are never materialised here. With none, the command and its bytes are as before.
+ */
+export const diffPatch = async (cwd: string, base: string, head: string, withheld: readonly string[] = []): Promise<string> => {
+  const pathspec = withheld.length === 0 ? [] : ["--", ":(top)", ...withheld.map((path) => `:(top,exclude,literal)${path}`)];
+  const patch = (await git(cwd, ["diff", "--no-color", ...PATCH_WITHOUT_PROGRAMS, "--full-index", "--binary", `${base}..${head}`, ...pathspec])).stdout;
+  return withTextRenderedAsText(cwd, base, head, pathspec, patch);
+};
+
+/** Stable digest of the exact patch between two commits, less any `withheld` file (`diffPatch`). */
+export const diffDigest = async (cwd: string, base: string, head: string, withheld: readonly string[] = []): Promise<string> =>
+  sha256(await diffPatch(cwd, base, head, withheld));
+
+/**
+ * #1232 — which of `paths` git itself treats as binary in the patch between two commits: its numstat
+ * reports `-` for both counts, read with the same options as `diffPatch`, so the repository's
+ * attributes decide exactly as they do there. Every path is a literal, root-relative pathspec.
+ */
+export const binaryPaths = async (cwd: string, base: string, head: string, paths: readonly string[]): Promise<Set<string>> => {
+  if (paths.length === 0) return new Set();
+  const listed = await git(cwd, [
+    "diff", "--numstat", "-z", "--no-renames", ...PATCH_WITHOUT_PROGRAMS, `${base}..${head}`, "--", ...paths.map((path) => `:(top,literal)${path}`),
+  ]);
+  const binary = new Set<string>();
+  for (const record of listed.stdout.split("\0")) {
+    const [added, deleted, path] = record.split("\t");
+    if (added === "-" && deleted === "-" && path !== undefined && paths.includes(path)) binary.add(path);
+  }
+  return binary;
+};
+
+/**
+ * The exact bytes of one blob, or null. Read as `latin1`, one character per byte, so binary content
+ * survives; the object id is re-derived from those bytes, and only when it equals the id git named
+ * are they the committed bytes. A blob larger than `GIT_OUTPUT_MAX_BYTES` cannot be read whole here.
+ */
+export const readBlob = async (cwd: string, id: string): Promise<Buffer | null> => {
+  if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(id)) return null;
+  const blob = await git(cwd, ["--no-replace-objects", "cat-file", "blob", id], { allowFailure: true, encoding: "latin1" });
+  if (blob.exitCode !== 0) return null;
+  const bytes = Buffer.from(blob.stdout, "latin1");
+  const format = id.length === 64 ? "sha256" : "sha1";
+  return createHash(format).update(`blob ${bytes.length}\0`).update(bytes).digest("hex") === id ? bytes : null;
+};
 
 export const diffText = async (cwd: string, base: string, head: string): Promise<string> =>
   (await git(cwd, ["diff", "--no-color", ...PATCH_WITHOUT_PROGRAMS, "--full-index", `${base}..${head}`]))

@@ -103,6 +103,11 @@ export interface ControlPlaneConfig {
   githubAppPrivateKeyPath?: string;
   /** Neutral, daemon-managed runtime root for CTO/continuity sessions. */
   runtimeRoot?: string;
+  /**
+   * #1232 — the ACP-owned root a task's imports are staged under, `<importRoot>/<runId>/<taskId>/<sha256
+   * hex>`. `defaultConfig()` puts it under the state root; absent, a task that declares imports is refused.
+   */
+  importRoot?: string;
   /** The serving daemon's own entrypoint, resolved once at startup; a stored observation of it is checked against it. */
   servingEntrypoint?: string;
   /**
@@ -195,6 +200,7 @@ export const defaultConfig = (root = join(homedir(), ".agent-control-plane")): C
     ? { githubAppPrivateKeyPath: process.env["ACP_GITHUB_APP_PRIVATE_KEY_PATH"] }
     : {}),
   runtimeRoot: join(root, "runtime"),
+  importRoot: join(root, "imports"),
   // Issue #246 — the Repo Factory work root, beside the other state directories. It is set here
   // rather than as a constructor fallback: a fallback would hand every directly constructed
   // control plane, test fixtures included, a work root beside the production `gh` port. The
@@ -607,7 +613,7 @@ export class ControlPlane {
         workerAdapter: (provider: string) => this.providers.requireForRole(provider, Role.WORKER),
         // #1242 — a dependent task's base, when its target is first recorded at its run; the pipeline is built below.
         predecessorBase: (input) => this.pipeline.predecessorBase(input),
-      });
+      }, config.importRoot === undefined ? {} : { importRoot: config.importRoot });
       // The shared packet-reviewer predicate, read from the raw reviewer adapter (the registry hands
       // out only wrapped ones): the gate may pass over its preferred reviewer only when this says
       // UNCONFIGURED. Only the Codex adapter has such a scope.

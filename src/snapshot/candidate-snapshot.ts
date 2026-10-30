@@ -2,11 +2,12 @@ import { z } from "zod";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
-import { digestOf } from "../core/digest.ts";
+import { digestOf, sha256 } from "../core/digest.ts";
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { changedPaths, diffDigest, git, isClean, revParse, treeOf, tryRevParse } from "../git/git.ts";
+import { binaryPaths, changedPaths, diffDigest, git, isClean, readBlob, revParse, treeOf, tryRevParse } from "../git/git.ts";
+import { classifyImport } from "../run/task-import.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
 
 export const CANDIDATE_SNAPSHOT_SCHEMA_ID = "agent-control-plane.candidate-snapshot.v1";
@@ -28,6 +29,50 @@ export const snapshotIntegrationSchema = z
   .strict();
 
 export type SnapshotIntegration = z.infer<typeof snapshotIntegrationSchema>;
+
+/**
+ * #1232 — a file a SUCCEEDED task imported, as the freeze found it: the candidate head holds a regular
+ * file at `path` whose blob is `blob` and whose bytes have exactly the manifest's `size` and `sha256`,
+ * the base holds nothing at or below `path`, and its exact extension/signature is recognized while a
+ * bounded structural parse places every byte in a parsed structure or zero padding (`classifyImport`;
+ * field contents are not interpreted), which git also reads as binary. The CTO PLAN manifest binds the
+ * identity of these exact opaque, potentially active bytes, not a review of their content; parsing does
+ * not attest their safety, passivity or non-executability. Its patch is left out of
+ * `diffDigest`, so its bytes are never materialised for the freeze or the review; the head and tree
+ * digests still fix it exactly. Text is never bound: it stays in the patch and is reviewed as such.
+ */
+export const snapshotImportSchema = z
+  .object({
+    path: z.string().min(1),
+    size: z.number().int().nonnegative(),
+    sha256: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+    blob: z.string().regex(/^[0-9a-f]{40}$/),
+    taskId: z.string().min(1),
+    /** The recognized, structurally checked container type; not a full-format or byte-safety attestation. */
+    type: z.string().min(1),
+  })
+  .strict();
+
+export type SnapshotImport = z.infer<typeof snapshotImportSchema>;
+
+/**
+ * #1232, review E3-3 — a file a SUCCEEDED task declared as an import that the freeze did not bind, with
+ * the manifest's size and sha256 and the reason: the inspection refused its bytes, or the candidate does
+ * not hold them as a new regular file, or git does not read them as binary. It stays in the patch like
+ * any other change, and the reviewer reads this reason with it. A text import is reviewed as text and
+ * is not listed.
+ */
+export const snapshotRefusedImportSchema = z
+  .object({
+    path: z.string().min(1),
+    size: z.number().int().nonnegative(),
+    sha256: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+    taskId: z.string().min(1),
+    reason: z.string().min(1),
+  })
+  .strict();
+
+export type SnapshotRefusedImport = z.infer<typeof snapshotRefusedImportSchema>;
 
 export const snapshotRepositorySchema = z
   .object({
@@ -55,6 +100,13 @@ export const snapshotRepositorySchema = z
      * the key out, so its digest is exactly what it was before the field existed.
      */
     integration: snapshotIntegrationSchema.optional(),
+    /**
+     * #1232 — present only when a SUCCEEDED task's imported files are in the candidate byte for byte;
+     * every other snapshot leaves the key out, so its digest is what it was before the field existed.
+     */
+    imports: z.array(snapshotImportSchema).optional(),
+    /** #1232 — present only when a declared import is not bound; see `snapshotRefusedImportSchema`. */
+    refusedImports: z.array(snapshotRefusedImportSchema).optional(),
   })
   .strict()
   .superRefine((repository, ctx) => {
@@ -176,6 +228,8 @@ export interface SnapshotRepositoryInput {
   manifestDigest?: string | null;
   /** S6-C — given with `candidateRef` naming the integrated commit; see `snapshotIntegrationSchema`. */
   integration?: SnapshotIntegration;
+  /** #1232 — the import manifests of this repository's SUCCEEDED tasks; see `snapshotImportSchema`. */
+  imports?: ReadonlyArray<{ taskId: string; path: string; size: number; sha256: string }>;
 }
 
 /** A verification command must resolve to exactly one repository identity. */
@@ -219,6 +273,61 @@ export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
     ...(snapshot.contractChange === undefined ? {} : { contractChange: snapshot.contractChange }),
   });
 
+/**
+ * #1232 — opaque, potentially active imports the CTO PLAN manifest authorized and the candidate holds
+ * byte for byte (`snapshotImportSchema`), read one blob at a time. Anything whose path, digest, size or
+ * selected container checks differ is not bound and stays in the patch like any other change, and its
+ * reason is kept (`snapshotRefusedImportSchema`) so review reads why, not only a patch (review E3-3).
+ */
+const importsAtCandidate = async (
+  checkoutPath: string,
+  baseHead: string,
+  candidateHead: string,
+  declared: NonNullable<SnapshotRepositoryInput["imports"]>,
+): Promise<{ imports: SnapshotImport[]; refusedImports: SnapshotRefusedImport[] }> => {
+  const bound = new Map<string, SnapshotImport>();
+  const refused = new Map<string, SnapshotRefusedImport>();
+  const refuse = (entry: (typeof declared)[number], reason: string): void => {
+    if (!refused.has(entry.path)) refused.set(entry.path, { path: entry.path, size: entry.size, sha256: entry.sha256, taskId: entry.taskId, reason });
+  };
+  for (const entry of declared) {
+    if (bound.has(entry.path)) continue;
+    const atHead = await git(checkoutPath, ["--no-replace-objects", "ls-tree", "-z", "--full-tree", candidateHead, "--", entry.path], { allowFailure: true });
+    const record = atHead.exitCode === 0 ? atHead.stdout.split("\0").find((line) => line.endsWith(`\t${entry.path}`)) : undefined;
+    const blob = record === undefined ? undefined : /^100644 blob ([0-9a-f]{40})\t/.exec(record)?.[1];
+    if (blob === undefined) {
+      refuse(entry, "the candidate does not hold a regular non-executable file (mode 100644) at the path");
+      continue;
+    }
+    // Nothing at or below the path at the base: leaving it out of the patch hides no other change.
+    const atBase = await git(checkoutPath, ["--no-replace-objects", "ls-tree", "-r", "-z", "--name-only", "--full-tree", baseHead, "--", entry.path], { allowFailure: true });
+    if (atBase.exitCode !== 0 || atBase.stdout.length > 0) {
+      refuse(entry, "the base already holds the path or a path below it");
+      continue;
+    }
+    const bytes = await readBlob(checkoutPath, blob);
+    if (bytes === null || bytes.length !== entry.size || sha256(bytes) !== entry.sha256) {
+      refuse(entry, "the candidate's bytes at the path are not the manifest's size and sha256");
+      continue;
+    }
+    const content = classifyImport(entry.path, bytes);
+    // Text is reviewed as the patch it is; only a refusal is a reason review must read.
+    if (content.kind === "refused") refuse(entry, content.why);
+    if (content.kind !== "data") continue;
+    bound.set(entry.path, { path: entry.path, size: entry.size, sha256: entry.sha256, blob, taskId: entry.taskId, type: content.type });
+    refused.delete(entry.path);
+  }
+  // Git's own decision for each path, attributes included: only what git also reads as binary is bound.
+  const binary = await binaryPaths(checkoutPath, baseHead, candidateHead, [...bound.keys()]);
+  for (const entry of bound.values()) {
+    if (binary.has(entry.path)) continue;
+    bound.delete(entry.path);
+    refused.set(entry.path, { path: entry.path, size: entry.size, sha256: entry.sha256, taskId: entry.taskId, reason: "git does not read the path as binary (its attributes), so its patch is shown as text" });
+  }
+  const byPath = (a: { path: string }, b: { path: string }): number => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  return { imports: [...bound.values()].sort(byPath), refusedImports: [...refused.values()].sort(byPath) };
+};
+
 export const buildCandidateSnapshot = async (
   params: {
     runId: string;
@@ -252,6 +361,7 @@ export const buildCandidateSnapshot = async (
       });
     }
     const candidateHead = await revParse(input.checkoutPath, input.candidateRef ?? "HEAD");
+    const { imports, refusedImports } = await importsAtCandidate(input.checkoutPath, baseHead, candidateHead, input.imports ?? []);
     repositories.push({
       identity: input.identity,
       repositoryRole: input.repositoryRole,
@@ -262,11 +372,13 @@ export const buildCandidateSnapshot = async (
       sourceHead,
       candidateHead,
       treeDigest: `git-tree:${await treeOf(input.checkoutPath, candidateHead)}`,
-      diffDigest: await diffDigest(input.checkoutPath, baseHead, candidateHead),
+      diffDigest: await diffDigest(input.checkoutPath, baseHead, candidateHead, imports.map((entry) => entry.path)),
       worktreeId: input.worktreeId ?? null,
       manifestDigest: input.manifestDigest ?? null,
       touchedPaths: await changedPaths(input.checkoutPath, baseHead, candidateHead),
       ...(input.integration === undefined ? {} : { integration: input.integration }),
+      ...(imports.length === 0 ? {} : { imports }),
+      ...(refusedImports.length === 0 ? {} : { refusedImports }),
     });
   }
 
