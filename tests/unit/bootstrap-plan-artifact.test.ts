@@ -2564,4 +2564,40 @@ describe("live run_3884d4fc: a bootstrap PLAN is reviewed only while it carries 
       expect(f.h.cp.runs.require(f.run.runId).state).toBe("READY_FOR_CEO_REVIEW");
     } finally { vi.restoreAllMocks(); await f.close(); }
   });
+
+  // Live run_fa432545 (CEO_DECISION 266236): the CEO's reply named a digest in its text, and every plan_submit
+  // re-collected it into a PLAN the artifact store refused as credential-shaped (TRUSTED_CREDENTIAL_LEAK_BLOCKED).
+  it("freezes an admitted CEO reply that names a digest as a marked display copy, binds review to it and shows the reviewer it is withheld", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      expect(await planSubmit(f, "digest-plan")).toMatchObject({ ok: true });
+      const zeros = "0".repeat(64);
+      const resolution = `Replan against contract sha256:${zeros} and resubmit.`;
+      await resolveEscalation(f, resolution);
+      const decisionEvent = f.h.cp.audit.forRun(f.run.runId).filter(a => a.kind === "CEO_DECISION").at(-1)!.eventId;
+      // The PLAN frozen before the decision does not carry it: review stays refused until a fresh-key plan_submit.
+      expect(await resultSubmit(f, "digest-result-refused")).toMatchObject({ ok: false, reasonCode: "BOOTSTRAP_PLAN_AUTHORITY_NOT_FROZEN",
+        evidence: { unfrozenCeoDecisionEvents: [decisionEvent] } });
+      const frozen = await planSubmit(f, "digest-plan-fresh");
+      expect(frozen, JSON.stringify(frozen)).toMatchObject({ ok: true });
+      const decisions = collectBootstrapCeoDecisions(f.h.cp.db, f.run.runId);
+      expect(decisions).toEqual([expect.objectContaining({ resolution: "Replan against contract sha256:[withheld: credential-shaped token] and resubmit.",
+        resolutionDigest: digestOf(resolution), withheld: expect.objectContaining({ mode: "REDACTED_SPANS" }),
+        source: expect.objectContaining({ kind: "ACP_CEO_ESCALATION_REPLY", decisionEventId: decisionEvent }) })]);
+      const plan = f.h.cp.artifacts.latest<Args>(f.run.runId, "PLAN")!;
+      expect(plan.content["authenticatedCeoDecisions"]).toEqual(decisions);
+      expect(JSON.stringify(plan.content)).not.toContain(zeros);
+      f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
+      expect(await resultSubmit(f, "digest-result")).toMatchObject({ ok: true });
+      const prompt = reviews(f)[0]!.prompt;
+      expect(decisionSection(prompt)).toEqual(decisions);
+      expect(prompt).toContain("A record with a `withheld` field does not show the CEO's original text");
+      expect(prompt).toContain("that is an authority gap, so answer BLOCK");
+      expect(prompt).not.toContain(zeros);
+      const current = currentBootstrapPlan(f.run.runId, plan);
+      if (!current.allowed) throw new Error(current.message);
+      expect(current.value.outputs.handoff.recentDecisions).toContain(JSON.stringify({ authenticatedCeoDecision: decisions[0] }));
+    } finally { await f.close(); }
+  });
 });
