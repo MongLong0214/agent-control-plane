@@ -30,7 +30,7 @@ import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import { residentBaseClone } from "../registry/resident-repositories.ts";
 import type { BlindReviewGate, BlindReviewInvoker, ReviewPacket } from "../review/blind-review.ts";
-import { captureContractChangeReviewContext, storeContractChangeReviewContext } from "../review/contract-change-review-context.ts";
+import { captureContractChangeReviewContext, readCanonicalCtoIdentity, storeContractChangeReviewContext } from "../review/contract-change-review-context.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import {
   type CandidateSnapshot,
@@ -346,6 +346,11 @@ export class CandidatePipeline {
       contractChange = current.value.binding;
       if (current.value.firstActivation) boundRevisions = current.value.workflowRevisions;
     }
+    // A CONTRACT_CHANGE candidate of a project is also the project's canonical CTO identity as it stands
+    // now, read once: a changed entitlement or PRIMARY_CTO binding is a different candidate, reviewed again.
+    const canonicalCtoIdentity = contractChange === undefined || run.projectId === null
+      ? undefined
+      : readCanonicalCtoIdentity(this.db, run.projectId);
 
     const snapshot = participants.length === 0
       ? buildNoRepositoryCandidateSnapshot(
@@ -354,6 +359,7 @@ export class CandidatePipeline {
             contractDigest: run.contractDigest,
             ...(bootstrapPlan === undefined ? {} : { bootstrapPlan }),
             ...(contractChange === undefined ? {} : { contractChange }),
+            ...(canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity }),
           },
           this.clock,
         )
@@ -363,6 +369,7 @@ export class CandidatePipeline {
             contractDigest: run.contractDigest,
             repositories,
             ...(contractChange === undefined ? {} : { contractChange }),
+            ...(canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity }),
           },
           this.clock,
         );
@@ -413,13 +420,13 @@ export class CandidatePipeline {
 
     // #1255 — what a CONTRACT_CHANGE candidate's review is shown beside its PLAN, read by ACP now, at the
     // freeze, and bound to this candidate and this freeze, so the review sees what held when it was frozen.
-    const reviewContext = contractChange === undefined || run.projectId === null
+    const reviewContext = contractChange === undefined || run.projectId === null || canonicalCtoIdentity === undefined
       ? null
       : await captureContractChangeReviewContext(
           { db: this.db, repositories: this.repositories, clock: this.clock },
           {
             runId, projectId: run.projectId, candidateSnapshotDigest: digest, planDigest: contractChange.planDigest,
-            workflowRevisions: boundRevisions,
+            workflowRevisions: boundRevisions, canonicalCtoIdentity,
             freezeId: `freeze_${randomUUID().replace(/-/g, "").slice(0, 24)}`, attemptId: attemptId ?? null,
           },
         );
