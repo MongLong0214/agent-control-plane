@@ -243,6 +243,9 @@ interface TurnLane {
   handled: Set<string>;
 }
 
+/** Durable proof that one non-envelope wake trigger's work turn completed and handled it. */
+export const SESSION_WAKE_TRIGGER_COMPLETED = "SESSION_WAKE_TRIGGER_COMPLETED";
+
 /**
  * #246 C1b — drives a provisioned (non-canonical) CTO session's real headless runtime: the daemon's
  * one source of its turns, the holder of its credential, and the judge of its readiness.
@@ -536,8 +539,9 @@ export class ProvisionedSessionRuntime {
   /**
    * One work turn for the role's holder, serving every trigger handed to it. When it ends the
    * triggers are released. A completed turn marks handled only the triggers that name no outbox
-   * row; an envelope's own status says whether it is done, so one the turn did not settle is left
-   * for the next wake that names it, as is every trigger of a failed turn.
+   * row and records their exact ids durably; an envelope's own status says whether it is done, so
+   * one the turn did not settle is left for the next wake that names it, as is every trigger of a
+   * failed turn.
    */
   async #workTurn(
     binding: RoleBinding,
@@ -605,6 +609,16 @@ export class ProvisionedSessionRuntime {
           // recovery) that its turn ran for is handled like an ordinary one.
           if (trigger.served !== undefined && trigger.served() !== true) continue;
           lane.handled.add(trigger.id);
+          this.ports.audit.record({
+            kind: SESSION_WAKE_TRIGGER_COMPLETED,
+            reasonCode: ReasonCode.OK,
+            sessionId: binding.sessionId,
+            roleKey: binding.roleKey,
+            evidence: {
+              triggerId: trigger.id,
+              bindingGeneration: binding.bindingGeneration,
+            },
+          });
         }
       }
     }

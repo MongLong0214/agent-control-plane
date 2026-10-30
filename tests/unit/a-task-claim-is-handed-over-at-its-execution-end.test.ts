@@ -1142,8 +1142,6 @@ describe("S2 — while any writer of the previous execution may still exist, the
       const s = await standardRun(f, "s2-redacted-modern-checkout");
       const [one] = s.taskIds;
       await staffAndClaim(f, s, one);
-      // A slash-joined hosted-runner checkout path whose temporary segment is credential-shaped.
-      // Audit stores its privacy projection, not this raw provenance path.
       const hostilePath = "/private/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/acp-repo-d6bqkZ";
       const endedNonce = "4a4b160e-b619-442a-b092-b36073c4d125";
       const ended = {
