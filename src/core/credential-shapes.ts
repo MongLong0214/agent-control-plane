@@ -106,7 +106,8 @@ export const isAcpGeneratedField = (value: string, path: readonly string[]): boo
 
 /**
  * #1254 G-2 — free-text and reviewer fields, per store, by key path (the path and every path under it):
- * a blind reviewer's omitted items, findings and covered files, and the audit copy of its omitted items;
+ * a blind reviewer's omitted items, findings (method findings, stored apart, included) and covered files,
+ * and the audit copy of its omitted items;
  * #1279 G3-1 — and a CEO's rationale, wherever an audit record carries it (ceo/production-gate.ts:
  * CEO_DECISION, the RUN_TRANSITION it makes, MANIFEST_ACTIVATION_CONSUMER_BOUND).
  * Their text is the reviewer's or the CEO's, so a whole value there is never an ACP id by its format: a
@@ -116,7 +117,7 @@ export const isAcpGeneratedField = (value: string, path: readonly string[]): boo
  * except at a `FREE_TEXT_WRITERS` writer, where only its typed fields do.
  */
 const FREE_TEXT_FIELDS: Readonly<Record<EvidenceField["store"], readonly string[]>> = {
-  artifact: ["omittedItems", "findings", "coveredFiles"],
+  artifact: ["omittedItems", "findings", "methodFindings", "coveredFiles"],
   audit: ["omittedItems", "rationale"],
 };
 

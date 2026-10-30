@@ -85,14 +85,14 @@ const prepare = async () => {
 };
 type Prepared = Awaited<ReturnType<typeof prepare>>;
 
-const finding = (detail: string) => ({ category: "correctness", severity: "MINOR", repository: "github:acme/fixture",
+const finding = (detail: string, category = "correctness") => ({ category, severity: "MINOR", repository: "github:acme/fixture",
   path: "src/app.js", summary: "nonblocking observation", detail });
 
-/** One review of the prepared candidate; the reviewer answers PASS with `details` as MINOR findings. */
-const review = async (setup: Prepared, details: readonly string[] = []) => {
+/** One review of the prepared candidate; the reviewer answers PASS with `details` as MINOR findings of `category`. */
+const review = async (setup: Prepared, details: readonly string[] = [], category = "correctness") => {
   setup.harness.scripted.script({ match: /Candidate review/, text: details.length === 0
     ? reviewerPass([`${setup.identity}:src/app.js`])
-    : JSON.stringify({ verdict: "PASS", coveredFiles: [`${setup.identity}:src/app.js`], omittedItems: [], findings: details.map(finding) }) });
+    : JSON.stringify({ verdict: "PASS", coveredFiles: [`${setup.identity}:src/app.js`], omittedItems: [], findings: details.map((detail) => finding(detail, category)) }) });
   const result = await setup.harness.cp.review.controlPlaneInvoker()({ runId: setup.runId, projectId: setup.projectId,
     executionMode: setup.executionMode, snapshot: setup.snapshot, contract: CONTRACT, contractDigest: setup.contractDigest,
     verification: setup.verification });
@@ -104,9 +104,11 @@ const refusals = (setup: Prepared) =>
   setup.harness.cp.audit.forRun(setup.runId).filter((row) => row.kind === "BLIND_REVIEW_STORAGE_REFUSED");
 
 /** The review is refused at storage, and its refusal row names the rule and form class, never the value. */
-const expectRefused = async (setup: Prepared, detail: string, rule: string, form: string, inPacket: boolean, value: string) => {
+const expectRefused = async (
+  setup: Prepared, detail: string, rule: string, form: string, inPacket: boolean, value: string, category = "correctness",
+) => {
   const before = refusals(setup).length;
-  const { result } = await review(setup, [detail]);
+  const { result } = await review(setup, [detail], category);
   expect(result, detail).toMatchObject({ allowed: false, reasonCode: ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED,
     evidence: { field: "detail", rule, form, inPacket } });
   const rows = refusals(setup);
@@ -195,6 +197,38 @@ describe("#1307: a blind review quoting a digest ACP computed for its own packet
       expect(put("run_000000000000000000000000", snapshotDigest)).toThrow(/contains a credential/);
       expect(put(setup.runId, sha256("another candidate"))).toThrow(/contains a credential/);
       expect(put(setup.runId, snapshotDigest)()).toMatchObject({ kind: "BLIND_REVIEW", runId: setup.runId });
+    } finally {
+      setup.harness.cp.close();
+    }
+  }, 60_000);
+});
+
+describe("#1307: a method finding (stored as `methodFindings`) is read like any other finding", () => {
+  it("is stored when it quotes the packet digest, prefixed and bare", async () => {
+    const setup = await prepare();
+    try {
+      const { packetDigest } = await review(setup);
+      const details = [`packet ${packetDigest}`, `bare: ${hexOf(packetDigest)}.`, packetDigest];
+      const { result } = await review(setup, details, "method");
+      expect(result, JSON.stringify(result)).toMatchObject({ allowed: true, value: { verdict: "PASS" } });
+      const stored = setup.harness.cp.artifacts.list<ReviewPacket>(setup.runId, "BLIND_REVIEW").at(-1)!.content;
+      expect(stored.methodFindings?.map((item) => item.detail)).toEqual(details);
+      expect(stored.findings).toEqual([]);
+      expect(refusals(setup)).toEqual([]);
+    } finally {
+      setup.harness.cp.close();
+    }
+  }, 60_000);
+
+  it("refuses an arbitrary whole sha256:<64hex> and a credential token", async () => {
+    const setup = await prepare();
+    try {
+      await review(setup);
+      const arbitrary = sha256Hex("an arbitrary value in no record");
+      const token = `ghp_${"A1b2C3d4".repeat(5)}`;
+      await expectRefused(setup, `sha256:${arbitrary}`, "long_base64_run", "sha256-64hex", false, arbitrary, "method");
+      await expectRefused(setup, `the log printed ${token}`, "github_token", "other", false, token, "method");
+      expect(setup.harness.cp.artifacts.list<ReviewPacket>(setup.runId, "BLIND_REVIEW")).toHaveLength(1);
     } finally {
       setup.harness.cp.close();
     }
