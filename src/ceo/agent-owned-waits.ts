@@ -120,8 +120,10 @@ export interface OwnerlessStall {
   /** A stall of a run stated again in the incident episode it was first routed in; absent, the run's current one. */
   incidentEpisode?: string;
   /**
-   * A stall of a run its detector settles when the run progresses past its episode (an owed stall: a reclaimed
-   * attempt), so that progress also resolves its incident (`Incident.settlesOnProgress`). Absent, it does not.
+   * A stall of a run its detector settles when the run progresses past its episode (every watchdog stall: one
+   * stated in its run's current episode is never stated in an earlier one, and an owed one, a reclaimed attempt,
+   * is settled when its run moved on), so that progress also resolves its incident (`Incident.settlesOnProgress`).
+   * Absent, it does not.
    */
   settlesOnProgress?: boolean;
 }
@@ -375,6 +377,10 @@ export class AgentOwnedWaits {
    * the same progress also resolves its notice wherever it is asked. H4-2 — an owed stall the watchdog found
    * on this pass is routed as owed the first time: when the run's existing notice covers it, the episode it is
    * stated in from then on is recorded at once, before any progress can move the run's episode on.
+   * H5-1 — every watchdog stall of a run says so too: the watchdog states it only in its run's current episode,
+   * and again in the next one if it outlasts the progress, so a run stall's notice that covered a reclaimed
+   * attempt is resolved by the progress that settled both, unless an incident progress does not settle (an
+   * agent-owned wait's escalation) was stated in that episode as well.
    */
   routeWatchdogStalls(stalls: readonly WatchdogStall[]): Array<{ kind: string; id: string; messageId: string | null; reasonCode: string }> {
     const routed: Array<{ kind: string; id: string; messageId: string | null; reasonCode: string }> = [];
@@ -406,7 +412,7 @@ export class AgentOwnedWaits {
         effects: route.effects,
         deliveryTimeout: stall.kind === "outbox",
         ...(owed?.episode != null ? { incidentEpisode: owed.episode } : {}),
-        ...(owed ? { settlesOnProgress: true } : {}),
+        settlesOnProgress: true,
       });
       if (owed && decision.allowed) {
         if (decision.value.state === "RESOLVED") {

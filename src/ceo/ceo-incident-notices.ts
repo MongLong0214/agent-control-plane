@@ -20,10 +20,10 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
  *
  * An incident is open while its detector still finds it and `resolutionOf` finds no evidence that closed it: its
  * run gone, its run ended, or a CEO decision recorded on its run, each after it opened, and for an incident its
- * detector settles on progress (`Incident.settlesOnProgress`), its run's progress past its episode. A stall that
- * cleared is no longer stated, so nothing more is delivered for it; an ACK is receipt, never resolution. A notice
- * of a resolved incident is withdrawn rather than carried to a CEO it was not addressed to
- * (`withdrawResolvedNotices`).
+ * detector settles on progress (`Incident.settlesOnProgress`), its run's progress past its episode, once every
+ * other incident its episode's notice stands for settles on it too. A stall that cleared is no longer stated, so
+ * nothing more is delivered for it; an ACK is receipt, never resolution. A notice of a resolved incident is
+ * withdrawn rather than carried to a CEO it was not addressed to (`withdrawResolvedNotices`).
  *
  * Two notices keep their own owners: a candidate's READY_FOR_CEO_REVIEW (`ProductionGate.buildPacket`, and
  * its re-delivery after a CEO recovery, deduplicated by the decision and the candidate, in
@@ -49,9 +49,11 @@ export type NotificationKind = (typeof NotificationKind)[keyof typeof Notificati
  *   agent-owned wait's CEO_ESCALATION step. Its episode is the run's latest progress (`runProgressAt`): two
  *   detectors that see the same unchanged run send one notice, and real progress starts the next episode.
  *   Whether that progress also closes the episode already open is the detector's, stated per incident
- *   (`Incident.settlesOnProgress`): a reclaimed attempt, which its watchdog sees only once and settles when its
- *   run moves on, is closed by it; an agent-owned wait's escalation, pinned to the episode it opened in, is
- *   not, because a worker heartbeat does not end a wait.
+ *   (`Incident.settlesOnProgress`): a watchdog stall, which the watchdog states in its run's current episode
+ *   only, or, for a reclaimed attempt it sees once, in the one it was first routed in until its run moves on,
+ *   is closed by it; an agent-owned wait's escalation, pinned to the episode it opened in, is not, because a
+ *   worker heartbeat does not end a wait. One notice stands for every incident stated in its episode, so
+ *   progress closes the episode only when each of them settles on it (H5-1).
  * - RETIREMENT_HELD (CRITICAL_SYSTEM_FAILURE; subject: the run that holds it). An owner retirement that
  *   waits on a run terminal in BLOCKED_POST_MERGE. Episode: that run's latest progress.
  * - DELIVERY_STALLED (CRITICAL_SYSTEM_FAILURE; subject: the role its messages are addressed to). Messages
@@ -107,10 +109,11 @@ export interface Incident {
   /** The audit event the incident opened with; a CEO_DECISION on the run after it resolves the incident. */
   openedEventId?: number | null;
   /**
-   * The detector settles this incident of a run when the run progresses past its episode (a reclaimed attempt:
-   * `AgentOwnedWaits.routeWatchdogStalls`), so that progress resolves it (`resolutionOf`, RUN_PROGRESSED). Absent,
-   * progress does not: an agent-owned wait's escalation stays open through its run's worker heartbeats. Its
-   * notice carries it, so the outbox reads the same answer back.
+   * The detector settles this incident of a run when the run progresses past its episode (a watchdog stall:
+   * `AgentOwnedWaits.routeWatchdogStalls`), so that progress resolves it (`resolutionOf`, RUN_PROGRESSED) once
+   * every incident stated in its episode settles on it. Absent, progress does not: an agent-owned wait's
+   * escalation stays open through its run's worker heartbeats. Its notice and delivery record carry it, so the
+   * outbox reads the same answer back; a covered statement without it is recorded (CEO_NOTIFICATION_COVERED).
    */
   settlesOnProgress?: boolean;
   payload: Record<string, unknown>;
@@ -161,6 +164,28 @@ export interface Resolution {
 export const runProgressedPast = (db: Pick<Db, "get">, runId: string, episode: string): boolean =>
   runEpisode(db, runId) !== episode;
 
+/**
+ * H5-1 — the record of an incident its detector does not settle on progress, stated in an episode whose notice
+ * an incident that does settle on it delivered (`deliverIncident` covering it): from then on that progress alone
+ * resolves neither of them.
+ */
+export const CEO_NOTIFICATION_COVERED = "CEO_NOTIFICATION_COVERED";
+
+/**
+ * Whether the incident's episode was stated by an incident progress does not settle: a delivery record of the
+ * episode (one per notice of it), or a CEO_NOTIFICATION_COVERED record, that does not say it settles on
+ * progress. A notice stands for every incident stated in its episode, the one that delivered it and each one it
+ * covered since, so progress resolves it only when none of them is such.
+ */
+const episodeHeldOpenOnProgress = (db: Pick<Db, "get">, incident: Incident, runId: string): boolean =>
+  db.get<{ held: number }>(
+    `SELECT 1 AS held FROM audit_events WHERE run_id = ? AND kind IN (?, ?)
+       AND json_extract(evidence_json, '$.correlation') = ? AND json_extract(evidence_json, '$.episode') = ?
+       AND json_extract(evidence_json, '$.settlesOnProgress') IS NOT 1
+     LIMIT 1`,
+    [runId, CLASS_RULES[incident.cls].record, CEO_NOTIFICATION_COVERED, correlationOf(incident.cls, incident.subject), incident.episode],
+  ) !== undefined;
+
 export interface NoticeDelivery {
   state: NoticeState;
   /** The notice delivered now, or the one that already covers the incident. */
@@ -192,7 +217,9 @@ const deliveriesOf = (db: Pick<Db, "all">, incident: Incident): NoticeStatus["de
  * - RUN_ENDED: the run is terminal and a RUN_TRANSITION followed the opening, so it ended since (cancelled,
  *   failed, completed). A run already terminal when its incident opened, as BLOCKED_POST_MERGE is, is not.
  * - RUN_PROGRESSED: only for an incident whose detector settles it on progress (`settlesOnProgress`), the run
- *   progressed past its episode (`runProgressedPast`). Any other incident is not closed by progress.
+ *   progressed past its episode (`runProgressedPast`), and no incident stated in that episode is one progress
+ *   does not settle (`episodeHeldOpenOnProgress`): the episode's notice stands for all of them. Any other
+ *   incident is not closed by progress.
  * An incident never delivered has not opened, so only RUN_GONE resolves it. An incident not about a run (a
  * role's stalled messages, a session) has no such evidence; its detector stops stating it when it clears.
  */
@@ -218,7 +245,10 @@ export const resolutionOf = (db: Pick<Db, "get">, incident: Incident): Resolutio
     [incident.runId, opened],
   ) : undefined;
   if (ended) return { kind: "RUN_ENDED", eventId: ended.event_id };
-  if (incident.settlesOnProgress === true && runProgressedPast(db, incident.runId, incident.episode)) {
+  if (
+    incident.settlesOnProgress === true && runProgressedPast(db, incident.runId, incident.episode)
+    && !episodeHeldOpenOnProgress(db, incident, incident.runId)
+  ) {
     return { kind: "RUN_PROGRESSED", eventId: null };
   }
   return null;
@@ -335,8 +365,35 @@ const withoutWhy = (payload: Record<string, unknown>): Record<string, unknown> =
   return rest;
 };
 
-const covered = (state: NoticeState, messageId: string | null): Decision<NoticeDelivery> =>
-  allow(ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED, { state, messageId, created: false, redelivery: false });
+/**
+ * The episode's notice already covers the incident. H5-1 — it stands for this incident too: one progress does not
+ * settle, covering an episode no incident so far stated keeps open against progress, is recorded
+ * (CEO_NOTIFICATION_COVERED), so the notice stays owed after its run moves on while this incident is open.
+ */
+const covered = (
+  ports: Pick<NoticePorts, "db" | "audit">,
+  incident: Incident,
+  state: NoticeState,
+  messageId: string | null,
+): Decision<NoticeDelivery> => {
+  if (
+    incident.settlesOnProgress !== true && incident.runId !== null && incident.subject === incident.runId
+    && !episodeHeldOpenOnProgress(ports.db, incident, incident.runId)
+  ) {
+    const recorded = ports.audit.record({
+      kind: CEO_NOTIFICATION_COVERED,
+      runId: incident.runId,
+      evidence: {
+        incidentClass: incident.cls,
+        correlation: correlationOf(incident.cls, incident.subject),
+        episode: incident.episode,
+        messageId,
+      },
+    });
+    if (!recorded.allowed) return recorded as unknown as Decision<NoticeDelivery>;
+  }
+  return allow(ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED, { state, messageId, created: false, redelivery: false });
+};
 
 /**
  * Delivers an open incident's notice, at most once per episode and CEO generation, and is asked on every
@@ -357,7 +414,7 @@ export const deliverIncident = (ports: NoticePorts, incident: Incident): Decisio
       return allow(ReasonCode.CEO_INCIDENT_RESOLVED, { state: "RESOLVED", messageId: null, created: false, redelivery: false });
     }
     const live = status.deliveries.find((delivery) => UNSETTLED.has(delivery.status));
-    if (live) return covered("ENQUEUED", live.messageId);
+    if (live) return covered(ports, incident, "ENQUEUED", live.messageId);
     const ceo = ports.bindings.active(roleKeyFor(Role.CEO));
     if (!ceo) {
       return deny(ReasonCode.GATE_AUTHORITY_DENIED, "no CEO binding can receive the notice", {
@@ -369,7 +426,9 @@ export const deliverIncident = (ports: NoticePorts, incident: Incident): Decisio
     const redelivery = status.state !== "NOT_ENQUEUED";
     if (redelivery) {
       const toCurrent = status.deliveries.find((delivery) => delivery.generation === ceo.bindingGeneration);
-      if (toCurrent || !rule.redeliverToNewCeo) return covered(status.state, (toCurrent ?? status.deliveries.at(-1))?.messageId ?? null);
+      if (toCurrent || !rule.redeliverToNewCeo) {
+        return covered(ports, incident, status.state, (toCurrent ?? status.deliveries.at(-1))?.messageId ?? null);
+      }
     }
     const key = deliveryKey(incident, ceo.bindingGeneration);
     let refusal: { reasonCode: ReasonCode; outcome: "REFUSED" | "UNKNOWN"; error?: string } | null = null;
@@ -415,6 +474,8 @@ export const deliverIncident = (ports: NoticePorts, incident: Incident): Decisio
       messageId: row.messageId,
       generation: ceo.bindingGeneration,
       redelivery,
+      // H5-1 — the delivering incident's own statement of its episode, as `episodeHeldOpenOnProgress` reads it.
+      ...(incident.settlesOnProgress === true ? { settlesOnProgress: true } : {}),
     };
     const delivery = { kind: rule.record, runId: incident.runId, roleKey: ceo.roleKey, sessionId: ceo.sessionId };
     const recorded = ports.audit.record({ ...delivery, evidence: { ...identity, ...(incident.record ?? withoutWhy(incident.payload)) } });
