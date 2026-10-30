@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { accessSync, constants, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { COMMITLORE_LIMITS, type CommitLorePort, commitloreRunner, createCommitLoreCliPort } from "../../src/bootstrap/commitlore-observation.ts";
 import { manifestDigest, projectManifestSchema } from "../../src/contracts/manifest.ts";
@@ -354,6 +354,81 @@ describe.skipIf(REAL === null)("#1268: a worker commit goes through CommitLore (
     const evidence = failedEvidence(world);
     expect(String(evidence["detail"])).toContain("ACP_COMMITLORE_BINARY NOT_LATEST");
     nothingCommitted(world, base);
+  });
+});
+
+/** The first `git` on this process's PATH, as ACP's own git calls find it. */
+const daemonGit = (): string => {
+  for (const directory of (process.env["PATH"] ?? "").split(":").filter((entry) => entry.startsWith("/"))) {
+    try {
+      accessSync(join(directory, "git"), constants.X_OK);
+      return join(directory, "git");
+    } catch {
+      // not here
+    }
+  }
+  throw new Error("no git on PATH");
+};
+
+/**
+ * A daemon PATH whose first directory holds `gh` beside a `git` (as Homebrew's does) that logs each call made
+ * with `GIT_ATTR_SOURCE` set, as every CommitLore child's is, then runs the real git; `answer`, when given, is
+ * what it says to `check-attr` instead.
+ */
+const daemonBinWithGh = (answer?: string): { dir: string; log: string } => {
+  const dir = tempDir("acp-1268-daemon-bin-");
+  const log = join(dir, "calls.log");
+  const real = daemonGit();
+  const override = answer === undefined ? "" : `if [ "$1" = check-attr ]; then echo ${JSON.stringify(answer)}; exit 0; fi\n`;
+  writeFileSync(
+    join(dir, "git"),
+    `#!/bin/sh\nif [ -n "$GIT_ATTR_SOURCE" ]; then echo "PATH=$PATH :: $*" >> ${JSON.stringify(log)}; fi\n${override}exec ${JSON.stringify(real)} "$@"\n`,
+    { mode: 0o755 },
+  );
+  writeFileSync(join(dir, "gh"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  vi.stubEnv("PATH", `${dir}:${process.env["PATH"] ?? "/usr/bin:/bin"}`);
+  return { dir, log };
+};
+
+describe.skipIf(REAL === null)("#1268 CI: CommitLore's children run the git ACP runs, not the agent PATH's", { timeout: 180_000 }, () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("the attribute-source probe and the capture's git calls run the daemon's git, though its directory also holds gh", async () => {
+    const world = requiredWorld();
+    const { dir, log } = daemonBinWithGh();
+    const adapter = fakeFor(world, `${SAID}\n\n${draft([warnRecord("Callers that expected 1 now get 2.")])}`);
+    await runTurn(world, makeRunner(world, adapter, { commitlore: realPort() }));
+
+    expect((succeededEvidence(world)["commitlore"] as { outcome: string }).outcome).toBe("recorded");
+    const calls = existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : [];
+    expect(calls.some((call) => call.endsWith(":: check-attr diff -- probe")), calls.join("\n")).toBe(true);
+    expect(calls.some((call) => / :: diff\b/.test(call)), calls.join("\n")).toBe(true);
+    // Only the git was handed over: no child's PATH holds the directory gh sits in.
+    for (const call of calls) expect(call.split(" :: ")[0]?.slice("PATH=".length).split(":")).not.toContain(dir);
+  });
+
+  it("a daemon git that ignores GIT_ATTR_SOURCE is refused before the turn starts, though the agent PATH's git honours it", async () => {
+    const world = requiredWorld();
+    const base = head(world);
+    daemonBinWithGh("probe: diff: acpprobe");
+    const adapter = fakeFor(world, `${SAID}\n\n${draft([warnRecord("Callers that expected 1 now get 2.")])}`);
+    const runner = makeRunner(world, adapter, { commitlore: realPort() });
+    const started = await runner.start({
+      runId: world.runId,
+      taskId: world.taskId,
+      claimId: world.claimId,
+      ownerSessionId: world.cto.sessionId,
+      ownerBindingGeneration: world.cto.generation,
+    });
+    if (started.allowed) await runner.settled(started.value.executionId);
+    expect(started).toMatchObject({
+      allowed: false,
+      message: expect.stringMatching(/ACP_COMMITLORE_BINARY UNSUPPORTED_GIT: .*does not honour GIT_ATTR_SOURCE \(it answered "probe: diff: acpprobe"\)/),
+    });
+    expect(head(world)).toBe(base);
+    expect(world.audit.byKind(WorkerTurnEvent.SUCCEEDED)).toHaveLength(0);
   });
 });
 

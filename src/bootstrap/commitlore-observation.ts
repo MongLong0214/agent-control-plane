@@ -28,6 +28,7 @@ import {
 import { type CommitLoreAttempt, commitloreAttempt } from "./commitlore-commit.ts";
 import {
   EMPTY_TREE,
+  acpGitDirectory,
   assertCommitLoreSnapshotUnchanged,
   disposeCommitLoreSnapshot,
   gitIgnoresAttrSource,
@@ -386,8 +387,11 @@ export const commitloreChildEnvironment = (home: string, git?: CommitLoreGitTarg
   // #1268 — no external diff program from the environment either; one a repository's config names refuses the
   // run before CommitLore starts (`externalDiffConfigured`).
   for (const name of Object.keys(environment)) if (INJECTED_GIT_CONFIG.test(name) || name === "GIT_EXTERNAL_DIFF") delete environment[name];
+  // #1268 — and the git ACP's own git calls run, first on its PATH (`acpGitDirectory`).
+  const gitDirectory = acpGitDirectory();
   const configured: NodeJS.ProcessEnv = {
     ...environment,
+    ...(gitDirectory === null ? {} : { PATH: [gitDirectory, environment["PATH"]].filter(Boolean).join(":") }),
     HOME: home,
     GIT_CONFIG_GLOBAL: join(home, ".gitconfig"),
     GIT_CONFIG_NOSYSTEM: "1",

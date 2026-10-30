@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { constants, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, mkdtempSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { type FileHandle, chmod, lstat, mkdir, mkdtemp, open, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
@@ -262,4 +262,46 @@ export const gitIgnoresAttrSource = async (path: string): Promise<string | null>
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
+};
+
+/** The first executable `git` on `path`, as the file it resolves to; null when there is none. */
+const firstGitOn = (path: string): string | null => {
+  for (const directory of path.split(":").filter(isAbsolute)) {
+    const candidate = join(directory, "git");
+    try {
+      accessSync(candidate, constants.X_OK);
+      if (statSync(candidate).isFile()) return realpathSync(candidate);
+    } catch {
+      // not here
+    }
+  }
+  return null;
+};
+
+const linkedGit = new Map<string, string>();
+
+/**
+ * #1268 — a private directory holding only `git`, linked to the git ACP's own git calls run (the first `git` on
+ * the daemon's PATH, which worker-git spawns); a CommitLore child's PATH puts it first, so the child, the hooks
+ * its git runs and the `GIT_ATTR_SOURCE` probe all run that git. The rest of a child's PATH is the agent PATH,
+ * which leaves out every directory holding `gh` and with it, where git shares one with gh (Homebrew's), that git:
+ * the child then ran whatever `/usr/bin/git` is, which on CI's Xcode 16.4 is git 2.39.5, older than
+ * `GIT_ATTR_SOURCE` (git 2.41), and was refused. Nothing else from the daemon's PATH is handed over. Null when
+ * the daemon's PATH has no git.
+ */
+export const acpGitDirectory = (path = process.env["PATH"] ?? ""): string | null => {
+  const git = firstGitOn(path);
+  if (git === null) return null;
+  const known = linkedGit.get(git);
+  if (known !== undefined) {
+    try {
+      if (readlinkSync(join(known, "git")) === git) return known;
+    } catch {
+      // gone: linked again below
+    }
+  }
+  const directory = mkdtempSync(join(tmpdir(), "acp-commitlore-git-"));
+  symlinkSync(git, join(directory, "git"));
+  linkedGit.set(git, directory);
+  return directory;
 };

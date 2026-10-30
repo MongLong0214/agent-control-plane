@@ -166,7 +166,8 @@ export const prepareBootstrapRun = async (
   const workRoot = tempDir("acp-246-runner-");
   const github = new InitializingGitHub(workRoot);
   const harness = makeHarness({
-    repoFactory: { workRoot, githubPort: github },
+    // #1268 — a CommitLore port the test names is the control plane's producer's too, one configuration as in production.
+    repoFactory: { workRoot, githubPort: github, ...(options.commitlore ? { commitlore: options.commitlore } : {}) },
     ...(options.ownerIdentities === undefined ? {} : { ownerIdentities: options.ownerIdentities }),
   });
   const contract = options.humanGate === undefined ? CONTRACT : { ...CONTRACT, humanGate: [...options.humanGate] };
