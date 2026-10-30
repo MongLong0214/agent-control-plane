@@ -591,6 +591,10 @@ export class CandidatePipeline {
             return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest });
           }
         }
+        if (reviewedPlan !== null) {
+          const superseded = this.supersededAtPublication(run, snapshot, snapshotDigest, attemptId, reviewedPlan);
+          if (superseded !== null) return superseded;
+        }
         const built = this.ceo.buildPacket({
           runId: input.runId,
           candidateSnapshotDigest: snapshotDigest,
@@ -727,6 +731,8 @@ export class CandidatePipeline {
           return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest });
         }
       }
+      const superseded = this.supersededAtPublication(run, snapshot, snapshotDigest, attemptId, reviewed);
+      if (superseded !== null) return superseded;
 
       const built = this.ceo.buildPacket({
         runId: input.runId,
@@ -905,7 +911,7 @@ export class CandidatePipeline {
     runId: string,
     snapshotDigest: string,
     attemptId: string,
-    stale: "AFTER_REVIEW" | "SOURCE_AT_PUBLICATION" | "PLAN_AT_PUBLICATION",
+    stale: "AFTER_REVIEW" | "SOURCE_AT_PUBLICATION" | "PLAN_AT_PUBLICATION" | "CANDIDATE_AT_PUBLICATION",
     refusal: Decision<unknown>,
     reviewed: Decision<ReviewPacket> | null,
   ): void {
@@ -923,6 +929,42 @@ export class CandidatePipeline {
         reviewerRoleBindingGeneration: typeof generation === "number" ? generation : null,
       },
     });
+  }
+
+  /**
+   * A reviewed candidate that is no longer the run's candidate is stale at publication: a later freeze
+   * replaced it while this submission awaited (another attempt re-froze after its lease lapsed), or the
+   * canonical CTO identity it froze is no longer the project's (a runtime move with no re-freeze yet).
+   * The production gate would refuse the first and publish a superseded identity for the second, so the
+   * refusal is recorded here with the candidate, attempt and reviewer it names. Null while current.
+   */
+  private supersededAtPublication(
+    run: RunRow,
+    snapshot: CandidateSnapshot,
+    snapshotDigest: string,
+    attemptId: string,
+    reviewed: Decision<ReviewPacket>,
+  ): Decision<PipelineOutcome> | null {
+    const current = this.runs.currentCandidate(run.runId);
+    let refusal: { message: string; evidence: Evidence } | null = null;
+    if (current !== snapshotDigest) {
+      refusal = { message: "candidate is not the run's current candidate", evidence: { runId: run.runId, supplied: snapshotDigest, current } };
+    } else if (snapshot.canonicalCtoIdentity !== undefined && run.projectId !== null) {
+      // Read as the freeze reads it; a candidate that froze no identity is not asked.
+      const frozenIdentityDigest = digestOf(snapshot.canonicalCtoIdentity);
+      const currentIdentityDigest = digestOf(readCanonicalCtoIdentity(this.db, run.projectId));
+      if (frozenIdentityDigest !== currentIdentityDigest) {
+        refusal = {
+          message: "the canonical CTO identity this candidate froze is no longer the project's",
+          evidence: { runId: run.runId, candidateSnapshotDigest: snapshotDigest, frozenIdentityDigest, currentIdentityDigest },
+        };
+      }
+    }
+    if (refusal === null) return null;
+    this.recordStaleAfterReview(run.runId, snapshotDigest, attemptId, "CANDIDATE_AT_PUBLICATION",
+      deny(ReasonCode.EVIDENCE_STALE, refusal.message, refusal.evidence), reviewed);
+    return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: ReasonCode.EVIDENCE_STALE, snapshotDigest,
+      detail: refusal });
   }
 
   /** Durable, per-run fence for the whole asynchronous verification/review attempt. */
