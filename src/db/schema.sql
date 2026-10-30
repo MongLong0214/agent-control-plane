@@ -655,6 +655,10 @@ CREATE INDEX IF NOT EXISTS finalization_attempts_running_deadline
 -- CP-HI-02 — §29's state machine is enforced in the database, not only in the service that usually writes it.
 -- §29 is a persisted state machine. The service owns authority/evidence/outbox work,
 -- while this guard rejects topology bypasses even from a raw SQLite caller.
+-- #1189 B5 (schema v53) — CEO_APPROVED and MERGING may go back to REVISION_REQUIRED: an approved candidate
+-- refused before anything merged. Like every edge it needs the authority marker (below); that no merge_execute
+-- receipt exists is RunEngine.returnApprovedCandidate's check, not this guard's, because a guard reading
+-- github_receipts would tie these triggers to every rebuild of that table (v49 refuses such a trigger).
 CREATE TRIGGER IF NOT EXISTS runs_state_transition_guard
 BEFORE UPDATE OF state ON runs
 WHEN NEW.state <> OLD.state
@@ -663,8 +667,8 @@ WHEN NEW.state <> OLD.state
    (OLD.state = 'ACTIVE' AND NEW.state IN ('BLOCKED','READY_FOR_CEO_REVIEW','FAILED','CANCELLED','AWAITING_HUMAN')) OR
    (OLD.state = 'BLOCKED' AND NEW.state IN ('ACTIVE','FAILED','CANCELLED','AWAITING_HUMAN')) OR
    (OLD.state = 'READY_FOR_CEO_REVIEW' AND NEW.state IN ('CEO_APPROVED','COMPLETED','REVISION_REQUIRED','AWAITING_HUMAN')) OR
-   (OLD.state = 'CEO_APPROVED' AND NEW.state IN ('MERGING')) OR
-   (OLD.state = 'MERGING' AND NEW.state IN ('POST_MERGE_VERIFYING','BLOCKED_POST_MERGE')) OR
+   (OLD.state = 'CEO_APPROVED' AND NEW.state IN ('MERGING','REVISION_REQUIRED')) OR
+   (OLD.state = 'MERGING' AND NEW.state IN ('POST_MERGE_VERIFYING','BLOCKED_POST_MERGE','REVISION_REQUIRED')) OR
    (OLD.state = 'POST_MERGE_VERIFYING' AND NEW.state IN ('MERGING','COMPLETED','BLOCKED_POST_MERGE')) OR
    (OLD.state = 'BLOCKED_POST_MERGE' AND NEW.state = 'POST_MERGE_VERIFYING') OR
    (OLD.state = 'REVISION_REQUIRED' AND NEW.state IN ('ACTIVE','FAILED','CANCELLED')) OR
@@ -694,8 +698,8 @@ WHEN NEW.state <> OLD.state
    (OLD.state = 'ACTIVE' AND NEW.state IN ('BLOCKED','READY_FOR_CEO_REVIEW','FAILED','CANCELLED','AWAITING_HUMAN')) OR
    (OLD.state = 'BLOCKED' AND NEW.state IN ('ACTIVE','FAILED','CANCELLED','AWAITING_HUMAN')) OR
    (OLD.state = 'READY_FOR_CEO_REVIEW' AND NEW.state IN ('CEO_APPROVED','COMPLETED','REVISION_REQUIRED','AWAITING_HUMAN')) OR
-   (OLD.state = 'CEO_APPROVED' AND NEW.state IN ('MERGING')) OR
-   (OLD.state = 'MERGING' AND NEW.state IN ('POST_MERGE_VERIFYING','BLOCKED_POST_MERGE')) OR
+   (OLD.state = 'CEO_APPROVED' AND NEW.state IN ('MERGING','REVISION_REQUIRED')) OR
+   (OLD.state = 'MERGING' AND NEW.state IN ('POST_MERGE_VERIFYING','BLOCKED_POST_MERGE','REVISION_REQUIRED')) OR
    (OLD.state = 'POST_MERGE_VERIFYING' AND NEW.state IN ('MERGING','COMPLETED','BLOCKED_POST_MERGE')) OR
    (OLD.state = 'BLOCKED_POST_MERGE' AND NEW.state = 'POST_MERGE_VERIFYING') OR
    (OLD.state = 'REVISION_REQUIRED' AND NEW.state IN ('ACTIVE','FAILED','CANCELLED')) OR

@@ -30,11 +30,14 @@ const TRANSITIONS: Readonly<Record<RunState, readonly RunState[]>> = {
   // A CEO approval authorizes the daemon to begin a one-way external finalization
   // sequence. It is deliberately not completion: completion is only legal after exact
   // post-merge verification has passed.
-  [RunState.CEO_APPROVED]: [RunState.MERGING],
+  // #1189 B5 (schema v53) — an approved candidate refused before anything merged goes back for
+  // revision (RunEngine.returnApprovedCandidate), which refuses while the run holds any merge_execute
+  // receipt, so a merge that may have landed stays on the post-merge path.
+  [RunState.CEO_APPROVED]: [RunState.MERGING, RunState.REVISION_REQUIRED],
   // There can be more than one repository. After each exact post-merge PASS the daemon
   // returns here to release the next one in mergeOrder; a partial external result has a
   // dedicated terminal state so it cannot quietly resume as ordinary work.
-  [RunState.MERGING]: [RunState.POST_MERGE_VERIFYING, RunState.BLOCKED_POST_MERGE],
+  [RunState.MERGING]: [RunState.POST_MERGE_VERIFYING, RunState.BLOCKED_POST_MERGE, RunState.REVISION_REQUIRED],
   [RunState.POST_MERGE_VERIFYING]: [
     RunState.MERGING,
     RunState.COMPLETED,

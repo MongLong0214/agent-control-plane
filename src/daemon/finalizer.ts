@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 
 import type { ControlPlane } from "../app/control-plane.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { NotificationKind } from "../ceo/production-gate.ts";
+import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { ArtifactKind, RunKind, RunState } from "../domain/types.ts";
 import { currentBranch } from "../git/git.ts";
@@ -24,13 +25,122 @@ import type {
   GrantConsumer,
   ManifestActivationTarget,
 } from "../registry/manifest-activation-grants.ts";
-import { GitHubAppClient } from "../github/github-kernel.ts";
+import { GitHubAppClient, transportOutcome } from "../github/github-kernel.ts";
 import { workflowDigestAtCommit } from "../github/workflow-digest-at-commit.ts";
 
 type ChangeTarget = Extract<ManifestActivationTarget, { kind: "CHANGE" }>;
 type FirstTarget = Extract<ManifestActivationTarget, { kind: "FIRST" }>;
 
 const FINALIZATION_LEASE_TTL_MS = 30 * 60_000;
+
+/**
+ * #1189 B5 — a refusal before anything merged that the daemon retries waits 1, 2, 4, 8 … minutes, never more
+ * than the hourly ceiling. At its cap (consecutive refusals of the same candidate for the same failure) the
+ * run is handed to the owner of its fix once: it stays approved, is never FAILED for a spent budget, and a fix
+ * made outside it is picked up by the next due retry without another command.
+ */
+const FINALIZATION_RETRY_BASE_MS = 60_000;
+const FINALIZATION_RETRY_CEILING_MS = 60 * 60_000;
+export const FINALIZATION_TRANSIENT_RETRY_CAP = 5;
+
+type RetryClass = "TRANSIENT" | "UNCLASSIFIED" | "OWNER_ACTION";
+
+/**
+ * What becomes of an approved run whose finalization was refused before any merge receipt existed. A retried
+ * refusal's `failureCause` is what "the same failure" means for its cap: every transport failure is one
+ * (GitHub unreachable reads as a caught denial at one step and a thrown error at the next), any other is
+ * its own reason code.
+ */
+type PreMergeRoute =
+  | { disposition: "REVISION" | "UNRECOVERABLE" }
+  | {
+      disposition: "RETRY";
+      failureClass: RetryClass;
+      failureCause: string;
+      cap: number;
+      owner: "CEO" | "OWNER";
+      action: string;
+    };
+
+/** The approved candidate cannot merge as it is, and its CTO can fix that with a new candidate. */
+const REVISION_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
+  ReasonCode.MERGE_BASE_STALE,
+  ReasonCode.MERGE_HEAD_STALE,
+  ReasonCode.SNAPSHOT_STALE,
+  ReasonCode.EVIDENCE_STALE,
+  ReasonCode.MERGE_CONFLICT,
+  ReasonCode.MERGE_CHECK_FAILED,
+  ReasonCode.MERGE_CLAIM_INVALID,
+  ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED,
+  ReasonCode.PR_BRANCH_CONTRACT_VIOLATION,
+]);
+
+/** Deterministic refusals whose fix is outside the CTO: handed on at the first refusal, not retried towards a cap. */
+const OWNER_ACTIONS: ReadonlyMap<ReasonCode, { owner: "CEO" | "OWNER"; action: string }> = new Map<ReasonCode, { owner: "CEO" | "OWNER"; action: string }>([
+  [ReasonCode.HUMAN_GATE_UNSATISFIED, { owner: "OWNER", action: "record the owner decision the run's human gate requires for this candidate" }],
+  [ReasonCode.GITHUB_APP_PERMISSION_DENIED, { owner: "OWNER", action: "restore the GitHub App's permissions to an owner-approved grant shape" }],
+  [ReasonCode.TRUSTED_CREDENTIAL_UNAVAILABLE, { owner: "OWNER", action: "restore the daemon's GitHub App credential" }],
+  [ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_STALE, { owner: "CEO", action: "re-enter with a CONFIRM of the same candidate" }],
+]);
+
+/**
+ * #1189 B5 (CEO ruling 1) — stale base, conflict and a fixable check failure go back for revision; a
+ * deterministic refusal someone else owns is handed to them; only an unrecoverable refusal ends the run;
+ * everything else, transient infrastructure first, is retried with backoff up to a cap. The lists are narrow
+ * on purpose: an unknown refusal is retried and handed to the CEO, never failed and never un-approved.
+ */
+const classifyPreMergeRefusal = (kind: RunKind, failure: Decision<unknown>): PreMergeRoute => {
+  const evidence = failure.evidence as Record<string, unknown>;
+  // The pinned merge strategy is one GitHub's pull-request merge API cannot perform: no revision of this
+  // run's candidate changes its pinned contract.
+  if (failure.reasonCode === ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED && evidence["mergeStrategy"] === "fast_forward") {
+    return { disposition: "UNRECOVERABLE" };
+  }
+  const cause = failure.reasonCode === ReasonCode.INTERNAL_ERROR && typeof evidence["errorReasonCode"] === "string"
+    ? evidence["errorReasonCode"] as ReasonCode
+    : failure.reasonCode;
+  const owned = OWNER_ACTIONS.get(cause);
+  if (owned) return { disposition: "RETRY", failureClass: "OWNER_ACTION", failureCause: cause, cap: 1, ...owned };
+  // A branch already published at another commit is never moved; the CTO publishes a new candidate on a new branch.
+  const branchElsewhere = failure.reasonCode === ReasonCode.RESOURCE_COLLISION &&
+    typeof evidence["expected"] === "string" && typeof evidence["observed"] === "string";
+  if (REVISION_REASON_CODES.has(failure.reasonCode) || branchElsewhere) {
+    // A CONTRACT_CHANGE holds the one activation grant its CONFIRM issued, so returned for revision it could
+    // never be confirmed again.
+    return kind === RunKind.CONTRACT_CHANGE
+      ? {
+          disposition: "RETRY", failureClass: "OWNER_ACTION", failureCause: failure.reasonCode, cap: 1, owner: "CEO",
+          action: "decide how this CONTRACT_CHANGE proceeds: it holds the one activation grant its CONFIRM issued, so it is not returned for revision automatically",
+        }
+      : { disposition: "REVISION" };
+  }
+  // Infrastructure: a GitHub request that was not answered, answered 5xx, or was rate-limited (429). The
+  // client reports each as PROBE_FAILED, caught as a denial or thrown (then INTERNAL_ERROR naming it). An
+  // answered 4xx, and an error that is not the client's, is not transient: it is retried the same way, but
+  // named for what it is.
+  const status = typeof evidence["status"] === "number" ? evidence["status"] : null;
+  const transient = cause === ReasonCode.PROBE_FAILED && (status === null || status >= 500 || status === 429);
+  return {
+    disposition: "RETRY",
+    failureClass: transient ? "TRANSIENT" : "UNCLASSIFIED",
+    failureCause: transient ? "TRANSIENT" : cause,
+    cap: FINALIZATION_TRANSIENT_RETRY_CAP,
+    owner: "CEO",
+    action: transient
+      ? "nothing in the candidate to fix: the daemon keeps retrying it, at most hourly; look at GitHub and the network if it does not clear"
+      : "inspect the refusal: the daemon keeps retrying it, at most hourly, and the approval stands until it merges or the refusal is fixed",
+  };
+};
+
+const retryDelayMs = (consecutive: number): number =>
+  Math.min(FINALIZATION_RETRY_BASE_MS * 2 ** (consecutive - 1), FINALIZATION_RETRY_CEILING_MS);
+
+/**
+ * The concrete blocker a hand-off names: the refusal's code and message. Bounded to the length the audit log
+ * admits for a field it has not reviewed, so the notice's own record keeps it.
+ */
+const blockerOf = (failure: Decision<unknown>): string =>
+  `${failure.reasonCode}: ${failure.allowed ? "" : failure.message}`.slice(0, 200);
 
 type FinalizationAttemptState = "RUNNING" | "RELEASED" | "COMPLETED" | "BLOCKED";
 
@@ -431,11 +541,27 @@ export class ApprovedRunFinalizer {
         deny(ReasonCode.INTERNAL_ERROR, "daemon finalization raised an unexpected error", {
           runId,
           error: error instanceof Error ? error.message : String(error),
+          // #1189 B5 — a GitHub read that threw (the kernel does not catch every one) keeps what the
+          // classification needs: whether GitHub answered, its status, and the denial's own code.
+          ...transportOutcome(error),
+          ...(isAcpError(error) ? { errorReasonCode: error.reasonCode } : {}),
         }),
       );
     } finally {
       if (!completed) this.releaseAttemptIfRunning(runId, attemptId);
     }
+  }
+
+  /**
+   * #1189 B5 — whether the daemon's sweep may try this run now. A refusal before any merge that the daemon
+   * retries waits out its backoff; every other run, and a run whose candidate changed since, is due.
+   */
+  retryDue(runId: string): boolean {
+    const run = this.cp.runs.get(runId);
+    if (!run || (run.state !== RunState.CEO_APPROVED && run.state !== RunState.MERGING)) return true;
+    const scheduled = this.latestRetrySchedule(runId);
+    if (!scheduled || scheduled.candidateSnapshotDigest !== this.cp.runs.currentCandidate(runId)) return true;
+    return this.cp.clock.now().getTime() >= Date.parse(scheduled.retryNotBefore);
   }
 
   private wasPostMergeResumed(runId: string): boolean {
@@ -964,13 +1090,166 @@ export class ApprovedRunFinalizer {
         { runId, attemptId, failureReasonCode: failure.reasonCode, compensation },
       );
     }
+    return this.refusedBeforeMerge(runId, attemptId, failure);
+  }
+
+  /**
+   * #1189 B5 — a refusal with no merge receipt: nothing merged. An approved run (CEO_APPROVED or MERGING)
+   * goes where `classifyPreMergeRefusal` sends it: back to its CTO with the approval invalidated, to FAILED
+   * when unrecoverable, or to a backoff whose cap hands it to the owner of its fix. The returned decision is
+   * the refusal itself, as before.
+   */
+  private refusedBeforeMerge(runId: string, attemptId: string, failure: Decision<unknown>): Decision<FinalizationResult> {
+    const run = this.cp.runs.get(runId);
+    const attempt = this.attempt(runId);
+    const candidateDigest = attempt?.attempt_id === attemptId && attempt.state === "RUNNING" ? attempt.candidate_digest : null;
+    if (failure.allowed || !run || candidateDigest === null ||
+        (run.state !== RunState.CEO_APPROVED && run.state !== RunState.MERGING)) {
+      this.cp.audit.record({
+        kind: "FINALIZATION_ATTEMPT_FAILED",
+        runId,
+        reasonCode: failure.reasonCode,
+        evidence: { attemptId, ...failure.evidence },
+      });
+      return failure as Decision<FinalizationResult>;
+    }
+    let route = classifyPreMergeRefusal(run.kind, failure);
     this.cp.audit.record({
       kind: "FINALIZATION_ATTEMPT_FAILED",
       runId,
       reasonCode: failure.reasonCode,
-      evidence: { attemptId, ...failure.evidence },
+      evidence: {
+        attemptId,
+        ...failure.evidence,
+        candidateSnapshotDigest: candidateDigest,
+        disposition: route.disposition,
+        ...(route.disposition === "RETRY" ? { failureClass: route.failureClass } : {}),
+      },
     });
+    if (route.disposition !== "RETRY") {
+      const unrecoverable = route.disposition === "UNRECOVERABLE";
+      const returned = this.cp.runs.returnApprovedCandidate(runId, {
+        candidateSnapshotDigest: candidateDigest,
+        attemptId,
+        reasonCode: failure.reasonCode,
+        reason: `${failure.reasonCode}: ${failure.message}`,
+        unrecoverable,
+      });
+      if (returned.allowed) {
+        // FAILED, or a revision with no current owner to take it: the CEO hears of it. A revision the CTO
+        // took reaches the CEO again as its new candidate's review.
+        if (returned.value.state !== RunState.ACTIVE) {
+          this.cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, runId, {
+            candidateSnapshotDigest: candidateDigest,
+            failureReasonCode: failure.reasonCode,
+            failureClass: route.disposition,
+            owner: "CEO",
+            action: unrecoverable
+              ? "the run ended FAILED and its approval is void; start a new run if the change is still wanted"
+              : "dispatch the run again so a current CTO revises it; its approval is void",
+            blocker: blockerOf(failure),
+            reason: failure.message,
+            whyItMatters: "a CEO-approved run did not merge, and nothing moves it without this",
+          });
+        }
+        return failure as Decision<FinalizationResult>;
+      }
+      // The approval stands, so the refusal is retried like any other, not every tick, and handed on at the cap.
+      this.cp.audit.record({
+        kind: "CEO_APPROVAL_INVALIDATION_REFUSED",
+        runId,
+        reasonCode: returned.reasonCode,
+        evidence: { attemptId, candidateSnapshotDigest: candidateDigest, failureReasonCode: failure.reasonCode, detail: returned.message },
+      });
+      route = {
+        disposition: "RETRY", failureClass: "UNCLASSIFIED", failureCause: failure.reasonCode,
+        cap: FINALIZATION_TRANSIENT_RETRY_CAP, owner: "CEO",
+        action: `the candidate could not be returned for revision (${returned.reasonCode}); decide how the run proceeds`,
+      };
+    }
+
+    const prior = this.latestRetrySchedule(runId);
+    const consecutive = prior && prior.candidateSnapshotDigest === candidateDigest && prior.failureCause === route.failureCause
+      ? prior.refusals + 1
+      : 1;
+    const retryNotBefore = new Date(this.cp.clock.now().getTime() + retryDelayMs(consecutive)).toISOString();
+    // The schedule is its own record: the refusal's evidence is the caller's, and a row that evidence makes the
+    // audit log reject must not reset the count.
+    this.cp.audit.record({
+      kind: "FINALIZATION_RETRY_SCHEDULED",
+      runId,
+      reasonCode: failure.reasonCode,
+      evidence: {
+        attemptId,
+        candidateSnapshotDigest: candidateDigest,
+        failureClass: route.failureClass,
+        // Not named *Key: the audit log redacts any key ending in "key" as a secret.
+        failureCause: route.failureCause,
+        // Consecutive refusals of this candidate for this failure. Not named consecutive*: the audit log
+        // redacts any key containing "nsec" as a secret.
+        refusals: consecutive,
+        threshold: route.cap,
+        retryNotBefore,
+      },
+    });
+    if (consecutive >= route.cap && !this.handedOff(runId, candidateDigest, route.failureCause)) {
+      const handoff = {
+        candidateSnapshotDigest: candidateDigest,
+        failureReasonCode: failure.reasonCode,
+        failureClass: route.failureClass,
+        failureCause: route.failureCause,
+        owner: route.owner,
+        action: route.action,
+        blocker: blockerOf(failure),
+      };
+      const notified = this.cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, runId, {
+        ...handoff,
+        reason: failure.message,
+        whyItMatters: "a CEO-approved run keeps being refused before its merge; it stays approved and is retried, at most hourly",
+      });
+      this.cp.audit.record({
+        kind: "FINALIZATION_HANDED_OFF",
+        runId,
+        reasonCode: failure.reasonCode,
+        evidence: { attemptId, ...handoff, refusals: consecutive, threshold: route.cap, delivered: notified.allowed },
+      });
+    }
     return failure as Decision<FinalizationResult>;
+  }
+
+  /** The newest backoff `refusedBeforeMerge` recorded for this run, or null. */
+  private latestRetrySchedule(runId: string): {
+    candidateSnapshotDigest: string;
+    failureCause: string;
+    refusals: number;
+    retryNotBefore: string;
+  } | null {
+    const row = this.cp.db.get<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events
+        WHERE run_id = ? AND kind = 'FINALIZATION_RETRY_SCHEDULED'
+        ORDER BY event_id DESC LIMIT 1`,
+      [runId],
+    );
+    if (!row) return null;
+    const evidence = JSON.parse(row.evidence_json) as Record<string, unknown>;
+    const { candidateSnapshotDigest, failureCause, refusals, retryNotBefore } = evidence;
+    if (typeof candidateSnapshotDigest !== "string" || typeof failureCause !== "string" || typeof refusals !== "number" ||
+        typeof retryNotBefore !== "string" || Number.isNaN(Date.parse(retryNotBefore))) {
+      return null;
+    }
+    return { candidateSnapshotDigest, failureCause, refusals, retryNotBefore };
+  }
+
+  /** Whether this candidate's failure was already handed on, with the notification enqueued. */
+  private handedOff(runId: string, candidateDigest: string, failureCause: string): boolean {
+    return this.cp.db.all<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events WHERE run_id = ? AND kind = 'FINALIZATION_HANDED_OFF'`,
+      [runId],
+    ).some((row) => {
+      const evidence = JSON.parse(row.evidence_json) as Record<string, unknown>;
+      return evidence["candidateSnapshotDigest"] === candidateDigest && evidence["failureCause"] === failureCause &&
+        evidence["delivered"] === true;
+    });
   }
 
   private touchAttempt(runId: string, attemptId: string, step: string): void {

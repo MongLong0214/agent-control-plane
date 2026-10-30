@@ -298,6 +298,8 @@ interface PullRequest {
   base: { sha: string; ref: string };
   merged: boolean;
   merge_commit_sha?: string | null;
+  /** GitHub's own mergeability: false is a conflict, null while GitHub is still computing it. */
+  mergeable?: boolean | null;
   state: string;
   html_url: string;
   title?: string;
@@ -1937,6 +1939,18 @@ export class GitHubKernel {
     if (!contract.allowed) {
       return deny(ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED, contract.message, contract.evidence);
     }
+    // #1189 B5 — what GitHub already knows would refuse this merge refuses it here, before any reservation.
+    // At the PUT the same refusal is an answered failure of an invoked effect, which leaves an unproven
+    // PENDING merge and a run blocked as if it might have merged; here it is a candidate to send back.
+    if (pull.mergeable === false) {
+      return deny(ReasonCode.MERGE_CONFLICT, "GitHub reports that the pull request does not merge cleanly", {
+        pullNumber: pull.number,
+        exactHead: input.exactHeadSha,
+        expectedBase: input.expectedBaseSha,
+      });
+    }
+    const declaredChecks = await this.refuseFailedDeclaredChecks(input.runId, input.repositoryIdentity, pull.head.sha);
+    if (!declaredChecks.allowed) return declaredChecks as Decision<{ predicates: Record<string, boolean> }>;
     // FD-GATE — the gate selected is the trusted one whose payload is backed by the current state, its
     // human-gate binding included, so a stale gate listed ahead of it cannot mask it.
     const gate = await this.verifyGate(input.repositoryIdentity, pull.head.sha, input.runId, (payload) =>
@@ -3268,6 +3282,35 @@ export class GitHubKernel {
    */
   postMergeVerificationInputs(runId: string, repositoryIdentity: string): Decision<readonly string[]> {
     return this.declaredPostMergeChecks(runId, repositoryIdentity);
+  }
+
+  /**
+   * #1189 B5 — a check the pinned manifest declares for this repository that GitHub Actions already concluded
+   * as failure on the head being merged refuses the merge, before any reservation: post-merge verification
+   * would refuse the same check only after an irreversible merge. Per declared name only the newest Actions
+   * run counts, so a re-run that passed is not refused; a pending or absent check refuses nothing here. A
+   * manifest this cannot resolve is left to post-merge verification, which refuses it as before.
+   */
+  private async refuseFailedDeclaredChecks(runId: string, repositoryIdentity: string, head: string): Promise<Decision<void>> {
+    const declared = this.declaredPostMergeChecks(runId, repositoryIdentity);
+    if (!declared.allowed) return allow(ReasonCode.OK, undefined);
+    for (const name of declared.value) {
+      const listed = await this.listCheckRuns(repositoryIdentity, head, name);
+      if (!listed.allowed) return listed as Decision<void>;
+      const newest = listed.value
+        .filter((check) => check.name === name && check.head_sha === head && check.app?.slug === "github-actions")
+        .reduce<CheckRun | null>((latest, check) => (latest === null || check.id > latest.id ? check : latest), null);
+      if (newest?.status === "completed" && newest.conclusion === "failure") {
+        return deny(ReasonCode.MERGE_CHECK_FAILED, "a check the pinned manifest declares failed on the head being merged", {
+          repositoryIdentity,
+          head,
+          name,
+          checkRunId: newest.id,
+          conclusion: newest.conclusion,
+        });
+      }
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   private declaredPostMergeChecks(runId: string, repositoryIdentity: string): Decision<string[]> {

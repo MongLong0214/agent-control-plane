@@ -435,6 +435,7 @@ describe("the v45 → v46 step", () => {
         { version: 50, migration_id: "v50-post-merge-verification-reentry" },
         { version: 51, migration_id: "v51-durable-recipient-delivery" },
         { version: 52, migration_id: "v52-resident-project-provisioning" },
+        { version: 53, migration_id: "v53-approved-run-revision-reentry" },
       ]);
     } finally {
       raw.close();
@@ -480,7 +481,7 @@ describe("the v45 → v46 step", () => {
     expect(approved).toMatchObject({
       fromVersion: 44,
       toVersion: SCHEMA_VERSION,
-      migrations: ["v45-first-manifest-activation", "v46-rowid-no-replace", "v47-owner-decision-authority-guard", "v48-owner-decision-supersede-guard", "v49-branch-publish-receipts", "v50-post-merge-verification-reentry", "v51-durable-recipient-delivery", "v52-resident-project-provisioning"],
+      migrations: ["v45-first-manifest-activation", "v46-rowid-no-replace", "v47-owner-decision-authority-guard", "v48-owner-decision-supersede-guard", "v49-branch-publish-receipts", "v50-post-merge-verification-reentry", "v51-durable-recipient-delivery", "v52-resident-project-provisioning", "v53-approved-run-revision-reentry"],
     });
     const databaseModule = new URL("../../src/db/database.ts", import.meta.url).href;
     const child = boundedSpawnSync(
@@ -515,7 +516,7 @@ describe("the v45 → v46 step", () => {
     expect(approveMigration(path, "V46 D5-b re-approval")).toMatchObject({
       fromVersion: 45,
       toVersion: SCHEMA_VERSION,
-      migrations: ["v46-rowid-no-replace", "v47-owner-decision-authority-guard", "v48-owner-decision-supersede-guard", "v49-branch-publish-receipts", "v50-post-merge-verification-reentry", "v51-durable-recipient-delivery", "v52-resident-project-provisioning"],
+      migrations: ["v46-rowid-no-replace", "v47-owner-decision-authority-guard", "v48-owner-decision-supersede-guard", "v49-branch-publish-receipts", "v50-post-merge-verification-reentry", "v51-durable-recipient-delivery", "v52-resident-project-provisioning", "v53-approved-run-revision-reentry"],
     });
     new Db(path).close();
     expect(contentDigests(path).userVersion).toBe(SCHEMA_VERSION);
