@@ -1,0 +1,23 @@
+Limit: BOOTSTRAP_PLAN and CONTRACT_CHANGE plan reviews get no digest set; their prompts carry no packet-digest line, so a quoted digest there is still refused by the long-base64 rule
+Record-Id: r-12bebe231f75
+Provenance: inherited a51e8a9962e12540da650da57a3dad1aaf4d23e1
+
+Limit: a reviewer can still return BLOCK or REVISE for a method-only reason; only the reviewer schema wording guards against that, the gate no longer counts method findings
+Record-Id: r-a1f71a9c80c4
+Provenance: inherited cce303f276f886fb35e1c72a93e790feb1b0d7be
+
+Limit: a reviewer that keeps returning method-only BLOCKs leaves the candidate waiting in REVIEW_UNAVAILABLE; bootstrap runs get the daemon's existing retry for unavailable reviews, standard runs need a fresh review
+Record-Id: r-671ace6f492c
+Provenance: inherited e414d9050e3bbe23c781a78701c340a60fc48197
+
+Limit: packets for candidates with no repositories carry a not-applicable review placeholder instead of a real BLIND_REVIEW, so the CONFIRM method check leaves them alone
+Record-Id: r-8b1328720541
+Provenance: inherited 825f5ddbf5ef283af7e4dab90a869ad5d40c0957
+
+Limit: retry_outbox treats unknown parameter names (a typo such as messageID) as no target and keeps the old all-roles reset, because no-target behaviour was required to stay unchanged
+Record-Id: r-a36c306864ed
+Provenance: inherited bb0956a9310d302e628f0a682c8d30e4794089a3
+
+Limit: the sweep releases a dead pid even while its receipt is still RUNNING, as outstandingProcess already does; the RUNNING receipt itself still blocks retries until it is closed
+Record-Id: r-121a55f0d679
+Provenance: inherited 56941e6a6e21e4bc0726f3d2b39a049ae711186b
