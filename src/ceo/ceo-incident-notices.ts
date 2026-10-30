@@ -19,9 +19,11 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
  * enqueues the notice itself.
  *
  * An incident is open while its detector still finds it and `resolutionOf` finds no evidence that closed it: its
- * run gone, its run ended, or a CEO decision recorded on its run, each after it opened. A stall that cleared is no
- * longer stated, so nothing more is delivered for it; an ACK is receipt, never resolution. A notice of a resolved
- * incident is withdrawn rather than carried to a CEO it was not addressed to (`withdrawResolvedNotices`).
+ * run gone, its run ended, or a CEO decision recorded on its run, each after it opened, and for an incident its
+ * detector settles on progress (`Incident.settlesOnProgress`), its run's progress past its episode. A stall that
+ * cleared is no longer stated, so nothing more is delivered for it; an ACK is receipt, never resolution. A notice
+ * of a resolved incident is withdrawn rather than carried to a CEO it was not addressed to
+ * (`withdrawResolvedNotices`).
  *
  * Two notices keep their own owners: a candidate's READY_FOR_CEO_REVIEW (`ProductionGate.buildPacket`, and
  * its re-delivery after a CEO recovery, deduplicated by the decision and the candidate, in
@@ -46,6 +48,10 @@ export type NotificationKind = (typeof NotificationKind)[keyof typeof Notificati
  *   candidate pipeline attempt, a READY task its CTO left after its one continuation wake, and an
  *   agent-owned wait's CEO_ESCALATION step. Its episode is the run's latest progress (`runProgressAt`): two
  *   detectors that see the same unchanged run send one notice, and real progress starts the next episode.
+ *   Whether that progress also closes the episode already open is the detector's, stated per incident
+ *   (`Incident.settlesOnProgress`): a reclaimed attempt, which its watchdog sees only once and settles when its
+ *   run moves on, is closed by it; an agent-owned wait's escalation, pinned to the episode it opened in, is
+ *   not, because a worker heartbeat does not end a wait.
  * - RETIREMENT_HELD (CRITICAL_SYSTEM_FAILURE; subject: the run that holds it). An owner retirement that
  *   waits on a run terminal in BLOCKED_POST_MERGE. Episode: that run's latest progress.
  * - DELIVERY_STALLED (CRITICAL_SYSTEM_FAILURE; subject: the role its messages are addressed to). Messages
@@ -100,6 +106,13 @@ export interface Incident {
   episode: string;
   /** The audit event the incident opened with; a CEO_DECISION on the run after it resolves the incident. */
   openedEventId?: number | null;
+  /**
+   * The detector settles this incident of a run when the run progresses past its episode (a reclaimed attempt:
+   * `AgentOwnedWaits.routeWatchdogStalls`), so that progress resolves it (`resolutionOf`, RUN_PROGRESSED). Absent,
+   * progress does not: an agent-owned wait's escalation stays open through its run's worker heartbeats. Its
+   * notice carries it, so the outbox reads the same answer back.
+   */
+  settlesOnProgress?: boolean;
   payload: Record<string, unknown>;
   /** The delivery record's own evidence; by default the payload without `whyItMatters`. */
   record?: Record<string, unknown>;
@@ -132,11 +145,21 @@ export interface NoticeStatus {
   resolvedBy: Resolution | null;
 }
 
-/** The evidence that closed an incident, and the audit event that is it (none for a run that is gone). */
+/**
+ * The evidence that closed an incident, and the audit event that is it: none for a run that is gone, nor for
+ * progress, which is a row of the run as often as an event.
+ */
 export interface Resolution {
-  kind: "RUN_GONE" | "RUN_ENDED" | "CEO_DECISION";
+  kind: "RUN_GONE" | "RUN_ENDED" | "CEO_DECISION" | "RUN_PROGRESSED";
   eventId: number | null;
 }
+
+/**
+ * Whether the run progressed past `episode` (F3-1: its latest progress is no longer the one the episode names).
+ * The one test of it, asked by `resolutionOf` and by the detector that settles a stall on it.
+ */
+export const runProgressedPast = (db: Pick<Db, "get">, runId: string, episode: string): boolean =>
+  runEpisode(db, runId) !== episode;
 
 export interface NoticeDelivery {
   state: NoticeState;
@@ -168,6 +191,8 @@ const deliveriesOf = (db: Pick<Db, "all">, incident: Incident): NoticeStatus["de
  *   its first delivery record);
  * - RUN_ENDED: the run is terminal and a RUN_TRANSITION followed the opening, so it ended since (cancelled,
  *   failed, completed). A run already terminal when its incident opened, as BLOCKED_POST_MERGE is, is not.
+ * - RUN_PROGRESSED: only for an incident whose detector settles it on progress (`settlesOnProgress`), the run
+ *   progressed past its episode (`runProgressedPast`). Any other incident is not closed by progress.
  * An incident never delivered has not opened, so only RUN_GONE resolves it. An incident not about a run (a
  * role's stalled messages, a session) has no such evidence; its detector stops stating it when it clears.
  */
@@ -187,13 +212,16 @@ export const resolutionOf = (db: Pick<Db, "get">, incident: Incident): Resolutio
     [incident.runId, opened],
   );
   if (decided) return { kind: "CEO_DECISION", eventId: decided.event_id };
-  if (!isTerminal(run.state)) return null;
-  const ended = db.get<{ event_id: number }>(
+  const ended = isTerminal(run.state) ? db.get<{ event_id: number }>(
     `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'RUN_TRANSITION' AND event_id > ?
       ORDER BY event_id DESC LIMIT 1`,
     [incident.runId, opened],
-  );
-  return ended ? { kind: "RUN_ENDED", eventId: ended.event_id } : null;
+  ) : undefined;
+  if (ended) return { kind: "RUN_ENDED", eventId: ended.event_id };
+  if (incident.settlesOnProgress === true && runProgressedPast(db, incident.runId, incident.episode)) {
+    return { kind: "RUN_PROGRESSED", eventId: null };
+  }
+  return null;
 };
 
 export const noticeStatus = (ports: Pick<NoticePorts, "db">, incident: Incident): NoticeStatus => {
@@ -231,7 +259,14 @@ const incidentOfNotice = (runId: string | null, payloadJson: string): Incident |
   if (typeof cls !== "string" || !(cls in CLASS_RULES) || typeof correlation !== "string" || typeof episode !== "string") return null;
   const prefix = correlationOf(cls as IncidentClass, "");
   if (!correlation.startsWith(prefix)) return null;
-  return { cls: cls as IncidentClass, subject: correlation.slice(prefix.length), runId, episode, payload: {} };
+  return {
+    cls: cls as IncidentClass,
+    subject: correlation.slice(prefix.length),
+    runId,
+    episode,
+    payload: {},
+    ...(payload["settlesOnProgress"] === true ? { settlesOnProgress: true } : {}),
+  };
 };
 
 /**
@@ -353,6 +388,7 @@ export const deliverIncident = (ports: NoticePorts, incident: Incident): Decisio
           incidentClass: incident.cls,
           correlation: status.correlation,
           episode: incident.episode,
+          ...(incident.settlesOnProgress === true ? { settlesOnProgress: true } : {}),
           ...(redelivery ? { redelivery: true } : {}),
         },
       });
