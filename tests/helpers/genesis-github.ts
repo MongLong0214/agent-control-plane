@@ -40,8 +40,7 @@ export const genesisBundle = (): GenesisBundle => ({
   productIntent: { summary: "An immediately developable product", references: ["https://example.test/design"], ownerInstructions: ["Preserve this intent"] },
 });
 
-export function genesisPlanFixture() {
-  const genesis = genesisBundle();
+export function genesisPlanFixture(genesis: GenesisBundle = genesisBundle()) {
   // #1268 — a bootstrap is a new project, and a new project requires CommitLore.
   const manifest = projectManifestSchema.parse(fixtureManifest("resident-test", {
     commitlore: { mode: "required" },

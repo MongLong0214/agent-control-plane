@@ -46,5 +46,8 @@ if (process.env.FIXTURE_CLI_RESPONSES) {
     process.stdout.write(JSON.stringify(world.runs.filter((run) => run.headSha === flag("--commit"))));
   } else if (args[0] === "run" && args[1] === "view") {
     process.stdout.write(JSON.stringify({ jobs: world.jobs[`${args[2]}/${flag("--attempt")}`] ?? [] }));
+  } else if (args[0] === "api" && /\/compare\/[0-9a-f]+\.\.\.[0-9a-f]+$/.test(args[1] ?? "")) {
+    // GitHub's compare of the base with the head, as `--jq '{status: .status}'` answers it.
+    process.stdout.write(JSON.stringify({ status: world.compare ?? "ahead" }));
   } else process.exit(2);
 }

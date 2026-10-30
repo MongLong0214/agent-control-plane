@@ -5,9 +5,18 @@ import { z } from "zod";
 import { canonicalJson, digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { verificationCommandSchema } from "./verification-command.ts";
+import {
+  isVerificationCommandRefused,
+  manifestVerificationCommandSchema,
+  PROJECT_VERIFICATION_EXECUTABLES,
+  type verificationCommandSchema,
+  verificationExecutableRefusalMessage,
+} from "./verification-command.ts";
 
 export const PROJECT_MANIFEST_SCHEMA_ID = "agent-control-plane.project.v2";
+
+/** The refusal a manifest naming a merge strategy other than `merge_commit` carries (#1269). */
+export const MERGE_COMMIT_ONLY = "MERGE_COMMIT_ONLY";
 
 /** Committed manifest location (Integration §10.1). */
 export const MANIFEST_RELATIVE_PATH = ".agent-control-plane/project.json";
@@ -19,6 +28,11 @@ export const branchProfileSchema = z
     updateStrategy: z.enum(["rebase_before_review", "merge_from_target"]).default(
       "rebase_before_review",
     ),
+    /**
+     * #1269 — ACP merges every pull request as a merge commit. A missing field reads as `merge_commit`;
+     * the other three are still readable so a stored contract that names one can be migrated by a
+     * contract change, but `assertPortableManifest` refuses to admit any of them.
+     */
     mergeStrategy: z.enum(["merge_commit", "fast_forward", "squash", "rebase"]).default("merge_commit"),
     releaseTagPolicy: z.enum(["semver", "none"]).default("semver"),
     releaseBranchCleanup: z.enum(["delete", "keep"]).default("keep"),
@@ -50,7 +64,15 @@ export const projectManifestSchema = z
         guarded: z.array(z.string()).default([]),
       })
       .strict(),
-    verificationCommands: z.array(verificationCommandSchema).default([]),
+    verificationCommands: z.array(manifestVerificationCommandSchema).default([]),
+    /**
+     * #1253 — executables this project's own verification commands may launch beyond the shared
+     * allowlist, each one PROJECT_VERIFICATION_EXECUTABLES names (none yet, so any declaration is
+     * refused). It reaches only this project's runs: the sandbox takes it from the pinned manifest.
+     * `.optional()` with no default keeps every existing manifest's digest unchanged, and `.min(1)`
+     * keeps an empty list from looking like a declaration.
+     */
+    verificationExecutables: z.array(z.string().min(1)).min(1).optional(),
     postMergeCommands: z.array(z.string()).default([]),
     ciWorkflows: z
       .array(
@@ -195,6 +217,25 @@ export const projectManifestSchema = z
         }
       }
     }
+    const executables = manifest.verificationExecutables ?? [];
+    for (const name of executables) {
+      if (!PROJECT_VERIFICATION_EXECUTABLES.has(name)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `verificationExecutables names '${name}', which a project cannot add to the verification executable allowlist`,
+          path: ["verificationExecutables"],
+        });
+      }
+    }
+    for (const [index, cmd] of manifest.verificationCommands.entries()) {
+      if (isVerificationCommandRefused(cmd.argv, { executables })) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: verificationExecutableRefusalMessage(cmd.argv, { executables }),
+          path: ["verificationCommands", index, "argv", 0],
+        });
+      }
+    }
     const roles = new Set(manifest.repositories.map((r) => r.role));
     for (const cmd of manifest.verificationCommands) {
       if (!roles.has(cmd.repositoryRole)) {
@@ -319,6 +360,16 @@ export const assertPortableManifest = (manifest: unknown): Decision<ProjectManif
           ? { refusal: i.params["refusal"] as string }
           : {}),
       })),
+    });
+  }
+
+  if (parsed.data.branchProfile.mergeStrategy !== "merge_commit") {
+    return deny(ReasonCode.INVALID_ARGUMENT, "manifest failed schema validation", {
+      issues: [{
+        path: "branchProfile.mergeStrategy",
+        message: `pull requests merge only as merge commits; '${parsed.data.branchProfile.mergeStrategy}' is not admitted`,
+        refusal: MERGE_COMMIT_ONLY,
+      }],
     });
   }
 

@@ -7,6 +7,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vites
 
 import {
   ATTACH_EXIT,
+  DEFAULT_REATTACH_POLICY,
   RELAY_REATTACHING_ERROR,
   runAttachRelay,
   runAttachRelayCommand,
@@ -477,7 +478,7 @@ describe("a canonical CTO relay across a daemon restart", () => {
     expect(await settles(r.exit)).toBe(ATTACH_EXIT.OK);
   });
 
-  it("exits once the daemon has not come back within its bound", async () => {
+  it("exits once the daemon has not come back within a bound it was given", async () => {
     const fixture = await started();
     const r = relay(fixture.paths, { ...POLICY, maxWaitMs: 300 });
     const init = await r.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: qualified });
@@ -504,7 +505,7 @@ const FAST: Partial<ReattachPolicy> = { maxWaitMs: 3_000, initialDelayMs: 5, max
 interface Line {
   id?: unknown;
   method?: string;
-  params?: { clientInfo?: unknown; name?: string };
+  params?: { clientInfo?: unknown; name?: string; arguments?: unknown };
 }
 
 const initializeResult = (id: unknown): string =>
@@ -512,8 +513,9 @@ const initializeResult = (id: unknown): string =>
 
 /**
  * A stand-in for the canonical CTO reattach door. `mode` decides each new connection: admitted with
- * `tuple`, answered unbound, or dropped at once. Every admitted connection's lines are kept by
- * connection, and `onLine` decides what that connection answers.
+ * `tuple`, answered unbound, dropped at once, or accepted and never answered (`silent`, a daemon
+ * still starting). Every admitted connection's lines are kept by connection, and `onLine` decides
+ * what that connection answers.
  */
 const standInDoor = async (
   path: string,
@@ -521,9 +523,10 @@ const standInDoor = async (
   listen = true,
 ) => {
   const door = {
-    mode: "admit" as "admit" | "unbound" | "drop",
+    mode: "admit" as "admit" | "unbound" | "drop" | "silent",
     tuple: STAND_IN_TUPLE as Record<string, unknown>,
     connections: [] as Socket[],
+    silent: [] as Socket[],
     closed: [] as boolean[],
     lines: [] as Line[][],
     open: () => door.closed.filter((closed) => !closed).length,
@@ -533,6 +536,10 @@ const standInDoor = async (
     socket.on("error", () => undefined);
     if (door.mode === "drop") {
       socket.destroy();
+      return;
+    }
+    if (door.mode === "silent") {
+      door.silent.push(socket);
       return;
     }
     if (door.mode === "unbound") {
@@ -559,7 +566,7 @@ const standInDoor = async (
     });
   });
   closers.push(async () => {
-    for (const socket of door.connections) socket.destroy();
+    for (const socket of [...door.connections, ...door.silent]) socket.destroy();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
   if (listen) await door.listen();
@@ -735,6 +742,68 @@ describe("review PR1051-R2: one wait, one connection, one deadline", () => {
     expect(await settles(r.exit)).toBe(ATTACH_EXIT.UNAVAILABLE);
     expect(door.connections.length).toBeGreaterThan(2);
     expect(await until(() => door.open() === 0, 500)).toBe(true);
+  });
+});
+
+/** A few turns of the real event loop, so socket I/O lands between fake-timer steps. */
+const ioTurns = async (): Promise<void> => {
+  for (let turn = 0; turn < 5; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+};
+
+describe("a daemon restart that outlasts any fixed wait", () => {
+  // A restart measured at 5m47s outlasted the five-minute wait the relay used to have: the relay
+  // exited, Claude Code does not respawn a dead stdio MCP server, and every later wake found no
+  // peer until the session was reconnected by hand.
+  it("keeps asking through six silent minutes, then reattaches and re-registers its wake endpoint", async () => {
+    const { dir, paths } = standInPaths();
+    const registration = { endpoint: join(dir, "wake.sock") };
+    const door = await standInDoor(paths.reattachPath, (socket, _index, line) => {
+      if (line.method === "initialize") socket.write(initializeResult(line.id));
+      if (line.method === "tools/call" && line.params?.name === "role_wake_endpoint_register") {
+        socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: line.id, result: { structuredContent: { ok: true } } })}\n`);
+      }
+      if (line.method === "tools/list") socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: line.id, result: { tools: [] } })}\n`);
+    });
+    // The production policy: nothing overridden.
+    const r = relay(paths, {});
+    expect((await initializeWith(r)).error).toBeUndefined();
+    r.notify("notifications/initialized");
+    const registered = await r.request("tools/call", { name: "role_wake_endpoint_register", arguments: registration });
+    expect(registered.result?.structuredContent).toMatchObject({ ok: true });
+    const replayed = (): boolean =>
+      door.lines[1]?.some((line) => line.params?.name === "role_wake_endpoint_register") === true;
+    let waited = 0;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      door.mode = "silent";
+      door.connections[0]!.destroy();
+      for (let second = 0; second < 6 * 60; second += 1) {
+        await vi.advanceTimersByTimeAsync(1_000);
+        await ioTurns();
+      }
+      expect(r.exited()).toBeNull();
+      expect(r.err()).toBe("");
+      // It kept asking the whole time, one connection after another rather than one held open.
+      expect(door.silent.length).toBeGreaterThan(5);
+      door.mode = "admit";
+      // Back within one attempt and one capped backoff step: the backoff stayed bounded.
+      while (!replayed() && waited <= DEFAULT_REATTACH_POLICY.attemptTimeoutMs + DEFAULT_REATTACH_POLICY.maxDelayMs) {
+        await vi.advanceTimersByTimeAsync(1_000);
+        await ioTurns();
+        waited += 1_000;
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(replayed()).toBe(true);
+    expect(waited).toBeLessThanOrEqual(DEFAULT_REATTACH_POLICY.attemptTimeoutMs + DEFAULT_REATTACH_POLICY.maxDelayMs);
+    expect(door.connections).toHaveLength(2);
+    expect(door.lines[1]!.find((line) => line.params?.name === "role_wake_endpoint_register")?.params?.arguments).toEqual(registration);
+    expect(await until(() => door.silent.every((socket) => socket.destroyed))).toBe(true);
+    const listed = await r.request("tools/list", {});
+    expect(listed.error).toBeUndefined();
+    r.stdin.end();
+    expect(await settles(r.exit)).toBe(ATTACH_EXIT.OK);
   });
 });
 

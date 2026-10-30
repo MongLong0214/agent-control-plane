@@ -575,6 +575,18 @@ describe("portable project manifest (Integration §10.2)", () => {
     expect(assertPortableManifest(base).allowed).toBe(true);
   });
 
+  it("#1269: admits merge commits only; a missing strategy reads as one, and squash, rebase and fast-forward are refused by name", () => {
+    const { mergeStrategy: _omitted, ...profile } = base.branchProfile;
+    const defaulted = assertPortableManifest({ ...base, branchProfile: profile });
+    expect(defaulted.allowed && defaulted.value.branchProfile.mergeStrategy).toBe("merge_commit");
+    for (const mergeStrategy of ["squash", "rebase", "fast_forward"]) {
+      const refused = assertPortableManifest({ ...base, branchProfile: { ...base.branchProfile, mergeStrategy } });
+      expect(refused.allowed).toBe(false);
+      expect(refused.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+      expect(refused.evidence["issues"]).toEqual([expect.objectContaining({ path: "branchProfile.mergeStrategy", refusal: "MERGE_COMMIT_ONLY" })]);
+    }
+  });
+
   it("CP-S04 / RF-S05: rejects absolute paths and session identifiers", () => {
     // RF-S05 arm:absolute-path
     // RF-S05 arm:session

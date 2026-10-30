@@ -281,6 +281,11 @@ export interface WrittenRoleWake {
   readonly cause: string;
 }
 
+/** One wake that was refused before it connected, or whose connection failed, and the code it was refused with. */
+export interface FailedRoleWake extends WrittenRoleWake {
+  readonly reasonCode: ReasonCode;
+}
+
 /**
  * The exact bytes of a wake: one newline-delimited JSON frame carrying the token as its content.
  *
@@ -534,7 +539,7 @@ export class RoleConversationPort {
    * queues can be attributed: the daemon writes it as a `ROLE_WAKE_SENT` audit row. Absent, wakes
    * are sent as before and recorded nowhere.
    */
-  readonly #onWakeFailed: ((wake: WrittenRoleWake) => void) | null;
+  readonly #onWakeFailed: ((wake: FailedRoleWake) => void) | null;
   readonly #onWakeWritten: ((wake: WrittenRoleWake) => void) | null;
   /**
    * Whether a registration or connection fallback has work to wake its holder for. A confirmed
@@ -550,7 +555,7 @@ export class RoleConversationPort {
       wakeTimeoutMs?: number;
       ownerMessages?: OwnerMessageLedger;
       serializeWake?: <T>(body: () => T) => T;
-      onWakeFailed?: (wake: WrittenRoleWake) => void;
+      onWakeFailed?: (wake: FailedRoleWake) => void;
       onWakeWritten?: (wake: WrittenRoleWake) => void;
       holderHasWork?: (holder: HolderIdentity) => boolean;
     } = {},
@@ -1209,40 +1214,57 @@ export class RoleConversationPort {
    * the constant token is what makes winning the race worth nothing.
    */
   async wake(roleKey: string, mention?: MentionWakeContext, cause?: string): Promise<Decision<void>> {
+    // A refusal made before any connection is told to `onWakeFailed` with its own code, as a failed
+    // connection is. Returned only to the caller, it used to be stored nowhere: an admission's wake
+    // is the one push a holder-claimed message gets, and one refused for want of an attached session
+    // left the message PENDING with nothing saying why. Nothing here touches the message or its
+    // outbox row. A recorder that throws loses only the record.
+    const refused = (decision: Decision<void>): Decision<void> => {
+      try {
+        this.#onWakeFailed?.({
+          roleKey,
+          cause: cause ?? (mention ? ROLE_WAKE_CAUSE.MENTION : ROLE_WAKE_CAUSE.UNSPECIFIED),
+          reasonCode: decision.reasonCode,
+        });
+      } catch {
+        // Only the record is lost.
+      }
+      return decision;
+    };
     const peer = this.#live.get(roleKey);
     if (!peer) {
-      return deny(ReasonCode.ROLE_PEER_ABSENT, "no session is currently attached for this role", {
+      return refused(deny(ReasonCode.ROLE_PEER_ABSENT, "no session is currently attached for this role", {
         role: this.#role,
         roleKey,
-      });
+      }));
     }
     const identity = peer.authenticate();
     if (!identity.allowed || !this.#isCurrentHolder(peer.binding, identity.value)) {
-      return deny(
+      return refused(deny(
         ReasonCode.ROLE_PEER_STALE,
         "the attached peer no longer holds the role its socket was admitted under",
         { role: this.#role, roleKey, generation: peer.binding.bindingGeneration },
-      );
+      ));
     }
     if (peer.endpoint === null) {
-      return deny(
+      return refused(deny(
         ReasonCode.ROLE_PEER_UNSUPPORTED,
         "the attached peer registered no wake endpoint on this connection",
         { role: this.#role, roleKey },
-      );
+      ));
     }
     const revalidated = this.#validateEndpointPath(peer.endpoint);
-    if (!revalidated.allowed) return revalidated as Decision<void>;
+    if (!revalidated.allowed) return refused(revalidated as Decision<void>);
     // A wake caused by a mention also needs the mention's identity, role and room to stand behind
     // this holder, now and again at the handoff below. Any other wake (in-band work, a peer turn
     // from the local socket, a registration's drain) keeps the current-holder check alone.
     const mentionHolds = (): boolean =>
       mention === undefined || (this.#mentionWakeGate !== null && this.#mentionWakeGate(peer.binding, mention));
     if (!mentionHolds()) {
-      return deny(ReasonCode.ROLE_PEER_STALE, "the mention's identity, role or room no longer stands behind this holder", {
+      return refused(deny(ReasonCode.ROLE_PEER_STALE, "the mention's identity, role or room no longer stands behind this holder", {
         role: this.#role,
         roleKey,
-      });
+      }));
     }
 
     // Read before the connect and compared after it. What this delivery is about is the
@@ -1333,7 +1355,6 @@ export class RoleConversationPort {
         });
       });
     } catch (failure) {
-      this.#onWakeFailed?.({ roleKey, cause: cause ?? (mention ? ROLE_WAKE_CAUSE.MENTION : ROLE_WAKE_CAUSE.UNSPECIFIED) });
       // Remembered against the registration it was sent under, so the scan can report a holder
       // whose registration is valid on the filesystem and still takes no wake -- the one unwakeable
       // state no check made before connecting can see. Not a probe: this is a delivery that was
@@ -1346,11 +1367,11 @@ export class RoleConversationPort {
       if (peer.registration === registration) {
         peer.wakeFailure = { shape: (failure as WakeFailure).shape };
       }
-      return deny(ReasonCode.ROLE_PEER_FAILED, "the peer's wake endpoint did not accept the wake", {
+      return refused(deny(ReasonCode.ROLE_PEER_FAILED, "the peer's wake endpoint did not accept the wake", {
         role: this.#role,
         roleKey,
         shape: (failure as WakeFailure).shape,
-      });
+      }));
     }
     // Neither is an endpoint failure, so nothing is remembered against the registration.
     if (outcome === "stale") {

@@ -40,6 +40,12 @@ export interface SandboxRequest {
    * other than exactly `"supervised-budget"`, including omitting it, is `"no-spawn"`.
    */
   processLimit?: ProcessLimitMode;
+  /**
+   * #1253 — the executables the manifest pinned for this run adds to the allowlist
+   * (`verificationExecutables`). Trusted control-plane code takes it from that manifest; only names
+   * in PROJECT_VERIFICATION_EXECUTABLES count. Absent means the allowlist alone.
+   */
+  executables?: readonly string[];
 }
 
 /**
@@ -695,7 +701,7 @@ const executableFileAt = (path: string): boolean => {
  */
 export const sandboxLaunchArgv = async (
   argv: readonly string[],
-  context: { cwd: string; additionalRoots: readonly string[] },
+  context: { cwd: string; additionalRoots: readonly string[]; executables?: readonly string[] },
 ): Promise<Decision<readonly string[]>> => {
   const resolved = resolveVerificationExecutable(argv[0] ?? "", context).resolvedPath;
   if (resolved === null || !XCRUN_STUBS.has(resolved)) return allow(ReasonCode.OK, argv);
@@ -770,7 +776,7 @@ const realPathOf = (path: string): string | null => {
  */
 export const verificationLaunchArgv = async (
   argv: readonly string[],
-  context: { cwd: string; additionalRoots: readonly string[] },
+  context: { cwd: string; additionalRoots: readonly string[]; executables?: readonly string[] },
 ): Promise<Decision<readonly string[]>> => {
   const resolution = resolveVerificationExecutable(argv[0] ?? "", context);
   if (!resolution.allowed || resolution.resolvedPath === null) {
@@ -892,6 +898,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   const executableContext = {
     cwd: resolve(worktreePath, command.cwd),
     additionalRoots: [worktreePath],
+    executables: request.executables ?? [],
   };
   if (isVerificationCommandRefused(command.argv, executableContext)) {
     rmSync(scratch, { recursive: true, force: true });

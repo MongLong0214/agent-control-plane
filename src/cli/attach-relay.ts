@@ -136,11 +136,15 @@ export interface SessionMessaging {
  *
  * It waits only while nobody answers on the reattach socket — a daemon that is down or still
  * starting — or while an admitted connection has not finished being restored. Any answer ends the
- * wait: admitted and restored, it carries on; refused, it exits. `maxWaitMs` is one absolute
- * deadline, taken when the connection is lost, over every admission and every restore of that
- * wait (review PR1051-R2); `attemptTimeoutMs` bounds each step inside it and never extends it.
- * `flushTimeoutMs` bounds how long an exiting relay waits for a client that stopped reading
- * (PR1051-R4).
+ * wait: admitted and restored, it carries on; refused, it exits. So does the client ending the
+ * session. By default nothing else ends it: a daemon restart measured at 5m47s outlasted the
+ * five-minute deadline this wait used to have, and a relay that gives up is not respawned by
+ * Claude Code, so every later wake of its role finds no peer. The asking stays bounded instead:
+ * one attempt at a time, each at most `attemptTimeoutMs`, with a backoff capped at `maxDelayMs`.
+ * A finite `maxWaitMs` is one absolute deadline, taken when the connection is lost, over every
+ * admission and every restore of that wait (review PR1051-R2); `attemptTimeoutMs` bounds each step
+ * inside it and never extends it. `flushTimeoutMs` bounds how long an exiting relay waits for a
+ * client that stopped reading (PR1051-R4).
  */
 export interface ReattachPolicy {
   maxWaitMs: number;
@@ -151,7 +155,7 @@ export interface ReattachPolicy {
 }
 
 export const DEFAULT_REATTACH_POLICY: ReattachPolicy = {
-  maxWaitMs: 5 * 60_000,
+  maxWaitMs: Number.POSITIVE_INFINITY,
   initialDelayMs: 250,
   maxDelayMs: 5_000,
   attemptTimeoutMs: 35_000,
@@ -1270,8 +1274,8 @@ const wakeRefusalReason = (message: RelayedMessage): string => {
  *     owns its waiters and its in-flight requests, and only the current link's lines reach anything.
  *     An attempt the relay gives up on is destroyed, so a late answer on it satisfies nothing; a
  *     link lost while it is being restored is retried by the wait already running, never by a
- *     second one. One absolute deadline, `maxWaitMs` from the loss, governs every admission,
- *     restore and pause of the wait.
+ *     second one. With a finite `maxWaitMs`, one absolute deadline from the loss governs every
+ *     admission, restore and pause of the wait; by default there is none (`ReattachPolicy`).
  *   - **It restores only what a daemon confirmed** (PR1051-R3). Replay state is taken from the
  *     daemon's answers rather than from the client's requests: taken from the requests, one the
  *     client was told was not sent ran on return, and a refused registration replaced the accepted
@@ -1351,7 +1355,7 @@ const relayWithReattach = (
     /** The one link the relay serves or is restoring. Every other socket it opened is destroyed. */
     let current: Link | null = null;
     /** The wait in progress: aborting it ends its admission, its restore and its pause at once. */
-    let waiting: { abort: AbortController; deadline: NodeJS.Timeout } | null = null;
+    let waiting: { abort: AbortController; deadline: NodeJS.Timeout | undefined } | null = null;
     let stdinEnded = false;
     let stdoutFailed = false;
     let stdoutBlocked = false;
@@ -1867,7 +1871,8 @@ const relayWithReattach = (
         io.stderr.write("attach: daemon did not return\n");
         end(ATTACH_EXIT.UNAVAILABLE);
       };
-      const wait = { abort, deadline: setTimeout(expire, policy.maxWaitMs) };
+      // An unbounded wait arms no deadline: `setTimeout` would read Infinity as an immediate one.
+      const wait = { abort, deadline: Number.isFinite(policy.maxWaitMs) ? setTimeout(expire, policy.maxWaitMs) : undefined };
       waiting = wait;
       flow();
       const left = (): number => deadlineAt - Date.now();

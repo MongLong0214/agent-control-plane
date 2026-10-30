@@ -54,19 +54,6 @@ const fixture = (count = 8) => {
 };
 
 /**
- * The official bytes `scripts/merge-pr.mjs` sends for `fixture()`: its draft is the subject, then
- * the `Merged-Head` paragraph naming the head it checked, then the body, through the same
- * `squash-preserve`. Everything after that paragraph is `fixture().expected`'s composition.
- */
-const officialWithMergedHead = (f: ReturnType<typeof fixture>): string => {
-  const path = join(f.dir, "official-merged-head.message");
-  writeFileSync(path, `merge fixture\n\nMerged-Head: ${f.head}\n\nSummary.\n`);
-  const rendered = run("commitlore", ["squash-preserve", `${f.base}..${f.head}`, "--message-file", path, "--json"], f.dir, f.env);
-  expect(rendered.status, rendered.stderr).toBe(0);
-  return path;
-};
-
-/**
  * After merging, `merge-pr.mjs` reads the merge commit back. The `gh` fixture composes no merge
  * commit and answers no API read, so that read-back refuses loudly once the merge call is made;
  * a-merge-names-the-head-it-checked.test.ts reads a real one back.
@@ -162,24 +149,15 @@ describe("hermetic required-check completion", () => {
 // ACP_COMMITLORE_INTEGRATION=1 pnpm exec vitest run tests/process/official-merge-records.test.ts
 const officialIntegration = describe.runIf(process.env.ACP_COMMITLORE_INTEGRATION === "1");
 officialIntegration("the merge helper preserves the official record paragraphs", () => {
-  it("carries eight official records byte-for-byte through the outgoing body and raw Git object", () => {
+  it("sends the validated message unchanged, and the branch's eight official records stay on its commits (#1269)", () => {
     const f = fixture();
     const result = run(process.execPath, [join(ROOT, "scripts/merge-pr.mjs"), "1", "--subject", "merge fixture", "--body-file", f.body], ROOT, f.env);
     expect(result.stdout).toContain(READ_BACK_REFUSED);
     expect(result.status, result.stdout + result.stderr).toBe(1);
-    const official = readFileSync(officialWithMergedHead(f));
-    expect(official.toString("utf8").startsWith(`merge fixture\n\nMerged-Head: ${f.head}\n\nSummary.\n\n`)).toBe(true);
-    expect(official.toString("utf8").slice(`merge fixture\n\nMerged-Head: ${f.head}\n\n`.length))
-      .toBe(readFileSync(f.expected, "utf8").slice("merge fixture\n\n".length));
-    expect(readFileSync(f.message)).toEqual(official);
-    const parsed = JSON.parse(run("commitlore", ["parse", "--message-file", f.message, "--json"], f.dir, f.env).stdout);
-    expect(parsed.blocks).toHaveLength(8);
-    expect(parsed.blocks.map((block: { trailers: { key: string; value: string }[] }) =>
-      block.trailers.find((t) => t.key === "Record-Id")?.value)).toEqual(Array.from({ length: 8 }, (_, i) => `r-fixture${String(i)}`));
-    expect(run("commitlore", ["validate", "--message-file", f.message, "--json"], f.dir, f.env).status).toBe(0);
-    const sha = f.git("commit-tree", f.tree, "-p", f.head, "-F", f.message);
-    const raw = run("git", ["cat-file", "commit", sha], f.dir).stdout;
-    expect(Buffer.from(raw.slice(raw.indexOf("\n\n") + 2))).toEqual(official);
+    expect(readFileSync(f.message, "utf8")).toBe("merge fixture\n\nSummary.\n");
+    const merged = f.git("commit-tree", f.tree, "-p", f.base, "-p", f.head, "-F", f.message);
+    const ids = f.git("log", "--format=%(trailers:key=Record-Id,valueonly)", `${f.base}..${merged}`).split("\n").filter(Boolean);
+    expect(ids.sort()).toEqual(Array.from({ length: 8 }, (_, i) => `r-fixture${String(i)}`));
   });
 });
 
@@ -230,11 +208,7 @@ officialIntegration("preservation is not a semantic exemption", () => {
 
   it("keeps ordinary Git trailer parsing for one record", () => {
     const f = fixture(1);
-    const result = run(process.execPath, [join(ROOT, "scripts/merge-pr.mjs"), "1", "--subject", "merge fixture", "--body-file", f.body], ROOT, f.env);
-    expect(result.stdout).toContain(READ_BACK_REFUSED);
-    expect(result.status, result.stdout + result.stderr).toBe(1);
-    expect(readFileSync(f.message)).toEqual(readFileSync(officialWithMergedHead(f)));
-    const message = readFileSync(f.message, "utf8");
+    const message = readFileSync(f.expected, "utf8");
     const parsed = run("git", ["interpret-trailers", "--parse"], f.dir, f.env, message).stdout;
     expect(message.endsWith(parsed)).toBe(true);
     expect(check(f, message.replace("Limit: synthetic constraint 0", "Limit: synthetic\nwrapped text")).status).toBe(1);

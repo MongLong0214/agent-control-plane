@@ -31,7 +31,7 @@ import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import { residentBaseClone } from "../registry/resident-repositories.ts";
 import type { BlindReviewGate, BlindReviewInvoker, ReviewPacket } from "../review/blind-review.ts";
-import { captureContractChangeReviewContext, storeContractChangeReviewContext } from "../review/contract-change-review-context.ts";
+import { captureContractChangeReviewContext, readCanonicalCtoIdentity, storeContractChangeReviewContext } from "../review/contract-change-review-context.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import {
   type CandidateSnapshot,
@@ -369,6 +369,11 @@ export class CandidatePipeline {
       contractChange = current.value.binding;
       if (current.value.firstActivation) boundRevisions = current.value.workflowRevisions;
     }
+    // A CONTRACT_CHANGE candidate of a project is also the project's canonical CTO identity as it stands
+    // now, read once: a changed entitlement or PRIMARY_CTO binding is a different candidate, reviewed again.
+    const canonicalCtoIdentity = contractChange === undefined || run.projectId === null
+      ? undefined
+      : readCanonicalCtoIdentity(this.db, run.projectId);
 
     const snapshot = participants.length === 0
       ? buildNoRepositoryCandidateSnapshot(
@@ -377,6 +382,7 @@ export class CandidatePipeline {
             contractDigest: run.contractDigest,
             ...(bootstrapPlan === undefined ? {} : { bootstrapPlan }),
             ...(contractChange === undefined ? {} : { contractChange }),
+            ...(canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity }),
           },
           this.clock,
         )
@@ -386,6 +392,7 @@ export class CandidatePipeline {
             contractDigest: run.contractDigest,
             repositories,
             ...(contractChange === undefined ? {} : { contractChange }),
+            ...(canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity }),
           },
           this.clock,
         );
@@ -436,13 +443,13 @@ export class CandidatePipeline {
 
     // #1255 — what a CONTRACT_CHANGE candidate's review is shown beside its PLAN, read by ACP now, at the
     // freeze, and bound to this candidate and this freeze, so the review sees what held when it was frozen.
-    const reviewContext = contractChange === undefined || run.projectId === null
+    const reviewContext = contractChange === undefined || run.projectId === null || canonicalCtoIdentity === undefined
       ? null
       : await captureContractChangeReviewContext(
           { db: this.db, repositories: this.repositories, clock: this.clock },
           {
             runId, projectId: run.projectId, candidateSnapshotDigest: digest, planDigest: contractChange.planDigest,
-            workflowRevisions: boundRevisions,
+            workflowRevisions: boundRevisions, canonicalCtoIdentity,
             freezeId: `freeze_${randomUUID().replace(/-/g, "").slice(0, 24)}`, attemptId: attemptId ?? null,
           },
         );
@@ -537,6 +544,8 @@ export class CandidatePipeline {
     // inspect. Publish the explicit no-op packet through the same production gate, then let
     // CEO confirmation and the daemon own completion exactly as for a repository run.
     if (snapshot.repositories.length === 0) {
+      // The review this candidate had, if any: a refusal at publication records what it refused.
+      let reviewedPlan: Decision<ReviewPacket> | null = null;
       // #246 C2 — except a project-less bootstrap candidate, whose planned outputs are exactly the
       // blind-review input there is. Its review is as automatic as a candidate's (§18.2): the gate
       // reloads the outputs from the PLAN artifact, a verdict other than PASS returns the run to its
@@ -552,6 +561,7 @@ export class CandidatePipeline {
           contractDigest: run.contractDigest,
           attemptId,
         });
+        reviewedPlan = reviewed;
         // Review rounds 1 and 2 (RF-REVIEW-02) — the review is asynchronous, and `plan_submit` can
         // replace the PLAN while it runs or while anything after it is awaited. A candidate whose PLAN
         // was replaced is stale whatever the verdict: a PASS is not P2's review, and a REVISE or BLOCK
@@ -580,6 +590,7 @@ export class CandidatePipeline {
           contractDigest: run.contractDigest,
           attemptId,
         });
+        reviewedPlan = reviewed;
         const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, () =>
           this.contractChangePlanStillCurrent(input.runId, snapshot),
         );
@@ -594,6 +605,7 @@ export class CandidatePipeline {
         if (snapshot.bootstrapPlan !== undefined) {
           const planAtPublication = this.bootstrapPlanStillCurrent(input.runId, snapshot);
           if (!planAtPublication.allowed) {
+            this.recordStaleAfterReview(input.runId, snapshotDigest, attemptId, "PLAN_AT_PUBLICATION", planAtPublication, reviewedPlan);
             return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest,
               detail: { message: planAtPublication.message, evidence: planAtPublication.evidence } });
           }
@@ -601,8 +613,13 @@ export class CandidatePipeline {
         if (snapshot.contractChange !== undefined) {
           const planAtPublication = this.contractChangePlanStillCurrent(input.runId, snapshot);
           if (!planAtPublication.allowed) {
+            this.recordStaleAfterReview(input.runId, snapshotDigest, attemptId, "PLAN_AT_PUBLICATION", planAtPublication, reviewedPlan);
             return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest });
           }
+        }
+        if (reviewedPlan !== null) {
+          const superseded = this.supersededAtPublication(run, snapshot, snapshotDigest, attemptId, reviewedPlan);
+          if (superseded !== null) return superseded;
         }
         const built = this.ceo.buildPacket({
           runId: input.runId,
@@ -725,6 +742,7 @@ export class CandidatePipeline {
       // writes cannot slip between this observation and production-ready publication.
       const stillFreshAfterReview = await this.assertStillFresh(snapshot);
       if (!stillFreshAfterReview.allowed) {
+        this.recordStaleAfterReview(input.runId, snapshotDigest, attemptId, "SOURCE_AT_PUBLICATION", stillFreshAfterReview, reviewed);
         return allow(ReasonCode.OK, {
           stage: "CANDIDATE_STALE",
           reasonCode: stillFreshAfterReview.reasonCode,
@@ -735,9 +753,12 @@ export class CandidatePipeline {
       if (snapshot.contractChange !== undefined) {
         const planAtPublication = this.contractChangePlanStillCurrent(input.runId, snapshot);
         if (!planAtPublication.allowed) {
+          this.recordStaleAfterReview(input.runId, snapshotDigest, attemptId, "PLAN_AT_PUBLICATION", planAtPublication, reviewed);
           return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest });
         }
       }
+      const superseded = this.supersededAtPublication(run, snapshot, snapshotDigest, attemptId, reviewed);
+      if (superseded !== null) return superseded;
 
       const built = this.ceo.buildPacket({
         runId: input.runId,
@@ -870,6 +891,7 @@ export class CandidatePipeline {
       reviewed.reasonCode === ReasonCode.REVIEW_OMITTED_ITEMS_PRESENT;
     const current = stillCurrent(isVerdict);
     if (!current.allowed) {
+      this.recordStaleAfterReview(runId, snapshotDigest, attemptId, "AFTER_REVIEW", current, reviewed);
       return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: current.reasonCode, snapshotDigest,
         detail: { message: current.message, evidence: current.evidence } });
     }
@@ -902,6 +924,73 @@ export class CandidatePipeline {
       snapshotDigest,
       ...(packet ? { review: packet } : {}),
     });
+  }
+
+  /**
+   * A candidate refused as stale once its review had run. The refusal is unchanged — no revision, no
+   * unavailable-review record, no packet — and this row says so: which check found it stale (`stale`),
+   * the candidate, the submission attempt, the review's own outcome and, when the review carried a
+   * packet, that reviewer's binding generation. Built field by field, never spread from a denial. An
+   * answer the review gate did not keep has the gate's own BLIND_REVIEW_REJECTED row naming its reviewer.
+   */
+  private recordStaleAfterReview(
+    runId: string,
+    snapshotDigest: string,
+    attemptId: string,
+    stale: "AFTER_REVIEW" | "SOURCE_AT_PUBLICATION" | "PLAN_AT_PUBLICATION" | "CANDIDATE_AT_PUBLICATION",
+    refusal: Decision<unknown>,
+    reviewed: Decision<ReviewPacket> | null,
+  ): void {
+    const packet = reviewed === null ? null : reviewed.allowed ? reviewed.value : reviewed.evidence["packet"];
+    const generation = (packet as Partial<ReviewPacket> | null | undefined)?.reviewerRoleBindingGeneration;
+    this.audit.record({
+      kind: "BLIND_REVIEW_REJECTED",
+      runId,
+      reasonCode: refusal.reasonCode,
+      evidence: {
+        candidateSnapshotDigest: snapshotDigest,
+        attemptId,
+        stale,
+        reviewReasonCode: reviewed?.reasonCode ?? null,
+        reviewerRoleBindingGeneration: typeof generation === "number" ? generation : null,
+      },
+    });
+  }
+
+  /**
+   * A reviewed candidate that is no longer the run's candidate is stale at publication: a later freeze
+   * replaced it while this submission awaited (another attempt re-froze after its lease lapsed), or the
+   * canonical CTO identity it froze is no longer the project's (a runtime move with no re-freeze yet).
+   * The production gate would refuse the first and publish a superseded identity for the second, so the
+   * refusal is recorded here with the candidate, attempt and reviewer it names. Null while current.
+   */
+  private supersededAtPublication(
+    run: RunRow,
+    snapshot: CandidateSnapshot,
+    snapshotDigest: string,
+    attemptId: string,
+    reviewed: Decision<ReviewPacket>,
+  ): Decision<PipelineOutcome> | null {
+    const current = this.runs.currentCandidate(run.runId);
+    let refusal: { message: string; evidence: Evidence } | null = null;
+    if (current !== snapshotDigest) {
+      refusal = { message: "candidate is not the run's current candidate", evidence: { runId: run.runId, supplied: snapshotDigest, current } };
+    } else if (snapshot.canonicalCtoIdentity !== undefined && run.projectId !== null) {
+      // Read as the freeze reads it; a candidate that froze no identity is not asked.
+      const frozenIdentityDigest = digestOf(snapshot.canonicalCtoIdentity);
+      const currentIdentityDigest = digestOf(readCanonicalCtoIdentity(this.db, run.projectId));
+      if (frozenIdentityDigest !== currentIdentityDigest) {
+        refusal = {
+          message: "the canonical CTO identity this candidate froze is no longer the project's",
+          evidence: { runId: run.runId, candidateSnapshotDigest: snapshotDigest, frozenIdentityDigest, currentIdentityDigest },
+        };
+      }
+    }
+    if (refusal === null) return null;
+    this.recordStaleAfterReview(run.runId, snapshotDigest, attemptId, "CANDIDATE_AT_PUBLICATION",
+      deny(ReasonCode.EVIDENCE_STALE, refusal.message, refusal.evidence), reviewed);
+    return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: ReasonCode.EVIDENCE_STALE, snapshotDigest,
+      detail: refusal });
   }
 
   /** Durable, per-run fence for the whole asynchronous verification/review attempt. */
