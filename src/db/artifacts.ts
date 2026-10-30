@@ -760,6 +760,8 @@ const blindReviewEvidenceSchema = z
       .strict(),
     coveredRepositories: z.array(z.string()),
     coveredFiles: z.array(z.string()),
+    // #1259 — well-formed claims for items the reviewer was not assigned: recorded, never credited.
+    extraClaims: z.array(z.string()).min(1).optional(),
     omittedItems: z.array(z.string()),
     verdict: z.enum(["PASS", "REVISE", "BLOCK"]),
     findings: z.array(z.object({}).passthrough()),

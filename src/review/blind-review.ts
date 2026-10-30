@@ -112,6 +112,10 @@ const storedFindings = (findings: readonly ReviewFinding[]): ReviewFinding[] =>
     return redacted ? { ...value, redacted: true } : finding;
   });
 
+/** Extra claims are reviewer text: redacted per path segment, so a shaped one cannot refuse the packet. */
+const storedExtraClaims = (claims: readonly string[]): string[] =>
+  redactCredentialValues([...claims], { path: ["extraClaims"], store: "artifact" }).value;
+
 export interface BootstrapReviewContext {
   deployment: BootstrapRuntimeObservation | null;
   lifecycle: ReturnType<typeof bootstrapCodeGuarantees>;
@@ -161,6 +165,11 @@ export interface ReviewPacket {
   };
   coveredRepositories: string[];
   coveredFiles: string[];
+  /**
+   * #1259 — present only when a reviewer claimed `<identity>:<path>` items it was not assigned, such
+   * as a file read for context. Recorded as claimed, credential shapes redacted; never coverage.
+   */
+  extraClaims?: string[];
   omittedItems: string[];
   verdict: ReviewVerdict;
   findings: ReviewFinding[];
@@ -608,7 +617,7 @@ export class BlindReviewGate {
         const reviewer = await this.constituteReviewer(request);
         if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
         rememberReviewer(reviewer.value);
-        outcome = await this.singleReview(request, prompt, reviewer.value);
+        outcome = await this.singleReview(request, prompt, reviewer.value, expected);
       }
 
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
@@ -671,6 +680,7 @@ export class BlindReviewGate {
         inputs,
         this.buildBootstrapPlanPrompt(inputs, expected, context),
         reviewer.value,
+        expected,
       );
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
       // Review round 1 (RF-REVIEW-02) — the reviewer answered asynchronously, and `plan_submit` may
@@ -730,6 +740,7 @@ export class BlindReviewGate {
         inputs,
         this.buildContractChangePrompt(inputs, expected),
         reviewer.value,
+        expected,
       );
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
       // As for a bootstrap PLAN: reloaded after the reviewer answered, before the verdict is kept.
@@ -800,6 +811,7 @@ export class BlindReviewGate {
       reviewPolicies: input.reviewPolicies,
       reviewerInputs: outcome.reviewerInputs,
       egressEvidence: outcome.egressEvidence,
+      extraClaims: outcome.extraClaims,
       bootstrapPlan: input.bootstrapPlan,
       ...(input.bootstrapPlanIntentDigest === undefined ? {} : { bootstrapPlanIntentDigest: input.bootstrapPlanIntentDigest }),
       contractChange: input.contractChange,
@@ -1410,6 +1422,7 @@ export class BlindReviewGate {
     request: ReviewSubject,
     prompt: string,
     reviewer: ReviewerBinding,
+    expected: ReadonlyArray<{ identity: string; path: string }>,
   ): Promise<Decision<ReviewOutcome>> {
     const adapter = this.providers.requireForRole(reviewer.preference.provider, Role.BLIND_REVIEWER);
     const capacity = await this.admitReviewer(reviewer.preference.provider);
@@ -1442,13 +1455,18 @@ export class BlindReviewGate {
     }
     const attested = this.assertInvocationIdentity(request.runId, reviewer, result.providerSessionId);
     if (!attested.allowed) return attested as Decision<ReviewOutcome>;
+    // The chunk rule (#1259), with the match `validateCoverage` credits by.
+    const assigned = new Set(expected.map((target) => normalizeCoverageKey(`${target.identity}:${target.path}`)));
+    const coverage = partitionCoverageClaims(parsed.coveredFiles, (claim) => assigned.has(normalizeCoverageKey(claim)));
+    if (!coverage.allowed) return coverage as Decision<ReviewOutcome>;
     return allow(ReasonCode.OK, {
-      verdict: parsed,
+      verdict: { ...parsed, coveredFiles: coverage.value.files },
       providerSessionId: result.providerSessionId!,
       reviewer,
       chunkReviewers: [],
       egressEvidence: isolation.value,
       reviewerInputs: [transmitted.value],
+      extraClaims: coverage.value.extraClaims,
     });
   }
 
@@ -1489,6 +1507,7 @@ export class BlindReviewGate {
     }
     const coveredFiles = new Set<string>();
     const coveredSlices = new Set<string>();
+    const extraClaims = new Set<string>();
     const expectedSlices = new Map<string, string>();
     for (const part of chunks.flat()) {
       for (const target of part.coverageTargets) expectedSlices.set(target.slice, target.file);
@@ -1568,6 +1587,7 @@ export class BlindReviewGate {
       if (!chunkCoverage.allowed) return chunkCoverage as Decision<ReviewOutcome>;
       for (const file of chunkCoverage.value.files) coveredFiles.add(file);
       for (const slice of chunkCoverage.value.slices) coveredSlices.add(slice);
+      for (const claim of chunkCoverage.value.extraClaims) extraClaims.add(claim);
       omitted.push(...parsed.omittedItems);
       findings.push(...parsed.findings);
       worst = worseVerdict(worst, parsed.verdict);
@@ -1669,6 +1689,7 @@ export class BlindReviewGate {
       chunkReviewers,
       egressEvidence,
       reviewerInputs,
+      extraClaims: [...extraClaims],
     });
   }
 
@@ -1789,6 +1810,9 @@ export class BlindReviewGate {
       "```",
       ...VERDICT_SCHEMA_PROMPT,
       "`coveredFiles` must list every file you actually examined, formatted `<repository-identity>:<path>`.",
+      ...(chunk
+        ? ["In this chunk, `coveredFiles` lists only files named under \"## Actual diff\" above; other reviewers cover the other chunks' files."]
+        : []),
       "`omittedItems` must list anything you could not examine. Do not return PASS with a non-empty omission list.",
     );
     return sections.filter(Boolean).join("\n");
@@ -1957,6 +1981,7 @@ export class BlindReviewGate {
     reviewPolicies: RepositoryReviewPolicy[];
     reviewerInputs: TransmittedReviewerInput[];
     egressEvidence: ReviewerEgressRecord[];
+    extraClaims: readonly string[];
     /** A BOOTSTRAP_PLAN review's binding; null for a candidate review, whose packet has no such key. */
     bootstrapPlan: BootstrapPlanBinding | null;
     bootstrapPlanIntentDigest?: string;
@@ -2002,6 +2027,7 @@ export class BlindReviewGate {
         ),
       ],
       coveredFiles: [...new Set(input.raw.coveredFiles)],
+      ...(input.extraClaims.length === 0 ? {} : { extraClaims: storedExtraClaims(input.extraClaims) }),
       omittedItems: [...new Set(input.raw.omittedItems)],
       verdict: input.raw.verdict,
       findings: storedFindings(input.raw.findings),
@@ -2498,6 +2524,8 @@ interface ReviewOutcome {
   egressEvidence: ReviewerEgressRecord[];
   /** Complete transmitted reviewer input committed in invocation order; no provider answer is used as proof. */
   reviewerInputs: TransmittedReviewerInput[];
+  /** Well-formed coverage claims for items the reviewer was not assigned: recorded, never credited. */
+  extraClaims: string[];
 }
 
 /** One reviewer call's transmitted input: its digest and the channels it covers (#1274). */
@@ -2843,27 +2871,47 @@ const coverageTargetsFor = (part: ReviewChunkInput): SliceCoverageTarget[] =>
         slice: `${part.identity}:${path}:whole`,
       }));
 
+/**
+ * A reviewer's coverage claims sorted against what it was assigned (#1259). An assigned claim is
+ * coverage. A well-formed `<identity>:<path>` claim for anything else, such as a file read for
+ * context, is an extra claim: recorded in the packet, never credited, and it does not discard the
+ * review. A claim that is not `<identity>:<path>` refuses the review.
+ */
+const partitionCoverageClaims = (
+  claims: readonly string[],
+  isAssigned: (claim: string) => boolean,
+): Decision<{ files: string[]; extraClaims: string[] }> => {
+  const files: string[] = [];
+  const extraClaims: string[] = [];
+  for (const claim of new Set(claims)) {
+    if (isAssigned(claim)) {
+      files.push(claim);
+      continue;
+    }
+    const parsed = splitCoverageKey(claim);
+    if (!parsed || claim !== `${parsed.identity}:${parsed.path}`) {
+      return deny(ReasonCode.COVERAGE_INCOMPLETE, "reviewer coverage claim is not <identity>:<path>", { claim });
+    }
+    extraClaims.push(claim);
+  }
+  return allow(ReasonCode.OK, { files, extraClaims });
+};
+
 const validateChunkCoverage = (
   claims: readonly string[],
   chunk: readonly ReviewChunkInput[],
-): Decision<{ files: string[]; slices: string[] }> => {
+): Decision<{ files: string[]; slices: string[]; extraClaims: string[] }> => {
   const assigned = new Set(chunk.flatMap((part) => part.files.map((path) => `${part.identity}:${path}`)));
-  for (const claim of claims) {
-    const parsed = splitCoverageKey(claim);
-    if (!parsed || claim !== `${parsed.identity}:${parsed.path}` || !assigned.has(claim)) {
-      return deny(ReasonCode.COVERAGE_INCOMPLETE, "reviewer claimed coverage outside its assigned chunk", {
-        claim,
-        assigned: [...assigned],
-      });
-    }
-  }
-  const files = [...new Set(claims)];
+  const partitioned = partitionCoverageClaims(claims, (claim) => assigned.has(claim));
+  if (!partitioned.allowed) return partitioned as Decision<never>;
+  const { files, extraClaims } = partitioned.value;
+  // Only assigned claims reach the slices, so an extra claim can never cover an assigned range.
   const claimed = new Set(files);
   const slices = chunk
     .flatMap(coverageTargetsFor)
     .filter((target) => claimed.has(target.file))
     .map((target) => target.slice);
-  return allow(ReasonCode.OK, { files, slices: [...new Set(slices)] });
+  return allow(ReasonCode.OK, { files, slices: [...new Set(slices)], extraClaims });
 };
 
 const worseVerdict = (a: ReviewVerdict, b: ReviewVerdict): ReviewVerdict => {
