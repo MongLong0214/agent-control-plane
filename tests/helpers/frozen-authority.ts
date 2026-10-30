@@ -61,14 +61,17 @@ export const RECEIPT_BYTES_SHA256 =
  *
  * `src/db/schema-v53.sql` is likewise `git show 24d49f94:src/db/schema.sql` (#1258's v53, frozen as the
  * prerequisite of #1189's v54 run-state exits step), and carries that file's git blob id.
+ *
+ * `src/db/schema-v54.sql` is likewise `git show 0c15e2f3:src/db/schema.sql` (#1189's v54 run-state exits, frozen
+ * as the prerequisite of #1189 B5's v55 approved-run revision re-entry), and carries that file's git blob id.
  */
 export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob?: string }> = [
   {
     path: "src/db/migrations.ts",
     // v53 appends verification history and freezes v52's released schema; #1189's v54 run-state exits
-    // step freezes v53's. Replayed lineage and compiled upgrades still bind the unchanged historical SQL,
-    // trace and receipt pins below.
-    sha256: "d302fd8e65e8727594e14895467f9ccb29ce393c9527446af7548c2f1bf8e07a",
+    // step freezes v53's, and #1189 B5's v55 (the two state guards) freezes v54's. Replayed lineage and
+    // compiled upgrades still bind the unchanged historical SQL, trace and receipt pins below.
+    sha256: "1a0985c2ad8f1953b799dc8d11ede590ae7bc72ece9dc8a692b133c2829c0e14",
   },
   {
     path: "src/db/schema-v37.sql",
@@ -121,6 +124,11 @@ export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob
     path: "src/db/schema-v53.sql",
     sha256: "404b748e9a33b4573f971be6b56ce22cd7fbd8899b909ad31a11613737f49cd5",
     gitBlob: "9d37653bd7129313560f8c5259587a4d02844a06",
+  },
+  {
+    path: "src/db/schema-v54.sql",
+    sha256: "d239afdd0e884ea2d451a4bee3fb81757d02273b464b95822408ac7b59219814",
+    gitBlob: "a99a02be889d4d404b8d5a590a8eab3ed71ea383",
   },
   {
     path: "tests/fixtures/schema-v13.sql",

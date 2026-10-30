@@ -560,16 +560,17 @@ const seedAsV47 = (path: string): { kept: Row[]; withdrawnPreV48: Row; removedPr
 };
 
 describe("S1: the v47 → v48 step on the released v47 image", () => {
-  it("is the step from 47, followed by v49, v50, v51, v52, v53 and v54, and v47 keeps the full checksum it shipped with", () => {
-    expect(SCHEMA_VERSION).toBe(54);
+  it("is the step from 47, followed by v49, v50, v51, v52, v53, v54 and v55, and v47 keeps the full checksum it shipped with", () => {
+    expect(SCHEMA_VERSION).toBe(55);
     expect(MIGRATIONS.find((step) => step.fromVersion === 47)).toMatchObject({ id: "v48-owner-decision-supersede-guard", fromVersion: 47, toVersion: 48 });
-    expect(MIGRATIONS.slice(-6)).toMatchObject([
+    expect(MIGRATIONS.slice(-7)).toMatchObject([
       { id: "v49-branch-publish-receipts", fromVersion: 48, toVersion: 49 },
       { id: "v50-post-merge-verification-reentry", fromVersion: 49, toVersion: 50 },
       { id: "v51-durable-recipient-delivery", fromVersion: 50, toVersion: 51 },
       { id: "v52-resident-project-provisioning", fromVersion: 51, toVersion: 52 },
       { id: "v53-verification-result-history", fromVersion: 52, toVersion: 53 },
       { id: "v54-run-state-exits", fromVersion: 53, toVersion: 54 },
+      { id: "v55-approved-run-revision-reentry", fromVersion: 54, toVersion: 55 },
     ]);
     expect(MIGRATIONS.find((step) => step.toVersion === 47)!.checksum()).toBe(V47_BASE_CHECKSUM);
   });

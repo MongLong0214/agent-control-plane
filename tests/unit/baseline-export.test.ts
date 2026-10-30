@@ -1156,6 +1156,7 @@ describe("baseline boundary contracts", () => {
       "v52-resident-project-provisioning",
       "v53-verification-result-history",
       "v54-run-state-exits",
+      "v55-approved-run-revision-reentry",
     ]);
   });
 

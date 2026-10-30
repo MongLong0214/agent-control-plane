@@ -9,6 +9,7 @@ import { MIGRATIONS } from "../../src/db/migrations.ts";
 import { RunState } from "../../src/domain/types.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { releasedChainImage } from "../helpers/released-chain-image.ts";
+import { takeBackV55 } from "../helpers/released-v50-schema.ts";
 import { privateStatePath, schemaRowsOf, userVersionOf } from "../helpers/released-v44-schema.ts";
 
 afterAll(cleanupTempDirs);
@@ -91,7 +92,7 @@ describe("#1189 run-state exits, as one schema step on a v53 database", () => {
   it("the step follows v53, and v52 and v53 are frozen byte for byte, v52 with the checksum it was released with", () => {
     const migration = step();
     expect(migration).toMatchObject({ id: STEP_ID, fromVersion: FROM, toVersion: FROM + 1 });
-    expect(MIGRATIONS.at(-2)).toMatchObject({ id: "v53-verification-result-history", fromVersion: 52, toVersion: 53 });
+    expect(MIGRATIONS.find((entry) => entry.toVersion === FROM)).toMatchObject({ id: "v53-verification-result-history", fromVersion: 52, toVersion: 53 });
     const blob = (bytes: Buffer): string => createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
     const v52 = readFileSync(new URL("../../src/db/schema-v52.sql", import.meta.url));
     expect(blob(v52)).toBe("4d92c12346efdb6096955d66fd83933c3a3a9eb5");
@@ -124,9 +125,12 @@ describe("#1189 run-state exits, as one schema step on a v53 database", () => {
     expect(after.filter((row) => !touched.includes(row.name))).toEqual(before.schema.filter((row) => !touched.includes(row.name)));
     expect(after.filter((row) => touched.includes(row.name) && !before.schema.some((old) => old.name === row.name && old.sql === row.sql))
       .map((row) => row.name).sort()).toEqual([...touched].sort());
-    // What a fresh database at this build holds is what the step left.
+    // What a fresh database at this build holds is what the step left, once v55's later change to the two
+    // guards is taken back to v54's frozen definitions.
     const freshPath = privateStatePath("acp-v54-fresh-");
     new Db(freshPath).close();
+    const taken = new Database(freshPath);
+    try { takeBackV55(taken); } finally { taken.close(); }
     const fresh = schemaRowsOf(freshPath);
     for (const name of touched) {
       expect(after.find((row) => row.name === name)?.sql).toBe(fresh.find((row) => row.name === name)?.sql);

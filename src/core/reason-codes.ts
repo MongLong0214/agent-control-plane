@@ -401,6 +401,10 @@ export const ReasonCode = {
   MERGE_BRANCH_PROFILE_UNSATISFIED: "MERGE_BRANCH_PROFILE_UNSATISFIED",
   MERGE_CLAIM_INVALID: "MERGE_CLAIM_INVALID",
   MERGE_ORDER_VIOLATION: "MERGE_ORDER_VIOLATION",
+  // #1189 B5 — GitHub says the pull does not merge cleanly, or a check the pinned manifest declares already
+  // failed on the candidate head; both refuse before any merge reservation, and the candidate goes back.
+  MERGE_CONFLICT: "MERGE_CONFLICT",
+  MERGE_CHECK_FAILED: "MERGE_CHECK_FAILED",
   GATE_EVIDENCE_NOT_BACKED: "GATE_EVIDENCE_NOT_BACKED",
   POST_MERGE_CHECKS_NOT_DECLARED: "POST_MERGE_CHECKS_NOT_DECLARED",
   POST_MERGE_VERIFICATION_FAILED: "POST_MERGE_VERIFICATION_FAILED",

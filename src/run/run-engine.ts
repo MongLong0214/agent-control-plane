@@ -113,6 +113,15 @@ export interface CompletionAuthoritySet {
 
 const ISSUED_COMPLETION_AUTHORITIES = new Set<string>();
 
+/** #1189 B5 — the refusal `RunEngine.returnApprovedCandidate` sends an approved candidate back for. */
+export interface ApprovedCandidateReturn {
+  candidateSnapshotDigest: string;
+  attemptId: string;
+  reasonCode: ReasonCode;
+  reason: string;
+  unrecoverable: boolean;
+}
+
 export interface CreateRunInput {
   projectId?: string | null;
   kind?: RunKind;
@@ -1475,6 +1484,99 @@ export class RunEngine {
           });
         }
       }
+      return allow(ReasonCode.OK, this.require(runId));
+    });
+  }
+
+  /**
+   * #1189 B5 — an approved candidate the daemon finalizer was refused before anything merged, and that will
+   * not merge as it is, leaves CEO approval in one transaction: the approval is recorded as invalidated
+   * (CEO_APPROVAL_INVALIDATED, naming the CONFIRM it voids), the candidate and every artifact bound to it are
+   * invalidated as `invalidateCandidate` does, so that CONFIRM names nothing current, and the run moves
+   * CEO_APPROVED or MERGING → REVISION_REQUIRED. A revision then goes → ACTIVE with a REVISION_REQUEST to the
+   * pinned owner while that owner is current, and otherwise waits in REVISION_REQUIRED for a dispatch; an
+   * unrecoverable refusal ends → FAILED with its reason. Only the refused candidate is ever invalidated, and
+   * never while the run holds a merge_execute receipt: a merge that may have landed stays on the post-merge
+   * path. That receipt check is this method's alone; the schema v55 guard opens the edge and reads no receipt.
+   * A refusal anywhere in the body (an audit, the state edges, the request) rolls back every write before it.
+   */
+  returnApprovedCandidate(runId: string, input: ApprovedCandidateReturn): Decision<RunRow> {
+    return this.db.txDecision(() => {
+      const run = this.require(runId);
+      if (run.state !== RunState.CEO_APPROVED && run.state !== RunState.MERGING) {
+        return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, `an approved candidate is returned only from CEO_APPROVED or MERGING, not ${run.state}`, {
+          runId,
+          state: run.state,
+        });
+      }
+      if (this.currentCandidate(runId) !== input.candidateSnapshotDigest) {
+        return deny(ReasonCode.EVIDENCE_STALE, "the refused candidate is no longer the run's current candidate", {
+          runId,
+          candidateSnapshotDigest: input.candidateSnapshotDigest,
+          currentCandidateSnapshotDigest: this.currentCandidate(runId),
+        });
+      }
+      if (this.db.get(`SELECT 1 AS held FROM github_receipts WHERE run_id = ? AND operation = 'merge_execute' LIMIT 1`, [runId])) {
+        return deny(ReasonCode.FINALIZATION_COMPENSATION_REQUIRED, "a merge may have landed, so the approval stays on the post-merge path", {
+          runId,
+        });
+      }
+      const disposition = input.unrecoverable ? "UNRECOVERABLE" : "REVISION";
+      const confirmed = this.audit.forRun(runId).reverse().find((entry) =>
+        entry.kind === "CEO_DECISION" &&
+        entry.evidence.decision === "CONFIRM" &&
+        entry.evidence.candidateSnapshotDigest === input.candidateSnapshotDigest);
+      const invalidated = this.audit.record({
+        kind: "CEO_APPROVAL_INVALIDATED",
+        runId,
+        projectId: run.projectId,
+        reasonCode: input.reasonCode,
+        evidence: {
+          from: run.state,
+          candidateSnapshotDigest: input.candidateSnapshotDigest,
+          attemptId: input.attemptId,
+          disposition,
+          approvedBy: confirmed?.sessionId ?? null,
+          approvedAt: confirmed?.at ?? null,
+          reason: input.reason,
+        },
+      });
+      if (!invalidated.allowed) return invalidated as Decision<RunRow>;
+      const evidence = {
+        candidateSnapshotDigest: input.candidateSnapshotDigest,
+        attemptId: input.attemptId,
+        failureReasonCode: input.reasonCode,
+        disposition,
+      };
+      this.invalidateCandidateInTx(runId, input.reason, evidence);
+      const revision = this.transition(runId, RunState.REVISION_REQUIRED, input.reason, evidence);
+      if (!revision.allowed) return revision;
+      if (input.unrecoverable) return this.transition(runId, RunState.FAILED, input.reason, evidence);
+      if (!run.ownerSessionId || run.ownerBindingGeneration == null || !run.ownerRoleKey ||
+          !this.assertOwner(runId, run.ownerSessionId, run.ownerBindingGeneration).allowed) {
+        return allow(ReasonCode.OK, this.require(runId));
+      }
+      const resumed = this.transition(runId, RunState.ACTIVE, "approved candidate returned for revision", evidence);
+      if (!resumed.allowed) return resumed;
+      // One request per revision cycle (the REVISION_REQUIRED edge above counted it), as a CEO FINAL_REVISE's is;
+      // a request the outbox refuses undoes the whole return, so the run is never ACTIVE with nobody told.
+      const requested = this.outbox.enqueue({
+        idempotencyKey: `approved-candidate-returned:${runId}:r${revision.value.revisionCount}:${input.candidateSnapshotDigest}`,
+        roleKey: run.ownerRoleKey,
+        bindingGeneration: run.ownerBindingGeneration,
+        targetSessionId: run.ownerSessionId,
+        runId,
+        kind: MessageKind.REVISION_REQUEST,
+        payload: {
+          runId,
+          reasonCode: input.reasonCode,
+          candidateSnapshotDigest: input.candidateSnapshotDigest,
+          reason: input.reason,
+          action: "fix the refusal and freeze a new candidate; it is verified, reviewed and confirmed again. " +
+            "A branch already published at the refused candidate is never moved, so publish the new one on a new branch.",
+        },
+      });
+      if (!requested.allowed) return requested as Decision<RunRow>;
       return allow(ReasonCode.OK, this.require(runId));
     });
   }

@@ -134,7 +134,7 @@ describe("v43: the bootstrap application record (#246 C3)", () => {
     const migrated = openDb(path);
     try {
       // #246 B2-b adds v44, #512 v45, #1094 v46 and SEC-OD1 v47 and v48 v49 (#512 S-PUSH) and v50 (post-merge recovery) on top; this row is about v43, which the chain still runs in order.
-      expect(SCHEMA_VERSION).toBe(54);
+      expect(SCHEMA_VERSION).toBe(55);
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(migrated.all<{ version: number; migration_id: string }>(
         `SELECT version, migration_id FROM schema_migrations WHERE version >= 42 ORDER BY version`,
@@ -152,6 +152,7 @@ describe("v43: the bootstrap application record (#246 C3)", () => {
         { version: 52, migration_id: "v52-resident-project-provisioning" },
         { version: 53, migration_id: "v53-verification-result-history" },
         { version: 54, migration_id: "v54-run-state-exits" },
+        { version: 55, migration_id: "v55-approved-run-revision-reentry" },
       ]);
       const objects = (type: string) =>
         migrated.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = ?`, [type]).map((row) => row.name);

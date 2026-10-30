@@ -1127,13 +1127,16 @@ describe("post-merge verification cannot be made vacuous (§24.7)", () => {
       },
     });
     let observations = 0;
+    // #1189 B5 — the merge reads the declared check on the head once itself (a failure there refuses the
+    // merge); what this test counts is post-merge verification's reads, so counting starts once merged.
+    let merged = false;
     const request = fixture.github.request.bind(fixture.github);
     fixture.github.request = async <T>(
       method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
       path: string,
       body?: unknown,
     ) => {
-      if (method === "GET" && /\/commits\/[^/]+\/check-runs/.test(path) && path.includes("check_name=project-ci")) {
+      if (merged && method === "GET" && /\/commits\/[^/]+\/check-runs/.test(path) && path.includes("check_name=project-ci")) {
         observations += 1;
         if (observations === 2) {
           fixture.github.setTrustedPostMergeCheck(
@@ -1147,6 +1150,7 @@ describe("post-merge verification cannot be made vacuous (§24.7)", () => {
     };
 
     const mergeSha = await mergeForReal(fixture);
+    merged = true;
     expect(mergeSha).toBe(fixture.head);
     const verified = await fixture.harness.cp.github.postMergeVerify(
       fixture.runId,

@@ -2276,12 +2276,24 @@ export class Daemon {
     await this.cp.workerCheckouts.ensureAll();
   }
 
-  private async resumeApprovedRuns(): Promise<string[]> {
+  /**
+   * The finalization sweep, once at start and then on every watchdog tick. #1189 B5 (CEO ruling 5) — a run
+   * whose last attempt was refused before anything merged waits out that refusal's backoff, and one that
+   * reached its retry cap is not tried again (`ApprovedRunFinalizer.retryDue`): both are durable, so a
+   * restart neither shortens the wait nor restarts the count. Only an explicit `finalizeApprovedRun` (the one a
+   * CONFIRM triggers) skips the wait; its refusals still count. A cap notice no CEO could take is still owed,
+   * and a pass over a run it does not retry sends it once a CEO is bound.
+   */
+  async resumeApprovedRuns(): Promise<string[]> {
     const resumed: string[] = [];
     const stalled: string[] = [];
     const states = [RunState.CEO_APPROVED, RunState.MERGING, RunState.POST_MERGE_VERIFYING, RunState.BLOCKED_POST_MERGE];
     for (const state of states) {
       for (const run of this.cp.runs.list({ state })) {
+        if (!this.#finalizer.retryDue(run.runId)) {
+          this.#finalizer.deliverOwedHandOff(run.runId);
+          continue;
+        }
         const finalized = await this.finalizeApprovedRun(run.runId);
         if (finalized.allowed) resumed.push(run.runId);
         // A run blocked earlier in this pass is listed again here, so its first refusal is seen at once.
