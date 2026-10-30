@@ -236,6 +236,8 @@ const serializedKind = (field: EvidenceField | undefined): "jsonl" | "json" | un
 const REPOSITORY_PATH_FIELDS: Readonly<Record<EvidenceField["store"], ReadonlySet<string>>> = {
   artifact: new Set([
     "repositories.touchedPaths", // CANDIDATE_SNAPSHOT
+    "repositories.imports.path", // CANDIDATE_SNAPSHOT, #1232
+    "repositories.refusedImports.path",
     "coveredFiles", // BLIND_REVIEW coverage keys, `<identity>:<path>`
     "extraClaims", // BLIND_REVIEW claims outside the assigned items, same `<identity>:<path>` shape (#1259)
     "findings.path", // BLIND_REVIEW finding location
@@ -254,6 +256,10 @@ const REPOSITORY_PATH_FIELDS: Readonly<Record<EvidenceField["store"], ReadonlySe
     "paths", // a worker turn's owned, changed or dirty paths; a check's workflow files
     "declared.paths",
     "writeTarget.paths",
+    // #1232 — a task's import manifest: in its recorded write target, as declared, and in its receipt.
+    "declared.imports.path",
+    "writeTarget.imports.path",
+    "imports.path",
     "ignoredChanges.paths",
     "workflow.path",
     "workflows.path",
