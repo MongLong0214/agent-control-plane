@@ -191,8 +191,10 @@ import {
 import {
   admitPinnedHolderGrandchild,
   admitRuntimeLineage,
+  confirmAdmittedGrandchild,
   defaultProcessLineageReader,
   recordedStartIsLive,
+  type AdmittedGrandchild,
   type HolderGrandchildRefusal,
   type ProcessLineageReader,
 } from "../session/runtime-lineage.ts";
@@ -3874,10 +3876,12 @@ export const SESSION_LAUNCH_CREDENTIAL_REFUSED = "SESSION_LAUNCH_CREDENTIAL_REFU
 
 /**
  * O4 — why a hand-over was refused, as the audit records it. `PEER_UNREADABLE`: the connection's kernel
- * peer could not be established as a direct, same-uid peer. The rest name the entry: no pin on a driven
- * entry, a lineage refusal (`HolderGrandchildRefusal`), a credential that no longer authenticates its
- * session at its incarnation (`CREDENTIAL_NOT_CURRENT`) or that nothing can verify, and an entry withdrawn
- * or replaced while it was being admitted.
+ * peer could not be established as a direct, same-uid peer, at the connection, at the request or at the
+ * hand-over. `PEER_CHANGED`: the kernel named another peer at the request than at the connection, or
+ * another pid or process at the hand-over than the one admitted. The rest name the entry: no pin on a
+ * driven entry, a lineage refusal (`HolderGrandchildRefusal`), a credential that no longer authenticates
+ * its session at its incarnation (`CREDENTIAL_NOT_CURRENT`) or that nothing can verify, and an entry
+ * withdrawn or replaced while it was being admitted.
  */
 type LaunchRefusal =
   | HolderGrandchildRefusal
@@ -3888,39 +3892,54 @@ type LaunchRefusal =
   | "ENTRY_REPLACED";
 
 type LaunchAdmission =
-  | { allowed: true; pin: SessionLaunchPin | undefined }
+  | { allowed: true; pin: SessionLaunchPin | undefined; grandchild: AdmittedGrandchild | null }
   | { allowed: false; refusal: LaunchRefusal; evidence?: Record<string, number> };
 
 /**
  * O4 — whether `launch` may be handed to this connection. Writes nothing and reads the request for
  * nothing but the id that found `launch`.
  *
- * A driven-turn entry needs the pin its spawn wrote, and the kernel peer must be the pinned holder's
- * grandchild (`admitPinnedHolderGrandchild`): holder → CLI → peer. The CLI's own identity is not pinned,
- * so any child of the holder's child passes. An interactive spawn's entry has no pin and no lineage to
- * check, and keeps the earlier same-uid, id-only path. Either way the credential must still
- * authenticate its session at the incarnation it names: an entry holding an earlier epoch's secret, or
- * naming an incarnation the session no longer has, is refused, and so is every entry when no registry
- * was given to verify it against.
+ * A driven-turn entry needs the pin its spawn wrote. The kernel is asked again who the peer is now
+ * (`peerNow`): on macOS that is the last process to use the socket, the one that sent the request. It
+ * must be the process the kernel named when the connection was accepted, so a socket handed to another
+ * process between the two is refused; and it must be the pinned holder's grandchild
+ * (`admitPinnedHolderGrandchild`): holder → CLI → peer, with the peer's start token bound to the
+ * admission for the hand-over to compare. The CLI's own identity is not pinned, so any child of the
+ * holder's child passes. An interactive spawn's entry has no pin and no lineage to check, and keeps the
+ * earlier same-uid, id-only path. Either way the credential must still authenticate its session at the
+ * incarnation it names: an entry holding an earlier epoch's secret, or naming an incarnation the session
+ * no longer has, is refused, and so is every entry when no registry was given to verify it against.
  */
 const admitLaunch = (
   launch: PendingLaunchCredential,
-  peer: Decision<AuthenticatedClaimPeer>,
+  connected: Decision<AuthenticatedClaimPeer>,
+  peerNow: () => Decision<AuthenticatedClaimPeer>,
   sessions: SessionLaunchChannelOptions["sessions"],
 ): LaunchAdmission => {
   const { credential } = launch;
   const pin = credential.pin;
+  let grandchild: AdmittedGrandchild | null = null;
   if (launch.driven) {
     if (pin === undefined) return { allowed: false, refusal: "PIN_ABSENT" };
-    if (!peer.allowed) return { allowed: false, refusal: "PEER_UNREADABLE" };
-    const lineage = admitPinnedHolderGrandchild(peer.value.peerPid, pin);
+    const requester = peerNow();
+    if (!connected.allowed) return { allowed: false, refusal: "PEER_UNREADABLE" };
+    if (!requester.allowed) return { allowed: false, refusal: "PEER_UNREADABLE" };
+    if (requester.value.peerPid !== connected.value.peerPid) {
+      return {
+        allowed: false,
+        refusal: "PEER_CHANGED",
+        evidence: { peerPid: requester.value.peerPid, connectedPid: connected.value.peerPid },
+      };
+    }
+    const lineage = admitPinnedHolderGrandchild(requester.value.peerPid, pin);
     if (!lineage.allowed) {
       return {
         allowed: false,
         refusal: lineage.evidence["refusal"] as HolderGrandchildRefusal,
-        evidence: { peerPid: peer.value.peerPid, holderPid: pin.pid },
+        evidence: { peerPid: requester.value.peerPid, holderPid: pin.pid },
       };
     }
+    grandchild = lineage.value;
   }
   if (!sessions) return { allowed: false, refusal: "CREDENTIAL_NOT_VERIFIABLE" };
   const verified = sessions.verifySecret(credential.sessionId, credential.sessionSecret);
@@ -3928,7 +3947,7 @@ const admitLaunch = (
   if (verified.value.incarnation !== credential.sessionIncarnation) {
     return { allowed: false, refusal: "CREDENTIAL_NOT_CURRENT" };
   }
-  return { allowed: true, pin };
+  return { allowed: true, pin, grandchild };
 };
 
 /**
@@ -3937,18 +3956,34 @@ const admitLaunch = (
  * accepts a caller-supplied control-plane session id or writes any received value durably.
  *
  * O4 — the id finds an entry; `admitLaunch` decides whether this connection gets it, on the kernel's
- * record of who connected (read before a byte of the request) and the daemon's own pin, never on
- * anything the request says about its sender. Then, in the same synchronous turn, the entry must still
- * be the one admitted with the pin admitted — not withdrawn or replaced meanwhile — and it is deleted
- * before the reply is written, so one entry is handed over at most once. A refusal keeps the entry and
- * records only the refusal case.
+ * record of who is connected and the daemon's own pin, never on anything the request says about its
+ * sender. Then the entry must still be the one admitted with the pin admitted — not withdrawn or
+ * replaced meanwhile — and, for a driven entry, the kernel is asked a last time who the peer is: the
+ * same pid as admitted, still the same process by its start token, under the same two links
+ * (`confirmAdmittedGrandchild`). The entry is deleted and the reply written right after, in the same
+ * synchronous step, with no await between the last check and the write, so one entry is handed over at
+ * most once. A refusal keeps the entry and records only the refusal case.
+ *
+ * What remains open after the last check: the reads it makes (the kernel peer, the peer's start token,
+ * two `ps` reads of the links) are separate reads, not one snapshot, and the peer runs while they are
+ * made. The reply goes into the socket's kernel buffer in that same step (the buffer is empty: nothing
+ * else is ever written on this connection), and whoever then reads that socket gets it. The kernel peer
+ * is the last process to have used the socket, not every process holding it: a process holding a
+ * duplicate of the admitted peer's descriptor — inherited from it, or passed to it by it, before or
+ * after the last check — can read the reply, and nothing the daemon reads can see a holder that has
+ * not used the socket. Such a duplicate exists only where the admitted process, a child of the holder's
+ * child, shares its descriptor, which is within the same-user trust in the turn's tree this rests on.
+ * And if the process that last used the socket exits after its request and its pid is reused before
+ * the request is read, a lookup still names that pid; its start token is then the new process's, and
+ * it is admitted if that process is itself a valid grandchild. That window is from the peer's request
+ * to the daemon reading it.
  */
 const serveSessionLaunchCredential = (
   socket: Socket,
   pending: Map<string, PendingLaunchCredential>,
   options: SessionLaunchChannelOptions,
 ): void => {
-  const peer = authenticateLaunchPeer(socket);
+  const connected = authenticateLaunchPeer(socket);
   let buffer = Buffer.alloc(0);
   let settled = false;
   const finish = (body: Record<string, unknown>): void => {
@@ -3958,12 +3993,17 @@ const serveSessionLaunchCredential = (
     socket.end(`${JSON.stringify(body)}\n`);
   };
   const refuse = (): void => finish({ ok: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED });
-  const refuseEntry = (launch: PendingLaunchCredential, refusal: LaunchRefusal, evidence: Record<string, number> = {}): void => {
+  const refuseEntry = (
+    launch: PendingLaunchCredential,
+    refusal: LaunchRefusal,
+    stage: "admission" | "hand-over",
+    evidence: Record<string, number> = {},
+  ): void => {
     options.audit?.record({
       kind: SESSION_LAUNCH_CREDENTIAL_REFUSED,
       reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED,
       sessionId: launch.credential.sessionId,
-      evidence: { refusal, driven: launch.driven, ...evidence },
+      evidence: { refusal, stage, driven: launch.driven, ...evidence },
     });
     refuse();
   };
@@ -3986,10 +4026,22 @@ const serveSessionLaunchCredential = (
       pending.delete(externalSessionId);
       return refuse();
     }
-    const admitted = admitLaunch(launch, peer, options.sessions);
-    if (!admitted.allowed) return refuseEntry(launch, admitted.refusal, admitted.evidence);
+    const admitted = admitLaunch(launch, connected, () => authenticateLaunchPeer(socket), options.sessions);
+    if (!admitted.allowed) return refuseEntry(launch, admitted.refusal, "admission", admitted.evidence);
     if (pending.get(externalSessionId) !== launch || launch.credential.pin !== admitted.pin) {
-      return refuseEntry(launch, "ENTRY_REPLACED");
+      return refuseEntry(launch, "ENTRY_REPLACED", "hand-over");
+    }
+    const grandchild = admitted.grandchild;
+    if (grandchild !== null) {
+      const handedTo = authenticateLaunchPeer(socket);
+      if (!handedTo.allowed) return refuseEntry(launch, "PEER_UNREADABLE", "hand-over", { peerPid: grandchild.peerPid });
+      const confirmed = confirmAdmittedGrandchild(handedTo.value.peerPid, grandchild);
+      if (!confirmed.allowed) {
+        return refuseEntry(launch, confirmed.evidence["refusal"] as HolderGrandchildRefusal, "hand-over", {
+          peerPid: handedTo.value.peerPid,
+          holderPid: grandchild.holderPid,
+        });
+      }
     }
 
     // Consume before writing. If the peer disappears while receiving its response, retrying

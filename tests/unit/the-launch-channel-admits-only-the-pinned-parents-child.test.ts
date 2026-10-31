@@ -44,28 +44,56 @@ const hooks = vi.hoisted(() => ({
   onTokenRead: null as ((pid: number) => void) | null,
   /** The kernel peer read fails. */
   peerUnreadable: false,
+  /** Replaces a start token as the kernel reports it: a pid reused between two reads. */
+  tokenFor: null as ((pid: number, actual: string | null) => string | null) | null,
+  /** Replaces the n-th kernel peer read (1-based, counted while set): a pid reused, a read that fails. */
+  peerAnswer: null as ((call: number, actual: PeerAnswer) => PeerAnswer) | null,
+  peerCalls: 0,
 }));
+type PeerAnswer = ReturnType<typeof PeercredModule.getPeerCredentials>;
 vi.mock("../../src/core/process-argv.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof ProcessArgvModule>();
   return {
     ...actual,
     readProcessStartToken: (pid: number): string | null => {
       hooks.onTokenRead?.(pid);
-      return hooks.unreadableTokens.has(pid) ? null : actual.readProcessStartToken(pid);
+      const read = hooks.unreadableTokens.has(pid) ? null : actual.readProcessStartToken(pid);
+      return hooks.tokenFor ? hooks.tokenFor(pid, read) : read;
     },
   };
 });
 vi.mock("../../src/core/peercred.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof PeercredModule>();
-  return { ...actual, getPeerCredentials: (fd: number) => (hooks.peerUnreadable ? null : actual.getPeerCredentials(fd)) };
+  return {
+    ...actual,
+    getPeerCredentials: (fd: number): PeerAnswer => {
+      if (hooks.peerUnreadable) return null;
+      const read = actual.getPeerCredentials(fd);
+      if (!hooks.peerAnswer) return read;
+      hooks.peerCalls += 1;
+      return hooks.peerAnswer(hooks.peerCalls, read);
+    },
+  };
 });
 
 const live: ChildProcess[] = [];
+/** Process groups a test leaves running (an idle turn tree), ended after it. */
+const groups: number[] = [];
 afterEach(() => {
   hooks.unreadableTokens.clear();
   hooks.onTokenRead = null;
   hooks.peerUnreadable = false;
+  hooks.tokenFor = null;
+  hooks.peerAnswer = null;
+  hooks.peerCalls = 0;
   for (const child of live.splice(0)) child.kill("SIGKILL");
+  for (const group of groups.splice(0)) {
+    try {
+      process.kill(-group, "SIGKILL");
+    } catch {
+      /* the group already ended */
+    }
+  }
 });
 afterAll(() => {
   cleanupTempDirs();
@@ -174,6 +202,72 @@ const idleProcess = (): number => {
   const idle = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
   live.push(idle);
   return idle.pid!;
+};
+
+/** One line of a child's stdout, parsed. */
+const firstLine = <T>(child: ChildProcess): Promise<T> =>
+  new Promise((resolve, reject) => {
+    let out = "";
+    child.stdout!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => {
+      out += chunk;
+      const boundary = out.indexOf("\n");
+      if (boundary !== -1) resolve(JSON.parse(out.slice(0, boundary)) as T);
+    });
+    // `close`, not `exit`: a child that handed its stdout on (the outsider's sender) outlives it.
+    child.once("close", () => {
+      if (!out.includes("\n")) reject(new Error("the child wrote no line"));
+    });
+  });
+
+/** A turn tree whose leaf stays alive and never asks: holder → its child → leaf, in the holder's own group. */
+const idleTurnTree = async (): Promise<{ holder: number; leaf: number }> => {
+  const leaf = `process.stdout.write(JSON.stringify({ pid: process.pid }) + "\\n"); setInterval(() => {}, 1000);`;
+  const level = (inner: string) =>
+    `const c = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(inner)}], { stdio: ["ignore", "inherit", "ignore"] });` +
+    `c.on("exit", () => process.exit(0));`;
+  const holder = spawn(process.execPath, ["-e", level(level(leaf))], { stdio: ["ignore", "pipe", "ignore"], detached: true });
+  groups.push(holder.pid!);
+  const { pid } = await firstLine<{ pid: number }>(holder);
+  return { holder: holder.pid!, leaf: pid };
+};
+
+/**
+ * A same-uid outsider that connects, hands its connected socket to a child, and exits; the child, once
+ * the connector is gone, sends the request on that socket and reports what came back.
+ */
+const outsiderPassingItsSocket = async (socketPath: string, externalSessionId: string) => {
+  const sender = `
+const net = require("node:net");
+const [connector, externalSessionId] = process.argv.slice(1);
+const gone = () => { try { process.kill(Number(connector), 0); return false; } catch { return true; } };
+const ask = () => {
+  const socket = new net.Socket({ fd: 3, readable: true, writable: true });
+  let received = ""; let done = false;
+  const report = () => { if (done) return; done = true; const line = received.trim(); process.stdout.write(JSON.stringify({ sender: process.pid, reply: line ? JSON.parse(line) : null }) + "\\n", () => process.exit(0)); };
+  socket.setEncoding("utf8");
+  socket.on("data", (chunk) => { received += chunk; });
+  socket.once("close", report);
+  socket.once("error", report);
+  socket.write(JSON.stringify({ externalSessionId }) + "\\n");
+};
+const wait = () => (gone() ? ask() : setTimeout(wait, 20));
+wait();
+`;
+  const connector = `
+const net = require("node:net");
+const { spawn } = require("node:child_process");
+const [socketPath, externalSessionId] = process.argv.slice(1);
+const socket = net.createConnection(socketPath);
+socket.once("connect", () => {
+  spawn(process.execPath, ["-e", ${JSON.stringify(sender)}, String(process.pid), externalSessionId], { stdio: ["ignore", "inherit", "ignore", socket._handle.fd] });
+  process.exit(0);
+});
+`;
+  const child = spawn(process.execPath, ["-e", connector, socketPath, externalSessionId], { stdio: ["ignore", "pipe", "ignore"] });
+  live.push(child);
+  const report = await firstLine<{ sender: number; reply: LaunchReply | null }>(child);
+  return { connector: child.pid!, ...report };
 };
 
 const pinOf = (pid: number): SessionLaunchPin => {
@@ -468,6 +562,90 @@ describe("O4 slice B — a driven entry goes only to the pinned holder's grandch
       expect(handed(nextRelay!.reply, current)).toBe(true);
       w.auditNeverHolds(previous.sessionSecret);
       w.auditNeverHolds(current.sessionSecret);
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("W-STALE (a): a connector that hands its socket to a child and exits is refused, even when its pid now names a valid grandchild", async () => {
+    const w = await world();
+    try {
+      const turn = await idleTurnTree();
+      const credential = w.credentialOf(w.session("w-stale"));
+      await w.offerDriven(credential, pinOf(turn.holder));
+
+      // As the kernel reports it: the connector at the connection, its child at the request.
+      const real = await outsiderPassingItsSocket(w.launch.socketPath, credential.externalSessionId);
+      expect(real.sender).not.toBe(real.connector);
+      expect(handed(real.reply, credential)).toBe(false);
+      // The kernel names the connector at the connection and the sender at the request. Were the daemon to
+      // read the connection only after the sender wrote, it would name the sender at both, which is no
+      // grandchild of the holder.
+      expect(["PEER_CHANGED", "NOT_HOLDER_GRANDCHILD"]).toContain(w.refusals()[0]);
+
+      // The connector's pid reused by a valid grandchild of the pinned holder: the connection-time read
+      // names that grandchild; every later read is the kernel's own.
+      hooks.peerAnswer = (call, actual) => (call === 1 && actual ? { ...actual, peerPid: turn.leaf, effectivePid: turn.leaf } : actual);
+      const reused = await outsiderPassingItsSocket(w.launch.socketPath, credential.externalSessionId);
+      expect(handed(reused.reply, credential)).toBe(false);
+      expect(reused.reply).toEqual({ ok: false, reasonCode: "MCP_PEER_UNAUTHENTICATED" });
+
+      expect(w.refusals()).toHaveLength(2);
+      expect(w.refusals()[1]).toBe("PEER_CHANGED");
+      expect(w.launch.withdraw(credential.externalSessionId)).toBe(true);
+      w.auditNeverHolds(credential.sessionSecret);
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("W-STALE (a): the admitted peer's start token or pid differing at hand-over is refused and the entry kept", async () => {
+    const w = await world();
+    try {
+      // The peer's pid reused between admission and hand-over: its start token reads differently the second time.
+      const byToken = w.credentialOf(w.session("w-stale-token"));
+      const first = w.tree(2, byToken);
+      await w.offerDriven(byToken, pinOf(first.pid));
+      const seen = new Map<number, number>();
+      hooks.tokenFor = (pid, actual) => {
+        if (pid === first.pid) return actual;
+        const reads = (seen.get(pid) ?? 0) + 1;
+        seen.set(pid, reads);
+        return reads === 1 ? actual : "darwin-tv:1.000001";
+      };
+      const [tokenRelay] = await first.go();
+      expect(handed(tokenRelay!.reply, byToken)).toBe(false);
+      hooks.tokenFor = null;
+
+      // The fresh kernel read at hand-over names another pid.
+      const byPid = w.credentialOf(w.session("w-stale-pid"));
+      const second = w.tree(2, byPid);
+      await w.offerDriven(byPid, pinOf(second.pid));
+      hooks.peerAnswer = (call, actual) => (call === 3 && actual ? { ...actual, peerPid: actual.peerPid + 1, effectivePid: actual.peerPid + 1 } : actual);
+      const [pidRelay] = await second.go();
+      expect(handed(pidRelay!.reply, byPid)).toBe(false);
+
+      expect(w.refusals()).toEqual(["PEER_CHANGED", "PEER_CHANGED"]);
+      expect(w.h.cp.audit.byKind(REFUSED).map((event) => event.evidence["stage"])).toEqual(["hand-over", "hand-over"]);
+      for (const entry of [byToken, byPid]) expect(w.launch.withdraw(entry.externalSessionId)).toBe(true);
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("W-STALE (b): a fresh kernel peer read that fails at hand-over is refused and the entry kept", async () => {
+    const w = await world();
+    try {
+      const credential = w.credentialOf(w.session("w-stale-unread"));
+      const turn = w.tree(2, credential);
+      await w.offerDriven(credential, pinOf(turn.pid));
+      hooks.peerAnswer = (call, actual) => (call === 3 ? null : actual);
+      const [relay] = await turn.go();
+      expect(handed(relay!.reply, credential)).toBe(false);
+      expect(w.refusals()).toEqual(["PEER_UNREADABLE"]);
+      expect(w.h.cp.audit.byKind(REFUSED).map((event) => event.evidence["stage"])).toEqual(["hand-over"]);
+      expect(w.launch.withdraw(credential.externalSessionId)).toBe(true);
+      w.auditNeverHolds(credential.sessionSecret);
     } finally {
       await w.close();
     }

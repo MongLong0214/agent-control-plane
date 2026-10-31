@@ -187,7 +187,9 @@ export type HolderGrandchildRefusal =
   | "NOT_HOLDER_GRANDCHILD"
   | "HOLDER_START_UNKNOWN"
   | "HOLDER_PID_REUSED"
-  | "LINK_CHANGED";
+  | "LINK_CHANGED"
+  | "PEER_START_UNKNOWN"
+  | "PEER_CHANGED";
 
 /** The native token formats `readProcessStartToken` writes; anything else is not compared with them. */
 const nativeStartFormat = (token: string): "darwin" | "linux" | null => {
@@ -196,28 +198,42 @@ const nativeStartFormat = (token: string): "darwin" | "linux" | null => {
   return null;
 };
 
-const refuseGrandchild = (refusal: HolderGrandchildRefusal, message: string): Decision<{ cliPid: number }> =>
+const refuseGrandchild = <T>(refusal: HolderGrandchildRefusal, message: string): Decision<T> =>
   deny(ReasonCode.CONFLICT, message, { refusal });
+
+/**
+ * O4 — what an admission bound: the peer by its pid and its start token (the process incarnation the
+ * kernel named, not only its number), and the two links it was found under.
+ */
+export interface AdmittedGrandchild {
+  readonly peerPid: number;
+  readonly peerStartToken: string;
+  readonly cliPid: number;
+  readonly holderPid: number;
+}
 
 /**
  * O4 — the one process shape a driven turn's launch credential is admitted to: the holder the daemon
  * spawned for the turn, the CLI that holder runs as its child, and `peerPid` as that CLI's child (the
  * relay the CLI starts as its MCP server). Exactly two parent links, nothing shallower and nothing deeper.
  *
- * What is identified is the holder only: its pid and its live start token, read here now, must equal the
- * pin the daemon recorded at its own spawn. The CLI between them is not pinned — its pid is whatever the
- * peer's parent is, and no start token was ever read for it — so any child of the holder's child passes:
- * the relay, a tool shell the CLI runs, anything it starts. This is same-user trust in the turn's own
+ * What is identified is the holder, and the peer: the holder's pid and its live start token, read here
+ * now, must equal the pin the daemon recorded at its own spawn; the peer's start token is read here
+ * first and bound to the admission, so a later read can tell whether that pid is still the same process
+ * (`confirmAdmittedGrandchild`). The CLI between them is not pinned — its pid is whatever the peer's
+ * parent is, and no start token is ever read for it — so any child of the holder's child passes: the
+ * relay, a tool shell the CLI runs, anything it starts. This is same-user trust in the turn's own
  * process tree. It does not authenticate the CLI or the relay binary.
  *
- * The links are read, then the holder's token, then the links again; a link that moved between the two
- * reads is refused, and so is any read that fails. Every refusal is its own statement. Nothing here writes.
+ * The peer's token is read, then the links, then the holder's token, then the links again; a link that
+ * moved between the two reads is refused, and so is any read that fails. Every refusal is its own
+ * statement. Nothing here writes.
  */
 export const admitPinnedHolderGrandchild = (
   peerPid: number,
   pin: { readonly pid: number; readonly startToken: string | null },
   processes: ProcessLineageReader = defaultProcessLineageReader,
-): Decision<{ cliPid: number }> => {
+): Decision<AdmittedGrandchild> => {
   if (pin.startToken === null) {
     return refuseGrandchild("HOLDER_START_UNKNOWN", "the holder's start token was not read at its spawn");
   }
@@ -225,6 +241,8 @@ export const admitPinnedHolderGrandchild = (
   if (pinnedFormat === null) {
     return refuseGrandchild("HOLDER_START_UNKNOWN", "the holder's pinned start is not a native start token");
   }
+  const peerStartToken = processes.startToken(peerPid);
+  if (peerStartToken === null) return refuseGrandchild("PEER_START_UNKNOWN", "the peer's start token could not be read");
   const cli = processes.parentOf(peerPid);
   if (cli === null) return refuseGrandchild("LINK_UNREADABLE", "the peer's parent could not be read");
   if (cli <= 1) return refuseGrandchild("NOT_HOLDER_GRANDCHILD", "the peer has no parent below init");
@@ -247,5 +265,33 @@ export const admitPinnedHolderGrandchild = (
   if (holderAgain !== holder) {
     return refuseGrandchild("LINK_CHANGED", "the parent of the peer's parent changed while it was observed");
   }
-  return allow(ReasonCode.OK, { cliPid: cli });
+  return allow(ReasonCode.OK, { peerPid, peerStartToken, cliPid: cli, holderPid: holder });
+};
+
+/**
+ * O4 — the hand-over's last look, for a peer pid the caller has just read from the kernel again: it
+ * must be the admitted pid, that pid's live start token must still be the one the admission read (the
+ * same process, not a later one on the same number), and both parent links must still be the admitted
+ * ones. Any read that fails or any difference is a refusal. Nothing here writes.
+ */
+export const confirmAdmittedGrandchild = (
+  peerPid: number,
+  admitted: AdmittedGrandchild,
+  processes: ProcessLineageReader = defaultProcessLineageReader,
+): Decision<null> => {
+  if (peerPid !== admitted.peerPid) return refuseGrandchild("PEER_CHANGED", "the kernel now names another peer");
+  const live = processes.startToken(peerPid);
+  if (live === null) return refuseGrandchild("PEER_START_UNKNOWN", "the peer's start token could not be read again");
+  if (live !== admitted.peerStartToken) {
+    return refuseGrandchild("PEER_CHANGED", "the peer's pid now belongs to another process than the one admitted");
+  }
+  const cli = processes.parentOf(peerPid);
+  if (cli === null) return refuseGrandchild("LINK_UNREADABLE", "the peer's parent could not be read again");
+  if (cli !== admitted.cliPid) return refuseGrandchild("LINK_CHANGED", "the peer's parent changed after its admission");
+  const holder = processes.parentOf(cli);
+  if (holder === null) return refuseGrandchild("LINK_UNREADABLE", "the parent of the peer's parent could not be read again");
+  if (holder !== admitted.holderPid) {
+    return refuseGrandchild("LINK_CHANGED", "the parent of the peer's parent changed after its admission");
+  }
+  return allow(ReasonCode.OK, null);
 };
