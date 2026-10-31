@@ -10,9 +10,13 @@
  * parents, their merged tree, subject and body as the message -- and can be told to compose it
  * wrongly. The `commitlore` stand-in validates nothing and pushes the notes ref on `sync`. `GIT_DIR`
  * points every git call at the fixture.
+ *
+ * merge-pr.mjs refuses a copy that differs from the current base of the pull request's repository,
+ * so the fixture is a current checkout: `origin` is that repository, `git@github.com:test/repo.git`,
+ * reached offline through a stand-in ssh, and the base it holds carries the script bytes that run.
  */
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
@@ -48,7 +52,8 @@ const origin = (...a) => execFileSync("git", ["--git-dir", world.origin, ...a], 
 const state = fs.existsSync(world.state) ? JSON.parse(fs.readFileSync(world.state, "utf8")) : {};
 if (args[0] === "pr" && args[1] === "view") {
   process.stdout.write(JSON.stringify({ state: "OPEN", mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", title: "fixture",
-    baseRefOid: world.baseRefOid ?? world.base, headRefOid: world.headRefOid ?? world.head, statusCheckRollup: [] }));
+    baseRefOid: world.baseRefOid ?? world.base, headRefOid: world.headRefOid ?? world.head, statusCheckRollup: [],
+    baseRefName: "main", url: "https://github.com/test/repo/pull/" + world.number }));
 } else if (args[0] === "run" && args[1] === "list") {
   process.stdout.write(JSON.stringify([{ databaseId: 1, attempt: 1, status: "completed", headSha: world.head }].filter((r) => r.headSha === flag("--commit"))));
 } else if (args[0] === "run" && args[1] === "view") {
@@ -101,12 +106,14 @@ interface Options {
 
 const mergeWorld = (options: Options = {}) => {
   const dir = tempDir("acp-merge-head-");
-  const origin = join(dir, "origin.git");
+  const remotes = join(dir, "remotes");
+  const origin = join(remotes, "test", "repo.git");
   const work = join(dir, "work");
   git(dir, "init", "--quiet", "--bare", "-b", "main", origin);
   git(dir, "init", "--quiet", "-b", "main", work);
   git(work, "config", "core.hooksPath", "/dev/null");
   writeFileSync(join(work, "a.txt"), "base\n");
+  cpSync(join(ROOT, "scripts"), join(work, "scripts"), { recursive: true });
   git(work, "add", "--all");
   git(work, "commit", "--quiet", "--no-verify", "-m", "base");
   const base = git(work, "rev-parse", "HEAD");
@@ -131,8 +138,13 @@ const mergeWorld = (options: Options = {}) => {
     git(other, "push", "--quiet", "--no-verify", "origin", "main");
     baseRefOid = git(other, "rev-parse", "HEAD");
   }
+  git(work, "remote", "set-url", "origin", "git@github.com:test/repo.git");
   const bin = join(dir, "bin");
   mkdirSync(bin);
+  // As ssh to github.com: the remote command runs against `remotes`, outside the fixture's GIT_DIR.
+  writeFileSync(join(bin, "fake-ssh"),
+    `#!/bin/sh\nfor last; do :; done\nunset GIT_DIR GIT_WORK_TREE\ncd '${remotes}' || exit 128\nexec /bin/sh -c "git \${last#git-}"\n`);
+  chmodSync(join(bin, "fake-ssh"), 0o755);
   writeFileSync(join(bin, "gh"), `#!${process.execPath}\n${GH}`);
   writeFileSync(join(bin, "commitlore"), `#!${process.execPath}\n${COMMITLORE}`);
   chmodSync(join(bin, "gh"), 0o755);
@@ -159,7 +171,9 @@ const merge = (w: MergeWorld, extra: readonly string[] = []) => {
       "--body-file", join(w.dir, "body"), ...extra], {
       cwd: ROOT, encoding: "utf8", timeout: 120_000,
       env: { ...inherited, ...IDENTITY, PATH: `${join(w.dir, "bin")}:${process.env["PATH"] ?? ""}`, MERGE_WORLD: join(w.dir, "world.json"),
-        GIT_DIR: join(w.work, ".git"), GIT_WORK_TREE: w.work, GITHUB_REPOSITORY: "test/repo" },
+        GIT_DIR: join(w.work, ".git"), GIT_WORK_TREE: w.work, GITHUB_REPOSITORY: "test/repo",
+        GIT_SSH_COMMAND: `'${join(w.dir, "bin", "fake-ssh")}'`, GIT_SSH_VARIANT: "simple",
+        GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
     });
   } catch (error) {
     const failure = error as { status?: number; stdout?: string; stderr?: string };

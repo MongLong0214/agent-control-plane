@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -19,7 +19,11 @@ const fixture = (count = 8) => {
   git("init", "-q", "-b", "main");
   git("config", "user.name", "fixture");
   git("config", "user.email", "fixture@example.invalid");
-  const tree = git("mktree");
+  // merge-pr.mjs refuses a copy that differs from the current base of the pull request's repository,
+  // so the base holds the script bytes that run (and `currentCheckout` gives it that origin).
+  cpSync(join(ROOT, "scripts"), join(dir, "scripts"), { recursive: true });
+  git("add", "scripts");
+  const tree = git("write-tree");
   const base = git("commit-tree", tree, "-m", "base");
   let head = base;
   for (let i = 0; i < count; i += 1) {
@@ -41,8 +45,15 @@ const fixture = (count = 8) => {
   writeFileSync(gh, readFileSync(join(ROOT, "tests/helpers/merge-gh-fixture.mjs")));
   chmodSync(gh, 0o755);
   const message = join(dir, "outgoing.message");
+  // The pull request as merge-gh-fixture.mjs answers it by default, with the repository and base it is in.
+  const ghWorld = join(dir, "gh-world.json");
+  writeFileSync(ghWorld, JSON.stringify({ pr: {
+    state: "OPEN", mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", title: "fixture", baseRefOid: base, headRefOid: head,
+    statusCheckRollup: [{ name: "verify", status: "COMPLETED", conclusion: "SUCCESS", completedAt: "2026-10-02T00:00:00Z" }],
+    baseRefName: "main", url: "https://github.com/test/repo/pull/1",
+  } }));
   const env = { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}`, GIT_DIR: join(dir, ".git"),
-    GIT_WORK_TREE: dir, FIXTURE_BASE: base, FIXTURE_HEAD: head, FIXTURE_MESSAGE: message };
+    GIT_WORK_TREE: dir, FIXTURE_BASE: base, FIXTURE_HEAD: head, FIXTURE_MESSAGE: message, FIXTURE_GH_WORLD: ghWorld };
   expect(run("commitlore", ["--version"], dir, env).stdout.trim()).toBe("1.5.0");
   const expected = join(dir, "official.message");
   writeFileSync(expected, "merge fixture\n\nSummary.\n");
@@ -51,6 +62,23 @@ const fixture = (count = 8) => {
   const body = join(dir, "body");
   writeFileSync(body, "Summary.\n");
   return { dir, git, tree, base, head, env, expected, message, body };
+};
+
+/**
+ * The fixture as a current checkout of test/repo, for merge-pr.mjs: origin is that repository,
+ * holding the base, reached offline through a stand-in ssh. Only the merge needs it; with a remote,
+ * the trailer checks the other cases run also want origin's notes ref, which is not their subject.
+ */
+const currentCheckout = (f: ReturnType<typeof fixture>): NodeJS.ProcessEnv => {
+  const remotes = tempDir("acp-official-origin-");
+  mkdirSync(join(remotes, "test"));
+  f.git("init", "-q", "--bare", "-b", "main", join(remotes, "test", "repo.git"));
+  f.git("push", "-q", "--no-verify", join(remotes, "test", "repo.git"), "main");
+  f.git("remote", "add", "origin", "git@github.com:test/repo.git");
+  const ssh = join(f.dir, "bin", "fake-ssh");
+  writeFileSync(ssh, `#!/bin/sh\nfor last; do :; done\nunset GIT_DIR GIT_WORK_TREE\ncd '${remotes}' || exit 128\nexec /bin/sh -c "git \${last#git-}"\n`);
+  chmodSync(ssh, 0o755);
+  return { ...f.env, GIT_SSH_COMMAND: `'${ssh}'`, GIT_SSH_VARIANT: "simple" };
 };
 
 /**
@@ -151,7 +179,7 @@ const officialIntegration = describe.runIf(process.env.ACP_COMMITLORE_INTEGRATIO
 officialIntegration("the merge helper preserves the official record paragraphs", () => {
   it("sends the validated message unchanged, and the branch's eight official records stay on its commits (#1269)", () => {
     const f = fixture();
-    const result = run(process.execPath, [join(ROOT, "scripts/merge-pr.mjs"), "1", "--subject", "merge fixture", "--body-file", f.body], ROOT, f.env);
+    const result = run(process.execPath, [join(ROOT, "scripts/merge-pr.mjs"), "1", "--subject", "merge fixture", "--body-file", f.body], ROOT, currentCheckout(f));
     expect(result.stdout).toContain(READ_BACK_REFUSED);
     expect(result.status, result.stdout + result.stderr).toBe(1);
     expect(readFileSync(f.message, "utf8")).toBe("merge fixture\n\nSummary.\n");

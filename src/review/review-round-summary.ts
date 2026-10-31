@@ -146,6 +146,15 @@ export interface ReviewRoundDelivery {
   acknowledged: boolean;
 }
 
+/**
+ * F1 — the in-band notice the pipeline sent the owner for a review that did not judge the product
+ * (`CandidatePipeline.noticeUnjudgedReview`): a REVISION_REQUEST marked `stage: "review-unavailable"`, which
+ * asks for no revision and carries no return. `notice` is its fixed notice code, or null for any other value.
+ */
+export interface ReviewRoundNotice extends ReviewRoundDelivery {
+  notice: "METHOD_FINDINGS_ONLY" | "REVIEW_UNAVAILABLE" | null;
+}
+
 export interface ReviewRound {
   round: number;
   frozenEventId: number;
@@ -163,6 +172,8 @@ export interface ReviewRound {
   attemptReclaimed: boolean;
   review: ReviewRoundReview | null;
   deliveries: ReviewRoundDelivery[];
+  /** Review-unavailable notices sent for this round's own unavailable review; never a revision delivery. */
+  notices: ReviewRoundNotice[];
   /** This attempt moved the run to READY_FOR_CEO_REVIEW. Never true unless its review passed. */
   readyForCeo: boolean;
   /** The first later round with a different candidate digest. */
@@ -190,7 +201,7 @@ export interface ReviewRoundSummary {
   interventionsBeforeFirstRound: Array<{ eventId: number; kind: string }>;
   /** Records placed on no round, with the rounds each could belong to. Never guessed onto one. */
   unattributedEvents: UnattributedReviewEvent[];
-  /** REVISION_REQUEST deliveries that match more than one round's return and no single attempt. */
+  /** REVISION_REQUEST deliveries that match more than one round's return and no single attempt, or a notice no round's unavailable review fits. */
   unattributedDeliveries: Array<{ messageId: string; candidateRounds: number[] } & Partial<ReturnType<typeof outboxDeliveryReadback>>>;
   /** The first round whose review returned findings, preserved whatever later rounds did. */
   firstFindings: { round: number; findings: ReviewRoundFinding[] } | null;
@@ -732,7 +743,32 @@ export const summarizeReviewRounds = (
     if (holder !== undefined && holder !== owner.index) return false;
     return owner.attemptId === null || owner.attemptId === key.attemptId;
   };
+  // F1 — a review-unavailable notice carries no return, so it is placed by its key alone: the round its trusted
+  // attempt is, whose candidate and reason the key and payload name, and for which that attempt stamped an
+  // unavailable record with that reason after the round's freeze. The record is matched by its stamp, not by the
+  // round's outcome slot, which a method-only round leaves empty (its completion and unavailable record conflict).
+  // It goes there as a notice; one that fits no such round is listed below as before.
+  const noticesOf = new Map<number, OutboxMessage[]>();
+  const noticeRound = (message: OutboxMessage): RoundState | undefined => {
+    const payload = record(message.payload);
+    const key = revisionKeyOf(message.idempotencyKey);
+    if (payload?.["stage"] !== "review-unavailable" || key === null || message.runId !== sources.runId || key.runId !== sources.runId) return undefined;
+    if (rejectedAttempts.has(key.attemptId)) return undefined;
+    const known = roundOfAttempt.get(key.attemptId);
+    const owner = known === undefined ? undefined : states[known]!;
+    if (owner === undefined || owner.tainted) return undefined;
+    if (key.candidateDigest !== owner.digest || payload["candidateSnapshotDigest"] !== owner.digest || payload["reasonCode"] !== key.reasonCode) return undefined;
+    const stamped = audit.some((row) => row.kind === "BLIND_REVIEW_UNAVAILABLE" && row.eventId > owner.freeze.eventId
+      && row.reasonCode === key.reasonCode && row.evidence["attemptId"] === key.attemptId && row.evidence["candidateSnapshotDigest"] === owner.digest
+      && row.evidence["attemptHeld"] !== false);
+    return stamped ? owner : undefined;
+  };
   for (const message of revisionMessages) {
+    const noticed = noticeRound(message);
+    if (noticed !== undefined) {
+      noticesOf.set(noticed.index, [...(noticesOf.get(noticed.index) ?? []), message]);
+      continue;
+    }
     const carriers = carriersOf(message);
     const attemptId = attemptOfKey(message.idempotencyKey);
     const known = attemptId === null ? undefined : roundOfAttempt.get(attemptId);
@@ -837,6 +873,10 @@ export const summarizeReviewRounds = (
       attemptReclaimed: state.reclaimed,
       review,
       deliveries: (deliveriesOf.get(state.index) ?? []).map(toDelivery),
+      notices: (noticesOf.get(state.index) ?? []).map((message) => {
+        const notice = record(message.payload)?.["notice"];
+        return { ...toDelivery(message), notice: notice === "METHOD_FINDINGS_ONLY" || notice === "REVIEW_UNAVAILABLE" ? notice : null };
+      }),
       readyForCeo: reached && outcome !== "REVIEW_UNAVAILABLE" && outcome !== "REVISION_RETURNED" && outcome !== "VERIFICATION_RETURNED",
       nextNewCandidate: null,
       duplicateEventsIgnored: state.duplicates,

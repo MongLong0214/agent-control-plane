@@ -176,6 +176,35 @@ const revisionAuditEvidence = (
   } as Evidence;
 };
 
+/**
+ * F1 — what the owning CTO is told, in band, when a review did not judge the product: a review that answered on
+ * method findings alone, or one that could not be constituted. It is no revision request for the product. The
+ * text is fixed here and never carries reviewer text; the reason code beside it is the gate's own.
+ */
+export const UNJUDGED_REVIEW_NOTICES = {
+  METHOD_FINDINGS_ONLY:
+    "This is not a product revision. The blind review answered on review-method findings alone, so it did not judge the product. Keep the PLAN and the code exactly as they are and change nothing.",
+  REVIEW_UNAVAILABLE:
+    "This is not a product revision. The blind review could not judge the product: assurance could not be constituted, for the reason code given. Keep the PLAN and the code exactly as they are and change nothing.",
+} as const;
+
+/** F1 — how many unjudged reviews in a row one unchanged candidate gets before its owner is sent to escalation. */
+export const UNJUDGED_REVIEW_LIMIT = 2;
+
+/** F1 — the one next step a notice gives, chosen by `unjudgedAttempts` against `UNJUDGED_REVIEW_LIMIT`. */
+export const UNJUDGED_REVIEW_NEXT_STEPS = {
+  RESUBMIT:
+    "Next step: once the result_submit of the attempt this notice names (attemptId) has answered, call result_submit again with a new idempotencyKey; that freezes the candidate afresh and runs a fresh review. Resubmit only while unjudgedAttempts is below unjudgedAttemptLimit.",
+  ESCALATE:
+    "Next step: this unchanged candidate has had unjudgedAttemptLimit unjudged reviews in a row, so ACP refuses another result_submit of it; do not resubmit it. Open a CEO escalation for this run with escalation_open, then acknowledge this notice.",
+} as const;
+
+/** F1 — the refusal of a result_submit for a candidate already unjudged `UNJUDGED_REVIEW_LIMIT` times in a row. */
+export const UNJUDGED_REVIEW_LIMIT_REFUSAL =
+  "refused: this same unchanged candidate already went unjudged unjudgedAttemptLimit times in a row, so nothing was verified or reviewed for this submission. Do not resubmit it; open a CEO escalation for this run with escalation_open.";
+/** F1 — the audit row a refused submission leaves, so the refusal never counts as an attempt that ended the run of unjudged ones. */
+const UNJUDGED_REVIEW_LIMIT_REFUSED = "UNJUDGED_REVIEW_LIMIT_REFUSED";
+
 export interface SubmitResultInput {
   runId: string;
   ownerSessionId: string;
@@ -591,6 +620,24 @@ export class CandidatePipeline {
     const snapshotDigest = candidateSnapshotDigest(snapshot);
     const boundAttempt = this.bindAttemptCandidate(input.runId, attemptId, snapshotDigest);
     if (!boundAttempt.allowed) return boundAttempt as Decision<PipelineOutcome>;
+    // F1 — the bound on unjudged reviews: a candidate whose last UNJUDGED_REVIEW_LIMIT attempts all went unjudged is not
+    // verified or reviewed again; the owner was told to escalate (`noticeUnjudgedReview`). The refusal changes no run
+    // state, PLAN or task and sends nothing; its row keeps it out of the count, so the next such submit is refused too,
+    // and a changed candidate starts its own count. A project-less bootstrap run keeps the daemon's review retry.
+    if (!isProjectlessBootstrap(run)) {
+      const unjudgedAttempts = this.consecutiveUnjudgedAttempts(input.runId, snapshotDigest, attemptId);
+      if (unjudgedAttempts >= UNJUDGED_REVIEW_LIMIT) {
+        const evidence = { runId: input.runId, candidateSnapshotDigest: snapshotDigest, attemptId, refusal: UNJUDGED_REVIEW_LIMIT_REFUSED,
+          unjudgedAttempts, unjudgedAttemptLimit: UNJUDGED_REVIEW_LIMIT };
+        const recorded = this.applyHolding(input, attemptId, () => {
+          const row = this.audit.record({ kind: UNJUDGED_REVIEW_LIMIT_REFUSED, runId: input.runId, reasonCode: ReasonCode.REVIEW_UNJUDGED_LIMIT_REACHED, evidence });
+          return row.allowed ? allow(ReasonCode.OK, undefined) : (row as Decision<void>);
+        });
+        if (recorded === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
+        if (!recorded.allowed) return recorded as Decision<PipelineOutcome>;
+        return deny(ReasonCode.REVIEW_UNJUDGED_LIMIT_REACHED, UNJUDGED_REVIEW_LIMIT_REFUSAL, evidence);
+      }
+    }
     const progress = (step: SubmissionProgressStep): boolean => this.renewAttempt(input, attemptId, step);
 
     // No repository means no source, verification command, or blind-review input exists to
@@ -694,7 +741,7 @@ export class CandidatePipeline {
           },
         } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string }));
         if (built === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewedPlan);
-        if (!built.allowed) return built as Decision<PipelineOutcome>;
+        if (!built.allowed) return this.returnBlockedPass(input, attemptId, snapshotDigest, built, reviewedPlan);
         return allow(ReasonCode.OK, {
           stage: "COMPLETED_REVIEW",
           packet: built.value,
@@ -840,7 +887,7 @@ export class CandidatePipeline {
         },
       } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string }));
       if (built === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewed);
-      if (!built.allowed) return built as Decision<PipelineOutcome>;
+      if (!built.allowed) return this.returnBlockedPass(input, attemptId, snapshotDigest, built, reviewed);
 
       return allow(ReasonCode.OK, {
         stage: "COMPLETED_REVIEW",
@@ -981,16 +1028,19 @@ export class CandidatePipeline {
           },
         });
       };
+      // F1 — the owning CTO is told in the same transaction (`noticeUnjudgedReview`); a notice the outbox
+      // refuses is answered as that refusal, with nothing recorded, as a refused revision is.
       const recorded = held
         ? this.applyHolding(input, attemptId, () => {
             recordUnavailable(true);
-            return allow(ReasonCode.OK, undefined);
+            return this.noticeUnjudgedReview(runId, snapshotDigest, reviewed, attemptId);
           })
         : null;
       // #1189 R1-01 — an attempt that no longer holds the run keeps its failure as its own history: the
       // row names its attempt and says it did not hold the run, so it is never the run's current outcome
       // and never the cause of a review retry (`Daemon.#bootstrapReviewRetry`).
       if (recorded === null) recordUnavailable(false);
+      else if (!recorded.allowed) return recorded as Decision<PipelineOutcome>;
       return allow(ReasonCode.OK, {
         stage: "REVIEW_UNAVAILABLE",
         reasonCode: reviewed.reasonCode,
@@ -1382,6 +1432,100 @@ export class CandidatePipeline {
       dims: { stage: evidence["stage"] ?? null, mode: run.executionMode },
     });
     return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * F1 — a PASS whose findings hold a BLOCKER is refused by the production gate as REVIEW_BLOCK, and goes back to
+   * the owning CTO as a BLOCK verdict does: `returnToCto` with the reviewer's packet, keyed by this attempt and
+   * candidate, so a replay delivers nothing new. The gate's refusal stays the answer; any other refusal is as before.
+   */
+  private returnBlockedPass(
+    input: SubmitResultInput,
+    attemptId: string,
+    snapshotDigest: string,
+    built: Decision<ProductionReadyPacket>,
+    reviewed: Decision<ReviewPacket> | null,
+  ): Decision<PipelineOutcome> {
+    if (built.reasonCode !== ReasonCode.REVIEW_BLOCK || reviewed === null || !reviewed.allowed) return built as Decision<PipelineOutcome>;
+    const returned = this.applyHolding(input, attemptId, () => this.returnToCto(input.runId, ReasonCode.REVIEW_BLOCK, {
+      stage: "blind-review",
+      candidateSnapshotDigest: snapshotDigest,
+      runId: input.runId,
+      packet: reviewed.value,
+    }, attemptId));
+    if (returned === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewed);
+    if (!returned.allowed) return returned as Decision<PipelineOutcome>;
+    return built as Decision<PipelineOutcome>;
+  }
+
+  /**
+   * F1 — a review that did not judge the product (method findings alone, or assurance not constituted) tells the
+   * owning CTO so in band, keyed as a revision is by candidate, reason and attempt: the gate's reason code, a fixed
+   * notice and its fixed recovery text (`UNJUDGED_REVIEW_NOTICES`). It asks for no product change and records no
+   * revision. A method-only review's own method findings ride along, read from the review the gate stored; this
+   * private delivery is the only place they go. A run with no active owner binding gets nothing, as a revision.
+   * The notice names its attempt and counts the unjudged attempts in a row on this candidate
+   * (`consecutiveUnjudgedAttempts`); at `UNJUDGED_REVIEW_LIMIT` its next step is escalation, not another resubmit.
+   */
+  private noticeUnjudgedReview(runId: string, snapshotDigest: string, reviewed: Decision<ReviewPacket>, attemptId: string): Decision<void> {
+    const run = this.runs.require(runId);
+    // Limit: a project-less bootstrap run gets no notice. Its driven bootstrap CTO is told to write and submit a new
+    // PLAN for any REVISION_REQUEST, which would replace the PLAN under review; it keeps the daemon's review-retry
+    // wake (`Daemon.#bootstrapReviewRetry`), which resubmits the same PLAN, as today.
+    if (isProjectlessBootstrap(run)) return allow(ReasonCode.OK, undefined);
+    const roleKey = this.runs.ownerRoleKeyFor(run);
+    const binding = roleKey ? this.bindings.active(roleKey) : null;
+    if (!binding) return allow(ReasonCode.OK, undefined);
+    const notice = reviewed.evidence["problem"] === "METHOD_FINDINGS_ONLY" ? "METHOD_FINDINGS_ONLY" : "REVIEW_UNAVAILABLE";
+    const methodFindings = notice === "METHOD_FINDINGS_ONLY" ? this.storedReview(runId, snapshotDigest)?.content.methodFindings : undefined;
+    const unjudgedAttempts = this.consecutiveUnjudgedAttempts(runId, snapshotDigest);
+    const nextStep = unjudgedAttempts < UNJUDGED_REVIEW_LIMIT ? "RESUBMIT" : "ESCALATE";
+    const enqueued = this.outbox.enqueue({
+      idempotencyKey: `revision:${runId}:${snapshotDigest}:${reviewed.reasonCode}:${attemptId}`,
+      roleKey: binding.roleKey,
+      bindingGeneration: binding.bindingGeneration,
+      targetSessionId: binding.sessionId,
+      runId,
+      kind: MessageKind.REVISION_REQUEST,
+      payload: {
+        runId,
+        reasonCode: reviewed.reasonCode,
+        stage: "review-unavailable",
+        candidateSnapshotDigest: snapshotDigest,
+        attemptId,
+        notice,
+        unjudgedAttempts,
+        unjudgedAttemptLimit: UNJUDGED_REVIEW_LIMIT,
+        nextStep,
+        recovery: `${UNJUDGED_REVIEW_NOTICES[notice]} ${UNJUDGED_REVIEW_NEXT_STEPS[nextStep]}`,
+        ...(methodFindings === undefined ? {} : { methodFindings }),
+      },
+    });
+    return enqueued.allowed ? allow(ReasonCode.OK, undefined) : (enqueued as Decision<void>);
+  }
+
+  /**
+   * F1 — the unjudged attempts in a row on this candidate: walking the run's submission freezes from the latest back,
+   * each one of this candidate whose attempt recorded, while it held the run, a BLIND_REVIEW_UNAVAILABLE row counts,
+   * and the first other one (another candidate, or an attempt that ended any other way) stops the count. A freeze
+   * outside a submission names no attempt, and a submission refused at the limit (or `except`, the one asking) did
+   * not end the run of unjudged attempts; all three are passed over.
+   */
+  private consecutiveUnjudgedAttempts(runId: string, snapshotDigest: string, except?: string): number {
+    const rows = this.audit.forRun(runId);
+    const attemptsOf = (kind: string) => new Set(rows
+      .filter((row) => row.kind === kind && row.evidence["attemptHeld"] !== false)
+      .map((row) => row.evidence["attemptId"]));
+    const unjudged = attemptsOf("BLIND_REVIEW_UNAVAILABLE");
+    const refused = attemptsOf(UNJUDGED_REVIEW_LIMIT_REFUSED);
+    let count = 0;
+    for (const freeze of rows.filter((row) => row.kind === "CANDIDATE_FROZEN").sort((a, b) => b.eventId - a.eventId)) {
+      const attempt = freeze.evidence["attemptId"];
+      if (typeof attempt !== "string" || attempt === except || refused.has(attempt)) continue;
+      if (freeze.evidence["candidateSnapshotDigest"] !== snapshotDigest || !unjudged.has(attempt)) break;
+      count += 1;
+    }
+    return count;
   }
 
   /** The review gate's own BLIND_REVIEW artifact for a candidate, or null when the gate stored none. */

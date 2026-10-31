@@ -3,6 +3,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, RunState } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
+import { UNJUDGED_REVIEW_NEXT_STEPS, UNJUDGED_REVIEW_NOTICES } from "../../src/run/candidate-pipeline.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, commitAll, writeFiles } from "../helpers/fixtures.ts";
 import { applyFailingChange, bindCeo, bindWorker, makeHarness, registerFixtureProject, reviewerPass, reviewerRevise } from "../helpers/harness.ts";
@@ -106,7 +107,15 @@ describe("#1189 the pipeline's attempt stamp", () => {
     expect(unavailable[0]!.reasonCode).toBe(ReasonCode.ISOLATION_LOST);
     // The revisions are delivered as before, keyed by the same attempts the rows name.
     const revisions = h.cp.outbox.listByRun(runId).filter((message) => message.kind === MessageKind.REVISION_REQUEST);
-    expect(revisions.map((message) => message.idempotencyKey.slice(message.idempotencyKey.lastIndexOf(":") + 1)).sort()).toEqual([attempt1, attempt2].sort());
+    const notices = revisions.filter((message) => (message.payload as { stage?: unknown }).stage === "review-unavailable");
+    expect(revisions.filter((message) => !notices.includes(message)).map((message) => message.idempotencyKey.slice(message.idempotencyKey.lastIndexOf(":") + 1)).sort())
+      .toEqual([attempt1, attempt2].sort());
+    // F1 — attempt 3's unavailable review sent the owner exactly one fixed notice, keyed by that attempt, and no revision.
+    expect(notices.map((message) => ({ key: message.idempotencyKey, payload: message.payload }))).toEqual([{
+      key: `revision:${runId}:${freezes[2]!.evidence["candidateSnapshotDigest"]}:${ReasonCode.ISOLATION_LOST}:${attempt3}`,
+      payload: { runId, reasonCode: ReasonCode.ISOLATION_LOST, stage: "review-unavailable", candidateSnapshotDigest: freezes[2]!.evidence["candidateSnapshotDigest"],
+        attemptId: attempt3, notice: "REVIEW_UNAVAILABLE", unjudgedAttempts: 1, unjudgedAttemptLimit: 2, nextStep: "RESUBMIT",
+        recovery: `${UNJUDGED_REVIEW_NOTICES.REVIEW_UNAVAILABLE} ${UNJUDGED_REVIEW_NEXT_STEPS.RESUBMIT}` } }]);
     expect(audit.filter((row) => row.kind === "REVISION_RETURNED_TO_CTO")).toHaveLength(2);
   });
 
