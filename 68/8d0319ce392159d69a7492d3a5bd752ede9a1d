@@ -1,0 +1,11 @@
+Limit: the bundle format does not force excerpt-only files, so trimming to minimal excerpts is up to the staging CTO; revision requests returned to that owning CTO still carry the reviewer's findings over the private channel
+Record-Id: r-be1aa4503e8d
+Provenance: inherited 6499d336236ea0bbbc2e48a406a95ad98ae04590
+
+Limit: for a private-evidence run, a reviewer PASS carrying a BLOCKER finding sends no revision request (unchanged path), so the owning CTO sees only REVIEW_BLOCK and counts, not the blocker text; an unavailable review's detail is reduced to its reason code
+Record-Id: r-a84b6cc765fd
+Provenance: inherited 220955038aa8c5778d0f6f811904e6ad88796040
+
+Warn: do not gate the bundle scan's base64 decode on string length: a file body under 45 bytes encodes to fewer than 60 base64 characters, so its decoded text is never scanned
+Record-Id: r-2fd7d94d6e26
+Provenance: inherited a70e71d77a982f48878ab5bbb51c543fe60c93bb
