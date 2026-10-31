@@ -384,7 +384,7 @@ describe("a late failure of an attempt that no longer holds the run is that atte
     const late = await first;
 
     expect(second).toMatchObject({ allowed: true, value: { stage: "REVISION_REQUIRED" } });
-    expect(late).toMatchObject({ allowed: true, value: { stage: "REVIEW_UNAVAILABLE" } });
+    expect(late).toMatchObject({ allowed: false, reasonCode: ReasonCode.BINDING_GENERATION_STALE, message: expect.stringMatching(/^not applied:/), evidence: { attemptHeld: false } });
     const reclaimedAttempt = reclaimed(h, runId)[0]!.evidence["attemptId"];
     const history = h.cp.audit.forRun(runId).filter((row) => row.kind === "BLIND_REVIEW_UNAVAILABLE");
     expect(history).toHaveLength(1);

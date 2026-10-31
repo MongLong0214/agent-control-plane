@@ -1,7 +1,9 @@
 import { afterAll, describe, expect, it } from "vitest";
 
+import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, RunKind } from "../../src/domain/types.ts";
 import { readReviewRoundSources, summarizeReviewRounds } from "../../src/review/review-round-summary.ts";
+import { STALE_ATTEMPT_NOT_APPLIED } from "../../src/run/candidate-pipeline.ts";
 import { bootstrapCoverageKeys, bootstrapPlan, cleanTreeManifest, reviewBootstrapPlan, submitBootstrapPlan } from "../helpers/bootstrap-plan.ts";
 import { cleanupTempDirs, gitSync } from "../helpers/fixtures.ts";
 import { applyPassingChange, bindCeo, dispatchBootstrapRun, makeHarness, registerFixtureProject, reviewerPass, reviewerRevise } from "../helpers/harness.ts";
@@ -54,7 +56,7 @@ describe("#1189 round-1 review witnesses", () => {
     release();
     const prior = await first;
     expect(second).toMatchObject({allowed:true,value:{stage:"COMPLETED_REVIEW"}});
-    expect(prior).toMatchObject({allowed:true,value:{stage:"REVIEW_UNAVAILABLE"}});
+    expect(prior).toMatchObject({allowed:false,reasonCode:ReasonCode.BINDING_GENERATION_STALE,message:STALE_ATTEMPT_NOT_APPLIED,evidence:{attemptHeld:false}});
     const overlap = JSON.stringify(summary().rounds.map(r=>({outcome:r.outcome,ready:r.readyForCeo,reason:r.reasonCode,attempt:r.attemptId})));
     expect(summary().rounds.map(r=>r.outcome), overlap).toEqual(["REVIEW_UNAVAILABLE","REVIEW_PASSED"]);
   });
@@ -128,7 +130,7 @@ const overlap = async () => {
   release();
   const prior = await first;
   expect(second).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
-  expect(prior).toMatchObject({ allowed: true, value: { stage: "REVIEW_UNAVAILABLE" } });
+  expect(prior).toMatchObject({ allowed: false, reasonCode: ReasonCode.BINDING_GENERATION_STALE, message: STALE_ATTEMPT_NOT_APPLIED, evidence: { attemptHeld: false } });
   return { h, runId, summary };
 };
 
