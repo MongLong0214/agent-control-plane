@@ -40,7 +40,7 @@ import {
   ClaudeUsageCollector,
   CodexUsageCollector,
   GrokUsageCollector,
-  CodexAppServerExited,
+  CodexAppServerFailed,
   SpawnCodexRateLimitProbe,
   type CodexAppServerLaunch,
   type CodexRateLimitProbe,
@@ -3133,12 +3133,16 @@ const linkedCredential = (path: string): string | null => {
 };
 
 /**
- * Whether an app-server that ended before answering was refused by its confinement rather than run:
- * sandbox-exec's own failures (65 for a profile it rejects, 71 when it cannot apply it or exec its launcher),
- * or `env`'s 126 for an executable the profile denied — only when the file itself is executable, so a bad
- * install still reads as a runtime that cannot run.
+ * Whether a failed app-server read under the composed profile was the confinement refusing the launch.
+ * Fail closed: it is *not* a refusal only when the process provably ran — its exit was confirmed, with a
+ * status that is not the launcher's. A launcher that never spawned (EAGAIN, ENOENT, EACCES), an exit that
+ * was never confirmed, and a failure of unknown shape are refusals; so are sandbox-exec's own statuses (65
+ * for a profile it rejects, 71 when it cannot apply it or exec), and `env`'s 126 for an executable the
+ * profile denied when the file itself is executable, so a bad install still reads as a runtime that cannot run.
  */
-const launchRefused = (exitCode: number | null, executable: string): boolean => {
+const launchRefused = (error: unknown, executable: string): boolean => {
+  if (!(error instanceof CodexAppServerFailed) || error.launch.kind !== "exited") return true;
+  const { exitCode } = error.launch;
   if (exitCode === 65 || exitCode === 71) return true;
   if (exitCode !== 126) return false;
   try {
@@ -3162,8 +3166,9 @@ const launchRefused = (exitCode: number | null, executable: string): boolean => 
  *
  * A profile, sandbox or proxy failure is also a boundary refusal, recorded for `CodexCliAdapter.probeCapacity`
  * (`boundaryRefusals`), which then starts no `--version` beside it: a home that cannot be resolved, a linked
- * credential, a profile sandbox-exec does not accept or that refuses the launch, and a proxy that fails. A
- * lease that is only busy, a spent budget and an app-server that ran and failed are not refusals.
+ * credential, a profile sandbox-exec does not accept, a launch that failed or whose exit is unknown
+ * (`launchRefused`), and a proxy that fails. A lease that is only busy, a spent budget and an app-server that
+ * provably ran and failed are not refusals.
  */
 export class ReviewerProfiledCodexRateLimitProbe implements CodexRateLimitProbe {
   constructor(
@@ -3245,8 +3250,10 @@ export class ReviewerProfiledCodexRateLimitProbe implements CodexRateLimitProbe 
         .read({ binary: native, timeoutMs: remainingMs, codexHome: input.codexHome, launch })
         .catch((error: unknown) => {
           if (lease.died()) return proxyDied();
-          if (error instanceof CodexAppServerExited && launchRefused(error.exitCode, native)) {
-            return refuse(new Error(`the composed reviewer profile refused to launch the Codex app-server (exit ${String(error.exitCode)})`));
+          if (launchRefused(error, native)) {
+            return refuse(new Error(
+              `the Codex app-server's launch under the composed reviewer profile failed: ${error instanceof Error ? error.message : String(error)}`,
+            ));
           }
           return Promise.reject(error);
         });

@@ -1,3 +1,5 @@
+import type * as ChildProcessModule from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server } from "node:net";
@@ -66,10 +68,35 @@ vi.mock("../../src/runtime/reviewer-egress.ts", async (importOriginal) => {
   };
 });
 
+/**
+ * When set, replaces the one spawn that launches the app-server under the composed profile (`sandbox-exec`
+ * with `app-server` in its argv). Every other spawn — the profile pre-check, the proxy, `--version` — is real.
+ */
+const launchInjection = vi.hoisted(() => ({
+  current: null as null | ((realSpawn: typeof ChildProcessModule.spawn) => ChildProcess),
+  used: 0,
+}));
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof ChildProcessModule>();
+  const spawn = (...spawnArgs: unknown[]): ChildProcess => {
+    const [file, args] = spawnArgs as [unknown, unknown];
+    const inject = launchInjection.current;
+    if (inject && file === "/usr/bin/sandbox-exec" && Array.isArray(args) && args.includes("app-server")) {
+      launchInjection.used += 1;
+      return inject(actual.spawn);
+    }
+    return Reflect.apply(actual.spawn, undefined, spawnArgs) as ChildProcess;
+  };
+  return { ...actual, spawn };
+});
+
 afterAll(cleanupTempDirs);
 afterEach(() => {
   vi.restoreAllMocks();
   leases.list.length = 0;
+  launchInjection.current = null;
+  launchInjection.used = 0;
 });
 
 interface StubRecord {
@@ -450,6 +477,15 @@ const sandboxedProbe = (fixture: Fixture): CodexRateLimitProbe => {
   return new Probe({ egress: fixture.egress, provider: "gpt", denyReadPaths: [] });
 };
 
+/** The collector with the sandboxed probe and a budget of `timeoutMs`. */
+const collectorWithin = (fixture: Fixture, timeoutMs: number) => new CodexUsageCollector({
+  clock: new ManualClock("2026-10-31T00:00:00.000Z"),
+  binary: fixture.stub,
+  codexHome: fixture.home,
+  timeoutMs,
+  codexRateLimits: sandboxedProbe(fixture),
+});
+
 const leaseDirectories = (fixture: Fixture): string[] =>
   existsSync(fixture.egress.runtimeDir) ? readdirSync(fixture.egress.runtimeDir) : [];
 
@@ -768,18 +804,85 @@ describe("W9: a Codex home that cannot be resolved is a boundary refusal, before
   }, 60_000);
 });
 
+/**
+ * A launcher in this process's own group (not detached), so the probe's group SIGKILL on settling misses it
+ * and its own exit status arrives after the settling event, as a launcher that had already exited does.
+ */
+const launcherExiting = (script: string, epipe: boolean) => (realSpawn: typeof ChildProcessModule.spawn): ChildProcess => {
+  const child = realSpawn("/bin/sh", ["-c", script], { stdio: ["pipe", "pipe", "pipe"] });
+  if (epipe) {
+    // The launcher's stdin is gone: the probe's first request fails with EPIPE before the exit status arrives.
+    child.stdin!.write = ((): boolean => {
+      process.nextTick(() => child.stdin!.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" })));
+      return false;
+    }) as typeof child.stdin.write;
+  }
+  return child;
+};
+
+/** A launcher the operating system never starts, with the errno it reports. */
+const launcherNotSpawned = (errno: "EAGAIN" | "ENOENT") => (realSpawn: typeof ChildProcessModule.spawn): ChildProcess => {
+  const child = realSpawn("/nonexistent/acp-cpr-sandbox-exec", ["app-server", "--stdio"], { stdio: ["pipe", "pipe", "pipe"], detached: true });
+  if (errno === "EAGAIN") {
+    const emit = child.emit.bind(child);
+    child.emit = ((event: string, ...rest: unknown[]) => event === "error"
+      ? emit("error", Object.assign(new Error("spawn /usr/bin/sandbox-exec EAGAIN"), { code: "EAGAIN", errno: -35, syscall: "spawn /usr/bin/sandbox-exec" }))
+      : emit(event, ...rest)) as typeof child.emit;
+  }
+  return child;
+};
+
+describe("W10: whatever settles the read first, a launch the composed profile did not let run is a boundary refusal", () => {
+  for (const row of [
+    { name: "EPIPE, then the launcher exits 126 (env denied the exec)", inject: launcherExiting("sleep 0.3; exit 126", true) },
+    { name: "EPIPE, then sandbox-exec exits 65 (profile rejected)", inject: launcherExiting("sleep 0.3; exit 65", true) },
+    { name: "EPIPE, then sandbox-exec exits 71 (cannot apply or exec)", inject: launcherExiting("sleep 0.3; exit 71", true) },
+    { name: "the launcher spawn fails with EAGAIN", inject: launcherNotSpawned("EAGAIN") },
+    { name: "the launcher is not there (ENOENT)", inject: launcherNotSpawned("ENOENT") },
+    { name: "control: the launcher exits 126 with no EPIPE before it", inject: launcherExiting("exit 126", false) },
+  ]) {
+    it(`${row.name}: runtime UNKNOWN and no version probe`, async (ctx) => {
+      requireSeatbelt(ctx);
+      const fixture = await makeFixture();
+      launchInjection.current = row.inject;
+      const reading = await codexAdapter(fixture).probeCapacity();
+      expect({
+        launched: launchInjection.used,
+        codexCalls: await settledRecords(fixture),
+        sensorHealth: reading.sensorHealth,
+        runtimeHealth: reading.runtimeHealth,
+        refusedAtLaunch: /launch under the composed reviewer profile failed|refused to launch/.test(reading.error ?? ""),
+      }).toEqual({ launched: 1, codexCalls: [], sensorHealth: "ERROR", runtimeHealth: "UNKNOWN", refusedAtLaunch: true });
+      await vi.waitFor(() => expect(leaseDirectories(fixture)).toEqual([]), { timeout: 5_000, interval: 25 });
+    }, 60_000);
+  }
+
+  it("a timeout settles first and the launcher then exits 71: still a refusal", async (ctx) => {
+    requireSeatbelt(ctx);
+    const fixture = await makeFixture();
+    // Answers nothing, and exits 71 once the probe, settled by its timer, closes the launcher's stdin.
+    launchInjection.current = launcherExiting("cat >/dev/null; exit 71", false);
+    const reading = await collectorWithin(fixture, 2_000).collect();
+    expect(launchInjection.used).toBe(1);
+    expect(reading.sensorHealth).toBe("ERROR");
+    expect(reading.error).toMatch(/launch under the composed reviewer profile failed: codex app-server did not answer in time \(exit 71\)/);
+  }, 60_000);
+
+  it("control: a launch that provably ran and exited 1 is an app-server failure, and the version probe still runs", async (ctx) => {
+    requireSeatbelt(ctx);
+    const fixture = await makeFixture();
+    launchInjection.current = launcherExiting("sleep 0.3; exit 1", true);
+    const reading = await codexAdapter(fixture).probeCapacity();
+    expect({ launched: launchInjection.used, sensorHealth: reading.sensorHealth, runtimeHealth: reading.runtimeHealth, codexCalls: await settledRecords(fixture) })
+      .toEqual({ launched: 1, sensorHealth: "ERROR", runtimeHealth: "HEALTHY", codexCalls: ["version"] });
+  }, 60_000);
+});
+
 describe("W5: a collector and a reviewer each hold and release only their own egress", () => {
   const reviewOnce = async (adapter: CodexCliAdapter) => {
     const packetRoot = realpathSync(tempDir("acp-cpr-packet-"));
     return adapter.startSession({ model: "gpt-6.1-sol", effort: "xhigh", workdir: packetRoot, purpose: "blind-review", isolation: isolationFor(packetRoot) });
   };
-  const collectorWithin = (fixture: Fixture, timeoutMs: number) => new CodexUsageCollector({
-    clock: new ManualClock("2026-10-31T00:00:00.000Z"),
-    binary: fixture.stub,
-    codexHome: fixture.home,
-    timeoutMs,
-    codexRateLimits: sandboxedProbe(fixture),
-  });
 
   it("a collector that times out behind a running reviewer leaves the reviewer's proxy and lease, and releases only its own", async (ctx) => {
     requireSeatbelt(ctx);
