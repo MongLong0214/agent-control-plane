@@ -7,7 +7,9 @@ agentctl run export <runId>
 agentctl baseline export --from <ISO-8601> --to <ISO-8601>
 ```
 
-The first command emits one canonical JSON `agent-control-plane.run-evidence-export.v1` bundle. The second emits a canonical JSON `agent-control-plane.baseline-export.v1` bundle containing completed runs whose `endedAt` falls in the inclusive window, plus a mechanical Gate A coverage report. The newline printed after the JSON is terminal framing and is not part of the checksum.
+The first command emits one canonical JSON `agent-control-plane.run-evidence-export.v2` bundle. The second emits a canonical JSON `agent-control-plane.baseline-export.v2` bundle containing completed runs whose `endedAt` falls in the inclusive window, plus a mechanical Gate A coverage report. The newline printed after the JSON is terminal framing and is not part of the checksum.
+
+Schema v2 (#1189) replaced v1 when the quality projection gained `postMergeChecks`. Reproduce and verify, for runs and baselines, accept only v2; a v1 bundle is refused as a version mismatch and is not reproduced, while a damaged or edited v2 is refused as an integrity failure. The boolean APIs return `false` for both; `evidenceExportRefusal(bundle, sourceDb?)` returns `VERSION_MISMATCH`, `INTEGRITY_FAILURE` or `null`. Consumers outside this repository and archived v1 bundles have not been checked against this change.
 
 ## Trust anchor and integrity
 
@@ -60,7 +62,7 @@ The export contains only observation and recording contracts; it does not select
 - Usage: source (`PROVIDER_REPORTED`, `CLI_REPORTED`, `QUOTA_DELTA`, `ACP_ESTIMATED`, or `UNAVAILABLE`), token dimensions, raw-observation digest, parser/collector version, confidence, quota observations, and versioned cost conversion identifier. `UNAVAILABLE` retains null values; it never creates zero token counts.
 - Graph: task/dependency structure, depth, observed parallel width, derivable critical path, plan/graph revision counts, and structural serial/parallel eligibility. Retry and repair counts are omitted until a durable source exists. No task prompt or chain-of-thought is exported.
 - Quality: verification and review facts, finding categories, CEO and owner interventions, immutable GitHub receipt digests, post-merge observations, and explicit rollback/defect-escape observations (`OBSERVED`, `NOT_OBSERVED`, or `UNAVAILABLE`). A rollback *plan* is not misrepresented as a completed compensation.
-- Post-merge checks: `quality.postMergeChecks` is `PASSED`, `NONE_DECLARED` (the pinned manifest declares none: nothing to verify, not a pass), `FAILED`, or `UNOBSERVED` (unanswered, missing, malformed or unbound), read only from the post_merge_verify receipt bound to this run's verified merge SHA and from `qualitySource.postMergeCheckInputs`; only `PASSED` or `NONE_DECLARED` covers the `postMergeVerification` fact, and `quality.postMergeVerification` is unchanged.
+- Post-merge checks: `quality.postMergeChecks` is `PASSED`, `NONE_DECLARED` (the pinned manifest declares none: nothing to verify, not a pass), `FAILED`, or `UNOBSERVED` (unanswered, missing, malformed or unbound), read only from the post_merge_verify receipt bound to this run's verified merge SHA and from `qualitySource.postMergeCheckInputs`; only `PASSED` or `NONE_DECLARED` covers the `postMergeVerification` fact, and `quality.postMergeVerification` keeps its earlier computation.
 - Task class: the fixed V1-BR-05 vocabulary with append-only proposed/final history and nullable confidence. The old lower-case operational category remains separate.
 - Harness: binary/schema/adapter/bundle/manifest/verification/review/tool-policy pins. Values the runtime cannot prove are `null`, not guesses.
 

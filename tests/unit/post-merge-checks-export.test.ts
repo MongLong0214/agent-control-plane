@@ -260,6 +260,26 @@ describe("#1189 (b) post-merge checks told apart in the run-evidence export", ()
     expect(later.baseline.quality["postMergeVerification"]).toBe("PRESENT");
   });
 
+  it("does not let a receipt taken under another declared set answer for the set now declared on the same merge SHA", async () => {
+    // Each receipt is written as postMergeVerify would have written it under the earlier set; the trusted set
+    // the export reads now is the pinned manifest's, and the receipt's checks are compared against it.
+    const cases: Array<{ now: string[]; then: { checks: Check[]; noChecksDeclared?: true } }> = [
+      { now: ["unit", "e2e"], then: { checks: [], noChecksDeclared: true } },
+      { now: ["unit", "e2e"], then: { checks: [{ name: "unit", conclusion: "success" }] } },
+      { now: ["unit"], then: { checks: [{ name: "unit", conclusion: "success" }, { name: "e2e", conclusion: "success" }] } },
+    ];
+    for (const { now, then } of cases) {
+      const h = makeHarness();
+      const { runId, identity } = await runWith(h, now);
+      recordMerge(h, runId, identity, SHA);
+      recordPostMerge(h, runId, identity, SHA, then);
+      const bundle = exported(h, runId);
+      expect(postMergeFact(bundle), JSON.stringify({ now, then })).toBe(false);
+      expect(bundle.baseline.quality["postMergeChecks"], JSON.stringify({ now, then })).toBe("UNOBSERVED");
+      expect(bundle.baseline.quality["postMergeVerification"]).toBe("PRESENT");
+    }
+  });
+
   it("reads a run with no verified merge as UNOBSERVED", async () => {
     const h = makeHarness();
     const { runId } = await runWith(h, ["unit"]);

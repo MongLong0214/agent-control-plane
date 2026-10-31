@@ -1476,6 +1476,27 @@ export const verifyBaselineEvidenceExport = (value: unknown, sourceDb: Db): bool
   return bundle.runs.every((run) => verifyRunEvidenceExport(run, sourceDb));
 };
 
+export type EvidenceExportRefusal = "VERSION_MISMATCH" | "INTEGRITY_FAILURE";
+
+const EXPORT_SCHEMA_FAMILY = /^agent-control-plane\.(?:run-evidence-export|baseline-export)\.v\d+$/;
+
+/**
+ * #1189 (b) — why a bundle is refused, beside the boolean APIs (same signatures): null when accepted (by reproduce, or by
+ * verify when `sourceDb` is given), VERSION_MISMATCH when it names another version of this export (v1 is never
+ * reproduced), INTEGRITY_FAILURE for any other refusal of a bundle — damaged, edited or not matching its host.
+ */
+export const evidenceExportRefusal = (value: unknown, sourceDb?: Db): EvidenceExportRefusal | null => {
+  const schema = asRecord(value)?.["schema"];
+  if (
+    typeof schema === "string" && EXPORT_SCHEMA_FAMILY.test(schema) &&
+    schema !== RUN_EVIDENCE_EXPORT_SCHEMA_ID && schema !== BASELINE_EXPORT_SCHEMA_ID
+  ) return "VERSION_MISMATCH";
+  const accepted = schema === BASELINE_EXPORT_SCHEMA_ID
+    ? (sourceDb ? verifyBaselineEvidenceExport(value, sourceDb) : reproduceBaselineEvidenceExport(value))
+    : (sourceDb ? verifyRunEvidenceExport(value, sourceDb) : reproduceRunEvidenceExport(value));
+  return accepted ? null : "INTEGRITY_FAILURE";
+};
+
 const artifactDigestForExport = (
   kind: unknown,
   content: unknown,
