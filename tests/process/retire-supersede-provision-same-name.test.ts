@@ -38,11 +38,11 @@ if (cmd === 'git') {
     const [url, dest] = args.slice(args.indexOf('--') + 1);
     const repo = github()[url];
     if (!repo) process.exit(128);
-    child.execFileSync(process.env.TEST_REAL_GIT, ['clone', '-q', '-b', 'dev', repo.bare, dest]);
-    child.execFileSync(process.env.TEST_REAL_GIT, ['-C', dest, 'remote', 'set-url', 'origin', url]);
+    child.execFileSync(process.env.TEST_REAL_GIT, ['clone', '-q', '-b', 'dev', repo.bare, dest], { timeout: 20000 });
+    child.execFileSync(process.env.TEST_REAL_GIT, ['-C', dest, 'remote', 'set-url', 'origin', url], { timeout: 20000 });
     process.exit(0);
   }
-  const passed = child.spawnSync(process.env.TEST_REAL_GIT, args, { stdio: 'inherit' });
+  const passed = child.spawnSync(process.env.TEST_REAL_GIT, args, { stdio: 'inherit', timeout: 20000 });
   process.exit(passed.status === null ? 1 : passed.status);
 }
 const a = JSON.parse(fs.readFileSync(path.join(home, 'allocation.json'), 'utf8'));
@@ -183,7 +183,7 @@ it('#1230: retire, then a bootstrap that supersedes the retired project, provisi
   const hostEnv = (a:ProjectAllocation):Record<string,string> => ({
     PATH:`${bin}:/usr/bin:/bin:/usr/sbin`,ACP_BUZZ_BINARY:join(pinned,'buzz'),ACP_CLAUDE_BINARY:join(pinned,'claude'),ACP_RESOLVED_BUZZ_BINARY:'',ACP_RESOLVED_CLAUDE_BINARY:'',
     CLAUDE_CONFIG_DIR:join(home,'.claude'),ACP_BUZZ_ADMISSION_COMMAND:JSON.stringify(['docker','exec','buzz-prod-relay-1','buzz-admin','add-member']),
-    TEST_REAL_GIT:execFileSync('/bin/sh',['-c','command -v git'],{encoding:'utf8'}).trim(),
+    TEST_REAL_GIT:execFileSync('/bin/sh',['-c','command -v git'],{encoding:'utf8',timeout:10_000}).trim(),
     // The old project's CTO is a stand-in process retirement must stop; the new one is this process.
     TEST_CLAUDE_PID:String(a.projectId === 'old' ? old.pid : process.pid),
   });
