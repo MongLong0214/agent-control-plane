@@ -164,7 +164,8 @@ describe("one predicate decides UNCONFIGURED, for the doctor and the reviewer al
 
       expect(packetReviewerScope(row.override, home).state, row.name).toBe(row.state);
       const adapter = adapterFor({ ...(row.override === undefined ? {} : { reviewerCodexHome: row.override }) });
-      expect(adapter.packetReviewerScope(), row.name).toEqual({ state: row.state, root: row.override || home });
+      const { state, root } = adapter.packetReviewerScope();
+      expect({ state, root }, row.name).toEqual({ state: row.state, root: row.override || home });
 
       const calls = stubCodex();
       const packetRoot = tempDir("acp-prs-agree-");
