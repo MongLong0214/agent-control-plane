@@ -1,0 +1,15 @@
+Limit: only runs whose pinned manifest says required (or is unreadable) commit through CommitLore; runs with no pinned manifest and preferred/off runs are unchanged until a contract change raises them
+Record-Id: r-65ce5f42afc8
+Provenance: inherited bad7dcb6e786e2dfe39e0fe519d6b1e3e1228f90
+
+Limit: in a checkout with a remote, a worker record capture is refused (notes-unfetched) until the CommitLore notes mirror refs/notes/commitlore has been fetched or doctor --fix has recorded that the remote has none; the commit is then blocked with the worker's bytes kept, and commits with nothing to record are unaffected
+Record-Id: r-2810a46f2875
+Provenance: inherited 9ea4ed80daeb42a9a765d42d21693fa5de0a2232
+
+Limit: a checkout with no git dir is treated as no repository: its object format defaults to sha1 and the attribute-source and diff.external checks pass, because there is nothing for git to read
+Record-Id: r-b4832c2f2486
+Provenance: inherited 01afedbe8c39a34328c914e49d2a0103564aecec
+
+Limit: each process leaves one small linked-git directory under TMPDIR per git it uses; it is not removed at exit
+Record-Id: r-48452cefe9af
+Provenance: inherited d5572978d12f7fe744aedab3bbc616f3f512ea5f
