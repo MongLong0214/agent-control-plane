@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import type * as ProcessArgvModule from "../../src/core/process-argv.ts";
 import { chmodSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -48,6 +49,10 @@ import { requireSeatbelt } from "../helpers/seatbelt.ts";
  * - D2: a daemon that restarts while a driven CTO's first work turn is still running runs no second turn
  *   of that conversation while the first one's process lives, and the next turn resumes the conversation
  *   (`--resume`) rather than opening it again (`--session-id`).
+ * - D2-R2: a previous runtime's turn counts as ended only on positive evidence: a `SESSION_TURN` that
+ *   records its process group's confirmed end, or its recorded group provably empty and its group leader
+ *   provably gone. A failed turn whose cleanup was unconfirmed, a start token that cannot be read, or a
+ *   group member that outlived the leader keeps the conversation in doubt; a group wholly gone resolves it.
  *
  * HOME points at a private directory before anything is imported, so every CLI scratch directory and
  * profile follows it and the live daemon's state is never touched.
@@ -58,8 +63,20 @@ const isolatedHome = vi.hoisted(() => {
   return home;
 });
 
+/** D2-R2 — pids whose start token reads as unavailable (as a permission or native error makes it); every other read is the kernel's. */
+const tokenReads = vi.hoisted(() => ({ unavailable: new Set<number>() }));
+vi.mock("../../src/core/process-argv.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof ProcessArgvModule>();
+  return {
+    ...actual,
+    readProcessStartToken: (pid: number): string | null =>
+      tokenReads.unavailable.has(pid) ? null : actual.readProcessStartToken(pid),
+  };
+});
+
 afterEach(() => {
   __testing.setRunCli(null);
+  tokenReads.unavailable.clear();
   vi.restoreAllMocks();
 });
 afterAll(() => {
@@ -505,6 +522,208 @@ describe("O4 D2 — a restart during a driven CTO's first work turn", () => {
       (firstTurnCli as ChildProcess | null)?.kill("SIGKILL");
       await after?.close();
       await before.close();
+    }
+  });
+});
+
+/** How the first turn's CLI looks to its daemon: the process its spawn reported, and its answer, if any. */
+interface FirstTurnCli {
+  /** The pid reported as the turn's spawn: its process group's leader, as the real adapter's holder is. */
+  leader: number;
+  /** The turn's answer; absent when its daemon dies before the turn answers. */
+  answer?: SessionTurnResult;
+}
+
+/**
+ * A driven CTO started by cto_start whose first work turn reports `firstTurn`'s process, after which the
+ * daemon goes down and a fresh one over the same database recovers the session. Every later turn runs
+ * through the real Claude adapter, so its request is mapped to argv.
+ */
+const restartDuringFirstTurn = async (projectId: string, firstTurn: (external: string) => FirstTurnCli) => {
+  const clock = new ManualClock("2026-10-31T00:00:00.000Z");
+  const first = makeHarness({ clock });
+  const claude = new RecordingRuntimeDouble(clock, "claude");
+  const before = await startDaemonProcess(first, claude);
+  await registerFixtureProject(first, projectId);
+  const ceo = bindCeo(first);
+  expect(await callMcpToolOverSocket(before.hermesSocket, ceo, "cto_start", { idempotencyKey: `${projectId}-start`, projectId }))
+    .toMatchObject({ ok: true });
+  const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+  const binding = first.cp.bindings.active(roleKey)!;
+  const session = first.cp.sessions.require(binding.sessionId);
+  const external = session.incarnation.split("#")[0]!;
+  mkdirSync(session.workdir!, { recursive: true });
+  const real = new ClaudeCliAdapter({ clock, capacityFile: join(tempDir("acp-o4a-r2-cap-"), "claude.json"), binary: "/bin/echo" });
+  const requests: SessionTurnSpawnRequest[] = [];
+  const cliArgs: string[][] = [];
+  __testing.setRunCli((async (_file: string, args: readonly string[]) => {
+    cliArgs.push([...args]);
+    return {
+      stdout: JSON.stringify({ session_id: external, result: "ok", is_error: false }),
+      stderr: "",
+      exitCode: 0,
+      timedOut: false,
+      isolationEnforced: false,
+    };
+  }) as unknown as Parameters<typeof __testing.setRunCli>[0]);
+  let reported!: () => void;
+  const inFirstTurn = new Promise<void>((resolve) => {
+    reported = resolve;
+  });
+  let answers = false;
+  claude.runSessionTurn = async (request: SessionTurnRequest): Promise<SessionTurnResult> => {
+    const spawnRequest = request as SessionTurnSpawnRequest;
+    requests.push(spawnRequest);
+    if (requests.length > 1) return real.runSessionTurn(spawnRequest);
+    const cli = firstTurn(external);
+    spawnRequest.onSpawn?.(cli.leader);
+    answers = cli.answer !== undefined;
+    reported();
+    return cli.answer ?? new Promise<SessionTurnResult>(() => undefined);
+  };
+  expect(first.cp.sessionRuntime.wake(roleKey, [{ id: "the-first-turn", kind: "test" }])).toMatchObject({ allowed: true });
+  await inFirstTurn;
+  if (answers) await vi.waitFor(() => expect(finishedTurns(first, binding.sessionId)).toBe(1), { timeout: 10_000 });
+  await before.close();
+
+  const second = makeHarness({ root: first.root, repoPath: first.repoPath, clock });
+  const after = await startDaemonProcess(second, claude);
+  const report = await after.daemon.reconcileContinuity("the daemon restarted during the first turn");
+  expect(report?.unresolved ?? []).not.toContainEqual(expect.objectContaining({ roleKey }));
+  expect(second.cp.sessions.require(binding.sessionId).credentialEpoch).toBe(1);
+  return {
+    cp: second.cp,
+    roleKey,
+    external,
+    requests,
+    cliArgs,
+    /** A wake of the role after the restart, and whether it reached the provider within a beat. */
+    wake: async (id: string) => {
+      const woke = second.cp.sessionRuntime.wake(roleKey, [{ id, kind: "test" }]);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return woke;
+    },
+    close: () => after.close(),
+  };
+};
+
+/** A process of the test's own that runs until it is killed; `detached` makes it lead a group of its own. */
+const runForever = (detached: boolean): ChildProcess =>
+  spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", detached });
+
+/** A group leader (detached) with one child of its own in its group; resolves with both pids. */
+const leaderWithChild = async (): Promise<{ leader: ChildProcess; child: number }> => {
+  const leader = spawn(process.execPath, ["-e", [
+    "const c = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+    "process.stdout.write(String(c.pid) + '\\n');",
+    "setInterval(() => {}, 1000);",
+  ].join(" ")], { stdio: ["ignore", "pipe", "ignore"], detached: true });
+  const child = await new Promise<number>((resolve) => leader.stdout!.once("data", (chunk: Buffer) => resolve(Number(String(chunk).trim()))));
+  return { leader, child };
+};
+
+const exited = (cli: ChildProcess): Promise<unknown> =>
+  cli.exitCode !== null || cli.signalCode !== null ? Promise.resolve() : new Promise((resolve) => cli.once("exit", resolve));
+
+const answersSignal0 = (pid: number): string => {
+  try {
+    process.kill(pid, 0);
+    return "ALIVE";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code ?? "UNKNOWN";
+  }
+};
+
+const killGroup = (pgid: number): void => {
+  try {
+    process.kill(-pgid, "SIGKILL");
+  } catch {
+    /* already gone */
+  }
+};
+
+describe("O4 D2-R2 — a previous runtime's turn is resolved only on positive evidence", () => {
+  it("(a) keeps in doubt a failed turn whose process-group cleanup was unconfirmed while its process lives", async () => {
+    const cli = runForever(true);
+    let world: Awaited<ReturnType<typeof restartDuringFirstTurn>> | null = null;
+    try {
+      world = await restartDuringFirstTurn("o4a-r2-unconfirmed", (external) => ({
+        leader: cli.pid!,
+        answer: {
+          ok: false,
+          text: "",
+          exitCode: null,
+          error: "PROCESS_GROUP_UNCONFIRMED",
+          providerSessionId: external,
+          durationMs: 1,
+          processGroup: { pgid: cli.pid!, ownership: "HOLDER_LOST", detail: "the holder was lost before its group was seen empty" },
+        },
+      }));
+      expect(answersSignal0(cli.pid!)).toBe("ALIVE");
+      expect(await world.wake("after-an-unconfirmed-cleanup")).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONVERSATION_TURN_IN_DOUBT });
+      expect(world.requests).toHaveLength(1);
+      expect(world.cliArgs).toEqual([]);
+    } finally {
+      killGroup(cli.pid!);
+      await world?.close();
+    }
+  });
+
+  it("(b) keeps in doubt a turn whose recorded start token cannot be read while its process lives", async () => {
+    // No group of its own, so only the leader's identity can decide: and it cannot be read.
+    const cli = runForever(false);
+    let world: Awaited<ReturnType<typeof restartDuringFirstTurn>> | null = null;
+    try {
+      world = await restartDuringFirstTurn("o4a-r2-unreadable", () => ({ leader: cli.pid! }));
+      tokenReads.unavailable.add(cli.pid!);
+      expect(answersSignal0(cli.pid!)).toBe("ALIVE");
+      expect(readProcessStartToken(cli.pid!)).toBeNull();
+      expect(await world.wake("while-its-token-cannot-be-read")).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONVERSATION_TURN_IN_DOUBT });
+      expect(world.requests).toHaveLength(1);
+    } finally {
+      cli.kill("SIGKILL");
+      await world?.close();
+    }
+  });
+
+  it("(c) keeps in doubt a turn whose group leader is gone while a member of its group lives", async () => {
+    const { leader, child } = await leaderWithChild();
+    let world: Awaited<ReturnType<typeof restartDuringFirstTurn>> | null = null;
+    try {
+      world = await restartDuringFirstTurn("o4a-r2-member", () => ({ leader: leader.pid! }));
+      leader.kill("SIGKILL");
+      await exited(leader);
+      await vi.waitFor(() => expect(answersSignal0(leader.pid!)).toBe("ESRCH"), { timeout: 5_000 });
+      expect(answersSignal0(child)).toBe("ALIVE");
+      expect(await world.wake("while-a-group-member-lives")).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONVERSATION_TURN_IN_DOUBT });
+      expect(world.requests).toHaveLength(1);
+    } finally {
+      killGroup(leader.pid!);
+      await world?.close();
+    }
+  });
+
+  it("(d) control: once the whole group and its leader are gone, the turn is resolved and the next one resumes", async () => {
+    const { leader, child } = await leaderWithChild();
+    let world: Awaited<ReturnType<typeof restartDuringFirstTurn>> | null = null;
+    try {
+      world = await restartDuringFirstTurn("o4a-r2-gone", () => ({ leader: leader.pid! }));
+      killGroup(leader.pid!);
+      await exited(leader);
+      await vi.waitFor(() => {
+        expect(answersSignal0(-leader.pid!)).toBe("ESRCH");
+        expect(answersSignal0(leader.pid!)).toBe("ESRCH");
+        expect(answersSignal0(child)).toBe("ESRCH");
+      }, { timeout: 5_000 });
+      expect(await world.wake("after-the-group-ended")).toMatchObject({ allowed: true });
+      await vi.waitFor(() => expect(world!.cliArgs).toHaveLength(1), { timeout: 10_000 });
+      expect(world.requests.map((request) => request.conversation)).toEqual(["new", "resume"]);
+      const argv = world.cliArgs[0]!;
+      expect(argv[argv.indexOf("--resume") + 1]).toBe(world.external);
+      expect(argv).not.toContain("--session-id");
+    } finally {
+      killGroup(leader.pid!);
+      await world?.close();
     }
   });
 });

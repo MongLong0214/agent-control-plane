@@ -2,10 +2,12 @@ import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
 import { MCP_MUTATION_RECOVERY } from "../core/mcp-recovery.ts";
 import { randomUUID } from "node:crypto";
 
+import { processGroupEmpty } from "../bootstrap/attempt-writer-group.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
+import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { fixedRuntimes } from "../domain/fixed-role-runtime.ts";
@@ -296,8 +298,10 @@ export class ProvisionedSessionRuntime {
   /** Conversations not opened by a work turn yet; readiness no longer opens them. */
   readonly #newConversations = new Set<string>();
   readonly #lanes = new Map<string, TurnLane>();
-  /** O4 (D2) — the `SESSION_TURN_STARTED` event ids of this runtime's own turns still running. */
+  /** O4 (D2) — the `SESSION_TURN_STARTED` event ids of every turn this runtime started. */
   readonly #ownTurns = new Set<number>();
+  /** O4 (D2) — those of them still running: the lane's current turn, never judged against itself. */
+  readonly #runningTurns = new Set<number>();
 
   constructor(
     private readonly ports: ProvisionedSessionRuntimePorts,
@@ -854,6 +858,9 @@ export class ProvisionedSessionRuntime {
     }
     const startedEventId = intent.value;
     this.#ownTurns.add(startedEventId);
+    this.#runningTurns.add(startedEventId);
+    // D2-R2 — set only by the adapter's positive statement that nothing of this turn outlives it.
+    let processGroupEnded = false;
     if (opens) {
       this.#newConversations.delete(sessionId);
       conversation = "new";
@@ -868,6 +875,9 @@ export class ProvisionedSessionRuntime {
         correlationId: `turn_${randomUUID()}`,
         relay: turn.relay ? this.#route : null,
         onSpawn: (pid) => this.#recordTurnProcess(sessionId, startedEventId, pid, launch),
+        onProcessGroupEnded: () => {
+          processGroupEnded = true;
+        },
       };
       result = await provider.runSessionTurn(request);
     } catch (error) {
@@ -910,11 +920,13 @@ export class ProvisionedSessionRuntime {
         sameConversationId: result.providerSessionId === handle.externalSessionId,
         // #1104 — the turn's own process group, when its cleanup could not confirm it ended.
         ...(result.processGroup === undefined ? {} : { processGroup: result.processGroup }),
-        // O4 (D2) — the start this turn ends.
+        // O4 (D2) — the start this turn ends, and (D2-R2) only when the adapter confirmed it, that its
+        // process group ended with it. An unconfirmed cleanup is never recorded as an end.
         startedEventId,
+        ...(processGroupEnded && result.processGroup === undefined ? { processGroupEnded: true } : {}),
       },
     });
-    this.#ownTurns.delete(startedEventId);
+    this.#runningTurns.delete(startedEventId);
     if (!completed) {
       return deny(
         ReasonCode.SESSION_TURN_FAILED,
@@ -954,29 +966,46 @@ export class ProvisionedSessionRuntime {
   }
 
   /**
-   * O4 (D2) — refuses while a turn of this session's conversation that another runtime started (a daemon
-   * since restarted) may still be running: its start has no `SESSION_TURN`, and the process its spawn
-   * recorded is still that process. Resolved by observation: once that process has ended, the turn has
-   * too. A start with no recorded process spawned none, because the spawn is reported in the same
-   * synchronous run as the start. This runtime's own turns are serialized by its lane and never counted.
+   * O4 (D2, D2-R2) — refuses while an earlier turn of this session's conversation may still be running.
+   * Fails closed: an earlier turn counts as ended only on positive evidence, and everything else keeps the
+   * conversation in doubt (`CONVERSATION_TURN_IN_DOUBT`) until that evidence exists.
+   *
+   * - Its `SESSION_TURN` records `processGroupEnded`: the adapter confirmed its group was seen empty after
+   *   its signal, or that it spawned nothing. A failed turn with an unconfirmed cleanup records no end.
+   * - Or the process its spawn recorded is observed gone: its group (the leader's pid) is empty, `kill(-pgid,
+   *   0)` ESRCH (`processGroupEmpty`), and the leader is DEAD by `probeSessionLiveness` (ESRCH, or a start
+   *   token read back that differs). A live member, EPERM, a token that cannot be read, or an unrecognised
+   *   one is not that evidence.
+   *
+   * A start with neither is in doubt — including one whose spawn was never recorded — with one exception:
+   * a turn this very runtime started, saw return, and whose adapter reported no process (a provider that
+   * does not report spawns). That one is serialized by this runtime's own lane, as every turn was before
+   * D2. The lane's current turn is never judged against itself.
    */
   #turnInDoubt(sessionId: string): Decision<void> {
     const ofSession = (kind: string) => this.ports.audit.byKind(kind).filter((event) => event.sessionId === sessionId);
-    const ended = new Set(ofSession("SESSION_TURN").map((event) => event.evidence["startedEventId"]));
-    const open = new Set(ofSession(SESSION_TURN_STARTED)
-      .map((event) => event.eventId)
-      .filter((eventId) => !ended.has(eventId) && !this.#ownTurns.has(eventId)));
-    if (open.size === 0) return allow(ReasonCode.OK, undefined);
-    for (const spawned of ofSession(SESSION_TURN_SPAWNED)) {
-      const { startedEventId, pid, startedAt } = spawned.evidence as { startedEventId?: unknown; pid?: unknown; startedAt?: unknown };
-      if (typeof startedEventId !== "number" || !open.has(startedEventId) || typeof pid !== "number") continue;
-      if (turnProcessRunning(pid, typeof startedAt === "string" ? startedAt : null)) {
-        return deny(ReasonCode.CONVERSATION_TURN_IN_DOUBT, "a turn of this conversation started before the daemon restarted may still be running", {
-          sessionId,
-          startedEventId,
-          pid,
-        });
+    const ends = new Map(ofSession("SESSION_TURN").map((event) => [event.evidence["startedEventId"], event.evidence] as const));
+    const spawns = new Map(ofSession(SESSION_TURN_SPAWNED).map((event) => [event.evidence["startedEventId"], event.evidence] as const));
+    for (const started of ofSession(SESSION_TURN_STARTED)) {
+      const startedEventId = started.eventId;
+      if (this.#runningTurns.has(startedEventId)) continue;
+      const end = ends.get(startedEventId);
+      if (end?.["processGroupEnded"] === true) continue;
+      const spawn = spawns.get(startedEventId);
+      const pid = spawn?.["pid"];
+      if (typeof pid === "number") {
+        const startedAt = spawn?.["startedAt"];
+        if (processGroupEmpty(pid) === true &&
+          probeSessionLiveness(pid, typeof startedAt === "string" ? startedAt : null) === "DEAD") continue;
+      } else if (spawn === undefined && end !== undefined && this.#ownTurns.has(startedEventId)) {
+        continue;
       }
+      return deny(ReasonCode.CONVERSATION_TURN_IN_DOUBT, "an earlier turn of this conversation is not proven to have ended", {
+        sessionId,
+        startedEventId,
+        pid: typeof pid === "number" ? pid : null,
+        ended: end !== undefined,
+      });
     }
     return allow(ReasonCode.OK, undefined);
   }
@@ -993,21 +1022,6 @@ export class ProvisionedSessionRuntime {
     }
   }
 }
-
-/**
- * O4 (D2) — whether the process a turn's spawn recorded is still that process: its start token reads back
- * as it did at the spawn, or, where none could be read then, the pid still answers. A pid reused since
- * reads as running until it ends; it never makes a running turn read as ended.
- */
-const turnProcessRunning = (pid: number, startedAt: string | null): boolean => {
-  if (startedAt !== null) return readProcessStartToken(pid) === startedAt;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-};
 
 /**
  * The provider's own conversation id is the incarnation's prefix (`CtoLifecycle.spawn` records
