@@ -800,6 +800,11 @@ const blindReviewEvidenceSchema = z
             digest: DIGEST_SCHEMA,
           })
           .strict(),
+        // The CEO-attached private review evidence a STANDARD_WORK candidate was frozen with, by digest.
+        reviewEvidence: z
+          .object({ digest: DIGEST_SCHEMA, bundleSha256: DIGEST_SCHEMA, attachmentDigest: DIGEST_SCHEMA })
+          .strict()
+          .optional(),
       })
       .strict(),
     coveredRepositories: z.array(z.string()),

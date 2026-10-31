@@ -10,16 +10,17 @@ import {
 } from "../bootstrap/bootstrap-plan.ts";
 import { collectBootstrapCeoDecisions, frozenBootstrapCeoDecisions } from "../bootstrap/bootstrap-ceo-decisions.ts";
 import { collectBootstrapReviewEvidence } from "../bootstrap/bootstrap-review-evidence.ts";
+import { collectStandardReviewEvidence, privateEvidenceAnswer, runHadStandardReviewEvidence } from "../review/standard-review-evidence.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
+import { type Decision, type Evidence, acpError, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { commandsForMode, type BranchProfile } from "../contracts/manifest.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
 import { EVIDENCE_PRODUCERS, type ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { ArtifactKind, type RunRow, RunState } from "../domain/types.ts";
+import { ArtifactKind, RunKind, type RunRow, RunState } from "../domain/types.ts";
 import { requiredBaseFor, sourceProbeBranchesFor } from "../github/branch-contract.ts";
 import { currentBranch, mergeBase, revParse, tryRevParse } from "../git/git.ts";
 import { MessageKind } from "../outbox/envelope.ts";
@@ -36,6 +37,7 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
 import {
   type CandidateSnapshot,
   type SnapshotRepositoryInput,
+  type SnapshotReviewEvidence,
   buildCandidateSnapshot,
   buildNoRepositoryCandidateSnapshot,
   candidateSnapshotDigest,
@@ -164,7 +166,9 @@ const revisionAuditEvidence = (
     findingsBySeverity: Object.fromEntries(
       FINDING_SEVERITIES.map((severity) => [severity, findings.filter((finding) => finding.severity === severity).length]),
     ),
-    findingDigests: findings.slice(0, MAX_AUDITED_FINDING_DIGESTS).map((finding) => digestOf(finding)),
+    // A review that read private evidence keeps no digest of its reviewer's text here: a short text is guessable from one.
+    ...(packet.inputManifest?.reviewEvidence === undefined
+      ? { findingDigests: findings.slice(0, MAX_AUDITED_FINDING_DIGESTS).map((finding) => digestOf(finding)) } : {}),
     coveredFiles: packet.coveredFiles.length,
     omittedItems: packet.omittedItems.length,
     ...(planDigest === undefined ? {} : { planDigest: boundedScalar(planDigest) ?? null }),
@@ -391,6 +395,14 @@ export class CandidatePipeline {
       ? undefined
       : readCanonicalCtoIdentity(this.db, run.projectId);
 
+    // A STANDARD_WORK candidate is frozen with the review evidence the CEO has bound now, digests only
+    // (review/standard-review-evidence.ts). A selection that cannot be read back intact refuses the freeze.
+    let reviewEvidence: SnapshotReviewEvidence | null = null;
+    if (run.kind === RunKind.STANDARD_WORK && participants.length > 0) {
+      try { reviewEvidence = collectStandardReviewEvidence({ artifacts: this.artifacts, audit: this.audit, runs: this.runs }, runId); }
+      catch { return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "attached review evidence cannot be frozen", { runId }); }
+    }
+
     const snapshot = participants.length === 0
       ? buildNoRepositoryCandidateSnapshot(
           {
@@ -409,6 +421,7 @@ export class CandidatePipeline {
             repositories,
             ...(contractChange === undefined ? {} : { contractChange }),
             ...(canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity }),
+            ...(reviewEvidence === null ? {} : { reviewEvidence }),
           },
           this.clock,
         );
@@ -529,7 +542,18 @@ export class CandidatePipeline {
     const controller = new AbortController();
     this.#attempts.set(attemptId, controller);
     try {
-      return await this.submitResultOnce(input, attemptId, controller.signal);
+      // The answer is stored as the mutation's result and returned to the caller. For a run that had private review
+      // evidence it is rebuilt from values of known provenance, before it is serialized or stored, and so is a thrown
+      // refusal (`privateEvidenceAnswer`); any other run's answer is exactly as before.
+      let outcome: Decision<PipelineOutcome>;
+      try { outcome = await this.submitResultOnce(input, attemptId, controller.signal); }
+      catch (error) {
+        if (!isAcpError(error) || !runHadStandardReviewEvidence({ audit: this.audit }, input.runId)) throw error;
+        const refused = privateEvidenceAnswer({ artifacts: this.artifacts, audit: this.audit }, input.runId, deny(error.reasonCode, error.message, error.evidence));
+        throw acpError(refused.reasonCode, refused.allowed ? "" : refused.message, refused.evidence);
+      }
+      if (!runHadStandardReviewEvidence({ audit: this.audit }, input.runId)) return outcome;
+      return privateEvidenceAnswer({ artifacts: this.artifacts, audit: this.audit }, input.runId, outcome);
     } finally {
       this.#attempts.delete(attemptId);
       this.releaseAttempt(input.runId, attemptId);

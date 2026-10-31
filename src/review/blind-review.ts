@@ -1,6 +1,7 @@
 import { FRONTIER_SIMPLIFY_SOURCE, frontierReviewPolicy, type FrontierSimplifySource } from "./frontier-simplify-policy.ts";
 import { DogfoodFindingStore } from "../quality/upstream-dogfood.ts";
 import { frozenBootstrapReviewEvidence, originalReviewRecords, type FrozenReviewEvidence, type ReviewEvidenceFile } from "../bootstrap/bootstrap-review-evidence.ts";
+import { frozenStandardReviewEvidence, standardReviewEvidenceDigests, standardReviewEvidenceSection, type FrozenStandardReviewEvidence } from "./standard-review-evidence.ts";
 import type { ReviewRecordVerification } from "../bootstrap/bootstrap-review-evidence-github.ts";
 import { bootstrapServingRuntime, bootstrapCodeGuarantees, type BootstrapRuntimeObservation } from "../bootstrap/bootstrap-runtime-observation.ts";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -81,6 +82,7 @@ import {
   type CandidateSnapshot,
   type SnapshotImport,
   type SnapshotRefusedImport,
+  type SnapshotReviewEvidence,
   candidateSnapshotDigest,
   snapshotCoverageTargets,
 } from "../snapshot/candidate-snapshot.ts";
@@ -238,6 +240,11 @@ export interface ReviewPacket {
      * upstream repository, revision, path and digest. The candidate's REVIEW.md is never this.
      */
     methodology: FrontierSimplifySource;
+    /**
+     * Present only when a STANDARD_WORK candidate was frozen with CEO-attached private review evidence:
+     * the exact bundle every reviewer input carried, by digest (review/standard-review-evidence.ts).
+     */
+    reviewEvidence?: { digest: string; bundleSha256: string; attachmentDigest: string };
   };
   coveredRepositories: string[];
   coveredFiles: string[];
@@ -564,6 +571,7 @@ const reviewPacketDigests = (
   snapshotDigest: string,
   packetDigest: string,
   receipts: readonly ReceiptEvidence[],
+  reviewEvidenceDigests: readonly string[] = [],
 ): ReviewPacketDigests => {
   const linked = receipts.filter((receipt) => receipt.linked);
   const resultDigests = linked.length === 0 ? [] : db.all<{ result_digest: string | null }>(
@@ -576,6 +584,7 @@ const reviewPacketDigests = (
     ...request.verification.results.map((result) => result.outputDigest),
     ...linked.map((receipt) => receipt.diffDigest),
     ...resultDigests,
+    ...reviewEvidenceDigests,
   ].filter(isDigest);
   return { runId: request.runId, candidateSnapshotDigest: snapshotDigest, digests: new Set(digests) };
 };
@@ -618,6 +627,7 @@ const reviewPacketDigest = (
     verificationDigest: digestOf(request.verification),
     coverageTargets: candidateCoverageTargets(request.snapshot, change).map(({ identity, path }) => `${identity}:${path}`),
     reviewPolicies,
+    ...(request.snapshot.reviewEvidence === undefined ? {} : { reviewEvidence: request.snapshot.reviewEvidence.digest }),
   });
 
 /**
@@ -742,6 +752,11 @@ export class BlindReviewGate {
     const changed = this.contractChangeForCandidate(request.runId, request.snapshot);
     if (!changed.allowed) return changed as Decision<ReviewPacket>;
     const change = changed.value;
+    // The private review evidence this candidate was frozen with, read back from the run's private artifacts.
+    let reviewEvidence: FrozenStandardReviewEvidence | null;
+    try { reviewEvidence = frozenStandardReviewEvidence({ artifacts: this.artifacts, audit: this.audit }, request.snapshot); }
+    catch { return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "frozen review evidence failed validation", { runId: request.runId }); }
+    const privateEvidence = reviewEvidence === null ? [] : standardReviewEvidenceSection(reviewEvidence);
 
     const expected = candidateCoverageTargets(request.snapshot, change);
     const reviewers: ReviewerBinding[] = [];
@@ -765,12 +780,12 @@ export class BlindReviewGate {
       // #1166 r3 — the listings get only the room left under the reviewer budget after the other
       // metadata, the chunk envelope and a share for the change itself, so they never crowd out
       // the diff or push the metadata past the budget. A cut is marked in the packet.
-      const bareEvidence = candidateEvidenceSection(this.db, request.runId, trees, execution, 0);
+      const bareEvidence = [...privateEvidence, ...candidateEvidenceSection(this.db, request.runId, trees, execution, 0)];
       const bareOverhead = this.promptOverhead(request, change, bareEvidence, reviewPolicies);
       // The change's real share of a prompt, repository and file fences included.
       const diffShare = this.buildPrompt(request, diffs, undefined, change, bareEvidence, reviewPolicies).length + REVIEWER_TRANSPORT_OVERHEAD_CHARS - bareOverhead;
       const evidenceRoom = CHUNK_THRESHOLD_CHARS - 4_096 - Math.min(diffShare, EVIDENCE_DIFF_RESERVE_CHARS) - bareOverhead;
-      const evidenceSection = candidateEvidenceSection(this.db, request.runId, trees, execution, evidenceRoom);
+      const evidenceSection = [...privateEvidence, ...candidateEvidenceSection(this.db, request.runId, trees, execution, evidenceRoom)];
 
       // Measure the complete input, including diff framing and system instructions, and send
       // this same rendered prompt if it fits. A lockfile is only ever reviewed in a chunk of its own.
@@ -813,7 +828,9 @@ export class BlindReviewGate {
         attemptId: request.attemptId,
         progress: request.progress,
         packetDigests: reviewPacketDigests(this.db, request, snapshotDigest,
-          reviewPacketDigest(request, change, reviewPolicies), execution.receipts),
+          reviewPacketDigest(request, change, reviewPolicies), execution.receipts,
+          reviewEvidence === null ? [] : standardReviewEvidenceDigests(reviewEvidence)),
+        ...(request.snapshot.reviewEvidence === undefined ? {} : { reviewEvidence: request.snapshot.reviewEvidence }),
       });
     } finally {
       this.release(reviewers);
@@ -982,6 +999,8 @@ export class BlindReviewGate {
     progress?: ReviewProgress | undefined;
     /** #1307 — a candidate review's packet digests (`reviewPacketDigests`); absent for a PLAN review. */
     packetDigests?: ReviewPacketDigests;
+    /** The private review evidence a STANDARD_WORK candidate was frozen with; absent for any other review. */
+    reviewEvidence?: SnapshotReviewEvidence;
   }): Decision<ReviewPacket> {
     const { runId, snapshotDigest, outcome, chunked, expected } = input;
     const authoritativeReviewer = outcome.reviewer;
@@ -1014,6 +1033,7 @@ export class BlindReviewGate {
       ...(input.bootstrapPlanIntentDigest === undefined ? {} : { bootstrapPlanIntentDigest: input.bootstrapPlanIntentDigest }),
       contractChange: input.contractChange,
       planReview: input.planReview,
+      ...(input.reviewEvidence === undefined ? {} : { reviewEvidence: input.reviewEvidence }),
     });
 
     // §18.4 / CP-HI-04 — re-check independence at packet time: a session can join the
@@ -1055,7 +1075,11 @@ export class BlindReviewGate {
         model: authoritativeReviewer.preference.model,
         effort: authoritativeReviewer.preference.effort,
         coveredFiles: validated.coveredFiles.length,
-        omittedItems: validated.omittedItems,
+        // A reviewer that read private evidence can echo it in any text it returns: its omissions are a count
+        // here, never its words nor a digest a short text could be guessed from (the findings are already a count).
+        ...(validated.inputManifest.reviewEvidence === undefined
+          ? { omittedItems: validated.omittedItems }
+          : { omittedItems: validated.omittedItems.length }),
         chunked,
         findings: validated.findings.length,
         egressRecords: validated.egressEvidence.length,
@@ -2361,6 +2385,7 @@ export class BlindReviewGate {
     /** A CONTRACT_CHANGE review's binding; null for any other review, whose packet has no such key. */
     contractChange: ContractChangeReviewBinding | null;
     planReview: boolean;
+    reviewEvidence?: SnapshotReviewEvidence;
   }): ReviewPacket {
     const planReview = input.planReview;
     const methodFindings = input.raw.findings.filter((finding) => finding.category === "method");
@@ -2396,6 +2421,9 @@ export class BlindReviewGate {
         reviewerPromptDigests: input.reviewerInputs.map(({ digest }) => digest),
         reviewerInputRepresentations: input.reviewerInputs.map(({ representation }) => representation),
         methodology: { ...FRONTIER_SIMPLIFY_SOURCE },
+        ...(input.reviewEvidence === undefined ? {} : { reviewEvidence: {
+          digest: input.reviewEvidence.digest, bundleSha256: input.reviewEvidence.bundleSha256, attachmentDigest: input.reviewEvidence.attachmentDigest,
+        } }),
       },
       coveredRepositories: [
         ...new Set(

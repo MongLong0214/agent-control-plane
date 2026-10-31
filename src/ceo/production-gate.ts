@@ -55,6 +55,7 @@ import type { VerificationReport } from "../verify/verification-engine.ts";
 import { currentVerdictPasses, currentVerificationResults } from "../verify/verification-history.ts";
 import type { ContinuityGate } from "../run/run-engine.ts";
 import { residentBaseClone } from "../registry/resident-repositories.ts";
+import { currentStandardReviewEvidenceDigest, standardReviewEvidenceCurrent } from "../review/standard-review-evidence.ts";
 import {
   candidateSnapshotDigest,
   candidateSnapshotSchema,
@@ -978,6 +979,19 @@ export class ProductionGate {
       }
     }
 
+    // A STANDARD_WORK candidate's review and approval rest on the private review evidence it was frozen
+    // with: evidence the CEO attached or replaced since leaves them stale for CONFIRM.
+    // The review checked is the one the packet names, by the evidence digest its inputManifest records.
+    if (input.decision === "CONFIRM" && run.kind === RunKind.STANDARD_WORK) {
+      const frozen = this.artifacts.latestForSnapshot<CandidateSnapshot>(input.runId, ArtifactKind.CANDIDATE_SNAPSHOT, input.candidateSnapshotDigest);
+      const reviewed = packet && packet.content.blindReview.provider !== "not-applicable"
+        ? this.artifacts.byDigest<ReviewPacket>(packet.content.blindReview.digest)?.content.inputManifest?.reviewEvidence?.digest ?? null
+        : null;
+      const current = standardReviewEvidenceCurrent({ artifacts: this.artifacts, audit: this.audit, runs: this.runs },
+        { runId: input.runId, reviewEvidence: frozen?.content.reviewEvidence }, reviewed);
+      if (!current.allowed) return current as Decision<{ isBootstrap: boolean }>;
+    }
+
     // The decision is an exercise of the CEO role, so the session must currently hold it.
     // Independence alone would let any unknown id decide (CP-HI-07).
     const holds = this.assertCurrentCeo(input.ceoSessionId);
@@ -1706,6 +1720,11 @@ export class ProductionGate {
 
         const actor = authenticatedOwner ?? `${receipt!.channel}:${receipt!.actor}`;
         const gate = this.humanGateDefinition(input.runId);
+        // A STANDARD_WORK run's consent is bound to the private review evidence in force when it is given:
+        // once the CEO replaces that evidence, the consent no longer counts (`ownerDecisionsOf`).
+        const evidence = fresh.kind === RunKind.STANDARD_WORK ? this.reviewEvidenceInForce(input.runId) : allow(ReasonCode.OK, null);
+        if (!evidence.allowed && input.approved) return evidence as Decision<void>;
+        const reviewEvidenceDigest = evidence.allowed ? evidence.value : null;
         // SEC-OD1 — the canonical owner decision: written only here, through this gate's capability, in
         // the transaction that authenticated the owner. The readers count
         // no other APPROVAL artifact as an owner decision.
@@ -1717,6 +1736,7 @@ export class ProductionGate {
           at: this.clock.nowIso(),
           humanGateDigest: gate.digest,
           candidateSnapshotDigest,
+          ...(reviewEvidenceDigest === null ? {} : { reviewEvidenceDigest }),
           // Retained for attribution; later readers trust this canonical decision.
           receipt,
         }, candidateSnapshotDigest);
@@ -1778,7 +1798,7 @@ export class ProductionGate {
   private boundOwnerDecision(
     runId: string,
     artifact: StoredArtifact<OwnerDecisionRecord>,
-  ): { item: string; approved: boolean; canonical: boolean } | null {
+  ): { item: string; approved: boolean; canonical: boolean; reviewEvidenceDigest: string | null } | null {
     const decision = artifact.content;
     if (
       // The one shape test, shared with v47's refusal of decisions written before its guard.
@@ -1803,11 +1823,18 @@ export class ProductionGate {
     } else if (artifact.producedBy !== OWNER_DECISION_PRODUCER) {
       return null;
     }
+    if (decision.reviewEvidenceDigest !== undefined && typeof decision.reviewEvidenceDigest !== "string") return null;
     return {
       item: decision.item,
       approved: decision.approved,
       canonical: artifact.producedBy === OWNER_DECISION_PRODUCER,
+      reviewEvidenceDigest: decision.reviewEvidenceDigest ?? null,
     };
+  }
+
+  /** The digest of a STANDARD_WORK run's private review evidence in force now (review/standard-review-evidence.ts). */
+  private reviewEvidenceInForce(runId: string): Decision<string | null> {
+    return currentStandardReviewEvidenceDigest({ artifacts: this.artifacts, audit: this.audit, runs: this.runs }, runId);
   }
 
   /** The latest decision per destructive action, in durable creation order. */
@@ -1815,9 +1842,16 @@ export class ProductionGate {
     runId: string,
   ): Map<string, boolean> {
     const latest = new Map<string, boolean>();
+    // An approval given under other private review evidence than the run's current evidence is no consent:
+    // it was given for what that evidence showed. A rejection stays a rejection.
+    const evidence = this.runs.get(runId)?.kind === RunKind.STANDARD_WORK ? this.reviewEvidenceInForce(runId) : null;
     for (const artifact of this.artifacts.listOwnerDecisions<OwnerDecisionRecord>(runId)) {
       const decision = this.boundOwnerDecision(runId, artifact);
       if (!decision) continue;
+      if (decision.approved && decision.canonical && evidence !== null && (!evidence.allowed || evidence.value !== decision.reviewEvidenceDigest)) {
+        latest.set(decision.item, false);
+        continue;
+      }
       // listOwnerDecisions is durable creation order (then rowid), so assignment makes
       // a later explicit rejection revoke an earlier approval for the same gate item.
       if (decision.canonical || !decision.approved) {
@@ -2192,6 +2226,8 @@ interface OwnerDecisionRecord {
   note?: unknown;
   humanGateDigest?: string;
   candidateSnapshotDigest?: string | null;
+  /** The STANDARD_WORK private review evidence in force when the decision was given; absent for none. */
+  reviewEvidenceDigest?: unknown;
   receipt?: unknown;
 }
 

@@ -151,6 +151,7 @@ const EXPECTED_CONVERTED_SITES = [
   { file: "outbox/ceo-notification-ack.ts", symbol: "acknowledgeCeoNotification", label: "acknowledgeCeoNotification", evidence: "direct" },
   // The selected artifact must roll back if its attachment audit refuses, preserving the prior selection.
   { file: "bootstrap/bootstrap-review-evidence.ts", symbol: "attachBootstrapReviewEvidence", label: "attachBootstrapReviewEvidence", evidence: "direct" },
+  { file: "review/standard-review-evidence.ts", symbol: "attachStandardReviewEvidence", label: "attachStandardReviewEvidence", evidence: "direct" },
   { file: "bootstrap/bootstrap-plan-artifact.ts", symbol: "stageBootstrapPlan", label: "stageBootstrapPlan", evidence: "direct" },
   // Input storage, replacement invalidation and notification must roll back if enqueue/audit denies.
   { file: "bootstrap/bootstrap-plan-artifact.ts", symbol: "attachBootstrapPlan", label: "attachBootstrapPlan", evidence: "direct" },
