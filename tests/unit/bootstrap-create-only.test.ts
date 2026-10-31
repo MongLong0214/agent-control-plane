@@ -353,11 +353,11 @@ describe("#246 C5 create-only bootstrap: GitHub initializes the default branch a
       port.createRepository({ owner: "acme", name: "fixture" }, "public", "repo-factory:marker", true),
     );
     // #1240 — the guard is also handed the request's body, so a guard can admit only content it approved.
-    expect(asked).toEqual([{ kind: "api", method: "POST", target: "orgs/acme/repos", body: { name: "fixture", description: "repo-factory:marker", private: false, visibility: "public", auto_init: true } }]);
+    expect(asked).toEqual([{ kind: "api", method: "POST", target: "orgs/acme/repos", body: { name: "fixture", description: "repo-factory:marker", private: false, visibility: "public", auto_init: true, allow_merge_commit: true, allow_squash_merge: false, allow_rebase_merge: false } }]);
     expect(calls.at(-1)).toEqual({
       method: "POST",
       path: "orgs/acme/repos",
-      body: { name: "fixture", description: "repo-factory:marker", private: false, visibility: "public", auto_init: true },
+      body: { name: "fixture", description: "repo-factory:marker", private: false, visibility: "public", auto_init: true, allow_merge_commit: true, allow_squash_merge: false, allow_rebase_merge: false },
     });
   });
 

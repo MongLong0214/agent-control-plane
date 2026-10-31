@@ -65,6 +65,7 @@ describe("GitHub write port over the REST API (#246)", () => {
       visibility: "public",
       description: null,
       defaultBranch: "main",
+      mergeMethods: { allow_merge_commit: null, allow_squash_merge: null, allow_rebase_merge: null },
     });
     expect(await port.observeRepository({ owner: "acme", name: "absent" })).toBeNull();
 
@@ -95,11 +96,12 @@ describe("GitHub write port over the REST API (#246)", () => {
       visibility: "public",
       description: null,
       defaultBranch: null,
+      mergeMethods: { allow_merge_commit: null, allow_squash_merge: null, allow_rebase_merge: null },
     });
     expect(client.calls.at(-1)).toEqual({
       method: "POST",
       path: "orgs/acme/repos",
-      body: { name: "fixture", description: "repo-factory:marker", private: false, visibility: "public", auto_init: false },
+      body: { name: "fixture", description: "repo-factory:marker", private: false, visibility: "public", auto_init: false, allow_merge_commit: true, allow_squash_merge: false, allow_rebase_merge: false },
     });
   });
 
@@ -114,7 +116,7 @@ describe("GitHub write port over the REST API (#246)", () => {
     expect(client.calls.at(-1)).toEqual({
       method: "POST",
       path: "user/repos",
-      body: { name: "fixture", description: "repo-factory:marker", private: true, visibility: "private", auto_init: false },
+      body: { name: "fixture", description: "repo-factory:marker", private: true, visibility: "private", auto_init: false, allow_merge_commit: true, allow_squash_merge: false, allow_rebase_merge: false },
     });
   });
 
