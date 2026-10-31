@@ -3007,19 +3007,26 @@ export class WorkerTurnRunner {
     return first === undefined ? null : { executionId: first.executionId, eventId: first.eventId };
   }
 
-  /** Whether the guard admitted a provider launch for this receipt; a launch with no recorded pid is then unidentifiable. */
   private launchWasAuthorised(executionId: string): boolean {
-    return Boolean(this.ports.db.get<{ n: number }>(
-      `SELECT 1 AS n FROM audit_events
-        WHERE kind = 'MANAGED_WRITE_GUARD'
-          AND json_extract(evidence_json, '$.taskReceiptId') = ?
-          AND json_extract(evidence_json, '$.operation') = 'FILE_MUTATION'
-          AND json_extract(evidence_json, '$.allowed') = 1
-        LIMIT 1`,
-      [executionId],
-    ));
+    return launchWasAuthorised(this.ports.db, executionId);
   }
 }
+
+/**
+ * Whether the guard admitted a provider launch for this receipt; a launch with no recorded pid is then
+ * unidentifiable. The one reader of it: the runner's restart reconciliation and worker retirement
+ * (`WorkerRetirement`) both ask it here.
+ */
+export const launchWasAuthorised = (db: Db, executionId: string): boolean =>
+  Boolean(db.get<{ n: number }>(
+    `SELECT 1 AS n FROM audit_events
+      WHERE kind = 'MANAGED_WRITE_GUARD'
+        AND json_extract(evidence_json, '$.taskReceiptId') = ?
+        AND json_extract(evidence_json, '$.operation') = 'FILE_MUTATION'
+        AND json_extract(evidence_json, '$.allowed') = 1
+      LIMIT 1`,
+    [executionId],
+  ));
 
 /** #1097 — `ignoredPathState`, with a failure kept as its error. */
 /** #512 S-TB — the audit kind for a task branch the control plane created or checked out. */
