@@ -9,7 +9,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { fixedRuntimes } from "../domain/fixed-role-runtime.ts";
 import { Role, type RoleBinding, RunKind, SessionLifecycle } from "../domain/types.ts";
-import { HOLDER_CLAIMED_KINDS } from "../outbox/envelope.ts";
+import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -566,7 +566,8 @@ export class ProvisionedSessionRuntime {
         const ownerMail = this.ports.outbox.hasHolderMessagesFor({ roleKey: binding.roleKey,
           bindingGeneration: binding.bindingGeneration, targetSessionId: binding.sessionId,
           sessionIncarnation: binding.sessionIncarnation });
-        return workPrompt(binding, admitted, admitted.some((trigger) => this.#concernsStandardWork(trigger)), ownerMail);
+        return workPrompt(binding, admitted, admitted.some((trigger) => this.#concernsStandardWork(trigger)), ownerMail,
+          admitted.some((trigger) => this.#isUnjudgedReviewNotice(trigger)));
       };
       const turn = await this.#turn(binding.sessionId, "resume", prompt, {
         relay: true,
@@ -634,6 +635,16 @@ export class ProvisionedSessionRuntime {
     if (trigger.kind.startsWith(STANDARD_CONTINUATION_KIND_PREFIX)) return true;
     const runId = this.ports.outbox.get(trigger.id)?.runId ?? null;
     return runId !== null && this.ports.runs.get(runId)?.kind === RunKind.STANDARD_WORK;
+  }
+
+  /**
+   * F1 — whether a trigger names a review-unavailable notice (`CandidatePipeline.noticeUnjudgedReview`): a
+   * REVISION_REQUEST that asks for no revision. Only such a turn's prompt carries the line that says so, so every
+   * other turn's prompt is exactly what it was.
+   */
+  #isUnjudgedReviewNotice(trigger: SessionWakeTrigger): boolean {
+    const message = this.ports.outbox.get(trigger.id);
+    return message?.kind === MessageKind.REVISION_REQUEST && (message.payload as { stage?: unknown } | null)?.stage === "review-unavailable";
   }
 
   /** Whether this trigger names an outbox row: its settlement is then the row's, not this lane's. */
@@ -1071,7 +1082,17 @@ export const standardWorkContinuationTriggerKind = (runId: string, taskId: strin
 export const standardWorkContinuationTriggerId = (runId: string, taskId: string, taskState: string): string =>
   `standard-work-continuation:${runId}:${taskId}:${taskState}`;
 
-const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[], standardWork: boolean, ownerMail: boolean): string =>
+/** F1 — the driven CTO's reading of a review-unavailable notice; see `#isUnjudgedReviewNotice`. */
+export const UNJUDGED_NOTICE_LINE =
+  "A REVISION_REQUEST whose payload stage is review-unavailable is a notice, never a revision: its review did not judge the product. " +
+  "For it, change no PLAN, task or code and do not provision or run a worker; take only its nextStep. " +
+  "RESUBMIT: once the result_submit of the attempt it names has answered, and only while its unjudgedAttempts is below its unjudgedAttemptLimit, submit that run's result once with mcp__acp-cto__result_submit and a new idempotencyKey. " +
+  "ESCALATE: report it for that run with mcp__acp-cto__escalation_open and do not resubmit. " +
+  "Then acknowledge it with mcp__acp-cto__run_ack.";
+
+export const workPrompt = (
+  binding: RoleBinding, triggers: readonly SessionWakeTrigger[], standardWork: boolean, ownerMail: boolean, unjudgedNotice = false,
+): string =>
   [
     `You are the ${binding.role}${binding.runId ? ` of run ${binding.runId}` : ""} in the agent control plane, at binding generation ${binding.bindingGeneration}.`,
     `The control plane woke you for: ${[...new Set(triggers.map((trigger) => trigger.kind))].join(", ")}.`,
@@ -1099,6 +1120,7 @@ const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[
         ]
       : []),
     `A REVISION_REQUEST for a run whose contract_get returned a bootstrapPlanGuide carries why its PLAN was sent back (the CEO's rationale, or the blind review's findings): for that run, ${PLAN_STEPS}, writing the new PLAN so that it addresses that reason; then acknowledge the REVISION_REQUEST with mcp__acp-cto__run_ack. If the run is ACTIVE, submit the new PLAN's result first, as above; a run the CEO sent back is ACTIVE again with its next RUN_DISPATCH.`,
+    ...(unjudgedNotice ? [UNJUDGED_NOTICE_LINE] : []),
     "An ESCALATION_REPLY is the CEO's resolution of the escalation it names (its escalationId) for a run you are the current owner of: act on it only when it is addressed to you as that run's current owner and names that run's escalation, and then only for that run. " +
       "Carry out its resolution, for example by planning that run again or submitting its result again as the lines above direct, then acknowledge the ESCALATION_REPLY with mcp__acp-cto__run_ack. " +
       "The resolution never bypasses the blind review or the CEO's CONFIRM: a new PLAN still goes through mcp__acp-cto__plan_submit and a result through mcp__acp-cto__result_submit, each with its normal gates. " +

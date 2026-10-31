@@ -3,7 +3,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, RunState } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
-import { UNJUDGED_REVIEW_NOTICES } from "../../src/run/candidate-pipeline.ts";
+import { UNJUDGED_REVIEW_NEXT_STEPS, UNJUDGED_REVIEW_NOTICES } from "../../src/run/candidate-pipeline.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, commitAll, writeFiles } from "../helpers/fixtures.ts";
 import { applyFailingChange, bindCeo, bindWorker, makeHarness, registerFixtureProject, reviewerPass, reviewerRevise } from "../helpers/harness.ts";
@@ -114,7 +114,8 @@ describe("#1189 the pipeline's attempt stamp", () => {
     expect(notices.map((message) => ({ key: message.idempotencyKey, payload: message.payload }))).toEqual([{
       key: `revision:${runId}:${freezes[2]!.evidence["candidateSnapshotDigest"]}:${ReasonCode.ISOLATION_LOST}:${attempt3}`,
       payload: { runId, reasonCode: ReasonCode.ISOLATION_LOST, stage: "review-unavailable", candidateSnapshotDigest: freezes[2]!.evidence["candidateSnapshotDigest"],
-        notice: "REVIEW_UNAVAILABLE", recovery: UNJUDGED_REVIEW_NOTICES.REVIEW_UNAVAILABLE } }]);
+        attemptId: attempt3, notice: "REVIEW_UNAVAILABLE", unjudgedAttempts: 1, unjudgedAttemptLimit: 2, nextStep: "RESUBMIT",
+        recovery: `${UNJUDGED_REVIEW_NOTICES.REVIEW_UNAVAILABLE} ${UNJUDGED_REVIEW_NEXT_STEPS.RESUBMIT}` } }]);
     expect(audit.filter((row) => row.kind === "REVISION_RETURNED_TO_CTO")).toHaveLength(2);
   });
 

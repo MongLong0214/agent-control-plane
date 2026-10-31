@@ -389,6 +389,12 @@ export const ReasonCode = {
   REVIEW_BLOCK: "REVIEW_BLOCK",
   REVIEW_OMITTED_ITEMS_PRESENT: "REVIEW_OMITTED_ITEMS_PRESENT",
   REVIEW_MANUAL_INVOCATION_DENIED: "REVIEW_MANUAL_INVOCATION_DENIED",
+  /**
+   * F1 — a result_submit refused before any verification or review: the same unchanged candidate already went
+   * unjudged (method findings alone, or assurance not constituted) the limit number of times in a row. Not a running
+   * attempt and not a retryable conflict: the owner escalates to the CEO instead of resubmitting.
+   */
+  REVIEW_UNJUDGED_LIMIT_REACHED: "REVIEW_UNJUDGED_LIMIT_REACHED",
 
   // --- github kernel -------------------------------------------------------
   PR_BRANCH_CONTRACT_VIOLATION: "PR_BRANCH_CONTRACT_VIOLATION",

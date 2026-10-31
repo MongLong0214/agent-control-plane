@@ -3,7 +3,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, Role, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
-import { UNJUDGED_REVIEW_NOTICES } from "../../src/run/candidate-pipeline.ts";
+import { UNJUDGED_REVIEW_NEXT_STEPS, UNJUDGED_REVIEW_NOTICES } from "../../src/run/candidate-pipeline.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, commitAll, writeFiles } from "../helpers/fixtures.ts";
 import {
@@ -192,7 +192,9 @@ describe("#1189 §3: an unavailable review is not a code-fix verdict", () => {
     // F1 — the owner gets exactly one fixed notice, no revision: the reason code, the notice and its recovery text only.
     expect(harness.cp.outbox.listByRun(runId).filter((message) => message.kind === MessageKind.REVISION_REQUEST).map((message) => message.payload)).toEqual([{
       runId, reasonCode: outcome.value.reasonCode, stage: "review-unavailable", candidateSnapshotDigest: outcome.value.snapshotDigest,
-      notice: "REVIEW_UNAVAILABLE", recovery: UNJUDGED_REVIEW_NOTICES.REVIEW_UNAVAILABLE }]);
+      attemptId: harness.cp.db.get<{ attempt_id: string }>("SELECT attempt_id FROM candidate_pipeline_attempts WHERE run_id = ?", [runId])!.attempt_id,
+      notice: "REVIEW_UNAVAILABLE", unjudgedAttempts: 1, unjudgedAttemptLimit: 2, nextStep: "RESUBMIT",
+      recovery: `${UNJUDGED_REVIEW_NOTICES.REVIEW_UNAVAILABLE} ${UNJUDGED_REVIEW_NEXT_STEPS.RESUBMIT}` }]);
     expect(harness.cp.artifacts.list(runId, "BLIND_REVIEW")).toEqual([]);
     expectNotCeoReady(harness, runId, outcome.value.snapshotDigest, ceoSessionId);
   });
@@ -365,7 +367,9 @@ describe("#1271: a method finding judges the review method, never the candidate"
       // F1 — the owner gets exactly one fixed notice, no revision; the method findings ride only in that private delivery.
       expect(harness.cp.outbox.listByRun(runId).filter((message) => message.kind === MessageKind.REVISION_REQUEST).map((message) => message.payload)).toEqual([{
         runId, reasonCode: ReasonCode.REVIEW_REQUIRED, stage: "review-unavailable", candidateSnapshotDigest: outcome.value.snapshotDigest,
-        notice: "METHOD_FINDINGS_ONLY", recovery: UNJUDGED_REVIEW_NOTICES.METHOD_FINDINGS_ONLY, methodFindings: [method] }]);
+        attemptId: harness.cp.db.get<{ attempt_id: string }>("SELECT attempt_id FROM candidate_pipeline_attempts WHERE run_id = ?", [runId])!.attempt_id,
+        notice: "METHOD_FINDINGS_ONLY", unjudgedAttempts: 1, unjudgedAttemptLimit: 2, nextStep: "RESUBMIT",
+        recovery: `${UNJUDGED_REVIEW_NOTICES.METHOD_FINDINGS_ONLY} ${UNJUDGED_REVIEW_NEXT_STEPS.RESUBMIT}`, methodFindings: [method] }]);
       for (const reviewerText of [method.summary, method.detail]) {
         expect(JSON.stringify(outcome)).not.toContain(reviewerText);
         // The dogfood record of the method finding (#1271, below) is the only audit row that keeps its text.
