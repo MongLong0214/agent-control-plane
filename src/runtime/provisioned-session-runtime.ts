@@ -249,6 +249,19 @@ interface TurnLane {
 export const SESSION_WAKE_TRIGGER_COMPLETED = "SESSION_WAKE_TRIGGER_COMPLETED";
 
 /**
+ * O4 (D2) — a work turn about to reach its provider, recorded before the spawn. Its `SESSION_TURN` names
+ * it (`startedEventId`) once the provider has answered; one with no `SESSION_TURN` was started by a runtime
+ * that never saw it end.
+ */
+export const SESSION_TURN_STARTED = "SESSION_TURN_STARTED";
+
+/**
+ * O4 (D2) — the process that turn's own spawn created (`pid`, and `startedAt`, its start token as the daemon
+ * read it), recorded in the spawn's tick. While it is still that process the turn may still be running.
+ */
+export const SESSION_TURN_SPAWNED = "SESSION_TURN_SPAWNED";
+
+/**
  * #246 C1b — drives a provisioned (non-canonical) CTO session's real headless runtime: the daemon's
  * one source of its turns, the holder of its credential, and the judge of its readiness.
  *
@@ -283,6 +296,8 @@ export class ProvisionedSessionRuntime {
   /** Conversations not opened by a work turn yet; readiness no longer opens them. */
   readonly #newConversations = new Set<string>();
   readonly #lanes = new Map<string, TurnLane>();
+  /** O4 (D2) — the `SESSION_TURN_STARTED` event ids of this runtime's own turns still running. */
+  readonly #ownTurns = new Set<number>();
 
   constructor(
     private readonly ports: ProvisionedSessionRuntimePorts,
@@ -447,7 +462,7 @@ export class ProvisionedSessionRuntime {
       }
       const current = this.turnEligibility(sessionId, "attestation", conversation, spawn);
       if (!current.allowed) return current;
-      if (conversation === "new" || !this.ports.audit.byKind("SESSION_TURN").some((event) => event.sessionId === sessionId)) {
+      if (conversation === "new" || !this.#turnAttempted(sessionId)) {
         this.#newConversations.add(sessionId);
       }
       return allow(ReasonCode.OK, undefined);
@@ -475,7 +490,7 @@ export class ProvisionedSessionRuntime {
       if (await adapter.value.probeRuntime() === "UNAVAILABLE") {
         return deny(ReasonCode.SESSION_NOT_READY, "the selected runtime is unavailable", { sessionId: session.sessionId });
       }
-      const attempted = this.ports.audit.byKind("SESSION_TURN").some((event) => event.sessionId === session.sessionId);
+      const attempted = this.#turnAttempted(session.sessionId);
       const conversation = resume && attempted ? "resume" : "new";
       if (await adapter.value.probeSession(handleFor(session), { conversation }) === "UNAVAILABLE") {
         return deny(ReasonCode.SESSION_NOT_READY, "the provider no longer has this session", { sessionId: session.sessionId });
@@ -514,6 +529,8 @@ export class ProvisionedSessionRuntime {
     // Admission only: the turn asks again when it runs (`#turn`).
     const eligible = this.turnEligibility(binding.sessionId, "work");
     if (!eligible.allowed) return eligible as Decision<"STARTED" | "COALESCED">;
+    const settled = this.#turnInDoubt(binding.sessionId);
+    if (!settled.allowed) return settled as Decision<"STARTED" | "COALESCED">;
     const lane = this.#lane(binding.sessionId);
     const fresh = triggers.filter((trigger, index) =>
       (!lane.claimed.has(trigger.id) || (lane.pending > 0 && (this.#isEnvelope(trigger.id) || trigger.served !== undefined) && !lane.coalesced.some((queued) => queued.id === trigger.id))) &&
@@ -806,6 +823,12 @@ export class ProvisionedSessionRuntime {
       if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
       return refused(now);
     }
+    // O4 (D2) — never a second turn of a conversation while an earlier runtime's turn of it may still run.
+    const settled = this.#turnInDoubt(sessionId);
+    if (!settled.allowed) {
+      if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
+      return refused(settled);
+    }
     // And, last, the triggers' own gate: a turn left with no trigger to serve (woken only by
     // mentions whose identity, role or room no longer stands behind this holder, or that another
     // turn has already served) is refused here with the gate's own answer, after every await and
@@ -816,7 +839,25 @@ export class ProvisionedSessionRuntime {
       return refused(wanted);
     }
     const text = typeof prompt === "string" ? prompt : prompt();
-    if (turn.purpose === "work" && this.#newConversations.delete(sessionId)) conversation = "new";
+    const opens = turn.purpose === "work" && this.#newConversations.has(sessionId);
+    // O4 (D2) — the turn's intent, durable before its provider spawns: a runtime that starts after this
+    // one died sees that the conversation was attempted (`#turnAttempted`) and that this turn may still be
+    // running (`#turnInDoubt`), not only what a returned turn recorded.
+    const intent = this.ports.audit.record({
+      kind: SESSION_TURN_STARTED,
+      sessionId,
+      evidence: { purpose: turn.purpose, step: opens ? "new" : conversation },
+    });
+    if (!intent.allowed) {
+      if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
+      return refused(intent as Decision<unknown> as Decision<void>);
+    }
+    const startedEventId = intent.value;
+    this.#ownTurns.add(startedEventId);
+    if (opens) {
+      this.#newConversations.delete(sessionId);
+      conversation = "new";
+    }
     let result: SessionTurnResult;
     try {
       const request: SessionTurnSpawnRequest = {
@@ -826,7 +867,7 @@ export class ProvisionedSessionRuntime {
         timeoutMs: turn.timeoutMs,
         correlationId: `turn_${randomUUID()}`,
         relay: turn.relay ? this.#route : null,
-        ...(launch === null ? {} : { onSpawn: pinTurn(launch) }),
+        onSpawn: (pid) => this.#recordTurnProcess(sessionId, startedEventId, pid, launch),
       };
       result = await provider.runSessionTurn(request);
     } catch (error) {
@@ -869,8 +910,11 @@ export class ProvisionedSessionRuntime {
         sameConversationId: result.providerSessionId === handle.externalSessionId,
         // #1104 — the turn's own process group, when its cleanup could not confirm it ended.
         ...(result.processGroup === undefined ? {} : { processGroup: result.processGroup }),
+        // O4 (D2) — the start this turn ends.
+        startedEventId,
       },
     });
+    this.#ownTurns.delete(startedEventId);
     if (!completed) {
       return deny(
         ReasonCode.SESSION_TURN_FAILED,
@@ -890,6 +934,53 @@ export class ProvisionedSessionRuntime {
     return allow(ReasonCode.OK, result);
   }
 
+  /**
+   * O4 — a turn's spawn, reported in its own tick (`SessionTurnSpawnRequest`): the pid the daemon's own
+   * spawn returned and that process's start token, read here from the kernel and never taken from a
+   * report. A relayed turn's pending launch entry is pinned to it before the CLI can start the MCP child
+   * that asks for the credential; and (D2) it is recorded durably, so a restarted daemon can tell whether
+   * the turn is still running. The session never reports either value.
+   */
+  #recordTurnProcess(sessionId: string, startedEventId: number, pid: number, launch: SessionLaunchCredential | null): void {
+    const startedAt = readProcessStartToken(pid);
+    if (launch !== null) launch.pin = { pid, startToken: startedAt };
+    this.ports.audit.record({ kind: SESSION_TURN_SPAWNED, sessionId, evidence: { startedEventId, pid, startedAt } });
+  }
+
+  /** O4 (D2) — whether a turn of this session's conversation was ever started, returned or not. */
+  #turnAttempted(sessionId: string): boolean {
+    return [SESSION_TURN_STARTED, "SESSION_TURN"].some((kind) =>
+      this.ports.audit.byKind(kind).some((event) => event.sessionId === sessionId));
+  }
+
+  /**
+   * O4 (D2) — refuses while a turn of this session's conversation that another runtime started (a daemon
+   * since restarted) may still be running: its start has no `SESSION_TURN`, and the process its spawn
+   * recorded is still that process. Resolved by observation: once that process has ended, the turn has
+   * too. A start with no recorded process spawned none, because the spawn is reported in the same
+   * synchronous run as the start. This runtime's own turns are serialized by its lane and never counted.
+   */
+  #turnInDoubt(sessionId: string): Decision<void> {
+    const ofSession = (kind: string) => this.ports.audit.byKind(kind).filter((event) => event.sessionId === sessionId);
+    const ended = new Set(ofSession("SESSION_TURN").map((event) => event.evidence["startedEventId"]));
+    const open = new Set(ofSession(SESSION_TURN_STARTED)
+      .map((event) => event.eventId)
+      .filter((eventId) => !ended.has(eventId) && !this.#ownTurns.has(eventId)));
+    if (open.size === 0) return allow(ReasonCode.OK, undefined);
+    for (const spawned of ofSession(SESSION_TURN_SPAWNED)) {
+      const { startedEventId, pid, startedAt } = spawned.evidence as { startedEventId?: unknown; pid?: unknown; startedAt?: unknown };
+      if (typeof startedEventId !== "number" || !open.has(startedEventId) || typeof pid !== "number") continue;
+      if (turnProcessRunning(pid, typeof startedAt === "string" ? startedAt : null)) {
+        return deny(ReasonCode.CONVERSATION_TURN_IN_DOUBT, "a turn of this conversation started before the daemon restarted may still be running", {
+          sessionId,
+          startedEventId,
+          pid,
+        });
+      }
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
   #adapterFor(session: SessionRecord, role: Role): Decision<ProviderAdapter> {
     try {
       return allow(ReasonCode.OK, this.ports.providers.requireForRole(session.provider, role));
@@ -904,13 +995,18 @@ export class ProvisionedSessionRuntime {
 }
 
 /**
- * O4 — pins a relayed turn's pending launch entry to the process the daemon itself just spawned for the
- * turn: the pid its own spawn returned, and that process's start token, read here from the kernel and
- * never taken from a report. Called in the spawn's own tick, so the entry names its process before the
- * CLI can start the MCP child that asks for the credential. The session never reports either value.
+ * O4 (D2) — whether the process a turn's spawn recorded is still that process: its start token reads back
+ * as it did at the spawn, or, where none could be read then, the pid still answers. A pid reused since
+ * reads as running until it ends; it never makes a running turn read as ended.
  */
-const pinTurn = (launch: SessionLaunchCredential) => (pid: number): void => {
-  launch.pin = { pid, startToken: readProcessStartToken(pid) };
+const turnProcessRunning = (pid: number, startedAt: string | null): boolean => {
+  if (startedAt !== null) return readProcessStartToken(pid) === startedAt;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 };
 
 /**

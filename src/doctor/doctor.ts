@@ -50,26 +50,33 @@ const exec = promisify(execFile);
 /**
  * O4 — whether nobody holds the credential of the PRIMARY_CTO session `sessionId`, as far as that can be
  * determined: an interactive session (no driven-spawn record) with no recorded process, no native start
- * pin and no adopted canonical runtime, and a daemon started after it was created. Its credential was
- * offered once, on the take-once launch channel of the daemon that spawned it, and lived only in that
- * daemon's memory; its relay never reconnects, and nothing re-credentials or pins it.
+ * pin and no adopted canonical runtime, created by a previous daemon process and given no credential by
+ * this one. Its credential was offered once, on the take-once launch channel of the process that spawned
+ * it, and lived only in that process's memory; its relay never reconnects, and nothing re-credentials it.
+ *
+ * "Previous process" is read against `openedAfterEventId`, the newest audit event when this process's
+ * control plane opened the database: before the daemon's start, and so before anything it dispatches
+ * while starting (D1: a later DAEMON_STARTED is no such boundary). A session's credential exists only
+ * where `SessionRegistry.create` or `rotateSecret` issued it, so one created at or below that mark and not
+ * rotated above it has none in this daemon's custody or launch channel.
  */
 const primaryCtoCredentialUnrecoverable = (
   db: Pick<Db, "get">,
   sessions: Pick<SessionRegistry, "get" | "pinnedNativeStart">,
   sessionId: string,
+  openedAfterEventId: number,
 ): boolean => {
   const session = sessions.get(sessionId);
   if (!session || session.osPid !== null || drivenModeOf(db, sessionId) !== "NONE") return false;
   if (sessions.pinnedNativeStart(sessionId) !== null || isAdoptedCanonicalRuntime(db, sessionId)) return false;
-  return db.get<{ restarted: number }>(
-    `SELECT 1 AS restarted FROM audit_events started
-      WHERE started.kind = 'DAEMON_STARTED'
-        AND started.event_id > COALESCE(
-              (SELECT MIN(created.event_id) FROM audit_events created
-                WHERE created.kind = 'SESSION_CREATED' AND created.session_id = ?), 0)
-      LIMIT 1`,
-    [sessionId],
+  return db.get<{ previous: number }>(
+    `SELECT 1 AS previous
+      WHERE COALESCE((SELECT MIN(created.event_id) FROM audit_events created
+                       WHERE created.kind = 'SESSION_CREATED' AND created.session_id = ?), 0) <= ?
+        AND NOT EXISTS (SELECT 1 FROM audit_events rotated
+                         WHERE rotated.kind = 'SESSION_CREDENTIAL_ROTATED' AND rotated.session_id = ?
+                           AND rotated.event_id > ?)`,
+    [sessionId, openedAfterEventId, sessionId, openedAfterEventId],
   ) !== undefined;
 };
 
@@ -466,6 +473,13 @@ export class Doctor {
    */
   #supplementalFindings: ((scope: DoctorScope) => readonly Finding[]) | null = null;
 
+  /**
+   * O4 (D1) — the newest audit event when this process's control plane opened the database, which it
+   * does before its daemon starts or dispatches anything: every event at or below it was written by an
+   * earlier process. Read once, here; see `primaryCtoCredentialUnrecoverable`.
+   */
+  readonly #openedAfterEventId: number;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
@@ -489,7 +503,9 @@ export class Doctor {
       secretsDir: string;
       capacityDir: string;
     },
-  ) {}
+  ) {
+    this.#openedAfterEventId = db.get<{ id: number }>(`SELECT COALESCE(MAX(event_id), 0) AS id FROM audit_events`)?.id ?? 0;
+  }
 
   /**
    * Registers the one supplier every door's report draws its supplemental findings from.
@@ -758,13 +774,13 @@ export class Doctor {
           recommendedAction: "run a recovery takeover for this project",
         });
       }
-      // O4 — a live-looking holder whose credential nobody holds: interactive, pinless, and a daemon has
-      // started since it was spawned. Nothing re-credentials it, so it is named with its cleanup. As above,
+      // O4 — a live-looking holder whose credential nobody holds: interactive, pinless, spawned by an earlier
+      // daemon process and given nothing by this one. Nothing re-credentials it, so it is named with its cleanup. As above,
       // it blocks the project's report and not the system report, the daemon's own startup gate.
       if (
         session &&
         (session.lifecycle === SessionLifecycle.READY || session.lifecycle === SessionLifecycle.DRAINING) &&
-        primaryCtoCredentialUnrecoverable(this.db, this.sessions, binding.sessionId)
+        primaryCtoCredentialUnrecoverable(this.db, this.sessions, binding.sessionId, this.#openedAfterEventId)
       ) {
         findings.push({
           code: "PRIMARY_CTO_CREDENTIAL_UNRECOVERABLE",

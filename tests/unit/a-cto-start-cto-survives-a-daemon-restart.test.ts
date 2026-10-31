@@ -1,3 +1,4 @@
+import { type ChildProcess, spawn } from "node:child_process";
 import { chmodSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -5,12 +6,13 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { ManualClock } from "../../src/core/clock.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { SessionLaunchCredential } from "../../src/cto/cto-lifecycle.ts";
 import { startLocalMcpListeners, startSessionLaunchChannel, wakeRoleHolder } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { ExecutionMode, Role, RunKind, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
-import { ClaudeCliAdapter } from "../../src/runtime/cli-adapters.ts";
+import { ClaudeCliAdapter, type SessionTurnSpawnRequest, __testing } from "../../src/runtime/cli-adapters.ts";
 import type { SessionTurnRequest, SessionTurnResult } from "../../src/runtime/provider.ts";
 import {
   DRIVEN_PRIMARY_CTO_SPAWN_RECORD,
@@ -41,6 +43,11 @@ import { requireSeatbelt } from "../helpers/seatbelt.ts";
  * - W4: after a restart, a legacy pinless ACTIVE PRIMARY_CTO (no driven record, no pid, no pin) gets a
  *   blocking doctor finding that names the official cleanup, and no credential is issued to it: the
  *   restart and the continuity pass rotate nothing, pin nothing and replace nothing.
+ * - D1: a PRIMARY_CTO the restarted daemon itself spawned while starting (dispatching a queued run, before
+ *   its DAEMON_STARTED), whose credential waits in that daemon's own launch channel, gets no finding.
+ * - D2: a daemon that restarts while a driven CTO's first work turn is still running runs no second turn
+ *   of that conversation while the first one's process lives, and the next turn resumes the conversation
+ *   (`--resume`) rather than opening it again (`--session-id`).
  *
  * HOME points at a private directory before anything is imported, so every CLI scratch directory and
  * profile follows it and the live daemon's state is never touched.
@@ -51,7 +58,10 @@ const isolatedHome = vi.hoisted(() => {
   return home;
 });
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  __testing.setRunCli(null);
+  vi.restoreAllMocks();
+});
 afterAll(() => {
   cleanupTempDirs();
   rmSync(isolatedHome, { recursive: true, force: true });
@@ -350,6 +360,151 @@ describe("O4 W4 — a legacy pinless PRIMARY_CTO is reported after a restart, ne
     } finally {
       await daemon.stop();
       cp.close();
+    }
+  });
+});
+
+describe("O4 D1 — a CTO the restarted daemon spawned while starting is not reported", () => {
+  it("gives no finding to a PRIMARY_CTO spawned by the start's own dispatch, whose credential waits in that daemon's launch channel", async () => {
+    const clock = new ManualClock("2026-10-31T00:00:00.000Z");
+    const first = makeHarness({ clock });
+    const { projectId } = await registerFixtureProject(first, "o4a-startup-spawn");
+    bindCeo(first);
+    // A run queued by the previous daemon, for a project that has no CTO yet.
+    const queued = first.cp.runs.create({ projectId, kind: RunKind.STANDARD_WORK, executionMode: ExecutionMode.STANDARD, contract: CONTRACT });
+    if (!queued.allowed) throw new Error(queued.message);
+    first.cp.close();
+
+    clock.advance(60_000);
+    const second = makeHarness({ root: first.root, repoPath: first.repoPath, clock });
+    const cp = second.cp;
+    // The daemon's launch channel, attached to the lifecycle as agentcpd attaches it: a spawn's credential waits there.
+    const launch = await startSessionLaunchChannel(tempDir("acp-o4a-d1-launch-"), { mcpToken: TOKEN });
+    const offered: SessionLaunchCredential[] = [];
+    cp.cto.attach({
+      sessionLaunch: {
+        prepare: () => launch.prepare(),
+        provision: (credential) => {
+          offered.push(credential);
+          return launch.provision(credential);
+        },
+      },
+    });
+    cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    const daemon = new Daemon(cp, { stateDir: tempDir("acp-o4a-d1-daemon-"), watchdogIntervalMs: 600_000 });
+    const started = await daemon.start();
+    try {
+      if (!started.allowed) throw new Error(`${started.reasonCode}: ${started.message} ${JSON.stringify(started.evidence)}`);
+      // The start dispatched the queued run, and that dispatch spawned the project's CTO before DAEMON_STARTED.
+      expect(started.value.resumedRuns).toEqual([queued.value.runId]);
+      const binding = cp.bindings.activePrimaryCto(projectId)!;
+      const eventOf = (kind: string, sessionId: string | null) => cp.db.get<{ id: number }>(
+        `SELECT MIN(event_id) AS id FROM audit_events WHERE kind = ? AND (? IS NULL OR session_id = ?)`,
+        [kind, sessionId, sessionId],
+      )!.id;
+      expect(eventOf("SESSION_CREATED", binding.sessionId)).toBeLessThan(eventOf("DAEMON_STARTED", null));
+      // Its credential waits in this daemon's launch channel, and it is the session's current one.
+      expect(offered.map((credential) => credential.sessionId)).toEqual([binding.sessionId]);
+      expect(cp.sessions.verifySecret(binding.sessionId, offered[0]!.sessionSecret).allowed).toBe(true);
+
+      for (const report of [await cp.doctor.run("cto", projectId), await cp.doctor.run("system")]) {
+        expect(report.findings.map((finding) => finding.code)).not.toContain("PRIMARY_CTO_CREDENTIAL_UNRECOVERABLE");
+      }
+    } finally {
+      await daemon.stop();
+      await launch.close();
+      cp.close();
+    }
+  });
+});
+
+describe("O4 D2 — a restart during a driven CTO's first work turn", () => {
+  it("runs no second turn while the first one's process lives, and then resumes the conversation with --resume", async () => {
+    const clock = new ManualClock("2026-10-31T00:00:00.000Z");
+    const first = makeHarness({ clock });
+    // The provider's conversations live outside the daemon, and outlive it.
+    const claude = new RecordingRuntimeDouble(clock, "claude");
+    const before = await startDaemonProcess(first, claude);
+    let after: DaemonProcess | null = null;
+    // The first turn's CLI: a real process the turn's own spawn reported, still running at the restart.
+    let firstTurnCli: ChildProcess | null = null;
+    const requests: SessionTurnSpawnRequest[] = [];
+    const cliArgs: string[][] = [];
+    try {
+      const { projectId } = await registerFixtureProject(first, "o4a-mid-turn");
+      const ceo = bindCeo(first);
+      expect(await callMcpToolOverSocket(before.hermesSocket, ceo, "cto_start", { idempotencyKey: "o4a-mid-turn-start", projectId }))
+        .toMatchObject({ ok: true });
+      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+      const binding = first.cp.bindings.active(roleKey)!;
+      const session = first.cp.sessions.require(binding.sessionId);
+      const external = session.incarnation.split("#")[0]!;
+      // After the first, every turn runs through the real Claude adapter, so its request is mapped to argv.
+      mkdirSync(session.workdir!, { recursive: true });
+      const real = new ClaudeCliAdapter({ clock, capacityFile: join(tempDir("acp-o4a-d2-cap-"), "claude.json"), binary: "/bin/echo" });
+      __testing.setRunCli((async (_file: string, args: readonly string[]) => {
+        cliArgs.push([...args]);
+        return {
+          stdout: JSON.stringify({ session_id: external, result: "ok", is_error: false }),
+          stderr: "",
+          exitCode: 0,
+          timedOut: false,
+          isolationEnforced: false,
+        };
+      }) as unknown as Parameters<typeof __testing.setRunCli>[0]);
+      let entered!: () => void;
+      const inFirstTurn = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      claude.runSessionTurn = async (request: SessionTurnRequest): Promise<SessionTurnResult> => {
+        const spawnRequest = request as SessionTurnSpawnRequest;
+        requests.push(spawnRequest);
+        if (requests.length > 1) return real.runSessionTurn(spawnRequest);
+        firstTurnCli = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+        spawnRequest.onSpawn?.(firstTurnCli.pid!);
+        entered();
+        // Its daemon dies before it answers: this turn never returns to it.
+        return new Promise<SessionTurnResult>(() => undefined);
+      };
+      expect(first.cp.sessionRuntime.wake(roleKey, [{ id: "the-first-turn", kind: "test" }])).toMatchObject({ allowed: true });
+      await inFirstTurn;
+      expect(requests.map((request) => request.conversation)).toEqual(["new"]);
+
+      // The daemon goes down while that turn runs; a fresh runtime over the same database recovers the session.
+      await before.close();
+      const second = makeHarness({ root: first.root, repoPath: first.repoPath, clock });
+      after = await startDaemonProcess(second, claude);
+      const cp = second.cp;
+      const report = await after.daemon.reconcileContinuity("the daemon restarted during the first turn");
+      expect(report?.unresolved ?? []).not.toContainEqual(expect.objectContaining({ roleKey }));
+      expect(cp.sessions.require(binding.sessionId).credentialEpoch).toBe(1);
+
+      // While the first turn's process lives, no second turn of the conversation runs.
+      expect(cp.sessionRuntime.wake(roleKey, [{ id: "while-the-first-turn-runs", kind: "test" }])).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.CONVERSATION_TURN_IN_DOUBT,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(requests).toHaveLength(1);
+      expect(cliArgs).toEqual([]);
+
+      // Once it has ended, the next turn resumes the conversation the first turn opened.
+      const cli = firstTurnCli as ChildProcess | null;
+      const pid = cli!.pid!;
+      const exited = new Promise((resolve) => cli!.once("exit", resolve));
+      cli!.kill("SIGKILL");
+      await exited;
+      await vi.waitFor(() => expect(readProcessStartToken(pid)).toBeNull(), { timeout: 5_000 });
+      expect(cp.sessionRuntime.wake(roleKey, [{ id: "after-the-first-turn-ended", kind: "test" }])).toMatchObject({ allowed: true });
+      await vi.waitFor(() => expect(cliArgs).toHaveLength(1), { timeout: 10_000 });
+      expect(requests.map((request) => request.conversation)).toEqual(["new", "resume"]);
+      const argv = cliArgs[0]!;
+      expect(argv[argv.indexOf("--resume") + 1]).toBe(external);
+      expect(argv).not.toContain("--session-id");
+    } finally {
+      (firstTurnCli as ChildProcess | null)?.kill("SIGKILL");
+      await after?.close();
+      await before.close();
     }
   });
 });
