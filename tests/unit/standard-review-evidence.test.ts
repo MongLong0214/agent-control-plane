@@ -537,6 +537,9 @@ describe("review round 2: the shared credential filter and no reviewer text in a
           { category: "correctness", severity: "MAJOR", repository: `${f.identity} ${MARKER}`, path: `src/${MARKER}.js`, summary: echoed, detail: echoed },
           { category: "method", severity: "MAJOR", repository: f.identity, path: null, summary: echoed, detail: echoed },
         ] }) });
+      // Two unjudged reviews in a row refuse the same unchanged candidate (F1), so the REVISE is given a candidate of its own.
+      writeFiles(f.h.repoPath, { "src/app.js": "module.exports = () => 2; // r7\n" });
+      commitAll(f.h.repoPath, "R7: a new candidate for the next review");
       answers.push(await submit("submit-revise"));
       expect(answers.map((a) => (a["value"] as Args | undefined)?.["stage"])).toEqual(["REVIEW_UNAVAILABLE", "REVIEW_UNAVAILABLE", "REVISION_REQUIRED"]);
       expect(f.reviews().at(-1)!.content.findings.map((x) => x.summary)).toContain(echoed);
@@ -644,6 +647,21 @@ describe("review round 3: answers kept by provenance, and every string and key o
         { category: "correctness", severity: "BLOCKER", repository: f.identity, path: "src/app.js", summary: "blocks", detail: "blocks detail" },
         { category: "method", severity: "MINOR", repository: f.identity, path: "docs/notes.md", summary: "method", detail: "method detail" }] };
       const answers: Args[] = [];
+      // Two unjudged reviews in a row refuse the same unchanged candidate (F1): a submit that would follow two such
+      // reviews of the current candidate is given a candidate of its own first, so every answer is still reviewed.
+      let unjudged = 0;
+      let candidates = 0;
+      const submitReviewed = async (key: string): Promise<Args> => {
+        if (unjudged >= 2) {
+          candidates += 1;
+          writeFiles(f.h.repoPath, { "src/app.js": `module.exports = () => 2; // r11-${candidates}\n` });
+          commitAll(f.h.repoPath, `R11: candidate ${candidates}`);
+          unjudged = 0;
+        }
+        const answer = await submitVia(f, key);
+        unjudged = (answer["value"] as Args | undefined)?.["stage"] === "REVIEW_UNAVAILABLE" ? unjudged + 1 : 0;
+        return answer;
+      };
       const inject = async (node: unknown, path: Array<string | number>): Promise<void> => {
         if (typeof node === "string") {
           const copy = structuredClone(template) as unknown as Args;
@@ -651,14 +669,14 @@ describe("review round 3: answers kept by provenance, and every string and key o
           for (const step of path.slice(0, -1)) at = at[step as string] as Args;
           at[path.at(-1) as string] = `${node} ${MARKER}`;
           f.h.scripted.script({ match: /Candidate review/, text: JSON.stringify(copy) });
-          answers.push(await submitVia(f, `submit-${path.join(".")}`));
+          answers.push(await submitReviewed(`submit-${path.join(".")}`));
           return;
         }
         if (node !== null && typeof node === "object") for (const [key, child] of Object.entries(node)) await inject(child, [...path, Array.isArray(node) ? Number(key) : key]);
       };
       await inject(template, []);
       f.h.scripted.script({ match: /Candidate review/, text: JSON.stringify({ ...template, omittedItems: [MARKER] }) });
-      answers.push(await submitVia(f, "submit-omitted"));
+      answers.push(await submitReviewed("submit-omitted"));
       expect(answers.length).toBeGreaterThanOrEqual(16);
       expect(answers.filter((answer) => answer["reasonCode"] === "REVIEW_BLOCK").length).toBeGreaterThan(0);
       for (const answer of answers) expect(JSON.stringify(answer)).not.toContain(MARKER);

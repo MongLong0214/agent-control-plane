@@ -3,6 +3,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { allow } from "../../src/core/errors.ts";
+import type { RoleBinding } from "../../src/domain/types.ts";
 import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, Role, SessionLifecycle } from "../../src/domain/types.ts";
@@ -11,8 +12,10 @@ import { HERMES_PROVENANCE_META_KEY } from "../../src/mcp/hermes-provenance.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, SELF_CLAIM_PROTOCOL, defaultProcessAncestryInspector } from "../../src/registry/canonical-self-claim.ts";
 import { readReviewRoundSources, summarizeReviewRounds } from "../../src/review/review-round-summary.ts";
+import * as pipeline from "../../src/run/candidate-pipeline.ts";
 import { UNJUDGED_REVIEW_NOTICES } from "../../src/run/candidate-pipeline.ts";
-import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import * as driven from "../../src/runtime/provisioned-session-runtime.ts";
+import { cleanupTempDirs, commitAll, writeFiles } from "../helpers/fixtures.ts";
 import { applyPassingChange, bindCeo, bindWorker, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 import { TestProductionAdapter } from "../helpers/production-adapter.ts";
 
@@ -109,13 +112,26 @@ async function fixture(kind: "private" | "plain") {
     "SELECT message_id, idempotency_key, target_session_id, binding_generation FROM outbox WHERE run_id = ? AND kind = 'REVISION_REQUEST'", [run.runId]);
   const stored = () => JSON.stringify(h.cp.db.all<Args>("SELECT * FROM inbound_messages"));
   const audited = () => JSON.stringify(h.cp.db.all<Args>("SELECT * FROM audit_events"));
+  /** Every submission attempt's id, in freeze order (the CANDIDATE_FROZEN rows the pipeline stamps). */
+  const attempts = (): string[] => h.cp.audit.forRun(run.runId).filter((row) => row.kind === "CANDIDATE_FROZEN")
+    .map((row) => row.evidence["attemptId"] as string);
+  /** Everything product-side a revision could move: run state and revision count, PLAN, tasks, candidate, revision telemetry. */
+  const productState = () => ({
+    run: h.cp.db.get<Args>("SELECT state, state_reason, revision_count, current_candidate_digest FROM runs WHERE run_id = ?", [run.runId]),
+    plans: h.cp.artifacts.list(run.runId, "PLAN").map((artifact) => artifact.digest),
+    tasks: h.cp.tasks.list(run.runId).map((task) => [task.taskId, task.state]),
+    revisionTelemetry: h.cp.db.all<Args>("SELECT * FROM telemetry_metrics WHERE run_id = ? AND name = 'revision'", [run.runId]).length,
+    returns: h.cp.audit.forRun(run.runId).filter((row) => row.kind === "REVISION_RETURNED_TO_CTO").length,
+  });
+  /** The payloads of every REVISION_REQUEST role_dispatch_pending lists for the owner, oldest first. */
+  const notices = async (): Promise<Args[]> => (await delivered()).map((message) => message.payload);
   /** The round summary places the notice on its round as a notice; the round's outcome is what it was before F1. */
   const expectNoticeOnRound = (messageId: string, notice: string, outcome: string) => {
     const summary = summarizeReviewRounds(readReviewRoundSources(h.cp, run.runId));
     expect(summary.unattributedDeliveries).toEqual([]);
     expect(summary.rounds).toMatchObject([{ outcome, deliveries: [], notices: [{ messageId, notice }] }]);
   };
-  return { h, run, identity, owner, ownerGeneration: bound.value.bindingGeneration, cto, review, submit, delivered, revisionRows, stored, audited, expectNoticeOnRound,
+  return { h, run, identity, owner, ownerGeneration: bound.value.bindingGeneration, cto, review, submit, delivered, revisionRows, stored, audited, expectNoticeOnRound, attempts, productState, notices,
     close: async () => { for (const c of closers.reverse()) await c.close(); h.cp.close(); startToken.mockRestore(); } };
 }
 
@@ -197,7 +213,8 @@ describe("F1 a review that did not judge the product tells the owning CTO so, wi
         expect(messages).toHaveLength(1);
         expect(messages).toMatchObject([{ runId: f.run.runId, bindingGeneration: f.ownerGeneration, payload: {
           reasonCode: "REVIEW_REQUIRED", stage: "review-unavailable", candidateSnapshotDigest: f.h.cp.runs.currentCandidate(f.run.runId),
-          notice: "METHOD_FINDINGS_ONLY", recovery: UNJUDGED_REVIEW_NOTICES.METHOD_FINDINGS_ONLY,
+          notice: "METHOD_FINDINGS_ONLY", unjudgedAttempts: 1, unjudgedAttemptLimit: 2, nextStep: "RESUBMIT",
+          recovery: `${UNJUDGED_REVIEW_NOTICES.METHOD_FINDINGS_ONLY} ${pipeline.UNJUDGED_REVIEW_NEXT_STEPS?.RESUBMIT}`,
           methodFindings: [{ category: "method", summary: `method: ${MARKER}` }] } }]);
         expect(messages[0]!.payload).not.toHaveProperty("packet");
         expect(f.h.cp.audit.forRun(f.run.runId).filter((row) => row.kind === "REVISION_RETURNED_TO_CTO")).toEqual([]);
@@ -220,7 +237,9 @@ describe("F1 a review that did not judge the product tells the owning CTO so, wi
         const messages = await f.delivered();
         expect(messages).toHaveLength(1);
         expect(messages).toEqual([{ ...messages[0], payload: { runId: f.run.runId, reasonCode: "EVIDENCE_MISSING", stage: "review-unavailable",
-          candidateSnapshotDigest: f.h.cp.runs.currentCandidate(f.run.runId), notice: "REVIEW_UNAVAILABLE", recovery: UNJUDGED_REVIEW_NOTICES.REVIEW_UNAVAILABLE } }]);
+          candidateSnapshotDigest: f.h.cp.runs.currentCandidate(f.run.runId), attemptId: f.attempts().at(-1), notice: "REVIEW_UNAVAILABLE",
+          unjudgedAttempts: 1, unjudgedAttemptLimit: 2, nextStep: "RESUBMIT",
+          recovery: `${UNJUDGED_REVIEW_NOTICES.REVIEW_UNAVAILABLE} ${pipeline.UNJUDGED_REVIEW_NEXT_STEPS?.RESUBMIT}` } }]);
         expect(messages[0]).toMatchObject({ runId: f.run.runId, bindingGeneration: f.ownerGeneration });
         f.expectNoticeOnRound(messages[0]!.messageId, "REVIEW_UNAVAILABLE", "REVIEW_UNAVAILABLE");
         expect(JSON.stringify(answer)).not.toContain(MARKER);
@@ -232,4 +251,136 @@ describe("F1 a review that did not judge the product tells the owning CTO so, wi
       } finally { await f.close(); }
     });
   }
+});
+
+describe("F1 an unjudged-review notice changes nothing product-side and its recovery is bounded", () => {
+  const unavailable = (f: Awaited<ReturnType<typeof fixture>>) => f.h.scripted.script({ match: /Candidate review/, text: `not a verdict: ${MARKER}` });
+
+  it("receiving and acknowledging the notice moves no run state, revision count, PLAN, task, candidate or revision telemetry", async () => {
+    const f = await fixture("plain");
+    try {
+      const before = f.productState();
+      unavailable(f);
+      expect(await f.submit("submit-unavailable")).toMatchObject({ ok: true, value: { stage: "REVIEW_UNAVAILABLE" } });
+      const afterSubmit = f.productState();
+      const [notice] = await f.delivered();
+      expect(notice).toBeDefined();
+      // Only the candidate the submission froze is new; nothing else a revision would move has moved.
+      expect({ ...afterSubmit, run: { ...afterSubmit.run, current_candidate_digest: null } })
+        .toEqual({ ...before, run: { ...before.run, current_candidate_digest: null } });
+      expect(afterSubmit.run).toMatchObject({ state: "ACTIVE", revision_count: 0 });
+      expect(await f.cto("role_dispatch_ack", { messageId: notice!.messageId })).toMatchObject({ ok: true });
+      expect(f.productState()).toEqual(afterSubmit);
+      expect(await f.delivered()).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it("counts unjudged attempts in a row on the unchanged candidate; at the limit the next step is escalation; a replay adds nothing", async () => {
+    const f = await fixture("plain");
+    try {
+      const step = (next: "RESUBMIT" | "ESCALATE") =>
+        `${UNJUDGED_REVIEW_NOTICES.REVIEW_UNAVAILABLE} ${(pipeline.UNJUDGED_REVIEW_NEXT_STEPS as Record<string, string> | undefined)?.[next]}`;
+      for (const key of ["first", "second"]) {
+        unavailable(f);
+        expect(await f.submit(key)).toMatchObject({ ok: true, value: { stage: "REVIEW_UNAVAILABLE" } });
+      }
+      const [a1, a2] = f.attempts();
+      expect((await f.notices()).map((p) => [p["attemptId"], p["unjudgedAttempts"], p["unjudgedAttemptLimit"], p["nextStep"], p["recovery"]])).toEqual([
+        [a1, 1, 2, "RESUBMIT", step("RESUBMIT")],
+        [a2, 2, 2, "ESCALATE", step("ESCALATE")],
+      ]);
+      // A replay of the last submit is its stored answer: no third notice.
+      await f.submit("second");
+      expect(f.revisionRows()).toHaveLength(2);
+    } finally { await f.close(); }
+  });
+
+  for (const kind of ["plain", "private"] as const) {
+    it(`${kind} run: at the limit the pipeline refuses the same candidate again and again, verifying and reviewing nothing; a changed candidate goes through`, async () => {
+      const f = await fixture(kind);
+      try {
+        for (const key of ["first", "second"]) {
+          unavailable(f);
+          expect(await f.submit(key)).toMatchObject({ ok: true, value: { stage: "REVIEW_UNAVAILABLE" } });
+        }
+        const candidate = f.h.cp.runs.currentCandidate(f.run.runId);
+        const work = () => ({ reviews: f.h.scripted.invocations.filter((call) => call.prompt.includes("Candidate review")).length,
+          verifications: f.h.cp.artifacts.list(f.run.runId, "VERIFICATION").length,
+          commands: f.h.cp.audit.forRun(f.run.runId).filter((row) => row.kind.startsWith("VERIFICATION")).length,
+          outbox: f.h.cp.db.all<Args>("SELECT message_id FROM outbox WHERE run_id = ?", [f.run.runId]).length });
+        const before = { work: work(), product: f.productState() };
+        // Each counter is live: the two judged-unavailable submissions verified and reviewed.
+        expect(before.work).toMatchObject({ reviews: 2, verifications: 2, outbox: 3 });
+        expect(before.work.commands).toBeGreaterThan(0);
+        unavailable(f);
+        const refused = [await f.submit("third"), await f.submit("fourth")];
+        for (const answer of refused) {
+          expect(answer).toMatchObject({ ok: false, reasonCode: "REVIEW_UNJUDGED_LIMIT_REACHED" });
+          if (kind === "private") {
+            expect(answer).toMatchObject({ evidence: { privateReviewEvidence: true, reasonCode: "REVIEW_UNJUDGED_LIMIT_REACHED", candidateSnapshotDigest: candidate } });
+            expect(JSON.stringify(answer)).not.toContain(MARKER);
+          } else {
+            expect(answer).toMatchObject({ message: pipeline.UNJUDGED_REVIEW_LIMIT_REFUSAL,
+              evidence: { candidateSnapshotDigest: candidate, unjudgedAttempts: 2, unjudgedAttemptLimit: 2 } });
+          }
+        }
+        // Nothing was verified, reviewed, sent or moved: no reviewer call, no verification, no notice, no product change.
+        expect({ work: work(), product: f.productState() }).toEqual(before);
+        expect(f.revisionRows()).toHaveLength(2);
+        // A replay of a refused submit is its stored answer.
+        expect(await f.submit("fourth")).toEqual(refused[1]);
+        // A changed candidate is judged afresh, and starts its own count.
+        writeFiles(f.h.repoPath, { "src/app.js": "module.exports = () => 1 + 1;\n" });
+        commitAll(f.h.repoPath, "same result, new candidate");
+        expect(await f.submit("changed")).toMatchObject({ ok: true, value: { stage: "REVIEW_UNAVAILABLE" } });
+        expect(f.h.cp.runs.currentCandidate(f.run.runId)).not.toBe(candidate);
+        expect(work().reviews).toBe(before.work.reviews + 1);
+        expect((await f.notices()).at(-1)).toMatchObject({ attemptId: f.attempts().at(-1), unjudgedAttempts: 1, nextStep: "RESUBMIT" });
+      } finally { await f.close(); }
+    });
+  }
+
+  it("a private run's method findings reach the owner's notice and the private review only: no answer, stored result, audit row or dogfood record", async () => {
+    const f = await fixture("private");
+    try {
+      f.review({ verdict: "BLOCK", findings: [{ ...blocker(f.identity), category: "method", severity: "MAJOR", summary: `method: ${MARKER}` }] });
+      const answer = await f.submit("submit-method");
+      expect(answer).toMatchObject({ ok: true, value: { stage: "REVIEW_UNAVAILABLE", reasonCode: "REVIEW_REQUIRED" } });
+      expect(JSON.stringify(answer)).not.toContain(MARKER);
+      const tables = f.h.cp.db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").map((t) => t.name);
+      const holding = tables.filter((table) => JSON.stringify(f.h.cp.db.all<Args>(`SELECT * FROM "${table}"`)).includes(MARKER)).sort();
+      expect(holding).toEqual(["outbox", "run_artifacts"]);
+      expect(f.h.cp.db.all<{ kind: string }>("SELECT kind FROM outbox WHERE payload_json LIKE ?", [`%${MARKER}%`])).toEqual([{ kind: "REVISION_REQUEST" }]);
+      expect(f.h.cp.db.all<{ kind: string }>("SELECT kind FROM run_artifacts WHERE content_json LIKE ?", [`%${MARKER}%`])).toEqual([{ kind: "BLIND_REVIEW" }]);
+    } finally { await f.close(); }
+  });
+
+  it("role_dispatch_pending and the driven CTO's prompt tell a notice apart from a revision", async () => {
+    const f = await fixture("plain");
+    try {
+      const server = createCtoServer(createCtoMcpPort(f.h.cp), () => allow(ReasonCode.OK, { actor: "f1", sessionId: f.owner.sessionId,
+        sessionIncarnation: f.h.cp.sessions.require(f.owner.sessionId).incarnation }));
+      const [ct, st] = InMemoryTransport.createLinkedPair();
+      await server.connect(st);
+      const client = new Client({ name: "f1-tools", version: "1" });
+      await client.connect(ct);
+      try {
+        const description = (await client.listTools()).tools.find((tool) => tool.name === "role_dispatch_pending")?.description ?? "";
+        expect(description).toContain("A REVISION_REQUEST whose payload stage is review-unavailable is a notice, never a revision");
+        expect(description).toContain("change no PLAN, task or code");
+      } finally { await client.close(); await server.close(); }
+    } finally { await f.close(); }
+
+    const prompt = (driven as { workPrompt?: (...args: unknown[]) => string }).workPrompt;
+    const line = (driven as { UNJUDGED_NOTICE_LINE?: string }).UNJUDGED_NOTICE_LINE;
+    expect(typeof prompt).toBe("function");
+    expect(line).toContain("never a revision");
+    const binding = { role: "PRIMARY_CTO", runId: null, bindingGeneration: 1, roleKey: "primary-cto:fixture" } as unknown as RoleBinding;
+    const triggers = [{ id: "msg_fixture", kind: "in-band dispatch" }];
+    const withNotice = prompt!(binding, triggers, true, false, true);
+    const without = prompt!(binding, triggers, true, false);
+    expect(withNotice.split("\n")).toContain(line);
+    expect(without).not.toContain("review-unavailable");
+    expect(withNotice.split("\n").filter((l) => l !== line).join("\n")).toBe(without);
+  });
 });
