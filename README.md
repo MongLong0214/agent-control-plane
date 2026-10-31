@@ -410,18 +410,19 @@ supply requests and evidence; they do not decide that work is complete.
 |---|---|
 | **Credentials** | The GitHub authority credential lives in a local secret store outside every project repository, read only by the daemon, and never placed in the environment of a CTO, worker, reviewer, verification subprocess, Repo Factory, Buzz or Telegram adapter. `ACP_MCP_TOKEN` and `ACP_OPERATOR_TOKEN` are distinct, Keychain-held, and never stored in the plist. |
 | **Local surfaces** | MCP and operator sockets live in the owner-only (`0700`) state directory; the database files are mode `0600`. |
-| **Verification** | A disposable worktree; a constructed (never inherited) environment with `HOME` and `TMPDIR` in scratch; a seatbelt profile that denies writes outside the worktree and scratch and denies reads of named sensitive paths; network denial when declared; and a captured pid/start-time identity with time, RSS and output limits. If confinement is unavailable, the command does not run. |
+| **Verification** | Any language: only the pinned manifest's declared commands run, each by the absolute path resolved outside the sandbox, against a disposable worktree. A constructed (never inherited) environment carries no token or agent socket pointer; `HOME` is the daemon's, `TMPDIR` the scratch. A seatbelt profile opens reads, outbound network and local IPC, confines writes to the worktree, `TMPDIR` and named toolchain caches, and denies reading, writing or socket access to named secret paths (best-effort); a captured pid/start-time identity carries time, RSS and output limits. If confinement is unavailable, the command does not run. |
 | **Blind reviewers** | A composed seatbelt profile denies remote TCP and UDP except one loopback CONNECT proxy port, with a fresh allowlist of the selected provider's endpoints per invocation. Allow, deny and direct-socket probes run before the reviewer may attest; any failure is `ISOLATION_LOST`. |
 | **The merge gate** | `merge_evaluate` accepts a gate only when it was created by the trusted identity, its payload digest matches the locally recorded publication, and its head equals the exact head being merged. Branch protection is defence in depth. |
 | **Ingress** | Owner decisions and actor messages are admitted by `IngressGuard` against declared identities, with replay protection on inbound messages. |
 
-The executable allowlist for verification commands is defence in depth, not the code-execution
-boundary: `node`, `npm`, `npx` and `vitest` are general-purpose interpreters and can exec a shell
-after they start. The boundary is the seatbelt and resource sandbox; the inside-shell regression
-proof is [`tests/unit/handoff-p1-boundaries.test.ts`](tests/unit/handoff-p1-boundaries.test.ts).
-Sandbox read confinement is a named deny list rather than a whitelist, because a blanket read deny
-aborts Node at load — a recorded [design decision](docs/design-decisions.md) with its revisit
-trigger.
+Verification commands have no executable allowlist (owner directive, 2026-10-31): argv[0] may be
+any executable, because a list never was the boundary — any declared command can exec a shell after
+it starts. The boundary is the seatbelt and resource sandbox; the inside-shell regression proof is
+[`tests/unit/handoff-p1-boundaries.test.ts`](tests/unit/handoff-p1-boundaries.test.ts) and the secret
+guard's is [`tests/unit/the-verification-sandbox-opens-to-every-language.test.ts`](tests/unit/the-verification-sandbox-opens-to-every-language.test.ts).
+Sandbox read confinement is a named deny list of secret paths rather than a whitelist — a recorded
+[design decision](docs/design-decisions.md) — and it is best-effort: a credential kept outside the
+named paths is readable ([ADR-0004](docs/adr/ADR-0004-verification-sandbox-isolation.md)).
 
 **Stated residuals** ([SECURITY.md](docs/SECURITY.md), [STATUS.md](docs/STATUS.md)):
 
@@ -464,11 +465,12 @@ prerequisite issue is not a live observation; a record in [`evidence/`](evidence
   boundary; [SECURITY.md](docs/SECURITY.md) records that its deployment evidence requirement
   remains ([reviewer egress](docs/reviewer-egress.md)).
 - **Verification inputs:** a fresh worktree contains only committed files — no `node_modules`, no
-  build cache — and with `network: "deny"` it cannot fetch them. A project therefore needs either
-  a verification command that needs no installed dependencies (this repository's
-  `scripts/verify-reason-codes.mjs` is one), or `evidenceMode: "TRUSTED_CI"`, which accepts CI's
-  result only at the exact candidate head from an approved workflow digest.
-  `network: "allowlist"` remains unsupported in project manifests.
+  build output. The sandbox's network is open for dependency lookup and download, and the named
+  toolchain caches under `HOME` are writable, so a command may install what it needs; a
+  dependency-free command (this repository's `scripts/verify-reason-codes.mjs` is one) or
+  `evidenceMode: "TRUSTED_CI"`, which accepts CI's result only at the exact candidate head from an
+  approved workflow digest, remain the options that need no fetch. `network: "allowlist"` remains
+  unsupported in project manifests.
 - **Test coverage meaning:** `pnpm trace` writes [traceability evidence](evidence/traceability.md)
   from the PRD and a fresh Vitest result set. It measures declaration coverage — a labelled leaf
   executed and passed — not behavioural or production-entry-point coverage.

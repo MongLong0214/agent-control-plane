@@ -142,15 +142,18 @@ describe("a declared verification executable runs by the absolute path the allow
     resolverOverride.next = { ...approved, resolvedPath: join(repository, "the-approved-tool") };
     const launched = await verificationLaunchArgv(["node", "-e", "process.exit(0)"], context);
     expect(launched.allowed).toBe(false);
-    expect(launched.allowed ? "" : launched.message).toContain("no longer leads to the tool the allowlist approved");
+    expect(launched.allowed ? "" : launched.message).toContain("no longer leads to the tool its resolution approved");
   });
 
-  it("refuses an executable the allowlist does not approve, rather than leaving it to the sandbox's PATH", async () => {
+  // Any executable may be argv[0] since 2026-10-31, so `sh` is launched like any other, by the absolute
+  // path resolved outside; only a name that leads to no executable file is refused.
+  it("launches any executable by its resolved absolute path, and refuses one that does not exist", async () => {
     const repository = makeRepo();
     const context = { cwd: repository, additionalRoots: [repository] };
     const launched = await verificationLaunchArgv(["sh", "-c", "exit 0"], context);
-    expect(launched.allowed).toBe(false);
+    expect(launched).toMatchObject({ allowed: true, value: ["/bin/sh", "-c", "exit 0"] });
     const missing = await verificationLaunchArgv(["pnpm-that-does-not-exist"], context);
     expect(missing.allowed).toBe(false);
+    expect(missing.allowed ? "" : missing.message).toContain("does not lead to an executable file");
   });
 });

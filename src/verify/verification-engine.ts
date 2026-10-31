@@ -476,8 +476,6 @@ export class VerificationEngine {
     let commands: readonly VerificationCommand[];
     /** RF-S22 — the pinned gate entries each selected command runs; none for a run-scoped run. */
     const gateObligations = new Map<string, readonly GateEntry[]>();
-    /** #1253 — what the pinned manifest adds to the executable allowlist; nothing for a run-scoped run. */
-    let executables: readonly string[] = [];
     if (run.pinnedManifestDigest) {
       if (options.runScoped) {
         return deny(
@@ -526,7 +524,6 @@ export class VerificationEngine {
         );
       }
       commands = expected;
-      executables = pinned.verificationExecutables ?? [];
       // Every repository in the candidate must also be pinned to that same manifest.
       const mismatched = snapshot.repositories.filter(
         (repo) => repo.manifestDigest !== run.pinnedManifestDigest,
@@ -670,7 +667,6 @@ export class VerificationEngine {
           repo.sourceBranch ?? null,
           gateObligations.get(command.id) ?? [],
           expectedCheckoutHead(repo),
-          executables,
           options.attempt?.signal,
         );
         if (!local.allowed) return local as Decision<VerificationReport>;
@@ -973,8 +969,6 @@ export class VerificationEngine {
     gateEntries: readonly GateEntry[],
     /** Where the source checkout must stand for a self-contained copy (`expectedCheckoutHead`). */
     sourceHead: string,
-    /** #1253 — the executables the run's pinned manifest declares (`verificationExecutables`). */
-    executables: readonly string[],
     /** Stops the command when its submission no longer holds the run. */
     signal?: AbortSignal,
   ): Promise<Decision<VerificationResultRecord>> {
@@ -1048,8 +1042,8 @@ export class VerificationEngine {
           ],
         },
         worktreePath: worktree.path,
-        // §33.3 — the control plane's own secret store and state must be unreadable to a
-        // candidate, as must every other checkout on this machine.
+        // §33.3 — the control plane's own secret store and state must be unreadable and unwritable
+        // to a candidate, and unreachable by a unix socket, as must every other checkout here.
         denyReadPaths: this.denyReadPaths(checkoutPath),
         // A gate command cannot spawn at all (RLIMIT_NPROC 1): the loader above binds what it
         // loads in-process only, and a spawned process would run outside it. Every other declared
@@ -1058,7 +1052,6 @@ export class VerificationEngine {
         // `gateEntries`, this command's obligations under the run's pinned manifest, which the
         // candidate cannot change; neither the command nor its environment carries a mode.
         processLimit: gateEntries.length > 0 ? "no-spawn" : "supervised-budget",
-        executables,
         ...(signal === undefined ? {} : { signal }),
       });
     } finally {
