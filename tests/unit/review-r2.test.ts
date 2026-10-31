@@ -996,10 +996,13 @@ describe("round-2 blind-review regressions", () => {
     expect(parts.map((part) => part.files)).toEqual([["src/new.js"], ["src/copy.js"]]);
 
     // A section larger than the budget is range-split under its destination too.
-    const large = section("rename", "src/old.js", "src/new.js", Array.from({ length: 40 }, (_, index) => `+line ${index}\n`).join(""));
-    const ranges = __testing.splitDiffs([{ identity, diff: large, files: ["src/new.js"] }], 150).chunks.flat();
+    const large = section("rename", "src/old.js", "src/new.js", Array.from({ length: 200 }, (_, index) => `+line ${index}\n`).join(""));
+    const ranges = __testing.splitDiffs([{ identity, diff: large, files: ["src/new.js"] }], 800).chunks.flat();
     expect(ranges.length).toBeGreaterThan(1);
     expect(ranges.every((part) => part.files.length === 1 && part.files[0] === "src/new.js")).toBe(true);
+    // Every range carries the rename's full header.
+    const fileHeader = large.slice(0, large.indexOf("\n@@ ") + 1);
+    expect(ranges.every((part) => part.diff.startsWith(fileHeader))).toBe(true);
   });
 
   it("#359 keeps a chunk BLOCK with only MAJOR findings from becoming a final PASS", async () => {
@@ -1760,15 +1763,17 @@ describe("round-2 blind-review regressions", () => {
 
   it("#135 range-splits an oversized single-file patch", () => {
     const header = "diff --git a/large.ts b/large.ts\n";
-    const payload = Array.from({ length: 250 }, (_, index) => index.toString(36).padStart(4, "0")).join("");
+    const payload = Array.from({ length: 2_500 }, (_, index) => index.toString(36).padStart(4, "0")).join("");
     const chunks = __testing.splitDiffs([{
       identity: "github:acme/fixture",
       diff: `${header}${payload}`,
       files: ["large.ts"],
-    }], 100).chunks;
+    }], 1_000).chunks;
     const parts = chunks.flat();
     expect(parts.length).toBeGreaterThan(1);
-    expect(parts.every((part) => part.diff.length <= 100)).toBe(true);
+    // Each part's label is charged to the same budget as its patch.
+    expect(parts.every((part) => part.diff.length + (part.rangeLabel?.length ?? 0) <= 1_000)).toBe(true);
+    expect(parts.every((part) => part.rangeLabel?.startsWith(`Part ${parts.indexOf(part) + 1} of ${parts.length} `))).toBe(true);
     expect(parts.every((part) => part.files.length === 1 && part.files[0] === "large.ts")).toBe(true);
     expect(parts.map((part) => part.diff.slice(header.length)).join("")).toBe(payload);
   });

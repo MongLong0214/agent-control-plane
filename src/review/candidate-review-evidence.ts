@@ -713,7 +713,8 @@ const renderExecution = (evidence: ExecutionEvidence, selection: Selection): str
     receipts: {
       changedRepositories: evidence.repositories.length, repositoriesListed: selection.repositories,
       repositories: evidence.repositories.slice(0, selection.repositories),
-      total: evidence.receipts.length, listed: selection.receipts, notListed: evidence.receiptsNotListed,
+      total: evidence.receipts.length, listed: selection.receipts,
+      notListed: { ...evidence.receiptsNotListed, overCharBudget: evidence.receipts.length - selection.receipts },
       receipts: receipts.map(({ snapshotDiffDigest: _snapshot, recomputedDiffDigest: _recomputed, ...receipt }) => receipt),
       // The digests side by side under names that say what each is computed over (the Digests line).
       diffDigests: receipts.map((receipt) => ({
@@ -750,22 +751,27 @@ const cutText = (full: string, room: number, keepTail: boolean): string => {
 
 /**
  * The execution section within `budget` characters beyond its own rendering at budget 0, which is
- * what the review's sizing charges as fixed overhead. Commands, then results, then receipts are
- * listed in order while they fit; the remaining room is shared among their texts, shortest first.
- * Anything cut is marked, and the section then says it is incomplete.
+ * what the review's sizing charges as fixed overhead. Commands, then results, then repositories, then
+ * the linked receipts are listed in order while they fit; the remaining room is shared among their
+ * texts, shortest first; the receipts that are not linked are listed after them while they fit. Anything
+ * cut is marked, a receipt not listed is counted, and the section then says it is incomplete.
  */
 export const executionEvidenceSection = (evidence: ExecutionEvidence, budget: number): { lines: string[]; used: number } => {
   const anything = evidence.commands.length + evidence.results.length + evidence.repositories.length + evidence.receipts.length > 0;
   const selection: Selection = { commands: 0, results: 0, repositories: 0, receipts: 0, texts: new Map(), cut: anything };
   const bare = measure(renderExecution(evidence, selection));
   const fits = (): boolean => measure(renderExecution(evidence, selection)) - bare <= budget;
-  for (const [field, total] of [["commands", evidence.commands.length], ["results", evidence.results.length],
-    ["repositories", evidence.repositories.length], ["receipts", evidence.receipts.length]] as const) {
+  // Receipts are listed in order, linked first: the leading linked ones keep their place before the texts.
+  const firstUnlinked = evidence.receipts.findIndex((receipt) => !receipt.linked);
+  const linked = firstUnlinked === -1 ? evidence.receipts.length : firstUnlinked;
+  const list = (field: "commands" | "results" | "repositories" | "receipts", total: number): void => {
     while (selection[field] < total) {
       selection[field] += 1;
       if (!fits()) { selection[field] -= 1; break; }
     }
-  }
+  };
+  for (const [field, total] of [["commands", evidence.commands.length], ["results", evidence.results.length],
+    ["repositories", evidence.repositories.length], ["receipts", linked]] as const) list(field, total);
   const texts: Array<{ key: string; full: string; keepTail: boolean }> = [
     ...evidence.results.slice(0, selection.results).flatMap((result, r) => [
       { key: `r${r}.out`, full: result.stdout, keepTail: true }, { key: `r${r}.err`, full: result.stderr, keepTail: true }]),
@@ -780,6 +786,8 @@ export const executionEvidenceSection = (evidence: ExecutionEvidence, budget: nu
     selection.texts.set(entry.key, kept);
     room -= JSON.stringify(kept).length - 2;
   }
+  // The receipts that are not linked get what the texts left.
+  list("receipts", evidence.receipts.length);
   const complete = selection.commands === evidence.commands.length && selection.results === evidence.results.length
     && selection.repositories === evidence.repositories.length && selection.receipts === evidence.receipts.length
     && texts.every((entry) => selection.texts.get(entry.key) === entry.full);
@@ -788,7 +796,8 @@ export const executionEvidenceSection = (evidence: ExecutionEvidence, budget: nu
   while (!fits()) {
     selection.cut = anything;
     const longest = [...selection.texts.entries()].sort((a, b) => b[1].length - a[1].length)[0];
-    if (longest && longest[1].length > 0) {
+    if (selection.receipts > linked) selection.receipts -= 1;
+    else if (longest && longest[1].length > 0) {
       const entry = texts.find((candidate) => candidate.key === longest[0])!;
       selection.texts.set(longest[0], cutText(entry.full, Math.floor((JSON.stringify(longest[1]).length - 2) / 2), entry.keepTail));
     } else if (selection.receipts > 0) selection.receipts -= 1;
