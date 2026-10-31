@@ -7,8 +7,13 @@
  * previous run's green `verify` standing alone while the newer run is still in its matrix, an
  * older run that finished later outranking a newer failure, and a pending commit status the
  * rollup reading skipped because it carries no `completedAt`.
+ *
+ * merge-pr.mjs refuses a copy that differs from the current base of the pull request's repository,
+ * so each run is from a current checkout: `GIT_DIR` names a repository whose `origin` is that
+ * repository, `git@github.com:test/repo.git`, reached offline through a stand-in ssh, and whose base
+ * holds the script bytes that run.
  */
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -29,13 +34,40 @@ type World = { pr: Record<string, unknown>; runs: Run[]; jobs: Record<string, Ch
 
 const pr = (mergeStateStatus: string, statusCheckRollup: Check[]) => ({
   state: "OPEN", mergeable: "MERGEABLE", mergeStateStatus, title: "fixture",
-  baseRefOid: BASE, headRefOid: HEAD, statusCheckRollup,
+  baseRefOid: BASE, headRefOid: HEAD, statusCheckRollup, baseRefName: "main", url: "https://github.com/test/repo/pull/1",
 });
 const check = (name: string, status: string, conclusion: string, completedAt: string): Check =>
   ({ name, status, conclusion, completedAt, workflowName: "project-ci" });
 const job = (name: string, status: string, conclusion: string): Check => ({ name, status, conclusion });
 const run = (databaseId: number, attempt: number, status: string, headSha = HEAD): Run =>
   ({ databaseId, attempt, status, headSha });
+
+const ISOLATED_GIT = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+
+/** A checkout of the current `main` of test/repo, whose origin a stand-in ssh in `bin` reaches offline. */
+const currentCheckout = (directory: string, bin: string): Record<string, string> => {
+  const remotes = join(directory, "remotes");
+  const work = join(directory, "work");
+  const git = (cwd: string, ...args: string[]): void => {
+    const result = boundedSpawnSync("git", ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+      "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", ...args],
+    { cwd, encoding: "utf8", timeout: 30_000, env: { ...process.env, ...ISOLATED_GIT, GIT_DIR: undefined, GIT_WORK_TREE: undefined } });
+    expect(result.status, result.stderr).toBe(0);
+  };
+  mkdirSync(join(remotes, "test"), { recursive: true });
+  git(directory, "init", "--quiet", "--bare", "-b", "main", join(remotes, "test", "repo.git"));
+  git(directory, "init", "--quiet", "-b", "main", work);
+  cpSync(join(ROOT, "scripts"), join(work, "scripts"), { recursive: true });
+  git(work, "add", "--all");
+  git(work, "commit", "--quiet", "--no-verify", "-m", "base");
+  git(work, "push", "--quiet", "--no-verify", join(remotes, "test", "repo.git"), "main");
+  git(work, "remote", "add", "origin", "git@github.com:test/repo.git");
+  writeFileSync(join(bin, "fake-ssh"),
+    `#!/bin/sh\nfor last; do :; done\nunset GIT_DIR GIT_WORK_TREE\ncd '${remotes}' || exit 128\nexec /bin/sh -c "git \${last#git-}"\n`);
+  chmodSync(join(bin, "fake-ssh"), 0o755);
+  return { ...ISOLATED_GIT, GIT_DIR: join(work, ".git"), GIT_WORK_TREE: work,
+    GIT_SSH_COMMAND: `'${join(bin, "fake-ssh")}'`, GIT_SSH_VARIANT: "simple" };
+};
 
 /** Runs the real merge script with `gh` answering from `world` and `commitlore` doing nothing. */
 const merge = (world: World): { status: number | null; stdout: string; merges: string[][] } => {
@@ -50,6 +82,7 @@ const merge = (world: World): { status: number | null; stdout: string; merges: s
   chmodSync(join(bin, "commitlore"), 0o755);
   writeFileSync(join(directory, "body"), "body\n");
   writeFileSync(join(directory, "world.json"), JSON.stringify(world));
+  const checkout = currentCheckout(directory, bin);
   const log = join(directory, "gh.log");
   // The fixture switches to other roles on these two, so they must not leak in from the suite.
   const inherited = Object.fromEntries(
@@ -63,6 +96,7 @@ const merge = (world: World): { status: number | null; stdout: string; merges: s
       encoding: "utf8",
       env: {
         ...inherited,
+        ...checkout,
         PATH: `${bin}:${process.env.PATH ?? ""}`,
         FIXTURE_HEAD: HEAD,
         FIXTURE_BASE: BASE,

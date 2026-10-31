@@ -42,6 +42,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { mergeScriptDiffersFromBase } from "./lib/merge-script-matches-base.mjs";
 import { RECORD_TRAILER_KEY_PATTERN } from "./lib/record-trailer-keys.mjs";
 import { pullRequest, Unanswered } from "./verify-merge-preserved-records.mjs";
 
@@ -74,7 +75,7 @@ const fail = (why) => {
 let pr;
 try {
   pr = JSON.parse(
-    run("gh", ["pr", "view", number, "--json", "mergeable,mergeStateStatus,headRefOid,baseRefOid,state,title,statusCheckRollup"]),
+    run("gh", ["pr", "view", number, "--json", "mergeable,mergeStateStatus,headRefOid,baseRefOid,baseRefName,state,title,statusCheckRollup,url"]),
   );
 } catch (error) {
   process.stdout.write(String(error.stdout ?? error.stderr ?? error.message ?? ""));
@@ -91,6 +92,12 @@ if (typeof head !== "string" || !FULL_SHA.test(head)) {
 if (typeof base !== "string" || !FULL_SHA.test(base)) {
   fail(`#${number}'s base from GitHub is not one full commit sha (${String(base)}).`);
 }
+
+// A checkout still at an older base kept squashing after #1269 landed, and nothing said so. This
+// refuses a copy that differs from the current base of the pull request's repository, before any
+// merge request and in --dry-run too. Copies older than this check lack it and are not stopped.
+const stale = mergeScriptDiffersFromBase(ROOT, fileURLToPath(import.meta.url), pr);
+if (stale !== undefined) fail(stale);
 
 // 2. The merge commit's message, validated before it becomes history: record semantics, and that git
 //    stores every record line it carries as a trailer.
