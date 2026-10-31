@@ -206,12 +206,13 @@ export const UNJUDGED_REVIEW_LIMIT_REFUSAL =
 const UNJUDGED_REVIEW_LIMIT_REFUSED = "UNJUDGED_REVIEW_LIMIT_REFUSED";
 
 /**
- * #1189 — the answer of a submission whose attempt no longer held the run (released, reclaimed, expired, at its cap,
- * or its owner binding moved on) when its review answered without a verdict. Its reason code is the review's own; this
- * text is fixed and never carries reviewer text, so a run with private review evidence is answered with it unchanged.
+ * #1189 — the answer of a submission whose attempt no longer holds the run (released, reclaimed, expired, at its cap,
+ * or its owner binding moved on), so nothing of its result is applied: `attemptLost`, and a review that answered such
+ * an attempt without a verdict, whose reason code is the review's own. The text is fixed and never carries reviewer
+ * text, so a run with private review evidence is answered with it unchanged. It gives no resubmit instruction.
  */
 export const STALE_ATTEMPT_NOT_APPLIED =
-  "not applied: this submission's attempt no longer held the run when its review answered, so nothing of its result was applied (no verdict, candidate state, revision or notice). This is not an unavailable review of the run's current candidate. What happens next follows from the run's current attempt and state, not from this answer: read the current run state.";
+  "not applied: this submission's attempt no longer holds the run, so nothing of its result was applied (no verdict, candidate state, revision or notice). This is not an unavailable review of the run's current candidate. What happens next follows from the run's current attempt and state, not from this answer: read the current run state.";
 
 export interface SubmitResultInput {
   runId: string;
@@ -1370,7 +1371,7 @@ export class CandidatePipeline {
 
   /**
    * The answer of a submission whose attempt no longer holds the run (released, expired or at its cap):
-   * its outcome is not applied, and a review that answered is recorded as refused for it.
+   * its outcome is not applied (`STALE_ATTEMPT_NOT_APPLIED`), and a review that answered is recorded as refused for it.
    */
   private attemptLost(
     runId: string,
@@ -1380,7 +1381,7 @@ export class CandidatePipeline {
   ): Decision<PipelineOutcome> {
     const refusal = deny<PipelineOutcome>(
       ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
-      "this submission's attempt no longer holds the run (released, expired or at its cap), so its outcome is not applied; submit the result again with a new idempotencyKey",
+      STALE_ATTEMPT_NOT_APPLIED,
       { runId, attemptId, candidateSnapshotDigest: snapshotDigest },
     );
     // A review the gate ended for this same reason reached no verdict, or recorded the one it did not keep.

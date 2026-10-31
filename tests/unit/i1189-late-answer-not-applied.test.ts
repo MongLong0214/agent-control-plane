@@ -5,22 +5,25 @@ import { afterAll, describe, expect, it } from "vitest";
 import { allow } from "../../src/core/errors.ts";
 import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ExecutionMode } from "../../src/domain/types.ts";
+import { ExecutionMode, RunKind } from "../../src/domain/types.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { HERMES_PROVENANCE_META_KEY } from "../../src/mcp/hermes-provenance.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { PRIVATE_EVIDENCE_ANSWER_NOTE } from "../../src/review/standard-review-evidence.ts";
 import * as pipeline from "../../src/run/candidate-pipeline.ts";
 import type { InvocationRequest, InvocationResult } from "../../src/runtime/provider.ts";
+import { bootstrapCoverageKeys, bootstrapPlan, cleanTreeManifest, submitBootstrapPlan } from "../helpers/bootstrap-plan.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { type Harness, applyPassingChange, bindCeo, bindWorker, makeHarness, registerFixtureProject, reviewerRevise } from "../helpers/harness.ts";
+import { type Harness, applyPassingChange, bindCeo, bindWorker, dispatchBootstrapRun, makeHarness, registerFixtureProject, reviewerPass,
+  reviewerRevise } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
 /**
  * #1189 (a) — a submission whose attempt lost its lease while its review ran, and whose review then answered without
  * a verdict, is told in fixed text that nothing of it was applied. It is not an unavailable review of the current
- * candidate, it changes nothing, and a run with private review evidence keeps the same fixed text. Markers are synthetic.
+ * candidate, it changes nothing, and a run with private review evidence keeps the same fixed text. So is a submission whose
+ * attempt the watchdog reclaimed while its review ran, with no other submission. Markers are synthetic.
  */
 type Args = Record<string, unknown>;
 const MINUTE = 60_000;
@@ -29,6 +32,21 @@ const WORK_BRANCH = "feature/late-answer";
 const NOT_APPLIED = (pipeline as Record<string, unknown>)["STALE_ATTEMPT_NOT_APPLIED"];
 const SOURCE = "a synthetic private source the excerpt is cut from";
 const EXCERPT = { originalSha256: sha256(SOURCE), omitted: true, ranges: [{ section: "result", startLine: 11, endLine: 12 }] };
+/** Everything a result could move: run state, candidate, verdicts, revisions, packets, every outbox message. */
+const productStateOf = (h: Harness, runId: string) => {
+  const kinds = (kind: string) => h.cp.audit.forRun(runId).filter((row) => row.kind === kind);
+  return {
+    run: h.cp.db.get<Args>("SELECT state, state_reason, revision_count, current_candidate_digest FROM runs WHERE run_id = ?", [runId]),
+    plans: h.cp.artifacts.list(runId, "PLAN").map((artifact) => artifact.digest),
+    snapshots: h.cp.artifacts.list(runId, "CANDIDATE_SNAPSHOT").map((artifact) => artifact.digest),
+    reviews: h.cp.artifacts.list(runId, "BLIND_REVIEW").map((artifact) => artifact.digest),
+    packets: h.cp.artifacts.list(runId, "PRODUCTION_READY_PACKET").length,
+    verdicts: kinds("BLIND_REVIEW_COMPLETED").length,
+    returns: kinds("REVISION_RETURNED_TO_CTO").length,
+    revisionTelemetry: h.cp.db.all<Args>("SELECT * FROM telemetry_metrics WHERE run_id = ? AND name = 'revision'", [runId]).length,
+    outbox: h.cp.db.all<Args>("SELECT message_id, kind, idempotency_key, status FROM outbox WHERE run_id = ? ORDER BY message_id", [runId]),
+  };
+};
 const bundleFor = (runId: string, contractDigest: string): string => {
   const bytes = Buffer.from(`## result\nsynthetic private excerpt ${MARKER}\n`, "utf8");
   return JSON.stringify({ runId, contractDigest, missing: ["the rest of the source"], files: [{ path: "handoff/excerpt.md", sha256: sha256(bytes),
@@ -92,25 +110,15 @@ async function fixture(kind: "private" | "plain") {
   /** Every submission attempt's id, in freeze order. */
   const attempts = (): string[] => h.cp.audit.forRun(runId).filter((row) => row.kind === "CANDIDATE_FROZEN").map((row) => row.evidence["attemptId"] as string);
   const kinds = (kind: string) => h.cp.audit.forRun(runId).filter((row) => row.kind === kind);
-  /** Everything a result could move: run state, candidate, verdicts, revisions, packets, every outbox message. */
-  const productState = () => ({
-    run: h.cp.db.get<Args>("SELECT state, state_reason, revision_count, current_candidate_digest FROM runs WHERE run_id = ?", [runId]),
-    snapshots: h.cp.artifacts.list(runId, "CANDIDATE_SNAPSHOT").map((artifact) => artifact.digest),
-    reviews: h.cp.artifacts.list(runId, "BLIND_REVIEW").map((artifact) => artifact.digest),
-    packets: h.cp.artifacts.list(runId, "PRODUCTION_READY_PACKET").length,
-    verdicts: kinds("BLIND_REVIEW_COMPLETED").length,
-    returns: kinds("REVISION_RETURNED_TO_CTO").length,
-    revisionTelemetry: h.cp.db.all<Args>("SELECT * FROM telemetry_metrics WHERE run_id = ? AND name = 'revision'", [runId]).length,
-    outbox: h.cp.db.all<Args>("SELECT message_id, kind, idempotency_key, status FROM outbox WHERE run_id = ? ORDER BY message_id", [runId]),
-  });
+  const productState = () => productStateOf(h, runId);
   const notices = () => h.cp.db.all<{ payload_json: string }>("SELECT payload_json FROM outbox WHERE run_id = ? AND kind = 'REVISION_REQUEST'", [runId])
     .map((row) => JSON.parse(row.payload_json) as Args);
   return { h, runId, identity, submit, attempts, kinds, productState, notices,
     close: async () => { for (const c of closers.reverse()) await c.close(); h.cp.close(); } };
 }
 
-/** The first candidate review waits until released; every later one answers at once. */
-const holdFirstReview = (h: Harness) => {
+/** The first review whose prompt matches waits until released; every later one answers at once. */
+const holdFirstReview = (h: Harness, review: RegExp = /Candidate review/) => {
   let entered!: () => void;
   const reviewing = new Promise<void>((resolve) => { entered = resolve; });
   let release!: () => void;
@@ -118,7 +126,7 @@ const holdFirstReview = (h: Harness) => {
   const invoke = h.scripted.invoke.bind(h.scripted);
   let calls = 0;
   h.scripted.invoke = async (request: InvocationRequest): Promise<InvocationResult> => {
-    if (/Candidate review/.test(request.prompt) && ++calls === 1) {
+    if (review.test(request.prompt) && ++calls === 1) {
       entered();
       await held;
     }
@@ -201,5 +209,67 @@ describe("#1189 a late answer of an attempt that lost its lease says its result 
       expect(JSON.stringify(late)).not.toContain(MARKER);
       expect(after).toEqual(before);
     } finally { await f.close(); }
+  });
+});
+
+/** A dispatched project-less bootstrap run with its PLAN submitted. */
+async function bootstrapRun() {
+  const h = makeHarness();
+  bindCeo(h);
+  const created = h.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: ExecutionMode.STANDARD,
+    contract: { goal: "bootstrap", why: "fixture", scope: [], nonGoals: [], acceptance: ["repository created"], priority: "NORMAL", humanGate: [], references: [] } });
+  if (!created.allowed) throw new Error(created.message);
+  const runId = created.value.runId;
+  await dispatchBootstrapRun(h.cp, h.clock, runId);
+  await submitBootstrapPlan(h, runId, bootstrapPlan(cleanTreeManifest("late-answer-1189")));
+  const run = h.cp.runs.require(runId);
+  const submit = () => h.cp.pipeline.submitResult({ runId, ownerSessionId: run.ownerSessionId!, ownerBindingGeneration: run.ownerBindingGeneration!,
+    resultSummary: "outputs", recommendation: "create" });
+  return { h, runId, submit };
+}
+
+/** The review outlasts its lease and the watchdog reclaims the attempt; no other submission starts; then the review answers. */
+const answeredAfterReclaim = async (h: Harness, runId: string, submit: () => ReturnType<Harness["cp"]["pipeline"]["submitResult"]>, review: RegExp) => {
+  const { reviewing, release } = holdFirstReview(h, review);
+  const answer = submit();
+  await reviewing;
+  h.clock.advance(31 * MINUTE);
+  expect(h.cp.pipeline.reclaimExpiredAttempts()).toHaveLength(1);
+  const before = productStateOf(h, runId);
+  release();
+  const late = await answer;
+  return { late, before, after: productStateOf(h, runId) };
+};
+
+const RESUBMIT = /resubmit|result_submit|submit the result again|idempotencyKey/i;
+
+describe("#1189 an attempt reclaimed while its review ran is answered not applied, with no resubmit instruction", () => {
+  it.each(["plain", "private"] as const)("a %s STANDARD run: the stale reason code, the fixed not-applied text and no state change", async (kind) => {
+    const f = await fixture(kind);
+    try {
+      f.h.scripted.script({ match: /Candidate review/, text: reviewerPass([`${f.identity}:src/app.js`]), once: false });
+      const { late, before, after } = await answeredAfterReclaim(f.h, f.runId, f.submit, /Candidate review/);
+
+      expect(late).toMatchObject({ allowed: false, reasonCode: ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
+        evidence: kind === "private" ? { privateReviewEvidence: true, outcome: "NOT_COMPLETED", note: PRIVATE_EVIDENCE_ANSWER_NOTE } : { runId: f.runId } });
+      expect(late.allowed ? null : late.message).not.toMatch(RESUBMIT);
+      expect(late.allowed ? null : late.message).toMatch(/^not applied:/);
+      expect(late).toMatchObject({ message: NOT_APPLIED });
+      expect(after).toEqual(before);
+    } finally { await f.close(); }
+  });
+
+  it("a project-less bootstrap run (the review reproduction): the stale reason code, the fixed not-applied text and no state change", async () => {
+    const { h, runId, submit } = await bootstrapRun();
+    try {
+      h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(h, runId)), once: false });
+      const { late, before, after } = await answeredAfterReclaim(h, runId, submit, /Bootstrap plan review/);
+
+      expect(late).toMatchObject({ allowed: false, reasonCode: ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE, evidence: { runId } });
+      expect(late.allowed ? null : late.message).not.toMatch(RESUBMIT);
+      expect(late.allowed ? null : late.message).toMatch(/^not applied:/);
+      expect(late).toMatchObject({ message: NOT_APPLIED });
+      expect(after).toEqual(before);
+    } finally { h.cp.close(); }
   });
 });
