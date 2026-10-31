@@ -61,8 +61,9 @@ const fixture = async () => {
   // The provider a canonical CTO's dispatch is admitted against; it launched none of them.
   const claude = new TestProductionAdapter(h.clock, "claude");
   h.cp.providers.register(claude);
-  const launch = await startSessionLaunchChannel(tempDir("acp-hof-launch-"));
-  h.cp.cto.attach({ sessionLaunch: launch });
+  // As agentcpd composes it (O4): the registry beside the channel, and the lifecycle at its interactive-spawn door.
+  const launch = await startSessionLaunchChannel(tempDir("acp-hof-launch-"), { sessions: h.cp.sessions, audit: h.cp.audit });
+  h.cp.cto.attach({ sessionLaunch: launch.interactiveSpawns });
   // The CEO the Hermes socket authenticates, for cto_replace, run_create and run_dispatch.
   const ceo = h.cp.sessions.create({ provider: "scripted", model: "handoff-ceo" });
   const ceoSecret = ceo.sessionSecret;

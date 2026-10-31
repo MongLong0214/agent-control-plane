@@ -48,7 +48,12 @@ export class RecordingRuntimeDouble extends HeadlessRuntimeDouble {
  */
 export const bootstrapRuntimeFixture = async (harnessOptions: Parameters<typeof makeHarness>[0] = {}) => {
   const harness = makeHarness(harnessOptions);
-  const launch = await startSessionLaunchChannel(tempDir("acp-c1b-launch-"), { mcpToken: BOOTSTRAP_FIXTURE_TOKEN });
+  // As the daemon composes it (O4): the registry each entry is verified against, and the audit log.
+  const launch = await startSessionLaunchChannel(tempDir("acp-c1b-launch-"), {
+    mcpToken: BOOTSTRAP_FIXTURE_TOKEN,
+    sessions: harness.cp.sessions,
+    audit: harness.cp.audit,
+  });
   const claude = new RecordingRuntimeDouble(harness.clock, "claude");
   claude.observeCredentialCustody(harness.cp.sessionRuntime, harness.cp.sessions, BOOTSTRAP_FIXTURE_TOKEN);
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);

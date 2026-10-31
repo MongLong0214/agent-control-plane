@@ -3,8 +3,9 @@ import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { SessionLaunchCredential } from "../../src/cto/cto-lifecycle.ts";
 import type { ProvisionedSessionRuntime, SessionCredentialDelivery } from "../../src/runtime/provisioned-session-runtime.ts";
+import type { SessionTurnSpawnRequest } from "../../src/runtime/cli-adapters.ts";
 import type { SessionTurnRequest, SessionTurnResult } from "../../src/runtime/provider.ts";
-import { claimLaunchedCredential } from "./mcp-socket.ts";
+import { claimLaunchedCredentialAsTurn } from "./mcp-socket.ts";
 import type { SessionRegistry } from "../../src/session/session-registry.ts";
 import { TestProductionAdapter } from "./production-adapter.ts";
 
@@ -133,8 +134,13 @@ export class HeadlessRuntimeDouble extends TestProductionAdapter {
           }
         : null;
     }
+    // O4 — over a real launch socket the claim comes from the shape a real turn has: a holder this double
+    // spawns and reports through the runtime's own `onSpawn` (which pins it with the start token the runtime
+    // reads itself), its child in the CLI's place, and the claiming leaf as that child's child. A request
+    // that carries no `onSpawn` leaves its entry unpinned, and the channel refuses it.
+    const onSpawn = (request as SessionTurnSpawnRequest).onSpawn;
     try {
-      const taken = await claimLaunchedCredential(request.relay!.launchSocketPath, externalSessionId);
+      const taken = await claimLaunchedCredentialAsTurn(request.relay!.launchSocketPath, externalSessionId, (pid) => onSpawn?.(pid));
       return {
         sessionId: taken.sessionId,
         sessionIncarnation: taken.sessionIncarnation ?? "",

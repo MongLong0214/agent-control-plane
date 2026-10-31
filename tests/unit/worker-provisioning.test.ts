@@ -278,8 +278,9 @@ interface FixtureOptions {
 const staffingFixture = async (options: FixtureOptions = {}) => {
   const harness = makeHarness();
   const { projectId, repositoryId } = await registerFixtureProject(harness);
-  const launch = await startSessionLaunchChannel(tempDir("acp-worker-launch-"));
-  harness.cp.cto.attach({ sessionLaunch: launch });
+  // As agentcpd composes it (O4): the registry beside the channel, and the lifecycle at its interactive-spawn door.
+  const launch = await startSessionLaunchChannel(tempDir("acp-worker-launch-"), { sessions: harness.cp.sessions, audit: harness.cp.audit });
+  harness.cp.cto.attach({ sessionLaunch: launch.interactiveSpawns });
   const created = harness.cp.runs.create({
     projectId,
     executionMode: ExecutionMode.STANDARD,

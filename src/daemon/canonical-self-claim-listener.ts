@@ -131,6 +131,15 @@ const authenticateClaimPeer = (socket: Socket): Decision<AuthenticatedClaimPeer>
   authenticateClaimCredentials(derivePeerCredentialsFromSocket(socket), process.geteuid?.());
 
 /**
+ * O4 — the kernel peer of one connection on the session launch channel (`cto.launch.sock`, served in
+ * `agentcpd.ts`): the same derivation and the same three refusals as the doors in this file, over the
+ * connection the launch request arrives on. The channel decides a driven turn's credential on this pid
+ * alone; nothing the request carries is ever read as the peer, its parent or its start.
+ */
+export const authenticateLaunchPeer = (socket: Socket): Decision<AuthenticatedClaimPeer> =>
+  authenticateClaimPeer(socket);
+
+/**
  * The same three refusals, over values rather than over a socket — the shape `assertDirectPeer`
  * was already split out into, extended to its two neighbours.
  *

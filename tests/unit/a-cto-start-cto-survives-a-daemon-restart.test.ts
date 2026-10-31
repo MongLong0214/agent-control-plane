@@ -111,7 +111,8 @@ interface DaemonProcess {
 
 const startDaemonProcess = async (harness: Harness, claude: RecordingRuntimeDouble): Promise<DaemonProcess> => {
   harness.cp.providers.registerForRole(claude, Role.PRIMARY_CTO);
-  const launch = await startSessionLaunchChannel(tempDir("acp-o4a-launch-"), { mcpToken: TOKEN });
+  // As agentcpd composes it (O4): the registry each entry is verified against, and the audit log.
+  const launch = await startSessionLaunchChannel(tempDir("acp-o4a-launch-"), { mcpToken: TOKEN, sessions: harness.cp.sessions, audit: harness.cp.audit });
   const offered: SessionLaunchCredential[] = [];
   const delivery: SessionCredentialDelivery = {
     prepare: () => launch.prepare(),
@@ -395,15 +396,16 @@ describe("O4 D1 — a CTO the restarted daemon spawned while starting is not rep
     clock.advance(60_000);
     const second = makeHarness({ root: first.root, repoPath: first.repoPath, clock });
     const cp = second.cp;
-    // The daemon's launch channel, attached to the lifecycle as agentcpd attaches it: a spawn's credential waits there.
-    const launch = await startSessionLaunchChannel(tempDir("acp-o4a-d1-launch-"), { mcpToken: TOKEN });
+    // The daemon's launch channel, attached to the lifecycle as agentcpd attaches it — at its interactive-spawn
+    // door (O4): a spawn's credential waits there.
+    const launch = await startSessionLaunchChannel(tempDir("acp-o4a-d1-launch-"), { mcpToken: TOKEN, sessions: cp.sessions, audit: cp.audit });
     const offered: SessionLaunchCredential[] = [];
     cp.cto.attach({
       sessionLaunch: {
-        prepare: () => launch.prepare(),
+        prepare: () => launch.interactiveSpawns.prepare(),
         provision: (credential) => {
           offered.push(credential);
-          return launch.provision(credential);
+          return launch.interactiveSpawns.provision(credential);
         },
       },
     });

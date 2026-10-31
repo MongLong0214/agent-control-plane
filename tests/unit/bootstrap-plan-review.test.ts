@@ -54,8 +54,10 @@ const CONTRACT: TaskContract = {
 
 const reviewFixture = async () => {
   const harness = makeHarness();
-  const launch = await startSessionLaunchChannel(tempDir("acp-c2-launch-"), { mcpToken: TOKEN });
-  harness.cp.cto.attach({ sessionLaunch: launch });
+  // As agentcpd composes it (O4): the registry beside the channel, the lifecycle at its interactive-spawn
+  // door, and (below) the runtime driver at the driven-turn door.
+  const launch = await startSessionLaunchChannel(tempDir("acp-c2-launch-"), { mcpToken: TOKEN, sessions: harness.cp.sessions, audit: harness.cp.audit });
+  harness.cp.cto.attach({ sessionLaunch: launch.interactiveSpawns });
   // Claude Opus staffs the bootstrap CTO; the reviewer is the harness's own. No worker is staffed: the
   // PLAN's task stays READY until CEO CONFIRM settles it (CEO 1792120507).
   const claude = new HeadlessRuntimeDouble(harness.clock, "claude");
