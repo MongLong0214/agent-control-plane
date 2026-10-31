@@ -174,9 +174,10 @@ export class WorkerRetirement {
    * What of `sessionId` is not shown ended, whatever its lifecycle; project retirement asks this for
    * every worker session of the project. Two things, each by its own evidence: every receipt the
    * session ran (`#remainingTurns`), and the session's own recorded process, which has ended only when
-   * it is probed DEAD (`#sessionProcess`); a session that recorded no process never had one. Its
-   * lifecycle (ERROR, STOPPED) or a stop that threw is evidence of neither. Read only: nothing is
-   * recorded, stopped or signalled.
+   * it is probed DEAD (`#sessionProcess`). A session with no recorded session pid gives the
+   * own-process check nothing to read, so that check adds nothing for it; the receipt, launch, git
+   * and orphan checks on its receipts still apply, separately. Its lifecycle (ERROR, STOPPED) or a
+   * stop that threw is evidence of neither. Read only: nothing is recorded, stopped or signalled.
    */
   unended(sessionId: string): RemainingWorkerProcess[] {
     const session = this.ports.sessions.get(sessionId);
@@ -409,9 +410,9 @@ export class WorkerRetirement {
    *   applies before it does — no member of the group it led remains, and the pid is gone or now
    *   names a process with another start time; otherwise it is running or unverified;
    * - with no recorded pid, a receipt that is runtime-managed or has any launch or git record of its
-   *   own (`#launchOrGitOnRecord`) has ended only when its records show it ran nothing (`#ranNothing`),
-   *   whatever its status: a SUCCEEDED or FAILED does not show that a process it may have spawned
-   *   ended. A receipt with neither, the CTO's reported completion, has ended only when it is
+   *   own (`#launchOrGitOnRecord`) has ended only when no unended evidence remains for it
+   *   (`#ranNothing`: no guard grant, and no unended launch, git group or git intent), whatever its
+   *   status: a SUCCEEDED or FAILED does not show that a process it may have spawned ended. A receipt with neither, the CTO's reported completion, has ended only when it is
    *   SUCCEEDED or FAILED, which reports the worker's end. Every other receipt without a pid is
    *   PROCESS_UNVERIFIED: nothing establishes that its worker, whoever launched it, has stopped.
    */
@@ -458,12 +459,14 @@ export class WorkerRetirement {
   }
 
   /**
-   * A runtime-managed receipt with no recorded pid ran nothing only when its records show it: the guard
-   * admitted no provider launch for it (`launchWasAuthorised`, the runner's own reader), its launch
-   * intent, if one was written, has its end (`TASK_WORKER_LAUNCH_ENDED`), and every git child its task
-   * started in its run has its end (`TASK_WORKER_GIT_GROUP_ENDED`, by nonce and pgid for a group, by
-   * nonce for an intent with no group), as the runner reads them. Its unidentified orphans are read
-   * before this, for every receipt. A missing pid alone, or a terminal status, is never an end.
+   * Whether no unended evidence remains for a receipt with no recorded pid (runtime-managed, or with a
+   * launch or git record of its own). It does not say nothing ran: a launch or a git group whose end
+   * is recorded passes. It checks that the guard admitted no provider launch for it
+   * (`launchWasAuthorised`, the runner's own reader), that its launch intent, if one was written, has
+   * its end (`TASK_WORKER_LAUNCH_ENDED`), and that every git group and git intent its task started in
+   * its run has its end (`TASK_WORKER_GIT_GROUP_ENDED`, by nonce and pgid for a group, by nonce for an
+   * intent with no group), as the runner reads them. Its unidentified orphans are read before this,
+   * for every receipt. A missing pid alone, or a terminal status, is never an end.
    */
   #ranNothing(row: { execution_id: string; run_id: string; task_id: string }): boolean {
     if (launchWasAuthorised(this.db, row.execution_id)) return false;
