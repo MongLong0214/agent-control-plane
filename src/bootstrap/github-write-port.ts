@@ -53,7 +53,19 @@ export interface ObservedRepository {
   /** Carries the create marker that lets a retry recognise its own create (RF1043-02). */
   description: string | null;
   defaultBranch: string | null;
+  /** #1269 — absent, or a field `null`, where GitHub's answer did not carry it: unknown, never a default. */
+  mergeMethods?: MergeMethods<boolean | null>;
 }
+
+/** #1269 — the merge methods a repository allows, under GitHub's field names. */
+export interface MergeMethods<T = boolean> {
+  allow_merge_commit: T;
+  allow_squash_merge: T;
+  allow_rebase_merge: T;
+}
+
+/** #1269 — every repository the port creates allows ordinary merge commits only. */
+export const NEW_REPOSITORY_MERGE_METHODS: MergeMethods = { allow_merge_commit: true, allow_squash_merge: false, allow_rebase_merge: false };
 
 export interface ObservedBranch {
   name: string;
@@ -265,6 +277,9 @@ interface RepositoryDocument {
   private?: unknown;
   description?: unknown;
   default_branch?: unknown;
+  allow_merge_commit?: unknown;
+  allow_squash_merge?: unknown;
+  allow_rebase_merge?: unknown;
 }
 
 /**
@@ -302,7 +317,13 @@ const repositoryFrom = (document: RepositoryDocument, path: string): ObservedRep
         : "unknown";
   const defaultBranch = typeof document.default_branch === "string" ? document.default_branch : null;
   const description = typeof document.description === "string" ? document.description : null;
-  return { nodeId, fullName, visibility, description, defaultBranch };
+  const flag = (value: unknown): boolean | null => (typeof value === "boolean" ? value : null);
+  const mergeMethods = {
+    allow_merge_commit: flag(document.allow_merge_commit),
+    allow_squash_merge: flag(document.allow_squash_merge),
+    allow_rebase_merge: flag(document.allow_rebase_merge),
+  };
+  return { nodeId, fullName, visibility, description, defaultBranch, mergeMethods };
 };
 
 interface ProtectionDocument {
@@ -483,6 +504,8 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
         private: visibility === "private",
         visibility,
         auto_init: autoInit,
+        // https://docs.github.com/en/rest/repos/repos — both create endpoints take these (default true); GET repos/{owner}/{repo} returns them.
+        ...NEW_REPOSITORY_MERGE_METHODS,
       });
       return repositoryFrom(created, path);
     },

@@ -125,7 +125,7 @@ const standIn = async (
 /** The create's body exactly as the port sends it, for counting what `gh` read. */
 const createBodyBytes = (descriptionBytes: number): number =>
   Buffer.byteLength(
-    JSON.stringify({ name: "fixture", description: "x".repeat(descriptionBytes), private: true, visibility: "private", auto_init: false }),
+    JSON.stringify({ name: "fixture", description: "x".repeat(descriptionBytes), private: true, visibility: "private", auto_init: false, allow_merge_commit: true, allow_squash_merge: false, allow_rebase_merge: false }),
     "utf8",
   );
 

@@ -22,6 +22,7 @@ import { git, tryRevParse } from "../git/git.ts";
 import {
   genesisLabelConflictOf,
   isGitHubNodeId,
+  NEW_REPOSITORY_MERGE_METHODS,
   parseGitHubIdentity,
   REQUEST_OUTCOME_UNKNOWN,
   requestOutcomeUnknown,
@@ -31,6 +32,7 @@ import {
   type GitHubRepositoryTarget,
   type GitHubVisibility,
   type GitHubWritePort,
+  type MergeMethods,
   UNOBSERVED,
   type ObservedBranchProtection,
   type ObservedRepository,
@@ -921,6 +923,26 @@ export const applyGitHubOperations = async (
     return allow(ReasonCode.OK, undefined);
   };
 
+  /**
+   * #1269 — a repository this operation's create made allows ordinary merge commits only, as the create
+   * asked, judged on GitHub's read of it. A receipted repository is not judged again. A field the read
+   * did not carry, or carries otherwise, refuses by name; nothing is PATCHed, deleted or created again.
+   */
+  const judgeMergeMethods = (observed: ObservedRepository, operationId: string): Decision<void> => {
+    const fields = (Object.keys(NEW_REPOSITORY_MERGE_METHODS) as (keyof MergeMethods)[]).filter(
+      (field) => observed.mergeMethods?.[field] !== NEW_REPOSITORY_MERGE_METHODS[field],
+    );
+    if (fields.length === 0) return allow(ReasonCode.OK, undefined);
+    return stop(
+      ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
+      "MERGE_METHODS_MISMATCH",
+      `GitHub reports ${observed.fullName} with ${fields.map((field) => `${field} ${String(observed.mergeMethods?.[field] ?? "absent")}`).join(", ")}, and its create asked for merge commits only`,
+      operationId,
+      { fields, observed: observed.mergeMethods ?? null, desired: NEW_REPOSITORY_MERGE_METHODS },
+      false,
+    );
+  };
+
   /** Before any later operation: the repository at this name is still the one we receipted. */
   const confirmRepository = async (operationId: string | null): Promise<Decision<ObservedRepository>> => {
     const observed = await remote(operationId, () => port.observeRepository(target));
@@ -1098,6 +1120,8 @@ export const applyGitHubOperations = async (
       }
       const judged = judgeRepository(observed.value, id);
       if (!judged.allowed) return judged as Decision<Step>;
+      const merges = judgeMergeMethods(observed.value, id);
+      if (!merges.allowed) return merges as Decision<Step>;
       return allow(ReasonCode.OK, {
         receipt: {
           operationId: id,
@@ -1184,6 +1208,8 @@ export const applyGitHubOperations = async (
     }
     const rereadJudged = judgeRepository(reread.value, id);
     if (!rereadJudged.allowed) return rereadJudged as Decision<Step>;
+    const rereadMerges = judgeMergeMethods(reread.value, id);
+    if (!rereadMerges.allowed) return rereadMerges as Decision<Step>;
     return allow(ReasonCode.OK, {
       receipt: {
         operationId: id,
