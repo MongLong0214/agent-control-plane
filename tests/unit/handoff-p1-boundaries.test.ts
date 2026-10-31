@@ -48,7 +48,7 @@ const parserError = (argv: readonly string[]): string => {
 
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
 
-/** Start with the allowlisted interpreter, then replace it with the shell under test. */
+/** Start with node, then replace it with the shell under test. */
 const nodeExecShell = (script: string): string => {
   const encoded = Buffer.from(script, "utf8").toString("base64");
   return `process.execve('/bin/sh',['sh','-c',Buffer.from(${JSON.stringify(encoded)},'base64').toString()],process.env)`;
@@ -152,7 +152,7 @@ describe("handoff P1 child boundaries", () => {
   // byte bound on the store that actually runs. Deleting them here rather than porting them
   // is deliberate: a test that constructs a class nobody ships is not a boundary proof.
 
-  it("P1-15 resolves allowlisted node forms by their real path", () => {
+  it("P1-15 resolves node forms by their real path", () => {
     const forms = ["node", relative(process.cwd(), process.execPath), process.execPath];
     for (const [index, argv0] of forms.entries()) {
       expect(
@@ -161,7 +161,9 @@ describe("handoff P1 child boundaries", () => {
     }
   });
 
-  it("P1-15 attempts all known launcher rounds and never exposes the shell sentinel", async () => {
+  // Owner directive 2026-10-31: any executable may be argv[0], launchers and shells included. These
+  // launcher rounds used to be refused; they now run as any declared command does, inside the sandbox.
+  it("P1-15 runs every known launcher round as a declared command, inside the sandbox", async () => {
     const attempts: readonly { label: string; argv: readonly string[] }[] = [
       { label: "env NAME=VALUE", argv: ["env", "NAME=VALUE", "sh", "-c", "printf pwned"] },
       { label: "env -S", argv: ["env", "-S", "X=1", "sh", "-c", "printf pwned"] },
@@ -171,39 +173,31 @@ describe("handoff P1 child boundaries", () => {
     ];
 
     for (const attempt of attempts) {
-      const parserResult = parserError(attempt.argv);
-      expect(parserResult, attempt.label).toContain("verification executable allowlist");
+      expect(parserError(attempt.argv), attempt.label).toBe("parser accepted the command");
 
       const outcome = await runSandboxed({
         command: legacyCommand(attempt.argv),
         worktreePath: tempDir(`acp-p1-15-${attempt.label.replaceAll(/[^a-z0-9]+/g, "-")}-`),
       });
-      expect(`${outcome.stdout}\n${outcome.stderr}`, attempt.label).not.toContain("pwned");
-      expect(outcome, attempt.label).toMatchObject({ status: "ERROR", reasonCode: "INVALID_ARGUMENT" });
-      expect(outcome.stderr, attempt.label).toContain("verification executable allowlist");
-      expect(outcome.stderr, attempt.label).toContain(attempt.argv[0]!);
+      if (attempt.argv.includes("/bin")) {
+        // `env -P /bin` names a path outside the worktree: the unchanged wrong-target rule refuses it.
+        expect(outcome, attempt.label).toMatchObject({ status: "ERROR", reasonCode: ReasonCode.SANDBOX_PATH_OUTSIDE_WORKTREE });
+        continue;
+      }
+      expect(outcome, `${attempt.label}: ${outcome.stderr}`).toMatchObject({
+        status: "PASS",
+        stdout: "pwned",
+        enforcement: { mechanism: "seatbelt", writeConfinement: true, readConfinement: "sensitive-paths" },
+      });
     }
   });
 
-  it("P1-15 refuses three executables outside the allowlist without running their sentinels", async () => {
-    const attempts: readonly { label: string; argv: readonly string[] }[] = [
-      { label: "open", argv: ["open", "sh", "-c", "printf pwned"] },
-      { label: "script", argv: ["script", "sh", "-c", "printf pwned"] },
-      { label: "caffeinate", argv: ["caffeinate", "sh", "-c", "printf pwned"] },
-    ];
-
-    for (const attempt of attempts) {
-      const parserResult = parserError(attempt.argv);
-      expect(parserResult, attempt.label).toContain("verification executable allowlist");
-
-      const outcome = await runSandboxed({
-        command: legacyCommand(attempt.argv),
-        worktreePath: tempDir(`acp-p1-15-${attempt.label}-worktree-`),
-      });
-      expect(`${outcome.stdout}\n${outcome.stderr}`, attempt.label).not.toContain("pwned");
-      expect(outcome, attempt.label).toMatchObject({ status: "ERROR", reasonCode: "INVALID_ARGUMENT" });
-      expect(outcome.stderr, attempt.label).toContain("verification executable allowlist");
-      expect(outcome.stderr, attempt.label).toContain(attempt.argv[0]!);
+  it("P1-15 accepts open, script and caffeinate as declared executables", () => {
+    // Accepted, not run here: `open` asks LaunchServices to start a process, which runs outside the
+    // sandbox (a limit ADR-0004 states), and `caffeinate` leaves a helper the supervisor reaps as a
+    // descendant that outlived the command. `env` and `arch` above show a launcher running confined.
+    for (const argv of [["open", "sh", "-c", "printf pwned"], ["script", "sh", "-c", "printf pwned"], ["caffeinate", "sh", "-c", "printf pwned"]]) {
+      expect(parserError(argv), argv[0]).toBe("parser accepted the command");
     }
   });
 
@@ -399,7 +393,9 @@ describe("handoff P1 child boundaries", () => {
     expect(rows.get("outside assigned roots")?.message).toMatch(/Operation not permitted|Permission denied/);
   });
 
-  it("P1-15 records the kernel refusal when a shell reaches the network", async () => {
+  // The network is open since 2026-10-31: a shell reaches a local server, and the evidence says
+  // `allow` rather than claiming a denial that was not in force.
+  it("P1-15 records that a shell reaches the network, and that no denial was in force", async () => {
     const server = createServer((socket) => {
       socket.on("error", () => undefined);
       socket.end("network-ok");
@@ -421,13 +417,12 @@ except OSError as error:
     print("network\tlocalhost\t1\t%s\t%s" % (errno.errorcode.get(error.errno, "UNKNOWN"), str(error)))
 `)}`;
       const outcome = await runSandboxed({
-        command: shellCommand("shell-network-deny", script),
+        command: shellCommand("shell-network-open", script),
         worktreePath: tempDir("acp-p1-15-network-worktree-"),
       });
       const row = probeRows(outcome.stdout)[0];
-      expect(outcome, JSON.stringify(outcome)).toMatchObject({ status: "PASS", reasonCode: null, enforcement: { networkEnforced: true, networkPolicy: "deny" } });
-      expect(row).toMatchObject({ kind: "network", label: "localhost", status: "1", errno: "EPERM" });
-      expect(row?.message).toMatch(/Operation not permitted|Permission denied/);
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({ status: "PASS", reasonCode: null, enforcement: { networkEnforced: false, networkPolicy: "allow" } });
+      expect(row).toMatchObject({ kind: "network", label: "localhost", status: "0", errno: "OK" });
     } finally {
       await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
     }

@@ -5,13 +5,7 @@ import { z } from "zod";
 import { canonicalJson, digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import {
-  isVerificationCommandRefused,
-  manifestVerificationCommandSchema,
-  PROJECT_VERIFICATION_EXECUTABLES,
-  type verificationCommandSchema,
-  verificationExecutableRefusalMessage,
-} from "./verification-command.ts";
+import { verificationCommandSchema } from "./verification-command.ts";
 
 export const PROJECT_MANIFEST_SCHEMA_ID = "agent-control-plane.project.v2";
 
@@ -64,15 +58,10 @@ export const projectManifestSchema = z
         guarded: z.array(z.string()).default([]),
       })
       .strict(),
-    verificationCommands: z.array(manifestVerificationCommandSchema).default([]),
-    /**
-     * #1253 — executables this project's own verification commands may launch beyond the shared
-     * allowlist, each one PROJECT_VERIFICATION_EXECUTABLES names (none yet, so any declaration is
-     * refused). It reaches only this project's runs: the sandbox takes it from the pinned manifest.
-     * `.optional()` with no default keeps every existing manifest's digest unchanged, and `.min(1)`
-     * keeps an empty list from looking like a declaration.
-     */
-    verificationExecutables: z.array(z.string().min(1)).min(1).optional(),
+    // Any executable may be argv[0] (owner directive 2026-10-31), so there is no per-project list of
+    // executables: #1253's `verificationExecutables` is gone, and a manifest naming it is refused as
+    // an unknown key, as every declaration of it already was.
+    verificationCommands: z.array(verificationCommandSchema).default([]),
     postMergeCommands: z.array(z.string()).default([]),
     ciWorkflows: z
       .array(
@@ -215,25 +204,6 @@ export const projectManifestSchema = z
             path: ["verificationProfiles", profile],
           });
         }
-      }
-    }
-    const executables = manifest.verificationExecutables ?? [];
-    for (const name of executables) {
-      if (!PROJECT_VERIFICATION_EXECUTABLES.has(name)) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `verificationExecutables names '${name}', which a project cannot add to the verification executable allowlist`,
-          path: ["verificationExecutables"],
-        });
-      }
-    }
-    for (const [index, cmd] of manifest.verificationCommands.entries()) {
-      if (isVerificationCommandRefused(cmd.argv, { executables })) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: verificationExecutableRefusalMessage(cmd.argv, { executables }),
-          path: ["verificationCommands", index, "argv", 0],
-        });
       }
     }
     const roles = new Set(manifest.repositories.map((r) => r.role));
@@ -494,8 +464,8 @@ const moduleFormatRefusal = (entry: GateEntry): string | null => {
  * Nothing else launches a gate. Package managers and task runners (npm, pnpm, yarn, npx, bun,
  * make, just) and tools that read their own configuration (vitest, eslint, tsc) choose what runs
  * from candidate files: `pnpm gate/check.mjs` runs a package script of that name. git is not an
- * interpreter. node is also the only interpreter the verification executable allowlist admits,
- * and an entry run as argv[0] is not on it either. Python and Deno are left out on their own
+ * interpreter. A gate entry run as argv[0] is not admitted either, though any executable may be
+ * argv[0] of an ordinary verification command (2026-10-31). Python and Deno are left out on their own
  * terms: CPython puts the script's directory first on its import path and runs an unchecked
  * hash-based .pyc in place of a declared helper's source, and Deno resolves imports through a
  * deno.json it discovers in the candidate tree.

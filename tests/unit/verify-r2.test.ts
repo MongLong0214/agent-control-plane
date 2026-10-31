@@ -17,7 +17,7 @@ import {
   manifestDigest,
   type ProjectManifest,
 } from "../../src/contracts/manifest.ts";
-import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
+import { parseVerificationCommand, resolveVerificationExecutable } from "../../src/contracts/verification-command.ts";
 import { sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { allow } from "../../src/core/errors.ts";
@@ -697,9 +697,11 @@ exec /bin/ps "$@"
     expect(assertPortableManifest(manifest)).toMatchObject({ allowed: false, reasonCode: ReasonCode.MANIFEST_NOT_PORTABLE });
   });
 
-  it("#171/#235 rejects shell paths and env launcher forms", () => {
-    expect(() => parseVerificationCommand({ id: "shell", argv: ["/bin/sh", "-c", "true"] })).toThrow();
-    expect(() => parseVerificationCommand({ id: "env-shell", argv: ["/usr/bin/env", "bash", "-c", "true"] })).toThrow();
+  // #171/#235 refused shells and env launchers. Since 2026-10-31 any executable may be argv[0], so
+  // the same forms are accepted; the sandbox, not argv inspection, is what confines them.
+  it("#171/#235 accepts shell paths and env launcher forms as any executable", () => {
+    expect(() => parseVerificationCommand({ id: "shell", argv: ["/bin/sh", "-c", "true"] })).not.toThrow();
+    expect(() => parseVerificationCommand({ id: "env-shell", argv: ["/usr/bin/env", "bash", "-c", "true"] })).not.toThrow();
 
     // P1-15's filed reproduction, exactly as reported: the old walker returned at the first
     // non-option argument, so `FOO=1` was read as the executable and the `bash` behind it was
@@ -708,14 +710,19 @@ exec /bin/ps "$@"
     expect(() => parseVerificationCommand({
       id: "env-assignment-shell",
       argv: ["env", "FOO=1", "bash", "-c", "true"],
-    })).toThrow();
+    })).not.toThrow();
     expect(() => parseVerificationCommand({
       id: "env-assignment-shell-abs",
       argv: ["/usr/bin/env", "FOO=1", "BAR=2", "sh", "-c", "true"],
-    })).toThrow();
+    })).not.toThrow();
+    // A name that leads to no executable file is still refused at the contract.
+    expect(() => parseVerificationCommand({ id: "missing", argv: ["acp-no-such-tool-235", "-c", "true"] }))
+      .toThrow(/does not lead to an executable file/);
   });
 
-  it("P1-15 decides the allowlist on the resolved binary, not the name it was given", () => {
+  // P1-15 decided the allowlist on the resolved binary. There is no allowlist since 2026-10-31; the
+  // resolution still reports the binary that will run, its realpath, which the launch binds to.
+  it("P1-15 resolves a disguised name to the binary that will actually run", () => {
     // A file *named* `node` whose realpath is `/bin/sh`. The name half of the allowlist used
     // to be satisfied by the basename and the permitted-root half by the target living in
     // `/bin`, so this restored the launcher form P1-15 was filed for — through a symlink
@@ -725,8 +732,8 @@ exec /bin/ps "$@"
     symlinkSync("/bin/sh", disguised);
 
     expect(() => parseVerificationCommand({ id: "disguised", argv: [disguised, "-c", "true"] }))
-      .toThrow();
-    // …while the interpreter the allowlist is actually for still passes.
+      .not.toThrow();
+    expect(resolveVerificationExecutable(disguised).resolvedPath).toBe(realpathSync("/bin/sh"));
     expect(() => parseVerificationCommand({ id: "real-node", argv: [process.execPath, "-e", "0"] }))
       .not.toThrow();
   });

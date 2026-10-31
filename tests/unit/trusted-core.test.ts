@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { join } from "node:path";
 import { chmodSync, writeFileSync } from "node:fs";
+import { createServer, type AddressInfo } from "node:net";
 
 import { isoPlus } from "../../src/core/clock.ts";
 import { canonicalJson, digestOf } from "../../src/core/digest.ts";
@@ -778,7 +779,7 @@ describe("portable project manifest (Integration §10.2)", () => {
       ["node", "--env-file", ".env", "scripts/gate.mjs"],
       ["scripts/gate.mjs"],
     ]) {
-      // Some of these are also outside the verification executable allowlist, a separate refusal.
+      // A gate entry runs under node's ACP loader; any other launcher is refused here.
       expect(refusedAt({ ...runsGate(argv), gateEntries: [gate] }), argv.join(" ")).toContain("gateEntries");
     }
     // A TRUSTED_CI command runs where ACP cannot check the entry first, so it cannot carry one;
@@ -965,7 +966,9 @@ describe("verification sandbox (PRD §17.4)", () => {
     expect(outcome.status).toBe("PASS");
     const parsed = JSON.parse(outcome.stdout) as { leak: string[]; home: string };
     expect(parsed.leak).toEqual([]);
-    expect(parsed.home).not.toBe(process.env["HOME"]);
+    // HOME is the daemon's own since 2026-10-31, so toolchains under it are found; the secret paths
+    // below it are denied by the profile instead (the-verification-sandbox-opens-to-every-language).
+    expect(parsed.home).toBe(process.env["HOME"]);
     expect(outcome.enforcement.secretsStripped).toBe(true);
   });
 
@@ -1048,12 +1051,16 @@ describe("verification sandbox (PRD §17.4)", () => {
     expect(outcome.enforcement.readConfinement).toBe("none");
   });
 
-  it("#318 returns the kernel network-denial errno for a refused connection", async () => {
+  // #318 asserted the kernel's EPERM for a denied connection. The network is open since 2026-10-31,
+  // so the same probe now reaches a local server, and the result records `allow`, not a denial.
+  it("#318 records an open network: a connection reaches a local server", async () => {
     const repo = makeRepo();
+    const server = createServer((socket) => socket.end());
+    const port = await new Promise<number>((resolvePort) => server.listen(0, "127.0.0.1", () => resolvePort((server.address() as AddressInfo).port)));
     writeFileSync(
       join(repo, "network.js"),
       `const net = require('node:net');
-       const socket = net.connect({ host: '203.0.113.1', port: 443 });
+       const socket = net.connect({ host: '127.0.0.1', port: ${port} });
        const timer = setTimeout(() => {
          socket.destroy();
          console.log(JSON.stringify({ event: 'timeout', errno: null }));
@@ -1068,21 +1075,26 @@ describe("verification sandbox (PRD §17.4)", () => {
          console.log(JSON.stringify({ event: 'error', errno: error.code ?? null }));
        });`,
     );
-    const outcome = await runSandboxed({
-      command: parseVerificationCommand({
-        id: "net",
-        argv: ["node", "network.js"],
-        network: "deny",
-        timeoutSeconds: 30,
-      }),
-      worktreePath: repo,
-    });
+    let outcome;
+    try {
+      outcome = await runSandboxed({
+        command: parseVerificationCommand({
+          id: "net",
+          argv: ["node", "network.js"],
+          network: "deny",
+          timeoutSeconds: 30,
+        }),
+        worktreePath: repo,
+      });
+    } finally {
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
     expect(outcome).toMatchObject({
       status: "PASS",
       reasonCode: null,
-      enforcement: { networkEnforced: true, networkPolicy: "deny" },
+      enforcement: { networkEnforced: false, networkPolicy: "allow" },
     });
-    expect(JSON.parse(outcome.stdout)).toEqual({ event: "error", errno: "EPERM" });
+    expect(JSON.parse(outcome.stdout)).toEqual({ event: "connected", errno: null });
   });
 
   it("does not hand the daemon's own PATH to the candidate", async () => {

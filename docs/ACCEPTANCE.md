@@ -202,20 +202,20 @@ while omitting `channel_id` produced an undefined address that `available()` rep
 usable.
 
 **A verification worktree has no installed dependencies.** A disposable worktree contains
-only committed files and, under `network: "deny"`, cannot fetch anything. A project needs a
-dependency-free command or `TRUSTED_CI` evidence. `network: "allowlist"` is deliberately
-rejected until a proxy/firewall backend can enforce destination policy; a manifest must not
-advertise an allowlist that seatbelt cannot apply. This repository uses the first for local
-verification (`scripts/verify-reason-codes.mjs`) and the third for its typecheck.
+only committed files. Since 2026-10-31 the sandbox's network is open for dependency lookup and
+download and the named toolchain caches under `HOME` are writable, so a command may install what
+it needs; a dependency-free command or `TRUSTED_CI` evidence needs no fetch. `network: "allowlist"`
+is deliberately rejected until a proxy/firewall backend can enforce destination policy; a manifest
+must not advertise an allowlist that seatbelt cannot apply. This repository uses a dependency-free
+command for local verification (`scripts/verify-reason-codes.mjs`) and CI for its typecheck.
 
 **P1-15's execution boundary is confinement, not argv inspection.** Verification commands are
-candidate-supplied code by design. The executable allowlist is defence in depth: it refuses a
-contract that declares `sh`, `env`, `arch` or another non-build executable, but it cannot stop an
-allowlisted interpreter such as `node`, `npm`, `npx` or `vitest` from execing a shell. The seatbelt
-profile and resource wrapper are the boundary. `tests/unit/handoff-p1-boundaries.test.ts` execs
-`/bin/sh` out of an allowlisted `node` and records the actual kernel result for production-layout
-state reads, writes outside the worktree, network, fork under `RLIMIT_NPROC`, `SIGXCPU` and the
-observed RSS breach. `tests/unit/trusted-core.test.ts` carries the same property for the default
+candidate-supplied code by design. Since 2026-10-31 there is no executable allowlist: `sh`, `env`,
+`arch`, `python3` or any other executable may be argv[0], because any declared command can exec a
+shell after it starts. The seatbelt profile and resource wrapper are the boundary.
+`tests/unit/handoff-p1-boundaries.test.ts` execs `/bin/sh` out of `node` and records the actual
+kernel result for production-layout state reads, writes outside the worktree, the open network,
+fork under `RLIMIT_NPROC`, `SIGXCPU` and the observed RSS breach. `tests/unit/trusted-core.test.ts` carries the same property for the default
 wrapper, where the fork limit means the shell is never reached at all. Provider-only reviewer
 egress remains the named macOS residual in [#419](STATUS.md).
 
