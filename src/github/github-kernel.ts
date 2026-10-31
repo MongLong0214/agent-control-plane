@@ -370,6 +370,14 @@ export const declaredPostMergeCheckNames = (stored: unknown, role: string | null
 };
 
 /**
+ * The request digest a post_merge_verify receipt carries: the merge commit and the required set it was verified
+ * against. postMergeVerify forms it, and refuses a replay whose receipt carries another; the run-evidence export
+ * (#1326) recomputes it the same way, so a receipt taken against another required set is no answer there either.
+ */
+export const postMergeVerifyRequestDigest = (mergeCommitSha: string, requiredChecks: readonly string[]): string =>
+  digestOf({ mergeCommitSha, requiredChecks });
+
+/**
  * PRD §24 — the sole writer of programmatic merges and production gates.
  *
  * Two design points carry the invariant. Trust is by provenance: a gate is accepted
@@ -3426,7 +3434,7 @@ export class GitHubKernel {
     }
 
     const idempotencyKey = `post_merge_verify:${repositoryIdentity}:${mergeCommitSha}`;
-    const requestDigest = digestOf({ mergeCommitSha, requiredChecks: effective });
+    const requestDigest = postMergeVerifyRequestDigest(mergeCommitSha, effective);
     const existing = this.receipt(idempotencyKey);
     if (existing) {
       if (existing.request_digest !== requestDigest || existing.verified !== 1) {

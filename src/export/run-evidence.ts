@@ -3,7 +3,7 @@ import { canonicalJson, digestOf, isDigest, sha256 } from "../core/digest.ts";
 import { allow, deny, type Decision } from "../core/errors.ts";
 import { parseGitHubIdentity } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { declaredPostMergeCheckNames, isUnansweredPostMergeCheck } from "../github/github-kernel.ts";
+import { declaredPostMergeCheckNames, isUnansweredPostMergeCheck, postMergeVerifyRequestDigest } from "../github/github-kernel.ts";
 import {
   AuditLog, credentialBearingField, MAX_CREDENTIAL_SCAN_DEPTH, prohibitedDurableField, UNEXAMINABLE_DEPTH,
 } from "../db/audit.ts";
@@ -962,6 +962,10 @@ const mergePostMergeChecks = (
   });
   if (bound.length !== 1) return "UNOBSERVED";
   const receipt = bound[0]!;
+  // #1326 — the receipt must have been taken against this merge SHA and the trusted declared set, the request
+  // postMergeVerify forms (its effective set is the declared set: a caller may only name declared checks).
+  const mergeCommitSha = (receipt["resourceIdentity"] as string).slice(prefix.length);
+  if (receipt["requestDigest"] !== postMergeVerifyRequestDigest(mergeCommitSha, declared)) return "UNOBSERVED";
   const response = inputs.responses.find((entry) => entry.receiptId === receipt["receiptId"]);
   if (!response || response.checks === null) return "UNOBSERVED";
   // The response must be the one the receipt recorded (github-kernel postMergeVerify's after-state digest).

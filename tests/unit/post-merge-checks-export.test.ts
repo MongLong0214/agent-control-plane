@@ -78,6 +78,8 @@ function recordPostMerge(
   identity: string,
   sha: string,
   response: { checks: Check[]; noChecksDeclared?: true },
+  /** The required set the request digest names; by default the checks the response carries. */
+  requested: string[] = response.checks.map((check) => check.name),
 ): void {
   const key = `post_merge_verify:${identity}:${sha}`;
   const at = h.clock.nowIso();
@@ -90,7 +92,7 @@ function recordPostMerge(
     [
       `rcp_${sha256(key).slice(7, 31)}`, key, runId, identity, `acme/fixture@${sha}`,
       response.noChecksDeclared ? digestOf(response) : digestOf(response.checks),
-      digestOf({ mergeCommitSha: sha, requiredChecks: response.checks.map((check) => check.name) }),
+      digestOf({ mergeCommitSha: sha, requiredChecks: requested }),
       JSON.stringify(response), at, at,
     ],
   );
@@ -278,6 +280,29 @@ describe("#1189 (b) post-merge checks told apart in the run-evidence export", ()
       expect(bundle.baseline.quality["postMergeChecks"], JSON.stringify({ now, then })).toBe("UNOBSERVED");
       expect(bundle.baseline.quality["postMergeVerification"]).toBe("PRESENT");
     }
+  });
+
+  it("does not accept a receipt whose request digest names another required set than the trusted one", async () => {
+    // #1326 review: the kernel refuses to replay this receipt (RESOURCE_COLLISION), so it is no answer here.
+    const h = makeHarness();
+    const { runId, identity } = await runWith(h, ["unit"]);
+    recordMerge(h, runId, identity, SHA);
+    recordPostMerge(h, runId, identity, SHA, { checks: [{ name: "unit", conclusion: "success" }] }, ["unit", "e2e"]);
+    const bundle = exported(h, runId);
+    expect(postMergeFact(bundle)).toBe(false);
+    expect(bundle.baseline.quality["postMergeChecks"]).toBe("UNOBSERVED");
+    expect(bundle.baseline.quality["postMergeVerification"]).toBe("PRESENT");
+    expect(reproduceRunEvidenceExport(bundle)).toBe(true);
+    expect(verifyRunEvidenceExport(bundle, h.cp.db)).toBe(true);
+
+    // The same response under a request digest bound to this merge SHA and the trusted set still reads PASSED.
+    const bound = makeHarness();
+    const run = await runWith(bound, ["unit"]);
+    recordMerge(bound, run.runId, run.identity, SHA);
+    recordPostMerge(bound, run.runId, run.identity, SHA, { checks: [{ name: "unit", conclusion: "success" }] }, ["unit"]);
+    const passed = exported(bound, run.runId);
+    expect(postMergeFact(passed)).toBe(true);
+    expect(passed.baseline.quality["postMergeChecks"]).toBe("PASSED");
   });
 
   it("reads a run with no verified merge as UNOBSERVED", async () => {
