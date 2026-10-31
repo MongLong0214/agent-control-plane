@@ -1018,11 +1018,14 @@ export class Doctor {
         const terminal = session.lifecycle === SessionLifecycle.ERROR || session.lifecycle === SessionLifecycle.STOPPED;
         if (!sessionId && terminal && !activeBinding && !unfinishedWork) continue;
         // Match checkBindings' project-availability policy: a settled PRIMARY_CTO with no
-        // unfinished work can be released through the operator door after startup. Keep the
-        // error visible; only the system gate relaxes it, never session/role diagnostics or
-        // another authority (including CEO), an unfinished run, or an open worker receipt.
+        // unfinished work can be released through the operator door after startup, and so can a
+        // settled CEO, whose binding is the door's other role (`DEAD_BINDING_RECOVERY_ROLES`).
+        // Keep the error visible; only the system gate relaxes it, never session/role diagnostics
+        // or any other authority, an unfinished run, or an open worker receipt.
         const recoverableBinding = scope === "system" && terminal && activeBinding && !unfinishedWork &&
-          activeBindings.every((binding) => binding.role === Role.PRIMARY_CTO && binding.project_id !== null);
+          activeBindings.every((binding) =>
+            (binding.role === Role.PRIMARY_CTO && binding.project_id !== null) ||
+            (binding.role === Role.CEO && binding.project_id === null));
         findings.push({
           code: "SESSION_PROCESS_MISSING",
           severity: activeBinding || unfinishedWork ? "ERROR" : "WARN",
