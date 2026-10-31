@@ -1,0 +1,7 @@
+Limit: a lockfile gets its own chunk only when it would otherwise be cut; a small lockfile stays whole in a shared chunk as before, and the full-bytes digest is the candidate blob id from the patch header, not a separate sha256
+Record-Id: r-b373fae67fd3
+Provenance: inherited 82f278b1799a8b1a749fffca2b52039d3790300e
+
+Limit: the 250,000-byte reviewer bound is derived from the Codex model catalogue (500K-token window, 95% usable, minus estimated 128K reasoning/answer and 96K CLI overhead) and not checked against a live model; a provider that silently truncates its input cannot be detected, and nothing shows a model reviewed a whole file, only that it was sent whole within the bound
+Record-Id: r-0cb6d5e0992f
+Provenance: inherited 3594f718a6eacca6655cf50e5f54a43b48195081
