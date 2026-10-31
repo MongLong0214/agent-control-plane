@@ -5,6 +5,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { Daemon } from "../../src/daemon/daemon.ts";
 import { ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { retireProject } from "../../src/registry/project-retirement.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
@@ -16,7 +17,7 @@ import {
   TASK_WORKER_LAUNCH_ENDED,
   TASK_WORKER_LAUNCH_INTENT,
 } from "../../src/run/worker-turn.ts";
-import { cleanupTempDirs, makeRepo } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
 import { bindCeo, fixtureManifest, type Harness, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 
 /**
@@ -389,8 +390,9 @@ const closedRuntimeReceipt = async (
   projectId: string,
   status: "SUCCEEDED" | "FAILED",
   records: (receipt: Receipt) => void,
+  receiptOptions: { runtimeManaged?: boolean; sessionPid?: number } = {},
 ): Promise<Receipt> => {
-  const receipt = await openReceipt(harness, projectId, { runtimeManaged: true });
+  const receipt = await openReceipt(harness, projectId, { runtimeManaged: true, ...receiptOptions });
   records(receipt);
   const finished = harness.cp.tasks.finishExecution(
     receipt.executionId,
@@ -400,7 +402,7 @@ const closedRuntimeReceipt = async (
   expect(finished.allowed, JSON.stringify(finished)).toBe(true);
   expect(harness.cp.runs.cancel(receipt.runId, "the run is withdrawn").allowed).toBe(true);
   await harness.cp.workerRetirement.settled();
-  expect(harness.cp.tasks.execution(receipt.executionId)).toMatchObject({ status, runtimeManaged: true, workerProcessId: null });
+  expect(harness.cp.tasks.execution(receipt.executionId)).toMatchObject({ status, runtimeManaged: receiptOptions.runtimeManaged ?? true, workerProcessId: null });
   return receipt;
 };
 
@@ -508,5 +510,72 @@ describe("a runtime-managed receipt with no pid is not ended by its status", () 
     const retired = await retire(h, receipt.projectId);
 
     expect(retired, JSON.stringify(retired)).toMatchObject({ allowed: true, value: { projectId: receipt.projectId } });
+  });
+});
+
+/**
+ * The worker session's own process dies and the daemon's restart reconciliation marks it ERROR, as
+ * `settleDeadSessions` does; that proves only the session process is gone.
+ */
+const sessionProcessDies = async (harness: Harness, receipt: Receipt, sessionProcess: ChildProcess): Promise<void> => {
+  await kill(sessionProcess);
+  const reconciled = await new Daemon(harness.cp, { stateDir: tempDir("acp-retire-dead-session-") }).reconcile();
+  expect(reconciled.sessionsMarkedError).toContain(receipt.workerSessionId);
+  expect(harness.cp.sessions.get(receipt.workerSessionId)?.lifecycle).toBe(SessionLifecycle.ERROR);
+};
+
+describe("a worker session's own end is not its workers' end", () => {
+  it("(i) refused, then the session process is killed and reconciliation marks the session ERROR: still refused", async () => {
+    const h = makeHarness();
+    const sessionProcess = liveProcess();
+    const receipt = await closedRuntimeReceipt(h, "rm-error-session", "FAILED", (r) => {
+      launch(h, r, TASK_WORKER_LAUNCH_INTENT);
+      unidentifiedOrphan(h, r);
+    }, { sessionPid: sessionProcess.pid! });
+    const before = receiptRow(h, receipt.executionId);
+    expectHeld(h, receipt.projectId, await retire(h, receipt.projectId));
+
+    await sessionProcessDies(h, receipt, sessionProcess);
+
+    expectHeld(h, receipt.projectId, await retire(h, receipt.projectId));
+    expect(receiptRow(h, receipt.executionId)).toEqual(before);
+  });
+
+  it("(j) a STOPPED session with an unended launch intent: refused", async () => {
+    const h = makeHarness();
+    const receipt = await unadmittedRuntimeReceipt(h, "rm-stopped-session", (r) => launch(h, r, TASK_WORKER_LAUNCH_INTENT));
+    expect(h.cp.sessions.transition(receipt.workerSessionId, SessionLifecycle.STOPPED, "the session was stopped").allowed).toBe(true);
+    const before = receiptRow(h, receipt.executionId);
+
+    expectHeld(h, receipt.projectId, await retire(h, receipt.projectId));
+    expect(receiptRow(h, receipt.executionId)).toEqual(before);
+    expect(h.cp.sessions.get(receipt.workerSessionId)?.lifecycle).toBe(SessionLifecycle.STOPPED);
+  });
+
+  for (const status of ["SUCCEEDED", "FAILED"] as const) {
+    it(`(k) a CTO-opened (runtime_managed = 0) ${status} receipt with an unresolved unidentified orphan: refused`, async () => {
+      const h = makeHarness();
+      const receipt = await closedRuntimeReceipt(h, `cto-${status.toLowerCase()}-orphan`, status, (r) => unidentifiedOrphan(h, r), { runtimeManaged: false });
+      const before = receiptRow(h, receipt.executionId);
+
+      expectHeld(h, receipt.projectId, await retire(h, receipt.projectId));
+      expect(receiptRow(h, receipt.executionId)).toEqual(before);
+    });
+  }
+
+  it("(l) positive control: an ERROR session whose receipts all have their recorded ends and no orphan: retirement proceeds", async () => {
+    const h = makeHarness();
+    const sessionProcess = liveProcess();
+    const receipt = await closedRuntimeReceipt(h, "rm-error-session-ended", "SUCCEEDED", (r) => {
+      launch(h, r, TASK_WORKER_LAUNCH_INTENT);
+      launch(h, r, TASK_WORKER_LAUNCH_ENDED);
+    }, { sessionPid: sessionProcess.pid! });
+    await sessionProcessDies(h, receipt, sessionProcess);
+    const before = receiptRow(h, receipt.executionId);
+
+    const retired = await retire(h, receipt.projectId);
+
+    expect(retired, JSON.stringify(retired)).toMatchObject({ allowed: true, reasonCode: ReasonCode.OK, value: { projectId: receipt.projectId } });
+    expect(receiptRow(h, receipt.executionId)).toEqual(before);
   });
 });

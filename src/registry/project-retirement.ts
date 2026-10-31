@@ -122,8 +122,12 @@ async function retire(cp:ControlPlane,projectId:string,suspended:boolean,reason:
     cancelledRuns.push(run.run_id);
   }
   const workers = await cp.workerRetirement.reconcile();
-  const projectWorkers = new Set(cp.db.all<{worker_session_id:string}>(`SELECT DISTINCT e.worker_session_id FROM task_executions e JOIN runs r ON r.run_id = e.run_id WHERE r.project_id = ? OR r.run_id IN (SELECT run_id FROM bootstrap_applications WHERE project_id = ?)`,[projectId,projectId]).map(r => r.worker_session_id));
-  if (workers.remaining.some(w => projectWorkers.has(w.sessionId)) || workers.stopFailed.some(id => projectWorkers.has(id)) || cp.db.get(`SELECT 1 FROM assignments a JOIN tasks t ON t.task_id = a.task_id JOIN runs r ON r.run_id = t.run_id WHERE a.role = 'WORKER' AND a.status = 'ACTIVE' AND r.project_id = ?`,[projectId])) {
+  const receipts = cp.db.all<{execution_id:string;worker_session_id:string}>(`SELECT e.execution_id,e.worker_session_id FROM task_executions e JOIN runs r ON r.run_id = e.run_id WHERE r.project_id = ? OR r.run_id IN (SELECT run_id FROM bootstrap_applications WHERE project_id = ?)`,[projectId,projectId]);
+  const projectWorkers = new Set(receipts.map(r => r.worker_session_id));
+  const projectReceipts = new Set(receipts.map(r => r.execution_id));
+  // A session's own end (ERROR, STOPPED) is not its workers' end: every receipt of the project is read by the same evidence rule, whatever its session's lifecycle.
+  const unended = [...projectWorkers].some(id => cp.workerRetirement.unendedTurns(id).some(t => t.executionId !== null && projectReceipts.has(t.executionId)));
+  if (workers.remaining.some(w => projectWorkers.has(w.sessionId)) || workers.stopFailed.some(id => projectWorkers.has(id)) || unended || cp.db.get(`SELECT 1 FROM assignments a JOIN tasks t ON t.task_id = a.task_id JOIN runs r ON r.run_id = t.run_id WHERE a.role = 'WORKER' AND a.status = 'ACTIVE' AND r.project_id = ?`,[projectId])) {
     unmark();
     return deny(ReasonCode.CONFLICT,'retirement waits for worker processes to settle; it stopped before the host step',{projectId,cancelledRuns,requiredOrder:["let the project's worker processes stop",rerun]});
   }

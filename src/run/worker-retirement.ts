@@ -170,6 +170,16 @@ export class WorkerRetirement {
     return pass;
   }
 
+  /**
+   * The receipts of `sessionId` that the evidence rule (`#remainingTurns`) does not show ended, whatever
+   * the session's lifecycle. A session that is ERROR or STOPPED shows only that its own process ended,
+   * never that its workers or their children did; project retirement asks this for every session its
+   * receipts name. Read only: nothing is recorded, stopped or signalled.
+   */
+  unendedTurns(sessionId: string): RemainingWorkerProcess[] {
+    return this.#remainingTurns(sessionId);
+  }
+
   /** Resolves once every settle queued so far has finished. */
   settled(): Promise<void> {
     return this.#tail;
@@ -387,6 +397,8 @@ export class WorkerRetirement {
    * receipt's, not the process's: ABANDONED is written by a cancel or a restart without anything
    * having seen the worker exit, and TIMEOUT says it did not finish. So:
    *
+   * - a receipt with an unresolved unidentified orphan (`unresolvedUnidentifiedOrphans`, which counts
+   *   only the operator's verified release as its end) has not ended, whatever else it records;
    * - a RUNNING receipt is open;
    * - a recorded pid ends only when the runner recorded it released, or by the rule the runner
    *   applies before it does — no member of the group it led remains, and the pid is gone or now
@@ -420,7 +432,9 @@ export class WorkerRetirement {
     for (const row of rows) {
       const pid = row.worker_process_id;
       let process: "GONE" | RemainingStatus;
-      if (pid !== null) {
+      if (unresolvedUnidentifiedOrphans(this.db, { executionId: row.execution_id }).length > 0) {
+        process = "PROCESS_UNVERIFIED";
+      } else if (pid !== null) {
         process = row.worker_process_released_at !== null ? "GONE" : this.#turnProcess(pid, row.worker_process_started_at);
       } else if (row.runtime_managed === 1) {
         process = this.#ranNothing(row) ? "GONE" : "PROCESS_UNVERIFIED";
@@ -443,13 +457,11 @@ export class WorkerRetirement {
    * admitted no provider launch for it (`launchWasAuthorised`, the runner's own reader), its launch
    * intent, if one was written, has its end (`TASK_WORKER_LAUNCH_ENDED`), and every git child its task
    * started in its run has its end (`TASK_WORKER_GIT_GROUP_ENDED`, by nonce and pgid for a group, by
-   * nonce for an intent with no group), as the runner reads them, and no unidentified orphan of it is
-   * unresolved (`unresolvedUnidentifiedOrphans`, which counts the operator's verified release as its
-   * end). A missing pid alone, or a terminal status, is never an end.
+   * nonce for an intent with no group), as the runner reads them. Its unidentified orphans are read
+   * before this, for every receipt. A missing pid alone, or a terminal status, is never an end.
    */
   #ranNothing(row: { execution_id: string; run_id: string; task_id: string }): boolean {
     if (launchWasAuthorised(this.db, row.execution_id)) return false;
-    if (unresolvedUnidentifiedOrphans(this.db, { executionId: row.execution_id }).length > 0) return false;
     const unended = this.db.get<{ n: number }>(
       `SELECT 1 AS n FROM audit_events i
         WHERE i.run_id = ? AND i.kind = ? AND json_extract(i.evidence_json, '$.executionId') = ?
