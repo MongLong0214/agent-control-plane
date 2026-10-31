@@ -29,8 +29,9 @@ export interface SandboxRequest {
   /** Extra environment values, filtered through the command's own allowlist. */
   env?: Record<string, string>;
   /**
-   * Additional absolute paths the candidate must not read — the control plane's own
-   * secret store and state directory, and any other checkout on this machine.
+   * Additional absolute paths the candidate must not read, write or reach by a unix socket — the
+   * control plane's own secret store and state directory, and any other checkout on this machine.
+   * They join `SANDBOX_SECRET_PATHS`.
    */
   denyReadPaths?: readonly string[];
   /**
@@ -40,12 +41,6 @@ export interface SandboxRequest {
    * other than exactly `"supervised-budget"`, including omitting it, is `"no-spawn"`.
    */
   processLimit?: ProcessLimitMode;
-  /**
-   * #1253 — the executables the manifest pinned for this run adds to the allowlist
-   * (`verificationExecutables`). Trusted control-plane code takes it from that manifest; only names
-   * in PROJECT_VERIFICATION_EXECUTABLES count. Absent means the allowlist alone.
-   */
-  executables?: readonly string[];
   /**
    * Aborting stops the command as its timeout does: the candidate's tree is signalled, then killed.
    * Its submission no longer holds the run, so nothing waits on the outcome.
@@ -96,15 +91,24 @@ export interface SandboxOutcome {
 export interface SandboxEnforcement {
   worktreeIsolated: true;
   secretsStripped: true;
+  /**
+   * The network policy in force. A launched command records `SANDBOX_NETWORK_POLICY` (`allow`):
+   * outbound network and local IPC are open whatever its contract's `network` says. A refused one,
+   * which never ran, records what its contract declared.
+   */
   networkPolicy: VerificationCommand["network"];
+  /** Whether a network denial was in force. Never true since the network was opened. */
   networkEnforced: boolean;
+  /**
+   * Writes are refused outside the worktree, TMPDIR and the toolchain caches `SANDBOX_CACHE_HOME_PATHS`
+   * names under HOME, and inside every secret path.
+   */
   writeConfinement: boolean;
   /**
-   * How reads are restricted. `sensitive-paths` is a deny list, not a whitelist: a
-   * whitelist cannot be expressed for a Node toolchain, because dyld needs a set of
-   * paths that is not enumerable in advance — denying reads wholesale aborts the
-   * interpreter before it starts. So the credential stores are named and denied, and this
-   * field says exactly that rather than claiming full read isolation.
+   * How reads are restricted. `sensitive-paths` is a deny list, not a whitelist: reads are
+   * open across the filesystem, toolchains under HOME included, and only the secret paths
+   * (`SANDBOX_SECRET_PATHS` and the caller's `denyReadPaths`) are denied. This field says
+   * exactly that rather than claiming read isolation.
    */
   readConfinement: "sensitive-paths" | "none";
   processGroupKill: true;
@@ -659,7 +663,7 @@ export const memoryLimitForPlatform = (
  * Resolving outside also fixes which `git` runs. Inside, the sandbox PATH lists the worktree before
  * `/usr/bin`, so a candidate that commits an executable named `git` at its root was run in place of
  * git -- measured: `git status --porcelain` printed the candidate's output and exited 0 -- while the
- * allowlist outside had approved `/usr/bin/git`. Every other declared executable had the same
+ * resolution outside had approved `/usr/bin/git`. Every other declared executable had the same
  * exposure until `verificationLaunchArgv` (#1102) launched each one by its approved absolute path.
  */
 const XCRUN_STUBS: ReadonlySet<string> = new Set(["/usr/bin/git"]);
@@ -706,7 +710,7 @@ const executableFileAt = (path: string): boolean => {
  */
 export const sandboxLaunchArgv = async (
   argv: readonly string[],
-  context: { cwd: string; additionalRoots: readonly string[]; executables?: readonly string[] },
+  context: { cwd: string; additionalRoots: readonly string[] },
 ): Promise<Decision<readonly string[]>> => {
   const resolved = resolveVerificationExecutable(argv[0] ?? "", context).resolvedPath;
   if (resolved === null || !XCRUN_STUBS.has(resolved)) return allow(ReasonCode.OK, argv);
@@ -740,7 +744,7 @@ export const sandboxLaunchArgv = async (
 /**
  * The absolute path argv[0] names, with its symlinks left in place: a path as declared (a relative
  * one against the command's cwd), or a bare name looked up in the daemon-built search path in the
- * resolver's order. It is the alias the allowlist approved. The sandbox's PATH is never consulted,
+ * resolver's order. It is the alias the resolution approved. The sandbox's PATH is never consulted,
  * and a relative entry on the daemon's PATH is made absolute here, against the daemon's cwd where
  * the resolver found it -- left relative, the sandbox would resolve it against the worktree.
  */
@@ -766,22 +770,23 @@ const realPathOf = (path: string): string | null => {
 };
 
 /**
- * The argv the sandbox execs (#1102): argv[0] is an absolute path the executable allowlist approved
- * outside the sandbox, never a name for the sandbox's PATH to look up. That PATH lists the worktree
- * ahead of `/usr/local/bin` and `/usr/bin`, and the daemon's PATH, where the allowlist also finds
- * tools, is not on it at all -- so a candidate that committed an executable named after a declared
- * command at its root ran in place of the approved tool. Measured: a declared `pnpm`, approved from
- * a directory on the daemon's PATH, printed the candidate's output and passed.
+ * The argv the sandbox execs (#1102): argv[0] is an absolute path resolved outside the sandbox
+ * (`resolveVerificationExecutable`; any executable file, there is no allowlist), never a name for the
+ * sandbox's PATH to look up. That PATH lists the worktree ahead of `/usr/local/bin` and `/usr/bin`,
+ * and the daemon's PATH, where the resolution also finds tools, is not on it at all -- so a candidate
+ * that committed an executable named after a declared command at its root ran in place of the
+ * resolved tool. Measured: a declared `pnpm`, resolved from a directory on the daemon's PATH, printed
+ * the candidate's output and passed.
  *
  * The approved path itself runs, not its realpath: a tool that dispatches on argv[0] (a multiplexer
  * behind a `pnpm` symlink) must see the name it was declared by. Measured: launching the realpath ran
  * the multiplexer's help, which exited 0 where the declared `pnpm test` exited 17. At launch the
- * path must still lead to the tool the allowlist approved, or the command is refused. An xcrun stub
+ * path must still lead to the tool the resolution approved, or the command is refused. An xcrun stub
  * is then replaced by the tool it stands for, as `sandboxLaunchArgv` says.
  */
 export const verificationLaunchArgv = async (
   argv: readonly string[],
-  context: { cwd: string; additionalRoots: readonly string[]; executables?: readonly string[] },
+  context: { cwd: string; additionalRoots: readonly string[] },
 ): Promise<Decision<readonly string[]>> => {
   const resolution = resolveVerificationExecutable(argv[0] ?? "", context);
   if (!resolution.allowed || resolution.resolvedPath === null) {
@@ -794,7 +799,7 @@ export const verificationLaunchArgv = async (
   if (launchPath === null || target !== resolution.resolvedPath || !executableFileAt(launchPath)) {
     return deny(
       ReasonCode.INVALID_ARGUMENT,
-      `verification executable '${resolution.name}' no longer leads to the tool the allowlist approved`,
+      `verification executable '${resolution.name}' no longer leads to the tool its resolution approved`,
       { approved: resolution.resolvedPath, launchPath, target },
     );
   }
@@ -881,11 +886,14 @@ const seatbeltAvailable = (): boolean => existsSync("/usr/bin/sandbox-exec");
 /**
  * Runs one verification command under the isolation PRD §17.4 requires.
  *
- * On macOS the confinement is enforced by seatbelt (`sandbox-exec`): network is
- * denied at the syscall layer and writes are confined to the disposable worktree plus
- * the scratch root. The executable allowlist above remains defence in depth; an
- * allowlisted interpreter may still exec a shell, so these seatbelt and resource controls
- * are the boundary. Where that mechanism is unavailable the run fails closed with
+ * The sandbox is open to every language (owner directive 2026-10-31): argv[0] may be any
+ * executable, reads are open across the filesystem, outbound network and local IPC are open for
+ * the run (to look up and download dependencies; nothing here is a publish or deploy right), and
+ * writes reach the disposable worktree, TMPDIR (the scratch root) and the named toolchain caches.
+ * What stays bound is what runs and where: only the commands the run's pinned manifest declares,
+ * each launched by the absolute path resolved outside (`verificationLaunchArgv`), against its own
+ * frozen worktree. The one confinement kept is the secret guard in `seatbeltProfile`, enforced by
+ * seatbelt (`sandbox-exec`). Where that mechanism is unavailable the run fails closed with
  * SANDBOX_NETWORK_DENIED instead of quietly executing unconfined — CP-HI-08 forbids
  * reporting a weaker execution as a pass.
  */
@@ -897,13 +905,11 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
 
   const mechanism: SandboxEnforcement["mechanism"] = seatbeltAvailable() ? "seatbelt" : "none";
 
-  // The public schema rejects this earlier, but keep the process-launch boundary defensive
-  // for legacy callers that hand the sandbox a structurally typed object. The same shared
-  // predicate is used by the contract parser, so no wrapper option grammar is duplicated here.
+  // argv[0] must lead to an executable file, resolved in this command's worktree; the launch below
+  // binds to the file this resolves. The same shared predicate is used by the contract parser.
   const executableContext = {
     cwd: resolve(worktreePath, command.cwd),
     additionalRoots: [worktreePath],
-    executables: request.executables ?? [],
   };
   if (isVerificationCommandRefused(command.argv, executableContext)) {
     rmSync(scratch, { recursive: true, force: true });
@@ -920,6 +926,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   // Integration §12 allows `allowlist`, but seatbelt cannot express per-host network
   // policy. Claiming to honour a host allowlist while permitting all traffic would be a
   // silent downgrade, so it is refused until a mechanism that can enforce it exists.
+  // (`deny` and `allow` both run with the network open; the result records `allow`.)
   if (command.network === "allowlist") {
     rmSync(scratch, { recursive: true, force: true });
     return unconfined(
@@ -931,8 +938,8 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     );
   }
 
-  // Confinement is required for every command, not only when the network must be denied:
-  // an unconfined command can also write anywhere and read any file this user can.
+  // Confinement is required for every command: an unconfined command could read and write
+  // every secret path, and write anywhere this user can.
   if (mechanism === "none") {
     rmSync(scratch, { recursive: true, force: true });
     return unconfined(
@@ -996,7 +1003,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   const file = "/usr/bin/sandbox-exec";
   const argv = [
     "-p",
-    seatbeltProfile(command, targets.worktree, realpathSync(scratch), request.denyReadPaths ?? []),
+    seatbeltProfile(targets.worktree, realpathSync(scratch), request.denyReadPaths ?? []),
     RESOURCE_WRAPPER,
     ...resourceArgs,
   ];
@@ -1419,8 +1426,8 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     enforcement: {
       worktreeIsolated: true,
       secretsStripped: true,
-      networkPolicy: command.network,
-      networkEnforced: mechanism === "seatbelt" && command.network === "deny",
+      networkPolicy: SANDBOX_NETWORK_POLICY,
+      networkEnforced: false,
       writeConfinement: mechanism === "seatbelt",
       readConfinement: mechanism === "seatbelt" ? "sensitive-paths" : "none",
       processGroupKill: true,
@@ -1468,9 +1475,16 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
 };
 
 /**
- * The environment is constructed, never inherited. HOME and TMPDIR point into the
- * scratch root so a candidate cannot read ~/.gitconfig, ~/.npmrc, ~/.claude or any
- * other credential store through a tool's normal lookup path.
+ * The environment is constructed, never inherited: the names below, plus the few `SAFE_COMMAND_ENV`
+ * names a contract admits, each value checked. No token-bearing variable of the daemon's (`GH_TOKEN`,
+ * `ANTHROPIC_API_KEY`, `AWS_*`, ACP's own credentials, `BUZZ_PRIVATE_KEY`…) and no agent pointer
+ * (`SSH_AUTH_SOCK`, `GPG_AGENT_INFO`, `DOCKER_HOST`) reaches a candidate, whatever its contract names.
+ *
+ * HOME is the daemon's own home, so a toolchain finds what it installed there (`~/.cargo`, `~/.rustup`,
+ * `~/.pyenv`, user site-packages) and uses the caches the profile lets it write. The secret paths under
+ * it are denied by the profile, not hidden, so the two tools that would read one on every run are
+ * pointed away: git reads no global config, credential helper, ignore or attributes file (a CLEAN_TREE
+ * check sees what it saw when HOME was the scratch), and npm reads no `~/.npmrc`. TMPDIR is the scratch.
  */
 export const buildSandboxEnvironment = (
   command: VerificationCommand,
@@ -1481,10 +1495,9 @@ export const buildSandboxEnvironment = (
   const env: NodeJS.ProcessEnv = {
     // The fixed system list plus this runtime and, when there is one, the worktree — not
     // `verificationExecutableSearchPath`'s default, which starts from the daemon's own
-    // `process.env.PATH`. Resolution may consult the daemon's PATH to decide whether a
-    // declared executable is allowlisted; the child must not *inherit* it, or a
-    // user-writable directory on the daemon's PATH becomes a directory the candidate can
-    // resolve binaries out of. This lane widened it while claiming tighter confinement.
+    // `process.env.PATH`. Resolution may consult the daemon's PATH to find a declared
+    // executable; the child must not *inherit* it, or a user-writable directory on the
+    // daemon's PATH becomes a directory the candidate can resolve binaries out of.
     // It never selects the declared executable: that is exec'd by absolute path
     // (`verificationLaunchArgv`, #1102). It serves only what the command itself looks up.
     PATH: [
@@ -1496,14 +1509,20 @@ export const buildSandboxEnvironment = (
       "/usr/sbin",
       "/sbin",
     ].join(delimiter),
-    HOME: scratch,
+    HOME: homedir(),
     TMPDIR: scratch,
     LANG: "C.UTF-8",
     LC_ALL: "C",
     CI: "true",
-    npm_config_cache: join(scratch, "npm-cache"),
     npm_config_update_notifier: "false",
+    npm_config_userconfig: "/dev/null",
     GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_COUNT: "2",
+    GIT_CONFIG_KEY_0: "core.excludesFile",
+    GIT_CONFIG_VALUE_0: "/dev/null",
+    GIT_CONFIG_KEY_1: "core.attributesFile",
+    GIT_CONFIG_VALUE_1: "/dev/null",
     GIT_TERMINAL_PROMPT: "0",
   };
 
@@ -1523,69 +1542,134 @@ export const buildSandboxEnvironment = (
 const looksLikeCredential = (value: string): boolean => hasCredentialShape(value);
 
 /**
- * Named locations a candidate command must never read. Seatbelt retains allow-default
- * reads for dyld and the Node toolchain, so these absolute denies—not HOME redirection
- * alone—protect provider, GitHub, Buzz and Telegram authority stores.
+ * What a launched command's network is: outbound and local IPC open, for looking up and downloading
+ * dependencies during verification. It is not a publish or deploy right — no credential reaches the
+ * command to publish with — and the result records it rather than a denial.
+ */
+export const SANDBOX_NETWORK_POLICY = "allow" as const;
+
+/**
+ * The one guard the open sandbox keeps (owner directive 2026-10-31): a command can neither read nor
+ * write these paths, nor connect to a unix socket below them. `~/` is the daemon's HOME. Best-effort,
+ * not leak-proof: it covers these locations, the caller's `denyReadPaths`, the launchd SSH agent and
+ * the keychain services (`seatbeltProfile`). A credential kept anywhere else is as readable as any
+ * other file, and a process the command asks launchd or LaunchServices to start runs outside it.
+ */
+export const SANDBOX_SECRET_PATHS: readonly string[] = [
+  // Login and signing keys, the keychain, and the agents that serve them.
+  "~/.ssh", "~/.gnupg", "~/Library/Keychains", "~/Library/Group Containers/2BUA8C4S2C.com.1password",
+  // GitHub, cloud and package-registry credentials.
+  "~/.config/gh", "~/Library/Application Support/GitHub CLI", "~/.gitconfig", "~/.git-credentials",
+  "~/.config/git/credentials", "~/.netrc", "~/.aws", "~/.config/gcloud", "~/.azure", "~/.kube",
+  "~/.docker/config.json", "~/.npmrc", "~/.pypirc", "~/.pip", "~/.config/pip", "~/Library/Application Support/pip",
+  "~/.gem/credentials", "~/.cargo/credentials", "~/.cargo/credentials.toml", "~/.m2/settings.xml",
+  "~/.m2/settings-security.xml", "~/.gradle/gradle.properties",
+  // ACP's state, keys and runtime, and the agents' identities, keys and transcripts.
+  "~/.agent-control-plane", "~/.hermes", "~/.claude", "~/.claude.json", "~/.codex", "~/.buzz", "~/.config/buzz",
+  "~/Library/Application Support/Code",
+  // Container engines: a socket here is root on the engine's VM (OrbStack keeps an SSH key here too).
+  "~/.docker/run", "~/.orbstack", "~/.colima", "~/.rd", "/var/run/docker.sock",
+];
+
+/**
+ * The toolchain caches a command may write besides its worktree and TMPDIR, under HOME. Caches only:
+ * never a toolchain's bin directory, an installed toolchain or its configuration (`~/.cargo/bin`,
+ * `~/.rustup`, `~/go/bin`, `~/.gradle/init.d`), where a write would run later outside the sandbox.
+ * A missing parent may be created as a directory. A shared cache can still be poisoned for a later
+ * build that trusts it; that is accepted with the cache. A tool whose cache is not here gets EPERM
+ * writing it: add the cache, not its root.
+ */
+export const SANDBOX_CACHE_HOME_PATHS: readonly string[] = [
+  ".npm", "Library/pnpm/store", "Library/Caches/pnpm", "Library/Caches/Yarn",
+  "Library/Caches/pip", ".cache/uv",
+  ".cargo/registry", ".cargo/git", ".cargo/.package-cache", ".cargo/.package-cache-mutate", ".cargo/.global-cache",
+  "go/pkg/mod", "Library/Caches/go-build",
+  ".gradle/caches", ".gradle/wrapper/dists", ".m2/repository",
+  "Library/Caches/org.swift.swiftpm",
+];
+
+/**
+ * The launchd listener a macOS SSH agent serves (`SSH_AUTH_SOCK`). The environment never carries the
+ * pointer, but `launchctl getenv` and a directory listing can still name it, so it is denied by path.
+ */
+const LAUNCHD_AGENT_LISTENERS = '#"^/private/tmp/com[.]apple[.]launchd[.][^/]+/"';
+
+/** The keychain services, a second lock beside `~/Library/Keychains` (`security`, git's osxkeychain, gh's keyring). */
+const KEYCHAIN_SERVICES = ["com.apple.SecurityServer", "com.apple.securityd.xpc", "com.apple.secd"] as const;
+
+/**
+ * Every secret path as an absolute path seatbelt can match: `SANDBOX_SECRET_PATHS` under each home
+ * the daemon names (`homedir()` and HOME), then the caller's own.
  */
 export const sensitiveReadPaths = (extra: readonly string[]): string[] => {
-  // A candidate can call os.userInfo().homedir(), which reads the passwd entry rather
-  // than HOME. Cover that account home as well as an explicitly configured daemon HOME.
   const homes = [...new Set([homedir(), process.env["HOME"]].filter((home): home is string => Boolean(home)))];
-  const homePaths = homes.flatMap((home) => [
-    `${home}/.ssh`,
-    `${home}/.aws`,
-    `${home}/.gnupg`,
-    `${home}/.config/gh`,
-    `${home}/.config/git/credentials`,
-    `${home}/.config/gcloud`,
-    `${home}/.claude`,
-    `${home}/.codex`,
-    `${home}/.buzz`,
-    `${home}/.agent-control-plane`,
-    `${home}/.npmrc`,
-    `${home}/.netrc`,
-    `${home}/.gitconfig`,
-    `${home}/.git-credentials`,
-    `${home}/.docker/config.json`,
-    `${home}/Library/Keychains`,
-    `${home}/Library/Application Support/Code`,
-    `${home}/Library/Application Support/GitHub CLI`,
-  ]);
+  const named = SANDBOX_SECRET_PATHS.flatMap((entry) =>
+    entry.startsWith("~/") ? homes.map((home) => join(home, entry.slice(2))) : [entry]);
   // seatbelt matches resolved paths, so an unresolved symlinked path (a temp dir under
   // /var/folders, say) would silently match nothing and the deny would be a no-op.
-  return [...homePaths, ...extra].filter(Boolean).map(resolveIfPossible);
+  return [...new Set([...named, ...extra].filter(Boolean).map(resolveIfPossible))];
 };
 
+/** The caches as absolute paths under the daemon's HOME, and the directories above them that may be created. */
+const sandboxCachePaths = (): { caches: string[]; parents: string[] } => {
+  const home = resolveIfPossible(homedir());
+  const caches = SANDBOX_CACHE_HOME_PATHS.map((entry) => resolveIfPossible(join(home, entry)));
+  const parents = new Set<string>();
+  for (const entry of SANDBOX_CACHE_HOME_PATHS) {
+    const segments = entry.split("/");
+    for (let depth = 1; depth < segments.length; depth += 1) {
+      parents.add(resolveIfPossible(join(home, ...segments.slice(0, depth))));
+    }
+  }
+  return { caches, parents: [...parents] };
+};
+
+/**
+ * The path seatbelt sees: its deepest existing ancestor resolved, the rest appended, so a path that
+ * does not exist yet below a symlinked directory still matches once it is created.
+ */
 const resolveIfPossible = (path: string): string => {
+  let existing = path;
+  const missing: string[] = [];
+  while (!existsSync(existing)) {
+    const parent = dirname(existing);
+    if (parent === existing) return path;
+    missing.unshift(basename(existing));
+    existing = parent;
+  }
   try {
-    return existsSync(path) ? realpathSync(path) : path;
+    return join(realpathSync(existing), ...missing);
   } catch {
     return path;
   }
 };
 
 /**
- * Seatbelt profile.
- *
- * Seatbelt remains allow-default so dyld and the Node toolchain can start. The named
- * sensitive paths above are explicitly denied; §33.3 requires the candidate not to reach
- * provider, GitHub, Buzz or Telegram secrets, and redirecting HOME only defeats *lookup by
- * convention* — an absolute path to the owner's credential store would still have worked.
+ * Seatbelt profile. Allow-default, so any toolchain starts and reads what it needs, and the network
+ * is open. Then the guard (§33.3 — no provider, GitHub, Buzz or Telegram authority reaches a
+ * candidate), best-effort as `SANDBOX_SECRET_PATHS` says:
+ * - reads of every secret path are denied; the worktree, the scratch and the pinned runtime are
+ *   carved back out, since production lays them under the denied state root;
+ * - writes are denied except to the worktree, the scratch, `/dev` and the named caches, and denied
+ *   again inside every secret path, the worktree and scratch carved out the same way;
+ * - no unix-socket connection below a secret path or to the launchd SSH agent listener, the worktree
+ *   and scratch carved out so a command's own IPC works;
+ * - no lookup of the keychain services.
+ * SBPL takes the last matching rule, which is what the ordering below relies on.
  */
 const seatbeltProfile = (
-  command: VerificationCommand,
   worktreePath: string,
   scratch: string,
   denyReadPaths: readonly string[],
 ): string => {
   const lines = ["(version 1)", "(allow default)"];
   const runtimeExecutable = realpathSync(process.execPath);
-  if (command.network === "deny") lines.push("(deny network*)");
   // A deny path below an allowed root would stop the command from reading its own inputs,
   // so that narrow case is omitted. An encompassing deny remains in force; the explicit
-  // read allows below carve out only the current worktree and scratch subtree.
-  for (const path of sensitiveReadPaths(denyReadPaths)) {
-    if (isWithin(worktreePath, path) || isWithin(scratch, path)) continue;
+  // allows below carve out only the current worktree and scratch subtree.
+  const secrets = sensitiveReadPaths(denyReadPaths)
+    .filter((path) => !isWithin(worktreePath, path) && !isWithin(scratch, path));
+  for (const path of secrets) {
     lines.push(`(deny file-read* (subpath ${quote(path)}))`);
     // Node resolves a module by lstat-ing each ancestor before it opens the file. Keep
     // directory metadata traversal possible for an encompassing deny. Data reads are
@@ -1598,6 +1682,7 @@ const seatbeltProfile = (
     }
   }
 
+  const { caches, parents } = sandboxCachePaths();
   lines.push(
     // A pinned Node can live inside the denied ACP state root. CoreFoundation must
     // inspect its executable path when npm sets process.title; denying the metadata
@@ -1607,10 +1692,18 @@ const seatbeltProfile = (
     `(allow file-read* (subpath ${quote(worktreePath)}))`,
     `(allow file-read* (subpath ${quote(scratch)}))`,
     "(deny file-write*)",
+    ...caches.map((cache) => `(allow file-write* (subpath ${quote(cache)}))`),
+    ...parents.map((parent) => `(allow file-write-create (require-all (literal ${quote(parent)}) (vnode-type DIRECTORY)))`),
+    ...secrets.map((path) => `(deny file-write* (subpath ${quote(path)}))`),
     `(allow file-write* (subpath ${quote(worktreePath)}))`,
     `(allow file-write* (subpath ${quote(scratch)}))`,
     "(allow file-write* (subpath \"/dev\"))",
     "(allow file-write-data (literal \"/dev/null\"))",
+    ...secrets.map((path) => `(deny network-outbound (remote unix-socket (subpath ${quote(path)})))`),
+    `(deny network-outbound (remote unix-socket (path-regex ${LAUNCHD_AGENT_LISTENERS})))`,
+    `(allow network-outbound (remote unix-socket (subpath ${quote(worktreePath)})))`,
+    `(allow network-outbound (remote unix-socket (subpath ${quote(scratch)})))`,
+    `(deny mach-lookup ${KEYCHAIN_SERVICES.map((name) => `(global-name ${quote(name)})`).join(" ")})`,
   );
   return lines.join("\n");
 };
@@ -1884,9 +1977,9 @@ const resolveCommandTargets = (
     }
 
     for (const [index, arg] of command.argv.entries()) {
-      // argv[0] has already been resolved against the executable allowlist and its
-      // permitted roots. It is allowed to be an absolute toolchain path; all other
-      // explicit paths remain confined to the disposable worktree.
+      // argv[0] has already been resolved to the executable the launch binds to. It is
+      // allowed to be an absolute toolchain path; all other explicit paths remain confined
+      // to the disposable worktree.
       if (index === 0) continue;
       const explicitPath = isAbsolute(arg) || arg.startsWith("./") || arg.startsWith("../");
       const localTarget = !arg.startsWith("-") && existsSync(resolve(cwd, arg));
