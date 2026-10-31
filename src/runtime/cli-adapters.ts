@@ -2630,16 +2630,13 @@ export class ClaudeCliAdapter implements ProviderAdapter {
    * only: the session credential reaches it over the daemon's take-once launch channel, never
    * through argv, the environment or a file.
    */
-  async runSessionTurn(request: SessionTurnRequest): Promise<SessionTurnResult> {
+  async runSessionTurn(request: SessionTurnSpawnRequest): Promise<SessionTurnResult> {
     const started = Date.now();
-    const refused = (error: string): SessionTurnResult => ({
-      ok: false,
-      text: "",
-      exitCode: null,
-      error,
-      providerSessionId: null,
-      durationMs: Date.now() - started,
-    });
+    const refused = (error: string): SessionTurnResult => {
+      // Refused before anything was spawned: there is no process group to outlive the turn.
+      request.onProcessGroupEnded?.();
+      return { ok: false, text: "", exitCode: null, error, providerSessionId: null, durationMs: Date.now() - started };
+    };
     const { handle } = request;
     if (handle.provider !== this.provider) return refused("SESSION_TURN_PROVIDER_MISMATCH");
     if (!handle.workdir) return refused("SESSION_TURN_WORKDIR_MISSING: a provisioned session runs in its fixed workdir");
@@ -2690,6 +2687,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     }
     args.push(conversationFlag(request.conversation), handle.externalSessionId);
 
+    let spawned = false;
     const result = await runCli(this.#binary, args, {
       cwd: workdir,
       timeoutMs: request.timeoutMs,
@@ -2704,7 +2702,14 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       },
       // #1104 — the turn owns what its CLI leaves in its group, the relay included; see `invoke`.
       reapProcessGroup: true,
+      // O4 — the pid of this turn's own spawn, reported in the spawn's tick (`SessionTurnSpawnRequest`).
+      onSpawn: (pid: number) => {
+        spawned = true;
+        request.onSpawn?.(pid);
+      },
     });
+    // O4 (D2-R2) — said only on positive evidence: the group seen empty after its signal, or no spawn.
+    if (result.processGroup?.reaped === true || (!spawned && result.processGroup === undefined)) request.onProcessGroupEnded?.();
     const envelope = safeParse(result.stdout);
     const providerError = claudeProviderError(envelope);
     const text = typeof envelope?.["result"] === "string" ? (envelope["result"] as string) : "";
@@ -2748,6 +2753,23 @@ const conversationFlag = (step: ConversationStep): "--session-id" | "--resume" =
 
 /** The one MCP server a provisioned session's turn is given; its tools are `mcp__acp-cto__*`. */
 export const SESSION_RELAY_SERVER = "acp-cto";
+
+/**
+ * O4 — a session turn as the daemon's runtime driver asks for one: the provider contract's request and
+ * the process this turn's own spawn created. `onSpawn` is called once, synchronously, in the tick the
+ * CLI process exists, with its pid, so the caller can pin the turn to it before the CLI starts its MCP
+ * child; the caller reads that process's start token itself. The process is spawned detached, so it
+ * leads a process group whose id is that pid. Never called for a turn that spawned nothing, and never
+ * with anything the session said. Kept here, beside the one adapter that runs session turns.
+ *
+ * O4 (D2-R2) — `onProcessGroupEnded` is the adapter's positive statement that nothing of the turn
+ * outlives it: its group was signalled and then observed with no member (`ProcessGroupReap.reaped`), or
+ * the turn spawned no process at all. Not called in any other case — an unconfirmed cleanup, a throw.
+ */
+export interface SessionTurnSpawnRequest extends SessionTurnRequest {
+  onSpawn?: (pid: number) => void;
+  onProcessGroupEnded?: () => void;
+}
 
 /**
  * The acp-cto relay this build ships, beside this module: `src/cli/session-relay.ts` when the

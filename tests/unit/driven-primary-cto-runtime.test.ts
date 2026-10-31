@@ -243,8 +243,9 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       expect(cp.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId: "standard-project" }))).toBeNull();
 
       // Interactive: the CTO preference, the shared managed root, no record, no custody, and woken
-      // through the conversation port, never the runtime.
-      const interactive = await cp.cto.ensurePrimaryCto("standard-project", "cto_start");
+      // through the conversation port, never the runtime. A run's dispatch asks for one (O4: since
+      // cto_start spawns driven, the dispatch door is the one still interactive).
+      const interactive = await cp.cto.ensurePrimaryCto("standard-project", standard.value.runId);
       if (!interactive.allowed) throw new Error(interactive.message);
       const interactiveSession = cp.sessions.require(interactive.value.sessionId);
       expect(interactiveSession).toMatchObject({ provider: "scripted", model: "scripted-cto" });
@@ -407,8 +408,9 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       const { binding } = await drivenPrimary(f, "marker-project");
       registerBareProject(f, "other-session-project");
       registerBareProject(f, "other-generation-project");
-      const otherSession = await cp.cto.ensurePrimaryCto("other-session-project", "cto_start");
-      const otherGeneration = await cp.cto.ensurePrimaryCto("other-generation-project", "cto_start");
+      // Interactive, through the dispatch door (O4: cto_start spawns driven).
+      const otherSession = await cp.cto.ensurePrimaryCto("other-session-project", "run-dispatch");
+      const otherGeneration = await cp.cto.ensurePrimaryCto("other-generation-project", "run-dispatch");
       if (!otherSession.allowed || !otherGeneration.allowed) throw new Error("interactive primary CTOs were refused");
 
       // Missing: an interactive session has no record, so nothing drives it — custody is refused.
