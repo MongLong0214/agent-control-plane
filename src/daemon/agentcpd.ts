@@ -494,6 +494,9 @@ export interface MachLaunchAddon {
   close(handle: MachLaunchHandle): { drained: number; refused: number; released: boolean };
   instanceLive(token: Buffer): boolean;
   bsdInfo(pid: number): { ppid: number; startSec: number; startUsec: number } | null;
+  auditTokenOfPid(pid: number): Buffer | null;
+  childPids(pid: number): number[];
+  executablePath(pid: number): string | null;
   readonly STATUS: { OK: number; REFUSED: number; STOPPING: number; BUSY: number; MALFORMED: number };
   readonly MAX_BODY: number;
 }
@@ -540,22 +543,157 @@ export const loadMachLaunchAddon = (): MachLaunchAddon => {
   throw new Error("the mach-launch addon could not be loaded");
 };
 
+/**
+ * O4b B' — on a #738 database refusal under launchd (the exit-0 stop signal), answer and release every
+ * request launchd queued for this job, and serve nothing.
+ *
+ * Measured (W-738 long window): a demand-launched job that exits without ever checking its declared Mach
+ * service in is relaunched every ThrottleInterval indefinitely after a burst — a log and CPU loop — even
+ * though the queue itself is bounded (sends past the queue limit time out unqueued). Checking the name in
+ * and handing it straight back, emptied, ends that.
+ *
+ * This is the whole of what runs: the addon's `listen` with a callback that does nothing, then `close`,
+ * whose native teardown answers every request still queued in the kernel or held by the receive thread
+ * with STOPPING and destroys the service's rights. No JavaScript answers anything here, and no session
+ * channel, credential store, pending entry or `serveMachLaunchCredential` exists on this path — the
+ * database admission failed before any of them was built — so it cannot hand anything out. #738's refusal
+ * condition and exit are unchanged; this only runs immediately before that exit.
+ */
+export const drainMachLaunchQueueOnRefusal = (
+  serviceName: string = MACH_LAUNCH_RESERVED_SERVICE,
+  loader: () => MachLaunchAddon = loadMachLaunchAddon,
+): { drained: number; refused: number; released: boolean } | null => {
+  let addon: MachLaunchAddon;
+  let handle: MachLaunchHandle;
+  try {
+    addon = loader();
+    handle = addon.listen(serviceName, () => { /* never answered here: close() refuses it STOPPING */ });
+  } catch {
+    return null;
+  }
+  return addon.close(handle);
+};
+
 /** The native lineage reads an admission uses; injectable so a witness can supply the real addon. */
 export interface MachLineageReaders {
   instanceLive(token: Buffer): boolean;
   bsdInfo(pid: number): { ppid: number; startSec: number; startUsec: number } | null;
 }
 
+/** The native reads the CLI pin uses, all taken by the daemon from the kernel: nothing anyone reports. */
+export interface MachCliPinReaders extends MachLineageReaders {
+  auditTokenOfPid(pid: number): Buffer | null;
+  childPids(pid: number): number[];
+  executablePath(pid: number): string | null;
+}
+
+/**
+ * O4b B' — the images the turn holder's own start-up passes the CLI through before the CLI runs:
+ * `PROBE_HOLDER_SCRIPT`'s `ksh` forks the child (image `/bin/ksh`), which execs `holderRestoredEnvironment`'s
+ * `/usr/bin/env`, which execs the CLI. These are the normal start-up execs and are never flagged; the CLI
+ * is pinned only once its image is neither, i.e. once its own start-up exec has finished.
+ */
+export const HOLDER_START_UP_IMAGES: ReadonlySet<string> = new Set(["/bin/ksh", "/usr/bin/env"]);
+
+/**
+ * O4b B' — binds the driven turn's CLI to its post-start-up exec image, by the daemon alone.
+ *
+ * The daemon does not spawn the CLI (the holder does), so it cannot pin the CLI in a spawn tick the way
+ * slice A pins the holder. Instead it discovers the CLI itself and verifies every fact from the kernel:
+ * the holder must still be the pinned holder (its live start token equals the pin), must have exactly one
+ * child (the holder runs one `"$@"`), that child's image must have left `HOLDER_START_UP_IMAGES` (its
+ * normal start-up exec is done), its parent must be the holder, and its audit token is then read through
+ * `task_name_for_pid` and re-checked live with the same parent and image. Nothing the holder, the CLI or the
+ * relay reports is used, and the relay never pins anything. The bound token carries the CLI's pidversion,
+ * which changes on every exec, so `instanceLive(cliPin.token)` at admission refuses any exec after the pin.
+ *
+ * Returns true when the entry is (now) pinned. False means "not yet" — it is retried, never relaxed.
+ */
+export const pinDrivenCli = (entry: PendingLaunchCredential, readers: MachCliPinReaders): boolean => {
+  if (entry.cliPin) return true;
+  const holderPin = entry.credential.pin;
+  if (!holderPin || holderPin.startToken === null) return false;
+  const holder = readers.bsdInfo(holderPin.pid);
+  if (!holder || formatDarwinStartToken(holder.startSec, holder.startUsec) !== holderPin.startToken) return false;
+  const children = readers.childPids(holderPin.pid);
+  if (children.length !== 1) return false;
+  const cliPid = children[0]!;
+  const image = readers.executablePath(cliPid);
+  if (image === null || HOLDER_START_UP_IMAGES.has(image)) return false;
+  const cli = readers.bsdInfo(cliPid);
+  if (!cli || cli.ppid !== holderPin.pid) return false;
+  const token = readers.auditTokenOfPid(cliPid);
+  if (!token) return false;
+  // Re-read after taking the token: still live as that very instance, same parent, same image.
+  const cliAgain = readers.bsdInfo(cliPid);
+  if (!readers.instanceLive(token) || !cliAgain || cliAgain.ppid !== holderPin.pid || readers.executablePath(cliPid) !== image) {
+    return false;
+  }
+  entry.cliPin = { pid: cliPid, token };
+  return true;
+};
+
+/**
+ * O4b B' — pins each pending driven entry's CLI as soon as the kernel shows it has finished its start-up
+ * exec, polling only while some entry carrying a holder pin still lacks a CLI pin. Returns a stop function.
+ * A claude CLI initialises for far longer than one poll before it starts its MCP relay, so the pin is
+ * taken well before the relay exists; a CLI that is still unpinned when its relay claims is refused
+ * (`CLI_NOT_PINNED`), never admitted on a late reading.
+ */
+export const startCliPinWatcher = (
+  pending: Map<string, PendingLaunchCredential>,
+  readers: MachCliPinReaders,
+  intervalMs = 2,
+  windowMs = 60_000,
+): { wake(): void; stop(): void } => {
+  let timer: ReturnType<typeof setInterval> | null = null;
+  // An entry is watched from the first tick that sees it for `windowMs`: a driven entry receives its holder
+  // pin in the spawn tick and its CLI pin milliseconds to seconds later; an interactive entry never gets a
+  // holder pin and simply ages out of the watch, so the poll never runs for a whole 30-minute entry TTL.
+  const firstSeen = new WeakMap<PendingLaunchCredential, number>();
+  const needsPin = (now: number): PendingLaunchCredential[] =>
+    [...pending.values()].filter((entry) => {
+      if (entry.cliPin !== undefined) return false;
+      const seen = firstSeen.get(entry) ?? now;
+      if (!firstSeen.has(entry)) firstSeen.set(entry, now);
+      return now - seen < windowMs;
+    });
+  const tick = (): void => {
+    const now = Date.now();
+    for (const entry of needsPin(now)) {
+      if (entry.credential.pin !== undefined) pinDrivenCli(entry, readers);
+    }
+    if (needsPin(Date.now()).length === 0 && timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+  };
+  return {
+    wake: () => {
+      if (timer) return;
+      timer = setInterval(tick, intervalMs);
+      timer.unref();
+    },
+    stop: () => {
+      if (timer) clearInterval(timer);
+      timer = null;
+    },
+  };
+};
+
 /**
  * O4b B' — per-message admission of a driven turn's credential, the real process shape and nothing else:
  * the pinned turn holder → the claude CLI → the sender (the CLI's own MCP child). Every check holds, or
  * the credential is refused; the caller then consumes the entry atomically and replies.
  *
- * The holder pin is the holder's evidence; the kernel audit token is the sender's evidence, and the two
- * are kept apart. The sender's own instance is bound by the token's pidversion (`instanceLive`), which
- * pid reuse cannot forge — the counterexample AF_UNIX left open (step 1). The CLI's instance is bound by
- * its start token, read twice. `exec` keeps a process's pid and start time, so the holder pin (read after
- * the holder's own `sandbox-exec`→`ksh` exec) and these reads name the post-exec images throughout.
+ * Three kinds of evidence, kept apart: the holder pin (slice A, the holder's own spawn tick); the CLI pin
+ * (`pinDrivenCli`, the CLI's post-start-up audit token, taken by the daemon from the kernel); and the kernel
+ * audit token on the message (the sender's). The sender's instance is bound by its token's pidversion
+ * (`instanceLive`), which pid reuse cannot forge — the counterexample AF_UNIX left open (step 1). The CLI's
+ * instance is bound by the pinned token's pidversion, which changes on every exec, so a CLI that exec'd
+ * after its pin is refused (`CLI_EXEC_AFTER_PIN`); its start token (fork time) is also re-read. The holder's
+ * pin is its start token: the holder's own `sandbox-exec`→`ksh` exec precedes the pin's read, and the
+ * holder's binding is to its fork instance, which the check against its sole child keeps meaningful.
  *
  * Returns a refusal whose message is the stage, for the caller to audit — never the credential.
  */
@@ -564,6 +702,7 @@ export const admitMachLaunchGrandchild = (
   senderPid: number,
   token: Buffer,
   pin: SessionLaunchPin,
+  cliPin?: { readonly pid: number; readonly token: Buffer },
 ): Decision<void> => {
   const refuse = (stage: string): Decision<void> => deny(ReasonCode.MACH_LAUNCH_ADMISSION_REFUSED, stage, { reason: stage });
   if (pin.startToken === null) return refuse("HOLDER_PIN_UNKNOWN");
@@ -580,10 +719,15 @@ export const admitMachLaunchGrandchild = (
   const holder1 = readers.bsdInfo(pin.pid);
   if (!holder1) return refuse("HOLDER_UNREADABLE");
   if (formatDarwinStartToken(holder1.startSec, holder1.startUsec) !== pin.startToken) return refuse("HOLDER_NOT_PINNED");
-  // (d) bind C's own instance.
+  // (d) bind C's own instance: its fork instance by start token, and its exec image by the CLI pin — the
+  // audit token the daemon took once C finished its start-up exec. A C that is not the pinned CLI, or that
+  // exec'd (or was replaced) after its pin, is refused; the CLI's normal start-up exec preceded the pin.
   const cliStart = formatDarwinStartToken(cli1.startSec, cli1.startUsec);
+  if (!cliPin) return refuse("CLI_NOT_PINNED");
+  if (cliPin.pid !== cliPid) return refuse("CLI_NOT_THE_PINNED_CLI");
+  if (!readers.instanceLive(cliPin.token)) return refuse("CLI_EXEC_AFTER_PIN");
   // (e) re-read: the sender is still live, its parent is still C, C is the same instance with the same
-  // parent, and the holder is still the pinned instance.
+  // parent and the same exec image, and the holder is still the pinned instance.
   if (!readers.instanceLive(token)) return refuse("SENDER_INSTANCE_GONE_LATE");
   const sender2 = readers.bsdInfo(senderPid);
   if (!sender2 || sender2.ppid !== cliPid) return refuse("SENDER_PARENT_CHANGED");
@@ -591,6 +735,7 @@ export const admitMachLaunchGrandchild = (
   if (!cli2 || cli2.ppid !== pin.pid || formatDarwinStartToken(cli2.startSec, cli2.startUsec) !== cliStart) {
     return refuse("CLI_CHANGED");
   }
+  if (!readers.instanceLive(cliPin.token)) return refuse("CLI_EXEC_AFTER_PIN_LATE");
   const holder2 = readers.bsdInfo(pin.pid);
   if (!holder2 || formatDarwinStartToken(holder2.startSec, holder2.startUsec) !== pin.startToken) return refuse("HOLDER_CHANGED");
   return allow(ReasonCode.OK, undefined);
@@ -678,6 +823,11 @@ interface LiveOperatorBinding extends LocalOperatorCredential {
 export interface PendingLaunchCredential {
   credential: SessionLaunchCredential;
   expiresAtMs: number;
+  /**
+   * O4b B' — the driven turn's CLI, bound by the daemon once it finished its start-up exec (`pinDrivenCli`):
+   * its pid and the audit token the daemon read from the kernel. Never set from a report.
+   */
+  cliPin?: { readonly pid: number; readonly token: Buffer };
 }
 
 /**
@@ -698,6 +848,7 @@ export const startSessionLaunchChannel = async (
   let machAddon: MachLaunchAddon | null = null;
   let machHandle: MachLaunchHandle | null = null;
   let machServiceName: string | null = null;
+  let cliPinWatcher: { wake(): void; stop(): void } | null = null;
 
   const pruneExpired = (): void => {
     const now = Date.now();
@@ -765,6 +916,8 @@ export const startSessionLaunchChannel = async (
         credential,
         expiresAtMs: Date.now() + SESSION_LAUNCH_TTL_MS,
       });
+      // A driven entry's holder pin arrives in the spawn tick after this; the watcher pins its CLI then.
+      cliPinWatcher?.wake();
       return allow(ReasonCode.OK, undefined);
     },
     withdraw: (externalSessionId) => pending.delete(externalSessionId),
@@ -796,6 +949,9 @@ export const startSessionLaunchChannel = async (
       }
       machAddon = addon;
       machServiceName = serviceName;
+      // The daemon's own CLI pinning: it runs only while a pending driven entry still lacks its CLI pin.
+      cliPinWatcher = startCliPinWatcher(pending, addon);
+      cliPinWatcher.wake();
       return allow(ReasonCode.OK, { serviceName });
     },
     close: async () => {
@@ -814,6 +970,8 @@ export const startSessionLaunchChannel = async (
         }
         machHandle = null;
         machServiceName = null;
+        cliPinWatcher?.stop();
+        cliPinWatcher = null;
         if (opening) await opening;
         const active = server;
         server = null;
@@ -4155,6 +4313,7 @@ export const serveMachLaunchCredential = (
     request.sender.pid,
     request.token,
     credential.pin,
+    launch.cliPin,
   );
   if (!admitted.allowed) return refuse(admitted.message ?? "REFUSED", credential.sessionId);
   // (f) the entry is the same object: its secret still verifies for the session's current state, and the
@@ -6630,6 +6789,19 @@ if (isMainModule()) {
           "Approve with: agentcpd-state approve-migration --approved-by <who> --confirm-migration\n" +
           "Inspect without approving: agentcpd-state migration-plan\n",
       );
+    }
+    // O4b B' — exit 0 is #738's launchd stop signal. A Mach request may have demand-launched this job, so
+    // the declared launch service is checked in only to refuse and release whatever launchd queued, then
+    // handed back empty; without this launchd relaunches the job every ThrottleInterval (measured). Nothing
+    // is served: no credential store or request handler exists on this path. Not done outside launchd.
+    if (disposition.exitCode === 0) {
+      const drained = drainMachLaunchQueueOnRefusal();
+      if (drained !== null) {
+        process.stderr.write(
+          `agentcpd: the Mach launch service was checked in only to refuse what was queued (drained=${drained.drained} ` +
+            `refused=${drained.refused}); no credential was served\n`,
+        );
+      }
     }
     process.exit(disposition.exitCode);
   });

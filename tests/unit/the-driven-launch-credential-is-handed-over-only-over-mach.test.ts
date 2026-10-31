@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 
@@ -10,6 +10,8 @@ import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import {
   MACH_LAUNCH_RESERVED_SERVICE,
   admitMachLaunchGrandchild,
+  drainMachLaunchQueueOnRefusal,
+  startCliPinWatcher,
   loadMachLaunchAddon,
   serveMachLaunchCredential,
   startSessionLaunchChannel,
@@ -23,6 +25,7 @@ import type { SessionRecord, SessionRegistry } from "../../src/session/session-r
 import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { tempDir } from "../helpers/fixtures.ts";
+import { __testing as cliAdapterTesting } from "../../src/runtime/cli-adapters.ts";
 
 /**
  * O4b B' step 2 — the driven-turn credential is handed over only over raw Mach, admitted per message to
@@ -125,6 +128,8 @@ interface Harness {
   readonly handle: MachLaunchHandle;
   readonly dir: string;
   beforeAdmit: ((request: MachLaunchIncoming) => void | Promise<void>) | null;
+  readonly watcher: { wake(): void; stop(): void };
+  readonly mcpSock: string;
   spawnTree(mode: "holder-cli-relay" | "holder-relay" | "holder-cli-two-relays", externalSessionId: string): {
     report: () => Record<string, number>;
     go: () => void;
@@ -166,7 +171,8 @@ const startHarness = (addon: MachLaunchAddon, record: Parameters<typeof sessions
   mcpServer.listen(mcpSock);
 
   const self: Harness = {
-    isoName, pending, audit, sessions, mcpLines, dir, handle: undefined as unknown as MachLaunchHandle,
+    isoName, pending, audit, sessions, mcpLines, dir, mcpSock, handle: undefined as unknown as MachLaunchHandle,
+    watcher: undefined as unknown as { wake(): void; stop(): void },
     beforeAdmit: null,
     spawnTree: (mode, externalSessionId) => {
       const report = join(dir, `report-${randomUUID().slice(0, 6)}`);
@@ -239,10 +245,14 @@ const startHarness = (addon: MachLaunchAddon, record: Parameters<typeof sessions
     void run();
   });
   (self as { handle: MachLaunchHandle }).handle = handle;
+  // The daemon's own CLI pinning, exactly as the channel runs it: kernel reads only, nothing reported.
+  const watcher = startCliPinWatcher(pending, addon);
+  (self as { watcher: { wake(): void; stop(): void } }).watcher = watcher;
 
   harnesses.push({
     cleanup: () => {
       for (const child of children) { try { if (child.pid) process.kill(child.pid, "SIGKILL"); } catch { /* gone */ } }
+      watcher.stop();
       try { addon.close(handle); } catch { /* already closed */ }
       mcpServer.close();
       rmSync(dir, { recursive: true, force: true });
@@ -257,6 +267,7 @@ const provision = (h: Harness, credential: SessionLaunchCredential & { sessionSe
     credential: { ...credential, pin: { pid: holderPid, startToken: readProcessStartToken(holderPid) } },
     expiresAtMs: Date.now() + 60_000,
   });
+  h.watcher.wake();
 };
 
 const deliveredCredential = (h: Harness, credential: { sessionSecret: string }): boolean =>
@@ -293,6 +304,67 @@ describe("O4b B' step 2 — a driven credential is handed over only over raw Mac
     tree.go();
     expect(await waitFor(() => refusals(h).length > 0, 15_000)).toBe(true);
     expect(lastRefusalReason(h)).toBe("NOT_HOLDER_GRANDCHILD");
+    expect(deliveredCredential(h, credential)).toBe(false);
+    expect(h.pending.has(credential.externalSessionId)).toBe(true);
+  });
+
+  /**
+   * The real turn holder: `productionRunCli` with `reapProcessGroup`, as `runSessionTurn` runs it —
+   * sandbox-exec → ksh (the pinned holder) → fork → /usr/bin/env → the CLI. The holder pin is taken in
+   * `onSpawn` exactly as slice A takes it; the CLI pin is taken by the daemon's watcher from the kernel.
+   */
+  const runUnderRealHolder = async (h: Harness, credential: SessionLaunchCredential & { sessionSecret: string }, cliBody: string, name: string) => {
+    const cliFile = join(h.dir, name);
+    writeFileSync(cliFile, cliBody);
+    chmodSync(cliFile, 0o755);
+    const workdir = tempDir("acp-o4b-real-holder-");
+    return cliAdapterTesting.productionRunCli(cliFile, [], {
+      cwd: workdir, timeoutMs: 20_000, stdin: "", reapProcessGroup: true,
+      onSpawn: (pid: number) => provision(h, credential, pid),
+    });
+  };
+  const relayArgv = (h: Harness, externalSessionId: string): string[] =>
+    [RELAY_JS, "--addon", ADDON_PATH, "--iso-service", h.isoName, "--mcp", h.mcpSock, "--session", externalSessionId];
+
+  it("W-CLI-INITIAL-EXEC (positive): the CLI's normal start-up exec through the real holder is not flagged, and its relay is admitted", async (ctx) => {
+    const addon = requireMach(ctx);
+    const record = { sessionId: `s-${randomUUID().slice(0, 8)}`, sessionSecret: "", incarnation: "inc-1", credentialEpoch: 1 };
+    const credential = credentialOf(record.sessionId);
+    record.sessionSecret = credential.sessionSecret;
+    const h = startHarness(addon, record);
+    // A CLI that initialises (as claude does) before starting its MCP relay as its direct child, and never
+    // execs again. It reached its image through ksh's fork and /usr/bin/env — two execs after the holder pin.
+    const cli = `#!${process.execPath}
+const { spawn } = require("node:child_process");
+setTimeout(() => {
+  const relay = spawn(process.execPath, ${JSON.stringify(relayArgv(h, credential.externalSessionId))}, { stdio: ["ignore", "ignore", "ignore"] });
+  relay.on("close", () => process.exit(0));
+}, 300);
+`;
+    const result = await runUnderRealHolder(h, credential, cli, "cli-initial-exec.cjs");
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(await waitFor(() => deliveredCredential(h, credential), 10_000)).toBe(true);
+    expect(refusals(h)).toHaveLength(0);
+    expect(h.pending.has(credential.externalSessionId)).toBe(false);
+  });
+
+  it("W-CLI-EXEC-AFTER-PIN (negative): a CLI that execs after its pin is refused CLI_EXEC_AFTER_PIN, no credential", async (ctx) => {
+    const addon = requireMach(ctx);
+    const record = { sessionId: `s-${randomUUID().slice(0, 8)}`, sessionSecret: "", incarnation: "inc-1", credentialEpoch: 1 };
+    const credential = credentialOf(record.sessionId);
+    record.sessionSecret = credential.sessionSecret;
+    const h = startHarness(addon, record);
+    // The reviewer's shape: the CLI starts its relay and then execs another image. Its pid, parent and BSD
+    // start time are unchanged; its pidversion is not, and the pinned token says so.
+    const relay = relayArgv(h, credential.externalSessionId).map((a) => `'${a}'`).join(" ");
+    const cli = `#!/bin/bash
+/bin/sleep 0.4
+'${process.execPath}' ${relay} </dev/null >/dev/null 2>&1 &
+exec /bin/sleep 3
+`;
+    await runUnderRealHolder(h, credential, cli, "cli-exec-after-pin.sh");
+    expect(await waitFor(() => refusals(h).length > 0, 10_000)).toBe(true);
+    expect(lastRefusalReason(h)).toMatch(/^CLI_EXEC_AFTER_PIN/);
     expect(deliveredCredential(h, credential)).toBe(false);
     expect(h.pending.has(credential.externalSessionId)).toBe(true);
   });
@@ -405,7 +477,7 @@ describe("O4b B' step 2 — a driven credential is handed over only over raw Mac
       respond: () => true,
     } as unknown as MachLaunchAddon;
     const pin = { pid: 12, startToken: "darwin-tv:3.000003" };
-    h.pending.set(credential.externalSessionId, { credential: { ...credential, pin }, expiresAtMs: Date.now() + 60_000 });
+    h.pending.set(credential.externalSessionId, { credential: { ...credential, pin }, expiresAtMs: Date.now() + 60_000, cliPin: { pid: 11, token: Buffer.alloc(32) } });
     const request: MachLaunchIncoming = { id: 1, body: Buffer.from(JSON.stringify({ externalSessionId: credential.externalSessionId })), token, live: true, sender: { pid: 10, pidversion: 1, euid: 501 } };
     serveMachLaunchCredential(request, { pending: h.pending, sessions: h.sessions, audit: h.audit, addon: fakeAddon, handle: {}, mcpToken: MCP_TOKEN });
     serveMachLaunchCredential({ ...request, id: 2 }, { pending: h.pending, sessions: h.sessions, audit: h.audit, addon: fakeAddon, handle: {}, mcpToken: MCP_TOKEN });
@@ -427,7 +499,7 @@ describe("O4b B' step 2 — a driven credential is handed over only over raw Mac
       respond: () => false, // the Mach reply send failed or is uncertain (MACH_SEND_INVALID_DEST, timeout)
     } as unknown as MachLaunchAddon;
     const pin = { pid: 12, startToken: "darwin-tv:3.000003" };
-    h.pending.set(credential.externalSessionId, { credential: { ...credential, pin }, expiresAtMs: Date.now() + 60_000 });
+    h.pending.set(credential.externalSessionId, { credential: { ...credential, pin }, expiresAtMs: Date.now() + 60_000, cliPin: { pid: 11, token: Buffer.alloc(32) } });
     const request: MachLaunchIncoming = { id: 1, body: Buffer.from(JSON.stringify({ externalSessionId: credential.externalSessionId })), token, live: true, sender: { pid: 10, pidversion: 1, euid: 501 } };
     serveMachLaunchCredential(request, { pending: h.pending, sessions: h.sessions, audit: h.audit, addon: fakeAddon, handle: {}, mcpToken: MCP_TOKEN });
     expect(h.pending.has(credential.externalSessionId)).toBe(false); // not restored
@@ -447,9 +519,9 @@ describe("O4b B' step 2 — a driven credential is handed over only over raw Mac
     const token = Buffer.alloc(32);
     const good = admitMachLaunchGrandchild(readers, self, token, {
       pid: grandparent, startToken: `darwin-tv:${readers.bsdInfo(grandparent)!.startSec}.${String(readers.bsdInfo(grandparent)!.startUsec).padStart(6, "0")}`,
-    });
+    }, { pid: parent, token });
     expect(good.allowed).toBe(true);
-    const moved = admitMachLaunchGrandchild(readers, self, token, { pid: grandparent, startToken: "darwin-tv:1.000000" });
+    const moved = admitMachLaunchGrandchild(readers, self, token, { pid: grandparent, startToken: "darwin-tv:1.000000" }, { pid: parent, token });
     expect(moved.allowed).toBe(false);
     if (!moved.allowed) expect(moved.message).toBe("HOLDER_NOT_PINNED");
   });
@@ -516,6 +588,23 @@ describe("O4b B' step 2 — resource-safety branches expose no credential and le
     const late = await claimFrom(addon, iso, Buffer.from(JSON.stringify({ externalSessionId: "late" })), 1_000);
     expect(late.code).not.toBe("OK");
     if (DIAG) { expect(threadsAtListen).toBe(1); expect(receiveThreads()).toBe(0); } // the receive thread joined; none leaked
+    // No per-cycle leak: a second identical held-then-close cycle leaves the port-name count where the first
+    // left it (the first concurrent claims allocate threadpool state once; measured 27 -> 31 -> 31 ...).
+    if (DIAG) {
+      const cycle = async (tag: string): Promise<number> => {
+        const name = isoName(tag);
+        const got: number[] = [];
+        const h2 = addon.listen(name, (req: MachLaunchIncoming) => { got.push(req.id); });
+        const p2 = [0, 1, 2, 3].map((i) => claimFrom(addon, name, Buffer.from(JSON.stringify({ externalSessionId: `c-${i}` })), 5_000));
+        await waitFor(() => got.length >= 4, 5_000);
+        expect(addon.close(h2).released).toBe(true);
+        expect((await Promise.all(p2)).every((r) => r.code !== "OK")).toBe(true);
+        await sleep(50);
+        return DIAG.ports().names;
+      };
+      const first = await cycle("stop-c1");
+      expect(await cycle("stop-c2")).toBe(first);
+    }
     void record;
   });
 
@@ -573,6 +662,33 @@ describe("O4b B' step 2 — resource-safety branches expose no credential and le
     } finally {
       addon.close(handleB);
     }
+  });
+});
+
+describe("O4b B' step 2 — a #738-refused daemon drains the launch queue and serves nothing", () => {
+  it("W-738-DRAIN: the refusal drain has no answering path of its own and releases the service; every queued request is refused STOPPING", async (ctx) => {
+    const addon = requireMach(ctx);
+    // With a recording double: the drain checks in, never calls respond, and closes exactly once.
+    const calls: string[] = [];
+    const spy = {
+      ...addon,
+      STATUS: addon.STATUS,
+      listen: (name: string, cb: (r: MachLaunchIncoming) => void) => { calls.push(`listen:${name === "iso-drain" ? "iso" : name}`); void cb; return {}; },
+      respond: () => { calls.push("respond"); return true; },
+      close: () => { calls.push("close"); return { drained: 0, refused: 0, released: true }; },
+    } as unknown as MachLaunchAddon;
+    expect(drainMachLaunchQueueOnRefusal("iso-drain", () => spy)).toEqual({ drained: 0, refused: 0, released: true });
+    expect(calls).toEqual(["listen:iso", "close"]);
+    // With the real addon: requests held by a previous holder of the name are answered STOPPING by the
+    // drain's own check-in/close, never OK, and the service's rights are released.
+    const iso = `com.acp-iso.o4b-step2-drain738.${process.pid}.${randomUUID().slice(0, 8)}`;
+    const inflight = [0, 1, 2].map((i) => claimFrom(addon, iso, Buffer.from(JSON.stringify({ externalSessionId: `q-${i}` })), 3_000));
+    const result = drainMachLaunchQueueOnRefusal(iso, () => addon);
+    expect(result?.released).toBe(true);
+    const codes = (await Promise.all(inflight)).map((r) => r.code);
+    expect(codes).not.toContain("OK");
+    // The loader failing (no addon) returns null: nothing is checked in and nothing is answered.
+    expect(drainMachLaunchQueueOnRefusal(iso, () => { throw new Error("no addon"); })).toBeNull();
   });
 });
 

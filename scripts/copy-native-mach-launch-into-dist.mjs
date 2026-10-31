@@ -11,7 +11,7 @@
  * Darwin only, matching `build-native-mach-launch.mjs`. On Darwin a missing source file is a build
  * order problem to report, not a case to pass through.
  */
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -30,5 +30,10 @@ if (!existsSync(SOURCE)) {
 }
 
 mkdirSync(dirname(DESTINATION), { recursive: true });
-copyFileSync(SOURCE, DESTINATION);
+// Replace, never overwrite in place: copying onto an existing signed Mach-O keeps its inode, and the
+// kernel then kills (SIGKILL, measured) any process that loads it, because the signature it cached for that
+// vnode no longer matches the bytes. A copy beside it renamed over the old name is a new inode.
+const staged = `${DESTINATION}.${process.pid}.tmp`;
+copyFileSync(SOURCE, staged);
+renameSync(staged, DESTINATION);
 process.exit(0);

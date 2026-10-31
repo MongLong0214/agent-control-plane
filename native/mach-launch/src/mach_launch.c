@@ -299,11 +299,6 @@ typedef struct {
   int released;
 } ml_close_result_t;
 
-static int ml_name_released(mach_port_t name) {
-  mach_port_type_t type = 0;
-  return !MACH_PORT_VALID(name) || mach_port_type(mach_task_self(), name, &type) == KERN_INVALID_NAME;
-}
-
 // Stops the receive thread, answers every request this side still holds or that is still queued with
 // STOPPING, and destroys every right it holds. Idempotent; JS thread only.
 static ml_close_result_t ml_teardown(ml_service_t *service) {
@@ -325,14 +320,18 @@ static ml_close_result_t ml_teardown(ml_service_t *service) {
     if (mach_msg(&stop, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof stop, 0, MACH_PORT_NULL, 1000, MACH_PORT_NULL) !=
         KERN_SUCCESS) {
       // Destroying the set ends the receive with MACH_RCV_PORT_DIED, which the loop treats as the end.
-      mach_port_mod_refs(task, service->set, MACH_PORT_RIGHT_PORT_SET, -1);
+      if (mach_port_mod_refs(task, service->set, MACH_PORT_RIGHT_PORT_SET, -1) != KERN_SUCCESS) result.released = 0;
       service->set = MACH_PORT_NULL;
     }
     pthread_join(service->thread, NULL);
     service->thread_started = 0;
   }
-  if (MACH_PORT_VALID(service->set)) mach_port_mod_refs(task, service->set, MACH_PORT_RIGHT_PORT_SET, -1);
-  if (MACH_PORT_VALID(service->control)) mach_port_destruct(task, service->control, -1, 0);
+  // `released` is the release calls' own success, not a later look-up of the names: another thread of this
+  // task may allocate a port that reuses a just-freed name, so a look-up can only race.
+  if (MACH_PORT_VALID(service->set) &&
+      mach_port_mod_refs(task, service->set, MACH_PORT_RIGHT_PORT_SET, -1) != KERN_SUCCESS) result.released = 0;
+  if (MACH_PORT_VALID(service->control) &&
+      mach_port_destruct(task, service->control, -1, 0) != KERN_SUCCESS) result.released = 0;
 
   // Requests already queued on the service port are answered, not left for a timeout.
   if (MACH_PORT_VALID(service->service)) {
@@ -367,13 +366,12 @@ static ml_close_result_t ml_teardown(ml_service_t *service) {
     pending = next;
   }
 
-  if (MACH_PORT_VALID(service->service)) {
-    mach_port_urefs_t sends = 0;
-    mach_port_get_refs(task, service->service, MACH_PORT_RIGHT_SEND, &sends);
-    mach_port_destruct(task, service->service, -(mach_port_delta_t)sends, 0);
-  }
-  result.released = ml_name_released(service->service) && ml_name_released(service->control) &&
-                    ml_name_released(service->set);
+  // Release exactly what this listener owns: the one receive right bootstrap_check_in returned (it returns
+  // no send right). A send uref on the same name held by other code in this task — a claim in flight from
+  // the same process — belongs to that code, which deallocates it; taking it here would race that code
+  // and could leave the receive right undestroyed (measured).
+  if (MACH_PORT_VALID(service->service) &&
+      mach_port_mod_refs(task, service->service, MACH_PORT_RIGHT_RECEIVE, -1) != KERN_SUCCESS) result.released = 0;
   service->service = service->control = service->set = MACH_PORT_NULL;
 
   if (service->tsfn != NULL) {
@@ -606,6 +604,75 @@ static napi_value ml_bsd_info(napi_env env, napi_callback_info info) {
   return result;
 }
 
+// auditTokenOfPid(pid) -> 32-byte Buffer | null. The live audit token of a same-uid process, read by the
+// daemon itself through the public task_name_for_pid + task_info(TASK_AUDIT_TOKEN). Its pidversion changes
+// on every exec, so a token bound once and checked later with `instanceLive` refuses a process that has
+// exec'd (or died and been reused) since. Nothing reported by another process is involved.
+static napi_value ml_audit_token_of_pid(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  int32_t pid = -1;
+  if (argc < 1 || napi_get_value_int32(env, argv[0], &pid) != napi_ok || pid <= 0) {
+    return ml_throw(env, "MACH_LAUNCH_INVALID_ARGUMENT", "auditTokenOfPid(pid)", 0);
+  }
+  napi_value result;
+  napi_get_null(env, &result);
+  mach_port_t name = MACH_PORT_NULL;
+  if (task_name_for_pid(mach_task_self(), pid, &name) != KERN_SUCCESS) return result;
+  audit_token_t token;
+  mach_msg_type_number_t count = TASK_AUDIT_TOKEN_COUNT;
+  kern_return_t kr = task_info(name, TASK_AUDIT_TOKEN, (task_info_t)&token, &count);
+  mach_port_deallocate(mach_task_self(), name);
+  if (kr != KERN_SUCCESS || audit_token_to_pid(token) != pid) return result;
+  void *copy = NULL;
+  napi_create_buffer_copy(env, sizeof token, &token, &copy, &result);
+  return result;
+}
+
+// childPids(pid) -> number[]. The live children of a process (public proc_listchildpids).
+static napi_value ml_child_pids(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  int32_t pid = -1;
+  if (argc < 1 || napi_get_value_int32(env, argv[0], &pid) != napi_ok || pid <= 0) {
+    return ml_throw(env, "MACH_LAUNCH_INVALID_ARGUMENT", "childPids(pid)", 0);
+  }
+  pid_t children[256];
+  // proc_listchildpids returns the number of pids written (measured), not a byte count.
+  int n = proc_listchildpids(pid, children, (int)sizeof children);
+  if (n < 0) n = 0;
+  if (n > 256) n = 256;
+  napi_value result, value;
+  napi_create_array_with_length(env, (size_t)n, &result);
+  for (int i = 0; i < n; i++) {
+    napi_create_int32(env, children[i], &value);
+    napi_set_element(env, result, (uint32_t)i, value);
+  }
+  return result;
+}
+
+// executablePath(pid) -> string | null. The path of the image a process is currently running (public
+// proc_pidpath); it follows exec, so it tells the daemon when a process has left the holder's wrappers.
+static napi_value ml_executable_path(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  int32_t pid = -1;
+  if (argc < 1 || napi_get_value_int32(env, argv[0], &pid) != napi_ok || pid <= 0) {
+    return ml_throw(env, "MACH_LAUNCH_INVALID_ARGUMENT", "executablePath(pid)", 0);
+  }
+  char path[PROC_PIDPATHINFO_MAXSIZE];
+  napi_value result;
+  if (proc_pidpath(pid, path, sizeof path) <= 0) {
+    napi_get_null(env, &result);
+    return result;
+  }
+  napi_create_string_utf8(env, path, NAPI_AUTO_LENGTH, &result);
+  return result;
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Relay side
 // ---------------------------------------------------------------------------------------------------
@@ -802,6 +869,7 @@ NAPI_MODULE_INIT() {
   const struct { const char *name; napi_callback fn; } functions[] = {
       {"listen", ml_listen}, {"respond", ml_respond}, {"close", ml_close},
       {"instanceLive", ml_instance_live}, {"bsdInfo", ml_bsd_info}, {"claim", ml_claim},
+      {"auditTokenOfPid", ml_audit_token_of_pid}, {"childPids", ml_child_pids}, {"executablePath", ml_executable_path},
   };
   for (size_t i = 0; i < sizeof functions / sizeof functions[0]; i++) {
     napi_value fn;
