@@ -149,7 +149,7 @@ import {
 } from "../ingress/telegram-external.ts";
 import type { TelegramDirectAnswer } from "../ingress/telegram-router.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
-import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
+import type { SessionLaunchChannel, SessionLaunchCredential, SessionLaunchPin } from "../cto/cto-lifecycle.ts";
 import {
   CanonicalCtoRestoreCondition,
   type CanonicalCtoAttachChallenger,
@@ -176,6 +176,7 @@ import { respond, type AuthenticatedMcpPeer, type McpPeerAuthenticator } from ".
 import type { AuthenticatedOperatorPeer, Daemon, StartStallNoticeRoute } from "./daemon.ts";
 import { executeCanonicalSelfClaimOperator } from "./canonical-self-claim-operator.ts";
 import {
+  authenticateLaunchPeer,
   startAdoptedCeoToolListener,
   startCanonicalCtoToolListener,
   startCanonicalSelfClaimListener,
@@ -188,9 +189,13 @@ import {
   type CanonicalCtoReattach,
 } from "../registry/canonical-cto-reattach.ts";
 import {
+  admitPinnedHolderGrandchild,
   admitRuntimeLineage,
+  confirmAdmittedGrandchild,
   defaultProcessLineageReader,
   recordedStartIsLive,
+  type AdmittedGrandchild,
+  type HolderGrandchildRefusal,
   type ProcessLineageReader,
 } from "../session/runtime-lineage.ts";
 import { readOneJsonLineRequest } from "./local-socket-framing.ts";
@@ -430,7 +435,18 @@ export interface LocalMcpListenerOptions {
 export interface LocalSessionLaunchChannel {
   socketPath: string;
   prepare(): Promise<Decision<void>>;
+  /**
+   * O4 — the driven-turn door: the runtime driver's (`ProvisionedSessionRuntime`) entry for one turn,
+   * which its spawn pins in place. Handed over only to the pinned holder's grandchild
+   * (`admitPinnedHolderGrandchild`); an entry offered here and never pinned is refused.
+   */
   provision(input: SessionLaunchCredential): Promise<Decision<void>>;
+  /**
+   * O4 — the interactive-spawn door: what `CtoLifecycle.spawn` offers for a session it does not drive.
+   * An entry offered here keeps the earlier path — any peer that can open this owner-only socket and
+   * names the session — because no process of its runtime is pinned. Its lineage is not checked.
+   */
+  interactiveSpawns: SessionLaunchChannel;
   /**
    * #246 C1b — removes a credential still waiting for its runtime. True when one was there to
    * remove: the runtime never took it. False when none was: it was taken, or never offered.
@@ -447,6 +463,14 @@ export interface SessionLaunchChannelOptions {
    * argv or environment. Omitted, a reply carries the credential alone, as before.
    */
   mcpToken?: string;
+  /**
+   * O4 — the registry an entry is verified against immediately before it is handed over: its secret must
+   * still authenticate its session at the incarnation it names, so an entry holding an earlier epoch's
+   * secret is never handed out. Omitted, no entry can be verified and none is handed over.
+   */
+  sessions?: Pick<ControlPlane["sessions"], "verifySecret">;
+  /** O4 — where a refused hand-over is recorded: the refusal only, never the credential or a hand-over. */
+  audit?: Pick<ControlPlane["audit"], "record">;
 }
 
 /** A daemon-owned local hop from the authenticated Buzz relay to SessionRegistry. */
@@ -531,12 +555,18 @@ interface LiveOperatorBinding extends LocalOperatorCredential {
 interface PendingLaunchCredential {
   credential: SessionLaunchCredential;
   expiresAtMs: number;
+  /** O4 — which door offered it: the driven-turn door (`provision`) or the interactive-spawn door. */
+  driven: boolean;
 }
 
 /**
  * The provider-issued external session id is a high-entropy, recipient-scoped rendezvous
  * key. The channel lives on an owner-only socket, retains no credential durably, and deletes
  * an entry before replying, so a runtime can obtain its MCP proof exactly once.
+ *
+ * O4 — knowing the id is not enough for a driven turn's entry: it goes only to the kernel peer whose
+ * parent's parent is the holder the daemon pinned at its own spawn (`serveSessionLaunchCredential`).
+ * An interactive spawn's entry, which pins no process, keeps the id-only path.
  */
 export const startSessionLaunchChannel = async (
   stateDir: string,
@@ -570,7 +600,7 @@ export const startSessionLaunchChannel = async (
         // under the daemon lock. A losing daemon can therefore never unlink the winner's
         // live launch socket while it is merely attempting startup.
         removeStaleSocket(socketPath);
-        candidate = createServer((socket) => serveSessionLaunchCredential(socket, pending, options.mcpToken));
+        candidate = createServer((socket) => serveSessionLaunchCredential(socket, pending, options));
         await listenSocket(candidate, socketPath);
         if (closed) {
           await closeSocketServer(candidate);
@@ -597,26 +627,30 @@ export const startSessionLaunchChannel = async (
     return opening;
   };
 
+  const offer = async (credential: SessionLaunchCredential, driven: boolean): Promise<Decision<void>> => {
+    const prepared = await prepare();
+    if (!prepared.allowed) return prepared;
+    pruneExpired();
+    if (pending.has(credential.externalSessionId)) {
+      return deny(
+        ReasonCode.CONFLICT,
+        "a launch credential is already pending for this external session",
+        { sessionId: credential.sessionId },
+      );
+    }
+    pending.set(credential.externalSessionId, {
+      credential,
+      expiresAtMs: Date.now() + SESSION_LAUNCH_TTL_MS,
+      driven,
+    });
+    return allow(ReasonCode.OK, undefined);
+  };
+
   return {
     socketPath,
     prepare,
-    provision: async (credential) => {
-      const prepared = await prepare();
-      if (!prepared.allowed) return prepared;
-      pruneExpired();
-      if (pending.has(credential.externalSessionId)) {
-        return deny(
-          ReasonCode.CONFLICT,
-          "a launch credential is already pending for this external session",
-          { sessionId: credential.sessionId },
-        );
-      }
-      pending.set(credential.externalSessionId, {
-        credential,
-        expiresAtMs: Date.now() + SESSION_LAUNCH_TTL_MS,
-      });
-      return allow(ReasonCode.OK, undefined);
-    },
+    provision: (credential) => offer(credential, true),
+    interactiveSpawns: { prepare, provision: (credential) => offer(credential, false) },
     withdraw: (externalSessionId) => pending.delete(externalSessionId),
     close: async () => {
       if (closing) return closing;
@@ -3837,16 +3871,147 @@ const authenticateOperatorPeer = (
   });
 };
 
+/** O4 — the audit kind of a refused hand-over on the launch channel; a hand-over itself is not recorded. */
+export const SESSION_LAUNCH_CREDENTIAL_REFUSED = "SESSION_LAUNCH_CREDENTIAL_REFUSED";
+
+/**
+ * O4 — why a hand-over was refused, as the audit records it. `PEER_UNREADABLE`: the connection's kernel
+ * peer could not be established as a direct, same-uid peer, at the connection, at the request or at the
+ * hand-over. `PEER_START_UNKNOWN`: the start token of the pid the kernel named at the accept could not be
+ * read then (the connector already gone, EPERM), or that pid's could not be read later. `PEER_CHANGED`: the
+ * kernel named another pid at the request or at the hand-over than at the accept, or that pid's start
+ * token is no longer the one read at the accept. The rest name the entry: no pin on a
+ * driven entry, a lineage refusal (`HolderGrandchildRefusal`), a credential that no longer authenticates
+ * its session at its incarnation (`CREDENTIAL_NOT_CURRENT`) or that nothing can verify, and an entry
+ * withdrawn or replaced while it was being admitted.
+ */
+type LaunchRefusal =
+  | HolderGrandchildRefusal
+  | "PIN_ABSENT"
+  | "PEER_UNREADABLE"
+  | "CREDENTIAL_NOT_CURRENT"
+  | "CREDENTIAL_NOT_VERIFIABLE"
+  | "ENTRY_REPLACED";
+
+/** O4 — what the daemon read about a connection's peer when it accepted it, before a byte of the request. */
+interface AcceptedLaunchPeer {
+  peer: Decision<AuthenticatedClaimPeer>;
+  /** The start token of the pid the kernel named at the accept, read then; null when it could not be. */
+  startToken: string | null;
+}
+
+type LaunchAdmission =
+  | { allowed: true; pin: SessionLaunchPin | undefined; grandchild: AdmittedGrandchild | null }
+  | { allowed: false; refusal: LaunchRefusal; evidence?: Record<string, number> };
+
+/**
+ * O4 — whether `launch` may be handed to this connection. Writes nothing and reads the request for
+ * nothing but the id that found `launch`.
+ *
+ * A driven-turn entry needs the pin its spawn wrote, and the start token the daemon read at the accept for
+ * the pid the kernel named then (`accepted`); a connection whose accept-time token could not be read is
+ * refused. The kernel is asked again who the peer is now (`peerNow`): on macOS that is the last process to
+ * use the socket, the one that sent the request. It must be the pid named at the accept, so a socket handed
+ * to another process between the two is refused; that pid's live start token must still be the accept-time
+ * one, so a pid reused after the accept is refused; and it must be the pinned holder's grandchild
+ * (`admitPinnedHolderGrandchild`): holder → CLI → peer. The CLI's own identity is not pinned, so any child of the
+ * holder's child passes. An interactive spawn's entry has no pin and no lineage to check, and keeps the
+ * earlier same-uid, id-only path. Either way the credential must still authenticate its session at the
+ * incarnation it names: an entry holding an earlier epoch's secret, or naming an incarnation the session
+ * no longer has, is refused, and so is every entry when no registry was given to verify it against.
+ */
+const admitLaunch = (
+  launch: PendingLaunchCredential,
+  accepted: AcceptedLaunchPeer,
+  peerNow: () => Decision<AuthenticatedClaimPeer>,
+  sessions: SessionLaunchChannelOptions["sessions"],
+): LaunchAdmission => {
+  const { credential } = launch;
+  const pin = credential.pin;
+  let grandchild: AdmittedGrandchild | null = null;
+  if (launch.driven) {
+    if (pin === undefined) return { allowed: false, refusal: "PIN_ABSENT" };
+    if (!accepted.peer.allowed) return { allowed: false, refusal: "PEER_UNREADABLE" };
+    const acceptedPid = accepted.peer.value.peerPid;
+    if (accepted.startToken === null) {
+      return { allowed: false, refusal: "PEER_START_UNKNOWN", evidence: { connectedPid: acceptedPid } };
+    }
+    const requester = peerNow();
+    if (!requester.allowed) return { allowed: false, refusal: "PEER_UNREADABLE" };
+    if (requester.value.peerPid !== acceptedPid) {
+      return {
+        allowed: false,
+        refusal: "PEER_CHANGED",
+        evidence: { peerPid: requester.value.peerPid, connectedPid: acceptedPid },
+      };
+    }
+    const lineage = admitPinnedHolderGrandchild({ pid: acceptedPid, startToken: accepted.startToken }, pin);
+    if (!lineage.allowed) {
+      return {
+        allowed: false,
+        refusal: lineage.evidence["refusal"] as HolderGrandchildRefusal,
+        evidence: { peerPid: requester.value.peerPid, holderPid: pin.pid },
+      };
+    }
+    grandchild = lineage.value;
+  }
+  if (!sessions) return { allowed: false, refusal: "CREDENTIAL_NOT_VERIFIABLE" };
+  const verified = sessions.verifySecret(credential.sessionId, credential.sessionSecret);
+  if (!verified.allowed) return { allowed: false, refusal: "CREDENTIAL_NOT_CURRENT" };
+  if (verified.value.incarnation !== credential.sessionIncarnation) {
+    return { allowed: false, refusal: "CREDENTIAL_NOT_CURRENT" };
+  }
+  return { allowed: true, pin, grandchild };
+};
+
 /**
  * The launch channel is intentionally much smaller than MCP: it accepts one externally
  * constituted session id, returns that session's credential once, and closes.  It never
  * accepts a caller-supplied control-plane session id or writes any received value durably.
+ *
+ * O4 — at the accept, before a byte of the request, the daemon reads the kernel's peer for the connection
+ * and the start token of that pid. The id finds an entry; `admitLaunch` decides whether this connection
+ * gets it, on those accept-time facts, the kernel's peer read again, and the daemon's own pin, never on
+ * anything the request says about its sender. Then the entry must still be the one admitted with the pin
+ * admitted — not withdrawn or replaced meanwhile — and, for a driven entry, the kernel is asked a last
+ * time who the peer is: the accept-time pid, still the accept-time process by its start token, under the
+ * same two links (`confirmAdmittedGrandchild`). The entry is deleted and the reply written right after,
+ * so one entry is handed over at most once. A refusal keeps the entry and records only the refusal case.
+ *
+ * "No await between the last check and the write" is a property of this process only. The operating
+ * system runs and replaces other processes between any two of these reads and the write; none of it is
+ * atomic with respect to them. What that leaves open:
+ *
+ * - The connect→accept window, not closed. On macOS `LOCAL_PEERPID` names the last process to have used
+ *   the socket by its pid number, and `LOCAL_PEERTOKEN` resolves that number against the live process
+ *   table when asked (measured: with the connector gone, it fails with EINVAL; with its pid reused by an
+ *   unrelated process before the accept, it returns that process's audit token, pidversion included).
+ *   `LOCAL_PEERUUID` is the executable image's UUID, the same for every process of that binary, and
+ *   `LOCAL_PEERCRED` carries no pid. So if the connector exits after its connect and its pid is reused
+ *   before the daemon's accept-time read, the daemon binds the reusing process: it is admitted if that
+ *   process is itself a valid grandchild of the pinned holder, and the credential goes down the
+ *   connector's socket to whoever holds it. No AF_UNIX option identifies the connecting process instance
+ *   across pid reuse. A connector that is gone before the accept with its pid not reused is refused
+ *   (`PEER_START_UNKNOWN`).
+ * - The reads at admission and at hand-over (the kernel peer, the peer's start token, two `ps` reads of
+ *   the links) are separate reads, not one snapshot. The reply goes into the socket's kernel buffer in the
+ *   same step as the last of them (the buffer is empty: nothing else is ever written on this connection),
+ *   and whoever then reads that socket gets it. The kernel peer is the last process to have used the
+ *   socket, not every process holding it: a process holding a duplicate of the admitted peer's descriptor
+ *   — inherited from it, or passed to it by it — can read the reply. Such a duplicate exists only where the
+ *   admitted process, a child of the holder's child, shares its descriptor.
  */
 const serveSessionLaunchCredential = (
   socket: Socket,
   pending: Map<string, PendingLaunchCredential>,
-  mcpToken: string | undefined,
+  options: SessionLaunchChannelOptions,
 ): void => {
+  // At the accept: the kernel's peer for this connection, and the start token of that pid, read now.
+  const peerAtAccept = authenticateLaunchPeer(socket);
+  const accepted: AcceptedLaunchPeer = {
+    peer: peerAtAccept,
+    startToken: peerAtAccept.allowed ? defaultProcessLineageReader.startToken(peerAtAccept.value.peerPid) : null,
+  };
   let buffer = Buffer.alloc(0);
   let settled = false;
   const finish = (body: Record<string, unknown>): void => {
@@ -3856,6 +4021,20 @@ const serveSessionLaunchCredential = (
     socket.end(`${JSON.stringify(body)}\n`);
   };
   const refuse = (): void => finish({ ok: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED });
+  const refuseEntry = (
+    launch: PendingLaunchCredential,
+    refusal: LaunchRefusal,
+    stage: "admission" | "hand-over",
+    evidence: Record<string, number> = {},
+  ): void => {
+    options.audit?.record({
+      kind: SESSION_LAUNCH_CREDENTIAL_REFUSED,
+      reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED,
+      sessionId: launch.credential.sessionId,
+      evidence: { refusal, stage, driven: launch.driven, ...evidence },
+    });
+    refuse();
+  };
   const receive = (chunk: Buffer): void => {
     buffer = Buffer.concat([buffer, chunk]);
     if (buffer.length > MAX_MCP_FRAMED_REQUEST_BYTES) return refuse();
@@ -3875,6 +4054,23 @@ const serveSessionLaunchCredential = (
       pending.delete(externalSessionId);
       return refuse();
     }
+    const admitted = admitLaunch(launch, accepted, () => authenticateLaunchPeer(socket), options.sessions);
+    if (!admitted.allowed) return refuseEntry(launch, admitted.refusal, "admission", admitted.evidence);
+    if (pending.get(externalSessionId) !== launch || launch.credential.pin !== admitted.pin) {
+      return refuseEntry(launch, "ENTRY_REPLACED", "hand-over");
+    }
+    const grandchild = admitted.grandchild;
+    if (grandchild !== null) {
+      const handedTo = authenticateLaunchPeer(socket);
+      if (!handedTo.allowed) return refuseEntry(launch, "PEER_UNREADABLE", "hand-over", { peerPid: grandchild.peerPid });
+      const confirmed = confirmAdmittedGrandchild(handedTo.value.peerPid, grandchild);
+      if (!confirmed.allowed) {
+        return refuseEntry(launch, confirmed.evidence["refusal"] as HolderGrandchildRefusal, "hand-over", {
+          peerPid: handedTo.value.peerPid,
+          holderPid: grandchild.holderPid,
+        });
+      }
+    }
 
     // Consume before writing. If the peer disappears while receiving its response, retrying
     // this session is unsafe because the plaintext could already have crossed the socket.
@@ -3884,7 +4080,7 @@ const serveSessionLaunchCredential = (
       sessionId: launch.credential.sessionId,
       sessionIncarnation: launch.credential.sessionIncarnation,
       sessionSecret: launch.credential.sessionSecret,
-      ...(mcpToken === undefined ? {} : { token: mcpToken }),
+      ...(options.mcpToken === undefined ? {} : { token: options.mcpToken }),
     });
   };
   socket.on("data", receive);
@@ -5584,7 +5780,8 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
 
   let sessionLaunch: LocalSessionLaunchChannel;
   try {
-    sessionLaunch = await startSessionLaunchChannel(stateDir, { mcpToken });
+    // O4 — the registry an entry is verified against before each hand-over, and where a refusal is recorded.
+    sessionLaunch = await startSessionLaunchChannel(stateDir, { mcpToken, sessions: cp.sessions, audit: cp.audit });
   } catch (err) {
     cp.close();
     throw err;
@@ -5675,7 +5872,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       disconnect: (sessionId) => buzz.disconnect(sessionId),
     },
     readiness: { checkSession: (id) => cp.doctor.sessionReadiness(id) },
-    sessionLaunch,
+    // O4 — the lifecycle offers only an interactive spawn's credential; a driven turn's comes from the
+    // runtime driver, through the channel's own `provision`.
+    sessionLaunch: sessionLaunch.interactiveSpawns,
   });
 
   const daemon = cp.createDaemon({ stateDir, buzz });

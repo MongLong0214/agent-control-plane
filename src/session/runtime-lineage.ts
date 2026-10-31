@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 
 import { type Decision, allow, deny } from "../core/errors.ts";
-import { readProcessStartToken } from "../core/process-argv.ts";
+import { DARWIN_START_TOKEN, readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /**
@@ -179,4 +179,123 @@ export const admitRuntimeLineage = (
     current = processes.parentOf(current);
   }
   return refuse("the caller does not descend from the runtime's process");
+};
+
+/** O4 — why `admitPinnedHolderGrandchild` refused: a closed set a caller can record without any process detail. */
+export type HolderGrandchildRefusal =
+  | "LINK_UNREADABLE"
+  | "NOT_HOLDER_GRANDCHILD"
+  | "HOLDER_START_UNKNOWN"
+  | "HOLDER_PID_REUSED"
+  | "LINK_CHANGED"
+  | "PEER_START_UNKNOWN"
+  | "PEER_CHANGED";
+
+/** The native token formats `readProcessStartToken` writes; anything else is not compared with them. */
+const nativeStartFormat = (token: string): "darwin" | "linux" | null => {
+  if (DARWIN_START_TOKEN.test(token)) return "darwin";
+  if (/^linux-clk:\d+$/.test(token)) return "linux";
+  return null;
+};
+
+const refuseGrandchild = <T>(refusal: HolderGrandchildRefusal, message: string): Decision<T> =>
+  deny(ReasonCode.CONFLICT, message, { refusal });
+
+/**
+ * O4 — what an admission bound: the peer by its pid and the start token read for that pid when the
+ * daemon accepted the connection, and the two links it was found under.
+ */
+export interface AdmittedGrandchild {
+  readonly peerPid: number;
+  readonly peerStartToken: string;
+  readonly cliPid: number;
+  readonly holderPid: number;
+}
+
+/**
+ * O4 — the one process shape a driven turn's launch credential is admitted to: the holder the daemon
+ * spawned for the turn, the CLI that holder runs as its child, and the peer as that CLI's child (the
+ * relay the CLI starts as its MCP server). Exactly two parent links, nothing shallower and nothing deeper.
+ *
+ * What is identified is the holder, and the peer: the holder's pid and its live start token, read here
+ * now, must equal the pin the daemon recorded at its own spawn; the peer's live start token, read here
+ * first, must equal the one the daemon read for that pid when it accepted the connection (`peer`), so a
+ * pid that came to name another process after the accept is refused. The CLI between them is not
+ * pinned — its pid is whatever the peer's parent is, and no start token is ever read for it — so any
+ * child of the holder's child passes: the relay, a tool shell the CLI runs, anything it starts. This is
+ * same-user trust in the turn's own process tree. It does not authenticate the CLI or the relay binary.
+ *
+ * The peer's token is read, then the links, then the holder's token, then the links again; a link that
+ * moved between the two reads is refused, and so is any read that fails. Every refusal is its own
+ * statement. Nothing here writes.
+ */
+export const admitPinnedHolderGrandchild = (
+  peer: { readonly pid: number; readonly startToken: string },
+  pin: { readonly pid: number; readonly startToken: string | null },
+  processes: ProcessLineageReader = defaultProcessLineageReader,
+): Decision<AdmittedGrandchild> => {
+  const peerPid = peer.pid;
+  if (pin.startToken === null) {
+    return refuseGrandchild("HOLDER_START_UNKNOWN", "the holder's start token was not read at its spawn");
+  }
+  const pinnedFormat = nativeStartFormat(pin.startToken);
+  if (pinnedFormat === null) {
+    return refuseGrandchild("HOLDER_START_UNKNOWN", "the holder's pinned start is not a native start token");
+  }
+  const peerStartToken = processes.startToken(peerPid);
+  if (peerStartToken === null) return refuseGrandchild("PEER_START_UNKNOWN", "the peer's start token could not be read");
+  if (peerStartToken !== peer.startToken) {
+    return refuseGrandchild("PEER_CHANGED", "the peer's pid names another process than at the accept");
+  }
+  const cli = processes.parentOf(peerPid);
+  if (cli === null) return refuseGrandchild("LINK_UNREADABLE", "the peer's parent could not be read");
+  if (cli <= 1) return refuseGrandchild("NOT_HOLDER_GRANDCHILD", "the peer has no parent below init");
+  const holder = processes.parentOf(cli);
+  if (holder === null) return refuseGrandchild("LINK_UNREADABLE", "the parent of the peer's parent could not be read");
+  if (holder !== pin.pid) {
+    return refuseGrandchild("NOT_HOLDER_GRANDCHILD", "the peer is not a child of the pinned holder's child");
+  }
+  const live = processes.startToken(pin.pid);
+  if (live === null) return refuseGrandchild("HOLDER_START_UNKNOWN", "the holder's live start token could not be read");
+  if (nativeStartFormat(live) !== pinnedFormat) {
+    return refuseGrandchild("HOLDER_START_UNKNOWN", "the holder's live start token is in another format than its pin");
+  }
+  if (live !== pin.startToken) {
+    return refuseGrandchild("HOLDER_PID_REUSED", "the holder's pid now belongs to another process");
+  }
+  const cliAgain = processes.parentOf(peerPid);
+  if (cliAgain !== cli) return refuseGrandchild("LINK_CHANGED", "the peer's parent changed while it was observed");
+  const holderAgain = processes.parentOf(cli);
+  if (holderAgain !== holder) {
+    return refuseGrandchild("LINK_CHANGED", "the parent of the peer's parent changed while it was observed");
+  }
+  return allow(ReasonCode.OK, { peerPid, peerStartToken, cliPid: cli, holderPid: holder });
+};
+
+/**
+ * O4 — the hand-over's last look, for a peer pid the caller has just read from the kernel again: it
+ * must be the admitted pid, that pid's live start token must still be the one bound at the accept (the
+ * same process, not a later one on the same number), and both parent links must still be the admitted
+ * ones. Any read that fails or any difference is a refusal. Nothing here writes.
+ */
+export const confirmAdmittedGrandchild = (
+  peerPid: number,
+  admitted: AdmittedGrandchild,
+  processes: ProcessLineageReader = defaultProcessLineageReader,
+): Decision<null> => {
+  if (peerPid !== admitted.peerPid) return refuseGrandchild("PEER_CHANGED", "the kernel now names another peer");
+  const live = processes.startToken(peerPid);
+  if (live === null) return refuseGrandchild("PEER_START_UNKNOWN", "the peer's start token could not be read again");
+  if (live !== admitted.peerStartToken) {
+    return refuseGrandchild("PEER_CHANGED", "the peer's pid now belongs to another process than the one admitted");
+  }
+  const cli = processes.parentOf(peerPid);
+  if (cli === null) return refuseGrandchild("LINK_UNREADABLE", "the peer's parent could not be read again");
+  if (cli !== admitted.cliPid) return refuseGrandchild("LINK_CHANGED", "the peer's parent changed after its admission");
+  const holder = processes.parentOf(cli);
+  if (holder === null) return refuseGrandchild("LINK_UNREADABLE", "the parent of the peer's parent could not be read again");
+  if (holder !== admitted.holderPid) {
+    return refuseGrandchild("LINK_CHANGED", "the parent of the peer's parent changed after its admission");
+  }
+  return allow(ReasonCode.OK, null);
 };

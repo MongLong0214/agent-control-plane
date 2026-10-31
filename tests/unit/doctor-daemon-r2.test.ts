@@ -788,8 +788,9 @@ describe("round 2 daemon regressions", () => {
 
   it("#378: a launched, unbound replacement can acknowledge only its delivered normal handoff", async () => {
     const harness = makeHarness();
-    const launch = await startSessionLaunchChannel(tempDir("acp-session-launch-"));
-    harness.cp.cto.attach({ sessionLaunch: launch });
+    // As agentcpd composes it (O4): the registry beside the channel, and the lifecycle at its interactive-spawn door.
+    const launch = await startSessionLaunchChannel(tempDir("acp-session-launch-"), { sessions: harness.cp.sessions, audit: harness.cp.audit });
+    harness.cp.cto.attach({ sessionLaunch: launch.interactiveSpawns });
     const { projectId } = await registerFixtureProject(harness);
 
     try {
@@ -905,8 +906,9 @@ describe("round 2 daemon regressions", () => {
 
   it("#378: a pending recipient is refused when its outgoing CTO generation has moved", async () => {
     const harness = makeHarness();
-    const launch = await startSessionLaunchChannel(tempDir("acp-session-launch-stale-"));
-    harness.cp.cto.attach({ sessionLaunch: launch });
+    // As agentcpd composes it (O4): the registry beside the channel, and the lifecycle at its interactive-spawn door.
+    const launch = await startSessionLaunchChannel(tempDir("acp-session-launch-stale-"), { sessions: harness.cp.sessions, audit: harness.cp.audit });
+    harness.cp.cto.attach({ sessionLaunch: launch.interactiveSpawns });
     const { projectId } = await registerFixtureProject(harness);
 
     try {
@@ -964,8 +966,9 @@ describe("round 2 daemon regressions", () => {
 
   it("#379/#380: a draining CTO can submit an in-flight receipt and the MCP boundary requires its worker identity", async () => {
     const { harness, projectId, repositoryId, run } = await createQueuedRun();
-    const launch = await startSessionLaunchChannel(tempDir("acp-session-launch-"));
-    harness.cp.cto.attach({ sessionLaunch: launch });
+    // As agentcpd composes it (O4): the registry beside the channel, and the lifecycle at its interactive-spawn door.
+    const launch = await startSessionLaunchChannel(tempDir("acp-session-launch-"), { sessions: harness.cp.sessions, audit: harness.cp.audit });
+    harness.cp.cto.attach({ sessionLaunch: launch.interactiveSpawns });
 
     try {
       const dispatched = await harness.cp.runs.dispatch(run.runId);
