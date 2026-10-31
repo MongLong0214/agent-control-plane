@@ -7,7 +7,16 @@ import { Role, type RunState, SessionLifecycle } from "../domain/types.ts";
 import type { ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
-import { type WorkerProcessPort, osWorkerProcesses } from "./worker-turn.ts";
+import {
+  TASK_WORKER_GIT_GROUP_ENDED,
+  TASK_WORKER_GIT_GROUP_STARTED,
+  TASK_WORKER_GIT_INTENT,
+  TASK_WORKER_LAUNCH_ENDED,
+  TASK_WORKER_LAUNCH_INTENT,
+  type WorkerProcessPort,
+  launchWasAuthorised,
+  osWorkerProcesses,
+} from "./worker-turn.ts";
 
 /** One WORKER binding revoked because its run ended. */
 export const WORKER_RETIRED = "WORKER_RETIRED";
@@ -382,20 +391,22 @@ export class WorkerRetirement {
    *   applies before it does — no member of the group it led remains, and the pid is gone or now
    *   names a process with another start time; otherwise it is running or unverified;
    * - with no recorded pid, only a SUCCEEDED or FAILED receipt, which reports the worker's end, or a
-   *   runtime-managed receipt whose launch the guard never admitted, which ran nothing, has ended.
+   *   runtime-managed receipt whose records show it ran nothing (`#ranNothing`), has ended.
    *   Any other receipt without a pid is PROCESS_UNVERIFIED: nothing establishes that its worker,
    *   whoever launched it, has stopped.
    */
   #remainingTurns(sessionId: string): RemainingWorkerProcess[] {
     const rows = this.db.all<{
       execution_id: string;
+      run_id: string;
+      task_id: string;
       status: string;
       runtime_managed: number;
       worker_process_id: number | null;
       worker_process_started_at: string | null;
       worker_process_released_at: string | null;
     }>(
-      `SELECT execution_id, status, runtime_managed, worker_process_id, worker_process_started_at,
+      `SELECT execution_id, run_id, task_id, status, runtime_managed, worker_process_id, worker_process_started_at,
               worker_process_released_at
          FROM task_executions
         WHERE worker_session_id = ?
@@ -410,7 +421,7 @@ export class WorkerRetirement {
         process = row.worker_process_released_at !== null ? "GONE" : this.#turnProcess(pid, row.worker_process_started_at);
       } else if (row.status === "SUCCEEDED" || row.status === "FAILED") {
         process = "GONE";
-      } else if (row.runtime_managed === 1 && !this.#launchWasAdmitted(row.execution_id)) {
+      } else if (row.runtime_managed === 1 && this.#ranNothing(row)) {
         process = "GONE";
       } else {
         process = "PROCESS_UNVERIFIED";
@@ -425,20 +436,35 @@ export class WorkerRetirement {
   }
 
   /**
-   * Whether the managed write guard admitted a provider launch for this runtime-managed receipt —
-   * the worker runner's own test for a launch that may have run with no pid recorded
-   * (`WorkerTurnRunner.launchWasAuthorised`), read here the same way.
+   * A runtime-managed receipt with no recorded pid ran nothing only when its records show it: the guard
+   * admitted no provider launch for it (`launchWasAuthorised`, the runner's own reader), its launch
+   * intent, if one was written, has its end (`TASK_WORKER_LAUNCH_ENDED`), and every git child its task
+   * started in its run has its end (`TASK_WORKER_GIT_GROUP_ENDED`, by nonce and pgid for a group, by
+   * nonce for an intent with no group), as the runner reads them. A missing pid alone is never an end.
    */
-  #launchWasAdmitted(executionId: string): boolean {
-    return this.db.get<{ n: number }>(
-      `SELECT 1 AS n FROM audit_events
-        WHERE kind = 'MANAGED_WRITE_GUARD'
-          AND json_extract(evidence_json, '$.taskReceiptId') = ?
-          AND json_extract(evidence_json, '$.operation') = 'FILE_MUTATION'
-          AND json_extract(evidence_json, '$.allowed') = 1
-        LIMIT 1`,
-      [executionId],
-    ) !== undefined;
+  #ranNothing(row: { execution_id: string; run_id: string; task_id: string }): boolean {
+    if (launchWasAuthorised(this.db, row.execution_id)) return false;
+    const unended = this.db.get<{ n: number }>(
+      `SELECT 1 AS n FROM audit_events i
+        WHERE i.run_id = ? AND i.kind = ? AND json_extract(i.evidence_json, '$.executionId') = ?
+          AND NOT EXISTS (SELECT 1 FROM audit_events e
+                           WHERE e.run_id = i.run_id AND e.kind = ?
+                             AND json_extract(e.evidence_json, '$.executionId') = ?)
+       UNION ALL
+       SELECT 1 AS n FROM audit_events g
+        WHERE g.run_id = ? AND g.kind IN (?, ?) AND json_extract(g.evidence_json, '$.taskId') = ?
+          AND NOT EXISTS (SELECT 1 FROM audit_events e
+                           WHERE e.run_id = g.run_id AND e.kind = ?
+                             AND json_extract(e.evidence_json, '$.nonce') = json_extract(g.evidence_json, '$.nonce')
+                             AND (g.kind = ? OR json_extract(e.evidence_json, '$.pgid') = json_extract(g.evidence_json, '$.pgid')))
+       LIMIT 1`,
+      [
+        row.run_id, TASK_WORKER_LAUNCH_INTENT, row.execution_id, TASK_WORKER_LAUNCH_ENDED, row.execution_id,
+        row.run_id, TASK_WORKER_GIT_INTENT, TASK_WORKER_GIT_GROUP_STARTED, row.task_id, TASK_WORKER_GIT_GROUP_ENDED,
+        TASK_WORKER_GIT_INTENT,
+      ],
+    );
+    return unended === undefined;
   }
 
   #turnProcess(pid: number, startedAt: string | null): "GONE" | "PROCESS_RUNNING" | "PROCESS_UNVERIFIED" {
