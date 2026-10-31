@@ -511,7 +511,10 @@ describe("an off-schema bootstrap PLAN review keeps its candidate, so the offici
       binary: process.execPath,
       codexHome: sharedCodexHome(),
     });
-    f.harness.cp.review.attach({ packetReviewerScope: (provider) => provider === "gpt" ? codex.packetReviewerScope() : null });
+    // runCli is stubbed below, and the reviewer's egress with it; the gate's egress check is stubbed alike.
+    f.harness.cp.review.attach({
+      packetReviewerScope: (provider) => provider === "gpt" ? { ...codex.packetReviewerScope(), verifyReviewerEgress: async () => undefined } : null,
+    });
     const start = f.gpt.startSession.bind(f.gpt);
     const invoke = f.gpt.invoke.bind(f.gpt);
     let reviews = 0;

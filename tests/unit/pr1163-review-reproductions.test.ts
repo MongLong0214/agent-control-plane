@@ -3,9 +3,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 import { ManualClock } from "../../src/core/clock.ts";
-import { SpawnCodexRateLimitProbe } from "../../src/capacity/usage-collectors.ts";
 import { WorkerTurnRunner, type WorkerProcessPort } from "../../src/run/worker-turn.ts";
-import { CodexCliAdapter, runtimeEnvironment, __testing } from "../../src/runtime/cli-adapters.ts";
+import { CodexCliAdapter, ReviewerProfiledCodexRateLimitProbe, runtimeEnvironment, __testing } from "../../src/runtime/cli-adapters.ts";
 import { makeCore, tempDir, cleanupTempDirs } from "../helpers/fixtures.ts";
 import { seedWorkerWorld } from "../helpers/worker-turn-fixture.ts";
 
@@ -75,7 +74,7 @@ it("PR1163-R1-02: capacity, login and worker exec use the configured Codex accou
   mkdirSync(account);
   writeFileSync(join(account, "auth.json"), "configured-account-placeholder");
   const clock = new ManualClock("2026-10-20T00:00:00.000Z");
-  const capacity = vi.spyOn(SpawnCodexRateLimitProbe.prototype, "read").mockResolvedValue({ primary: { usedPercent: 5, windowDurationMins: 300, resetsAt: 1792468800 } });
+  const capacity = vi.spyOn(ReviewerProfiledCodexRateLimitProbe.prototype, "read").mockResolvedValue({ primary: { usedPercent: 5, windowDurationMins: 300, resetsAt: 1792468800 } });
   const seen: Array<{ command: string; home: string; granted: readonly string[] }> = [];
   __testing.setRunCli(async (_file, args, options) => {
     // productionRunCli passes the configured account as the explicit codexHome argument.

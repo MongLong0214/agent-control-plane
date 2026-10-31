@@ -82,8 +82,12 @@ const preferCodex = (
   before: () => Error | null = () => null,
   scopeReported: () => boolean = () => true,
 ) => {
+  // runCli is stubbed at the spawn boundary, and the reviewer's egress with it; the gate's egress check
+  // is stubbed alike, so each row reaches the refusal it is about.
   f.harness.cp.review.attach({
-    packetReviewerScope: (provider) => provider === "gpt" && scopeReported() ? codex().packetReviewerScope() : null,
+    packetReviewerScope: (provider) => provider === "gpt" && scopeReported()
+      ? { ...codex().packetReviewerScope(), verifyReviewerEgress: async () => undefined }
+      : null,
   });
   const start = f.gpt.startSession.bind(f.gpt);
   const invoke = f.gpt.invoke.bind(f.gpt);

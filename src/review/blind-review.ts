@@ -76,6 +76,7 @@ import {
 } from "../runtime/provider.ts";
 import { CODEX_REVIEWER_INPUT_MAX_BYTES, REVIEWER_TRANSPORT_SEPARATOR } from "../runtime/cli-adapters.ts";
 import type { PacketReviewerScope } from "../runtime/reviewer-codex-home.ts";
+import { ReviewerEgressError } from "../runtime/reviewer-egress.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 import {
@@ -669,8 +670,15 @@ export const REVIEWER_FALLBACK_SCOPE_UNCONFIGURED = "REVIEWER_FALLBACK_SCOPE_UNC
 /**
  * A provider's packet-reviewer scope by the shared predicate (`packetReviewerScope`), or null for a
  * provider that has none. Read from the raw adapter, which the registry hands out only wrapped.
+ *
+ * `verifyReviewerEgress`, when the adapter supplies it, checks the egress boundary that reviewer runs
+ * behind without starting the provider CLI. A scope that is not UNCONFIGURED names a shared or
+ * authenticated home, so the gate awaits it before that provider's version probe, capacity probe or
+ * reviewer spawn; a rejection refuses the review with no provider process started.
  */
-export type PacketReviewerScopePort = (provider: string) => PacketReviewerScope | null;
+export type PacketReviewerScopePort = (provider: string) => (PacketReviewerScope & {
+  readonly verifyReviewerEgress?: () => Promise<void>;
+}) | null;
 
 export class BlindReviewGate {
   readonly #pipelineCapability = Symbol("blind-review-control-plane");
@@ -1309,7 +1317,8 @@ export class BlindReviewGate {
       // Unknown registry scope is not an availability proof authorizing fallback.
       const scope = this.reviewerScope(preference.provider);
       if (!scope.allowed) return scope;
-      if (isPreferred && this.#packetScope?.(preference.provider)?.state === "UNCONFIGURED") {
+      const packetScope = this.#packetScope?.(preference.provider) ?? null;
+      if (isPreferred && packetScope?.state === "UNCONFIGURED") {
         attempts.push({ preference, reason: REVIEWER_FALLBACK_SCOPE_UNCONFIGURED });
         continue;
       }
@@ -1340,6 +1349,24 @@ export class BlindReviewGate {
           });
         }
         continue;
+      }
+      // Before the version probe, the capacity probe and the reviewer spawn: a reviewer whose home is
+      // shared or authenticated must not have its CLI started at all when its egress boundary fails.
+      if (packetScope?.verifyReviewerEgress && packetScope.state !== "UNCONFIGURED") {
+        try {
+          await packetScope.verifyReviewerEgress();
+        } catch (error) {
+          const failureCode = error instanceof ReviewerEgressError ? error.failureCode : "REVIEWER_EGRESS_UNVERIFIED";
+          attempts.push({ preference, reason: failureCode });
+          return deny(ReasonCode.ISOLATION_LOST, "reviewer egress could not be verified; no provider process was started", {
+            runId,
+            provider: preference.provider,
+            model: preference.model,
+            effort: preference.effort,
+            reason: error instanceof Error ? error.message : String(error),
+            attempts,
+          });
+        }
       }
       const health = await adapter.probeRuntime();
       // The awaited probe may invalidate scope. Stop before treating any subsequent

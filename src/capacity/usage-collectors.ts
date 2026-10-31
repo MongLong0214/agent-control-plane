@@ -823,8 +823,20 @@ export interface CodexRateLimitProbe {
   read(input: { binary: string; timeoutMs: number; codexHome: string }): Promise<unknown>;
 }
 
+/**
+ * How the app-server is started, when the caller confines it: the exact process to spawn (a
+ * `sandbox-exec` wrapping the CLI), its environment and its working directory. Absent, the CLI is
+ * spawned directly. The production Codex adapter always supplies one (`cli-adapters.ts`).
+ */
+export interface CodexAppServerLaunch {
+  file: string;
+  args: readonly string[];
+  env: NodeJS.ProcessEnv;
+  cwd?: string;
+}
+
 export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
-  async read(input: { binary: string; timeoutMs: number; codexHome: string }): Promise<unknown> {
+  async read(input: { binary: string; timeoutMs: number; codexHome: string; launch?: CodexAppServerLaunch }): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const neverStarted = (error: unknown): Error => {
         const message = error instanceof Error ? error.message : "a non-error value was thrown";
@@ -838,14 +850,22 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
       };
       let child: ReturnType<typeof spawn>;
       try {
-        child = spawn(input.binary, ["app-server", "--stdio"], {
-          stdio: ["pipe", "pipe", "pipe"],
-          detached: true,
-          // CODEX_HOME is pinned, never inherited. A daemon can be started under an environment
-          // naming a different Codex home — this machine has two — and reading the wrong one
-          // reports another account's quota while looking entirely healthy.
-          env: { ...nonInteractiveEnvironment(), CODEX_HOME: input.codexHome },
-        });
+        const launch = input.launch;
+        child = launch
+          ? spawn(launch.file, [...launch.args], {
+            stdio: ["pipe", "pipe", "pipe"],
+            detached: true,
+            env: launch.env,
+            ...(launch.cwd === undefined ? {} : { cwd: launch.cwd }),
+          })
+          : spawn(input.binary, ["app-server", "--stdio"], {
+            stdio: ["pipe", "pipe", "pipe"],
+            detached: true,
+            // CODEX_HOME is pinned, never inherited. A daemon can be started under an environment
+            // naming a different Codex home — this machine has two — and reading the wrong one
+            // reports another account's quota while looking entirely healthy.
+            env: { ...nonInteractiveEnvironment(), CODEX_HOME: input.codexHome },
+          });
       } catch (error) {
         reject(neverStarted(error));
         return;
