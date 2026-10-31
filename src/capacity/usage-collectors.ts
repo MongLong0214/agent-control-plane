@@ -823,38 +823,89 @@ export interface CodexRateLimitProbe {
   read(input: { binary: string; timeoutMs: number; codexHome: string }): Promise<unknown>;
 }
 
+/**
+ * How the app-server is started, when the caller confines it: the exact process to spawn (a
+ * `sandbox-exec` wrapping the CLI), its environment and its working directory. Absent, the CLI is
+ * spawned directly. The production Codex adapter always supplies one (`cli-adapters.ts`).
+ */
+export interface CodexAppServerLaunch {
+  file: string;
+  args: readonly string[];
+  env: NodeJS.ProcessEnv;
+  cwd?: string;
+}
+
+/**
+ * What the operating system reported about the process a read launched. It is taken from that process's
+ * own `exit` and `error` events and never from whichever stream, timer or pipe settled the read first, so a
+ * confining launcher's own refusal (its exit status, or its failure to spawn) survives any settling order.
+ *
+ * - `exited`: it ended, with this status, or with the signal that ended it (status null).
+ * - `not-spawned`: the operating system never started it (the errno).
+ * - `unconfirmed`: it was started, and the read ended before its exit was confirmed.
+ */
+export type CodexAppServerLaunchOutcome =
+  | { readonly kind: "exited"; readonly exitCode: number | null; readonly signal: NodeJS.Signals | null }
+  | { readonly kind: "not-spawned"; readonly errno: string }
+  | { readonly kind: "unconfirmed" };
+
+/** Every failed read, with the launched process's outcome attached. */
+export class CodexAppServerFailed extends Error {
+  constructor(message: string, readonly launch: CodexAppServerLaunchOutcome) {
+    super(message);
+    this.name = "CodexAppServerFailed";
+  }
+}
+
+const errnoOf = (error: unknown): string =>
+  error && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : "no errno";
+
 export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
-  async read(input: { binary: string; timeoutMs: number; codexHome: string }): Promise<unknown> {
+  async read(input: { binary: string; timeoutMs: number; codexHome: string; launch?: CodexAppServerLaunch }): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const neverStarted = (error: unknown): Error => {
         const message = error instanceof Error ? error.message : "a non-error value was thrown";
-        const code = error && typeof error === "object" && "code" in error && typeof error.code === "string"
-          ? error.code
-          : "no errno";
         return new Error(
           `codex app-server never started: the operating system could not spawn the configured CLI at ` +
-            `${input.binary} (${code}: ${message})`,
+            `${input.binary} (${errnoOf(error)}: ${message})`,
         );
+      };
+      // Recorded from the process's own events only; see `CodexAppServerLaunchOutcome`.
+      let launched: CodexAppServerLaunchOutcome | null = null;
+      const failed = (message: string): CodexAppServerFailed => {
+        const outcome: CodexAppServerLaunchOutcome = launched ?? { kind: "unconfirmed" };
+        const status = outcome.kind !== "exited" ? ""
+          : outcome.exitCode === null ? ` (ended by ${outcome.signal ?? "a signal"})` : ` (exit ${outcome.exitCode})`;
+        return new CodexAppServerFailed(`${message}${status}`, outcome);
       };
       let child: ReturnType<typeof spawn>;
       try {
-        child = spawn(input.binary, ["app-server", "--stdio"], {
-          stdio: ["pipe", "pipe", "pipe"],
-          detached: true,
-          // CODEX_HOME is pinned, never inherited. A daemon can be started under an environment
-          // naming a different Codex home — this machine has two — and reading the wrong one
-          // reports another account's quota while looking entirely healthy.
-          env: { ...nonInteractiveEnvironment(), CODEX_HOME: input.codexHome },
-        });
+        const launch = input.launch;
+        child = launch
+          ? spawn(launch.file, [...launch.args], {
+            stdio: ["pipe", "pipe", "pipe"],
+            detached: true,
+            env: launch.env,
+            ...(launch.cwd === undefined ? {} : { cwd: launch.cwd }),
+          })
+          : spawn(input.binary, ["app-server", "--stdio"], {
+            stdio: ["pipe", "pipe", "pipe"],
+            detached: true,
+            // CODEX_HOME is pinned, never inherited. A daemon can be started under an environment
+            // naming a different Codex home — this machine has two — and reading the wrong one
+            // reports another account's quota while looking entirely healthy.
+            env: { ...nonInteractiveEnvironment(), CODEX_HOME: input.codexHome },
+          });
       } catch (error) {
-        reject(neverStarted(error));
+        launched = { kind: "not-spawned", errno: errnoOf(error) };
+        reject(failed(neverStarted(error).message));
         return;
       }
       const childStdin = child.stdin;
       const childStdout = child.stdout;
       if (!childStdin || !childStdout) {
         child.kill("SIGKILL");
-        reject(new Error("codex app-server started without the required stdio pipes"));
+        reject(failed("codex app-server started without the required stdio pipes"));
         return;
       }
       let buffer = "";
@@ -874,7 +925,7 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
         returned = true;
         clearTimeout(timer);
         clearTimeout(deadline);
-        if (decided.error) reject(new Error(decided.error));
+        if (decided.error) reject(failed(decided.error));
         else resolve(decided.value);
       };
       const finish = (outcome: { value?: unknown; error?: string }): void => {
@@ -910,7 +961,7 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
         if (returned || ownedPid === null) return;
         returned = true;
         clearTimeout(timer);
-        reject(new Error(cleanupUnconfirmed("the owned codex app-server", ownedPid, decided?.error ?? "an answer was read")));
+        reject(failed(cleanupUnconfirmed("the owned codex app-server", ownedPid, decided?.error ?? "an answer was read")));
       }, input.timeoutMs);
       const send = (message: unknown): void => void childStdin.write(`${JSON.stringify(message)}\n`);
       // FIX-STDIN-SIBLINGS — before the first `send`, and for as long as the stream lives. A server
@@ -967,11 +1018,19 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
         }
       };
       childStdout.on("data", onData);
-      child.once("error", (error) => finish({ error: neverStarted(error).message }));
+      childStdout.on("error", (error: NodeJS.ErrnoException) =>
+        finish({ error: `codex app-server's output failed (${error.code ?? error.message}), so no rate-limit answer is read` }),
+      );
+      child.once("error", (error) => {
+        // No pid is a process the OS never started; with one, this is a failed signal and `exit` still decides.
+        if (child.pid === undefined) launched ??= { kind: "not-spawned", errno: errnoOf(error) };
+        finish({ error: neverStarted(error).message });
+      });
       // To notice a process that died before answering, and to confirm a settled probe's server is
       // gone before the call returns. The answer never arrives this way.
-      child.once("exit", () => {
+      child.once("exit", (code, signal) => {
         exited = true;
+        launched = { kind: "exited", exitCode: code, signal };
         finish({ error: "codex app-server exited before answering" });
         returnDecided();
       });

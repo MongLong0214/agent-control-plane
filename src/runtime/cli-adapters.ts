@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import {
   accessSync,
@@ -5,6 +6,7 @@ import {
   constants,
   existsSync,
   lstatSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   realpathSync,
@@ -38,6 +40,10 @@ import {
   ClaudeUsageCollector,
   CodexUsageCollector,
   GrokUsageCollector,
+  CodexAppServerFailed,
+  SpawnCodexRateLimitProbe,
+  type CodexAppServerLaunch,
+  type CodexRateLimitProbe,
   type UsageCollector,
 } from "../capacity/usage-collectors.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
@@ -3070,6 +3076,210 @@ export const CODEX_REVIEWER_INPUT_MAX_BYTES = Math.floor((CODEX_GPT_6_1_SOL_USAB
   CODEX_REVIEWER_OUTPUT_RESERVE_TOKENS - CODEX_REVIEWER_TOOL_SCHEMA_RESERVE_TOKENS) / 1_000) * 1_000;
 
 /**
+ * A reviewer egress lease, waited for no longer than `budgetMs`. The lease is serialized in this
+ * process, so a packet reviewer holding it makes this wait; past the budget the caller fails. The
+ * queued acquisition cannot be withdrawn, so whatever it later obtains is the caller's and is released
+ * here once it arrives. Nothing another holder acquired is touched.
+ */
+const reviewerEgressWithin = async (
+  config: ReviewerEgressConfig | undefined,
+  provider: string,
+  budgetMs: number,
+): Promise<ReviewerEgressLease> => {
+  const pending = acquireReviewerEgress(config, provider);
+  let timer: NodeJS.Timeout | undefined;
+  const spent = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), Math.max(0, budgetMs));
+  });
+  try {
+    const lease = await Promise.race([pending, spent]);
+    if (lease) return lease;
+  } finally {
+    clearTimeout(timer);
+  }
+  void pending.then((late) => late.abandon(), () => undefined);
+  throw new Error(`the reviewer egress lease did not come free within ${budgetMs}ms; another holder is using it`);
+};
+
+/**
+ * One `CodexCliAdapter.probeCapacity` call's egress-boundary refusal, if its collector met one. The collector
+ * reports a failure only as text, so the refusal is carried beside it as a fact rather than parsed back out.
+ */
+const boundaryRefusals = new AsyncLocalStorage<{ refusal: string | null }>();
+
+/** Records a profile, sandbox or proxy failure as this probe call's boundary refusal, and throws it. */
+const refuse = (error: unknown): never => {
+  const scope = boundaryRefusals.getStore();
+  if (scope && scope.refusal === null) scope.refusal = error instanceof Error ? error.message : String(error);
+  throw error;
+};
+
+/**
+ * Why a credential path cannot be protected by a write deny on that one path, or null when it can. A
+ * symbolic link resolves elsewhere and a hard link has other names, and seatbelt matches the path a write
+ * goes through. Metadata only: the file is never opened. A missing credential is protected, since the
+ * deny also refuses creating it.
+ */
+const linkedCredential = (path: string): string | null => {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? null : "cannot be inspected";
+  }
+  if (stat.isSymbolicLink()) return "is a symbolic link";
+  if (!stat.isFile()) return "is not a regular file";
+  return stat.nlink > 1 ? `has ${stat.nlink} hard links` : null;
+};
+
+/**
+ * Whether a failed app-server read under the composed profile was the confinement refusing the launch.
+ * Fail closed: it is *not* a refusal only when the process provably ran — its exit was confirmed, with a
+ * status of its own that is not the launcher's. A launcher that never spawned (EAGAIN, ENOENT, EACCES), an
+ * exit that was never confirmed, an exit by a signal (this probe's own cleanup kill, the launcher's, or
+ * anyone else's — the signal can replace a refusal status the launcher was about to report), and a failure
+ * of unknown shape are refusals; so are sandbox-exec's own statuses (65 for a profile it rejects, 71 when it
+ * cannot apply it or exec), and `env`'s 126 for an executable the profile denied when the file itself is
+ * executable, so a bad install still reads as a runtime that cannot run.
+ */
+const launchRefused = (error: unknown, executable: string): boolean => {
+  if (!(error instanceof CodexAppServerFailed) || error.launch.kind !== "exited") return true;
+  const { exitCode } = error.launch;
+  if (exitCode === null || exitCode === 65 || exitCode === 71) return true;
+  if (exitCode !== 126) return false;
+  try {
+    accessSync(executable, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * The Codex capacity probe's `app-server`, run under the packet reviewer's own composed profile.
+ *
+ * The app-server reads the authenticated Codex home a default-home reviewer runs under, so it gets the
+ * reviewer's boundary: the owner's egress profile composed with the reviewer profile generated here,
+ * through a reviewer egress lease of its own, plus one rule — the home's `auth.json` stays readable but
+ * cannot be written, truncated, renamed or unlinked. There is no unconfined fallback: no `sandbox-exec`,
+ * a missing or refused profile, a proxy that does not start or dies, or a lease that does not come free
+ * within the probe's budget is the probe's failure, which the collector reports as an ERROR reading with
+ * no buckets. The lease, packet directory and profile file are this probe's and are released on every exit.
+ *
+ * A profile, sandbox or proxy failure is also a boundary refusal, recorded for `CodexCliAdapter.probeCapacity`
+ * (`boundaryRefusals`), which then starts no `--version` beside it: a home that cannot be resolved, a linked
+ * credential, a profile sandbox-exec does not accept, a launch that failed or whose exit is unknown
+ * (`launchRefused`), and a proxy that fails. A lease that is only busy, a spent budget and an app-server that
+ * provably ran and failed are not refusals.
+ */
+export class ReviewerProfiledCodexRateLimitProbe implements CodexRateLimitProbe {
+  constructor(
+    private readonly options: { egress: ReviewerEgressConfig | undefined; provider: string; denyReadPaths: readonly string[] },
+  ) {}
+
+  async read(input: { binary: string; timeoutMs: number; codexHome: string }): Promise<unknown> {
+    const deadline = Date.now() + input.timeoutMs;
+    if (!existsSync("/usr/bin/sandbox-exec")) {
+      refuse(new Error("runtime filesystem confinement is unavailable; the Codex capacity probe does not run unconfined"));
+    }
+    // The profile is built around the resolved home; with none to resolve there is nothing to confine.
+    let home: string;
+    try {
+      home = realpathSync(input.codexHome);
+    } catch (error) {
+      return refuse(new Error(
+        `the Codex home ${input.codexHome} cannot be resolved, so the capacity probe has no home to confine: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      ));
+    }
+    const credential = join(home, "auth.json");
+    const linked = linkedCredential(credential);
+    if (linked !== null) {
+      refuse(new Error(`the Codex credential ${credential} ${linked}; its write deny names one path, so a linked credential is refused`));
+    }
+    const lease = await reviewerEgressWithin(this.options.egress, this.options.provider, input.timeoutMs)
+      .catch((error: unknown) => error instanceof ReviewerEgressError ? refuse(error) : Promise.reject(error));
+    const proxyDied = (): never =>
+      refuse(new ReviewerEgressError("REVIEWER_EGRESS_PROXY_DIED", "reviewer egress proxy died while the Codex capacity probe was running"));
+    let packetRoot: string | null = null;
+    let profileDirectory: string | null = null;
+    try {
+      let launch: CodexAppServerLaunch;
+      let native: string;
+      let generated: string;
+      let composedProfilePath: string;
+      try {
+        packetRoot = realpathSync(mkdtempSync(join(tmpdir(), "acp-codex-capacity-")));
+        profileDirectory = acpScratchDir("acp-codex-capacity-");
+        const executables = codexReviewerExecutables(input.binary);
+        native = executables.at(-1)!;
+        generated = reviewerProfile(
+          packetRoot,
+          this.options.denyReadPaths,
+          native,
+          codexCredentialPaths(home),
+          executables,
+          lease.port,
+          undefined,
+          home,
+        );
+        // Last, so it wins over the home's read/write reopening: SBPL takes the last matching rule.
+        const authDeny = `(deny file-write* (literal ${quote(credential)}))`;
+        composedProfilePath = join(profileDirectory, "codex-capacity.sb");
+        writeFileSync(composedProfilePath, `${composeReviewerProfile(lease.profileText, generated)}${authDeny}\n`, { mode: 0o600 });
+        launch = {
+          file: "/usr/bin/sandbox-exec",
+          args: reviewerSandboxArgs(generated, native, ["app-server", "--stdio"], lease, composedProfilePath),
+          env: codexReviewerEnvironment(packetRoot, home),
+          cwd: packetRoot,
+        };
+      } catch (error) {
+        return refuse(error);
+      }
+      // The reviewer's own first check: sandbox-exec must accept and apply the composed profile, through the
+      // same launcher, with the runtime it permits — before Codex is started under it.
+      const accepted = await profileAccepted(generated, packetRoot, launch.env, Math.max(1, deadline - Date.now()), lease, composedProfilePath);
+      if (!accepted.accepted) {
+        if (lease.died()) proxyDied();
+        refuse(new Error(
+          `the composed reviewer profile was not accepted by sandbox-exec (exit ${String(accepted.exitCode)}` +
+            `${accepted.timedOut ? ", timed out" : ""}): ${(accepted.stderr || accepted.stdout).trim().slice(0, 300)}`,
+        ));
+      }
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) throw new Error("the Codex capacity probe's budget was spent before its app-server could start");
+      const answer = await new SpawnCodexRateLimitProbe()
+        .read({ binary: native, timeoutMs: remainingMs, codexHome: input.codexHome, launch })
+        .catch((error: unknown) => {
+          if (lease.died()) return proxyDied();
+          if (launchRefused(error, native)) {
+            return refuse(new Error(
+              `the Codex app-server's launch under the composed reviewer profile failed: ${error instanceof Error ? error.message : String(error)}`,
+            ));
+          }
+          return Promise.reject(error);
+        });
+      if (lease.died()) proxyDied();
+      return answer;
+    } finally {
+      await lease.abandon();
+      if (packetRoot) rmSync(packetRoot, { recursive: true, force: true });
+      if (profileDirectory) rmSync(profileDirectory, { recursive: true, force: true });
+    }
+  }
+}
+
+/** The packet reviewer's scope, with the check of the egress boundary that reviewer runs behind. */
+export type CodexPacketReviewerScope = PacketReviewerScope & {
+  /**
+   * Acquires and releases a reviewer egress lease, starting no Codex process: the owner profile is
+   * present, readable and holds the contract, the proxy starts and attests the generated allowlist.
+   * Rejects with the `ReviewerEgressError` that names what failed.
+   */
+  readonly verifyReviewerEgress: () => Promise<void>;
+};
+
+/**
  * Codex CLI adapter. Preferred runtime for the blind reviewer (GPT-6.1 Sol at xhigh
  * effort, §18.1) and for mechanical worker tasks.
  */
@@ -3141,19 +3351,34 @@ export class CodexCliAdapter implements ProviderAdapter {
     // One home for this account, handed to the capacity probe explicitly so the quota it reads and
     // the identity a default-home reviewer runs under cannot drift apart.
     this.#codexHome = options.codexHome ?? defaultCodexHome();
+    // The app-server reads the account home the default-home reviewer runs under, so it runs under
+    // that reviewer's composed profile and egress, on every path that collects (daemon start, doctor,
+    // the periodic sweep, admission). No profile, no proxy: no reading.
     this.#usageCollector = options.usageCollector ?? new CodexUsageCollector({
       clock: this.#clock,
       binary: this.#binary,
       codexHome: this.#codexHome,
+      codexRateLimits: new ReviewerProfiledCodexRateLimitProbe({
+        egress: this.#reviewerEgress,
+        provider: this.provider,
+        denyReadPaths: this.#denyReadPaths,
+      }),
     });
   }
 
   /**
    * The packet reviewer's Codex home as the shared predicate reads it — the same rule the doctor's
-   * `checkPacketReviewerScope` reports, evaluated for this adapter's override and default home.
+   * `checkPacketReviewerScope` reports, evaluated for this adapter's override and default home — and
+   * the check of its egress boundary, which the review gate awaits before any Codex process.
    */
-  packetReviewerScope(): PacketReviewerScope {
-    return packetReviewerScope(this.#reviewerCodexHome, this.#codexHome);
+  packetReviewerScope(): CodexPacketReviewerScope {
+    return {
+      ...packetReviewerScope(this.#reviewerCodexHome, this.#codexHome),
+      verifyReviewerEgress: async () => {
+        const lease = await acquireReviewerEgress(this.#reviewerEgress, this.provider);
+        await lease.abandon();
+      },
+    };
   }
 
   /**
@@ -3422,12 +3647,16 @@ export class CodexCliAdapter implements ProviderAdapter {
   }
 
   private async measureRuntime(): Promise<CapacityReading["runtimeHealth"]> {
+    // `--version` needs no account, so every Codex home this adapter knows is read-denied to it; the
+    // runtime profile already denies writes outside its scratch. It cannot read or change a login.
+    const authenticatedHomes = [this.#codexHome, defaultCodexHome(), this.#reviewerCodexHome]
+      .filter((home): home is string => Boolean(home));
     return measuredRuntimeHealth(
       await runCli(this.#binary, ["--version"], {
         cwd: undefined,
         timeoutMs: RUNTIME_PROBE_TIMEOUT_MS,
         environmentAllowlist: this.#environmentAllowlist,
-        denyReadPaths: this.#denyReadPaths,
+        denyReadPaths: [...this.#denyReadPaths, ...new Set(authenticatedHomes)],
         providerCredentialDir: this.#providerCredentialDir,
       }),
     );
@@ -3471,10 +3700,14 @@ export class CodexCliAdapter implements ProviderAdapter {
   }
 
   async probeCapacity(): Promise<CapacityReading> {
-    return resolveRuntimeHealth(
-      await this.#usageCollector.collect(),
-      () => this.measureRuntime(),
-    );
+    const boundary: { refusal: string | null } = { refusal: null };
+    const reading = await boundaryRefusals.run(boundary, () => this.#usageCollector.collect());
+    // The egress boundary refused (profile, sandbox or proxy): capacity is unknown, and no Codex process
+    // runs beside the refusal — a confined `--version` answering HEALTHY would invent a normal runtime.
+    if (boundary.refusal !== null) {
+      return { ...reading, sensorHealth: "ERROR", runtimeHealth: "UNKNOWN", buckets: [], error: boundary.refusal };
+    }
+    return resolveRuntimeHealth(reading, () => this.measureRuntime());
   }
 
   /**
