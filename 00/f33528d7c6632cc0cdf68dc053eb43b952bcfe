@@ -1,0 +1,8 @@
+Limit: the in-flight replay answer holds only within one daemon process (after a restart the existing outcome-unknown reply applies), and a provider call or verification command already running when the lease is lost runs to its end; the work stops at the next step
+Record-Id: r-0e94d4f2089d
+Provenance: inherited e84b4b46e6f581616734a5bb3307810faab17747
+
+Limit: when ACP releases an attempt its reviewer and verification children are aborted through the attempt's signal; GitHub CI evidence collection has no child process to abort, so only its write is fenced, and the scripted test reviewer ignores the abort
+Record-Id: r-75941a8e169b
+Supersedes: r-0e94d4f2089d
+Provenance: inherited 3278e43dde1eff3dd2ac0ba2309f4ccc8a00d692
