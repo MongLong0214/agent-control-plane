@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server } from "node:net";
 import { join } from "node:path";
 
@@ -89,6 +89,8 @@ interface StubRecord {
   reads: Record<string, string>;
   execShell: string;
   directTcp: string;
+  /** Appends attempted on other paths (each undone when it succeeds). */
+  writes: Record<string, string>;
 }
 
 const freePort = async (): Promise<number> => new Promise((resolve, reject) => {
@@ -180,6 +182,11 @@ const authRename = outcome(() => { fs.renameSync(C.auth, C.auth + ".moved"); fs.
 const authUnlink = outcome(() => { fs.unlinkSync(C.auth); restore(); });
 const homeList = outcome(() => { fs.readdirSync(C.authHome); });
 const reads = {};
+const writes = {};
+for (const [name, path] of Object.entries(C.writes || {})) {
+  let before = null;
+  writes[name] = outcome(() => { before = fs.readFileSync(path, "utf8"); fs.appendFileSync(path, " "); fs.writeFileSync(path, before); });
+}
 for (const [name, path] of Object.entries(C.canaries)) reads[name] = outcome(() => { fs.readFileSync(path); });
 const shell = cp.spawnSync("/bin/sh", ["-c", "exit 0"]);
 const execShell = shell.error ? (shell.error.code || String(shell.error)) : shell.status === 0 ? "ALLOWED" : "status " + shell.status;
@@ -201,7 +208,7 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms || 0));
     role, argv, pid: process.pid, ppid: process.ppid,
     codexHome: process.env.CODEX_HOME || null, httpsProxy: process.env.HTTPS_PROXY || null,
     sandboxed: reads.ssh === "EPERM",
-    authRead, authAppend, authTruncate, authRename, authUnlink, homeList, reads, execShell,
+    authRead, authAppend, authTruncate, authRename, authUnlink, homeList, reads, writes, execShell,
     directTcp: await direct(),
   });
   if (role === "version") { process.stdout.write("codex-cli 0.0.0-stub\\n"); process.exit(0); }
@@ -260,15 +267,35 @@ afterEach(async () => {
 });
 
 const makeFixture = async (
-  options: { profile?: "valid" | "missing"; proxy?: "fake" | "dies"; clockIso?: string } = {},
+  options: {
+    profile?: "valid" | "missing";
+    proxy?: "fake" | "dies";
+    clockIso?: string;
+    /** Appended to an otherwise contract-valid owner profile. */
+    ownerProfileExtra?: string;
+    /** A Codex home of this test's own, so a missing home or a linked credential reaches no other test. */
+    ownHome?: { state: "present" | "missing"; credential?: "file" | "symlink-in-home" | "symlink-out-of-home" | "hardlink" };
+  } = {},
 ): Promise<Fixture> => {
   const root = realpathSync(tempDir("acp-cpr-"));
   const user = process.env["HOME"]!;
-  const home = join(user, ".codex");
-  mkdirSync(home, { recursive: true, mode: 0o700 });
+  const home = join(user, options.ownHome ? `.codex-${randomUUID().slice(0, 8)}` : ".codex");
   const auth = join(home, "auth.json");
-  writeFileSync(auth, '{"synthetic":"canary credential"}', { mode: 0o600 });
-  writeFileSync(join(home, "config.toml"), 'model = "the user\'s own"\n');
+  const writeTargets: Record<string, string> = {};
+  if (options.ownHome?.state !== "missing") {
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    writeFileSync(join(home, "config.toml"), 'model = "the user\'s own"\n');
+    const credential = options.ownHome?.credential ?? "file";
+    if (credential === "file") {
+      writeFileSync(auth, '{"synthetic":"canary credential"}', { mode: 0o600 });
+    } else {
+      const target = credential === "symlink-out-of-home" ? join(root, "outside-auth.json") : join(home, "stored-auth.json");
+      writeFileSync(target, '{"synthetic":"canary credential"}', { mode: 0o600 });
+      if (credential === "hardlink") linkSync(target, auth);
+      else symlinkSync(target, auth);
+      writeTargets["target"] = target;
+    }
+  }
   const canaries: Record<string, string> = {
     ssh: join(user, ".ssh", "id_canary"),
     gh: join(user, ".config", "gh", "hosts.yml"),
@@ -304,12 +331,14 @@ const makeFixture = async (
   const stub = join(root, "bin", "codex");
   mkdirSync(join(root, "bin"));
   writeFileSync(stub, stubSource({
-    control, auth, authHome: home, canaries, socket: socketPath, directPort, resetsAt,
+    control, auth, authHome: home, canaries, writes: writeTargets, socket: socketPath, directPort, resetsAt,
   }));
   chmodSync(stub, 0o755);
 
   const profilePath = join(root, "reviewer.sb");
-  if ((options.profile ?? "valid") === "valid") writeFileSync(profilePath, ownerProfile(port, canaries["ownerCanary"]!));
+  if ((options.profile ?? "valid") === "valid") {
+    writeFileSync(profilePath, `${ownerProfile(port, canaries["ownerCanary"]!)}${options.ownerProfileExtra ?? ""}`);
+  }
   const proxyPath = join(root, "allowlist-proxy.py");
   writeFileSync(proxyPath, (options.proxy ?? "fake") === "fake" ? FAKE_PROXY : "import sys\nsys.exit(7)\n", { mode: 0o700 });
   const egress: ReviewerEgressConfig = {
@@ -636,6 +665,106 @@ describe("W6: a refused egress boundary reads as unknown capacity on every probe
     const version = fixture.records.find((record) => record.role === "version")!;
     expect(version.sandboxed).toBe(true);
     expect(version.authRead).toBe("EPERM");
+  }, 60_000);
+});
+
+/** Every capacity reading `adapter` gives, as it gives it. */
+const recordReadings = (adapter: CodexCliAdapter): CapacityReading[] => {
+  const readings: CapacityReading[] = [];
+  const probeCapacity = adapter.probeCapacity.bind(adapter);
+  vi.spyOn(adapter, "probeCapacity").mockImplementation(async () => {
+    const reading = await probeCapacity();
+    readings.push(reading);
+    return reading;
+  });
+  return readings;
+};
+
+const settledRecords = async (fixture: Fixture): Promise<string[]> => {
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  return fixture.records.map((record) => record.role);
+};
+
+describe("W7: a composed profile sandbox-exec will not accept is a boundary refusal", () => {
+  it("an invalid form in a contract-valid owner profile: runtime UNKNOWN, no version probe, no collector", async (ctx) => {
+    requireSeatbelt(ctx);
+    const fixture = await makeFixture({ ownerProfileExtra: "\n(this-is-not-a-form)\n" });
+    const adapter = codexAdapter(fixture);
+    // The owner profile passes the contract check, so the egress pre-check alone does not catch it.
+    await expect(adapter.packetReviewerScope().verifyReviewerEgress()).resolves.toBeUndefined();
+
+    const reading = await adapter.probeCapacity();
+    expect({
+      codexCalls: await settledRecords(fixture),
+      sensorHealth: reading.sensorHealth,
+      runtimeHealth: reading.runtimeHealth,
+      refusedByTheProfile: reading.error?.includes("not accepted by sandbox-exec") ?? false,
+    }).toEqual({ codexCalls: [], sensorHealth: "ERROR", runtimeHealth: "UNKNOWN", refusedByTheProfile: true });
+    await vi.waitFor(() => expect(leaseDirectories(fixture)).toEqual([]), { timeout: 5_000, interval: 25 });
+  }, 60_000);
+});
+
+describe("W8: a linked credential is refused, so no write deny can be stepped around", () => {
+  for (const credential of ["symlink-in-home", "symlink-out-of-home", "hardlink"] as const) {
+    it(`auth.json as a ${credential}: no Codex process, runtime UNKNOWN, the target unchanged`, async (ctx) => {
+      requireSeatbelt(ctx);
+      const fixture = await makeFixture({ ownHome: { state: "present", credential } });
+      const target = credential === "symlink-out-of-home" ? join(fixture.root, "outside-auth.json") : join(fixture.home, "stored-auth.json");
+      const before = readFileSync(target, "utf8");
+
+      const reading = await codexAdapter(fixture).probeCapacity();
+      const records = await settledRecords(fixture);
+      expect({
+        codexCalls: records,
+        targetWritable: fixture.records.some((record) => record.writes["target"] === "ALLOWED"),
+        sensorHealth: reading.sensorHealth,
+        runtimeHealth: reading.runtimeHealth,
+        refusedAsLinked: /symbolic link|hard links/.test(reading.error ?? ""),
+      }).toEqual({ codexCalls: [], targetWritable: false, sensorHealth: "ERROR", runtimeHealth: "UNKNOWN", refusedAsLinked: true });
+      expect(readFileSync(target, "utf8")).toBe(before);
+    }, 60_000);
+  }
+});
+
+describe("W9: a Codex home that cannot be resolved is a boundary refusal, before or beside the egress check", () => {
+  for (const profile of ["missing", "valid"] as const) {
+    it(`a missing home with the reviewer profile ${profile}: runtime UNKNOWN and no Codex process`, async (ctx) => {
+      requireSeatbelt(ctx);
+      const fixture = await makeFixture({ profile, ownHome: { state: "missing" } });
+      const reading = await codexAdapter(fixture).probeCapacity();
+      expect({
+        codexCalls: await settledRecords(fixture),
+        sensorHealth: reading.sensorHealth,
+        runtimeHealth: reading.runtimeHealth,
+        refusedForTheHome: reading.error?.includes("cannot be resolved") ?? false,
+      }).toEqual({ codexCalls: [], sensorHealth: "ERROR", runtimeHealth: "UNKNOWN", refusedForTheHome: true });
+      expect(leaseDirectories(fixture)).toEqual([]);
+    }, 60_000);
+  }
+
+  it("a blind review with both the home and the profile missing starts no Codex process for the whole submit", async () => {
+    const harness = makeHarness({ reviewer: { preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" }, fallbacks: [] } });
+    const fixture = await makeFixture({ profile: "missing", ownHome: { state: "missing" }, clockIso: harness.clock.nowIso() });
+    const adapter = new CodexCliAdapter({
+      clock: harness.clock,
+      capacityFile: join(fixture.root, "gpt.json"),
+      binary: fixture.stub,
+      codexHome: fixture.home,
+      reviewerEgress: fixture.egress,
+    });
+    harness.cp.providers.registerForRole(adapter, Role.BLIND_REVIEWER);
+    harness.cp.review.attach({ packetReviewerScope: (provider) => (provider === "gpt" ? adapter.packetReviewerScope() : null) });
+    expect(adapter.packetReviewerScope().state).toBe("UNCONFIGURED");
+    const readings = recordReadings(adapter);
+
+    const runId = await submit(harness);
+    const unavailable = harness.cp.audit.byKind("BLIND_REVIEW_UNAVAILABLE").filter((row) => row.runId === runId).at(-1);
+    expect({ codexCalls: await settledRecords(fixture), reasonCode: unavailable?.reasonCode })
+      .toEqual({ codexCalls: [], reasonCode: ReasonCode.ISOLATION_LOST });
+    expect(readings.length).toBeGreaterThan(0);
+    for (const reading of readings) {
+      expect({ sensorHealth: reading.sensorHealth, runtimeHealth: reading.runtimeHealth }).toEqual({ sensorHealth: "ERROR", runtimeHealth: "UNKNOWN" });
+    }
   }, 60_000);
 });
 

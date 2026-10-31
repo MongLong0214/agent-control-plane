@@ -835,6 +835,17 @@ export interface CodexAppServerLaunch {
   cwd?: string;
 }
 
+/**
+ * The app-server ended before it answered, with the exit status the operating system reported (null when
+ * a signal ended it). A confining launcher's own refusal surfaces here as its exit status.
+ */
+export class CodexAppServerExited extends Error {
+  constructor(readonly exitCode: number | null) {
+    super(`codex app-server exited before answering${exitCode === null ? "" : ` (exit ${exitCode})`}`);
+    this.name = "CodexAppServerExited";
+  }
+}
+
 export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
   async read(input: { binary: string; timeoutMs: number; codexHome: string; launch?: CodexAppServerLaunch }): Promise<unknown> {
     return new Promise((resolve, reject) => {
@@ -885,7 +896,8 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
       // direct child ended and was reaped, not that its descendants did. Returning at the decision left the server running past the return. The existing
       // timeout is split, not extended: the work ends `cleanupReserveMs` before it, and a server whose
       // exit the OS has not confirmed by the timeout is a cleanup failure, never the answer.
-      let decided: { value?: unknown; error?: string } | null = null;
+      // `exitCode` is present when the server ended before answering: the status the OS reported for it.
+      let decided: { value?: unknown; error?: string; exitCode?: number | null } | null = null;
       let exited = false;
       let returned = false;
       const ownedPid = ownedProcessGroup(child.pid);
@@ -894,10 +906,10 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
         returned = true;
         clearTimeout(timer);
         clearTimeout(deadline);
-        if (decided.error) reject(new Error(decided.error));
+        if (decided.error) reject(decided.exitCode === undefined ? new Error(decided.error) : new CodexAppServerExited(decided.exitCode));
         else resolve(decided.value);
       };
-      const finish = (outcome: { value?: unknown; error?: string }): void => {
+      const finish = (outcome: { value?: unknown; error?: string; exitCode?: number | null }): void => {
         if (settled) return;
         settled = true;
         decided = outcome;
@@ -990,9 +1002,9 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
       child.once("error", (error) => finish({ error: neverStarted(error).message }));
       // To notice a process that died before answering, and to confirm a settled probe's server is
       // gone before the call returns. The answer never arrives this way.
-      child.once("exit", () => {
+      child.once("exit", (code) => {
         exited = true;
-        finish({ error: "codex app-server exited before answering" });
+        finish({ error: new CodexAppServerExited(code).message, exitCode: code });
         returnDecided();
       });
       send({ method: "initialize", id: 0, params: { clientInfo: { name: "agent-control-plane", version: "1.0.0" } } });
