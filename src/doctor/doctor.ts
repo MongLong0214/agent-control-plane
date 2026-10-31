@@ -28,6 +28,7 @@ import { Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts
 import type { GitHubKernel } from "../github/github-kernel.ts";
 import { git, isClean, tryRevParse } from "../git/git.ts";
 import { HOLDER_CLAIMED_KIND_SQL, type Outbox, sourceNeverSpentSql } from "../outbox/outbox.ts";
+import { isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
@@ -38,12 +39,39 @@ import {
 } from "../run/worker-orphan-release.ts";
 import { receiptProcessIsRunning, type TaskGraph } from "../run/task-graph.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
+import { drivenModeOf } from "../runtime/provisioned-session-runtime.ts";
 import { defaultCodexHome, inspectReviewerCodexHome, packetReviewerScope } from "../runtime/reviewer-codex-home.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import { resolveCeoBuzzIdentity } from "../session/ceo-buzz-identity.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 
 const exec = promisify(execFile);
+
+/**
+ * O4 — whether nobody holds the credential of the PRIMARY_CTO session `sessionId`, as far as that can be
+ * determined: an interactive session (no driven-spawn record) with no recorded process, no native start
+ * pin and no adopted canonical runtime, and a daemon started after it was created. Its credential was
+ * offered once, on the take-once launch channel of the daemon that spawned it, and lived only in that
+ * daemon's memory; its relay never reconnects, and nothing re-credentials or pins it.
+ */
+const primaryCtoCredentialUnrecoverable = (
+  db: Pick<Db, "get">,
+  sessions: Pick<SessionRegistry, "get" | "pinnedNativeStart">,
+  sessionId: string,
+): boolean => {
+  const session = sessions.get(sessionId);
+  if (!session || session.osPid !== null || drivenModeOf(db, sessionId) !== "NONE") return false;
+  if (sessions.pinnedNativeStart(sessionId) !== null || isAdoptedCanonicalRuntime(db, sessionId)) return false;
+  return db.get<{ restarted: number }>(
+    `SELECT 1 AS restarted FROM audit_events started
+      WHERE started.kind = 'DAEMON_STARTED'
+        AND started.event_id > COALESCE(
+              (SELECT MIN(created.event_id) FROM audit_events created
+                WHERE created.kind = 'SESSION_CREATED' AND created.session_id = ?), 0)
+      LIMIT 1`,
+    [sessionId],
+  ) !== undefined;
+};
 
 /**
  * When an unresolved turn stops being an ordinary crash artefact and becomes something nobody
@@ -728,6 +756,36 @@ export class Doctor {
           confidence: "HIGH",
           observedEvidence: { sessionId: binding.sessionId, lifecycle: session?.lifecycle ?? "missing" },
           recommendedAction: "run a recovery takeover for this project",
+        });
+      }
+      // O4 — a live-looking holder whose credential nobody holds: interactive, pinless, and a daemon has
+      // started since it was spawned. Nothing re-credentials it, so it is named with its cleanup. As above,
+      // it blocks the project's report and not the system report, the daemon's own startup gate.
+      if (
+        session &&
+        (session.lifecycle === SessionLifecycle.READY || session.lifecycle === SessionLifecycle.DRAINING) &&
+        primaryCtoCredentialUnrecoverable(this.db, this.sessions, binding.sessionId)
+      ) {
+        findings.push({
+          code: "PRIMARY_CTO_CREDENTIAL_UNRECOVERABLE",
+          // BLOCKED where it blocks (§25.5): it waits on an operator's cleanup, not on a repair of the doctor.
+          severity: "ERROR",
+          scope: `project:${project.projectId}`,
+          blocking: !systemReport,
+          confidence: "HIGH",
+          observedEvidence: {
+            sessionId: binding.sessionId,
+            roleKey: binding.roleKey,
+            bindingGeneration: binding.bindingGeneration,
+            lifecycle: session.lifecycle,
+            drivenSpawnRecord: false,
+            osPid: null,
+            nativeStartPin: null,
+          },
+          recommendedAction:
+            `${binding.roleKey} is held by a pinless interactive session whose credential lived only in the memory ` +
+            "of the daemon that spawned it; it is never delivered or rotated again. Clear the role with cto_suspend, " +
+            `then cto_resume and cto_start (a new CTO, driven), or agentctl project retire ${project.projectId} <reason>`,
         });
       }
       if (session && !session.buzzAddress) {

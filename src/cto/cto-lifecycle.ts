@@ -81,6 +81,19 @@ export interface SessionLaunchCredential {
   sessionIncarnation: string;
   externalSessionId: string;
   sessionSecret: string;
+  /**
+   * O4 — the process a driven turn's credential is for, written by the runtime driver into this very
+   * entry while the launch channel holds it, in the tick its own spawn of the CLI returned. Absent until
+   * then, and for a spawn's launch. Never reported by the session; the channel hands out only the
+   * credential.
+   */
+  pin?: SessionLaunchPin;
+}
+
+/** O4 — the daemon's own spawn of a turn's CLI: the pid it returned and the start token the daemon read from it. */
+export interface SessionLaunchPin {
+  readonly pid: number;
+  readonly startToken: string | null;
 }
 
 /**
@@ -191,11 +204,19 @@ interface SpawnRequest {
   /** Record the session as spawned for this run, with the session row (`BOOTSTRAP_CTO_SPAWN_RECORD`). */
   spawnedForRun?: string;
   /**
-   * #246 C4 — a PRIMARY_CTO for the project this bootstrap run activates, driven on the headless
-   * runtime: recorded so with the session row (`DRIVEN_PRIMARY_CTO_SPAWN_RECORD`), under this run.
+   * #246 C4 — a PRIMARY_CTO driven on the headless runtime: recorded so with the session row
+   * (`DRIVEN_PRIMARY_CTO_SPAWN_RECORD`), under the bootstrap run that activates its project, or, O4,
+   * under no run for `cto_start`, which names none.
    */
-  drivenForActivation?: string;
+  drivenPrimary?: { runId: string | null };
 }
+
+/**
+ * O4 — the run id `cto_start` (hermes-server) passes to `ensurePrimaryCto`. It names no run: a
+ * PRIMARY_CTO it spawns is driven, recorded under no run, so a daemon restart recovers it on its own
+ * session (`recoverDrivenPrimaryCto`) instead of leaving a credential nobody can deliver again.
+ */
+export const CTO_START = "cto_start";
 
 export class CtoLifecycle {
   #buzz: BuzzConnector | null = null;
@@ -242,7 +263,8 @@ export class CtoLifecycle {
    * fresh session → Buzz → doctor readiness → binding → project ACTIVE → dispatch.
    */
   async ensurePrimaryCto(projectId: string, runId: string): Promise<Decision<RoleBinding>> {
-    return this.#ensurePrimaryCto(projectId, runId, false);
+    // O4 — `cto_start` spawns driven, under no run; a dispatch's spawn stays interactive.
+    return this.#ensurePrimaryCto(projectId, runId, runId === CTO_START ? { runId: null } : null);
   }
 
   /**
@@ -274,7 +296,7 @@ export class CtoLifecycle {
         kind: run?.kind ?? null,
       });
     }
-    return this.#ensurePrimaryCto(projectId, bootstrapRunId, true, replacing);
+    return this.#ensurePrimaryCto(projectId, bootstrapRunId, { runId: bootstrapRunId }, replacing);
   }
 
   /**
@@ -318,7 +340,8 @@ export class CtoLifecycle {
   async #ensurePrimaryCto(
     projectId: string,
     runId: string,
-    driven: boolean,
+    /** Spawn driven, recorded under this run (null: none), or interactive when null. */
+    driven: { runId: string | null } | null,
     replacing?: UndeliverablePrimaryCto,
   ): Promise<Decision<RoleBinding>> {
     const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
@@ -377,7 +400,7 @@ export class CtoLifecycle {
       purpose: "primary-cto",
       runtime,
       canonicalGuard: { roleKey, runId },
-      ...(driven ? { drivenForActivation: runId, stopOnRefusal: true } : {}),
+      ...(driven ? { drivenPrimary: driven, stopOnRefusal: true } : {}),
     });
     if (!created.allowed) return created as Decision<RoleBinding>;
 
@@ -406,11 +429,11 @@ export class CtoLifecycle {
     });
     if (!bound.allowed && bound.reasonCode === ReasonCode.CANONICAL_CTO_AWAITING_RECLAIM) {
       const claimed = this.#releasedCanonicalHolder(projectId, roleKey);
-      await (driven ? this.#cleanUpDrivenSpawn(created.value, runId, "canonical role claimed during provisioning") : this.stopUnusedSession(created.value, "canonical role claimed during provisioning"));
+      await (driven ? this.#cleanUpDrivenSpawn(created.value, driven.runId, "canonical role claimed during provisioning") : this.stopUnusedSession(created.value, "canonical role claimed during provisioning"));
       return claimed ? this.#refuseAdoptedCanonical(claimed, null, null, runId) : bound;
     }
     if (!bound.allowed) {
-      if (driven) await this.#cleanUpDrivenSpawn(created.value, runId, "binding refused");
+      if (driven) await this.#cleanUpDrivenSpawn(created.value, driven.runId, "binding refused");
       else this.sessions.transition(created.value, SessionLifecycle.STOPPED, "binding refused");
       return bound;
     }
@@ -1330,8 +1353,8 @@ export class CtoLifecycle {
     if (residentProject()) return residentRefusal();
     // #246 C1b — a BOOTSTRAP_CTO runs on the real headless runtime, and is refused before anything
     // starts when there is none: readiness then has nothing that could authenticate it. #246 C4 — so
-    // does a PRIMARY_CTO a bootstrap activation asked for driven; any other PRIMARY_CTO does not.
-    const driven = role === Role.BOOTSTRAP_CTO || (role === Role.PRIMARY_CTO && request.drivenForActivation !== undefined);
+    // does a PRIMARY_CTO a bootstrap activation, or (O4) `cto_start`, asked for driven; no other does.
+    const driven = role === Role.BOOTSTRAP_CTO || (role === Role.PRIMARY_CTO && request.drivenPrimary !== undefined);
     const headless = driven ? this.#sessionRuntime : null;
     if (driven && !headless) return runtimeUnavailable(null, role);
     const adapter = this.providers.hasRoleScoped(runtime.provider)
@@ -1419,7 +1442,7 @@ export class CtoLifecycle {
           )?.next ?? 1;
           this.audit.record({
             kind: DRIVEN_PRIMARY_CTO_SPAWN_RECORD,
-            runId: request.drivenForActivation ?? null,
+            runId: request.drivenPrimary?.runId ?? null,
             projectId: scope,
             sessionId: created.sessionId,
             roleKey,
@@ -1434,8 +1457,8 @@ export class CtoLifecycle {
         // its run and the provider resource itself, and a failed stop is never left unrecorded.
         let stopped = true;
         await adapter.stopSession(handle).catch(() => { stopped = false; });
-        if (role === Role.PRIMARY_CTO && request.drivenForActivation !== undefined) {
-          this.#recordUnpersistedSpawnCleanup(request.drivenForActivation, scope, adapter.provider, handle.externalSessionId, stopped);
+        if (role === Role.PRIMARY_CTO && request.drivenPrimary !== undefined) {
+          this.#recordUnpersistedSpawnCleanup(request.drivenPrimary.runId, scope, adapter.provider, handle.externalSessionId, stopped);
         }
       }
       throw error;
@@ -1446,7 +1469,7 @@ export class CtoLifecycle {
     // #246 C4-R2 — a driven PRIMARY_CTO's refused spawn reports what its cleanup did. The handle it
     // stops is the one this attempt's own `startSession` returned, so ownership is proven by
     // construction; a stop that fails leaves the session REMAINING, never counted as cleaned up.
-    const drivenSpawn = role === Role.PRIMARY_CTO && request.drivenForActivation !== undefined;
+    const drivenSpawn = role === Role.PRIMARY_CTO && request.drivenPrimary !== undefined;
     const refuse = async <T>(reason: string, refused: Decision<T>): Promise<Decision<T>> => {
       headless?.release(session.sessionId);
       this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, reason);
@@ -1454,7 +1477,7 @@ export class CtoLifecycle {
         try {
           await adapter.stopSession(handle);
           this.sessions.transition(session.sessionId, SessionLifecycle.STOPPED, `${reason}: stopped`);
-          if (drivenSpawn) this.#recordSpawnCleanup(session.sessionId, request.drivenForActivation ?? null, "STOPPED", reason);
+          if (drivenSpawn) this.#recordSpawnCleanup(session.sessionId, request.drivenPrimary?.runId ?? null, "STOPPED", reason);
         } catch (error) {
           this.audit.record({
             kind: "CTO_UNUSED_SESSION_STOP_FAILED",
@@ -1462,7 +1485,7 @@ export class CtoLifecycle {
             sessionId: session.sessionId,
             evidence: { reason, role, error: error instanceof Error ? error.message : String(error) },
           });
-          if (drivenSpawn) this.#recordSpawnCleanup(session.sessionId, request.drivenForActivation ?? null, "REMAINING_STOP_FAILED", reason);
+          if (drivenSpawn) this.#recordSpawnCleanup(session.sessionId, request.drivenPrimary?.runId ?? null, "REMAINING_STOP_FAILED", reason);
         }
       }
       return refused;
@@ -1932,7 +1955,7 @@ export class CtoLifecycle {
    * provider stop that fails leaves the session ERROR and recorded `REMAINING_STOP_FAILED`; only a
    * stop that returned is recorded `STOPPED`.
    */
-  async #cleanUpDrivenSpawn(sessionId: string, runId: string, reason: string): Promise<void> {
+  async #cleanUpDrivenSpawn(sessionId: string, runId: string | null, reason: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     // The spawn wrote exactly one record for its session, naming its run; a second is not its own.
     const records = this.db.all<{ run_id: string | null }>(
@@ -1984,7 +2007,7 @@ export class CtoLifecycle {
    * The spawn is failing either way; if this record itself cannot be written, that is thrown rather
    * than leaving the resource untracked behind an error that never mentions it.
    */
-  #recordUnpersistedSpawnCleanup(runId: string, projectId: string, provider: string, externalSessionId: string, stopped: boolean): void {
+  #recordUnpersistedSpawnCleanup(runId: string | null, projectId: string, provider: string, externalSessionId: string, stopped: boolean): void {
     const outcome: DrivenSpawnCleanupOutcome = stopped ? "STOPPED" : "REMAINING_STOP_FAILED";
     const recorded = this.audit.record({
       kind: DRIVEN_PRIMARY_CTO_SPAWN_CLEANUP,

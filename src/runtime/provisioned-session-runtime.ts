@@ -3,6 +3,7 @@ import { MCP_MUTATION_RECOVERY } from "../core/mcp-recovery.ts";
 import { randomUUID } from "node:crypto";
 
 import { type Decision, allow, deny } from "../core/errors.ts";
+import { readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import type { AuditLog } from "../db/audit.ts";
@@ -23,6 +24,7 @@ import type {
   SessionRelayRoute,
   SessionTurnResult,
 } from "./provider.ts";
+import type { SessionTurnSpawnRequest } from "./cli-adapters.ts";
 
 /**
  * The daemon's take-once launch channel, as the runtime driver uses it: open it, offer one
@@ -755,6 +757,9 @@ export class ProvisionedSessionRuntime {
     }
     const handle = handleFor(session);
     let delivered = false;
+    // O4 — the entry this turn's credential waits in on the launch channel, kept so that the turn's own
+    // spawn can be pinned in it (`pinTurn`).
+    let launch: SessionLaunchCredential | null = null;
     if (turn.relay) {
       if (!this.#route || !this.#delivery) {
         return deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "no route to the daemon is attached for a session turn", {
@@ -771,12 +776,13 @@ export class ProvisionedSessionRuntime {
       if (!prepared.allowed) return prepared as Decision<SessionTurnResult>;
       // A credential left over from a turn that never withdrew it is not this turn's to reuse.
       this.#delivery.withdraw(handle.externalSessionId);
-      const provisioned = await this.#delivery.provision({
+      launch = {
         sessionId,
         sessionIncarnation: session.incarnation,
         externalSessionId: handle.externalSessionId,
         sessionSecret: held.sessionSecret,
-      });
+      };
+      const provisioned = await this.#delivery.provision(launch);
       if (!provisioned.allowed) return provisioned as Decision<SessionTurnResult>;
       delivered = true;
     }
@@ -813,14 +819,16 @@ export class ProvisionedSessionRuntime {
     if (turn.purpose === "work" && this.#newConversations.delete(sessionId)) conversation = "new";
     let result: SessionTurnResult;
     try {
-      result = await provider.runSessionTurn({
+      const request: SessionTurnSpawnRequest = {
         handle,
         conversation,
         prompt: text,
         timeoutMs: turn.timeoutMs,
         correlationId: `turn_${randomUUID()}`,
         relay: turn.relay ? this.#route : null,
-      });
+        ...(launch === null ? {} : { onSpawn: pinTurn(launch) }),
+      };
+      result = await provider.runSessionTurn(request);
     } catch (error) {
       result = {
         ok: false,
@@ -894,6 +902,16 @@ export class ProvisionedSessionRuntime {
     }
   }
 }
+
+/**
+ * O4 — pins a relayed turn's pending launch entry to the process the daemon itself just spawned for the
+ * turn: the pid its own spawn returned, and that process's start token, read here from the kernel and
+ * never taken from a report. Called in the spawn's own tick, so the entry names its process before the
+ * CLI can start the MCP child that asks for the credential. The session never reports either value.
+ */
+const pinTurn = (launch: SessionLaunchCredential) => (pid: number): void => {
+  launch.pin = { pid, startToken: readProcessStartToken(pid) };
+};
 
 /**
  * The provider's own conversation id is the incarnation's prefix (`CtoLifecycle.spawn` records
