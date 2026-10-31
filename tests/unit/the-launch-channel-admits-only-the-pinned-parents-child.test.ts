@@ -1,6 +1,6 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { join } from "node:path";
 
@@ -268,6 +268,53 @@ socket.once("connect", () => {
   live.push(child);
   const report = await firstLine<{ sender: number; reply: LaunchReply | null }>(child);
   return { connector: child.pid!, ...report };
+};
+
+/**
+ * A connector that is gone before the daemon accepts: this test process's event loop is held (the whole
+ * outsider runs under `spawnSync`) while the connector connects, hands its socket to a holder and exits.
+ * The holder, alone on the socket, sends the request once the daemon runs again and writes what came back
+ * to a file.
+ */
+const connectorGoneBeforeAccept = async (socketPath: string, externalSessionId: string) => {
+  const result = join(tempDir("acp-o4b-gone-"), "reply.json");
+  const holder = `
+const net = require("node:net");
+const fs = require("node:fs");
+const [result, externalSessionId] = process.argv.slice(1);
+setTimeout(() => {
+  const socket = new net.Socket({ fd: 3, readable: true, writable: true });
+  let received = ""; let done = false;
+  const report = () => { if (done) return; done = true; const line = received.trim(); fs.writeFileSync(result, JSON.stringify({ sender: process.pid, reply: line ? JSON.parse(line) : null })); process.exit(0); };
+  socket.setEncoding("utf8");
+  socket.on("data", (chunk) => { received += chunk; });
+  socket.once("close", report);
+  socket.once("error", report);
+  socket.write(JSON.stringify({ externalSessionId }) + "\\n");
+}, 500);
+`;
+  const connector = `
+const net = require("node:net");
+const { spawn } = require("node:child_process");
+const [socketPath, externalSessionId, result] = process.argv.slice(1);
+const socket = net.createConnection(socketPath);
+socket.once("connect", () => {
+  const held = spawn(process.execPath, ["-e", ${JSON.stringify(holder)}, result, externalSessionId], { stdio: ["ignore", "ignore", "ignore", socket._handle.fd], detached: true });
+  held.unref();
+  process.stdout.write(String(process.pid) + "\\n", () => process.exit(0));
+});
+`;
+  const outsider = `
+const { spawn } = require("node:child_process");
+const c = spawn(process.execPath, ["-e", ${JSON.stringify(connector)}, ...process.argv.slice(1)], { stdio: ["ignore", "pipe", "ignore"] });
+let out = ""; c.stdout.on("data", (chunk) => { out += chunk; });
+c.on("close", () => { process.stdout.write(out); process.exit(0); });
+`;
+  const ran = spawnSync(process.execPath, ["-e", outsider, socketPath, externalSessionId, result], { encoding: "utf8", timeout: 20_000 });
+  const connectorPid = Number(ran.stdout.trim());
+  await vi.waitFor(() => expect(existsSync(result)).toBe(true), { timeout: 10_000, interval: 20 });
+  const report = JSON.parse(readFileSync(result, "utf8")) as { sender: number; reply: LaunchReply | null };
+  return { connector: connectorPid, ...report };
 };
 
 const pinOf = (pid: number): SessionLaunchPin => {
@@ -611,7 +658,8 @@ describe("O4 slice B — a driven entry goes only to the pinned holder's grandch
         if (pid === first.pid) return actual;
         const reads = (seen.get(pid) ?? 0) + 1;
         seen.set(pid, reads);
-        return reads === 1 ? actual : "darwin-tv:1.000001";
+        // The reads at accept and at admission see the admitted process; the read at hand-over sees another.
+        return reads <= 2 ? actual : "darwin-tv:1.000001";
       };
       const [tokenRelay] = await first.go();
       expect(handed(tokenRelay!.reply, byToken)).toBe(false);
@@ -628,6 +676,47 @@ describe("O4 slice B — a driven entry goes only to the pinned holder's grandch
       expect(w.refusals()).toEqual(["PEER_CHANGED", "PEER_CHANGED"]);
       expect(w.h.cp.audit.byKind(REFUSED).map((event) => event.evidence["stage"])).toEqual(["hand-over", "hand-over"]);
       for (const entry of [byToken, byPid]) expect(w.launch.withdraw(entry.externalSessionId)).toBe(true);
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("W-REUSED (review o4b2): a pid reused after accept, named by every peer read, is refused against the token bound at accept", async () => {
+    const w = await world();
+    try {
+      const turn = await idleTurnTree();
+      const credential = w.credentialOf(w.session("w-reused"));
+      await w.offerDriven(credential, pinOf(turn.holder));
+      // The kernel keeps naming the dead connector's pid; after the accept-time read it belongs to a valid
+      // grandchild of the pinned holder. At accept that pid was still the connector (this process here).
+      const connectorToken = readProcessStartToken(process.pid);
+      hooks.peerAnswer = (_call, actual) => (actual ? { ...actual, peerPid: turn.leaf, effectivePid: turn.leaf } : actual);
+      hooks.tokenFor = (pid, actual) => (pid === turn.leaf && hooks.peerCalls <= 1 ? connectorToken : actual);
+      const reply = await claimFromHere(w.launch.socketPath, credential.externalSessionId);
+      expect(handed(reply, credential)).toBe(false);
+      expect(reply).toEqual({ ok: false, reasonCode: "MCP_PEER_UNAUTHENTICATED" });
+      expect(w.refusals()).toEqual(["PEER_CHANGED"]);
+      expect(w.launch.withdraw(credential.externalSessionId)).toBe(true);
+      w.auditNeverHolds(credential.sessionSecret);
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("W-GONE: a connector that is gone before the daemon accepts is refused, the entry kept and nothing written", async () => {
+    const w = await world();
+    try {
+      const turn = await idleTurnTree();
+      const credential = w.credentialOf(w.session("w-gone"));
+      await w.offerDriven(credential, pinOf(turn.holder));
+      const gone = await connectorGoneBeforeAccept(w.launch.socketPath, credential.externalSessionId);
+      expect(gone.sender).not.toBe(gone.connector);
+      expect(handed(gone.reply, credential)).toBe(false);
+      expect(gone.reply).toEqual({ ok: false, reasonCode: "MCP_PEER_UNAUTHENTICATED" });
+      // At accept the kernel still named the dead connector, whose start token could not be read.
+      expect(w.refusals()).toEqual(["PEER_START_UNKNOWN"]);
+      expect(w.launch.withdraw(credential.externalSessionId)).toBe(true);
+      w.auditNeverHolds(credential.sessionSecret);
     } finally {
       await w.close();
     }
