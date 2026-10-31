@@ -579,3 +579,87 @@ describe("a worker session's own end is not its workers' end", () => {
     expect(receiptRow(h, receipt.executionId)).toEqual(before);
   });
 });
+
+/** Whether a pid still names a process, by signal 0. */
+const pidAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+describe("retirement needs every worker session's own process shown ended, and every launch or git record ended", () => {
+  it("(m) the session stop throws, the session is ERROR and its process is alive: retirement refuses", async () => {
+    const h = makeHarness();
+    const sessionProcess = liveProcess();
+    vi.spyOn(h.scripted, "stopSession").mockRejectedValue(new Error("provider would not stop the session"));
+    const receipt = await closedRuntimeReceipt(h, "rm-stop-threw", "FAILED", (r) => {
+      launch(h, r, TASK_WORKER_LAUNCH_INTENT);
+      launch(h, r, TASK_WORKER_LAUNCH_ENDED);
+    }, { sessionPid: sessionProcess.pid! });
+    expect(h.cp.sessions.get(receipt.workerSessionId)?.lifecycle).toBe(SessionLifecycle.ERROR);
+    expect(h.cp.audit.byKind("WORKER_SESSION_STOP_FAILED").filter((entry) => entry.sessionId === receipt.workerSessionId)).toHaveLength(1);
+    const before = receiptRow(h, receipt.executionId);
+
+    expectHeld(h, receipt.projectId, await retire(h, receipt.projectId));
+    expect(pidAlive(sessionProcess.pid!)).toBe(true);
+    expect(receiptRow(h, receipt.executionId)).toEqual(before);
+  });
+
+  it("(n) a STOPPED session whose recorded process is still alive: retirement refuses", async () => {
+    const h = makeHarness();
+    const sessionProcess = liveProcess();
+    const receipt = await closedRuntimeReceipt(h, "rm-stopped-alive", "SUCCEEDED", (r) => {
+      launch(h, r, TASK_WORKER_LAUNCH_INTENT);
+      launch(h, r, TASK_WORKER_LAUNCH_ENDED);
+    }, { sessionPid: sessionProcess.pid! });
+    expect(h.cp.sessions.transition(receipt.workerSessionId, SessionLifecycle.STOPPED, "marked stopped elsewhere").allowed).toBe(true);
+
+    expectHeld(h, receipt.projectId, await retire(h, receipt.projectId));
+    expect(pidAlive(sessionProcess.pid!)).toBe(true);
+    expect(h.cp.sessions.get(receipt.workerSessionId)?.lifecycle).toBe(SessionLifecycle.STOPPED);
+  });
+
+  for (const status of ["SUCCEEDED", "FAILED"] as const) {
+    it(`(o) a CTO-opened (runtime_managed = 0) ${status} receipt with a launch intent that has no recorded end: refused`, async () => {
+      const h = makeHarness();
+      const receipt = await closedRuntimeReceipt(h, `cto-${status.toLowerCase()}-unended-launch`, status, (r) => launch(h, r, TASK_WORKER_LAUNCH_INTENT), { runtimeManaged: false });
+      const before = receiptRow(h, receipt.executionId);
+
+      expectHeld(h, receipt.projectId, await retire(h, receipt.projectId));
+      expect(receiptRow(h, receipt.executionId)).toEqual(before);
+    });
+  }
+
+  it("(p) positive control: the stop threw and left the session ERROR, then its recorded process is proven dead and its receipts all ended: retirement proceeds", async () => {
+    const h = makeHarness();
+    const sessionProcess = liveProcess();
+    vi.spyOn(h.scripted, "stopSession").mockRejectedValue(new Error("provider would not stop the session"));
+    const receipt = await closedRuntimeReceipt(h, "rm-stop-threw-then-dead", "FAILED", (r) => {
+      launch(h, r, TASK_WORKER_LAUNCH_INTENT);
+      launch(h, r, TASK_WORKER_LAUNCH_ENDED);
+    }, { sessionPid: sessionProcess.pid! });
+    expect(h.cp.sessions.get(receipt.workerSessionId)?.lifecycle).toBe(SessionLifecycle.ERROR);
+    await kill(sessionProcess);
+    expect(pidAlive(sessionProcess.pid!)).toBe(false);
+    const before = receiptRow(h, receipt.executionId);
+
+    const retired = await retire(h, receipt.projectId);
+
+    expect(retired, JSON.stringify(retired)).toMatchObject({ allowed: true, reasonCode: ReasonCode.OK, value: { projectId: receipt.projectId } });
+    expect(receiptRow(h, receipt.executionId)).toEqual(before);
+  });
+
+  it("(q) positive control: a CTO-opened (runtime_managed = 0) SUCCEEDED receipt with no launch or git record and no orphan: retirement proceeds", async () => {
+    const h = makeHarness();
+    const receipt = await closedRuntimeReceipt(h, "cto-succeeded-reported", "SUCCEEDED", () => undefined, { runtimeManaged: false });
+    const before = receiptRow(h, receipt.executionId);
+
+    const retired = await retire(h, receipt.projectId);
+
+    expect(retired, JSON.stringify(retired)).toMatchObject({ allowed: true, reasonCode: ReasonCode.OK, value: { projectId: receipt.projectId } });
+    expect(receiptRow(h, receipt.executionId)).toEqual(before);
+  });
+});

@@ -171,13 +171,18 @@ export class WorkerRetirement {
   }
 
   /**
-   * The receipts of `sessionId` that the evidence rule (`#remainingTurns`) does not show ended, whatever
-   * the session's lifecycle. A session that is ERROR or STOPPED shows only that its own process ended,
-   * never that its workers or their children did; project retirement asks this for every session its
-   * receipts name. Read only: nothing is recorded, stopped or signalled.
+   * What of `sessionId` is not shown ended, whatever its lifecycle; project retirement asks this for
+   * every worker session of the project. Two things, each by its own evidence: every receipt the
+   * session ran (`#remainingTurns`), and the session's own recorded process, which has ended only when
+   * it is probed DEAD (`#sessionProcess`); a session that recorded no process never had one. Its
+   * lifecycle (ERROR, STOPPED) or a stop that threw is evidence of neither. Read only: nothing is
+   * recorded, stopped or signalled.
    */
-  unendedTurns(sessionId: string): RemainingWorkerProcess[] {
-    return this.#remainingTurns(sessionId);
+  unended(sessionId: string): RemainingWorkerProcess[] {
+    const session = this.ports.sessions.get(sessionId);
+    const own = session ? this.#sessionProcess(session) : null;
+    const turns = this.#remainingTurns(sessionId);
+    return own === null ? turns : [...turns, own];
   }
 
   /** Resolves once every settle queued so far has finished. */
@@ -403,12 +408,12 @@ export class WorkerRetirement {
    * - a recorded pid ends only when the runner recorded it released, or by the rule the runner
    *   applies before it does — no member of the group it led remains, and the pid is gone or now
    *   names a process with another start time; otherwise it is running or unverified;
-   * - with no recorded pid, a runtime-managed receipt has ended only when its records show it ran
-   *   nothing (`#ranNothing`), whatever its status: a SUCCEEDED or FAILED written by the runner does
-   *   not show that a process it may have spawned ended. Any other receipt without a pid has ended
-   *   only when it is SUCCEEDED or FAILED, which reports the worker's end. Every other receipt without
-   *   a pid is PROCESS_UNVERIFIED: nothing establishes that its worker, whoever launched it, has
-   *   stopped.
+   * - with no recorded pid, a receipt that is runtime-managed or has any launch or git record of its
+   *   own (`#launchOrGitOnRecord`) has ended only when its records show it ran nothing (`#ranNothing`),
+   *   whatever its status: a SUCCEEDED or FAILED does not show that a process it may have spawned
+   *   ended. A receipt with neither, the CTO's reported completion, has ended only when it is
+   *   SUCCEEDED or FAILED, which reports the worker's end. Every other receipt without a pid is
+   *   PROCESS_UNVERIFIED: nothing establishes that its worker, whoever launched it, has stopped.
    */
   #remainingTurns(sessionId: string): RemainingWorkerProcess[] {
     const rows = this.db.all<{
@@ -436,7 +441,7 @@ export class WorkerRetirement {
         process = "PROCESS_UNVERIFIED";
       } else if (pid !== null) {
         process = row.worker_process_released_at !== null ? "GONE" : this.#turnProcess(pid, row.worker_process_started_at);
-      } else if (row.runtime_managed === 1) {
+      } else if (row.runtime_managed === 1 || this.#launchOrGitOnRecord(row)) {
         process = this.#ranNothing(row) ? "GONE" : "PROCESS_UNVERIFIED";
       } else if (row.status === "SUCCEEDED" || row.status === "FAILED") {
         process = "GONE";
@@ -483,6 +488,18 @@ export class WorkerRetirement {
       ],
     );
     return unended === undefined;
+  }
+
+  /** A provider launch of this receipt, or a git child of its task in its run, is on record. */
+  #launchOrGitOnRecord(row: { execution_id: string; run_id: string; task_id: string }): boolean {
+    return this.db.get<{ n: number }>(
+      `SELECT 1 AS n FROM audit_events
+        WHERE run_id = ?
+          AND ((kind = ? AND json_extract(evidence_json, '$.executionId') = ?)
+               OR (kind IN (?, ?) AND json_extract(evidence_json, '$.taskId') = ?))
+        LIMIT 1`,
+      [row.run_id, TASK_WORKER_LAUNCH_INTENT, row.execution_id, TASK_WORKER_GIT_INTENT, TASK_WORKER_GIT_GROUP_STARTED, row.task_id],
+    ) !== undefined;
   }
 
   #turnProcess(pid: number, startedAt: string | null): "GONE" | "PROCESS_RUNNING" | "PROCESS_UNVERIFIED" {
