@@ -352,8 +352,30 @@ interface ObservedPostMergeCheck {
 }
 
 /** A declared post-merge check that has not answered yet: absent, or still running. */
-const isUnansweredPostMergeCheck = (check: ObservedPostMergeCheck): boolean =>
+export const isUnansweredPostMergeCheck = (check: ObservedPostMergeCheck): boolean =>
   check.conclusion === "missing" || check.conclusion.startsWith("incomplete:");
+
+/**
+ * The post-merge checks a pinned manifest declares for one repository role: that role's workflow check
+ * names, then `postMergeCommands`, each once. Null when the manifest does not parse or does not name the
+ * role. postMergeVerify and the run-evidence export (#1189) read the declared set through this one place.
+ */
+export const declaredPostMergeCheckNames = (stored: unknown, role: string | null): string[] | null => {
+  const manifest = projectManifestSchema.safeParse(stored);
+  if (!manifest.success || !role || !manifest.data.repositories.some((repository) => repository.role === role)) return null;
+  const fromWorkflows = manifest.data.ciWorkflows
+    .filter((workflow) => workflow.repositoryRole === role)
+    .map((workflow) => workflow.checkName);
+  return [...new Set([...fromWorkflows, ...manifest.data.postMergeCommands])];
+};
+
+/**
+ * The request digest a post_merge_verify receipt carries: the merge commit and the required set it was verified
+ * against. postMergeVerify forms it, and refuses a replay whose receipt carries another; the run-evidence export
+ * (#1326) recomputes it the same way, so a receipt taken against another required set is no answer there either.
+ */
+export const postMergeVerifyRequestDigest = (mergeCommitSha: string, requiredChecks: readonly string[]): string =>
+  digestOf({ mergeCommitSha, requiredChecks });
 
 /**
  * PRD §24 — the sole writer of programmatic merges and production gates.
@@ -3412,7 +3434,7 @@ export class GitHubKernel {
     }
 
     const idempotencyKey = `post_merge_verify:${repositoryIdentity}:${mergeCommitSha}`;
-    const requestDigest = digestOf({ mergeCommitSha, requiredChecks: effective });
+    const requestDigest = postMergeVerifyRequestDigest(mergeCommitSha, effective);
     const existing = this.receipt(idempotencyKey);
     if (existing) {
       if (existing.request_digest !== requestDigest || existing.verified !== 1) {
@@ -3659,17 +3681,13 @@ export class GitHubKernel {
     try {
       const run = this.runs.get(runId);
       const stored = run?.pinnedManifestDigest ? this.projects.manifest(run.pinnedManifestDigest) : null;
-      const manifest = projectManifestSchema.safeParse(stored);
-      const role = this.repositoryRoleInRun(runId, repositoryIdentity);
-      if (!manifest.success || !role || !manifest.data.repositories.some((repository) => repository.role === role)) {
+      const declared = declaredPostMergeCheckNames(stored, this.repositoryRoleInRun(runId, repositoryIdentity));
+      if (declared === null) {
         return deny(ReasonCode.EVIDENCE_MISSING, "pinned post-merge manifest or repository role could not be resolved", {
           runId, repositoryIdentity,
         });
       }
-      const fromWorkflows = manifest.data.ciWorkflows
-        .filter((workflow) => workflow.repositoryRole === role)
-        .map((workflow) => workflow.checkName);
-      return allow(ReasonCode.OK, [...new Set([...fromWorkflows, ...manifest.data.postMergeCommands])]);
+      return allow(ReasonCode.OK, declared);
     } catch {
       return deny(ReasonCode.EVIDENCE_MISSING, "pinned post-merge manifest could not be read or parsed", {
         runId, repositoryIdentity,
