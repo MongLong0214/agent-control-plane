@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { homedir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
@@ -8,6 +8,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import {
+  __testing as sandboxTesting,
   runSandboxed,
   SANDBOX_CACHE_HOME_PATHS,
   SANDBOX_SECRET_PATHS,
@@ -15,6 +16,8 @@ import {
 } from "../../src/verify/sandbox.ts";
 import { cleanupTempDirs, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { requireSeatbelt } from "../helpers/seatbelt.ts";
+import { stableFixtureLink } from "../helpers/stable-fixture-executable.ts";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 
 /**
  * Owner directive 2026-10-31: the verification sandbox runs any language, reads the filesystem and
@@ -371,5 +374,127 @@ describe("the one guard that stays: secret paths, credential environment and age
     // GIT_CONFIG_KEY_<n> names a git setting the sandbox pins, not a key.
     expect(Object.keys(seen).filter((name) => /TOKEN|SECRET|_KEY|PASSWORD|AUTH/.test(name) && !/^GIT_CONFIG_KEY_\d+$/.test(name))).toEqual([]);
     expect(seen["HOME"]).toBe(home);
+  });
+});
+
+/** Runs `operation` with `values` set in the daemon's environment, then restores it. */
+const withDaemonEnv = async <T>(values: Record<string, string>, operation: () => Promise<T>): Promise<T> => {
+  const previous = Object.fromEntries(Object.keys(values).map((name) => [name, process.env[name]]));
+  Object.assign(process.env, values);
+  try {
+    return await operation();
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+};
+
+/** The profile the sandbox would apply for a worktree, under the daemon environment in force now. */
+const profileText = (): string =>
+  sandboxTesting.seatbeltProfile(tempDir("acp-open-sandbox-profile-"), tempDir("acp-open-sandbox-profile-scratch-"), []);
+
+describe("review P1s: a symlinked cache and the daemon's own agent sockets", () => {
+  it("grants no write through a cache entry that is a symlink out of HOME (P1-1)", async (context) => {
+    requireSeatbelt(context);
+    const tag = randomUUID().slice(0, 8);
+    const symlinkedHome = join(home, `symlinked-home-${tag}`);
+    const unrelated = `/private/tmp/acp-unrelated-project-${tag}`;
+    scratchDirs.push(unrelated);
+    mkdirSync(symlinkedHome, { recursive: true });
+    mkdirSync(unrelated, { recursive: true });
+    symlinkSync(unrelated, join(symlinkedHome, ".npm"));
+    const { outcome, result } = await withDaemonEnv({ HOME: symlinkedHome }, () => nodeScript(`
+      const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
+      const attempt = (target) => { try { fs.writeFileSync(target, 'planted'); return 'WRITTEN'; } catch (error) { return error.code; } };
+      console.log(JSON.stringify({
+        throughLink: attempt(path.join(os.homedir(), '.npm', 'planted-through-link')),
+        direct: attempt(${JSON.stringify(join(unrelated, "planted-direct"))}),
+      }));
+    `));
+    expect(outcome, described(outcome)).toMatchObject({ status: "PASS" });
+    expect(result).toEqual({ throughLink: "EPERM", direct: "EPERM" });
+    expect(existsSync(join(unrelated, "planted-through-link"))).toBe(false);
+    expect(existsSync(join(unrelated, "planted-direct"))).toBe(false);
+    const profile = await withDaemonEnv({ HOME: symlinkedHome }, async () => profileText());
+    expect(profile).not.toContain(unrelated);
+  });
+
+  it("refuses a connection to the daemon's own SSH, GPG and Docker agent sockets wherever they live (P1-2)", async (context) => {
+    requireSeatbelt(context);
+    const tag = randomUUID().slice(0, 8);
+    const sshAgent = `/private/tmp/custom-agent-${tag}.sock`;
+    const perAgentDir = `/private/tmp/ssh-acp${tag}`;
+    const gnupgHome = `/private/tmp/acp-gnupg-${tag}`;
+    const docker = `/private/tmp/acp-docker-${tag}.sock`;
+    const control = `/private/tmp/acp-ctl2-${tag}.sock`;
+    scratchDirs.push(sshAgent, perAgentDir, gnupgHome, docker, control);
+    const sockets = {
+      SSH_AUTH_SOCK: sshAgent,
+      "SSH_AUTH_SOCK, per-agent directory": join(perAgentDir, "agent.4242"),
+      "sibling in the per-agent directory": join(perAgentDir, "agent.4243"),
+      "GNUPGHOME agent": join(gnupgHome, "S.gpg-agent"),
+      DOCKER_HOST: docker,
+      control,
+    };
+    for (const path of Object.values(sockets)) await listen(path);
+    const daemonEnv = { SSH_AUTH_SOCK: sshAgent, GNUPGHOME: gnupgHome, DOCKER_HOST: `unix://${docker}` };
+    const connect = (pointer: Record<string, string>) => withDaemonEnv({ ...daemonEnv, ...pointer }, () => nodeScript(`
+      const net = require('node:net');
+      const connect = (path) => new Promise((resolve) => {
+        const client = net.connect({ path });
+        let data = '';
+        client.on('data', (chunk) => { data += chunk; });
+        client.on('error', (error) => resolve(error.code));
+        client.on('end', () => resolve(data.trim()));
+      });
+      (async () => {
+        const results = { pointer: process.env.SSH_AUTH_SOCK ?? null };
+        for (const [label, path] of Object.entries(${JSON.stringify(sockets)})) results[label] = await connect(path);
+        console.log(JSON.stringify(results));
+      })();
+    `));
+    const first = await connect({});
+    expect(first.outcome, described(first.outcome)).toMatchObject({ status: "PASS" });
+    expect(first.result).toMatchObject({ pointer: null, SSH_AUTH_SOCK: "EPERM", "GNUPGHOME agent": "EPERM", DOCKER_HOST: "EPERM", control: "agent-answered" });
+    const second = await connect({ SSH_AUTH_SOCK: sockets["SSH_AUTH_SOCK, per-agent directory"] });
+    expect(second.outcome, described(second.outcome)).toMatchObject({ status: "PASS" });
+    expect(second.result).toMatchObject({
+      pointer: null,
+      "SSH_AUTH_SOCK, per-agent directory": "EPERM",
+      "sibling in the per-agent directory": "EPERM",
+      control: "agent-answered",
+    });
+    const profile = await withDaemonEnv(daemonEnv, async () => profileText());
+    expect(profile).toContain(`(deny network-outbound (remote unix-socket (subpath "${sshAgent}")))`);
+    expect(profile).toContain(`(deny network-outbound (remote unix-socket (subpath "${docker}")))`);
+    expect(profile).toContain(`(deny network-outbound (remote unix-socket (subpath "${gnupgHome}")))`);
+    expect(profile).not.toContain(`(subpath "/private/tmp")`);
+  });
+});
+
+describe("the supervisor never runs through the python3 xcrun stub (CI, 27518d67)", () => {
+  // `/usr/bin/python3` is an xcrun stub. On a cold xcrun cache it writes `xcrun_db` in the per-user
+  // temp directory, which the profile refuses (9efc1040's did too); on the CI runner the stub then
+  // ran no supervisor: ERROR, empty stdout, "couldn't create cache file". A cold cache cannot be
+  // made here without touching the user's own, so this proves the cause is gone instead: the
+  // supervisor is the python3 of the active developer directory, never the stub.
+  it("launches the supervisor as the developer directory's python3, not the xcrun stub", async (context) => {
+    requireSeatbelt(context);
+    const located = boundedSpawnSync("/usr/bin/xcrun", ["--find", "python3"], { encoding: "utf8" });
+    if (located.status !== 0) context.skip("xcrun cannot locate python3 on this host");
+    const real = String(located.stdout).trim();
+    const developerDir = tempDir("acp-developer-dir-");
+    mkdirSync(join(developerDir, "usr", "bin"), { recursive: true });
+    stableFixtureLink(join(developerDir, "usr", "bin", "python3"), `#!/bin/sh\necho ACP_SUPERVISOR_FROM_DEVELOPER_DIR >&2\nexec ${JSON.stringify(real)} "$@"\n`);
+    const repository = makeRepo();
+    const outcome = await withDaemonEnv({ DEVELOPER_DIR: developerDir }, () => runSandboxed({
+      command: parseVerificationCommand({ id: "launcher", argv: ["env", "NAME=VALUE", "sh", "-c", "printf pwned"], timeoutSeconds: 30 }),
+      worktreePath: repository,
+    }));
+    expect(outcome, described(outcome)).toMatchObject({ status: "PASS", stdout: "pwned" });
+    expect(outcome.stderr).toContain("ACP_SUPERVISOR_FROM_DEVELOPER_DIR");
+    expect(outcome.stderr).not.toContain("xcrun_db");
   });
 });

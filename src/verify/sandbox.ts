@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { accessSync, constants as fsConstants, existsSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
-import { constants as osConstants, homedir } from "node:os";
+import { constants as osConstants, homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
 import { promisify } from "node:util";
@@ -692,6 +692,33 @@ const xcrunFind: DeveloperToolFinder = async (name) => {
 
 let findDeveloperTool: DeveloperToolFinder = xcrunFind;
 
+/** Where `xcode-select` records the active developer directory, which the xcrun stubs read. */
+const XCODE_SELECT_LINK = "/var/db/xcode_select_link";
+
+/**
+ * The python3 the supervisor (`RESOURCE_WRAPPER_PROGRAM`) runs as. `RESOURCE_WRAPPER` is an xcrun stub
+ * too: on a cold xcrun cache it writes `xcrun_db` in the per-user temp directory, which the profile
+ * refuses — as 9efc1040's did, which granted writes to the worktree, scratch and /dev only. Locally,
+ * under the Command Line Tools, that is a warning. Measured on the CI runner (27518d67): the stub
+ * reported "couldn't create cache file" and ran no supervisor, so the command was ERROR with empty
+ * stdout. So the supervisor is the interpreter the stub would run, found as the stub finds it —
+ * DEVELOPER_DIR, else xcode-select's link — and nothing in the per-user temp directory is opened.
+ * It is read from the filesystem rather than asked of xcrun, so nothing is awaited before the
+ * supervisor spawns. Where no developer directory holds python3, the stub runs as before.
+ */
+const resourceWrapper = (): string => {
+  for (const developerDir of [process.env["DEVELOPER_DIR"], realPathOf(XCODE_SELECT_LINK)]) {
+    if (!developerDir || !isAbsolute(developerDir)) continue;
+    for (const python3 of [
+      join(developerDir, "usr", "bin", "python3"),
+      join(developerDir, "Contents", "Developer", "usr", "bin", "python3"),
+    ]) {
+      if (executableFileAt(python3)) return python3;
+    }
+  }
+  return RESOURCE_WRAPPER;
+};
+
 const executableFileAt = (path: string): boolean => {
   try {
     if (!statSync(path).isFile()) return false;
@@ -822,6 +849,9 @@ export const __testing = Object.freeze({
       childListReader = previous;
     }
   },
+  /** The profile `runSandboxed` would apply for these roots, under the daemon environment in force now. */
+  seatbeltProfile: (worktreePath: string, scratch: string, denyReadPaths: readonly string[]): string =>
+    seatbeltProfile(realpathSync(worktreePath), realpathSync(scratch), denyReadPaths),
   /** Stand in for `xcrun --find`, to place the developer tool where another host would have it. */
   withDeveloperToolFinder: async <T>(finder: DeveloperToolFinder, operation: () => Promise<T>): Promise<T> => {
     const previous = findDeveloperTool;
@@ -969,7 +999,8 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     );
   }
   const env = buildSandboxEnvironment(command, scratch, request.env, targets.worktree);
-  if (!existsSync(RESOURCE_WRAPPER)) {
+  const wrapper = resourceWrapper();
+  if (!existsSync(wrapper)) {
     rmSync(scratch, { recursive: true, force: true });
     return refused(
       command,
@@ -1004,7 +1035,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   const argv = [
     "-p",
     seatbeltProfile(targets.worktree, realpathSync(scratch), request.denyReadPaths ?? []),
-    RESOURCE_WRAPPER,
+    wrapper,
     ...resourceArgs,
   ];
 
@@ -1599,7 +1630,8 @@ const KEYCHAIN_SERVICES = ["com.apple.SecurityServer", "com.apple.securityd.xpc"
 
 /**
  * Every secret path as an absolute path seatbelt can match: `SANDBOX_SECRET_PATHS` under each home
- * the daemon names (`homedir()` and HOME), then the caller's own.
+ * the daemon names (`homedir()` and HOME), the agent sockets the daemon itself points at
+ * (`daemonAgentSockets`), then the caller's own.
  */
 export const sensitiveReadPaths = (extra: readonly string[]): string[] => {
   const homes = [...new Set([homedir(), process.env["HOME"]].filter((home): home is string => Boolean(home)))];
@@ -1607,21 +1639,98 @@ export const sensitiveReadPaths = (extra: readonly string[]): string[] => {
     entry.startsWith("~/") ? homes.map((home) => join(home, entry.slice(2))) : [entry]);
   // seatbelt matches resolved paths, so an unresolved symlinked path (a temp dir under
   // /var/folders, say) would silently match nothing and the deny would be a no-op.
-  return [...new Set([...named, ...extra].filter(Boolean).map(resolveIfPossible))];
+  return [...new Set([...named, ...daemonAgentSockets(), ...extra].filter(Boolean).map(resolveIfPossible))];
 };
 
-/** The caches as absolute paths under the daemon's HOME, and the directories above them that may be created. */
+/** A bound, not a measurement: `gpgconf --list-dirs` reads its configuration and answers at once. */
+const GPGCONF_TIMEOUT_MS = 2_000;
+const gpgDirectories = new Map<string, readonly string[]>();
+
+/**
+ * gpg's agent sockets and home as `gpgconf` names them for the daemon's environment (GNUPGHOME
+ * included), and GNUPGHOME itself. Empty where gpg is not installed or does not answer in time.
+ */
+const gpgAgentPaths = (): readonly string[] => {
+  const key = [process.env["HOME"], process.env["GNUPGHOME"], process.env["PATH"]].join("\u0000");
+  const known = gpgDirectories.get(key);
+  if (known) return known;
+  const paths = process.env["GNUPGHOME"] ? [process.env["GNUPGHOME"]] : [];
+  try {
+    const listing = execFileSync("gpgconf", ["--list-dirs"], {
+      encoding: "utf8",
+      timeout: GPGCONF_TIMEOUT_MS,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    for (const line of listing.split("\n")) {
+      const [name, value] = [line.slice(0, line.indexOf(":")), line.slice(line.indexOf(":") + 1)];
+      if (!/^(agent(-ssh|-extra|-browser)?-socket|homedir|socketdir)$/.test(name)) continue;
+      const path = value.replace(/%([0-9A-Fa-f]{2})/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+      if (isAbsolute(path)) paths.push(path);
+    }
+  } catch {
+    // No gpgconf, or no answer: the named ~/.gnupg and GNUPGHOME are what is denied.
+  }
+  gpgDirectories.set(key, paths);
+  return paths;
+};
+
+/**
+ * The agent sockets the daemon itself points at, wherever they live: SSH_AUTH_SOCK, GPG_AGENT_INFO
+ * (`<socket>:<pid>:1`), and DOCKER_HOST and CONTAINER_HOST when they name a unix socket. The command
+ * never receives these pointers, but it can find a socket without them, so each is denied by path.
+ * Read from the daemon's environment each time a profile is built.
+ */
+const daemonAgentSocketPointers = (): string[] => {
+  const unixHost = (value: string | undefined): string | undefined =>
+    value?.startsWith("unix://") ? value.slice("unix://".length) : undefined;
+  return [
+    process.env["SSH_AUTH_SOCK"],
+    process.env["GPG_AGENT_INFO"]?.split(":")[0],
+    unixHost(process.env["DOCKER_HOST"]),
+    unixHost(process.env["CONTAINER_HOST"]),
+  ].filter((path): path is string => path !== undefined && isAbsolute(path));
+};
+
+const daemonAgentSockets = (): string[] => [...daemonAgentSocketPointers(), ...gpgAgentPaths()];
+
+/** Directories many processes share. An agent socket in one is denied by itself, never its directory. */
+const sharedDirectories = (): Set<string> => new Set(
+  ["/", "/tmp", "/var/tmp", "/var/run", tmpdir(), homedir()].map(resolveIfPossible),
+);
+
+/**
+ * The directory of each socket the daemon points at, when it is the agent's own (OpenSSH's
+ * `/tmp/ssh-XXXX/agent.<pid>`): no unix socket in it may be reached. A shared directory, or one that
+ * holds the worktree or scratch, is left alone.
+ */
+const perAgentDirectories = (worktreePath: string, scratch: string): string[] => {
+  const shared = sharedDirectories();
+  return [...new Set(daemonAgentSocketPointers().map((socket) => dirname(resolveIfPossible(socket))))]
+    .filter((dir) => !shared.has(dir) && !isWithin(dir, worktreePath) && !isWithin(dir, scratch));
+};
+
+/**
+ * The caches as absolute paths under the daemon's HOME, and the directories above them that may be
+ * created. A cache is granted at its resolved location only when that location is still inside a
+ * cache's own place under the real HOME: a cache entry that is a symlink to anywhere else (HOME/.npm
+ * pointing at another project) gets no grant at all, rather than a grant at its destination or at
+ * the unresolved path. A parent is granted only where nothing on its path is a link.
+ */
 const sandboxCachePaths = (): { caches: string[]; parents: string[] } => {
   const home = resolveIfPossible(homedir());
-  const caches = SANDBOX_CACHE_HOME_PATHS.map((entry) => resolveIfPossible(join(home, entry)));
+  const roots = SANDBOX_CACHE_HOME_PATHS.map((entry) => join(home, entry));
+  const caches = roots
+    .map(resolveIfPossible)
+    .filter((resolved) => roots.some((root) => isWithin(root, resolved)));
   const parents = new Set<string>();
   for (const entry of SANDBOX_CACHE_HOME_PATHS) {
     const segments = entry.split("/");
     for (let depth = 1; depth < segments.length; depth += 1) {
-      parents.add(resolveIfPossible(join(home, ...segments.slice(0, depth))));
+      const parent = join(home, ...segments.slice(0, depth));
+      if (resolveIfPossible(parent) === parent) parents.add(parent);
     }
   }
-  return { caches, parents: [...parents] };
+  return { caches: [...new Set(caches)], parents: [...parents] };
 };
 
 /**
@@ -1652,7 +1761,8 @@ const resolveIfPossible = (path: string): string => {
  *   carved back out, since production lays them under the denied state root;
  * - writes are denied except to the worktree, the scratch, `/dev` and the named caches, and denied
  *   again inside every secret path, the worktree and scratch carved out the same way;
- * - no unix-socket connection below a secret path or to the launchd SSH agent listener, the worktree
+ * - no unix-socket connection below a secret path, to an agent socket the daemon points at or the
+ *   agent's own directory (`daemonAgentSockets`), or to the launchd SSH agent listener, the worktree
  *   and scratch carved out so a command's own IPC works;
  * - no lookup of the keychain services.
  * SBPL takes the last matching rule, which is what the ordering below relies on.
@@ -1700,6 +1810,8 @@ const seatbeltProfile = (
     "(allow file-write* (subpath \"/dev\"))",
     "(allow file-write-data (literal \"/dev/null\"))",
     ...secrets.map((path) => `(deny network-outbound (remote unix-socket (subpath ${quote(path)})))`),
+    ...perAgentDirectories(worktreePath, scratch)
+      .map((dir) => `(deny network-outbound (remote unix-socket (subpath ${quote(dir)})))`),
     `(deny network-outbound (remote unix-socket (path-regex ${LAUNCHD_AGENT_LISTENERS})))`,
     `(allow network-outbound (remote unix-socket (subpath ${quote(worktreePath)})))`,
     `(allow network-outbound (remote unix-socket (subpath ${quote(scratch)})))`,
