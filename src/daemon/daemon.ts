@@ -355,8 +355,8 @@ export const OPERATOR_METHOD = {
   ROLE_ATTACHMENT_REVOKE: "roleAttachment.revoke",
   /**
    * The parked daemon's recovery for CTO_BINDING_POINTS_AT_DEAD_SESSION: release a PRIMARY_CTO
-   * binding whose session's process is provably gone, under an owner approval this call itself
-   * admits. It mints no session and no generation — see `dead-binding-recovery.ts` for why the
+   * binding — or the CEO binding, the door's one other role — whose session's process is provably
+   * gone. It mints no session and no generation — see `dead-binding-recovery.ts` for why the
    * spawning `CtoLifecycle.recoveryTakeover` is deliberately not what a parked daemon serves.
    */
   BINDING_RECOVER_DEAD: "binding.recoverDead",
@@ -1225,7 +1225,8 @@ export class Daemon {
   }
 
   /**
-   * Releases a canonical PRIMARY_CTO binding whose session's process is provably gone.
+   * Releases a canonical PRIMARY_CTO binding, or the CEO binding, whose session's process is
+   * provably gone.
    *
    * No owner-approval envelope is minted, admitted or consumed here. This method used to build
    * one and put it through `admitCliOwnerApproval`, and the reason it had to build its own rather

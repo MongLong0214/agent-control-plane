@@ -445,7 +445,14 @@ describe("round 2 daemon regressions", () => {
       expect(harness.cp.sessions.require(sessionId).lifecycle).toBe(SessionLifecycle.ERROR);
       if (reference === "active CEO") expect(harness.cp.bindings.active("CEO")?.sessionId).toBe(sessionId);
       else expect(harness.cp.runs.activeRunsOwnedBy(sessionId).map((owned) => owned.runId)).toContain(run.runId);
-      expect((await harness.cp.doctor.run("system")).findings).toContainEqual(expected);
+      if (reference === "active CEO") {
+        // A settled CEO is the operator door's other role (`binding recover-dead-ceo`), so the
+        // system report names it as a non-blocking ERROR; its own session report still blocks.
+        expect((await harness.cp.doctor.run("system")).findings).toContainEqual(expect.objectContaining({
+          code: "SESSION_PROCESS_MISSING", scope: `session:${sessionId}`, severity: "ERROR", blocking: false,
+        }));
+        expect((await harness.cp.doctor.run("session", sessionId)).findings).toContainEqual(expected);
+      } else expect((await harness.cp.doctor.run("system")).findings).toContainEqual(expected);
     },
   );
 

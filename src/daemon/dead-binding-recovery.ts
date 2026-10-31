@@ -8,12 +8,16 @@ import { Role, roleKeyFor } from "../domain/types.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 
-/**
- * What the recovery releases. Deliberately one role and not a parameter with a default: this
- * door exists for the canonical CTO binding that locks a restart out, and a caller naming
- * anything else is answered with a refusal rather than with a wider capability.
- */
+/** The project-scoped role this door recovers: one project's canonical CTO. */
 export const DEAD_BINDING_RECOVERY_ROLE = Role.PRIMARY_CTO;
+
+/**
+ * Every role this door recovers, written out rather than derived, and never "any role": a caller
+ * naming anything else is answered with a refusal rather than with a wider capability. Both
+ * bindings lock a restart out when their process dies with the daemon — the canonical CTO of a
+ * project, and the CEO, which has no project. Each is released only on the same proof.
+ */
+export const DEAD_BINDING_RECOVERY_ROLES: readonly Role[] = [DEAD_BINDING_RECOVERY_ROLE, Role.CEO];
 
 /**
  * A three-valued answer to "is the process behind this session still running".
@@ -117,7 +121,8 @@ export const probeSessionLiveness = (
 
 /** Everything the recovery names, all required, none defaulted. */
 export interface DeadBindingRecoveryRequest {
-  projectId: string;
+  /** The canonical CTO's project; null, and only null, for the CEO, which has none. */
+  projectId: string | null;
   role: string;
   sessionId: string;
   sessionIncarnation: string;
@@ -133,7 +138,8 @@ const isNonEmptyString = (value: unknown): value is string =>
  * Every field here names the target: which project, which session, which incarnation, which
  * generation. A default on any of them would let a caller who named nothing release whatever
  * happened to hold the role, which is the opposite of what this door is for — so an omitted or
- * malformed field is a refusal rather than a wildcard.
+ * malformed field is a refusal rather than a wildcard. The CEO's project is named too: an explicit
+ * null, so an omitted project is refused for the CEO exactly as for the CTO.
  */
 export const parseDeadBindingRecoveryRequest = (
   params: Record<string, unknown>,
@@ -144,7 +150,7 @@ export const parseDeadBindingRecoveryRequest = (
   const sessionIncarnation = params["sessionIncarnation"];
   const expectedBindingGeneration = params["expectedBindingGeneration"];
   if (
-    !isNonEmptyString(projectId) ||
+    !(role === Role.CEO ? projectId === null : isNonEmptyString(projectId)) ||
     !isNonEmptyString(role) ||
     !isNonEmptyString(sessionId) ||
     !isNonEmptyString(sessionIncarnation) ||
@@ -158,7 +164,7 @@ export const parseDeadBindingRecoveryRequest = (
     );
   }
   return allow(ReasonCode.OK, {
-    projectId,
+    projectId: projectId as string | null,
     role,
     sessionId,
     sessionIncarnation,
@@ -194,7 +200,8 @@ export interface DeadBindingRecoveryDeps {
 }
 
 export interface DeadBindingRecoveryReceipt {
-  projectId: string;
+  projectId: string | null;
+  /** Names the role released: `CEO`, or `PRIMARY_CTO:<project>`. */
   roleKey: string;
   assignmentId: string;
   sessionId: string;
@@ -208,7 +215,14 @@ export interface DeadBindingRecoveryReceipt {
 }
 
 /**
- * Releases a PRIMARY_CTO binding whose session's process is provably gone, and nothing else.
+ * Releases a PRIMARY_CTO or CEO binding whose session's process is provably gone, and nothing
+ * else.
+ *
+ * The CEO is the second entry of `DEAD_BINDING_RECOVERY_ROLES`, on the identical proof: a Hermes
+ * CEO that died with the daemon left its binding ACTIVE, and since no CEO bootstrap or adoption
+ * replaces an active binding, nothing could clear it. Released here, the same actor re-attaches at
+ * the next generation through its own `restoreCeo` doors (`agentctl adopt hermes` or
+ * `agentctl bootstrap hermes`); this door mints no actor and no binding for it.
  *
  * This is the door a parked daemon serves for CTO_BINDING_POINTS_AT_DEAD_SESSION. It is
  * deliberately *not* `CtoLifecycle.recoveryTakeover`: that path spawns a replacement CTO and
@@ -258,14 +272,20 @@ export const recoverDeadCanonicalBinding = (
   request: DeadBindingRecoveryRequest,
   deps: DeadBindingRecoveryDeps,
 ): Decision<DeadBindingRecoveryReceipt> => {
-  if (request.role !== DEAD_BINDING_RECOVERY_ROLE) {
+  // Each allowlisted role in the one scope it is keyed by: a project's CTO by its project, the CEO
+  // by none. A CEO request naming a project names a binding that cannot exist, and is refused.
+  const roleKey = request.role === DEAD_BINDING_RECOVERY_ROLE && isNonEmptyString(request.projectId)
+    ? roleKeyFor(Role.PRIMARY_CTO, { projectId: request.projectId })
+    : request.role === Role.CEO && request.projectId === null
+      ? roleKeyFor(Role.CEO)
+      : null;
+  if (roleKey === null) {
     return deny(
       ReasonCode.INVALID_ARGUMENT,
-      "this door recovers the canonical PRIMARY_CTO binding and no other role",
-      { role: request.role, supportedRole: DEAD_BINDING_RECOVERY_ROLE },
+      "this door recovers a project's canonical PRIMARY_CTO binding and the CEO binding, and no other role",
+      { role: request.role, projectId: request.projectId, supportedRoles: DEAD_BINDING_RECOVERY_ROLES },
     );
   }
-  const roleKey = roleKeyFor(DEAD_BINDING_RECOVERY_ROLE, { projectId: request.projectId });
 
   return deps.db.txDecision<DeadBindingRecoveryReceipt>(() => {
     const current = deps.bindings.active(roleKey);
@@ -316,6 +336,25 @@ export const recoverDeadCanonicalBinding = (
           roleKey,
           expectedGeneration: request.expectedBindingGeneration,
           currentGeneration: current.bindingGeneration,
+        },
+      );
+    }
+    // The CEO only: a surviving switch moves the actor's runtime and leaves the binding row, so
+    // the bound session can be dead while the CEO answers on another one. The bound session's
+    // death proves nothing about that runtime, so the release requires the two to be one. The
+    // CTO branch is left as it was.
+    if (
+      request.role === Role.CEO &&
+      (current.sessionId !== current.boundSessionId ||
+        current.sessionIncarnation !== current.boundSessionIncarnation)
+    ) {
+      return deny(
+        ReasonCode.INVALID_ARGUMENT,
+        "the CEO's live runtime is not the bound session; this door releases only a binding whose runtime is the dead one",
+        {
+          roleKey,
+          boundSessionId: current.boundSessionId,
+          liveSessionId: current.sessionId,
         },
       );
     }
