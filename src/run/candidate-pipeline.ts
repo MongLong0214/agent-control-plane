@@ -205,6 +205,15 @@ export const UNJUDGED_REVIEW_LIMIT_REFUSAL =
 /** F1 — the audit row a refused submission leaves, so the refusal never counts as an attempt that ended the run of unjudged ones. */
 const UNJUDGED_REVIEW_LIMIT_REFUSED = "UNJUDGED_REVIEW_LIMIT_REFUSED";
 
+/**
+ * #1189 — the answer of a submission whose attempt no longer holds the run (released, reclaimed, expired, at its cap,
+ * or its owner binding moved on), so nothing of its result is applied: `attemptLost`, and a review that answered such
+ * an attempt without a verdict, whose reason code is the review's own. The text is fixed and never carries reviewer
+ * text, so a run with private review evidence is answered with it unchanged. It gives no resubmit instruction.
+ */
+export const STALE_ATTEMPT_NOT_APPLIED =
+  "not applied: this submission's attempt no longer holds the run, so nothing of its result was applied (no verdict, candidate state, revision or notice). This is not an unavailable review of the run's current candidate. What happens next follows from the run's current attempt and state, not from this answer: read the current run state.";
+
 export interface SubmitResultInput {
   runId: string;
   ownerSessionId: string;
@@ -582,7 +591,10 @@ export class CandidatePipeline {
         throw acpError(refused.reasonCode, refused.allowed ? "" : refused.message, refused.evidence);
       }
       if (!runHadStandardReviewEvidence({ audit: this.audit }, input.runId)) return outcome;
-      return privateEvidenceAnswer({ artifacts: this.artifacts, audit: this.audit }, input.runId, outcome);
+      const answered = privateEvidenceAnswer({ artifacts: this.artifacts, audit: this.audit }, input.runId, outcome);
+      // #1189 — a stale attempt's not-applied text is a fixed constant, so the projection keeps it where it withholds any other.
+      return outcome.allowed || outcome.message !== STALE_ATTEMPT_NOT_APPLIED ? answered
+        : deny(answered.reasonCode, STALE_ATTEMPT_NOT_APPLIED, answered.evidence);
     } finally {
       this.#attempts.delete(attemptId);
       this.releaseAttempt(input.runId, attemptId);
@@ -1038,9 +1050,13 @@ export class CandidatePipeline {
         : null;
       // #1189 R1-01 — an attempt that no longer holds the run keeps its failure as its own history: the
       // row names its attempt and says it did not hold the run, so it is never the run's current outcome
-      // and never the cause of a review retry (`Daemon.#bootstrapReviewRetry`).
-      if (recorded === null) recordUnavailable(false);
-      else if (!recorded.allowed) return recorded as Decision<PipelineOutcome>;
+      // and never the cause of a review retry (`Daemon.#bootstrapReviewRetry`). Its answer says, in fixed
+      // text, that nothing of it was applied: it is no unavailable review of the current candidate.
+      if (recorded === null) {
+        recordUnavailable(false);
+        return deny(reviewed.reasonCode, STALE_ATTEMPT_NOT_APPLIED, { runId, attemptId, candidateSnapshotDigest: snapshotDigest, attemptHeld: false });
+      }
+      if (!recorded.allowed) return recorded as Decision<PipelineOutcome>;
       return allow(ReasonCode.OK, {
         stage: "REVIEW_UNAVAILABLE",
         reasonCode: reviewed.reasonCode,
@@ -1355,7 +1371,7 @@ export class CandidatePipeline {
 
   /**
    * The answer of a submission whose attempt no longer holds the run (released, expired or at its cap):
-   * its outcome is not applied, and a review that answered is recorded as refused for it.
+   * its outcome is not applied (`STALE_ATTEMPT_NOT_APPLIED`), and a review that answered is recorded as refused for it.
    */
   private attemptLost(
     runId: string,
@@ -1365,7 +1381,7 @@ export class CandidatePipeline {
   ): Decision<PipelineOutcome> {
     const refusal = deny<PipelineOutcome>(
       ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
-      "this submission's attempt no longer holds the run (released, expired or at its cap), so its outcome is not applied; submit the result again with a new idempotencyKey",
+      STALE_ATTEMPT_NOT_APPLIED,
       { runId, attemptId, candidateSnapshotDigest: snapshotDigest },
     );
     // A review the gate ended for this same reason reached no verdict, or recorded the one it did not keep.
