@@ -820,6 +820,24 @@ const launcherExiting = (script: string, epipe: boolean) => (realSpawn: typeof C
   return child;
 };
 
+/** A launcher a signal ends: its own, the probe's group kill (detached), or an outside one. */
+const launcherSignalled = (shape: "detached-epipe-exit-71" | "self-sigterm" | "external-sigkill") =>
+  (realSpawn: typeof ChildProcessModule.spawn): ChildProcess => {
+    if (shape === "detached-epipe-exit-71") {
+      // Its own group, so the probe's SIGKILL on settling by EPIPE lands before the pending exit 71.
+      const child = realSpawn("/bin/sh", ["-c", "sleep 0.3; exit 71"], { stdio: ["pipe", "pipe", "pipe"], detached: true });
+      child.stdin!.write = ((): boolean => {
+        process.nextTick(() => child.stdin!.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" })));
+        return false;
+      }) as typeof child.stdin.write;
+      return child;
+    }
+    if (shape === "self-sigterm") return realSpawn("/bin/sh", ["-c", "kill -TERM $$"], { stdio: ["pipe", "pipe", "pipe"] });
+    const child = realSpawn("/bin/sh", ["-c", "cat >/dev/null"], { stdio: ["pipe", "pipe", "pipe"] });
+    setTimeout(() => { if (child.pid !== undefined && child.exitCode === null) process.kill(child.pid, "SIGKILL"); }, 200);
+    return child;
+  };
+
 /** A launcher the operating system never starts, with the errno it reports. */
 const launcherNotSpawned = (errno: "EAGAIN" | "ENOENT") => (realSpawn: typeof ChildProcessModule.spawn): ChildProcess => {
   const child = realSpawn("/nonexistent/acp-cpr-sandbox-exec", ["app-server", "--stdio"], { stdio: ["pipe", "pipe", "pipe"], detached: true });
@@ -840,7 +858,10 @@ describe("W10: whatever settles the read first, a launch the composed profile di
     { name: "the launcher spawn fails with EAGAIN", inject: launcherNotSpawned("EAGAIN") },
     { name: "the launcher is not there (ENOENT)", inject: launcherNotSpawned("ENOENT") },
     { name: "control: the launcher exits 126 with no EPIPE before it", inject: launcherExiting("exit 126", false) },
-  ]) {
+    { name: "a detached launcher with a pending exit 71 is SIGKILLed by the probe's cleanup after EPIPE", inject: launcherSignalled("detached-epipe-exit-71"), endedBy: /SIGKILL/ },
+    { name: "the launcher kills itself with SIGTERM before Codex starts", inject: launcherSignalled("self-sigterm"), endedBy: /SIGTERM/ },
+    { name: "an outside SIGKILL ends the launcher", inject: launcherSignalled("external-sigkill"), endedBy: /SIGKILL/ },
+  ] as Array<{ name: string; inject: (realSpawn: typeof ChildProcessModule.spawn) => ChildProcess; endedBy?: RegExp }>) {
     it(`${row.name}: runtime UNKNOWN and no version probe`, async (ctx) => {
       requireSeatbelt(ctx);
       const fixture = await makeFixture();
@@ -853,6 +874,8 @@ describe("W10: whatever settles the read first, a launch the composed profile di
         runtimeHealth: reading.runtimeHealth,
         refusedAtLaunch: /launch under the composed reviewer profile failed|refused to launch/.test(reading.error ?? ""),
       }).toEqual({ launched: 1, codexCalls: [], sensorHealth: "ERROR", runtimeHealth: "UNKNOWN", refusedAtLaunch: true });
+      // The signal that ended the launcher is named, so the row exercised the path it is about.
+      if (row.endedBy) expect(reading.error).toMatch(row.endedBy);
       await vi.waitFor(() => expect(leaseDirectories(fixture)).toEqual([]), { timeout: 5_000, interval: 25 });
     }, 60_000);
   }

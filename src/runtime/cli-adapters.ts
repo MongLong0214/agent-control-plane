@@ -3135,15 +3135,17 @@ const linkedCredential = (path: string): string | null => {
 /**
  * Whether a failed app-server read under the composed profile was the confinement refusing the launch.
  * Fail closed: it is *not* a refusal only when the process provably ran — its exit was confirmed, with a
- * status that is not the launcher's. A launcher that never spawned (EAGAIN, ENOENT, EACCES), an exit that
- * was never confirmed, and a failure of unknown shape are refusals; so are sandbox-exec's own statuses (65
- * for a profile it rejects, 71 when it cannot apply it or exec), and `env`'s 126 for an executable the
- * profile denied when the file itself is executable, so a bad install still reads as a runtime that cannot run.
+ * status of its own that is not the launcher's. A launcher that never spawned (EAGAIN, ENOENT, EACCES), an
+ * exit that was never confirmed, an exit by a signal (this probe's own cleanup kill, the launcher's, or
+ * anyone else's — the signal can replace a refusal status the launcher was about to report), and a failure
+ * of unknown shape are refusals; so are sandbox-exec's own statuses (65 for a profile it rejects, 71 when it
+ * cannot apply it or exec), and `env`'s 126 for an executable the profile denied when the file itself is
+ * executable, so a bad install still reads as a runtime that cannot run.
  */
 const launchRefused = (error: unknown, executable: string): boolean => {
   if (!(error instanceof CodexAppServerFailed) || error.launch.kind !== "exited") return true;
   const { exitCode } = error.launch;
-  if (exitCode === 65 || exitCode === 71) return true;
+  if (exitCode === null || exitCode === 65 || exitCode === 71) return true;
   if (exitCode !== 126) return false;
   try {
     accessSync(executable, constants.X_OK);

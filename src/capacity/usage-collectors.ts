@@ -840,12 +840,12 @@ export interface CodexAppServerLaunch {
  * own `exit` and `error` events and never from whichever stream, timer or pipe settled the read first, so a
  * confining launcher's own refusal (its exit status, or its failure to spawn) survives any settling order.
  *
- * - `exited`: it ended, with this status (null when a signal ended it).
+ * - `exited`: it ended, with this status, or with the signal that ended it (status null).
  * - `not-spawned`: the operating system never started it (the errno).
  * - `unconfirmed`: it was started, and the read ended before its exit was confirmed.
  */
 export type CodexAppServerLaunchOutcome =
-  | { readonly kind: "exited"; readonly exitCode: number | null }
+  | { readonly kind: "exited"; readonly exitCode: number | null; readonly signal: NodeJS.Signals | null }
   | { readonly kind: "not-spawned"; readonly errno: string }
   | { readonly kind: "unconfirmed" };
 
@@ -874,7 +874,8 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
       let launched: CodexAppServerLaunchOutcome | null = null;
       const failed = (message: string): CodexAppServerFailed => {
         const outcome: CodexAppServerLaunchOutcome = launched ?? { kind: "unconfirmed" };
-        const status = outcome.kind !== "exited" ? "" : outcome.exitCode === null ? " (ended by a signal)" : ` (exit ${outcome.exitCode})`;
+        const status = outcome.kind !== "exited" ? ""
+          : outcome.exitCode === null ? ` (ended by ${outcome.signal ?? "a signal"})` : ` (exit ${outcome.exitCode})`;
         return new CodexAppServerFailed(`${message}${status}`, outcome);
       };
       let child: ReturnType<typeof spawn>;
@@ -1027,9 +1028,9 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
       });
       // To notice a process that died before answering, and to confirm a settled probe's server is
       // gone before the call returns. The answer never arrives this way.
-      child.once("exit", (code) => {
+      child.once("exit", (code, signal) => {
         exited = true;
-        launched = { kind: "exited", exitCode: code };
+        launched = { kind: "exited", exitCode: code, signal };
         finish({ error: "codex app-server exited before answering" });
         returnDecided();
       });
