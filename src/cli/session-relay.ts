@@ -3,19 +3,23 @@
  * #246 C1b — the acp-cto relay a provisioned session's headless turn runs as its only MCP server.
  *
  * Claude Code spawns this once per turn (`ClaudeCliAdapter.runSessionTurn`, `--strict-mcp-config`).
- * It asks the daemon's take-once launch channel for the credential of the one session it was
- * started for, presents it as the first line on the CTO MCP socket, and from then on copies bytes
- * in both directions. The daemon re-verifies that credential on every request, so a credential the
- * daemon has since rotated stops working mid-connection, not only at the next one.
+ * O4b B' — it claims the credential of the one session it was started for over raw Mach: it
+ * `process.dlopen`s the native mach-launch addon (the one Node built-in that loads it) and makes one
+ * bounded claim on the daemon's launch service, off the event loop. It then presents the credential as
+ * the first line on the CTO MCP socket and copies bytes both ways. The daemon re-verifies the credential
+ * on every request, so one it has since rotated stops working mid-connection, not only at the next one.
  *
- * What it is given on its command line is a session's provider id and two socket paths, none of
- * them a secret. The credential exists in this process's memory only: it is never written to
- * stdout, stderr, a file or the environment, and the closed stderr vocabulary is
- * `session-relay: <stage> <code>`. There is no retry and no reconnect: the launch entry is gone
- * once taken, so a second connection would have nothing to present, which is the point.
+ * What it is given on its command line is the addon path, the MCP socket path and the session's provider
+ * id, none of them a secret, plus `--iso-service` in an isolated test. In production the Mach service is
+ * the launchd-reserved name compiled in, so argv cannot point the claim elsewhere. Any claim failure —
+ * the addon missing, the service absent, a daemon refusal, a dropped reply or a timeout — is a refusal:
+ * the relay exits and never falls back to AF_UNIX or any other transport. The credential exists in this
+ * process's memory only: never written to stdout, stderr, a file or the environment, and the closed
+ * stderr vocabulary is `session-relay: <stage> <code>`. There is no retry and no reconnect.
  *
  * Self-contained by design — Node built-ins only, and only syntax Node can strip — because the
- * turn's sandbox re-opens exactly this file for reading and nothing it might import.
+ * turn's sandbox re-opens exactly this file (and the addon it dlopens) for reading and nothing it
+ * might import.
  */
 import { createConnection, type Socket } from "node:net";
 
@@ -30,8 +34,19 @@ const EXIT = {
   STREAM_CLOSED: 5,
 } as const;
 
+/**
+ * O4b B' — the launchd-reserved Mach launch service name. A literal copy of
+ * `MACH_LAUNCH_RESERVED_SERVICE` in `src/daemon/agentcpd.ts` and `src/runtime/cli-adapters.ts`, kept in
+ * sync by hand because this relay imports nothing — it must stay loadable from the one file the turn's
+ * sandbox reopens. In production this is the only name claimed; a different name is honoured solely when
+ * `--iso-service` is passed (an isolated test), never from configuration or the environment, so neither
+ * argv alone nor a squatter on an undeclared name can divert a production claim.
+ */
+const RESERVED_SERVICE = "com.agentcontrolplane.agentcpd.launch";
+
 interface RelayArguments {
-  launchSocketPath: string;
+  addonPath: string;
+  serviceName: string;
   mcpSocketPath: string;
   externalSessionId: string;
 }
@@ -40,6 +55,11 @@ interface LaunchedCredential {
   token: string;
   sessionId: string;
   sessionSecret: string;
+}
+
+/** The subset of the native addon this relay uses: one bounded claim over raw Mach. */
+interface MachLaunchClaimAddon {
+  claim(serviceName: string, body: Buffer, timeoutMs: number): Promise<{ code: string; body?: Buffer }>;
 }
 
 const report = (stage: string, code: string): void => {
@@ -52,61 +72,81 @@ const parseArguments = (argv: readonly string[]): RelayArguments | null => {
     const name = argv[index];
     const value = argv[index + 1];
     if (name === undefined || value === undefined || value.length === 0) return null;
-    if (name !== "--launch" && name !== "--mcp" && name !== "--session") return null;
+    if (name !== "--addon" && name !== "--iso-service" && name !== "--mcp" && name !== "--session") return null;
     if (values.has(name)) return null;
     values.set(name, value);
   }
-  const launchSocketPath = values.get("--launch");
+  const addonPath = values.get("--addon");
   const mcpSocketPath = values.get("--mcp");
   const externalSessionId = values.get("--session");
-  if (!launchSocketPath || !mcpSocketPath || !externalSessionId) return null;
-  return { launchSocketPath, mcpSocketPath, externalSessionId };
+  if (!addonPath || !mcpSocketPath || !externalSessionId) return null;
+  // The reserved name is the production default; `--iso-service` is the only way to claim another, and
+  // nothing but an explicit test passes it. There is no environment or configuration input here.
+  const serviceName = values.get("--iso-service") ?? RESERVED_SERVICE;
+  return { addonPath, serviceName, mcpSocketPath, externalSessionId };
 };
 
-/** One line out, one line back, on the launch channel. Null when nothing usable came back. */
-const claimCredential = (socketPath: string, externalSessionId: string): Promise<LaunchedCredential | null> =>
-  new Promise((resolveClaim) => {
-    const socket = createConnection(socketPath);
-    let received = Buffer.alloc(0);
-    let settled = false;
-    const finish = (credential: LaunchedCredential | null): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      socket.destroy();
-      resolveClaim(credential);
-    };
-    const timer = setTimeout(() => finish(null), LAUNCH_TIMEOUT_MS);
-    socket.once("connect", () => socket.write(`${JSON.stringify({ externalSessionId })}\n`));
-    socket.on("data", (chunk: Buffer) => {
-      received = Buffer.concat([received, chunk]);
-      const boundary = received.indexOf(0x0a);
-      if (boundary === -1) {
-        if (received.length > MAX_LINE_BYTES) finish(null);
-        return;
-      }
-      let body: unknown;
-      try {
-        body = JSON.parse(received.subarray(0, boundary).toString("utf8")) as unknown;
-      } catch {
-        finish(null);
-        return;
-      }
-      const reply = (body ?? {}) as { ok?: unknown; token?: unknown; sessionId?: unknown; sessionSecret?: unknown };
-      if (
-        reply.ok !== true ||
-        typeof reply.token !== "string" || reply.token.length === 0 ||
-        typeof reply.sessionId !== "string" || reply.sessionId.length === 0 ||
-        typeof reply.sessionSecret !== "string" || reply.sessionSecret.length === 0
-      ) {
-        finish(null);
-        return;
-      }
-      finish({ token: reply.token, sessionId: reply.sessionId, sessionSecret: reply.sessionSecret });
-    });
-    socket.once("error", () => finish(null));
-    socket.once("close", () => finish(null));
-  });
+/**
+ * `process.dlopen` the native addon — the one Node built-in that loads it, the same way the daemon
+ * loads its side — and return just the claim surface. Null when the addon is unavailable, which is a
+ * refusal, never a reason to try another transport.
+ */
+const loadClaimAddon = (addonPath: string): MachLaunchClaimAddon | null => {
+  const module = { exports: {} as Partial<MachLaunchClaimAddon> };
+  try {
+    process.dlopen(module, addonPath);
+  } catch {
+    return null;
+  }
+  return typeof module.exports.claim === "function" ? (module.exports as MachLaunchClaimAddon) : null;
+};
+
+/**
+ * One bounded claim over raw Mach: look the service up, send one request naming the session, and wait
+ * for the daemon's reply off the event loop. Any outcome other than a well-formed credential is a
+ * refusal (NATIVE_UNAVAILABLE, SERVICE_UNAVAILABLE, a daemon refusal, DROPPED, TIMED_OUT), and there is
+ * no AF_UNIX attempt for a driven turn.
+ */
+const claimCredential = async (
+  addonPath: string,
+  serviceName: string,
+  externalSessionId: string,
+): Promise<LaunchedCredential | null> => {
+  const addon = loadClaimAddon(addonPath);
+  if (!addon) {
+    report("launch", "NATIVE_UNAVAILABLE");
+    return null;
+  }
+  let result: { code: string; body?: Buffer };
+  try {
+    result = await addon.claim(serviceName, Buffer.from(JSON.stringify({ externalSessionId }), "utf8"), LAUNCH_TIMEOUT_MS);
+  } catch {
+    report("launch", "CLAIM_ERROR");
+    return null;
+  }
+  if (result.code !== "OK" || !result.body) {
+    report("launch", result.code || "REFUSED");
+    return null;
+  }
+  let body: unknown;
+  try {
+    body = JSON.parse(result.body.toString("utf8")) as unknown;
+  } catch {
+    report("launch", "MALFORMED_REPLY");
+    return null;
+  }
+  const reply = (body ?? {}) as { ok?: unknown; token?: unknown; sessionId?: unknown; sessionSecret?: unknown };
+  if (
+    reply.ok !== true ||
+    typeof reply.token !== "string" || reply.token.length === 0 ||
+    typeof reply.sessionId !== "string" || reply.sessionId.length === 0 ||
+    typeof reply.sessionSecret !== "string" || reply.sessionSecret.length === 0
+  ) {
+    report("launch", "MALFORMED_REPLY");
+    return null;
+  }
+  return { token: reply.token, sessionId: reply.sessionId, sessionSecret: reply.sessionSecret };
+};
 
 /**
  * The daemon's first line answers this relay's handshake: on refusal `{"ok":false,"reasonCode":…}`
@@ -190,9 +230,9 @@ const run = async (): Promise<number> => {
     report("usage", "INVALID_ARGUMENTS");
     return EXIT.USAGE;
   }
-  const credential = await claimCredential(args.launchSocketPath, args.externalSessionId);
+  const credential = await claimCredential(args.addonPath, args.serviceName, args.externalSessionId);
   if (!credential) {
-    report("launch", "CREDENTIAL_UNAVAILABLE");
+    // claimCredential already reported the specific stage; this is the single refusal exit.
     return EXIT.LAUNCH_REFUSED;
   }
   return relay(createConnection(args.mcpSocketPath), credential);

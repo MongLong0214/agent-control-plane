@@ -258,6 +258,33 @@ export const ReasonCode = {
    */
   SESSION_RUNTIME_UNAVAILABLE: "SESSION_RUNTIME_UNAVAILABLE",
   /**
+   * O4b B' — the raw-Mach launch service that hands a driven turn its credential is not available: the
+   * daemon's `bootstrap_check_in` of the launchd-declared service name failed (it is not running under
+   * launchd, or the name is already taken), or the addon could not load. A driven turn's credential
+   * request is refused under this code and never falls back to AF_UNIX or the interactive id-only path.
+   */
+  MACH_LAUNCH_SERVICE_UNAVAILABLE: "MACH_LAUNCH_SERVICE_UNAVAILABLE",
+  /**
+   * O4b B' — a driven turn's per-message Mach admission refused the credential. The specific stage —
+   * sender not live, the parent/holder chain, a changed link, a stale instance, a stale secret or
+   * incarnation — is recorded in the refusal's audit evidence, never the credential. The entry is kept
+   * for a genuine later claim, except where a prior hand-over already consumed it.
+   */
+  MACH_LAUNCH_ADMISSION_REFUSED: "MACH_LAUNCH_ADMISSION_REFUSED",
+  /**
+   * O4b B' — a driven entry (one carrying a turn pin) was presented on the AF_UNIX launch socket
+   * (`cto.launch.sock`). Driven credentials move only over raw Mach; the id-only AF_UNIX path serves
+   * interactive spawns alone, so a driven request there is refused rather than served.
+   */
+  DRIVEN_LAUNCH_ON_AF_UNIX_REFUSED: "DRIVEN_LAUNCH_ON_AF_UNIX_REFUSED",
+  /**
+   * O4b B' — a driven turn's credential was admitted but its Mach reply send failed or was uncertain
+   * (no receiver, timeout, interruption). The entry stays consumed and invalidated and the session's
+   * secret is rotated before any new hand-over; the credential is never re-offered. The case is
+   * audited, never the credential.
+   */
+  MACH_LAUNCH_SEND_FAILED: "MACH_LAUNCH_SEND_FAILED",
+  /**
    * #246 C1b — a provisioned session's turn ran and the daemon did not receive the authenticated
    * attestation that turn was asked for: the relay never took its credential, never authenticated,
    * or never presented the challenge. Readiness is never inferred from the turn's exit alone.

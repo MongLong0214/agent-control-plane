@@ -48,7 +48,13 @@ export class RecordingRuntimeDouble extends HeadlessRuntimeDouble {
  */
 export const bootstrapRuntimeFixture = async (harnessOptions: Parameters<typeof makeHarness>[0] = {}) => {
   const harness = makeHarness(harnessOptions);
-  const launch = await startSessionLaunchChannel(tempDir("acp-c1b-launch-"), { mcpToken: BOOTSTRAP_FIXTURE_TOKEN });
+  // O4b B' — sessions and audit are handed to the channel so a test can enable the raw-Mach driven
+  // hand-over (`enableMachService`) on it; the AF_UNIX id-only path other fixtures use is unchanged.
+  const launch = await startSessionLaunchChannel(tempDir("acp-c1b-launch-"), {
+    mcpToken: BOOTSTRAP_FIXTURE_TOKEN,
+    sessions: harness.cp.sessions,
+    audit: harness.cp.audit,
+  });
   const claude = new RecordingRuntimeDouble(harness.clock, "claude");
   claude.observeCredentialCustody(harness.cp.sessionRuntime, harness.cp.sessions, BOOTSTRAP_FIXTURE_TOKEN);
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
@@ -186,12 +192,18 @@ export const bootstrapRuntimeFixture = async (harnessOptions: Parameters<typeof 
       throw new Error(`expected ${expected} finished turns of ${sessionId}; reached ${turnState(sessionId)}`);
     }
   };
+  // O4b B' — enable the raw-Mach driven hand-over on an isolated per-fixture service name, if the addon
+  // is built on this platform. A test that exercises the real relay guards on this being non-null.
+  let machServiceName: string | null = null;
+  const machEnabled = launch.enableMachService({ isolatedServiceName: `com.acp-iso.c1b-relay.${process.pid}.${(Math.random() * 1e9) | 0}` });
+  if (machEnabled.allowed) machServiceName = machEnabled.value.serviceName;
   return {
     harness,
     claude,
     gpt,
     daemon,
     launch,
+    machServiceName,
     ctoSocket,
     ceoSessionId: ceo.sessionId,
     hermes,

@@ -124,10 +124,25 @@ export interface CliAdapterOptions {
    * runtime generates a fresh provider-specific allowlist for each invocation.
    */
   reviewerEgress?: ReviewerEgressConfig;
+  /**
+   * O4b B' — the raw-Mach service name a driven turn's relay claims its credential on. Defaults to the
+   * production launchd-reserved name (`MACH_LAUNCH_RESERVED_SERVICE`). A test may pass an isolated
+   * per-run name here; the adapter then runs the relay in isolated mode. This is a constructor argument
+   * only — never read from the environment or runtime configuration — so a production adapter can never
+   * be pointed at a name other than the one launchd declares.
+   */
+  machServiceName?: string;
 }
 
 const DEFAULT_FRESHNESS_MS = 15 * 60 * 1000;
 const DEFAULT_CLOCK_SKEW_MS = 60_000;
+
+/**
+ * O4b B' — the launchd-reserved Mach launch service name, a literal copy of
+ * `MACH_LAUNCH_RESERVED_SERVICE` in `src/daemon/agentcpd.ts`, kept in sync by hand because this module
+ * must not import the daemon entrypoint. The daemon checks this name in; a driven relay claims it.
+ */
+export const MACH_LAUNCH_RESERVED_SERVICE = "com.agentcontrolplane.agentcpd.launch";
 
 /** Tools a read-only invocation must not have. Denied by name, not by permission mode. */
 const DENIED_TOOLS = [
@@ -2317,6 +2332,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
   readonly #reviewerEgress: ReviewerEgressConfig | undefined;
   readonly #managedWriteBroker: ManagedInvocationWriteBroker | undefined;
   readonly #usageCollector: UsageCollector;
+  readonly #machServiceName: string;
 
   constructor(options: CliAdapterOptions) {
     this.#binary = resolveExecutable(options.binary ?? "claude");
@@ -2329,6 +2345,10 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     this.#providerCredentialDir = options.providerCredentialDir;
     this.#reviewerEgress = options.reviewerEgress;
     this.#managedWriteBroker = options.managedWriteBroker;
+    // O4b B' — the production launchd-reserved Mach name unless a test explicitly supplied an isolated
+    // one. Never read from the environment or runtime configuration, so production always claims only
+    // the launchd-declared name.
+    this.#machServiceName = options.machServiceName ?? MACH_LAUNCH_RESERVED_SERVICE;
     // The capacity probe deliberately does *not* take `providerCredentialDir`.
     //
     // That option exists to keep the sandbox's keychain deny from being self-defeating: a
@@ -2664,6 +2684,14 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       "none",
     ];
     const relayScript = sessionRelayScript();
+    const addonPath = machLaunchAddonPath();
+    // O4b B' — the driven relay claims its credential over raw Mach, not the AF_UNIX launch socket. In
+    // production it uses the launchd-reserved service name (its own compiled default, so no argv, config
+    // or environment can point it at another process). An isolated per-run name is passed only when this
+    // adapter was explicitly constructed with one — a test — and then as `--iso-service`, which also
+    // switches the relay out of production mode. The MCP socket it presents the credential on is
+    // unchanged.
+    const isolated = this.#machServiceName !== MACH_LAUNCH_RESERVED_SERVICE;
     if (request.relay) {
       args.push(
         "--mcp-config",
@@ -2674,7 +2702,8 @@ export class ClaudeCliAdapter implements ProviderAdapter {
               command: process.execPath,
               args: [
                 relayScript,
-                "--launch", request.relay.launchSocketPath,
+                "--addon", addonPath,
+                ...(isolated ? ["--iso-service", this.#machServiceName] : []),
                 "--mcp", request.relay.mcpSocketPath,
                 "--session", handle.externalSessionId,
               ],
@@ -2698,7 +2727,9 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       writablePaths: [transcripts],
       readablePaths: {
         subtrees: [workdir],
-        files: request.relay ? [relayScript, process.execPath] : [],
+        // O4b B' — the Mach-launch addon the relay `process.dlopen`s is reopened for reading too, the
+        // one file step 1 measured a driven turn needs beyond the relay script and interpreter.
+        files: request.relay ? [relayScript, process.execPath, addonPath] : [],
       },
       // #1104 — the turn owns what its CLI leaves in its group, the relay included; see `invoke`.
       reapProcessGroup: true,
@@ -2780,6 +2811,23 @@ export interface SessionTurnSpawnRequest extends SessionTurnRequest {
 export const sessionRelayScript = (): string => {
   const extension = import.meta.url.endsWith(".ts") ? ".ts" : ".js";
   return fileURLToPath(new URL(`../cli/session-relay${extension}`, import.meta.url));
+};
+
+/**
+ * O4b B' — the Mach-launch native addon a driven turn's relay `process.dlopen`s. Resolved from this
+ * module's own location the same way the relay resolves it from its own: the generation-local copy
+ * (`dist/native/...`, placed by `copy-native-mach-launch-into-dist.mjs`) first, then the in-tree build
+ * (`native/...`) for a source checkout. The adapter names this exact path in the turn's sandbox so the
+ * one file is readable; the relay finds the same file by the same priority. If neither exists the
+ * generation-local candidate is returned, and the relay then fails closed NATIVE_UNAVAILABLE.
+ */
+export const machLaunchAddonPath = (): string => {
+  const relative = "native/mach-launch/build/Release/mach_launch.node";
+  const candidates = [
+    fileURLToPath(new URL(`../${relative}`, import.meta.url)),
+    fileURLToPath(new URL(`../../${relative}`, import.meta.url)),
+  ];
+  return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0]!;
 };
 
 /**

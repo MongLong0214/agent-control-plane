@@ -11,6 +11,18 @@
     <string>__ACP_LAUNCHER__</string>
   </array>
 
+  <!-- O4b B' — the raw-Mach launch service a driven turn's credential is handed over on. launchd holds
+       this name's receive right for the job and hands it to the daemon via bootstrap_check_in at start,
+       so a same-uid process cannot check it in first (step 1: kr=1100). The name is fixed, derived from
+       the Label the way every reserved name is, and matches MACH_LAUNCH_RESERVED_SERVICE in the daemon.
+       It demand-launches the job; the daemon checks it in only after its database admission passes, so a
+       #738-refused daemon (which exits first) is never relaunched into serving by a Mach request. -->
+  <key>MachServices</key>
+  <dict>
+    <key>com.agentcontrolplane.agentcpd.launch</key>
+    <true/>
+  </dict>
+
   <key>WorkingDirectory</key>
   <string>__ACP_WORKING_DIRECTORY__</string>
 
