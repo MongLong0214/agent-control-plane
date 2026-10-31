@@ -8,6 +8,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { retireProject } from "../../src/registry/project-retirement.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
+import { ORPHAN_UNIDENTIFIED_EVENT } from "../../src/run/worker-orphan-release.ts";
 import {
   TASK_WORKER_GIT_GROUP_ENDED,
   TASK_WORKER_GIT_GROUP_STARTED,
@@ -376,5 +377,136 @@ describe("a runtime-managed receipt with no pid is ended only by its records", (
 
     expect(retired, JSON.stringify(retired)).toMatchObject({ allowed: true, reasonCode: ReasonCode.OK, value: { projectId: receipt.projectId } });
     expect(receiptRow(h, receipt.executionId)).toEqual(before);
+  });
+});
+
+/**
+ * A runtime-managed receipt with no recorded pid, closed `status` by the runner's own writer, its run then
+ * cancelled. `records` are written before it closes.
+ */
+const closedRuntimeReceipt = async (
+  harness: Harness,
+  projectId: string,
+  status: "SUCCEEDED" | "FAILED",
+  records: (receipt: Receipt) => void,
+): Promise<Receipt> => {
+  const receipt = await openReceipt(harness, projectId, { runtimeManaged: true });
+  records(receipt);
+  const finished = harness.cp.tasks.finishExecution(
+    receipt.executionId,
+    status === "SUCCEEDED" ? { status, resultDigest: "sha256:result" } : { status, failureClass: "infrastructure" },
+    receipt.runId,
+  );
+  expect(finished.allowed, JSON.stringify(finished)).toBe(true);
+  expect(harness.cp.runs.cancel(receipt.runId, "the run is withdrawn").allowed).toBe(true);
+  await harness.cp.workerRetirement.settled();
+  expect(harness.cp.tasks.execution(receipt.executionId)).toMatchObject({ status, runtimeManaged: true, workerProcessId: null });
+  return receipt;
+};
+
+/** The guard's admission of a provider launch for this receipt, as `launchWasAuthorised` reads it. */
+const guardGrant = (harness: Harness, receipt: Receipt): void => {
+  expect(harness.cp.audit.record({
+    kind: "MANAGED_WRITE_GUARD",
+    runId: receipt.runId,
+    evidence: { taskReceiptId: receipt.executionId, operation: "FILE_MUTATION", allowed: true },
+  }).allowed).toBe(true);
+};
+
+/** What `recordLaunchEnd` writes when the provider threw with no pid recorded: an unidentified orphan. */
+const unidentifiedOrphan = (harness: Harness, receipt: Receipt): void => {
+  expect(harness.cp.audit.record({
+    kind: ORPHAN_UNIDENTIFIED_EVENT,
+    runId: receipt.runId,
+    sessionId: receipt.workerSessionId,
+    evidence: {
+      executionId: receipt.executionId,
+      taskId: receipt.taskId,
+      status: "RUNNING",
+      reason: "the provider launch ended with no answer and no recorded process",
+      pid: null,
+      recordedStartedAt: null,
+      observedStartedAt: null,
+      claimsOnPid: 0,
+      ownership: null,
+      killed: false,
+      reexecutionBlocked: true,
+    },
+  }).allowed).toBe(true);
+};
+
+describe("a runtime-managed receipt with no pid is not ended by its status", () => {
+  it("(e) FAILED with a launch intent that has no recorded end: retirement is held", async () => {
+    const h = makeHarness();
+    const receipt = await closedRuntimeReceipt(h, "rm-failed-unended-launch", "FAILED", (r) => launch(h, r, TASK_WORKER_LAUNCH_INTENT));
+    const before = receiptRow(h, receipt.executionId);
+
+    expectHeld(h, receipt.projectId, await retire(h, receipt.projectId));
+    expect(receiptRow(h, receipt.executionId)).toEqual(before);
+    expect(h.cp.sessions.get(receipt.workerSessionId)?.lifecycle).toBe(SessionLifecycle.READY);
+  });
+
+  it("(f) FAILED after a provider that threw: its launch has no end and its unidentified orphan is unresolved, so retirement is held", async () => {
+    const h = makeHarness();
+    const receipt = await closedRuntimeReceipt(h, "rm-failed-orphan", "FAILED", (r) => {
+      launch(h, r, TASK_WORKER_LAUNCH_INTENT);
+      unidentifiedOrphan(h, r);
+    });
+    const before = receiptRow(h, receipt.executionId);
+
+    expectHeld(h, receipt.projectId, await retire(h, receipt.projectId));
+    expect(receiptRow(h, receipt.executionId)).toEqual(before);
+    expect(h.cp.sessions.get(receipt.workerSessionId)?.lifecycle).toBe(SessionLifecycle.READY);
+  });
+
+  it("(f) an unresolved unidentified orphan holds retirement by itself, whatever else is recorded ended", async () => {
+    const h = makeHarness();
+    const receipt = await closedRuntimeReceipt(h, "rm-failed-orphan-only", "FAILED", (r) => {
+      launch(h, r, TASK_WORKER_LAUNCH_INTENT);
+      launch(h, r, TASK_WORKER_LAUNCH_ENDED);
+      unidentifiedOrphan(h, r);
+    });
+
+    expectHeld(h, receipt.projectId, await retire(h, receipt.projectId));
+  });
+
+  it("(g) SUCCEEDED with a guard grant: retirement is held, even with its launch recorded ended", async () => {
+    const h = makeHarness();
+    const receipt = await closedRuntimeReceipt(h, "rm-succeeded-granted", "SUCCEEDED", (r) => {
+      launch(h, r, TASK_WORKER_LAUNCH_INTENT);
+      guardGrant(h, r);
+      launch(h, r, TASK_WORKER_LAUNCH_ENDED);
+    });
+    const before = receiptRow(h, receipt.executionId);
+
+    expectHeld(h, receipt.projectId, await retire(h, receipt.projectId));
+    expect(receiptRow(h, receipt.executionId)).toEqual(before);
+  });
+
+  it("(h) positive control: SUCCEEDED with its launch and its task's git group recorded ended, no grant and no orphan: retirement proceeds", async () => {
+    const h = makeHarness();
+    const receipt = await closedRuntimeReceipt(h, "rm-succeeded-ended", "SUCCEEDED", (r) => {
+      launch(h, r, TASK_WORKER_LAUNCH_INTENT);
+      git(h, r, TASK_WORKER_GIT_INTENT, { nonce: "n1" });
+      git(h, r, TASK_WORKER_GIT_GROUP_STARTED, { nonce: "n1", pgid: 999_999, leaderStartedAt: null });
+      git(h, r, TASK_WORKER_GIT_GROUP_ENDED, { nonce: "n1", pgid: 999_999, proven: "GROUP_GONE" });
+      launch(h, r, TASK_WORKER_LAUNCH_ENDED);
+    });
+    const before = receiptRow(h, receipt.executionId);
+
+    const retired = await retire(h, receipt.projectId);
+
+    expect(retired, JSON.stringify(retired)).toMatchObject({ allowed: true, reasonCode: ReasonCode.OK, value: { projectId: receipt.projectId } });
+    expect(retirementRows(h, receipt.projectId)).toEqual(["PROJECT_RETIREMENT_INTENT", "PROJECT_RETIREMENT_INTENT", "PROJECT_RETIRED"]);
+    expect(receiptRow(h, receipt.executionId)).toEqual(before);
+  });
+
+  it("(h) positive control: FAILED with nothing launched on record, no grant and no orphan: retirement proceeds", async () => {
+    const h = makeHarness();
+    const receipt = await closedRuntimeReceipt(h, "rm-failed-never-ran", "FAILED", () => undefined);
+
+    const retired = await retire(h, receipt.projectId);
+
+    expect(retired, JSON.stringify(retired)).toMatchObject({ allowed: true, value: { projectId: receipt.projectId } });
   });
 });

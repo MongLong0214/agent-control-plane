@@ -7,6 +7,7 @@ import { Role, type RunState, SessionLifecycle } from "../domain/types.ts";
 import type { ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
+import { unresolvedUnidentifiedOrphans } from "./worker-orphan-release.ts";
 import {
   TASK_WORKER_GIT_GROUP_ENDED,
   TASK_WORKER_GIT_GROUP_STARTED,
@@ -390,10 +391,12 @@ export class WorkerRetirement {
    * - a recorded pid ends only when the runner recorded it released, or by the rule the runner
    *   applies before it does — no member of the group it led remains, and the pid is gone or now
    *   names a process with another start time; otherwise it is running or unverified;
-   * - with no recorded pid, only a SUCCEEDED or FAILED receipt, which reports the worker's end, or a
-   *   runtime-managed receipt whose records show it ran nothing (`#ranNothing`), has ended.
-   *   Any other receipt without a pid is PROCESS_UNVERIFIED: nothing establishes that its worker,
-   *   whoever launched it, has stopped.
+   * - with no recorded pid, a runtime-managed receipt has ended only when its records show it ran
+   *   nothing (`#ranNothing`), whatever its status: a SUCCEEDED or FAILED written by the runner does
+   *   not show that a process it may have spawned ended. Any other receipt without a pid has ended
+   *   only when it is SUCCEEDED or FAILED, which reports the worker's end. Every other receipt without
+   *   a pid is PROCESS_UNVERIFIED: nothing establishes that its worker, whoever launched it, has
+   *   stopped.
    */
   #remainingTurns(sessionId: string): RemainingWorkerProcess[] {
     const rows = this.db.all<{
@@ -419,9 +422,9 @@ export class WorkerRetirement {
       let process: "GONE" | RemainingStatus;
       if (pid !== null) {
         process = row.worker_process_released_at !== null ? "GONE" : this.#turnProcess(pid, row.worker_process_started_at);
+      } else if (row.runtime_managed === 1) {
+        process = this.#ranNothing(row) ? "GONE" : "PROCESS_UNVERIFIED";
       } else if (row.status === "SUCCEEDED" || row.status === "FAILED") {
-        process = "GONE";
-      } else if (row.runtime_managed === 1 && this.#ranNothing(row)) {
         process = "GONE";
       } else {
         process = "PROCESS_UNVERIFIED";
@@ -440,10 +443,13 @@ export class WorkerRetirement {
    * admitted no provider launch for it (`launchWasAuthorised`, the runner's own reader), its launch
    * intent, if one was written, has its end (`TASK_WORKER_LAUNCH_ENDED`), and every git child its task
    * started in its run has its end (`TASK_WORKER_GIT_GROUP_ENDED`, by nonce and pgid for a group, by
-   * nonce for an intent with no group), as the runner reads them. A missing pid alone is never an end.
+   * nonce for an intent with no group), as the runner reads them, and no unidentified orphan of it is
+   * unresolved (`unresolvedUnidentifiedOrphans`, which counts the operator's verified release as its
+   * end). A missing pid alone, or a terminal status, is never an end.
    */
   #ranNothing(row: { execution_id: string; run_id: string; task_id: string }): boolean {
     if (launchWasAuthorised(this.db, row.execution_id)) return false;
+    if (unresolvedUnidentifiedOrphans(this.db, { executionId: row.execution_id }).length > 0) return false;
     const unended = this.db.get<{ n: number }>(
       `SELECT 1 AS n FROM audit_events i
         WHERE i.run_id = ? AND i.kind = ? AND json_extract(i.evidence_json, '$.executionId') = ?
