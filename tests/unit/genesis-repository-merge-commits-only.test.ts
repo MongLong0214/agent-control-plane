@@ -105,6 +105,25 @@ describe("#1269 genesis confirms a created repository allows merge commits only"
     }
   });
 
+  it("the refusal is kept with the pending create: once GitHub later shows the stated values, a retry still refuses and writes nothing more", async () => {
+    const reported: Partial<typeof STATED> = { ...STATED, allow_squash_merge: true };
+    const { port, input } = genesis(reported);
+    const first = await produceRepoFactoryResult(input);
+    expect(first.allowed).toBe(false);
+    reported.allow_squash_merge = false;
+    expect((await port.observeRepository(target))?.mergeMethods).toEqual(STATED);
+    const second = await produceRepoFactoryResult(input);
+    expect(second.allowed, "drive 2").toBe(false);
+    if (second.allowed || first.allowed) return;
+    for (const decision of [first, second]) {
+      expect(JSON.stringify(decision.evidence)).toContain('"refusal":"MERGE_METHODS_MISMATCH"');
+      expect(JSON.stringify(decision.evidence)).toContain('"fields":["allow_squash_merge"]');
+    }
+    expect(port.creates).toBe(1);
+    expect(port.writes.map((write) => write.method)).toEqual(["createRepository"]);
+    expect(port.events).toEqual(["create-repository"]);
+  });
+
   it("control: a reread with all three as stated proceeds through genesis", async () => {
     const { port, input } = genesis(STATED);
     const decision = await produceRepoFactoryResult(input);
