@@ -535,6 +535,12 @@ const REVIEW_INPUT_STATEMENT =
   "this restriction does not establish that the packet is sufficient. " +
   "Worker/CTO reasoning, chat history and producer self-assessment remain withheld.";
 
+/** Told to a chunk reviewer whose chunk holds a range of an oversized file (`splitOversizedSection`). */
+const RANGE_PART_STATEMENT =
+  "A part labelled `Part k of n` is one range of its file's patch, and the file's other ranges are reviewed by other chunk reviewers: " +
+  "judge the range shown, do not report the absence of the other ranges as an omission, and still list in `omittedItems` " +
+  "any of this range's characters that are not shown or that you could not read.";
+
 /**
  * Free-form provider text (an answer, stderr, an adapter error) as review evidence: its digest and
  * length under `<name>Digest` / `<name>Length`, never the text. A denial's evidence is returned to
@@ -2169,8 +2175,10 @@ export class BlindReviewGate {
 
     for (const repo of diffs) {
       const lockfile = "lockfile" in repo && repo.lockfile !== undefined ? [repo.lockfile] : [];
-      sections.push(`### ${repo.identity}`, "Files:", ...repo.files.map((f) => `- ${f}`), ...lockfile, "```diff", repo.diff, "```");
+      const rangeLabel = "rangeLabel" in repo && repo.rangeLabel !== undefined ? [repo.rangeLabel] : [];
+      sections.push(`### ${repo.identity}`, "Files:", ...repo.files.map((f) => `- ${f}`), ...lockfile, ...rangeLabel, "```diff", repo.diff, "```");
     }
+    const holdsRange = diffs.some((repo) => "rangeLabel" in repo && repo.rangeLabel !== undefined);
 
     sections.push(
       "",
@@ -2206,6 +2214,7 @@ export class BlindReviewGate {
       ...(chunk
         ? ["In this chunk, `coveredFiles` lists only files named under \"## Actual diff\" above; other reviewers cover the other chunks' files."]
         : []),
+      ...(chunk && holdsRange ? [RANGE_PART_STATEMENT] : []),
       "`omittedItems` must list anything you could not examine. Do not return PASS with a non-empty omission list.",
     );
     return sections.filter(Boolean).join("\n");
@@ -3403,6 +3412,8 @@ interface ReviewChunkPart extends ReviewerDiff {
   coverageTargets: SliceCoverageTarget[];
   /** A lockfile part's status, path and blobs, and a modified one's full candidate text, shown above its patch. */
   lockfile?: string;
+  /** A range part's number, character range, starting line and whether it completes the file, shown above its patch. */
+  rangeLabel?: string;
 }
 
 type ReviewChunkInput = ReviewChunkPart | ReviewerDiff;
@@ -3504,13 +3515,14 @@ const splitDiffs = (
     }
     if (separated.rest === null) continue;
     for (const part of splitByFile(separated.rest, budget)) {
-      if (size + part.diff.length > budget && current.length > 0) {
+      const length = part.diff.length + (part.rangeLabel?.length ?? 0);
+      if (size + length > budget && current.length > 0) {
         chunks.push(current);
         current = [];
         size = 0;
       }
       current.push(part);
-      size += part.diff.length;
+      size += length;
     }
   }
   if (current.length > 0) chunks.push(current);
@@ -3789,31 +3801,116 @@ const wholeFilePart = (identity: string, diff: string, targets: readonly Section
   })),
 });
 
+/** Where a range of a patch's content starts. */
+interface PatchPosition {
+  /** The patch line it starts at, or inside when `inside`; the section's `diff --git` line is line 1. */
+  line: number;
+  inside: boolean;
+  /** The header line of the hunk it starts in, with that hunk's old and new file lines there; "" outside a hunk or at a hunk header. */
+  hunk: string;
+  old: number;
+  new: number;
+}
+
+const HUNK_START = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+const HUNK_LINE = new RegExp(`${HUNK_START.source}[^\\n]*\\n?`, "gm");
+
+/** The end of the line that starts at `at`, after its newline. */
+const lineEnd = (text: string, at: number): number => {
+  const newline = text.indexOf("\n", at);
+  return newline === -1 ? text.length : newline + 1;
+};
+
+/**
+ * The position of offsets of `payload` (a patch after its file header, whose first line is patch line
+ * `firstLine`), asked in increasing order: one forward walk over the lines serves every part.
+ */
+const patchPositions = (payload: string, firstLine: number): ((offset: number) => PatchPosition) => {
+  let at = 0;
+  let line = firstLine;
+  let hunk = "";
+  let old = 0;
+  let next = 0;
+  return (offset) => {
+    for (let end = lineEnd(payload, at); at < offset && end <= offset; end = lineEnd(payload, at)) {
+      const text = payload.slice(at, end);
+      const start = text.startsWith("@@ ") ? HUNK_START.exec(text) : null;
+      if (start) [hunk, old, next] = [text, Number(start[1]), Number(start[2])];
+      else if (hunk !== "" && !text.startsWith("\\")) {
+        if (!text.startsWith("+")) old += 1;
+        if (!text.startsWith("-")) next += 1;
+      }
+      at = end;
+      line += 1;
+    }
+    const inside = at < offset;
+    return { line, inside, hunk: !inside && payload.startsWith("@@ ", offset) ? "" : hunk, old, new: next };
+  };
+};
+
+/** A range part's label: its number, its characters of the patch after the file header, where it starts, and whether it completes the file. */
+const rangePartLabel = (part: number, of: number, start: number, end: number, total: number, from: PatchPosition): string =>
+  `Part ${part} of ${of} of this file's patch: characters [${start}, ${end}) of the ${total} after its file header, ` +
+  `from ${from.inside ? "inside " : ""}patch line ${from.line}${from.hunk === "" ? "" : `, old line ${from.old}, new line ${from.new}`}. ` +
+  (part === 1 ? "" : `Its file header${from.hunk === "" ? " is" : " and the header of the hunk it starts in are"} repeated above it. `) +
+  `This part ${part === of ? "completes" : "does not complete"} the file.`;
+
+const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff;
+const isLowSurrogate = (code: number): boolean => code >= 0xdc00 && code <= 0xdfff;
+
+/**
+ * An oversized section as labelled ranges that join back into it exactly. Every part repeats the
+ * section's file header (its `diff --git` lines and, for a text patch, its `---`/`+++` lines) and the
+ * header of the hunk its range starts in, and is cut at the last line end that fits; a line longer than
+ * a whole part is cut inside itself, never between the halves of a surrogate pair. The headers and the
+ * label are charged to `budget` beside the range, the label at its widest.
+ */
 const splitOversizedSection = (
   identity: string,
   target: SectionTarget,
   section: string,
   budget: number,
 ): ReviewChunkPart[] => {
-  const headerEnd = section.indexOf("\n") + 1;
-  const header = headerEnd > 0 ? section.slice(0, headerEnd) : "";
-  const payload = section.slice(header.length);
-  const capacity = budget - header.length;
-  if (capacity <= 0) return [wholeFilePart(identity, section, [target])];
-
-  const parts: ReviewChunkPart[] = [];
-  for (let offset = 0; offset < payload.length; offset += capacity) {
-    parts.push({
-      identity,
-      diff: `${header}${payload.slice(offset, offset + capacity)}`,
-      files: [target.path],
-      coverageTargets: [{
-        file: `${identity}:${target.path}`,
-        slice: sliceKey(identity, target.path, target.section, offset),
-      }],
-    });
+  const header = sectionHeader(section);
+  const named = header + (/^--- [^\n]*\n\+\+\+ [^\n]*\n/.exec(section.slice(header.length))?.[0] ?? "");
+  // A section with no content marker keeps its first line as its header.
+  const fileHeader = named.length < section.length ? named : section.slice(0, section.indexOf("\n") + 1);
+  const payload = section.slice(fileHeader.length);
+  let widestStart = 0;
+  let longestHunk = 0;
+  for (const hunk of payload.matchAll(HUNK_LINE)) {
+    widestStart = Math.max(widestStart, Number(hunk[1]), Number(hunk[2]));
+    longestHunk = Math.max(longestHunk, hunk[0].length);
   }
-  return parts;
+  // Eight numbers, none over this many digits; each has one digit in this, the longest wording.
+  const digits = String(section.length + 1 + widestStart).length;
+  const labelRoom = rangePartLabel(2, 3, 0, 0, 0, { line: 0, inside: true, hunk: "@", old: 0, new: 0 }).length + 8 * (digits - 1);
+  const room = budget - labelRoom - fileHeader.length;
+  if (payload === "" || room - longestHunk < 2) return [wholeFilePart(identity, section, [target])];
+
+  const positionOf = patchPositions(payload, fileHeader.split("\n").length);
+  const ranges: Array<{ start: number; end: number; from: PatchPosition }> = [];
+  for (let start = 0; start < payload.length; ) {
+    const from = positionOf(start);
+    let end = Math.min(payload.length, start + room - from.hunk.length);
+    if (end < payload.length) {
+      const newline = payload.lastIndexOf("\n", end - 1);
+      if (newline >= start) end = newline + 1;
+      else if (isHighSurrogate(payload.charCodeAt(end - 1)) && isLowSurrogate(payload.charCodeAt(end))) end -= 1;
+    }
+    ranges.push({ start, end, from });
+    start = end;
+  }
+  return ranges.map(({ start, end, from }, index) => ({
+    identity,
+    diff: `${fileHeader}${from.hunk}${payload.slice(start, end)}`,
+    files: [target.path],
+    coverageTargets: [{
+      file: `${identity}:${target.path}`,
+      slice: sliceKey(identity, target.path, target.section, start),
+    }],
+    rangeLabel: rangePartLabel(index + 1, ranges.length, start, end, payload.length, from),
+  }));
 };
 
 export const __testing = { splitDiffs, parseVerdict, worseVerdict, validateChunkCoverage, VERDICT_SCHEMA, LOCKFILE_CHUNK_THRESHOLD_CHARS };

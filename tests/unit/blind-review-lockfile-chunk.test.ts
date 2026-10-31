@@ -217,14 +217,15 @@ describe("a lockfile is reviewed whole in its own chunk, never cut into ranges",
   it("splits ordinary files under git-quoted, spaced and escaped paths by the path git lists, none dropped or mis-mapped", () => {
     const listed = ['"\\355\\225\\234\\352\\270\\200/data.txt"', "my dir/a.txt", '"q\\"uote\\\\x.txt"'];
     const side = (prefix: string, path: string): string => (path.startsWith('"') ? `"${prefix}${path.slice(1)}` : `${prefix}${path}`);
-    const sections = listed.map((path, index) => `diff --git ${side("a/", path)} ${side("b/", path)}\n${String(index).repeat(300)}\n`);
-    const { chunks, omitted, unmapped } = __testing.splitDiffs([{ identity: IDENTITY, diff: sections.join(""), files: listed }], 100);
+    const sections = listed.map((path, index) => `diff --git ${side("a/", path)} ${side("b/", path)}\n${String(index).repeat(3_000)}\n`);
+    const { chunks, omitted, unmapped } = __testing.splitDiffs([{ identity: IDENTITY, diff: sections.join(""), files: listed }], 1_000);
 
     expect([omitted, unmapped]).toEqual([[], []]);
     for (const [index, path] of listed.entries()) {
       const parts = chunks.flat().filter((part) => part.files.includes(path));
+      expect(parts.length).toBeGreaterThan(1);
       expect(parts.every((part) => part.files.length === 1 && part.diff.startsWith(`diff --git ${side("a/", path)} `))).toBe(true);
-      expect(parts.map((part) => part.diff.slice(part.diff.indexOf("\n") + 1)).join("")).toBe(`${String(index).repeat(300)}\n`);
+      expect(parts.map((part) => part.diff.slice(part.diff.indexOf("\n") + 1)).join("")).toBe(`${String(index).repeat(3_000)}\n`);
     }
   });
 
@@ -243,23 +244,23 @@ describe("a lockfile is reviewed whole in its own chunk, never cut into ranges",
     }
   });
 
-  it("still splits a large file that is not a lockfile exactly as before", () => {
+  it("still splits a large file that is not a lockfile into labelled ranges, and keeps the lockfile whole", () => {
     const header = "diff --git a/large.ts b/large.ts\n";
-    const payload = `${Array.from({ length: 250 }, (_, index) => index.toString(36).padStart(4, "0")).join("")}\n`;
+    const payload = `${Array.from({ length: 2_500 }, (_, index) => index.toString(36).padStart(4, "0")).join("")}\n`;
     const lock = newFileSection("yarn.lock", lockfileText(400, 10));
     const { chunks, omitted } = __testing.splitDiffs(
       [{ identity: IDENTITY, diff: `${header}${payload}${lock}`, files: ["large.ts", "yarn.lock"], lockfiles: [added("yarn.lock", lock)] }],
-      100,
+      1_000,
       1_000,
     );
 
     expect(omitted).toEqual([]);
-    const capacity = 100 - header.length;
     const ranges = chunks.flat().filter((part) => part.files[0] === "large.ts");
-    expect(ranges.map((part) => part.diff)).toEqual(
-      Array.from({ length: Math.ceil(payload.length / capacity) }, (_, index) => `${header}${payload.slice(index * capacity, (index + 1) * capacity)}`),
-    );
+    expect(ranges.length).toBeGreaterThan(1);
+    expect(ranges.every((part) => part.diff.startsWith(header) && part.diff.length + (part.rangeLabel?.length ?? 0) <= 1_000)).toBe(true);
+    expect(ranges.map((part) => part.diff.slice(header.length)).join("")).toBe(payload);
     expect(chunks.flat().filter((part) => part.files[0] === "yarn.lock").map((part) => part.diff)).toEqual([lock]);
+    expect(chunks.flat().filter((part) => part.files[0] === "yarn.lock").map((part) => part.rangeLabel)).toEqual([undefined]);
   });
 });
 
