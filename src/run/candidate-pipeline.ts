@@ -176,6 +176,18 @@ const revisionAuditEvidence = (
   } as Evidence;
 };
 
+/**
+ * F1 — what the owning CTO is told, in band, when a review did not judge the product: a review that answered on
+ * method findings alone, or one that could not be constituted. It is no revision request for the product. The
+ * text is fixed here and never carries reviewer text; the reason code beside it is the gate's own.
+ */
+export const UNJUDGED_REVIEW_NOTICES = {
+  METHOD_FINDINGS_ONLY:
+    "This is not a product revision. The blind review answered on review-method findings alone, so it did not judge the product. Keep the PLAN and the code exactly as they are and change nothing. Next step: call result_submit again with a new idempotencyKey; that freezes the candidate afresh and runs a fresh review. If the fresh review again answers on method findings alone, stop resubmitting and open a CEO escalation for this run with escalation_open.",
+  REVIEW_UNAVAILABLE:
+    "This is not a product revision. The blind review could not judge the product: assurance could not be constituted, for the reason code given. Keep the PLAN and the code exactly as they are and change nothing. Next step: call result_submit again with a new idempotencyKey; that freezes the candidate afresh and runs a fresh review. If the fresh review is unavailable again, stop resubmitting and open a CEO escalation for this run with escalation_open.",
+} as const;
+
 export interface SubmitResultInput {
   runId: string;
   ownerSessionId: string;
@@ -694,7 +706,7 @@ export class CandidatePipeline {
           },
         } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string }));
         if (built === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewedPlan);
-        if (!built.allowed) return built as Decision<PipelineOutcome>;
+        if (!built.allowed) return this.returnBlockedPass(input, attemptId, snapshotDigest, built, reviewedPlan);
         return allow(ReasonCode.OK, {
           stage: "COMPLETED_REVIEW",
           packet: built.value,
@@ -840,7 +852,7 @@ export class CandidatePipeline {
         },
       } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string }));
       if (built === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewed);
-      if (!built.allowed) return built as Decision<PipelineOutcome>;
+      if (!built.allowed) return this.returnBlockedPass(input, attemptId, snapshotDigest, built, reviewed);
 
       return allow(ReasonCode.OK, {
         stage: "COMPLETED_REVIEW",
@@ -981,16 +993,19 @@ export class CandidatePipeline {
           },
         });
       };
+      // F1 — the owning CTO is told in the same transaction (`noticeUnjudgedReview`); a notice the outbox
+      // refuses is answered as that refusal, with nothing recorded, as a refused revision is.
       const recorded = held
         ? this.applyHolding(input, attemptId, () => {
             recordUnavailable(true);
-            return allow(ReasonCode.OK, undefined);
+            return this.noticeUnjudgedReview(runId, snapshotDigest, reviewed, attemptId);
           })
         : null;
       // #1189 R1-01 — an attempt that no longer holds the run keeps its failure as its own history: the
       // row names its attempt and says it did not hold the run, so it is never the run's current outcome
       // and never the cause of a review retry (`Daemon.#bootstrapReviewRetry`).
       if (recorded === null) recordUnavailable(false);
+      else if (!recorded.allowed) return recorded as Decision<PipelineOutcome>;
       return allow(ReasonCode.OK, {
         stage: "REVIEW_UNAVAILABLE",
         reasonCode: reviewed.reasonCode,
@@ -1382,6 +1397,68 @@ export class CandidatePipeline {
       dims: { stage: evidence["stage"] ?? null, mode: run.executionMode },
     });
     return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * F1 — a PASS whose findings hold a BLOCKER is refused by the production gate as REVIEW_BLOCK, and goes back to
+   * the owning CTO as a BLOCK verdict does: `returnToCto` with the reviewer's packet, keyed by this attempt and
+   * candidate, so a replay delivers nothing new. The gate's refusal stays the answer; any other refusal is as before.
+   */
+  private returnBlockedPass(
+    input: SubmitResultInput,
+    attemptId: string,
+    snapshotDigest: string,
+    built: Decision<ProductionReadyPacket>,
+    reviewed: Decision<ReviewPacket> | null,
+  ): Decision<PipelineOutcome> {
+    if (built.reasonCode !== ReasonCode.REVIEW_BLOCK || reviewed === null || !reviewed.allowed) return built as Decision<PipelineOutcome>;
+    const returned = this.applyHolding(input, attemptId, () => this.returnToCto(input.runId, ReasonCode.REVIEW_BLOCK, {
+      stage: "blind-review",
+      candidateSnapshotDigest: snapshotDigest,
+      runId: input.runId,
+      packet: reviewed.value,
+    }, attemptId));
+    if (returned === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewed);
+    if (!returned.allowed) return returned as Decision<PipelineOutcome>;
+    return built as Decision<PipelineOutcome>;
+  }
+
+  /**
+   * F1 — a review that did not judge the product (method findings alone, or assurance not constituted) tells the
+   * owning CTO so in band, keyed as a revision is by candidate, reason and attempt: the gate's reason code, a fixed
+   * notice and its fixed recovery text (`UNJUDGED_REVIEW_NOTICES`). It asks for no product change and records no
+   * revision. A method-only review's own method findings ride along, read from the review the gate stored; this
+   * private delivery is the only place they go. A run with no active owner binding gets nothing, as a revision.
+   */
+  private noticeUnjudgedReview(runId: string, snapshotDigest: string, reviewed: Decision<ReviewPacket>, attemptId: string): Decision<void> {
+    const run = this.runs.require(runId);
+    // Limit: a project-less bootstrap run gets no notice. Its driven bootstrap CTO is told to write and submit a new
+    // PLAN for any REVISION_REQUEST, which would replace the PLAN under review; it keeps the daemon's review-retry
+    // wake (`Daemon.#bootstrapReviewRetry`), which resubmits the same PLAN, as today.
+    if (isProjectlessBootstrap(run)) return allow(ReasonCode.OK, undefined);
+    const roleKey = this.runs.ownerRoleKeyFor(run);
+    const binding = roleKey ? this.bindings.active(roleKey) : null;
+    if (!binding) return allow(ReasonCode.OK, undefined);
+    const notice = reviewed.evidence["problem"] === "METHOD_FINDINGS_ONLY" ? "METHOD_FINDINGS_ONLY" : "REVIEW_UNAVAILABLE";
+    const methodFindings = notice === "METHOD_FINDINGS_ONLY" ? this.storedReview(runId, snapshotDigest)?.content.methodFindings : undefined;
+    const enqueued = this.outbox.enqueue({
+      idempotencyKey: `revision:${runId}:${snapshotDigest}:${reviewed.reasonCode}:${attemptId}`,
+      roleKey: binding.roleKey,
+      bindingGeneration: binding.bindingGeneration,
+      targetSessionId: binding.sessionId,
+      runId,
+      kind: MessageKind.REVISION_REQUEST,
+      payload: {
+        runId,
+        reasonCode: reviewed.reasonCode,
+        stage: "review-unavailable",
+        candidateSnapshotDigest: snapshotDigest,
+        notice,
+        recovery: UNJUDGED_REVIEW_NOTICES[notice],
+        ...(methodFindings === undefined ? {} : { methodFindings }),
+      },
+    });
+    return enqueued.allowed ? allow(ReasonCode.OK, undefined) : (enqueued as Decision<void>);
   }
 
   /** The review gate's own BLIND_REVIEW artifact for a candidate, or null when the gate stored none. */
