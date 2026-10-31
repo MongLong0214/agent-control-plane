@@ -3,6 +3,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, Role, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
+import { UNJUDGED_REVIEW_NOTICES } from "../../src/run/candidate-pipeline.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, commitAll, writeFiles } from "../helpers/fixtures.ts";
 import {
@@ -188,7 +189,10 @@ describe("#1189 §3: an unavailable review is not a code-fix verdict", () => {
     }
     expect([ReasonCode.REVIEW_REVISE, ReasonCode.REVIEW_BLOCK, ReasonCode.REVIEW_OMITTED_ITEMS_PRESENT]).not.toContain(outcome.value.reasonCode);
     expect(harness.cp.audit.forRun(runId).filter((row) => row.kind === "REVISION_RETURNED_TO_CTO")).toEqual([]);
-    expect(harness.cp.outbox.listByRun(runId).filter((message) => message.kind === MessageKind.REVISION_REQUEST)).toEqual([]);
+    // F1 — the owner gets exactly one fixed notice, no revision: the reason code, the notice and its recovery text only.
+    expect(harness.cp.outbox.listByRun(runId).filter((message) => message.kind === MessageKind.REVISION_REQUEST).map((message) => message.payload)).toEqual([{
+      runId, reasonCode: outcome.value.reasonCode, stage: "review-unavailable", candidateSnapshotDigest: outcome.value.snapshotDigest,
+      notice: "REVIEW_UNAVAILABLE", recovery: UNJUDGED_REVIEW_NOTICES.REVIEW_UNAVAILABLE }]);
     expect(harness.cp.artifacts.list(runId, "BLIND_REVIEW")).toEqual([]);
     expectNotCeoReady(harness, runId, outcome.value.snapshotDigest, ceoSessionId);
   });
@@ -358,7 +362,16 @@ describe("#1271: a method finding judges the review method, never the candidate"
       }
       expect(outcome.value.reasonCode).toBe(ReasonCode.REVIEW_REQUIRED);
       expect(harness.cp.audit.forRun(runId).filter((row) => row.kind === "REVISION_RETURNED_TO_CTO")).toEqual([]);
-      expect(harness.cp.outbox.listByRun(runId).filter((message) => message.kind === MessageKind.REVISION_REQUEST)).toEqual([]);
+      // F1 — the owner gets exactly one fixed notice, no revision; the method findings ride only in that private delivery.
+      expect(harness.cp.outbox.listByRun(runId).filter((message) => message.kind === MessageKind.REVISION_REQUEST).map((message) => message.payload)).toEqual([{
+        runId, reasonCode: ReasonCode.REVIEW_REQUIRED, stage: "review-unavailable", candidateSnapshotDigest: outcome.value.snapshotDigest,
+        notice: "METHOD_FINDINGS_ONLY", recovery: UNJUDGED_REVIEW_NOTICES.METHOD_FINDINGS_ONLY, methodFindings: [method] }]);
+      for (const reviewerText of [method.summary, method.detail]) {
+        expect(JSON.stringify(outcome)).not.toContain(reviewerText);
+        // The dogfood record of the method finding (#1271, below) is the only audit row that keeps its text.
+        expect(harness.cp.audit.forRun(runId).filter((row) => JSON.stringify(row).includes(reviewerText)).map((row) => row.kind))
+          .toEqual(["UPSTREAM_DOGFOOD_FINDING"]);
+      }
       expect(harness.cp.review.latestPacket(runId, outcome.value.snapshotDigest)).toMatchObject({
         verdict: value, findings: [], methodFindings: [{ category: "method" }],
       });
