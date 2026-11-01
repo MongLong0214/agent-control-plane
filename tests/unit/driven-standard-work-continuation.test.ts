@@ -1078,8 +1078,8 @@ describe("review r1 probe 3, kept as written", () => {
       let release!: () => void;
       let entered = false;
       const barrier = new Promise<void>((resolve) => { release = resolve; });
-      const prepare = f.launch.prepare.bind(f.launch);
-      vi.spyOn(f.launch, "prepare").mockImplementationOnce(async () => { entered = true; await barrier; return prepare(); });
+      const prepare = f.drivenDoor.prepare.bind(f.drivenDoor);
+      vi.spyOn(f.drivenDoor, "prepare").mockImplementationOnce(async () => { entered = true; await barrier; return prepare(); });
       const turns = f.finishedTurns(sessionId);
       expect(f.daemon.wakeStandardWorkContinuation().woken).toHaveLength(1);
       await vi.waitFor(() => expect(entered).toBe(true));

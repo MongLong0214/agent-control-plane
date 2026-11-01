@@ -790,7 +790,7 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
         cp.sessionRuntime.attach({
           delivery: {
             prepare: async () => {
-              const prepared = await f.launch.prepare();
+              const prepared = await f.drivenDoor.prepare();
               if (armed) {
                 armed = false;
                 cp.sessions.transition(binding.sessionId, SessionLifecycle.ERROR, "fixture: failed during preparation");
@@ -799,10 +799,10 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
             },
             provision: async (credential) => {
               provisioned += 1;
-              return f.launch.provision(credential);
+              return f.drivenDoor.provision(credential);
             },
             withdraw: (externalSessionId) => {
-              const untaken = f.launch.withdraw(externalSessionId);
+              const untaken = f.drivenDoor.withdraw(externalSessionId);
               if (provisioned > 0) withdrawn.push(untaken);
               return untaken;
             },
@@ -828,15 +828,15 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       let provisioned = 0;
       f.harness.cp.sessionRuntime.attach({
         delivery: {
-          prepare: () => f.launch.prepare(),
+          prepare: () => f.drivenDoor.prepare(),
           provision: async (credential) => {
-            const result = await f.launch.provision(credential);
+            const result = await f.drivenDoor.provision(credential);
             provisioned += 1;
             if (provisioned === 1) change();
             return result;
           },
           withdraw: (externalSessionId) => {
-            const untaken = f.launch.withdraw(externalSessionId);
+            const untaken = f.drivenDoor.withdraw(externalSessionId);
             if (provisioned > 0) withdrawn.push(untaken);
             return untaken;
           },

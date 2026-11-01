@@ -149,7 +149,10 @@ import {
 } from "../ingress/telegram-external.ts";
 import type { TelegramDirectAnswer } from "../ingress/telegram-router.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
-import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
+import type { SessionLaunchCredential, SessionLaunchPin } from "../cto/cto-lifecycle.ts";
+import type { SessionRegistry } from "../session/session-registry.ts";
+import type { AuditLog } from "../db/audit.ts";
+import { createRequire } from "node:module";
 import {
   CanonicalCtoRestoreCondition,
   type CanonicalCtoAttachChallenger,
@@ -426,16 +429,51 @@ export interface LocalMcpListenerOptions {
   ceoConversation?: CeoConversationPort;
 }
 
+/**
+ * #1336 — which of the channel's two doors an entry came through, recorded by the channel at provision
+ * time and never by the session: `provision` is the interactive door (`CtoLifecycle`'s spawn), `driven`
+ * the door the session runtime's turns are handed. It does not depend on the turn's pin.
+ */
+export type SessionLaunchDoor = "interactive" | "driven";
+
+/** #1336 — the driven door: what the session runtime is attached with, so every entry it offers is driven. */
+export interface DrivenSessionLaunchDoor {
+  prepare(): Promise<Decision<void>>;
+  /** Offers a driven turn's credential: served only over raw Mach, never on `socketPath`. */
+  provision(input: SessionLaunchCredential): Promise<Decision<void>>;
+  withdraw(externalSessionId: string): boolean;
+}
+
 /** A one-time, owner-only credential handoff for a runtime that was just constituted. */
 export interface LocalSessionLaunchChannel {
   socketPath: string;
   prepare(): Promise<Decision<void>>;
+  /** The confirmed interactive door: an entry offered here is the one kind `socketPath` hands over. */
   provision(input: SessionLaunchCredential): Promise<Decision<void>>;
+  /**
+   * #1336 — the driven door, for the session runtime's `delivery`. Its entries are refused on
+   * `socketPath` from the moment they are offered, before and without a turn pin.
+   */
+  readonly driven: DrivenSessionLaunchDoor;
   /**
    * #246 C1b — removes a credential still waiting for its runtime. True when one was there to
    * remove: the runtime never took it. False when none was: it was taken, or never offered.
    */
   withdraw(externalSessionId: string): boolean;
+  /**
+   * O4b B' — the raw-Mach name a driven turn's credential is handed over on, once `enableMachService`
+   * has checked it in; `null` before that, and on a daemon where check-in failed. A driven turn is
+   * served only here, never on `socketPath`.
+   */
+  readonly machServiceName: string | null;
+  /**
+   * O4b B' — `bootstrap_check_in` the Mach launch service and start the non-blocking receive. Called
+   * once, after the daemon's database admission has succeeded, so a #738-refused daemon (which exits
+   * before this) never checks in and so can never be relaunched into serving by a Mach request. With no
+   * `isolatedServiceName` the production launchd-reserved name is used; a unique per-run name is an
+   * explicit test-only argument and is never read from configuration or the environment.
+   */
+  enableMachService(options?: { isolatedServiceName?: string }): Decision<{ serviceName: string }>;
   close(): Promise<void>;
 }
 
@@ -447,7 +485,306 @@ export interface SessionLaunchChannelOptions {
    * argv or environment. Omitted, a reply carries the credential alone, as before.
    */
   mcpToken?: string;
+  /**
+   * O4b B' — the registry whose `verifySecret`/`rotateSecret` the Mach hand-over binds the entry to at
+   * delivery (step (f)) and invalidates the secret with after an uncertain send (rotation, else the
+   * session is marked ERROR: `invalidateAfterUncertainSend`). Omitted, the Mach service cannot be enabled.
+   */
+  sessions?: MachLaunchSessions;
+  /**
+   * #1336 — the session runtime's custody of each session's credential (`ProvisionedSessionRuntime.release`),
+   * dropped when an uncertain send left a secret that could not be shown invalid, so no turn of that session
+   * runs and no launch is offered for it. Omitted, that block is ERROR alone.
+   */
+  custody?: MachLaunchCustody;
+  /** O4b B' — where a Mach admission refusal, send failure or delivery is audited, never the credential. */
+  audit?: Pick<AuditLog, "record">;
+  /** O4b B' — the native addon, injectable so a witness can drive admission on real Mach facts. */
+  machLoader?: () => MachLaunchAddon;
 }
+
+/** O4b B' — what the Mach hand-over reads and writes on the session registry. */
+export type MachLaunchSessions = Pick<SessionRegistry, "verifySecret" | "rotateSecret" | "get" | "transition">;
+/** #1336 — the one thing the Mach hand-over asks of the session runtime: forget a session's credential. */
+export interface MachLaunchCustody {
+  release(sessionId: string): void;
+}
+
+/**
+ * O4b B' — the launchd-reserved Mach service name a production daemon checks in and a driven turn's
+ * relay claims on. Derived from the daemon's launchd label (`LABEL`) the way every other reserved name
+ * is: one fixed string, declared in `deploy/com.agentcontrolplane.agentcpd.plist.template`'s MachServices.
+ * A successful `bootstrap_look_up` of it is not proof of the daemon's identity; in production only this
+ * launchd-declared name is used, and launchd refuses a same-uid process that tries to check it in
+ * (measured, step 1: kr=1100), so a squatter cannot answer for it. `src/cli/session-relay.ts` and
+ * `src/runtime/cli-adapters.ts` carry a literal copy of this string, kept in sync by hand, because the
+ * relay imports nothing daemon-side and the adapter must not import the daemon entrypoint.
+ */
+export const MACH_LAUNCH_RESERVED_SERVICE = "com.agentcontrolplane.agentcpd.launch";
+
+/** O4b B' — the native addon's daemon and lineage surface (native/mach-launch). */
+export interface MachLaunchAddon {
+  listen(serviceName: string, onRequest: (request: MachLaunchIncoming) => void): MachLaunchHandle;
+  respond(handle: MachLaunchHandle, id: number, status: number, body?: Buffer): boolean;
+  close(handle: MachLaunchHandle): { drained: number; refused: number; released: boolean };
+  instanceLive(token: Buffer): boolean;
+  bsdInfo(pid: number): { ppid: number; startSec: number; startUsec: number } | null;
+  auditTokenOfPid(pid: number): Buffer | null;
+  childPids(pid: number): number[];
+  executablePath(pid: number): string | null;
+  readonly STATUS: { OK: number; REFUSED: number; STOPPING: number; BUSY: number; MALFORMED: number };
+  readonly MAX_BODY: number;
+}
+export type MachLaunchHandle = object;
+/** One request the addon delivered to JavaScript: the kernel audit token and the sender it names. */
+export interface MachLaunchIncoming {
+  readonly id: number;
+  readonly body: Buffer;
+  readonly token: Buffer;
+  readonly live: boolean;
+  readonly sender: { readonly pid: number; readonly pidversion: number; readonly euid: number };
+}
+
+/** The `darwin-tv:` start token `readProcessStartToken` renders, formed here from `bsdInfo`'s fields. */
+const formatDarwinStartToken = (startSec: number, startUsec: number): string =>
+  `darwin-tv:${startSec}.${String(startUsec).padStart(6, "0")}`;
+
+let cachedMachAddon: MachLaunchAddon | null | undefined;
+/**
+ * Loads the native addon the way `src/core/peercred.ts` loads peercred: `createRequire`, from
+ * `dist/native/...` inside an installed generation (what `copy-native-mach-launch-into-dist.mjs` placed
+ * there), else the in-tree `native/...` build for a source checkout. Throws if neither is present, so a
+ * driven turn fails closed rather than falling back to another transport.
+ *
+ * #1336 — the candidate is chosen as `machLaunchAddonPath` (`src/runtime/cli-adapters.ts`) chooses the one the
+ * relay loads: the first that exists, and only that one. A generation-local copy that exists but fails to
+ * load is a refusal here, never a reason to load the next candidate, which for a generation installed as its
+ * own `dist` tree lies outside it (and is not the file the relay would load).
+ */
+export const loadMachLaunchAddon = (): MachLaunchAddon => {
+  if (cachedMachAddon !== undefined) {
+    if (cachedMachAddon === null) throw new Error("the mach-launch addon could not be loaded");
+    return cachedMachAddon;
+  }
+  const require = createRequire(import.meta.url);
+  const relative = join("native", "mach-launch", "build", "Release", "mach_launch.node");
+  // From `dist/daemon` the generation-local copy is `../native/...`; from `src/daemon` the in-tree build
+  // is `../../native/...`. Try the generation-local one first, matching `copy-native-mach-launch-into-dist`.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const candidate = [join("..", relative), join("..", "..", relative)].find((path) => existsSync(join(here, path)));
+  if (candidate !== undefined) {
+    try {
+      cachedMachAddon = require(candidate) as MachLaunchAddon;
+      return cachedMachAddon;
+    } catch {
+      /* the one candidate that exists failed to load: refused below, never another candidate */
+    }
+  }
+  cachedMachAddon = null;
+  throw new Error("the mach-launch addon could not be loaded");
+};
+
+/**
+ * O4b B' — on a #738 database refusal under launchd (the exit-0 stop signal), answer and release every
+ * request launchd queued for this job, and serve nothing.
+ *
+ * Measured (W-738 long window): a demand-launched job that exits without ever checking its declared Mach
+ * service in is relaunched every ThrottleInterval indefinitely after a burst — a log and CPU loop — even
+ * though the queue itself is bounded (sends past the queue limit time out unqueued). Checking the name in
+ * and handing it straight back, emptied, ends that.
+ *
+ * This is the whole of what runs: the addon's `listen` with a callback that does nothing, then `close`,
+ * whose native teardown answers every request still queued in the kernel or held by the receive thread
+ * with STOPPING and destroys the service's rights. No JavaScript answers anything here, and no session
+ * channel, credential store, pending entry or `serveMachLaunchCredential` exists on this path — the
+ * database admission failed before any of them was built — so it cannot hand anything out. #738's refusal
+ * condition and exit are unchanged; this only runs immediately before that exit.
+ */
+export const drainMachLaunchQueueOnRefusal = (
+  serviceName: string = MACH_LAUNCH_RESERVED_SERVICE,
+  loader: () => MachLaunchAddon = loadMachLaunchAddon,
+): { drained: number; refused: number; released: boolean } | null => {
+  let addon: MachLaunchAddon;
+  let handle: MachLaunchHandle;
+  try {
+    addon = loader();
+    handle = addon.listen(serviceName, () => { /* never answered here: close() refuses it STOPPING */ });
+  } catch {
+    return null;
+  }
+  return addon.close(handle);
+};
+
+/** The native lineage reads an admission uses; injectable so a witness can supply the real addon. */
+export interface MachLineageReaders {
+  instanceLive(token: Buffer): boolean;
+  bsdInfo(pid: number): { ppid: number; startSec: number; startUsec: number } | null;
+}
+
+/** The native reads the CLI pin uses, all taken by the daemon from the kernel: nothing anyone reports. */
+export interface MachCliPinReaders extends MachLineageReaders {
+  auditTokenOfPid(pid: number): Buffer | null;
+  childPids(pid: number): number[];
+  executablePath(pid: number): string | null;
+}
+
+/**
+ * O4b B' — the images the turn holder's own start-up passes the CLI through before the CLI runs:
+ * `PROBE_HOLDER_SCRIPT`'s `ksh` forks the child (image `/bin/ksh`), which execs `holderRestoredEnvironment`'s
+ * `/usr/bin/env`, which execs the CLI. These are the normal start-up execs and are never flagged; the CLI
+ * is pinned only once its image is neither, i.e. once its own start-up exec has finished.
+ */
+export const HOLDER_START_UP_IMAGES: ReadonlySet<string> = new Set(["/bin/ksh", "/usr/bin/env"]);
+
+/**
+ * O4b B' — pins the driven turn's CLI, by the daemon alone: the CLI process instance the daemon first
+ * observed after it left the holder's start-up images. That is what the pin trusts, not that the image is
+ * the intended CLI: whatever the holder's one child became after its start-up execs is what gets pinned.
+ *
+ * The daemon does not spawn the CLI (the holder does), so it cannot pin the CLI in a spawn tick the way
+ * slice A pins the holder. Instead it discovers the CLI itself and verifies every fact from the kernel:
+ * the holder must still be the pinned holder (its live start token equals the pin), must have exactly one
+ * child (the holder runs one `"$@"`), that child's image must have left `HOLDER_START_UP_IMAGES` (its
+ * normal start-up exec is done), its parent must be the holder, and its audit token is then read through
+ * `task_name_for_pid` and re-checked live with the same parent and image. Nothing the holder, the CLI or the
+ * relay reports is used, and the relay never pins anything. The bound token carries the CLI's pidversion,
+ * which changes on every exec, so `instanceLive(cliPin.token)` at admission refuses any exec after the pin.
+ *
+ * Returns true when the entry is (now) pinned. False means "not yet" — it is retried, never relaxed.
+ */
+export const pinDrivenCli = (entry: PendingLaunchCredential, readers: MachCliPinReaders): boolean => {
+  if (entry.cliPin) return true;
+  const holderPin = entry.credential.pin;
+  if (!holderPin || holderPin.startToken === null) return false;
+  const holder = readers.bsdInfo(holderPin.pid);
+  if (!holder || formatDarwinStartToken(holder.startSec, holder.startUsec) !== holderPin.startToken) return false;
+  const children = readers.childPids(holderPin.pid);
+  if (children.length !== 1) return false;
+  const cliPid = children[0]!;
+  const image = readers.executablePath(cliPid);
+  if (image === null || HOLDER_START_UP_IMAGES.has(image)) return false;
+  const cli = readers.bsdInfo(cliPid);
+  if (!cli || cli.ppid !== holderPin.pid) return false;
+  const token = readers.auditTokenOfPid(cliPid);
+  if (!token) return false;
+  // Re-read after taking the token: still live as that very instance, same parent, same image.
+  const cliAgain = readers.bsdInfo(cliPid);
+  if (!readers.instanceLive(token) || !cliAgain || cliAgain.ppid !== holderPin.pid || readers.executablePath(cliPid) !== image) {
+    return false;
+  }
+  entry.cliPin = { pid: cliPid, token };
+  return true;
+};
+
+/**
+ * O4b B' — pins each pending driven entry's CLI as soon as the kernel shows it has finished its start-up
+ * exec. It polls while any entry still lacks a CLI pin within its watch window, entries without a holder
+ * pin included (an interactive entry, or a driven one before its spawn tick): those are skipped on each
+ * tick until their holder pin arrives or they age out of the window. Returns a stop function.
+ * A claude CLI initialises for far longer than one poll before it starts its MCP relay, so the pin is
+ * taken well before the relay exists; a CLI that is still unpinned when its relay claims is refused
+ * (`CLI_NOT_PINNED`), never admitted on a late reading.
+ */
+export const startCliPinWatcher = (
+  pending: Map<string, PendingLaunchCredential>,
+  readers: MachCliPinReaders,
+  intervalMs = 2,
+  windowMs = 60_000,
+): { wake(): void; stop(): void } => {
+  let timer: ReturnType<typeof setInterval> | null = null;
+  // An entry is watched from the first tick that sees it for `windowMs`: a driven entry receives its holder
+  // pin in the spawn tick and its CLI pin milliseconds to seconds later; an interactive entry never gets a
+  // holder pin and simply ages out of the watch, so the poll never runs for a whole 30-minute entry TTL.
+  const firstSeen = new WeakMap<PendingLaunchCredential, number>();
+  const needsPin = (now: number): PendingLaunchCredential[] =>
+    [...pending.values()].filter((entry) => {
+      if (entry.cliPin !== undefined) return false;
+      const seen = firstSeen.get(entry) ?? now;
+      if (!firstSeen.has(entry)) firstSeen.set(entry, now);
+      return now - seen < windowMs;
+    });
+  const tick = (): void => {
+    const now = Date.now();
+    for (const entry of needsPin(now)) {
+      if (entry.credential.pin !== undefined) pinDrivenCli(entry, readers);
+    }
+    if (needsPin(Date.now()).length === 0 && timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+  };
+  return {
+    wake: () => {
+      if (timer) return;
+      timer = setInterval(tick, intervalMs);
+      timer.unref();
+    },
+    stop: () => {
+      if (timer) clearInterval(timer);
+      timer = null;
+    },
+  };
+};
+
+/**
+ * O4b B' — per-message admission of a driven turn's credential, the real process shape and nothing else:
+ * the pinned turn holder → the claude CLI → the sender (the CLI's own MCP child). Every check holds, or
+ * the credential is refused; the caller then consumes the entry atomically and replies.
+ *
+ * Three kinds of evidence, kept apart: the holder pin (slice A, the holder's own spawn tick); the CLI pin
+ * (`pinDrivenCli`, the CLI's post-start-up audit token, taken by the daemon from the kernel); and the kernel
+ * audit token on the message (the sender's). The sender's instance is bound by its token's pidversion
+ * (`instanceLive`), which pid reuse cannot forge — the counterexample AF_UNIX left open (step 1). The CLI's
+ * instance is bound by the pinned token's pidversion, which changes on every exec, so a CLI that exec'd
+ * after its pin is refused (`CLI_EXEC_AFTER_PIN`); its start token (fork time) is also re-read. The holder's
+ * pin is its start token: the holder's own `sandbox-exec`→`ksh` exec precedes the pin's read, and the
+ * holder's binding is to its fork instance, which the check against its sole child keeps meaningful.
+ *
+ * Returns a refusal whose message is the stage, for the caller to audit — never the credential.
+ */
+export const admitMachLaunchGrandchild = (
+  readers: MachLineageReaders,
+  senderPid: number,
+  token: Buffer,
+  pin: SessionLaunchPin,
+  cliPin?: { readonly pid: number; readonly token: Buffer },
+): Decision<void> => {
+  const refuse = (stage: string): Decision<void> => deny(ReasonCode.MACH_LAUNCH_ADMISSION_REFUSED, stage, { reason: stage });
+  if (pin.startToken === null) return refuse("HOLDER_PIN_UNKNOWN");
+  // (a) the sender is still the token's own instance.
+  if (!readers.instanceLive(token)) return refuse("SENDER_INSTANCE_GONE");
+  // (b) C = the sender's parent, read while the token is live.
+  const sender1 = readers.bsdInfo(senderPid);
+  if (!sender1) return refuse("SENDER_UNREADABLE");
+  const cliPid = sender1.ppid;
+  const cli1 = readers.bsdInfo(cliPid);
+  if (!cli1) return refuse("CLI_UNREADABLE");
+  // (c) C's parent is the pinned holder, and the holder's live start token equals the pin.
+  if (cli1.ppid !== pin.pid) return refuse("NOT_HOLDER_GRANDCHILD");
+  const holder1 = readers.bsdInfo(pin.pid);
+  if (!holder1) return refuse("HOLDER_UNREADABLE");
+  if (formatDarwinStartToken(holder1.startSec, holder1.startUsec) !== pin.startToken) return refuse("HOLDER_NOT_PINNED");
+  // (d) bind C's own instance: its fork instance by start token, and its exec image by the CLI pin — the
+  // audit token the daemon took once C finished its start-up exec. A C that is not the pinned CLI, or that
+  // exec'd (or was replaced) after its pin, is refused; the CLI's normal start-up exec preceded the pin.
+  const cliStart = formatDarwinStartToken(cli1.startSec, cli1.startUsec);
+  if (!cliPin) return refuse("CLI_NOT_PINNED");
+  if (cliPin.pid !== cliPid) return refuse("CLI_NOT_THE_PINNED_CLI");
+  if (!readers.instanceLive(cliPin.token)) return refuse("CLI_EXEC_AFTER_PIN");
+  // (e) re-read: the sender is still live, its parent is still C, C is the same instance with the same
+  // parent and the same exec image, and the holder is still the pinned instance.
+  if (!readers.instanceLive(token)) return refuse("SENDER_INSTANCE_GONE_LATE");
+  const sender2 = readers.bsdInfo(senderPid);
+  if (!sender2 || sender2.ppid !== cliPid) return refuse("SENDER_PARENT_CHANGED");
+  const cli2 = readers.bsdInfo(cliPid);
+  if (!cli2 || cli2.ppid !== pin.pid || formatDarwinStartToken(cli2.startSec, cli2.startUsec) !== cliStart) {
+    return refuse("CLI_CHANGED");
+  }
+  if (!readers.instanceLive(cliPin.token)) return refuse("CLI_EXEC_AFTER_PIN_LATE");
+  const holder2 = readers.bsdInfo(pin.pid);
+  if (!holder2 || formatDarwinStartToken(holder2.startSec, holder2.startUsec) !== pin.startToken) return refuse("HOLDER_CHANGED");
+  return allow(ReasonCode.OK, undefined);
+};
 
 /** A daemon-owned local hop from the authenticated Buzz relay to SessionRegistry. */
 export interface LocalBuzzActorIngress {
@@ -528,9 +865,17 @@ interface LiveOperatorBinding extends LocalOperatorCredential {
   active: boolean;
 }
 
-interface PendingLaunchCredential {
+export interface PendingLaunchCredential {
   credential: SessionLaunchCredential;
   expiresAtMs: number;
+  /** #1336 — the door the entry came through (`SessionLaunchDoor`), set by the channel and never changed. */
+  readonly door: SessionLaunchDoor;
+  /**
+   * O4b B' — the driven turn's CLI as the daemon pinned it (`pinDrivenCli`): the process instance it first
+   * observed after it left the holder's start-up images, by its pid and the audit token the daemon read from
+   * the kernel. It is not a check that the image is the intended CLI. Never set from a report.
+   */
+  cliPin?: { readonly pid: number; readonly token: Buffer };
 }
 
 /**
@@ -548,6 +893,10 @@ export const startSessionLaunchChannel = async (
   let opening: Promise<Decision<void>> | null = null;
   let closing: Promise<void> | null = null;
   let closed = false;
+  let machAddon: MachLaunchAddon | null = null;
+  let machHandle: MachLaunchHandle | null = null;
+  let machServiceName: string | null = null;
+  let cliPinWatcher: { wake(): void; stop(): void } | null = null;
 
   const pruneExpired = (): void => {
     const now = Date.now();
@@ -570,7 +919,7 @@ export const startSessionLaunchChannel = async (
         // under the daemon lock. A losing daemon can therefore never unlink the winner's
         // live launch socket while it is merely attempting startup.
         removeStaleSocket(socketPath);
-        candidate = createServer((socket) => serveSessionLaunchCredential(socket, pending, options.mcpToken));
+        candidate = createServer((socket) => serveSessionLaunchCredential(socket, pending, options.mcpToken, options.audit));
         await listenSocket(candidate, socketPath);
         if (closed) {
           await closeSocketServer(candidate);
@@ -597,32 +946,86 @@ export const startSessionLaunchChannel = async (
     return opening;
   };
 
+  // #1336 — both doors share one pending map; each entry records the door it came through, here and only here.
+  const provisionAt = (door: SessionLaunchDoor) => async (credential: SessionLaunchCredential): Promise<Decision<void>> => {
+    const prepared = await prepare();
+    if (!prepared.allowed) return prepared;
+    pruneExpired();
+    if (pending.has(credential.externalSessionId)) {
+      return deny(
+        ReasonCode.CONFLICT,
+        "a launch credential is already pending for this external session",
+        { sessionId: credential.sessionId },
+      );
+    }
+    pending.set(credential.externalSessionId, {
+      credential,
+      expiresAtMs: Date.now() + SESSION_LAUNCH_TTL_MS,
+      door,
+    });
+    // A driven entry's holder pin arrives in the spawn tick after this; the watcher pins its CLI then.
+    cliPinWatcher?.wake();
+    return allow(ReasonCode.OK, undefined);
+  };
+  const withdraw = (externalSessionId: string): boolean => pending.delete(externalSessionId);
+
   return {
     socketPath,
     prepare,
-    provision: async (credential) => {
-      const prepared = await prepare();
-      if (!prepared.allowed) return prepared;
-      pruneExpired();
-      if (pending.has(credential.externalSessionId)) {
-        return deny(
-          ReasonCode.CONFLICT,
-          "a launch credential is already pending for this external session",
-          { sessionId: credential.sessionId },
-        );
-      }
-      pending.set(credential.externalSessionId, {
-        credential,
-        expiresAtMs: Date.now() + SESSION_LAUNCH_TTL_MS,
-      });
-      return allow(ReasonCode.OK, undefined);
+    provision: provisionAt("interactive"),
+    driven: { prepare, provision: provisionAt("driven"), withdraw },
+    withdraw,
+    get machServiceName(): string | null {
+      return machServiceName;
     },
-    withdraw: (externalSessionId) => pending.delete(externalSessionId),
+    enableMachService: (machOptions = {}) => {
+      if (closed) return deny(ReasonCode.CONFLICT, "session launch channel is closed", { socketPath });
+      if (machHandle) return allow(ReasonCode.OK, { serviceName: machServiceName! });
+      const { sessions, audit, custody } = options;
+      if (!sessions || !audit) {
+        return deny(ReasonCode.MACH_LAUNCH_SERVICE_UNAVAILABLE,
+          "the Mach launch service needs a session registry and audit log", { socketPath });
+      }
+      const serviceName = machOptions.isolatedServiceName ?? MACH_LAUNCH_RESERVED_SERVICE;
+      let addon: MachLaunchAddon;
+      try {
+        addon = (options.machLoader ?? loadMachLaunchAddon)();
+      } catch (error) {
+        return deny(ReasonCode.MACH_LAUNCH_SERVICE_UNAVAILABLE, "the mach-launch addon could not be loaded",
+          { reason: "NATIVE_UNAVAILABLE", error: error instanceof Error ? error.message : String(error) });
+      }
+      try {
+        machHandle = addon.listen(serviceName, (request) =>
+          serveMachLaunchCredential(request, { pending, sessions, audit, addon, handle: machHandle!, mcpToken: options.mcpToken, ...(custody ? { custody } : {}) }));
+      } catch (error) {
+        return deny(ReasonCode.MACH_LAUNCH_SERVICE_UNAVAILABLE, "bootstrap_check_in of the Mach launch service failed",
+          { reason: "CHECK_IN_REFUSED", error: error instanceof Error ? error.message : String(error) });
+      }
+      machAddon = addon;
+      machServiceName = serviceName;
+      // The daemon's own CLI pinning: it polls while a pending entry still lacks a CLI pin within its window.
+      cliPinWatcher = startCliPinWatcher(pending, addon);
+      cliPinWatcher.wake();
+      return allow(ReasonCode.OK, { serviceName });
+    },
     close: async () => {
       if (closing) return closing;
       closed = true;
       closing = (async () => {
         pending.clear();
+        // Stop the Mach receive, answer and release every request and port the service held, before the
+        // AF_UNIX teardown. `close` is idempotent in the addon, so a double close here is harmless.
+        if (machHandle && machAddon) {
+          try {
+            machAddon.close(machHandle);
+          } catch {
+            /* a listener that already tore itself down owns nothing more to release */
+          }
+        }
+        machHandle = null;
+        machServiceName = null;
+        cliPinWatcher?.stop();
+        cliPinWatcher = null;
         if (opening) await opening;
         const active = server;
         server = null;
@@ -3846,6 +4249,7 @@ const serveSessionLaunchCredential = (
   socket: Socket,
   pending: Map<string, PendingLaunchCredential>,
   mcpToken: string | undefined,
+  audit?: Pick<AuditLog, "record">,
 ): void => {
   let buffer = Buffer.alloc(0);
   let settled = false;
@@ -3875,6 +4279,20 @@ const serveSessionLaunchCredential = (
       pending.delete(externalSessionId);
       return refuse();
     }
+    // O4b B' / #1336 — this id-only socket serves only an entry that came through the interactive door and
+    // carries no turn pin. A driven entry (one offered through the `driven` door) is served only over raw
+    // Mach, with per-message instance-bound admission, and is refused here whether or not its pin has
+    // arrived yet; so is an entry of any other door. There is no fallback from Mach to AF_UNIX, and the
+    // entry is kept for its real Mach claim. Interactive spawns keep the same-uid id-only path unchanged.
+    if (launch.door !== "interactive" || launch.credential.pin !== undefined) {
+      audit?.record({
+        kind: "SESSION_LAUNCH_CREDENTIAL_REFUSED",
+        reasonCode: ReasonCode.DRIVEN_LAUNCH_ON_AF_UNIX_REFUSED,
+        sessionId: launch.credential.sessionId,
+        evidence: { transport: "af_unix", reason: "DRIVEN_ON_AF_UNIX" },
+      });
+      return finish({ ok: false, reasonCode: ReasonCode.DRIVEN_LAUNCH_ON_AF_UNIX_REFUSED });
+    }
 
     // Consume before writing. If the peer disappears while receiving its response, retrying
     // this session is unsafe because the plaintext could already have crossed the socket.
@@ -3893,6 +4311,227 @@ const serveSessionLaunchCredential = (
       settled = true;
       socket.removeListener("data", receive);
     }
+  });
+};
+
+/**
+ * O4b B' — one driven-turn credential hand-over over raw Mach, admitted per message and answered once.
+ *
+ * Everything from reading the request to the reply happens here, synchronously, with no `await`: the
+ * addon's receive thread hands the request to this JS callback, and nothing else runs on this thread
+ * until it returns, so the admission's re-reads and the atomic consume are not interleaved with any
+ * other turn. A refusal keeps the entry (a genuine claim can still come) and audits its stage, never
+ * the credential. On a reply send that failed, threw or is uncertain the entry stays consumed and is never
+ * re-offered, and the possibly-delivered secret is invalidated or its session blocked
+ * (`invalidateAfterUncertainSend`).
+ */
+export const serveMachLaunchCredential = (
+  request: MachLaunchIncoming,
+  deps: {
+    pending: Map<string, PendingLaunchCredential>;
+    sessions: MachLaunchSessions;
+    audit: Pick<AuditLog, "record">;
+    addon: MachLaunchAddon;
+    handle: MachLaunchHandle;
+    mcpToken: string | undefined;
+    custody?: MachLaunchCustody;
+  },
+): void => {
+  const { pending, sessions, audit, addon, handle, mcpToken } = deps;
+  const refuse = (stage: string, sessionId?: string): void => {
+    audit.record({
+      kind: "SESSION_LAUNCH_CREDENTIAL_REFUSED",
+      reasonCode: ReasonCode.MACH_LAUNCH_ADMISSION_REFUSED,
+      ...(sessionId === undefined ? {} : { sessionId }),
+      evidence: { transport: "mach", reason: stage },
+    });
+    addon.respond(handle, request.id, addon.STATUS.REFUSED, Buffer.from(stage));
+  };
+  let externalSessionId: string | null = null;
+  try {
+    externalSessionId = launchExternalSessionId(JSON.parse(request.body.toString("utf8")));
+  } catch {
+    externalSessionId = null;
+  }
+  if (!externalSessionId) {
+    addon.respond(handle, request.id, addon.STATUS.MALFORMED, Buffer.from("MALFORMED"));
+    return;
+  }
+  const launch = pending.get(externalSessionId);
+  if (!launch || launch.expiresAtMs <= Date.now()) {
+    pending.delete(externalSessionId);
+    return refuse("ENTRY_UNKNOWN");
+  }
+  const { credential } = launch;
+  // Admission needs the holder pin the runtime writes in its spawn tick: an entry without one (an
+  // interactive entry, or a driven one whose turn has not spawned yet) is refused here and kept.
+  if (!credential.pin) return refuse("NO_PIN", credential.sessionId);
+  const admitted = admitMachLaunchGrandchild(
+    { instanceLive: addon.instanceLive, bsdInfo: addon.bsdInfo },
+    request.sender.pid,
+    request.token,
+    credential.pin,
+    launch.cliPin,
+  );
+  if (!admitted.allowed) return refuse(admitted.message ?? "REFUSED", credential.sessionId);
+  // (f) the entry is the same object: its secret still verifies for the session's current state, and the
+  // session is still the incarnation the entry names. verifySecret runs against the live row, so a
+  // rotation since the entry was provisioned refuses here rather than handing out a stale secret.
+  const verified = sessions.verifySecret(credential.sessionId, credential.sessionSecret);
+  if (!verified.allowed) return refuse("SECRET_STALE", credential.sessionId);
+  if (verified.value.incarnation !== credential.sessionIncarnation) return refuse("INCARNATION_STALE", credential.sessionId);
+  const credentialEpoch = verified.value.credentialEpoch;
+  // Atomic single consumption: delete returns false if another admitted request already took it, so two
+  // concurrent valid requests produce exactly one credential.
+  if (!pending.delete(externalSessionId)) return refuse("ENTRY_WITHDRAWN", credential.sessionId);
+  const body = Buffer.from(JSON.stringify({
+    ok: true,
+    sessionId: credential.sessionId,
+    sessionIncarnation: credential.sessionIncarnation,
+    sessionSecret: credential.sessionSecret,
+    ...(mcpToken === undefined ? {} : { token: mcpToken }),
+  }));
+  // #1336 — a respond that throws is as uncertain as one that returns false: the reply may have been queued.
+  let send: "OK" | "FALSE" | "THREW";
+  try {
+    send = addon.respond(handle, request.id, addon.STATUS.OK, body) ? "OK" : "FALSE";
+  } catch {
+    send = "THREW";
+    // The native side may still hold this request's reply right (and its ML_MAX_PENDING slot): answer it
+    // REFUSED, best effort. If the OK reply did go out the entry is already taken and this answers nothing.
+    try {
+      addon.respond(handle, request.id, addon.STATUS.REFUSED, Buffer.from("SEND_UNCERTAIN"));
+    } catch {
+      /* the requester then waits out its own timeout; teardown still answers whatever is held */
+    }
+  }
+  if (send !== "OK") {
+    // The entry is not restored: the plaintext may already have crossed.
+    settleUncertainSend(sessions, audit, deps.custody, credential, credentialEpoch, send);
+    return;
+  }
+  // Residual trust, recorded so it is not mistaken for the pid-reuse misdelivery the audit token closed:
+  // an admitted sender could have handed the receive right of its Mach reply port to another same-uid
+  // process, which would then read this credential. That is within the turn's own process tree's
+  // same-user trust; it is a different thing from a credential going to a reused pid, which cannot happen.
+  audit.record({
+    kind: "SESSION_LAUNCH_CREDENTIAL_DELIVERED",
+    reasonCode: ReasonCode.OK,
+    sessionId: credential.sessionId,
+    evidence: { transport: "mach", residual: "reply_right_delegation_same_uid" },
+  });
+};
+
+/** #1336 — the uncertain send's secret no longer authenticates: rotated, or already invalid. */
+const secretInvalidatedAfterSend = (send: "FALSE" | "THREW", evidence: Record<string, unknown>): Decision<void> =>
+  deny(ReasonCode.MACH_LAUNCH_SEND_FAILED, "the driven credential's Mach reply send was uncertain; its secret no longer authenticates",
+    { transport: "mach", send, ...evidence });
+/** #1336 — the uncertain send's secret could not be shown invalid; the session is blocked as far as possible. */
+const secretNotInvalidatedAfterSend = (send: "FALSE" | "THREW", evidence: Record<string, unknown>): Decision<void> =>
+  deny(ReasonCode.MACH_LAUNCH_SECRET_NOT_INVALIDATED, "the driven credential's Mach reply send was uncertain and its secret could not be shown invalid",
+    { transport: "mach", send, ...evidence });
+
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/**
+ * #1336 — after a Mach reply send that failed, threw or is uncertain, the secret it carried may have been
+ * delivered, so nothing may go on using it. Nothing here throws out of the Mach callback, whatever the
+ * registry or the audit log does. Exactly one of three outcomes (never the secret in any of them):
+ *  - the secret is rotated: it stops verifying in the same statement (`MACH_LAUNCH_SEND_FAILED`, ROTATED);
+ *  - the rotation is refused and the secret no longer verifies — its epoch already moved, or the session
+ *    is already STOPPED or ERROR — so it is already invalid (`MACH_LAUNCH_SEND_FAILED`, ALREADY_INVALID);
+ *  - otherwise — the rotation was refused and the secret still verifies (a DRAINING or STARTING session, a
+ *    CAS that lost), or the rotation or the check threw — the strongest block available is taken
+ *    (`blockSessionAfterUncertainSend`) and recorded as `MACH_LAUNCH_SECRET_NOT_INVALIDATED`.
+ * The outcome is audited; if the audit write itself fails, the reason code and session id (never the
+ * secret) are written to stderr instead, so the case is stated even with the database down.
+ */
+const settleUncertainSend = (
+  sessions: MachLaunchSessions,
+  audit: Pick<AuditLog, "record">,
+  custody: MachLaunchCustody | undefined,
+  credential: SessionLaunchCredential,
+  credentialEpoch: number,
+  send: "FALSE" | "THREW",
+): void => {
+  const { sessionId, sessionSecret } = credential;
+  let outcome: Decision<void> | null = null;
+  let cause: Record<string, unknown>;
+  try {
+    const rotated = sessions.rotateSecret(sessionId, credentialEpoch);
+    if (rotated.allowed) {
+      outcome = secretInvalidatedAfterSend(send, { rotated: true, invalidated: "ROTATED" });
+      cause = {};
+    } else if (!sessions.verifySecret(sessionId, sessionSecret).allowed) {
+      outcome = secretInvalidatedAfterSend(send, { rotated: false, invalidated: "ALREADY_INVALID", rotationRefused: rotated.reasonCode });
+      cause = {};
+    } else {
+      cause = { rotationRefused: rotated.reasonCode };
+    }
+  } catch (error) {
+    cause = { invalidationFailed: errorText(error) };
+  }
+  outcome ??= blockSessionAfterUncertainSend(sessions, custody, credential, send, cause);
+  try {
+    audit.record({ kind: "SESSION_LAUNCH_CREDENTIAL_SEND_FAILED", reasonCode: outcome.reasonCode, sessionId, evidence: outcome.evidence });
+  } catch (error) {
+    process.stderr.write(`session launch: ${outcome.reasonCode} for ${sessionId} could not be audited: ${errorText(error)}\n`);
+  }
+};
+
+/**
+ * #1336 — the strongest block available when an uncertain send's secret could not be shown invalid. The
+ * runtime's held credential for the session is dropped: no turn of it runs, no launch is offered for it, and
+ * its secret no longer authenticates on a socket (`drivenCredentialNotHeld`), whether or not any database
+ * write below succeeds, and after a restart too, since nothing is held until recovery rotates and adopts.
+ * The session is also marked ERROR where the registry can write it, after which `verifySecret` refuses the
+ * secret and nothing re-credentials the session; `blocked` is true only when the secret was then seen to
+ * stop verifying. If the ERROR write failed, the row stays READY and continuity's recovery may later resume
+ * the session on a newly rotated secret, which invalidates the old one. Each step is attempted whether or
+ * not another failed, and nothing here resumes the session itself.
+ */
+const blockSessionAfterUncertainSend = (
+  sessions: MachLaunchSessions,
+  custody: MachLaunchCustody | undefined,
+  credential: SessionLaunchCredential,
+  send: "FALSE" | "THREW",
+  cause: Record<string, unknown>,
+): Decision<void> => {
+  const { sessionId, sessionSecret } = credential;
+  let transitionRefused: string | null = null;
+  let marked = false;
+  try {
+    const transition = sessions.transition(sessionId, SessionLifecycle.ERROR,
+      "a driven credential's Mach reply send was uncertain and its secret could not be shown invalid");
+    marked = transition.allowed;
+    if (!transition.allowed) transitionRefused = transition.reasonCode;
+  } catch (error) {
+    transitionRefused = errorText(error);
+  }
+  let blocked = false;
+  if (marked) {
+    try {
+      blocked = !sessions.verifySecret(sessionId, sessionSecret).allowed;
+    } catch {
+      blocked = false; // not seen to stop verifying, so not claimed
+    }
+  }
+  let custodyReleased: boolean | string = false;
+  if (custody) {
+    try {
+      custody.release(sessionId);
+      custodyReleased = true;
+    } catch (error) {
+      custodyReleased = errorText(error);
+    }
+  }
+  return secretNotInvalidatedAfterSend(send, {
+    rotated: false,
+    invalidated: blocked ? "SESSION_BLOCKED" : "NOT_GUARANTEED",
+    ...cause,
+    blocked,
+    custodyReleased,
+    ...(transitionRefused === null ? {} : { transitionRefused }),
   });
 };
 
@@ -4263,6 +4902,8 @@ const authenticateSocketPeer = (
     if (admission.pendingHandoffAck && session.value.lifecycle === SessionLifecycle.READY) {
       const pending = currentPendingNormalHandoff(cp, credential.sessionId);
       if (pending.allowed) {
+        const notHeld = drivenCredentialNotHeld(cp, credential.sessionId, null);
+        if (notHeld) return notHeld;
         return allow(ReasonCode.OK, {
           kind: "PENDING_HANDOFF_ACK",
           handoffId: pending.value.handoffId,
@@ -4284,6 +4925,8 @@ const authenticateSocketPeer = (
       role: candidate.role,
     });
   }
+  const notHeld = drivenCredentialNotHeld(cp, credential.sessionId, candidate.role);
+  if (notHeld) return notHeld;
   const authenticated = cp.bindings.authenticateBoundSession({
     roleKey: candidate.roleKey,
     sessionId: credential.sessionId,
@@ -4355,6 +4998,24 @@ const currentPendingNormalHandoff = (
   return allow(ReasonCode.OK, {
     handoffId: handoff.handoff_id,
     fromGeneration: handoff.from_generation,
+  });
+};
+
+/**
+ * #1336 R-1 — a driven session's secret authenticates on a socket only while the daemon's session runtime
+ * holds that session's current credential. The runtime adopts it (spawn, or recovery after rotating) before
+ * any relayed turn can present it, and drops it when it may have leaked (`blockSessionAfterUncertainSend`)
+ * or the runtime is lost, so a secret the registry would still verify — a READY row whose ERROR write
+ * failed, or any row after a restart — is refused until recovery rotates and adopts a new one. `role` is
+ * the binding the connection is judged under; an unbound connection is judged by the session's
+ * driven-spawn record alone. Interactive sessions are not driven and are not affected.
+ */
+const drivenCredentialNotHeld = (cp: ControlPlane, sessionId: string, role: Role | null): Decision<never> | null => {
+  const runtime = cp.sessionRuntime;
+  if (!runtime.drivesSession(sessionId, role ?? Role.PRIMARY_CTO) || runtime.holds(sessionId)) return null;
+  return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "the daemon holds no current credential for this driven session", {
+    sessionId,
+    reason: "DRIVEN_CREDENTIAL_NOT_HELD",
   });
 };
 
@@ -4488,6 +5149,8 @@ const peerAuthenticator =
           expectedGeneration: opening.fromGeneration,
         });
       }
+      const notHeld = drivenCredentialNotHeld(cp, credential.sessionId, null);
+      if (notHeld) return notHeld;
       return allow(ReasonCode.OK, authenticatedPeer(credential, opening.sessionIncarnation));
     }
 
@@ -4498,6 +5161,8 @@ const peerAuthenticator =
         { sessionId: credential.sessionId, lifecycle: session.value.lifecycle, role: opening.binding.role },
       );
     }
+    const notHeld = drivenCredentialNotHeld(cp, credential.sessionId, opening.binding.role);
+    if (notHeld) return notHeld;
     const bound = cp.bindings.authenticateBoundSession({
       roleKey: opening.binding.roleKey,
       sessionId: credential.sessionId,
@@ -4574,6 +5239,8 @@ const conversationPeerAuthenticator =
         { sessionId: credential.sessionId, lifecycle: session.value.lifecycle, role },
       );
     }
+    const notHeld = drivenCredentialNotHeld(cp, credential.sessionId, role);
+    if (notHeld) return notHeld;
     return allow(ReasonCode.OK, authenticatedPeer(credential, sessionIncarnation));
   };
 
@@ -5584,7 +6251,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
 
   let sessionLaunch: LocalSessionLaunchChannel;
   try {
-    sessionLaunch = await startSessionLaunchChannel(stateDir, { mcpToken });
+    sessionLaunch = await startSessionLaunchChannel(stateDir, {
+      mcpToken, sessions: cp.sessions, audit: cp.audit, custody: { release: (sessionId) => cp.sessionRuntime.release(sessionId) },
+    });
   } catch (err) {
     cp.close();
     throw err;
@@ -5890,12 +6559,32 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       process.stdout.write("canonical self-claim listener started\n");
     }
     listeners = await startDaemonMcpListeners(cp, stateDir, mcpToken, daemon);
+    // O4b B' — only now, after `daemon.start()` has passed the database admission, does the daemon check
+    // in the raw-Mach launch service that hands driven turns their credential. A #738 database refusal
+    // exits the process above, before this line, so a daemon that deliberately stopped is never checked
+    // in and so can never be relaunched into serving by a Mach request. On failure (not under launchd, or
+    // the name is taken, or the addon is missing) the daemon keeps running but advertises no Mach service:
+    // a driven turn's relay then fails closed with SERVICE_UNAVAILABLE and the turn is refused, with no
+    // fallback to the id-only path.
+    const machEnabled = sessionLaunch.enableMachService();
+    if (machEnabled.allowed) {
+      process.stdout.write(`Mach launch service checked in: ${machEnabled.value.serviceName}\n`);
+    } else {
+      cp.audit.record({
+        kind: "MACH_LAUNCH_SERVICE_UNAVAILABLE",
+        reasonCode: ReasonCode.MACH_LAUNCH_SERVICE_UNAVAILABLE,
+        evidence: { reason: (machEnabled.evidence["reason"] as string | undefined) ?? "UNAVAILABLE" },
+      });
+      process.stderr.write(`Mach launch service unavailable; driven turns will be refused: ${machEnabled.message}\n`);
+    }
     // #246 C1b — a provisioned session's turns reach the daemon only through these two sockets,
     // so its runtime gets them once both are listening. Until then (the queued-run resume inside
     // `daemon.start()` included) a bootstrap dispatch is refused SESSION_RUNTIME_UNAVAILABLE before
     // any provider turn is spent, and its run stays QUEUED.
+    // #1336 — the runtime gets the driven door, so every credential it offers is refused on the AF_UNIX
+    // launch socket from provision onward; `cp.cto` above keeps the interactive door.
     cp.sessionRuntime.attach({
-      delivery: sessionLaunch,
+      delivery: sessionLaunch.driven,
       route: { launchSocketPath: sessionLaunch.socketPath, mcpSocketPath: join(stateDir, "cto.mcp.sock") },
     });
     // #1037 — only where the canonical claim is configured: reattaching is that claim's sequel.
@@ -6305,6 +6994,19 @@ if (isMainModule()) {
           "Approve with: agentcpd-state approve-migration --approved-by <who> --confirm-migration\n" +
           "Inspect without approving: agentcpd-state migration-plan\n",
       );
+    }
+    // O4b B' — exit 0 is #738's launchd stop signal. A Mach request may have demand-launched this job, so
+    // the declared launch service is checked in only to refuse and release whatever launchd queued, then
+    // handed back empty; without this launchd relaunches the job every ThrottleInterval (measured). Nothing
+    // is served: no credential store or request handler exists on this path. Not done outside launchd.
+    if (disposition.exitCode === 0) {
+      const drained = drainMachLaunchQueueOnRefusal();
+      if (drained !== null) {
+        process.stderr.write(
+          `agentcpd: the Mach launch service was checked in only to refuse what was queued (drained=${drained.drained} ` +
+            `refused=${drained.refused}); no credential was served\n`,
+        );
+      }
     }
     process.exit(disposition.exitCode);
   });

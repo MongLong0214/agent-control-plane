@@ -83,7 +83,7 @@ describe.skipIf(!LIVE)("C1b live: a real headless BOOTSTRAP_CTO", () => {
     const daemon = cp.createDaemon({ stateDir });
     const listeners = await startDaemonMcpListeners(cp, stateDir, TOKEN, daemon);
     cp.sessionRuntime.attach({
-      delivery: launch,
+      delivery: launch.driven,
       route: { launchSocketPath: launch.socketPath, mcpSocketPath: join(stateDir, "cto.mcp.sock") },
     });
     try {

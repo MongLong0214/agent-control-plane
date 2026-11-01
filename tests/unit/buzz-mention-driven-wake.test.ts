@@ -84,7 +84,7 @@ for (const change of ["none", "room lost", "room changed", "identity excluded"] 
         cp.sessionRuntime.attach({
           delivery: {
             prepare: async () => {
-              const prepared = await f.launch.prepare();
+              const prepared = await f.drivenDoor.prepare();
               if (!changed) {
                 changed = true;
                 if (change === "room lost") cp.sessions.setBuzzAddress(binding.sessionId, null);
@@ -97,8 +97,8 @@ for (const change of ["none", "room lost", "room changed", "identity excluded"] 
               }
               return prepared;
             },
-            provision: (credential) => f.launch.provision(credential),
-            withdraw: (externalSessionId) => f.launch.withdraw(externalSessionId),
+            provision: (credential) => f.drivenDoor.provision(credential),
+            withdraw: (externalSessionId) => f.drivenDoor.withdraw(externalSessionId),
           },
         });
         const external = session.incarnation.split("#")[0];

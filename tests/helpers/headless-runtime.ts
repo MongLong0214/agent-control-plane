@@ -22,6 +22,8 @@ export interface InProcessLaunchChannel extends SessionCredentialDelivery {
   take(externalSessionId: string): SessionLaunchCredential | null;
   /** How many credentials were offered, for rows that count deliveries. */
   readonly offered: number;
+  /** #1336 — the socket gate a hand-over carries beside the credential, when the door stands in for one that does. */
+  readonly token?: string;
 }
 
 export const inProcessLaunchChannel = (): InProcessLaunchChannel => {
@@ -129,7 +131,7 @@ export class HeadlessRuntimeDouble extends TestProductionAdapter {
             sessionId: taken.sessionId,
             sessionIncarnation: taken.sessionIncarnation,
             sessionSecret: taken.sessionSecret,
-            token: null,
+            token: this.#inProcess.launch.token ?? null,
           }
         : null;
     }

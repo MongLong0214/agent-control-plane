@@ -58,6 +58,12 @@ const NATIVE_EXTENSION = join(
   "Release",
   process.platform === "darwin" ? "acp_fd_vfs.dylib" : "acp_fd_vfs.so",
 );
+// O4b B' — `pnpm build` also copies the Darwin-only Mach-launch addon into dist, and like the fd-vfs copy
+// it fails loudly when the built addon is missing. It is a build input in exactly the same way, so it is
+// supplied here the same way; off Darwin the addon is never built and its copy step is a skip.
+const MACH_LAUNCH_ADDON = process.platform === "darwin"
+  ? [join("native", "mach-launch", "build", "Release", "mach_launch.node")]
+  : [];
 
 /** Every schema file `migrations.ts` resolves beside itself, i.e. every file `schemaSqlAt` can return. */
 const schemaFilesBesideMigrations = (): string[] =>
@@ -79,7 +85,7 @@ const schemaFilesBesideMigrations = (): string[] =>
  */
 const scratchBuild = (): string => {
   const root = join(tempDir("acp-a0-build-"), "repo");
-  for (const file of ["package.json", "tsconfig.json", "tsconfig.build.json", NATIVE_EXTENSION]) {
+  for (const file of ["package.json", "tsconfig.json", "tsconfig.build.json", NATIVE_EXTENSION, ...MACH_LAUNCH_ADDON]) {
     mkdirSync(dirname(join(root, file)), { recursive: true });
     cpSync(join(ROOT, file), join(root, file));
   }

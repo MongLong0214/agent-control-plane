@@ -260,6 +260,45 @@ export const ReasonCode = {
    */
   SESSION_RUNTIME_UNAVAILABLE: "SESSION_RUNTIME_UNAVAILABLE",
   /**
+   * O4b B' — the raw-Mach launch service that hands a driven turn its credential is not available: the
+   * daemon's `bootstrap_check_in` of the launchd-declared service name failed (it is not running under
+   * launchd, or the name is already taken), or the addon could not load. A driven turn's credential
+   * request is refused under this code and never falls back to AF_UNIX or the interactive id-only path.
+   */
+  MACH_LAUNCH_SERVICE_UNAVAILABLE: "MACH_LAUNCH_SERVICE_UNAVAILABLE",
+  /**
+   * O4b B' — a driven turn's per-message Mach admission refused the credential. The specific stage —
+   * sender not live, the parent/holder chain, a changed link, a stale instance, a stale secret or
+   * incarnation — is recorded in the refusal's audit evidence, never the credential. The entry is kept
+   * for a genuine later claim, except where a prior hand-over already consumed it.
+   */
+  MACH_LAUNCH_ADMISSION_REFUSED: "MACH_LAUNCH_ADMISSION_REFUSED",
+  /**
+   * O4b B' — a driven entry (one the session runtime offered through the launch channel's driven door,
+   * whether or not its turn pin has arrived) was presented on the AF_UNIX launch socket
+   * (`cto.launch.sock`). Driven credentials move only over raw Mach; the id-only AF_UNIX path serves
+   * interactive spawns alone, so a driven request there is refused rather than served.
+   */
+  DRIVEN_LAUNCH_ON_AF_UNIX_REFUSED: "DRIVEN_LAUNCH_ON_AF_UNIX_REFUSED",
+  /**
+   * O4b B' — a driven turn's credential was admitted but its Mach reply send failed, threw or was
+   * uncertain (no receiver, timeout, interruption). The entry stays consumed and is never re-offered, and
+   * the secret it carried no longer authenticates: it was rotated, or it was already invalid (its epoch
+   * had moved, or the session had ended); the evidence's `invalidated` says which. When neither holds,
+   * `MACH_LAUNCH_SECRET_NOT_INVALIDATED` is recorded instead. The case is audited, never the credential.
+   */
+  MACH_LAUNCH_SEND_FAILED: "MACH_LAUNCH_SEND_FAILED",
+  /**
+   * #1336 — a driven turn's Mach reply send was uncertain and the secret it carried could not be shown
+   * invalid: its rotation was refused while it still verified, or the rotation or the check failed. The
+   * runtime's held credential for the session is dropped (`custodyReleased`), so no turn of it runs, no
+   * launch is offered for it and its secret is refused at socket authentication until recovery rotates and
+   * adopts a new one. Where the registry could write it, the session is also marked ERROR (`blocked: true`
+   * once the secret is seen to stop verifying); if that write failed (`blocked: false`), continuity's
+   * recovery may later resume the session on a newly rotated secret. Never the credential.
+   */
+  MACH_LAUNCH_SECRET_NOT_INVALIDATED: "MACH_LAUNCH_SECRET_NOT_INVALIDATED",
+  /**
    * #246 C1b — a provisioned session's turn ran and the daemon did not receive the authenticated
    * attestation that turn was asked for: the relay never took its credential, never authenticated,
    * or never presented the challenge. Readiness is never inferred from the turn's exit alone.
