@@ -1801,7 +1801,8 @@ const resolveIfPossible = (path: string): string => {
  * Seatbelt profile. Allow-default, so any toolchain starts and reads what it needs, and the network
  * is open unless `denyNetwork` (the command's contract says `deny`). Then IP networking, inbound and
  * outbound, is denied, and so is every unix socket except one bound in the worktree or scratch and
- * a connection to one there (the carve-out below), so a command's own IPC still works.
+ * a connection to one there (the carve-out below), so a command's own IPC still works, and so are
+ * launchd job creation and the LaunchServices lookup, the verified delegation boundaries.
  * Then the guard (§33.3 — no provider, GitHub, Buzz or Telegram authority reaches a candidate),
  * best-effort as `SANDBOX_SECRET_PATHS` says:
  * - reads of every secret path are denied; the worktree, the scratch and the pinned runtime are
@@ -1830,6 +1831,14 @@ const seatbeltProfile = (
       "(deny network* (local unix-socket))",
       `(allow network-bind (local unix-socket (subpath ${quote(worktreePath)})))`,
       `(allow network-bind (local unix-socket (subpath ${quote(scratch)})))`,
+      // The delegation boundaries: a deny command may not have launchd or LaunchServices start a
+      // process for it outside the sandbox. `job-creation` is hardening that pins the macOS default
+      // (measured: `launchctl submit` is already refused inside an allow-default sandbox), not a fix
+      // for an observed escape. The mach-lookup denial is the minimal LaunchServices delegation block:
+      // a lookup of either service fails under it (measured). Apple events and other XPC services are
+      // not covered.
+      "(deny job-creation)",
+      '(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.lsd.mapdb"))',
     );
   }
   // A deny path below an allowed root would stop the command from reading its own inputs,
