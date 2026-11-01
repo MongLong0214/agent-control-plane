@@ -7,6 +7,7 @@ import { bootstrapServingRuntime, bootstrapCodeGuarantees, type BootstrapRuntime
 import { mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 
 import { bootstrapLifecycleSection, type BootstrapPlanTaskProvenance } from "../bootstrap/bootstrap-lifecycle.ts";
 import {
@@ -315,6 +316,61 @@ export interface ReviewerPreference {
   model: string;
   effort: string | null;
 }
+
+/** The daemon's per-project reviewer file, `<stateDir>/reviewer-preferences.json`, as read once at start. */
+export const PROJECT_REVIEWER_FILE = "reviewer-preferences.json";
+
+/** That file's bytes: `text` null when it does not exist, `unreadable` when it exists and could not be read. */
+export interface ProjectReviewerFile {
+  path: string;
+  text: string | null;
+  unreadable?: string;
+}
+
+/**
+ * CEO msg_e91da929 — the projects that name their own preferred Blind Reviewer. An entry replaces the
+ * global preferred reviewer for that project's runs and has no fallback. `refused` names why a file was
+ * not applied; a refused file applies no entry at all.
+ */
+export interface ProjectReviewerPreferences {
+  byProject: ReadonlyMap<string, ReviewerPreference>;
+  refused: { path: string; reason: string } | null;
+}
+
+const projectReviewerEntries = z.record(
+  z.string().min(1),
+  z.object({ provider: z.string().min(1), model: z.string().min(1), effort: z.string().min(1).nullable() }).strict(),
+);
+
+/**
+ * `{ "<projectId>": { provider, model, effort } }`, every provider registered for BLIND_REVIEWER, or nothing.
+ * A missing file is no project preferences, which is the behaviour without this file.
+ */
+export const resolveProjectReviewerPreferences = (
+  file: ProjectReviewerFile,
+  registeredForReview: (provider: string) => boolean,
+): ProjectReviewerPreferences => {
+  const refuse = (reason: string): ProjectReviewerPreferences => ({ byProject: new Map(), refused: { path: file.path, reason } });
+  if (file.unreadable !== undefined) return refuse(`unreadable: ${file.unreadable}`);
+  if (file.text === null) return { byProject: new Map(), refused: null };
+  let raw: unknown;
+  try {
+    raw = JSON.parse(file.text);
+  } catch {
+    return refuse("not JSON");
+  }
+  const parsed = projectReviewerEntries.safeParse(raw);
+  if (!parsed.success) {
+    const at = parsed.error.issues[0]?.path.join(".") ?? "";
+    return refuse(`not { "<projectId>": { provider, model, effort } }${at === "" ? "" : ` at ${at}`}`);
+  }
+  for (const [projectId, entry] of Object.entries(parsed.data)) {
+    if (!registeredForReview(entry.provider)) {
+      return refuse(`project ${projectId} names provider ${entry.provider}, which is not registered for BLIND_REVIEWER`);
+    }
+  }
+  return { byProject: new Map(Object.entries(parsed.data)), refused: null };
+};
 
 /** A real step of a review, on which the submission that asked for it renews its attempt lease. */
 export type ReviewProgressStep = "REVIEW_CHUNK_COMPLETED" | "FINAL_REVIEW_STARTED" | "FINAL_REVIEW_ENDED";
@@ -705,6 +761,8 @@ export class BlindReviewGate {
     private readonly preferences: {
       preferred: ReviewerPreference;
       fallbacks: ReviewerPreference[];
+      /** A project's own preferred reviewer, which replaces `preferred` for its runs and has no fallback. */
+      projects?: ReadonlyMap<string, ReviewerPreference>;
     },
     /** The same daemon-owned endpoint policy supplied to production CLI adapters. */
     private readonly reviewerEgressEndpoints: Readonly<Record<string, readonly string[]>> = REVIEWER_PROVIDER_ENDPOINTS,
@@ -1088,6 +1146,10 @@ export class BlindReviewGate {
         provider: authoritativeReviewer.preference.provider,
         model: authoritativeReviewer.preference.model,
         effort: authoritativeReviewer.preference.effort,
+        // CEO msg_e91da929 — a reviewer the project named is its preferred one, never a fallback.
+        ...(authoritativeReviewer.projectPreference === undefined
+          ? {}
+          : { reviewerSource: "PROJECT_PREFERENCE", projectId: authoritativeReviewer.projectPreference }),
         coveredFiles: validated.coveredFiles.length,
         // A reviewer that read private evidence can echo it in any text it returns: its omissions are a count
         // here, never its words nor a digest a short text could be guessed from (the findings are already a count).
@@ -1291,6 +1353,9 @@ export class BlindReviewGate {
    * anything is probed or allocated for it. Every other preferred failure — runtime unavailable,
    * capacity denied, binding refused, a wrong or spent override, an auth or isolation failure —
    * ends the selection with no fallback. This replaces the earlier measured-outage fallback.
+   *
+   * CEO msg_e91da929: a run whose project has an entry in `preferences.projects` gets that reviewer as
+   * its preferred one, with no fallback; every check below applies to it unchanged.
    */
   private async constituteReviewer(
     request: ReviewSubject,
@@ -1302,6 +1367,8 @@ export class BlindReviewGate {
       externalSessionId: string;
       generation: number;
       preference: ReviewerPreference;
+      /** The project whose own preference this reviewer is; absent for the global preference or a fallback. */
+      projectPreference?: string;
       roleKey: string;
       /** Empty packet-only directory; candidate checkouts are never reviewer cwd. */
       workdir: string;
@@ -1311,9 +1378,13 @@ export class BlindReviewGate {
     const roleKey = roleKeyFor(Role.BLIND_REVIEWER, { runId });
     const attempts: Array<{ preference: ReviewerPreference; reason: string }> = [];
     let capacityFailure: Decision<void> | null = null;
+    const projectId = this.db.get<{ project_id: string | null }>(`SELECT project_id FROM runs WHERE run_id = ?`, [runId])?.project_id ?? null;
+    const projectPreferred = projectId === null ? undefined : this.preferences.projects?.get(projectId);
+    const preferred = projectPreferred ?? this.preferences.preferred;
+    const source = projectPreferred === undefined ? {} : { reviewerSource: "PROJECT_PREFERENCE", projectId };
 
-    for (const preference of [this.preferences.preferred, ...this.preferences.fallbacks]) {
-      const isPreferred = preference === this.preferences.preferred;
+    for (const preference of projectPreferred === undefined ? [preferred, ...this.preferences.fallbacks] : [preferred]) {
+      const isPreferred = preference === preferred;
       // Unknown registry scope is not an availability proof authorizing fallback.
       const scope = this.reviewerScope(preference.provider);
       if (!scope.allowed) return scope;
@@ -1512,6 +1583,7 @@ export class BlindReviewGate {
         externalSessionId: handle.externalSessionId,
         generation: bound.value.bindingGeneration,
         preference,
+        ...(projectPreferred === undefined || projectId === null ? {} : { projectPreference: projectId }),
         roleKey,
         workdir,
       });
@@ -1521,13 +1593,13 @@ export class BlindReviewGate {
       return deny(
         capacityFailure.reasonCode,
         "no blind reviewer could be constituted with current routable capacity",
-        { runId, attempts, capacity: capacityFailure.evidence },
+        { runId, attempts, capacity: capacityFailure.evidence, ...source },
       );
     }
     return deny(
       ReasonCode.ISOLATION_LOST,
       "no isolated blind reviewer could be constituted; the gate is not lowered",
-      { runId, attempts },
+      { runId, attempts, ...source },
     );
   }
 
@@ -2940,6 +3012,8 @@ interface ReviewerBinding {
   externalSessionId: string;
   generation: number;
   preference: ReviewerPreference;
+  /** The project whose own preference constituted this reviewer; absent otherwise. */
+  projectPreference?: string;
   roleKey: string;
   workdir: string;
 }
