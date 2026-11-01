@@ -404,6 +404,9 @@ const runCommand = (network: "deny" | "allow", argv: string[], files: Record<str
 
 const LAUNCH_SERVICES = ["com.apple.coreservices.launchservicesd", "com.apple.lsd.mapdb"] as const;
 
+/** A bound on each launchctl call here; it answers at once. */
+const LAUNCHCTL_TIMEOUT_MS = 10_000;
+
 /** Looks each service up with `bootstrap_look_up` and prints its kern_return_t; nothing is launched. */
 const LOOKUP_PY = `import ctypes, json, sys
 libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
@@ -419,11 +422,16 @@ describe("a deny command cannot delegate a process to launchd or LaunchServices"
   it("refuses launchctl submit from inside a deny command, and no job is left", async (context) => {
     requireSeatbelt(context);
     const label = `acp.test.deny-job-creation.${randomUUID()}`;
-    const listed = (): boolean => spawnSync("/bin/launchctl", ["list", label], { stdio: "ignore" }).status === 0;
+    // A list that does not answer is an error, never "not listed".
+    const listed = (): boolean => {
+      const run = spawnSync("/bin/launchctl", ["list", label], { stdio: "ignore", timeout: LAUNCHCTL_TIMEOUT_MS });
+      if (run.error || run.status === null) throw new Error(`launchctl list did not answer: ${String(run.error ?? run.signal)}`);
+      return run.status === 0;
+    };
     try {
       const outcome = await runCommand("deny", ["node", "submit.cjs"], {
         "submit.cjs": `const { spawnSync } = require('node:child_process');
-          const run = spawnSync('/bin/launchctl', ['submit', '-l', ${JSON.stringify(label)}, '--', '/usr/bin/true'], { encoding: 'utf8' });
+          const run = spawnSync('/bin/launchctl', ['submit', '-l', ${JSON.stringify(label)}, '--', '/usr/bin/true'], { encoding: 'utf8', timeout: ${LAUNCHCTL_TIMEOUT_MS} });
           console.log(JSON.stringify({ status: run.status, error: run.error ? run.error.code : null }));`,
       });
       expect(outcome, described(outcome)).toMatchObject({
@@ -436,7 +444,7 @@ describe("a deny command cannot delegate a process to launchd or LaunchServices"
       expect(listed()).toBe(false);
     } finally {
       // Only this test's own label; any other job is left alone.
-      spawnSync("/bin/launchctl", ["remove", label], { stdio: "ignore" });
+      spawnSync("/bin/launchctl", ["remove", label], { stdio: "ignore", timeout: LAUNCHCTL_TIMEOUT_MS });
     }
     expect(listed()).toBe(false);
   });
