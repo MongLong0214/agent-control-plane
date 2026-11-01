@@ -62,8 +62,9 @@ describe("R1 repository envelope budget", () => {
       if (!execution.allowed) throw new Error(execution.message);
       applyPassingChange(harness.repoPath);
       harness.cp.tasks.finishExecution(execution.value.executionId, { status: "SUCCEEDED", resultDigest: "sha256:done" });
+      // The official command's output goes to the reviewer as required coverage beside the changed file.
       harness.scripted.script({ match: /Candidate review|Review chunk|Final review/, text: JSON.stringify({ verdict: "PASS",
-        coveredFiles: ["github:acme/repo-000:src/app.js"], omittedItems: [], findings: [] }) });
+        coveredFiles: ["github:acme/repo-000:src/app.js", "github:acme/repo-000:#verification-output/verify/stdout"], omittedItems: [], findings: [] }) });
       const outcome = await harness.cp.pipeline.submitResult({ runId: run.runId, ownerSessionId: run.ownerSessionId!,
         ownerBindingGeneration: run.ownerBindingGeneration!, resultSummary: "app returns 2", recommendation: "merge" });
       const prompts = harness.scripted.invocations.filter((r) => /# Candidate review|# Review chunk|# Final review/.test(r.prompt));
