@@ -48,9 +48,25 @@ git reads no global config, credential helper, ignore or attributes file, and np
   Gradle's caches and wrapper distributions, Maven's repository, SwiftPM) — caches only, never a
   toolchain's bin directory, installed toolchain or configuration, where a write would run later
   outside the sandbox;
-- outbound network and local IPC are open, to look up and download dependencies during
-  verification. This is not a publish or deploy right: no credential reaches the command to publish
-  with. `network: "allowlist"` is still refused, because seatbelt cannot enforce destinations.
+- for a command whose contract says `network: "allow"`, outbound network and local IPC are open, to
+  look up and download dependencies during verification. This is not a publish or deploy right: no
+  credential reaches the command to publish with. A command whose contract says `deny`, the default,
+  has IP networking denied, inbound and outbound, and every unix socket outside its worktree and
+  scratch, while binding and connecting its own socket there still works. So that it cannot bring
+  an outside socket in, a deny command also cannot rename or link a socket, or rename or remove a
+  directory, outside its worktree and scratch. That is a compatibility cost: toolchain caches are
+  included, so a tool that moves directories into place in its cache (Gradle's offline transforms,
+  for one) can fail under `deny`. Cleanup inside a cache fails as well (measured: `uv cache clean`
+  exits 2 and leaves an empty directory), so temp and lock directories a tool creates in a shared
+  cache cannot be removed and persist into later runs and the owner's own use, and a deny command
+  cannot delete a stale socket in a cache. Mainstream offline installs from a warm cache still work
+  (`uv pip install --offline`, `pnpm install --offline`). A command that needs more is a contract
+  decision of its own, not a quiet switch to `allow`. A deny command also may not have launchd or
+  LaunchServices start a process for it: `(deny job-creation)` and a mach-lookup denial of
+  `com.apple.coreservices.launchservicesd` and `com.apple.lsd.mapdb`, the minimal LaunchServices
+  delegation block. `job-creation` is hardening that pins the macOS default (`launchctl submit` is
+  already refused inside an allow-default sandbox, measured), not a fix for an observed escape.
+  `network: "allowlist"` is still refused, because seatbelt cannot enforce destinations.
 
 **The guard.** `SANDBOX_SECRET_PATHS` — SSH and GPG keys and their agents, the keychain, GitHub,
 cloud and package-registry credentials, ACP's state root, Hermes, Claude, Codex and Buzz
@@ -63,14 +79,21 @@ runtime are carved back out, since production lays them under the state root.
 **Best-effort, not leak-proof.** The guard covers the named locations only: a credential kept
 anywhere else is as readable as any other file. A shared cache the command writes can be poisoned
 for a later build outside the sandbox. A process the command asks launchd or LaunchServices to
-start (`open`, `osascript`, `launchctl`) runs outside the sandbox. Toolchain configuration that
+start (`open`, `osascript`, `launchctl`) runs outside the sandbox; for a deny command, launchd job
+creation and the LaunchServices lookup are denied (above), Apple events and other XPC services are
+not. Toolchain configuration that
 sits on the list is unreadable, so Maven with a `~/.m2/settings.xml` or Gradle with a
 `~/.gradle/gradle.properties` can fail, and a Node installed under `~/.hermes` cannot run `npm`
 from there.
 
-**Evidence.** The result records what was in force: `networkPolicy: "allow"`,
-`networkEnforced: false`, `readConfinement: "sensitive-paths"`, and `writeConfinement: true`
-meaning writes are confined to the worktree, `TMPDIR` and the named caches. No evidence mode treats
+**Evidence.** The result records what was in force: `networkPolicy` is the command's declared
+`deny` or `allow`, with `networkEnforced: true` only for a `deny` command whose profile was applied,
+`readConfinement: "sensitive-paths"`, and `writeConfinement: true` meaning writes are confined to
+the worktree, `TMPDIR` and the named caches. `networkEnforced: true` means the command's own process
+tree was denied direct network and every unix socket outside its worktree and scratch, and the
+verified delegation boundaries, launchd job creation and the LaunchServices lookup, were denied as
+well. Apple events (`osascript`) and other XPC services are not claimed: a process started through
+them runs outside the sandbox (the limit above). No evidence mode treats
 a network denial as part of what it means: `TRUSTED_CI` reads CI's result, and `LOCAL_COMMAND` and
 `BOTH_REQUIRED` read this record.
 

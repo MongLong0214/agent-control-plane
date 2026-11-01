@@ -50,6 +50,16 @@ const run = (argv: string[], worktreePath: string, extra: Partial<Parameters<typ
     ...extra,
   });
 
+/**
+ * What a probe of the open network passes: it declares `network: "allow"`, since an omitted
+ * `network` is `deny`, which the sandbox enforces.
+ */
+const openNetworkProbe = {
+  command: parseVerificationCommand({
+    id: "open-sandbox", argv: ["node", "probe.cjs"], network: "allow", timeoutSeconds: 60, maxMemoryMb: 1024,
+  }),
+};
+
 /** A node script in the worktree that prints one JSON line. */
 const nodeScript = async (source: string, extra: Partial<Parameters<typeof runSandboxed>[0]> = {}) => {
   const repository = makeRepo();
@@ -235,14 +245,14 @@ describe("the verification sandbox opens to every language", () => {
         const loopback = await roundTrip([0, '127.0.0.1']);
         console.log(JSON.stringify({ worktree, tmpdir, loopback }));
       })();
-    `);
+    `, openNetworkProbe);
     expect(outcome, described(outcome)).toMatchObject({ status: "PASS" });
     expect(result).toEqual({ worktree: "pong", tmpdir: "pong", loopback: "pong" });
   });
 
   it("records the open network in the evidence instead of claiming it was denied", async (context) => {
     requireSeatbelt(context);
-    const { outcome } = await nodeScript("console.log(JSON.stringify({ ok: true }));");
+    const { outcome } = await nodeScript("console.log(JSON.stringify({ ok: true }));", openNetworkProbe);
     expect(outcome, described(outcome)).toMatchObject({
       status: "PASS",
       enforcement: {
@@ -330,7 +340,7 @@ describe("the one guard that stays: secret paths, credential environment and age
           console.log(JSON.stringify(results));
         })();
       `, {
-        command: parseVerificationCommand({ id: "sockets", argv: ["node", "probe.cjs"], envAllowlist: ["SSH_AUTH_SOCK"] }),
+        command: parseVerificationCommand({ id: "sockets", argv: ["node", "probe.cjs"], envAllowlist: ["SSH_AUTH_SOCK"], network: "allow" }),
         env: { SSH_AUTH_SOCK: sockets["ssh-agent (SSH_AUTH_SOCK)"] },
       });
     } finally {
@@ -454,7 +464,7 @@ describe("review P1s: a symlinked cache and the daemon's own agent sockets", () 
         for (const [label, path] of Object.entries(${JSON.stringify(sockets)})) results[label] = await connect(path);
         console.log(JSON.stringify(results));
       })();
-    `));
+    `, openNetworkProbe));
     const first = await connect({});
     expect(first.outcome, described(first.outcome)).toMatchObject({ status: "PASS" });
     expect(first.result).toMatchObject({ pointer: null, SSH_AUTH_SOCK: "EPERM", "GNUPGHOME agent": "EPERM", DOCKER_HOST: "EPERM", control: "agent-answered" });
