@@ -39,6 +39,7 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 import type { AttestingPeer, SessionAttestations } from "../session/session-attestations.ts";
 import type { ContinuityKernel } from "../continuity/continuity-kernel.ts";
+import { reportWithoutCapturedOutput } from "../verify/verification-engine.ts";
 import {
   authenticateMcpPeer,
   createMcpMutationPort,
@@ -866,7 +867,10 @@ const createCtoServerFromPort = (
     async (args, extra) => writeOwned("result_submit", args, async (peer, fenced) => {
       const commands = args.runScopedCommands.map((command) => parseVerificationCommand(command));
       const onProgress = progressNotifier(extra);
-      return respond(await port.submitResult({ runId: args.runId, ownerSessionId: fenced.sessionId, ownerBindingGeneration: fenced.bindingGeneration, resultSummary: args.resultSummary, recommendation: args.recommendation, residualRisk: args.residualRisk, ...(commands.length === 0 ? {} : { runScopedCommands: commands }), ...(onProgress === undefined ? {} : { onProgress }) }));
+      const outcome = await port.submitResult({ runId: args.runId, ownerSessionId: fenced.sessionId, ownerBindingGeneration: fenced.bindingGeneration, resultSummary: args.resultSummary, recommendation: args.recommendation, residualRisk: args.residualRisk, ...(commands.length === 0 ? {} : { runScopedCommands: commands }), ...(onProgress === undefined ? {} : { onProgress }) });
+      // A failed verification reaches the CTO with its excerpts, not the whole capture the review reads.
+      return respond(outcome.allowed && outcome.value.stage === "VERIFICATION_FAILED"
+        ? { ...outcome, value: { ...outcome.value, report: reportWithoutCapturedOutput(outcome.value.report) } } : outcome);
     }, true),
   );
   server.registerTool(

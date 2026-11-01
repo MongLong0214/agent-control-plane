@@ -165,6 +165,7 @@ const SECRET_COLLECTION_KEY =
   /(?:^|[_-])(env|environment|headers|http_?headers|request_?headers|response_?headers|cookies|secrets|credentials)(?:$|[_-])/i;
 
 /** Content §31.5 forbids storing at all, whatever the surrounding key is called. */
+// The list targets prompts and transcripts (§31.5); a redacted verification command log bounded by maxOutputBytes (acp.verification-output.v2 `capturedOutput`) is admitted.
 const BULK_KEY =
   /(?:^|[_-])(prompt|prompts|system_?prompt|transcript|chat_?transcript|chain_?of_?thought|reasoning|messages|conversation|raw_?output|full_?output)(?:$|[_-])/i;
 

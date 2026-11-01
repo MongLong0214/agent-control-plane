@@ -44,7 +44,7 @@ import {
   verifySnapshotFreshness,
 } from "../snapshot/candidate-snapshot.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
-import type { VerificationEngine, VerificationReport } from "../verify/verification-engine.ts";
+import { type VerificationEngine, type VerificationReport, reportWithoutCapturedOutput } from "../verify/verification-engine.ts";
 import {
   BASE_REF_NAMESPACE,
   CANDIDATE_REF_NAMESPACE,
@@ -797,11 +797,11 @@ export class CandidatePipeline {
         } satisfies VerificationReport);
 
       // §34.2 — a failed verification returns to CTO revision with the evidence still
-      // bound to the candidate that failed.
+      // bound to the candidate that failed: its excerpts, not the whole capture the review reads.
       const returned = this.applyHolding(input, attemptId, () => this.returnToCto(input.runId, verified.reasonCode, {
         stage: "verification",
         candidateSnapshotDigest: snapshotDigest,
-        report,
+        report: reportWithoutCapturedOutput(report),
       }, attemptId));
       if (returned === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
       if (!returned.allowed) return returned as Decision<PipelineOutcome>;
