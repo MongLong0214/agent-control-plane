@@ -238,6 +238,13 @@ export const ReasonCode = {
   PRIMARY_CTO_ALREADY_BOUND: "PRIMARY_CTO_ALREADY_BOUND",
   SWITCHOVER_BLOCKED_ACTIVE_RUNS: "SWITCHOVER_BLOCKED_ACTIVE_RUNS",
   REVOCATION_BLOCKED_ACTIVE_RUNS: "REVOCATION_BLOCKED_ACTIVE_RUNS",
+  /**
+   * A resumed canonical CTO's self-claim waits: a run its dead predecessor generation owns still has
+   * a RUNNING worker execution or a candidate pipeline attempt that holds it (the evidence names which).
+   * Nothing moves; the daemon-owned work ends under the generation that started it, and the next claim
+   * takes the run over with that result kept.
+   */
+  PREDECESSOR_WORKER_TURN_IN_FLIGHT: "PREDECESSOR_WORKER_TURN_IN_FLIGHT",
   PRODUCER_HISTORY_UNAVAILABLE: "PRODUCER_HISTORY_UNAVAILABLE",
   SESSION_SECRET_STORAGE_UNAVAILABLE: "SESSION_SECRET_STORAGE_UNAVAILABLE",
   SESSION_SECRET_INVALID: "SESSION_SECRET_INVALID",

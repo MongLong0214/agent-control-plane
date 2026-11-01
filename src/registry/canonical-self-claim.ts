@@ -172,9 +172,10 @@ export const peerMessageCarrySuccessionOf = PeerMessageCarryAuthorityToken.succe
  * and incarnation by that assignment; `to` is generation N + 1, ACTIVE, the same; both held by the
  * one conversational actor whose lifetime target is this `SELF_CLAIM_EXECUTOR_KIND` conversation
  * UUID; both runtimes speak as this Buzz channel identity; and the release is this exact
- * `DEAD_BINDING_RECOVERED` row for that assignment.
+ * `DEAD_BINDING_RECOVERED` row for that assignment, recording the predecessor DEAD.
  *
- * Asked only by the self-claim, before it mints the carry authority. The hand-over does not ask
+ * Asked by the self-claim, before it mints the carry authority, and again by
+ * `BindingRegistry.repointLiveRunsToSameActorSuccessor` before it moves a run. The hand-over does not ask
  * it: what it rests on is the carry record (`selfClaimCarriedTo`), which ordinary SQL cannot write,
  * while every table read here can be.
  */
@@ -204,6 +205,7 @@ export const peerMessageSuccessionIsProven = (
           AND e.kind = 'DEAD_BINDING_RECOVERED'
           AND e.role_key = prev.role_key AND e.session_id = prev.session_id
           AND json_extract(e.evidence_json, '$.assignmentId') = prev.assignment_id
+          AND json_extract(e.evidence_json, '$.liveness') = 'DEAD'
      ) AS held`,
     [
       s.toAssignmentId, s.recoveryAuditEventId,
@@ -2534,44 +2536,66 @@ export class CanonicalSelfClaim {
         });
         this.bindings.carryPeerMessagesToSameActorSuccessor(succession, recoveredFrom.alreadyCarried);
         // The runs the release left pinned to the dead generation move to this one on the same
-        // proof the carry rests on, or the claim refuses and the release rolls back with it. Only
-        // the owner pin moves; the run, its contract, candidate and reviews stay as they are.
+        // proof the carry rests on, proven again by the repoint, or the claim refuses and the
+        // release rolls back with it. Only the owner pin moves: a run with a worker execution still
+        // RUNNING, or a candidate pipeline attempt still holding it, refuses the claim
+        // (PREDECESSOR_WORKER_TURN_IN_FLIGHT) rather than lose that work, so nothing is re-run; the
+        // run's HELD claims move with its pin, and the run, its tasks, executions, contract, candidate
+        // and reviews stay as they are.
         if (recoveredFrom.liveRunIds.length > 0) {
           const moved = this.bindings.repointLiveRunsToSameActorSuccessor(succession, recoveredFrom.liveRunIds);
           if (!moved.allowed) return moved as Decision<CanonicalSelfClaimReceipt>;
-          let recorded: Decision<number>;
-          try {
-            recorded = this.audit.record({
-              kind: "CANONICAL_LIVE_RUNS_TAKEN_OVER",
-              reasonCode: ReasonCode.OK,
-              projectId: entry.projectId,
-              sessionId: created.sessionId,
-              roleKey,
-              actor: `${SELF_CLAIM_RECOVERY_ACTOR_PREFIX}${recoveredFrom.actorId}`,
-              evidence: {
-                runIds: moved.value.runIds,
-                fromGeneration: recoveredFrom.generation,
-                toGeneration: bound.value.bindingGeneration,
-                fromSession: recoveredFrom.sessionId,
-                toSessionId: created.sessionId,
-                actorId: recoveredFrom.actorId,
-                recoveryAuditEventId: recoveredFrom.recoveryAuditEventId,
-                sessionIncarnation: recoveredFrom.sessionIncarnation,
-                osPid: recoveredFrom.osPid,
-                recordedStartedAt: recoveredFrom.osProcessStartedAt,
-                liveness: recoveredFrom.liveness,
-              },
-            });
-          } catch (error) {
-            recorded = deny(ReasonCode.AUDIT_WRITE_FAILED, error instanceof Error ? error.message : String(error), {});
+          // One row per moved run, on its run_id: the run's own history says its owner moved here.
+          for (const runId of moved.value.runIds) {
+            let recorded: Decision<number>;
+            try {
+              recorded = this.audit.record({
+                kind: "CANONICAL_LIVE_RUNS_TAKEN_OVER",
+                reasonCode: ReasonCode.OK,
+                runId,
+                projectId: entry.projectId,
+                sessionId: created.sessionId,
+                roleKey,
+                actor: `${SELF_CLAIM_RECOVERY_ACTOR_PREFIX}${recoveredFrom.actorId}`,
+                evidence: {
+                  claimIds: moved.value.claims.filter((claim) => claim.runId === runId).map((claim) => claim.claimId),
+                  fromGeneration: recoveredFrom.generation,
+                  toGeneration: bound.value.bindingGeneration,
+                  fromSession: recoveredFrom.sessionId,
+                  toSessionId: created.sessionId,
+                  actorId: recoveredFrom.actorId,
+                  recoveryAuditEventId: recoveredFrom.recoveryAuditEventId,
+                  sessionIncarnation: recoveredFrom.sessionIncarnation,
+                  osPid: recoveredFrom.osPid,
+                  recordedStartedAt: recoveredFrom.osProcessStartedAt,
+                  liveness: recoveredFrom.liveness,
+                },
+              });
+            } catch (error) {
+              recorded = deny(ReasonCode.AUDIT_WRITE_FAILED, error instanceof Error ? error.message : String(error), {});
+            }
+            if (!recorded.allowed) {
+              return deny(
+                ReasonCode.AUDIT_WRITE_FAILED,
+                "the live-run takeover's audit row could not be written, so the claim was rolled back",
+                { roleKey, runs: moved.value.runIds },
+              );
+            }
           }
-          if (!recorded.allowed) {
-            return deny(
-              ReasonCode.AUDIT_WRITE_FAILED,
-              "the live-run takeover's audit row could not be written, so the claim was rolled back",
-              { roleKey, runs: moved.value.runIds },
-            );
-          }
+        }
+        // The release left its live runs pinned on this claim's word; before commit, none may still
+        // be. A generation that still owns one refuses the claim, whatever the steps above said.
+        const stranded = this.bindings.liveRunIdsOwnedBy({
+          roleKey,
+          boundSessionId: recoveredFrom.sessionId,
+          bindingGeneration: recoveredFrom.generation,
+        });
+        if (stranded.length > 0) {
+          return deny(
+            ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,
+            "the released generation still owns live runs at the claim's commit, so the claim was rolled back",
+            { roleKey, runs: stranded },
+          );
         }
       }
 

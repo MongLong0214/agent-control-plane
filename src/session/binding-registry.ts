@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { claimAcquisition } from "../claims/claim-registry.ts";
 import type { Clock } from "../core/clock.ts";
 import { canonicalJson, digestOf, isDigest } from "../core/digest.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
@@ -19,7 +20,11 @@ import {
   roleKeyFor,
 } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
-import { type PeerMessageCarryAuthority, peerMessageCarrySuccessionOf } from "../registry/canonical-self-claim.ts";
+import {
+  type PeerMessageCarryAuthority,
+  peerMessageCarrySuccessionOf,
+  peerMessageSuccessionIsProven,
+} from "../registry/canonical-self-claim.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
 import { servedHermesHeads } from "./hermes-target-head.ts";
 import type { SessionRegistry } from "./session-registry.ts";
@@ -649,7 +654,11 @@ export class BindingRegistry {
         const to = { roleKey, sessionId: input.sessionId, generation, incarnation: session.incarnation };
         const repointable = this.#liveRunsRepointable(current, to);
         if (!repointable.allowed) return repointable as Decision<RoleBinding>;
-        repointed = this.#repointLiveRuns(current, to, input.reason).repointed;
+        const moved = this.#repointLiveRuns(current, to);
+        repointed = moved.repointed;
+        for (const runId of moved.runIds) {
+          this.#tasks?.abandonStaleExecutions(runId, generation, `binding takeover: ${input.reason}`);
+        }
       }
 
       const fence = current
@@ -898,8 +907,10 @@ export class BindingRegistry {
        * REVOCATION_BLOCKED_ACTIVE_RUNS, and name every one in `runIds`. Only the canonical
        * self-claim's dead-predecessor recovery passes it, because it binds the same actor's next
        * generation in the same transaction and then moves exactly these runs to it with
-       * `repointLiveRunsToSameActorSuccessor`, which refuses unless the succession is proven; that
-       * refusal rolls the revoke back with the claim. Every other revoke refuses as before.
+       * `repointLiveRunsToSameActorSuccessor`, which refuses unless the succession is proven and no
+       * worker execution of those runs is still RUNNING; that refusal rolls the revoke back with the
+       * claim, and so does the claim's own check before commit that this generation owns no live run
+       * any more (`liveRunIdsOwnedBy`). Every other revoke refuses as before.
        */
       liveRunsForSameActorSuccessor?: { readonly runIds: string[] };
       /**
@@ -988,22 +999,32 @@ export class BindingRegistry {
   }
 
   /**
-   * The second half of `revoke`'s `liveRunsForSameActorSuccessor`: the §10.3 takeover's own run
-   * repoint (`#repointLiveRuns`), for one same-conversation canonical restart. The succession comes
-   * from the self-claim's authority, never from the caller, and it must be proven
-   * (`peerMessageSuccessionIsProven`: same actor, conversation UUID, role, project and Buzz identity,
-   * N to N + 1, and the predecessor's DEAD_BINDING_RECOVERED row); otherwise this refuses
-   * REVOCATION_BLOCKED_ACTIVE_RUNS, the refusal the revoke would have given. Exactly the runs the
-   * revoke named are moved, or nothing is. Only the owner pin moves: run, contract, candidate and
-   * evidence rows are not touched, and nothing is re-run or passed.
+   * The second half of `revoke`'s `liveRunsForSameActorSuccessor`: the §10.3 takeover's run repoint
+   * (`#repointLiveRuns`) for one same-conversation canonical restart, with the moved runs' HELD
+   * resource claims. Executions are neither abandoned nor carried here: while any execution of a moved
+   * run is still RUNNING, or a candidate pipeline attempt still holds one, this refuses
+   * PREDECESSOR_WORKER_TURN_IN_FLIGHT, so the daemon-owned turn or attempt ends under the generation
+   * that started it and its result is kept for the next claim. Only the runs' owner pin and their
+   * claims' owner move; the run, its tasks, executions, contract, candidate and reviews are left
+   * exactly as they are, and no review is passed.
+   *
+   * The succession comes from the self-claim's authority, never from the caller, and is proven again
+   * here against this transaction's rows (`peerMessageSuccessionIsProven`: same actor, conversation
+   * UUID, role, project and Buzz identity, N to N + 1, and the predecessor's DEAD DEAD_BINDING_RECOVERED
+   * row), not taken from the answer frozen when the authority was minted; unproven, this refuses
+   * REVOCATION_BLOCKED_ACTIVE_RUNS, the refusal the revoke would have given. Exactly the runs the revoke
+   * named are moved, or nothing is. It runs only inside the caller's (the claim's) transaction.
    */
   repointLiveRunsToSameActorSuccessor(
     authority: PeerMessageCarryAuthority,
     runIds: readonly string[],
-  ): Decision<{ runIds: string[] }> {
+  ): Decision<{ runIds: string[]; claims: Array<{ claimId: string; runId: string }> }> {
+    if (!this.db.inTransaction) {
+      return fail(ReasonCode.COMPLETION_AUTHORITY_DENIED, "a live-run takeover requires the self-claim's transaction", {});
+    }
     return this.db.txDecision(() => {
       const succession = peerMessageCarrySuccessionOf(authority, this.db);
-      if (succession === null || !succession.proven) {
+      if (succession === null || !peerMessageSuccessionIsProven(this.db, succession)) {
         return deny(
           ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,
           "the released binding owns live runs and its successor is not proven to be the same conversation",
@@ -1023,20 +1044,79 @@ export class BindingRegistry {
           found: owned,
         });
       }
+      // Work the predecessor generation still has in flight on a moved run: a RUNNING worker execution,
+      // or a candidate pipeline attempt that still holds the run (RUNNING, unexpired, under exactly the
+      // run's pinned owner), whose verification and review would be refused once the pin moves. An
+      // expired attempt no longer holds the run whatever this does, so it does not hold the claim back.
+      const runList = owned.map(() => "?").join(",");
+      const inFlight = owned.length === 0 ? [] : this.db.all<{ kind: string; id: string; run_id: string }>(
+        `SELECT 'EXECUTION' AS kind, execution_id AS id, run_id FROM task_executions
+          WHERE status = 'RUNNING' AND run_id IN (${runList})
+         UNION ALL
+         SELECT 'PIPELINE_ATTEMPT' AS kind, attempt_id AS id, run_id FROM candidate_pipeline_attempts
+          WHERE state = 'RUNNING' AND deadline_at > ? AND owner_session_id = ? AND owner_binding_generation = ?
+            AND run_id IN (${runList})
+         ORDER BY kind, id`,
+        [...owned, this.clock.nowIso(), from.boundSessionId, from.bindingGeneration, ...owned],
+      );
+      if (inFlight.length > 0) {
+        return deny(
+          ReasonCode.PREDECESSOR_WORKER_TURN_IN_FLIGHT,
+          "the predecessor generation still has a worker turn or a candidate pipeline attempt in flight; the claim waits for it to end",
+          {
+            roleKey: succession.roleKey,
+            runs: [...new Set(inFlight.map((row) => row.run_id))],
+            inFlight: inFlight.map((row) => ({ kind: row.kind, id: row.id, runId: row.run_id })),
+          },
+        );
+      }
+      // Every refusal is above: the update below matches exactly the rows `owned` read, in this
+      // transaction, so it moves all of them.
       const to = {
         roleKey: succession.roleKey,
         sessionId: succession.toSessionId,
         generation: succession.toGeneration,
         incarnation: succession.toSessionIncarnation,
       };
-      const repointable = this.#liveRunsRepointable(from, to);
-      if (!repointable.allowed) return repointable as Decision<{ runIds: string[] }>;
-      // Every refusal is above: the update below matches exactly the rows `owned` read, in this
-      // transaction, so it moves all of them.
-      const moved = this.#repointLiveRuns(from, to,
-        `same-conversation canonical restart, generation ${succession.fromGeneration} to ${succession.toGeneration}`);
-      return allow(ReasonCode.OK, { runIds: moved.runIds });
+      const moved = this.#repointLiveRuns(from, to);
+      // The moved runs' HELD resource claims follow their owner pin, or the successor's writes, worker
+      // turns and next verification find no claim of its generation and are refused. Safe here only: the
+      // refusal above means no turn or attempt of these runs is in flight. Every row acquired with a
+      // HELD one moves with it, so an acquisition stays provable (`claimAcquisition`) for the worktree
+      // hand-over and a worker turn; a claim of any other run or owner is not touched.
+      const held = owned.length === 0 ? [] : this.db.all<{ claim_id: string }>(
+        `SELECT claim_id FROM resource_claims
+          WHERE status = 'HELD' AND owner_session_id = ? AND owner_binding_generation = ? AND run_id IN (${runList})`,
+        [from.boundSessionId, from.bindingGeneration, ...owned],
+      );
+      const claims = new Map<string, string>();
+      for (const { claim_id: claimId } of held) {
+        for (const row of claimAcquisition(this.db, claimId)?.rows ?? []) {
+          if (row.owner_session_id === from.boundSessionId && row.owner_binding_generation === from.bindingGeneration &&
+              owned.includes(row.run_id)) claims.set(row.claim_id, row.run_id);
+        }
+      }
+      for (const claimId of claims.keys()) {
+        this.db.run(
+          `UPDATE resource_claims SET owner_session_id = ?, owner_binding_generation = ?
+            WHERE claim_id = ? AND owner_session_id = ? AND owner_binding_generation = ?`,
+          [to.sessionId, to.generation, claimId, from.boundSessionId, from.bindingGeneration],
+        );
+      }
+      return allow(ReasonCode.OK, {
+        runIds: moved.runIds,
+        claims: [...claims].map(([claimId, runId]) => ({ claimId, runId })),
+      });
     });
+  }
+
+  /**
+   * The live runs `binding` still owns, by id. The self-claim asks it last, before its commit, for the
+   * generation it released with `liveRunsForSameActorSuccessor`: one still owning a live run refuses
+   * the claim, whatever the steps between said.
+   */
+  liveRunIdsOwnedBy(binding: Pick<RoleBinding, "roleKey" | "boundSessionId" | "bindingGeneration">): string[] {
+    return this.liveRunsOwnedBy(binding).map((run) => run.run_id);
   }
 
   /**
@@ -1068,15 +1148,14 @@ export class BindingRegistry {
   }
 
   /**
-   * §10.3 — repoints every live run `from` owns onto `to` and abandons their stale executions, in
-   * the caller's transaction, so a crash cannot leave a run pinned to a revoked generation. Used by
-   * `switchTo`'s takeover and by `repointLiveRunsToSameActorSuccessor`, each after
-   * `#liveRunsRepointable`.
+   * §10.3 — repoints every live run `from` owns onto `to`, in the caller's transaction, so a crash
+   * cannot leave a run pinned to a revoked generation. Only the owner pin: `switchTo`'s takeover then
+   * abandons the stale executions itself, and `repointLiveRunsToSameActorSuccessor` refuses while any
+   * is still RUNNING instead. Each caller asks `#liveRunsRepointable` or refuses first.
    */
   #repointLiveRuns(
     from: Pick<RoleBinding, "roleKey" | "boundSessionId" | "bindingGeneration">,
     to: { roleKey: string; sessionId: string; generation: number; incarnation: string },
-    reason: string,
   ): { runIds: string[]; repointed: number } {
     const affectedRuns = this.liveRunsOwnedBy(from);
     const repointed = this.db.run(
@@ -1092,9 +1171,6 @@ export class BindingRegistry {
         from.boundSessionId, from.bindingGeneration, from.roleKey, ...LIVE_RUN_STATES,
       ],
     ).changes;
-    for (const affected of affectedRuns) {
-      this.#tasks?.abandonStaleExecutions(affected.run_id, to.generation, `binding takeover: ${reason}`);
-    }
     return { runIds: affectedRuns.map((run) => run.run_id), repointed };
   }
 

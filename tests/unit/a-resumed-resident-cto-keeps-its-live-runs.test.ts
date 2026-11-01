@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
+import { join } from "node:path";
 
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
@@ -8,7 +9,8 @@ import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { recoverDeadCanonicalBinding } from "../../src/daemon/dead-binding-recovery.ts";
 import type { Db } from "../../src/db/database.ts";
-import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { WriteOperation } from "../../src/guard/managed-write-guard.ts";
+import { ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import {
   CanonicalSelfClaim,
@@ -16,8 +18,17 @@ import {
   type CanonicalSelfClaimReceipt,
   type ProcessSnapshot,
 } from "../../src/registry/canonical-self-claim.ts";
-import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { bootstrapCtoProvider, driveToReviewedCandidate, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import { cleanupTempDirs, makeRepo, seedRun } from "../helpers/fixtures.ts";
+import {
+  applyPassingChange,
+  bindCeo,
+  bindWorker,
+  bootstrapCtoProvider,
+  driveToReviewedCandidate,
+  makeHarness,
+  registerFixtureProject,
+  reviewerRevise,
+} from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -92,7 +103,32 @@ interface ClaimOptions {
   claimedSessionUuid?: string;
 }
 
-const startFixture = async (options: { liveRun?: boolean } = {}) => {
+const contract = {
+  goal: "make app() return 2",
+  why: "downstream callers expect 2",
+  scope: ["src/app.js"],
+  nonGoals: [],
+  acceptance: ["verify.js exits 0"],
+  priority: "NORMAL" as const,
+  humanGate: [],
+  references: [],
+};
+
+interface FixtureOptions {
+  /** Drive the run to a BLOCK review (the default), or leave no live run at all. */
+  liveRun?: boolean;
+  /** Instead, leave the run with its one worker execution still RUNNING under generation 1. */
+  inFlight?: boolean;
+  /**
+   * Instead, finish that execution and submit the result under generation 1, holding the blind review
+   * so the candidate pipeline attempt stays RUNNING until `releaseReview`.
+   */
+  submitting?: boolean;
+  /** Also dispatch a second, bare run to generation 1. */
+  secondRun?: boolean;
+}
+
+const startFixture = async (options: FixtureOptions = {}) => {
   const harness = makeHarness();
   const registered = await registerFixtureProject(harness);
   const { projectId } = registered;
@@ -152,7 +188,65 @@ const startFixture = async (options: { liveRun?: boolean } = {}) => {
   expect(predecessor.osPid).toBe(live.pid);
 
   let runId = RUN_ID;
-  if (options.liveRun !== false) {
+  let executionId: string | null = null;
+  let releaseReview: (() => void) | null = null;
+  let submission: Promise<Decision<unknown>> | null = null;
+  // The canonical CTO's provider is `claude`; dispatch asks its capacity before it pins the owner.
+  if (options.liveRun !== false || options.secondRun === true || options.submitting === true) {
+    bootstrapCtoProvider(harness.cp, harness.clock);
+  }
+  if (options.inFlight === true || options.submitting === true) {
+    // The real run path up to a worker turn the daemon has started and not finished.
+    if (!harness.cp.bindings.active(roleKeyFor(Role.CEO))) bindCeo(harness);
+    const created = harness.cp.runs.create({
+      projectId, executionMode: ExecutionMode.STANDARD, contract,
+      repositories: [{ repositoryId: registered.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    });
+    if (!created.allowed) throw new Error(created.message);
+    runId = created.value.runId;
+    const dispatched = await harness.cp.runs.dispatch(runId);
+    if (!dispatched.allowed) throw new Error(`${dispatched.reasonCode}: ${dispatched.message}`);
+    expect(dispatched.value).toMatchObject({ ownerSessionId: predecessor.sessionId, ownerBindingGeneration: 1 });
+    const tasks = harness.cp.tasks.submit(runId, [{ key: "impl", title: "change app()", category: "implementation" }]);
+    if (!tasks.allowed) throw new Error(tasks.message);
+    const impl = harness.cp.tasks.ready(runId)[0]!;
+    const started = harness.cp.tasks.startExecution({
+      runId, taskId: impl.taskId, ownerBindingGeneration: 1, workerSessionId: bindWorker(harness, impl.taskId),
+      provider: "scripted", model: "scripted-worker", repositoryId: registered.repositoryId,
+    });
+    if (!started.allowed) throw new Error(started.message);
+    executionId = started.value.executionId;
+    if (options.submitting === true) {
+      const head = applyPassingChange(harness.repoPath, "feature/F1-thing");
+      const finished = harness.cp.tasks.finishExecution(executionId, { status: "SUCCEEDED", resultDigest: `sha256:${head}` });
+      if (!finished.allowed) throw new Error(finished.message);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let reviewStarted!: () => void;
+      const reviewing = new Promise<void>((resolve) => { reviewStarted = resolve; });
+      const invoke = harness.scripted.invoke.bind(harness.scripted);
+      vi.spyOn(harness.scripted, "invoke").mockImplementation(async (request) => {
+        if (/Candidate review/.test(request.prompt)) {
+          reviewStarted();
+          await gate;
+        }
+        return invoke(request);
+      });
+      harness.scripted.script({
+        match: /Candidate review/,
+        text: reviewerRevise([`${registered.identity}:src/app.js`], "fixture revision"),
+      });
+      submission = harness.cp.pipeline.submitResult({
+        runId, ownerSessionId: predecessor.sessionId, ownerBindingGeneration: 1,
+        resultSummary: "app() returns 2", recommendation: "review it",
+      });
+      await Promise.race([
+        reviewing,
+        submission.then((ended) => { throw new Error(`the submission ended before its review: ${JSON.stringify(ended)}`); }),
+      ]);
+      releaseReview = release;
+    }
+  } else if (options.liveRun !== false) {
     // The production shape, driven through the real run path with this canonical CTO as owner:
     // contract, dispatch, a worker change, a frozen candidate, verification and a blind review that
     // answers BLOCK (scripted first, so it is the response the review consumes).
@@ -168,8 +262,6 @@ const startFixture = async (options: { liveRun?: boolean } = {}) => {
         }],
       }),
     });
-    // The canonical CTO's provider is `claude`; dispatch asks its capacity before it pins the owner.
-    bootstrapCtoProvider(harness.cp, harness.clock);
     // The helper stops at the review's refusal; the run, its evidence and the BLOCK are what it left.
     await expect(driveToReviewedCandidate(harness, { registeredProject: registered })).rejects.toThrow(/REVIEW_BLOCK/);
     const driven = db.all<{ run_id: string; state: string; owner_session_id: string; owner_binding_generation: number }>(
@@ -180,6 +272,19 @@ const startFixture = async (options: { liveRun?: boolean } = {}) => {
     runId = driven[0]!.run_id;
     expect(driven[0]).toMatchObject({ owner_session_id: predecessor.sessionId, owner_binding_generation: 1 });
     expect(["COMPLETED", "FAILED", "CANCELLED"]).not.toContain(driven[0]!.state);
+  }
+  let secondRunId: string | null = null;
+  if (options.secondRun === true) {
+    if (!harness.cp.bindings.active(roleKeyFor(Role.CEO))) bindCeo(harness);
+    const created = harness.cp.runs.create({
+      projectId, executionMode: ExecutionMode.STANDARD, contract: { ...contract, goal: "a second piece of work" },
+      repositories: [{ repositoryId: registered.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    });
+    if (!created.allowed) throw new Error(created.message);
+    const dispatched = await harness.cp.runs.dispatch(created.value.runId);
+    if (!dispatched.allowed) throw new Error(`${dispatched.reasonCode}: ${dispatched.message}`);
+    expect(dispatched.value).toMatchObject({ ownerSessionId: predecessor.sessionId, ownerBindingGeneration: 1 });
+    secondRunId = created.value.runId;
   }
   // The relay and the process are gone; nothing revoked the binding.
   live.kill("SIGKILL");
@@ -194,15 +299,17 @@ const startFixture = async (options: { liveRun?: boolean } = {}) => {
     ) ?? null,
     artifacts: db.all<Record<string, unknown>>(`SELECT * FROM run_artifacts WHERE run_id = ? ORDER BY artifact_id`, [runId]),
     verification: db.all<Record<string, unknown>>(`SELECT * FROM verification_results ORDER BY rowid`),
+    tasks: db.all<Record<string, unknown>>(`SELECT * FROM tasks WHERE run_id = ? ORDER BY task_id`, [runId]),
+    executions: db.all<Record<string, unknown>>(`SELECT * FROM task_executions WHERE run_id = ? ORDER BY execution_id`, [runId]),
   });
 
-  const owner = () =>
+  const owner = (of: string = runId) =>
     db.get<{
       owner_session_id: string; owner_binding_generation: number; owner_session_incarnation: string; owner_role_key: string;
     }>(
       `SELECT owner_session_id, owner_binding_generation, owner_session_incarnation, owner_role_key
          FROM runs WHERE run_id = ?`,
-      [runId],
+      [of],
     ) ?? null;
 
   const assignments = () =>
@@ -212,8 +319,9 @@ const startFixture = async (options: { liveRun?: boolean } = {}) => {
     );
 
   const takeovers = () =>
-    db.all<{ session_id: string; role_key: string; actor: string; evidence_json: string }>(
-      `SELECT session_id, role_key, actor, evidence_json FROM audit_events WHERE kind = 'CANONICAL_LIVE_RUNS_TAKEN_OVER'`,
+    db.all<{ run_id: string; session_id: string; role_key: string; actor: string; evidence_json: string }>(
+      `SELECT run_id, session_id, role_key, actor, evidence_json FROM audit_events
+        WHERE kind = 'CANONICAL_LIVE_RUNS_TAKEN_OVER' ORDER BY event_id`,
     ).map(({ evidence_json, ...row }) => ({ ...row, evidence: JSON.parse(evidence_json) as Record<string, unknown> }));
 
   /** Every table, and the audit log up to what it held: the rollback oracle. */
@@ -235,7 +343,9 @@ const startFixture = async (options: { liveRun?: boolean } = {}) => {
   };
 
   return {
-    harness, db, projectId, roleKey, runId, runOne, first: first.value, predecessor, claimAs, work, owner, assignments,
+    harness, db, projectId, roleKey, runId, secondRunId, executionId, releaseReview, submission, runOne,
+    first: first.value, predecessor, claimAs,
+    work, owner, assignments,
     takeovers, durable, expectUnchangedBut,
   };
 };
@@ -258,6 +368,9 @@ describe("a resumed resident CTO keeps its live runs (CEO msg_00ce7760, option A
   it("W1 — the same conversation, proven DEAD predecessor: admitted at gen+1 and the run's owner moves, nothing else", async () => {
     const f = await startFixture();
     const before = f.work();
+    const heldClaims = f.db.all<{ claim_id: string }>(
+      `SELECT claim_id FROM resource_claims WHERE run_id = ? AND status = 'HELD' ORDER BY claim_id`, [f.runId],
+    ).map((row) => row.claim_id);
     expect(f.owner()).toEqual({
       owner_session_id: f.predecessor.sessionId, owner_binding_generation: 1,
       owner_session_incarnation: f.predecessor.incarnation, owner_role_key: f.roleKey,
@@ -273,8 +386,10 @@ describe("a resumed resident CTO keeps its live runs (CEO msg_00ce7760, option A
       owner_session_id: successor.sessionId, owner_binding_generation: 2,
       owner_session_incarnation: successor.incarnation, owner_role_key: f.roleKey,
     });
-    // Run, contract, candidate and the BLOCK review are byte for byte what they were.
+    // Run, contract, candidate, the BLOCK review, its tasks and executions are byte for byte what they were.
     expect(f.work()).toEqual(before);
+    expect(before.tasks.length).toBeGreaterThan(0);
+    expect(before.executions.map((row) => row["status"])).toEqual(["SUCCEEDED"]);
     const kinds = before.artifacts.map((row) => row["kind"]);
     expect(kinds).toEqual(expect.arrayContaining(["TASK_CONTRACT", "CANDIDATE_SNAPSHOT", "VERIFICATION", "BLIND_REVIEW"]));
     const review = before.artifacts.find((row) => row["kind"] === "BLIND_REVIEW")!;
@@ -292,11 +407,12 @@ describe("a resumed resident CTO keeps its live runs (CEO msg_00ce7760, option A
     expect(recovered).toHaveLength(1);
     expect(JSON.parse(recovered[0]!.evidence_json)).toMatchObject({ liveness: "DEAD", releasedGeneration: 1 });
     expect(f.takeovers()).toEqual([{
+      run_id: f.runId,
       session_id: successor.sessionId,
       role_key: f.roleKey,
       actor: `canonical-self-claim:${rows[0]!.actor_id}`,
       evidence: {
-        runIds: [f.runId],
+        claimIds: heldClaims,
         fromGeneration: 1,
         toGeneration: 2,
         fromSession: f.predecessor.sessionId,
@@ -549,5 +665,345 @@ describe("a resumed resident CTO keeps its live runs (CEO msg_00ce7760, option A
       liveness: { signal: signalFrom(chain), startedAt: (pid) => chain.find((entry) => entry.pid === pid)?.startedAt ?? null },
     })).toMatchObject({ allowed: false, reasonCode: ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS });
     expect(f.durable()).toEqual(before);
+  });
+
+  it("W8 (F1) — a worker turn still RUNNING under gen 1 refuses the claim with nothing moved; once it ends, the claim keeps its result", async () => {
+    const f = await startFixture({ inFlight: true });
+    const { harness, db } = f;
+    const executionOf = () => db.get<Record<string, unknown>>(`SELECT * FROM task_executions WHERE execution_id = ?`, [f.executionId]);
+    const taskOf = () => db.all<Record<string, unknown>>(`SELECT * FROM tasks WHERE run_id = ? ORDER BY task_id`, [f.runId]);
+    expect(executionOf()).toMatchObject({ status: "RUNNING", owner_binding_generation: 1 });
+    const taskBefore = taskOf();
+    const before = f.durable();
+
+    const refused = await f.claimAs(2);
+
+    expect(refused).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.PREDECESSOR_WORKER_TURN_IN_FLIGHT,
+      evidence: { runs: [f.runId], inFlight: [{ kind: "EXECUTION", id: f.executionId, runId: f.runId }] },
+    });
+    f.expectUnchangedBut(before, refused);
+    expect(executionOf()).toMatchObject({ status: "RUNNING", owner_binding_generation: 1 });
+    expect(taskOf()).toEqual(taskBefore);
+    expect(f.owner()).toMatchObject({ owner_session_id: f.predecessor.sessionId, owner_binding_generation: 1 });
+    expect(harness.cp.bindings.active(f.roleKey)?.bindingGeneration).toBe(1);
+
+    // The daemon-owned turn ends by itself under the generation that started it.
+    const head = applyPassingChange(harness.repoPath, "feature/F1-thing");
+    const finished = harness.cp.tasks.finishExecution(f.executionId!, { status: "SUCCEEDED", resultDigest: `sha256:${head}` });
+    expect(finished.allowed, JSON.stringify(finished)).toBe(true);
+    const settled = { execution: executionOf(), tasks: taskOf() };
+    expect(settled.execution).toMatchObject({ status: "SUCCEEDED", result_digest: `sha256:${head}` });
+
+    const admitted = await f.claimAs(2);
+
+    expect(admitted.allowed, JSON.stringify(admitted)).toBe(true);
+    if (!admitted.allowed) return;
+    expect(f.owner()).toMatchObject({ owner_session_id: admitted.value.sessionId, owner_binding_generation: 2 });
+    // The finished work is kept: neither the execution nor its task was touched by the takeover.
+    expect({ execution: executionOf(), tasks: taskOf() }).toEqual(settled);
+  });
+
+  it("W9 (F2) — the proof requires the recorded DEAD: a recovery row recording anything else moves nothing", async () => {
+    const f = await startFixture();
+    const before = f.durable();
+    const record = f.harness.cp.audit.record.bind(f.harness.cp.audit);
+    const spy = vi.spyOn(f.harness.cp.audit, "record").mockImplementation((entry) =>
+      record(entry.kind === "DEAD_BINDING_RECOVERED" ? { ...entry, evidence: { ...entry.evidence, liveness: "UNKNOWN" } } : entry));
+
+    let refused: Decision<unknown>;
+    try {
+      refused = await f.claimAs(2);
+    } finally { spy.mockRestore(); }
+
+    expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS });
+    f.expectUnchangedBut(before, refused);
+  });
+
+  it("W10 (F2) — the repoint proves the succession again: one broken after the authority was minted moves nothing", async () => {
+    const f = await startFixture();
+    const before = f.durable();
+    const carry = f.harness.cp.bindings.carryPeerMessagesToSameActorSuccessor.bind(f.harness.cp.bindings);
+    // Between the authority's minting and the repoint: the successor generation is revoked again.
+    const spy = vi.spyOn(f.harness.cp.bindings, "carryPeerMessagesToSameActorSuccessor").mockImplementation((...args) => {
+      const carried = carry(...args);
+      expect(f.harness.cp.bindings.revoke(f.roleKey, "the successor lost its binding after minting").allowed).toBe(true);
+      return carried;
+    });
+
+    let refused: Decision<unknown>;
+    try {
+      refused = await f.claimAs(2);
+    } finally { spy.mockRestore(); }
+
+    expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS });
+    f.expectUnchangedBut(before, refused);
+  });
+
+  it("W11 (F2) — the repoint runs only inside the claim's transaction", async () => {
+    const f = await startFixture();
+    const real = f.harness.cp.bindings.repointLiveRunsToSameActorSuccessor.bind(f.harness.cp.bindings);
+    let authority: Parameters<typeof real>[0] | null = null;
+    const spy = vi.spyOn(f.harness.cp.bindings, "repointLiveRunsToSameActorSuccessor").mockImplementation((...args) => {
+      authority = args[0];
+      return real(...args);
+    });
+    let claimed: Decision<unknown>;
+    try {
+      claimed = await f.claimAs(2);
+    } finally { spy.mockRestore(); }
+    expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
+    expect(authority).not.toBeNull();
+    const after = f.durable();
+
+    expect(() => f.harness.cp.bindings.repointLiveRunsToSameActorSuccessor(authority!, [])).toThrow(/requires the self-claim's transaction/);
+    expect(f.durable()).toEqual(after);
+  });
+
+  it("W12 (F3) — a release whose runs were not moved fails the claim before commit", async () => {
+    const f = await startFixture();
+    const before = f.durable();
+    // The repoint answers success and moves nothing: the release's word is all the claim has.
+    const spy = vi.spyOn(f.harness.cp.bindings, "repointLiveRunsToSameActorSuccessor")
+      .mockImplementation((_authority, runIds) => allow(ReasonCode.OK, { runIds: [...runIds], claims: [] }));
+
+    let refused: Decision<unknown>;
+    try {
+      refused = await f.claimAs(2);
+    } finally { spy.mockRestore(); }
+
+    expect(refused).toMatchObject({
+      allowed: false, reasonCode: ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS, evidence: { runs: [f.runId] },
+    });
+    f.expectUnchangedBut(before, refused);
+  });
+
+  it("W13 (F4) — one CANONICAL_LIVE_RUNS_TAKEN_OVER row per moved run, on its run_id", async () => {
+    const f = await startFixture({ secondRun: true });
+    expect(f.secondRunId).not.toBeNull();
+
+    const claimed = await f.claimAs(2);
+
+    expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
+    if (!claimed.allowed) return;
+    for (const runId of [f.runId, f.secondRunId!]) {
+      expect(f.owner(runId)).toMatchObject({ owner_session_id: claimed.value.sessionId, owner_binding_generation: 2 });
+    }
+    const rows = f.takeovers();
+    expect(rows.map((row) => row.run_id).sort()).toEqual([f.runId, f.secondRunId!].sort());
+    for (const row of rows) {
+      expect(row).toMatchObject({ session_id: claimed.value.sessionId, role_key: f.roleKey });
+      expect(row.evidence).toMatchObject({ fromGeneration: 1, toGeneration: 2, liveness: "DEAD" });
+    }
+  });
+
+  it("W14 (F4) — a run continuity holds is kept held after the takeover, and the takeover row is why", async () => {
+    const f = await startFixture();
+    const { harness } = f;
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    const pause = () => {
+      // The daemon's own pause (`Daemon.pauseAffectedRuns`) for a lost CEO.
+      const paused = harness.cp.runs.pauseForContinuity(f.runId, ceo.roleKey, "failover refused: SESSION_NOT_READY", {
+        roleKey: ceo.roleKey, continuityAction: "PAUSE_NEW_WORK",
+      });
+      expect(paused.allowed, JSON.stringify(paused)).toBe(true);
+    };
+    expect(harness.cp.runs.require(f.runId).state).toBe(RunState.ACTIVE);
+    // Control: with nothing moved, the same hold is released.
+    pause();
+    const control = harness.cp.runs.releaseContinuityHold(f.runId, ceo);
+    expect(control).toMatchObject({ allowed: true, value: { released: true, kept: null } });
+    pause();
+
+    const claimed = await f.claimAs(2);
+    expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
+
+    const decided = harness.cp.runs.releaseContinuityHold(f.runId, ceo);
+    expect(decided).toMatchObject({
+      allowed: true,
+      value: {
+        released: false,
+        kept: expect.stringMatching(/^CANONICAL_LIVE_RUNS_TAKEN_OVER \(event \d+\) was recorded for the run after continuity's pause \(event \d+\)$/),
+      },
+    });
+    expect(harness.cp.runs.require(f.runId)).toMatchObject({ state: RunState.BLOCKED, continuityHoldRoleKey: ceo.roleKey });
+  });
+
+  it("W15 (F1) — a candidate pipeline attempt still RUNNING under gen 1 refuses the claim with nothing moved; once it ends, the claim keeps its review", async () => {
+    const f = await startFixture({ submitting: true });
+    const { db } = f;
+    const attemptOf = () => db.get<Record<string, unknown>>(`SELECT * FROM candidate_pipeline_attempts WHERE run_id = ?`, [f.runId]);
+    const reviewsOf = () => db.all<Record<string, unknown>>(
+      `SELECT * FROM run_artifacts WHERE run_id = ? AND kind = 'BLIND_REVIEW' ORDER BY artifact_id`, [f.runId]);
+    const held = attemptOf();
+    expect(held).toMatchObject({ state: "RUNNING", owner_session_id: f.predecessor.sessionId, owner_binding_generation: 1 });
+    const before = f.durable();
+
+    const refused = await f.claimAs(2);
+
+    expect(refused).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.PREDECESSOR_WORKER_TURN_IN_FLIGHT,
+      evidence: { runs: [f.runId], inFlight: [{ kind: "PIPELINE_ATTEMPT", id: held!["attempt_id"], runId: f.runId }] },
+    });
+    f.expectUnchangedBut(before, refused);
+    expect(attemptOf()).toEqual(held);
+    expect(f.owner()).toMatchObject({ owner_session_id: f.predecessor.sessionId, owner_binding_generation: 1 });
+
+    // The attempt ends by itself under the generation that started it, and its review is applied.
+    f.releaseReview!();
+    const outcome = await f.submission!;
+    expect(outcome.allowed, JSON.stringify(outcome)).toBe(true);
+    const settled = { attempt: attemptOf(), reviews: reviewsOf(), state: f.harness.cp.runs.require(f.runId).state };
+    expect(settled.attempt).toMatchObject({ attempt_id: held!["attempt_id"], state: "RELEASED" });
+    expect(settled.reviews).toHaveLength(1);
+    expect(String(settled.reviews[0]!["content_json"])).toContain('"verdict":"REVISE"');
+
+    const admitted = await f.claimAs(2);
+
+    expect(admitted.allowed, JSON.stringify(admitted)).toBe(true);
+    if (!admitted.allowed) return;
+    expect(f.owner()).toMatchObject({ owner_session_id: admitted.value.sessionId, owner_binding_generation: 2 });
+    // The finished attempt and its review are kept as they were.
+    expect({ attempt: attemptOf(), reviews: reviewsOf(), state: f.harness.cp.runs.require(f.runId).state }).toEqual(settled);
+  });
+
+  /** The run's repository, and the claims of a run by row, for the claim witnesses below. */
+  const repositoryOf = (f: Awaited<ReturnType<typeof startFixture>>) =>
+    f.db.get<{ identity: string; checkout_path: string }>(
+      `SELECT r.identity, r.checkout_path FROM repositories r JOIN run_repositories rr ON rr.repository_id = r.repository_id
+        WHERE rr.run_id = ?`,
+      [f.runId],
+    )!;
+  const claimsOf = (f: Awaited<ReturnType<typeof startFixture>>, runId: string = f.runId) =>
+    f.db.all<Record<string, unknown>>(`SELECT * FROM resource_claims WHERE run_id = ? ORDER BY claim_id`, [runId]);
+  /** Gen 1 takes claims of its own while it still holds the role (nothing revoked it). */
+  const acquireAsGen1 = (f: Awaited<ReturnType<typeof startFixture>>, request: Record<string, unknown>) => {
+    const repo = repositoryOf(f);
+    const acquired = f.harness.cp.claims.acquire({
+      runId: f.runId, ownerRoleKey: f.roleKey, repositoryIdentity: repo.identity,
+      ownerSessionId: f.predecessor.sessionId, ownerBindingGeneration: 1, ...request,
+    } as Parameters<typeof f.harness.cp.claims.acquire>[0]);
+    if (!acquired.allowed) throw new Error(JSON.stringify(acquired));
+    return acquired.value;
+  };
+
+  it("W16 (claims) — right after a takeover, verification as gen 2 passes with no manual release", async () => {
+    const f = await startFixture();
+    const { harness } = f;
+    // The BLOCK review's verification left its worktree claim HELD at gen 1.
+    expect(claimsOf(f).filter((row) => row["status"] === "HELD")).toEqual([
+      expect.objectContaining({ owner_session_id: f.predecessor.sessionId, owner_binding_generation: 1 }),
+    ]);
+
+    const claimed = await f.claimAs(2);
+    expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
+    if (!claimed.allowed) return;
+
+    const digest = harness.cp.runs.currentCandidate(f.runId)!;
+    const snapshot = harness.cp.artifacts.latestForSnapshot(f.runId, "CANDIDATE_SNAPSHOT", digest)!.content as
+      Parameters<typeof harness.cp.verification.verify>[0]["snapshot"];
+    const verified = await harness.cp.verification.verify({
+      runId: f.runId, snapshot, contractDigest: snapshot.contractDigest,
+      commands: harness.cp.projects.activeManifest(f.projectId)!.manifest.verificationCommands,
+    });
+    expect(verified.allowed, JSON.stringify(verified)).toBe(true);
+    if (!verified.allowed) return;
+    expect(verified.value.status).toBe("PASS");
+    // The verification used the moved claim: still the one row, now the successor's.
+    expect(claimsOf(f).filter((row) => row["status"] === "HELD")).toEqual([
+      expect.objectContaining({ owner_session_id: claimed.value.sessionId, owner_binding_generation: 2 }),
+    ]);
+  });
+
+  it("W17 (claims) — a gen-1 branch and path claimed in separate acquisitions are the successor's to write under", async () => {
+    const f = await startFixture();
+    const { harness } = f;
+    const repo = repositoryOf(f);
+    const branch = acquireAsGen1(f, { branch: "feature/F1-thing" });
+    const path = acquireAsGen1(f, { declaredPaths: ["src/app.js"] });
+
+    const claimed = await f.claimAs(2);
+    expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
+    if (!claimed.allowed) return;
+
+    for (const id of [branch[0]!.claimId, path[0]!.claimId]) {
+      expect(claimsOf(f).find((row) => row["claim_id"] === id)).toMatchObject({
+        status: "HELD", owner_session_id: claimed.value.sessionId, owner_binding_generation: 2,
+      });
+    }
+    // A managed write to the run's checkout as gen 2: its grant needs the branch claim at the run's generation.
+    const granted = harness.cp.guard.evaluate({
+      operation: WriteOperation.FILE_MUTATION, runId: f.runId, sessionId: claimed.value.sessionId, bindingGeneration: 2,
+      targetPath: join(repo.checkout_path, "src/app.js"),
+    });
+    expect(granted.allowed, JSON.stringify(granted)).toBe(true);
+    if (!granted.allowed) return;
+    expect(granted.value.targetBranch).toBe("feature/F1-thing");
+    expect(harness.cp.guard.consume(granted.value.grantId)).toMatchObject({ allowed: true, reasonCode: ReasonCode.WRITE_ALLOWED });
+    // Nothing needs re-acquiring: the successor holds them, and releasing one frees it to acquire again.
+    expect(harness.cp.claims.release(path[0]!.claimId, f.runId).allowed).toBe(true);
+    expect(harness.cp.claims.acquire({
+      runId: f.runId, ownerRoleKey: f.roleKey, repositoryIdentity: repo.identity,
+      ownerSessionId: claimed.value.sessionId, ownerBindingGeneration: 2, declaredPaths: ["src/app.js"],
+    }).allowed).toBe(true);
+  });
+
+  it("W18 (claims) — an acquisition with one row already released moves whole, so the worktree still hands over", async () => {
+    const f = await startFixture();
+    const { harness } = f;
+    const repo = repositoryOf(f);
+    const acquired = acquireAsGen1(f, { worktreeId: repo.checkout_path, branch: "feature/wt", declaredPaths: ["README.md"] });
+    const readme = acquired.find((claim) => claim.declaredPath === "README.md")!;
+    expect(harness.cp.claims.release(readme.claimId, f.runId).allowed).toBe(true);
+
+    const claimed = await f.claimAs(2);
+    expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
+    if (!claimed.allowed) return;
+    const handedOver = harness.cp.claims.acquire({
+      runId: f.runId, ownerRoleKey: f.roleKey, repositoryIdentity: repo.identity,
+      ownerSessionId: claimed.value.sessionId, ownerBindingGeneration: 2,
+      worktreeId: repo.checkout_path, branch: "feature/wt",
+    });
+    expect(handedOver.allowed, JSON.stringify(handedOver)).toBe(true);
+    for (const claim of acquired) {
+      expect(claimsOf(f).find((row) => row["claim_id"] === claim.claimId)).toMatchObject({
+        status: "RELEASED", owner_session_id: claimed.value.sessionId, owner_binding_generation: 2,
+      });
+    }
+  });
+
+  it("W19 (claims) — a HELD claim of a run that is not moved, owned by another role, is untouched", async () => {
+    const f = await startFixture();
+    const other = seedRun({ db: f.db, clock: f.harness.clock, repoPath: makeRepo(), identity: "github:acme/other" });
+    const before = claimsOf(f, other.runId);
+    expect(before).toEqual([expect.objectContaining({ status: "HELD", owner_binding_generation: 1, owner_session_id: other.sessionId })]);
+
+    const claimed = await f.claimAs(2);
+
+    expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
+    expect(claimsOf(f, other.runId)).toEqual(before);
+    expect(f.owner(other.runId)).toMatchObject({ owner_session_id: other.sessionId, owner_binding_generation: 1 });
+  });
+
+  it("W20 (claims) — a rollback mid-transaction leaves every claim at gen 1", async () => {
+    const f = await startFixture();
+    acquireAsGen1(f, { branch: "feature/F1-thing" });
+    acquireAsGen1(f, { declaredPaths: ["src/app.js"] });
+    const claimsBefore = claimsOf(f);
+    expect(claimsBefore.filter((row) => row["status"] === "HELD")).toHaveLength(3);
+    const before = f.durable();
+    const injected = failAuditInsertsOf(f.db, "CANONICAL_LIVE_RUNS_TAKEN_OVER");
+
+    let refused: Decision<unknown>;
+    try {
+      refused = await f.claimAs(2);
+    } finally { injected.restore(); }
+
+    expect(injected.refused).toEqual(["CANONICAL_LIVE_RUNS_TAKEN_OVER"]);
+    f.expectUnchangedBut(before, refused);
+    expect(claimsOf(f)).toEqual(claimsBefore);
+    expect(claimsOf(f).every((row) => row["owner_binding_generation"] === 1)).toBe(true);
   });
 });
