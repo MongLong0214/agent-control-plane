@@ -3,6 +3,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, Role, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
+import { UNJUDGED_REVIEW_NEXT_STEPS, UNJUDGED_REVIEW_NOTICES } from "../../src/run/candidate-pipeline.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, commitAll, writeFiles } from "../helpers/fixtures.ts";
 import {
@@ -188,7 +189,12 @@ describe("#1189 §3: an unavailable review is not a code-fix verdict", () => {
     }
     expect([ReasonCode.REVIEW_REVISE, ReasonCode.REVIEW_BLOCK, ReasonCode.REVIEW_OMITTED_ITEMS_PRESENT]).not.toContain(outcome.value.reasonCode);
     expect(harness.cp.audit.forRun(runId).filter((row) => row.kind === "REVISION_RETURNED_TO_CTO")).toEqual([]);
-    expect(harness.cp.outbox.listByRun(runId).filter((message) => message.kind === MessageKind.REVISION_REQUEST)).toEqual([]);
+    // F1 — the owner gets exactly one fixed notice, no revision: the reason code, the notice and its recovery text only.
+    expect(harness.cp.outbox.listByRun(runId).filter((message) => message.kind === MessageKind.REVISION_REQUEST).map((message) => message.payload)).toEqual([{
+      runId, reasonCode: outcome.value.reasonCode, stage: "review-unavailable", candidateSnapshotDigest: outcome.value.snapshotDigest,
+      attemptId: harness.cp.db.get<{ attempt_id: string }>("SELECT attempt_id FROM candidate_pipeline_attempts WHERE run_id = ?", [runId])!.attempt_id,
+      notice: "REVIEW_UNAVAILABLE", unjudgedAttempts: 1, unjudgedAttemptLimit: 2, nextStep: "RESUBMIT",
+      recovery: `${UNJUDGED_REVIEW_NOTICES.REVIEW_UNAVAILABLE} ${UNJUDGED_REVIEW_NEXT_STEPS.RESUBMIT}` }]);
     expect(harness.cp.artifacts.list(runId, "BLIND_REVIEW")).toEqual([]);
     expectNotCeoReady(harness, runId, outcome.value.snapshotDigest, ceoSessionId);
   });
@@ -337,5 +343,74 @@ describe("#1189 §3: a new reviewer judges only the candidate", () => {
     }
     expect(prompts[1]!.externalSessionId).not.toBe(prompts[0]!.externalSessionId);
     expectNotCeoReady(harness, runId, second.value.snapshotDigest, ceoSessionId);
+  });
+});
+
+describe("#1271: a method finding judges the review method, never the candidate", () => {
+  const method = { category: "method", severity: "BLOCKER", repository: "github:acme/fixture", path: null,
+    summary: "The method names no rule for when a review round may stop", detail: "Nothing in the method ends a round." };
+  const answer = (value: "REVISE" | "BLOCK", covered: string[], findings: Array<Record<string, unknown>>): string =>
+    JSON.stringify({ verdict: value, coveredFiles: covered, omittedItems: [], findings });
+  const dogfoodRows = (harness: Harness) => harness.cp.audit.byKind("UPSTREAM_DOGFOOD_FINDING");
+
+  for (const value of ["BLOCK", "REVISE"] as const) {
+    it(`a ${value} backed only by method findings sends nothing into revision and is neither PASS nor confirmable`, async () => {
+      const harness = makeHarness();
+      const { runId, ceoSessionId, submit, covered } = await startRun(harness);
+      harness.scripted.script({ match: /Candidate review/, text: answer(value, covered, [method]) });
+      const outcome = await submit();
+      if (!outcome.allowed || outcome.value.stage !== "REVIEW_UNAVAILABLE") {
+        throw new Error(`unexpected outcome: ${JSON.stringify(outcome).slice(0, 400)}`);
+      }
+      expect(outcome.value.reasonCode).toBe(ReasonCode.REVIEW_REQUIRED);
+      expect(harness.cp.audit.forRun(runId).filter((row) => row.kind === "REVISION_RETURNED_TO_CTO")).toEqual([]);
+      // F1 — the owner gets exactly one fixed notice, no revision; the method findings ride only in that private delivery.
+      expect(harness.cp.outbox.listByRun(runId).filter((message) => message.kind === MessageKind.REVISION_REQUEST).map((message) => message.payload)).toEqual([{
+        runId, reasonCode: ReasonCode.REVIEW_REQUIRED, stage: "review-unavailable", candidateSnapshotDigest: outcome.value.snapshotDigest,
+        attemptId: harness.cp.db.get<{ attempt_id: string }>("SELECT attempt_id FROM candidate_pipeline_attempts WHERE run_id = ?", [runId])!.attempt_id,
+        notice: "METHOD_FINDINGS_ONLY", unjudgedAttempts: 1, unjudgedAttemptLimit: 2, nextStep: "RESUBMIT",
+        recovery: `${UNJUDGED_REVIEW_NOTICES.METHOD_FINDINGS_ONLY} ${UNJUDGED_REVIEW_NEXT_STEPS.RESUBMIT}`, methodFindings: [method] }]);
+      for (const reviewerText of [method.summary, method.detail]) {
+        expect(JSON.stringify(outcome)).not.toContain(reviewerText);
+        // The dogfood record of the method finding (#1271, below) is the only audit row that keeps its text.
+        expect(harness.cp.audit.forRun(runId).filter((row) => JSON.stringify(row).includes(reviewerText)).map((row) => row.kind))
+          .toEqual(["UPSTREAM_DOGFOOD_FINDING"]);
+      }
+      expect(harness.cp.review.latestPacket(runId, outcome.value.snapshotDigest)).toMatchObject({
+        verdict: value, findings: [], methodFindings: [{ category: "method" }],
+      });
+      expect(dogfoodRows(harness)).toHaveLength(1);
+      expectNotCeoReady(harness, runId, outcome.value.snapshotDigest, ceoSessionId);
+    });
+  }
+
+  it("a BLOCK with product and method findings returns to the CTO as today, and the method finding is recorded", async () => {
+    const harness = makeHarness();
+    const { runId, ceoSessionId, submit, covered } = await startRun(harness);
+    const product = { ...method, category: "correctness", path: "src/app.js", summary: "app() still returns 1", detail: "app() still returns 1." };
+    harness.scripted.script({ match: /Candidate review/, text: answer("BLOCK", covered, [product, method]) });
+    const outcome = await submit();
+    if (!outcome.allowed || outcome.value.stage !== "REVISION_REQUIRED") {
+      throw new Error(`unexpected outcome: ${JSON.stringify(outcome).slice(0, 400)}`);
+    }
+    expect(outcome.value.reasonCode).toBe(ReasonCode.REVIEW_BLOCK);
+    expect(outcome.value.review?.findings).toMatchObject([{ category: "correctness" }]);
+    expect(harness.cp.audit.forRun(runId).filter((row) => row.kind === "REVISION_RETURNED_TO_CTO")).toHaveLength(1);
+    expect(dogfoodRows(harness)).toHaveLength(1);
+    expectNotCeoReady(harness, runId, outcome.value.snapshotDigest, ceoSessionId);
+  });
+
+  it("a BLOCK with no findings at all returns to the CTO as today", async () => {
+    const harness = makeHarness();
+    const { runId, ceoSessionId, submit, covered } = await startRun(harness);
+    harness.scripted.script({ match: /Candidate review/, text: answer("BLOCK", covered, []) });
+    const outcome = await submit();
+    if (!outcome.allowed || outcome.value.stage !== "REVISION_REQUIRED") {
+      throw new Error(`unexpected outcome: ${JSON.stringify(outcome).slice(0, 400)}`);
+    }
+    expect(outcome.value.reasonCode).toBe(ReasonCode.REVIEW_BLOCK);
+    expect(harness.cp.audit.forRun(runId).filter((row) => row.kind === "REVISION_RETURNED_TO_CTO")).toHaveLength(1);
+    expect(dogfoodRows(harness)).toEqual([]);
+    expectNotCeoReady(harness, runId, outcome.value.snapshotDigest, ceoSessionId);
   });
 });

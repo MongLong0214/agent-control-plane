@@ -215,10 +215,12 @@ describe("#246 C4-R2 — a driven PRIMARY_CTO is recovered on its own session, a
       expect(cp.sessionRuntime.holds(binding.sessionId)).toBe(true);
       expect(countAudit(f, "PRIMARY_CTO_RECOVERY_REFUSED", binding.sessionId)).toBe(0);
 
-      // Nor anything that is not a driven PRIMARY_CTO: an interactive one, or a run's bootstrap CTO.
+      // Nor anything that is not a driven PRIMARY_CTO: an interactive one (a dispatch's; O4: cto_start
+      // spawns driven), or a run's bootstrap CTO.
       registerBareProjectFor(f, "interactive-other");
-      const interactive = await cp.cto.ensurePrimaryCto("interactive-other", "cto_start");
+      const interactive = await cp.cto.ensurePrimaryCto("interactive-other", "run-dispatch");
       if (!interactive.allowed) throw new Error(interactive.message);
+      expect(cp.outbox.drivenModeOf(interactive.value.sessionId)).toBe("NONE");
       const interactiveEpoch = cp.sessions.require(interactive.value.sessionId).credentialEpoch;
       expect(await cp.cto.recoverDrivenPrimaryCto(interactive.value.roleKey, { capacity: cp.capacity, runtime: cp.sessionRuntime }))
         .toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });

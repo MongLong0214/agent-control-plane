@@ -1,5 +1,7 @@
-import { frontierReviewPolicy } from "./frontier-simplify-policy.ts";
+import { FRONTIER_SIMPLIFY_SOURCE, frontierReviewPolicy, type FrontierSimplifySource } from "./frontier-simplify-policy.ts";
+import { DogfoodFindingStore } from "../quality/upstream-dogfood.ts";
 import { frozenBootstrapReviewEvidence, originalReviewRecords, type FrozenReviewEvidence, type ReviewEvidenceFile } from "../bootstrap/bootstrap-review-evidence.ts";
+import { frozenStandardReviewEvidence, standardReviewEvidenceDigests, standardReviewEvidenceSection, type FrozenStandardReviewEvidence } from "./standard-review-evidence.ts";
 import type { ReviewRecordVerification } from "../bootstrap/bootstrap-review-evidence-github.ts";
 import { bootstrapServingRuntime, bootstrapCodeGuarantees, type BootstrapRuntimeObservation } from "../bootstrap/bootstrap-runtime-observation.ts";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -23,7 +25,7 @@ import {
 import type { DispatchCapacityTarget } from "../capacity/capacity-monitor.ts";
 import type { ProjectManifest } from "../contracts/manifest.ts";
 import type { Clock } from "../core/clock.ts";
-import { digestOf, sha256 } from "../core/digest.ts";
+import { digestOf, isDigest, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { credentialBearingField, type AuditLog } from "../db/audit.ts";
@@ -33,6 +35,7 @@ import {
   reviewPolicyText,
   type ArtifactStore,
   type EvidenceWriter,
+  type ReviewPacketDigests,
 } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import {
@@ -44,7 +47,7 @@ import {
   SessionLifecycle,
   roleKeyFor,
 } from "../domain/types.ts";
-import { diffPatch, git } from "../git/git.ts";
+import { PATCH_WITHOUT_PROGRAMS, diffPatch, git, readBlob } from "../git/git.ts";
 import { canonical } from "../guard/workspace-probe.ts";
 import {
   type AnyContractChangeBinding,
@@ -71,14 +74,16 @@ import {
   type ProviderRegistry,
   type ReviewerEgressRecord,
 } from "../runtime/provider.ts";
-import { REVIEWER_TRANSPORT_SEPARATOR } from "../runtime/cli-adapters.ts";
+import { CODEX_REVIEWER_INPUT_MAX_BYTES, REVIEWER_TRANSPORT_SEPARATOR } from "../runtime/cli-adapters.ts";
 import type { PacketReviewerScope } from "../runtime/reviewer-codex-home.ts";
+import { ReviewerEgressError } from "../runtime/reviewer-egress.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 import {
   type CandidateSnapshot,
   type SnapshotImport,
   type SnapshotRefusedImport,
+  type SnapshotReviewEvidence,
   candidateSnapshotDigest,
   snapshotCoverageTargets,
 } from "../snapshot/candidate-snapshot.ts";
@@ -88,7 +93,9 @@ import type { VerificationReport } from "../verify/verification-engine.ts";
 import { currentVerdictPasses, currentVerificationResults } from "../verify/verification-history.ts";
 import type { TaskContract } from "../run/run-engine.ts";
 import { bootstrapPlanTaskRecorded } from "../run/task-graph.ts";
-import { candidateEvidenceSection, readExecutionEvidence, readTrackedTree, type TrackedTreeEvidence } from "./candidate-review-evidence.ts";
+import {
+  candidateEvidenceSection, readExecutionEvidence, readTrackedTree, type ReceiptEvidence, type TrackedTreeEvidence,
+} from "./candidate-review-evidence.ts";
 import { redactCredentialValues } from "../core/credential-shapes.ts";
 import { contractChangeReadbackFor, type ContractChangeReadback } from "./contract-change-review-context.ts";
 
@@ -229,6 +236,16 @@ export interface ReviewPacket {
      * `stdin` for Codex's joined string, `argv --append-system-prompt + stdin` for Claude.
      */
     reviewerInputRepresentations: string[];
+    /**
+     * #1270 — the review method every input above carried whole: the vendored frontier-simplify file's
+     * upstream repository, revision, path and digest. The candidate's REVIEW.md is never this.
+     */
+    methodology: FrontierSimplifySource;
+    /**
+     * Present only when a STANDARD_WORK candidate was frozen with CEO-attached private review evidence:
+     * the exact bundle every reviewer input carried, by digest (review/standard-review-evidence.ts).
+     */
+    reviewEvidence?: { digest: string; bundleSha256: string; attachmentDigest: string };
   };
   coveredRepositories: string[];
   coveredFiles: string[];
@@ -239,7 +256,14 @@ export interface ReviewPacket {
   extraClaims?: string[];
   omittedItems: string[];
   verdict: ReviewVerdict;
+  /** The candidate's findings. A `method` finding is never one of them (`methodFindings`). */
   findings: ReviewFinding[];
+  /**
+   * #1271 — present only when the reviewer returned `method` findings: gaps in the frontier-simplify
+   * method, not in the candidate. Kept apart so they never weigh on the candidate; they are recorded
+   * as frontier-simplify dogfood findings bound to this review, and nothing else reads them.
+   */
+  methodFindings?: ReviewFinding[];
   chunked: boolean;
   /**
    * Issue #246 PR-C slice C2 — present only on a BOOTSTRAP_PLAN review: the PLAN, manifest and
@@ -292,6 +316,23 @@ export interface ReviewerPreference {
   effort: string | null;
 }
 
+/** A real step of a review, on which the submission that asked for it renews its attempt lease. */
+export type ReviewProgressStep = "REVIEW_CHUNK_COMPLETED" | "FINAL_REVIEW_STARTED" | "FINAL_REVIEW_ENDED";
+
+/**
+ * Renews the submission's attempt lease on a real step, and answers whether the attempt still holds
+ * the run. False once it does not (released, expired or at its cap): the review stops there, and a
+ * verdict reached after it is not stored.
+ */
+export type ReviewProgress = (step: ReviewProgressStep) => boolean;
+
+/** The refusal of a review whose submission's attempt no longer holds the run. */
+const attemptLeaseLost = <T>(runId: string, attemptId: string | undefined): Decision<T> =>
+  deny<T>(ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE, "the submission's attempt no longer holds the run, so its review stopped", {
+    runId,
+    attemptId: attemptId ?? null,
+  });
+
 export interface BlindReviewRequest {
   /** A candidate review: the frozen repositories' diffs and their verification. The default. */
   kind?: "CANDIDATE";
@@ -304,6 +345,10 @@ export interface BlindReviewRequest {
   verification: VerificationReport;
   /** The submission this review belongs to, named in a refused review's record (`storeReview`). */
   attemptId?: string;
+  /** The submission's lease, renewed on each real step of this review. */
+  progress?: ReviewProgress;
+  /** Aborted when the submission no longer holds the run: every reviewer invocation it starts is stopped. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -324,6 +369,8 @@ export interface BootstrapPlanReviewRequest {
   plannedOutputs?: unknown;
   manifest?: unknown;
   attemptId?: string;
+  progress?: ReviewProgress;
+  signal?: AbortSignal;
 }
 
 /**
@@ -342,6 +389,8 @@ export interface ContractChangeReviewRequest {
   manifest?: unknown;
   baseManifest?: unknown;
   attemptId?: string;
+  progress?: ReviewProgress;
+  signal?: AbortSignal;
 }
 
 /** The composition root supplies the capacity admission that reviewer allocation needs. */
@@ -355,7 +404,7 @@ export type BlindReviewInvoker = (
 ) => Promise<Decision<ReviewPacket>>;
 
 /** What every reviewer constituted for a run needs to know about the request. */
-type ReviewSubject = Pick<BlindReviewRequest, "runId" | "snapshot">;
+type ReviewSubject = Pick<BlindReviewRequest, "runId" | "snapshot" | "signal">;
 
 /** A BOOTSTRAP_PLAN request once its trusted inputs have been reloaded. */
 interface TrustedBootstrapPlanReview {
@@ -432,9 +481,10 @@ const VERDICT_SCHEMA = {
         properties: {
           category: {
             type: "string",
+            description: "method: a defect or gap in the frontier-simplify review method itself, not in the candidate. It is recorded for frontier-simplify and is never a reason for the verdict.",
             enum: [
               "correctness", "regression", "security", "scope", "performance",
-              "maintainability", "evidence", "freshness", "source",
+              "maintainability", "evidence", "freshness", "source", "method",
             ],
           },
           severity: { type: "string", enum: ["INFO", "MINOR", "MAJOR", "BLOCKER"] },
@@ -479,11 +529,18 @@ const REVIEWER_TRANSPORT_OVERHEAD_CHARS = REVIEWER_TRANSPORT_INSTRUCTIONS.length
 
 /** Packet capabilities and the existing wire envelope, not review methodology. */
 const REVIEW_INPUT_STATEMENT =
+  "ACP's own reviewer contract, not part of frontier-simplify: " +
   "Return the existing ACP JSON envelope; findings.detail carries the finding text and omittedItems lists coverage limitations. " +
   "This is a packet-only invocation with no tools or disposable candidate checkout. The Actual diff and Files sections " +
   "are inline inputs. Unavailable evidence remains unavailable; " +
   "this restriction does not establish that the packet is sufficient. " +
   "Worker/CTO reasoning, chat history and producer self-assessment remain withheld.";
+
+/** Told to a chunk reviewer whose chunk holds a range of an oversized file (`splitOversizedSection`). */
+const RANGE_PART_STATEMENT =
+  "A part labelled `Part k of n` is one range of its file's patch, and the file's other ranges are reviewed by other chunk reviewers: " +
+  "judge the range shown, do not report the absence of the other ranges as an omission, and still list in `omittedItems` " +
+  "any of this range's characters that are not shown or that you could not read.";
 
 /**
  * Free-form provider text (an answer, stderr, an adapter error) as review evidence: its digest and
@@ -504,9 +561,57 @@ const unparsableAnswerEvidence = (text: string): Record<string, string | number 
 
 /** A refused field's name as the artifact store reports it: a key of the packet, or its `<value>` marker. */
 const REFUSED_FIELD_NAME = /^[A-Za-z0-9_<>.-]{1,64}$/;
+/** A refusal's rule id or form class as the artifact store reports it (core/credential-shapes.ts). */
+const REFUSAL_CLASS = /^[a-z0-9_-]{1,32}$/;
+
+/**
+ * #1307 — the digests ACP computed for this candidate review's packet, read from its own typed fields
+ * for this run and candidate, never from the prompt's text: the packet digest, the frozen snapshot's
+ * diffDigests, the verification results' outputDigests, and the diffDigest and resultDigest of each
+ * receipt linked to this candidate. A reviewer that quotes one is not quoting a credential
+ * (`WriteSite.packetDigests`). The workflow digests a manifest approves are not among them: those are
+ * bound only once ACP has read the workflow's bytes (db/registry-view.ts).
+ */
+const reviewPacketDigests = (
+  db: Db,
+  request: BlindReviewRequest,
+  snapshotDigest: string,
+  packetDigest: string,
+  receipts: readonly ReceiptEvidence[],
+  reviewEvidenceDigests: readonly string[] = [],
+): ReviewPacketDigests => {
+  const linked = receipts.filter((receipt) => receipt.linked);
+  const resultDigests = linked.length === 0 ? [] : db.all<{ result_digest: string | null }>(
+    `SELECT result_digest FROM task_executions WHERE run_id = ? AND execution_id IN (${linked.map(() => "?").join(", ")})`,
+    [request.runId, ...linked.map((receipt) => receipt.executionId)],
+  ).map((row) => row.result_digest);
+  const digests = [
+    packetDigest,
+    ...request.snapshot.repositories.map((repo) => repo.diffDigest),
+    ...request.verification.results.map((result) => result.outputDigest),
+    ...linked.map((receipt) => receipt.diffDigest),
+    ...resultDigests,
+    ...reviewEvidenceDigests,
+  ].filter(isDigest);
+  return { runId: request.runId, candidateSnapshotDigest: snapshotDigest, digests: new Set(digests) };
+};
 
 /** Diff size above which a single reviewer context is not trusted to hold everything. */
 const CHUNK_THRESHOLD_CHARS = 120_000;
+/**
+ * The cap on the complete reviewer input (instructions, packet metadata, chunk envelope and the
+ * lockfile) of a chunk that holds one lockfile whole: the primary reviewer path's input bound,
+ * `CODEX_REVIEWER_INPUT_MAX_BYTES` (where it is derived). A lockfile cut into byte ranges gives every
+ * reviewer an incomplete file; a lockfile that does not fit whole under this cap is an omitted item,
+ * never cut. Chunks are planned in characters; the chunk is sent only when its exact UTF-8 bytes are
+ * within the bound the selected reviewer's adapter declares for its model (`reviewerInputMaxBytes`).
+ */
+const LOCKFILE_CHUNK_THRESHOLD_CHARS = CODEX_REVIEWER_INPUT_MAX_BYTES;
+/** Lockfile base names. `bun.lockb` is binary and is not among them. */
+const LOCKFILE_NAMES: ReadonlySet<string> = new Set([
+  "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "Cargo.lock",
+  "poetry.lock", "uv.lock", "Gemfile.lock", "go.sum",
+]);
 /** Room kept for the change itself before the packet's tree and task listings take any. */
 const EVIDENCE_DIFF_RESERVE_CHARS = 32_000;
 const REVIEW_TIMEOUT_MS = 20 * 60 * 1000;
@@ -529,6 +634,7 @@ const reviewPacketDigest = (
     verificationDigest: digestOf(request.verification),
     coverageTargets: candidateCoverageTargets(request.snapshot, change).map(({ identity, path }) => `${identity}:${path}`),
     reviewPolicies,
+    ...(request.snapshot.reviewEvidence === undefined ? {} : { reviewEvidence: request.snapshot.reviewEvidence.digest }),
   });
 
 /**
@@ -564,8 +670,15 @@ export const REVIEWER_FALLBACK_SCOPE_UNCONFIGURED = "REVIEWER_FALLBACK_SCOPE_UNC
 /**
  * A provider's packet-reviewer scope by the shared predicate (`packetReviewerScope`), or null for a
  * provider that has none. Read from the raw adapter, which the registry hands out only wrapped.
+ *
+ * `verifyReviewerEgress`, when the adapter supplies it, checks the egress boundary that reviewer runs
+ * behind without starting the provider CLI. A scope that is not UNCONFIGURED names a shared or
+ * authenticated home, so the gate awaits it before that provider's version probe, capacity probe or
+ * reviewer spawn; a rejection refuses the review with no provider process started.
  */
-export type PacketReviewerScopePort = (provider: string) => PacketReviewerScope | null;
+export type PacketReviewerScopePort = (provider: string) => (PacketReviewerScope & {
+  readonly verifyReviewerEgress?: () => Promise<void>;
+}) | null;
 
 export class BlindReviewGate {
   readonly #pipelineCapability = Symbol("blind-review-control-plane");
@@ -653,6 +766,11 @@ export class BlindReviewGate {
     const changed = this.contractChangeForCandidate(request.runId, request.snapshot);
     if (!changed.allowed) return changed as Decision<ReviewPacket>;
     const change = changed.value;
+    // The private review evidence this candidate was frozen with, read back from the run's private artifacts.
+    let reviewEvidence: FrozenStandardReviewEvidence | null;
+    try { reviewEvidence = frozenStandardReviewEvidence({ artifacts: this.artifacts, audit: this.audit }, request.snapshot); }
+    catch { return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "frozen review evidence failed validation", { runId: request.runId }); }
+    const privateEvidence = reviewEvidence === null ? [] : standardReviewEvidenceSection(reviewEvidence);
 
     const expected = candidateCoverageTargets(request.snapshot, change);
     const reviewers: ReviewerBinding[] = [];
@@ -676,22 +794,24 @@ export class BlindReviewGate {
       // #1166 r3 — the listings get only the room left under the reviewer budget after the other
       // metadata, the chunk envelope and a share for the change itself, so they never crowd out
       // the diff or push the metadata past the budget. A cut is marked in the packet.
-      const bareEvidence = candidateEvidenceSection(this.db, request.runId, trees, execution, 0);
+      const bareEvidence = [...privateEvidence, ...candidateEvidenceSection(this.db, request.runId, trees, execution, 0)];
       const bareOverhead = this.promptOverhead(request, change, bareEvidence, reviewPolicies);
       // The change's real share of a prompt, repository and file fences included.
       const diffShare = this.buildPrompt(request, diffs, undefined, change, bareEvidence, reviewPolicies).length + REVIEWER_TRANSPORT_OVERHEAD_CHARS - bareOverhead;
       const evidenceRoom = CHUNK_THRESHOLD_CHARS - 4_096 - Math.min(diffShare, EVIDENCE_DIFF_RESERVE_CHARS) - bareOverhead;
-      const evidenceSection = candidateEvidenceSection(this.db, request.runId, trees, execution, evidenceRoom);
+      const evidenceSection = [...privateEvidence, ...candidateEvidenceSection(this.db, request.runId, trees, execution, evidenceRoom)];
 
       // Measure the complete input, including diff framing and system instructions, and send
-      // this same rendered prompt if it fits.
+      // this same rendered prompt if it fits. A lockfile is only ever reviewed in a chunk of its own.
       const prompt = this.buildPrompt(request, diffs, undefined, change, evidenceSection, reviewPolicies);
-      const chunked = prompt.length + REVIEWER_TRANSPORT_OVERHEAD_CHARS > CHUNK_THRESHOLD_CHARS;
+      const chunked = prompt.length + REVIEWER_TRANSPORT_OVERHEAD_CHARS > CHUNK_THRESHOLD_CHARS ||
+        diffs.some((repo) => (repo.lockfiles?.length ?? 0) > 0);
 
       let outcome: Decision<ReviewOutcome>;
       if (chunked) {
         outcome = await this.chunkedReview(request, diffs, rememberReviewer, change, evidenceSection, reviewPolicies);
       } else {
+        if (request.progress?.("FINAL_REVIEW_STARTED") === false) return attemptLeaseLost(request.runId, request.attemptId);
         const reviewer = await this.constituteReviewer(request);
         if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
         rememberReviewer(reviewer.value);
@@ -703,7 +823,9 @@ export class BlindReviewGate {
       // a verdict on a PLAN the run no longer has is stale and is not stored. `settle` does not await.
       if (change !== null) {
         const stillCurrent = this.contractChangeForCandidate(request.runId, request.snapshot);
-        if (!stillCurrent.allowed) return stillCurrent as Decision<ReviewPacket>;
+        if (!stillCurrent.allowed) {
+          return this.verdictNotKept("REVIEW_INPUTS", outcome.value.reviewer, request.runId, snapshotDigest, request.attemptId, stillCurrent);
+        }
       }
       return this.settle({
         runId: request.runId,
@@ -718,6 +840,11 @@ export class BlindReviewGate {
         contractChange: change === null ? null : reviewBindingOf(change),
         planReview: false,
         attemptId: request.attemptId,
+        progress: request.progress,
+        packetDigests: reviewPacketDigests(this.db, request, snapshotDigest,
+          reviewPacketDigest(request, change, reviewPolicies), execution.receipts,
+          reviewEvidence === null ? [] : standardReviewEvidenceDigests(reviewEvidence)),
+        ...(request.snapshot.reviewEvidence === undefined ? {} : { reviewEvidence: request.snapshot.reviewEvidence }),
       });
     } finally {
       this.release(reviewers);
@@ -740,6 +867,9 @@ export class BlindReviewGate {
       lifecycle: bootstrapCodeGuarantees(),
       originalRecords: await originalReviewRecords(inputs.reviewEvidence, this.#verifyOriginalRecord),
     };
+    // The review starting is real progress, after its preparation: an attempt that no longer holds the
+    // run starts no reviewer and records no review context.
+    if (request.progress?.("FINAL_REVIEW_STARTED") === false) return attemptLeaseLost(request.runId, request.attemptId);
     // The existing BLIND_REVIEW envelope is closed. Persist its private inputs in the same
     // typed HANDOFF artifact path as stage/attach, bound to this candidate and an ACP audit.
     const privateInputs = this.artifacts.put(inputs.runId, ArtifactKind.HANDOFF,
@@ -749,14 +879,16 @@ export class BlindReviewGate {
         runtimeEventId: context.deployment?.eventId ?? null, payloadDigest: digestOf(context) } });
     if (!inputRecord.allowed) return inputRecord as Decision<ReviewPacket>;
     const expected = bootstrapPlanCoverageTargets(inputs.outputs);
+    // The reviewer's session and invocation stop when the submission no longer holds the run.
+    const subject = { ...inputs, ...(request.signal === undefined ? {} : { signal: request.signal }) };
 
     const reviewers: ReviewerBinding[] = [];
     try {
-      const reviewer = await this.constituteReviewer(inputs);
+      const reviewer = await this.constituteReviewer(subject);
       if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
       reviewers.push(reviewer.value);
       const outcome = await this.singleReview(
-        inputs,
+        subject,
         this.buildBootstrapPlanPrompt(inputs, expected, context),
         reviewer.value,
         expected,
@@ -768,7 +900,9 @@ export class BlindReviewGate {
       // only a review of the current PLAN can make its candidate ready. `settle` does not await, so
       // nothing can replace the PLAN between this reload and the packet it stores.
       const stillCurrent = this.trustedBootstrapPlanInputs(request, snapshotDigest);
-      if (!stillCurrent.allowed) return stillCurrent as Decision<ReviewPacket>;
+      if (!stillCurrent.allowed) {
+        return this.verdictNotKept("REVIEW_INPUTS", outcome.value.reviewer, inputs.runId, snapshotDigest, request.attemptId, stillCurrent);
+      }
       // The same PLAN can be submitted again with another task, which no binding digest covers: a
       // verdict on an intent the run no longer has is stale too.
       const intentCurrent = bootstrapReviewIntentCurrent({
@@ -777,7 +911,9 @@ export class BlindReviewGate {
         planArtifact: this.artifacts.latest<unknown>(inputs.runId, ArtifactKind.PLAN),
         tasks: bootstrapPlanIntentTasks(this.db, inputs.runId),
       });
-      if (!intentCurrent.allowed) return intentCurrent as Decision<ReviewPacket>;
+      if (!intentCurrent.allowed) {
+        return this.verdictNotKept("REVIEW_INTENT", outcome.value.reviewer, inputs.runId, snapshotDigest, request.attemptId, intentCurrent);
+      }
       return this.settle({
         runId: inputs.runId,
         contractDigest: inputs.contractDigest,
@@ -792,6 +928,7 @@ export class BlindReviewGate {
         contractChange: null,
         planReview: true,
         attemptId: request.attemptId,
+        progress: request.progress,
       });
     } finally {
       this.release(reviewers);
@@ -810,14 +947,16 @@ export class BlindReviewGate {
     if (!trusted.allowed) return trusted as Decision<ReviewPacket>;
     const inputs = trusted.value;
     const expected = [inputs.change.target];
+    if (request.progress?.("FINAL_REVIEW_STARTED") === false) return attemptLeaseLost(request.runId, request.attemptId);
+    const subject = { ...inputs, ...(request.signal === undefined ? {} : { signal: request.signal }) };
 
     const reviewers: ReviewerBinding[] = [];
     try {
-      const reviewer = await this.constituteReviewer(inputs);
+      const reviewer = await this.constituteReviewer(subject);
       if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
       reviewers.push(reviewer.value);
       const outcome = await this.singleReview(
-        inputs,
+        subject,
         this.buildContractChangePrompt(inputs, expected),
         reviewer.value,
         expected,
@@ -825,7 +964,9 @@ export class BlindReviewGate {
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
       // As for a bootstrap PLAN: reloaded after the reviewer answered, before the verdict is kept.
       const stillCurrent = this.trustedContractChangeInputs(request, snapshotDigest);
-      if (!stillCurrent.allowed) return stillCurrent as Decision<ReviewPacket>;
+      if (!stillCurrent.allowed) {
+        return this.verdictNotKept("REVIEW_INPUTS", outcome.value.reviewer, inputs.runId, snapshotDigest, request.attemptId, stillCurrent);
+      }
       return this.settle({
         runId: inputs.runId,
         contractDigest: inputs.contractDigest,
@@ -839,6 +980,7 @@ export class BlindReviewGate {
         contractChange: reviewBindingOf(inputs.change),
         planReview: true,
         attemptId: request.attemptId,
+        progress: request.progress,
       });
     } finally {
       this.release(reviewers);
@@ -867,6 +1009,12 @@ export class BlindReviewGate {
     /** The reviewer read a PLAN's outputs or manifest, not a diff and its verification. */
     planReview: boolean;
     attemptId: string | undefined;
+    /** The submission's lease: the final review ending renews it as the packet is stored. */
+    progress?: ReviewProgress | undefined;
+    /** #1307 — a candidate review's packet digests (`reviewPacketDigests`); absent for a PLAN review. */
+    packetDigests?: ReviewPacketDigests;
+    /** The private review evidence a STANDARD_WORK candidate was frozen with; absent for any other review. */
+    reviewEvidence?: SnapshotReviewEvidence;
   }): Decision<ReviewPacket> {
     const { runId, snapshotDigest, outcome, chunked, expected } = input;
     const authoritativeReviewer = outcome.reviewer;
@@ -874,11 +1022,12 @@ export class BlindReviewGate {
     // A reviewer binding is a fencing token. If something replaced it while the
     // provider was working, its verdict is no longer attributable to the active role.
     if (!this.bindings.isCurrent(authoritativeReviewer.roleKey, authoritativeReviewer.generation)) {
-      return deny(ReasonCode.BINDING_GENERATION_STALE, "reviewer binding changed during review", {
-        runId,
-        roleKey: authoritativeReviewer.roleKey,
-        generation: authoritativeReviewer.generation,
-      });
+      return this.verdictNotKept("REVIEWER_BINDING", authoritativeReviewer, runId, snapshotDigest, input.attemptId,
+        deny(ReasonCode.BINDING_GENERATION_STALE, "reviewer binding changed during review", {
+          runId,
+          roleKey: authoritativeReviewer.roleKey,
+          generation: authoritativeReviewer.generation,
+        }));
     }
 
     const packet = this.assemble({
@@ -898,6 +1047,7 @@ export class BlindReviewGate {
       ...(input.bootstrapPlanIntentDigest === undefined ? {} : { bootstrapPlanIntentDigest: input.bootstrapPlanIntentDigest }),
       contractChange: input.contractChange,
       planReview: input.planReview,
+      ...(input.reviewEvidence === undefined ? {} : { reviewEvidence: input.reviewEvidence }),
     });
 
     // §18.4 / CP-HI-04 — re-check independence at packet time: a session can join the
@@ -918,7 +1068,7 @@ export class BlindReviewGate {
     }
 
     const validated = this.validateCoverage(packet, expected);
-    const stored = this.storeReview(validated, authoritativeReviewer, input.attemptId);
+    const stored = this.storeReview(validated, authoritativeReviewer, input.attemptId, input.packetDigests, input.progress);
     if (!stored.allowed) return stored as Decision<ReviewPacket>;
 
     this.audit.record({
@@ -939,7 +1089,11 @@ export class BlindReviewGate {
         model: authoritativeReviewer.preference.model,
         effort: authoritativeReviewer.preference.effort,
         coveredFiles: validated.coveredFiles.length,
-        omittedItems: validated.omittedItems,
+        // A reviewer that read private evidence can echo it in any text it returns: its omissions are a count
+        // here, never its words nor a digest a short text could be guessed from (the findings are already a count).
+        ...(validated.inputManifest.reviewEvidence === undefined
+          ? { omittedItems: validated.omittedItems }
+          : { omittedItems: validated.omittedItems.length }),
         chunked,
         findings: validated.findings.length,
         egressRecords: validated.egressEvidence.length,
@@ -971,6 +1125,23 @@ export class BlindReviewGate {
       },
     });
 
+    // #1271 — a REVISE or BLOCK whose only grounds are method findings judges the review method, not the
+    // candidate: it is no revision request and no PASS. The candidate waits for a fresh review, as after an
+    // unavailable one; the method findings are recorded with the review. A verdict with no findings at
+    // all, or with any finding about the candidate, is unchanged.
+    if (
+      validated.verdict !== "PASS" &&
+      validated.findings.length === 0 &&
+      validated.omittedItems.length === 0 &&
+      validated.methodFindings !== undefined
+    ) {
+      return deny(ReasonCode.REVIEW_REQUIRED, `blind review returned ${validated.verdict} on method findings alone; the candidate needs a fresh review`, {
+        runId,
+        problem: "METHOD_FINDINGS_ONLY",
+        verdict: validated.verdict,
+        methodFindings: validated.methodFindings.length,
+      });
+    }
     if (validated.verdict !== "PASS") {
       return deny(
         validated.verdict === "REVISE" ? ReasonCode.REVIEW_REVISE : ReasonCode.REVIEW_BLOCK,
@@ -988,20 +1159,77 @@ export class BlindReviewGate {
   }
 
   /**
+   * A reviewer answered and its verdict is not kept, because its binding was replaced while it worked,
+   * what it judged is no longer the run's, or the submission that asked for it no longer holds the run
+   * (`ATTEMPT_LEASE`). The refusal returned is unchanged; this row is why no
+   * BLIND_REVIEW exists for that answer: which check refused it (`stale`), the candidate, the submission
+   * attempt and the reviewer's binding generation, never the answer itself.
+   */
+  private verdictNotKept(
+    stale: "REVIEWER_BINDING" | "REVIEW_INPUTS" | "REVIEW_INTENT" | "ATTEMPT_LEASE",
+    reviewer: ReviewerBinding,
+    runId: string,
+    snapshotDigest: string,
+    attemptId: string | undefined,
+    refusal: Decision<unknown>,
+  ): Decision<ReviewPacket> {
+    this.audit.record({
+      kind: "BLIND_REVIEW_REJECTED",
+      runId,
+      sessionId: reviewer.sessionId,
+      roleKey: reviewer.roleKey,
+      reasonCode: refusal.reasonCode,
+      evidence: {
+        candidateSnapshotDigest: snapshotDigest,
+        attemptId: attemptId ?? null,
+        stale,
+        reviewerRoleBindingGeneration: reviewer.generation,
+      },
+    });
+    return refusal as Decision<ReviewPacket>;
+  }
+
+  /**
    * #1254 — the packet stored as BLIND_REVIEW evidence. Content the store refuses to keep (a credential
    * in a reviewer's text) is not stored, rewritten or kept raw; the refusal is recorded with what
    * identifies the review and never with its text: the candidate, the refused kind and field, the
    * verdict, and the reviewer and submission it came from. The review then ends without a verdict, as
    * an unavailable one does, so the run stays where it was and a later submission reviews it again.
    */
-  private storeReview(packet: ReviewPacket, reviewer: ReviewerBinding, attemptId: string | undefined): Decision<void> {
+  private storeReview(
+    packet: ReviewPacket, reviewer: ReviewerBinding, attemptId: string | undefined, packetDigests?: ReviewPacketDigests,
+    progress?: ReviewProgress,
+  ): Decision<void> {
     try {
-      this.artifacts.putEvidence(this.evidenceWriter, packet.runId, ArtifactKind.BLIND_REVIEW, packet, packet.candidateSnapshotDigest);
+      // #1271 — the review and the frontier-simplify findings its reviewer returned are kept in one
+      // transaction, bound to this review: a method finding exists exactly when the review carrying it does.
+      // Recording one never fails the review; a finding the store refuses is left out.
+      const kept = this.db.tx(() => {
+        // The final review ending renews the submission's lease in this same transaction, a compare-and-set
+        // on its attempt and deadline: an attempt released or capped while the reviewer worked stores nothing.
+        if (progress !== undefined && !progress("FINAL_REVIEW_ENDED")) return false;
+        const stored = this.artifacts.putEvidence(this.evidenceWriter, packet.runId, ArtifactKind.BLIND_REVIEW, packet, packet.candidateSnapshotDigest,
+          packetDigests);
+        if (packet.methodFindings !== undefined) {
+          new DogfoodFindingStore({ db: this.db, audit: this.audit, artifacts: this.artifacts, clock: this.clock })
+            .recordReviewMethodFindings(packet.runId, stored.artifactId);
+        }
+        return true;
+      });
+      if (!kept) {
+        return this.verdictNotKept("ATTEMPT_LEASE", reviewer, packet.runId, packet.candidateSnapshotDigest, attemptId,
+          attemptLeaseLost(packet.runId, attemptId)) as Decision<void>;
+      }
       return allow(ReasonCode.OK, undefined);
     } catch (error) {
       if (!isAcpError(error) || error.reasonCode !== ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED) throw error;
       const named = error.evidence["field"];
       const field = typeof named === "string" && REFUSED_FIELD_NAME.test(named) ? named : null;
+      // #1307 — which rule matched and the class of what it matched, never the text.
+      const classOf = (value: unknown): string | null => (typeof value === "string" && REFUSAL_CLASS.test(value) ? value : null);
+      const rule = classOf(error.evidence["rule"]);
+      const form = classOf(error.evidence["form"]);
+      const inPacket = typeof error.evidence["inPacket"] === "boolean" ? error.evidence["inPacket"] : null;
       const recorded = this.audit.record({
         kind: "BLIND_REVIEW_STORAGE_REFUSED",
         runId: packet.runId,
@@ -1012,6 +1240,9 @@ export class BlindReviewGate {
           candidateSnapshotDigest: packet.candidateSnapshotDigest,
           kind: ArtifactKind.BLIND_REVIEW,
           field,
+          rule,
+          form,
+          inPacket,
           verdict: packet.verdict,
           findings: packet.findings.length,
           generation: reviewer.generation,
@@ -1023,6 +1254,9 @@ export class BlindReviewGate {
         runId: packet.runId,
         kind: ArtifactKind.BLIND_REVIEW,
         field,
+        rule,
+        form,
+        inPacket,
         candidateSnapshotDigest: packet.candidateSnapshotDigest,
         verdict: packet.verdict,
         refusalEventId: recorded.allowed ? recorded.value : null,
@@ -1083,7 +1317,8 @@ export class BlindReviewGate {
       // Unknown registry scope is not an availability proof authorizing fallback.
       const scope = this.reviewerScope(preference.provider);
       if (!scope.allowed) return scope;
-      if (isPreferred && this.#packetScope?.(preference.provider)?.state === "UNCONFIGURED") {
+      const packetScope = this.#packetScope?.(preference.provider) ?? null;
+      if (isPreferred && packetScope?.state === "UNCONFIGURED") {
         attempts.push({ preference, reason: REVIEWER_FALLBACK_SCOPE_UNCONFIGURED });
         continue;
       }
@@ -1114,6 +1349,24 @@ export class BlindReviewGate {
           });
         }
         continue;
+      }
+      // Before the version probe, the capacity probe and the reviewer spawn: a reviewer whose home is
+      // shared or authenticated must not have its CLI started at all when its egress boundary fails.
+      if (packetScope?.verifyReviewerEgress && packetScope.state !== "UNCONFIGURED") {
+        try {
+          await packetScope.verifyReviewerEgress();
+        } catch (error) {
+          const failureCode = error instanceof ReviewerEgressError ? error.failureCode : "REVIEWER_EGRESS_UNVERIFIED";
+          attempts.push({ preference, reason: failureCode });
+          return deny(ReasonCode.ISOLATION_LOST, "reviewer egress could not be verified; no provider process was started", {
+            runId,
+            provider: preference.provider,
+            model: preference.model,
+            effort: preference.effort,
+            reason: error instanceof Error ? error.message : String(error),
+            attempts,
+          });
+        }
       }
       const health = await adapter.probeRuntime();
       // The awaited probe may invalidate scope. Stop before treating any subsequent
@@ -1150,6 +1403,7 @@ export class BlindReviewGate {
           workdir,
           purpose,
           isolation: this.reviewerIsolation(request, workdir),
+          ...(request.signal === undefined ? {} : { signal: request.signal }),
         });
       } catch (error) {
         rmSync(workdir, { recursive: true, force: true });
@@ -1437,7 +1691,13 @@ export class BlindReviewGate {
         });
       }
       trees.push(await readTrackedTree(record.checkoutPath, repo.identity, repo.candidateHead));
-      diffs.push({ identity: repo.identity, diff: diff + (repo.imports ?? []).map(importManifestSection).join(""), files: repo.touchedPaths });
+      const lockfiles = await lockfileChanges(record.checkoutPath, repo, withheld);
+      diffs.push({
+        identity: repo.identity,
+        diff: diff + (repo.imports ?? []).map(importManifestSection).join(""),
+        files: repo.touchedPaths,
+        ...(lockfiles.length === 0 ? {} : { lockfiles }),
+      });
     }
 
     return allow(ReasonCode.OK, { diffs, binaryArtifacts, trees });
@@ -1461,6 +1721,7 @@ export class BlindReviewGate {
       correlationId,
       externalSessionId: reviewer.externalSessionId,
       isolation: this.reviewerIsolation(request, reviewer.workdir),
+      ...(request.signal === undefined ? {} : { signal: request.signal }),
     };
   }
 
@@ -1621,15 +1882,23 @@ export class BlindReviewGate {
     // A chunk adds repository/file fences and the chunk heading beyond the empty-prompt
     // measurement. Reserve a bounded envelope so the complete serialized prompt, not only
     // the patch body, remains inside the review budget.
-    const chunkBudget = CHUNK_THRESHOLD_CHARS - this.promptOverhead(request, change, evidenceSection, reviewPolicies) - 4_096;
+    const overhead = this.promptOverhead(request, change, evidenceSection, reviewPolicies);
+    const chunkBudget = CHUNK_THRESHOLD_CHARS - overhead - 4_096;
     if (chunkBudget <= 0) {
       return deny(ReasonCode.EVIDENCE_MISSING, "review prompt metadata exceeds the reviewer context budget", {
         runId: request.runId,
-        overhead: this.promptOverhead(request, change, evidenceSection, reviewPolicies),
+        overhead,
         budget: CHUNK_THRESHOLD_CHARS,
       });
     }
-    const chunks = splitDiffs(diffs, chunkBudget);
+    const { chunks, omitted: unfitLockfiles, unmapped } = splitDiffs(diffs, chunkBudget, LOCKFILE_CHUNK_THRESHOLD_CHARS - overhead - 4_096);
+    // A lockfile's sections are told from the others by path alone; where that is not certain, no chunk is sent.
+    if (unmapped.length > 0) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "a lockfile's patch sections cannot be told apart from the other files' by path", {
+        runId: request.runId,
+        unmapped,
+      });
+    }
     // #246 B2-a — every chunk prompt carries the contract change; the first chunk's reviewer is the
     // one that may claim the manifest, so the reducer can tell whether any reviewer covered it.
     if (change !== null && chunks.length > 0) {
@@ -1649,7 +1918,7 @@ export class BlindReviewGate {
       for (const target of part.coverageTargets) expectedSlices.set(target.slice, target.file);
     }
     const findings: ReviewFinding[] = [];
-    const omitted: string[] = [];
+    const omitted: string[] = [...unfitLockfiles];
     const chunkReviewers: ChunkReviewerEvidence[] = [];
     const egressEvidence: ReviewerEgressRecord[] = [];
     const reviewerInputs: TransmittedReviewerInput[] = [];
@@ -1657,12 +1926,14 @@ export class BlindReviewGate {
 
     for (const [index, chunk] of chunks.entries()) {
       const prompt = this.buildPrompt(request, chunk, { chunk: index + 1, of: chunks.length }, change, evidenceSection, reviewPolicies);
-      if (prompt.length + REVIEWER_TRANSPORT_OVERHEAD_CHARS > CHUNK_THRESHOLD_CHARS) {
+      const lockfileChunk = chunk.some((part) => part.lockfile !== undefined);
+      const cap = lockfileChunk ? LOCKFILE_CHUNK_THRESHOLD_CHARS : CHUNK_THRESHOLD_CHARS;
+      if (prompt.length + REVIEWER_TRANSPORT_OVERHEAD_CHARS > cap) {
         return deny(ReasonCode.EVIDENCE_MISSING, "a review chunk exceeds the context budget", {
           runId: request.runId,
           chunk: index + 1,
           length: prompt.length,
-          budget: CHUNK_THRESHOLD_CHARS,
+          budget: cap,
         });
       }
       // CP-HI-04 / ADR-0006: every chunk is a fresh provider session and a fresh
@@ -1679,6 +1950,20 @@ export class BlindReviewGate {
       const invocation = this.reviewInvocation(request, reviewer, prompt, `${request.runId}:${reviewer.sessionId}:chunk${index + 1}`);
       const transmitted = transmittedReviewerInput(request.runId, adapter, invocation);
       if (!transmitted.allowed) return transmitted as Decision<ReviewOutcome>;
+      // A lockfile chunk goes only to a reviewer whose model is known to receive it whole: the bound is
+      // checked against every byte this call transmits, instructions, packet and lockfile, as the adapter
+      // sends them (stdin and any argv value).
+      if (lockfileChunk) {
+        const sent = adapter.transmittedReviewerInput!(invocation);
+        const bytes = Buffer.byteLength(sent.stdin) + sent.argv.reduce((total, [, value]) => total + Buffer.byteLength(value), 0);
+        const limit = adapter.reviewerInputMaxBytes?.(reviewer.preference.model);
+        if (limit === undefined || bytes > limit) {
+          const bound = limit === undefined ? "declares no input bound for it" : `accepts at most ${limit} bytes`;
+          omitted.push(...chunk.filter((part) => part.lockfile !== undefined).map((part) => `${part.identity}:${part.files[0]}: lockfile not reviewed: ` +
+            `its review input is ${bytes} bytes and the selected reviewer model ${reviewer.preference.provider}/${reviewer.preference.model} ${bound}`));
+          continue;
+        }
+      }
       reviewerInputs.push(transmitted.value);
       const result = await adapter.invoke(invocation);
       const isolation = this.assertIsolationAttested(request.runId, reviewer, result);
@@ -1727,6 +2012,9 @@ export class BlindReviewGate {
       omitted.push(...parsed.omittedItems);
       findings.push(...parsed.findings);
       worst = worseVerdict(worst, parsed.verdict);
+      // A completed chunk is real progress. An attempt that no longer holds the run stops here rather
+      // than reviewing on for no one.
+      if (request.progress?.("REVIEW_CHUNK_COMPLETED") === false) return attemptLeaseLost(request.runId, request.attemptId);
     }
 
     // Coverage reducer: every touched file must have been seen by at least one chunk,
@@ -1748,6 +2036,7 @@ export class BlindReviewGate {
 
     // §18.5 — the reduced result is not the verdict. A *final fresh reviewer* judges it,
     // and only that judgement is authoritative.
+    if (request.progress?.("FINAL_REVIEW_STARTED") === false) return attemptLeaseLost(request.runId, request.attemptId);
     const finalReviewer = await this.constituteReviewer(request, "blind-review-final");
     if (!finalReviewer.allowed) return finalReviewer as Decision<never>;
     rememberReviewer(finalReviewer.value);
@@ -1872,7 +2161,7 @@ export class BlindReviewGate {
 
   private buildPrompt(
     request: BlindReviewRequest,
-    diffs: ReviewerDiff[],
+    diffs: readonly ReviewChunkInput[],
     chunk?: { chunk: number; of: number },
     change: TrustedContractChange | null = null,
     evidenceSection: readonly string[] = [],
@@ -1912,8 +2201,11 @@ export class BlindReviewGate {
     ];
 
     for (const repo of diffs) {
-      sections.push(`### ${repo.identity}`, "Files:", ...repo.files.map((f) => `- ${f}`), "```diff", repo.diff, "```");
+      const lockfile = "lockfile" in repo && repo.lockfile !== undefined ? [repo.lockfile] : [];
+      const rangeLabel = "rangeLabel" in repo && repo.rangeLabel !== undefined ? [repo.rangeLabel] : [];
+      sections.push(`### ${repo.identity}`, "Files:", ...repo.files.map((f) => `- ${f}`), ...lockfile, ...rangeLabel, "```diff", repo.diff, "```");
     }
+    const holdsRange = diffs.some((repo) => "rangeLabel" in repo && repo.rangeLabel !== undefined);
 
     sections.push(
       "",
@@ -1949,6 +2241,7 @@ export class BlindReviewGate {
       ...(chunk
         ? ["In this chunk, `coveredFiles` lists only files named under \"## Actual diff\" above; other reviewers cover the other chunks' files."]
         : []),
+      ...(chunk && holdsRange ? [RANGE_PART_STATEMENT] : []),
       "`omittedItems` must list anything you could not examine. Do not return PASS with a non-empty omission list.",
     );
     return sections.filter(Boolean).join("\n");
@@ -2128,8 +2421,10 @@ export class BlindReviewGate {
     /** A CONTRACT_CHANGE review's binding; null for any other review, whose packet has no such key. */
     contractChange: ContractChangeReviewBinding | null;
     planReview: boolean;
+    reviewEvidence?: SnapshotReviewEvidence;
   }): ReviewPacket {
     const planReview = input.planReview;
+    const methodFindings = input.raw.findings.filter((finding) => finding.category === "method");
     return {
       runId: input.request.runId,
       candidateSnapshotDigest: input.snapshotDigest,
@@ -2161,6 +2456,10 @@ export class BlindReviewGate {
         reviewPolicies: input.reviewPolicies,
         reviewerPromptDigests: input.reviewerInputs.map(({ digest }) => digest),
         reviewerInputRepresentations: input.reviewerInputs.map(({ representation }) => representation),
+        methodology: { ...FRONTIER_SIMPLIFY_SOURCE },
+        ...(input.reviewEvidence === undefined ? {} : { reviewEvidence: {
+          digest: input.reviewEvidence.digest, bundleSha256: input.reviewEvidence.bundleSha256, attachmentDigest: input.reviewEvidence.attachmentDigest,
+        } }),
       },
       coveredRepositories: [
         ...new Set(
@@ -2176,7 +2475,8 @@ export class BlindReviewGate {
       // #1254 G-4 — the findings as the reviewer wrote them. The artifact store checks them, like every
       // other field of the packet, before anything is stored, so a credential in a finding refuses the
       // review through `storeReview`'s refusal record instead of being rewritten into a stored verdict.
-      findings: [...input.raw.findings],
+      findings: input.raw.findings.filter((finding) => finding.category !== "method"),
+      ...(methodFindings.length === 0 ? {} : { methodFindings }),
       chunked: input.chunked,
       ...(input.bootstrapPlan === null ? {} : { bootstrapPlan: input.bootstrapPlan }),
       ...(input.bootstrapPlanIntentDigest === undefined ? {} : { bootstrapPlanIntentDigest: input.bootstrapPlanIntentDigest }),
@@ -2693,6 +2993,15 @@ const transmittedReviewerInput = (
       provider: adapter.provider,
     });
   }
+  // #1270 — a reviewer whose transmitted input lost the method, or any part of it, is not asked: its
+  // verdict would not be a frontier-simplify review, so the review is unavailable rather than a PASS.
+  const method = frontierReviewPolicy();
+  if (![...input.argv.map(([, value]) => value), input.stdin].some((channel) => channel.includes(method))) {
+    return deny(ReasonCode.EVIDENCE_MISSING, "reviewer input does not carry the whole frontier-simplify method", {
+      runId,
+      provider: adapter.provider,
+    });
+  }
   return allow(ReasonCode.OK, { digest: transmittedInputDigest(input), representation: transmittedInputRepresentation(input) });
 };
 
@@ -2836,7 +3145,10 @@ const contractChangeReadbackSection = (change: TrustedContractChange): string[] 
         `${change.readback.context.candidateSnapshotDigest}; not written by the CTO. For each repository, driftState, lastObservedHead and`,
         "lastObservedAt are the registry's stored values; checkout is the registered checkout as ACP read it then, and its",
         "observedDriftState and observedDriftCauses are the drift ACP recomputed from that read against its acceptedHead, the",
-        "registry head the inspection read, and what it rested on. For",
+        "registry head the inspection read, and what it rested on. The project's canonicalSessionEntitlements and",
+        "primaryCtoBinding are its canonical CTO conversation entitlements and ACTIVE PRIMARY_CTO binding, with the",
+        "session the bound actor ran on, as ACP's own tables held them at the freeze (null: no ACTIVE binding); the",
+        "candidate snapshot holds the same baseline and its digest covers it, so a changed identity is another candidate. For",
         "each bound workflow revision, read is the exact local read of that commit's file with replacement objects off;",
         "ABSENT means the object was not in the checkout and was not read another way.",
         "```json",
@@ -3085,6 +3397,8 @@ interface ReviewerDiff {
   identity: string;
   diff: string;
   files: string[];
+  /** The lockfiles this diff changes (`lockfileChanges`); each is reviewed in a chunk of its own. */
+  lockfiles?: LockfileChange[];
 }
 
 /**
@@ -3123,6 +3437,10 @@ const snapshotForReviewer = (snapshot: CandidateSnapshot): unknown => ({
 
 interface ReviewChunkPart extends ReviewerDiff {
   coverageTargets: SliceCoverageTarget[];
+  /** A lockfile part's status, path and blobs, and a modified one's full candidate text, shown above its patch. */
+  lockfile?: string;
+  /** A range part's number, character range, starting line and whether it completes the file, shown above its patch. */
+  rangeLabel?: string;
 }
 
 type ReviewChunkInput = ReviewChunkPart | ReviewerDiff;
@@ -3195,36 +3513,264 @@ const dedupeFindings = (findings: ReviewFinding[]): ReviewFinding[] => {
   });
 };
 
+/**
+ * Chunks of at most `budget` diff chars each. Each lockfile a diff changes goes whole into a chunk of
+ * its own when it fits `lockfileBudget`; one that does not is returned in `omitted`. Where a lockfile's
+ * sections cannot be told from the others' by path, the repository is named in `unmapped` and no
+ * chunk is to be sent.
+ */
 const splitDiffs = (
   diffs: ReviewerDiff[],
   budget: number,
-): ReviewChunkPart[][] => {
+  lockfileBudget = budget,
+): { chunks: ReviewChunkPart[][]; omitted: string[]; unmapped: string[] } => {
   const chunks: ReviewChunkPart[][] = [];
+  const omitted: string[] = [];
+  const unmapped: string[] = [];
   let current: ReviewChunkPart[] = [];
   let size = 0;
   for (const repo of diffs) {
-    for (const part of splitByFile(repo, budget)) {
-      if (size + part.diff.length > budget && current.length > 0) {
+    const separated = separateLockfiles(repo);
+    if (separated === null) {
+      unmapped.push(repo.identity);
+      continue;
+    }
+    for (const [index, lockfile] of (repo.lockfiles ?? []).entries()) {
+      const whole = lockfilePart(repo.identity, lockfile, separated.owned[index]!.join(""), lockfileBudget);
+      if (typeof whole === "string") omitted.push(whole);
+      else chunks.push([whole]);
+    }
+    if (separated.rest === null) continue;
+    for (const part of splitByFile(separated.rest, budget)) {
+      const length = part.diff.length + (part.rangeLabel?.length ?? 0);
+      if (size + length > budget && current.length > 0) {
         chunks.push(current);
         current = [];
         size = 0;
       }
       current.push(part);
-      size += part.diff.length;
+      size += length;
     }
   }
   if (current.length > 0) chunks.push(current);
-  return chunks.length > 0 ? chunks : [[]];
+  return { chunks: chunks.length > 0 ? chunks : [[]], omitted, unmapped };
+};
+
+/**
+ * The paths a patch section changes, as git lists them (C-quoted where git quotes them): a rename's or
+ * copy's own `from`/`to` lines, else the one path both sides of its `diff --git` line name, quoted or
+ * not, spaces included. Undefined for a header that names no such path. Read from the header only.
+ */
+const sectionPaths = (section: string): { from: string; to: string } | undefined => {
+  const header = sectionHeader(section);
+  const from = /^(?:rename|copy) from (.+)$/m.exec(header)?.[1];
+  const to = /^(?:rename|copy) to (.+)$/m.exec(header)?.[1];
+  if (from !== undefined && to !== undefined) return { from, to };
+  const line = /^diff --git (.+)$/m.exec(header)?.[1];
+  if (line === undefined) return undefined;
+  const quoted = /^"a\/((?:[^"\\]|\\.)*)" "b\/((?:[^"\\]|\\.)*)"$/.exec(line);
+  if (quoted) return quoted[1] === quoted[2] ? { from: `"${quoted[1]}"`, to: `"${quoted[1]}"` } : undefined;
+  const half = (line.length - 1) / 2;
+  const [a, b] = [line.slice(0, half), line.slice(half + 1)];
+  return Number.isInteger(half) && line[half] === " " && a.startsWith("a/") && b.startsWith("b/") && a.slice(2) === b.slice(2)
+    ? { from: a.slice(2), to: a.slice(2) }
+    : undefined;
 };
 
 /**
  * The path a patch section changes, as git lists it among the changed paths: a rename's or copy's
  * destination (review lane-e-fs-r8 — its `a/` path is the source, which git does not list), else its
- * `a/` path. Read from the section's header lines only.
+ * one path.
  */
-const sectionPath = (section: string): string | undefined => {
-  const header = section.slice(0, /^(?:--- |@@ |GIT binary patch$|Binary files )/m.exec(section)?.index ?? section.length);
-  return /^(?:rename|copy) to (.+)$/m.exec(header)?.[1] ?? /^diff --git a\/(\S+) b\//m.exec(header)?.[1];
+const sectionPath = (section: string): string | undefined => sectionPaths(section)?.to;
+
+/** A lockfile the candidate changes, from git's raw diff of the frozen base and candidate commits. */
+interface LockfileChange {
+  /** The path as the candidate snapshot lists it: the coverage key. */
+  listed: string;
+  /** Its path (the deleted path for a deletion), and the source path of a rename or copy, unquoted. */
+  path: string;
+  from: string | null;
+  /** Git's raw status letter: A, M, D, R, C or T. */
+  status: string;
+  /** Blob ids; null for a side that does not exist. */
+  base: string | null;
+  candidate: string | null;
+  /** Each existing side's full text, read by its blob id; null where that side is absent, or is not UTF-8 text without NUL bytes. */
+  baseText: string | null;
+  text: string | null;
+}
+
+const isLockfile = (path: string): boolean => LOCKFILE_NAMES.has(path.slice(path.lastIndexOf("/") + 1));
+
+/** A blob's bytes as text: only when they are UTF-8 that decodes and re-encodes to the same bytes, with no NUL. */
+const blobText = async (cwd: string, id: string): Promise<string | null> => {
+  const bytes = await readBlob(cwd, id);
+  if (bytes === null || bytes.includes(0)) return null;
+  const text = bytes.toString("utf8");
+  return Buffer.from(text, "utf8").equals(bytes) ? text : null;
+};
+
+/**
+ * Each lockfile the frozen candidate changes: `git diff --raw -z` names its status, its exact paths and
+ * its blobs, rename-only changes included. It is read the way `diffPatch` reads the frozen patch, with no
+ * rename or copy option of its own, so the repository's `diff.renames` decides for both: with renames
+ * off a renamed lockfile is a deletion and an addition, each a lockfile. A lockfile is told by the base
+ * name of its path, the deleted path for a deletion. Both sides' texts are read by blob id.
+ */
+const lockfileChanges = async (
+  cwd: string,
+  repo: { baseHead: string; candidateHead: string; touchedPaths: readonly string[] },
+  withheld: readonly string[],
+): Promise<LockfileChange[]> => {
+  const excluded = withheld.length === 0 ? [] : ["--", ":(top)", ...withheld.map((path) => `:(top,exclude,literal)${path}`)];
+  const raw = (await git(cwd, [
+    "diff", "--raw", "-z", "--no-abbrev", ...PATCH_WITHOUT_PROGRAMS, `${repo.baseHead}..${repo.candidateHead}`, ...excluded,
+  ])).stdout.split("\0");
+  const blob = (id: string): string | null => (/^0+$/.test(id) ? null : id);
+  const changes: LockfileChange[] = [];
+  for (let at = 0; at < raw.length; ) {
+    const meta = raw[at] ?? "";
+    if (!meta.startsWith(":")) {
+      at += 1;
+      continue;
+    }
+    const [, , oldBlob = "", newBlob = "", status = ""] = meta.slice(1).split(" ");
+    const paths = raw.slice(at + 1, at + 1 + (/^[RC]/.test(status) ? 2 : 1));
+    at += 1 + paths.length;
+    const path = paths.at(-1);
+    if (path === undefined || !isLockfile(path)) continue;
+    const base = blob(oldBlob);
+    const candidate = blob(newBlob);
+    changes.push({
+      listed: repo.touchedPaths.find((touched) => gitPath(touched) === path) ?? path,
+      path,
+      from: paths.length === 2 ? paths[0]! : null,
+      status: status.slice(0, 1),
+      base,
+      candidate,
+      baseText: base === null ? null : await blobText(cwd, base),
+      text: candidate === null ? null : await blobText(cwd, candidate),
+    });
+  }
+  return changes;
+};
+
+/**
+ * A diff's sections split by path identity: each lockfile's own sections (those whose source and
+ * destination, decoded, are exactly its source and path), whatever their content, and the rest. Null
+ * when that is not certain: a section whose paths cannot be read, a section that names a lockfile's
+ * path without being exactly its own, or a lockfile with no section.
+ */
+const separateLockfiles = (repo: ReviewerDiff): { owned: string[][]; rest: ReviewerDiff | null } | null => {
+  const lockfiles = repo.lockfiles ?? [];
+  if (lockfiles.length === 0) return { owned: [], rest: repo };
+  const owned = lockfiles.map((): string[] => []);
+  const named = new Set(lockfiles.flatMap((lockfile) => (lockfile.from === null ? [lockfile.path] : [lockfile.path, lockfile.from])));
+  let diff = "";
+  for (const section of repo.diff.split(/(?=^diff --git )/m).filter(Boolean)) {
+    const paths = sectionPaths(section);
+    if (paths === undefined) return null;
+    const [from, to] = [gitPath(paths.from), gitPath(paths.to)];
+    const owner = lockfiles.findIndex((lockfile) => lockfile.path === to && (lockfile.from ?? lockfile.path) === from);
+    if (owner !== -1) owned[owner]!.push(section);
+    else if (named.has(from) || named.has(to)) return null;
+    else diff += section;
+  }
+  if (owned.some((sections) => sections.length === 0)) return null;
+  const listed = new Set(lockfiles.map((lockfile) => lockfile.listed));
+  const files = repo.files.filter((path) => !listed.has(path));
+  return { owned, rest: diff === "" && files.length === 0 ? null : { identity: repo.identity, diff, files } };
+};
+
+/** A patch section's header lines, before its content. */
+const sectionHeader = (section: string): string =>
+  section.slice(0, /^(?:--- |@@ |GIT binary patch$|Binary files )/m.exec(section)?.index ?? section.length);
+
+const GIT_QUOTE_ESCAPES: Readonly<Record<string, number>> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+
+/** A path as git lists it, decoded: git C-quotes one with special or non-ASCII bytes, as octal escapes. */
+const gitPath = (written: string): string => {
+  if (!written.startsWith('"') || !written.endsWith('"') || written.length < 2) return written;
+  const bytes: number[] = [];
+  for (let at = 1; at < written.length - 1; at += 1) {
+    const char = written[at]!;
+    if (char !== "\\") {
+      bytes.push(...Buffer.from(char, "utf8"));
+    } else if (/^[0-7]{3}$/.test(written.slice(at + 1, at + 4))) {
+      bytes.push(Number.parseInt(written.slice(at + 1, at + 4), 8));
+      at += 3;
+    } else {
+      bytes.push(GIT_QUOTE_ESCAPES[written[at + 1]!] ?? written.charCodeAt(at + 1));
+      at += 1;
+    }
+  }
+  return Buffer.from(bytes).toString("utf8");
+};
+
+/** A patch with its content lines left out: its header, its file lines and each hunk's changed line ranges. */
+const changedRanges = (section: string): string => {
+  const header = sectionHeader(section);
+  const files = /^--- [^\n]*\n\+\+\+ [^\n]*\n/.exec(section.slice(header.length))?.[0] ?? "";
+  return header + files + (section.match(/^@@ [^\n]*\n/gm) ?? []).join("");
+};
+
+/** Whether `section` is git's text patch adding exactly `text`, line for line, so that it shows the full text. */
+const addsExactly = (section: string, text: string): boolean => {
+  if (text === "") return false;
+  const lines = (text.endsWith("\n") ? text.slice(0, -1) : text).split("\n");
+  const hunk = `@@ -0,0 +1${lines.length === 1 ? "" : `,${lines.length}`} @@\n`;
+  const body = lines.map((line) => `+${line}\n`).join("") + (text.endsWith("\n") ? "" : "\\ No newline at end of file\n");
+  const at = section.indexOf("\n@@ ");
+  return at !== -1 && section.slice(at + 1) === hunk + body;
+};
+
+const LOCKFILE_STATUS: Readonly<Record<string, string>> = { A: "added", M: "modified", D: "deleted", R: "renamed", C: "copied", T: "changed in type" };
+
+/**
+ * A lockfile as one part of its own, never cut into ranges, bound to the candidate by its paths and
+ * blob ids (a candidate blob is git's digest of the file's full bytes). Each side it has must be UTF-8
+ * text without NUL bytes. An added lockfile whose patch adds exactly its text is that patch. Any other
+ * lockfile with a candidate side is its full candidate text, then its change as its frozen sections
+ * or, when they do not fit beside the text, as their changed line ranges. A deleted one is its
+ * deletion patch. A lockfile that does not fit `budget`, or whose text cannot be shown, is the omitted
+ * item that says so.
+ */
+const lockfilePart = (identity: string, change: LockfileChange, section: string, budget: number): ReviewChunkPart | string => {
+  const { listed, path, from, status, base, candidate, baseText, text } = change;
+  const key = `${identity}:${listed}`;
+  for (const [side, id, shown] of [["base", base, baseText], ["candidate", candidate, text]] as const) {
+    if (id !== null && shown === null) {
+      return `${key}: lockfile not reviewed: its ${side} blob ${id} is not UTF-8 text without NUL bytes, or could not be read whole`;
+    }
+  }
+  const part = (lockfile: string, diff: string): ReviewChunkPart => ({
+    identity,
+    diff,
+    files: [listed],
+    coverageTargets: [{ file: key, slice: sliceKey(identity, listed, -1, "whole") }],
+    lockfile,
+  });
+  const named = `Lockfile ${path}${from === null ? "" : ` (from ${from})`}, ${LOCKFILE_STATUS[status] ?? status}`;
+  const forms: ReviewChunkPart[] = [];
+  if (candidate !== null && base === null && addsExactly(section, text!)) {
+    forms.push(part(`${named}, shown whole in this chunk: the patch below adds its full text, candidate blob ${candidate} (git's digest of its full bytes).`, section));
+  } else if (candidate !== null) {
+    const shown = (then: string): string =>
+      `${named}, shown whole in this chunk: its full candidate text follows, candidate blob ${candidate} (git's digest of its full bytes), ` +
+      `base blob ${base ?? "none"}; then ${then}.\n\`\`\`text\n${text!}\n\`\`\``;
+    forms.push(
+      part(shown("its change, as its complete patch"), section),
+      part(shown("its change, as the changed line ranges of its patch, whose full form does not fit beside the text"), changedRanges(section)),
+    );
+  } else {
+    forms.push(part(`${named}: the patch below removes it, base blob ${base}.`, section));
+  }
+  const size = (form: ReviewChunkPart): number => (form.lockfile?.length ?? 0) + form.diff.length;
+  const fitting = forms.find((form) => size(form) <= budget);
+  if (fitting !== undefined) return fitting;
+  return `${key}: lockfile not reviewed: shown whole it needs ${Math.min(...forms.map(size))} chars, more than the ` +
+    `${budget} chars one lockfile review chunk holds; a lockfile is not cut into ranges`;
 };
 
 /** One patch section's coverage: the path it changes and its position in the repository's patch. */
@@ -3282,31 +3828,116 @@ const wholeFilePart = (identity: string, diff: string, targets: readonly Section
   })),
 });
 
+/** Where a range of a patch's content starts. */
+interface PatchPosition {
+  /** The patch line it starts at, or inside when `inside`; the section's `diff --git` line is line 1. */
+  line: number;
+  inside: boolean;
+  /** The header line of the hunk it starts in, with that hunk's old and new file lines there; "" outside a hunk or at a hunk header. */
+  hunk: string;
+  old: number;
+  new: number;
+}
+
+const HUNK_START = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+const HUNK_LINE = new RegExp(`${HUNK_START.source}[^\\n]*\\n?`, "gm");
+
+/** The end of the line that starts at `at`, after its newline. */
+const lineEnd = (text: string, at: number): number => {
+  const newline = text.indexOf("\n", at);
+  return newline === -1 ? text.length : newline + 1;
+};
+
+/**
+ * The position of offsets of `payload` (a patch after its file header, whose first line is patch line
+ * `firstLine`), asked in increasing order: one forward walk over the lines serves every part.
+ */
+const patchPositions = (payload: string, firstLine: number): ((offset: number) => PatchPosition) => {
+  let at = 0;
+  let line = firstLine;
+  let hunk = "";
+  let old = 0;
+  let next = 0;
+  return (offset) => {
+    for (let end = lineEnd(payload, at); at < offset && end <= offset; end = lineEnd(payload, at)) {
+      const text = payload.slice(at, end);
+      const start = text.startsWith("@@ ") ? HUNK_START.exec(text) : null;
+      if (start) [hunk, old, next] = [text, Number(start[1]), Number(start[2])];
+      else if (hunk !== "" && !text.startsWith("\\")) {
+        if (!text.startsWith("+")) old += 1;
+        if (!text.startsWith("-")) next += 1;
+      }
+      at = end;
+      line += 1;
+    }
+    const inside = at < offset;
+    return { line, inside, hunk: !inside && payload.startsWith("@@ ", offset) ? "" : hunk, old, new: next };
+  };
+};
+
+/** A range part's label: its number, its characters of the patch after the file header, where it starts, and whether it completes the file. */
+const rangePartLabel = (part: number, of: number, start: number, end: number, total: number, from: PatchPosition): string =>
+  `Part ${part} of ${of} of this file's patch: characters [${start}, ${end}) of the ${total} after its file header, ` +
+  `from ${from.inside ? "inside " : ""}patch line ${from.line}${from.hunk === "" ? "" : `, old line ${from.old}, new line ${from.new}`}. ` +
+  (part === 1 ? "" : `Its file header${from.hunk === "" ? " is" : " and the header of the hunk it starts in are"} repeated above it. `) +
+  `This part ${part === of ? "completes" : "does not complete"} the file.`;
+
+const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff;
+const isLowSurrogate = (code: number): boolean => code >= 0xdc00 && code <= 0xdfff;
+
+/**
+ * An oversized section as labelled ranges that join back into it exactly. Every part repeats the
+ * section's file header (its `diff --git` lines and, for a text patch, its `---`/`+++` lines) and the
+ * header of the hunk its range starts in, and is cut at the last line end that fits; a line longer than
+ * a whole part is cut inside itself, never between the halves of a surrogate pair. The headers and the
+ * label are charged to `budget` beside the range, the label at its widest.
+ */
 const splitOversizedSection = (
   identity: string,
   target: SectionTarget,
   section: string,
   budget: number,
 ): ReviewChunkPart[] => {
-  const headerEnd = section.indexOf("\n") + 1;
-  const header = headerEnd > 0 ? section.slice(0, headerEnd) : "";
-  const payload = section.slice(header.length);
-  const capacity = budget - header.length;
-  if (capacity <= 0) return [wholeFilePart(identity, section, [target])];
-
-  const parts: ReviewChunkPart[] = [];
-  for (let offset = 0; offset < payload.length; offset += capacity) {
-    parts.push({
-      identity,
-      diff: `${header}${payload.slice(offset, offset + capacity)}`,
-      files: [target.path],
-      coverageTargets: [{
-        file: `${identity}:${target.path}`,
-        slice: sliceKey(identity, target.path, target.section, offset),
-      }],
-    });
+  const header = sectionHeader(section);
+  const named = header + (/^--- [^\n]*\n\+\+\+ [^\n]*\n/.exec(section.slice(header.length))?.[0] ?? "");
+  // A section with no content marker keeps its first line as its header.
+  const fileHeader = named.length < section.length ? named : section.slice(0, section.indexOf("\n") + 1);
+  const payload = section.slice(fileHeader.length);
+  let widestStart = 0;
+  let longestHunk = 0;
+  for (const hunk of payload.matchAll(HUNK_LINE)) {
+    widestStart = Math.max(widestStart, Number(hunk[1]), Number(hunk[2]));
+    longestHunk = Math.max(longestHunk, hunk[0].length);
   }
-  return parts;
+  // Eight numbers, none over this many digits; each has one digit in this, the longest wording.
+  const digits = String(section.length + 1 + widestStart).length;
+  const labelRoom = rangePartLabel(2, 3, 0, 0, 0, { line: 0, inside: true, hunk: "@", old: 0, new: 0 }).length + 8 * (digits - 1);
+  const room = budget - labelRoom - fileHeader.length;
+  if (payload === "" || room - longestHunk < 2) return [wholeFilePart(identity, section, [target])];
+
+  const positionOf = patchPositions(payload, fileHeader.split("\n").length);
+  const ranges: Array<{ start: number; end: number; from: PatchPosition }> = [];
+  for (let start = 0; start < payload.length; ) {
+    const from = positionOf(start);
+    let end = Math.min(payload.length, start + room - from.hunk.length);
+    if (end < payload.length) {
+      const newline = payload.lastIndexOf("\n", end - 1);
+      if (newline >= start) end = newline + 1;
+      else if (isHighSurrogate(payload.charCodeAt(end - 1)) && isLowSurrogate(payload.charCodeAt(end))) end -= 1;
+    }
+    ranges.push({ start, end, from });
+    start = end;
+  }
+  return ranges.map(({ start, end, from }, index) => ({
+    identity,
+    diff: `${fileHeader}${from.hunk}${payload.slice(start, end)}`,
+    files: [target.path],
+    coverageTargets: [{
+      file: `${identity}:${target.path}`,
+      slice: sliceKey(identity, target.path, target.section, start),
+    }],
+    rangeLabel: rangePartLabel(index + 1, ranges.length, start, end, payload.length, from),
+  }));
 };
 
-export const __testing = { splitDiffs, parseVerdict, worseVerdict, validateChunkCoverage, VERDICT_SCHEMA };
+export const __testing = { splitDiffs, parseVerdict, worseVerdict, validateChunkCoverage, VERDICT_SCHEMA, LOCKFILE_CHUNK_THRESHOLD_CHARS };

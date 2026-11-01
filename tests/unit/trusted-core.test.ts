@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { join } from "node:path";
 import { chmodSync, writeFileSync } from "node:fs";
+import { createServer, type AddressInfo } from "node:net";
 
 import { isoPlus } from "../../src/core/clock.ts";
 import { canonicalJson, digestOf } from "../../src/core/digest.ts";
@@ -575,6 +576,18 @@ describe("portable project manifest (Integration §10.2)", () => {
     expect(assertPortableManifest(base).allowed).toBe(true);
   });
 
+  it("#1269: admits merge commits only; a missing strategy reads as one, and squash, rebase and fast-forward are refused by name", () => {
+    const { mergeStrategy: _omitted, ...profile } = base.branchProfile;
+    const defaulted = assertPortableManifest({ ...base, branchProfile: profile });
+    expect(defaulted.allowed && defaulted.value.branchProfile.mergeStrategy).toBe("merge_commit");
+    for (const mergeStrategy of ["squash", "rebase", "fast_forward"]) {
+      const refused = assertPortableManifest({ ...base, branchProfile: { ...base.branchProfile, mergeStrategy } });
+      expect(refused.allowed).toBe(false);
+      expect(refused.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+      expect(refused.evidence["issues"]).toEqual([expect.objectContaining({ path: "branchProfile.mergeStrategy", refusal: "MERGE_COMMIT_ONLY" })]);
+    }
+  });
+
   it("CP-S04 / RF-S05: rejects absolute paths and session identifiers", () => {
     // RF-S05 arm:absolute-path
     // RF-S05 arm:session
@@ -686,17 +699,25 @@ describe("portable project manifest (Integration §10.2)", () => {
     expect("gateEntries" in parsed.value).toBe(false);
     expect(manifestDigest(parsed.value)).toBe("sha256:65bd321ae60be501826cfd667cfbf39385997c9a1b488a79b78c55c87c947bfc");
 
-    // The same for a manifest that leaves every defaulted field to the schema.
-    const minimal = assertPortableManifest({
+    // The same for a manifest that leaves every defaulted field to the schema but CommitLore's mode, which
+    // it names as the default named it then: a stored manifest is stored as parsed, so it names its mode.
+    const input = {
       schema: PROJECT_MANIFEST_SCHEMA_ID,
       projectId: "minimal",
       repositories: [{ role: "primary", remote: "github:acme/minimal" }],
       branchProfile: {},
       verificationProfiles: {},
-    });
+    };
+    const minimal = assertPortableManifest({ ...input, commitlore: { mode: "preferred" } });
     if (!minimal.allowed) throw new Error(minimal.message);
     expect("gateEntries" in minimal.value).toBe(false);
     expect(manifestDigest(minimal.value)).toBe("sha256:ca1dc49e1f7a4724d696210edeeb89cb586a0e9a887a97bdfec77e1d7e5c47a2");
+
+    // #1268 — an input that leaves CommitLore's mode to the schema now gets `required`, and that digest.
+    const unnamed = assertPortableManifest(input);
+    if (!unnamed.allowed) throw new Error(unnamed.message);
+    expect(unnamed.value.commitlore).toEqual({ mode: "required" });
+    expect(manifestDigest(unnamed.value)).toBe("sha256:38545fe208531996999eb6b95f1123ca7e4fd0923dd36744fc20d175ce55b1b2");
   });
 
   /** `base` with its one command running a gate script directly. */
@@ -758,7 +779,7 @@ describe("portable project manifest (Integration §10.2)", () => {
       ["node", "--env-file", ".env", "scripts/gate.mjs"],
       ["scripts/gate.mjs"],
     ]) {
-      // Some of these are also outside the verification executable allowlist, a separate refusal.
+      // A gate entry runs under node's ACP loader; any other launcher is refused here.
       expect(refusedAt({ ...runsGate(argv), gateEntries: [gate] }), argv.join(" ")).toContain("gateEntries");
     }
     // A TRUSTED_CI command runs where ACP cannot check the entry first, so it cannot carry one;
@@ -945,7 +966,9 @@ describe("verification sandbox (PRD §17.4)", () => {
     expect(outcome.status).toBe("PASS");
     const parsed = JSON.parse(outcome.stdout) as { leak: string[]; home: string };
     expect(parsed.leak).toEqual([]);
-    expect(parsed.home).not.toBe(process.env["HOME"]);
+    // HOME is the daemon's own since 2026-10-31, so toolchains under it are found; the secret paths
+    // below it are denied by the profile instead (the-verification-sandbox-opens-to-every-language).
+    expect(parsed.home).toBe(process.env["HOME"]);
     expect(outcome.enforcement.secretsStripped).toBe(true);
   });
 
@@ -1028,12 +1051,16 @@ describe("verification sandbox (PRD §17.4)", () => {
     expect(outcome.enforcement.readConfinement).toBe("none");
   });
 
-  it("#318 returns the kernel network-denial errno for a refused connection", async () => {
+  // #318 asserted the kernel's EPERM for a denied connection. The network is open since 2026-10-31,
+  // so the same probe now reaches a local server, and the result records `allow`, not a denial.
+  it("#318 records an open network: a connection reaches a local server", async () => {
     const repo = makeRepo();
+    const server = createServer((socket) => socket.end());
+    const port = await new Promise<number>((resolvePort) => server.listen(0, "127.0.0.1", () => resolvePort((server.address() as AddressInfo).port)));
     writeFileSync(
       join(repo, "network.js"),
       `const net = require('node:net');
-       const socket = net.connect({ host: '203.0.113.1', port: 443 });
+       const socket = net.connect({ host: '127.0.0.1', port: ${port} });
        const timer = setTimeout(() => {
          socket.destroy();
          console.log(JSON.stringify({ event: 'timeout', errno: null }));
@@ -1048,21 +1075,26 @@ describe("verification sandbox (PRD §17.4)", () => {
          console.log(JSON.stringify({ event: 'error', errno: error.code ?? null }));
        });`,
     );
-    const outcome = await runSandboxed({
-      command: parseVerificationCommand({
-        id: "net",
-        argv: ["node", "network.js"],
-        network: "deny",
-        timeoutSeconds: 30,
-      }),
-      worktreePath: repo,
-    });
+    let outcome;
+    try {
+      outcome = await runSandboxed({
+        command: parseVerificationCommand({
+          id: "net",
+          argv: ["node", "network.js"],
+          network: "deny",
+          timeoutSeconds: 30,
+        }),
+        worktreePath: repo,
+      });
+    } finally {
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
     expect(outcome).toMatchObject({
       status: "PASS",
       reasonCode: null,
-      enforcement: { networkEnforced: true, networkPolicy: "deny" },
+      enforcement: { networkEnforced: false, networkPolicy: "allow" },
     });
-    expect(JSON.parse(outcome.stdout)).toEqual({ event: "error", errno: "EPERM" });
+    expect(JSON.parse(outcome.stdout)).toEqual({ event: "connected", errno: null });
   });
 
   it("does not hand the daemon's own PATH to the candidate", async () => {

@@ -19,10 +19,11 @@ import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
-import type { ACPBootstrapActivationResult, BootstrapActivation } from "./activation.ts";
+import { type ACPBootstrapActivationResult, type BootstrapActivation, newProjectCommitLore } from "./activation.ts";
 import { type GroupMember, processGroupEmpty, processGroupMembership } from "./attempt-writer-group.ts";
 import { type BootstrapWriteRequest, runUnderWriteGuard } from "./bootstrap-write-guard.ts";
-import { type CommitLorePort, commitloreRequired, probeCommitLore, verifyCommitLoreBinding } from "./commitlore-observation.ts";
+import { type CommitLoreObservation, type CommitLorePort, commitloreRequired, probeCommitLore, verifyCommitLoreBinding } from "./commitlore-observation.ts";
+import { type DogfoodFindingStore, commitloreObservationFinding } from "../quality/upstream-dogfood.ts";
 import {
   consumeWithheldExemption,
   readWithheldIntent,
@@ -182,6 +183,11 @@ export interface RepoFactoryBootstrapRunnerDeps {
    * anything is consumed or written when this is absent; it never falls back to a resident.
    */
   adoptions?: Pick<CanonicalCtoBootstrapAdoptions, "recorded" | "validate" | "pinHolds" | "targetHolds"> | null;
+  /**
+   * #1271 — where a CommitLore observation that did not pass is recorded as an upstream dogfood finding.
+   * The production composition passes the control plane's store; absent, nothing is recorded.
+   */
+  dogfood?: DogfoodFindingStore | null;
 }
 
 type Stage = "precondition" | "approval" | "production" | "activation";
@@ -361,6 +367,28 @@ export class RepoFactoryBootstrapRunner {
    * ended. Never attached, that cannot be shown: a new attempt after an earlier one, and a release,
    * are refused.
    */
+  /**
+   * #1271 — a CommitLore observation that did not pass, at the probe or at the published head, is a
+   * dogfood finding, recorded where its refusal is answered. Recording never changes that answer.
+   */
+  #recordCommitLoreFinding(runId: string, decision: Decision<unknown>): void {
+    const store = this.deps.dogfood;
+    if (!store || decision.allowed || decision.evidence["refusal"] !== "COMMITLORE_REQUIRED_NOT_OBSERVED") return;
+    const observation = decision.evidence["observation"] as CommitLoreObservation | undefined;
+    if (observation?.outcome !== "FAIL" || typeof observation.detail !== "string") return;
+    const at = decision.evidence["at"] === "probe" ? "probe" : "head";
+    const finding = commitloreObservationFinding(observation, {
+      productRevision: "unrecorded",
+      privateEvidenceRef: `bootstrap run ${runId}, CommitLore ${at} observation`,
+    });
+    if (finding === null) return;
+    try {
+      store.record(finding, { runId, actor: "repo-factory-bootstrap" });
+    } catch {
+      // The store answers with a refusal rather than throwing; this only keeps the refusal above intact.
+    }
+  }
+
   attachWriterLock(held: () => boolean, identity: (() => AttemptWriter | null) | null = null): void {
     this.#writerLockHeld = held;
     this.#writerIdentity = identity;
@@ -699,9 +727,17 @@ export class RepoFactoryBootstrapRunner {
       // owner's approval is consumed or GitHub is read or written: no observer, or a probe that does not
       // pass, refuses here, and a new run reserves nothing. The PLAN stays as approved; nothing lowers its
       // mode. The observation the result reports is made again in the checkout, at the published head.
+      // #1268 — and a new project's manifest that does not require CommitLore activates nothing, so it is
+      // refused here, before anything is consumed, read or written, as activation would refuse it after.
+      const newProject = newProjectCommitLore(input.approvedManifest);
+      if (!newProject.allowed) {
+        if (existing !== null) this.deps.applications.recordRefusal(runId, refusalRecord(newProject, "precondition"));
+        return atStage(newProject as Decision<ACPBootstrapActivationResult>, "precondition");
+      }
       if (commitloreRequired(commitlore.mode)) {
         const probed = await probeCommitLore(commitlore.port);
         if (!probed.allowed) {
+          this.#recordCommitLoreFinding(runId, probed);
           if (existing !== null) this.deps.applications.recordRefusal(runId, refusalRecord(probed, "precondition"));
           return atStage(probed as Decision<ACPBootstrapActivationResult>, "precondition");
         }
@@ -900,6 +936,7 @@ export class RepoFactoryBootstrapRunner {
       return deny(ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS, "the attempt stopped before its next request", { stage: "production" });
     });
     if (!produced.allowed) {
+      this.#recordCommitLoreFinding(runId, produced);
       // Authority lost mid-attempt: what was written is in the ledger, and nothing further was sent.
       if (staleAuthority !== null) {
         const stale = staleAuthority as Decision<void>;

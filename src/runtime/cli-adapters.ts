@@ -1,9 +1,13 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import {
   accessSync,
+  chmodSync,
   constants,
   existsSync,
   lstatSync,
+  mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -36,6 +40,10 @@ import {
   ClaudeUsageCollector,
   CodexUsageCollector,
   GrokUsageCollector,
+  CodexAppServerFailed,
+  SpawnCodexRateLimitProbe,
+  type CodexAppServerLaunch,
+  type CodexRateLimitProbe,
   type UsageCollector,
 } from "../capacity/usage-collectors.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
@@ -48,6 +56,8 @@ import {
   type InvocationResult,
   type ProviderAdapter,
   type TransmittedInput,
+  type TurnScratchListing,
+  TurnScratchThrown,
   ProviderSessionProvisionError,
   REVIEWER_EGRESS_DENY_PROBE_ENDPOINTS,
   type ReviewerEgressConfig,
@@ -800,6 +810,12 @@ const productionRunCli = async (
     workerTurn?: boolean;
     /** #1246 — with `workerTurn`: git configuration the child's git applies over the repository's. */
     gitConfig?: Readonly<Record<string, string>>;
+    /**
+     * With `"codex-workspace-write"`: the turn's private temporary directory, the one writable root
+     * its sandbox adds to the checkout. The child's TMPDIR and the caches that do not follow TMPDIR
+     * point into it.
+     */
+    turnTemp?: string;
   },
 ): Promise<{
   stdout: string;
@@ -881,6 +897,14 @@ const productionRunCli = async (
         environment[`GIT_CONFIG_KEY_${index}`] = key;
         environment[`GIT_CONFIG_VALUE_${index}`] = value;
       });
+    }
+    // Set after the allowlist, so an inherited value cannot point a tool back at the checkout. Node's
+    // compile cache otherwise follows TMPDIR; xcrun keeps `xcrun_db` in the per-user temp directory
+    // unless `xcrun_db` names an absolute path.
+    if (codexWorkspaceWrite && options.turnTemp !== undefined) {
+      environment["TMPDIR"] = options.turnTemp;
+      environment["NODE_COMPILE_CACHE"] = join(options.turnTemp, "node-compile-cache");
+      environment["xcrun_db"] = join(options.turnTemp, "xcrun_db");
     }
     if (egress) {
       // The child receives only the loopback proxy route. Do not let a caller-supplied
@@ -2606,16 +2630,13 @@ export class ClaudeCliAdapter implements ProviderAdapter {
    * only: the session credential reaches it over the daemon's take-once launch channel, never
    * through argv, the environment or a file.
    */
-  async runSessionTurn(request: SessionTurnRequest): Promise<SessionTurnResult> {
+  async runSessionTurn(request: SessionTurnSpawnRequest): Promise<SessionTurnResult> {
     const started = Date.now();
-    const refused = (error: string): SessionTurnResult => ({
-      ok: false,
-      text: "",
-      exitCode: null,
-      error,
-      providerSessionId: null,
-      durationMs: Date.now() - started,
-    });
+    const refused = (error: string): SessionTurnResult => {
+      // Refused before anything was spawned: there is no process group to outlive the turn.
+      request.onProcessGroupEnded?.();
+      return { ok: false, text: "", exitCode: null, error, providerSessionId: null, durationMs: Date.now() - started };
+    };
     const { handle } = request;
     if (handle.provider !== this.provider) return refused("SESSION_TURN_PROVIDER_MISMATCH");
     if (!handle.workdir) return refused("SESSION_TURN_WORKDIR_MISSING: a provisioned session runs in its fixed workdir");
@@ -2666,6 +2687,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     }
     args.push(conversationFlag(request.conversation), handle.externalSessionId);
 
+    let spawned = false;
     const result = await runCli(this.#binary, args, {
       cwd: workdir,
       timeoutMs: request.timeoutMs,
@@ -2680,7 +2702,14 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       },
       // #1104 — the turn owns what its CLI leaves in its group, the relay included; see `invoke`.
       reapProcessGroup: true,
+      // O4 — the pid of this turn's own spawn, reported in the spawn's tick (`SessionTurnSpawnRequest`).
+      onSpawn: (pid: number) => {
+        spawned = true;
+        request.onSpawn?.(pid);
+      },
     });
+    // O4 (D2-R2) — said only on positive evidence: the group seen empty after its signal, or no spawn.
+    if (result.processGroup?.reaped === true || (!spawned && result.processGroup === undefined)) request.onProcessGroupEnded?.();
     const envelope = safeParse(result.stdout);
     const providerError = claudeProviderError(envelope);
     const text = typeof envelope?.["result"] === "string" ? (envelope["result"] as string) : "";
@@ -2724,6 +2753,23 @@ const conversationFlag = (step: ConversationStep): "--session-id" | "--resume" =
 
 /** The one MCP server a provisioned session's turn is given; its tools are `mcp__acp-cto__*`. */
 export const SESSION_RELAY_SERVER = "acp-cto";
+
+/**
+ * O4 — a session turn as the daemon's runtime driver asks for one: the provider contract's request and
+ * the process this turn's own spawn created. `onSpawn` is called once, synchronously, in the tick the
+ * CLI process exists, with its pid, so the caller can pin the turn to it before the CLI starts its MCP
+ * child; the caller reads that process's start token itself. The process is spawned detached, so it
+ * leads a process group whose id is that pid. Never called for a turn that spawned nothing, and never
+ * with anything the session said. Kept here, beside the one adapter that runs session turns.
+ *
+ * O4 (D2-R2) — `onProcessGroupEnded` is the adapter's positive statement that nothing of the turn
+ * outlives it: its group was signalled and then observed with no member (`ProcessGroupReap.reaped`), or
+ * the turn spawned no process at all. Not called in any other case — an unconfirmed cleanup, a throw.
+ */
+export interface SessionTurnSpawnRequest extends SessionTurnRequest {
+  onSpawn?: (pid: number) => void;
+  onProcessGroupEnded?: () => void;
+}
 
 /**
  * The acp-cto relay this build ships, beside this module: `src/cli/session-relay.ts` when the
@@ -2927,6 +2973,334 @@ export const REVIEWER_TRANSPORT_SEPARATOR = "\n\n---\n\n";
 export const reviewerTransportInput = (request: Pick<InvocationRequest, "systemPrompt" | "prompt">): string =>
   request.systemPrompt ? `${request.systemPrompt}${REVIEWER_TRANSPORT_SEPARATOR}${request.prompt}` : request.prompt;
 
+const TURN_SCRATCH_PATHS = 50;
+const TURN_SCRATCH_WALK_LIMIT = 10_000;
+
+/**
+ * What a GPT worker turn left in its temporary directory: file count, bytes and the first sorted
+ * relative paths. Bounded, and a symbolic link is counted as a file, never followed.
+ */
+const turnScratchListing = (root: string): TurnScratchListing => {
+  const paths: string[] = [];
+  let bytes = 0;
+  let visited = 0;
+  let unread = false;
+  const pending = [""];
+  while (pending.length > 0 && visited < TURN_SCRATCH_WALK_LIMIT) {
+    const directory = pending.pop()!;
+    let entries: string[] = [];
+    try {
+      entries = readdirSync(join(root, directory));
+    } catch {
+      unread = true;
+      continue;
+    }
+    for (const name of entries) {
+      if (visited >= TURN_SCRATCH_WALK_LIMIT) break;
+      visited += 1;
+      const path = directory === "" ? name : `${directory}/${name}`;
+      try {
+        const entry = lstatSync(join(root, path));
+        if (entry.isDirectory()) {
+          pending.push(path);
+          continue;
+        }
+        bytes += entry.size;
+      } catch {
+        // Gone since it was listed; still named.
+      }
+      paths.push(path);
+    }
+  }
+  paths.sort();
+  return {
+    files: paths.length,
+    bytes,
+    paths: paths.slice(0, TURN_SCRATCH_PATHS),
+    complete: !unread && pending.length === 0 && visited < TURN_SCRATCH_WALK_LIMIT,
+  };
+};
+
+const errorCode = (error: unknown): string =>
+  typeof (error as NodeJS.ErrnoException | null)?.code === "string" ? (error as NodeJS.ErrnoException).code! : "UNKNOWN";
+
+/**
+ * Gives the owner read, write and search on `root` and every directory under it, so it can be
+ * removed. No file's mode is changed, a symbolic link is never followed or changed, and nothing
+ * outside `root` is touched. Bounded like the listing; a failure on one entry leaves the rest to the
+ * removal.
+ */
+const restoreOwnerAccess = (root: string): void => {
+  let visited = 0;
+  const pending = [""];
+  while (pending.length > 0 && visited < TURN_SCRATCH_WALK_LIMIT) {
+    const relative = pending.pop()!;
+    const path = relative === "" ? root : join(root, relative);
+    visited += 1;
+    try {
+      // Directories only, never through a link: removing a file needs write permission on its
+      // directory, not on the file, and a file here may be a hard link to one in the checkout.
+      const entry = lstatSync(path);
+      if (!entry.isDirectory()) continue;
+      chmodSync(path, (entry.mode & 0o7777) | 0o700);
+      for (const name of readdirSync(path)) pending.push(relative === "" ? name : `${relative}/${name}`);
+    } catch {
+      // Left to the removal, which reports what remains.
+    }
+  }
+};
+
+/**
+ * Removes a turn's scratch. A failed removal never replaces the turn's outcome: it is retried once
+ * with owner access restored inside the scratch, and the result is a note — the path, the error code
+ * and whether the directory was left — never its contents. Undefined when the first removal worked.
+ */
+const removeTurnScratch = (root: string): TurnScratchListing["cleanup"] => {
+  try {
+    rmSync(root, { recursive: true, force: true });
+    return undefined;
+  } catch (first) {
+    restoreOwnerAccess(root);
+    try {
+      rmSync(root, { recursive: true, force: true });
+      return { path: root, code: errorCode(first), left: false };
+    } catch (second) {
+      return { path: root, code: errorCode(second), left: true };
+    }
+  }
+};
+
+/**
+ * Grounded: Codex CLI 0.164.0's model catalogue gives gpt-6.1-sol `context_window` 500,000 tokens and
+ * `effective_context_window_percent` 95, so 475,000 usable tokens.
+ */
+const CODEX_GPT_6_1_SOL_USABLE_TOKENS = (500_000 * 95) / 100;
+/**
+ * Grounded: the same catalogue's instructions for gpt-6.1-sol (`model_messages`) measure 62,023 bytes,
+ * and a byte-level tokenizer's token covers at least one byte, so they take at most that many tokens.
+ */
+const CODEX_GPT_6_1_SOL_INSTRUCTION_BYTES = 62_023;
+/** Estimated, not measured: the model's reasoning and answer at xhigh effort. */
+const CODEX_REVIEWER_OUTPUT_RESERVE_TOKENS = 128_000;
+/** Estimated, not measured: the tool definitions and response schema the CLI adds beside its instructions. */
+const CODEX_REVIEWER_TOOL_SCHEMA_RESERVE_TOKENS = 34_000;
+
+/**
+ * The reviewer input bound for GPT-6.1 Sol through `codex exec`, whose packet reviewer input goes on
+ * stdin, so no argv limit applies: the usable window less the CLI's instructions and the two
+ * estimated reserves, rounded down to a thousand. Every input token covers at least one byte, so an
+ * input of at most this many UTF-8 bytes is at most this many tokens. Measured once, for one size on
+ * this path only: a 180,587-byte reviewer input holding a synthetic 154,859-byte lockfile, sent through
+ * codex-cli 0.164.0 to gpt-6.1-sol at xhigh, was answered from its middle and its end (the CLI reported
+ * 118,941 input tokens). Nothing here detects a provider that silently truncates an input.
+ */
+export const CODEX_REVIEWER_INPUT_MAX_BYTES = Math.floor((CODEX_GPT_6_1_SOL_USABLE_TOKENS - CODEX_GPT_6_1_SOL_INSTRUCTION_BYTES -
+  CODEX_REVIEWER_OUTPUT_RESERVE_TOKENS - CODEX_REVIEWER_TOOL_SCHEMA_RESERVE_TOKENS) / 1_000) * 1_000;
+
+/**
+ * A reviewer egress lease, waited for no longer than `budgetMs`. The lease is serialized in this
+ * process, so a packet reviewer holding it makes this wait; past the budget the caller fails. The
+ * queued acquisition cannot be withdrawn, so whatever it later obtains is the caller's and is released
+ * here once it arrives. Nothing another holder acquired is touched.
+ */
+const reviewerEgressWithin = async (
+  config: ReviewerEgressConfig | undefined,
+  provider: string,
+  budgetMs: number,
+): Promise<ReviewerEgressLease> => {
+  const pending = acquireReviewerEgress(config, provider);
+  let timer: NodeJS.Timeout | undefined;
+  const spent = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), Math.max(0, budgetMs));
+  });
+  try {
+    const lease = await Promise.race([pending, spent]);
+    if (lease) return lease;
+  } finally {
+    clearTimeout(timer);
+  }
+  void pending.then((late) => late.abandon(), () => undefined);
+  throw new Error(`the reviewer egress lease did not come free within ${budgetMs}ms; another holder is using it`);
+};
+
+/**
+ * One `CodexCliAdapter.probeCapacity` call's egress-boundary refusal, if its collector met one. The collector
+ * reports a failure only as text, so the refusal is carried beside it as a fact rather than parsed back out.
+ */
+const boundaryRefusals = new AsyncLocalStorage<{ refusal: string | null }>();
+
+/** Records a profile, sandbox or proxy failure as this probe call's boundary refusal, and throws it. */
+const refuse = (error: unknown): never => {
+  const scope = boundaryRefusals.getStore();
+  if (scope && scope.refusal === null) scope.refusal = error instanceof Error ? error.message : String(error);
+  throw error;
+};
+
+/**
+ * Why a credential path cannot be protected by a write deny on that one path, or null when it can. A
+ * symbolic link resolves elsewhere and a hard link has other names, and seatbelt matches the path a write
+ * goes through. Metadata only: the file is never opened. A missing credential is protected, since the
+ * deny also refuses creating it.
+ */
+const linkedCredential = (path: string): string | null => {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? null : "cannot be inspected";
+  }
+  if (stat.isSymbolicLink()) return "is a symbolic link";
+  if (!stat.isFile()) return "is not a regular file";
+  return stat.nlink > 1 ? `has ${stat.nlink} hard links` : null;
+};
+
+/**
+ * Whether a failed app-server read under the composed profile was the confinement refusing the launch.
+ * Fail closed: it is *not* a refusal only when the process provably ran — its exit was confirmed, with a
+ * status of its own that is not the launcher's. A launcher that never spawned (EAGAIN, ENOENT, EACCES), an
+ * exit that was never confirmed, an exit by a signal (this probe's own cleanup kill, the launcher's, or
+ * anyone else's — the signal can replace a refusal status the launcher was about to report), and a failure
+ * of unknown shape are refusals; so are sandbox-exec's own statuses (65 for a profile it rejects, 71 when it
+ * cannot apply it or exec), and `env`'s 126 for an executable the profile denied when the file itself is
+ * executable, so a bad install still reads as a runtime that cannot run.
+ */
+const launchRefused = (error: unknown, executable: string): boolean => {
+  if (!(error instanceof CodexAppServerFailed) || error.launch.kind !== "exited") return true;
+  const { exitCode } = error.launch;
+  if (exitCode === null || exitCode === 65 || exitCode === 71) return true;
+  if (exitCode !== 126) return false;
+  try {
+    accessSync(executable, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * The Codex capacity probe's `app-server`, run under the packet reviewer's own composed profile.
+ *
+ * The app-server reads the authenticated Codex home a default-home reviewer runs under, so it gets the
+ * reviewer's boundary: the owner's egress profile composed with the reviewer profile generated here,
+ * through a reviewer egress lease of its own, plus one rule — the home's `auth.json` stays readable but
+ * cannot be written, truncated, renamed or unlinked. There is no unconfined fallback: no `sandbox-exec`,
+ * a missing or refused profile, a proxy that does not start or dies, or a lease that does not come free
+ * within the probe's budget is the probe's failure, which the collector reports as an ERROR reading with
+ * no buckets. The lease, packet directory and profile file are this probe's and are released on every exit.
+ *
+ * A profile, sandbox or proxy failure is also a boundary refusal, recorded for `CodexCliAdapter.probeCapacity`
+ * (`boundaryRefusals`), which then starts no `--version` beside it: a home that cannot be resolved, a linked
+ * credential, a profile sandbox-exec does not accept, a launch that failed or whose exit is unknown
+ * (`launchRefused`), and a proxy that fails. A lease that is only busy, a spent budget and an app-server that
+ * provably ran and failed are not refusals.
+ */
+export class ReviewerProfiledCodexRateLimitProbe implements CodexRateLimitProbe {
+  constructor(
+    private readonly options: { egress: ReviewerEgressConfig | undefined; provider: string; denyReadPaths: readonly string[] },
+  ) {}
+
+  async read(input: { binary: string; timeoutMs: number; codexHome: string }): Promise<unknown> {
+    const deadline = Date.now() + input.timeoutMs;
+    if (!existsSync("/usr/bin/sandbox-exec")) {
+      refuse(new Error("runtime filesystem confinement is unavailable; the Codex capacity probe does not run unconfined"));
+    }
+    // The profile is built around the resolved home; with none to resolve there is nothing to confine.
+    let home: string;
+    try {
+      home = realpathSync(input.codexHome);
+    } catch (error) {
+      return refuse(new Error(
+        `the Codex home ${input.codexHome} cannot be resolved, so the capacity probe has no home to confine: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      ));
+    }
+    const credential = join(home, "auth.json");
+    const linked = linkedCredential(credential);
+    if (linked !== null) {
+      refuse(new Error(`the Codex credential ${credential} ${linked}; its write deny names one path, so a linked credential is refused`));
+    }
+    const lease = await reviewerEgressWithin(this.options.egress, this.options.provider, input.timeoutMs)
+      .catch((error: unknown) => error instanceof ReviewerEgressError ? refuse(error) : Promise.reject(error));
+    const proxyDied = (): never =>
+      refuse(new ReviewerEgressError("REVIEWER_EGRESS_PROXY_DIED", "reviewer egress proxy died while the Codex capacity probe was running"));
+    let packetRoot: string | null = null;
+    let profileDirectory: string | null = null;
+    try {
+      let launch: CodexAppServerLaunch;
+      let native: string;
+      let generated: string;
+      let composedProfilePath: string;
+      try {
+        packetRoot = realpathSync(mkdtempSync(join(tmpdir(), "acp-codex-capacity-")));
+        profileDirectory = acpScratchDir("acp-codex-capacity-");
+        const executables = codexReviewerExecutables(input.binary);
+        native = executables.at(-1)!;
+        generated = reviewerProfile(
+          packetRoot,
+          this.options.denyReadPaths,
+          native,
+          codexCredentialPaths(home),
+          executables,
+          lease.port,
+          undefined,
+          home,
+        );
+        // Last, so it wins over the home's read/write reopening: SBPL takes the last matching rule.
+        const authDeny = `(deny file-write* (literal ${quote(credential)}))`;
+        composedProfilePath = join(profileDirectory, "codex-capacity.sb");
+        writeFileSync(composedProfilePath, `${composeReviewerProfile(lease.profileText, generated)}${authDeny}\n`, { mode: 0o600 });
+        launch = {
+          file: "/usr/bin/sandbox-exec",
+          args: reviewerSandboxArgs(generated, native, ["app-server", "--stdio"], lease, composedProfilePath),
+          env: codexReviewerEnvironment(packetRoot, home),
+          cwd: packetRoot,
+        };
+      } catch (error) {
+        return refuse(error);
+      }
+      // The reviewer's own first check: sandbox-exec must accept and apply the composed profile, through the
+      // same launcher, with the runtime it permits — before Codex is started under it.
+      const accepted = await profileAccepted(generated, packetRoot, launch.env, Math.max(1, deadline - Date.now()), lease, composedProfilePath);
+      if (!accepted.accepted) {
+        if (lease.died()) proxyDied();
+        refuse(new Error(
+          `the composed reviewer profile was not accepted by sandbox-exec (exit ${String(accepted.exitCode)}` +
+            `${accepted.timedOut ? ", timed out" : ""}): ${(accepted.stderr || accepted.stdout).trim().slice(0, 300)}`,
+        ));
+      }
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) throw new Error("the Codex capacity probe's budget was spent before its app-server could start");
+      const answer = await new SpawnCodexRateLimitProbe()
+        .read({ binary: native, timeoutMs: remainingMs, codexHome: input.codexHome, launch })
+        .catch((error: unknown) => {
+          if (lease.died()) return proxyDied();
+          if (launchRefused(error, native)) {
+            return refuse(new Error(
+              `the Codex app-server's launch under the composed reviewer profile failed: ${error instanceof Error ? error.message : String(error)}`,
+            ));
+          }
+          return Promise.reject(error);
+        });
+      if (lease.died()) proxyDied();
+      return answer;
+    } finally {
+      await lease.abandon();
+      if (packetRoot) rmSync(packetRoot, { recursive: true, force: true });
+      if (profileDirectory) rmSync(profileDirectory, { recursive: true, force: true });
+    }
+  }
+}
+
+/** The packet reviewer's scope, with the check of the egress boundary that reviewer runs behind. */
+export type CodexPacketReviewerScope = PacketReviewerScope & {
+  /**
+   * Acquires and releases a reviewer egress lease, starting no Codex process: the owner profile is
+   * present, readable and holds the contract, the proxy starts and attests the generated allowlist.
+   * Rejects with the `ReviewerEgressError` that names what failed.
+   */
+  readonly verifyReviewerEgress: () => Promise<void>;
+};
+
 /**
  * Codex CLI adapter. Preferred runtime for the blind reviewer (GPT-6.1 Sol at xhigh
  * effort, §18.1) and for mechanical worker tasks.
@@ -2999,19 +3373,34 @@ export class CodexCliAdapter implements ProviderAdapter {
     // One home for this account, handed to the capacity probe explicitly so the quota it reads and
     // the identity a default-home reviewer runs under cannot drift apart.
     this.#codexHome = options.codexHome ?? defaultCodexHome();
+    // The app-server reads the account home the default-home reviewer runs under, so it runs under
+    // that reviewer's composed profile and egress, on every path that collects (daemon start, doctor,
+    // the periodic sweep, admission). No profile, no proxy: no reading.
     this.#usageCollector = options.usageCollector ?? new CodexUsageCollector({
       clock: this.#clock,
       binary: this.#binary,
       codexHome: this.#codexHome,
+      codexRateLimits: new ReviewerProfiledCodexRateLimitProbe({
+        egress: this.#reviewerEgress,
+        provider: this.provider,
+        denyReadPaths: this.#denyReadPaths,
+      }),
     });
   }
 
   /**
    * The packet reviewer's Codex home as the shared predicate reads it — the same rule the doctor's
-   * `checkPacketReviewerScope` reports, evaluated for this adapter's override and default home.
+   * `checkPacketReviewerScope` reports, evaluated for this adapter's override and default home — and
+   * the check of its egress boundary, which the review gate awaits before any Codex process.
    */
-  packetReviewerScope(): PacketReviewerScope {
-    return packetReviewerScope(this.#reviewerCodexHome, this.#codexHome);
+  packetReviewerScope(): CodexPacketReviewerScope {
+    return {
+      ...packetReviewerScope(this.#reviewerCodexHome, this.#codexHome),
+      verifyReviewerEgress: async () => {
+        const lease = await acquireReviewerEgress(this.#reviewerEgress, this.provider);
+        await lease.abandon();
+      },
+    };
   }
 
   /**
@@ -3091,6 +3480,11 @@ export class CodexCliAdapter implements ProviderAdapter {
     this.#workerSessions.delete(handle.externalSessionId);
   }
 
+  /** `CODEX_REVIEWER_INPUT_MAX_BYTES` for the model it is derived for; no bound for any other. */
+  reviewerInputMaxBytes(model: string): number | undefined {
+    return model === "gpt-6.1-sol" ? CODEX_REVIEWER_INPUT_MAX_BYTES : undefined;
+  }
+
   /** A packet reviewer's request reaches `codex exec resume` as one string on stdin (`invokePacketReviewer`). */
   transmittedReviewerInput(request: Pick<InvocationRequest, "systemPrompt" | "prompt">): TransmittedInput {
     return { argv: [], stdin: reviewerTransportInput(request) };
@@ -3116,6 +3510,31 @@ export class CodexCliAdapter implements ProviderAdapter {
     if (request.isolation) {
       return this.invokePacketReviewer(request, started);
     }
+    // Only a GPT worker turn drops the outer profile; see `invokeExec`. It gets its own temporary
+    // directory, created per execution, outside the checkout and apart from the `-o` scratch, and
+    // removed here on every exit path. Nothing else removes or reuses it.
+    const gptWorkerTurn = request.readOnly === false
+      && request.externalSessionId !== undefined
+      && request.onSpawn !== undefined;
+    if (!gptWorkerTurn) return this.invokeExec(request, started, undefined);
+    const turnTemp = realpathSync(acpScratchDir("acp-codex-turn-"));
+    // Listed on every exit path once the invocation has ended, before the directory is removed: with
+    // the result, a broker refusal and a timeout included, or with the error the invocation threw.
+    // The removal cannot replace either; a failed one is noted on the listing.
+    let outcome: { result: InvocationResult } | { thrown: unknown };
+    try {
+      outcome = { result: await this.invokeExec(request, started, turnTemp) };
+    } catch (error) {
+      outcome = { thrown: error };
+    }
+    const listing = turnScratchListing(turnTemp);
+    const cleanup = removeTurnScratch(turnTemp);
+    const turnScratch = cleanup === undefined ? listing : { ...listing, cleanup };
+    if ("thrown" in outcome) throw new TurnScratchThrown(outcome.thrown, turnScratch);
+    return { ...outcome.result, turnScratch };
+  }
+
+  private async invokeExec(request: InvocationRequest, started: number, turnTemp: string | undefined): Promise<InvocationResult> {
     // Resolved: seatbelt matches real paths, and this directory is the one the child must be
     // able to write `-o` into. It is not the checkout; the guard still names that.
     const scratch = realpathSync(acpScratchDir("acp-codex-"));
@@ -3130,23 +3549,23 @@ export class CodexCliAdapter implements ProviderAdapter {
     args.push("-s", request.readOnly ? "read-only" : "workspace-write");
     // Only a GPT worker turn drops the outer profile. Codex `workspace-write` otherwise also
     // opens /tmp and $TMPDIR, and network follows `[sandbox_workspace_write]`. These keys are
-    // that table (codex 0.163.0): the checkout is the only writable root, and network is off.
+    // that table (codex 0.163.0): the checkout and the turn's own temporary directory are the only
+    // writable roots, and network is off. Without that directory the checkout was the only place
+    // a tool's temporary files and caches could land, and the turn was refused for them.
     // `--ignore-user-config` skips only `$CODEX_HOME/config.toml`. A project `.codex/config.toml`
-    // or a profile can still grant `writable_roots`, so the worker pins that list to empty on
-    // the `-c` layer, which overrides those surviving layers. Login probes, read-only exec, and
+    // or a profile can still grant `writable_roots`, so the worker pins that list on the `-c`
+    // layer, which overrides those surviving layers. Login probes, read-only exec, and
     // a writable exec that forgot `onSpawn` do not get them. `-o` stays in ACP scratch, outside
     // the checkout. The parent Codex process writes that file after the turn; the path is not a
     // workspace-write root and is not passed with `--add-dir`, so a sandboxed shell cannot write
     // it. The ACP parent reads the file after the child exits.
-    const gptWorkerTurn = request.readOnly === false
-      && request.externalSessionId !== undefined
-      && request.onSpawn !== undefined;
+    const gptWorkerTurn = turnTemp !== undefined;
     if (gptWorkerTurn) {
       args.push(
         "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
         "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
         "-c", "sandbox_workspace_write.network_access=false",
-        "-c", "sandbox_workspace_write.writable_roots=[]",
+        "-c", `sandbox_workspace_write.writable_roots=${JSON.stringify([turnTemp])}`,
       );
     }
     // Codex rejects `--session-id`. The worker session is the argv element after `--thread-source`,
@@ -3178,7 +3597,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       // fails closed. The broker still authorises the checkout before launch.
       writablePaths: [...writablePaths, ...this.codexWritableRoots(scratch)],
       readablePaths: { subtrees: this.codexWritableRoots(scratch) },
-      ...(gptWorkerTurn ? { sandbox: "codex-workspace-write" as const, workerTurn: true, gitConfig: request.gitConfig } : {}),
+      ...(gptWorkerTurn ? { sandbox: "codex-workspace-write" as const, workerTurn: true, gitConfig: request.gitConfig, turnTemp } : {}),
       ...(tracked ? { onSpawn: request.onSpawn, signal: request.signal, reapProcessGroup: true as const } : {}),
     });
     let result: Awaited<ReturnType<typeof runCli>>;
@@ -3250,12 +3669,16 @@ export class CodexCliAdapter implements ProviderAdapter {
   }
 
   private async measureRuntime(): Promise<CapacityReading["runtimeHealth"]> {
+    // `--version` needs no account, so every Codex home this adapter knows is read-denied to it; the
+    // runtime profile already denies writes outside its scratch. It cannot read or change a login.
+    const authenticatedHomes = [this.#codexHome, defaultCodexHome(), this.#reviewerCodexHome]
+      .filter((home): home is string => Boolean(home));
     return measuredRuntimeHealth(
       await runCli(this.#binary, ["--version"], {
         cwd: undefined,
         timeoutMs: RUNTIME_PROBE_TIMEOUT_MS,
         environmentAllowlist: this.#environmentAllowlist,
-        denyReadPaths: this.#denyReadPaths,
+        denyReadPaths: [...this.#denyReadPaths, ...new Set(authenticatedHomes)],
         providerCredentialDir: this.#providerCredentialDir,
       }),
     );
@@ -3299,10 +3722,14 @@ export class CodexCliAdapter implements ProviderAdapter {
   }
 
   async probeCapacity(): Promise<CapacityReading> {
-    return resolveRuntimeHealth(
-      await this.#usageCollector.collect(),
-      () => this.measureRuntime(),
-    );
+    const boundary: { refusal: string | null } = { refusal: null };
+    const reading = await boundaryRefusals.run(boundary, () => this.#usageCollector.collect());
+    // The egress boundary refused (profile, sandbox or proxy): capacity is unknown, and no Codex process
+    // runs beside the refusal — a confined `--version` answering HEALTHY would invent a normal runtime.
+    if (boundary.refusal !== null) {
+      return { ...reading, sensorHealth: "ERROR", runtimeHealth: "UNKNOWN", buckets: [], error: boundary.refusal };
+    }
+    return resolveRuntimeHealth(reading, () => this.measureRuntime());
   }
 
   /**
@@ -3324,6 +3751,8 @@ export class CodexCliAdapter implements ProviderAdapter {
       reviewerEgress: this.#reviewerEgress,
       reviewerProvider: this.provider,
       reviewerEgressPhase: "session-bootstrap",
+      // Aborting ends the handshake's process group through runCli's own end path.
+      ...(spec.signal === undefined ? {} : { signal: spec.signal }),
     });
     if (!result.isolationEnforced || !result.egressEvidence || result.egressEvidence.length === 0) {
       throw new ProviderSessionProvisionError(
@@ -3420,6 +3849,8 @@ export class CodexCliAdapter implements ProviderAdapter {
       reviewerEgress: this.#reviewerEgress,
       reviewerProvider: this.provider,
       reviewerEgressPhase: "reviewer-invocation",
+      // Aborting ends the reviewer's process group through runCli's own end path.
+      ...(request.signal === undefined ? {} : { signal: request.signal }),
     }).finally(() => { constituted.busy = false; });
     const observedSessionId = codexThreadId(result.stdout);
     const sessionMatches = !observedSessionId || observedSessionId === expectedSessionId;

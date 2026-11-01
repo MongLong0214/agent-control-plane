@@ -2,14 +2,17 @@ import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
 import { MCP_MUTATION_RECOVERY } from "../core/mcp-recovery.ts";
 import { randomUUID } from "node:crypto";
 
+import { processGroupEmpty } from "../bootstrap/attempt-writer-group.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
+import { readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
+import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { fixedRuntimes } from "../domain/fixed-role-runtime.ts";
 import { Role, type RoleBinding, RunKind, SessionLifecycle } from "../domain/types.ts";
-import { HOLDER_CLAIMED_KINDS } from "../outbox/envelope.ts";
+import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -23,6 +26,7 @@ import type {
   SessionRelayRoute,
   SessionTurnResult,
 } from "./provider.ts";
+import type { SessionTurnSpawnRequest } from "./cli-adapters.ts";
 
 /**
  * The daemon's take-once launch channel, as the runtime driver uses it: open it, offer one
@@ -247,6 +251,19 @@ interface TurnLane {
 export const SESSION_WAKE_TRIGGER_COMPLETED = "SESSION_WAKE_TRIGGER_COMPLETED";
 
 /**
+ * O4 (D2) — a work turn about to reach its provider, recorded before the spawn. Its `SESSION_TURN` names
+ * it (`startedEventId`) once the provider has answered; one with no `SESSION_TURN` was started by a runtime
+ * that never saw it end.
+ */
+export const SESSION_TURN_STARTED = "SESSION_TURN_STARTED";
+
+/**
+ * O4 (D2) — the process that turn's own spawn created (`pid`, and `startedAt`, its start token as the daemon
+ * read it), recorded in the spawn's tick. While it is still that process the turn may still be running.
+ */
+export const SESSION_TURN_SPAWNED = "SESSION_TURN_SPAWNED";
+
+/**
  * #246 C1b — drives a provisioned (non-canonical) CTO session's real headless runtime: the daemon's
  * one source of its turns, the holder of its credential, and the judge of its readiness.
  *
@@ -281,6 +298,10 @@ export class ProvisionedSessionRuntime {
   /** Conversations not opened by a work turn yet; readiness no longer opens them. */
   readonly #newConversations = new Set<string>();
   readonly #lanes = new Map<string, TurnLane>();
+  /** O4 (D2) — the `SESSION_TURN_STARTED` event ids of every turn this runtime started. */
+  readonly #ownTurns = new Set<number>();
+  /** O4 (D2) — those of them still running: the lane's current turn, never judged against itself. */
+  readonly #runningTurns = new Set<number>();
 
   constructor(
     private readonly ports: ProvisionedSessionRuntimePorts,
@@ -445,7 +466,7 @@ export class ProvisionedSessionRuntime {
       }
       const current = this.turnEligibility(sessionId, "attestation", conversation, spawn);
       if (!current.allowed) return current;
-      if (conversation === "new" || !this.ports.audit.byKind("SESSION_TURN").some((event) => event.sessionId === sessionId)) {
+      if (conversation === "new" || !this.#turnAttempted(sessionId)) {
         this.#newConversations.add(sessionId);
       }
       return allow(ReasonCode.OK, undefined);
@@ -473,7 +494,7 @@ export class ProvisionedSessionRuntime {
       if (await adapter.value.probeRuntime() === "UNAVAILABLE") {
         return deny(ReasonCode.SESSION_NOT_READY, "the selected runtime is unavailable", { sessionId: session.sessionId });
       }
-      const attempted = this.ports.audit.byKind("SESSION_TURN").some((event) => event.sessionId === session.sessionId);
+      const attempted = this.#turnAttempted(session.sessionId);
       const conversation = resume && attempted ? "resume" : "new";
       if (await adapter.value.probeSession(handleFor(session), { conversation }) === "UNAVAILABLE") {
         return deny(ReasonCode.SESSION_NOT_READY, "the provider no longer has this session", { sessionId: session.sessionId });
@@ -512,6 +533,8 @@ export class ProvisionedSessionRuntime {
     // Admission only: the turn asks again when it runs (`#turn`).
     const eligible = this.turnEligibility(binding.sessionId, "work");
     if (!eligible.allowed) return eligible as Decision<"STARTED" | "COALESCED">;
+    const settled = this.#turnInDoubt(binding.sessionId);
+    if (!settled.allowed) return settled as Decision<"STARTED" | "COALESCED">;
     const lane = this.#lane(binding.sessionId);
     const fresh = triggers.filter((trigger, index) =>
       (!lane.claimed.has(trigger.id) || (lane.pending > 0 && (this.#isEnvelope(trigger.id) || trigger.served !== undefined) && !lane.coalesced.some((queued) => queued.id === trigger.id))) &&
@@ -566,7 +589,8 @@ export class ProvisionedSessionRuntime {
         const ownerMail = this.ports.outbox.hasHolderMessagesFor({ roleKey: binding.roleKey,
           bindingGeneration: binding.bindingGeneration, targetSessionId: binding.sessionId,
           sessionIncarnation: binding.sessionIncarnation });
-        return workPrompt(binding, admitted, admitted.some((trigger) => this.#concernsStandardWork(trigger)), ownerMail);
+        return workPrompt(binding, admitted, admitted.some((trigger) => this.#concernsStandardWork(trigger)), ownerMail,
+          admitted.some((trigger) => this.#isUnjudgedReviewNotice(trigger)));
       };
       const turn = await this.#turn(binding.sessionId, "resume", prompt, {
         relay: true,
@@ -634,6 +658,16 @@ export class ProvisionedSessionRuntime {
     if (trigger.kind.startsWith(STANDARD_CONTINUATION_KIND_PREFIX)) return true;
     const runId = this.ports.outbox.get(trigger.id)?.runId ?? null;
     return runId !== null && this.ports.runs.get(runId)?.kind === RunKind.STANDARD_WORK;
+  }
+
+  /**
+   * F1 — whether a trigger names a review-unavailable notice (`CandidatePipeline.noticeUnjudgedReview`): a
+   * REVISION_REQUEST that asks for no revision. Only such a turn's prompt carries the line that says so, so every
+   * other turn's prompt is exactly what it was.
+   */
+  #isUnjudgedReviewNotice(trigger: SessionWakeTrigger): boolean {
+    const message = this.ports.outbox.get(trigger.id);
+    return message?.kind === MessageKind.REVISION_REQUEST && (message.payload as { stage?: unknown } | null)?.stage === "review-unavailable";
   }
 
   /** Whether this trigger names an outbox row: its settlement is then the row's, not this lane's. */
@@ -744,6 +778,9 @@ export class ProvisionedSessionRuntime {
     }
     const handle = handleFor(session);
     let delivered = false;
+    // O4 — the entry this turn's credential waits in on the launch channel, kept so that the turn's own
+    // spawn can be pinned in it (`pinTurn`).
+    let launch: SessionLaunchCredential | null = null;
     if (turn.relay) {
       if (!this.#route || !this.#delivery) {
         return deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "no route to the daemon is attached for a session turn", {
@@ -760,12 +797,13 @@ export class ProvisionedSessionRuntime {
       if (!prepared.allowed) return prepared as Decision<SessionTurnResult>;
       // A credential left over from a turn that never withdrew it is not this turn's to reuse.
       this.#delivery.withdraw(handle.externalSessionId);
-      const provisioned = await this.#delivery.provision({
+      launch = {
         sessionId,
         sessionIncarnation: session.incarnation,
         externalSessionId: handle.externalSessionId,
         sessionSecret: held.sessionSecret,
-      });
+      };
+      const provisioned = await this.#delivery.provision(launch);
       if (!provisioned.allowed) return provisioned as Decision<SessionTurnResult>;
       delivered = true;
     }
@@ -789,6 +827,12 @@ export class ProvisionedSessionRuntime {
       if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
       return refused(now);
     }
+    // O4 (D2) — never a second turn of a conversation while an earlier runtime's turn of it may still run.
+    const settled = this.#turnInDoubt(sessionId);
+    if (!settled.allowed) {
+      if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
+      return refused(settled);
+    }
     // And, last, the triggers' own gate: a turn left with no trigger to serve (woken only by
     // mentions whose identity, role or room no longer stands behind this holder, or that another
     // turn has already served) is refused here with the gate's own answer, after every await and
@@ -799,17 +843,43 @@ export class ProvisionedSessionRuntime {
       return refused(wanted);
     }
     const text = typeof prompt === "string" ? prompt : prompt();
-    if (turn.purpose === "work" && this.#newConversations.delete(sessionId)) conversation = "new";
+    const opens = turn.purpose === "work" && this.#newConversations.has(sessionId);
+    // O4 (D2) — the turn's intent, durable before its provider spawns: a runtime that starts after this
+    // one died sees that the conversation was attempted (`#turnAttempted`) and that this turn may still be
+    // running (`#turnInDoubt`), not only what a returned turn recorded.
+    const intent = this.ports.audit.record({
+      kind: SESSION_TURN_STARTED,
+      sessionId,
+      evidence: { purpose: turn.purpose, step: opens ? "new" : conversation },
+    });
+    if (!intent.allowed) {
+      if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
+      return refused(intent as Decision<unknown> as Decision<void>);
+    }
+    const startedEventId = intent.value;
+    this.#ownTurns.add(startedEventId);
+    this.#runningTurns.add(startedEventId);
+    // D2-R2 — set only by the adapter's positive statement that nothing of this turn outlives it.
+    let processGroupEnded = false;
+    if (opens) {
+      this.#newConversations.delete(sessionId);
+      conversation = "new";
+    }
     let result: SessionTurnResult;
     try {
-      result = await provider.runSessionTurn({
+      const request: SessionTurnSpawnRequest = {
         handle,
         conversation,
         prompt: text,
         timeoutMs: turn.timeoutMs,
         correlationId: `turn_${randomUUID()}`,
         relay: turn.relay ? this.#route : null,
-      });
+        onSpawn: (pid) => this.#recordTurnProcess(sessionId, startedEventId, pid, launch),
+        onProcessGroupEnded: () => {
+          processGroupEnded = true;
+        },
+      };
+      result = await provider.runSessionTurn(request);
     } catch (error) {
       result = {
         ok: false,
@@ -850,8 +920,13 @@ export class ProvisionedSessionRuntime {
         sameConversationId: result.providerSessionId === handle.externalSessionId,
         // #1104 — the turn's own process group, when its cleanup could not confirm it ended.
         ...(result.processGroup === undefined ? {} : { processGroup: result.processGroup }),
+        // O4 (D2) — the start this turn ends, and (D2-R2) only when the adapter confirmed it, that its
+        // process group ended with it. An unconfirmed cleanup is never recorded as an end.
+        startedEventId,
+        ...(processGroupEnded && result.processGroup === undefined ? { processGroupEnded: true } : {}),
       },
     });
+    this.#runningTurns.delete(startedEventId);
     if (!completed) {
       return deny(
         ReasonCode.SESSION_TURN_FAILED,
@@ -869,6 +944,70 @@ export class ProvisionedSessionRuntime {
       );
     }
     return allow(ReasonCode.OK, result);
+  }
+
+  /**
+   * O4 — a turn's spawn, reported in its own tick (`SessionTurnSpawnRequest`): the pid the daemon's own
+   * spawn returned and that process's start token, read here from the kernel and never taken from a
+   * report. A relayed turn's pending launch entry is pinned to it before the CLI can start the MCP child
+   * that asks for the credential; and (D2) it is recorded durably, so a restarted daemon can tell whether
+   * the turn is still running. The session never reports either value.
+   */
+  #recordTurnProcess(sessionId: string, startedEventId: number, pid: number, launch: SessionLaunchCredential | null): void {
+    const startedAt = readProcessStartToken(pid);
+    if (launch !== null) launch.pin = { pid, startToken: startedAt };
+    this.ports.audit.record({ kind: SESSION_TURN_SPAWNED, sessionId, evidence: { startedEventId, pid, startedAt } });
+  }
+
+  /** O4 (D2) — whether a turn of this session's conversation was ever started, returned or not. */
+  #turnAttempted(sessionId: string): boolean {
+    return [SESSION_TURN_STARTED, "SESSION_TURN"].some((kind) =>
+      this.ports.audit.byKind(kind).some((event) => event.sessionId === sessionId));
+  }
+
+  /**
+   * O4 (D2, D2-R2) — refuses while an earlier turn of this session's conversation may still be running.
+   * Fails closed: an earlier turn counts as ended only on positive evidence, and everything else keeps the
+   * conversation in doubt (`CONVERSATION_TURN_IN_DOUBT`) until that evidence exists.
+   *
+   * - Its `SESSION_TURN` records `processGroupEnded`: the adapter confirmed its group was seen empty after
+   *   its signal, or that it spawned nothing. A failed turn with an unconfirmed cleanup records no end.
+   * - Or the process its spawn recorded is observed gone: its group (the leader's pid) is empty, `kill(-pgid,
+   *   0)` ESRCH (`processGroupEmpty`), and the leader is DEAD by `probeSessionLiveness` (ESRCH, or a start
+   *   token read back that differs). A live member, EPERM, a token that cannot be read, or an unrecognised
+   *   one is not that evidence.
+   *
+   * A start with neither is in doubt — including one whose spawn was never recorded — with one exception:
+   * a turn this very runtime started, saw return, and whose adapter reported no process (a provider that
+   * does not report spawns). That one is serialized by this runtime's own lane, as every turn was before
+   * D2. The lane's current turn is never judged against itself.
+   */
+  #turnInDoubt(sessionId: string): Decision<void> {
+    const ofSession = (kind: string) => this.ports.audit.byKind(kind).filter((event) => event.sessionId === sessionId);
+    const ends = new Map(ofSession("SESSION_TURN").map((event) => [event.evidence["startedEventId"], event.evidence] as const));
+    const spawns = new Map(ofSession(SESSION_TURN_SPAWNED).map((event) => [event.evidence["startedEventId"], event.evidence] as const));
+    for (const started of ofSession(SESSION_TURN_STARTED)) {
+      const startedEventId = started.eventId;
+      if (this.#runningTurns.has(startedEventId)) continue;
+      const end = ends.get(startedEventId);
+      if (end?.["processGroupEnded"] === true) continue;
+      const spawn = spawns.get(startedEventId);
+      const pid = spawn?.["pid"];
+      if (typeof pid === "number") {
+        const startedAt = spawn?.["startedAt"];
+        if (processGroupEmpty(pid) === true &&
+          probeSessionLiveness(pid, typeof startedAt === "string" ? startedAt : null) === "DEAD") continue;
+      } else if (spawn === undefined && end !== undefined && this.#ownTurns.has(startedEventId)) {
+        continue;
+      }
+      return deny(ReasonCode.CONVERSATION_TURN_IN_DOUBT, "an earlier turn of this conversation is not proven to have ended", {
+        sessionId,
+        startedEventId,
+        pid: typeof pid === "number" ? pid : null,
+        ended: end !== undefined,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   #adapterFor(session: SessionRecord, role: Role): Decision<ProviderAdapter> {
@@ -1071,7 +1210,17 @@ export const standardWorkContinuationTriggerKind = (runId: string, taskId: strin
 export const standardWorkContinuationTriggerId = (runId: string, taskId: string, taskState: string): string =>
   `standard-work-continuation:${runId}:${taskId}:${taskState}`;
 
-const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[], standardWork: boolean, ownerMail: boolean): string =>
+/** F1 — the driven CTO's reading of a review-unavailable notice; see `#isUnjudgedReviewNotice`. */
+export const UNJUDGED_NOTICE_LINE =
+  "A REVISION_REQUEST whose payload stage is review-unavailable is a notice, never a revision: its review did not judge the product. " +
+  "For it, change no PLAN, task or code and do not provision or run a worker; take only its nextStep. " +
+  "RESUBMIT: once the result_submit of the attempt it names has answered, and only while its unjudgedAttempts is below its unjudgedAttemptLimit, submit that run's result once with mcp__acp-cto__result_submit and a new idempotencyKey. " +
+  "ESCALATE: report it for that run with mcp__acp-cto__escalation_open and do not resubmit. " +
+  "Then acknowledge it with mcp__acp-cto__run_ack.";
+
+export const workPrompt = (
+  binding: RoleBinding, triggers: readonly SessionWakeTrigger[], standardWork: boolean, ownerMail: boolean, unjudgedNotice = false,
+): string =>
   [
     `You are the ${binding.role}${binding.runId ? ` of run ${binding.runId}` : ""} in the agent control plane, at binding generation ${binding.bindingGeneration}.`,
     `The control plane woke you for: ${[...new Set(triggers.map((trigger) => trigger.kind))].join(", ")}.`,
@@ -1099,6 +1248,7 @@ const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[
         ]
       : []),
     `A REVISION_REQUEST for a run whose contract_get returned a bootstrapPlanGuide carries why its PLAN was sent back (the CEO's rationale, or the blind review's findings): for that run, ${PLAN_STEPS}, writing the new PLAN so that it addresses that reason; then acknowledge the REVISION_REQUEST with mcp__acp-cto__run_ack. If the run is ACTIVE, submit the new PLAN's result first, as above; a run the CEO sent back is ACTIVE again with its next RUN_DISPATCH.`,
+    ...(unjudgedNotice ? [UNJUDGED_NOTICE_LINE] : []),
     "An ESCALATION_REPLY is the CEO's resolution of the escalation it names (its escalationId) for a run you are the current owner of: act on it only when it is addressed to you as that run's current owner and names that run's escalation, and then only for that run. " +
       "Carry out its resolution, for example by planning that run again or submitting its result again as the lines above direct, then acknowledge the ESCALATION_REPLY with mcp__acp-cto__run_ack. " +
       "The resolution never bypasses the blind review or the CEO's CONFIRM: a new PLAN still goes through mcp__acp-cto__plan_submit and a result through mcp__acp-cto__result_submit, each with its normal gates. " +

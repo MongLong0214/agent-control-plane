@@ -3,8 +3,10 @@ import { TaskClass, type TaskCategory, type TaskClass as TaskClassValue } from "
 
 /** Versioned, structural facts only. No prompt, transcript, or raw provider output belongs here. */
 export const BASELINE_RECORD_SCHEMA_ID = "agent-control-plane.baseline-record.v1";
-export const RUN_EVIDENCE_EXPORT_SCHEMA_ID = "agent-control-plane.run-evidence-export.v1";
-export const BASELINE_EXPORT_SCHEMA_ID = "agent-control-plane.baseline-export.v1";
+// #1189 (b) — v2: the quality projection gained postMergeChecks and narrowed the post-merge fact. Reproduce and
+// verify accept only these ids; a v1 bundle is refused as a version mismatch (see evidenceExportRefusal).
+export const RUN_EVIDENCE_EXPORT_SCHEMA_ID = "agent-control-plane.run-evidence-export.v2";
+export const BASELINE_EXPORT_SCHEMA_ID = "agent-control-plane.baseline-export.v2";
 export const EXPERIMENT_ISOLATION_SCHEMA_ID = "agent-control-plane.experiment-isolation.v1";
 
 export const UsageSource = {

@@ -151,6 +151,7 @@ const EXPECTED_CONVERTED_SITES = [
   { file: "outbox/ceo-notification-ack.ts", symbol: "acknowledgeCeoNotification", label: "acknowledgeCeoNotification", evidence: "direct" },
   // The selected artifact must roll back if its attachment audit refuses, preserving the prior selection.
   { file: "bootstrap/bootstrap-review-evidence.ts", symbol: "attachBootstrapReviewEvidence", label: "attachBootstrapReviewEvidence", evidence: "direct" },
+  { file: "review/standard-review-evidence.ts", symbol: "attachStandardReviewEvidence", label: "attachStandardReviewEvidence", evidence: "direct" },
   { file: "bootstrap/bootstrap-plan-artifact.ts", symbol: "stageBootstrapPlan", label: "stageBootstrapPlan", evidence: "direct" },
   // Input storage, replacement invalidation and notification must roll back if enqueue/audit denies.
   { file: "bootstrap/bootstrap-plan-artifact.ts", symbol: "attachBootstrapPlan", label: "attachBootstrapPlan", evidence: "direct" },
@@ -219,6 +220,10 @@ const EXPECTED_CONVERTED_SITES = [
   // then a state UPDATE conditional on the state, hold, reason and owner pin it read; a run that moved in
   // between updates no row and is refused, and that refusal has to take the transition record back.
   { file: "run/run-engine.ts", symbol: "releaseContinuityHold", label: "RunEngine.releaseContinuityHold", evidence: "direct" },
+  // #1271: a cross-product split records the review's own frontier-simplify record, the CommitLore side
+  // and, when the frontier-simplify issue is already written, one linking item, each through `#store`'s
+  // audit write; a refused later side must take the earlier ones back, so no side stands without the other.
+  { file: "quality/upstream-dogfood.ts", symbol: "recordAcrossProducts", label: "DogfoodFindingStore.recordAcrossProducts", evidence: "helper:#store" },
 ];
 
 /**

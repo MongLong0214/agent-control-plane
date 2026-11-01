@@ -1,5 +1,6 @@
 import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
 import { attachBootstrapReviewEvidence, reviewEvidenceAttachAccess, reviewEvidenceAttachAuthority, type ReviewEvidenceInput } from "../bootstrap/bootstrap-review-evidence.ts";
+import { attachStandardReviewEvidence, standardReviewEvidenceAttachAccess, type StandardReviewEvidenceAttachInput } from "../review/standard-review-evidence.ts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
@@ -164,6 +165,9 @@ export const createHermesMcpPort = (
     attachBootstrapReviewEvidence: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: ReviewEvidenceInput) =>
       attachBootstrapReviewEvidence(source, peer, turn, input),
     reviewEvidenceAttachAccess: (input: ReviewEvidenceInput) => reviewEvidenceAttachAccess(source, input),
+    attachStandardReviewEvidence: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: StandardReviewEvidenceAttachInput) =>
+      attachStandardReviewEvidence(source, peer, turn, input),
+    standardReviewEvidenceAttachAccess: (input: StandardReviewEvidenceAttachInput) => standardReviewEvidenceAttachAccess(source, input),
     reviewEvidenceAttachAuthority: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined) =>
       reviewEvidenceAttachAuthority(source, peer, turn),
     attachBootstrapPlan: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: BootstrapPlanAttachInput) =>
@@ -483,6 +487,12 @@ const createHermesServerFromPort = (
           const access = port.ceoNotificationAckAccess(peer.value, admittedTurnOf(extra), args.messageId as string);
           return access.allowed ? authority : access;
         }
+        if (authority.allowed && toolName === "review_evidence_attach") {
+          const ceo = port.reviewEvidenceAttachAuthority(peer.value, admittedTurnOf(extra));
+          if (!ceo.allowed) return ceo;
+          const access = port.standardReviewEvidenceAttachAccess(args as unknown as StandardReviewEvidenceAttachInput);
+          return access.allowed ? authority : access;
+        }
         if (!authority.allowed || (toolName !== "bootstrap_plan_attach" && toolName !== "bootstrap_review_resume" && toolName !== "bootstrap_review_evidence_attach")) return authority;
         const identity = port.bootstrapPlanAttachAuthority(peer.value, admittedTurnOf(extra));
         if (!identity.allowed) return identity;
@@ -559,6 +569,15 @@ const createHermesServerFromPort = (
     async (args, extra) => write("bootstrap_review_evidence_attach", args, extra, () => {
       const peer = authenticateMcpPeer(authenticate);
       return peer.allowed ? respond(port.attachBootstrapReviewEvidence(peer.value, admittedTurnOf(extra), args)) : respond(peer);
+    }),
+  );
+  server.registerTool(
+    "review_evidence_attach",
+    { description: "Bind a STANDARD_WORK run owner's staged private review evidence bundle as this run's review input, by exact run/contract/stager/digest, after checking its sources. Current authenticated CEO owner or peer turn only. It is not owner approval, not a contract change and not a PASS: the bundle is attributed data for the reviewer. The next result_submit freezes it; refused while a submission is in flight. A replacement names replacesSha256 and leaves any earlier review or approval stale for CONFIRM; nothing is deleted.",
+      inputSchema: { ...mutation, runId: z.string(), contractDigest: z.string(), stagedBy: z.string(), expectedSha256: z.string(), replacesSha256: z.string().optional() } },
+    async (args, extra) => write("review_evidence_attach", args, extra, () => {
+      const peer = authenticateMcpPeer(authenticate);
+      return peer.allowed ? respond(port.attachStandardReviewEvidence(peer.value, admittedTurnOf(extra), args)) : respond(peer);
     }),
   );
   server.registerTool(

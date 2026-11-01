@@ -123,6 +123,13 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string; witn
       title: "rolls back review evidence attachment and audit on denial, preserving the current selection and retry" }],
   },
   {
+    label: "attachStandardReviewEvidence",
+    file: "review/standard-review-evidence.ts",
+    anchor: "): Decision<{ digest: string }> => source.db.txDecision(() => {",
+    witnesses: [{ file: "tests/unit/standard-review-evidence.test.ts",
+      title: "rolls back a replacement and its audit on denial, keeping the current selection" }],
+  },
+  {
     label: "resumeBootstrapReview",
     file: "bootstrap/bootstrap-plan-artifact.ts",
     anchor: "): Decision<ResumeReviewResult> => source.db.txDecision(() => {",
@@ -340,6 +347,12 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string; witn
     label: "RunEngine.releaseContinuityHold",
     file: "run/run-engine.ts",
     anchor: "  ): Decision<{ run: RunRow; released: boolean; kept: string | null }> {\n    return this.db.txDecision(() => {",
+  },
+  {
+    // #1271: a refused later side of a cross-product split is refused after an earlier side's audit write.
+    label: "DogfoodFindingStore.recordAcrossProducts",
+    file: "quality/upstream-dogfood.ts",
+    anchor: "    const [linking, commitloreHalf] = [sides[0]!.data, sides[1]!.data];\n    return this.#deps.db.txDecision(() => {",
   },
 ];
 

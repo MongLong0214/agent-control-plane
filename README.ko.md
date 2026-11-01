@@ -394,16 +394,14 @@ node dist/cli/agentctl.js baseline export --from <ISO-8601> --to <ISO-8601>
 |---|---|
 | **자격 증명** | GitHub 권한 자격 증명은 어느 프로젝트 저장소에도 속하지 않는 로컬 비밀 저장소에 있고, 데몬만 읽습니다. CTO, 워커, 리뷰어, 검증 하위 프로세스, Repo Factory, Buzz·Telegram 어댑터의 환경에는 절대 들어가지 않습니다. `ACP_MCP_TOKEN`과 `ACP_OPERATOR_TOKEN`은 서로 다른 값이며, 키체인에 보관하고 plist에는 저장하지 않습니다. |
 | **로컬 표면** | MCP 소켓과 운영자 소켓은 오너 전용(`0700`) 상태 디렉터리에 있고, 데이터베이스 파일 권한은 `0600`입니다. |
-| **검증** | 일회용 워크트리를 씁니다. 환경은 상속하지 않고 새로 구성하며 `HOME`과 `TMPDIR`은 scratch 안을 가리킵니다. seatbelt 프로필은 워크트리와 scratch 밖의 쓰기, 그리고 지정된 민감 경로의 읽기를 막습니다. 선언하면 네트워크를 차단하고, pid와 시작 시각으로 프로세스 신원을 잡아 둔 채 시간·RSS·출력에 한도를 둡니다. 가둘 수단이 없으면 명령을 실행하지 않습니다. |
+| **검증** | 언어 제한이 없습니다. 고정된 매니페스트가 선언한 명령만, 샌드박스 밖에서 확인한 절대 경로로, 일회용 워크트리에서 실행합니다. 환경은 상속하지 않고 새로 구성하며 토큰이나 에이전트 소켓 포인터를 담지 않습니다. `HOME`은 데몬의 홈, `TMPDIR`은 scratch입니다. seatbelt 프로필은 읽기·외부 네트워크·로컬 IPC를 열고, 쓰기는 워크트리·`TMPDIR`·지정된 툴체인 캐시로 제한하며, 지정된 비밀 경로의 읽기·쓰기·소켓 접근을 막습니다(최선의 노력이며 완전한 차단은 아닙니다). pid와 시작 시각으로 프로세스 신원을 잡아 둔 채 시간·RSS·출력에 한도를 둡니다. 가둘 수단이 없으면 명령을 실행하지 않습니다. |
 | **블라인드 리뷰어** | 조합된 seatbelt 프로필이 루프백 CONNECT 프록시 포트 하나만 남기고 원격 TCP·UDP를 모두 막습니다. 호출마다 선택된 프로바이더의 엔드포인트만 담은 허용 목록을 새로 만듭니다. 리뷰어가 증명(attest)하기 전에 허용·거부·직접 소켓 프로브를 실행하며, 하나라도 실패하면 `ISOLATION_LOST`입니다. |
 | **머지 게이트** | `merge_evaluate`는 게이트가 신뢰된 신원으로 만들어졌고, 페이로드 다이제스트가 로컬에 기록된 게시 내용과 일치하며, head가 머지하려는 정확한 head와 같을 때만 받아들입니다. 브랜치 보호는 심층 방어입니다. |
 | **인그레스** | 오너의 결정과 행위자 메시지는 `IngressGuard`가 선언된 신원과 대조해 받아들이며, 들어오는 메시지에는 재전송 방지가 걸려 있습니다. |
 
-검증 명령의 실행 파일 허용 목록은 심층 방어이지, 코드 실행 경계가 아닙니다.
-`node`, `npm`, `npx`, `vitest`는 범용 인터프리터라서 시작한 뒤 셸을 실행할 수 있습니다.
-실제 경계는 seatbelt와 리소스 샌드박스이며, 셸 내부 회귀 증명은 [`tests/unit/handoff-p1-boundaries.test.ts`](tests/unit/handoff-p1-boundaries.test.ts)에 있습니다.
-샌드박스의 읽기 제한이 화이트리스트가 아니라 지정된 거부 목록인 이유는, 읽기를 통째로 막으면 Node가 로드 단계에서 중단되기 때문입니다.
-이 결정은 재검토 조건과 함께 [설계 결정](docs/design-decisions.md)에 기록돼 있습니다.
+검증 명령에는 실행 파일 허용 목록이 없습니다(2026-10-31 오너 지시). argv[0]에는 어떤 실행 파일이든 올 수 있습니다. 선언된 명령은 어느 것이든 시작한 뒤 셸을 실행할 수 있어서, 목록은 원래 경계가 아니었습니다.
+실제 경계는 seatbelt와 리소스 샌드박스이며, 셸 내부 회귀 증명은 [`tests/unit/handoff-p1-boundaries.test.ts`](tests/unit/handoff-p1-boundaries.test.ts), 비밀 경로 가드의 증명은 [`tests/unit/the-verification-sandbox-opens-to-every-language.test.ts`](tests/unit/the-verification-sandbox-opens-to-every-language.test.ts)에 있습니다.
+샌드박스의 읽기 제한은 화이트리스트가 아니라 지정된 비밀 경로의 거부 목록이며([설계 결정](docs/design-decisions.md)), 최선의 노력입니다. 목록 밖에 둔 자격 증명은 읽힙니다([ADR-0004](docs/adr/ADR-0004-verification-sandbox-isolation.md)).
 
 **명시된 잔여 위험** ([SECURITY.md](docs/SECURITY.md), [STATUS.md](docs/STATUS.md)):
 
@@ -438,8 +436,8 @@ node dist/cli/agentctl.js baseline export --from <ISO-8601> --to <ISO-8601>
   이 가운데 어느 것도 `evidence/`에 기록이 없습니다.
 - **리뷰어 이그레스:** 패킷만 보는 블라인드 리뷰어에는 측정을 거쳤고 실패하면 닫히는 프로바이더 프록시 경계가 있습니다.
   다만 배포 수준의 증거 요구는 아직 남아 있다고 [SECURITY.md](docs/SECURITY.md)에 기록돼 있습니다([리뷰어 이그레스](docs/reviewer-egress.md)).
-- **검증 입력:** 새 워크트리에는 커밋된 파일만 있습니다. `node_modules`도 빌드 캐시도 없고, `network: "deny"`이면 받아 올 수도 없습니다.
-  그래서 프로젝트에는 설치된 의존성이 필요 없는 검증 명령(이 저장소의 `scripts/verify-reason-codes.mjs`가 그런 예입니다)이나, 승인된 워크플로 다이제스트에서 나온 CI 결과를 정확한 후보 head에서만 받아들이는 `evidenceMode: "TRUSTED_CI"` 중 하나가 필요합니다.
+- **검증 입력:** 새 워크트리에는 커밋된 파일만 있습니다. `node_modules`도 빌드 결과물도 없습니다.
+  샌드박스의 네트워크는 의존성 조회와 다운로드를 위해 열려 있고 `HOME` 아래 지정된 툴체인 캐시에 쓸 수 있으므로, 명령이 필요한 것을 직접 설치할 수 있습니다. 내려받을 필요가 없는 길은 의존성 없는 검증 명령(이 저장소의 `scripts/verify-reason-codes.mjs`가 그런 예입니다)이나, 승인된 워크플로 다이제스트에서 나온 CI 결과를 정확한 후보 head에서만 받아들이는 `evidenceMode: "TRUSTED_CI"`입니다.
   프로젝트 매니페스트에서 `network: "allowlist"`는 여전히 지원하지 않습니다.
 - **테스트 커버리지의 의미:** `pnpm trace`는 PRD와 새로 실행한 Vitest 결과로 [추적성 증거](evidence/traceability.md)를 만듭니다.
   이것이 재는 것은 선언 커버리지, 즉 라벨이 붙은 테스트 항목이 실행돼 통과했는지입니다. 동작 커버리지나 프로덕션 진입점 커버리지는 재지 않습니다.
@@ -512,7 +510,7 @@ pnpm gates           # CI verify 순서를 로컬에서 실행
 - 로컬 테스트, 픽스처, 모델링한 어댑터, 템플릿을 GitHub·Buzz·Telegram·launchd·프로바이더·오너의 실환경 증거처럼 내세우지 마세요.
 - 커밋 메시지에는 외부 작업 세션 페이지 링크를 넣을 수 없습니다. `commit-msg` 훅과 `pnpm trailers`가 이를 거부합니다.
 - 풀 리퀘스트는 `pnpm merge <number> --subject <text> --body-file <path>`([`scripts/merge-pr.mjs`](scripts/merge-pr.mjs))로 머지합니다.
-  이 스크립트는 정확한 head에서 필수 `verify` 실행 결과를 확인하고, 일반 squash 머지였다면 사라졌을 커밋 기록을 보존합니다.
+  이 스크립트는 정확한 head에서 필수 `verify` 실행 결과를 확인하고, 일반 merge commit으로만 머지한 뒤 부모·tree·브랜치 커밋의 CommitLore notes가 origin에 있는지 다시 읽어 확인합니다.
 
 ## 라이선스
 

@@ -1,3 +1,7 @@
+import { createHash } from "node:crypto";
+
+import { acpError } from "../../src/core/errors.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
 
 export interface FakePull {
@@ -48,6 +52,18 @@ export class FakeGitHub implements GitHubClient {
   commitParents = new Map<string, string[]>();
   /** When set, the next merge records this sha as the merge commit's first parent. */
   driftBaseTo: string | null = null;
+  /** sha -> its tree. A commit not named here has a tree derived from its sha; a merge takes its head's. */
+  commitTrees = new Map<string, string>();
+  /** When set, the next merge records this tree instead of its head's. */
+  nextMergeTree: string | null = null;
+  /** Heads that do not contain the base they are compared with; every other head does. */
+  headsMissingBase = new Set<string>();
+  /** `refs/notes/commitlore` as the Git Data API sees it: its commit, and each notes commit's tree (path -> blob). */
+  notesRef: string | null = null;
+  notesCommits = new Map<string, { tree: string; parents: string[] }>();
+  notesTrees = new Map<string, Map<string, string>>();
+  /** When true, the next write to the notes ref is refused, as a protected or diverged ref would be. */
+  refuseNotesWrite = false;
   /** Lets a scenario use a real local candidate commit for trusted workflow-file inspection. */
   nextMergeSha: string | null = null;
   /** Synchronous hook used to model Actions publishing its exact-merge check before a reread. */
@@ -126,6 +142,8 @@ export class FakeGitHub implements GitHubClient {
       const firstParent = this.driftBaseTo ?? pull.base.sha;
       this.driftBaseTo = null;
       this.commitParents.set(mergeSha, [firstParent, pull.head.sha]);
+      this.commitTrees.set(mergeSha, this.nextMergeTree ?? this.treeOf(pull.head.sha));
+      this.nextMergeTree = null;
       // GitHub's merged-PR resource retains the base snapshot it was opened against;
       // the separate target ref is the mutable source of truth after a merge.
       pull.merge_commit_sha = mergeSha;
@@ -172,10 +190,10 @@ export class FakeGitHub implements GitHubClient {
       return { ...run, id, repository: { id: 42, full_name: /(?:^|\/)repos\/([^/]+\/[^/]+)\//.exec(path)![1] } } as unknown as T;
     }
 
-    if (method === "GET" && /\/commits\/[^/]+$/.test(path)) {
+    if (method === "GET" && /\/commits\/[^/]+$/.test(path) && !path.includes("/git/commits/")) {
       const sha = /\/commits\/([^/]+)$/.exec(path)![1]!;
       const parents = this.commitParents.get(sha) ?? [];
-      return { sha, parents: parents.map((p) => ({ sha: p })) } as unknown as T;
+      return { sha, parents: parents.map((p) => ({ sha: p })), commit: { tree: { sha: this.treeOf(sha) } } } as unknown as T;
     }
 
     if (method === "GET" && /\/contents\//.test(path)) {
@@ -191,6 +209,52 @@ export class FakeGitHub implements GitHubClient {
         encoding: "base64",
         content: Buffer.from(content, "utf8").toString("base64"),
       } as unknown as T;
+    }
+
+    // --- the CommitLore notes ref, through the Git Data API -----------------
+    if (method === "GET" && /\/git\/ref\/notes\/commitlore$/.test(path)) {
+      if (!this.notesRef) throw acpError(ReasonCode.PROBE_FAILED, "404 Not Found", { status: 404 });
+      return { ref: "refs/notes/commitlore", object: { sha: this.notesRef, type: "commit" } } as unknown as T;
+    }
+    if (method === "GET" && /\/git\/commits\/[0-9a-f]{40}$/.test(path)) {
+      const commit = this.notesCommits.get(/([0-9a-f]{40})$/.exec(path)![1]!);
+      if (!commit) throw acpError(ReasonCode.PROBE_FAILED, "404 Not Found", { status: 404 });
+      return { tree: { sha: commit.tree }, parents: commit.parents.map((sha) => ({ sha })) } as unknown as T;
+    }
+    if (method === "GET" && /\/git\/trees\/[0-9a-f]{40}\?recursive=1$/.test(path)) {
+      const tree = this.notesTrees.get(/trees\/([0-9a-f]{40})/.exec(path)![1]!);
+      if (!tree) throw acpError(ReasonCode.PROBE_FAILED, "404 Not Found", { status: 404 });
+      return { tree: [...tree].map(([entry, sha]) => ({ path: entry, type: "blob", mode: "100644", sha })), truncated: false } as unknown as T;
+    }
+    if (method === "POST" && /\/git\/blobs$/.test(path)) {
+      const content = Buffer.from((body as { content: string }).content, "base64");
+      const sha = createHash("sha1").update(Buffer.concat([Buffer.from(`blob ${content.length}\0`), content])).digest("hex");
+      return { sha } as unknown as T;
+    }
+    if (method === "POST" && /\/git\/trees$/.test(path)) {
+      const input = body as { base_tree?: string; tree: Array<{ path: string; sha: string }> };
+      const entries = new Map(input.base_tree ? this.notesTrees.get(input.base_tree) : []);
+      for (const entry of input.tree) entries.set(entry.path, entry.sha);
+      const sha = createHash("sha1").update(JSON.stringify([...entries].sort())).digest("hex");
+      this.notesTrees.set(sha, entries);
+      return { sha } as unknown as T;
+    }
+    if (method === "POST" && /\/git\/commits$/.test(path)) {
+      const input = body as { tree: string; parents: string[]; message: string };
+      const sha = createHash("sha1").update(JSON.stringify(input)).digest("hex");
+      this.notesCommits.set(sha, { tree: input.tree, parents: input.parents });
+      return { sha } as unknown as T;
+    }
+    if ((method === "PATCH" && /\/git\/refs\/notes\/commitlore$/.test(path)) ||
+        (method === "POST" && /\/git\/refs$/.test(path) && (body as { ref?: string }).ref === "refs/notes/commitlore")) {
+      const sha = (body as { sha: string }).sha;
+      const fastForward = method === "POST" ? this.notesRef === null : this.notesCommits.get(sha)?.parents.includes(this.notesRef ?? "") === true;
+      if (this.refuseNotesWrite || !fastForward) {
+        this.refuseNotesWrite = false;
+        throw acpError(ReasonCode.PROBE_FAILED, "422 Update is not a fast forward", { status: 422 });
+      }
+      this.notesRef = sha;
+      return { ref: "refs/notes/commitlore", object: { sha, type: "commit" } } as unknown as T;
     }
 
     // --- refs and tags -----------------------------------------------------
@@ -219,6 +283,10 @@ export class FakeGitHub implements GitHubClient {
     }
     if (method === "GET" && /\/compare\//.test(path)) {
       const [, base, headSha] = /\/compare\/(.+)\.\.\.(.+)$/.exec(path)!;
+      // A merge's base-in-head preflight compares two commits, never a branch name.
+      if (/^[0-9a-f]{40}$/.test(base!)) {
+        return { status: this.headsMissingBase.has(headSha!) ? "diverged" : "ahead" } as unknown as T;
+      }
       const branch = decodeURIComponent(base!);
       const has = this.contains.get(branch)?.has(headSha!) ?? false;
       return { status: has ? "behind" : "diverged" } as unknown as T;
@@ -260,6 +328,18 @@ export class FakeGitHub implements GitHubClient {
         commit: { message: commit.message },
       })),
     );
+  }
+
+  /** A commit's tree: the one recorded for it, else one derived from its sha. */
+  treeOf(sha: string): string {
+    return this.commitTrees.get(sha) ?? createHash("sha1").update(`tree:${sha}`).digest("hex");
+  }
+
+  /** The note the remote `refs/notes/commitlore` carries for `object`, as a blob id, or undefined. */
+  remoteNoteFor(object: string): string | undefined {
+    if (!this.notesRef) return undefined;
+    const tree = this.notesTrees.get(this.notesCommits.get(this.notesRef)?.tree ?? "");
+    return [...(tree ?? [])].find(([entry]) => entry.replaceAll("/", "") === object)?.[1];
   }
 
   /** Register a branch and the sha it points at. */

@@ -1,7 +1,9 @@
 import type { Clock } from "../core/clock.ts";
-import { canonicalJson, digestOf, isDigest } from "../core/digest.ts";
+import { canonicalJson, digestOf, isDigest, sha256 } from "../core/digest.ts";
 import { allow, deny, type Decision } from "../core/errors.ts";
+import { parseGitHubIdentity } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { declaredPostMergeCheckNames, isUnansweredPostMergeCheck, postMergeVerifyRequestDigest } from "../github/github-kernel.ts";
 import {
   AuditLog, credentialBearingField, MAX_CREDENTIAL_SCAN_DEPTH, prohibitedDurableField, UNEXAMINABLE_DEPTH,
 } from "../db/audit.ts";
@@ -218,7 +220,20 @@ interface QualitySource extends Record<string, unknown> {
   productionPacketArtifactId: string | null;
   receipts: Array<Record<string, unknown>>;
   decisions: Array<Record<string, unknown>>;
+  postMergeCheckInputs: PostMergeCheckInputs;
 }
+
+interface PostMergeCheck { name: string; conclusion: string | null }
+
+/** #1189 (b) — what `quality.postMergeChecks` is projected from, carried so it can be reproduced. */
+interface PostMergeCheckInputs {
+  /** Per repository, the declared set read as postMergeVerify reads it; null when it cannot be resolved. */
+  declared: Array<{ repositoryIdentity: string; checks: string[] | null }>;
+  /** Each verified post_merge_verify receipt's stored response; checks null when that response is malformed. */
+  responses: Array<{ receiptId: string; checks: PostMergeCheck[] | null; noChecksDeclared: boolean }>;
+}
+
+type PostMergeChecks = "PASSED" | "NONE_DECLARED" | "FAILED" | "UNOBSERVED";
 
 const NON_EXPORTABLE_ARTIFACT_CONTENT: ReadonlySet<string> = new Set([
   "HANDOFF",
@@ -714,6 +729,53 @@ export class RunEvidenceExporter {
         createdAt: receipt.created_at,
       })).map((receipt) => ({ ...receipt, sourceDigest: digestOf(receipt) })),
       decisions: decisions.map((decision) => ({ ...decision, sourceDigest: digestOf(decision) })),
+      postMergeCheckInputs: this.postMergeCheckInputs(run, receipts),
+    };
+  }
+
+  /**
+   * #1189 (b) — the declared set comes from the same source postMergeVerify uses (the run's pinned manifest
+   * and the role the repository holds in this run), never from the receipt.
+   */
+  private postMergeCheckInputs(run: RawRun, receipts: readonly RawReceipt[]): PostMergeCheckInputs {
+    const pinned = run.pinned_manifest_digest
+      ? this.db.get<{ content_json: string }>(`SELECT content_json FROM manifests WHERE digest = ?`, [
+          run.pinned_manifest_digest,
+        ])
+      : undefined;
+    const manifest = pinned ? safeJson(pinned.content_json) : null;
+    const roleOf = (identity: string): string | null =>
+      this.db.get<{ repository_role: string }>(
+        `SELECT rr.repository_role FROM run_repositories rr
+           JOIN repositories r ON r.repository_id = rr.repository_id
+          WHERE rr.run_id = ? AND r.identity = ?`,
+        [run.run_id, identity],
+      )?.repository_role ?? null;
+    const identities = new Set(receipts
+      .filter((receipt) => receipt.operation === "merge_execute" || receipt.operation === "post_merge_verify")
+      .map((receipt) => receipt.repository_identity));
+    const responses = this.db.all<{ receipt_id: string; response_json: string }>(
+      `SELECT receipt_id, response_json FROM github_receipts
+        WHERE run_id = ? AND operation = 'post_merge_verify' AND status = 'APPLIED' AND verified = 1
+        ORDER BY created_at, receipt_id`,
+      [run.run_id],
+    );
+    return {
+      declared: [...identities].map((repositoryIdentity) => ({
+        repositoryIdentity,
+        checks: declaredPostMergeCheckNames(manifest, roleOf(repositoryIdentity)),
+      })),
+      responses: responses.map((row) => {
+        const response = safeJson(row.response_json);
+        const checks = response?.["checks"];
+        return {
+          receiptId: row.receipt_id,
+          checks: Array.isArray(checks) && checks.every(isPostMergeCheck)
+            ? checks.map(({ name, conclusion }) => ({ name, conclusion }))
+            : null,
+          noChecksDeclared: response?.["noChecksDeclared"] === true,
+        };
+      }),
     };
   }
 
@@ -744,7 +806,10 @@ const exportArtifacts = (artifacts: readonly StoredArtifact[]): RunEvidenceExpor
     // and omit the whole content; new PLANs carry only a private-artifact reference.
     const legacyReviewBundle = artifact.kind === "PLAN"
       && asRecord(asRecord(artifact.content)?.["reviewEvidence"])?.["bundle"] !== undefined;
-    const reason = legacyReviewBundle ? "PRIVATE_BULK_CONTENT" : exclusionReason(artifact.content, {
+    // A review that read CEO-attached private evidence can re-quote it in its reviewer's text: omitted whole.
+    const privateEvidenceReview = artifact.kind === "BLIND_REVIEW"
+      && asRecord(asRecord(artifact.content)?.["inputManifest"])?.["reviewEvidence"] !== undefined;
+    const reason = legacyReviewBundle || privateEvidenceReview ? "PRIVATE_BULK_CONTENT" : exclusionReason(artifact.content, {
       required: !NON_EXPORTABLE_ARTIFACT_CONTENT.has(artifact.kind),
     });
     if (reason) {
@@ -826,13 +891,114 @@ const parseQualitySource = (value: unknown): QualitySource | null => {
     receiptRecords.some((record) => !sourceDigestMatches(record!)) ||
     decisionRecords.some((record) => !sourceDigestMatches(record!))
   ) return null;
+  const postMergeCheckInputs = parsePostMergeCheckInputs(source["postMergeCheckInputs"]);
+  if (!postMergeCheckInputs) return null;
   return {
     verificationArtifactId: id(source["verificationArtifactId"]),
     blindReviewArtifactId: id(source["blindReviewArtifactId"]),
     productionPacketArtifactId: id(source["productionPacketArtifactId"]),
     receipts: receiptRecords as Array<Record<string, unknown>>,
     decisions: decisionRecords as Array<Record<string, unknown>>,
+    postMergeCheckInputs,
   };
+};
+
+const isPostMergeCheck = (value: unknown): value is PostMergeCheck => {
+  const check = asRecord(value);
+  return check !== null && Object.keys(check).length === 2 && typeof check["name"] === "string" &&
+    (typeof check["conclusion"] === "string" || check["conclusion"] === null);
+};
+
+const parsePostMergeCheckInputs = (value: unknown): PostMergeCheckInputs | null => {
+  const inputs = asRecord(value);
+  const declared = inputs?.["declared"];
+  const responses = inputs?.["responses"];
+  if (!Array.isArray(declared) || !Array.isArray(responses)) return null;
+  const declaredValid = declared.every((entry) => {
+    const item = asRecord(entry);
+    const checks = item?.["checks"];
+    return typeof item?.["repositoryIdentity"] === "string" &&
+      (checks === null || (Array.isArray(checks) && checks.every((name) => typeof name === "string")));
+  });
+  const responsesValid = responses.every((entry) => {
+    const item = asRecord(entry);
+    const checks = item?.["checks"];
+    return typeof item?.["receiptId"] === "string" && typeof item["noChecksDeclared"] === "boolean" &&
+      (checks === null || (Array.isArray(checks) && checks.every(isPostMergeCheck)));
+  });
+  return declaredValid && responsesValid ? { declared, responses } as PostMergeCheckInputs : null;
+};
+
+/**
+ * #1189 (b) — one declared check, by the check policy postMergeVerify applies: only `success` passes, an absent
+ * or unfinished check has not answered, and every other conclusion (neutral and skipped included) is a failure.
+ * A null or `pending` conclusion is no answer either: neither a PASS nor a recorded FAIL (B13).
+ */
+const postMergeCheckOutcome = (check: PostMergeCheck | undefined): PostMergeChecks => {
+  if (!check || check.conclusion === null || check.conclusion === "pending") return "UNOBSERVED";
+  if (check.conclusion === "success") return "PASSED";
+  return isUnansweredPostMergeCheck({ name: check.name, conclusion: check.conclusion }) ? "UNOBSERVED" : "FAILED";
+};
+
+/**
+ * #1189 (b) — the post-merge answer for one verified merge, read only from the receipt bound to it: this run's
+ * (the source holds only its receipts), the same repository, the post_merge_verify operation and the exact SHA
+ * this merge recorded. A missing, ambiguous or malformed receipt, or an unresolved declared set, is UNOBSERVED.
+ */
+const mergePostMergeChecks = (
+  merge: Record<string, unknown>,
+  verifications: readonly Record<string, unknown>[],
+  inputs: PostMergeCheckInputs,
+): PostMergeChecks => {
+  const identity = merge["repositoryIdentity"];
+  const slug = typeof identity === "string" ? parseGitHubIdentity(identity) : null;
+  const declared = inputs.declared.find((entry) => entry.repositoryIdentity === identity)?.checks ?? null;
+  if (!slug || declared === null || !isDigest(merge["afterStateDigest"])) return "UNOBSERVED";
+  const prefix = `${slug.owner}/${slug.repo}@`;
+  const bound = verifications.filter((receipt) => {
+    const resource = receipt["resourceIdentity"];
+    return receipt["repositoryIdentity"] === identity && typeof resource === "string" && resource.startsWith(prefix) &&
+      sha256(resource.slice(prefix.length)) === merge["afterStateDigest"];
+  });
+  if (bound.length !== 1) return "UNOBSERVED";
+  const receipt = bound[0]!;
+  // #1326 — the receipt must have been taken against this merge SHA and the trusted declared set, the request
+  // postMergeVerify forms (its effective set is the declared set: a caller may only name declared checks).
+  const mergeCommitSha = (receipt["resourceIdentity"] as string).slice(prefix.length);
+  if (receipt["requestDigest"] !== postMergeVerifyRequestDigest(mergeCommitSha, declared)) return "UNOBSERVED";
+  const response = inputs.responses.find((entry) => entry.receiptId === receipt["receiptId"]);
+  if (!response || response.checks === null) return "UNOBSERVED";
+  // The response must be the one the receipt recorded (github-kernel postMergeVerify's after-state digest).
+  if (response.noChecksDeclared) {
+    const recorded = response.checks.length === 0 &&
+      receipt["afterStateDigest"] === digestOf({ checks: [], noChecksDeclared: true });
+    // The flag alone cannot erase a declared check: NONE_DECLARED only when the trusted set is empty.
+    return recorded && declared.length === 0 ? "NONE_DECLARED" : "UNOBSERVED";
+  }
+  if (receipt["afterStateDigest"] !== digestOf(response.checks)) return "UNOBSERVED";
+  const names = response.checks.map((check) => check.name);
+  if (declared.length === 0 || new Set(names).size !== names.length || names.some((name) => !declared.includes(name))) {
+    return "UNOBSERVED";
+  }
+  const outcomes = declared.map((name) => postMergeCheckOutcome(response.checks!.find((check) => check.name === name)));
+  if (outcomes.includes("FAILED")) return "FAILED";
+  return outcomes.every((outcome) => outcome === "PASSED") ? "PASSED" : "UNOBSERVED";
+};
+
+/** A known failure anywhere is FAILED; otherwise any doubt is UNOBSERVED; a run with no verified merge has no answer. */
+const projectPostMergeChecks = (
+  receipts: readonly Record<string, unknown>[],
+  inputs: PostMergeCheckInputs,
+): PostMergeChecks => {
+  const verified = (receipt: Record<string, unknown>, operation: string): boolean =>
+    receipt["operation"] === operation && receipt["status"] === "APPLIED" && receipt["verified"] === true;
+  const merges = receipts.filter((receipt) => verified(receipt, "merge_execute"));
+  const verifications = receipts.filter((receipt) => verified(receipt, "post_merge_verify"));
+  if (merges.length === 0) return "UNOBSERVED";
+  const outcomes = merges.map((merge) => mergePostMergeChecks(merge, verifications, inputs));
+  if (outcomes.includes("FAILED")) return "FAILED";
+  if (outcomes.includes("UNOBSERVED")) return "UNOBSERVED";
+  return outcomes.includes("PASSED") ? "PASSED" : "NONE_DECLARED";
 };
 
 const projectQuality = (
@@ -880,6 +1046,7 @@ const projectQuality = (
   };
   const rollbackObservation = latestObservation("rollbackOrCompensation");
   const defectEscapeObservation = latestObservation("defectEscape");
+  const postMergeChecks = projectPostMergeChecks(receipts, source.postMergeCheckInputs);
   const facts = [
     { name: "deterministicVerification", present: Boolean(verification) },
     { name: "blindReview", present: Boolean(review) },
@@ -888,10 +1055,9 @@ const projectQuality = (
       name: "mergeReceipt",
       present: mergeReceipts.some((receipt) => receipt["status"] === "APPLIED" && receipt["verified"] === true),
     },
-    {
-      name: "postMergeVerification",
-      present: postMerge.some((receipt) => receipt["status"] === "APPLIED" && receipt["verified"] === true),
-    },
+    // #1189 (b) — a verified receipt is not a passing one: only every declared check passing, or a confirmed-empty
+    // declared set (nothing to verify), covers this fact. FAILED and UNOBSERVED do not.
+    { name: "postMergeVerification", present: postMergeChecks === "PASSED" || postMergeChecks === "NONE_DECLARED" },
     { name: "rollbackOrCompensation", present: observationCoversFact(rollbackObservation) },
     { name: "defectEscape", present: observationCoversFact(defectEscapeObservation) },
     // A state string is not a final-outcome receipt. In particular, a manually or
@@ -926,6 +1092,7 @@ const projectQuality = (
     )
       ? "PRESENT"
       : "UNAVAILABLE",
+    postMergeChecks,
     rollbackPreparationReceipts: rollbackPreparation.map((receipt) => ({
       receiptId: receipt["receiptId"],
       status: receipt["status"],
@@ -1311,6 +1478,27 @@ export const verifyBaselineEvidenceExport = (value: unknown, sourceDb: Db): bool
   if (canonicalJson(actualRunIds) !== canonicalJson(expectedRunIds)) return false;
   if (canonicalJson(bundle.gateAAssessment) !== canonicalJson(expected.value.gateAAssessment)) return false;
   return bundle.runs.every((run) => verifyRunEvidenceExport(run, sourceDb));
+};
+
+export type EvidenceExportRefusal = "VERSION_MISMATCH" | "INTEGRITY_FAILURE";
+
+const EXPORT_SCHEMA_FAMILY = /^agent-control-plane\.(?:run-evidence-export|baseline-export)\.v\d+$/;
+
+/**
+ * #1189 (b) — why a bundle is refused, beside the boolean APIs (same signatures): null when accepted (by reproduce, or by
+ * verify when `sourceDb` is given), VERSION_MISMATCH when it names another version of this export (v1 is never
+ * reproduced), INTEGRITY_FAILURE for any other refusal of a bundle — damaged, edited or not matching its host.
+ */
+export const evidenceExportRefusal = (value: unknown, sourceDb?: Db): EvidenceExportRefusal | null => {
+  const schema = asRecord(value)?.["schema"];
+  if (
+    typeof schema === "string" && EXPORT_SCHEMA_FAMILY.test(schema) &&
+    schema !== RUN_EVIDENCE_EXPORT_SCHEMA_ID && schema !== BASELINE_EXPORT_SCHEMA_ID
+  ) return "VERSION_MISMATCH";
+  const accepted = schema === BASELINE_EXPORT_SCHEMA_ID
+    ? (sourceDb ? verifyBaselineEvidenceExport(value, sourceDb) : reproduceBaselineEvidenceExport(value))
+    : (sourceDb ? verifyRunEvidenceExport(value, sourceDb) : reproduceRunEvidenceExport(value));
+  return accepted ? null : "INTEGRITY_FAILURE";
 };
 
 const artifactDigestForExport = (

@@ -9,6 +9,9 @@ import { verificationCommandSchema } from "./verification-command.ts";
 
 export const PROJECT_MANIFEST_SCHEMA_ID = "agent-control-plane.project.v2";
 
+/** The refusal a manifest naming a merge strategy other than `merge_commit` carries (#1269). */
+export const MERGE_COMMIT_ONLY = "MERGE_COMMIT_ONLY";
+
 /** Committed manifest location (Integration §10.1). */
 export const MANIFEST_RELATIVE_PATH = ".agent-control-plane/project.json";
 
@@ -19,6 +22,11 @@ export const branchProfileSchema = z
     updateStrategy: z.enum(["rebase_before_review", "merge_from_target"]).default(
       "rebase_before_review",
     ),
+    /**
+     * #1269 — ACP merges every pull request as a merge commit. A missing field reads as `merge_commit`;
+     * the other three are still readable so a stored contract that names one can be migrated by a
+     * contract change, but `assertPortableManifest` refuses to admit any of them.
+     */
     mergeStrategy: z.enum(["merge_commit", "fast_forward", "squash", "rebase"]).default("merge_commit"),
     releaseTagPolicy: z.enum(["semver", "none"]).default("semver"),
     releaseBranchCleanup: z.enum(["delete", "keep"]).default("keep"),
@@ -50,6 +58,9 @@ export const projectManifestSchema = z
         guarded: z.array(z.string()).default([]),
       })
       .strict(),
+    // Any executable may be argv[0] (owner directive 2026-10-31), so there is no per-project list of
+    // executables: #1253's `verificationExecutables` is gone, and a manifest naming it is refused as
+    // an unknown key, as every declaration of it already was.
     verificationCommands: z.array(verificationCommandSchema).default([]),
     postMergeCommands: z.array(z.string()).default([]),
     ciWorkflows: z
@@ -171,10 +182,15 @@ export const projectManifestSchema = z
       )
       .min(1)
       .optional(),
+    /**
+     * #1268 — a manifest that does not name a mode requires CommitLore. Every stored manifest was stored
+     * after the schema filled this field in, so the default changes no stored manifest or its digest; one
+     * that says `preferred` or `off` keeps it until a contract change raises it.
+     */
     commitlore: z
-      .object({ mode: z.enum(["required", "preferred", "off"]).default("preferred") })
+      .object({ mode: z.enum(["required", "preferred", "off"]).default("required") })
       .strict()
-      .default({ mode: "preferred" }),
+      .default({ mode: "required" }),
   })
   .strict()
   .superRefine((manifest, ctx) => {
@@ -317,6 +333,16 @@ export const assertPortableManifest = (manifest: unknown): Decision<ProjectManif
     });
   }
 
+  if (parsed.data.branchProfile.mergeStrategy !== "merge_commit") {
+    return deny(ReasonCode.INVALID_ARGUMENT, "manifest failed schema validation", {
+      issues: [{
+        path: "branchProfile.mergeStrategy",
+        message: `pull requests merge only as merge commits; '${parsed.data.branchProfile.mergeStrategy}' is not admitted`,
+        refusal: MERGE_COMMIT_ONLY,
+      }],
+    });
+  }
+
   const text = canonicalJson(parsed.data);
   const violations = NON_PORTABLE_PATTERNS.filter(([pattern]) => pattern.test(text)).map(
     ([, label]) => label,
@@ -438,8 +464,8 @@ const moduleFormatRefusal = (entry: GateEntry): string | null => {
  * Nothing else launches a gate. Package managers and task runners (npm, pnpm, yarn, npx, bun,
  * make, just) and tools that read their own configuration (vitest, eslint, tsc) choose what runs
  * from candidate files: `pnpm gate/check.mjs` runs a package script of that name. git is not an
- * interpreter. node is also the only interpreter the verification executable allowlist admits,
- * and an entry run as argv[0] is not on it either. Python and Deno are left out on their own
+ * interpreter. A gate entry run as argv[0] is not admitted either, though any executable may be
+ * argv[0] of an ordinary verification command (2026-10-31). Python and Deno are left out on their own
  * terms: CPython puts the script's directory first on its import path and runs an unchecked
  * hash-based .pyc in place of a declared helper's source, and Deno resolves imports through a
  * deno.json it discovers in the candidate tree.

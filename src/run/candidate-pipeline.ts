@@ -1,3 +1,4 @@
+import { type CommitLorePort, commitloreGoverned, checkGeneratedCommitMessage, createCommitLoreCliPort } from "../bootstrap/commitlore-observation.ts";
 import { randomUUID } from "node:crypto";
 
 import {
@@ -9,16 +10,17 @@ import {
 } from "../bootstrap/bootstrap-plan.ts";
 import { collectBootstrapCeoDecisions, frozenBootstrapCeoDecisions } from "../bootstrap/bootstrap-ceo-decisions.ts";
 import { collectBootstrapReviewEvidence } from "../bootstrap/bootstrap-review-evidence.ts";
+import { collectStandardReviewEvidence, privateEvidenceAnswer, runHadStandardReviewEvidence } from "../review/standard-review-evidence.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
+import { type Decision, type Evidence, acpError, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { commandsForMode, type BranchProfile } from "../contracts/manifest.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
 import { EVIDENCE_PRODUCERS, type ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { ArtifactKind, type RunRow, RunState } from "../domain/types.ts";
+import { ArtifactKind, RunKind, type RunRow, RunState } from "../domain/types.ts";
 import { requiredBaseFor, sourceProbeBranchesFor } from "../github/branch-contract.ts";
 import { currentBranch, mergeBase, revParse, tryRevParse } from "../git/git.ts";
 import { MessageKind } from "../outbox/envelope.ts";
@@ -29,12 +31,13 @@ import { firstActivationFactsOf } from "../registry/manifest-activation-grants.t
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import { residentBaseClone } from "../registry/resident-repositories.ts";
-import type { BlindReviewGate, BlindReviewInvoker, ReviewPacket } from "../review/blind-review.ts";
-import { captureContractChangeReviewContext, storeContractChangeReviewContext } from "../review/contract-change-review-context.ts";
+import type { BlindReviewGate, BlindReviewInvoker, ReviewPacket, ReviewProgressStep } from "../review/blind-review.ts";
+import { captureContractChangeReviewContext, readCanonicalCtoIdentity, storeContractChangeReviewContext } from "../review/contract-change-review-context.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import {
   type CandidateSnapshot,
   type SnapshotRepositoryInput,
+  type SnapshotReviewEvidence,
   buildCandidateSnapshot,
   buildNoRepositoryCandidateSnapshot,
   candidateSnapshotDigest,
@@ -50,6 +53,8 @@ import {
   baseRefFor,
   candidateRefFor,
   candidateRefPlan,
+  type CheckMergeMessage,
+  type MergeCheckBinding,
   integratePredecessors,
   integrateTaskResults,
   lostTaskChanges,
@@ -60,7 +65,13 @@ import type { TaskGraph } from "./task-graph.ts";
 import { type PredecessorBase, type StartsFrom, recordedTargetForBranch } from "./task-write-target.ts";
 import type { ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 
+/** An attempt's lease: set at acquisition, and renewed to this from now on each real step. */
 const ATTEMPT_LEASE_TTL_MS = 30 * 60 * 1000;
+/**
+ * However it progresses, an attempt holds the run at most this long from acquisition: no renewal sets a
+ * deadline past it, so at the cap the lease lapses and is reclaimed as an unrenewed one is.
+ */
+const ATTEMPT_LEASE_CAP_MS = 120 * 60 * 1000;
 
 /**
  * The BLIND_REVIEW_UNAVAILABLE row, built field by field and never spread from the denial. A denial
@@ -155,13 +166,53 @@ const revisionAuditEvidence = (
     findingsBySeverity: Object.fromEntries(
       FINDING_SEVERITIES.map((severity) => [severity, findings.filter((finding) => finding.severity === severity).length]),
     ),
-    findingDigests: findings.slice(0, MAX_AUDITED_FINDING_DIGESTS).map((finding) => digestOf(finding)),
+    // A review that read private evidence keeps no digest of its reviewer's text here: a short text is guessable from one.
+    ...(packet.inputManifest?.reviewEvidence === undefined
+      ? { findingDigests: findings.slice(0, MAX_AUDITED_FINDING_DIGESTS).map((finding) => digestOf(finding)) } : {}),
     coveredFiles: packet.coveredFiles.length,
     omittedItems: packet.omittedItems.length,
     ...(planDigest === undefined ? {} : { planDigest: boundedScalar(planDigest) ?? null }),
     ...(packet.bootstrapPlanIntentDigest === undefined ? {} : { bootstrapPlanIntentDigest: boundedScalar(packet.bootstrapPlanIntentDigest) ?? null }),
   } as Evidence;
 };
+
+/**
+ * F1 — what the owning CTO is told, in band, when a review did not judge the product: a review that answered on
+ * method findings alone, or one that could not be constituted. It is no revision request for the product. The
+ * text is fixed here and never carries reviewer text; the reason code beside it is the gate's own.
+ */
+export const UNJUDGED_REVIEW_NOTICES = {
+  METHOD_FINDINGS_ONLY:
+    "This is not a product revision. The blind review answered on review-method findings alone, so it did not judge the product. Keep the PLAN and the code exactly as they are and change nothing.",
+  REVIEW_UNAVAILABLE:
+    "This is not a product revision. The blind review could not judge the product: assurance could not be constituted, for the reason code given. Keep the PLAN and the code exactly as they are and change nothing.",
+} as const;
+
+/** F1 — how many unjudged reviews in a row one unchanged candidate gets before its owner is sent to escalation. */
+export const UNJUDGED_REVIEW_LIMIT = 2;
+
+/** F1 — the one next step a notice gives, chosen by `unjudgedAttempts` against `UNJUDGED_REVIEW_LIMIT`. */
+export const UNJUDGED_REVIEW_NEXT_STEPS = {
+  RESUBMIT:
+    "Next step: once the result_submit of the attempt this notice names (attemptId) has answered, call result_submit again with a new idempotencyKey; that freezes the candidate afresh and runs a fresh review. Resubmit only while unjudgedAttempts is below unjudgedAttemptLimit.",
+  ESCALATE:
+    "Next step: this unchanged candidate has had unjudgedAttemptLimit unjudged reviews in a row, so ACP refuses another result_submit of it; do not resubmit it. Open a CEO escalation for this run with escalation_open, then acknowledge this notice.",
+} as const;
+
+/** F1 — the refusal of a result_submit for a candidate already unjudged `UNJUDGED_REVIEW_LIMIT` times in a row. */
+export const UNJUDGED_REVIEW_LIMIT_REFUSAL =
+  "refused: this same unchanged candidate already went unjudged unjudgedAttemptLimit times in a row, so nothing was verified or reviewed for this submission. Do not resubmit it; open a CEO escalation for this run with escalation_open.";
+/** F1 — the audit row a refused submission leaves, so the refusal never counts as an attempt that ended the run of unjudged ones. */
+const UNJUDGED_REVIEW_LIMIT_REFUSED = "UNJUDGED_REVIEW_LIMIT_REFUSED";
+
+/**
+ * #1189 — the answer of a submission whose attempt no longer holds the run (released, reclaimed, expired, at its cap,
+ * or its owner binding moved on), so nothing of its result is applied: `attemptLost`, and a review that answered such
+ * an attempt without a verdict, whose reason code is the review's own. The text is fixed and never carries reviewer
+ * text, so a run with private review evidence is answered with it unchanged. It gives no resubmit instruction.
+ */
+export const STALE_ATTEMPT_NOT_APPLIED =
+  "not applied: this submission's attempt no longer holds the run, so nothing of its result was applied (no verdict, candidate state, revision or notice). This is not an unavailable review of the run's current candidate. What happens next follows from the run's current attempt and state, not from this answer: read the current run state.";
 
 export interface SubmitResultInput {
   runId: string;
@@ -175,7 +226,15 @@ export interface SubmitResultInput {
    * project manifest (§17.5); otherwise the pinned contract's commands win.
    */
   runScopedCommands?: readonly VerificationCommand[];
+  /**
+   * Told of each real step once it has renewed the attempt's lease: a verification command, a review
+   * chunk, the final review starting and ending. What it does never decides the submission.
+   */
+  onProgress?: (step: SubmissionProgressStep) => void;
 }
+
+/** A real step of a submission: the only thing that renews its attempt lease. */
+export type SubmissionProgressStep = "VERIFICATION_COMMAND_COMPLETED" | ReviewProgressStep;
 
 export type PipelineOutcome =
   | { stage: "COMPLETED_REVIEW"; packet: ProductionReadyPacket; snapshotDigest: string }
@@ -254,9 +313,23 @@ export class CandidatePipeline {
   ) {}
 
   #continuity: { evaluate?(reason: string): Promise<unknown> } | null = null;
+  /** The attempts this process runs, each with what stops its reviewer and verification children. */
+  readonly #attempts = new Map<string, AbortController>();
+  /**
+   * #1268 — the CommitLore the merge commit messages of a run whose contract requires it are checked by. Defaults
+   * to the pinned CLI (`createCommitLoreCliPort`); null is a deployment with none, where such a merge is not made.
+   */
+  #commitlore: CommitLorePort | null = createCommitLoreCliPort();
 
-  attach(ports: { continuity?: { evaluate?(reason: string): Promise<unknown> } }): void {
+  attach(ports: { continuity?: { evaluate?(reason: string): Promise<unknown> }; commitlore?: CommitLorePort | null }): void {
     if (ports.continuity) this.#continuity = ports.continuity;
+    if (ports.commitlore !== undefined) this.#commitlore = ports.commitlore;
+  }
+
+  /** #1268 — the message check a run's merge commits get, or none when its contract does not require CommitLore. */
+  private checkMergeMessages(runId: string): CheckMergeMessage | undefined {
+    if (!commitloreGoverned(this.db, runId)) return undefined;
+    return (input) => checkGeneratedCommitMessage(this.#commitlore, input);
   }
 
   /**
@@ -279,6 +352,9 @@ export class CandidatePipeline {
     // missing-commit guard below asks the final candidate for are the same commits (S6-B, S6-C).
     const commits = participants.length === 0 ? [] : succeededTaskCommits(this.db, runId);
     const repositories: SnapshotRepositoryInput[] = [];
+    // #1268 — every merge commit the integration makes has its message checked by CommitLore when the run requires it.
+    const checkMergeMessages = this.checkMergeMessages(runId);
+    const commitloreMergeChecks = new Map<string, MergeCheckBinding[]>();
     for (const repo of participants) {
       // S6-C — when the checkout's HEAD does not hold every SUCCEEDED task's commit, the candidate is
       // their integration onto the run's pinned base; a conflict between two tasks refuses the freeze.
@@ -290,8 +366,13 @@ export class CandidatePipeline {
         repositoryIdentity: repo.identity,
         checkoutPath: repo.checkoutPath,
         worktree: (input, use) => this.verification.withRunWorktree(run, input, use),
+        ...(checkMergeMessages === undefined ? {} : { checkMessage: checkMergeMessages }),
       });
       if (!integrated.allowed) return integrated as Decision<CandidateSnapshot>;
+      // Recorded where a check was required or made; a run that requires none keeps its evidence as it was.
+      if (integrated.value !== null && (checkMergeMessages !== undefined || integrated.value.commitloreMergeChecks.length > 0)) {
+        commitloreMergeChecks.set(repo.identity, integrated.value.commitloreMergeChecks);
+      }
       // The integrated candidate's origin is its tasks' recorded one (S-TB-06), as one task's is below.
       const source = integrated.value === null
         ? await this.sourceAtFreeze(repo.checkoutPath, repo.workBranch, repo.baseBranch, profile, { runId, identity: repo.identity })
@@ -346,6 +427,19 @@ export class CandidatePipeline {
       contractChange = current.value.binding;
       if (current.value.firstActivation) boundRevisions = current.value.workflowRevisions;
     }
+    // A CONTRACT_CHANGE candidate of a project is also the project's canonical CTO identity as it stands
+    // now, read once: a changed entitlement or PRIMARY_CTO binding is a different candidate, reviewed again.
+    const canonicalCtoIdentity = contractChange === undefined || run.projectId === null
+      ? undefined
+      : readCanonicalCtoIdentity(this.db, run.projectId);
+
+    // A STANDARD_WORK candidate is frozen with the review evidence the CEO has bound now, digests only
+    // (review/standard-review-evidence.ts). A selection that cannot be read back intact refuses the freeze.
+    let reviewEvidence: SnapshotReviewEvidence | null = null;
+    if (run.kind === RunKind.STANDARD_WORK && participants.length > 0) {
+      try { reviewEvidence = collectStandardReviewEvidence({ artifacts: this.artifacts, audit: this.audit, runs: this.runs }, runId); }
+      catch { return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "attached review evidence cannot be frozen", { runId }); }
+    }
 
     const snapshot = participants.length === 0
       ? buildNoRepositoryCandidateSnapshot(
@@ -354,6 +448,7 @@ export class CandidatePipeline {
             contractDigest: run.contractDigest,
             ...(bootstrapPlan === undefined ? {} : { bootstrapPlan }),
             ...(contractChange === undefined ? {} : { contractChange }),
+            ...(canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity }),
           },
           this.clock,
         )
@@ -363,6 +458,8 @@ export class CandidatePipeline {
             contractDigest: run.contractDigest,
             repositories,
             ...(contractChange === undefined ? {} : { contractChange }),
+            ...(canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity }),
+            ...(reviewEvidence === null ? {} : { reviewEvidence }),
           },
           this.clock,
         );
@@ -413,13 +510,13 @@ export class CandidatePipeline {
 
     // #1255 — what a CONTRACT_CHANGE candidate's review is shown beside its PLAN, read by ACP now, at the
     // freeze, and bound to this candidate and this freeze, so the review sees what held when it was frozen.
-    const reviewContext = contractChange === undefined || run.projectId === null
+    const reviewContext = contractChange === undefined || run.projectId === null || canonicalCtoIdentity === undefined
       ? null
       : await captureContractChangeReviewContext(
           { db: this.db, repositories: this.repositories, clock: this.clock },
           {
             runId, projectId: run.projectId, candidateSnapshotDigest: digest, planDigest: contractChange.planDigest,
-            workflowRevisions: boundRevisions,
+            workflowRevisions: boundRevisions, canonicalCtoIdentity,
             freezeId: `freeze_${randomUUID().replace(/-/g, "").slice(0, 24)}`, attemptId: attemptId ?? null,
           },
         );
@@ -452,6 +549,9 @@ export class CandidatePipeline {
           sourceHead: r.sourceHead ?? null,
           files: r.touchedPaths.length,
           ...(r.integration === undefined ? {} : { integratedTasks: r.integration.tasks.length }),
+          // #1268 — internal execution evidence: each merge whose message CommitLore's commit-msg check passed, with
+          // the parents and tree that check was bound to. No capture and no record: no session produced a merge.
+          ...(commitloreMergeChecks.has(r.identity) ? { commitloreMergeChecks: commitloreMergeChecks.get(r.identity)! } : {}),
         })),
         ...(attemptId === undefined ? {} : { attemptId }),
         ...(reviewContextOutcome === null ? {} : { reviewContext: reviewContextOutcome }),
@@ -477,14 +577,40 @@ export class CandidatePipeline {
     const attemptId = `attempt_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
     const acquired = this.acquireAttempt(input, attemptId);
     if (!acquired.allowed) return acquired as Decision<PipelineOutcome>;
+    const controller = new AbortController();
+    this.#attempts.set(attemptId, controller);
     try {
-      return await this.submitResultOnce(input, attemptId);
+      // The answer is stored as the mutation's result and returned to the caller. For a run that had private review
+      // evidence it is rebuilt from values of known provenance, before it is serialized or stored, and so is a thrown
+      // refusal (`privateEvidenceAnswer`); any other run's answer is exactly as before.
+      let outcome: Decision<PipelineOutcome>;
+      try { outcome = await this.submitResultOnce(input, attemptId, controller.signal); }
+      catch (error) {
+        if (!isAcpError(error) || !runHadStandardReviewEvidence({ audit: this.audit }, input.runId)) throw error;
+        const refused = privateEvidenceAnswer({ artifacts: this.artifacts, audit: this.audit }, input.runId, deny(error.reasonCode, error.message, error.evidence));
+        throw acpError(refused.reasonCode, refused.allowed ? "" : refused.message, refused.evidence);
+      }
+      if (!runHadStandardReviewEvidence({ audit: this.audit }, input.runId)) return outcome;
+      const answered = privateEvidenceAnswer({ artifacts: this.artifacts, audit: this.audit }, input.runId, outcome);
+      // #1189 — a stale attempt's not-applied text is a fixed constant, so the projection keeps it where it withholds any other.
+      return outcome.allowed || outcome.message !== STALE_ATTEMPT_NOT_APPLIED ? answered
+        : deny(answered.reasonCode, STALE_ATTEMPT_NOT_APPLIED, answered.evidence);
     } finally {
+      this.#attempts.delete(attemptId);
       this.releaseAttempt(input.runId, attemptId);
     }
   }
 
-  private async submitResultOnce(input: SubmitResultInput, attemptId: string): Promise<Decision<PipelineOutcome>> {
+  /**
+   * Stops what an attempt this process runs has in flight (its reviewer and verification children)
+   * once ACP no longer lets it hold the run: a watchdog or acquisition reclaim, the cap, a refused
+   * renewal. What those children still return is fenced off by the same hold.
+   */
+  abortAttempt(attemptId: string): void {
+    this.#attempts.get(attemptId)?.abort();
+  }
+
+  private async submitResultOnce(input: SubmitResultInput, attemptId: string, signal: AbortSignal): Promise<Decision<PipelineOutcome>> {
     const owner = this.runs.assertOwner(
       input.runId,
       input.ownerSessionId,
@@ -506,11 +632,32 @@ export class CandidatePipeline {
     const snapshotDigest = candidateSnapshotDigest(snapshot);
     const boundAttempt = this.bindAttemptCandidate(input.runId, attemptId, snapshotDigest);
     if (!boundAttempt.allowed) return boundAttempt as Decision<PipelineOutcome>;
+    // F1 — the bound on unjudged reviews: a candidate whose last UNJUDGED_REVIEW_LIMIT attempts all went unjudged is not
+    // verified or reviewed again; the owner was told to escalate (`noticeUnjudgedReview`). The refusal changes no run
+    // state, PLAN or task and sends nothing; its row keeps it out of the count, so the next such submit is refused too,
+    // and a changed candidate starts its own count. A project-less bootstrap run keeps the daemon's review retry.
+    if (!isProjectlessBootstrap(run)) {
+      const unjudgedAttempts = this.consecutiveUnjudgedAttempts(input.runId, snapshotDigest, attemptId);
+      if (unjudgedAttempts >= UNJUDGED_REVIEW_LIMIT) {
+        const evidence = { runId: input.runId, candidateSnapshotDigest: snapshotDigest, attemptId, refusal: UNJUDGED_REVIEW_LIMIT_REFUSED,
+          unjudgedAttempts, unjudgedAttemptLimit: UNJUDGED_REVIEW_LIMIT };
+        const recorded = this.applyHolding(input, attemptId, () => {
+          const row = this.audit.record({ kind: UNJUDGED_REVIEW_LIMIT_REFUSED, runId: input.runId, reasonCode: ReasonCode.REVIEW_UNJUDGED_LIMIT_REACHED, evidence });
+          return row.allowed ? allow(ReasonCode.OK, undefined) : (row as Decision<void>);
+        });
+        if (recorded === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
+        if (!recorded.allowed) return recorded as Decision<PipelineOutcome>;
+        return deny(ReasonCode.REVIEW_UNJUDGED_LIMIT_REACHED, UNJUDGED_REVIEW_LIMIT_REFUSAL, evidence);
+      }
+    }
+    const progress = (step: SubmissionProgressStep): boolean => this.renewAttempt(input, attemptId, step);
 
     // No repository means no source, verification command, or blind-review input exists to
     // inspect. Publish the explicit no-op packet through the same production gate, then let
     // CEO confirmation and the daemon own completion exactly as for a repository run.
     if (snapshot.repositories.length === 0) {
+      // The review this candidate had, if any: a refusal at publication records what it refused.
+      let reviewedPlan: Decision<ReviewPacket> | null = null;
       // #246 C2 — except a project-less bootstrap candidate, whose planned outputs are exactly the
       // blind-review input there is. Its review is as automatic as a candidate's (§18.2): the gate
       // reloads the outputs from the PLAN artifact, a verdict other than PASS returns the run to its
@@ -525,7 +672,10 @@ export class CandidatePipeline {
           contract: contract.value,
           contractDigest: run.contractDigest,
           attemptId,
+          progress,
+          signal,
         });
+        reviewedPlan = reviewed;
         // Review rounds 1 and 2 (RF-REVIEW-02) — the review is asynchronous, and `plan_submit` can
         // replace the PLAN while it runs or while anything after it is awaited. A candidate whose PLAN
         // was replaced is stale whatever the verdict: a PASS is not P2's review, and a REVISE or BLOCK
@@ -534,7 +684,7 @@ export class CandidatePipeline {
         // (`unpassedReview`), and the packet (below) — never only once after the review.
         // A verdict rests on the review the gate stored, whose intent must still be the run's too
         // (BPI-R1-01): a task replaced during the await keeps the PLAN binding and changes only that.
-        const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, (verdict) =>
+        const unpassed = await this.unpassedReview(input, snapshotDigest, reviewed, attemptId, (verdict) =>
           this.bootstrapPlanStillCurrent(input.runId, snapshot, verdict ? snapshotDigest : null),
         );
         if (unpassed !== null) return unpassed;
@@ -553,8 +703,11 @@ export class CandidatePipeline {
           contract: contract.value,
           contractDigest: run.contractDigest,
           attemptId,
+          progress,
+          signal,
         });
-        const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, () =>
+        reviewedPlan = reviewed;
+        const unpassed = await this.unpassedReview(input, snapshotDigest, reviewed, attemptId, () =>
           this.contractChangePlanStillCurrent(input.runId, snapshot),
         );
         if (unpassed !== null) return unpassed;
@@ -568,6 +721,7 @@ export class CandidatePipeline {
         if (snapshot.bootstrapPlan !== undefined) {
           const planAtPublication = this.bootstrapPlanStillCurrent(input.runId, snapshot);
           if (!planAtPublication.allowed) {
+            this.recordStaleAfterReview(input.runId, snapshotDigest, attemptId, "PLAN_AT_PUBLICATION", planAtPublication, reviewedPlan);
             return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest,
               detail: { message: planAtPublication.message, evidence: planAtPublication.evidence } });
           }
@@ -575,10 +729,15 @@ export class CandidatePipeline {
         if (snapshot.contractChange !== undefined) {
           const planAtPublication = this.contractChangePlanStillCurrent(input.runId, snapshot);
           if (!planAtPublication.allowed) {
+            this.recordStaleAfterReview(input.runId, snapshotDigest, attemptId, "PLAN_AT_PUBLICATION", planAtPublication, reviewedPlan);
             return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest });
           }
         }
-        const built = this.ceo.buildPacket({
+        if (reviewedPlan !== null) {
+          const superseded = this.supersededAtPublication(run, snapshot, snapshotDigest, attemptId, reviewedPlan);
+          if (superseded !== null) return superseded;
+        }
+        const built = this.applyHolding(input, attemptId, () => this.ceo.buildPacket({
           runId: input.runId,
           candidateSnapshotDigest: snapshotDigest,
           sourceReadLeaseId: sourceReadLease.value.leaseId,
@@ -592,8 +751,9 @@ export class CandidatePipeline {
             approvedByGeneration: input.ownerBindingGeneration,
             approvedAt: this.clock.nowIso(),
           },
-        } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string });
-        if (!built.allowed) return built as Decision<PipelineOutcome>;
+        } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string }));
+        if (built === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewedPlan);
+        if (!built.allowed) return this.returnBlockedPass(input, attemptId, snapshotDigest, built, reviewedPlan);
         return allow(ReasonCode.OK, {
           stage: "COMPLETED_REVIEW",
           packet: built.value,
@@ -617,9 +777,11 @@ export class CandidatePipeline {
       pinnedManifestDigest: run.pinnedManifestDigest,
       executionMode: run.executionMode,
       runScoped: Boolean(input.runScopedCommands),
+      attempt: { holds: () => this.attemptHolds(input, attemptId), progress: () => progress("VERIFICATION_COMMAND_COMPLETED"), signal },
     });
 
     if (!verified.allowed) {
+      if (verified.reasonCode === ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
       const report =
         this.verification.latestReport(input.runId, snapshotDigest) ??
         ({
@@ -636,11 +798,12 @@ export class CandidatePipeline {
 
       // §34.2 — a failed verification returns to CTO revision with the evidence still
       // bound to the candidate that failed.
-      const returned = this.returnToCto(input.runId, verified.reasonCode, {
+      const returned = this.applyHolding(input, attemptId, () => this.returnToCto(input.runId, verified.reasonCode, {
         stage: "verification",
         candidateSnapshotDigest: snapshotDigest,
         report,
-      }, attemptId);
+      }, attemptId));
+      if (returned === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
       if (!returned.allowed) return returned as Decision<PipelineOutcome>;
       return allow(ReasonCode.OK, {
         stage: "VERIFICATION_FAILED",
@@ -665,6 +828,7 @@ export class CandidatePipeline {
     if (!contract.allowed) return contract as Decision<PipelineOutcome>;
 
     // §18.2 — automatic, immediately after verification passes.
+    if (!this.attemptHolds(input, attemptId)) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
     const reviewed = await this.invokeReview({
       runId: input.runId,
       projectId: run.projectId,
@@ -674,13 +838,15 @@ export class CandidatePipeline {
       contractDigest: run.contractDigest,
       verification: verified.value,
       attemptId,
+      progress,
+      signal,
     });
 
     // #246 B2-a — a CONTRACT_CHANGE candidate's verdict is for the PLAN it names; one replaced since
     // gets no revision request. Any other candidate's verdict is delivered as before.
     const unpassed = snapshot.contractChange === undefined
-      ? await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId)
-      : await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, () =>
+      ? await this.unpassedReview(input, snapshotDigest, reviewed, attemptId)
+      : await this.unpassedReview(input, snapshotDigest, reviewed, attemptId, () =>
           this.contractChangePlanStillCurrent(input.runId, snapshot),
         );
     if (unpassed !== null) return unpassed;
@@ -699,6 +865,7 @@ export class CandidatePipeline {
       // writes cannot slip between this observation and production-ready publication.
       const stillFreshAfterReview = await this.assertStillFresh(snapshot);
       if (!stillFreshAfterReview.allowed) {
+        this.recordStaleAfterReview(input.runId, snapshotDigest, attemptId, "SOURCE_AT_PUBLICATION", stillFreshAfterReview, reviewed);
         return allow(ReasonCode.OK, {
           stage: "CANDIDATE_STALE",
           reasonCode: stillFreshAfterReview.reasonCode,
@@ -709,11 +876,14 @@ export class CandidatePipeline {
       if (snapshot.contractChange !== undefined) {
         const planAtPublication = this.contractChangePlanStillCurrent(input.runId, snapshot);
         if (!planAtPublication.allowed) {
+          this.recordStaleAfterReview(input.runId, snapshotDigest, attemptId, "PLAN_AT_PUBLICATION", planAtPublication, reviewed);
           return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest });
         }
       }
+      const superseded = this.supersededAtPublication(run, snapshot, snapshotDigest, attemptId, reviewed);
+      if (superseded !== null) return superseded;
 
-      const built = this.ceo.buildPacket({
+      const built = this.applyHolding(input, attemptId, () => this.ceo.buildPacket({
         runId: input.runId,
         candidateSnapshotDigest: snapshotDigest,
         sourceReadLeaseId: sourceReadLease.value.leaseId,
@@ -727,8 +897,9 @@ export class CandidatePipeline {
           approvedByGeneration: input.ownerBindingGeneration,
           approvedAt: this.clock.nowIso(),
         },
-      } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string });
-      if (!built.allowed) return built as Decision<PipelineOutcome>;
+      } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string }));
+      if (built === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewed);
+      if (!built.allowed) return this.returnBlockedPass(input, attemptId, snapshotDigest, built, reviewed);
 
       return allow(ReasonCode.OK, {
         stage: "COMPLETED_REVIEW",
@@ -816,7 +987,7 @@ export class CandidatePipeline {
    * run to its CTO, and an assurance failure waits (§18.6, §18.7).
    */
   private async unpassedReview(
-    runId: string,
+    input: SubmitResultInput,
     snapshotDigest: string,
     reviewed: Decision<ReviewPacket>,
     /** The submission this review belongs to: its revision is delivered once per attempt. */
@@ -829,12 +1000,7 @@ export class CandidatePipeline {
     stillCurrent: (verdict: boolean) => Decision<void> = () => allow(ReasonCode.OK, undefined),
   ): Promise<Decision<PipelineOutcome> | null> {
     if (reviewed.allowed) return null;
-    // §18.7 is an assurance decision too. Re-evaluate continuity before deciding
-    // whether a provider/isolation failure waits or moves the system into SURVIVAL.
-    if (this.#continuity?.evaluate) await this.#continuity.evaluate("blind-review-unavailable");
-    // #246 C2, review round 2 (RF-REVIEW-02) — the review and the evaluation above were awaited, and
-    // a bootstrap PLAN replaced during either makes this outcome stale: no revision request and no
-    // unavailable-review record is produced for it. Nothing below awaits before either is written.
+    const runId = input.runId;
     // §18.7 — only a reviewer *verdict* enters the CTO revision loop. A lost isolation
     // or a provider that never answered is an assurance failure the candidate cannot
     // repair, so the gate is neither lowered nor handed to the CTO to "fix".
@@ -842,19 +1008,55 @@ export class CandidatePipeline {
       reviewed.reasonCode === ReasonCode.REVIEW_REVISE ||
       reviewed.reasonCode === ReasonCode.REVIEW_BLOCK ||
       reviewed.reasonCode === ReasonCode.REVIEW_OMITTED_ITEMS_PRESENT;
+    // A submission whose attempt no longer holds the run applies no outcome: not the gate's refusal for a
+    // lost lease, not a verdict, and nothing after the await below unless a transaction that holds it
+    // writes it. Its assurance failure is still that attempt's own history (#1189 R1-01), below.
+    if (reviewed.reasonCode === ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE) return this.attemptLost(runId, attemptId, snapshotDigest, reviewed);
+    const held = this.attemptHolds(input, attemptId);
+    if (!held && isVerdict) return this.attemptLost(runId, attemptId, snapshotDigest, reviewed);
+    // §18.7 is an assurance decision too. Re-evaluate continuity before deciding
+    // whether a provider/isolation failure waits or moves the system into SURVIVAL. A stale attempt's
+    // failure moves nothing, so it is not asked.
+    if (held && this.#continuity?.evaluate) await this.#continuity.evaluate("blind-review-unavailable");
+    // #246 C2, review round 2 (RF-REVIEW-02) — the review and the evaluation above were awaited, and
+    // a bootstrap PLAN replaced during either makes this outcome stale: no revision request and no
+    // unavailable-review record is produced for it. Nothing below awaits before either is written.
     const current = stillCurrent(isVerdict);
     if (!current.allowed) {
+      this.recordStaleAfterReview(runId, snapshotDigest, attemptId, "AFTER_REVIEW", current, reviewed);
       return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: current.reasonCode, snapshotDigest,
         detail: { message: current.message, evidence: current.evidence } });
     }
 
     if (!isVerdict) {
-      this.audit.record({
-        kind: "BLIND_REVIEW_UNAVAILABLE",
-        runId,
-        reasonCode: reviewed.reasonCode,
-        evidence: unavailableReviewEvidence(snapshotDigest, reviewed.evidence, attemptId),
-      });
+      const recordUnavailable = (attemptHeld: boolean): void => {
+        this.audit.record({
+          kind: "BLIND_REVIEW_UNAVAILABLE",
+          runId,
+          reasonCode: reviewed.reasonCode,
+          evidence: {
+            ...unavailableReviewEvidence(snapshotDigest, reviewed.evidence, attemptId),
+            ...(attemptHeld ? {} : { attemptHeld: false }),
+          },
+        });
+      };
+      // F1 — the owning CTO is told in the same transaction (`noticeUnjudgedReview`); a notice the outbox
+      // refuses is answered as that refusal, with nothing recorded, as a refused revision is.
+      const recorded = held
+        ? this.applyHolding(input, attemptId, () => {
+            recordUnavailable(true);
+            return this.noticeUnjudgedReview(runId, snapshotDigest, reviewed, attemptId);
+          })
+        : null;
+      // #1189 R1-01 — an attempt that no longer holds the run keeps its failure as its own history: the
+      // row names its attempt and says it did not hold the run, so it is never the run's current outcome
+      // and never the cause of a review retry (`Daemon.#bootstrapReviewRetry`). Its answer says, in fixed
+      // text, that nothing of it was applied: it is no unavailable review of the current candidate.
+      if (recorded === null) {
+        recordUnavailable(false);
+        return deny(reviewed.reasonCode, STALE_ATTEMPT_NOT_APPLIED, { runId, attemptId, candidateSnapshotDigest: snapshotDigest, attemptHeld: false });
+      }
+      if (!recorded.allowed) return recorded as Decision<PipelineOutcome>;
       return allow(ReasonCode.OK, {
         stage: "REVIEW_UNAVAILABLE",
         reasonCode: reviewed.reasonCode,
@@ -863,11 +1065,12 @@ export class CandidatePipeline {
       });
     }
 
-    const returned = this.returnToCto(runId, reviewed.reasonCode, {
+    const returned = this.applyHolding(input, attemptId, () => this.returnToCto(runId, reviewed.reasonCode, {
       stage: "blind-review",
       candidateSnapshotDigest: snapshotDigest,
       ...reviewed.evidence,
-    }, attemptId);
+    }, attemptId));
+    if (returned === null) return this.attemptLost(runId, attemptId, snapshotDigest, reviewed);
     if (!returned.allowed) return returned as Decision<PipelineOutcome>;
     const packet = this.review.latestPacket(runId, snapshotDigest);
     return allow(ReasonCode.OK, {
@@ -876,6 +1079,73 @@ export class CandidatePipeline {
       snapshotDigest,
       ...(packet ? { review: packet } : {}),
     });
+  }
+
+  /**
+   * A candidate refused as stale once its review had run. The refusal is unchanged — no revision, no
+   * unavailable-review record, no packet — and this row says so: which check found it stale (`stale`),
+   * the candidate, the submission attempt, the review's own outcome and, when the review carried a
+   * packet, that reviewer's binding generation. Built field by field, never spread from a denial. An
+   * answer the review gate did not keep has the gate's own BLIND_REVIEW_REJECTED row naming its reviewer.
+   */
+  private recordStaleAfterReview(
+    runId: string,
+    snapshotDigest: string,
+    attemptId: string,
+    stale: "AFTER_REVIEW" | "SOURCE_AT_PUBLICATION" | "PLAN_AT_PUBLICATION" | "CANDIDATE_AT_PUBLICATION" | "ATTEMPT_LEASE",
+    refusal: Decision<unknown>,
+    reviewed: Decision<ReviewPacket> | null,
+  ): void {
+    const packet = reviewed === null ? null : reviewed.allowed ? reviewed.value : reviewed.evidence["packet"];
+    const generation = (packet as Partial<ReviewPacket> | null | undefined)?.reviewerRoleBindingGeneration;
+    this.audit.record({
+      kind: "BLIND_REVIEW_REJECTED",
+      runId,
+      reasonCode: refusal.reasonCode,
+      evidence: {
+        candidateSnapshotDigest: snapshotDigest,
+        attemptId,
+        stale,
+        reviewReasonCode: reviewed?.reasonCode ?? null,
+        reviewerRoleBindingGeneration: typeof generation === "number" ? generation : null,
+      },
+    });
+  }
+
+  /**
+   * A reviewed candidate that is no longer the run's candidate is stale at publication: a later freeze
+   * replaced it while this submission awaited (another attempt re-froze after its lease lapsed), or the
+   * canonical CTO identity it froze is no longer the project's (a runtime move with no re-freeze yet).
+   * The production gate would refuse the first and publish a superseded identity for the second, so the
+   * refusal is recorded here with the candidate, attempt and reviewer it names. Null while current.
+   */
+  private supersededAtPublication(
+    run: RunRow,
+    snapshot: CandidateSnapshot,
+    snapshotDigest: string,
+    attemptId: string,
+    reviewed: Decision<ReviewPacket>,
+  ): Decision<PipelineOutcome> | null {
+    const current = this.runs.currentCandidate(run.runId);
+    let refusal: { message: string; evidence: Evidence } | null = null;
+    if (current !== snapshotDigest) {
+      refusal = { message: "candidate is not the run's current candidate", evidence: { runId: run.runId, supplied: snapshotDigest, current } };
+    } else if (snapshot.canonicalCtoIdentity !== undefined && run.projectId !== null) {
+      // Read as the freeze reads it; a candidate that froze no identity is not asked.
+      const frozenIdentityDigest = digestOf(snapshot.canonicalCtoIdentity);
+      const currentIdentityDigest = digestOf(readCanonicalCtoIdentity(this.db, run.projectId));
+      if (frozenIdentityDigest !== currentIdentityDigest) {
+        refusal = {
+          message: "the canonical CTO identity this candidate froze is no longer the project's",
+          evidence: { runId: run.runId, candidateSnapshotDigest: snapshotDigest, frozenIdentityDigest, currentIdentityDigest },
+        };
+      }
+    }
+    if (refusal === null) return null;
+    this.recordStaleAfterReview(run.runId, snapshotDigest, attemptId, "CANDIDATE_AT_PUBLICATION",
+      deny(ReasonCode.EVIDENCE_STALE, refusal.message, refusal.evidence), reviewed);
+    return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: ReasonCode.EVIDENCE_STALE, snapshotDigest,
+      detail: refusal });
   }
 
   /** Durable, per-run fence for the whole asynchronous verification/review attempt. */
@@ -920,6 +1190,7 @@ export class CandidatePipeline {
       );
       if (inserted.changes === 1) {
         if (prior?.state === "RUNNING" && prior.deadline_at <= startedAt) {
+          this.db.afterCommit(() => this.abortAttempt(prior.attempt_id));
           this.recordAttemptReclaimed({
             runId: input.runId,
             attemptId: prior.attempt_id,
@@ -982,6 +1253,7 @@ export class CandidatePipeline {
           [releasedAt, attempt.run_id, attempt.attempt_id, releasedAt],
         );
         if (released.changes !== 1) continue;
+        this.db.afterCommit(() => this.abortAttempt(attempt.attempt_id));
         const startedAt = new Date(attempt.started_at).getTime();
         const reclaimedAttempt = {
           runId: attempt.run_id,
@@ -1030,6 +1302,93 @@ export class CandidatePipeline {
           attemptId,
           candidateDigest,
         });
+  }
+
+  /**
+   * Renews this attempt's lease on a real step, and only while the attempt still holds the run
+   * (`attemptHolds`): a RELEASED or expired attempt is never revived, and no deadline is set past the cap
+   * from acquisition. A compare-and-set on the attempt and the deadline it read; true while the attempt
+   * holds the run, and the caller is told only of a renewal that committed.
+   */
+  private renewAttempt(input: SubmitResultInput, attemptId: string, step: SubmissionProgressStep): boolean {
+    return this.db.tx(() => {
+      if (!this.attemptHolds(input, attemptId)) return false;
+      const now = this.clock.now();
+      const held = this.db.get<{ started_at: string; deadline_at: string }>(
+        `SELECT started_at, deadline_at FROM candidate_pipeline_attempts WHERE run_id = ? AND attempt_id = ?`,
+        [input.runId, attemptId],
+      )!;
+      const renewal = Math.min(now.getTime() + ATTEMPT_LEASE_TTL_MS, new Date(held.started_at).getTime() + ATTEMPT_LEASE_CAP_MS);
+      const deadlineAt = new Date(Math.max(renewal, new Date(held.deadline_at).getTime())).toISOString();
+      const renewed = this.db.run(
+        `UPDATE candidate_pipeline_attempts SET deadline_at = ?
+          WHERE run_id = ? AND attempt_id = ? AND state = 'RUNNING' AND deadline_at = ?`,
+        [deadlineAt, input.runId, attemptId, held.deadline_at],
+      ).changes === 1;
+      if (!renewed) {
+        this.abortAttempt(attemptId);
+        return false;
+      }
+      const notify = input.onProgress;
+      if (notify) {
+        this.db.afterCommit(() => {
+          try { notify(step); } catch { /* a notice that fails never decides the submission */ }
+        });
+      }
+      return true;
+    });
+  }
+
+  /**
+   * Whether this attempt still holds the run: RUNNING, unexpired, and its owner still the run's current
+   * one. An attempt found not to hold it is stopped (`abortAttempt`).
+   */
+  private attemptHolds(input: SubmitResultInput, attemptId: string): boolean {
+    const holds = this.db.get<{ n: number }>(
+      `SELECT 1 AS n FROM candidate_pipeline_attempts
+        WHERE run_id = ? AND attempt_id = ? AND owner_session_id = ? AND owner_binding_generation = ?
+          AND state = 'RUNNING' AND deadline_at > ?`,
+      [input.runId, attemptId, input.ownerSessionId, input.ownerBindingGeneration, this.clock.nowIso()],
+    ) !== undefined && this.runs.assertOwner(input.runId, input.ownerSessionId, input.ownerBindingGeneration).allowed;
+    if (!holds) this.abortAttempt(attemptId);
+    return holds;
+  }
+
+  /**
+   * Applies an attempt's outcome (a revision request, an unavailable-review row, the packet) only while
+   * the attempt holds the run: the check and the writes are one transaction. Null, with nothing applied,
+   * when it no longer holds; otherwise what `apply` answered, a denial rolling back what it wrote.
+   */
+  private applyHolding<T>(input: SubmitResultInput, attemptId: string, apply: () => Decision<T>): Decision<T> | null {
+    let lost = false;
+    const applied = this.db.txDecision(() => {
+      if (this.attemptHolds(input, attemptId)) return apply();
+      lost = true;
+      return deny<T>(ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE, "the attempt no longer holds the run", { runId: input.runId, attemptId });
+    });
+    return lost ? null : applied;
+  }
+
+  /**
+   * The answer of a submission whose attempt no longer holds the run (released, expired or at its cap):
+   * its outcome is not applied (`STALE_ATTEMPT_NOT_APPLIED`), and a review that answered is recorded as refused for it.
+   */
+  private attemptLost(
+    runId: string,
+    attemptId: string,
+    snapshotDigest: string,
+    reviewed: Decision<ReviewPacket> | null,
+  ): Decision<PipelineOutcome> {
+    const refusal = deny<PipelineOutcome>(
+      ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
+      STALE_ATTEMPT_NOT_APPLIED,
+      { runId, attemptId, candidateSnapshotDigest: snapshotDigest },
+    );
+    // A review the gate ended for this same reason reached no verdict, or recorded the one it did not keep.
+    if (reviewed !== null && reviewed.reasonCode !== ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE) {
+      this.recordStaleAfterReview(runId, snapshotDigest, attemptId, "ATTEMPT_LEASE", refusal, reviewed);
+    }
+    return refusal;
   }
 
   private releaseAttempt(runId: string, attemptId: string): void {
@@ -1089,6 +1448,100 @@ export class CandidatePipeline {
       dims: { stage: evidence["stage"] ?? null, mode: run.executionMode },
     });
     return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * F1 — a PASS whose findings hold a BLOCKER is refused by the production gate as REVIEW_BLOCK, and goes back to
+   * the owning CTO as a BLOCK verdict does: `returnToCto` with the reviewer's packet, keyed by this attempt and
+   * candidate, so a replay delivers nothing new. The gate's refusal stays the answer; any other refusal is as before.
+   */
+  private returnBlockedPass(
+    input: SubmitResultInput,
+    attemptId: string,
+    snapshotDigest: string,
+    built: Decision<ProductionReadyPacket>,
+    reviewed: Decision<ReviewPacket> | null,
+  ): Decision<PipelineOutcome> {
+    if (built.reasonCode !== ReasonCode.REVIEW_BLOCK || reviewed === null || !reviewed.allowed) return built as Decision<PipelineOutcome>;
+    const returned = this.applyHolding(input, attemptId, () => this.returnToCto(input.runId, ReasonCode.REVIEW_BLOCK, {
+      stage: "blind-review",
+      candidateSnapshotDigest: snapshotDigest,
+      runId: input.runId,
+      packet: reviewed.value,
+    }, attemptId));
+    if (returned === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewed);
+    if (!returned.allowed) return returned as Decision<PipelineOutcome>;
+    return built as Decision<PipelineOutcome>;
+  }
+
+  /**
+   * F1 — a review that did not judge the product (method findings alone, or assurance not constituted) tells the
+   * owning CTO so in band, keyed as a revision is by candidate, reason and attempt: the gate's reason code, a fixed
+   * notice and its fixed recovery text (`UNJUDGED_REVIEW_NOTICES`). It asks for no product change and records no
+   * revision. A method-only review's own method findings ride along, read from the review the gate stored; this
+   * private delivery is the only place they go. A run with no active owner binding gets nothing, as a revision.
+   * The notice names its attempt and counts the unjudged attempts in a row on this candidate
+   * (`consecutiveUnjudgedAttempts`); at `UNJUDGED_REVIEW_LIMIT` its next step is escalation, not another resubmit.
+   */
+  private noticeUnjudgedReview(runId: string, snapshotDigest: string, reviewed: Decision<ReviewPacket>, attemptId: string): Decision<void> {
+    const run = this.runs.require(runId);
+    // Limit: a project-less bootstrap run gets no notice. Its driven bootstrap CTO is told to write and submit a new
+    // PLAN for any REVISION_REQUEST, which would replace the PLAN under review; it keeps the daemon's review-retry
+    // wake (`Daemon.#bootstrapReviewRetry`), which resubmits the same PLAN, as today.
+    if (isProjectlessBootstrap(run)) return allow(ReasonCode.OK, undefined);
+    const roleKey = this.runs.ownerRoleKeyFor(run);
+    const binding = roleKey ? this.bindings.active(roleKey) : null;
+    if (!binding) return allow(ReasonCode.OK, undefined);
+    const notice = reviewed.evidence["problem"] === "METHOD_FINDINGS_ONLY" ? "METHOD_FINDINGS_ONLY" : "REVIEW_UNAVAILABLE";
+    const methodFindings = notice === "METHOD_FINDINGS_ONLY" ? this.storedReview(runId, snapshotDigest)?.content.methodFindings : undefined;
+    const unjudgedAttempts = this.consecutiveUnjudgedAttempts(runId, snapshotDigest);
+    const nextStep = unjudgedAttempts < UNJUDGED_REVIEW_LIMIT ? "RESUBMIT" : "ESCALATE";
+    const enqueued = this.outbox.enqueue({
+      idempotencyKey: `revision:${runId}:${snapshotDigest}:${reviewed.reasonCode}:${attemptId}`,
+      roleKey: binding.roleKey,
+      bindingGeneration: binding.bindingGeneration,
+      targetSessionId: binding.sessionId,
+      runId,
+      kind: MessageKind.REVISION_REQUEST,
+      payload: {
+        runId,
+        reasonCode: reviewed.reasonCode,
+        stage: "review-unavailable",
+        candidateSnapshotDigest: snapshotDigest,
+        attemptId,
+        notice,
+        unjudgedAttempts,
+        unjudgedAttemptLimit: UNJUDGED_REVIEW_LIMIT,
+        nextStep,
+        recovery: `${UNJUDGED_REVIEW_NOTICES[notice]} ${UNJUDGED_REVIEW_NEXT_STEPS[nextStep]}`,
+        ...(methodFindings === undefined ? {} : { methodFindings }),
+      },
+    });
+    return enqueued.allowed ? allow(ReasonCode.OK, undefined) : (enqueued as Decision<void>);
+  }
+
+  /**
+   * F1 — the unjudged attempts in a row on this candidate: walking the run's submission freezes from the latest back,
+   * each one of this candidate whose attempt recorded, while it held the run, a BLIND_REVIEW_UNAVAILABLE row counts,
+   * and the first other one (another candidate, or an attempt that ended any other way) stops the count. A freeze
+   * outside a submission names no attempt, and a submission refused at the limit (or `except`, the one asking) did
+   * not end the run of unjudged attempts; all three are passed over.
+   */
+  private consecutiveUnjudgedAttempts(runId: string, snapshotDigest: string, except?: string): number {
+    const rows = this.audit.forRun(runId);
+    const attemptsOf = (kind: string) => new Set(rows
+      .filter((row) => row.kind === kind && row.evidence["attemptHeld"] !== false)
+      .map((row) => row.evidence["attemptId"]));
+    const unjudged = attemptsOf("BLIND_REVIEW_UNAVAILABLE");
+    const refused = attemptsOf(UNJUDGED_REVIEW_LIMIT_REFUSED);
+    let count = 0;
+    for (const freeze of rows.filter((row) => row.kind === "CANDIDATE_FROZEN").sort((a, b) => b.eventId - a.eventId)) {
+      const attempt = freeze.evidence["attemptId"];
+      if (typeof attempt !== "string" || attempt === except || refused.has(attempt)) continue;
+      if (freeze.evidence["candidateSnapshotDigest"] !== snapshotDigest || !unjudged.has(attempt)) break;
+      count += 1;
+    }
+    return count;
   }
 
   /** The review gate's own BLIND_REVIEW artifact for a candidate, or null when the gate stored none. */
@@ -1204,6 +1657,7 @@ export class CandidatePipeline {
   async predecessorBase(input: Parameters<PredecessorBase>[0]): Promise<Decision<StartsFrom | null>> {
     const run = this.runs.get(input.runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
+    const checkMergeMessages = this.checkMergeMessages(input.runId);
     const built = await integratePredecessors({
       db: this.db,
       runId: input.runId,
@@ -1214,6 +1668,7 @@ export class CandidatePipeline {
       checkoutPath: input.checkoutPath,
       baseSha: input.baseSha,
       worktree: (worktreeInput, use) => this.verification.withRunWorktree(run, worktreeInput, use),
+      ...(checkMergeMessages === undefined ? {} : { checkMessage: checkMergeMessages }),
     });
     if (!built.allowed || built.value === null) return built;
     const ref = baseRefFor(input.runId, input.taskId);

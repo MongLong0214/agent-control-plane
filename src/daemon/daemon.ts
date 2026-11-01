@@ -30,7 +30,7 @@ import {
   CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON,
   CONTINUITY_PAUSE_OWNER_FIELDS,
 } from "../run/run-engine.ts";
-import { BOOTSTRAP_PLAN_TASKS } from "../run/task-graph.ts";
+import { BOOTSTRAP_PLAN_TASKS, receiptProcessIsRunning } from "../run/task-graph.ts";
 import { TASK_WRITE_TARGET_RECORDED, TaskWriteTargets } from "../run/task-write-target.ts";
 import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import {
@@ -355,8 +355,8 @@ export const OPERATOR_METHOD = {
   ROLE_ATTACHMENT_REVOKE: "roleAttachment.revoke",
   /**
    * The parked daemon's recovery for CTO_BINDING_POINTS_AT_DEAD_SESSION: release a PRIMARY_CTO
-   * binding whose session's process is provably gone, under an owner approval this call itself
-   * admits. It mints no session and no generation — see `dead-binding-recovery.ts` for why the
+   * binding — or the CEO binding, the door's one other role — whose session's process is provably
+   * gone. It mints no session and no generation — see `dead-binding-recovery.ts` for why the
    * spawning `CtoLifecycle.recoveryTakeover` is deliberately not what a parked daemon serves.
    */
   BINDING_RECOVER_DEAD: "binding.recoverDead",
@@ -1225,7 +1225,8 @@ export class Daemon {
   }
 
   /**
-   * Releases a canonical PRIMARY_CTO binding whose session's process is provably gone.
+   * Releases a canonical PRIMARY_CTO binding, or the CEO binding, whose session's process is
+   * provably gone.
    *
    * No owner-approval envelope is minted, admitted or consumed here. This method used to build
    * one and put it through `admitCliOwnerApproval`, and the reason it had to build its own rather
@@ -1767,11 +1768,15 @@ export class Daemon {
     const orphanedExecutions: string[] = (await this.cp.workerTurns.reconcileAfterRestart())
       .map((orphan) => orphan.executionId);
 
-    // A receipt that says RUNNING across a restart has no live worker behind it.
-    for (const row of this.cp.db.all<{ execution_id: string; worker_process_id: number | null }>(
-      `SELECT execution_id, worker_process_id FROM task_executions WHERE status = 'RUNNING' AND runtime_managed = 0`,
+    // A receipt that says RUNNING across a restart has no live worker behind it, unless the exact
+    // process it named at open still runs: the same pid with the same OS start.
+    for (const row of this.cp.db.all<{ execution_id: string; run_id: string; worker_process_id: number | null }>(
+      `SELECT execution_id, run_id, worker_process_id FROM task_executions WHERE status = 'RUNNING' AND runtime_managed = 0`,
     )) {
-      if (row.worker_process_id == null || !isAlive(row.worker_process_id)) {
+      if (
+        row.worker_process_id == null ||
+        !receiptProcessIsRunning(this.cp.db, { runId: row.run_id, executionId: row.execution_id, pid: row.worker_process_id })
+      ) {
         this.cp.tasks.finishExecution(row.execution_id, {
           status: "ABANDONED",
           failureClass: "infrastructure",
@@ -1779,6 +1784,9 @@ export class Daemon {
         orphanedExecutions.push(row.execution_id);
       }
     }
+    // A receipt's process confirmed gone, however the receipt ended, is recorded released: no runner
+    // exists to do it.
+    this.cp.workerTurns.releaseGoneReceiptProcesses();
 
     // #512 — a run that ended while no daemon ran, or before retirement existed, left its WORKER
     // bindings ACTIVE and their sessions live. Retired here, after the receipts above are settled and
@@ -2705,6 +2713,8 @@ export class Daemon {
       `SELECT event_id, kind, json_extract(evidence_json, '$.candidateSnapshotDigest') AS candidate
          FROM audit_events
         WHERE run_id = ? AND kind IN ('BLIND_REVIEW_UNAVAILABLE', 'BLIND_REVIEW_COMPLETED', 'BLIND_REVIEW_REJECTED')
+          -- An attempt that no longer held the run recorded its late failure as its own history only.
+          AND NOT (kind = 'BLIND_REVIEW_UNAVAILABLE' AND json_extract(evidence_json, '$.attemptHeld') IS 0)
         ORDER BY event_id DESC
         LIMIT 1`,
       [runId],
@@ -3172,8 +3182,10 @@ export class Daemon {
       });
       // #1189 — pending reviews follow a recovered CEO, and agent-owned waits take their deadline steps.
       void this.runPeriodic("agent_owned_waits", async () => { await this.sweepAgentOwnedWaits(); });
-      // #512 — and a retired worker's session left live while its process ran is settled on a later tick.
+      // #512 — and a retired worker's session left live while its process ran is settled on a later tick,
+      // after a CTO receipt's process confirmed gone since is recorded released.
       void this.runPeriodic("worker_retirement", async () => {
+        this.cp.workerTurns.releaseGoneReceiptProcesses();
         await this.cp.workerRetirement.reconcile();
       });
       void this.runPeriodic("cto_canonical_switchover_settle", () => this.settleCanonicalSwitchovers());
@@ -4100,16 +4112,6 @@ export class Daemon {
     return { complete: !lockRetained };
   }
 }
-
-const isAlive = (pid: number): boolean => {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-};
 
 const parseAuthenticatedOperatorPeer = (
   peer: AuthenticatedOperatorPeer | undefined,

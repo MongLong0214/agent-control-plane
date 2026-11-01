@@ -56,6 +56,10 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
                                            the state this exists for. There is no owner approval
                                            to present: the liveness proof is the whole bound, and
                                            <generation> is what stops a repeat.
+  agentctl binding recover-dead-ceo <sessionId> <incarnation> <generation>
+                                           the same release for the CEO binding, on the same proof.
+                                           The same CEO actor then re-attaches at the next
+                                           generation through adopt hermes or bootstrap hermes.
   agentctl conversation contradictions     turns whose records disagree, with the ids to cite
   agentctl conversation adjudicate <actor> <turn> <reason-code> <evidence-digest> <id>...
   agentctl conversation unresolved         turns waiting on a person, with what each already holds
@@ -519,9 +523,9 @@ export const dispatch = async (
     if (sub === "recover-dead") {
       return call("binding.recoverDead", {
         projectId: required(projectId, "projectId"),
-        // Fixed, not taken from the command line. This door recovers the canonical CTO binding
-        // and refuses any other role, so offering a role argument would only invite a request
-        // the daemon is going to refuse.
+        // Fixed, not taken from the command line. The door recovers the canonical CTO binding and
+        // the CEO's (`recover-dead-ceo` below) and refuses any other role, so offering a role
+        // argument would only invite a request the daemon is going to refuse.
         role: "PRIMARY_CTO",
         sessionId: required(sessionId, "sessionId"),
         sessionIncarnation: required(sessionIncarnation, "sessionIncarnation"),
@@ -532,6 +536,18 @@ export const dispatch = async (
         // that can only hold one value, and a nonce whose only job was to make that field's
         // envelope unique, recorded a decision nobody had made. The generation above is what
         // keeps a repeat from doing anything, and it did that before these two existed.
+      });
+    }
+    if (sub === "recover-dead-ceo") {
+      // The same door for its one other role. The CEO has no project, so the arguments shift by
+      // one and the project travels as an explicit null rather than as an omitted field.
+      const [, ceoSessionId, ceoSessionIncarnation, ceoGeneration] = args;
+      return call("binding.recoverDead", {
+        projectId: null,
+        role: "CEO",
+        sessionId: required(ceoSessionId, "sessionId"),
+        sessionIncarnation: required(ceoSessionIncarnation, "sessionIncarnation"),
+        expectedBindingGeneration: requiredInteger(ceoGeneration, "expectedBindingGeneration", 1),
       });
     }
     return fail(`unknown binding subcommand: ${sub ?? ""}`);

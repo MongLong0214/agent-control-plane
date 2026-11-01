@@ -165,6 +165,57 @@ export const snapshotContractChangeSchema = z.union([
 
 export type SnapshotContractChange = z.infer<typeof snapshotContractChangeSchema>;
 
+/**
+ * A CONTRACT_CHANGE candidate's canonical CTO identity baseline, as ACP's own tables held it at the
+ * freeze: the project's canonical session entitlement rows and its ACTIVE PRIMARY_CTO binding with the
+ * session the bound actor ran on (null when there is none). Part of the candidate's identity, so a
+ * changed entitlement or binding is a different candidate and is reviewed again.
+ */
+export const snapshotCanonicalCtoIdentitySchema = z
+  .object({
+    canonicalSessionEntitlements: z.array(z.object({
+      sessionUuid: z.string().min(1),
+      buzzActorId: z.string().min(1),
+      buzzAddress: z.string().min(1),
+      revision: z.number().int(),
+      revokedAt: z.string().nullable(),
+    }).strict()),
+    primaryCtoBinding: z.object({
+      assignmentId: z.string().min(1),
+      roleKey: z.string().min(1),
+      actorId: z.string().min(1),
+      sessionId: z.string().min(1),
+      sessionIncarnation: z.string().min(1),
+      bindingGeneration: z.number().int(),
+      createdAt: z.string().min(1),
+      currentSession: z.object({
+        sessionId: z.string().min(1),
+        incarnation: z.string().min(1),
+        lifecycle: z.string().min(1),
+        buzzActorId: z.string().nullable(),
+        buzzAddress: z.string().nullable(),
+      }).strict().nullable(),
+    }).strict().nullable(),
+  })
+  .strict();
+
+export type SnapshotCanonicalCtoIdentity = z.infer<typeof snapshotCanonicalCtoIdentitySchema>;
+
+const SNAPSHOT_DIGEST = z.string().regex(/^sha256:[0-9a-f]{64}$/);
+/**
+ * The private review evidence a STANDARD_WORK candidate was frozen with (review/standard-review-evidence.ts):
+ * digests only. The bundle's bytes stay in the run's private HANDOFF artifacts.
+ */
+export const snapshotReviewEvidenceSchema = z
+  .object({
+    digest: SNAPSHOT_DIGEST,
+    bundleSha256: SNAPSHOT_DIGEST,
+    candidateDigest: SNAPSHOT_DIGEST,
+    attachmentDigest: SNAPSHOT_DIGEST,
+  })
+  .strict();
+export type SnapshotReviewEvidence = z.infer<typeof snapshotReviewEvidenceSchema>;
+
 export const candidateSnapshotSchema = z
   .object({
     schema: z.literal(CANDIDATE_SNAPSHOT_SCHEMA_ID),
@@ -179,15 +230,33 @@ export const candidateSnapshotSchema = z
     bootstrapPlan: snapshotBootstrapPlanSchema.optional(),
     /** Present only on a CONTRACT_CHANGE candidate; every other snapshot omits the key. */
     contractChange: snapshotContractChangeSchema.optional(),
+    /** Present only on a CONTRACT_CHANGE candidate of a project; every other snapshot omits the key. */
+    canonicalCtoIdentity: snapshotCanonicalCtoIdentitySchema.optional(),
+    /** Present only on a STANDARD_WORK candidate frozen with CEO-attached review evidence. */
+    reviewEvidence: snapshotReviewEvidenceSchema.optional(),
     createdAt: z.string().min(1),
   })
   .strict()
   .superRefine((snapshot, ctx) => {
+    if (snapshot.reviewEvidence !== undefined && (snapshot.bootstrapPlan !== undefined || snapshot.contractChange !== undefined)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "only a STANDARD_WORK candidate carries review evidence",
+        path: ["reviewEvidence"],
+      });
+    }
     if (snapshot.bootstrapPlan !== undefined && snapshot.contractChange !== undefined) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: "a candidate is a bootstrap plan or a contract change, never both",
         path: ["contractChange"],
+      });
+    }
+    if (snapshot.canonicalCtoIdentity !== undefined && snapshot.contractChange === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "only a contract change candidate carries a canonical CTO identity baseline",
+        path: ["canonicalCtoIdentity"],
       });
     }
     for (const duplicate of duplicateRepositoryRoles(snapshot.repositories)) {
@@ -261,7 +330,9 @@ export const duplicateRepositoryRoles = (
  * A bootstrap candidate's PLAN, manifest and planned outputs are part of its identity (#246 C2):
  * a re-plan is a different candidate. A snapshot without `bootstrapPlan` digests exactly the four
  * fields it always did — the key is left out, not set to null — so no existing digest moves. The
- * same holds for a CONTRACT_CHANGE candidate's `contractChange` (#246 B2-a).
+ * same holds for a CONTRACT_CHANGE candidate's `contractChange` (#246 B2-a) and its canonical CTO
+ * identity baseline (`canonicalCtoIdentity`), and a STANDARD_WORK candidate's private review evidence
+ * (`reviewEvidence`): a candidate frozen with other evidence is a different candidate, reviewed again.
  */
 export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
   digestOf({
@@ -271,6 +342,8 @@ export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
     repositories: snapshot.repositories,
     ...(snapshot.bootstrapPlan === undefined ? {} : { bootstrapPlan: snapshot.bootstrapPlan }),
     ...(snapshot.contractChange === undefined ? {} : { contractChange: snapshot.contractChange }),
+    ...(snapshot.canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity: snapshot.canonicalCtoIdentity }),
+    ...(snapshot.reviewEvidence === undefined ? {} : { reviewEvidence: snapshot.reviewEvidence }),
   });
 
 /**
@@ -334,6 +407,8 @@ export const buildCandidateSnapshot = async (
     contractDigest: string;
     repositories: readonly SnapshotRepositoryInput[];
     contractChange?: SnapshotContractChange;
+    canonicalCtoIdentity?: SnapshotCanonicalCtoIdentity;
+    reviewEvidence?: SnapshotReviewEvidence;
   },
   clock: Clock,
 ): Promise<CandidateSnapshot> => {
@@ -391,6 +466,8 @@ export const buildCandidateSnapshot = async (
     contractDigest: params.contractDigest,
     repositories,
     ...(params.contractChange === undefined ? {} : { contractChange: params.contractChange }),
+    ...(params.canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity: params.canonicalCtoIdentity }),
+    ...(params.reviewEvidence === undefined ? {} : { reviewEvidence: params.reviewEvidence }),
     createdAt: clock.nowIso(),
   });
 };
@@ -407,6 +484,7 @@ export const buildNoRepositoryCandidateSnapshot = (
     contractDigest: string;
     bootstrapPlan?: SnapshotBootstrapPlan;
     contractChange?: SnapshotContractChange;
+    canonicalCtoIdentity?: SnapshotCanonicalCtoIdentity;
   },
   clock: Clock,
 ): CandidateSnapshot =>
@@ -417,6 +495,7 @@ export const buildNoRepositoryCandidateSnapshot = (
     repositories: [],
     ...(params.bootstrapPlan === undefined ? {} : { bootstrapPlan: params.bootstrapPlan }),
     ...(params.contractChange === undefined ? {} : { contractChange: params.contractChange }),
+    ...(params.canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity: params.canonicalCtoIdentity }),
     createdAt: clock.nowIso(),
   });
 

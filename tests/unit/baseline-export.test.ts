@@ -265,7 +265,7 @@ describe("host-anchored redacted run-evidence export", () => {
     expect(verifyRunEvidenceExport(reseal(derivedQualityTampered), harness.cp.db)).toBe(false);
 
     const baselineBundle = sealBaselineEvidenceExport({
-      schema: "agent-control-plane.baseline-export.v1",
+      schema: BASELINE_EXPORT_SCHEMA_ID,
       window: { from: "2020-01-01T00:00:00.000Z", to: "2030-01-01T00:00:00.000Z" },
       runs: [exported.value],
       gateAAssessment: assessBaselineMinimum([exported.value]),

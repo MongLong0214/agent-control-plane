@@ -53,7 +53,19 @@ export interface ObservedRepository {
   /** Carries the create marker that lets a retry recognise its own create (RF1043-02). */
   description: string | null;
   defaultBranch: string | null;
+  /** #1269 — absent, or a field `null`, where GitHub's answer did not carry it: unknown, never a default. */
+  mergeMethods?: MergeMethods<boolean | null>;
 }
+
+/** #1269 — the merge methods a repository allows, under GitHub's field names. */
+export interface MergeMethods<T = boolean> {
+  allow_merge_commit: T;
+  allow_squash_merge: T;
+  allow_rebase_merge: T;
+}
+
+/** #1269 — every repository the port creates allows ordinary merge commits only. */
+export const NEW_REPOSITORY_MERGE_METHODS: MergeMethods = { allow_merge_commit: true, allow_squash_merge: false, allow_rebase_merge: false };
 
 export interface ObservedBranch {
   name: string;
@@ -104,6 +116,12 @@ export interface WorkMilestone { number: number; nodeId: string; title: string; 
 export interface WorkIssue { number: number; nodeId: string; title: string; body: string; milestone: { number: number; nodeId: string } | null }
 /** #1240 — every milestone and issue of the repository at `repositoryNodeId`, all pages. */
 export interface WorkResources { repositoryNodeId: string; milestones: WorkMilestone[]; issues: WorkIssue[] }
+/**
+ * #1240 — a planned genesis label, milestone or issue a readback did not find as planned: nothing carries
+ * its name or marker (`absent`), something does but differs (`differs`), or the issue does not link its
+ * planned milestone (`milestone`).
+ */
+export interface GenesisResourceUnmet { resource: "label" | "milestone" | "issue"; key: string; problem: "absent" | "differs" | "milestone" }
 
 export interface GitHubWritePort {
   observeRepository(target: GitHubRepositoryTarget): Promise<ObservedRepository | null>;
@@ -137,9 +155,10 @@ export interface GitHubWritePort {
   /**
    * #1240 — with `repositoryNodeId`, the readback is the repository's at that node id, read before and
    * after the lists, and every listed milestone and issue must name that repository (an answer naming
-   * another is thrown, never matched); an issue's milestone is judged by the milestone's node id.
+   * another is thrown, never matched); an issue's milestone is judged by the milestone's node id. A
+   * readback that answers null pushes each planned item it did not find as planned onto `unmet`.
    */
-  observeGenesisResources?(target: GitHubRepositoryTarget, bundle: Pick<GenesisBundle, 'labels' | 'milestones' | 'issues'>, options?: { repositoryNodeId?: string }): Promise<Record<string, unknown> | null>;
+  observeGenesisResources?(target: GitHubRepositoryTarget, bundle: Pick<GenesisBundle, 'labels' | 'milestones' | 'issues'>, options?: { repositoryNodeId?: string; unmet?: GenesisResourceUnmet[] }): Promise<Record<string, unknown> | null>;
   /**
    * #1240 — a readback for a STANDARD_WORK run's work units: every milestone and issue (pull requests
    * excluded) on every page, the repository read at `repositoryNodeId` before and after the lists, and
@@ -258,6 +277,9 @@ interface RepositoryDocument {
   private?: unknown;
   description?: unknown;
   default_branch?: unknown;
+  allow_merge_commit?: unknown;
+  allow_squash_merge?: unknown;
+  allow_rebase_merge?: unknown;
 }
 
 /**
@@ -295,7 +317,13 @@ const repositoryFrom = (document: RepositoryDocument, path: string): ObservedRep
         : "unknown";
   const defaultBranch = typeof document.default_branch === "string" ? document.default_branch : null;
   const description = typeof document.description === "string" ? document.description : null;
-  return { nodeId, fullName, visibility, description, defaultBranch };
+  const flag = (value: unknown): boolean | null => (typeof value === "boolean" ? value : null);
+  const mergeMethods = {
+    allow_merge_commit: flag(document.allow_merge_commit),
+    allow_squash_merge: flag(document.allow_squash_merge),
+    allow_rebase_merge: flag(document.allow_rebase_merge),
+  };
+  return { nodeId, fullName, visibility, description, defaultBranch, mergeMethods };
 };
 
 interface ProtectionDocument {
@@ -368,7 +396,7 @@ const repoPath = (target: GitHubRepositoryTarget): string => `repos/${target.own
 const LIST_PAGE = 100;
 const LIST_PAGE_BOUND = 100;
 
-interface ListedMilestone { number: number; node_id: string; title: string; description: string; url?: unknown }
+interface ListedMilestone { number: number; node_id: string; title: string; description: string | null; url?: unknown }
 interface ListedIssue {
   number: number;
   node_id: string;
@@ -476,6 +504,8 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
         private: visibility === "private",
         visibility,
         auto_init: autoInit,
+        // https://docs.github.com/en/rest/repos/repos — both create endpoints take these (default true); GET repos/{owner}/{repo} returns them.
+        ...NEW_REPOSITORY_MERGE_METHODS,
       });
       return repositoryFrom(created, path);
     },
@@ -609,14 +639,31 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
         await identified(target, repositoryNodeId!);
       }
       const issues = fullName === null ? listed : listed.filter(i => i.pull_request === undefined);
-      const markedMilestone = (key: string) => milestones.find(m => m.description.endsWith(`<!-- acp-genesis:${key} -->`));
+      const markedMilestone = (key: string) => milestones.find(m => (m.description ?? "").endsWith(`<!-- acp-genesis:${key} -->`));
       // With the repository bound, a link is the milestone's node id; a number alone can name another one.
       const linked = (x: ListedIssue, key: string): boolean => fullName === null
         ? x.milestone?.number === markedMilestone(key)?.number
         : x.milestone != null && x.milestone.node_id === markedMilestone(key)?.node_id;
-      if (!bundle.labels.every(l => labels.some(x => x.name === l.name && sameIgnoringCase(x.color, l.color) && (x.description ?? '') === l.description))) return null;
-      if (!bundle.milestones.every(m => milestones.some(x => x.title === m.title && x.description === `${m.description}\n<!-- acp-genesis:${m.key} -->`))) return null;
-      if (!bundle.issues.every(i => issues.some(x => x.title === i.title && x.body === `${i.body}\n<!-- acp-genesis:${i.key} -->` && canonicalLabels(x.labels.map(l => l.name)) === canonicalLabels(i.labels) && (i.milestoneKey === null ? x.milestone === null : linked(x, i.milestoneKey))))) return null;
+      // #1240 — each planned item not found as planned is named, so a failed readback says what is unmet.
+      const unmet: GenesisResourceUnmet[] = [];
+      for (const l of bundle.labels) {
+        if (labels.some(x => x.name === l.name && sameIgnoringCase(x.color, l.color) && (x.description ?? '') === l.description)) continue;
+        unmet.push({ resource: "label", key: l.name, problem: labels.some(x => sameIgnoringCase(x.name, l.name)) ? "differs" : "absent" });
+      }
+      for (const m of bundle.milestones) {
+        if (milestones.some(x => x.title === m.title && x.description === `${m.description}\n<!-- acp-genesis:${m.key} -->`)) continue;
+        unmet.push({ resource: "milestone", key: m.key, problem: markedMilestone(m.key) ? "differs" : "absent" });
+      }
+      for (const i of bundle.issues) {
+        const marked = issues.filter(x => (x.body ?? "").endsWith(`<!-- acp-genesis:${i.key} -->`));
+        const same = marked.filter(x => x.title === i.title && x.body === `${i.body}\n<!-- acp-genesis:${i.key} -->` && canonicalLabels(x.labels.map(l => l.name)) === canonicalLabels(i.labels));
+        if (same.some(x => i.milestoneKey === null ? x.milestone === null : linked(x, i.milestoneKey))) continue;
+        unmet.push({ resource: "issue", key: i.key, problem: same.length > 0 ? "milestone" : marked.length > 0 ? "differs" : "absent" });
+      }
+      if (unmet.length > 0) {
+        options?.unmet?.push(...unmet);
+        return null;
+      }
       return { labels:bundle.labels, milestones:bundle.milestones, issues:bundle.issues };
     },
     async observeWorkResources(target, repositoryNodeId) {

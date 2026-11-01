@@ -255,11 +255,22 @@ describe("the reuse decision", () => {
     }
   });
 
-  it("does not reuse a push with two parents", async () => {
+  // #1269: a merge commit names its head as its second parent; no trailer is read.
+  it("reuses a merge commit push whose parents are the tested base and the pull request's head", async () => {
     const { decision } = await decide({}, ({ routes }) => {
-      routes.set(`/repos/${REPO}/commits/${PUSHED}`, { commit: { tree: { sha: TREE }, message: MESSAGE }, parents: [{ sha: PARENT }, { sha: HEAD }] });
+      routes.set(`/repos/${REPO}/commits/${PUSHED}`, { commit: { tree: { sha: TREE }, message: "Merge pull request #9\n\nNo trailer here.\n" }, parents: [{ sha: PARENT }, { sha: HEAD }] });
     });
-    expect(decision.reuse).toBe(false);
+    expect(decision.reuse, decision.reason).toBe(true);
+    expect(decision.evidence).toMatchObject({ headSha: HEAD, parentSha: PARENT });
+  });
+
+  it("does not reuse a merge commit push whose second parent is not the pull request's head, or one with three parents", async () => {
+    for (const parents of [[PARENT, SIBLING], [PARENT, HEAD, OTHER]]) {
+      const { decision } = await decide({}, ({ routes }) => {
+        routes.set(`/repos/${REPO}/commits/${PUSHED}`, { commit: { tree: { sha: TREE }, message: MESSAGE }, parents: parents.map((sha) => ({ sha })) });
+      });
+      expect(decision.reuse, JSON.stringify(parents)).toBe(false);
+    }
   });
 
   // The Merged-Head trailer is a claim in a message; GitHub's merged-PR record must say the same.

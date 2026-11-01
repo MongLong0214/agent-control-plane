@@ -42,6 +42,8 @@ import {
   judgeCommitLoreInitCommand,
   judgeCommitLoreVersion,
 } from "../../src/bootstrap/commitlore-pin.ts";
+import { latestRelease, stableReleaseAnswer } from "../helpers/commitlore-release.ts";
+import { hostGitDirectory, packageVersionFor, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 /**
@@ -224,10 +226,13 @@ interface FakeOptions {
   mode?: number;
 }
 
-/** A fake `commitlore` in a directory of its own; every invocation appends its argv and environment to `log`. */
-const fake = (name: string, options: FakeOptions = {}): { dir: string; bin: string; log: string } => {
+/**
+ * A fake `commitlore` in a directory of its own, installed as CommitLore's installer installs it (#1268: a run
+ * copies the package its wrapper names, so a fixture is a package): `bin` is the wrapper, `bundle` the program.
+ * Every invocation appends its argv and environment to `log`.
+ */
+const fake = (name: string, options: FakeOptions = {}): { dir: string; bin: string; log: string; bundle: string } => {
   const dir = tempDir(`acp-s16-${name}-`);
-  const bin = join(dir, "commitlore");
   const log = join(dir, "invocations.jsonl");
   const {
     version = "1.7.3\n",
@@ -246,11 +251,9 @@ const fake = (name: string, options: FakeOptions = {}): { dir: string; bin: stri
   } = options;
   const unknownAnswer =
     unknown === "root-usage" ? `answer(${JSON.stringify(ROOT_USAGE)}, 0)` : `process.stderr.write("error: unknown command or option '" + argv.join(' ') + "'\\n", () => process.exit(2))`;
-  writeFileSync(join(dir, "package.json"), '{"type":"commonjs"}');
-  writeFileSync(
-    bin,
-    `#!${process.execPath}
-const fs = require('node:fs');
+  const installed = writeCommitLoreInstall(
+    dir,
+    `const fs = require('node:fs');
 const argv = process.argv.slice(2);
 const [command, flag] = argv;
 fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv, env: process.env, origin: performance.timeOrigin, first: performance.timeOrigin + performance.now() }) + '\\n');
@@ -263,9 +266,9 @@ else if (command === 'init' && flag === '--help' && argv.length === 2) ${hasInit
 else if (${hasInit} && argv.join(' ') === ${JSON.stringify(INIT)}) answer('', ${initExit});
 else ${unknownAnswer};
 `,
-    { mode: options.mode ?? 0o700 },
+    { version: packageVersionFor(version), mode: options.mode ?? 0o700 },
   );
-  return { dir, bin, log };
+  return { dir, bin: installed.wrapper, log, bundle: installed.bundle };
 };
 
 const invocations = (log: string): Array<{ argv: string[]; env: Record<string, string>; origin: number; first: number }> => {
@@ -284,11 +287,14 @@ const argvs = (log: string): string[] => invocations(log).map(({ argv }) => argv
 /** A working `commitlore` first on this process's PATH: what a PATH search would find and pass with. */
 const workingOnPath = () => {
   const onPath = fake("on-path");
-  vi.stubEnv("PATH", `${onPath.dir}:/usr/bin:/bin`);
+  vi.stubEnv("PATH", `${onPath.dir}:${hostGitDirectory()}:/usr/bin:/bin`);
   return onPath;
 };
 
-const refusedWith = async (condition: string, port = createCommitLoreCliPort()) => {
+/** #1268 — the production port on the pin in the environment, with a release lookup confirming `version` as the newest. */
+const envPort = (version = "1.7.3") => createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, undefined, latestRelease(version)));
+
+const refusedWith = async (condition: string, port = envPort()) => {
   const probed = await probeCommitLore(port);
   expect(probed).toMatchObject({
     allowed: false,
@@ -420,15 +426,15 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
     workingOnPath();
     const pinned = fake("supported", { version });
     vi.stubEnv(VARIABLE, pinned.bin);
-    expect(await probeCommitLore(createCommitLoreCliPort())).toMatchObject({ allowed: true, value: { outcome: "PASS" } });
+    expect(await probeCommitLore(envPort(version.trim()))).toMatchObject({ allowed: true, value: { outcome: "PASS" } });
   });
 
   it("the pin, not PATH, is what runs: a failing CLI first on PATH does not answer for a working pin", async () => {
     const onPath = fake("failing-on-path", { doctorReport: FAILED_REPORT, doctorExit: 1 });
-    vi.stubEnv("PATH", `${onPath.dir}:/usr/bin:/bin`);
+    vi.stubEnv("PATH", `${onPath.dir}:${hostGitDirectory()}:/usr/bin:/bin`);
     const pinned = fake("pinned");
     vi.stubEnv(VARIABLE, pinned.bin);
-    expect(await probeCommitLore(createCommitLoreCliPort())).toMatchObject({ allowed: true, value: { outcome: "PASS" } });
+    expect(await probeCommitLore(envPort())).toMatchObject({ allowed: true, value: { outcome: "PASS" } });
     expect(invocations(onPath.log)).toEqual([]);
     // The pin's own checks precede the observation's first command, once.
     expect(argvs(pinned.log)).toEqual(OBSERVATION);
@@ -438,7 +444,7 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
     workingOnPath();
     const pinned = fake("each-observation");
     vi.stubEnv(VARIABLE, pinned.bin);
-    const port = createCommitLoreCliPort();
+    const port = envPort();
     const root = tempDir("acp-s16-each-observation-");
     expect(await port.observe(root)).toMatchObject({ outcome: "PASS" });
     expect(await port.observe(root)).toMatchObject({ outcome: "PASS" });
@@ -469,7 +475,7 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
     prepareFixture(pinned.bin, ["doctor", "--help"], pinned.log);
     const limits = { ...COMMITLORE_LIMITS, checkTimeoutMs: 800, killGraceMs: 300 };
     try {
-      const observed = await createCommitLoreCliPort(commitloreRunner(limits, pinned.bin)).observe(tempDir("acp-s16-hanging-check-"));
+      const observed = await createCommitLoreCliPort(commitloreRunner(limits, pinned.bin, latestRelease("1.7.3"))).observe(tempDir("acp-s16-hanging-check-"));
       expect(observed).toMatchObject({ outcome: "FAIL", detail: expect.stringMatching(/commitlore --version did not answer within 800 ms/) });
       expect(argvs(pinned.log)).toEqual(["--version"]);
     } finally {
@@ -486,7 +492,7 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
     const pinned = shellFake("slow-check", { versionDelay: "1.5" });
     const limits = { ...COMMITLORE_LIMITS, timeoutMs: 1_000, killGraceMs: 300 };
     const started = performance.now();
-    const observed = await createCommitLoreCliPort(commitloreRunner(limits, pinned.bin)).observe(tempDir("acp-s16-slow-check-"));
+    const observed = await createCommitLoreCliPort(commitloreRunner(limits, pinned.bin, latestRelease("1.7.3"))).observe(tempDir("acp-s16-slow-check-"));
     const elapsed = performance.now() - started;
     const trace = process.env["S16_WITNESS_TRACE"];
     if (trace !== undefined) appendFileSync(trace, `${JSON.stringify({ elapsed, observed, ran: shellArgvs(pinned.log) })}\n`);
@@ -503,7 +509,7 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
     const pinned = fake("cold-first-spawn");
     expect(COMMITLORE_LIMITS).toMatchObject({ checkTimeoutMs: 180_000, timeoutMs: 180_000 });
     const started = performance.timeOrigin + performance.now();
-    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pinned.bin)).observe(tempDir("acp-s16-cold-"));
+    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pinned.bin, latestRelease("1.7.3"))).observe(tempDir("acp-s16-cold-"));
     expect(observed).toMatchObject({ outcome: "PASS" });
     const ran = invocations(pinned.log);
     // Its first exec, which pays the cold cost, is the `--version` check, under `checkTimeoutMs`; `init` and
@@ -525,8 +531,13 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
     vi.stubEnv("GIT_CONFIG_COUNT", "2");
     vi.stubEnv("GIT_CONFIG_KEY_1", "credential.helper");
     vi.stubEnv("GIT_CONFIG_VALUE_1", "s16-only-count");
-    await probeCommitLore(createCommitLoreCliPort());
+    await probeCommitLore(envPort());
     const checks = invocations(pinned.log).filter(({ argv }) => argv[0] === "--version" || argv[1] === "--help");
+    // #1268 — the observation's environment: the worker's git hardening bar the hooks path and the empty attribute
+    // source, on top of S11-R3's controls.
+    const observationEnvironment = commitloreChildEnvironment("/", { gitDir: "/", workTree: "/", installsHooks: true });
+    const observationHardening = Object.fromEntries(Object.entries(observationEnvironment).filter(([key]) => /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/.test(key)));
+    expect(Object.values(observationHardening)).toEqual(expect.arrayContaining(["credential.helper", "core.fsmonitor"]));
     expect(checks.map(({ argv }) => argv.join(" "))).toEqual(["--version", "doctor --help", "init --help"]);
     const constructed = new Set([
       "PATH",
@@ -537,11 +548,11 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
       "LC_ALL",
       "GIT_CONFIG_GLOBAL",
       "GIT_CONFIG_NOSYSTEM",
-      "GIT_CONFIG_COUNT",
-      "GIT_CONFIG_KEY_0",
-      "GIT_CONFIG_VALUE_0",
       "GIT_ASKPASS",
       "GIT_TERMINAL_PROMPT",
+      "GIT_SSH_COMMAND",
+      // #1268 — the worker's git hardening, bar the hooks path init installs into: every value ACP's own.
+      ...Object.keys(observationEnvironment).filter((key) => key.startsWith("GIT_")),
     ]);
     for (const { env } of checks) {
       expect(Object.keys(env).filter((key) => !constructed.has(key) && key !== "__CF_USER_TEXT_ENCODING")).toEqual([]);
@@ -553,14 +564,15 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
       expect(home).not.toBe(daemonHome);
       expect(existsSync(home), home).toBe(false);
       expect(env).toMatchObject({
-        GIT_CONFIG_GLOBAL: join(home, ".gitconfig"),
+        GIT_CONFIG_GLOBAL: "/dev/null",
         GIT_CONFIG_NOSYSTEM: "1",
-        GIT_CONFIG_COUNT: "1",
-        GIT_CONFIG_KEY_0: "credential.helper",
-        GIT_CONFIG_VALUE_0: "",
+        ...observationHardening,
         GIT_ASKPASS: "",
         GIT_TERMINAL_PROMPT: "0",
+        GIT_SSH_COMMAND: "ssh",
+        GIT_ATTR_SOURCE: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
       });
+      expect(Object.entries(observationHardening)).toContainEqual([expect.stringMatching(/^GIT_CONFIG_KEY_/), "credential.helper"]);
     }
     expect(new Set(checks.map(({ env }) => env["HOME"])).size).toBe(checks.length);
   });
@@ -684,7 +696,7 @@ describe("S16-R1-03: the pinned CLI must have the init command, with the options
     const pinned = fake("no-init-root-usage", { hasInit: false, unknown: "root-usage" });
     expect(execFileSync(pinned.bin, INIT.split(" "), { encoding: "utf8", timeout: 30_000 })).toBe(ROOT_USAGE);
     writeFileSync(pinned.log, "");
-    const probed = await refusedWith("NO_INIT_COMMAND", createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pinned.bin)));
+    const probed = await refusedWith("NO_INIT_COMMAND", createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pinned.bin, latestRelease("1.7.3"))));
     expect(probed.allowed).toBe(false);
     expect(argvs(pinned.log)).not.toContain(INIT);
   });
@@ -692,7 +704,7 @@ describe("S16-R1-03: the pinned CLI must have the init command, with the options
   it("the help check runs no init and vouches for none: an init that lists its options and then fails still fails the observation", async () => {
     workingOnPath();
     const pinned = fake("init-fails", { initExit: 2 });
-    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pinned.bin)).observe(tempDir("acp-s16-init-fails-"));
+    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pinned.bin, latestRelease("1.7.3"))).observe(tempDir("acp-s16-init-fails-"));
     expect(observed).toMatchObject({ outcome: "FAIL", detail: expect.stringMatching(/^commitlore init failed \(2\)/) });
     expect(argvs(pinned.log)).toEqual(OBSERVATION.slice(0, 4));
   });
@@ -701,7 +713,7 @@ describe("S16-R1-03: the pinned CLI must have the init command, with the options
 describe("S16-R1-02: every spawn after the checks is preceded by a re-check that the pin is still the file the checks ran", () => {
   /** A CLI that would pass everything but `--version`, logging every argv that reaches it. */
   const uncheckedTarget = () => fake("unchecked-target", { version: "2.0.0\n" });
-  const observeAt = (pin: string) => probeCommitLore(createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pin)));
+  const observeAt = (pin: string) => probeCommitLore(createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pin, latestRelease("1.7.3"))));
   const swapLink = (pin: string, to: string) =>
     `fs.symlinkSync(${JSON.stringify(to)}, ${JSON.stringify(`${pin}.next`)}); fs.renameSync(${JSON.stringify(`${pin}.next`)}, ${JSON.stringify(pin)});`;
   const renameOver = (pin: string, from: string) =>
@@ -727,7 +739,8 @@ describe("S16-R1-02: every spawn after the checks is preceded by a re-check that
     const bad = uncheckedTarget();
     const good = fake("renamed-over", {});
     const pin = good.bin;
-    writeFileSync(pin, readFileSync(pin, "utf8").replace("const answer =", `if (argv.join(' ') === 'doctor --help') { ${renameOver(pin, bad.bin)} }\nconst answer =`), { mode: 0o700 });
+    // The program is the package's bundle (#1268); the pin it renames over is the wrapper.
+    writeFileSync(good.bundle, readFileSync(good.bundle, "utf8").replace("const answer =", `if (argv.join(' ') === 'doctor --help') { ${renameOver(pin, bad.bin)} }\nconst answer =`), { mode: 0o700 });
     const probed = await observeAt(pin);
     expect(probed).toMatchObject({ allowed: false, evidence: { observation: { outcome: "FAIL", detail: expect.stringContaining(`${VARIABLE} REPLACED`) } } });
     expect(argvs(bad.log)).toEqual([]);
@@ -748,7 +761,7 @@ describe("S16-R1-02: every spawn after the checks is preceded by a re-check that
     const good = fake("changed", {});
     const target = linked ? pin : good.bin;
     const code = how === "rewrite" ? rewrite(target, bad.bin) : how === "touch" ? touch(target) : swapLink(target, bad.bin);
-    writeFileSync(good.bin, readFileSync(good.bin, "utf8").replace("const answer =", `if (argv.join(' ') === ${JSON.stringify(when)}) { ${code} }\nconst answer =`), { mode: 0o700 });
+    writeFileSync(good.bundle, readFileSync(good.bundle, "utf8").replace("const answer =", `if (argv.join(' ') === ${JSON.stringify(when)}) { ${code} }\nconst answer =`), { mode: 0o700 });
     if (linked) symlinkSync(good.bin, pin);
     const probed = await observeAt(target);
     expect(probed).toMatchObject({ allowed: false, evidence: { observation: { outcome: "FAIL", detail: expect.stringContaining(`${VARIABLE} REPLACED`) } } });
@@ -763,7 +776,7 @@ describe("S16-R1-02: every spawn after the checks is preceded by a re-check that
     const pin = join(tempDir("acp-s16-during-init-"), "commitlore");
     const good = fake("during-init", { during: { argv: INIT, code: swapLink(pin, bad.bin) } });
     symlinkSync(good.bin, pin);
-    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pin)).observe(tempDir("acp-s16-during-init-checkout-"));
+    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pin, latestRelease("1.7.3"))).observe(tempDir("acp-s16-during-init-checkout-"));
     expect(observed).toMatchObject({ outcome: "FAIL", detail: expect.stringMatching(new RegExp(`^commitlore doctor could not be run: ${VARIABLE} REPLACED`)) });
     expect(argvs(bad.log)).toEqual([]);
     expect(argvs(good.log)).toEqual(OBSERVATION.slice(0, 4));
@@ -780,33 +793,35 @@ describe("S16-R1-02: every spawn after the checks is preceded by a re-check that
 });
 
 /**
- * A `commitlore` that is a `/bin/sh` script: what it answers is fixed when it is written, before any clock
- * starts, so a command it answers costs a shell's start and a `printf`, not an interpreter's start-up. The
- * `--version` check sleeps `versionDelay` seconds first. Each invocation appends its argv to `log`.
+ * A `commitlore` whose answers are fixed when it is written, before any clock starts: a command costs the
+ * interpreter's start and one write. (It was a `/bin/sh` script; #1268 runs a copy of the package the wrapper
+ * names with node, so it is a bundle now.) The `--version` check waits `versionDelay` seconds first. Each
+ * invocation appends its argv to `log`.
  */
 const shellFake = (name: string, { versionDelay = "0" }: { versionDelay?: string } = {}): { dir: string; bin: string; log: string } => {
   const dir = tempDir(`acp-s16-${name}-`);
-  const bin = join(dir, "commitlore");
   const log = join(dir, "invocations.txt");
-  const quoted = (text: string): string => `'${text.replace(/'/g, `'\\''`)}'`;
-  writeFileSync(
-    bin,
-    [
-      "#!/bin/sh",
-      `printf '%s\\n' "$*" >> ${quoted(log)}`,
-      'case "$*" in',
-      `  "--version") sleep ${versionDelay}; printf '1.7.3\\n' ;;`,
-      `  "doctor --help") printf '%s' ${quoted(DOCTOR_USAGE)} ;;`,
-      `  "init --help") printf '%s' ${quoted(INIT_USAGE)} ;;`,
-      `  "${INIT}") : ;;`,
-      `  "doctor --json") printf '%s\\n' ${quoted(OK_REPORT)} ;;`,
-      `  *) printf "error: unknown command or option '%s'\\n" "$*" >&2; exit 2 ;;`,
-      "esac",
-      "",
-    ].join("\n"),
-    { mode: 0o700 },
+  const answers: Record<string, string> = {
+    "--version": "1.7.3\n",
+    "doctor --help": DOCTOR_USAGE,
+    "init --help": INIT_USAGE,
+    [INIT]: "",
+    "doctor --json": `${OK_REPORT}\n`,
+  };
+  const installed = writeCommitLoreInstall(
+    dir,
+    `const fs = require('node:fs');
+const argv = process.argv.slice(2).join(' ');
+fs.appendFileSync(${JSON.stringify(log)}, argv + '\\n');
+const answers = ${JSON.stringify(answers)};
+const answer = () => {
+  if (!(argv in answers)) return process.stderr.write("error: unknown command or option '" + argv + "'\\n", () => process.exit(2));
+  process.stdout.write(answers[argv], () => process.exit(0));
+};
+if (argv === '--version') setTimeout(answer, ${Math.round(Number(versionDelay) * 1000)}); else answer();
+`,
   );
-  return { dir, bin, log };
+  return { dir, bin: installed.wrapper, log };
 };
 const shellArgvs = (log: string): string[] => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : []);
 
@@ -873,24 +888,28 @@ describe("S16: the real CLI (ACP_TEST_REAL_COMMITLORE, else the first on PATH) i
     execFileSync("git", ["init", "-q"], { cwd: repo, timeout: 20_000 });
     const hooks = (): string[] => readdirSync(join(repo, ".git", "hooks")).sort();
     const hooksBefore = hooks();
+    // #1268 — what release is newest is not this test's subject, and it reaches no network: the lookup
+    // confirms the real CLI's own version.
+    const realVersion = execFileSync(REAL as string, ["--version"], { encoding: "utf8", timeout: 20_000 }).trim();
     vi.stubEnv("HOME", home);
     vi.stubEnv(VARIABLE, undefined);
     for (const key of ["ACP_MCP_TOKEN", "ACP_OPERATOR_TOKEN", "GH_TOKEN"]) vi.stubEnv(key, `s16-only-${key}`);
-    const run = commitloreRunner(COMMITLORE_LIMITS, REAL as string);
+    const run = commitloreRunner(COMMITLORE_LIMITS, REAL as string, latestRelease(realVersion));
     // The usage again, through the runner: the branch the title names is the one judged here.
     const usage = await run(["init", "--help"], repo);
     expect(usage.exitCode).toBe(0);
     expect(branchFor(usage.stdout)).toBe(REAL_BRANCH);
     if (offersNoAgentHooks(usage.stdout)) {
-      // The pin is passed, not found: its checks, `--version`, `doctor --help` and `init --help`, pass, and so
-      // does a run through the runner they bound.
-      const checked = await run.ready(repo);
-      const answered = await checked(["--version"], repo);
+      // The pin is passed, not found: its checks, `--version`, `doctor --help` and `init --help`, pass on the
+      // copy of the package it loads (#1268), and so does a run through the runner they prepared.
+      const prepared = await run.prepare(repo, { gitDir: join(repo, ".git"), workTree: repo }, { checked: true });
+      const answered = await prepared.run(["--version"], repo);
+      prepared.dispose();
       expect(answered.exitCode).toBe(0);
       expect(answered.stdout.trim()).toMatch(/^1\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
     } else {
       // A release whose init does not offer --no-agent-hooks (1.7.4) is refused at its checks, before any init.
-      await expect(run.ready(repo)).rejects.toThrow(new RegExp(`^${VARIABLE} NO_INIT_OPTION: .* init does not offer --no-agent-hooks, `));
+      await expect(run.prepare(repo, { gitDir: join(repo, ".git"), workTree: repo }, { checked: true })).rejects.toThrow(new RegExp(`^${VARIABLE} NO_INIT_OPTION: .* init does not offer --no-agent-hooks, `));
     }
     expect(readdirSync(home)).toEqual([]);
     const status = execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: repo, encoding: "utf8", timeout: 20_000 });
@@ -1012,7 +1031,8 @@ const turn = () => { if (!observing) return; turns += 1; setImmediate(turn); };
 const limits = { ...COMMITLORE_LIMITS, checkTimeoutMs: Number(checkTimeoutMs), timeoutMs: 100 };
 write({ event: "observe-call", checkTimeoutMs: limits.checkTimeoutMs, timeoutMs: limits.timeoutMs });
 setImmediate(turn);
-const pending = createCommitLoreCliPort(commitloreRunner(limits, pin)).observe(checkout);
+const latest = async () => (${JSON.stringify(stableReleaseAnswer("1.7.3"))});
+const pending = createCommitLoreCliPort(commitloreRunner(limits, pin, latest)).observe(checkout);
 write({ event: "observe-returned-promise", elapsed: performance.now() - start });
 const result = await pending;
 observing = false;
@@ -1105,7 +1125,13 @@ setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: per
 
   it("growth during the check: a pin that makes itself 1 TiB (sparse) during doctor --help is refused before init --help spawns, at once, while the heartbeat fires", async () => {
     // The reviewer's growth case, its paths aside: the CLI the pin is grows its own file during a check.
-    const pinned = fake("grow-during-check", { during: { argv: "doctor --help", code: `fs.truncateSync(process.argv[1], ${TIB});` } });
+    // The pin is the wrapper; the program that grows it is the bundle, run from a copy (#1268).
+    const pinned = fake("grow-during-check");
+    writeFileSync(
+      pinned.bundle,
+      readFileSync(pinned.bundle, "utf8").replace("const answer =", `if (argv.join(' ') === 'doctor --help') { fs.truncateSync(${JSON.stringify(pinned.bin)}, ${TIB}); }\nconst answer =`),
+      { mode: 0o700 },
+    );
     // Bounded preparation before the watchdog starts (`prepareFixture`): the new file's cold first exec.
     prepareFixture(pinned.bin, ["--version"], pinned.log);
     try {
@@ -1191,7 +1217,7 @@ setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: per
     await vi.waitFor(() => expect(descriptorsOn(pinned.bin)).toEqual([]), { timeout: 2_000, interval: 20 });
     // Through the runner: `identityTimeoutMs` is that deadline, and the refusal comes before any spawn.
     const busy = occupyPool();
-    const observed = await createCommitLoreCliPort(commitloreRunner({ ...COMMITLORE_LIMITS, identityTimeoutMs: 100 }, pinned.bin)).observe(
+    const observed = await createCommitLoreCliPort(commitloreRunner({ ...COMMITLORE_LIMITS, identityTimeoutMs: 100 }, pinned.bin, latestRelease("1.7.3"))).observe(
       tempDir("acp-s16-r2-deadline-checkout-"),
     );
     await busy;
@@ -1211,26 +1237,26 @@ setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: per
     const wrapper = join(tempDir("acp-s16-r2-wrapper-"), "commitlore");
     writeFileSync(
       wrapper,
-      `#!/bin/sh\n# commitlore:wrapper:v1\n# Installed by install.sh. Edits are lost on reinstall.\nNODE="${process.execPath}"\n[ -x "$NODE" ] || NODE=node\nexec "$NODE" "${bundle.bin}" "$@"\n`,
+      `#!/bin/sh\n# commitlore:wrapper:v1\n# Installed by install.sh. Edits are lost on reinstall.\nNODE="${process.execPath}"\n[ -x "$NODE" ] || NODE=node\nexec "$NODE" "${bundle.bundle}" "$@"\n`,
       { mode: 0o700 },
     );
     // The release bundle pinned directly, at the size of the 1.7.4 bundle (written out: 1.5 MB is no large file).
     const bundled = fake("control-bundle-sized");
-    appendFileSync(bundled.bin, `/*${" ".repeat(1_571_351 - statSync(bundled.bin).size - 5)}*/\n`);
+    appendFileSync(bundled.bundle, `/*${" ".repeat(1_571_351 - statSync(bundled.bundle).size - 5)}*/\n`);
     for (const [pin, ran, minimumTurns] of [
       [wrapper, bundle.log, 1],
-      [bundled.bin, bundled.log, 16],
+      [bundled.bundle, bundled.log, 16],
     ] as const) {
       const read = await duringCheck(() => commitlorePinIdentity(pin));
       expect(read.turns).toBeGreaterThanOrEqual(minimumTurns);
       expect(read.value).toMatchObject({ size: String(statSync(pin).size), sha256: createHash("sha256").update(readFileSync(pin)).digest("hex") });
       expect(statSync(pin).size).toBeLessThanOrEqual(CAP);
-      const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pin)).observe(tempDir("acp-s16-r2-control-checkout-"));
+      const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pin, latestRelease("1.7.3"))).observe(tempDir("acp-s16-r2-control-checkout-"));
       expect(observed).toMatchObject({ outcome: "PASS" });
       expect(argvs(ran)).toEqual(OBSERVATION);
     }
     expect(statSync(wrapper).size).toBeLessThan(4_096);
-    expect(statSync(bundled.bin).size).toBe(1_571_351);
+    expect(statSync(bundled.bundle).size).toBe(1_571_351);
     witnessed("S16-R2-01 normal-entrypoint control asserted");
   });
 });

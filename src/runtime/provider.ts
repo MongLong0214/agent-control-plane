@@ -314,6 +314,32 @@ export interface InvocationResult {
   effortAttested?: boolean;
   /** #1104 — present when the invocation's own process group was not confirmed ended; `ok` is then false. */
   processGroup?: UnendedProcessGroup;
+  /**
+   * A GPT worker turn only: what the turn left in its private temporary directory, read after its
+   * process ended and before the directory was removed. Diagnostic; never part of the change scan.
+   */
+  turnScratch?: TurnScratchListing;
+}
+
+/** Files under a turn's temporary directory: counts, and the first sorted relative paths. */
+export interface TurnScratchListing {
+  files: number;
+  bytes: number;
+  paths: string[];
+  /** False when the walk stopped at its entry limit or could not read a directory: the counts are a lower bound. */
+  complete: boolean;
+  /**
+   * Present only when removing the directory failed: its path, the error code, and whether it was
+   * left behind after a second attempt with its owner permissions restored.
+   */
+  cleanup?: { path: string; code: string; left: boolean };
+}
+
+/** A GPT worker turn's invocation threw: the error it threw, and what the turn left in its scratch. */
+export class TurnScratchThrown extends Error {
+  constructor(readonly thrown: unknown, readonly turnScratch: TurnScratchListing) {
+    super(thrown instanceof Error ? thrown.message : String(thrown));
+  }
 }
 
 /**
@@ -385,6 +411,8 @@ export interface SessionSpec {
    * will later produce the answer.
    */
   isolation?: InvocationRequest["isolation"];
+  /** Aborting stops a runtime that spawns to constitute the session (a reviewer handshake). */
+  signal?: AbortSignal;
   /**
    * Records that a future invocation may request a managed write. It is intentionally
    * descriptive only: session creation never grants filesystem access, and every effect
@@ -541,6 +569,13 @@ export interface ProviderAdapter {
    * is refused as a reviewer rather than assumed to send what another adapter sends.
    */
   transmittedReviewerInput?(request: Pick<InvocationRequest, "systemPrompt" | "prompt">): TransmittedInput;
+  /**
+   * The most UTF-8 bytes one packet reviewer input (system instructions, separator and prompt) may take
+   * for `model` and still reach that model whole, with room for the CLI's own instructions and the
+   * model's answer. Undefined, or absent, where no such bound is known: a blind review then does not
+   * send that reviewer a lockfile chunk.
+   */
+  reviewerInputMaxBytes?(model: string): number | undefined;
   /** Cheap liveness check for an existing critical session (§14.3). */
   probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE">;
   /**
@@ -665,6 +700,10 @@ class CapacityObservedAdapter implements ProviderAdapter {
   }
 
   /** Present exactly when the wrapped adapter declares it, so a review digests that adapter's own input. */
+  get reviewerInputMaxBytes(): ProviderAdapter["reviewerInputMaxBytes"] {
+    return this.inner.reviewerInputMaxBytes?.bind(this.inner);
+  }
+
   get transmittedReviewerInput(): ProviderAdapter["transmittedReviewerInput"] {
     return this.inner.transmittedReviewerInput?.bind(this.inner);
   }

@@ -67,6 +67,47 @@ export const GIT_HARDENING: readonly string[] = [
   "-c", "core.askPass=",
 ];
 
+/**
+ * #1268 — `GIT_HARDENING` in the form git reads from its environment (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`,
+ * `GIT_CONFIG_VALUE_<n>`), for a child that runs git itself — CommitLore — and so cannot be handed `-c`.
+ * Git reads these after every configuration file, so they override the repository's own as `-c` does.
+ */
+export const gitHardeningEnvironment = (options: { except?: readonly string[] } = {}): Record<string, string> => {
+  const settings: Array<[string, string]> = [];
+  for (let index = 0; index + 1 < GIT_HARDENING.length; index += 2) {
+    const setting = GIT_HARDENING[index + 1]!;
+    const at = setting.indexOf("=");
+    // `except` names whole settings a caller leaves to the repository; the worker's own git leaves none.
+    if (options.except?.includes(setting.slice(0, at)) === true) continue;
+    settings.push([setting.slice(0, at), setting.slice(at + 1)]);
+  }
+  return Object.fromEntries([
+    ["GIT_CONFIG_COUNT", String(settings.length)],
+    ...settings.flatMap(([key, value], index) => [[`GIT_CONFIG_KEY_${index}`, key], [`GIT_CONFIG_VALUE_${index}`, value]]),
+  ]);
+};
+
+/**
+ * The environment every pinned git child runs in, bar its PATH, HOME and committer: git dir and work tree
+ * passed explicitly, no system or global configuration, no system attributes, no replace refs, no optional
+ * locks, literal pathspecs. `runPinnedGit` adds `GIT_HARDENING` as `-c`; a child that runs git itself adds
+ * `gitHardeningEnvironment` (#1268).
+ */
+export const pinnedGitEnvironment = (input: { gitDir: string; workTree: string; index?: string }): Record<string, string> => ({
+  LC_ALL: "C",
+  GIT_TERMINAL_PROMPT: "0",
+  GIT_PAGER: "cat",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_ATTR_NOSYSTEM: "1",
+  GIT_NO_REPLACE_OBJECTS: "1",
+  GIT_OPTIONAL_LOCKS: "0",
+  GIT_LITERAL_PATHSPECS: "1",
+  GIT_DIR: input.gitDir,
+  GIT_WORK_TREE: input.workTree,
+  ...(input.index ? { GIT_INDEX_FILE: input.index } : {}),
+});
+
 /** The committer the control plane signs worker commits as; no provider, model or session in it. */
 const CONTROL_PLANE_IDENTITY = {
   GIT_AUTHOR_NAME: "agent-control-plane",
@@ -471,18 +512,7 @@ export const runPinnedGit = (
       PATH: process.env["PATH"] ?? "/usr/bin:/bin",
       HOME: join(repo.scratch, "home"),
       XDG_CONFIG_HOME: join(repo.scratch, "home"),
-      LC_ALL: "C",
-      GIT_TERMINAL_PROMPT: "0",
-      GIT_PAGER: "cat",
-      GIT_CONFIG_NOSYSTEM: "1",
-      GIT_CONFIG_GLOBAL: "/dev/null",
-      GIT_ATTR_NOSYSTEM: "1",
-      GIT_NO_REPLACE_OBJECTS: "1",
-      GIT_OPTIONAL_LOCKS: "0",
-      GIT_LITERAL_PATHSPECS: "1",
-      GIT_DIR: repo.gitDir,
-      GIT_WORK_TREE: repo.workTree,
-      ...(options.index ? { GIT_INDEX_FILE: options.index } : {}),
+      ...pinnedGitEnvironment({ gitDir: repo.gitDir, workTree: repo.workTree, ...(options.index ? { index: options.index } : {}) }),
       ...CONTROL_PLANE_IDENTITY,
       ...(options.extraEnv ?? {}),
     };
@@ -943,8 +973,21 @@ export interface WorkerCommitPort {
        * branch moves. A refusal commits nothing.
        */
       stillAuthorized: () => Decision<void>;
+      /**
+       * #1268 — CommitLore's procedure around this commit, for a run whose contract requires it. `consider`
+       * gets the private index once it stages exactly `entries`, before any commit object exists, and
+       * answers the message to commit; a refusal commits nothing. `settle` gets the commit once the branch
+       * and the index are at it; a refusal leaves that commit where it is and reports it.
+       */
+      commitlore?: WorkerCommitLoreStep;
     },
   ): Promise<Decision<string>>;
+}
+
+/** #1268 — see `WorkerCommitPort`'s `commitlore`. */
+export interface WorkerCommitLoreStep {
+  consider(index: string, message: string): Promise<Decision<string>>;
+  settle(commit: string): Promise<Decision<unknown>>;
 }
 
 /**
@@ -983,8 +1026,17 @@ export const plumbingWorkerCommit: WorkerCommitPort = {
       }
       const indexInfo = lines.map((line) => `${line}\0`).join("");
       await must(repo, ["update-index", "-z", "--index-info"], { index, input: indexInfo });
+      // #1268 — CommitLore considers exactly the tree this commit will have, before the commit exists.
+      let message = input.message;
+      if (input.commitlore) {
+        const considered = await input.commitlore.consider(index, input.message);
+        if (!considered.allowed) {
+          return deny(considered.reasonCode, considered.message, { ...considered.evidence, committed: false });
+        }
+        message = considered.value;
+      }
       const tree = (await must(repo, ["write-tree"], { index })).trim();
-      const commit = (await must(repo, ["commit-tree", tree, "-p", input.baseHead, "--no-gpg-sign", "-m", input.message])).trim();
+      const commit = (await must(repo, ["commit-tree", tree, "-p", input.baseHead, "--no-gpg-sign", "-m", message])).trim();
 
       try {
         writeFileSync(lock, "", { flag: "wx", mode: 0o644 });
@@ -1040,6 +1092,15 @@ export const plumbingWorkerCommit: WorkerCommitPort = {
       renameSync(lock, realIndex);
       held = false;
       repo.children.holdIndexLock(null);
+      if (input.commitlore) {
+        const settled = await input.commitlore.settle(commit);
+        if (!settled.allowed) {
+          return deny(settled.reasonCode, `the worker commit exists, and CommitLore did not settle it: ${settled.message}`, {
+            ...settled.evidence,
+            head: commit,
+          });
+        }
+      }
       return allow(ReasonCode.OK, commit);
     } catch (error) {
       return deny(ReasonCode.INTERNAL_ERROR, "the worker commit could not be written", {

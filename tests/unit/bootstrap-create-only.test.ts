@@ -145,7 +145,11 @@ describe("#246 C5 create-only bootstrap: GitHub initializes the default branch a
     const remote = github.repository("acme", "fixture")!;
     expect((await git(remote.bare, ["ls-tree", "-r", "--name-only", head])).stdout.trim().split("\n")).toEqual(["README.md"]);
     const result = harness.cp.artifacts.latest<RepoFactoryResult>(runId, "REPO_FACTORY_RESULT")?.content;
-    expect(result?.bootstrapVerification).toEqual([{ commandId: "clean-tree", repositoryIdentity: IDENTITY, exactHead: head, status: "PASS" }]);
+    // #1268 — a new project requires CommitLore, and it is observed at the head GitHub initialized.
+    expect(result?.bootstrapVerification).toEqual([
+      { commandId: "clean-tree", repositoryIdentity: IDENTITY, exactHead: head, status: "PASS" },
+      { commandId: "commitlore:doctor", repositoryIdentity: IDENTITY, exactHead: head, status: "PASS" },
+    ]);
     expect(result?.externalWriteReceipts.map((receipt) => receipt.operationId)).toEqual(["create-repository:fixture"]);
     expect(result?.repositories).toEqual([expect.objectContaining({ identity: IDENTITY, defaultBranch: "main", createdBranches: [] })]);
     const checkout = attemptCheckoutPath(join(prepared.workRoot, runId), "primary", 1);
@@ -163,10 +167,10 @@ describe("#246 C5 create-only bootstrap: GitHub initializes the default branch a
       { nodeId: remote.nodeId, fullName: "acme/fixture", visibility: "public", defaultBranch: "main", initializedHead: head },
     ]);
 
-    // G0a: the activation names the CommitLore it did not observe, before and after the CONFIRM.
-    expect(beforeConfirm["warnings"]).toEqual([{ commitlore: "NOT_OBSERVED", mode: "preferred" }]);
+    // G0a: CommitLore was observed, so the activation names nothing unobserved, before and after the CONFIRM.
+    expect(beforeConfirm["warnings"] ?? []).toEqual([]);
     expect(final).toMatchObject({ projectId: "c5-create-only", ceoConfirm: { decision: "CONFIRM" } });
-    expect(final["warnings"]).toEqual([{ commitlore: "NOT_OBSERVED", mode: "preferred" }]);
+    expect(final["warnings"] ?? []).toEqual([]);
   });
 
   it("W2: a repository already at the name is refused, not adopted, before any write — at the runner and in the producer", async () => {
@@ -349,11 +353,11 @@ describe("#246 C5 create-only bootstrap: GitHub initializes the default branch a
       port.createRepository({ owner: "acme", name: "fixture" }, "public", "repo-factory:marker", true),
     );
     // #1240 — the guard is also handed the request's body, so a guard can admit only content it approved.
-    expect(asked).toEqual([{ kind: "api", method: "POST", target: "orgs/acme/repos", body: { name: "fixture", description: "repo-factory:marker", private: false, visibility: "public", auto_init: true } }]);
+    expect(asked).toEqual([{ kind: "api", method: "POST", target: "orgs/acme/repos", body: { name: "fixture", description: "repo-factory:marker", private: false, visibility: "public", auto_init: true, allow_merge_commit: true, allow_squash_merge: false, allow_rebase_merge: false } }]);
     expect(calls.at(-1)).toEqual({
       method: "POST",
       path: "orgs/acme/repos",
-      body: { name: "fixture", description: "repo-factory:marker", private: false, visibility: "public", auto_init: true },
+      body: { name: "fixture", description: "repo-factory:marker", private: false, visibility: "public", auto_init: true, allow_merge_commit: true, allow_squash_merge: false, allow_rebase_merge: false },
     });
   });
 

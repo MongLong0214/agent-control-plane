@@ -12,6 +12,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { git } from "../../src/git/git.ts";
 import { cleanTreeManifest, bootstrapOperations } from "../helpers/bootstrap-plan.ts";
 import { type Operation, type PreparedBootstrapRun, ownerApprovalFor, prepareBootstrapRun } from "../helpers/bootstrap-runner.ts";
+import { gitCommitAttempt } from "../helpers/commitlore-attempt.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 
 /**
@@ -31,11 +32,13 @@ afterEach(() => vi.restoreAllMocks());
 const REPORT = JSON.stringify({ schema: "commitlore_doctor.v2", status: "ok", exitCode: 0, checks: [] });
 const PASS: CommitLoreObservation = { outcome: "PASS", reportStatus: "ok", warnings: [], detail: "commitlore doctor passed", report: REPORT };
 
+// #1268 — the bootstrap's own commit goes through CommitLore; these witnesses are about the observation,
+// so it is made by a plain-git double.
 const requiredRun = (projectId: string, commitlore: CommitLorePort): Promise<PreparedBootstrapRun> =>
   prepareBootstrapRun(projectId, {
     manifest: cleanTreeManifest(projectId, { commitlore: { mode: "required" } }),
     ops: bootstrapOperations() as Operation[],
-    commitlore,
+    commitlore: { observe: (path) => commitlore.observe(path), attempt: gitCommitAttempt() },
   });
 
 const confirm = (prepared: PreparedBootstrapRun) =>

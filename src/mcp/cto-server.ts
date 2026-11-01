@@ -1,5 +1,6 @@
 import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
 import { BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES, collectBootstrapReviewEvidence, reviewEvidenceStageAccess, stageBootstrapReviewEvidence, type ReviewEvidenceStageInput } from "../bootstrap/bootstrap-review-evidence.ts";
+import { stageStandardReviewEvidence, type StandardReviewEvidenceStageInput } from "../review/standard-review-evidence.ts";
 import { collectBootstrapCeoDecisions } from "../bootstrap/bootstrap-ceo-decisions.ts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -46,6 +47,7 @@ import {
   type AuthenticatedMcpPeer,
   type McpMutationSource,
   type McpPeerAuthenticator,
+  progressNotifier,
   respond,
   type ToolResult,
 } from "./shared.ts";
@@ -231,6 +233,8 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       return checked.allowed ? allow(ReasonCode.OK, { roleKey: checked.value.roleKey, bindingGeneration: checked.value.bindingGeneration }) : checked;
     },
     stageBootstrapReviewEvidence: (peer: AuthenticatedMcpPeer, input: ReviewEvidenceStageInput) => stageBootstrapReviewEvidence(source, peer, input),
+    stageStandardReviewEvidence: (owner: { sessionId: string; bindingGeneration: number; roleKey: string }, input: StandardReviewEvidenceStageInput) =>
+      stageStandardReviewEvidence(source, owner, input),
     stageBootstrapPlan: (peer: AuthenticatedMcpPeer, input: BootstrapPlanStageInput) => stageBootstrapPlan(source, peer, input),
     bootstrapPlanForRun: (runId: string) => readBootstrapPlanAttachment(source, runId),
     resolvePlanInput: (runId: string, input: { bootstrapPlanDigest?: string; plan?: Record<string, unknown>; tasks?: z.infer<typeof submittedTasksSchema> }) =>
@@ -517,6 +521,7 @@ const createCtoServerFromPort = (
     args: Record<string, unknown> & { idempotencyKey: string },
     execute: (peer: AuthenticatedMcpPeer) => Promise<ToolResult> | ToolResult,
     authority: (peer: AuthenticatedMcpPeer) => Decision<Record<string, unknown>> = () => allow(ReasonCode.OK, {}),
+    answersInFlight = false,
   ) => guarded(async () => {
     const peer = peerFor(toolName);
     return peer.allowed
@@ -525,6 +530,7 @@ const createCtoServerFromPort = (
             const current = peerFor(toolName);
             return current.allowed ? authority(current.value) : current;
           },
+          ...(answersInFlight ? { answersInFlight } : {}),
         })
       : respond(peer);
   });
@@ -534,6 +540,7 @@ const createCtoServerFromPort = (
     toolName: string,
     args: Record<string, unknown> & { idempotencyKey: string; runId: string },
     execute: (peer: AuthenticatedMcpPeer, owner: { sessionId: string; bindingGeneration: number; roleKey: string }) => Promise<ToolResult> | ToolResult,
+    answersInFlight = false,
   ) => {
     let current!: { sessionId: string; bindingGeneration: number; roleKey: string };
     return write(toolName, args, peer => execute(peer, current), peer => {
@@ -550,7 +557,7 @@ const createCtoServerFromPort = (
         }
       }
       return fenced;
-    });
+    }, answersInFlight);
   };
   const primary = (peer: AuthenticatedMcpPeer, projectId: string): Decision<Record<string, unknown>> => {
     if (!peer.sessionId || !peer.sessionIncarnation) return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP peer is missing a session incarnation");
@@ -575,7 +582,8 @@ const createCtoServerFromPort = (
     "role_dispatch_pending",
     {
       description:
-        "The pending control-plane messages (dispatch, revision, resume review, escalation reply, drain, cancel, bootstrap handoff) addressed in band to this exact session at its active generation. Acknowledge a HANDOFF_PACKAGE with handoff_ack; other messages use role_dispatch_ack (or run_ack, for a row that names a run this session owns).",
+        "The pending control-plane messages (dispatch, revision, resume review, escalation reply, drain, cancel, bootstrap handoff) addressed in band to this exact session at its active generation. Acknowledge a HANDOFF_PACKAGE with handoff_ack; other messages use role_dispatch_ack (or run_ack, for a row that names a run this session owns). " +
+        "A REVISION_REQUEST whose payload stage is review-unavailable is a notice, never a revision: its review did not judge the product, so change no PLAN, task or code for it, and take only its nextStep (RESUBMIT: one new result_submit once the attempt it names has answered, while unjudgedAttempts is below unjudgedAttemptLimit; ESCALATE: escalation_open for that run, no resubmit); then acknowledge it.",
       inputSchema: {},
     },
     async () => read("role_dispatch_pending", (peer) => {
@@ -650,6 +658,12 @@ const createCtoServerFromPort = (
       inputSchema: { ...mutation, ...runIdentity, contractDigest: z.string(), bootstrapPlanDigest: z.string(), evidenceBody: z.string(), expectedSha256: z.string() } },
     async args => write("bootstrap_review_evidence_stage", args, peer => respond(port.stageBootstrapReviewEvidence(peer, args)),
       peer => port.reviewEvidenceStageAuthority(peer, args)),
+  );
+  server.registerTool(
+    "review_evidence_stage",
+    { description: `Stage one immutable private review evidence bundle for a STANDARD_WORK run you own (the same bundle format and ${BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES / 1024} KiB UTF-8 limit as bootstrap_review_evidence_stage): only the minimal excerpts, their source identification and comparison ranges, digests and limits. Binds this run and its contract digest. It is attributed data for the reviewer, never a contract change or an approval; the canonical CEO must select it with review_evidence_attach, and the next result_submit freezes it into the candidate's review.`,
+      inputSchema: { ...mutation, ...runIdentity, contractDigest: z.string(), evidenceBody: z.string(), expectedSha256: z.string() } },
+    async args => writeOwned("review_evidence_stage", args, (_peer, current) => respond(port.stageStandardReviewEvidence(current, args))),
   );
   server.registerTool(
     "bootstrap_plan_stage",
@@ -847,10 +861,13 @@ const createCtoServerFromPort = (
   server.registerTool(
     "result_submit",
     { description: "Submit a candidate for automatic verification and blind review.", inputSchema: { ...mutation, ...runIdentity, resultSummary: z.string(), recommendation: z.string(), residualRisk: z.array(z.string()).default([]), runScopedCommands: z.array(z.record(z.unknown())).default([]) } },
-    async (args) => writeOwned("result_submit", args, async (peer, fenced) => {
+    // A long review: each real step renews the submission's lease and, when the caller asked with a
+    // progressToken, is a progress notice to it; a replay of its key while it runs is answered as in flight.
+    async (args, extra) => writeOwned("result_submit", args, async (peer, fenced) => {
       const commands = args.runScopedCommands.map((command) => parseVerificationCommand(command));
-      return respond(await port.submitResult({ runId: args.runId, ownerSessionId: fenced.sessionId, ownerBindingGeneration: fenced.bindingGeneration, resultSummary: args.resultSummary, recommendation: args.recommendation, residualRisk: args.residualRisk, ...(commands.length === 0 ? {} : { runScopedCommands: commands }) }));
-    }),
+      const onProgress = progressNotifier(extra);
+      return respond(await port.submitResult({ runId: args.runId, ownerSessionId: fenced.sessionId, ownerBindingGeneration: fenced.bindingGeneration, resultSummary: args.resultSummary, recommendation: args.recommendation, residualRisk: args.residualRisk, ...(commands.length === 0 ? {} : { runScopedCommands: commands }), ...(onProgress === undefined ? {} : { onProgress }) }));
+    }, true),
   );
   server.registerTool(
     "escalation_open",

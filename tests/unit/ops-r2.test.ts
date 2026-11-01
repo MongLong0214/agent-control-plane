@@ -102,6 +102,12 @@ const validResult = (harness: Harness, runId: string, projectId: string, planDig
     repositoryIdentity: BOOTSTRAP_IDENTITY,
     exactHead: gitSync(harness.repoPath, ["rev-parse", "HEAD"]),
     status: "PASS",
+  }, {
+    // #1268 — a new project requires CommitLore, so its result carries CommitLore's verification at the head.
+    commandId: "commitlore:doctor",
+    repositoryIdentity: BOOTSTRAP_IDENTITY,
+    exactHead: gitSync(harness.repoPath, ["rev-parse", "HEAD"]),
+    status: "PASS",
   }],
   ciEvidence: [],
   unresolvedGaps: [],

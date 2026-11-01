@@ -123,7 +123,41 @@ export interface McpMutationRequest {
   durableReplaySupersedesStored?: boolean;
   /** Extra domain validation for settled handoff ACKs; never the mutation handler. */
   replayAuthority?: () => Decision<unknown>;
+  /**
+   * Opt-in: a replay while the first call with this key is still running in this process is answered as
+   * in flight rather than refused. Nothing runs again; the key answers the stored result once it is done.
+   */
+  answersInFlight?: boolean;
 }
+
+/** What the request a progress notice answers carried, and the way back to its caller. */
+export interface ProgressCarrier {
+  _meta?: { progressToken?: string | number };
+  sendNotification: (notification: {
+    method: "notifications/progress";
+    params: { progressToken: string | number; progress: number; message: string };
+  }) => Promise<void>;
+}
+
+/**
+ * A `notifications/progress` sender for a long mutation's real steps, when its caller sent a progressToken;
+ * undefined otherwise, so a caller that asked for none is sent none. A notice that cannot be sent (the
+ * connection is gone) is dropped: the work and its stored result never depend on it.
+ */
+export const progressNotifier = (carrier: ProgressCarrier): ((message: string) => void) | undefined => {
+  const progressToken = carrier._meta?.progressToken;
+  if (progressToken === undefined) return undefined;
+  let progress = 0;
+  return (message) => {
+    progress += 1;
+    try {
+      void carrier.sendNotification({ method: "notifications/progress", params: { progressToken, progress, message } })
+        .catch(() => undefined);
+    } catch {
+      // A closed transport can refuse synchronously as well.
+    }
+  };
+};
 
 /**
  * MCP request identity preserves string bytes, including CR/LF. Artifact canonicalJson
@@ -289,6 +323,13 @@ export const idempotentMcpMutation = async (
       // Its replay is safe only after the same fingerprint and current authority passed.
       const durable = request.durableReplay?.(fingerprint, true);
       if (durable) return durable;
+      if (reservation.inFlight && request.answersInFlight === true) {
+        return respond(allow(ReasonCode.MCP_MUTATION_IN_FLIGHT, {
+          idempotencyKey,
+          inFlight: true,
+          next: "the first call with this idempotencyKey is still running; call again with the same key for its result",
+        }));
+      }
       return respond(deny(reservation.inFlight ? ReasonCode.INGRESS_REPLAY_IGNORED : ReasonCode.MCP_MUTATION_OUTCOME_UNKNOWN,
         reservation.inFlight ? "MCP mutation is already reserved" : "MCP mutation outcome is unknown; reconcile durable state without resubmitting", { idempotencyKey }));
     }

@@ -10,6 +10,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { Role, RunState, roleKeyFor } from "../domain/types.ts";
 import { type WorkspaceProbe, isWithin } from "./workspace-probe.ts";
+import { standingClaimSql } from "../claims/claim-registry.ts";
 
 /**
  * Operations that mutate project-natured state. PRD §4 CP-HI-01 enumerates these
@@ -2437,9 +2438,9 @@ export class ManagedWriteGuard {
       worktree_id: string | null;
       declared_path: string | null;
     }>(
-      `SELECT claim_id, run_id, branch, worktree_id, declared_path
-         FROM resource_claims
-        WHERE status = 'HELD' AND repository_identity = ? AND run_id <> ?`,
+      `SELECT c.claim_id, c.run_id, c.branch, c.worktree_id, c.declared_path
+         FROM resource_claims c
+        WHERE ${standingClaimSql("c")} AND c.repository_identity = ? AND c.run_id <> ?`,
       [participant.identity, runId],
     );
     if (held.length === 0) return null;

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { executablePlanOf, planForSubmission } from "../../src/bootstrap/bootstrap-plan.ts";
 import { createBootstrapGitHubWritePort } from "../../src/bootstrap/bootstrap-write-guard.ts";
 import { type GenesisBundle, parseGenesis } from "../../src/bootstrap/genesis-bundle.ts";
-import { createGitHubApiWritePort, type GitHubRepositoryTarget } from "../../src/bootstrap/github-write-port.ts";
+import { createGitHubApiWritePort, type GenesisResourceUnmet, type GitHubRepositoryTarget } from "../../src/bootstrap/github-write-port.ts";
 import { produceRepoFactoryResult } from "../../src/bootstrap/repo-factory-producer.ts";
 import { acpError, allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -83,6 +83,9 @@ class IssuesGitHub implements GitHubClient {
   foreign = false;
   /** GitHub accepts an issue and drops its milestone. */
   dropMilestone = false;
+  readonly labels: Array<{ name: string; color: string; description: string }> = [];
+  /** GitHub accepts a label and keeps none of it. */
+  dropLabel = false;
   private next = 1;
   /** The next GET of `route` waits until released, as a slow GitHub answer would. */
   private hold: { route: string; reached: boolean; release: () => void; released: Promise<void> } | null = null;
@@ -147,7 +150,12 @@ class IssuesGitHub implements GitHubClient {
     if (method === "GET" && route === ROOT) {
       return { node_id: this.nodeId, full_name: `${OWNER}/${NAME}`, visibility: "public", private: false, default_branch: "dev", description: null } as T;
     }
-    if (route === `${ROOT}/labels` && method === "GET") return [] as T;
+    if (route === `${ROOT}/labels` && method === "GET") return this.labels as T;
+    if (route === `${ROOT}/labels` && method === "POST") {
+      const label = body as { name: string; color: string; description: string };
+      if (!this.dropLabel) this.labels.push(label);
+      return label as T;
+    }
     if (route === `${ROOT}/milestones` || route === `${ROOT}/issues`) {
       if (method === "GET") {
         return (route.endsWith("/milestones") ? elsewhere(paged(this.milestones)) : elsewhere(paged(this.issues))) as T;
@@ -1189,7 +1197,7 @@ describe("#1240 (i) — the genesis resources readback is bound to the exact rep
     class Recording extends GenesisGitHub {
       readonly bound: unknown[] = [];
       override async observeGenesisResources(t: GitHubRepositoryTarget, b: Pick<GenesisBundle, "labels" | "milestones" | "issues">, options?: { repositoryNodeId?: string }) {
-        this.bound.push(options);
+        this.bound.push({ repositoryNodeId: options?.repositoryNodeId });
         return super.observeGenesisResources(t, b);
       }
     }
@@ -1217,6 +1225,120 @@ describe("#1240 (i) — the genesis resources readback is bound to the exact rep
     await port.ensureGenesisResources!(target, bundle);
     expect(github.posts("/issues")).toHaveLength(0);
     expect(await port.observeGenesisResources!(target, bundle, { repositoryNodeId: NODE })).toEqual(bundle);
+  });
+
+  it("a readback that is not as planned names each unmet item: an absent milestone, an absent issue, a mis-linked issue", async () => {
+    const github = genesisRepository();
+    github.issues[1]!.milestone = { ...github.milestoneRef(github.milestones[0]!), node_id: "MI_elsewhere" };
+    const planned = {
+      labels: [],
+      milestones: [...bundle.milestones, { key: "m2", title: "Second product increment", description: "The second product increment" }],
+      issues: [...bundle.issues, { key: "i2", title: "Ship the second increment", body: "What the second increment delivers", labels: [], milestoneKey: "m2" }],
+    };
+    const unmet: GenesisResourceUnmet[] = [];
+    const port = createGitHubApiWritePort({ client: github });
+    expect(await port.observeGenesisResources!(target, planned, { repositoryNodeId: NODE, unmet })).toBeNull();
+    expect(unmet).toEqual([
+      { resource: "milestone", key: "m2", problem: "absent" },
+      { resource: "issue", key: "i1", problem: "milestone" },
+      { resource: "issue", key: "i2", problem: "absent" },
+    ]);
+  });
+
+  it("a milestone with no description, and an issue with no body, never stop provisioning: the absent milestone is named, then created", async () => {
+    const github = new IssuesGitHub();
+    Object.assign(github.addMilestone("Someone else's milestone", ""), { description: null });
+    Object.assign(github.addIssue("Someone else's issue", "", null), { body: null });
+    const unmet: GenesisResourceUnmet[] = [];
+    const port = createGitHubApiWritePort({ client: github });
+    expect(await port.observeGenesisResources!(target, bundle, { repositoryNodeId: NODE, unmet })).toBeNull();
+    expect(unmet).toEqual([{ resource: "milestone", key: "m1", problem: "absent" }, { resource: "issue", key: "i1", problem: "absent" }]);
+    await port.ensureGenesisResources!(target, bundle);
+    expect(github.posts("/milestones")).toHaveLength(1);
+    expect(github.posts("/issues")).toHaveLength(1);
+    expect(await port.observeGenesisResources!(target, bundle, { repositoryNodeId: NODE })).toEqual(bundle);
+  });
+
+  /** The genesis double, with its labels, milestones and issues on the production port over the REST double. */
+  class Linked extends GenesisGitHub {
+    readonly issuesRest = new IssuesGitHub();
+    private readonly api = createGitHubApiWritePort({ client: this.issuesRest });
+    override async ensureGenesisResources(t: GitHubRepositoryTarget, b: Pick<GenesisBundle, "labels" | "milestones" | "issues">) {
+      this.issuesRest.nodeId = this.repository(t.owner, t.name)!.nodeId;
+      await this.api.ensureGenesisResources!(t, b);
+    }
+    override async observeGenesisResources(t: GitHubRepositoryTarget, b: Pick<GenesisBundle, "labels" | "milestones" | "issues">, options?: { repositoryNodeId?: string }) {
+      this.issuesRest.nodeId = this.repository(t.owner, t.name)!.nodeId;
+      return (await this.api.observeGenesisResources!(t, b, options)) === null ? null : b;
+    }
+  }
+
+  const labelled = {
+    ...bundle,
+    labels: [{ name: "ready", color: "123abc", description: "ready" }, { name: "blocked", color: "d73a4a", description: "waits on another unit" }],
+  };
+
+  it("a readback that lacks a planned label names it absent, beside the other unmet items", async () => {
+    const github = genesisRepository();
+    github.labels.push(labelled.labels[0]!);
+    const planned = { ...labelled, milestones: [...labelled.milestones, { key: "m2", title: "Second product increment", description: "The second product increment" }] };
+    const unmet: GenesisResourceUnmet[] = [];
+    const port = createGitHubApiWritePort({ client: github });
+    expect(await port.observeGenesisResources!(target, planned, { repositoryNodeId: NODE, unmet })).toBeNull();
+    expect(unmet).toEqual([
+      { resource: "label", key: "blocked", problem: "absent" },
+      { resource: "milestone", key: "m2", problem: "absent" },
+    ]);
+  });
+
+  it("a readback with every planned label present names no label", async () => {
+    const github = genesisRepository();
+    github.labels.push(...labelled.labels);
+    const unmet: GenesisResourceUnmet[] = [];
+    const port = createGitHubApiWritePort({ client: github });
+    expect(await port.observeGenesisResources!(target, labelled, { repositoryNodeId: NODE, unmet })).toEqual(labelled);
+    expect(unmet).toEqual([]);
+  });
+
+  it("a label GitHub accepted but does not keep stops acp-genesis-labels naming that label, before any milestone or issue", async () => {
+    const f = genesisPlanFixture();
+    const root = tempDir("genesis-absent-label-");
+    const port = new Linked(root);
+    port.issuesRest.dropLabel = true;
+    const result = await produceRepoFactoryResult({
+      plan: executablePlanOf(f.outputs, f.binding.planDigest),
+      workDir: join(root, "work"),
+      approvedFiles: f.outputs.files,
+      github: { port, authority: { owner: OWNER, visibility: "public" as const, approvedOperations: f.outputs.githubOperations.map(({ operationId, resourceIdentity, resourceType }) => ({ operationId, resourceIdentity, resourceType })) } },
+    });
+    expect(result.allowed).toBe(false);
+    expect(result.evidence).toMatchObject({ refusal: "REREAD_MISMATCH", failedOperationId: "acp-genesis-labels", unmet: [{ resource: "label", key: "ready", problem: "absent" }] });
+    expect(port.issuesRest.posts("/labels")).toHaveLength(1);
+    expect(port.issuesRest.posts("/milestones")).toHaveLength(0);
+    expect(port.issuesRest.posts("/issues")).toHaveLength(0);
+  });
+
+  it("an issue GitHub accepted without its milestone stops acp-genesis-issues naming that link, and a resume creates no second issue", async () => {
+    const unlabelled = { ...genesisBundle(), labels: [], issues: genesisBundle().issues.map((issue) => ({ ...issue, labels: [] })) };
+    const f = genesisPlanFixture(unlabelled);
+    const root = tempDir("genesis-unmet-readback-");
+    const port = new Linked(root);
+    port.issuesRest.dropMilestone = true;
+    const produce = () => produceRepoFactoryResult({
+      plan: executablePlanOf(f.outputs, f.binding.planDigest),
+      workDir: join(root, "work"),
+      approvedFiles: f.outputs.files,
+      github: { port, authority: { owner: OWNER, visibility: "public" as const, approvedOperations: f.outputs.githubOperations.map(({ operationId, resourceIdentity, resourceType }) => ({ operationId, resourceIdentity, resourceType })) } },
+    });
+    const first = await produce();
+    expect(first.allowed).toBe(false);
+    expect(first.evidence).toMatchObject({ refusal: "REREAD_MISMATCH", failedOperationId: "acp-genesis-issues", unmet: [{ resource: "issue", key: "i1", problem: "milestone" }] });
+    port.issuesRest.dropMilestone = false;
+    const resumed = await produce();
+    expect(resumed.allowed).toBe(false);
+    expect(resumed.evidence).toMatchObject({ failedOperationId: "acp-genesis-issues", unmet: [{ resource: "issue", key: "i1", problem: "milestone" }] });
+    expect(port.issuesRest.posts("/issues")).toHaveLength(1);
+    expect(port.issuesRest.posts("/milestones")).toHaveLength(1);
   });
 });
 

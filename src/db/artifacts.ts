@@ -11,7 +11,7 @@ import {
   candidateSnapshotDigest as digestCandidateSnapshot,
   candidateSnapshotSchema,
 } from "../snapshot/candidate-snapshot.ts";
-import { credentialBearingField, prohibitedDurableField } from "./audit.ts";
+import { credentialRefusal, prohibitedDurableField } from "./audit.ts";
 import { registryView } from "./registry-view.ts";
 import type { Db, EvidenceWritePort } from "./database.ts";
 import { OWNER_DECISION_LABEL, ownerDecisionShapeSql } from "./migrations.ts";
@@ -177,6 +177,16 @@ const ISSUED_WRITERS = new Set<string>();
 // through its prototype, while this module-private map never hands the database marker out.
 const EVIDENCE_WRITE_PORTS = new WeakMap<object, EvidenceWritePort>();
 
+/**
+ * #1307 — the `sha256:` digests ACP computed for one blind review's packet from its own typed fields,
+ * with the run and candidate they were computed for (review/blind-review.ts reviewPacketDigests).
+ */
+export interface ReviewPacketDigests {
+  readonly runId: string;
+  readonly candidateSnapshotDigest: string;
+  readonly digests: ReadonlySet<string>;
+}
+
 /** Artifact kinds that must be bound to an exact candidate (§30.2 #7, CP-HI-06). */
 const SNAPSHOT_BOUND: ReadonlySet<string> = new Set([
   "VERIFICATION",
@@ -306,6 +316,10 @@ export class ArtifactStore {
    * name it supplies: the recorded producer is derived from the capability's kind, so a
    * caller that knows "verification-engine" but holds nothing is refused, and a caller
    * holding one kind's capability cannot write another's (#70).
+   *
+   * #1307 — `packetDigests`, given only by the blind review, are the digests ACP computed for the
+   * review being stored; they are read (`WriteSite.packetDigests`) only for a BLIND_REVIEW of the same
+   * run and candidate they name.
    */
   putEvidence<K extends EvidenceKind, T>(
     writer: EvidenceWriter<K>,
@@ -313,6 +327,7 @@ export class ArtifactStore {
     kind: K,
     content: T,
     candidateSnapshotDigest: string,
+    packetDigests?: ReviewPacketDigests,
   ): StoredArtifact<T> {
     if (!isEvidenceKind(kind)) {
       fail(ReasonCode.INVALID_ARGUMENT, `${kind} is not an evidence kind`, { runId, kind });
@@ -340,6 +355,8 @@ export class ArtifactStore {
         { runId, kind },
       );
     }
+    const ownPacket = kind === "BLIND_REVIEW" && packetDigests?.runId === runId
+      && packetDigests.candidateSnapshotDigest === candidateSnapshotDigest;
     return this.write(
       runId,
       kind,
@@ -347,6 +364,7 @@ export class ArtifactStore {
       candidateSnapshotDigest,
       EVIDENCE_PRODUCERS[kind],
       writePort,
+      ownPacket ? packetDigests.digests : undefined,
     );
   }
 
@@ -357,6 +375,7 @@ export class ArtifactStore {
     candidateSnapshotDigest: string | null,
     producedBy: string,
     evidenceWritePort?: EvidenceWritePort,
+    packetDigests?: ReadonlySet<string>,
   ): StoredArtifact<T> {
     if (SNAPSHOT_BOUND.has(kind) && !candidateSnapshotDigest) {
       fail(
@@ -382,14 +401,16 @@ export class ArtifactStore {
     // refusing to store it at all, and the producer is the one that must not include it.
     // Checked before an identical stored row is looked up, so every write, a repeated one
     // included, is checked against the store's own configuration and stored facts.
-    const credential = credentialBearingField(content, 0, [], {
+    const credential = credentialRefusal(content, 0, [], {
       writer: kind, runId, locations: this.locations, registry: registryView(this.db), record: content,
+      ...(packetDigests === undefined ? {} : { packetDigests }),
     });
     if (credential) {
+      // #1307 — the rule and the class of what it matched, never the matched text.
       fail(
         ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED,
         `${kind} contains a credential and cannot be stored as evidence`,
-        { runId, kind, field: credential },
+        { runId, kind, field: credential.field, rule: credential.rule, form: credential.form, inPacket: credential.inPacket },
       );
     }
     const durableContent = content;
@@ -770,6 +791,20 @@ const blindReviewEvidenceSchema = z
         ),
         reviewerPromptDigests: z.array(DIGEST_SCHEMA).min(1),
         reviewerInputRepresentations: z.array(z.string().min(1)).min(1),
+        // #1270 — the frontier-simplify source every reviewer input carried; a packet without it is no review.
+        methodology: z
+          .object({
+            repository: z.string().min(1),
+            revision: z.string().regex(/^[0-9a-f]{40}$/),
+            path: z.string().min(1),
+            digest: DIGEST_SCHEMA,
+          })
+          .strict(),
+        // The CEO-attached private review evidence a STANDARD_WORK candidate was frozen with, by digest.
+        reviewEvidence: z
+          .object({ digest: DIGEST_SCHEMA, bundleSha256: DIGEST_SCHEMA, attachmentDigest: DIGEST_SCHEMA })
+          .strict()
+          .optional(),
       })
       .strict(),
     coveredRepositories: z.array(z.string()),
@@ -779,6 +814,8 @@ const blindReviewEvidenceSchema = z
     omittedItems: z.array(z.string()),
     verdict: z.enum(["PASS", "REVISE", "BLOCK"]),
     findings: z.array(z.object({}).passthrough()),
+    // #1271 — `method` findings: gaps in the review method, kept apart from the candidate's findings.
+    methodFindings: z.array(z.object({}).passthrough()).min(1).optional(),
     chunked: z.boolean(),
     // Issue #246 PR-C slice C2 — a BOOTSTRAP_PLAN review names the PLAN, manifest and planned
     // outputs it judged, reloaded from the PLAN artifact. A candidate review carries no such key.

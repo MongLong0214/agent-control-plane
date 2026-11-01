@@ -119,10 +119,12 @@ const CLEAN_TREE_COMMAND = {
   maxMemoryMb: 2048,
 };
 
+// #1268 — a bootstrap is a new project, and a new project requires CommitLore (the harness gives a passing double).
 const cleanTreeManifest = (projectId: string): ProjectManifest =>
   fixtureManifest(projectId, {
     verificationCommands: [CLEAN_TREE_COMMAND],
     verificationProfiles: { simple: ["clean-tree"], standard: ["clean-tree"], guarded: ["clean-tree"] },
+    commitlore: { mode: "required" },
   });
 
 interface PreparedRun {

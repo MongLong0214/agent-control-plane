@@ -433,7 +433,7 @@ export const mergeBase = async (cwd: string, a: string, b: string): Promise<stri
  *   both ran through `diffDigest`, and neither runs with this option. `short` is git's default,
  *   so a repository without that setting digests the same bytes as before.
  */
-const PATCH_WITHOUT_PROGRAMS = ["--no-ext-diff", "--no-textconv", "--submodule=short"] as const;
+export const PATCH_WITHOUT_PROGRAMS = ["--no-ext-diff", "--no-textconv", "--submodule=short"] as const;
 
 /**
  * Git's own text/binary decision on content (`buffer_is_binary` in git's xdiff-interface.c): a NUL byte

@@ -35,6 +35,7 @@ import { ManifestActivationGrants } from "../registry/manifest-activation-grants
 import { RepositoryRegistry } from "../registry/repository-registry.ts";
 import { WorkerCheckouts } from "../registry/worker-checkout.ts";
 import { ConversationalActorRegistry } from "../registry/conversational-actor-registry.ts";
+import { DogfoodFindingStore } from "../quality/upstream-dogfood.ts";
 import { BlindReviewGate, type ReviewerPreference } from "../review/blind-review.ts";
 import { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import { type CompletionAuthority, type CompletionAuthoritySet, RunEngine } from "../run/run-engine.ts";
@@ -341,6 +342,8 @@ export class ControlPlane {
   readonly bootstrap: BootstrapActivation;
   /** Issue #246 — performs a bootstrap plan's GitHub writes, then hands the result to `bootstrap`. */
   readonly bootstrapProducer: RepoFactoryBootstrapRunner;
+  /** #1271 — upstream dogfood findings, on the audit log. Nothing publishes them while publishing is off. */
+  readonly dogfoodFindings: DogfoodFindingStore;
   /** Issue #246 PR-C slice C3 — the durable record of each bootstrap run's application. */
   readonly bootstrapApplications: BootstrapApplications;
 
@@ -512,6 +515,7 @@ export class ControlPlane {
       // Claimed immediately: issuance succeeds once per database, so claiming here is what
       // makes every later claim — by any component that reaches this store — fail.
       this.#evidenceWriters = this.artifacts.issueEvidenceWriters();
+      this.dogfoodFindings = new DogfoodFindingStore({ db: this.db, audit: this.audit, artifacts: this.artifacts, clock: this.clock });
       this.telemetry = new Telemetry(this.db, this.clock);
       this.outbox = new Outbox(this.db, this.clock, this.audit);
 
@@ -716,6 +720,8 @@ export class ControlPlane {
         },
       );
       this.watchdog = new Watchdog(this.db, this.clock, this.audit, this.doctor, this.claims, this.outbox);
+      // An attempt the watchdog releases has its reviewer and verification children stopped.
+      this.watchdog.attach({ attemptReleased: (attemptId) => this.pipeline.abortAttempt(attemptId) });
       this.bootstrapApplications = new BootstrapApplications(this.db, this.clock, this.audit);
       const hostScript = config.residentProvisioner?.script ?? process.env["ACP_HOST_PROJECT_PROVISIONER"];
       this.hostProjectProvisioner = config.residentProvisioner?.port ?? (hostScript
@@ -825,6 +831,8 @@ export class ControlPlane {
         adoptions: this.bootstrapAdoptions,
         // #246 B3 — runs only for a manifest whose CommitLore mode is required.
         commitlore: config.repoFactory?.commitlore ?? createCommitLoreCliPort(),
+        // #1271 — a CommitLore observation that did not pass is recorded as an upstream dogfood finding.
+        dogfood: this.dogfoodFindings,
       });
       // FIX-FINALIZER-DIGEST — the GitHub kernel compares its payload with the production gate's one
       // human-gate resolution: the status and the binding the daemon finalizer names, resolved again at

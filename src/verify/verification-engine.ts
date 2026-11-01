@@ -202,7 +202,21 @@ export interface VerifyOptions {
   executionMode?: "SIMPLE" | "STANDARD" | "GUARDED";
   /** Commands the CTO proposed for an unregistered repository (§17.5). */
   runScoped?: boolean;
+  /**
+   * The submission this verification runs for. `holds` is asked before each command starts and in the
+   * transaction of each result and report written; `progress` renews its lease once a command's
+   * evidence is in. Either answering false stops verification with nothing more recorded, and the
+   * signal stops the command running when the submission no longer holds the run.
+   */
+  attempt?: { holds: () => boolean; progress: () => boolean; signal: AbortSignal };
 }
+
+/** The refusal of a verification whose submission no longer holds the run. */
+const attemptStale = (runId: string, snapshotDigest: string): Decision<VerificationReport> =>
+  deny(ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE, "the submission's attempt no longer holds the run, so its verification stopped", {
+    runId,
+    snapshotDigest,
+  });
 
 const memoryEvidenceReason = (
   peakRssMb: number | null | undefined,
@@ -610,7 +624,7 @@ export class VerificationEngine {
       const report = this.buildReport(verifiedOptions, snapshotDigest, [], [
         "no verification command is configured for this candidate",
       ]);
-      this.persist(runId, snapshotDigest, report);
+      if (!this.persist(runId, snapshotDigest, report, options.attempt)) return attemptStale(runId, snapshotDigest);
       return deny(ReasonCode.VERIFICATION_GAP, "no verification command configured", {
         runId,
         snapshotDigest,
@@ -637,6 +651,8 @@ export class VerificationEngine {
         continue;
       }
 
+      // No command starts for a submission that no longer holds the run.
+      if (options.attempt?.holds() === false) return attemptStale(runId, snapshotDigest);
       if (command.evidenceMode !== "TRUSTED_CI") {
         const claim = this.ensureVerificationClaim(run, repo.identity);
         if (!claim.allowed) return claim as Decision<VerificationReport>;
@@ -651,13 +667,19 @@ export class VerificationEngine {
           repo.sourceBranch ?? null,
           gateObligations.get(command.id) ?? [],
           expectedCheckoutHead(repo),
+          options.attempt?.signal,
         );
         if (!local.allowed) return local as Decision<VerificationReport>;
+        // A result that comes back after its submission lost the run is not recorded.
+        if (!this.writeResultRow(runId, snapshotDigest, local.value, options.attempt)) return attemptStale(runId, snapshotDigest);
         results.push(local.value);
       }
       if (command.evidenceMode !== "LOCAL_COMMAND") {
-        results.push(await this.collectCi(runId, snapshotDigest, command, repo.identity, repo.candidateHead));
+        const ci = await this.collectCi(command, repo.identity, repo.candidateHead);
+        if (!this.writeResultRow(runId, snapshotDigest, ci, options.attempt)) return attemptStale(runId, snapshotDigest);
+        results.push(ci);
       }
+      if (options.attempt?.progress() === false) return attemptStale(runId, snapshotDigest);
     }
 
     // §16.2 — the commands ran against a detached worktree, but the source may have moved
@@ -668,12 +690,12 @@ export class VerificationEngine {
         ...gaps,
         "the candidate changed while verification was running",
       ]);
-      this.persist(runId, snapshotDigest, staleReport);
+      if (!this.persist(runId, snapshotDigest, staleReport, options.attempt)) return attemptStale(runId, snapshotDigest);
       return stillFresh as Decision<VerificationReport>;
     }
 
     const report = this.buildReport(verifiedOptions, snapshotDigest, results, gaps);
-    this.persist(runId, snapshotDigest, report);
+    if (!this.persist(runId, snapshotDigest, report, options.attempt)) return attemptStale(runId, snapshotDigest);
 
     this.telemetry.record({
       scope: "quality",
@@ -947,6 +969,8 @@ export class VerificationEngine {
     gateEntries: readonly GateEntry[],
     /** Where the source checkout must stand for a self-contained copy (`expectedCheckoutHead`). */
     sourceHead: string,
+    /** Stops the command when its submission no longer holds the run. */
+    signal?: AbortSignal,
   ): Promise<Decision<VerificationResultRecord>> {
     const runId = run.runId;
     const worktreeId = `verify-${runId}-${command.id}-${head.slice(0, 8)}-${randomUUID().replaceAll("-", "")}`;
@@ -1018,8 +1042,8 @@ export class VerificationEngine {
           ],
         },
         worktreePath: worktree.path,
-        // §33.3 — the control plane's own secret store and state must be unreadable to a
-        // candidate, as must every other checkout on this machine.
+        // §33.3 — the control plane's own secret store and state must be unreadable and unwritable
+        // to a candidate, and unreachable by a unix socket, as must every other checkout here.
         denyReadPaths: this.denyReadPaths(checkoutPath),
         // A gate command cannot spawn at all (RLIMIT_NPROC 1): the loader above binds what it
         // loads in-process only, and a spawned process would run outside it. Every other declared
@@ -1028,6 +1052,7 @@ export class VerificationEngine {
         // `gateEntries`, this command's obligations under the run's pinned manifest, which the
         // candidate cannot change; neither the command nor its environment carries a mode.
         processLimit: gateEntries.length > 0 ? "no-spawn" : "supervised-budget",
+        ...(signal === undefined ? {} : { signal }),
       });
     } finally {
       if (worktree) {
@@ -1076,7 +1101,6 @@ export class VerificationEngine {
         outcome.outputTruncated,
       ),
     };
-    this.writeResultRow(runId, snapshotDigest, record);
     return allow(ReasonCode.OK, record);
   }
 
@@ -1085,8 +1109,6 @@ export class VerificationEngine {
    * approved workflow digest, created by a trusted identity, with a non-vacuous job.
    */
   private async collectCi(
-    runId: string,
-    snapshotDigest: string,
     command: VerificationCommand,
     identity: string,
     head: string,
@@ -1107,9 +1129,7 @@ export class VerificationEngine {
     };
 
     if (!this.#ci) {
-      const record = { ...base, reasonCode: ReasonCode.EVIDENCE_MISSING };
-      this.writeResultRow(runId, snapshotDigest, record);
-      return record;
+      return { ...base, reasonCode: ReasonCode.EVIDENCE_MISSING };
     }
 
     const [checks, approved, creators] = await Promise.all([
@@ -1132,26 +1152,20 @@ export class VerificationEngine {
     );
     const match = ordered[0];
     if (!match) {
-      const record = {
+      return {
         ...base,
         reasonCode:
           candidates.length > 0 ? ReasonCode.VERIFICATION_CI_HEAD_MISMATCH : ReasonCode.EVIDENCE_MISSING,
       };
-      this.writeResultRow(runId, snapshotDigest, record);
-      return record;
     }
     if (!approved.includes(match.workflowDigest)) {
-      const record = { ...base, reasonCode: ReasonCode.VERIFICATION_CI_WORKFLOW_DIGEST_MISMATCH };
-      this.writeResultRow(runId, snapshotDigest, record);
-      return record;
+      return { ...base, reasonCode: ReasonCode.VERIFICATION_CI_WORKFLOW_DIGEST_MISMATCH };
     }
     if (!creators.includes(match.creatorIdentity) || !match.nonVacuous) {
-      const record = { ...base, reasonCode: ReasonCode.GATE_CREATOR_UNTRUSTED };
-      this.writeResultRow(runId, snapshotDigest, record);
-      return record;
+      return { ...base, reasonCode: ReasonCode.GATE_CREATOR_UNTRUSTED };
     }
 
-    const record: VerificationResultRecord = {
+    return {
       ...base,
       startedAt: match.completedAt,
       endedAt: match.completedAt,
@@ -1159,8 +1173,6 @@ export class VerificationEngine {
       reasonCode: match.conclusion === "success" ? null : ciNonSuccessReason(match.conclusion),
       outputDigest: digestOf(match),
     };
-    this.writeResultRow(runId, snapshotDigest, record);
-    return record;
   }
 
   private ensureVerificationClaim(
@@ -1334,7 +1346,16 @@ export class VerificationEngine {
     };
   }
 
-  private persist(runId: string, snapshotDigest: string, report: VerificationReport): void {
+  /** Records the report, in one transaction with the submission's hold on the run; false when it no longer holds. */
+  private persist(runId: string, snapshotDigest: string, report: VerificationReport, attempt?: { holds: () => boolean }): boolean {
+    return this.db.tx(() => {
+      if (attempt?.holds() === false) return false;
+      this.persistReport(runId, snapshotDigest, report);
+      return true;
+    });
+  }
+
+  private persistReport(runId: string, snapshotDigest: string, report: VerificationReport): void {
     this.artifacts.putEvidence(
       this.evidenceWriter,
       runId,
@@ -1371,7 +1392,17 @@ export class VerificationEngine {
     runId: string,
     snapshotDigest: string,
     record: VerificationResultRecord,
-  ): void {
+    /** Asked in the same transaction: a submission that no longer holds the run records nothing. */
+    attempt?: { holds: () => boolean },
+  ): boolean {
+    return this.db.tx(() => {
+      if (attempt?.holds() === false) return false;
+      this.insertResultRow(runId, snapshotDigest, record);
+      return true;
+    });
+  }
+
+  private insertResultRow(runId: string, snapshotDigest: string, record: VerificationResultRecord): void {
     this.db.run(
       `INSERT INTO verification_results
          (result_id, run_id, candidate_snapshot_digest, command_id, repository_identity, source, attempt,

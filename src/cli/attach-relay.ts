@@ -136,11 +136,15 @@ export interface SessionMessaging {
  *
  * It waits only while nobody answers on the reattach socket — a daemon that is down or still
  * starting — or while an admitted connection has not finished being restored. Any answer ends the
- * wait: admitted and restored, it carries on; refused, it exits. `maxWaitMs` is one absolute
- * deadline, taken when the connection is lost, over every admission and every restore of that
- * wait (review PR1051-R2); `attemptTimeoutMs` bounds each step inside it and never extends it.
- * `flushTimeoutMs` bounds how long an exiting relay waits for a client that stopped reading
- * (PR1051-R4).
+ * wait: admitted and restored, it carries on; refused, it exits. So does the client ending the
+ * session. By default nothing else ends it: a daemon restart measured at 5m47s outlasted the
+ * five-minute deadline this wait used to have, and a relay that gives up is not respawned by
+ * Claude Code, so every later wake of its role finds no peer. The asking stays bounded instead:
+ * one attempt at a time, each at most `attemptTimeoutMs`, with a backoff capped at `maxDelayMs`.
+ * A finite `maxWaitMs` is one absolute deadline, taken when the connection is lost, over every
+ * admission and every restore of that wait (review PR1051-R2); `attemptTimeoutMs` bounds each step
+ * inside it and never extends it. `flushTimeoutMs` bounds how long an exiting relay waits for a
+ * client that stopped reading (PR1051-R4).
  */
 export interface ReattachPolicy {
   maxWaitMs: number;
@@ -151,7 +155,7 @@ export interface ReattachPolicy {
 }
 
 export const DEFAULT_REATTACH_POLICY: ReattachPolicy = {
-  maxWaitMs: 5 * 60_000,
+  maxWaitMs: Number.POSITIVE_INFINITY,
   initialDelayMs: 250,
   maxDelayMs: 5_000,
   attemptTimeoutMs: 35_000,
@@ -998,16 +1002,124 @@ export const runAttachRelay = async (
  *
  * It still never reconnects, but for a different reason than the CTO relay: there is no
  * credential to reuse. A respawn is simply a new connection, admitted or refused on the same facts
- * as the first one, and Hermes is what respawns it.
+ * as the first one, and Hermes is what respawns it. Only the **first** connect waits
+ * (`connectWhenReady`), because Hermes respawns the relay on the CEO's next tool call and retries
+ * that call once: a call that lands while the daemon restarts would otherwise fail outright.
  */
-export const runAdoptedCeoAttachRelay = (
-  options: { toolSocketPath: string },
+export const runAdoptedCeoAttachRelay = async (
+  options: { toolSocketPath: string; initialConnect?: Partial<InitialConnectPolicy> },
   io: AttachRelayIo,
 ): Promise<number> => {
-  // The client's bytes wait until the socket is connected, so none is lost to a closed pipe.
-  io.stdin.pause();
-  return pipeStdioToSocket(createConnection(options.toolSocketPath), io, { handshake: () => undefined });
+  const policy: InitialConnectPolicy = { ...ADOPTED_CEO_INITIAL_CONNECT, ...options.initialConnect };
+  const ready = await connectWhenReady(options.toolSocketPath, policy, io);
+  if ("exit" in ready) return ready.exit;
+  return pipeStdioToSocket(ready.socket, io, NO_HANDSHAKE);
 };
+
+/**
+ * How long, and how many times, the adopted CEO's relay tries its first connection while the tool
+ * socket is not there yet. Both bounds hold; whichever is reached first ends the wait with
+ * `UNAVAILABLE`, which is what the first failure meant before there was a wait.
+ */
+export interface InitialConnectPolicy {
+  maxWaitMs: number;
+  maxAttempts: number;
+  retryDelayMs: number;
+}
+
+export const ADOPTED_CEO_INITIAL_CONNECT: InitialConnectPolicy = {
+  maxWaitMs: 10_000,
+  maxAttempts: 40,
+  retryDelayMs: 250,
+};
+
+/**
+ * The only connect errors that mean "not there yet": no socket at the path (`ENOENT`), or a path
+ * nothing listens on (`ECONNREFUSED`) — a daemon that is restarting. Anything else, a permission
+ * error above all, is final at once and is never waited out.
+ */
+const NOT_YET_LISTENING = new Set(["ENOENT", "ECONNREFUSED"]);
+
+/**
+ * Connects to `path`, retrying only while it is not yet listening, within `policy`.
+ *
+ * The client's stdin is read while this waits, so its end is seen: a client that goes away ends
+ * the wait with `OK` and nothing connects afterwards. What it wrote is held and put back in front
+ * of stdin, in order, before the connected socket is handed to the pipe, so no byte is lost. Past
+ * the daemon's own line ceiling stdin is paused instead of held, which bounds the buffer.
+ */
+const connectWhenReady = (
+  path: string,
+  policy: InitialConnectPolicy,
+  io: AttachRelayIo,
+): Promise<{ socket: Socket } | { exit: number }> =>
+  new Promise((resolve) => {
+    const deadline = performance.now() + policy.maxWaitMs;
+    const held: Buffer[] = [];
+    let heldBytes = 0;
+    let attempts = 0;
+    let waiting = false;
+    let done = false;
+    let attempt: Socket | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    const hold = (chunk: Buffer): void => {
+      held.push(chunk);
+      heldBytes += chunk.length;
+      if (heldBytes > MAX_LINE_BYTES) io.stdin.pause();
+    };
+    const ended = (): void => stop({ exit: ATTACH_EXIT.OK });
+    const broken = (): void => stop({ exit: ATTACH_EXIT.STREAM_CLOSED });
+    const stop = (outcome: { socket: Socket } | { exit: number }): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      io.stdin.removeListener("data", hold);
+      io.stdin.removeListener("end", ended);
+      io.stdin.removeListener("error", broken);
+      io.stdin.removeListener("close", broken);
+      io.stdin.pause();
+      if ("socket" in outcome) {
+        if (held.length > 0) io.stdin.unshift(Buffer.concat(held));
+      } else {
+        attempt?.destroy();
+      }
+      resolve(outcome);
+    };
+    // Checked before every attempt, before every retry is scheduled, and once more after a connect
+    // succeeds: a timer or a connect completion can run late, and a connection made past the
+    // deadline is refused here, before any held byte is written to it.
+    const expired = (): boolean => attempts >= policy.maxAttempts || performance.now() > deadline;
+    const unavailable = (): void => {
+      io.stderr.write("attach: mcp socket unavailable\n");
+      stop({ exit: ATTACH_EXIT.UNAVAILABLE });
+    };
+    const connect = (): void => {
+      if (expired()) return unavailable();
+      attempts += 1;
+      const socket = createConnection(path);
+      attempt = socket;
+      const failed = (error: NodeJS.ErrnoException): void => {
+        if (done) return;
+        if (!NOT_YET_LISTENING.has(error.code ?? "") || expired()) return unavailable();
+        if (!waiting) {
+          waiting = true;
+          io.stderr.write("attach: mcp socket waiting\n");
+        }
+        timer = setTimeout(connect, Math.min(policy.retryDelayMs, Math.max(0, deadline - performance.now())));
+      };
+      socket.once("error", failed);
+      socket.once("connect", () => {
+        socket.removeListener("error", failed);
+        if (performance.now() > deadline) return unavailable();
+        stop({ socket });
+      });
+    };
+    io.stdin.on("data", hold);
+    io.stdin.once("end", ended);
+    io.stdin.once("error", broken);
+    io.stdin.once("close", broken);
+    connect();
+  });
 
 /**
  * The byte pipe every relay shares: once `socket` is connected — now, or when it connects — let
@@ -1270,8 +1382,8 @@ const wakeRefusalReason = (message: RelayedMessage): string => {
  *     owns its waiters and its in-flight requests, and only the current link's lines reach anything.
  *     An attempt the relay gives up on is destroyed, so a late answer on it satisfies nothing; a
  *     link lost while it is being restored is retried by the wait already running, never by a
- *     second one. One absolute deadline, `maxWaitMs` from the loss, governs every admission,
- *     restore and pause of the wait.
+ *     second one. With a finite `maxWaitMs`, one absolute deadline from the loss governs every
+ *     admission, restore and pause of the wait; by default there is none (`ReattachPolicy`).
  *   - **It restores only what a daemon confirmed** (PR1051-R3). Replay state is taken from the
  *     daemon's answers rather than from the client's requests: taken from the requests, one the
  *     client was told was not sent ran on return, and a refused registration replaced the accepted
@@ -1351,7 +1463,7 @@ const relayWithReattach = (
     /** The one link the relay serves or is restoring. Every other socket it opened is destroyed. */
     let current: Link | null = null;
     /** The wait in progress: aborting it ends its admission, its restore and its pause at once. */
-    let waiting: { abort: AbortController; deadline: NodeJS.Timeout } | null = null;
+    let waiting: { abort: AbortController; deadline: NodeJS.Timeout | undefined } | null = null;
     let stdinEnded = false;
     let stdoutFailed = false;
     let stdoutBlocked = false;
@@ -1867,7 +1979,8 @@ const relayWithReattach = (
         io.stderr.write("attach: daemon did not return\n");
         end(ATTACH_EXIT.UNAVAILABLE);
       };
-      const wait = { abort, deadline: setTimeout(expire, policy.maxWaitMs) };
+      // An unbounded wait arms no deadline: `setTimeout` would read Infinity as an immediate one.
+      const wait = { abort, deadline: Number.isFinite(policy.maxWaitMs) ? setTimeout(expire, policy.maxWaitMs) : undefined };
       waiting = wait;
       flow();
       const left = (): number => deadlineAt - Date.now();

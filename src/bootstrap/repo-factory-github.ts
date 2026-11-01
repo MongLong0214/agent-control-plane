@@ -22,14 +22,17 @@ import { git, tryRevParse } from "../git/git.ts";
 import {
   genesisLabelConflictOf,
   isGitHubNodeId,
+  NEW_REPOSITORY_MERGE_METHODS,
   parseGitHubIdentity,
   REQUEST_OUTCOME_UNKNOWN,
   requestOutcomeUnknown,
   sameGitHubName,
   type BranchProtectionState,
+  type GenesisResourceUnmet,
   type GitHubRepositoryTarget,
   type GitHubVisibility,
   type GitHubWritePort,
+  type MergeMethods,
   UNOBSERVED,
   type ObservedBranchProtection,
   type ObservedRepository,
@@ -514,6 +517,20 @@ export const pendingWriteSchema = z
     respondedNodeId: z.string().min(1).nullable(),
     /** branch: the commit the push sent. */
     pushedHead: z.string().min(1).nullable(),
+    /**
+     * #1269 — repository: the merge methods GitHub's read of this create showed otherwise than asked.
+     * Optional, so a ledger stored before it still parses; once recorded, every later drive stops on it.
+     */
+    mergeMethodsRefused: z
+      .object({
+        fields: z.array(z.enum(["allow_merge_commit", "allow_squash_merge", "allow_rebase_merge"])).min(1),
+        observed: z
+          .object({ allow_merge_commit: z.boolean().nullable(), allow_squash_merge: z.boolean().nullable(), allow_rebase_merge: z.boolean().nullable() })
+          .strict()
+          .nullable(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -920,6 +937,32 @@ export const applyGitHubOperations = async (
     return allow(ReasonCode.OK, undefined);
   };
 
+  /**
+   * #1269 — a repository this operation's create made allows ordinary merge commits only, as the create
+   * asked, judged on GitHub's read of it. A receipted repository is not judged again. A field the read
+   * did not carry, or carries otherwise, refuses by name; nothing is PATCHed, deleted or created again.
+   * The refusal is recorded with the pending create, so it stands whatever GitHub shows later.
+   */
+  const judgeMergeMethods = (observed: ObservedRepository, intent: PendingWrite): Decision<void> => {
+    const fields = (Object.keys(NEW_REPOSITORY_MERGE_METHODS) as (keyof MergeMethods)[]).filter(
+      (field) => observed.mergeMethods?.[field] !== NEW_REPOSITORY_MERGE_METHODS[field],
+    );
+    if (fields.length === 0) return allow(ReasonCode.OK, undefined);
+    const refused = { fields, observed: observed.mergeMethods ?? null };
+    begin({ ...intent, mergeMethodsRefused: refused });
+    return mergeMethodsRefusal(intent.operationId, refused);
+  };
+
+  const mergeMethodsRefusal = <T>(operationId: string, refused: NonNullable<PendingWrite["mergeMethodsRefused"]>): Decision<T> =>
+    stop(
+      ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
+      "MERGE_METHODS_MISMATCH",
+      `GitHub reported ${target.owner}/${target.name} with ${refused.fields.map((field) => `${field} ${String(refused.observed?.[field] ?? "absent")}`).join(", ")}, and its create asked for merge commits only`,
+      operationId,
+      { fields: refused.fields, observed: refused.observed, desired: NEW_REPOSITORY_MERGE_METHODS },
+      false,
+    );
+
   /** Before any later operation: the repository at this name is still the one we receipted. */
   const confirmRepository = async (operationId: string | null): Promise<Decision<ObservedRepository>> => {
     const observed = await remote(operationId, () => port.observeRepository(target));
@@ -1015,6 +1058,8 @@ export const applyGitHubOperations = async (
     const id = operation.operationId;
     const prior = input.prior.receipts.get(id);
     const pendingWrite = pending.get(id);
+    // #1269 — a create refused on its merge methods stays refused: nothing is read, adopted or written again.
+    if (pendingWrite?.mergeMethodsRefused !== undefined) return mergeMethodsRefusal(id, pendingWrite.mergeMethodsRefused);
     const observed = await remote(id, () => port.observeRepository(target));
     if (!observed.allowed) return observed as Decision<Step>;
     if (prior !== undefined) {
@@ -1097,6 +1142,8 @@ export const applyGitHubOperations = async (
       }
       const judged = judgeRepository(observed.value, id);
       if (!judged.allowed) return judged as Decision<Step>;
+      const merges = judgeMergeMethods(observed.value, pendingWrite);
+      if (!merges.allowed) return merges as Decision<Step>;
       return allow(ReasonCode.OK, {
         receipt: {
           operationId: id,
@@ -1156,7 +1203,8 @@ export const applyGitHubOperations = async (
         false,
       );
     }
-    begin({ ...intent, respondedNodeId: created.value.nodeId });
+    const answered: PendingWrite = { ...intent, respondedNodeId: created.value.nodeId };
+    begin(answered);
     const createdJudged = judgeRepository(created.value, id);
     if (!createdJudged.allowed) return createdJudged as Decision<Step>;
     const reread = await remote(id, () => port.observeRepository(target));
@@ -1183,6 +1231,8 @@ export const applyGitHubOperations = async (
     }
     const rereadJudged = judgeRepository(reread.value, id);
     if (!rereadJudged.allowed) return rereadJudged as Decision<Step>;
+    const rereadMerges = judgeMergeMethods(reread.value, answered);
+    if (!rereadMerges.allowed) return rereadMerges as Decision<Step>;
     return allow(ReasonCode.OK, {
       receipt: {
         operationId: id,
@@ -1741,10 +1791,12 @@ export const applyGitHubOperations = async (
     if (!port.observeGenesisResources || !port.ensureGenesisResources) return stop(ReasonCode.VERIFICATION_GAP,"GENESIS_RESOURCES_UNSUPPORTED","GitHub port cannot provision genesis resources",id,{},false);
     const prior = input.prior.receipts.get(id);
     // #1240 — the readback is bound to the repository confirmRepository just matched to its receipted node id.
-    const bound = { repositoryNodeId: repository.value.nodeId };
-    let observed = await remote(id,() => port.observeGenesisResources!(target,operation.desiredState,bound));
+    // A failed readback names each planned item it did not find as planned.
+    const unmet: GenesisResourceUnmet[] = [];
+    const readback = () => { unmet.length = 0; return remote(id,() => port.observeGenesisResources!(target,operation.desiredState,{repositoryNodeId:repository.value.nodeId,unmet})); };
+    let observed = await readback();
     if (!observed.allowed) return observed as Decision<Step>;
-    if (prior && (observed.value === null || digestOf(observed.value) !== digestOf(prior.observed))) return stop(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"RESUMED_RESOURCE_DRIFTED","genesis resources drifted",id,{},false);
+    if (prior && (observed.value === null || digestOf(observed.value) !== digestOf(prior.observed))) return stop(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"RESUMED_RESOURCE_DRIFTED","genesis resources drifted",id,{unmet},false);
     const intent = pending.get(id) ?? {operationId:id,resourceType:operation.resourceType,resourceIdentity:operation.resourceIdentity,attemptedAt:clock.nowIso(),preexisting:false,beforeStateDigest:null,marker:null,respondedNodeId:null,pushedHead:null};
     // A same-named label is repainted only on a repository this operation created, as its receipt says
     // and confirmRepository still observes: there it is GitHub's autoInit default label, never someone's.
@@ -1752,10 +1804,10 @@ export const applyGitHubOperations = async (
     if (!observed.value) {
       begin(intent);
       const written = await remote(id,() => port.ensureGenesisResources!(target,operation.desiredState,{reconcileExistingLabels})); if (!written.allowed) return written as Decision<Step>;
-      observed = await remote(id,() => port.observeGenesisResources!(target,operation.desiredState,bound));
+      observed = await readback();
     }
     if (!observed.allowed) return observed as Decision<Step>;
-    if (!observed.value) return stop(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,"REREAD_MISMATCH","genesis resource readback failed",id,{},true);
+    if (!observed.value) return stop(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,"REREAD_MISMATCH","genesis resource readback failed",id,{unmet},true);
     return allow(ReasonCode.OK,{receipt:{operationId:id,resourceType:"genesis-resources",resourceIdentity:operation.resourceIdentity,repositoryNodeId:repository.value.nodeId,preexisting:false,beforeStateDigest:null,createdAt:prior?.createdAt ?? intent.attemptedAt,rereadAt:clock.nowIso(),observed:observed.value},outcome:prior ? "resumed" : "written"});
   };
 

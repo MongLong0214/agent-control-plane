@@ -389,6 +389,12 @@ export const ReasonCode = {
   REVIEW_BLOCK: "REVIEW_BLOCK",
   REVIEW_OMITTED_ITEMS_PRESENT: "REVIEW_OMITTED_ITEMS_PRESENT",
   REVIEW_MANUAL_INVOCATION_DENIED: "REVIEW_MANUAL_INVOCATION_DENIED",
+  /**
+   * F1 — a result_submit refused before any verification or review: the same unchanged candidate already went
+   * unjudged (method findings alone, or assurance not constituted) the limit number of times in a row. Not a running
+   * attempt and not a retryable conflict: the owner escalates to the CEO instead of resubmitting.
+   */
+  REVIEW_UNJUDGED_LIMIT_REACHED: "REVIEW_UNJUDGED_LIMIT_REACHED",
 
   // --- github kernel -------------------------------------------------------
   PR_BRANCH_CONTRACT_VIOLATION: "PR_BRANCH_CONTRACT_VIOLATION",
@@ -396,6 +402,8 @@ export const ReasonCode = {
   MERGE_GATE_MISSING: "MERGE_GATE_MISSING",
   MERGE_BASE_STALE: "MERGE_BASE_STALE",
   MERGE_HEAD_STALE: "MERGE_HEAD_STALE",
+  /** #1269 — the merge is proven, and only its candidate's CommitLore notes are not on the remote yet. */
+  MERGE_NOTES_PENDING: "MERGE_NOTES_PENDING",
   MERGE_IDEMPOTENT_REPLAY: "MERGE_IDEMPOTENT_REPLAY",
   GITHUB_RECEIPT_PROTOCOL_VIOLATION: "GITHUB_RECEIPT_PROTOCOL_VIOLATION",
   MERGE_BRANCH_PROFILE_UNSATISFIED: "MERGE_BRANCH_PROFILE_UNSATISFIED",
@@ -484,6 +492,11 @@ export const ReasonCode = {
    */
   MCP_REPLAY_UNVERIFIABLE: "MCP_REPLAY_UNVERIFIABLE",
   MCP_MUTATION_OUTCOME_UNKNOWN: "MCP_MUTATION_OUTCOME_UNKNOWN",
+  /**
+   * A replay of a key whose first call is still running in this process, for a mutation that answers
+   * so (`result_submit`): nothing ran again, and the same key answers the stored result once it is done.
+   */
+  MCP_MUTATION_IN_FLIGHT: "MCP_MUTATION_IN_FLIGHT",
   MCP_PEER_UNAUTHENTICATED: "MCP_PEER_UNAUTHENTICATED",
   /**
    * #1037 — a mutation on the adopted CEO's tool channel whose caller provenance is not the owner's

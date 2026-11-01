@@ -7,11 +7,18 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
+  COMMITLORE_LIMITS,
   commitloreChildEnvironment,
+  commitloreRunner,
   createCommitLoreCliPort,
   requiredCommitLoreObservation,
 } from "../../src/bootstrap/commitlore-observation.ts";
+import { latestRelease } from "../helpers/commitlore-release.ts";
+import { hostGitDirectory, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+
+/** #1268 — the production port on the pin in the environment; the fake answers 1.7.3, confirmed as the newest release. */
+const envPort = () => createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, undefined, latestRelease("1.7.3")));
 
 /**
  * Review S11-R3 (PR #1138, CEO cb5501eb) — no credential reaches a `commitlore` child indirectly: not
@@ -117,7 +124,6 @@ const injectDaemonEnvironment = (): void => {
  */
 const fake = (name: string, body: string): void => {
   const dir = tempDir(`acp-s11-r3-${name}-`);
-  writeFileSync(join(dir, "package.json"), '{"type":"commonjs"}');
   const prelude = `
     if (process.argv[2] === '--version') { process.stdout.write('1.7.3\\n'); return; }
     if (process.argv[2] === 'doctor' && process.argv[3] === '--help') { process.stdout.write('Usage: commitlore doctor [options]\\n\\nOptions:\\n  --json  emit the report as JSON\\n'); return; }
@@ -136,8 +142,9 @@ const fake = (name: string, body: string): void => {
     };
     const fill = 'protocol=http\\nhost=127.0.0.1:${port}\\n\\n';
   `;
-  writeFileSync(join(dir, "commitlore"), `#!${process.execPath}\n${prelude}\n${body}\n`, { mode: 0o700 });
-  vi.stubEnv("PATH", `${dir}:/usr/bin:/bin`);
+  // #1268 — installed as the installer installs it: a run copies the package its wrapper names.
+  writeCommitLoreInstall(dir, `${prelude}\n${body}`);
+  vi.stubEnv("PATH", `${dir}:${hostGitDirectory()}:/usr/bin:/bin`);
   vi.stubEnv("ACP_COMMITLORE_BINARY", join(dir, "commitlore"));
 };
 
@@ -242,7 +249,7 @@ describe("S11-R3: a CommitLore child reaches no credential, through its own git 
     );
     injectDaemonEnvironment();
     resetMarks();
-    observedOutcome = (await createCommitLoreCliPort().observe(repo)).outcome;
+    observedOutcome = (await envPort().observe(repo)).outcome;
     const log = readLog("observed");
     observedHomes = log.filter((entry) => "home" in entry);
     // Every credential request was made, reached git's credential step and found nothing there.
@@ -292,7 +299,8 @@ describe("S11-R3: a CommitLore child reaches no credential, through its own git 
     for (const entry of observedHomes) {
       const home = entry["home"] as string;
       expect(home).not.toBe(daemonHome);
-      expect(entry).toMatchObject({ mode: "700", entries: [".gitconfig"], globalConfig: join(home, ".gitconfig"), globalBytes: 0 });
+      // #1268 — under the worker's git hardening the global config is /dev/null: as empty as the home's own.
+      expect(entry).toMatchObject({ mode: "700", entries: [".gitconfig"], globalConfig: "/dev/null", globalBytes: 0 });
       expect(existsSync(home), home).toBe(false);
     }
   });
@@ -309,6 +317,10 @@ describe("S11-R3: a CommitLore child reaches no credential, through its own git 
       GIT_CONFIG_VALUE_0: "",
       GIT_ASKPASS: "",
       GIT_TERMINAL_PROMPT: "0",
+      // #1268 — preferred by git to the repository's core.sshCommand.
+      GIT_SSH_COMMAND: "ssh",
+      // #1268 — attributes from the empty tree: no work-tree .gitattributes selects a driver.
+      GIT_ATTR_SOURCE: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
     });
   });
 });
@@ -327,7 +339,7 @@ describe("S11-R3 control: a required CommitLore that cannot reach its remote is 
     fake(name, `process.exit(git(['ls-remote', 'origin']) ?? 1);`);
     injectDaemonEnvironment();
     resetMarks();
-    const decision = await requiredCommitLoreObservation(createCommitLoreCliPort(), repo);
+    const decision = await requiredCommitLoreObservation(envPort(), repo);
     expect(decision).toMatchObject({ allowed: false, evidence: { refusal: "COMMITLORE_REQUIRED_NOT_OBSERVED" } });
     expect(readLog(name).map((entry) => [entry["git"], entry["status"]])).toEqual([["ls-remote origin", 128]]);
     expect(ran()).toEqual([]);

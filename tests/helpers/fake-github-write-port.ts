@@ -1,5 +1,6 @@
 import { join } from "node:path";
 
+import type { ObservedRepository } from "../../src/bootstrap/github-write-port.ts";
 import { git } from "../../src/git/git.ts";
 
 /**
@@ -145,13 +146,15 @@ export class FakeGitHub {
     }
   }
 
-  private shape(repository: FakeRepository) {
+  private shape(repository: FakeRepository): ObservedRepository {
     return {
       nodeId: repository.nodeId,
       fullName: `${repository.owner}/${repository.name}`,
       visibility: repository.visibility,
       description: repository.description,
       defaultBranch: repository.defaultBranch,
+      // #1269 — what GitHub keeps for the merge methods the port's create states.
+      mergeMethods: { allow_merge_commit: true, allow_squash_merge: false, allow_rebase_merge: false },
     };
   }
 

@@ -821,7 +821,7 @@ exec /bin/ps "$@"
     expect(outcome).toMatchObject({
       status: "PASS", exitCode: 0, signal: null,
       stdout: "TITLE_OK_SECRETS_DENIED\n",
-      enforcement: { networkEnforced: true, writeConfinement: true, resourceLimitsEnforced: true, childContainmentEnforced: true },
+      enforcement: { networkEnforced: false, writeConfinement: true, resourceLimitsEnforced: true, childContainmentEnforced: true },
     });
   });
 
@@ -849,8 +849,7 @@ exec /bin/ps "$@"
     }
     expect(outcome).toMatchObject({ status: "FAIL", exitCode: 1 });
     expect(`${outcome.stdout}\n${outcome.stderr}`).toMatch(/EACCES|EPERM/);
-    // The sandbox receives a scrubbed HOME, so userInfo().homedir() is also denied by
-    // the independently derived passwd-home path rather than relying on this override.
+    // The sandbox receives the daemon's HOME; the secret path is denied by the profile under it.
     expect(sensitiveReadPaths([])).toContain(join(homedir(), ".config", "git", "credentials"));
   });
 });

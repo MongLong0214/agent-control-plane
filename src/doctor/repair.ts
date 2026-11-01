@@ -10,6 +10,7 @@ import { type AuditLog, type AuditRow, RECORDED_REFUSAL_KINDS, redact } from "..
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, type RunState } from "../domain/types.ts";
+import { HOLDER_CLAIMED_KINDS } from "../outbox/envelope.ts";
 import type { CandidateSnapshot } from "../snapshot/candidate-snapshot.ts";
 import { isTerminal, TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import { isClean, tryRevParse } from "../git/git.ts";
@@ -28,6 +29,7 @@ import {
 } from "../run/worker-orphan-release.ts";
 import { WorkerTurnEvent } from "../run/worker-turn.ts";
 import { CONTINUITY_HOLD_NON_MOVEMENT_KINDS, isRecordedMovement } from "../run/run-engine.ts";
+import { receiptProcessIsRunning } from "../run/task-graph.ts";
 import {
   type RepairWorktreeAuthority,
   type ManagedWriteGuard,
@@ -152,7 +154,7 @@ export class RepairService {
       id: "retry_outbox",
       risk: "LOW",
       authorization: "HERMES",
-      description: "Reset delivery attempts on pending outbox messages",
+      description: "Reset delivery attempts on pending outbox messages, or only a target's: parameters messageId or roleKey",
       expectedEffect: "pending messages are retried on the next delivery pass",
       undo: "none; delivery remains idempotent",
       preconditions: ["messages are PENDING and unexpired"],
@@ -517,15 +519,18 @@ export class RepairService {
         };
       }
       case "abandon_dead_executions": {
-        const running = this.db.all<{ execution_id: string; worker_process_id: number | null }>(
-          `SELECT execution_id, worker_process_id FROM task_executions WHERE status = 'RUNNING'`,
+        const running = this.db.all<{ execution_id: string; run_id: string; worker_process_id: number | null; runtime_managed: number }>(
+          `SELECT execution_id, run_id, worker_process_id, runtime_managed FROM task_executions WHERE status = 'RUNNING'`,
         );
         const dead = running.filter(
           (execution) =>
             execution.worker_process_id !== null &&
             Number.isInteger(execution.worker_process_id) &&
             execution.worker_process_id > 0 &&
-            !alive(execution.worker_process_id),
+            // A CTO receipt's process is the one it named at open, pid and OS start; a reused pid is not it.
+            !(execution.runtime_managed === 0
+              ? receiptProcessIsRunning(this.db, { runId: execution.run_id, executionId: execution.execution_id, pid: execution.worker_process_id })
+              : alive(execution.worker_process_id)),
         );
         const evidence = {
           running: running.map((execution) => ({
@@ -554,6 +559,8 @@ export class RepairService {
         };
       }
       case "retry_outbox": {
+        const targeted = this.retryOutboxTarget(operation, request);
+        if (targeted !== null) return targeted;
         const pending = this.db.all<{ message_id: string; expires_at: string }>(
           `SELECT message_id, expires_at FROM outbox WHERE status = 'PENDING' AND attempts > 0`,
         );
@@ -813,6 +820,76 @@ export class RepairService {
       ],
     );
     return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * retry_outbox scoped to a target: the message `messageId` names, whatever its status, or the undelivered
+   * rows of `roleKey`, PENDING or EXPIRED, so an expired one is listed and not hidden (with both, that message
+   * only if it is that role's).
+   * Null without a target, which keeps the unscoped reset.
+   * Only a row a retry can deliver is reset, and every other target row is listed with why not: a
+   * holder-claimed kind is delivered by its holder's claim, never by the delivery pass; an expired row is
+   * never resent. The evidence names the target's rows and nothing else.
+   */
+  private retryOutboxTarget(operation: RepairOperation, request: RepairRequest): RepairPlan | null {
+    const messageId = request.parameters["messageId"];
+    const roleKey = request.parameters["roleKey"];
+    if (messageId === undefined && roleKey === undefined) return null;
+    const now = this.clock.nowIso();
+    const where = [
+      messageId !== undefined ? "message_id = ?" : "status IN ('PENDING', 'EXPIRED')",
+      ...(roleKey !== undefined ? ["role_key = ?"] : []),
+    ];
+    const rows = this.db.all<{
+      message_id: string; kind: string; status: string; attempts: number; expires_at: string;
+      role_key: string; binding_generation: number; target_session_id: string;
+    }>(
+      `SELECT message_id, kind, status, attempts, expires_at, role_key, binding_generation, target_session_id
+         FROM outbox WHERE ${where.join(" AND ")} ORDER BY created_at, message_id`,
+      [...(messageId !== undefined ? [messageId] : []), ...(roleKey !== undefined ? [roleKey] : [])],
+    );
+    const refusalOf = (row: (typeof rows)[number]): { refusal: string; reason: string } | null => {
+      if ((HOLDER_CLAIMED_KINDS as ReadonlySet<string>).has(row.kind)) {
+        return {
+          refusal: "HOLDER_CLAIMED",
+          reason: `a ${row.kind} is delivered by its holder's claim (role_owner_message_claim), and a retry cannot deliver it`,
+        };
+      }
+      if (row.status === "EXPIRED" || (row.status === "PENDING" && row.expires_at <= now)) {
+        return { refusal: "EXPIRED", reason: `it expired at ${row.expires_at}, and an expired message is never resent` };
+      }
+      if (row.status !== "PENDING") return { refusal: "NOT_PENDING", reason: `it is ${row.status}, not PENDING` };
+      if (row.attempts === 0) return { refusal: "NO_FAILED_ATTEMPT", reason: "no delivery attempt has failed; the delivery pass sends it" };
+      return null;
+    };
+    // Keys the audit record keeps: it stores no `messages` and redacts any key ending in `key`.
+    const listed = rows.map((row) => ({
+      messageId: row.message_id, kind: row.kind, status: row.status, attempts: row.attempts, expiresAt: row.expires_at,
+      role: row.role_key, bindingGeneration: row.binding_generation, targetSessionId: row.target_session_id,
+      ...refusalOf(row),
+    }));
+    const eligible = listed.filter((message) => !("refusal" in message));
+    const evidence = {
+      target: { messageId: messageId ?? null, role: roleKey ?? null },
+      found: rows.length > 0,
+      rows: listed,
+      eligibleMessageIds: eligible.map((message) => message.messageId),
+    };
+    return {
+      preconditions: [checked(operation.preconditions[0]!, eligible.length > 0, evidence)],
+      perform: async (dryRun) => {
+        if (dryRun) return { changes: eligible.length, evidence };
+        let changes = 0;
+        for (const message of eligible) {
+          changes += this.db.run(
+            `UPDATE outbox SET attempts = 0, last_error = NULL
+              WHERE message_id = ? AND status = 'PENDING' AND expires_at > ?`,
+            [message.messageId, now],
+          ).changes;
+        }
+        return { changes, evidence };
+      },
+    };
   }
 
   private repairWorktreeAuthorization(

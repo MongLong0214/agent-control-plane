@@ -5,6 +5,7 @@ import { basename, join } from "node:path";
 
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 
+import { hostGitDirectory, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 /**
@@ -21,7 +22,8 @@ vi.mock("node:child_process", async (original) => {
   return {
     ...actual,
     spawn(command: string, args: readonly string[], options: Record<string, unknown>) {
-      if (basename(command) === "commitlore") {
+      // #1268 — the CommitLore child is node running the copied bundle, `dist/commitlore.mjs`.
+      if (basename(command) === "commitlore" || String(args[0] ?? "").endsWith("/dist/commitlore.mjs")) {
         timing.requested.push(options["timeout"]);
         // Real subprocesses and real timeout delivery; shorten only the 180-second wait.
         return actual.spawn(command, args, { ...options, timeout: 1500 });
@@ -30,7 +32,8 @@ vi.mock("node:child_process", async (original) => {
     },
   };
 });
-import { createCommitLoreCliPort } from "../../src/bootstrap/commitlore-observation.ts";
+import { COMMITLORE_LIMITS, commitloreRunner, createCommitLoreCliPort } from "../../src/bootstrap/commitlore-observation.ts";
+import { latestRelease } from "../helpers/commitlore-release.ts";
 
 afterEach(() => vi.unstubAllEnvs());
 afterAll(cleanupTempDirs);
@@ -40,10 +43,10 @@ it("R1-02: timeout is refused even if the signalled child exits zero with valid 
   const dir = tempDir("acp-s11-r1-timeout-bin-");
   const events = join(root, "timeout-events.txt");
   writeFileSync(events, "");
-  writeFileSync(join(dir, "package.json"), '{"type":"commonjs"}');
-  writeFileSync(
-    join(dir, "commitlore"),
-    `#!${process.execPath}\n
+  // #1268 — installed as the installer installs it: a run copies the package its wrapper names.
+  writeCommitLoreInstall(
+    dir,
+    `
     // Slice S16: the pin's checks are answered at once, as a supported CLI answers them.
     if (process.argv[2] === '--version') { process.stdout.write('1.7.3\\n'); return; }
     if (process.argv[2] === 'doctor' && process.argv[3] === '--help') { process.stdout.write('Usage: commitlore doctor [options]\\n\\nOptions:\\n  --json\\n'); return; }
@@ -57,9 +60,8 @@ it("R1-02: timeout is refused even if the signalled child exits zero with valid 
     });
     setInterval(() => {}, 1000);
   `,
-    { mode: 0o700 },
   );
-  vi.stubEnv("PATH", `${dir}:/usr/bin:/bin`);
+  vi.stubEnv("PATH", `${dir}:${hostGitDirectory()}:/usr/bin:/bin`);
   vi.stubEnv("ACP_COMMITLORE_BINARY", join(dir, "commitlore"));
   // CEO 19aabbda (C-2): fixture preparation, bounded and before the observation. Every spawn here runs under
   // the shortened 1.5 s, and since slice S16 the first is the `--version` check: the newly written fake is
@@ -71,7 +73,7 @@ it("R1-02: timeout is refused even if the signalled child exits zero with valid 
   } catch (error) {
     throw new Error(`FIXTURE-PREPARATION FAILURE: the fake's --version did not complete within 30000 ms (${(error as Error).message.split("\n", 1)[0]}); the witness was not judged`);
   }
-  const result = await createCommitLoreCliPort().observe(root);
+  const result = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, undefined, latestRelease("1.7.3"))).observe(root);
   // The review asserted both commands asked for 180 s; at the fix `init` is refused, so only it asks, after
   // the pin's three checks (slice S16: `--version`, `doctor --help`, `init --help`), under the same bound.
   expect(timing.requested).toEqual([180000, 180000, 180000, 180000]);
