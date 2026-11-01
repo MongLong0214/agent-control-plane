@@ -172,7 +172,7 @@ const aliveAsSpawned = (pid: number): boolean => {
   return token !== undefined && readProcessStartToken(pid) === token;
 };
 const groupMembers = (pgid: number): number[] =>
-  spawnSync("/usr/bin/pgrep", ["-g", String(pgid)], { encoding: "utf8" }).stdout
+  spawnSync("/usr/bin/pgrep", ["-g", String(pgid)], { encoding: "utf8", timeout: 5_000 }).stdout
     .split("\n").map(Number).filter((pid) => Number.isSafeInteger(pid) && pid > 1);
 /** Kills each group (only while a process this file started is still in it) and waits until all of it is gone. */
 const killTrees = async (groups: readonly number[], pids: readonly number[]): Promise<void> => {

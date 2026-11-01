@@ -4389,7 +4389,13 @@ export const serveMachLaunchCredential = (
   }
   if (send !== "OK") {
     // The entry is not restored: the plaintext may already have crossed.
-    invalidateAfterUncertainSend(sessions, audit, credential, credentialEpoch, send);
+    const outcome = invalidateAfterUncertainSend(sessions, credential, credentialEpoch, send);
+    audit.record({
+      kind: "SESSION_LAUNCH_CREDENTIAL_SEND_FAILED",
+      reasonCode: outcome.reasonCode,
+      sessionId: credential.sessionId,
+      evidence: outcome.evidence,
+    });
     return;
   }
   // Residual trust, recorded so it is not mistaken for the pid-reuse misdelivery the audit token closed:
@@ -4418,20 +4424,23 @@ export const serveMachLaunchCredential = (
  */
 const invalidateAfterUncertainSend = (
   sessions: MachLaunchSessions,
-  audit: Pick<AuditLog, "record">,
   credential: SessionLaunchCredential,
   credentialEpoch: number,
   send: "FALSE" | "THREW",
-): void => {
+): Decision<void> => {
   const { sessionId, sessionSecret } = credential;
-  const record = (reasonCode: ReasonCode, evidence: Record<string, unknown>): void => {
-    audit.record({ kind: "SESSION_LAUNCH_CREDENTIAL_SEND_FAILED", reasonCode, sessionId, evidence: { transport: "mach", send, ...evidence } });
-  };
+  // The outcome the caller audits: which of the three it was, never the secret.
+  const invalidated = (evidence: Record<string, unknown>): Decision<void> =>
+    deny(ReasonCode.MACH_LAUNCH_SEND_FAILED, "the driven credential's Mach reply send was uncertain; its secret no longer authenticates",
+      { transport: "mach", send, ...evidence });
+  const notInvalidated = (evidence: Record<string, unknown>): Decision<void> =>
+    deny(ReasonCode.MACH_LAUNCH_SECRET_NOT_INVALIDATED, "the driven credential's Mach reply send was uncertain and its secret could not be rotated",
+      { transport: "mach", send, ...evidence });
   const rotated = sessions.rotateSecret(sessionId, credentialEpoch);
-  if (rotated.allowed) return record(ReasonCode.MACH_LAUNCH_SEND_FAILED, { rotated: true, invalidated: "ROTATED" });
+  if (rotated.allowed) return invalidated({ rotated: true, invalidated: "ROTATED" });
   const rotationRefused = rotated.reasonCode;
   if (!sessions.verifySecret(sessionId, sessionSecret).allowed) {
-    return record(ReasonCode.MACH_LAUNCH_SEND_FAILED, { rotated: false, invalidated: "ALREADY_INVALID", rotationRefused });
+    return invalidated({ rotated: false, invalidated: "ALREADY_INVALID", rotationRefused });
   }
   let blocked = false;
   let transitionRefused: string | null = null;
@@ -4443,7 +4452,7 @@ const invalidateAfterUncertainSend = (
   } catch (error) {
     transitionRefused = error instanceof Error ? error.message : String(error);
   }
-  record(ReasonCode.MACH_LAUNCH_SECRET_NOT_INVALIDATED, {
+  return notInvalidated({
     rotated: false,
     invalidated: blocked ? "SESSION_BLOCKED" : "NOT_GUARANTEED",
     rotationRefused,
