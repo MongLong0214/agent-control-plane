@@ -804,6 +804,8 @@ export class BlindReviewGate {
       // A whole-capture output stream the evidence section does not show whole goes in the diff's
       // place: whole in a single review, as labelled parts across chunks otherwise.
       const outputStreams = outputStreamsInParts(execution, evidenceRoom);
+      // Each delivered stream is a coverage item the review must account for, as a candidate file is.
+      const required = [...expected, ...outputStreams.map((stream) => ({ identity: stream.repository, path: stream.path }))];
 
       // Measure the complete input, including diff framing and system instructions, and send
       // this same rendered prompt if it fits. A lockfile is only ever reviewed in a chunk of its own.
@@ -820,7 +822,7 @@ export class BlindReviewGate {
         const reviewer = await this.constituteReviewer(request);
         if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
         rememberReviewer(reviewer.value);
-        outcome = await this.singleReview(request, prompt, reviewer.value, expected);
+        outcome = await this.singleReview(request, prompt, reviewer.value, required);
       }
 
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
@@ -838,7 +840,7 @@ export class BlindReviewGate {
         snapshotDigest,
         outcome: outcome.value,
         chunked,
-        expected,
+        expected: required,
         binaryArtifacts,
         reviewPolicies,
         bootstrapPlan: null,
@@ -2207,6 +2209,8 @@ export class BlindReviewGate {
       `Packet digest: ${reviewPacketDigest(request, change, reviewPolicies)}`,
       "Required coverage:",
       ...candidateCoverageTargets(request.snapshot, change).map((target) => `- ${target.identity}:${target.path}`),
+      // An official output stream delivered in this prompt is required coverage too.
+      ...new Set(diffs.flatMap((part) => ("outputLabel" in part && part.outputLabel !== undefined ? [`- ${part.identity}:${part.files[0]}`] : []))),
       "",
       ...evidenceSection,
       ...reviewPolicySection(reviewPolicies),

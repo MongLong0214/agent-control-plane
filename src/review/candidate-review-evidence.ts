@@ -252,13 +252,6 @@ export interface OutputStreamDelivery {
   captureTruncated: boolean;
 }
 
-/** A repository's task -> commit rows exactly as the frozen candidate snapshot's `integration` stores them. */
-export interface IntegrationEvidence {
-  repository: string;
-  checkoutHead: string;
-  tasks: Array<{ taskId: string; commit: string }>;
-}
-
 export interface ReceiptEvidence {
   runId: string;
   taskId: string;
@@ -285,8 +278,8 @@ export interface ExecutionEvidence {
   receipts: ReceiptEvidence[];
   /** Receipts not listed, by why. */
   receiptsNotListed: { outsideCandidateHistory: number; notACandidateRepository: number; noCommitReceipt: number; overListLimit: number; unchecked: number };
-  /** The frozen snapshot's integration records, for the repositories that have one; read from the snapshot only. */
-  integration?: { candidateSnapshotDigest: string; repositories: IntegrationEvidence[] };
+  /** The repositories whose frozen snapshot entry holds an `integration` record, with its number of task rows. */
+  integration?: Array<{ repository: string; tasks: number }>;
 }
 
 export interface ExecutionEvidenceInput {
@@ -724,11 +717,8 @@ export const readExecutionEvidence = async (db: Db, input: ExecutionEvidenceInpu
     commands,
     results: input.verification.results.map((result) => outputEvidence(input, result)),
     ...(await receiptEvidence(db, input)),
-    integration: { candidateSnapshotDigest: input.snapshotDigest,
-      repositories: input.snapshot.repositories.flatMap((repo) => repo.integration === undefined ? [] : [{
-        repository: repo.identity, checkoutHead: repo.integration.checkoutHead,
-        tasks: repo.integration.tasks.map(({ taskId, commit }) => ({ taskId, commit })),
-      }]) },
+    integration: input.snapshot.repositories.flatMap((repo) =>
+      repo.integration === undefined ? [] : [{ repository: repo.identity, tasks: repo.integration.tasks.length }]),
   };
 };
 
@@ -895,9 +885,6 @@ export const executionEvidenceSection = (
   return { lines, used: measure(lines) - bare, inParts: streamsInParts(evidence, selection) };
 };
 
-/** The frozen snapshot's task -> commit rows take at most this much of the packet. */
-export const INTEGRATION_CHAR_BUDGET = 8_000;
-
 /** The execution evidence's share of the room `candidateEvidenceSection` is given. */
 const executionShare = (room: number): number => Math.min(EXECUTION_EVIDENCE_CHAR_BUDGET, Math.floor((Math.max(0, room) * 2) / 5));
 
@@ -908,37 +895,21 @@ const executionShare = (room: number): number => Math.min(EXECUTION_EVIDENCE_CHA
 export const outputStreamsInParts = (execution: ExecutionEvidence, budget = EXECUTION_EVIDENCE_CHAR_BUDGET + TREE_CHAR_BUDGET + TASK_CHAR_BUDGET): OutputStreamDelivery[] =>
   executionEvidenceSection(execution, executionShare(budget)).inParts;
 
-/** Each repository's rows in order while they fit `budget`, rendered four levels deep; a repository cut here says so. */
-const integrationListing = (integration: readonly IntegrationEvidence[], budget: number) => {
-  let used = 0;
-  let full = false;
-  const listed = integration.map(({ repository, checkoutHead, tasks }) => {
-    const kept: IntegrationEvidence["tasks"] = [];
-    for (const task of tasks) {
-      const text = JSON.stringify(task, null, 2);
-      const cost = text.length + 8 * text.split("\n").length + 2;
-      if (full || used + cost > budget) { full = true; break; }
-      used += cost;
-      kept.push(task);
-    }
-    return { repository, checkoutHead, total: tasks.length, listed: kept.length, truncated: kept.length < tasks.length, tasks: kept };
-  });
-  return { listed, used };
-};
-
-const INTEGRATION_HEADER = [
+/** Said only when a repository's frozen snapshot entry holds an integration record; the rows stay in the manifest. */
+const integrationSection = (integration: ReadonlyArray<{ repository: string; tasks: number }>): string[] => [
   "## Task-to-commit mapping stored in the frozen candidate snapshot",
-  "Control-plane facts, read from the frozen candidate snapshot only and bound to this candidate by its snapshot digest: each repository's `integration` record as the snapshot stores it, the commit recorded for each task and the head the candidate checkout was built at. " +
-    "This is the stored mapping; ACP did not independently verify it for this review. A repository the snapshot holds no integration record for is not listed, and nothing here says how its commits map to tasks. " +
-    "Where a repository's rows are truncated, the rows not listed are not shown, and nothing is established about them.",
+  "Control-plane facts from the frozen candidate snapshot only, bound to this candidate by its snapshot digest: the commit recorded for each task, and the head the candidate checkout was built at, " +
+    "are the candidate snapshot manifest's `repositories[].integration` (`checkoutHead`, and `tasks` as `{ taskId, commit }`). " +
+    "This is the stored mapping; ACP did not independently verify it for this review. A repository with no integration record there has no stored mapping, and nothing here says how its commits map to tasks.",
+  `Repositories with an integration record: ${integration.map(({ repository, tasks }) => `${repository} (${tasks} task rows)`).join(", ")}.`,
+  "",
 ];
 
 /**
- * `budget` is the room the caller has for the execution evidence and the listings, measured against
- * the reviewer's real context budget. The execution evidence takes up to two fifths of it (at most
- * EXECUTION_EVIDENCE_CHAR_BUDGET); what it does not use is split between the tree listing, the
- * snapshot's task -> commit rows and the task listing, none over its own limit. A snapshot with no
- * integration record renders no rows and no heading for them.
+ * `budget` is the room the caller has for the execution evidence and the two listings, measured
+ * against the reviewer's real context budget. The execution evidence takes up to two fifths of it
+ * (at most EXECUTION_EVIDENCE_CHAR_BUDGET); what it does not use is split between the listings,
+ * which never exceed their own limits. A snapshot with no integration record gets no mapping section.
  */
 export const candidateEvidenceSection = (
   db: Db,
@@ -952,8 +923,7 @@ export const candidateEvidenceSection = (
   const rest = room - Math.max(0, executed.used);
   const treeBudget = Math.min(TREE_CHAR_BUDGET, Math.floor((rest * 3) / 5));
   const { listed, omitted } = budgetTrees(trees, treeBudget);
-  const integration = execution.integration?.repositories ?? [];
-  const mapping = integrationListing(integration, Math.min(INTEGRATION_CHAR_BUDGET, Math.floor((rest - treeBudget) / 2)));
+  const integration = execution.integration ?? [];
   return [
     "## Frozen candidate tracked trees",
     "Tracked paths at each candidate SHA, including unchanged paths. A truncated listing is incomplete; it cannot establish absence of unlisted paths.",
@@ -962,9 +932,8 @@ export const candidateEvidenceSection = (
     "",
     "## Control-plane evidence",
     "Read from canonical audit, task and assignment records. Worker counts include all recorded bindings, with active bindings counted separately. taskSummary counts every task in the run; when it says truncated, the task list is incomplete and cannot establish absence of unlisted tasks.",
-    "```json", JSON.stringify(controlPlaneEvidence(db, runId, Math.min(TASK_CHAR_BUDGET, rest - treeBudget - mapping.used)), null, 2), "```", "",
-    ...(integration.length === 0 ? [] : [...INTEGRATION_HEADER, "```json",
-      JSON.stringify({ candidateSnapshotDigest: execution.integration!.candidateSnapshotDigest, repositories: mapping.listed }, null, 2), "```", ""]),
+    "```json", JSON.stringify(controlPlaneEvidence(db, runId, Math.min(TASK_CHAR_BUDGET, rest - treeBudget)), null, 2), "```", "",
+    ...(integration.length === 0 ? [] : integrationSection(integration)),
     ...executed.lines,
     ...laterGateSection(db.get<{ kind: string }>(`SELECT kind FROM runs WHERE run_id = ?`, [runId])?.kind ?? null, trees.length),
   ];

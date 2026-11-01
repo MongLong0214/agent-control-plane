@@ -200,6 +200,39 @@ describe("witness 1: the reviewer receives every line of an official test run", 
   }, 240_000);
 });
 
+describe("witness 1b: in a single review, a stream delivered as a part is required coverage", () => {
+  // About 45K characters: too long for the evidence section's share, short enough for one review prompt.
+  const stdout = tap(112, 400);
+  const requiredIn = (prompt: string): string[] =>
+    prompt.split("Required coverage:\n")[1]!.split("\n\n")[0]!.split("\n").filter((line) => line.startsWith("- "));
+
+  it("an output stream the single reviewer does not claim fails coverage, as an unclaimed chunk part does", async () => {
+    sandbox.stdout = stdout;
+    const setup = await runOfficial((identity) => [{ match: /Candidate review/, text: reviewerPass([`${identity}:src/app.js`]) }]);
+    try {
+      const prompt = setup.prompts.find((text) => text.startsWith("# Candidate review"))!;
+      expect(partsIn(prompt).map((part) => [part.k, part.n, part.text.length])).toEqual([[1, 1, stdout.length]]);
+      expect(setup.outcome, JSON.stringify(setup.outcome).slice(0, 400)).toMatchObject({ allowed: true, value: { stage: "REVISION_REQUIRED" } });
+      const packet = setup.harness.cp.review.latestPacket(setup.run.runId, candidateSnapshotDigest(setup.snapshot!));
+      expect(packet).toMatchObject({ verdict: "REVISE", chunked: false });
+      expect(packet?.omittedItems).toContain(STDOUT_KEY(setup.identity));
+      expect(requiredIn(prompt)).toContain(`- ${STDOUT_KEY(setup.identity)}`);
+    } finally { setup.harness.cp.close(); }
+  }, 120_000);
+
+  it("a single reviewer that claims the stream passes, its claim credited as coverage", async () => {
+    sandbox.stdout = stdout;
+    const setup = await runOfficial((identity) => [{ match: /Candidate review/, text: reviewerPass([`${identity}:src/app.js`, STDOUT_KEY(identity)]) }]);
+    try {
+      expect(setup.outcome, JSON.stringify(setup.outcome).slice(0, 400)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+      const packet = setup.harness.cp.review.latestPacket(setup.run.runId, candidateSnapshotDigest(setup.snapshot!));
+      expect(packet).toMatchObject({ verdict: "PASS", chunked: false, omittedItems: [] });
+      expect(packet!.coveredFiles).toContain(STDOUT_KEY(setup.identity));
+      expect(packet!.extraClaims ?? []).not.toContain(STDOUT_KEY(setup.identity));
+    } finally { setup.harness.cp.close(); }
+  }, 120_000);
+});
+
 describe("witness 2: a capture cut at maxOutputBytes stays marked truncated, its cut edge withheld", () => {
   it("stores the cut explicitly with the limit, withholds the edge, and the review evidence and parts say so", async () => {
     const edge = "Ab9+/Zq7Ab9+/Zq7Ab";
