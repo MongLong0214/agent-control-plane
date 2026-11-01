@@ -240,6 +240,18 @@ export const ReasonCode = {
   PRIMARY_CTO_ALREADY_BOUND: "PRIMARY_CTO_ALREADY_BOUND",
   SWITCHOVER_BLOCKED_ACTIVE_RUNS: "SWITCHOVER_BLOCKED_ACTIVE_RUNS",
   REVOCATION_BLOCKED_ACTIVE_RUNS: "REVOCATION_BLOCKED_ACTIVE_RUNS",
+  /**
+   * A resumed canonical CTO's self-claim waits: a run its dead predecessor generation owns still has
+   * a RUNNING worker execution or a candidate pipeline attempt that holds it (the evidence names which,
+   * and for an execution `runtimeManaged`). Nothing moves. A daemon-run worker turn or pipeline attempt
+   * ends by itself under the generation that started it, and the next claim takes the run over with its
+   * result kept. A CTO-reported receipt (`runtimeManaged: false`) does not end by itself. It ends
+   * through its owner's task_receipt_submit; or ABANDONED, once the process it recorded at open (pid
+   * and OS start) is no longer running, by the doctor repair abandon_dead_executions or the next
+   * daemon restart; or, when it recorded no pid, ABANDONED only at the next daemon restart. Until
+   * then every claim is refused.
+   */
+  PREDECESSOR_WORKER_TURN_IN_FLIGHT: "PREDECESSOR_WORKER_TURN_IN_FLIGHT",
   PRODUCER_HISTORY_UNAVAILABLE: "PRODUCER_HISTORY_UNAVAILABLE",
   SESSION_SECRET_STORAGE_UNAVAILABLE: "SESSION_SECRET_STORAGE_UNAVAILABLE",
   SESSION_SECRET_INVALID: "SESSION_SECRET_INVALID",
