@@ -604,13 +604,13 @@ export class ControlPlane {
         this.repositories, this.worktrees, this.claims, this.guard, this.telemetry,
       );
       // CEO msg_e91da929 — the per-project reviewers apply only when the whole file does, every provider
-      // registered for BLIND_REVIEWER; otherwise none applies and the refusal is recorded and reported.
+      // registered for BLIND_REVIEWER with an adapter that can isolate a reviewer; otherwise none applies
+      // and the refusal is recorded and reported.
       const projectReviewers = resolveProjectReviewerPreferences(
         config.reviewerPreferencesFile ?? { path: PROJECT_REVIEWER_FILE, text: null },
         (provider) => {
           try {
-            this.providers.requireForRole(provider, Role.BLIND_REVIEWER);
-            return true;
+            return this.providers.requireForRole(provider, Role.BLIND_REVIEWER).supportsReviewerIsolation !== false;
           } catch {
             return false;
           }

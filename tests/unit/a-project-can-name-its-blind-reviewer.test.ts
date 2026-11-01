@@ -127,6 +127,11 @@ const prepared = async () => {
 
 type Prepared = Awaited<ReturnType<typeof prepared>>;
 
+/** A registered reviewer adapter that cannot enforce reviewer isolation, as production's grok adapter. */
+class NoIsolationAdapter extends TestProductionAdapter {
+  readonly supportsReviewerIsolation = false;
+}
+
 /** The production default (gpt-6.1-sol preferred, Claude Opus fallback) plus the given project entries. */
 const gateFor = (setup: Prepared, projects: Record<string, ReviewerPreference>) => {
   const cp = setup.harness.cp;
@@ -297,10 +302,14 @@ describe("the daemon's reviewer preference file", () => {
       .toEqual({ byProject: new Map(), refused: { path: "/state/reviewer-preferences.json", reason: "unreadable: EACCES" } });
   });
 
-  it("4: a control plane given an unregistered provider applies nothing, audits the refusal and reports a doctor finding", () => {
+  it.each([
+    ["a provider no adapter is registered for", "nonesuch"],
+    // Production registers grok without a role and its adapter cannot isolate a reviewer.
+    ["a registered provider that cannot isolate a reviewer", "grok"],
+  ])("4: a control plane given %s applies nothing, audits the refusal and reports a doctor finding", (_label, provider) => {
     const root = tempDir("acp-reviewer-pref-cp-");
     const file = join(root, "reviewer-preferences.json");
-    writeFileSync(file, JSON.stringify({ "e2e-1": OPUS, "e2e-2": { provider: "grok", model: "grok-5", effort: null } }));
+    writeFileSync(file, JSON.stringify({ "e2e-1": OPUS, "e2e-2": { provider, model: "some-model", effort: null } }));
     const clock = new ManualClock("2026-11-01T00:00:00.000Z");
     const open = () => new ControlPlane({
       databasePath: join(root, "state.sqlite"),
@@ -308,20 +317,22 @@ describe("the daemon's reviewer preference file", () => {
       capacityDir: join(root, "capacity"),
       secretsDir: join(root, "secrets"),
       clock,
-      adapters: [new TestProductionAdapter(clock, "gpt"), new TestProductionAdapter(clock, "claude")],
+      adapters: [new TestProductionAdapter(clock, "gpt"), new TestProductionAdapter(clock, "claude"), new NoIsolationAdapter(clock, "grok")],
       allowNonProductionAdapters: true,
       reviewerPreferencesFile: readProjectReviewerFile(file),
     });
 
     const refused = open();
     try {
+      expect(() => refused.providers.requireForRole("grok", Role.BLIND_REVIEWER)).not.toThrow();
+      expect(() => refused.providers.requireForRole("nonesuch", Role.BLIND_REVIEWER)).toThrow();
       // The default applies: no project entry, the global preferred and fallbacks as they were.
       const preferences = refused.review["preferences"];
-      expect(preferences.projects?.size ?? 0).toBe(0);
+      expect(preferences.projects).toBeUndefined();
       expect(preferences.preferred).toEqual({ provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" });
       expect(refused.audit.byKind("REVIEWER_PREFERENCES_REFUSED")).toEqual([expect.objectContaining({
         reasonCode: ReasonCode.REVIEWER_PREFERENCES_INVALID,
-        evidence: expect.objectContaining({ path: file, reason: expect.stringContaining("grok") }),
+        evidence: expect.objectContaining({ path: file, reason: expect.stringContaining(provider) }),
       })]);
       expect(refused.doctor["checkReviewerPreferences"]()).toEqual([expect.objectContaining({
         code: ReasonCode.REVIEWER_PREFERENCES_INVALID,

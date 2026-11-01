@@ -343,7 +343,8 @@ const projectReviewerEntries = z.record(
 );
 
 /**
- * `{ "<projectId>": { provider, model, effort } }`, every provider registered for BLIND_REVIEWER, or nothing.
+ * `{ "<projectId>": { provider, model, effort } }`, every provider registered for BLIND_REVIEWER with an
+ * adapter that can isolate a reviewer (`registeredForReview`), or nothing.
  * A missing file is no project preferences, which is the behaviour without this file.
  */
 export const resolveProjectReviewerPreferences = (
@@ -366,7 +367,7 @@ export const resolveProjectReviewerPreferences = (
   }
   for (const [projectId, entry] of Object.entries(parsed.data)) {
     if (!registeredForReview(entry.provider)) {
-      return refuse(`project ${projectId} names provider ${entry.provider}, which is not registered for BLIND_REVIEWER`);
+      return refuse(`project ${projectId} names provider ${entry.provider}, which is not registered for BLIND_REVIEWER with reviewer isolation`);
     }
   }
   return { byProject: new Map(Object.entries(parsed.data)), refused: null };

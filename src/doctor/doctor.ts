@@ -1276,6 +1276,23 @@ export class Doctor {
     return findings;
   }
 
+  /** A per-project reviewer file the daemon refused at start: no project gets its own reviewer until it is fixed. */
+  private checkReviewerPreferences(): Finding[] {
+    if (this.reviewerPreferencesRefused === null) return [];
+    return [{
+      code: ReasonCode.REVIEWER_PREFERENCES_INVALID,
+      severity: "ERROR",
+      scope: "reviewer:project-preferences",
+      blocking: false,
+      confidence: "HIGH",
+      observedEvidence: { ...this.reviewerPreferencesRefused },
+      recommendedAction:
+        'fix the file to { "<projectId>": { provider, model, effort } } naming only providers registered for ' +
+        "BLIND_REVIEWER that can isolate a reviewer, then restart the daemon; " +
+        "until then every project uses the global reviewer preference",
+    }];
+  }
+
   /**
    * Whether the packet reviewer has a Codex home it could actually use: the optional private
    * override's capsule, or — with no override — this user's own authenticated Codex home. Read
@@ -1299,22 +1316,6 @@ export class Doctor {
    * not a review, and a blocking finding for a missing thing is how a daemon ends up parked behind
    * the very coordinator that would fix it (#950, #958).
    */
-  /** A per-project reviewer file the daemon refused at start: no project gets its own reviewer until it is fixed. */
-  private checkReviewerPreferences(): Finding[] {
-    if (this.reviewerPreferencesRefused === null) return [];
-    return [{
-      code: ReasonCode.REVIEWER_PREFERENCES_INVALID,
-      severity: "ERROR",
-      scope: "reviewer:project-preferences",
-      blocking: false,
-      confidence: "HIGH",
-      observedEvidence: { ...this.reviewerPreferencesRefused },
-      recommendedAction:
-        'fix the file to { "<projectId>": { provider, model, effort } } naming only providers registered for ' +
-        "BLIND_REVIEWER, then restart the daemon; until then every project uses the global reviewer preference",
-    }];
-  }
-
   private checkPacketReviewerScope(): Finding[] {
     const findings: Finding[] = [];
     const action =
