@@ -272,18 +272,27 @@ export const ReasonCode = {
    */
   MACH_LAUNCH_ADMISSION_REFUSED: "MACH_LAUNCH_ADMISSION_REFUSED",
   /**
-   * O4b B' — a driven entry (one carrying a turn pin) was presented on the AF_UNIX launch socket
+   * O4b B' — a driven entry (one the session runtime offered through the launch channel's driven door,
+   * whether or not its turn pin has arrived) was presented on the AF_UNIX launch socket
    * (`cto.launch.sock`). Driven credentials move only over raw Mach; the id-only AF_UNIX path serves
    * interactive spawns alone, so a driven request there is refused rather than served.
    */
   DRIVEN_LAUNCH_ON_AF_UNIX_REFUSED: "DRIVEN_LAUNCH_ON_AF_UNIX_REFUSED",
   /**
-   * O4b B' — a driven turn's credential was admitted but its Mach reply send failed or was uncertain
-   * (no receiver, timeout, interruption). The entry stays consumed and invalidated and the session's
-   * secret is rotated before any new hand-over; the credential is never re-offered. The case is
-   * audited, never the credential.
+   * O4b B' — a driven turn's credential was admitted but its Mach reply send failed, threw or was
+   * uncertain (no receiver, timeout, interruption). The entry stays consumed and is never re-offered, and
+   * the secret it carried no longer authenticates: it was rotated, or it was already invalid (its epoch
+   * had moved, or the session had ended); the evidence's `invalidated` says which. When neither holds,
+   * `MACH_LAUNCH_SECRET_NOT_INVALIDATED` is recorded instead. The case is audited, never the credential.
    */
   MACH_LAUNCH_SEND_FAILED: "MACH_LAUNCH_SEND_FAILED",
+  /**
+   * #1336 — a driven turn's Mach reply send was uncertain, the secret it carried could not be rotated and
+   * still verified. The session is marked ERROR so that secret authenticates nothing, no turn of it runs
+   * and no launch is offered for it (`blocked: true`); if that transition was itself refused the evidence
+   * says `blocked: false`. Either way the session is not resumed normally. Never the credential.
+   */
+  MACH_LAUNCH_SECRET_NOT_INVALIDATED: "MACH_LAUNCH_SECRET_NOT_INVALIDATED",
   /**
    * #246 C1b — a provisioned session's turn ran and the daemon did not receive the authenticated
    * attestation that turn was asked for: the relay never took its credential, never authenticated,

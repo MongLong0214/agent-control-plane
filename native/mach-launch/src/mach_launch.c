@@ -172,8 +172,10 @@ static ml_pending_t *ml_take_pending(ml_service_t *service, uint32_t id) {
   return found;
 }
 
+// Runs on the JavaScript thread. `context` is the service, alive while the function can still be called
+// with an env: teardown, which runs on this thread too, aborts the function before the service is freed.
 static void ml_call_js(napi_env env, napi_value callback, void *context, void *data) {
-  (void)context;
+  ml_service_t *service = context;
   ml_delivery_t *delivery = data;
   if (env != NULL && callback != NULL) {
     napi_value request, value, sender, undefined;
@@ -200,8 +202,21 @@ static void ml_call_js(napi_env env, napi_value callback, void *context, void *d
     }
     napi_set_named_property(env, request, "sender", sender);
     napi_get_undefined(env, &undefined);
-    napi_call_function(env, undefined, callback, 1, &request, NULL);
+    if (napi_call_function(env, undefined, callback, 1, &request, NULL) != napi_ok) {
+      // The callback threw, or could not be called, so it may never answer: its reply right is reclaimed
+      // here rather than held (and counted against ML_MAX_PENDING) until teardown. If the callback answered
+      // before it threw, `respond` already took the entry and there is nothing left to take. The exception
+      // itself is left pending, exactly as before.
+      ml_pending_t *taken = ml_take_pending(service, delivery->id);
+      if (taken != NULL) {
+        ml_send_reply(taken->reply, ML_REFUSED, NULL, 0);
+        free(taken);
+      }
+    }
   }
+  // With a NULL env the function is being finalized after teardown, which already answered every pending
+  // request with STOPPING (ml_teardown, "Requests handed to JavaScript and never answered"); only the
+  // delivery itself is left to free. When the threadsafe call itself fails, ml_handle_request answers it.
   free(delivery->body);
   free(delivery);
 }
@@ -486,7 +501,7 @@ static napi_value ml_listen(napi_env env, napi_callback_info info) {
   if (failed == NULL) {
     napi_value resource;
     napi_create_string_utf8(env, "acp.mach-launch", NAPI_AUTO_LENGTH, &resource);
-    if (napi_create_threadsafe_function(env, argv[1], NULL, resource, 0, 1, NULL, NULL, NULL, ml_call_js,
+    if (napi_create_threadsafe_function(env, argv[1], NULL, resource, 0, 1, NULL, NULL, service, ml_call_js,
                                         &service->tsfn) != napi_ok) {
       failed = "thread-safe function";
     }
@@ -577,8 +592,9 @@ static napi_value ml_instance_live(napi_env env, napi_callback_info info) {
 // bsdInfo(pid) -> { ppid, startSec, startUsec } | null. PROC_PIDTBSDINFO gives a pid's parent and its
 // start time; the daemon's admission reads it to walk the sender's parent chain and to bind each
 // process's own instance by its start token (the sender's own instance is bound by the audit token's
-// pidversion through `instanceLive`, which pid reuse cannot forge). The reads are synchronous, so the
-// admission's before/after re-reads happen with no other process event interleaved on this thread.
+// pidversion through `instanceLive`, which pid reuse cannot forge). The reads are synchronous, so no other
+// JavaScript runs between the admission's before/after re-reads; other processes can still exit, exec or
+// reparent meanwhile, which is why admission re-reads and binds each instance rather than trusting one read.
 static napi_value ml_bsd_info(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
@@ -854,8 +870,15 @@ static napi_value ml_claim(napi_env env, napi_callback_info info) {
   napi_value promise, resource;
   napi_create_promise(env, &claim->deferred, &promise);
   napi_create_string_utf8(env, "acp.mach-launch.claim", NAPI_AUTO_LENGTH, &resource);
-  if (napi_create_async_work(env, NULL, resource, ml_claim_execute, ml_claim_complete, claim, &claim->work) != napi_ok ||
-      napi_queue_async_work(env, claim->work) != napi_ok) {
+  if (napi_create_async_work(env, NULL, resource, ml_claim_execute, ml_claim_complete, claim, &claim->work) != napi_ok) {
+    // Nothing was created: only the claim's own memory is released.
+    free(claim->body);
+    free(claim);
+    return ml_throw(env, "MACH_LAUNCH_RESOURCE", "could not create the claim", 0);
+  }
+  if (napi_queue_async_work(env, claim->work) != napi_ok) {
+    // The work exists but will never run, so ml_claim_complete will never delete it: it is deleted here.
+    napi_delete_async_work(env, claim->work);
     free(claim->body);
     free(claim);
     return ml_throw(env, "MACH_LAUNCH_RESOURCE", "could not queue the claim", 0);

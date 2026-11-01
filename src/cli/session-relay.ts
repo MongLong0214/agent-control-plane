@@ -10,8 +10,12 @@
  * on every request, so one it has since rotated stops working mid-connection, not only at the next one.
  *
  * What it is given on its command line is the addon path, the MCP socket path and the session's provider
- * id, none of them a secret, plus `--iso-service` in an isolated test. In production the Mach service is
- * the launchd-reserved name compiled in, so argv cannot point the claim elsewhere. Any claim failure —
+ * id, none of them a secret, plus `--iso-service` in an isolated test. The relay accepts `--iso-service`
+ * from its argv, so whoever writes that argv chooses the name it claims on: it is the adapter, which writes
+ * it and passes `--iso-service` only when it was constructed with an isolated name, that fixes the
+ * production name to the launchd-reserved one compiled in here. The relay does not check the reply's
+ * `replier`: trusting the reply rests on launchd's protection of that reserved name (a same-uid process
+ * cannot check it in), not on mutual authentication of the daemon's instance. Any claim failure —
  * the addon missing, the service absent, a daemon refusal, a dropped reply or a timeout — is a refusal:
  * the relay exits and never falls back to AF_UNIX or any other transport. The credential exists in this
  * process's memory only: never written to stdout, stderr, a file or the environment, and the closed
@@ -38,9 +42,9 @@ const EXIT = {
  * O4b B' — the launchd-reserved Mach launch service name. A literal copy of
  * `MACH_LAUNCH_RESERVED_SERVICE` in `src/daemon/agentcpd.ts` and `src/runtime/cli-adapters.ts`, kept in
  * sync by hand because this relay imports nothing — it must stay loadable from the one file the turn's
- * sandbox reopens. In production this is the only name claimed; a different name is honoured solely when
- * `--iso-service` is passed (an isolated test), never from configuration or the environment, so neither
- * argv alone nor a squatter on an undeclared name can divert a production claim.
+ * sandbox reopens. It is the name claimed unless `--iso-service` is on the argv; it is never read from
+ * configuration or the environment. A production claim stays on it because the adapter that writes the
+ * argv never passes `--iso-service` there, not because this file could refuse one.
  */
 const RESERVED_SERVICE = "com.agentcontrolplane.agentcpd.launch";
 
@@ -80,8 +84,8 @@ const parseArguments = (argv: readonly string[]): RelayArguments | null => {
   const mcpSocketPath = values.get("--mcp");
   const externalSessionId = values.get("--session");
   if (!addonPath || !mcpSocketPath || !externalSessionId) return null;
-  // The reserved name is the production default; `--iso-service` is the only way to claim another, and
-  // nothing but an explicit test passes it. There is no environment or configuration input here.
+  // The reserved name is the default; `--iso-service` is the only way to claim another, and the adapter
+  // passes it only when constructed with an isolated name (a test). There is no environment or configuration input here.
   const serviceName = values.get("--iso-service") ?? RESERVED_SERVICE;
   return { addonPath, serviceName, mcpSocketPath, externalSessionId };
 };

@@ -1,14 +1,20 @@
 import { createConnection } from "node:net";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { startLocalMcpListeners, startSessionLaunchChannel, wakeRoleHolder } from "../../src/daemon/agentcpd.ts";
+import type { SessionLaunchCredential } from "../../src/cto/cto-lifecycle.ts";
+import {
+  startLocalMcpListeners,
+  startSessionLaunchChannel,
+  wakeRoleHolder,
+  type LocalSessionLaunchChannel,
+} from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { ExecutionMode, Role, RunKind, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { CapacityReading, SessionHandle, SessionSpec } from "../../src/runtime/provider.ts";
 import { tempDir } from "./fixtures.ts";
 import { makeHarness } from "./harness.ts";
-import { HeadlessRuntimeDouble } from "./headless-runtime.ts";
+import { HeadlessRuntimeDouble, type InProcessLaunchChannel } from "./headless-runtime.ts";
 import { callMcpToolOverSocket } from "./mcp-socket.ts";
 
 export const BOOTSTRAP_FIXTURE_TOKEN = "bootstrap-runtime-token";
@@ -41,6 +47,44 @@ export class RecordingRuntimeDouble extends HeadlessRuntimeDouble {
 }
 
 /**
+ * #1336 — the channel's driven door as an in-process double reaches it. The runtime is attached with
+ * the channel's `driven` door, as `main` attaches it, so the daemon's AF_UNIX launch socket refuses every
+ * credential the runtime offers, before and after its pin. A double is not a turn CLI the kernel can show
+ * to be the pinned holder's grandchild, so it cannot pass the Mach admission either; it takes the credential
+ * here instead, with what the Mach reply carries (the credential and the socket gate), and only while the
+ * channel still holds that very entry, which the take consumes. The Mach admission itself is witnessed on
+ * real process trees in `session-relay.test.ts` and `the-driven-launch-credential-is-handed-over-only-over-mach.test.ts`.
+ */
+export const drivenDoorStandIn = (launch: LocalSessionLaunchChannel, token: string): InProcessLaunchChannel => {
+  const offeredBy = new Map<string, SessionLaunchCredential>();
+  let offered = 0;
+  return {
+    get offered() {
+      return offered;
+    },
+    token,
+    prepare: () => launch.driven.prepare(),
+    provision: async (credential) => {
+      const provisioned = await launch.driven.provision(credential);
+      if (provisioned.allowed) {
+        offered += 1;
+        offeredBy.set(credential.externalSessionId, credential);
+      }
+      return provisioned;
+    },
+    withdraw: (externalSessionId) => {
+      offeredBy.delete(externalSessionId);
+      return launch.driven.withdraw(externalSessionId);
+    },
+    take: (externalSessionId) => {
+      const credential = offeredBy.get(externalSessionId) ?? null;
+      offeredBy.delete(externalSessionId);
+      return credential !== null && launch.driven.withdraw(externalSessionId) ? credential : null;
+    },
+  };
+};
+
+/**
  * #246 C1b — a project-less bootstrap run's world over the real sockets: `hermes.mcp.sock` as the
  * CEO, `cto.mcp.sock` and the take-once launch channel (handing out the socket gate too) as the
  * bootstrap CTO's runtime reaches them, a headless Claude double for the role, a GPT provider
@@ -49,7 +93,7 @@ export class RecordingRuntimeDouble extends HeadlessRuntimeDouble {
 export const bootstrapRuntimeFixture = async (harnessOptions: Parameters<typeof makeHarness>[0] = {}) => {
   const harness = makeHarness(harnessOptions);
   // O4b B' — sessions and audit are handed to the channel so a test can enable the raw-Mach driven
-  // hand-over (`enableMachService`) on it; the AF_UNIX id-only path other fixtures use is unchanged.
+  // hand-over (`enableMachService`) on it. #1336: its AF_UNIX id-only path serves interactive entries only.
   const launch = await startSessionLaunchChannel(tempDir("acp-c1b-launch-"), {
     mcpToken: BOOTSTRAP_FIXTURE_TOKEN,
     sessions: harness.cp.sessions,
@@ -79,8 +123,10 @@ export const bootstrapRuntimeFixture = async (harnessOptions: Parameters<typeof 
   const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-c1b-mcp-"), BOOTSTRAP_FIXTURE_TOKEN);
   const [hermesSocket, ctoSocket] = listeners.socketPaths;
   if (!hermesSocket || !ctoSocket) throw new Error("the MCP listeners were not started");
+  const drivenDoor = drivenDoorStandIn(launch, BOOTSTRAP_FIXTURE_TOKEN);
+  claude.useInProcess({ launch: drivenDoor });
   harness.cp.sessionRuntime.attach({
-    delivery: launch,
+    delivery: drivenDoor,
     route: { launchSocketPath: launch.socketPath, mcpSocketPath: ctoSocket },
   });
   // The daemon's in-band wake, as `startDaemonMcpListeners` attaches it: a provisioned session's
@@ -203,6 +249,7 @@ export const bootstrapRuntimeFixture = async (harnessOptions: Parameters<typeof 
     gpt,
     daemon,
     launch,
+    drivenDoor,
     machServiceName,
     ctoSocket,
     ceoSessionId: ceo.sessionId,

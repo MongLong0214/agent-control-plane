@@ -1,10 +1,10 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import {
@@ -18,13 +18,16 @@ import {
   type MachLaunchAddon,
   type MachLaunchHandle,
   type MachLaunchIncoming,
+  type MachLaunchSessions,
   type PendingLaunchCredential,
 } from "../../src/daemon/agentcpd.ts";
+import { SessionLifecycle } from "../../src/domain/types.ts";
 import type { SessionLaunchCredential } from "../../src/cto/cto-lifecycle.ts";
 import type { SessionRecord, SessionRegistry } from "../../src/session/session-registry.ts";
 import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { tempDir } from "../helpers/fixtures.ts";
+import { makeHarness } from "../helpers/harness.ts";
 import { __testing as cliAdapterTesting } from "../../src/runtime/cli-adapters.ts";
 
 /**
@@ -70,25 +73,39 @@ const claimFrom = (addon: MachLaunchAddon, name: string, body: Buffer, timeoutMs
 const RELAY_JS = join(process.cwd(), "dist/cli/session-relay.js");
 const ADDON_PATH = join(process.cwd(), "dist/native/mach-launch/build/Release/mach_launch.node");
 
-/** A session registry double: it answers from the one secret/incarnation/epoch this test provisioned. */
+/**
+ * A session registry double: it answers from the one secret/incarnation/epoch this test provisioned. As
+ * the registry does, a rotation replaces the secret, and an ERROR or STOPPED session's secret stops verifying.
+ */
 const sessionsDouble = (record: { sessionId: string; sessionSecret: string; incarnation: string; credentialEpoch: number }) => {
   let epoch = record.credentialEpoch;
+  let secret = record.sessionSecret;
+  let lifecycle: SessionLifecycle = SessionLifecycle.READY;
   const rotations: number[] = [];
-  const asRecord = (): SessionRecord => ({ incarnation: record.incarnation, credentialEpoch: epoch } as unknown as SessionRecord);
-  const api: Pick<SessionRegistry, "get" | "verifySecret" | "rotateSecret"> = {
+  const transitions: SessionLifecycle[] = [];
+  const asRecord = (): SessionRecord => ({ incarnation: record.incarnation, credentialEpoch: epoch, lifecycle } as unknown as SessionRecord);
+  const api: MachLaunchSessions = {
     get: (id: string): SessionRecord | null => (id === record.sessionId ? asRecord() : null),
-    verifySecret: (id: string, secret: string) =>
-      id === record.sessionId && secret === record.sessionSecret
+    verifySecret: (id: string, presented: string) =>
+      id === record.sessionId && presented === (secret || record.sessionSecret) &&
+      lifecycle !== SessionLifecycle.ERROR && lifecycle !== SessionLifecycle.STOPPED
         ? allow(ReasonCode.OK, asRecord())
         : deny<SessionRecord>(ReasonCode.SESSION_SECRET_INVALID, "no", { sessionId: id }),
     rotateSecret: ((id: string, expected: number) => {
       if (id !== record.sessionId || expected !== epoch) return deny(ReasonCode.SESSION_CREDENTIAL_EPOCH_STALE, "stale", {});
       epoch += 1;
+      secret = `rotated-${epoch}`;
       rotations.push(epoch);
-      return allow(ReasonCode.OK, { sessionId: id, sessionSecret: "rotated", credentialEpoch: epoch });
+      return allow(ReasonCode.OK, { sessionId: id, sessionSecret: secret, credentialEpoch: epoch });
     }) as SessionRegistry["rotateSecret"],
+    transition: ((id: string, to: SessionLifecycle) => {
+      if (id !== record.sessionId) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId: id });
+      lifecycle = to;
+      transitions.push(to);
+      return allow(ReasonCode.OK, asRecord());
+    }) as SessionRegistry["transition"],
   };
-  return Object.assign(api, { rotations });
+  return Object.assign(api, { rotations, transitions });
 };
 
 type AuditRow = { kind: string; reasonCode: string; evidence: Record<string, unknown> };
@@ -130,6 +147,8 @@ interface Harness {
   beforeAdmit: ((request: MachLaunchIncoming) => void | Promise<void>) | null;
   readonly watcher: { wake(): void; stop(): void };
   readonly mcpSock: string;
+  /** Process groups this harness started (a spawned tree's holder, a real holder's sandbox-exec), killed at cleanup. */
+  readonly groups: number[];
   spawnTree(mode: "holder-cli-relay" | "holder-relay" | "holder-cli-two-relays", externalSessionId: string): {
     report: () => Record<string, number>;
     go: () => void;
@@ -137,9 +156,50 @@ interface Harness {
   };
 }
 
-const harnesses: Array<{ cleanup: () => void }> = [];
-afterEach((ctx) => {
-  for (const h of harnesses.splice(0)) h.cleanup();
+/**
+ * Every process a witness here started, by pid and the start token it had when it was first seen, so the
+ * file can show at its end that none of them is still alive. A tree is killed as a process group: a CLI or
+ * relay whose parent died is reparented to launchd but stays in its holder's group, so the group reaches it.
+ */
+const spawnedThisFile = new Map<number, string>();
+const remember = (pid: number | undefined): void => {
+  if (pid === undefined || pid <= 1 || spawnedThisFile.has(pid)) return;
+  const token = readProcessStartToken(pid);
+  if (token !== null) spawnedThisFile.set(pid, token);
+};
+const aliveAsSpawned = (pid: number): boolean => {
+  const token = spawnedThisFile.get(pid);
+  return token !== undefined && readProcessStartToken(pid) === token;
+};
+const groupMembers = (pgid: number): number[] =>
+  spawnSync("/usr/bin/pgrep", ["-g", String(pgid)], { encoding: "utf8" }).stdout
+    .split("\n").map(Number).filter((pid) => Number.isSafeInteger(pid) && pid > 1);
+/** Kills each group (only while a process this file started is still in it) and waits until all of it is gone. */
+const killTrees = async (groups: readonly number[], pids: readonly number[]): Promise<void> => {
+  const ours = new Set<number>([...groups, ...pids]);
+  for (const pid of ours) remember(pid);
+  for (const pgid of groups) {
+    const members = groupMembers(pgid);
+    if (!members.some((pid) => aliveAsSpawned(pid))) continue;
+    for (const pid of members) { remember(pid); ours.add(pid); }
+    try { process.kill(-pgid, "SIGKILL"); } catch { /* the group emptied meanwhile */ }
+  }
+  for (const pid of ours) {
+    if (aliveAsSpawned(pid)) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
+  }
+  const survivors = (): number[] => [...ours].filter((pid) => aliveAsSpawned(pid));
+  if (!(await waitFor(() => survivors().length === 0, 10_000))) {
+    throw new Error(`spawned processes survived cleanup: ${survivors().join(", ")}`);
+  }
+};
+
+const harnesses: Array<{ cleanup: () => Promise<void> }> = [];
+afterAll(() => {
+  // No process any witness in this file started is alive once the file is done.
+  expect([...spawnedThisFile.keys()].filter((pid) => aliveAsSpawned(pid))).toEqual([]);
+});
+afterEach(async (ctx) => {
+  for (const h of harnesses.splice(0)) await h.cleanup();
   // A marker the macos-15 CI step greps for, to show from the log that the real Mach witnesses actually
   // executed on the runner (and did not silently skip). Printed only when the case was not skipped.
   if (ctx.task.result?.state !== "skip") process.stdout.write(`MACH_WITNESS_EXECUTED ${ctx.task.name}\n`);
@@ -153,6 +213,9 @@ const startHarness = (addon: MachLaunchAddon, record: Parameters<typeof sessions
   const mcpLines: string[] = [];
   const dir = tempDir("acp-o4b-step2-");
   const children: ChildProcess[] = [];
+  const groups: number[] = [];
+  const reported: number[] = [];
+  const reports: string[] = [];
   // A stand-in cto.mcp.sock: it captures the first line the relay writes, which is the credential it
   // claimed. Capturing it here is how the test sees a credential was handed over.
   const mcpSock = join(dir, "mcp.sock");
@@ -171,7 +234,7 @@ const startHarness = (addon: MachLaunchAddon, record: Parameters<typeof sessions
   mcpServer.listen(mcpSock);
 
   const self: Harness = {
-    isoName, pending, audit, sessions, mcpLines, dir, mcpSock, handle: undefined as unknown as MachLaunchHandle,
+    isoName, pending, audit, sessions, mcpLines, dir, mcpSock, groups, handle: undefined as unknown as MachLaunchHandle,
     watcher: undefined as unknown as { wake(): void; stop(): void },
     beforeAdmit: null,
     spawnTree: (mode, externalSessionId) => {
@@ -216,16 +279,25 @@ const startHarness = (addon: MachLaunchAddon, record: Parameters<typeof sessions
         setInterval(() => {}, 1 << 30);
       `);
       const count = mode === "holder-cli-two-relays" ? "2" : "1";
+      // Its own process group, so the CLI and relays it starts are killed with it even once reparented.
       const holder = spawn(process.execPath, [holderScript, mode, report, goFile, cliScript, count, ...relayArgs], {
         stdio: ["ignore", "ignore", "ignore"],
+        detached: true,
       });
       children.push(holder);
+      remember(holder.pid);
+      if (holder.pid) groups.push(holder.pid);
+      reports.push(report);
       return {
         report: (): Record<string, number> => {
           const map: Record<string, number> = {};
           for (const line of readFileSync(report, "utf8").split("\n")) {
             const [k, v] = line.split("=");
-            if (k && v) map[k] = Number(v);
+            if (k && v) {
+              map[k] = Number(v);
+              remember(map[k]);
+              reported.push(map[k]!);
+            }
           }
           return map;
         },
@@ -250,12 +322,24 @@ const startHarness = (addon: MachLaunchAddon, record: Parameters<typeof sessions
   (self as { watcher: { wake(): void; stop(): void } }).watcher = watcher;
 
   harnesses.push({
-    cleanup: () => {
-      for (const child of children) { try { if (child.pid) process.kill(child.pid, "SIGKILL"); } catch { /* gone */ } }
-      watcher.stop();
-      try { addon.close(handle); } catch { /* already closed */ }
-      mcpServer.close();
-      rmSync(dir, { recursive: true, force: true });
+    cleanup: async () => {
+      // Every pid a tree reported, then every group killed and confirmed gone, reparented grandchildren included.
+      for (const report of reports) {
+        try {
+          for (const line of readFileSync(report, "utf8").split("\n")) {
+            const pid = Number(line.split("=")[1]);
+            if (Number.isSafeInteger(pid) && pid > 1) { remember(pid); reported.push(pid); }
+          }
+        } catch { /* never written */ }
+      }
+      try {
+        await killTrees(groups, [...children.map((child) => child.pid ?? 0).filter((pid) => pid > 1), ...reported]);
+      } finally {
+        watcher.stop();
+        try { addon.close(handle); } catch { /* already closed */ }
+        mcpServer.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
     },
   });
   return self;
@@ -266,6 +350,7 @@ const provision = (h: Harness, credential: SessionLaunchCredential & { sessionSe
   h.pending.set(credential.externalSessionId, {
     credential: { ...credential, pin: { pid: holderPid, startToken: readProcessStartToken(holderPid) } },
     expiresAtMs: Date.now() + 60_000,
+    door: "driven",
   });
   h.watcher.wake();
 };
@@ -320,7 +405,12 @@ describe("O4b B' step 2 — a driven credential is handed over only over raw Mac
     const workdir = tempDir("acp-o4b-real-holder-");
     return cliAdapterTesting.productionRunCli(cliFile, [], {
       cwd: workdir, timeoutMs: 20_000, stdin: "", reapProcessGroup: true,
-      onSpawn: (pid: number) => provision(h, credential, pid),
+      onSpawn: (pid: number) => {
+        // The holder leads its own group (`detached`); it is killed with that group at cleanup.
+        remember(pid);
+        h.groups.push(pid);
+        provision(h, credential, pid);
+      },
     });
   };
   const relayArgv = (h: Harness, externalSessionId: string): string[] =>
@@ -447,6 +537,16 @@ exec /bin/sleep 3
     expect(await waitFor(() => refusals(h).length > 0, 15_000)).toBe(true);
     expect(lastRefusalReason(h)).toBe("SECRET_STALE");
     expect(deliveredCredential(h, staleSecret)).toBe(false);
+    // #1336 — the secret still verifies, but the session is no longer the incarnation the entry names.
+    const staleIncarnation = { ...credential, externalSessionId: `${credential.externalSessionId}-inc`, sessionIncarnation: "inc-0" };
+    const second = h.spawnTree("holder-cli-relay", staleIncarnation.externalSessionId);
+    expect(await waitFor(() => "holder" in second.report() && "cli" in second.report(), 10_000)).toBe(true);
+    provision(h, staleIncarnation, second.report()["holder"]!);
+    second.go();
+    expect(await waitFor(() => refusals(h).length > 1, 15_000)).toBe(true);
+    expect(lastRefusalReason(h)).toBe("INCARNATION_STALE");
+    expect(deliveredCredential(h, staleIncarnation)).toBe(false);
+    expect(h.pending.has(staleIncarnation.externalSessionId)).toBe(true);
   });
 
   it("W-MALFORMED: a request body with no session id is refused MALFORMED and exposes no credential", async (ctx) => {
@@ -477,7 +577,7 @@ exec /bin/sleep 3
       respond: () => true,
     } as unknown as MachLaunchAddon;
     const pin = { pid: 12, startToken: "darwin-tv:3.000003" };
-    h.pending.set(credential.externalSessionId, { credential: { ...credential, pin }, expiresAtMs: Date.now() + 60_000, cliPin: { pid: 11, token: Buffer.alloc(32) } });
+    h.pending.set(credential.externalSessionId, { credential: { ...credential, pin }, expiresAtMs: Date.now() + 60_000, door: "driven", cliPin: { pid: 11, token: Buffer.alloc(32) } });
     const request: MachLaunchIncoming = { id: 1, body: Buffer.from(JSON.stringify({ externalSessionId: credential.externalSessionId })), token, live: true, sender: { pid: 10, pidversion: 1, euid: 501 } };
     serveMachLaunchCredential(request, { pending: h.pending, sessions: h.sessions, audit: h.audit, addon: fakeAddon, handle: {}, mcpToken: MCP_TOKEN });
     serveMachLaunchCredential({ ...request, id: 2 }, { pending: h.pending, sessions: h.sessions, audit: h.audit, addon: fakeAddon, handle: {}, mcpToken: MCP_TOKEN });
@@ -499,13 +599,128 @@ exec /bin/sleep 3
       respond: () => false, // the Mach reply send failed or is uncertain (MACH_SEND_INVALID_DEST, timeout)
     } as unknown as MachLaunchAddon;
     const pin = { pid: 12, startToken: "darwin-tv:3.000003" };
-    h.pending.set(credential.externalSessionId, { credential: { ...credential, pin }, expiresAtMs: Date.now() + 60_000, cliPin: { pid: 11, token: Buffer.alloc(32) } });
+    h.pending.set(credential.externalSessionId, { credential: { ...credential, pin }, expiresAtMs: Date.now() + 60_000, door: "driven", cliPin: { pid: 11, token: Buffer.alloc(32) } });
     const request: MachLaunchIncoming = { id: 1, body: Buffer.from(JSON.stringify({ externalSessionId: credential.externalSessionId })), token, live: true, sender: { pid: 10, pidversion: 1, euid: 501 } };
     serveMachLaunchCredential(request, { pending: h.pending, sessions: h.sessions, audit: h.audit, addon: fakeAddon, handle: {}, mcpToken: MCP_TOKEN });
     expect(h.pending.has(credential.externalSessionId)).toBe(false); // not restored
     expect(h.sessions.rotations).toEqual([6]); // rotated from the epoch verifySecret returned
     expect(h.audit.rows.some((r) => r.kind === "SESSION_LAUNCH_CREDENTIAL_SEND_FAILED" && r.evidence["rotated"] === true)).toBe(true);
     expect(h.audit.rows.some((r) => r.kind === "SESSION_LAUNCH_CREDENTIAL_DELIVERED")).toBe(false);
+  });
+
+  /**
+   * #1336 — one admitted hand-over whose reply send is uncertain, on a fake addon whose admission passes and
+   * whose `respond` is the test's: the entry is consumed, and what happens to the secret is the subject.
+   */
+  const sendUncertain = (
+    addon: MachLaunchAddon,
+    deps: { pending: Map<string, PendingLaunchCredential>; sessions: MachLaunchSessions; audit: ReturnType<typeof auditDouble> },
+    credential: SessionLaunchCredential & { sessionSecret: string },
+    respond: () => boolean,
+  ): void => {
+    const fakeAddon = {
+      STATUS: addon.STATUS,
+      instanceLive: () => true,
+      bsdInfo: (pid: number) => (pid === 10 ? { ppid: 11, startSec: 1, startUsec: 1 } : pid === 11 ? { ppid: 12, startSec: 2, startUsec: 2 } : { ppid: 1, startSec: 3, startUsec: 3 }),
+      respond,
+    } as unknown as MachLaunchAddon;
+    const pin = { pid: 12, startToken: "darwin-tv:3.000003" };
+    deps.pending.set(credential.externalSessionId, { credential: { ...credential, pin }, expiresAtMs: Date.now() + 60_000, door: "driven", cliPin: { pid: 11, token: Buffer.alloc(32) } });
+    const request: MachLaunchIncoming = { id: 1, body: Buffer.from(JSON.stringify({ externalSessionId: credential.externalSessionId })), token: Buffer.alloc(32), live: true, sender: { pid: 10, pidversion: 1, euid: 501 } };
+    serveMachLaunchCredential(request, { ...deps, addon: fakeAddon, handle: {}, mcpToken: MCP_TOKEN });
+  };
+  const sendFailures = (audit: ReturnType<typeof auditDouble>) => audit.rows.filter((r) => r.kind === "SESSION_LAUNCH_CREDENTIAL_SEND_FAILED");
+  /** A real registry's session, READY or DRAINING, with the credential a driven turn's entry would carry. */
+  const realSession = (lifecycle: typeof SessionLifecycle.READY | typeof SessionLifecycle.DRAINING) => {
+    const harness = makeHarness();
+    const created = harness.cp.sessions.create({ provider: "claude", model: "o4b-send-uncertain" });
+    expect(harness.cp.sessions.transition(created.sessionId, SessionLifecycle.READY, "fixture").allowed).toBe(true);
+    if (lifecycle === SessionLifecycle.DRAINING) {
+      expect(harness.cp.sessions.transition(created.sessionId, SessionLifecycle.DRAINING, "fixture").allowed).toBe(true);
+    }
+    const session = harness.cp.sessions.require(created.sessionId);
+    const credential = {
+      sessionId: session.sessionId,
+      sessionIncarnation: session.incarnation,
+      externalSessionId: `ext-${session.sessionId}`,
+      sessionSecret: created.sessionSecret!,
+    };
+    return { harness, sessions: harness.cp.sessions, credential, epoch: session.credentialEpoch };
+  };
+
+  it("#1336 W-SENDTHROW: a respond that throws goes down the same path as one that returns false", (ctx) => {
+    const addon = requireMach(ctx);
+    const outcome = (respond: () => boolean) => {
+      const record = { sessionId: "s-send", sessionSecret: "", incarnation: "inc-1", credentialEpoch: 5 };
+      const credential = credentialOf(record.sessionId);
+      record.sessionSecret = credential.sessionSecret;
+      const deps = { pending: new Map<string, PendingLaunchCredential>(), sessions: sessionsDouble(record), audit: auditDouble() };
+      expect(() => sendUncertain(addon, deps, credential, respond)).not.toThrow();
+      return {
+        pending: deps.pending.size,
+        rotations: deps.sessions.rotations,
+        secretStillVerifies: deps.sessions.verifySecret(record.sessionId, credential.sessionSecret).allowed,
+        delivered: deps.audit.rows.some((r) => r.kind === "SESSION_LAUNCH_CREDENTIAL_DELIVERED"),
+        failures: sendFailures(deps.audit).map((r) => ({ reasonCode: r.reasonCode, evidence: { ...r.evidence, send: "-" } })),
+        sends: sendFailures(deps.audit).map((r) => r.evidence["send"]),
+      };
+    };
+    const returnedFalse = outcome(() => false);
+    const threw = outcome(() => { throw new Error("mach_msg send raised"); });
+    expect(returnedFalse).toMatchObject({ pending: 0, rotations: [6], secretStillVerifies: false, delivered: false, sends: ["FALSE"] });
+    expect(returnedFalse.failures).toEqual([{ reasonCode: ReasonCode.MACH_LAUNCH_SEND_FAILED, evidence: { transport: "mach", send: "-", rotated: true, invalidated: "ROTATED" } }]);
+    expect(threw.sends).toEqual(["THREW"]);
+    expect({ ...threw, sends: null }).toEqual({ ...returnedFalse, sends: null });
+  });
+
+  it("#1336 W-ROTATE-REFUSED-STILL-VALID: a refused rotation whose secret still verifies blocks the session", (ctx) => {
+    const addon = requireMach(ctx);
+    // A real registry: a DRAINING session's secret still verifies, and its credential is not rotated.
+    const { harness, sessions, credential, epoch } = realSession(SessionLifecycle.DRAINING);
+    try {
+      expect(sessions.verifySecret(credential.sessionId, credential.sessionSecret).allowed).toBe(true);
+      const deps = { pending: new Map<string, PendingLaunchCredential>(), sessions, audit: auditDouble() };
+      sendUncertain(addon, deps, credential, () => false);
+      expect(deps.pending.size).toBe(0); // not restored
+      expect(sendFailures(deps.audit)).toEqual([{
+        kind: "SESSION_LAUNCH_CREDENTIAL_SEND_FAILED",
+        reasonCode: ReasonCode.MACH_LAUNCH_SECRET_NOT_INVALIDATED,
+        evidence: { transport: "mach", send: "FALSE", rotated: false, invalidated: "SESSION_BLOCKED", rotationRefused: ReasonCode.SESSION_NOT_READY, blocked: true },
+      }]);
+      // Blocked through the registry's own path: the secret authenticates nothing, nothing can re-credential it.
+      const after = sessions.require(credential.sessionId);
+      expect(after.lifecycle).toBe(SessionLifecycle.ERROR);
+      expect(after.credentialEpoch).toBe(epoch);
+      expect(sessions.verifySecret(credential.sessionId, credential.sessionSecret).allowed).toBe(false);
+      expect(sessions.rotateSecret(credential.sessionId, epoch).allowed).toBe(false);
+      expect(deps.audit.rows.some((r) => r.kind === "SESSION_LAUNCH_CREDENTIAL_DELIVERED")).toBe(false);
+    } finally {
+      harness.cp.close();
+    }
+  });
+
+  it("#1336 W-ROTATE-REFUSED-EPOCH-MOVED: a rotation refused because the epoch already moved leaves the session alone", (ctx) => {
+    const addon = requireMach(ctx);
+    const { harness, sessions, credential, epoch } = realSession(SessionLifecycle.READY);
+    try {
+      const deps = { pending: new Map<string, PendingLaunchCredential>(), sessions, audit: auditDouble() };
+      // The epoch moves while the reply is in flight (another rotation of the session), and the send is uncertain.
+      sendUncertain(addon, deps, credential, () => {
+        expect(sessions.rotateSecret(credential.sessionId, epoch).allowed).toBe(true);
+        return false;
+      });
+      expect(deps.pending.size).toBe(0);
+      expect(sendFailures(deps.audit)).toEqual([{
+        kind: "SESSION_LAUNCH_CREDENTIAL_SEND_FAILED",
+        reasonCode: ReasonCode.MACH_LAUNCH_SEND_FAILED,
+        evidence: { transport: "mach", send: "FALSE", rotated: false, invalidated: "ALREADY_INVALID", rotationRefused: ReasonCode.SESSION_CREDENTIAL_EPOCH_STALE },
+      }]);
+      // The old secret is already dead; the session is not blocked and keeps the epoch the other rotation set.
+      expect(sessions.verifySecret(credential.sessionId, credential.sessionSecret).allowed).toBe(false);
+      expect(sessions.require(credential.sessionId)).toMatchObject({ lifecycle: SessionLifecycle.READY, credentialEpoch: epoch + 1 });
+    } finally {
+      harness.cp.close();
+    }
   });
 
   it("the admission function admits the real shape and refuses a holder-pin whose start token moved", (ctx) => {
@@ -529,8 +744,9 @@ exec /bin/sleep 3
 
 describe("O4b B' step 2 — resource-safety branches expose no credential and leak no port or thread (CEO item 4)", () => {
   // The step-1 thread/port counter, loaded only to confirm the receive thread and the service ports
-  // return to baseline. Absent (a clean CI runner without the step-1 evidence), the native close()
-  // `released` flag is the portable no-leak statement and the thread assertions are skipped.
+  // return to baseline. It is read from a local evidence path that a CI runner does not have, so on CI it is
+  // absent and the thread and port-count assertions below do not run there (the log says which:
+  // MACH_DIAG_CHECKS); the native close() `released` flag is then the only no-leak statement.
   const DIAG = (() => {
     const p = "/Users/isaac/.claude/jobs/cto-restart/evidence/o4b-mach-step1/harness/diag.node";
     if (process.platform !== "darwin" || !existsSync(p)) return null;
@@ -566,7 +782,7 @@ describe("O4b B' step 2 — resource-safety branches expose no credential and le
     expect(receiveThreads()).toBeLessThanOrEqual(0); // -1 when no diag, 0 when the receive thread joined
   });
 
-  it("W-DURING-STOP: requests in flight at close and one arriving after it are both refused, no credential, thread and ports back to baseline", async (ctx) => {
+  it("W-DURING-STOP: requests already at the callback when close runs, and one sent after close completed, are refused, no credential, thread and ports back to baseline", async (ctx) => {
     const addon = requireMach(ctx);
     const iso = isoName("stop");
     const record = { sessionId: `s-${randomUUID().slice(0, 8)}`, sessionSecret: "valid", incarnation: "inc-1", credentialEpoch: 1 };
@@ -584,9 +800,10 @@ describe("O4b B' step 2 — resource-safety branches expose no credential and le
     expect(closed.refused + closed.drained).toBeGreaterThanOrEqual(4); // every in-flight request refused, none served
     const results = await Promise.all(inFlight);
     expect(results.every((r) => r.code !== "OK")).toBe(true);
-    // One arriving after close has begun finds no service.
+    // One sent after close completed finds no service. A request arriving while close() runs is not covered here.
     const late = await claimFrom(addon, iso, Buffer.from(JSON.stringify({ externalSessionId: "late" })), 1_000);
     expect(late.code).not.toBe("OK");
+    process.stdout.write(`MACH_DIAG_CHECKS ${DIAG ? "ran" : "skipped (no step-1 diag addon on this host)"}\n`);
     if (DIAG) { expect(threadsAtListen).toBe(1); expect(receiveThreads()).toBe(0); } // the receive thread joined; none leaked
     // No per-cycle leak: a second identical held-then-close cycle leaves the port-name count where the first
     // left it (the first concurrent claims allocate threadpool state once; measured 27 -> 31 -> 31 ...).
@@ -608,7 +825,7 @@ describe("O4b B' step 2 — resource-safety branches expose no credential and le
     void record;
   });
 
-  it("the kernel-queue drain at close is attempted; whether any request was still queued is reported", async (ctx) => {
+  it("the kernel-queue drain at close is attempted and its count reported; it does not force or prove that any request was still queued", async (ctx) => {
     const addon = requireMach(ctx);
     const iso = isoName("drain");
     const handle = addon.listen(iso, (req: MachLaunchIncoming) => { void req; });
@@ -636,6 +853,27 @@ describe("O4b B' step 2 — resource-safety branches expose no credential and le
     expect(closed.released).toBe(true);
   });
 
+  it("#1336 W-CALLBACK-THREW: a request whose JS callback throws is answered REFUSED at once, its reply right not held until close", (ctx) => {
+    requireMach(ctx);
+    // In a child process, so the callback's uncaught Node-API exception stays out of this worker. The daemon
+    // side runs on the in-tree build, exactly as `loadMachLaunchAddon` loads it from a source checkout.
+    const script = `
+      const addon = require(${JSON.stringify(join(process.cwd(), "native/mach-launch/build/Release/mach_launch.node"))});
+      process.on("uncaughtException", () => {});
+      const name = ${JSON.stringify(isoName("threw"))};
+      const handle = addon.listen(name, () => { throw new Error("the callback threw"); });
+      const started = Date.now();
+      addon.claim(name, Buffer.from(JSON.stringify({ externalSessionId: "x" })), 3000).then((r) => {
+        const elapsedMs = Date.now() - started;
+        const closed = addon.close(handle);
+        process.stdout.write(JSON.stringify({ code: r.code, answeredBeforeTimeout: elapsedMs < 2500, heldUntilClose: closed.refused, released: closed.released }));
+        process.exit(0);
+      });`;
+    const run = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 20_000 });
+    expect(run.status, run.stderr).toBe(0);
+    expect(JSON.parse(run.stdout)).toEqual({ code: "REFUSED", answeredBeforeTimeout: true, heldUntilClose: 0, released: true });
+  });
+
   it("W-PREV-INSTANCE: a request for a previous instance's entry, delivered to a new instance on the same name, is refused with no credential and no reissue", async (ctx) => {
     const addon = requireMach(ctx);
     const iso = isoName("prev");
@@ -645,7 +883,7 @@ describe("O4b B' step 2 — resource-safety branches expose no credential and le
     // Instance A owns the service and holds entry E (pinned to this live process so lineage is not the
     // reason it is refused later). A is torn down before anything claims E.
     const pendingA = new Map<string, PendingLaunchCredential>();
-    pendingA.set(credE.externalSessionId, { credential: { ...credE, pin: { pid: process.pid, startToken: readProcessStartToken(process.pid) } }, expiresAtMs: Date.now() + 60_000 });
+    pendingA.set(credE.externalSessionId, { credential: { ...credE, pin: { pid: process.pid, startToken: readProcessStartToken(process.pid) } }, expiresAtMs: Date.now() + 60_000, door: "driven" });
     const handleA: MachLaunchHandle = addon.listen(iso, (req: MachLaunchIncoming) => serveMachLaunchCredential(req, { ...serveDeps(addon, handleA, pendingA, recordA) }));
     expect(addon.close(handleA).released).toBe(true);
     // Instance B checks in on the same name with its own pending, which has never heard of E.
@@ -692,29 +930,106 @@ describe("O4b B' step 2 — a #738-refused daemon drains the launch queue and se
   });
 });
 
+/** One id-only request on `cto.launch.sock`: the parsed reply and the raw line, so a test can look for the secret in it. */
+const askAfUnix = (socketPath: string, externalSessionId: string): Promise<{ reply: Record<string, unknown>; raw: string }> =>
+  new Promise((resolve) => {
+    const socket = createConnection(socketPath, () => socket.write(`${JSON.stringify({ externalSessionId })}\n`));
+    let buf = "";
+    socket.on("data", (c) => { buf += c.toString("utf8"); if (buf.includes("\n")) { resolve({ reply: JSON.parse(buf.trim()) as Record<string, unknown>, raw: buf }); socket.destroy(); } });
+    socket.on("error", () => resolve({ reply: { error: true }, raw: buf }));
+  });
+
 describe("O4b B' step 2 — a driven request on the AF_UNIX launch socket is refused, and no-service fails closed", () => {
-  it("W-AFUNIX: a driven (pinned) entry presented on cto.launch.sock is refused, and the entry is kept", async () => {
+  /** A channel as `main` wires it: the session runtime is attached with `driven`, `cp.cto` with the channel itself. */
+  const openChannel = async () => {
     const dir = tempDir("acp-o4b-afunix-");
     const record = { sessionId: `s-${randomUUID().slice(0, 8)}`, sessionSecret: "", incarnation: "inc-1", credentialEpoch: 1 };
-    const credential = credentialOf(record.sessionId);
+    const credential: SessionLaunchCredential & { sessionSecret: string } = credentialOf(record.sessionId);
     record.sessionSecret = credential.sessionSecret;
-    const channel = await startSessionLaunchChannel(dir, { mcpToken: MCP_TOKEN, sessions: sessionsDouble(record), audit: auditDouble() });
+    const audit = auditDouble();
+    const channel = await startSessionLaunchChannel(dir, { mcpToken: MCP_TOKEN, sessions: sessionsDouble(record), audit });
+    expect((await channel.prepare()).allowed).toBe(true);
+    return {
+      channel, credential, audit,
+      close: async () => { await channel.close(); rmSync(dir, { recursive: true, force: true }); },
+    };
+  };
+  const drivenRefusals = (audit: ReturnType<typeof auditDouble>) =>
+    audit.rows.filter((r) => r.kind === "SESSION_LAUNCH_CREDENTIAL_REFUSED" && r.reasonCode === ReasonCode.DRIVEN_LAUNCH_ON_AF_UNIX_REFUSED);
+
+  it("W-AFUNIX: a driven (pinned) entry presented on cto.launch.sock is refused, and the entry is kept", async () => {
+    const { channel, credential, close } = await openChannel();
     try {
-      await channel.prepare();
-      // A driven entry carries a pin; drive it straight onto the id-only socket.
-      await channel.provision({ ...credential, pin: { pid: process.pid, startToken: readProcessStartToken(process.pid) } });
-      const reply = await new Promise<Record<string, unknown>>((resolve) => {
-        const socket = createConnection(channel.socketPath, () => socket.write(`${JSON.stringify({ externalSessionId: credential.externalSessionId })}\n`));
-        let buf = "";
-        socket.on("data", (c) => { buf += c.toString("utf8"); if (buf.includes("\n")) { resolve(JSON.parse(buf.trim())); socket.destroy(); } });
-        socket.on("error", () => resolve({ error: true }));
-      });
+      // A driven entry, offered through the driven door, with its pin; drive it straight onto the id-only socket.
+      await channel.driven.provision({ ...credential, pin: { pid: process.pid, startToken: readProcessStartToken(process.pid) } });
+      const { reply } = await askAfUnix(channel.socketPath, credential.externalSessionId);
       expect(reply["ok"]).toBe(false);
       expect(reply["reasonCode"]).toBe(ReasonCode.DRIVEN_LAUNCH_ON_AF_UNIX_REFUSED);
       expect(channel.withdraw(credential.externalSessionId)).toBe(true); // kept for the real Mach claim
     } finally {
-      await channel.close();
-      rmSync(dir, { recursive: true, force: true });
+      await close();
+    }
+  });
+
+  it("#1336 (a): a request between the driven provision and its pin is refused on AF_UNIX, hands over nothing, and keeps the entry", async () => {
+    const { channel, credential, audit, close } = await openChannel();
+    try {
+      // The runtime's own order: provision the turn's entry, then write the holder pin into that very object
+      // in the spawn tick. A same-uid presenter of the id that asks in between finds no pin yet.
+      const launch: SessionLaunchCredential = { ...credential };
+      expect((await channel.driven.provision(launch)).allowed).toBe(true);
+      const early = await askAfUnix(channel.socketPath, credential.externalSessionId);
+      expect(early.reply).toEqual({ ok: false, reasonCode: ReasonCode.DRIVEN_LAUNCH_ON_AF_UNIX_REFUSED });
+      expect(early.raw).not.toContain(credential.sessionSecret);
+      expect(early.raw).not.toContain(MCP_TOKEN);
+      expect(drivenRefusals(audit)).toHaveLength(1);
+      expect(drivenRefusals(audit)[0]!.evidence).toEqual({ transport: "af_unix", reason: "DRIVEN_ON_AF_UNIX" });
+      // The pin arrives: the same entry is still pending, for its Mach claim, and still refused here.
+      launch.pin = { pid: process.pid, startToken: readProcessStartToken(process.pid) };
+      const late = await askAfUnix(channel.socketPath, credential.externalSessionId);
+      expect(late.reply).toEqual({ ok: false, reasonCode: ReasonCode.DRIVEN_LAUNCH_ON_AF_UNIX_REFUSED });
+      expect(late.raw).not.toContain(credential.sessionSecret);
+      expect(channel.driven.withdraw(credential.externalSessionId)).toBe(true);
+    } finally {
+      await close();
+    }
+  });
+
+  it("#1336 (b): a driven entry that never gets a pin is refused on AF_UNIX every time it is asked for", async () => {
+    const { channel, credential, audit, close } = await openChannel();
+    try {
+      expect((await channel.driven.provision(credential)).allowed).toBe(true);
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const asked = await askAfUnix(channel.socketPath, credential.externalSessionId);
+        expect(asked.reply).toEqual({ ok: false, reasonCode: ReasonCode.DRIVEN_LAUNCH_ON_AF_UNIX_REFUSED });
+        expect(asked.raw).not.toContain(credential.sessionSecret);
+      }
+      expect(drivenRefusals(audit)).toHaveLength(3);
+      expect(audit.rows.some((r) => r.kind === "SESSION_LAUNCH_CREDENTIAL_DELIVERED")).toBe(false);
+      expect(channel.withdraw(credential.externalSessionId)).toBe(true); // never consumed
+    } finally {
+      await close();
+    }
+  });
+
+  it("#1336 (c): an interactive entry, offered through the channel's own provision, is still handed over on AF_UNIX once", async () => {
+    const { channel, credential, audit, close } = await openChannel();
+    try {
+      expect((await channel.provision(credential)).allowed).toBe(true);
+      const asked = await askAfUnix(channel.socketPath, credential.externalSessionId);
+      expect(asked.reply).toEqual({
+        ok: true,
+        sessionId: credential.sessionId,
+        sessionIncarnation: credential.sessionIncarnation,
+        sessionSecret: credential.sessionSecret,
+        token: MCP_TOKEN,
+      });
+      expect(drivenRefusals(audit)).toHaveLength(0);
+      expect(channel.withdraw(credential.externalSessionId)).toBe(false); // take-once: consumed by the hand-over
+      const again = await askAfUnix(channel.socketPath, credential.externalSessionId);
+      expect(again.reply).toEqual({ ok: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED });
+    } finally {
+      await close();
     }
   });
 

@@ -20,7 +20,7 @@ import {
   type SessionCredentialDelivery,
   drivenModeOf,
 } from "../../src/runtime/provisioned-session-runtime.ts";
-import { RecordingRuntimeDouble, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
+import { RecordingRuntimeDouble, drivenDoorStandIn, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { drivenPrimary } from "../helpers/driven-primary-cto.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { type Harness, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
@@ -113,13 +113,17 @@ const startDaemonProcess = async (harness: Harness, claude: RecordingRuntimeDoub
   harness.cp.providers.registerForRole(claude, Role.PRIMARY_CTO);
   const launch = await startSessionLaunchChannel(tempDir("acp-o4a-launch-"), { mcpToken: TOKEN });
   const offered: SessionLaunchCredential[] = [];
+  // #1336 — the runtime is attached with the channel's driven door, as `main` attaches it; the double
+  // takes what that door offers through the fixture's stand-in for the Mach hand-over.
+  const door = drivenDoorStandIn(launch, TOKEN);
+  claude.useInProcess({ launch: door });
   const delivery: SessionCredentialDelivery = {
-    prepare: () => launch.prepare(),
+    prepare: () => door.prepare(),
     provision: (credential) => {
       offered.push(credential);
-      return launch.provision(credential);
+      return door.provision(credential);
     },
-    withdraw: (externalSessionId) => launch.withdraw(externalSessionId),
+    withdraw: (externalSessionId) => door.withdraw(externalSessionId),
   };
   const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-o4a-mcp-"), TOKEN);
   const [hermesSocket, ctoSocket] = listeners.socketPaths;
@@ -270,8 +274,8 @@ describe("O4 pin — a relayed turn is pinned to the daemon's own spawn of claud
       const cp = f.harness.cp;
       const { binding } = await drivenPrimary(f, "o4a-pin");
       const offered: SessionLaunchCredential[] = [];
-      const provision = f.launch.provision.bind(f.launch);
-      f.launch.provision = (credential) => {
+      const provision = f.drivenDoor.provision.bind(f.drivenDoor);
+      f.drivenDoor.provision = (credential) => {
         offered.push(credential);
         return provision(credential);
       };

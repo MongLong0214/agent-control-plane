@@ -182,16 +182,21 @@ jobs:
       # (real Mach messages, real holder → CLI → relay process trees) actually executed. The witnesses
       # fail rather than skip when ACP_REQUIRE_SEATBELT=1 and the addon is unavailable, so an unsupported
       # environment cannot report this step as a success.
+      # `shell: bash` runs the script as `bash -eo pipefail`: without pipefail the pipeline's status is tee's,
+      # so failing witnesses could still print their markers and pass the step. The marker count below only
+      # catches cases that did not execute; whether they passed is vitest's exit status, through the pipe.
       - name: driven-launch Mach witnesses ran (real Mach, real process trees)
+        shell: bash
         env:
           ACP_REQUIRE_SEATBELT: "1"
         run: |
           test -f native/mach-launch/build/Release/mach_launch.node
           pnpm build
           node_modules/.bin/vitest run tests/unit/the-driven-launch-credential-is-handed-over-only-over-mach.test.ts --reporter=verbose 2>&1 | tee mach-witness.log
-          # 21 cases execute (positive, the admission shapes, CLI exec, BUSY, oversized, during-stop, previous-instance, #738 drain,
-          # send-fail, concurrency, AF-UNIX, no-service); require nearly all, so a silent skip fails the step.
-          test "$(grep -c 'MACH_WITNESS_EXECUTED' mach-witness.log)" -ge 20
+          # 28 cases execute (positive, the admission shapes, CLI exec, BUSY, oversized, during-stop, previous-instance, #738 drain,
+          # send-fail/throw and the two refused rotations, a throwing callback, concurrency, AF-UNIX before/without a pin and
+          # the interactive control, no-service); require nearly all, so a silent skip fails the step.
+          test "$(grep -c 'MACH_WITNESS_EXECUTED' mach-witness.log)" -ge 27
       # ACP_TRAILERS_RANGE is the one workflow-specific value the runner takes: which commits to
       # read is a property of the event GitHub is handling, not of the gate. Unset locally, where
       # the check uses its own default of `origin/main..HEAD`.

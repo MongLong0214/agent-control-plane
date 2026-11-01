@@ -2686,8 +2686,9 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     const relayScript = sessionRelayScript();
     const addonPath = machLaunchAddonPath();
     // O4b B' — the driven relay claims its credential over raw Mach, not the AF_UNIX launch socket. In
-    // production it uses the launchd-reserved service name (its own compiled default, so no argv, config
-    // or environment can point it at another process). An isolated per-run name is passed only when this
+    // production it uses the launchd-reserved service name, its own compiled default: no config or
+    // environment can point it elsewhere, but its argv can (`--iso-service`), so it is this adapter, which
+    // writes that argv, that fixes the production name. An isolated per-run name is passed only when this
     // adapter was explicitly constructed with one — a test — and then as `--iso-service`, which also
     // switches the relay out of production mode. The MCP socket it presents the credential on is
     // unchanged.

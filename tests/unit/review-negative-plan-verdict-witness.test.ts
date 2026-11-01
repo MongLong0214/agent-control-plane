@@ -67,7 +67,7 @@ const fixture = async () => {
   if (!hermesSocket || !ctoSocket) throw new Error("the MCP listeners were not started");
   // C1b: the bootstrap CTO's runtime reaches the daemon over these two sockets.
   harness.cp.sessionRuntime.attach({
-    delivery: launch,
+    delivery: launch.driven,
     route: { launchSocketPath: launch.socketPath, mcpSocketPath: ctoSocket },
   });
   let keys = 0;

@@ -212,8 +212,8 @@ describe("the result recovery wake: once per (run, owner generation, PLAN digest
 /** Holds the next launch preparation — between the wake that admitted a turn and its provider call — until released. */
 const holdLaunchPreparation = (f: BootstrapRuntimeFixture) => {
   const held = barrier();
-  const prepare = f.launch.prepare.bind(f.launch);
-  vi.spyOn(f.launch, "prepare").mockImplementationOnce(async () => {
+  const prepare = f.drivenDoor.prepare.bind(f.drivenDoor);
+  vi.spyOn(f.drivenDoor, "prepare").mockImplementationOnce(async () => {
     held.enter();
     await held.gate;
     return prepare();
