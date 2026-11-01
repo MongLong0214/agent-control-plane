@@ -95,7 +95,8 @@ import { currentVerdictPasses, currentVerificationResults } from "../verify/veri
 import type { TaskContract } from "../run/run-engine.ts";
 import { bootstrapPlanTaskRecorded } from "../run/task-graph.ts";
 import {
-  candidateEvidenceSection, readExecutionEvidence, readTrackedTree, type ReceiptEvidence, type TrackedTreeEvidence,
+  candidateEvidenceSection, type OutputPart, type OutputStreamDelivery, outputStreamParts, outputStreamsInParts, readExecutionEvidence,
+  readTrackedTree, type ReceiptEvidence, type TrackedTreeEvidence,
 } from "./candidate-review-evidence.ts";
 import { redactCredentialValues } from "../core/credential-shapes.ts";
 import { contractChangeReadbackFor, type ContractChangeReadback } from "./contract-change-review-context.ts";
@@ -859,22 +860,28 @@ export class BlindReviewGate {
       const diffShare = this.buildPrompt(request, diffs, undefined, change, bareEvidence, reviewPolicies).length + REVIEWER_TRANSPORT_OVERHEAD_CHARS - bareOverhead;
       const evidenceRoom = CHUNK_THRESHOLD_CHARS - 4_096 - Math.min(diffShare, EVIDENCE_DIFF_RESERVE_CHARS) - bareOverhead;
       const evidenceSection = [...privateEvidence, ...candidateEvidenceSection(this.db, request.runId, trees, execution, evidenceRoom)];
+      // A whole-capture output stream the evidence section does not show whole goes in the diff's
+      // place: whole in a single review, as labelled parts across chunks otherwise.
+      const outputStreams = outputStreamsInParts(execution, evidenceRoom);
+      // Each delivered stream is a coverage item the review must account for, as a candidate file is.
+      const required = [...expected, ...outputStreams.map((stream) => ({ identity: stream.repository, path: stream.path }))];
 
       // Measure the complete input, including diff framing and system instructions, and send
       // this same rendered prompt if it fits. A lockfile is only ever reviewed in a chunk of its own.
-      const prompt = this.buildPrompt(request, diffs, undefined, change, evidenceSection, reviewPolicies);
+      const prompt = this.buildPrompt(request, [...diffs, ...outputStreams.flatMap((stream) => outputStreamParts(stream, Infinity)).map(outputChunkPart)],
+        undefined, change, evidenceSection, reviewPolicies);
       const chunked = prompt.length + REVIEWER_TRANSPORT_OVERHEAD_CHARS > CHUNK_THRESHOLD_CHARS ||
         diffs.some((repo) => (repo.lockfiles?.length ?? 0) > 0);
 
       let outcome: Decision<ReviewOutcome>;
       if (chunked) {
-        outcome = await this.chunkedReview(request, diffs, rememberReviewer, change, evidenceSection, reviewPolicies);
+        outcome = await this.chunkedReview(request, diffs, rememberReviewer, change, evidenceSection, reviewPolicies, outputStreams);
       } else {
         if (request.progress?.("FINAL_REVIEW_STARTED") === false) return attemptLeaseLost(request.runId, request.attemptId);
         const reviewer = await this.constituteReviewer(request);
         if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
         rememberReviewer(reviewer.value);
-        outcome = await this.singleReview(request, prompt, reviewer.value, expected);
+        outcome = await this.singleReview(request, prompt, reviewer.value, required);
       }
 
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
@@ -892,7 +899,7 @@ export class BlindReviewGate {
         snapshotDigest,
         outcome: outcome.value,
         chunked,
-        expected,
+        expected: required,
         binaryArtifacts,
         reviewPolicies,
         bootstrapPlan: null,
@@ -1951,6 +1958,7 @@ export class BlindReviewGate {
     change: TrustedContractChange | null = null,
     evidenceSection: readonly string[] = [],
     reviewPolicies: readonly RepositoryReviewPolicy[] = [],
+    outputStreams: readonly OutputStreamDelivery[] = [],
   ): Promise<Decision<ReviewOutcome>> {
     // A chunk adds repository/file fences and the chunk heading beyond the empty-prompt
     // measurement. Reserve a bounded envelope so the complete serialized prompt, not only
@@ -1971,6 +1979,20 @@ export class BlindReviewGate {
         runId: request.runId,
         unmapped,
       });
+    }
+    // Each whole-capture stream's labelled parts, packed into chunks of their own after the diff's:
+    // each part is a slice the chunk holding it must claim, like a range of an oversized file.
+    const outputParts = outputStreams.flatMap((stream) => outputStreamParts(stream, chunkBudget)).map(outputChunkPart);
+    if (outputParts.length > 0 && chunks.length === 1 && chunks[0]!.length === 0) chunks.pop();
+    let outputSize = Infinity;
+    for (const part of outputParts) {
+      const length = part.diff.length + (part.outputLabel?.length ?? 0);
+      if (outputSize + length > chunkBudget) {
+        chunks.push([]);
+        outputSize = 0;
+      }
+      chunks.at(-1)!.push(part);
+      outputSize += length;
     }
     // #246 B2-a — every chunk prompt carries the contract change; the first chunk's reviewer is the
     // one that may claim the manifest, so the reducer can tell whether any reviewer covered it.
@@ -2260,6 +2282,8 @@ export class BlindReviewGate {
       `Packet digest: ${reviewPacketDigest(request, change, reviewPolicies)}`,
       "Required coverage:",
       ...candidateCoverageTargets(request.snapshot, change).map((target) => `- ${target.identity}:${target.path}`),
+      // An official output stream delivered in this prompt is required coverage too.
+      ...new Set(diffs.flatMap((part) => ("outputLabel" in part && part.outputLabel !== undefined ? [`- ${part.identity}:${part.files[0]}`] : []))),
       "",
       ...evidenceSection,
       ...reviewPolicySection(reviewPolicies),
@@ -2267,7 +2291,8 @@ export class BlindReviewGate {
       "## Deterministic verification evidence",
       // Retained output is budgeted and shown under "Untrusted execution evidence", not here.
       "```json",
-      JSON.stringify({ ...request.verification, results: request.verification.results.map(({ output: _output, ...result }) => result) }, null, 2),
+      JSON.stringify({ ...request.verification,
+        results: request.verification.results.map(({ output: _output, capturedOutput: _captured, ...result }) => result) }, null, 2),
       "```",
       "",
       "## Actual diff",
@@ -2276,7 +2301,10 @@ export class BlindReviewGate {
     for (const repo of diffs) {
       const lockfile = "lockfile" in repo && repo.lockfile !== undefined ? [repo.lockfile] : [];
       const rangeLabel = "rangeLabel" in repo && repo.rangeLabel !== undefined ? [repo.rangeLabel] : [];
-      sections.push(`### ${repo.identity}`, "Files:", ...repo.files.map((f) => `- ${f}`), ...lockfile, ...rangeLabel, "```diff", repo.diff, "```");
+      // A part of an official output stream is text, fenced longer than any backtick run it holds.
+      const output = "outputLabel" in repo && repo.outputLabel !== undefined ? { label: repo.outputLabel, fence: repo.outputFence ?? "```" } : null;
+      sections.push(`### ${repo.identity}`, "Files:", ...repo.files.map((f) => `- ${f}`), ...lockfile, ...rangeLabel,
+        ...(output === null ? ["```diff", repo.diff, "```"] : [output.label, `${output.fence}text`, repo.diff, output.fence]));
     }
     const holdsRange = diffs.some((repo) => "rangeLabel" in repo && repo.rangeLabel !== undefined);
 
@@ -3516,7 +3544,20 @@ interface ReviewChunkPart extends ReviewerDiff {
   lockfile?: string;
   /** A range part's number, character range, starting line and whether it completes the file, shown above its patch. */
   rangeLabel?: string;
+  /** An official output part's label (`outputStreamParts`), shown above its text in place of a patch. */
+  outputLabel?: string;
+  outputFence?: string;
 }
+
+/** A labelled part of a whole-capture output stream as a chunk part: its own slice of its stream's coverage item. */
+const outputChunkPart = (part: OutputPart): ReviewChunkPart => ({
+  identity: part.repository,
+  diff: part.text,
+  files: [part.path],
+  coverageTargets: [{ file: `${part.repository}:${part.path}`, slice: sliceKey(part.repository, part.path, -2, part.start) }],
+  outputLabel: part.label,
+  outputFence: part.fence,
+});
 
 type ReviewChunkInput = ReviewChunkPart | ReviewerDiff;
 
