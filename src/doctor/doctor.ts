@@ -503,6 +503,8 @@ export class Doctor {
       secretsDir: string;
       capacityDir: string;
     },
+    /** Why the daemon's per-project reviewer file was not applied at start, or null (CEO msg_e91da929). */
+    private readonly reviewerPreferencesRefused: { path: string; reason: string } | null = null,
   ) {
     this.#openedAfterEventId = db.get<{ id: number }>(`SELECT COALESCE(MAX(event_id), 0) AS id FROM audit_events`)?.id ?? 0;
   }
@@ -569,6 +571,7 @@ export class Doctor {
     }
     if (scope === "system") {
       findings.push(...this.checkPacketReviewerScope());
+      findings.push(...this.checkReviewerPreferences());
       findings.push(...this.checkStatePaths());
       findings.push(...(await this.checkHostResources()));
       findings.push(...this.checkClaims());
@@ -1271,6 +1274,23 @@ export class Doctor {
       });
     }
     return findings;
+  }
+
+  /** A per-project reviewer file the daemon refused at start: no project gets its own reviewer until it is fixed. */
+  private checkReviewerPreferences(): Finding[] {
+    if (this.reviewerPreferencesRefused === null) return [];
+    return [{
+      code: ReasonCode.REVIEWER_PREFERENCES_INVALID,
+      severity: "ERROR",
+      scope: "reviewer:project-preferences",
+      blocking: false,
+      confidence: "HIGH",
+      observedEvidence: { ...this.reviewerPreferencesRefused },
+      recommendedAction:
+        'fix the file to { "<projectId>": { provider, model, effort } } naming only providers registered for ' +
+        "BLIND_REVIEWER that can isolate a reviewer, then restart the daemon; " +
+        "until then every project uses the global reviewer preference",
+    }];
   }
 
   /**

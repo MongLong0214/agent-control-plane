@@ -35,7 +35,9 @@ import { RepositoryRegistry } from "../registry/repository-registry.ts";
 import { WorkerCheckouts } from "../registry/worker-checkout.ts";
 import { ConversationalActorRegistry } from "../registry/conversational-actor-registry.ts";
 import { DogfoodFindingStore } from "../quality/upstream-dogfood.ts";
-import { BlindReviewGate, type ReviewerPreference } from "../review/blind-review.ts";
+import {
+  BlindReviewGate, PROJECT_REVIEWER_FILE, resolveProjectReviewerPreferences, type ProjectReviewerFile, type ReviewerPreference,
+} from "../review/blind-review.ts";
 import { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import { type CompletionAuthority, type CompletionAuthoritySet, RunEngine } from "../run/run-engine.ts";
 import { TaskGraph } from "../run/task-graph.ts";
@@ -126,6 +128,11 @@ export interface ControlPlaneConfig {
   hermesGatewayReceipt?: HermesGatewayReceiptPortOptions;
   ctoPreference?: CtoPreference;
   reviewer?: { preferred: ReviewerPreference; fallbacks: ReviewerPreference[] };
+  /**
+   * CEO msg_e91da929 — the daemon's per-project preferred Blind Reviewer file, read once at start by
+   * `defaultConfig()` (`<stateDir>/reviewer-preferences.json`). No agent-facing tool sets it.
+   */
+  reviewerPreferencesFile?: ProjectReviewerFile;
   capacity?: CapacityOptions;
   /**
    * Paths for daemon-owned, provider-only blind-review egress. The endpoint policy itself
@@ -212,7 +219,18 @@ export const defaultConfig = (root = join(homedir(), ".agent-control-plane")): C
   // `<root>/owner-identities`. An absent or empty file means this deployment has no owner,
   // so no human gate can be satisfied; that is the safe reading, not a permissive one.
   ownerIdentities: readOwnerIdentities(join(root, "owner-identities")),
+  reviewerPreferencesFile: readProjectReviewerFile(join(root, PROJECT_REVIEWER_FILE)),
 });
+
+/** The per-project reviewer file's text, null when it does not exist; what failed when it cannot be read. */
+export const readProjectReviewerFile = (path: string): ProjectReviewerFile => {
+  try {
+    return { path, text: readFileSync(path, "utf8") };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path, text: null };
+    return { path, text: null, unreadable: (error as NodeJS.ErrnoException).code ?? "read failed" };
+  }
+};
 
 /**
  * Reads the deployment's declared owner identities, one `channel:actor` per line. Exported
@@ -585,12 +603,36 @@ export class ControlPlane {
         this.db, this.clock, this.audit, this.artifacts, this.#evidenceWriters.VERIFICATION,
         this.repositories, this.worktrees, this.claims, this.guard, this.telemetry,
       );
+      // CEO msg_e91da929 — the per-project reviewers apply only when the whole file does, every provider
+      // registered for BLIND_REVIEWER with an adapter that can isolate a reviewer; otherwise none applies
+      // and the refusal is recorded and reported.
+      const projectReviewers = resolveProjectReviewerPreferences(
+        config.reviewerPreferencesFile ?? { path: PROJECT_REVIEWER_FILE, text: null },
+        (provider) => {
+          try {
+            return this.providers.requireForRole(provider, Role.BLIND_REVIEWER).supportsReviewerIsolation !== false;
+          } catch {
+            return false;
+          }
+        },
+      );
+      if (projectReviewers.refused) {
+        this.audit.record({
+          kind: "REVIEWER_PREFERENCES_REFUSED",
+          reasonCode: ReasonCode.REVIEWER_PREFERENCES_INVALID,
+          evidence: projectReviewers.refused,
+        });
+      }
       this.review = new BlindReviewGate(
         this.clock, this.db, this.audit, this.artifacts, this.#evidenceWriters.BLIND_REVIEW,
         this.sessions, this.bindings, this.providers, this.repositories, this.telemetry,
-        config.reviewer ?? {
-          preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
-          fallbacks: [{ provider: "claude", model: "opus", effort: null }],
+        {
+          ...(config.reviewer ?? {
+            preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
+            fallbacks: [{ provider: "claude", model: "opus", effort: null }],
+          }),
+          // Absent unless an entry applies, so the default preferences are exactly what they were.
+          ...(projectReviewers.byProject.size === 0 ? {} : { projects: projectReviewers.byProject }),
         },
         config.reviewerEgress?.providerEndpoints ?? REVIEWER_PROVIDER_ENDPOINTS,
       );
@@ -715,6 +757,7 @@ export class ControlPlane {
           secretsDir: config.secretsDir,
           capacityDir: config.capacityDir,
         },
+        projectReviewers.refused,
       );
       this.watchdog = new Watchdog(this.db, this.clock, this.audit, this.doctor, this.claims, this.outbox);
       // An attempt the watchdog releases has its reviewer and verification children stopped.

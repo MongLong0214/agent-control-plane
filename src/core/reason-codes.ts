@@ -156,6 +156,8 @@ export const ReasonCode = {
    * for a reviewer — at which point a claim is permanent whether or not the run succeeds.
    */
   PACKET_REVIEWER_SCOPE_UNAVAILABLE: "PACKET_REVIEWER_SCOPE_UNAVAILABLE",
+  /** The daemon's per-project reviewer file could not be applied whole, so no entry of it applies. */
+  REVIEWER_PREFERENCES_INVALID: "REVIEWER_PREFERENCES_INVALID",
   /**
    * A provider adapter's pinned executable is not something that can be spawned.
    *
