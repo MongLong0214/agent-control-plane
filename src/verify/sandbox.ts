@@ -855,6 +855,8 @@ export const __testing = Object.freeze({
   /** The profile `runSandboxed` would apply for these roots, under the daemon environment in force now. */
   seatbeltProfile: (worktreePath: string, scratch: string, denyReadPaths: readonly string[], denyNetwork = false): string =>
     seatbeltProfile(realpathSync(worktreePath), realpathSync(scratch), denyReadPaths, denyNetwork),
+  sandboxNotApplied: (exitCode: number | null, candidateReported: boolean, stderr: string): boolean =>
+    sandboxNotApplied(exitCode, candidateReported, stderr),
   /** Stand in for `xcrun --find`, to place the developer tool where another host would have it. */
   withDeveloperToolFinder: async <T>(finder: DeveloperToolFinder, operation: () => Promise<T>): Promise<T> => {
     const previous = findDeveloperTool;
@@ -915,6 +917,14 @@ const SUPERVISOR_STOP_GRACE_MS = 2_000;
 const STDIO_DRAIN_GRACE_MS = 1_000;
 
 const seatbeltAvailable = (): boolean => existsSync("/usr/bin/sandbox-exec");
+
+/**
+ * Whether sandbox-exec itself refused, before starting anything: exit 65 for a profile it cannot
+ * compile, 71 when `sandbox_apply` is denied (as inside another sandbox), its message on stderr.
+ * Only with no candidate reported, since a candidate that ran could print and exit the same way.
+ */
+const sandboxNotApplied = (exitCode: number | null, candidateReported: boolean, stderr: string): boolean =>
+  !candidateReported && (exitCode === 65 || exitCode === 71) && stderr.startsWith("sandbox-exec:");
 
 /**
  * Runs one verification command under the isolation PRD §17.4 requires.
@@ -1421,6 +1431,18 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   const stderr = stderrChunks.join("");
   const endedAt = new Date().toISOString();
 
+  // sandbox-exec that refuses its profile starts nothing: no candidate was reported, so nothing ran.
+  // That is a sandbox that was not applied, refused as one, not an orphaned self-detaching process.
+  if (!groupOutlivedLeader && sandboxNotApplied(exit.code, candidateReportSeen, stderr)) {
+    return unconfined(
+      command,
+      startedMs,
+      startedAt,
+      mechanism,
+      `sandbox not applied (sandbox-exec exit ${String(exit.code)}); refusing to run unconfined: ${stderr.trim().slice(0, 500)}`,
+    );
+  }
+
   const resourceUnavailable = exit.code === 125 && stderr.includes("ACP_RESOURCE_LIMIT_UNAVAILABLE:");
   const childCleanupUnavailable = stderr.includes("ACP_CHILD_CLEANUP_UNAVAILABLE:");
   if (childCleanupUnavailable) {
@@ -1843,6 +1865,11 @@ const seatbeltProfile = (
     `(allow file-write* (subpath ${quote(scratch)}))`,
     "(allow file-write* (subpath \"/dev\"))",
     "(allow file-write-data (literal \"/dev/null\"))",
+    // A deny command reaches a unix socket only in the worktree or scratch, so it may not rename or
+    // link one in from a cache it can write: that would carry an outside listener through the carve-out.
+    ...(denyNetwork
+      ? [`(deny file-write* (require-all (vnode-type SOCKET) (require-not (subpath ${quote(worktreePath)})) (require-not (subpath ${quote(scratch)}))))`]
+      : []),
     ...secrets.map((path) => `(deny network-outbound (remote unix-socket (subpath ${quote(path)})))`),
     ...perAgentDirectories(worktreePath, scratch)
       .map((dir) => `(deny network-outbound (remote unix-socket (subpath ${quote(dir)})))`),

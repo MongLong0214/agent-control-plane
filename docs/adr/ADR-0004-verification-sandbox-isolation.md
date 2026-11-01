@@ -48,9 +48,12 @@ git reads no global config, credential helper, ignore or attributes file, and np
   Gradle's caches and wrapper distributions, Maven's repository, SwiftPM) — caches only, never a
   toolchain's bin directory, installed toolchain or configuration, where a write would run later
   outside the sandbox;
-- outbound network and local IPC are open, to look up and download dependencies during
-  verification. This is not a publish or deploy right: no credential reaches the command to publish
-  with. `network: "allowlist"` is still refused, because seatbelt cannot enforce destinations.
+- for a command whose contract says `network: "allow"`, outbound network and local IPC are open, to
+  look up and download dependencies during verification. This is not a publish or deploy right: no
+  credential reaches the command to publish with. A command whose contract says `deny`, the default,
+  has IP networking denied, inbound and outbound, and every unix socket outside its worktree and
+  scratch, while binding and connecting its own socket there still works.
+  `network: "allowlist"` is still refused, because seatbelt cannot enforce destinations.
 
 **The guard.** `SANDBOX_SECRET_PATHS` — SSH and GPG keys and their agents, the keychain, GitHub,
 cloud and package-registry credentials, ACP's state root, Hermes, Claude, Codex and Buzz
@@ -68,9 +71,12 @@ sits on the list is unreadable, so Maven with a `~/.m2/settings.xml` or Gradle w
 `~/.gradle/gradle.properties` can fail, and a Node installed under `~/.hermes` cannot run `npm`
 from there.
 
-**Evidence.** The result records what was in force: `networkPolicy: "allow"`,
-`networkEnforced: false`, `readConfinement: "sensitive-paths"`, and `writeConfinement: true`
-meaning writes are confined to the worktree, `TMPDIR` and the named caches. No evidence mode treats
+**Evidence.** The result records what was in force: `networkPolicy` is the command's declared
+`deny` or `allow`, with `networkEnforced: true` only for a `deny` command whose profile was applied,
+`readConfinement: "sensitive-paths"`, and `writeConfinement: true` meaning writes are confined to
+the worktree, `TMPDIR` and the named caches. `networkEnforced: true` means the command's own process
+tree was denied the network; it does not cover a process started through `open`, `osascript` or
+`launchctl`, which runs outside the sandbox (the limit above). No evidence mode treats
 a network denial as part of what it means: `TRUSTED_CI` reads CI's result, and `LOCAL_COMMAND` and
 `BOTH_REQUIRED` read this record.
 

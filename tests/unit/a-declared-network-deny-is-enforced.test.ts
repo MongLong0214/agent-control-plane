@@ -1,7 +1,9 @@
+import type * as ChildProcessModule from "node:child_process";
+import type { SpawnOptions } from "node:child_process";
 import type * as FsModule from "node:fs";
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type AddressInfo, type Server, type Socket } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -20,8 +22,13 @@ import { requireSeatbelt } from "../helpers/seatbelt.ts";
  * cannot be applied the command is refused, never run with the network open.
  */
 
-// One case hides seatbelt, as on a host without it; one makes the profile impossible to build.
-const fault = vi.hoisted(() => ({ hideSeatbelt: false, failProfile: false }));
+// One case hides seatbelt, as on a host without it; one makes the profile impossible to build; two
+// make the real sandbox-exec refuse to apply its profile.
+const fault = vi.hoisted(() => ({
+  hideSeatbelt: false,
+  failProfile: false,
+  sandboxExec: null as null | "bad-profile" | "nested",
+}));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof FsModule>();
   const realpathSync = Object.assign(
@@ -40,9 +47,24 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
+/** An outer profile that applies, so the sandbox-exec run inside it is refused `sandbox_apply` (exit 71). */
+const OUTER_PROFILE = '(version 1)\n(allow default)\n(deny file-read-data (literal "/nonexistent/acp-outer-sandbox"))';
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof ChildProcessModule>();
+  const spawn = ((file: string, args: readonly string[], options: SpawnOptions) => {
+    if (file !== "/usr/bin/sandbox-exec" || fault.sandboxExec === null) return actual.spawn(file, args, options);
+    // A profile sandbox-exec cannot compile (exit 65), or sandbox-exec inside another sandbox (exit 71).
+    return fault.sandboxExec === "bad-profile"
+      ? actual.spawn(file, ["-p", "(version 1)\n(no-such-rule)", ...args.slice(2)], options)
+      : actual.spawn(file, ["-p", OUTER_PROFILE, file, ...args], options);
+  }) as typeof actual.spawn;
+  return { ...actual, spawn };
+});
+
 afterEach(() => {
   fault.hideSeatbelt = false;
   fault.failProfile = false;
+  fault.sandboxExec = null;
   cleanupTempDirs();
 });
 
@@ -119,9 +141,9 @@ const probeSource = (): string => `
   })();
 `;
 
-const probe = async (network: "deny" | "allow", argv: string[] = ["node", "probe.cjs"]) => {
+const probe = async (network: "deny" | "allow", argv: string[] = ["node", "probe.cjs"], source = probeSource()) => {
   const worktree = makeRepo();
-  writeFileSync(join(worktree, "probe.cjs"), probeSource());
+  writeFileSync(join(worktree, "probe.cjs"), source);
   accepted = 0;
   const outcome = await runSandboxed({
     command: parseVerificationCommand({ id: "net-probe", argv, network, timeoutSeconds: 60, maxMemoryMb: 1024 }),
@@ -152,6 +174,7 @@ describe("a declared network deny is enforced", () => {
       "(deny network* (local unix-socket))",
       `(allow network-bind (local unix-socket (subpath "${realpathSync(worktree)}")))`,
       `(allow network-bind (local unix-socket (subpath "${realpathSync(scratch)}")))`,
+      `(deny file-write* (require-all (vnode-type SOCKET) (require-not (subpath "${realpathSync(worktree)}")) (require-not (subpath "${realpathSync(scratch)}"))))`,
     ]);
     expect(denied.filter((line) => !added.includes(line))).toEqual(open);
   });
@@ -175,6 +198,52 @@ describe("a declared network deny is enforced", () => {
     expect(outcome, described(outcome)).toMatchObject({ status: "PASS", enforcement: { networkEnforced: true } });
     expect(connections?.unix).toBe("EPERM");
     expect(reached).toBe(0);
+  });
+
+  it("refuses to rename or link an outside listener in a writable cache into the worktree", async (context) => {
+    requireSeatbelt(context);
+    // A cache the profile lets the command write (SANDBOX_CACHE_HOME_PATHS), under this file's HOME.
+    const cacheDir = join(homedir(), ".npm", "acp-nd1");
+    mkdirSync(cacheDir, { recursive: true });
+    const cached = join(cacheDir, "s.sock");
+    rmSync(cached, { force: true });
+    const listener = createServer((socket) => {
+      accepted += 1;
+      socket.on("error", () => undefined);
+      socket.end("reached\n");
+    });
+    await new Promise<void>((resolveListen, reject) => {
+      listener.once("error", reject);
+      listener.listen(cached, () => resolveListen());
+    });
+    try {
+      const { outcome, connections, accepted: reached } = await probe("deny", ["node", "probe.cjs"], `
+        const fs = require('node:fs');
+        const net = require('node:net');
+        const tried = (operation) => { try { operation(); return 'ok'; } catch (error) { return error.code; } };
+        const attempt = (path) => new Promise((done) => {
+          const socket = net.connect({ path });
+          socket.once('connect', () => { socket.destroy(); done('CONNECTED'); });
+          socket.once('error', (error) => done(error.code));
+        });
+        (async () => {
+          const linked = tried(() => fs.linkSync(${JSON.stringify(cached)}, 'linked.sock'));
+          const linkedConnect = await attempt('linked.sock');
+          const renamed = tried(() => fs.renameSync(${JSON.stringify(cached)}, 'moved.sock'));
+          const renamedConnect = await attempt('moved.sock');
+          console.log(JSON.stringify({ linked, linkedConnect, renamed, renamedConnect }));
+        })();
+      `);
+      expect(outcome, described(outcome)).toMatchObject({
+        status: "PASS",
+        enforcement: { networkPolicy: "deny", networkEnforced: true },
+      });
+      expect(connections).toEqual({ linked: "EPERM", linkedConnect: "ENOENT", renamed: "EPERM", renamedConnect: "ENOENT" });
+      expect(reached).toBe(0);
+    } finally {
+      await new Promise<void>((done) => listener.close(() => done()));
+      rmSync(cacheDir, { recursive: true, force: true });
+    }
   });
 
   it("lets a deny command bind and connect its own unix socket in the worktree", async (context) => {
@@ -239,5 +308,44 @@ describe("a declared network deny is enforced", () => {
     expect(outcome.stderr).toContain("network=deny");
     expect(ran).toBe(false);
     expect(reached).toBe(0);
+  });
+
+  it.for([
+    ["deny", "bad-profile", 65],
+    ["deny", "nested", 71],
+    ["allow", "nested", 71],
+  ] as const)("refuses a %s command whose sandbox was not applied (%s, exit %d), without running it", async ([network, failure, exitCode], context) => {
+    requireSeatbelt(context);
+    fault.sandboxExec = failure;
+    const { outcome, connections, ran, accepted: reached } = await probe(network);
+    expect(outcome, described(outcome)).toMatchObject({
+      status: "ERROR",
+      reasonCode: ReasonCode.SANDBOX_NETWORK_DENIED,
+      enforcement: { mechanism: "seatbelt", networkPolicy: network, networkEnforced: false },
+    });
+    expect(outcome.stderr).toContain(`sandbox not applied (sandbox-exec exit ${exitCode})`);
+    expect(outcome.stderr).toContain("sandbox-exec:");
+    expect(ran).toBe(false);
+    expect(connections).toBeNull();
+    expect(reached).toBe(0);
+  });
+});
+
+describe("a sandbox that was not applied is told apart from an escape", () => {
+  const notApplied = sandboxTesting.sandboxNotApplied;
+  it("names sandbox-exec's own refusals, before any candidate was reported", () => {
+    expect(notApplied(71, false, "sandbox-exec: sandbox_apply: Operation not permitted\n")).toBe(true);
+    expect(notApplied(65, false, "sandbox-exec: unbound variable: no-such-rule at <input string>, line 2\n")).toBe(true);
+  });
+
+  it("does not, once a candidate was reported, since a candidate can print and exit the same way", () => {
+    expect(notApplied(71, true, "sandbox-exec: sandbox_apply: Operation not permitted\n")).toBe(false);
+  });
+
+  it("does not for another exit status or for output that is not sandbox-exec's", () => {
+    expect(notApplied(1, false, "sandbox-exec: sandbox_apply: Operation not permitted\n")).toBe(false);
+    expect(notApplied(null, false, "sandbox-exec: sandbox_apply: Operation not permitted\n")).toBe(false);
+    expect(notApplied(71, false, "")).toBe(false);
+    expect(notApplied(71, false, "node: sandbox-exec: something else\n")).toBe(false);
   });
 });
