@@ -22,13 +22,16 @@ import {
   type MachLaunchSessions,
   type PendingLaunchCredential,
 } from "../../src/daemon/agentcpd.ts";
-import { Role, SessionLifecycle } from "../../src/domain/types.ts";
+import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { SessionLaunchCredential } from "../../src/cto/cto-lifecycle.ts";
 import type { SessionRecord, SessionRegistry } from "../../src/session/session-registry.ts";
 import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { tempDir } from "../helpers/fixtures.ts";
-import { makeHarness } from "../helpers/harness.ts";
+import { BOOTSTRAP_FIXTURE_TOKEN, type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
+import { drivenPrimary } from "../helpers/driven-primary-cto.ts";
+import { makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
 import { __testing as cliAdapterTesting } from "../../src/runtime/cli-adapters.ts";
 
 /**
@@ -819,6 +822,154 @@ exec /bin/sleep 3
       stderr.mockRestore();
       f.harness.cp.close();
     }
+  });
+
+  /**
+   * #1336 R-1 — one MCP connection kept open across requests, so a request after the block is judged by the
+   * connection's per-request re-authentication rather than by a new handshake.
+   */
+  const openMcpConnection = async (socketPath: string, credential: { token: string; sessionId: string; sessionSecret: string }) => {
+    const socket = createConnection(socketPath);
+    socket.setEncoding("utf8");
+    let buffer = "";
+    const waiters = new Map<number, (reply: Record<string, unknown>) => void>();
+    socket.on("data", (chunk: string) => {
+      buffer += chunk;
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        try {
+          const message = JSON.parse(line) as { id?: unknown; result?: { structuredContent?: Record<string, unknown> } };
+          if (typeof message.id === "number") waiters.get(message.id)?.(message.result?.structuredContent ?? (message as Record<string, unknown>));
+        } catch { /* not a JSON-RPC line */ }
+      }
+    });
+    socket.on("error", () => {});
+    await new Promise<void>((resolve) => socket.once("connect", () => resolve()));
+    let next = 1;
+    const request = (method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> => {
+      const id = next++;
+      const answered = new Promise<Record<string, unknown>>((resolve) => waiters.set(id, resolve));
+      socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+      return answered;
+    };
+    socket.write(`${JSON.stringify(credential)}\n`);
+    await request("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "r1-witness", version: "1" } });
+    socket.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`);
+    return {
+      call: (name: string, args: Record<string, unknown>) => request("tools/call", { name, arguments: args }),
+      close: () => socket.destroy(),
+    };
+  };
+
+  /**
+   * #1336 R-1 — W-DB-DOWN's state on a real control plane: an uncertain send while the database is down, so
+   * rotation, the ERROR write and the audit all throw, and the runtime's custody is dropped. The database
+   * reads again afterwards; the row is still READY.
+   */
+  const blockWithDatabaseDown = (addon: MachLaunchAddon, cp: BootstrapRuntimeFixture["harness"]["cp"], sessionId: string, sessionSecret: string): void => {
+    let armed = false;
+    const failing = (what: string) => () => { throw new Error(`SQLITE_IOERR: disk I/O error (${what})`); };
+    const sessions: MachLaunchSessions = {
+      get: (id) => cp.sessions.get(id),
+      verifySecret: (id, secret) => cp.sessions.verifySecret(id, secret),
+      rotateSecret: (id, epoch) => (armed ? failing("rotateSecret")() : cp.sessions.rotateSecret(id, epoch)),
+      transition: (id, to, reason) => (armed ? failing("transition")() : cp.sessions.transition(id, to, reason)),
+    };
+    const session = cp.sessions.require(sessionId);
+    const credential = { sessionId, sessionIncarnation: session.incarnation, externalSessionId: `ext-${sessionId}`, sessionSecret };
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      sendUncertain(addon, {
+        pending: new Map<string, PendingLaunchCredential>(), sessions, audit: { record: failing("audit") },
+        custody: { release: (id) => cp.sessionRuntime.release(id) },
+      }, credential, () => { armed = true; return false; });
+    } finally {
+      stderr.mockRestore();
+    }
+    expect(cp.sessions.require(sessionId).lifecycle).toBe(SessionLifecycle.READY);
+    expect(cp.sessionRuntime.holds(sessionId)).toBe(false);
+  };
+
+  it("#1336 R-1 W-SAME-RUN: after the database-down block, with the database readable again, the old secret is refused at socket authentication", async (ctx) => {
+    const addon = requireMach(ctx);
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const { binding } = await drivenPrimary(f, "r1-same-run");
+      const held = f.claude.credentials.get(binding.sessionId)!;
+      const as = { token: BOOTSTRAP_FIXTURE_TOKEN, sessionId: held.sessionId, sessionSecret: held.sessionSecret };
+      const open = await openMcpConnection(f.ctoSocket, as);
+      try {
+        expect(await open.call("role_dispatch_pending", {})).toMatchObject({ ok: true });
+        blockWithDatabaseDown(addon, cp, binding.sessionId, held.sessionSecret);
+        // The database reads again, and on its own it would still accept the old secret: the row is READY.
+        expect(cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+        expect(cp.sessions.verifySecret(binding.sessionId, held.sessionSecret).allowed).toBe(true);
+        expect(cp.sessionRuntime.holds(binding.sessionId)).toBe(false);
+        // The connection opened before the block: its next request is refused.
+        expect(await open.call("role_dispatch_pending", {})).toMatchObject({ ok: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED });
+        // A new connection: refused at the handshake, naming why, never the secret.
+        const fresh = await callMcpToolOverSocket(f.ctoSocket, as, "role_dispatch_pending", {});
+        expect(fresh).toMatchObject({ ok: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED, evidence: { reason: "DRIVEN_CREDENTIAL_NOT_HELD" } });
+        expect(JSON.stringify(fresh)).not.toContain(held.sessionSecret);
+      } finally {
+        open.close();
+      }
+    });
+  });
+
+  it("#1336 R-1 W-ATTACH: role-attachment issue and revoke take a held driven secret, and refuse it after the database-down block", async (ctx) => {
+    const addon = requireMach(ctx);
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      // The daemon's own attachment authority, as the operator socket reaches it.
+      const attachments = f.daemon.attachments;
+      const { binding } = await drivenPrimary(f, "r1-attach");
+      const held = f.claude.credentials.get(binding.sessionId)!;
+      const subject = { sessionId: binding.sessionId, sessionSecret: held.sessionSecret };
+      expect(cp.sessionRuntime.drivesSession(binding.sessionId, Role.PRIMARY_CTO)).toBe(true);
+      expect(cp.sessionRuntime.holds(binding.sessionId)).toBe(true);
+      // Held: a driven primary issues and revokes as before.
+      const first = attachments.issue({ ...subject, roleKey: binding.roleKey });
+      expect(first).toMatchObject({ allowed: true });
+      expect(attachments.revoke({ ...subject, attachmentId: first.allowed ? first.value.attachmentId : "" })).toMatchObject({ allowed: true });
+      const kept = attachments.issue({ ...subject, roleKey: binding.roleKey });
+      expect(kept).toMatchObject({ allowed: true });
+
+      blockWithDatabaseDown(addon, cp, binding.sessionId, held.sessionSecret);
+      expect(cp.sessions.verifySecret(binding.sessionId, held.sessionSecret).allowed).toBe(true);
+      const notHeld = { allowed: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED, evidence: { sessionId: binding.sessionId, reason: "DRIVEN_CREDENTIAL_NOT_HELD" } };
+      // Each door on its own: a refusal of one does not hide the other.
+      expect.soft(attachments.issue({ ...subject, roleKey: binding.roleKey })).toMatchObject(notHeld);
+      expect.soft(attachments.revoke({ ...subject, attachmentId: kept.allowed ? kept.value.attachmentId : "" })).toMatchObject(notHeld);
+    });
+  });
+
+  it("#1336 R-1 control: an interactive primary CTO's socket authentication does not depend on the runtime holding anything", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const { projectId } = await registerFixtureProject(f.harness, "r1-interactive");
+      const created = cp.sessions.create({ provider: "scripted", model: "r1-interactive-cto" });
+      expect(cp.sessions.transition(created.sessionId, SessionLifecycle.READY, "fixture").allowed).toBe(true);
+      expect(cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId, sessionId: created.sessionId }).allowed).toBe(true);
+      expect(cp.sessionRuntime.drivesSession(created.sessionId, Role.PRIMARY_CTO)).toBe(false);
+      expect(cp.sessionRuntime.holds(created.sessionId)).toBe(false);
+      const as = { token: BOOTSTRAP_FIXTURE_TOKEN, sessionId: created.sessionId, sessionSecret: created.sessionSecret! };
+      expect(await callMcpToolOverSocket(f.ctoSocket, as, "role_dispatch_pending", {})).toMatchObject({ ok: true });
+      const open = await openMcpConnection(f.ctoSocket, as);
+      try {
+        expect(await open.call("role_dispatch_pending", {})).toMatchObject({ ok: true });
+        expect(await open.call("role_dispatch_pending", {})).toMatchObject({ ok: true });
+      } finally {
+        open.close();
+      }
+      // And its role-attachment issue and revoke, with nothing held for it.
+      const roleKey = cp.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId }))!.roleKey;
+      const subject = { sessionId: created.sessionId, sessionSecret: created.sessionSecret! };
+      const issued = f.daemon.attachments.issue({ ...subject, roleKey });
+      expect(issued).toMatchObject({ allowed: true });
+      expect(f.daemon.attachments.revoke({ ...subject, attachmentId: issued.allowed ? issued.value.attachmentId : "" })).toMatchObject({ allowed: true });
+    });
   });
 
   it("#1336 N-2: a respond that throws is followed by a best-effort REFUSED answer, itself guarded", (ctx) => {

@@ -360,6 +360,11 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       }).reasonCode,
     ).toBe(ReasonCode.OK);
 
+    // #1336 R-1 — a BOOTSTRAP_CTO is driven by its role, and its secret authenticates on a socket only while
+    // the daemon's runtime holds it, as it does from the spawn on; this one is given the same custody.
+    expect(harness.cp.sessionRuntime.adopt(bootstrap.sessionId, Role.BOOTSTRAP_CTO, bootstrap.sessionSecret,
+      harness.cp.sessions.require(bootstrap.sessionId).credentialEpoch).allowed).toBe(true);
+
     const stranger = readySession(harness, "other-project-cto");
     expect(
       harness.cp.bindings.bind({

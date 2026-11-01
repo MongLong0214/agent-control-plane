@@ -4480,11 +4480,15 @@ const settleUncertainSend = (
 };
 
 /**
- * #1336 — the strongest block available when an uncertain send's secret could not be shown invalid: the
- * session is marked ERROR, the registry's official path after which `verifySecret` refuses that secret and
- * nothing re-credentials it, and the runtime's held credential for it is dropped, so no turn of it runs and
- * no launch is offered for it. Each step is attempted whether or not another failed; `blocked` is true only
- * when the secret was then seen to stop verifying. Nothing here resumes the session.
+ * #1336 — the strongest block available when an uncertain send's secret could not be shown invalid. The
+ * runtime's held credential for the session is dropped: no turn of it runs, no launch is offered for it, and
+ * its secret no longer authenticates on a socket (`drivenCredentialNotHeld`), whether or not any database
+ * write below succeeds, and after a restart too, since nothing is held until recovery rotates and adopts.
+ * The session is also marked ERROR where the registry can write it, after which `verifySecret` refuses the
+ * secret and nothing re-credentials the session; `blocked` is true only when the secret was then seen to
+ * stop verifying. If the ERROR write failed, the row stays READY and continuity's recovery may later resume
+ * the session on a newly rotated secret, which invalidates the old one. Each step is attempted whether or
+ * not another failed, and nothing here resumes the session itself.
  */
 const blockSessionAfterUncertainSend = (
   sessions: MachLaunchSessions,
@@ -4898,6 +4902,8 @@ const authenticateSocketPeer = (
     if (admission.pendingHandoffAck && session.value.lifecycle === SessionLifecycle.READY) {
       const pending = currentPendingNormalHandoff(cp, credential.sessionId);
       if (pending.allowed) {
+        const notHeld = drivenCredentialNotHeld(cp, credential.sessionId, null);
+        if (notHeld) return notHeld;
         return allow(ReasonCode.OK, {
           kind: "PENDING_HANDOFF_ACK",
           handoffId: pending.value.handoffId,
@@ -4919,6 +4925,8 @@ const authenticateSocketPeer = (
       role: candidate.role,
     });
   }
+  const notHeld = drivenCredentialNotHeld(cp, credential.sessionId, candidate.role);
+  if (notHeld) return notHeld;
   const authenticated = cp.bindings.authenticateBoundSession({
     roleKey: candidate.roleKey,
     sessionId: credential.sessionId,
@@ -4990,6 +4998,24 @@ const currentPendingNormalHandoff = (
   return allow(ReasonCode.OK, {
     handoffId: handoff.handoff_id,
     fromGeneration: handoff.from_generation,
+  });
+};
+
+/**
+ * #1336 R-1 — a driven session's secret authenticates on a socket only while the daemon's session runtime
+ * holds that session's current credential. The runtime adopts it (spawn, or recovery after rotating) before
+ * any relayed turn can present it, and drops it when it may have leaked (`blockSessionAfterUncertainSend`)
+ * or the runtime is lost, so a secret the registry would still verify — a READY row whose ERROR write
+ * failed, or any row after a restart — is refused until recovery rotates and adopts a new one. `role` is
+ * the binding the connection is judged under; an unbound connection is judged by the session's
+ * driven-spawn record alone. Interactive sessions are not driven and are not affected.
+ */
+const drivenCredentialNotHeld = (cp: ControlPlane, sessionId: string, role: Role | null): Decision<never> | null => {
+  const runtime = cp.sessionRuntime;
+  if (!runtime.drivesSession(sessionId, role ?? Role.PRIMARY_CTO) || runtime.holds(sessionId)) return null;
+  return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "the daemon holds no current credential for this driven session", {
+    sessionId,
+    reason: "DRIVEN_CREDENTIAL_NOT_HELD",
   });
 };
 
@@ -5123,6 +5149,8 @@ const peerAuthenticator =
           expectedGeneration: opening.fromGeneration,
         });
       }
+      const notHeld = drivenCredentialNotHeld(cp, credential.sessionId, null);
+      if (notHeld) return notHeld;
       return allow(ReasonCode.OK, authenticatedPeer(credential, opening.sessionIncarnation));
     }
 
@@ -5133,6 +5161,8 @@ const peerAuthenticator =
         { sessionId: credential.sessionId, lifecycle: session.value.lifecycle, role: opening.binding.role },
       );
     }
+    const notHeld = drivenCredentialNotHeld(cp, credential.sessionId, opening.binding.role);
+    if (notHeld) return notHeld;
     const bound = cp.bindings.authenticateBoundSession({
       roleKey: opening.binding.roleKey,
       sessionId: credential.sessionId,
@@ -5209,6 +5239,8 @@ const conversationPeerAuthenticator =
         { sessionId: credential.sessionId, lifecycle: session.value.lifecycle, role },
       );
     }
+    const notHeld = drivenCredentialNotHeld(cp, credential.sessionId, role);
+    if (notHeld) return notHeld;
     return allow(ReasonCode.OK, authenticatedPeer(credential, sessionIncarnation));
   };
 

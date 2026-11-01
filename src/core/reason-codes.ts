@@ -289,10 +289,11 @@ export const ReasonCode = {
   /**
    * #1336 — a driven turn's Mach reply send was uncertain and the secret it carried could not be shown
    * invalid: its rotation was refused while it still verified, or the rotation or the check failed. The
-   * session is marked ERROR so that secret authenticates nothing (`blocked: true` once it is seen to stop
-   * verifying) and the runtime's held credential for it is dropped (`custodyReleased`), so no turn of it
-   * runs and no launch is offered for it. If the transition failed too the evidence says `blocked: false`.
-   * Either way the session is not resumed normally. Never the credential.
+   * runtime's held credential for the session is dropped (`custodyReleased`), so no turn of it runs, no
+   * launch is offered for it and its secret is refused at socket authentication until recovery rotates and
+   * adopts a new one. Where the registry could write it, the session is also marked ERROR (`blocked: true`
+   * once the secret is seen to stop verifying); if that write failed (`blocked: false`), continuity's
+   * recovery may later resume the session on a newly rotated secret. Never the credential.
    */
   MACH_LAUNCH_SECRET_NOT_INVALIDATED: "MACH_LAUNCH_SECRET_NOT_INVALIDATED",
   /**
