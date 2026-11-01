@@ -24,8 +24,23 @@ export const takeBackV50 = (raw: Database.Database): void => {
 /** The only definitions v55 replaces, named independently of the migration. */
 export const V55_CHANGED_GUARDS = ["runs_state_transition_guard", "runs_state_transition_authority_guard"];
 
-/** A fixture built from a current database that claims to predate v55 holds v54's state guards. */
+/** The only definition v56 replaces, named independently of the migration. */
+export const V56_CHANGED_GUARDS = ["projects_active_manifest_moves_by_grant"];
+
+/** A fixture built from a current database that claims to predate v56 holds v55's manifest-pointer guard. */
+export const takeBackV56 = (raw: Database.Database): void => {
+  const snapshot = readFileSync(new URL("../../src/db/schema-v55.sql", import.meta.url), "utf8");
+  for (const name of V56_CHANGED_GUARDS) {
+    const ddl = new RegExp(`CREATE TRIGGER IF NOT EXISTS ${name}\\n[\\s\\S]*?\\nEND;`).exec(snapshot)?.[0];
+    if (!ddl) throw new Error(`${name} is absent from the v55 snapshot`);
+    raw.exec(`DROP TRIGGER IF EXISTS ${name}`);
+    raw.exec(ddl);
+  }
+};
+
+/** A fixture built from a current database that claims to predate v55 holds v54's state guards (and v55's pointer guard). */
 export const takeBackV55 = (raw: Database.Database): void => {
+  takeBackV56(raw);
   const snapshot = readFileSync(new URL("../../src/db/schema-v54.sql", import.meta.url), "utf8");
   for (const name of V55_CHANGED_GUARDS) {
     const ddl = new RegExp(`CREATE TRIGGER IF NOT EXISTS ${name}\\n[\\s\\S]*?\\nEND;`).exec(snapshot)?.[0];

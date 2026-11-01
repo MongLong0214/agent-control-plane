@@ -1676,6 +1676,12 @@ END;
 -- a project inserts its first manifest and is not an update.
 -- v45 (#512): or, from NULL only, by the project's consumed first-activation grant naming the new
 -- manifest. For any non-NULL old value the body decides exactly as v44's did.
+-- v56 (#1234): or, from NULL only, by the WRITTEN, unretired application of a PROJECT_BOOTSTRAP run that
+-- reserved exactly this project and this manifest digest, whose first RUN_CREATED record (the one written with
+-- the run row) carries the canonical-CTO adoption the control plane validated and stored: this project, the
+-- run's own owner session and
+-- generation, and the conversation session UUID and Buzz actor of the project's unrevoked entitlement.
+-- A record without all of that, or a WRITTEN application of a run created without it, moves nothing.
 CREATE TRIGGER IF NOT EXISTS projects_active_manifest_moves_by_grant
 BEFORE UPDATE OF active_manifest_digest ON projects
 WHEN NEW.active_manifest_digest IS NOT OLD.active_manifest_digest
@@ -1691,6 +1697,29 @@ WHEN NEW.active_manifest_digest IS NOT OLD.active_manifest_digest
    WHERE f.project_id = NEW.project_id
      AND f.manifest_digest IS NEW.active_manifest_digest
      AND f.consumed_at IS NOT NULL
+))
+ AND NOT (OLD.active_manifest_digest IS NULL AND EXISTS (
+  SELECT 1 FROM bootstrap_applications b
+    JOIN runs r ON r.run_id = b.run_id AND r.kind = 'PROJECT_BOOTSTRAP'
+    JOIN audit_events e ON e.event_id = (
+      SELECT MIN(x.event_id) FROM audit_events x WHERE x.run_id = b.run_id AND x.kind = 'RUN_CREATED')
+    JOIN canonical_session_entitlements c ON c.project_id = NEW.project_id AND c.revoked_at IS NULL
+   WHERE b.project_id = NEW.project_id
+     AND b.manifest_digest IS NEW.active_manifest_digest
+     AND b.phase = 'WRITTEN'
+     AND b.retired_at IS NULL
+     AND CASE WHEN json_valid(e.evidence_json) THEN
+           json_type(e.evidence_json, '$.adoptCanonicalCto') = 'object'
+           AND json_extract(e.evidence_json, '$.adoptCanonicalCto.projectId') IS NEW.project_id
+           AND json_type(e.evidence_json, '$.adoptCanonicalCto.sessionId') = 'text'
+           AND json_extract(e.evidence_json, '$.adoptCanonicalCto.sessionId') IS r.owner_session_id
+           AND json_type(e.evidence_json, '$.adoptCanonicalCto.bindingGeneration') = 'integer'
+           AND json_extract(e.evidence_json, '$.adoptCanonicalCto.bindingGeneration') IS r.owner_binding_generation
+           AND json_type(e.evidence_json, '$.adoptCanonicalCto.entitlementSessionUuid') = 'text'
+           AND json_extract(e.evidence_json, '$.adoptCanonicalCto.entitlementSessionUuid') IS c.session_uuid
+           AND json_type(e.evidence_json, '$.adoptCanonicalCto.buzzActorId') = 'text'
+           AND json_extract(e.evidence_json, '$.adoptCanonicalCto.buzzActorId') IS c.buzz_actor_id
+         ELSE 0 END
 ))
 BEGIN
   SELECT RAISE(ABORT, 'MANIFEST_ACTIVATION_AUTHORITY_DENIED');

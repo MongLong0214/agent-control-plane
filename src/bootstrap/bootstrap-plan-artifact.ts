@@ -15,6 +15,7 @@ import type { RunEngine } from "../run/run-engine.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { BootstrapApplications } from "./bootstrap-applications.ts";
+import { recordedBootstrapAdoption } from "./bootstrap-adoption-input.ts";
 import { bootstrapPlanInputSchema, type submittedTasksSchema } from "./plan-input-schema.ts";
 
 // Leaves room for JSON escaping and the MCP envelope within the existing 1 MiB line limit.
@@ -195,6 +196,31 @@ export const bootstrapStagingIdentity = (source: StageSource, peer: Authenticate
 };
 
 /**
+ * The run a PLAN candidate is staged for: project-less, with a current owner that is either its
+ * run-scoped BOOTSTRAP_CTO (any current PRIMARY_CTO may stage), or the canonical CTO the run adopted.
+ * An adopting run is admitted only on the adoption ACP recorded with RUN_CREATED, never on the owner
+ * pin's role label: the pin must name that record's project, session and generation, and the stager
+ * must be that very owner, on the pinned incarnation and generation.
+ */
+const stagingRunOwner = (source: Source, run: RunRow, primary: RoleBinding): Decision<void> => {
+  const refused = deny<void>(ReasonCode.MCP_PEER_UNAUTHENTICATED, "staging requires a project-less bootstrap run with its current run-scoped owner");
+  if (run.projectId !== null || !run.ownerSessionId) return refused;
+  if (run.ownerRoleKey === roleKeyFor(Role.BOOTSTRAP_CTO, { runId: run.runId })) return allow(ReasonCode.OK, undefined);
+  const adoption = recordedBootstrapAdoption(source.db, run.runId);
+  if (!adoption || run.ownerRoleKey !== roleKeyFor(Role.PRIMARY_CTO, { projectId: adoption.projectId })
+      || run.ownerSessionId !== adoption.sessionId || run.ownerBindingGeneration !== adoption.bindingGeneration) {
+    return refused;
+  }
+  if (primary.roleKey !== run.ownerRoleKey || primary.sessionId !== run.ownerSessionId
+      || primary.sessionIncarnation !== run.ownerSessionIncarnation || primary.bindingGeneration !== run.ownerBindingGeneration) {
+    return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "staging for an adopting bootstrap requires its adopted canonical CTO", {
+      refusal: "ADOPTION_STAGER_NOT_OWNER",
+    });
+  }
+  return allow(ReasonCode.OK, undefined);
+};
+
+/**
  * No provenance links a PRIMARY_CTO to a project-less bootstrap run. This is a non-authoritative
  * upload of immutable candidates, with at most one unattached candidate per stager. Only CEO attach selects run input;
  * neither the stager's generation nor the run's owner pin is part of the candidate's identity.
@@ -218,9 +244,8 @@ export const bootstrapPlanStageAccess = (source: StageSource, peer: Authenticate
   const current = currentBootstrapInputRun(source, input.runId);
   if (!current.allowed) return current;
   const run = current.value;
-  if (run.projectId !== null || !run.ownerSessionId || run.ownerRoleKey !== roleKeyFor(Role.BOOTSTRAP_CTO, { runId: run.runId })) {
-    return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "staging requires a project-less bootstrap run with its current run-scoped owner");
-  }
+  const owned = stagingRunOwner(source, run, primary);
+  if (!owned.allowed) return owned;
   const checked = validateBody(run, input.planBody, input);
   if (!checked.allowed) return checked;
   const candidates = candidatesOf(source, run.runId, primary.roleKey);

@@ -49,6 +49,13 @@ import {
   unresolvedCreationAttempt,
 } from "./task-write-target.ts";
 import { type HermesAdmittedTurn, hermesTurnEvidence } from "../mcp/hermes-provenance.ts";
+import {
+  BOOTSTRAP_ADOPTION_EVIDENCE_FIELD,
+  type CanonicalCtoBootstrapAdoption,
+  type RecordedBootstrapAdoption,
+  parseBootstrapAdoption,
+  recordedBootstrapAdoption,
+} from "../bootstrap/bootstrap-adoption-input.ts";
 
 /** PRD §13.1 — the authoritative specification Hermes writes. */
 export interface TaskContract {
@@ -138,6 +145,13 @@ export interface CreateRunInput {
   }>;
   /** The Hermes turn the CEO door admitted this call for, recorded in RUN_CREATED; absent in process. */
   hermesTurn?: HermesAdmittedTurn;
+  /**
+   * A PROJECT_BOOTSTRAP run only: adopt this exact canonical CTO (project, session, binding generation)
+   * as the run's owner instead of staffing a BOOTSTRAP_CTO, and connect its project instead of
+   * provisioning a resident. Validated before anything is stored and recorded with RUN_CREATED.
+   * Absent, the bootstrap is exactly the default one.
+   */
+  adoptCanonicalCto?: CanonicalCtoBootstrapAdoption | null;
 }
 
 /** Provisioning a primary CTO belongs to the CTO lifecycle; the run engine only asks. */
@@ -167,6 +181,20 @@ export interface BootstrapCtoProvisioner {
   bindForDispatch(runId: string, staffed: BootstrapCtoStaffedSession): Decision<RoleBinding>;
   discard(staffed: BootstrapCtoStaffedSession, reason: string): Promise<void>;
   release(runId: string, reason: string): void;
+}
+
+/**
+ * The explicit canonical-CTO adoption of a PROJECT_BOOTSTRAP run, which the run engine only asks about
+ * (`CanonicalCtoBootstrapAdoptions` answers). `admitAtCreation` validates a run_create request and
+ * answers the record ACP stores for it (the entitlement read here, never the requester's); `admit`
+ * validates the recorded adoption at dispatch, its process
+ * included, and answers the binding in owner-pin form; `stillHeld` asks again, without a process probe,
+ * inside the dispatch transaction that pins it.
+ */
+export interface BootstrapAdoptionPort {
+  admitAtCreation(adoption: CanonicalCtoBootstrapAdoption): Decision<RecordedBootstrapAdoption>;
+  admit(adoption: RecordedBootstrapAdoption): Decision<RoleBinding>;
+  stillHeld(adoption: RecordedBootstrapAdoption, admitted: RoleBinding): Decision<RoleBinding>;
 }
 
 /**
@@ -348,6 +376,7 @@ const CONTINUITY_HOLD_MUTATING_KINDS: readonly string[] = [
   "CLAIM_ACQUIRED", "CLAIM_RELEASED", "SOURCE_READ_LEASE_ACQUIRED", "SOURCE_READ_LEASE_RELEASED",
   "MANAGED_WRITE_GUARD", "MANAGED_WRITE_GUARD_CONSUMED", "MANAGED_WRITE_GUARD_REVOKED",
   "REPOSITORY_TEMPORARY_BINDING", "MANIFEST_ACTIVATION_CONSUMER_BOUND", "PROJECT_MANIFEST_ACTIVATED",
+  "PROJECT_MANIFEST_ADOPTED_BY_BOOTSTRAP",
   "STANDARD_WORK_CONTINUATION_WAKE", "BOOTSTRAP_PLAN_RECOVERY_WAKE", "BOOTSTRAP_RESULT_RECOVERY_WAKE",
   "BOOTSTRAP_REVIEW_RETRY_WAKE", "BOOTSTRAP_PLAN_TASKS", "BOOTSTRAP_TASKS_SUPERSEDED", "BOOTSTRAP_TASK_SETTLED",
   "BOOTSTRAP_CTO_SESSION_SPAWNED", "BOOTSTRAP_CTO_PROVISIONED", "BOOTSTRAP_CTO_RECOVERED", "BOOTSTRAP_ACTIVATED", "BOOTSTRAP_ACTIVATION_INCOMPLETE",
@@ -417,6 +446,7 @@ export class RunEngine {
 
   #cto: CtoProvisioner | null = null;
   #bootstrapCto: BootstrapCtoProvisioner | null = null;
+  #bootstrapAdoption: BootstrapAdoptionPort | null = null;
   #workerRetirement: WorkerRetirementPort | null = null;
   #cancelSettlement: CancelSettlementPort | null = null;
   #capacity: CapacityGate | null = null;
@@ -447,6 +477,7 @@ export class RunEngine {
   attach(ports: {
     cto?: CtoProvisioner;
     bootstrapCto?: BootstrapCtoProvisioner;
+    bootstrapAdoption?: BootstrapAdoptionPort;
     workerRetirement?: WorkerRetirementPort;
     cancelSettlement?: CancelSettlementPort;
     capacity?: CapacityGate;
@@ -455,6 +486,7 @@ export class RunEngine {
   }): void {
     if (ports.cto) this.#cto = ports.cto;
     if (ports.bootstrapCto) this.#bootstrapCto = ports.bootstrapCto;
+    if (ports.bootstrapAdoption) this.#bootstrapAdoption = ports.bootstrapAdoption;
     if (ports.workerRetirement) this.#workerRetirement = ports.workerRetirement;
     if (ports.cancelSettlement) this.#cancelSettlement = ports.cancelSettlement;
     if (ports.capacity) this.#capacity = ports.capacity;
@@ -491,6 +523,25 @@ export class RunEngine {
     });
     if (input.projectId && !this.projects.get(input.projectId)) {
       return deny(ReasonCode.NOT_FOUND, "unknown project", { projectId: input.projectId });
+    }
+    // The explicit adoption input: a bootstrap's only, validated against its exact target before
+    // anything is stored. A wrong session, a stale generation or another project's CTO stores nothing.
+    let adoption: RecordedBootstrapAdoption | null = null;
+    if (input.adoptCanonicalCto !== undefined && input.adoptCanonicalCto !== null) {
+      if (kind !== RunKind.PROJECT_BOOTSTRAP) {
+        return deny(ReasonCode.INVALID_ARGUMENT, "only a PROJECT_BOOTSTRAP run adopts a canonical CTO", {
+          refusal: "ADOPTION_REQUIRES_BOOTSTRAP",
+          kind,
+        });
+      }
+      const parsed = parseBootstrapAdoption(input.adoptCanonicalCto);
+      if (!parsed.allowed) return parsed as Decision<RunRow>;
+      if (!this.#bootstrapAdoption) {
+        return deny(ReasonCode.INTERNAL_ERROR, "no canonical CTO adoption validator is attached", { refusal: "ADOPTION_UNAVAILABLE" });
+      }
+      const admitted = this.#bootstrapAdoption.admitAtCreation(parsed.value);
+      if (!admitted.allowed) return admitted as Decision<RunRow>;
+      adoption = admitted.value;
     }
 
     return this.db.tx(() => {
@@ -552,7 +603,7 @@ export class RunEngine {
         normalizeHarnessIdentity(input.baselineHarness, Number.isInteger(schemaVersion) ? schemaVersion : null),
       );
       if (!harness.allowed) fail(harness.reasonCode, harness.message, harness.evidence);
-      this.audit.record({
+      const recorded = this.audit.record({
         kind: "RUN_CREATED",
         runId,
         projectId: input.projectId ?? null,
@@ -564,8 +615,17 @@ export class RunEngine {
           humanGate: humanGate.items,
           humanGateRequired: humanGate.required,
           ...hermesTurnEvidence(input.hermesTurn),
+          ...(adoption ? { [BOOTSTRAP_ADOPTION_EVIDENCE_FIELD]: adoption } : {}),
         },
       });
+      // The adoption is read back from this very record by every later door; a record that did not
+      // keep it exactly would turn the run into a default bootstrap, so the whole creation rolls back.
+      if (adoption) {
+        const readBack = recordedBootstrapAdoption(this.db, runId);
+        if (!recorded.allowed || digestOf(readBack) !== digestOf(adoption)) {
+          fail(ReasonCode.AUDIT_WRITE_FAILED, "the run's canonical CTO adoption could not be recorded exactly", { refusal: "ADOPTION_NOT_RECORDED" });
+        }
+      }
 
       return allow(ReasonCode.OK, this.require(runId));
     });
@@ -601,11 +661,18 @@ export class RunEngine {
     }
 
     let binding: RoleBinding | null = null;
+    // A bootstrap created with the explicit adoption input is owned by exactly that canonical CTO,
+    // validated again now: no BOOTSTRAP_CTO is staffed for it, and a refusal never falls back to one.
+    const adoption = !run.projectId && run.kind === RunKind.PROJECT_BOOTSTRAP ? recordedBootstrapAdoption(this.db, runId) : null;
     // Issue #246 — a project-less PROJECT_BOOTSTRAP run's owner is the BOOTSTRAP_CTO this dispatch
     // staffs: a live binding a re-dispatch reuses, or a fresh one. Refusals that need no provider
     // (an earlier holder, a foreign pin) come before capacity, as a pinned owner's do.
-    const staffsBootstrapCto = !run.projectId && run.kind === RunKind.PROJECT_BOOTSTRAP;
-    if (staffsBootstrapCto) {
+    const staffsBootstrapCto = !run.projectId && run.kind === RunKind.PROJECT_BOOTSTRAP && adoption === null;
+    if (adoption) {
+      const admitted = this.admitAdoptedOwner(run, adoption);
+      if (!admitted.allowed) return admitted as Decision<RunRow>;
+      binding = admitted.value;
+    } else if (staffsBootstrapCto) {
       if (!this.#bootstrapCto) return deny(ReasonCode.INTERNAL_ERROR, "no bootstrap CTO staffing attached", { runId });
       const admitted = this.#bootstrapCto.admit(run);
       if (!admitted.allowed) return admitted as Decision<RunRow>;
@@ -669,7 +736,7 @@ export class RunEngine {
 
     let activated: Decision<RunRow>;
     try {
-      activated = this.activateDispatched(runId, binding, staffed, options.hermesTurn);
+      activated = this.activateDispatched(runId, binding, staffed, options.hermesTurn, adoption);
     } catch (error) {
       if (staffed) await this.#bootstrapCto!.discard(staffed, "bootstrap dispatch failed");
       throw error;
@@ -689,6 +756,7 @@ export class RunEngine {
     provisioned: RoleBinding | null,
     staffed: BootstrapCtoStaffedSession | null,
     hermesTurn: HermesAdmittedTurn | undefined,
+    adoption: RecordedBootstrapAdoption | null = null,
   ): Decision<RunRow> {
     return this.db.txDecision(() => {
       const fresh = this.require(runId);
@@ -696,6 +764,15 @@ export class RunEngine {
       if (!transition.allowed) return transition as Decision<RunRow>;
 
       let binding = provisioned;
+      if (adoption) {
+        // The awaits since admission can let the role move: asked again where the owner is pinned.
+        if (!binding || !this.#bootstrapAdoption) {
+          return deny(ReasonCode.INTERNAL_ERROR, "the adopted owner was not admitted", { runId, refusal: "ADOPTION_UNAVAILABLE" });
+        }
+        const held = this.#bootstrapAdoption.stillHeld(adoption, binding);
+        if (!held.allowed) return held as Decision<RunRow>;
+        binding = held.value;
+      }
       if (staffed) {
         const bound = this.#bootstrapCto!.bindForDispatch(runId, staffed);
         if (!bound.allowed) return bound as Decision<RunRow>;
@@ -940,6 +1017,30 @@ export class RunEngine {
         ? { role: run.projectId ? Role.PRIMARY_CTO : freshBootstrapCto ? Role.BOOTSTRAP_CTO : binding!.role }
         : {}),
     });
+  }
+
+  /**
+   * The owner of a bootstrap created with the adoption input: the adopted canonical CTO's binding,
+   * validated now. A re-dispatch keeps that owner, so a pin, once set, must still name it exactly.
+   */
+  private admitAdoptedOwner(run: RunRow, adoption: RecordedBootstrapAdoption): Decision<RoleBinding> {
+    if (!this.#bootstrapAdoption) {
+      return deny(ReasonCode.INTERNAL_ERROR, "no canonical CTO adoption validator is attached", { runId: run.runId, refusal: "ADOPTION_UNAVAILABLE" });
+    }
+    const pinned = run.ownerRoleKey !== null || run.ownerSessionId !== null;
+    if (
+      pinned &&
+      (run.ownerRoleKey !== roleKeyFor(Role.PRIMARY_CTO, { projectId: adoption.projectId }) ||
+        run.ownerSessionId !== adoption.sessionId ||
+        run.ownerBindingGeneration !== adoption.bindingGeneration)
+    ) {
+      return deny(ReasonCode.RUN_OWNER_REVOKED, "the run's owner pin is not its adopted canonical CTO", {
+        runId: run.runId,
+        refusal: "ADOPTION_OWNER_NOT_PINNED",
+        ownerRoleKey: run.ownerRoleKey,
+      });
+    }
+    return this.#bootstrapAdoption.admit(adoption);
   }
 
   /** A projectless run's owner is already pinned, so its provider is a stored fact. */
@@ -1718,7 +1819,11 @@ export class RunEngine {
 
   ownerRoleKeyFor(run: RunRow): string | null {
     if (run.ownerRoleKey) return run.ownerRoleKey;
-    if (run.kind === RunKind.PROJECT_BOOTSTRAP) return roleKeyFor(Role.BOOTSTRAP_CTO, { runId: run.runId });
+    if (run.kind === RunKind.PROJECT_BOOTSTRAP) {
+      const adoption = run.projectId === null ? recordedBootstrapAdoption(this.db, run.runId) : null;
+      if (adoption) return roleKeyFor(Role.PRIMARY_CTO, { projectId: adoption.projectId });
+      return roleKeyFor(Role.BOOTSTRAP_CTO, { runId: run.runId });
+    }
     return run.projectId ? roleKeyFor(Role.PRIMARY_CTO, { projectId: run.projectId }) : null;
   }
 

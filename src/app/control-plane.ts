@@ -1,6 +1,7 @@
 import { verifyReviewGithubEntry } from "../bootstrap/bootstrap-review-evidence-github.ts";
 import { GhCliGitHubClient } from "../bootstrap/github-write-port.ts";
 import { ResidentProjectProvisioning } from '../bootstrap/resident-project-provisioning.ts';
+import { CanonicalCtoBootstrapAdoptions } from "../bootstrap/canonical-cto-bootstrap-adoption.ts";
 import { ExecFileHostProjectProvisioner, type HostProjectProvisioner } from '../runtime/host-project-provisioner.ts';
 import { dirname, join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
@@ -336,6 +337,8 @@ export class ControlPlane {
   readonly residentProjects: ResidentProjectProvisioning;
   /** #1227 — moves each resident project's worker turns off the resident's clone, into their own checkout. */
   readonly workerCheckouts: WorkerCheckouts;
+  /** The explicit canonical-CTO adoption of a PROJECT_BOOTSTRAP run: one validator for every door. */
+  readonly bootstrapAdoptions: CanonicalCtoBootstrapAdoptions;
   readonly bootstrap: BootstrapActivation;
   /** Issue #246 — performs a bootstrap plan's GitHub writes, then hands the result to `bootstrap`. */
   readonly bootstrapProducer: RepoFactoryBootstrapRunner;
@@ -725,10 +728,14 @@ export class ControlPlane {
         ? new ExecFileHostProjectProvisioner(hostScript,residentHome,dirname(config.databasePath),120_000,config.databasePath) : null);
       this.residentProjects = new ResidentProjectProvisioning(this.db,this.clock,
         this.hostProjectProvisioner,residentHome,locations.stateRoot);
+      this.bootstrapAdoptions = new CanonicalCtoBootstrapAdoptions({
+        db: this.db, bindings: this.bindings, sessions: this.sessions, projects: this.projects,
+      });
       this.bootstrap = new BootstrapActivation(
         this.db, this.clock, this.audit, this.artifacts, this.projects, this.repositories,
         this.runs, this.bindings, this.sessions, this.cto, this.doctor, this.ceo, this.outbox, this.residentProjects, !config.allowTestEvidenceWriters,
       );
+      this.bootstrap.attachCanonicalAdoptions(this.bootstrapAdoptions);
 
       this.sessionAttestations = new SessionAttestations(this.sessions, this.audit);
       this.sessionRuntime = new ProvisionedSessionRuntime({
@@ -785,6 +792,7 @@ export class ControlPlane {
           plannedProvider: (projectId) => this.cto.plannedProvider(projectId),
         },
         bootstrapCto: this.bootstrapCtos,
+        bootstrapAdoption: this.bootstrapAdoptions,
         workerRetirement: this.workerRetirement,
         // The target has to survive the port: dropping it here is what made every dispatch
         // ask "is any provider healthy?" instead of "is the one this run will use healthy?".
@@ -820,6 +828,7 @@ export class ControlPlane {
         bindings: this.bindings,
         projects: this.projects,
         repositories: this.repositories,
+        adoptions: this.bootstrapAdoptions,
         // #246 B3 — runs only for a manifest whose CommitLore mode is required.
         commitlore: config.repoFactory?.commitlore ?? createCommitLoreCliPort(),
         // #1271 — a CommitLore observation that did not pass is recorded as an upstream dogfood finding.

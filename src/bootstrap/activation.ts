@@ -44,6 +44,7 @@ import {
 import { commitloreActivationGate } from "./commitlore-observation.ts";
 import type { RepoFactoryResult } from "./repo-factory-result.ts";
 import { parseRepoFactoryResult } from "./repo-factory-result.ts";
+import { type AdoptedCanonicalCto, CanonicalCtoBootstrapAdoptions } from "./canonical-cto-bootstrap-adoption.ts";
 
 /** Integration §13.5 — the activation facts only the control plane may state. */
 export interface ACPBootstrapActivationResult {
@@ -64,6 +65,20 @@ export interface ACPBootstrapActivationResult {
   /** G0a (RF-018) — what this activation did not observe, said rather than passed over silently. */
   warnings: ActivationWarning[];
   provisioning?: ProvisioningEvidence;
+  /**
+   * Present only for a bootstrap created with the explicit canonical-CTO adoption: the existing
+   * conversation that owns the project, kept as it was (no resident, no new session, no new Buzz
+   * identity or room), and the GitHub node id of the repository this run created and connected.
+   */
+  canonicalCtoAdoption?: {
+    sessionId: string;
+    bindingGeneration: number;
+    conversationUuid: string;
+    buzzActorId: string;
+    buzzAddress: string | null;
+    repositoryIdentity: string;
+    repositoryNodeId: string;
+  };
 }
 
 /**
@@ -170,9 +185,47 @@ export class BootstrapActivation {
     private readonly outbox: Outbox,
     private readonly residentProjects?: ResidentProjectProvisioning,
     readonly residentGenesisRequired = true,
-  ) {}
+  ) {
+    this.#adoptions = new CanonicalCtoBootstrapAdoptions({ db, bindings, sessions, projects });
+  }
 
   #completionChain: BootstrapCompletionChainPort | null = null;
+  #adoptions: CanonicalCtoBootstrapAdoptions;
+
+  /** The composition root's one adoption validator, so every door asks the same instance. */
+  attachCanonicalAdoptions(adoptions: CanonicalCtoBootstrapAdoptions): void {
+    this.#adoptions = adoptions;
+  }
+
+  /**
+   * An adopting bootstrap's target, asked before the first mutation and again in the registration
+   * transaction: the run is pinned to its adopted canonical CTO, that CTO is still exactly the
+   * adopted session at the adopted generation (live, authenticated, entitled, on its own Buzz route),
+   * and the project the manifest names is that CTO's own, manifest-less one.
+   */
+  private adoptionHolds(
+    runId: string,
+    approvedManifest: ProjectManifest,
+    approvedDigest: string,
+    repositoryIdentity: string,
+    options: { liveness?: boolean } = {},
+  ): Decision<AdoptedCanonicalCto> | null {
+    const adoption = this.#adoptions.recorded(runId);
+    if (!adoption) return null;
+    const run = this.runs.get(runId);
+    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+    const pinned = this.#adoptions.pinHolds(run, adoption);
+    if (!pinned.allowed) return pinned as Decision<AdoptedCanonicalCto>;
+    const validated = this.#adoptions.validate(adoption, options);
+    if (!validated.allowed) return validated;
+    const target = this.#adoptions.targetHolds(adoption, {
+      manifestProjectId: approvedManifest.projectId,
+      approvedManifestDigest: approvedDigest,
+      repositoryIdentity,
+    });
+    if (!target.allowed) return target as Decision<AdoptedCanonicalCto>;
+    return validated;
+  }
 
   /**
    * #246 C3, review 1076-R1-02 — the chain a bootstrap completes on: the approval anchored as its
@@ -282,6 +335,28 @@ export class BootstrapActivation {
     const preflight = this.preflight(input, run.projectId ?? input.approvedManifest.projectId);
     if (!preflight.allowed) return preflight as Decision<ACPBootstrapActivationResult>;
 
+    // The explicit canonical-CTO adoption, refused here, before anything is written: the adopted CTO
+    // still holds exactly what the run was created with, the manifest names its own manifest-less
+    // project, and the repository this run created is identified by its GitHub node id, never by name.
+    const adopted = this.adoptionHolds(input.runId, input.approvedManifest, approvedDigest, current.value.outputs.target.repositoryIdentity);
+    if (adopted && !adopted.allowed) return adopted as Decision<ACPBootstrapActivationResult>;
+    const adoptedRepository = adopted ? result.repositories.find((repository) => repository.identity === current.value.outputs.target.repositoryIdentity) : undefined;
+    if (adopted) {
+      if (current.value.outputs.supersedesProjectId !== undefined) {
+        return deny(ReasonCode.INVALID_ARGUMENT, "an adopting bootstrap connects its CTO's own project and names no predecessor", {
+          refusal: "ADOPTION_SUPERSEDES_REFUSED",
+          runId: input.runId,
+        });
+      }
+      if (!adoptedRepository?.repositoryNodeId) {
+        return deny(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "an adopting bootstrap connects its repository only by the GitHub node id its creation returned", {
+          refusal: "ADOPTION_REPOSITORY_NODE_ID_MISSING",
+          runId: input.runId,
+          repositoryIdentity: current.value.outputs.target.repositoryIdentity,
+        });
+      }
+    }
+
     // 2. Register the project and activate the approved manifest digest.
     const projectId = run.projectId ?? input.approvedManifest.projectId;
     const manifestAuthorization: ManagedManifestWrite = {
@@ -296,6 +371,18 @@ export class BootstrapActivation {
       const predecessor = this.projects.validatePredecessor(projectId, current.value.outputs.supersedesProjectId);
       if (!predecessor.allowed) return predecessor;
       const existing = this.projects.get(projectId);
+      if (adopted) {
+        // The adopted project exists; its first manifest moves from NULL in this transaction, on the
+        // adoption asked again here (process-free) and the run's own authority to write that manifest.
+        const again = this.adoptionHolds(input.runId, input.approvedManifest, approvedDigest, current.value.outputs.target.repositoryIdentity, { liveness: false });
+        if (!again?.allowed) return again ?? deny(ReasonCode.INTERNAL_ERROR, "the adoption record disappeared", { runId: input.runId });
+        if (!existing) return deny(ReasonCode.NOT_FOUND, "the adopted CTO's project is not registered", { projectId });
+        if (existing.activeManifestDigest === null) {
+          const first = this.projects.activateAdoptedBootstrapManifest(input.approvedManifest, manifestAuthorization);
+          if (!first.allowed) return first as Decision<void>;
+          return allow(ReasonCode.OK, undefined);
+        }
+      }
       if (!existing) {
         const registered = this.projects.register({
           projectId,
@@ -321,11 +408,13 @@ export class BootstrapActivation {
       }
       return allow(ReasonCode.OK, undefined);
     };
-    const registration = current.value.outputs.supersedesProjectId === undefined ? register() : this.db.txDecision(register);
+    const registration = current.value.outputs.supersedesProjectId === undefined && !adopted ? register() : this.db.txDecision(register);
     if (!registration.allowed) return registration;
 
     let provisioning: ProvisioningEvidence | undefined;
-    if (current.value.outputs.genesis) {
+    // An adopting bootstrap provisions no resident: its PRIMARY_CTO is the adopted conversation, and
+    // its repository binding is the checkout the producer proposed, read back below by its remote.
+    if (current.value.outputs.genesis && !adopted) {
       const repository = result.repositories[0]!;
       if (!this.residentProjects || !repository.repositoryNodeId) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"resident provisioning is required",{});
       try {
@@ -370,8 +459,19 @@ export class BootstrapActivation {
     // reported here is read, not assumed. The one exception is an interactive holder this run's
     // handoff could not reach (`undeliverableRecipient`): the retry replaces it with a driven one.
     const alreadyBound = this.bindings.active(primaryRoleKey);
-    const undeliverable = alreadyBound ? this.undeliverableRecipient(input.runId, projectId, alreadyBound) : null;
-    if (provisioning) {
+    const undeliverable = alreadyBound && !adopted ? this.undeliverableRecipient(input.runId, projectId, alreadyBound) : null;
+    if (adopted) {
+      // Exactly the adopted binding, never a replacement, a driven spawn or a new Buzz identity.
+      const held = adopted.value.binding;
+      if (!alreadyBound || alreadyBound.assignmentId !== held.assignmentId || alreadyBound.sessionId !== held.sessionId ||
+        alreadyBound.bindingGeneration !== held.bindingGeneration) {
+        return deny(ReasonCode.BINDING_GENERATION_STALE, "the adopted PRIMARY_CTO binding moved during activation", {
+          refusal: "ADOPTION_BINDING_MOVED",
+          runId: input.runId,
+        });
+      }
+      primaryCtoBinding = { roleKey: primaryRoleKey, sessionId: held.sessionId, bindingGeneration: held.bindingGeneration, promotedFromBootstrap: false };
+    } else if (provisioning) {
       if (!alreadyBound || alreadyBound.sessionId !== provisioning.claimSessionId) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"awaiting resident canonical claim",{runId:input.runId});
       primaryCtoBinding = {roleKey:primaryRoleKey,sessionId:alreadyBound.sessionId,bindingGeneration:alreadyBound.bindingGeneration,promotedFromBootstrap:false};
     } else if (alreadyBound && !undeliverable) {
@@ -437,7 +537,9 @@ export class BootstrapActivation {
       ceoConfirm: null,
       primaryCtoBinding,
       ...(provisioning ? {provisioning} : {}),
-      buzz: { connected: provisioning ? this.residentProjects!.ready(input.runId,primaryCtoBinding.sessionId) : Boolean(ctoSession?.buzzAddress), address: ctoSession?.buzzAddress ?? null },
+      ...(adopted ? { canonicalCtoAdoption: this.adoptionEvidence(adopted.value, current.value.outputs.target.repositoryIdentity, adoptedRepository!.repositoryNodeId!) } : {}),
+      buzz: { connected: provisioning ? this.residentProjects!.ready(input.runId,primaryCtoBinding.sessionId)
+        : adopted ? this.adoptedRouteHolds(adopted.value, ctoSession) : Boolean(ctoSession?.buzzAddress), address: ctoSession?.buzzAddress ?? null },
       handoffAck,
       doctor: { status: report.status, findings: report.findings.length },
       activity: project.activity,
@@ -481,9 +583,28 @@ export class BootstrapActivation {
         primaryCtoGeneration: primaryCtoBinding.bindingGeneration,
         promotedFromBootstrap: primaryCtoBinding.promotedFromBootstrap,
         doctorStatus: report.status,
+        ...(adopted ? { adoptedCanonicalCto: { sessionId: adopted.value.binding.sessionId, bindingGeneration: adopted.value.binding.bindingGeneration } } : {}),
       },
     });
     return allow(ReasonCode.OK, activation);
+  }
+
+  /** What an adopting activation reports about the conversation it kept and the repository it connected. */
+  private adoptionEvidence(adopted: AdoptedCanonicalCto, repositoryIdentity: string, repositoryNodeId: string): NonNullable<ACPBootstrapActivationResult["canonicalCtoAdoption"]> {
+    return {
+      sessionId: adopted.binding.sessionId,
+      bindingGeneration: adopted.binding.bindingGeneration,
+      conversationUuid: adopted.entry.sessionUuid,
+      buzzActorId: adopted.entry.buzzActorId,
+      buzzAddress: adopted.entry.buzzAddress ?? null,
+      repositoryIdentity,
+      repositoryNodeId,
+    };
+  }
+
+  /** The adopted session still routes over exactly the Buzz identity and room its canonical entry names. */
+  private adoptedRouteHolds(adopted: AdoptedCanonicalCto, session: { buzzAddress: string | null; buzzActorId: string | null } | null): boolean {
+    return Boolean(session?.buzzAddress) && session?.buzzAddress === (adopted.entry.buzzAddress ?? null) && session?.buzzActorId === adopted.entry.buzzActorId;
   }
 
   /**
@@ -746,8 +867,25 @@ export class BootstrapActivation {
         projectId,
       });
     }
-    const provisioning = plan.value.outputs.genesis ? this.residentProjects?.evidence(input.runId) : undefined;
-    if (plan.value.outputs.genesis && (!provisioning || !primary || !this.residentProjects?.ready(input.runId,primary.sessionId))) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"resident provisioning readbacks unavailable at confirmation",{});
+    // An adopting bootstrap completes on its adopted canonical CTO, asked again in this transaction: the
+    // binding the handoff went to, still at the adopted generation, live and on its own Buzz route.
+    const adopted = this.adoptionHolds(input.runId, plan.value.manifest, plannedManifestDigest, target.repositoryIdentity);
+    if (adopted && !adopted.allowed) return adopted as Decision<ACPBootstrapActivationResult>;
+    if (adopted && (!primary || primary.assignmentId !== adopted.value.binding.assignmentId || !this.adoptedRouteHolds(adopted.value, ctoSession))) {
+      return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE, "the adopted canonical CTO is not the project's PRIMARY_CTO on its own route at confirmation", {
+        refusal: "ADOPTION_BINDING_MOVED",
+        runId: input.runId,
+      });
+    }
+    const adoptedRepository = adopted ? factory.content.repositories.find((repository) => repository.identity === target.repositoryIdentity) : undefined;
+    if (adopted && !adoptedRepository?.repositoryNodeId) {
+      return deny(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "an adopting bootstrap completes only on the GitHub node id its creation returned", {
+        refusal: "ADOPTION_REPOSITORY_NODE_ID_MISSING",
+        runId: input.runId,
+      });
+    }
+    const provisioning = plan.value.outputs.genesis && !adopted ? this.residentProjects?.evidence(input.runId) : undefined;
+    if (plan.value.outputs.genesis && !adopted && (!provisioning || !primary || !this.residentProjects?.ready(input.runId,primary.sessionId))) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"resident provisioning readbacks unavailable at confirmation",{});
     const activation: ACPBootstrapActivationResult = {
       schema: "agent-control-plane.bootstrap-activation.v1",
       runId: input.runId,
@@ -769,7 +907,9 @@ export class BootstrapActivation {
           }
         : null,
       ...(provisioning ? {provisioning} : {}),
-      buzz: { connected: provisioning ? Boolean(primary && this.residentProjects?.ready(input.runId,primary.sessionId)) : Boolean(ctoSession?.buzzAddress), address: ctoSession?.buzzAddress ?? null },
+      ...(adopted ? { canonicalCtoAdoption: this.adoptionEvidence(adopted.value, target.repositoryIdentity, adoptedRepository!.repositoryNodeId!) } : {}),
+      buzz: { connected: provisioning ? Boolean(primary && this.residentProjects?.ready(input.runId,primary.sessionId))
+        : adopted ? this.adoptedRouteHolds(adopted.value, ctoSession) : Boolean(ctoSession?.buzzAddress), address: ctoSession?.buzzAddress ?? null },
       handoffAck,
       doctor: {
         status: doctorArtifact.content.report.status,
@@ -805,6 +945,7 @@ export class BootstrapActivation {
         blindReviewDigest: review.value.digest,
         primaryCtoGeneration: primary?.bindingGeneration ?? null,
         doctorStatus: activation.doctor.status,
+        ...(activation.canonicalCtoAdoption ? { adoptedCanonicalCto: { sessionId: activation.canonicalCtoAdoption.sessionId, repositoryNodeId: activation.canonicalCtoAdoption.repositoryNodeId } } : {}),
       },
     });
     return allow(ReasonCode.OK, activation);
