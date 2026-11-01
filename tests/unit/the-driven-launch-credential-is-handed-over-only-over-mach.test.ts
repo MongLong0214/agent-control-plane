@@ -4,7 +4,7 @@ import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import {
@@ -17,11 +17,12 @@ import {
   startSessionLaunchChannel,
   type MachLaunchAddon,
   type MachLaunchHandle,
+  type MachLaunchCustody,
   type MachLaunchIncoming,
   type MachLaunchSessions,
   type PendingLaunchCredential,
 } from "../../src/daemon/agentcpd.ts";
-import { SessionLifecycle } from "../../src/domain/types.ts";
+import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import type { SessionLaunchCredential } from "../../src/cto/cto-lifecycle.ts";
 import type { SessionRecord, SessionRegistry } from "../../src/session/session-registry.ts";
 import { allow, deny } from "../../src/core/errors.ts";
@@ -614,9 +615,9 @@ exec /bin/sleep 3
    */
   const sendUncertain = (
     addon: MachLaunchAddon,
-    deps: { pending: Map<string, PendingLaunchCredential>; sessions: MachLaunchSessions; audit: ReturnType<typeof auditDouble> },
+    deps: { pending: Map<string, PendingLaunchCredential>; sessions: MachLaunchSessions; audit: Pick<ReturnType<typeof auditDouble>, "record">; custody?: MachLaunchCustody },
     credential: SessionLaunchCredential & { sessionSecret: string },
-    respond: () => boolean,
+    respond: (handle: MachLaunchHandle, id: number, status: number, body?: Buffer) => boolean,
   ): void => {
     const fakeAddon = {
       STATUS: addon.STATUS,
@@ -685,7 +686,7 @@ exec /bin/sleep 3
       expect(sendFailures(deps.audit)).toEqual([{
         kind: "SESSION_LAUNCH_CREDENTIAL_SEND_FAILED",
         reasonCode: ReasonCode.MACH_LAUNCH_SECRET_NOT_INVALIDATED,
-        evidence: { transport: "mach", send: "FALSE", rotated: false, invalidated: "SESSION_BLOCKED", rotationRefused: ReasonCode.SESSION_NOT_READY, blocked: true },
+        evidence: { transport: "mach", send: "FALSE", rotated: false, invalidated: "SESSION_BLOCKED", rotationRefused: ReasonCode.SESSION_NOT_READY, blocked: true, custodyReleased: false },
       }]);
       // Blocked through the registry's own path: the secret authenticates nothing, nothing can re-credential it.
       const after = sessions.require(credential.sessionId);
@@ -721,6 +722,122 @@ exec /bin/sleep 3
     } finally {
       harness.cp.close();
     }
+  });
+
+  /**
+   * #1336 N-1 — a registry whose `rotateSecret`, `verifySecret` or `transition` throws once armed (armed by
+   * the uncertain send itself, so the admission before it reads the real registry), and the session runtime's
+   * real custody of the session's credential, which the block must drop.
+   */
+  const faultySession = (lifecycle: typeof SessionLifecycle.READY | typeof SessionLifecycle.DRAINING, faults: {
+    rotateSecret?: boolean; verifySecretOnce?: boolean; transition?: boolean;
+  }) => {
+    const real = realSession(lifecycle);
+    const { cp } = real.harness;
+    expect(cp.sessionRuntime.adopt(real.credential.sessionId, Role.BOOTSTRAP_CTO, real.credential.sessionSecret, real.epoch).allowed).toBe(true);
+    expect(cp.sessionRuntime.holds(real.credential.sessionId)).toBe(true);
+    let armed = false;
+    let verifyFaults = faults.verifySecretOnce ? 1 : 0;
+    const sessions: MachLaunchSessions = {
+      get: (id) => real.sessions.get(id),
+      rotateSecret: (id, epoch) => {
+        if (armed && faults.rotateSecret) throw new Error("SQLITE_IOERR: disk I/O error (rotateSecret)");
+        return real.sessions.rotateSecret(id, epoch);
+      },
+      verifySecret: (id, secret) => {
+        if (armed && verifyFaults > 0) { verifyFaults -= 1; throw new Error("SQLITE_IOERR: disk I/O error (verifySecret)"); }
+        return real.sessions.verifySecret(id, secret);
+      },
+      transition: (id, to, reason) => {
+        if (armed && faults.transition) throw new Error("SQLITE_IOERR: disk I/O error (transition)");
+        return real.sessions.transition(id, to, reason);
+      },
+    };
+    const custody: MachLaunchCustody = { release: (id) => cp.sessionRuntime.release(id) };
+    return { ...real, cp, sessions, custody, arm: () => { armed = true; } };
+  };
+
+  it("#1336 N-1 W-ROTATE-THREW: a rotateSecret that throws after an uncertain send blocks the session, drops its custody, and is audited", (ctx) => {
+    const addon = requireMach(ctx);
+    const f = faultySession(SessionLifecycle.READY, { rotateSecret: true });
+    try {
+      const deps = { pending: new Map<string, PendingLaunchCredential>(), sessions: f.sessions, audit: auditDouble(), custody: f.custody };
+      // The daemon stays up: nothing escapes the Mach callback.
+      expect(() => sendUncertain(addon, deps, f.credential, () => { f.arm(); return false; })).not.toThrow();
+      expect(sendFailures(deps.audit)).toEqual([{
+        kind: "SESSION_LAUNCH_CREDENTIAL_SEND_FAILED",
+        reasonCode: ReasonCode.MACH_LAUNCH_SECRET_NOT_INVALIDATED,
+        evidence: { transport: "mach", send: "FALSE", rotated: false, invalidated: "SESSION_BLOCKED", invalidationFailed: "SQLITE_IOERR: disk I/O error (rotateSecret)", blocked: true, custodyReleased: true },
+      }]);
+      // Unusable for turns and redelivery: ERROR, its secret refused, the runtime no longer holds a credential for it.
+      expect(f.cp.sessions.require(f.credential.sessionId).lifecycle).toBe(SessionLifecycle.ERROR);
+      expect(f.cp.sessions.verifySecret(f.credential.sessionId, f.credential.sessionSecret).allowed).toBe(false);
+      expect(f.cp.sessionRuntime.holds(f.credential.sessionId)).toBe(false);
+      expect(deps.pending.size).toBe(0);
+    } finally {
+      f.harness.cp.close();
+    }
+  });
+
+  it("#1336 N-1 W-VERIFY-THREW: a verifySecret that throws after a refused rotation blocks the session, drops its custody, and is audited", (ctx) => {
+    const addon = requireMach(ctx);
+    // DRAINING: the rotation is refused, so the check of the old secret runs, and it throws.
+    const f = faultySession(SessionLifecycle.DRAINING, { verifySecretOnce: true });
+    try {
+      const deps = { pending: new Map<string, PendingLaunchCredential>(), sessions: f.sessions, audit: auditDouble(), custody: f.custody };
+      expect(() => sendUncertain(addon, deps, f.credential, () => { f.arm(); return false; })).not.toThrow();
+      expect(sendFailures(deps.audit)).toEqual([{
+        kind: "SESSION_LAUNCH_CREDENTIAL_SEND_FAILED",
+        reasonCode: ReasonCode.MACH_LAUNCH_SECRET_NOT_INVALIDATED,
+        evidence: { transport: "mach", send: "FALSE", rotated: false, invalidated: "SESSION_BLOCKED", invalidationFailed: "SQLITE_IOERR: disk I/O error (verifySecret)", blocked: true, custodyReleased: true },
+      }]);
+      expect(f.cp.sessions.require(f.credential.sessionId).lifecycle).toBe(SessionLifecycle.ERROR);
+      expect(f.cp.sessions.verifySecret(f.credential.sessionId, f.credential.sessionSecret).allowed).toBe(false);
+      expect(f.cp.sessionRuntime.holds(f.credential.sessionId)).toBe(false);
+    } finally {
+      f.harness.cp.close();
+    }
+  });
+
+  it("#1336 N-1 W-DB-DOWN: with the registry and the audit log both failing, custody is still dropped and the reason is stated, never the secret", (ctx) => {
+    const addon = requireMach(ctx);
+    const f = faultySession(SessionLifecycle.READY, { rotateSecret: true, transition: true });
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      const audit = { record: () => { throw new Error("SQLITE_IOERR: disk I/O error (audit)"); } };
+      const deps = { pending: new Map<string, PendingLaunchCredential>(), sessions: f.sessions, audit, custody: f.custody };
+      expect(() => sendUncertain(addon, deps, f.credential, () => { f.arm(); return false; })).not.toThrow();
+      const stated = stderr.mock.calls.map(([line]) => String(line)).filter((line) => line.startsWith("session launch: "));
+      expect(stated).toEqual([
+        `session launch: ${ReasonCode.MACH_LAUNCH_SECRET_NOT_INVALIDATED} for ${f.credential.sessionId} could not be audited: SQLITE_IOERR: disk I/O error (audit)\n`,
+      ]);
+      expect(stated.join("")).not.toContain(f.credential.sessionSecret);
+      // ERROR could not be written, so the block that remains is the dropped custody: no turn of it runs.
+      expect(f.cp.sessionRuntime.holds(f.credential.sessionId)).toBe(false);
+      expect(f.cp.sessions.require(f.credential.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+    } finally {
+      stderr.mockRestore();
+      f.harness.cp.close();
+    }
+  });
+
+  it("#1336 N-2: a respond that throws is followed by a best-effort REFUSED answer, itself guarded", (ctx) => {
+    const addon = requireMach(ctx);
+    const run = (refusedThrows: boolean) => {
+      const record = { sessionId: "s-n2", sessionSecret: "", incarnation: "inc-1", credentialEpoch: 2 };
+      const credential = credentialOf(record.sessionId);
+      record.sessionSecret = credential.sessionSecret;
+      const calls: Array<{ status: number; body: string }> = [];
+      const deps = { pending: new Map<string, PendingLaunchCredential>(), sessions: sessionsDouble(record), audit: auditDouble() };
+      expect(() => sendUncertain(addon, deps, credential, (_handle, _id, status, body) => {
+        calls.push({ status, body: body?.toString("utf8") ?? "" });
+        if (status === addon.STATUS.OK || refusedThrows) throw new Error("respond raised");
+        return true;
+      })).not.toThrow();
+      return { statuses: calls.map((c) => c.status), refusedBody: calls[1]?.body, secretInRefusal: calls[1]?.body.includes(credential.sessionSecret), sends: sendFailures(deps.audit).map((r) => r.evidence["send"]) };
+    };
+    expect(run(false)).toEqual({ statuses: [addon.STATUS.OK, addon.STATUS.REFUSED], refusedBody: "SEND_UNCERTAIN", secretInRefusal: false, sends: ["THREW"] });
+    expect(run(true)).toEqual({ statuses: [addon.STATUS.OK, addon.STATUS.REFUSED], refusedBody: "SEND_UNCERTAIN", secretInRefusal: false, sends: ["THREW"] });
   });
 
   it("the admission function admits the real shape and refuses a holder-pin whose start token moved", (ctx) => {

@@ -287,10 +287,12 @@ export const ReasonCode = {
    */
   MACH_LAUNCH_SEND_FAILED: "MACH_LAUNCH_SEND_FAILED",
   /**
-   * #1336 — a driven turn's Mach reply send was uncertain, the secret it carried could not be rotated and
-   * still verified. The session is marked ERROR so that secret authenticates nothing, no turn of it runs
-   * and no launch is offered for it (`blocked: true`); if that transition was itself refused the evidence
-   * says `blocked: false`. Either way the session is not resumed normally. Never the credential.
+   * #1336 — a driven turn's Mach reply send was uncertain and the secret it carried could not be shown
+   * invalid: its rotation was refused while it still verified, or the rotation or the check failed. The
+   * session is marked ERROR so that secret authenticates nothing (`blocked: true` once it is seen to stop
+   * verifying) and the runtime's held credential for it is dropped (`custodyReleased`), so no turn of it
+   * runs and no launch is offered for it. If the transition failed too the evidence says `blocked: false`.
+   * Either way the session is not resumed normally. Never the credential.
    */
   MACH_LAUNCH_SECRET_NOT_INVALIDATED: "MACH_LAUNCH_SECRET_NOT_INVALIDATED",
   /**

@@ -491,6 +491,12 @@ export interface SessionLaunchChannelOptions {
    * session is marked ERROR: `invalidateAfterUncertainSend`). Omitted, the Mach service cannot be enabled.
    */
   sessions?: MachLaunchSessions;
+  /**
+   * #1336 — the session runtime's custody of each session's credential (`ProvisionedSessionRuntime.release`),
+   * dropped when an uncertain send left a secret that could not be shown invalid, so no turn of that session
+   * runs and no launch is offered for it. Omitted, that block is ERROR alone.
+   */
+  custody?: MachLaunchCustody;
   /** O4b B' — where a Mach admission refusal, send failure or delivery is audited, never the credential. */
   audit?: Pick<AuditLog, "record">;
   /** O4b B' — the native addon, injectable so a witness can drive admission on real Mach facts. */
@@ -499,6 +505,10 @@ export interface SessionLaunchChannelOptions {
 
 /** O4b B' — what the Mach hand-over reads and writes on the session registry. */
 export type MachLaunchSessions = Pick<SessionRegistry, "verifySecret" | "rotateSecret" | "get" | "transition">;
+/** #1336 — the one thing the Mach hand-over asks of the session runtime: forget a session's credential. */
+export interface MachLaunchCustody {
+  release(sessionId: string): void;
+}
 
 /**
  * O4b B' — the launchd-reserved Mach service name a production daemon checks in and a driven turn's
@@ -971,7 +981,7 @@ export const startSessionLaunchChannel = async (
     enableMachService: (machOptions = {}) => {
       if (closed) return deny(ReasonCode.CONFLICT, "session launch channel is closed", { socketPath });
       if (machHandle) return allow(ReasonCode.OK, { serviceName: machServiceName! });
-      const { sessions, audit } = options;
+      const { sessions, audit, custody } = options;
       if (!sessions || !audit) {
         return deny(ReasonCode.MACH_LAUNCH_SERVICE_UNAVAILABLE,
           "the Mach launch service needs a session registry and audit log", { socketPath });
@@ -986,7 +996,7 @@ export const startSessionLaunchChannel = async (
       }
       try {
         machHandle = addon.listen(serviceName, (request) =>
-          serveMachLaunchCredential(request, { pending, sessions, audit, addon, handle: machHandle!, mcpToken: options.mcpToken }));
+          serveMachLaunchCredential(request, { pending, sessions, audit, addon, handle: machHandle!, mcpToken: options.mcpToken, ...(custody ? { custody } : {}) }));
       } catch (error) {
         return deny(ReasonCode.MACH_LAUNCH_SERVICE_UNAVAILABLE, "bootstrap_check_in of the Mach launch service failed",
           { reason: "CHECK_IN_REFUSED", error: error instanceof Error ? error.message : String(error) });
@@ -4324,6 +4334,7 @@ export const serveMachLaunchCredential = (
     addon: MachLaunchAddon;
     handle: MachLaunchHandle;
     mcpToken: string | undefined;
+    custody?: MachLaunchCustody;
   },
 ): void => {
   const { pending, sessions, audit, addon, handle, mcpToken } = deps;
@@ -4386,16 +4397,17 @@ export const serveMachLaunchCredential = (
     send = addon.respond(handle, request.id, addon.STATUS.OK, body) ? "OK" : "FALSE";
   } catch {
     send = "THREW";
+    // The native side may still hold this request's reply right (and its ML_MAX_PENDING slot): answer it
+    // REFUSED, best effort. If the OK reply did go out the entry is already taken and this answers nothing.
+    try {
+      addon.respond(handle, request.id, addon.STATUS.REFUSED, Buffer.from("SEND_UNCERTAIN"));
+    } catch {
+      /* the requester then waits out its own timeout; teardown still answers whatever is held */
+    }
   }
   if (send !== "OK") {
     // The entry is not restored: the plaintext may already have crossed.
-    const outcome = invalidateAfterUncertainSend(sessions, credential, credentialEpoch, send);
-    audit.record({
-      kind: "SESSION_LAUNCH_CREDENTIAL_SEND_FAILED",
-      reasonCode: outcome.reasonCode,
-      sessionId: credential.sessionId,
-      evidence: outcome.evidence,
-    });
+    settleUncertainSend(sessions, audit, deps.custody, credential, credentialEpoch, send);
     return;
   }
   // Residual trust, recorded so it is not mistaken for the pid-reuse misdelivery the audit token closed:
@@ -4410,53 +4422,111 @@ export const serveMachLaunchCredential = (
   });
 };
 
+/** #1336 — the uncertain send's secret no longer authenticates: rotated, or already invalid. */
+const secretInvalidatedAfterSend = (send: "FALSE" | "THREW", evidence: Record<string, unknown>): Decision<void> =>
+  deny(ReasonCode.MACH_LAUNCH_SEND_FAILED, "the driven credential's Mach reply send was uncertain; its secret no longer authenticates",
+    { transport: "mach", send, ...evidence });
+/** #1336 — the uncertain send's secret could not be shown invalid; the session is blocked as far as possible. */
+const secretNotInvalidatedAfterSend = (send: "FALSE" | "THREW", evidence: Record<string, unknown>): Decision<void> =>
+  deny(ReasonCode.MACH_LAUNCH_SECRET_NOT_INVALIDATED, "the driven credential's Mach reply send was uncertain and its secret could not be shown invalid",
+    { transport: "mach", send, ...evidence });
+
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
 /**
  * #1336 — after a Mach reply send that failed, threw or is uncertain, the secret it carried may have been
- * delivered, so nothing may go on using it. Exactly one of three outcomes, each audited (never the secret):
+ * delivered, so nothing may go on using it. Nothing here throws out of the Mach callback, whatever the
+ * registry or the audit log does. Exactly one of three outcomes (never the secret in any of them):
  *  - the secret is rotated: it stops verifying in the same statement (`MACH_LAUNCH_SEND_FAILED`, ROTATED);
  *  - the rotation is refused and the secret no longer verifies — its epoch already moved, or the session
  *    is already STOPPED or ERROR — so it is already invalid (`MACH_LAUNCH_SEND_FAILED`, ALREADY_INVALID);
- *  - the rotation is refused and the secret still verifies (a DRAINING or STARTING session, a CAS that lost,
- *    no epoch storage): rotation cannot invalidate it, so the session is marked ERROR, the official path
- *    after which `verifySecret` refuses that secret, no turn of the session runs and no launch is offered
- *    for it, and the blocker is recorded (`MACH_LAUNCH_SECRET_NOT_INVALIDATED`, `blocked`). If even that
- *    transition fails, the same blocker is recorded with `blocked: false`; nothing resumes the session.
+ *  - otherwise — the rotation was refused and the secret still verifies (a DRAINING or STARTING session, a
+ *    CAS that lost), or the rotation or the check threw — the strongest block available is taken
+ *    (`blockSessionAfterUncertainSend`) and recorded as `MACH_LAUNCH_SECRET_NOT_INVALIDATED`.
+ * The outcome is audited; if the audit write itself fails, the reason code and session id (never the
+ * secret) are written to stderr instead, so the case is stated even with the database down.
  */
-const invalidateAfterUncertainSend = (
+const settleUncertainSend = (
   sessions: MachLaunchSessions,
+  audit: Pick<AuditLog, "record">,
+  custody: MachLaunchCustody | undefined,
   credential: SessionLaunchCredential,
   credentialEpoch: number,
   send: "FALSE" | "THREW",
+): void => {
+  const { sessionId, sessionSecret } = credential;
+  let outcome: Decision<void> | null = null;
+  let cause: Record<string, unknown>;
+  try {
+    const rotated = sessions.rotateSecret(sessionId, credentialEpoch);
+    if (rotated.allowed) {
+      outcome = secretInvalidatedAfterSend(send, { rotated: true, invalidated: "ROTATED" });
+      cause = {};
+    } else if (!sessions.verifySecret(sessionId, sessionSecret).allowed) {
+      outcome = secretInvalidatedAfterSend(send, { rotated: false, invalidated: "ALREADY_INVALID", rotationRefused: rotated.reasonCode });
+      cause = {};
+    } else {
+      cause = { rotationRefused: rotated.reasonCode };
+    }
+  } catch (error) {
+    cause = { invalidationFailed: errorText(error) };
+  }
+  outcome ??= blockSessionAfterUncertainSend(sessions, custody, credential, send, cause);
+  try {
+    audit.record({ kind: "SESSION_LAUNCH_CREDENTIAL_SEND_FAILED", reasonCode: outcome.reasonCode, sessionId, evidence: outcome.evidence });
+  } catch (error) {
+    process.stderr.write(`session launch: ${outcome.reasonCode} for ${sessionId} could not be audited: ${errorText(error)}\n`);
+  }
+};
+
+/**
+ * #1336 — the strongest block available when an uncertain send's secret could not be shown invalid: the
+ * session is marked ERROR, the registry's official path after which `verifySecret` refuses that secret and
+ * nothing re-credentials it, and the runtime's held credential for it is dropped, so no turn of it runs and
+ * no launch is offered for it. Each step is attempted whether or not another failed; `blocked` is true only
+ * when the secret was then seen to stop verifying. Nothing here resumes the session.
+ */
+const blockSessionAfterUncertainSend = (
+  sessions: MachLaunchSessions,
+  custody: MachLaunchCustody | undefined,
+  credential: SessionLaunchCredential,
+  send: "FALSE" | "THREW",
+  cause: Record<string, unknown>,
 ): Decision<void> => {
   const { sessionId, sessionSecret } = credential;
-  // The outcome the caller audits: which of the three it was, never the secret.
-  const invalidated = (evidence: Record<string, unknown>): Decision<void> =>
-    deny(ReasonCode.MACH_LAUNCH_SEND_FAILED, "the driven credential's Mach reply send was uncertain; its secret no longer authenticates",
-      { transport: "mach", send, ...evidence });
-  const notInvalidated = (evidence: Record<string, unknown>): Decision<void> =>
-    deny(ReasonCode.MACH_LAUNCH_SECRET_NOT_INVALIDATED, "the driven credential's Mach reply send was uncertain and its secret could not be rotated",
-      { transport: "mach", send, ...evidence });
-  const rotated = sessions.rotateSecret(sessionId, credentialEpoch);
-  if (rotated.allowed) return invalidated({ rotated: true, invalidated: "ROTATED" });
-  const rotationRefused = rotated.reasonCode;
-  if (!sessions.verifySecret(sessionId, sessionSecret).allowed) {
-    return invalidated({ rotated: false, invalidated: "ALREADY_INVALID", rotationRefused });
+  let transitionRefused: string | null = null;
+  let marked = false;
+  try {
+    const transition = sessions.transition(sessionId, SessionLifecycle.ERROR,
+      "a driven credential's Mach reply send was uncertain and its secret could not be shown invalid");
+    marked = transition.allowed;
+    if (!transition.allowed) transitionRefused = transition.reasonCode;
+  } catch (error) {
+    transitionRefused = errorText(error);
   }
   let blocked = false;
-  let transitionRefused: string | null = null;
-  try {
-    const marked = sessions.transition(sessionId, SessionLifecycle.ERROR,
-      "a driven credential's Mach reply send was uncertain and its secret could not be rotated");
-    if (!marked.allowed) transitionRefused = marked.reasonCode;
-    blocked = marked.allowed && !sessions.verifySecret(sessionId, sessionSecret).allowed;
-  } catch (error) {
-    transitionRefused = error instanceof Error ? error.message : String(error);
+  if (marked) {
+    try {
+      blocked = !sessions.verifySecret(sessionId, sessionSecret).allowed;
+    } catch {
+      blocked = false; // not seen to stop verifying, so not claimed
+    }
   }
-  return notInvalidated({
+  let custodyReleased: boolean | string = false;
+  if (custody) {
+    try {
+      custody.release(sessionId);
+      custodyReleased = true;
+    } catch (error) {
+      custodyReleased = errorText(error);
+    }
+  }
+  return secretNotInvalidatedAfterSend(send, {
     rotated: false,
     invalidated: blocked ? "SESSION_BLOCKED" : "NOT_GUARANTEED",
-    rotationRefused,
+    ...cause,
     blocked,
+    custodyReleased,
     ...(transitionRefused === null ? {} : { transitionRefused }),
   });
 };
@@ -6149,7 +6219,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
 
   let sessionLaunch: LocalSessionLaunchChannel;
   try {
-    sessionLaunch = await startSessionLaunchChannel(stateDir, { mcpToken, sessions: cp.sessions, audit: cp.audit });
+    sessionLaunch = await startSessionLaunchChannel(stateDir, {
+      mcpToken, sessions: cp.sessions, audit: cp.audit, custody: { release: (sessionId) => cp.sessionRuntime.release(sessionId) },
+    });
   } catch (err) {
     cp.close();
     throw err;

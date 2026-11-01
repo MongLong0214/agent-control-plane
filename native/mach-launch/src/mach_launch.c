@@ -842,8 +842,22 @@ static void ml_claim_complete(napi_env env, napi_status status, void *data) {
   free(claim);
 }
 
+// Settles a claim's promise that will never reach ml_claim_complete, so its deferred is not left pending.
+// It rejects rather than throws: ml_claim then returns this promise, because a rejected promise that is
+// never returned to JavaScript is an unhandled rejection, which ends the process (measured on Node 24).
+static napi_value ml_reject_claim(napi_env env, napi_deferred deferred, napi_value promise, const char *message) {
+  napi_value error, code_value, message_value;
+  napi_create_string_utf8(env, "MACH_LAUNCH_RESOURCE", NAPI_AUTO_LENGTH, &code_value);
+  napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &message_value);
+  if (napi_create_error(env, code_value, message_value, &error) != napi_ok) error = message_value;
+  napi_reject_deferred(env, deferred, error);
+  return promise;
+}
+
 // claim(serviceName, body, timeoutMs) -> Promise<{ code, kr?, status?, body?, replier? }>. Never rejects
-// for a Mach outcome: every one of them is a named code. Throws only for invalid arguments.
+// for a Mach outcome: every one of them is a named code. Throws only for invalid arguments or no memory
+// before the promise exists; once it exists, a claim that cannot be created or queued rejects it with a
+// MACH_LAUNCH_RESOURCE error.
 static napi_value ml_claim(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value argv[3];
@@ -871,17 +885,20 @@ static napi_value ml_claim(napi_env env, napi_callback_info info) {
   napi_create_promise(env, &claim->deferred, &promise);
   napi_create_string_utf8(env, "acp.mach-launch.claim", NAPI_AUTO_LENGTH, &resource);
   if (napi_create_async_work(env, NULL, resource, ml_claim_execute, ml_claim_complete, claim, &claim->work) != napi_ok) {
-    // Nothing was created: only the claim's own memory is released.
+    // Nothing was created: only the claim's own memory is released, and its promise is settled.
+    napi_deferred deferred = claim->deferred;
     free(claim->body);
     free(claim);
-    return ml_throw(env, "MACH_LAUNCH_RESOURCE", "could not create the claim", 0);
+    return ml_reject_claim(env, deferred, promise, "could not create the claim");
   }
   if (napi_queue_async_work(env, claim->work) != napi_ok) {
-    // The work exists but will never run, so ml_claim_complete will never delete it: it is deleted here.
+    // The work exists but will never run, so ml_claim_complete will never delete it or settle the promise:
+    // both are done here.
+    napi_deferred deferred = claim->deferred;
     napi_delete_async_work(env, claim->work);
     free(claim->body);
     free(claim);
-    return ml_throw(env, "MACH_LAUNCH_RESOURCE", "could not queue the claim", 0);
+    return ml_reject_claim(env, deferred, promise, "could not queue the claim");
   }
   return promise;
 }
