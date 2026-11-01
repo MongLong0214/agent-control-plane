@@ -133,7 +133,7 @@ describe("a declared verification command spawns under a supervised process budg
       status: "PASS",
       exitCode: 0,
       reasonCode: null,
-      enforcement: { processLimit: "supervised-budget", childContainmentEnforced: true, networkEnforced: false },
+      enforcement: { processLimit: "supervised-budget", childContainmentEnforced: true, networkEnforced: true },
     });
     // The verdict is the runner's own: both files ran, in their own processes, and passed.
     expect(outcome.stdout).toMatch(/^# tests 2$/m);
