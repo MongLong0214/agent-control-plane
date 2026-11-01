@@ -380,7 +380,7 @@ describe("a declared network deny is enforced", () => {
       reasonCode: ReasonCode.SANDBOX_NETWORK_DENIED,
       enforcement: { mechanism: "seatbelt", networkPolicy: network, networkEnforced: false },
     });
-    expect(outcome.stderr).toContain(`sandbox not applied (sandbox-exec exit ${exitCode})`);
+    expect(outcome.stderr).toContain(`sandbox-exec refused before starting anything (exit ${exitCode})`);
     expect(outcome.stderr).toContain("sandbox-exec:");
     expect(ran).toBe(false);
     expect(connections).toBeNull();

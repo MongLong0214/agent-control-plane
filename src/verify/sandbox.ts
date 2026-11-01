@@ -920,8 +920,9 @@ const seatbeltAvailable = (): boolean => existsSync("/usr/bin/sandbox-exec");
 
 /**
  * Whether sandbox-exec itself refused, before starting anything: exit 65 for a profile it cannot
- * compile, 71 when `sandbox_apply` is denied (as inside another sandbox), its message on stderr.
- * Only with no candidate reported, since a candidate that ran could print and exit the same way.
+ * compile, 71 when `sandbox_apply` is denied (as inside another sandbox) or when the profile applied
+ * but exec of the wrapper failed, its message on stderr. Only with no candidate reported, since a
+ * candidate that ran could print and exit the same way.
  */
 const sandboxNotApplied = (exitCode: number | null, candidateReported: boolean, stderr: string): boolean =>
   !candidateReported && (exitCode === 65 || exitCode === 71) && stderr.startsWith("sandbox-exec:");
@@ -1431,15 +1432,16 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   const stderr = stderrChunks.join("");
   const endedAt = new Date().toISOString();
 
-  // sandbox-exec that refuses its profile starts nothing: no candidate was reported, so nothing ran.
-  // That is a sandbox that was not applied, refused as one, not an orphaned self-detaching process.
+  // sandbox-exec that fails with its own error starts nothing: no candidate was reported, so nothing
+  // ran. That is sandbox-exec refusing before starting anything, refused as such, not an orphaned
+  // self-detaching process.
   if (!groupOutlivedLeader && sandboxNotApplied(exit.code, candidateReportSeen, stderr)) {
     return unconfined(
       command,
       startedMs,
       startedAt,
       mechanism,
-      `sandbox not applied (sandbox-exec exit ${String(exit.code)}); refusing to run unconfined: ${stderr.trim().slice(0, 500)}`,
+      `sandbox-exec refused before starting anything (exit ${String(exit.code)}); refusing to run unconfined: ${stderr.trim().slice(0, 500)}`,
     );
   }
 
@@ -1869,8 +1871,12 @@ const seatbeltProfile = (
     // from a cache it can write, which would carry an outside listener through the carve-out: not the
     // socket itself (rename, link) and not any directory above it (rename, swap). The cost: a deny
     // command cannot rename or remove a directory outside the worktree and scratch, toolchain caches
-    // included (Gradle's offline transforms move directories into place, for one). A command that
-    // needs that is a contract decision of its own; nothing here switches it to `allow`.
+    // included (Gradle's offline transforms move directories into place, for one). Cleanup inside a
+    // cache fails too (`uv cache clean` exits 2 and leaves an empty directory): temp and lock
+    // directories a tool makes in a shared cache stay, into later runs and the owner's own use, and a
+    // stale socket in a cache cannot be deleted. Offline installs from a warm cache still work
+    // (`uv pip install --offline`, `pnpm install --offline`). A command that needs more is a contract
+    // decision of its own; nothing here switches it to `allow`.
     ...(denyNetwork
       ? [
         `(deny file-write* (require-all (vnode-type SOCKET) (require-not (subpath ${quote(worktreePath)})) (require-not (subpath ${quote(scratch)}))))`,

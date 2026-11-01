@@ -56,8 +56,12 @@ git reads no global config, credential helper, ignore or attributes file, and np
   an outside socket in, a deny command also cannot rename or link a socket, or rename or remove a
   directory, outside its worktree and scratch. That is a compatibility cost: toolchain caches are
   included, so a tool that moves directories into place in its cache (Gradle's offline transforms,
-  for one) can fail under `deny`. A command that needs that is a contract decision of its own, not
-  a quiet switch to `allow`.
+  for one) can fail under `deny`. Cleanup inside a cache fails as well (measured: `uv cache clean`
+  exits 2 and leaves an empty directory), so temp and lock directories a tool creates in a shared
+  cache cannot be removed and persist into later runs and the owner's own use, and a deny command
+  cannot delete a stale socket in a cache. Mainstream offline installs from a warm cache still work
+  (`uv pip install --offline`, `pnpm install --offline`). A command that needs more is a contract
+  decision of its own, not a quiet switch to `allow`.
   `network: "allowlist"` is still refused, because seatbelt cannot enforce destinations.
 
 **The guard.** `SANDBOX_SECRET_PATHS` — SSH and GPG keys and their agents, the keychain, GitHub,
