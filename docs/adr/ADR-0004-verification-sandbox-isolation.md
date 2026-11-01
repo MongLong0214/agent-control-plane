@@ -52,7 +52,12 @@ git reads no global config, credential helper, ignore or attributes file, and np
   look up and download dependencies during verification. This is not a publish or deploy right: no
   credential reaches the command to publish with. A command whose contract says `deny`, the default,
   has IP networking denied, inbound and outbound, and every unix socket outside its worktree and
-  scratch, while binding and connecting its own socket there still works.
+  scratch, while binding and connecting its own socket there still works. So that it cannot bring
+  an outside socket in, a deny command also cannot rename or link a socket, or rename or remove a
+  directory, outside its worktree and scratch. That is a compatibility cost: toolchain caches are
+  included, so a tool that moves directories into place in its cache (Gradle's offline transforms,
+  for one) can fail under `deny`. A command that needs that is a contract decision of its own, not
+  a quiet switch to `allow`.
   `network: "allowlist"` is still refused, because seatbelt cannot enforce destinations.
 
 **The guard.** `SANDBOX_SECRET_PATHS` — SSH and GPG keys and their agents, the keychain, GitHub,

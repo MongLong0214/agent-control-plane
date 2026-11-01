@@ -4,7 +4,7 @@ import type * as FsModule from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type AddressInfo, type Server, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -75,12 +75,14 @@ let socketDir = "";
 let socketPath = "";
 let accepted = 0;
 
+/** Every outside listener here answers the same way and counts what reached it. */
+const answer = (socket: Socket): void => {
+  accepted += 1;
+  socket.on("error", () => undefined);
+  socket.end("reached\n");
+};
+
 beforeAll(async () => {
-  const answer = (socket: Socket) => {
-    accepted += 1;
-    socket.on("error", () => undefined);
-    socket.end("reached\n");
-  };
   tcpServer = createServer(answer);
   port = await new Promise<number>((resolvePort, reject) => {
     tcpServer.once("error", reject);
@@ -161,6 +163,44 @@ const probe = async (network: "deny" | "allow", argv: string[] = ["node", "probe
   };
 };
 
+/**
+ * Runs `run` while an outside listener serves `relative` inside a cache the profile lets a command
+ * write (`SANDBOX_CACHE_HOME_PATHS`), under this file's HOME. Accepts count in `accepted`.
+ */
+const withCacheListener = async <T>(relative: string, run: (cached: string, cacheDir: string) => Promise<T>): Promise<T> => {
+  const cacheDir = join(homedir(), ".npm", "acp-nd1");
+  const cached = join(cacheDir, relative);
+  mkdirSync(dirname(cached), { recursive: true });
+  const listener = createServer(answer);
+  await new Promise<void>((resolveListen, reject) => {
+    listener.once("error", reject);
+    listener.listen(cached, () => resolveListen());
+  });
+  try {
+    return await run(cached, cacheDir);
+  } finally {
+    await new Promise<void>((done) => listener.close(() => done()));
+    rmSync(cacheDir, { recursive: true, force: true });
+  }
+};
+
+/** A probe that runs `body`, recording into `result`, then prints `result` as one JSON line. */
+const moveProbe = (body: string): string => `
+  const fs = require('node:fs');
+  const net = require('node:net');
+  const tried = (operation) => { try { operation(); return 'ok'; } catch (error) { return error.code; } };
+  const attempt = (path) => new Promise((done) => {
+    const socket = net.connect({ path });
+    socket.once('connect', () => { socket.destroy(); done('CONNECTED'); });
+    socket.once('error', (error) => done(error.code));
+  });
+  (async () => {
+    const result = {};
+    ${body}
+    console.log(JSON.stringify(result));
+  })();
+`;
+
 describe("a declared network deny is enforced", () => {
   it("adds the denial to a deny command's profile and leaves an allow command's as it was", () => {
     const [worktree, scratch] = [tempDir("acp-net-deny-profile-"), tempDir("acp-net-deny-scratch-")];
@@ -175,6 +215,7 @@ describe("a declared network deny is enforced", () => {
       `(allow network-bind (local unix-socket (subpath "${realpathSync(worktree)}")))`,
       `(allow network-bind (local unix-socket (subpath "${realpathSync(scratch)}")))`,
       `(deny file-write* (require-all (vnode-type SOCKET) (require-not (subpath "${realpathSync(worktree)}")) (require-not (subpath "${realpathSync(scratch)}"))))`,
+      `(deny file-write-unlink (require-all (vnode-type DIRECTORY) (require-not (subpath "${realpathSync(worktree)}")) (require-not (subpath "${realpathSync(scratch)}"))))`,
     ]);
     expect(denied.filter((line) => !added.includes(line))).toEqual(open);
   });
@@ -202,48 +243,64 @@ describe("a declared network deny is enforced", () => {
 
   it("refuses to rename or link an outside listener in a writable cache into the worktree", async (context) => {
     requireSeatbelt(context);
-    // A cache the profile lets the command write (SANDBOX_CACHE_HOME_PATHS), under this file's HOME.
-    const cacheDir = join(homedir(), ".npm", "acp-nd1");
-    mkdirSync(cacheDir, { recursive: true });
-    const cached = join(cacheDir, "s.sock");
-    rmSync(cached, { force: true });
-    const listener = createServer((socket) => {
-      accepted += 1;
-      socket.on("error", () => undefined);
-      socket.end("reached\n");
+    const { outcome, connections, accepted: reached } = await withCacheListener("s.sock", (cached) => probe("deny", ["node", "probe.cjs"], moveProbe(`
+      result.linked = tried(() => fs.linkSync(${JSON.stringify(cached)}, 'linked.sock'));
+      result.linkedConnect = await attempt('linked.sock');
+      result.renamed = tried(() => fs.renameSync(${JSON.stringify(cached)}, 'moved.sock'));
+      result.renamedConnect = await attempt('moved.sock');
+    `)));
+    expect(outcome, described(outcome)).toMatchObject({
+      status: "PASS",
+      enforcement: { networkPolicy: "deny", networkEnforced: true },
     });
-    await new Promise<void>((resolveListen, reject) => {
-      listener.once("error", reject);
-      listener.listen(cached, () => resolveListen());
+    expect(connections).toEqual({ linked: "EPERM", linkedConnect: "ENOENT", renamed: "EPERM", renamedConnect: "ENOENT" });
+    expect(reached).toBe(0);
+  });
+
+  it("refuses to rename a cache directory holding an outside listener into the worktree", async (context) => {
+    requireSeatbelt(context);
+    const { outcome, connections, accepted: reached } = await withCacheListener("sub/s.sock", (_cached, cacheDir) => probe("deny", ["node", "probe.cjs"], moveProbe(`
+      result.renamed = tried(() => fs.renameSync(${JSON.stringify(join(cacheDir, "sub"))}, 'sub'));
+      result.renamedConnect = await attempt('sub/s.sock');
+    `)));
+    expect(outcome, described(outcome)).toMatchObject({
+      status: "PASS",
+      enforcement: { networkPolicy: "deny", networkEnforced: true },
     });
-    try {
-      const { outcome, connections, accepted: reached } = await probe("deny", ["node", "probe.cjs"], `
-        const fs = require('node:fs');
-        const net = require('node:net');
-        const tried = (operation) => { try { operation(); return 'ok'; } catch (error) { return error.code; } };
-        const attempt = (path) => new Promise((done) => {
-          const socket = net.connect({ path });
-          socket.once('connect', () => { socket.destroy(); done('CONNECTED'); });
-          socket.once('error', (error) => done(error.code));
-        });
-        (async () => {
-          const linked = tried(() => fs.linkSync(${JSON.stringify(cached)}, 'linked.sock'));
-          const linkedConnect = await attempt('linked.sock');
-          const renamed = tried(() => fs.renameSync(${JSON.stringify(cached)}, 'moved.sock'));
-          const renamedConnect = await attempt('moved.sock');
-          console.log(JSON.stringify({ linked, linkedConnect, renamed, renamedConnect }));
-        })();
-      `);
-      expect(outcome, described(outcome)).toMatchObject({
-        status: "PASS",
-        enforcement: { networkPolicy: "deny", networkEnforced: true },
-      });
-      expect(connections).toEqual({ linked: "EPERM", linkedConnect: "ENOENT", renamed: "EPERM", renamedConnect: "ENOENT" });
-      expect(reached).toBe(0);
-    } finally {
-      await new Promise<void>((done) => listener.close(() => done()));
-      rmSync(cacheDir, { recursive: true, force: true });
-    }
+    expect(connections).toEqual({ renamed: "EPERM", renamedConnect: "ENOENT" });
+    expect(reached).toBe(0);
+  });
+
+  it("refuses the same through a directory two levels above the listener", async (context) => {
+    requireSeatbelt(context);
+    const { outcome, connections, accepted: reached } = await withCacheListener("a/b/s.sock", (_cached, cacheDir) => probe("deny", ["node", "probe.cjs"], moveProbe(`
+      result.renamed = tried(() => fs.renameSync(${JSON.stringify(join(cacheDir, "a"))}, 'a'));
+      result.renamedConnect = await attempt('a/b/s.sock');
+    `)));
+    expect(outcome, described(outcome)).toMatchObject({
+      status: "PASS",
+      enforcement: { networkPolicy: "deny", networkEnforced: true },
+    });
+    expect(connections).toEqual({ renamed: "EPERM", renamedConnect: "ENOENT" });
+    expect(reached).toBe(0);
+  });
+
+  it("still renames files in a cache and directories in its worktree, at the stated cost to cache directories", async (context) => {
+    requireSeatbelt(context);
+    const { outcome, connections } = await withCacheListener("s.sock", (_cached, cacheDir) => probe("deny", ["node", "probe.cjs"], moveProbe(`
+      const cache = ${JSON.stringify(cacheDir)};
+      fs.writeFileSync(cache + '/entry.tmp', 'cached');
+      result.cacheFileRename = tried(() => fs.renameSync(cache + '/entry.tmp', cache + '/entry'));
+      result.cacheMkdir = tried(() => fs.mkdirSync(cache + '/d1'));
+      result.cacheDirRename = tried(() => fs.renameSync(cache + '/d1', cache + '/d2'));
+      fs.mkdirSync('w1');
+      result.worktreeDirRename = tried(() => fs.renameSync('w1', 'w2'));
+    `)));
+    expect(outcome, described(outcome)).toMatchObject({
+      status: "PASS",
+      enforcement: { networkPolicy: "deny", networkEnforced: true },
+    });
+    expect(connections).toEqual({ cacheFileRename: "ok", cacheMkdir: "ok", cacheDirRename: "EPERM", worktreeDirRename: "ok" });
   });
 
   it("lets a deny command bind and connect its own unix socket in the worktree", async (context) => {

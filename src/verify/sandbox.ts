@@ -1865,10 +1865,17 @@ const seatbeltProfile = (
     `(allow file-write* (subpath ${quote(scratch)}))`,
     "(allow file-write* (subpath \"/dev\"))",
     "(allow file-write-data (literal \"/dev/null\"))",
-    // A deny command reaches a unix socket only in the worktree or scratch, so it may not rename or
-    // link one in from a cache it can write: that would carry an outside listener through the carve-out.
+    // A deny command reaches a unix socket only in the worktree or scratch, so it may not bring one in
+    // from a cache it can write, which would carry an outside listener through the carve-out: not the
+    // socket itself (rename, link) and not any directory above it (rename, swap). The cost: a deny
+    // command cannot rename or remove a directory outside the worktree and scratch, toolchain caches
+    // included (Gradle's offline transforms move directories into place, for one). A command that
+    // needs that is a contract decision of its own; nothing here switches it to `allow`.
     ...(denyNetwork
-      ? [`(deny file-write* (require-all (vnode-type SOCKET) (require-not (subpath ${quote(worktreePath)})) (require-not (subpath ${quote(scratch)}))))`]
+      ? [
+        `(deny file-write* (require-all (vnode-type SOCKET) (require-not (subpath ${quote(worktreePath)})) (require-not (subpath ${quote(scratch)}))))`,
+        `(deny file-write-unlink (require-all (vnode-type DIRECTORY) (require-not (subpath ${quote(worktreePath)})) (require-not (subpath ${quote(scratch)}))))`,
+      ]
       : []),
     ...secrets.map((path) => `(deny network-outbound (remote unix-socket (subpath ${quote(path)})))`),
     ...perAgentDirectories(worktreePath, scratch)
