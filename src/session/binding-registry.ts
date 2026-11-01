@@ -1049,11 +1049,13 @@ export class BindingRegistry {
       // run's pinned owner), whose verification and review would be refused once the pin moves. An
       // expired attempt no longer holds the run whatever this does, so it does not hold the claim back.
       const runList = owned.map(() => "?").join(",");
-      const inFlight = owned.length === 0 ? [] : this.db.all<{ kind: string; id: string; run_id: string }>(
-        `SELECT 'EXECUTION' AS kind, execution_id AS id, run_id FROM task_executions
+      const inFlight = owned.length === 0 ? [] : this.db.all<{
+        kind: string; id: string; run_id: string; runtime_managed: number | null;
+      }>(
+        `SELECT 'EXECUTION' AS kind, execution_id AS id, run_id, runtime_managed FROM task_executions
           WHERE status = 'RUNNING' AND run_id IN (${runList})
          UNION ALL
-         SELECT 'PIPELINE_ATTEMPT' AS kind, attempt_id AS id, run_id FROM candidate_pipeline_attempts
+         SELECT 'PIPELINE_ATTEMPT' AS kind, attempt_id AS id, run_id, NULL AS runtime_managed FROM candidate_pipeline_attempts
           WHERE state = 'RUNNING' AND deadline_at > ? AND owner_session_id = ? AND owner_binding_generation = ?
             AND run_id IN (${runList})
          ORDER BY kind, id`,
@@ -1066,7 +1068,13 @@ export class BindingRegistry {
           {
             roleKey: succession.roleKey,
             runs: [...new Set(inFlight.map((row) => row.run_id))],
-            inFlight: inFlight.map((row) => ({ kind: row.kind, id: row.id, runId: row.run_id })),
+            // An execution says whether a runtime runs it (`runtimeManaged`): a daemon-run turn ends by
+            // itself, a CTO-reported receipt (false) only through its owner's task_receipt_submit or the
+            // next daemon restart.
+            inFlight: inFlight.map((row) => ({
+              kind: row.kind, id: row.id, runId: row.run_id,
+              ...(row.runtime_managed === null ? {} : { runtimeManaged: row.runtime_managed === 1 }),
+            })),
           },
         );
       }
@@ -1079,14 +1087,18 @@ export class BindingRegistry {
         incarnation: succession.toSessionIncarnation,
       };
       const moved = this.#repointLiveRuns(from, to);
-      // The moved runs' HELD resource claims follow their owner pin, or the successor's writes, worker
-      // turns and next verification find no claim of its generation and are refused. Safe here only: the
-      // refusal above means no turn or attempt of these runs is in flight. Every row acquired with a
-      // HELD one moves with it, so an acquisition stays provable (`claimAcquisition`) for the worktree
-      // hand-over and a worker turn; a claim of any other run or owner is not touched.
+      // The moved runs' HELD and EXPIRED resource claims follow their owner pin, or the successor's
+      // writes, worker turns and next verification find no claim of its generation, and finalization
+      // cannot renew a lapsed branch claim (GitHubKernel.assertClaim renews only one of the run's owner
+      // generation). Safe here only: the refusal above means no turn or attempt of these runs is in
+      // flight. Every row acquired with one of them moves with it, so an acquisition stays provable
+      // (`claimAcquisition`) for the worktree hand-over and a worker turn. An acquisition whose rows are
+      // all RELEASED stays where it is (nothing reads one at the owner's generation), and a claim of
+      // any other run or owner is not touched.
       const held = owned.length === 0 ? [] : this.db.all<{ claim_id: string }>(
         `SELECT claim_id FROM resource_claims
-          WHERE status = 'HELD' AND owner_session_id = ? AND owner_binding_generation = ? AND run_id IN (${runList})`,
+          WHERE status IN ('HELD','EXPIRED') AND owner_session_id = ? AND owner_binding_generation = ?
+            AND run_id IN (${runList})`,
         [from.boundSessionId, from.bindingGeneration, ...owned],
       );
       const claims = new Map<string, string>();

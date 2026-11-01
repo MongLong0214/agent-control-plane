@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
+import { digestOf } from "../../src/core/digest.ts";
 import { type Decision, allow, deny } from "../../src/core/errors.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -18,13 +19,16 @@ import {
   type CanonicalSelfClaimReceipt,
   type ProcessSnapshot,
 } from "../../src/registry/canonical-self-claim.ts";
+import { FakeGitHub } from "../helpers/fake-github.ts";
 import { cleanupTempDirs, makeRepo, seedRun } from "../helpers/fixtures.ts";
 import {
   applyPassingChange,
+  approveReviewedCandidateForFinalization,
   bindCeo,
   bindWorker,
   bootstrapCtoProvider,
   driveToReviewedCandidate,
+  installDaemonFinalizerGitHubFixture,
   makeHarness,
   registerFixtureProject,
   reviewerRevise,
@@ -126,10 +130,16 @@ interface FixtureOptions {
   submitting?: boolean;
   /** Also dispatch a second, bare run to generation 1. */
   secondRun?: boolean;
+  /**
+   * Instead, drive a PASS review to CEO_APPROVED on a fake GitHub, with generation 1's branch claim
+   * on the work branch and the finalization gate published: the run the daemon finalizer takes over.
+   */
+  approved?: boolean;
 }
 
 const startFixture = async (options: FixtureOptions = {}) => {
-  const harness = makeHarness();
+  const github = options.approved === true ? new FakeGitHub() : null;
+  const harness = makeHarness(github === null ? {} : { githubClient: github });
   const registered = await registerFixtureProject(harness);
   const { projectId } = registered;
   const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
@@ -190,12 +200,42 @@ const startFixture = async (options: FixtureOptions = {}) => {
   let runId = RUN_ID;
   let executionId: string | null = null;
   let releaseReview: (() => void) | null = null;
+  let approved: Awaited<ReturnType<typeof driveToReviewedCandidate>> | null = null;
   let submission: Promise<Decision<unknown>> | null = null;
   // The canonical CTO's provider is `claude`; dispatch asks its capacity before it pins the owner.
   if (options.liveRun !== false || options.secondRun === true || options.submitting === true) {
     bootstrapCtoProvider(harness.cp, harness.clock);
   }
-  if (options.inFlight === true || options.submitting === true) {
+  if (github !== null) {
+    // `github-r2`'s finalization fixture, with this canonical CTO as the run's owner.
+    harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
+    const driven = await driveToReviewedCandidate(harness, { registeredProject: registered, workBranch: "feature/F1-thing" });
+    expect(driven).toMatchObject({ ownerSessionId: predecessor.sessionId, ownerBindingGeneration: 1 });
+    github.setBranch("dev", driven.baseHead);
+    github.setBranch("main", "m".repeat(40));
+    github.setBranch(driven.workBranch, driven.candidateHead);
+    const branchClaim = harness.cp.claims.acquire({
+      runId: driven.runId, ownerSessionId: predecessor.sessionId, ownerBindingGeneration: 1, ownerRoleKey: roleKey,
+      repositoryIdentity: driven.identity, branch: driven.workBranch,
+    });
+    if (!branchClaim.allowed) throw new Error(branchClaim.message);
+    await approveReviewedCandidateForFinalization(harness, driven);
+    installDaemonFinalizerGitHubFixture(harness);
+    const gate = await harness.cp.github.gatePublish({
+      runId: driven.runId,
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      contractDigest: driven.contractDigest,
+      verificationDigest: driven.verificationDigest,
+      blindReviewDigest: driven.blindReviewDigest,
+      humanGateDigest: digestOf({ humanGate: "NOT_REQUIRED" }),
+      bindingGeneration: 1,
+      exactHead: driven.candidateHead,
+      timestamp: "2026-08-12T00:00:00.000Z",
+    }, driven.identity);
+    if (!gate.allowed) throw new Error(`${gate.reasonCode}: ${gate.message}`);
+    runId = driven.runId;
+    approved = driven;
+  } else if (options.inFlight === true || options.submitting === true) {
     // The real run path up to a worker turn the daemon has started and not finished.
     if (!harness.cp.bindings.active(roleKeyFor(Role.CEO))) bindCeo(harness);
     const created = harness.cp.runs.create({
@@ -343,7 +383,7 @@ const startFixture = async (options: FixtureOptions = {}) => {
   };
 
   return {
-    harness, db, projectId, roleKey, runId, secondRunId, executionId, releaseReview, submission, runOne,
+    harness, db, projectId, roleKey, runId, secondRunId, executionId, releaseReview, submission, approved, runOne,
     first: first.value, predecessor, claimAs,
     work, owner, assignments,
     takeovers, durable, expectUnchangedBut,
@@ -681,7 +721,7 @@ describe("a resumed resident CTO keeps its live runs (CEO msg_00ce7760, option A
     expect(refused).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.PREDECESSOR_WORKER_TURN_IN_FLIGHT,
-      evidence: { runs: [f.runId], inFlight: [{ kind: "EXECUTION", id: f.executionId, runId: f.runId }] },
+      evidence: { runs: [f.runId], inFlight: [{ kind: "EXECUTION", id: f.executionId, runId: f.runId, runtimeManaged: false }] },
     });
     f.expectUnchangedBut(before, refused);
     expect(executionOf()).toMatchObject({ status: "RUNNING", owner_binding_generation: 1 });
@@ -689,7 +729,8 @@ describe("a resumed resident CTO keeps its live runs (CEO msg_00ce7760, option A
     expect(f.owner()).toMatchObject({ owner_session_id: f.predecessor.sessionId, owner_binding_generation: 1 });
     expect(harness.cp.bindings.active(f.roleKey)?.bindingGeneration).toBe(1);
 
-    // The daemon-owned turn ends by itself under the generation that started it.
+    // The turn ends under the generation that started it: this one is a CTO-reported receipt
+    // (runtimeManaged false), finished through the receipt path rather than by itself.
     const head = applyPassingChange(harness.repoPath, "feature/F1-thing");
     const finished = harness.cp.tasks.finishExecution(f.executionId!, { status: "SUCCEEDED", resultDigest: `sha256:${head}` });
     expect(finished.allowed, JSON.stringify(finished)).toBe(true);
@@ -1005,5 +1046,38 @@ describe("a resumed resident CTO keeps its live runs (CEO msg_00ce7760, option A
     f.expectUnchangedBut(before, refused);
     expect(claimsOf(f)).toEqual(claimsBefore);
     expect(claimsOf(f).every((row) => row["owner_binding_generation"] === 1)).toBe(true);
+  });
+
+  it("W21 (N1) — a branch claim that lapsed before the takeover is renewed for finalization under gen 2", async () => {
+    const f = await startFixture({ approved: true });
+    const { harness, db } = f;
+    const driven = f.approved!;
+    expect(harness.cp.runs.require(f.runId).state).toBe(RunState.CEO_APPROVED);
+    const branchClaim = () => db.get<Record<string, unknown>>(
+      `SELECT * FROM resource_claims WHERE run_id = ? AND branch = ?`, [f.runId, driven.workBranch]);
+    // The run waited past the claim's lease; the daemon's sweep marked it EXPIRED, still gen 1's.
+    harness.clock.advance(2 * 60 * 60 * 1000 + 1_000);
+    harness.cp.claims.expireOverdue();
+    expect(branchClaim()).toMatchObject({ status: "EXPIRED", owner_session_id: f.predecessor.sessionId, owner_binding_generation: 1 });
+
+    const claimed = await f.claimAs(2);
+    expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
+    if (!claimed.allowed) return;
+    const afterTakeover = branchClaim();
+
+    const prepared = await harness.cp.github.prPrepare({
+      runId: f.runId, repositoryIdentity: driven.identity, head: driven.workBranch, base: "dev", title: "candidate", body: "",
+      ownerSessionId: claimed.value.sessionId, ownerBindingGeneration: 2, exactHeadSha: driven.candidateHead,
+      daemonFinalizerAuthority: harness.cp.daemonFinalizationAuthorities().write,
+    });
+
+    expect(prepared.reasonCode, JSON.stringify(prepared)).not.toBe(ReasonCode.MERGE_CLAIM_INVALID);
+    expect(afterTakeover).toMatchObject({ status: "EXPIRED", owner_session_id: claimed.value.sessionId, owner_binding_generation: 2 });
+    expect(branchClaim()).toMatchObject({ status: "HELD", owner_session_id: claimed.value.sessionId, owner_binding_generation: 2 });
+    expect(new Date(String(branchClaim()!["expires_at"])).getTime()).toBeGreaterThan(harness.clock.now().getTime());
+    expect(db.all(`SELECT kind FROM audit_events WHERE kind = 'CLAIM_RENEWED_FOR_FINALIZATION' AND run_id = ?`, [f.runId]))
+      .toHaveLength(1);
+    // And the finalization step itself goes through under the successor.
+    expect(prepared.allowed, JSON.stringify(prepared)).toBe(true);
   });
 });
