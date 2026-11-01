@@ -631,7 +631,8 @@ export class ControlPlane {
             preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
             fallbacks: [{ provider: "claude", model: "opus", effort: null }],
           }),
-          projects: projectReviewers.byProject,
+          // Absent unless an entry applies, so the default preferences are exactly what they were.
+          ...(projectReviewers.byProject.size === 0 ? {} : { projects: projectReviewers.byProject }),
         },
         config.reviewerEgress?.providerEndpoints ?? REVIEWER_PROVIDER_ENDPOINTS,
       );
