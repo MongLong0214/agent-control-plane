@@ -197,6 +197,15 @@ export interface DeadBindingRecoveryDeps {
    * that refusal for its successor to see.
    */
   holdPeerMessagesForSameActorSuccessor?: { readonly alreadyCarried: string[] };
+  /**
+   * Release a binding that still owns live runs instead of refusing REVOCATION_BLOCKED_ACTIVE_RUNS,
+   * naming them in `runIds`. Only the canonical self-claim sets it: it binds the same conversational
+   * actor's next generation inside this same transaction and moves exactly these runs to it
+   * (`BindingRegistry.repointLiveRunsToSameActorSuccessor`) once the succession is proven, or
+   * refuses and rolls the release back. The operator door passes nothing: it binds no successor,
+   * so a binding that owns live runs is still refused there.
+   */
+  takeOverLiveRunsForSameActorSuccessor?: { readonly runIds: string[] };
 }
 
 export interface DeadBindingRecoveryReceipt {
@@ -412,9 +421,14 @@ export const recoverDeadCanonicalBinding = (
     const revoked = deps.bindings.revoke(
       roleKey,
       `dead canonical binding recovery: session ${request.sessionId} process ${session.osPid ?? "unknown"} is gone`,
-      deps.holdPeerMessagesForSameActorSuccessor === undefined
-        ? {}
-        : { holdPeerMessagesForSameActorSuccessor: deps.holdPeerMessagesForSameActorSuccessor },
+      {
+        ...(deps.holdPeerMessagesForSameActorSuccessor === undefined
+          ? {}
+          : { holdPeerMessagesForSameActorSuccessor: deps.holdPeerMessagesForSameActorSuccessor }),
+        ...(deps.takeOverLiveRunsForSameActorSuccessor === undefined
+          ? {}
+          : { liveRunsForSameActorSuccessor: deps.takeOverLiveRunsForSameActorSuccessor }),
+      },
     );
     if (!revoked.allowed) return revoked as Decision<DeadBindingRecoveryReceipt>;
 

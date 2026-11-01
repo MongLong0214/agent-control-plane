@@ -2245,6 +2245,12 @@ export class CanonicalSelfClaim {
         actorId: string;
         recoveryAuditEventId: number | null;
         alreadyCarried: string[];
+        /** The live runs the release left pinned to the predecessor generation, for the successor. */
+        liveRunIds: string[];
+        /** The release's proof, for the takeover's record: the probe's answer and what it probed. */
+        liveness: string;
+        osPid: number | null;
+        osProcessStartedAt: string | null;
       } | null = null;
       // Liveness of a row is not liveness of a process (#831). This branch's subject is a *live*
       // runtime replacing its own revoked attachment, so a predecessor whose recorded
@@ -2292,6 +2298,7 @@ export class CanonicalSelfClaim {
           // format this claim recorded it and the two reads cannot disagree about one row.
           const startedAt = (pid: number) => this.#processInspector.snapshot(pid)?.startedAt ?? null;
           const hold = { alreadyCarried: [] as string[] };
+          const liveRuns = { runIds: [] as string[] };
           const released = recoverDeadCanonicalBinding(`${SELF_CLAIM_RECOVERY_ACTOR_PREFIX}${incumbent.actor_id}`, {
             projectId,
             role: Role.PRIMARY_CTO,
@@ -2311,6 +2318,13 @@ export class CanonicalSelfClaim {
             // same conversation. So those rows are held, and carried or rejected after `bind`
             // below, inside this transaction. Every other revoke still rejects them.
             holdPeerMessagesForSameActorSuccessor: hold,
+            // Policy change (CEO msg_00ce7760, option A): the revoke used to refuse
+            // REVOCATION_BLOCKED_ACTIVE_RUNS whenever the dead predecessor still owned a live run,
+            // so a resumed resident CTO could keep its conversation or its runs, never both. The
+            // runs are left pinned here and moved to the successor after `bind` below, only once
+            // the succession is proven, inside this transaction; unproven, the claim refuses with
+            // that same code and rolls everything back. Every other revoke still refuses.
+            takeOverLiveRunsForSameActorSuccessor: liveRuns,
           });
           if (!released.allowed) return released as Decision<CanonicalSelfClaimReceipt>;
           recoveredFrom = {
@@ -2321,6 +2335,10 @@ export class CanonicalSelfClaim {
             actorId: incumbent.actor_id,
             recoveryAuditEventId: released.value.recoveryAuditEventId,
             alreadyCarried: hold.alreadyCarried,
+            liveRunIds: liveRuns.runIds,
+            liveness: released.value.liveness,
+            osPid: predecessor.osPid,
+            osProcessStartedAt: predecessor.osProcessStartedAt,
           };
         }
       } else if (incumbent && predecessor &&
@@ -2510,10 +2528,51 @@ export class CanonicalSelfClaim {
           buzzActorId: entry.buzzActorId,
           recoveryAuditEventId: recoveredFrom.recoveryAuditEventId,
         };
-        this.bindings.carryPeerMessagesToSameActorSuccessor(
-          new PeerMessageCarryAuthorityToken(this.db, { ...facts, proven: peerMessageSuccessionIsProven(this.db, facts) }),
-          recoveredFrom.alreadyCarried,
-        );
+        const succession = new PeerMessageCarryAuthorityToken(this.db, {
+          ...facts,
+          proven: peerMessageSuccessionIsProven(this.db, facts),
+        });
+        this.bindings.carryPeerMessagesToSameActorSuccessor(succession, recoveredFrom.alreadyCarried);
+        // The runs the release left pinned to the dead generation move to this one on the same
+        // proof the carry rests on, or the claim refuses and the release rolls back with it. Only
+        // the owner pin moves; the run, its contract, candidate and reviews stay as they are.
+        if (recoveredFrom.liveRunIds.length > 0) {
+          const moved = this.bindings.repointLiveRunsToSameActorSuccessor(succession, recoveredFrom.liveRunIds);
+          if (!moved.allowed) return moved as Decision<CanonicalSelfClaimReceipt>;
+          let recorded: Decision<number>;
+          try {
+            recorded = this.audit.record({
+              kind: "CANONICAL_LIVE_RUNS_TAKEN_OVER",
+              reasonCode: ReasonCode.OK,
+              projectId: entry.projectId,
+              sessionId: created.sessionId,
+              roleKey,
+              actor: `${SELF_CLAIM_RECOVERY_ACTOR_PREFIX}${recoveredFrom.actorId}`,
+              evidence: {
+                runIds: moved.value.runIds,
+                fromGeneration: recoveredFrom.generation,
+                toGeneration: bound.value.bindingGeneration,
+                fromSession: recoveredFrom.sessionId,
+                toSessionId: created.sessionId,
+                actorId: recoveredFrom.actorId,
+                recoveryAuditEventId: recoveredFrom.recoveryAuditEventId,
+                sessionIncarnation: recoveredFrom.sessionIncarnation,
+                osPid: recoveredFrom.osPid,
+                recordedStartedAt: recoveredFrom.osProcessStartedAt,
+                liveness: recoveredFrom.liveness,
+              },
+            });
+          } catch (error) {
+            recorded = deny(ReasonCode.AUDIT_WRITE_FAILED, error instanceof Error ? error.message : String(error), {});
+          }
+          if (!recorded.allowed) {
+            return deny(
+              ReasonCode.AUDIT_WRITE_FAILED,
+              "the live-run takeover's audit row could not be written, so the claim was rolled back",
+              { roleKey, runs: moved.value.runIds },
+            );
+          }
+        }
       }
 
       const admitted = allow(ReasonCode.OK, {

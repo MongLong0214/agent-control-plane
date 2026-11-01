@@ -19,7 +19,7 @@ import {
   roleKeyFor,
 } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
-import type { PeerMessageCarryAuthority } from "../registry/canonical-self-claim.ts";
+import { type PeerMessageCarryAuthority, peerMessageCarrySuccessionOf } from "../registry/canonical-self-claim.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
 import { servedHermesHeads } from "./hermes-target-head.ts";
 import type { SessionRegistry } from "./session-registry.ts";
@@ -646,43 +646,10 @@ export class BindingRegistry {
       // leave a run pinned to a revoked generation.
       let repointed = 0;
       if (current && input.takeover) {
-        const affectedRuns = this.liveRunsOwnedBy(current);
-        const staleExecutions = affectedRuns.flatMap((affected) => this.db.all<{ execution_id: string }>(
-          `SELECT execution_id FROM task_executions
-            WHERE run_id = ? AND status = 'RUNNING' AND owner_binding_generation <> ?`,
-          [affected.run_id, generation],
-        ));
-        if (staleExecutions.length > 0 && !this.#tasks) {
-          return deny(
-            ReasonCode.BINDING_GENERATION_STALE,
-            "takeover cannot repoint live runs until stale executions can be abandoned",
-            {
-              roleKey,
-              runs: affectedRuns.map((run) => run.run_id),
-              executions: staleExecutions.map((execution) => execution.execution_id),
-            },
-          );
-        }
-        repointed = this.db.run(
-          `UPDATE runs SET owner_session_id = ?, owner_binding_generation = ?,
-                           owner_session_incarnation = ?, owner_role_key = ?
-            WHERE owner_session_id = ? AND owner_binding_generation = ? AND owner_role_key = ?
-              AND state IN (${LIVE_RUN_STATES.map(() => "?").join(",")})`,
-          [
-            // Both sides are identity: the new row's own binding-time runtime, and the outgoing
-            // binding's. `current.sessionId` is the live view and would fail to match the tuple
-            // the run actually holds (#493).
-            input.sessionId, generation, session.incarnation, roleKey,
-            current.boundSessionId, current.bindingGeneration, current.roleKey, ...LIVE_RUN_STATES,
-          ],
-        ).changes;
-        for (const affected of affectedRuns) {
-          this.#tasks?.abandonStaleExecutions(
-            affected.run_id,
-            generation,
-            `binding takeover: ${input.reason}`,
-          );
-        }
+        const to = { roleKey, sessionId: input.sessionId, generation, incarnation: session.incarnation };
+        const repointable = this.#liveRunsRepointable(current, to);
+        if (!repointable.allowed) return repointable as Decision<RoleBinding>;
+        repointed = this.#repointLiveRuns(current, to, input.reason).repointed;
       }
 
       const fence = current
@@ -927,6 +894,15 @@ export class BindingRegistry {
        */
       holdPeerMessagesForSameActorSuccessor?: { readonly alreadyCarried: string[] };
       /**
+       * Leave this generation's live runs pinned to it instead of refusing
+       * REVOCATION_BLOCKED_ACTIVE_RUNS, and name every one in `runIds`. Only the canonical
+       * self-claim's dead-predecessor recovery passes it, because it binds the same actor's next
+       * generation in the same transaction and then moves exactly these runs to it with
+       * `repointLiveRunsToSameActorSuccessor`, which refuses unless the succession is proven; that
+       * refusal rolls the revoke back with the claim. Every other revoke refuses as before.
+       */
+      liveRunsForSameActorSuccessor?: { readonly runIds: string[] };
+      /**
        * Hold this generation's PENDING, unclaimed ESCALATION_REPLY rows instead of rejecting them
        * (`Outbox.retargetOrReject`'s escalation-reply hold), for the same session's renewal of the
        * run's owner at the next generation to carry once (`RunEngine.restoreRecoveredBootstrapOwner`).
@@ -944,7 +920,9 @@ export class BindingRegistry {
       const held: readonly string[] = options.allowHeldRuns
         ? ["BLOCKED", "REVISION_REQUIRED", "AWAITING_HUMAN"]
         : options.allowBlockedRuns ? ["BLOCKED"] : [];
-      const orphaned = ownedRuns.filter((run) => !held.includes(run.state));
+      const successorRuns = options.liveRunsForSameActorSuccessor;
+      successorRuns?.runIds.push(...ownedRuns.map((run) => run.run_id));
+      const orphaned = successorRuns ? [] : ownedRuns.filter((run) => !held.includes(run.state));
       if (orphaned.length > 0) {
         return deny(
           ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,
@@ -1007,6 +985,117 @@ export class BindingRegistry {
     alreadyCarried: readonly string[] = [],
   ): { retargeted: string[]; rejected: string[] } {
     return this.outbox.carryPeerMessagesToSameActorSuccessor(authority, alreadyCarried);
+  }
+
+  /**
+   * The second half of `revoke`'s `liveRunsForSameActorSuccessor`: the §10.3 takeover's own run
+   * repoint (`#repointLiveRuns`), for one same-conversation canonical restart. The succession comes
+   * from the self-claim's authority, never from the caller, and it must be proven
+   * (`peerMessageSuccessionIsProven`: same actor, conversation UUID, role, project and Buzz identity,
+   * N to N + 1, and the predecessor's DEAD_BINDING_RECOVERED row); otherwise this refuses
+   * REVOCATION_BLOCKED_ACTIVE_RUNS, the refusal the revoke would have given. Exactly the runs the
+   * revoke named are moved, or nothing is. Only the owner pin moves: run, contract, candidate and
+   * evidence rows are not touched, and nothing is re-run or passed.
+   */
+  repointLiveRunsToSameActorSuccessor(
+    authority: PeerMessageCarryAuthority,
+    runIds: readonly string[],
+  ): Decision<{ runIds: string[] }> {
+    return this.db.txDecision(() => {
+      const succession = peerMessageCarrySuccessionOf(authority, this.db);
+      if (succession === null || !succession.proven) {
+        return deny(
+          ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,
+          "the released binding owns live runs and its successor is not proven to be the same conversation",
+          { roleKey: succession?.roleKey ?? null, runs: [...runIds] },
+        );
+      }
+      const from = {
+        roleKey: succession.roleKey,
+        boundSessionId: succession.fromSessionId,
+        bindingGeneration: succession.fromGeneration,
+      };
+      const owned = this.liveRunsOwnedBy(from).map((run) => run.run_id).sort();
+      if (owned.join("\n") !== [...runIds].sort().join("\n")) {
+        return deny(ReasonCode.CONFLICT, "the released generation's live runs changed before they could be moved", {
+          roleKey: succession.roleKey,
+          expected: [...runIds],
+          found: owned,
+        });
+      }
+      const to = {
+        roleKey: succession.roleKey,
+        sessionId: succession.toSessionId,
+        generation: succession.toGeneration,
+        incarnation: succession.toSessionIncarnation,
+      };
+      const repointable = this.#liveRunsRepointable(from, to);
+      if (!repointable.allowed) return repointable as Decision<{ runIds: string[] }>;
+      // Every refusal is above: the update below matches exactly the rows `owned` read, in this
+      // transaction, so it moves all of them.
+      const moved = this.#repointLiveRuns(from, to,
+        `same-conversation canonical restart, generation ${succession.fromGeneration} to ${succession.toGeneration}`);
+      return allow(ReasonCode.OK, { runIds: moved.runIds });
+    });
+  }
+
+  /**
+   * §10.3 — whether `from`'s live runs can be moved onto `to.generation`: refused while a stale
+   * RUNNING execution has no task graph to abandon it. Read-only, so a caller refuses before it writes.
+   */
+  #liveRunsRepointable(
+    from: Pick<RoleBinding, "roleKey" | "boundSessionId" | "bindingGeneration">,
+    to: { roleKey: string; generation: number },
+  ): Decision<void> {
+    const affectedRuns = this.liveRunsOwnedBy(from);
+    const staleExecutions = affectedRuns.flatMap((affected) => this.db.all<{ execution_id: string }>(
+      `SELECT execution_id FROM task_executions
+        WHERE run_id = ? AND status = 'RUNNING' AND owner_binding_generation <> ?`,
+      [affected.run_id, to.generation],
+    ));
+    if (staleExecutions.length > 0 && !this.#tasks) {
+      return deny(
+        ReasonCode.BINDING_GENERATION_STALE,
+        "takeover cannot repoint live runs until stale executions can be abandoned",
+        {
+          roleKey: to.roleKey,
+          runs: affectedRuns.map((run) => run.run_id),
+          executions: staleExecutions.map((execution) => execution.execution_id),
+        },
+      );
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * §10.3 — repoints every live run `from` owns onto `to` and abandons their stale executions, in
+   * the caller's transaction, so a crash cannot leave a run pinned to a revoked generation. Used by
+   * `switchTo`'s takeover and by `repointLiveRunsToSameActorSuccessor`, each after
+   * `#liveRunsRepointable`.
+   */
+  #repointLiveRuns(
+    from: Pick<RoleBinding, "roleKey" | "boundSessionId" | "bindingGeneration">,
+    to: { roleKey: string; sessionId: string; generation: number; incarnation: string },
+    reason: string,
+  ): { runIds: string[]; repointed: number } {
+    const affectedRuns = this.liveRunsOwnedBy(from);
+    const repointed = this.db.run(
+      `UPDATE runs SET owner_session_id = ?, owner_binding_generation = ?,
+                       owner_session_incarnation = ?, owner_role_key = ?
+        WHERE owner_session_id = ? AND owner_binding_generation = ? AND owner_role_key = ?
+          AND state IN (${LIVE_RUN_STATES.map(() => "?").join(",")})`,
+      [
+        // Both sides are identity: the new row's own binding-time runtime, and the outgoing
+        // binding's. `current.sessionId` is the live view and would fail to match the tuple
+        // the run actually holds (#493).
+        to.sessionId, to.generation, to.incarnation, to.roleKey,
+        from.boundSessionId, from.bindingGeneration, from.roleKey, ...LIVE_RUN_STATES,
+      ],
+    ).changes;
+    for (const affected of affectedRuns) {
+      this.#tasks?.abandonStaleExecutions(affected.run_id, to.generation, `binding takeover: ${reason}`);
+    }
+    return { runIds: affectedRuns.map((run) => run.run_id), repointed };
   }
 
   active(roleKey: string): RoleBinding | null {
@@ -1808,7 +1897,9 @@ export class BindingRegistry {
     return (row?.maximum ?? 0) + 1;
   }
 
-  private liveRunsOwnedBy(binding: RoleBinding): Array<{ run_id: string; state: string }> {
+  private liveRunsOwnedBy(
+    binding: Pick<RoleBinding, "roleKey" | "boundSessionId" | "bindingGeneration">,
+  ): Array<{ run_id: string; state: string }> {
     return this.db.all<{ run_id: string; state: string }>(
       `SELECT run_id, state FROM runs
         WHERE owner_session_id = ? AND owner_binding_generation = ? AND owner_role_key = ?
