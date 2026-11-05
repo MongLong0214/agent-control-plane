@@ -107,6 +107,77 @@ describe("non-interactive account usage (#582)", () => {
     expect(reading.buckets.every((bucket) => bucket.measuredAs === "used")).toBe(true);
   });
 
+  it("names a subscription with no window as usage the CLI could not get, through a real fake CLI", async () => {
+    // What claude 2.1.283 printed on the isolated instance, whose usage reading was five days old
+    // and which had no other Claude session to keep it young: the subscription line and nothing
+    // else. It is still no reading, so the provider stays ERROR. Only the sentence changes, so an
+    // operator can tell this from a trust warning or a cost summary, which the generic one also covers.
+    const root = tempDir("acp-claude-usage-unavailable-");
+    const binary = join(root, "claude-usage-unavailable.mjs");
+    writeFileSync(
+      binary,
+      `#!${process.execPath}\n` +
+        `const args = process.argv.slice(2);\n` +
+        `if (args[args.length - 1] !== "/usage") process.exit(2);\n` +
+        `process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, num_turns: 0,\n` +
+        `  total_cost_usd: 0, result: "You are currently using your subscription to power your Claude Code usage" }));\n`,
+    );
+    chmodSync(binary, 0o700);
+
+    const reading = await new ClaudeUsageCollector({
+      clock: clock(),
+      binary,
+      timeoutMs: 8_000,
+      accountIdentity: null,
+    }).collect();
+
+    expect(reading.sensorHealth).toBe("ERROR");
+    expect(reading.buckets).toEqual([]);
+    expect(reading.error).toContain("stated a subscription but no quota window (1 line(s) read)");
+    expect(reading.error).toContain("usage not available, because the CLI could not get the plan's usage");
+    expect(reading.error).not.toContain("neither a usage report nor a recognised refusal");
+  });
+
+  it("names the overage and local-history forms the same way, and nothing that never stated a subscription", () => {
+    const now = clock().nowIso();
+    const unavailable = (text: string): string => {
+      const parsed = parseNonInteractiveUsage("claude", text, now);
+      expect(parsed.ok, text).toBe(false);
+      return parsed.ok ? "" : parsed.error;
+    };
+
+    // The overage form, and the subscription line followed by the local-history section the CLI
+    // prints from this machine's own transcripts, with no window between them.
+    for (const text of [
+      "You are currently using your overages to power your Claude Code usage. We will automatically " +
+        "switch you back to your subscription rate limits when they reset",
+      [
+        "You are currently using your subscription to power your Claude Code usage",
+        "",
+        "What's contributing to your limits usage?",
+        "  90% of your usage was at >150k context",
+        "  Top MCP servers: acp-cto 21%",
+      ].join("\n"),
+    ]) {
+      expect(unavailable(text), text).toContain("usage not available, because the CLI could not get the plan's usage");
+    }
+
+    // Measured 2026-11-06 from the real CLI with a HOME that is not signed in, and earlier with no
+    // `USER`: a cost summary. Not the subscription case, so not that sentence.
+    const costSummary = [
+      "Total cost:            $0.0000",
+      "Total duration (API):  0s",
+      "Total duration (wall): 0s",
+      "Total code changes:    0 lines added, 0 lines removed",
+      "Usage:                 0 input, 0 output, 0 cache read, 0 cache write",
+    ].join("\n");
+    for (const text of [costSummary, "Claude Code could not read this project's settings"]) {
+      const error = unavailable(text);
+      expect(error, text).toContain("neither a usage report nor a recognised refusal");
+      expect(error, text).not.toContain("usage not available");
+    }
+  });
+
   it("refuses a window-shaped line it cannot read, and steps over prose that merely quotes one", () => {
     // Two opposite hazards, one boundary. Skipping an unreadable *window* loses a constraint and
     // lets the survivors route alone. Refusing on any line that mentions a percentage makes a
