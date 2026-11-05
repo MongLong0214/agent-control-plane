@@ -184,7 +184,7 @@ const applicationFixture = async () => {
   const [hermesSocket, ctoSocket] = listeners.socketPaths;
   if (!hermesSocket || !ctoSocket) throw new Error("the MCP listeners were not started");
   harness.cp.sessionRuntime.attach({
-    delivery: launch,
+    delivery: launch.driven,
     route: { launchSocketPath: launch.socketPath, mcpSocketPath: ctoSocket },
   });
 

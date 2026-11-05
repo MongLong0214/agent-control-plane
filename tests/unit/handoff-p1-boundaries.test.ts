@@ -393,8 +393,8 @@ describe("handoff P1 child boundaries", () => {
     expect(rows.get("outside assigned roots")?.message).toMatch(/Operation not permitted|Permission denied/);
   });
 
-  // The network is open since 2026-10-31: a shell reaches a local server, and the evidence says
-  // `allow` rather than claiming a denial that was not in force.
+  // A command that declares `network: "allow"` has the network open: a shell reaches a local server,
+  // and the evidence says `allow` rather than claiming a denial that was not in force.
   it("P1-15 records that a shell reaches the network, and that no denial was in force", async () => {
     const server = createServer((socket) => {
       socket.on("error", () => undefined);
@@ -417,7 +417,7 @@ except OSError as error:
     print("network\tlocalhost\t1\t%s\t%s" % (errno.errorcode.get(error.errno, "UNKNOWN"), str(error)))
 `)}`;
       const outcome = await runSandboxed({
-        command: shellCommand("shell-network-open", script),
+        command: shellCommand("shell-network-open", script, { network: "allow" }),
         worktreePath: tempDir("acp-p1-15-network-worktree-"),
       });
       const row = probeRows(outcome.stdout)[0];

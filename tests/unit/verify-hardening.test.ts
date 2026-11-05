@@ -821,7 +821,7 @@ exec /bin/ps "$@"
     expect(outcome).toMatchObject({
       status: "PASS", exitCode: 0, signal: null,
       stdout: "TITLE_OK_SECRETS_DENIED\n",
-      enforcement: { networkEnforced: false, writeConfinement: true, resourceLimitsEnforced: true, childContainmentEnforced: true },
+      enforcement: { networkEnforced: true, writeConfinement: true, resourceLimitsEnforced: true, childContainmentEnforced: true },
     });
   });
 

@@ -20,7 +20,7 @@ import {
   type SessionCredentialDelivery,
   drivenModeOf,
 } from "../../src/runtime/provisioned-session-runtime.ts";
-import { RecordingRuntimeDouble, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
+import { RecordingRuntimeDouble, drivenDoorStandIn, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { drivenPrimary } from "../helpers/driven-primary-cto.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { type Harness, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
@@ -113,13 +113,17 @@ const startDaemonProcess = async (harness: Harness, claude: RecordingRuntimeDoub
   harness.cp.providers.registerForRole(claude, Role.PRIMARY_CTO);
   const launch = await startSessionLaunchChannel(tempDir("acp-o4a-launch-"), { mcpToken: TOKEN });
   const offered: SessionLaunchCredential[] = [];
+  // #1336 — the runtime is attached with the channel's driven door, as `main` attaches it; the double
+  // takes what that door offers through the fixture's stand-in for the Mach hand-over.
+  const door = drivenDoorStandIn(launch, TOKEN);
+  claude.useInProcess({ launch: door });
   const delivery: SessionCredentialDelivery = {
-    prepare: () => launch.prepare(),
+    prepare: () => door.prepare(),
     provision: (credential) => {
       offered.push(credential);
-      return launch.provision(credential);
+      return door.provision(credential);
     },
-    withdraw: (externalSessionId) => launch.withdraw(externalSessionId),
+    withdraw: (externalSessionId) => door.withdraw(externalSessionId),
   };
   const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-o4a-mcp-"), TOKEN);
   const [hermesSocket, ctoSocket] = listeners.socketPaths;
@@ -247,6 +251,54 @@ describe("O4 W1 — a cto_start PRIMARY_CTO survives a daemon restart", () => {
   });
 });
 
+describe("#1336 R-1 — after a restart a driven CTO's old secret authenticates nothing until recovery rotates it", () => {
+  it("refuses the old secret on the READY row a fresh runtime holds nothing for, and admits the secret recovery adopts", async () => {
+    const clock = new ManualClock("2026-10-31T00:00:00.000Z");
+    const first = makeHarness({ clock });
+    const claude = new RecordingRuntimeDouble(clock, "claude");
+    const before = await startDaemonProcess(first, claude);
+    // What the first runtime adopts, and later what the second adopts: the secrets the test presents.
+    claude.observeCredentialCustody(first.cp.sessionRuntime, first.cp.sessions, TOKEN);
+    let after: DaemonProcess | null = null;
+    try {
+      const { projectId } = await registerFixtureProject(first, "r1-restart");
+      const ceo = bindCeo(first);
+      expect(await callMcpToolOverSocket(before.hermesSocket, ceo, "cto_start", { idempotencyKey: "r1-cto-start", projectId })).toMatchObject({ ok: true });
+      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+      const binding = first.cp.bindings.active(roleKey)!;
+      const old = claude.credentials.get(binding.sessionId)!;
+      const oldAs = { token: TOKEN, sessionId: binding.sessionId, sessionSecret: old.sessionSecret };
+      expect(await callMcpToolOverSocket(before.ctoSocket, oldAs, "role_dispatch_pending", {})).toMatchObject({ ok: true });
+
+      await before.close();
+      const second = makeHarness({ root: first.root, repoPath: first.repoPath, clock });
+      after = await startDaemonProcess(second, claude);
+      claude.observeCredentialCustody(second.cp.sessionRuntime, second.cp.sessions, TOKEN);
+      const cp = second.cp;
+      // The row is READY and the registry alone would accept the old secret; the fresh runtime holds nothing.
+      expect(cp.sessions.require(binding.sessionId)).toMatchObject({ lifecycle: SessionLifecycle.READY, credentialEpoch: 0 });
+      expect(cp.sessions.verifySecret(binding.sessionId, old.sessionSecret).allowed).toBe(true);
+      expect(cp.sessionRuntime.holds(binding.sessionId)).toBe(false);
+      expect(await callMcpToolOverSocket(after.ctoSocket, oldAs, "role_dispatch_pending", {})).toMatchObject({
+        ok: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED, evidence: { reason: "DRIVEN_CREDENTIAL_NOT_HELD" },
+      });
+
+      // Recovery rotates and adopts: the new secret authenticates, the old one is dead by the registry too.
+      await after.daemon.reconcileContinuity("the daemon restarted");
+      expect(cp.sessions.require(binding.sessionId).credentialEpoch).toBe(1);
+      expect(cp.sessionRuntime.holds(binding.sessionId)).toBe(true);
+      const renewed = claude.credentials.get(binding.sessionId)!;
+      expect(renewed.sessionSecret).not.toBe(old.sessionSecret);
+      expect(await callMcpToolOverSocket(after.ctoSocket, { token: TOKEN, sessionId: binding.sessionId, sessionSecret: renewed.sessionSecret }, "role_dispatch_pending", {}))
+        .toMatchObject({ ok: true });
+      expect(await callMcpToolOverSocket(after.ctoSocket, oldAs, "role_dispatch_pending", {})).toMatchObject({ ok: false });
+    } finally {
+      await after?.close();
+      await before.close();
+    }
+  });
+});
+
 /**
  * A `claude` stand-in in the session's own workdir: it answers as the conversation its argv names and
  * reports its parent's pid, which is the process the daemon spawned for the turn (the group holder that
@@ -270,8 +322,8 @@ describe("O4 pin — a relayed turn is pinned to the daemon's own spawn of claud
       const cp = f.harness.cp;
       const { binding } = await drivenPrimary(f, "o4a-pin");
       const offered: SessionLaunchCredential[] = [];
-      const provision = f.launch.provision.bind(f.launch);
-      f.launch.provision = (credential) => {
+      const provision = f.drivenDoor.provision.bind(f.drivenDoor);
+      f.drivenDoor.provision = (credential) => {
         offered.push(credential);
         return provision(credential);
       };

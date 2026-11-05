@@ -6,7 +6,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { ManualClock } from "../../src/core/clock.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, Role, RunKind, roleKeyFor } from "../../src/domain/types.ts";
-import { ClaudeCliAdapter, __testing, claudeTranscriptDirectory, sessionRelayScript } from "../../src/runtime/cli-adapters.ts";
+import { ClaudeCliAdapter, __testing, claudeTranscriptDirectory, machLaunchAddonPath, sessionRelayScript } from "../../src/runtime/cli-adapters.ts";
 import type { SessionTurnRequest } from "../../src/runtime/provider.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { bootstrapCtoProvider, dispatchBootstrapRun, makeHarness } from "../helpers/harness.ts";
@@ -112,7 +112,7 @@ describe("C1b adapter: a session turn is one conversation, opened once and resum
     }
   });
 
-  it("the acp-cto relay is the only MCP server: strict config, no operator settings, its tools alone admitted, named by socket paths and the conversation id only", async () => {
+  it("the acp-cto relay is the only MCP server: strict config, no operator settings, its tools alone admitted, and it claims over Mach by the reserved service (not a socket), named by the conversation id only", async () => {
     const workdir = tempDir("acp-c1b-turn-");
     const spawned = captureRunCli(() => ({ session_id: "6f0c1d1e-0000-4000-8000-000000000001", result: "ok" }));
     await adapter().runSessionTurn(turn({ workdir }));
@@ -121,6 +121,10 @@ describe("C1b adapter: a session turn is one conversation, opened once and resum
     expect(flagValue(args, "--settings")).toBe(__testing.sanctionedSettings());
     expect(flagValue(args, "--allowedTools")).toBe("mcp__acp-cto");
     expect(flagValue(args, "--model")).toBe("opus");
+    // O4b B' — the driven relay no longer takes a launch socket; it claims over raw Mach. In production
+    // (no isolated adapter) it carries no service name on argv at all and uses the reserved name itself,
+    // so argv cannot point it at another process. It still takes the addon path, the MCP socket and the
+    // conversation id.
     expect(JSON.parse(flagValue(args, "--mcp-config")!)).toEqual({
       mcpServers: {
         "acp-cto": {
@@ -128,17 +132,19 @@ describe("C1b adapter: a session turn is one conversation, opened once and resum
           command: process.execPath,
           args: [
             sessionRelayScript(),
-            "--launch", "/state/cto.launch.sock",
+            "--addon", machLaunchAddonPath(),
             "--mcp", "/state/cto.mcp.sock",
             "--session", "6f0c1d1e-0000-4000-8000-000000000001",
           ],
         },
       },
     });
-    // Its script and interpreter are re-opened for reading; nothing else is.
+    expect(args).not.toContain("--launch");
+    expect(args).not.toContain("--iso-service");
+    // Its script, interpreter and the Mach addon it dlopens are re-opened for reading; nothing else is.
     expect(spawned[0]!.options["readablePaths"]).toEqual({
       subtrees: [realpathSync(workdir)],
-      files: [sessionRelayScript(), process.execPath],
+      files: [sessionRelayScript(), process.execPath, machLaunchAddonPath()],
     });
   });
 

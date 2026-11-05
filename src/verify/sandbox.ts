@@ -92,12 +92,15 @@ export interface SandboxEnforcement {
   worktreeIsolated: true;
   secretsStripped: true;
   /**
-   * The network policy in force. A launched command records `SANDBOX_NETWORK_POLICY` (`allow`):
-   * outbound network and local IPC are open whatever its contract's `network` says. A refused one,
-   * which never ran, records what its contract declared.
+   * The network policy the command ran under, or for a refused one, which never ran, what its
+   * contract declared. A launched `deny` command records `deny`; any other launched command records
+   * `SANDBOX_NETWORK_POLICY` (`allow`): outbound network and local IPC open.
    */
   networkPolicy: VerificationCommand["network"];
-  /** Whether a network denial was in force. Never true since the network was opened. */
+  /**
+   * Whether a network denial was in force: true only for a launched `deny` command whose profile,
+   * carrying the network denial, was applied, which the supervisor running under it shows.
+   */
   networkEnforced: boolean;
   /**
    * Writes are refused outside the worktree, TMPDIR and the toolchain caches `SANDBOX_CACHE_HOME_PATHS`
@@ -850,8 +853,10 @@ export const __testing = Object.freeze({
     }
   },
   /** The profile `runSandboxed` would apply for these roots, under the daemon environment in force now. */
-  seatbeltProfile: (worktreePath: string, scratch: string, denyReadPaths: readonly string[]): string =>
-    seatbeltProfile(realpathSync(worktreePath), realpathSync(scratch), denyReadPaths),
+  seatbeltProfile: (worktreePath: string, scratch: string, denyReadPaths: readonly string[], denyNetwork = false): string =>
+    seatbeltProfile(realpathSync(worktreePath), realpathSync(scratch), denyReadPaths, denyNetwork),
+  sandboxNotApplied: (exitCode: number | null, candidateReported: boolean, stderr: string): boolean =>
+    sandboxNotApplied(exitCode, candidateReported, stderr),
   /** Stand in for `xcrun --find`, to place the developer tool where another host would have it. */
   withDeveloperToolFinder: async <T>(finder: DeveloperToolFinder, operation: () => Promise<T>): Promise<T> => {
     const previous = findDeveloperTool;
@@ -914,6 +919,15 @@ const STDIO_DRAIN_GRACE_MS = 1_000;
 const seatbeltAvailable = (): boolean => existsSync("/usr/bin/sandbox-exec");
 
 /**
+ * Whether sandbox-exec itself refused, before starting anything: exit 65 for a profile it cannot
+ * compile, 71 when `sandbox_apply` is denied (as inside another sandbox) or when the profile applied
+ * but exec of the wrapper failed, its message on stderr. Only with no candidate reported, since a
+ * candidate that ran could print and exit the same way.
+ */
+const sandboxNotApplied = (exitCode: number | null, candidateReported: boolean, stderr: string): boolean =>
+  !candidateReported && (exitCode === 65 || exitCode === 71) && stderr.startsWith("sandbox-exec:");
+
+/**
  * Runs one verification command under the isolation PRD §17.4 requires.
  *
  * The sandbox is open to every language (owner directive 2026-10-31): argv[0] may be any
@@ -922,10 +936,11 @@ const seatbeltAvailable = (): boolean => existsSync("/usr/bin/sandbox-exec");
  * writes reach the disposable worktree, TMPDIR (the scratch root) and the named toolchain caches.
  * What stays bound is what runs and where: only the commands the run's pinned manifest declares,
  * each launched by the absolute path resolved outside (`verificationLaunchArgv`), against its own
- * frozen worktree. The one confinement kept is the secret guard in `seatbeltProfile`, enforced by
- * seatbelt (`sandbox-exec`). Where that mechanism is unavailable the run fails closed with
- * SANDBOX_NETWORK_DENIED instead of quietly executing unconfined — CP-HI-08 forbids
- * reporting a weaker execution as a pass.
+ * frozen worktree. The confinement kept is the secret guard in `seatbeltProfile`, and for a command
+ * whose contract says `network: "deny"`, a denied network, both enforced by seatbelt
+ * (`sandbox-exec`). Where that mechanism is unavailable, or a deny command's profile cannot be
+ * built, the run fails closed with SANDBOX_NETWORK_DENIED instead of quietly executing unconfined
+ * or with the network open — CP-HI-08 forbids reporting a weaker execution as a pass.
  */
 export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutcome> => {
   const { command, worktreePath } = request;
@@ -956,7 +971,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   // Integration §12 allows `allowlist`, but seatbelt cannot express per-host network
   // policy. Claiming to honour a host allowlist while permitting all traffic would be a
   // silent downgrade, so it is refused until a mechanism that can enforce it exists.
-  // (`deny` and `allow` both run with the network open; the result records `allow`.)
+  // (`deny` runs with the network denied, `allow` with it open; see `seatbeltProfile`.)
   if (command.network === "allowlist") {
     rmSync(scratch, { recursive: true, force: true });
     return unconfined(
@@ -1031,13 +1046,25 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     String(process.pid),
     ...launch.value,
   ];
+  const denyNetwork = command.network === "deny";
+  let profile: string;
+  try {
+    profile = seatbeltProfile(targets.worktree, realpathSync(scratch), request.denyReadPaths ?? [], denyNetwork);
+  } catch (error) {
+    // A deny command never runs without its denial in force; any other command's failure here
+    // propagates as it always has.
+    if (!denyNetwork) throw error;
+    rmSync(scratch, { recursive: true, force: true });
+    return unconfined(
+      command,
+      startedMs,
+      startedAt,
+      mechanism,
+      `network=deny cannot be enforced: the seatbelt profile could not be built (${error instanceof Error ? error.message : String(error)})`,
+    );
+  }
   const file = "/usr/bin/sandbox-exec";
-  const argv = [
-    "-p",
-    seatbeltProfile(targets.worktree, realpathSync(scratch), request.denyReadPaths ?? []),
-    wrapper,
-    ...resourceArgs,
-  ];
+  const argv = ["-p", profile, wrapper, ...resourceArgs];
 
   const child = spawn(file, argv, {
     cwd: targets.cwd,
@@ -1405,6 +1432,19 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   const stderr = stderrChunks.join("");
   const endedAt = new Date().toISOString();
 
+  // sandbox-exec that fails with its own error starts nothing: no candidate was reported, so nothing
+  // ran. That is sandbox-exec refusing before starting anything, refused as such, not an orphaned
+  // self-detaching process.
+  if (!groupOutlivedLeader && sandboxNotApplied(exit.code, candidateReportSeen, stderr)) {
+    return unconfined(
+      command,
+      startedMs,
+      startedAt,
+      mechanism,
+      `sandbox-exec refused before starting anything (exit ${String(exit.code)}); refusing to run unconfined: ${stderr.trim().slice(0, 500)}`,
+    );
+  }
+
   const resourceUnavailable = exit.code === 125 && stderr.includes("ACP_RESOURCE_LIMIT_UNAVAILABLE:");
   const childCleanupUnavailable = stderr.includes("ACP_CHILD_CLEANUP_UNAVAILABLE:");
   if (childCleanupUnavailable) {
@@ -1457,8 +1497,11 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     enforcement: {
       worktreeIsolated: true,
       secretsStripped: true,
-      networkPolicy: SANDBOX_NETWORK_POLICY,
-      networkEnforced: false,
+      networkPolicy: denyNetwork ? "deny" : SANDBOX_NETWORK_POLICY,
+      // The supervisor reports a candidate only once it runs, and sandbox-exec starts it only after
+      // applying the profile (`sandbox_apply` failing execs nothing), so the report shows the denial
+      // was in force.
+      networkEnforced: denyNetwork && candidateReportSeen,
       writeConfinement: mechanism === "seatbelt",
       readConfinement: mechanism === "seatbelt" ? "sensitive-paths" : "none",
       processGroupKill: true,
@@ -1573,9 +1616,10 @@ export const buildSandboxEnvironment = (
 const looksLikeCredential = (value: string): boolean => hasCredentialShape(value);
 
 /**
- * What a launched command's network is: outbound and local IPC open, for looking up and downloading
- * dependencies during verification. It is not a publish or deploy right — no credential reaches the
- * command to publish with — and the result records it rather than a denial.
+ * What a launched command's network is unless its contract says `deny`: outbound and local IPC open,
+ * for looking up and downloading dependencies during verification. It is not a publish or deploy
+ * right — no credential reaches the command to publish with — and the result records it rather than
+ * a denial.
  */
 export const SANDBOX_NETWORK_POLICY = "allow" as const;
 
@@ -1755,8 +1799,12 @@ const resolveIfPossible = (path: string): string => {
 
 /**
  * Seatbelt profile. Allow-default, so any toolchain starts and reads what it needs, and the network
- * is open. Then the guard (§33.3 — no provider, GitHub, Buzz or Telegram authority reaches a
- * candidate), best-effort as `SANDBOX_SECRET_PATHS` says:
+ * is open unless `denyNetwork` (the command's contract says `deny`). Then IP networking, inbound and
+ * outbound, is denied, and so is every unix socket except one bound in the worktree or scratch and
+ * a connection to one there (the carve-out below), so a command's own IPC still works, and so are
+ * launchd job creation and the LaunchServices lookup, the verified delegation boundaries.
+ * Then the guard (§33.3 — no provider, GitHub, Buzz or Telegram authority reaches a candidate),
+ * best-effort as `SANDBOX_SECRET_PATHS` says:
  * - reads of every secret path are denied; the worktree, the scratch and the pinned runtime are
  *   carved back out, since production lays them under the denied state root;
  * - writes are denied except to the worktree, the scratch, `/dev` and the named caches, and denied
@@ -1771,9 +1819,28 @@ const seatbeltProfile = (
   worktreePath: string,
   scratch: string,
   denyReadPaths: readonly string[],
+  denyNetwork: boolean,
 ): string => {
   const lines = ["(version 1)", "(allow default)"];
   const runtimeExecutable = realpathSync(process.execPath);
+  if (denyNetwork) {
+    lines.push(
+      "(deny network* (remote ip))",
+      "(deny network* (local ip))",
+      "(deny network* (remote unix-socket))",
+      "(deny network* (local unix-socket))",
+      `(allow network-bind (local unix-socket (subpath ${quote(worktreePath)})))`,
+      `(allow network-bind (local unix-socket (subpath ${quote(scratch)})))`,
+      // The delegation boundaries: a deny command may not have launchd or LaunchServices start a
+      // process for it outside the sandbox. `job-creation` is hardening that pins the macOS default
+      // (measured: `launchctl submit` is already refused inside an allow-default sandbox), not a fix
+      // for an observed escape. The mach-lookup denial is the minimal LaunchServices delegation block:
+      // a lookup of either service fails under it (measured). Apple events and other XPC services are
+      // not covered.
+      "(deny job-creation)",
+      '(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.lsd.mapdb"))',
+    );
+  }
   // A deny path below an allowed root would stop the command from reading its own inputs,
   // so that narrow case is omitted. An encompassing deny remains in force; the explicit
   // allows below carve out only the current worktree and scratch subtree.
@@ -1809,6 +1876,22 @@ const seatbeltProfile = (
     `(allow file-write* (subpath ${quote(scratch)}))`,
     "(allow file-write* (subpath \"/dev\"))",
     "(allow file-write-data (literal \"/dev/null\"))",
+    // A deny command reaches a unix socket only in the worktree or scratch, so it may not bring one in
+    // from a cache it can write, which would carry an outside listener through the carve-out: not the
+    // socket itself (rename, link) and not any directory above it (rename, swap). The cost: a deny
+    // command cannot rename or remove a directory outside the worktree and scratch, toolchain caches
+    // included (Gradle's offline transforms move directories into place, for one). Cleanup inside a
+    // cache fails too (`uv cache clean` exits 2 and leaves an empty directory): temp and lock
+    // directories a tool makes in a shared cache stay, into later runs and the owner's own use, and a
+    // stale socket in a cache cannot be deleted. Offline installs from a warm cache still work
+    // (`uv pip install --offline`, `pnpm install --offline`). A command that needs more is a contract
+    // decision of its own; nothing here switches it to `allow`.
+    ...(denyNetwork
+      ? [
+        `(deny file-write* (require-all (vnode-type SOCKET) (require-not (subpath ${quote(worktreePath)})) (require-not (subpath ${quote(scratch)}))))`,
+        `(deny file-write-unlink (require-all (vnode-type DIRECTORY) (require-not (subpath ${quote(worktreePath)})) (require-not (subpath ${quote(scratch)}))))`,
+      ]
+      : []),
     ...secrets.map((path) => `(deny network-outbound (remote unix-socket (subpath ${quote(path)})))`),
     ...perAgentDirectories(worktreePath, scratch)
       .map((dir) => `(deny network-outbound (remote unix-socket (subpath ${quote(dir)})))`),

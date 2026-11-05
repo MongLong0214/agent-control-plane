@@ -1051,9 +1051,10 @@ describe("verification sandbox (PRD §17.4)", () => {
     expect(outcome.enforcement.readConfinement).toBe("none");
   });
 
-  // #318 asserted the kernel's EPERM for a denied connection. The network is open since 2026-10-31,
-  // so the same probe now reaches a local server, and the result records `allow`, not a denial.
-  it("#318 records an open network: a connection reaches a local server", async () => {
+  // #318: a command whose contract says `network: "deny"` runs with the network denied (the CEO's
+  // ruling on #1328), so a connection to a local server gets the kernel's EPERM and the result
+  // records the denial as enforced.
+  it("#318 returns the kernel network-denial errno for a refused connection", async () => {
     const repo = makeRepo();
     const server = createServer((socket) => socket.end());
     const port = await new Promise<number>((resolvePort) => server.listen(0, "127.0.0.1", () => resolvePort((server.address() as AddressInfo).port)));
@@ -1092,9 +1093,9 @@ describe("verification sandbox (PRD §17.4)", () => {
     expect(outcome).toMatchObject({
       status: "PASS",
       reasonCode: null,
-      enforcement: { networkEnforced: false, networkPolicy: "allow" },
+      enforcement: { networkEnforced: true, networkPolicy: "deny" },
     });
-    expect(JSON.parse(outcome.stdout)).toEqual({ event: "connected", errno: null });
+    expect(JSON.parse(outcome.stdout)).toEqual({ event: "error", errno: "EPERM" });
   });
 
   it("does not hand the daemon's own PATH to the candidate", async () => {

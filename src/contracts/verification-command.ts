@@ -16,8 +16,9 @@ const verificationCommandShape = z
     cwd: z.string().default("."),
     timeoutSeconds: z.number().int().positive().max(24 * 3600).default(1200),
     envAllowlist: z.array(z.string()).default([]),
-    // The sandbox no longer denies the network (owner directive 2026-10-31): `deny` and `allow` both
-    // run with outbound network and local IPC open, and the result records `networkPolicy: "allow"`.
+    // `deny`, the default, runs with IP networking and every unix socket outside the command's worktree
+    // and scratch denied, and the result records `deny` as enforced; a command that needs the network
+    // declares `allow`, which runs with outbound network and local IPC open and records `allow`.
     // The field and its default stay so every existing manifest keeps its digest. `allowlist` is
     // retained in the wire union solely to return an explicit migration error for old manifests:
     // seatbelt cannot enforce a destination allowlist, so it is not a production-supported contract.

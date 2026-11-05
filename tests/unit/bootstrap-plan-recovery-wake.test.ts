@@ -224,8 +224,8 @@ const holdLaunchPreparation = (f: BootstrapRuntimeFixture) => {
   const barrier = new Promise<void>((resolve) => {
     release = resolve;
   });
-  const prepare = f.launch.prepare.bind(f.launch);
-  vi.spyOn(f.launch, "prepare").mockImplementationOnce(async () => {
+  const prepare = f.drivenDoor.prepare.bind(f.drivenDoor);
+  vi.spyOn(f.drivenDoor, "prepare").mockImplementationOnce(async () => {
     entered = true;
     await barrier;
     return prepare();

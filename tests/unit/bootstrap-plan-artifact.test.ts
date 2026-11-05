@@ -291,6 +291,10 @@ describe("CEO-approved bootstrap PLAN input over real Hermes and CTO MCP servers
     const listeners = await startLocalMcpListeners(f.h.cp, tempDir("bp-sock-"), token);
     const credential = f.h.cp.sessions.rotateSecret(f.run.ownerSessionId!, 0);
     if (!credential.allowed) throw new Error(credential.message);
+    // #1336 R-1 — as recovery does after it rotates: the runtime adopts the secret, without which a driven
+    // BOOTSTRAP_CTO's secret authenticates on no socket.
+    expect(f.h.cp.sessionRuntime.adopt(f.run.ownerSessionId!, Role.BOOTSTRAP_CTO, credential.value.sessionSecret,
+      credential.value.session.credentialEpoch).allowed).toBe(true);
     const ceoCredential = f.h.cp.sessions.rotateSecret(f.ceo, 0);
     if (!ceoCredential.allowed) throw new Error(ceoCredential.message);
     const call = (name: string, args: Args) => callMcpToolOverSocket(listeners.socketPaths[1]!, {

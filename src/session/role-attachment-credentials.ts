@@ -71,10 +71,17 @@ const scopeOf = (binding: RoleBinding): AttachmentScope => ({
 export class RoleAttachmentCredentials {
   readonly #records = new Map<string, AttachmentRecord>();
 
+  /**
+   * `drivenCredentialNotHeld` (#1336 R-1): true for a driven session whose current credential the daemon's
+   * session runtime does not hold. Such a session's secret authenticates nothing here, as on the sockets,
+   * whatever the registry would verify: the runtime dropped it as possibly leaked, or holds nothing yet after
+   * a restart. The daemon passes it; a composition that omits it treats no session as driven.
+   */
   constructor(
     private readonly sessions: SessionRegistry,
     private readonly bindings: BindingRegistry,
     private readonly clock: Clock,
+    private readonly drivenCredentialNotHeld: (sessionId: string) => boolean = () => false,
   ) {
     bindings.onSwitch((binding) => {
       const current = scopeOf(binding);
@@ -105,6 +112,8 @@ export class RoleAttachmentCredentials {
     const { sessionId, sessionSecret, roleKey } = parsed.data;
     const authenticated = this.sessions.verifySecret(sessionId, sessionSecret);
     if (!authenticated.allowed) return authenticated;
+    const notHeld = this.#refuseUnheldDriven(sessionId);
+    if (notHeld) return notHeld;
     const scope = this.scope(sessionId, roleKey);
     if (!scope.allowed) return scope;
     // No owner decision is required or read here. Issuance used to also demand an
@@ -209,12 +218,22 @@ export class RoleAttachmentCredentials {
     const { sessionId, sessionSecret, attachmentId } = parsed.data;
     const authenticated = this.sessions.verifySecret(sessionId, sessionSecret);
     if (!authenticated.allowed) return authenticated;
+    const notHeld = this.#refuseUnheldDriven(sessionId);
+    if (notHeld) return notHeld;
     const record = this.#records.get(attachmentId);
     if (!record || record.scope.sessionId !== sessionId || record.scope.sessionIncarnation !== authenticated.value.incarnation) {
       return refused("attachment does not belong to the authenticated subject");
     }
     this.#invalidate(attachmentId);
     return allow(ReasonCode.OK, undefined);
+  }
+
+  #refuseUnheldDriven(sessionId: string): Decision<never> | null {
+    if (!this.drivenCredentialNotHeld(sessionId)) return null;
+    return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "the daemon holds no current credential for this driven session", {
+      sessionId,
+      reason: "DRIVEN_CREDENTIAL_NOT_HELD",
+    });
   }
 
   #invalidate(attachmentId: string): void {

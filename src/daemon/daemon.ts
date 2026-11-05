@@ -744,7 +744,10 @@ export class Daemon {
     mkdirSync(options.stateDir, { recursive: true });
     chmodSync(options.stateDir, 0o700);
     this.lock = new SingleInstanceLock(join(options.stateDir, "agentcpd.lock"));
-    this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.clock);
+    // #1336 R-1 — the same custody rule the MCP sockets apply (`drivenCredentialNotHeld` in agentcpd.ts):
+    // an attachment is scoped to a PRIMARY_CTO, which is driven when its spawn record says DRIVEN.
+    this.attachments = new RoleAttachmentCredentials(cp.sessions, cp.bindings, cp.clock, (sessionId) =>
+      cp.sessionRuntime.drivesSession(sessionId, Role.PRIMARY_CTO) && !cp.sessionRuntime.holds(sessionId));
     this.#finalizer = new ApprovedRunFinalizer(cp, undefined, authorities);
     this.#evidenceExporter = new RunEvidenceExporter(cp.db, cp.artifacts, cp.clock, cp.audit);
     this.#agentWaits = new AgentOwnedWaits(

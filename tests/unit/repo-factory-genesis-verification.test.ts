@@ -98,7 +98,7 @@ describe.skipIf(process.platform !== "darwin" || !existsSync("/usr/bin/sandbox-e
     expect(decision.evidence.genesisVerification).toEqual([
       expect.objectContaining({ phase: "verifyGenesis", commandId: "test", approvedArgv, executedArgv, compat,
         outcome: expect.objectContaining({ status: "PASS", exitCode: 0, stdout: expect.stringContaining(`# pass ${passCount}`),
-          enforcement: expect.objectContaining({ mechanism: "seatbelt", networkEnforced: false, networkPolicy: "allow", resourceLimitsEnforced: true }) }) }),
+          enforcement: expect.objectContaining({ mechanism: "seatbelt", networkEnforced: true, networkPolicy: "deny", resourceLimitsEnforced: true }) }) }),
       expect.objectContaining({ phase: "GENESIS_TEST", commandId: "test", approvedArgv, executedArgv, compat,
         outcome: expect.objectContaining({ status: "PASS", exitCode: 0, stdout: expect.stringContaining(`# pass ${passCount}`) }) }),
     ]);
@@ -185,7 +185,7 @@ describe("RF genesis approved worktree checks", () => {
       expect(f.runs).toHaveBeenCalledTimes(2);
       expect(decision.evidence.genesisVerification).toEqual([
         expect.objectContaining({ phase: "verifyGenesis", outcome: expect.objectContaining({ status: "PASS",
-          enforcement: expect.objectContaining({ mechanism: "seatbelt", networkEnforced: false, networkPolicy: "allow", resourceLimitsEnforced: true }) }) }),
+          enforcement: expect.objectContaining({ mechanism: "seatbelt", networkEnforced: true, networkPolicy: "deny", resourceLimitsEnforced: true }) }) }),
         expect.objectContaining({ phase: "GENESIS_TEST", outcome: expect.objectContaining({ status: "PASS" }) }),
       ]);
     } finally {

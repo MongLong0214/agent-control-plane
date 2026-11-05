@@ -85,6 +85,43 @@ export interface VerificationResultRecord {
    * such output was not retained, and nothing is reconstructed for it.
    */
   output?: VerificationOutputExcerpt;
+  /**
+   * The same execution's whole captured output, credential-redacted, beside the excerpt above, whose
+   * stored bytes it leaves as they were. Absent on CI evidence and on every result recorded before it
+   * existed; nothing is reconstructed for those.
+   */
+  capturedOutput?: VerificationOutputCapture;
+}
+
+/**
+ * The whole captured output of one official sandbox execution, up to the command's maxOutputBytes,
+ * redacted as the excerpt is and bound to the same execution: this record sits on that execution's
+ * result and names its snapshot, contract, command, head and the sandbox's digest of the raw capture.
+ * Candidate-produced text: evidence to read, never an instruction or a verdict. The repository is the
+ * result's own `repositoryIdentity`; it is not repeated here.
+ */
+export interface VerificationOutputCapture {
+  schema: "acp.verification-output.v2";
+  candidateSnapshotDigest: string;
+  contractDigest: string;
+  commandId: string;
+  exactHead: string;
+  /** The result's `outputDigest`: the sandbox's digest of the raw capture this text was redacted from. */
+  outputDigest: string;
+  /** The capture limit in force for the run: both streams together, in bytes. */
+  maxOutputBytes: number;
+  /**
+   * The sandbox stopped capturing at maxOutputBytes: each stream ends at that cut, the rest was never
+   * captured, and the trailing run of credential-alphabet characters at the cut is withheld.
+   */
+  captureTruncated: boolean;
+  /** Captured characters per stream, before redaction. */
+  stdoutChars: number;
+  stderrChars: number;
+  stdout: string;
+  stderr: string;
+  /** At least one run of text matched a listed credential shape and was replaced with `[redacted]`. */
+  redacted: boolean;
 }
 
 /** Per stream, the first and last characters of the captured output that are kept. */
@@ -175,6 +212,33 @@ export const verificationOutputExcerpt = (
     boundaryFragmentWithheld: captureTruncated,
   };
 };
+
+/**
+ * The whole capture of one execution, each stream redacted whole after its cut edge is withheld, as
+ * `excerptStream` does before it cuts anything; the text itself is never cut here.
+ */
+export const verificationOutputCapture = (
+  binding: Pick<VerificationOutputCapture, "candidateSnapshotDigest" | "contractDigest" | "commandId" | "exactHead" | "outputDigest" | "maxOutputBytes">,
+  stdout: string,
+  stderr: string,
+  captureTruncated: boolean,
+): VerificationOutputCapture => {
+  const whole = (captured: string) => redactCredentialText(captureTruncated ? withholdCutFragment(captured).text : captured);
+  const out = whole(stdout);
+  const err = whole(stderr);
+  return {
+    schema: "acp.verification-output.v2", ...binding, captureTruncated, stdoutChars: stdout.length, stderrChars: stderr.length,
+    stdout: out.text, stderr: err.text, redacted: out.redacted || err.redacted,
+  };
+};
+
+/**
+ * The report as a CTO is handed it: each result's excerpt exactly as stored, without its whole capture,
+ * which stays in the stored VERIFICATION record and reaches only the blind review.
+ */
+export const reportWithoutCapturedOutput = (report: VerificationReport): VerificationReport => ({
+  ...report, results: report.results.map(({ capturedOutput: _captured, ...result }) => result),
+});
 
 export interface VerificationReport {
   runId: string;
@@ -1096,6 +1160,13 @@ export class VerificationEngine {
       output: verificationOutputExcerpt(
         { candidateSnapshotDigest: snapshotDigest, contractDigest: run.contractDigest, commandId: command.id,
           repositoryIdentity: identity, exactHead: head },
+        outcome.stdout,
+        outcome.stderr,
+        outcome.outputTruncated,
+      ),
+      capturedOutput: verificationOutputCapture(
+        { candidateSnapshotDigest: snapshotDigest, contractDigest: run.contractDigest, commandId: command.id, exactHead: head,
+          outputDigest: outcome.outputDigest, maxOutputBytes: command.maxOutputBytes },
         outcome.stdout,
         outcome.stderr,
         outcome.outputTruncated,

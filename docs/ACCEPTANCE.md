@@ -202,9 +202,10 @@ while omitting `channel_id` produced an undefined address that `available()` rep
 usable.
 
 **A verification worktree has no installed dependencies.** A disposable worktree contains
-only committed files. Since 2026-10-31 the sandbox's network is open for dependency lookup and
-download and the named toolchain caches under `HOME` are writable, so a command may install what
-it needs; a dependency-free command or `TRUSTED_CI` evidence needs no fetch. `network: "allowlist"`
+only committed files. A command that declares `network: "allow"` has the network open for
+dependency lookup and download, and the named toolchain caches under `HOME` are writable, so it may
+install what it needs; under the default `network: "deny"` a command cannot download anything. A
+dependency-free command or `TRUSTED_CI` evidence needs no fetch. `network: "allowlist"`
 is deliberately rejected until a proxy/firewall backend can enforce destination policy; a manifest
 must not advertise an allowlist that seatbelt cannot apply. This repository uses a dependency-free
 command for local verification (`scripts/verify-reason-codes.mjs`) and CI for its typecheck.
