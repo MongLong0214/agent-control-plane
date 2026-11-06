@@ -47,6 +47,9 @@ export const submittedPlanSchema = z.object({
   // CEO msg_2b439e5a — a STANDARD_WORK re-plan names the earlier tasks of its run that it replaces; only
   // those are cancelled, and only when none of them ever had an execution. Covered by the PLAN digest.
   supersedesTaskIds: z.array(z.string().min(1)).min(1).optional(),
+  // #1347 — a CONTRACT_CHANGE PLAN that reverts exactly one earlier, additive CONTRACT_CHANGE names its
+  // run; the PLAN must then carry exactly the manifest that change replaced. Covered by the PLAN digest.
+  revertsContractChangeRunId: z.string().min(1).optional(),
   requestDigest: z.string().min(1).optional(),
   projectManifestDigest: z.string().min(1).optional(),
   // Issue #246 — each operation as the Repo Factory runner executes it and the owner

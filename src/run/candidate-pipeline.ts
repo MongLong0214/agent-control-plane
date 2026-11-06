@@ -27,7 +27,7 @@ import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { ProductionGate, ProductionReadyPacket } from "../ceo/production-gate.ts";
 import { currentContractChangeTarget, isContractChangeRun, sameContractChangeBinding, type WorkflowRevision } from "../registry/contract-change-plan.ts";
-import { firstActivationFactsOf } from "../registry/manifest-activation-grants.ts";
+import { contractChangeRevertFactsOf, firstActivationFactsOf } from "../registry/manifest-activation-grants.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import { residentBaseClone } from "../registry/resident-repositories.ts";
@@ -422,6 +422,7 @@ export class CandidatePipeline {
         this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN),
         (digest) => this.projects.manifest(digest),
         firstActivationFactsOf(this.db, run),
+        contractChangeRevertFactsOf(this.db, run),
       );
       if (!current.allowed) return current as Decision<CandidateSnapshot>;
       contractChange = current.value.binding;
@@ -1618,6 +1619,7 @@ export class CandidatePipeline {
           this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN),
           (digest) => this.projects.manifest(digest),
           firstActivationFactsOf(this.db, run),
+          contractChangeRevertFactsOf(this.db, run),
         )
       : null;
     const currentBinding = current?.allowed ? current.value.binding : null;
