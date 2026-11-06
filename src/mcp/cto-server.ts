@@ -46,6 +46,7 @@ import {
   guarded,
   ok,
   type AuthenticatedMcpPeer,
+  type McpMutationRequest,
   type McpMutationSource,
   type McpPeerAuthenticator,
   progressNotifier,
@@ -432,6 +433,9 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       runId: string,
     ) => source.tasks.finishExecution(executionId, outcome, runId),
     submitResult: (input: Parameters<CandidatePipeline["submitResult"]>[0]) => source.pipeline.submitResult(input),
+    // #1344 B — read only: what a result_submit key's attempt answered, from durable state.
+    resultSubmitReplay: (runId: string, idempotencyKey: string, requestFingerprint: string) =>
+      source.pipeline.replaySubmission(runId, idempotencyKey, requestFingerprint),
     openEscalation: (input: Parameters<ProductionGate["openEscalation"]>[0]) => source.ceo.openEscalation(input),
     activePrimaryCto: (projectId: string) => source.bindings.activePrimaryCto(projectId),
     prepareSwitchover: (...args: Parameters<CtoLifecycle["prepareSwitchover"]>) => source.cto.prepareSwitchover(...args),
@@ -526,18 +530,20 @@ const createCtoServerFromPort = (
   const write = (
     toolName: string,
     args: Record<string, unknown> & { idempotencyKey: string },
-    execute: (peer: AuthenticatedMcpPeer) => Promise<ToolResult> | ToolResult,
+    execute: (peer: AuthenticatedMcpPeer, fingerprint: string) => Promise<ToolResult> | ToolResult,
     authority: (peer: AuthenticatedMcpPeer) => Decision<Record<string, unknown>> = () => allow(ReasonCode.OK, {}),
     answersInFlight = false,
+    durableReplay?: McpMutationRequest["durableReplay"],
   ) => guarded(async () => {
     const peer = peerFor(toolName);
     return peer.allowed
-      ? port.mutation.execute(peer.value, args.idempotencyKey, () => execute(peer.value), {
+      ? port.mutation.execute(peer.value, args.idempotencyKey, (fingerprint) => execute(peer.value, fingerprint), {
           toolName, arguments: args, authority: () => {
             const current = peerFor(toolName);
             return current.allowed ? authority(current.value) : current;
           },
           ...(answersInFlight ? { answersInFlight } : {}),
+          ...(durableReplay === undefined ? {} : { durableReplay }),
         })
       : respond(peer);
   });
@@ -546,11 +552,12 @@ const createCtoServerFromPort = (
   const writeOwned = (
     toolName: string,
     args: Record<string, unknown> & { idempotencyKey: string; runId: string },
-    execute: (peer: AuthenticatedMcpPeer, owner: { sessionId: string; bindingGeneration: number; roleKey: string }) => Promise<ToolResult> | ToolResult,
+    execute: (peer: AuthenticatedMcpPeer, owner: { sessionId: string; bindingGeneration: number; roleKey: string }, fingerprint: string) => Promise<ToolResult> | ToolResult,
     answersInFlight = false,
+    durableReplay?: McpMutationRequest["durableReplay"],
   ) => {
     let current!: { sessionId: string; bindingGeneration: number; roleKey: string };
-    return write(toolName, args, peer => execute(peer, current), peer => {
+    return write(toolName, args, (peer, fingerprint) => execute(peer, current, fingerprint), peer => {
       const fenced = owner(peer, args.runId);
       if (fenced.allowed) {
         current = fenced.value;
@@ -564,7 +571,7 @@ const createCtoServerFromPort = (
         }
       }
       return fenced;
-    }, answersInFlight);
+    }, answersInFlight, durableReplay);
   };
   const primary = (peer: AuthenticatedMcpPeer, projectId: string): Decision<Record<string, unknown>> => {
     if (!peer.sessionId || !peer.sessionIncarnation) return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP peer is missing a session incarnation");
@@ -870,14 +877,22 @@ const createCtoServerFromPort = (
     { description: "Submit a candidate for automatic verification and blind review.", inputSchema: { ...mutation, ...runIdentity, resultSummary: z.string(), recommendation: z.string(), residualRisk: z.array(z.string()).default([]), runScopedCommands: z.array(z.record(z.unknown())).default([]) } },
     // A long review: each real step renews the submission's lease and, when the caller asked with a
     // progressToken, is a progress notice to it; a replay of its key while it runs is answered as in flight.
-    async (args, extra) => writeOwned("result_submit", args, async (peer, fenced) => {
+    async (args, extra) => writeOwned("result_submit", args, async (peer, fenced, fingerprint) => {
       const commands = args.runScopedCommands.map((command) => parseVerificationCommand(command));
       const onProgress = progressNotifier(extra);
-      const outcome = await port.submitResult({ runId: args.runId, ownerSessionId: fenced.sessionId, ownerBindingGeneration: fenced.bindingGeneration, resultSummary: args.resultSummary, recommendation: args.recommendation, residualRisk: args.residualRisk, ...(commands.length === 0 ? {} : { runScopedCommands: commands }), ...(onProgress === undefined ? {} : { onProgress }) });
+      const outcome = await port.submitResult({ runId: args.runId, ownerSessionId: fenced.sessionId, ownerBindingGeneration: fenced.bindingGeneration, resultSummary: args.resultSummary, recommendation: args.recommendation, residualRisk: args.residualRisk, ...(commands.length === 0 ? {} : { runScopedCommands: commands }), ...(onProgress === undefined ? {} : { onProgress }),
+        replayIdentity: { idempotencyKey: args.idempotencyKey, requestFingerprint: fingerprint } });
       // A failed verification reaches the CTO with its excerpts, not the whole capture the review reads.
       return respond(outcome.allowed && outcome.value.stage === "VERIFICATION_FAILED"
         ? { ...outcome, value: { ...outcome.value, report: reportWithoutCapturedOutput(outcome.value.report) } } : outcome);
-    }, true),
+    }, true,
+    // #1344 B — a replay whose response was never stored (its daemon ended first) is answered from what the key's
+    // attempt recorded, after the same request and current owner authority passed; a stored response replays unchanged.
+    (fingerprint, _reservationVerified, stored) => {
+      if (stored !== undefined) return null;
+      const replay = port.resultSubmitReplay(args.runId, args.idempotencyKey, fingerprint);
+      return replay === null ? null : respond(replay);
+    }),
   );
   server.registerTool(
     "escalation_open",
