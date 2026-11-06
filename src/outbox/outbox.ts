@@ -1115,6 +1115,16 @@ export class Outbox {
   }
 
   /**
+   * #1344 — removes the canonical notice transport, a stall notice's restricted one included, so the
+   * canonical branch is no route and the Buzz sweep owns every routable CEO notification again. A pass
+   * already in flight ends with the transport it took; the journal and every recorded fence stay.
+   */
+  detachCeoNotificationDelivery(): void {
+    this.#ceoDelivery = null;
+    this.#ceoDeliveryOnly = null;
+  }
+
+  /**
    * A CEO notification is role mail: every unACKed one follows the role's current holder, whichever
    * path moved the role (a bind or adoption, a takeover, a surviving runtime move, a revoke and
    * rebind, or a stopped runtime replaced), so a route the current CEO has is the route every

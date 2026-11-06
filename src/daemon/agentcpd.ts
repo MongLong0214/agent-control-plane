@@ -3449,6 +3449,12 @@ export const createConfiguredHermesGatewayDaemonNoticeTarget = (
   };
 };
 
+/** `error.code` of a parsed Gateway error body; the sender has already parsed the JSON (null when it was not). */
+const gatewayErrorCode = (body: unknown): unknown => {
+  const error = typeof body === "object" && body !== null ? (body as { error?: unknown }).error : undefined;
+  return typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+};
+
 /** CEO notifications use the authenticated canonical daemon-notice surface, with receipt dedupe. */
 export const createCeoNotificationSender = (resolveTarget: DaemonNoticeTargetResolver, laneSecret: string) =>
   async (message: OutboxMessage, attempt?: CeoNoticeAttempt): Promise<Decision<void>> => {
@@ -3475,11 +3481,12 @@ export const createCeoNotificationSender = (resolveTarget: DaemonNoticeTargetRes
     let settledParts = 0;
     for (const body of prepared.requests) {
       const result = await target.send(body);
-      // This exact Gateway parser error is emitted before receipt claim. A generic 400, truncated
-      // answer, timeout or canonical_event_uncertain proves nothing. A partially delivered multipart
-      // notification likewise cannot be moved to Buzz as a whole.
+      // This Gateway parser error (400, error.code canonical_invalid_request, whatever else the body
+      // carries, such as Hermes's `message`) is emitted before receipt claim. Any other 400, an
+      // unparsable answer, a timeout or canonical_event_uncertain proves nothing. A partially delivered
+      // multipart notification likewise cannot be moved to Buzz as a whole.
       if (settledParts === 0 && result.kind === "RESPONDED" && result.status === 400 &&
-          JSON.stringify(result.body) === '{"error":{"code":"canonical_invalid_request"}}') {
+          gatewayErrorCode(result.body) === "canonical_invalid_request") {
         return deny(ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED, "canonical notice protocol refused before claim",
           { noticeOutcome: "REFUSED" });
       }
@@ -3520,6 +3527,23 @@ export const startConfiguredCeoNotificationRoute = (
     if (binding.role === Role.CEO && binding.status === "ACTIVE") void cp.outbox.deliverCeoNotifications();
   });
   return { started: true };
+};
+
+/**
+ * #1344 — the daemon attaches the canonical CEO route only once Hermes is ready for
+ * `acp-daemon-notice/v1`: `ACP_DAEMON_NOTICE_ENABLED` exactly `1`, the switch the peer-message notice
+ * delivery waits on. Off, no canonical transport stays attached, the stall notice's restricted one a
+ * parked start attached included, so the canonical branch is not a route (`ceoCanonicalRouteSql`):
+ * every unsent CEO notification takes the CEO's bound Buzz route, and without one is withheld PENDING
+ * with one CEO_NOTIFICATION_ROUTE_UNAVAILABLE record, as before.
+ */
+export const startEnabledCeoNotificationRoute = (
+  cp: ControlPlane,
+  options: Parameters<typeof startConfiguredCeoNotificationRoute>[1],
+): ReturnType<typeof startConfiguredCeoNotificationRoute> => {
+  if (options.environment["ACP_DAEMON_NOTICE_ENABLED"] === "1") return startConfiguredCeoNotificationRoute(cp, options);
+  cp.outbox.detachCeoNotificationDelivery();
+  return { started: false, reason: "ACP_DAEMON_NOTICE_ENABLED is not 1" };
 };
 
 /**
@@ -6735,7 +6759,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       laneSecret: telegramExternalConfig?.sharedSecret ?? null,
       ports: { authorityHeld: () => daemon.lock.held() },
     });
-    const ceoRoute = startConfiguredCeoNotificationRoute(cp, {
+    const ceoRoute = startEnabledCeoNotificationRoute(cp, {
       environment: process.env,
       hermesConfiguration: hermesAdoptionConfiguration,
       ports: { authorityHeld: () => daemon.lock.held() },

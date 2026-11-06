@@ -9,7 +9,7 @@ import type * as Http from "node:http";
 import { digestOf, sha256, sha256Hex } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
-import { createConfiguredHermesGatewayDaemonNoticeTarget, startConfiguredCeoNotificationRoute } from "../../src/daemon/agentcpd.ts";
+import { createConfiguredHermesGatewayDaemonNoticeTarget, startEnabledCeoNotificationRoute, startStallNoticeRoute } from "../../src/daemon/agentcpd.ts";
 import { currentCanonicalCeoBuzzRoute } from "../../src/outbox/ceo-buzz-signer.ts";
 import { HostProvisionerError, type HostAllocation, type HostObservation, type HostOperation } from "../../src/runtime/host-project-provisioner.ts";
 import { BuzzAdapter, BuzzCliTransport, InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.ts";
@@ -27,7 +27,7 @@ import { stableFixtureLink } from "../helpers/stable-fixture-executable.ts";
 const http = vi.hoisted(() => ({
   request: vi.fn(),
   posts: [] as DaemonNoticeBody[],
-  mode: "refused" as "refused" | "completed" | "timeout" | "lost" | "uncertain" | "409" | "other400" | "wrongShape" | "partial" | "notSent",
+  mode: "refused" as "refused" | "completed" | "timeout" | "lost" | "uncertain" | "409" | "other400" | "wrongShape" | "malformed" | "partial" | "notSent",
   hold: false,
   release: null as (() => void) | null,
   lostMessageId: null as string | null,
@@ -68,12 +68,16 @@ vi.mock("node:http", async (original) => {
               receipt: { status: "completed", receipt_id: "receipt", session_id: LIVE, lineage_root_digest: DIGEST } }
               : http.mode === "other400" ? { error: { code: "some_other_error" } }
               : http.mode === "wrongShape" ? { error: "canonical_invalid_request" }
-              : { error: { code: http.mode === "409" ? "canonical_event_uncertain" : "canonical_invalid_request" } };
+              : http.mode === "409" ? { error: { code: "canonical_event_uncertain" } }
+              // The live Hermes Gateway's refusal, `message` included (#1344).
+              : { error: { code: "canonical_invalid_request", message: "Canonical request rejected." } };
           }
           respond(res);
           if (notice && http.mode === "uncertain") res.emit("aborted");
           else {
-            res.emit("data", Buffer.from(JSON.stringify(body)));
+            const bytes = JSON.stringify(body);
+            // "malformed": the refusal's bytes cut short, so the answer does not parse.
+            res.emit("data", Buffer.from(notice && http.mode === "malformed" ? bytes.slice(0, -1) : bytes));
             res.emit("end");
           }
           req.emit("close");
@@ -97,7 +101,7 @@ afterAll(cleanupTempDirs);
 
 const destination = { session_id: LIVE, lineage_root_digest: DIGEST, process_pid: GATEWAY, process_started_at: TOKEN };
 const routeOptions = (httpDiscovery = false) => ({
-    environment: { ACP_TELEGRAM_EXTERNAL_SECRET: "lane-secret" },
+    environment: { ACP_DAEMON_NOTICE_ENABLED: "1", ACP_TELEGRAM_EXTERNAL_SECRET: "lane-secret" },
     hermesConfiguration: { ACP_HERMES_LINEAGE_ROOT_DIGEST: DIGEST, ACP_HERMES_EXECUTABLE: "/opt/test/hermes",
       ACP_HERMES_PROFILE: "test", ACP_HERMES_HOME: "/opt/test/home",
       ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY: "hermes-runtime:test", ACP_HERMES_GATEWAY_API_KEY: "test-key" },
@@ -107,7 +111,7 @@ const routeOptions = (httpDiscovery = false) => ({
         createHermesGatewayDaemonNoticeSender({ ...options, timeoutMs: http.hold ? 5000 : 20 }) },
 });
 const start = async (f: Fixture, httpDiscovery = false) => {
-  expect(startConfiguredCeoNotificationRoute(f.h.cp, routeOptions(httpDiscovery))).toEqual({ started: true });
+  expect(startEnabledCeoNotificationRoute(f.h.cp, routeOptions(httpDiscovery))).toEqual({ started: true });
   await f.h.cp.outbox.deliverCeoNotifications();
 };
 const probe = async (f: Fixture, nonce: string) => {
@@ -164,12 +168,13 @@ it("records an exact pre-claim 400 per row, switches the SAME id to verified Buz
   expect(http.posts).toHaveLength(1);
 });
 
-it.each(["timeout", "lost", "uncertain", "409", "other400", "wrongShape"] as const)(
+it.each(["timeout", "lost", "uncertain", "409", "other400", "wrongShape", "malformed"] as const)(
   "%s remains withheld without HTTP while receiver support is unverified", async (mode) => {
     const f = await fixture(); http.mode = mode;
     const id = notify(f);
     await f.h.cp.outbox.deliverCeoNotifications();
     expect(f.h.cp.outbox.get(id)?.status).toBe("PENDING");
+    expect(events(f, "CEO_NOTIFICATION_CANONICAL_RESULT")).toMatchObject([{ evidence: { messageId: id, outcome: "UNKNOWN" } }]);
     const calls = http.request.mock.calls.length;
     await bindBuzz(f);
     await f.h.buzzAdapter.deliverPending();
@@ -215,6 +220,53 @@ it("withholds without a verified Buzz binding, audits the refusal once, and resu
   expect(f.h.buzz.sent).toHaveLength(0);
   await bindBuzz(f);
   expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([id]);
+});
+
+it.each([undefined, "true"])("#1344: ACP_DAEMON_NOTICE_ENABLED=%s starts no canonical route and the notification goes to the bound Buzz route", async (flag) => {
+  const f = adoptedFixture(); fixtures.push(f);
+  const environment = { ACP_TELEGRAM_EXTERNAL_SECRET: "lane-secret", ...(flag === undefined ? {} : { ACP_DAEMON_NOTICE_ENABLED: flag }) };
+  expect(startEnabledCeoNotificationRoute(f.h.cp, { ...routeOptions(), environment }))
+    .toEqual({ started: false, reason: "ACP_DAEMON_NOTICE_ENABLED is not 1" });
+  await bindBuzz(f);
+  const id = notify(f);
+  await f.h.cp.outbox.deliverCeoNotifications();
+  expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([id]);
+  expect(f.h.buzz.sent).toEqual([{ channel: "ceo-room", content: expect.stringContaining(id), recipients: ["ceo-key"] }]);
+  expect(http.posts).toHaveLength(0);
+  expect(events(f, "CEO_NOTIFICATION_CANONICAL_ATTEMPT")).toHaveLength(0);
+});
+
+it("#1344: with the switch off and no bound Buzz route, the notification is withheld PENDING with one route-unavailable record, then delivered under its id once Buzz is bound", async () => {
+  const f = adoptedFixture(); fixtures.push(f);
+  expect(startEnabledCeoNotificationRoute(f.h.cp, { ...routeOptions(), environment: { ACP_TELEGRAM_EXTERNAL_SECRET: "lane-secret" } }).started)
+    .toBe(false);
+  const id = notify(f);
+  for (let i = 0; i < 3; i++) { await f.h.cp.outbox.deliverCeoNotifications(); await f.h.buzzAdapter.deliverPending(); }
+  expect(f.h.cp.outbox.get(id)).toMatchObject({ status: "PENDING", attempts: 0 });
+  expect(events(f, "CEO_NOTIFICATION_ROUTE_UNAVAILABLE"))
+    .toMatchObject([{ evidence: { messageId: id, reason: "CANONICAL_TRANSPORT_NOT_ATTACHED" } }]);
+  expect(http.posts).toHaveLength(0);
+  expect(f.h.buzz.sent).toHaveLength(0);
+  await bindBuzz(f);
+  expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([id]);
+  expect(http.posts).toHaveLength(0);
+});
+
+it("#1344: a stall notice's transport, attached while the start was parked, does not outlive a switch-off start; fresh mail goes to Buzz", async () => {
+  const f = adoptedFixture(); fixtures.push(f); http.mode = "completed";
+  const stall = startStallNoticeRoute(f.h.cp, routeOptions());
+  expect(stall.open!()).toEqual({ started: true });
+  const stallId = notify(f, "stall-notice");
+  expect(await stall.deliver([stallId])).toEqual({ started: true });
+  expect(f.h.cp.outbox.get(stallId)?.status).toBe("ACKED");
+  expect(startEnabledCeoNotificationRoute(f.h.cp, { ...routeOptions(), environment: { ACP_TELEGRAM_EXTERNAL_SECRET: "lane-secret" } }))
+    .toEqual({ started: false, reason: "ACP_DAEMON_NOTICE_ENABLED is not 1" });
+  await bindBuzz(f);
+  const id = notify(f, "fresh");
+  await f.h.cp.outbox.deliverCeoNotifications();
+  expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([id]);
+  expect(f.h.buzz.sent).toEqual([{ channel: "ceo-room", content: expect.stringContaining(id), recipients: ["ceo-key"] }]);
+  expect(http.posts).toHaveLength(1);
 });
 
 it("sends fresh unsent mail straight to verified Buzz when support is unverified", async () => {
