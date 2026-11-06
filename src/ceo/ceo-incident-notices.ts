@@ -503,7 +503,7 @@ export interface NoticeConclusion {
 }
 
 /** The run states that end a run. BLOCKED_POST_MERGE is terminal but waits on recovery, so it ends nothing. */
-const ENDED_RUN_STATES: ReadonlySet<string> = new Set<string>([RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED]);
+export const ENDED_RUN_STATES: ReadonlySet<string> = new Set<string>([RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED]);
 
 interface NoticeRow {
   message_id: string; idempotency_key: string; run_id: string | null; role_key: string; target_session_id: string;
