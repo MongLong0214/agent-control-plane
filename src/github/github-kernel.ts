@@ -643,6 +643,10 @@ export class GitHubKernel {
         }
         if (matches.length === 1) {
           const value = { pullNumber: matches[0]!.number, url: matches[0]!.html_url };
+          if (input.requireLinkage) {
+            const closing = await this.closingReferencesHold(owner, repo, value.pullNumber, linkedIssues);
+            if (!closing.allowed) return closing as Decision<{ pullNumber: number; url: string }>;
+          }
           const finalized = this.finalizeReservedReceipt({
             idempotencyKey,
             requestDigest,
@@ -687,6 +691,10 @@ export class GitHubKernel {
           expected: candidate.value.baseHead,
           observed: reread.base.sha,
         });
+      }
+      if (input.requireLinkage) {
+        const closing = await this.closingReferencesHold(owner, repo, cached.pullNumber, linkedIssues);
+        if (!closing.allowed) return closing as Decision<{ pullNumber: number; url: string }>;
       }
       return allow(ReasonCode.MERGE_IDEMPOTENT_REPLAY, {
         pullNumber: cached.pullNumber,
@@ -811,6 +819,10 @@ export class GitHubKernel {
         pullNumber: reread.number,
         linkedIssues,
       });
+    }
+    if (input.input.requireLinkage) {
+      const closing = await this.closingReferencesHold(owner, repo, reread.number, linkedIssues);
+      if (!closing.allowed) return closing as Decision<{ pullNumber: number; url: string }>;
     }
 
     const value = { pullNumber: reread.number, url: reread.html_url };
@@ -4683,6 +4695,37 @@ export class GitHubKernel {
       linkedIssues.every((issue) => new RegExp(`\\bCloses\\s+#${issue}\\b`, "i").test(body)) &&
       body.includes(`<!-- acp-linked-issues:${linkedIssues.join(",")} -->`)
     );
+  }
+
+  /**
+   * #1345 — the PR's linkage as GitHub resolves it (GraphQL `closingIssuesReferences`), not as its body reads: a
+   * `Closes #N` inside a code block, or one GitHub did not link, closes nothing. Every linked issue must be a
+   * closing reference of this repository; a missing one, or an answer that cannot be read, is PR_LINKAGE_MISSING.
+   */
+  private async closingReferencesHold(owner: string, repo: string, pullNumber: number, linkedIssues: readonly number[]): Promise<Decision<void>> {
+    const refused = (evidence: Record<string, unknown>): Decision<void> =>
+      deny(ReasonCode.PR_LINKAGE_MISSING, "GitHub does not resolve the PR's required closing issue references", { pullNumber, linkedIssues, ...evidence });
+    let answer: { data?: { repository?: { pullRequest?: { closingIssuesReferences?: { nodes?: unknown } } | null } | null } | null; errors?: unknown } | null;
+    try {
+      answer = await this.api().request("POST", "/graphql", {
+        query: "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){closingIssuesReferences(first:100){nodes{number repository{nameWithOwner}}}}}}",
+        variables: { owner, repo, number: pullNumber },
+      });
+    } catch (error) {
+      return refused({ cause: "the closing references could not be read", ...transportOutcome(error) });
+    }
+    const nodes = answer?.data?.repository?.pullRequest?.closingIssuesReferences?.nodes;
+    if ((Array.isArray(answer?.errors) && answer.errors.length > 0) || !Array.isArray(nodes)) {
+      return refused({ cause: "GitHub's closing references answer is not readable" });
+    }
+    const own = `${owner}/${repo}`.toLowerCase();
+    const present = new Set(
+      (nodes as Array<{ number?: unknown; repository?: { nameWithOwner?: unknown } | null }>)
+        .filter((node) => typeof node?.repository?.nameWithOwner === "string" && node.repository.nameWithOwner.toLowerCase() === own)
+        .map((node) => node.number),
+    );
+    const missing = linkedIssues.filter((issue) => !present.has(issue));
+    return missing.length > 0 ? refused({ missing }) : allow(ReasonCode.OK, undefined);
   }
 
   private hasPrRunMarker(body: string | null | undefined, runId: string): boolean {

@@ -75,6 +75,22 @@ export class FakeGitHub implements GitHubClient {
   readonly calls: Array<{ method: string; path: string; body?: unknown }> = [];
   mergeCount = 0;
   #nextId = 100;
+  /**
+   * #1345 — the issues GitHub resolves as a pull's closing references (GraphQL `closingIssuesReferences`): by
+   * default each line of its body that opens with a closing keyword and `#N`, outside fenced code.
+   */
+  closingIssuesFor: (pull: FakePull) => number[] = (pull) => {
+    let fenced = false;
+    const issues: number[] = [];
+    for (const line of (pull.body ?? "").split("\n")) {
+      if (/^\s*```/.test(line)) fenced = !fenced;
+      const match = fenced ? null : /^\s*(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b/i.exec(line);
+      if (match) issues.push(Number(match[1]));
+    }
+    return issues;
+  };
+  /** #1345 — when set, the GraphQL endpoint answers these errors and no data. */
+  graphqlErrors: string[] | null = null;
 
   async request<T>(
     method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
@@ -82,6 +98,14 @@ export class FakeGitHub implements GitHubClient {
     body?: unknown,
   ): Promise<T> {
     this.calls.push({ method, path, body });
+
+    if (method === "POST" && path === "/graphql") {
+      if (this.graphqlErrors) return { data: null, errors: this.graphqlErrors.map((message) => ({ message })) } as unknown as T;
+      const { owner, repo, number } = (body as { variables: { owner: string; repo: string; number: number } }).variables;
+      const pull = this.pulls.find((entry) => entry.number === number);
+      const nodes = pull ? this.closingIssuesFor(pull).map((issue) => ({ number: issue, repository: { nameWithOwner: `${owner}/${repo}` } })) : [];
+      return { data: { repository: { pullRequest: pull ? { closingIssuesReferences: { nodes } } : null } } } as unknown as T;
+    }
 
     // --- pulls -------------------------------------------------------------
     if (method === "GET" && /\/pulls\?/.test(path)) {

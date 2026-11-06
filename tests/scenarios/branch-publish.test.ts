@@ -297,6 +297,48 @@ describe("#1345: the finalization PR closes the issues the run tracks on its own
     expect(openedPrBodies(fixture)).toEqual([
       `Automated daemon finalization for run ${driven.runId}.\n\nCloses #7\n<!-- acp-run:${driven.runId} -->\n<!-- acp-linked-issues:7 -->`,
     ]);
+    // GitHub's own closing references were read for that pull, and they hold #7.
+    const pullNumber = fixture.github.pulls[0]!.number;
+    expect(fixture.log.filter((call) => call.method === "POST" && call.path === "/graphql")
+      .map((call) => (call.body as { variables: { number: number } }).variables.number)).toContain(pullNumber);
+  });
+
+  /** A refused finalization of the tracked run: PR_LINKAGE_MISSING, nothing merged, the run still approved. */
+  const expectLinkageRefused = async (fixture: Fixture): Promise<void> => {
+    const refused = await new ApprovedRunFinalizer(fixture.harness.cp).finalizeApprovedRun(fixture.driven.runId);
+    expect(refused.allowed, JSON.stringify(refused)).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
+    expect(fixture.github.mergeCount).toBe(0);
+    expect(fixture.harness.cp.runs.require(fixture.driven.runId).state).toBe(RunState.CEO_APPROVED);
+  };
+
+  it("an open PR of the run whose `Closes #7` sits in a code block is refused: GitHub resolves no closing reference", async () => {
+    const fixture = await trackedRun();
+    const { harness, github, driven } = fixture;
+    github.pulls.push({
+      number: 98,
+      head: { sha: driven.candidateHead, ref: WORK_BRANCH },
+      base: { sha: driven.baseHead, ref: "dev" },
+      merged: false,
+      state: "open",
+      html_url: "https://github.test/pull/98",
+      title: `ACP finalization: ${harness.cp.runs.require(driven.runId).goal}`,
+      body: `Automated daemon finalization for run ${driven.runId}.\n\n\`\`\`\nCloses #7\n\`\`\`\n<!-- acp-run:${driven.runId} -->\n<!-- acp-linked-issues:7 -->`,
+    });
+    await expectLinkageRefused(fixture);
+  });
+
+  it("a PR whose GitHub closing references are empty is refused, though its body carries `Closes #7`", async () => {
+    const fixture = await trackedRun();
+    fixture.github.closingIssuesFor = () => [];
+    await expectLinkageRefused(fixture);
+    expect(fixture.github.pulls).toHaveLength(1);
+  });
+
+  it("a GraphQL error reading the closing references is refused, never taken as linkage", async () => {
+    const fixture = await trackedRun();
+    fixture.github.graphqlErrors = ["Something went wrong while executing your query."];
+    await expectLinkageRefused(fixture);
   });
 
   it("an open PR of the run that does not carry `Closes #7` is not accepted: PR_LINKAGE_MISSING, nothing merged", async () => {
