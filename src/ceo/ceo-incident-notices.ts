@@ -5,9 +5,9 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { OWNERLESS_STALL_ROUTED, runProgressAt } from "../doctor/watchdog.ts";
 import { isTerminal } from "../domain/run-state.ts";
-import { Role, type RunState, roleKeyFor } from "../domain/types.ts";
+import { Role, RunState, roleKeyFor } from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
-import type { Outbox } from "../outbox/outbox.ts";
+import { type Outbox, type OutboxMessage, outboxDeliveryReadback } from "../outbox/outbox.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 
 /**
@@ -206,9 +206,13 @@ export const runProgressedPast = (db: Pick<Db, "get">, runId: string, episode: s
   runEpisode(db, runId) !== episode;
 
 /**
- * H5-1 — the record of an incident its detector does not settle on progress, stated in an episode whose notice
- * an incident that does settle on it delivered (`deliverIncident` covering it): while that incident is open,
- * progress alone resolves neither of them.
+ * What is owed for something is accounted for by another record. Two statements carry it:
+ * - H5-1 — an incident its detector does not settle on progress, stated in an episode whose notice an incident
+ *   that does settle on it delivered (`deliverIncident` covering it): while that incident is open, progress alone
+ *   resolves neither of them. It names the incident (`correlation`, `episode`) and the notice (`messageId`).
+ * - A notice whose exact request an official record concluded (`settleConcludedNotices`): it names the notice
+ *   (`messageId`), its request under `request` and the concluding record under `concludedBy`, never a top-level
+ *   `correlation`, so it is not read as the first.
  */
 export const CEO_NOTIFICATION_COVERED = "CEO_NOTIFICATION_COVERED";
 
@@ -457,6 +461,201 @@ export const withdrawResolvedNotices = (
     });
   }
   return withdrawn;
+};
+
+/** A CEO notice's exact request, read back from what its writer put on it. */
+interface NoticeRequest {
+  notification: string | null;
+  runId: string | null;
+  /** The CTO escalation it asks about: its `escalationId`, or a CTO_ESCALATION incident's episode. */
+  escalationId?: number;
+  /** The candidate a review notice asks the CEO to decide. */
+  candidateSnapshotDigest?: string;
+  /** A stall notice's stalled resource: its kind, its id and since when. */
+  stall?: string;
+  resource?: string;
+  since?: string;
+  incidentClass?: string;
+  correlation?: string;
+  episode?: string;
+}
+
+/**
+ * The official record that concluded a notice's exact request (`conclusionOf`), and the row it is when it is not
+ * an audit event (a claim's, a message's).
+ */
+export interface NoticeConclusion {
+  kind: "CEO_DECISION" | "RUN_ENDED" | "CLAIM_EXPIRED" | "MESSAGE_ACKED";
+  eventId: number | null;
+  runState?: string;
+  claimId?: string;
+  ackedMessageId?: string;
+  ackedAt?: string;
+}
+
+/** The run states that end a run. BLOCKED_POST_MERGE is terminal but waits on recovery, so it ends nothing. */
+const ENDED_RUN_STATES: ReadonlySet<string> = new Set<string>([RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED]);
+
+interface NoticeRow {
+  message_id: string; run_id: string | null; role_key: string; target_session_id: string; binding_generation: number;
+  status: OutboxMessage["status"]; reason_code: string | null; attempts: number; failure_class: OutboxMessage["failureClass"];
+  created_at: string;
+  payload_json: string;
+}
+
+const requestOf = (row: NoticeRow): { request: NoticeRequest; incident: Incident | null } | null => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.payload_json);
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed)) return null;
+  const payload = parsed;
+  const text = (key: string): string | undefined => {
+    const value = payload[key];
+    return typeof value === "string" ? value : undefined;
+  };
+  const incident = incidentOfNotice(row.run_id, row.payload_json);
+  const escalationId = typeof payload["escalationId"] === "number" ? payload["escalationId"]
+    : incident?.cls === IncidentClass.CTO_ESCALATION && /^\d+$/.test(incident.episode) ? Number(incident.episode) : undefined;
+  const [candidateSnapshotDigest, stall, resource, since] = [text("candidateSnapshotDigest"), text("stall"), text("resource"), text("since")];
+  const request: NoticeRequest = {
+    notification: text("notification") ?? null,
+    runId: row.run_id,
+    ...(escalationId !== undefined ? { escalationId } : {}),
+    ...(candidateSnapshotDigest !== undefined ? { candidateSnapshotDigest } : {}),
+    ...(stall !== undefined ? { stall } : {}),
+    ...(resource !== undefined ? { resource } : {}),
+    ...(since !== undefined ? { since } : {}),
+    ...(incident !== null
+      ? { incidentClass: incident.cls, correlation: correlationOf(incident.cls, incident.subject), episode: incident.episode }
+      : {}),
+  };
+  return { request, incident };
+};
+
+/**
+ * The official record that concluded the notice's exact request, or null while there is none and the notice stays
+ * owed. Each is bound to that request, never to its run alone: a decision on another escalation or candidate of the
+ * same run concludes nothing here.
+ * - CEO_DECISION: the CEO decision on that escalation (its `escalationId`), or on the candidate a review notice
+ *   names, recorded after the notice;
+ * - CLAIM_EXPIRED: the claim a stall notice reports, its lease since expired (its row EXPIRED);
+ * - MESSAGE_ACKED: the oldest stalled message a delivery stall notice names, since ACKed, with none of that role's
+ *   messages queued no later still PENDING (they would be stated in the same episode);
+ * - RUN_ENDED: the RUN_TRANSITION that ended the notice's run after the notice, for a notice about that run.
+ * An incident notice stands for every incident stated in its episode, so it is settled only once that episode is
+ * closed under `resolutionOf` too: no later statement can be folded into a notice nobody is told.
+ */
+const conclusionOf = (db: Pick<Db, "get" | "all">, row: NoticeRow, request: NoticeRequest, incident: Incident | null): NoticeConclusion | null => {
+  const concluded = ((): NoticeConclusion | null => {
+    const runId = row.run_id;
+    if (runId !== null && request.escalationId !== undefined) {
+      const decided = db.get<{ event_id: number }>(
+        `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CEO_DECISION'
+           AND json_extract(evidence_json, '$.escalation') = 1 AND json_extract(evidence_json, '$.escalationId') = ?
+         ORDER BY event_id LIMIT 1`,
+        [runId, request.escalationId],
+      );
+      if (decided) return { kind: "CEO_DECISION", eventId: decided.event_id };
+    }
+    if (runId !== null && request.notification === NotificationKind.READY_FOR_CEO_REVIEW && request.candidateSnapshotDigest !== undefined) {
+      const decided = db.get<{ event_id: number }>(
+        `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CEO_DECISION'
+           AND json_extract(evidence_json, '$.decision') IS NOT NULL
+           AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ? AND at > ?
+         ORDER BY event_id LIMIT 1`,
+        [runId, request.candidateSnapshotDigest, row.created_at],
+      );
+      if (decided) return { kind: "CEO_DECISION", eventId: decided.event_id };
+    }
+    if (incident?.cls === IncidentClass.RUN_STALLED && request.stall === "claim" && request.resource !== undefined) {
+      const claim = db.get<{ status: string }>(`SELECT status FROM resource_claims WHERE claim_id = ? AND run_id IS ?`, [request.resource, runId]);
+      if (claim?.status === "EXPIRED") return { kind: "CLAIM_EXPIRED", eventId: null, claimId: request.resource };
+    }
+    if (incident?.cls === IncidentClass.DELIVERY_STALLED && request.stall === "outbox" && request.resource !== undefined && request.since !== undefined) {
+      const acked = db.get<{ role_key: string; acked_at: string }>(
+        `SELECT role_key, acked_at FROM outbox WHERE message_id = ? AND status = 'ACKED' AND acked_at IS NOT NULL`,
+        [request.resource],
+      );
+      const waiting = acked && db.get(
+        `SELECT 1 FROM outbox WHERE role_key = ? AND status = 'PENDING' AND kind <> 'CEO_NOTIFICATION' AND created_at <= ? LIMIT 1`,
+        [acked.role_key, request.since],
+      );
+      if (acked && !waiting) return { kind: "MESSAGE_ACKED", eventId: null, ackedMessageId: request.resource, ackedAt: acked.acked_at };
+    }
+    if (runId !== null && (incident === null || incident.subject === runId)) {
+      const run = db.get<{ state: string }>(`SELECT state FROM runs WHERE run_id = ?`, [runId]);
+      const ended = run && ENDED_RUN_STATES.has(run.state)
+        ? db.get<{ event_id: number }>(
+          `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'RUN_TRANSITION'
+             AND json_extract(evidence_json, '$.to') = ? AND at > ? ORDER BY event_id DESC LIMIT 1`,
+          [runId, run.state, row.created_at],
+        )
+        : undefined;
+      if (run && ended) return { kind: "RUN_ENDED", eventId: ended.event_id, runState: run.state };
+    }
+    return null;
+  })();
+  if (concluded === null) return null;
+  if (incident !== null && incident.runId !== null && incident.subject === incident.runId && resolutionOf(db, incident) === null) return null;
+  return concluded;
+};
+
+/**
+ * Every CEO notice still owed (PENDING or SENT) whose exact request an official record concluded (`conclusionOf`) is
+ * settled COVERED: REJECTED with CEO_NOTIFICATION_COVERED, and a CEO_NOTIFICATION_COVERED record that binds the
+ * notice, its request, what it was (status, attempts, failure class, reason) and the concluding record. COVERED is
+ * not receipt, ACK or delivery success: its attempts, its outcome-unknown history (failure class, error, sent
+ * destinations, the canonical attempt journal) and its body stay as they were; it only leaves the redelivery and
+ * watchdog-overdue sets. A notice being sent (IN_FLIGHT) is that send's, and is settled on a later pass. Run by the
+ * watchdog on every tick (`Outbox.settleConcludedCeoNotices`); idempotent, since a settled notice is no longer owed.
+ */
+export const settleConcludedNotices = (db: Db, audit: AuditLog): string[] => {
+  const settled: string[] = [];
+  const rows = db.all<NoticeRow>(
+    `SELECT message_id, run_id, role_key, target_session_id, binding_generation, status, reason_code, attempts,
+            failure_class, created_at, payload_json FROM outbox
+      WHERE kind = 'CEO_NOTIFICATION' AND status IN ('PENDING', 'SENT')
+      ORDER BY created_at, rowid`,
+  );
+  for (const row of rows) {
+    const asked = requestOf(row);
+    const concluded = asked === null ? null : conclusionOf(db, row, asked.request, asked.incident);
+    if (asked === null || concluded === null) continue;
+    const written = db.txDecision((): Decision<boolean> => {
+      const changed = db.run(
+        `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
+                           retry_eligible = 0, next_attempt_at = NULL
+          WHERE message_id = ? AND kind = 'CEO_NOTIFICATION' AND status = ?`,
+        [ReasonCode.CEO_NOTIFICATION_COVERED, row.message_id, row.status],
+      ).changes;
+      if (changed !== 1) return allow(ReasonCode.OK, false);
+      const recorded = audit.record({
+        kind: CEO_NOTIFICATION_COVERED,
+        reasonCode: ReasonCode.CEO_NOTIFICATION_COVERED,
+        runId: row.run_id,
+        roleKey: row.role_key,
+        sessionId: row.target_session_id,
+        evidence: {
+          messageId: row.message_id,
+          // What it was, an outcome-unknown send disclosed as one (FCR-17).
+          ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class }),
+          attempts: row.attempts,
+          failureClass: row.failure_class,
+          priorReasonCode: row.reason_code,
+          generation: row.binding_generation,
+          targetSessionId: row.target_session_id,
+          request: { ...asked.request },
+          concludedBy: { ...concluded },
+        },
+      });
+      return recorded.allowed ? allow(ReasonCode.OK, true) : recorded as unknown as Decision<boolean>;
+    });
+    if (written.allowed && written.value) settled.push(row.message_id);
+  }
+  return settled;
 };
 
 const withoutWhy = (payload: Record<string, unknown>): Record<string, unknown> => {

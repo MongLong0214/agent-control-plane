@@ -403,6 +403,9 @@ export class Watchdog {
       );
     }
 
+    // A CEO notice never expires on its TTL (r-6b2239c63486); one whose exact request an official record concluded is
+    // settled COVERED first, so it is neither counted overdue here nor delivered again.
+    this.outbox.settleConcludedCeoNotices();
     for (const message of this.db.all<{ message_id: string; created_at: string; run_id: string | null; kind: string; role_key: string }>(
       `SELECT message_id, created_at, run_id, kind, role_key FROM outbox WHERE status = 'PENDING'`,
     )) {

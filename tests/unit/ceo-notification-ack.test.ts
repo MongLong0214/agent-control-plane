@@ -113,11 +113,45 @@ it.each([
   ["PENDING", "status = 'PENDING', sent_at = NULL", "INVALID_ARGUMENT"],
   ["EXPIRED", "status = 'EXPIRED'", "OUTBOX_EXPIRED"],
   ["REJECTED", "status = 'REJECTED'", "OUTBOX_STALE_GENERATION_REJECTED"],
-  ["expired SENT", "expires_at = created_at", "OUTBOX_EXPIRED"],
   ["other kind", "kind = 'ESCALATION_REPLY'", "INVALID_ARGUMENT"],
   ["unproven ACKED", "status = 'ACKED', acked_at = sent_at", "CONFLICT"],
 ])("refuses %s with the row, audit and run unchanged", async (_label, change, reasonCode) => {
   const f = await fixture();
+  f.h.cp.db.run(`UPDATE outbox SET ${change} WHERE message_id = ?`, [f.messageId]);
+  const before = f.state();
+  expect(await f.call()).toMatchObject({ ok: false, reasonCode });
+  expect(f.state()).toEqual(before);
+});
+
+/**
+ * A CEO notification has no delivery TTL (r-6b2239c63486): it stays PENDING past its expires_at until a route
+ * reaches its CEO. One posted only then is acknowledged by the current CEO like any other, and only by them.
+ */
+const postedAfterItsWindow = (f: Awaited<ReturnType<typeof fixture>>): void => {
+  f.h.cp.db.run("UPDATE outbox SET status = 'PENDING', sent_at = NULL WHERE message_id = ?", [f.messageId]);
+  f.h.clock.advance(45 * 60 * 1000);
+  const row = f.h.cp.db.get<{ expires_at: string }>("SELECT expires_at FROM outbox WHERE message_id = ?", [f.messageId])!;
+  expect(row.expires_at <= f.h.clock.nowIso()).toBe(true);
+  f.h.cp.db.run("UPDATE outbox SET status = 'SENT', sent_at = ? WHERE message_id = ?", [f.h.clock.nowIso(), f.messageId]);
+};
+
+it("ACKs a notification PENDING past its expires_at and posted now, received by the current CEO", async () => {
+  const f = await fixture();
+  postedAfterItsWindow(f);
+  expect(await f.call()).toMatchObject({ ok: true, value: { messageId: f.messageId } });
+  expect(f.h.cp.db.get("SELECT status, acked_at FROM outbox WHERE message_id = ?", [f.messageId]))
+    .toEqual({ status: "ACKED", acked_at: f.h.clock.nowIso() });
+  expect(f.h.cp.audit.byKind("CEO_NOTIFICATION_ACKED")).toHaveLength(1);
+});
+
+it.each([
+  ["wrong target", "target_session_id = 'another-session'", "OUTBOX_STALE_GENERATION_REJECTED"],
+  ["stale generation", "binding_generation = binding_generation + 1", "OUTBOX_STALE_GENERATION_REJECTED"],
+  ["still PENDING", "status = 'PENDING', sent_at = NULL", "INVALID_ARGUMENT"],
+  ["EXPIRED", "status = 'EXPIRED'", "OUTBOX_EXPIRED"],
+])("still refuses a notification past its expires_at with %s, the row, audit and run unchanged", async (_label, change, reasonCode) => {
+  const f = await fixture();
+  postedAfterItsWindow(f);
   f.h.cp.db.run(`UPDATE outbox SET ${change} WHERE message_id = ?`, [f.messageId]);
   const before = f.state();
   expect(await f.call()).toMatchObject({ ok: false, reasonCode });

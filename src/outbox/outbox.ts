@@ -1,5 +1,5 @@
 import { resumeReviewAttachmentMatches } from "../bootstrap/bootstrap-plan-artifact.ts";
-import { withdrawResolvedNotices } from "../ceo/ceo-incident-notices.ts";
+import { settleConcludedNotices, withdrawResolvedNotices } from "../ceo/ceo-incident-notices.ts";
 import { buzzPolicyHoldReason, ceoBuzzHistoryIsPrePost, isBuzzSignerRefusal, type BuzzPolicyBinding, type BuzzPolicyReadiness } from "./ceo-buzz-signer.ts";
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
@@ -1143,6 +1143,15 @@ export class Outbox {
     withdrawResolvedNotices(this.db, this.audit, { generation: current.generation, sessionId: current.session });
     // A new target is a new route: a failure recorded against the previous one no longer holds it.
     readdressCeoNotifications(this.db, current.generation, current.session);
+  }
+
+  /**
+   * The CEO notices whose exact request an official record concluded, settled COVERED by the incident module's own
+   * rule (`settleConcludedNotices`): out of the redelivery and watchdog-overdue sets, history and body kept. The
+   * watchdog runs it on every tick; it is idempotent.
+   */
+  settleConcludedCeoNotices(): string[] {
+    return settleConcludedNotices(this.db, this.audit);
   }
 
   /**
