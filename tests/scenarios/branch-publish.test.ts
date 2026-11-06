@@ -4,12 +4,12 @@ import { dirname, join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
-import { sha256 } from "../../src/core/digest.ts";
+import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { ApprovedRunFinalizer } from "../../src/daemon/finalizer.ts";
-import { RunState } from "../../src/domain/types.ts";
+import { ArtifactKind, ExecutionMode, RunKind, RunState } from "../../src/domain/types.ts";
 import {
   type ConfirmedMergePlan,
   type ConfirmedMergePorts,
@@ -17,6 +17,7 @@ import {
 } from "../../src/github/confirmed-merge-operation.ts";
 import type { BranchPublishLimits } from "../../src/git/branch-objects.ts";
 import { NO_HUMAN_GATE_DIGEST, type GitHubClient } from "../../src/github/github-kernel.ts";
+import { WORK_SCOPE_APPROVED, WORK_SCOPE_GITHUB_TRACKED } from "../../src/run/work-scope-tracking.ts";
 import type { CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
 import { cleanupTempDirs, commitAll, tempDir, writeFiles } from "../helpers/fixtures.ts";
@@ -227,6 +228,77 @@ describe("S-PUSH: the finalizer publishes the branch before it prepares the PR",
     expect(replay.allowed).toBe(true);
     expect(fixture.log.filter((call) => call.method === "POST" && GIT_DATA.test(call.path)).length).toBe(sentBefore);
     expect(receiptsOf(fixture)).toHaveLength(1);
+  });
+});
+
+/**
+ * #1345 — the run's work scope tracked on GitHub, as `WorkScopeTracking` records it: the project is a Repo
+ * Factory one at a recorded node id, the run's PLAN puts its one task in one unit adopting issue #`issue`, the
+ * owner's approval of that PLAN, and the unit's verification. Seeded before CONFIRM, whose work-scope check
+ * refuses a governed run unless these records hold its every unit as tracked.
+ */
+const trackWorkScope = (fixture: Fixture, issue: number): void => {
+  const { harness, driven } = fixture;
+  const node = "R_kgDOfixture";
+  const contract = { goal: "bootstrap", why: "genesis", scope: [], nonGoals: [], acceptance: [], priority: "NORMAL" as const, humanGate: [], references: [] };
+  const holder = harness.cp.runs.create({ projectId: driven.projectId, kind: RunKind.STANDARD_WORK, executionMode: ExecutionMode.SIMPLE, contract, repositories: [] });
+  if (!holder.allowed) throw new Error(holder.message);
+  harness.cp.db.run(
+    `INSERT INTO resident_project_provisioning(run_id,project_id,binding_json,allocation_json,confirmation_json,steps_json,status,updated_at)
+     VALUES (?,?,'{}',?,'{}','{}','COMPLETE',?)`,
+    [holder.value.runId, driven.projectId, JSON.stringify({ projectId: driven.projectId, repositoryIdentity: driven.identity, repositoryNodeId: node }), harness.clock.nowIso()],
+  );
+  const taskIds = harness.cp.tasks.list(driven.runId).map((task) => task.taskId);
+  const unit = { key: "app", tasks: taskIds, issue: { number: issue }, milestone: { number: 1 } };
+  const plan = harness.cp.artifacts.put(driven.runId, ArtifactKind.PLAN, { summary: "one work unit", workUnits: [unit] });
+  const approved = harness.cp.tasks.workScope!.approve(driven.runId, plan.digest, { units: [unit] }, [], [], {
+    sessionId: driven.ownerSessionId,
+    bindingGeneration: driven.ownerBindingGeneration,
+  });
+  if (!approved.allowed) throw new Error(approved.message);
+  const approval = harness.cp.audit.byKind(WORK_SCOPE_APPROVED).at(-1)!;
+  const declarationDigest = (approval.evidence as { units: Array<{ declarationDigest: string }> }).units[0]!.declarationDigest;
+  harness.cp.audit.record({
+    kind: WORK_SCOPE_GITHUB_TRACKED,
+    runId: driven.runId,
+    projectId: driven.projectId,
+    evidence: {
+      repositoryIdentity: driven.identity,
+      repositoryNodeId: node,
+      units: [{
+        unit: unit.key, declarationDigest, scopeDigest: digestOf({ declarationDigest, taskIds: [...taskIds].sort() }), taskIds,
+        approvalEventId: approval.eventId, issueNumber: issue, issueNodeId: `I_${issue}`, milestoneNumber: 1, milestoneNodeId: "MI_1", adopted: true,
+      }],
+    },
+  });
+};
+
+/** The body of every pull request the finalizer opened, in order. */
+const openedPrBodies = (fixture: Fixture): string[] =>
+  fixture.log.filter((call) => call.method === "POST" && /\/pulls$/.test(call.path)).map((call) => (call.body as { body: string }).body);
+
+describe("#1345: the finalization PR closes the issues the run tracks on its own repository", () => {
+  it("a run tracking issue #7 opens its PR with `Closes #7`, the run marker kept; the run completes", async () => {
+    const fixture = await setup({ finalization: false });
+    const { harness, driven } = fixture;
+    trackWorkScope(fixture, 7);
+    expect(harness.cp.tasks.workScope!.trackedIssues(driven.runId)).toEqual({ repositoryIdentity: driven.identity, issues: [7] });
+    await approveReviewedCandidateForFinalization(harness, driven);
+    const done = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+    expect(done.allowed, JSON.stringify(done)).toBe(true);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+    expect(openedPrBodies(fixture)).toEqual([
+      `Automated daemon finalization for run ${driven.runId}.\n\nCloses #7\n\n<!-- acp-run:${driven.runId} -->`,
+    ]);
+  });
+
+  it("a run that tracks no issue opens its PR with the body it always had", async () => {
+    const fixture = await setup();
+    const { harness, driven } = fixture;
+    expect(harness.cp.tasks.workScope!.trackedIssues(driven.runId)).toBeNull();
+    const done = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+    expect(done.allowed, JSON.stringify(done)).toBe(true);
+    expect(openedPrBodies(fixture)).toEqual([`Automated daemon finalization for run ${driven.runId}.\n\n<!-- acp-run:${driven.runId} -->`]);
   });
 });
 

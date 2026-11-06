@@ -233,6 +233,15 @@ const retryDelayMs = (refusals: number): number =>
 const blockerOf = (failure: Decision<unknown>): string =>
   `${failure.reasonCode}: ${failure.allowed ? "" : failure.message}`.slice(0, 200);
 
+/**
+ * #1345 — the finalization PR's body, with one `Closes #N` line for each issue the run tracks on that PR's own
+ * repository, so merging the PR closes them. A bare `#N` names an issue of the PR's repository, so the caller
+ * passes only issues of that repository, never another's. GitHub acts on the keyword only when the PR's base
+ * is the repository's default branch; a PR into any other base leaves the issues open.
+ */
+const finalizationBody = (runId: string, closes: readonly number[]): string =>
+  [`Automated daemon finalization for run ${runId}.`, ...(closes.length > 0 ? ["", ...closes.map((issue) => `Closes #${issue}`)] : [])].join("\n");
+
 type FinalizationAttemptState = "RUNNING" | "RELEASED" | "COMPLETED" | "BLOCKED";
 
 interface FinalizationAttemptRow {
@@ -928,6 +937,7 @@ export class ApprovedRunFinalizer {
     const humanGate = this.cp.ceo.currentHumanGateDecisionDigest(runId);
     if (!humanGate.allowed) return humanGate as Decision<ConfirmedMergePlan[]>;
 
+    const tracked = this.cp.tasks.workScope?.trackedIssues(runId) ?? null;
     const plans: ConfirmedMergePlan[] = [];
     for (const participant of this.cp.runs.repositoriesOf(runId)) {
       const snapshotRepository = snapshotArtifact.content.repositories.find(
@@ -954,7 +964,7 @@ export class ApprovedRunFinalizer {
         repositoryIdentity: participant.identity,
         head,
         title: `ACP finalization: ${run.goal}`,
-        body: `Automated daemon finalization for run ${runId}.`,
+        body: finalizationBody(runId, tracked?.repositoryIdentity === participant.identity ? tracked.issues : []),
         declaredParent: snapshotRepository.sourceBranch ?? null,
         humanGateDigest: humanGate.value,
       });
