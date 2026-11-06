@@ -744,13 +744,20 @@ export class CandidatePipeline {
    * (`attemptReleasedNoticeKey`), so a release is told once. It asks for no product change: the attempt's outcome was
    * not applied, and a fresh result_submit with a new idempotency key goes on. Answers the notice's id; null when none
    * is owed (a run not ACTIVE, or a project-less bootstrap run, whose driven CTO would replace its PLAN for any
-   * REVISION_REQUEST and which the daemon's review retry wakes instead, `Daemon.#bootstrapReviewRetry`); and a denial
-   * when one is owed and cannot be written now (no active owner binding, or the outbox refused its target), which the
-   * watchdog keeps owed and retries (`Watchdog.deliverOwedReleaseNotices`). The release never waits on it.
+   * REVISION_REQUEST and which the daemon's review retry wakes instead, `Daemon.#bootstrapReviewRetry`; or an attempt
+   * whose outcome was applied, #1344 B, whose own notice already told the owner and of which "not applied" is false);
+   * and a denial when one is owed and cannot be written now (no active owner binding, or the outbox refused its target),
+   * which the watchdog keeps owed and retries (`Watchdog.deliverOwedReleaseNotices`). The release never waits on it.
    */
   noticeAttemptReleased(released: { runId: string; attemptId: string; reason: string }): Decision<string | null> {
     const run = this.runs.get(released.runId);
     if (!run || run.state !== RunState.ACTIVE || isProjectlessBootstrap(run)) return allow(ReasonCode.OK, null);
+    const applied = this.db.get<{ n: number }>(
+      `SELECT 1 AS n FROM audit_events WHERE run_id = ? AND kind = ?
+          AND json_extract(evidence_json, '$.attemptId') = ? AND json_extract(evidence_json, '$.outcome') = 'APPLIED' LIMIT 1`,
+      [released.runId, CANDIDATE_PIPELINE_ATTEMPT_ENDED, released.attemptId],
+    );
+    if (applied) return allow(ReasonCode.OK, null);
     const roleKey = this.runs.ownerRoleKeyFor(run);
     const binding = roleKey ? this.bindings.active(roleKey) : null;
     if (!binding) {

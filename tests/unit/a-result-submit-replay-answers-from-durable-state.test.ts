@@ -7,6 +7,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { ExecutionMode, type RunRow } from "../../src/domain/types.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
+import { MessageKind } from "../../src/outbox/envelope.ts";
 import { REPLAYED_ATTEMPT_ERRORED, REPLAYED_ATTEMPT_RELEASED, type PipelineOutcome } from "../../src/run/candidate-pipeline.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { InvocationRequest, InvocationResult } from "../../src/runtime/provider.ts";
@@ -226,8 +227,15 @@ describe("#1344 B: a same-key result_submit replay is answered from durable stat
     h.cp.close();
 
     const restarted = makeHarness({ root: h.root, repoPath: h.repoPath, clock: h.clock });
-    await restartReconcile(restarted);
+    const report = await restartReconcile(restarted);
+    // The release itself is kept; its owner is told nothing of "not applied": the verification failure's own revision told it.
     expect(attemptRow(restarted, run.runId)).toEqual({ attempt_id: attemptId, state: "RELEASED" });
+    expect(report.releasedCandidateAttempts).toEqual([expect.objectContaining({
+      runId: run.runId, attemptId, reason: "daemon restart", ownerNoticeId: null, ownerNoticeDeferred: null,
+    })]);
+    await restarted.cp.watchdog.tick();
+    const revisions = restarted.cp.outbox.listByRun(run.runId).filter((message) => message.kind === MessageKind.REVISION_REQUEST);
+    expect(revisions.map((message) => (message.payload as { stage?: unknown }).stage)).toEqual(["verification"]);
     const submit = vi.spyOn(restarted.cp.pipeline, "submitResult");
     const after = await connect(restarted, run);
     try {
