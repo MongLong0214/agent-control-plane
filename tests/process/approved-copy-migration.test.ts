@@ -531,3 +531,73 @@ describe("U6-UNIT3 migrate-approved-copy runs in the file it verified", () => {
     expect(usage.stderr + usage.stdout).toContain("migrate-approved-copy");
   }, 120_000);
 });
+
+/**
+ * #1348 — `state-admin` handed `main()`'s result straight to `process.exit()`. On macOS a write to
+ * a pipe is asynchronous, so whatever the pipe had not yet taken when exit ran was dropped: a
+ * reader that had not drained it got the first 512 bytes of the JSON and lost the rest, while the
+ * same command redirected to a file printed it whole.
+ *
+ * 512 bytes is what an unexpanded macOS pipe holds. Whether the kernel grows a pipe for a larger
+ * write depends on system-wide pipe memory, so a 593-byte plan is lost on one run and arrives whole
+ * on the next. The plan here carries a refusal record larger than any pipe buffer (64 KiB at most),
+ * which no pipe size can absorb: the loss shows on every run, not just on a busy machine.
+ *
+ * The reader below takes nothing from its stdin until the CLI on the other end has exited, or until
+ * bytes have sat unread in the pipe for a second while the CLI is still alive (`fstat` on a macOS
+ * pipe reports what it holds). A CLI that exits before its output has flushed is read in the first
+ * case and shows the loss; one that waits for the flush is read in the second, rather than waiting
+ * on a reader that is waiting on it.
+ */
+const LATE_READER = `
+const { existsSync, fstatSync, readFileSync } = require("node:fs");
+const exited = process.argv[1];
+const started = Date.now();
+let bufferedSince = 0;
+const tick = () => {
+  const now = Date.now();
+  if (!bufferedSince && fstatSync(0).size > 0) bufferedSince = now;
+  if (existsSync(exited) || (bufferedSince && now - bufferedSince > 1000) || now - started > 60000) {
+    process.stdout.write(readFileSync(0));
+    return;
+  }
+  setTimeout(tick, 20);
+};
+tick();
+`;
+
+describe("#1348 state-admin's output reaches a pipe that is read late", () => {
+  it("delivers the whole migration plan, larger than any pipe buffer, to a pipe its reader drains only after a delay", () => {
+    const dir = tempDir("acp-state-admin-late-pipe-");
+    const database = seedAt(join(dir, "state.sqlite"));
+    const refusal = { refusedAt: "2026-11-06T00:00:00.000Z", detail: "r".repeat(128 * 1024) };
+    writeFileSync(join(dir, "migration-refusal.json"), JSON.stringify(refusal), { mode: 0o600 });
+    // Written by the left side of the pipeline once the CLI has exited, with its exit status.
+    const exited = join(dir, "exit-status");
+    const piped = spawnSync(
+      "/bin/sh",
+      [
+        "-c",
+        '{ "$0" --import tsx "$1" migration-plan --database "$2"; echo $? > "$3"; } | "$0" -e "$4" "$3"',
+        process.execPath,
+        CLI,
+        database,
+        exited,
+        LATE_READER,
+      ],
+      { encoding: "utf8", env: { ...process.env, ACP_STATE_DIR: dir, HOME: dir }, timeout: 120_000 },
+    );
+    expect(piped.error).toBeUndefined();
+    expect(piped.status, piped.stderr).toBe(0);
+    expect(readFileSync(exited, "utf8").trim(), piped.stderr).toBe("0");
+    expect(Buffer.byteLength(piped.stdout)).toBeGreaterThan(128 * 1024);
+    const report = JSON.parse(piped.stdout) as { onDiskVersion: number; plan: unknown; lastRefusal: unknown };
+    expect(report.onDiskVersion).toBe(25);
+    expect(report.plan).not.toBeNull();
+    expect(report.lastRefusal).toEqual(refusal);
+    // The same bytes a reader draining the pipe as they arrive gets.
+    const eager = run(["migration-plan", "--database", database], { ACP_STATE_DIR: dir, HOME: dir });
+    expect(eager.status, eager.stderr).toBe(0);
+    expect(piped.stdout).toBe(eager.stdout);
+  }, 300_000);
+});
