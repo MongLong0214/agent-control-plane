@@ -413,6 +413,16 @@ export class WorkScopeTracking {
     return { repositoryIdentity: governed.value.repositoryIdentity, issues };
   }
 
+  /**
+   * #1368 — read-only: the key of the unit of the run's current approved scope that holds `taskId`, or
+   * `null` for a run that is not governed, has no approval of its current PLAN, or maps the task to no unit.
+   */
+  unitOf(runId: string, taskId: string): string | null {
+    const governed = this.#governed(runId);
+    if (!governed.allowed || governed.value === null) return null;
+    return this.#scope(runId)?.units.find((unit) => unit.taskIds.includes(taskId))?.unit ?? null;
+  }
+
   async #ensureNow(runId: string, taskId: string | undefined): Promise<Decision<TrackedUnit | { units: TrackedUnit[] } | null>> {
     const governed = this.#governed(runId);
     if (!governed.allowed || governed.value === null) return governed as Decision<null>;

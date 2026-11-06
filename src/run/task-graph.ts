@@ -167,6 +167,33 @@ export const BOOTSTRAP_TASKS_SUPERSEDED = "BOOTSTRAP_TASKS_SUPERSEDED";
 export const BOOTSTRAP_TASK_SETTLED = "BOOTSTRAP_TASK_SETTLED";
 /** The audit kind a STANDARD_WORK re-plan writes when it cancels the earlier tasks its PLAN names. */
 export const STANDARD_WORK_TASKS_SUPERSEDED = "STANDARD_WORK_TASKS_SUPERSEDED";
+/** #1368 — the audit kind of one correction relation its run's owner registered (`registerCorrection`). */
+export const TASK_CORRECTION_REGISTERED = "TASK_CORRECTION_REGISTERED";
+
+/**
+ * #1368 — the acceptance a correction states it meets: the digest of the corrected task as its PLAN
+ * defined it (its id, title, category and spec). `contract_get` answers it with each task; a correction
+ * names it, and it must still match the task when completeness is read.
+ */
+export const taskAcceptanceDigest = (task: Pick<TaskRecord, "taskId" | "title" | "category" | "spec">): string =>
+  digestOf({ schema: "agent-control-plane.task-acceptance.v1", taskId: task.taskId, title: task.title, category: task.category, spec: task.spec });
+
+/** #1368 — the run owner's claim that a SUCCEEDED task of the run replaces one of its FAILED tasks. */
+export interface TaskCorrectionInput {
+  runId: string;
+  correctionTaskId: string;
+  corrects: { taskId: string; acceptanceDigest: string };
+  owner: { sessionId: string; bindingGeneration: number };
+}
+
+/** #1368 — one registered correction relation, as its `TASK_CORRECTION_REGISTERED` record holds it. */
+export interface TaskCorrection {
+  eventId: number;
+  originalTaskId: string;
+  correctionTaskId: string;
+  workUnit: string;
+  acceptanceDigest: string;
+}
 
 /**
  * CEO msg_2b439e5a — the earlier tasks of the same STANDARD_WORK run a new PLAN names in
@@ -1143,13 +1170,18 @@ export class TaskGraph {
     return allow(ReasonCode.OK, { settled: true });
   }
 
-  completeness(runId: string): Decision<{ tasks: number; succeeded: number }> {
+  /**
+   * #1368 — a FAILED task counts as finished here only while a registered correction settles it
+   * (`#settledByCorrection`); the task and its executions keep their FAILED state and evidence.
+   */
+  completeness(runId: string): Decision<{ tasks: number; succeeded: number; settledByCorrection?: Array<{ taskId: string; correctionTaskId: string }> }> {
     const tasks = this.list(runId);
     if (tasks.length === 0) {
       return allow(ReasonCode.OK, { tasks: 0, succeeded: 0 });
     }
+    const settled = this.#settledByCorrection(runId, tasks);
     const unfinished = tasks.filter(
-      (t) => t.state !== TaskState.SUCCEEDED && t.state !== TaskState.CANCELLED,
+      (t) => t.state !== TaskState.SUCCEEDED && t.state !== TaskState.CANCELLED && !settled.has(t.taskId),
     );
     if (unfinished.length > 0) {
       return deny(
@@ -1171,7 +1203,172 @@ export class TaskGraph {
     return allow(ReasonCode.OK, {
       tasks: tasks.length,
       succeeded: tasks.filter((t) => t.state === TaskState.SUCCEEDED).length,
+      ...(settled.size === 0 ? {} : { settledByCorrection: [...settled].map(([taskId, correctionTaskId]) => ({ taskId, correctionTaskId })) }),
     });
+  }
+
+  /**
+   * #1368 (CEO decision) — the run's owner registers that a SUCCEEDED correction task meets the
+   * acceptance of a FAILED task it replaces, so completeness stops counting that FAILED task as
+   * unfinished. Nothing else changes: both tasks and their executions stay as they are, and the run
+   * still goes through result_submit's verification, blind review and the CEO's decision.
+   *
+   * Refused, each with its refusal named: a sealed run; a task correcting itself; an unknown task or one
+   * of another run; a task another correction already replaces, or a correction already registered for
+   * another task; a relation that would close a cycle; a correction whose PLAN spec does not name the
+   * task in `correctionOf.taskId`; two tasks that are not in one work unit of the run's current approved
+   * scope; an acceptance digest that is not the task's (`taskAcceptanceDigest`); a task that is not
+   * FAILED; and a correction that is not SUCCEEDED with a SUCCEEDED execution. The same relation again
+   * is answered as registered, with no second record.
+   */
+  registerCorrection(input: TaskCorrectionInput): Decision<{ correction: TaskCorrection; registered: boolean }> {
+    // Every refusal precedes the one write, the record; a refused record throws, which rolls it back.
+    return this.db.tx((): Decision<{ correction: TaskCorrection; registered: boolean }> => {
+      const { runId, correctionTaskId } = input;
+      const originalTaskId = input.corrects.taskId;
+      const refuse = (reasonCode: ReasonCode, refusal: string, message: string, evidence: Record<string, unknown> = {}) =>
+        deny(reasonCode, message, { runId, refusal, taskId: originalTaskId, correctionTaskId, ...evidence }) as Decision<never>;
+      const run = this.db.get<{ state: string }>(`SELECT state FROM runs WHERE run_id = ?`, [runId]);
+      if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+      if (CLOSED_TO_NEW_TASKS.has(run.state)) {
+        return refuse(ReasonCode.RUN_TRANSITION_ILLEGAL, "CORRECTION_RUN_SEALED", `run is ${run.state}; its tasks' outcomes are sealed`, { state: run.state });
+      }
+      if (originalTaskId === correctionTaskId) return refuse(ReasonCode.INVALID_ARGUMENT, "CORRECTION_SELF_REFERENCE", "a task cannot correct itself");
+      const original = this.get(originalTaskId);
+      const correction = this.get(correctionTaskId);
+      if (!original || !correction) {
+        return refuse(ReasonCode.NOT_FOUND, "CORRECTION_TASK_UNKNOWN", "unknown task", { unknown: [original ? null : originalTaskId, correction ? null : correctionTaskId].filter((id) => id !== null) });
+      }
+      if (original.runId !== runId || correction.runId !== runId) {
+        return refuse(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "CORRECTION_ACROSS_RUNS", "a correction and the task it corrects both belong to this run", {
+          taskRunId: original.runId, correctionRunId: correction.runId,
+        });
+      }
+      const registered = this.#corrections(runId);
+      const rival = registered.find((r) => r.originalTaskId === originalTaskId && r.correctionTaskId !== correctionTaskId);
+      if (rival) {
+        return refuse(ReasonCode.CONFLICT, "CORRECTION_DUPLICATE", "another correction is already registered for this task", { registeredCorrectionTaskId: rival.correctionTaskId });
+      }
+      const elsewhere = registered.find((r) => r.correctionTaskId === correctionTaskId && r.originalTaskId !== originalTaskId);
+      if (elsewhere) {
+        return refuse(ReasonCode.CONFLICT, "CORRECTION_DUPLICATE", "this correction is already registered for another task; one correction replaces one task", { registeredTaskId: elsewhere.originalTaskId });
+      }
+      if (this.#correctionReaches(registered, originalTaskId, correctionTaskId)) {
+        return refuse(ReasonCode.CONFLICT, "CORRECTION_CYCLE", "the task is itself registered, directly or through others, as a correction of this correction");
+      }
+      const declared = correction.spec["correctionOf"];
+      const declaredTaskId = typeof declared === "object" && declared !== null && !Array.isArray(declared) ? (declared as Record<string, unknown>)["taskId"] : undefined;
+      if (declaredTaskId !== originalTaskId) {
+        return refuse(ReasonCode.INVALID_ARGUMENT, "CORRECTION_NOT_DECLARED", "the correction's PLAN spec names the task it corrects in correctionOf.taskId", {
+          declaredTaskId: typeof declaredTaskId === "string" ? declaredTaskId : null,
+        });
+      }
+      const workUnit = this.#unitOf(runId, originalTaskId);
+      const correctionUnit = this.#unitOf(runId, correctionTaskId);
+      if (workUnit === null || correctionUnit === null) {
+        return refuse(ReasonCode.INVALID_ARGUMENT, "CORRECTION_WORK_UNIT_UNPROVEN", "both tasks must be in a work unit of the run's current approved PLAN", { workUnit, correctionWorkUnit: correctionUnit });
+      }
+      if (workUnit !== correctionUnit) {
+        return refuse(ReasonCode.INVALID_ARGUMENT, "CORRECTION_ACROSS_WORK_UNITS", "a correction is in the work unit of the task it corrects", { workUnit, correctionWorkUnit: correctionUnit });
+      }
+      if (input.corrects.acceptanceDigest !== taskAcceptanceDigest(original)) {
+        return refuse(ReasonCode.INVALID_ARGUMENT, "CORRECTION_ACCEPTANCE_MISMATCH", "the acceptance named is not the corrected task's; read its acceptanceDigest with contract_get", {
+          namedAcceptanceDigest: input.corrects.acceptanceDigest,
+        });
+      }
+      if (original.state !== TaskState.FAILED) {
+        return refuse(ReasonCode.CONFLICT, "CORRECTION_ORIGINAL_NOT_FAILED", `the corrected task is ${original.state}; only a FAILED task is replaced by a correction`, { state: original.state });
+      }
+      const executions = this.executions(runId);
+      const result = executions.filter((e) => e.taskId === correctionTaskId && e.status === "SUCCEEDED").sort((a, b) => a.attempt - b.attempt).at(-1);
+      if (correction.state !== TaskState.SUCCEEDED || result === undefined) {
+        return refuse(ReasonCode.CONFLICT, "CORRECTION_NOT_SUCCEEDED", `the correction is ${correction.state}; the corrected task keeps blocking until its correction SUCCEEDED`, { correctionState: correction.state });
+      }
+      const acceptanceDigest = input.corrects.acceptanceDigest;
+      const same = registered.find((r) => r.originalTaskId === originalTaskId && r.correctionTaskId === correctionTaskId && r.acceptanceDigest === acceptanceDigest && r.workUnit === workUnit);
+      if (same) return allow(ReasonCode.OK, { correction: same, registered: false });
+      const recorded = this.audit.record({
+        kind: TASK_CORRECTION_REGISTERED,
+        runId,
+        sessionId: input.owner.sessionId,
+        evidence: {
+          originalTaskId,
+          correctionTaskId,
+          workUnit,
+          acceptanceDigest,
+          bindingGeneration: input.owner.bindingGeneration,
+          correctionOfDigest: digestOf(declared),
+          correctionExecution: { executionId: result.executionId, resultDigest: result.resultDigest },
+          originalExecutions: executions
+            .filter((e) => e.taskId === originalTaskId)
+            .map((e) => ({ executionId: e.executionId, status: e.status, failureClass: e.failureClass })),
+        },
+      });
+      if (!recorded.allowed) return fail(recorded.reasonCode, recorded.message, recorded.evidence);
+      return allow(ReasonCode.OK, { correction: { eventId: recorded.value, originalTaskId, correctionTaskId, workUnit, acceptanceDigest }, registered: true });
+    });
+  }
+
+  /** #1368 — the run's registered correction relations, oldest first. */
+  #corrections(runId: string): TaskCorrection[] {
+    return this.db
+      .all<{ event_id: number; evidence_json: string }>(
+        `SELECT event_id, evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`,
+        [TASK_CORRECTION_REGISTERED, runId],
+      )
+      .flatMap((row) => {
+        const e = JSON.parse(row.evidence_json) as Record<string, unknown>;
+        const { originalTaskId, correctionTaskId, workUnit, acceptanceDigest } = e;
+        return typeof originalTaskId === "string" && typeof correctionTaskId === "string" && typeof workUnit === "string" && typeof acceptanceDigest === "string"
+          ? [{ eventId: row.event_id, originalTaskId, correctionTaskId, workUnit, acceptanceDigest }]
+          : [];
+      });
+  }
+
+  /** Whether `from`, followed through the corrections it is registered as, reaches `target`. */
+  #correctionReaches(registered: readonly TaskCorrection[], from: string, target: string): boolean {
+    const seen = new Set<string>();
+    const pending = [from];
+    while (pending.length > 0) {
+      const taskId = pending.pop()!;
+      if (taskId === target) return true;
+      if (seen.has(taskId)) continue;
+      seen.add(taskId);
+      for (const r of registered) if (r.correctionTaskId === taskId) pending.push(r.originalTaskId);
+    }
+    return false;
+  }
+
+  #unitOf(runId: string, taskId: string): string | null {
+    return this.#workScope?.unitOf(runId, taskId) ?? null;
+  }
+
+  /**
+   * #1368 — the run's FAILED tasks a registered correction settles for completeness, each with its
+   * correction, read again from the tasks as they are now: exactly one correction claims the task and
+   * claims no other, the correction is SUCCEEDED, both are in the work unit the relation names, and the
+   * task's acceptance digest is still the one named. Anything else leaves the task blocking.
+   */
+  #settledByCorrection(runId: string, tasks: readonly TaskRecord[]): Map<string, string> {
+    const settled = new Map<string, string>();
+    const failed = tasks.filter((t) => t.state === TaskState.FAILED);
+    if (failed.length === 0) return settled;
+    const registered = this.#corrections(runId);
+    if (registered.length === 0) return settled;
+    const byId = new Map(tasks.map((t) => [t.taskId, t] as const));
+    for (const original of failed) {
+      const claims = registered.filter((r) => r.originalTaskId === original.taskId);
+      if (new Set(claims.map((r) => r.correctionTaskId)).size !== 1) continue;
+      const claim = claims.at(-1)!;
+      if (registered.some((r) => r.correctionTaskId === claim.correctionTaskId && r.originalTaskId !== original.taskId)) continue;
+      const correction = byId.get(claim.correctionTaskId);
+      if (correction?.state !== TaskState.SUCCEEDED) continue;
+      const unit = this.#unitOf(runId, original.taskId);
+      if (unit === null || unit !== claim.workUnit || this.#unitOf(runId, correction.taskId) !== unit) continue;
+      if (taskAcceptanceDigest(original) !== claim.acceptanceDigest) continue;
+      settled.set(original.taskId, correction.taskId);
+    }
+    return settled;
   }
 
   /**
