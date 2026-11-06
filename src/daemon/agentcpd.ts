@@ -3532,17 +3532,19 @@ export const startConfiguredCeoNotificationRoute = (
 /**
  * #1344 — the daemon attaches the canonical CEO route only once Hermes is ready for
  * `acp-daemon-notice/v1`: `ACP_DAEMON_NOTICE_ENABLED` exactly `1`, the switch the peer-message notice
- * delivery waits on. Off, no canonical transport is attached, so the canonical branch is not a route
- * (`ceoCanonicalRouteSql`): every unsent CEO notification takes the CEO's bound Buzz route, and without
- * one is withheld PENDING with one CEO_NOTIFICATION_ROUTE_UNAVAILABLE record, as before.
+ * delivery waits on. Off, no canonical transport stays attached, the stall notice's restricted one a
+ * parked start attached included, so the canonical branch is not a route (`ceoCanonicalRouteSql`):
+ * every unsent CEO notification takes the CEO's bound Buzz route, and without one is withheld PENDING
+ * with one CEO_NOTIFICATION_ROUTE_UNAVAILABLE record, as before.
  */
 export const startEnabledCeoNotificationRoute = (
   cp: ControlPlane,
   options: Parameters<typeof startConfiguredCeoNotificationRoute>[1],
-): ReturnType<typeof startConfiguredCeoNotificationRoute> =>
-  options.environment["ACP_DAEMON_NOTICE_ENABLED"] !== "1"
-    ? { started: false, reason: "ACP_DAEMON_NOTICE_ENABLED is not 1" }
-    : startConfiguredCeoNotificationRoute(cp, options);
+): ReturnType<typeof startConfiguredCeoNotificationRoute> => {
+  if (options.environment["ACP_DAEMON_NOTICE_ENABLED"] === "1") return startConfiguredCeoNotificationRoute(cp, options);
+  cp.outbox.detachCeoNotificationDelivery();
+  return { started: false, reason: "ACP_DAEMON_NOTICE_ENABLED is not 1" };
+};
 
 /**
  * #1189 D1 — the route a start that refused or parked sends its stall notice over, before that start

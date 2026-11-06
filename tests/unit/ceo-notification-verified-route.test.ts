@@ -9,7 +9,7 @@ import type * as Http from "node:http";
 import { digestOf, sha256, sha256Hex } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
-import { createConfiguredHermesGatewayDaemonNoticeTarget, startEnabledCeoNotificationRoute } from "../../src/daemon/agentcpd.ts";
+import { createConfiguredHermesGatewayDaemonNoticeTarget, startEnabledCeoNotificationRoute, startStallNoticeRoute } from "../../src/daemon/agentcpd.ts";
 import { currentCanonicalCeoBuzzRoute } from "../../src/outbox/ceo-buzz-signer.ts";
 import { HostProvisionerError, type HostAllocation, type HostObservation, type HostOperation } from "../../src/runtime/host-project-provisioner.ts";
 import { BuzzAdapter, BuzzCliTransport, InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.ts";
@@ -250,6 +250,23 @@ it("#1344: with the switch off and no bound Buzz route, the notification is with
   await bindBuzz(f);
   expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([id]);
   expect(http.posts).toHaveLength(0);
+});
+
+it("#1344: a stall notice's transport, attached while the start was parked, does not outlive a switch-off start; fresh mail goes to Buzz", async () => {
+  const f = adoptedFixture(); fixtures.push(f); http.mode = "completed";
+  const stall = startStallNoticeRoute(f.h.cp, routeOptions());
+  expect(stall.open!()).toEqual({ started: true });
+  const stallId = notify(f, "stall-notice");
+  expect(await stall.deliver([stallId])).toEqual({ started: true });
+  expect(f.h.cp.outbox.get(stallId)?.status).toBe("ACKED");
+  expect(startEnabledCeoNotificationRoute(f.h.cp, { ...routeOptions(), environment: { ACP_TELEGRAM_EXTERNAL_SECRET: "lane-secret" } }))
+    .toEqual({ started: false, reason: "ACP_DAEMON_NOTICE_ENABLED is not 1" });
+  await bindBuzz(f);
+  const id = notify(f, "fresh");
+  await f.h.cp.outbox.deliverCeoNotifications();
+  expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([id]);
+  expect(f.h.buzz.sent).toEqual([{ channel: "ceo-room", content: expect.stringContaining(id), recipients: ["ceo-key"] }]);
+  expect(http.posts).toHaveLength(1);
 });
 
 it("sends fresh unsent mail straight to verified Buzz when support is unverified", async () => {
