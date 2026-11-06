@@ -312,6 +312,96 @@ describe("an adopted bootstrap follows its canonical CTO through the official ta
     nothingWritten();
   });
 
+  /** An adopted, dispatched bootstrap whose first CONFIRM connected the project and waits for its handoff ACK. */
+  const handoffPending = async (buzzActorId: string) => {
+    const h = harness();
+    const f = genesisPlanFixture();
+    const doctor = h.cp.doctor.run.bind(h.cp.doctor);
+    vi.spyOn(h.cp.doctor, "run").mockImplementation(async (...args) => ({ ...await doctor(...args), status: "HEALTHY", findings: [] }));
+    const adopted = await adoptedAndDispatched(h, f.manifest.projectId, buzzActorId);
+    const ceoSessionId = bindCeo(h);
+    const reviewed = await reviewBootstrapPlan(h, adopted.runId, { ...f.artifact.content, githubOperations: undefined, requestDigest: h.cp.runs.require(adopted.runId).contractDigest });
+    const confirm = () => decideThroughHermes(h, { runId: adopted.runId, candidateSnapshotDigest: reviewed.snapshotDigest, ceoSessionId, rationale: "create and connect" });
+    const first = await confirm();
+    expect(first.evidence["incomplete"], JSON.stringify(first)).toEqual(["handoffAck"]);
+    const handoffs = () => h.cp.db.all<{ handoff_id: string; to_session_id: string; status: string }>(
+      `SELECT handoff_id, to_session_id, status FROM handoffs WHERE project_id = ? AND kind = 'BOOTSTRAP' ORDER BY created_at, handoff_id`, [adopted.projectId]);
+    expect(handoffs().map((row) => [row.to_session_id, row.status])).toEqual([[adopted.sessionId, "PENDING"]]);
+    const original = handoffs()[0]!.handoff_id;
+    /** `handoff_ack` of `handoffId`'s package, as `sessionId` on its recorded incarnation. */
+    const ackAs = (sessionId: string, handoffId: string, key: string) => {
+      const message = h.cp.db.get<{ message_id: string; payload_digest: string; binding_generation: number }>(
+        `SELECT message_id, payload_digest, binding_generation FROM outbox WHERE idempotency_key = ?`, [`bootstrap-handoff:${handoffId}`])!;
+      return callCtoTool(h, { sessionId, incarnation: h.cp.sessions.require(sessionId).incarnation }, "handoff_ack", {
+        idempotencyKey: key, handoffId, messageId: message.message_id, payloadDigest: message.payload_digest, bindingGeneration: message.binding_generation,
+      });
+    };
+    return { h, f, adopted, confirm, handoffs, original, ackAs };
+  };
+
+  it("W6 — a restart while the activation handoff waits for its ACK reissues it to the restarted CTO; the dead predecessor's ACK counts for nothing", async () => {
+    const { h, f, adopted, confirm, handoffs, original, ackAs } = await handoffPending("4".repeat(64));
+    await adopted.first.kill();
+    const successorId = await adopted.claimAs(2, thisProcess());
+    expect(pinOf(h, adopted.runId)).toMatchObject({ sessionId: successorId, bindingGeneration: 2 });
+
+    // The next CONFIRM reissues the pending handoff to the restarted CTO, the earlier one kept as it is.
+    const second = await confirm();
+    expect(second.allowed).toBe(false);
+    expect(second.evidence["incomplete"], JSON.stringify(second)).toEqual(["handoffAck"]);
+    const rows = handoffs();
+    expect(rows.map((row) => [row.to_session_id, row.status])).toEqual(expect.arrayContaining([[adopted.sessionId, "PENDING"], [successorId, "PENDING"]]));
+    expect(rows).toHaveLength(2);
+    const reissued = rows.find((row) => row.to_session_id === successorId)!.handoff_id;
+    expect(h.cp.audit.byKind("HANDOFF_SUBMITTED").at(-1)).toMatchObject({ sessionId: successorId, evidence: { handoffId: reissued, reissuedFrom: original } });
+
+    // The dead predecessor cannot acknowledge its package, and nothing it could do completes the run.
+    expect(await ackAs(adopted.sessionId, original, "predecessor-ack")).toMatchObject({ ok: false, reasonCode: "HANDOFF_ACK_REQUIRED" });
+    expect(handoffs().find((row) => row.handoff_id === original)?.status).toBe("PENDING");
+    expect((await confirm()).evidence["incomplete"]).toEqual(["handoffAck"]);
+
+    // The restarted CTO acknowledges the reissued package, and the same CONFIRM completes on it.
+    expect(await ackAs(successorId, reissued, "successor-ack"), "successor ack").toMatchObject({ ok: true });
+    const completed = await confirm();
+    expect(completed.allowed, JSON.stringify(completed)).toBe(true);
+    expect(h.cp.runs.require(adopted.runId).state).toBe(RunState.COMPLETED);
+    const result = h.cp.artifacts.latest<ACPBootstrapActivationResult>(adopted.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT)!.content;
+    expect(result.primaryCtoBinding).toMatchObject({ sessionId: successorId, bindingGeneration: 2 });
+    expect(result.handoffAck).toMatchObject({ handoffId: reissued });
+    expect(h.port.writes.filter((write) => write.method === "createRepository")).toHaveLength(1);
+    expect(h.cp.projects.require(adopted.projectId).activeManifestDigest).toBe(manifestDigest(f.manifest));
+  });
+
+  it("W6c — a restart after the predecessor ACKed but before the completing CONFIRM reissues the handoff, and only the successor's ACK completes", async () => {
+    const { h, adopted, confirm, handoffs, original, ackAs } = await handoffPending("2".repeat(64));
+    expect(await ackAs(adopted.sessionId, original, "acked-before-restart")).toMatchObject({ ok: true });
+    await adopted.first.kill();
+    const successorId = await adopted.claimAs(2, thisProcess());
+    const second = await confirm();
+    expect(second.evidence["incomplete"], JSON.stringify(second)).toEqual(["handoffAck"]);
+    const reissued = handoffs().find((row) => row.to_session_id === successorId);
+    expect(reissued?.status).toBe("PENDING");
+    expect(handoffs().find((row) => row.handoff_id === original)?.status).toBe("ACKED");
+    expect(await ackAs(successorId, reissued!.handoff_id, "successor-ack-after")).toMatchObject({ ok: true });
+    const completed = await confirm();
+    expect(completed.allowed, JSON.stringify(completed)).toBe(true);
+    expect(h.cp.artifacts.latest<ACPBootstrapActivationResult>(adopted.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT)!.content.handoffAck)
+      .toMatchObject({ handoffId: reissued!.handoff_id });
+  });
+
+  it("W6b — with the handoff pending, a pin moved to an unproven successor reissues nothing and refuses the CONFIRM", async () => {
+    const { h, adopted, confirm, handoffs, original, ackAs } = await handoffPending("3".repeat(64));
+    const stranger = h.cp.sessions.create({ provider: "scripted", model: "scripted-cto" });
+    h.cp.sessions.transition(stranger.sessionId, SessionLifecycle.READY, "test");
+    expect(movePinByHand(h, adopted.runId, adopted.roleKey, adopted.projectId, stranger.sessionId)).toBe(2);
+    const refused = await confirm();
+    expect(refused.allowed).toBe(false);
+    expect(refused.evidence, JSON.stringify(refused)).toMatchObject({ refusal: "ADOPTION_OWNER_NOT_PINNED", takeover: "ADOPTION_TAKEOVER_MISSING" });
+    expect(handoffs().map((row) => [row.handoff_id, row.to_session_id, row.status])).toEqual([[original, adopted.sessionId, "PENDING"]]);
+    expect(await ackAs(stranger.sessionId, original, "stranger-ack")).toMatchObject({ ok: false });
+    expect(h.cp.runs.require(adopted.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+  });
+
   it("W1b — the chain holds through two restarts, one takeover per generation", async () => {
     const h = harness();
     const adopted = await adoptedAndDispatched(h, "project-two-restarts", "b".repeat(64));

@@ -106,6 +106,12 @@ const takeoverLinks = (db: Pick<Db, "all">, runId: string, roleKey: string, proj
     [runId, projectId, roleKey],
   );
 
+/** An adoption where the official takeovers carried it, and the sessions its chain passed through, in order. */
+export interface CarriedAdoption {
+  adoption: RecordedBootstrapAdoption;
+  through: string[];
+}
+
 /**
  * #1302 — where the official takeovers of `pin`'s run carried the adoption its RUN_CREATED recorded:
  * `record` itself while the pin is still on it, or exactly the pin once every generation between the
@@ -127,9 +133,9 @@ const carriedByTakeovers = (
   db: Pick<Db, "get" | "all">,
   record: RecordedBootstrapAdoption,
   pin: OwnerPin,
-): Decision<RecordedBootstrapAdoption> => {
+): Decision<CarriedAdoption> => {
   const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: record.projectId });
-  const broken = (takeover: string, fromGeneration: number): Decision<RecordedBootstrapAdoption> =>
+  const broken = (takeover: string, fromGeneration: number): Decision<CarriedAdoption> =>
     deny(ReasonCode.RUN_OWNER_NOT_PINNED, "the run's owner pin was not carried to its current binding by the adopted CTO's own restarts", {
       takeover,
       fromGeneration,
@@ -137,7 +143,9 @@ const carriedByTakeovers = (
   if (pin.ownerRoleKey !== roleKey || pin.ownerSessionId === null || pin.ownerBindingGeneration === null || pin.ownerSessionIncarnation === null) {
     return broken("ADOPTION_TAKEOVER_PIN_FOREIGN", record.bindingGeneration);
   }
-  if (pin.ownerSessionId === record.sessionId && pin.ownerBindingGeneration === record.bindingGeneration) return allow(ReasonCode.OK, record);
+  if (pin.ownerSessionId === record.sessionId && pin.ownerBindingGeneration === record.bindingGeneration) {
+    return allow(ReasonCode.OK, { adoption: record, through: [record.sessionId] });
+  }
   if (pin.ownerBindingGeneration <= record.bindingGeneration) return broken("ADOPTION_TAKEOVER_NOT_PROVEN", record.bindingGeneration);
   const assignmentAt = (generation: number, sessionId: string) => {
     const rows = db.all<{ assignment_id: string; session_incarnation: string }>(
@@ -148,6 +156,7 @@ const carriedByTakeovers = (
   };
   const links = takeoverLinks(db, pin.runId, roleKey, record.projectId);
   let at = { sessionId: record.sessionId, eventId: 0 };
+  const through = [record.sessionId];
   for (let generation = record.bindingGeneration; generation < pin.ownerBindingGeneration; generation += 1) {
     const candidates = links.filter((link) => link.from_generation === generation);
     if (candidates.length === 0) return broken("ADOPTION_TAKEOVER_MISSING", generation);
@@ -182,8 +191,12 @@ const carriedByTakeovers = (
       return broken("ADOPTION_TAKEOVER_NOT_PROVEN", generation);
     }
     at = { sessionId: link.to_session_id, eventId: link.event_id };
+    through.push(link.to_session_id);
   }
-  return allow(ReasonCode.OK, { ...record, sessionId: pin.ownerSessionId, bindingGeneration: pin.ownerBindingGeneration });
+  return allow(ReasonCode.OK, {
+    adoption: { ...record, sessionId: pin.ownerSessionId, bindingGeneration: pin.ownerBindingGeneration },
+    through,
+  });
 };
 
 /**
@@ -192,13 +205,22 @@ const carriedByTakeovers = (
  * moves the pin, and on any chain that does not prove the pin's move, so every door asked with it
  * refuses. Null for a run created without the adoption. Every door reads the adoption through this.
  */
-export const carriedBootstrapAdoption = (db: Pick<Db, "get" | "all">, runId: string): RecordedBootstrapAdoption | null => {
+export const carriedBootstrapAdoption = (db: Pick<Db, "get" | "all">, runId: string): RecordedBootstrapAdoption | null =>
+  carriedBootstrapAdoptionChain(db, runId)?.adoption ?? null;
+
+/**
+ * `carriedBootstrapAdoption` with the sessions its proven chain passed through, the record's first and
+ * the pin's last (only the record's when nothing was proven to move it): the same walk, read whole, for
+ * what the adopted CTO was handed before a restart moved it (activation's pending handoff).
+ */
+export const carriedBootstrapAdoptionChain = (db: Pick<Db, "get" | "all">, runId: string): CarriedAdoption | null => {
   const record = recordedBootstrapAdoption(db, runId);
   if (!record) return null;
+  const unmoved = { adoption: record, through: [record.sessionId] };
   const pin = db.get<{
     owner_role_key: string | null; owner_session_id: string | null; owner_binding_generation: number | null; owner_session_incarnation: string | null;
   }>(`SELECT owner_role_key, owner_session_id, owner_binding_generation, owner_session_incarnation FROM runs WHERE run_id = ?`, [runId]);
-  if (!pin || pin.owner_session_id === null) return record;
+  if (!pin || pin.owner_session_id === null) return unmoved;
   const carried = carriedByTakeovers(db, record, {
     runId,
     ownerRoleKey: pin.owner_role_key,
@@ -206,7 +228,7 @@ export const carriedBootstrapAdoption = (db: Pick<Db, "get" | "all">, runId: str
     ownerBindingGeneration: pin.owner_binding_generation,
     ownerSessionIncarnation: pin.owner_session_incarnation,
   });
-  return carried.allowed ? carried.value : record;
+  return carried.allowed ? carried.value : unmoved;
 };
 
 /**
@@ -228,7 +250,7 @@ export const adoptedOwnerPinHolds = (
   const carried = record?.projectId === adoption.projectId ? carriedByTakeovers(deps.db, record, run) : null;
   const asked = (held: CanonicalCtoBootstrapAdoption) => held.sessionId === adoption.sessionId && held.bindingGeneration === adoption.bindingGeneration;
   // An allowed carry ends exactly on the run's pin, under this role.
-  if (!carried?.allowed || !(asked(record!) || asked(carried.value))) {
+  if (!carried?.allowed || !(asked(record!) || asked(carried.value.adoption))) {
     return refuse(ReasonCode.RUN_OWNER_NOT_PINNED, "ADOPTION_OWNER_NOT_PINNED", "the bootstrap run's owner is not pinned to its adopted canonical CTO", {
       ...evidence,
       ownerRoleKey: run.ownerRoleKey,
@@ -287,6 +309,11 @@ export class CanonicalCtoBootstrapAdoptions {
   /** `carriedBootstrapAdoption`: the run's recorded adoption, where the official takeovers carried it. */
   recorded(runId: string): RecordedBootstrapAdoption | null {
     return carriedBootstrapAdoption(this.deps.db, runId);
+  }
+
+  /** `carriedBootstrapAdoptionChain`: `recorded`, with the sessions its proven chain passed through. */
+  recordedChain(runId: string): CarriedAdoption | null {
+    return carriedBootstrapAdoptionChain(this.deps.db, runId);
   }
 
   /**

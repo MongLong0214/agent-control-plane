@@ -982,9 +982,11 @@ export class BootstrapActivation {
     // PRIMARY_CTO, of the same package with the observed facts, for a new ACK. Only that differs; the
     // earlier handoff row and artifact are kept as they are, and its ACK, if any, is evidence of nothing.
     // #246 C4 — so is one whose recipient this activation replaced as undeliverable (`reissuedToReplacement`).
+    // #1302 — and one whose adopted recipient a proven same-conversation restart succeeded (`reissuedToTakeoverSuccessor`).
     const reissues = recorded !== null &&
       (this.reissuable(projectId, recorded.content, handoff) ||
         this.reissuedToReplacement(projectId, recorded.content, toSessionId, handoff) ||
+        this.reissuedToTakeoverSuccessor(runId, projectId, recorded.content, toSessionId, handoff) ||
         this.reissuesUnreadablePackage(projectId, recorded.content, toSessionId, handoff));
     if (recorded && !reissues) {
       const recordedDigest = digestOf(recorded.content.handoff);
@@ -1104,6 +1106,35 @@ export class BootstrapActivation {
       this.observedHandoffFacts(recorded.handoffId, handoff).allowed &&
       factless(recorded.handoff) === factless(handoff)
     );
+  }
+
+  /**
+   * #1302 — whether an adopting run's recorded BOOTSTRAP handoff is reissued to `toSessionId` because the
+   * adopted CTO it went to was restarted on the same conversation since: the run's adoption, carried along
+   * its proven takeover chain (`recordedChain`), is now `toSessionId`, the run's pin holds on it
+   * (`pinHolds`), and the recorded recipient is a session that chain passed through before it. The
+   * handoff is the same package, still PENDING or ACKED by that predecessor; the successor ACKs the
+   * reissued one, and the earlier row, artifact and any ACK of it are kept and count for nothing. A
+   * recipient off the proven chain, or a chain that does not reach `toSessionId`, reissues nothing.
+   */
+  private reissuedToTakeoverSuccessor(
+    runId: string,
+    projectId: string,
+    recorded: { handoffId: string; projectId: string; toSessionId: string; handoff: HandoffPackage },
+    toSessionId: string,
+    handoff: HandoffPackage,
+  ): boolean {
+    if (recorded.projectId !== projectId || recorded.toSessionId === toSessionId || digestOf(recorded.handoff) !== digestOf(handoff)) return false;
+    const row = this.db.get<{ status: string; to_session_id: string; digest: string }>(
+      `SELECT status, to_session_id, digest FROM handoffs WHERE handoff_id = ? AND kind = 'BOOTSTRAP' AND project_id = ?`,
+      [recorded.handoffId, projectId],
+    );
+    if ((row?.status !== "PENDING" && row?.status !== "ACKED") || row.to_session_id !== recorded.toSessionId || row.digest !== digestOf(handoff)) return false;
+    const chain = this.#adoptions.recordedChain(runId);
+    const run = this.runs.get(runId);
+    if (!chain || !run || chain.adoption.projectId !== projectId || chain.adoption.sessionId !== toSessionId) return false;
+    if (!this.#adoptions.pinHolds(run, chain.adoption).allowed) return false;
+    return chain.through.slice(0, -1).includes(recorded.toSessionId);
   }
 
   /**
