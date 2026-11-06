@@ -324,6 +324,8 @@ interface PreparedPrIntent {
 
 /** Where CommitLore keeps a commit's records beside its message; a merge does not move it (#1269). */
 const NOTES_REF = "refs/notes/commitlore";
+/** #1345 — pages of 100 closing references read for one PR; a PLAN's 200 work units fit in 2. */
+const CLOSING_REFERENCE_PAGE_BOUND = 10;
 
 interface GitHubWriteTarget {
   /** The concrete branch whose claim fences this remote write. */
@@ -734,38 +736,45 @@ export class GitHubKernel {
         requestDigest,
       });
       if (!reserved.allowed) return reserved as Decision<{ pullNumber: number; url: string }>;
-      const target = this.writeTarget(input.runId, input.repositoryIdentity, input.head);
-      if (!target.allowed) return target as Decision<{ pullNumber: number; url: string }>;
-      const created = await this.mediate(
-        WriteOperation.GITHUB_PR,
-        input.runId,
-        input.repositoryIdentity,
-        target.value,
-        input,
-        () => this.api().request<PullRequest>("POST", `/repos/${owner}/${repo}/pulls`, {
-          title: input.title,
-          body: prBody,
-          head: input.head,
-          base: input.base,
-        }),
-      );
-      if (!created.allowed) {
-        if (created.evidence["effectInvoked"] !== true) this.releaseReservation(idempotencyKey, requestDigest);
-        return created as Decision<{ pullNumber: number; url: string }>;
+      // #1345 — the in-memory reservation stops only a concurrent duplicate of this invocation's own write. It
+      // ends with the invocation, on every path; the durable PENDING receipt stays, and a retry in this process
+      // reconciles from it (an unproven linkage, a lost answer) instead of reading as in flight until a restart.
+      try {
+        const target = this.writeTarget(input.runId, input.repositoryIdentity, input.head);
+        if (!target.allowed) return target as Decision<{ pullNumber: number; url: string }>;
+        const created = await this.mediate(
+          WriteOperation.GITHUB_PR,
+          input.runId,
+          input.repositoryIdentity,
+          target.value,
+          input,
+          () => this.api().request<PullRequest>("POST", `/repos/${owner}/${repo}/pulls`, {
+            title: input.title,
+            body: prBody,
+            head: input.head,
+            base: input.base,
+          }),
+        );
+        if (!created.allowed) {
+          if (created.evidence["effectInvoked"] !== true) this.releaseReservation(idempotencyKey, requestDigest);
+          return created as Decision<{ pullNumber: number; url: string }>;
+        }
+        const pull = created.value;
+        return await this.finishPreparedPr({
+          pull,
+          createdByUs,
+          input,
+          candidate: candidate.value,
+          linkedIssues,
+          idempotencyKey,
+          requestDigest,
+          request,
+          owner,
+          repo,
+        });
+      } finally {
+        this.inFlightReservations.delete(idempotencyKey);
       }
-      const pull = created.value;
-      return this.finishPreparedPr({
-        pull,
-        createdByUs,
-        input,
-        candidate: candidate.value,
-        linkedIssues,
-        idempotencyKey,
-        requestDigest,
-        request,
-        owner,
-        repo,
-      });
     }
     const pull = open[0]!;
 
@@ -4705,27 +4714,39 @@ export class GitHubKernel {
   private async closingReferencesHold(owner: string, repo: string, pullNumber: number, linkedIssues: readonly number[]): Promise<Decision<void>> {
     const refused = (evidence: Record<string, unknown>): Decision<void> =>
       deny(ReasonCode.PR_LINKAGE_MISSING, "GitHub does not resolve the PR's required closing issue references", { pullNumber, linkedIssues, ...evidence });
-    let answer: { data?: { repository?: { pullRequest?: { closingIssuesReferences?: { nodes?: unknown } } | null } | null } | null; errors?: unknown } | null;
-    try {
-      answer = await this.api().request("POST", "/graphql", {
-        query: "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){closingIssuesReferences(first:100){nodes{number repository{nameWithOwner}}}}}}",
-        variables: { owner, repo, number: pullNumber },
-      });
-    } catch (error) {
-      return refused({ cause: "the closing references could not be read", ...transportOutcome(error) });
-    }
-    const nodes = answer?.data?.repository?.pullRequest?.closingIssuesReferences?.nodes;
-    if ((Array.isArray(answer?.errors) && answer.errors.length > 0) || !Array.isArray(nodes)) {
-      return refused({ cause: "GitHub's closing references answer is not readable" });
-    }
+    type Page = { nodes?: unknown; pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } | null };
+    type Answer = { data?: { repository?: { pullRequest?: { closingIssuesReferences?: Page | null } | null } | null } | null; errors?: unknown } | null;
     const own = `${owner}/${repo}`.toLowerCase();
-    const present = new Set(
-      (nodes as Array<{ number?: unknown; repository?: { nameWithOwner?: unknown } | null }>)
-        .filter((node) => typeof node?.repository?.nameWithOwner === "string" && node.repository.nameWithOwner.toLowerCase() === own)
-        .map((node) => node.number),
-    );
-    const missing = linkedIssues.filter((issue) => !present.has(issue));
-    return missing.length > 0 ? refused({ missing }) : allow(ReasonCode.OK, undefined);
+    const present = new Set<unknown>();
+    // Page by page (100 a page), until every linked issue is found or GitHub has no next page.
+    let after: string | null = null;
+    for (let page = 0; page < CLOSING_REFERENCE_PAGE_BOUND; page += 1) {
+      let answer: Answer;
+      try {
+        answer = await this.api().request<Answer>("POST", "/graphql", {
+          query: "query($owner:String!,$repo:String!,$number:Int!,$after:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){closingIssuesReferences(first:100,after:$after){nodes{number repository{nameWithOwner}} pageInfo{hasNextPage endCursor}}}}}",
+          variables: { owner, repo, number: pullNumber, after },
+        });
+      } catch (error) {
+        return refused({ cause: "the closing references could not be read", ...transportOutcome(error) });
+      }
+      const references: Page | null | undefined = answer?.data?.repository?.pullRequest?.closingIssuesReferences;
+      const nodes = references?.nodes;
+      const next = references?.pageInfo?.hasNextPage;
+      if ((Array.isArray(answer?.errors) && answer.errors.length > 0) || !Array.isArray(nodes) || typeof next !== "boolean") {
+        return refused({ cause: "GitHub's closing references answer is not readable" });
+      }
+      for (const node of nodes as Array<{ number?: unknown; repository?: { nameWithOwner?: unknown } | null }>) {
+        if (typeof node?.repository?.nameWithOwner === "string" && node.repository.nameWithOwner.toLowerCase() === own) present.add(node.number);
+      }
+      const missing = linkedIssues.filter((issue) => !present.has(issue));
+      if (missing.length === 0) return allow(ReasonCode.OK, undefined);
+      if (!next) return refused({ missing });
+      const cursor: unknown = references?.pageInfo?.endCursor;
+      if (typeof cursor !== "string" || cursor === after) return refused({ cause: "GitHub's closing references answer is not readable" });
+      after = cursor;
+    }
+    return refused({ cause: "the closing references run past the pages read" });
   }
 
   private hasPrRunMarker(body: string | null | undefined, runId: string): boolean {

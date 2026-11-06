@@ -101,10 +101,14 @@ export class FakeGitHub implements GitHubClient {
 
     if (method === "POST" && path === "/graphql") {
       if (this.graphqlErrors) return { data: null, errors: this.graphqlErrors.map((message) => ({ message })) } as unknown as T;
-      const { owner, repo, number } = (body as { variables: { owner: string; repo: string; number: number } }).variables;
+      const { owner, repo, number, after } = (body as { variables: { owner: string; repo: string; number: number; after?: string | null } }).variables;
       const pull = this.pulls.find((entry) => entry.number === number);
-      const nodes = pull ? this.closingIssuesFor(pull).map((issue) => ({ number: issue, repository: { nameWithOwner: `${owner}/${repo}` } })) : [];
-      return { data: { repository: { pullRequest: pull ? { closingIssuesReferences: { nodes } } : null } } } as unknown as T;
+      // Pages of 100, as the query asks; the cursor is the next page's offset.
+      const start = after ? Number(after) : 0;
+      const all = pull ? this.closingIssuesFor(pull) : [];
+      const nodes = all.slice(start, start + 100).map((issue) => ({ number: issue, repository: { nameWithOwner: `${owner}/${repo}` } }));
+      const pageInfo = { hasNextPage: start + 100 < all.length, endCursor: start + 100 < all.length ? String(start + 100) : null };
+      return { data: { repository: { pullRequest: pull ? { closingIssuesReferences: { nodes, pageInfo } } : null } } } as unknown as T;
     }
 
     // --- pulls -------------------------------------------------------------

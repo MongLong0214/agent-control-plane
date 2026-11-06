@@ -335,6 +335,46 @@ describe("#1345: the finalization PR closes the issues the run tracks on its own
     expect(fixture.github.pulls).toHaveLength(1);
   });
 
+  it("a linkage GitHub has not resolved yet is retried in the same process: once #7 resolves, the retry reconciles the PR and completes", async () => {
+    const fixture = await trackedRun();
+    const { harness, github, driven } = fixture;
+    const resolves = github.closingIssuesFor;
+    github.closingIssuesFor = () => [];
+    await expectLinkageRefused(fixture);
+    github.closingIssuesFor = resolves;
+    const done = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+    expect(done.allowed, JSON.stringify(done)).toBe(true);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+    expect(github.pulls).toHaveLength(1);
+  });
+
+  const ISSUES = Array.from({ length: 101 }, (_, index) => index + 1);
+  /** The PR prepared directly, after its branch is published, requiring linkage to issues #1–#101. */
+  const prepareLinked = async (fixture: Fixture) => {
+    const plan = fixture.plan();
+    const published = await fixture.harness.cp.github.publishBranch(plan.publish);
+    expect(published.allowed, JSON.stringify(published)).toBe(true);
+    return fixture.harness.cp.github.prPrepare({ ...plan.prepare, linkedIssues: ISSUES, requireLinkage: true });
+  };
+
+  it("101 linked issues are found across two pages of GitHub's closing references, and accepted", async () => {
+    const fixture = await setup();
+    const prepared = await prepareLinked(fixture);
+    expect(prepared.allowed, JSON.stringify(prepared)).toBe(true);
+    const cursors = fixture.log.filter((call) => call.method === "POST" && call.path === "/graphql")
+      .map((call) => (call.body as { variables: { after: string | null } }).variables.after);
+    expect(cursors).toEqual([null, "100"]);
+  });
+
+  it("101 linked issues with one missing from the last page of closing references are refused", async () => {
+    const fixture = await setup();
+    const resolves = fixture.github.closingIssuesFor;
+    fixture.github.closingIssuesFor = (pull) => resolves(pull).filter((issue) => issue !== 101);
+    const refused = await prepareLinked(fixture);
+    expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
+    expect(refused.evidence).toMatchObject({ missing: [101] });
+  });
+
   it("a GraphQL error reading the closing references is refused, never taken as linkage", async () => {
     const fixture = await trackedRun();
     fixture.github.graphqlErrors = ["Something went wrong while executing your query."];
