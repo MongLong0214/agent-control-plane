@@ -20,7 +20,6 @@ interface Notification {
   binding_generation: number;
   run_id: string | null;
   status: string;
-  expires_at: string;
   acked_at: string | null;
 }
 type AckResult = { messageId: string };
@@ -51,9 +50,9 @@ export const ceoNotificationAckAccess = (
     [ceo.sessionId, ceo.roleKey, row.run_id, messageId, ceo.sessionId, ceo.bindingGeneration, row.acked_at]);
     if (!receipt) return deny(ReasonCode.CONFLICT, "notification has no matching CEO acknowledgement receipt");
   } else {
-    if (row.status === "EXPIRED" || row.expires_at <= source.clock.nowIso()) {
-      return deny(ReasonCode.OUTBOX_EXPIRED, "notification has expired");
-    }
+    // A CEO notification has no delivery TTL (r-6b2239c63486): it stays owed past its expires_at, so one posted late is
+    // acknowledged late too, as `Outbox.acknowledge` treats every retained kind. Only an EXPIRED row is expired.
+    if (row.status === "EXPIRED") return deny(ReasonCode.OUTBOX_EXPIRED, "notification has expired");
     if (row.status === "REJECTED") return deny(ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, "notification was rejected");
     if (row.status !== "SENT") return deny(ReasonCode.INVALID_ARGUMENT, "notification must be SENT before acknowledgement");
   }
@@ -98,8 +97,8 @@ export const acknowledgeCeoNotification = (
   const ackedAt = source.clock.nowIso();
   const changed = source.db.run(`UPDATE outbox SET status = 'ACKED', acked_at = ?
     WHERE message_id = ? AND kind = 'CEO_NOTIFICATION' AND role_key = ?
-      AND target_session_id = ? AND binding_generation = ? AND status = 'SENT' AND expires_at > ?`,
-  [ackedAt, input.messageId, ceo.roleKey, ceo.sessionId, ceo.bindingGeneration, ackedAt]);
+      AND target_session_id = ? AND binding_generation = ? AND status = 'SENT'`,
+  [ackedAt, input.messageId, ceo.roleKey, ceo.sessionId, ceo.bindingGeneration]);
   if (changed.changes !== 1) return deny(ReasonCode.CONFLICT, "notification changed before acknowledgement");
   const audit = source.audit.record({ kind: "CEO_NOTIFICATION_ACKED", runId: row.run_id,
     sessionId: ceo.sessionId, roleKey: ceo.roleKey, evidence: { messageId: input.messageId, sessionId: ceo.sessionId,

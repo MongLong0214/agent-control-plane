@@ -5,9 +5,9 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { OWNERLESS_STALL_ROUTED, runProgressAt } from "../doctor/watchdog.ts";
 import { isTerminal } from "../domain/run-state.ts";
-import { Role, type RunState, roleKeyFor } from "../domain/types.ts";
+import { Role, RunState, roleKeyFor } from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
-import type { Outbox } from "../outbox/outbox.ts";
+import { type Outbox, type OutboxMessage, outboxDeliveryReadback } from "../outbox/outbox.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 
 /**
@@ -206,9 +206,13 @@ export const runProgressedPast = (db: Pick<Db, "get">, runId: string, episode: s
   runEpisode(db, runId) !== episode;
 
 /**
- * H5-1 — the record of an incident its detector does not settle on progress, stated in an episode whose notice
- * an incident that does settle on it delivered (`deliverIncident` covering it): while that incident is open,
- * progress alone resolves neither of them.
+ * What is owed for something is accounted for by another record. Two statements carry it:
+ * - H5-1 — an incident its detector does not settle on progress, stated in an episode whose notice an incident
+ *   that does settle on it delivered (`deliverIncident` covering it): while that incident is open, progress alone
+ *   resolves neither of them. It names the incident (`correlation`, `episode`) and the notice (`messageId`).
+ * - A notice whose exact request an official record concluded (`settleConcludedNotices`): it names the notice
+ *   (`messageId`), its request under `request` and the concluding record under `concludedBy`, never a top-level
+ *   `correlation`, so it is not read as the first.
  */
 export const CEO_NOTIFICATION_COVERED = "CEO_NOTIFICATION_COVERED";
 
@@ -305,6 +309,14 @@ export const runEndedSince = (db: Pick<Db, "get">, run: { runId: string; state: 
     )?.event_id ?? null
     : null;
 
+/** The audit event a run's incident opened with: its own (`openedEventId`), else its episode's first delivery record. */
+const incidentOpenedEventId = (db: Pick<Db, "get">, incident: Incident & { runId: string }): number | null =>
+  incident.openedEventId ?? db.get<{ event_id: number | null }>(
+    `SELECT MIN(event_id) AS event_id FROM audit_events WHERE run_id = ? AND kind = ?
+       AND json_extract(evidence_json, '$.correlation') = ? AND json_extract(evidence_json, '$.episode') = ?`,
+    [incident.runId, CLASS_RULES[incident.cls].record, correlationOf(incident.cls, incident.subject), incident.episode],
+  )?.event_id ?? null;
+
 /**
  * The one definition of an incident's resolution, asked by every path that would hand its notice to a CEO:
  * `deliverIncident` before it delivers, `retryDeferredNotices` before it retries, and the outbox
@@ -329,11 +341,7 @@ export const resolutionOf = (db: Pick<Db, "get" | "all">, incident: Incident): R
   if (incident.runId === null || incident.subject !== incident.runId) return null;
   const run = db.get<{ state: RunState }>(`SELECT state FROM runs WHERE run_id = ?`, [incident.runId]);
   if (!run) return { kind: "RUN_GONE", eventId: null };
-  const opened = incident.openedEventId ?? db.get<{ event_id: number | null }>(
-    `SELECT MIN(event_id) AS event_id FROM audit_events WHERE run_id = ? AND kind = ?
-       AND json_extract(evidence_json, '$.correlation') = ? AND json_extract(evidence_json, '$.episode') = ?`,
-    [incident.runId, CLASS_RULES[incident.cls].record, correlationOf(incident.cls, incident.subject), incident.episode],
-  )?.event_id ?? null;
+  const opened = incidentOpenedEventId(db, { ...incident, runId: incident.runId });
   if (opened === null) return null;
   const decided = db.get<{ event_id: number }>(
     `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CEO_DECISION' AND event_id > ?
@@ -457,6 +465,269 @@ export const withdrawResolvedNotices = (
     });
   }
   return withdrawn;
+};
+
+/** A CEO notice's exact request, read back from what its writer put on it. */
+interface NoticeRequest {
+  notification: string | null;
+  runId: string | null;
+  /** The CTO escalation it asks about: its `escalationId`, or a CTO_ESCALATION incident's episode. */
+  escalationId?: number;
+  /** The candidate a review notice asks the CEO to decide. */
+  candidateSnapshotDigest?: string;
+  /** A stall notice's stalled resource: its kind, its id and since when. */
+  stall?: string;
+  resource?: string;
+  since?: string;
+  incidentClass?: string;
+  correlation?: string;
+  episode?: string;
+}
+
+/**
+ * The official record that concluded a notice's exact request (`conclusionOf`), and the row it is when it is not
+ * an audit event (a claim's, a message's).
+ */
+export interface NoticeConclusion {
+  kind: "CEO_DECISION" | "RUN_ENDED" | "CLAIM_EXPIRED" | "MESSAGE_ACKED";
+  eventId: number | null;
+  runState?: string;
+  claimId?: string;
+  ackedMessageId?: string;
+  ackedAt?: string;
+}
+
+/** The run states that end a run. BLOCKED_POST_MERGE is terminal but waits on recovery, so it ends nothing. */
+const ENDED_RUN_STATES: ReadonlySet<string> = new Set<string>([RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED]);
+
+interface NoticeRow {
+  message_id: string; idempotency_key: string; run_id: string | null; role_key: string; target_session_id: string;
+  binding_generation: number;
+  status: OutboxMessage["status"]; reason_code: string | null; attempts: number; failure_class: OutboxMessage["failureClass"];
+  payload_json: string;
+}
+
+const requestOf = (row: NoticeRow): { request: NoticeRequest; incident: Incident | null } | null => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.payload_json);
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed)) return null;
+  const payload = parsed;
+  const text = (key: string): string | undefined => {
+    const value = payload[key];
+    return typeof value === "string" ? value : undefined;
+  };
+  const incident = incidentOfNotice(row.run_id, row.payload_json);
+  const escalationId = typeof payload["escalationId"] === "number" ? payload["escalationId"]
+    : incident?.cls === IncidentClass.CTO_ESCALATION && /^\d+$/.test(incident.episode) ? Number(incident.episode) : undefined;
+  const [candidateSnapshotDigest, stall, resource, since] = [text("candidateSnapshotDigest"), text("stall"), text("resource"), text("since")];
+  const request: NoticeRequest = {
+    notification: text("notification") ?? null,
+    runId: row.run_id,
+    ...(escalationId !== undefined ? { escalationId } : {}),
+    ...(candidateSnapshotDigest !== undefined ? { candidateSnapshotDigest } : {}),
+    ...(stall !== undefined ? { stall } : {}),
+    ...(resource !== undefined ? { resource } : {}),
+    ...(since !== undefined ? { since } : {}),
+    ...(incident !== null
+      ? { incidentClass: incident.cls, correlation: correlationOf(incident.cls, incident.subject), episode: incident.episode }
+      : {}),
+  };
+  return { request, incident };
+};
+
+/**
+ * The record a notice that is no incident's was written with, in the same transaction, so the request it was written
+ * for is the one open then and never one opened after it. Bound by identity, never by descriptive text (the audit cuts
+ * long strings): a wait's deadline-step notice's AGENT_WAIT_DEADLINE, which names the wait it is for (`episode`, the
+ * RUN_TRANSITION that entered it); a review re-delivery's CEO_REVIEW_REDELIVERED; or a review packet's CEO_NOTIFICATION
+ * (`ProductionGate.buildPacket`), the latest naming the notice, since an identical later packet is written as that same
+ * notice. A packet record written before it named its notice is matched by the digest the notice's idempotency key is
+ * built from, computed over the record's own fields: a field the audit cut never matches. Null when there is none.
+ * (The kind names are `AgentOwnedWaits`', whose module reads this one.)
+ */
+const noticeWrittenWith = (db: Pick<Db, "get" | "all">, row: NoticeRow, request: NoticeRequest): { eventId: number; waitEpisode: number | null } | null => {
+  const named = db.get<{ event_id: number; kind: string; episode: unknown }>(
+    `SELECT event_id, kind, json_extract(evidence_json, '$.episode') AS episode FROM audit_events
+      WHERE run_id = ? AND kind IN ('AGENT_WAIT_DEADLINE', 'CEO_REVIEW_REDELIVERED', 'CEO_NOTIFICATION')
+        AND json_extract(evidence_json, '$.messageId') = ?
+      ORDER BY event_id DESC LIMIT 1`,
+    [row.run_id, row.message_id],
+  );
+  if (named) {
+    return { eventId: named.event_id, waitEpisode: named.kind === "AGENT_WAIT_DEADLINE" && typeof named.episode === "number" ? named.episode : null };
+  }
+  const packetKey = `notify:${NotificationKind.READY_FOR_CEO_REVIEW}:${row.run_id}:`;
+  if (request.notification !== NotificationKind.READY_FOR_CEO_REVIEW || request.candidateSnapshotDigest === undefined
+      || !row.idempotency_key.startsWith(packetKey)) return null;
+  const keyDigest = row.idempotency_key.slice(packetKey.length);
+  for (const packet of db.all<{ event_id: number; evidence_json: string }>(
+    `SELECT event_id, evidence_json FROM audit_events WHERE run_id = ? AND kind = 'CEO_NOTIFICATION'
+       AND json_extract(evidence_json, '$.messageId') IS NULL AND json_extract(evidence_json, '$.notification') = ?
+       AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?
+     ORDER BY event_id DESC`,
+    [row.run_id, NotificationKind.READY_FOR_CEO_REVIEW, request.candidateSnapshotDigest],
+  )) {
+    let evidence: unknown;
+    try {
+      evidence = JSON.parse(packet.evidence_json);
+    } catch {
+      continue;
+    }
+    if (!isRecord(evidence)) continue;
+    const { goal, candidateSnapshotDigest, humanGate } = evidence;
+    if (digestOf({ goal, candidateSnapshotDigest, humanGate }) === keyDigest) return { eventId: packet.event_id, waitEpisode: null };
+  }
+  return null;
+};
+
+/**
+ * The audit event the notice's exact request opened with, as it stood when the notice was written, so what concluded it
+ * is ordered after it by durable event order, never by wall-clock time and never against a request opened after the
+ * notice: its escalation (the CTO_ESCALATION event), its incident's opening (`incidentOpenedEventId`), the wait a
+ * deadline-step notice names, or the RUN_TRANSITION that put its candidate up for review last before the notice was
+ * written (`noticeWrittenWith`; the same candidate up for review again later is a new request). Null for a notice whose
+ * request none of them tells: nothing here settles it.
+ */
+const requestOpenedEventId = (db: Pick<Db, "get" | "all">, row: NoticeRow, request: NoticeRequest, incident: Incident | null): number | null => {
+  const runId = row.run_id;
+  if (runId === null) return null;
+  if (request.escalationId !== undefined) return request.escalationId;
+  if (incident !== null) return incident.subject === runId ? incidentOpenedEventId(db, { ...incident, runId }) : null;
+  const written = noticeWrittenWith(db, row, request);
+  if (written === null) return null;
+  if (written.waitEpisode !== null) return written.waitEpisode;
+  if (request.notification !== NotificationKind.READY_FOR_CEO_REVIEW || request.candidateSnapshotDigest === undefined) return null;
+  return db.get<{ event_id: number }>(
+    `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'RUN_TRANSITION' AND event_id <= ?
+       AND json_extract(evidence_json, '$.to') = ? AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?
+     ORDER BY event_id DESC LIMIT 1`,
+    [runId, written.eventId, RunState.READY_FOR_CEO_REVIEW, request.candidateSnapshotDigest],
+  )?.event_id ?? null;
+};
+
+/**
+ * The official record that concluded the notice's exact request, or null while there is none and the notice stays
+ * owed. Each is bound to that request, never to its run alone: a decision on another escalation or candidate of the
+ * same run concludes nothing here, and a notice whose request has no opening event (`requestOpenedEventId`) is never
+ * settled by its run's end.
+ * - CEO_DECISION: the CEO decision on that escalation (its `escalationId`), or on the candidate a review notice names,
+ *   recorded after that review opened;
+ * - CLAIM_EXPIRED: the claim a stall notice reports, its lease since expired (its row EXPIRED);
+ * - MESSAGE_ACKED: the oldest stalled message a delivery stall notice names, since ACKed, with none of that role's
+ *   messages queued no later still PENDING (they would be stated in the same episode);
+ * - RUN_ENDED: the RUN_TRANSITION that ended the notice's run after its request opened (`runEndedSince`, the ended rule
+ *   `resolutionOf` and `ProductionGate.openEscalationOf` ask), in the same instant as it included.
+ * An incident notice stands for every incident stated in its episode, so it is settled only once that episode is
+ * closed under `resolutionOf` too: no later statement can be folded into a notice nobody is told.
+ */
+const conclusionOf = (db: Pick<Db, "get" | "all">, row: NoticeRow, request: NoticeRequest, incident: Incident | null): NoticeConclusion | null => {
+  const concluded = ((): NoticeConclusion | null => {
+    const runId = row.run_id;
+    const opened = requestOpenedEventId(db, row, request, incident);
+    if (runId !== null && request.escalationId !== undefined) {
+      const decided = db.get<{ event_id: number }>(
+        `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CEO_DECISION'
+           AND json_extract(evidence_json, '$.escalation') = 1 AND json_extract(evidence_json, '$.escalationId') = ?
+         ORDER BY event_id LIMIT 1`,
+        [runId, request.escalationId],
+      );
+      if (decided) return { kind: "CEO_DECISION", eventId: decided.event_id };
+    }
+    if (runId !== null && opened !== null && request.notification === NotificationKind.READY_FOR_CEO_REVIEW
+        && request.candidateSnapshotDigest !== undefined) {
+      const decided = db.get<{ event_id: number }>(
+        `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CEO_DECISION' AND event_id > ?
+           AND json_extract(evidence_json, '$.decision') IS NOT NULL
+           AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?
+         ORDER BY event_id LIMIT 1`,
+        [runId, opened, request.candidateSnapshotDigest],
+      );
+      if (decided) return { kind: "CEO_DECISION", eventId: decided.event_id };
+    }
+    if (incident?.cls === IncidentClass.RUN_STALLED && request.stall === "claim" && request.resource !== undefined) {
+      const claim = db.get<{ status: string }>(`SELECT status FROM resource_claims WHERE claim_id = ? AND run_id IS ?`, [request.resource, runId]);
+      if (claim?.status === "EXPIRED") return { kind: "CLAIM_EXPIRED", eventId: null, claimId: request.resource };
+    }
+    if (incident?.cls === IncidentClass.DELIVERY_STALLED && request.stall === "outbox" && request.resource !== undefined && request.since !== undefined) {
+      const acked = db.get<{ role_key: string; acked_at: string }>(
+        `SELECT role_key, acked_at FROM outbox WHERE message_id = ? AND status = 'ACKED' AND acked_at IS NOT NULL`,
+        [request.resource],
+      );
+      const waiting = acked && db.get(
+        `SELECT 1 FROM outbox WHERE role_key = ? AND status = 'PENDING' AND kind <> 'CEO_NOTIFICATION' AND created_at <= ? LIMIT 1`,
+        [acked.role_key, request.since],
+      );
+      if (acked && !waiting) return { kind: "MESSAGE_ACKED", eventId: null, ackedMessageId: request.resource, ackedAt: acked.acked_at };
+    }
+    if (runId !== null && opened !== null) {
+      const run = db.get<{ state: RunState }>(`SELECT state FROM runs WHERE run_id = ?`, [runId]);
+      const ended = run && ENDED_RUN_STATES.has(run.state) ? runEndedSince(db, { runId, state: run.state }, opened) : null;
+      if (run && ended !== null) return { kind: "RUN_ENDED", eventId: ended, runState: run.state };
+    }
+    return null;
+  })();
+  if (concluded === null) return null;
+  if (incident !== null && incident.runId !== null && incident.subject === incident.runId && resolutionOf(db, incident) === null) return null;
+  return concluded;
+};
+
+/**
+ * Every CEO notice still owed (PENDING or SENT) whose exact request an official record concluded (`conclusionOf`) is
+ * settled COVERED: REJECTED with CEO_NOTIFICATION_COVERED, and a CEO_NOTIFICATION_COVERED record that binds the
+ * notice, its request, what it was (status, attempts, failure class, reason) and the concluding record. COVERED is
+ * not receipt, ACK or delivery success: its attempts, its outcome-unknown history (failure class, error, sent
+ * destinations, the canonical attempt journal) and its body stay as they were; it only leaves the redelivery and
+ * watchdog-overdue sets. A notice being sent (IN_FLIGHT) is that send's, and is settled on a later pass. Run by the
+ * watchdog on every tick (`Outbox.settleConcludedCeoNotices`); idempotent, since a settled notice is no longer owed.
+ */
+export const settleConcludedNotices = (db: Db, audit: AuditLog): string[] => {
+  const settled: string[] = [];
+  const rows = db.all<NoticeRow>(
+    `SELECT message_id, idempotency_key, run_id, role_key, target_session_id, binding_generation, status, reason_code,
+            attempts, failure_class, payload_json FROM outbox
+      WHERE kind = 'CEO_NOTIFICATION' AND status IN ('PENDING', 'SENT')
+      ORDER BY created_at, rowid`,
+  );
+  for (const row of rows) {
+    const asked = requestOf(row);
+    const concluded = asked === null ? null : conclusionOf(db, row, asked.request, asked.incident);
+    if (asked === null || concluded === null) continue;
+    const written = db.txDecision((): Decision<boolean> => {
+      const changed = db.run(
+        `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
+                           retry_eligible = 0, next_attempt_at = NULL
+          WHERE message_id = ? AND kind = 'CEO_NOTIFICATION' AND status = ?`,
+        [ReasonCode.CEO_NOTIFICATION_COVERED, row.message_id, row.status],
+      ).changes;
+      if (changed !== 1) return allow(ReasonCode.OK, false);
+      const recorded = audit.record({
+        kind: CEO_NOTIFICATION_COVERED,
+        reasonCode: ReasonCode.CEO_NOTIFICATION_COVERED,
+        runId: row.run_id,
+        roleKey: row.role_key,
+        sessionId: row.target_session_id,
+        evidence: {
+          messageId: row.message_id,
+          // What it was, an outcome-unknown send disclosed as one (FCR-17).
+          ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class }),
+          attempts: row.attempts,
+          failureClass: row.failure_class,
+          priorReasonCode: row.reason_code,
+          generation: row.binding_generation,
+          targetSessionId: row.target_session_id,
+          request: { ...asked.request },
+          concludedBy: { ...concluded },
+        },
+      });
+      return recorded.allowed ? allow(ReasonCode.CEO_NOTIFICATION_COVERED, true) : recorded as unknown as Decision<boolean>;
+    });
+    if (written.allowed && written.value) settled.push(row.message_id);
+  }
+  return settled;
 };
 
 const withoutWhy = (payload: Record<string, unknown>): Record<string, unknown> => {

@@ -591,7 +591,7 @@ export class ProductionGate {
           throw acpError(afterTransition.reasonCode, afterTransition.message, afterTransition.evidence);
         }
 
-        this.outbox.enqueue({
+        const notice = this.outbox.enqueue({
           idempotencyKey: `notify:${NotificationKind.READY_FOR_CEO_REVIEW}:${input.runId}:${digestOf({
             goal: run.goal,
             candidateSnapshotDigest: input.candidateSnapshotDigest,
@@ -619,6 +619,9 @@ export class ProductionGate {
             goal: run.goal,
             candidateSnapshotDigest: input.candidateSnapshotDigest,
             humanGate,
+            // The notice this records, by its id: the audit cuts long text, so its goal cannot name it
+            // (`settleConcludedNotices` binds the notice to this review through it).
+            ...(notice.allowed ? { messageId: notice.value.messageId } : {}),
           },
         });
         return allow(ReasonCode.OK, packet);
