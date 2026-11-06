@@ -7,12 +7,13 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { ExecutionMode, type RunRow } from "../../src/domain/types.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
-import { REPLAYED_ATTEMPT_RELEASED, type PipelineOutcome } from "../../src/run/candidate-pipeline.ts";
+import { REPLAYED_ATTEMPT_ERRORED, REPLAYED_ATTEMPT_RELEASED, type PipelineOutcome } from "../../src/run/candidate-pipeline.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { InvocationRequest, InvocationResult } from "../../src/runtime/provider.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import {
   type Harness,
+  applyFailingChange,
   applyPassingChange,
   bindCeo,
   bindWorker,
@@ -25,9 +26,10 @@ afterAll(cleanupTempDirs);
 
 /**
  * #1344 B — a result_submit replay of the same key and request gets a definite answer from durable state when the
- * key's response was never stored (its daemon ended first): the attempt's recorded outcome when it completed, or that
- * it was released with nothing applied. A replay never freezes, verifies or reviews again, and the same key naming a
- * different request is a conflict.
+ * key's response was never stored (its daemon ended first, or the call threw): the attempt's applied outcome, which is
+ * recorded in the transaction that applies it; that it was released with nothing applied; or that it ended on an error
+ * with nothing applied. A replay never freezes, verifies or reviews again, and the same key naming a different request
+ * is a conflict.
  */
 
 const CONTRACT: TaskContract = {
@@ -41,7 +43,7 @@ const CONTRACT: TaskContract = {
   references: [],
 };
 
-const prepare = async () => {
+const prepare = async (change: (repoPath: string) => string = applyPassingChange) => {
   const h = makeHarness();
   const { projectId, repositoryId, identity } = await registerFixtureProject(h, "fixture-project");
   bindCeo(h);
@@ -67,7 +69,7 @@ const prepare = async () => {
     repositoryId,
   });
   if (!execution.allowed) throw new Error(execution.message);
-  const head = applyPassingChange(h.repoPath);
+  const head = change(h.repoPath);
   h.cp.tasks.finishExecution(execution.value.executionId, { status: "SUCCEEDED", resultDigest: `sha256:${head}` });
   return { h, run, covered: `${identity}:src/app.js` };
 };
@@ -96,6 +98,15 @@ const connect = async (h: Harness, run: RunRow) => {
   };
   return { submit, close };
 };
+
+/** The daemon ends between the attempt's applied outcome and its own end: its release, the receipt after it, the response. */
+const endsBeforeItsAttempt = (h: Harness): void => {
+  vi.spyOn(h.cp.pipeline as unknown as { endAttempt: () => void }, "endAttempt").mockImplementationOnce(() => {
+    throw new Error("the daemon stopped after the outcome was applied");
+  });
+};
+
+const restartReconcile = (h: Harness) => new Daemon(h.cp, { stateDir: tempDir("acp-1344b-restart-") }).reconcile();
 
 const count = (h: Harness, runId: string, kind: string): number =>
   h.cp.audit.forRun(runId).filter((row) => row.kind === kind).length;
@@ -175,7 +186,7 @@ describe("#1344 B: a same-key result_submit replay is answered from durable stat
 
     const restarted = makeHarness({ root: h.root, repoPath: h.repoPath, clock: h.clock });
     // The restart's reconcile releases the attempt its predecessor left RUNNING (#1356).
-    await new Daemon(restarted.cp, { stateDir: tempDir("acp-1344b-restart-") }).reconcile();
+    await restartReconcile(restarted);
     expect(attemptRow(restarted, run.runId)).toEqual({ attempt_id: interrupted, state: "RELEASED" });
     const submit = vi.spyOn(restarted.cp.pipeline, "submitResult");
     const after = await connect(restarted, run);
@@ -197,6 +208,93 @@ describe("#1344 B: a same-key result_submit replay is answered from durable stat
     } finally {
       await after.close();
       restarted.cp.close();
+    }
+  });
+
+  it("an outcome applied just before the daemon ended replays as that outcome after the restart's release, never as not applied", async () => {
+    const { h, run } = await prepare(applyFailingChange);
+    endsBeforeItsAttempt(h);
+    const before = await connect(h, run);
+    expect(await before.submit("failed-verification-at-the-boundary")).toMatchObject({ ok: false, reasonCode: ReasonCode.INTERNAL_ERROR });
+    await before.close();
+    // Its outcome is applied: the run went back to its CTO. The attempt is still RUNNING: its daemon ended first.
+    const returned = h.cp.audit.forRun(run.runId).filter((row) => row.kind === "REVISION_RETURNED_TO_CTO");
+    expect(returned).toHaveLength(1);
+    const applied = returned[0]!;
+    const attemptId = attemptRow(h, run.runId).attempt_id;
+    expect(attemptRow(h, run.runId).state).toBe("RUNNING");
+    h.cp.close();
+
+    const restarted = makeHarness({ root: h.root, repoPath: h.repoPath, clock: h.clock });
+    await restartReconcile(restarted);
+    expect(attemptRow(restarted, run.runId)).toEqual({ attempt_id: attemptId, state: "RELEASED" });
+    const submit = vi.spyOn(restarted.cp.pipeline, "submitResult");
+    const after = await connect(restarted, run);
+    try {
+      const was = footprint(restarted, run.runId);
+      expect(await after.submit("failed-verification-at-the-boundary")).toMatchObject({
+        ok: true,
+        value: { stage: "VERIFICATION_FAILED", reasonCode: applied.reasonCode, snapshotDigest: applied.evidence["candidateSnapshotDigest"], attemptId },
+      });
+      expect(submit).not.toHaveBeenCalled();
+      expect(footprint(restarted, run.runId)).toEqual(was);
+      expect(count(restarted, run.runId, "REVISION_RETURNED_TO_CTO")).toBe(1);
+    } finally {
+      await after.close();
+      restarted.cp.close();
+    }
+  });
+
+  it("an attempt that throws before any outcome is applied replays as ended with an error, before and after a restart; a fresh key is admitted", async () => {
+    const { h, run, covered } = await prepare();
+    vi.spyOn(h.cp.pipeline, "freeze").mockRejectedValueOnce(new Error("injected after acquisition"));
+    const first = await connect(h, run);
+    const errored = { ok: false, reasonCode: ReasonCode.INTERNAL_ERROR, message: REPLAYED_ATTEMPT_ERRORED };
+    let attemptId: string;
+    try {
+      expect(await first.submit("throws-after-acquisition")).toMatchObject({ ok: false, reasonCode: ReasonCode.INTERNAL_ERROR });
+      attemptId = attemptRow(h, run.runId).attempt_id;
+      expect(attemptRow(h, run.runId).state).toBe("RELEASED");
+      expect(await first.submit("throws-after-acquisition")).toMatchObject({ ...errored, evidence: { runId: run.runId, attemptId } });
+    } finally {
+      await first.close();
+    }
+    h.cp.close();
+
+    const restarted = makeHarness({ root: h.root, repoPath: h.repoPath, clock: h.clock });
+    await restartReconcile(restarted);
+    const submit = vi.spyOn(restarted.cp.pipeline, "submitResult");
+    const after = await connect(restarted, run);
+    try {
+      const was = footprint(restarted, run.runId);
+      expect(await after.submit("throws-after-acquisition")).toMatchObject({ ...errored, evidence: { runId: run.runId, attemptId } });
+      expect(submit).not.toHaveBeenCalled();
+      expect(footprint(restarted, run.runId)).toEqual(was);
+      restarted.scripted.script({ match: /Candidate review/, text: reviewerRevise([covered], "a finding") });
+      expect(await after.submit("a-fresh-key")).toMatchObject({ ok: true, value: { stage: "REVISION_REQUIRED" } });
+    } finally {
+      await after.close();
+      restarted.cp.close();
+    }
+  });
+
+  it("an attempt that throws after its outcome was applied replays as that outcome, not as ended with an error", async () => {
+    const { h, run, covered } = await prepare();
+    h.scripted.script({ match: /Candidate review/, text: reviewerRevise([covered], "a finding") });
+    // The revision is applied; the read after it throws.
+    vi.spyOn(h.cp.review, "latestPacket").mockImplementationOnce(() => { throw new Error("injected after the outcome"); });
+    const cto = await connect(h, run);
+    try {
+      expect(await cto.submit("throws-after-the-outcome")).toMatchObject({ ok: false, reasonCode: ReasonCode.INTERNAL_ERROR });
+      const applied = h.cp.audit.forRun(run.runId).filter((row) => row.kind === "REVISION_RETURNED_TO_CTO");
+      expect(applied).toHaveLength(1);
+      expect(await cto.submit("throws-after-the-outcome")).toMatchObject({
+        ok: true,
+        value: { stage: "REVISION_REQUIRED", reasonCode: ReasonCode.REVIEW_REVISE, snapshotDigest: applied[0]!.evidence["candidateSnapshotDigest"] },
+      });
+    } finally {
+      await cto.close();
+      h.cp.close();
     }
   });
 });

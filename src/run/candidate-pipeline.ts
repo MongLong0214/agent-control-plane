@@ -222,14 +222,47 @@ const ATTEMPT_RELEASED_RECOVERY =
 
 /**
  * #1344 B — the audit row that binds a result_submit's idempotency key (as a digest) and MCP request fingerprint to the
- * attempt it started, written with the attempt row; and the row of what that attempt answered, written as it ends its
- * own hold. A replay of the key whose response was never stored is answered from them (`replaySubmission`).
+ * attempt it started, written with the attempt row; and the row of what that attempt answered (`AttemptEnd`). A replay
+ * of the key whose response was never stored is answered from them (`replaySubmission`).
  */
 export const CANDIDATE_PIPELINE_ATTEMPT_STARTED = "CANDIDATE_PIPELINE_ATTEMPT_STARTED";
 export const CANDIDATE_PIPELINE_ATTEMPT_ENDED = "CANDIDATE_PIPELINE_ATTEMPT_ENDED";
 /** #1344 B — a replay's answer when ACP released the attempt its key started: definite, never an unknown outcome. */
 export const REPLAYED_ATTEMPT_RELEASED = "attempt released, outcome not applied; submit with a new idempotencyKey";
-const REPLAYED_ATTEMPT_REFUSED = "the first result_submit with this idempotencyKey was refused; nothing was run again";
+/** #1344 B — a replay's answer when the attempt its key started ended on an error before any outcome was applied. */
+export const REPLAYED_ATTEMPT_ERRORED = "attempt ended with an error; outcome not applied; submit with a new idempotencyKey";
+const REPLAYED_ATTEMPT_REFUSED = "the first result_submit with this idempotencyKey was answered with this refusal; nothing was run again";
+
+/**
+ * #1344 B — how an attempt ended, as its ENDED row records it: `APPLIED`, an outcome committed in the same transaction
+ * as this row (`applyHolding`, the only place an attempt applies one); `NOT_APPLIED`, an answer that applied nothing (a
+ * refusal, a stale candidate, a lost hold); `ERRORED`, a throw with no outcome applied. So no applied outcome is ever
+ * without its row, and an attempt without an APPLIED row applied none.
+ */
+type AttemptEnd = "APPLIED" | "NOT_APPLIED" | "ERRORED";
+
+/** #1344 B — what an attempt answered, as its ENDED row records it. */
+interface AttemptReceipt {
+  allowed: boolean;
+  reasonCode: ReasonCode;
+  stage: PipelineOutcome["stage"] | null;
+  stageReasonCode: string | null;
+  candidateSnapshotDigest: string | null;
+}
+
+const appliedStage = (stage: PipelineOutcome["stage"], snapshotDigest: string, stageReasonCode: string | null = null): AttemptReceipt =>
+  ({ allowed: true, reasonCode: ReasonCode.OK, stage, stageReasonCode, candidateSnapshotDigest: snapshotDigest });
+const appliedRefusal = (reasonCode: ReasonCode, snapshotDigest: string): AttemptReceipt =>
+  ({ allowed: false, reasonCode, stage: null, stageReasonCode: null, candidateSnapshotDigest: snapshotDigest });
+const receiptOf = (outcome: Decision<PipelineOutcome>): AttemptReceipt => {
+  if (outcome.allowed) {
+    return { allowed: true, reasonCode: outcome.reasonCode, stage: outcome.value.stage,
+      stageReasonCode: "reasonCode" in outcome.value ? outcome.value.reasonCode : null, candidateSnapshotDigest: outcome.value.snapshotDigest };
+  }
+  const digest = outcome.evidence["candidateSnapshotDigest"];
+  return { allowed: false, reasonCode: outcome.reasonCode, stage: null, stageReasonCode: null,
+    candidateSnapshotDigest: typeof digest === "string" ? digest : null };
+};
 /** The digest a result_submit idempotency key is recorded under; the key itself is never stored. */
 const resultSubmitKeyDigestOf = (idempotencyKey: string): string =>
   sha256(JSON.stringify(["acp.result-submit.key.v1", idempotencyKey]));
@@ -631,12 +664,13 @@ export class CandidatePipeline {
 
   /**
    * #1344 B — the answer a result_submit replay gets from durable state, when the key's response was never stored (its
-   * daemon ended first). Bound to the run, the key and the MCP request fingerprint the attempt was recorded under; read
-   * only, so nothing is frozen, verified or reviewed again. The attempt's recorded outcome when it ended itself with one;
-   * `REPLAYED_ATTEMPT_RELEASED` when ACP released it (its deadline, a daemon restart, a reclaim) or it ended not holding
-   * the run; a CONFLICT for the same key naming another request. Null otherwise: no attempt recorded under the key, one
-   * still RUNNING (in this process the caller's in-flight answer; one an ended daemon left is released by the restart's
-   * reconcile), or one that ended on a throw, whose outcome stays unknown.
+   * daemon ended first, or the call threw). Bound to the run, the key and the MCP request fingerprint the attempt was
+   * recorded under; read only, so nothing is frozen, verified or reviewed again. The attempt's ENDED row decides first:
+   * an applied outcome (committed with its row, so one is never answered as not applied), an answer that applied
+   * nothing, or `REPLAYED_ATTEMPT_ERRORED`. With no ENDED row the attempt applied no outcome: `REPLAYED_ATTEMPT_RELEASED`
+   * once ACP released it (its deadline, a daemon restart, a reclaim). A CONFLICT for the same key naming another request.
+   * Null otherwise: no attempt recorded under the key, or one still RUNNING (in this process the caller's in-flight
+   * answer; one an ended daemon left is released by the restart's reconcile).
    */
   replaySubmission(runId: string, idempotencyKey: string, requestFingerprint: string): Decision<unknown> | null {
     const started = this.db.get<{ evidence_json: string }>(
@@ -658,7 +692,8 @@ export class CandidatePipeline {
       [runId, CANDIDATE_PIPELINE_ATTEMPT_ENDED, attemptId],
     );
     if (ended) {
-      const end = JSON.parse(ended.evidence_json) as { allowed?: unknown; stage?: unknown; stageReasonCode?: unknown; candidateSnapshotDigest?: unknown };
+      const end = JSON.parse(ended.evidence_json) as { outcome?: unknown; allowed?: unknown; stage?: unknown; stageReasonCode?: unknown; candidateSnapshotDigest?: unknown };
+      if (end.outcome === "ERRORED") return deny(ReasonCode.INTERNAL_ERROR, REPLAYED_ATTEMPT_ERRORED, { runId, attemptId, outcome: "NOT_APPLIED" });
       const reasonCode = (ended.reason_code ?? ReasonCode.OK) as ReasonCode;
       const snapshotDigest = typeof end.candidateSnapshotDigest === "string" ? end.candidateSnapshotDigest : null;
       if (end.allowed === true) {
@@ -671,7 +706,7 @@ export class CandidatePipeline {
         });
       }
       // An attempt that ended not holding the run applied nothing: it was released under its answer.
-      if (reasonCode === ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE) return released;
+      if (end.outcome === "NOT_APPLIED" && reasonCode === ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE) return released;
       return deny(reasonCode, REPLAYED_ATTEMPT_REFUSED, { runId, attemptId, ...(snapshotDigest === null ? {} : { candidateSnapshotDigest: snapshotDigest }) });
     }
     const row = this.db.get<{ attempt_id: string; state: string }>(
@@ -778,7 +813,7 @@ export class CandidatePipeline {
         const recorded = this.applyHolding(input, attemptId, () => {
           const row = this.audit.record({ kind: UNJUDGED_REVIEW_LIMIT_REFUSED, runId: input.runId, reasonCode: ReasonCode.REVIEW_UNJUDGED_LIMIT_REACHED, evidence });
           return row.allowed ? allow(ReasonCode.OK, undefined) : (row as Decision<void>);
-        });
+        }, appliedRefusal(ReasonCode.REVIEW_UNJUDGED_LIMIT_REACHED, snapshotDigest));
         if (recorded === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
         if (!recorded.allowed) return recorded as Decision<PipelineOutcome>;
         return deny(ReasonCode.REVIEW_UNJUDGED_LIMIT_REACHED, UNJUDGED_REVIEW_LIMIT_REFUSAL, evidence);
@@ -885,7 +920,7 @@ export class CandidatePipeline {
             approvedByGeneration: input.ownerBindingGeneration,
             approvedAt: this.clock.nowIso(),
           },
-        } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string }));
+        } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string }), appliedStage("COMPLETED_REVIEW", snapshotDigest));
         if (built === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewedPlan);
         if (!built.allowed) return this.returnBlockedPass(input, attemptId, snapshotDigest, built, reviewedPlan);
         return allow(ReasonCode.OK, {
@@ -936,7 +971,7 @@ export class CandidatePipeline {
         stage: "verification",
         candidateSnapshotDigest: snapshotDigest,
         report: reportWithoutCapturedOutput(report),
-      }, attemptId));
+      }, attemptId), appliedStage("VERIFICATION_FAILED", snapshotDigest, verified.reasonCode));
       if (returned === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, null);
       if (!returned.allowed) return returned as Decision<PipelineOutcome>;
       return allow(ReasonCode.OK, {
@@ -1031,7 +1066,7 @@ export class CandidatePipeline {
           approvedByGeneration: input.ownerBindingGeneration,
           approvedAt: this.clock.nowIso(),
         },
-      } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string }));
+      } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string }), appliedStage("COMPLETED_REVIEW", snapshotDigest));
       if (built === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewed);
       if (!built.allowed) return this.returnBlockedPass(input, attemptId, snapshotDigest, built, reviewed);
 
@@ -1180,7 +1215,7 @@ export class CandidatePipeline {
         ? this.applyHolding(input, attemptId, () => {
             recordUnavailable(true);
             return this.noticeUnjudgedReview(runId, snapshotDigest, reviewed, attemptId);
-          })
+          }, appliedStage("REVIEW_UNAVAILABLE", snapshotDigest, reviewed.reasonCode))
         : null;
       // #1189 R1-01 — an attempt that no longer holds the run keeps its failure as its own history: the
       // row names its attempt and says it did not hold the run, so it is never the run's current outcome
@@ -1203,7 +1238,7 @@ export class CandidatePipeline {
       stage: "blind-review",
       candidateSnapshotDigest: snapshotDigest,
       ...reviewed.evidence,
-    }, attemptId));
+    }, attemptId), appliedStage("REVISION_REQUIRED", snapshotDigest, reviewed.reasonCode));
     if (returned === null) return this.attemptLost(runId, attemptId, snapshotDigest, reviewed);
     if (!returned.allowed) return returned as Decision<PipelineOutcome>;
     const packet = this.review.latestPacket(runId, snapshotDigest);
@@ -1504,13 +1539,19 @@ export class CandidatePipeline {
    * Applies an attempt's outcome (a revision request, an unavailable-review row, the packet) only while
    * the attempt holds the run: the check and the writes are one transaction. Null, with nothing applied,
    * when it no longer holds; otherwise what `apply` answered, a denial rolling back what it wrote.
+   * #1344 B — `receipt` is what the attempt answers once this outcome is applied: its APPLIED row commits with the
+   * outcome, so a daemon that ends right after leaves the outcome's own answer for a replay of its key.
    */
-  private applyHolding<T>(input: SubmitResultInput, attemptId: string, apply: () => Decision<T>): Decision<T> | null {
+  private applyHolding<T>(input: SubmitResultInput, attemptId: string, apply: () => Decision<T>, receipt: AttemptReceipt): Decision<T> | null {
     let lost = false;
     const applied = this.db.txDecision(() => {
-      if (this.attemptHolds(input, attemptId)) return apply();
-      lost = true;
-      return deny<T>(ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE, "the attempt no longer holds the run", { runId: input.runId, attemptId });
+      if (!this.attemptHolds(input, attemptId)) {
+        lost = true;
+        return deny<T>(ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE, "the attempt no longer holds the run", { runId: input.runId, attemptId });
+      }
+      const result = apply();
+      if (result.allowed) this.recordAttemptEnded(input, attemptId, "APPLIED", receipt);
+      return result;
     });
     return lost ? null : applied;
   }
@@ -1547,28 +1588,39 @@ export class CandidatePipeline {
   }
 
   /**
-   * An attempt ends its own hold; #1344 B — and, for a result_submit, records with it what the attempt answered (its
-   * stage, reason codes and candidate), so a replay whose response was never stored is answered that. One that threw
-   * records nothing: its outcome stays unknown.
+   * An attempt ends its own hold; #1344 B — and, for a result_submit whose attempt applied no outcome (none has an
+   * APPLIED row: `applyHolding` writes it with the outcome), records with the release what it answered, NOT_APPLIED, or,
+   * when it threw, ERRORED. Either way nothing of an outcome was applied, so a replay is told so definitely.
    */
   private endAttempt(input: SubmitResultInput, attemptId: string, outcome: Decision<PipelineOutcome> | undefined): void {
     this.db.tx(() => {
       this.releaseAttempt(input.runId, attemptId);
-      if (outcome === undefined || input.replayIdentity === undefined) return;
-      const evidenceDigest = outcome.allowed ? null : outcome.evidence["candidateSnapshotDigest"];
-      this.audit.record({
-        kind: CANDIDATE_PIPELINE_ATTEMPT_ENDED,
-        runId: input.runId,
-        reasonCode: outcome.reasonCode,
-        evidence: {
-          attemptId,
-          allowed: outcome.allowed,
-          stage: outcome.allowed ? outcome.value.stage : null,
-          stageReasonCode: outcome.allowed && "reasonCode" in outcome.value ? outcome.value.reasonCode : null,
-          candidateSnapshotDigest: outcome.allowed ? outcome.value.snapshotDigest
-            : typeof evidenceDigest === "string" ? evidenceDigest : null,
-        },
-      });
+      if (input.replayIdentity === undefined) return;
+      const ended = this.db.get<{ n: number }>(
+        `SELECT 1 AS n FROM audit_events WHERE run_id = ? AND kind = ? AND json_extract(evidence_json, '$.attemptId') = ? LIMIT 1`,
+        [input.runId, CANDIDATE_PIPELINE_ATTEMPT_ENDED, attemptId],
+      );
+      if (ended) return;
+      if (outcome === undefined) this.recordAttemptEnded(input, attemptId, "ERRORED", null);
+      else this.recordAttemptEnded(input, attemptId, "NOT_APPLIED", receiptOf(outcome));
+    });
+  }
+
+  /** #1344 B — the ENDED row of a result_submit's attempt: how it ended and what it answered. */
+  private recordAttemptEnded(input: SubmitResultInput, attemptId: string, outcome: AttemptEnd, receipt: AttemptReceipt | null): void {
+    if (input.replayIdentity === undefined) return;
+    this.audit.record({
+      kind: CANDIDATE_PIPELINE_ATTEMPT_ENDED,
+      runId: input.runId,
+      reasonCode: receipt?.reasonCode ?? null,
+      evidence: {
+        attemptId,
+        outcome,
+        allowed: receipt?.allowed ?? false,
+        stage: receipt?.stage ?? null,
+        stageReasonCode: receipt?.stageReasonCode ?? null,
+        candidateSnapshotDigest: receipt?.candidateSnapshotDigest ?? null,
+      },
     });
   }
 
@@ -1640,7 +1692,7 @@ export class CandidatePipeline {
       candidateSnapshotDigest: snapshotDigest,
       runId: input.runId,
       packet: reviewed.value,
-    }, attemptId));
+    }, attemptId), appliedRefusal(built.reasonCode as ReasonCode, snapshotDigest));
     if (returned === null) return this.attemptLost(input.runId, attemptId, snapshotDigest, reviewed);
     if (!returned.allowed) return returned as Decision<PipelineOutcome>;
     return built as Decision<PipelineOutcome>;
