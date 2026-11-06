@@ -6,6 +6,7 @@ import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { AttemptReleaseReason, OWNERLESS_STALL_OWED, OWNERLESS_STALL_ROUTED, type WatchdogStall } from "../doctor/watchdog.ts";
+import { isTerminal } from "../domain/run-state.ts";
 import { ArtifactKind, Role, RunState, roleKeyFor, type RoleBinding, type RunRow } from "../domain/types.ts";
 import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
@@ -364,16 +365,27 @@ export class AgentOwnedWaits {
    * (OWNERLESS_STALL_ROUTED). With no CEO bound (or its session not READY) nothing is written and the next
    * pass asks again. `routed` is whether this call delivered a notice; `messageId` is the notice that covers
    * the stall, delivered now or before; `state` is what the CEO has of it, in the incident `episode`.
+   * #1361 — a stall of a run that has ended (terminal, and not BLOCKED_POST_MERGE, which waits on recovery) is
+   * told nothing and is RESOLVED: the transition that ended it, its latest progress, is never read as a new
+   * episode or a re-notice. Its state is asked in the transaction that writes the notice and its record, so a
+   * run observed ACTIVE and ended before the notice is written (a CEO cancel between a tick and its routing)
+   * is told nothing either.
    */
   routeOwnerlessStall(stall: OwnerlessStall): Decision<RoutedStall> {
-    const incident = stallIncident(this.ports.db, stall);
-    const delivered = deliverIncident(this.ports, incident);
-    if (!delivered.allowed) return delivered as unknown as Decision<RoutedStall>;
-    return allow(delivered.reasonCode, {
-      messageId: delivered.value.messageId,
-      routed: delivered.value.created,
-      state: delivered.value.state,
-      episode: incident.episode,
+    return this.ports.db.txDecision(() => {
+      const incident = stallIncident(this.ports.db, stall);
+      const run = incident.cls === IncidentClass.RUN_STALLED ? this.ports.runs.get(incident.subject) : null;
+      if (run && isTerminal(run.state) && run.state !== RunState.BLOCKED_POST_MERGE) {
+        return allow(ReasonCode.RUN_ALREADY_TERMINAL, { messageId: null, routed: false, state: "RESOLVED", episode: incident.episode });
+      }
+      const delivered = deliverIncident(this.ports, incident);
+      if (!delivered.allowed) return delivered as unknown as Decision<RoutedStall>;
+      return allow(delivered.reasonCode, {
+        messageId: delivered.value.messageId,
+        routed: delivered.value.created,
+        state: delivered.value.state,
+        episode: incident.episode,
+      });
     });
   }
 
