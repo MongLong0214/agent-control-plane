@@ -499,13 +499,18 @@ const isMainModule = (): boolean => {
 };
 
 if (isMainModule()) {
+  // `process.exitCode`, not `process.exit()` (#1348): on macOS a write to a pipe is asynchronous,
+  // and exiting at once dropped whatever the reader had not taken yet — it got the first 512 bytes
+  // of the JSON. The process ending on its own waits for stdout and stderr to flush.
   void main(process.argv.slice(2))
-    .then((code) => process.exit(code))
+    .then((code) => {
+      process.exitCode = code;
+    })
     .catch((error: unknown) => {
       const body = isAcpError(error)
         ? { reasonCode: error.reasonCode, message: error.message, evidence: error.evidence }
         : { message: error instanceof Error ? error.message : String(error) };
       process.stderr.write(`${JSON.stringify(body, null, 2)}\n`);
-      process.exit(1);
+      process.exitCode = 1;
     });
 }
