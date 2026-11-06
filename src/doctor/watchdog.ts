@@ -1,4 +1,5 @@
 import type { Clock } from "../core/clock.ts";
+import type { Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { AuditLog } from "../db/audit.ts";
@@ -50,6 +51,49 @@ export const OWNERLESS_STALL_ROUTED = "OWNERLESS_STALL_ROUTED";
 export const OWNERLESS_STALL_OWED = "OWNERLESS_STALL_OWED";
 
 /**
+ * #1344 — why ACP ended a candidate pipeline attempt's hold on its run: its persisted deadline passed (a watchdog
+ * tick), or the daemon whose process ran it is gone (a restart's reconcile). An attempt runs in the process that
+ * took it, so none outlives its daemon.
+ */
+export const AttemptReleaseReason = { DEADLINE: "deadline", DAEMON_RESTART: "daemon restart" } as const;
+export type AttemptReleaseReason = (typeof AttemptReleaseReason)[keyof typeof AttemptReleaseReason];
+
+/** A candidate pipeline attempt ACP released, why, and the release notice its run's owner CTO was given. */
+export interface ReleasedPipelineAttempt {
+  runId: string;
+  attemptId: string;
+  startedAt: string;
+  deadlineAt: string;
+  reason: AttemptReleaseReason;
+  /** The stall's instant: the persisted deadline for a deadline release, the release itself for a restart's. */
+  since: string;
+  /** The owner CTO's notice (`CandidatePipeline.noticeAttemptReleased`), or null when it was given none now. */
+  ownerNoticeId: string | null;
+  /** Why a notice the owner is owed could not be written now (`ATTEMPT_RELEASE_NOTICE_DEFERRED`); a later tick retries it. */
+  ownerNoticeDeferred: string | null;
+}
+
+/**
+ * #1344 C1 — the owner CTO's release notice, keyed by its attempt: one per release, however often it is asked for.
+ * A RELEASED attempt with a release record and no outbox row under this key is a notice still owed.
+ */
+const ATTEMPT_RELEASED_KEY_PREFIX = "attempt-released:";
+export const attemptReleasedNoticeKey = (runId: string, attemptId: string): string =>
+  `${ATTEMPT_RELEASED_KEY_PREFIX}${runId}:${attemptId}`;
+
+/** #1344 C1 — a release notice its owner was owed and could not be given at once; `deliverOwedReleaseNotices` retries it. */
+export const ATTEMPT_RELEASE_NOTICE_DEFERRED = "ATTEMPT_RELEASE_NOTICE_DEFERRED";
+
+type ReleaseNotice = (released: { runId: string; attemptId: string; reason: AttemptReleaseReason }) => Decision<string | null>;
+
+interface AttemptRow {
+  run_id: string;
+  attempt_id: string;
+  started_at: string;
+  deadline_at: string;
+}
+
+/**
  * #1189 F3-1 — a run's progress, defined by what it is rather than by what it is not: its state edges
  * (DISPATCHED, RUN_TRANSITION) and its own rows — tasks, task executions (started, active, ended),
  * artifacts (its PLAN, candidates, verification, reviews, results) and the start of a candidate pipeline
@@ -96,10 +140,124 @@ export class Watchdog {
   ) {}
 
   #attemptReleased: ((attemptId: string) => void) | null = null;
+  #attemptRunsHere: (attemptId: string) => boolean = () => false;
+  #ownerNotice: ReleaseNotice | null = null;
 
-  /** Told of each candidate pipeline attempt this watchdog releases, once the release commits, to stop its work. */
-  attach(ports: { attemptReleased?: (attemptId: string) => void }): void {
+  /**
+   * `attemptReleased`: told of each candidate pipeline attempt this watchdog releases, once the release commits, to
+   * stop its work. `attemptRunsHere`: whether this process runs an attempt (none, without a pipeline). `ownerNotice`:
+   * the release notice to the run's owner CTO: its message id, null when none is owed, or a denial when one is owed
+   * and cannot be written now.
+   */
+  attach(ports: {
+    attemptReleased?: (attemptId: string) => void;
+    attemptRunsHere?: (attemptId: string) => boolean;
+    ownerNotice?: ReleaseNotice;
+  }): void {
     if (ports.attemptReleased) this.#attemptReleased = ports.attemptReleased;
+    if (ports.attemptRunsHere) this.#attemptRunsHere = ports.attemptRunsHere;
+    if (ports.ownerNotice) this.#ownerNotice = ports.ownerNotice;
+  }
+
+  /**
+   * #1344 — at a daemon's start, before it can start an attempt: every candidate pipeline attempt still RUNNING that
+   * this process does not run is released, through the deadline release's own path (`#releaseAttempt`), with the
+   * reason "daemon restart". Its daemon is gone, so its row would otherwise hold the run until its deadline and refuse
+   * a fresh result_submit as CONFLICT meanwhile. An attempt this process runs is never released here.
+   */
+  releaseAttemptsOfEndedDaemons(): ReleasedPipelineAttempt[] {
+    const nowIso = this.clock.nowIso();
+    const released: ReleasedPipelineAttempt[] = [];
+    for (const attempt of this.db.all<AttemptRow>(
+      `SELECT run_id, attempt_id, started_at, deadline_at
+         FROM candidate_pipeline_attempts WHERE state = 'RUNNING' ORDER BY started_at, run_id`,
+    )) {
+      if (this.#attemptRunsHere(attempt.attempt_id)) continue;
+      const one = this.#releaseAttempt(attempt, nowIso, AttemptReleaseReason.DAEMON_RESTART);
+      if (one) released.push(one);
+    }
+    return released;
+  }
+
+  /**
+   * The one release of a candidate pipeline attempt's hold, for either reason. A conditional update of the exact row
+   * read (and, for a deadline release, only once that deadline passed), so a concurrent fresh submit is never
+   * released. #1189 F3-2, #1344 C1 — the release and the notices it owes are one transaction, the CEO's owed stall
+   * record and the owner CTO's notice: only this pass sees the attempt RUNNING, so neither can rest on a later one.
+   * The attempt's evidence rows are kept; only the hold ends.
+   */
+  #releaseAttempt(attempt: AttemptRow, nowIso: string, reason: AttemptReleaseReason): ReleasedPipelineAttempt | null {
+    const since = reason === AttemptReleaseReason.DEADLINE ? attempt.deadline_at : nowIso;
+    return this.db.tx(() => {
+      const released = this.db.run(
+        `UPDATE candidate_pipeline_attempts
+            SET state = 'RELEASED', released_at = ?
+          WHERE run_id = ? AND attempt_id = ? AND state = 'RUNNING' AND deadline_at = ?
+            ${reason === AttemptReleaseReason.DEADLINE ? "AND deadline_at <= ?" : ""}`,
+        [nowIso, attempt.run_id, attempt.attempt_id, attempt.deadline_at,
+          ...(reason === AttemptReleaseReason.DEADLINE ? [nowIso] : [])],
+      );
+      if (released.changes !== 1) return null;
+      const stop = this.#attemptReleased;
+      if (stop) this.db.afterCommit(() => stop(attempt.attempt_id));
+      this.audit.record({
+        kind: OWNERLESS_STALL_OWED,
+        runId: attempt.run_id,
+        evidence: { kind: "candidate_pipeline_attempt", target: attempt.attempt_id, since, reason },
+      });
+      const notice = this.#ownerNotice?.({ runId: attempt.run_id, attemptId: attempt.attempt_id, reason }) ?? null;
+      // #1344 — a notice owed and refused now (its owner's session not live, the role unbound) is not dropped: the
+      // release record keeps it owed, this row says why it waits, and every tick retries it until it is written.
+      if (notice !== null && !notice.allowed) {
+        this.audit.record({
+          kind: ATTEMPT_RELEASE_NOTICE_DEFERRED,
+          runId: attempt.run_id,
+          reasonCode: notice.reasonCode,
+          evidence: { attemptId: attempt.attempt_id, reason },
+        });
+      }
+      return {
+        runId: attempt.run_id,
+        attemptId: attempt.attempt_id,
+        startedAt: attempt.started_at,
+        deadlineAt: attempt.deadline_at,
+        reason,
+        since,
+        ownerNoticeId: notice?.allowed ? notice.value : null,
+        ownerNoticeDeferred: notice !== null && !notice.allowed ? notice.reasonCode : null,
+      };
+    });
+  }
+
+  /**
+   * #1344 C1 — the release notices still owed: an attempt ACP released (its release record names it), still the run's
+   * latest, on a run still ACTIVE, with no notice written under its key. Each is asked for again; the outbox writes it
+   * once its owner's binding takes it. A fresh submission replaces the attempt row and so ends what is owed. The
+   * message ids written.
+   */
+  deliverOwedReleaseNotices(): string[] {
+    const notice = this.#ownerNotice;
+    if (!notice) return [];
+    const owed = this.db.all<{ run_id: string; attempt_id: string; reason: string | null }>(
+      `SELECT a.run_id, a.attempt_id, json_extract(owed.evidence_json, '$.reason') AS reason
+         FROM candidate_pipeline_attempts a
+         JOIN runs r ON r.run_id = a.run_id AND r.state = 'ACTIVE'
+         JOIN audit_events owed ON owed.run_id = a.run_id AND owed.kind = ?
+                               AND json_extract(owed.evidence_json, '$.kind') = 'candidate_pipeline_attempt'
+                               AND json_extract(owed.evidence_json, '$.target') = a.attempt_id
+        WHERE a.state = 'RELEASED'
+          AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.idempotency_key = ? || a.run_id || ':' || a.attempt_id)
+        ORDER BY owed.event_id`,
+      [OWNERLESS_STALL_OWED, ATTEMPT_RELEASED_KEY_PREFIX],
+    );
+    const written: string[] = [];
+    for (const row of owed) {
+      // A release recorded before #1344 named no reason; only the deadline release wrote one then.
+      const reason = row.reason === AttemptReleaseReason.DAEMON_RESTART ? AttemptReleaseReason.DAEMON_RESTART : AttemptReleaseReason.DEADLINE;
+      const answered = notice({ runId: row.run_id, attemptId: row.attempt_id, reason });
+      if (answered.allowed && answered.value !== null) written.push(answered.value);
+    }
+    return written;
   }
 
   async tick(): Promise<WatchdogTick> {
@@ -109,6 +267,7 @@ export class Watchdog {
     const stalls: WatchdogStall[] = [];
     const scopes = new Map<string, { scope: DoctorScope; target: string | null }>();
     const stallFindings = new Map<string, Finding[]>();
+    this.deliverOwedReleaseNotices();
     const addOverdue = (
       key: string,
       scope: DoctorScope,
@@ -162,36 +321,11 @@ export class Watchdog {
     // authoritative recovery fact: reconstructing it from started_at can silently change an
     // existing lease when policy changes. Keep the exact tuple conditional so a concurrent
     // fresh submit cannot be released accidentally (#335).
-    for (const attempt of this.db.all<{
-      run_id: string;
-      attempt_id: string;
-      started_at: string;
-      deadline_at: string;
-    }>(`SELECT run_id, attempt_id, started_at, deadline_at
+    for (const attempt of this.db.all<AttemptRow>(`SELECT run_id, attempt_id, started_at, deadline_at
           FROM candidate_pipeline_attempts
          WHERE state = 'RUNNING' AND deadline_at <= ?`, [nowIso])) {
       const ageMs = now - new Date(attempt.started_at).getTime();
-      // #1189 F3-2 — the release and the notice it owes the CEO are one transaction: this tick is the only
-      // one that sees the attempt RUNNING, so the owed notice cannot rest on the routing that follows it.
-      const reclaimed = this.db.tx(() => {
-        const released = this.db.run(
-          `UPDATE candidate_pipeline_attempts
-              SET state = 'RELEASED', released_at = ?
-            WHERE run_id = ? AND attempt_id = ? AND state = 'RUNNING' AND deadline_at = ? AND deadline_at <= ?`,
-          [nowIso, attempt.run_id, attempt.attempt_id, attempt.deadline_at, nowIso],
-        );
-        if (released.changes === 1) {
-          const stop = this.#attemptReleased;
-          if (stop) this.db.afterCommit(() => stop(attempt.attempt_id));
-          this.audit.record({
-            kind: OWNERLESS_STALL_OWED,
-            runId: attempt.run_id,
-            evidence: { kind: "candidate_pipeline_attempt", target: attempt.attempt_id, since: attempt.deadline_at },
-          });
-        }
-        return released;
-      });
-      if (reclaimed.changes !== 1) continue;
+      if (this.#releaseAttempt(attempt, nowIso, AttemptReleaseReason.DEADLINE) === null) continue;
 
       const key = `run:${attempt.run_id}`;
       overdue.push({ kind: "candidate_pipeline_attempt", id: attempt.attempt_id, ageMs });

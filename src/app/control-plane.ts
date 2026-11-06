@@ -763,8 +763,13 @@ export class ControlPlane {
         projectReviewers.refused,
       );
       this.watchdog = new Watchdog(this.db, this.clock, this.audit, this.doctor, this.claims, this.outbox);
-      // An attempt the watchdog releases has its reviewer and verification children stopped.
-      this.watchdog.attach({ attemptReleased: (attemptId) => this.pipeline.abortAttempt(attemptId) });
+      // An attempt the watchdog releases has its reviewer and verification children stopped, and its run's owner CTO
+      // is told (#1344 C1). A restart's reconcile releases only the attempts this process does not run.
+      this.watchdog.attach({
+        attemptReleased: (attemptId) => this.pipeline.abortAttempt(attemptId),
+        attemptRunsHere: (attemptId) => this.pipeline.runsAttempt(attemptId),
+        ownerNotice: (released) => this.pipeline.noticeAttemptReleased(released),
+      });
       this.bootstrapApplications = new BootstrapApplications(this.db, this.clock, this.audit);
       const hostScript = config.residentProvisioner?.script ?? process.env["ACP_HOST_PROJECT_PROVISIONER"];
       this.hostProjectProvisioner = config.residentProvisioner?.port ?? (hostScript

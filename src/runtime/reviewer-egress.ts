@@ -1,17 +1,20 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import {
   accessSync,
   constants,
   existsSync,
   lstatSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:net";
 import { join } from "node:path";
 
 import { sha256 } from "../core/digest.ts";
+import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
 import { credentialBearingField } from "../db/audit.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import {
@@ -150,6 +153,18 @@ const configuredEndpoints = (config: ReviewerEgressConfig, provider: string): st
     fail("REVIEWER_EGRESS_PROVIDER_ENDPOINTS_INVALID", `provider '${provider}' has an invalid reviewer egress hostname`);
   }
   return endpoints as string[];
+};
+
+/** A lease's record: a private directory under the runtime directory, removed when the lease ends. */
+const LEASE_PREFIX = "reviewer-egress-";
+const leaseFiles = (leaseDirectory: string): { allowlistPath: string; logPath: string } => ({
+  allowlistPath: join(leaseDirectory, "allowlist.txt"),
+  logPath: join(leaseDirectory, "egress.jsonl"),
+});
+/** The proxy's arguments after its interpreter: the script, the port and the lease's own two files. */
+const proxyArguments = (proxyPath: string, port: number, leaseDirectory: string): string[] => {
+  const { allowlistPath, logPath } = leaseFiles(leaseDirectory);
+  return [proxyPath, String(port), allowlistPath, logPath];
 };
 
 let queuedLease: Promise<void> = Promise.resolve();
@@ -436,9 +451,8 @@ export const acquireReviewerEgress = async (
   let leaseDirectory: string | null = null;
   let proxy: ChildProcess | null = null;
   try {
-    leaseDirectory = mkdtempSync(join(effectiveConfig.runtimeDir, "reviewer-egress-"));
-    const allowlistPath = join(leaseDirectory, "allowlist.txt");
-    const logPath = join(leaseDirectory, "egress.jsonl");
+    leaseDirectory = mkdtempSync(join(effectiveConfig.runtimeDir, LEASE_PREFIX));
+    const { allowlistPath, logPath } = leaseFiles(leaseDirectory);
     writeFileSync(allowlistPath, `${endpoints.join("\n")}\n`, { mode: 0o600 });
     // The proxy must include this exact digest in its START record after reading the path
     // it was launched with. That binds its observed policy to this invocation's generated
@@ -448,7 +462,8 @@ export const acquireReviewerEgress = async (
     // has stopped, never by following an owner-controlled log path.
     writeFileSync(logPath, "", { mode: 0o600 });
     try {
-      proxy = spawn(effectiveConfig.pythonBinary ?? "/usr/bin/python3", [effectiveConfig.proxyPath, String(port), allowlistPath, logPath], {
+      // #1344 D — this argv is the process signature `reapOrphanedReviewerEgress` identifies a leftover proxy by.
+      proxy = spawn(effectiveConfig.pythonBinary ?? "/usr/bin/python3", proxyArguments(effectiveConfig.proxyPath, port, leaseDirectory), {
         detached: true,
         stdio: ["ignore", "ignore", "pipe"],
       });
@@ -488,6 +503,228 @@ export const acquireReviewerEgress = async (
     if (leaseDirectory) rmSync(leaseDirectory, { recursive: true, force: true });
     releaseLock();
     throw error;
+  }
+};
+
+/**
+ * #1344 D — what a daemon's start found of reviewer egress proxies an earlier instance launched and left running.
+ * `leases`: the lease directories left behind (their names). `discovery`: COMPLETE when every live process of this user
+ * was listed and its argv read; otherwise FAILED, with why (`discoveryError`), and no lease is removed. `stopped`: the
+ * proxies matched to a lease and proven gone after it was signalled. `survived`: matched proxies proven still there.
+ * `unproven`: matched proxies whose identity could not be read while stopping them, so they are neither. `kept`: the
+ * leases not removed, because their proxy is not proven gone. `portFree`: whether the reviewer port takes
+ * a listener now. False means a holder not proven to be one of these proxies, which is left alone: a review start fails
+ * as it did before, and this record is the evidence of why.
+ */
+export interface ReviewerEgressReap {
+  port: number;
+  leases: string[];
+  discovery: "COMPLETE" | "FAILED";
+  discoveryError?: string;
+  stopped: Array<{ pid: number; lease: string }>;
+  survived: Array<{ pid: number; lease: string }>;
+  unproven: Array<{ pid: number; lease: string }>;
+  kept: string[];
+  portFree: boolean;
+}
+
+/** A live process of this user, as `ps` lists it: its pid, and whether it is a zombie (exited, holding no socket). */
+interface ListedProcess { pid: number; zombie: boolean }
+
+/**
+ * Every process of this user but this one, from `ps`'s pid, uid and state columns. An error answers why the listing is
+ * not complete: `ps` failed or timed out, a line it printed is not those three columns, or it did not list this process.
+ */
+const ownProcesses = (): { processes: ListedProcess[] } | { error: string } => {
+  const uid = process.getuid?.();
+  if (uid === undefined) return { error: "this platform has no process user id" };
+  let listing: string;
+  try {
+    listing = execFileSync("ps", ["-axo", "pid=,uid=,stat="], { encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "ignore"] });
+  } catch (error) {
+    return { error: `ps failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  const processes: ListedProcess[] = [];
+  let listedSelf = false;
+  for (const line of listing.split("\n")) {
+    if (line.trim() === "") continue;
+    // A uid is printed signed: nobody is -2.
+    const match = /^\s*(\d+)\s+(-?\d+)\s+(\S+)\s*$/.exec(line);
+    if (!match) return { error: "ps printed a line that is not pid, uid and state" };
+    const pid = Number(match[1]);
+    if (pid === process.pid) listedSelf = true;
+    if (pid !== process.pid && Number(match[2]) === uid) processes.push({ pid, zombie: match[3]!.startsWith("Z") });
+  }
+  return listedSelf ? { processes } : { error: "ps did not list this process" };
+};
+
+/** Whether no process has this pid any more: only ESRCH proves it; a permission error or a live process does not. */
+const processGone = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+};
+
+/**
+ * What a pid is now, against the process identified as `startToken`: SAME, OTHER (its start token proves another process
+ * holds the pid), GONE (no process has it: ESRCH), or UNKNOWN (its start token cannot be read while a process holds it).
+ * Only OTHER and GONE prove the identified process is gone.
+ */
+const identityOf = (pid: number, startToken: string): "SAME" | "OTHER" | "GONE" | "UNKNOWN" => {
+  let now: string | null;
+  try {
+    now = readProcessStartToken(pid);
+  } catch {
+    now = null;
+  }
+  if (now !== null) return now === startToken ? "SAME" : "OTHER";
+  return processGone(pid) ? "GONE" : "UNKNOWN";
+};
+
+/**
+ * Signals the exact process only while it is proven still the one identified (same pid and OS start), then waits for
+ * it to go. STOPPED only once it is proven gone; SURVIVED while it is proven still there; UNPROVEN when its identity
+ * cannot be read, in which case it is signalled no further and its lease is kept.
+ */
+const stopExact = async (pid: number, startToken: string): Promise<"STOPPED" | "SURVIVED" | "UNPROVEN"> => {
+  const proven = (identity: ReturnType<typeof identityOf>): boolean => identity === "GONE" || identity === "OTHER";
+  let identity = identityOf(pid, startToken);
+  for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+    if (proven(identity)) return "STOPPED";
+    if (identity === "UNKNOWN") return "UNPROVEN";
+    try {
+      process.kill(pid, signal);
+    } catch {
+      identity = identityOf(pid, startToken);
+      return proven(identity) ? "STOPPED" : identity === "SAME" ? "SURVIVED" : "UNPROVEN";
+    }
+    // An exiting process can read UNKNOWN for a moment, before its parent reaps it; only a proof ends the wait.
+    const deadline = Date.now() + 1_000;
+    for (identity = identityOf(pid, startToken); !proven(identity) && Date.now() < deadline; identity = identityOf(pid, startToken)) {
+      await delay(25);
+    }
+  }
+  return proven(identity) ? "STOPPED" : identity === "SAME" ? "SURVIVED" : "UNPROVEN";
+};
+
+const portTakesListener = (port: number): Promise<boolean> => new Promise((resolve) => {
+  const server = createServer();
+  server.once("error", () => resolve(false));
+  server.listen(port, "127.0.0.1", () => server.close(() => resolve(true)));
+});
+
+/**
+ * #1344 D — at a daemon's start, before any review can start: stops the reviewer egress proxies an earlier instance
+ * of this daemon launched and left running, which hold the fixed port so that every later review fails ISOLATION_LOST.
+ *
+ * A proxy is identified the way the launcher records it: a lease directory left under this daemon's runtime directory
+ * (a lease that ended removed its own), and a process of this user whose kernel argv ends with exactly the arguments
+ * that lease was launched with: this daemon's proxy script, its port and that directory's two files. Only those exact
+ * pids are signalled, each while its OS start token is still the one read; never a process found by name, and never
+ * what merely holds the port. A lease is removed only when its proxy is proven gone (ESRCH, or a start token that
+ * proves another process holds its pid): it was matched and stopped, or discovery was complete and no process matched
+ * it. A discovery that failed (`ps` failed, timed out or printed what cannot be read, or a live process's start token or
+ * argv could not be read) keeps every lease it did not stop, and a stop whose identity read failed keeps its lease, for
+ * the next start to reap. Runs under the lease lock, so no lease of this process is live meanwhile. Null when no lease
+ * was left behind.
+ */
+export const reapOrphanedReviewerEgress = async (config: ReviewerEgressConfig | undefined): Promise<ReviewerEgressReap | null> => {
+  if (!config) return null;
+  const port = config.port ?? 18_443;
+  let names: string[];
+  try {
+    names = readdirSync(config.runtimeDir);
+  } catch {
+    return null;
+  }
+  const leases = names.filter((name) => {
+    if (!name.startsWith(LEASE_PREFIX)) return false;
+    try {
+      return lstatSync(join(config.runtimeDir, name)).isDirectory();
+    } catch {
+      return false;
+    }
+  }).sort();
+  if (leases.length === 0) return null;
+
+  const releaseLock = await acquireLeaseLock();
+  try {
+    const signatures = leases.map((lease) => ({ lease, tail: proxyArguments(config.proxyPath, port, join(config.runtimeDir, lease)) }));
+    const listed = ownProcesses();
+    let discoveryError = "error" in listed ? listed.error : null;
+    const matched: Array<{ pid: number; startToken: string; lease: string }> = [];
+    /** Matches one process; false when it is live and its argv cannot be read now. */
+    /**
+     * Matches one process; false when it could be a proxy and cannot be proven one way or the other now: its start
+     * token or argv unreadable while it is live, or its start token unreadable or changed after its argv was read.
+     */
+    const inspect = (pid: number): boolean => {
+      let startToken: string | null;
+      let argv: readonly string[] | null;
+      try {
+        startToken = readProcessStartToken(pid);
+        argv = startToken === null ? null : readProcessArgv(pid);
+      } catch {
+        startToken = null;
+        argv = null;
+      }
+      // Gone since the listing proves nothing is there; a live process whose argv cannot be read could be a proxy.
+      if (startToken === null || argv === null) return processGone(pid);
+      const signature = signatures.find(({ tail }) =>
+        argv.length > tail.length && tail.every((value, index) => argv[argv.length - tail.length + index] === value));
+      if (!signature) return true;
+      // The argv read is this process's only while the same start token is read after it.
+      const after = identityOf(pid, startToken);
+      if (after === "SAME") matched.push({ pid, startToken, lease: signature.lease });
+      return after !== "UNKNOWN" && after !== "OTHER";
+    };
+    let unread = ("error" in listed ? [] : listed.processes).filter(({ zombie }) => !zombie).map(({ pid }) => pid)
+      .filter((pid) => !inspect(pid));
+    // A process caught exiting or between exec steps is unreadable for a moment: asked again, briefly, before it is
+    // taken to leave the discovery incomplete.
+    for (let round = 0; unread.length > 0 && round < 3; round += 1) {
+      await delay(100);
+      unread = unread.filter((pid) => !inspect(pid));
+    }
+    if (unread.length > 0) discoveryError ??= `the identity of live process ${unread[0]} could not be read`;
+    const stopped: ReviewerEgressReap["stopped"] = [];
+    const survived: ReviewerEgressReap["survived"] = [];
+    const unproven: ReviewerEgressReap["unproven"] = [];
+    for (const proxy of matched) {
+      const outcome = await stopExact(proxy.pid, proxy.startToken);
+      (outcome === "STOPPED" ? stopped : outcome === "SURVIVED" ? survived : unproven).push({ pid: proxy.pid, lease: proxy.lease });
+    }
+    const provenGone = (lease: string): boolean =>
+      ![...survived, ...unproven].some((proxy) => proxy.lease === lease) &&
+      (stopped.some((proxy) => proxy.lease === lease) || discoveryError === null);
+    const kept: string[] = [];
+    for (const lease of leases) {
+      if (provenGone(lease)) rmSync(join(config.runtimeDir, lease), { recursive: true, force: true });
+      else kept.push(lease);
+    }
+    let portFree = await portTakesListener(port);
+    // A stopped proxy's listening socket closes with its process; give the kernel a moment to show it.
+    const deadline = Date.now() + 1_000;
+    while (!portFree && stopped.length > 0 && Date.now() < deadline) {
+      await delay(25);
+      portFree = await portTakesListener(port);
+    }
+    return {
+      port,
+      leases,
+      discovery: discoveryError === null ? "COMPLETE" : "FAILED",
+      ...(discoveryError === null ? {} : { discoveryError }),
+      stopped,
+      survived,
+      unproven,
+      kept,
+      portFree,
+    };
+  } finally {
+    releaseLock();
   }
 };
 

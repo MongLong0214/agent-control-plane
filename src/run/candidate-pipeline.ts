@@ -20,6 +20,7 @@ import type { VerificationCommand } from "../contracts/verification-command.ts";
 import { EVIDENCE_PRODUCERS, type ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import { attemptReleasedNoticeKey } from "../doctor/watchdog.ts";
 import { ArtifactKind, RunKind, type RunRow, RunState } from "../domain/types.ts";
 import { requiredBaseFor, sourceProbeBranchesFor } from "../github/branch-contract.ts";
 import { currentBranch, mergeBase, revParse, tryRevParse } from "../git/git.ts";
@@ -213,6 +214,11 @@ const UNJUDGED_REVIEW_LIMIT_REFUSED = "UNJUDGED_REVIEW_LIMIT_REFUSED";
  */
 export const STALE_ATTEMPT_NOT_APPLIED =
   "not applied: this submission's attempt no longer holds the run, so nothing of its result was applied (no verdict, candidate state, revision or notice). This is not an unavailable review of the run's current candidate. What happens next follows from the run's current attempt and state, not from this answer: read the current run state.";
+
+/** #1344 C1 — the owner CTO's notice that ACP released an attempt of its run (`noticeAttemptReleased`). */
+export const ATTEMPT_RELEASED_NOTICE = "attempt released, outcome not applied; submit a fresh result";
+const ATTEMPT_RELEASED_RECOVERY =
+  "Change no PLAN, task or code. Submit that run's result once with mcp__acp-cto__result_submit and a new idempotencyKey, then acknowledge this message with mcp__acp-cto__run_ack.";
 
 export interface SubmitResultInput {
   runId: string;
@@ -611,6 +617,52 @@ export class CandidatePipeline {
    */
   abortAttempt(attemptId: string): void {
     this.#attempts.get(attemptId)?.abort();
+  }
+
+  /** #1344 — whether this process runs the attempt: one it took and has not ended. */
+  runsAttempt(attemptId: string): boolean {
+    return this.#attempts.has(attemptId);
+  }
+
+  /**
+   * #1344 C1 — the run's owner CTO is told that ACP released an attempt of its run, whether its deadline passed or the
+   * daemon that ran it restarted: in band, as a revision is (`returnToCto`), keyed by the attempt
+   * (`attemptReleasedNoticeKey`), so a release is told once. It asks for no product change: the attempt's outcome was
+   * not applied, and a fresh result_submit with a new idempotency key goes on. Answers the notice's id; null when none
+   * is owed (a run not ACTIVE, or a project-less bootstrap run, whose driven CTO would replace its PLAN for any
+   * REVISION_REQUEST and which the daemon's review retry wakes instead, `Daemon.#bootstrapReviewRetry`); and a denial
+   * when one is owed and cannot be written now (no active owner binding, or the outbox refused its target), which the
+   * watchdog keeps owed and retries (`Watchdog.deliverOwedReleaseNotices`). The release never waits on it.
+   */
+  noticeAttemptReleased(released: { runId: string; attemptId: string; reason: string }): Decision<string | null> {
+    const run = this.runs.get(released.runId);
+    if (!run || run.state !== RunState.ACTIVE || isProjectlessBootstrap(run)) return allow(ReasonCode.OK, null);
+    const roleKey = this.runs.ownerRoleKeyFor(run);
+    const binding = roleKey ? this.bindings.active(roleKey) : null;
+    if (!binding) {
+      return deny(ReasonCode.OUTBOX_TARGET_NOT_CURRENT, "the run's owner role has no active binding to tell of the release", {
+        runId: released.runId,
+        roleKey,
+      });
+    }
+    const enqueued = this.outbox.enqueue({
+      idempotencyKey: attemptReleasedNoticeKey(released.runId, released.attemptId),
+      roleKey: binding.roleKey,
+      bindingGeneration: binding.bindingGeneration,
+      targetSessionId: binding.sessionId,
+      runId: released.runId,
+      kind: MessageKind.REVISION_REQUEST,
+      payload: {
+        runId: released.runId,
+        reasonCode: ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
+        stage: "attempt-released",
+        attemptId: released.attemptId,
+        reason: released.reason,
+        notice: ATTEMPT_RELEASED_NOTICE,
+        recovery: ATTEMPT_RELEASED_RECOVERY,
+      },
+    });
+    return enqueued.allowed ? allow(ReasonCode.OK, enqueued.value.messageId) : (enqueued as Decision<never>);
   }
 
   private async submitResultOnce(input: SubmitResultInput, attemptId: string, signal: AbortSignal): Promise<Decision<PipelineOutcome>> {
