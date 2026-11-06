@@ -86,6 +86,17 @@ class IssuesGitHub implements GitHubClient {
   readonly labels: Array<{ name: string; color: string; description: string }> = [];
   /** GitHub accepts a label and keeps none of it. */
   dropLabel = false;
+  /**
+   * #1365 — GitHub's lists lag behind its items: a node id here is left out of its route's lists from that
+   * list GET on (counted per route, from 1), while a GET of it by number still answers it.
+   */
+  readonly unlisted = new Map<string, number>();
+  /** #1365 — how many list GETs each route has answered. */
+  readonly lists = { issues: 0, milestones: 0 };
+  /** #1365 — what a POST creates on these routes is left out of every list, as right after a create. */
+  readonly lagCreates = new Set<"issues" | "milestones">();
+  /** #1365 — a GET of one issue or milestone by number answers a 404, another node id, or an error. */
+  byNumber: "404" | "other" | "error" | null = null;
   private next = 1;
   /** The next GET of `route` waits until released, as a slow GitHub answer would. */
   private hold: { route: string; reached: boolean; release: () => void; released: Promise<void> } | null = null;
@@ -156,9 +167,19 @@ class IssuesGitHub implements GitHubClient {
       if (!this.dropLabel) this.labels.push(label);
       return label as T;
     }
+    const one = method === "GET" ? new RegExp(`^${ROOT}/(issues|milestones)/(\\d+)$`).exec(path) : null;
+    if (one !== null) {
+      if (this.byNumber === "error") throw new Error("connection reset before GitHub answered");
+      const row = (one[1] === "issues" ? this.issues : this.milestones).find((r: { number: number }) => r.number === Number(one[2]));
+      if (row === undefined || this.byNumber === "404") throw acpError(ReasonCode.INTERNAL_ERROR, `gh api GET ${path} failed: (HTTP 404)`, { status: 404, method, path });
+      return (this.byNumber === "other" ? { ...row, node_id: `${row.node_id}_other` } : row) as T;
+    }
     if (route === `${ROOT}/milestones` || route === `${ROOT}/issues`) {
       if (method === "GET") {
-        return (route.endsWith("/milestones") ? elsewhere(paged(this.milestones)) : elsewhere(paged(this.issues))) as T;
+        const kind = route.endsWith("/milestones") ? "milestones" : "issues";
+        const seen = (this.lists[kind] += 1);
+        const shown = <X extends { node_id: string }>(rows: X[]): X[] => rows.filter((row) => seen < (this.unlisted.get(row.node_id) ?? Infinity));
+        return (kind === "milestones" ? elsewhere(paged(shown(this.milestones))) : elsewhere(paged(shown(this.issues)))) as T;
       }
       if (method !== "POST") throw new Error(`unexpected request ${method} ${path}`);
       const matched = this.fault !== null && route.endsWith(this.fault.suffix);
@@ -187,6 +208,7 @@ class IssuesGitHub implements GitHubClient {
         const milestone = this.dropMilestone ? null : this.milestones.find((m) => m.number === value["milestone"]) ?? null;
         answer = this.addIssue(String(value["title"]), String(value["body"]), milestone);
       }
+      if (this.lagCreates.has(route.endsWith("/milestones") ? "milestones" : "issues")) this.unlisted.set((answer as { node_id: string }).node_id, 0);
       if (faulted && this.fault!.when === "after") {
         this.fault = null;
         throw new Error("connection reset after GitHub accepted the request");
@@ -1512,5 +1534,72 @@ describe("#1344 — a work-scope issue create keeps GitHub's HTTP status, so a d
     expect(unresolved(await planSubmit(g, feedUnit(impl), undefined, "retry")).map((u) => u.unit)).toEqual(["feed"]);
     expect(g.github.posts("/issues")).toHaveLength(1);
     expect(g.github.issues.filter((i) => i.title === "Add feed filtering")).toEqual([]);
+  });
+});
+
+describe("#1365 — an issue or milestone this synchronization created is not refused because GitHub's list lags right after the create", () => {
+  const gets = (g: Governed, path: string) => g.github.calls.filter((c) => c.method === "GET" && c.path === `${ROOT}/${path}`);
+  const newIssue = (impl: string, milestone: unknown = { number: 1 }) => [{ key: "feed", tasks: [impl], issue: { new: { title: "Add feed filtering", body: "Filter the feed" } }, milestone }];
+  const newMilestone = { new: { title: "Product: feed filtering", description: "The next product increment" } };
+
+  it("the live counterexample: issue #11, created and recorded, is missing from the listing; read by number at its recorded node id, it is verified", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.lagCreates.add("issues");
+    const answer = await planSubmit(g, newIssue(impl));
+    expect(tracking(answer)).toMatchObject({ tracked: true });
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(gets(g, "issues/11")).toHaveLength(1);
+    expect(trackedRecords(g).flatMap((r) => r.units).map((u) => [u.unit, u.issueNumber, u.milestoneNumber])).toEqual([["feed", 11, 1]]);
+    expect(startExecution(g, impl).allowed).toBe(true);
+  });
+
+  it("a new milestone, created and recorded, is missing from the listing; read by number at its recorded node id, it is verified", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.lagCreates.add("milestones");
+    const answer = await planSubmit(g, newIssue(impl, newMilestone));
+    expect(tracking(answer)).toMatchObject({ tracked: true });
+    expect(gets(g, "milestones/4")).toHaveLength(1);
+    expect(trackedRecords(g).flatMap((r) => r.units).map((u) => [u.unit, u.issueNumber, u.milestoneNumber])).toEqual([["feed", 11, 4]]);
+    expect(startExecution(g, impl).allowed).toBe(true);
+  });
+
+  it.each(["404", "other", "error"] as const)("the issue read by number answering %s stays ISSUE_NOT_FOUND", async (byNumber) => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.lagCreates.add("issues");
+    g.github.byNumber = byNumber;
+    const answer = await planSubmit(g, newIssue(impl));
+    expect(unmetOf(tracking(answer))).toMatchObject([{ unit: "feed", unmet: "ISSUE_NOT_FOUND", issues: [11] }]);
+    expect(gets(g, "issues/11")).toHaveLength(1);
+    expect(trackedRecords(g)).toEqual([]);
+    expect(startExecution(g, impl).reasonCode).toBe(REFUSED);
+  });
+
+  it.each(["404", "other", "error"] as const)("the milestone read by number answering %s stays MILESTONE_NOT_FOUND", async (byNumber) => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.lagCreates.add("milestones");
+    g.github.byNumber = byNumber;
+    const answer = await planSubmit(g, newIssue(impl, newMilestone));
+    expect(unmetOf(tracking(answer))).toMatchObject([{ unit: "feed", unmet: "MILESTONE_NOT_FOUND" }]);
+    expect(gets(g, "milestones/4")).toHaveLength(1);
+    expect(trackedRecords(g)).toEqual([]);
+    expect(startExecution(g, impl).reasonCode).toBe(REFUSED);
+  });
+
+  it("an adopted issue or milestone missing from the readback listing is refused as before, with no read by number", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 2) });
+    const [impl, review] = g.taskIds as [string, string];
+    g.github.unlisted.set("I_3", g.github.lists.issues + 2);
+    g.github.unlisted.set("MI_2", g.github.lists.milestones + 2);
+    const answer = await planSubmit(g, [
+      { key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } },
+      { key: "short", tasks: [review], issue: { number: 5 }, milestone: { number: 2 } },
+    ]);
+    expect(unmetOf(tracking(answer)).map((u) => [u.unit, u.unmet])).toEqual([["feed", "ISSUE_NOT_FOUND"], ["short", "MILESTONE_NOT_FOUND"]]);
+    expect(g.github.calls.filter((c) => c.method === "GET" && /\/(issues|milestones)\/\d+$/.test(c.path))).toEqual([]);
+    expect(trackedRecords(g)).toEqual([]);
   });
 });
