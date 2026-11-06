@@ -390,3 +390,124 @@ describe("a CEO notice whose exact request an official record concluded is settl
     expect(settlements(harness)).toHaveLength(status === "REJECTED" ? 1 : 0);
   });
 });
+
+describe("a retargeted CEO notice keeps its link to the request it was written for", () => {
+  /**
+   * The shape `ProductionGate.openEscalation` wrote before its notice named its escalation: the CTO_ESCALATION record,
+   * then the notice (`ProductionGate.notify`, keyed by its payload's digest) whose CEO_NOTIFICATION record names neither
+   * the notice nor the escalation, then BLOCKED for a critical-path one. Without its record, the notice alone.
+   */
+  const legacyEscalation = (harness: Harness, runId: string, question: string, blocksCriticalPath: boolean, withRecord = true) => {
+    const fields = { question, options: ["a", "b"], recommendation: "a", blocksCriticalPath };
+    const opened = harness.cp.audit.record({ kind: "CTO_ESCALATION", runId, evidence: fields });
+    if (!opened.allowed) throw new Error(opened.message);
+    const payload = { ...fields, whyItMatters: "the importer depends on it" };
+    if (withRecord) {
+      expect(harness.cp.ceo.notify(NotificationKind.TRUE_ESCALATION, runId, payload).allowed).toBe(true);
+    } else {
+      const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+      const queued = harness.cp.outbox.enqueue({
+        idempotencyKey: `notify:TRUE_ESCALATION:${runId}:${digestOf(payload)}`,
+        roleKey: ceo.roleKey, bindingGeneration: ceo.bindingGeneration, targetSessionId: ceo.sessionId, runId,
+        kind: MessageKind.CEO_NOTIFICATION,
+        payload: { notification: "TRUE_ESCALATION", runId, ...payload },
+      });
+      if (!queued.allowed) throw new Error(queued.message);
+    }
+    if (blocksCriticalPath) {
+      expect(harness.cp.runs.transition(runId, RunState.BLOCKED, "CEO_DECISION_REQUIRED", { question }).allowed).toBe(true);
+    }
+    harness.clock.advance(1000);
+    const notice = ceoNotices(harness).find((message) => payloadOf(message)["question"] === question)!;
+    expect(payloadOf(notice)["escalationId"]).toBeUndefined();
+    const record = harness.cp.audit.forRun(runId)
+      .find((entry) => entry.kind === "CEO_NOTIFICATION" && entry.evidence["question"] === question);
+    expect(record?.evidence["messageId"]).toBeUndefined();
+    return { escalationId: opened.value, notice, recordEventId: record?.eventId ?? null };
+  };
+
+  /** The CEO is replaced: every unsettled notice is retargeted in place to the new holder. */
+  const replaceCeo = (harness: Harness, notices: OutboxMessage[]): { sessionId: string; generation: number } => {
+    expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "CEO runtime lost").allowed).toBe(true);
+    const sessionId = bindCeo(harness);
+    const generation = harness.cp.bindings.active(roleKeyFor(Role.CEO))!.bindingGeneration;
+    for (const notice of notices) {
+      expect(notice.bindingGeneration).not.toBe(generation);
+      expect(rowOf(harness, notice.messageId)).toMatchObject({
+        message_id: notice.messageId, idempotency_key: notice.idempotencyKey, status: "PENDING", reason_code: "OUTBOX_RETARGETED",
+        binding_generation: generation, target_session_id: sessionId,
+      });
+    }
+    return { sessionId, generation };
+  };
+
+  it("an escalation notice that named no escalation, retargeted: COVERED by the CEO_DECISION on that escalation, bound to its chain", async () => {
+    const harness = makeHarness();
+    const run = await activeRun(harness);
+    const resolved = legacyEscalation(harness, run.runId, "which schema version does the importer target?", true);
+    // Opened before the decision on `resolved`, and never decided itself: that decision concludes nothing here.
+    const aside = legacyEscalation(harness, run.runId, "which log format does the importer write?", false);
+    const ceo = replaceCeo(harness, [resolved.notice, aside.notice]);
+
+    expect(harness.cp.ceo.resolveEscalation(run.runId, "v2", ceo.sessionId, { escalationId: resolved.escalationId }))
+      .toMatchObject({ allowed: true });
+    const decision = harness.cp.audit.forRun(run.runId)
+      .find((entry) => entry.kind === "CEO_DECISION" && entry.evidence["escalationId"] === resolved.escalationId)!;
+    const later = legacyEscalation(harness, run.runId, "which encoding does the importer read?", true);
+    await harness.cp.watchdog.tick();
+
+    expect(rowOf(harness, resolved.notice.messageId)).toMatchObject({ status: "REJECTED", reason_code: "CEO_NOTIFICATION_COVERED" });
+    expect(settlements(harness)).toEqual([expect.objectContaining({
+      runId: run.runId,
+      evidence: expect.objectContaining({
+        messageId: resolved.notice.messageId,
+        priorReasonCode: "OUTBOX_RETARGETED",
+        generation: ceo.generation,
+        targetSessionId: ceo.sessionId,
+        request: {
+          notification: "TRUE_ESCALATION", runId: run.runId, escalationId: resolved.escalationId, writtenWith: resolved.recordEventId,
+        },
+        concludedBy: { kind: "CEO_DECISION", eventId: decision.eventId },
+      }),
+    })]);
+    for (const open of [aside, later]) expect(rowOf(harness, open.notice.messageId)["status"]).toBe("PENDING");
+  });
+
+  it("a retargeted escalation notice whose record is missing stays PENDING, its escalation decided and its run ended", async () => {
+    const harness = makeHarness();
+    const run = await activeRun(harness);
+    const broken = legacyEscalation(harness, run.runId, "which schema version does the importer target?", true, false);
+    expect(broken.recordEventId).toBeNull();
+    const ceo = replaceCeo(harness, [broken.notice]);
+    expect(harness.cp.ceo.resolveEscalation(run.runId, "v2", ceo.sessionId, { escalationId: broken.escalationId }))
+      .toMatchObject({ allowed: true });
+    expect(harness.cp.runs.transition(run.runId, RunState.CANCELLED, "cancelled by the CEO").allowed).toBe(true);
+    await harness.cp.watchdog.tick();
+
+    expect(rowOf(harness, broken.notice.messageId)).toMatchObject({ status: "PENDING", reason_code: "OUTBOX_RETARGETED" });
+    expect(settlements(harness)).toEqual([]);
+  });
+
+  it("a retargeted escalation notice whose escalation is still open stays PENDING, even with its run COMPLETED", async () => {
+    const harness = makeHarness();
+    const driven = await atReview(harness);
+    expect(harness.cp.ceo.submitCeoDecision({
+      runId: driven.runId, decision: "CONFIRM", candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      ceoSessionId: ceoSession(harness), rationale: "ship it",
+    }).allowed).toBe(true);
+    for (const state of [RunState.MERGING, RunState.POST_MERGE_VERIFYING]) {
+      expect(harness.cp.runs.transition(driven.runId, state, "merged").allowed).toBe(true);
+    }
+    expect(harness.cp.runs.transition(driven.runId, RunState.COMPLETED, "verified after merge", {},
+      harness.cp.daemonFinalizationAuthorities().completion).allowed).toBe(true);
+    expect(harness.cp.runs.get(driven.runId)?.state).toBe(RunState.COMPLETED);
+    // The chain is whole: only a record that concluded this escalation is missing, and the CONFIRM is another request's.
+    const open = legacyEscalation(harness, driven.runId, "which log format does the importer write?", false);
+    expect(open.recordEventId).not.toBeNull();
+    replaceCeo(harness, [open.notice]);
+    await harness.cp.watchdog.tick();
+
+    expect(rowOf(harness, open.notice.messageId)).toMatchObject({ status: "PENDING", reason_code: "OUTBOX_RETARGETED" });
+    expect(settlements(harness).map((entry) => entry.evidence["messageId"])).not.toContain(open.notice.messageId);
+  });
+});
