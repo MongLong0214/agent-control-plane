@@ -541,7 +541,7 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     expect(g.github.calls).toEqual([]);
   });
 
-  it("a GitHub outage holds back only the unit not yet linked; a linked unit's admission asks GitHub nothing", async () => {
+  it("a GitHub outage holds back only the unit not yet linked; a linked unit's admission sends GitHub nothing", async () => {
     const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
     const [impl] = g.taskIds as [string];
     const feed = { key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } };
@@ -553,7 +553,8 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     const seen = g.github.calls.length;
     expect(startExecution(g, impl).allowed).toBe(true);
     expect((await provision(g, impl))["reasonCode"]).not.toBe(REFUSED);
-    expect(g.github.calls.length).toBe(seen);
+    // #1364 — while roundup's create is unknown, an admission only reads GitHub for its token.
+    expect(g.github.calls.slice(seen).filter((c) => c.method !== "GET")).toEqual([]);
     // The outage's request may still land: nothing is sent again for roundup until it is known.
     expect(startExecution(g, roundup).reasonCode).toBe(REFUSED);
     expect((await startWorkerExecution(g, roundup)).reasonCode).toBe(REFUSED);
@@ -1794,6 +1795,69 @@ describe("#1364 — a work-scope issue create's original outcome is kept apart f
     expect(g.github.calls.filter((c) => c.method !== "GET" && c.method !== "POST")).toEqual([]);
   });
 
+  it("review: with every unit tracked after an adoption, the next ensure still reads the token and records the late CREATED, flagged", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/issues", when: "late" };
+    await planSubmit(g, [feedUnit(impl)]);
+    const intent = intentOf(g);
+    const adopting = [feedUnit(impl, { number: 3 })];
+    expect(tracking(await planSubmit(g, adopting, undefined, "adopted"))).toMatchObject({ tracked: true });
+    // GitHub completes the original POST; the unchanged PLAN is sent again and the task admitted. No unit is pending.
+    g.github.land();
+    const late = g.github.issues.find((i) => i.title === "Add feed filtering")!;
+    expect((await planSubmit(g, adopting, undefined, "adopted"))["evidence"]).toMatchObject({ replayed: true, githubTracking: { tracked: true } });
+    expect((await g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl)).allowed).toBe(true);
+    expect(createdFor(g, intent).map((row) => row.evidence)).toEqual([expect.objectContaining({ number: late.number, nodeId: late.node_id, possibleDuplicateOf: [3] })]);
+    // Known now: a further admission asks GitHub nothing, and nothing was sent or closed.
+    const calls = g.github.calls.length;
+    expect((await g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl)).allowed).toBe(true);
+    expect(g.github.calls).toHaveLength(calls);
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(g.github.calls.filter((c) => c.method !== "GET" && c.method !== "POST")).toEqual([]);
+  });
+
+  it("review: while a create is unknown, a failed token read refuses no admission of a tracked unit", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/issues", when: "late" };
+    await planSubmit(g, [feedUnit(impl)]);
+    expect(tracking(await planSubmit(g, [feedUnit(impl, { number: 3 })], undefined, "adopted"))).toMatchObject({ tracked: true });
+    vi.spyOn(g.github, "request").mockRejectedValueOnce(new Error("GitHub is unavailable"));
+    expect((await g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl)).allowed).toBe(true);
+    expect(createdFor(g, intentOf(g))).toEqual([]);
+  });
+
+  it("review: the CEO's escalation_resolve of the escalation naming the intent ends the wait on a BLOCKED run; another escalation's does not", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/issues", when: "late" };
+    await planSubmit(g, [feedUnit(impl)]);
+    const intent = intentOf(g);
+    const ceo = g.h.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId;
+    const escalateAndResolve = async (question: string, key: string): Promise<number> => {
+      const opened = await callCtoTool(g.h, g.owner, "escalation_open", {
+        idempotencyKey: `open-${key}`, runId: g.runId, question, options: ["adopt an existing issue"], ctoRecommendation: "adopt an existing issue", whyItMatters: "the unit cannot be linked", blocksCriticalPath: true,
+      });
+      expect(opened["ok"], key).toBe(true);
+      expect(g.h.cp.runs.require(g.runId).state, key).toBe("BLOCKED");
+      const escalationId = (opened["value"] as { escalationId: number }).escalationId;
+      expect(g.h.cp.ceo.resolveEscalation(g.runId, "adopt an existing issue by number", ceo, { escalationId, idempotencyKey: `resolve-${key}` }).allowed, key).toBe(true);
+      return escalationId;
+    };
+    // A resolution of an escalation about something else ends nothing.
+    await escalateAndResolve("which milestone does the next unit go in?", "other");
+    expect(unresolvedOf(tracking(await planSubmit(g, [feedUnit(impl)], undefined, "after another escalation"))).map((u) => [u.retryable, u.dispositions])).toEqual([[true, undefined]]);
+    // The escalation about this unresolved create, resolved by the CEO: the wait ends; the outcome stays UNKNOWN.
+    const escalationId = await escalateAndResolve(`the issue create ${intent} has an unknown outcome; how does the run proceed?`, "this");
+    const ended = unresolvedOf(tracking(await planSubmit(g, [feedUnit(impl)], undefined, "after the CEO")));
+    expect(ended.map((u) => [u.unit, u.intents, u.originalOutcome, u.retryable])).toEqual([["feed", [intent], "UNKNOWN", false]]);
+    expect(ended[0]!.dispositions).toEqual([{ intent, disposition: "ENDED_BY_CEO", answeredBy: "ESCALATION_RESOLVE", escalationId, decisionEventId: expect.any(Number) }]);
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(retiredRows(g)).toEqual([]);
+    expect(createdFor(g, intent)).toEqual([]);
+  });
+
   it("the CEO's FINAL_REVISE answering an escalation ends the wait: no longer retryable, the outcome stays UNKNOWN, nothing is sent again", async () => {
     const github = myeotnyeon();
     const h = harnessFor(github);
@@ -1819,7 +1883,7 @@ describe("#1364 — a work-scope issue create's original outcome is kept apart f
     expect(h.cp.ceo.submitCeoDecision({ runId: driven.runId, decision: "FINAL_REVISE", candidateSnapshotDigest: driven.candidateSnapshotDigest, ceoSessionId: ceo.sessionId, rationale: "adopt an existing issue for the unit" }).allowed).toBe(true);
     const ended = unresolvedOf(tracking(await submit("after the CEO")));
     expect(ended.map((u) => [u.unit, u.intents, u.originalOutcome, u.retryable])).toEqual([["feed", [intent], "UNKNOWN", false]]);
-    expect(ended[0]!.dispositions).toEqual([{ intent, disposition: "ENDED_BY_CEO", escalationId: expect.any(Number), decisionEventId: expect.any(Number) }]);
+    expect(ended[0]!.dispositions).toEqual([{ intent, disposition: "ENDED_BY_CEO", answeredBy: "FINAL_REVISE", escalationId: expect.any(Number), decisionEventId: expect.any(Number) }]);
     expect(ended[0]!.correction).toMatch(/CEO ended the wait/);
     expect(github.posts("/issues")).toHaveLength(1);
     expect(retiredRows(g)).toEqual([]);
@@ -1837,10 +1901,14 @@ describe("#1364 — a work-scope issue create's original outcome is kept apart f
     });
     expect(opened["ok"]).toBe(true);
     expect(g.h.cp.runs.cancel(g.runId, "CEO: cancel the run").allowed).toBe(true);
-    g.github.land();
     expect((await g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl)).allowed).toBe(false);
     expect(g.github.posts("/issues")).toHaveLength(1);
     expect(retiredRows(g)).toEqual([]);
     expect(createdFor(g, intent)).toEqual([]);
+    // Its own token appearing later is still recorded as CREATED; nothing is sent.
+    g.github.land();
+    await g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl);
+    expect(createdFor(g, intent)).toHaveLength(1);
+    expect(g.github.posts("/issues")).toHaveLength(1);
   });
 });
