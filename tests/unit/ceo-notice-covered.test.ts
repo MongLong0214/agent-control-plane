@@ -1,6 +1,6 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
-import { AgentOwnedWaits, DEFAULT_AGENT_WAIT_DEADLINES } from "../../src/ceo/agent-owned-waits.ts";
+import { AgentOwnedWaits, type AgentWaitDeadlines, DEFAULT_AGENT_WAIT_DEADLINES } from "../../src/ceo/agent-owned-waits.ts";
 import { CEO_NOTIFICATION_COVERED, NotificationKind } from "../../src/ceo/ceo-incident-notices.ts";
 import { ExecutionMode, Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
@@ -19,7 +19,7 @@ afterAll(cleanupTempDirs);
 const MINUTE = 60 * 1000;
 const HOUR = 60 * MINUTE;
 
-const waitsOf = (harness: Harness): AgentOwnedWaits =>
+const waitsOf = (harness: Harness, deadlines: Partial<AgentWaitDeadlines> = {}): AgentOwnedWaits =>
   new AgentOwnedWaits({
     db: harness.cp.db,
     clock: harness.cp.clock,
@@ -29,7 +29,7 @@ const waitsOf = (harness: Harness): AgentOwnedWaits =>
     outbox: harness.cp.outbox,
     artifacts: harness.cp.artifacts,
     gate: harness.cp.ceo,
-  }, DEFAULT_AGENT_WAIT_DEADLINES);
+  }, { ...DEFAULT_AGENT_WAIT_DEADLINES, ...deadlines });
 
 const ceoSession = (harness: Harness): string => harness.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId;
 
@@ -76,6 +76,23 @@ const activeRun = async (harness: Harness) => {
   const dispatched = await harness.cp.runs.dispatch(created.value.runId);
   if (!dispatched.allowed) throw new Error(`${dispatched.reasonCode}: ${dispatched.message}`);
   return dispatched.value;
+};
+
+/** A real reviewed candidate with its production-ready packet: the run at READY_FOR_CEO_REVIEW. */
+const atReview = async (harness: Harness) => {
+  const driven = await driveToReviewedCandidate(harness);
+  await harness.cp.continuity.evaluate("test");
+  const packet = harness.cp.ceo.buildPacket({
+    runId: driven.runId,
+    candidateSnapshotDigest: driven.candidateSnapshotDigest,
+    approval: {
+      runId: driven.runId, candidateSnapshotDigest: driven.candidateSnapshotDigest, resultSummary: "done", recommendation: "ship",
+      residualRisk: [], approvedBySessionId: driven.ownerSessionId, approvedByGeneration: driven.ownerBindingGeneration,
+      approvedAt: harness.clock.nowIso(),
+    },
+  });
+  if (!packet.allowed) throw new Error(`${packet.reasonCode}: ${packet.message}`);
+  return driven;
 };
 
 describe("a CEO notice whose exact request an official record concluded is settled COVERED", () => {
@@ -247,18 +264,7 @@ describe("a CEO notice whose exact request an official record concluded is settl
 
   it("a review notice: COVERED by the CEO's CONFIRM of that candidate", async () => {
     const harness = makeHarness();
-    const driven = await driveToReviewedCandidate(harness);
-    await harness.cp.continuity.evaluate("test");
-    const packet = harness.cp.ceo.buildPacket({
-      runId: driven.runId,
-      candidateSnapshotDigest: driven.candidateSnapshotDigest,
-      approval: {
-        runId: driven.runId, candidateSnapshotDigest: driven.candidateSnapshotDigest, resultSummary: "done", recommendation: "ship",
-        residualRisk: [], approvedBySessionId: driven.ownerSessionId, approvedByGeneration: driven.ownerBindingGeneration,
-        approvedAt: harness.clock.nowIso(),
-      },
-    });
-    if (!packet.allowed) throw new Error(`${packet.reasonCode}: ${packet.message}`);
+    const driven = await atReview(harness);
     const review = ceoNotices(harness).find((message) => payloadOf(message)["notification"] === "READY_FOR_CEO_REVIEW")!;
     await harness.cp.watchdog.tick();
     expect(rowOf(harness, review.messageId)["status"]).toBe("PENDING");
@@ -281,5 +287,42 @@ describe("a CEO notice whose exact request an official record concluded is settl
         concludedBy: { kind: "CEO_DECISION", eventId: decision.eventId },
       }),
     })]);
+  });
+
+  it("a review reminder is bound to the review it was written for: FINAL_REVISE settles it after the candidate is up again, and the new reminder stays", async () => {
+    const harness = makeHarness();
+    const driven = await atReview(harness);
+    const waits = waitsOf(harness, { ceoReviewMs: HOUR });
+    const reminders = () => ceoNotices(harness).filter((message) => payloadOf(message)["step"] === "RENOTIFY");
+    const packetNotice = ceoNotices(harness).find((message) => payloadOf(message)["notification"] === "READY_FOR_CEO_REVIEW")!;
+
+    harness.clock.advance(HOUR);
+    expect((await waits.sweep(vi.fn())).taken).toEqual([expect.objectContaining({ kind: "CEO_REVIEW", step: "RENOTIFY" })]);
+    const old = reminders()[0]!;
+
+    expect(harness.cp.ceo.submitCeoDecision({
+      runId: driven.runId, decision: "FINAL_REVISE", candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      ceoSessionId: ceoSession(harness), rationale: "add a regression test",
+    }).allowed).toBe(true);
+    const revised = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CEO_DECISION").at(-1)!;
+    // The same candidate is up for review again before any sweep, and its wait is reminded in turn.
+    expect(harness.cp.runs.transition(driven.runId, RunState.ACTIVE, "revision taken up").allowed).toBe(true);
+    expect(harness.cp.runs.transition(driven.runId, RunState.READY_FOR_CEO_REVIEW, "the same candidate is up for review again",
+      { candidateSnapshotDigest: driven.candidateSnapshotDigest }).allowed).toBe(true);
+    harness.clock.advance(HOUR);
+    expect((await waits.sweep(vi.fn())).taken).toEqual([expect.objectContaining({ kind: "CEO_REVIEW", step: "RENOTIFY" })]);
+    const fresh = reminders().find((message) => message.messageId !== old.messageId)!;
+
+    await harness.cp.watchdog.tick();
+
+    for (const settled of [old, packetNotice]) {
+      expect(rowOf(harness, settled.messageId)).toMatchObject({ status: "REJECTED", reason_code: "CEO_NOTIFICATION_COVERED" });
+    }
+    expect(settlements(harness).map((entry) => [entry.evidence["messageId"], entry.evidence["concludedBy"]])).toEqual(expect.arrayContaining([
+      [old.messageId, { kind: "CEO_DECISION", eventId: revised.eventId }],
+      [packetNotice.messageId, { kind: "CEO_DECISION", eventId: revised.eventId }],
+    ]));
+    expect(settlements(harness)).toHaveLength(2);
+    expect(rowOf(harness, fresh.messageId)["status"]).toBe("PENDING");
   });
 });

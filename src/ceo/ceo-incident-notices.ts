@@ -539,33 +539,67 @@ const requestOf = (row: NoticeRow): { request: NoticeRequest; incident: Incident
 };
 
 /**
- * The audit event the notice's exact request opened with, so what concluded it is ordered after it by durable event
- * order, never by wall-clock time: its escalation (the CTO_ESCALATION event), its incident's opening
- * (`incidentOpenedEventId`), the latest RUN_TRANSITION that put its candidate up for review (a candidate up for review
- * again is a request open again), or the RUN_TRANSITION that entered the wait a deadline-step notice is for, as its
- * AGENT_WAIT_DEADLINE record (`AgentOwnedWaits`) names it. Null for a notice that names none of them: its run alone does
- * not tell its request, and nothing here settles it.
+ * The record a notice that is no incident's was written with, in the same transaction, so the request it was written
+ * for is the one open then and never one opened after it: a wait's deadline-step notice's AGENT_WAIT_DEADLINE, which
+ * names the wait it is for (`episode`, the RUN_TRANSITION that entered it); a review re-delivery's
+ * CEO_REVIEW_REDELIVERED; or a review packet's CEO_NOTIFICATION (`ProductionGate.buildPacket`), which names no message:
+ * its first record of exactly the notice's content (goal, candidate, human gate, what its idempotency key is the digest
+ * of), since a later identical packet finds that same notice. Null when there is none. (The kind names are
+ * `AgentOwnedWaits`', whose module reads this one.)
+ */
+const noticeWrittenWith = (db: Pick<Db, "get">, row: NoticeRow, request: NoticeRequest): { eventId: number; waitEpisode: number | null } | null => {
+  const named = db.get<{ event_id: number; kind: string; episode: unknown }>(
+    `SELECT event_id, kind, json_extract(evidence_json, '$.episode') AS episode FROM audit_events
+      WHERE run_id = ? AND kind IN ('AGENT_WAIT_DEADLINE', 'CEO_REVIEW_REDELIVERED') AND json_extract(evidence_json, '$.messageId') = ?
+      ORDER BY event_id LIMIT 1`,
+    [row.run_id, row.message_id],
+  );
+  if (named) {
+    return { eventId: named.event_id, waitEpisode: named.kind === "AGENT_WAIT_DEADLINE" && typeof named.episode === "number" ? named.episode : null };
+  }
+  if (request.notification !== NotificationKind.READY_FOR_CEO_REVIEW || request.candidateSnapshotDigest === undefined) return null;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(row.payload_json);
+  } catch {
+    return null;
+  }
+  if (!isRecord(payload) || typeof payload["goal"] !== "string") return null;
+  const packet = db.get<{ event_id: number }>(
+    `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CEO_NOTIFICATION'
+       AND json_extract(evidence_json, '$.messageId') IS NULL AND json_extract(evidence_json, '$.notification') = ?
+       AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ? AND json_extract(evidence_json, '$.goal') = ?
+       AND json_extract(evidence_json, '$.humanGate') IS json(?)
+     ORDER BY event_id LIMIT 1`,
+    [row.run_id, NotificationKind.READY_FOR_CEO_REVIEW, request.candidateSnapshotDigest, payload["goal"],
+      payload["humanGate"] === undefined ? null : JSON.stringify(payload["humanGate"])],
+  );
+  return packet ? { eventId: packet.event_id, waitEpisode: null } : null;
+};
+
+/**
+ * The audit event the notice's exact request opened with, as it stood when the notice was written, so what concluded it
+ * is ordered after it by durable event order, never by wall-clock time and never against a request opened after the
+ * notice: its escalation (the CTO_ESCALATION event), its incident's opening (`incidentOpenedEventId`), the wait a
+ * deadline-step notice names, or the RUN_TRANSITION that put its candidate up for review last before the notice was
+ * written (`noticeWrittenWith`; the same candidate up for review again later is a new request). Null for a notice whose
+ * request none of them tells: nothing here settles it.
  */
 const requestOpenedEventId = (db: Pick<Db, "get">, row: NoticeRow, request: NoticeRequest, incident: Incident | null): number | null => {
   const runId = row.run_id;
   if (runId === null) return null;
   if (request.escalationId !== undefined) return request.escalationId;
   if (incident !== null) return incident.subject === runId ? incidentOpenedEventId(db, { ...incident, runId }) : null;
-  if (request.notification === NotificationKind.READY_FOR_CEO_REVIEW && request.candidateSnapshotDigest !== undefined) {
-    return db.get<{ event_id: number }>(
-      `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'RUN_TRANSITION'
-         AND json_extract(evidence_json, '$.to') = ? AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?
-       ORDER BY event_id DESC LIMIT 1`,
-      [runId, RunState.READY_FOR_CEO_REVIEW, request.candidateSnapshotDigest],
-    )?.event_id ?? null;
-  }
-  const wait = db.get<{ episode: unknown }>(
-    `SELECT json_extract(evidence_json, '$.episode') AS episode FROM audit_events
-      WHERE run_id = ? AND kind = 'AGENT_WAIT_DEADLINE' AND json_extract(evidence_json, '$.messageId') = ?
-      ORDER BY event_id LIMIT 1`,
-    [runId, row.message_id],
-  );
-  return typeof wait?.episode === "number" ? wait.episode : null;
+  const written = noticeWrittenWith(db, row, request);
+  if (written === null) return null;
+  if (written.waitEpisode !== null) return written.waitEpisode;
+  if (request.notification !== NotificationKind.READY_FOR_CEO_REVIEW || request.candidateSnapshotDigest === undefined) return null;
+  return db.get<{ event_id: number }>(
+    `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'RUN_TRANSITION' AND event_id <= ?
+       AND json_extract(evidence_json, '$.to') = ? AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?
+     ORDER BY event_id DESC LIMIT 1`,
+    [runId, written.eventId, RunState.READY_FOR_CEO_REVIEW, request.candidateSnapshotDigest],
+  )?.event_id ?? null;
 };
 
 /**
