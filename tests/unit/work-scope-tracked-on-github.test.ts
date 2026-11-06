@@ -1828,34 +1828,57 @@ describe("#1364 — a work-scope issue create's original outcome is kept apart f
     expect(createdFor(g, intentOf(g))).toEqual([]);
   });
 
-  it("review: the CEO's escalation_resolve of the escalation naming the intent ends the wait on a BLOCKED run; another escalation's does not", async () => {
+  it("review R2: an escalation_resolve, even of the escalation naming the intent, ends no wait; the CEO's cancel of the BLOCKED run does", async () => {
     const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
     const [impl] = g.taskIds as [string];
     g.github.fault = { suffix: "/issues", when: "late" };
     await planSubmit(g, [feedUnit(impl)]);
     const intent = intentOf(g);
     const ceo = g.h.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId;
-    const escalateAndResolve = async (question: string, key: string): Promise<number> => {
+    const escalate = async (key: string): Promise<number> => {
       const opened = await callCtoTool(g.h, g.owner, "escalation_open", {
-        idempotencyKey: `open-${key}`, runId: g.runId, question, options: ["adopt an existing issue"], ctoRecommendation: "adopt an existing issue", whyItMatters: "the unit cannot be linked", blocksCriticalPath: true,
+        idempotencyKey: `open-${key}`, runId: g.runId, question: `the issue create ${intent} has an unknown outcome; how does the run proceed?`,
+        options: ["keep waiting", "cancel"], ctoRecommendation: "cancel", whyItMatters: "the unit cannot be linked", blocksCriticalPath: true,
       });
       expect(opened["ok"], key).toBe(true);
       expect(g.h.cp.runs.require(g.runId).state, key).toBe("BLOCKED");
-      const escalationId = (opened["value"] as { escalationId: number }).escalationId;
-      expect(g.h.cp.ceo.resolveEscalation(g.runId, "adopt an existing issue by number", ceo, { escalationId, idempotencyKey: `resolve-${key}` }).allowed, key).toBe(true);
-      return escalationId;
+      return (opened["value"] as { escalationId: number }).escalationId;
     };
-    // A resolution of an escalation about something else ends nothing.
-    await escalateAndResolve("which milestone does the next unit go in?", "other");
-    expect(unresolvedOf(tracking(await planSubmit(g, [feedUnit(impl)], undefined, "after another escalation"))).map((u) => [u.retryable, u.dispositions])).toEqual([[true, undefined]]);
-    // The escalation about this unresolved create, resolved by the CEO: the wait ends; the outcome stays UNKNOWN.
-    const escalationId = await escalateAndResolve(`the issue create ${intent} has an unknown outcome; how does the run proceed?`, "this");
-    const ended = unresolvedOf(tracking(await planSubmit(g, [feedUnit(impl)], undefined, "after the CEO")));
-    expect(ended.map((u) => [u.unit, u.intents, u.originalOutcome, u.retryable])).toEqual([["feed", [intent], "UNKNOWN", false]]);
-    expect(ended[0]!.dispositions).toEqual([{ intent, disposition: "ENDED_BY_CEO", answeredBy: "ESCALATION_RESOLVE", escalationId, decisionEventId: expect.any(Number) }]);
+    // The CEO answers the escalation naming the intent with "keep waiting": the wait goes on.
+    expect(g.h.cp.ceo.resolveEscalation(g.runId, "keep waiting for GitHub", ceo, { escalationId: await escalate("first"), idempotencyKey: "resolve" }).allowed).toBe(true);
+    const waiting = unresolvedOf(tracking(await planSubmit(g, [feedUnit(impl)], undefined, "after keep waiting")));
+    expect(waiting.map((u) => [u.unit, u.originalOutcome, u.retryable, u.dispositions])).toEqual([["feed", "UNKNOWN", true, undefined]]);
+    expect(waiting[0]!.correction).toMatch(/escalate \(escalation_open\): the CEO may cancel the run/);
+    // Escalated again and held BLOCKED, the run is cancelled by the CEO (run_cancel): the wait ends with it.
+    await escalate("second");
+    expect(g.h.cp.runs.cancel(g.runId, "CEO: cancel the run").allowed).toBe(true);
+    expect((await g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl)).allowed).toBe(false);
     expect(g.github.posts("/issues")).toHaveLength(1);
     expect(retiredRows(g)).toEqual([]);
     expect(createdFor(g, intent)).toEqual([]);
+  });
+
+  it("review R2: an admission whose token read awaits GitHub is decided on the scope as it stands after the read", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/issues", when: "late" };
+    await planSubmit(g, [feedUnit(impl)]);
+    expect(tracking(await planSubmit(g, [feedUnit(impl, { number: 3 })], undefined, "adopted"))).toMatchObject({ tracked: true });
+    // The admission's token read waits on GitHub; meanwhile a replacement PLAN links the unit to #99, which does not exist.
+    const hold = g.github.holdNext(`${ROOT}/issues`);
+    const admission = provision(g, impl);
+    await vi.waitFor(() => expect(hold.reached()).toBe(true));
+    const plan = g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!.digest;
+    const replacing = planSubmit(g, [feedUnit(impl, { number: 99 })], undefined, "relinked");
+    await vi.waitFor(() => expect(g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!.digest).not.toBe(plan));
+    expect(g.h.cp.tasks.workScope!.assertTracked(g.runId, impl).allowed).toBe(false);
+    hold.release();
+    // Refused at the work-scope check, before staffing (this harness staffs no worker provider) or any binding.
+    const admitted = await admission;
+    expect(admitted["reasonCode"]).toBe(REFUSED);
+    expect(unmetOf(admitted["evidence"]).map((u) => [u.unit, u.unmet, u.issues])).toEqual([["feed", "ISSUE_NOT_FOUND", [99]]]);
+    expect(g.h.cp.bindings.active(roleKeyFor(Role.WORKER, { taskId: impl }))).toBeNull();
+    expect(unmetOf(tracking(await replacing)).map((u) => u.unmet)).toEqual(["ISSUE_NOT_FOUND"]);
   });
 
   it("the CEO's FINAL_REVISE answering an escalation ends the wait: no longer retryable, the outcome stays UNKNOWN, nothing is sent again", async () => {
@@ -1883,7 +1906,7 @@ describe("#1364 — a work-scope issue create's original outcome is kept apart f
     expect(h.cp.ceo.submitCeoDecision({ runId: driven.runId, decision: "FINAL_REVISE", candidateSnapshotDigest: driven.candidateSnapshotDigest, ceoSessionId: ceo.sessionId, rationale: "adopt an existing issue for the unit" }).allowed).toBe(true);
     const ended = unresolvedOf(tracking(await submit("after the CEO")));
     expect(ended.map((u) => [u.unit, u.intents, u.originalOutcome, u.retryable])).toEqual([["feed", [intent], "UNKNOWN", false]]);
-    expect(ended[0]!.dispositions).toEqual([{ intent, disposition: "ENDED_BY_CEO", answeredBy: "FINAL_REVISE", escalationId: expect.any(Number), decisionEventId: expect.any(Number) }]);
+    expect(ended[0]!.dispositions).toEqual([{ intent, disposition: "ENDED_BY_CEO", escalationId: expect.any(Number), decisionEventId: expect.any(Number) }]);
     expect(ended[0]!.correction).toMatch(/CEO ended the wait/);
     expect(github.posts("/issues")).toHaveLength(1);
     expect(retiredRows(g)).toEqual([]);
@@ -1900,6 +1923,7 @@ describe("#1364 — a work-scope issue create's original outcome is kept apart f
       idempotencyKey: "escalate", runId: g.runId, question: `the issue create ${intent} has an unknown outcome`, options: ["cancel"], ctoRecommendation: "cancel", whyItMatters: "the unit cannot be linked", blocksCriticalPath: true,
     });
     expect(opened["ok"]).toBe(true);
+    expect(g.h.cp.runs.require(g.runId).state).toBe("BLOCKED");
     expect(g.h.cp.runs.cancel(g.runId, "CEO: cancel the run").allowed).toBe(true);
     expect((await g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl)).allowed).toBe(false);
     expect(g.github.posts("/issues")).toHaveLength(1);

@@ -74,10 +74,10 @@ export const WORK_SCOPE_GITHUB_CREATED = "WORK_SCOPE_GITHUB_CREATED";
  *     `disposition`), with the deciding owner, the issue and what the readback showed. Nothing is created or
  *     sent again; a supersede of the adopted tasks is no longer refused. A later token match is still recorded
  *     as CREATED, flagged `possibleDuplicateOf` when it is not the adopted issue.
- *   - ENDED_BY_CEO: an escalation opened after the intent, answered by the CEO's FINAL_REVISE, or by the CEO's
- *     `escalation_resolve` of that escalation when it names the intent. Read from those records: the wait ends
- *     (no longer retryable), and nothing else changes. A cancel ends it with the run: its tasks are cancelled,
- *     so no unit waits and nothing is sent.
+ *   - ENDED_BY_CEO: an escalation opened after the intent and the CEO's FINAL_REVISE after it, for a run that
+ *     reaches review. Read from those records: the wait ends (no longer retryable), and nothing else changes. A
+ *     run held BLOCKED on it is ended by the CEO's cancel: its tasks are cancelled, so no unit waits and nothing
+ *     is sent. An escalation_resolve ends nothing; its answer is free text.
  *   While any intent is UNKNOWN, every ensure reads its token, so a late result is recorded without a pending unit.
  */
 export const WORK_SCOPE_GITHUB_CREATING = "WORK_SCOPE_GITHUB_CREATING";
@@ -149,11 +149,8 @@ export interface UnmetWork {
   correction: string;
 }
 
-/**
- * #1364 — the CEO's end of the wait on an intent: an escalation opened after it, answered by the CEO's FINAL_REVISE
- * of the run, or by the CEO's `escalation_resolve` of that very escalation when it names the intent.
- */
-interface CeoEnd { intent: string; disposition: "ENDED_BY_CEO"; answeredBy: "FINAL_REVISE" | "ESCALATION_RESOLVE"; escalationId: number; decisionEventId: number }
+/** #1364 — the CEO's end of the wait on an intent: the escalation after it and the FINAL_REVISE after that. */
+interface CeoEnd { intent: string; disposition: "ENDED_BY_CEO"; escalationId: number; decisionEventId: number }
 
 /** What `declare` admitted of a PLAN, before it is stored. */
 export interface WorkScopeDeclaration {
@@ -459,19 +456,22 @@ export class WorkScopeTracking {
     const governed = this.#governed(runId);
     if (!governed.allowed || governed.value === null) return governed as Decision<null>;
     let status = this.#status(runId, governed.value);
+    if (taskId !== undefined && !status.unitOf.has(taskId)) return this.#refused(runId, governed.value, status, { taskId, correction: SHAPE });
+    // #1364 — with nothing to synchronize, a create whose outcome is unknown is read for its token first. The read
+    // awaits GitHub, so nothing read before it decides anything: the status is read again after it, and a scope
+    // that changed meanwhile is checked, and synchronized, as it now stands.
+    if (!this.#synchronizes(status, taskId)) {
+      await this.#readLateCreates(runId, governed.value);
+      status = this.#status(runId, governed.value);
+    }
     if (taskId !== undefined) {
       const unit = status.unitOf.get(taskId);
       if (unit === undefined) return this.#refused(runId, governed.value, status, { taskId, correction: SHAPE });
       const tracked = status.tracked.get(unit.unit);
-      if (tracked !== undefined) {
-        await this.#readLateCreates(runId, governed.value);
-        return allow(ReasonCode.OK, tracked);
-      }
+      if (tracked !== undefined) return allow(ReasonCode.OK, tracked);
     }
     const pending = status.live.filter((unit) => !status.tracked.has(unit.unit));
-    const syncing = pending.length > 0 && status.scope !== null;
-    if (!syncing) await this.#readLateCreates(runId, governed.value);
-    const synced = syncing ? await this.#synchronize(runId, governed.value, status, pending) : {};
+    const synced = pending.length > 0 && status.scope !== null ? await this.#synchronize(runId, governed.value, status, pending) : {};
     status = this.#status(runId, governed.value);
     if (taskId !== undefined) {
       const tracked = status.tracked.get(status.unitOf.get(taskId)?.unit ?? "");
@@ -624,7 +624,7 @@ export class WorkScopeTracking {
                   ...(ended.length > 0 ? { dispositions: ended } : {}),
                   retryable: waiting,
                   correction: waiting
-                    ? `an earlier issue create for task ${taskId} (intent ${intent.intent}) has an unknown outcome and may still land; ACP links it when it appears, and creates nothing for that task until then. Retry later, adopt an existing issue by number, or escalate naming intent ${intent.intent}`
+                    ? `an earlier issue create for task ${taskId} (intent ${intent.intent}) has an unknown outcome and may still land; ACP links it when it appears, and creates nothing for that task until then. Retry later, adopt an existing issue by number, or escalate (escalation_open): the CEO may cancel the run`
                     : `the CEO ended the wait on the earlier issue create for task ${taskId} (intent ${intent.intent}); its outcome stays unknown and ACP sends nothing again for that task. Adopt an existing issue by number`,
                 });
                 continue;
@@ -716,6 +716,14 @@ export class WorkScopeTracking {
       });
     }
     return unmet.length > 0 ? { unmet } : {};
+  }
+
+  /** Whether an ensure (for `taskId`, or the whole scope) synchronizes: its unit, or some live unit, is not verified. */
+  #synchronizes(status: Status, taskId: string | undefined): boolean {
+    if (status.scope === null) return false;
+    const unit = taskId === undefined ? undefined : status.unitOf.get(taskId);
+    if (taskId !== undefined && (unit === undefined || status.tracked.has(unit.unit))) return false;
+    return status.live.some((live) => !status.tracked.has(live.unit));
   }
 
   /**
@@ -985,38 +993,25 @@ export class WorkScopeTracking {
   }
 
   /**
-   * #1364 — the intents among `intents` whose wait the CEO ended (ENDED_BY_CEO), at the CEO's first such answer:
-   *   - FINAL_REVISE: an escalation the run's owner opened after the intent, and a CEO FINAL_REVISE of the run
-   *     after that escalation;
-   *   - ESCALATION_RESOLVE: an escalation opened after the intent whose record names the intent, and the CEO's
-   *     `escalation_resolve` of exactly that escalation (its CEO_DECISION names it by event id; the door admits only
-   *     the current CEO, and only for the run's open escalation). A resolution of any other escalation is not one.
-   * Read only; it moves no outcome and opens no new create.
+   * #1364 — the intents among `intents` whose wait the CEO ended (ENDED_BY_CEO): an escalation the run's owner
+   * opened after the intent, and a CEO FINAL_REVISE of the run after that escalation. An `escalation_resolve` is not
+   * one: its answer is free text, which may say to keep waiting. A run held BLOCKED on an unresolved create is
+   * ended by the CEO's cancel. Read only; it moves no outcome and opens no new create.
    */
   #endedByCeo(runId: string, intents: readonly IssueIntent[]): CeoEnd[] {
     return intents.flatMap((intent) => {
-      const ends: CeoEnd[] = [];
       const escalation = this.ports.db.get<{ event_id: number }>(
         `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CTO_ESCALATION' AND event_id > ? ORDER BY event_id LIMIT 1`,
         [runId, intent.eventId],
       );
-      const revise = escalation === undefined ? undefined : this.ports.db.get<{ event_id: number }>(
+      const decision = escalation === undefined ? undefined : this.ports.db.get<{ event_id: number }>(
         `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CEO_DECISION' AND event_id > ?
            AND json_extract(evidence_json, '$.decision') = 'FINAL_REVISE' ORDER BY event_id LIMIT 1`,
         [runId, escalation.event_id],
       );
-      if (escalation !== undefined && revise !== undefined) ends.push({ intent: intent.intent, disposition: "ENDED_BY_CEO", answeredBy: "FINAL_REVISE", escalationId: escalation.event_id, decisionEventId: revise.event_id });
-      const resolved = this.ports.db.get<{ escalation_id: number; decision_id: number }>(
-        `SELECT e.event_id AS escalation_id, d.event_id AS decision_id
-           FROM audit_events e JOIN audit_events d
-             ON d.run_id = e.run_id AND d.kind = 'CEO_DECISION' AND d.event_id > e.event_id AND d.session_id IS NOT NULL
-            AND json_extract(d.evidence_json, '$.escalation') = 1 AND json_extract(d.evidence_json, '$.escalationId') = e.event_id
-          WHERE e.run_id = ? AND e.kind = 'CTO_ESCALATION' AND e.event_id > ? AND instr(e.evidence_json, ?) > 0
-          ORDER BY d.event_id LIMIT 1`,
-        [runId, intent.eventId, intent.intent],
-      );
-      if (resolved !== undefined) ends.push({ intent: intent.intent, disposition: "ENDED_BY_CEO", answeredBy: "ESCALATION_RESOLVE", escalationId: resolved.escalation_id, decisionEventId: resolved.decision_id });
-      return ends.sort((a, b) => a.decisionEventId - b.decisionEventId).slice(0, 1);
+      return escalation === undefined || decision === undefined
+        ? []
+        : [{ intent: intent.intent, disposition: "ENDED_BY_CEO" as const, escalationId: escalation.event_id, decisionEventId: decision.event_id }];
     });
   }
 
