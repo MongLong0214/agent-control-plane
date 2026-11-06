@@ -30,7 +30,7 @@ import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { BlindReviewGate } from "../review/blind-review.ts";
 import type { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import type { RunEngine } from "../run/run-engine.ts";
-import type { TaskGraph } from "../run/task-graph.ts";
+import { type TaskCorrectionInput, type TaskGraph, taskAcceptanceDigest } from "../run/task-graph.ts";
 import { TaskWriteTargets } from "../run/task-write-target.ts";
 import type { WorkScopeDeclaration } from "../run/work-scope-tracking.ts";
 import { WORKER_TURN_MAX_TIMEOUT_MS, type WorkerTurnRequest, type WorkerTurnRunner } from "../run/worker-turn.ts";
@@ -109,6 +109,8 @@ const standardWorkTasks = (source: CtoMcpSource, runId: string) => {
       category: task.category,
       state: task.state,
       spec: task.spec,
+      // #1368 — what a correction names to state it meets this task's acceptance (task_correction_register).
+      acceptanceDigest: taskAcceptanceDigest(task),
       dependsOn: task.dependsOn,
       worker: worker === null
         ? null
@@ -385,6 +387,8 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     },
     workerExecution: (executionId: string, runId: string) => source.workerTurns.describe(executionId, runId),
     executionIsRuntimeManaged: (executionId: string) => source.tasks.execution(executionId)?.runtimeManaged === true,
+    // #1368 — the run owner's registration of a SUCCEEDED correction for a FAILED task, checked and audited.
+    registerTaskCorrection: (input: TaskCorrectionInput) => source.tasks.registerCorrection(input),
     taskIsRuntimeManaged: (taskId: string) =>
       Boolean(source.db.get<{ n: number }>(
         `SELECT 1 AS n FROM task_executions WHERE task_id = ? AND runtime_managed = 1 LIMIT 1`,
@@ -871,6 +875,28 @@ const createCtoServerFromPort = (
       const fenced = owner(peer, args.runId);
       return fenced.allowed ? respond(port.workerExecution(args.executionId, args.runId)) : respond(fenced);
     }),
+  );
+  server.registerTool(
+    "task_correction_register",
+    {
+      description:
+        "Register that a SUCCEEDED correction task of a run you own replaces one FAILED task of the same run and work unit, and meets its acceptance: name the correction as taskId and, in corrects, the FAILED task's taskId and the acceptanceDigest contract_get answers for it. The correction's PLAN spec must name that task in correctionOf.taskId. " +
+        "Completeness then stops counting the FAILED task as unfinished; both tasks and their executions stay as they are, and result_submit still runs verification and blind review and the CEO still decides. " +
+        "Refused for a task correcting itself, a cycle, a task another correction already replaces, a correction already registered for another task, another run or work unit, an acceptance that does not match, a task that is not FAILED and a correction that is not SUCCEEDED. The same relation again is answered as registered, with no second record.",
+      inputSchema: {
+        ...mutation,
+        ...runIdentity,
+        taskId: z.string().min(1),
+        corrects: z.object({ taskId: z.string().min(1), acceptanceDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/) }).strict(),
+      },
+    },
+    async (args) => writeOwned("task_correction_register", args, (_peer, fenced) =>
+      respond(port.registerTaskCorrection({
+        runId: args.runId,
+        correctionTaskId: args.taskId,
+        corrects: args.corrects,
+        owner: { sessionId: fenced.sessionId, bindingGeneration: fenced.bindingGeneration },
+      }))),
   );
   server.registerTool(
     "result_submit",
