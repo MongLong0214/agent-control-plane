@@ -2036,6 +2036,20 @@ const EVERY_FIGURE = /(?<value>\d{1,3}(?:\.\d+)?)\s*%\s*(?<sense>used|remaining|
  */
 const WINDOW_SHAPED = /^.*[A-Za-z].*[:\u2014\u00B7-]\s*\d{1,4}(?:\.\d+)?\s*%/iu;
 
+/**
+ * The line `claude -p "/usage"` opens with when the account is on a subscription (or, the second
+ * form, running on its overage). On its own it is how the CLI answers when it could not get the
+ * plan's usage. Measured on claude 2.1.283 with `--debug-file`, 2026-11-06: with its last reading
+ * under a minute old the CLI printed it ("endpoint not asked"); at 156 s it requested its usage
+ * endpoint itself, printed the answer and stored it; at 66 s the request came back 200 with no
+ * usage fields, and the CLI printed its 66 s old reading instead. That fallback holds only while
+ * the reading is under an hour old. Past it the CLI prints this line and nothing else, which is
+ * what the isolated instance printed on 2026-11-05 with a five-day-old reading and no other Claude
+ * session on its HOME to keep one young. The Agent SDK documents the same state as
+ * `usage_report.rate_limits: null`, "when Claude Code couldn't get the plan's usage".
+ */
+const PLAN_POWERS_USAGE = /^You are currently using your (?:subscription|overages) to power your Claude Code usage\b/iu;
+
 /** The reset clause inside whatever trails the percentage. */
 const RESET_CLAUSE = /\bresets?\s+(?<reset>.+?)\s*$/iu;
 
@@ -2184,10 +2198,24 @@ export const parseNonInteractiveUsage = (
     });
   }
   if (buckets.length === 0) {
+    const linesRead = text.split("\n").filter(Boolean).length;
+    // Still a refusal, and still no reading: a plan whose usage the CLI could not get is not a plan
+    // with quota left. What changes is the sentence. The generic one also covers a trust warning
+    // and the cost summary a missing `USER` produces, and an operator cannot tell those from this
+    // one, which needs a fresh usage request from the CLI rather than a change to the host.
+    if (text.split("\n").some((line) => PLAN_POWERS_USAGE.test(line.trim()))) {
+      return {
+        ok: false,
+        error:
+          `non-interactive /usage stated a subscription but no quota window (${linesRead} line(s) read): ` +
+          "usage not available, because the CLI could not get the plan's usage and held no cached reading " +
+          "recent enough to print; this is no reading, not a spent quota",
+      };
+    }
     return {
       ok: false,
       error:
-        `non-interactive /usage stated no quota window (${text.split("\n").filter(Boolean).length} line(s) read); ` +
+        `non-interactive /usage stated no quota window (${linesRead} line(s) read); ` +
         "it was neither a usage report nor a recognised refusal",
     };
   }
