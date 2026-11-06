@@ -253,6 +253,8 @@ interface AuthoritySnapshot {
   ceoBinding: RoleBinding | null;
   planDigest: string;
   reviewDigest: string;
+  /** For an adopting run, what its adoption is asked against before every write; null otherwise. */
+  adoptionTarget: { manifest: ProjectManifest; repositoryIdentity: string } | null;
 }
 
 /**
@@ -712,6 +714,7 @@ export class RepoFactoryBootstrapRunner {
         ceoBinding,
         planDigest: planArtifact.digest,
         reviewDigest: reviewed.value.digest,
+        adoptionTarget: adoption ? { manifest: input.approvedManifest, repositoryIdentity: outputs.target.repositoryIdentity } : null,
       });
 
     // Production is still owed unless the application is WRITTEN. A new attempt starts only once every
@@ -1334,6 +1337,16 @@ export class RepoFactoryBootstrapRunner {
     }
     const pinned = this.assertOwnerPin(run);
     if (!pinned.allowed) return pinned;
+    // #1302 — an adopting run's whole adoption, as activation will ask it at registration (the pin above,
+    // the adopted CTO and the target), before every write: a refusal there is a refusal here first.
+    const adoption = this.adoptionOf(runId);
+    if (adoption) {
+      if (snapshot.adoptionTarget === null) {
+        return lost(ReasonCode.INTERNAL_ERROR, "ADOPTION_TARGET_UNKNOWN", "an adopting bootstrap's write was asked without its adoption target");
+      }
+      const adopted = this.adoptionTargetHolds(adoption, snapshot.adoptionTarget.manifest, snapshot.adoptionTarget.repositoryIdentity);
+      if (!adopted.allowed) return atStage(adopted, "precondition");
+    }
     const admitted = this.deps.ceo.assertCeoDecisionAdmissible({
       runId,
       decision: "CONFIRM",

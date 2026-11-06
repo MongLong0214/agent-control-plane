@@ -1682,6 +1682,12 @@ END;
 -- run's own owner session and
 -- generation, and the conversation session UUID and Buzz actor of the project's unrevoked entitlement.
 -- A record without all of that, or a WRITTEN application of a run created without it, moves nothing.
+-- #1302: the owner session and generation may also be where the official same-conversation restarts moved
+-- the pin: the run's own CANONICAL_LIVE_RUNS_TAKEN_OVER rows, of this project and the pin's PRIMARY_CTO role,
+-- one per generation from the record's to the pin's, each N to N + 1, each leaving the session the one before
+-- it reached (the first, the record's), in event order, the last reaching the pin's session. This is the
+-- chain's shape only; that each link is the adopted conversation's restart is the control plane's proof
+-- (carriedByTakeovers), asked before the first GitHub write. A takeover row alone moves nothing.
 CREATE TRIGGER IF NOT EXISTS projects_active_manifest_moves_by_grant
 BEFORE UPDATE OF active_manifest_digest ON projects
 WHEN NEW.active_manifest_digest IS NOT OLD.active_manifest_digest
@@ -1712,9 +1718,59 @@ WHEN NEW.active_manifest_digest IS NOT OLD.active_manifest_digest
            json_type(e.evidence_json, '$.adoptCanonicalCto') = 'object'
            AND json_extract(e.evidence_json, '$.adoptCanonicalCto.projectId') IS NEW.project_id
            AND json_type(e.evidence_json, '$.adoptCanonicalCto.sessionId') = 'text'
-           AND json_extract(e.evidence_json, '$.adoptCanonicalCto.sessionId') IS r.owner_session_id
            AND json_type(e.evidence_json, '$.adoptCanonicalCto.bindingGeneration') = 'integer'
-           AND json_extract(e.evidence_json, '$.adoptCanonicalCto.bindingGeneration') IS r.owner_binding_generation
+           AND ((json_extract(e.evidence_json, '$.adoptCanonicalCto.sessionId') IS r.owner_session_id
+                 AND json_extract(e.evidence_json, '$.adoptCanonicalCto.bindingGeneration') IS r.owner_binding_generation)
+             OR (r.owner_role_key IS 'PRIMARY_CTO:' || NEW.project_id
+                 AND r.owner_binding_generation > json_extract(e.evidence_json, '$.adoptCanonicalCto.bindingGeneration')
+                 -- one link per generation between the record's and the pin's, the last leaving the pin's predecessor
+                 AND (SELECT COUNT(*) = r.owner_binding_generation - json_extract(e.evidence_json, '$.adoptCanonicalCto.bindingGeneration')
+                             AND MAX(json_extract(t.evidence_json, '$.fromGeneration')) = r.owner_binding_generation - 1
+                        FROM audit_events t
+                       WHERE t.run_id = b.run_id AND t.kind = 'CANONICAL_LIVE_RUNS_TAKEN_OVER'
+                         AND t.project_id IS NEW.project_id AND t.role_key IS r.owner_role_key
+                         AND CASE WHEN json_valid(t.evidence_json) THEN
+                               json_type(t.evidence_json, '$.fromGeneration') = 'integer'
+                               AND json_type(t.evidence_json, '$.toGeneration') = 'integer'
+                               AND json_type(t.evidence_json, '$.fromSession') = 'text'
+                               AND json_type(t.evidence_json, '$.toSessionId') = 'text'
+                               AND json_extract(t.evidence_json, '$.toSessionId') IS t.session_id
+                               AND json_extract(t.evidence_json, '$.fromGeneration') >= json_extract(e.evidence_json, '$.adoptCanonicalCto.bindingGeneration')
+                               AND json_extract(t.evidence_json, '$.fromGeneration') < r.owner_binding_generation
+                             ELSE 0 END)
+                 -- and no link out of shape: N to N + 1, from the record's session, to the pin's, after the link before it
+                 AND NOT EXISTS (
+                   SELECT 1 FROM audit_events t
+                    WHERE t.run_id = b.run_id AND t.kind = 'CANONICAL_LIVE_RUNS_TAKEN_OVER'
+                      AND t.project_id IS NEW.project_id AND t.role_key IS r.owner_role_key
+                      AND CASE WHEN json_valid(t.evidence_json) THEN
+                            json_type(t.evidence_json, '$.fromGeneration') = 'integer'
+                            AND json_type(t.evidence_json, '$.toGeneration') = 'integer'
+                            AND json_type(t.evidence_json, '$.fromSession') = 'text'
+                            AND json_type(t.evidence_json, '$.toSessionId') = 'text'
+                            AND json_extract(t.evidence_json, '$.toSessionId') IS t.session_id
+                            AND json_extract(t.evidence_json, '$.fromGeneration') >= json_extract(e.evidence_json, '$.adoptCanonicalCto.bindingGeneration')
+                            AND json_extract(t.evidence_json, '$.fromGeneration') < r.owner_binding_generation
+                            AND (json_extract(t.evidence_json, '$.toGeneration') IS NOT json_extract(t.evidence_json, '$.fromGeneration') + 1
+                              OR (json_extract(t.evidence_json, '$.fromGeneration') = json_extract(e.evidence_json, '$.adoptCanonicalCto.bindingGeneration')
+                                  AND json_extract(t.evidence_json, '$.fromSession') IS NOT json_extract(e.evidence_json, '$.adoptCanonicalCto.sessionId'))
+                              OR (json_extract(t.evidence_json, '$.fromGeneration') = r.owner_binding_generation - 1
+                                  AND t.session_id IS NOT r.owner_session_id)
+                              OR (json_extract(t.evidence_json, '$.fromGeneration') > json_extract(e.evidence_json, '$.adoptCanonicalCto.bindingGeneration')
+                                  AND NOT EXISTS (
+                                    SELECT 1 FROM audit_events p
+                                     WHERE p.run_id = t.run_id AND p.kind = t.kind AND p.project_id IS t.project_id
+                                       AND p.role_key IS t.role_key AND p.event_id < t.event_id
+                                       AND CASE WHEN json_valid(p.evidence_json) THEN
+                                             json_type(p.evidence_json, '$.fromGeneration') = 'integer'
+                                             AND json_type(p.evidence_json, '$.toGeneration') = 'integer'
+                                             AND json_type(p.evidence_json, '$.fromSession') = 'text'
+                                             AND json_type(p.evidence_json, '$.toSessionId') = 'text'
+                                             AND json_extract(p.evidence_json, '$.toSessionId') IS p.session_id
+                                             AND json_extract(p.evidence_json, '$.fromGeneration') = json_extract(t.evidence_json, '$.fromGeneration') - 1
+                                             AND json_extract(p.evidence_json, '$.toSessionId') IS json_extract(t.evidence_json, '$.fromSession')
+                                           ELSE 0 END)))
+                          ELSE 0 END)))
            AND json_type(e.evidence_json, '$.adoptCanonicalCto.entitlementSessionUuid') = 'text'
            AND json_extract(e.evidence_json, '$.adoptCanonicalCto.entitlementSessionUuid') IS c.session_uuid
            AND json_type(e.evidence_json, '$.adoptCanonicalCto.buzzActorId') = 'text'

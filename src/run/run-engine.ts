@@ -189,12 +189,15 @@ export interface BootstrapCtoProvisioner {
  * answers the record ACP stores for it (the entitlement read here, never the requester's); `admit`
  * validates the recorded adoption at dispatch, its process
  * included, and answers the binding in owner-pin form; `stillHeld` asks again, without a process probe,
- * inside the dispatch transaction that pins it.
+ * inside the dispatch transaction that pins it. `recorded` is the run's adoption where the official
+ * takeovers of its pin carried it (#1302), and `pinHolds` the one owner-pin judgement of an adopting run.
  */
 export interface BootstrapAdoptionPort {
   admitAtCreation(adoption: CanonicalCtoBootstrapAdoption): Decision<RecordedBootstrapAdoption>;
   admit(adoption: RecordedBootstrapAdoption): Decision<RoleBinding>;
   stillHeld(adoption: RecordedBootstrapAdoption, admitted: RoleBinding): Decision<RoleBinding>;
+  recorded(runId: string): RecordedBootstrapAdoption | null;
+  pinHolds(run: RunRow, adoption: CanonicalCtoBootstrapAdoption): Decision<RoleBinding>;
 }
 
 /**
@@ -665,7 +668,9 @@ export class RunEngine {
     let binding: RoleBinding | null = null;
     // A bootstrap created with the explicit adoption input is owned by exactly that canonical CTO,
     // validated again now: no BOOTSTRAP_CTO is staffed for it, and a refusal never falls back to one.
-    const adoption = !run.projectId && run.kind === RunKind.PROJECT_BOOTSTRAP ? recordedBootstrapAdoption(this.db, runId) : null;
+    // The adoption is the validator's reading, carried along the official takeovers of the run's pin.
+    const recorded = !run.projectId && run.kind === RunKind.PROJECT_BOOTSTRAP ? recordedBootstrapAdoption(this.db, runId) : null;
+    const adoption = recorded && (this.#bootstrapAdoption?.recorded(runId) ?? recorded);
     // Issue #246 — a project-less PROJECT_BOOTSTRAP run's owner is the BOOTSTRAP_CTO this dispatch
     // staffs: a live binding a re-dispatch reuses, or a fresh one. Refusals that need no provider
     // (an earlier holder, a foreign pin) come before capacity, as a pinned owner's do.
@@ -1023,24 +1028,16 @@ export class RunEngine {
 
   /**
    * The owner of a bootstrap created with the adoption input: the adopted canonical CTO's binding,
-   * validated now. A re-dispatch keeps that owner, so a pin, once set, must still name it exactly.
+   * validated now. A re-dispatch keeps that owner, so a pin, once set, must still be the adoption's,
+   * by the validator's own owner-pin judgement (moved only by the official takeovers, #1302).
    */
   private admitAdoptedOwner(run: RunRow, adoption: RecordedBootstrapAdoption): Decision<RoleBinding> {
     if (!this.#bootstrapAdoption) {
       return deny(ReasonCode.INTERNAL_ERROR, "no canonical CTO adoption validator is attached", { runId: run.runId, refusal: "ADOPTION_UNAVAILABLE" });
     }
-    const pinned = run.ownerRoleKey !== null || run.ownerSessionId !== null;
-    if (
-      pinned &&
-      (run.ownerRoleKey !== roleKeyFor(Role.PRIMARY_CTO, { projectId: adoption.projectId }) ||
-        run.ownerSessionId !== adoption.sessionId ||
-        run.ownerBindingGeneration !== adoption.bindingGeneration)
-    ) {
-      return deny(ReasonCode.RUN_OWNER_REVOKED, "the run's owner pin is not its adopted canonical CTO", {
-        runId: run.runId,
-        refusal: "ADOPTION_OWNER_NOT_PINNED",
-        ownerRoleKey: run.ownerRoleKey,
-      });
+    if (run.ownerRoleKey !== null || run.ownerSessionId !== null) {
+      const pinned = this.#bootstrapAdoption.pinHolds(run, adoption);
+      if (!pinned.allowed) return pinned;
     }
     return this.#bootstrapAdoption.admit(adoption);
   }

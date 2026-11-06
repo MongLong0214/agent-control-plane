@@ -235,4 +235,102 @@ describe("#1234 v56 — an adopting bootstrap's first manifest, and nothing else
       w.close();
     }
   });
+
+  describe("#1302 — the owner pin may be where the run's own takeover rows carried it, in shape, and nowhere else", () => {
+    interface LinkOptions { toGeneration?: number; runId?: string; projectId?: string; roleKey?: string; sessionId?: string; evidence?: string }
+    /** A CANONICAL_LIVE_RUNS_TAKEN_OVER row of `of`, shaped as the self-claim writes one; each part can be bent. */
+    const link = (w: ReturnType<typeof world>, of: { runId: string; projectId: string }, from: number, fromSession: string, toSession: string, options: LinkOptions = {}) => {
+      w.raw.prepare(`INSERT INTO audit_events (at, kind, run_id, project_id, session_id, role_key, evidence_json)
+        VALUES (?, 'CANONICAL_LIVE_RUNS_TAKEN_OVER', ?, ?, ?, ?, ?)`).run(
+        AT, options.runId ?? of.runId, options.projectId ?? of.projectId, options.sessionId ?? toSession, options.roleKey ?? `PRIMARY_CTO:${of.projectId}`,
+        options.evidence ?? JSON.stringify({ fromGeneration: from, toGeneration: options.toGeneration ?? from + 1, fromSession, toSessionId: toSession }),
+      );
+    };
+    /** A run whose pin is `owner`, adopted at generation 1 by the seeded session, with `links` written after it. */
+    const pinnedAt = (w: ReturnType<typeof world>, owner: { sessionId: string; generation: number }, links: (seeded: { runId: string; projectId: string; sessionId: string }) => void = () => {}) => {
+      if (owner.sessionId !== w.peek().sessionId) {
+        w.raw.prepare(`INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+          SELECT ?, 'inc', 'scripted', 'scripted', 'READY', ?, ? WHERE NOT EXISTS (SELECT 1 FROM sessions WHERE session_id = ?)`)
+          .run(owner.sessionId, AT, AT, owner.sessionId);
+      }
+      const seeded = w.seed({ owner });
+      links(seeded);
+      return seeded;
+    };
+
+    it("a direct UPDATE with a hand-moved pin, and no takeover rows, is aborted", () => {
+      const w = world();
+      try {
+        const sameSession = pinnedAt(w, { sessionId: w.peek().sessionId, generation: 2 });
+        expect(w.move(sameSession.projectId)).toThrow(DENIED);
+        const otherSession = pinnedAt(w, { sessionId: "ses-moved", generation: 2 });
+        expect(w.move(otherSession.projectId)).toThrow(DENIED);
+        w.control();
+      } finally {
+        w.close();
+      }
+    });
+
+    it("admits the pin a contiguous chain of the run's takeover rows reaches, through one restart or two", () => {
+      const w = world();
+      try {
+        const once = pinnedAt(w, { sessionId: "ses-b", generation: 2 }, (r) => link(w, r, 1, r.sessionId, "ses-b"));
+        expect(w.move(once.projectId)).not.toThrow();
+        const twice = pinnedAt(w, { sessionId: "ses-c", generation: 3 }, (r) => {
+          link(w, r, 1, r.sessionId, "ses-b");
+          link(w, r, 2, "ses-b", "ses-c");
+        });
+        expect(w.move(twice.projectId)).not.toThrow();
+        // A row of no link's shape (unreadable evidence) is not a link, and does not break the chain.
+        const noise = pinnedAt(w, { sessionId: "ses-b", generation: 2 }, (r) => {
+          link(w, r, 1, r.sessionId, "ses-b", { evidence: "not json" });
+          link(w, r, 1, r.sessionId, "ses-b");
+        });
+        expect(w.move(noise.projectId)).not.toThrow();
+      } finally {
+        w.close();
+      }
+    });
+
+    it("refuses every chain out of shape: a lone row, a gap, a skip, a broken hop, a wrong first or last session, a duplicate, the wrong order", () => {
+      const w = world();
+      try {
+        const cases: Array<[string, { sessionId: string; generation: number }, (r: { runId: string; projectId: string; sessionId: string }) => void]> = [
+          ["a row that does not reach the pin", { sessionId: "ses-c", generation: 2 }, (r) => link(w, r, 1, r.sessionId, "ses-b")],
+          ["a gap at the last generation", { sessionId: "ses-c", generation: 3 }, (r) => link(w, r, 1, r.sessionId, "ses-b")],
+          ["a gap at the first generation", { sessionId: "ses-c", generation: 3 }, (r) => link(w, r, 2, "ses-b", "ses-c")],
+          ["a row that skips a generation", { sessionId: "ses-c", generation: 3 }, (r) => link(w, r, 1, r.sessionId, "ses-c", { toGeneration: 3 })],
+          ["a hop that leaves another session than the last one reached", { sessionId: "ses-c", generation: 3 }, (r) => {
+            link(w, r, 1, r.sessionId, "ses-b");
+            link(w, r, 2, "ses-x", "ses-c");
+          }],
+          ["a first hop from another session than the record's", { sessionId: "ses-b", generation: 2 }, (r) => link(w, r, 1, "ses-x", "ses-b")],
+          ["two rows for one generation", { sessionId: "ses-b", generation: 2 }, (r) => {
+            link(w, r, 1, r.sessionId, "ses-b");
+            link(w, r, 1, r.sessionId, "ses-b");
+          }],
+          ["the links out of event order", { sessionId: "ses-c", generation: 3 }, (r) => {
+            link(w, r, 2, "ses-b", "ses-c");
+            link(w, r, 1, r.sessionId, "ses-b");
+          }],
+          ["a row whose to-session is not its own session", { sessionId: "ses-b", generation: 2 }, (r) => link(w, r, 1, r.sessionId, "ses-b", { sessionId: "ses-x" })],
+          ["another run's row", { sessionId: "ses-b", generation: 2 }, (r) => link(w, r, 1, r.sessionId, "ses-b", { runId: "run-elsewhere" })],
+          ["another project's row", { sessionId: "ses-b", generation: 2 }, (r) => link(w, r, 1, r.sessionId, "ses-b", { projectId: "project-elsewhere" })],
+          ["another role's row", { sessionId: "ses-b", generation: 2 }, (r) => link(w, r, 1, r.sessionId, "ses-b", { roleKey: "PRIMARY_CTO:project-elsewhere" })],
+          ["only an unreadable row", { sessionId: "ses-b", generation: 2 }, (r) => link(w, r, 1, r.sessionId, "ses-b", { evidence: "not json" })],
+        ];
+        for (const [name, owner, links] of cases) {
+          const refused = pinnedAt(w, owner, links);
+          expect(w.move(refused.projectId), name).toThrow(DENIED);
+        }
+        // A chain in shape under a pin that is not the project's PRIMARY_CTO.
+        const relabelled = pinnedAt(w, { sessionId: "ses-b", generation: 2 }, (r) => link(w, r, 1, r.sessionId, "ses-b"));
+        w.raw.prepare(`UPDATE runs SET owner_role_key = 'BOOTSTRAP_CTO:x' WHERE run_id = ?`).run(relabelled.runId);
+        expect(w.move(relabelled.projectId)).toThrow(DENIED);
+        w.control();
+      } finally {
+        w.close();
+      }
+    });
+  });
 });

@@ -6,7 +6,13 @@ import { probeSessionLiveness, type SessionLiveness } from "../daemon/dead-bindi
 import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import { Role, RunKind, type RoleBinding, type RunRow, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import { CanonicalSessionRegistry } from "../registry/canonical-session-registry.ts";
-import { type CanonicalAdoptableSession, isAdoptedCanonicalRuntime, SELF_CLAIM_EXECUTOR_KIND } from "../registry/canonical-self-claim.ts";
+import {
+  type CanonicalAdoptableSession,
+  isAdoptedCanonicalRuntime,
+  type PeerMessageSuccession,
+  peerMessageSuccessionIsProven,
+  SELF_CLAIM_EXECUTOR_KIND,
+} from "../registry/canonical-self-claim.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
@@ -45,6 +51,204 @@ const defaultLiveness = (session: SessionRecord): SessionLiveness | "EPERM" => {
   return liveness === "ALIVE" && refused ? "EPERM" : liveness;
 };
 
+/** Whether an authenticated canonical claim of `identity` admitted `sessionId` to `roleKey` at `generation`. */
+const selfClaimAdmitted = (db: Pick<Db, "get">, sessionId: string, roleKey: string, identity: string, generation: number): boolean =>
+  db.get(
+    `SELECT 1 FROM audit_events WHERE kind = 'CANONICAL_SELF_CLAIM_ADMITTED' AND session_id = ? AND role_key = ?
+        AND json_extract(evidence_json, '$.identity') = ? AND json_extract(evidence_json, '$.generation') = ? LIMIT 1`,
+    [sessionId, roleKey, identity, generation],
+  ) !== undefined;
+
+type OwnerPin = Pick<RunRow, "runId" | "ownerRoleKey" | "ownerSessionId" | "ownerBindingGeneration" | "ownerSessionIncarnation">;
+
+/**
+ * One CANONICAL_LIVE_RUNS_TAKEN_OVER row of a run that has a link's shape: integer generations, a from
+ * session, and a to session that is the row's own `session_id`. The rows the v56 manifest-pointer guard
+ * counts as links, read by its own predicate, so the chain this module walks is the chain it checks.
+ * The facts the link's proof reads are typed here and judged there.
+ */
+interface TakeoverLink {
+  event_id: number;
+  from_generation: number;
+  to_generation: number;
+  from_session: string;
+  to_session_id: string;
+  actor_id: unknown;
+  actor_type: string | null;
+  recovery_event_id: unknown;
+  recovery_type: string | null;
+  from_incarnation: unknown;
+  incarnation_type: string | null;
+}
+
+const takeoverLinks = (db: Pick<Db, "all">, runId: string, roleKey: string, projectId: string): TakeoverLink[] =>
+  db.all<TakeoverLink>(
+    `SELECT event_id,
+            json_extract(evidence_json, '$.fromGeneration') AS from_generation,
+            json_extract(evidence_json, '$.toGeneration') AS to_generation,
+            json_extract(evidence_json, '$.fromSession') AS from_session,
+            session_id AS to_session_id,
+            json_extract(evidence_json, '$.actorId') AS actor_id, json_type(evidence_json, '$.actorId') AS actor_type,
+            json_extract(evidence_json, '$.recoveryAuditEventId') AS recovery_event_id,
+            json_type(evidence_json, '$.recoveryAuditEventId') AS recovery_type,
+            json_extract(evidence_json, '$.sessionIncarnation') AS from_incarnation,
+            json_type(evidence_json, '$.sessionIncarnation') AS incarnation_type
+       FROM audit_events
+      WHERE run_id = ? AND kind = 'CANONICAL_LIVE_RUNS_TAKEN_OVER' AND project_id IS ? AND role_key IS ?
+        AND CASE WHEN json_valid(evidence_json) THEN
+              json_type(evidence_json, '$.fromGeneration') = 'integer'
+              AND json_type(evidence_json, '$.toGeneration') = 'integer'
+              AND json_type(evidence_json, '$.fromSession') = 'text'
+              AND json_type(evidence_json, '$.toSessionId') = 'text'
+              AND json_extract(evidence_json, '$.toSessionId') IS session_id
+            ELSE 0 END
+      ORDER BY event_id`,
+    [runId, projectId, roleKey],
+  );
+
+/**
+ * #1302 — where the official takeovers of `pin`'s run carried the adoption its RUN_CREATED recorded:
+ * `record` itself while the pin is still on it, or exactly the pin once every generation between the
+ * two was left by one same-conversation restart of the adopted CTO.
+ *
+ * The chain's shape is the one the v56 manifest-pointer guard checks, so this proof is never looser:
+ * the run's own takeover rows of this project and the pin's role (`takeoverLinks`), exactly one per
+ * generation from the record's to the pin's predecessor, each N to N + 1, each leaving the session the
+ * link before it reached (the first, the record's), after it in event order, the last reaching the pin's
+ * session. A row only names its link. Each link is proven on the facts the takeover itself was admitted
+ * on, re-read from the bindings, sessions and recovery row (same actor, the record's conversation and
+ * Buzz identity, N to N + 1, the predecessor recovered DEAD) by `peerMessageSuccessionIsProven`, the
+ * takeover's own judgement: the link onto the pin with its successor ACTIVE, an earlier one with its
+ * successor REVOKED by the later restart; and every generation it reaches was admitted by an
+ * authenticated claim of the record's conversation. A link missing, ambiguous, out of
+ * shape or unproven refuses by name; the run's ACTIVE owner is asked by the caller.
+ */
+const carriedByTakeovers = (
+  db: Pick<Db, "get" | "all">,
+  record: RecordedBootstrapAdoption,
+  pin: OwnerPin,
+): Decision<RecordedBootstrapAdoption> => {
+  const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: record.projectId });
+  const broken = (takeover: string, fromGeneration: number): Decision<RecordedBootstrapAdoption> =>
+    deny(ReasonCode.RUN_OWNER_NOT_PINNED, "the run's owner pin was not carried to its current binding by the adopted CTO's own restarts", {
+      takeover,
+      fromGeneration,
+    });
+  if (pin.ownerRoleKey !== roleKey || pin.ownerSessionId === null || pin.ownerBindingGeneration === null || pin.ownerSessionIncarnation === null) {
+    return broken("ADOPTION_TAKEOVER_PIN_FOREIGN", record.bindingGeneration);
+  }
+  if (pin.ownerSessionId === record.sessionId && pin.ownerBindingGeneration === record.bindingGeneration) return allow(ReasonCode.OK, record);
+  if (pin.ownerBindingGeneration <= record.bindingGeneration) return broken("ADOPTION_TAKEOVER_NOT_PROVEN", record.bindingGeneration);
+  const assignmentAt = (generation: number, sessionId: string) => {
+    const rows = db.all<{ assignment_id: string; session_incarnation: string }>(
+      `SELECT assignment_id, session_incarnation FROM assignments WHERE role_key = ? AND binding_generation = ? AND session_id = ?`,
+      [roleKey, generation, sessionId],
+    );
+    return rows.length === 1 ? rows[0]! : null;
+  };
+  const links = takeoverLinks(db, pin.runId, roleKey, record.projectId);
+  let at = { sessionId: record.sessionId, eventId: 0 };
+  for (let generation = record.bindingGeneration; generation < pin.ownerBindingGeneration; generation += 1) {
+    const candidates = links.filter((link) => link.from_generation === generation);
+    if (candidates.length === 0) return broken("ADOPTION_TAKEOVER_MISSING", generation);
+    if (candidates.length > 1) return broken("ADOPTION_TAKEOVER_AMBIGUOUS", generation);
+    const link = candidates[0]!;
+    const onPin = generation + 1 === pin.ownerBindingGeneration;
+    if (link.to_generation !== generation + 1 || link.from_session !== at.sessionId || link.event_id <= at.eventId ||
+      (onPin && link.to_session_id !== pin.ownerSessionId) ||
+      link.actor_type !== "text" || link.recovery_type !== "integer" || link.incarnation_type !== "text") {
+      return broken("ADOPTION_TAKEOVER_NOT_PROVEN", generation);
+    }
+    const prev = assignmentAt(generation, link.from_session);
+    const next = assignmentAt(generation + 1, link.to_session_id);
+    if (!prev || !next || (onPin && next.session_incarnation !== pin.ownerSessionIncarnation)) return broken("ADOPTION_TAKEOVER_NOT_PROVEN", generation);
+    const succession: Omit<PeerMessageSuccession, "proven"> = {
+      roleKey,
+      fromSessionId: link.from_session,
+      fromSessionIncarnation: link.from_incarnation as string,
+      fromGeneration: generation,
+      fromAssignmentId: prev.assignment_id,
+      toSessionId: link.to_session_id,
+      toSessionIncarnation: next.session_incarnation,
+      toGeneration: generation + 1,
+      toAssignmentId: next.assignment_id,
+      actorId: link.actor_id as string,
+      conversationUuid: record.entitlementSessionUuid,
+      buzzActorId: record.buzzActorId,
+      recoveryAuditEventId: link.recovery_event_id as number,
+    };
+    const proven = peerMessageSuccessionIsProven(db, succession, onPin ? "ACTIVE" : "REVOKED");
+    if (!proven || !selfClaimAdmitted(db, link.to_session_id, roleKey, record.entitlementSessionUuid, generation + 1)) {
+      return broken("ADOPTION_TAKEOVER_NOT_PROVEN", generation);
+    }
+    at = { sessionId: link.to_session_id, eventId: link.event_id };
+  }
+  return allow(ReasonCode.OK, { ...record, sessionId: pin.ownerSessionId, bindingGeneration: pin.ownerBindingGeneration });
+};
+
+/**
+ * The adoption `runId` was created with, at the session and generation the official takeovers of its
+ * owner pin carried it to (`carriedByTakeovers`): the record itself until a same-conversation restart
+ * moves the pin, and on any chain that does not prove the pin's move, so every door asked with it
+ * refuses. Null for a run created without the adoption. Every door reads the adoption through this.
+ */
+export const carriedBootstrapAdoption = (db: Pick<Db, "get" | "all">, runId: string): RecordedBootstrapAdoption | null => {
+  const record = recordedBootstrapAdoption(db, runId);
+  if (!record) return null;
+  const pin = db.get<{
+    owner_role_key: string | null; owner_session_id: string | null; owner_binding_generation: number | null; owner_session_incarnation: string | null;
+  }>(`SELECT owner_role_key, owner_session_id, owner_binding_generation, owner_session_incarnation FROM runs WHERE run_id = ?`, [runId]);
+  if (!pin || pin.owner_session_id === null) return record;
+  const carried = carriedByTakeovers(db, record, {
+    runId,
+    ownerRoleKey: pin.owner_role_key,
+    ownerSessionId: pin.owner_session_id,
+    ownerBindingGeneration: pin.owner_binding_generation,
+    ownerSessionIncarnation: pin.owner_session_incarnation,
+  });
+  return carried.allowed ? carried.value : record;
+};
+
+/**
+ * Whether `run` is pinned to exactly the adopted binding, and that binding is still the role's ACTIVE
+ * one at the adopted generation. The adopted binding is the one RUN_CREATED recorded or, once the
+ * official takeovers moved the pin, the one they carried it to (`carriedByTakeovers`); `adoption` is
+ * either. Synchronous and process-free, for the transactions and pre-write checkpoints that ask it
+ * again after an await, and the one owner-pin judgement of an adopting run: dispatch, PLAN staging, the
+ * Repo Factory runner and activation all ask this.
+ */
+export const adoptedOwnerPinHolds = (
+  deps: { db: Pick<Db, "get" | "all">; bindings: Pick<BindingRegistry, "active"> },
+  run: RunRow,
+  adoption: CanonicalCtoBootstrapAdoption,
+): Decision<RoleBinding> => {
+  const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: adoption.projectId });
+  const evidence = { runId: run.runId, projectId: adoption.projectId, sessionId: adoption.sessionId, bindingGeneration: adoption.bindingGeneration };
+  const record = recordedBootstrapAdoption(deps.db, run.runId);
+  const carried = record?.projectId === adoption.projectId ? carriedByTakeovers(deps.db, record, run) : null;
+  const asked = (held: CanonicalCtoBootstrapAdoption) => held.sessionId === adoption.sessionId && held.bindingGeneration === adoption.bindingGeneration;
+  // An allowed carry ends exactly on the run's pin, under this role.
+  if (!carried?.allowed || !(asked(record!) || asked(carried.value))) {
+    return refuse(ReasonCode.RUN_OWNER_NOT_PINNED, "ADOPTION_OWNER_NOT_PINNED", "the bootstrap run's owner is not pinned to its adopted canonical CTO", {
+      ...evidence,
+      ownerRoleKey: run.ownerRoleKey,
+      ...(carried && !carried.allowed ? carried.evidence : {}),
+    });
+  }
+  const active = deps.bindings.active(roleKey);
+  if (!active || active.status !== "ACTIVE" || active.boundSessionId !== run.ownerSessionId ||
+    active.boundSessionIncarnation !== run.ownerSessionIncarnation) {
+    return refuse(ReasonCode.RUN_OWNER_REVOKED, "ADOPTION_OWNER_NOT_ACTIVE", "the adopted canonical CTO is no longer the run's ACTIVE owner", evidence);
+  }
+  if (active.bindingGeneration !== run.ownerBindingGeneration) {
+    return refuse(ReasonCode.BINDING_GENERATION_STALE, "ADOPTION_OWNER_PIN_STALE", "the adopted canonical CTO's binding moved to another generation", {
+      ...evidence,
+      currentGeneration: active.bindingGeneration,
+    });
+  }
+  return allow(ReasonCode.OK, active);
+};
+
 export interface CanonicalCtoBootstrapAdoptionDeps {
   db: Pick<Db, "get" | "all">;
   bindings: Pick<BindingRegistry, "active" | "activePrimaryCtos">;
@@ -69,7 +273,8 @@ export interface CanonicalCtoBootstrapAdoptionDeps {
  *   - the session is READY, its recorded process is the one running, and its Buzz identity and room
  *     are the entry's;
  *   - for a recorded adoption, the entitlement is still the one the run was created on (its
- *     conversation's session UUID and its Buzz actor);
+ *     conversation's session UUID and its Buzz actor), and the session and generation are where the
+ *     official takeovers of the run's owner pin carried the recorded ones (`recorded`, #1302);
  *   - while the project's pointer is NULL, no CONTRACT_CHANGE run of it (necessarily a first
  *     activation) is open: that run moves the same NULL pointer under its own grant, and whichever
  *     moved second would be stranded.
@@ -79,8 +284,9 @@ export interface CanonicalCtoBootstrapAdoptionDeps {
 export class CanonicalCtoBootstrapAdoptions {
   constructor(private readonly deps: CanonicalCtoBootstrapAdoptionDeps) {}
 
+  /** `carriedBootstrapAdoption`: the run's recorded adoption, where the official takeovers carried it. */
   recorded(runId: string): RecordedBootstrapAdoption | null {
-    return recordedBootstrapAdoption(this.deps.db, runId);
+    return carriedBootstrapAdoption(this.deps.db, runId);
   }
 
   /**
@@ -177,12 +383,7 @@ export class CanonicalCtoBootstrapAdoptions {
     if (target?.target_locator !== entry.sessionUuid) {
       return refuse(ReasonCode.CONFLICT, "ADOPTION_CONVERSATION_NOT_ENTITLED", "the binding's conversation is not the canonical entry's", evidence);
     }
-    const admitted = this.deps.db.get(
-      `SELECT 1 FROM audit_events WHERE kind = 'CANONICAL_SELF_CLAIM_ADMITTED' AND session_id = ? AND role_key = ?
-          AND json_extract(evidence_json, '$.identity') = ? AND json_extract(evidence_json, '$.generation') = ? LIMIT 1`,
-      [sessionId, roleKey, entry.sessionUuid, bindingGeneration],
-    );
-    if (!admitted) {
+    if (!selfClaimAdmitted(this.deps.db, sessionId, roleKey, entry.sessionUuid, bindingGeneration)) {
       return refuse(ReasonCode.MCP_PEER_UNAUTHENTICATED, "ADOPTION_NOT_AUTHENTICATED", "no authenticated canonical claim admitted this binding", evidence);
     }
     const session = this.deps.sessions.get(sessionId);
@@ -239,32 +440,9 @@ export class CanonicalCtoBootstrapAdoptions {
     return allow(ReasonCode.OK, { ...active, sessionId: active.boundSessionId, sessionIncarnation: active.boundSessionIncarnation });
   }
 
-  /**
-   * Whether `run` is pinned to exactly the adopted binding, and that binding is still the role's ACTIVE
-   * one at the adopted generation. Synchronous and process-free, for the transactions and pre-write
-   * checkpoints that ask it again after an await.
-   */
+  /** `adoptedOwnerPinHolds`, on this validator's database and bindings. */
   pinHolds(run: RunRow, adoption: CanonicalCtoBootstrapAdoption): Decision<RoleBinding> {
-    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: adoption.projectId });
-    const evidence = { runId: run.runId, projectId: adoption.projectId, sessionId: adoption.sessionId, bindingGeneration: adoption.bindingGeneration };
-    if (run.ownerRoleKey !== roleKey || run.ownerSessionId !== adoption.sessionId || run.ownerBindingGeneration !== adoption.bindingGeneration) {
-      return refuse(ReasonCode.RUN_OWNER_NOT_PINNED, "ADOPTION_OWNER_NOT_PINNED", "the bootstrap run's owner is not pinned to its adopted canonical CTO", {
-        ...evidence,
-        ownerRoleKey: run.ownerRoleKey,
-      });
-    }
-    const active = this.deps.bindings.active(roleKey);
-    if (!active || active.status !== "ACTIVE" || active.boundSessionId !== run.ownerSessionId ||
-      active.boundSessionIncarnation !== run.ownerSessionIncarnation) {
-      return refuse(ReasonCode.RUN_OWNER_REVOKED, "ADOPTION_OWNER_NOT_ACTIVE", "the adopted canonical CTO is no longer the run's ACTIVE owner", evidence);
-    }
-    if (active.bindingGeneration !== run.ownerBindingGeneration) {
-      return refuse(ReasonCode.BINDING_GENERATION_STALE, "ADOPTION_OWNER_PIN_STALE", "the adopted canonical CTO's binding moved to another generation", {
-        ...evidence,
-        currentGeneration: active.bindingGeneration,
-      });
-    }
-    return allow(ReasonCode.OK, active);
+    return adoptedOwnerPinHolds(this.deps, run, adoption);
   }
 
   /**
