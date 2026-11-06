@@ -4718,8 +4718,9 @@ export class GitHubKernel {
     type Answer = { data?: { repository?: { pullRequest?: { closingIssuesReferences?: Page | null } | null } | null } | null; errors?: unknown } | null;
     const own = `${owner}/${repo}`.toLowerCase();
     const present = new Set<unknown>();
-    // Page by page (100 a page), until every linked issue is found or GitHub has no next page. Every linked issue
-    // found is complete evidence, whatever later pages hold; a cursor seen before (a cycle) refuses.
+    // Page by page (100 a page), until every linked issue is found or GitHub has no next page. Each page's
+    // continuation is checked before anything on it is accepted: a next page needs a string cursor not seen before
+    // (no cycle) and a page left within the bound. On a well-formed page, every linked issue found is proof.
     let after: string | null = null;
     const cursors = new Set<string>();
     for (let page = 0; page < CLOSING_REFERENCE_PAGE_BOUND; page += 1) {
@@ -4738,16 +4739,21 @@ export class GitHubKernel {
       if ((Array.isArray(answer?.errors) && answer.errors.length > 0) || !Array.isArray(nodes) || typeof next !== "boolean") {
         return refused({ cause: "GitHub's closing references answer is not readable" });
       }
+      let following: string | null = null;
+      if (next) {
+        const cursor: unknown = references?.pageInfo?.endCursor;
+        if (typeof cursor !== "string" || cursors.has(cursor)) return refused({ cause: "GitHub's closing references answer is not readable" });
+        if (page === CLOSING_REFERENCE_PAGE_BOUND - 1) return refused({ cause: "the closing references run past the pages read" });
+        following = cursor;
+      }
       for (const node of nodes as Array<{ number?: unknown; repository?: { nameWithOwner?: unknown } | null }>) {
         if (typeof node?.repository?.nameWithOwner === "string" && node.repository.nameWithOwner.toLowerCase() === own) present.add(node.number);
       }
       const missing = linkedIssues.filter((issue) => !present.has(issue));
       if (missing.length === 0) return allow(ReasonCode.OK, undefined);
-      if (!next) return refused({ missing });
-      const cursor: unknown = references?.pageInfo?.endCursor;
-      if (typeof cursor !== "string" || cursors.has(cursor)) return refused({ cause: "GitHub's closing references answer is not readable" });
-      cursors.add(cursor);
-      after = cursor;
+      if (following === null) return refused({ missing });
+      cursors.add(following);
+      after = following;
     }
     return refused({ cause: "the closing references run past the pages read" });
   }

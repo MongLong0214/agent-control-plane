@@ -349,13 +349,66 @@ describe("#1345: the finalization PR closes the issues the run tracks on its own
   });
 
   const ISSUES = Array.from({ length: 101 }, (_, index) => index + 1);
-  /** The PR prepared directly, after its branch is published, requiring linkage to issues #1–#101. */
-  const prepareLinked = async (fixture: Fixture) => {
+  /** The PR prepared directly, after its branch is published, requiring linkage to `issues` (#1–#101 by default). */
+  const prepareLinked = async (fixture: Fixture, issues: readonly number[] = ISSUES) => {
     const plan = fixture.plan();
     const published = await fixture.harness.cp.github.publishBranch(plan.publish);
     expect(published.allowed, JSON.stringify(published)).toBe(true);
-    return fixture.harness.cp.github.prPrepare({ ...plan.prepare, linkedIssues: ISSUES, requireLinkage: true });
+    return fixture.harness.cp.github.prPrepare({ ...plan.prepare, linkedIssues: issues, requireLinkage: true });
   };
+
+  /** GitHub's closing-references pages, scripted by the cursor each is asked for ("" for the first). */
+  const scriptPages = (fixture: Fixture, pages: Record<string, { issues: number[]; pageInfo: Record<string, unknown> }>): void => {
+    const { github } = fixture;
+    const request = github.request.bind(github);
+    github.request = async <T>(method: HttpMethod, path: string, body?: unknown): Promise<T> => {
+      if (method !== "POST" || path !== "/graphql") return request<T>(method, path, body);
+      const { owner, repo, after } = (body as { variables: { owner: string; repo: string; after: string | null } }).variables;
+      const page = pages[after ?? ""]!;
+      const nodes = page.issues.map((number) => ({ number, repository: { nameWithOwner: `${owner}/${repo}` } }));
+      return { data: { repository: { pullRequest: { closingIssuesReferences: { nodes, pageInfo: page.pageInfo } } } } } as T;
+    };
+  };
+  const graphqlReads = (fixture: Fixture): number => fixture.log.filter((call) => call.method === "POST" && call.path === "/graphql").length;
+
+  it("every linked issue found on a well-formed page that has a next page is accepted", async () => {
+    const fixture = await setup();
+    scriptPages(fixture, { "": { issues: [7], pageInfo: { hasNextPage: true, endCursor: "A" } } });
+    const prepared = await prepareLinked(fixture, [7]);
+    expect(prepared.allowed, JSON.stringify(prepared)).toBe(true);
+    expect(graphqlReads(fixture)).toBe(1);
+  });
+
+  it("#7 found on a page whose next page has no string cursor is refused", async () => {
+    const fixture = await setup();
+    scriptPages(fixture, { "": { issues: [7], pageInfo: { hasNextPage: true, endCursor: 42 } } });
+    const refused = await prepareLinked(fixture, [7]);
+    expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
+  });
+
+  it("an A→B→A cycle is refused even when the repeating page holds the last linked issue", async () => {
+    const fixture = await setup();
+    scriptPages(fixture, {
+      "": { issues: [1], pageInfo: { hasNextPage: true, endCursor: "A" } },
+      A: { issues: [2], pageInfo: { hasNextPage: true, endCursor: "B" } },
+      B: { issues: [3], pageInfo: { hasNextPage: true, endCursor: "A" } },
+    });
+    const refused = await prepareLinked(fixture, [1, 2, 3]);
+    expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
+    expect(graphqlReads(fixture)).toBe(3);
+  });
+
+  it("a 10th page that still has a next page is refused, though it holds the last linked issue", async () => {
+    const fixture = await setup();
+    const pages: Record<string, { issues: number[]; pageInfo: Record<string, unknown> }> = {};
+    for (let page = 0; page < 10; page += 1) {
+      pages[page === 0 ? "" : `c${page}`] = { issues: page === 9 ? [7] : [], pageInfo: { hasNextPage: true, endCursor: `c${page + 1}` } };
+    }
+    scriptPages(fixture, pages);
+    const refused = await prepareLinked(fixture, [7]);
+    expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
+    expect(graphqlReads(fixture)).toBe(10);
+  });
 
   it("101 linked issues are found across two pages of GitHub's closing references, and accepted", async () => {
     const fixture = await setup();
@@ -377,18 +430,14 @@ describe("#1345: the finalization PR closes the issues the run tracks on its own
 
   it("closing-reference cursors that cycle A→B→A with linked issues still missing are refused at the repeat", async () => {
     const fixture = await setup();
-    const { github } = fixture;
-    const request = github.request.bind(github);
-    const next: Record<string, string> = { "": "A", A: "B", B: "A" };
-    github.request = async <T>(method: HttpMethod, path: string, body?: unknown): Promise<T> => {
-      if (method !== "POST" || path !== "/graphql") return request<T>(method, path, body);
-      const after = (body as { variables: { after: string | null } }).variables.after ?? "";
-      const page = { nodes: [], pageInfo: { hasNextPage: true, endCursor: next[after] } };
-      return { data: { repository: { pullRequest: { closingIssuesReferences: page } } } } as T;
-    };
+    scriptPages(fixture, {
+      "": { issues: [], pageInfo: { hasNextPage: true, endCursor: "A" } },
+      A: { issues: [], pageInfo: { hasNextPage: true, endCursor: "B" } },
+      B: { issues: [], pageInfo: { hasNextPage: true, endCursor: "A" } },
+    });
     const refused = await prepareLinked(fixture);
     expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
-    expect(fixture.log.filter((call) => call.method === "POST" && call.path === "/graphql")).toHaveLength(3);
+    expect(graphqlReads(fixture)).toBe(3);
   });
 
   it("a GraphQL error reading the closing references is refused, never taken as linkage", async () => {
