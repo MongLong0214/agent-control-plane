@@ -124,6 +124,9 @@ const FREE_TEXT_FIELDS: Readonly<Record<EvidenceField["store"], readonly string[
 /** The writer `mcp/shared.ts` names when it checks a refusal a mutation handler threw before storing it. */
 export const MCP_THROWN_REFUSAL_WRITER = "MCP_THROWN_REFUSAL";
 
+/** #1347 — the writer review/standard-review-evidence.ts names when it scans the text of a review evidence bundle. */
+export const STANDARD_REVIEW_EVIDENCE_WRITER = "STANDARD_REVIEW_EVIDENCE";
+
 /**
  * #1279 G3-1 — writers whose fields are free text except the ones their schema types as an ACP digest or
  * id, by `<store>:<writer>`, each with those typed key paths (array positions left out). Only a typed
@@ -137,6 +140,8 @@ const FREE_TEXT_WRITERS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["artifact:TASK_CONTRACT", new Set<string>()],
   // A thrown refusal's message and evidence (mcp/shared.ts) type no field: a refusal names what it was handed.
   [`artifact:${MCP_THROWN_REFUSAL_WRITER}`, new Set<string>()],
+  // #1347 — a review evidence bundle's text (review/standard-review-evidence.ts) types no field: it is the CTO's.
+  [`artifact:${STANDARD_REVIEW_EVIDENCE_WRITER}`, new Set<string>()],
   // A PLAN (mcp/cto-server.ts submitPlan): the digests plan_submit checks or ACP computes and adds
   // (bootstrap/plan-input-schema.ts, bootstrap/bootstrap-plan.ts planForSubmission, the carried manifest
   // and genesis bundle, bootstrap/bootstrap-review-evidence.ts, bootstrap/bootstrap-ceo-decisions.ts).
@@ -163,6 +168,8 @@ const FREE_TEXT_WRITERS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["artifact:HANDOFF", new Set([
     "sha256", "replacesSha256", "contractDigest", "bootstrapPlanDigest", "candidateDigest", "bodyBase64",
     "candidateSnapshotDigest", "planDigest",
+    // #1347 — the project records ACP confirmed for a STANDARD review evidence bundle, and their digest.
+    "verifiedReferences.digest", "verifiedReferencesDigest",
     "context.deployment.runtimeSha256", "context.deployment.entrypointSha256", "context.deployment.lifecycleDigest",
     "context.originalRecords.bundleDigest", "context.originalRecords.source.bootstrapPlanDigest",
     "context.originalRecords.source.bundleSha256", "context.originalRecords.source.candidateDigest",
@@ -272,9 +279,13 @@ export interface WriteSite {
    * its own typed fields for that run and candidate (review/blind-review.ts reviewPacketDigests), never
    * from the prompt's text. At a free-text field, a digest named here skips the long-base64 shape as a
    * bound reference does (`isBoundRun`), and nothing else. The artifact store sets it only for the
-   * BLIND_REVIEW it is writing, for that review's run and candidate (db/artifacts.ts).
+   * BLIND_REVIEW it is writing, for that review's run and candidate (db/artifacts.ts). #1347 — the
+   * review evidence scan sets it to the digests ACP confirmed in the run's project's stored records
+   * (review/standard-review-evidence.ts), with `prefixedPacketDigestsOnly`.
    */
   readonly packetDigests?: ReadonlySet<string>;
+  /** #1347 — a `packetDigests` digest is exempt only as an exact `sha256:<64hex>` token, never as its bare hex. */
+  readonly prefixedPacketDigestsOnly?: boolean;
 }
 
 /** #1307 — what matched when a value is refused: the rule's id and the class of the match, never the value. */
@@ -386,15 +397,17 @@ const MARKED = /\uE000(\d+)\uE001/g;
  * digest or id in any text there skips the long-base64 shape only when it names a record the store
  * holds (`RegistryView.boundReference`), never for its shape alone (`isBoundRun`). Without such a site,
  * nothing does. #1307 — at a free-text field, so does a digest ACP computed for the packet of the review
- * being stored (`WriteSite.packetDigests`), prefixed or as its bare hex.
+ * being stored (`WriteSite.packetDigests`), prefixed or as its bare hex; #1347 — prefixed only, at a site
+ * that says so (`WriteSite.prefixedPacketDigestsOnly`).
  */
 const boundReferenceOf = (field: EvidenceField | undefined): BoundTest => {
   const registry = field?.site?.registry;
   const packet = isFreeText(field) ? field?.site?.packetDigests : undefined;
   if (registry?.boundReference === undefined && packet === undefined) return undefined;
   const runId = field?.site?.runId ?? null;
+  const bare = field?.site?.prefixedPacketDigestsOnly !== true;
   return (token) => registry?.boundReference?.(runId, token) === true ||
-    packet?.has(token.startsWith(DIGEST_PREFIX) ? token : `${DIGEST_PREFIX}${token}`) === true;
+    (token.startsWith(DIGEST_PREFIX) ? packet?.has(token) === true : bare && packet?.has(`${DIGEST_PREFIX}${token}`) === true);
 };
 
 const setAside = (text: string, tokens: RegExp | undefined): { text: string; tokens: string[] } => {
