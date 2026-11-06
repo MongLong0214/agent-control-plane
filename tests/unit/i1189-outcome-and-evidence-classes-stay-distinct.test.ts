@@ -13,7 +13,7 @@ import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import type { ProjectCi } from "../../src/registry/project-ci.ts";
 import type { InvocationRequest, InvocationResult } from "../../src/runtime/provider.ts";
-import { UNJUDGED_REVIEW_NEXT_STEPS, UNJUDGED_REVIEW_NOTICES } from "../../src/run/candidate-pipeline.ts";
+import { ATTEMPT_RELEASED_NOTICE, UNJUDGED_REVIEW_NEXT_STEPS, UNJUDGED_REVIEW_NOTICES } from "../../src/run/candidate-pipeline.ts";
 import { cleanupTempDirs, gitSync } from "../helpers/fixtures.ts";
 import {
   type Harness,
@@ -214,8 +214,12 @@ describe("#1189 §11: each outcome reaches its recipient as itself, with its own
       expect(told, JSON.stringify(told).slice(0, 800)).toHaveLength(1);
       expect(told[0]).toMatchObject({ notification: "CRITICAL_SYSTEM_FAILURE", stall: "candidate_pipeline_attempt", resource: interruptedAttempt,
         effects: "MAY_HAVE_RUN", checkBeforeRerun: true, productFailure: false });
-      // The CTO is sent nothing for it: no revision and no review-unavailable notice, and no unavailable review is recorded.
-      expect(await cto.revisions()).toEqual([]);
+      // #1344 C1 — the CTO is told only that the attempt was released: no revision and no review-unavailable notice,
+      // and no unavailable review is recorded.
+      const released = await cto.revisions();
+      expect(released.map((notice) => notice.payload)).toEqual([expect.objectContaining({
+        runId: run.runId, stage: "attempt-released", attemptId: interruptedAttempt, reason: "deadline", notice: ATTEMPT_RELEASED_NOTICE,
+      })]);
       expect(restarted.cp.audit.forRun(run.runId).filter((row) => row.kind === "BLIND_REVIEW_UNAVAILABLE")).toEqual([]);
 
       // A fresh submission whose review cannot be constituted: the CTO gets the answer and the fixed notice.
@@ -227,7 +231,7 @@ describe("#1189 §11: each outcome reaches its recipient as itself, with its own
       expect(value["reasonCode"]).not.toBe(ReasonCode.MCP_MUTATION_OUTCOME_UNKNOWN);
       const freshAttempt = attemptIds(restarted, run.runId).at(-1)!;
       expect(freshAttempt).not.toBe(interruptedAttempt);
-      const notices = await cto.revisions();
+      const notices = (await cto.revisions()).slice(released.length);
       expect(notices.map((notice) => notice.payload)).toEqual([{
         runId: run.runId, reasonCode: value["reasonCode"], stage: "review-unavailable", candidateSnapshotDigest: value["snapshotDigest"],
         attemptId: freshAttempt, notice: "REVIEW_UNAVAILABLE", unjudgedAttempts: 1, unjudgedAttemptLimit: 2, nextStep: "RESUBMIT",

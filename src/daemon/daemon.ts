@@ -61,6 +61,8 @@ import {
 } from "../doctor/doctor.ts";
 import { isProjectlessBootstrap } from "../bootstrap/bootstrap-plan.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
+import type { ReleasedPipelineAttempt } from "../doctor/watchdog.ts";
+import { reapOrphanedReviewerEgress } from "../runtime/reviewer-egress.ts";
 import { describeStartStall, type StartStall } from "./start-stall.ts";
 import { routeUnreleasedWorkerOrphans } from "../run/worker-orphan-routing.ts";
 import {
@@ -333,6 +335,8 @@ export interface ReconcileReport {
   orphanedExecutions: string[];
   sessionsMarkedError: string[];
   reclaimedFinalizationAttempts: ReclaimedFinalizationAttempt[];
+  /** #1344 — the candidate pipeline attempts an ended daemon left RUNNING, released by this reconcile. */
+  releasedCandidateAttempts: ReleasedPipelineAttempt[];
   resumedFinalizations: string[];
   doctorStatus: string;
   blockingFindings: BlockingFinding[];
@@ -459,6 +463,7 @@ const mergeReconciled = (earlier: ReconcileReport, later: ReconcileReport): Reco
     ...earlier.reclaimedFinalizationAttempts,
     ...later.reclaimedFinalizationAttempts,
   ],
+  releasedCandidateAttempts: [...earlier.releasedCandidateAttempts, ...later.releasedCandidateAttempts],
 });
 
 export const canParkForBootstrap = (blockingFindings: readonly BlockingFinding[]): boolean =>
@@ -1492,6 +1497,7 @@ export class Daemon {
       this.cp.outbox.startCeoNotificationAttemptJournal();
       this.installContinuityCoordinator();
       await this.refreshCapacitySensors();
+      await this.reapReviewerEgress();
       let report = await this.reconcile();
       this.writeHealth(report);
 
@@ -1756,11 +1762,39 @@ export class Daemon {
     }
   }
 
+  /**
+   * #1344 D — at start, before any review can start: the reviewer egress proxies an earlier instance of this daemon
+   * launched and left running hold the fixed port, so every later review would fail ISOLATION_LOST. Those exact
+   * recorded proxies are stopped (`reapOrphanedReviewerEgress`) and what was found is recorded; a holder of the port
+   * not proven to be one is left running, and is recorded as such. A failure is recorded and does not stop the start.
+   */
+  private async reapReviewerEgress(): Promise<void> {
+    try {
+      const reaped = await reapOrphanedReviewerEgress(this.cp.config.reviewerEgress);
+      if (reaped === null) return;
+      this.cp.audit.record({
+        kind: "REVIEWER_EGRESS_REAPED",
+        reasonCode: reaped.portFree ? ReasonCode.OK : ReasonCode.ISOLATION_LOST,
+        evidence: { ...reaped },
+      });
+    } catch (error) {
+      this.cp.audit.record({
+        kind: "REVIEWER_EGRESS_REAPED",
+        reasonCode: ReasonCode.ISOLATION_LOST,
+        evidence: { error: safeErrorMessage(error) },
+      });
+    }
+  }
+
   /** §34.5 — the documented restart sequence, in order. */
   async reconcile(): Promise<ReconcileReport> {
     const expiredClaims = this.cp.claims.expireOverdue();
     const expiredMessages = this.cp.outbox.expireOverdue();
     const reclaimedFinalizationAttempts = this.#finalizer.reclaimExpiredAttempts();
+    // #1344 — a candidate pipeline attempt runs in its daemon's process, so none survives a restart: one still RUNNING
+    // that this process does not run is released here, before an attempt can start, rather than holding its run until
+    // its deadline. Its evidence is kept, and its run's owner CTO and the CEO are told.
+    const releasedCandidateAttempts = this.cp.watchdog.releaseAttemptsOfEndedDaemons();
 
     const sessionsMarkedError = this.settleDeadSessions();
     await this.observeRepositories();
@@ -1810,6 +1844,7 @@ export class Daemon {
       orphanedExecutions,
       sessionsMarkedError,
       reclaimedFinalizationAttempts,
+      releasedCandidateAttempts,
       resumedFinalizations: [],
       doctorStatus: report.status,
       blockingFindings: blockingFindingsOf(report),

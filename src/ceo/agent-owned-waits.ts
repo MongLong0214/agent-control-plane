@@ -5,7 +5,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { OWNERLESS_STALL_OWED, OWNERLESS_STALL_ROUTED, type WatchdogStall } from "../doctor/watchdog.ts";
+import { AttemptReleaseReason, OWNERLESS_STALL_OWED, OWNERLESS_STALL_ROUTED, type WatchdogStall } from "../doctor/watchdog.ts";
 import { ArtifactKind, Role, RunState, roleKeyFor, type RoleBinding, type RunRow } from "../domain/types.ts";
 import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
@@ -205,6 +205,9 @@ const WATCHDOG_STALL_ROUTES: Readonly<Record<string, { recoveryAction: string; e
     recoveryAction: "retry the delivery (repair_execute retry_outbox, HERMES authority); a delivery timeout does not fail the run",
   },
 };
+
+/** #1344 — what an owed candidate pipeline attempt is when a restart's reconcile, not its deadline, released it. */
+const RESTART_RELEASED_ATTEMPT = "a candidate pipeline attempt released at a daemon restart, the daemon that ran it being gone";
 
 /**
  * The incident an ownerless stall is, in `ceo-incident-notices.ts`'s one correlation per (subject, class):
@@ -456,8 +459,11 @@ export class AgentOwnedWaits {
       routeOne(stall, `${count} ${WATCHDOG_STALL_ROUTES["outbox"]!.what} to ${role}; the oldest is ${stall.id}, since ${stall.since}`,
         this.#deliveryRecovery(group, stall.since));
     }
-    for (const { stall: owed } of owedStalls) {
-      routeOne(owed, `${WATCHDOG_STALL_ROUTES[owed.kind]?.what ?? owed.kind}: ${owed.kind} ${owed.id}, since ${owed.since}`);
+    for (const { stall: owed, reason } of owedStalls) {
+      const what = owed.kind === "candidate_pipeline_attempt" && reason === AttemptReleaseReason.DAEMON_RESTART
+        ? RESTART_RELEASED_ATTEMPT
+        : WATCHDOG_STALL_ROUTES[owed.kind]?.what ?? owed.kind;
+      routeOne(owed, `${what}: ${owed.kind} ${owed.id}, since ${owed.since}`);
     }
     return routed;
   }
@@ -467,7 +473,7 @@ export class AgentOwnedWaits {
    * A stall whose routed records name no episode was routed before episodes were recorded, and is answered, as
    * it was then.
    */
-  #owedStalls(): Array<{ stall: WatchdogStall; episode: string | null }> {
+  #owedStalls(): Array<{ stall: WatchdogStall; episode: string | null; reason: string | null }> {
     const sameStall = (alias: string): string => `${alias}.kind = '${OWNERLESS_STALL_ROUTED}'
       AND json_extract(${alias}.evidence_json, '$.kind') = json_extract(owed.evidence_json, '$.kind')
       AND json_extract(${alias}.evidence_json, '$.target') = json_extract(owed.evidence_json, '$.target')
@@ -489,7 +495,8 @@ export class AgentOwnedWaits {
       const [kind, id, since] = [evidence["kind"], evidence["target"], evidence["since"]];
       if (typeof kind !== "string" || typeof id !== "string" || typeof since !== "string") return [];
       if (row.routed === 1 && row.episode === null) return [];
-      return [{ stall: { kind, id, runId: row.run_id, since }, episode: row.episode }];
+      const reason = typeof evidence["reason"] === "string" ? evidence["reason"] : null;
+      return [{ stall: { kind, id, runId: row.run_id, since }, episode: row.episode, reason }];
     });
   }
 

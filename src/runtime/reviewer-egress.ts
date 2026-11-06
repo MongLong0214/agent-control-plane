@@ -1,17 +1,20 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import {
   accessSync,
   constants,
   existsSync,
   lstatSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:net";
 import { join } from "node:path";
 
 import { sha256 } from "../core/digest.ts";
+import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
 import { credentialBearingField } from "../db/audit.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import {
@@ -150,6 +153,18 @@ const configuredEndpoints = (config: ReviewerEgressConfig, provider: string): st
     fail("REVIEWER_EGRESS_PROVIDER_ENDPOINTS_INVALID", `provider '${provider}' has an invalid reviewer egress hostname`);
   }
   return endpoints as string[];
+};
+
+/** A lease's record: a private directory under the runtime directory, removed when the lease ends. */
+const LEASE_PREFIX = "reviewer-egress-";
+const leaseFiles = (leaseDirectory: string): { allowlistPath: string; logPath: string } => ({
+  allowlistPath: join(leaseDirectory, "allowlist.txt"),
+  logPath: join(leaseDirectory, "egress.jsonl"),
+});
+/** The proxy's arguments after its interpreter: the script, the port and the lease's own two files. */
+const proxyArguments = (proxyPath: string, port: number, leaseDirectory: string): string[] => {
+  const { allowlistPath, logPath } = leaseFiles(leaseDirectory);
+  return [proxyPath, String(port), allowlistPath, logPath];
 };
 
 let queuedLease: Promise<void> = Promise.resolve();
@@ -436,9 +451,8 @@ export const acquireReviewerEgress = async (
   let leaseDirectory: string | null = null;
   let proxy: ChildProcess | null = null;
   try {
-    leaseDirectory = mkdtempSync(join(effectiveConfig.runtimeDir, "reviewer-egress-"));
-    const allowlistPath = join(leaseDirectory, "allowlist.txt");
-    const logPath = join(leaseDirectory, "egress.jsonl");
+    leaseDirectory = mkdtempSync(join(effectiveConfig.runtimeDir, LEASE_PREFIX));
+    const { allowlistPath, logPath } = leaseFiles(leaseDirectory);
     writeFileSync(allowlistPath, `${endpoints.join("\n")}\n`, { mode: 0o600 });
     // The proxy must include this exact digest in its START record after reading the path
     // it was launched with. That binds its observed policy to this invocation's generated
@@ -448,7 +462,8 @@ export const acquireReviewerEgress = async (
     // has stopped, never by following an owner-controlled log path.
     writeFileSync(logPath, "", { mode: 0o600 });
     try {
-      proxy = spawn(effectiveConfig.pythonBinary ?? "/usr/bin/python3", [effectiveConfig.proxyPath, String(port), allowlistPath, logPath], {
+      // #1344 D — this argv is the process signature `reapOrphanedReviewerEgress` identifies a leftover proxy by.
+      proxy = spawn(effectiveConfig.pythonBinary ?? "/usr/bin/python3", proxyArguments(effectiveConfig.proxyPath, port, leaseDirectory), {
         detached: true,
         stdio: ["ignore", "ignore", "pipe"],
       });
@@ -488,6 +503,126 @@ export const acquireReviewerEgress = async (
     if (leaseDirectory) rmSync(leaseDirectory, { recursive: true, force: true });
     releaseLock();
     throw error;
+  }
+};
+
+/**
+ * #1344 D — what a daemon's start found of reviewer egress proxies an earlier instance launched and left running.
+ * `leases`: the lease directories left behind (their names). `stopped`: the proxies matched to one of them and stopped.
+ * `survived`: matched proxies that did not stop; their leases are kept. `portFree`: whether the reviewer port takes a
+ * listener now. False means a holder not proven to be one of these proxies, which is left alone: a review start fails
+ * as it did before, and this record is the evidence of why.
+ */
+export interface ReviewerEgressReap {
+  port: number;
+  leases: string[];
+  stopped: Array<{ pid: number; lease: string }>;
+  survived: Array<{ pid: number; lease: string }>;
+  portFree: boolean;
+}
+
+/** Every process of this user but this one, from `ps`'s numeric columns only; none when `ps` cannot answer. */
+const ownProcessIds = (): number[] => {
+  const uid = process.getuid?.();
+  if (uid === undefined) return [];
+  let listing: string;
+  try {
+    listing = execFileSync("ps", ["-axo", "pid=,uid="], { encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "ignore"] });
+  } catch {
+    return [];
+  }
+  return listing.split("\n").flatMap((line) => {
+    const [pid, owner] = line.trim().split(/\s+/).map(Number);
+    return pid !== undefined && Number.isSafeInteger(pid) && pid > 0 && pid !== process.pid && owner === uid ? [pid] : [];
+  });
+};
+
+/** Signals the exact process while it is still the one identified (same pid and OS start), then waits for it to go. */
+const stopExact = async (pid: number, startToken: string): Promise<boolean> => {
+  const same = (): boolean => readProcessStartToken(pid) === startToken;
+  for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+    if (!same()) return true;
+    try {
+      process.kill(pid, signal);
+    } catch {
+      return !same();
+    }
+    const deadline = Date.now() + 1_000;
+    while (Date.now() < deadline) {
+      if (!same()) return true;
+      await delay(25);
+    }
+  }
+  return !same();
+};
+
+const portTakesListener = (port: number): Promise<boolean> => new Promise((resolve) => {
+  const server = createServer();
+  server.once("error", () => resolve(false));
+  server.listen(port, "127.0.0.1", () => server.close(() => resolve(true)));
+});
+
+/**
+ * #1344 D — at a daemon's start, before any review can start: stops the reviewer egress proxies an earlier instance
+ * of this daemon launched and left running, which hold the fixed port so that every later review fails ISOLATION_LOST.
+ *
+ * A proxy is identified the way the launcher records it: a lease directory left under this daemon's runtime directory
+ * (a lease that ended removed its own), and a process of this user whose kernel argv ends with exactly the arguments
+ * that lease was launched with: this daemon's proxy script, its port and that directory's two files. Only those exact
+ * pids are signalled, each while its OS start token is still the one read; never a process found by name, and never
+ * what merely holds the port. A lease whose proxy is gone is removed. Runs under the lease lock, so no lease of this
+ * process is live meanwhile. Null when no lease was left behind.
+ */
+export const reapOrphanedReviewerEgress = async (config: ReviewerEgressConfig | undefined): Promise<ReviewerEgressReap | null> => {
+  if (!config) return null;
+  const port = config.port ?? 18_443;
+  let names: string[];
+  try {
+    names = readdirSync(config.runtimeDir);
+  } catch {
+    return null;
+  }
+  const leases = names.filter((name) => {
+    if (!name.startsWith(LEASE_PREFIX)) return false;
+    try {
+      return lstatSync(join(config.runtimeDir, name)).isDirectory();
+    } catch {
+      return false;
+    }
+  }).sort();
+  if (leases.length === 0) return null;
+
+  const releaseLock = await acquireLeaseLock();
+  try {
+    const signatures = leases.map((lease) => ({ lease, tail: proxyArguments(config.proxyPath, port, join(config.runtimeDir, lease)) }));
+    const matched = ownProcessIds().flatMap((pid) => {
+      const startToken = readProcessStartToken(pid);
+      const argv = startToken === null ? null : readProcessArgv(pid);
+      if (startToken === null || argv === null) return [];
+      const signature = signatures.find(({ tail }) =>
+        argv.length > tail.length && tail.every((value, index) => argv[argv.length - tail.length + index] === value));
+      if (!signature || readProcessStartToken(pid) !== startToken) return [];
+      return [{ pid, startToken, lease: signature.lease }];
+    });
+    const stopped: ReviewerEgressReap["stopped"] = [];
+    const survived: ReviewerEgressReap["survived"] = [];
+    for (const proxy of matched) {
+      (await stopExact(proxy.pid, proxy.startToken) ? stopped : survived).push({ pid: proxy.pid, lease: proxy.lease });
+    }
+    const kept = new Set(survived.map((proxy) => proxy.lease));
+    for (const lease of leases) {
+      if (!kept.has(lease)) rmSync(join(config.runtimeDir, lease), { recursive: true, force: true });
+    }
+    let portFree = await portTakesListener(port);
+    // A stopped proxy's listening socket closes with its process; give the kernel a moment to show it.
+    const deadline = Date.now() + 1_000;
+    while (!portFree && stopped.length > 0 && Date.now() < deadline) {
+      await delay(25);
+      portFree = await portTakesListener(port);
+    }
+    return { port, leases, stopped, survived, portFree };
+  } finally {
+    releaseLock();
   }
 };
 
