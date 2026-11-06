@@ -501,7 +501,8 @@ export interface NoticeConclusion {
 const ENDED_RUN_STATES: ReadonlySet<string> = new Set<string>([RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED]);
 
 interface NoticeRow {
-  message_id: string; run_id: string | null; role_key: string; target_session_id: string; binding_generation: number;
+  message_id: string; idempotency_key: string; run_id: string | null; role_key: string; target_session_id: string;
+  binding_generation: number;
   status: OutboxMessage["status"]; reason_code: string | null; attempts: number; failure_class: OutboxMessage["failureClass"];
   payload_json: string;
 }
@@ -540,41 +541,47 @@ const requestOf = (row: NoticeRow): { request: NoticeRequest; incident: Incident
 
 /**
  * The record a notice that is no incident's was written with, in the same transaction, so the request it was written
- * for is the one open then and never one opened after it: a wait's deadline-step notice's AGENT_WAIT_DEADLINE, which
- * names the wait it is for (`episode`, the RUN_TRANSITION that entered it); a review re-delivery's
- * CEO_REVIEW_REDELIVERED; or a review packet's CEO_NOTIFICATION (`ProductionGate.buildPacket`), which names no message:
- * its first record of exactly the notice's content (goal, candidate, human gate, what its idempotency key is the digest
- * of), since a later identical packet finds that same notice. Null when there is none. (The kind names are
- * `AgentOwnedWaits`', whose module reads this one.)
+ * for is the one open then and never one opened after it. Bound by identity, never by descriptive text (the audit cuts
+ * long strings): a wait's deadline-step notice's AGENT_WAIT_DEADLINE, which names the wait it is for (`episode`, the
+ * RUN_TRANSITION that entered it); a review re-delivery's CEO_REVIEW_REDELIVERED; or a review packet's CEO_NOTIFICATION
+ * (`ProductionGate.buildPacket`), the latest naming the notice, since an identical later packet is written as that same
+ * notice. A packet record written before it named its notice is matched by the digest the notice's idempotency key is
+ * built from, computed over the record's own fields: a field the audit cut never matches. Null when there is none.
+ * (The kind names are `AgentOwnedWaits`', whose module reads this one.)
  */
-const noticeWrittenWith = (db: Pick<Db, "get">, row: NoticeRow, request: NoticeRequest): { eventId: number; waitEpisode: number | null } | null => {
+const noticeWrittenWith = (db: Pick<Db, "get" | "all">, row: NoticeRow, request: NoticeRequest): { eventId: number; waitEpisode: number | null } | null => {
   const named = db.get<{ event_id: number; kind: string; episode: unknown }>(
     `SELECT event_id, kind, json_extract(evidence_json, '$.episode') AS episode FROM audit_events
-      WHERE run_id = ? AND kind IN ('AGENT_WAIT_DEADLINE', 'CEO_REVIEW_REDELIVERED') AND json_extract(evidence_json, '$.messageId') = ?
-      ORDER BY event_id LIMIT 1`,
+      WHERE run_id = ? AND kind IN ('AGENT_WAIT_DEADLINE', 'CEO_REVIEW_REDELIVERED', 'CEO_NOTIFICATION')
+        AND json_extract(evidence_json, '$.messageId') = ?
+      ORDER BY event_id DESC LIMIT 1`,
     [row.run_id, row.message_id],
   );
   if (named) {
     return { eventId: named.event_id, waitEpisode: named.kind === "AGENT_WAIT_DEADLINE" && typeof named.episode === "number" ? named.episode : null };
   }
-  if (request.notification !== NotificationKind.READY_FOR_CEO_REVIEW || request.candidateSnapshotDigest === undefined) return null;
-  let payload: unknown;
-  try {
-    payload = JSON.parse(row.payload_json);
-  } catch {
-    return null;
-  }
-  if (!isRecord(payload) || typeof payload["goal"] !== "string") return null;
-  const packet = db.get<{ event_id: number }>(
-    `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CEO_NOTIFICATION'
+  const packetKey = `notify:${NotificationKind.READY_FOR_CEO_REVIEW}:${row.run_id}:`;
+  if (request.notification !== NotificationKind.READY_FOR_CEO_REVIEW || request.candidateSnapshotDigest === undefined
+      || !row.idempotency_key.startsWith(packetKey)) return null;
+  const keyDigest = row.idempotency_key.slice(packetKey.length);
+  for (const packet of db.all<{ event_id: number; evidence_json: string }>(
+    `SELECT event_id, evidence_json FROM audit_events WHERE run_id = ? AND kind = 'CEO_NOTIFICATION'
        AND json_extract(evidence_json, '$.messageId') IS NULL AND json_extract(evidence_json, '$.notification') = ?
-       AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ? AND json_extract(evidence_json, '$.goal') = ?
-       AND json_extract(evidence_json, '$.humanGate') IS json(?)
-     ORDER BY event_id LIMIT 1`,
-    [row.run_id, NotificationKind.READY_FOR_CEO_REVIEW, request.candidateSnapshotDigest, payload["goal"],
-      payload["humanGate"] === undefined ? null : JSON.stringify(payload["humanGate"])],
-  );
-  return packet ? { eventId: packet.event_id, waitEpisode: null } : null;
+       AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?
+     ORDER BY event_id DESC`,
+    [row.run_id, NotificationKind.READY_FOR_CEO_REVIEW, request.candidateSnapshotDigest],
+  )) {
+    let evidence: unknown;
+    try {
+      evidence = JSON.parse(packet.evidence_json);
+    } catch {
+      continue;
+    }
+    if (!isRecord(evidence)) continue;
+    const { goal, candidateSnapshotDigest, humanGate } = evidence;
+    if (digestOf({ goal, candidateSnapshotDigest, humanGate }) === keyDigest) return { eventId: packet.event_id, waitEpisode: null };
+  }
+  return null;
 };
 
 /**
@@ -585,7 +592,7 @@ const noticeWrittenWith = (db: Pick<Db, "get">, row: NoticeRow, request: NoticeR
  * written (`noticeWrittenWith`; the same candidate up for review again later is a new request). Null for a notice whose
  * request none of them tells: nothing here settles it.
  */
-const requestOpenedEventId = (db: Pick<Db, "get">, row: NoticeRow, request: NoticeRequest, incident: Incident | null): number | null => {
+const requestOpenedEventId = (db: Pick<Db, "get" | "all">, row: NoticeRow, request: NoticeRequest, incident: Incident | null): number | null => {
   const runId = row.run_id;
   if (runId === null) return null;
   if (request.escalationId !== undefined) return request.escalationId;
@@ -680,8 +687,8 @@ const conclusionOf = (db: Pick<Db, "get" | "all">, row: NoticeRow, request: Noti
 export const settleConcludedNotices = (db: Db, audit: AuditLog): string[] => {
   const settled: string[] = [];
   const rows = db.all<NoticeRow>(
-    `SELECT message_id, run_id, role_key, target_session_id, binding_generation, status, reason_code, attempts,
-            failure_class, payload_json FROM outbox
+    `SELECT message_id, idempotency_key, run_id, role_key, target_session_id, binding_generation, status, reason_code,
+            attempts, failure_class, payload_json FROM outbox
       WHERE kind = 'CEO_NOTIFICATION' AND status IN ('PENDING', 'SENT')
       ORDER BY created_at, rowid`,
   );

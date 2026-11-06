@@ -2,6 +2,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { AgentOwnedWaits, type AgentWaitDeadlines, DEFAULT_AGENT_WAIT_DEADLINES } from "../../src/ceo/agent-owned-waits.ts";
 import { CEO_NOTIFICATION_COVERED, NotificationKind } from "../../src/ceo/ceo-incident-notices.ts";
+import { digestOf } from "../../src/core/digest.ts";
 import { ExecutionMode, Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import type { OutboxMessage } from "../../src/outbox/outbox.ts";
@@ -79,8 +80,10 @@ const activeRun = async (harness: Harness) => {
 };
 
 /** A real reviewed candidate with its production-ready packet: the run at READY_FOR_CEO_REVIEW. */
-const atReview = async (harness: Harness) => {
+const atReview = async (harness: Harness, goal?: string) => {
   const driven = await driveToReviewedCandidate(harness);
+  // The packet names its run's goal; a goal past the audit's string limit is cut in the audit, never in the notice.
+  if (goal !== undefined) harness.cp.db.run(`UPDATE runs SET goal = ? WHERE run_id = ?`, [goal, driven.runId]);
   await harness.cp.continuity.evaluate("test");
   const packet = harness.cp.ceo.buildPacket({
     runId: driven.runId,
@@ -324,5 +327,66 @@ describe("a CEO notice whose exact request an official record concluded is settl
     ]));
     expect(settlements(harness)).toHaveLength(2);
     expect(rowOf(harness, fresh.messageId)["status"]).toBe("PENDING");
+  });
+
+  /** Prose of exactly `length` characters, which no credential shape matches. */
+  const goalOf = (length: number): string => "make app() return 2 for every downstream caller. ".repeat(Math.ceil(length / 49)).slice(0, length);
+  /** The packet's audit record, which the audit cuts at its string limit. */
+  const packetRecords = (harness: Harness, runId: string) => harness.cp.audit.forRun(runId)
+    .filter((entry) => entry.kind === "CEO_NOTIFICATION" && entry.evidence["notification"] === "READY_FOR_CEO_REVIEW");
+  const cancelled = (harness: Harness, runId: string) => {
+    expect(harness.cp.runs.transition(runId, RunState.CANCELLED, "cancelled by the CEO").allowed).toBe(true);
+    return harness.cp.audit.forRun(runId).filter((entry) => entry.kind === "RUN_TRANSITION" && entry.evidence["to"] === RunState.CANCELLED).at(-1)!;
+  };
+
+  it.each([100, 2_100])("a review packet notice with a %i-character goal is bound by its id: COVERED once its run is cancelled", async (length) => {
+    const harness = makeHarness();
+    const goal = goalOf(length);
+    const driven = await atReview(harness, goal);
+    const review = ceoNotices(harness).find((message) => payloadOf(message)["notification"] === "READY_FOR_CEO_REVIEW")!;
+    expect(payloadOf(review)["goal"]).toBe(goal);
+    const [record] = packetRecords(harness, driven.runId);
+    expect(record?.evidence["messageId"]).toBe(review.messageId);
+    expect(record?.evidence["goal"] === goal).toBe(length < 2_000);
+
+    const cancel = cancelled(harness, driven.runId);
+    await harness.cp.watchdog.tick();
+    expect(rowOf(harness, review.messageId)).toMatchObject({ status: "REJECTED", reason_code: "CEO_NOTIFICATION_COVERED" });
+    expect(settlements(harness)).toEqual([expect.objectContaining({
+      evidence: expect.objectContaining({
+        messageId: review.messageId,
+        concludedBy: { kind: "RUN_ENDED", eventId: cancel.eventId, runState: RunState.CANCELLED },
+      }),
+    })]);
+  });
+
+  it.each([
+    [100, "REJECTED"],
+    [2_100, "PENDING"],
+  ])("a packet notice whose record names no message is matched by its key's digest: a %i-character goal leaves it %s", async (length, status) => {
+    const harness = makeHarness();
+    const run = await activeRun(harness);
+    const candidateSnapshotDigest = `sha256:${"c".repeat(64)}`;
+    const goal = goalOf(length);
+    const humanGate: string[] = [];
+    // The shape `ProductionGate.buildPacket` wrote before its record named the notice: the review entry, the notice, the record.
+    expect(harness.cp.runs.transition(run.runId, RunState.READY_FOR_CEO_REVIEW, "production-ready packet assembled",
+      { candidateSnapshotDigest }).allowed).toBe(true);
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    const queued = harness.cp.outbox.enqueue({
+      idempotencyKey: `notify:READY_FOR_CEO_REVIEW:${run.runId}:${digestOf({ goal, candidateSnapshotDigest, humanGate })}`,
+      roleKey: ceo.roleKey, bindingGeneration: ceo.bindingGeneration, targetSessionId: ceo.sessionId, runId: run.runId,
+      kind: MessageKind.CEO_NOTIFICATION,
+      payload: { notification: "READY_FOR_CEO_REVIEW", runId: run.runId, goal, candidateSnapshotDigest, humanGate },
+    });
+    if (!queued.allowed) throw new Error(queued.message);
+    expect(harness.cp.audit.record({ kind: "CEO_NOTIFICATION", runId: run.runId, roleKey: ceo.roleKey,
+      evidence: { notification: "READY_FOR_CEO_REVIEW", goal, candidateSnapshotDigest, humanGate } }).allowed).toBe(true);
+
+    cancelled(harness, run.runId);
+    await harness.cp.watchdog.tick();
+    // A goal the audit cut gives another digest, so the record never stands for the notice.
+    expect(rowOf(harness, queued.value.messageId)["status"]).toBe(status);
+    expect(settlements(harness)).toHaveLength(status === "REJECTED" ? 1 : 0);
   });
 });
