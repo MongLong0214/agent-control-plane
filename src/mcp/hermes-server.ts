@@ -631,7 +631,7 @@ const createHermesServerFromPort = (
   );
   server.registerTool(
     "review_evidence_attach",
-    { description: "Bind a STANDARD_WORK run owner's staged private review evidence bundle as this run's review input, by exact run/contract/stager/digest, after checking its sources. Current authenticated CEO owner or peer turn only. It is not owner approval, not a contract change and not a PASS: the bundle is attributed data for the reviewer. The next result_submit freezes it; refused while a submission is in flight. A replacement names replacesSha256 and leaves any earlier review or approval stale for CONFIRM; nothing is deleted.",
+    { description: "Bind a STANDARD_WORK or CONTRACT_CHANGE run owner's staged private review evidence bundle as this run's review input, by exact run/contract/stager/digest, after checking its sources. Current authenticated CEO owner or peer turn only. It is not owner approval, not a contract change and not a PASS: the bundle is attributed data for the reviewer. The next result_submit freezes it; refused while a submission is in flight. A replacement names replacesSha256 and leaves any earlier review or approval stale for CONFIRM; nothing is deleted.",
       inputSchema: { ...mutation, runId: z.string(), contractDigest: z.string(), stagedBy: z.string(), expectedSha256: z.string(), replacesSha256: z.string().optional() } },
     async (args, extra) => write("review_evidence_attach", args, extra, () => {
       const peer = authenticateMcpPeer(authenticate);

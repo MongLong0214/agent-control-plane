@@ -56,7 +56,7 @@ import type { VerificationReport } from "../verify/verification-engine.ts";
 import { currentVerdictPasses, currentVerificationResults } from "../verify/verification-history.ts";
 import type { ContinuityGate } from "../run/run-engine.ts";
 import { residentBaseClone } from "../registry/resident-repositories.ts";
-import { currentStandardReviewEvidenceDigest, standardReviewEvidenceCurrent } from "../review/standard-review-evidence.ts";
+import { currentStandardReviewEvidenceDigest, standardReviewEvidenceCurrent, takesStandardReviewEvidence } from "../review/standard-review-evidence.ts";
 import {
   candidateSnapshotDigest,
   candidateSnapshotSchema,
@@ -980,14 +980,19 @@ export class ProductionGate {
       }
     }
 
-    // A STANDARD_WORK candidate's review and approval rest on the private review evidence it was frozen
-    // with: evidence the CEO attached or replaced since leaves them stale for CONFIRM.
-    // The review checked is the one the packet names, by the evidence digest its inputManifest records.
-    if (input.decision === "CONFIRM" && run.kind === RunKind.STANDARD_WORK) {
+    // A STANDARD_WORK or CONTRACT_CHANGE candidate's review and approval rest on the private review evidence it
+    // was frozen with: evidence the CEO attached or replaced since leaves them stale for CONFIRM.
+    // The review checked is the one the packet names, by the evidence digest its inputManifest records. A
+    // no-repository CONTRACT_CHANGE packet names a not-applicable placeholder: its review is the candidate's own
+    // BLIND_REVIEW, the one its activation grant reads.
+    if (input.decision === "CONFIRM" && takesStandardReviewEvidence(run.kind)) {
       const frozen = this.artifacts.latestForSnapshot<CandidateSnapshot>(input.runId, ArtifactKind.CANDIDATE_SNAPSHOT, input.candidateSnapshotDigest);
-      const reviewed = packet && packet.content.blindReview.provider !== "not-applicable"
-        ? this.artifacts.byDigest<ReviewPacket>(packet.content.blindReview.digest)?.content.inputManifest?.reviewEvidence?.digest ?? null
-        : null;
+      const review = !packet ? undefined : packet.content.blindReview.provider !== "not-applicable"
+        ? this.artifacts.byDigest<ReviewPacket>(packet.content.blindReview.digest)
+        : run.kind === RunKind.CONTRACT_CHANGE
+          ? this.artifacts.latestForSnapshot<ReviewPacket>(input.runId, ArtifactKind.BLIND_REVIEW, input.candidateSnapshotDigest)
+          : undefined;
+      const reviewed = review?.content.inputManifest?.reviewEvidence?.digest ?? null;
       const current = standardReviewEvidenceCurrent({ artifacts: this.artifacts, audit: this.audit, runs: this.runs },
         { runId: input.runId, reviewEvidence: frozen?.content.reviewEvidence }, reviewed);
       if (!current.allowed) return current as Decision<{ isBootstrap: boolean }>;
@@ -1721,9 +1726,9 @@ export class ProductionGate {
 
         const actor = authenticatedOwner ?? `${receipt!.channel}:${receipt!.actor}`;
         const gate = this.humanGateDefinition(input.runId);
-        // A STANDARD_WORK run's consent is bound to the private review evidence in force when it is given:
-        // once the CEO replaces that evidence, the consent no longer counts (`ownerDecisionsOf`).
-        const evidence = fresh.kind === RunKind.STANDARD_WORK ? this.reviewEvidenceInForce(input.runId) : allow(ReasonCode.OK, null);
+        // A STANDARD_WORK or CONTRACT_CHANGE run's consent is bound to the private review evidence in force when
+        // it is given: once the CEO replaces that evidence, the consent no longer counts (`ownerDecisionsOf`).
+        const evidence = takesStandardReviewEvidence(fresh.kind) ? this.reviewEvidenceInForce(input.runId) : allow(ReasonCode.OK, null);
         if (!evidence.allowed && input.approved) return evidence as Decision<void>;
         const reviewEvidenceDigest = evidence.allowed ? evidence.value : null;
         // SEC-OD1 — the canonical owner decision: written only here, through this gate's capability, in
@@ -1833,7 +1838,7 @@ export class ProductionGate {
     };
   }
 
-  /** The digest of a STANDARD_WORK run's private review evidence in force now (review/standard-review-evidence.ts). */
+  /** The digest of a STANDARD_WORK or CONTRACT_CHANGE run's private review evidence in force now (review/standard-review-evidence.ts). */
   private reviewEvidenceInForce(runId: string): Decision<string | null> {
     return currentStandardReviewEvidenceDigest({ artifacts: this.artifacts, audit: this.audit, runs: this.runs }, runId);
   }
@@ -1845,7 +1850,8 @@ export class ProductionGate {
     const latest = new Map<string, boolean>();
     // An approval given under other private review evidence than the run's current evidence is no consent:
     // it was given for what that evidence showed. A rejection stays a rejection.
-    const evidence = this.runs.get(runId)?.kind === RunKind.STANDARD_WORK ? this.reviewEvidenceInForce(runId) : null;
+    const kind = this.runs.get(runId)?.kind;
+    const evidence = kind !== undefined && takesStandardReviewEvidence(kind) ? this.reviewEvidenceInForce(runId) : null;
     for (const artifact of this.artifacts.listOwnerDecisions<OwnerDecisionRecord>(runId)) {
       const decision = this.boundOwnerDecision(runId, artifact);
       if (!decision) continue;

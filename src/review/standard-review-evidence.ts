@@ -19,11 +19,12 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { CandidateSnapshot, SnapshotReviewEvidence } from "../snapshot/candidate-snapshot.ts";
 
 /**
- * Private review evidence for a STANDARD_WORK run: the bootstrap evidence path (bootstrap/bootstrap-review-evidence.ts)
- * keyed by run and contract instead of a bootstrap PLAN. The run's owning CTO stages one bundle, the canonical CEO
- * binds it as the review's input, and the next freeze carries its digests in the candidate snapshot. Attaching is
- * neither owner approval nor a contract change; the bundle is attributed data for the reviewer. Bytes stay in
- * the run's private HANDOFF artifacts; nothing here is ever deleted.
+ * Private review evidence for a STANDARD_WORK or CONTRACT_CHANGE run: the bootstrap evidence path
+ * (bootstrap/bootstrap-review-evidence.ts) keyed by run and contract instead of a bootstrap PLAN. The run's owning
+ * CTO stages one bundle, the canonical CEO binds it as the review's input, and the next freeze carries its digests
+ * in the candidate snapshot. Attaching is neither owner approval nor a contract change; the bundle is attributed
+ * data for the reviewer, and nothing that judges a CONTRACT_CHANGE (its PLAN, manifest, revert eligibility or
+ * activation grant) reads it. Bytes stay in the run's private HANDOFF artifacts; nothing here is ever deleted.
  */
 const CANDIDATE = "acp.standard-review-evidence-candidate.v1";
 const ATTACHED = "acp.standard-review-evidence-attached.v1";
@@ -163,17 +164,23 @@ const candidates = (source: ReadSource, runId: string) =>
 const attachments = (source: ReadSource, runId: string) =>
   source.artifacts.list<Attachment>(runId, ArtifactKind.HANDOFF).filter(a => a.content?.schema === ATTACHED);
 
+/** The run kinds this path serves; a bootstrap run uses its own. */
+export const takesStandardReviewEvidence = (kind: string): boolean => kind === RunKind.STANDARD_WORK || kind === RunKind.CONTRACT_CHANGE;
+
 const evidenceRun = (source: Pick<Source, "runs">, input: { runId: string; contractDigest: string; expectedSha256: string; replacesSha256?: string | undefined }): Decision<RunRow> => {
   if (![input.contractDigest, input.expectedSha256, ...(input.replacesSha256 === undefined ? [] : [input.replacesSha256])].every(d => digest.safeParse(d).success)) {
     return deny(ReasonCode.INVALID_ARGUMENT, "review evidence digests are sha256:<64 lowercase hex>");
   }
   const run = source.runs.get(input.runId);
   if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run");
-  if (run.kind !== RunKind.STANDARD_WORK) return deny(ReasonCode.INVALID_ARGUMENT, "this review evidence path is for STANDARD_WORK runs; a bootstrap run uses its own");
+  if (!takesStandardReviewEvidence(run.kind)) return deny(ReasonCode.INVALID_ARGUMENT, "this review evidence path is for STANDARD_WORK and CONTRACT_CHANGE runs; a bootstrap run uses its own");
   if (!OPEN_STATES.includes(run.state)) return deny(ReasonCode.CONFLICT, "this run no longer accepts review evidence");
   if (run.contractDigest !== input.contractDigest) return deny(ReasonCode.CONFLICT, "review evidence must bind the run's immutable contract digest");
-  // Only a repository candidate is blind-reviewed; evidence on a run with none would bind nothing.
-  if (source.runs.repositoriesOf(run.runId).length === 0) return deny(ReasonCode.INVALID_ARGUMENT, "review evidence needs a run with a participating repository");
+  // Only a repository candidate of a STANDARD_WORK run is blind-reviewed; evidence on one with none would bind
+  // nothing. A CONTRACT_CHANGE candidate is reviewed with or without repositories.
+  if (run.kind === RunKind.STANDARD_WORK && source.runs.repositoriesOf(run.runId).length === 0) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "review evidence needs a run with a participating repository");
+  }
   return allow(ReasonCode.OK, run);
 };
 

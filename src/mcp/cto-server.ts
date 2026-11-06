@@ -668,7 +668,7 @@ const createCtoServerFromPort = (
   );
   server.registerTool(
     "review_evidence_stage",
-    { description: `Stage one immutable private review evidence bundle for a STANDARD_WORK run you own (the same bundle format and ${BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES / 1024} KiB UTF-8 limit as bootstrap_review_evidence_stage): only the minimal excerpts, their source identification and comparison ranges, digests and limits. Binds this run and its contract digest. It is attributed data for the reviewer, never a contract change or an approval; the canonical CEO must select it with review_evidence_attach, and the next result_submit freezes it into the candidate's review.`,
+    { description: `Stage one immutable private review evidence bundle for a STANDARD_WORK or CONTRACT_CHANGE run you own (the same bundle format and ${BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES / 1024} KiB UTF-8 limit as bootstrap_review_evidence_stage): only the minimal excerpts, their source identification and comparison ranges, digests and limits. Binds this run and its contract digest. It is attributed data for the reviewer, never a contract change or an approval; the canonical CEO must select it with review_evidence_attach, and the next result_submit freezes it into the candidate's review.`,
       inputSchema: { ...mutation, ...runIdentity, contractDigest: z.string(), evidenceBody: z.string(), expectedSha256: z.string() } },
     async args => writeOwned("review_evidence_stage", args, (_peer, current) => respond(port.stageStandardReviewEvidence(current, args))),
   );

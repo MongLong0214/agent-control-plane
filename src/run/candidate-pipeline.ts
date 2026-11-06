@@ -434,10 +434,11 @@ export class CandidatePipeline {
       ? undefined
       : readCanonicalCtoIdentity(this.db, run.projectId);
 
-    // A STANDARD_WORK candidate is frozen with the review evidence the CEO has bound now, digests only
-    // (review/standard-review-evidence.ts). A selection that cannot be read back intact refuses the freeze.
+    // A STANDARD_WORK candidate with repositories, or a CONTRACT_CHANGE candidate, is frozen with the review
+    // evidence the CEO has bound now, digests only (review/standard-review-evidence.ts). A selection that cannot be
+    // read back intact refuses the freeze.
     let reviewEvidence: SnapshotReviewEvidence | null = null;
-    if (run.kind === RunKind.STANDARD_WORK && participants.length > 0) {
+    if ((run.kind === RunKind.STANDARD_WORK && participants.length > 0) || isContractChangeRun(run)) {
       try { reviewEvidence = collectStandardReviewEvidence({ artifacts: this.artifacts, audit: this.audit, runs: this.runs }, runId); }
       catch { return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "attached review evidence cannot be frozen", { runId }); }
     }
@@ -450,6 +451,7 @@ export class CandidatePipeline {
             ...(bootstrapPlan === undefined ? {} : { bootstrapPlan }),
             ...(contractChange === undefined ? {} : { contractChange }),
             ...(canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity }),
+            ...(reviewEvidence === null ? {} : { reviewEvidence }),
           },
           this.clock,
         )

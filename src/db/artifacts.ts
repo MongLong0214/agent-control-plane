@@ -800,7 +800,7 @@ const blindReviewEvidenceSchema = z
             digest: DIGEST_SCHEMA,
           })
           .strict(),
-        // The CEO-attached private review evidence a STANDARD_WORK candidate was frozen with, by digest.
+        // The CEO-attached private review evidence a STANDARD_WORK or CONTRACT_CHANGE candidate was frozen with, by digest.
         reviewEvidence: z
           .object({ digest: DIGEST_SCHEMA, bundleSha256: DIGEST_SCHEMA, attachmentDigest: DIGEST_SCHEMA })
           .strict()
@@ -870,6 +870,38 @@ const blindReviewEvidenceSchema = z
             })
             .strict(),
         ),
+        // #1347 — a revert PLAN's review names the judgement its reviewer was shown, as
+        // `contractChangeRevert` admitted it. Every other review carries no such key.
+        revert: z
+          .object({
+            revertsContractChangeRunId: z.string().min(1),
+            target: z.object({ kind: z.string().min(1), projectId: z.string().nullable(), state: z.string().min(1) }).strict(),
+            firstActivation: z.boolean(),
+            grant: z
+              .object({
+                grantId: z.string().min(1),
+                projectId: z.string().min(1),
+                fromManifestDigest: z.string().min(1),
+                manifestDigest: z.string().min(1),
+                consumed: z.boolean(),
+                intact: z.boolean(),
+              })
+              .strict(),
+            activation: z.object({ eventId: z.number().int(), grantId: z.string().min(1), from: z.string().min(1), to: z.string().min(1) }).strict(),
+            latestActivationEventId: z.number().int().nullable(),
+            activeManifestDigest: z.string().min(1).nullable(),
+            pinnedManifestDigest: z.string().min(1).nullable(),
+            additive: z
+              .object({
+                comparedCommands: z.array(z.string()),
+                changedCommands: z.array(z.string()),
+                lowered: z.array(z.record(z.string(), z.string().nullable())),
+              })
+              .strict(),
+            revertedBy: z.array(z.string()),
+          })
+          .strict()
+          .optional(),
       })
       .strict()
       .superRefine((change, ctx) => {
