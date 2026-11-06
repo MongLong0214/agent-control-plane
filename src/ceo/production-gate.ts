@@ -7,7 +7,7 @@ import {
   deferIncidentNotice,
   deliverIncident,
   enqueueAdHocNotice,
-  resolutionOf,
+  runEndedSince,
 } from "./ceo-incident-notices.ts";
 import { deriveHumanGate } from "./human-gate.ts";
 import { admitOwnerDecisionReason } from "./owner-decision-reason.ts";
@@ -1992,10 +1992,11 @@ export class ProductionGate {
    * refused one back), and `audit_events` is append only, so this is the whole escalation record.
    *
    * #1347 — an escalation whose run has since ended (cancelled, failed, completed) is not open either:
-   * the ended rule is the CEO incident path's own (`resolutionOf`, RUN_ENDED), asked of the same
-   * incident `openEscalation` delivered. BLOCKED_POST_MERGE is terminal there but not an end here: the
-   * run waits on recovery, and `openPostMergeResponsibility` still counts its escalation open. Read
-   * only; nothing is recorded or marked resolved.
+   * the ended rule is the CEO incident path's own (`runEndedSince`, `resolutionOf`'s RUN_ENDED), asked
+   * on its own, so a CEO decision recorded between the opening and the end does not hide the end.
+   * BLOCKED_POST_MERGE is terminal there but not an end here: the run waits on recovery, and
+   * `openPostMergeResponsibility` still counts its escalation open. Read only; nothing is recorded or
+   * marked resolved.
    */
   openEscalationOf(runId: string): { escalationId: number } | null {
     const opened = this.db.get<{ event_id: number }>(
@@ -2010,17 +2011,8 @@ export class ProductionGate {
       [runId, opened.event_id],
     );
     if (answered) return null;
-    if (this.runs.get(runId)?.state !== RunState.BLOCKED_POST_MERGE) {
-      const resolution = resolutionOf(this.db, {
-        cls: IncidentClass.CTO_ESCALATION,
-        subject: runId,
-        runId,
-        episode: String(opened.event_id),
-        openedEventId: opened.event_id,
-        payload: {},
-      });
-      if (resolution?.kind === "RUN_ENDED") return null;
-    }
+    const run = this.runs.get(runId);
+    if (run && run.state !== RunState.BLOCKED_POST_MERGE && runEndedSince(this.db, run, opened.event_id) !== null) return null;
     return { escalationId: opened.event_id };
   }
 
