@@ -69,11 +69,11 @@ const LONG_BASE64_TEXT = /^[A-Za-z0-9+/]{60,}={0,2}$/;
 const DIGEST_TOKEN = /(?<![A-Za-z0-9+/])sha256:[0-9a-f]{64}(?![A-Za-z0-9+/=])/g;
 /**
  * Where in the bundle a refused text or an unconfirmed digest sits, by structure only: the JSON path through the
- * bundle's own key names (any other key by its position), the line and column inside that text, and the file's
- * `path` when that path passes every shape itself. Positions instead of any part of the refused text or the token,
- * not even a prefix: an unconfirmed token may be a credential.
+ * bundle's own key names (any other key by its position), which names a file by its index (`$.files[<n>]`), and
+ * the line and column inside that text. Positions instead of any text the stager wrote, a file's `path` included:
+ * an unconfirmed token may be a credential, and a path can carry a piece of one in any form.
  */
-interface Place { field: string; file?: string; line?: number; column?: number }
+interface Place { field: string; line?: number; column?: number }
 type ScanRefusal = { rule: string; form: string; at?: Place; unresolvedDigests?: Place[]; unresolvedDigestCount?: number };
 /** The bundle schema's key names: a refusal names a key by one of these, any other key by its position. */
 const BUNDLE_KEYS: ReadonlySet<string> = new Set(["runId", "contractDigest", "files", "missing", "path", "sha256", "origin", "grade", "bodyBase64",
@@ -179,40 +179,17 @@ const scanBundle = (root: unknown, resolve: ResolveReferences): { refused: ScanR
   const references = tokens.flatMap(token => resolved.find(r => r.digest === token) ?? []);
   const verified = new Set(references.map(r => r.digest));
   const field = fieldFor(verified);
-  const placed = placesIn(root);
   for (const item of checked) {
     const refused = "text" in item ? subjectRefusal(item.text, field) : item;
     if (refused === null) continue;
     const unresolved = texts.flatMap(s => (WHOLE_DIGEST.test(s.text) ? [] : [...s.text.matchAll(DIGEST_TOKEN)]
-      .filter(m => !verified.has(m[0])).map(m => placed(s.field, lineAndColumn(s.text, m.index)))));
+      .filter(m => !verified.has(m[0])).map(m => ({ field: s.field, ...lineAndColumn(s.text, m.index) }))));
     const line = "text" in item && item.text.includes("\n")
       ? item.text.split("\n").findIndex(l => shapeRefusal(l, field)?.rule === refused.rule) + 1 : 0;
-    return { refused: { ...refused, ...("text" in item ? { at: placed(item.field, line > 0 ? { line } : {}) } : {}),
+    return { refused: { ...refused, ...("text" in item ? { at: { field: item.field, ...(line > 0 ? { line } : {}) } } : {}),
       ...(unresolved.length === 0 ? {} : { unresolvedDigests: unresolved.slice(0, MAX_PLACED_DIGESTS), unresolvedDigestCount: unresolved.length }) } };
   }
   return { references };
-};
-
-/** A run of 8 or more hex digits, or a base64-like run (16 or more characters of the base64 alphabets): either could be a token's fragment. */
-const FRAGMENT_RUN = /[0-9a-fA-F]{8}|[A-Za-z0-9+/=_-]{16}/;
-
-/**
- * Places by JSON path, which names a file by its index. A text under `$.files[<n>]` also names that file's `path`
- * when the path holds no `FRAGMENT_RUN` and passes every shape itself; a path can carry a fragment of a token that
- * passes every shape, so any other path is left out and the index alone names the file.
- */
-const placesIn = (root: unknown): ((field: string, at: { line?: number; column?: number }) => Place) => {
-  const files = root !== null && typeof root === "object" && Array.isArray((root as { files?: unknown }).files) ? (root as { files: unknown[] }).files : [];
-  const pathOf = (index: number): string | undefined => {
-    const file = files[index];
-    const path = file !== null && typeof file === "object" ? (file as { path?: unknown }).path : undefined;
-    return typeof path === "string" && !FRAGMENT_RUN.test(path) && shapeRefusal(path, undefined) === null ? path : undefined;
-  };
-  return (field, at) => {
-    const index = /^\$\.files\[(\d+)\]/.exec(field)?.[1];
-    const file = index === undefined ? undefined : pathOf(Number(index));
-    return { field, ...(file === undefined ? {} : { file }), ...at };
-  };
 };
 
 type ReferenceSource = Pick<Source, "artifacts" | "audit" | "runs">;

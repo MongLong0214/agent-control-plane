@@ -357,7 +357,8 @@ describe("review evidence quoting a project run's verification outputs and contr
       expect(f.h.cp.db.get("SELECT count(*) AS n FROM run_artifacts WHERE instr(content_json, ?) > 0", [laundered])).toEqual({ n: 1 });
       const slack = ["xoxb", "123456789012345678901234567890"].join("-");
       const quoted = "records/quoted.txt";
-      const at = { field: "$.files[2].bodyBase64", file: quoted, line: 2 };
+      // A file is named only by its index in the field, never by the path the stager wrote.
+      const at = { field: "$.files[2].bodyBase64", line: 2 };
       const refused: Array<[string, string]> = [
         ["another project's contract", foreign.value.contractDigest],
         ["an outputDigest no project artifact records", digestOf("an output ACP never recorded")],
@@ -367,20 +368,31 @@ describe("review evidence quoting a project run's verification outputs and contr
       for (const [label, digest] of refused) {
         const answer = await f.stageBody(run, `refused-${label}`, body([fileOf(quoted, "a note", `the live records above\nquoted ${digest}\n`)]));
         expect(answer, label).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED",
-          evidence: { rule: "long_base64_run", form: "sha256-64hex", at, unresolvedDigests: [{ ...at, column: 8 }], unresolvedDigestCount: 1 } });
-        expect(JSON.stringify(answer), label).not.toContain(hexOf(digest).slice(0, 12));
+          evidence: { rule: "long_base64_run", form: "sha256-64hex", unresolvedDigestCount: 1 } });
+        expect((answer["evidence"] as Args)["at"], label).toEqual(at);
+        expect((answer["evidence"] as Args)["unresolvedDigests"], label).toEqual([{ ...at, column: 8 }]);
+        expect(JSON.stringify(answer), label).not.toContain(hexOf(digest).slice(0, 7));
+        expect(JSON.stringify(answer), label).not.toContain(quoted);
       }
-      // A file path that carries a fragment of the token is left out; the field's index names the file.
+      // A file path carrying pieces of the token, whole or split, is never shown: the field's index names the file.
       const unrecorded = digestOf("another output ACP never recorded");
-      const fragment = await f.stageBody(run, "refused-fragment-path",
-        body([fileOf(`records/${hexOf(unrecorded).slice(0, 12)}.txt`, "a note", `the live records above\nquoted ${unrecorded}\n`)]));
-      expect(fragment).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "long_base64_run", unresolvedDigestCount: 1 } });
-      expect((fragment["evidence"] as Args)["at"]).toEqual({ field: "$.files[2].bodyBase64", line: 2 });
-      expect((fragment["evidence"] as Args)["unresolvedDigests"]).toEqual([{ field: "$.files[2].bodyBase64", line: 2, column: 8 }]);
-      expect(JSON.stringify(fragment)).not.toMatch(new RegExp(hexOf(unrecorded).slice(0, 8)));
+      const groups = hexOf(unrecorded).match(/.{1,7}/g)!;
+      const paths: Array<[string, string]> = [
+        ["a 12-hex path", `records/${hexOf(unrecorded).slice(0, 12)}.txt`],
+        ["a 7-hex path", `records/${groups[0]}.txt`],
+        ["the whole hex split into dotted 7-character groups", `records/${groups.join(".")}.txt`],
+      ];
+      for (const [label, path] of paths) {
+        const answer = await f.stageBody(run, `refused-path-${label}`, body([fileOf(path, "a note", `the live records above\nquoted ${unrecorded}\n`)]));
+        expect(answer, label).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "long_base64_run", unresolvedDigestCount: 1 } });
+        expect((answer["evidence"] as Args)["at"], label).toEqual(at);
+        expect((answer["evidence"] as Args)["unresolvedDigests"], label).toEqual([{ ...at, column: 8 }]);
+        for (const group of groups.filter((g) => g.length === 7)) expect(JSON.stringify(answer), label).not.toContain(group);
+      }
 
       const credential = await f.stageBody(run, "refused-credential", body([fileOf(quoted, "a note", `quoted ${output}\nnote ${slack}\n`)]));
-      expect(credential).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "slack_token", at } });
+      expect(credential).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "slack_token" } });
+      expect((credential["evidence"] as Args)["at"]).toEqual(at);
       expect(JSON.stringify(credential)).not.toContain("xoxb");
       expect((credential["evidence"] as Args)["unresolvedDigests"]).toBeUndefined();
 
