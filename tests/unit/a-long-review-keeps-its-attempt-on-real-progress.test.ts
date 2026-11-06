@@ -12,6 +12,7 @@ import { ArtifactKind, ExecutionMode, RunKind, RunState, type RunRow } from "../
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { progressNotifier } from "../../src/mcp/shared.ts";
+import { REPLAYED_ATTEMPT_RELEASED } from "../../src/run/candidate-pipeline.ts";
 import type { InvocationRequest, InvocationResult } from "../../src/runtime/provider.ts";
 import { BOOTSTRAP_REVIEW_RETRY_WAKE } from "../../src/runtime/provisioned-session-runtime.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
@@ -595,13 +596,14 @@ describe("result_submit over MCP", () => {
       expect(newKey.structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
       expect(frozen()).toBe(2);
       expect(restarted.scripted.invocations).toEqual([]);
-      // Its lease lapses unrenewed and the watchdog reclaims it; the interrupted key still runs nothing.
+      // Its lease lapses unrenewed and the watchdog reclaims it; the interrupted key still runs nothing, and is now
+      // told definitely that its attempt was released with nothing applied (#1344 B).
       restarted.clock.advance(31 * MINUTE);
       await restarted.cp.watchdog.tick();
       expect(restarted.cp.db.get<{ state: string }>("SELECT state FROM candidate_pipeline_attempts WHERE run_id = ?", [run.runId])?.state)
         .toBe("RELEASED");
       expect((await after.client.callTool(resultSubmit(run, "running-at-the-restart"))).structuredContent)
-        .toMatchObject({ ok: false, reasonCode: ReasonCode.MCP_MUTATION_OUTCOME_UNKNOWN });
+        .toMatchObject({ ok: false, reasonCode: ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE, message: REPLAYED_ATTEMPT_RELEASED });
       expect(submit).toHaveBeenCalledTimes(1);
       expect(frozen()).toBe(2);
     } finally {

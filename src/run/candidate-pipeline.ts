@@ -12,7 +12,7 @@ import { collectBootstrapCeoDecisions, frozenBootstrapCeoDecisions } from "../bo
 import { collectBootstrapReviewEvidence } from "../bootstrap/bootstrap-review-evidence.ts";
 import { collectStandardReviewEvidence, privateEvidenceAnswer, runHadStandardReviewEvidence } from "../review/standard-review-evidence.ts";
 import type { Clock } from "../core/clock.ts";
-import { digestOf } from "../core/digest.ts";
+import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, type Evidence, acpError, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { commandsForMode, type BranchProfile } from "../contracts/manifest.ts";
@@ -20,7 +20,7 @@ import type { VerificationCommand } from "../contracts/verification-command.ts";
 import { EVIDENCE_PRODUCERS, type ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { attemptReleasedNoticeKey } from "../doctor/watchdog.ts";
+import { OWNERLESS_STALL_OWED, attemptReleasedNoticeKey } from "../doctor/watchdog.ts";
 import { ArtifactKind, RunKind, type RunRow, RunState } from "../domain/types.ts";
 import { requiredBaseFor, sourceProbeBranchesFor } from "../github/branch-contract.ts";
 import { currentBranch, mergeBase, revParse, tryRevParse } from "../git/git.ts";
@@ -220,6 +220,20 @@ export const ATTEMPT_RELEASED_NOTICE = "attempt released, outcome not applied; s
 const ATTEMPT_RELEASED_RECOVERY =
   "Change no PLAN, task or code. Submit that run's result once with mcp__acp-cto__result_submit and a new idempotencyKey, then acknowledge this message with mcp__acp-cto__run_ack.";
 
+/**
+ * #1344 B — the audit row that binds a result_submit's idempotency key (as a digest) and MCP request fingerprint to the
+ * attempt it started, written with the attempt row; and the row of what that attempt answered, written as it ends its
+ * own hold. A replay of the key whose response was never stored is answered from them (`replaySubmission`).
+ */
+export const CANDIDATE_PIPELINE_ATTEMPT_STARTED = "CANDIDATE_PIPELINE_ATTEMPT_STARTED";
+export const CANDIDATE_PIPELINE_ATTEMPT_ENDED = "CANDIDATE_PIPELINE_ATTEMPT_ENDED";
+/** #1344 B — a replay's answer when ACP released the attempt its key started: definite, never an unknown outcome. */
+export const REPLAYED_ATTEMPT_RELEASED = "attempt released, outcome not applied; submit with a new idempotencyKey";
+const REPLAYED_ATTEMPT_REFUSED = "the first result_submit with this idempotencyKey was refused; nothing was run again";
+/** The digest a result_submit idempotency key is recorded under; the key itself is never stored. */
+const resultSubmitKeyDigestOf = (idempotencyKey: string): string =>
+  sha256(JSON.stringify(["acp.result-submit.key.v1", idempotencyKey]));
+
 export interface SubmitResultInput {
   runId: string;
   ownerSessionId: string;
@@ -237,6 +251,11 @@ export interface SubmitResultInput {
    * chunk, the final review starting and ending. What it does never decides the submission.
    */
   onProgress?: (step: SubmissionProgressStep) => void;
+  /**
+   * #1344 B — the result_submit request this submission answers: its idempotency key and MCP request fingerprint. The
+   * attempt it starts, and what that attempt answers, are recorded under them (`replaySubmission`).
+   */
+  replayIdentity?: { idempotencyKey: string; requestFingerprint: string };
 }
 
 /** A real step of a submission: the only thing that renews its attempt lease. */
@@ -588,11 +607,11 @@ export class CandidatePipeline {
     if (!acquired.allowed) return acquired as Decision<PipelineOutcome>;
     const controller = new AbortController();
     this.#attempts.set(attemptId, controller);
+    let outcome: Decision<PipelineOutcome> | undefined;
     try {
       // The answer is stored as the mutation's result and returned to the caller. For a run that had private review
       // evidence it is rebuilt from values of known provenance, before it is serialized or stored, and so is a thrown
       // refusal (`privateEvidenceAnswer`); any other run's answer is exactly as before.
-      let outcome: Decision<PipelineOutcome>;
       try { outcome = await this.submitResultOnce(input, attemptId, controller.signal); }
       catch (error) {
         if (!isAcpError(error) || !runHadStandardReviewEvidence({ audit: this.audit }, input.runId)) throw error;
@@ -606,8 +625,68 @@ export class CandidatePipeline {
         : deny(answered.reasonCode, STALE_ATTEMPT_NOT_APPLIED, answered.evidence);
     } finally {
       this.#attempts.delete(attemptId);
-      this.releaseAttempt(input.runId, attemptId);
+      this.endAttempt(input, attemptId, outcome);
     }
+  }
+
+  /**
+   * #1344 B — the answer a result_submit replay gets from durable state, when the key's response was never stored (its
+   * daemon ended first). Bound to the run, the key and the MCP request fingerprint the attempt was recorded under; read
+   * only, so nothing is frozen, verified or reviewed again. The attempt's recorded outcome when it ended itself with one;
+   * `REPLAYED_ATTEMPT_RELEASED` when ACP released it (its deadline, a daemon restart, a reclaim) or it ended not holding
+   * the run; a CONFLICT for the same key naming another request. Null otherwise: no attempt recorded under the key, one
+   * still RUNNING (in this process the caller's in-flight answer; one an ended daemon left is released by the restart's
+   * reconcile), or one that ended on a throw, whose outcome stays unknown.
+   */
+  replaySubmission(runId: string, idempotencyKey: string, requestFingerprint: string): Decision<unknown> | null {
+    const started = this.db.get<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events WHERE run_id = ? AND kind = ?
+          AND json_extract(evidence_json, '$.idempotencyKeyDigest') = ? ORDER BY event_id LIMIT 1`,
+      [runId, CANDIDATE_PIPELINE_ATTEMPT_STARTED, resultSubmitKeyDigestOf(idempotencyKey)],
+    );
+    if (!started) return null;
+    const recorded = JSON.parse(started.evidence_json) as { attemptId?: unknown; mcpFingerprint?: unknown };
+    if (typeof recorded.attemptId !== "string") return null;
+    if (recorded.mcpFingerprint !== requestFingerprint) {
+      return deny(ReasonCode.CONFLICT, "this idempotencyKey already names a different result_submit request", { runId });
+    }
+    const attemptId = recorded.attemptId;
+    const released = deny(ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE, REPLAYED_ATTEMPT_RELEASED, { runId, attemptId });
+    const ended = this.db.get<{ reason_code: string | null; evidence_json: string }>(
+      `SELECT reason_code, evidence_json FROM audit_events WHERE run_id = ? AND kind = ?
+          AND json_extract(evidence_json, '$.attemptId') = ? ORDER BY event_id LIMIT 1`,
+      [runId, CANDIDATE_PIPELINE_ATTEMPT_ENDED, attemptId],
+    );
+    if (ended) {
+      const end = JSON.parse(ended.evidence_json) as { allowed?: unknown; stage?: unknown; stageReasonCode?: unknown; candidateSnapshotDigest?: unknown };
+      const reasonCode = (ended.reason_code ?? ReasonCode.OK) as ReasonCode;
+      const snapshotDigest = typeof end.candidateSnapshotDigest === "string" ? end.candidateSnapshotDigest : null;
+      if (end.allowed === true) {
+        return allow(reasonCode, {
+          stage: end.stage,
+          ...(typeof end.stageReasonCode === "string" ? { reasonCode: end.stageReasonCode } : {}),
+          snapshotDigest,
+          attemptId,
+          replayed: "DURABLE_OUTCOME",
+        });
+      }
+      // An attempt that ended not holding the run applied nothing: it was released under its answer.
+      if (reasonCode === ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE) return released;
+      return deny(reasonCode, REPLAYED_ATTEMPT_REFUSED, { runId, attemptId, ...(snapshotDigest === null ? {} : { candidateSnapshotDigest: snapshotDigest }) });
+    }
+    const row = this.db.get<{ attempt_id: string; state: string }>(
+      "SELECT attempt_id, state FROM candidate_pipeline_attempts WHERE run_id = ?",
+      [runId],
+    );
+    if (row?.attempt_id === attemptId && row.state === "RUNNING") return null;
+    const releasedByAcp = this.db.get<{ n: number }>(
+      `SELECT 1 AS n FROM audit_events WHERE run_id = ? AND (
+          (kind = ? AND json_extract(evidence_json, '$.kind') = 'candidate_pipeline_attempt'
+                    AND json_extract(evidence_json, '$.target') = ?)
+          OR (kind = 'CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED' AND json_extract(evidence_json, '$.attemptId') = ?)) LIMIT 1`,
+      [runId, OWNERLESS_STALL_OWED, attemptId, attemptId],
+    ) !== undefined;
+    return releasedByAcp ? released : null;
   }
 
   /**
@@ -1244,6 +1323,18 @@ export class CandidatePipeline {
         [input.runId, attemptId, input.ownerSessionId, input.ownerBindingGeneration, startedAt, deadlineAt, startedAt],
       );
       if (inserted.changes === 1) {
+        // #1344 B — the key and request this attempt answers, so a replay of the key can find it.
+        if (input.replayIdentity) {
+          this.audit.record({
+            kind: CANDIDATE_PIPELINE_ATTEMPT_STARTED,
+            runId: input.runId,
+            evidence: {
+              attemptId,
+              idempotencyKeyDigest: resultSubmitKeyDigestOf(input.replayIdentity.idempotencyKey),
+              mcpFingerprint: input.replayIdentity.requestFingerprint,
+            },
+          });
+        }
         if (prior?.state === "RUNNING" && prior.deadline_at <= startedAt) {
           this.db.afterCommit(() => this.abortAttempt(prior.attempt_id));
           this.recordAttemptReclaimed({
@@ -1453,6 +1544,32 @@ export class CandidatePipeline {
         WHERE run_id = ? AND attempt_id = ? AND state = 'RUNNING'`,
       [this.clock.nowIso(), runId, attemptId],
     );
+  }
+
+  /**
+   * An attempt ends its own hold; #1344 B — and, for a result_submit, records with it what the attempt answered (its
+   * stage, reason codes and candidate), so a replay whose response was never stored is answered that. One that threw
+   * records nothing: its outcome stays unknown.
+   */
+  private endAttempt(input: SubmitResultInput, attemptId: string, outcome: Decision<PipelineOutcome> | undefined): void {
+    this.db.tx(() => {
+      this.releaseAttempt(input.runId, attemptId);
+      if (outcome === undefined || input.replayIdentity === undefined) return;
+      const evidenceDigest = outcome.allowed ? null : outcome.evidence["candidateSnapshotDigest"];
+      this.audit.record({
+        kind: CANDIDATE_PIPELINE_ATTEMPT_ENDED,
+        runId: input.runId,
+        reasonCode: outcome.reasonCode,
+        evidence: {
+          attemptId,
+          allowed: outcome.allowed,
+          stage: outcome.allowed ? outcome.value.stage : null,
+          stageReasonCode: outcome.allowed && "reasonCode" in outcome.value ? outcome.value.reasonCode : null,
+          candidateSnapshotDigest: outcome.allowed ? outcome.value.snapshotDigest
+            : typeof evidenceDigest === "string" ? evidenceDigest : null,
+        },
+      });
+    });
   }
 
   /**
