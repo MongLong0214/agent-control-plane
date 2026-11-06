@@ -24,8 +24,8 @@ import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
 import { ArtifactKind, Role, RunKind, roleKeyFor } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
-import { contractChangePlanForSubmission, isContractChangeRun } from "../registry/contract-change-plan.ts";
-import { firstActivationFactsOf } from "../registry/manifest-activation-grants.ts";
+import { ContractChangeRefusal, contractChangePlanForSubmission, isContractChangeRun } from "../registry/contract-change-plan.ts";
+import { contractChangeRevertFactsOf, firstActivationFactsOf } from "../registry/manifest-activation-grants.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { BlindReviewGate } from "../review/blind-review.ts";
 import type { CandidatePipeline } from "../run/candidate-pipeline.ts";
@@ -257,9 +257,15 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
           runId, refusal: "SUPERSEDES_TASKS_NOT_STANDARD_WORK", kind: run.kind,
         });
       }
+      // #1347 — only a CONTRACT_CHANGE PLAN reverts a contract change.
+      if (plan["revertsContractChangeRunId"] !== undefined && !isContractChangeRun(run)) {
+        return deny(ReasonCode.INVALID_ARGUMENT, "only a CONTRACT_CHANGE PLAN reverts a contract change", {
+          runId, refusal: ContractChangeRefusal.REVERT_TARGET_INVALID, kind: run.kind,
+        });
+      }
       if (isProjectlessBootstrap(run) && source.bootstrap.residentGenesisRequired && plan["genesis"] === undefined) return deny(ReasonCode.INVALID_ARGUMENT,"bootstrap PLAN requires inline genesis bytes",{refusal:"GENESIS_MISSING"});
       const admitted = isContractChangeRun(run)
-        ? contractChangePlanForSubmission(run, plan, (digest) => source.projects.manifest(digest), firstActivationFactsOf(source.db, run))
+        ? contractChangePlanForSubmission(run, plan, (digest) => source.projects.manifest(digest), firstActivationFactsOf(source.db, run), contractChangeRevertFactsOf(source.db, run))
         : planForSubmission(run, plan);
       if (!admitted.allowed) return admitted as Decision<{ digest: string }>;
       // The authority field is ACP-owned. Never retain a producer's claim, even with no CEO replies.

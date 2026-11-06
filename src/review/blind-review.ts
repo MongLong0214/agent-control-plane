@@ -60,7 +60,7 @@ import {
   sameContractChangeBinding,
   storedManifest,
 } from "../registry/contract-change-plan.ts";
-import { firstActivationFactsOf } from "../registry/manifest-activation-grants.ts";
+import { contractChangeRevertFactsOf, firstActivationFactsOf } from "../registry/manifest-activation-grants.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import {
   ProviderSessionProvisionError,
@@ -2830,6 +2830,7 @@ export class BlindReviewGate {
       planArtifact,
       (digest) => storedManifest(this.db, digest),
       firstActivationFactsOf(this.db, facts),
+      contractChangeRevertFactsOf(this.db, facts),
     );
     if (!current.allowed) return current as Decision<TrustedContractChange | null>;
     if (!sameContractChangeBinding(current.value.binding, named)) {

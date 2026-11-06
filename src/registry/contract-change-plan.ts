@@ -72,6 +72,19 @@ export const ContractChangeRefusal = {
    * missing, extra or repeated, a field that does not match, or a commit that is not 40 lowercase hex.
    */
   FIRST_ACTIVATION_REVISIONS_MISMATCH: "CONTRACT_CHANGE_FIRST_ACTIVATION_REVISIONS_MISMATCH",
+  /** #1347 — another run's consumed grant already reverted the CONTRACT_CHANGE this PLAN names. */
+  REVERT_ALREADY_USED: "CONTRACT_CHANGE_REVERT_ALREADY_USED",
+  /**
+   * #1347 — the named run is not a COMPLETED, activated CONTRACT_CHANGE of this project whose one
+   * consumed grant and one activation record agree, or the facts to judge it were not supplied.
+   */
+  REVERT_TARGET_INVALID: "CONTRACT_CHANGE_REVERT_TARGET_INVALID",
+  /** #1347 — the named change was not additive: it lowered, changed or removed existing verification. */
+  REVERT_TARGET_NOT_ADDITIVE: "CONTRACT_CHANGE_REVERT_TARGET_NOT_ADDITIVE",
+  /** #1347 — the run's pin, or the project's active manifest, is not the one the named change activated last. */
+  REVERT_BASE_STALE: "CONTRACT_CHANGE_REVERT_BASE_STALE",
+  /** #1347 — the carried manifest is not exactly the manifest the named change replaced. */
+  REVERT_MANIFEST_MISMATCH: "CONTRACT_CHANGE_REVERT_MANIFEST_MISMATCH",
 } as const;
 export type ContractChangeRefusal = (typeof ContractChangeRefusal)[keyof typeof ContractChangeRefusal];
 
@@ -165,6 +178,37 @@ export interface ContractChangeRun {
 
 /** Reads a stored manifest back by its digest; null when nothing is stored under it. */
 export type ManifestLookup = (digest: string) => unknown;
+
+/**
+ * #1347 — what the database holds about the CONTRACT_CHANGE a revert PLAN names, as it stands now,
+ * read for the reverting run. Every reader of a CONTRACT_CHANGE PLAN passes it; a PLAN naming a revert
+ * is refused where it is not supplied.
+ */
+export interface ContractChangeRevertFacts {
+  /** The named run; null when there is none. */
+  target: { kind: string; projectId: string | null; state: string } | null;
+  /** The named run's activation grant; `intact` when its columns still recompute to its digest. */
+  grant: {
+    grantId: string;
+    projectId: string;
+    fromManifestDigest: string;
+    manifestDigest: string;
+    consumed: boolean;
+    intact: boolean;
+  } | null;
+  /** Whether the named run holds a first-activation grant. */
+  firstActivation: boolean;
+  /** The named run's PROJECT_MANIFEST_ACTIVATED rows, oldest first. */
+  activations: ReadonlyArray<{ eventId: number; grantId: unknown; from: unknown; to: unknown }>;
+  /** The reverting run's project: its latest PROJECT_MANIFEST_ACTIVATED row, and its active manifest. */
+  latestActivationEventId: number | null;
+  activeManifestDigest: string | null;
+  /** Other runs whose consumed grant was issued for a PLAN reverting the named run. */
+  revertedBy: readonly string[];
+}
+
+/** #1347 — the revert facts for the run a PLAN names. */
+export type RevertLookup = (targetRunId: string) => ContractChangeRevertFacts;
 
 export const isContractChangeRun = (run: { kind: string }): boolean => run.kind === RunKind.CONTRACT_CHANGE;
 
@@ -493,6 +537,110 @@ const baseManifestFor = (run: ContractChangeRun, lookup: ManifestLookup): Decisi
   return allow(ReasonCode.OK, parsed.data);
 };
 
+/** A stored manifest read back by its digest and checked to hash to it; null otherwise. */
+const manifestAt = (lookup: ManifestLookup, digest: string): ProjectManifest | null => {
+  const stored = lookup(digest);
+  const parsed = stored === null || stored === undefined ? null : projectManifestSchema.safeParse(stored);
+  return parsed?.success && manifestDigest(parsed.data) === digest ? parsed.data : null;
+};
+
+/**
+ * #1347 — the one judgement of a CONTRACT_CHANGE PLAN that names `revertsContractChangeRunId` C1, asked
+ * by every reader of such a PLAN (plan_submit, review, candidate freeze, and the grant at CONFIRM,
+ * before the first GitHub write and in the activation transaction). Admitted only when the PLAN is the
+ * exact inverse of an additive change, in this order:
+ *
+ * - no other run's consumed grant reverted C1 already (ALREADY_USED);
+ * - C1 is a COMPLETED CONTRACT_CHANGE of this project, not a first activation, whose one grant is
+ *   consumed and unaltered and whose one activation record names that grant's move (TARGET_INVALID);
+ * - C1 was additive: from its grant's from-manifest X0 to its manifest X1 nothing is lowered and every
+ *   command of X0 is in X1 unchanged (TARGET_NOT_ADDITIVE);
+ * - the run's pin and the project's active manifest are X1, and C1's activation is the project's latest
+ *   (BASE_STALE);
+ * - the carried manifest is exactly X0 (MANIFEST_MISMATCH).
+ *
+ * Admitted, the PLAN may lower the bar to X0 and nothing else. Every other lowering is still refused.
+ */
+export const contractChangeRevert = (
+  run: ContractChangeRun,
+  named: unknown,
+  suppliedDigest: string,
+  lookup: ManifestLookup,
+  revert: RevertLookup | null,
+): Decision<{ targetRunId: string }> => {
+  type Judged = Decision<{ targetRunId: string }>;
+  const invalid = (cause: string, evidence: Evidence = {}): Judged =>
+    refuse(ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_DENIED, ContractChangeRefusal.REVERT_TARGET_INVALID, "the PLAN names no completed, activated CONTRACT_CHANGE of this project to revert", {
+      revertsContractChangeRunId: typeof named === "string" ? named : null,
+      cause,
+      ...evidence,
+    });
+  if (typeof named !== "string" || named.length === 0) return invalid("TARGET_NOT_NAMED");
+  if (revert === null) return invalid("FACTS_NOT_SUPPLIED");
+  const facts = revert(named);
+  const evidence = { revertsContractChangeRunId: named };
+  if (facts.revertedBy.length > 0) {
+    return refuse(ReasonCode.CONFLICT, ContractChangeRefusal.REVERT_ALREADY_USED, "another run has already reverted this CONTRACT_CHANGE", {
+      ...evidence,
+      revertedBy: [...facts.revertedBy],
+    });
+  }
+  const { target, grant, activations } = facts;
+  if (target === null) return invalid("TARGET_MISSING");
+  if (target.kind !== RunKind.CONTRACT_CHANGE) return invalid("TARGET_NOT_CONTRACT_CHANGE", { kind: target.kind });
+  if (target.projectId !== run.projectId) return invalid("TARGET_OTHER_PROJECT", { targetProjectId: target.projectId });
+  if (target.state !== "COMPLETED") return invalid("TARGET_NOT_COMPLETED", { state: target.state });
+  if (facts.firstActivation) return invalid("TARGET_FIRST_ACTIVATION");
+  if (grant === null || !grant.consumed || !grant.intact || grant.projectId !== run.projectId) {
+    return invalid("TARGET_GRANT_NOT_CONSUMED", { grantId: grant?.grantId ?? null });
+  }
+  const activation = activations.length === 1 ? activations[0]! : null;
+  if (
+    activation === null ||
+    activation.grantId !== grant.grantId ||
+    activation.from !== grant.fromManifestDigest ||
+    activation.to !== grant.manifestDigest
+  ) {
+    return invalid("TARGET_ACTIVATION_MISMATCH", { grantId: grant.grantId, activations: activations.length });
+  }
+  const before = manifestAt(lookup, grant.fromManifestDigest);
+  const after = manifestAt(lookup, grant.manifestDigest);
+  if (before === null || after === null) return invalid("TARGET_MANIFEST_UNREADABLE", { from: grant.fromManifestDigest, to: grant.manifestDigest });
+  const lowered = verificationBarLowerings(before, after);
+  const changed = before.verificationCommands
+    .filter((command) => !after.verificationCommands.some((next) => canonicalJson(next) === canonicalJson(command)))
+    .map((command) => command.id);
+  if (lowered.length > 0 || changed.length > 0) {
+    return refuse(ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT, ContractChangeRefusal.REVERT_TARGET_NOT_ADDITIVE, "the named CONTRACT_CHANGE changed or removed existing verification; only an additive change is reverted", {
+      ...evidence,
+      lowered: lowered.map((entry) => ({ kind: entry.kind, ...entry.detail })),
+      changedCommands: changed,
+    });
+  }
+  if (
+    run.pinnedManifestDigest !== grant.manifestDigest ||
+    facts.activeManifestDigest !== grant.manifestDigest ||
+    facts.latestActivationEventId !== activation.eventId
+  ) {
+    return refuse(ReasonCode.MANIFEST_PIN_SUPERSEDED, ContractChangeRefusal.REVERT_BASE_STALE, "the manifest the named CONTRACT_CHANGE activated is no longer this run's base and the project's latest activation", {
+      ...evidence,
+      activated: grant.manifestDigest,
+      pinnedManifestDigest: run.pinnedManifestDigest,
+      active: facts.activeManifestDigest,
+      latestActivationEventId: facts.latestActivationEventId,
+      targetActivationEventId: activation.eventId,
+    });
+  }
+  if (suppliedDigest !== grant.fromManifestDigest) {
+    return refuse(ReasonCode.CONTRACT_DIGEST_MISMATCH, ContractChangeRefusal.REVERT_MANIFEST_MISMATCH, "the carried manifest is not exactly the one the named CONTRACT_CHANGE replaced", {
+      ...evidence,
+      supplied: suppliedDigest,
+      replaced: grant.fromManifestDigest,
+    });
+  }
+  return allow(ReasonCode.OK, { targetRunId: named });
+};
+
 interface ValidatedContractChange {
   manifest: ProjectManifest;
   manifestDigest: string;
@@ -505,6 +653,7 @@ const validateContractChangePlan = (
   run: ContractChangeRun,
   plan: Record<string, unknown>,
   lookup: ManifestLookup,
+  revert: RevertLookup | null,
 ): Decision<ValidatedContractChange> => {
   if (!run.projectId) {
     return refuse(ReasonCode.INVALID_ARGUMENT, ContractChangeRefusal.PROJECT_MISSING, "a CONTRACT_CHANGE run names the project whose contract it changes");
@@ -538,6 +687,12 @@ const validateContractChangePlan = (
   const base = baseManifestFor(run, lookup);
   if (!base.allowed) return base as Decision<ValidatedContractChange>;
   const baseDigest = run.pinnedManifestDigest!;
+  // #1347 — a PLAN naming a revert is judged as one before anything else about its base.
+  const reverting = plan["revertsContractChangeRunId"] !== undefined;
+  if (reverting) {
+    const judged = contractChangeRevert(run, plan["revertsContractChangeRunId"], supplied, lookup, revert);
+    if (!judged.allowed) return judged as Decision<ValidatedContractChange>;
+  }
   if (canonicalJson(manifest.value.repositories) !== canonicalJson(base.value.repositories)) {
     return refuse(
       ReasonCode.REPOSITORY_IDENTITY_MISMATCH,
@@ -552,7 +707,8 @@ const validateContractChangePlan = (
     });
   }
   // Workflow replacements are reviewed independently and activated only by a CEO-confirmed grant.
-  const lowered = verificationBarLowerings(base.value, manifest.value).filter(entry => entry.kind !== "CI_WORKFLOW_DIGEST_CHANGED" || manifest.value.ciWorkflows.some(w => w.approvedDigest === null));
+  // #1347 — the exact inverse of an additive change, admitted above, lowers only what that change added.
+  const lowered = reverting ? [] : verificationBarLowerings(base.value, manifest.value).filter(entry => entry.kind !== "CI_WORKFLOW_DIGEST_CHANGED" || manifest.value.ciWorkflows.some(w => w.approvedDigest === null));
   if (lowered.length > 0) {
     // Lowering the bar needs the owner's approval bound to these exact lowerings. Nothing can bind
     // one yet, so every lowering is refused; a stricter or equivalent manifest is not. A changed
@@ -588,10 +744,12 @@ export const contractChangePlanForSubmission = (
   lookup: ManifestLookup,
   /** #512 — the first-activation facts, where the caller holds the database; E2–E5 are then checked too. */
   facts: FirstActivationFacts | null = null,
+  /** #1347 — the revert facts; a PLAN naming a revert is refused without them. */
+  revert: RevertLookup | null = null,
 ): Decision<Record<string, unknown>> => {
   // #512 — a PLAN that says it is a first activation is judged only as one, never as a change of a base.
   if (isFirstActivationPlan(plan)) return firstActivationPlanForSubmission(run, plan, facts);
-  const validated = validateContractChangePlan(run, plan, lookup);
+  const validated = validateContractChangePlan(run, plan, lookup, revert);
   if (!validated.allowed) return validated as Decision<Record<string, unknown>>;
   return allow(ReasonCode.OK, { ...plan, projectManifest: validated.value.manifest });
 };
@@ -780,6 +938,12 @@ const validateFirstActivationPlan = (
       pinnedManifestDigest: run.pinnedManifestDigest,
     });
   }
+  // #1347 — a first activation has no earlier change to revert.
+  if (plan["revertsContractChangeRunId"] !== undefined) {
+    return refuse(ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_DENIED, ContractChangeRefusal.REVERT_TARGET_INVALID, "a first activation reverts no CONTRACT_CHANGE", {
+      cause: "FIRST_ACTIVATION_PLAN",
+    });
+  }
   const carried = plan["projectManifest"];
   const named = plan["projectManifestDigest"];
   if (carried === undefined) {
@@ -902,12 +1066,14 @@ export const currentContractChangeTarget = (
   lookup: ManifestLookup,
   /** #512 — as for `contractChangePlanForSubmission`: given, a first activation is judged against them. */
   facts: FirstActivationFacts | null = null,
+  /** #1347 — as for `contractChangePlanForSubmission`. */
+  revert: RevertLookup | null = null,
 ): Decision<(CurrentContractChangePlan & { firstActivation?: undefined }) | (CurrentFirstActivationPlan & { firstActivation: true })> => {
   if (planArtifact !== null && isFirstActivationPlan(planArtifact.content)) {
     const first = currentFirstActivationPlan(run, planArtifact, facts);
     return first.allowed ? allow(ReasonCode.OK, { ...first.value, firstActivation: true as const }) : (first as Decision<never>);
   }
-  return currentContractChangePlan(run, planArtifact, lookup);
+  return currentContractChangePlan(run, planArtifact, lookup, revert);
 };
 
 /**
@@ -919,13 +1085,15 @@ export const currentContractChangePlan = (
   run: ContractChangeRun,
   planArtifact: { digest: string; content: unknown } | null,
   lookup: ManifestLookup,
+  /** #1347 — as for `contractChangePlanForSubmission`. */
+  revert: RevertLookup | null = null,
 ): Decision<CurrentContractChangePlan> => {
   if (planArtifact === null || !isRecord(planArtifact.content)) {
     return refuse(ReasonCode.INVALID_ARGUMENT, ContractChangeRefusal.MANIFEST_MISSING, "the CONTRACT_CHANGE run has no PLAN carrying a manifest", {
       planDigest: planArtifact?.digest ?? null,
     });
   }
-  const validated = validateContractChangePlan(run, planArtifact.content, lookup);
+  const validated = validateContractChangePlan(run, planArtifact.content, lookup, revert);
   if (!validated.allowed) {
     return deny(validated.reasonCode, validated.message, { planDigest: planArtifact.digest, ...validated.evidence }) as Decision<CurrentContractChangePlan>;
   }

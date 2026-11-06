@@ -12,9 +12,11 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
 import { isMcpReservationInFlight } from "../ingress/ingress-guard.ts";
 import {
   type AnyContractChangeBinding,
+  type ContractChangeRevertFacts,
   type ContractChangeWorkflowEvidence,
   type FirstActivationBinding,
   type FirstActivationFacts,
+  type RevertLookup,
   type WorkflowRevision,
   currentContractChangePlan,
   currentFirstActivationPlan,
@@ -1035,11 +1037,13 @@ export class ManifestActivationGrants {
       return deny(ReasonCode.MANIFEST_ACTIVATION_TARGET_STALE, "the candidate binds no contract change", evidence);
     }
     const current = this.currentPlan(run);
-    if (!current.allowed || !sameContractChangeBinding(current.value.binding, binding)) {
+    // #1347 — a PLAN that no longer passes (a revert whose facts moved) is refused for its own reason.
+    if (!current.allowed) return deny(current.reasonCode, current.message, { ...evidence, ...current.evidence });
+    if (!sameContractChangeBinding(current.value.binding, binding)) {
       return deny(ReasonCode.MANIFEST_ACTIVATION_TARGET_STALE, "the PLAN this candidate binds is no longer the run's current PLAN", {
         ...evidence,
         candidate: binding,
-        current: current.allowed ? current.value.binding : null,
+        current: current.value.binding,
       });
     }
     const packet = this.artifacts.latestForSnapshot<unknown>(run.runId, ArtifactKind.PRODUCTION_READY_PACKET, candidateSnapshotDigest);
@@ -1160,6 +1164,7 @@ export class ManifestActivationGrants {
       run,
       this.artifacts.latest<unknown>(run.runId, ArtifactKind.PLAN),
       (digest) => storedManifest(this.db, digest),
+      contractChangeRevertFactsOf(this.db, run),
     );
   }
 
@@ -1262,6 +1267,70 @@ export const firstActivationFactsOf = (
       [projectId],
     ),
     runRepositories: db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM run_repositories WHERE run_id = ?`, [run.runId])?.n ?? 0,
+  };
+};
+
+/**
+ * #1347 — the revert facts for `run`, as they stand now, for the run a PLAN names: that run, its grant
+ * (consumed, and still recomputing to its digest), whether it was a first activation, its activation
+ * records, the project's latest activation and active manifest, and the other runs whose consumed grant
+ * was issued for a PLAN reverting it. Read inside the activation transaction, the last of these is the
+ * consumption of the revert authority: the grant consumed there is the one a second revert meets.
+ */
+export const contractChangeRevertFactsOf = (
+  db: Pick<Db, "get" | "all">,
+  run: { runId: string; projectId: string | null },
+): RevertLookup => (targetRunId: string): ContractChangeRevertFacts => {
+  const target = db.get<{ kind: string; project_id: string | null; state: string }>(
+    `SELECT kind, project_id, state FROM runs WHERE run_id = ?`,
+    [targetRunId],
+  );
+  const raw = db.get<RawGrant>(`SELECT * FROM manifest_activation_grants WHERE run_id = ?`, [targetRunId]);
+  const grant = raw ? hydrate(raw) : null;
+  const activations = db.all<{ event_id: number; grant_id: unknown; from_digest: unknown; to_digest: unknown }>(
+    `SELECT event_id,
+            CASE WHEN json_valid(evidence_json) THEN json_extract(evidence_json, '$.grantId') END AS grant_id,
+            CASE WHEN json_valid(evidence_json) THEN json_extract(evidence_json, '$.from') END AS from_digest,
+            CASE WHEN json_valid(evidence_json) THEN json_extract(evidence_json, '$.to') END AS to_digest
+       FROM audit_events
+      WHERE kind = 'PROJECT_MANIFEST_ACTIVATED' AND run_id = ?
+      ORDER BY event_id`,
+    [targetRunId],
+  );
+  const projectId = run.projectId ?? "";
+  return {
+    target: target ? { kind: target.kind, projectId: target.project_id, state: target.state } : null,
+    grant: grant
+      ? (() => {
+          const { grantDigest, consumedAt, consumedAttemptId: _attempt, consumer: _consumer, ...identity } = grant;
+          return {
+            grantId: grant.grantId,
+            projectId: grant.projectId,
+            fromManifestDigest: grant.fromManifestDigest,
+            manifestDigest: grant.manifestDigest,
+            consumed: consumedAt !== null,
+            intact: grantDigestOf(identity) === grantDigest,
+          };
+        })()
+      : null,
+    firstActivation: db.get(`SELECT 1 AS n FROM manifest_first_activation_grants WHERE run_id = ?`, [targetRunId]) !== undefined,
+    activations: activations.map((row) => ({ eventId: row.event_id, grantId: row.grant_id, from: row.from_digest, to: row.to_digest })),
+    latestActivationEventId: db.get<{ event_id: number | null }>(
+      `SELECT MAX(event_id) AS event_id FROM audit_events WHERE kind = 'PROJECT_MANIFEST_ACTIVATED' AND project_id = ?`,
+      [projectId],
+    )?.event_id ?? null,
+    activeManifestDigest: db.get<{ active_manifest_digest: string | null }>(
+      `SELECT active_manifest_digest FROM projects WHERE project_id = ?`,
+      [projectId],
+    )?.active_manifest_digest ?? null,
+    revertedBy: db.all<{ run_id: string }>(
+      `SELECT DISTINCT g.run_id FROM manifest_activation_grants g
+         JOIN run_artifacts a ON a.run_id = g.run_id AND a.kind = 'PLAN' AND a.digest = g.plan_digest
+        WHERE g.consumed_at IS NOT NULL AND g.run_id <> ?
+          AND CASE WHEN json_valid(a.content_json) THEN json_extract(a.content_json, '$.revertsContractChangeRunId') END = ?
+        ORDER BY g.run_id`,
+      [run.runId, targetRunId],
+    ).map((row) => row.run_id),
   };
 };
 
