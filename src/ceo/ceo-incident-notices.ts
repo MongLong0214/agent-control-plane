@@ -471,8 +471,13 @@ export const withdrawResolvedNotices = (
 interface NoticeRequest {
   notification: string | null;
   runId: string | null;
-  /** The CTO escalation it asks about: its `escalationId`, or a CTO_ESCALATION incident's episode. */
+  /**
+   * The CTO escalation it asks about: its `escalationId`, a CTO_ESCALATION incident's episode, or for a notice that
+   * names neither, the escalation it was written for (`escalationWrittenWith`).
+   */
   escalationId?: number;
+  /** For that last: the CEO_NOTIFICATION record written with the notice, which links it to its escalation. */
+  writtenWith?: number;
   /** The candidate a review notice asks the CEO to decide. */
   candidateSnapshotDigest?: string;
   /** A stall notice's stalled resource: its kind, its id and since when. */
@@ -507,7 +512,61 @@ interface NoticeRow {
   payload_json: string;
 }
 
-const requestOf = (row: NoticeRow): { request: NoticeRequest; incident: Incident | null } | null => {
+/**
+ * The escalation a TRUE_ESCALATION notice that names none was written for: the shape `ProductionGate.openEscalation`
+ * wrote before its notice named its escalation, the CTO_ESCALATION record, then the notice (`enqueueAdHocNotice`, keyed
+ * by its payload's digest) and its CEO_NOTIFICATION record, which names neither. A retarget (`Outbox.retargetOrReject`,
+ * `adoptHolderMessages`, the CEO readdress) moves that row in place, its id, key and body kept, so it is still the notice
+ * written then. The link is restored only through that write: the one such CEO_NOTIFICATION record of its run whose own
+ * fields, with the notice's `whyItMatters` (the one field it leaves out), give the key's digest; and the run's audit event
+ * immediately before it, past those the enqueue wrote about the notice itself (naming its id), a CTO_ESCALATION, the only
+ * one of the run whose fields give that digest too. A link missing, cut by the audit or shared by two of them: null, and
+ * nothing here settles the notice.
+ */
+const escalationWrittenWith = (
+  db: Pick<Db, "get" | "all">,
+  row: NoticeRow,
+  payload: Record<string, unknown>,
+): { escalationId: number; writtenWith: number } | null => {
+  const keyPrefix = `notify:${NotificationKind.TRUE_ESCALATION}:${row.run_id}:`;
+  if (row.run_id === null || payload["notification"] !== NotificationKind.TRUE_ESCALATION
+      || !row.idempotency_key.startsWith(keyPrefix)) return null;
+  const keyDigest = row.idempotency_key.slice(keyPrefix.length);
+  const keyed = (evidenceJson: string): boolean => {
+    let evidence: unknown;
+    try {
+      evidence = JSON.parse(evidenceJson);
+    } catch {
+      return false;
+    }
+    if (!isRecord(evidence)) return false;
+    const { notification: _notification, ...fields } = evidence;
+    return digestOf({ ...fields, whyItMatters: payload["whyItMatters"] }) === keyDigest;
+  };
+  const only = (rows: Array<{ event_id: number; evidence_json: string }>): number | null => {
+    const matched = rows.filter((candidate) => keyed(candidate.evidence_json));
+    return matched.length === 1 ? matched[0]!.event_id : null;
+  };
+  const record = only(db.all(
+    `SELECT event_id, evidence_json FROM audit_events WHERE run_id = ? AND kind = 'CEO_NOTIFICATION'
+       AND json_extract(evidence_json, '$.messageId') IS NULL AND json_extract(evidence_json, '$.notification') = ?`,
+    [row.run_id, NotificationKind.TRUE_ESCALATION],
+  ));
+  if (record === null) return null;
+  const escalationId = only(db.all(
+    `SELECT event_id, evidence_json FROM audit_events WHERE run_id = ? AND kind = 'CTO_ESCALATION'`,
+    [row.run_id],
+  ));
+  const before = db.get<{ event_id: number }>(
+    `SELECT event_id FROM audit_events WHERE run_id = ? AND event_id < ?
+       AND json_extract(evidence_json, '$.messageId') IS NOT ?
+     ORDER BY event_id DESC LIMIT 1`,
+    [row.run_id, record, row.message_id],
+  );
+  return escalationId !== null && before?.event_id === escalationId ? { escalationId, writtenWith: record } : null;
+};
+
+const requestOf = (db: Pick<Db, "get" | "all">, row: NoticeRow): { request: NoticeRequest; incident: Incident | null } | null => {
   let parsed: unknown;
   try {
     parsed = JSON.parse(row.payload_json);
@@ -523,11 +582,13 @@ const requestOf = (row: NoticeRow): { request: NoticeRequest; incident: Incident
   const incident = incidentOfNotice(row.run_id, row.payload_json);
   const escalationId = typeof payload["escalationId"] === "number" ? payload["escalationId"]
     : incident?.cls === IncidentClass.CTO_ESCALATION && /^\d+$/.test(incident.episode) ? Number(incident.episode) : undefined;
+  const written = escalationId === undefined && incident === null ? escalationWrittenWith(db, row, payload) : null;
   const [candidateSnapshotDigest, stall, resource, since] = [text("candidateSnapshotDigest"), text("stall"), text("resource"), text("since")];
   const request: NoticeRequest = {
     notification: text("notification") ?? null,
     runId: row.run_id,
     ...(escalationId !== undefined ? { escalationId } : {}),
+    ...(written !== null ? { escalationId: written.escalationId, writtenWith: written.writtenWith } : {}),
     ...(candidateSnapshotDigest !== undefined ? { candidateSnapshotDigest } : {}),
     ...(stall !== undefined ? { stall } : {}),
     ...(resource !== undefined ? { resource } : {}),
@@ -693,7 +754,7 @@ export const settleConcludedNotices = (db: Db, audit: AuditLog): string[] => {
       ORDER BY created_at, rowid`,
   );
   for (const row of rows) {
-    const asked = requestOf(row);
+    const asked = requestOf(db, row);
     const concluded = asked === null ? null : conclusionOf(db, row, asked.request, asked.incident);
     if (asked === null || concluded === null) continue;
     const written = db.txDecision((): Decision<boolean> => {
