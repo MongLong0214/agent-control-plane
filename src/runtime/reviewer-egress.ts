@@ -510,8 +510,9 @@ export const acquireReviewerEgress = async (
  * #1344 D — what a daemon's start found of reviewer egress proxies an earlier instance launched and left running.
  * `leases`: the lease directories left behind (their names). `discovery`: COMPLETE when every live process of this user
  * was listed and its argv read; otherwise FAILED, with why (`discoveryError`), and no lease is removed. `stopped`: the
- * proxies matched to a lease and stopped. `survived`: matched proxies that did not stop. `kept`: the leases not removed,
- * because their proxy survived or because discovery could not prove it gone. `portFree`: whether the reviewer port takes
+ * proxies matched to a lease and proven gone after it was signalled. `survived`: matched proxies proven still there.
+ * `unproven`: matched proxies whose identity could not be read while stopping them, so they are neither. `kept`: the
+ * leases not removed, because their proxy is not proven gone. `portFree`: whether the reviewer port takes
  * a listener now. False means a holder not proven to be one of these proxies, which is left alone: a review start fails
  * as it did before, and this record is the evidence of why.
  */
@@ -522,6 +523,7 @@ export interface ReviewerEgressReap {
   discoveryError?: string;
   stopped: Array<{ pid: number; lease: string }>;
   survived: Array<{ pid: number; lease: string }>;
+  unproven: Array<{ pid: number; lease: string }>;
   kept: string[];
   portFree: boolean;
 }
@@ -566,23 +568,46 @@ const processGone = (pid: number): boolean => {
   }
 };
 
-/** Signals the exact process while it is still the one identified (same pid and OS start), then waits for it to go. */
-const stopExact = async (pid: number, startToken: string): Promise<boolean> => {
-  const same = (): boolean => readProcessStartToken(pid) === startToken;
+/**
+ * What a pid is now, against the process identified as `startToken`: SAME, OTHER (its start token proves another process
+ * holds the pid), GONE (no process has it: ESRCH), or UNKNOWN (its start token cannot be read while a process holds it).
+ * Only OTHER and GONE prove the identified process is gone.
+ */
+const identityOf = (pid: number, startToken: string): "SAME" | "OTHER" | "GONE" | "UNKNOWN" => {
+  let now: string | null;
+  try {
+    now = readProcessStartToken(pid);
+  } catch {
+    now = null;
+  }
+  if (now !== null) return now === startToken ? "SAME" : "OTHER";
+  return processGone(pid) ? "GONE" : "UNKNOWN";
+};
+
+/**
+ * Signals the exact process only while it is proven still the one identified (same pid and OS start), then waits for
+ * it to go. STOPPED only once it is proven gone; SURVIVED while it is proven still there; UNPROVEN when its identity
+ * cannot be read, in which case it is signalled no further and its lease is kept.
+ */
+const stopExact = async (pid: number, startToken: string): Promise<"STOPPED" | "SURVIVED" | "UNPROVEN"> => {
+  const proven = (identity: ReturnType<typeof identityOf>): boolean => identity === "GONE" || identity === "OTHER";
+  let identity = identityOf(pid, startToken);
   for (const signal of ["SIGTERM", "SIGKILL"] as const) {
-    if (!same()) return true;
+    if (proven(identity)) return "STOPPED";
+    if (identity === "UNKNOWN") return "UNPROVEN";
     try {
       process.kill(pid, signal);
     } catch {
-      return !same();
+      identity = identityOf(pid, startToken);
+      return proven(identity) ? "STOPPED" : identity === "SAME" ? "SURVIVED" : "UNPROVEN";
     }
+    // An exiting process can read UNKNOWN for a moment, before its parent reaps it; only a proof ends the wait.
     const deadline = Date.now() + 1_000;
-    while (Date.now() < deadline) {
-      if (!same()) return true;
+    for (identity = identityOf(pid, startToken); !proven(identity) && Date.now() < deadline; identity = identityOf(pid, startToken)) {
       await delay(25);
     }
   }
-  return !same();
+  return proven(identity) ? "STOPPED" : identity === "SAME" ? "SURVIVED" : "UNPROVEN";
 };
 
 const portTakesListener = (port: number): Promise<boolean> => new Promise((resolve) => {
@@ -599,10 +624,12 @@ const portTakesListener = (port: number): Promise<boolean> => new Promise((resol
  * (a lease that ended removed its own), and a process of this user whose kernel argv ends with exactly the arguments
  * that lease was launched with: this daemon's proxy script, its port and that directory's two files. Only those exact
  * pids are signalled, each while its OS start token is still the one read; never a process found by name, and never
- * what merely holds the port. A lease is removed only when its proxy is proven gone: it was matched and stopped, or
- * discovery was complete and no process matched it. A discovery that failed (`ps` failed, timed out or printed what
- * cannot be read, or a live process's argv could not be read) keeps every lease it did not stop, for the next start to
- * reap. Runs under the lease lock, so no lease of this process is live meanwhile. Null when no lease was left behind.
+ * what merely holds the port. A lease is removed only when its proxy is proven gone (ESRCH, or a start token that
+ * proves another process holds its pid): it was matched and stopped, or discovery was complete and no process matched
+ * it. A discovery that failed (`ps` failed, timed out or printed what cannot be read, or a live process's start token or
+ * argv could not be read) keeps every lease it did not stop, and a stop whose identity read failed keeps its lease, for
+ * the next start to reap. Runs under the lease lock, so no lease of this process is live meanwhile. Null when no lease
+ * was left behind.
  */
 export const reapOrphanedReviewerEgress = async (config: ReviewerEgressConfig | undefined): Promise<ReviewerEgressReap | null> => {
   if (!config) return null;
@@ -630,15 +657,29 @@ export const reapOrphanedReviewerEgress = async (config: ReviewerEgressConfig | 
     let discoveryError = "error" in listed ? listed.error : null;
     const matched: Array<{ pid: number; startToken: string; lease: string }> = [];
     /** Matches one process; false when it is live and its argv cannot be read now. */
+    /**
+     * Matches one process; false when it could be a proxy and cannot be proven one way or the other now: its start
+     * token or argv unreadable while it is live, or its start token unreadable or changed after its argv was read.
+     */
     const inspect = (pid: number): boolean => {
-      const startToken = readProcessStartToken(pid);
-      const argv = startToken === null ? null : readProcessArgv(pid);
+      let startToken: string | null;
+      let argv: readonly string[] | null;
+      try {
+        startToken = readProcessStartToken(pid);
+        argv = startToken === null ? null : readProcessArgv(pid);
+      } catch {
+        startToken = null;
+        argv = null;
+      }
       // Gone since the listing proves nothing is there; a live process whose argv cannot be read could be a proxy.
       if (startToken === null || argv === null) return processGone(pid);
       const signature = signatures.find(({ tail }) =>
         argv.length > tail.length && tail.every((value, index) => argv[argv.length - tail.length + index] === value));
-      if (signature && readProcessStartToken(pid) === startToken) matched.push({ pid, startToken, lease: signature.lease });
-      return true;
+      if (!signature) return true;
+      // The argv read is this process's only while the same start token is read after it.
+      const after = identityOf(pid, startToken);
+      if (after === "SAME") matched.push({ pid, startToken, lease: signature.lease });
+      return after !== "UNKNOWN" && after !== "OTHER";
     };
     let unread = ("error" in listed ? [] : listed.processes).filter(({ zombie }) => !zombie).map(({ pid }) => pid)
       .filter((pid) => !inspect(pid));
@@ -648,14 +689,16 @@ export const reapOrphanedReviewerEgress = async (config: ReviewerEgressConfig | 
       await delay(100);
       unread = unread.filter((pid) => !inspect(pid));
     }
-    if (unread.length > 0) discoveryError ??= `the argv of live process ${unread[0]} could not be read`;
+    if (unread.length > 0) discoveryError ??= `the identity of live process ${unread[0]} could not be read`;
     const stopped: ReviewerEgressReap["stopped"] = [];
     const survived: ReviewerEgressReap["survived"] = [];
+    const unproven: ReviewerEgressReap["unproven"] = [];
     for (const proxy of matched) {
-      (await stopExact(proxy.pid, proxy.startToken) ? stopped : survived).push({ pid: proxy.pid, lease: proxy.lease });
+      const outcome = await stopExact(proxy.pid, proxy.startToken);
+      (outcome === "STOPPED" ? stopped : outcome === "SURVIVED" ? survived : unproven).push({ pid: proxy.pid, lease: proxy.lease });
     }
     const provenGone = (lease: string): boolean =>
-      !survived.some((proxy) => proxy.lease === lease) &&
+      ![...survived, ...unproven].some((proxy) => proxy.lease === lease) &&
       (stopped.some((proxy) => proxy.lease === lease) || discoveryError === null);
     const kept: string[] = [];
     for (const lease of leases) {
@@ -676,6 +719,7 @@ export const reapOrphanedReviewerEgress = async (config: ReviewerEgressConfig | 
       ...(discoveryError === null ? {} : { discoveryError }),
       stopped,
       survived,
+      unproven,
       kept,
       portFree,
     };

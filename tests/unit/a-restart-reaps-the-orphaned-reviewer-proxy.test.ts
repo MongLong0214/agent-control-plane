@@ -3,8 +3,10 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { createConnection, createServer } from "node:net";
 import { basename, join } from "node:path";
 
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
+import type * as ProcessArgv from "../../src/core/process-argv.ts";
+import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import type { ReviewerEgressConfig } from "../../src/runtime/provider.ts";
@@ -13,6 +15,18 @@ import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
+
+// The kernel's start-token read, passed through unless a test makes it fail for one pid (an identity read fault).
+vi.mock("../../src/core/process-argv.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof ProcessArgv>();
+  return { ...actual, readProcessStartToken: vi.fn(actual.readProcessStartToken) };
+});
+const { readProcessStartToken: realStartToken } = await vi.importActual<typeof ProcessArgv>("../../src/core/process-argv.ts");
+/** From the `after`-th read of `pid`'s start token on, the read is unavailable (null); every other read is the kernel's. */
+const faultStartToken = (pid: number, after: number): void => {
+  let reads = 0;
+  vi.mocked(readProcessStartToken).mockImplementation((asked) => (asked === pid && ++reads > after ? null : realStartToken(asked)));
+};
 
 /**
  * #1344 D — a cut-off review's allowlist proxy survived a daemon restart with ppid 1, still listening on the fixed
@@ -43,6 +57,7 @@ const alive = (pid: number): boolean => {
   }
 };
 afterEach(() => {
+  vi.mocked(readProcessStartToken).mockImplementation(realStartToken);
   for (const pid of started.splice(0)) if (alive(pid)) process.kill(pid, "SIGKILL");
 });
 
@@ -111,6 +126,7 @@ describe("#1344 D: a daemon start reaps the reviewer egress proxy an earlier ins
       discovery: "COMPLETE",
       stopped: [{ pid, lease: basename(lease) }],
       survived: [],
+      unproven: [],
       kept: [],
       portFree: true,
     });
@@ -127,7 +143,7 @@ describe("#1344 D: a daemon start reaps the reviewer egress proxy an earlier ins
 
     const reaped = await reapOrphanedReviewerEgress(config);
 
-    expect(reaped).toEqual({ port, leases: [basename(lease)], discovery: "COMPLETE", stopped: [], survived: [], kept: [], portFree: false });
+    expect(reaped).toEqual({ port, leases: [basename(lease)], discovery: "COMPLETE", stopped: [], survived: [], unproven: [], kept: [], portFree: false });
     expect(alive(unrelated)).toBe(true);
     expect(await listening(port)).toBe(true);
   });
@@ -160,7 +176,7 @@ describe("#1344 D: a daemon start reaps the reviewer egress proxy an earlier ins
     }
 
     expect(failed).toMatchObject({
-      port, leases: [basename(lease)], discovery: "FAILED", stopped: [], survived: [], kept: [basename(lease)], portFree: false,
+      port, leases: [basename(lease)], discovery: "FAILED", stopped: [], survived: [], unproven: [], kept: [basename(lease)], portFree: false,
     });
     expect(failed!.discoveryError).toMatch(/^ps failed/);
     expect(existsSync(lease)).toBe(true);
@@ -169,6 +185,53 @@ describe("#1344 D: a daemon start reaps the reviewer egress proxy an earlier ins
     const next = await reapOrphanedReviewerEgress(config);
 
     expect(next).toMatchObject({ discovery: "COMPLETE", stopped: [{ pid, lease: basename(lease) }], kept: [], portFree: true });
+    expect(alive(pid)).toBe(false);
+    expect(existsSync(lease)).toBe(false);
+  });
+
+  it("a start-token read fault during discovery keeps the lease and kills nothing; the next good sweep reaps it", async () => {
+    const { config, port, lease } = await layout();
+    const pid = recordedProxy(config, port, lease);
+    await waitListening(port);
+    // The first read (before its argv) answers; the read after its argv matched, and every later one, does not.
+    faultStartToken(pid, 1);
+
+    const faulted = await reapOrphanedReviewerEgress(config);
+
+    expect(faulted).toMatchObject({ discovery: "FAILED", stopped: [], survived: [], unproven: [], kept: [basename(lease)], portFree: false });
+    expect(faulted!.discoveryError).toContain(`live process ${pid}`);
+    expect(existsSync(lease)).toBe(true);
+    expect(alive(pid)).toBe(true);
+    expect(await listening(port)).toBe(true);
+
+    vi.mocked(readProcessStartToken).mockImplementation(realStartToken);
+    const next = await reapOrphanedReviewerEgress(config);
+
+    expect(next).toMatchObject({ discovery: "COMPLETE", stopped: [{ pid, lease: basename(lease) }], kept: [], portFree: true });
+    expect(alive(pid)).toBe(false);
+    expect(existsSync(lease)).toBe(false);
+  });
+
+  it("a start-token read fault while stopping keeps the lease, signals nothing, and is not reported stopped", async () => {
+    const { config, port, lease } = await layout();
+    const pid = recordedProxy(config, port, lease);
+    await waitListening(port);
+    // Discovery's two reads answer and match it; the stop's identity reads do not.
+    faultStartToken(pid, 2);
+
+    const faulted = await reapOrphanedReviewerEgress(config);
+
+    expect(faulted).toMatchObject({
+      discovery: "COMPLETE", stopped: [], survived: [], unproven: [{ pid, lease: basename(lease) }], kept: [basename(lease)], portFree: false,
+    });
+    expect(existsSync(lease)).toBe(true);
+    expect(alive(pid)).toBe(true);
+    expect(await listening(port)).toBe(true);
+
+    vi.mocked(readProcessStartToken).mockImplementation(realStartToken);
+    const next = await reapOrphanedReviewerEgress(config);
+
+    expect(next).toMatchObject({ stopped: [{ pid, lease: basename(lease) }], unproven: [], kept: [], portFree: true });
     expect(alive(pid)).toBe(false);
     expect(existsSync(lease)).toBe(false);
   });
@@ -200,7 +263,7 @@ describe("#1344 D: a daemon start reaps the reviewer egress proxy an earlier ins
       const [record] = harness.cp.audit.byKind("REVIEWER_EGRESS_REAPED");
       expect(record).toMatchObject({
         reasonCode: ReasonCode.OK,
-        evidence: { port, discovery: "COMPLETE", stopped: [{ pid, lease: basename(lease) }], survived: [], kept: [], portFree: true },
+        evidence: { port, discovery: "COMPLETE", stopped: [{ pid, lease: basename(lease) }], survived: [], unproven: [], kept: [], portFree: true },
       });
       expect(alive(pid)).toBe(false);
       expect(await listening(port)).toBe(false);
