@@ -7,6 +7,7 @@ import {
   deferIncidentNotice,
   deliverIncident,
   enqueueAdHocNotice,
+  runEndedSince,
 } from "./ceo-incident-notices.ts";
 import { deriveHumanGate } from "./human-gate.ts";
 import { admitOwnerDecisionReason } from "./owner-decision-reason.ts";
@@ -1989,6 +1990,13 @@ export class ProductionGate {
    * non-blocking one never moved the run, so it neither shadows the one that did nor is resolved
    * through this door. Every CTO_ESCALATION row is an admitted opening (`openEscalation` rolls a
    * refused one back), and `audit_events` is append only, so this is the whole escalation record.
+   *
+   * #1347 — an escalation whose run has since ended (cancelled, failed, completed) is not open either:
+   * the ended rule is the CEO incident path's own (`runEndedSince`, `resolutionOf`'s RUN_ENDED), asked
+   * on its own, so a CEO decision recorded between the opening and the end does not hide the end.
+   * BLOCKED_POST_MERGE is terminal there but not an end here: the run waits on recovery, and
+   * `openPostMergeResponsibility` still counts its escalation open. Read only; nothing is recorded or
+   * marked resolved.
    */
   openEscalationOf(runId: string): { escalationId: number } | null {
     const opened = this.db.get<{ event_id: number }>(
@@ -2002,7 +2010,10 @@ export class ProductionGate {
          AND json_extract(evidence_json, '$.escalation') = 1 LIMIT 1`,
       [runId, opened.event_id],
     );
-    return answered ? null : { escalationId: opened.event_id };
+    if (answered) return null;
+    const run = this.runs.get(runId);
+    if (run && run.state !== RunState.BLOCKED_POST_MERGE && runEndedSince(this.db, run, opened.event_id) !== null) return null;
+    return { escalationId: opened.event_id };
   }
 
   /**

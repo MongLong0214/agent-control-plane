@@ -292,6 +292,20 @@ const deliveriesOf = (db: Pick<Db, "all">, incident: Incident): NoticeStatus["de
 };
 
 /**
+ * The ended rule (`resolutionOf`, RUN_ENDED): the run is terminal and a RUN_TRANSITION followed `openedEventId`, so it
+ * ended since (cancelled, failed, completed). A run already terminal at that event, as BLOCKED_POST_MERGE is, did
+ * not. The latest such transition's event, or null. `ProductionGate.openEscalationOf` asks the same rule.
+ */
+export const runEndedSince = (db: Pick<Db, "get">, run: { runId: string; state: RunState }, openedEventId: number): number | null =>
+  isTerminal(run.state)
+    ? db.get<{ event_id: number }>(
+      `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'RUN_TRANSITION' AND event_id > ?
+        ORDER BY event_id DESC LIMIT 1`,
+      [run.runId, openedEventId],
+    )?.event_id ?? null
+    : null;
+
+/**
  * The one definition of an incident's resolution, asked by every path that would hand its notice to a CEO:
  * `deliverIncident` before it delivers, `retryDeferredNotices` before it retries, and the outbox
  * (`withdrawResolvedNotices`) before it carries a notice to a CEO it was not addressed to. An incident about
@@ -327,12 +341,8 @@ export const resolutionOf = (db: Pick<Db, "get" | "all">, incident: Incident): R
     [incident.runId, opened],
   );
   if (decided) return { kind: "CEO_DECISION", eventId: decided.event_id };
-  const ended = isTerminal(run.state) ? db.get<{ event_id: number }>(
-    `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'RUN_TRANSITION' AND event_id > ?
-      ORDER BY event_id DESC LIMIT 1`,
-    [incident.runId, opened],
-  ) : undefined;
-  if (ended) return { kind: "RUN_ENDED", eventId: ended.event_id };
+  const ended = runEndedSince(db, { runId: incident.runId, state: run.state }, opened);
+  if (ended !== null) return { kind: "RUN_ENDED", eventId: ended };
   if (runProgressedPast(db, incident.runId, incident.episode)) {
     const openWait = runStateEntry(db, { runId: incident.runId, state: run.state })?.eventId ?? null;
     if (!openOnProgress(incident, openWait) && !episodeHeldOpenOnProgress(db, incident, incident.runId, openWait)) {
