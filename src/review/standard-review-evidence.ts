@@ -2,7 +2,7 @@ import { z } from "zod";
 import { reviewEvidenceAttachAuthority } from "../bootstrap/bootstrap-review-evidence.ts";
 import { screenPublicText } from "../bootstrap/genesis-bundle.ts";
 import type { Clock } from "../core/clock.ts";
-import { credentialShapeMatch } from "../core/credential-shapes.ts";
+import { credentialShapeMatch, STANDARD_REVIEW_EVIDENCE_WRITER, type EvidenceField } from "../core/credential-shapes.ts";
 import { MAX_CREDENTIAL_SCAN_DEPTH } from "../db/audit.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { allow, deny, type Decision } from "../core/errors.ts";
@@ -65,58 +65,140 @@ export const STANDARD_REVIEW_SCAN_MAX_VALUES = 20_000;
 const WHOLE_DIGEST = /^sha256:[0-9a-f]{64}$/;
 const BASE64_TEXT = /^[A-Za-z0-9+/]+={0,2}$/;
 const LONG_BASE64_TEXT = /^[A-Za-z0-9+/]{60,}={0,2}$/;
+/** An exact `sha256:<64hex>` token inside text, nothing of the base64 alphabet on either side (core/credential-shapes.ts isBoundRun). */
+const DIGEST_TOKEN = /(?<![A-Za-z0-9+/])sha256:[0-9a-f]{64}(?![A-Za-z0-9+/=])/g;
 type ScanRefusal = { rule: string; form: string };
 
+/**
+ * #1347 — a `sha256:<64hex>` token in a bundle's text that ACP found in its own stored records of the run's project
+ * (`projectReference`): what the record is, where ACP holds it, and the digest. Who staged the bundle, and what its
+ * text calls the digest, count for nothing.
+ */
+export interface StandardReviewEvidenceReference {
+  /** The artifact's kind (CANDIDATE_SNAPSHOT for a frozen candidate's digest), or MANIFEST. */
+  kind: string;
+  digest: string;
+  /** The project's run that holds it: the artifact's run, or the run that pins the manifest; null for a manifest only the project's activation names. */
+  runId: string | null;
+  /** The artifact that holds it; null for a manifest. */
+  artifactId: string | null;
+  /** The audit event in which the project activated the manifest, when no run of the project pins it; else null. */
+  activationEventId: number | null;
+}
+/** The references ACP holds for some of the given tokens: the store's own answer at stage and attach, the staged set at the freeze. */
+type ResolveReferences = (tokens: readonly string[]) => readonly StandardReviewEvidenceReference[];
+
+/**
+ * The field a bundle's text is checked as. With no verified digest, none: every shape, as for any outside text. With
+ * some, free text whose only exemption is the shared bound-reference rule for exactly those digests, each as an exact
+ * `sha256:<64hex>` token and never as its bare hex (`WriteSite.packetDigests`, `prefixedPacketDigestsOnly`); every
+ * other shape still applies to the token, and every shape to the text around it.
+ */
+const fieldFor = (verified: ReadonlySet<string>): EvidenceField | undefined => (verified.size === 0 ? undefined
+  : { path: [], store: "artifact", site: { writer: STANDARD_REVIEW_EVIDENCE_WRITER, packetDigests: verified, prefixedPacketDigestsOnly: true } });
+
 /** One text through the shared credential rules (core/credential-shapes.ts) and the public-text screen; a whole digest passes. */
-const subjectRefusal = (subject: string): ScanRefusal | null => {
+const subjectRefusal = (subject: string, field: EvidenceField | undefined): ScanRefusal | null => {
   if (WHOLE_DIGEST.test(subject)) return null;
-  const match = credentialShapeMatch(subject);
+  const match = credentialShapeMatch(subject, field);
   if (match !== null) return { rule: match.rule, form: match.form };
   try { screenPublicText(subject); } catch { return { rule: "public_text_screen", form: "other" }; }
   return null;
 };
 
 /**
- * One string or object key, by its form and never its name: canonical base64 of any length (non-empty and
- * re-encoding byte-identically, so a multiple of 4) that decodes to UTF-8 is checked as the text it carries. The
- * raw string is checked too, except for the 60+ character form, which would otherwise be refused as the long
- * base64 run every staged body is; a whole `sha256:<64hex>` digest is a digest.
+ * The texts one string or object key is checked as, by its form and never its name: canonical base64 of any length
+ * (non-empty and re-encoding byte-identically, so a multiple of 4) that decodes to UTF-8 is checked as the text it
+ * carries. The raw string is checked too, except for the 60+ character form, which would otherwise be refused as the
+ * long base64 run every staged body is; a whole `sha256:<64hex>` digest is a digest.
  */
-const textRefusal = (text: string): ScanRefusal | null => {
-  let decoded: string | null = null;
+const subjectsOf = (text: string): string[] => {
   if (BASE64_TEXT.test(text)) {
     const bytes = Buffer.from(text, "base64");
     const utf8 = bytes.toString("utf8");
-    if (bytes.toString("base64") === text && Buffer.from(utf8, "utf8").equals(bytes)) decoded = utf8;
+    if (bytes.toString("base64") === text && Buffer.from(utf8, "utf8").equals(bytes)) return LONG_BASE64_TEXT.test(text) ? [utf8] : [utf8, text];
   }
-  if (decoded === null) return subjectRefusal(text);
-  return subjectRefusal(decoded) ?? (LONG_BASE64_TEXT.test(text) ? null : subjectRefusal(text));
+  return [text];
 };
 
-/** Every string and every object key of the bundle, at any depth, with no field list; bounded, and refused past the bound. */
-const scanBundle = (root: unknown): ScanRefusal | null => {
+/**
+ * Every string and every object key of the bundle, at any depth, with no field list; bounded, and refused past the
+ * bound. The `sha256:<64hex>` tokens in the texts checked are resolved first, and only the references `resolve`
+ * returns for them are exempt (`fieldFor`); any other digest in text is refused as a long base64 run.
+ */
+const scanBundle = (root: unknown, resolve: ResolveReferences): { refused: ScanRefusal } | { references: StandardReviewEvidenceReference[] } => {
+  // In scan order, ending at the first bound passed, so the first refusal is the one a single pass would find.
+  const checked: Array<string | ScanRefusal> = [];
   let values = 0;
-  const visit = (value: unknown, depth: number): ScanRefusal | null => {
-    if (depth > STANDARD_REVIEW_SCAN_MAX_DEPTH) return { rule: "unexaminable_depth", form: "structure" };
-    if ((values += 1) > STANDARD_REVIEW_SCAN_MAX_VALUES) return { rule: "unexaminable_size", form: "structure" };
-    if (typeof value === "string") return textRefusal(value);
-    if (Array.isArray(value)) {
-      for (const item of value) { const found = visit(item, depth + 1); if (found) return found; }
-    } else if (value !== null && typeof value === "object") {
-      for (const [key, item] of Object.entries(value)) {
-        const found = textRefusal(key) ?? visit(item, depth + 1);
-        if (found) return found;
-      }
+  const visit = (value: unknown, depth: number): boolean => {
+    const bound = depth > STANDARD_REVIEW_SCAN_MAX_DEPTH ? "unexaminable_depth" : (values += 1) > STANDARD_REVIEW_SCAN_MAX_VALUES ? "unexaminable_size" : null;
+    if (bound !== null) {
+      checked.push({ rule: bound, form: "structure" });
+      return false;
     }
-    return null;
+    if (typeof value === "string") checked.push(...subjectsOf(value));
+    else if (Array.isArray(value)) return value.every(item => visit(item, depth + 1));
+    else if (value !== null && typeof value === "object") {
+      return Object.entries(value).every(([key, item]) => { checked.push(...subjectsOf(key)); return visit(item, depth + 1); });
+    }
+    return true;
   };
-  return visit(root, 0);
+  visit(root, 0);
+  const tokens = [...new Set(checked.flatMap(s => (typeof s === "string" && !WHOLE_DIGEST.test(s) ? s.match(DIGEST_TOKEN) ?? [] : [])))].sort();
+  const resolved = resolve(tokens);
+  const references = tokens.flatMap(token => resolved.find(r => r.digest === token) ?? []);
+  const field = fieldFor(new Set(references.map(r => r.digest)));
+  for (const item of checked) {
+    const refused = typeof item === "string" ? subjectRefusal(item, field) : item;
+    if (refused !== null) return { refused };
+  }
+  return { references };
 };
+
+/**
+ * #1347 — the earliest stored record of the run's project that `digest` names, as ACP itself computed or recorded
+ * it, or null: a frozen candidate of one of the project's runs, by its candidate digest; an artifact of one, by the
+ * digest the artifact store computed over it (checked again here); or a stored manifest that a run of the project
+ * pins, else one the project activated (its registration, a contract change's activation, a bootstrap's adoption).
+ * Never a manifest that is only in the global manifests table. Records are never rewritten or deleted, so the
+ * answer for a digest does not change once given.
+ */
+const projectReference = (source: Pick<Source, "db" | "artifacts">, projectId: string, digest: string): StandardReviewEvidenceReference | null => {
+  const row = source.db.get<{ artifact_id: string; run_id: string; kind: StoredArtifact["kind"] }>(
+    `SELECT a.artifact_id, a.run_id, a.kind FROM run_artifacts a JOIN runs r ON r.run_id = a.run_id
+      WHERE r.project_id = ? AND (a.digest = ? OR (a.kind = 'CANDIDATE_SNAPSHOT' AND a.candidate_snapshot_digest = ?)) ORDER BY a.rowid LIMIT 1`,
+    [projectId, digest, digest]);
+  if (row) {
+    const artifact = source.artifacts.list(row.run_id, row.kind).find(a => a.artifactId === row.artifact_id);
+    return artifact && artifactDigestMatches(artifact) ? { kind: row.kind, digest, runId: row.run_id, artifactId: row.artifact_id, activationEventId: null } : null;
+  }
+  if (source.db.get(`SELECT 1 AS found FROM manifests WHERE digest = ?`, [digest]) === undefined) return null;
+  const pin = source.db.get<{ run_id: string }>(`SELECT run_id FROM runs WHERE project_id = ? AND pinned_manifest_digest = ? ORDER BY rowid LIMIT 1`, [projectId, digest]);
+  if (pin) return { kind: "MANIFEST", digest, runId: pin.run_id, artifactId: null, activationEventId: null };
+  const activation = source.db.get<{ event_id: number }>(
+    `SELECT event_id FROM audit_events WHERE project_id = ? AND json_valid(evidence_json) AND (
+       (kind = 'PROJECT_REGISTERED' AND json_extract(evidence_json, '$.activeManifestDigest') = ?)
+       OR (kind IN ('PROJECT_MANIFEST_ACTIVATED', 'PROJECT_MANIFEST_ADOPTED_BY_BOOTSTRAP') AND json_extract(evidence_json, '$.to') = ?))
+     ORDER BY event_id LIMIT 1`, [projectId, digest, digest]);
+  return activation ? { kind: "MANIFEST", digest, runId: null, artifactId: null, activationEventId: activation.event_id } : null;
+};
+
+/** The store's own answer for a run: references only in its project's records, none for a run with no project. */
+const inProject = (source: Pick<Source, "db" | "artifacts">, run: RunRow): ResolveReferences => tokens =>
+  run.projectId === null ? [] : tokens.flatMap(token => projectReference(source, run.projectId!, token) ?? []);
+
+const referencesOf = (content: { verifiedReferences?: StandardReviewEvidenceReference[] }): StandardReviewEvidenceReference[] => content.verifiedReferences ?? [];
+/** The digest that binds a reference set, null for none: absent from every record that has none, as before #1347. */
+const referencesDigestOf = (references: readonly StandardReviewEvidenceReference[]): string | null => (references.length === 0 ? null : digestOf(references));
 
 const lineCount = (text: string): number => (text === "" ? 0 : text.split("\n").length - (text.endsWith("\n") ? 1 : 0));
 
-/** The exact staged bytes as a STANDARD bundle bound to this run and contract, or the refusal; never echoes content. */
-const parseStandardBundle = (body: string, input: { runId: string; contractDigest: string; expectedSha256: string }): Decision<StandardReviewEvidenceBundle> => {
+interface ParsedBundle { bundle: StandardReviewEvidenceBundle; references: StandardReviewEvidenceReference[] }
+
+/** The exact staged bytes as a STANDARD bundle bound to this run and contract, with the references it quotes, or the refusal; never echoes content. */
+const parseStandardBundle = (
+  body: string, input: { runId: string; contractDigest: string; expectedSha256: string }, resolve: ResolveReferences,
+): Decision<ParsedBundle> => {
   const bytes = Buffer.from(body, "utf8");
   if (bytes.length > BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES || bytes.toString("utf8") !== body) {
     return deny(ReasonCode.INVALID_ARGUMENT, `review evidence bundle exceeds the ${BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES}-byte UTF-8 staging limit`);
@@ -125,8 +207,8 @@ const parseStandardBundle = (body: string, input: { runId: string; contractDiges
   let value: unknown;
   try { value = JSON.parse(body); } catch { return deny(ReasonCode.INVALID_ARGUMENT, "review evidence bundle must be JSON"); }
   // Before any shape is checked: the refusal names the rule and the form, never the text it matched.
-  const refused = scanBundle(value);
-  if (refused !== null) return deny(ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED, "review evidence holds credential-shaped or unexaminable content", refused);
+  const scanned = scanBundle(value, resolve);
+  if ("refused" in scanned) return deny(ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED, "review evidence holds credential-shaped or unexaminable content", scanned.refused);
   const parsed = standardBundleSchema.safeParse(value);
   if (!parsed.success || parsed.data.runId !== input.runId || parsed.data.contractDigest !== input.contractDigest) {
     return deny(ReasonCode.INVALID_ARGUMENT, `review evidence must bind this run and contract and list MISSING items; each file is a declared excerpt (origin, excerpt.originalSha256 and line ranges) of at most ${STANDARD_REVIEW_EXCERPT_MAX_BYTES} bytes, never its whole source, with no more lines than its ranges`);
@@ -142,18 +224,22 @@ const parseStandardBundle = (body: string, input: { runId: string; contractDiges
       return deny(ReasonCode.INVALID_ARGUMENT, `each review evidence file is an excerpt of at most ${STANDARD_REVIEW_EXCERPT_MAX_BYTES} bytes, never its whole source, with no more lines than its ranges`);
     }
   }
-  return allow(ReasonCode.OK, parsed.data);
+  return allow(ReasonCode.OK, { bundle: parsed.data, references: scanned.references });
 };
 
-interface Candidate { schema: typeof CANDIDATE; runId: string; contractDigest: string; sha256: string; bodyBase64: string; stagedBy: string }
-interface Attachment { schema: typeof ATTACHED; runId: string; contractDigest: string; sha256: string; stagedBy: string; candidateDigest: string }
+interface Candidate { schema: typeof CANDIDATE; runId: string; contractDigest: string; sha256: string; bodyBase64: string; stagedBy: string;
+  verifiedReferences?: StandardReviewEvidenceReference[] }
+interface Attachment { schema: typeof ATTACHED; runId: string; contractDigest: string; sha256: string; stagedBy: string; candidateDigest: string;
+  verifiedReferencesDigest?: string }
 
 export interface StandardReviewEvidenceStageInput { runId: string; contractDigest: string; expectedSha256: string; evidenceBody: string }
 export interface StandardReviewEvidenceAttachInput { runId: string; contractDigest: string; stagedBy: string; expectedSha256: string; replacesSha256?: string | undefined }
 export interface FrozenStandardReviewEvidence {
   bundle: StandardReviewEvidenceBundle;
   source: { bundleSha256: string; candidateDigest: string; attachmentDigest: string; stageEventId: number; attachEventId: number;
-    stagedBy: string; collectedBySessionId: string; attachedBySessionId: string; ceoBindingGeneration: number };
+    stagedBy: string; collectedBySessionId: string; attachedBySessionId: string; ceoBindingGeneration: number;
+    /** #1347 — the project records ACP confirmed for the digests the bundle quotes; absent when it quotes none. */
+    references?: StandardReviewEvidenceReference[] };
   digest: string;
 }
 interface Source { db: Db; clock: Clock; artifacts: ArtifactStore; audit: AuditLog; runs: RunEngine; bindings: BindingRegistry }
@@ -193,27 +279,32 @@ const submissionInFlight = (source: Pick<Source, "db" | "clock">, runId: string)
 
 export const stageStandardReviewEvidence = (
   source: Source, owner: { sessionId: string; bindingGeneration: number; roleKey: string }, input: StandardReviewEvidenceStageInput,
-): Decision<{ digest: string; stagedBy: string }> => source.db.txDecision(() => {
+): Decision<{ digest: string; stagedBy: string; verifiedReferences: StandardReviewEvidenceReference[] }> => source.db.txDecision(() => {
   const run = evidenceRun(source, input);
   if (!run.allowed) return run;
   const current = source.runs.assertOwner(input.runId, owner.sessionId, owner.bindingGeneration);
   if (!current.allowed || current.value.ownerRoleKey !== owner.roleKey) {
     return current.allowed ? deny(ReasonCode.RUN_OWNER_REVOKED, "review evidence is staged only by the run's current owning CTO") : current;
   }
-  const parsed = parseStandardBundle(input.evidenceBody, input);
+  const parsed = parseStandardBundle(input.evidenceBody, input, inProject(source, run.value));
   if (!parsed.allowed) return parsed;
   const stagedBy = owner.roleKey;
+  const references = parsed.value.references;
+  const referencesDigest = referencesDigestOf(references);
+  const staged = allow(ReasonCode.OK, { digest: input.expectedSha256, stagedBy, verifiedReferences: references });
   const prior = candidates(source, input.runId).filter(c => c.content.stagedBy === stagedBy && c.content.contractDigest === input.contractDigest);
-  if (prior.some(c => c.content.sha256 === input.expectedSha256 && artifactDigestMatches(c))) return allow(ReasonCode.OK, { digest: input.expectedSha256, stagedBy });
+  if (prior.some(c => c.content.sha256 === input.expectedSha256 && artifactDigestMatches(c) && referencesDigestOf(referencesOf(c.content)) === referencesDigest)) return staged;
   const attached = attachments(source, input.runId);
   if (prior.some(c => !attached.some(a => a.content.candidateDigest === c.digest))) {
     return deny(ReasonCode.CONFLICT, "this CTO already has an unattached immutable review evidence bundle for this run");
   }
   const artifact = source.artifacts.put(input.runId, ArtifactKind.HANDOFF, { schema: CANDIDATE, runId: input.runId,
-    contractDigest: input.contractDigest, sha256: input.expectedSha256, stagedBy, bodyBase64: Buffer.from(input.evidenceBody).toString("base64") });
+    contractDigest: input.contractDigest, sha256: input.expectedSha256, stagedBy, bodyBase64: Buffer.from(input.evidenceBody).toString("base64"),
+    ...(referencesDigest === null ? {} : { verifiedReferences: references }) });
   const recorded = source.audit.record({ kind: STANDARD_REVIEW_EVIDENCE_STAGED, runId: input.runId, sessionId: owner.sessionId, roleKey: stagedBy,
-    evidence: { digest: artifact.digest, payloadDigest: input.expectedSha256, contractDigest: input.contractDigest, bindingGeneration: owner.bindingGeneration, stagedBy } });
-  return recorded.allowed ? allow(ReasonCode.OK, { digest: input.expectedSha256, stagedBy }) : recorded;
+    evidence: { digest: artifact.digest, payloadDigest: input.expectedSha256, contractDigest: input.contractDigest, bindingGeneration: owner.bindingGeneration, stagedBy,
+      ...(referencesDigest === null ? {} : { verifiedReferencesDigest: referencesDigest }) } });
+  return recorded.allowed ? staged : recorded;
 });
 
 /** Also asked before a cached MCP reply, so a replay cannot pass a tampered candidate or an in-flight submission. */
@@ -223,15 +314,20 @@ export const standardReviewEvidenceAttachAccess = (source: Source, input: Standa
   const candidate = candidates(source, input.runId).find(c => c.content.stagedBy === input.stagedBy && c.content.sha256 === input.expectedSha256
     && c.content.contractDigest === input.contractDigest && c.content.runId === input.runId);
   const receipt = candidate && source.audit.forRun(input.runId).find(e => e.kind === STANDARD_REVIEW_EVIDENCE_STAGED && e.roleKey === input.stagedBy
-    && e.evidence["digest"] === candidate.digest && e.evidence["payloadDigest"] === input.expectedSha256 && e.evidence["contractDigest"] === input.contractDigest);
+    && e.evidence["digest"] === candidate.digest && e.evidence["payloadDigest"] === input.expectedSha256 && e.evidence["contractDigest"] === input.contractDigest
+    && (e.evidence["verifiedReferencesDigest"] ?? null) === referencesDigestOf(referencesOf(candidate.content)));
   if (!candidate || !receipt || !artifactDigestMatches(candidate)) return deny(ReasonCode.NOT_FOUND, "no intact review evidence candidate at this run/contract/stager/digest");
   if (attachments(source, input.runId).some(a => a.superseded && a.content.candidateDigest === candidate.digest)) {
     return deny(ReasonCode.CONFLICT, "a superseded review evidence selection cannot be made current again");
   }
   const body = Buffer.from(candidate.content.bodyBase64, "base64");
   if (body.toString("base64") !== candidate.content.bodyBase64) return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "review evidence candidate encoding differs");
-  const parsed = parseStandardBundle(body.toString("utf8"), input);
+  const parsed = parseStandardBundle(body.toString("utf8"), input, inProject(source, run.value));
   if (!parsed.allowed) return parsed;
+  // The store's answer now is the set it gave at the stage: the references cannot be swapped under the same body.
+  if (referencesDigestOf(parsed.value.references) !== referencesDigestOf(referencesOf(candidate.content))) {
+    return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "review evidence references differ from the ones ACP confirmed when it was staged");
+  }
   if (submissionInFlight(source, input.runId)) {
     return deny(ReasonCode.CONFLICT, "a result submission is in flight for this run; select review evidence after it ends");
   }
@@ -251,10 +347,12 @@ export const attachStandardReviewEvidence = (
   const prior = attachments(source, input.runId).find(a => !a.superseded);
   if (prior?.content.sha256 === input.expectedSha256 && prior.content.candidateDigest === candidate.digest) return allow(ReasonCode.OK, { digest: input.expectedSha256 });
   if (prior && input.replacesSha256 !== prior.content.sha256) return deny(ReasonCode.CONFLICT, "replacement review evidence must name replacesSha256");
+  const referencesDigest = referencesDigestOf(referencesOf(candidate.content));
+  const bound = referencesDigest === null ? {} : { verifiedReferencesDigest: referencesDigest };
   const attached = source.artifacts.put(input.runId, ArtifactKind.HANDOFF, { schema: ATTACHED, runId: input.runId,
-    contractDigest: input.contractDigest, sha256: input.expectedSha256, stagedBy: input.stagedBy, candidateDigest: candidate.digest });
+    contractDigest: input.contractDigest, sha256: input.expectedSha256, stagedBy: input.stagedBy, candidateDigest: candidate.digest, ...bound });
   const recorded = source.audit.record({ kind: STANDARD_REVIEW_EVIDENCE_ATTACHED, runId: input.runId, sessionId: peer.sessionId,
-    roleKey: identity.value.ceo.roleKey, evidence: { digest: attached.digest, payloadDigest: input.expectedSha256, contractDigest: input.contractDigest,
+    roleKey: identity.value.ceo.roleKey, evidence: { digest: attached.digest, payloadDigest: input.expectedSha256, contractDigest: input.contractDigest, ...bound,
       bindingGeneration: identity.value.ceo.bindingGeneration, stagedBy: input.stagedBy, replacesSha256: prior?.content.sha256 ?? null,
       hermesPrincipal: identity.value.turn.principal, hermesPeerGrant: identity.value.turn.peerGrant } });
   if (!recorded.allowed) return recorded;
@@ -266,19 +364,25 @@ export const attachStandardReviewEvidence = (
 const readFrozen = (source: ReadSource, runId: string, attached: StoredArtifact<Attachment>): FrozenStandardReviewEvidence => {
   const audit = source.audit.forRun(runId);
   const candidate = candidates(source, runId).find(c => c.digest === attached.content.candidateDigest);
+  const references = candidate === undefined ? [] : referencesOf(candidate.content);
+  const referencesDigest = referencesDigestOf(references);
   const stage = candidate && audit.find(e => e.kind === STANDARD_REVIEW_EVIDENCE_STAGED && e.roleKey === attached.content.stagedBy
-    && e.evidence["digest"] === candidate.digest && e.evidence["payloadDigest"] === attached.content.sha256);
+    && e.evidence["digest"] === candidate.digest && e.evidence["payloadDigest"] === attached.content.sha256
+    && (e.evidence["verifiedReferencesDigest"] ?? null) === referencesDigest);
   const attach = audit.find(e => e.kind === STANDARD_REVIEW_EVIDENCE_ATTACHED && e.evidence["digest"] === attached.digest
     && e.evidence["payloadDigest"] === attached.content.sha256);
   if (!candidate || !stage?.sessionId || !attach?.sessionId || !artifactDigestMatches(candidate) || !artifactDigestMatches(attached)
       || candidate.content.runId !== runId || attached.content.runId !== runId || candidate.content.sha256 !== attached.content.sha256
-      || candidate.content.contractDigest !== attached.content.contractDigest) throw new Error("review evidence receipt or artifact differs");
+      || candidate.content.contractDigest !== attached.content.contractDigest
+      || (attached.content.verifiedReferencesDigest ?? null) !== referencesDigest) throw new Error("review evidence receipt or artifact differs");
+  // The freeze reads no store: exactly the references bound at the stage and the attachment, each quoted in the body.
   const parsed = parseStandardBundle(Buffer.from(candidate.content.bodyBase64, "base64").toString("utf8"),
-    { runId, contractDigest: attached.content.contractDigest, expectedSha256: attached.content.sha256 });
-  if (!parsed.allowed) throw new Error("review evidence bundle differs");
-  const record = { bundle: parsed.value, source: { bundleSha256: attached.content.sha256, candidateDigest: candidate.digest, attachmentDigest: attached.digest,
+    { runId, contractDigest: attached.content.contractDigest, expectedSha256: attached.content.sha256 }, () => references);
+  if (!parsed.allowed || referencesDigestOf(parsed.value.references) !== referencesDigest) throw new Error("review evidence bundle differs");
+  const record = { bundle: parsed.value.bundle, source: { bundleSha256: attached.content.sha256, candidateDigest: candidate.digest, attachmentDigest: attached.digest,
     stageEventId: stage.eventId, attachEventId: attach.eventId, stagedBy: attached.content.stagedBy, collectedBySessionId: stage.sessionId,
-    attachedBySessionId: attach.sessionId, ceoBindingGeneration: attach.evidence["bindingGeneration"] as number } };
+    attachedBySessionId: attach.sessionId, ceoBindingGeneration: attach.evidence["bindingGeneration"] as number,
+    ...(referencesDigest === null ? {} : { references }) } };
   return { ...record, digest: digestOf(record) };
 };
 
@@ -407,9 +511,10 @@ export const privateEvidenceAnswer = <T>(source: ReadSource, runId: string, answ
   return answer.allowed ? allow(code, projection as unknown as T) : deny<T>(code, PRIVATE_EVIDENCE_REFUSAL_MESSAGE, projection);
 };
 
-/** Digests the reviewer is shown for the bundle; quoting one is not quoting a credential. */
+/** Digests the reviewer is shown for the bundle, the project records ACP confirmed in its text included; quoting one is not quoting a credential. */
 export const standardReviewEvidenceDigests = (record: FrozenStandardReviewEvidence): string[] => [
   record.digest, record.source.bundleSha256, ...record.bundle.files.flatMap(file => [file.sha256, file.excerpt.originalSha256]),
+  ...(record.source.references ?? []).map(reference => reference.digest),
 ];
 
 /** The reviewer's section: attributed data, bounded by the statements that keep it from acting as an instruction. */
