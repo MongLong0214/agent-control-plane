@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 55;
+export const SCHEMA_VERSION = 56;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -24,6 +24,7 @@ const v51SchemaPath = fileURLToPath(new URL("./schema-v51.sql", import.meta.url)
 const v52SchemaPath = fileURLToPath(new URL("./schema-v52.sql", import.meta.url)); // released v52 reads only this
 const v53SchemaPath = fileURLToPath(new URL("./schema-v53.sql", import.meta.url)); // released v53 reads only this
 const v54SchemaPath = fileURLToPath(new URL("./schema-v54.sql", import.meta.url)); // released v54 reads only this
+const v55SchemaPath = fileURLToPath(new URL("./schema-v55.sql", import.meta.url)); // released v55 reads only this
 export const schemaSql = (): string => readFileSync(schemaPath, "utf8");
 const historicalSchemaSql = (): string => readFileSync(historicalSchemaPath, "utf8");
 const schemaSqlAt = (version: number): string =>
@@ -38,7 +39,8 @@ const schemaSqlAt = (version: number): string =>
                   : version <= 51 ? readFileSync(v51SchemaPath, "utf8")
                     : version <= 52 ? readFileSync(v52SchemaPath, "utf8")
                       : version <= 53 ? readFileSync(v53SchemaPath, "utf8")
-                        : version <= LATEST_FROZEN_VERSION ? readFileSync(v54SchemaPath, "utf8") : schemaSql();
+                        : version <= 54 ? readFileSync(v54SchemaPath, "utf8")
+                          : version <= LATEST_FROZEN_VERSION ? readFileSync(v55SchemaPath, "utf8") : schemaSql();
 
 /** Connection PRAGMAs are established by Db before any migration transaction begins. */
 export const schemaDdl = (): string =>
@@ -4353,6 +4355,28 @@ const v55: SchemaMigration = {
   checksum: () => migrationChecksum("v55-approved-run-revision-reentry", 55),
 };
 
+/**
+ * #1234 — v56 replaces only the manifest-pointer guard. A project's active manifest may also leave NULL
+ * on the WRITTEN application of a PROJECT_BOOTSTRAP run whose RUN_CREATED record carries the canonical-CTO
+ * adoption ACP validated and stored for exactly this project, naming the project's live entitlement (its
+ * session UUID and Buzz actor) and the run's own owner pin, for exactly the manifest digest the application
+ * reserved. A non-NULL old value is decided exactly as before. It names no other object and moves no row.
+ */
+const V56_REPLACED_GUARDS = ["projects_active_manifest_moves_by_grant"] as const;
+const v56: SchemaMigration = {
+  id: "v56-adopted-bootstrap-first-manifest",
+  fromVersion: 55,
+  toVersion: 56,
+  apply(raw) {
+    const objects = stepTriggerObjects(56, V56_REPLACED_GUARDS, { version: 55, names: V56_REPLACED_GUARDS });
+    assertStepNames(raw, 56, objects, "before");
+    raw.exec(dropsFor([...V56_REPLACED_GUARDS]));
+    raw.exec(triggerDdlFor([...V56_REPLACED_GUARDS], 56));
+    assertStepNames(raw, 56, objects, "after");
+  },
+  checksum: () => migrationChecksum("v56-adopted-bootstrap-first-manifest", 56),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -4398,6 +4422,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v53,
   v54,
   v55,
+  v56,
 ]);
 
 interface RequiredTrigger {
@@ -4769,6 +4794,7 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * file, so a later schema edit cannot change what a database receives at its v52 step.
  * v53 is frozen as v54's prerequisite in schema-v53.sql, byte-identical to schema.sql at 24d49f94.
  * v54 is frozen as v55's prerequisite in schema-v54.sql, byte-identical to schema.sql at 0c15e2f3.
+ * v55 is frozen as v56's prerequisite in schema-v55.sql, byte-identical to schema.sql at 02d4b98a.
  * v51 is frozen as v52's prerequisite in schema-v51.sql, byte-identical to schema.sql at 3915f78c; v50 is
  * frozen as v51's prerequisite in schema-v50.sql.
  * v49 is frozen as v50's prerequisite in schema-v49.sql, byte-identical to a620b8d2.
@@ -4777,7 +4803,7 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * cannot leak back into what a database receives at its v48 step, and v48's checksum is the value the
  * pre-freeze build computed.
  */
-const LATEST_FROZEN_VERSION = 54;
+const LATEST_FROZEN_VERSION = 55;
 
 /**
  * The last version whose stored receipt is compared by value (`receiptMismatches`). It stays at 47 when

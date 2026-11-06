@@ -177,11 +177,14 @@ export const peerMessageCarrySuccessionOf = PeerMessageCarryAuthorityToken.succe
  * Asked by the self-claim, before it mints the carry authority, and again by
  * `BindingRegistry.repointLiveRunsToSameActorSuccessor` before it moves a run. The hand-over does not ask
  * it: what it rests on is the carry record (`selfClaimCarriedTo`), which ordinary SQL cannot write,
- * while every table read here can be.
+ * while every table read here can be. #1302: an adopted bootstrap's owner-pin chain asks it of every
+ * restart the pin was carried through; one a later restart superseded has its `to` generation REVOKED
+ * since (`successor: "REVOKED"`), every other fact the same.
  */
 export const peerMessageSuccessionIsProven = (
   db: Pick<Db, "get">,
   succession: Omit<PeerMessageSuccession, "proven">,
+  successor: "ACTIVE" | "REVOKED" = "ACTIVE",
 ): boolean => {
   const s = succession;
   if (!Number.isSafeInteger(s.fromGeneration) || s.toGeneration !== s.fromGeneration + 1) return false;
@@ -199,7 +202,7 @@ export const peerMessageSuccessionIsProven = (
           AND prev.actor_id = ? AND prev.status = 'REVOKED'
           AND next.role_key = prev.role_key AND next.role = prev.role
           AND next.binding_generation = ? AND next.session_id = ? AND next.session_incarnation = ?
-          AND next.actor_id = prev.actor_id AND next.status = 'ACTIVE'
+          AND next.actor_id = prev.actor_id AND next.status = ?
           AND tb.executor_kind = ? AND tb.target_locator = ?
           AND prev_s.buzz_actor_id = ? AND next_s.buzz_actor_id = ?
           AND e.kind = 'DEAD_BINDING_RECOVERED'
@@ -211,7 +214,7 @@ export const peerMessageSuccessionIsProven = (
       s.toAssignmentId, s.recoveryAuditEventId,
       s.fromAssignmentId, s.roleKey, Role.PRIMARY_CTO,
       s.fromGeneration, s.fromSessionId, s.fromSessionIncarnation, s.actorId,
-      s.toGeneration, s.toSessionId, s.toSessionIncarnation,
+      s.toGeneration, s.toSessionId, s.toSessionIncarnation, successor,
       SELF_CLAIM_EXECUTOR_KIND, s.conversationUuid,
       s.buzzActorId, s.buzzActorId,
     ],

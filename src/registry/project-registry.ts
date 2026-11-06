@@ -315,6 +315,61 @@ export class ProjectRegistry {
     });
   }
 
+  /**
+   * A PROJECT_BOOTSTRAP run created with the explicit canonical-CTO adoption connects the adopted CTO's
+   * own project, already registered and manifest-less, instead of registering a new one: its first
+   * active manifest is the one the run's CEO-confirmed PLAN carries, moved from NULL in the activation's
+   * registration transaction. The authority is the run's WRITTEN application of exactly this project and
+   * manifest digest, which the CEO's CONFIRM reserved (#246 C3), and the adoption ACP recorded with the
+   * run's creation; the database's pointer guard admits the move only on those rows (schema v56). Refused, with nothing written, unless the project exists, is not
+   * retired and still has no active manifest; the manifest write itself is authorized as every bootstrap
+   * manifest write is (`storeManifest`, the run's pinned owner and generation).
+   */
+  activateAdoptedBootstrapManifest(manifest: ProjectManifest, authorization: ManagedManifestWrite): Decision<string> {
+    if (!this.db.inTransaction) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "an adopted project's first manifest moves only inside the activation's registration transaction", {
+        projectId: authorization.projectId,
+      });
+    }
+    const project = this.get(authorization.projectId);
+    if (!project || project.retiredAt !== null || project.activeManifestDigest !== null) {
+      return deny(ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN, "only a registered, unretired, manifest-less project takes its first manifest from an adopting bootstrap", {
+        refusal: "ADOPTION_PROJECT_HAS_MANIFEST",
+        projectId: authorization.projectId,
+        activeManifestDigest: project?.activeManifestDigest ?? null,
+      });
+    }
+    if (manifest.projectId !== authorization.projectId) {
+      return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "registered project and manifest identities differ", {
+        projectId: authorization.projectId,
+        manifestProjectId: manifest.projectId,
+      });
+    }
+    const stored = this.storeManifest(manifest, authorization);
+    if (!stored.allowed) return stored;
+    const moved = this.db.run(
+      `UPDATE projects SET active_manifest_digest = ? WHERE project_id = ? AND active_manifest_digest IS NULL AND retired_at IS NULL`,
+      [stored.value, authorization.projectId],
+    );
+    if (moved.changes !== 1) {
+      return deny(ReasonCode.CONFLICT, "the adopted project's manifest moved during activation", { projectId: authorization.projectId });
+    }
+    const audited = this.audit.record({
+      kind: "PROJECT_MANIFEST_ADOPTED_BY_BOOTSTRAP",
+      projectId: authorization.projectId,
+      runId: authorization.runId,
+      sessionId: authorization.sessionId,
+      evidence: {
+        from: null,
+        to: stored.value,
+        viaRunKind: "PROJECT_BOOTSTRAP",
+        ownerBindingGeneration: authorization.bindingGeneration,
+      },
+    });
+    if (!audited.allowed) return audited as Decision<string>;
+    return allow(ReasonCode.OK, stored.value);
+  }
+
   /** #246 B2-b — wired once by the composition root; activation reads its grants through nothing else. */
   attachManifestGrants(grants: ManifestActivationGrants): void {
     if (this.#grants) throw new Error("manifest activation grants are already attached");

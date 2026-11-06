@@ -43,10 +43,11 @@ describe("v54 → v55 approved-run revision re-entry", () => {
     expect(createHash("sha256").update(v54).digest("hex")).toBe("d239afdd0e884ea2d451a4bee3fb81757d02273b464b95822408ac7b59219814");
     expect(createHash("sha1").update(`blob ${v54.length}\0`).update(v54).digest("hex")).toBe("a99a02be889d4d404b8d5a590a8eab3ed71ea383");
     expect(v54.toString()).toContain("(OLD.state = 'CEO_APPROVED' AND NEW.state IN ('MERGING','CANCELLED')) OR");
-    expect(SCHEMA_VERSION).toBe(55);
-    expect(MIGRATIONS.slice(-2).map((step) => [step.id, step.fromVersion, step.toVersion])).toEqual([
+    expect(SCHEMA_VERSION).toBe(56);
+    expect(MIGRATIONS.slice(-3).map((step) => [step.id, step.fromVersion, step.toVersion])).toEqual([
       ["v54-run-state-exits", 53, 54],
       ["v55-approved-run-revision-reentry", 54, 55],
+      ["v56-adopted-bootstrap-first-manifest", 55, 56],
     ]);
   });
 

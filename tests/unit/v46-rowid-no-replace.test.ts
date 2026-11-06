@@ -438,6 +438,7 @@ describe("the v45 → v46 step", () => {
         { version: 53, migration_id: "v53-verification-result-history" },
         { version: 54, migration_id: "v54-run-state-exits" },
         { version: 55, migration_id: "v55-approved-run-revision-reentry" },
+        { version: 56, migration_id: "v56-adopted-bootstrap-first-manifest" },
       ]);
     } finally {
       raw.close();
@@ -483,7 +484,7 @@ describe("the v45 → v46 step", () => {
     expect(approved).toMatchObject({
       fromVersion: 44,
       toVersion: SCHEMA_VERSION,
-      migrations: ["v45-first-manifest-activation", "v46-rowid-no-replace", "v47-owner-decision-authority-guard", "v48-owner-decision-supersede-guard", "v49-branch-publish-receipts", "v50-post-merge-verification-reentry", "v51-durable-recipient-delivery", "v52-resident-project-provisioning", "v53-verification-result-history", "v54-run-state-exits", "v55-approved-run-revision-reentry"],
+      migrations: ["v45-first-manifest-activation", "v46-rowid-no-replace", "v47-owner-decision-authority-guard", "v48-owner-decision-supersede-guard", "v49-branch-publish-receipts", "v50-post-merge-verification-reentry", "v51-durable-recipient-delivery", "v52-resident-project-provisioning", "v53-verification-result-history", "v54-run-state-exits", "v55-approved-run-revision-reentry", "v56-adopted-bootstrap-first-manifest"],
     });
     const databaseModule = new URL("../../src/db/database.ts", import.meta.url).href;
     const child = boundedSpawnSync(
@@ -518,7 +519,7 @@ describe("the v45 → v46 step", () => {
     expect(approveMigration(path, "V46 D5-b re-approval")).toMatchObject({
       fromVersion: 45,
       toVersion: SCHEMA_VERSION,
-      migrations: ["v46-rowid-no-replace", "v47-owner-decision-authority-guard", "v48-owner-decision-supersede-guard", "v49-branch-publish-receipts", "v50-post-merge-verification-reentry", "v51-durable-recipient-delivery", "v52-resident-project-provisioning", "v53-verification-result-history", "v54-run-state-exits", "v55-approved-run-revision-reentry"],
+      migrations: ["v46-rowid-no-replace", "v47-owner-decision-authority-guard", "v48-owner-decision-supersede-guard", "v49-branch-publish-receipts", "v50-post-merge-verification-reentry", "v51-durable-recipient-delivery", "v52-resident-project-provisioning", "v53-verification-result-history", "v54-run-state-exits", "v55-approved-run-revision-reentry", "v56-adopted-bootstrap-first-manifest"],
     });
     new Db(path).close();
     expect(contentDigests(path).userVersion).toBe(SCHEMA_VERSION);
