@@ -1,4 +1,5 @@
 import type { Clock } from "../core/clock.ts";
+import type { Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { AuditLog } from "../db/audit.ts";
@@ -66,9 +67,24 @@ export interface ReleasedPipelineAttempt {
   reason: AttemptReleaseReason;
   /** The stall's instant: the persisted deadline for a deadline release, the release itself for a restart's. */
   since: string;
-  /** The owner CTO's notice (`CandidatePipeline.noticeAttemptReleased`), or null when it was given none. */
+  /** The owner CTO's notice (`CandidatePipeline.noticeAttemptReleased`), or null when it was given none now. */
   ownerNoticeId: string | null;
+  /** Why a notice the owner is owed could not be written now (`ATTEMPT_RELEASE_NOTICE_DEFERRED`); a later tick retries it. */
+  ownerNoticeDeferred: string | null;
 }
+
+/**
+ * #1344 C1 — the owner CTO's release notice, keyed by its attempt: one per release, however often it is asked for.
+ * A RELEASED attempt with a release record and no outbox row under this key is a notice still owed.
+ */
+const ATTEMPT_RELEASED_KEY_PREFIX = "attempt-released:";
+export const attemptReleasedNoticeKey = (runId: string, attemptId: string): string =>
+  `${ATTEMPT_RELEASED_KEY_PREFIX}${runId}:${attemptId}`;
+
+/** #1344 C1 — a release notice its owner was owed and could not be given at once; `deliverOwedReleaseNotices` retries it. */
+export const ATTEMPT_RELEASE_NOTICE_DEFERRED = "ATTEMPT_RELEASE_NOTICE_DEFERRED";
+
+type ReleaseNotice = (released: { runId: string; attemptId: string; reason: AttemptReleaseReason }) => Decision<string | null>;
 
 interface AttemptRow {
   run_id: string;
@@ -125,17 +141,18 @@ export class Watchdog {
 
   #attemptReleased: ((attemptId: string) => void) | null = null;
   #attemptRunsHere: (attemptId: string) => boolean = () => false;
-  #ownerNotice: ((released: { runId: string; attemptId: string; reason: AttemptReleaseReason }) => string | null) | null = null;
+  #ownerNotice: ReleaseNotice | null = null;
 
   /**
    * `attemptReleased`: told of each candidate pipeline attempt this watchdog releases, once the release commits, to
    * stop its work. `attemptRunsHere`: whether this process runs an attempt (none, without a pipeline). `ownerNotice`:
-   * the release notice to the run's owner CTO, written in the release's transaction; its message id, or null.
+   * the release notice to the run's owner CTO: its message id, null when none is owed, or a denial when one is owed
+   * and cannot be written now.
    */
   attach(ports: {
     attemptReleased?: (attemptId: string) => void;
     attemptRunsHere?: (attemptId: string) => boolean;
-    ownerNotice?: (released: { runId: string; attemptId: string; reason: AttemptReleaseReason }) => string | null;
+    ownerNotice?: ReleaseNotice;
   }): void {
     if (ports.attemptReleased) this.#attemptReleased = ports.attemptReleased;
     if (ports.attemptRunsHere) this.#attemptRunsHere = ports.attemptRunsHere;
@@ -188,7 +205,17 @@ export class Watchdog {
         runId: attempt.run_id,
         evidence: { kind: "candidate_pipeline_attempt", target: attempt.attempt_id, since, reason },
       });
-      const ownerNoticeId = this.#ownerNotice?.({ runId: attempt.run_id, attemptId: attempt.attempt_id, reason }) ?? null;
+      const notice = this.#ownerNotice?.({ runId: attempt.run_id, attemptId: attempt.attempt_id, reason }) ?? null;
+      // #1344 — a notice owed and refused now (its owner's session not live, the role unbound) is not dropped: the
+      // release record keeps it owed, this row says why it waits, and every tick retries it until it is written.
+      if (notice !== null && !notice.allowed) {
+        this.audit.record({
+          kind: ATTEMPT_RELEASE_NOTICE_DEFERRED,
+          runId: attempt.run_id,
+          reasonCode: notice.reasonCode,
+          evidence: { attemptId: attempt.attempt_id, reason },
+        });
+      }
       return {
         runId: attempt.run_id,
         attemptId: attempt.attempt_id,
@@ -196,9 +223,41 @@ export class Watchdog {
         deadlineAt: attempt.deadline_at,
         reason,
         since,
-        ownerNoticeId,
+        ownerNoticeId: notice?.allowed ? notice.value : null,
+        ownerNoticeDeferred: notice !== null && !notice.allowed ? notice.reasonCode : null,
       };
     });
+  }
+
+  /**
+   * #1344 C1 — the release notices still owed: an attempt ACP released (its release record names it), still the run's
+   * latest, on a run still ACTIVE, with no notice written under its key. Each is asked for again; the outbox writes it
+   * once its owner's binding takes it. A fresh submission replaces the attempt row and so ends what is owed. The
+   * message ids written.
+   */
+  deliverOwedReleaseNotices(): string[] {
+    const notice = this.#ownerNotice;
+    if (!notice) return [];
+    const owed = this.db.all<{ run_id: string; attempt_id: string; reason: string | null }>(
+      `SELECT a.run_id, a.attempt_id, json_extract(owed.evidence_json, '$.reason') AS reason
+         FROM candidate_pipeline_attempts a
+         JOIN runs r ON r.run_id = a.run_id AND r.state = 'ACTIVE'
+         JOIN audit_events owed ON owed.run_id = a.run_id AND owed.kind = ?
+                               AND json_extract(owed.evidence_json, '$.kind') = 'candidate_pipeline_attempt'
+                               AND json_extract(owed.evidence_json, '$.target') = a.attempt_id
+        WHERE a.state = 'RELEASED'
+          AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.idempotency_key = ? || a.run_id || ':' || a.attempt_id)
+        ORDER BY owed.event_id`,
+      [OWNERLESS_STALL_OWED, ATTEMPT_RELEASED_KEY_PREFIX],
+    );
+    const written: string[] = [];
+    for (const row of owed) {
+      // A release recorded before #1344 named no reason; only the deadline release wrote one then.
+      const reason = row.reason === AttemptReleaseReason.DAEMON_RESTART ? AttemptReleaseReason.DAEMON_RESTART : AttemptReleaseReason.DEADLINE;
+      const answered = notice({ runId: row.run_id, attemptId: row.attempt_id, reason });
+      if (answered.allowed && answered.value !== null) written.push(answered.value);
+    }
+    return written;
   }
 
   async tick(): Promise<WatchdogTick> {
@@ -208,6 +267,7 @@ export class Watchdog {
     const stalls: WatchdogStall[] = [];
     const scopes = new Map<string, { scope: DoctorScope; target: string | null }>();
     const stallFindings = new Map<string, Finding[]>();
+    this.deliverOwedReleaseNotices();
     const addOverdue = (
       key: string,
       scope: DoctorScope,

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { basename, join } from "node:path";
 
@@ -71,11 +71,11 @@ const waitListening = async (port: number): Promise<void> => {
 
 /** Started through a shell that exits at once, so the process is an orphan (ppid 1) as the cut-off proxy was. */
 const orphan = (args: readonly string[]): number => {
-  const pid = Number(execFileSync("/bin/sh", ["-c", '"$0" "$@" </dev/null >/dev/null 2>&1 & echo $!', PYTHON, ...args], { encoding: "utf8" }).trim());
+  const pid = Number(execFileSync("/bin/sh", ["-c", '"$0" "$@" </dev/null >/dev/null 2>&1 & echo $!', PYTHON, ...args], { encoding: "utf8", timeout: 5_000 }).trim());
   started.push(pid);
   return pid;
 };
-const parentOf = (pid: number): number => Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim());
+const parentOf = (pid: number): number => Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8", timeout: 5_000 }).trim());
 
 /** A reviewer egress layout under a fresh state root, with a lease directory an earlier instance left behind. */
 const layout = async (): Promise<{ config: ReviewerEgressConfig; port: number; lease: string }> => {
@@ -108,8 +108,10 @@ describe("#1344 D: a daemon start reaps the reviewer egress proxy an earlier ins
     expect(reaped).toEqual({
       port,
       leases: [basename(lease)],
+      discovery: "COMPLETE",
       stopped: [{ pid, lease: basename(lease) }],
       survived: [],
+      kept: [],
       portFree: true,
     });
     expect(alive(pid)).toBe(false);
@@ -125,7 +127,7 @@ describe("#1344 D: a daemon start reaps the reviewer egress proxy an earlier ins
 
     const reaped = await reapOrphanedReviewerEgress(config);
 
-    expect(reaped).toEqual({ port, leases: [basename(lease)], stopped: [], survived: [], portFree: false });
+    expect(reaped).toEqual({ port, leases: [basename(lease)], discovery: "COMPLETE", stopped: [], survived: [], kept: [], portFree: false });
     expect(alive(unrelated)).toBe(true);
     expect(await listening(port)).toBe(true);
   });
@@ -142,9 +144,38 @@ describe("#1344 D: a daemon start reaps the reviewer egress proxy an earlier ins
     expect(alive(foreign)).toBe(true);
   });
 
+  it("a process discovery that failed keeps every lease and kills nothing; the next successful sweep reaps the proxy", async () => {
+    const { config, port, lease } = await layout();
+    const pid = recordedProxy(config, port, lease);
+    await waitListening(port);
+
+    // A transient `ps` failure: it cannot be run at all.
+    const path = process.env["PATH"];
+    process.env["PATH"] = tempDir("acp-1344-no-ps-");
+    let failed: Awaited<ReturnType<typeof reapOrphanedReviewerEgress>>;
+    try {
+      failed = await reapOrphanedReviewerEgress(config);
+    } finally {
+      process.env["PATH"] = path;
+    }
+
+    expect(failed).toMatchObject({
+      port, leases: [basename(lease)], discovery: "FAILED", stopped: [], survived: [], kept: [basename(lease)], portFree: false,
+    });
+    expect(failed!.discoveryError).toMatch(/^ps failed/);
+    expect(existsSync(lease)).toBe(true);
+    expect(alive(pid)).toBe(true);
+
+    const next = await reapOrphanedReviewerEgress(config);
+
+    expect(next).toMatchObject({ discovery: "COMPLETE", stopped: [{ pid, lease: basename(lease) }], kept: [], portFree: true });
+    expect(alive(pid)).toBe(false);
+    expect(existsSync(lease)).toBe(false);
+  });
+
   it("nothing is probed or signalled when no lease was left behind", async () => {
     const { config, port, lease } = await layout();
-    execFileSync("rm", ["-rf", lease]);
+    rmSync(lease, { recursive: true, force: true });
     const unrelated = orphan(["-c", LISTENER, String(port)]);
     await waitListening(port);
 
@@ -169,7 +200,7 @@ describe("#1344 D: a daemon start reaps the reviewer egress proxy an earlier ins
       const [record] = harness.cp.audit.byKind("REVIEWER_EGRESS_REAPED");
       expect(record).toMatchObject({
         reasonCode: ReasonCode.OK,
-        evidence: { port, stopped: [{ pid, lease: basename(lease) }], survived: [], portFree: true },
+        evidence: { port, discovery: "COMPLETE", stopped: [{ pid, lease: basename(lease) }], survived: [], kept: [], portFree: true },
       });
       expect(alive(pid)).toBe(false);
       expect(await listening(port)).toBe(false);

@@ -61,7 +61,7 @@ import {
 } from "../doctor/doctor.ts";
 import { isProjectlessBootstrap } from "../bootstrap/bootstrap-plan.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
-import type { ReleasedPipelineAttempt } from "../doctor/watchdog.ts";
+import { OWNERLESS_STALL_OWED, type ReleasedPipelineAttempt } from "../doctor/watchdog.ts";
 import { reapOrphanedReviewerEgress } from "../runtime/reviewer-egress.ts";
 import { describeStartStall, type StartStall } from "./start-stall.ts";
 import { routeUnreleasedWorkerOrphans } from "../run/worker-orphan-routing.ts";
@@ -584,8 +584,11 @@ export interface BootstrapResultRecoveryReport {
     roleKey: string;
     bindingGeneration: number;
     planDigest: string;
-    /** Present on a review retry wake: the frozen candidate and the unavailable review it retries. */
-    retry?: { candidateSnapshotDigest: string; unavailableEventId: number; candidateFrozenEventId?: number };
+    /**
+     * Present on a review retry wake: the frozen candidate and the unavailable review it retries, or (#1344) the
+     * release of the attempt whose review it retries (`releasedAttemptId`, its release record's event).
+     */
+    retry?: { candidateSnapshotDigest: string; unavailableEventId: number; candidateFrozenEventId?: number; releasedAttemptId?: string };
   }>;
 }
 
@@ -1766,7 +1769,8 @@ export class Daemon {
    * #1344 D — at start, before any review can start: the reviewer egress proxies an earlier instance of this daemon
    * launched and left running hold the fixed port, so every later review would fail ISOLATION_LOST. Those exact
    * recorded proxies are stopped (`reapOrphanedReviewerEgress`) and what was found is recorded; a holder of the port
-   * not proven to be one is left running, and is recorded as such. A failure is recorded and does not stop the start.
+   * not proven to be one is left running, and a lease whose proxy discovery could not prove gone is kept for the next
+   * start; both are recorded as such. A failure is recorded and does not stop the start.
    */
   private async reapReviewerEgress(): Promise<void> {
     try {
@@ -1774,7 +1778,8 @@ export class Daemon {
       if (reaped === null) return;
       this.cp.audit.record({
         kind: "REVIEWER_EGRESS_REAPED",
-        reasonCode: reaped.portFree ? ReasonCode.OK : ReasonCode.ISOLATION_LOST,
+        // A discovery that could not prove a lease's proxy gone kept that lease for the next start: not a clean reap.
+        reasonCode: reaped.portFree && reaped.discovery === "COMPLETE" ? ReasonCode.OK : ReasonCode.ISOLATION_LOST,
         evidence: { ...reaped },
       });
     } catch (error) {
@@ -2629,6 +2634,7 @@ export class Daemon {
             ...(retry.candidateFrozenEventId === undefined
               ? {}
               : { unavailableLinkedBy: "AUDIT_ORDER", candidateFrozenEventId: retry.candidateFrozenEventId }),
+            ...(retry.releasedAttemptId === undefined ? {} : { releasedAttemptId: retry.releasedAttemptId }),
             triggerId,
           },
         });
@@ -2721,7 +2727,11 @@ export class Daemon {
    * - the run's latest review outcome (`BLIND_REVIEW_UNAVAILABLE`, `BLIND_REVIEW_COMPLETED` or
    *   `BLIND_REVIEW_REJECTED`, by event order) is `BLIND_REVIEW_UNAVAILABLE` for that candidate, or
    *   a legacy one with no candidate digest that audit order links to it (`#legacyUnavailableFreeze`,
-   *   whose freeze is then answered too);
+   *   whose freeze is then answered too); or (#1344) it is ACP's release of a submission's attempt (its
+   *   release record, `OWNERLESS_STALL_OWED`, for its deadline or its daemon's restart) after that
+   *   candidate's latest freeze: an interrupted review records no outcome, and the released attempt's
+   *   result was not applied, so submitting it again is the same retry. The release's event stands for
+   *   the unavailable review's, and its attempt is answered too;
    * - `owner` is exactly the run's owner (`#bootstrapOwnerExact`).
    *
    * The sweep also asks the once-marker; the wake's `stillAdmissible` asks only this.
@@ -2730,7 +2740,7 @@ export class Daemon {
     runId: string,
     owner: { roleKey: string; sessionId: string; sessionIncarnation: string; bindingGeneration: number },
     planDigest: string,
-  ): { candidateSnapshotDigest: string; unavailableEventId: number; candidateFrozenEventId?: number } | null {
+  ): { candidateSnapshotDigest: string; unavailableEventId: number; candidateFrozenEventId?: number; releasedAttemptId?: string } | null {
     const run = this.cp.runs.get(runId);
     if (!run || run.state !== RunState.ACTIVE || !isProjectlessBootstrap(run)) return null;
     if (this.cp.artifacts.latest(runId, ArtifactKind.PLAN)?.digest !== planDigest) return null;
@@ -2747,16 +2757,29 @@ export class Daemon {
       candidate,
     );
     if (snapshot?.content.bootstrapPlan?.planDigest !== planDigest) return null;
-    const latest = this.cp.db.get<{ event_id: number; kind: string; candidate: unknown }>(
-      `SELECT event_id, kind, json_extract(evidence_json, '$.candidateSnapshotDigest') AS candidate
+    const latest = this.cp.db.get<{ event_id: number; kind: string; candidate: unknown; released: unknown }>(
+      `SELECT event_id, kind, json_extract(evidence_json, '$.candidateSnapshotDigest') AS candidate,
+              json_extract(evidence_json, '$.target') AS released
          FROM audit_events
-        WHERE run_id = ? AND kind IN ('BLIND_REVIEW_UNAVAILABLE', 'BLIND_REVIEW_COMPLETED', 'BLIND_REVIEW_REJECTED')
-          -- An attempt that no longer held the run recorded its late failure as its own history only.
-          AND NOT (kind = 'BLIND_REVIEW_UNAVAILABLE' AND json_extract(evidence_json, '$.attemptHeld') IS 0)
+        WHERE run_id = ?
+          AND ((kind IN ('BLIND_REVIEW_UNAVAILABLE', 'BLIND_REVIEW_COMPLETED', 'BLIND_REVIEW_REJECTED')
+                -- An attempt that no longer held the run recorded its late failure as its own history only.
+                AND NOT (kind = 'BLIND_REVIEW_UNAVAILABLE' AND json_extract(evidence_json, '$.attemptHeld') IS 0))
+               OR (kind = ? AND json_extract(evidence_json, '$.kind') = 'candidate_pipeline_attempt'))
         ORDER BY event_id DESC
         LIMIT 1`,
-      [runId],
+      [runId, OWNERLESS_STALL_OWED],
     );
+    if (latest?.kind === OWNERLESS_STALL_OWED && typeof latest.released === "string") {
+      const frozen = this.cp.db.get<{ event_id: number | null }>(
+        `SELECT MAX(event_id) AS event_id FROM audit_events
+          WHERE run_id = ? AND kind = 'CANDIDATE_FROZEN' AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?`,
+        [runId, candidate],
+      );
+      if (frozen?.event_id == null || frozen.event_id > latest.event_id) return null;
+      if (!this.#bootstrapOwnerExact(run, owner)) return null;
+      return { candidateSnapshotDigest: candidate, unavailableEventId: latest.event_id, releasedAttemptId: latest.released };
+    }
     if (!latest || latest.kind !== "BLIND_REVIEW_UNAVAILABLE") return null;
     const linkedFreeze = latest.candidate === candidate ? null : this.#legacyUnavailableFreeze(runId, candidate, latest.event_id);
     if (latest.candidate !== candidate && linkedFreeze === null) return null;

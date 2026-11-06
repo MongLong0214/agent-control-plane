@@ -508,33 +508,62 @@ export const acquireReviewerEgress = async (
 
 /**
  * #1344 D — what a daemon's start found of reviewer egress proxies an earlier instance launched and left running.
- * `leases`: the lease directories left behind (their names). `stopped`: the proxies matched to one of them and stopped.
- * `survived`: matched proxies that did not stop; their leases are kept. `portFree`: whether the reviewer port takes a
- * listener now. False means a holder not proven to be one of these proxies, which is left alone: a review start fails
+ * `leases`: the lease directories left behind (their names). `discovery`: COMPLETE when every live process of this user
+ * was listed and its argv read; otherwise FAILED, with why (`discoveryError`), and no lease is removed. `stopped`: the
+ * proxies matched to a lease and stopped. `survived`: matched proxies that did not stop. `kept`: the leases not removed,
+ * because their proxy survived or because discovery could not prove it gone. `portFree`: whether the reviewer port takes
+ * a listener now. False means a holder not proven to be one of these proxies, which is left alone: a review start fails
  * as it did before, and this record is the evidence of why.
  */
 export interface ReviewerEgressReap {
   port: number;
   leases: string[];
+  discovery: "COMPLETE" | "FAILED";
+  discoveryError?: string;
   stopped: Array<{ pid: number; lease: string }>;
   survived: Array<{ pid: number; lease: string }>;
+  kept: string[];
   portFree: boolean;
 }
 
-/** Every process of this user but this one, from `ps`'s numeric columns only; none when `ps` cannot answer. */
-const ownProcessIds = (): number[] => {
+/** A live process of this user, as `ps` lists it: its pid, and whether it is a zombie (exited, holding no socket). */
+interface ListedProcess { pid: number; zombie: boolean }
+
+/**
+ * Every process of this user but this one, from `ps`'s pid, uid and state columns. An error answers why the listing is
+ * not complete: `ps` failed or timed out, a line it printed is not those three columns, or it did not list this process.
+ */
+const ownProcesses = (): { processes: ListedProcess[] } | { error: string } => {
   const uid = process.getuid?.();
-  if (uid === undefined) return [];
+  if (uid === undefined) return { error: "this platform has no process user id" };
   let listing: string;
   try {
-    listing = execFileSync("ps", ["-axo", "pid=,uid="], { encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "ignore"] });
-  } catch {
-    return [];
+    listing = execFileSync("ps", ["-axo", "pid=,uid=,stat="], { encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "ignore"] });
+  } catch (error) {
+    return { error: `ps failed: ${error instanceof Error ? error.message : String(error)}` };
   }
-  return listing.split("\n").flatMap((line) => {
-    const [pid, owner] = line.trim().split(/\s+/).map(Number);
-    return pid !== undefined && Number.isSafeInteger(pid) && pid > 0 && pid !== process.pid && owner === uid ? [pid] : [];
-  });
+  const processes: ListedProcess[] = [];
+  let listedSelf = false;
+  for (const line of listing.split("\n")) {
+    if (line.trim() === "") continue;
+    // A uid is printed signed: nobody is -2.
+    const match = /^\s*(\d+)\s+(-?\d+)\s+(\S+)\s*$/.exec(line);
+    if (!match) return { error: "ps printed a line that is not pid, uid and state" };
+    const pid = Number(match[1]);
+    if (pid === process.pid) listedSelf = true;
+    if (pid !== process.pid && Number(match[2]) === uid) processes.push({ pid, zombie: match[3]!.startsWith("Z") });
+  }
+  return listedSelf ? { processes } : { error: "ps did not list this process" };
+};
+
+/** Whether no process has this pid any more: only ESRCH proves it; a permission error or a live process does not. */
+const processGone = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
 };
 
 /** Signals the exact process while it is still the one identified (same pid and OS start), then waits for it to go. */
@@ -570,8 +599,10 @@ const portTakesListener = (port: number): Promise<boolean> => new Promise((resol
  * (a lease that ended removed its own), and a process of this user whose kernel argv ends with exactly the arguments
  * that lease was launched with: this daemon's proxy script, its port and that directory's two files. Only those exact
  * pids are signalled, each while its OS start token is still the one read; never a process found by name, and never
- * what merely holds the port. A lease whose proxy is gone is removed. Runs under the lease lock, so no lease of this
- * process is live meanwhile. Null when no lease was left behind.
+ * what merely holds the port. A lease is removed only when its proxy is proven gone: it was matched and stopped, or
+ * discovery was complete and no process matched it. A discovery that failed (`ps` failed, timed out or printed what
+ * cannot be read, or a live process's argv could not be read) keeps every lease it did not stop, for the next start to
+ * reap. Runs under the lease lock, so no lease of this process is live meanwhile. Null when no lease was left behind.
  */
 export const reapOrphanedReviewerEgress = async (config: ReviewerEgressConfig | undefined): Promise<ReviewerEgressReap | null> => {
   if (!config) return null;
@@ -595,23 +626,41 @@ export const reapOrphanedReviewerEgress = async (config: ReviewerEgressConfig | 
   const releaseLock = await acquireLeaseLock();
   try {
     const signatures = leases.map((lease) => ({ lease, tail: proxyArguments(config.proxyPath, port, join(config.runtimeDir, lease)) }));
-    const matched = ownProcessIds().flatMap((pid) => {
+    const listed = ownProcesses();
+    let discoveryError = "error" in listed ? listed.error : null;
+    const matched: Array<{ pid: number; startToken: string; lease: string }> = [];
+    /** Matches one process; false when it is live and its argv cannot be read now. */
+    const inspect = (pid: number): boolean => {
       const startToken = readProcessStartToken(pid);
       const argv = startToken === null ? null : readProcessArgv(pid);
-      if (startToken === null || argv === null) return [];
+      // Gone since the listing proves nothing is there; a live process whose argv cannot be read could be a proxy.
+      if (startToken === null || argv === null) return processGone(pid);
       const signature = signatures.find(({ tail }) =>
         argv.length > tail.length && tail.every((value, index) => argv[argv.length - tail.length + index] === value));
-      if (!signature || readProcessStartToken(pid) !== startToken) return [];
-      return [{ pid, startToken, lease: signature.lease }];
-    });
+      if (signature && readProcessStartToken(pid) === startToken) matched.push({ pid, startToken, lease: signature.lease });
+      return true;
+    };
+    let unread = ("error" in listed ? [] : listed.processes).filter(({ zombie }) => !zombie).map(({ pid }) => pid)
+      .filter((pid) => !inspect(pid));
+    // A process caught exiting or between exec steps is unreadable for a moment: asked again, briefly, before it is
+    // taken to leave the discovery incomplete.
+    for (let round = 0; unread.length > 0 && round < 3; round += 1) {
+      await delay(100);
+      unread = unread.filter((pid) => !inspect(pid));
+    }
+    if (unread.length > 0) discoveryError ??= `the argv of live process ${unread[0]} could not be read`;
     const stopped: ReviewerEgressReap["stopped"] = [];
     const survived: ReviewerEgressReap["survived"] = [];
     for (const proxy of matched) {
       (await stopExact(proxy.pid, proxy.startToken) ? stopped : survived).push({ pid: proxy.pid, lease: proxy.lease });
     }
-    const kept = new Set(survived.map((proxy) => proxy.lease));
+    const provenGone = (lease: string): boolean =>
+      !survived.some((proxy) => proxy.lease === lease) &&
+      (stopped.some((proxy) => proxy.lease === lease) || discoveryError === null);
+    const kept: string[] = [];
     for (const lease of leases) {
-      if (!kept.has(lease)) rmSync(join(config.runtimeDir, lease), { recursive: true, force: true });
+      if (provenGone(lease)) rmSync(join(config.runtimeDir, lease), { recursive: true, force: true });
+      else kept.push(lease);
     }
     let portFree = await portTakesListener(port);
     // A stopped proxy's listening socket closes with its process; give the kernel a moment to show it.
@@ -620,7 +669,16 @@ export const reapOrphanedReviewerEgress = async (config: ReviewerEgressConfig | 
       await delay(25);
       portFree = await portTakesListener(port);
     }
-    return { port, leases, stopped, survived, portFree };
+    return {
+      port,
+      leases,
+      discovery: discoveryError === null ? "COMPLETE" : "FAILED",
+      ...(discoveryError === null ? {} : { discoveryError }),
+      stopped,
+      survived,
+      kept,
+      portFree,
+    };
   } finally {
     releaseLock();
   }

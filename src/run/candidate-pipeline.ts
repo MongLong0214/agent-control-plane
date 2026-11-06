@@ -20,6 +20,7 @@ import type { VerificationCommand } from "../contracts/verification-command.ts";
 import { EVIDENCE_PRODUCERS, type ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import { attemptReleasedNoticeKey } from "../doctor/watchdog.ts";
 import { ArtifactKind, RunKind, type RunRow, RunState } from "../domain/types.ts";
 import { requiredBaseFor, sourceProbeBranchesFor } from "../github/branch-contract.ts";
 import { currentBranch, mergeBase, revParse, tryRevParse } from "../git/git.ts";
@@ -625,20 +626,27 @@ export class CandidatePipeline {
 
   /**
    * #1344 C1 — the run's owner CTO is told that ACP released an attempt of its run, whether its deadline passed or the
-   * daemon that ran it restarted: in band, as a revision is (`returnToCto`), keyed by the attempt, so a release is told
-   * once. It asks for no product change: the attempt's outcome was not applied, and a fresh result_submit with a new
-   * idempotency key goes on. The notice's id, or null when it is given none: a run not ACTIVE, one with no active
-   * owner binding (as a revision), a project-less bootstrap run (as `noticeUnjudgedReview`, whose Limit applies), or
-   * an enqueue the outbox refused. The release never waits on it.
+   * daemon that ran it restarted: in band, as a revision is (`returnToCto`), keyed by the attempt
+   * (`attemptReleasedNoticeKey`), so a release is told once. It asks for no product change: the attempt's outcome was
+   * not applied, and a fresh result_submit with a new idempotency key goes on. Answers the notice's id; null when none
+   * is owed (a run not ACTIVE, or a project-less bootstrap run, whose driven CTO would replace its PLAN for any
+   * REVISION_REQUEST and which the daemon's review retry wakes instead, `Daemon.#bootstrapReviewRetry`); and a denial
+   * when one is owed and cannot be written now (no active owner binding, or the outbox refused its target), which the
+   * watchdog keeps owed and retries (`Watchdog.deliverOwedReleaseNotices`). The release never waits on it.
    */
-  noticeAttemptReleased(released: { runId: string; attemptId: string; reason: string }): string | null {
+  noticeAttemptReleased(released: { runId: string; attemptId: string; reason: string }): Decision<string | null> {
     const run = this.runs.get(released.runId);
-    if (!run || run.state !== RunState.ACTIVE || isProjectlessBootstrap(run)) return null;
+    if (!run || run.state !== RunState.ACTIVE || isProjectlessBootstrap(run)) return allow(ReasonCode.OK, null);
     const roleKey = this.runs.ownerRoleKeyFor(run);
     const binding = roleKey ? this.bindings.active(roleKey) : null;
-    if (!binding) return null;
+    if (!binding) {
+      return deny(ReasonCode.OUTBOX_TARGET_NOT_CURRENT, "the run's owner role has no active binding to tell of the release", {
+        runId: released.runId,
+        roleKey,
+      });
+    }
     const enqueued = this.outbox.enqueue({
-      idempotencyKey: `attempt-released:${released.runId}:${released.attemptId}`,
+      idempotencyKey: attemptReleasedNoticeKey(released.runId, released.attemptId),
       roleKey: binding.roleKey,
       bindingGeneration: binding.bindingGeneration,
       targetSessionId: binding.sessionId,
@@ -654,7 +662,7 @@ export class CandidatePipeline {
         recovery: ATTEMPT_RELEASED_RECOVERY,
       },
     });
-    return enqueued.allowed ? enqueued.value.messageId : null;
+    return enqueued.allowed ? allow(ReasonCode.OK, enqueued.value.messageId) : (enqueued as Decision<never>);
   }
 
   private async submitResultOnce(input: SubmitResultInput, attemptId: string, signal: AbortSignal): Promise<Decision<PipelineOutcome>> {

@@ -1,12 +1,15 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
-import { OWNERLESS_STALL_OWED } from "../../src/doctor/watchdog.ts";
-import { ExecutionMode, type RunRow } from "../../src/domain/types.ts";
+import { ATTEMPT_RELEASE_NOTICE_DEFERRED, OWNERLESS_STALL_OWED } from "../../src/doctor/watchdog.ts";
+import { ArtifactKind, ExecutionMode, Role, RunState, SessionLifecycle, type RunRow } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { ATTEMPT_RELEASED_NOTICE } from "../../src/run/candidate-pipeline.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
+import { BOOTSTRAP_REVIEW_RETRY_WAKE, reviewRetryTriggerKind } from "../../src/runtime/provisioned-session-runtime.ts";
+import { withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
+import { bootstrapCoverageKeys } from "../helpers/bootstrap-plan.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import {
   type Harness,
@@ -17,6 +20,7 @@ import {
   registerFixtureProject,
   reviewerPass,
 } from "../helpers/harness.ts";
+import { scriptBootstrapOwner } from "../helpers/scripted-bootstrap-owner.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -80,7 +84,7 @@ const submission = (run: RunRow) => ({
 });
 
 /** An attempt a daemon that has since ended took for the run: RUNNING, its deadline 28 minutes ahead. */
-const strandAttempt = (h: Harness, run: RunRow, attemptId = "attempt_endeddaemon000000000001"): string => {
+const strandAttempt = (h: Pick<Harness, "clock" | "cp">, run: RunRow, attemptId = "attempt_endeddaemon000000000001"): string => {
   const now = h.clock.now();
   h.cp.db.run(
     `INSERT INTO candidate_pipeline_attempts
@@ -201,5 +205,93 @@ describe("#1344 C1: the run's owner CTO is told its attempt was released, on bot
     expect(owed?.evidence).toMatchObject({ target: attemptId, reason: "deadline" });
     const [notice] = releaseNotices(h, run.runId);
     expectOwnerNotice(h, run, attemptId, "deadline", notice?.messageId ?? null);
+  });
+});
+
+describe("#1344: a release notice is never lost, and a project-less bootstrap owner is woken to resubmit", () => {
+  it("an owner whose session is ERROR at the restart is told once it recovers: the notice stays owed, never dropped", async () => {
+    const { h, run } = await prepare();
+    const attemptId = strandAttempt(h, run);
+    const down = h.cp.sessions.transition(run.ownerSessionId!, SessionLifecycle.ERROR, "the owner's process ended with the daemon");
+    expect(down.allowed).toBe(true);
+
+    const [released] = (await restartReconcile(h)).releasedCandidateAttempts;
+
+    // The outbox refuses a target that is not live; the release still commits, and the notice is owed, not dropped.
+    expect(released).toMatchObject({ attemptId, ownerNoticeId: null, ownerNoticeDeferred: ReasonCode.OUTBOX_TARGET_NOT_CURRENT });
+    expect(attemptRow(h, run.runId).state).toBe("RELEASED");
+    expect(releaseNotices(h, run.runId)).toEqual([]);
+    expect(h.cp.audit.forRun(run.runId).filter((row) => row.kind === ATTEMPT_RELEASE_NOTICE_DEFERRED)).toEqual([
+      expect.objectContaining({ reasonCode: ReasonCode.OUTBOX_TARGET_NOT_CURRENT, evidence: { attemptId, reason: "daemon restart" } }),
+    ]);
+    // While the owner is down, a tick asks again and writes nothing.
+    await h.cp.watchdog.tick();
+    expect(releaseNotices(h, run.runId)).toEqual([]);
+
+    // The owner recovers: the role is given a live holder.
+    const replacement = h.cp.sessions.create({ provider: "scripted", model: "scripted-cto" });
+    h.cp.sessions.transition(replacement.sessionId, SessionLifecycle.READY, "replacement CTO");
+    const switched = h.cp.bindings.switchTo({
+      role: Role.PRIMARY_CTO,
+      projectId: run.projectId!,
+      sessionId: replacement.sessionId,
+      reason: "the CTO is replaced",
+      conversation: "REPLACED",
+      takeover: true,
+    });
+    if (!switched.allowed) throw new Error(switched.message);
+
+    await h.cp.watchdog.tick();
+
+    expect(releaseNotices(h, run.runId)).toEqual([expect.objectContaining({
+      targetSessionId: replacement.sessionId,
+      bindingGeneration: switched.value.bindingGeneration,
+      payload: expect.objectContaining({ attemptId, reason: "daemon restart", notice: ATTEMPT_RELEASED_NOTICE }),
+    })]);
+    // Told once: a later tick writes no second notice.
+    await h.cp.watchdog.tick();
+    expect(releaseNotices(h, run.runId)).toHaveLength(1);
+  });
+
+  it("a project-less bootstrap run with a frozen PLAN and a stranded attempt: its owner is woken to resubmit, and its review completes", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onRevision: "ignore", onResult: "ignore", onRetry: "follow-prompt" });
+      const { runId, ownerSessionId } = await f.dispatchBootstrap();
+      await f.awaitFinishedTurns(ownerSessionId, 1);
+      await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false), { timeout: 10_000, interval: 25 });
+      const plans = owner.submissions.length;
+      const planDigest = f.harness.cp.artifacts.latest(runId, ArtifactKind.PLAN)!.digest;
+      const run = f.harness.cp.runs.require(runId);
+      // A daemon that has since ended took the attempt and froze the PLAN's candidate; its review never answered.
+      const attemptId = strandAttempt(f.harness, run);
+      const frozen = await f.harness.cp.pipeline.freeze(runId, attemptId);
+      if (!frozen.allowed) throw new Error(frozen.message);
+      const candidate = f.harness.cp.runs.currentCandidate(runId)!;
+      expect(f.harness.cp.audit.forRun(runId).filter((row) => row.kind === "BLIND_REVIEW_UNAVAILABLE")).toEqual([]);
+
+      const [released] = f.harness.cp.watchdog.releaseAttemptsOfEndedDaemons();
+
+      expect(released).toMatchObject({ runId, attemptId, reason: "daemon restart", ownerNoticeId: null, ownerNoticeDeferred: null });
+      // No REVISION_REQUEST: one would make the driven bootstrap CTO replace the PLAN under review.
+      expect(f.harness.cp.outbox.listByRun(runId).filter((message) => message.kind === MessageKind.REVISION_REQUEST)).toEqual([]);
+
+      f.harness.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.harness, runId)) });
+      const swept = f.daemon.wakeBootstrapResultRecovery();
+
+      expect(swept.woken).toEqual([expect.objectContaining({
+        runId,
+        retry: expect.objectContaining({ candidateSnapshotDigest: candidate, releasedAttemptId: attemptId }),
+      })]);
+      expect(f.harness.cp.audit.forRun(runId).filter((row) => row.kind === BOOTSTRAP_REVIEW_RETRY_WAKE)).toEqual([
+        expect.objectContaining({ evidence: expect.objectContaining({ candidateSnapshotDigest: candidate, releasedAttemptId: attemptId }) }),
+      ]);
+      await vi.waitFor(() => expect(owner.results).toHaveLength(1), { timeout: 10_000, interval: 25 });
+      expect(owner.prompts.at(-1)).toContain(`The control plane woke you for: ${reviewRetryTriggerKind(runId)}.`);
+      expect(owner.results).toEqual([{ runId, ok: true, stage: "COMPLETED_REVIEW" }]);
+      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+      // It resubmitted the same PLAN's result: no new PLAN.
+      expect(owner.submissions).toHaveLength(plans);
+      expect(f.harness.cp.artifacts.latest(runId, ArtifactKind.PLAN)!.digest).toBe(planDigest);
+    });
   });
 });
