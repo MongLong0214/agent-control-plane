@@ -4718,8 +4718,10 @@ export class GitHubKernel {
     type Answer = { data?: { repository?: { pullRequest?: { closingIssuesReferences?: Page | null } | null } | null } | null; errors?: unknown } | null;
     const own = `${owner}/${repo}`.toLowerCase();
     const present = new Set<unknown>();
-    // Page by page (100 a page), until every linked issue is found or GitHub has no next page.
+    // Page by page (100 a page), until every linked issue is found or GitHub has no next page. Every linked issue
+    // found is complete evidence, whatever later pages hold; a cursor seen before (a cycle) refuses.
     let after: string | null = null;
+    const cursors = new Set<string>();
     for (let page = 0; page < CLOSING_REFERENCE_PAGE_BOUND; page += 1) {
       let answer: Answer;
       try {
@@ -4743,7 +4745,8 @@ export class GitHubKernel {
       if (missing.length === 0) return allow(ReasonCode.OK, undefined);
       if (!next) return refused({ missing });
       const cursor: unknown = references?.pageInfo?.endCursor;
-      if (typeof cursor !== "string" || cursor === after) return refused({ cause: "GitHub's closing references answer is not readable" });
+      if (typeof cursor !== "string" || cursors.has(cursor)) return refused({ cause: "GitHub's closing references answer is not readable" });
+      cursors.add(cursor);
       after = cursor;
     }
     return refused({ cause: "the closing references run past the pages read" });

@@ -375,6 +375,22 @@ describe("#1345: the finalization PR closes the issues the run tracks on its own
     expect(refused.evidence).toMatchObject({ missing: [101] });
   });
 
+  it("closing-reference cursors that cycle A→B→A with linked issues still missing are refused at the repeat", async () => {
+    const fixture = await setup();
+    const { github } = fixture;
+    const request = github.request.bind(github);
+    const next: Record<string, string> = { "": "A", A: "B", B: "A" };
+    github.request = async <T>(method: HttpMethod, path: string, body?: unknown): Promise<T> => {
+      if (method !== "POST" || path !== "/graphql") return request<T>(method, path, body);
+      const after = (body as { variables: { after: string | null } }).variables.after ?? "";
+      const page = { nodes: [], pageInfo: { hasNextPage: true, endCursor: next[after] } };
+      return { data: { repository: { pullRequest: { closingIssuesReferences: page } } } } as T;
+    };
+    const refused = await prepareLinked(fixture);
+    expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
+    expect(fixture.log.filter((call) => call.method === "POST" && call.path === "/graphql")).toHaveLength(3);
+  });
+
   it("a GraphQL error reading the closing references is refused, never taken as linkage", async () => {
     const fixture = await trackedRun();
     fixture.github.graphqlErrors = ["Something went wrong while executing your query."];
