@@ -219,7 +219,7 @@ describe("gh CLI transport (#246)", () => {
     expect(seen).toEqual([
       { args: ["api", "--hostname", "github.com", "--method", "GET", "repos/acme/fixture"], stdin: null },
       {
-        args: ["api", "--hostname", "github.com", "--method", "POST", "orgs/acme/repos", "--input", "-"],
+        args: ["api", "--hostname", "github.com", "--method", "POST", "orgs/acme/repos", "--include", "--input", "-"],
         stdin: '{"name":"fixture"}',
       },
     ]);
@@ -241,6 +241,60 @@ describe("gh CLI transport (#246)", () => {
       reasonCode: ReasonCode.INTERNAL_ERROR,
       evidence: { status: null },
     });
+  });
+});
+
+/**
+ * #1344 — a write's status is GitHub's status line, which `gh api --include` prints before the body.
+ * Without it, an error with an empty body reached the port as `gh`'s "unexpected end of JSON input"
+ * and no status, so a definite refusal was recorded as an unknown outcome.
+ */
+describe("gh CLI transport: a write's status comes from the response head (#1344)", () => {
+  const head = (statusLine: string, ...headers: string[]): string => `${statusLine}\n${headers.map((h) => `${h}\r\n`).join("")}\r\n`;
+  const REQUEST_ID = "C0DE:1234:ABCDEF:5678:6A1B2C3D";
+  const headers = ["Content-Type: application/json; charset=utf-8", "Set-Cookie: _gh_sess=fixture-session; path=/", `X-Github-Request-Id: ${REQUEST_ID}`, "X-Oauth-Scopes: repo"];
+  const answering = (result: { exitCode: number; stdout: string; stderr: string }) => {
+    const seen: Array<readonly string[]> = [];
+    const client = new GhCliGitHubClient(async (args) => {
+      seen.push(args);
+      return result;
+    });
+    return { client, seen };
+  };
+
+  it("a 422 with an empty body keeps its status and the request id, and no other header", async () => {
+    const { client, seen } = answering({ exitCode: 1, stdout: head("HTTP/2.0 422 Unprocessable Entity", ...headers), stderr: "unexpected end of JSON input\n" });
+    const failure = await client.request("POST", "repos/acme/fixture/issues", { title: "t" }).then(() => null, (error: unknown) => error);
+    expect(seen[0]).toContain("--include");
+    expect(failure).toMatchObject({ reasonCode: ReasonCode.INTERNAL_ERROR });
+    const { evidence, message } = failure as { evidence: Record<string, unknown>; message: string };
+    expect(evidence).toEqual({ status: 422, method: "POST", path: "repos/acme/fixture/issues", requestId: REQUEST_ID });
+    expect(message).not.toMatch(/_gh_sess|Set-Cookie|X-Oauth-Scopes/i);
+  });
+
+  it("a 502 with an empty body and a 404 keep their statuses; a write that got no answer has none", async () => {
+    await expect(answering({ exitCode: 1, stdout: head("HTTP/2.0 502 Bad Gateway"), stderr: "unexpected end of JSON input" }).client.request("POST", "repos/acme/fixture/issues", {}))
+      .rejects.toMatchObject({ reasonCode: ReasonCode.INTERNAL_ERROR, evidence: { status: 502 } });
+    await expect(answering({ exitCode: 1, stdout: head("HTTP/2.0 404 Not Found"), stderr: "gh: Not Found (HTTP 404)" }).client.request("PATCH", "repos/acme/absent", {}))
+      .rejects.toMatchObject({ reasonCode: ReasonCode.NOT_FOUND, evidence: { status: 404 } });
+    await expect(answering({ exitCode: 1, stdout: "", stderr: "dial tcp: timeout" }).client.request("POST", "repos/acme/fixture/issues", {}))
+      .rejects.toMatchObject({ evidence: { status: null } });
+  });
+
+  it("a 2xx write answers with the body after its head; one whose body is cut short still throws with no status", async () => {
+    const created = answering({ exitCode: 0, stdout: `${head("HTTP/2.0 201 Created", ...headers)}{"number":11}`, stderr: "" });
+    expect(await created.client.request("POST", "repos/acme/fixture/issues", {})).toEqual({ number: 11 });
+    expect(await answering({ exitCode: 0, stdout: head("HTTP/2.0 204 No Content"), stderr: "" }).client.request("DELETE", "repos/acme/fixture/labels/x")).toBeNull();
+    const truncated = await answering({ exitCode: 0, stdout: `${head("HTTP/2.0 201 Created")}{"number":11,"node_id":"I_`, stderr: "" })
+      .client.request("POST", "repos/acme/fixture/issues", {}).then(() => null, (error: unknown) => error);
+    expect(truncated).toBeInstanceOf(SyntaxError);
+    expect((truncated as { evidence?: unknown }).evidence).toBeUndefined();
+  });
+
+  it("a read is sent without --include and its output is all body, as before", async () => {
+    const { client, seen } = answering({ exitCode: 0, stdout: '{"ok":true}', stderr: "" });
+    expect(await client.request("GET", "repos/acme/fixture")).toEqual({ ok: true });
+    expect(seen[0]).not.toContain("--include");
   });
 });
 

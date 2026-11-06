@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { executablePlanOf, planForSubmission } from "../../src/bootstrap/bootstrap-plan.ts";
 import { createBootstrapGitHubWritePort } from "../../src/bootstrap/bootstrap-write-guard.ts";
 import { type GenesisBundle, parseGenesis } from "../../src/bootstrap/genesis-bundle.ts";
-import { createGitHubApiWritePort, type GenesisResourceUnmet, type GitHubRepositoryTarget } from "../../src/bootstrap/github-write-port.ts";
+import { GhCliGitHubClient, createGitHubApiWritePort, type GenesisResourceUnmet, type GitHubRepositoryTarget } from "../../src/bootstrap/github-write-port.ts";
 import { produceRepoFactoryResult } from "../../src/bootstrap/repo-factory-producer.ts";
 import { acpError, allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -1434,5 +1434,78 @@ describe("#1240 (RF lane) — the genesis issues' work-unit markers are checked 
     github.issues[1]!.milestone = github.milestoneRef(github.milestones[0]!);
     github.foreign = true;
     await expect(port.observeGenesisResources!(target, resources, { repositoryNodeId: NODE })).rejects.toThrow(/another repository/);
+  });
+});
+
+/**
+ * #1344 — the live counterexample (run_13accc91, 2026-11-05): GitHub refused a work-scope issue create
+ * with an empty body, `gh` printed only "unexpected end of JSON input", and the port recorded no status,
+ * so the definite refusal was kept as an unknown outcome that nothing could resolve.
+ *
+ * Here the production `gh` client sits in front of the double: every request is the argv and stdin
+ * `GhCliGitHubClient` sends, answered as `gh api` prints it, the status line and headers first only when
+ * `--include` asks for them. The next POST to `/issues` prints `script` instead.
+ */
+interface GhOutput { head: string; body: string; stderr: string; exitCode: number; creates: boolean }
+const REQUEST_ID = "C0DE:1234:ABCDEF:5678:6A1B2C3D";
+const responseHead = (statusLine: string): string => `${statusLine}\nContent-Type: application/json; charset=utf-8\r\nX-Github-Request-Id: ${REQUEST_ID}\r\n\r\n`;
+const throughGh = (github: IssuesGitHub, script: GhOutput): IssuesGitHub => {
+  const direct = github.request.bind(github);
+  let next: GhOutput | null = script;
+  const gh = new GhCliGitHubClient(async (args, stdin) => {
+    const method = args[4] as "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
+    const path = args[5]!;
+    const include = args.includes("--include");
+    const body: unknown = stdin === null ? undefined : JSON.parse(stdin);
+    if (next !== null && method === "POST" && path.endsWith("/issues")) {
+      const out = next;
+      next = null;
+      if (out.creates) await direct(method, path, body);
+      else github.calls.push({ method, path, body });
+      return { exitCode: out.exitCode, stdout: `${include ? out.head : ""}${out.body}`, stderr: out.stderr };
+    }
+    const answer = await direct(method, path, body);
+    return { exitCode: 0, stdout: `${include ? responseHead(method === "POST" ? "HTTP/2.0 201 Created" : "HTTP/2.0 200 OK") : ""}${JSON.stringify(answer)}`, stderr: "" };
+  });
+  github.request = <T>(method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE", path: string, body?: unknown): Promise<T> => gh.request<T>(method, path, body);
+  return github;
+};
+
+describe("#1344 — a work-scope issue create keeps GitHub's HTTP status, so a definite refusal is not held as unknown", () => {
+  const feedUnit = (impl: string) => [{ key: "feed", tasks: [impl], issue: { new: { title: "Add feed filtering", body: "Filter the feed" } }, milestone: { number: 1 } }];
+
+  it("a 422 with an empty body is definite: its intent is retired, and a new-key retry creates the issue once", async () => {
+    const github = throughGh(myeotnyeon(), { head: responseHead("HTTP/2.0 422 Unprocessable Entity"), body: "", stderr: "unexpected end of JSON input\n", exitCode: 1, creates: false });
+    const g = await governedRun({ github, legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    expect(tracking(await planSubmit(g, feedUnit(impl)))).toMatchObject({ tracked: false });
+    expect(intentsOf(g)).toEqual([{ outcome: "DEFINITE_NOT_CREATED", status: 422 }]);
+    expect(g.github.issues.filter((i) => i.title === "Add feed filtering")).toEqual([]);
+    expect(tracking(await planSubmit(g, feedUnit(impl), undefined, "retry"))).toMatchObject({ tracked: true });
+    expect(g.github.posts("/issues")).toHaveLength(2);
+    expect(g.github.issues.filter((i) => i.title === "Add feed filtering")).toHaveLength(1);
+    expect(startExecution(g, impl).allowed).toBe(true);
+  });
+
+  it("a 201 whose body is cut short stays unknown: nothing is retired or sent again, and the issue is linked by its token", async () => {
+    const github = throughGh(myeotnyeon(), { head: responseHead("HTTP/2.0 201 Created"), body: '{"number":11,"node_id":"I_', stderr: "", exitCode: 0, creates: true });
+    const g = await governedRun({ github, legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    expect(tracking(await planSubmit(g, feedUnit(impl)))).toMatchObject({ tracked: false });
+    expect(intentsOf(g)).toEqual([]);
+    expect(tracking(await planSubmit(g, feedUnit(impl), undefined, "retry"))).toMatchObject({ tracked: true });
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(g.github.issues.filter((i) => i.title === "Add feed filtering")).toHaveLength(1);
+  });
+
+  it("a 502 with an empty body stays unknown: nothing is retired, and a retry is held as unresolved without sending again", async () => {
+    const github = throughGh(myeotnyeon(), { head: responseHead("HTTP/2.0 502 Bad Gateway"), body: "", stderr: "unexpected end of JSON input\n", exitCode: 1, creates: false });
+    const g = await governedRun({ github, legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    expect(tracking(await planSubmit(g, feedUnit(impl)))).toMatchObject({ tracked: false });
+    expect(intentsOf(g)).toEqual([]);
+    expect(unresolved(await planSubmit(g, feedUnit(impl), undefined, "retry")).map((u) => u.unit)).toEqual(["feed"]);
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(g.github.issues.filter((i) => i.title === "Add feed filtering")).toEqual([]);
   });
 });
