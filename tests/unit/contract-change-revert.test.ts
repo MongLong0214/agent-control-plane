@@ -120,6 +120,18 @@ const activatedChange = async (h: Harness, projectId: string, propose: (base: Pr
   return change;
 };
 
+/** Every contract-change reviewer prompt the scripted reviewer was given, oldest first. */
+const reviewPrompts = (h: Harness): string[] =>
+  h.scripted.invocations.map((call) => call.prompt).filter((prompt) => prompt.startsWith("# Contract change review"));
+
+/** The fenced JSON block that follows `heading` in a prompt. */
+const fencedJsonAfter = (prompt: string, heading: string): unknown => {
+  const at = prompt.indexOf(heading);
+  if (at < 0) throw new Error(`the prompt has no ${heading} section`);
+  const open = prompt.indexOf("```json\n", at);
+  return JSON.parse(prompt.slice(open + 8, prompt.indexOf("\n```", open + 8)));
+};
+
 /** The base X0 a project's first change replaced, read back by digest. */
 const manifestOf = (h: Harness, digest: string): ProjectManifest => h.cp.projects.manifest(digest)!;
 
@@ -170,6 +182,44 @@ describe("#1347 W1/W8: the exact inverse of an additive change, end to end", () 
     expect(h.cp.runs.require(inFlight.runId).pinnedManifestDigest).toBe(c1.digest);
     // The next run pins X0 again.
     expect((await dispatchRun(h, projectId, RunKind.CONTRACT_CHANGE)).baseDigest).toBe(x0);
+  });
+
+  it("the revert's reviewer packet carries the judgement it was admitted on, and its stored review binds it; a non-revert packet carries none", async () => {
+    const h = makeHarness();
+    const { projectId } = await registerFixtureProject(h, "revert-packet");
+    const x0 = activeManifest(h, projectId)!;
+    const c1 = await activatedChange(h, projectId, addsCommand("e2e-wait"));
+    const c1Prompt = reviewPrompts(h).at(-1)!;
+    const c1Review = h.cp.artifacts.latest<{ contractChange: Record<string, unknown> }>(c1.runId, "BLIND_REVIEW")!.content;
+    const revert = await confirmedChange(h, projectId, () => manifestOf(h, x0), c1.runId);
+    const prompt = reviewPrompts(h).at(-1)!;
+
+    const c1Grant = grantRow(h, c1.runId)!;
+    const [c1Activation] = activationsOf(h, projectId);
+    const judgement = {
+      revertsContractChangeRunId: c1.runId,
+      target: { kind: RunKind.CONTRACT_CHANGE, projectId, state: "COMPLETED" },
+      firstActivation: false,
+      grant: { grantId: c1Grant["grant_id"], projectId, fromManifestDigest: x0, manifestDigest: c1.digest, consumed: true, intact: true },
+      activation: { eventId: c1Activation!.eventId, grantId: c1Grant["grant_id"], from: x0, to: c1.digest },
+      latestActivationEventId: c1Activation!.eventId,
+      activeManifestDigest: c1.digest,
+      pinnedManifestDigest: c1.digest,
+      additive: { comparedCommands: manifestOf(h, x0).verificationCommands.map((command) => command.id), changedCommands: [], lowered: [] },
+      revertedBy: [],
+    };
+    expect(fencedJsonAfter(prompt, "### Revert eligibility, as ACP judged it")).toEqual(judgement);
+    expect(prompt).toContain(`The PLAN names revertsContractChangeRunId ${c1.runId}.`);
+    expect(prompt).not.toMatch(/Other PLAN fields, not shown:.*revertsContractChangeRunId/);
+    // The stored review records the judgement it was shown, as it records the workflows it judged.
+    const review = h.cp.artifacts.latest<{ contractChange: Record<string, unknown> }>(revert.runId, "BLIND_REVIEW")!;
+    expect(review.candidateSnapshotDigest).toBe(h.cp.runs.currentCandidate(revert.runId));
+    expect(review.content.contractChange["revert"]).toEqual(judgement);
+
+    // C1, a CONTRACT_CHANGE naming no revert: no revert section, and nothing of one in its stored review.
+    expect(c1Prompt).not.toContain("Revert eligibility");
+    expect(c1Prompt).not.toContain("revertsContractChangeRunId");
+    expect(c1Review.contractChange).not.toHaveProperty("revert");
   });
 
   it("the PLAN field survives the plan_submit input schema", () => {

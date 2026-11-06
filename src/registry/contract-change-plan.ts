@@ -210,6 +210,29 @@ export interface ContractChangeRevertFacts {
 /** #1347 — the revert facts for the run a PLAN names. */
 export type RevertLookup = (targetRunId: string) => ContractChangeRevertFacts;
 
+/**
+ * #1347 — what an admitted revert was judged on, exactly as `contractChangeRevert` read and compared it:
+ * the facts it was given for the named run and the additive comparison of that run's move. Its reviewer
+ * is shown this, never a second reading.
+ */
+export interface ContractChangeRevertJudgement {
+  /** The PLAN's `revertsContractChangeRunId`, as stored. */
+  revertsContractChangeRunId: string;
+  target: NonNullable<ContractChangeRevertFacts["target"]>;
+  firstActivation: boolean;
+  grant: NonNullable<ContractChangeRevertFacts["grant"]>;
+  /** The named run's one PROJECT_MANIFEST_ACTIVATED row. */
+  activation: ContractChangeRevertFacts["activations"][number];
+  latestActivationEventId: number | null;
+  activeManifestDigest: string | null;
+  /** The reverting run's pin. */
+  pinnedManifestDigest: string | null;
+  /** From the grant's from-manifest to its manifest: each earlier command compared, and what changed or was lowered (none). */
+  additive: { comparedCommands: string[]; changedCommands: string[]; lowered: Array<Record<string, string | null>> };
+  /** Other runs whose consumed grant reverted the named run (none). */
+  revertedBy: readonly string[];
+}
+
 export const isContractChangeRun = (run: { kind: string }): boolean => run.kind === RunKind.CONTRACT_CHANGE;
 
 /** One way the carried manifest asks less of a candidate than the base did. */
@@ -252,6 +275,8 @@ export interface CurrentContractChangePlan {
   manifest: ProjectManifest;
   baseManifest: ProjectManifest;
   workflowEvidence: ContractChangeWorkflowEvidence[];
+  /** #1347 — present only for a PLAN naming a revert: what its admission was judged on. */
+  revert?: ContractChangeRevertJudgement;
 }
 
 const refuse = <T>(
@@ -567,8 +592,8 @@ export const contractChangeRevert = (
   suppliedDigest: string,
   lookup: ManifestLookup,
   revert: RevertLookup | null,
-): Decision<{ targetRunId: string }> => {
-  type Judged = Decision<{ targetRunId: string }>;
+): Decision<{ targetRunId: string; judgement: ContractChangeRevertJudgement }> => {
+  type Judged = Decision<{ targetRunId: string; judgement: ContractChangeRevertJudgement }>;
   const invalid = (cause: string, evidence: Evidence = {}): Judged =>
     refuse(ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_DENIED, ContractChangeRefusal.REVERT_TARGET_INVALID, "the PLAN names no completed, activated CONTRACT_CHANGE of this project to revert", {
       revertsContractChangeRunId: typeof named === "string" ? named : null,
@@ -606,14 +631,14 @@ export const contractChangeRevert = (
   const before = manifestAt(lookup, grant.fromManifestDigest);
   const after = manifestAt(lookup, grant.manifestDigest);
   if (before === null || after === null) return invalid("TARGET_MANIFEST_UNREADABLE", { from: grant.fromManifestDigest, to: grant.manifestDigest });
-  const lowered = verificationBarLowerings(before, after);
+  const lowered = verificationBarLowerings(before, after).map((entry) => ({ kind: entry.kind, ...entry.detail }));
   const changed = before.verificationCommands
     .filter((command) => !after.verificationCommands.some((next) => canonicalJson(next) === canonicalJson(command)))
     .map((command) => command.id);
   if (lowered.length > 0 || changed.length > 0) {
     return refuse(ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT, ContractChangeRefusal.REVERT_TARGET_NOT_ADDITIVE, "the named CONTRACT_CHANGE changed or removed existing verification; only an additive change is reverted", {
       ...evidence,
-      lowered: lowered.map((entry) => ({ kind: entry.kind, ...entry.detail })),
+      lowered,
       changedCommands: changed,
     });
   }
@@ -638,7 +663,21 @@ export const contractChangeRevert = (
       replaced: grant.fromManifestDigest,
     });
   }
-  return allow(ReasonCode.OK, { targetRunId: named });
+  return allow(ReasonCode.OK, {
+    targetRunId: named,
+    judgement: {
+      revertsContractChangeRunId: named,
+      target,
+      firstActivation: facts.firstActivation,
+      grant,
+      activation,
+      latestActivationEventId: facts.latestActivationEventId,
+      activeManifestDigest: facts.activeManifestDigest,
+      pinnedManifestDigest: run.pinnedManifestDigest,
+      additive: { comparedCommands: before.verificationCommands.map((command) => command.id), changedCommands: changed, lowered },
+      revertedBy: facts.revertedBy,
+    },
+  });
 };
 
 interface ValidatedContractChange {
@@ -646,6 +685,8 @@ interface ValidatedContractChange {
   manifestDigest: string;
   baseManifest: ProjectManifest;
   baseManifestDigest: string;
+  /** #1347 — the admitted revert's judgement, for a PLAN naming one; null otherwise. */
+  revert: ContractChangeRevertJudgement | null;
 }
 
 /** Every check a CONTRACT_CHANGE PLAN passes, in order; each refusal names its own code. */
@@ -689,9 +730,11 @@ const validateContractChangePlan = (
   const baseDigest = run.pinnedManifestDigest!;
   // #1347 — a PLAN naming a revert is judged as one before anything else about its base.
   const reverting = plan["revertsContractChangeRunId"] !== undefined;
+  let judgement: ContractChangeRevertJudgement | null = null;
   if (reverting) {
     const judged = contractChangeRevert(run, plan["revertsContractChangeRunId"], supplied, lookup, revert);
     if (!judged.allowed) return judged as Decision<ValidatedContractChange>;
+    judgement = judged.value.judgement;
   }
   if (canonicalJson(manifest.value.repositories) !== canonicalJson(base.value.repositories)) {
     return refuse(
@@ -729,6 +772,7 @@ const validateContractChangePlan = (
     manifestDigest: supplied,
     baseManifest: base.value,
     baseManifestDigest: baseDigest,
+    revert: judgement,
   });
 };
 
@@ -1106,6 +1150,7 @@ export const currentContractChangePlan = (
     manifest: validated.value.manifest,
     baseManifest: validated.value.baseManifest,
     workflowEvidence: contractChangeWorkflowEvidence(validated.value.baseManifest, validated.value.manifest),
+    ...(validated.value.revert === null ? {} : { revert: validated.value.revert }),
   });
 };
 

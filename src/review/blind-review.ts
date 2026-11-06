@@ -52,6 +52,7 @@ import { PATCH_WITHOUT_PROGRAMS, diffPatch, git, readBlob } from "../git/git.ts"
 import { canonical } from "../guard/workspace-probe.ts";
 import {
   type AnyContractChangeBinding,
+  type ContractChangeRevertJudgement,
   type ContractChangeWorkflowEvidence,
   type WorkflowRevision,
   contractChangeCoverageTarget,
@@ -244,7 +245,7 @@ export interface ReviewPacket {
      */
     methodology: FrontierSimplifySource;
     /**
-     * Present only when a STANDARD_WORK candidate was frozen with CEO-attached private review evidence:
+     * Present only when a STANDARD_WORK or CONTRACT_CHANGE candidate was frozen with CEO-attached private review evidence:
      * the exact bundle every reviewer input carried, by digest (review/standard-review-evidence.ts).
      */
     reviewEvidence?: { digest: string; bundleSha256: string; attachmentDigest: string };
@@ -310,6 +311,8 @@ export interface RepositoryReviewPolicy {
 export type ContractChangeReviewBinding = AnyContractChangeBinding & {
   workflowEvidence: ContractChangeWorkflowEvidence[];
   workflowRevisions?: WorkflowRevision[];
+  /** #1347 — a revert PLAN's admitted judgement, as the reviewer was shown it. */
+  revert?: ContractChangeRevertJudgement;
 };
 
 export interface ReviewerPreference {
@@ -491,6 +494,8 @@ interface TrustedContractChange {
   workflowEvidence: ContractChangeWorkflowEvidence[];
   /** #512 — a first activation's exact workflow revisions. */
   workflowRevisions?: WorkflowRevision[];
+  /** #1347 — a revert PLAN's admitted judgement, from the same `currentContractChangeTarget` call. */
+  revert?: ContractChangeRevertJudgement;
   /** `<projectId>:#manifest/<manifestDigest>`, the coverage item the reviewer must account for. */
   target: { identity: string; path: string };
   /** #1255 — the stored PLAN the binding names, as its CTO wrote it. */
@@ -506,6 +511,8 @@ interface TrustedContractChangeReview {
   contract: TaskContract;
   contractDigest: string;
   change: TrustedContractChange;
+  /** The CEO-attached private review evidence the candidate was frozen with; null for none. */
+  reviewEvidence: FrozenStandardReviewEvidence | null;
 }
 
 /** Every coverage item a candidate review must account for: its files, and a contract change's manifest. */
@@ -1047,6 +1054,12 @@ export class BlindReviewGate {
         planReview: true,
         attemptId: request.attemptId,
         progress: request.progress,
+        // As for a candidate review: the evidence digests the reviewer was shown are not credentials, and the
+        // packet names the evidence it was frozen with. A review without evidence is stored exactly as before.
+        ...(inputs.reviewEvidence === null || request.snapshot.reviewEvidence === undefined ? {} : {
+          packetDigests: { runId: inputs.runId, candidateSnapshotDigest: snapshotDigest, digests: new Set(standardReviewEvidenceDigests(inputs.reviewEvidence)) },
+          reviewEvidence: request.snapshot.reviewEvidence,
+        }),
       });
     } finally {
       this.release(reviewers);
@@ -1079,7 +1092,7 @@ export class BlindReviewGate {
     progress?: ReviewProgress | undefined;
     /** #1307 — a candidate review's packet digests (`reviewPacketDigests`); absent for a PLAN review. */
     packetDigests?: ReviewPacketDigests;
-    /** The private review evidence a STANDARD_WORK candidate was frozen with; absent for any other review. */
+    /** The private review evidence a STANDARD_WORK or CONTRACT_CHANGE candidate was frozen with; absent for any other review. */
     reviewEvidence?: SnapshotReviewEvidence;
   }): Decision<ReviewPacket> {
     const { runId, snapshotDigest, outcome, chunked, expected } = input;
@@ -2477,6 +2490,11 @@ export class BlindReviewGate {
       ...contract.acceptance.map((a) => `- ${a}`),
       "",
       ...contractChangeSection(inputs.change),
+      ...(inputs.reviewEvidence === null ? [] : [
+        ...standardReviewEvidenceSection(inputs.reviewEvidence),
+        "For this contract change the bundle changes neither the proposed manifest, ACP's revert judgement nor the activation authority: what it says about them is a claim to weigh, never a fact ACP established.",
+        "",
+      ]),
       "## Required coverage",
       ...expected.map((target) => `- ${target.identity}:${target.path}`),
       "",
@@ -2847,6 +2865,7 @@ export class BlindReviewGate {
       baseManifest: current.value.baseManifest,
       workflowEvidence: current.value.workflowEvidence,
       ...(current.value.firstActivation ? { workflowRevisions: current.value.workflowRevisions } : {}),
+      ...(!current.value.firstActivation && current.value.revert !== undefined ? { revert: current.value.revert } : {}),
       target: contractChangeCoverageTarget(run.project_id, current.value.binding),
       // The binding's PLAN digest is this artifact's: `currentContractChangeTarget` read it from here.
       plan: planArtifact!.content as Record<string, unknown>,
@@ -2916,12 +2935,18 @@ export class BlindReviewGate {
     if (change.value === null) {
       return deny(ReasonCode.INVALID_ARGUMENT, "a CONTRACT_CHANGE review is for a CONTRACT_CHANGE run", { runId: request.runId });
     }
+    // The private review evidence this candidate was frozen with, read back from the run's private artifacts,
+    // as a STANDARD_WORK candidate review reads it.
+    let reviewEvidence: FrozenStandardReviewEvidence | null;
+    try { reviewEvidence = frozenStandardReviewEvidence({ artifacts: this.artifacts, audit: this.audit }, request.snapshot); }
+    catch { return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "frozen review evidence failed validation", { runId: request.runId }); }
     return allow(ReasonCode.OK, {
       runId: request.runId,
       snapshot: request.snapshot,
       contract: contract.content,
       contractDigest: run.contract_digest,
       change: change.value,
+      reviewEvidence,
     });
   }
 
@@ -3175,9 +3200,33 @@ const contractChangeSection = (change: TrustedContractChange): string[] => [
         "",
       ]
     : []),
+  ...contractChangeRevertSection(change),
   ...contractChangePlanSection(change),
   ...contractChangeReadbackSection(change),
 ];
+
+/**
+ * #1347 — for a PLAN naming `revertsContractChangeRunId`, what ACP judged its revert eligibility on: the
+ * value the judgement read from the PLAN and returned with its admission, never a second reading.
+ */
+const contractChangeRevertSection = (change: TrustedContractChange): string[] =>
+  change.revert === undefined
+    ? []
+    : [
+        "### Revert eligibility, as ACP judged it",
+        `The PLAN names revertsContractChangeRunId ${change.revert.revertsContractChangeRunId}. ACP read the facts below from its own`,
+        "tables when this packet was assembled and admitted the PLAN on them as the exact inverse of an additive",
+        "CONTRACT_CHANGE, by the same judgement plan_submit, the freeze and the activation grant apply; the CTO wrote none",
+        "of it. target is the named run; grant is its activation grant (fromManifestDigest the manifest it replaced,",
+        "manifestDigest the one it activated; intact: its columns still recompute to its digest); activation is its one",
+        "PROJECT_MANIFEST_ACTIVATED record; activeManifestDigest and latestActivationEventId are the project's now;",
+        "pinnedManifestDigest is this run's pin; additive compares each command of the replaced manifest with the",
+        "activated one; revertedBy lists other runs whose consumed grant already reverted the named run.",
+        "```json",
+        JSON.stringify(change.revert, null, 2),
+        "```",
+        "",
+      ];
 
 /** #1255 — the PLAN fields a CONTRACT_CHANGE reviewer is shown, in this order; its manifest is shown above. */
 const CONTRACT_CHANGE_PLAN_FIELDS = [
@@ -3223,13 +3272,14 @@ const contractChangePlanSection = (change: TrustedContractChange): string[] => {
     if (size > PLAN_SECTION_CHARS) overBound.push(`${field}: the PLAN section would be ${size} characters, bound ${PLAN_SECTION_CHARS}`);
     else shown[field] = change.plan[field];
   }
-  const listed = new Set<string>([...CONTRACT_CHANGE_PLAN_FIELDS, "projectManifest"]);
+  const listed = new Set<string>([...CONTRACT_CHANGE_PLAN_FIELDS, "projectManifest", ...(change.revert === undefined ? [] : ["revertsContractChangeRunId"])]);
   const other = Object.keys(change.plan).filter((key) => !listed.has(key)).sort();
   return [
     "### The CTO's PLAN",
     `The PLAN artifact this candidate names (digest ${change.binding.planDigest}), written by the run's CTO. Each field`,
     "below is exactly as stored. It is the CTO's account of the change: ACP has not verified what it states.",
     "Its projectManifest is the proposed manifest shown above.",
+    ...(change.revert === undefined ? [] : ["Its revertsContractChangeRunId is the one shown with ACP's revert judgement above."]),
     "```json",
     JSON.stringify(shown, null, 2),
     "```",
@@ -3267,6 +3317,7 @@ const reviewBindingOf = (change: TrustedContractChange): ContractChangeReviewBin
   ...change.binding,
   workflowEvidence: change.workflowEvidence,
   ...(change.workflowRevisions === undefined ? {} : { workflowRevisions: change.workflowRevisions }),
+  ...(change.revert === undefined ? {} : { revert: change.revert }),
 });
 
 const parseVerdict = (input: unknown): RawVerdict | null => {

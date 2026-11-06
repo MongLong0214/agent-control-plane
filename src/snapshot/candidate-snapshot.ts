@@ -203,8 +203,8 @@ export type SnapshotCanonicalCtoIdentity = z.infer<typeof snapshotCanonicalCtoId
 
 const SNAPSHOT_DIGEST = z.string().regex(/^sha256:[0-9a-f]{64}$/);
 /**
- * The private review evidence a STANDARD_WORK candidate was frozen with (review/standard-review-evidence.ts):
- * digests only. The bundle's bytes stay in the run's private HANDOFF artifacts.
+ * The private review evidence a STANDARD_WORK or CONTRACT_CHANGE candidate was frozen with
+ * (review/standard-review-evidence.ts): digests only. The bundle's bytes stay in the run's private HANDOFF artifacts.
  */
 export const snapshotReviewEvidenceSchema = z
   .object({
@@ -232,16 +232,16 @@ export const candidateSnapshotSchema = z
     contractChange: snapshotContractChangeSchema.optional(),
     /** Present only on a CONTRACT_CHANGE candidate of a project; every other snapshot omits the key. */
     canonicalCtoIdentity: snapshotCanonicalCtoIdentitySchema.optional(),
-    /** Present only on a STANDARD_WORK candidate frozen with CEO-attached review evidence. */
+    /** Present only on a STANDARD_WORK or CONTRACT_CHANGE candidate frozen with CEO-attached review evidence. */
     reviewEvidence: snapshotReviewEvidenceSchema.optional(),
     createdAt: z.string().min(1),
   })
   .strict()
   .superRefine((snapshot, ctx) => {
-    if (snapshot.reviewEvidence !== undefined && (snapshot.bootstrapPlan !== undefined || snapshot.contractChange !== undefined)) {
+    if (snapshot.reviewEvidence !== undefined && snapshot.bootstrapPlan !== undefined) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "only a STANDARD_WORK candidate carries review evidence",
+        message: "only a STANDARD_WORK or CONTRACT_CHANGE candidate carries review evidence",
         path: ["reviewEvidence"],
       });
     }
@@ -331,7 +331,7 @@ export const duplicateRepositoryRoles = (
  * a re-plan is a different candidate. A snapshot without `bootstrapPlan` digests exactly the four
  * fields it always did — the key is left out, not set to null — so no existing digest moves. The
  * same holds for a CONTRACT_CHANGE candidate's `contractChange` (#246 B2-a) and its canonical CTO
- * identity baseline (`canonicalCtoIdentity`), and a STANDARD_WORK candidate's private review evidence
+ * identity baseline (`canonicalCtoIdentity`), and a STANDARD_WORK or CONTRACT_CHANGE candidate's private review evidence
  * (`reviewEvidence`): a candidate frozen with other evidence is a different candidate, reviewed again.
  */
 export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
@@ -485,6 +485,7 @@ export const buildNoRepositoryCandidateSnapshot = (
     bootstrapPlan?: SnapshotBootstrapPlan;
     contractChange?: SnapshotContractChange;
     canonicalCtoIdentity?: SnapshotCanonicalCtoIdentity;
+    reviewEvidence?: SnapshotReviewEvidence;
   },
   clock: Clock,
 ): CandidateSnapshot =>
@@ -496,6 +497,7 @@ export const buildNoRepositoryCandidateSnapshot = (
     ...(params.bootstrapPlan === undefined ? {} : { bootstrapPlan: params.bootstrapPlan }),
     ...(params.contractChange === undefined ? {} : { contractChange: params.contractChange }),
     ...(params.canonicalCtoIdentity === undefined ? {} : { canonicalCtoIdentity: params.canonicalCtoIdentity }),
+    ...(params.reviewEvidence === undefined ? {} : { reviewEvidence: params.reviewEvidence }),
     createdAt: clock.nowIso(),
   });
 
