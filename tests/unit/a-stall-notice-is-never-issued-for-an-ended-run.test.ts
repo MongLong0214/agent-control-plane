@@ -28,11 +28,9 @@ const waitsOf = (harness: Harness): AgentOwnedWaits =>
     gate: harness.cp.ceo,
   });
 
-const activeRun = async (harness: Harness) => {
-  const { projectId, repositoryId } = await registerFixtureProject(harness);
-  bindCeo(harness);
+const dispatchRun = async (harness: Harness, project: { projectId: string; repositoryId: string }) => {
   const created = harness.cp.runs.create({
-    projectId,
+    projectId: project.projectId,
     executionMode: ExecutionMode.STANDARD,
     contract: {
       goal: "make app() return 2",
@@ -44,12 +42,19 @@ const activeRun = async (harness: Harness) => {
       humanGate: [],
       references: [],
     },
-    repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    repositories: [{ repositoryId: project.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
   });
   if (!created.allowed) throw new Error(created.message);
   const dispatched = await harness.cp.runs.dispatch(created.value.runId);
   if (!dispatched.allowed) throw new Error(`${dispatched.reasonCode}: ${dispatched.message}`);
   return dispatched.value;
+};
+
+/** An ACTIVE run of a registered project, with a CEO bound. */
+const activeRun = async (harness: Harness) => {
+  const project = await registerFixtureProject(harness);
+  bindCeo(harness);
+  return dispatchRun(harness, project);
 };
 
 const runStalls = (tick: WatchdogTick) => tick.stalls.filter((stall) => stall.kind === "run");
@@ -62,6 +67,7 @@ const routedRecords = (harness: Harness, runId: string) =>
   harness.cp.audit.forRun(runId).filter((entry) => entry.kind === OWNERLESS_STALL_ROUTED);
 
 const RUN_PROGRESS_DEADLINE_PASSED = 121 * 60 * 1000;
+const OUTBOX_DEADLINE_PASSED = 11 * 60 * 1000;
 
 describe("#1361 — a stall notice is never issued for a run that has ended", () => {
   it("the live sequence: a stalled ACTIVE run is told once; the CEO cancels it; the tick that observed it ACTIVE, routed after the cancel, and every later tick issue nothing", async () => {
@@ -88,13 +94,12 @@ describe("#1361 — a stall notice is never issued for a run that has ended", ()
     expect(stallNotices(harness, run.runId)).toHaveLength(1);
     expect(routedRecords(harness, run.runId)).toHaveLength(1);
 
-    // Nor is the end grounds for a re-notice: not on a later tick, nor to a CEO that replaced the one told. (The
-    // run's RUN_DISPATCH, never delivered in this fixture, is its role's DELIVERY_STALLED incident, not the run's.)
+    // Nor is the end grounds for a re-notice: not on a later tick, nor to a CEO that replaced the one told.
     expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "CEO runtime lost").allowed).toBe(true);
     bindCeo(harness);
     harness.clock.advance(RUN_PROGRESS_DEADLINE_PASSED);
     waits.routeWatchdogStalls(observed);
-    waits.routeWatchdogStalls((await harness.cp.watchdog.tick()).stalls.filter((stall) => stall.kind !== "outbox"));
+    waits.routeWatchdogStalls((await harness.cp.watchdog.tick()).stalls);
     expect(stallNotices(harness, run.runId)).toHaveLength(1);
     expect(routedRecords(harness, run.runId)).toHaveLength(1);
   });
@@ -120,6 +125,72 @@ describe("#1361 — a stall notice is never issued for a run that has ended", ()
     expect(harness.cp.runs.require(run.runId).state).toBe(RunState.CANCELLED);
     expect(stallNotices(harness, run.runId)).toEqual([]);
     expect(routedRecords(harness, run.runId)).toEqual([]);
+  });
+
+  it("a delivery stall of a message for a run that has ended is told nothing: the cancelled run's undelivered RUN_DISPATCH raises no DELIVERY_STALLED, asked in the transaction that would write it", async () => {
+    const harness = makeHarness();
+    const run = await activeRun(harness);
+    const waits = waitsOf(harness);
+    const dispatch = harness.cp.outbox.listByRun(run.runId).find((message) => message.kind === MessageKind.RUN_DISPATCH);
+    expect(dispatch?.status).toBe("PENDING");
+
+    harness.clock.advance(OUTBOX_DEADLINE_PASSED);
+    const observed = (await harness.cp.watchdog.tick()).stalls.filter((stall) => stall.kind === "outbox");
+    expect(observed).toEqual([expect.objectContaining({ id: dispatch!.messageId, runId: run.runId })]);
+    // The CEO's cancel commits after every read the routing makes before its transaction opens.
+    const db = harness.cp.db;
+    const begin = db.txDecision.bind(db);
+    const raced = vi.spyOn(db, "txDecision").mockImplementationOnce((fn) => {
+      expect(harness.cp.runs.cancel(run.runId, "the CEO cancels the run").allowed).toBe(true);
+      return begin(fn);
+    });
+    expect(waits.routeWatchdogStalls(observed)).toEqual([expect.objectContaining({ kind: "outbox", messageId: null })]);
+    raced.mockRestore();
+    expect(harness.cp.runs.require(run.runId).state).toBe(RunState.CANCELLED);
+    expect(harness.cp.outbox.get(dispatch!.messageId)?.status).toBe("PENDING");
+
+    harness.clock.advance(OUTBOX_DEADLINE_PASSED);
+    waits.routeWatchdogStalls((await harness.cp.watchdog.tick()).stalls);
+    expect(stallNotices(harness, run.runId)).toEqual([]);
+    expect(routedRecords(harness, run.runId)).toEqual([]);
+  });
+
+  it("a role's stalled messages for a run that has ended and for a live run: the live run's is told, filed under it, and nothing is filed under the ended run", async () => {
+    const harness = makeHarness();
+    const project = await registerFixtureProject(harness);
+    bindCeo(harness);
+    const ended = await dispatchRun(harness, project);
+    harness.clock.advance(60_000);
+    const live = await dispatchRun(harness, project);
+    harness.clock.advance(OUTBOX_DEADLINE_PASSED);
+    expect(harness.cp.runs.cancel(ended.runId, "the CEO cancels the run").allowed).toBe(true);
+
+    const observed = (await harness.cp.watchdog.tick()).stalls.filter((stall) => stall.kind === "outbox");
+    expect(observed.map((stall) => stall.runId).sort()).toEqual([ended.runId, live.runId].sort());
+    expect(new Set(observed.map((stall) => stall.roleKey)).size).toBe(1);
+    waitsOf(harness).routeWatchdogStalls(observed);
+
+    expect(stallNotices(harness, ended.runId)).toEqual([]);
+    expect(routedRecords(harness, ended.runId)).toEqual([]);
+    expect(stallNotices(harness, live.runId)).toEqual([
+      expect.objectContaining({ payload: expect.objectContaining({ incidentClass: "DELIVERY_STALLED", runId: live.runId }) }),
+    ]);
+  });
+
+  it("a delivery stall of a message for a live run still notifies, once", async () => {
+    const harness = makeHarness();
+    const run = await activeRun(harness);
+    const waits = waitsOf(harness);
+    harness.clock.advance(OUTBOX_DEADLINE_PASSED);
+    const observed = (await harness.cp.watchdog.tick()).stalls.filter((stall) => stall.kind === "outbox");
+    expect(observed).toEqual([expect.objectContaining({ runId: run.runId, messageKind: MessageKind.RUN_DISPATCH })]);
+    expect(waits.routeWatchdogStalls(observed)).toEqual([expect.objectContaining({ kind: "outbox", messageId: expect.any(String) })]);
+    waits.routeWatchdogStalls(observed);
+    expect(stallNotices(harness, run.runId)).toEqual([
+      expect.objectContaining({ payload: expect.objectContaining({ incidentClass: "DELIVERY_STALLED", stall: "outbox", runId: run.runId }) }),
+    ]);
+    expect(routedRecords(harness, run.runId)).toHaveLength(1);
+    expect(harness.cp.runs.require(run.runId).state).toBe(RunState.ACTIVE);
   });
 
   it("a genuinely stalled ACTIVE run still gets its notice, once", async () => {

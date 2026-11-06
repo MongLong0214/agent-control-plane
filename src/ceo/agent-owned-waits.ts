@@ -6,13 +6,13 @@ import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { AttemptReleaseReason, OWNERLESS_STALL_OWED, OWNERLESS_STALL_ROUTED, type WatchdogStall } from "../doctor/watchdog.ts";
-import { isTerminal } from "../domain/run-state.ts";
 import { ArtifactKind, Role, RunState, roleKeyFor, type RoleBinding, type RunRow } from "../domain/types.ts";
 import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import {
+  ENDED_RUN_STATES,
   type Incident,
   IncidentClass,
   type NoticeState,
@@ -210,6 +210,12 @@ const WATCHDOG_STALL_ROUTES: Readonly<Record<string, { recoveryAction: string; e
 /** #1344 — what an owed candidate pipeline attempt is when a restart's reconcile, not its deadline, released it. */
 const RESTART_RELEASED_ATTEMPT = "a candidate pipeline attempt released at a daemon restart, the daemon that ran it being gone";
 
+/** #1361 — the run has ended (`ENDED_RUN_STATES`; BLOCKED_POST_MERGE waits on recovery and has not). */
+const runHasEnded = (runs: Pick<RunEngine, "get">, runId: string): boolean => {
+  const run = runs.get(runId);
+  return run !== null && ENDED_RUN_STATES.has(run.state);
+};
+
 /**
  * The incident an ownerless stall is, in `ceo-incident-notices.ts`'s one correlation per (subject, class):
  * a stall of a run is that run's RUN_STALLED incident in its current progress episode (F3-1), so two
@@ -365,17 +371,16 @@ export class AgentOwnedWaits {
    * (OWNERLESS_STALL_ROUTED). With no CEO bound (or its session not READY) nothing is written and the next
    * pass asks again. `routed` is whether this call delivered a notice; `messageId` is the notice that covers
    * the stall, delivered now or before; `state` is what the CEO has of it, in the incident `episode`.
-   * #1361 — a stall of a run that has ended (terminal, and not BLOCKED_POST_MERGE, which waits on recovery) is
-   * told nothing and is RESOLVED: the transition that ended it, its latest progress, is never read as a new
-   * episode or a re-notice. Its state is asked in the transaction that writes the notice and its record, so a
-   * run observed ACTIVE and ended before the notice is written (a CEO cancel between a tick and its routing)
-   * is told nothing either.
+   * #1361 — a stall filed under a run that has ended (`ENDED_RUN_STATES`: BLOCKED_POST_MERGE waits on recovery and
+   * has not), the run's own or a delivery stall of a message for it, is told nothing and is RESOLVED: the transition
+   * that ended it, its latest progress, is never read as a new episode or a re-notice. Its state is asked in the
+   * transaction that writes the notice and its record, so a run observed ACTIVE and ended before the notice is
+   * written (a CEO cancel between a tick and its routing) is told nothing either.
    */
   routeOwnerlessStall(stall: OwnerlessStall): Decision<RoutedStall> {
     return this.ports.db.txDecision(() => {
       const incident = stallIncident(this.ports.db, stall);
-      const run = incident.cls === IncidentClass.RUN_STALLED ? this.ports.runs.get(incident.subject) : null;
-      if (run && isTerminal(run.state) && run.state !== RunState.BLOCKED_POST_MERGE) {
+      if (incident.runId !== null && runHasEnded(this.ports.runs, incident.runId)) {
         return allow(ReasonCode.RUN_ALREADY_TERMINAL, { messageId: null, routed: false, state: "RESOLVED", episode: incident.episode });
       }
       const delivered = deliverIncident(this.ports, incident);
@@ -456,6 +461,8 @@ export class AgentOwnedWaits {
     for (const stall of stalls) {
       if (stall.kind === "outbox") {
         if (stall.messageKind === MessageKind.CEO_NOTIFICATION) continue;
+        // #1361 — a message for a run that has ended is not told; its role's others are, filed under the oldest of them.
+        if (stall.runId !== null && runHasEnded(this.ports.runs, stall.runId)) continue;
         const role = stall.roleKey ?? "unknown";
         const held = oldestByRole.get(role);
         if (!held) oldestByRole.set(role, { stall, count: 1, group: [stall] });
