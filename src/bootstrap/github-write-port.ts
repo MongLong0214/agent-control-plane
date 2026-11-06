@@ -897,8 +897,9 @@ const splitResponse = (stdout: string): { head: ResponseHead | null; body: strin
  *
  * #1344 — a write asks `gh` for the response head (`--include`), so its status is GitHub's status
  * line, and a refusal with an empty or truncated body keeps it: a definite 4xx stays definite. Of
- * the headers only GitHub's request id is kept. A 2xx whose body does not parse still throws as it
- * did, with no status: the resource may exist. A read keeps the plain output it always had.
+ * the headers only GitHub's request id is kept. A body after a head that does not parse throws with
+ * the head's status and request id; for a 2xx that is no refusal (`definitelyNotCreated` reads only a
+ * 4xx), since the resource may exist. A read keeps the plain output it always had.
  */
 export class GhCliGitHubClient implements GitHubClient {
   constructor(private readonly run: GhRunner = spawnGh) {}
@@ -928,7 +929,19 @@ export class GhCliGitHubClient implements GitHubClient {
       );
     }
     const text = answer.trim();
-    return (text ? JSON.parse(text) : null) as T;
+    if (!text) return null as T;
+    if (head === null) return JSON.parse(text) as T;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      // The head is GitHub's answer even when the body after it is cut short: it keeps its status and
+      // request id. The body is not quoted. A 2xx here is no refusal — the resource may exist.
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        `gh api ${method} ${path} answered HTTP ${head.status} with a body that does not parse`,
+        { status: head.status, method, path, ...(head.requestId ? { requestId: head.requestId } : {}) },
+      );
+    }
   }
 }
 

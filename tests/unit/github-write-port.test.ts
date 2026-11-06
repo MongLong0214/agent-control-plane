@@ -281,14 +281,16 @@ describe("gh CLI transport: a write's status comes from the response head (#1344
       .rejects.toMatchObject({ evidence: { status: null } });
   });
 
-  it("a 2xx write answers with the body after its head; one whose body is cut short still throws with no status", async () => {
+  it("a 2xx write answers with the body after its head; one whose body is cut short throws keeping its status and request id", async () => {
     const created = answering({ exitCode: 0, stdout: `${head("HTTP/2.0 201 Created", ...headers)}{"number":11}`, stderr: "" });
     expect(await created.client.request("POST", "repos/acme/fixture/issues", {})).toEqual({ number: 11 });
     expect(await answering({ exitCode: 0, stdout: head("HTTP/2.0 204 No Content"), stderr: "" }).client.request("DELETE", "repos/acme/fixture/labels/x")).toBeNull();
-    const truncated = await answering({ exitCode: 0, stdout: `${head("HTTP/2.0 201 Created")}{"number":11,"node_id":"I_`, stderr: "" })
+    const truncated = await answering({ exitCode: 0, stdout: `${head("HTTP/2.0 201 Created", ...headers)}{"number":11,"node_id":"I_`, stderr: "" })
       .client.request("POST", "repos/acme/fixture/issues", {}).then(() => null, (error: unknown) => error);
-    expect(truncated).toBeInstanceOf(SyntaxError);
-    expect((truncated as { evidence?: unknown }).evidence).toBeUndefined();
+    expect(truncated).toMatchObject({ reasonCode: ReasonCode.INTERNAL_ERROR });
+    const { evidence, message } = truncated as { evidence: Record<string, unknown>; message: string };
+    expect(evidence).toEqual({ status: 201, method: "POST", path: "repos/acme/fixture/issues", requestId: REQUEST_ID });
+    expect(message).not.toMatch(/node_id|_gh_sess/);
   });
 
   it("a read is sent without --include and its output is all body, as before", async () => {
