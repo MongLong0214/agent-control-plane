@@ -14,7 +14,7 @@ import { HERMES_PROVENANCE_META_KEY } from "../../src/mcp/hermes-provenance.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { frozenStandardReviewEvidence } from "../../src/review/standard-review-evidence.ts";
 import type { CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
-import { dispatchRun, normalized } from "../helpers/contract-change.ts";
+import { CONTRACT_CHANGE_CONTRACT, dispatchRun, normalized } from "../helpers/contract-change.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { applyPassingChange, bindCeo, bindWorker, decideThroughHermes, fixtureManifest, makeHarness, registerFixtureProject, reviewerPass } from "../helpers/harness.ts";
 
@@ -83,6 +83,13 @@ async function fixture() {
   const attach = async (run: Planned, key: string, text: string) =>
     (await connect("hermes", ceo()))("review_evidence_attach", { idempotencyKey: key, runId: run.runId, contractDigest: run.contractDigest,
       stagedBy: stagedBy(run), expectedSha256: sha256(bundleFor(run.runId, run.contractDigest, text)) });
+  /** `stage` and `attach` for a whole bundle body, as the CTO and the CEO send it. */
+  const stageBody = async (run: Planned, key: string, evidenceBody: string) =>
+    (await connect("cto", run.ownerSessionId))("review_evidence_stage", { idempotencyKey: key, runId: run.runId,
+      contractDigest: run.contractDigest, evidenceBody, expectedSha256: sha256(evidenceBody) });
+  const attachBody = async (run: Planned, key: string, evidenceBody: string) =>
+    (await connect("hermes", ceo()))("review_evidence_attach", { idempotencyKey: key, runId: run.runId, contractDigest: run.contractDigest,
+      stagedBy: stagedBy(run), expectedSha256: sha256(evidenceBody) });
   const submit = async (run: Planned) => {
     h.scripted.script({ match: /Contract change review/, text: reviewerPass([run.coverage]) });
     await h.cp.continuity.evaluate("contract change candidate");
@@ -140,7 +147,7 @@ async function fixture() {
       raw.prepare("UPDATE run_artifacts SET content_json = ? WHERE artifact_id = ?").run(JSON.stringify(content), artifactId);
     } finally { raw.close(); }
   };
-  return { h, projectId, planned, stage, attach, submit, activate, reviewed, verifiedWork, handoffs, tamper,
+  return { h, projectId, planned, stage, attach, stageBody, attachBody, submit, activate, reviewed, verifiedWork, handoffs, tamper,
     close: async () => { for (const s of servers.reverse()) await s.close(); h.cp.close(); } };
 }
 
@@ -259,6 +266,192 @@ describe("review evidence quoting ACP's own digests of the run's project", () =>
         expect(await f.h.cp.pipeline.freeze(run.runId), label).toMatchObject({ allowed: false, reasonCode: "SNAPSHOT_DIGEST_MISMATCH" });
       }
       expect(f.h.cp.artifacts.list(run.runId, "CANDIDATE_SNAPSHOT")).toEqual([]);
+    } finally { await f.close(); }
+  });
+});
+
+/**
+ * #1347 — the live bundle shape: excerpts of a cancelled run's stored VERIFICATION artifact (its per-command
+ * `outputDigest` values, its contract and candidate digests, the artifact's own digest in the origin) and of that
+ * run's runs row (its pinned manifest). The new kinds are one command's `outputDigest` at exactly
+ * `$.results[<n>].outputDigest` of an official VERIFICATION artifact and a run's contract digest. A refusal places
+ * each digest ACP did not confirm by file, field, line and column, and carries no part of it.
+ */
+type Fixture = Awaited<ReturnType<typeof fixture>>;
+type ExcerptFile = { path: string; sha256: string; origin: string; grade: string; bodyBase64: string; excerpt: typeof EXCERPT };
+const pretty = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
+const fileOf = (path: string, origin: string, text: string): ExcerptFile => {
+  const bytes = Buffer.from(text, "utf8");
+  return { path, sha256: sha256(bytes), origin, grade: "execution-log", bodyBase64: bytes.toString("base64"),
+    excerpt: { originalSha256: sha256(`${text}and the rest of the record`), omitted: true, ranges: [{ section: "excerpt", startLine: 1, endLine: text.split("\n").length - 1 }] } };
+};
+const hexOf = (digest: string): string => digest.slice("sha256:".length);
+
+async function liveShape(f: Fixture) {
+  const earlier = await f.verifiedWork();
+  expect(f.h.cp.runs.cancel(earlier.run.runId, "end the experiment")).toMatchObject({ allowed: true, value: { state: RunState.CANCELLED } });
+  const verification = earlier.artifact as typeof earlier.artifact & { content: { results: Array<{ outputDigest: string }> } };
+  const row = f.h.cp.runs.require(earlier.run.runId);
+  const run = await f.planned(f.projectId, addsCommand("evidence-check"));
+  const files = [
+    fileOf(`records/verification-${verification.artifactId}-results.json`,
+      `run_artifacts.content_json of VERIFICATION artifact ${verification.artifactId} (run ${row.runId}, artifact digest ${verification.digest}), 2-space pretty JSON`,
+      pretty(verification.content)),
+    fileOf(`records/runs-row-${row.runId}.json`, `runs table row for ${row.runId}, 2-space pretty JSON`,
+      pretty({ run_id: row.runId, kind: row.kind, state: row.state, pinned_manifest_digest: row.pinnedManifestDigest })),
+  ];
+  const body = (extra: ExcerptFile[] = []): string =>
+    JSON.stringify({ runId: run.runId, contractDigest: run.contractDigest, files: [...files, ...extra], missing: ["a per-run creation key"] });
+  return { earlier, verification, row, run, body };
+}
+
+describe("review evidence quoting a project run's verification outputs and contract", () => {
+  it("stages, attaches and freezes the live shape: a cancelled run's per-command outputDigests, contract, candidate and pinned manifest", async () => {
+    const f = await fixture();
+    try {
+      const { earlier, verification, row, run, body } = await liveShape(f);
+      const staged = await f.stageBody(run, "stage-live", body());
+      expect(staged, JSON.stringify(staged)).toMatchObject({ ok: true });
+      const [task] = f.h.cp.artifacts.list(row.runId, "TASK_CONTRACT");
+      // The first command that has a value names it.
+      const outputs = new Map(verification.content.results.map((result, n) => [result.outputDigest, { kind: "VERIFICATION_OUTPUT", digest: result.outputDigest,
+        runId: row.runId, artifactId: verification.artifactId, activationEventId: null, jsonPath: `$.results[${n}].outputDigest` }] as const).reverse());
+      expect(outputs.size).toBeGreaterThan(0);
+      const references = [
+        { kind: "VERIFICATION", digest: verification.digest, runId: row.runId, artifactId: verification.artifactId, activationEventId: null },
+        { kind: "CANDIDATE_SNAPSHOT", digest: earlier.snapshot.candidateSnapshotDigest!, runId: row.runId, artifactId: earlier.snapshot.artifactId, activationEventId: null },
+        // The run's contract keeps the answer #1354 gave it: its stored TASK_CONTRACT artifact.
+        { kind: "TASK_CONTRACT", digest: row.contractDigest, runId: row.runId, artifactId: task!.artifactId, activationEventId: null },
+        { kind: "MANIFEST", digest: row.pinnedManifestDigest!, runId: row.runId, artifactId: null, activationEventId: null },
+        ...outputs.values(),
+      ].sort((a, b) => (a.digest < b.digest ? -1 : 1));
+      expect((staged["value"] as Args)["verifiedReferences"]).toEqual(references);
+      const receipt = f.h.cp.audit.forRun(run.runId).find((e) => e.kind === "STANDARD_REVIEW_EVIDENCE_STAGED")!;
+      expect(receipt.evidence["verifiedReferencesDigest"]).toBe(digestOf(references));
+
+      expect(await f.attachBody(run, "attach-live", body())).toMatchObject({ ok: true });
+      expect(f.handoffs(run.runId, ATTACHED_SCHEMA)[0]!.content["verifiedReferencesDigest"]).toBe(digestOf(references));
+      const outcome = await f.submit(run);
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+      const snapshot = f.h.cp.artifacts.list<CandidateSnapshot>(run.runId, "CANDIDATE_SNAPSHOT").at(-1)!.content;
+      expect(frozenStandardReviewEvidence({ artifacts: f.h.cp.artifacts, audit: f.h.cp.audit }, snapshot)!.source.references).toEqual(references);
+    } finally { await f.close(); }
+  });
+
+  it("refuses another project's contract, an unrecorded or tampered outputDigest, a digest an artifact merely holds and a credential, placing each without any part of it", async () => {
+    const f = await fixture();
+    try {
+      const { earlier, verification, run, body } = await liveShape(f);
+      const otherProject = `evidence-digests-other-${projectSeq}`;
+      const otherManifest = fixtureManifest(otherProject);
+      expect(f.h.cp.projects.register({ projectId: otherProject, name: "other", manifest: otherManifest,
+        authorization: f.h.cp.manifestAuthorizationForTests(otherManifest) })).toMatchObject({ allowed: true });
+      // A contract only the other project's run has: every CONTRACT_CHANGE run of the fixture shares one contract.
+      const foreign = f.h.cp.runs.create({ projectId: otherProject, kind: RunKind.CONTRACT_CHANGE, executionMode: ExecutionMode.STANDARD,
+        contract: { ...CONTRACT_CHANGE_CONTRACT, goal: "a contract only the other project has" }, repositories: [] });
+      if (!foreign.allowed) throw new Error(foreign.message);
+      const output = verification.content.results[0]!.outputDigest;
+      // A submitter's string held in an artifact of the project's run, at a field the HANDOFF writer types as a digest.
+      const laundered = digestOf("a submitter's string");
+      f.h.cp.artifacts.put(earlier.run.runId, "HANDOFF", { schema: "acp.test-note.v1", sha256: laundered });
+      expect(f.h.cp.db.get("SELECT count(*) AS n FROM run_artifacts WHERE instr(content_json, ?) > 0", [laundered])).toEqual({ n: 1 });
+      const slack = ["xoxb", "123456789012345678901234567890"].join("-");
+      const quoted = "records/quoted.txt";
+      // A file is named only by its index in the field, never by the path the stager wrote.
+      const at = { field: "$.files[2].bodyBase64", line: 2 };
+      const refused: Array<[string, string]> = [
+        ["another project's contract", foreign.value.contractDigest],
+        ["an outputDigest no project artifact records", digestOf("an output ACP never recorded")],
+        ["a tampered outputDigest", `${output.slice(0, -1)}${output.at(-1) === "0" ? "1" : "0"}`],
+        ["a digest an artifact merely holds", laundered],
+      ];
+      for (const [label, digest] of refused) {
+        const answer = await f.stageBody(run, `refused-${label}`, body([fileOf(quoted, "a note", `the live records above\nquoted ${digest}\n`)]));
+        expect(answer, label).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED",
+          evidence: { rule: "long_base64_run", form: "sha256-64hex", unresolvedDigestCount: 1 } });
+        expect((answer["evidence"] as Args)["at"], label).toEqual(at);
+        expect((answer["evidence"] as Args)["unresolvedDigests"], label).toEqual([{ ...at, column: 8 }]);
+        expect(JSON.stringify(answer), label).not.toContain(hexOf(digest).slice(0, 7));
+        expect(JSON.stringify(answer), label).not.toContain(quoted);
+      }
+      // A file path carrying pieces of the token, whole or split, is never shown: the field's index names the file.
+      const unrecorded = digestOf("another output ACP never recorded");
+      const groups = hexOf(unrecorded).match(/.{1,7}/g)!;
+      const paths: Array<[string, string]> = [
+        ["a 12-hex path", `records/${hexOf(unrecorded).slice(0, 12)}.txt`],
+        ["a 7-hex path", `records/${groups[0]}.txt`],
+        ["the whole hex split into dotted 7-character groups", `records/${groups.join(".")}.txt`],
+      ];
+      for (const [label, path] of paths) {
+        const answer = await f.stageBody(run, `refused-path-${label}`, body([fileOf(path, "a note", `the live records above\nquoted ${unrecorded}\n`)]));
+        expect(answer, label).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "long_base64_run", unresolvedDigestCount: 1 } });
+        expect((answer["evidence"] as Args)["at"], label).toEqual(at);
+        expect((answer["evidence"] as Args)["unresolvedDigests"], label).toEqual([{ ...at, column: 8 }]);
+        for (const group of groups.filter((g) => g.length === 7)) expect(JSON.stringify(answer), label).not.toContain(group);
+      }
+
+      const credential = await f.stageBody(run, "refused-credential", body([fileOf(quoted, "a note", `quoted ${output}\nnote ${slack}\n`)]));
+      expect(credential).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "slack_token" } });
+      expect((credential["evidence"] as Args)["at"]).toEqual(at);
+      expect(JSON.stringify(credential)).not.toContain("xoxb");
+      expect((credential["evidence"] as Args)["unresolvedDigests"]).toBeUndefined();
+
+      // The VERIFICATION artifact's content no longer matches its digest: none of its digests is confirmed.
+      f.tamper(verification.artifactId, { ...verification.content, gaps: ["a gap written afterwards"] });
+      const tampered = await f.stageBody(run, "refused-tampered-artifact", body());
+      expect(tampered).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "long_base64_run" } });
+      const places = (tampered["evidence"] as Args)["unresolvedDigests"] as Args[];
+      expect(places.map((p) => p["field"])).toContain("$.files[0].origin");
+      expect(places.filter((p) => p["field"] === "$.files[0].bodyBase64").length).toBeGreaterThan(0);
+      for (const digest of [verification.digest, output]) expect(JSON.stringify(tampered)).not.toContain(hexOf(digest).slice(0, 12));
+      expect(f.handoffs(run.runId, CANDIDATE_SCHEMA)).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it("binds a project run's contract digest as RUN_CONTRACT when no stored artifact carries it", async () => {
+    const f = await fixture();
+    try {
+      const other = (await f.verifiedWork()).run;
+      const [task] = f.h.cp.artifacts.list(other.runId, "TASK_CONTRACT");
+      // Synthetic: the contract's TASK_CONTRACT row is given another digest, so only runs.contract_digest names it.
+      const raw = new Database(f.h.cp.db.raw.name);
+      try {
+        raw.function("acp_evidence_write_authorized", () => 0);
+        raw.exec("DROP TRIGGER IF EXISTS run_artifacts_content_immutable");
+        raw.prepare("UPDATE run_artifacts SET digest = ? WHERE artifact_id = ?").run(digestOf("another digest"), task!.artifactId);
+      } finally { raw.close(); }
+      const run = await f.planned(f.projectId, addsCommand("evidence-check"));
+      const staged = await f.stage(run, "stage-run-contract", `contract: ${other.contractDigest}`);
+      expect(staged, JSON.stringify(staged)).toMatchObject({ ok: true });
+      expect((staged["value"] as Args)["verifiedReferences"]).toEqual([{ kind: "RUN_CONTRACT", digest: other.contractDigest, runId: other.runId, artifactId: null, activationEventId: null }]);
+    } finally { await f.close(); }
+  });
+  it("checks a staged reference at its own source: a record stored later for its digest changes nothing, a source that no longer holds is refused at attach and freeze", async () => {
+    const f = await fixture();
+    try {
+      const { verification, row, run, body } = await liveShape(f);
+      const staged = await f.stageBody(run, "stage-bound", body());
+      expect(staged, JSON.stringify(staged)).toMatchObject({ ok: true });
+      const references = (staged["value"] as Args)["verifiedReferences"] as Args[];
+      expect(references).toContainEqual({ kind: "MANIFEST", digest: row.pinnedManifestDigest, runId: row.runId, artifactId: null, activationEventId: null });
+      // Stored after the stage, a HANDOFF whose own digest is the pinned manifest's: a fresh lookup would now answer with it.
+      const later = f.h.cp.artifacts.put(row.runId, "HANDOFF", f.h.cp.projects.manifest(row.pinnedManifestDigest!)!);
+      expect(later.digest).toBe(row.pinnedManifestDigest);
+
+      expect(await f.attachBody(run, "attach-bound", body())).toMatchObject({ ok: true });
+
+      // A source that no longer holds: the VERIFICATION artifact's content no longer matches its digest.
+      const tampered = { ...verification.content, gaps: ["a gap written afterwards"] };
+      f.tamper(verification.artifactId, tampered);
+      expect(await f.attachBody(run, "attach-tampered", body())).toMatchObject({ ok: false, reasonCode: "SNAPSHOT_DIGEST_MISMATCH" });
+      expect(await f.h.cp.pipeline.freeze(run.runId)).toMatchObject({ allowed: false, reasonCode: "SNAPSHOT_DIGEST_MISMATCH" });
+      expect(f.h.cp.artifacts.list(run.runId, "CANDIDATE_SNAPSHOT")).toEqual([]);
+
+      f.tamper(verification.artifactId, verification.content);
+      const outcome = await f.submit(run);
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+      const snapshot = f.h.cp.artifacts.list<CandidateSnapshot>(run.runId, "CANDIDATE_SNAPSHOT").at(-1)!.content;
+      expect(frozenStandardReviewEvidence({ artifacts: f.h.cp.artifacts, audit: f.h.cp.audit }, snapshot)!.source.references).toEqual(references);
     } finally { await f.close(); }
   });
 });
