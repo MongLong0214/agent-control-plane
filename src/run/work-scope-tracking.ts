@@ -193,6 +193,7 @@ const definitelyNotCreated = (error: unknown): number | null => {
 };
 interface IssueIntent { intent: string; unit: string; taskIds: string[]; marker: string }
 interface CreatedIssue { intent?: string; unit: string; taskIds: string[]; marker: string; issueNumber: number; nodeId: string }
+type CreatedKey = { intent?: string; unit?: string; titleDigest?: string; taskIds?: string[]; marker?: string };
 
 const createdMarker = (runId: string, resource: "issue" | "milestone", key: string): string =>
   `<!-- acp:${createHash("sha256").update(`${runId}\n${resource}\n${key}`).digest("hex").slice(0, 16)} -->`;
@@ -477,6 +478,12 @@ export class WorkScopeTracking {
       if ("new" in declared.milestone) planned.push({ path: "milestones", title: declared.milestone.new.title, text: withMarker(declared.milestone.new.description, createdMarker(runId, "milestone", declared.milestone.new.title.trim().toLowerCase())) });
     }
     const resolved = new Map<string, { milestoneNumber: number; issueNumber: number; adopted: boolean }>();
+    // #1365 — what this synchronization records as created, by number: the node id each create recorded.
+    const createdNow = { issue: new Map<number, string>(), milestone: new Map<number, string>() };
+    const recordCreated = (resource: "issue" | "milestone", key: CreatedKey, answered: { number: number; nodeId: string }): void => {
+      this.#recordCreated(runId, resource, key, answered);
+      createdNow[resource].set(answered.number, answered.nodeId);
+    };
     let readback: { milestones: WorkMilestone[]; issues: WorkIssue[] };
     try {
       readback = await runUnderWriteGuard(this.#guard(runId, target, status.scope!, planned, outbound), async () => {
@@ -485,7 +492,7 @@ export class WorkScopeTracking {
         // tasks it covered, whatever unit key they have now; not found, it stays unknown.
         for (const intent of this.#unknownIntents(runId)) {
           const found = resources.issues.find((i) => i.body.includes(intent.marker));
-          if (found !== undefined) this.#recordCreated(runId, "issue", { intent: intent.intent, unit: intent.unit, taskIds: intent.taskIds, marker: intent.marker }, found);
+          if (found !== undefined) recordCreated("issue", { intent: intent.intent, unit: intent.unit, taskIds: intent.taskIds, marker: intent.marker }, found);
         }
         known();
         for (const approved of pending) {
@@ -520,7 +527,7 @@ export class WorkScopeTracking {
                 continue;
               }
               milestone = await github.createWorkMilestone!(target, repositoryNodeId, { title, description: withMarker(description, marker) });
-              this.#recordCreated(runId, "milestone", { titleDigest: titleDigestOf(title) }, milestone);
+              recordCreated("milestone", { titleDigest: titleDigestOf(title) }, milestone);
               created.set(`milestone:${titleDigestOf(title)}`, milestone);
               resources.milestones.push(milestone);
             }
@@ -587,7 +594,7 @@ export class WorkScopeTracking {
                 throw error;
               }
               outbound.current = null;
-              this.#recordCreated(runId, "issue", { intent, unit: approved.unit, taskIds: approved.taskIds, marker }, issue);
+              recordCreated("issue", { intent, unit: approved.unit, taskIds: approved.taskIds, marker }, issue);
               createdIssues.push({ intent, unit: approved.unit, taskIds: approved.taskIds, marker, issueNumber: issue.number, nodeId: issue.nodeId });
               resources.issues.push(issue);
             }
@@ -612,11 +619,28 @@ export class WorkScopeTracking {
     const claimed = new Map<number, string>();
     for (const unit of status.tracked.values()) claimed.set(unit.issueNumber, unit.unit);
     for (const [unit, link] of resolved) if (!claimed.has(link.issueNumber)) claimed.set(link.issueNumber, unit);
+    // #1365 — GitHub's list can lag right after a create: an item this synchronization created that the listing
+    // lacks is read by its number, and stands only at the node id its create recorded. A 404, another node id,
+    // or a failed or unreadable read leaves it missing.
+    const read = async <T extends { number: number; nodeId: string }>(listed: T[], number: number, recorded: Map<number, string>, get: ((number: number) => Promise<T | null>) | undefined): Promise<T | undefined> => {
+      const found = listed.find((item) => item.number === number);
+      const nodeId = recorded.get(number);
+      if (found !== undefined || nodeId === undefined || get === undefined) return found;
+      let fetched: unknown;
+      try {
+        fetched = await get(number);
+      } catch {
+        return undefined;
+      }
+      if (!isRecord(fetched) || fetched["nodeId"] !== nodeId) return undefined;
+      listed.push(fetched as T);
+      return fetched as T;
+    };
     const verified: TrackedUnit[] = [];
     for (const [unit, link] of resolved) {
       const approved = pending.find((p) => p.unit === unit)!;
-      const issue = readback.issues.find((i) => i.number === link.issueNumber);
-      const milestone = readback.milestones.find((m) => m.number === link.milestoneNumber);
+      const issue = await read(readback.issues, link.issueNumber, createdNow.issue, github.observeWorkIssue && ((n) => github.observeWorkIssue!(target, repositoryNodeId, n)));
+      const milestone = issue === undefined ? undefined : await read(readback.milestones, link.milestoneNumber, createdNow.milestone, github.observeWorkMilestone && ((n) => github.observeWorkMilestone!(target, repositoryNodeId, n)));
       if (issue === undefined) unmet.push({ unit, unmet: "ISSUE_NOT_FOUND", issues: [link.issueNumber], correction: `#${link.issueNumber} is no longer an issue of ${governed.repositoryIdentity}` });
       else if (milestone === undefined) unmet.push({ unit, unmet: "MILESTONE_NOT_FOUND", milestones: [link.milestoneNumber], correction: `milestone #${link.milestoneNumber} is no longer a milestone of ${governed.repositoryIdentity}` });
       else if (claimed.get(issue.number) !== unit) unmet.push({ unit, unmet: "CATCH_ALL_ISSUE", issues: [issue.number], correction: `issue #${issue.number} already stands for unit ${claimed.get(issue.number)}; give this unit its own issue` });
@@ -824,7 +848,7 @@ export class WorkScopeTracking {
         : []);
   }
 
-  #recordCreated(runId: string, resource: "issue" | "milestone", key: { intent?: string; unit?: string; titleDigest?: string; taskIds?: string[]; marker?: string }, answered: { number: number; nodeId: string }): void {
+  #recordCreated(runId: string, resource: "issue" | "milestone", key: CreatedKey, answered: { number: number; nodeId: string }): void {
     this.ports.audit.record({
       kind: WORK_SCOPE_GITHUB_CREATED,
       runId,

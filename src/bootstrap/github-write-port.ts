@@ -166,6 +166,13 @@ export interface GitHubWritePort {
    * reports; `WorkScopeTracking` decides what to adopt, reuse or create.
    */
   observeWorkResources?(target: GitHubRepositoryTarget, repositoryNodeId: string): Promise<WorkResources>;
+  /**
+   * #1365 — one issue by number on the repository at `repositoryNodeId`, as a GET answers it: null on a 404
+   * or when the number is a pull request; an answer naming another repository is thrown, never returned.
+   */
+  observeWorkIssue?(target: GitHubRepositoryTarget, repositoryNodeId: string, number: number): Promise<WorkIssue | null>;
+  /** #1365 — one milestone by number on the repository at `repositoryNodeId`, as a GET answers it: null on a 404. */
+  observeWorkMilestone?(target: GitHubRepositoryTarget, repositoryNodeId: string, number: number): Promise<WorkMilestone | null>;
   /** #1240 — creates exactly this milestone on the repository at `repositoryNodeId`, and answers GitHub's milestone. */
   createWorkMilestone?(target: GitHubRepositoryTarget, repositoryNodeId: string, milestone: { title: string; description: string }): Promise<WorkMilestone>;
   /** #1240 — creates exactly this issue in that milestone on the repository at `repositoryNodeId`, and answers GitHub's issue. */
@@ -676,6 +683,16 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
         milestones: milestones.map(workMilestoneOf),
         issues: issues.filter(i => i.pull_request === undefined).map(workIssueOf),
       };
+    },
+    async observeWorkIssue(target, repositoryNodeId, number) {
+      const fullName = await identified(target, repositoryNodeId);
+      const issue = await absentOn404(() => client.request<ListedIssue>("GET", `${repoPath(target)}/issues/${number}`));
+      return issue === null || ownIssue(fullName, issue).pull_request !== undefined ? null : workIssueOf(issue);
+    },
+    async observeWorkMilestone(target, repositoryNodeId, number) {
+      const fullName = await identified(target, repositoryNodeId);
+      const milestone = await absentOn404(() => client.request<ListedMilestone>("GET", `${repoPath(target)}/milestones/${number}`));
+      return milestone === null ? null : workMilestoneOf(ownMilestone(fullName, milestone));
     },
     async createWorkMilestone(target, repositoryNodeId, milestone) {
       const fullName = await identified(target, repositoryNodeId);
