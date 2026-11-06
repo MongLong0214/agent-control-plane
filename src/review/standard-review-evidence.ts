@@ -193,13 +193,20 @@ const scanBundle = (root: unknown, resolve: ResolveReferences): { refused: ScanR
   return { references };
 };
 
-/** Places by JSON path: a text under `$.files[<n>]` names that file's `path` when the path passes every shape itself. */
+/** A run of 8 or more hex digits, or a base64-like run (16 or more characters of the base64 alphabets): either could be a token's fragment. */
+const FRAGMENT_RUN = /[0-9a-fA-F]{8}|[A-Za-z0-9+/=_-]{16}/;
+
+/**
+ * Places by JSON path, which names a file by its index. A text under `$.files[<n>]` also names that file's `path`
+ * when the path holds no `FRAGMENT_RUN` and passes every shape itself; a path can carry a fragment of a token that
+ * passes every shape, so any other path is left out and the index alone names the file.
+ */
 const placesIn = (root: unknown): ((field: string, at: { line?: number; column?: number }) => Place) => {
   const files = root !== null && typeof root === "object" && Array.isArray((root as { files?: unknown }).files) ? (root as { files: unknown[] }).files : [];
   const pathOf = (index: number): string | undefined => {
     const file = files[index];
     const path = file !== null && typeof file === "object" ? (file as { path?: unknown }).path : undefined;
-    return typeof path === "string" && shapeRefusal(path, undefined) === null ? path : undefined;
+    return typeof path === "string" && !FRAGMENT_RUN.test(path) && shapeRefusal(path, undefined) === null ? path : undefined;
   };
   return (field, at) => {
     const index = /^\$\.files\[(\d+)\]/.exec(field)?.[1];
@@ -208,24 +215,58 @@ const placesIn = (root: unknown): ((field: string, at: { line?: number; column?:
   };
 };
 
+type ReferenceSource = Pick<Source, "artifacts" | "audit" | "runs">;
+/** The audit events by which a project activates a manifest, with the evidence key that names it. */
+const ACTIVATIONS = [["PROJECT_REGISTERED", "activeManifestDigest"], ["PROJECT_MANIFEST_ACTIVATED", "to"], ["PROJECT_MANIFEST_ADOPTED_BY_BOOTSTRAP", "to"]] as const;
+const OUTPUT_PATH = /^\$\.results\[(\d+)\]\.outputDigest$/;
+
+/**
+ * Whether a reference still holds at the record it names, and that record is still the project's: the run, its pin
+ * or contract, the activation event, or the artifact with its digest re-checked (for VERIFICATION_OUTPUT, the
+ * verification engine's VERIFICATION artifact holding the digest at the reference's JSON path). Stage, attach and
+ * freeze ask this of the very source a reference was bound to, rather than which record now answers first for the digest.
+ */
+const referenceHolds = (source: ReferenceSource, projectId: string, ref: StandardReviewEvidenceReference): boolean => {
+  const run = ref.runId === null ? null : source.runs.get(ref.runId);
+  if (ref.runId !== null && run?.projectId !== projectId) return false;
+  if (ref.kind === "MANIFEST" || ref.kind === "RUN_CONTRACT") {
+    if (ref.artifactId !== null || ref.jsonPath !== undefined) return false;
+    if (ref.kind === "RUN_CONTRACT") return run !== null && ref.activationEventId === null && run.contractDigest === ref.digest;
+    if (run !== null) return ref.activationEventId === null && run.pinnedManifestDigest === ref.digest;
+    return ACTIVATIONS.some(([kind, key]) => source.audit.byKind(kind)
+      .some(e => e.eventId === ref.activationEventId && e.projectId === projectId && e.evidence[key] === ref.digest));
+  }
+  const output = ref.kind === "VERIFICATION_OUTPUT";
+  const position = output ? OUTPUT_PATH.exec(ref.jsonPath ?? "")?.[1] : undefined;
+  if (run === null || ref.artifactId === null || ref.activationEventId !== null || (output ? position === undefined : ref.jsonPath !== undefined)) return false;
+  const artifact = source.artifacts.list<{ results?: unknown }>(run.runId, (output ? ArtifactKind.VERIFICATION : ref.kind) as ArtifactKind)
+    .find(a => a.artifactId === ref.artifactId);
+  if (!artifact || !artifactDigestMatches(artifact)) return false;
+  if (!output) return artifact.digest === ref.digest || (artifact.kind === ArtifactKind.CANDIDATE_SNAPSHOT && artifact.candidateSnapshotDigest === ref.digest);
+  const results = artifact.content?.results;
+  const result: unknown = Array.isArray(results) ? results[Number(position)] : undefined;
+  return artifact.producedBy === EVIDENCE_PRODUCERS.VERIFICATION && result !== null && typeof result === "object"
+    && (result as { outputDigest?: unknown }).outputDigest === ref.digest;
+};
+
 /**
  * #1347 — the earliest stored record of the run's project that `digest` names, as ACP itself computed or recorded
  * it, or null: a frozen candidate of one of the project's runs, by its candidate digest; an artifact of one, by the
  * digest the artifact store computed over it (checked again here); or a stored manifest that a run of the project
  * pins, else one the project activated (its registration, a contract change's activation, a bootstrap's adoption).
  * Never a manifest that is only in the global manifests table. Then a run's contract digest, and last one command's
- * `outputDigest` in an official VERIFICATION artifact (`verificationOutputReference`); the earlier kinds come
- * first, so a digest one of them names keeps the answer it had. Records are never rewritten or deleted, so the
- * answer for a digest does not change once given.
+ * `outputDigest` in an official VERIFICATION artifact (`verificationOutputReference`). This order is asked only at
+ * the stage; once bound, a reference is checked at its own source (`referenceHolds`), so a record stored later
+ * that answers first for the same digest changes nothing.
  */
-const projectReference = (source: Pick<Source, "db" | "artifacts">, projectId: string, digest: string): StandardReviewEvidenceReference | null => {
+const projectReference = (source: Pick<Source, "db"> & ReferenceSource, projectId: string, digest: string): StandardReviewEvidenceReference | null => {
   const row = source.db.get<{ artifact_id: string; run_id: string; kind: StoredArtifact["kind"] }>(
     `SELECT a.artifact_id, a.run_id, a.kind FROM run_artifacts a JOIN runs r ON r.run_id = a.run_id
       WHERE r.project_id = ? AND (a.digest = ? OR (a.kind = 'CANDIDATE_SNAPSHOT' AND a.candidate_snapshot_digest = ?)) ORDER BY a.rowid LIMIT 1`,
     [projectId, digest, digest]);
   if (row) {
-    const artifact = source.artifacts.list(row.run_id, row.kind).find(a => a.artifactId === row.artifact_id);
-    return artifact && artifactDigestMatches(artifact) ? { kind: row.kind, digest, runId: row.run_id, artifactId: row.artifact_id, activationEventId: null } : null;
+    const ref = { kind: row.kind, digest, runId: row.run_id, artifactId: row.artifact_id, activationEventId: null };
+    return referenceHolds(source, projectId, ref) ? ref : null;
   }
   const manifest = manifestReference(source, projectId, digest);
   if (manifest !== null) return manifest;
@@ -253,7 +294,7 @@ const manifestReference = (source: Pick<Source, "db">, projectId: string, digest
  * value. Only that field counts, rather than any digest an artifact's content holds (the command's captured text
  * included): a submitter's string can be stored in an artifact, and storing it does not make it ACP's.
  */
-const verificationOutputReference = (source: Pick<Source, "db" | "artifacts">, projectId: string, digest: string): StandardReviewEvidenceReference | null => {
+const verificationOutputReference = (source: Pick<Source, "db"> & ReferenceSource, projectId: string, digest: string): StandardReviewEvidenceReference | null => {
   const row = source.db.get<{ artifact_id: string; run_id: string; position: number }>(
     `SELECT a.artifact_id, a.run_id, CAST(result.key AS INTEGER) AS position FROM runs r
        JOIN run_artifacts a ON a.run_id = r.run_id AND a.kind = 'VERIFICATION' AND a.produced_by = ? AND json_valid(a.content_json)
@@ -263,18 +304,17 @@ const verificationOutputReference = (source: Pick<Source, "db" | "artifacts">, p
       ORDER BY a.rowid, result.key LIMIT 1`,
     [EVIDENCE_PRODUCERS.VERIFICATION, projectId, digest]);
   if (!row) return null;
-  const artifact = source.artifacts.list<{ results?: unknown }>(row.run_id, ArtifactKind.VERIFICATION).find(a => a.artifactId === row.artifact_id);
-  const results = artifact?.content?.results;
-  const result: unknown = Array.isArray(results) ? results[row.position] : undefined;
-  const value = result !== null && typeof result === "object" ? (result as { outputDigest?: unknown }).outputDigest : undefined;
-  return artifact && artifact.producedBy === EVIDENCE_PRODUCERS.VERIFICATION && artifactDigestMatches(artifact) && value === digest
-    ? { kind: "VERIFICATION_OUTPUT", digest, runId: row.run_id, artifactId: row.artifact_id, activationEventId: null, jsonPath: `$.results[${row.position}].outputDigest` }
-    : null;
+  const ref = { kind: "VERIFICATION_OUTPUT", digest, runId: row.run_id, artifactId: row.artifact_id, activationEventId: null, jsonPath: `$.results[${row.position}].outputDigest` };
+  return referenceHolds(source, projectId, ref) ? ref : null;
 };
 
-/** The store's own answer for a run: references only in its project's records, none for a run with no project. */
-const inProject = (source: Pick<Source, "db" | "artifacts">, run: RunRow): ResolveReferences => tokens =>
+/** The store's own answer for a run at the stage: references only in its project's records, none for a run with no project. */
+const inProject = (source: Pick<Source, "db"> & ReferenceSource, run: RunRow): ResolveReferences => tokens =>
   run.projectId === null ? [] : tokens.flatMap(token => projectReference(source, run.projectId!, token) ?? []);
+
+/** Whether every bound reference still holds at its own source, in the run's project (`referenceHolds`). */
+const referencesHold = (source: ReferenceSource, run: Pick<RunRow, "projectId">, references: readonly StandardReviewEvidenceReference[]): boolean =>
+  references.every(ref => run.projectId !== null && referenceHolds(source, run.projectId, ref));
 
 const referencesOf = (content: { verifiedReferences?: StandardReviewEvidenceReference[] }): StandardReviewEvidenceReference[] => content.verifiedReferences ?? [];
 /** The digest that binds a reference set, null for none: absent from every record that has none, as before #1347. */
@@ -411,11 +451,13 @@ export const standardReviewEvidenceAttachAccess = (source: Source, input: Standa
   }
   const body = Buffer.from(candidate.content.bodyBase64, "base64");
   if (body.toString("base64") !== candidate.content.bodyBase64) return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "review evidence candidate encoding differs");
-  const parsed = parseStandardBundle(body.toString("utf8"), input, inProject(source, run.value));
+  // Exactly the references bound at the stage, each quoted in the body and each still holding at its own source;
+  // never which record answers first for the digest now, which a record stored later can change.
+  const staged = referencesOf(candidate.content);
+  const parsed = parseStandardBundle(body.toString("utf8"), input, () => staged);
   if (!parsed.allowed) return parsed;
-  // The store's answer now is the set it gave at the stage: the references cannot be swapped under the same body.
-  if (referencesDigestOf(parsed.value.references) !== referencesDigestOf(referencesOf(candidate.content))) {
-    return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "review evidence references differ from the ones ACP confirmed when it was staged");
+  if (referencesDigestOf(parsed.value.references) !== referencesDigestOf(staged) || !referencesHold(source, run.value, staged)) {
+    return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "review evidence references no longer hold at the records ACP confirmed when it was staged");
   }
   if (submissionInFlight(source, input.runId)) {
     return deny(ReasonCode.CONFLICT, "a result submission is in flight for this run; select review evidence after it ends");
@@ -464,7 +506,8 @@ const readFrozen = (source: ReadSource, runId: string, attached: StoredArtifact<
       || candidate.content.runId !== runId || attached.content.runId !== runId || candidate.content.sha256 !== attached.content.sha256
       || candidate.content.contractDigest !== attached.content.contractDigest
       || (attached.content.verifiedReferencesDigest ?? null) !== referencesDigest) throw new Error("review evidence receipt or artifact differs");
-  // The freeze reads no store: exactly the references bound at the stage and the attachment, each quoted in the body.
+  // No new lookup: exactly the references bound at the stage and the attachment, each quoted in the body. The freeze
+  // also checks each one at its own source (collectStandardReviewEvidence); a reviewer's read-back does not.
   const parsed = parseStandardBundle(Buffer.from(candidate.content.bodyBase64, "base64").toString("utf8"),
     { runId, contractDigest: attached.content.contractDigest, expectedSha256: attached.content.sha256 }, () => references);
   if (!parsed.allowed || referencesDigestOf(parsed.value.references) !== referencesDigest) throw new Error("review evidence bundle differs");
@@ -479,15 +522,21 @@ const bindingOf = (record: FrozenStandardReviewEvidence): SnapshotReviewEvidence
   digest: record.digest, bundleSha256: record.source.bundleSha256, candidateDigest: record.source.candidateDigest, attachmentDigest: record.source.attachmentDigest,
 });
 
-/** The current selection for a freeze, digests only, or null; throws when a selection exists but cannot be read back intact. */
+/**
+ * The current selection for a freeze, digests only, or null; throws when a selection exists but cannot be read back
+ * intact, or when a reference bound to it no longer holds at its own source in the run's project (`referenceHolds`).
+ */
 export function collectStandardReviewEvidence(source: ReadSource & Pick<Source, "runs">, runId: string): SnapshotReviewEvidence | null {
   const attached = attachments(source, runId).find(a => !a.superseded);
   if (!attached) {
     if (source.audit.forRun(runId).some(e => e.kind === STANDARD_REVIEW_EVIDENCE_ATTACHED)) throw new Error("attached review evidence is missing");
     return null;
   }
-  if (source.runs.get(runId)?.contractDigest !== attached.content.contractDigest) throw new Error("attached review evidence names another contract");
-  return bindingOf(readFrozen(source, runId, attached));
+  const run = source.runs.get(runId);
+  if (!run || run.contractDigest !== attached.content.contractDigest) throw new Error("attached review evidence names another contract");
+  const record = readFrozen(source, runId, attached);
+  if (!referencesHold(source, run, record.source.references ?? [])) throw new Error("a review evidence reference no longer holds at its source");
+  return bindingOf(record);
 }
 
 /** The bundle a frozen candidate names, read back from the private artifacts; throws on any difference. */

@@ -370,13 +370,22 @@ describe("review evidence quoting a project run's verification outputs and contr
           evidence: { rule: "long_base64_run", form: "sha256-64hex", at, unresolvedDigests: [{ ...at, column: 8 }], unresolvedDigestCount: 1 } });
         expect(JSON.stringify(answer), label).not.toContain(hexOf(digest).slice(0, 12));
       }
+      // A file path that carries a fragment of the token is left out; the field's index names the file.
+      const unrecorded = digestOf("another output ACP never recorded");
+      const fragment = await f.stageBody(run, "refused-fragment-path",
+        body([fileOf(`records/${hexOf(unrecorded).slice(0, 12)}.txt`, "a note", `the live records above\nquoted ${unrecorded}\n`)]));
+      expect(fragment).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "long_base64_run", unresolvedDigestCount: 1 } });
+      expect((fragment["evidence"] as Args)["at"]).toEqual({ field: "$.files[2].bodyBase64", line: 2 });
+      expect((fragment["evidence"] as Args)["unresolvedDigests"]).toEqual([{ field: "$.files[2].bodyBase64", line: 2, column: 8 }]);
+      expect(JSON.stringify(fragment)).not.toMatch(new RegExp(hexOf(unrecorded).slice(0, 8)));
+
       const credential = await f.stageBody(run, "refused-credential", body([fileOf(quoted, "a note", `quoted ${output}\nnote ${slack}\n`)]));
       expect(credential).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "slack_token", at } });
       expect(JSON.stringify(credential)).not.toContain("xoxb");
       expect((credential["evidence"] as Args)["unresolvedDigests"]).toBeUndefined();
 
       // The VERIFICATION artifact's content no longer matches its digest: none of its digests is confirmed.
-      f.tamper(verification.artifactId, { ...verification.content, reasonCode: "TAMPERED" });
+      f.tamper(verification.artifactId, { ...verification.content, gaps: ["a gap written afterwards"] });
       const tampered = await f.stageBody(run, "refused-tampered-artifact", body());
       expect(tampered).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "long_base64_run" } });
       const places = (tampered["evidence"] as Args)["unresolvedDigests"] as Args[];
@@ -403,6 +412,34 @@ describe("review evidence quoting a project run's verification outputs and contr
       const staged = await f.stage(run, "stage-run-contract", `contract: ${other.contractDigest}`);
       expect(staged, JSON.stringify(staged)).toMatchObject({ ok: true });
       expect((staged["value"] as Args)["verifiedReferences"]).toEqual([{ kind: "RUN_CONTRACT", digest: other.contractDigest, runId: other.runId, artifactId: null, activationEventId: null }]);
+    } finally { await f.close(); }
+  });
+  it("checks a staged reference at its own source: a record stored later for its digest changes nothing, a source that no longer holds is refused at attach and freeze", async () => {
+    const f = await fixture();
+    try {
+      const { verification, row, run, body } = await liveShape(f);
+      const staged = await f.stageBody(run, "stage-bound", body());
+      expect(staged, JSON.stringify(staged)).toMatchObject({ ok: true });
+      const references = (staged["value"] as Args)["verifiedReferences"] as Args[];
+      expect(references).toContainEqual({ kind: "MANIFEST", digest: row.pinnedManifestDigest, runId: row.runId, artifactId: null, activationEventId: null });
+      // Stored after the stage, a HANDOFF whose own digest is the pinned manifest's: a fresh lookup would now answer with it.
+      const later = f.h.cp.artifacts.put(row.runId, "HANDOFF", f.h.cp.projects.manifest(row.pinnedManifestDigest!)!);
+      expect(later.digest).toBe(row.pinnedManifestDigest);
+
+      expect(await f.attachBody(run, "attach-bound", body())).toMatchObject({ ok: true });
+
+      // A source that no longer holds: the VERIFICATION artifact's content no longer matches its digest.
+      const tampered = { ...verification.content, gaps: ["a gap written afterwards"] };
+      f.tamper(verification.artifactId, tampered);
+      expect(await f.attachBody(run, "attach-tampered", body())).toMatchObject({ ok: false, reasonCode: "SNAPSHOT_DIGEST_MISMATCH" });
+      expect(await f.h.cp.pipeline.freeze(run.runId)).toMatchObject({ allowed: false, reasonCode: "SNAPSHOT_DIGEST_MISMATCH" });
+      expect(f.h.cp.artifacts.list(run.runId, "CANDIDATE_SNAPSHOT")).toEqual([]);
+
+      f.tamper(verification.artifactId, verification.content);
+      const outcome = await f.submit(run);
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+      const snapshot = f.h.cp.artifacts.list<CandidateSnapshot>(run.runId, "CANDIDATE_SNAPSHOT").at(-1)!.content;
+      expect(frozenStandardReviewEvidence({ artifacts: f.h.cp.artifacts, audit: f.h.cp.audit }, snapshot)!.source.references).toEqual(references);
     } finally { await f.close(); }
   });
 });
