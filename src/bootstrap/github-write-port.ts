@@ -852,11 +852,54 @@ const spawnGh: GhRunner = (args, stdin) =>
 /** `gh: Not Found (HTTP 404)` — the status `gh api` prints on a refused request. */
 const HTTP_STATUS = /\(HTTP (\d{3})\)/;
 
+/** The status line `gh api --include` prints first: `HTTP/2.0 422 Unprocessable Entity`. */
+const STATUS_LINE = /^HTTP\/\d+(?:\.\d+)?[ \t]+(\d{3})(?:[ \t]|\r?$)/;
+const REQUEST_ID_HEADER = "x-github-request-id";
+const REQUEST_ID = /^[\x21-\x7e]{1,128}$/;
+/** The escape `gh` colours a header name with when colour is forced. */
+const ANSI_COLOUR = /\x1b\[[0-9;]*m/g;
+
+/** What a response head says, reduced to the status and GitHub's request id: no other header is kept. */
+interface ResponseHead {
+  status: number;
+  requestId: string | null;
+}
+
+/**
+ * #1344 — `gh api --include` prints GitHub's status line, its headers and a blank line, then the
+ * body. The status is read from that head, never from the body: on an error whose body is empty or
+ * cut short, `gh` reports only "unexpected end of JSON input" and the `(HTTP nnn)` it would otherwise
+ * print is lost. Output that does not open with a status line has no head, and is all body.
+ */
+const splitResponse = (stdout: string): { head: ResponseHead | null; body: string } => {
+  const statusLine = STATUS_LINE.exec(stdout);
+  if (statusLine === null) return { head: null, body: stdout };
+  const lines = stdout.split("\n");
+  let requestId: string | null = null;
+  let end = 1;
+  for (; end < lines.length; end += 1) {
+    const line = lines[end]!.replace(ANSI_COLOUR, "").replace(/\r$/, "");
+    if (line === "") break;
+    const colon = line.indexOf(":");
+    if (colon > 0 && line.slice(0, colon).trim().toLowerCase() === REQUEST_ID_HEADER) {
+      const value = line.slice(colon + 1).trim();
+      requestId = REQUEST_ID.test(value) ? value : null;
+    }
+  }
+  return { head: { status: Number(statusLine[1]), requestId }, body: lines.slice(end + 1).join("\n") };
+};
+
 /**
  * `GitHubClient` over `gh api`. A failure carries GitHub's HTTP status in its evidence when
  * one arrived (`status: null` when none did), the same distinction `transportOutcome` in the
  * GitHub kernel reads: a 404 is an answer, a dropped connection is not, and `absentOn404` above
  * must never read the second as the first.
+ *
+ * #1344 — a write asks `gh` for the response head (`--include`), so its status is GitHub's status
+ * line, and a refusal with an empty or truncated body keeps it: a definite 4xx stays definite. Of
+ * the headers only GitHub's request id is kept. A body after a head that does not parse throws with
+ * the head's status and request id; for a 2xx that is no refusal (`definitelyNotCreated` reads only a
+ * 4xx), since the resource may exist. A read keeps the plain output it always had.
  */
 export class GhCliGitHubClient implements GitHubClient {
   constructor(private readonly run: GhRunner = spawnGh) {}
@@ -867,23 +910,38 @@ export class GhCliGitHubClient implements GitHubClient {
     body?: unknown,
   ): Promise<T> {
     const args = ["api", "--hostname", GITHUB_HOST, "--method", method, path];
+    const include = method !== "GET";
+    if (include) args.push("--include");
     let stdin: string | null = null;
     if (body !== undefined) {
       args.push("--input", "-");
       stdin = JSON.stringify(body);
     }
     const result = await this.run(args, stdin);
+    const { head, body: answer } = include ? splitResponse(result.stdout) : { head: null, body: result.stdout };
     if (result.exitCode !== 0) {
       const match = HTTP_STATUS.exec(result.stderr);
-      const status = match?.[1] === undefined ? null : Number(match[1]);
+      const status = head?.status ?? (match?.[1] === undefined ? null : Number(match[1]));
       throw acpError(
         status === 404 ? ReasonCode.NOT_FOUND : ReasonCode.INTERNAL_ERROR,
         `gh api ${method} ${path} failed: ${result.stderr.trim().slice(0, 300)}`,
-        { status, method, path },
+        { status, method, path, ...(head?.requestId ? { requestId: head.requestId } : {}) },
       );
     }
-    const text = result.stdout.trim();
-    return (text ? JSON.parse(text) : null) as T;
+    const text = answer.trim();
+    if (!text) return null as T;
+    if (head === null) return JSON.parse(text) as T;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      // The head is GitHub's answer even when the body after it is cut short: it keeps its status and
+      // request id. The body is not quoted. A 2xx here is no refusal — the resource may exist.
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        `gh api ${method} ${path} answered HTTP ${head.status} with a body that does not parse`,
+        { status: head.status, method, path, ...(head.requestId ? { requestId: head.requestId } : {}) },
+      );
+    }
   }
 }
 
