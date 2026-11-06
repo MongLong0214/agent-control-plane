@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 
 import { AgentOwnedWaits, DEFAULT_AGENT_WAIT_DEADLINES } from "../../src/ceo/agent-owned-waits.ts";
-import { CEO_NOTIFICATION_COVERED } from "../../src/ceo/ceo-incident-notices.ts";
+import { CEO_NOTIFICATION_COVERED, NotificationKind } from "../../src/ceo/ceo-incident-notices.ts";
 import { ExecutionMode, Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import type { OutboxMessage } from "../../src/outbox/outbox.ts";
@@ -155,7 +155,7 @@ describe("a CEO notice whose exact request an official record concluded is settl
     expect(rowOf(harness, resolvedNotice.messageId)).toEqual(settledRow);
   });
 
-  it("a stall notice whose run is now CANCELLED: COVERED and bound to the cancel transition", async () => {
+  it("a stall notice whose run is now CANCELLED, in the same instant as the notice: COVERED and bound to the cancel transition", async () => {
     const harness = makeHarness();
     const run = await activeRun(harness);
     harness.clock.advance(2 * HOUR + 1);
@@ -166,12 +166,17 @@ describe("a CEO notice whose exact request an official record concluded is settl
     expect(rowOf(harness, stall.messageId)["status"]).toBe("PENDING");
     expect(settlements(harness)).toEqual([]);
 
-    harness.clock.advance(1000);
+    // No clock advance: the cancel is recorded in the notice's own millisecond, and only event order says it is later.
     expect(harness.cp.runs.transition(run.runId, RunState.CANCELLED, "cancelled by the CEO").allowed).toBe(true);
     const cancel = harness.cp.audit.forRun(run.runId)
       .filter((entry) => entry.kind === "RUN_TRANSITION" && entry.evidence["to"] === RunState.CANCELLED).at(-1)!;
-    harness.clock.advance(1000);
+    expect(cancel.at).toBe(stall.createdAt);
+    // A notice that names no request, written as the run ends, reports that end: the end does not conclude it.
+    expect(harness.cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, run.runId, { blocker: "cancelled with its branch kept" }).allowed)
+      .toBe(true);
+    const report = ceoNotices(harness).find((message) => payloadOf(message)["blocker"] === "cancelled with its branch kept")!;
     await harness.cp.watchdog.tick();
+    expect(rowOf(harness, report.messageId)["status"]).toBe("PENDING");
 
     expect(rowOf(harness, stall.messageId)).toMatchObject({ status: "REJECTED", reason_code: "CEO_NOTIFICATION_COVERED" });
     expect(settlements(harness)).toEqual([expect.objectContaining({
@@ -258,13 +263,14 @@ describe("a CEO notice whose exact request an official record concluded is settl
     await harness.cp.watchdog.tick();
     expect(rowOf(harness, review.messageId)["status"]).toBe("PENDING");
 
-    harness.clock.advance(1000);
+    // Decided in the notice's own millisecond: event order, not the clock, puts the decision after the review.
     const confirmed = harness.cp.ceo.submitCeoDecision({
       runId: driven.runId, decision: "CONFIRM", candidateSnapshotDigest: driven.candidateSnapshotDigest,
       ceoSessionId: ceoSession(harness), rationale: "ship it",
     });
     if (!confirmed.allowed) throw new Error(`${confirmed.reasonCode}: ${confirmed.message}`);
     const decision = harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CEO_DECISION").at(-1)!;
+    expect(decision.at).toBe(review.createdAt);
     await harness.cp.watchdog.tick();
 
     expect(rowOf(harness, review.messageId)).toMatchObject({ status: "REJECTED", reason_code: "CEO_NOTIFICATION_COVERED" });

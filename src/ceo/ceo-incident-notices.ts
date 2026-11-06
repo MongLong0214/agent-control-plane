@@ -309,6 +309,14 @@ export const runEndedSince = (db: Pick<Db, "get">, run: { runId: string; state: 
     )?.event_id ?? null
     : null;
 
+/** The audit event a run's incident opened with: its own (`openedEventId`), else its episode's first delivery record. */
+const incidentOpenedEventId = (db: Pick<Db, "get">, incident: Incident & { runId: string }): number | null =>
+  incident.openedEventId ?? db.get<{ event_id: number | null }>(
+    `SELECT MIN(event_id) AS event_id FROM audit_events WHERE run_id = ? AND kind = ?
+       AND json_extract(evidence_json, '$.correlation') = ? AND json_extract(evidence_json, '$.episode') = ?`,
+    [incident.runId, CLASS_RULES[incident.cls].record, correlationOf(incident.cls, incident.subject), incident.episode],
+  )?.event_id ?? null;
+
 /**
  * The one definition of an incident's resolution, asked by every path that would hand its notice to a CEO:
  * `deliverIncident` before it delivers, `retryDeferredNotices` before it retries, and the outbox
@@ -333,11 +341,7 @@ export const resolutionOf = (db: Pick<Db, "get" | "all">, incident: Incident): R
   if (incident.runId === null || incident.subject !== incident.runId) return null;
   const run = db.get<{ state: RunState }>(`SELECT state FROM runs WHERE run_id = ?`, [incident.runId]);
   if (!run) return { kind: "RUN_GONE", eventId: null };
-  const opened = incident.openedEventId ?? db.get<{ event_id: number | null }>(
-    `SELECT MIN(event_id) AS event_id FROM audit_events WHERE run_id = ? AND kind = ?
-       AND json_extract(evidence_json, '$.correlation') = ? AND json_extract(evidence_json, '$.episode') = ?`,
-    [incident.runId, CLASS_RULES[incident.cls].record, correlationOf(incident.cls, incident.subject), incident.episode],
-  )?.event_id ?? null;
+  const opened = incidentOpenedEventId(db, { ...incident, runId: incident.runId });
   if (opened === null) return null;
   const decided = db.get<{ event_id: number }>(
     `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CEO_DECISION' AND event_id > ?
@@ -499,7 +503,6 @@ const ENDED_RUN_STATES: ReadonlySet<string> = new Set<string>([RunState.COMPLETE
 interface NoticeRow {
   message_id: string; run_id: string | null; role_key: string; target_session_id: string; binding_generation: number;
   status: OutboxMessage["status"]; reason_code: string | null; attempts: number; failure_class: OutboxMessage["failureClass"];
-  created_at: string;
   payload_json: string;
 }
 
@@ -536,21 +539,54 @@ const requestOf = (row: NoticeRow): { request: NoticeRequest; incident: Incident
 };
 
 /**
+ * The audit event the notice's exact request opened with, so what concluded it is ordered after it by durable event
+ * order, never by wall-clock time: its escalation (the CTO_ESCALATION event), its incident's opening
+ * (`incidentOpenedEventId`), the latest RUN_TRANSITION that put its candidate up for review (a candidate up for review
+ * again is a request open again), or the RUN_TRANSITION that entered the wait a deadline-step notice is for, as its
+ * AGENT_WAIT_DEADLINE record (`AgentOwnedWaits`) names it. Null for a notice that names none of them: its run alone does
+ * not tell its request, and nothing here settles it.
+ */
+const requestOpenedEventId = (db: Pick<Db, "get">, row: NoticeRow, request: NoticeRequest, incident: Incident | null): number | null => {
+  const runId = row.run_id;
+  if (runId === null) return null;
+  if (request.escalationId !== undefined) return request.escalationId;
+  if (incident !== null) return incident.subject === runId ? incidentOpenedEventId(db, { ...incident, runId }) : null;
+  if (request.notification === NotificationKind.READY_FOR_CEO_REVIEW && request.candidateSnapshotDigest !== undefined) {
+    return db.get<{ event_id: number }>(
+      `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'RUN_TRANSITION'
+         AND json_extract(evidence_json, '$.to') = ? AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?
+       ORDER BY event_id DESC LIMIT 1`,
+      [runId, RunState.READY_FOR_CEO_REVIEW, request.candidateSnapshotDigest],
+    )?.event_id ?? null;
+  }
+  const wait = db.get<{ episode: unknown }>(
+    `SELECT json_extract(evidence_json, '$.episode') AS episode FROM audit_events
+      WHERE run_id = ? AND kind = 'AGENT_WAIT_DEADLINE' AND json_extract(evidence_json, '$.messageId') = ?
+      ORDER BY event_id LIMIT 1`,
+    [runId, row.message_id],
+  );
+  return typeof wait?.episode === "number" ? wait.episode : null;
+};
+
+/**
  * The official record that concluded the notice's exact request, or null while there is none and the notice stays
  * owed. Each is bound to that request, never to its run alone: a decision on another escalation or candidate of the
- * same run concludes nothing here.
- * - CEO_DECISION: the CEO decision on that escalation (its `escalationId`), or on the candidate a review notice
- *   names, recorded after the notice;
+ * same run concludes nothing here, and a notice whose request has no opening event (`requestOpenedEventId`) is never
+ * settled by its run's end.
+ * - CEO_DECISION: the CEO decision on that escalation (its `escalationId`), or on the candidate a review notice names,
+ *   recorded after that review opened;
  * - CLAIM_EXPIRED: the claim a stall notice reports, its lease since expired (its row EXPIRED);
  * - MESSAGE_ACKED: the oldest stalled message a delivery stall notice names, since ACKed, with none of that role's
  *   messages queued no later still PENDING (they would be stated in the same episode);
- * - RUN_ENDED: the RUN_TRANSITION that ended the notice's run after the notice, for a notice about that run.
+ * - RUN_ENDED: the RUN_TRANSITION that ended the notice's run after its request opened (`runEndedSince`, the ended rule
+ *   `resolutionOf` and `ProductionGate.openEscalationOf` ask), in the same instant as it included.
  * An incident notice stands for every incident stated in its episode, so it is settled only once that episode is
  * closed under `resolutionOf` too: no later statement can be folded into a notice nobody is told.
  */
 const conclusionOf = (db: Pick<Db, "get" | "all">, row: NoticeRow, request: NoticeRequest, incident: Incident | null): NoticeConclusion | null => {
   const concluded = ((): NoticeConclusion | null => {
     const runId = row.run_id;
+    const opened = requestOpenedEventId(db, row, request, incident);
     if (runId !== null && request.escalationId !== undefined) {
       const decided = db.get<{ event_id: number }>(
         `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CEO_DECISION'
@@ -560,13 +596,14 @@ const conclusionOf = (db: Pick<Db, "get" | "all">, row: NoticeRow, request: Noti
       );
       if (decided) return { kind: "CEO_DECISION", eventId: decided.event_id };
     }
-    if (runId !== null && request.notification === NotificationKind.READY_FOR_CEO_REVIEW && request.candidateSnapshotDigest !== undefined) {
+    if (runId !== null && opened !== null && request.notification === NotificationKind.READY_FOR_CEO_REVIEW
+        && request.candidateSnapshotDigest !== undefined) {
       const decided = db.get<{ event_id: number }>(
-        `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CEO_DECISION'
+        `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CEO_DECISION' AND event_id > ?
            AND json_extract(evidence_json, '$.decision') IS NOT NULL
-           AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ? AND at > ?
+           AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?
          ORDER BY event_id LIMIT 1`,
-        [runId, request.candidateSnapshotDigest, row.created_at],
+        [runId, opened, request.candidateSnapshotDigest],
       );
       if (decided) return { kind: "CEO_DECISION", eventId: decided.event_id };
     }
@@ -585,16 +622,10 @@ const conclusionOf = (db: Pick<Db, "get" | "all">, row: NoticeRow, request: Noti
       );
       if (acked && !waiting) return { kind: "MESSAGE_ACKED", eventId: null, ackedMessageId: request.resource, ackedAt: acked.acked_at };
     }
-    if (runId !== null && (incident === null || incident.subject === runId)) {
-      const run = db.get<{ state: string }>(`SELECT state FROM runs WHERE run_id = ?`, [runId]);
-      const ended = run && ENDED_RUN_STATES.has(run.state)
-        ? db.get<{ event_id: number }>(
-          `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'RUN_TRANSITION'
-             AND json_extract(evidence_json, '$.to') = ? AND at > ? ORDER BY event_id DESC LIMIT 1`,
-          [runId, run.state, row.created_at],
-        )
-        : undefined;
-      if (run && ended) return { kind: "RUN_ENDED", eventId: ended.event_id, runState: run.state };
+    if (runId !== null && opened !== null) {
+      const run = db.get<{ state: RunState }>(`SELECT state FROM runs WHERE run_id = ?`, [runId]);
+      const ended = run && ENDED_RUN_STATES.has(run.state) ? runEndedSince(db, { runId, state: run.state }, opened) : null;
+      if (run && ended !== null) return { kind: "RUN_ENDED", eventId: ended, runState: run.state };
     }
     return null;
   })();
@@ -616,7 +647,7 @@ export const settleConcludedNotices = (db: Db, audit: AuditLog): string[] => {
   const settled: string[] = [];
   const rows = db.all<NoticeRow>(
     `SELECT message_id, run_id, role_key, target_session_id, binding_generation, status, reason_code, attempts,
-            failure_class, created_at, payload_json FROM outbox
+            failure_class, payload_json FROM outbox
       WHERE kind = 'CEO_NOTIFICATION' AND status IN ('PENDING', 'SENT')
       ORDER BY created_at, rowid`,
   );
@@ -651,7 +682,7 @@ export const settleConcludedNotices = (db: Db, audit: AuditLog): string[] => {
           concludedBy: { ...concluded },
         },
       });
-      return recorded.allowed ? allow(ReasonCode.OK, true) : recorded as unknown as Decision<boolean>;
+      return recorded.allowed ? allow(ReasonCode.CEO_NOTIFICATION_COVERED, true) : recorded as unknown as Decision<boolean>;
     });
     if (written.allowed && written.value) settled.push(row.message_id);
   }
