@@ -4,12 +4,12 @@ import { dirname, join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
-import { sha256 } from "../../src/core/digest.ts";
+import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { ApprovedRunFinalizer } from "../../src/daemon/finalizer.ts";
-import { RunState } from "../../src/domain/types.ts";
+import { ArtifactKind, ExecutionMode, RunKind, RunState } from "../../src/domain/types.ts";
 import {
   type ConfirmedMergePlan,
   type ConfirmedMergePorts,
@@ -17,6 +17,7 @@ import {
 } from "../../src/github/confirmed-merge-operation.ts";
 import type { BranchPublishLimits } from "../../src/git/branch-objects.ts";
 import { NO_HUMAN_GATE_DIGEST, type GitHubClient } from "../../src/github/github-kernel.ts";
+import { WORK_SCOPE_APPROVED, WORK_SCOPE_GITHUB_TRACKED } from "../../src/run/work-scope-tracking.ts";
 import type { CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
 import { cleanupTempDirs, commitAll, tempDir, writeFiles } from "../helpers/fixtures.ts";
@@ -227,6 +228,272 @@ describe("S-PUSH: the finalizer publishes the branch before it prepares the PR",
     expect(replay.allowed).toBe(true);
     expect(fixture.log.filter((call) => call.method === "POST" && GIT_DATA.test(call.path)).length).toBe(sentBefore);
     expect(receiptsOf(fixture)).toHaveLength(1);
+  });
+});
+
+/**
+ * #1345 — the run's work scope tracked on GitHub, as `WorkScopeTracking` records it: the project is a Repo
+ * Factory one at a recorded node id, the run's PLAN puts its one task in one unit adopting issue #`issue`, the
+ * owner's approval of that PLAN, and the unit's verification. Seeded before CONFIRM, whose work-scope check
+ * refuses a governed run unless these records hold its every unit as tracked.
+ */
+const trackWorkScope = (fixture: Fixture, issue: number): void => {
+  const { harness, driven } = fixture;
+  const node = "R_kgDOfixture";
+  const contract = { goal: "bootstrap", why: "genesis", scope: [], nonGoals: [], acceptance: [], priority: "NORMAL" as const, humanGate: [], references: [] };
+  const holder = harness.cp.runs.create({ projectId: driven.projectId, kind: RunKind.STANDARD_WORK, executionMode: ExecutionMode.SIMPLE, contract, repositories: [] });
+  if (!holder.allowed) throw new Error(holder.message);
+  harness.cp.db.run(
+    `INSERT INTO resident_project_provisioning(run_id,project_id,binding_json,allocation_json,confirmation_json,steps_json,status,updated_at)
+     VALUES (?,?,'{}',?,'{}','{}','COMPLETE',?)`,
+    [holder.value.runId, driven.projectId, JSON.stringify({ projectId: driven.projectId, repositoryIdentity: driven.identity, repositoryNodeId: node }), harness.clock.nowIso()],
+  );
+  const taskIds = harness.cp.tasks.list(driven.runId).map((task) => task.taskId);
+  const unit = { key: "app", tasks: taskIds, issue: { number: issue }, milestone: { number: 1 } };
+  const plan = harness.cp.artifacts.put(driven.runId, ArtifactKind.PLAN, { summary: "one work unit", workUnits: [unit] });
+  const approved = harness.cp.tasks.workScope!.approve(driven.runId, plan.digest, { units: [unit] }, [], [], {
+    sessionId: driven.ownerSessionId,
+    bindingGeneration: driven.ownerBindingGeneration,
+  });
+  if (!approved.allowed) throw new Error(approved.message);
+  const approval = harness.cp.audit.byKind(WORK_SCOPE_APPROVED).at(-1)!;
+  const declarationDigest = (approval.evidence as { units: Array<{ declarationDigest: string }> }).units[0]!.declarationDigest;
+  harness.cp.audit.record({
+    kind: WORK_SCOPE_GITHUB_TRACKED,
+    runId: driven.runId,
+    projectId: driven.projectId,
+    evidence: {
+      repositoryIdentity: driven.identity,
+      repositoryNodeId: node,
+      units: [{
+        unit: unit.key, declarationDigest, scopeDigest: digestOf({ declarationDigest, taskIds: [...taskIds].sort() }), taskIds,
+        approvalEventId: approval.eventId, issueNumber: issue, issueNodeId: `I_${issue}`, milestoneNumber: 1, milestoneNodeId: "MI_1", adopted: true,
+      }],
+    },
+  });
+};
+
+/** The body of every pull request the finalizer opened, in order. */
+const openedPrBodies = (fixture: Fixture): string[] =>
+  fixture.log.filter((call) => call.method === "POST" && /\/pulls$/.test(call.path)).map((call) => (call.body as { body: string }).body);
+
+describe("#1345: the finalization PR closes the issues the run tracks on its own repository", () => {
+  /** A tracked run of issue #7, CEO-approved for finalization. */
+  const trackedRun = async (): Promise<Fixture> => {
+    const fixture = await setup({ finalization: false });
+    trackWorkScope(fixture, 7);
+    expect(fixture.harness.cp.tasks.workScope!.trackedIssues(fixture.driven.runId)).toEqual({ repositoryIdentity: fixture.driven.identity, issues: [7] });
+    await approveReviewedCandidateForFinalization(fixture.harness, fixture.driven);
+    return fixture;
+  };
+  const LEGACY_BODY = (runId: string): string => `Automated daemon finalization for run ${runId}.\n\n<!-- acp-run:${runId} -->`;
+
+  it("a run tracking issue #7 opens its PR with the kernel's linkage, `Closes #7`, the run marker kept; the run completes", async () => {
+    const fixture = await trackedRun();
+    const { harness, driven } = fixture;
+    const done = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+    expect(done.allowed, JSON.stringify(done)).toBe(true);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+    expect(openedPrBodies(fixture)).toEqual([
+      `Automated daemon finalization for run ${driven.runId}.\n\nCloses #7\n<!-- acp-run:${driven.runId} -->\n<!-- acp-linked-issues:7 -->`,
+    ]);
+    // GitHub's own closing references were read for that pull, and they hold #7.
+    const pullNumber = fixture.github.pulls[0]!.number;
+    expect(fixture.log.filter((call) => call.method === "POST" && call.path === "/graphql")
+      .map((call) => (call.body as { variables: { number: number } }).variables.number)).toContain(pullNumber);
+  });
+
+  /** A refused finalization of the tracked run: PR_LINKAGE_MISSING, nothing merged, the run still approved. */
+  const expectLinkageRefused = async (fixture: Fixture): Promise<void> => {
+    const refused = await new ApprovedRunFinalizer(fixture.harness.cp).finalizeApprovedRun(fixture.driven.runId);
+    expect(refused.allowed, JSON.stringify(refused)).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
+    expect(fixture.github.mergeCount).toBe(0);
+    expect(fixture.harness.cp.runs.require(fixture.driven.runId).state).toBe(RunState.CEO_APPROVED);
+  };
+
+  it("an open PR of the run whose `Closes #7` sits in a code block is refused: GitHub resolves no closing reference", async () => {
+    const fixture = await trackedRun();
+    const { harness, github, driven } = fixture;
+    github.pulls.push({
+      number: 98,
+      head: { sha: driven.candidateHead, ref: WORK_BRANCH },
+      base: { sha: driven.baseHead, ref: "dev" },
+      merged: false,
+      state: "open",
+      html_url: "https://github.test/pull/98",
+      title: `ACP finalization: ${harness.cp.runs.require(driven.runId).goal}`,
+      body: `Automated daemon finalization for run ${driven.runId}.\n\n\`\`\`\nCloses #7\n\`\`\`\n<!-- acp-run:${driven.runId} -->\n<!-- acp-linked-issues:7 -->`,
+    });
+    await expectLinkageRefused(fixture);
+  });
+
+  it("a PR whose GitHub closing references are empty is refused, though its body carries `Closes #7`", async () => {
+    const fixture = await trackedRun();
+    fixture.github.closingIssuesFor = () => [];
+    await expectLinkageRefused(fixture);
+    expect(fixture.github.pulls).toHaveLength(1);
+  });
+
+  it("a linkage GitHub has not resolved yet is retried in the same process: once #7 resolves, the retry reconciles the PR and completes", async () => {
+    const fixture = await trackedRun();
+    const { harness, github, driven } = fixture;
+    const resolves = github.closingIssuesFor;
+    github.closingIssuesFor = () => [];
+    await expectLinkageRefused(fixture);
+    github.closingIssuesFor = resolves;
+    const done = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+    expect(done.allowed, JSON.stringify(done)).toBe(true);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+    expect(github.pulls).toHaveLength(1);
+  });
+
+  const ISSUES = Array.from({ length: 101 }, (_, index) => index + 1);
+  /** The PR prepared directly, after its branch is published, requiring linkage to `issues` (#1–#101 by default). */
+  const prepareLinked = async (fixture: Fixture, issues: readonly number[] = ISSUES) => {
+    const plan = fixture.plan();
+    const published = await fixture.harness.cp.github.publishBranch(plan.publish);
+    expect(published.allowed, JSON.stringify(published)).toBe(true);
+    return fixture.harness.cp.github.prPrepare({ ...plan.prepare, linkedIssues: issues, requireLinkage: true });
+  };
+
+  /** GitHub's closing-references pages, scripted by the cursor each is asked for ("" for the first). */
+  const scriptPages = (fixture: Fixture, pages: Record<string, { issues: number[]; pageInfo: Record<string, unknown> }>): void => {
+    const { github } = fixture;
+    const request = github.request.bind(github);
+    github.request = async <T>(method: HttpMethod, path: string, body?: unknown): Promise<T> => {
+      if (method !== "POST" || path !== "/graphql") return request<T>(method, path, body);
+      const { owner, repo, after } = (body as { variables: { owner: string; repo: string; after: string | null } }).variables;
+      const page = pages[after ?? ""]!;
+      const nodes = page.issues.map((number) => ({ number, repository: { nameWithOwner: `${owner}/${repo}` } }));
+      return { data: { repository: { pullRequest: { closingIssuesReferences: { nodes, pageInfo: page.pageInfo } } } } } as T;
+    };
+  };
+  const graphqlReads = (fixture: Fixture): number => fixture.log.filter((call) => call.method === "POST" && call.path === "/graphql").length;
+
+  it("every linked issue found on a well-formed page that has a next page is accepted", async () => {
+    const fixture = await setup();
+    scriptPages(fixture, { "": { issues: [7], pageInfo: { hasNextPage: true, endCursor: "A" } } });
+    const prepared = await prepareLinked(fixture, [7]);
+    expect(prepared.allowed, JSON.stringify(prepared)).toBe(true);
+    expect(graphqlReads(fixture)).toBe(1);
+  });
+
+  it("#7 found on a page whose next page has no string cursor is refused", async () => {
+    const fixture = await setup();
+    scriptPages(fixture, { "": { issues: [7], pageInfo: { hasNextPage: true, endCursor: 42 } } });
+    const refused = await prepareLinked(fixture, [7]);
+    expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
+  });
+
+  it("an A→B→A cycle is refused even when the repeating page holds the last linked issue", async () => {
+    const fixture = await setup();
+    scriptPages(fixture, {
+      "": { issues: [1], pageInfo: { hasNextPage: true, endCursor: "A" } },
+      A: { issues: [2], pageInfo: { hasNextPage: true, endCursor: "B" } },
+      B: { issues: [3], pageInfo: { hasNextPage: true, endCursor: "A" } },
+    });
+    const refused = await prepareLinked(fixture, [1, 2, 3]);
+    expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
+    expect(graphqlReads(fixture)).toBe(3);
+  });
+
+  it("a 10th page that still has a next page is refused, though it holds the last linked issue", async () => {
+    const fixture = await setup();
+    const pages: Record<string, { issues: number[]; pageInfo: Record<string, unknown> }> = {};
+    for (let page = 0; page < 10; page += 1) {
+      pages[page === 0 ? "" : `c${page}`] = { issues: page === 9 ? [7] : [], pageInfo: { hasNextPage: true, endCursor: `c${page + 1}` } };
+    }
+    scriptPages(fixture, pages);
+    const refused = await prepareLinked(fixture, [7]);
+    expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
+    expect(graphqlReads(fixture)).toBe(10);
+  });
+
+  it("101 linked issues are found across two pages of GitHub's closing references, and accepted", async () => {
+    const fixture = await setup();
+    const prepared = await prepareLinked(fixture);
+    expect(prepared.allowed, JSON.stringify(prepared)).toBe(true);
+    const cursors = fixture.log.filter((call) => call.method === "POST" && call.path === "/graphql")
+      .map((call) => (call.body as { variables: { after: string | null } }).variables.after);
+    expect(cursors).toEqual([null, "100"]);
+  });
+
+  it("101 linked issues with one missing from the last page of closing references are refused", async () => {
+    const fixture = await setup();
+    const resolves = fixture.github.closingIssuesFor;
+    fixture.github.closingIssuesFor = (pull) => resolves(pull).filter((issue) => issue !== 101);
+    const refused = await prepareLinked(fixture);
+    expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
+    expect(refused.evidence).toMatchObject({ missing: [101] });
+  });
+
+  it("closing-reference cursors that cycle A→B→A with linked issues still missing are refused at the repeat", async () => {
+    const fixture = await setup();
+    scriptPages(fixture, {
+      "": { issues: [], pageInfo: { hasNextPage: true, endCursor: "A" } },
+      A: { issues: [], pageInfo: { hasNextPage: true, endCursor: "B" } },
+      B: { issues: [], pageInfo: { hasNextPage: true, endCursor: "A" } },
+    });
+    const refused = await prepareLinked(fixture);
+    expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
+    expect(graphqlReads(fixture)).toBe(3);
+  });
+
+  it("a GraphQL error reading the closing references is refused, never taken as linkage", async () => {
+    const fixture = await trackedRun();
+    fixture.github.graphqlErrors = ["Something went wrong while executing your query."];
+    await expectLinkageRefused(fixture);
+  });
+
+  it("an open PR of the run that does not carry `Closes #7` is not accepted: PR_LINKAGE_MISSING, nothing merged", async () => {
+    const fixture = await trackedRun();
+    const { harness, github, driven } = fixture;
+    github.pulls.push({
+      number: 99,
+      head: { sha: driven.candidateHead, ref: WORK_BRANCH },
+      base: { sha: driven.baseHead, ref: "dev" },
+      merged: false,
+      state: "open",
+      html_url: "https://github.test/pull/99",
+      title: `ACP finalization: ${harness.cp.runs.require(driven.runId).goal}`,
+      body: LEGACY_BODY(driven.runId),
+    });
+    const refused = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
+    expect(github.mergeCount).toBe(0);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
+  });
+
+  for (const before of ["published", "published and prepared"] as const) {
+    it(`a tracked run ${before} before the upgrade finishes with the text it was published with: no RESOURCE_COLLISION`, async () => {
+      const fixture = await trackedRun();
+      const { harness, driven } = fixture;
+      // Before the upgrade, the finalizer's plan named no issue: what `plan()` derives.
+      const legacy = fixture.plan();
+      const published = await harness.cp.github.publishBranch(legacy.publish);
+      expect(published.allowed, JSON.stringify(published)).toBe(true);
+      if (before === "published and prepared") {
+        const prepared = await harness.cp.github.prPrepare(legacy.prepare);
+        expect(prepared.allowed, JSON.stringify(prepared)).toBe(true);
+      }
+      const done = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+      expect(done.allowed, JSON.stringify(done)).toBe(true);
+      expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+      expect(openedPrBodies(fixture)).toEqual([LEGACY_BODY(driven.runId)]);
+      expect(fixture.gitData.posts("refs")).toHaveLength(1);
+      expect(receiptsOf(fixture)).toHaveLength(1);
+    });
+  }
+
+  it("a run that tracks no issue opens its PR with the body it always had", async () => {
+    const fixture = await setup();
+    const { harness, driven } = fixture;
+    expect(harness.cp.tasks.workScope!.trackedIssues(driven.runId)).toBeNull();
+    const done = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+    expect(done.allowed, JSON.stringify(done)).toBe(true);
+    expect(openedPrBodies(fixture)).toEqual([LEGACY_BODY(driven.runId)]);
   });
 });
 

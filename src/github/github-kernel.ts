@@ -324,6 +324,8 @@ interface PreparedPrIntent {
 
 /** Where CommitLore keeps a commit's records beside its message; a merge does not move it (#1269). */
 const NOTES_REF = "refs/notes/commitlore";
+/** #1345 — pages of 100 closing references read for one PR; a PLAN's 200 work units fit in 2. */
+const CLOSING_REFERENCE_PAGE_BOUND = 10;
 
 interface GitHubWriteTarget {
   /** The concrete branch whose claim fences this remote write. */
@@ -643,6 +645,10 @@ export class GitHubKernel {
         }
         if (matches.length === 1) {
           const value = { pullNumber: matches[0]!.number, url: matches[0]!.html_url };
+          if (input.requireLinkage) {
+            const closing = await this.closingReferencesHold(owner, repo, value.pullNumber, linkedIssues);
+            if (!closing.allowed) return closing as Decision<{ pullNumber: number; url: string }>;
+          }
           const finalized = this.finalizeReservedReceipt({
             idempotencyKey,
             requestDigest,
@@ -688,6 +694,10 @@ export class GitHubKernel {
           observed: reread.base.sha,
         });
       }
+      if (input.requireLinkage) {
+        const closing = await this.closingReferencesHold(owner, repo, cached.pullNumber, linkedIssues);
+        if (!closing.allowed) return closing as Decision<{ pullNumber: number; url: string }>;
+      }
       return allow(ReasonCode.MERGE_IDEMPOTENT_REPLAY, {
         pullNumber: cached.pullNumber,
         url: cached.url,
@@ -726,38 +736,45 @@ export class GitHubKernel {
         requestDigest,
       });
       if (!reserved.allowed) return reserved as Decision<{ pullNumber: number; url: string }>;
-      const target = this.writeTarget(input.runId, input.repositoryIdentity, input.head);
-      if (!target.allowed) return target as Decision<{ pullNumber: number; url: string }>;
-      const created = await this.mediate(
-        WriteOperation.GITHUB_PR,
-        input.runId,
-        input.repositoryIdentity,
-        target.value,
-        input,
-        () => this.api().request<PullRequest>("POST", `/repos/${owner}/${repo}/pulls`, {
-          title: input.title,
-          body: prBody,
-          head: input.head,
-          base: input.base,
-        }),
-      );
-      if (!created.allowed) {
-        if (created.evidence["effectInvoked"] !== true) this.releaseReservation(idempotencyKey, requestDigest);
-        return created as Decision<{ pullNumber: number; url: string }>;
+      // #1345 — the in-memory reservation stops only a concurrent duplicate of this invocation's own write. It
+      // ends with the invocation, on every path; the durable PENDING receipt stays, and a retry in this process
+      // reconciles from it (an unproven linkage, a lost answer) instead of reading as in flight until a restart.
+      try {
+        const target = this.writeTarget(input.runId, input.repositoryIdentity, input.head);
+        if (!target.allowed) return target as Decision<{ pullNumber: number; url: string }>;
+        const created = await this.mediate(
+          WriteOperation.GITHUB_PR,
+          input.runId,
+          input.repositoryIdentity,
+          target.value,
+          input,
+          () => this.api().request<PullRequest>("POST", `/repos/${owner}/${repo}/pulls`, {
+            title: input.title,
+            body: prBody,
+            head: input.head,
+            base: input.base,
+          }),
+        );
+        if (!created.allowed) {
+          if (created.evidence["effectInvoked"] !== true) this.releaseReservation(idempotencyKey, requestDigest);
+          return created as Decision<{ pullNumber: number; url: string }>;
+        }
+        const pull = created.value;
+        return await this.finishPreparedPr({
+          pull,
+          createdByUs,
+          input,
+          candidate: candidate.value,
+          linkedIssues,
+          idempotencyKey,
+          requestDigest,
+          request,
+          owner,
+          repo,
+        });
+      } finally {
+        this.inFlightReservations.delete(idempotencyKey);
       }
-      const pull = created.value;
-      return this.finishPreparedPr({
-        pull,
-        createdByUs,
-        input,
-        candidate: candidate.value,
-        linkedIssues,
-        idempotencyKey,
-        requestDigest,
-        request,
-        owner,
-        repo,
-      });
     }
     const pull = open[0]!;
 
@@ -811,6 +828,10 @@ export class GitHubKernel {
         pullNumber: reread.number,
         linkedIssues,
       });
+    }
+    if (input.input.requireLinkage) {
+      const closing = await this.closingReferencesHold(owner, repo, reread.number, linkedIssues);
+      if (!closing.allowed) return closing as Decision<{ pullNumber: number; url: string }>;
     }
 
     const value = { pullNumber: reread.number, url: reread.html_url };
@@ -4683,6 +4704,58 @@ export class GitHubKernel {
       linkedIssues.every((issue) => new RegExp(`\\bCloses\\s+#${issue}\\b`, "i").test(body)) &&
       body.includes(`<!-- acp-linked-issues:${linkedIssues.join(",")} -->`)
     );
+  }
+
+  /**
+   * #1345 — the PR's linkage as GitHub resolves it (GraphQL `closingIssuesReferences`), not as its body reads: a
+   * `Closes #N` inside a code block, or one GitHub did not link, closes nothing. Every linked issue must be a
+   * closing reference of this repository; a missing one, or an answer that cannot be read, is PR_LINKAGE_MISSING.
+   */
+  private async closingReferencesHold(owner: string, repo: string, pullNumber: number, linkedIssues: readonly number[]): Promise<Decision<void>> {
+    const refused = (evidence: Record<string, unknown>): Decision<void> =>
+      deny(ReasonCode.PR_LINKAGE_MISSING, "GitHub does not resolve the PR's required closing issue references", { pullNumber, linkedIssues, ...evidence });
+    type Page = { nodes?: unknown; pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } | null };
+    type Answer = { data?: { repository?: { pullRequest?: { closingIssuesReferences?: Page | null } | null } | null } | null; errors?: unknown } | null;
+    const own = `${owner}/${repo}`.toLowerCase();
+    const present = new Set<unknown>();
+    // Page by page (100 a page), until every linked issue is found or GitHub has no next page. Each page's
+    // continuation is checked before anything on it is accepted: a next page needs a string cursor not seen before
+    // (no cycle) and a page left within the bound. On a well-formed page, every linked issue found is proof.
+    let after: string | null = null;
+    const cursors = new Set<string>();
+    for (let page = 0; page < CLOSING_REFERENCE_PAGE_BOUND; page += 1) {
+      let answer: Answer;
+      try {
+        answer = await this.api().request<Answer>("POST", "/graphql", {
+          query: "query($owner:String!,$repo:String!,$number:Int!,$after:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){closingIssuesReferences(first:100,after:$after){nodes{number repository{nameWithOwner}} pageInfo{hasNextPage endCursor}}}}}",
+          variables: { owner, repo, number: pullNumber, after },
+        });
+      } catch (error) {
+        return refused({ cause: "the closing references could not be read", ...transportOutcome(error) });
+      }
+      const references: Page | null | undefined = answer?.data?.repository?.pullRequest?.closingIssuesReferences;
+      const nodes = references?.nodes;
+      const next = references?.pageInfo?.hasNextPage;
+      if ((Array.isArray(answer?.errors) && answer.errors.length > 0) || !Array.isArray(nodes) || typeof next !== "boolean") {
+        return refused({ cause: "GitHub's closing references answer is not readable" });
+      }
+      let following: string | null = null;
+      if (next) {
+        const cursor: unknown = references?.pageInfo?.endCursor;
+        if (typeof cursor !== "string" || cursors.has(cursor)) return refused({ cause: "GitHub's closing references answer is not readable" });
+        if (page === CLOSING_REFERENCE_PAGE_BOUND - 1) return refused({ cause: "the closing references run past the pages read" });
+        following = cursor;
+      }
+      for (const node of nodes as Array<{ number?: unknown; repository?: { nameWithOwner?: unknown } | null }>) {
+        if (typeof node?.repository?.nameWithOwner === "string" && node.repository.nameWithOwner.toLowerCase() === own) present.add(node.number);
+      }
+      const missing = linkedIssues.filter((issue) => !present.has(issue));
+      if (missing.length === 0) return allow(ReasonCode.OK, undefined);
+      if (following === null) return refused({ missing });
+      cursors.add(following);
+      after = following;
+    }
+    return refused({ cause: "the closing references run past the pages read" });
   }
 
   private hasPrRunMarker(body: string | null | undefined, runId: string): boolean {

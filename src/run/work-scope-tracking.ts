@@ -399,6 +399,19 @@ export class WorkScopeTracking {
     });
   }
 
+  /**
+   * #1345 — read-only: the issues the run's current approved scope holds verified, on the governed repository
+   * they belong to, so the run's merged pull request can close them. `null` for a run that is not governed,
+   * or whose repository is unresolved (CONFIRM refuses that one).
+   */
+  trackedIssues(runId: string): { repositoryIdentity: string; issues: number[] } | null {
+    const governed = this.#governed(runId);
+    if (!governed.allowed || governed.value === null) return null;
+    const status = this.#status(runId, governed.value);
+    const issues = [...new Set([...status.tracked.values()].map((unit) => unit.issueNumber))].sort((a, b) => a - b);
+    return { repositoryIdentity: governed.value.repositoryIdentity, issues };
+  }
+
   async #ensureNow(runId: string, taskId: string | undefined): Promise<Decision<TrackedUnit | { units: TrackedUnit[] } | null>> {
     const governed = this.#governed(runId);
     if (!governed.allowed || governed.value === null) return governed as Decision<null>;
