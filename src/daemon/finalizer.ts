@@ -234,13 +234,20 @@ const blockerOf = (failure: Decision<unknown>): string =>
   `${failure.reasonCode}: ${failure.allowed ? "" : failure.message}`.slice(0, 200);
 
 /**
- * #1345 — the finalization PR's body, with one `Closes #N` line for each issue the run tracks on that PR's own
- * repository, so merging the PR closes them. A bare `#N` names an issue of the PR's repository, so the caller
- * passes only issues of that repository, never another's. GitHub acts on the keyword only when the PR's base
- * is the repository's default branch; a PR into any other base leaves the issues open.
+ * #1345 — the finalization plan as it stood before its PR named the run's tracked issues: the same plan, with
+ * no issue linkage. A publication receipted before the upgrade was scanned and digested with this text.
  */
-const finalizationBody = (runId: string, closes: readonly number[]): string =>
-  [`Automated daemon finalization for run ${runId}.`, ...(closes.length > 0 ? ["", ...closes.map((issue) => `Closes #${issue}`)] : [])].join("\n");
+const withoutLinkage = (plan: ConfirmedMergePlan): ConfirmedMergePlan => ({
+  ...plan,
+  publish: { ...plan.publish, pullRequest: { title: plan.publish.pullRequest.title, body: plan.publish.pullRequest.body } },
+  prepare: { ...plan.prepare, linkedIssues: undefined, requireLinkage: undefined },
+});
+
+/** The kernel's refusal of a publication whose existing receipt was made for another request digest. */
+const publicationIntentMismatch = (decision: Decision<unknown>): boolean =>
+  !decision.allowed &&
+  decision.reasonCode === ReasonCode.RESOURCE_COLLISION &&
+  typeof decision.evidence["existingRequestDigest"] === "string";
 
 type FinalizationAttemptState = "RUNNING" | "RELEASED" | "COMPLETED" | "BLOCKED";
 
@@ -492,16 +499,28 @@ export class ApprovedRunFinalizer {
       }
 
       const prepared: PlannedRepository[] = [];
-      for (const plan of plans.value) {
-        const receipt = this.mergeReceiptPull(runId, plan.repositoryIdentity);
+      for (const derived of plans.value) {
+        const receipt = this.mergeReceiptPull(runId, derived.repositoryIdentity);
         if (receipt?.status === "APPLIED" && receipt.verified === 1) {
-          prepared.push({ plan, pullNumber: receipt.pullNumber, merged: true });
+          prepared.push({ plan: derived, pullNumber: receipt.pullNumber, merged: true });
           continue;
         }
         // #512 S-PUSH — the candidate branch reaches GitHub before its PR is prepared. Create-only: a
         // branch already at the exact candidate is reconciled, any other commit refuses (D4).
-        this.touchAttempt(runId, attemptId, `PUBLISH_BRANCH:${plan.repositoryIdentity}`);
-        const published = await publishConfirmedBranch(this.#ports, plan);
+        this.touchAttempt(runId, attemptId, `PUBLISH_BRANCH:${derived.repositoryIdentity}`);
+        let plan = derived;
+        let published = await publishConfirmedBranch(this.#ports, plan);
+        // #1345 — a publication receipted before the PR named its tracked issues keeps the text it was scanned
+        // with: the kernel refuses the linked text under that receipt's digest, so the plan without linkage is
+        // tried once, and kept for the PR only when the receipt's digest is its own. A new publication links.
+        if (plan.prepare.requireLinkage === true && publicationIntentMismatch(published)) {
+          const unlinked = withoutLinkage(plan);
+          const again = await publishConfirmedBranch(this.#ports, unlinked);
+          if (!publicationIntentMismatch(again)) {
+            plan = unlinked;
+            published = again;
+          }
+        }
         if (!published.allowed) return this.handleFailure(runId, attemptId, published as Decision<unknown>);
         this.touchAttempt(runId, attemptId, `PREPARE_PR:${plan.repositoryIdentity}`);
         const pr = await prepareConfirmedMerge(this.#ports, plan);
@@ -949,6 +968,7 @@ export class ApprovedRunFinalizer {
           repositoryIdentity: participant.identity,
         });
       }
+      const closes = tracked?.repositoryIdentity === participant.identity ? tracked.issues : [];
       let head = participant.workBranch;
       if (!head) {
         head = await currentBranch(participant.checkoutPath);
@@ -964,9 +984,13 @@ export class ApprovedRunFinalizer {
         repositoryIdentity: participant.identity,
         head,
         title: `ACP finalization: ${run.goal}`,
-        body: finalizationBody(runId, tracked?.repositoryIdentity === participant.identity ? tracked.issues : []),
+        body: `Automated daemon finalization for run ${runId}.`,
         declaredParent: snapshotRepository.sourceBranch ?? null,
         humanGateDigest: humanGate.value,
+        // #1345 — the issues the run tracks on this PR's own repository, never another's (a bare `#N` names an
+        // issue of the PR's repository). The kernel writes one `Closes #N` line each and refuses a PR that does
+        // not carry them. GitHub closes them on merge only when the PR's base is the repository's default branch.
+        ...(closes.length > 0 ? { linkedIssues: closes, requireLinkage: true } : {}),
       });
       if (!plan.allowed) return plan as Decision<ConfirmedMergePlan[]>;
       plans.push(plan.value);

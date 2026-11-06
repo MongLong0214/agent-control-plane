@@ -278,19 +278,67 @@ const openedPrBodies = (fixture: Fixture): string[] =>
   fixture.log.filter((call) => call.method === "POST" && /\/pulls$/.test(call.path)).map((call) => (call.body as { body: string }).body);
 
 describe("#1345: the finalization PR closes the issues the run tracks on its own repository", () => {
-  it("a run tracking issue #7 opens its PR with `Closes #7`, the run marker kept; the run completes", async () => {
+  /** A tracked run of issue #7, CEO-approved for finalization. */
+  const trackedRun = async (): Promise<Fixture> => {
     const fixture = await setup({ finalization: false });
-    const { harness, driven } = fixture;
     trackWorkScope(fixture, 7);
-    expect(harness.cp.tasks.workScope!.trackedIssues(driven.runId)).toEqual({ repositoryIdentity: driven.identity, issues: [7] });
-    await approveReviewedCandidateForFinalization(harness, driven);
+    expect(fixture.harness.cp.tasks.workScope!.trackedIssues(fixture.driven.runId)).toEqual({ repositoryIdentity: fixture.driven.identity, issues: [7] });
+    await approveReviewedCandidateForFinalization(fixture.harness, fixture.driven);
+    return fixture;
+  };
+  const LEGACY_BODY = (runId: string): string => `Automated daemon finalization for run ${runId}.\n\n<!-- acp-run:${runId} -->`;
+
+  it("a run tracking issue #7 opens its PR with the kernel's linkage, `Closes #7`, the run marker kept; the run completes", async () => {
+    const fixture = await trackedRun();
+    const { harness, driven } = fixture;
     const done = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
     expect(done.allowed, JSON.stringify(done)).toBe(true);
     expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
     expect(openedPrBodies(fixture)).toEqual([
-      `Automated daemon finalization for run ${driven.runId}.\n\nCloses #7\n\n<!-- acp-run:${driven.runId} -->`,
+      `Automated daemon finalization for run ${driven.runId}.\n\nCloses #7\n<!-- acp-run:${driven.runId} -->\n<!-- acp-linked-issues:7 -->`,
     ]);
   });
+
+  it("an open PR of the run that does not carry `Closes #7` is not accepted: PR_LINKAGE_MISSING, nothing merged", async () => {
+    const fixture = await trackedRun();
+    const { harness, github, driven } = fixture;
+    github.pulls.push({
+      number: 99,
+      head: { sha: driven.candidateHead, ref: WORK_BRANCH },
+      base: { sha: driven.baseHead, ref: "dev" },
+      merged: false,
+      state: "open",
+      html_url: "https://github.test/pull/99",
+      title: `ACP finalization: ${harness.cp.runs.require(driven.runId).goal}`,
+      body: LEGACY_BODY(driven.runId),
+    });
+    const refused = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
+    expect(github.mergeCount).toBe(0);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
+  });
+
+  for (const before of ["published", "published and prepared"] as const) {
+    it(`a tracked run ${before} before the upgrade finishes with the text it was published with: no RESOURCE_COLLISION`, async () => {
+      const fixture = await trackedRun();
+      const { harness, driven } = fixture;
+      // Before the upgrade, the finalizer's plan named no issue: what `plan()` derives.
+      const legacy = fixture.plan();
+      const published = await harness.cp.github.publishBranch(legacy.publish);
+      expect(published.allowed, JSON.stringify(published)).toBe(true);
+      if (before === "published and prepared") {
+        const prepared = await harness.cp.github.prPrepare(legacy.prepare);
+        expect(prepared.allowed, JSON.stringify(prepared)).toBe(true);
+      }
+      const done = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+      expect(done.allowed, JSON.stringify(done)).toBe(true);
+      expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+      expect(openedPrBodies(fixture)).toEqual([LEGACY_BODY(driven.runId)]);
+      expect(fixture.gitData.posts("refs")).toHaveLength(1);
+      expect(receiptsOf(fixture)).toHaveLength(1);
+    });
+  }
 
   it("a run that tracks no issue opens its PR with the body it always had", async () => {
     const fixture = await setup();
@@ -298,7 +346,7 @@ describe("#1345: the finalization PR closes the issues the run tracks on its own
     expect(harness.cp.tasks.workScope!.trackedIssues(driven.runId)).toBeNull();
     const done = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
     expect(done.allowed, JSON.stringify(done)).toBe(true);
-    expect(openedPrBodies(fixture)).toEqual([`Automated daemon finalization for run ${driven.runId}.\n\n<!-- acp-run:${driven.runId} -->`]);
+    expect(openedPrBodies(fixture)).toEqual([LEGACY_BODY(driven.runId)]);
   });
 });
 
