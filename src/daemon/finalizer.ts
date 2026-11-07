@@ -4,6 +4,7 @@ import type { ControlPlane } from "../app/control-plane.ts";
 import { NotificationKind } from "../ceo/production-gate.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { redact } from "../db/audit.ts";
 import { ArtifactKind, Role, RunKind, RunState, roleKeyFor } from "../domain/types.ts";
 import { currentBranch } from "../git/git.ts";
 import type { DaemonFinalizerAuthority } from "../guard/managed-write-guard.ts";
@@ -41,7 +42,8 @@ const FINALIZATION_LEASE_TTL_MS = 30 * 60_000;
  * retries: its first attempt is not one of them. Every refusal is counted durably, per failure and in total,
  * so an intervening different failure resets nothing; a failure whose fix is someone else's allows no retry
  * at all. Once a cap is reached nothing retries the run automatically, not the watchdog and not a daemon
- * start, and the owner of its fix is told once. It stays approved and is never FAILED for a spent budget.
+ * start, and the owner of its fix is told once. It stays approved and is never FAILED for a spent budget,
+ * except under a route that `endsAtCap` (#1189 §0, BOUNDED_CREDENTIAL_ROUTES): that one ends FAILED.
  */
 const FINALIZATION_RETRY_BASE_MS = 60_000;
 const FINALIZATION_RETRY_CEILING_MS = 60 * 60_000;
@@ -79,6 +81,8 @@ type PreMergeRoute =
       retries: number;
       owner: "CEO" | "OWNER";
       action: string;
+      /** At either cap the run ends FAILED, its approval void, instead of being handed off and held approved. */
+      endsAtCap?: true;
     };
 
 type RetryRoute = Extract<PreMergeRoute, { disposition: "RETRY" }>;
@@ -107,8 +111,6 @@ const REVISION_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
 const OWNER_ACTIONS: ReadonlyMap<ReasonCode, Pick<RetryRoute, "failureClass" | "owner" | "action">> =
   new Map<ReasonCode, Pick<RetryRoute, "failureClass" | "owner" | "action">>([
     [ReasonCode.HUMAN_GATE_UNSATISFIED, { failureClass: "OWNER_ACTION", owner: "OWNER", action: "record the owner decision the run's human gate requires for this candidate" }],
-    [ReasonCode.GITHUB_APP_PERMISSION_DENIED, { failureClass: "OWNER_ACTION", owner: "OWNER", action: "restore the GitHub App's permissions to an owner-approved grant shape" }],
-    [ReasonCode.TRUSTED_CREDENTIAL_UNAVAILABLE, { failureClass: "OWNER_ACTION", owner: "OWNER", action: "restore the daemon's GitHub App credential" }],
     [ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_STALE, { failureClass: "OWNER_ACTION", owner: "CEO", action: "re-enter with a CONFIRM of the same candidate" }],
     [ReasonCode.MERGE_CLAIM_INVALID, {
       failureClass: "AUTHORITY_RECOVERY", owner: "CEO",
@@ -118,13 +120,41 @@ const OWNER_ACTIONS: ReadonlyMap<ReasonCode, Pick<RetryRoute, "failureClass" | "
   ]);
 
 /**
+ * #1189 §0 — the daemon's GitHub credential or the App's grant: never a request that somebody act, and never a
+ * run held approved with no end. Each retry first asks the daemon's own credential store again
+ * (`credentialRecheck`). An unreadable credential can be momentary, so it is retried like any refusal, up to the
+ * cap; a grant that does not cover the call is deterministic, so it is re-checked once. At the bound the run ends
+ * FAILED with nothing merged and the CEO told once (`endAtBound`).
+ */
+const BOUNDED_CREDENTIAL_ROUTES: ReadonlyMap<ReasonCode, Omit<RetryRoute, "disposition" | "failureCause">> =
+  new Map<ReasonCode, Omit<RetryRoute, "disposition" | "failureCause">>([
+    [ReasonCode.TRUSTED_CREDENTIAL_UNAVAILABLE, {
+      failureClass: "TRANSIENT", retries: FINALIZATION_RETRY_CAP, owner: "CEO", endsAtCap: true,
+      action: "nothing in the candidate to fix: the daemon re-reads its own GitHub App credential before each retry, and if it is " +
+        "still not readable at the cap the run ends FAILED with nothing merged",
+    }],
+    [ReasonCode.GITHUB_APP_PERMISSION_DENIED, {
+      failureClass: "UNCLASSIFIED", retries: 1, owner: "CEO", endsAtCap: true,
+      action: "nothing in the candidate to fix: the daemon re-checks the GitHub App's grant once before its one retry, and if the " +
+        "grant still does not cover the call the run ends FAILED with nothing merged",
+    }],
+  ]);
+
+/**
+ * A count record written before BOUNDED_CREDENTIAL_ROUTES: one of its reasons handed to the owner with no retry
+ * (`failureRetryCap` 0). Such a run was held approved for good; it is due again, its earlier refusal counted.
+ */
+const heldForTheOwner = (failureCause: unknown, failureRetryCap: unknown): boolean =>
+  typeof failureCause === "string" && BOUNDED_CREDENTIAL_ROUTES.has(failureCause as ReasonCode) && failureRetryCap === 0;
+
+/**
  * #1189 B5 (CEO ruling 1) — stale base, conflict and a fixable check failure go back for revision; a
  * deterministic refusal someone else owns is handed to them; only an unrecoverable refusal whose
  * non-application GitHub confirmed ends the run; everything else, transient infrastructure first, is retried
  * with backoff up to a cap. The lists are narrow on purpose: an unknown refusal is retried and handed to the
  * CEO, never failed and never un-approved.
  */
-const classifyPreMergeRefusal = (kind: RunKind, failure: Decision<unknown>): PreMergeRoute => {
+export const classifyPreMergeRefusal = (kind: RunKind, failure: Decision<unknown>): PreMergeRoute => {
   const evidence = failure.evidence as Record<string, unknown>;
   // The pinned merge strategy is not a merge commit, the only one ACP sends (#1269): no revision of this
   // run's candidate changes its pinned contract. FAILED only on the kernel's read that the pull request is
@@ -142,6 +172,8 @@ const classifyPreMergeRefusal = (kind: RunKind, failure: Decision<unknown>): Pre
     : failure.reasonCode;
   const owned = OWNER_ACTIONS.get(cause);
   if (owned) return { disposition: "RETRY", failureCause: cause, retries: 0, ...owned };
+  const bounded = BOUNDED_CREDENTIAL_ROUTES.get(cause);
+  if (bounded) return { disposition: "RETRY", failureCause: cause, ...bounded };
   // A branch already published at another commit is never moved; the CTO publishes a new candidate on a new branch.
   const branchElsewhere = failure.reasonCode === ReasonCode.RESOURCE_COLLISION &&
     typeof evidence["expected"] === "string" && typeof evidence["observed"] === "string";
@@ -462,6 +494,9 @@ export class ApprovedRunFinalizer {
     const consumer = initial.kind === RunKind.CONTRACT_CHANGE ? this.cp.manifestGrants.consumerOf(runId) : null;
     let completed = false;
     try {
+      // #1189 §0 — a retry of a credential or permission refusal asks the daemon's own store again first.
+      const recheck = await this.credentialRecheck(runId, candidateDigest);
+      if (!recheck.allowed) return this.handleFailure(runId, attemptId, recheck);
       // Resolve every participant before planning or any remote write.
       for (const repository of this.cp.runs.repositoriesOf(runId)) {
         const inputs = this.cp.github.postMergeVerificationInputs(runId, repository.identity);
@@ -710,21 +745,23 @@ export class ApprovedRunFinalizer {
    * #1189 B5 — whether the daemon's sweep (at start and on every watchdog tick) may try this run now. A
    * refusal before any merge that the daemon retries waits out its backoff, across restarts; one that reached a
    * cap is not tried again automatically at all; every other run, and a run whose candidate changed since, is
-   * due.
+   * due. #1189 §0 — so is a run an earlier build held for the owner under a BOUNDED_CREDENTIAL_ROUTES reason
+   * (`heldForTheOwner`): it is retried or ended within that route's bound, its earlier refusal counted.
    */
   retryDue(runId: string): boolean {
     const run = this.cp.runs.get(runId);
     if (!run || (run.state !== RunState.CEO_APPROVED && run.state !== RunState.MERGING)) return true;
     const latest = this.latestRetryRecord(runId);
     if (!latest || latest.candidateSnapshotDigest !== this.cp.runs.currentCandidate(runId)) return true;
-    if (latest.retryNotBefore === null) return false;
+    if (latest.retryNotBefore === null) return heldForTheOwner(latest.failureCause, latest.failureRetryCap);
     return this.cp.clock.now().getTime() >= Date.parse(latest.retryNotBefore);
   }
 
   /**
    * #1189 B5 — a cap's notice that could not be enqueued (no CEO was bound to take it) is still owed. The sweep
    * asks for it on each pass over a run it does not retry; it is enqueued once a CEO is bound, and only once. The
-   * run itself is not retried for it, and while no CEO is bound nothing is attempted or recorded.
+   * run itself is not retried for it, and while no CEO is bound nothing is attempted or recorded. A hand-off an
+   * earlier build owed the owner (`heldForTheOwner`) is not sent: that run is retried within its bound instead.
    */
   deliverOwedHandOff(runId: string): void {
     const run = this.cp.runs.get(runId);
@@ -735,6 +772,7 @@ export class ApprovedRunFinalizer {
       const { candidateSnapshotDigest, delivered, limit, failureCause } = entry.evidence;
       if (entry.kind !== "FINALIZATION_HANDED_OFF" || candidateSnapshotDigest !== candidateDigest || delivered !== false ||
           (limit !== "FAILURE" && limit !== "CANDIDATE") || typeof failureCause !== "string" ||
+          heldForTheOwner(failureCause, entry.evidence["failureRetryCap"]) ||
           this.handedOff(runId, candidateDigest, limit, failureCause)) continue;
       const notice = Object.fromEntries(HAND_OFF_NOTICE_FIELDS.map((field) => [field, entry.evidence[field] ?? null]));
       const notified = this.cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, runId, { ...notice, whyItMatters: HAND_OFF_WHY });
@@ -1488,6 +1526,12 @@ export class ApprovedRunFinalizer {
       return failure as Decision<FinalizationResult>;
     }
 
+    // #1189 §0 — at a cap, a route that ends there ends the run FAILED. A held merge never takes such a route, and
+    // only a refusal the return takes ends it; a refused return is handed off below like any cap.
+    if (route.endsAtCap === true && heldMerge === null && this.endAtBound(runId, candidateDigest, failure, route, counted, limit)) {
+      return failure as Decision<FinalizationResult>;
+    }
+
     // A cap: nothing retries the run automatically any more, and the owner of the fix hears of it once (per
     // failure, and once for the candidate's total), which the hand-off record keeps across restarts. A notice
     // that could not be enqueued stays owed (`deliverOwedHandOff`).
@@ -1546,10 +1590,12 @@ export class ApprovedRunFinalizer {
   }
 
   /**
-   * The newest count record `refusedBeforeMerge` wrote for this run, or null: its candidate, and when it may be
-   * retried — null once a cap stopped the retries.
+   * The newest count record `refusedBeforeMerge` wrote for this run, or null: its candidate, the failure it
+   * counted and that failure's retry allowance, and when it may be retried — null once a cap stopped the retries.
    */
-  private latestRetryRecord(runId: string): { candidateSnapshotDigest: string; retryNotBefore: string | null } | null {
+  private latestRetryRecord(runId: string): {
+    candidateSnapshotDigest: string; retryNotBefore: string | null; failureCause: unknown; failureRetryCap: unknown;
+  } | null {
     const row = this.cp.db.get<{ kind: string; evidence_json: string }>(
       `SELECT kind, evidence_json FROM audit_events
         WHERE run_id = ? AND kind IN ('FINALIZATION_RETRY_SCHEDULED', 'FINALIZATION_RETRIES_EXHAUSTED')
@@ -1558,12 +1604,108 @@ export class ApprovedRunFinalizer {
     );
     if (!row) return null;
     const evidence = JSON.parse(row.evidence_json) as Record<string, unknown>;
-    const { candidateSnapshotDigest, retryNotBefore } = evidence;
+    const { candidateSnapshotDigest, retryNotBefore, failureCause, failureRetryCap } = evidence;
     if (typeof candidateSnapshotDigest !== "string") return null;
-    if (row.kind === "FINALIZATION_RETRIES_EXHAUSTED") return { candidateSnapshotDigest, retryNotBefore: null };
+    if (row.kind === "FINALIZATION_RETRIES_EXHAUSTED") return { candidateSnapshotDigest, retryNotBefore: null, failureCause, failureRetryCap };
     return typeof retryNotBefore === "string" && !Number.isNaN(Date.parse(retryNotBefore))
-      ? { candidateSnapshotDigest, retryNotBefore }
+      ? { candidateSnapshotDigest, retryNotBefore, failureCause, failureRetryCap }
       : null;
+  }
+
+  /**
+   * #1189 §0 — before retrying a credential or permission refusal of this candidate, the daemon's own trusted store
+   * is asked again, for the App installation and grant shape it is configured with: the credential through its
+   * loader (`availability`), the App's grant through its permission probe (`authenticate`). Nothing else is read,
+   * and no credential is substituted or grant widened. A loader that still cannot read it is the same refusal,
+   * named with the loader's reason; any other run, or any other refusal, is not re-checked here.
+   */
+  private async credentialRecheck(runId: string, candidateDigest: string): Promise<Decision<void>> {
+    const latest = this.latestRetryRecord(runId);
+    const cause = latest?.candidateSnapshotDigest === candidateDigest ? latest.failureCause : null;
+    if (cause === ReasonCode.TRUSTED_CREDENTIAL_UNAVAILABLE) {
+      const loaded = this.cp.credentials.availability();
+      if (loaded.allowed) return loaded;
+      return deny(ReasonCode.TRUSTED_CREDENTIAL_UNAVAILABLE, "the daemon's GitHub App credential is still not readable", {
+        runId, phase: "credential-recheck", loaderReasonCode: loaded.reasonCode,
+      });
+    }
+    if (cause === ReasonCode.GITHUB_APP_PERMISSION_DENIED) {
+      const probed = await this.cp.credentials.authenticate();
+      if (probed.allowed) return probed;
+      return deny(probed.reasonCode, probed.message, { ...probed.evidence, phase: "permission-recheck" });
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * #1189 §0 — a refusal under a route that `endsAtCap`, at a cap: the run leaves approval through the return an
+   * unrecoverable refusal takes (CEO_APPROVAL_INVALIDATED, the candidate invalidated, → REVISION_REQUIRED →
+   * FAILED), which refuses while the run holds any merge receipt, so nothing merged. Its count is recorded as the
+   * cap's, marked FAILED, and the CEO is told once, on the ordinary notice path, with the reason, the refused
+   * attempts and the refusal's evidence. A return that is refused leaves the run approved, and false.
+   */
+  private endAtBound(
+    runId: string,
+    candidateDigest: string,
+    failure: Decision<unknown>,
+    route: RetryRoute,
+    counted: Record<string, unknown> & { attemptId: string },
+    limit: "FAILURE" | "CANDIDATE",
+  ): boolean {
+    const reason = failure.allowed ? "" : failure.message;
+    const returned = this.cp.runs.returnApprovedCandidate(runId, {
+      candidateSnapshotDigest: candidateDigest,
+      attemptId: counted.attemptId,
+      reasonCode: failure.reasonCode,
+      reason: `${failure.reasonCode}: ${reason}`,
+      unrecoverable: true,
+    });
+    if (!returned.allowed) {
+      this.cp.audit.record({
+        kind: "CEO_APPROVAL_INVALIDATION_REFUSED",
+        runId,
+        reasonCode: returned.reasonCode,
+        evidence: {
+          attemptId: counted.attemptId, candidateSnapshotDigest: candidateDigest, failureReasonCode: failure.reasonCode, detail: returned.message,
+        },
+      });
+      return false;
+    }
+    this.cp.audit.record({
+      kind: "FINALIZATION_RETRIES_EXHAUSTED",
+      runId,
+      reasonCode: failure.reasonCode,
+      evidence: { ...counted, limit, outcome: "FAILED", merged: false },
+    });
+    const attempts = this.cp.audit.forRun(runId)
+      .filter((entry) => entry.kind === "FINALIZATION_ATTEMPT_FAILED" && entry.evidence["candidateSnapshotDigest"] === candidateDigest)
+      .map((entry) => entry.evidence["attemptId"]);
+    const evidence = Object.fromEntries(Object.entries(failure.evidence)
+      .filter(([, value]) => value === null || typeof value === "string" || typeof value === "boolean" ||
+        (typeof value === "number" && Number.isFinite(value)))
+      .map(([key, value]) => [key, typeof value === "string" ? value.slice(0, 200) : value]));
+    this.cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, runId, {
+      candidateSnapshotDigest: candidateDigest,
+      failureReasonCode: failure.reasonCode,
+      failureClass: route.failureClass,
+      failureCause: route.failureCause,
+      limit,
+      outcome: "FAILED",
+      merged: false,
+      owner: "CEO",
+      action: "nothing is left to do for this run: it ended FAILED with nothing merged and its approval void; " +
+        "a new run is needed only if the change is still wanted",
+      blocker: blockerOf(failure),
+      reason,
+      refusals: counted["refusals"],
+      failureRetryCap: counted["failureRetryCap"],
+      retries: counted["retries"],
+      retryCap: FINALIZATION_RETRY_CAP,
+      attempts,
+      evidence: redact(evidence),
+      whyItMatters: "a CEO-approved run did not merge: the daemon's GitHub credential or its App's grant was still refused at the retry bound",
+    });
+    return true;
   }
 
   /**
