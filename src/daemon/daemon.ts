@@ -2399,7 +2399,8 @@ export class Daemon {
    * reached its retry cap is not tried again (`ApprovedRunFinalizer.retryDue`): both are durable, so a
    * restart neither shortens the wait nor restarts the count. Only an explicit `finalizeApprovedRun` (the one a
    * CONFIRM triggers) skips the wait; its refusals still count. A cap notice no CEO could take is still owed,
-   * and a pass over a run it does not retry sends it once a CEO is bound.
+   * and a pass over a run it does not retry sends it once a CEO is bound; so is a FAILED run's notice, which
+   * every pass sends once a CEO is bound (`ApprovedRunFinalizer.deliverOwedFailedNotices`).
    */
   async resumeApprovedRuns(): Promise<string[]> {
     const resumed: string[] = [];
@@ -2419,6 +2420,7 @@ export class Daemon {
         }
       }
     }
+    this.#finalizer.deliverOwedFailedNotices();
     // #1189 — a block the finalizer will not resume is routed to the CEO, once per finalization attempt;
     // the run, its merges and its compensation plan stay as recorded.
     if (stalled.length > 0) {

@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
 
-import { acpError } from "../../src/core/errors.ts";
+import { acpError, deny } from "../../src/core/errors.ts";
 import { sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
@@ -1096,6 +1096,221 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     for (const kind of ["CEO_APPROVAL_INVALIDATED", "FINALIZATION_HANDED_OFF", "FINALIZATION_ATTEMPT_FAILED"]) {
       expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === kind), kind).toHaveLength(0);
     }
+    await daemon.stop();
+  });
+});
+
+/**
+ * #1189 — a run the finalizer ends FAILED tells the CEO once. A notice no CEO could take then (none bound) is kept
+ * owed, durably, and the finalization sweep sends it, once, to the CEO binding current when one is bound. Sending it
+ * is a notice only: the run stays as its failure left it.
+ */
+describe("#1189 — a FAILED run's CEO notice no CEO could take is owed until a CEO is bound", () => {
+  const OWED = "FINALIZATION_FAILED_NOTICE";
+  const restartedDaemon = (fixture: Fixture): Daemon =>
+    new Daemon(fixture.harness.cp, { stateDir: tempDir("acp-b5-"), watchdogIntervalMs: 24 * 60 * MINUTE });
+
+  /** The unrecoverable return (#1380): a pinned fast_forward contract ends the run FAILED at its first attempt. */
+  const failedWithNoCeo = async (): Promise<Fixture> => {
+    const fixture = await approved({ pinnedMergeStrategy: "fast_forward" });
+    expect(fixture.harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "the CEO seat is vacated").allowed).toBe(true);
+    expect((await fixture.daemon.start()).allowed).toBe(true);
+    expect(fixture.harness.cp.runs.require(fixture.driven.runId).state).toBe(RunState.FAILED);
+    return fixture;
+  };
+
+  const failureNotices = (fixture: Fixture) =>
+    fixture.harness.cp.db.all<{ target_session_id: string; binding_generation: number; payload_json: string }>(
+      "SELECT target_session_id, binding_generation, payload_json FROM outbox WHERE run_id = ? AND kind = 'CEO_NOTIFICATION' ORDER BY created_at, rowid",
+      [fixture.driven.runId],
+    ).map((row) => ({ target: row.target_session_id, generation: row.binding_generation, payload: JSON.parse(row.payload_json) as Record<string, unknown> }))
+      .filter((notice) => notice.payload.notification === "CRITICAL_SYSTEM_FAILURE");
+
+  const owed = (fixture: Fixture): unknown[] =>
+    fixture.harness.cp.audit.forRun(fixture.driven.runId).filter((entry) => entry.kind === OWED).map((entry) => entry.evidence.delivered);
+
+  /** The run as its failure left it. */
+  const runAsLeft = (fixture: Fixture) => {
+    const run = fixture.harness.cp.runs.require(fixture.driven.runId);
+    return { state: run.state, stateReason: run.stateReason, transitions: transitions(fixture), attempts: failedAttempts(fixture) };
+  };
+
+  const sweep = async (fixture: Fixture, daemon: Daemon, times = 1): Promise<void> => {
+    for (let pass = 0; pass < times; pass += 1) {
+      fixture.harness.clock.advance(60 * MINUTE);
+      await daemon.resumeApprovedRuns();
+    }
+  };
+
+  it("a run that fails while no CEO is bound still ends FAILED; its notice is owed, and no sweep sends or retries anything while no CEO is bound", async () => {
+    const fixture = await failedWithNoCeo();
+    const { harness, driven, daemon } = fixture;
+    expect(failureNotices(fixture)).toHaveLength(0);
+    expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CEO_NOTIFICATION_BLOCKED")).toHaveLength(1);
+    expect(owed(fixture)).toEqual([false]);
+    const left = runAsLeft(fixture);
+    await sweep(fixture, daemon, 3);
+    expect(failureNotices(fixture)).toHaveLength(0);
+    expect(owed(fixture)).toEqual([false]);
+    expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CEO_NOTIFICATION_BLOCKED")).toHaveLength(1);
+    expect(runAsLeft(fixture)).toEqual(left);
+    await daemon.stop();
+  });
+
+  it("once a CEO is bound the next sweep sends it to that binding exactly once, and the run is left as it was", async () => {
+    const fixture = await failedWithNoCeo();
+    const { harness, driven, daemon } = fixture;
+    const left = runAsLeft(fixture);
+    const ceoSessionId = bindCeo(harness);
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    await sweep(fixture, daemon, 3);
+    const notices = failureNotices(fixture);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ target: ceoSessionId, generation: ceo.bindingGeneration });
+    expect(notices[0]!.payload).toMatchObject({
+      runId: driven.runId, candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      failureReasonCode: ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED, failureClass: "UNRECOVERABLE", owner: "CEO",
+      action: expect.stringContaining("ended FAILED"), blocker: expect.stringMatching(/^MERGE_BRANCH_PROFILE_UNSATISFIED: /),
+      reason: expect.any(String), whyItMatters: expect.any(String),
+    });
+    expect(owed(fixture)).toEqual([false, true]);
+    expect(runAsLeft(fixture)).toEqual(left);
+    expect(fixture.github.mergeCount).toBe(0);
+    expect(outboxOf(fixture, "REVISION_REQUEST")).toHaveLength(0);
+    await daemon.stop();
+  });
+
+  it("a restart while the notice is owed keeps it owed: the restarted daemon sends it once a CEO is bound, once", async () => {
+    const fixture = await failedWithNoCeo();
+    const { harness } = fixture;
+    await fixture.daemon.stop();
+    const restarted = restartedDaemon(fixture);
+    expect((await restarted.start()).allowed).toBe(true);
+    expect(failureNotices(fixture)).toHaveLength(0);
+    expect(owed(fixture)).toEqual([false]);
+    await restarted.stop();
+    const ceoSessionId = bindCeo(harness);
+    const again = restartedDaemon(fixture);
+    expect((await again.start()).allowed).toBe(true);
+    await sweep(fixture, again, 3);
+    expect(failureNotices(fixture).map((notice) => notice.target)).toEqual([ceoSessionId]);
+    expect(owed(fixture)).toEqual([false, true]);
+    expect(harness.cp.runs.require(fixture.driven.runId).state).toBe(RunState.FAILED);
+    await again.stop();
+  });
+
+  it("a binding replaced before the notice is sent: it goes to the new binding only, never the revoked one", async () => {
+    const fixture = await failedWithNoCeo();
+    const { harness, daemon } = fixture;
+    const revokedSessionId = bindCeo(harness);
+    const revokedGeneration = harness.cp.bindings.active(roleKeyFor(Role.CEO))!.bindingGeneration;
+    expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "the CEO is replaced").allowed).toBe(true);
+    const currentSessionId = bindCeo(harness);
+    const current = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    expect(current.bindingGeneration).toBeGreaterThan(revokedGeneration);
+    await sweep(fixture, daemon, 3);
+    expect(failureNotices(fixture)).toEqual([expect.objectContaining({ target: currentSessionId, generation: current.bindingGeneration })]);
+    expect(harness.cp.db.all("SELECT 1 FROM outbox WHERE target_session_id = ?", [revokedSessionId])).toHaveLength(0);
+    expect(owed(fixture)).toEqual([false, true]);
+    await daemon.stop();
+  });
+
+  it("repeated sweeps and a restart after it was sent send nothing more", async () => {
+    const fixture = await failedWithNoCeo();
+    const { harness, daemon } = fixture;
+    bindCeo(harness);
+    await sweep(fixture, daemon, 5);
+    await daemon.stop();
+    const restarted = restartedDaemon(fixture);
+    expect((await restarted.start()).allowed).toBe(true);
+    await sweep(fixture, restarted, 5);
+    expect(failureNotices(fixture)).toHaveLength(1);
+    expect(owed(fixture)).toEqual([false, true]);
+    await restarted.stop();
+  });
+
+  it("a crash between the send and its record leaves it owed, with nothing sent: the next sweep sends it once", async () => {
+    const fixture = await failedWithNoCeo();
+    const { harness, daemon } = fixture;
+    bindCeo(harness);
+    const record = harness.cp.audit.record.bind(harness.cp.audit);
+    let crash = true;
+    const recorder = vi.spyOn(harness.cp.audit, "record").mockImplementation((entry) => {
+      if (crash && entry.kind === OWED && (entry.evidence as Record<string, unknown> | undefined)?.["delivered"] === true) {
+        crash = false;
+        throw new Error("the daemon died between the send and its record");
+      }
+      return record(entry);
+    });
+    await sweep(fixture, daemon);
+    expect(crash).toBe(false);
+    expect(failureNotices(fixture)).toHaveLength(0);
+    expect(owed(fixture)).toEqual([false]);
+    await sweep(fixture, daemon, 3);
+    expect(failureNotices(fixture)).toHaveLength(1);
+    expect(owed(fixture)).toEqual([false, true]);
+    recorder.mockRestore();
+    await daemon.stop();
+  });
+
+  it.each([
+    ["no CEO is bound", false],
+    ["a CEO is bound", true],
+  ] as const)("a crash right after the run ended FAILED, while %s, loses nothing: the notice was written with the run's end", async (_label, bound) => {
+    const fixture = await approved({ pinnedMergeStrategy: "fast_forward" });
+    const { harness, driven, daemon } = fixture;
+    if (!bound) expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "the CEO seat is vacated").allowed).toBe(true);
+    const real = harness.cp.runs.returnApprovedCandidate.bind(harness.cp.runs);
+    const died = vi.spyOn(harness.cp.runs, "returnApprovedCandidate").mockImplementation((runId, input) => {
+      const returned = real(runId, input);
+      if (returned.allowed && returned.value.state === RunState.FAILED) throw new Error("the daemon died right after the run ended FAILED");
+      return returned;
+    });
+    await daemon.start();
+    died.mockRestore();
+    await daemon.stop();
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.FAILED);
+    const ceoSessionId = bound ? harness.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId : bindCeo(harness);
+    const restarted = restartedDaemon(fixture);
+    expect((await restarted.start()).allowed).toBe(true);
+    await sweep(fixture, restarted, 3);
+    expect(failureNotices(fixture).map((notice) => notice.target)).toEqual([ceoSessionId]);
+    expect(failureNotices(fixture)[0]!.payload).toMatchObject({ failureReasonCode: ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED, failureClass: "UNRECOVERABLE" });
+    expect(owed(fixture)).toEqual(bound ? [] : [false, true]);
+    await restarted.stop();
+  });
+
+  it("a notice the outbox keeps refusing stays owed without a refusal record on every sweep, and is sent once the outbox takes it", async () => {
+    const fixture = await failedWithNoCeo();
+    const { harness, driven, daemon } = fixture;
+    bindCeo(harness);
+    const blocked = () => harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CEO_NOTIFICATION_BLOCKED").length;
+    const before = blocked();
+    const enqueue = harness.cp.outbox.enqueue.bind(harness.cp.outbox);
+    const refusing = vi.spyOn(harness.cp.outbox, "enqueue").mockImplementation((message) =>
+      message.kind === MessageKind.CEO_NOTIFICATION ? deny(ReasonCode.OUTBOX_TARGET_NOT_CURRENT, "the outbox refused the notice", {}) : enqueue(message));
+    await sweep(fixture, daemon, 3);
+    expect(failureNotices(fixture)).toHaveLength(0);
+    expect(blocked()).toBe(before);
+    expect(owed(fixture)).toEqual([false]);
+    refusing.mockRestore();
+    await sweep(fixture, daemon, 3);
+    expect(failureNotices(fixture)).toHaveLength(1);
+    expect(owed(fixture)).toEqual([false, true]);
+    await daemon.stop();
+  });
+
+  it("a CEO already bound when the run fails is told at once, as before, with no owed record", async () => {
+    const fixture = await approved({ pinnedMergeStrategy: "fast_forward" });
+    const { harness, driven, daemon } = fixture;
+    expect((await daemon.start()).allowed).toBe(true);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.FAILED);
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    expect(failureNotices(fixture)).toEqual([expect.objectContaining({ target: ceo.sessionId, generation: ceo.bindingGeneration })]);
+    await sweep(fixture, daemon, 3);
+    expect(failureNotices(fixture)).toHaveLength(1);
+    expect(owed(fixture)).toEqual([]);
+    expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CEO_NOTIFICATION_BLOCKED")).toHaveLength(0);
     await daemon.stop();
   });
 });

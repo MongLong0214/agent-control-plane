@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 
 import type { ControlPlane } from "../app/control-plane.ts";
 import { NotificationKind } from "../ceo/production-gate.ts";
-import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
+import { redactCredentialShapes } from "../core/credential-shapes.ts";
+import { type Decision, acpError, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { redact } from "../db/audit.ts";
 import { ArtifactKind, Role, RunKind, RunState, roleKeyFor } from "../domain/types.ts";
@@ -64,6 +65,30 @@ const HAND_OFF_NOTICE_FIELDS = [
   "candidateSnapshotDigest", "failureReasonCode", "failureClass", "failureCause", "limit", "owner", "action", "blocker",
   "retries", "retryCap", "reason",
 ] as const;
+
+/**
+ * #1189 — a FAILED run's CEO notice that could not be enqueued when the run ended (no CEO bound, or the outbox
+ * refused it) is kept owed in this record: the notice, with `delivered: false`, as a cap's hand-off is kept
+ * (`deliverOwedHandOff`). Once the sweep has sent it, a second record with `delivered: true` names the first
+ * (`owedEventId`). A notice enqueued at once writes none.
+ */
+const FAILED_NOTICE = "FINALIZATION_FAILED_NOTICE";
+
+/**
+ * #1189 — what a FAILED notice's owed record keeps when the audit log refuses the notice's own text (a refusal
+ * message holding a credential shape, say): the failure's codes, its counts and ACP's own words, with the blocker's
+ * shapes redacted. The refusal's free text (`reason`, `evidence`) and the attempt ids are left out.
+ */
+const MINIMAL_FAILED_NOTICE_FIELDS = [
+  "candidateSnapshotDigest", "failureReasonCode", "failureClass", "failureCause", "limit", "outcome", "merged", "owner",
+  "action", "refusals", "failureRetryCap", "retries", "retryCap", "whyItMatters",
+] as const;
+
+const minimalFailedNotice = (notice: Record<string, unknown>): Record<string, unknown> => ({
+  ...Object.fromEntries(MINIMAL_FAILED_NOTICE_FIELDS.filter((field) => notice[field] !== undefined).map((field) => [field, notice[field]])),
+  blocker: redactCredentialShapes(String(notice["blocker"] ?? "")).slice(0, 200),
+  detailWithheld: true,
+});
 
 /**
  * What becomes of an approved run whose finalization was refused before any merge receipt existed. A retried
@@ -786,6 +811,59 @@ export class ApprovedRunFinalizer {
     }
   }
 
+  /**
+   * #1189 — every FAILED run's notice still owed (`notifyFailed`) is sent once a CEO is bound, through the same
+   * notice path: to the CEO binding current then, under the same payload key. Its `delivered: true` record is
+   * written in the enqueue's transaction, so a crash between them leaves it owed with nothing queued, and a send
+   * repeated after an enqueue that did commit finds that outbox row. It is a notice only: the run is left as it
+   * is. While no CEO is bound nothing is attempted or recorded, and a pass the outbox refuses leaves it owed and
+   * writes nothing, its refusal rolled back (the first refusal, when the run ended, is on record).
+   */
+  deliverOwedFailedNotices(): void {
+    if (!this.cp.bindings.active(roleKeyFor(Role.CEO))) return;
+    const owed = this.cp.db.all<{ event_id: number; run_id: string; evidence_json: string }>(
+      `SELECT event_id, run_id, evidence_json FROM audit_events AS owed
+        WHERE kind = ? AND json_extract(evidence_json, '$.delivered') = 0
+          AND NOT EXISTS (SELECT 1 FROM audit_events AS sent WHERE sent.run_id = owed.run_id AND sent.kind = owed.kind
+            AND json_extract(sent.evidence_json, '$.owedEventId') = owed.event_id)
+        ORDER BY event_id`,
+      [FAILED_NOTICE],
+    );
+    for (const entry of owed) {
+      if (this.cp.runs.get(entry.run_id)?.state !== RunState.FAILED) continue;
+      const { delivered: _delivered, ...notice } = JSON.parse(entry.evidence_json) as Record<string, unknown>;
+      try {
+        this.cp.db.txDecision((): Decision<void> => {
+          const notified = this.cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, entry.run_id, notice);
+          if (!notified.allowed) return notified;
+          this.cp.audit.record({ kind: FAILED_NOTICE, runId: entry.run_id, evidence: { delivered: true, owedEventId: entry.event_id } });
+          return allow(ReasonCode.OK, undefined);
+        });
+      } catch {
+        // Rolled back with its record: still owed, and the next pass sends it.
+      }
+    }
+  }
+
+  /**
+   * #1189 — a FAILED run's notice to the CEO, enqueued at once as before, in the transaction that ends the run
+   * (`returnApprovedCandidate`'s `onFailed`). One that could not be (no CEO bound, or the outbox refused it) is
+   * kept owed there instead, for `deliverOwedFailedNotices`, minimal (`minimalFailedNotice`) if the audit log refuses
+   * its text; the run never waits on it.
+   */
+  private notifyFailed(runId: string, notice: Record<string, unknown>): void {
+    this.cp.db.tx(() => {
+      const notified = this.cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, runId, notice);
+      if (notified.allowed) return;
+      const owed = { kind: FAILED_NOTICE, runId, reasonCode: notified.reasonCode };
+      if (this.cp.audit.record({ ...owed, evidence: { ...notice, delivered: false } }).allowed) return;
+      // The audit log would not keep the notice's own text: the obligation is kept without it. A refusal of that
+      // too is a fault, and rolls the run's end back with it.
+      const kept = this.cp.audit.record({ ...owed, evidence: { ...minimalFailedNotice(notice), delivered: false } });
+      if (!kept.allowed) throw acpError(kept.reasonCode, "the FAILED run's CEO notice could not be kept owed", { runId });
+    });
+  }
+
   private wasPostMergeResumed(runId: string): boolean {
     return this.cp.audit.forRun(runId).some((entry) => entry.kind === "FINALIZATION_POST_MERGE_RESUMED");
   }
@@ -1446,29 +1524,31 @@ export class ApprovedRunFinalizer {
     });
     if (route.disposition !== "RETRY") {
       const unrecoverable = route.disposition === "UNRECOVERABLE";
+      const notice = {
+        candidateSnapshotDigest: candidateDigest,
+        failureReasonCode: failure.reasonCode,
+        failureClass: route.disposition,
+        owner: "CEO",
+        action: unrecoverable
+          ? "the run ended FAILED and its approval is void; start a new run if the change is still wanted"
+          : "dispatch the run again so a current CTO revises it; its approval is void",
+        blocker: blockerOf(failure),
+        reason: failure.message,
+        whyItMatters: "a CEO-approved run did not merge, and nothing moves it without this",
+      };
       const returned = this.cp.runs.returnApprovedCandidate(runId, {
         candidateSnapshotDigest: candidateDigest,
         attemptId,
         reasonCode: failure.reasonCode,
         reason: `${failure.reasonCode}: ${failure.message}`,
         unrecoverable,
+        onFailed: () => this.notifyFailed(runId, notice),
       });
       if (returned.allowed) {
-        // FAILED, or a revision with no current owner to take it: the CEO hears of it. A revision the CTO
-        // took reaches the CEO again as its new candidate's review.
-        if (returned.value.state !== RunState.ACTIVE) {
-          this.cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, runId, {
-            candidateSnapshotDigest: candidateDigest,
-            failureReasonCode: failure.reasonCode,
-            failureClass: route.disposition,
-            owner: "CEO",
-            action: unrecoverable
-              ? "the run ended FAILED and its approval is void; start a new run if the change is still wanted"
-              : "dispatch the run again so a current CTO revises it; its approval is void",
-            blocker: blockerOf(failure),
-            reason: failure.message,
-            whyItMatters: "a CEO-approved run did not merge, and nothing moves it without this",
-          });
+        // FAILED (told with the run's end, `onFailed`), or a revision with no current owner to take it: the CEO
+        // hears of it. A revision the CTO took reaches the CEO again as its new candidate's review.
+        if (returned.value.state !== RunState.ACTIVE && returned.value.state !== RunState.FAILED) {
+          this.cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, runId, notice);
         }
         return failure as Decision<FinalizationResult>;
       }
@@ -1641,8 +1721,9 @@ export class ApprovedRunFinalizer {
    * #1189 §0 — a refusal under a route that `endsAtCap`, at a cap: the run leaves approval through the return an
    * unrecoverable refusal takes (CEO_APPROVAL_INVALIDATED, the candidate invalidated, → REVISION_REQUIRED →
    * FAILED), which refuses while the run holds any merge receipt, so nothing merged. Its count is recorded as the
-   * cap's, marked FAILED, and the CEO is told once, on the ordinary notice path, with the reason, the refused
-   * attempts and the refusal's evidence. A return that is refused leaves the run approved, and false.
+   * cap's, marked FAILED, and the CEO is told once, on the ordinary notice path (`notifyFailed`, owed while no CEO
+   * can take it), with the reason, the refused attempts and the refusal's evidence. A return that is refused leaves
+   * the run approved, and false.
    */
   private endAtBound(
     runId: string,
@@ -1653,30 +1734,6 @@ export class ApprovedRunFinalizer {
     limit: "FAILURE" | "CANDIDATE",
   ): boolean {
     const reason = failure.allowed ? "" : failure.message;
-    const returned = this.cp.runs.returnApprovedCandidate(runId, {
-      candidateSnapshotDigest: candidateDigest,
-      attemptId: counted.attemptId,
-      reasonCode: failure.reasonCode,
-      reason: `${failure.reasonCode}: ${reason}`,
-      unrecoverable: true,
-    });
-    if (!returned.allowed) {
-      this.cp.audit.record({
-        kind: "CEO_APPROVAL_INVALIDATION_REFUSED",
-        runId,
-        reasonCode: returned.reasonCode,
-        evidence: {
-          attemptId: counted.attemptId, candidateSnapshotDigest: candidateDigest, failureReasonCode: failure.reasonCode, detail: returned.message,
-        },
-      });
-      return false;
-    }
-    this.cp.audit.record({
-      kind: "FINALIZATION_RETRIES_EXHAUSTED",
-      runId,
-      reasonCode: failure.reasonCode,
-      evidence: { ...counted, limit, outcome: "FAILED", merged: false },
-    });
     const attempts = this.cp.audit.forRun(runId)
       .filter((entry) => entry.kind === "FINALIZATION_ATTEMPT_FAILED" && entry.evidence["candidateSnapshotDigest"] === candidateDigest)
       .map((entry) => entry.evidence["attemptId"]);
@@ -1684,7 +1741,7 @@ export class ApprovedRunFinalizer {
       .filter(([, value]) => value === null || typeof value === "string" || typeof value === "boolean" ||
         (typeof value === "number" && Number.isFinite(value)))
       .map(([key, value]) => [key, typeof value === "string" ? value.slice(0, 200) : value]));
-    this.cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, runId, {
+    const notice = {
       candidateSnapshotDigest: candidateDigest,
       failureReasonCode: failure.reasonCode,
       failureClass: route.failureClass,
@@ -1704,7 +1761,35 @@ export class ApprovedRunFinalizer {
       attempts,
       evidence: redact(evidence),
       whyItMatters: "a CEO-approved run did not merge: the daemon's GitHub credential or its App's grant was still refused at the retry bound",
+    };
+    const returned = this.cp.runs.returnApprovedCandidate(runId, {
+      candidateSnapshotDigest: candidateDigest,
+      attemptId: counted.attemptId,
+      reasonCode: failure.reasonCode,
+      reason: `${failure.reasonCode}: ${reason}`,
+      unrecoverable: true,
+      // The cap's count and the CEO's notice are written with the run's end.
+      onFailed: () => {
+        this.cp.audit.record({
+          kind: "FINALIZATION_RETRIES_EXHAUSTED",
+          runId,
+          reasonCode: failure.reasonCode,
+          evidence: { ...counted, limit, outcome: "FAILED", merged: false },
+        });
+        this.notifyFailed(runId, notice);
+      },
     });
+    if (!returned.allowed) {
+      this.cp.audit.record({
+        kind: "CEO_APPROVAL_INVALIDATION_REFUSED",
+        runId,
+        reasonCode: returned.reasonCode,
+        evidence: {
+          attemptId: counted.attemptId, candidateSnapshotDigest: candidateDigest, failureReasonCode: failure.reasonCode, detail: returned.message,
+        },
+      });
+      return false;
+    }
     return true;
   }
 

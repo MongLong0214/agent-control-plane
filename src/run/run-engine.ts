@@ -128,6 +128,11 @@ export interface ApprovedCandidateReturn {
   reasonCode: ReasonCode;
   reason: string;
   unrecoverable: boolean;
+  /**
+   * #1189 — written in the return's transaction once the run is FAILED (the finalizer's CEO notice, or its owed
+   * record), so a crash after the run ended cannot lose it. A throw rolls the whole return back.
+   */
+  onFailed?: () => void;
 }
 
 export interface CreateRunInput {
@@ -1659,7 +1664,11 @@ export class RunEngine {
       this.invalidateCandidateInTx(runId, input.reason, evidence);
       const revision = this.transition(runId, RunState.REVISION_REQUIRED, input.reason, evidence);
       if (!revision.allowed) return revision;
-      if (input.unrecoverable) return this.transition(runId, RunState.FAILED, input.reason, evidence);
+      if (input.unrecoverable) {
+        const failed = this.transition(runId, RunState.FAILED, input.reason, evidence);
+        if (failed.allowed) input.onFailed?.();
+        return failed;
+      }
       if (!run.ownerSessionId || run.ownerBindingGeneration == null || !run.ownerRoleKey ||
           !this.assertOwner(runId, run.ownerSessionId, run.ownerBindingGeneration).allowed) {
         return allow(ReasonCode.OK, this.require(runId));
