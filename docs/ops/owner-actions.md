@@ -1,6 +1,6 @@
 # Owner actions — prepared up to the line
 
-Four items need the owner. Each is prepared as far as it can be without them; what remains is
+Three items need the owner (§2–§4); §1 is a recovery step needed only if the reviewer's sign-in stops working. Each is prepared as far as it can be without them; what remains is
 stated as commands rather than description. Ordered by what they unblock.
 
 Every path and variable below was read out of the code, not inferred. Where I am recommending
@@ -8,29 +8,32 @@ rather than reporting a requirement, it says so.
 
 ---
 
-## 1. Reviewer credential scope — blocks the first lifecycle and #241
+## 1. Reviewer credential scope — in place; the owner is needed only if its sign-in stops working
 
-### Why it is needed
+The reviewer's credential scope exists, and blind reviews have run under it since 2026-11-01.
+Nothing waits on this item. It stays here as the recovery step for the one case that needs the
+owner: a blind review refused because the reviewer's own sign-in is no longer accepted.
+
+### Why the reviewer has its own scope
 
 A blind reviewer runs under `tools: "none"`, which is `(deny process-exec*)` with an allowlist
 of the provider binary, node and `/usr/bin/env`. The Claude CLI reads its OAuth credential by
-spawning `/usr/bin/security` against the login Keychain, so a confined reviewer dies:
+spawning `/usr/bin/security` against the login Keychain, so a confined reviewer reading the
+ordinary credential dies:
 
     EPERM: operation not permitted, posix_spawn 'security'
 
 The run then fails `EVIDENCE_MISSING`. The credential has to live somewhere the reviewer is
 allowed to *read*, rather than somewhere it must *spawn* to reach.
 
-### Command
+### Where it lives
 
-    CLAUDE_CONFIG_DIR="$HOME/.agent-control-plane/reviewer/claude" claude
-    # then: /login    (and /exit once it reports authenticated)
-
-### What it creates
-
-`~/.agent-control-plane/reviewer/claude/` containing `.credentials.json` and `.claude.json`.
-Those three paths are exactly what `claudeCredentialPaths()` hands the seatbelt profile as the
-reviewer's readable credential scope (`claudeCredentialPaths` in `src/runtime/cli-adapters.ts`).
+In the reviewer's own Claude config directory, `ACP_CLAUDE_REVIEWER_CONFIG_DIR`. The installed
+launcher derives it from `ACP_REVIEWER_ROOT` when it is not set, outside the daemon state tree
+that the reviewer seatbelt denies; an explicit value in the launchd environment still wins. The
+comment above that export in `deploy/install-launchd.sh` gives the reasoning, and
+`claudeCredentialPaths` in `src/runtime/cli-adapters.ts` is what hands the directory to the
+seatbelt profile as the reviewer's readable credential scope. Read the location there, not here.
 
 ### Which identity
 
@@ -47,47 +50,19 @@ means the reviewer and the producers share a rate-limit pool, so reviewer starva
 producer starvation become the same event. That is an availability argument, not an isolation
 one — CP-HI-04 is about role separation within a run, which the directory already gives.
 
-### Where it applies
+### If the reviewer's sign-in stops working
 
-**Precondition: this machine has no daemon installed.** No launcher, no `acp` plist, no
-`agentcpd` process — checked, not assumed. Installing it is a separate step owned by the CTO,
-and authenticating does not depend on it. Do the login; the daemon comes after.
+Only then: sign in again into the same directory, with `ACP_CLAUDE_REVIEWER_CONFIG_DIR` set to
+the value the installed launcher exports.
 
-Once a daemon exists, nothing further is needed — as of `9e970f2` the launcher derives it:
+    CLAUDE_CONFIG_DIR="$ACP_CLAUDE_REVIEWER_CONFIG_DIR" claude
+    # then: /login    (and /exit once it reports authenticated)
 
-    export ACP_CLAUDE_REVIEWER_CONFIG_DIR="${ACP_CLAUDE_REVIEWER_CONFIG_DIR:-$ACP_STATE_DIR/reviewer/claude}"
+### How to tell it works
 
-So authenticating into the path above is sufficient; the daemon already looks there. An
-explicit `ACP_CLAUDE_REVIEWER_CONFIG_DIR` in the launchd environment still wins if the scope
-must live elsewhere.
-
-Before `9e970f2` the launcher exported neither variable, so setting it in a shell had no
-effect. If the daemon is running from an older launcher, reinstall it first:
-
-    bash deploy/install-launchd.sh install --app-root "$PWD" --node "$(command -v node)"
-
-### Verification — exits 0 when done
-
-The owner's half, which is all that is being asked for here:
-
-    test -s "$HOME/.agent-control-plane/reviewer/claude/.credentials.json" \
-      && echo "reviewer credential present"
-
-**Do not include the launcher in this check.** An earlier version of this document did, and on
-a machine with no daemon that fails whatever the owner does — reporting "cannot determine" in
-the shape of "did not work". That fold is the subject of #444, and this document produced it.
-
-The launcher condition belongs to the daemon install and is checked there:
-
-    grep -q 'ACP_CLAUDE_REVIEWER_CONFIG_DIR' "$HOME/.agent-control-plane/agentcpd-launch.sh"
-
-The real proof is a lifecycle that gets past the reviewer:
-
-    ACP_COMPONENT_INTEGRATION=1 pnpm test:e2e
-
-It currently stops at `EVIDENCE_MISSING`; success is any stage beyond it. Note this runs
-without a daemon and against a temporary state root, so it demonstrates the pipeline and
-cannot itself accumulate the observation window — see below.
+A blind review that completes is the proof. A file in the reviewer's directory is not: its
+presence does not show that the sign-in it holds is still accepted, so this item gives no file
+check.
 
 ---
 
