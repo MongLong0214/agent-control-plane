@@ -58,12 +58,14 @@ import {
   type CheckMergeMessage,
   type MergeCheckBinding,
   PREDECESSOR_BASE_MERGES_CHECKED,
+  checkoutHeadAsCandidate,
   foreignCandidateCommit,
   integratePredecessors,
   integrateTaskResults,
   lostTaskChanges,
   recordedPredecessorMergeChecks,
   succeededTaskCommits,
+  undoCandidateRefLines,
 } from "./candidate-integration.ts";
 import type { RunEngine, TaskContract } from "./run-engine.ts";
 import type { TaskGraph } from "./task-graph.ts";
@@ -354,6 +356,25 @@ export interface ReclaimedCandidatePipelineAttempt {
  * agent-facing operation can skip, reorder or repeat it against stale evidence. A
  * REVISE verdict returns to the CTO here and never reaches Hermes (§18.6, CP-S33).
  */
+/**
+ * #1268 — the first frozen repository whose registered checkout's HEAD is not the one its candidate was frozen
+ * from (`expectedCheckoutHead`), or null when none moved.
+ */
+const movedCheckoutHead = async (
+  frozen: readonly { identity: string; candidateHead: string; integration?: CandidateSnapshot["repositories"][number]["integration"] }[],
+  repositories: readonly { identity: string; checkoutPath: string }[],
+): Promise<Record<string, unknown> | null> => {
+  for (const repository of frozen) {
+    const checkoutPath = repositories.find((repo) => repo.identity === repository.identity)!.checkoutPath;
+    const expected = expectedCheckoutHead(repository);
+    const observed = await tryRevParse(checkoutPath, "HEAD");
+    if (observed !== expected) {
+      return { repositoryIdentity: repository.identity, candidateHead: repository.candidateHead, expectedCheckoutHead: expected, observedCheckoutHead: observed };
+    }
+  }
+  return null;
+};
+
 export class CandidatePipeline {
   constructor(
     private readonly db: Db,
@@ -417,11 +438,17 @@ export class CandidatePipeline {
     // #1268 — every merge commit the integration makes has its message checked by CommitLore when the run requires it.
     const checkMergeMessages = this.checkMergeMessages(runId);
     const commitloreMergeChecks = new Map<string, MergeCheckBinding[]>();
-    // #1268 — a run whose contract requires CommitLore: before anything is built or written, every SUCCEEDED task
-    // commit and every commit between the run's pinned base and it is a worker commit of this run whose CommitLore
-    // evidence matches the commit's own Record-Id trailers, or a merge recorded for a predecessor base a task of
-    // this run starts from. What the integration then adds is only its own merges.
+    // #1268 — a run whose contract requires CommitLore: before any repository's integration builds or writes
+    // anything, in every repository, every SUCCEEDED task commit and every commit between the run's pinned base and
+    // it, and the range of a candidate that will be the checkout's HEAD, is a worker commit of this run whose
+    // CommitLore evidence matches the commit's own Record-Id trailers, or a merge recorded for a predecessor base a
+    // task of this run starts from. What an integration then adds is only its own merges.
     const accounted = new Set<string>();
+    const refuseForeign = (evidence: Record<string, unknown>): Decision<CandidateSnapshot> =>
+      deny(ReasonCode.CANDIDATE_FOREIGN_COMMIT, "a commit in the candidate is not one this run's CommitLore path accounts for; nothing was frozen", {
+        runId,
+        ...evidence,
+      });
     if (checkMergeMessages !== undefined) {
       for (const repo of participants) {
         const mergeChecks = recordedPredecessorMergeChecks(this.db, runId, repo.identity);
@@ -441,13 +468,28 @@ export class CandidatePipeline {
           });
           if (!foreign.allowed) return foreign as Decision<CandidateSnapshot>;
           if (foreign.value !== null) {
-            return deny(
-              ReasonCode.CANDIDATE_FOREIGN_COMMIT,
-              "a commit in a task's result is not one this run's CommitLore path accounts for; nothing was frozen",
-              { runId, repositoryIdentity: repo.identity, taskId: task.taskId, baseHead: target.baseSha, candidateHead: task.commit, ...foreign.value },
-            );
+            return refuseForeign({ repositoryIdentity: repo.identity, taskId: task.taskId, baseHead: target.baseSha, candidateHead: task.commit, ...foreign.value });
           }
         }
+        // A candidate that will be this checkout's HEAD (the integration takes it as it is) is asked now too, from the
+        // base its snapshot will be frozen with (`sourceAtFreeze`, else the base branch), read-only like the rest.
+        const head = await checkoutHeadAsCandidate({ db: this.db, runId, tasks, commits, repositoryIdentity: repo.identity, checkoutPath: repo.checkoutPath });
+        if (!head.allowed) return head as Decision<CandidateSnapshot>;
+        if (head.value === null) continue;
+        const source = await this.sourceAtFreeze(repo.checkoutPath, repo.workBranch, repo.baseBranch, profile, { runId, identity: repo.identity });
+        const baseHead = source.taskBaseHead ?? (await tryRevParse(repo.checkoutPath, repo.baseBranch)) ?? "";
+        const foreign = await foreignCandidateCommit({
+          db: this.db,
+          runId,
+          repositoryIdentity: repo.identity,
+          checkoutPath: repo.checkoutPath,
+          baseHead,
+          candidateHead: head.value,
+          mergeChecks,
+          accounted,
+        });
+        if (!foreign.allowed) return foreign as Decision<CandidateSnapshot>;
+        if (foreign.value !== null) return refuseForeign({ repositoryIdentity: repo.identity, baseHead, candidateHead: head.value, ...foreign.value });
       }
     }
     for (const repo of participants) {
@@ -593,9 +635,8 @@ export class CandidatePipeline {
       }
       // #1268 — and of the candidate as frozen: every commit between the base each repository was frozen at and
       // the exact head frozen for it is one checked above, a merge this freeze's check was bound to, or one
-      // recorded for a predecessor base (#1242). For an integrated candidate only an inconsistency inside ACP
-      // can refuse here; a candidate that is the checkout's HEAD has its own commits asked here, before anything
-      // is written, the integration having written nothing for it.
+      // recorded for a predecessor base (#1242). Only an inconsistency inside ACP, or a checkout that moved since
+      // the check above, can refuse here.
       if (checkMergeMessages !== undefined) {
         for (const frozen of snapshot.repositories) {
           const checkoutPath = repositories.find((repo) => repo.identity === frozen.identity)!.checkoutPath;
@@ -611,11 +652,7 @@ export class CandidatePipeline {
           });
           if (!foreign.allowed) return foreign as Decision<CandidateSnapshot>;
           if (foreign.value !== null) {
-            return deny(
-              ReasonCode.CANDIDATE_FOREIGN_COMMIT,
-              "a commit in the candidate is not one this run's CommitLore path accounts for; nothing was frozen",
-              { runId, repositoryIdentity: frozen.identity, baseHead: frozen.baseHead, candidateHead: frozen.candidateHead, ...foreign.value },
-            );
+            return refuseForeign({ repositoryIdentity: frozen.identity, baseHead: frozen.baseHead, candidateHead: frozen.candidateHead, ...foreign.value });
           }
         }
       }
@@ -633,29 +670,24 @@ export class CandidatePipeline {
       if (!plan.allowed) return plan as Decision<CandidateSnapshot>;
       refWrites.push({ identity: frozen.identity, checkoutPath, lines: plan.value.filter((line) => !line.startsWith("delete ")) });
     }
-    // #1268 — no gap between the head checked and the head frozen: at the last point before the freeze's first
-    // write, each checkout of a run whose contract requires CommitLore still stands where the freeze read it. A
-    // HEAD that moves after this stales the frozen candidate (`verifySnapshotFreshness`, SNAPSHOT_STALE).
+    // #1268 — no gap between the head checked and the head frozen: before the freeze's first write, each checkout
+    // of a run whose contract requires CommitLore still stands where the freeze read it.
+    const headMoved = (moved: Record<string, unknown>, leftoverRefs: string[]): Decision<CandidateSnapshot> =>
+      deny(ReasonCode.CANDIDATE_HEAD_MOVED, "the checkout's HEAD moved after the candidate's commits were checked; nothing was frozen", {
+        runId,
+        refusal: "HEAD_MOVED",
+        ...moved,
+        leftoverRefs,
+      });
     if (checkMergeMessages !== undefined) {
-      for (const frozen of snapshot.repositories) {
-        const checkoutPath = repositories.find((repo) => repo.identity === frozen.identity)!.checkoutPath;
-        const expected = expectedCheckoutHead(frozen);
-        const observed = await tryRevParse(checkoutPath, "HEAD");
-        if (observed !== expected) {
-          return deny(ReasonCode.CANDIDATE_HEAD_MOVED, "the checkout's HEAD moved after the candidate's commits were checked; nothing was frozen", {
-            runId,
-            repositoryIdentity: frozen.identity,
-            refusal: "HEAD_MOVED",
-            candidateHead: frozen.candidateHead,
-            expectedCheckoutHead: expected,
-            observedCheckoutHead: observed,
-          });
-        }
-      }
+      const moved = await movedCheckoutHead(snapshot.repositories, repositories);
+      if (moved !== null) return headMoved(moved, []);
     }
+    const applied: typeof refWrites = [];
     for (const write of refWrites) {
       const held = await this.writeCandidateRefs(run, write.identity, write.checkoutPath, write.lines);
       if (!held.allowed) return held as Decision<CandidateSnapshot>;
+      applied.push(write);
     }
 
     // #1255 — what a CONTRACT_CHANGE candidate's review is shown beside its PLAN, read by ACP now, at the
@@ -670,6 +702,21 @@ export class CandidatePipeline {
             freezeId: `freeze_${randomUUID().replace(/-/g, "").slice(0, 24)}`, attemptId: attemptId ?? null,
           },
         );
+
+    // #1268 — and again once the refs are applied: the freeze's last read before it records the candidate, with no
+    // await between it and `artifacts.put` below. A moved HEAD undoes exactly the refs this freeze applied, through
+    // the same guarded ref path, and refuses; a ref that cannot be undone is named, and refused all the same.
+    if (checkMergeMessages !== undefined) {
+      const moved = await movedCheckoutHead(snapshot.repositories, repositories);
+      if (moved !== null) {
+        const leftoverRefs: string[] = [];
+        for (const write of applied.reverse()) {
+          const undone = await this.writeCandidateRefs(run, write.identity, write.checkoutPath, undoCandidateRefLines(write.lines));
+          if (!undone.allowed) leftoverRefs.push(...write.lines.map((line) => line.split(" ")[1]!));
+        }
+        return headMoved(moved, leftoverRefs);
+      }
+    }
 
     this.artifacts.put(runId, ArtifactKind.CANDIDATE_SNAPSHOT, snapshot, digest);
     // G-6 — a readback the store refuses is replaced by this freeze's refusal row, so the review names it

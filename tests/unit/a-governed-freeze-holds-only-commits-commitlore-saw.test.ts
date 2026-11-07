@@ -2,6 +2,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { commitloreGoverned } from "../../src/bootstrap/commitlore-observation.ts";
 import { sha256 } from "../../src/core/digest.ts";
+import { deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
 import type * as Integration from "../../src/run/candidate-integration.ts";
@@ -9,7 +10,7 @@ import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { StartsFrom } from "../../src/run/task-write-target.ts";
 import { WorkerTurnEvent, workerSuccessDigest, type WorkerSuccessDigestInputs } from "../../src/run/worker-turn.ts";
 import { passingCommitLore } from "../helpers/commitlore-attempt.ts";
-import { cleanupTempDirs, commitAll, gitSync, writeFiles } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, gitSync, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { bindCeo, bindWorker, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 
 /**
@@ -38,6 +39,9 @@ const hooks = vi.hoisted(() => ({
   atRefPlan: null as (() => void) | null,
   /** Runs once when the freeze starts applying its candidate refs. */
   atRefApply: null as (() => void) | null,
+  /** How many ref applications have started, and the one (if any) that is refused instead of applied. */
+  refApplies: 0,
+  failRefApplyAt: null as number | null,
 }));
 vi.mock("../../src/run/candidate-integration.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof Integration>();
@@ -55,9 +59,11 @@ vi.mock("../../src/run/candidate-integration.ts", async (importOriginal) => {
       return actual.candidateRefPlan(...args);
     },
     applyCandidateRefPlan: async (...args: Parameters<typeof actual.applyCandidateRefPlan>) => {
+      hooks.refApplies += 1;
       const hook = hooks.atRefApply;
       hooks.atRefApply = null;
       hook?.();
+      if (hooks.failRefApplyAt === hooks.refApplies) return deny(ReasonCode.PROBE_FAILED, "this ref application is refused by the test", {});
       return actual.applyCandidateRefPlan(...args);
     },
     foreignCandidateCommit: async (input: Parameters<typeof actual.foreignCandidateCommit>[0]) => {
@@ -76,6 +82,8 @@ afterEach(() => {
   hooks.tamperChecks = null;
   hooks.atRefPlan = null;
   hooks.atRefApply = null;
+  hooks.refApplies = 0;
+  hooks.failRefApplyAt = null;
 });
 
 const CONTRACT: TaskContract = {
@@ -99,23 +107,47 @@ const recorded = (...recordIds: string[]): Lore => ({ outcome: "recorded", recor
 
 type World = Awaited<ReturnType<typeof worldOf>>;
 
-const worldOf = async (mode: "required" | "preferred", projectId = `cl-freeze-${mode}`) => {
+const SECOND = "github:acme/second";
+
+/**
+ * A dispatched run of a project whose CommitLore mode is `mode`. `second` adds a secondary repository to the
+ * project and the run: a clone of the primary with no remote, so the two share their base commit.
+ */
+const worldOf = async (mode: "required" | "preferred", projectId = `cl-freeze-${mode}`, options: { second?: boolean } = {}) => {
   const harness = makeHarness();
-  const { repositoryId, identity } = await registerFixtureProject(harness, projectId, { commitlore: { mode } });
+  const { repositoryId, identity } = await registerFixtureProject(harness, projectId, {
+    commitlore: { mode },
+    ...(options.second
+      ? { repositories: [{ role: "primary", remote: "github:acme/fixture", manifestRoot: "." }, { role: "secondary", remote: SECOND, manifestRoot: "." }] }
+      : {}),
+  });
+  let second: { repositoryId: string; repo: string } | null = null;
+  if (options.second) {
+    const clone = tempDir("acp-1268-second-");
+    gitSync(harness.repoPath, ["clone", "-q", "--no-local", harness.repoPath, clone]);
+    gitSync(clone, ["remote", "remove", "origin"]);
+    gitSync(clone, ["config", "--local", "maintenance.auto", "false"]);
+    const registered = await harness.cp.repositories.register({ checkoutPath: clone, projectId, repositoryRole: "secondary", identity: SECOND });
+    if (!registered.allowed) throw new Error(registered.message);
+    second = { repositoryId: registered.value.repositoryId, repo: clone };
+  }
   bindCeo(harness);
-  const run = await dispatchedRun(harness, projectId, repositoryId);
+  const run = await dispatchedRun(harness, projectId, repositoryId, second?.repositoryId);
   // The integration's merge messages get CommitLore's check; this double passes every one.
   harness.cp.pipeline.attach({ commitlore: passingCommitLore() });
   expect(commitloreGoverned(harness.cp.db, run.runId)).toBe(mode === "required");
-  return { harness, run, projectId, repositoryId, identity, repo: harness.repoPath, base: gitSync(harness.repoPath, ["rev-parse", "dev"]) };
+  return { harness, run, projectId, repositoryId, identity, repo: harness.repoPath, base: gitSync(harness.repoPath, ["rev-parse", "dev"]), second };
 };
 
-const dispatchedRun = async (harness: ReturnType<typeof makeHarness>, projectId: string, repositoryId: string) => {
+const dispatchedRun = async (harness: ReturnType<typeof makeHarness>, projectId: string, repositoryId: string, secondRepositoryId?: string) => {
   const created = harness.cp.runs.create({
     projectId,
     executionMode: ExecutionMode.STANDARD,
     contract: CONTRACT,
-    repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    repositories: [
+      { repositoryId, repositoryRole: "primary", baseBranch: "dev" },
+      ...(secondRepositoryId === undefined ? [] : [{ repositoryId: secondRepositoryId, repositoryRole: "secondary", baseBranch: "dev" }]),
+    ],
   });
   if (!created.allowed) throw new Error(created.message);
   const dispatched = await harness.cp.runs.dispatch(created.value.runId);
@@ -236,7 +268,8 @@ const expectRefusedUnchanged = async (
   expected: { reasonCode: string; commit?: string; refusal: string },
   options: { afterIntegration?: boolean } = {},
 ) => {
-  const before = refsAndHead(world.repo);
+  const repos = [world.repo, ...(world.second === null ? [] : [world.second.repo])];
+  const before = repos.map(refsAndHead);
   const rows = persistentRows(world);
   const frozen = await world.harness.cp.pipeline.freeze(world.run.runId);
   expect(frozen, JSON.stringify(frozen)).toMatchObject({
@@ -244,7 +277,7 @@ const expectRefusedUnchanged = async (
     reasonCode: expected.reasonCode,
     evidence: { runId: world.run.runId, refusal: expected.refusal, ...(expected.commit === undefined ? {} : { commit: expected.commit }) },
   });
-  expect(refsAndHead(world.repo)).toBe(before);
+  expect(repos.map(refsAndHead)).toEqual(before);
   if (!options.afterIntegration) expect(persistentRows(world)).toEqual(rows);
   expect(currentCandidateOf(world)).toBeNull();
   expect(frozenRows(world)).toEqual([]);
@@ -434,7 +467,7 @@ describe("#1268: a governed freeze holds only commits CommitLore accounts for", 
     expect(frozenRows(world)).toEqual([]);
   });
 
-  it("P2-2 the window after the last re-read: a HEAD moved while the ref is applied is frozen, and verification then refuses it SNAPSHOT_STALE", async () => {
+  it("R2 refused — an unmanaged commit appended when the freeze starts applying its candidate ref: the ref it applied is undone", async () => {
     const world = await worldOf("required");
     workerCommit(world, "readme", { "README.md": "# one\n" }, "update readme", EMPTY);
     const app = workerCommit(world, "app", { "src/app.js": "module.exports = () => 2;\n" }, "update app", EMPTY);
@@ -442,30 +475,72 @@ describe("#1268: a governed freeze holds only commits CommitLore accounts for", 
     hooks.atRefApply = () => {
       moved = unmanagedCommit(world, "appended while the ref is applied");
     };
-    const snapshot = await freezeAllowed(world);
-    expect(snapshot.repositories[0]!.integration?.checkoutHead).toBe(app.commit);
-    expect(gitSync(world.repo, ["rev-parse", "HEAD"])).toBe(moved);
-    const manifest = world.harness.cp.projects.activeManifest(world.projectId)!.manifest;
-    const verified = await world.harness.cp.verification.verify({
-      runId: world.run.runId,
-      snapshot,
-      commands: manifest.verificationCommands,
-      contractDigest: snapshot.contractDigest,
-    });
-    expect(verified, JSON.stringify(verified)).toMatchObject({
+    const refsBefore = gitSync(world.repo, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+    const frozen = await world.harness.cp.pipeline.freeze(world.run.runId);
+    expect(frozen, JSON.stringify(frozen)).toMatchObject({
       allowed: false,
-      reasonCode: ReasonCode.SNAPSHOT_STALE,
-      evidence: { drift: [{ expectedHead: app.commit, observedHead: moved }] },
+      reasonCode: ReasonCode.CANDIDATE_HEAD_MOVED,
+      evidence: { refusal: "HEAD_MOVED", expectedCheckoutHead: app.commit, observedCheckoutHead: moved, leftoverRefs: [] },
     });
+    // The ref was applied (once) and then undone (a second application): every ref is as it was, but the branch the
+    // appended commit itself moved.
+    expect(hooks.refApplies).toBe(2);
+    const others = (listed: string): string => listed.split("\n").filter((line) => !line.startsWith("refs/heads/task/app ")).join("\n");
+    const refsAfter = gitSync(world.repo, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+    expect(others(refsAfter)).toBe(others(refsBefore));
+    expect(refsAfter).toContain(`refs/heads/task/app ${moved}`);
+    expect(currentCandidateOf(world)).toBeNull();
+    expect(frozenRows(world)).toEqual([]);
+  });
+
+  it("R2 refused — the same, when undoing the applied ref fails: still refused, naming the ref left behind", async () => {
+    const world = await worldOf("required");
+    workerCommit(world, "readme", { "README.md": "# one\n" }, "update readme", EMPTY);
+    workerCommit(world, "app", { "src/app.js": "module.exports = () => 2;\n" }, "update app", EMPTY);
+    hooks.atRefApply = () => {
+      unmanagedCommit(world, "appended while the ref is applied");
+    };
+    hooks.failRefApplyAt = 2;
+    const frozen = await world.harness.cp.pipeline.freeze(world.run.runId);
+    expect(frozen, JSON.stringify(frozen)).toMatchObject({ allowed: false, reasonCode: ReasonCode.CANDIDATE_HEAD_MOVED, evidence: { refusal: "HEAD_MOVED" } });
+    const leftover = frozen.allowed ? [] : (frozen.evidence["leftoverRefs"] as string[]);
+    expect(leftover).toHaveLength(1);
+    expect(leftover[0]).toMatch(new RegExp(`^refs/acp/candidates/${world.run.runId}/`));
+    expect(gitSync(world.repo, ["for-each-ref", "--format=%(refname)", "refs/acp/candidates/"])).toBe(leftover[0]);
+    expect(currentCandidateOf(world)).toBeNull();
+    expect(frozenRows(world)).toEqual([]);
+  });
+
+  it("R2 P1 refused — a worker commit of one repository fetched into another, which has no receipt for it", async () => {
+    const world = await worldOf("required", "cl-freeze-two", { second: true });
+    const readme = workerCommit(world, "readme", { "README.md": "# one\n" }, "update readme", EMPTY);
+    const second = world.second!;
+    expect(gitSync(second.repo, ["rev-parse", "dev"])).toBe(world.base);
+    gitSync(second.repo, ["fetch", "-q", world.repo, "task/readme:refs/heads/fetched"]);
+    gitSync(second.repo, ["checkout", "-q", "fetched"]);
+    expect(gitSync(second.repo, ["rev-parse", "HEAD"])).toBe(readme.commit);
+    await expectRefusedUnchanged(world, { reasonCode: ReasonCode.CANDIDATE_FOREIGN_COMMIT, commit: readme.commit, refusal: "NOT_A_RUN_WORKER_COMMIT" });
+  });
+
+  it("R2 P2 refused before any repository's integration writes — one repository integrates two tasks, another holds an unmanaged commit", async () => {
+    const world = await worldOf("required", "cl-freeze-two", { second: true });
+    workerCommit(world, "readme", { "README.md": "# one\n" }, "update readme", EMPTY);
+    workerCommit(world, "app", { "src/app.js": "module.exports = () => 2;\n" }, "update app", EMPTY);
+    const second = world.second!;
+    gitSync(second.repo, ["checkout", "-q", "-b", "elsewhere"]);
+    writeFiles(second.repo, { "notes.md": "unmanaged\n" });
+    const foreign = commitAll(second.repo, "unmanaged in the second repository");
+    await expectRefusedUnchanged(world, { reasonCode: ReasonCode.CANDIDATE_FOREIGN_COMMIT, commit: foreign, refusal: "NOT_A_RUN_WORKER_COMMIT" });
   });
 
   it("refused — the checkout's HEAD moved after the check: the checked head is not the one that would be frozen", async () => {
     const world = await worldOf("required");
     const one = workerCommit(world, "readme", { "README.md": "# one\n" }, "update readme", EMPTY);
     let moved: string | null = null;
-    // The second range check is the candidate's own (the first is the task's, before anything is built).
+    // The third range check is the frozen candidate's own: the task's range and the checkout HEAD's are asked first,
+    // before anything is built.
     hooks.afterRangeCheck = (calls) => {
-      if (calls !== 2) return;
+      if (calls !== 3) return;
       hooks.afterRangeCheck = null;
       moved = unmanagedCommit(world, "slipped in after the check");
     };

@@ -532,6 +532,32 @@ const buildIntegration = async (
   );
 };
 
+/** Whether `head` already holds every result's commit: the case in which the candidate is the checkout's HEAD. */
+const holdsEvery = async (repo: PinnedRepository, results: readonly TaskResult[], head: string): Promise<boolean> =>
+  (await Promise.all(results.map((result) => isAncestor(repo, result.commit, head)))).every((answer) => answer === true);
+
+/**
+ * #1268 — read-only: the checkout's HEAD when `integrateTaskResults` would take it as the candidate (the run has
+ * no SUCCEEDED result it places in this repository, or HEAD already holds every one), else null. Conflicts are
+ * not asked: the integration refuses them either way.
+ */
+export const checkoutHeadAsCandidate = async (input: {
+  db: Db;
+  runId: string;
+  tasks: readonly TaskRecord[];
+  commits: readonly SucceededTaskCommit[];
+  repositoryIdentity: string;
+  checkoutPath: string;
+}): Promise<Decision<string | null>> => {
+  const results = succeededTaskResults(input.db, input.runId, input.tasks, input.commits, input.repositoryIdentity);
+  return withPinned<string | null>(input.checkoutPath, "acp-integration-head-", async (repo) => {
+    const headRead = await runPinnedGit(repo, ["rev-parse", "--verify", "-q", "HEAD^{commit}"]);
+    const head = headRead.exitCode === 0 ? headRead.stdout.trim() : null;
+    if (head === null) return allow(ReasonCode.OK, null);
+    return allow(ReasonCode.OK, results.length === 0 || (await holdsEvery(repo, results, head)) ? head : null);
+  });
+};
+
 /**
  * The run's integrated candidate in one repository, or null when no two tasks' changes overlap and
  * the checkout's HEAD already holds every SUCCEEDED task's commit (a single-task run, as before), or
@@ -574,8 +600,7 @@ export const integrateTaskResults = async (input: {
       );
     }
     // No overlap, and HEAD already holds every task's commit: the candidate is HEAD, as before.
-    const contained = await Promise.all(results.map((result) => isAncestor(repo, result.commit, checkoutHead)));
-    if (contained.every((answer) => answer === true)) return allow(ReasonCode.OK, null);
+    if (await holdsEvery(repo, results, checkoutHead)) return allow(ReasonCode.OK, null);
     const placed = await placeResults(repo, read.value, input.repositoryIdentity);
     if (!placed.allowed) return placed as Decision<never>;
     return allow(ReasonCode.OK, { ...placed.value, checkoutHead });
@@ -907,9 +932,9 @@ const unaccounted = (commitlore: unknown, message: string): ForeignCommitRefusal
  *   order, tree and message, re-read from the commit.
  *
  * A base that is not an ancestor of the head, or an object that cannot be read, is refused
- * (CANDIDATE_RANGE_UNVERIFIABLE). Read-only, over the registered checkout. `accounted` carries the commits one
- * freeze has already found accounted for (an object id names its bytes), which are not read again, and gains
- * every commit this call accounts for.
+ * (CANDIDATE_RANGE_UNVERIFIABLE). Read-only, over the registered checkout. `accounted` carries what one freeze has
+ * already found accounted for, per repository (an object id names its bytes, but a receipt is a repository's), which
+ * is not read again, and gains every commit this call accounts for here.
  */
 export const foreignCandidateCommit = async (input: {
   db: Db;
@@ -938,8 +963,9 @@ export const foreignCandidateCommit = async (input: {
     const listed = await runPinnedGit(repo, ["rev-list", "--reverse", "--topo-order", `${baseHead}..${candidateHead}`]);
     if (listed.exitCode !== 0) return unverifiable("OBJECT_UNREADABLE");
     const receipts = workerReceiptsByCommit(input.db, runId, repositoryIdentity);
+    const key = (commit: string): string => `${repositoryIdentity}\u0000${commit}`;
     for (const commit of listed.stdout.split("\n").filter((line) => line.length > 0)) {
-      if (input.accounted?.has(commit)) continue;
+      if (input.accounted?.has(key(commit))) continue;
       const read = await runPinnedGit(repo, ["cat-file", "commit", commit]);
       if (read.exitCode !== 0) return unverifiable("OBJECT_UNREADABLE", commit);
       const split = read.stdout.indexOf("\n\n");
@@ -949,7 +975,7 @@ export const foreignCandidateCommit = async (input: {
       if (named !== undefined) {
         const refusal = named.map((commitlore) => unaccounted(commitlore, message)).find((answer) => answer !== null) ?? null;
         if (refusal !== null) return allow(ReasonCode.OK, { commit, refusal });
-        input.accounted?.add(commit);
+        input.accounted?.add(key(commit));
         continue;
       }
       const parents = [...header.matchAll(/^parent ([0-9a-f]+)$/gm)].map((match) => match[1]!);
@@ -959,7 +985,7 @@ export const foreignCandidateCommit = async (input: {
       const exact = parents.length === 2 && parents[0] === bound.parents[0] && parents[1] === bound.parents[1] &&
         tree === bound.tree && sha256(message.trimEnd()) === bound.messageDigest;
       if (!exact) return allow(ReasonCode.OK, { commit, refusal: "MERGE_NOT_BOUND" });
-      input.accounted?.add(commit);
+      input.accounted?.add(key(commit));
     }
     return allow(ReasonCode.OK, null);
   });
@@ -1002,6 +1028,18 @@ export const candidateRefPlan = async (
       if (ref !== keep?.ref) lines.push(`delete ${ref} ${commit}`);
     }
     return allow(ReasonCode.OK, lines);
+  });
+
+/**
+ * #1268 — the `update-ref --stdin` lines that undo `candidateRefPlan` lines once applied, last first, each only at
+ * the value the line set: a created ref is deleted, an updated one is put back, a deleted one is created again.
+ */
+export const undoCandidateRefLines = (lines: readonly string[]): string[] =>
+  [...lines].reverse().map((line) => {
+    const [verb, ref, value, previous] = line.split(" ");
+    if (verb === "create") return `delete ${ref} ${value}`;
+    if (verb === "delete") return `create ${ref} ${value}`;
+    return `update ${ref} ${previous} ${value}`;
   });
 
 /** Applies `candidateRefPlan` lines as one atomic ref transaction, pinned and hook-free. */
