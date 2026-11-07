@@ -876,4 +876,81 @@ describe("#1189 — a refusal's credential-shaped text is redacted wherever the 
     expectNothingMerged(fixture);
     await restarted.stop();
   });
+  // A whole message is read as free text: a value with an ACP id's format is kept only when the store holds it for the run.
+  const unknownHex = sha256("a digest no record of this store names").slice("sha256:".length);
+  const WHOLE_MESSAGES = [
+    ["an unknown 64-hex", () => ({ text: unknownHex, kept: REDACTED })],
+    ["sha256: and an unknown 64-hex", () => ({ text: `sha256:${unknownHex}`, kept: `sha256:${REDACTED}` })],
+    ["the run's own candidate digest", (driven: Fixture["driven"]) => ({ text: driven.candidateSnapshotDigest, kept: driven.candidateSnapshotDigest })],
+    ["the bare hex of the run's own candidate digest", (driven: Fixture["driven"]) => {
+      const hex = driven.candidateSnapshotDigest.slice("sha256:".length);
+      return { text: hex, kept: hex };
+    }],
+  ] as const;
+
+  it.each(WHOLE_MESSAGES.flatMap(([label, of]) => (["unrecoverable", "at the bound"] as const).map((route) => [label, route, of] as const)))(
+    "a refusal whose whole message is %s (%s): redacted in the notice and the stateReason unless the store holds it for the run", async (_label, route, of) => {
+      const fixture = await approved();
+      const { harness, driven } = fixture;
+      const { text, kept } = of(driven);
+      const code = route === "at the bound" ? PERMISSION : ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED;
+      if (route === "at the bound") vi.spyOn(harness.cp.credentials, "authenticate").mockImplementation(async () => deny(PERMISSION, text, {}));
+      else {
+        vi.spyOn(harness.cp.github, "prPrepare").mockImplementation(async () =>
+          deny<{ pullNumber: number; url: string }>(code, text, { mergeStrategy: "squash", pullMerged: false }));
+      }
+      expect(await start(fixture.daemon)).toBe(true);
+      if (route === "at the bound") await sweepThroughTheCap(fixture);
+      const run = harness.cp.runs.require(driven.runId);
+      expect(run.state).toBe(RunState.FAILED);
+      expect(run.stateReason).toBe(`${code}: ${kept}`);
+      const notices = failureNotices(fixture);
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.payload).toMatchObject({ reason: kept, blocker: `${code}: ${kept}` });
+      const stored = [
+        ...harness.cp.db.all<{ text: string }>("SELECT payload_json AS text FROM outbox WHERE run_id = ?", [driven.runId]),
+        ...harness.cp.db.all<{ text: string }>("SELECT evidence_json AS text FROM audit_events WHERE run_id = ?", [driven.runId]),
+      ];
+      for (const row of stored) expect(row.text).not.toContain(unknownHex);
+      await fixture.daemon.stop();
+    });
+  it.each([
+    ["sent at once", "bound"],
+    ["kept owed while no CEO is bound, then sent", "unbound"],
+  ] as const)("refusal evidence in the FAILED notice %s: an unknown whole 64-hex is redacted; an ACP id and the run's held digest are kept", async (_label, variant) => {
+    const fixture = await approved();
+    const { harness, driven } = fixture;
+    const held = driven.candidateSnapshotDigest;
+    const evidence = {
+      observedDigest: unknownHex, prefixedDigest: `sha256:${unknownHex}`,
+      heldDigest: held, heldHex: held.slice("sha256:".length), runRef: driven.runId, note: `the candidate ${held} was refused`,
+    };
+    const expected = { ...evidence, observedDigest: REDACTED, prefixedDigest: `sha256:${REDACTED}` };
+    vi.spyOn(harness.cp.credentials, "authenticate").mockImplementation(async () =>
+      deny(PERMISSION, "GitHub App permissions do not match any approved grant shape", evidence));
+    expect(await start(fixture.daemon)).toBe(true);
+    if (variant === "unbound") expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "the CEO seat is vacated").allowed).toBe(true);
+    await sweepThroughTheCap(fixture);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.FAILED);
+    if (variant === "unbound") {
+      const owed = auditOf(fixture, "FINALIZATION_FAILED_NOTICE");
+      expect(owed.map((entry) => entry.evidence.delivered)).toEqual([false]);
+      expect(owed[0]!.evidence.evidence).toMatchObject(expected);
+      bindCeo(harness);
+      await sweepThroughTheCap(fixture);
+      expect(auditOf(fixture, "FINALIZATION_FAILED_NOTICE").map((entry) => entry.evidence.delivered)).toEqual([false, true]);
+    } else {
+      expect(auditOf(fixture, "FINALIZATION_FAILED_NOTICE")).toHaveLength(0);
+    }
+    const notices = failureNotices(fixture);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.payload.evidence).toMatchObject(expected);
+    const sinks = [
+      ...harness.cp.db.all<{ text: string }>("SELECT payload_json AS text FROM outbox WHERE run_id = ?", [driven.runId]),
+      ...harness.cp.db.all<{ text: string }>(
+        "SELECT evidence_json AS text FROM audit_events WHERE run_id = ? AND kind = 'FINALIZATION_FAILED_NOTICE'", [driven.runId]),
+    ];
+    for (const row of sinks) expect(row.text).not.toContain(unknownHex);
+    await fixture.daemon.stop();
+  });
 });

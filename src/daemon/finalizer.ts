@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type { ControlPlane } from "../app/control-plane.ts";
 import { NotificationKind } from "../ceo/production-gate.ts";
-import { redactCredentialShapes } from "../core/credential-shapes.ts";
+import { MCP_THROWN_REFUSAL_WRITER, redactCredentialShapes } from "../core/credential-shapes.ts";
 import { type Decision, acpError, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { redact } from "../db/audit.ts";
@@ -285,17 +285,38 @@ const retryDelayMs = (refusals: number): number =>
   Math.min(FINALIZATION_RETRY_BASE_MS * 2 ** (refusals - 1), FINALIZATION_RETRY_CEILING_MS);
 
 /**
- * A refusal's message as the finalizer passes it on (a CEO notice's `blocker` and `reason`, the run's stateReason
- * and its revision request): every credential shape redacted (`redactCredentialShapes`), so a token in a GitHub
- * error body reaches none of them. A `sha256:` digest or 64-hex id is kept only where it names a record the store
- * holds for the run (`registryView`, the bound references the audit log keeps); a commit SHA is no shape. The rest
- * of the text is kept as it is, and what is kept is admitted under any audit field. Each notice is built from it
- * once per refusal, so its payload key does not move.
+ * A refusal's text as the finalizer passes it on (its message, and each string of its evidence a notice copies):
+ * every credential shape redacted (`redactCredentialShapes`), so a token in a GitHub error body reaches no notice,
+ * revision request, stateReason or owed record. A `sha256:` digest or 64-hex id is kept only where it names a record
+ * the store holds for the run (`registryView`, the bound references the audit log keeps); a commit SHA, and an ACP id
+ * with no digest in it, is no shape. Each string is read as free text, the way a thrown refusal's is
+ * (`MCP_THROWN_REFUSAL_WRITER`): one that is nothing but a digest or 64-hex id gets no exemption for its format
+ * alone. The rest of the text is kept as it is, and what is kept is admitted under any audit field. Each notice is
+ * built from it once per refusal, so its payload key does not move.
  */
+const refusalText = (cp: ControlPlane, runId: string): ((text: string) => string) => {
+  const field = { path: [], store: "artifact", site: { writer: MCP_THROWN_REFUSAL_WRITER, runId, registry: registryView(cp.db) } } as const;
+  return (text) => redactCredentialShapes(text, field);
+};
+
+/** A refusal's message as the finalizer passes it on (`refusalText`). */
 const refusalMessage = (cp: ControlPlane, runId: string, failure: Decision<unknown>): string =>
-  failure.allowed ? "" : redactCredentialShapes(failure.message, {
-    path: [], store: "audit", site: { writer: "FINALIZATION_ATTEMPT_FAILED", runId, registry: registryView(cp.db) },
-  });
+  failure.allowed ? "" : refusalText(cp, runId)(failure.message);
+
+/**
+ * #1189 §0 — a refusal's evidence as a FAILED notice copies it: its scalar values only, each string redacted as the
+ * refusal's text (`refusalText`) and then cut to the 200 characters the audit log admits for a field it has not
+ * reviewed, and the audit log's key rules (`redact`: a secret-named key, a collection of them, bulk content) applied
+ * over it at the run's own write site, so a digest the store holds for the run stays in the text around it too.
+ */
+const refusalEvidence = (cp: ControlPlane, runId: string, failure: Decision<unknown>): unknown => {
+  const scrub = refusalText(cp, runId);
+  const scalars = Object.fromEntries(Object.entries(failure.evidence)
+    .filter(([, value]) => value === null || typeof value === "string" || typeof value === "boolean" ||
+      (typeof value === "number" && Number.isFinite(value)))
+    .map(([key, value]) => [key, typeof value === "string" ? scrub(value).slice(0, 200) : value]));
+  return redact(scalars, 0, [], { writer: FAILED_NOTICE, runId, registry: registryView(cp.db) });
+};
 
 /**
  * The concrete blocker a hand-off names: the refusal's code and its redacted message (`refusalMessage`). Bounded to
@@ -1753,10 +1774,6 @@ export class ApprovedRunFinalizer {
     const attempts = this.cp.audit.forRun(runId)
       .filter((entry) => entry.kind === "FINALIZATION_ATTEMPT_FAILED" && entry.evidence["candidateSnapshotDigest"] === candidateDigest)
       .map((entry) => entry.evidence["attemptId"]);
-    const evidence = Object.fromEntries(Object.entries(failure.evidence)
-      .filter(([, value]) => value === null || typeof value === "string" || typeof value === "boolean" ||
-        (typeof value === "number" && Number.isFinite(value)))
-      .map(([key, value]) => [key, typeof value === "string" ? value.slice(0, 200) : value]));
     const notice = {
       candidateSnapshotDigest: candidateDigest,
       failureReasonCode: failure.reasonCode,
@@ -1775,7 +1792,7 @@ export class ApprovedRunFinalizer {
       retries: counted["retries"],
       retryCap: FINALIZATION_RETRY_CAP,
       attempts,
-      evidence: redact(evidence),
+      evidence: refusalEvidence(this.cp, runId, failure),
       whyItMatters: "a CEO-approved run did not merge: the daemon's GitHub credential or its App's grant was still refused at the retry bound",
     };
     const returned = this.cp.runs.returnApprovedCandidate(runId, {
