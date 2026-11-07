@@ -7,7 +7,7 @@ import { Daemon } from "../../src/daemon/daemon.ts";
 import { FINALIZATION_RETRY_CAP, classifyPreMergeRefusal } from "../../src/daemon/finalizer.ts";
 import { RunKind, RunState, Role, roleKeyFor } from "../../src/domain/types.ts";
 import { cleanupTempDirs, commitAll, tempDir, writeFiles } from "../helpers/fixtures.ts";
-import { type Harness, driveToReviewedCandidate, makeHarness } from "../helpers/harness.ts";
+import { type Harness, bindCeo, driveToReviewedCandidate, makeHarness } from "../helpers/harness.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
 
 afterAll(cleanupTempDirs);
@@ -506,6 +506,34 @@ describe("#1189 §0 — an approved run never waits on a person for a GitHub cre
     expect(failureNotices(fixture)).toHaveLength(1);
     expectNothingMerged(fixture);
     await restarted.stop();
+  });
+
+  it("credential unavailable through the cap while no CEO is bound: the run still ends FAILED, its notice is owed, and the CEO bound later is told once", async () => {
+    const fixture = await approved(credentialThrowWhile(() => true));
+    const { harness, driven, daemon } = fixture;
+    loaderWhile(fixture, () => true);
+    expect(await start(daemon)).toBe(true);
+    expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "the CEO seat is vacated").allowed).toBe(true);
+    await sweepThroughTheCap(fixture);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.FAILED);
+    expect(failedAttempts(fixture)).toBe(FINALIZATION_RETRY_CAP + 1);
+    expect(failureNotices(fixture)).toHaveLength(0);
+    const owed = () => auditOf(fixture, "FINALIZATION_FAILED_NOTICE").map((entry) => entry.evidence.delivered);
+    expect(owed()).toEqual([false]);
+    const atFailure = transitions(fixture);
+    const ceoSessionId = bindCeo(harness);
+    await sweepThroughTheCap(fixture);
+    expect(failureNotices(fixture).map((notice) => notice.target)).toEqual([ceoSessionId]);
+    expect(failureNotices(fixture)[0]!.payload).toMatchObject({
+      runId: driven.runId, candidateSnapshotDigest: driven.candidateSnapshotDigest, failureCause: CREDENTIAL, limit: "FAILURE",
+      outcome: "FAILED", merged: false, owner: "CEO", retryCap: FINALIZATION_RETRY_CAP,
+    });
+    expect(owed()).toEqual([false, true]);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.FAILED);
+    expect(transitions(fixture)).toEqual(atFailure);
+    expect(failedAttempts(fixture)).toBe(FINALIZATION_RETRY_CAP + 1);
+    expectNothingMerged(fixture);
+    await daemon.stop();
   });
 
   describe("a run held CEO_APPROVED under one of these reasons before this change is picked up after a restart", () => {
