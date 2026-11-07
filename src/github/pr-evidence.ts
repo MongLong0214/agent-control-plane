@@ -1,6 +1,8 @@
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+
 import { z } from "zod";
 
-import { sha256 } from "../core/digest.ts";
+import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, type Evidence, allow, deny, isAcpError } from "../core/errors.ts";
 import { parseGitHubIdentity } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -14,10 +16,18 @@ import type { RepositoryRecord } from "../registry/repository-registry.ts";
  * the PR is the one number asked for; and GitHub is reached only through `GitHubReadClient`, which has
  * no method that writes. Nothing here runs a command or touches a local path.
  *
+ * Head binding: the files, patches and merge-base are read from `compare/{baseSha}...{headSha}` by the
+ * SHAs the PR read answered, on every page, rather than from `pulls/{n}/files`, which follows the PR's
+ * head while it is being read: a push landing between the two reads would put another head's diff
+ * under this head's label. A compare of two SHAs cannot change, and the check runs and statuses are
+ * read by the same head SHA. The cost is GitHub's 300-file compare limit, past which the read is named
+ * incomplete rather than wrong.
+ *
  * Nothing incomplete is summarised as passing: every lookup that failed, every page that is missing,
  * every patch GitHub left out is named in `incomplete`, and while that list is not empty the answer is
  * a COVERAGE_INCOMPLETE refusal carrying what was read, `requiredChecks.allSatisfied` is never true,
- * and nothing in it says "ok".
+ * and nothing in it says "ok". A continuation page carries the first page's gaps in its signed cursor,
+ * so a snapshot that was incomplete stays incomplete on every page of it.
  */
 
 /** GET only, over the kernel's App client and credential (`GitHubKernel.readOnlyGitHub`). */
@@ -44,8 +54,8 @@ export interface PrEvidenceInput {
 export const PR_EVIDENCE_DIFF_PAGE_MAX_CHARS = 100_000;
 
 const PER_PAGE = 100;
-/** GitHub lists at most 3000 files of a pull request: 30 pages of 100. */
-const FILE_PAGE_BOUND = 30;
+/** GitHub's compare lists at most this many files; a larger diff is named incomplete. */
+const COMPARE_FILE_LIMIT = 300;
 const CHECK_PAGE_BOUND = 10;
 const RULE_PAGE_BOUND = 10;
 const SHA = /^[0-9a-f]{40}$/;
@@ -54,7 +64,9 @@ const NOT_A_NAME = /[/\\:\s]|[\u0000-\u001f\u007f]|^\.\.?$/;
 
 export interface PrEvidenceIncomplete {
   kind: "LOOKUP_FAILED" | "PERMISSION_DENIED" | "MALFORMED_RESPONSE" | "PAGE_BOUND_REACHED" | "COUNT_MISMATCH"
-    | "PATCH_OMITTED" | "MERGEABILITY_NOT_COMPUTED" | "HEAD_MISMATCH";
+    | "PATCH_OMITTED" | "MERGEABILITY_NOT_COMPUTED" | "HEAD_MISMATCH"
+    /** On a continuation page: the first page of this snapshot named gaps, so the snapshot is incomplete. */
+    | "SNAPSHOT_INCOMPLETE";
   /** The GitHub API path the gap is in. */
   lookup: string;
   detail: string;
@@ -174,14 +186,31 @@ const cursorSchema = z.object({
   h: z.string().regex(SHA),
   d: z.string(),
   o: z.number().int().min(0),
+  /** How many gaps the first page of this snapshot named, and their digest. */
+  g: z.number().int().min(0),
+  gd: z.string(),
 }).strict();
 type Cursor = z.infer<typeof cursorSchema>;
 
-const encodeCursor = (cursor: Cursor): string => Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+/**
+ * Signs the page cursors this process issues, so a cursor cannot be edited into another offset or into
+ * a first page that had no gaps. Not a credential: it authorizes nothing, and a daemon restart only
+ * makes earlier cursors unknown, which a fresh read without a cursor answers.
+ */
+const CURSOR_KEY = randomBytes(32);
+const macOf = (payload: string): string => createHmac("sha256", CURSOR_KEY).update(payload).digest("base64url");
+const encodeCursor = (cursor: Cursor): string => {
+  const payload = Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+  return `${payload}.${macOf(payload)}`;
+};
 const decodeCursor = (text: string): Cursor | null => {
-  if (!/^[A-Za-z0-9_-]{1,4096}$/.test(text)) return null;
+  const match = /^([A-Za-z0-9_-]{1,4000})\.([A-Za-z0-9_-]{43})$/.exec(text);
+  if (!match) return null;
+  const expected = Buffer.from(macOf(match[1]!), "utf8");
+  const given = Buffer.from(match[2]!, "utf8");
+  if (expected.length !== given.length || !timingSafeEqual(expected, given)) return null;
   try {
-    const parsed = cursorSchema.safeParse(JSON.parse(Buffer.from(text, "base64url").toString("utf8")));
+    const parsed = cursorSchema.safeParse(JSON.parse(Buffer.from(match[1]!, "base64url").toString("utf8")));
     return parsed.success ? parsed.data : null;
   } catch {
     return null;
@@ -217,67 +246,78 @@ const gap = (error: unknown, lookup: string, detail: string, page?: number): PrE
   };
 };
 
-interface FileRead { files: Array<PrEvidenceFile & { patch: string | null }>; gaps: PrEvidenceIncomplete[] }
+interface FileRead {
+  files: Array<PrEvidenceFile & { patch: string | null }>;
+  gaps: PrEvidenceIncomplete[];
+  mergeBase: { sha: string; compareStatus: string | null; aheadBy: number | null; behindBy: number | null } | null;
+  compareUrl: string | null;
+  lookup: string;
+}
 
-/** Every file page in order until a short page; a page that fails or is malformed ends the read and is named. */
-const readFiles = async (github: GitHubReadClient, root: string, prNumber: number, changedFiles: number | null): Promise<FileRead> => {
-  const lookup = `${root}/pulls/${prNumber}/files`;
+/**
+ * The changed files, their patches and the merge-base, from one compare of the two SHAs. GitHub lists every
+ * file of a compare on its first page, up to COMPARE_FILE_LIMIT; a count short of the PR's is named.
+ */
+const readComparedFiles = async (
+  github: GitHubReadClient, root: string, baseSha: string, headSha: string, changedFiles: number | null, pullLookup: string,
+): Promise<FileRead> => {
+  const lookup = `${root}/compare/${baseSha}...${headSha}`;
   const files: FileRead["files"] = [];
   const gaps: PrEvidenceIncomplete[] = [];
-  let stopped: "last-page" | "failed" | null = null;
-  for (let page = 1; page <= FILE_PAGE_BOUND && stopped === null; page += 1) {
-    let rows: unknown;
-    try {
-      rows = await github.get<unknown>(`${lookup}?per_page=${PER_PAGE}&page=${page}`);
-    } catch (error) {
-      gaps.push(gap(error, lookup, `file page ${page} could not be read; it and every later page are missing`, page));
-      stopped = "failed";
-      break;
-    }
-    if (!Array.isArray(rows)) {
-      gaps.push({ kind: "MALFORMED_RESPONSE", lookup, page, detail: `file page ${page} is not a list; it and every later page are missing` });
-      stopped = "failed";
-      break;
-    }
-    for (const row of rows) {
-      const entry = record(row);
-      const filename = text(entry?.["filename"]);
-      if (!entry || filename === null) {
-        gaps.push({ kind: "MALFORMED_RESPONSE", lookup, page, detail: `file page ${page} holds an entry with no filename` });
-        continue;
-      }
-      const patch = text(entry["patch"]);
-      const status = text(entry["status"]) ?? "unknown";
-      const changes = count(entry["changes"]) ?? 0;
-      // A rename with no line changes has no patch to show; every other file without one is a gap.
-      const patchOmitted = patch === null && !(status === "renamed" && changes === 0);
-      if (patchOmitted) {
-        gaps.push({ kind: "PATCH_OMITTED", lookup, page, file: filename,
-          detail: "GitHub returned no patch for this file (binary, too large, or otherwise omitted); its diff is not in this answer" });
-      }
-      files.push({
-        filename,
-        previousFilename: text(entry["previous_filename"]),
-        status,
-        additions: count(entry["additions"]) ?? 0,
-        deletions: count(entry["deletions"]) ?? 0,
-        changes,
-        patchOmitted,
-        blobUrl: httpsUrl(entry["blob_url"]),
-        patch,
-      });
-    }
-    if (rows.length < PER_PAGE) stopped = "last-page";
+  let compare: Json | null = null;
+  try {
+    compare = record(await github.get<unknown>(`${lookup}?per_page=1`));
+  } catch (error) {
+    gaps.push(gap(error, lookup, "the compare of the two SHAs could not be read; no file or patch is in this answer"));
   }
-  if (stopped === null) {
-    gaps.push({ kind: "PAGE_BOUND_REACHED", lookup, detail: `GitHub lists at most ${FILE_PAGE_BOUND * PER_PAGE} files of a pull request` });
+  const rows = compare?.["files"];
+  if (compare && !Array.isArray(rows)) {
+    gaps.push({ kind: "MALFORMED_RESPONSE", lookup, detail: "the compare answer carries no files list" });
+  }
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const entry = record(row);
+    const filename = text(entry?.["filename"]);
+    if (!entry || filename === null) {
+      gaps.push({ kind: "MALFORMED_RESPONSE", lookup, detail: "the compare lists an entry with no filename" });
+      continue;
+    }
+    const patch = text(entry["patch"]);
+    const status = text(entry["status"]) ?? "unknown";
+    const changes = count(entry["changes"]) ?? 0;
+    // A rename with no line changes has no patch to show; every other file without one is a gap.
+    const patchOmitted = patch === null && !(status === "renamed" && changes === 0);
+    if (patchOmitted) {
+      gaps.push({ kind: "PATCH_OMITTED", lookup, file: filename,
+        detail: "GitHub returned no patch for this file (binary, too large, or otherwise omitted); its diff is not in this answer" });
+    }
+    files.push({
+      filename,
+      previousFilename: text(entry["previous_filename"]),
+      status,
+      additions: count(entry["additions"]) ?? 0,
+      deletions: count(entry["deletions"]) ?? 0,
+      changes,
+      patchOmitted,
+      blobUrl: httpsUrl(entry["blob_url"]),
+      patch,
+    });
   }
   if (changedFiles === null) {
-    gaps.push({ kind: "MALFORMED_RESPONSE", lookup: `${root}/pulls/${prNumber}`, detail: "the pull request carries no changed_files count" });
+    gaps.push({ kind: "MALFORMED_RESPONSE", lookup: pullLookup, detail: "the pull request carries no changed_files count" });
   } else if (files.length !== changedFiles) {
-    gaps.push({ kind: "COUNT_MISMATCH", lookup, detail: `${files.length} files listed, the pull request reports ${changedFiles}` });
+    gaps.push({ kind: "COUNT_MISMATCH", lookup, detail: `${files.length} files listed, the pull request reports ${changedFiles}`
+      + (files.length >= COMPARE_FILE_LIMIT ? `; GitHub's compare lists at most ${COMPARE_FILE_LIMIT}` : "") });
   }
-  return { files, gaps };
+  let mergeBase: FileRead["mergeBase"] = null;
+  if (compare) {
+    const mergeBaseSha = text(record(compare["merge_base_commit"])?.["sha"]);
+    if (mergeBaseSha !== null && SHA.test(mergeBaseSha)) {
+      mergeBase = { sha: mergeBaseSha, compareStatus: text(compare["status"]), aheadBy: count(compare["ahead_by"]), behindBy: count(compare["behind_by"]) };
+    } else {
+      gaps.push({ kind: "MALFORMED_RESPONSE", lookup, detail: "the compare answer carries no merge-base commit" });
+    }
+  }
+  return { files, gaps, mergeBase, compareUrl: httpsUrl(compare?.["html_url"]), lookup };
 };
 
 /** Each file's section: a git header, and its GitHub patch when there is one. */
@@ -437,7 +477,12 @@ const readRequired = async (github: GitHubReadClient, root: string, baseRef: str
   return { required: [...required.values()], branchLookup, rulesLookup };
 };
 
-/** A required check is satisfied only by a completed `success` at the head, from the named app when one is named. */
+/**
+ * GitHub's protected-branch semantics: a required check passes on a completed `success`, `neutral` or `skipped`,
+ * and a required status on `success`. Only what was observed at the head counts, from the named app when one is named.
+ */
+const PASSING_CONCLUSIONS: ReadonlySet<string> = new Set(["success", "neutral", "skipped"]);
+
 const evaluateRequired = (
   required: Array<{ context: string; appId: number | null; sources: Set<"branch-protection" | "ruleset"> }>,
   checkRuns: PrEvidenceCheckRun[],
@@ -450,7 +495,7 @@ const evaluateRequired = (
     ...states.map((status) => ({ kind: "status" as const, state: status.state, url: status.url })),
   ];
   const satisfied = observed.length > 0
-    && runs.every((run) => run.status === "completed" && run.conclusion === "success")
+    && runs.every((run) => run.status === "completed" && run.conclusion !== null && PASSING_CONCLUSIONS.has(run.conclusion))
     && states.every((status) => status.state === "success");
   return { context, appId, sources: [...sources], satisfied, observed };
 });
@@ -564,7 +609,8 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
   }
 
   const changedFiles = count(pull["changed_files"]);
-  const read = await readFiles(source.github, root, input.prNumber, changedFiles);
+  // By the two SHAs, on every page: see the module comment.
+  const read = await readComparedFiles(source.github, root, baseSha, headSha, changedFiles, pullLookup);
   const incomplete = [...read.gaps];
   const diff = diffOf(read.files);
   const diffSha256 = sha256(diff);
@@ -575,46 +621,19 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
   }
   const offset = cursor?.o ?? 0;
   if (offset > diff.length) return deny(ReasonCode.INVALID_ARGUMENT, "cursor points past the end of the diff", {});
-  const pageChars = input.pageChars ?? PR_EVIDENCE_DIFF_PAGE_MAX_CHARS;
-  let end = Math.min(offset + pageChars, diff.length);
-  // A cut between the halves of a surrogate pair would leave half a character in each page.
-  const last = diff.charCodeAt(end - 1);
-  if (end < diff.length && end - offset > 1 && last >= 0xd800 && last <= 0xdbff) end -= 1;
-  const done = end >= diff.length;
-  const page = {
-    offset,
-    chars: end - offset,
-    nextCursor: done ? null : encodeCursor({ v: 1, p: input.projectId, r: identity, n: input.prNumber, b: baseSha, h: headSha, d: diffSha256, o: end }),
-    done,
-    totalChars: diff.length,
-    totalUtf8Bytes: Buffer.byteLength(diff, "utf8"),
-    sha256: diffSha256,
-    fileCount: read.files.length,
-    text: diff.slice(offset, end),
-  };
 
   let summary: PrEvidenceSummary | null = null;
-  if (!cursor) {
+  if (cursor) {
+    if (cursor.g > 0) {
+      incomplete.unshift({ kind: "SNAPSHOT_INCOMPLETE", lookup: pullLookup,
+        detail: `the first page of this read named ${cursor.g} gap(s) (digest ${cursor.gd}); every page of it is incomplete` });
+    }
+  } else {
     const mergeable = bool(pull["mergeable"]);
     const mergeableState = text(pull["mergeable_state"]);
     if (mergeable === null || mergeableState === null || mergeableState === "unknown") {
       incomplete.push({ kind: "MERGEABILITY_NOT_COMPUTED", lookup: pullLookup,
         detail: "GitHub has not computed this pull request's mergeability yet; ask again" });
-    }
-    const compareLookup = `${root}/compare/${baseSha}...${headSha}`;
-    let mergeBase: PrEvidenceSummary["mergeBase"] = null;
-    let compareUrl: string | null = null;
-    try {
-      const compare = record(await source.github.get<unknown>(`${compareLookup}?per_page=1`));
-      const mergeBaseSha = text(record(compare?.["merge_base_commit"])?.["sha"]);
-      if (mergeBaseSha !== null && SHA.test(mergeBaseSha)) {
-        mergeBase = { sha: mergeBaseSha, compareStatus: text(compare?.["status"]), aheadBy: count(compare?.["ahead_by"]), behindBy: count(compare?.["behind_by"]) };
-        compareUrl = httpsUrl(compare?.["html_url"]);
-      } else {
-        incomplete.push({ kind: "MALFORMED_RESPONSE", lookup: compareLookup, detail: "the compare answer carries no merge-base commit" });
-      }
-    } catch (error) {
-      incomplete.push(gap(error, compareLookup, "the merge-base could not be read"));
     }
     const checks = await readChecks(source.github, root, headSha, incomplete);
     const required = await readRequired(source.github, root, baseRef, incomplete);
@@ -629,7 +648,7 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
         headRef: text(head?.["ref"]) ?? "", baseRef, mergeable, mergeableState,
         changedFiles, additions: count(pull["additions"]), deletions: count(pull["deletions"]), commits: count(pull["commits"]),
       },
-      mergeBase,
+      mergeBase: read.mergeBase,
       files: read.files.map((file): PrEvidenceFile => ({
         filename: file.filename, previousFilename: file.previousFilename, status: file.status, additions: file.additions,
         deletions: file.deletions, changes: file.changes, patchOmitted: file.patchOmitted, blobUrl: file.blobUrl,
@@ -638,14 +657,36 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
       requiredChecks: { declared: contexts.length > 0, contexts, allSatisfied },
       urls: {
         pull: html, files: html === null ? null : `${html}/files`, checks: html === null ? null : `${html}/checks`,
-        diff: httpsUrl(pull["diff_url"]), patch: httpsUrl(pull["patch_url"]), compare: compareUrl,
+        diff: httpsUrl(pull["diff_url"]), patch: httpsUrl(pull["patch_url"]), compare: read.compareUrl,
         api: {
-          pull: pullLookup, files: `${pullLookup}/files`, compare: compareLookup, checkRuns: checks.runsLookup,
+          pull: pullLookup, compare: read.lookup, checkRuns: checks.runsLookup,
           status: checks.statusLookup, branch: required.branchLookup, rules: required.rulesLookup,
         },
       },
     };
   }
+
+  // Sliced after every read of the snapshot, so the next cursor carries the first page's whole gap list.
+  const pageChars = input.pageChars ?? PR_EVIDENCE_DIFF_PAGE_MAX_CHARS;
+  let end = Math.min(offset + pageChars, diff.length);
+  // A cut between the halves of a surrogate pair would leave half a character in each page.
+  const last = diff.charCodeAt(end - 1);
+  if (end < diff.length && end - offset > 1 && last >= 0xd800 && last <= 0xdbff) end -= 1;
+  const done = end >= diff.length;
+  const carried = cursor ? { g: cursor.g, gd: cursor.gd } : { g: incomplete.length, gd: digestOf(incomplete) };
+  const page = {
+    offset,
+    chars: end - offset,
+    nextCursor: done ? null : encodeCursor({
+      v: 1, p: input.projectId, r: identity, n: input.prNumber, b: baseSha, h: headSha, d: diffSha256, o: end, ...carried,
+    }),
+    done,
+    totalChars: diff.length,
+    totalUtf8Bytes: Buffer.byteLength(diff, "utf8"),
+    sha256: diffSha256,
+    fileCount: read.files.length,
+    text: diff.slice(offset, end),
+  };
 
   const evidence: PrEvidence = {
     schema: "acp.pr-evidence.v1",

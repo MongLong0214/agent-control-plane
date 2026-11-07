@@ -29,9 +29,12 @@ const ELSEWHERE = "e5".repeat(20);
 
 type Row = Record<string, unknown>;
 
-/** FakeGitHub plus the PR files, combined status, branch, rules and merge-base compare reads. */
+/** FakeGitHub plus the PR files, combined status, branch, rules and compare reads. */
 class PrEvidenceGitHub extends FakeGitHub {
-  files = new Map<number, Row[]>();
+  /** The changed files GitHub holds for each head SHA. */
+  filesByHead = new Map<string, Row[]>();
+  /** Runs after a PR read is answered: a push landing between that read and the next one. */
+  afterPullRead: ((number: number) => void) | null = null;
   statuses: Array<{ sha: string; context: string; state: string; target_url: string | null }> = [];
   branchBodies = new Map<string, Row>();
   rules = new Map<string, Row[]>();
@@ -45,14 +48,24 @@ class PrEvidenceGitHub extends FakeGitHub {
     const status = /\/repos\/acme\/fixture\/commits\/([0-9a-f]{40})\/status\?per_page=(\d+)&page=(\d+)$/.exec(path);
     const branch = /\/repos\/acme\/fixture\/branches\/([^/?]+)$/.exec(path);
     const rules = /\/repos\/acme\/fixture\/rules\/branches\/([^/?]+)\?per_page=(\d+)&page=(\d+)$/.exec(path);
-    const compare = /\/repos\/acme\/fixture\/compare\/([0-9a-f]{40})\.\.\.([0-9a-f]{40})\?per_page=1$/.exec(path);
-    const mine = failure !== undefined || files || status || branch || rules || compare
-      || (method === "GET" && pull && !this.pulls.some((p) => p.number === Number(pull[1])));
+    const compare = /\/repos\/acme\/fixture\/compare\/([0-9a-f]{40})\.\.\.([^?]+)\?per_page=1$/.exec(path);
+    const mine = failure !== undefined || files || status || branch || rules || compare || (method === "GET" && pull);
     if (!mine) return super.request<T>(method, path, body);
     this.calls.push({ method, path, body });
     if (failure) throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method, status: failure.status });
     const page = <R>(all: R[], size: string, at: string): R[] => all.slice((Number(at) - 1) * Number(size), Number(at) * Number(size));
-    if (files) return page(this.files.get(Number(files[1])) ?? [], files[2]!, files[3]!) as T;
+    if (pull) {
+      const found = this.pulls.find((p) => p.number === Number(pull[1]));
+      if (!found) throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method, status: 404 });
+      const answered = structuredClone(found);
+      this.afterPullRead?.(found.number);
+      return answered as T;
+    }
+    // By PR number: whatever the PR's head is when this request is answered.
+    if (files) {
+      const current = this.pulls.find((p) => p.number === Number(files[1]));
+      return page(this.filesByHead.get(current?.head.sha ?? "") ?? [], files[2]!, files[3]!) as T;
+    }
     if (status) {
       const sha = status[1]!;
       const all = this.statuses.filter((s) => s.sha === sha);
@@ -66,20 +79,25 @@ class PrEvidenceGitHub extends FakeGitHub {
     }
     if (rules) return page(this.rules.get(decodeURIComponent(rules[1]!)) ?? [], rules[2]!, rules[3]!) as T;
     if (compare) {
+      // A 40-hex head is that commit; anything else is a branch name, resolved to its PR's head now.
+      const named = decodeURIComponent(compare[2]!);
+      const head = /^[0-9a-f]{40}$/.test(named) ? named : this.pulls.find((p) => p.head.ref === named)?.head.sha ?? "";
+      // GitHub's compare lists at most 300 files.
       return { status: "ahead", ahead_by: 2, behind_by: 0, merge_base_commit: { sha: MERGE_BASE },
+        files: (this.filesByHead.get(head) ?? []).slice(0, 300),
         html_url: `https://github.com/acme/fixture/compare/${compare[1]}...${compare[2]}` } as T;
     }
     throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method, status: 404 });
   }
 }
 
-const fileRow = (index: number, padding = 900): Row => ({
+const fileRow = (index: number, padding = 900, tag = "A"): Row => ({
   filename: `src/f${String(index).padStart(3, "0")}.ts`,
   status: "modified",
   additions: 2,
   deletions: 1,
   changes: 3,
-  patch: `@@ -1 +1,2 @@\n-old ${index}\n+new ${index}\n+${"x".repeat(padding)}`,
+  patch: `@@ -1 +1,2 @@\n-old ${index}\n+new ${tag}${index}\n+${"x".repeat(padding)}`,
   blob_url: `https://github.com/acme/fixture/blob/${HEAD_A}/src/f${index}.ts`,
 });
 
@@ -106,7 +124,7 @@ const pullRow = (number: number, head: string, changedFiles: number, extra: Row 
 interface Page {
   compared: { baseSha: string; headSha: string };
   diff: { offset: number; chars: number; nextCursor: string | null; done: boolean; totalChars: number; sha256: string; text: string };
-  incomplete: Array<{ kind: string; lookup: string; file?: string; page?: number; status?: number }>;
+  incomplete: Array<{ kind: string; lookup: string; detail: string; file?: string; page?: number; status?: number }>;
   complete: boolean;
   summary: null | {
     pull: { state: string; mergeable: boolean | null; mergeableState: string | null };
@@ -116,7 +134,7 @@ interface Page {
       checkRuns: Array<{ name: string; headSha: string; conclusion: string | null; url: string | null }>;
       statuses: Array<{ context: string; state: string; url: string | null }>;
     };
-    requiredChecks: { declared: boolean; allSatisfied: boolean | null; contexts: Array<{ context: string; satisfied: boolean }> };
+    requiredChecks: { declared: boolean; allSatisfied: boolean | null; contexts: Array<{ context: string; satisfied: boolean; observed: Array<{ state: string | null }> }> };
     urls: Record<string, unknown>;
   };
 }
@@ -176,7 +194,8 @@ beforeAll(async () => {
 
 beforeEach(() => {
   gh.pulls = [];
-  gh.files.clear();
+  gh.filesByHead.clear();
+  gh.afterPullRead = null;
   gh.checkRuns = [];
   gh.statuses = [];
   gh.failing = [];
@@ -202,7 +221,7 @@ afterAll(async () => {
 /** A green 150-file PR at HEAD_A: two GitHub file pages, a passing check and status at the head. */
 const seedNormalPull = (number: number): void => {
   gh.pulls.push(pullRow(number, HEAD_A, 150));
-  gh.files.set(number, Array.from({ length: 150 }, (_, i) => fileRow(i)));
+  gh.filesByHead.set(HEAD_A, Array.from({ length: 150 }, (_, i) => fileRow(i)));
   gh.checkRuns.push(
     { id: 1, name: "ci", head_sha: HEAD_A, status: "completed", conclusion: "success", app: { slug: "github-actions" },
       details_url: "https://github.com/acme/fixture/actions/runs/1" },
@@ -257,15 +276,18 @@ describe("pr_evidence_get", () => {
     expect(pages.every((page) => page.diff.sha256 === first!.diff.sha256 && page.diff.totalChars === joined.length)).toBe(true);
     // Every file's patch is in the diff, in GitHub's order, under its own header.
     let at = 0;
-    for (const row of gh.files.get(7)!) {
+    for (const row of gh.filesByHead.get(HEAD_A)!) {
       const header = joined.indexOf(`diff --git a/${String(row["filename"])} b/${String(row["filename"])}\n`, at);
       expect(header, String(row["filename"])).toBeGreaterThanOrEqual(at);
       const patch = joined.indexOf(String(row["patch"]), header);
       expect(patch).toBeGreaterThan(header);
       at = patch;
     }
-    // Both GitHub file pages were read.
-    expect(gh.calls.some((call) => /\/pulls\/7\/files\?per_page=100&page=2$/.test(call.path))).toBe(true);
+    // The files and patches were read by the compared SHAs on every page, never by PR number.
+    const compares = gh.calls.filter((call) => call.path.includes("/compare/"));
+    expect(compares.length).toBe(pages.length);
+    expect(compares.every((call) => call.path === `/repos/acme/fixture/compare/${BASE}...${HEAD_A}?per_page=1`)).toBe(true);
+    expect(gh.calls.some((call) => call.path.includes("/files"))).toBe(false);
 
     const summary = first!.summary!;
     expect(first!.complete).toBe(true);
@@ -296,6 +318,69 @@ describe("pr_evidence_get", () => {
     expect(page.summary!.requiredChecks.contexts.find((c) => c.context === "ci")).toMatchObject({ satisfied: false });
   });
 
+  it("counts neutral and skipped like success for a required check, as GitHub's protected branches do", async () => {
+    seedNormalPull(20);
+    gh.checkRuns[0] = { ...gh.checkRuns[0]!, conclusion: "neutral" };
+    gh.checkRuns.push({ id: 4, name: "docs", head_sha: HEAD_A, status: "completed", conclusion: "skipped" });
+    gh.branchBodies.set("main", { name: "main", protected: true, protection: { enabled: true,
+      required_status_checks: { enforcement_level: "everyone", contexts: ["ci", "docs"], checks: [{ context: "ci", app_id: null }, { context: "docs", app_id: null }] } } });
+    const page = pageOf(await ceoCall({ projectId, prNumber: 20, expectedHead: HEAD_A }));
+    expect(page.summary!.requiredChecks.contexts.map((c) => [c.context, c.satisfied, c.observed.map((o) => o.state)]))
+      .toEqual([["ci", true, ["neutral"]], ["docs", true, ["skipped"]], ["lint", true, ["success"]]]);
+    expect(page.summary!.requiredChecks.allSatisfied).toBe(true);
+  });
+
+  it("binds the diff to the head it is labelled with when the PR moves while it is read", async () => {
+    // Same file count at both heads, different patches.
+    gh.pulls.push(pullRow(18, HEAD_A, 3));
+    gh.filesByHead.set(HEAD_A, [0, 1, 2].map((i) => fileRow(i, 10, "A")));
+    gh.filesByHead.set(HEAD_B, [0, 1, 2].map((i) => fileRow(i, 10, "B")));
+    gh.checkRuns.push({ id: 5, name: "ci", head_sha: HEAD_A, status: "completed", conclusion: "success" });
+    gh.statuses.push({ sha: HEAD_A, context: "lint", state: "success", target_url: null });
+    // A push to B lands right after the PR read answers A.
+    gh.afterPullRead = (number) => { if (number === 18) gh.pulls[0] = pullRow(18, HEAD_B, 3); };
+    const page = pageOf(await ceoCall({ projectId, prNumber: 18, expectedHead: HEAD_A }));
+    expect(page.compared.headSha).toBe(HEAD_A);
+    expect(page.diff.text).toContain("+new A0\n");
+    expect(page.diff.text).not.toContain("+new B");
+    expect(page.summary!.checks.checkRuns.every((run) => run.headSha === HEAD_A)).toBe(true);
+  });
+
+  it("carries the first page's incompleteness onto every continuation page", async () => {
+    seedNormalPull(19);
+    gh.failing.push({ pattern: /\/check-runs/, status: 502 });
+    const first = await ceoCall({ projectId, prNumber: 19, expectedHead: HEAD_A, pageChars: 40_000 });
+    expect(first).toMatchObject({ ok: false, reasonCode: ReasonCode.COVERAGE_INCOMPLETE });
+    if (first.ok) throw new Error("unreachable");
+    let cursor = (first.evidence as unknown as Page).diff.nextCursor;
+    expect(cursor).toEqual(expect.any(String));
+    // GitHub recovers; the snapshot the pages belong to stays incomplete.
+    gh.failing = [];
+    let continuations = 0;
+    while (cursor) {
+      const next = await ceoCall({ projectId, prNumber: 19, expectedHead: HEAD_A, pageChars: 40_000, cursor });
+      expect(next).toMatchObject({ ok: false, reasonCode: ReasonCode.COVERAGE_INCOMPLETE });
+      if (next.ok) throw new Error("unreachable");
+      const page = next.evidence as unknown as Page;
+      expect(page.complete).toBe(false);
+      expect(page.incomplete).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "SNAPSHOT_INCOMPLETE" })]));
+      cursor = page.diff.nextCursor;
+      continuations += 1;
+    }
+    expect(continuations).toBeGreaterThan(1);
+  });
+
+  it("names a PR over GitHub's 300-file compare limit as incomplete", async () => {
+    gh.pulls.push(pullRow(21, HEAD_A, 301));
+    gh.filesByHead.set(HEAD_A, Array.from({ length: 301 }, (_, i) => fileRow(i, 1)));
+    gh.checkRuns.push({ id: 6, name: "ci", head_sha: HEAD_A, status: "completed", conclusion: "success" });
+    gh.statuses.push({ sha: HEAD_A, context: "lint", state: "success", target_url: null });
+    const answer = await ceoCall({ projectId, prNumber: 21, expectedHead: HEAD_A });
+    expect(answer).toMatchObject({ ok: false, reasonCode: ReasonCode.COVERAGE_INCOMPLETE });
+    if (answer.ok) throw new Error("unreachable");
+    expect((answer.evidence as unknown as Page).incomplete).toEqual([expect.objectContaining({ kind: "COUNT_MISMATCH" })]);
+  });
+
   it("refuses a project, PR or input that is not a registered repository's, before asking GitHub", async () => {
     seedNormalPull(9);
     expect(await ceoCall({ projectId: "not-a-project", prNumber: 9, expectedHead: HEAD_A }))
@@ -317,10 +402,15 @@ describe("pr_evidence_get", () => {
     // A page token another PR was issued is not this PR's.
     const first = pageOf(await ceoCall({ projectId, prNumber: 9, expectedHead: HEAD_A, pageChars: 1_000 }));
     gh.pulls.push(pullRow(10, HEAD_A, 150));
-    gh.files.set(10, gh.files.get(9)!);
     expect(await ceoCall({ projectId, prNumber: 10, expectedHead: HEAD_A, cursor: first.diff.nextCursor }))
       .toMatchObject({ ok: false, reasonCode: ReasonCode.INVALID_ARGUMENT });
     expect(await ceoCall({ projectId, prNumber: 9, expectedHead: HEAD_A, cursor: "eyJ2IjoxfQ" }))
+      .toMatchObject({ ok: false, reasonCode: ReasonCode.INVALID_ARGUMENT });
+    // A token whose payload was edited (here: a later offset) is not one this tool issued.
+    const [payload, mac] = first.diff.nextCursor!.split(".");
+    const edited = { ...JSON.parse(Buffer.from(payload!, "base64url").toString("utf8")) as Row, o: 5_000 };
+    const forged = `${Buffer.from(JSON.stringify(edited), "utf8").toString("base64url")}.${mac}`;
+    expect(await ceoCall({ projectId, prNumber: 9, expectedHead: HEAD_A, cursor: forged }))
       .toMatchObject({ ok: false, reasonCode: ReasonCode.INVALID_ARGUMENT });
   });
 
@@ -340,6 +430,7 @@ describe("pr_evidence_get", () => {
     expect(first.diff.done).toBe(false);
     // The head moves to HEAD_B with the same files.
     gh.pulls[0] = pullRow(12, HEAD_B, 150);
+    gh.filesByHead.set(HEAD_B, gh.filesByHead.get(HEAD_A)!);
     // The CEO asking for HEAD_B with HEAD_A's token: the token names another head.
     expect(await ceoCall({ projectId, prNumber: 12, expectedHead: HEAD_B, cursor: token })).toMatchObject({
       ok: false, reasonCode: ReasonCode.SNAPSHOT_STALE, evidence: { tokenHeadSha: HEAD_A, expectedHead: HEAD_B } });
@@ -348,21 +439,21 @@ describe("pr_evidence_get", () => {
       ok: false, reasonCode: ReasonCode.MERGE_HEAD_STALE, evidence: { expectedHead: HEAD_A, headSha: HEAD_B } });
     // The same head with a different diff (a page of files changed under it) refuses the token too.
     gh.pulls[0] = pullRow(12, HEAD_A, 150);
-    gh.files.set(12, [...gh.files.get(12)!.slice(0, 149), fileRow(999)]);
+    gh.filesByHead.set(HEAD_A, [...gh.filesByHead.get(HEAD_A)!.slice(0, 149), fileRow(999)]);
     expect(await ceoCall({ projectId, prNumber: 12, expectedHead: HEAD_A, cursor: token }))
       .toMatchObject({ ok: false, reasonCode: ReasonCode.SNAPSHOT_STALE });
   });
 
-  it("names a failed file page as incomplete and never reports the checks as satisfied", async () => {
+  it("names a failed diff read as incomplete and never reports the checks as satisfied", async () => {
     seedNormalPull(13);
-    gh.failing.push({ pattern: /\/pulls\/13\/files\?per_page=100&page=2$/, status: 502 });
+    gh.failing.push({ pattern: /\/compare\//, status: 502 });
     const answer = await ceoCall({ projectId, prNumber: 13, expectedHead: HEAD_A });
     expect(answer).toMatchObject({ ok: false, reasonCode: ReasonCode.COVERAGE_INCOMPLETE });
     if (answer.ok) throw new Error("unreachable");
     const page = answer.evidence as unknown as Page;
     expect(page.complete).toBe(false);
     expect(page.incomplete).toEqual(expect.arrayContaining([
-      expect.objectContaining({ kind: "LOOKUP_FAILED", page: 2, status: 502 }),
+      expect.objectContaining({ kind: "LOOKUP_FAILED", status: 502 }),
       expect.objectContaining({ kind: "COUNT_MISMATCH" }),
     ]));
     expect(page.summary!.requiredChecks.allSatisfied).toBeNull();
@@ -373,7 +464,7 @@ describe("pr_evidence_get", () => {
     gh.pulls.push(pullRow(14, HEAD_A, 3));
     const omitted: Row = { ...fileRow(1), filename: "assets/huge.json", additions: 40_000, changes: 40_000 };
     delete omitted["patch"];
-    gh.files.set(14, [fileRow(0), omitted, fileRow(2)]);
+    gh.filesByHead.set(HEAD_A, [fileRow(0), omitted, fileRow(2)]);
     gh.checkRuns.push({ id: 3, name: "ci", head_sha: HEAD_A, status: "completed", conclusion: "success" });
     gh.statuses.push({ sha: HEAD_A, context: "lint", state: "success", target_url: null });
     const answer = await ceoCall({ projectId, prNumber: 14, expectedHead: HEAD_A });
