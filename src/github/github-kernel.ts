@@ -35,6 +35,7 @@ import {
   gitBytes,
 } from "../git/branch-objects.ts";
 import { scanPublication, workflowChanges } from "./branch-publish.ts";
+import { commitloreGoverned } from "../bootstrap/commitlore-mode.ts";
 
 /**
  * The gate's GitHub-side correlator: run, candidate, and the payload digest that binds the rest.
@@ -324,6 +325,59 @@ interface PreparedPrIntent {
 
 /** Where CommitLore keeps a commit's records beside its message; a merge does not move it (#1269). */
 const NOTES_REF = "refs/notes/commitlore";
+
+/** #1268 — one note the candidate's checkout holds: the commit it is attached to, and the note's blob. */
+interface CandidateNote {
+  readonly object: string;
+  readonly blob: string;
+}
+
+/** CommitLore's own keys (SPEC §3). In a note, an earlier paragraph that declares one is a record block. */
+const COMMITLORE_KEYS: ReadonlySet<string> = new Set([
+  "Limit", "Ruled-out", "Warn", "Blast", "Undo", "Certainty", "Verified", "Unverified", "Record-Id", "Follows",
+  "Supersedes", "Expires", "Evidence", "Provenance", "CommitLore-Version",
+]);
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
+
+/**
+ * #1268 — the trailer block of `message` as CommitLore parses one (`parseCommitMessage`): git's own parser,
+ * `interpret-trailers --parse --no-divider` with the separator pinned to `:`, each line split at its first `: `
+ * (a bare `Key:` has an empty value). A field is `key\0value`; any other line, or output that is not UTF-8, throws.
+ */
+const trailerFields = async (cwd: string, message: string): Promise<string[]> => {
+  const parsed = await gitBytes(cwd, ["-c", "trailer.separators=:", "interpret-trailers", "--parse", "--no-divider"], {
+    input: Buffer.from(message, "utf8"),
+  });
+  return strictUtf8.decode(parsed.stdout).split("\n").filter((line) => line.length > 0).map((line) => {
+    const at = line.indexOf(": ");
+    if (at !== -1) return `${line.slice(0, at)}\u0000${line.slice(at + 2)}`;
+    if (line.endsWith(":")) return `${line.slice(0, -1)}\u0000`;
+    throw new Error("git interpret-trailers answered a line that is not a trailer");
+  });
+};
+
+/**
+ * #1268 — the record blocks CommitLore reads in a commit message, or in a note body (`note`), by its grammar
+ * (SPEC §2.4, `parseRecordBlocks`): each earlier paragraph that is wholly a trailer block and declares a
+ * `Record-Id` (in a note, any CommitLore key), then the last paragraph's trailer block. A note body is read under
+ * the synthetic subject CommitLore reads one under.
+ */
+const recordBlocks = async (cwd: string, text: string, note: boolean): Promise<string[][]> => {
+  const message = note ? `commitlore notes mirror\n\n${text}` : text;
+  const blocks: string[][] = [];
+  const paragraphs = message.replace(/\r\n/g, "\n").split(/\n\n+/).filter((paragraph) => paragraph.trim() !== "");
+  for (const paragraph of paragraphs.slice(0, -1)) {
+    if (!note && !/record-id/i.test(paragraph)) continue;
+    const fields = await trailerFields(cwd, `x\n\n${paragraph}`);
+    const keys = fields.map((field) => field.slice(0, field.indexOf("\u0000")));
+    if (keys.some((key) => (note ? COMMITLORE_KEYS.has(key) || /^X-./.test(key) : key === "Record-Id"))) blocks.push(fields);
+  }
+  const last = await trailerFields(cwd, message);
+  return last.length === 0 ? blocks : [...blocks, last];
+};
+
+/** A block's fields, every one of them and in any order: a mirror is the same fields, not only the same Record-Id. */
+const blockSignature = (fields: readonly string[]): string => JSON.stringify([...fields].sort());
 /** #1345 — pages of 100 closing references read for one PR; a PLAN's 200 work units fit in 2. */
 const CLOSING_REFERENCE_PAGE_BOUND = 10;
 
@@ -1895,7 +1949,7 @@ export class GitHubKernel {
   /** `mergeEvaluate`, also naming the gate payload it selected, which `mergeExecute` re-verifies before it writes. */
   private async evaluateMerge(
     input: MergeInput,
-  ): Promise<Decision<{ predicates: Record<string, boolean>; gate?: GatePayload }>> {
+  ): Promise<Decision<{ predicates: Record<string, boolean>; gate?: GatePayload; notes?: CandidateNote[] | null }>> {
     const authority = this.assertAuthority(input.runId, input.repositoryIdentity, input);
     if (!authority.allowed) return authority as Decision<{ predicates: Record<string, boolean> }>;
 
@@ -2024,8 +2078,14 @@ export class GitHubKernel {
     const stillBacked = this.assertGatePayloadBacked(gate.value, input.repositoryIdentity);
     if (!stillBacked.allowed) return stillBacked as Decision<{ predicates: Record<string, boolean> }>;
 
+    // #1268 — a governed run's notes are judged here, before anything is reserved or sent; the pairs judged are
+    // the input `mergeExecute` hands its notes carry, and a refusal sends and publishes nothing.
+    const notes = await this.checkedCandidateNotes(input);
+    if (!notes.allowed) return notes as Decision<{ predicates: Record<string, boolean> }>;
+
     return allow(ReasonCode.OK, {
       gate: gate.value,
+      notes: notes.value,
       predicates: {
         exactHead: true,
         expectedBase: true,
@@ -2909,7 +2969,7 @@ export class GitHubKernel {
       }
       return proof as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
-    const notes = await this.carryCandidateNotes(input, owner, repo, target.value);
+    const notes = await this.carryCandidateNotes(input, owner, repo, target.value, evaluation.value.notes);
     if (!notes.allowed) return this.recordNotesPending(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, notes);
 
     const finalized = this.finalizeReservedReceipt({
@@ -2972,6 +3032,92 @@ export class GitHubKernel {
     });
   }
 
+  /** #1268 — every note the registered checkout holds for a commit of base..head, as (commit, blob) pairs. */
+  private async candidateNotes(input: MergeInput): Promise<Decision<{ checkout: string; notes: CandidateNote[] }>> {
+    const checkout = this.repositories.byIdentity(input.repositoryIdentity)?.checkoutPath;
+    if (!checkout) return deny(ReasonCode.EVIDENCE_MISSING, "the candidate's checkout is not registered, so its notes cannot be read");
+    const text = async (args: readonly string[]) => (await gitBytes(checkout, args)).stdout.toString("utf8");
+    const notes: CandidateNote[] = [];
+    try {
+      if ((await text(["for-each-ref", "--format=%(objectname)", NOTES_REF])).trim() !== "") {
+        const listed = new Map((await text(["notes", `--ref=${NOTES_REF}`, "list"])).split("\n").filter(Boolean)
+          .map((line) => [line.split(" ")[1], line.split(" ")[0]] as const));
+        for (const object of (await text(["rev-list", `${input.expectedBaseSha}..${input.exactHeadSha}`])).split("\n").filter(Boolean)) {
+          const blob = listed.get(object);
+          if (blob) notes.push({ object, blob });
+        }
+      }
+    } catch {
+      return deny(ReasonCode.EVIDENCE_MISSING, "the candidate's CommitLore notes could not be read from its checkout");
+    }
+    return allow(ReasonCode.OK, { checkout, notes });
+  }
+
+  /**
+   * #1268 — the notes of a governed run (`commitloreGoverned`), read and judged (`judgeCandidateNotes`) by the
+   * merge evaluation, before the merge PUT: the pairs judged are the input `carryCandidateNotes` copies. A run that
+   * is not governed is not read here (null), and its notes are carried as they always were.
+   */
+  private async checkedCandidateNotes(input: MergeInput): Promise<Decision<CandidateNote[] | null>> {
+    if (!commitloreGoverned(this.db, input.runId)) return allow(ReasonCode.OK, null);
+    const preflight = (refusal: Decision<unknown> & { allowed: false }) =>
+      deny<CandidateNote[] | null>(refusal.reasonCode, refusal.message, { phase: "preflight-notes", ref: NOTES_REF, ...refusal.evidence });
+    const read = await this.candidateNotes(input);
+    if (!read.allowed) return preflight(read);
+    const judged = await this.judgeCandidateNotes(read.value.checkout, read.value.notes);
+    if (!judged.allowed) return preflight(judged);
+    return allow(ReasonCode.OK, read.value.notes);
+  }
+
+  /**
+   * #1268 — a governed run's note is carried only when it is its own commit's: every record block in the note
+   * (its blob, the bytes a carry copies) is, field for field, a record block of that commit's message. It may
+   * hold fewer blocks than the message; Record-Id alone is not a match; a commit with no record of its own has
+   * none to mirror. A note naming `Provenance: inherited` is a squash-preserve transport, refused as unsupported
+   * here. A commit with no note is not asked. One refused note refuses every one, so nothing is published.
+   */
+  private async judgeCandidateNotes(checkout: string, notes: readonly CandidateNote[]): Promise<Decision<void>> {
+    const inherited: string[] = [];
+    const unbound: string[] = [];
+    try {
+      for (const note of notes) {
+        const blocks = await recordBlocks(checkout, strictUtf8.decode((await gitBytes(checkout, ["cat-file", "blob", note.blob])).stdout), true);
+        if (blocks.some((fields) => fields.some((field) => /^Provenance\u0000inherited(\s|$)/.test(field)))) {
+          inherited.push(note.object);
+          continue;
+        }
+        // The message in UTF-8, whatever the checkout's display encoding (`i18n.logOutputEncoding`): git converts
+        // it from the commit's declared `encoding`, and the flags keep `log.*` settings from adding any byte. A
+        // message git cannot convert to UTF-8 comes back as it is stored, and the strict decode refuses it.
+        const message = strictUtf8.decode((await gitBytes(checkout, [
+          "log", "-1", "--no-show-signature", "--no-decorate", "--no-notes", "--no-color", "--encoding=UTF-8", "--format=%B",
+          "--end-of-options", note.object,
+        ])).stdout);
+        const own = new Set((await recordBlocks(checkout, message, false)).map(blockSignature));
+        if (!blocks.every((fields) => own.has(blockSignature(fields)))) unbound.push(note.object);
+      }
+    } catch {
+      return deny(ReasonCode.VERIFICATION_GAP, "a candidate note or its commit's message could not be read, so no note is published", {
+        refusal: "COMMITLORE_NOTE_UNREADABLE",
+      });
+    }
+    if (inherited.length > 0) {
+      return deny(ReasonCode.VERIFICATION_GAP,
+        "a candidate note carries Provenance: inherited, a squash-preserve transport that is unsupported on the governed carry path; no note is published", {
+          refusal: "COMMITLORE_NOTE_INHERITED_UNSUPPORTED",
+          objects: inherited,
+          ...(unbound.length > 0 ? { unbound } : {}),
+        });
+    }
+    if (unbound.length > 0) {
+      return deny(ReasonCode.VERIFICATION_GAP, "a candidate note holds a record block its own commit's message does not, so no note is published", {
+        refusal: "COMMITLORE_NOTE_UNBOUND",
+        objects: unbound,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
   /**
    * #1269 — the candidate's CommitLore notes, on the remote. A merge commit keeps the branch's commits, but
    * their notes travel only on `refs/notes/commitlore`, which no merge moves. Every note the registered
@@ -2979,30 +3125,43 @@ export class GitHubKernel {
    * are written through the Git Data API (their blobs, a tree on the remote notes tree, a commit on the
    * remote notes commit, then a fast-forward of the ref), and the ref is then read back. A remote note that
    * differs is never overwritten, and every failure is a refusal the caller records as a pending proof failure.
+   *
+   * #1268 — for a governed run the copy's input is only judged notes. `checked` is the set `mergeExecute`
+   * judged before its PUT: the checkout must still hold exactly those (commit, blob) pairs, or nothing is
+   * published, and they are what is copied. Without it (a settlement), the governed notes read here are judged
+   * here first.
    */
   private async carryCandidateNotes(
     input: MergeInput,
     owner: string,
     repo: string,
     target: GitHubWriteTarget,
+    checked: readonly CandidateNote[] | null = null,
   ): Promise<Decision<{ notes: number }>> {
     const refused = (message: string, evidence: Record<string, unknown> = {}) =>
       deny<{ notes: number }>(ReasonCode.EVIDENCE_MISSING, message, { phase: "postflight-notes", ref: NOTES_REF, ...evidence });
-    const checkout = this.repositories.byIdentity(input.repositoryIdentity)?.checkoutPath;
-    if (!checkout) return refused("the candidate's checkout is not registered, so its notes cannot be read");
-    const text = async (args: readonly string[]) => (await gitBytes(checkout, args)).stdout.toString("utf8");
-    const owed: Array<{ object: string; blob: string }> = [];
-    try {
-      if ((await text(["for-each-ref", "--format=%(objectname)", NOTES_REF])).trim() !== "") {
-        const listed = new Map((await text(["notes", `--ref=${NOTES_REF}`, "list"])).split("\n").filter(Boolean)
-          .map((line) => [line.split(" ")[1], line.split(" ")[0]] as const));
-        for (const object of (await text(["rev-list", `${input.expectedBaseSha}..${input.exactHeadSha}`])).split("\n").filter(Boolean)) {
-          const blob = listed.get(object);
-          if (blob) owed.push({ object, blob });
-        }
+    const read = await this.candidateNotes(input);
+    if (!read.allowed) return refused(read.message, read.evidence);
+    const { checkout } = read.value;
+    let owed: readonly CandidateNote[] = read.value.notes;
+    if (checked !== null) {
+      const pair = (note: CandidateNote) => `${note.object} ${note.blob}`;
+      const judged = new Set(checked.map(pair));
+      const held = new Set(owed.map(pair));
+      const changed = [...new Set([...checked.filter((note) => !held.has(pair(note))), ...owed.filter((note) => !judged.has(pair(note)))]
+        .map((note) => note.object))];
+      if (changed.length > 0) {
+        return refused("a candidate note changed after it was checked, so none is published", {
+          refusal: "COMMITLORE_NOTE_CHANGED",
+          objects: changed,
+        });
       }
-    } catch {
-      return refused("the candidate's CommitLore notes could not be read from its checkout");
+      owed = checked;
+    } else if (commitloreGoverned(this.db, input.runId)) {
+      const judged = await this.judgeCandidateNotes(checkout, owed);
+      if (!judged.allowed) {
+        return deny<{ notes: number }>(judged.reasonCode, judged.message, { phase: "postflight-notes", ref: NOTES_REF, ...judged.evidence });
+      }
     }
     if (owed.length === 0) return allow(ReasonCode.OK, { notes: 0 });
 
