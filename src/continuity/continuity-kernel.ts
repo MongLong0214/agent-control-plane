@@ -23,6 +23,7 @@ import { ContinuityMode, Role, type RoleBinding, RunState, SessionLifecycle, rol
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
 import { drivenModeOf } from "../runtime/provisioned-session-runtime.ts";
+import { hermesCanonicalRuntimeSql } from "../outbox/outbox.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -626,16 +627,18 @@ export class ContinuityKernel {
     // in its own session, which is recovered on itself (`CtoLifecycle.recoverDrivenPrimaryCto`).
     // The holder read here is the one this failover may replace: fenced before the first await, so
     // a binding that arrives while evaluation or admission is awaited is refused, never replaced.
-    const fenced = role === Role.PRIMARY_CTO ? this.bindings.active(roleKey) : null;
+    const holder = this.bindings.active(roleKey);
+    const fenced = role === Role.PRIMARY_CTO ? holder : null;
     if (fenced && drivenModeOf(this.db, fenced.sessionId) !== "NONE") return drivenPrimaryNotReplaceable(roleKey, fenced.sessionId);
-    // Nor one under canonical self-claim (`isAdoptedCanonicalRuntime`, the rule the outbox and
-    // `CtoLifecycle` share): its runtime is a conversation no provider launched. A failover would start
-    // a fresh headless session and move the actor onto it, and that session records no process, so the
-    // conversation's own restart could not prove its predecessor gone and claim the role back
-    // (`CanonicalSelfClaim`). Refused before anything is measured or started; the daemon revokes the
-    // role for its lost runtime and the conversation's resume and self-claim take it back.
-    if (fenced && isAdoptedCanonicalRuntime(this.db, fenced.sessionId, fenced.assignmentId)) {
-      return canonicalPrimaryNotReplaceable(roleKey, fenced.sessionId);
+    // Nor, whatever the role, a holder whose runtime an adoption bound and no provider launched
+    // (`holdsAdoptedRuntime`). A failover would start a fresh session and move the actor onto it: a
+    // canonical CTO's own restart could then not prove its predecessor gone, the session recording no
+    // process (`CanonicalSelfClaim`), and an adopted CEO would sit on a runtime that is not a Hermes one,
+    // which its tool admission refuses and which Gateway re-adoption reads as an active CEO. Refused
+    // before anything is measured or started; the daemon revokes the role for its lost runtime, and the
+    // role's own recovery takes it back: the conversation's self-claim, or the Gateway's re-adoption.
+    if (holder && holdsAdoptedRuntime(this.db, this.sessions.get(holder.sessionId), holder)) {
+      return adoptedRuntimeNotReplaceable(roleKey, holder.sessionId);
     }
     const plan = await this.evaluate(`failover:${roleKey}`);
     const assignment = plan.assignments.find((a) => a.roleKey === roleKey);
@@ -1684,10 +1687,22 @@ const drivenPrimaryNotReplaceable = <T>(roleKey: string, sessionId: string): Dec
     { roleKey, sessionId },
   );
 
-const canonicalPrimaryNotReplaceable = <T>(roleKey: string, sessionId: string): Decision<T> =>
+/**
+ * Whether a holder's runtime is one an adoption bound and no provider launched: a canonical CTO's own
+ * claude conversation (`isAdoptedCanonicalRuntime`), or an adopted Hermes CEO's Gateway, which is a
+ * Hermes runtime (the one adopted-CEO tool admission accepts) carrying the actor's Hermes target
+ * (`hermesCanonicalRuntimeSql`, the outbox's canonical-route rule). A Hermes-target actor already on a
+ * provider-launched session is not on an adopted runtime, and #649's attested survival still moves it.
+ */
+const holdsAdoptedRuntime = (db: Db, session: SessionRecord | null, holder: RoleBinding): boolean =>
+  isAdoptedCanonicalRuntime(db, holder.sessionId, holder.assignmentId) ||
+  (session?.provider === "hermes" &&
+    db.get<{ held: number }>(`SELECT ${hermesCanonicalRuntimeSql("?")} AS held`, [holder.sessionId])?.held === 1);
+
+const adoptedRuntimeNotReplaceable = <T>(roleKey: string, sessionId: string): Decision<T> =>
   deny(
     ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED,
-    "a canonical primary CTO is never failed over to another runtime; its own conversation claims the role back",
+    "an adopted runtime is never failed over to another; the role's own recovery takes it back",
     { roleKey, sessionId },
   );
 

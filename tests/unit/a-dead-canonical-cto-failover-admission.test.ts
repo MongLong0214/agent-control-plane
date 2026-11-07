@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { ControlPlane } from "../../src/app/control-plane.ts";
+import { createHermesAutoAdoption } from "../../src/bootstrap/hermes-auto-adoption.ts";
 import {
   CONTINUITY_RUNTIME_LOST_REVOCATION_REASON,
   CanonicalCtoRestoreCondition,
@@ -13,7 +14,7 @@ import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { type Decision, allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
-import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import {
   CanonicalSelfClaim,
   SELF_CLAIM_EXECUTOR_KIND,
@@ -22,6 +23,7 @@ import {
   type ProcessSnapshot,
 } from "../../src/registry/canonical-self-claim.ts";
 import type { CapacityReading } from "../../src/runtime/provider.ts";
+import { adoptedFixture } from "../helpers/adopted-ceo.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest } from "../helpers/harness.ts";
 import { TestProductionAdapter } from "../helpers/production-adapter.ts";
@@ -336,6 +338,88 @@ describe("a PRIMARY_CTO continuity may replace is failed over against its own ro
         generation: 1,
         failoverRefusal: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
       }]);
+    });
+  });
+});
+
+describe("no adopted runtime is failed over, whatever its role", () => {
+  it("an adopted Hermes CEO whose Gateway died is revoked for its lost runtime and left for Gateway re-adoption", async () => {
+    const fixture = adoptedFixture();
+    const { h } = fixture;
+    try {
+      // Claude registered for the CEO the way the composition root registers it: role-scoped. The
+      // readiness check is the production one the control plane attaches.
+      const claude = new TestProductionAdapter(h.clock, "claude");
+      h.cp.providers.registerForRole(claude, Role.CEO);
+      claude.setCapacity(healthy(h.clock));
+      h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+      const daemon = new Daemon(h.cp, { stateDir: join(h.root, "daemon") });
+      const started = await daemon.start();
+      if (!started.allowed) throw new Error(started.message);
+      try {
+        const before = h.cp.db.all<{ session_id: string }>(`SELECT session_id FROM sessions ORDER BY session_id`);
+        expect(h.cp.sessions.transition(fixture.gatewaySessionId, SessionLifecycle.ERROR, "session process is dead").allowed).toBe(true);
+
+        const report = await daemon.reconcileContinuity("the Hermes Gateway died");
+
+        expect(h.cp.db.all(`SELECT session_id FROM sessions ORDER BY session_id`)).toEqual(before);
+        expect(h.cp.audit.byKind("BINDING_RUNTIME_MOVED")).toEqual([]);
+        expect(report?.reassigned).toEqual([]);
+        expect(report?.unresolved).toContainEqual({ roleKey: roleKeyFor(Role.CEO), reasonCode: ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED });
+        expect(h.cp.db.all(`SELECT current_session_id FROM conversational_actors WHERE actor_id = ?`, [fixture.actorId]))
+          .toEqual([{ current_session_id: fixture.gatewaySessionId }]);
+        expect(h.cp.bindings.active(roleKeyFor(Role.CEO))).toBeNull();
+        expect(h.cp.audit.byKind("BINDING_REVOKED").map((row) => row.evidence)).toEqual([{
+          reason: CONTINUITY_RUNTIME_LOST_REVOCATION_REASON,
+          generation: 1,
+          failoverRefusal: ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED,
+        }]);
+
+        // Gateway re-adoption is still the way back: it is attempted for exactly the revoked generation.
+        const adopt = vi.fn(async () => allow(ReasonCode.OK, undefined));
+        const outcome = await createHermesAutoAdoption(h.cp, { adopt, liveness: () => "DEAD" }).tick("the Gateway is back");
+        expect(outcome.attempted).toBe(true);
+        expect(adopt).toHaveBeenCalledWith({
+          assignmentId: expect.any(String),
+          generation: 1,
+          revokedReason: CONTINUITY_RUNTIME_LOST_REVOCATION_REASON,
+        });
+      } finally {
+        await daemon.stop();
+      }
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  it("a BLIND_REVIEWER, which nothing adopts, is still admitted against its role-scoped capacity and staffed", async () => {
+    const f = plane();
+    await withDaemon(f, async (daemon) => {
+      const ceo = f.cp.sessions.create({ provider: "claude", model: "claude-cli" });
+      expect(f.cp.sessions.transition(ceo.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+      expect(f.cp.bindings.bind({ role: Role.CEO, sessionId: ceo.sessionId }).allowed).toBe(true);
+      const run = f.cp.runs.create({ projectId: PROJECT, executionMode: ExecutionMode.SIMPLE,
+        contract: { goal: "review", why: "coverage", scope: [], nonGoals: [], acceptance: ["done"],
+          priority: "NORMAL", humanGate: [], references: [] } });
+      if (!run.allowed) throw new Error(run.message);
+      const dispatched = await f.cp.runs.dispatch(run.value.runId);
+      if (!dispatched.allowed) throw new Error(dispatched.message);
+      const session = f.cp.sessions.create({ provider: "claude", model: "claude-cli", osPid: CLAUDE_PID, osStartedAt: "darwin-tv:1790000100.000001" });
+      expect(f.cp.sessions.transition(session.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+      const bound = f.cp.bindings.bind({ role: Role.BLIND_REVIEWER, runId: run.value.runId, sessionId: session.sessionId });
+      if (!bound.allowed) throw new Error(bound.message);
+      const reviewer = bound.value.roleKey;
+      processDied(f, session.sessionId);
+      const admission = vi.spyOn(f.cp.capacity, "refreshForProviderSwitch");
+
+      const report = await daemon.reconcileContinuity("the reviewer's claude process died");
+
+      expect(admission.mock.calls.map(([target]) => target)).toContainEqual(
+        { provider: "claude", role: Role.BLIND_REVIEWER, capabilities: ["blind-review"], priority: "critical" });
+      expect(report?.reassigned).toContainEqual(expect.objectContaining({ roleKey: reviewer, fromGeneration: 1, toGeneration: 2 }));
+      const active = f.cp.bindings.active(reviewer)!;
+      expect(active.sessionId).not.toBe(session.sessionId);
+      expect(f.cp.sessions.require(active.sessionId).lifecycle).toBe(SessionLifecycle.READY);
     });
   });
 });
