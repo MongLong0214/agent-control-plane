@@ -39,6 +39,7 @@ import { DogfoodFindingStore } from "../quality/upstream-dogfood.ts";
 import {
   BlindReviewGate, PROJECT_REVIEWER_FILE, resolveProjectReviewerPreferences, type ProjectReviewerFile, type ReviewerPreference,
 } from "../review/blind-review.ts";
+import { supersessionBinding } from "../run/candidate-integration.ts";
 import { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import { type CompletionAuthority, type CompletionAuthoritySet, RunEngine } from "../run/run-engine.ts";
 import { TaskGraph } from "../run/task-graph.ts";
@@ -592,6 +593,8 @@ export class ControlPlane {
             );
           },
         },
+        // CEO msg_8f666e55 — a SUCCEEDED task's correction is bound to the receipts the freeze reads.
+        supersession: (runId, originalTaskId, correctionTaskId) => supersessionBinding(this.db, runId, originalTaskId, correctionTaskId),
       });
       this.bindings.attach({ tasks: this.tasks });
       this.runs = new RunEngine(

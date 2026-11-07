@@ -12,6 +12,8 @@ import { readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import type { SupersessionBinding } from "./candidate-integration.ts";
+import { recordedWriteTarget } from "./task-write-target.ts";
 import type { WorkScopeTracking } from "./work-scope-tracking.ts";
 import {
   type FailureClass,
@@ -178,7 +180,7 @@ export const TASK_CORRECTION_REGISTERED = "TASK_CORRECTION_REGISTERED";
 export const taskAcceptanceDigest = (task: Pick<TaskRecord, "taskId" | "title" | "category" | "spec">): string =>
   digestOf({ schema: "agent-control-plane.task-acceptance.v1", taskId: task.taskId, title: task.title, category: task.category, spec: task.spec });
 
-/** #1368 — the run owner's claim that a SUCCEEDED task of the run replaces one of its FAILED tasks. */
+/** #1368 — the run owner's claim that a SUCCEEDED task of the run replaces one of its FAILED (or, CEO msg_8f666e55, SUCCEEDED) tasks. */
 export interface TaskCorrectionInput {
   runId: string;
   correctionTaskId: string;
@@ -193,6 +195,8 @@ export interface TaskCorrection {
   correctionTaskId: string;
   workUnit: string;
   acceptanceDigest: string;
+  /** CEO msg_8f666e55 — for a SUCCEEDED task, the receipts the relation is bound to; the freeze honours only these. */
+  supersedes?: SupersessionBinding;
 }
 
 /**
@@ -227,6 +231,27 @@ export const bootstrapPlanTaskRecorded = (db: Pick<Db, "all">, runId: string, ta
 export interface WorkerExecutionBindingGate {
   hasLiveWorkerBinding(taskId: string, sessionId: string): boolean;
 }
+
+/**
+ * CEO msg_8f666e55 (review r2) — the tasks among `candidates`, other than `taskId` and `later`, that build on `taskId`
+ * without its correction: their dependsOn, or the predecessors of the base recorded for them (#1242), hold `taskId`
+ * and no task of `later`, the corrections after it in its chain. Review r3 — a base holding a later correction
+ * already holds the corrected output. Asked of a SUCCEEDED task a correction supersedes; which tasks may count is the
+ * caller's (`registerCorrection`, `supersessionOf`).
+ */
+export const tasksBuildingOn = (db: Db, runId: string, taskId: string, later: ReadonlySet<string>, candidates: readonly string[]): string[] =>
+  candidates
+    .filter((id) => id !== taskId && !later.has(id))
+    .filter((id) => {
+      const base = new Set([
+        ...db.all<{ depends_on: string }>(`SELECT depends_on FROM task_dependencies WHERE task_id = ?`, [id]).map((row) => row.depends_on),
+        ...(recordedWriteTarget(db, runId, id)?.startsFrom?.predecessors ?? []).map((predecessor) => predecessor.taskId),
+      ]);
+      return base.has(taskId) && ![...later].some((member) => base.has(member));
+    });
+
+/** CEO msg_8f666e55 — the receipt binding of a SUCCEEDED task and its correction (`supersessionBinding`), or why there is none. */
+export type SupersessionReader = (runId: string, originalTaskId: string, correctionTaskId: string) => Decision<SupersessionBinding>;
 
 
 /**
@@ -277,6 +302,7 @@ export class TaskGraph {
   #capacity: WorkerCapacityGate | null = null;
   #workerBindings: WorkerExecutionBindingGate | null = null;
   #workScope: WorkScopeTracking | null = null;
+  #supersession: SupersessionReader | null = null;
   readonly #baseline: BaselineRecorder;
 
   constructor(
@@ -289,10 +315,11 @@ export class TaskGraph {
   }
 
   /** Closed by the composition root after the capacity monitor exists. */
-  attach(ports: { capacity?: WorkerCapacityGate; workerBindings?: WorkerExecutionBindingGate; workScope?: WorkScopeTracking }): void {
+  attach(ports: { capacity?: WorkerCapacityGate; workerBindings?: WorkerExecutionBindingGate; workScope?: WorkScopeTracking; supersession?: SupersessionReader }): void {
     if (ports.capacity) this.#capacity = ports.capacity;
     if (ports.workerBindings) this.#workerBindings = ports.workerBindings;
     if (ports.workScope) this.#workScope = ports.workScope;
+    if (ports.supersession) this.#supersession = ports.supersession;
   }
 
   /**
@@ -1217,9 +1244,16 @@ export class TaskGraph {
    * of another run; a task another correction already replaces, or a correction already registered for
    * another task; a relation that would close a cycle; a correction whose PLAN spec does not name the
    * task in `correctionOf.taskId`; two tasks that are not in one work unit of the run's current approved
-   * scope; an acceptance digest that is not the task's (`taskAcceptanceDigest`); a task that is not
-   * FAILED; and a correction that is not SUCCEEDED with a SUCCEEDED execution. The same relation again
-   * is answered as registered, with no second record.
+   * scope; an acceptance digest that is not the task's (`taskAcceptanceDigest`); a task that is neither
+   * FAILED nor SUCCEEDED; and a correction that is not SUCCEEDED with a SUCCEEDED execution. The same
+   * relation again is answered as registered, with no second record.
+   *
+   * CEO msg_8f666e55 — a SUCCEEDED task is corrected the same way, and its record also binds both tasks'
+   * receipts, execution, result digest and commit, in their one repository (`SupersessionBinding`): the
+   * freeze then counts only the correction (`supersessionOf`), and a chain only its last task.
+   * Refused besides: either task with no SUCCEEDED commit receipt, or the two in different repositories; and
+   * (review r2) a task of the chain the relation completes that a task outside the chain after it builds on
+   * (`tasksBuildingOn`), CORRECTION_ORIGINAL_HAS_DEPENDENTS.
    */
   registerCorrection(input: TaskCorrectionInput): Decision<{ correction: TaskCorrection; registered: boolean }> {
     // Every refusal precedes the one write, the record; a refused record throws, which rolls it back.
@@ -1276,17 +1310,41 @@ export class TaskGraph {
           namedAcceptanceDigest: input.corrects.acceptanceDigest,
         });
       }
-      if (original.state !== TaskState.FAILED) {
-        return refuse(ReasonCode.CONFLICT, "CORRECTION_ORIGINAL_NOT_FAILED", `the corrected task is ${original.state}; only a FAILED task is replaced by a correction`, { state: original.state });
+      if (original.state !== TaskState.FAILED && original.state !== TaskState.SUCCEEDED) {
+        return refuse(ReasonCode.CONFLICT, "CORRECTION_ORIGINAL_UNFINISHED", `the corrected task is ${original.state}; only a FAILED or SUCCEEDED task is replaced by a correction`, { state: original.state });
       }
       const executions = this.executions(runId);
       const result = executions.filter((e) => e.taskId === correctionTaskId && e.status === "SUCCEEDED").sort((a, b) => a.attempt - b.attempt).at(-1);
       if (correction.state !== TaskState.SUCCEEDED || result === undefined) {
         return refuse(ReasonCode.CONFLICT, "CORRECTION_NOT_SUCCEEDED", `the correction is ${correction.state}; the corrected task keeps blocking until its correction SUCCEEDED`, { correctionState: correction.state });
       }
+      let supersedes: SupersessionBinding | undefined;
+      if (original.state === TaskState.SUCCEEDED) {
+        const bound = this.#supersession?.(runId, originalTaskId, correctionTaskId)
+          ?? deny<SupersessionBinding>(ReasonCode.TASK_RECEIPT_MISSING, "no receipt reader is composed", { refusal: "CORRECTION_RECEIPT_MISSING" });
+        if (!bound.allowed) return refuse(bound.reasonCode, String(bound.evidence["refusal"]), bound.message, bound.evidence);
+        supersedes = bound.value;
+      }
       const acceptanceDigest = input.corrects.acceptanceDigest;
-      const same = registered.find((r) => r.originalTaskId === originalTaskId && r.correctionTaskId === correctionTaskId && r.acceptanceDigest === acceptanceDigest && r.workUnit === workUnit);
+      const same = registered.find((r) => r.originalTaskId === originalTaskId && r.correctionTaskId === correctionTaskId && r.acceptanceDigest === acceptanceDigest && r.workUnit === workUnit &&
+        digestOf(r.supersedes ?? null) === digestOf(supersedes ?? null));
+      // Review r3 — a relation already registered is acknowledged; a dependent planned since is the freeze's to refuse.
       if (same) return allow(ReasonCode.OK, { correction: same, registered: false });
+      if (supersedes !== undefined) {
+        // Every task that may still produce a result counts: not CANCELLED, and not a FAILED task a correction settles.
+        const tasks = this.list(runId);
+        const settled = this.#settledByCorrection(runId, tasks);
+        const live = tasks.filter((t) => t.state !== TaskState.CANCELLED && !settled.has(t.taskId)).map((t) => t.taskId).sort();
+        const chain = this.#chainThrough(registered, originalTaskId, correctionTaskId);
+        for (const [at, supersededTaskId] of chain.slice(0, -1).entries()) {
+          const dependents = tasksBuildingOn(this.db, runId, supersededTaskId, new Set(chain.slice(at + 1)), live);
+          if (dependents.length > 0) {
+            return refuse(ReasonCode.CORRECTION_ORIGINAL_HAS_DEPENDENTS, "CORRECTION_ORIGINAL_HAS_DEPENDENTS", "a task outside the correction's chain builds on a task it would supersede; no candidate both drops that task and keeps what was built on it", {
+              supersededTaskId, dependents,
+            });
+          }
+        }
+      }
       const recorded = this.audit.record({
         kind: TASK_CORRECTION_REGISTERED,
         runId,
@@ -1302,10 +1360,14 @@ export class TaskGraph {
           originalExecutions: executions
             .filter((e) => e.taskId === originalTaskId)
             .map((e) => ({ executionId: e.executionId, status: e.status, failureClass: e.failureClass })),
+          ...(supersedes === undefined ? {} : { supersedes }),
         },
       });
       if (!recorded.allowed) return fail(recorded.reasonCode, recorded.message, recorded.evidence);
-      return allow(ReasonCode.OK, { correction: { eventId: recorded.value, originalTaskId, correctionTaskId, workUnit, acceptanceDigest }, registered: true });
+      return allow(ReasonCode.OK, {
+        correction: { eventId: recorded.value, originalTaskId, correctionTaskId, workUnit, acceptanceDigest, ...(supersedes === undefined ? {} : { supersedes }) },
+        registered: true,
+      });
     });
   }
 
@@ -1318,11 +1380,32 @@ export class TaskGraph {
       )
       .flatMap((row) => {
         const e = JSON.parse(row.evidence_json) as Record<string, unknown>;
-        const { originalTaskId, correctionTaskId, workUnit, acceptanceDigest } = e;
+        const { originalTaskId, correctionTaskId, workUnit, acceptanceDigest, supersedes } = e;
         return typeof originalTaskId === "string" && typeof correctionTaskId === "string" && typeof workUnit === "string" && typeof acceptanceDigest === "string"
-          ? [{ eventId: row.event_id, originalTaskId, correctionTaskId, workUnit, acceptanceDigest }]
+          ? [{ eventId: row.event_id, originalTaskId, correctionTaskId, workUnit, acceptanceDigest, ...(supersedes === undefined ? {} : { supersedes: supersedes as SupersessionBinding }) }]
           : [];
       });
+  }
+
+  /**
+   * Review r2 — the chain of SUCCEEDED tasks and their corrections that registering `original` -> `correction` makes,
+   * first task first: the registered relations that bind receipts, followed back from `original` and on from
+   * `correction`. A cycle is refused before this is asked.
+   */
+  #chainThrough(registered: readonly TaskCorrection[], original: string, correction: string): string[] {
+    const binding = registered.filter((r) => r.supersedes !== undefined);
+    const chain = [original, correction];
+    for (;;) {
+      const before = binding.find((r) => r.correctionTaskId === chain[0]);
+      if (!before || chain.includes(before.originalTaskId)) break;
+      chain.unshift(before.originalTaskId);
+    }
+    for (;;) {
+      const after = binding.find((r) => r.originalTaskId === chain.at(-1));
+      if (!after || chain.includes(after.correctionTaskId)) break;
+      chain.push(after.correctionTaskId);
+    }
+    return chain;
   }
 
   /** Whether `from`, followed through the corrections it is registered as, reaches `target`. */
