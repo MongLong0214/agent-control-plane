@@ -87,8 +87,8 @@ const persistPassingVerification = (
 };
 
 /** A frozen, verified candidate on a project run whose worker is a Claude session. */
-const prepared = async () => {
-  const harness = makeHarness();
+const prepared = async (options: Parameters<typeof makeHarness>[0] = {}) => {
+  const harness = makeHarness(options);
   const { projectId, repositoryId, identity } = await registerFixtureProject(harness);
   bindCeo(harness);
   const created = harness.cp.runs.create({
@@ -271,6 +271,58 @@ describe("a project's own Blind Reviewer", () => {
   });
 });
 
+describe("a project whose reviewer entry names a provider ACP does not support", () => {
+  it("6: grok — the control plane's own candidate review is refused by name; no reviewer is launched and nothing reaches gpt", async () => {
+    const root = tempDir("acp-reviewer-pref-grok-");
+    const file = join(root, "reviewer-preferences.json");
+    writeFileSync(file, JSON.stringify({ "fixture-project": { provider: "grok", model: "grok-4", effort: null } }));
+    // The production reviewer default, so a fallback to it would be a GPT review.
+    const setup = await prepared({
+      reviewerPreferencesFile: readProjectReviewerFile(file),
+      reviewer: {
+        preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
+        fallbacks: [{ provider: "claude", model: "opus", effort: null }],
+      },
+    });
+    try {
+      expect(setup.projectId).toBe("fixture-project");
+      const gptStart = vi.spyOn(setup.gpt, "startSession");
+      const claudeStart = vi.spyOn(setup.claude, "startSession");
+
+      const result = await review(setup.harness.cp.review, setup);
+
+      expect(result).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.REVIEWER_PREFERENCES_INVALID,
+        evidence: { runId: setup.run.runId, projectId: "fixture-project", provider: "grok" },
+      });
+      // No reviewer was constituted and no provider was asked anything: no session, no invocation,
+      // so no reviewer egress lease either.
+      expect(gptStart).not.toHaveBeenCalled();
+      expect(claudeStart).not.toHaveBeenCalled();
+      expect(setup.gpt.invocations).toHaveLength(0);
+      expect(setup.claude.invocations).toHaveLength(0);
+      expect(setup.harness.cp.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM assignments WHERE role = 'BLIND_REVIEWER'`,
+      )?.n).toBe(0);
+      expect(setup.harness.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(0);
+      expect(completed(setup)).toHaveLength(0);
+      // The refusal is recorded and reported for that project.
+      expect(setup.harness.cp.audit.byKind("REVIEWER_PREFERENCES_REFUSED")).toEqual([expect.objectContaining({
+        reasonCode: ReasonCode.REVIEWER_PREFERENCES_INVALID,
+        evidence: expect.objectContaining({ path: file, projectId: "fixture-project", provider: "grok" }),
+      })]);
+      expect(setup.harness.cp.doctor["checkReviewerPreferences"]()).toEqual([expect.objectContaining({
+        code: ReasonCode.REVIEWER_PREFERENCES_INVALID,
+        scope: "reviewer:project:fixture-project",
+        observedEvidence: expect.objectContaining({ projectId: "fixture-project", provider: "grok" }),
+      })]);
+    } finally {
+      setup.harness.cp.close();
+    }
+  });
+});
+
 describe("the daemon's reviewer preference file", () => {
   const registered = (provider: string) => provider === "claude" || provider === "gpt";
 
@@ -278,11 +330,11 @@ describe("the daemon's reviewer preference file", () => {
     const root = tempDir("acp-reviewer-pref-root-");
     expect(defaultConfig(root).reviewerPreferencesFile).toEqual({ path: join(root, "reviewer-preferences.json"), text: null });
     expect(resolveProjectReviewerPreferences(defaultConfig(root).reviewerPreferencesFile!, registered))
-      .toEqual({ byProject: new Map(), refused: null });
+      .toEqual({ byProject: new Map(), refused: null, refusedProjects: new Map() });
 
     writeFileSync(join(root, "reviewer-preferences.json"), JSON.stringify({ "e2e-1": OPUS }));
     expect(resolveProjectReviewerPreferences(defaultConfig(root).reviewerPreferencesFile!, registered))
-      .toEqual({ byProject: new Map([["e2e-1", OPUS]]), refused: null });
+      .toEqual({ byProject: new Map([["e2e-1", OPUS]]), refused: null, refusedProjects: new Map() });
   });
 
   it.each([
@@ -290,22 +342,38 @@ describe("the daemon's reviewer preference file", () => {
     ["not an object of entries", JSON.stringify([OPUS])],
     ["an entry missing its effort", JSON.stringify({ "e2e-1": { provider: "claude", model: "opus" } })],
     ["an entry with an extra key", JSON.stringify({ "e2e-1": { ...OPUS, fallbacks: [] } })],
-    ["an unknown provider beside a valid entry", JSON.stringify({ "e2e-1": OPUS, "e2e-2": { provider: "nonesuch", model: "x", effort: null } })],
   ])("4: %s applies nothing and names why", (_label, text) => {
     const resolved = resolveProjectReviewerPreferences({ path: "/state/reviewer-preferences.json", text }, registered);
     expect(resolved.byProject.size).toBe(0);
+    expect(resolved.refusedProjects.size).toBe(0);
     expect(resolved.refused).toMatchObject({ path: "/state/reviewer-preferences.json", reason: expect.any(String) });
   });
 
   it("4: a file that exists but cannot be read applies nothing and names why", () => {
     expect(resolveProjectReviewerPreferences({ path: "/state/reviewer-preferences.json", text: null, unreadable: "EACCES" }, registered))
-      .toEqual({ byProject: new Map(), refused: { path: "/state/reviewer-preferences.json", reason: "unreadable: EACCES" } });
+      .toEqual({
+        byProject: new Map(),
+        refused: { path: "/state/reviewer-preferences.json", reason: "unreadable: EACCES" },
+        refusedProjects: new Map(),
+      });
+  });
+
+  it.each([["grok"], ["nonesuch"]])("4: an entry naming %s beside a valid entry refuses that project alone; the valid entry applies", (provider) => {
+    const text = JSON.stringify({ "e2e-1": OPUS, "e2e-2": { provider, model: "x", effort: null } });
+    expect(resolveProjectReviewerPreferences({ path: "/state/reviewer-preferences.json", text }, registered)).toEqual({
+      byProject: new Map([["e2e-1", OPUS]]),
+      refused: null,
+      refusedProjects: new Map([["e2e-2", {
+        provider,
+        reason: `project e2e-2 names provider ${provider}, which is not registered for BLIND_REVIEWER with reviewer isolation`,
+      }]]),
+    });
   });
 
   it.each([
     ["a provider no adapter is registered for", "nonesuch"],
     ["a registered provider that cannot isolate a reviewer", "no-isolation"],
-  ])("4: a control plane given %s applies nothing, audits the refusal and reports a doctor finding", (_label, provider) => {
+  ])("4: a control plane given %s refuses that project's reviewer, keeps the others, audits the refusal and reports a doctor finding", (_label, provider) => {
     const root = tempDir("acp-reviewer-pref-cp-");
     const file = join(root, "reviewer-preferences.json");
     writeFileSync(file, JSON.stringify({ "e2e-1": OPUS, "e2e-2": { provider, model: "some-model", effort: null } }));
@@ -325,18 +393,22 @@ describe("the daemon's reviewer preference file", () => {
     try {
       expect(() => refused.providers.requireForRole("no-isolation", Role.BLIND_REVIEWER)).not.toThrow();
       expect(() => refused.providers.requireForRole("nonesuch", Role.BLIND_REVIEWER)).toThrow();
-      // The default applies: no project entry, the global preferred and fallbacks as they were.
+      // e2e-2's reviews are refused, never moved onto the global reviewer. e2e-1's entry still applies,
+      // and the global preferred and fallbacks are as they were for every other project.
       const preferences = refused.review["preferences"];
-      expect(preferences.projects).toBeUndefined();
+      expect(preferences.projects).toEqual(new Map([["e2e-1", OPUS]]));
+      expect(preferences.refusedProjects).toEqual(new Map([["e2e-2", expect.objectContaining({ provider })]]));
       expect(preferences.preferred).toEqual({ provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" });
+      expect(preferences.fallbacks).toEqual([{ provider: "claude", model: "opus", effort: null }]);
       expect(refused.audit.byKind("REVIEWER_PREFERENCES_REFUSED")).toEqual([expect.objectContaining({
         reasonCode: ReasonCode.REVIEWER_PREFERENCES_INVALID,
-        evidence: expect.objectContaining({ path: file, reason: expect.stringContaining(provider) }),
+        evidence: expect.objectContaining({ path: file, projectId: "e2e-2", provider, reason: expect.stringContaining(provider) }),
       })]);
       expect(refused.doctor["checkReviewerPreferences"]()).toEqual([expect.objectContaining({
         code: ReasonCode.REVIEWER_PREFERENCES_INVALID,
         severity: "ERROR",
-        observedEvidence: expect.objectContaining({ path: file }),
+        scope: "reviewer:project:e2e-2",
+        observedEvidence: expect.objectContaining({ path: file, projectId: "e2e-2", provider }),
       })]);
     } finally {
       refused.close();

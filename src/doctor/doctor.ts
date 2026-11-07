@@ -504,6 +504,8 @@ export class Doctor {
     },
     /** Why the daemon's per-project reviewer file was not applied at start, or null (CEO msg_e91da929). */
     private readonly reviewerPreferencesRefused: { path: string; reason: string } | null = null,
+    /** The projects whose reviewer entry names a provider that cannot review; their reviews are refused. */
+    private readonly reviewerProjectsRefused: ReadonlyArray<{ path: string; projectId: string; provider: string; reason: string }> = [],
   ) {
     this.#openedAfterEventId = db.get<{ id: number }>(`SELECT COALESCE(MAX(event_id), 0) AS id FROM audit_events`)?.id ?? 0;
   }
@@ -1277,8 +1279,19 @@ export class Doctor {
 
   /** A per-project reviewer file the daemon refused at start: no project gets its own reviewer until it is fixed. */
   private checkReviewerPreferences(): Finding[] {
-    if (this.reviewerPreferencesRefused === null) return [];
-    return [{
+    const projects: Finding[] = this.reviewerProjectsRefused.map((refused) => ({
+      code: ReasonCode.REVIEWER_PREFERENCES_INVALID,
+      severity: "ERROR",
+      scope: `reviewer:project:${refused.projectId}`,
+      blocking: false,
+      confidence: "HIGH",
+      observedEvidence: { ...refused },
+      recommendedAction:
+        `project ${refused.projectId}'s blind reviews are refused, not sent to another provider, until its entry ` +
+        "names a provider registered for BLIND_REVIEWER that can isolate a reviewer; fix the file, then restart the daemon",
+    }));
+    if (this.reviewerPreferencesRefused === null) return projects;
+    return [...projects, {
       code: ReasonCode.REVIEWER_PREFERENCES_INVALID,
       severity: "ERROR",
       scope: "reviewer:project-preferences",
@@ -1286,8 +1299,7 @@ export class Doctor {
       confidence: "HIGH",
       observedEvidence: { ...this.reviewerPreferencesRefused },
       recommendedAction:
-        'fix the file to { "<projectId>": { provider, model, effort } } naming only providers registered for ' +
-        "BLIND_REVIEWER that can isolate a reviewer, then restart the daemon; " +
+        'fix the file to { "<projectId>": { provider, model, effort } }, then restart the daemon; ' +
         "until then every project uses the global reviewer preference",
     }];
   }

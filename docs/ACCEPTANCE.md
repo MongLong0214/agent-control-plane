@@ -165,11 +165,14 @@ verified against a modelled GitHub API, including that a same-named check from a
 creator is refused (CP-S35). The other API paths the kernel uses were checked against the
 live repository and return the expected shapes.
 
-**Provider capacity is collected from interactive `/usage`.** Claude, Codex, and Grok each
+**Provider capacity is collected from interactive `/usage`.** Claude and Codex each
 have a PTY collector that sends the slash command and accepts only explicit
 remaining-quota/reset statements. A trust prompt, activity-only screen, timeout, or parse
 failure is persisted as an error and suspends new allocation; the daemon's JSON mirror is
 diagnostic output, not an owner-maintained capacity input. See `docs/capacity-source.md`.
+
+> **2026-11-07: Grok support removed (owner directive).** ACP has no Grok collector any more. Before
+> this amendment the paragraph above read "Claude, Codex, and Grok each have a PTY collector".
 
 **Buzz delivery is verified live; #243 is not closed** (#423 is). A fenced envelope was
 enqueued, drained by `BuzzAdapter.deliverPending` over `BuzzCliTransport`, and read back off
@@ -334,15 +337,20 @@ blind spot is exactly what a second round from the same reviewer cannot catch.
    justification for exposing it was false.
 
 **No third Sol round has been run**; there is no `round:r3` label and no `evidence/review-round3/`.
-The final gate is a Grok review of all nine areas (`node scripts/grok-review.mjs`), which has not
-been run against a settled tree yet.
+No Grok review gate remains: the Grok review of all nine areas was never run against a settled tree,
+and its script was removed with Grok support.
 
-"Gate" there means the last diagnostic pass planned before publication, not a merge gate. Both
-review scripts (`scripts/production-review.mjs`, `scripts/grok-review.mjs`) are broad one-off
-diagnostics, and frontier PR review serves a different purpose: frontier judges one change within
-its bounded attempts, while these read whole areas of one commit for defects nobody asked about.
-They are not meant to run on every PR. Running one is not a way around frontier's three-attempt
-limit and does not count as an additional approving review. Since #1189 each run reviews one pinned
+> **2026-11-07: Grok support removed (owner directive); `scripts/grok-review.mjs` is deleted.** Before
+> this amendment the text read: "The final gate is a Grok review of all nine areas
+> (`node scripts/grok-review.mjs`), which has not been run against a settled tree yet." and "Both
+> review scripts (`scripts/production-review.mjs`, `scripts/grok-review.mjs`) are broad one-off
+> diagnostics". The Grok audit in item 5 above is a past result and stands as recorded.
+
+The review script, `scripts/production-review.mjs`, is a broad one-off diagnostic, and frontier PR
+review serves a different purpose: frontier judges one change within its bounded attempts, while the
+script reads whole areas of one commit for defects nobody asked about. It is not meant to run on
+every PR. Running it is not a way around frontier's three-attempt limit and does not count as an
+additional approving review. Since #1189 each run reviews one pinned
 commit from a disposable checkout, refuses a dirty HEAD or an unknown ref, and writes a new
 directory whose `manifest.json` attributes every area result to that run; its exit status says
 whether the reviewers ran, its findings verdict says what they found, and neither is a merge

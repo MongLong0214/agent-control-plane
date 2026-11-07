@@ -1463,7 +1463,7 @@ setInterval(() => {}, 1_000);
     }
   });
 
-  it("installs the two live collectors in the production default registry and refuses grok by name", () => {
+  it("installs the two live collectors in the production default registry and refuses grok by name", async () => {
     const root = tempDir("acp-default-provider-collectors-");
     // A project that names grok as its Blind Reviewer, in the file production reads.
     const preferences = join(root, "reviewer-preferences.json");
@@ -1487,12 +1487,18 @@ setInterval(() => {}, 1_000);
           `no adapter registered for provider 'grok' in role '${role}'`,
         );
       }
-      // The project entry is refused, named and recorded, never moved onto another provider.
+      // Capacity admission for grok is refused by name, never answered by another provider's reading.
+      expect(await cp.capacity.refreshForDispatch({ provider: "grok", role: Role.PRIMARY_CTO, capabilities: ["cto"] }))
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
+      // The project entry is refused for that project, named and recorded, never moved onto another provider.
       expect(cp.review["preferences"].projects).toBeUndefined();
+      expect(cp.review["preferences"].refusedProjects).toEqual(new Map([["names-grok", expect.objectContaining({ provider: "grok" })]]));
       expect(cp.audit.byKind("REVIEWER_PREFERENCES_REFUSED")).toEqual([expect.objectContaining({
         reasonCode: ReasonCode.REVIEWER_PREFERENCES_INVALID,
         evidence: expect.objectContaining({
           path: preferences,
+          projectId: "names-grok",
+          provider: "grok",
           reason: "project names-grok names provider grok, which is not registered for BLIND_REVIEWER with reviewer isolation",
         }),
       })]);

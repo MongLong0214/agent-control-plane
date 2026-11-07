@@ -608,11 +608,13 @@ export class ControlPlane {
         this.db, this.clock, this.audit, this.artifacts, this.#evidenceWriters.VERIFICATION,
         this.repositories, this.worktrees, this.claims, this.guard, this.telemetry,
       );
-      // CEO msg_e91da929 — the per-project reviewers apply only when the whole file does, every provider
-      // registered for BLIND_REVIEWER with an adapter that can isolate a reviewer; otherwise none applies
-      // and the refusal is recorded and reported.
+      // CEO msg_e91da929 — the per-project reviewers apply only when the file is readable and well formed;
+      // otherwise none applies and the refusal is recorded and reported. An entry naming a provider that is
+      // not registered for BLIND_REVIEWER with an adapter that can isolate a reviewer refuses that project's
+      // reviews, recorded and reported per project, and never sends them to the global reviewer.
+      const reviewerFile = config.reviewerPreferencesFile ?? { path: PROJECT_REVIEWER_FILE, text: null };
       const projectReviewers = resolveProjectReviewerPreferences(
-        config.reviewerPreferencesFile ?? { path: PROJECT_REVIEWER_FILE, text: null },
+        reviewerFile,
         (provider) => {
           try {
             return this.providers.requireForRole(provider, Role.BLIND_REVIEWER).supportsReviewerIsolation !== false;
@@ -628,6 +630,18 @@ export class ControlPlane {
           evidence: projectReviewers.refused,
         });
       }
+      const refusedProjectReviewers = [...projectReviewers.refusedProjects].map(([projectId, refused]) => ({
+        path: reviewerFile.path,
+        projectId,
+        ...refused,
+      }));
+      for (const evidence of refusedProjectReviewers) {
+        this.audit.record({
+          kind: "REVIEWER_PREFERENCES_REFUSED",
+          reasonCode: ReasonCode.REVIEWER_PREFERENCES_INVALID,
+          evidence,
+        });
+      }
       this.review = new BlindReviewGate(
         this.clock, this.db, this.audit, this.artifacts, this.#evidenceWriters.BLIND_REVIEW,
         this.sessions, this.bindings, this.providers, this.repositories, this.telemetry,
@@ -638,6 +652,7 @@ export class ControlPlane {
           }),
           // Absent unless an entry applies, so the default preferences are exactly what they were.
           ...(projectReviewers.byProject.size === 0 ? {} : { projects: projectReviewers.byProject }),
+          ...(projectReviewers.refusedProjects.size === 0 ? {} : { refusedProjects: projectReviewers.refusedProjects }),
         },
         config.reviewerEgress?.providerEndpoints ?? REVIEWER_PROVIDER_ENDPOINTS,
       );
@@ -763,6 +778,7 @@ export class ControlPlane {
           capacityDir: config.capacityDir,
         },
         projectReviewers.refused,
+        refusedProjectReviewers,
       );
       this.watchdog = new Watchdog(this.db, this.clock, this.audit, this.doctor, this.claims, this.outbox);
       // An attempt the watchdog releases has its reviewer and verification children stopped, and its run's owner CTO
