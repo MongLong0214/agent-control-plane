@@ -1,3 +1,7 @@
+import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import type { Decision } from "../../src/core/errors.ts";
@@ -76,7 +80,12 @@ const reflectMergedBase = (github: FakeGitHub): void => {
  * The setup is the one the #1269 notes scenarios use, with X committed on the work branch before the run. The run
  * is governed (CommitLore `required`) unless `governed` is false (`preferred`, the fixture manifest's own mode).
  */
-const setup = async (options: { governed?: boolean; xLimit?: string } = {}) => {
+const setup = async (options: {
+  governed?: boolean;
+  xLimit?: string;
+  /** X's message as ISO-8859-1 bytes, committed with that `encoding` header (`declared`) or with none (null). */
+  xLatin1?: { declared: "ISO-8859-1" | null };
+} = {}) => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
   const harness = makeHarness({ githubClient: github });
@@ -93,8 +102,27 @@ const setup = async (options: { governed?: boolean; xLimit?: string } = {}) => {
   const repo = harness.repoPath;
   gitSync(repo, ["checkout", "-q", "-b", WORK_BRANCH]);
   writeFiles(repo, { "src/app.js": "module.exports = () => 1 + 0;\n" });
-  const x = commitAll(repo, `prepare app()\n\nLimit: an earlier record of X\nRecord-Id: ${X_EARLY_ID}\n\n` +
-    `Record-Id: ${X_ID}\nLimit: ${options.xLimit ?? "app() keeps one export, the record of X"}`);
+  const xMessage = `prepare app()\n\nLimit: an earlier record of X\nRecord-Id: ${X_EARLY_ID}\n\n` +
+    `Record-Id: ${X_ID}\nLimit: ${options.xLimit ?? "app() keeps one export, the record of X"}`;
+  let x: string;
+  if (options.xLatin1 === undefined) {
+    x = commitAll(repo, xMessage);
+  } else {
+    gitSync(repo, ["add", "-A"]);
+    if (options.xLatin1.declared !== null) {
+      const file = join(repo, ".git", "X_MESSAGE");
+      writeFileSync(file, Buffer.from(xMessage, "latin1"));
+      gitSync(repo, ["-c", `i18n.commitEncoding=${options.xLatin1.declared}`, "commit", "-q", "-F", file]);
+      x = gitSync(repo, ["rev-parse", "HEAD"]);
+    } else {
+      // `git commit` re-encodes a message that is not UTF-8 as if it were Latin-1, so the object is written directly.
+      const who = "ACP Test <test@example.invalid> 1786000000 +0000";
+      const header = `tree ${gitSync(repo, ["write-tree"])}\nparent ${gitSync(repo, ["rev-parse", "HEAD"])}\nauthor ${who}\ncommitter ${who}\n\n`;
+      const object = Buffer.concat([Buffer.from(header), Buffer.from(`${xMessage}\n`, "latin1")]);
+      x = execFileSync("git", ["-C", repo, "hash-object", "-t", "commit", "-w", "--stdin"], { input: object }).toString("utf8").trim();
+      gitSync(repo, ["update-ref", "HEAD", x]);
+    }
+  }
   if (options.governed !== false) {
     // X's turn is recorded in the run once the run exists, before its one freeze; the harness records the head's.
     const freeze = harness.cp.pipeline.freeze.bind(harness.cp.pipeline);
@@ -162,6 +190,9 @@ const setup = async (options: { governed?: boolean; xLimit?: string } = {}) => {
   const merge = () => harness.cp.github.mergeExecute(input);
   return { harness, github, repo, x, y, base: driven.baseHead, head: driven.candidateHead, input, merge };
 };
+
+/** A git answer as raw bytes, which `gitSync`'s UTF-8 string cannot keep. */
+const execRaw = (repo: string, args: readonly string[]): Buffer => execFileSync("git", ["-C", repo, ...args]);
 
 /** A commit's own trailer block, as git reads it. */
 const trailersOf = (repo: string, commit: string): string => gitSync(repo, ["log", "-1", "--format=%(trailers:only,unfold)", commit]);
@@ -306,9 +337,38 @@ describe("#1268 slice 2 — a carried note holds the record of the commit it is 
     expect(gitSync(fixture.repo, ["notes", "--ref=commitlore", "show", fixture.x])).toContain("café");
     // Only how `git log` shows messages changes; the commit and the note are the same UTF-8 bytes.
     gitSync(fixture.repo, ["config", "i18n.logOutputEncoding", "ISO-8859-1"]);
+    gitSync(fixture.repo, ["config", "log.showSignature", "true"]);
+    gitSync(fixture.repo, ["config", "log.decorate", "full"]);
     const merged = await fixture.merge();
     expect(merged.reasonCode, merged.allowed ? "" : `${merged.message} ${JSON.stringify(merged.evidence)}`).toBe(ReasonCode.OK);
     expect(fixture.github.remoteNoteFor(fixture.x)).toBe(own);
+  });
+
+  it("a commit that declares encoding ISO-8859-1 is read in it: its UTF-8 own-mirror note is carried", async () => {
+    const fixture = await setup({ xLimit: "app() keeps one export, the record of X, café", xLatin1: { declared: "ISO-8859-1" } });
+    const raw = execRaw(fixture.repo, ["cat-file", "commit", fixture.x]);
+    expect(raw.includes(Buffer.from("\nencoding ISO-8859-1\n"))).toBe(true);
+    expect(raw.includes(Buffer.from("café", "latin1"))).toBe(true);
+    // The note is the same record in UTF-8, as `git log` gives it in this checkout's default display encoding.
+    const own = noteOn(fixture, fixture.x, trailersOf(fixture.repo, fixture.x));
+    expect(gitSync(fixture.repo, ["notes", "--ref=commitlore", "show", fixture.x])).toContain("café");
+    const merged = await fixture.merge();
+    expect(merged.reasonCode, merged.allowed ? "" : `${merged.message} ${JSON.stringify(merged.evidence)}`).toBe(ReasonCode.OK);
+    expect(fixture.github.remoteNoteFor(fixture.x)).toBe(own);
+  });
+
+  it("a message that is not UTF-8 and declares no encoding is refused as unreadable", async () => {
+    const fixture = await setup({ xLimit: "app() keeps one export, the record of X, café", xLatin1: { declared: null } });
+    const raw = execRaw(fixture.repo, ["cat-file", "commit", fixture.x]);
+    expect(raw.includes(Buffer.from("\nencoding "))).toBe(false);
+    expect(raw.includes(Buffer.from("café", "latin1"))).toBe(true);
+    noteOn(fixture, fixture.x, `Record-Id: ${X_ID}\nLimit: app() keeps one export, the record of X`);
+    const refused = await fixture.merge();
+    expect(refused.reasonCode, refused.allowed ? "" : `${refused.message} ${JSON.stringify(refused.evidence)}`).toBe(ReasonCode.VERIFICATION_GAP);
+    if (refused.allowed) throw new Error("expected a refusal");
+    expect(refused.evidence).toMatchObject({ phase: "preflight-notes", ref: "refs/notes/commitlore", refusal: "COMMITLORE_NOTE_UNREADABLE" });
+    expect(fixture.github.calls.filter((call) => call.method === "PUT")).toEqual([]);
+    expect(fixture.github.notesRef).toBeNull();
   });
 
   it("a non-governed run is unchanged: its notes are carried as they are", async () => {

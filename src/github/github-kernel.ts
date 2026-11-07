@@ -3086,11 +3086,13 @@ export class GitHubKernel {
           inherited.push(note.object);
           continue;
         }
-        // The commit's own bytes, read as the note's are (`cat-file`): `git log` would re-encode the message to
-        // the checkout's display encoding (`i18n.logOutputEncoding`) and print what `log.*` settings add.
-        const commit = (await gitBytes(checkout, ["cat-file", "commit", note.object])).stdout;
-        const split = commit.indexOf("\n\n");
-        const message = split === -1 ? "" : strictUtf8.decode(commit.subarray(split + 2));
+        // The message in UTF-8, whatever the checkout's display encoding (`i18n.logOutputEncoding`): git converts
+        // it from the commit's declared `encoding`, and the flags keep `log.*` settings from adding any byte. A
+        // message git cannot convert to UTF-8 comes back as it is stored, and the strict decode refuses it.
+        const message = strictUtf8.decode((await gitBytes(checkout, [
+          "log", "-1", "--no-show-signature", "--no-decorate", "--no-notes", "--no-color", "--encoding=UTF-8", "--format=%B",
+          "--end-of-options", note.object,
+        ])).stdout);
         const own = new Set((await recordBlocks(checkout, message, false)).map(blockSignature));
         if (!blocks.every((fields) => own.has(blockSignature(fields)))) unbound.push(note.object);
       }
