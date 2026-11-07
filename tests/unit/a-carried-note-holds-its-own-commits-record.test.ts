@@ -1,13 +1,16 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import type { Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { NO_HUMAN_GATE_DIGEST } from "../../src/github/github-kernel.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
+import { WorkerTurnEvent } from "../../src/run/worker-turn.ts";
 import { cleanupTempDirs, commitAll, gitSync, writeFiles } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
 import {
+  type Harness,
   approveReviewedCandidateForFinalization,
+  bindWorker,
   driveToReviewedCandidate,
   installDaemonFinalizerGitHubFixture,
   makeHarness,
@@ -19,6 +22,37 @@ const WORK_BRANCH = "feature/F1-thing";
 const X_ID = "r-xcommit01";
 const Y_ID = "r-ycommit01";
 const X_EARLY_ID = "r-xearly01";
+
+/**
+ * #1268 slice 1 — a governed freeze holds only commits a SUCCEEDED worker receipt of the run accounts for. `commit`
+ * is its own task's worker turn, recorded as the harness records the head's (`driveToReviewedCandidate`) and slice 1's
+ * witness records one: the execution opened and closed SUCCEEDED, and the receipt naming the commit with the
+ * CommitLore outcome a settled turn records, its record ids exactly the commit's own `Record-Id` trailers.
+ */
+const recordWorkerTurn = (harness: Harness, runId: string, commit: string, recordIds: string[]): void => {
+  const submitted = harness.cp.tasks.submit(runId, [{ key: "prepare", title: "prepare app()", category: "implementation" }]);
+  if (!submitted.allowed) throw new Error(submitted.message);
+  const taskId = submitted.value[0]!.taskId;
+  const workerSessionId = bindWorker(harness, taskId);
+  const repository = harness.cp.db.get<{ repository_id: string }>(`SELECT repository_id FROM run_repositories WHERE run_id = ?`, [runId]);
+  const opened = harness.cp.tasks.startExecution({
+    runId, taskId, ownerBindingGeneration: harness.cp.runs.require(runId).ownerBindingGeneration!, workerSessionId,
+    provider: "scripted", model: "scripted-worker", repositoryId: repository!.repository_id,
+  });
+  if (!opened.allowed) throw new Error(opened.message);
+  const resultDigest = `sha256:${commit}`;
+  const closed = harness.cp.tasks.finishExecution(opened.value.executionId, { status: "SUCCEEDED", resultDigest });
+  if (!closed.allowed) throw new Error(closed.message);
+  harness.cp.audit.record({
+    kind: WorkerTurnEvent.SUCCEEDED,
+    runId,
+    sessionId: workerSessionId,
+    evidence: {
+      executionId: opened.value.executionId, resultDigest, taskId, commitHead: commit,
+      commitlore: { outcome: "recorded", recordIds, nonce: "capture-nonce" },
+    },
+  });
+};
 
 /** GitHub's merged-PR snapshot and its base ref, as `tests/scenarios/github-kernel.test.ts` models them. */
 const reflectMergedBase = (github: FakeGitHub): void => {
@@ -42,7 +76,7 @@ const reflectMergedBase = (github: FakeGitHub): void => {
  * The setup is the one the #1269 notes scenarios use, with X committed on the work branch before the run. The run
  * is governed (CommitLore `required`) unless `governed` is false (`preferred`, the fixture manifest's own mode).
  */
-const setup = async (options: { governed?: boolean } = {}) => {
+const setup = async (options: { governed?: boolean; xLimit?: string } = {}) => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
   const harness = makeHarness({ githubClient: github });
@@ -60,7 +94,15 @@ const setup = async (options: { governed?: boolean } = {}) => {
   gitSync(repo, ["checkout", "-q", "-b", WORK_BRANCH]);
   writeFiles(repo, { "src/app.js": "module.exports = () => 1 + 0;\n" });
   const x = commitAll(repo, `prepare app()\n\nLimit: an earlier record of X\nRecord-Id: ${X_EARLY_ID}\n\n` +
-    `Record-Id: ${X_ID}\nLimit: app() keeps one export, the record of X`);
+    `Record-Id: ${X_ID}\nLimit: ${options.xLimit ?? "app() keeps one export, the record of X"}`);
+  if (options.governed !== false) {
+    // X's turn is recorded in the run once the run exists, before its one freeze; the harness records the head's.
+    const freeze = harness.cp.pipeline.freeze.bind(harness.cp.pipeline);
+    vi.spyOn(harness.cp.pipeline, "freeze").mockImplementationOnce(async (runId, attemptId) => {
+      recordWorkerTurn(harness, runId, x, [X_EARLY_ID, X_ID]);
+      return freeze(runId, attemptId);
+    });
+  }
 
   const driven = await driveToReviewedCandidate(harness, {
     workBranch: WORK_BRANCH,
@@ -256,6 +298,17 @@ describe("#1268 slice 2 — a carried note holds the record of the commit it is 
     expect(merged.reasonCode, merged.allowed ? "" : merged.message).toBe(ReasonCode.OK);
     expect(fixture.github.remoteNoteFor(fixture.x)).toBe(own);
     expect(fixture.github.remoteNoteFor(fixture.head)).toBeUndefined();
+  });
+
+  it("an own-mirror note is carried whatever encoding git displays commit messages in", async () => {
+    const fixture = await setup({ xLimit: "app() keeps one export, the record of X, café" });
+    const own = noteOn(fixture, fixture.x, trailersOf(fixture.repo, fixture.x));
+    expect(gitSync(fixture.repo, ["notes", "--ref=commitlore", "show", fixture.x])).toContain("café");
+    // Only how `git log` shows messages changes; the commit and the note are the same UTF-8 bytes.
+    gitSync(fixture.repo, ["config", "i18n.logOutputEncoding", "ISO-8859-1"]);
+    const merged = await fixture.merge();
+    expect(merged.reasonCode, merged.allowed ? "" : `${merged.message} ${JSON.stringify(merged.evidence)}`).toBe(ReasonCode.OK);
+    expect(fixture.github.remoteNoteFor(fixture.x)).toBe(own);
   });
 
   it("a non-governed run is unchanged: its notes are carried as they are", async () => {

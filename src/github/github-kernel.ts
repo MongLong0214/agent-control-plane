@@ -3086,7 +3086,11 @@ export class GitHubKernel {
           inherited.push(note.object);
           continue;
         }
-        const message = strictUtf8.decode((await gitBytes(checkout, ["log", "-1", "--format=%B", note.object])).stdout);
+        // The commit's own bytes, read as the note's are (`cat-file`): `git log` would re-encode the message to
+        // the checkout's display encoding (`i18n.logOutputEncoding`) and print what `log.*` settings add.
+        const commit = (await gitBytes(checkout, ["cat-file", "commit", note.object])).stdout;
+        const split = commit.indexOf("\n\n");
+        const message = split === -1 ? "" : strictUtf8.decode(commit.subarray(split + 2));
         const own = new Set((await recordBlocks(checkout, message, false)).map(blockSignature));
         if (!blocks.every((fields) => own.has(blockSignature(fields)))) unbound.push(note.object);
       }
