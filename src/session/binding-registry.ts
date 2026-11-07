@@ -428,6 +428,13 @@ export class BindingRegistry {
        * generation alone does not say the holder is the same.
        */
       expectedCurrent?: { assignmentId: string; sessionId: string; sessionIncarnation: string };
+      /**
+       * Asked of the role's current binding inside this transaction, before anything is written; false
+       * refuses the switch ROLE_RUNTIME_SUBSTITUTION_REFUSED. Continuity passes its adopted-runtime rule,
+       * so a holder that came onto an adopted runtime after the caller last looked is neither moved nor
+       * replaced.
+       */
+      replaceableCurrent?: (current: RoleBinding) => boolean;
     },
   ): Decision<RoleBinding> {
     // #664 — this body's writes (the runtime move, the revoke+mint+insert, the run
@@ -466,6 +473,12 @@ export class BindingRegistry {
           roleKey,
           expectedAssignmentId: input.expectedCurrent.assignmentId,
           actualAssignmentId: current?.assignmentId ?? null,
+        });
+      }
+      if (current && input.replaceableCurrent && !input.replaceableCurrent(current)) {
+        return deny(ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED, "the role's current holder is on an adopted runtime; it is not replaced", {
+          roleKey,
+          sessionId: current.sessionId,
         });
       }
 
@@ -922,11 +935,33 @@ export class BindingRegistry {
        * — rejects them as before.
        */
       holdEscalationRepliesForRenewal?: boolean;
+      /**
+       * Further facts for this revocation's BINDING_REVOKED record, beside `reason` and `generation`,
+       * which it never replaces. Continuity's runtime-loss revocation names the refused failover's
+       * reason code here. Absent, the record is exactly `{ reason, generation }`.
+       */
+      evidence?: Readonly<Record<string, string | number | boolean | null>>;
+      /**
+       * The exact binding the caller decided to revoke, checked in this transaction: anything else
+       * holding the role (another assignment, generation, runtime or incarnation) is refused
+       * BINDING_GENERATION_STALE and left as it is.
+       */
+      expectedCurrent?: Pick<RoleBinding, "assignmentId" | "bindingGeneration" | "sessionId" | "sessionIncarnation">;
     } = {},
   ): Decision<void> {
     return this.db.tx(() => {
       const current = this.active(roleKey);
       if (!current) return deny(ReasonCode.NOT_FOUND, "no active binding", { roleKey });
+      const expected = options.expectedCurrent;
+      if (expected !== undefined && (current.assignmentId !== expected.assignmentId ||
+          current.bindingGeneration !== expected.bindingGeneration || current.sessionId !== expected.sessionId ||
+          current.sessionIncarnation !== expected.sessionIncarnation)) {
+        return deny(ReasonCode.BINDING_GENERATION_STALE, "the role's binding is no longer the one this revocation was for", {
+          roleKey,
+          expectedGeneration: expected.bindingGeneration,
+          currentGeneration: current.bindingGeneration,
+        });
+      }
       const ownedRuns = this.liveRunsOwnedBy(current);
       const held: readonly string[] = options.allowHeldRuns
         ? ["BLOCKED", "REVISION_REQUIRED", "AWAITING_HUMAN"]
@@ -976,7 +1011,7 @@ export class BindingRegistry {
         kind: "BINDING_REVOKED",
         roleKey,
         sessionId: current.sessionId,
-        evidence: { reason, generation: current.bindingGeneration },
+        evidence: { ...options.evidence, reason, generation: current.bindingGeneration },
       });
       this.#notifySwitch({ ...current, status: "REVOKED" });
       return allow(ReasonCode.OK, undefined);

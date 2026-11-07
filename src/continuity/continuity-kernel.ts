@@ -23,6 +23,7 @@ import { ContinuityMode, Role, type RoleBinding, RunState, SessionLifecycle, rol
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
 import { drivenModeOf } from "../runtime/provisioned-session-runtime.ts";
+import { hermesCanonicalRuntimeSql } from "../outbox/outbox.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -137,8 +138,20 @@ export const coverageRevocationReason = (measured: { runtimeLost: boolean; quota
 export const CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON =
   "continuity failover did not leave a ready planned binding";
 
-/** The prefix of the third such reason, whose tail is the refused failover's reason code. */
+/**
+ * The prefix of the third such reason, whose tail is the refused failover's reason code. No longer
+ * written: a refused failover is recorded as the runtime loss below. Kept for the rows that carry it.
+ */
 export const CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX = "continuity failover refused: ";
+
+/**
+ * A bound role lost its runtime (its session is gone or no longer READY, its runtime was measured
+ * UNAVAILABLE, or its recorded process is dead) and continuity did not put another behind it: the
+ * failover was refused, or the role is a canonical CTO that is never failed over. The refused
+ * failover's reason code is recorded beside it on the revocation (`failoverRefusal`), never as it, so
+ * an admission refusal is not read as the cause of a lost runtime.
+ */
+export const CONTINUITY_RUNTIME_LOST_REVOCATION_REASON = "the bound runtime was lost and continuity did not fail it over";
 
 /**
  * #246 C1b — the fourth: a bootstrap CTO's same-session recovery renewed the binding and then could
@@ -163,6 +176,7 @@ export const CONTINUITY_REVOCATION_REASONS: readonly string[] = [
   CONTINUITY_CAPACITY_AND_RUNTIME_REVOCATION_REASON,
   CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON,
   CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON,
+  CONTINUITY_RUNTIME_LOST_REVOCATION_REASON,
 ];
 
 /**
@@ -611,10 +625,22 @@ export class ContinuityKernel {
     if (role === Role.BOOTSTRAP_CTO) return bootstrapCtoNotReplaceable(roleKey);
     // #246 C4-R2 — nor is a PRIMARY_CTO whose holder has a driven-spawn record: its conversation lives
     // in its own session, which is recovered on itself (`CtoLifecycle.recoverDrivenPrimaryCto`).
-    // The holder read here is the one this failover may replace: fenced before the first await, so
-    // a binding that arrives while evaluation or admission is awaited is refused, never replaced.
-    const fenced = role === Role.PRIMARY_CTO ? this.bindings.active(roleKey) : null;
+    // The holder read here, whatever the role, is the one this failover may replace: fenced before the
+    // first await, so a binding that arrives while evaluation or admission is awaited is refused, never
+    // replaced.
+    const holder = this.bindings.active(roleKey);
+    const fenced = role === Role.PRIMARY_CTO ? holder : null;
     if (fenced && drivenModeOf(this.db, fenced.sessionId) !== "NONE") return drivenPrimaryNotReplaceable(roleKey, fenced.sessionId);
+    // Nor, whatever the role, a holder whose runtime an adoption bound and no provider launched
+    // (`holdsAdoptedRuntime`). A failover would start a fresh session and move the actor onto it: a
+    // canonical CTO's own restart could then not prove its predecessor gone, the session recording no
+    // process (`CanonicalSelfClaim`), and an adopted CEO would sit on a runtime that is not a Hermes one,
+    // which its tool admission refuses and which Gateway re-adoption reads as an active CEO. Refused
+    // before anything is measured or started; the daemon revokes the role for its lost runtime, and the
+    // role's own recovery takes it back: the conversation's self-claim, or the Gateway's re-adoption.
+    if (holder && holdsAdoptedRuntime(this.db, this.sessions.get(holder.sessionId), holder)) {
+      return adoptedRuntimeNotReplaceable(roleKey, holder.sessionId);
+    }
     const plan = await this.evaluate(`failover:${roleKey}`);
     const assignment = plan.assignments.find((a) => a.roleKey === roleKey);
     const required = plan.requiredRoles.find((candidate) => candidate.roleKey === roleKey);
@@ -632,22 +658,24 @@ export class ContinuityKernel {
     // capability immediately before `startSession` (§14.2). Worker failover remains a
     // lower-priority allocation and therefore carries the same dynamic reserve as fan-out.
     //
-    // #246 — a role with a fixed runtime is admitted against its own role-scoped reading, the one it
-    // was staffed under, so a Claude-to-Claude failover can be admitted at all; every other role
-    // keeps the provider-level admission it had.
-    const fixedRole = fixedRuntimes(role).length > 0 && this.providers.hasRoleScoped(assignment.provider) ? role : undefined;
+    // #246 — a role on a provider with role-scoped adapters is admitted against its own role-scoped
+    // reading, the one it was staffed under, as the canonical CTO restore is: that provider has no
+    // provider-level reading, and admission refuses a role-less target for it, so without the role no
+    // Claude-to-Claude failover could be admitted at all. Every other provider keeps the provider-level
+    // admission it had.
+    const scopedRole = this.providers.hasRoleScoped(assignment.provider) ? role : undefined;
     const switchTarget: DispatchCapacityTarget =
       required.capability === "worker"
         ? {
             provider: assignment.provider,
-            ...(fixedRole ? { role: fixedRole } : {}),
+            ...(scopedRole ? { role: scopedRole } : {}),
             capabilities: [required.capability],
             priority: "worker",
-            reserveDemand: this.capacity.workerReserveDemand(assignment.provider, fixedRole),
+            reserveDemand: this.capacity.workerReserveDemand(assignment.provider, scopedRole),
           }
         : {
             provider: assignment.provider,
-            ...(fixedRole ? { role: fixedRole } : {}),
+            ...(scopedRole ? { role: scopedRole } : {}),
             capabilities: [required.capability],
             priority: "critical",
           };
@@ -657,13 +685,20 @@ export class ContinuityKernel {
     const endedBeforeSpawn = this.#workerRunEnded(role, scope);
     if (endedBeforeSpawn) return endedBeforeSpawn;
 
+    // The holder after the awaits must be exactly the one fenced (assignment, generation, runtime and
+    // incarnation), and still not on an adopted runtime, before anything is started: otherwise nothing
+    // is provisioned. A binding that arrived while the plan was computed, an adopted CEO re-bound among
+    // them, is never this failover's to replace.
     const expected = this.bindings.active(roleKey);
-    if (role === Role.PRIMARY_CTO && !sameHolder(fenced, expected)) {
+    if (!sameHolder(holder, expected)) {
       return deny(ReasonCode.BINDING_GENERATION_STALE, "the role's binding changed while the failover was admitted; it is not replaced", {
         roleKey,
-        fencedGeneration: fenced?.bindingGeneration ?? null,
+        fencedGeneration: holder?.bindingGeneration ?? null,
         currentGeneration: expected?.bindingGeneration ?? null,
       });
+    }
+    if (expected && holdsAdoptedRuntime(this.db, this.sessions.get(expected.sessionId), expected)) {
+      return adoptedRuntimeNotReplaceable(roleKey, expected.sessionId);
     }
     // #954 — a role continuity revoked for want of coverage gets its binding back only from a claim
     // (see `restore()`). With no active binding `switchTo` has no current row to replace, reads the
@@ -733,6 +768,10 @@ export class ContinuityKernel {
       ...(role === Role.PRIMARY_CTO && expected
         ? { expectedCurrent: { assignmentId: expected.assignmentId, sessionId: expected.sessionId, sessionIncarnation: expected.sessionIncarnation } }
         : {}),
+      // And, for every role, the holder the switch finds is asked again in the switch's own transaction:
+      // one that came onto an adopted runtime after the checks above, at the same generation, is
+      // refused, and the session started for it is stopped below.
+      replaceableCurrent: (current) => !holdsAdoptedRuntime(this.db, this.sessions.get(current.sessionId), current),
       // A failover of a role that still owns live work is a takeover: the runs move to the
       // new generation in the same transaction rather than being orphaned.
       takeover: true,
@@ -1657,6 +1696,25 @@ const drivenPrimaryNotReplaceable = <T>(roleKey: string, sessionId: string): Dec
   deny(
     ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED,
     "a driven primary CTO is never failed over to another session; it is recovered on its own",
+    { roleKey, sessionId },
+  );
+
+/**
+ * Whether a holder's runtime is one an adoption bound and no provider launched: a canonical CTO's own
+ * claude conversation (`isAdoptedCanonicalRuntime`), or an adopted Hermes CEO's Gateway, which is a
+ * Hermes runtime (the one adopted-CEO tool admission accepts) carrying the actor's Hermes target
+ * (`hermesCanonicalRuntimeSql`, the outbox's canonical-route rule). A Hermes-target actor already on a
+ * provider-launched session is not on an adopted runtime, and #649's attested survival still moves it.
+ */
+const holdsAdoptedRuntime = (db: Db, session: SessionRecord | null, holder: RoleBinding): boolean =>
+  isAdoptedCanonicalRuntime(db, holder.sessionId, holder.assignmentId) ||
+  (session?.provider === "hermes" &&
+    db.get<{ held: number }>(`SELECT ${hermesCanonicalRuntimeSql("?")} AS held`, [holder.sessionId])?.held === 1);
+
+const adoptedRuntimeNotReplaceable = <T>(roleKey: string, sessionId: string): Decision<T> =>
+  deny(
+    ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED,
+    "an adopted runtime is never failed over to another; the role's own recovery takes it back",
     { roleKey, sessionId },
   );
 
