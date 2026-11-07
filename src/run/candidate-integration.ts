@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
@@ -9,7 +10,15 @@ import type { Db } from "../db/database.ts";
 import type { SnapshotIntegration } from "../snapshot/candidate-snapshot.ts";
 import type { TaskRecord } from "./task-graph.ts";
 import { type StartsFrom, TASK_WRITE_TARGET_RECORDED, recordedWriteTarget, startOf } from "./task-write-target.ts";
-import { type PinnedRepository, committedChanges, objectFormatOf, pinRepository, runPinnedGit } from "./worker-git.ts";
+import {
+  GIT_HARDENING,
+  type PinnedRepository,
+  committedChanges,
+  objectFormatOf,
+  pinRepository,
+  pinnedGitEnvironment,
+  runPinnedGit,
+} from "./worker-git.ts";
 import { type TaskImport, parseImportManifest } from "./task-import.ts";
 import { WorkerTurnEvent } from "./worker-turn.ts";
 
@@ -1001,6 +1010,36 @@ export const foreignCandidateCommit = async (input: {
     }
     return allow(ReasonCode.OK, null);
   });
+};
+
+/**
+ * #1268 — a checkout's HEAD commit, read with nothing awaited: the pinned git (`pinRepository`, `GIT_HARDENING`,
+ * `pinnedGitEnvironment`, as `runPinnedGit` runs it) started synchronously, for a decision taken inside one
+ * database transaction. Null when git does not answer it.
+ */
+export const checkoutHeadNow = (checkoutPath: string): string | null => {
+  const scratch = acpScratchDir("acp-candidate-head-now-");
+  try {
+    const pinned = pinRepository(checkoutPath, scratch);
+    if (!pinned.allowed) return null;
+    try {
+      const home = join(scratch, "home");
+      const head = execFileSync("git", [...GIT_HARDENING, "rev-parse", "--verify", "-q", "HEAD^{commit}"], {
+        cwd: pinned.value.workTree,
+        env: { PATH: process.env["PATH"] ?? "/usr/bin:/bin", HOME: home, XDG_CONFIG_HOME: home, ...pinnedGitEnvironment({ gitDir: pinned.value.gitDir, workTree: pinned.value.workTree }) },
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 30_000,
+      }).trim();
+      return head.length > 0 ? head : null;
+    } catch {
+      return null;
+    } finally {
+      pinned.value.children.retire();
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 };
 
 /** S6 review (P2) — where an integrated candidate is kept reachable: never a branch, never HEAD. */

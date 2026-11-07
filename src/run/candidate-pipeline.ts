@@ -59,6 +59,7 @@ import {
   type MergeCheckBinding,
   PREDECESSOR_BASE_MERGES_CHECKED,
   checkoutHeadAsCandidate,
+  checkoutHeadNow,
   foreignCandidateCommit,
   integratePredecessors,
   integrateTaskResults,
@@ -368,6 +369,22 @@ const movedCheckoutHead = async (
     const checkoutPath = repositories.find((repo) => repo.identity === repository.identity)!.checkoutPath;
     const expected = expectedCheckoutHead(repository);
     const observed = await tryRevParse(checkoutPath, "HEAD");
+    if (observed !== expected) {
+      return { repositoryIdentity: repository.identity, candidateHead: repository.candidateHead, expectedCheckoutHead: expected, observedCheckoutHead: observed };
+    }
+  }
+  return null;
+};
+
+/** #1268 — `movedCheckoutHead`, read with nothing awaited (`checkoutHeadNow`), for a decision inside one transaction. */
+const movedCheckoutHeadNow = (
+  frozen: readonly { identity: string; candidateHead: string; integration?: CandidateSnapshot["repositories"][number]["integration"] }[],
+  repositories: readonly { identity: string; checkoutPath: string }[],
+): Record<string, unknown> | null => {
+  for (const repository of frozen) {
+    const checkoutPath = repositories.find((repo) => repo.identity === repository.identity)!.checkoutPath;
+    const expected = expectedCheckoutHead(repository);
+    const observed = checkoutHeadNow(checkoutPath);
     if (observed !== expected) {
       return { repositoryIdentity: repository.identity, candidateHead: repository.candidateHead, expectedCheckoutHead: expected, observedCheckoutHead: observed };
     }
@@ -703,38 +720,22 @@ export class CandidatePipeline {
           },
         );
 
-    // #1268 — and again once the refs are applied: the freeze's last read before it records the candidate, with no
-    // await between it and `artifacts.put` below. A moved HEAD undoes exactly the refs this freeze applied, through
-    // the same guarded ref path, and refuses; a ref that cannot be undone is named, and refused all the same.
+    // #1268 — and again once the refs are applied. A moved HEAD undoes exactly the refs this freeze applied,
+    // through the same guarded ref path, and refuses; a ref that cannot be undone is named, and refused all the same.
+    const refuseMoved = async (moved: Record<string, unknown>): Promise<Decision<CandidateSnapshot>> => {
+      const leftoverRefs: string[] = [];
+      for (const write of [...applied].reverse()) {
+        const undone = await this.writeCandidateRefs(run, write.identity, write.checkoutPath, undoCandidateRefLines(write.lines));
+        if (!undone.allowed) leftoverRefs.push(...write.lines.map((line) => line.split(" ")[1]!));
+      }
+      return headMoved(moved, leftoverRefs);
+    };
     if (checkMergeMessages !== undefined) {
       const moved = await movedCheckoutHead(snapshot.repositories, repositories);
-      if (moved !== null) {
-        const leftoverRefs: string[] = [];
-        for (const write of applied.reverse()) {
-          const undone = await this.writeCandidateRefs(run, write.identity, write.checkoutPath, undoCandidateRefLines(write.lines));
-          if (!undone.allowed) leftoverRefs.push(...write.lines.map((line) => line.split(" ")[1]!));
-        }
-        return headMoved(moved, leftoverRefs);
-      }
+      if (moved !== null) return refuseMoved(moved);
     }
 
-    this.artifacts.put(runId, ArtifactKind.CANDIDATE_SNAPSHOT, snapshot, digest);
-    // G-6 — a readback the store refuses is replaced by this freeze's refusal row, so the review names it
-    // missing with the refusal rather than showing an earlier freeze's readback of the same candidate.
-    const reviewContextOutcome = reviewContext === null ? null : storeContractChangeReviewContext(this.artifacts, reviewContext);
-    // One transaction records the new candidate and stales everything bound to an older
-    // one, so no window exists in which superseded evidence still reads as current.
-    this.runs.promoteCandidate(runId, digest);
-    // The refs of the candidates this one supersedes go now. Best effort: one left behind keeps an
-    // old candidate's objects from gc, nothing more, and the next freeze asks again.
-    for (const repo of repositories) {
-      const frozen = snapshot.repositories.find((candidate) => candidate.identity === repo.identity);
-      const keep = frozen?.integration === undefined ? null : { ref: candidateRefFor(runId, digest), commit: frozen.candidateHead };
-      const plan = await candidateRefPlan(repo.checkoutPath, runId, keep);
-      const superseded = plan.allowed ? plan.value.filter((line) => line.startsWith("delete ")) : [];
-      if (superseded.length > 0) await this.writeCandidateRefs(run, repo.identity, repo.checkoutPath, superseded);
-    }
-    this.audit.record({
+    const frozenRecord = (reviewContextOutcome: ReturnType<typeof storeContractChangeReviewContext> | null) => ({
       kind: "CANDIDATE_FROZEN",
       runId,
       evidence: {
@@ -754,6 +755,49 @@ export class CandidatePipeline {
         ...(reviewContextOutcome === null ? {} : { reviewContext: reviewContextOutcome }),
       },
     });
+    // The refs of the candidates this one supersedes go now. Best effort: one left behind keeps an
+    // old candidate's objects from gc, nothing more, and the next freeze asks again.
+    const removeSupersededRefs = async (): Promise<void> => {
+      for (const repo of repositories) {
+        const frozen = snapshot.repositories.find((candidate) => candidate.identity === repo.identity);
+        const keep = frozen?.integration === undefined ? null : { ref: candidateRefFor(runId, digest), commit: frozen.candidateHead };
+        const plan = await candidateRefPlan(repo.checkoutPath, runId, keep);
+        const superseded = plan.allowed ? plan.value.filter((line) => line.startsWith("delete ")) : [];
+        if (superseded.length > 0) await this.writeCandidateRefs(run, repo.identity, repo.checkoutPath, superseded);
+      }
+    };
+
+    if (checkMergeMessages !== undefined) {
+      // #1268 — a run whose contract requires CommitLore records its candidate in one synchronous transaction: the
+      // artifact, the promotion and CANDIDATE_FROZEN, then every checkout's HEAD read again with nothing awaited
+      // (`checkoutHeadNow`). A HEAD that is not the one frozen rolls all three back, so no success row exists unless
+      // every HEAD matched after they were written; the refs are then undone and the freeze refused.
+      const seen: { moved: Record<string, unknown> | null } = { moved: null };
+      const persisted = this.db.txDecision(() => {
+        this.artifacts.put(runId, ArtifactKind.CANDIDATE_SNAPSHOT, snapshot, digest);
+        const reviewContextOutcome = reviewContext === null ? null : storeContractChangeReviewContext(this.artifacts, reviewContext);
+        this.runs.promoteCandidate(runId, digest);
+        this.audit.record(frozenRecord(reviewContextOutcome));
+        seen.moved = movedCheckoutHeadNow(snapshot.repositories, repositories);
+        return seen.moved === null
+          ? allow(ReasonCode.OK, undefined)
+          : deny(ReasonCode.CANDIDATE_HEAD_MOVED, "a checkout's HEAD moved before the candidate was recorded", {});
+      });
+      if (!persisted.allowed) return seen.moved === null ? (persisted as Decision<CandidateSnapshot>) : refuseMoved(seen.moved);
+      // Best-effort cleanup, after the decision and outside it.
+      await removeSupersededRefs();
+      return allow(ReasonCode.OK, snapshot);
+    }
+
+    this.artifacts.put(runId, ArtifactKind.CANDIDATE_SNAPSHOT, snapshot, digest);
+    // G-6 — a readback the store refuses is replaced by this freeze's refusal row, so the review names it
+    // missing with the refusal rather than showing an earlier freeze's readback of the same candidate.
+    const reviewContextOutcome = reviewContext === null ? null : storeContractChangeReviewContext(this.artifacts, reviewContext);
+    // One transaction records the new candidate and stales everything bound to an older
+    // one, so no window exists in which superseded evidence still reads as current.
+    this.runs.promoteCandidate(runId, digest);
+    await removeSupersededRefs();
+    this.audit.record(frozenRecord(reviewContextOutcome));
     return allow(ReasonCode.OK, snapshot);
   }
 

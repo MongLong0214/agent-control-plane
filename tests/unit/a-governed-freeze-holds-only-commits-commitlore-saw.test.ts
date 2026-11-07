@@ -1,4 +1,4 @@
-import { rmSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
@@ -8,6 +8,7 @@ import { sha256 } from "../../src/core/digest.ts";
 import { deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
+import type * as Git from "../../src/git/git.ts";
 import type * as Integration from "../../src/run/candidate-integration.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { StartsFrom } from "../../src/run/task-write-target.ts";
@@ -45,7 +46,19 @@ const hooks = vi.hoisted(() => ({
   /** How many ref applications have started, and the one (if any) that is refused instead of applied. */
   refApplies: 0,
   failRefApplyAt: null as number | null,
+  /** Runs before each `tryRevParse(…, "HEAD")` the freeze makes, with the checkout it reads. */
+  duringHeadRead: null as ((checkoutPath: string) => void) | null,
 }));
+vi.mock("../../src/git/git.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof Git>();
+  return {
+    ...actual,
+    tryRevParse: async (...args: Parameters<typeof actual.tryRevParse>) => {
+      if (args[1] === "HEAD") hooks.duringHeadRead?.(args[0]);
+      return actual.tryRevParse(...args);
+    },
+  };
+});
 vi.mock("../../src/run/candidate-integration.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof Integration>();
   return {
@@ -87,6 +100,7 @@ afterEach(() => {
   hooks.atRefApply = null;
   hooks.refApplies = 0;
   hooks.failRefApplyAt = null;
+  hooks.duringHeadRead = null;
 });
 
 const CONTRACT: TaskContract = {
@@ -547,6 +561,87 @@ describe("#1268: a governed freeze holds only commits CommitLore accounts for", 
     rmSync(join(second.repo, ".git", "objects", lost.slice(0, 2), lost.slice(2)));
     expect(() => gitSync(second.repo, ["rev-parse", "--verify", "-q", "HEAD^{commit}"])).toThrow();
     await expectRefusedUnchanged(world, { reasonCode: ReasonCode.CANDIDATE_RANGE_UNVERIFIABLE, refusal: "OBJECT_UNREADABLE" });
+  });
+
+  it("R4 refused — one repository's HEAD moves while the final check reads another's: no artifact, promotion or CANDIDATE_FROZEN", async () => {
+    const world = await worldOf("required", "cl-freeze-two", { second: true });
+    workerCommit(world, "readme", { "README.md": "# one\n" }, "update readme", EMPTY);
+    workerCommit(world, "app", { "src/app.js": "module.exports = () => 2;\n" }, "update app", EMPTY);
+    const read: string[] = [];
+    let moved: string | null = null;
+    // Once the candidate ref is being applied, the next HEAD reads are the final check's: the first repository it
+    // reads moves while it reads the second.
+    hooks.atRefApply = () => {
+      hooks.duringHeadRead = (checkoutPath) => {
+        read.push(checkoutPath);
+        if (read.length !== 2) return;
+        hooks.duringHeadRead = null;
+        writeFiles(read[0]!, { "notes.md": "moved while another repository is read\n" });
+        moved = commitAll(read[0]!, "moved while another repository is read");
+      };
+    };
+    const frozen = await world.harness.cp.pipeline.freeze(world.run.runId);
+    expect(read).toHaveLength(2);
+    expect(read[0]).not.toBe(read[1]);
+    expect(frozen, JSON.stringify(frozen)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CANDIDATE_HEAD_MOVED,
+      evidence: { refusal: "HEAD_MOVED", observedCheckoutHead: moved, leftoverRefs: [] },
+    });
+    expect(world.harness.cp.artifacts.latest(world.run.runId, "CANDIDATE_SNAPSHOT")).toBeNull();
+    expect(currentCandidateOf(world)).toBeNull();
+    expect(frozenRows(world)).toEqual([]);
+    expect(gitSync(world.repo, ["for-each-ref", "--format=%(refname)", "refs/acp/candidates/"])).toBe("");
+  });
+
+  it("R4 what an integration-then-refusal leaves is never taken up: a new freeze and its verification make their own", async () => {
+    const world = await worldOf("required");
+    workerCommit(world, "readme", { "README.md": "# one\n" }, "update readme", EMPTY);
+    workerCommit(world, "app", { "src/app.js": "module.exports = () => 2;\n" }, "update app", EMPTY);
+    hooks.atRefApply = () => {
+      unmanagedCommit(world, "appended while the ref is applied");
+    };
+    const db = world.harness.cp.db;
+    const refused = await world.harness.cp.pipeline.freeze(world.run.runId);
+    expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.CANDIDATE_HEAD_MOVED });
+    // What it left: its integration worktree ended (DESTROYED, its directory gone), its claims released, and no
+    // candidate, CANDIDATE_FROZEN, merge-check record or candidate ref.
+    const worktreesOf = () => db.all<{ worktree_id: string; state: string; worktree_path: string; command_id: string }>(
+      `SELECT worktree_id, state, worktree_path, command_id FROM verification_worktrees WHERE run_id = ? ORDER BY worktree_id`, [world.run.runId]);
+    const left = worktreesOf();
+    expect(left.map((row) => [row.command_id, row.state])).toEqual([["candidate-integration", "DESTROYED"]]);
+    expect(left.every((row) => !existsSync(row.worktree_path))).toBe(true);
+    expect(gitSync(world.repo, ["worktree", "list", "--porcelain"]).split("\n").filter((line) => line.startsWith("worktree "))).toHaveLength(1);
+    expect(db.all<{ status: string }>(`SELECT status FROM resource_claims WHERE run_id = ?`, [world.run.runId]).every((row) => row.status === "RELEASED")).toBe(true);
+    expect(world.harness.cp.artifacts.latest(world.run.runId, "CANDIDATE_SNAPSHOT")).toBeNull();
+    expect(frozenRows(world)).toEqual([]);
+    expect(world.harness.cp.audit.byKind("PREDECESSOR_BASE_MERGES_CHECKED")).toEqual([]);
+    expect(gitSync(world.repo, ["for-each-ref", "--format=%(refname)", "refs/acp/"])).toBe("");
+
+    // A new, valid freeze: its own integration worktree, its own merge check, its own candidate.
+    const snapshot = await freezeAllowed(world);
+    const head = snapshot.repositories[0]!.candidateHead;
+    const afterFreeze = worktreesOf();
+    expect(afterFreeze.filter((row) => left.some((old) => old.worktree_id === row.worktree_id))).toEqual(left);
+    expect(afterFreeze.filter((row) => !left.some((old) => old.worktree_id === row.worktree_id)).map((row) => [row.command_id, row.state]))
+      .toEqual([["candidate-integration", "DESTROYED"]]);
+    const evidence = frozenRows(world).at(-1)?.evidence as { candidateSnapshotDigest: string; repositories: Array<Record<string, unknown>> };
+    expect(evidence.repositories[0]).toMatchObject({ commitloreMergeChecks: [{ commit: head }] });
+    expect(currentCandidateOf(world)).toBe(evidence.candidateSnapshotDigest);
+
+    // Its verification runs on that candidate, in worktrees of its own.
+    const manifest = world.harness.cp.projects.activeManifest(world.projectId)!.manifest;
+    const verified = await world.harness.cp.verification.verify({
+      runId: world.run.runId,
+      snapshot,
+      commands: manifest.verificationCommands,
+      contractDigest: snapshot.contractDigest,
+    });
+    expect(verified, JSON.stringify(verified).slice(0, 600)).toMatchObject({ allowed: true, value: { candidateSnapshotDigest: evidence.candidateSnapshotDigest } });
+    const results = db.all<{ exact_head: string }>(`SELECT exact_head FROM verification_results WHERE run_id = ?`, [world.run.runId]);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results.every((row) => row.exact_head === head)).toBe(true);
+    expect(worktreesOf().filter((row) => afterFreeze.some((old) => old.worktree_id === row.worktree_id))).toEqual(afterFreeze);
   });
 
   it("refused — the checkout's HEAD moved after the check: the checked head is not the one that would be frozen", async () => {
