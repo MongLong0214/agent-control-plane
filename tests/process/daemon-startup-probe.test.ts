@@ -15,7 +15,7 @@ const fakeBin = join(fixtureRoot, "bin");
 const providerTouch = join(fixtureRoot, "provider-was-invoked");
 
 mkdirSync(fakeBin, { recursive: true, mode: 0o700 });
-for (const provider of ["claude", "codex", "grok"]) {
+for (const provider of ["claude", "codex"]) {
   const executable = join(fakeBin, provider);
   writeFileSync(executable, `#!/bin/sh\nprintf touched > ${JSON.stringify(providerTouch)}\nexit 1\n`);
   chmodSync(executable, 0o700);
@@ -42,20 +42,9 @@ const providerHome = (state: "absent" | "present"): string => {
 
   const codex = join(home, ".codex");
   const claude = join(home, ".claude");
-  const grok = join(home, ".grok");
-  for (const directory of [codex, claude, grok]) mkdirSync(directory, { mode: 0o700 });
+  for (const directory of [codex, claude]) mkdirSync(directory, { mode: 0o700 });
   writeFileSync(join(codex, "auth.json"), JSON.stringify({ access_token: "present-path-sentinel" }), { mode: 0o600 });
   writeFileSync(join(claude, ".credentials.json"), JSON.stringify({ oauth: "present-path-sentinel" }), { mode: 0o600 });
-  writeFileSync(
-    join(grok, "auth.json"),
-    JSON.stringify({
-      "https://auth.x.ai::fixture": {
-        key: "present-path-sentinel-present-path-sentinel",
-        create_time: "2026-08-30T00:00:00.000Z",
-      },
-    }),
-    { mode: 0o600 },
-  );
   return home;
 };
 
@@ -68,7 +57,7 @@ const runProbe = (home: string): StartupReport => {
       ...process.env,
       HOME: home,
       PATH: `${fakeBin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
-      // If the isolated collector seam is removed, Grok must still refuse before any HTTP call.
+      // A client in the probe that honours a proxy setting is pointed at a host that does not exist.
       HTTPS_PROXY: "probe-test-must-not-contact-providers",
     },
   });
@@ -104,11 +93,6 @@ const stableOutcome = (report: StartupReport) => report.stages.map((stage, index
   retryAfterBackoff: index === 3 ? stableStartup(startup(stage, "retryAfterBackoff")) : undefined,
 }));
 
-// grok is deliberately absent: #735 retired it from the unattended capacity probe, so a
-// default-configuration startup (this probe never opts it back in) never reads it at all —
-// `cp.capacity.all()` only reports providers a refresh actually persisted a row for. Do not
-// add it back here; that would be re-introducing the always-failing unattended probe this
-// retirement removed.
 /**
  * `claude` reports `role-capacity-unavailable` here, and that is the contract rather than a loss.
  *
@@ -120,8 +104,7 @@ const stableOutcome = (report: StartupReport) => report.stages.map((stage, index
  * The measurement is not lost, and that is the part worth checking before accepting this value:
  * `continuity-kernel.ts:260` calls `refreshForRole(provider, role)` and `:139`/`:150` read
  * `currentForRole`, so Claude's capacity is collected once a role is bound. Were that not true,
- * this constant would be papering over a provider that had stopped being measured — which is
- * exactly the failure the `not.toHaveProperty("grok")` assertion below exists to make visible.
+ * this constant would be papering over a provider that had stopped being measured.
  *
  * What this case is actually about — that startup outcomes do not depend on provider login files —
  * is unchanged: both runs still produce identical sources.
@@ -147,9 +130,6 @@ describe("the daemon startup probe", () => {
     for (const stage of withoutLoginPaths.stages) {
       expect(stage).not.toHaveProperty("error");
       expect(stage["capacitySources"]).toEqual(isolatedSources);
-      // Named explicitly, not left as a silent omission: a provider quietly dropping out of
-      // a startup probe is exactly the kind of change that should be visible in a test.
-      expect(stage["capacitySources"]).not.toHaveProperty("grok");
     }
 
     expect(withoutLoginPaths.stages[0]).toMatchObject({

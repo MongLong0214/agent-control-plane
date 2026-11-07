@@ -320,15 +320,14 @@ if [[ "$target" == *"agentcpd.js" ]]; then
   # to carry had already gone stale twice: it said the canonical group ran 17-24 when it runs 17-22,
   # put lsof at 25-26 when it is 23-24, and gave Hermes an overlapping 26-33. A comment restating a
   # derived position is the second authority the derivation was introduced to remove.
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \\
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \\
     "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \\
     "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \\
     "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \\
-    "\${ACP_CLAUDE_BINARY:-<unset>}" "\${ACP_CODEX_BINARY:-<unset>}" "\${ACP_GROK_BINARY:-<unset>}" \\
+    "\${ACP_CLAUDE_BINARY:-<unset>}" "\${ACP_CODEX_BINARY:-<unset>}" \\
     "$(command -v claude || printf '<unresolvable>')" \\
     "$(command -v codex || printf '<unresolvable>')" \\
-    "$(command -v grok || printf '<unresolvable>')" \\
-    "$(started_of "\${ACP_CLAUDE_BINARY:-}"),$(started_of "\${ACP_CODEX_BINARY:-}"),$(started_of "\${ACP_GROK_BINARY:-}")" \\
+    "$(started_of "\${ACP_CLAUDE_BINARY:-}"),$(started_of "\${ACP_CODEX_BINARY:-}")" \\
     "$(command -v node || printf '<unresolvable>')" \\
     "$(command -v acp-sibling-probe || printf '<unresolvable>')" \\
     "\${ACP_CANONICAL_SESSIONS_JSON-}" "\${ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION-}" \\
@@ -525,21 +524,21 @@ const runGeneratedLauncher = (harness: InstallerHarness): CommandResult => {
  * about exactly these two indices while the hermes base, added later, was the third instance of the
  * same mistake. Deriving them is what stops the next change from being the fourth.
  */
-const CANONICAL_BASE_FIELD = 17;
+const CANONICAL_BASE_FIELD = 15;
 const LSOF_FIELD = CANONICAL_BASE_FIELD + CANONICAL_ACTIVATION_VARIABLES.length;
 const HERMES_BASE_FIELD = LSOF_FIELD + 2;
 
 /** What the daemon saw, by field. Positions are the contract; see the stub in `makeHarness`. */
 const launcherObservations = (harness: InstallerHarness) => {
   const f = readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
-  const byProvider = (a: number, b: number, c: number) =>
-    ({ claude: f[a], codex: f[b], grok: f[c] }) as Record<string, string | undefined>;
+  const byProvider = (a: number, b: number) =>
+    ({ claude: f[a], codex: f[b] }) as Record<string, string | undefined>;
   return {
-    handed: byProvider(8, 9, 10),
-    onPath: byProvider(11, 12, 13),
-    started: f[14],
-    node: f[15],
-    sibling: f[16],
+    handed: byProvider(8, 9),
+    onPath: byProvider(10, 11),
+    started: f[12],
+    node: f[13],
+    sibling: f[14],
     /** Where the daemon's PATH resolves the bare name `lsof`, and what a scan through it reports. */
     lsof: f[LSOF_FIELD],
     lsofScan: f[LSOF_FIELD + 1],
@@ -1773,11 +1772,11 @@ exec /bin/cp "$@"
 
   it("#785 pins each provider CLI absolutely and puts no provider directory on the daemon's PATH", () => {
     const harness = makeHarness();
-    // Three providers in three directories. `resolveExecutable` (src/runtime/cli-adapters.ts)
+    // Two providers in two directories. `resolveExecutable` (src/runtime/cli-adapters.ts)
     // searches the daemon's PATH for the bare names, the launcher pins that PATH to a fixed set,
     // and a CLI installed elsewhere resolves to a bare name that never spawns — reported by the
     // capacity parser as no quota rather than as an error.
-    const directories = ["a", "b", "c"].map((suffix) => {
+    const directories = ["a", "b"].map((suffix) => {
       const directory = join(harness.home, `acp-provider-cli-${suffix}`);
       mkdirSync(directory, { recursive: true });
       return directory;
@@ -1785,7 +1784,6 @@ exec /bin/cp "$@"
     const cli: Record<string, string> = {
       claude: writeProviderCli(join(directories[0] as string, "claude"), SELF_CONTAINED_CLI),
       codex: writeProviderCli(join(directories[1] as string, "codex"), SELF_CONTAINED_CLI),
-      grok: writeProviderCli(join(directories[2] as string, "grok"), SELF_CONTAINED_CLI),
     };
     harness.env["PATH"] = isolatedInstallerPath(harness, ...directories);
 
@@ -1795,6 +1793,9 @@ exec /bin/cp "$@"
     for (const [name, path] of Object.entries(cli)) {
       expect(launcher, `${name} was not resolved at install time`).toContain(path);
     }
+    // Grok is not a provider: the launcher names no pin or variable of it. Upper case only, because
+    // the launcher's own paths carry whatever the checkout directory is called.
+    expect(launcher, "the launcher still names the removed grok provider").not.toMatch(/GROK/);
     // Whole-line, so that no provider directory can be added anywhere in it.
     expect(launcher).toContain(EXPECTED_LAUNCHER_PATH_LINE);
     for (const directory of directories) {
@@ -1814,7 +1815,7 @@ exec /bin/cp "$@"
     expect(launched.status, launched.stderr).toBe(0);
     const seen = launcherObservations(harness);
 
-    for (const name of ["claude", "codex", "grok"]) {
+    for (const name of ["claude", "codex"]) {
       expect(seen.handed[name], `the launcher never exported a resolved ${name}`).toBe(cli[name]);
       // The pin is the only channel. If the directory were on PATH, this would resolve and the
       // row would pass for a reason it does not claim.
@@ -1822,7 +1823,7 @@ exec /bin/cp "$@"
         "<unresolvable>",
       );
     }
-    expect(seen.started, "a pinned CLI did not start").toBe("started,started,started");
+    expect(seen.started, "a pinned CLI did not start").toBe("started,started");
   });
 
   it("#785 leaves an executable sitting beside a provider CLI unreachable from the daemon", () => {
@@ -1926,12 +1927,12 @@ exec /bin/cp "$@"
     // A CLI can sit at a path with no directory worth adding to anything — a native build under
     // its own root, or a single file. The pin carries it; nothing about its parent directory is
     // encoded into the daemon's PATH.
-    const grok = writeProviderCli(join(harness.home, "grok"), SELF_CONTAINED_CLI);
+    const codex = writeProviderCli(join(harness.home, "codex"), SELF_CONTAINED_CLI);
     harness.env["PATH"] = isolatedInstallerPath(harness, harness.home);
 
     expect(installWithPins(harness).status).toBe(0);
     const launcher = readFileSync(launcherPath(harness), "utf8");
-    expect(launcher).toContain(grok);
+    expect(launcher).toContain(codex);
     expect(launcher).toContain(EXPECTED_LAUNCHER_PATH_LINE);
     expect(launcher, "the CLI's parent directory was encoded into a PATH").not.toContain(
       `${harness.home}:`,
@@ -1940,9 +1941,9 @@ exec /bin/cp "$@"
     const launched = runGeneratedLauncher(harness);
     expect(launched.status, launched.stderr).toBe(0);
     const seen = launcherObservations(harness);
-    expect(seen.handed["grok"]).toBe(grok);
-    expect(seen.onPath["grok"]).toBe("<unresolvable>");
-    expect(seen.started?.split(",")[2]).toBe("started");
+    expect(seen.handed["codex"]).toBe(codex);
+    expect(seen.onPath["codex"]).toBe("<unresolvable>");
+    expect(seen.started?.split(",")[1]).toBe("started");
   });
 
   it("#785 pins a symlinked CLI at the name it answered with and refuses a relative, non-executable or absent one", () => {
@@ -1965,22 +1966,25 @@ exec /bin/cp "$@"
     // A relative answer names nothing a daemon in another working directory can reach. It would
     // reach resolveExecutable's slash branch — which tests for a slash, not for an absolute path —
     // and be anchored to whatever directory the daemon happens to be in rather than searched for.
-    // `grok` resolves only through a relative PATH entry.
+    // `commitlore`, which the installer resolves by the same rule, resolves only through a relative
+    // PATH entry. An inherited value would be the operator's and would win; this row measures the
+    // installer's.
+    delete harness.env["ACP_COMMITLORE_BINARY"];
     const relative = "acp-provider-cli-relative";
     mkdirSync(join(harness.home, relative), { recursive: true });
-    writeProviderCli(join(harness.home, relative, "grok"), SELF_CONTAINED_CLI);
+    writeProviderCli(join(harness.home, relative, "commitlore"), SELF_CONTAINED_CLI);
 
     harness.env["PATH"] = `${harness.bin}:${onPath}:${relative}:/usr/bin:/bin`;
     // The premise, asserted rather than assumed: from this working directory the shell really does
     // answer with the relative spelling. Run anywhere else and it answers with nothing, and the
     // row below would be measuring an absent CLI while claiming to measure a relative one.
-    const relativeAnswer = boundedSpawnSync("bash", ["-c", "command -v grok"], {
+    const relativeAnswer = boundedSpawnSync("bash", ["-c", "command -v commitlore"], {
       encoding: "utf8",
       env: harness.env,
       cwd: harness.home,
     });
     expect(relativeAnswer.stdout.trim(), "the fixture did not produce a relative answer").toBe(
-      `${relative}/grok`,
+      `${relative}/commitlore`,
     );
 
     const installed = runInstaller(
@@ -1999,9 +2003,9 @@ exec /bin/cp "$@"
     );
     // Not pinned: neither the unexecutable file nor anything relative.
     expect(launcher, "a non-executable file was pinned").not.toContain("ACP_RESOLVED_CODEX_BINARY=");
-    expect(launcher, "a relative path was pinned").not.toContain("ACP_RESOLVED_GROK_BINARY=");
+    expect(launcher, "a relative path was pinned").not.toContain("ACP_RESOLVED_COMMITLORE_BINARY=");
     expect(launcher).not.toContain(`=${relative}/`);
-    for (const name of ["codex", "grok"]) {
+    for (const name of ["codex", "commitlore"]) {
       expect(installed.stderr).toContain(`could not resolve the ${name} CLI`);
     }
 
@@ -2011,7 +2015,7 @@ exec /bin/cp "$@"
     expect(seen.handed["claude"]).toBe(claudeLink);
     expect(seen.started?.split(",")[0]).toBe("started");
     expect(seen.handed["codex"]).toBe("<unset>");
-    expect(seen.handed["grok"]).toBe("<unset>");
+    expect(seen.commitlore, "the daemon was handed a relative CommitLore pin").toBeUndefined();
   });
 
   it("#954 pins the stable name a provider's updater maintains, not the versioned file behind it", () => {
@@ -2279,15 +2283,15 @@ exec /bin/cp "$@"
 
   it("#785 names each provider CLI it could not resolve and installs anyway", () => {
     const harness = makeHarness();
-    // grok is optional and a host without it must still be able to deploy, so nothing is pinned
-    // and nothing is refused. What it must not be is silent: an absent CLI reports as no quota,
+    // A host without a provider CLI must still be able to deploy, so nothing is pinned and nothing
+    // is refused. What it must not be is silent: an absent CLI reports as no quota,
     // which is indistinguishable from a provider that is out of quota unless the install says so.
     harness.env["PATH"] = isolatedInstallerPath(harness);
-    assertProviderUnresolvable(harness, "claude", "codex", "grok");
+    assertProviderUnresolvable(harness, "claude", "codex");
 
     const installed = installWithPins(harness);
     expect(installed.status, installed.stderr).toBe(0);
-    for (const name of ["claude", "codex", "grok"]) {
+    for (const name of ["claude", "codex"]) {
       expect(installed.stderr, `the installer said nothing about ${name}`).toContain(
         `could not resolve the ${name} CLI`,
       );
@@ -2300,7 +2304,6 @@ exec /bin/cp "$@"
     for (const variable of [
       "ACP_RESOLVED_CLAUDE_BINARY",
       "ACP_RESOLVED_CODEX_BINARY",
-      "ACP_RESOLVED_GROK_BINARY",
     ]) {
       expect(launcher, `${variable} was baked for a CLI that was never found`).not.toContain(
         `${variable}=`,
@@ -2311,7 +2314,7 @@ exec /bin/cp "$@"
     // The daemon still starts. An unresolved provider is a degraded deployment, not a dead one.
     expect(launched.status, launched.stderr).toBe(0);
     const seen = launcherObservations(harness);
-    for (const name of ["claude", "codex", "grok"]) expect(seen.handed[name]).toBe("<unset>");
+    for (const name of ["claude", "codex"]) expect(seen.handed[name]).toBe("<unset>");
   });
 
   /**
@@ -2324,7 +2327,6 @@ exec /bin/cp "$@"
   const PINNED_CLIS = [
     ["claude", "ACP_RESOLVED_CLAUDE_BINARY"],
     ["codex", "ACP_RESOLVED_CODEX_BINARY"],
-    ["grok", "ACP_RESOLVED_GROK_BINARY"],
     ["commitlore", "ACP_RESOLVED_COMMITLORE_BINARY"],
   ] as const;
 
@@ -2345,7 +2347,7 @@ exec /bin/cp "$@"
 
   it("B3-PIN pins the commitlore CLI absolutely beside the provider pins, and the daemon is handed it", () => {
     const harness = makeHarness();
-    const cli = cliDirectories(harness, "claude", "codex", "grok", "commitlore");
+    const cli = cliDirectories(harness, "claude", "codex", "commitlore");
 
     const installed = installWithPins(harness);
     expect(installed.status, installed.stderr).toBe(0);
@@ -2373,8 +2375,8 @@ exec /bin/cp "$@"
     const seen = launcherObservations(harness);
     expect(seen.commitlore, "the launcher never exported the resolved commitlore CLI").toBe(cli["commitlore"]);
     // The provider pins are what they were.
-    for (const name of ["claude", "codex", "grok"]) expect(seen.handed[name]).toBe(cli[name]);
-    expect(seen.started, "a pinned provider CLI did not start").toBe("started,started,started");
+    for (const name of ["claude", "codex"]) expect(seen.handed[name]).toBe(cli[name]);
+    expect(seen.started, "a pinned provider CLI did not start").toBe("started,started");
   });
 
   /**
@@ -2548,7 +2550,7 @@ exec /bin/cp "$@"
    * naming a real absolute executable, with no ACP_<P>_BINARY in the parent environment or the Keychain.
    * How an inherited ACP_<P>_BINARY itself is treated is a separate question these rows do not touch.
    */
-  const SIBLING_PINS = ["claude", "codex", "grok", "buzz"] as const;
+  const SIBLING_PINS = ["claude", "codex", "buzz"] as const;
   type SiblingPin = (typeof SIBLING_PINS)[number];
 
   /** What the daemon was handed for `name` on each of two launches, as a label. */
@@ -2705,7 +2707,7 @@ exec /bin/cp "$@"
   it("B3-PIN names an unresolvable commitlore CLI on stderr, pins nothing for it and installs anyway", () => {
     const harness = makeHarness();
     // The providers resolve, so the row also shows commitlore's absence costs them nothing.
-    const cli = cliDirectories(harness, "claude", "codex", "grok");
+    const cli = cliDirectories(harness, "claude", "codex");
     assertProviderUnresolvable(harness, "commitlore");
 
     const installed = installWithPins(harness);
@@ -2721,7 +2723,7 @@ exec /bin/cp "$@"
     const launcher = readFileSync(launcherPath(harness), "utf8");
     expect(launcher, "a pin was baked for a CLI that was never found").not.toMatch(/^ACP_RESOLVED_COMMITLORE_BINARY=/m);
     const lines = launcher.split("\n");
-    for (const [name, variable] of PINNED_CLIS.slice(0, 3)) {
+    for (const [name, variable] of PINNED_CLIS.slice(0, 2)) {
       expect(lines, `the ${name} pin changed`).toContain(`${variable}=${cli[name]}`);
     }
 
@@ -2730,7 +2732,7 @@ exec /bin/cp "$@"
     expect(launched.status, launched.stderr).toBe(0);
     const seen = launcherObservations(harness);
     expect(seen.commitlore, "the daemon was handed a CommitLore pin").toBeUndefined();
-    for (const name of ["claude", "codex", "grok"]) expect(seen.handed[name]).toBe(cli[name]);
+    for (const name of ["claude", "codex"]) expect(seen.handed[name]).toBe(cli[name]);
   });
 
   it("#423 leaves BUZZ_PRIVATE_KEY unset rather than guessing when neither source has it", () => {
@@ -3497,7 +3499,6 @@ describe("the suite's executable fixture writers", () => {
     for (const name of [
       "claude",
       "codex",
-      "grok",
       "commitlore",
       "acp-sibling-probe",
       "claude-1.0",
@@ -3534,7 +3535,7 @@ describe("the suite's executable fixture writers", () => {
     const warm = new Set(executables(writeEveryExecutableFixture()).map(({ inode }) => inode));
     const repeated = executables(writeEveryExecutableFixture());
 
-    expect(repeated.length, "the writers left no executables, so this measured nothing").toBe(12);
+    expect(repeated.length, "the writers left no executables, so this measured nothing").toBe(11);
     expect(
       repeated.filter(({ inode }) => !warm.has(inode)).map(({ path }) => path),
       "a repeated run wrote these as new executable inodes",

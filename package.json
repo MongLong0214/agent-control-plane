@@ -53,7 +53,6 @@
     "qualify:wake-transport": "tsx scripts/qualify-wake-transport.ts",
     "repo-factory:produce-local": "tsx scripts/repo-factory-produce-local.ts",
     "ssot:report": "node scripts/ssot-report.mjs",
-    "review:grok": "node scripts/grok-review.mjs",
     "review:production": "node scripts/production-review.mjs",
     "review:file-majors": "node scripts/file-review-majors.mjs",
     "file:open-work": "node scripts/file-open-work.mjs",

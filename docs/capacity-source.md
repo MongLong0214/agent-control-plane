@@ -25,16 +25,9 @@ persisted; its SHA-256 digest is retained in the reading source for audit correl
 |---|---|---|
 | Claude | `claude -p --output-format json --safe-mode --max-turns 1 "/usage"` | ~2s, `num_turns 0`, `total_cost_usd 0` |
 | Codex/GPT | `codex app-server --stdio` → `account/rateLimits/read` | ~2–3s, no model turn |
-| Grok | `GET cli-chat-proxy.grok.com/v1/billing?format=credits` | ~0.4s |
 
-Two of the three are the CLI doing what it already does with the credential it already holds,
-so nothing here handles a token. **Grok is the exception**, and deliberately so: `grok agent
-stdio` answers `-32601` for billing and no subcommand exits with it, so there is no
-CLI-mediated route. ACP borrows the subscription's bearer from the CLI's auth file for the
-length of one request. It is never stored, printed or forwarded, and it does not appear in the
-response body. That token expires — measured at six hours — and nothing here writes a refreshed
-one back, because that file belongs to the CLI and a second writer to a credential store is a
-worse problem than a stale reading. An expired credential is reported as exactly that.
+Both are the CLI doing what it already does with the credential it already holds, so nothing
+here handles a token.
 
 The HTTP surfaces underneath the Claude and Codex commands were rejected even though they
 return better-shaped data. Calling a vendor endpoint directly is the shape of metered access
@@ -54,13 +47,9 @@ the safer one could not answer.
 |---|---|---|
 | Claude (`claude`) | `ClaudeUsageCollector` | `cto`, `ceo`, `blind-review`, `worker` |
 | Codex/GPT (`gpt`) | `CodexUsageCollector` | `ceo`, `blind-review`, `worker`, `luna-worker` |
-| Grok (`grok`) | `GrokUsageCollector` | `adversarial-review` only |
 
 The parenthesised value is the registered provider id, and it is what `<provider>` below
 must be. `codex` is not a registered id and is refused with `CAPACITY_UNKNOWN_NOT_ROUTABLE`.
-
-Grok is optional diversity only. It never advertises a critical continuity capability and
-its absence does not degrade a required-role coverage plan.
 
 The collectors do not answer trust prompts, permission prompts, login prompts, or reset
 redemption prompts. Any such prompt is a failed observation. This prevents a capacity refresh
@@ -149,16 +138,16 @@ has a stricter requirement: set `ACP_CODEX_REVIEWER_HOME` to a dedicated Codex h
 contains reviewer credentials but no producer session history. The reviewer process uses
 that exact scope with a packet-local `HOME`; it never repurposes `~/.codex`.
 
-`ACP_CLAUDE_REVIEWER_CONFIG_DIR` and `ACP_GROK_CREDENTIAL_DIR` are corresponding optional
-deployment scopes. They are not capacity values and must not be written into manifests.
+`ACP_CLAUDE_REVIEWER_CONFIG_DIR` is the corresponding optional deployment scope for Claude. It is
+not a capacity value and must not be written into manifests.
 
 ## Live limitations observed on this machine
 
 Codex's current `/usage` command was reachable through a real PTY, but its available view
 reported token activity rather than a remaining quota/reset window, so it correctly
-produced no routable capacity. Claude and Grok stopped at their interactive trust prompts;
-the collector refused to approve them. No installed CLI exposes remaining quota and reset
-non-interactively on this host. That is a platform residual: use a provenance-bearing,
+produced no routable capacity. Claude stopped at its interactive trust prompt; the collector
+refused to approve it. No installed CLI exposes remaining quota and reset non-interactively on
+this host. That is a platform residual: use a provenance-bearing,
 short-lived operator observation until a provider exposes an accepted machine-readable
 quota surface.
 

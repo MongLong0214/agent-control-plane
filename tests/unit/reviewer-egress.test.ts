@@ -605,18 +605,20 @@ describe("gpt reviewer egress covers ChatGPT-authenticated Codex", () => {
     expect(record.jsonl).toContain(`"verdict": "DENY", "host": "${deniedHost}"`);
   }, 60_000);
 
-  it("leaves the claude and grok allowlists unchanged", async () => {
+  it("leaves the claude allowlist unchanged and has none for a provider that is not one", async () => {
     expect(REVIEWER_PROVIDER_ENDPOINTS["claude"]).toEqual(["api.anthropic.com"]);
-    expect(REVIEWER_PROVIDER_ENDPOINTS["grok"]).toEqual(["api.x.ai"]);
+    expect(Object.keys(REVIEWER_PROVIDER_ENDPOINTS).sort()).toEqual(["claude", "gpt"]);
     const fixture = await makeFixture();
-    for (const [provider, endpoints] of [["claude", ["api.anthropic.com"]], ["grok", ["api.x.ai"]]] as const) {
-      const lease = await acquireReviewerEgress(compiledPolicy(fixture.config), provider);
-      try {
-        expect(lease.allowedEndpoints, provider).toEqual(endpoints);
-      } finally {
-        await lease.abandon();
-      }
+    const lease = await acquireReviewerEgress(compiledPolicy(fixture.config), "claude");
+    try {
+      expect(lease.allowedEndpoints).toEqual(["api.anthropic.com"]);
+    } finally {
+      await lease.abandon();
     }
+    // Grok is no longer a provider: its reviewer egress is refused, never routed through
+    // another provider's hosts.
+    await expect(acquireReviewerEgress(compiledPolicy(fixture.config), "grok"))
+      .rejects.toMatchObject({ failureCode: "REVIEWER_EGRESS_PROVIDER_ENDPOINTS_MISSING" });
   });
 });
 

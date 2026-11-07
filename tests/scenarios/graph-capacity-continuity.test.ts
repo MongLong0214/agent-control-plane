@@ -27,8 +27,8 @@ const CONTRACT: TaskContract = {
 };
 
 /**
- * A control plane with three named providers so the coverage planner's real preference
- * table (gpt/claude preferred, grok optional) is what gets exercised. The adapters are
+ * A control plane with two named providers so the coverage planner's real preference
+ * table (gpt/claude) is what gets exercised. The adapters are
  * production-eligible test fixtures because these scenarios exercise routing paths.
  */
 const makeMultiProviderHarness = ({ forwardDispatchTarget = true }: { forwardDispatchTarget?: boolean } = {}) => {
@@ -36,7 +36,6 @@ const makeMultiProviderHarness = ({ forwardDispatchTarget = true }: { forwardDis
   const clock = new ManualClock("2026-08-12T00:00:00.000Z");
   const gpt = new TestProductionAdapter(clock, "gpt");
   const claude = new TestProductionAdapter(clock, "claude");
-  const grok = new TestProductionAdapter(clock, "grok");
   const repoPath = makeRepo({ "src/app.js": "module.exports = () => 1;\n" });
 
   const cp = new ControlPlane({
@@ -45,7 +44,7 @@ const makeMultiProviderHarness = ({ forwardDispatchTarget = true }: { forwardDis
     capacityDir: join(root, "capacity"),
     secretsDir: join(root, "secrets"),
     clock,
-    adapters: [gpt, claude, grok],
+    adapters: [gpt, claude],
     allowTestEvidenceWriters: true,
     ctoPreference: { provider: "claude", model: "opus", effort: null },
     reviewer: {
@@ -66,7 +65,7 @@ const makeMultiProviderHarness = ({ forwardDispatchTarget = true }: { forwardDis
       capacity: { refreshForDispatch: (target) => cp.capacity.refreshForDispatch(target) },
     });
   }
-  return { cp, clock, gpt, claude, grok, repoPath };
+  return { cp, clock, gpt, claude, repoPath };
 };
 
 const reading = (
@@ -350,9 +349,9 @@ describe("provider capacity (CP-S16, CP-S17, CP-S18)", () => {
 
   it("CP-S17: dispatch attempts its selected provider when quota collection fails", async () => {
     const harness = makeMultiProviderHarness({ forwardDispatchTarget: false });
-    // These providers remain open for worker work. A targetless admission would therefore
+    // This provider remains open for worker work. A targetless admission would therefore
     // pass, even though dispatch is about to constitute a Claude CTO.
-    for (const adapter of [harness.gpt, harness.grok]) {
+    for (const adapter of [harness.gpt]) {
       adapter.setCapacity(
         reading(adapter.provider, harness.clock, {
           buckets: [{ id: "worker", remainingPercent: 90, resetAt: null, capabilities: ["worker"] }],
@@ -517,7 +516,7 @@ describe("role continuity (CP-S19 – CP-S24)", () => {
 
   it("CP-S22: real outages remain uncovered without adding a continuity completion proof", async () => {
     const { harness, runId } = await withProject();
-    for (const adapter of [harness.gpt, harness.claude, harness.grok]) {
+    for (const adapter of [harness.gpt, harness.claude]) {
       adapter.setCapacity(reading(adapter.provider, harness.clock, { sensorHealth: "ERROR", runtimeHealth: "UNAVAILABLE", buckets: [] }));
     }
 
@@ -529,25 +528,6 @@ describe("role continuity (CP-S19 – CP-S24)", () => {
     const completion = harness.cp.continuity.assertCompletionAllowed(runId);
     expect(completion.allowed).toBe(true);
 
-  });
-
-  it("Grok being absent on its own never degrades continuity", async () => {
-    const { harness } = await withProject();
-    harness.gpt.setCapacity(reading("gpt", harness.clock));
-    harness.claude.setCapacity(reading("claude", harness.clock));
-    harness.grok.setCapacity(reading("grok", harness.clock, { runtimeHealth: "UNAVAILABLE", buckets: [] }));
-
-    // #735 — grok is retired from the *unattended* probe `continuity.evaluate()` runs by
-    // default, so its reading has to be seeded through an explicit ask first (the same path
-    // a real deployment uses to probe it on demand). This still exercises the property this
-    // test is about: even with a real, current UNAVAILABLE reading on file, grok's absence
-    // never degrades continuity.
-    await harness.cp.capacity.refresh(RefreshTrigger.PROVIDER_SWITCH_OR_FAILURE, ["grok"]);
-
-    const plan = await harness.cp.continuity.evaluate("grok gone");
-    expect(plan.outcome).toBe("FULL_COVERAGE");
-    expect(plan.mode).toBe(ContinuityMode.NORMAL);
-    expect(plan.providers.find((p) => p.provider === "grok")?.optional).toBe(true);
   });
 
   it("CP-S24: a recovered provider does not seize an in-flight run owner", async () => {
@@ -584,7 +564,7 @@ describe("role continuity (CP-S19 – CP-S24)", () => {
 
   it("CP-S34: failover attempts its selected provider despite unknown capacity", async () => {
     const { harness, projectId } = await withProject();
-    for (const adapter of [harness.gpt, harness.claude, harness.grok]) {
+    for (const adapter of [harness.gpt, harness.claude]) {
       adapter.setCapacity(reading(adapter.provider, harness.clock, { sensorHealth: "ERROR", runtimeHealth: "UNKNOWN", buckets: [] }));
     }
     const refused = await harness.cp.continuity.failover(

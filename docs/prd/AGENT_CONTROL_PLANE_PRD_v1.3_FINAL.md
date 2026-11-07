@@ -7,6 +7,7 @@
 - **배포 형태:** Local · Single Owner · 24/7 Workstation Service
 - **주 인터페이스:** Buzz·Telegram을 통한 Hermes
 - **최종 개정일:** 2026-08-12
+- **개정 2026-11-07:** Grok 지원 제거 (owner 지시). Grok을 지정한 Role·Project는 지원하지 않는 Provider로 거부되며 다른 Provider로 대체되지 않는다. 아래 Grok 서술은 해당 위치의 개정 주석과 함께 이력으로 남긴다.
 - **구현 SSOT 문서 집합:** 이 문서 + `REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md` 두 개만 사용
 - **비규범 문서:** 이전 PRD와 Production Review 문서는 결정 이력일 뿐 구현 입력으로 사용하지 않음
 
@@ -194,7 +195,9 @@ Run 내부의 제한된 작업 단위. 병렬·의존 실행과 여러 Attempt�
 
 ## 5.5 Runtime Session
 
-GPT·Claude·Grok 또는 미래 Runtime의 실제 Session. 영구 조직 Identity가 아니다.
+GPT·Claude 또는 미래 Runtime의 실제 Session. 영구 조직 Identity가 아니다.
+
+> **2026-11-07: Grok 지원 제거 (owner 지시).** 개정 전 문장: “GPT·Claude·Grok 또는 미래 Runtime의 실제 Session.”
 
 ## 5.6 Session Incarnation
 
@@ -307,8 +310,10 @@ Hermes Logical CEO Endpoint
       ↓ Buzz Dispatch
 Dynamic Claude Opus Primary CTO Sessions
       ↓
-GPT / Claude / Optional Grok Workers
+GPT / Claude Workers
 ```
+
+> **2026-11-07: Grok 지원 제거 (owner 지시).** 개정 전 도식의 마지막 줄: `GPT / Claude / Optional Grok Workers`.
 
 Repo Factory는 제한된 Bootstrap Capability로 호출하며 두 번째 Runtime Authority가 아니다.
 
@@ -644,9 +649,11 @@ SIMPLE에 Verbose Graph DSL을 강제하지 않는다.
 
 ## 14.1 Provider Adapter
 
-기본 Deployment Provider는 GPT·Claude·Optional Grok이다. 실제 Subscription Plan·Quota Size·Expiry는 Local Deployment Config이며 PRD Constant가 아니다.
+기본 Deployment Provider는 GPT·Claude이다. 실제 Subscription Plan·Quota Size·Expiry는 Local Deployment Config이며 PRD Constant가 아니다.
 
 현재 운영값처럼 GPT/Claude x20, Grok 소형 Plan·만료 예정 등의 정보는 Local Config에 기록할 수 있지만 Architecture Contract가 아니다. Optional Provider를 끄더라도 Role/Run Contract가 깨지면 안 된다.
+
+> **2026-11-07: Grok 지원 제거 (owner 지시).** 개정 전 첫 문장: “기본 Deployment Provider는 GPT·Claude·Optional Grok이다.” 둘째 문단의 Grok Plan은 작성 당시 운영값으로 이력이며, Optional Provider는 더 이상 없다.
 
 ## 14.2 Usage Probe
 
@@ -731,11 +738,9 @@ Claude
 1. Active Primary/Acting CTO Continuity
 2. Acting CEO/Reviewer Continuity
 3. Sonnet Worker
-
-Grok
-Optional Adversarial Review Only
-Critical Path 단독 의존 금지
 ```
+
+> **2026-11-07: Grok 지원 제거 (owner 지시).** 개정 전 목록의 마지막 항목: `Grok` / `Optional Adversarial Review Only` / `Critical Path 단독 의존 금지`.
 
 Priority는 고정하되 Reserve 비율은 동적이다. 30% 같은 고정 Reserve를 두지 않는다.
 
@@ -757,8 +762,9 @@ Mechanical Low-ambiguity Code → Luna Max 우선
 Normal Implementation → Luna/Sonnet/Terra 중 CTO 판단
 Complex Semantic Work → Sonnet 또는 Opus WORKER (CTO는 라우팅·리뷰)
 Architecture/Root Cause/High Risk → Opus WORKER, CTO는 설계·리뷰 (CTO 직접 구현 없음)
-Optional Diversity → Grok
 ```
+
+> **2026-11-07: Grok 지원 제거 (owner 지시).** 개정 전 목록의 마지막 줄: `Optional Diversity → Grok`. Grok으로 라우팅하지 않는다.
 
 Token을 소모하기 위한 대규모 Fan-out을 금지한다.
 
@@ -789,7 +795,7 @@ DEGRADED
 SURVIVAL
 ```
 
-Grok은 Optional이므로 Grok 부재만으로 DEGRADED가 되지 않는다.
+> **2026-11-07: Grok 지원 제거 (owner 지시).** Optional Provider는 없다. 개정 전 문장: “Grok은 Optional이므로 Grok 부재만으로 DEGRADED가 되지 않는다.”
 
 ## 15.3 RoleCoveragePlan
 

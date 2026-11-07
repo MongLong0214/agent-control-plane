@@ -26,7 +26,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const ACCEPTANCE = "tests/e2e/real-component-integration.test.ts";
-const REAL_ADAPTERS = ["ClaudeCliAdapter", "CodexCliAdapter", "GrokCliAdapter"];
+const REAL_ADAPTERS = ["ClaudeCliAdapter", "CodexCliAdapter"];
 
 const source = readFileSync(new URL(`../${ACCEPTANCE}`, import.meta.url), "utf8");
 

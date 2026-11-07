@@ -10,7 +10,6 @@
  *   1. a delegate report says `fixed` (not `partial`, not `not-a-defect`)
  *   2. the test it names exists, by file and by test name
  *   3. that test file currently passes
- *   4. where a Grok verification of the lane exists, it did not say WRONG or REGRESSION
  *
  * Anything failing a check is listed as held, with the reason, and left open. Judgement that
  * cannot be automated — whether the test would fail if the enforcement were removed — stays with
@@ -64,17 +63,6 @@ for (const file of readdirSync(reportsDir).filter((f) => f.endsWith(".md")).sort
   }
 }
 
-/** Grok's per-lane verification, when one was run and completed. */
-const grokVerdicts = new Map();
-const logs = join(repoRoot, "..", "..");
-for (const file of readdirSync(reportsDir).filter((f) => f.startsWith("grok-verify-"))) {
-  const lane = file.replace(/^grok-verify-/, "").replace(/\.(md|txt)$/, "");
-  const text = readFileSync(join(reportsDir, file), "utf8");
-  for (const m of text.matchAll(/#(\d+)\s*[—\-–:]?\s*(CONFIRMED|UNPROVEN|WRONG|REGRESSION)/g)) {
-    grokVerdicts.set(Number(m[1]), { lane, verdict: m[2] });
-  }
-}
-
 const testLocation = (claim) => {
   if (!claim.test) return { ok: false, why: "the report names no test" };
   const path = /([\w./-]+\.test\.ts)/.exec(claim.test)?.[1];
@@ -115,11 +103,6 @@ for (const [issue, claim] of [...claims].sort((a, b) => a[0] - b[0])) {
     held.push([issue, `reported ${claim.verdict}${claim.remaining ? `: ${claim.remaining.slice(0, 90)}` : ""}`]);
     continue;
   }
-  const grok = grokVerdicts.get(issue);
-  if (grok && (grok.verdict === "WRONG" || grok.verdict === "REGRESSION")) {
-    held.push([issue, `Grok said ${grok.verdict} on the ${grok.lane} lane`]);
-    continue;
-  }
   const located = testLocation(claim);
   if (!located.ok) {
     held.push([issue, located.why]);
@@ -129,10 +112,10 @@ for (const [issue, claim] of [...claims].sort((a, b) => a[0] - b[0])) {
     held.push([issue, `${located.path} does not pass`]);
     continue;
   }
-  closing.push([issue, claim, located.path, grok]);
+  closing.push([issue, claim, located.path]);
 }
 
-const body = (issue, claim, path, grok) =>
+const body = (issue, claim, path) =>
   [
     `**Fixed.**`,
     ``,
@@ -141,7 +124,6 @@ const body = (issue, claim, path, grok) =>
     `**Regression test** ${claim.test}`,
     `**Change** ${claim.change ?? "_not recorded_"}`,
     `**Commit** \`${commit}\``,
-    ...(grok ? [`**Independent verification** Grok read the diff against this ticket and returned ${grok.verdict}.`] : []),
     ``,
     `Checked before closing: the test exists by file and by name, and \`${path}\` passes. The check`,
     `this cannot automate — whether that test would fail if the enforcement were deleted — is why`,
@@ -150,10 +132,10 @@ const body = (issue, claim, path, grok) =>
   ].join("\n");
 
 console.log(`claims parsed: ${claims.size} | open: ${open.size} | closing: ${closing.length} | held: ${held.length}\n`);
-for (const [issue, claim, path, grok] of closing) {
-  console.log(`close #${issue}  ${claim.lane}  ${path}${grok ? `  grok:${grok.verdict}` : ""}`);
+for (const [issue, claim, path] of closing) {
+  console.log(`close #${issue}  ${claim.lane}  ${path}`);
   if (apply) {
-    await gh(["issue", "comment", String(issue), "--body-file", "-"], body(issue, claim, path, grok));
+    await gh(["issue", "comment", String(issue), "--body-file", "-"], body(issue, claim, path));
     await gh(["issue", "close", String(issue), "--reason", "completed"]);
   }
 }

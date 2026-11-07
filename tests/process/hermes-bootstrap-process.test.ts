@@ -252,9 +252,8 @@ process.stdin.on("end", () => {
     const providerOutput: Record<string, string> = {
       claude: "5-hour limit: 80% remaining\\n",
       codex: "press enter to confirm\\n5-hour limit: 80% remaining\\n",
-      grok: "5-hour limit: 80% remaining\\n",
     };
-    for (const binary of ["claude", "codex", "grok"]) {
+    for (const binary of ["claude", "codex"]) {
       const path = join(fakeBin, binary);
       writeFileSync(path, `#!/bin/sh\nprintf '%b' '${providerOutput[binary]}'\nexit 0\n`, { mode: 0o700 });
       chmodSync(path, 0o700);
