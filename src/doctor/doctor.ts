@@ -139,8 +139,8 @@ export const CAPACITY_SWEEP_BUDGET_MS = 45_000;
  * reads it — `ControlPlane`'s adapter construction, `control-plane.ts:723`, `:753` and `:762`.
  *
  * Written out rather than derived, and the divergence is the whole reason. `ACP_` plus the
- * upper-cased provider id plus `_BINARY` is the right answer for two of the three, which is what
- * makes the transformation read as correct. It is wrong for the third: `CodexCliAdapter.provider`
+ * upper-cased provider id plus `_BINARY` is the right answer for `claude`, which is what makes the
+ * transformation read as correct. It is wrong for the other: `CodexCliAdapter.provider`
  * is `"gpt"` (`cli-adapters.ts:1873`) while the variable its pin comes from is `ACP_CODEX_BINARY`.
  * `ACP_GPT_BINARY` is read nowhere in this repository, so a derived name would tell an operator to
  * repoint a setting nothing consumes — a message that sends someone to the wrong place, which is
@@ -152,7 +152,6 @@ export const CAPACITY_SWEEP_BUDGET_MS = 45_000;
 const PROVIDER_PIN_VARIABLE: Readonly<Record<string, string>> = {
   claude: "ACP_CLAUDE_BINARY",
   gpt: "ACP_CODEX_BINARY",
-  grok: "ACP_GROK_BINARY",
 };
 
 /**
@@ -505,6 +504,8 @@ export class Doctor {
     },
     /** Why the daemon's per-project reviewer file was not applied at start, or null (CEO msg_e91da929). */
     private readonly reviewerPreferencesRefused: { path: string; reason: string } | null = null,
+    /** The projects whose reviewer entry names a provider that cannot review; their reviews are refused. */
+    private readonly reviewerProjectsRefused: ReadonlyArray<{ path: string; projectId: string; provider: string; reason: string }> = [],
   ) {
     this.#openedAfterEventId = db.get<{ id: number }>(`SELECT COALESCE(MAX(event_id), 0) AS id FROM audit_events`)?.id ?? 0;
   }
@@ -1278,8 +1279,19 @@ export class Doctor {
 
   /** A per-project reviewer file the daemon refused at start: no project gets its own reviewer until it is fixed. */
   private checkReviewerPreferences(): Finding[] {
-    if (this.reviewerPreferencesRefused === null) return [];
-    return [{
+    const projects: Finding[] = this.reviewerProjectsRefused.map((refused) => ({
+      code: ReasonCode.REVIEWER_PREFERENCES_INVALID,
+      severity: "ERROR",
+      scope: `reviewer:project:${refused.projectId}`,
+      blocking: false,
+      confidence: "HIGH",
+      observedEvidence: { ...refused },
+      recommendedAction:
+        `project ${refused.projectId}'s blind reviews are refused, not sent to another provider, until its entry ` +
+        "names a provider registered for BLIND_REVIEWER that can isolate a reviewer; fix the file, then restart the daemon",
+    }));
+    if (this.reviewerPreferencesRefused === null) return projects;
+    return [...projects, {
       code: ReasonCode.REVIEWER_PREFERENCES_INVALID,
       severity: "ERROR",
       scope: "reviewer:project-preferences",
@@ -1287,8 +1299,7 @@ export class Doctor {
       confidence: "HIGH",
       observedEvidence: { ...this.reviewerPreferencesRefused },
       recommendedAction:
-        'fix the file to { "<projectId>": { provider, model, effort } } naming only providers registered for ' +
-        "BLIND_REVIEWER that can isolate a reviewer, then restart the daemon; " +
+        'fix the file to { "<projectId>": { provider, model, effort } }, then restart the daemon; ' +
         "until then every project uses the global reviewer preference",
     }];
   }
@@ -1409,8 +1420,8 @@ export class Doctor {
     // question this is: `list()` enumerates every provider the deployment has, role-scoped
     // included, "because providerCount, the sweep budget derived from its length, and doctor's
     // per-provider reads are facts about the provider set". Measured on the shipped composition
-    // with the three `ACP_*_BINARY` pins set: `list()` gives `['gpt','grok','claude']` and
-    // `production()` gives `['gpt','grok']`.
+    // with the `ACP_*_BINARY` pins set: `list()` gives `['gpt','claude']` and `production()` gives
+    // `['gpt']`.
     //
     // `list()` collapses to one representative adapter per provider — `#adapters` first, then the
     // first `#roleScoped` entry for a provider not already present — so this loop cannot emit two

@@ -27,9 +27,9 @@ afterAll(cleanupTempDirs);
  * `capacity.refresh` deliberately skips such a provider because a provider-global row cannot carry
  * role provenance. The doctor kept refreshing only the half it does not read.
  *
- * On this deployment that is every start. `claude` is registered for `CTO_ROLES` and
- * `REVIEWER_ROLES` (`control-plane.ts`), `codex` and `grok` are both SUSPENDED, and the startup
- * doctor runs before any continuity evaluation — so the first coverage score of a cold daemon sees
+ * On that deployment it was every start. `claude` is registered for `CTO_ROLES` and
+ * `REVIEWER_ROLES` (`control-plane.ts`), `codex` and `grok` (a provider since removed) were both
+ * SUSPENDED, and the startup doctor runs before any continuity evaluation — so the first coverage score of a cold daemon sees
  * an empty role snapshot, reports `ROLE_COVERAGE_NO_VALID_COVERAGE` as CRITICAL and blocking, and
  * the daemon parks. The park then *uninstalls the continuity coordinator*, which is the only thing
  * that would have taken the measurement, so nothing reachable clears the finding: measured

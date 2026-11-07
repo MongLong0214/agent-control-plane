@@ -18,8 +18,8 @@
  *   released immediately); it does not claim to exercise `agentcpd.main` socket plumbing.
  *
  *   An ordinary operator run adds one clearly labelled live-collector observation. Only that
- *   stage uses the production collectors' normal credential paths and may make the Grok billing
- *   request. `--isolated` skips it and is the mode used by automated tests.
+ *   stage uses the production collectors' normal credential paths. `--isolated` skips it and is
+ *   the mode used by automated tests.
  *
  * Every state, generated App credential, and mirror write stays under a throwaway directory and
  * is removed on completion or a handled failure. An uncatchable process death may leave that
@@ -157,7 +157,6 @@ const isolatedUsageCollector = (provider: UsageProvider): UsageCollector => ({
 const isolatedAdapterOptions = (): NonNullable<ControlPlaneConfig["adapterOptions"]> => ({
   claude: { usageCollector: isolatedUsageCollector("claude") },
   gpt: { usageCollector: isolatedUsageCollector("gpt") },
-  grok: { usageCollector: isolatedUsageCollector("grok") },
 });
 
 type CollectorMode = "isolated" | "live";
@@ -191,7 +190,7 @@ const writeCapacityMirrors = (directory: string): void => {
             id: `${provider}-5h`,
             remainingPercent: 90,
             resetAt: null,
-            capabilities: ["ceo", "cto", "blind-review", "worker", "luna-worker", "adversarial-review"],
+            capabilities: ["ceo", "cto", "blind-review", "worker", "luna-worker"],
           },
         ],
       }),

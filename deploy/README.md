@@ -128,14 +128,14 @@ to the plist. Installation does not create `buzz-nostr-subscriber.json`; that se
 subscriber config retains its existing authentication contract. Without it, an otherwise configured
 daemon can start with full canonical activation while the subscriber opens zero sockets.
 
-The installer resolves the provider CLIs `claude`, `codex` and `grok` from the installing shell's
-`PATH` and bakes each absolute path into the launcher as `ACP_RESOLVED_CLAUDE_BINARY`,
-`ACP_RESOLVED_CODEX_BINARY` and `ACP_RESOLVED_GROK_BINARY`. The launcher promotes each to
-`ACP_CLAUDE_BINARY`, `ACP_CODEX_BINARY` or `ACP_GROK_BINARY` unless that variable is already set,
-and the daemon passes it to the matching adapter. An absolute pin is the only channel by which a
-CLI outside the launcher's `PATH` is reachable; a configured adapter override takes precedence
-over the environment. The launcher clears every inherited `ACP_RESOLVED_*_BINARY` (Buzz and
-CommitLore included) before its own, so each is only what the install resolved, or nothing.
+The installer resolves the provider CLIs `claude` and `codex` from the installing shell's `PATH`
+and bakes each absolute path into the launcher as `ACP_RESOLVED_CLAUDE_BINARY` and
+`ACP_RESOLVED_CODEX_BINARY`. The launcher promotes each to `ACP_CLAUDE_BINARY` or
+`ACP_CODEX_BINARY` unless that variable is already set, and the daemon passes it to the matching
+adapter. An absolute pin is the only channel by which a CLI outside the launcher's `PATH` is
+reachable; a configured adapter override takes precedence over the environment. The launcher
+clears every inherited `ACP_RESOLVED_*_BINARY` (Buzz and CommitLore included) before its own, so
+each is only what the install resolved, or nothing.
 
 `commitlore` is resolved the same way, into `ACP_RESOLVED_COMMITLORE_BINARY`, but the operator's
 persistent value is the `ACP_COMMITLORE_BINARY` account under the same Keychain service: the launcher

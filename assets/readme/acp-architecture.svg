@@ -80,7 +80,7 @@ text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helveti
 <rect class="bx" x="764" y="130" width="196" height="76" rx="12"/><rect class="v" x="764" y="142" width="4" height="26" rx="2"/>
 <text class="bt" x="780" y="158">Verification sandbox</text><text class="bs" x="780" y="178">seatbelt, own process group</text><text class="bs" x="780" y="195">time, RSS and output limits</text>
 <rect class="bx" x="764" y="218" width="196" height="76" rx="12"/><rect class="r" x="764" y="230" width="4" height="26" rx="2"/>
-<text class="bt" x="780" y="246">Blind reviewers</text><text class="bs" x="780" y="266">gpt · claude · grok</text><text class="bs" x="780" y="283">provider-only egress proxy</text>
+<text class="bt" x="780" y="246">Blind reviewers</text><text class="bs" x="780" y="266">gpt · claude</text><text class="bs" x="780" y="283">provider-only egress proxy</text>
 <rect class="bx" x="764" y="306" width="196" height="76" rx="12"/><rect class="m" x="764" y="318" width="4" height="26" rx="2"/>
 <text class="bt" x="780" y="334">Buzz relay</text><text class="bs" x="780" y="354">fenced envelopes</text><text class="bs" x="780" y="371">to bound role holders</text>
 <rect class="bx" x="764" y="394" width="196" height="76" rx="12"/><rect class="g" x="764" y="406" width="4" height="26" rx="2"/>

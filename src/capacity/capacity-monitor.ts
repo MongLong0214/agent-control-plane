@@ -38,7 +38,7 @@ export interface OperatorCapacityObservation {
 /**
  * `UNKNOWN` is not a degree of low. It means no bucket was read at all, and it exists because
  * the absence used to be reported as `EXHAUSTED` — the strongest possible claim about a number
- * nobody had. A grok billing token that expires every six hours produced exactly that: the
+ * nobody had. A billing token that expired every six hours produced exactly that: the
  * doctor said the quota was exhausted with `confidence: "HIGH"` and advised waiting for a reset,
  * while the provider was in fact usable and the reset would never come.
  *
@@ -91,36 +91,7 @@ export interface CapacityOptions {
   exhaustedPercent?: number;
   /** Sensor clocks may lead the daemon by this much before their evidence is refused. */
   maxClockSkewMs?: number;
-  /**
-   * Providers named here are opted back into the unattended periodic probe despite being
-   * in `UNATTENDED_PROBE_EXCLUDED_BY_DEFAULT`. Absence is the safe default: a reader can
-   * tell whether a deployment probes grok unattended by reading this one field, rather
-   * than inferring it from how many times the probe has already failed (#735).
-   */
-  unattendedProbeOptIns?: readonly string[];
 }
-
-/**
- * Providers the periodic *unattended* probe never probes unless the deployment names them
- * in `CapacityOptions.unattendedProbeOptIns`. "Unattended" means `refresh` was called with
- * no explicit `providerIds` — the four-minute daemon sweep and `Doctor.checkCapacity`, both
- * of which ask "what is true of every registered provider" rather than naming one. #735:
- * grok's stored CLI credential expires and only the CLI can renew it, so an unattended
- * probe against it can only ever record a failure — every four minutes, forever, which is a
- * warning light that never turns off and therefore stops warning about anything else.
- *
- * This is a different question from `OPTIONAL_PROVIDERS` in `continuity-kernel.ts`, and is
- * kept as its own set on purpose rather than reused. That set answers "can continuity's
- * coverage plan proceed without this provider bound to a role" — a routing tolerance
- * evaluated *after* a reading exists. This one answers "should the daemon even attempt to
- * read this provider's quota when nobody asked" — a decision about whether to probe at all.
- * They are independent: a provider required for coverage could still be worth excluding
- * from an unattended sweep (a known-broken automated surface an operator still checks by
- * hand), and a provider optional for coverage could still be worth actively, automatically
- * monitoring. Reusing one set for both meanings would make a future case that needs one
- * without the other silently get both.
- */
-export const UNATTENDED_PROBE_EXCLUDED_BY_DEFAULT: ReadonlySet<string> = new Set(["grok"]);
 
 export const CAPACITY_DEFAULTS = {
   freshnessMs: 5 * 60 * 1000,
@@ -138,9 +109,6 @@ export const CAPACITY_DEFAULTS = {
   criticalPercent: 2,
   exhaustedPercent: 1,
   maxClockSkewMs: 60_000,
-  // Absent is the safe default (#735): nothing is opted back into the unattended probe
-  // unless a deployment names it.
-  unattendedProbeOptIns: [] as readonly string[],
 };
 
 /** How many successive readings a role binding keeps for burn; only the newest two per window are read. */
@@ -532,14 +500,11 @@ export class CapacityMonitor {
   async refresh(trigger: RefreshTrigger, providerIds?: readonly string[]): Promise<ProviderCapacity[]> {
     try {
       // An explicit `providerIds` is always honored, whatever it names (§14.2 dispatch,
-      // blind-review and provider-switch admission each pass their exact target) — that is
-      // the "asked for" path #735 preserves. Only the unattended case, where nobody named a
-      // provider, consults the exclusion list.
+      // blind-review and provider-switch admission each pass their exact target).
       const ambiguous = providerIds?.filter((id) => this.providers.hasRoleScoped(id)) ?? [];
       const adapters = providerIds
         ? providerIds.filter((id) => !this.providers.hasRoleScoped(id)).map((id) => this.providers.require(id))
-        : this.providers.list().filter((adapter) =>
-          !this.providers.hasRoleScoped(adapter.provider) && this.isAutoProbeEnabled(adapter.provider));
+        : this.providers.list().filter((adapter) => !this.providers.hasRoleScoped(adapter.provider));
 
       const readings: ProviderCapacity[] = ambiguous.map((provider) => this.unknownCapacity(provider));
       for (const adapter of adapters) {
@@ -1072,22 +1037,6 @@ export class CapacityMonitor {
     // on the "nothing to say" side and be exempted from the reading it genuinely needs. Only a
     // provider capacity was never built to measure — the bootstrap CEO runtime — is exempt.
     return this.providers.has(provider) || (USAGE_PROVIDERS as readonly string[]).includes(provider);
-  }
-
-  /**
-   * Whether `provider` participates in the unattended periodic probe (#735) — the sweep
-   * `refresh` runs when nobody named a `providerIds`. A provider excluded here is still
-   * fully usable: registered, routable, and probed the moment anything asks for it by name
-   * (`refreshForDispatch`, `refreshForBlindReview`, `refreshForProviderSwitch`). This only
-   * decides whether it gets asked when nobody asked.
-   *
-   * Doctor's own sensor-file check reads this too (`checkCapacitySensorFiles`), so a
-   * provider excluded from the sweep is not also faulted for a file the sweep will never
-   * write for it again.
-   */
-  isAutoProbeEnabled(provider: string): boolean {
-    if (!UNATTENDED_PROBE_EXCLUDED_BY_DEFAULT.has(provider)) return true;
-    return (this.#options.unattendedProbeOptIns ?? []).includes(provider);
   }
 
   isRoutableFor(capacity: ProviderCapacity, _capability: string): boolean {

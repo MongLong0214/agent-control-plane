@@ -23,23 +23,22 @@ import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
 /**
- * #1189 §2.A — the two developer audit scripts, `scripts/production-review.mjs` and
- * `scripts/grok-review.mjs`, review one pinned commit from a disposable checkout and write every
- * run into its own directory, attributed by a manifest.
+ * #1189 §2.A — the developer audit script, `scripts/production-review.mjs`, reviews one pinned
+ * commit from a disposable checkout and writes every run into its own directory, attributed by a
+ * manifest.
  *
  * Each test copies the scripts under test into a throwaway git repository and runs them there with
- * a fake `codex` and `grok` first on PATH, so no real model or CLI is ever reached. The scripts find
+ * a fake `codex` first on PATH, so no real model or CLI is ever reached. The scripts find
  * the repository they review from their own location, which is why copying them in is enough: the
  * same tests run unchanged against the scripts as they were at a680e971, and fail there.
  */
 const ACP_SCRIPTS = fileURLToPath(new URL("../../scripts/", import.meta.url));
-const SCRIPTS = ["production-review.mjs", "grok-review.mjs"] as const;
+const SCRIPTS = ["production-review.mjs"] as const;
 type Script = (typeof SCRIPTS)[number];
-const CLI: Record<Script, string> = { "production-review.mjs": "codex", "grok-review.mjs": "grok" };
+const CLI: Record<Script, string> = { "production-review.mjs": "codex" };
 /** Where a680e971 wrote every run. Read only when a run names no directory of its own. */
 const FIXED_OUTPUT: Record<Script, string> = {
   "production-review.mjs": join("evidence", "review"),
-  "grok-review.mjs": join("evidence", "review-grok"),
 };
 
 const RUN_BUDGET_MS = 20_000;
@@ -82,9 +81,9 @@ const gitDirectory = (): string => {
 };
 
 /**
- * One fake for both CLIs, told apart by the name it was started as. Each invocation appends one
- * line to the log: the area, the directory the reviewer was pointed at, and what `src/subject.txt`
- * held there when it looked. The plan file says how each area's review ends.
+ * The fake `codex`. Each invocation appends one line to the log: the area, the directory the
+ * reviewer was pointed at, and what `src/subject.txt` held there when it looked. The plan file says
+ * how each area's review ends.
  */
 const FAKE_REVIEWER = String.raw`
 const fs = require("node:fs");
@@ -97,34 +96,32 @@ if (args[0] === "--version") {
 }
 const plan = JSON.parse(fs.readFileSync(process.env.FAKE_REVIEWER_PLAN, "utf8"));
 const after = (flag) => { const i = args.indexOf(flag); return i === -1 ? undefined : args[i + 1]; };
-const outPath = cli === "codex" ? after("-o") : undefined;
-const area = cli === "codex" ? path.basename(outPath).replace(/\.json$/, "") : path.basename(after("--leader-socket")).split(".")[0];
-const viewDir = cli === "codex" ? process.cwd() : after("--cwd");
+const outPath = after("-o");
+const area = path.basename(outPath).replace(/\.json$/, "");
+const viewDir = process.cwd();
 const mode = (plan.areas || {})[area] || plan.default || "pass";
 if (plan.mutateOriginal) fs.writeFileSync(path.join(plan.mutateOriginal, "src", "subject.txt"), "mutated while the review ran\n");
 let subject = null;
 try { subject = fs.readFileSync(path.join(viewDir, "src", "subject.txt"), "utf8"); } catch {}
 const nonce = Math.random().toString(36).slice(2) + "-" + process.pid;
 const model = after("-m") ?? null;
-fs.appendFileSync(process.env.FAKE_REVIEWER_LOG, JSON.stringify({ cli, area, mode, viewDir, subject, model, prompt: cli === "codex" ? args.at(-1) : after("-p") }) + "\n");
+fs.appendFileSync(process.env.FAKE_REVIEWER_LOG, JSON.stringify({ cli, area, mode, viewDir, subject, model, prompt: args.at(-1) }) + "\n");
 // The model the CLI's own output names: by default the one it was asked for, as the real CLIs do;
 // plan.observedModel "none" names none, a model id names that model instead, and the spoofs put the
 // requested model only where it is not the CLI's own metadata.
-const spoof = ["docs", "unclosed", "stdout-only", "in-report"].includes(plan.observedModel) ? plan.observedModel : null;
+const spoof = ["docs", "unclosed", "stdout-only"].includes(plan.observedModel) ? plan.observedModel : null;
 const observed = plan.observedModel === "none" || spoof !== null ? null : (plan.observedModel ?? model);
 const headerOf = (named) => "OpenAI Codex v0.0.0-fake (research preview)\n--------\nworkdir: " + process.cwd() + "\n" + (named === null ? "" : "model: " + named + "\n") + "provider: fake\nsandbox: read-only\n--------\n";
-if (cli === "codex") {
-  if (spoof === "docs") {
-    // A genuine header without a model, then the session, then documentation quoted to stdout.
-    process.stderr.write(headerOf(null) + "user\nReview the code.\ncodex\n");
-    process.stdout.write("The documentation contains this example log:\nOpenAI Codex v0.0.0-example\n--------\nmodel: " + model + "\n--------\n");
-  } else if (spoof === "unclosed") {
-    process.stderr.write("OpenAI Codex v0.0.0-fake\n--------\nworkdir: " + process.cwd() + "\nuser\nCopied from documentation:\nmodel: " + model + "\n");
-  } else if (spoof === "stdout-only") {
-    process.stdout.write(headerOf(model));
-  } else if (observed !== null) {
-    process.stderr.write(headerOf(observed));
-  }
+if (spoof === "docs") {
+  // A genuine header without a model, then the session, then documentation quoted to stdout.
+  process.stderr.write(headerOf(null) + "user\nReview the code.\ncodex\n");
+  process.stdout.write("The documentation contains this example log:\nOpenAI Codex v0.0.0-example\n--------\nmodel: " + model + "\n--------\n");
+} else if (spoof === "unclosed") {
+  process.stderr.write("OpenAI Codex v0.0.0-fake\n--------\nworkdir: " + process.cwd() + "\nuser\nCopied from documentation:\nmodel: " + model + "\n");
+} else if (spoof === "stdout-only") {
+  process.stdout.write(headerOf(model));
+} else if (observed !== null) {
+  process.stderr.write(headerOf(observed));
 }
 const reportOf = (verdict, tag) => ({
   verdict,
@@ -132,13 +129,8 @@ const reportOf = (verdict, tag) => ({
   omittedItems: [],
   findings: verdict === "PASS" ? [] : [{ severity: "MAJOR", category: "correctness", file: "src/subject.txt", line: 1, summary: "s", detail: "d", suggestedFix: "f" }],
 });
-const textOf = (report) => cli === "codex" ? JSON.stringify(report) : JSON.stringify({
-  text: spoof === "in-report" ? "narration\nmodel: " + model + "\n" + headerOf(model) : "narration",
-  structuredOutput: spoof === "in-report" ? { ...report, model, metadata: { model } } : report,
-  stopReason: "end_turn",
-  ...(observed !== null ? { model: observed } : {}),
-});
-const emit = (text) => { if (cli === "codex") fs.writeFileSync(outPath, text); else process.stdout.write(text); };
+const textOf = (report) => JSON.stringify(report);
+const emit = (text) => fs.writeFileSync(outPath, text);
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 const report = textOf(reportOf(mode === "revise" ? "REVISE" : mode === "block" ? "BLOCK" : "PASS", "nonce " + nonce));
 (async () => {
@@ -156,12 +148,10 @@ const report = textOf(reportOf(mode === "revise" ? "REVISE" : mode === "block" ?
       process.exit(0);
     case "fifo": {
       // A FIFO where the report goes, fed by a detached writer that hands successive readers
-      // different reports. grok's report path is one the script writes, so it is named in the plan.
+      // different reports.
       const cp = require("node:child_process");
-      const target = cli === "codex" ? outPath : path.join(plan.fifoDir, area + ".json");
-      cp.execFileSync("mkfifo", [target], { timeout: 5000 });
-      cp.spawn(process.execPath, [plan.feeder, cli, target], { stdio: "ignore", detached: true }).unref();
-      if (cli === "grok") process.stdout.write(textOf(reportOf("BLOCK", "fifo")));
+      cp.execFileSync("mkfifo", [outPath], { timeout: 5000 });
+      cp.spawn(process.execPath, [plan.feeder, outPath], { stdio: "ignore", detached: true }).unref();
       process.exit(0);
     }
     case "fail":
@@ -202,22 +192,20 @@ const report = textOf(reportOf(mode === "revise" ? "REVISE" : mode === "block" ?
 `;
 
 /**
- * Feeds the FIFO: a BLOCK to the first reader (or, for grok, accepts the runner's own write), then
- * another invocation's PASS to each later reader. Opens without O_CREAT so it never leaves a
+ * Feeds the FIFO: a BLOCK to the first reader, then another invocation's PASS to each later reader. Opens without O_CREAT so it never leaves a
  * regular file behind, and exits after three seconds whatever it is waiting on.
  */
 const FIFO_FEEDER = String.raw`
 const fs = require("node:fs");
-const [kind, file] = process.argv.slice(2);
+const [file] = process.argv.slice(2);
 const block = JSON.stringify({ verdict: "BLOCK", filesExamined: ["fifo"], omittedItems: [], findings: [{ severity: "MAJOR", category: "correctness", file: "src/subject.txt", line: 1, summary: "s", detail: "d", suggestedFix: "f" }] });
 const pass = JSON.stringify({ verdict: "PASS", filesExamined: ["another invocation"], omittedItems: [], findings: [] });
 setTimeout(() => process.exit(0), 3000);
 const nap = () => new Promise((done) => setTimeout(done, 200));
 const write = async (text) => { const handle = await fs.promises.open(file, fs.constants.O_WRONLY); try { await handle.writeFile(text); } finally { await handle.close(); } };
-const read = async () => { const handle = await fs.promises.open(file, fs.constants.O_RDONLY); try { await handle.readFile(); } finally { await handle.close(); } };
 (async () => {
   try {
-    if (kind === "grok") await read(); else await write(block);
+    await write(block);
     await nap();
     await write(pass);
     await nap();
@@ -295,7 +283,6 @@ interface Plan {
   readonly tamperOut?: string;
   /** What the fake CLI's own output names as its model; "none" names none. Default: what it was asked for. */
   readonly observedModel?: string;
-  readonly fifoDir?: string;
   readonly feeder?: string;
 }
 
@@ -684,10 +671,8 @@ describe.each(SCRIPTS)("%s", (script) => {
       expect(result.status).toBe(1);
       expect(summary?.revision?.commit).toBe(second);
       expect(entryOf(summary, "guard")).toMatchObject({ result: "NOT_RUN", execution: "NOT_RUN" });
-      // codex names its model in a header the cut report does not touch; grok names it inside the
-      // envelope that was cut, so its model is unverified as well.
-      const execution = script === "grok-review.mjs" ? "MODEL_UNVERIFIED" : "COMPLETED";
-      expect(entryOf(summary, "core")).toMatchObject({ result: "ERROR", execution, report: "UNPARSABLE" });
+      // codex names its model in a header the cut report does not touch.
+      expect(entryOf(summary, "core")).toMatchObject({ result: "ERROR", execution: "COMPLETED", report: "UNPARSABLE" });
       expect(summary?.findingsVerdict).toBe("UNDETERMINED");
     },
     TEST_TIMEOUT_MS,
@@ -822,7 +807,7 @@ describe.each(SCRIPTS)("%s", (script) => {
       const out = join("evidence", "local", "fifo");
       const feeder = join(fixture.base, "feeder.cjs");
       writeFileSync(feeder, FIFO_FEEDER);
-      setPlan(fixture, { default: "fifo", fifoDir: join(fixture.root, out), feeder });
+      setPlan(fixture, { default: "fifo", feeder });
 
       const result = await run(fixture, script, ["core", `--out=${out}`]);
       const summary = summaryIn(join(fixture.root, out));
@@ -895,7 +880,7 @@ describe.each(SCRIPTS)("%s", (script) => {
     TEST_TIMEOUT_MS,
   );
 
-  const REQUESTED: Record<Script, string> = { "production-review.mjs": "gpt-6.1-sol", "grok-review.mjs": "grok-4.6" };
+  const REQUESTED: Record<Script, string> = { "production-review.mjs": "gpt-6.1-sol" };
   it.each([
     ["names no model", "none", null],
     ["names a different model", "some-other-model", "some-other-model"],
@@ -953,14 +938,13 @@ describe.each(SCRIPTS)("%s", (script) => {
   );
 
   // The model is evidence only where the CLI writes its own metadata: codex's configuration header
-  // opening stderr, grok's top-level envelope field. Each case puts the requested model somewhere else.
+  // opening stderr. Each case puts the requested model somewhere else.
   const SPOOFS: Record<Script, readonly (readonly [string, string])[]> = {
     "production-review.mjs": [
       ["a docs-quoted header after a genuine header that names no model", "docs"],
       ["a header that is never closed before a later model line", "unclosed"],
       ["a header printed only on stdout, where the reviewer's message goes", "stdout-only"],
     ],
-    "grok-review.mjs": [["model text that appears only inside the report", "in-report"]],
   };
   it.each(SPOOFS[script])(
     "does not take the model from %s",
@@ -984,36 +968,6 @@ describe.each(SCRIPTS)("%s", (script) => {
 
 describe("the reviewer model", () => {
   it(
-    "grok-review.mjs selects its model explicitly, records it, and says UNKNOWN when the CLI reports another",
-    async () => {
-      const fixture = makeFixture();
-      setPlan(fixture, { default: "pass" });
-      const first = await run(fixture, "grok-review.mjs", ["core"]);
-      expect(callsOf(fixture).map((call) => call.model)).toEqual(["grok-4.6"]);
-      expect(first.status).toBe(0);
-      const firstDir = runDirectoryOf(fixture, "grok-review.mjs", first);
-      expect(manifestIn(firstDir).reviewer).toMatchObject({ requestedModel: "grok-4.6", modelIdentity: "ESTABLISHED" });
-      expect(summaryIn(firstDir)).toMatchObject({ requestedModel: "grok-4.6", modelIdentity: "ESTABLISHED" });
-
-      const chosen = await run(fixture, "grok-review.mjs", ["core", "--model=grok-4.7"]);
-      expect(callsOf(fixture).at(-1)?.model).toBe("grok-4.7");
-      expect(manifestIn(runDirectoryOf(fixture, "grok-review.mjs", chosen)).reviewer.requestedModel).toBe("grok-4.7");
-
-      setPlan(fixture, { default: "pass", observedModel: "grok-somebody-else" });
-      const other = await run(fixture, "grok-review.mjs", ["core"]);
-      const otherDir = runDirectoryOf(fixture, "grok-review.mjs", other);
-      const manifest = manifestIn(otherDir);
-      expect(manifest.results["core"]?.observedModel).toBe("grok-somebody-else");
-      expect(manifest.reviewer).toMatchObject({ requestedModel: "grok-4.6", modelIdentity: "UNKNOWN" });
-      const summary = summaryIn(otherDir);
-      expect(summary?.modelIdentity).toBe("UNKNOWN");
-      expect(summary?.modelNote).toMatch(/grok-somebody-else/);
-      expect(other.stdout).toMatch(/reviewer model: UNKNOWN/);
-    },
-    TEST_TIMEOUT_MS,
-  );
-
-  it(
     "production-review.mjs passes and records its pinned model and refuses another",
     async () => {
       const fixture = makeFixture();
@@ -1025,6 +979,17 @@ describe("the reviewer model", () => {
       expect(callsOf(fixture).map((call) => call.model)).toEqual(["gpt-6.1-sol"]);
       const dir = runDirectoryOf(fixture, "production-review.mjs", result);
       expect(summaryIn(dir)).toMatchObject({ requestedModel: "gpt-6.1-sol", modelIdentity: "ESTABLISHED" });
+
+      setPlan(fixture, { default: "pass", observedModel: "gpt-somebody-else" });
+      const other = await run(fixture, "production-review.mjs", ["core"]);
+      const otherDir = runDirectoryOf(fixture, "production-review.mjs", other);
+      const manifest = manifestIn(otherDir);
+      expect(manifest.results["core"]?.observedModel).toBe("gpt-somebody-else");
+      expect(manifest.reviewer).toMatchObject({ requestedModel: "gpt-6.1-sol", modelIdentity: "UNKNOWN" });
+      const summary = summaryIn(otherDir);
+      expect(summary?.modelIdentity).toBe("UNKNOWN");
+      expect(summary?.modelNote).toMatch(/gpt-somebody-else/);
+      expect(other.stdout).toMatch(/reviewer model: UNKNOWN/);
     },
     TEST_TIMEOUT_MS,
   );

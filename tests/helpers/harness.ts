@@ -90,6 +90,8 @@ export const makeHarness = (
     residentProvisioner?: ControlPlaneConfig["residentProvisioner"];
     /** The blind reviewer's preference and fallbacks; the scripted reviewer alone when omitted. */
     reviewer?: ControlPlaneConfig["reviewer"];
+    /** The daemon's per-project reviewer file, as read at start; none when omitted. */
+    reviewerPreferencesFile?: ControlPlaneConfig["reviewerPreferencesFile"];
   } = {},
 ): Harness => {
   const root = options.root ?? tempDir("acp-harness-");
@@ -141,6 +143,7 @@ console.log('verification ok');`,
     // #1268 — a new project requires CommitLore; without a port of the test's own, a passing double.
     ...(options.repoFactory ? { repoFactory: { commitlore: passingCommitLore(), ...options.repoFactory } } : {}),
     ...(options.residentProvisioner ? {residentProvisioner:options.residentProvisioner} : {}),
+    ...(options.reviewerPreferencesFile ? { reviewerPreferencesFile: options.reviewerPreferencesFile } : {}),
   });
 
   // A route for the roles the control plane binds. The daemon wires the real CLI

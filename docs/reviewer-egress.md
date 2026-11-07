@@ -13,7 +13,6 @@ The daemon's endpoint policy lives in
 | --- | --- |
 | `gpt` | `api.openai.com`, `chatgpt.com`, `ab.chatgpt.com`, `auth.openai.com` |
 | `claude` | `api.anthropic.com` |
-| `grok` | `api.x.ai` |
 
 `ReviewerEgressConfig.providerEndpoints` can replace that map for a deployment. It must
 name every provider the deployment permits to review; a missing provider does not inherit a

@@ -1,9 +1,8 @@
 /**
- * One run of an area-based audit script (`scripts/production-review.mjs`,
- * `scripts/grok-review.mjs`): the commit it reviewed, the directory it wrote, and what each area's
- * reviewer actually did.
+ * One run of an area-based audit script (`scripts/production-review.mjs`): the commit it reviewed,
+ * the directory it wrote, and what each area's reviewer actually did.
  *
- * Both scripts used to point their reviewer at the live checkout and write into a fixed directory.
+ * The audit scripts used to point their reviewer at the live checkout and write into a fixed directory.
  * Three things followed from that (#1189):
  *
  *   * the reviewer read whatever the working tree held while it ran, including other agents'
@@ -838,8 +837,8 @@ const summarize = ({ tool, manifest, outDir, areaKeys }) => {
 // The run
 
 /**
- * `sequential` runs areas one at a time (grok's leader socket cannot be shared); otherwise they run
- * concurrently. Exits the process with one of `EXIT`.
+ * `sequential` runs areas one at a time, for a reviewer CLI that cannot serve two at once; otherwise
+ * they run concurrently. Exits the process with one of `EXIT`.
  */
 export const runAudit = async ({ tool, script, repoRoot, areas, sequential, reviewer, reviewArea }) => {
   installInterruptHandlers();

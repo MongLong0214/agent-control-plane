@@ -11,6 +11,8 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
+import { ticketIssueBody } from "./lib/ticket-issue-body.mjs";
+
 const REPO = process.env.ACP_ISSUE_REPO ?? "MongLong0214/agent-control-plane";
 const ticketsPath = fileURLToPath(new URL("../docs/tickets/tickets.json", import.meta.url));
 const { milestones, tickets } = JSON.parse(readFileSync(ticketsPath, "utf8"));
@@ -24,35 +26,7 @@ const api = (method, path, fields = {}) => {
   return JSON.parse(gh(args));
 };
 
-const marker = (id) => `<!-- acp-ticket:${id} -->`;
-
-const body = (ticket) => {
-  const deps = ticket.deps.length
-    ? ticket.deps.map((d) => `\`${d}\` ${titleOf(d)}`).join("\n- ")
-    : "none — this ticket is a DAG root";
-  const blocks = tickets.filter((t) => t.deps.includes(ticket.id));
-  return [
-    marker(ticket.id),
-    `**Milestone:** ${ticket.milestone}`,
-    "",
-    "### Depends on",
-    `- ${deps}`,
-    "",
-    "### Blocks",
-    blocks.length ? blocks.map((t) => `- \`${t.id}\` ${t.title}`).join("\n") : "- nothing",
-    "",
-    "### PRD requirements",
-    ticket.requirements.length ? ticket.requirements.map((r) => `- ${r}`).join("\n") : "- (supporting)",
-    "",
-    "### Scenarios",
-    ticket.scenarios.length ? ticket.scenarios.map((s) => `- ${s}`).join("\n") : "- (covered indirectly)",
-    "",
-    "### Acceptance",
-    ticket.acceptance,
-  ].join("\n");
-};
-
-const titleOf = (id) => tickets.find((t) => t.id === id)?.title ?? "(unknown)";
+const body = (ticket) => ticketIssueBody(ticket, tickets);
 
 const existingMilestones = JSON.parse(gh(["api", `repos/${REPO}/milestones?state=all&per_page=100`]));
 const milestoneNumber = new Map(existingMilestones.map((m) => [m.title, m.number]));

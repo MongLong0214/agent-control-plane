@@ -67,10 +67,10 @@ describe("a registry hands out the role that asked", () => {
     // The capacity monitor asks by provider alone and has no role. Nothing about it changes,
     // which is why this repair does not have to reach it.
     const registry = new ProviderRegistry();
-    registry.register(adapterNamed("grok", "shared"));
+    registry.register(adapterNamed("gpt", "shared"));
 
-    expect((registry.require("grok") as unknown as { marker: string }).marker).toBe("shared");
-    expect((registry.requireForRole("grok", Role.PRIMARY_CTO) as unknown as { marker: string }).marker)
+    expect((registry.require("gpt") as unknown as { marker: string }).marker).toBe("shared");
+    expect((registry.requireForRole("gpt", Role.PRIMARY_CTO) as unknown as { marker: string }).marker)
       .toBe("shared");
   });
 

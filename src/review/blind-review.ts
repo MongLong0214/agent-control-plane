@@ -335,10 +335,21 @@ export interface ProjectReviewerFile {
  * CEO msg_e91da929 — the projects that name their own preferred Blind Reviewer. An entry replaces the
  * global preferred reviewer for that project's runs and has no fallback. `refused` names why a file was
  * not applied; a refused file applies no entry at all.
+ *
+ * `refusedProjects` holds the entries of an applied file that name a provider which cannot review: one
+ * not registered for BLIND_REVIEWER with reviewer isolation, Grok since its removal included. That
+ * project's reviews are refused, never moved onto the global reviewer; every other entry still applies.
  */
 export interface ProjectReviewerPreferences {
   byProject: ReadonlyMap<string, ReviewerPreference>;
   refused: { path: string; reason: string } | null;
+  refusedProjects: ReadonlyMap<string, RefusedProjectReviewer>;
+}
+
+/** A project whose reviewer entry names a provider that cannot review, and why. */
+export interface RefusedProjectReviewer {
+  provider: string;
+  reason: string;
 }
 
 const projectReviewerEntries = z.record(
@@ -347,17 +358,22 @@ const projectReviewerEntries = z.record(
 );
 
 /**
- * `{ "<projectId>": { provider, model, effort } }`, every provider registered for BLIND_REVIEWER with an
- * adapter that can isolate a reviewer (`registeredForReview`), or nothing.
- * A missing file is no project preferences, which is the behaviour without this file.
+ * `{ "<projectId>": { provider, model, effort } }`, or nothing when the file is unreadable or not that
+ * shape. A missing file is no project preferences, which is the behaviour without this file.
+ *
+ * An entry whose provider is not registered for BLIND_REVIEWER with an adapter that can isolate a
+ * reviewer (`registeredForReview`) is refused for its project alone, rather than refusing the whole
+ * file: refusing the file let that project's reviews run on the global reviewer — a provider the entry
+ * did not name.
  */
 export const resolveProjectReviewerPreferences = (
   file: ProjectReviewerFile,
   registeredForReview: (provider: string) => boolean,
 ): ProjectReviewerPreferences => {
-  const refuse = (reason: string): ProjectReviewerPreferences => ({ byProject: new Map(), refused: { path: file.path, reason } });
+  const refuse = (reason: string): ProjectReviewerPreferences =>
+    ({ byProject: new Map(), refused: { path: file.path, reason }, refusedProjects: new Map() });
   if (file.unreadable !== undefined) return refuse(`unreadable: ${file.unreadable}`);
-  if (file.text === null) return { byProject: new Map(), refused: null };
+  if (file.text === null) return { byProject: new Map(), refused: null, refusedProjects: new Map() };
   let raw: unknown;
   try {
     raw = JSON.parse(file.text);
@@ -369,12 +385,16 @@ export const resolveProjectReviewerPreferences = (
     const at = parsed.error.issues[0]?.path.join(".") ?? "";
     return refuse(`not { "<projectId>": { provider, model, effort } }${at === "" ? "" : ` at ${at}`}`);
   }
+  const byProject = new Map<string, ReviewerPreference>();
+  const refusedProjects = new Map<string, RefusedProjectReviewer>();
   for (const [projectId, entry] of Object.entries(parsed.data)) {
-    if (!registeredForReview(entry.provider)) {
-      return refuse(`project ${projectId} names provider ${entry.provider}, which is not registered for BLIND_REVIEWER with reviewer isolation`);
-    }
+    if (registeredForReview(entry.provider)) byProject.set(projectId, entry);
+    else refusedProjects.set(projectId, {
+      provider: entry.provider,
+      reason: `project ${projectId} names provider ${entry.provider}, which is not registered for BLIND_REVIEWER with reviewer isolation`,
+    });
   }
-  return { byProject: new Map(Object.entries(parsed.data)), refused: null };
+  return { byProject, refused: null, refusedProjects };
 };
 
 /** A real step of a review, on which the submission that asked for it renews its attempt lease. */
@@ -772,6 +792,8 @@ export class BlindReviewGate {
       fallbacks: ReviewerPreference[];
       /** A project's own preferred reviewer, which replaces `preferred` for its runs and has no fallback. */
       projects?: ReadonlyMap<string, ReviewerPreference>;
+      /** Projects whose own reviewer names a provider that cannot review: their reviews are refused. */
+      refusedProjects?: ReadonlyMap<string, RefusedProjectReviewer>;
     },
     /** The same daemon-owned endpoint policy supplied to production CLI adapters. */
     private readonly reviewerEgressEndpoints: Readonly<Record<string, readonly string[]>> = REVIEWER_PROVIDER_ENDPOINTS,
@@ -1400,6 +1422,17 @@ export class BlindReviewGate {
     const attempts: Array<{ preference: ReviewerPreference; reason: string }> = [];
     let capacityFailure: Decision<void> | null = null;
     const projectId = this.db.get<{ project_id: string | null }>(`SELECT project_id FROM runs WHERE run_id = ?`, [runId])?.project_id ?? null;
+    // A project that named a provider which cannot review gets no reviewer at all. The global
+    // preference is not a substitute for it: that would run the review on a provider it did not name.
+    const refusedProject = projectId === null ? undefined : this.preferences.refusedProjects?.get(projectId);
+    if (refusedProject !== undefined) {
+      return deny(
+        ReasonCode.REVIEWER_PREFERENCES_INVALID,
+        `project ${projectId} names reviewer provider ${refusedProject.provider}, which is not a supported reviewer; ` +
+          "its blind review is refused rather than run on another provider",
+        { runId, projectId, provider: refusedProject.provider, reason: refusedProject.reason, reviewerSource: "PROJECT_PREFERENCE" },
+      );
+    }
     const projectPreferred = projectId === null ? undefined : this.preferences.projects?.get(projectId);
     const preferred = projectPreferred ?? this.preferences.preferred;
     const source = projectPreferred === undefined ? {} : { reviewerSource: "PROJECT_PREFERENCE", projectId };
