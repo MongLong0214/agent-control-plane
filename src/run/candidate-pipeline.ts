@@ -42,6 +42,7 @@ import {
   buildCandidateSnapshot,
   buildNoRepositoryCandidateSnapshot,
   candidateSnapshotDigest,
+  expectedCheckoutHead,
   verifySnapshotFreshness,
 } from "../snapshot/candidate-snapshot.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
@@ -56,9 +57,12 @@ import {
   candidateRefPlan,
   type CheckMergeMessage,
   type MergeCheckBinding,
+  PREDECESSOR_BASE_MERGES_CHECKED,
+  foreignCandidateCommit,
   integratePredecessors,
   integrateTaskResults,
   lostTaskChanges,
+  recordedPredecessorMergeChecks,
   succeededTaskCommits,
 } from "./candidate-integration.ts";
 import type { RunEngine, TaskContract } from "./run-engine.ts";
@@ -552,6 +556,49 @@ export class CandidatePipeline {
             `a SUCCEEDED task's change is not in the candidate's tree although its commit is in the candidate's history: ${named}`,
             { runId, repositoryIdentity: frozen.identity, lost: lost.value },
           );
+        }
+      }
+      // #1268 — a run whose contract requires CommitLore: every commit between the base each repository was
+      // frozen at and the exact head frozen for it is a SUCCEEDED worker commit of this run whose CommitLore
+      // evidence matches the commit's own Record-Id trailers, or a merge whose check was bound to it: this
+      // freeze's, or one recorded for a predecessor base a task of this run starts from (#1242).
+      // Asked of the frozen object ids, before anything is written.
+      if (checkMergeMessages !== undefined) {
+        for (const frozen of snapshot.repositories) {
+          const checkoutPath = repositories.find((repo) => repo.identity === frozen.identity)!.checkoutPath;
+          const foreign = await foreignCandidateCommit({
+            db: this.db,
+            runId,
+            repositoryIdentity: frozen.identity,
+            checkoutPath,
+            baseHead: frozen.baseHead,
+            candidateHead: frozen.candidateHead,
+            mergeChecks: [...(commitloreMergeChecks.get(frozen.identity) ?? []), ...recordedPredecessorMergeChecks(this.db, runId, frozen.identity)],
+          });
+          if (!foreign.allowed) return foreign as Decision<CandidateSnapshot>;
+          if (foreign.value !== null) {
+            return deny(
+              ReasonCode.CANDIDATE_FOREIGN_COMMIT,
+              "a commit in the candidate is not one this run's CommitLore path accounts for; nothing was frozen",
+              { runId, repositoryIdentity: frozen.identity, baseHead: frozen.baseHead, candidateHead: frozen.candidateHead, ...foreign.value },
+            );
+          }
+        }
+        // No gap between the head checked and the head frozen: each checkout still stands where the freeze read it.
+        for (const frozen of snapshot.repositories) {
+          const checkoutPath = repositories.find((repo) => repo.identity === frozen.identity)!.checkoutPath;
+          const expected = expectedCheckoutHead(frozen);
+          const observed = await tryRevParse(checkoutPath, "HEAD");
+          if (observed !== expected) {
+            return deny(ReasonCode.CANDIDATE_HEAD_MOVED, "the checkout's HEAD moved after the candidate's commits were checked; nothing was frozen", {
+              runId,
+              repositoryIdentity: frozen.identity,
+              refusal: "HEAD_MOVED",
+              candidateHead: frozen.candidateHead,
+              expectedCheckoutHead: expected,
+              observedCheckoutHead: observed,
+            });
+          }
         }
       }
     }
@@ -1890,6 +1937,7 @@ export class CandidatePipeline {
     const run = this.runs.get(input.runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
     const checkMergeMessages = this.checkMergeMessages(input.runId);
+    const checked: MergeCheckBinding[] = [];
     const built = await integratePredecessors({
       db: this.db,
       runId: input.runId,
@@ -1901,6 +1949,7 @@ export class CandidatePipeline {
       baseSha: input.baseSha,
       worktree: (worktreeInput, use) => this.verification.withRunWorktree(run, worktreeInput, use),
       ...(checkMergeMessages === undefined ? {} : { checkMessage: checkMergeMessages }),
+      checked,
     });
     if (!built.allowed || built.value === null) return built;
     const ref = baseRefFor(input.runId, input.taskId);
@@ -1913,6 +1962,17 @@ export class CandidatePipeline {
         () => applyCandidateRefPlan(input.checkoutPath, plan.value),
       );
       if (!held.allowed) return held as Decision<never>;
+    }
+    // #1268 — the merges this base was built with, each bound to its check, so a freeze of a candidate holding
+    // them (the dependent task's branch starts here) accepts them as it accepts its own. A base it cannot record
+    // is refused.
+    if (checked.length > 0) {
+      const recorded = this.audit.record({
+        kind: PREDECESSOR_BASE_MERGES_CHECKED,
+        runId: input.runId,
+        evidence: { taskId: input.taskId, repositoryIdentity: input.repositoryIdentity, commit: built.value.commit, commitloreMergeChecks: checked },
+      });
+      if (!recorded.allowed) return recorded as Decision<never>;
     }
     return built;
   }

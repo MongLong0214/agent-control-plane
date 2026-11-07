@@ -1,4 +1,6 @@
 import { passingCommitLore } from "./commitlore-attempt.ts";
+import { commitloreGoverned } from "../../src/bootstrap/commitlore-observation.ts";
+import { WorkerTurnEvent } from "../../src/run/worker-turn.ts";
 import { join } from "node:path";
 
 import { type Clock, ManualClock } from "../../src/core/clock.ts";
@@ -558,6 +560,22 @@ export const driveToReviewedCandidate = async (
     status: "SUCCEEDED",
     resultDigest: `sha256:${head}`,
   });
+  // #1268 — a run whose contract requires CommitLore freezes only commits a worker receipt accounts for: the
+  // receipt a CommitLore-settled turn writes for this commit, which carries no record.
+  if (commitloreGoverned(harness.cp.db, runId)) {
+    harness.cp.audit.record({
+      kind: WorkerTurnEvent.SUCCEEDED,
+      runId,
+      sessionId: workerSessionId,
+      evidence: {
+        executionId: execution.value.executionId,
+        resultDigest: `sha256:${head}`,
+        taskId: impl.taskId,
+        commitHead: head,
+        commitlore: { outcome: "empty", recordIds: [], nonce: null },
+      },
+    });
+  }
 
   const frozen = await harness.cp.pipeline.freeze(runId);
   if (!frozen.allowed) throw new Error(`${frozen.reasonCode}: ${frozen.message}`);
