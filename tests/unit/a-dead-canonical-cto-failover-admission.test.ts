@@ -11,7 +11,7 @@ import {
 } from "../../src/continuity/continuity-kernel.ts";
 import { ManualClock } from "../../src/core/clock.ts";
 import { digestOf, sha256 } from "../../src/core/digest.ts";
-import { type Decision, allow } from "../../src/core/errors.ts";
+import { type Decision, allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
@@ -542,5 +542,146 @@ describe("a failover replaces only the holder it started from, and never one on 
     } finally {
       h.cp.close();
     }
+  });
+});
+
+describe("the daemon acts on a refused failover only for the holder that attempt started from", () => {
+  it("a CEO re-adopted while the failover was evaluated stays bound, and no run is paused; the attempt is recorded as superseded", async () => {
+    const { f, h, plainSessionId } = releasedAdoption();
+    try {
+      h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+      const replaceable = h.cp.bindings.bind({ role: Role.CEO, sessionId: plainSessionId });
+      if (!replaceable.allowed) throw new Error(replaceable.message);
+      const daemon = new Daemon(h.cp, { stateDir: join(h.root, "daemon") });
+      const started = await daemon.start();
+      if (!started.allowed) throw new Error(started.message);
+      try {
+        // A run a CEO loss would pause (every run is paused for the CEO), owned by nobody so either CEO may go.
+        const runId = "run_kept_through_a_superseded_failover";
+        h.cp.db.run(
+          `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal, contract_digest, created_at, dispatched_at)
+           VALUES (?, NULL, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'ACTIVE', ?, ?, ?, ?)`,
+          [runId, "kept", "sha256:kept-through-a-superseded-failover", h.clock.nowIso(), h.clock.nowIso()],
+        );
+        expect(h.cp.sessions.transition(plainSessionId, SessionLifecycle.ERROR, "session process is dead").allowed).toBe(true);
+        const evaluate = h.cp.continuity.evaluate.bind(h.cp.continuity);
+        let readopted: { assignmentId: string; bindingGeneration: number } | null = null;
+        let gateway: string | null = null;
+        vi.spyOn(h.cp.continuity, "evaluate").mockImplementation(async (why) => {
+          if (readopted === null && why.startsWith("failover:")) {
+            // The Gateway is re-adopted, on its READY runtime, while the failover's own plan is computed.
+            expect(h.cp.bindings.revoke(roleKeyFor(Role.CEO), "the Gateway is adopted again").allowed).toBe(true);
+            const runtime = h.cp.sessions.create({ provider: "hermes", model: "hermes-runtime" });
+            expect(h.cp.sessions.transition(runtime.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+            gateway = runtime.sessionId;
+            readopted = bindToHermesTarget(f, runtime.sessionId);
+          }
+          return evaluate(why);
+        });
+
+        const report = await daemon.reconcileContinuity("the replaceable CEO's session died");
+
+        expect(readopted).not.toBeNull();
+        expect(h.cp.bindings.active(roleKeyFor(Role.CEO))).toMatchObject({
+          assignmentId: readopted!.assignmentId,
+          bindingGeneration: readopted!.bindingGeneration,
+          sessionId: gateway,
+        });
+        expect(h.cp.runs.require(runId).state).toBe("ACTIVE");
+        expect(report?.pausedRuns).toEqual([]);
+        expect(report?.unresolved).toEqual([]);
+        expect(h.cp.audit.byKind("BINDING_REVOKED").map((row) => row.evidence["reason"]))
+          .not.toContain(CONTINUITY_RUNTIME_LOST_REVOCATION_REASON);
+        expect(h.cp.audit.byKind("CONTINUITY_FAILOVER_SUPERSEDED").map((row) => row.evidence)).toEqual([{
+          generation: replaceable.value.bindingGeneration,
+          currentGeneration: readopted!.bindingGeneration,
+          failoverRefusal: ReasonCode.BINDING_GENERATION_STALE,
+        }]);
+      } finally {
+        await daemon.stop();
+      }
+    } finally {
+      h.cp.close();
+    }
+  });
+});
+
+describe("the revocation for a lost runtime is fenced to the holder it was decided for", () => {
+  it("a CEO re-adopted while the lost one's runs are paused is not revoked by that loss", async () => {
+    const { f, h, plainSessionId } = releasedAdoption();
+    try {
+      h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+      const replaceable = h.cp.bindings.bind({ role: Role.CEO, sessionId: plainSessionId });
+      if (!replaceable.allowed) throw new Error(replaceable.message);
+      const daemon = new Daemon(h.cp, { stateDir: join(h.root, "daemon") });
+      const started = await daemon.start();
+      if (!started.allowed) throw new Error(started.message);
+      try {
+        const runId = "run_paused_for_the_lost_ceo";
+        h.cp.db.run(
+          `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal, contract_digest, created_at, dispatched_at)
+           VALUES (?, NULL, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'ACTIVE', ?, ?, ?, ?)`,
+          [runId, "paused", "sha256:paused-for-the-lost-ceo", h.clock.nowIso(), h.clock.nowIso()],
+        );
+        expect(h.cp.sessions.transition(plainSessionId, SessionLifecycle.ERROR, "session process is dead").allowed).toBe(true);
+        vi.spyOn(h.cp.continuity, "failover").mockResolvedValue(deny(ReasonCode.SESSION_NOT_READY, "the planned CEO session is not ready") as never);
+        const pause = h.cp.runs.pauseForContinuity.bind(h.cp.runs);
+        let readopted: { bindingGeneration: number; sessionId: string } | null = null;
+        vi.spyOn(h.cp.runs, "pauseForContinuity").mockImplementation((...args) => {
+          const paused = pause(...args);
+          // After the lost CEO's run is paused and before its revocation, the Gateway is re-adopted.
+          expect(h.cp.bindings.revoke(roleKeyFor(Role.CEO), "the Gateway is adopted again", { allowBlockedRuns: true }).allowed).toBe(true);
+          const runtime = h.cp.sessions.create({ provider: "hermes", model: "hermes-runtime" });
+          expect(h.cp.sessions.transition(runtime.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+          readopted = bindToHermesTarget(f, runtime.sessionId);
+          return paused;
+        });
+
+        await daemon.reconcileContinuity("the replaceable CEO's session died");
+
+        expect(readopted).not.toBeNull();
+        expect(h.cp.runs.require(runId).state).toBe("BLOCKED");
+        expect(h.cp.bindings.active(roleKeyFor(Role.CEO))).toMatchObject({
+          bindingGeneration: readopted!.bindingGeneration,
+          sessionId: readopted!.sessionId,
+        });
+        expect(h.cp.audit.byKind("CONTINUITY_REVOKE_DEFERRED")).toEqual([]);
+        expect(h.cp.audit.byKind("CONTINUITY_FAILOVER_SUPERSEDED")).toHaveLength(1);
+      } finally {
+        await daemon.stop();
+      }
+    } finally {
+      h.cp.close();
+    }
+  });
+});
+
+describe("the daemon's check of a completed failover leaves a later holder alone", () => {
+  it("a CTO bound after the failover's switch is not revoked as an incomplete failover", async () => {
+    const f = plane();
+    const original = bindPlainCto(f);
+    await withDaemon(f, async (daemon) => {
+      processDied(f, original);
+      const failover = f.cp.continuity.failover.bind(f.cp.continuity);
+      let later: { bindingGeneration: number; sessionId: string } | null = null;
+      vi.spyOn(f.cp.continuity, "failover").mockImplementation(async (...args) => {
+        const switched = await failover(...args);
+        // Between the switch and the daemon's own check of it, another CTO takes the role.
+        expect(f.cp.bindings.revoke(CTO, "replaced by the operator").allowed).toBe(true);
+        const session = f.cp.sessions.create({ provider: "claude", model: "claude-cli" });
+        expect(f.cp.sessions.transition(session.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+        const bound = f.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: PROJECT, sessionId: session.sessionId });
+        if (!bound.allowed) throw new Error(bound.message);
+        later = bound.value;
+        return switched;
+      });
+
+      const report = await daemon.reconcileContinuity("the CTO's claude process died");
+
+      expect(later).not.toBeNull();
+      expect(f.cp.bindings.active(CTO)).toMatchObject({ bindingGeneration: later!.bindingGeneration, sessionId: later!.sessionId });
+      expect(report?.unresolved).toEqual([]);
+      expect(f.cp.audit.byKind("CONTINUITY_FAILOVER_SUPERSEDED")).toHaveLength(1);
+    });
   });
 });

@@ -1980,17 +1980,30 @@ export class Daemon {
           reason,
         );
         if (!failedOver.allowed) {
-          unresolved.push({ roleKey: required.roleKey, reasonCode: failedOver.reasonCode });
           // Every failover this loop asks for follows a lost runtime: `currentStillCovered` keeps a READY
           // incumbent whose runtime is not UNAVAILABLE and whose process is live or unrecorded, so a role
           // reaches here only with its session gone or not READY, its runtime UNAVAILABLE, or its recorded
           // process dead. The revocation says so. The refused failover's own reason code (an admission
           // refusal, or a canonical CTO that is never failed over) is recorded beside it, never as it: a
           // CTO whose process died under HEALTHY readings was read as a capacity problem (2026-11-07).
+          //
+          // That loss is `current`'s, read before the failover was awaited. The role must still be held
+          // by exactly that binding (assignment, generation and runtime): a holder that came while the
+          // failover was awaited (a re-adopted CEO, a claim) has lost nothing, so neither it nor its runs
+          // are touched, and the attempt is recorded as superseded. Asked with no await before the pauses,
+          // and again inside the revocation's own transaction (`expected`). The pauses keep committing one
+          // by one, as before: a pass interrupted after one keeps it (`RunEngine.#lossEpisode`).
+          if (!this.sameHolder(this.cp.bindings.active(required.roleKey), current)) {
+            this.recordSupersededFailover(required.roleKey, current, failedOver.reasonCode);
+            continue;
+          }
+          unresolved.push({ roleKey: required.roleKey, reasonCode: failedOver.reasonCode });
           pausedRuns.push(...this.pauseAffectedRuns(required, CONTINUITY_PAUSE_RUNTIME_LOST_REASON));
-          this.revokePausedBinding(required, CONTINUITY_RUNTIME_LOST_REVOCATION_REASON, {
+          const revoked = this.revokePausedBinding(required, CONTINUITY_RUNTIME_LOST_REVOCATION_REASON, {
             evidence: { failoverRefusal: failedOver.reasonCode },
+            expected: current,
           });
+          if (revoked === "SUPERSEDED") this.recordSupersededFailover(required.roleKey, current, failedOver.reasonCode);
           continue;
         }
 
@@ -1998,6 +2011,12 @@ export class Daemon {
         const replacement = active ? this.cp.sessions.get(active.sessionId) : null;
         // `failover` promises an atomic switch, but verify the exact durable endpoint
         // before reporting success. A route that was only planned is never coverage.
+        // A binding newer than the one the failover reported came after it, and is not this attempt's to
+        // revoke: the generation only grows, so the comparison names it.
+        if (active && active.bindingGeneration > failedOver.value.generation) {
+          this.recordSupersededFailover(required.roleKey, current, ReasonCode.BINDING_GENERATION_STALE);
+          continue;
+        }
         if (
           !active ||
           !replacement ||
@@ -2280,6 +2299,32 @@ export class Daemon {
     });
   }
 
+  /** The same holder: no binding on both sides, or the same assignment at the same generation on the same runtime. */
+  private sameHolder(now: RoleBinding | null, then: RoleBinding): boolean {
+    return now !== null &&
+      now.assignmentId === then.assignmentId &&
+      now.bindingGeneration === then.bindingGeneration &&
+      now.sessionId === then.sessionId &&
+      now.sessionIncarnation === then.sessionIncarnation;
+  }
+
+  /**
+   * A failover whose result no longer describes the role's holder: another binding took the role while
+   * it was awaited. Nothing was paused or revoked for it; the ledger says so once per attempt.
+   */
+  private recordSupersededFailover(roleKey: string, attempted: RoleBinding, failoverRefusal: string): void {
+    this.cp.audit.record({
+      kind: "CONTINUITY_FAILOVER_SUPERSEDED",
+      roleKey,
+      sessionId: attempted.sessionId,
+      evidence: {
+        generation: attempted.bindingGeneration,
+        currentGeneration: this.cp.bindings.active(roleKey)?.bindingGeneration ?? null,
+        failoverRefusal,
+      },
+    });
+  }
+
   /**
    * Once affected work is paused, revoke the dead endpoint so an old generation cannot
    * resume it through a late message. BindingRegistry fences queued/in-flight outbox rows
@@ -2288,20 +2333,27 @@ export class Daemon {
   private revokePausedBinding(
     required: RequiredRole,
     reason: string,
-    options: { allowHeldRuns?: boolean; evidence?: Readonly<Record<string, string>> } = {},
-  ): void {
+    options: {
+      allowHeldRuns?: boolean;
+      evidence?: Readonly<Record<string, string>>;
+      /** Revoke only this exact binding, checked in the revocation's transaction; another holder is left. */
+      expected?: RoleBinding;
+    } = {},
+  ): "SUPERSEDED" | null {
     const current = this.cp.bindings.active(required.roleKey);
-    if (!current) return;
+    if (!current) return null;
     const revoked = this.cp.bindings.revoke(required.roleKey, reason, {
       allowBlockedRuns: true,
       ...(options.allowHeldRuns === true ? { allowHeldRuns: true } : {}),
       ...(options.evidence === undefined ? {} : { evidence: options.evidence }),
+      ...(options.expected === undefined ? {} : { expectedCurrent: options.expected }),
       // A run's BOOTSTRAP_CTO revoked here is the one continuity recovers on its own session at the
       // next generation (`BootstrapCtoStaffing.recover` accepts exactly these continuity reasons), so
       // a resolution still queued for it is held for that renewal rather than lost to the outage.
       ...(required.role === Role.BOOTSTRAP_CTO ? { holdEscalationRepliesForRenewal: true } : {}),
     });
     if (!revoked.allowed) {
+      if (options.expected !== undefined && revoked.reasonCode === ReasonCode.BINDING_GENERATION_STALE) return "SUPERSEDED";
       // The generation, as BINDING_REVOKED records it: what ties a pause at CEO review in this pass to
       // the binding whose revocation was deferred (`RunEngine.#continuityReviewHold`).
       this.cp.audit.record({
@@ -2312,6 +2364,7 @@ export class Daemon {
         evidence: { ...options.evidence, reason, generation: current.bindingGeneration },
       });
     }
+    return null;
   }
 
   /** #1189 — the ownerless stalls this daemon detects, and the CEO notices deferred while their facts were kept. */

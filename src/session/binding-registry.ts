@@ -941,11 +941,27 @@ export class BindingRegistry {
        * reason code here. Absent, the record is exactly `{ reason, generation }`.
        */
       evidence?: Readonly<Record<string, string | number | boolean | null>>;
+      /**
+       * The exact binding the caller decided to revoke, checked in this transaction: anything else
+       * holding the role (another assignment, generation, runtime or incarnation) is refused
+       * BINDING_GENERATION_STALE and left as it is.
+       */
+      expectedCurrent?: Pick<RoleBinding, "assignmentId" | "bindingGeneration" | "sessionId" | "sessionIncarnation">;
     } = {},
   ): Decision<void> {
     return this.db.tx(() => {
       const current = this.active(roleKey);
       if (!current) return deny(ReasonCode.NOT_FOUND, "no active binding", { roleKey });
+      const expected = options.expectedCurrent;
+      if (expected !== undefined && (current.assignmentId !== expected.assignmentId ||
+          current.bindingGeneration !== expected.bindingGeneration || current.sessionId !== expected.sessionId ||
+          current.sessionIncarnation !== expected.sessionIncarnation)) {
+        return deny(ReasonCode.BINDING_GENERATION_STALE, "the role's binding is no longer the one this revocation was for", {
+          roleKey,
+          expectedGeneration: expected.bindingGeneration,
+          currentGeneration: current.bindingGeneration,
+        });
+      }
       const ownedRuns = this.liveRunsOwnedBy(current);
       const held: readonly string[] = options.allowHeldRuns
         ? ["BLOCKED", "REVISION_REQUIRED", "AWAITING_HUMAN"]
