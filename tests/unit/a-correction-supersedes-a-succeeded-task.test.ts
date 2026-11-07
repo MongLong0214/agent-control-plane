@@ -152,7 +152,14 @@ const governedRun = async () => {
     executions: h.cp.db.all(`SELECT * FROM task_executions WHERE task_id = ? ORDER BY attempt`, [taskId]),
     receipts: h.cp.audit.byKind(WorkerTurnEvent.SUCCEEDED).filter((row) => row.evidence["taskId"] === taskId),
   });
-  return { h, project, runId, holderRunId: holder.value.runId, repo, base, plan, succeed, register, records, freeze, predecessorBase, rowsOf };
+  /** One FAILED turn of `taskId`, as a worker's contract failure ends it. */
+  const failTask = (taskId: string) => {
+    const opened = h.cp.tasks.startExecution({ runId, taskId, ownerBindingGeneration: h.cp.runs.require(runId).ownerBindingGeneration!, workerSessionId: bindWorker(h, taskId), provider: "scripted", model: "scripted-worker", repositoryId: project.repositoryId });
+    if (!opened.allowed) throw new Error(`${opened.reasonCode}: ${opened.message}`);
+    const closed = h.cp.tasks.finishExecution(opened.value.executionId, { status: "FAILED", resultDigest: null, failureClass: "contract" }, runId);
+    if (!closed.allowed) throw new Error(`${closed.reasonCode}: ${closed.message}`);
+  };
+  return { h, project, runId, holderRunId: holder.value.runId, repo, base, plan, succeed, failTask, register, records, freeze, predecessorBase, rowsOf };
 };
 type Run = Awaited<ReturnType<typeof governedRun>>;
 
@@ -307,6 +314,8 @@ describe("CEO msg_8f666e55 — a SUCCEEDED task superseded by a registered corre
     const [w] = await r.plan([{ key: "W", dependsOn: ["A"] }]) as [string];
     const based = await r.predecessorBase(w, [a]);
     expect(based, JSON.stringify(based).slice(0, 400)).toMatchObject({ allowed: true, value: { predecessors: [{ taskId: a, commit: first.commit }] } });
+    if (!based.allowed || based.value === null) return;
+    r.succeed(w, "", { files: { "w.txt": "W\n" }, startsFrom: based.value });
     expect(await r.freeze()).toMatchObject({ allowed: false, reasonCode: HAS_DEPENDENTS, evidence: { refusal: HAS_DEPENDENTS, supersededTaskId: a, dependents: [w] } });
     // Extending the chain asks the same of every task it supersedes: C would supersede B, and so A, which W builds on.
     const [c] = await r.plan([{ key: "C", spec: correctionOf(b) }]) as [string];
@@ -381,5 +390,72 @@ describe("CEO msg_8f666e55 — a SUCCEEDED task superseded by a registered corre
         allowed: false, reasonCode: HAS_DEPENDENTS, evidence: { refusal: HAS_DEPENDENTS, supersededTaskId: late.a, dependents: [late.w] },
       });
     }
+  });
+
+  it("review r3 [1] — W depends only on B, the correction, and its recorded base holds A and B: W builds on the corrected output, so nothing is refused", async () => {
+    for (const planned of ["before", "after"] as const) {
+      const r = await governedRun();
+      const [a] = await r.plan([{ key: "A" }]) as [string];
+      const first = r.succeed(a, "", { files: { "one.txt": "A one\n", "two.txt": "A two\n" } });
+      const [b] = await r.plan([{ key: "B", spec: correctionOf(a), dependsOn: ["A"] }]) as [string];
+      const correction = r.succeed(b, "", { files: { "one.txt": "B one\n" }, startsFrom: onCommit(a, first.commit) });
+      const dependent = async () => {
+        const [w] = await r.plan([{ key: "W", dependsOn: ["B"] }]) as [string];
+        const based = await r.predecessorBase(w, [a, b]);
+        expect(based, JSON.stringify(based).slice(0, 400)).toMatchObject({ allowed: true, value: { commit: correction.commit, predecessors: [{ taskId: a }, { taskId: b }] } });
+        if (!based.allowed || based.value === null) throw new Error("no base");
+        r.succeed(w, "", { files: { "three.txt": "W three\n" }, startsFrom: based.value });
+        return w;
+      };
+      const early = planned === "before" ? await dependent() : null;
+      expect(await r.register(b, a), `W planned ${planned}`).toMatchObject({ ok: true, value: { registered: true } });
+      const w = early ?? await dependent();
+      gitSync(r.repo, ["checkout", "-q", `task/${a}`]);
+      const frozen = await r.freeze();
+      expect(frozen, `W planned ${planned}: ${JSON.stringify(frozen).slice(0, 400)}`).toMatchObject({ allowed: true });
+      if (!frozen.allowed) continue;
+      const [repository] = frozen.value.repositories;
+      expect(repository!.integration?.tasks.map((task) => task.taskId).sort()).toEqual([b, w].sort());
+      expect(treeOf(r, repository!.candidateHead, ["one.txt", "two.txt", "three.txt"])).toEqual({ "one.txt": "B one", "two.txt": "A two", "three.txt": "W three" });
+    }
+  });
+
+  it("review r3 [2] — W depends on A and FAILED, and #1368's correction X settles it: W contributes nothing, so neither registration nor the freeze is refused", async () => {
+    for (const order of ["supersession first", "settlement first"] as const) {
+      const r = await governedRun();
+      const [a] = await r.plan([{ key: "A" }]) as [string];
+      r.succeed(a, "A");
+      const [b] = await r.plan([{ key: "B", spec: correctionOf(a) }]) as [string];
+      r.succeed(b, "B");
+      const supersede = async () => expect.soft(await r.register(b, a), `${order}: B corrects A`).toMatchObject({ ok: true, value: { registered: true } });
+      // An unsettled FAILED dependent may still be retried, so A -> B is registered before W is planned, or after X settles it.
+      if (order === "supersession first") await supersede();
+      const [w] = await r.plan([{ key: "W", dependsOn: ["A"] }]) as [string];
+      r.failTask(w);
+      const [x] = await r.plan([{ key: "X", spec: correctionOf(w) }]) as [string];
+      r.succeed(x, "", { files: { "x.txt": "X\n" } });
+      expect(await r.register(x, w), `${order}: X corrects W`).toMatchObject({ ok: true, value: { registered: true } });
+      if (order === "settlement first") await supersede();
+      expect(r.h.cp.tasks.completeness(r.runId)).toMatchObject({ allowed: true, value: { settledByCorrection: [{ taskId: w, correctionTaskId: x }] } });
+      gitSync(r.repo, ["checkout", "-q", `task/${a}`]);
+      const frozen = await r.freeze();
+      expect.soft(frozen, `${order}: ${JSON.stringify(frozen).slice(0, 400)}`).toMatchObject({ allowed: true });
+      if (!frozen.allowed) continue;
+      expect(frozen.value.repositories[0]!.integration?.tasks.map((task) => task.taskId).sort()).toEqual([b, x].sort());
+    }
+  });
+
+  it("review r3 [3] — the same relation again, after a dependent of A was planned, is acknowledged; the freeze then refuses that dependent", async () => {
+    const r = await governedRun();
+    const [a] = await r.plan([{ key: "A" }]) as [string];
+    const first = r.succeed(a, "A");
+    const [b] = await r.plan([{ key: "B", spec: correctionOf(a) }]) as [string];
+    r.succeed(b, "B");
+    expect(await r.register(b, a)).toMatchObject({ ok: true, value: { registered: true } });
+    const [w] = await r.plan([{ key: "W", dependsOn: ["A"] }]) as [string];
+    expect(await r.register(b, a)).toMatchObject({ ok: true, value: { registered: false, correction: { originalTaskId: a, correctionTaskId: b } } });
+    expect(r.records()).toHaveLength(1);
+    r.succeed(w, "", { files: { "w.txt": "W\n" }, startsFrom: onCommit(a, first.commit) });
+    expect(await r.freeze()).toMatchObject({ allowed: false, reasonCode: HAS_DEPENDENTS, evidence: { refusal: HAS_DEPENDENTS, supersededTaskId: a, dependents: [w] } });
   });
 });

@@ -230,7 +230,8 @@ export interface Supersession {
  * FAILED task's correction (#1368) binds no receipt and supersedes nothing here. Nothing picks a winner by time or
  * ancestry: without such a relation every SUCCEEDED task is a result, and the path-level conflict check decides.
  * Review r2 — refused, CORRECTION_ORIGINAL_HAS_DEPENDENTS, while a task outside a superseded task's chain builds on
- * it (`tasksBuildingOn`), as one planned after the relation was registered can: nothing is merged around it.
+ * it (`tasksBuildingOn`), as one planned after the relation was registered can: nothing is merged around it. Review
+ * r3 — only a task result counts: a superseded task, or a FAILED one a correction settles, contributes nothing.
  */
 export const supersessionOf = (db: Db, runId: string, receipts: readonly SucceededTaskCommit[]): Decision<Supersession> => {
   const relations = db
@@ -248,7 +249,7 @@ export const supersessionOf = (db: Db, runId: string, receipts: readonly Succeed
     const current = digestOf(bound.value);
     if (claims.some((claim) => claim.supersedes !== undefined && digestOf(claim.supersedes) === current)) replacedBy.set(originalTaskId, correctionTaskId);
   }
-  const superseded = new Set<string>();
+  const later = new Map<string, Set<string>>();
   const terminals = new Set<string>();
   for (const taskId of replacedBy.keys()) {
     const seen = new Set<string>();
@@ -260,16 +261,19 @@ export const supersessionOf = (db: Db, runId: string, receipts: readonly Succeed
     if (replacedBy.has(at)) continue;
     const after = new Set([...seen, at]);
     after.delete(taskId);
-    const dependents = tasksBuildingOn(db, runId, taskId, after);
+    later.set(taskId, after);
+    terminals.add(at);
+  }
+  const results = receipts.map((receipt) => receipt.taskId).filter((taskId) => !later.has(taskId)).sort();
+  for (const [taskId, after] of later) {
+    const dependents = tasksBuildingOn(db, runId, taskId, after, results);
     if (dependents.length > 0) {
       return deny(ReasonCode.CORRECTION_ORIGINAL_HAS_DEPENDENTS, "a task outside its chain of corrections builds on a task a correction supersedes; the candidate is not frozen", {
         runId, refusal: "CORRECTION_ORIGINAL_HAS_DEPENDENTS", supersededTaskId: taskId, correctionTaskId: replacedBy.get(taskId), dependents,
       });
     }
-    superseded.add(taskId);
-    terminals.add(at);
   }
-  return allow(ReasonCode.OK, { superseded, terminals });
+  return allow(ReasonCode.OK, { superseded: new Set(later.keys()), terminals });
 };
 
 /**

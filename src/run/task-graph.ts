@@ -233,18 +233,22 @@ export interface WorkerExecutionBindingGate {
 }
 
 /**
- * CEO msg_8f666e55 (review r2) — the run's live tasks, other than `taskId` and `exempt`, that build on `taskId`: they
- * name it in dependsOn, or the write target recorded for them starts from a base that holds it (#1242). Asked of a
- * SUCCEEDED task a correction supersedes, `exempt` being the corrections after it in its chain.
+ * CEO msg_8f666e55 (review r2) — the tasks among `candidates`, other than `taskId` and `later`, that build on `taskId`
+ * without its correction: their dependsOn, or the predecessors of the base recorded for them (#1242), hold `taskId`
+ * and no task of `later`, the corrections after it in its chain. Review r3 — a base holding a later correction
+ * already holds the corrected output. Asked of a SUCCEEDED task a correction supersedes; which tasks may count is the
+ * caller's (`registerCorrection`, `supersessionOf`).
  */
-export const tasksBuildingOn = (db: Db, runId: string, taskId: string, exempt: ReadonlySet<string>): string[] => {
-  const named = new Set(db.all<{ task_id: string }>(`SELECT task_id FROM task_dependencies WHERE depends_on = ?`, [taskId]).map((row) => row.task_id));
-  return db
-    .all<{ task_id: string }>(`SELECT task_id FROM tasks WHERE run_id = ? AND state != 'CANCELLED' ORDER BY task_id`, [runId])
-    .map((row) => row.task_id)
-    .filter((id) => id !== taskId && !exempt.has(id))
-    .filter((id) => named.has(id) || (recordedWriteTarget(db, runId, id)?.startsFrom?.predecessors ?? []).some((predecessor) => predecessor.taskId === taskId));
-};
+export const tasksBuildingOn = (db: Db, runId: string, taskId: string, later: ReadonlySet<string>, candidates: readonly string[]): string[] =>
+  candidates
+    .filter((id) => id !== taskId && !later.has(id))
+    .filter((id) => {
+      const base = new Set([
+        ...db.all<{ depends_on: string }>(`SELECT depends_on FROM task_dependencies WHERE task_id = ?`, [id]).map((row) => row.depends_on),
+        ...(recordedWriteTarget(db, runId, id)?.startsFrom?.predecessors ?? []).map((predecessor) => predecessor.taskId),
+      ]);
+      return base.has(taskId) && ![...later].some((member) => base.has(member));
+    });
 
 /** CEO msg_8f666e55 — the receipt binding of a SUCCEEDED task and its correction (`supersessionBinding`), or why there is none. */
 export type SupersessionReader = (runId: string, originalTaskId: string, correctionTaskId: string) => Decision<SupersessionBinding>;
@@ -1320,9 +1324,20 @@ export class TaskGraph {
           ?? deny<SupersessionBinding>(ReasonCode.TASK_RECEIPT_MISSING, "no receipt reader is composed", { refusal: "CORRECTION_RECEIPT_MISSING" });
         if (!bound.allowed) return refuse(bound.reasonCode, String(bound.evidence["refusal"]), bound.message, bound.evidence);
         supersedes = bound.value;
+      }
+      const acceptanceDigest = input.corrects.acceptanceDigest;
+      const same = registered.find((r) => r.originalTaskId === originalTaskId && r.correctionTaskId === correctionTaskId && r.acceptanceDigest === acceptanceDigest && r.workUnit === workUnit &&
+        digestOf(r.supersedes ?? null) === digestOf(supersedes ?? null));
+      // Review r3 — a relation already registered is acknowledged; a dependent planned since is the freeze's to refuse.
+      if (same) return allow(ReasonCode.OK, { correction: same, registered: false });
+      if (supersedes !== undefined) {
+        // Every task that may still produce a result counts: not CANCELLED, and not a FAILED task a correction settles.
+        const tasks = this.list(runId);
+        const settled = this.#settledByCorrection(runId, tasks);
+        const live = tasks.filter((t) => t.state !== TaskState.CANCELLED && !settled.has(t.taskId)).map((t) => t.taskId).sort();
         const chain = this.#chainThrough(registered, originalTaskId, correctionTaskId);
         for (const [at, supersededTaskId] of chain.slice(0, -1).entries()) {
-          const dependents = tasksBuildingOn(this.db, runId, supersededTaskId, new Set(chain.slice(at + 1)));
+          const dependents = tasksBuildingOn(this.db, runId, supersededTaskId, new Set(chain.slice(at + 1)), live);
           if (dependents.length > 0) {
             return refuse(ReasonCode.CORRECTION_ORIGINAL_HAS_DEPENDENTS, "CORRECTION_ORIGINAL_HAS_DEPENDENTS", "a task outside the correction's chain builds on a task it would supersede; no candidate both drops that task and keeps what was built on it", {
               supersededTaskId, dependents,
@@ -1330,10 +1345,6 @@ export class TaskGraph {
           }
         }
       }
-      const acceptanceDigest = input.corrects.acceptanceDigest;
-      const same = registered.find((r) => r.originalTaskId === originalTaskId && r.correctionTaskId === correctionTaskId && r.acceptanceDigest === acceptanceDigest && r.workUnit === workUnit &&
-        digestOf(r.supersedes ?? null) === digestOf(supersedes ?? null));
-      if (same) return allow(ReasonCode.OK, { correction: same, registered: false });
       const recorded = this.audit.record({
         kind: TASK_CORRECTION_REGISTERED,
         runId,
