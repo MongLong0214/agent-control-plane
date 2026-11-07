@@ -99,7 +99,6 @@ export class GuardedInvocationWriteBroker implements ManagedInvocationWriteBroke
 export const ProviderId = {
   gpt: "gpt",
   claude: "claude",
-  grok: "grok",
   /** Deterministic adapter for tests. Never selectable by a production routing path. */
   scripted: "scripted",
 } as const;
@@ -119,7 +118,6 @@ export const REVIEWER_PROVIDER_ENDPOINTS: Readonly<Record<string, readonly strin
   // is valid only for an exact generated endpoint, so the subdomain is named, not inherited.
   gpt: Object.freeze(["api.openai.com", "chatgpt.com", "ab.chatgpt.com", "auth.openai.com"]),
   claude: Object.freeze(["api.anthropic.com"]),
-  grok: Object.freeze(["api.x.ai"]),
 });
 
 /**
@@ -547,8 +545,6 @@ export interface ProviderAdapter {
   readonly requiresReviewerProviderSessionProof?: boolean;
   /** This adapter can attest that its reviewer effort setting was accepted. */
   readonly supportsReviewerEffortAttestation?: boolean;
-  /** Provider may contribute only optional adversarial work, never a required role. */
-  readonly optionalAdversarialOnly?: boolean;
   /**
    * The path this adapter will hand to `execve` — the pin, exactly as the adapter holds it.
    *
@@ -655,10 +651,6 @@ class CapacityObservedAdapter implements ProviderAdapter {
 
   get supportsReviewerEffortAttestation(): boolean | undefined {
     return this.inner.supportsReviewerEffortAttestation;
-  }
-
-  get optionalAdversarialOnly(): boolean | undefined {
-    return this.inner.optionalAdversarialOnly;
   }
 
   /**

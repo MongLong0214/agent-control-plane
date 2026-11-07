@@ -48,7 +48,7 @@ import { BootstrapCtoStaffing } from "../run/bootstrap-cto-staffing.ts";
 import { WorkerTurnRunner } from "../run/worker-turn.ts";
 import { WorkerRetirement } from "../run/worker-retirement.ts";
 import { WorkerStaffing } from "../run/worker-staffing.ts";
-import { ClaudeCliAdapter, CodexCliAdapter, GrokCliAdapter, type CliAdapterOptions } from "../runtime/cli-adapters.ts";
+import { ClaudeCliAdapter, CodexCliAdapter, type CliAdapterOptions } from "../runtime/cli-adapters.ts";
 import {
   GuardedInvocationWriteBroker,
   type ProviderAdapter,
@@ -160,7 +160,6 @@ export interface ControlPlaneConfig {
   adapterOptions?: {
     claude?: Partial<CliAdapterOptions>;
     gpt?: Partial<CliAdapterOptions>;
-    grok?: Partial<CliAdapterOptions>;
   };
   /**
    * Permits binding a role to an adapter that fabricates responses. Off by default, so
@@ -1049,15 +1048,6 @@ export class ControlPlane {
         reviewerEgress: this.config.reviewerEgress,
         binary: process.env["ACP_CODEX_BINARY"],
               ...overrides.gpt,
-      }) },
-      { adapter: new GrokCliAdapter({
-        clock: this.clock,
-        capacityFile: join(this.config.capacityDir, "grok.json"),
-        environmentAllowlist: [],
-        denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir, ...credentialDenyPaths],
-        providerCredentialDir: process.env["ACP_GROK_CREDENTIAL_DIR"],
-        binary: process.env["ACP_GROK_BINARY"],
-              ...overrides.grok,
       }) },
     ];
   }

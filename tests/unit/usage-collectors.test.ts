@@ -2,7 +2,6 @@ import { afterAll, describe, expect, it } from "vitest";
 import {
   chmodSync,
   existsSync,
-  linkSync,
   mkdirSync,
   realpathSync,
   rmSync,
@@ -12,12 +11,12 @@ import {
 import { isAbsolute, join, relative, resolve } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role } from "../../src/domain/types.ts";
-import { ControlPlane } from "../../src/app/control-plane.ts";
+import { ControlPlane, readProjectReviewerFile } from "../../src/app/control-plane.ts";
 import {
   ClaudeCliAdapter,
   CodexCliAdapter,
-  GrokCliAdapter,
   __testing,
 } from "../../src/runtime/cli-adapters.ts";
 import {
@@ -29,18 +28,14 @@ import {
   CodexUsageCollector,
   SpawnCodexRateLimitProbe,
   type CodexRateLimitProbe,
-  GrokUsageCollector,
-  grokBearer,
   parseCodexRateLimits,
-  parseGrokBilling,
-  type GrokBillingProbe,
   parseUsageOutput,
   ExpectUsageTerminal,
   type UsageTerminal,
   nonInteractiveEnvironment,
 } from "../../src/capacity/usage-collectors.ts";
 import type { ProviderAdapter } from "../../src/runtime/provider.ts";
-import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -48,7 +43,8 @@ afterAll(cleanupTempDirs);
 /**
  * The enclosing case declares `20_000`, so the helper's 55s default would never be the bound that
  * fires — vitest would time the case out first and report it against whatever the worker held.
- * `mkfifo` creates one node and returns; 10s is already far past anything it can legitimately cost.
+ * Each child here runs a script that exits at once; 10s is already far past anything it can
+ * legitimately cost.
  */
 const QUICK_CHILD_BUDGET_MS = 10_000;
 
@@ -618,178 +614,19 @@ describe("Codex account rate limits (#582)", () => {
   }, 20_000);
 });
 
-describe("Grok subscription billing (#582)", () => {
-  // Captured live from cli-chat-proxy.grok.com/v1/billing?format=credits on this host.
-  const LIVE = {
-    config: {
-      currentPeriod: {
-        type: "USAGE_PERIOD_TYPE_WEEKLY",
-        start: "2026-08-12T06:08:19.603673+00:00",
-        end: "2026-08-19T06:08:19.603673+00:00",
-      },
-      creditUsagePercent: 51.0,
-      productUsage: [
-        { product: "GrokBuild", usagePercent: 50.0 },
-        { product: "GrokChat", usagePercent: 1.0 },
-      ],
-    },
-  };
-
-  const probeReturning = (payload: unknown): GrokBillingProbe => ({ read: async () => payload });
-
-  it("reads the credit window and each product's share of it", async () => {
-    const reading = await new GrokUsageCollector({
-      clock: clock(),
-      binary: "grok",
-      grokBilling: probeReturning(LIVE),
-    }).collect();
-
-    expect(reading.sensorHealth, reading.error ?? "").toBe("HEALTHY");
-    expect(reading.source).toMatch(/^account-billing:grok;/u);
-    expect(reading.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
-      ["credits", 49],
-      ["grokbuild", 50],
-      ["grokchat", 99],
-    ]);
-    // Grok's capability set is unchanged by the new source: optional diversity only, never a
-    // critical continuity role (ADR-0007).
-    expect(reading.buckets.every((bucket) => bucket.capabilities.join() === "adversarial-review")).toBe(true);
-    expect(reading.buckets[0]?.resetAt).toBe("2026-08-19T06:08:19.603Z");
-  });
-
-  it("refuses rather than guessing when the account states no usable percentage", async () => {
-    for (const payload of [null, {}, { config: {} }, { config: { creditUsagePercent: "n/a" } }, { config: { creditUsagePercent: 140 } }]) {
-      const reading = await new GrokUsageCollector({
-        clock: clock(),
-        binary: "grok",
-        grokBilling: probeReturning(payload),
-      }).collect();
-      expect(reading.sensorHealth, JSON.stringify(payload)).toBe("ERROR");
-      expect(reading.buckets).toEqual([]);
-    }
-  });
-
-  it("drops a product whose share is not a usable percentage", async () => {
-    // A malformed product must not become a bucket. Every applicable bucket has to clear the
-    // floor, so a nonsense one either withholds all Grok work or, read as zero used, quietly
-    // adds headroom that was never stated.
-    const reading = await new GrokUsageCollector({
-      clock: clock(),
-      binary: "grok",
-      grokBilling: probeReturning({
-        config: {
-          creditUsagePercent: 10,
-          currentPeriod: { end: "2026-08-19T06:08:19.603673+00:00" },
-          productUsage: [
-            { product: "GrokBuild", usagePercent: 20 },
-            { product: "Broken", usagePercent: "n/a" },
-            { product: "AlsoBroken", usagePercent: 140 },
-            { product: 42, usagePercent: 5 },
-          ],
-        },
-      }),
-    }).collect();
-
-    expect(reading.sensorHealth, reading.error ?? "").toBe("HEALTHY");
-    expect(reading.buckets.map((bucket) => bucket.id)).toEqual(["credits", "grokbuild"]);
-  });
-
-  it("keeps the borrowed credential out of everything it records", async () => {
-    // This is the one provider whose quota cannot be read through its own CLI, so ACP holds the
-    // subscription's bearer for the length of one request. Nothing about that may survive into
-    // a reading, a source string or a digest.
-    const secret = "xai-secret-token-value-that-must-not-appear-anywhere";
-    const reading = await new GrokUsageCollector({
-      clock: clock(),
-      binary: "grok",
-      grokBilling: {
-        read: async () => ({ config: { ...LIVE.config, echoedToken: secret } }),
-      },
-    }).collect();
-
-    const recorded = JSON.stringify(reading);
-    expect(recorded).not.toContain(secret);
-    expect(recorded).not.toContain("Bearer");
-  });
-
-  it("reports a missing credential through the real probe, not an injected one", async () => {
-    // Every other test here injects a probe, which means the shipped one — the part that reads
-    // the auth file and makes the request — is never entered. This drives it, stopping before
-    // the network: no credential, no call. The same tests that pass with a fake probe would
-    // pass if the real one threw on its first line.
-    const reading = await new GrokUsageCollector({
-      clock: clock(),
-      binary: "grok",
-      grokAuthPath: join(tempDir("acp-grok-noauth-"), "absent.json"),
-    }).collect();
-
-    expect(reading.sensorHealth).toBe("ERROR");
-    expect(reading.error).toContain("no usable credential");
-    expect(reading.buckets).toEqual([]);
-  });
-
-  it("reaches the request once it has a credential, and refuses before it otherwise", async () => {
-    const root = tempDir("acp-grok-auth-");
-    const authPath = join(root, "auth.json");
-    writeFileSync(
-      authPath,
-      JSON.stringify({
-        "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {
-          key: "x".repeat(882),
-          create_time: "2026-08-01T00:00:00.000Z",
-          auth_mode: "oidc",
-        },
-      }),
-      { mode: 0o600 },
-    );
-
-    // Reaching the network is the proof it got a bearer: without one it refuses before calling.
-    const reading = await new GrokUsageCollector({
-      clock: clock(),
-      binary: "grok",
-      timeoutMs: 1,
-      grokAuthPath: authPath,
-    }).collect();
-
-    expect(reading.sensorHealth).toBe("ERROR");
-    expect(reading.error, reading.error ?? "").not.toContain("no usable credential");
-    // And whatever fetch said about it, the credential is not in what gets recorded.
-    expect(JSON.stringify(reading)).not.toContain("x".repeat(40));
-  }, 20_000);
-
-  it("says plainly that an expired credential is the CLI's to renew", async () => {
-    const reading = await new GrokUsageCollector({
-      clock: clock(),
-      binary: "grok",
-      grokBilling: {
-        read: async () => {
-          throw new Error("grok billing refused the stored credential; it has expired and only the CLI can renew it");
-        },
-      },
-    }).collect();
-
-    // Measured at six hours, and it expired mid-session while this was being written. Nothing
-    // here writes a refreshed token back: that file belongs to the CLI, and racing it would be
-    // a second writer to a credential store.
-    expect(reading.sensorHealth).toBe("ERROR");
-    expect(reading.error).toContain("only the CLI can renew it");
-  });
-});
-
 describe("capacity review findings (#582)", () => {
   it("refuses an absent percentage instead of reading it as a full window", () => {
     // `Number()` maps null, "", [] and false to 0, and a zero used-percentage is a *full*
     // window. Every one of these reported complete headroom on an account that had stated
     // nothing — and on Codex those buckets carry ceo and worker.
     for (const absent of [null, "", [], false, {}, "n/a"]) {
-      expect(parseGrokBilling({ config: { creditUsagePercent: absent } }).ok, JSON.stringify(absent)).toBe(false);
       expect(
         parseCodexRateLimits("gpt", { primary: { usedPercent: absent, windowDurationMins: 10080, resetsAt: 1 } }).ok,
         JSON.stringify(absent),
       ).toBe(false);
     }
     // A real zero is a real statement and must still be read.
-    const zero = parseGrokBilling({ config: { creditUsagePercent: 0 } });
+    const zero = parseCodexRateLimits("gpt", { primary: { usedPercent: 0, windowDurationMins: 10080, resetsAt: 1 } });
     expect(zero.ok).toBe(true);
     if (!zero.ok) return;
     expect(zero.buckets[0]?.remainingPercent).toBe(100);
@@ -805,87 +642,6 @@ describe("capacity review findings (#582)", () => {
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
     expect(parsed.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([["7d", 5]]);
-  });
-
-  it("folds product names that normalise together, keeping the tightest", () => {
-    // `Grok-Build`, `Grok Build` and `grok_build` are one id. The first won, so the 90% and
-    // 99% used rows vanished behind a 10% one.
-    const parsed = parseGrokBilling({
-      config: {
-        creditUsagePercent: 10,
-        productUsage: [
-          { product: "Grok-Build", usagePercent: 10 },
-          { product: "Grok Build", usagePercent: 90 },
-          { product: "grok_build", usagePercent: 99 },
-        ],
-      },
-    });
-    expect(parsed.ok).toBe(true);
-    if (!parsed.ok) return;
-    expect(parsed.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
-      ["credits", 90],
-      ["grok-build", 1],
-    ]);
-  });
-
-  it("reads the credential only from a file shaped like the CLI's own auth store", () => {
-    const root = tempDir("acp-grok-auth-guard-");
-    const write = (name: string, body: unknown): string => {
-      const at = join(root, name);
-      writeFileSync(at, JSON.stringify(body), { mode: 0o600 });
-      return at;
-    };
-    const scope = (id: string, key: string, createdAt: string): Record<string, unknown> => ({
-      [`https://auth.x.ai::${id}`]: { key, create_time: createdAt, auth_mode: "oidc" },
-    });
-
-    // The live shape: one scope entry keyed by the issuer.
-    const credential = "x".repeat(40);
-    expect(grokBearer(write("one.json", scope("a", credential, "2026-08-01T00:00:00.000Z")))).toBe(credential);
-
-    // Several scopes is normal — the CLI's own migration leaves a legacy entry behind — and
-    // refusing on that was a dead sensor for a file the CLI writes and calls healthy. The live
-    // credential is the most recently created.
-    const newest = "b".repeat(40);
-    expect(
-      grokBearer(
-        write("two.json", {
-          ...scope("a", "a".repeat(40), "2026-01-01T00:00:00.000Z"),
-          ...scope("b", newest, "2026-08-01T00:00:00.000Z"),
-        }),
-      ),
-    ).toBe(newest);
-
-    // Undated or tied entries leave no way to say which is current.
-    expect(grokBearer(write("undated.json", { ...scope("a", "a".repeat(40), "nonsense"), ...scope("b", "b".repeat(40), "2026-08-01T00:00:00.000Z") }))).toBeNull();
-
-    // A foreign secrets store, reached three ways. The first two are about the path; the third
-    // is not — a hard link *is* the file, so only what the file says can refuse it.
-    // Nested the way a real secrets store is, so what refuses it is the file's *shape* rather
-    // than a stricter check further down. A flat `{ key: … }` is rejected for the wrong reason.
-    const foreign = write("other-secrets.json", {
-      "signing-material": { key: "exfiltrated-other-secret-value-XXXXXXXX", create_time: "2026-08-01T00:00:00.000Z" },
-    });
-    const symlinked = join(root, "sym.json");
-    symlinkSync(foreign, symlinked);
-    expect(grokBearer(symlinked)).toBeNull();
-    const hardLinked = join(root, "hard.json");
-    linkSync(foreign, hardLinked);
-    expect(grokBearer(hardLinked)).toBeNull();
-    expect(grokBearer(foreign)).toBeNull();
-
-    // Non-files, including the one that used to block outside every timer this code has.
-    expect(grokBearer(root)).toBeNull();
-    expect(grokBearer("/dev/null")).toBeNull();
-    const fifo = join(root, "fifo.json");
-    boundedExecFileSync("mkfifo", [fifo], { timeout: QUICK_CHILD_BUDGET_MS });
-    const started = Date.now();
-    expect(grokBearer(fifo)).toBeNull();
-    expect(Date.now() - started).toBeLessThan(1_000);
-
-    // A value carrying CR/LF is quoted back verbatim by fetch's error, which is recorded in the
-    // reading, mirrored to disk, and served over the operator socket.
-    expect(grokBearer(write("crlf.json", scope("a", "xai-secret\r\nX-Inject: 1 aaaaaaaaaaaaaaaaaaaa", "2026-08-01T00:00:00.000Z")))).toBeNull();
   });
 
   it("answers a Codex stream whose ids are strings, and ignores an id it did not ask for", async () => {
@@ -921,7 +677,7 @@ describe("capacity review findings (#582)", () => {
 describe("interactive provider usage collectors", () => {
   it("normalises explicit quota windows, reset horizons, capabilities, and raw-output digest", async () => {
     // Through Codex: Claude reads its account non-interactively now, and this pins the
-    // terminal parser that Codex and Grok still use.
+    // terminal parser that Codex still uses.
     const collector = new CodexUsageCollector({
       clock: clock(),
       binary: "unused-by-injected-terminal",
@@ -985,7 +741,7 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
    */
   const CHA = (column: number) => `[${column}G`;
 
-  it("refuses live trust prompts from Claude and Grok rather than approving them", async () => {
+  it("refuses live trust prompts rather than approving them", async () => {
     const claude = await new CodexUsageCollector({
       clock: clock(),
       binary: "unused-by-injected-terminal",
@@ -993,13 +749,13 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
         `${CHA(3)}Quick${CHA(9)}safety${CHA(16)}check:${CHA(23)}Is this a project you trust?${CHA(3)}1. Yes, I trust this folder`,
       ),
     }).collect();
-    const grok = await new GrokUsageCollector({
+    const directory = await new CodexUsageCollector({
       clock: clock(),
       binary: "unused-by-injected-terminal",
       terminal: terminal(`${CHA(3)}Do${CHA(6)}you${CHA(10)}trust${CHA(16)}the contents of this directory?`),
     }).collect();
 
-    for (const reading of [claude, grok]) {
+    for (const reading of [claude, directory]) {
       expect(reading.sensorHealth).toBe("ERROR");
       expect(reading.buckets).toEqual([]);
       expect(reading.error).toContain("trust or approval");
@@ -1671,12 +1427,6 @@ setInterval(() => {}, 1_000);
         collector: (options: ConstructorParameters<typeof CodexUsageCollector>[0]) => new CodexUsageCollector(options),
         adapter: (options: ConstructorParameters<typeof CodexCliAdapter>[0]) => new CodexCliAdapter(options),
       },
-      {
-        provider: "grok" as const,
-        file: "grok.json",
-        collector: (options: ConstructorParameters<typeof GrokUsageCollector>[0]) => new GrokUsageCollector(options),
-        adapter: (options: ConstructorParameters<typeof GrokCliAdapter>[0]) => new GrokCliAdapter(options),
-      },
     ];
 
     for (const { provider, file, collector, adapter } of providers) {
@@ -1713,50 +1463,42 @@ setInterval(() => {}, 1_000);
     }
   });
 
-  it("registers Grok as optional adversarial capacity, never a required-role runtime", async () => {
-    const packetRoot = tempDir("acp-grok-optional-");
-    const adapter = new GrokCliAdapter({
-      clock: clock(),
-      capacityFile: join(packetRoot, "grok.json"),
-      binary: "grok-not-invoked-by-required-role-test",
-    });
-
-    expect(adapter.optionalAdversarialOnly).toBe(true);
-    await expect(adapter.startSession({
-      model: "grok",
-      workdir: packetRoot,
-      purpose: "blind-review",
-    })).rejects.toThrow(/optional adversarial review/);
-    const requiredRole = await adapter.invoke({
-      prompt: "Perform a required control-plane role.",
-      workdir: packetRoot,
-      timeoutMs: 1_000,
-      readOnly: true,
-      correlationId: "grok-required-role-refusal",
-    });
-    expect(requiredRole).toMatchObject({ ok: false, isolationAttested: false });
-    expect(requiredRole.error).toContain("optional adversarial-review only");
-    // Removing either refusal lets a third provider silently become required-role
-    // capacity, which violates the collector-only diversity contract.
-  });
-
-  it("installs all three live collectors in the production default registry", () => {
+  it("installs the two live collectors in the production default registry and refuses grok by name", () => {
     const root = tempDir("acp-default-provider-collectors-");
+    // A project that names grok as its Blind Reviewer, in the file production reads.
+    const preferences = join(root, "reviewer-preferences.json");
+    writeFileSync(preferences, JSON.stringify({ "names-grok": { provider: "grok", model: "grok-4", effort: null } }));
     const cp = new ControlPlane({
       databasePath: join(root, "state.sqlite"),
       worktreeRoot: join(root, "worktrees"),
       capacityDir: join(root, "capacity"),
       secretsDir: join(root, "secrets"),
       clock: clock(),
+      reviewerPreferencesFile: readProjectReviewerFile(preferences),
     });
     try {
-      expect(cp.providers.list().map((adapter) => adapter.provider).sort()).toEqual(["claude", "gpt", "grok"]);
-      expect(cp.providers.require("grok").optionalAdversarialOnly).toBe(true);
+      expect(cp.providers.list().map((adapter) => adapter.provider).sort()).toEqual(["claude", "gpt"]);
+      // Grok is not a provider. Asked for by name, in any role, the registry refuses; no other
+      // provider's adapter answers in its place.
+      expect(() => cp.providers.require("grok")).toThrow("no adapter registered for provider 'grok'");
+      expect(cp.providers.representative("grok")).toBeNull();
+      for (const role of Object.values(Role)) {
+        expect(() => cp.providers.requireForRole("grok", role)).toThrow(
+          `no adapter registered for provider 'grok' in role '${role}'`,
+        );
+      }
+      // The project entry is refused, named and recorded, never moved onto another provider.
+      expect(cp.review["preferences"].projects).toBeUndefined();
+      expect(cp.audit.byKind("REVIEWER_PREFERENCES_REFUSED")).toEqual([expect.objectContaining({
+        reasonCode: ReasonCode.REVIEWER_PREFERENCES_INVALID,
+        evidence: expect.objectContaining({
+          path: preferences,
+          reason: "project names-grok names provider grok, which is not registered for BLIND_REVIEWER with reviewer isolation",
+        }),
+      })]);
     } finally {
       cp.close();
     }
-    // Deleting Grok from the composition root turns this into a two-provider registry;
-    // merely defining a collector elsewhere is not enough to satisfy P0-11.
   });
 
   it("doctor reads role-scoped telemetry without requiring a shared sensor mirror", async () => {
@@ -1812,7 +1554,7 @@ setInterval(() => {}, 1_000);
     const binDirectory = join(root, "pinned");
     mkdirSync(binDirectory, { recursive: true });
     const pins: Record<string, string> = {};
-    for (const name of ["claude", "codex", "grok"]) {
+    for (const name of ["claude", "codex"]) {
       const path = join(binDirectory, name);
       writeFileSync(path, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
       chmodSync(path, 0o755);
@@ -1828,7 +1570,7 @@ setInterval(() => {}, 1_000);
     pins: Record<string, string | undefined>,
     body: (spawned: string[]) => Promise<void>,
   ): Promise<void> => {
-    const variables = { claude: "ACP_CLAUDE_BINARY", codex: "ACP_CODEX_BINARY", grok: "ACP_GROK_BINARY" };
+    const variables = { claude: "ACP_CLAUDE_BINARY", codex: "ACP_CODEX_BINARY" };
     const before: Record<string, string | undefined> = {};
     for (const [name, variable] of Object.entries(variables)) {
       before[variable] = process.env[variable];
@@ -1866,7 +1608,7 @@ setInterval(() => {}, 1_000);
     // `representative`, not `require`: this probes the *binary* each provider was pinned to, which
     // is a provider-level fact. `require` refuses a role-less caller by design (#512), and after
     // #917 registered Claude per role that refusal is what this loop would hit.
-    for (const provider of ["claude", "gpt", "grok"]) {
+    for (const provider of ["claude", "gpt"]) {
       const adapter = cp.providers.representative(provider);
       if (!adapter) throw new Error(`no adapter enumerated for ${provider}`);
       await adapter.probeRuntime();
@@ -1884,7 +1626,6 @@ setInterval(() => {}, 1_000);
         expect(spawned).toEqual([
           pins["claude"] as string,
           pins["codex"] as string,
-          pins["grok"] as string,
         ]);
         // Never a bare name: that is the state the pins exist to end.
         for (const file of spawned) expect(file.startsWith("/")).toBe(true);
@@ -1906,9 +1647,8 @@ setInterval(() => {}, 1_000);
       try {
         await probeAll(cp);
         expect(spawned[0], "the environment pin overrode an explicit configuration").toBe(configured);
-        // And only the key it named: the other two still come from the environment.
+        // And only the key it named: the other still comes from the environment.
         expect(spawned[1]).toBe(pins["codex"] as string);
-        expect(spawned[2]).toBe(pins["grok"] as string);
       } finally {
         cp.close();
       }
@@ -1924,7 +1664,7 @@ setInterval(() => {}, 1_000);
     const searchable = join(root, "searchable");
     mkdirSync(searchable, { recursive: true });
     const onPath: Record<string, string> = {};
-    for (const name of ["claude", "codex", "grok"]) {
+    for (const name of ["claude", "codex"]) {
       const path = join(searchable, name);
       writeFileSync(path, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
       chmodSync(path, 0o755);
@@ -1943,7 +1683,7 @@ setInterval(() => {}, 1_000);
         const cp = controlPlaneAt(root);
         try {
           await probeAll(cp);
-          expect(spawned).toEqual([onPath["claude"], onPath["codex"], onPath["grok"]]);
+          expect(spawned).toEqual([onPath["claude"], onPath["codex"]]);
         } finally {
           cp.close();
         }
@@ -1956,7 +1696,7 @@ setInterval(() => {}, 1_000);
         const cp = controlPlaneAt(join(root, "second"));
         try {
           await probeAll(cp);
-          expect(spawned).toEqual(["claude", "codex", "grok"]);
+          expect(spawned).toEqual(["claude", "codex"]);
         } finally {
           cp.close();
         }

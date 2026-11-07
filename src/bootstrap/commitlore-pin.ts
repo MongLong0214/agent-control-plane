@@ -12,7 +12,7 @@ import type { CommitLoreRun, CommitLoreRunner } from "./commitlore-observation.t
  * Slice S16 (#246 B3) — the one setting that selects the `commitlore` a bootstrap runs.
  *
  * `ACP_COMMITLORE_BINARY`, named by the convention the provider CLIs' pins follow (`ACP_CLAUDE_BINARY`,
- * `ACP_CODEX_BINARY`, `ACP_GROK_BINARY`), and it is the only one: nothing searches PATH, and there is no
+ * `ACP_CODEX_BINARY`), and it is the only one: nothing searches PATH, and there is no
  * alias and no fallback. The daemon's launcher PATH holds no user directory by policy, so a CLI found by
  * searching it would be whichever one happened to be there; a pin says which one.
  *

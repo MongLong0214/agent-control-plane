@@ -39,7 +39,6 @@ import { Role } from "../domain/types.ts";
 import {
   ClaudeUsageCollector,
   CodexUsageCollector,
-  GrokUsageCollector,
   CodexAppServerFailed,
   SpawnCodexRateLimitProbe,
   type CodexAppServerLaunch,
@@ -795,8 +794,8 @@ const productionRunCli = async (
     /**
      * The configured Codex account. Set on the child as `CODEX_HOME` for the worker login probe
      * and the worker execution, the same directory `CodexUsageCollector` reads. Unset leaves the
-     * constructor's account selection alone (Claude, Grok, and the packet reviewer, which names
-     * its home on `reviewerEnvironment`).
+     * constructor's account selection alone (Claude, and the packet reviewer, which names its
+     * home on `reviewerEnvironment`).
      */
     codexHome?: string;
     /**
@@ -3928,108 +3927,6 @@ export class CodexCliAdapter implements ProviderAdapter {
         ? [...constituted.bootstrapEgressEvidence, ...(result.egressEvidence ?? [])]
         : undefined,
     };
-  }
-}
-
-/**
- * Grok is deliberately a sensor and optional diversity provider, not a critical-path
- * fallback. Its collector is real, while any attempted required-role invocation is
- * refused at the adapter boundary.
- */
-export class GrokCliAdapter implements ProviderAdapter {
-  readonly provider = "grok";
-  readonly isProduction = true;
-  readonly optionalAdversarialOnly = true;
-  readonly supportsReviewerIsolation = false;
-  readonly defaultModels = { reviewer: "grok", adversarialReviewer: "grok" } as const;
-
-  readonly #binary: string;
-  readonly #clock: Clock;
-  readonly #denyReadPaths: readonly string[];
-  readonly #providerCredentialDir: string | undefined;
-  readonly #usageCollector: UsageCollector;
-
-  constructor(options: CliAdapterOptions) {
-    this.#binary = resolveExecutable(options.binary ?? "grok");
-    this.#clock = options.clock;
-    this.#denyReadPaths = [options.capacityFile, ...(options.denyReadPaths ?? [])];
-    this.#providerCredentialDir = options.providerCredentialDir;
-    // The capacity probe deliberately does *not* take `providerCredentialDir`.
-    //
-    // That option exists to keep the sandbox's keychain deny from being self-defeating: a
-    // session runs under seatbelt with the host keychain closed, so it needs a dedicated
-    // store to authenticate from (see the option's own documentation above). The probe has
-    // neither half of that problem — `ExpectUsageTerminal` spawns `/usr/bin/expect`
-    // directly, with no profile, so the keychain is reachable.
-    //
-    // Passing it anyway sets `CLAUDE_SECURESTORAGE_CONFIG_DIR`, which switches the CLI from
-    // the keychain to a file store in that directory. No such store is populated, so every
-    // probe read an unauthenticated screen with no quota on it — 28 lines instead of 41,
-    // for months (#564). The setting solved a problem this path does not have and broke the
-    // one thing it does.
-    //
-    // Session isolation is untouched: `runtimeEnvironment` and the seatbelt profile still
-    // receive it, and no profile deny is relaxed.
-    this.#usageCollector = options.usageCollector ?? new GrokUsageCollector({
-      clock: this.#clock,
-      binary: this.#binary,
-    });
-  }
-
-  /**
-   * The pin this adapter will spawn, as it holds it.
-   *
-   * Uncanonicalised on purpose, and fixed for the adapter's life: `resolveExecutable` runs once in
-   * the constructor. See `ClaudeCliAdapter.executablePath` for #954, the failure that made this
-   * readable at all.
-   */
-  get executablePath(): string {
-    return this.#binary;
-  }
-
-  async startSession(spec: SessionSpec): Promise<SessionHandle> {
-    void spec;
-    throw new ProviderSessionProvisionError(
-      ReasonCode.ISOLATION_LOST,
-      "Grok is registered only for optional adversarial review and cannot constitute a required role",
-    );
-  }
-
-  async stopSession(): Promise<void> {
-    /* Grok never owns a required control-plane session. */
-  }
-
-  async invoke(request: InvocationRequest): Promise<InvocationResult> {
-    return refusedInvocation(
-      request,
-      this.provider,
-      request.model ?? this.defaultModels.adversarialReviewer,
-      Date.now(),
-      "Grok is optional adversarial-review only; required-role invocation is refused",
-    );
-  }
-
-  async probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
-    return collapseUnmeasuredRuntime(await this.measureRuntime());
-  }
-
-  private async measureRuntime(): Promise<CapacityReading["runtimeHealth"]> {
-    return measuredRuntimeHealth(
-      await runCli(this.#binary, ["--version"], {
-        cwd: process.cwd(),
-        timeoutMs: RUNTIME_PROBE_TIMEOUT_MS,
-        denyReadPaths: this.#denyReadPaths,
-        providerCredentialDir: this.#providerCredentialDir,
-      }),
-    );
-  }
-
-  async probeSession(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
-    return "UNAVAILABLE";
-  }
-
-  async probeCapacity(): Promise<CapacityReading> {
-    return resolveRuntimeHealth(await this.#usageCollector.collect(), () => this.measureRuntime());
   }
 }
 

@@ -84,16 +84,12 @@ export interface RoleCoveragePlan {
   restorationPending: string[];
   providers: Array<{
     provider: string;
-    optional: boolean;
     admission: string;
     runtimeHealth: string;
     advisoryState: string;
   }>;
   computedAt: string;
 }
-
-/** §14.5 — Grok is an optional adversarial reviewer and never a critical dependency. */
-const OPTIONAL_PROVIDERS: ReadonlySet<string> = new Set(["grok"]);
 
 /**
  * The revocation reasons continuity writes when it could not put a provider behind a bound role
@@ -411,9 +407,7 @@ export class ContinuityKernel {
     const registered = [...productionProviders];
     const candidatesFor = (capability: string): string[] => {
       const ranked = (PREFERENCE[capability] ?? []).filter((p) => byProvider.has(p) || registered.includes(p));
-      // §14.5 — an optional provider never becomes coverage on its own. It is a
-      // candidate only where the preference table names it explicitly.
-      const rest = registered.filter((p) => !ranked.includes(p) && !OPTIONAL_PROVIDERS.has(p));
+      const rest = registered.filter((p) => !ranked.includes(p));
       return [...ranked, ...rest];
     };
 
@@ -488,10 +482,9 @@ export class ContinuityKernel {
     const anyFallback = assignments.some((a) => a.reason === "fallback");
     const requiredProvidersDown = [...byProvider.values()].filter(
       (c) =>
-        !OPTIONAL_PROVIDERS.has(c.provider) &&
-        (c.allocationAdmission === "SUSPENDED" ||
-          c.runtimeHealth === "UNAVAILABLE" ||
-          c.runtimeHealth === "UNKNOWN"),
+        c.allocationAdmission === "SUSPENDED" ||
+        c.runtimeHealth === "UNAVAILABLE" ||
+        c.runtimeHealth === "UNKNOWN",
     );
 
     const activeFallback = requiredRoles.some((role) => this.bindings.active(role.roleKey)?.mode === "FALLBACK");
@@ -514,7 +507,6 @@ export class ContinuityKernel {
       restorationPending,
       providers: [...byProvider.values()].map((c) => ({
         provider: c.provider,
-        optional: OPTIONAL_PROVIDERS.has(c.provider),
         admission: c.allocationAdmission,
         runtimeHealth: c.runtimeHealth,
         advisoryState: c.advisoryState,

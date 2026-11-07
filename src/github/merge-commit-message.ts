@@ -69,9 +69,9 @@ export interface BranchCommitMessage {
  * Deliberately short and literal. Each is a key whose whole purpose is to name a session or the
  * agent that held it, so removing the line loses nothing else. `Claude-Session` and
  * `X-Claude-Session` are the two shapes measured on this repository's open branches; the rest are
- * the same construction for the other agents this daemon launches (`ACP_CODEX_BINARY`,
- * `ACP_GROK_BINARY`) and the generic form, so that the next tool to adopt the convention is
- * already covered.
+ * the same construction for Codex, the other agent this daemon launches (`ACP_CODEX_BINARY`), for
+ * Grok, whose session lines a commit can still carry although this daemon no longer launches it,
+ * and the generic form, so that the next tool to adopt the convention is already covered.
  *
  * Not included, on purpose:
  *   - `Co-Authored-By`, which is a legitimate key naming humans. Excluding it by identity would

@@ -8,7 +8,7 @@ import { type Clock, ManualClock } from "../../src/core/clock.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import type { Finding } from "../../src/doctor/doctor.ts";
-import { ClaudeCliAdapter, CodexCliAdapter, GrokCliAdapter } from "../../src/runtime/cli-adapters.ts";
+import { ClaudeCliAdapter, CodexCliAdapter } from "../../src/runtime/cli-adapters.ts";
 import { ProviderRegistry } from "../../src/runtime/provider.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
@@ -178,8 +178,8 @@ describe("the doctor reads the pin it will spawn", () => {
   });
 
   it("is the pin the real CLI adapters resolved, carried through the registry's wrapper", () => {
-    // Every other row here drives a test double, so without this one the three shipped adapters
-    // could all answer `undefined` and the suite would stay green while the check went silent on
+    // Every other row here drives a test double, so without this one the two shipped adapters
+    // could both answer `undefined` and the suite would stay green while the check went silent on
     // the only deployment it exists for. The registry compounds that: `production()` hands out
     // `CapacityObservedAdapter`, so the wrapper has to carry the pin too or the doctor asks the
     // wrong object.
@@ -188,7 +188,6 @@ describe("the doctor reads the pin it will spawn", () => {
     for (const adapter of [
       new ClaudeCliAdapter({ clock: harness.clock, capacityFile: join(harness.root, "claude.json"), binary: pin }),
       new CodexCliAdapter({ clock: harness.clock, capacityFile: join(harness.root, "codex.json"), binary: pin }),
-      new GrokCliAdapter({ clock: harness.clock, capacityFile: join(harness.root, "grok.json"), binary: pin }),
     ]) {
       // The pin itself, uncanonicalised. This asserted `realpathSync(pin)` until #998 landed, and
       // the merge turned it red: `resolveExecutable` now returns `resolve(...)` at both sites, so a
@@ -204,7 +203,7 @@ describe("the doctor reads the pin it will spawn", () => {
   });
 
   it("names the environment variable each provider's pin is actually read from", async () => {
-    // `ACP_` + the upper-cased provider id + `_BINARY` is the right answer for two of these three,
+    // `ACP_` + the upper-cased provider id + `_BINARY` is the right answer for one of these two,
     // which is exactly what makes deriving the name read as correct. `CodexCliAdapter.provider` is
     // `"gpt"`, and the variable `ControlPlane` reads its pin from is `ACP_CODEX_BINARY`
     // (`control-plane.ts:753`). `ACP_GPT_BINARY` occurs nowhere in this repository, so a derived
@@ -226,11 +225,6 @@ describe("the doctor reads the pin it will spawn", () => {
         provider: new CodexCliAdapter({ clock: harness.clock, capacityFile: join(harness.root, "codex.json"), binary: pin })
           .provider,
         variable: "ACP_CODEX_BINARY",
-      },
-      {
-        provider: new GrokCliAdapter({ clock: harness.clock, capacityFile: join(harness.root, "grok.json"), binary: pin })
-          .provider,
-        variable: "ACP_GROK_BINARY",
       },
     ];
 
@@ -363,10 +357,9 @@ describe("the doctor reads the pin it will spawn", () => {
     // that directory as NOT_A_FILE and sent the operator to repair a path nobody configured.
     const root = tempDir("acp-empty-provider-pin-");
     const codexPin = executableAt(join(root, "pinned"), "codex");
-    const grokPin = executableAt(join(root, "pinned"), "grok");
 
     await withPins(
-      { ACP_CLAUDE_BINARY: "", ACP_CODEX_BINARY: codexPin, ACP_GROK_BINARY: grokPin },
+      { ACP_CLAUDE_BINARY: "", ACP_CODEX_BINARY: codexPin },
       async () => {
         const cp = new ControlPlane({
           databasePath: join(root, "state.sqlite"),
@@ -412,10 +405,9 @@ describe("the doctor reads the pin it will spawn", () => {
     const root = tempDir("acp-pin-composed-");
     const claudePin = prunedVersionPin();
     const codexPin = executableAt(join(root, "pinned"), "codex");
-    const grokPin = executableAt(join(root, "pinned"), "grok");
 
     await withPins(
-      { ACP_CLAUDE_BINARY: claudePin, ACP_CODEX_BINARY: codexPin, ACP_GROK_BINARY: grokPin },
+      { ACP_CLAUDE_BINARY: claudePin, ACP_CODEX_BINARY: codexPin },
       async () => {
         const cp = new ControlPlane({
           databasePath: join(root, "state.sqlite"),
@@ -430,7 +422,6 @@ describe("the doctor reads the pin it will spawn", () => {
           expect(cp.providers.list().map((adapter) => adapter.provider).sort()).toEqual([
             "claude",
             "gpt",
-            "grok",
           ]);
           expect(cp.providers.production().map((adapter) => adapter.provider)).not.toContain("claude");
 

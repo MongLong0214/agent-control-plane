@@ -64,7 +64,6 @@ describe.skipIf(!LIVE)("C1b live: a real headless BOOTSTRAP_CTO", () => {
     const collectors: Record<string, UsageCollector> = {
       claude: { collect: async () => reading("claude", claudeUp.value) },
       gpt: { collect: async () => reading("gpt", false) },
-      grok: { collect: async () => reading("grok", false) },
     };
     const root = realpathSync(tempDir("acp-c1b-live-"));
     const stateDir = join(root, "state");
@@ -76,7 +75,6 @@ describe.skipIf(!LIVE)("C1b live: a real headless BOOTSTRAP_CTO", () => {
       adapterOptions: {
         claude: { usageCollector: collectors["claude"]!, binary: process.env["ACP_CLAUDE_BINARY"] ?? "claude" },
         gpt: { usageCollector: collectors["gpt"]!, binary: "/nonexistent/codex" },
-        grok: { usageCollector: collectors["grok"]!, binary: "/nonexistent/grok" },
       },
     });
     const launch = await startSessionLaunchChannel(stateDir, { mcpToken: TOKEN });

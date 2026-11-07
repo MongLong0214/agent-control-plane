@@ -127,7 +127,7 @@ const prepared = async () => {
 
 type Prepared = Awaited<ReturnType<typeof prepared>>;
 
-/** A registered reviewer adapter that cannot enforce reviewer isolation, as production's grok adapter. */
+/** A registered reviewer adapter that cannot enforce reviewer isolation. */
 class NoIsolationAdapter extends TestProductionAdapter {
   readonly supportsReviewerIsolation = false;
 }
@@ -304,8 +304,7 @@ describe("the daemon's reviewer preference file", () => {
 
   it.each([
     ["a provider no adapter is registered for", "nonesuch"],
-    // Production registers grok without a role and its adapter cannot isolate a reviewer.
-    ["a registered provider that cannot isolate a reviewer", "grok"],
+    ["a registered provider that cannot isolate a reviewer", "no-isolation"],
   ])("4: a control plane given %s applies nothing, audits the refusal and reports a doctor finding", (_label, provider) => {
     const root = tempDir("acp-reviewer-pref-cp-");
     const file = join(root, "reviewer-preferences.json");
@@ -317,14 +316,14 @@ describe("the daemon's reviewer preference file", () => {
       capacityDir: join(root, "capacity"),
       secretsDir: join(root, "secrets"),
       clock,
-      adapters: [new TestProductionAdapter(clock, "gpt"), new TestProductionAdapter(clock, "claude"), new NoIsolationAdapter(clock, "grok")],
+      adapters: [new TestProductionAdapter(clock, "gpt"), new TestProductionAdapter(clock, "claude"), new NoIsolationAdapter(clock, "no-isolation")],
       allowNonProductionAdapters: true,
       reviewerPreferencesFile: readProjectReviewerFile(file),
     });
 
     const refused = open();
     try {
-      expect(() => refused.providers.requireForRole("grok", Role.BLIND_REVIEWER)).not.toThrow();
+      expect(() => refused.providers.requireForRole("no-isolation", Role.BLIND_REVIEWER)).not.toThrow();
       expect(() => refused.providers.requireForRole("nonesuch", Role.BLIND_REVIEWER)).toThrow();
       // The default applies: no project entry, the global preferred and fallbacks as they were.
       const preferences = refused.review["preferences"];

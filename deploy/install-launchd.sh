@@ -332,7 +332,7 @@ resolve_buzz_binary() {
 }
 
 # `resolveExecutable` (src/runtime/cli-adapters.ts) searches the daemon's PATH for the bare names
-# `claude`, `codex` and `grok`. The launcher pins that PATH to a fixed set of directories, so a
+# `claude` and `codex`. The launcher pins that PATH to a fixed set of directories, so a
 # CLI installed anywhere else is unreachable to the daemon while remaining reachable from the
 # shell that installs it. An unresolvable CLI returns as a bare name, nothing spawns, and the
 # capacity parser has no representation for "the CLI was not there" — it reports the empty stream
@@ -378,10 +378,10 @@ write_launcher() {
   # Resolved before the launcher is opened for writing, because stdout inside the block below is
   # the launcher file and an unresolvable CLI has to reach the operator's terminal instead.
   #
-  # A CLI that cannot be resolved does not fail the install: `grok` is optional, and a host
-  # without it must still be able to deploy. It is named on stderr instead, because a provider
-  # whose CLI is absent reports no quota rather than an error, which is indistinguishable from a
-  # provider that is simply out of quota unless the install says so.
+  # A CLI that cannot be resolved does not fail the install: a host without one must still be able
+  # to deploy. It is named on stderr instead, because a provider whose CLI is absent reports no
+  # quota rather than an error, which is indistinguishable from a provider that is simply out of
+  # quota unless the install says so.
   #
   # `commitlore` is resolved by the same rule (#246 B3). The daemon runs a bootstrap's CommitLore only
   # from ACP_COMMITLORE_BINARY, an explicit absolute path, and searches no PATH for it
@@ -393,7 +393,7 @@ write_launcher() {
   # ACP_COMMITLORE_BINARY, which the launcher reads on every launch and which wins over it.
   local spec cli pin_variable resolved_cli
   local cli_pins=()
-  for spec in claude:ACP_RESOLVED_CLAUDE_BINARY codex:ACP_RESOLVED_CODEX_BINARY grok:ACP_RESOLVED_GROK_BINARY \
+  for spec in claude:ACP_RESOLVED_CLAUDE_BINARY codex:ACP_RESOLVED_CODEX_BINARY \
     commitlore:ACP_RESOLVED_COMMITLORE_BINARY; do
     cli="${spec%%:*}"
     pin_variable="${spec##*:}"
@@ -424,7 +424,7 @@ write_launcher() {
     # below would consume a value of that name inherited from launchd (`launchctl setenv`) — a pin no
     # operator stored and no install resolved. Cleared before the baked lines, so each resolved pin is
     # exactly what this install wrote, or nothing. (CommitLore since #1152; the others since its sibling.)
-    printf 'unset ACP_RESOLVED_BUZZ_BINARY ACP_RESOLVED_CLAUDE_BINARY ACP_RESOLVED_CODEX_BINARY ACP_RESOLVED_GROK_BINARY ACP_RESOLVED_COMMITLORE_BINARY\n'
+    printf 'unset ACP_RESOLVED_BUZZ_BINARY ACP_RESOLVED_CLAUDE_BINARY ACP_RESOLVED_CODEX_BINARY ACP_RESOLVED_COMMITLORE_BINARY\n'
     local resolved_buzz=""
     resolved_buzz="$(resolve_buzz_binary)"
     if [[ -n "$resolved_buzz" ]]; then
@@ -601,9 +601,6 @@ if [[ -z "${ACP_CLAUDE_BINARY:-}" && -n "${ACP_RESOLVED_CLAUDE_BINARY:-}" ]]; th
 fi
 if [[ -z "${ACP_CODEX_BINARY:-}" && -n "${ACP_RESOLVED_CODEX_BINARY:-}" ]]; then
   export ACP_CODEX_BINARY="$ACP_RESOLVED_CODEX_BINARY"
-fi
-if [[ -z "${ACP_GROK_BINARY:-}" && -n "${ACP_RESOLVED_GROK_BINARY:-}" ]]; then
-  export ACP_GROK_BINARY="$ACP_RESOLVED_GROK_BINARY"
 fi
 # The CommitLore CLI (#246 B3). ACP_COMMITLORE_BINARY is the only input the daemon reads for it, and the
 # daemon searches no PATH for it. The operator's persistent value is the Keychain item of that name: it

@@ -1,6 +1,6 @@
 # ADR-0007 — Capacity is event-driven and three-signalled; there is no UNKNOWN route
 
-- **Status:** Accepted
+- **Status:** Accepted; revised 2026-11-07 (Grok removed)
 - **Date:** 2026-08-12
 - **Drivers:** PRD §14, §15, CP-S16–CP-S24
 
@@ -35,6 +35,11 @@ reviews. No hard-coded 30%.
 yields FULL / PARTIAL / NO_VALID_COVERAGE plus an action
 (WAIT_FOR_RESET, FALLBACK_ROLE, PAUSE_NEW_WORK, OWNER_APPROVED_PROJECT_SUSPEND,
 SURVIVAL). Grok's absence alone never degrades the mode — it is optional by contract.
+
+> **Amended 2026-11-07.** ACP no longer supports Grok. No provider is optional to the coverage
+> plan any more, and a project or role that names `grok` is refused as a provider that is not
+> registered rather than moved onto another one. The sentence above describes the provider set
+> this ADR was accepted with.
 
 **Restoration never preempts.** A recovered preferred provider takes new work only; the
 in-flight reviewer finishes, the acting CTO drains to zero runs first
