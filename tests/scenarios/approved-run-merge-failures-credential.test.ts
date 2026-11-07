@@ -508,6 +508,61 @@ describe("#1189 §0 — an approved run never waits on a person for a GitHub cre
     await restarted.stop();
   });
 
+  it.each([
+    ["no CEO is bound", "unbound"],
+    ["the outbox refuses the notice", "refused"],
+  ] as const)("a refusal whose text is credential-shaped, at the bound while %s: the run ends FAILED, a minimal secret-free notice stays owed, and it is sent once", async (_label, variant) => {
+    // Built at run time, so this file holds no token-shaped literal.
+    const secret = ["ghp", "_", "a1B2c3D4".repeat(4)].join("");
+    const fixture = await approved();
+    const { harness, driven } = fixture;
+    vi.spyOn(harness.cp.credentials, "authenticate").mockImplementation(async () =>
+      deny(PERMISSION, `GitHub App permissions do not match any approved grant shape for installation token ${secret}`, {}));
+    const enqueue = harness.cp.outbox.enqueue.bind(harness.cp.outbox);
+    const refusing = variant === "refused"
+      ? vi.spyOn(harness.cp.outbox, "enqueue").mockImplementation((message) => message.kind === "CEO_NOTIFICATION"
+        ? deny(ReasonCode.OUTBOX_TARGET_NOT_CURRENT, "the outbox refused the notice", {})
+        : enqueue(message))
+      : null;
+    expect(await start(fixture.daemon)).toBe(true);
+    if (variant === "unbound") expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "the CEO seat is vacated").allowed).toBe(true);
+    await sweepThroughTheCap(fixture);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.FAILED);
+    expect(failureNotices(fixture)).toHaveLength(0);
+    // The audit log's refusal of the full notice is on record as such; the obligation is the record that says `delivered`.
+    const owed = () => auditOf(fixture, "FINALIZATION_FAILED_NOTICE").filter((entry) => "delivered" in entry.evidence)
+      .map((entry) => entry.evidence.delivered);
+    expect(owed()).toEqual([false]);
+    refusing?.mockRestore();
+    const ceoSessionId = variant === "unbound" ? bindCeo(harness) : harness.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId;
+    const atFailure = transitions(fixture);
+    await sweepThroughTheCap(fixture);
+    await fixture.daemon.stop();
+    const restarted = newDaemon(harness);
+    expect(await start(restarted)).toBe(true);
+    await sweepThroughTheCap(fixture, restarted);
+    const notices = failureNotices(fixture);
+    expect(notices.map((notice) => notice.target)).toEqual([ceoSessionId]);
+    expect(notices[0]!.payload).toMatchObject({
+      runId: driven.runId, candidateSnapshotDigest: driven.candidateSnapshotDigest, failureReasonCode: PERMISSION, failureCause: PERMISSION,
+      limit: "FAILURE", outcome: "FAILED", merged: false, owner: "CEO", refusals: 2, failureRetryCap: 1, retryCap: FINALIZATION_RETRY_CAP,
+      blocker: expect.stringMatching(/^GITHUB_APP_PERMISSION_DENIED: /),
+    });
+    expect(owed()).toEqual([false, true]);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.FAILED);
+    expect(transitions(fixture)).toEqual(atFailure);
+    const stored = harness.cp.db.all<{ evidence_json: string }>(
+      "SELECT evidence_json FROM audit_events WHERE run_id = ? AND kind = 'FINALIZATION_FAILED_NOTICE'", [driven.runId]);
+    expect(stored.length).toBeGreaterThan(0);
+    for (const row of stored) expect(row.evidence_json).not.toContain(secret);
+    const sent = harness.cp.db.all<{ payload_json: string }>(
+      "SELECT payload_json FROM outbox WHERE run_id = ? AND kind = 'CEO_NOTIFICATION'", [driven.runId]);
+    expect(sent.filter((row) => (JSON.parse(row.payload_json) as Record<string, unknown>).notification === "CRITICAL_SYSTEM_FAILURE")).toHaveLength(1);
+    for (const row of sent) expect(row.payload_json).not.toContain(secret);
+    expectNothingMerged(fixture);
+    await restarted.stop();
+  });
+
   it("credential unavailable through the cap while no CEO is bound: the run still ends FAILED, its notice is owed, and the CEO bound later is told once", async () => {
     const fixture = await approved(credentialThrowWhile(() => true));
     const { harness, driven, daemon } = fixture;
