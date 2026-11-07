@@ -112,6 +112,26 @@ export const ReasonCode = {
    * before review or publication, naming the task and each such path.
    */
   CANDIDATE_MISSING_TASK_CHANGE: "CANDIDATE_MISSING_TASK_CHANGE",
+  /**
+   * #1268 — a freeze of a run whose contract requires CommitLore found a commit between the base it froze and
+   * the exact head it froze that is neither one of this run's SUCCEEDED worker commits whose CommitLore evidence
+   * names exactly the commit's own `Record-Id` trailers, nor an integration merge this freeze's CommitLore check
+   * was bound to (that commit, its parents in order, its tree and its message). Refused before anything is
+   * written, naming the first such commit and why (`refusal`).
+   */
+  CANDIDATE_FOREIGN_COMMIT: "CANDIDATE_FOREIGN_COMMIT",
+  /**
+   * #1268 — the same freeze could not establish that range: the frozen base is not an ancestor of the frozen
+   * head (`refusal: BASE_NOT_ANCESTOR`), or a commit object of it could not be read (`OBJECT_UNREADABLE`).
+   * Refused before anything is written.
+   */
+  CANDIDATE_RANGE_UNVERIFIABLE: "CANDIDATE_RANGE_UNVERIFIABLE",
+  /**
+   * #1268 — the same freeze re-read a checkout's HEAD after its CommitLore range check and found it is not the
+   * HEAD the candidate was frozen from, so the head checked would not be the one frozen. Refused before anything
+   * is written; a new freeze reads the checkout again.
+   */
+  CANDIDATE_HEAD_MOVED: "CANDIDATE_HEAD_MOVED",
 
   // --- CP-HI-07 Human Role ------------------------------------------------
   OWNER_AUTHORITY_NOT_DELEGABLE: "OWNER_AUTHORITY_NOT_DELEGABLE",
