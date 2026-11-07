@@ -5370,6 +5370,14 @@ export class GitHubKernel {
       creatorIdentity: this.credentials.creatorIdentity(),
     };
   }
+
+  /**
+   * The CEO's `pr_evidence_get` reads GitHub through this and nothing else: the kernel's own client and
+   * App credential, with GET as the only method there is to call.
+   */
+  readOnlyGitHub(): { get<T>(path: string): Promise<T> } {
+    return Object.freeze({ get: <T>(path: string): Promise<T> => this.api().request<T>("GET", path) });
+  }
 }
 
 /** One approved Actions workflow: the check it reports and the SHA-256 its bytes were approved at. */
