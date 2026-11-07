@@ -1,13 +1,31 @@
 import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
 import {
+  BEFORE_CHANGE_CONCURRENCY,
+  BEFORE_CHANGE_LOOKUP_MS,
+  BEFORE_CHANGE_MAX_PATHS,
   type CommitLoreAttempt,
   type CommitLoreConsidered,
   type CommitLoreSettled,
   COMMITLORE_DRAFT_FENCE,
+  COMMITLORE_SUPPLEMENT_FIELD,
+  beforeChangeCoverage,
+  beforeChangeProposal,
+  beforeChangeSection,
+  boundSupplements,
   draftFromReply,
+  withoutSupplement,
   workerCommitLoreSection,
 } from "../bootstrap/commitlore-commit.ts";
-import { type CommitLorePort, commitloreGoverned, createCommitLoreCliPort } from "../bootstrap/commitlore-observation.ts";
+import {
+  type CommitLoreBeforeChange,
+  type CommitLoreGuardLookup,
+  type CommitLoreLookupEvent,
+  type CommitLorePathLookup,
+  type CommitLorePort,
+  commitloreGoverned,
+  commitloreRunMode,
+  createCommitLoreCliPort,
+} from "../bootstrap/commitlore-observation.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { allow, deny, isAcpError, type Decision, type Evidence } from "../core/errors.ts";
@@ -267,6 +285,11 @@ export interface WorkerTurnOptions {
    * turn is refused before it starts. A turn whose run requires nothing of CommitLore never asks it.
    */
   commitlore?: CommitLorePort | null;
+  /**
+   * #1268 — the one deadline for the CommitLore lookup a turn of a `required` or `preferred` run makes before
+   * its worker launches (`BEFORE_CHANGE_LOOKUP_MS`). Whatever has not answered by then is a failed lookup.
+   */
+  commitloreLookupMs?: number;
 }
 
 /** Ports the runner needs; the composition root supplies them, none is a service it could misuse. */
@@ -342,6 +365,12 @@ interface TurnFacts extends DurableFacts {
    * pinned manifest requires CommitLore; null when it requires nothing of it.
    */
   commitloreContract: string | null;
+  /**
+   * #1268 — what CommitLore holds for the paths this turn may change, read before its worker launched, for a
+   * run whose CommitLore mode is `required` or `preferred`: the section the worker's prompt carries, and the
+   * STARTED audit's record of it (its digest and the lookup's provenance). Null for any other run.
+   */
+  commitloreBeforeChange: { section: string; evidence: Record<string, unknown> } | null;
 }
 
 /** #1097 — a reading of the worktree's ignored paths; a failed one is kept as its error, never as empty. */
@@ -486,6 +515,7 @@ export class WorkerTurnRunner {
   readonly #processSettleMs: number;
   readonly #importRoot: string | null;
   readonly #commitlore: CommitLorePort | null;
+  readonly #commitloreLookupMs: number;
   #stopping = false;
 
   constructor(private readonly ports: WorkerTurnPorts, options: WorkerTurnOptions = {}) {
@@ -497,6 +527,7 @@ export class WorkerTurnRunner {
     this.#processSettleMs = options.processSettleMs ?? DEFAULT_PROCESS_SETTLE_MS;
     this.#importRoot = options.importRoot ?? null;
     this.#commitlore = options.commitlore === undefined ? createCommitLoreCliPort() : options.commitlore;
+    this.#commitloreLookupMs = options.commitloreLookupMs ?? BEFORE_CHANGE_LOOKUP_MS;
   }
 
   /**
@@ -580,10 +611,16 @@ export class WorkerTurnRunner {
       const contract = await this.commitloreContract(prepared.value);
       if (this.#stopping) return this.stoppingRefusal(request.taskId);
       if (!contract.allowed) return contract as Decision<{ executionId: string }>;
+      // #1268 — a run whose CommitLore mode is required or preferred gets what CommitLore holds for the paths
+      // its worker may change into the prompt, or no turn: refused here, before an execution is opened.
+      const beforeChange = await this.commitloreBeforeChange(prepared.value, scratch);
+      if (this.#stopping) return this.stoppingRefusal(request.taskId);
+      if (!beforeChange.allowed) return beforeChange as Decision<{ executionId: string }>;
       const turn: TurnFacts = {
         ...prepared.value,
         imports: staged.value.map(({ bytes: _bytes, ...entry }) => entry),
         commitloreContract: contract.value,
+        commitloreBeforeChange: beforeChange.value,
       };
       const started = await this.ports.tasks.startWorkerExecution({
         runId: turn.runId,
@@ -619,6 +656,8 @@ export class WorkerTurnRunner {
           head: turn.baseHead,
           generation: turn.worker.generation,
           timeoutMs,
+          // #1268 — what was delivered before the worker edits, and how it was looked up: delivery evidence only.
+          ...(turn.commitloreBeforeChange === null ? {} : { beforeChange: turn.commitloreBeforeChange.evidence }),
         },
       });
       // #1232 — the verified bytes are written under this execution's receipt, before its worker launches.
@@ -1672,6 +1711,152 @@ export class WorkerTurnRunner {
   }
 
   /**
+   * #1268 — what CommitLore holds for the paths this turn may change (its claim's paths, then its write
+   * target's), read at its base before an execution opens, for a run whose CommitLore mode is `required` or
+   * `preferred` (`commitloreBeforeChange`); null for a run with mode `off`, with no pinned manifest, or of a
+   * `preferred` run in a deployment with no CommitLore.
+   *
+   * - A path the lookup did not cover (it failed, timed out, answered in part, or its data did not fit) refuses
+   *   a `required` turn, and a `preferred` one until the run owner's supplement for exactly those paths at this
+   *   base is bound (`boundSupplements`): WORKER_COMMITLORE_CONTEXT_INCOMPLETE, before anything starts.
+   * - A path with `[blocked]` records refuses the turn in either mode (WORKER_COMMITLORE_CONTEXT_BLOCKED), first:
+   *   whether it may be changed cannot be decided, a turn's paths cannot be split mid-turn, and no supplement
+   *   stands in for content CommitLore withheld (r1 P1-2).
+   * - One deadline: an answer that arrives after it is a failed lookup, however soon after (r1 P2); each part
+   *   the port told by then is kept, so only the paths it had not answered fail, and guard not answering by
+   *   then is guard not consulted, never a gap in any path's context (r2).
+   * - guard's answer never refuses: a match is a lead, and a guard that gave none is stated as not consulted.
+   */
+  private async commitloreBeforeChange(facts: TurnFacts, scratch: string): Promise<Decision<TurnFacts["commitloreBeforeChange"]>> {
+    const mode = commitloreRunMode(this.ports.db, facts.runId);
+    if (mode === null || mode === "off") return allow(ReasonCode.OK, null);
+    const unobservable = (): Decision<never> =>
+      deny(ReasonCode.VERIFICATION_GAP, "this run's contract requires CommitLore, and this deployment has no CommitLore to read its records before the worker edits", {
+        refusal: "COMMITLORE_REQUIRED_UNOBSERVABLE",
+        runId: facts.runId,
+        taskId: facts.taskId,
+      });
+    const port = this.#commitlore;
+    if (port === null || port.beforeChange === undefined) return mode === "required" ? unobservable() : allow(ReasonCode.OK, null);
+    const paths = [...new Set([...facts.claim.ownedPaths, ...(facts.writeTarget?.paths ?? [])])];
+    const lookedUp = paths.slice(0, BEFORE_CHANGE_MAX_PATHS);
+    const lookupMs = this.#commitloreLookupMs;
+    const deadline = Date.now() + lookupMs;
+    // r2 — every part of the answer the port tells by the deadline is kept, whatever it is (a path answered, in
+    // part or blocked, or guard); only a part not told by then has failed, and guard's never touches a path's.
+    const told: { paths: Map<string, CommitLorePathLookup>; guard: CommitLoreGuardLookup | null; identity: CommitLoreBeforeChange["cliIdentity"] } = {
+      paths: new Map(),
+      guard: null,
+      identity: null,
+    };
+    const report = (event: CommitLoreLookupEvent): void => {
+      if (Date.now() > deadline) return;
+      if (event.kind === "path") told.paths.set(event.lookup.path, event.lookup);
+      else if (event.kind === "guard") told.guard = event.lookup;
+      else told.identity = event.identity;
+    };
+    const fromTold = (path: string, guard: string, whole?: CommitLoreBeforeChange): CommitLoreBeforeChange => ({
+      paths: lookedUp.map(
+        (looked) =>
+          told.paths.get(looked) ??
+          whole?.paths.find((entry) => entry.path === looked) ?? { path: looked, outcome: "failed", text: "", cacheKey: null, withheld: 0, items: null, detail: path },
+      ),
+      guard: told.guard ?? whole?.guard ?? { status: "not_consulted", matches: [], detail: guard },
+      cliIdentity: told.identity ?? whole?.cliIdentity ?? null,
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let answer: CommitLoreBeforeChange | null;
+    try {
+      const asked = port.beforeChange(
+        facts.claim.worktree,
+        { gitDir: facts.repo.gitDir, workTree: facts.repo.workTree, objectFormat: facts.objectFormat },
+        {
+          paths: lookedUp,
+          baseHead: facts.baseHead,
+          proposal: beforeChangeProposal(facts.taskTitle, facts.taskSpec),
+          scratch,
+          deadline,
+          concurrency: BEFORE_CHANGE_CONCURRENCY,
+          report,
+        },
+      );
+      // The port bounds its own children by the deadline, and their cleanup runs on after it; what this turn
+      // takes is only what was told or answered by the deadline (r1 P2).
+      asked.catch(() => {});
+      const settled = await Promise.race([
+        asked.then((value) => ({ value })),
+        new Promise<"late">((resolve) => {
+          timer = setTimeout(() => resolve("late"), Math.max(0, deadline - Date.now()));
+        }),
+      ]);
+      if (settled === "late" || Date.now() > deadline) {
+        answer = fromTold(`the CommitLore lookup did not answer for this path within ${lookupMs} ms`, `guard not consulted (timeout): it did not answer within ${lookupMs} ms`);
+      } else {
+        answer = settled.value === null ? null : fromTold("CommitLore gave no answer for it", "guard not consulted: the CommitLore lookup gave no guard answer", settled.value);
+      }
+    } catch (error) {
+      const failed = `the CommitLore lookup failed: ${errorText(error).slice(0, 300)}`;
+      answer = fromTold(failed, `guard not consulted: ${failed}`);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+    if (answer === null) return mode === "required" ? unobservable() : allow(ReasonCode.OK, null);
+
+    const coverage = beforeChangeCoverage(paths, answer.paths);
+    const uncoveredPaths = [...new Set(coverage.uncovered.map((gap) => gap.path))];
+    const lookup = {
+      mode,
+      base: facts.baseHead,
+      target: { taskId: facts.taskId, repositoryIdentity: facts.claim.repositoryIdentity, branch: facts.claim.branch },
+      paths,
+      uncovered: coverage.uncovered,
+      blocked: coverage.blocked,
+    };
+    // r1 P1-2 — in either mode, and before any supplement is read: none stands in for withheld content.
+    if (coverage.blocked.length > 0) {
+      return deny(
+        ReasonCode.WORKER_COMMITLORE_CONTEXT_BLOCKED,
+        "CommitLore withheld [blocked] records for paths this turn may change, so whether they may be changed cannot be decided; a turn's paths cannot be split mid-turn, and no supplement stands in for withheld content, so no edit starts",
+        { refusal: "CONTEXT_BLOCKED", ...lookup },
+      );
+    }
+    if (mode === "required" && uncoveredPaths.length > 0) {
+      return deny(
+        ReasonCode.WORKER_COMMITLORE_CONTEXT_INCOMPLETE,
+        `this run's contract requires CommitLore, and its context was not delivered for every path this turn may change at ${facts.baseHead}; no edit starts`,
+        { refusal: "CONTEXT_INCOMPLETE", ...lookup },
+      );
+    }
+    // A required run's turn is never supplemented: its lookup either covered every path or refused above.
+    const bound = mode === "preferred" ? boundSupplements(facts.taskSpec, facts.baseHead, uncoveredPaths) : { supplied: false, supplements: [], problems: [] };
+    if (bound.problems.length > 0) {
+      return deny(
+        ReasonCode.WORKER_COMMITLORE_CONTEXT_INCOMPLETE,
+        `this run prefers CommitLore, and its context was not delivered for every path this turn may change at ${facts.baseHead}; no edit starts until the run owner supplies it for exactly the uncovered paths at that base (${COMMITLORE_SUPPLEMENT_FIELD} in the task's PLAN spec: [{path, base, contextText}])`,
+        { refusal: bound.supplied ? "SUPPLEMENT_REFUSED" : "CONTEXT_INCOMPLETE", ...lookup, supplementProblems: bound.problems },
+      );
+    }
+    const section = beforeChangeSection({ baseHead: facts.baseHead, coverage, supplements: bound.supplements, guard: answer.guard });
+    return allow(ReasonCode.OK, {
+      section,
+      evidence: {
+        digest: sha256(section),
+        status: bound.supplements.length > 0 ? "SUPPLEMENTED" : "COMPLETE",
+        ...lookup,
+        // `value`, not `cacheKey`: the audit redacts any field whose name ends in "key".
+        cacheKeys: answer.paths.map(({ path, cacheKey }) => ({ path, value: cacheKey })),
+        supplements: bound.supplements.map(({ path, base, digest }) => ({ path, base, digest })),
+        guard: {
+          status: answer.guard.status,
+          matches: answer.guard.matches.map(({ recordId, sha, score, trust }) => ({ recordId, sha, score, trust })),
+          detail: answer.guard.detail,
+        },
+        cliIdentity: answer.cliIdentity,
+      },
+    });
+  }
+
+  /**
    * #1268 — CommitLore's procedure around this turn's commit (`WorkerCommitLoreStep`): one commit attempt
    * (the pin's checks and the newest-release confirmation, made for it alone), the worker's draft verified
    * and bound against `transcript` and the private index before the commit exists, and the commit
@@ -1809,6 +1994,7 @@ export class WorkerTurnRunner {
         gitDirEntries: gitDirEntries(repo),
         imports: [],
         commitloreContract: null,
+        commitloreBeforeChange: null,
       });
     } catch (error) {
       return deny(ReasonCode.PROBE_FAILED, "the claimed worktree could not be inspected", {
@@ -3473,15 +3659,22 @@ const ignoredChangesOf = async (facts: TurnFacts): Promise<{ paths: string[]; to
  */
 const workerTranscript = (facts: TurnFacts, said: string): string => `${workerTaskPrompt(facts)}\n\n${said}\n`;
 
-const workerPrompt = (facts: TurnFacts): string =>
-  facts.commitloreContract === null ? workerTaskPrompt(facts) : `${workerTaskPrompt(facts)}\n${workerCommitLoreSection(facts.commitloreContract)}`;
+/**
+ * #1268 — the task, then what CommitLore holds for its paths, then CommitLore's drafting contract; neither
+ * CommitLore part is in the transcript a draft is verified against (`workerTranscript`).
+ */
+const workerPrompt = (facts: TurnFacts): string => {
+  const task = facts.commitloreBeforeChange === null ? workerTaskPrompt(facts) : `${workerTaskPrompt(facts)}\n${facts.commitloreBeforeChange.section}`;
+  return facts.commitloreContract === null ? task : `${task}\n${workerCommitLoreSection(facts.commitloreContract)}`;
+};
 
 const workerTaskPrompt = (facts: TurnFacts): string =>
   [
     "You are the implementer for one task of a managed run. Make the change by editing files in this working tree.",
     "",
     `Task: ${facts.taskTitle}`,
-    `Specification (JSON): ${JSON.stringify(facts.taskSpec)}`,
+    // #1268 — a run owner's CommitLore supplement reaches the worker as data in its section, not as spec.
+    `Specification (JSON): ${JSON.stringify(facts.commitloreBeforeChange === null ? facts.taskSpec : withoutSupplement(facts.taskSpec))}`,
     frontierReviewPolicy(),
     "",
     "Rules:",
