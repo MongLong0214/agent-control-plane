@@ -1,3 +1,6 @@
+import { rmSync } from "node:fs";
+import { join } from "node:path";
+
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { commitloreGoverned } from "../../src/bootstrap/commitlore-observation.ts";
@@ -531,6 +534,19 @@ describe("#1268: a governed freeze holds only commits CommitLore accounts for", 
     writeFiles(second.repo, { "notes.md": "unmanaged\n" });
     const foreign = commitAll(second.repo, "unmanaged in the second repository");
     await expectRefusedUnchanged(world, { reasonCode: ReasonCode.CANDIDATE_FOREIGN_COMMIT, commit: foreign, refusal: "NOT_A_RUN_WORKER_COMMIT" });
+  });
+
+  it("R3 refused before any repository's integration writes — another repository's HEAD commit object cannot be read", async () => {
+    const world = await worldOf("required", "cl-freeze-two", { second: true });
+    workerCommit(world, "readme", { "README.md": "# one\n" }, "update readme", EMPTY);
+    workerCommit(world, "app", { "src/app.js": "module.exports = () => 2;\n" }, "update app", EMPTY);
+    const second = world.second!;
+    gitSync(second.repo, ["checkout", "-q", "-b", "broken"]);
+    writeFiles(second.repo, { "notes.md": "lost\n" });
+    const lost = commitAll(second.repo, "a commit whose object is then lost");
+    rmSync(join(second.repo, ".git", "objects", lost.slice(0, 2), lost.slice(2)));
+    expect(() => gitSync(second.repo, ["rev-parse", "--verify", "-q", "HEAD^{commit}"])).toThrow();
+    await expectRefusedUnchanged(world, { reasonCode: ReasonCode.CANDIDATE_RANGE_UNVERIFIABLE, refusal: "OBJECT_UNREADABLE" });
   });
 
   it("refused — the checkout's HEAD moved after the check: the checked head is not the one that would be frozen", async () => {

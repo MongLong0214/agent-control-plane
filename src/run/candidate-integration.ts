@@ -539,7 +539,8 @@ const holdsEvery = async (repo: PinnedRepository, results: readonly TaskResult[]
 /**
  * #1268 — read-only: the checkout's HEAD when `integrateTaskResults` would take it as the candidate (the run has
  * no SUCCEEDED result it places in this repository, or HEAD already holds every one), else null. Conflicts are
- * not asked: the integration refuses them either way.
+ * not asked: the integration refuses them either way. A HEAD, or an ancestry, that cannot be read is refused
+ * (CANDIDATE_RANGE_UNVERIFIABLE), never taken as an answer.
  */
 export const checkoutHeadAsCandidate = async (input: {
   db: Db;
@@ -551,10 +552,21 @@ export const checkoutHeadAsCandidate = async (input: {
 }): Promise<Decision<string | null>> => {
   const results = succeededTaskResults(input.db, input.runId, input.tasks, input.commits, input.repositoryIdentity);
   return withPinned<string | null>(input.checkoutPath, "acp-integration-head-", async (repo) => {
+    const unreadable = (ref: string): Decision<never> =>
+      deny(ReasonCode.CANDIDATE_RANGE_UNVERIFIABLE, "the checkout's HEAD or its history could not be read, so the freeze is refused", {
+        runId: input.runId,
+        repositoryIdentity: input.repositoryIdentity,
+        refusal: "OBJECT_UNREADABLE",
+        ref,
+      });
     const headRead = await runPinnedGit(repo, ["rev-parse", "--verify", "-q", "HEAD^{commit}"]);
-    const head = headRead.exitCode === 0 ? headRead.stdout.trim() : null;
-    if (head === null) return allow(ReasonCode.OK, null);
-    return allow(ReasonCode.OK, results.length === 0 || (await holdsEvery(repo, results, head)) ? head : null);
+    if (headRead.exitCode !== 0) return unreadable("HEAD");
+    const head = headRead.stdout.trim();
+    if (results.length === 0) return allow(ReasonCode.OK, head);
+    const answers = await Promise.all(results.map((result) => isAncestor(repo, result.commit, head)));
+    const unread = results.find((_, at) => answers[at] === null);
+    if (unread !== undefined) return unreadable(unread.commit);
+    return allow(ReasonCode.OK, answers.every((answer) => answer === true) ? head : null);
   });
 };
 
