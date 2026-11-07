@@ -428,6 +428,13 @@ export class BindingRegistry {
        * generation alone does not say the holder is the same.
        */
       expectedCurrent?: { assignmentId: string; sessionId: string; sessionIncarnation: string };
+      /**
+       * Asked of the role's current binding inside this transaction, before anything is written; false
+       * refuses the switch ROLE_RUNTIME_SUBSTITUTION_REFUSED. Continuity passes its adopted-runtime rule,
+       * so a holder that came onto an adopted runtime after the caller last looked is neither moved nor
+       * replaced.
+       */
+      replaceableCurrent?: (current: RoleBinding) => boolean;
     },
   ): Decision<RoleBinding> {
     // #664 — this body's writes (the runtime move, the revoke+mint+insert, the run
@@ -466,6 +473,12 @@ export class BindingRegistry {
           roleKey,
           expectedAssignmentId: input.expectedCurrent.assignmentId,
           actualAssignmentId: current?.assignmentId ?? null,
+        });
+      }
+      if (current && input.replaceableCurrent && !input.replaceableCurrent(current)) {
+        return deny(ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED, "the role's current holder is on an adopted runtime; it is not replaced", {
+          roleKey,
+          sessionId: current.sessionId,
         });
       }
 

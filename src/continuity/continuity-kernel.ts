@@ -625,8 +625,9 @@ export class ContinuityKernel {
     if (role === Role.BOOTSTRAP_CTO) return bootstrapCtoNotReplaceable(roleKey);
     // #246 C4-R2 — nor is a PRIMARY_CTO whose holder has a driven-spawn record: its conversation lives
     // in its own session, which is recovered on itself (`CtoLifecycle.recoverDrivenPrimaryCto`).
-    // The holder read here is the one this failover may replace: fenced before the first await, so
-    // a binding that arrives while evaluation or admission is awaited is refused, never replaced.
+    // The holder read here, whatever the role, is the one this failover may replace: fenced before the
+    // first await, so a binding that arrives while evaluation or admission is awaited is refused, never
+    // replaced.
     const holder = this.bindings.active(roleKey);
     const fenced = role === Role.PRIMARY_CTO ? holder : null;
     if (fenced && drivenModeOf(this.db, fenced.sessionId) !== "NONE") return drivenPrimaryNotReplaceable(roleKey, fenced.sessionId);
@@ -684,13 +685,20 @@ export class ContinuityKernel {
     const endedBeforeSpawn = this.#workerRunEnded(role, scope);
     if (endedBeforeSpawn) return endedBeforeSpawn;
 
+    // The holder after the awaits must be exactly the one fenced (assignment, generation, runtime and
+    // incarnation), and still not on an adopted runtime, before anything is started: otherwise nothing
+    // is provisioned. A binding that arrived while the plan was computed, an adopted CEO re-bound among
+    // them, is never this failover's to replace.
     const expected = this.bindings.active(roleKey);
-    if (role === Role.PRIMARY_CTO && !sameHolder(fenced, expected)) {
+    if (!sameHolder(holder, expected)) {
       return deny(ReasonCode.BINDING_GENERATION_STALE, "the role's binding changed while the failover was admitted; it is not replaced", {
         roleKey,
-        fencedGeneration: fenced?.bindingGeneration ?? null,
+        fencedGeneration: holder?.bindingGeneration ?? null,
         currentGeneration: expected?.bindingGeneration ?? null,
       });
+    }
+    if (expected && holdsAdoptedRuntime(this.db, this.sessions.get(expected.sessionId), expected)) {
+      return adoptedRuntimeNotReplaceable(roleKey, expected.sessionId);
     }
     // #954 — a role continuity revoked for want of coverage gets its binding back only from a claim
     // (see `restore()`). With no active binding `switchTo` has no current row to replace, reads the
@@ -760,6 +768,10 @@ export class ContinuityKernel {
       ...(role === Role.PRIMARY_CTO && expected
         ? { expectedCurrent: { assignmentId: expected.assignmentId, sessionId: expected.sessionId, sessionIncarnation: expected.sessionIncarnation } }
         : {}),
+      // And, for every role, the holder the switch finds is asked again in the switch's own transaction:
+      // one that came onto an adopted runtime after the checks above, at the same generation, is
+      // refused, and the session started for it is stopped below.
+      replaceableCurrent: (current) => !holdsAdoptedRuntime(this.db, this.sessions.get(current.sessionId), current),
       // A failover of a role that still owns live work is a takeover: the runs move to the
       // new generation in the same transaction rather than being orphaned.
       takeover: true,

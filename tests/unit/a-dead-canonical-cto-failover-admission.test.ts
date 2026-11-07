@@ -23,7 +23,7 @@ import {
   type ProcessSnapshot,
 } from "../../src/registry/canonical-self-claim.ts";
 import type { CapacityReading } from "../../src/runtime/provider.ts";
-import { adoptedFixture } from "../helpers/adopted-ceo.ts";
+import { DIGEST, LIVE, RUNTIME, adoptedFixture, type AdoptedCeoFixture } from "../helpers/adopted-ceo.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest } from "../helpers/harness.ts";
 import { TestProductionAdapter } from "../helpers/production-adapter.ts";
@@ -421,5 +421,126 @@ describe("no adopted runtime is failed over, whatever its role", () => {
       expect(active.sessionId).not.toBe(session.sessionId);
       expect(f.cp.sessions.require(active.sessionId).lifecycle).toBe(SessionLifecycle.READY);
     });
+  });
+});
+
+/**
+ * The CEO bound on `sessionId` to the adopted Gateway's own Hermes target, as adoption binds it: the
+ * target's actor is reused, at the next generation. On the Gateway's session that is an adopted runtime;
+ * on any other session it is not.
+ */
+const bindToHermesTarget = (f: AdoptedCeoFixture, sessionId: string) => {
+  const claimed = { executorKind: "hermes", targetLocator: LIVE, targetLocatorDigest: DIGEST };
+  let receipt: Record<string, unknown> | null = null;
+  const bound = f.h.cp.bindings.bind({
+    role: Role.CEO,
+    sessionId,
+    authenticatedTarget: {
+      claimed,
+      protocolVersion: "hermes.target-bind/v1",
+      expectedExecutorRuntimeIdentity: RUNTIME,
+      get targetBindReceipt() {
+        return receipt as never;
+      },
+      get attestationDigest() {
+        return (receipt?.["receipt_digest"] as string | undefined) ?? "";
+      },
+      verify: (tuple) => {
+        const fields = {
+          domain: "hermes.target-bind" as const,
+          version: 1 as const,
+          actor_id: tuple.actorId,
+          binding_generation: tuple.generation,
+          executor_runtime_identity: RUNTIME,
+          requested_session_id: claimed.targetLocator,
+          lineage_root_digest: claimed.targetLocatorDigest,
+        };
+        receipt = { ...fields, receipt_digest: digestOf(fields) };
+        return claimed;
+      },
+    },
+  });
+  if (!bound.allowed) throw new Error(bound.message);
+  return bound.value;
+};
+
+/** The adopted fixture with its Gateway CEO released, Claude role-scoped for the CEO, and a plain session ready. */
+const releasedAdoption = () => {
+  const f = adoptedFixture();
+  const { h } = f;
+  const claude = new TestProductionAdapter(h.clock, "claude");
+  h.cp.providers.registerForRole(claude, Role.CEO);
+  claude.setCapacity(healthy(h.clock));
+  expect(h.cp.bindings.revoke(roleKeyFor(Role.CEO), "released for the test").allowed).toBe(true);
+  const plain = h.cp.sessions.create({ provider: "claude", model: "claude-cli" });
+  expect(h.cp.sessions.transition(plain.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+  return { f, h, plainSessionId: plain.sessionId };
+};
+
+const continuitySessions = (h: AdoptedCeoFixture["h"]) =>
+  h.cp.db.all<{ session_id: string; lifecycle: string }>(
+    `SELECT session_id, lifecycle FROM sessions WHERE session_id LIKE 'ses_cont_%' ORDER BY session_id`,
+  );
+
+describe("a failover replaces only the holder it started from, and never one on an adopted runtime", () => {
+  it("an adopted Hermes CEO bound while the failover's evaluation is awaited is not replaced, and no session is started", async () => {
+    const { f, h, plainSessionId } = releasedAdoption();
+    try {
+      const replaceable = h.cp.bindings.bind({ role: Role.CEO, sessionId: plainSessionId });
+      if (!replaceable.allowed) throw new Error(replaceable.message);
+      const evaluate = h.cp.continuity.evaluate.bind(h.cp.continuity);
+      let swapped: { bindingGeneration: number } | null = null;
+      vi.spyOn(h.cp.continuity, "evaluate").mockImplementation(async (why) => {
+        if (swapped === null) {
+          // While the failover's plan is computed, the replaceable CEO is released and the Gateway re-adopted.
+          expect(h.cp.bindings.revoke(roleKeyFor(Role.CEO), "the Gateway is adopted again").allowed).toBe(true);
+          swapped = bindToHermesTarget(f, f.gatewaySessionId);
+        }
+        return evaluate(why);
+      });
+
+      const decision = await h.cp.continuity.failover(roleKeyFor(Role.CEO), Role.CEO, {}, "the replaceable CEO's session died");
+
+      expect(decision).toMatchObject({ allowed: false, reasonCode: ReasonCode.BINDING_GENERATION_STALE });
+      expect(continuitySessions(h)).toEqual([]);
+      expect(h.cp.audit.byKind("BINDING_RUNTIME_MOVED")).toEqual([]);
+      expect(h.cp.bindings.active(roleKeyFor(Role.CEO))).toMatchObject({
+        sessionId: f.gatewaySessionId,
+        bindingGeneration: swapped!.bindingGeneration,
+      });
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  it("a holder whose actor moves onto the adopted Gateway right before the switch is refused inside the switch, and its replacement is stopped", async () => {
+    const { f, h, plainSessionId } = releasedAdoption();
+    try {
+      // The Gateway's actor, bound on a provider session: not an adopted runtime, so a failover may proceed.
+      const before = bindToHermesTarget(f, plainSessionId);
+      const switchTo = h.cp.bindings.switchTo.bind(h.cp.bindings);
+      vi.spyOn(h.cp.bindings, "switchTo").mockImplementation((input) => {
+        // Every check before the switch has passed; the actor's runtime moves to the Gateway at the same generation.
+        h.cp.db.run(`UPDATE conversational_actors SET current_session_id = ?, current_session_incarnation = ? WHERE actor_id = ?`,
+          [f.gatewaySessionId, h.cp.sessions.require(f.gatewaySessionId).incarnation, f.actorId]);
+        return switchTo(input);
+      });
+
+      const decision = await h.cp.continuity.failover(roleKeyFor(Role.CEO), Role.CEO, {}, "the CEO's provider session died");
+
+      expect(decision).toMatchObject({ allowed: false, reasonCode: ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED });
+      expect(h.cp.bindings.active(roleKeyFor(Role.CEO))).toMatchObject({
+        assignmentId: before.assignmentId,
+        bindingGeneration: before.bindingGeneration,
+        sessionId: f.gatewaySessionId,
+      });
+      expect(h.cp.audit.byKind("BINDING_RUNTIME_MOVED")).toEqual([]);
+      // The session this failover started is stopped, not left READY.
+      const started = continuitySessions(h);
+      expect(started).toHaveLength(1);
+      expect(started[0]!.lifecycle).not.toBe(SessionLifecycle.READY);
+    } finally {
+      h.cp.close();
+    }
   });
 });
