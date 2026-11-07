@@ -175,7 +175,9 @@ const channel = async (peer: AuthenticatedMcpPeer, withProvenance = true) => {
   open.push(client, server);
   return { client, call: async (args: Row): Promise<Answer> => {
     const result = await client.callTool({ name: "pr_evidence_get", arguments: args, ...(withProvenance ? { _meta: OWNER_TURN } : {}) });
-    return (result.structuredContent ?? { ok: false, reasonCode: "NO_STRUCTURED_ANSWER", message: JSON.stringify(result.content), evidence: {} }) as Answer;
+    // Every answer of the tool is structured; anything else (an RPC error) fails the case with its text.
+    if (!result.structuredContent) throw new Error(`pr_evidence_get gave no structured answer: ${JSON.stringify(result.content)}`);
+    return result.structuredContent as Answer;
   } };
 };
 
