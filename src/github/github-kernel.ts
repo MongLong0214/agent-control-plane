@@ -35,7 +35,7 @@ import {
   gitBytes,
 } from "../git/branch-objects.ts";
 import { scanPublication, workflowChanges } from "./branch-publish.ts";
-import { commitloreGoverned } from "../bootstrap/commitlore-observation.ts";
+import { commitloreGoverned } from "../bootstrap/commitlore-mode.ts";
 
 /**
  * The gate's GitHub-side correlator: run, candidate, and the payload digest that binds the rest.

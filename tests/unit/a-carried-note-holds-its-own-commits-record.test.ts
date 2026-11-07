@@ -26,6 +26,8 @@ const WORK_BRANCH = "feature/F1-thing";
 const X_ID = "r-xcommit01";
 const Y_ID = "r-ycommit01";
 const X_EARLY_ID = "r-xearly01";
+/** The bound on each git this file runs itself, as `gitSync`'s; a local git answers in well under a second. */
+const GIT_TIMEOUT_MS = 30_000;
 
 /**
  * #1268 slice 1 — a governed freeze holds only commits a SUCCEEDED worker receipt of the run accounts for. `commit`
@@ -78,10 +80,11 @@ const reflectMergedBase = (github: FakeGitHub): void => {
  * earlier record block in its message declares X_EARLY_ID. The head records nothing.
  * Y is a recorded commit outside the candidate (branch `side`, on the base): its trailer block declares Y_ID.
  * The setup is the one the #1269 notes scenarios use, with X committed on the work branch before the run. The run
- * is governed (CommitLore `required`) unless `governed` is false (`preferred`, the fixture manifest's own mode).
+ * is governed (CommitLore `required`) unless `lenient` names one of the two modes that are not (`preferred`, the
+ * fixture manifest's own mode, or `off`).
  */
 const setup = async (options: {
-  governed?: boolean;
+  lenient?: "preferred" | "off";
   xLimit?: string;
   /** X's message as ISO-8859-1 bytes, committed with that `encoding` header (`declared`) or with none (null). */
   xLatin1?: { declared: "ISO-8859-1" | null };
@@ -119,11 +122,11 @@ const setup = async (options: {
       const who = "ACP Test <test@example.invalid> 1786000000 +0000";
       const header = `tree ${gitSync(repo, ["write-tree"])}\nparent ${gitSync(repo, ["rev-parse", "HEAD"])}\nauthor ${who}\ncommitter ${who}\n\n`;
       const object = Buffer.concat([Buffer.from(header), Buffer.from(`${xMessage}\n`, "latin1")]);
-      x = execFileSync("git", ["-C", repo, "hash-object", "-t", "commit", "-w", "--stdin"], { input: object }).toString("utf8").trim();
+      x = execFileSync("git", ["-C", repo, "hash-object", "-t", "commit", "-w", "--stdin"], { input: object, timeout: GIT_TIMEOUT_MS }).toString("utf8").trim();
       gitSync(repo, ["update-ref", "HEAD", x]);
     }
   }
-  if (options.governed !== false) {
+  if (options.lenient === undefined) {
     // X's turn is recorded in the run once the run exists, before its one freeze; the harness records the head's.
     const freeze = harness.cp.pipeline.freeze.bind(harness.cp.pipeline);
     vi.spyOn(harness.cp.pipeline, "freeze").mockImplementationOnce(async (runId, attemptId) => {
@@ -135,7 +138,7 @@ const setup = async (options: {
   const driven = await driveToReviewedCandidate(harness, {
     workBranch: WORK_BRANCH,
     manifestOverrides: {
-      commitlore: { mode: options.governed === false ? "preferred" : "required" },
+      commitlore: { mode: options.lenient ?? "required" },
       ciWorkflows: [{ path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null, unapprovedFirstActivation: true, repositoryRole: "primary" }],
       verificationProfiles: { simple: ["project-ci"], standard: ["project-ci"], guarded: ["project-ci"] },
       verificationCommands: [parseVerificationCommand({
@@ -192,7 +195,7 @@ const setup = async (options: {
 };
 
 /** A git answer as raw bytes, which `gitSync`'s UTF-8 string cannot keep. */
-const execRaw = (repo: string, args: readonly string[]): Buffer => execFileSync("git", ["-C", repo, ...args]);
+const execRaw = (repo: string, args: readonly string[]): Buffer => execFileSync("git", ["-C", repo, ...args], { timeout: GIT_TIMEOUT_MS });
 
 /** A commit's own trailer block, as git reads it. */
 const trailersOf = (repo: string, commit: string): string => gitSync(repo, ["log", "-1", "--format=%(trailers:only,unfold)", commit]);
@@ -371,8 +374,8 @@ describe("#1268 slice 2 — a carried note holds the record of the commit it is 
     expect(fixture.github.notesRef).toBeNull();
   });
 
-  it("a non-governed run is unchanged: its notes are carried as they are", async () => {
-    const fixture = await setup({ governed: false });
+  it.each(["preferred", "off"] as const)("a non-governed run (%s) is unchanged: its notes are carried as they are", async (lenient) => {
+    const fixture = await setup({ lenient });
     const copied = noteOn(fixture, fixture.x, trailersOf(fixture.repo, fixture.y));
     const merged = await fixture.merge();
     expect(merged.reasonCode, merged.allowed ? "" : merged.message).toBe(ReasonCode.OK);
