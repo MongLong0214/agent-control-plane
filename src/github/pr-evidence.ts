@@ -28,6 +28,10 @@ import type { RepositoryRecord } from "../registry/repository-registry.ts";
  * a COVERAGE_INCOMPLETE refusal carrying what was read, `requiredChecks.allSatisfied` is never true,
  * and nothing in it says "ok". A continuation page carries the first page's gaps in its signed cursor,
  * so a snapshot that was incomplete stays incomplete on every page of it.
+ *
+ * Read in a prefix: Hermes shows its model only the first 2048 characters of a tool error, and the
+ * refusal's text is the whole answer. So `brief` comes first and is bounded whatever the gaps, cursor
+ * or diff hold, and `diff` comes last, its page text at the very end.
  */
 
 /** GET only, over the kernel's App client and credential (`GitHubKernel.readOnlyGitHub`). */
@@ -112,6 +116,13 @@ export interface PrEvidenceRequiredCheck {
   observed: Array<{ kind: "check_run" | "status"; state: string | null; url: string | null }>;
 }
 
+/**
+ * Whether GitHub's mergeability speaks to the pull request. Only an open one has it: GitHub leaves a closed
+ * one's `mergeable` null and `mergeable_state` "unknown" for good, so a closed one, merged or not, is a fact
+ * here rather than a gap. An open one GitHub has not computed yet is NOT_COMPUTED, and named in `incomplete`.
+ */
+export type PrEvidenceMergeability = "COMPUTED" | "NOT_COMPUTED" | "NOT_APPLICABLE_MERGED" | "NOT_APPLICABLE_CLOSED";
+
 export interface PrEvidenceSummary {
   pull: {
     state: string;
@@ -123,6 +134,7 @@ export interface PrEvidenceSummary {
     mergeable: boolean | null;
     /** REST `mergeable_state` (GraphQL `mergeStateStatus`), as GitHub computed it. */
     mergeableState: string | null;
+    mergeability: PrEvidenceMergeability;
     changedFiles: number | null;
     additions: number | null;
     deletions: number | null;
@@ -150,14 +162,40 @@ export interface PrEvidenceSummary {
   };
 }
 
+/** How many gaps `brief` quotes, and the most characters (as JSON writes them) of each quote and of its location. */
+const BRIEF_GAPS_QUOTED = 3;
+const BRIEF_GAP_CHARS = 200;
+const BRIEF_WHERE_CHARS = 60;
+
+/**
+ * The answer's state in under 2048 characters as `respond` writes it, so a reader that sees only the start
+ * (a Hermes tool error) still has it. Each value is a copy of what the fields below carry in full.
+ */
+export interface PrEvidenceBrief {
+  complete: boolean;
+  baseSha: string;
+  headSha: string;
+  page: { offset: number; chars: number; totalChars: number; done: boolean; hasNextCursor: boolean; textAt: string };
+  /** On the first page only, null on a continuation page, as `summary` is. */
+  pull: { state: string; merged: boolean | null; mergeability: PrEvidenceMergeability } | null;
+  /** Every gap counted by kind, and the first BRIEF_GAPS_QUOTED as one bounded line each. */
+  gaps: { count: number; kinds: Partial<Record<PrEvidenceIncomplete["kind"], number>>; first: string[] };
+}
+
 export interface PrEvidence {
   schema: "acp.pr-evidence.v1";
+  brief: PrEvidenceBrief;
   projectId: string;
   repositoryIdentity: string;
   repositoryRole: string | null;
   prNumber: number;
   /** The SHAs the diff is between; every page of one read carries the same pair. */
   compared: { baseSha: string; headSha: string };
+  complete: boolean;
+  incomplete: PrEvidenceIncomplete[];
+  /** The PR, files, checks and required checks; on the first page only, null on a continuation page. */
+  summary: PrEvidenceSummary | null;
+  /** Last, so a cut through the answer falls in the page's text, never ahead of the state. */
   diff: {
     offset: number;
     chars: number;
@@ -172,10 +210,6 @@ export interface PrEvidence {
     fileCount: number;
     text: string;
   };
-  incomplete: PrEvidenceIncomplete[];
-  complete: boolean;
-  /** The PR, files, checks and required checks; on the first page only, null on a continuation page. */
-  summary: PrEvidenceSummary | null;
 }
 
 const cursorSchema = z.object({
@@ -244,6 +278,42 @@ const gap = (error: unknown, lookup: string, detail: string, page?: number): PrE
     lookup, detail,
     ...(page === undefined ? {} : { page }),
     ...(status === undefined ? {} : { status }),
+  };
+};
+
+/** `value` in at most `max` characters as JSON writes it (an escape counts in full), ending in "…" when cut. */
+const clip = (value: string, max: number): string => {
+  const width = (part: string): number => JSON.stringify(part).length - 2;
+  if (width(value) <= max) return value;
+  let end = Math.min(value.length, max - 1);
+  while (end > 0 && width(value.slice(0, end)) > max - 1) end -= 1;
+  const last = value.charCodeAt(end - 1);
+  if (end > 0 && last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${value.slice(0, end)}…`;
+};
+
+/** One gap as a line of at most BRIEF_GAP_CHARS: kind, HTTP status, file or API path (SHAs shortened), detail. */
+const quoteGap = (entry: PrEvidenceIncomplete, root: string): string => {
+  const path = entry.lookup.startsWith(root) ? entry.lookup.slice(root.length) : entry.lookup;
+  const where = clip(entry.file ?? path.replace(/[0-9a-f]{40}/g, (sha) => sha.slice(0, 7)), BRIEF_WHERE_CHARS);
+  return clip(`${entry.kind}${entry.status === undefined ? "" : ` ${entry.status}`} ${where}: ${entry.detail}`, BRIEF_GAP_CHARS);
+};
+
+const briefOf = (
+  incomplete: PrEvidenceIncomplete[], root: string, compared: PrEvidence["compared"], page: PrEvidence["diff"],
+  pull: PrEvidenceSummary["pull"] | null,
+): PrEvidenceBrief => {
+  const kinds: PrEvidenceBrief["gaps"]["kinds"] = {};
+  for (const entry of incomplete) kinds[entry.kind] = (kinds[entry.kind] ?? 0) + 1;
+  return {
+    complete: incomplete.length === 0,
+    baseSha: compared.baseSha,
+    headSha: compared.headSha,
+    page: { offset: page.offset, chars: page.chars, totalChars: page.totalChars, done: page.done,
+      hasNextCursor: page.nextCursor !== null, textAt: "diff.text, the last field of this answer" },
+    pull: pull === null ? null : { state: clip(pull.state, 20), merged: pull.merged, mergeability: pull.mergeability },
+    // Last: a quote holds GitHub's text, so whatever it grows to downstream it cannot push the state above out.
+    gaps: { count: incomplete.length, kinds, first: incomplete.slice(0, BRIEF_GAPS_QUOTED).map((entry) => quoteGap(entry, root)) },
   };
 };
 
@@ -653,9 +723,15 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
         detail: `the first page of this read named ${cursor.g} gap(s) (digest ${cursor.gd}); every page of it is incomplete` });
     }
   } else {
+    const state = text(pull["state"]);
+    const merged = bool(pull["merged"]);
     const mergeable = bool(pull["mergeable"]);
     const mergeableState = text(pull["mergeable_state"]);
-    if (mergeable === null || mergeableState === null || mergeableState === "unknown") {
+    // Only a closed PR that says whether it was merged is spared; any other answer is judged as an open one.
+    const mergeability: PrEvidenceMergeability = state === "closed" && merged === true ? "NOT_APPLICABLE_MERGED"
+      : state === "closed" && merged === false ? "NOT_APPLICABLE_CLOSED"
+      : mergeable === null || mergeableState === null || mergeableState === "unknown" ? "NOT_COMPUTED" : "COMPUTED";
+    if (mergeability === "NOT_COMPUTED") {
       incomplete.push({ kind: "MERGEABILITY_NOT_COMPUTED", lookup: pullLookup,
         detail: "GitHub has not computed this pull request's mergeability yet; ask again" });
     }
@@ -668,8 +744,8 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
     const html = httpsUrl(pull["html_url"]);
     summary = {
       pull: {
-        state: text(pull["state"]) ?? "unknown", draft: bool(pull["draft"]), merged: bool(pull["merged"]), title: text(pull["title"]),
-        headRef: text(head?.["ref"]) ?? "", baseRef, mergeable, mergeableState,
+        state: state ?? "unknown", draft: bool(pull["draft"]), merged, title: text(pull["title"]),
+        headRef: text(head?.["ref"]) ?? "", baseRef, mergeable, mergeableState, mergeability,
         changedFiles, additions: count(pull["additions"]), deletions: count(pull["deletions"]), commits: count(pull["commits"]),
       },
       mergeBase: read.mergeBase,
@@ -712,17 +788,20 @@ export const readPrEvidence = async (source: PrEvidenceSource, input: PrEvidence
     text: diff.slice(offset, end),
   };
 
+  const compared = { baseSha, headSha };
+  // Key order is the order a reader of a prefix sees: see the module comment.
   const evidence: PrEvidence = {
     schema: "acp.pr-evidence.v1",
+    brief: briefOf(incomplete, root, compared, page, summary?.pull ?? null),
     projectId: input.projectId,
     repositoryIdentity: identity,
     repositoryRole: repository.value.repositoryRole,
     prNumber: input.prNumber,
-    compared: { baseSha, headSha },
-    diff: page,
-    incomplete,
+    compared,
     complete: incomplete.length === 0,
+    incomplete,
     summary,
+    diff: page,
   };
   return incomplete.length === 0
     ? allow(ReasonCode.OK, evidence)

@@ -3,13 +3,14 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { sha256 } from "../../src/core/digest.ts";
-import { acpError, allow } from "../../src/core/errors.ts";
+import { acpError, allow, deny, type Evidence } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, roleKeyFor, SessionLifecycle } from "../../src/domain/types.ts";
+import { PR_EVIDENCE_DIFF_PAGE_MAX_CHARS } from "../../src/github/pr-evidence.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { HERMES_PROVENANCE_META_KEY } from "../../src/mcp/hermes-provenance.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
-import type { AuthenticatedMcpPeer } from "../../src/mcp/shared.ts";
+import { type AuthenticatedMcpPeer, respond } from "../../src/mcp/shared.ts";
 import { FakeGitHub, type FakePull } from "../helpers/fake-github.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { bindCeo, makeHarness, registerFixtureProject, type Harness } from "../helpers/harness.ts";
@@ -132,12 +133,20 @@ const pullRow = (number: number, head: string, changedFiles: number, extra: Row 
 });
 
 interface Page {
+  brief: {
+    complete: boolean;
+    baseSha: string;
+    headSha: string;
+    page: { offset: number; chars: number; totalChars: number; done: boolean; hasNextCursor: boolean; textAt: string };
+    pull: { state: string; merged: boolean | null; mergeability: string } | null;
+    gaps: { count: number; kinds: Record<string, number>; first: string[] };
+  };
   compared: { baseSha: string; headSha: string };
   diff: { offset: number; chars: number; nextCursor: string | null; done: boolean; totalChars: number; sha256: string; text: string };
   incomplete: Array<{ kind: string; lookup: string; detail: string; file?: string; page?: number; status?: number }>;
   complete: boolean;
   summary: null | {
-    pull: { state: string; mergeable: boolean | null; mergeableState: string | null };
+    pull: { state: string; merged: boolean | null; mergeable: boolean | null; mergeableState: string | null; mergeability: string };
     mergeBase: { sha: string } | null;
     files: Array<{ filename: string; additions: number; deletions: number; patchOmitted: boolean }>;
     checks: {
@@ -173,12 +182,39 @@ const channel = async (peer: AuthenticatedMcpPeer, withProvenance = true) => {
   const client = new Client({ name: "pr-evidence", version: "1" });
   await client.connect(clientTransport);
   open.push(client, server);
-  return { client, call: async (args: Row): Promise<Answer> => {
-    const result = await client.callTool({ name: "pr_evidence_get", arguments: args, ...(withProvenance ? { _meta: OWNER_TURN } : {}) });
+  const raw = async (args: Row) =>
+    client.callTool({ name: "pr_evidence_get", arguments: args, ...(withProvenance ? { _meta: OWNER_TURN } : {}) });
+  return { client, raw, call: async (args: Row): Promise<Answer> => {
+    const result = await raw(args);
     // Every answer of the tool is structured; anything else (an RPC error) fails the case with its text.
     if (!result.structuredContent) throw new Error(`pr_evidence_get gave no structured answer: ${JSON.stringify(result.content)}`);
     return result.structuredContent as Answer;
   } };
+};
+
+/**
+ * What Hermes shows its model of a tool error: an MCP result with isError has its text blocks joined
+ * (hermes-agent tools/mcp_tool.py) and cut at 2048 characters (tools/registry.py `_MAX_TOOL_ERROR_CHARS`).
+ */
+const HERMES_TOOL_ERROR_CAP = 2048;
+const hermesView = (content: unknown): string =>
+  (content as Array<{ type: string; text?: string }>).map((block) => block.text ?? "").join("").slice(0, HERMES_TOOL_ERROR_CAP);
+
+/** What a reader of `seen` cannot find of an incomplete answer's key state; empty when all of it is there. */
+const missingKeyState = (seen: string, page: Page): string[] => {
+  const missing: string[] = [];
+  if (!seen.includes(`"reasonCode": "${ReasonCode.COVERAGE_INCOMPLETE}"`)) missing.push("reasonCode");
+  if (!seen.includes(`"baseSha": "${page.compared.baseSha}"`)) missing.push("baseSha");
+  if (!seen.includes(`"headSha": "${page.compared.headSha}"`)) missing.push("headSha");
+  if (!seen.includes(`"done": ${page.diff.done}`)) missing.push("done");
+  if (!seen.includes(`"hasNextCursor": ${page.diff.nextCursor !== null}`) && !(page.diff.nextCursor !== null && seen.includes(`"nextCursor": "`))) {
+    missing.push("nextCursor");
+  }
+  const kinds = new Map<string, number>();
+  for (const entry of page.incomplete) kinds.set(entry.kind, (kinds.get(entry.kind) ?? 0) + 1);
+  for (const [kind, n] of kinds) if (!seen.includes(`"${kind}": ${n}`)) missing.push(`count of ${kind}`);
+  if (!seen.includes(page.incomplete[0]!.detail.slice(0, 30))) missing.push("first detail");
+  return missing;
 };
 
 const ceoCall = async (args: Row): Promise<Answer> => (await channel(ceoPeer)).call(args);
@@ -232,8 +268,8 @@ afterAll(async () => {
 });
 
 /** A green 150-file PR at HEAD_A: two GitHub file pages, a passing check and status at the head. */
-const seedNormalPull = (number: number): void => {
-  gh.pulls.push(pullRow(number, HEAD_A, 150));
+const seedNormalPull = (number: number, extra: Row = {}): void => {
+  gh.pulls.push(pullRow(number, HEAD_A, 150, extra));
   gh.filesByHead.set(HEAD_A, Array.from({ length: 150 }, (_, i) => fileRow(i)));
   gh.checkRuns.push(
     { id: 1, name: "ci", head_sha: HEAD_A, status: "completed", conclusion: "success", app: { slug: "github-actions" },
@@ -431,6 +467,96 @@ describe("pr_evidence_get", () => {
       ]));
       expect(page.summary!.requiredChecks.allSatisfied).not.toBe(true);
     });
+  });
+
+  describe("mergeability on a pull request that is no longer open", () => {
+    /** GitHub never computes mergeability again once a pull request is closed: null and "unknown" for good. */
+    const uncomputed = { mergeable: null, mergeable_state: "unknown" };
+
+    it.each<[string, Row, string]>([
+      ["merged", { state: "closed", merged: true }, "NOT_APPLICABLE_MERGED"],
+      ["closed without merging", { state: "closed", merged: false }, "NOT_APPLICABLE_CLOSED"],
+    ])("names mergeability as not applying to a %s PR, which alone leaves the answer complete", async (_name, extra, mergeability) => {
+      seedNormalPull(23, { ...uncomputed, ...extra });
+      const page = pageOf(await ceoCall({ projectId, prNumber: 23, expectedHead: HEAD_A }));
+      expect(page).toMatchObject({ complete: true, incomplete: [] });
+      const pull = { state: "closed", merged: extra["merged"], mergeability };
+      expect(page.summary!.pull).toMatchObject({ ...pull, mergeable: null, mergeableState: "unknown" });
+      expect(page.brief.pull).toEqual(pull);
+      // Checks are judged at the head as for any PR: here they pass there.
+      expect(page.summary!.requiredChecks.allSatisfied).toBe(true);
+    });
+
+    it("still names an open PR whose mergeability GitHub has not computed as incomplete", async () => {
+      seedNormalPull(24, uncomputed);
+      const answer = await ceoCall({ projectId, prNumber: 24, expectedHead: HEAD_A });
+      expect(answer).toMatchObject({ ok: false, reasonCode: ReasonCode.COVERAGE_INCOMPLETE });
+      if (answer.ok) throw new Error("unreachable");
+      const page = answer.evidence as unknown as Page;
+      expect(page.incomplete).toEqual([expect.objectContaining({ kind: "MERGEABILITY_NOT_COMPUTED" })]);
+      expect(page.summary!.pull).toMatchObject({ state: "open", merged: false, mergeability: "NOT_COMPUTED" });
+      expect(page.summary!.requiredChecks.allSatisfied).toBeNull();
+    });
+
+    it("keeps a merged PR whose check read fails incomplete", async () => {
+      seedNormalPull(25, { ...uncomputed, state: "closed", merged: true });
+      gh.failing.push({ pattern: /\/check-runs/, status: 502 });
+      const answer = await ceoCall({ projectId, prNumber: 25, expectedHead: HEAD_A });
+      expect(answer).toMatchObject({ ok: false, reasonCode: ReasonCode.COVERAGE_INCOMPLETE });
+      if (answer.ok) throw new Error("unreachable");
+      const page = answer.evidence as unknown as Page;
+      expect(page.complete).toBe(false);
+      expect(page.incomplete).toEqual([expect.objectContaining({ kind: "LOOKUP_FAILED", status: 502, lookup: expect.stringContaining("/check-runs") })]);
+      expect(page.summary!.pull).toMatchObject({ merged: true, mergeability: "NOT_APPLICABLE_MERGED" });
+      expect(page.summary!.requiredChecks.allSatisfied).not.toBe(true);
+    });
+  });
+
+  it("keeps an incomplete answer's key state inside what Hermes shows of a tool error", async () => {
+    // Twenty files GitHub gave no patch for, each with a long path that JSON escapes, ahead of a diff larger than one page.
+    const longPath = (i: number): string => `assets/${"gen \"q\\\\\"/".repeat(18)}blob-${String(i).padStart(2, "0")}.bin`;
+    const omitted = Array.from({ length: 20 }, (_, i) => {
+      const row: Row = { ...fileRow(i), filename: longPath(i) };
+      delete row["patch"];
+      return row;
+    });
+    gh.filesByHead.set(HEAD_A, [...omitted, ...Array.from({ length: 150 }, (_, i) => fileRow(100 + i))]);
+    // Every kind of gap a first page can name, at once.
+    gh.pulls.push(pullRow(30, HEAD_A, 171, { mergeable: null, mergeable_state: "unknown" }));
+    gh.reshape = { compare: (body) => ({ ...body, status: null }), status: (body) => ({ ...body, sha: ELSEWHERE }) };
+    gh.failing.push({ pattern: /\/check-runs/, status: 502 }, { pattern: /\/branches\/main$/, status: 403 });
+    gh.rules.set("main", Array.from({ length: 1_000 }, () => ({ type: "deletion" })));
+
+    const { raw } = await channel(ceoPeer);
+    const result = await raw({ projectId, prNumber: 30, expectedHead: HEAD_A, pageChars: PR_EVIDENCE_DIFF_PAGE_MAX_CHARS - 1 });
+    expect(result.isError).toBe(true);
+    const body = result.structuredContent as { reasonCode: string; message: string; evidence: Row };
+    expect(body.reasonCode).toBe(ReasonCode.COVERAGE_INCOMPLETE);
+    const page = body.evidence as unknown as Page;
+    expect(page.incomplete.length).toBeGreaterThanOrEqual(25);
+    expect(new Set(page.incomplete.map((entry) => entry.kind)).size).toBe(8);
+    expect(page.diff.chars).toBe(PR_EVIDENCE_DIFF_PAGE_MAX_CHARS - 1);
+    expect(page.diff.nextCursor!.length).toBeGreaterThan(400);
+
+    const seen = hermesView(result.content);
+    expect(missingKeyState(seen, page)).toEqual([]);
+    // The page's text is not in view, and what is in view says where it is rather than presenting it.
+    expect(seen).not.toContain("diff --git");
+    expect(seen).toContain(`"chars": ${page.diff.chars}`);
+    expect(seen).toContain(JSON.stringify(page.brief.page.textAt));
+    expect(page.brief.gaps.first.length).toBeGreaterThan(1);
+    for (const first of page.brief.gaps.first) expect(seen).toContain(JSON.stringify(first));
+
+    // Mutation witnesses, through the same emitter: the field order this tool had before fails the check,
+    // and so does moving `incomplete` ahead of the diff without the bounded brief.
+    const emitted = (evidence: Row): string => hermesView(respond(deny(ReasonCode.COVERAGE_INCOMPLETE, body.message, evidence as Evidence)).content);
+    const e = body.evidence;
+    const before = { schema: e["schema"], projectId: e["projectId"], repositoryIdentity: e["repositoryIdentity"], repositoryRole: e["repositoryRole"],
+      prNumber: e["prNumber"], compared: e["compared"], diff: e["diff"], incomplete: e["incomplete"], complete: e["complete"], summary: e["summary"] };
+    expect(missingKeyState(emitted(before), page)).toEqual(expect.arrayContaining(["first detail", "count of PATCH_OMITTED"]));
+    const reorderedOnly = { schema: e["schema"], projectId: e["projectId"], repositoryIdentity: e["repositoryIdentity"], repositoryRole: e["repositoryRole"],
+      prNumber: e["prNumber"], compared: e["compared"], complete: e["complete"], incomplete: e["incomplete"], summary: e["summary"], diff: e["diff"] };
+    expect(missingKeyState(emitted(reorderedOnly), page)).toEqual(expect.arrayContaining(["done", "nextCursor", "count of PATCH_OMITTED"]));
   });
 
   it("names a PR over GitHub's 300-file compare limit as incomplete", async () => {
