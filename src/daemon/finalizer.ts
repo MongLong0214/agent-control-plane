@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type { ControlPlane } from "../app/control-plane.ts";
 import { NotificationKind } from "../ceo/production-gate.ts";
-import { MCP_THROWN_REFUSAL_WRITER, redactCredentialShapes } from "../core/credential-shapes.ts";
+import { MCP_THROWN_REFUSAL_WRITER, REDACTED, redactCredentialShapes } from "../core/credential-shapes.ts";
 import { type Decision, acpError, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { redact } from "../db/audit.ts";
@@ -302,6 +302,26 @@ const refusalText = (cp: ControlPlane, runId: string): ((text: string) => string
 /** A refusal's message as the finalizer passes it on (`refusalText`). */
 const refusalMessage = (cp: ControlPlane, runId: string, failure: Decision<unknown>): string =>
   failure.allowed ? "" : refusalText(cp, runId)(failure.message);
+
+/**
+ * A refusal's evidence as the finalizer records it (its FINALIZATION_ATTEMPT_FAILED record, the BLOCKED_POST_MERGE
+ * edge): the same shape, with every string in it, key or value at any depth, redacted as the refusal's text
+ * (`refusalText`). A digest the store does not hold for the run is gone, whole or inside text; one it holds, and
+ * every ACP id with no digest in it, is kept. A record nested deeper than the audit log reads is not kept.
+ */
+const refusalRecordEvidence = (cp: ControlPlane, runId: string, evidence: Record<string, unknown>): Record<string, unknown> => {
+  const scrub = refusalText(cp, runId);
+  const walk = (value: unknown, depth: number): unknown => {
+    if (typeof value === "string") return scrub(value);
+    if (value === null || typeof value !== "object") return value;
+    if (depth > 8) return REDACTED;
+    if (Array.isArray(value)) return value.map((item) => walk(item, depth + 1));
+    const prototype: unknown = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return value;
+    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [scrub(key), walk(nested, depth + 1)]));
+  };
+  return walk(evidence, 0) as Record<string, unknown>;
+};
 
 /**
  * #1189 §0 — a refusal's evidence as a FAILED notice copies it: its scalar values only, each string redacted as the
@@ -1478,7 +1498,7 @@ export class ApprovedRunFinalizer {
           {
             attemptId,
             failureReasonCode: failure.reasonCode,
-            failure: failure.evidence,
+            failure: refusalRecordEvidence(this.cp, runId, failure.evidence),
             compensation,
           },
         );
@@ -1529,13 +1549,15 @@ export class ApprovedRunFinalizer {
     const run = this.cp.runs.get(runId);
     const attempt = this.attempt(runId);
     const candidateDigest = attempt?.attempt_id === attemptId && attempt.state === "RUNNING" ? attempt.candidate_digest : null;
+    // The refusal's evidence as both of its records below keep it.
+    const recorded = refusalRecordEvidence(this.cp, runId, failure.evidence);
     if (failure.allowed || !run || candidateDigest === null ||
         (run.state !== RunState.CEO_APPROVED && run.state !== RunState.MERGING)) {
       this.cp.audit.record({
         kind: "FINALIZATION_ATTEMPT_FAILED",
         runId,
         reasonCode: failure.reasonCode,
-        evidence: { attemptId, ...failure.evidence },
+        evidence: { attemptId, ...recorded },
       });
       return failure as Decision<FinalizationResult>;
     }
@@ -1551,7 +1573,7 @@ export class ApprovedRunFinalizer {
       reasonCode: failure.reasonCode,
       evidence: {
         attemptId,
-        ...failure.evidence,
+        ...recorded,
         candidateSnapshotDigest: candidateDigest,
         disposition: route.disposition,
         ...(route.disposition === "RETRY" ? { failureClass: route.failureClass } : {}),

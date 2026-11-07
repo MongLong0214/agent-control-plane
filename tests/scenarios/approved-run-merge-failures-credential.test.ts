@@ -1,3 +1,5 @@
+import { randomBytes } from "node:crypto";
+
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { REDACTED } from "../../src/core/credential-shapes.ts";
@@ -951,6 +953,79 @@ describe("#1189 — a refusal's credential-shaped text is redacted wherever the 
         "SELECT evidence_json AS text FROM audit_events WHERE run_id = ? AND kind = 'FINALIZATION_FAILED_NOTICE'", [driven.runId]),
     ];
     for (const row of sinks) expect(row.text).not.toContain(unknownHex);
+    await fixture.daemon.stop();
+  });
+  /** Refusal evidence holding a runtime-generated 64-hex secret beside the run's own held digest and an ACP id. */
+  const evidenceWithSecret = (driven: Fixture["driven"]) => {
+    const secretHex = randomBytes(32).toString("hex");
+    const held = driven.candidateSnapshotDigest;
+    const evidence = {
+      observedDigest: secretHex, heldDigest: held, heldHex: held.slice("sha256:".length), runRef: driven.runId,
+      note: `the candidate ${held} was refused`, nested: { observedDigest: secretHex, heldDigest: held },
+    };
+    return { secretHex, evidence, kept: { ...evidence, observedDigest: REDACTED, nested: { observedDigest: REDACTED, heldDigest: held } } };
+  };
+
+  /** Not in any FINALIZATION_* record of the run, nor in any other audit record, outbox row or the run's own row. */
+  const expectNowhere = (fixture: Fixture, secretHex: string): void => {
+    const { harness, driven } = fixture;
+    const finalization = harness.cp.db.all<{ kind: string; text: string }>(
+      "SELECT kind, evidence_json AS text FROM audit_events WHERE run_id = ? AND kind LIKE 'FINALIZATION\\_%' ESCAPE '\\'", [driven.runId]);
+    expect(finalization.length).toBeGreaterThan(0);
+    for (const row of finalization) expect(row.text, row.kind).not.toContain(secretHex);
+    const elsewhere = [
+      ...harness.cp.db.all<{ text: string }>("SELECT evidence_json AS text FROM audit_events WHERE run_id = ?", [driven.runId]),
+      ...harness.cp.db.all<{ text: string }>("SELECT payload_json AS text FROM outbox WHERE run_id = ?", [driven.runId]),
+      ...harness.cp.db.all<{ text: string }>("SELECT json_object('r', state_reason) AS text FROM runs WHERE run_id = ?", [driven.runId]),
+    ];
+    for (const row of elsewhere) expect(row.text).not.toContain(secretHex);
+  };
+
+  it("an approved run's refusal record: a 64-hex secret in its evidence is redacted; the held digest and the ACP id are kept", async () => {
+    const fixture = await approved();
+    const { harness, driven } = fixture;
+    const { secretHex, evidence, kept } = evidenceWithSecret(driven);
+    vi.spyOn(harness.cp.github, "prPrepare").mockImplementation(async () =>
+      deny<{ pullNumber: number; url: string }>(ReasonCode.MERGE_CONFLICT, "GitHub refused the pull request", evidence));
+    expect(await start(fixture.daemon)).toBe(true);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.ACTIVE);
+    const refused = auditOf(fixture, "FINALIZATION_ATTEMPT_FAILED");
+    expect(refused).toHaveLength(1);
+    expect(refused[0]!.evidence).toMatchObject({ ...kept, disposition: "REVISION" });
+    expectNowhere(fixture, secretHex);
+    await fixture.daemon.stop();
+  });
+
+  it("a refusal recorded after the attempt lost its lease: a 64-hex secret in its evidence is redacted; the held digest and the ACP id are kept", async () => {
+    const fixture = await approved();
+    const { harness, driven } = fixture;
+    const { secretHex, evidence, kept } = evidenceWithSecret(driven);
+    vi.spyOn(harness.cp.github, "prPrepare").mockImplementation(async () => {
+      // Another daemon reclaimed the attempt while GitHub answered: the refusal is recorded, never routed.
+      harness.cp.db.run("UPDATE finalization_attempts SET state = 'RELEASED' WHERE run_id = ? AND state = 'RUNNING'", [driven.runId]);
+      return deny<{ pullNumber: number; url: string }>(ReasonCode.MERGE_CONFLICT, "GitHub refused the pull request", evidence);
+    });
+    expect(await start(fixture.daemon)).toBe(true);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
+    const refused = auditOf(fixture, "FINALIZATION_ATTEMPT_FAILED");
+    expect(refused).toHaveLength(1);
+    expect(refused[0]!.evidence).not.toHaveProperty("disposition");
+    expect(refused[0]!.evidence).toMatchObject(kept);
+    expectNowhere(fixture, secretHex);
+    await fixture.daemon.stop();
+  });
+
+  it("a refusal after the merge: the BLOCKED_POST_MERGE edge keeps the held digest and the ACP id of its evidence, and a 64-hex secret reaches no record", async () => {
+    const fixture = await approved();
+    const { harness, driven } = fixture;
+    const { secretHex, evidence, kept } = evidenceWithSecret(driven);
+    vi.spyOn(harness.cp.github, "postMergeVerify").mockResolvedValue(
+      deny(ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED, "the post-merge check could not be read", evidence));
+    expect(await start(fixture.daemon)).toBe(true);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.BLOCKED_POST_MERGE);
+    const edge = auditOf(fixture, "RUN_TRANSITION").find((entry) => entry.evidence.to === RunState.BLOCKED_POST_MERGE);
+    expect(edge?.evidence.failure).toMatchObject(kept);
+    expectNowhere(fixture, secretHex);
     await fixture.daemon.stop();
   });
 });
