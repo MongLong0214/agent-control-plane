@@ -2,8 +2,8 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   CONTINUITY_COVERAGE_REVOCATION_REASON,
-  CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX,
   CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON,
+  CONTINUITY_RUNTIME_LOST_REVOCATION_REASON,
 } from "../../src/continuity/continuity-kernel.ts";
 import { deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -1064,13 +1064,15 @@ describe("#1189 — a wait continuity placed for the CEO is handed back once the
         continuityAction: "PAUSE_NEW_WORK",
         continuityHold: CEO,
       });
-      // Two revocations of roles whose loss pauses the run, for the one reason the pause names.
-      const refused = `${CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX}${ReasonCode.SESSION_NOT_READY}`;
-      expect(f.harness.cp.db.all<{ role_key: string; reason: string }>(
-        `SELECT role_key, json_extract(evidence_json, '$.reason') AS reason FROM audit_events
+      // Two revocations of roles whose loss pauses the run, for the one reason the pause names; the
+      // refused failover is recorded beside it.
+      const lost = { reason: CONTINUITY_RUNTIME_LOST_REVOCATION_REASON, failoverRefusal: ReasonCode.SESSION_NOT_READY };
+      expect(f.harness.cp.db.all<{ role_key: string; reason: string; failoverRefusal: string }>(
+        `SELECT role_key, json_extract(evidence_json, '$.reason') AS reason,
+                json_extract(evidence_json, '$.failoverRefusal') AS failoverRefusal FROM audit_events
           WHERE kind = 'BINDING_REVOKED' AND event_id > ? AND role_key IN (?, ?) ORDER BY event_id`,
         [mark, CEO, reviewerRole],
-      )).toEqual([{ role_key: CEO, reason: refused }, { role_key: reviewerRole, reason: refused }]);
+      )).toEqual([{ role_key: CEO, ...lost }, { role_key: reviewerRole, ...lost }]);
       const paused = transitions(f, ready.runId).length;
 
       // The reviewer is back first: the pause was the CEO's, so the reviewer's return keeps it.

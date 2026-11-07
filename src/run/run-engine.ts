@@ -2,6 +2,7 @@ import type { DispatchCapacityTarget } from "../capacity/capacity-monitor.ts";
 import {
   CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX,
   CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON,
+  CONTINUITY_RUNTIME_LOST_REVOCATION_REASON,
   isContinuityRevocationReason,
 } from "../continuity/continuity-kernel.ts";
 import type { Clock } from "../core/clock.ts";
@@ -314,17 +315,21 @@ const recordedPauseOwner = (evidence: Record<string, unknown>): Omit<ContinuityO
 
 /**
  * S-HOLD — the reasons `Daemon.pauseAffectedRuns` pauses an ACTIVE run with that are not themselves a
- * continuity revocation reason: a refused failover (`failover refused: <reasonCode>`) and a failover
- * that left no ready planned binding. Every other pause reason is one of continuity's revocation reasons.
+ * continuity revocation reason: a lost runtime continuity did not fail over, a failover that left no
+ * ready planned binding, and, on rows written before the runtime-loss reason, a refused failover
+ * (`failover refused: <reasonCode>`). Every other pause reason is one of continuity's revocation reasons.
  */
 export const CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX = "failover refused: ";
 export const CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON = "failover did not leave a ready planned binding";
+/** Paired with `CONTINUITY_RUNTIME_LOST_REVOCATION_REASON`, and like the refused-failover pause it replaces, not one itself. */
+export const CONTINUITY_PAUSE_RUNTIME_LOST_REASON = "the runtime was lost and not failed over";
 
 const isContinuityPauseReason = (reason: unknown): reason is string =>
   typeof reason === "string" &&
   (isContinuityRevocationReason(reason) ||
     reason.startsWith(CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX) ||
-    reason === CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON);
+    reason === CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON ||
+    reason === CONTINUITY_PAUSE_RUNTIME_LOST_REASON);
 
 /** The revocation row paired with each reason `pauseAffectedRuns` records for the same loss. */
 const continuityRevocationReasonForPause = (reason: unknown): string | null => {
@@ -335,6 +340,9 @@ const continuityRevocationReasonForPause = (reason: unknown): string | null => {
   }
   if (reason === CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON) {
     return CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON;
+  }
+  if (reason === CONTINUITY_PAUSE_RUNTIME_LOST_REASON) {
+    return CONTINUITY_RUNTIME_LOST_REVOCATION_REASON;
   }
   return null;
 };
