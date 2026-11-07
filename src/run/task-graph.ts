@@ -1231,7 +1231,7 @@ export class TaskGraph {
    *
    * CEO msg_8f666e55 — a SUCCEEDED task is corrected the same way, and its record also binds both tasks'
    * receipts, execution, result digest and commit, in their one repository (`SupersessionBinding`): the
-   * freeze then counts only the correction (`succeededTaskCommits`), and a chain only its last task.
+   * freeze then counts only the correction (`supersessionOf`), and a chain only its last task.
    * Refused besides: either task with no SUCCEEDED commit receipt, or the two in different repositories.
    */
   registerCorrection(input: TaskCorrectionInput): Decision<{ correction: TaskCorrection; registered: boolean }> {

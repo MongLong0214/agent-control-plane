@@ -137,17 +137,10 @@ const importsOf = (recorded: unknown): TaskImport[] => {
  * Each task's latest SUCCEEDED attempt only, and only when its own SUCCEEDED evidence still reads
  * back by both its execution id and its stored result digest, the two values ACP-WORKER-02 bound
  * together when the receipt was written. A receipt that cannot be read back that way names nothing.
- * CEO msg_8f666e55 — a SUCCEEDED task a registered correction supersedes (`supersededTasks`) is no task
- * result: its receipt is left out here, and stays as it was.
+ * CEO msg_8f666e55 — a task a registered correction supersedes is read here like any other: only the
+ * freeze's task results leave it out (`supersessionOf`); a dependent task still starts from it (#1242).
  */
 export const succeededTaskCommits = (db: Db, runId: string): SucceededTaskCommit[] => {
-  const receipts = taskReceipts(db, runId);
-  const superseded = supersededTasks(db, runId, receipts);
-  return receipts.filter((receipt) => !superseded.has(receipt.taskId));
-};
-
-/** Every task's receipt as `succeededTaskCommits` reads it, superseded tasks' included. */
-const taskReceipts = (db: Db, runId: string): SucceededTaskCommit[] => {
   const rows = db.all<{ taskId: string; executionId: string; resultDigest: string; commitHead: unknown; repositoryIdentity: string | null; imports: unknown }>(
     `SELECT te.task_id AS taskId,
             te.execution_id AS executionId,
@@ -187,7 +180,7 @@ const taskReceipts = (db: Db, runId: string): SucceededTaskCommit[] => {
 
 /**
  * CEO msg_8f666e55 — what a registered correction of a SUCCEEDED task is bound to: the receipt each of the two
- * tasks has (`taskReceipts`), its execution, result digest and commit, in their one repository.
+ * tasks has (`succeededTaskCommits`), its execution, result digest and commit, in their one repository.
  */
 export interface SupersessionBinding {
   repositoryIdentity: string;
@@ -217,7 +210,17 @@ const bindingOf = (receipts: readonly SucceededTaskCommit[], originalTaskId: str
 
 /** CEO msg_8f666e55 — the binding `registerCorrection` records for a SUCCEEDED task and its correction, or why there is none. */
 export const supersessionBinding = (db: Db, runId: string, originalTaskId: string, correctionTaskId: string): Decision<SupersessionBinding> =>
-  bindingOf(taskReceipts(db, runId), originalTaskId, correctionTaskId);
+  bindingOf(succeededTaskCommits(db, runId), originalTaskId, correctionTaskId);
+
+/**
+ * CEO msg_8f666e55 — what the freeze's task results leave out (`superseded`), and the last task of each chain of
+ * corrections (`terminals`), whose change is read against the run's pinned base (`succeededTaskResults`): built
+ * on a task it supersedes, it carries what it kept of that task's change, which no other result now names.
+ */
+export interface Supersession {
+  superseded: ReadonlySet<string>;
+  terminals: ReadonlySet<string>;
+}
 
 /**
  * CEO msg_8f666e55 — the run's SUCCEEDED tasks a registered correction supersedes, read again from the records and
@@ -227,7 +230,7 @@ export const supersessionBinding = (db: Db, runId: string, originalTaskId: strin
  * FAILED task's correction (#1368) binds no receipt and supersedes nothing here. Nothing picks a winner by time or
  * ancestry: without such a relation every SUCCEEDED task is a result, and the path-level conflict check decides.
  */
-const supersededTasks = (db: Db, runId: string, receipts: readonly SucceededTaskCommit[]): Set<string> => {
+export const supersessionOf = (db: Db, runId: string, receipts: readonly SucceededTaskCommit[]): Supersession => {
   const relations = db
     .all<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`, [TASK_CORRECTION_REGISTERED, runId])
     .map((row) => JSON.parse(row.evidence_json) as { originalTaskId?: unknown; correctionTaskId?: unknown; supersedes?: unknown });
@@ -244,6 +247,7 @@ const supersededTasks = (db: Db, runId: string, receipts: readonly SucceededTask
     if (claims.some((claim) => claim.supersedes !== undefined && digestOf(claim.supersedes) === current)) replacedBy.set(originalTaskId, correctionTaskId);
   }
   const superseded = new Set<string>();
+  const terminals = new Set<string>();
   for (const taskId of replacedBy.keys()) {
     const seen = new Set<string>();
     let at = taskId;
@@ -251,9 +255,11 @@ const supersededTasks = (db: Db, runId: string, receipts: readonly SucceededTask
       seen.add(at);
       at = replacedBy.get(at)!;
     }
-    if (!replacedBy.has(at)) superseded.add(taskId);
+    if (replacedBy.has(at)) continue;
+    superseded.add(taskId);
+    terminals.add(at);
   }
-  return superseded;
+  return { superseded, terminals };
 };
 
 /**
@@ -268,6 +274,8 @@ export const succeededTaskResults = (
   tasks: readonly TaskRecord[],
   commits: readonly SucceededTaskCommit[],
   repositoryIdentity: string,
+  /** CEO msg_8f666e55 — the chains' last tasks (`Supersession.terminals`): each one's change is read from `baseSha`. */
+  measuredFromBase: ReadonlySet<string> = new Set(),
 ): TaskResult[] => {
   const titles = new Map(tasks.map((task) => [task.taskId, task.title]));
   const results: TaskResult[] = [];
@@ -281,7 +289,7 @@ export const succeededTaskResults = (
       commit: succeeded.commit,
       declaredParent: target.declaredParent,
       baseSha: target.baseSha,
-      ...(target.startsFrom ? { startSha: startOf(target) } : {}),
+      ...(target.startsFrom && !measuredFromBase.has(succeeded.taskId) ? { startSha: startOf(target) } : {}),
     });
   }
   return results;
@@ -680,15 +688,17 @@ export const integrateTaskResults = async (input: {
   db: Db;
   runId: string;
   tasks: readonly TaskRecord[];
-  /** `succeededTaskCommits` of the run, read once by the freeze for the integration and its guard. */
+  /** The freeze's task results: `succeededTaskCommits` of the run, read once, less what a correction supersedes. */
   commits: readonly SucceededTaskCommit[];
   repositoryIdentity: string;
   checkoutPath: string;
   worktree: RunWorktree;
   /** #1268 — given for a run whose contract requires CommitLore. */
   checkMessage?: CheckMergeMessage;
+  /** CEO msg_8f666e55 — `Supersession.terminals`: each one's change is read against the pinned base. */
+  measuredFromBase?: ReadonlySet<string>;
 }): Promise<Decision<IntegratedCandidate | null>> => {
-  const results = succeededTaskResults(input.db, input.runId, input.tasks, input.commits, input.repositoryIdentity);
+  const results = succeededTaskResults(input.db, input.runId, input.tasks, input.commits, input.repositoryIdentity, input.measuredFromBase);
   if (results.length === 0) return allow(ReasonCode.OK, null);
 
   // Read-only, over the registered checkout: everything is decided, and every conflict refused,
@@ -865,7 +875,8 @@ export const integratePredecessors = async (input: {
  * left it: the same mode and blob, or absent for a deletion. The one exception is a path that a later
  * recorded task commit descending from it changed too (that task was built on top of it); the later
  * version is then the one asked for. A task without dependsOn predecessors starts at the pinned base
- * and descends from no other task (S-TB); a dependent one is built on its predecessors (#1242).
+ * and descends from no other task (S-TB); a dependent one is built on its predecessors (#1242). The last
+ * task of a chain of corrections (`measuredFromBase`) is asked against the pinned base, as it is integrated.
  * Read-only, over the registered checkout. Lists each task with the paths it lost.
  */
 export const lostTaskChanges = async (input: {
@@ -875,6 +886,7 @@ export const lostTaskChanges = async (input: {
   repositoryIdentity: string;
   checkoutPath: string;
   candidateHead: string;
+  measuredFromBase?: ReadonlySet<string>;
 }): Promise<Decision<Array<{ taskId: string; commitHead: string; paths: string[] }>>> => {
   const here = input.commits.filter((commit) => commit.repositoryIdentity === input.repositoryIdentity);
   if (here.length < 2) return allow(ReasonCode.OK, []);
@@ -886,7 +898,7 @@ export const lostTaskChanges = async (input: {
     const changes = new Map<string, Map<string, string>>();
     for (const commit of here) {
       const target = targets.get(commit.taskId);
-      const base = target?.repositoryIdentity === input.repositoryIdentity ? startOf(target) : shared;
+      const base = target?.repositoryIdentity !== input.repositoryIdentity ? shared : input.measuredFromBase?.has(commit.taskId) ? target.baseSha : startOf(target);
       changes.set(commit.taskId, new Map((await committedChanges(repo, base, commit.commit)).map((change) => [change.path, entryOf(change)])));
     }
     const descends = new Map<string, boolean>();

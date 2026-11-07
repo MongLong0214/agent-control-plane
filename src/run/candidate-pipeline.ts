@@ -66,6 +66,7 @@ import {
   lostTaskChanges,
   recordedPredecessorMergeChecks,
   succeededTaskCommits,
+  supersessionOf,
   undoCandidateRefLines,
 } from "./candidate-integration.ts";
 import type { RunEngine, TaskContract } from "./run-engine.ts";
@@ -451,6 +452,11 @@ export class CandidatePipeline {
     // One read of the run's SUCCEEDED task commits: what the integration places and what the
     // missing-commit guard below asks the final candidate for are the same commits (S6-B, S6-C).
     const commits = participants.length === 0 ? [] : succeededTaskCommits(this.db, runId);
+    // CEO msg_8f666e55 — the task results are those commits less what a registered correction supersedes; the
+    // integration and its missing-commit and missing-change checks read these alone. Every receipt still accounts
+    // for its own commit (#1268) and binds its imports (#1232), superseded or not.
+    const supersession = supersessionOf(this.db, runId, commits);
+    const results = commits.filter((commit) => !supersession.superseded.has(commit.taskId));
     const repositories: SnapshotRepositoryInput[] = [];
     // #1268 — every merge commit the integration makes has its message checked by CommitLore when the run requires it.
     const checkMergeMessages = this.checkMergeMessages(runId);
@@ -490,7 +496,7 @@ export class CandidatePipeline {
         }
         // A candidate that will be this checkout's HEAD (the integration takes it as it is) is asked now too, from the
         // base its snapshot will be frozen with (`sourceAtFreeze`, else the base branch), read-only like the rest.
-        const head = await checkoutHeadAsCandidate({ db: this.db, runId, tasks, commits, repositoryIdentity: repo.identity, checkoutPath: repo.checkoutPath });
+        const head = await checkoutHeadAsCandidate({ db: this.db, runId, tasks, commits: results, repositoryIdentity: repo.identity, checkoutPath: repo.checkoutPath });
         if (!head.allowed) return head as Decision<CandidateSnapshot>;
         if (head.value === null) continue;
         const source = await this.sourceAtFreeze(repo.checkoutPath, repo.workBranch, repo.baseBranch, profile, { runId, identity: repo.identity });
@@ -516,7 +522,8 @@ export class CandidatePipeline {
         db: this.db,
         runId,
         tasks,
-        commits,
+        commits: results,
+        measuredFromBase: supersession.terminals,
         repositoryIdentity: repo.identity,
         checkoutPath: repo.checkoutPath,
         worktree: (input, use) => this.verification.withRunWorktree(run, input, use),
@@ -625,7 +632,7 @@ export class CandidatePipeline {
     // before it is ever persisted as this run's current candidate. Asked of the final candidate
     // head, integrated or not: the post-condition of the integration above, never replaced by it.
     if (participants.length > 0) {
-      const missing = await this.missingTaskCommits(commits, snapshot.repositories, repositories);
+      const missing = await this.missingTaskCommits(results, snapshot.repositories, repositories);
       if (missing.length > 0) {
         return deny(
           ReasonCode.CANDIDATE_MISSING_TASK_COMMIT,
@@ -639,7 +646,7 @@ export class CandidatePipeline {
       for (const frozen of snapshot.repositories) {
         const checkoutPath = repositories.find((repo) => repo.identity === frozen.identity)?.checkoutPath;
         if (!checkoutPath) continue;
-        const lost = await lostTaskChanges({ db: this.db, runId, commits, repositoryIdentity: frozen.identity, checkoutPath, candidateHead: frozen.candidateHead });
+        const lost = await lostTaskChanges({ db: this.db, runId, commits: results, repositoryIdentity: frozen.identity, checkoutPath, candidateHead: frozen.candidateHead, measuredFromBase: supersession.terminals });
         if (!lost.allowed) return lost as Decision<CandidateSnapshot>;
         if (lost.value.length > 0) {
           const named = lost.value.map((task) => `${task.taskId} (${task.paths.join(", ")})`).join("; ");

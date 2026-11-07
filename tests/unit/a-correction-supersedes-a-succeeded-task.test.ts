@@ -7,6 +7,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, RunKind, TaskState } from "../../src/domain/types.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
 import { TASK_CORRECTION_REGISTERED } from "../../src/run/task-graph.ts";
+import type { StartsFrom } from "../../src/run/task-write-target.ts";
 import { WorkerTurnEvent, workerSuccessDigest } from "../../src/run/worker-turn.ts";
 import { callCtoTool } from "../helpers/cto-tool.ts";
 import { cleanupTempDirs, commitAll, gitSync, tempDir, writeFiles } from "../helpers/fixtures.ts";
@@ -87,24 +88,27 @@ const governedRun = async () => {
   const call = (name: string, args: Record<string, unknown>) => callCtoTool(h, owner, name, { idempotencyKey: `sup-${++seq}`, runId, ...args });
   const byTitle = (title: string) => h.cp.tasks.list(runId).find((task) => task.title === title)!.taskId;
   /** One PLAN: the unit holds the tasks already planned and the new ones, by key. */
-  const plan = async (tasks: Array<{ key: string; spec?: Record<string, unknown> }>) => {
+  const plan = async (tasks: Array<{ key: string; spec?: Record<string, unknown>; dependsOn?: string[] }>) => {
     const planned = h.cp.tasks.list(runId).map((task) => task.taskId);
     const answer = await call("plan_submit", {
       plan: { summary: "migration unit 2", workUnits: [{ ...UNIT, tasks: [...planned, ...tasks.map((task) => task.key)] }] },
-      tasks: tasks.map((task) => ({ key: task.key, title: task.key, category: "implementation", spec: task.spec ?? {} })),
+      tasks: tasks.map((task) => ({ key: task.key, title: task.key, category: "implementation", spec: task.spec ?? {}, ...(task.dependsOn ? { dependsOn: task.dependsOn } : {}) })),
     });
     expect(answer, JSON.stringify(answer).slice(0, 600)).toMatchObject({ ok: true });
     return tasks.map((task) => byTitle(task.key));
   };
   /**
-   * One SUCCEEDED turn of `taskId`: its branch at the pinned base (or at `from`), its write target, its commit
-   * of `content` at PATH, and the receipt naming it. `repositoryId` puts the execution in another repository.
+   * One SUCCEEDED turn of `taskId`: its branch at the pinned base (or at `startsFrom`, #1242), its write target,
+   * its commit of `content` at PATH (or of `files`), and the receipt naming it. `repositoryId` puts the execution
+   * in another repository.
    */
-  const succeed = (taskId: string, content: string, options: { from?: string; repositoryId?: string } = {}) => {
+  const succeed = (taskId: string, content: string, options: { files?: Record<string, string>; startsFrom?: StartsFrom; repositoryId?: string } = {}) => {
     const branch = `task/${taskId}`;
-    gitSync(repo, ["checkout", "-q", "-B", branch, options.from ?? base]);
-    h.cp.audit.record({ kind: "TASK_WRITE_TARGET_RECORDED", runId, evidence: { taskId, writeTarget: { repositoryIdentity: IDENTITY, branch, paths: [PATH], declaredParent: "dev", baseSha: base } } });
-    writeFiles(repo, { [PATH]: content });
+    const files = options.files ?? { [PATH]: content };
+    gitSync(repo, ["checkout", "-q", "-B", branch, options.startsFrom?.commit ?? base]);
+    const writeTarget = { repositoryIdentity: IDENTITY, branch, paths: Object.keys(files), declaredParent: "dev", baseSha: base, ...(options.startsFrom ? { startsFrom: options.startsFrom } : {}) };
+    h.cp.audit.record({ kind: "TASK_WRITE_TARGET_RECORDED", runId, evidence: { taskId, writeTarget } });
+    writeFiles(repo, files);
     const commit = commitAll(repo, `${taskId}: ${content}`);
     const workerSessionId = bindWorker(h, taskId);
     const opened = h.cp.tasks.startExecution({ runId, taskId, ownerBindingGeneration: h.cp.runs.require(runId).ownerBindingGeneration!, workerSessionId, provider: "scripted", model: "scripted-worker", repositoryId: options.repositoryId ?? project.repositoryId });
@@ -116,7 +120,7 @@ const governedRun = async () => {
     const resultDigest = workerSuccessDigest(inputs);
     const closed = h.cp.tasks.finishExecution(opened.value.executionId, { status: "SUCCEEDED", resultDigest }, runId);
     if (!closed.allowed) throw new Error(`${closed.reasonCode}: ${closed.message}`);
-    h.cp.audit.record({ kind: WorkerTurnEvent.SUCCEEDED, runId, sessionId: workerSessionId, evidence: { ...inputs, resultDigest, taskId, head: base, paths: [PATH], commitlore: { outcome: "empty", recordIds: [], nonce: null } } });
+    h.cp.audit.record({ kind: WorkerTurnEvent.SUCCEEDED, runId, sessionId: workerSessionId, evidence: { ...inputs, resultDigest, taskId, head: base, paths: Object.keys(files), commitlore: { outcome: "empty", recordIds: [], nonce: null } } });
     return { commit, executionId: opened.value.executionId };
   };
   const acceptanceOf = async (taskId: string): Promise<string> => {
@@ -128,13 +132,16 @@ const governedRun = async () => {
     call("task_correction_register", { taskId: correction, corrects: { taskId: original, acceptanceDigest: acceptanceDigest ?? await acceptanceOf(original) } });
   const records = () => h.cp.audit.byKind(TASK_CORRECTION_REGISTERED);
   const freeze = () => h.cp.pipeline.freeze(runId);
+  /** The base #1242 builds for `taskId` from the SUCCEEDED tasks it depends on. */
+  const predecessorBase = (taskId: string, predecessors: string[]) =>
+    h.cp.pipeline.predecessorBase({ runId, taskId, predecessors, repositoryIdentity: IDENTITY, checkoutPath: repo, baseSha: base });
   /** What a supersession must leave as it was: the task, its executions and its receipts. */
   const rowsOf = (taskId: string) => ({
     task: h.cp.db.get(`SELECT * FROM tasks WHERE task_id = ?`, [taskId]),
     executions: h.cp.db.all(`SELECT * FROM task_executions WHERE task_id = ? ORDER BY attempt`, [taskId]),
     receipts: h.cp.audit.byKind(WorkerTurnEvent.SUCCEEDED).filter((row) => row.evidence["taskId"] === taskId),
   });
-  return { h, project, runId, holderRunId: holder.value.runId, repo, base, plan, succeed, register, records, freeze, rowsOf };
+  return { h, project, runId, holderRunId: holder.value.runId, repo, base, plan, succeed, register, records, freeze, predecessorBase, rowsOf };
 };
 type Run = Awaited<ReturnType<typeof governedRun>>;
 
@@ -244,5 +251,56 @@ describe("CEO msg_8f666e55 — a SUCCEEDED task superseded by a registered corre
     const refused = await r.freeze();
     expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
     expect(conflictPairs(refused.evidence)).toEqual([[u2b, unrelated].sort()]);
+  });
+
+  it("review r1 P2-1 — a dependent of a superseded task still starts from that task's commit: provisioning reads every SUCCEEDED receipt", async () => {
+    const r = await governedRun();
+    const [a] = await r.plan([{ key: "A" }]) as [string];
+    const first = r.succeed(a, "A");
+    const [b, w] = await r.plan([{ key: "B", spec: correctionOf(a) }, { key: "W", dependsOn: ["A"] }]) as [string, string];
+    r.succeed(b, "B");
+    const before = await r.predecessorBase(w, [a]);
+    expect(before, JSON.stringify(before).slice(0, 400)).toMatchObject({ allowed: true, value: { predecessors: [{ taskId: a, commit: first.commit }] } });
+    expect(await r.register(b, a)).toMatchObject({ ok: true, value: { registered: true } });
+
+    // A's execution and receipt are as they were, so W's base is too.
+    const after = await r.predecessorBase(w, [a]);
+    expect(after, JSON.stringify(after).slice(0, 400)).toMatchObject({ allowed: true });
+    expect(after.allowed ? after.value : null).toEqual(before.allowed ? before.value : undefined);
+  });
+
+  it("review r1 P2-2 — a correction built on the task it supersedes keeps what it inherited; an unrelated change to an inherited path still conflicts", async () => {
+    const r = await governedRun();
+    const [a] = await r.plan([{ key: "A" }]) as [string];
+    const first = r.succeed(a, "", { files: { "one.txt": "A one\n", "two.txt": "A two\n" } });
+    const onA: StartsFrom = { commit: first.commit, predecessors: [{ taskId: a, commit: first.commit }] };
+    const [b, w] = await r.plan([{ key: "B", spec: correctionOf(a), dependsOn: ["A"] }, { key: "W", dependsOn: ["A"] }]) as [string, string];
+    const correction = r.succeed(b, "", { files: { "one.txt": "B one\n" }, startsFrom: onA });
+    const dependent = r.succeed(w, "", { files: { "three.txt": "W three\n" }, startsFrom: onA });
+    gitSync(r.repo, ["checkout", "-q", `task/${a}`]);
+    const tree = (head: string) => Object.fromEntries(["one.txt", "two.txt", "three.txt"].map((path) => [path, gitSync(r.repo, ["show", `${head}:${path}`])]));
+    const expected = { "one.txt": "B one", "two.txt": "A two", "three.txt": "W three" };
+
+    const unregistered = await r.freeze();
+    expect(unregistered, JSON.stringify(unregistered).slice(0, 600)).toMatchObject({ allowed: true });
+    if (!unregistered.allowed) return;
+    expect(tree(unregistered.value.repositories[0]!.candidateHead)).toEqual(expected);
+
+    expect(await r.register(b, a)).toMatchObject({ ok: true, value: { registered: true } });
+    const frozen = await r.freeze();
+    expect(frozen, JSON.stringify(frozen).slice(0, 600)).toMatchObject({ allowed: true });
+    if (!frozen.allowed) return;
+    const [repository] = frozen.value.repositories;
+    expect(tree(repository!.candidateHead)).toEqual(expected);
+    expect(repository!.integration?.tasks.map((task) => task.taskId).sort()).toEqual([b, w].sort());
+    expect(repository!.integration?.tasks).toEqual(expect.arrayContaining([{ taskId: b, commit: correction.commit }, { taskId: w, commit: dependent.commit }]));
+
+    // two.txt is A's, inherited by B: an unrelated task changing it is a conflict with B, not a silent replacement.
+    const [u] = await r.plan([{ key: "U" }]) as [string];
+    r.succeed(u, "", { files: { "two.txt": "U two\n" } });
+    gitSync(r.repo, ["checkout", "-q", `task/${a}`]);
+    const refused = await r.freeze();
+    expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+    expect(conflictPairs(refused.evidence)).toEqual([[b, u].sort()]);
   });
 });
