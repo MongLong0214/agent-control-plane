@@ -243,6 +243,13 @@ export const ReasonCode = {
   IMPORT_CONTENT_REFUSED: "IMPORT_CONTENT_REFUSED",
   TASK_RECEIPT_MISSING: "TASK_RECEIPT_MISSING",
   TASK_RESULT_COUNT_MISMATCH: "TASK_RESULT_COUNT_MISMATCH",
+  /**
+   * CEO msg_8f666e55 (review r2) — a SUCCEEDED task a correction would supersede has a task outside its own
+   * chain of corrections building on it (dependsOn, or a base recorded to start from it, #1242). No candidate
+   * both drops the task and keeps what was built on it, so the correction is not registered, or the freeze
+   * that would honour a registered one is refused.
+   */
+  CORRECTION_ORIGINAL_HAS_DEPENDENTS: "CORRECTION_ORIGINAL_HAS_DEPENDENTS",
 
   // --- session / binding ---------------------------------------------------
   SESSION_NOT_READY: "SESSION_NOT_READY",

@@ -13,6 +13,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import type { SupersessionBinding } from "./candidate-integration.ts";
+import { recordedWriteTarget } from "./task-write-target.ts";
 import type { WorkScopeTracking } from "./work-scope-tracking.ts";
 import {
   type FailureClass,
@@ -230,6 +231,20 @@ export const bootstrapPlanTaskRecorded = (db: Pick<Db, "all">, runId: string, ta
 export interface WorkerExecutionBindingGate {
   hasLiveWorkerBinding(taskId: string, sessionId: string): boolean;
 }
+
+/**
+ * CEO msg_8f666e55 (review r2) — the run's live tasks, other than `taskId` and `exempt`, that build on `taskId`: they
+ * name it in dependsOn, or the write target recorded for them starts from a base that holds it (#1242). Asked of a
+ * SUCCEEDED task a correction supersedes, `exempt` being the corrections after it in its chain.
+ */
+export const tasksBuildingOn = (db: Db, runId: string, taskId: string, exempt: ReadonlySet<string>): string[] => {
+  const named = new Set(db.all<{ task_id: string }>(`SELECT task_id FROM task_dependencies WHERE depends_on = ?`, [taskId]).map((row) => row.task_id));
+  return db
+    .all<{ task_id: string }>(`SELECT task_id FROM tasks WHERE run_id = ? AND state != 'CANCELLED' ORDER BY task_id`, [runId])
+    .map((row) => row.task_id)
+    .filter((id) => id !== taskId && !exempt.has(id))
+    .filter((id) => named.has(id) || (recordedWriteTarget(db, runId, id)?.startsFrom?.predecessors ?? []).some((predecessor) => predecessor.taskId === taskId));
+};
 
 /** CEO msg_8f666e55 — the receipt binding of a SUCCEEDED task and its correction (`supersessionBinding`), or why there is none. */
 export type SupersessionReader = (runId: string, originalTaskId: string, correctionTaskId: string) => Decision<SupersessionBinding>;
@@ -1232,7 +1247,9 @@ export class TaskGraph {
    * CEO msg_8f666e55 — a SUCCEEDED task is corrected the same way, and its record also binds both tasks'
    * receipts, execution, result digest and commit, in their one repository (`SupersessionBinding`): the
    * freeze then counts only the correction (`supersessionOf`), and a chain only its last task.
-   * Refused besides: either task with no SUCCEEDED commit receipt, or the two in different repositories.
+   * Refused besides: either task with no SUCCEEDED commit receipt, or the two in different repositories; and
+   * (review r2) a task of the chain the relation completes that a task outside the chain after it builds on
+   * (`tasksBuildingOn`), CORRECTION_ORIGINAL_HAS_DEPENDENTS.
    */
   registerCorrection(input: TaskCorrectionInput): Decision<{ correction: TaskCorrection; registered: boolean }> {
     // Every refusal precedes the one write, the record; a refused record throws, which rolls it back.
@@ -1303,6 +1320,15 @@ export class TaskGraph {
           ?? deny<SupersessionBinding>(ReasonCode.TASK_RECEIPT_MISSING, "no receipt reader is composed", { refusal: "CORRECTION_RECEIPT_MISSING" });
         if (!bound.allowed) return refuse(bound.reasonCode, String(bound.evidence["refusal"]), bound.message, bound.evidence);
         supersedes = bound.value;
+        const chain = this.#chainThrough(registered, originalTaskId, correctionTaskId);
+        for (const [at, supersededTaskId] of chain.slice(0, -1).entries()) {
+          const dependents = tasksBuildingOn(this.db, runId, supersededTaskId, new Set(chain.slice(at + 1)));
+          if (dependents.length > 0) {
+            return refuse(ReasonCode.CORRECTION_ORIGINAL_HAS_DEPENDENTS, "CORRECTION_ORIGINAL_HAS_DEPENDENTS", "a task outside the correction's chain builds on a task it would supersede; no candidate both drops that task and keeps what was built on it", {
+              supersededTaskId, dependents,
+            });
+          }
+        }
       }
       const acceptanceDigest = input.corrects.acceptanceDigest;
       const same = registered.find((r) => r.originalTaskId === originalTaskId && r.correctionTaskId === correctionTaskId && r.acceptanceDigest === acceptanceDigest && r.workUnit === workUnit &&
@@ -1348,6 +1374,27 @@ export class TaskGraph {
           ? [{ eventId: row.event_id, originalTaskId, correctionTaskId, workUnit, acceptanceDigest, ...(supersedes === undefined ? {} : { supersedes: supersedes as SupersessionBinding }) }]
           : [];
       });
+  }
+
+  /**
+   * Review r2 — the chain of SUCCEEDED tasks and their corrections that registering `original` -> `correction` makes,
+   * first task first: the registered relations that bind receipts, followed back from `original` and on from
+   * `correction`. A cycle is refused before this is asked.
+   */
+  #chainThrough(registered: readonly TaskCorrection[], original: string, correction: string): string[] {
+    const binding = registered.filter((r) => r.supersedes !== undefined);
+    const chain = [original, correction];
+    for (;;) {
+      const before = binding.find((r) => r.correctionTaskId === chain[0]);
+      if (!before || chain.includes(before.originalTaskId)) break;
+      chain.unshift(before.originalTaskId);
+    }
+    for (;;) {
+      const after = binding.find((r) => r.originalTaskId === chain.at(-1));
+      if (!after || chain.includes(after.correctionTaskId)) break;
+      chain.push(after.correctionTaskId);
+    }
+    return chain;
   }
 
   /** Whether `from`, followed through the corrections it is registered as, reaches `target`. */

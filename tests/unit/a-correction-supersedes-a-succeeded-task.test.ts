@@ -2,6 +2,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { createBootstrapGitHubWritePort } from "../../src/bootstrap/bootstrap-write-guard.ts";
 import { sha256 } from "../../src/core/digest.ts";
+import type * as Ids from "../../src/core/ids.ts";
 import { acpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, RunKind, TaskState } from "../../src/domain/types.ts";
@@ -13,8 +14,18 @@ import { callCtoTool } from "../helpers/cto-tool.ts";
 import { cleanupTempDirs, commitAll, gitSync, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { bindCeo, bindWorker, makeHarness, registerFixtureProject, type Harness } from "../helpers/harness.ts";
 
+/** Task ids the task graph mints next, when a test sets them: which of two ready tasks integrates first. */
+const seeded = vi.hoisted(() => ({ taskIds: [] as string[] }));
+vi.mock("../../src/core/ids.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof Ids>();
+  return { ...actual, newTaskId: () => (seeded.taskIds.shift() ?? actual.newTaskId()) as ReturnType<typeof actual.newTaskId> };
+});
+
 afterAll(cleanupTempDirs);
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  seeded.taskIds.length = 0;
+});
 
 /**
  * CEO msg_8f666e55 — a SUCCEEDED task superseded by a correction: once the run's owner registers the relation
@@ -158,6 +169,37 @@ const liveChain = async (r: Run) => {
   return { u2a: u2a!, u2b: u2b!, u2c: u2c!, a, b, c };
 };
 
+const HAS_DEPENDENTS = "CORRECTION_ORIGINAL_HAS_DEPENDENTS";
+const BASE_README = "# fixture project\n";
+
+/** A base built on `taskId`'s commit alone, as #1242 records it for a task depending on it. */
+const onCommit = (taskId: string, commit: string): StartsFrom => ({ commit, predecessors: [{ taskId, commit }] });
+
+/** What `paths` hold at `head`. */
+const treeOf = (r: Run, head: string, paths: string[]) => Object.fromEntries(paths.map((path) => [path, gitSync(r.repo, ["show", `${head}:${path}`])]));
+
+/**
+ * Review r2 — A, its correction B built on it (dependsOn and start), and W, which depends on and starts from A too.
+ * W is planned and run `before` A -> B is registered, or `after`; the checkout is left on A's branch so the freeze
+ * integrates. What the registration and the freeze then answer.
+ */
+const buildsOnOriginal = async (r: Run, files: Record<"a" | "b" | "w", Record<string, string>>, dependent: "before" | "after") => {
+  const [a] = await r.plan([{ key: "A" }]) as [string];
+  const first = r.succeed(a, "", { files: files.a });
+  const [b] = await r.plan([{ key: "B", spec: correctionOf(a), dependsOn: ["A"] }]) as [string];
+  r.succeed(b, "", { files: files.b, startsFrom: onCommit(a, first.commit) });
+  const plant = async () => {
+    const [w] = await r.plan([{ key: "W", dependsOn: ["A"] }]) as [string];
+    r.succeed(w, "", { files: files.w, startsFrom: onCommit(a, first.commit) });
+    return w;
+  };
+  const before = dependent === "before" ? await plant() : null;
+  const registered = await r.register(b, a);
+  const w = before ?? await plant();
+  gitSync(r.repo, ["checkout", "-q", `task/${a}`]);
+  return { a, b, w, repo: r.repo, base: r.base, registered, records: r.records(), frozen: await r.freeze() };
+};
+
 const refusal = (answer: Record<string, unknown>) => (answer["evidence"] as { refusal?: string } | undefined)?.refusal;
 const conflictPairs = (evidence: unknown) => ((evidence as { conflicts?: Array<{ tasks: string[] }> }).conflicts ?? []).map((conflict) => [...conflict.tasks].sort());
 
@@ -253,47 +295,46 @@ describe("CEO msg_8f666e55 — a SUCCEEDED task superseded by a registered corre
     expect(conflictPairs(refused.evidence)).toEqual([[u2b, unrelated].sort()]);
   });
 
-  it("review r1 P2-1 — a dependent of a superseded task still starts from that task's commit: provisioning reads every SUCCEEDED receipt", async () => {
+  it("review r1 P2-1 — a dependent planned after the supersession still starts from the superseded task's commit; the freeze then refuses it by name", async () => {
     const r = await governedRun();
     const [a] = await r.plan([{ key: "A" }]) as [string];
     const first = r.succeed(a, "A");
-    const [b, w] = await r.plan([{ key: "B", spec: correctionOf(a) }, { key: "W", dependsOn: ["A"] }]) as [string, string];
+    const [b] = await r.plan([{ key: "B", spec: correctionOf(a) }]) as [string];
     r.succeed(b, "B");
-    const before = await r.predecessorBase(w, [a]);
-    expect(before, JSON.stringify(before).slice(0, 400)).toMatchObject({ allowed: true, value: { predecessors: [{ taskId: a, commit: first.commit }] } });
     expect(await r.register(b, a)).toMatchObject({ ok: true, value: { registered: true } });
 
-    // A's execution and receipt are as they were, so W's base is too.
-    const after = await r.predecessorBase(w, [a]);
-    expect(after, JSON.stringify(after).slice(0, 400)).toMatchObject({ allowed: true });
-    expect(after.allowed ? after.value : null).toEqual(before.allowed ? before.value : undefined);
+    // A's execution and receipt are as they were: provisioning reads every SUCCEEDED receipt.
+    const [w] = await r.plan([{ key: "W", dependsOn: ["A"] }]) as [string];
+    const based = await r.predecessorBase(w, [a]);
+    expect(based, JSON.stringify(based).slice(0, 400)).toMatchObject({ allowed: true, value: { predecessors: [{ taskId: a, commit: first.commit }] } });
+    expect(await r.freeze()).toMatchObject({ allowed: false, reasonCode: HAS_DEPENDENTS, evidence: { refusal: HAS_DEPENDENTS, supersededTaskId: a, dependents: [w] } });
+    // Extending the chain asks the same of every task it supersedes: C would supersede B, and so A, which W builds on.
+    const [c] = await r.plan([{ key: "C", spec: correctionOf(b) }]) as [string];
+    r.succeed(c, "C");
+    expect(await r.register(c, b)).toMatchObject({ ok: false, reasonCode: HAS_DEPENDENTS, evidence: { refusal: HAS_DEPENDENTS, supersededTaskId: a, dependents: [w] } });
   });
 
   it("review r1 P2-2 — a correction built on the task it supersedes keeps what it inherited; an unrelated change to an inherited path still conflicts", async () => {
     const r = await governedRun();
     const [a] = await r.plan([{ key: "A" }]) as [string];
     const first = r.succeed(a, "", { files: { "one.txt": "A one\n", "two.txt": "A two\n" } });
-    const onA: StartsFrom = { commit: first.commit, predecessors: [{ taskId: a, commit: first.commit }] };
-    const [b, w] = await r.plan([{ key: "B", spec: correctionOf(a), dependsOn: ["A"] }, { key: "W", dependsOn: ["A"] }]) as [string, string];
-    const correction = r.succeed(b, "", { files: { "one.txt": "B one\n" }, startsFrom: onA });
-    const dependent = r.succeed(w, "", { files: { "three.txt": "W three\n" }, startsFrom: onA });
+    const [b] = await r.plan([{ key: "B", spec: correctionOf(a), dependsOn: ["A"] }]) as [string];
+    const correction = r.succeed(b, "", { files: { "one.txt": "B one\n" }, startsFrom: onCommit(a, first.commit) });
     gitSync(r.repo, ["checkout", "-q", `task/${a}`]);
-    const tree = (head: string) => Object.fromEntries(["one.txt", "two.txt", "three.txt"].map((path) => [path, gitSync(r.repo, ["show", `${head}:${path}`])]));
-    const expected = { "one.txt": "B one", "two.txt": "A two", "three.txt": "W three" };
+    const expected = { "one.txt": "B one", "two.txt": "A two" };
 
     const unregistered = await r.freeze();
     expect(unregistered, JSON.stringify(unregistered).slice(0, 600)).toMatchObject({ allowed: true });
     if (!unregistered.allowed) return;
-    expect(tree(unregistered.value.repositories[0]!.candidateHead)).toEqual(expected);
+    expect(treeOf(r, unregistered.value.repositories[0]!.candidateHead, Object.keys(expected))).toEqual(expected);
 
     expect(await r.register(b, a)).toMatchObject({ ok: true, value: { registered: true } });
     const frozen = await r.freeze();
     expect(frozen, JSON.stringify(frozen).slice(0, 600)).toMatchObject({ allowed: true });
     if (!frozen.allowed) return;
     const [repository] = frozen.value.repositories;
-    expect(tree(repository!.candidateHead)).toEqual(expected);
-    expect(repository!.integration?.tasks.map((task) => task.taskId).sort()).toEqual([b, w].sort());
-    expect(repository!.integration?.tasks).toEqual(expect.arrayContaining([{ taskId: b, commit: correction.commit }, { taskId: w, commit: dependent.commit }]));
+    expect(treeOf(r, repository!.candidateHead, Object.keys(expected))).toEqual(expected);
+    expect(repository!.integration?.tasks).toEqual([{ taskId: b, commit: correction.commit }]);
 
     // two.txt is A's, inherited by B: an unrelated task changing it is a conflict with B, not a silent replacement.
     const [u] = await r.plan([{ key: "U" }]) as [string];
@@ -302,5 +343,43 @@ describe("CEO msg_8f666e55 — a SUCCEEDED task superseded by a registered corre
     const refused = await r.freeze();
     expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
     expect(conflictPairs(refused.evidence)).toEqual([[b, u].sort()]);
+  });
+
+  const A_FILES = { a: { "one.txt": "A one\n", "two.txt": "A two\n" }, b: { "one.txt": "B one\n" }, w: { "two.txt": "W two\n" } };
+  const B_FILES = { a: { "README.md": "A readme\n", "one.txt": "A one\n" }, b: { "README.md": BASE_README, "one.txt": "B one\n" }, w: { "three.txt": "W three\n" } };
+
+  it("review r2 (a) at registration — W builds on A and edits a file B kept: A -> B is refused by name, and nothing is superseded", async () => {
+    const early = await buildsOnOriginal(await governedRun(), A_FILES, "before");
+    expect(early.registered).toMatchObject({ ok: false, reasonCode: HAS_DEPENDENTS, evidence: { refusal: HAS_DEPENDENTS, supersededTaskId: early.a, dependents: [early.w] } });
+    expect(early.records).toEqual([]);
+    // Every task is then a result: B and W are each built on A and change different files.
+    expect(early.frozen, JSON.stringify(early.frozen).slice(0, 400)).toMatchObject({ allowed: true });
+  });
+
+  it("review r2 (a) at the freeze — W planned after A -> B: the freeze is refused by name, not as a path conflict", async () => {
+    const late = await buildsOnOriginal(await governedRun(), A_FILES, "after");
+    expect(late.registered).toMatchObject({ ok: true, value: { registered: true } });
+    expect(late.frozen).toMatchObject({ allowed: false, reasonCode: HAS_DEPENDENTS, evidence: { refusal: HAS_DEPENDENTS, supersededTaskId: late.a, correctionTaskId: late.b, dependents: [late.w] } });
+  });
+
+  it("review r2 (b) at registration — B puts A's README back and W builds on A: A -> B is refused by name", async () => {
+    const early = await buildsOnOriginal(await governedRun(), B_FILES, "before");
+    expect(gitSync(early.repo, ["show", `${early.base}:README.md`])).toBe(BASE_README.trim());
+    expect(early.registered).toMatchObject({ ok: false, reasonCode: HAS_DEPENDENTS, evidence: { refusal: HAS_DEPENDENTS, supersededTaskId: early.a, dependents: [early.w] } });
+    expect(early.records).toEqual([]);
+  });
+
+  it("review r2 (b) at the freeze — W planned after A -> B: refused by name whichever of B and W integrates first", async () => {
+    for (const first of ["dependent", "correction"] as const) {
+      // Ids order the two ready tasks: A, then the smaller of B's and W's.
+      const [low, high] = ["task_000000000000000000000000", "task_ffffffffffffffffffffffff"];
+      seeded.taskIds.push("task_888888888888888888888888", ...(first === "dependent" ? [high, low] : [low, high]));
+      const late = await buildsOnOriginal(await governedRun(), B_FILES, "after");
+      expect(seeded.taskIds).toEqual([]);
+      expect(late.registered, first).toMatchObject({ ok: true, value: { registered: true } });
+      expect.soft(late.frozen, `${first} first: ${JSON.stringify(late.frozen).slice(0, 300)}`).toMatchObject({
+        allowed: false, reasonCode: HAS_DEPENDENTS, evidence: { refusal: HAS_DEPENDENTS, supersededTaskId: late.a, dependents: [late.w] },
+      });
+    }
   });
 });

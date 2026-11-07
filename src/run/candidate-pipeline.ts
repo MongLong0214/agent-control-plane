@@ -455,7 +455,9 @@ export class CandidatePipeline {
     // CEO msg_8f666e55 — the task results are those commits less what a registered correction supersedes; the
     // integration and its missing-commit and missing-change checks read these alone. Every receipt still accounts
     // for its own commit (#1268) and binds its imports (#1232), superseded or not.
-    const supersession = supersessionOf(this.db, runId, commits);
+    const superseding = supersessionOf(this.db, runId, commits);
+    if (!superseding.allowed) return superseding as Decision<CandidateSnapshot>;
+    const supersession = superseding.value;
     const results = commits.filter((commit) => !supersession.superseded.has(commit.taskId));
     const repositories: SnapshotRepositoryInput[] = [];
     // #1268 — every merge commit the integration makes has its message checked by CommitLore when the run requires it.

@@ -8,7 +8,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { acpScratchDir } from "../core/scratch-root.ts";
 import type { Db } from "../db/database.ts";
 import type { SnapshotIntegration } from "../snapshot/candidate-snapshot.ts";
-import { TASK_CORRECTION_REGISTERED, type TaskRecord } from "./task-graph.ts";
+import { TASK_CORRECTION_REGISTERED, type TaskRecord, tasksBuildingOn } from "./task-graph.ts";
 import { type StartsFrom, TASK_WRITE_TARGET_RECORDED, recordedWriteTarget, startOf } from "./task-write-target.ts";
 import {
   GIT_HARDENING,
@@ -229,8 +229,10 @@ export interface Supersession {
  * from the task ends at one nothing supersedes, which alone stays a task result (a cycle supersedes nothing). A
  * FAILED task's correction (#1368) binds no receipt and supersedes nothing here. Nothing picks a winner by time or
  * ancestry: without such a relation every SUCCEEDED task is a result, and the path-level conflict check decides.
+ * Review r2 — refused, CORRECTION_ORIGINAL_HAS_DEPENDENTS, while a task outside a superseded task's chain builds on
+ * it (`tasksBuildingOn`), as one planned after the relation was registered can: nothing is merged around it.
  */
-export const supersessionOf = (db: Db, runId: string, receipts: readonly SucceededTaskCommit[]): Supersession => {
+export const supersessionOf = (db: Db, runId: string, receipts: readonly SucceededTaskCommit[]): Decision<Supersession> => {
   const relations = db
     .all<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`, [TASK_CORRECTION_REGISTERED, runId])
     .map((row) => JSON.parse(row.evidence_json) as { originalTaskId?: unknown; correctionTaskId?: unknown; supersedes?: unknown });
@@ -256,10 +258,18 @@ export const supersessionOf = (db: Db, runId: string, receipts: readonly Succeed
       at = replacedBy.get(at)!;
     }
     if (replacedBy.has(at)) continue;
+    const after = new Set([...seen, at]);
+    after.delete(taskId);
+    const dependents = tasksBuildingOn(db, runId, taskId, after);
+    if (dependents.length > 0) {
+      return deny(ReasonCode.CORRECTION_ORIGINAL_HAS_DEPENDENTS, "a task outside its chain of corrections builds on a task a correction supersedes; the candidate is not frozen", {
+        runId, refusal: "CORRECTION_ORIGINAL_HAS_DEPENDENTS", supersededTaskId: taskId, correctionTaskId: replacedBy.get(taskId), dependents,
+      });
+    }
     superseded.add(taskId);
     terminals.add(at);
   }
-  return { superseded, terminals };
+  return allow(ReasonCode.OK, { superseded, terminals });
 };
 
 /**
