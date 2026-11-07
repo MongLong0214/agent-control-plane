@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
@@ -8,8 +9,16 @@ import { acpScratchDir } from "../core/scratch-root.ts";
 import type { Db } from "../db/database.ts";
 import type { SnapshotIntegration } from "../snapshot/candidate-snapshot.ts";
 import type { TaskRecord } from "./task-graph.ts";
-import { type StartsFrom, recordedWriteTarget, startOf } from "./task-write-target.ts";
-import { type PinnedRepository, committedChanges, objectFormatOf, pinRepository, runPinnedGit } from "./worker-git.ts";
+import { type StartsFrom, TASK_WRITE_TARGET_RECORDED, recordedWriteTarget, startOf } from "./task-write-target.ts";
+import {
+  GIT_HARDENING,
+  type PinnedRepository,
+  committedChanges,
+  objectFormatOf,
+  pinRepository,
+  pinnedGitEnvironment,
+  runPinnedGit,
+} from "./worker-git.ts";
 import { type TaskImport, parseImportManifest } from "./task-import.ts";
 import { WorkerTurnEvent } from "./worker-turn.ts";
 
@@ -532,6 +541,44 @@ const buildIntegration = async (
   );
 };
 
+/** Whether `head` already holds every result's commit: the case in which the candidate is the checkout's HEAD. */
+const holdsEvery = async (repo: PinnedRepository, results: readonly TaskResult[], head: string): Promise<boolean> =>
+  (await Promise.all(results.map((result) => isAncestor(repo, result.commit, head)))).every((answer) => answer === true);
+
+/**
+ * #1268 — read-only: the checkout's HEAD when `integrateTaskResults` would take it as the candidate (the run has
+ * no SUCCEEDED result it places in this repository, or HEAD already holds every one), else null. Conflicts are
+ * not asked: the integration refuses them either way. A HEAD, or an ancestry, that cannot be read is refused
+ * (CANDIDATE_RANGE_UNVERIFIABLE), never taken as an answer.
+ */
+export const checkoutHeadAsCandidate = async (input: {
+  db: Db;
+  runId: string;
+  tasks: readonly TaskRecord[];
+  commits: readonly SucceededTaskCommit[];
+  repositoryIdentity: string;
+  checkoutPath: string;
+}): Promise<Decision<string | null>> => {
+  const results = succeededTaskResults(input.db, input.runId, input.tasks, input.commits, input.repositoryIdentity);
+  return withPinned<string | null>(input.checkoutPath, "acp-integration-head-", async (repo) => {
+    const unreadable = (ref: string): Decision<never> =>
+      deny(ReasonCode.CANDIDATE_RANGE_UNVERIFIABLE, "the checkout's HEAD or its history could not be read, so the freeze is refused", {
+        runId: input.runId,
+        repositoryIdentity: input.repositoryIdentity,
+        refusal: "OBJECT_UNREADABLE",
+        ref,
+      });
+    const headRead = await runPinnedGit(repo, ["rev-parse", "--verify", "-q", "HEAD^{commit}"]);
+    if (headRead.exitCode !== 0) return unreadable("HEAD");
+    const head = headRead.stdout.trim();
+    if (results.length === 0) return allow(ReasonCode.OK, head);
+    const answers = await Promise.all(results.map((result) => isAncestor(repo, result.commit, head)));
+    const unread = results.find((_, at) => answers[at] === null);
+    if (unread !== undefined) return unreadable(unread.commit);
+    return allow(ReasonCode.OK, answers.every((answer) => answer === true) ? head : null);
+  });
+};
+
 /**
  * The run's integrated candidate in one repository, or null when no two tasks' changes overlap and
  * the checkout's HEAD already holds every SUCCEEDED task's commit (a single-task run, as before), or
@@ -574,8 +621,7 @@ export const integrateTaskResults = async (input: {
       );
     }
     // No overlap, and HEAD already holds every task's commit: the candidate is HEAD, as before.
-    const contained = await Promise.all(results.map((result) => isAncestor(repo, result.commit, checkoutHead)));
-    if (contained.every((answer) => answer === true)) return allow(ReasonCode.OK, null);
+    if (await holdsEvery(repo, results, checkoutHead)) return allow(ReasonCode.OK, null);
     const placed = await placeResults(repo, read.value, input.repositoryIdentity);
     if (!placed.allowed) return placed as Decision<never>;
     return allow(ReasonCode.OK, { ...placed.value, checkoutHead });
@@ -625,6 +671,8 @@ export const integratePredecessors = async (input: {
   worktree: RunWorktree;
   /** #1268 — given for a run whose contract requires CommitLore. */
   checkMessage?: CheckMergeMessage;
+  /** #1268 — receives each merge the base's integration made with `checkMessage` passing, bound as the freeze's are. */
+  checked?: MergeCheckBinding[];
 }): Promise<Decision<StartsFrom | null>> => {
   const missing = (predecessor: string, missingWhat: string, commit: string | null, repositoryIdentity = input.repositoryIdentity): Decision<never> =>
     deny(ReasonCode.TASK_PREDECESSOR_COMMIT_MISSING, `a task this one depends on has no ${missingWhat} to start from; it is not started at the run's base instead`, {
@@ -711,6 +759,7 @@ export const integratePredecessors = async (input: {
         ...(input.checkMessage === undefined ? {} : { checkMessage: input.checkMessage }),
       },
       placement,
+      input.checked,
     );
   if (!built.allowed) return built as Decision<never>;
   return allow(ReasonCode.OK, { commit: built.value, predecessors });
@@ -785,6 +834,214 @@ export const lostTaskChanges = async (input: {
   });
 };
 
+/** #1268 — why a commit in a governed candidate's range is not one the run's CommitLore path accounts for. */
+export type ForeignCommitRefusal =
+  /** No SUCCEEDED worker receipt of this run in this repository names it, and it is no merge. */
+  | "NOT_A_RUN_WORKER_COMMIT"
+  /** A receipt names it, with no CommitLore evidence. */
+  | "COMMITLORE_EVIDENCE_MISSING"
+  /** A receipt names it, with an outcome other than `recorded` or `empty`. */
+  | "COMMITLORE_OUTCOME_UNKNOWN"
+  /** A receipt names it, with record ids that are not strings, `empty` with ids, or `recorded` with none. */
+  | "COMMITLORE_EVIDENCE_MALFORMED"
+  /** A receipt names it, and the commit's own `Record-Id` trailers are not exactly the receipt's record ids. */
+  | "RECORD_IDS_MISMATCH"
+  /** A merge no check of this freeze was bound to. */
+  | "MERGE_NOT_CHECKED"
+  /** A merge listed as checked whose parents, their order, tree or message are not what its check was bound to. */
+  | "MERGE_NOT_BOUND";
+
+export interface ForeignCommit {
+  commit: string;
+  refusal: ForeignCommitRefusal;
+}
+
+const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/**
+ * #1268 — the audit kind a governed run's predecessor base (#1242) is recorded under when its integration made
+ * merges: the task it is for, its commit, and each merge's check binding (`MergeCheckBinding`).
+ */
+export const PREDECESSOR_BASE_MERGES_CHECKED = "PREDECESSOR_BASE_MERGES_CHECKED";
+
+/**
+ * #1268 — the merge check bindings recorded for this run's predecessor bases in a repository, each only when a
+ * write target recorded for the same task of this run starts from that base's commit (`startsFrom.commit`).
+ */
+export const recordedPredecessorMergeChecks = (db: Db, runId: string, repositoryIdentity: string): MergeCheckBinding[] => {
+  const rows = db.all<{ checks: string | null }>(
+    `SELECT json_extract(b.evidence_json, '$.commitloreMergeChecks') AS checks
+       FROM audit_events b
+      WHERE b.kind = ? AND b.run_id = ?
+        AND json_extract(b.evidence_json, '$.repositoryIdentity') = ?
+        AND EXISTS (
+          SELECT 1 FROM audit_events t
+           WHERE t.kind = ? AND t.run_id = b.run_id
+             AND json_extract(t.evidence_json, '$.taskId') = json_extract(b.evidence_json, '$.taskId')
+             AND json_extract(t.evidence_json, '$.writeTarget.repositoryIdentity') = ?
+             AND json_extract(t.evidence_json, '$.writeTarget.startsFrom.commit') = json_extract(b.evidence_json, '$.commit')
+        )`,
+    [PREDECESSOR_BASE_MERGES_CHECKED, runId, repositoryIdentity, TASK_WRITE_TARGET_RECORDED, repositoryIdentity],
+  );
+  const isBinding = (value: unknown): value is MergeCheckBinding => {
+    const check = value as Partial<MergeCheckBinding> | null;
+    return typeof check === "object" && check !== null && typeof check.commit === "string" && typeof check.tree === "string" &&
+      typeof check.messageDigest === "string" && Array.isArray(check.parents) && check.parents.length === 2 &&
+      check.parents.every((parent) => typeof parent === "string");
+  };
+  return rows.flatMap((row) => {
+    const checks = row.checks === null ? null : (JSON.parse(row.checks) as unknown);
+    return Array.isArray(checks) ? checks.filter(isBinding) : [];
+  });
+};
+
+/**
+ * Every `Record-Id` line of a commit message, its value trimmed. Read more loosely than CommitLore writes it
+ * (any case, any spacing), so a line that only looks like a trailer still counts against the receipt.
+ */
+const recordIdsOf = (message: string): string[] => [...message.matchAll(/^record-id[ \t]*:(.*)$/gim)].map((match) => match[1]!.trim());
+
+/**
+ * #1268 — this run's SUCCEEDED worker receipts in a repository, by the commit each names: every attempt's, read
+ * the way `succeededTaskCommits` reads one (the row of this run and task whose execution id and result digest are
+ * the ones stored on the execution), each with the CommitLore evidence it carries, or undefined.
+ */
+const workerReceiptsByCommit = (db: Db, runId: string, repositoryIdentity: string): Map<string, unknown[]> => {
+  const rows = db.all<{ evidence: string }>(
+    `SELECT a.evidence_json AS evidence
+       FROM task_executions te
+       JOIN repositories r ON r.repository_id = te.repository_id
+       JOIN audit_events a
+         ON a.kind = ?
+        AND a.run_id = te.run_id
+        AND json_extract(a.evidence_json, '$.taskId') = te.task_id
+        AND json_extract(a.evidence_json, '$.executionId') = te.execution_id
+        AND json_extract(a.evidence_json, '$.resultDigest') = te.result_digest
+      WHERE te.run_id = ? AND te.status = 'SUCCEEDED' AND r.identity = ?`,
+    [WorkerTurnEvent.SUCCEEDED, runId, repositoryIdentity],
+  );
+  const byCommit = new Map<string, unknown[]>();
+  for (const row of rows) {
+    const evidence = JSON.parse(row.evidence) as { commitHead?: unknown; commitlore?: unknown };
+    if (typeof evidence.commitHead !== "string" || evidence.commitHead.length === 0) continue;
+    byCommit.set(evidence.commitHead, [...(byCommit.get(evidence.commitHead) ?? []), evidence.commitlore]);
+  }
+  return byCommit;
+};
+
+/** Why one receipt's CommitLore evidence does not account for a commit whose message is `message`; null when it does. */
+const unaccounted = (commitlore: unknown, message: string): ForeignCommitRefusal | null => {
+  if (typeof commitlore !== "object" || commitlore === null || Array.isArray(commitlore)) return "COMMITLORE_EVIDENCE_MISSING";
+  const { outcome, recordIds } = commitlore as { outcome?: unknown; recordIds?: unknown };
+  if (outcome !== "recorded" && outcome !== "empty") return "COMMITLORE_OUTCOME_UNKNOWN";
+  if (!Array.isArray(recordIds) || !recordIds.every((id) => typeof id === "string")) return "COMMITLORE_EVIDENCE_MALFORMED";
+  if ((outcome === "empty") !== (recordIds.length === 0)) return "COMMITLORE_EVIDENCE_MALFORMED";
+  const carried = recordIdsOf(message);
+  return carried.length === recordIds.length && carried.every((id, at) => id === recordIds[at]) ? null : "RECORD_IDS_MISMATCH";
+};
+
+/**
+ * #1268 — for a run whose contract requires CommitLore: the first commit, oldest first, between the base a
+ * repository was frozen at and the exact head frozen for it that the run's CommitLore path does not account for,
+ * or null when every one is accounted for. A commit is accounted for when it is either
+ *
+ * - a worker commit: named by SUCCEEDED receipts of this run in this repository (`workerReceiptsByCommit`), each
+ *   with CommitLore evidence of a known outcome whose record ids are exactly the `Record-Id` trailers re-read from
+ *   the commit itself, none for `empty`; or
+ * - an integration merge in `mergeChecks` (the merges this freeze's check passed, and those recorded for this
+ *   run's predecessor bases, `recordedPredecessorMergeChecks`) whose binding is this commit's own parents in
+ *   order, tree and message, re-read from the commit.
+ *
+ * A base that is not an ancestor of the head, or an object that cannot be read, is refused
+ * (CANDIDATE_RANGE_UNVERIFIABLE). Read-only, over the registered checkout. `accounted` carries what one freeze has
+ * already found accounted for, per repository (an object id names its bytes, but a receipt is a repository's), which
+ * is not read again, and gains every commit this call accounts for here.
+ */
+export const foreignCandidateCommit = async (input: {
+  db: Db;
+  runId: string;
+  repositoryIdentity: string;
+  checkoutPath: string;
+  baseHead: string;
+  candidateHead: string;
+  mergeChecks: readonly MergeCheckBinding[];
+  accounted?: Set<string>;
+}): Promise<Decision<ForeignCommit | null>> => {
+  const { runId, repositoryIdentity, baseHead, candidateHead } = input;
+  const unverifiable = (refusal: "BASE_NOT_ANCESTOR" | "OBJECT_UNREADABLE", commit: string | null = null): Decision<never> =>
+    deny(ReasonCode.CANDIDATE_RANGE_UNVERIFIABLE, "the candidate's commits since its frozen base could not be established, so the freeze is refused", {
+      runId,
+      repositoryIdentity,
+      baseHead,
+      candidateHead,
+      refusal,
+      ...(commit === null ? {} : { commit }),
+    });
+  if (!OBJECT_ID.test(baseHead) || !OBJECT_ID.test(candidateHead)) return unverifiable("OBJECT_UNREADABLE");
+  return withPinned<ForeignCommit | null>(input.checkoutPath, "acp-candidate-commitlore-", async (repo) => {
+    const descends = await isAncestor(repo, baseHead, candidateHead);
+    if (descends !== true) return unverifiable(descends === false ? "BASE_NOT_ANCESTOR" : "OBJECT_UNREADABLE");
+    const listed = await runPinnedGit(repo, ["rev-list", "--reverse", "--topo-order", `${baseHead}..${candidateHead}`]);
+    if (listed.exitCode !== 0) return unverifiable("OBJECT_UNREADABLE");
+    const receipts = workerReceiptsByCommit(input.db, runId, repositoryIdentity);
+    const key = (commit: string): string => `${repositoryIdentity}\u0000${commit}`;
+    for (const commit of listed.stdout.split("\n").filter((line) => line.length > 0)) {
+      if (input.accounted?.has(key(commit))) continue;
+      const read = await runPinnedGit(repo, ["cat-file", "commit", commit]);
+      if (read.exitCode !== 0) return unverifiable("OBJECT_UNREADABLE", commit);
+      const split = read.stdout.indexOf("\n\n");
+      const header = split === -1 ? read.stdout : read.stdout.slice(0, split);
+      const message = split === -1 ? "" : read.stdout.slice(split + 2);
+      const named = receipts.get(commit);
+      if (named !== undefined) {
+        const refusal = named.map((commitlore) => unaccounted(commitlore, message)).find((answer) => answer !== null) ?? null;
+        if (refusal !== null) return allow(ReasonCode.OK, { commit, refusal });
+        input.accounted?.add(key(commit));
+        continue;
+      }
+      const parents = [...header.matchAll(/^parent ([0-9a-f]+)$/gm)].map((match) => match[1]!);
+      const bound = input.mergeChecks.find((check) => check.commit === commit);
+      if (bound === undefined) return allow(ReasonCode.OK, { commit, refusal: parents.length >= 2 ? "MERGE_NOT_CHECKED" : "NOT_A_RUN_WORKER_COMMIT" });
+      const tree = /^tree ([0-9a-f]+)$/m.exec(header)?.[1] ?? null;
+      const exact = parents.length === 2 && parents[0] === bound.parents[0] && parents[1] === bound.parents[1] &&
+        tree === bound.tree && sha256(message.trimEnd()) === bound.messageDigest;
+      if (!exact) return allow(ReasonCode.OK, { commit, refusal: "MERGE_NOT_BOUND" });
+      input.accounted?.add(key(commit));
+    }
+    return allow(ReasonCode.OK, null);
+  });
+};
+
+/**
+ * #1268 — a checkout's HEAD commit, read with nothing awaited: the pinned git (`pinRepository`, `GIT_HARDENING`,
+ * `pinnedGitEnvironment`, as `runPinnedGit` runs it) started synchronously, for a decision taken inside one
+ * database transaction. Null when git does not answer it.
+ */
+export const checkoutHeadNow = (checkoutPath: string): string | null => {
+  const scratch = acpScratchDir("acp-candidate-head-now-");
+  try {
+    const pinned = pinRepository(checkoutPath, scratch);
+    if (!pinned.allowed) return null;
+    try {
+      const home = join(scratch, "home");
+      const head = execFileSync("git", [...GIT_HARDENING, "rev-parse", "--verify", "-q", "HEAD^{commit}"], {
+        cwd: pinned.value.workTree,
+        env: { PATH: process.env["PATH"] ?? "/usr/bin:/bin", HOME: home, XDG_CONFIG_HOME: home, ...pinnedGitEnvironment({ gitDir: pinned.value.gitDir, workTree: pinned.value.workTree }) },
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 30_000,
+      }).trim();
+      return head.length > 0 ? head : null;
+    } catch {
+      return null;
+    } finally {
+      pinned.value.children.retire();
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+};
+
 /** S6 review (P2) — where an integrated candidate is kept reachable: never a branch, never HEAD. */
 export const CANDIDATE_REF_NAMESPACE = "refs/acp/candidates";
 
@@ -822,6 +1079,18 @@ export const candidateRefPlan = async (
       if (ref !== keep?.ref) lines.push(`delete ${ref} ${commit}`);
     }
     return allow(ReasonCode.OK, lines);
+  });
+
+/**
+ * #1268 — the `update-ref --stdin` lines that undo `candidateRefPlan` lines once applied, last first, each only at
+ * the value the line set: a created ref is deleted, an updated one is put back, a deleted one is created again.
+ */
+export const undoCandidateRefLines = (lines: readonly string[]): string[] =>
+  [...lines].reverse().map((line) => {
+    const [verb, ref, value, previous] = line.split(" ");
+    if (verb === "create") return `delete ${ref} ${value}`;
+    if (verb === "delete") return `create ${ref} ${value}`;
+    return `update ${ref} ${previous} ${value}`;
   });
 
 /** Applies `candidateRefPlan` lines as one atomic ref transaction, pinned and hook-free. */
