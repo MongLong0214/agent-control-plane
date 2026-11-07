@@ -264,6 +264,20 @@ export const ReasonCode = {
    * hold the git dir unchanged; the turn is refused before anything is prepared or launched.
    */
   WORKER_REPOSITORY_SPLIT_INDEX_UNSUPPORTED: "WORKER_REPOSITORY_SPLIT_INDEX_UNSUPPORTED",
+  /**
+   * #1268 — a worker turn of a run whose CommitLore mode is `required` or `preferred` did not get CommitLore's
+   * context for every path it may change, at its base: a lookup that failed, timed out, answered in part, or
+   * did not fit. Refused before an execution opens or anything launches, naming the base, the target and each
+   * uncovered path (and value). A `preferred` turn starts once the run owner's supplement for exactly those
+   * paths at that base is bound (`refusal: SUPPLEMENT_REFUSED` names what did not bind); a `required` one never.
+   */
+  WORKER_COMMITLORE_CONTEXT_INCOMPLETE: "WORKER_COMMITLORE_CONTEXT_INCOMPLETE",
+  /**
+   * #1268 — a `required` run's worker turn may change a path for which CommitLore withheld `[blocked]` records,
+   * so whether it may be changed cannot be decided; a turn's owned paths cannot be split mid-turn, so the
+   * whole turn is refused before an execution opens.
+   */
+  WORKER_COMMITLORE_CONTEXT_BLOCKED: "WORKER_COMMITLORE_CONTEXT_BLOCKED",
   PRIMARY_CTO_ALREADY_BOUND: "PRIMARY_CTO_ALREADY_BOUND",
   SWITCHOVER_BLOCKED_ACTIVE_RUNS: "SWITCHOVER_BLOCKED_ACTIVE_RUNS",
   REVOCATION_BLOCKED_ACTIVE_RUNS: "REVOCATION_BLOCKED_ACTIVE_RUNS",
