@@ -56,6 +56,7 @@ export const PR_EVIDENCE_DIFF_PAGE_MAX_CHARS = 100_000;
 const PER_PAGE = 100;
 /** GitHub's compare lists at most this many files; a larger diff is named incomplete. */
 const COMPARE_FILE_LIMIT = 300;
+const COMPARE_STATUSES: ReadonlySet<string> = new Set(["ahead", "behind", "diverged", "identical"]);
 const CHECK_PAGE_BOUND = 10;
 const RULE_PAGE_BOUND = 10;
 const SHA = /^[0-9a-f]{40}$/;
@@ -267,12 +268,24 @@ const readComparedFiles = async (
   let compare: Json | null = null;
   try {
     compare = record(await github.get<unknown>(`${lookup}?per_page=1`));
+    // An answer that is not an object holds no file, patch or merge-base: a gap, whatever the file count.
+    if (!compare) gaps.push({ kind: "MALFORMED_RESPONSE", lookup, detail: "the compare answer is not an object; no file, patch or merge-base is in this answer" });
   } catch (error) {
     gaps.push(gap(error, lookup, "the compare of the two SHAs could not be read; no file or patch is in this answer"));
   }
   const rows = compare?.["files"];
-  if (compare && !Array.isArray(rows)) {
-    gaps.push({ kind: "MALFORMED_RESPONSE", lookup, detail: "the compare answer carries no files list" });
+  if (compare) {
+    if (!Array.isArray(rows)) gaps.push({ kind: "MALFORMED_RESPONSE", lookup, detail: "the compare answer carries no files list" });
+    if (text(record(compare["base_commit"])?.["sha"]) !== baseSha) {
+      gaps.push({ kind: "MALFORMED_RESPONSE", lookup, detail: `the compare answer's base commit is not ${baseSha}` });
+    }
+    const compareStatus = text(compare["status"]);
+    if (compareStatus === null || !COMPARE_STATUSES.has(compareStatus)) {
+      gaps.push({ kind: "MALFORMED_RESPONSE", lookup, detail: "the compare answer carries no comparison status" });
+    }
+    if (count(compare["ahead_by"]) === null || count(compare["behind_by"]) === null) {
+      gaps.push({ kind: "MALFORMED_RESPONSE", lookup, detail: "the compare answer carries no ahead_by/behind_by counts" });
+    }
   }
   for (const row of Array.isArray(rows) ? rows : []) {
     const entry = record(row);
@@ -282,6 +295,10 @@ const readComparedFiles = async (
       continue;
     }
     const patch = text(entry["patch"]);
+    if (text(entry["status"]) === null || count(entry["additions"]) === null || count(entry["deletions"]) === null
+        || count(entry["changes"]) === null) {
+      gaps.push({ kind: "MALFORMED_RESPONSE", lookup, file: filename, detail: "the compare lists this file with no status or line counts" });
+    }
     const status = text(entry["status"]) ?? "unknown";
     const changes = count(entry["changes"]) ?? 0;
     // A rename with no line changes has no patch to show; every other file without one is a gap.
@@ -350,8 +367,13 @@ const readCounted = async (
       gaps.push({ kind: "MALFORMED_RESPONSE", lookup, page, detail: `page ${page} carries no ${key} list` });
       return { rows, first };
     }
+    const pageTotal = count(body["total_count"]);
+    if (pageTotal === null) {
+      gaps.push({ kind: "MALFORMED_RESPONSE", lookup, page, detail: `page ${page} carries no total_count, so a missing entry could not be seen` });
+      return { rows, first: first ?? body };
+    }
     first ??= body;
-    total ??= count(body["total_count"]);
+    total ??= pageTotal;
     for (const row of list) {
       const entry = record(row);
       if (entry) rows.push(entry);
@@ -394,7 +416,9 @@ const readChecks = async (github: GitHubReadClient, root: string, headSha: strin
   const combined = await readCounted(github, statusLookup, "", "statuses", gaps);
   const combinedSha = text(combined.first?.["sha"]);
   const statuses: PrEvidenceStatus[] = [];
-  if (combined.first && combinedSha !== headSha) {
+  if (combined.first && combinedSha === null) {
+    gaps.push({ kind: "MALFORMED_RESPONSE", lookup: statusLookup, detail: "the combined status names no commit; it is left out" });
+  } else if (combined.first && combinedSha !== headSha) {
     gaps.push({ kind: "HEAD_MISMATCH", lookup: statusLookup, detail: `the combined status is for ${String(combinedSha)}, not ${headSha}; it is left out` });
   } else {
     for (const status of combined.rows) {

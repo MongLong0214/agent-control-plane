@@ -40,6 +40,8 @@ class PrEvidenceGitHub extends FakeGitHub {
   rules = new Map<string, Row[]>();
   /** Each GET whose path matches answers with this HTTP status instead, as the credential store reports one. */
   failing: Array<{ pattern: RegExp; status: number }> = [];
+  /** Rewrites an answer GitHub would give, for a response that is malformed or missing a field. */
+  reshape: { compare?: (body: Row) => unknown; checkRuns?: (body: Row) => unknown; status?: (body: Row) => unknown } = {};
 
   override async request<T>(method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE", path: string, body?: unknown): Promise<T> {
     const failure = method === "GET" ? this.failing.find((entry) => entry.pattern.test(path)) : undefined;
@@ -49,7 +51,8 @@ class PrEvidenceGitHub extends FakeGitHub {
     const branch = /\/repos\/acme\/fixture\/branches\/([^/?]+)$/.exec(path);
     const rules = /\/repos\/acme\/fixture\/rules\/branches\/([^/?]+)\?per_page=(\d+)&page=(\d+)$/.exec(path);
     const compare = /\/repos\/acme\/fixture\/compare\/([0-9a-f]{40})\.\.\.([^?]+)\?per_page=1$/.exec(path);
-    const mine = failure !== undefined || files || status || branch || rules || compare || (method === "GET" && pull);
+    const runs = /\/repos\/acme\/fixture\/commits\/([0-9a-f]{40})\/check-runs\?filter=latest&per_page=(\d+)&page=(\d+)$/.exec(path);
+    const mine = failure !== undefined || files || status || branch || rules || compare || runs || (method === "GET" && pull);
     if (!mine) return super.request<T>(method, path, body);
     this.calls.push({ method, path, body });
     if (failure) throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method, status: failure.status });
@@ -69,8 +72,14 @@ class PrEvidenceGitHub extends FakeGitHub {
     if (status) {
       const sha = status[1]!;
       const all = this.statuses.filter((s) => s.sha === sha);
-      return { sha, state: all.every((s) => s.state === "success") ? "success" : "failure", total_count: all.length,
-        statuses: page(all, status[2]!, status[3]!) } as T;
+      const answer = { sha, state: all.every((s) => s.state === "success") ? "success" : "failure", total_count: all.length,
+        statuses: page(all, status[2]!, status[3]!) };
+      return (this.reshape.status ? this.reshape.status(answer) : answer) as T;
+    }
+    if (runs) {
+      const all = this.checkRuns.filter((run) => run.head_sha === runs[1]);
+      const answer = { total_count: all.length, check_runs: page(all, runs[2]!, runs[3]!) };
+      return (this.reshape.checkRuns ? this.reshape.checkRuns(answer) : answer) as T;
     }
     if (branch) {
       const found = this.branchBodies.get(decodeURIComponent(branch[1]!));
@@ -83,9 +92,10 @@ class PrEvidenceGitHub extends FakeGitHub {
       const named = decodeURIComponent(compare[2]!);
       const head = /^[0-9a-f]{40}$/.test(named) ? named : this.pulls.find((p) => p.head.ref === named)?.head.sha ?? "";
       // GitHub's compare lists at most 300 files.
-      return { status: "ahead", ahead_by: 2, behind_by: 0, merge_base_commit: { sha: MERGE_BASE },
+      const answer = { status: "ahead", ahead_by: 2, behind_by: 0, base_commit: { sha: compare[1] }, merge_base_commit: { sha: MERGE_BASE },
         files: (this.filesByHead.get(head) ?? []).slice(0, 300),
-        html_url: `https://github.com/acme/fixture/compare/${compare[1]}...${compare[2]}` } as T;
+        html_url: `https://github.com/acme/fixture/compare/${compare[1]}...${compare[2]}` };
+      return (this.reshape.compare ? this.reshape.compare(answer) : answer) as T;
     }
     throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method, status: 404 });
   }
@@ -199,6 +209,7 @@ beforeEach(() => {
   gh.checkRuns = [];
   gh.statuses = [];
   gh.failing = [];
+  gh.reshape = {};
   gh.rules.clear();
   gh.branchBodies.clear();
   gh.branchBodies.set("main", { name: "main", protected: true, protection: { enabled: true,
@@ -368,6 +379,56 @@ describe("pr_evidence_get", () => {
       continuations += 1;
     }
     expect(continuations).toBeGreaterThan(1);
+  });
+
+  describe("never reads a malformed or missing field as complete", () => {
+    /** A valid PR with no changed files and passing required checks: only the reshaped answer can be wrong. */
+    const seedEmptyPull = (): void => {
+      gh.pulls.push(pullRow(22, HEAD_A, 0));
+      gh.filesByHead.set(HEAD_A, []);
+      gh.checkRuns.push({ id: 7, name: "ci", head_sha: HEAD_A, status: "completed", conclusion: "success" });
+      gh.statuses.push({ sha: HEAD_A, context: "lint", state: "success", target_url: null });
+    };
+    const without = (body: Row, field: string): Row => {
+      const copy = { ...body };
+      delete copy[field];
+      return copy;
+    };
+
+    it("answers the unreshaped PR as complete", async () => {
+      seedEmptyPull();
+      const page = pageOf(await ceoCall({ projectId, prNumber: 22, expectedHead: HEAD_A }));
+      expect(page).toMatchObject({ complete: true, incomplete: [] });
+      expect(page.summary!.requiredChecks.allSatisfied).toBe(true);
+    });
+
+    it.each<[string, PrEvidenceGitHub["reshape"], string]>([
+      ["a null compare answer", { compare: () => null }, "/compare/"],
+      ["a compare answer that is a list", { compare: () => [] }, "/compare/"],
+      ["a compare with no merge_base_commit", { compare: (b) => without(b, "merge_base_commit") }, "/compare/"],
+      ["a compare whose merge-base is not a SHA", { compare: (b) => ({ ...b, merge_base_commit: { sha: "main" } }) }, "/compare/"],
+      ["a compare with no files list", { compare: (b) => without(b, "files") }, "/compare/"],
+      ["a compare with no status", { compare: (b) => without(b, "status") }, "/compare/"],
+      ["a compare for another base commit", { compare: (b) => ({ ...b, base_commit: { sha: ELSEWHERE } }) }, "/compare/"],
+      ["a compare with no base commit", { compare: (b) => without(b, "base_commit") }, "/compare/"],
+      ["a null check-runs answer", { checkRuns: () => null }, "/check-runs"],
+      ["check runs with no total_count", { checkRuns: (b) => without(b, "total_count") }, "/check-runs"],
+      ["a null combined status", { status: () => null }, "/status"],
+      ["a combined status with no total_count", { status: (b) => without(b, "total_count") }, "/status"],
+      ["a combined status with no sha", { status: (b) => without(b, "sha") }, "/status"],
+    ])("names %s as incomplete", async (_name, reshape, lookup) => {
+      seedEmptyPull();
+      gh.reshape = reshape;
+      const answer = await ceoCall({ projectId, prNumber: 22, expectedHead: HEAD_A });
+      expect(answer).toMatchObject({ ok: false, reasonCode: ReasonCode.COVERAGE_INCOMPLETE });
+      if (answer.ok) throw new Error("unreachable");
+      const page = answer.evidence as unknown as Page;
+      expect(page.complete).toBe(false);
+      expect(page.incomplete).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "MALFORMED_RESPONSE", lookup: expect.stringContaining(lookup) }),
+      ]));
+      expect(page.summary!.requiredChecks.allSatisfied).not.toBe(true);
+    });
   });
 
   it("names a PR over GitHub's 300-file compare limit as incomplete", async () => {
