@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { type Stats, closeSync, existsSync, fsyncSync, lstatSync, mkdtempSync, openSync, readFileSync, rmSync, statSync } from "node:fs";
+import { type Stats, closeSync, existsSync, fsyncSync, lstatSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
@@ -103,10 +103,112 @@ export interface CommitLorePort {
    * a commit through CommitLore, and a commit that requires CommitLore is then refused, never made without.
    */
   attempt?(checkoutPath: string, git: CommitLoreGitTarget): Promise<Decision<CommitLoreAttempt>>;
+  /**
+   * #1268 — what CommitLore holds for the paths a worker may change, read in `checkoutPath` before the worker
+   * starts (`commitloreBeforeChange`). Null when this deployment has no CommitLore configured at all.
+   */
+  beforeChange?(checkoutPath: string, git: CommitLoreGitTarget, request: CommitLoreBeforeChangeRequest): Promise<CommitLoreBeforeChange | null>;
 }
 
-import { commitloreGoverned, commitloreRequired } from "./commitlore-mode.ts";
-export { commitloreGoverned, commitloreRequired };
+/** #1268 — the record values a worker must have before it edits a path, in CommitLore's own priority order. */
+export const COMMITLORE_REQUIRED_KEYS = Object.freeze(["Warn", "Limit", "Ruled-out"] as const);
+export type CommitLoreRequiredKey = (typeof COMMITLORE_REQUIRED_KEYS)[number];
+
+/** #1268 — one required value `context --json` reported, from a record CommitLore did not withhold. */
+export interface CommitLoreRequiredItem {
+  readonly recordId: string | null;
+  readonly sha: string;
+  readonly trust: string;
+  readonly key: CommitLoreRequiredKey;
+  readonly value: string;
+}
+
+/** #1268 — what CommitLore answered for one path. */
+export interface CommitLorePathLookup {
+  readonly path: string;
+  /**
+   * `answered`: CommitLore answered for this path at the turn's base, from a whole scan. `incomplete`: it
+   * answered, but its scan stopped early or its notes mirror was not fetched, so records may be missing.
+   * `failed`: no answer (`detail` says why), a lookup still running at the deadline included.
+   */
+  readonly outcome: "answered" | "incomplete" | "failed";
+  /** `inject`'s payload exactly as it printed it; empty when it had nothing to say or did not answer. */
+  readonly text: string;
+  /** `inject`'s cache key: the same key means the same bytes. */
+  readonly cacheKey: string | null;
+  /** How many records CommitLore withheld as `[blocked]`; their content never reaches here. */
+  readonly withheld: number;
+  /**
+   * Set only when `inject`'s budget cut a Warn, Limit or Ruled-out value: every such value `context --json`
+   * reported for the path, Warn first, delivered instead of `text`. Null when `inject` carried them all.
+   */
+  readonly items: readonly CommitLoreRequiredItem[] | null;
+  readonly detail: string | null;
+  /**
+   * #1268 r1 — CommitLore found no blob of this path in the history it read whole (a file the turn creates, or
+   * one renamed from a name not asked for): no record names it, and its empty answer is not evidence that
+   * nothing was decided about it. Absent or false otherwise.
+   */
+  readonly noHistory?: boolean;
+}
+
+/** #1268 — one guard match, as `guard --json` renders it; a `[blocked]` match carries no content. */
+export interface CommitLoreGuardMatch {
+  readonly recordId: string | null;
+  readonly sha: string;
+  readonly score: number;
+  readonly trust: string;
+  readonly alternative: string | null;
+  readonly reason: string | null;
+}
+
+/**
+ * #1268 — `guard`'s answer on the proposal: `clean` (exit 0, a whole check, nothing matched), `matched`
+ * (exit 1: leads to inspect, never a refusal), `incomplete` (exit 3: the check did not finish), or
+ * `not_consulted` (no answer at all, `detail` says why). Only `clean` says nothing was matched.
+ */
+export interface CommitLoreGuardLookup {
+  readonly status: "clean" | "matched" | "incomplete" | "not_consulted";
+  readonly matches: readonly CommitLoreGuardMatch[];
+  readonly detail: string | null;
+}
+
+export interface CommitLoreBeforeChange {
+  /** One per requested path, in the order requested. */
+  readonly paths: readonly CommitLorePathLookup[];
+  readonly guard: CommitLoreGuardLookup;
+  /** The copied package that answered: its stated version and its digest. Null when none ran. */
+  readonly cliIdentity: { readonly version: string; readonly digest: string } | null;
+}
+
+export interface CommitLoreBeforeChangeRequest {
+  /** The paths to look up, in order. */
+  readonly paths: readonly string[];
+  /** The commit the checkout is at: an answer from any other head is not an answer for this turn. */
+  readonly baseHead: string;
+  /** The text `guard` checks. */
+  readonly proposal: string;
+  /** Where the proposal file is written; never the working tree. */
+  readonly scratch: string;
+  /** The `Date.now()` by which the whole lookup has answered; whatever has not by then failed. */
+  readonly deadline: number;
+  /** How many CommitLore children run at once. */
+  readonly concurrency: number;
+  /**
+   * r2 — told each part of the answer the moment it is decided: the CLI that answers, guard's answer, and each
+   * path's. A caller whose deadline passes before the whole answer keeps every part told by then.
+   */
+  readonly report?: (event: CommitLoreLookupEvent) => void;
+}
+
+/** #1268 r2 — one decided part of a before-change lookup (`CommitLoreBeforeChangeRequest.report`). */
+export type CommitLoreLookupEvent =
+  | { readonly kind: "identity"; readonly identity: { readonly version: string; readonly digest: string } }
+  | { readonly kind: "guard"; readonly lookup: CommitLoreGuardLookup }
+  | { readonly kind: "path"; readonly lookup: CommitLorePathLookup };
+
+import { commitloreGoverned, commitloreRequired, commitloreRunMode } from "./commitlore-mode.ts";
+export { commitloreGoverned, commitloreRequired, commitloreRunMode };
 
 /**
  * #1268 — one commit the control plane builds that no session produced and CommitLore has no command to make
@@ -232,6 +334,11 @@ export interface CommitLoreRunner {
    * git hardening. `dispose` removes the copy.
    */
   readonly prepare?: (cwd: string, git: CommitLoreGitTarget, options: { checked: boolean }) => Promise<PreparedCommitLore>;
+  /**
+   * #1268 — false when this deployment pins no CommitLore at all (`ACP_COMMITLORE_BINARY` unset), which is not
+   * the same as a pin that is set and refused. A runner that does not say is taken to have one.
+   */
+  readonly configured?: boolean;
 }
 
 /** #1268 — the repository a CommitLore command works on, passed to git explicitly. */
@@ -284,6 +391,8 @@ export const repositoryObjectFormat = async (gitDir: string): Promise<"sha1" | "
 export interface PreparedCommitLore {
   readonly run: CommitLoreRunner;
   readonly dispose: () => void;
+  /** #1268 — the copied package's stated version and its digest (`CommitLoreSnapshot`), for evidence. */
+  readonly identity?: { readonly version: string; readonly digest: string };
 }
 
 /**
@@ -300,6 +409,11 @@ export interface CommitLoreRunOptions {
    * repository names is run by CommitLore's git.
    */
   git?: CommitLoreGitTarget;
+  /**
+   * #1268 — a bound on this one command below the runner's `timeoutMs`, measured from its spawn like that one:
+   * what is left of a deadline several commands share. Never a longer bound than the runner's.
+   */
+  timeoutMs?: number;
 }
 
 /**
@@ -520,6 +634,8 @@ const commitloreChild =
       ...commitloreChildEnvironment(home, options?.git),
       ...(options?.indexFile === undefined ? {} : { GIT_INDEX_FILE: options.indexFile }),
     };
+    // #1268 — a command given a shorter bound runs under it; none is given a longer one.
+    const timeoutMs = options?.timeoutMs === undefined ? limits.timeoutMs : Math.max(1, Math.min(limits.timeoutMs, Math.floor(options.timeoutMs)));
     try {
       await beforeSpawn();
     } catch (error) {
@@ -530,7 +646,7 @@ const commitloreChild =
       const child = spawn(executable, [...prefix, ...argv], {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: limits.timeoutMs,
+        timeout: timeoutMs,
         env,
       });
       child.once("exit", removeHome).once("error", removeHome);
@@ -569,7 +685,7 @@ const commitloreChild =
         terminate();
         settle(() => reject(new Error(`commitlore ${argv[0]} ${failure}`)));
       };
-      deadline = setTimeout(() => stop(`did not answer within ${limits.timeoutMs} ms`), limits.timeoutMs);
+      deadline = setTimeout(() => stop(`did not answer within ${timeoutMs} ms`), timeoutMs);
       const keep = (stream: "stdout" | "stderr") => (chunk: Buffer) => {
         if (failure !== null) return;
         if (size[stream] + chunk.length > limits.maxOutputBytes) {
@@ -676,13 +792,17 @@ export const commitloreRunner = (
         await unchanged();
       }
       const command = commitloreChild(process.execPath, limits, unchanged, [snapshot.entry]);
-      return { run: async (argv, commandCwd, commandOptions) => command(argv, commandCwd, { ...commandOptions, git }), dispose };
+      return {
+        run: async (argv, commandCwd, commandOptions) => command(argv, commandCwd, { ...commandOptions, git }),
+        dispose,
+        identity: { version: snapshot.version, digest: snapshot.digest },
+      };
     } catch (error) {
       dispose();
       throw error;
     }
   };
-  return Object.assign(run, { prepare });
+  return Object.assign(run, { prepare, configured: pin !== undefined && pin !== "" });
 };
 
 /**
@@ -693,9 +813,13 @@ export const commitloreRunner = (
  * #1268 — `attempt` prepares a checked copy of the package the pin loads once per commit attempt
  * (`commitloreRunner`'s `prepare`), and its commands run from that copy (`commitloreAttempt`). `contract`
  * prints the static drafting contract from an unchecked copy: it is text for a prompt, and the attempt that
- * commits is the one that checks.
+ * commits is the one that checks. `beforeChange` reads from an unchecked copy for the same reason
+ * (`commitloreBeforeChange`).
  */
 export const createCommitLoreCliPort = (run: CommitLoreRunner = commitloreRunner()): CommitLorePort => ({
+  async beforeChange(checkoutPath, git, request) {
+    return commitloreBeforeChange(run, checkoutPath, git, request);
+  },
   async contract(checkoutPath, git) {
     if (run.prepare === undefined) return unprepared();
     let prepared: PreparedCommitLore | null = null;
@@ -769,6 +893,277 @@ const unprepared = (): Decision<never> =>
   deny(ReasonCode.VERIFICATION_GAP, "this CommitLore runner cannot run a checked copy of its package, so it makes no commit", {
     refusal: "COMMITLORE_NOT_RUN",
   });
+
+/** #1268 — `inject`'s budget, the CLI's own default, named so the argv says what it asks for. */
+const INJECT_BUDGET_TOKENS = "800";
+/** The tiers `inject` cuts from the bottom: a cut that reached one of these dropped a required value. */
+const REQUIRED_TIERS: ReadonlySet<string> = new Set(["warn", "limit", "ruled-out"]);
+/** The notice `inject`'s fixed template prints, at the start of a line, when its scan stopped early. */
+const INJECT_SCAN_INCOMPLETE = /^incomplete: the scan stopped/m;
+
+const failedLookup = (path: string, detail: string, cacheKey: string | null = null): CommitLorePathLookup => ({
+  path,
+  outcome: "failed",
+  text: "",
+  cacheKey,
+  withheld: 0,
+  items: null,
+  detail: detail.slice(0, 400),
+});
+
+const parsedObject = (stdout: string): Record<string, unknown> | null => {
+  try {
+    const parsed: unknown = JSON.parse(stdout);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+};
+
+/** Runs `jobs` at most `width` at a time, each result at its job's index. A job never throws here. */
+const inPool = async <T>(width: number, jobs: ReadonlyArray<() => Promise<T>>): Promise<T[]> => {
+  const results = new Array<T>(jobs.length);
+  let next = 0;
+  const lane = async (): Promise<void> => {
+    while (next < jobs.length) {
+      const index = next++;
+      results[index] = await (jobs[index] as () => Promise<T>)();
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(width, jobs.length)) }, lane));
+  return results;
+};
+
+/**
+ * #1268 r1 P1-1 — every way `context --json` says its answer is not whole: an exit other than 0 (3 is "answered,
+ * but the notes mirror is unfetched or the scan was truncated"), `coverage` other than `complete`, unread commits,
+ * `history` other than `ready`, `notes` other than `present` or `absent`, and every entry of `diagnostics`. Each of
+ * CommitLore's query diagnostics is a caveat on the answer (an unread index or scan, unreadable or shallow history,
+ * unfetched notes, a checkout behind its upstream, capped rename aliases, withheld or masked values) and none says
+ * it is whole, so each counts, by its presence and not by its wording, with one exception (`noHistory`). A field
+ * missing or of an unknown value counts too: empty only for an answer CommitLore itself calls whole.
+ *
+ * The exception is the one diagnostic that is about the path rather than the answer's coverage: CommitLore's fixed
+ * template (`pathPresenceDiagnostics`) for a path no commit in the history it read ever held, with that exact path
+ * at its start and, optionally, its fixed hint naming an ancestor that does have history. It is recognised only in
+ * that exact form; any other wording, or another path, is an ordinary diagnostic and counts.
+ */
+const pathWithoutHistory = (path: string): RegExp =>
+  new RegExp(
+    `^${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} matched no blob in the walked history, so 0 records is uninformative rather than a statement that nothing was recorded(?:; \\S+ does have history, so query that if the name has changed)?$`,
+  );
+
+const coverageGaps = (exitCode: number, context: Record<string, unknown>, path: string): { gaps: string[]; noHistory: boolean } => {
+  const shown = (value: unknown): string => JSON.stringify(value ?? null).slice(0, 60);
+  const gaps: string[] = [];
+  if (exitCode !== 0) gaps.push(`commitlore context exited ${exitCode}`);
+  if (context["coverage"] !== "complete") gaps.push(`coverage is ${shown(context["coverage"])}`);
+  if (context["unreadCommits"] !== 0) gaps.push(`unreadCommits is ${shown(context["unreadCommits"])}`);
+  if (context["history"] !== "ready") gaps.push(`history is ${shown(context["history"])}`);
+  if (context["notes"] !== "present" && context["notes"] !== "absent") gaps.push(`notes are ${shown(context["notes"])}`);
+  const diagnostics = context["diagnostics"];
+  const withoutHistory = pathWithoutHistory(path);
+  let noHistory = false;
+  if (!Array.isArray(diagnostics)) gaps.push("it reported no diagnostics list");
+  else {
+    for (const diagnostic of diagnostics) {
+      if (typeof diagnostic === "string" && withoutHistory.test(diagnostic)) noHistory = true;
+      else gaps.push(`it said: ${String(diagnostic).slice(0, 160)}`);
+    }
+  }
+  return { gaps, noHistory };
+};
+
+/** #1268 r1 — how many records `context --json` reports CommitLore withheld as `[blocked]`. */
+const blockedRecords = (records: unknown): number =>
+  Array.isArray(records) ? records.filter((record) => (record as { trust?: unknown } | null)?.trust === "blocked").length : 0;
+
+/** The required values `context --json` reports for a path, from active records CommitLore did not withhold. */
+const requiredItems = (records: unknown): CommitLoreRequiredItem[] | null => {
+  if (!Array.isArray(records)) return null;
+  const items: CommitLoreRequiredItem[] = [];
+  for (const entry of records) {
+    if (typeof entry !== "object" || entry === null) return null;
+    const record = entry as Record<string, unknown>;
+    // A withheld record's content is the attack: nothing of it is carried, its count comes from `inject`.
+    if (record["trust"] === "blocked" || record["lifecycle"] !== "active" || !Array.isArray(record["trailers"])) continue;
+    for (const trailer of record["trailers"] as unknown[]) {
+      const { key, value } = (trailer ?? {}) as { key?: unknown; value?: unknown };
+      if (typeof value !== "string" || !(COMMITLORE_REQUIRED_KEYS as readonly unknown[]).includes(key)) continue;
+      items.push({
+        recordId: typeof record["recordId"] === "string" ? record["recordId"] : null,
+        sha: typeof record["sha"] === "string" ? record["sha"] : "",
+        trust: typeof record["trust"] === "string" ? record["trust"] : "unknown",
+        key: key as CommitLoreRequiredKey,
+        value,
+      });
+    }
+  }
+  // Warn, then Limit, then Ruled-out, as `inject` orders its tiers; within one, as `context` listed them.
+  return items
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => COMMITLORE_REQUIRED_KEYS.indexOf(a.item.key) - COMMITLORE_REQUIRED_KEYS.indexOf(b.item.key) || a.index - b.index)
+    .map(({ item }) => item);
+};
+
+/**
+ * #1268 — what CommitLore holds for the paths a worker may change, before it starts, from an unchecked copy of
+ * the pinned package (`prepare` with `checked: false`, as `contract` reads its text: this too is text for a
+ * prompt, and the commit attempt is the one that checks).
+ *
+ * - Each path: first `context --json`, whose structured answer says whether CommitLore's answer for the path is
+ *   whole (`coverageGaps`; r1 P1-1): one that is not is `incomplete`, whatever else it holds. Then
+ *   `inject --path <p> --json --budget 800`, CommitLore's own pre-edit projection, which is what is delivered,
+ *   except where its budget provably cut a required value (`truncatedAt` is `warn`, `limit` or `ruled-out`; the
+ *   tiers are cut from the bottom, so a cut that reaches only `other` dropped none): then every Warn, Limit and
+ *   Ruled-out value `context` listed is. An answer at any head but `baseHead` is never an answer.
+ * - Once: `guard --proposal @<file> --json` on those paths, the proposal written into `scratch`.
+ * - Every command with `--no-index`: the index lives in the git dir, whose entries the turn is held to from
+ *   before this lookup, and reading it rewrites its WAL files and its directory. CommitLore answers the same
+ *   from git alone, slower.
+ * - At most `concurrency` children at once, each bounded by what is left of `deadline`, and none started after
+ *   it: whatever has not answered by then failed. Each part is `report`ed the moment it is decided (r2).
+ *
+ * Null when this deployment pins no CommitLore at all; never a refusal: the caller decides what a gap means.
+ */
+export const commitloreBeforeChange = async (
+  run: CommitLoreRunner,
+  checkoutPath: string,
+  git: CommitLoreGitTarget,
+  request: CommitLoreBeforeChangeRequest,
+): Promise<CommitLoreBeforeChange | null> => {
+  if (run.configured === false) return null;
+  const unanswered = (detail: string): CommitLoreBeforeChange => ({
+    paths: request.paths.map((path) => failedLookup(path, detail)),
+    guard: { status: "not_consulted", matches: [], detail },
+    cliIdentity: null,
+  });
+  if (run.prepare === undefined) return unanswered("this CommitLore runner cannot run a copy of its package");
+  const left = (): number => request.deadline - Date.now();
+  let prepared: PreparedCommitLore;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const preparing = run.prepare(checkoutPath, git, { checked: false });
+    const expired = new Promise<null>((resolvePromise) => {
+      timer = setTimeout(() => resolvePromise(null), Math.max(0, left()));
+    });
+    const ready = await Promise.race([preparing, expired]);
+    if (ready === null) {
+      // Prepared after the deadline: removed when it arrives, never used.
+      preparing.then((late) => late.dispose(), () => {});
+      return unanswered("CommitLore could not be prepared before the lookup's deadline");
+    }
+    prepared = ready;
+    if (prepared.identity !== undefined) request.report?.({ kind: "identity", identity: prepared.identity });
+  } catch (error) {
+    return unanswered(`commitlore could not be run: ${(error as Error).message.slice(0, 300)}`);
+  } finally {
+    clearTimeout(timer);
+  }
+  try {
+    const command = async (argv: readonly string[]): Promise<CommitLoreRun> => {
+      const remaining = left();
+      if (remaining <= 0) throw new Error(`commitlore ${argv[0]} was not started: the lookup's deadline had passed`);
+      return prepared.run(argv, checkoutPath, { timeoutMs: remaining });
+    };
+    const proposalPath = join(request.scratch, "commitlore-guard-proposal.txt");
+    writeFileSync(proposalPath, request.proposal, { mode: 0o600 });
+
+    const guardLookup = async (): Promise<CommitLoreGuardLookup> => {
+      let answer: CommitLoreRun;
+      try {
+        answer = await command(["guard", "--proposal", `@${proposalPath}`, "--json", "--no-index", "--", ...request.paths]);
+      } catch (error) {
+        return { status: "not_consulted", matches: [], detail: `commitlore guard did not answer: ${(error as Error).message.slice(0, 300)}` };
+      }
+      const parsed = [0, 1, 3].includes(answer.exitCode) ? parsedObject(answer.stdout) : null;
+      if (parsed === null || !Array.isArray(parsed["matches"]) || typeof parsed["matched"] !== "boolean") {
+        return { status: "not_consulted", matches: [], detail: `commitlore guard exited ${answer.exitCode} without its answer: ${tail(answer.stderr)}` };
+      }
+      const matches = (parsed["matches"] as unknown[]).map((entry): CommitLoreGuardMatch => {
+        const match = (entry ?? {}) as Record<string, unknown>;
+        const blocked = match["trust"] === "blocked";
+        return {
+          recordId: typeof match["recordId"] === "string" ? match["recordId"] : null,
+          sha: typeof match["sha"] === "string" ? match["sha"] : "",
+          score: typeof match["score"] === "number" ? match["score"] : 0,
+          trust: typeof match["trust"] === "string" ? match["trust"] : "unknown",
+          alternative: !blocked && typeof match["alternative"] === "string" ? match["alternative"] : null,
+          reason: !blocked && typeof match["reason"] === "string" ? match["reason"] : null,
+        };
+      });
+      if (answer.exitCode === 1 || parsed["matched"] === true) return { status: "matched", matches, detail: null };
+      if (answer.exitCode === 3 || parsed["incomplete"] === true) return { status: "incomplete", matches, detail: "commitlore guard's check was incomplete" };
+      return { status: "clean", matches: [], detail: null };
+    };
+
+    const pathLookup = async (path: string): Promise<CommitLorePathLookup> => {
+      // r1 P1-1 — whether CommitLore's answer for the path is whole is read from `context --json`, its structured
+      // answer, and never from what `inject` printed: with the notes mirror unfetched, `inject` exits 0 with
+      // nothing to say, and the only sign is a line on its stderr.
+      let listed: CommitLoreRun;
+      try {
+        listed = await command(["context", "--json", "--no-index", "--", path]);
+      } catch (error) {
+        return failedLookup(path, `commitlore context did not answer: ${(error as Error).message.slice(0, 300)}`);
+      }
+      const context = listed.exitCode === 0 || listed.exitCode === 3 ? parsedObject(listed.stdout) : null;
+      const items = context === null ? null : requiredItems(context["records"]);
+      if (context === null || items === null) {
+        return failedLookup(path, `commitlore context exited ${listed.exitCode} without its answer: ${tail(listed.stderr)}`);
+      }
+      const vantage = (context["vantage"] ?? {}) as { head?: unknown };
+      if (vantage.head !== request.baseHead) return failedLookup(path, `commitlore context answered at ${String(vantage.head)}, not at the turn's base ${request.baseHead}`);
+      const blocked = blockedRecords(context["records"]);
+      const { gaps, noHistory } = coverageGaps(listed.exitCode, context, path);
+      if (gaps.length > 0) {
+        return { path, outcome: "incomplete", text: "", cacheKey: null, withheld: blocked, items: null, detail: `CommitLore's answer for this path is not whole: ${gaps.join("; ")}`.slice(0, 400) };
+      }
+      let injected: CommitLoreRun;
+      try {
+        injected = await command(["inject", "--path", path, "--json", "--budget", INJECT_BUDGET_TOKENS, "--no-index"]);
+      } catch (error) {
+        return failedLookup(path, `commitlore inject did not answer: ${(error as Error).message.slice(0, 300)}`);
+      }
+      const injection = injected.exitCode === 0 ? parsedObject(injected.stdout) : null;
+      const { text, cacheKey, head, withheld, truncatedAt } = injection ?? {};
+      if (typeof text !== "string" || typeof cacheKey !== "string" || typeof head !== "string" || typeof withheld !== "number") {
+        return failedLookup(path, `commitlore inject exited ${injected.exitCode} without its projection: ${tail(injected.stderr)}`);
+      }
+      if (head !== request.baseHead) return failedLookup(path, `commitlore inject answered at ${head || "no commit"}, not at the turn's base ${request.baseHead}`, cacheKey);
+      const answered = { path, text, cacheKey, withheld: Math.max(withheld, blocked), items: null, detail: null, noHistory };
+      if (INJECT_SCAN_INCOMPLETE.test(text)) {
+        return { ...answered, outcome: "incomplete", detail: "CommitLore's scan stopped at its time budget, so records for this path may be missing" };
+      }
+      // Only where `inject`'s budget provably dropped a required value does the section carry `context`'s list.
+      if (typeof truncatedAt !== "string" || !REQUIRED_TIERS.has(truncatedAt)) return { ...answered, outcome: "answered" };
+      return { ...answered, outcome: "answered", items };
+    };
+
+    // r2 — each part is told as it is decided, so a deadline that passes on one keeps the others.
+    const [guard, ...paths] = await inPool<CommitLoreGuardLookup | CommitLorePathLookup>(request.concurrency, [
+      async () => {
+        const lookup = await guardLookup();
+        request.report?.({ kind: "guard", lookup });
+        return lookup;
+      },
+      ...request.paths.map((path) => async () => {
+        const lookup = await pathLookup(path);
+        request.report?.({ kind: "path", lookup });
+        return lookup;
+      }),
+    ]);
+    return {
+      paths: paths as CommitLorePathLookup[],
+      guard: guard as CommitLoreGuardLookup,
+      cliIdentity: prepared.identity ?? null,
+    };
+  } catch (error) {
+    return unanswered(`the CommitLore lookup did not complete: ${(error as Error).message.slice(0, 300)}`);
+  } finally {
+    prepared.dispose();
+  }
+};
 
 const refuse = (refusal: string, message: string, evidence: Record<string, unknown>): Decision<CommitLoreObservation> =>
   deny(ReasonCode.VERIFICATION_GAP, message, { refusal, ...evidence });
