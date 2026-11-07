@@ -508,6 +508,11 @@ describe("#1268 (C): CommitLore's context and guard reach a worker before it edi
     hang?: boolean;
     /** Answer after this many milliseconds. */
     delayMs?: number;
+    /**
+     * Report each path's answer at once, except the paths `unfinished` names, then never answer as a whole: as a
+     * port whose guard (and any unfinished path) is still running at the deadline.
+     */
+    reportThenHang?: { unfinished?: (path: string) => boolean };
   };
 
   /** A CommitLore double: its before-change answer is `script`'s; a required run's contract and commit pass. */
@@ -533,6 +538,16 @@ describe("#1268 (C): CommitLore's context and guard reach a worker before it edi
       beforeChange: async (_checkout, _git, request) => {
         requests.push(request);
         if (script.hang === true) return new Promise<never>(() => {});
+        if (script.reportThenHang !== undefined) {
+          for (const path of request.paths) {
+            if (script.reportThenHang.unfinished?.(path) === true) continue;
+            request.report?.({
+              kind: "path",
+              lookup: { path, outcome: "answered", text: record(path), cacheKey: `cache-${path}`, withheld: 0, items: null, detail: null, ...script.path?.(path) },
+            });
+          }
+          return new Promise<never>(() => {});
+        }
         if (script.delayMs !== undefined) await new Promise((resolve) => setTimeout(resolve, script.delayMs));
         return {
           paths: request.paths.map((path) => ({
@@ -680,7 +695,7 @@ describe("#1268 (C): CommitLore's context and guard reach a worker before it edi
     expect(started).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.WORKER_COMMITLORE_CONTEXT_INCOMPLETE,
-      evidence: { uncovered: [{ path: "src", reason: "the CommitLore lookup did not answer within 50 ms" }] },
+      evidence: { uncovered: [{ path: "src", reason: "the CommitLore lookup did not answer for this path within 50 ms" }] },
     });
     refusedBeforeAnyEdit(subject, adapter, base);
   });
@@ -813,6 +828,105 @@ describe("#1268 (C): CommitLore's context and guard reach a worker before it edi
     refusedBeforeAnyEdit(subject, adapter, base);
   });
 
+  it("r2 repro 1: a path reported blocked before the deadline stays blocked when guard runs past it, and no supplement unblocks it", async () => {
+    const subject = world("preferred");
+    const base = head(subject);
+    supplement(subject, [{ path: "src", base, contextText: "Limit: by hand" }]);
+    const { port } = lookupPort({ path: () => ({ withheld: 1 }), reportThenHang: {} });
+    const adapter = fakeFor(subject, SAID);
+    const started = await start(subject, adapter, { commitlore: port, commitloreLookupMs: 300 });
+
+    expect(started).toMatchObject({ allowed: false, reasonCode: ReasonCode.WORKER_COMMITLORE_CONTEXT_BLOCKED, evidence: { blocked: [{ path: "src", withheld: 1 }], uncovered: [] } });
+    refusedBeforeAnyEdit(subject, adapter, base);
+  });
+
+  it("r2 repro 2: guard alone past the deadline, the context whole: a required turn proceeds, guard stated as not consulted", async () => {
+    const subject = world("required");
+    const { port } = lookupPort({ reportThenHang: {} });
+    const adapter = fakeFor(subject, replyFor("required"));
+    await start(subject, adapter, { commitlore: port, commitloreLookupMs: 300 });
+
+    expect(succeededEvidence(subject)["commitlore"]).toEqual({ outcome: "empty", recordIds: [], nonce: null });
+    const section = sectionOf(adapter.requests[0]!.prompt);
+    expect(section).toContain("guard not consulted");
+    expect(section).toContain("src keeps its exports stable");
+    expect(beforeChangeOf(subject)).toMatchObject({
+      status: "COMPLETE",
+      uncovered: [],
+      cacheKeys: [{ path: "src", value: "cache-src" }],
+      guard: { status: "not_consulted", detail: "guard not consulted (timeout): it did not answer within 300 ms" },
+    });
+  });
+
+  it("r2: paths that finished by the deadline are kept, and only the unfinished one is uncovered (required: refused)", async () => {
+    const subject = world("required", ["src", "docs", "lib"]);
+    const base = head(subject);
+    const { port } = lookupPort({ reportThenHang: { unfinished: (path) => path === "lib" } });
+    const adapter = fakeFor(subject, replyFor("required"));
+    const started = await start(subject, adapter, { commitlore: port, commitloreLookupMs: 300 });
+
+    expect(started).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.WORKER_COMMITLORE_CONTEXT_INCOMPLETE,
+      evidence: { uncovered: [{ path: "lib", reason: "the CommitLore lookup did not answer for this path within 300 ms" }], blocked: [] },
+    });
+    refusedBeforeAnyEdit(subject, adapter, base);
+  });
+
+  it("r2: paths that finished by the deadline are kept, and only the unfinished one needs the run owner's supplement (preferred)", async () => {
+    const subject = world("preferred", ["src", "docs", "lib"]);
+    const base = head(subject);
+    supplement(subject, [{ path: "lib", base, contextText: "Limit: lib stays small" }]);
+    const { port } = lookupPort({ reportThenHang: { unfinished: (path) => path === "lib" } });
+    const adapter = fakeFor(subject, SAID);
+    await start(subject, adapter, { commitlore: port, commitloreLookupMs: 300 });
+
+    expect(succeededEvidence(subject)).toBeDefined();
+    const section = sectionOf(adapter.requests[0]!.prompt);
+    for (const path of ["src", "docs"]) expect(section).toContain(`${path} keeps its exports stable`);
+    expect(section).toContain("Path lib: manually supplied by the run owner");
+    expect(beforeChangeOf(subject)).toMatchObject({
+      status: "SUPPLEMENTED",
+      uncovered: [{ path: "lib" }],
+      cacheKeys: expect.arrayContaining([{ path: "src", value: "cache-src" }, { path: "docs", value: "cache-docs" }, { path: "lib", value: null }]),
+      guard: { status: "not_consulted" },
+    });
+  });
+
+  it("r2: through the CLI port, a guard child still running at the deadline leaves the paths it answered, and the turn proceeds", async () => {
+    const subject = world("preferred");
+    const base = head(subject);
+    const runner: CommitLoreRunner = Object.assign(async (): Promise<never> => {
+      throw new Error("unprepared");
+    }, {
+      configured: true,
+      prepare: async () => ({
+        dispose: () => {},
+        identity: { version: "1.7.5", digest: "sha256:fixture" },
+        run: async (argv: readonly string[], _cwd: string, options?: { timeoutMs?: number }) => {
+          if (argv[0] === "context") {
+            return { exitCode: 0, stderr: "", stdout: JSON.stringify({ coverage: "complete", unreadCommits: 0, history: "ready", notes: "absent", vantage: { head: base }, records: [], diagnostics: [] }) };
+          }
+          if (argv[0] === "inject") return { exitCode: 0, stderr: "", stdout: JSON.stringify({ text: record("src"), included: 1, omitted: 0, cacheKey: "k-src", head: base, withheld: 0 }) };
+          // guard: bounded by what is left of the deadline, as the real child is, and never answers within it.
+          return new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error(`commitlore guard did not answer within ${options?.timeoutMs} ms`)), options?.timeoutMs ?? 0));
+        },
+      }),
+    });
+    const adapter = fakeFor(subject, SAID);
+    await start(subject, adapter, { commitlore: createCommitLoreCliPort(runner), commitloreLookupMs: 300 });
+
+    expect(succeededEvidence(subject)).toBeDefined();
+    expect(sectionOf(adapter.requests[0]!.prompt)).toContain("guard not consulted");
+    expect(beforeChangeOf(subject)).toMatchObject({
+      status: "COMPLETE",
+      uncovered: [],
+      cacheKeys: [{ path: "src", value: "k-src" }],
+      guard: { status: "not_consulted" },
+      cliIdentity: { version: "1.7.5", digest: "sha256:fixture" },
+    });
+  });
+
   it("(d) r1 P2: an answer that arrives after the lookup's deadline is a failed lookup, however soon after", async () => {
     const subject = world("required");
     const base = head(subject);
@@ -823,7 +937,7 @@ describe("#1268 (C): CommitLore's context and guard reach a worker before it edi
     expect(started).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.WORKER_COMMITLORE_CONTEXT_INCOMPLETE,
-      evidence: { uncovered: [{ path: "src", reason: "the CommitLore lookup did not answer within 50 ms" }] },
+      evidence: { uncovered: [{ path: "src", reason: "the CommitLore lookup did not answer for this path within 50 ms" }] },
     });
     refusedBeforeAnyEdit(subject, adapter, base);
   });
@@ -1037,7 +1151,7 @@ describe.skipIf(REAL === null)("#1268 (C): CommitLore's context reaches a worker
     expect(started).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.WORKER_COMMITLORE_CONTEXT_INCOMPLETE,
-      evidence: { base, uncovered: [{ path: "src", reason: expect.stringMatching(/deadline|did not answer within 1 ms/) }] },
+      evidence: { base, uncovered: [{ path: "src", reason: expect.stringMatching(/deadline|did not answer for this path within 1 ms/) }] },
     });
     expect(world.tasks.executions(world.runId)).toEqual([]);
     expect(adapter.launches).toBe(0);

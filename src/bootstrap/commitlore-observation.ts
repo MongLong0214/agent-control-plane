@@ -194,7 +194,18 @@ export interface CommitLoreBeforeChangeRequest {
   readonly deadline: number;
   /** How many CommitLore children run at once. */
   readonly concurrency: number;
+  /**
+   * r2 — told each part of the answer the moment it is decided: the CLI that answers, guard's answer, and each
+   * path's. A caller whose deadline passes before the whole answer keeps every part told by then.
+   */
+  readonly report?: (event: CommitLoreLookupEvent) => void;
 }
+
+/** #1268 r2 — one decided part of a before-change lookup (`CommitLoreBeforeChangeRequest.report`). */
+export type CommitLoreLookupEvent =
+  | { readonly kind: "identity"; readonly identity: { readonly version: string; readonly digest: string } }
+  | { readonly kind: "guard"; readonly lookup: CommitLoreGuardLookup }
+  | { readonly kind: "path"; readonly lookup: CommitLorePathLookup };
 
 import { commitloreGoverned, commitloreRequired, commitloreRunMode } from "./commitlore-mode.ts";
 export { commitloreGoverned, commitloreRequired, commitloreRunMode };
@@ -1011,7 +1022,7 @@ const requiredItems = (records: unknown): CommitLoreRequiredItem[] | null => {
  *   before this lookup, and reading it rewrites its WAL files and its directory. CommitLore answers the same
  *   from git alone, slower.
  * - At most `concurrency` children at once, each bounded by what is left of `deadline`, and none started after
- *   it: whatever has not answered by then failed.
+ *   it: whatever has not answered by then failed. Each part is `report`ed the moment it is decided (r2).
  *
  * Null when this deployment pins no CommitLore at all; never a refusal: the caller decides what a gap means.
  */
@@ -1043,6 +1054,7 @@ export const commitloreBeforeChange = async (
       return unanswered("CommitLore could not be prepared before the lookup's deadline");
     }
     prepared = ready;
+    if (prepared.identity !== undefined) request.report?.({ kind: "identity", identity: prepared.identity });
   } catch (error) {
     return unanswered(`commitlore could not be run: ${(error as Error).message.slice(0, 300)}`);
   } finally {
@@ -1128,9 +1140,18 @@ export const commitloreBeforeChange = async (
       return { ...answered, outcome: "answered", items };
     };
 
+    // r2 — each part is told as it is decided, so a deadline that passes on one keeps the others.
     const [guard, ...paths] = await inPool<CommitLoreGuardLookup | CommitLorePathLookup>(request.concurrency, [
-      guardLookup,
-      ...request.paths.map((path) => () => pathLookup(path)),
+      async () => {
+        const lookup = await guardLookup();
+        request.report?.({ kind: "guard", lookup });
+        return lookup;
+      },
+      ...request.paths.map((path) => async () => {
+        const lookup = await pathLookup(path);
+        request.report?.({ kind: "path", lookup });
+        return lookup;
+      }),
     ]);
     return {
       paths: paths as CommitLorePathLookup[],

@@ -18,6 +18,9 @@ import {
 } from "../bootstrap/commitlore-commit.ts";
 import {
   type CommitLoreBeforeChange,
+  type CommitLoreGuardLookup,
+  type CommitLoreLookupEvent,
+  type CommitLorePathLookup,
   type CommitLorePort,
   commitloreGoverned,
   commitloreRunMode,
@@ -1719,7 +1722,9 @@ export class WorkerTurnRunner {
    * - A path with `[blocked]` records refuses the turn in either mode (WORKER_COMMITLORE_CONTEXT_BLOCKED), first:
    *   whether it may be changed cannot be decided, a turn's paths cannot be split mid-turn, and no supplement
    *   stands in for content CommitLore withheld (r1 P1-2).
-   * - One deadline: an answer that arrives after it is a failed lookup, however soon after (r1 P2).
+   * - One deadline: an answer that arrives after it is a failed lookup, however soon after (r1 P2); each part
+   *   the port told by then is kept, so only the paths it had not answered fail, and guard not answering by
+   *   then is guard not consulted, never a gap in any path's context (r2).
    * - guard's answer never refuses: a match is a lead, and a guard that gave none is stated as not consulted.
    */
   private async commitloreBeforeChange(facts: TurnFacts, scratch: string): Promise<Decision<TurnFacts["commitloreBeforeChange"]>> {
@@ -1735,14 +1740,30 @@ export class WorkerTurnRunner {
     if (port === null || port.beforeChange === undefined) return mode === "required" ? unobservable() : allow(ReasonCode.OK, null);
     const paths = [...new Set([...facts.claim.ownedPaths, ...(facts.writeTarget?.paths ?? [])])];
     const lookedUp = paths.slice(0, BEFORE_CHANGE_MAX_PATHS);
-    const unanswered = (detail: string): CommitLoreBeforeChange => ({
-      paths: lookedUp.map((path) => ({ path, outcome: "failed", text: "", cacheKey: null, withheld: 0, items: null, detail })),
-      guard: { status: "not_consulted", matches: [], detail },
-      cliIdentity: null,
-    });
     const lookupMs = this.#commitloreLookupMs;
     const deadline = Date.now() + lookupMs;
-    const late = (): CommitLoreBeforeChange => unanswered(`the CommitLore lookup did not answer within ${lookupMs} ms`);
+    // r2 — every part of the answer the port tells by the deadline is kept, whatever it is (a path answered, in
+    // part or blocked, or guard); only a part not told by then has failed, and guard's never touches a path's.
+    const told: { paths: Map<string, CommitLorePathLookup>; guard: CommitLoreGuardLookup | null; identity: CommitLoreBeforeChange["cliIdentity"] } = {
+      paths: new Map(),
+      guard: null,
+      identity: null,
+    };
+    const report = (event: CommitLoreLookupEvent): void => {
+      if (Date.now() > deadline) return;
+      if (event.kind === "path") told.paths.set(event.lookup.path, event.lookup);
+      else if (event.kind === "guard") told.guard = event.lookup;
+      else told.identity = event.identity;
+    };
+    const fromTold = (path: string, guard: string, whole?: CommitLoreBeforeChange): CommitLoreBeforeChange => ({
+      paths: lookedUp.map(
+        (looked) =>
+          told.paths.get(looked) ??
+          whole?.paths.find((entry) => entry.path === looked) ?? { path: looked, outcome: "failed", text: "", cacheKey: null, withheld: 0, items: null, detail: path },
+      ),
+      guard: told.guard ?? whole?.guard ?? { status: "not_consulted", matches: [], detail: guard },
+      cliIdentity: told.identity ?? whole?.cliIdentity ?? null,
+    });
     let timer: ReturnType<typeof setTimeout> | undefined;
     let answer: CommitLoreBeforeChange | null;
     try {
@@ -1756,20 +1777,26 @@ export class WorkerTurnRunner {
           scratch,
           deadline,
           concurrency: BEFORE_CHANGE_CONCURRENCY,
+          report,
         },
       );
       // The port bounds its own children by the deadline, and their cleanup runs on after it; what this turn
-      // takes is only an answer that arrived by the deadline (r1 P2).
+      // takes is only what was told or answered by the deadline (r1 P2).
       asked.catch(() => {});
-      answer = await Promise.race([
-        asked,
-        new Promise<CommitLoreBeforeChange>((resolve) => {
-          timer = setTimeout(() => resolve(late()), Math.max(0, deadline - Date.now()));
+      const settled = await Promise.race([
+        asked.then((value) => ({ value })),
+        new Promise<"late">((resolve) => {
+          timer = setTimeout(() => resolve("late"), Math.max(0, deadline - Date.now()));
         }),
       ]);
-      if (Date.now() > deadline) answer = late();
+      if (settled === "late" || Date.now() > deadline) {
+        answer = fromTold(`the CommitLore lookup did not answer for this path within ${lookupMs} ms`, `guard not consulted (timeout): it did not answer within ${lookupMs} ms`);
+      } else {
+        answer = settled.value === null ? null : fromTold("CommitLore gave no answer for it", "guard not consulted: the CommitLore lookup gave no guard answer", settled.value);
+      }
     } catch (error) {
-      answer = unanswered(`the CommitLore lookup failed: ${errorText(error).slice(0, 300)}`);
+      const failed = `the CommitLore lookup failed: ${errorText(error).slice(0, 300)}`;
+      answer = fromTold(failed, `guard not consulted: ${failed}`);
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
