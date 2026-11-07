@@ -12,6 +12,7 @@ import { type Decision, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { RunState } from "../domain/types.ts";
 import { SingleInstanceLock } from "../daemon/single-instance.ts";
+import { prepareReviewEvidenceFile } from "../review/review-evidence-file.ts";
 
 /**
  * PRD §28.4 — the operator CLI is a client, never a composition root. Every command crosses
@@ -85,6 +86,12 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
                                            live Gateway as its stdio MCP server and relayed to the
                                            adopted CEO tool socket, which admits it by kernel peer
                                            and Gateway ancestry. Takes no selector and no secret
+  agentctl review-evidence prepare <runId> <bundle-file>
+                                           write a review evidence bundle where review_evidence_stage
+                                           reads it with evidenceFromFile: true, as
+                                           <state root>/review-evidence/<runId>/<sha256> (0600 under
+                                           0700 directories, renamed into place whole), and print the
+                                           expectedSha256 to stage with. Needs no daemon and no token
   agentctl daemon status                  daemon mode and health; falls back to the lock file
 `;
 
@@ -155,6 +162,15 @@ export const main = async (argv: string[]): Promise<number> => {
   // proves it — a relay that could read the owner/admin credential would be a claimant holding it.
   if (command === "attach") {
     return dispatchAttach(rest, config);
+  }
+
+  // GAP 2 — the owning CTO's way to hand ACP a large review evidence bundle without passing it through its MCP
+  // call. It writes one file below the state root and reaches no socket, so it sits above the token read too.
+  if (command === "review-evidence") {
+    if (rest[0] !== "prepare" || rest.length !== 3) return fail("usage: agentctl review-evidence prepare <runId> <bundle-file>");
+    const prepared = prepareReviewEvidenceFile(join(config.databasePath, ".."), rest[1]!, rest[2]!);
+    print(prepared.allowed ? prepared.value : prepared);
+    return prepared.allowed ? 0 : 1;
   }
 
   const owner = rest.includes("--owner");

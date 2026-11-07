@@ -3,6 +3,7 @@ import { BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES, collectBootstrapReviewEvidence, re
 import { stageStandardReviewEvidence, type StandardReviewEvidenceStageInput } from "../review/standard-review-evidence.ts";
 import { collectBootstrapCeoDecisions } from "../bootstrap/bootstrap-ceo-decisions.ts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { dirname } from "node:path";
 import { z } from "zod";
 
 import { submittedPlanSchema, submittedTasksSchema } from "../bootstrap/plan-input-schema.ts";
@@ -63,6 +64,8 @@ const runIdentity = { runId: z.string() };
  * the control plane as a convenience shortcut (#352).
  */
 export interface CtoMcpSource extends McpMutationSource {
+  /** The state root is `dirname(databasePath)`; `review_evidence_stage` reads a file input below it. */
+  readonly config: { readonly databasePath: string };
   readonly db: Db;
   readonly clock: Clock;
   readonly artifacts: ArtifactStore;
@@ -237,8 +240,9 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       return checked.allowed ? allow(ReasonCode.OK, { roleKey: checked.value.roleKey, bindingGeneration: checked.value.bindingGeneration }) : checked;
     },
     stageBootstrapReviewEvidence: (peer: AuthenticatedMcpPeer, input: ReviewEvidenceStageInput) => stageBootstrapReviewEvidence(source, peer, input),
+    // GAP 2 — a file input is read from the state root the daemon's database lives in, the root agentctl writes to.
     stageStandardReviewEvidence: (owner: { sessionId: string; bindingGeneration: number; roleKey: string }, input: StandardReviewEvidenceStageInput) =>
-      stageStandardReviewEvidence(source, owner, input),
+      stageStandardReviewEvidence(source, owner, input, dirname(source.config.databasePath)),
     stageBootstrapPlan: (peer: AuthenticatedMcpPeer, input: BootstrapPlanStageInput) => stageBootstrapPlan(source, peer, input),
     bootstrapPlanForRun: (runId: string) => readBootstrapPlanAttachment(source, runId),
     resolvePlanInput: (runId: string, input: { bootstrapPlanDigest?: string; plan?: Record<string, unknown>; tasks?: z.infer<typeof submittedTasksSchema> }) =>
@@ -679,8 +683,8 @@ const createCtoServerFromPort = (
   );
   server.registerTool(
     "review_evidence_stage",
-    { description: `Stage one immutable private review evidence bundle for a STANDARD_WORK or CONTRACT_CHANGE run you own (the same bundle format and ${BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES / 1024} KiB UTF-8 limit as bootstrap_review_evidence_stage): only the minimal excerpts, their source identification and comparison ranges, digests and limits. Binds this run and its contract digest. It is attributed data for the reviewer, never a contract change or an approval; the canonical CEO must select it with review_evidence_attach, and the next result_submit freezes it into the candidate's review.`,
-      inputSchema: { ...mutation, ...runIdentity, contractDigest: z.string(), evidenceBody: z.string(), expectedSha256: z.string() } },
+    { description: `Stage one immutable private review evidence bundle for a STANDARD_WORK or CONTRACT_CHANGE run you own (the same bundle format and ${BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES / 1024} KiB UTF-8 limit as bootstrap_review_evidence_stage): only the minimal excerpts, their source identification and comparison ranges, digests and limits. Binds this run and its contract digest. Send the bundle as evidenceBody, or instead set evidenceFromFile: true to have ACP read <state root>/review-evidence/<runId>/<expectedSha256>, which \`agentctl review-evidence prepare <runId> <bundle-file>\` writes and answers expectedSha256 for; exactly one of the two, and no path is ever an argument. It is attributed data for the reviewer, never a contract change or an approval; the canonical CEO must select it with review_evidence_attach, and the next result_submit freezes it into the candidate's review.`,
+      inputSchema: { ...mutation, ...runIdentity, contractDigest: z.string(), evidenceBody: z.string().optional(), evidenceFromFile: z.boolean().optional(), expectedSha256: z.string() } },
     async args => writeOwned("review_evidence_stage", args, (_peer, current) => respond(port.stageStandardReviewEvidence(current, args))),
   );
   server.registerTool(

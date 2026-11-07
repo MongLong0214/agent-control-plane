@@ -17,6 +17,7 @@ import type { AuthenticatedMcpPeer } from "../mcp/shared.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { CandidateSnapshot, SnapshotReviewEvidence } from "../snapshot/candidate-snapshot.ts";
+import { readReviewEvidenceFile } from "./review-evidence-file.ts";
 
 /**
  * Private review evidence for a STANDARD_WORK or CONTRACT_CHANGE run: the bootstrap evidence path
@@ -338,7 +339,12 @@ interface Candidate { schema: typeof CANDIDATE; runId: string; contractDigest: s
 interface Attachment { schema: typeof ATTACHED; runId: string; contractDigest: string; sha256: string; stagedBy: string; candidateDigest: string;
   verifiedReferencesDigest?: string }
 
-export interface StandardReviewEvidenceStageInput { runId: string; contractDigest: string; expectedSha256: string; evidenceBody: string }
+/**
+ * The bundle is `evidenceBody` inline, or with `evidenceFromFile: true` the file the server names itself,
+ * `<stateRoot>/review-evidence/<runId>/<expectedSha256>` (review/review-evidence-file.ts); exactly one of the two.
+ */
+export interface StandardReviewEvidenceStageInput { runId: string; contractDigest: string; expectedSha256: string;
+  evidenceBody?: string | undefined; evidenceFromFile?: boolean | undefined }
 export interface StandardReviewEvidenceAttachInput { runId: string; contractDigest: string; stagedBy: string; expectedSha256: string; replacesSha256?: string | undefined }
 export interface FrozenStandardReviewEvidence {
   bundle: StandardReviewEvidenceBundle;
@@ -383,16 +389,36 @@ const submissionInFlight = (source: Pick<Source, "db" | "clock">, runId: string)
     [runId, source.clock.nowIso()],
   ) !== undefined;
 
+/**
+ * The bundle's text: the inline body, or the derived file's bytes once they decode as UTF-8 exactly. Read only after
+ * the run, contract and owner checks pass, so no other caller learns whether a file is there.
+ */
+const stagedBody = (stateRoot: string, input: StandardReviewEvidenceStageInput): Decision<string> => {
+  if (input.evidenceFromFile !== true) return allow(ReasonCode.OK, input.evidenceBody!);
+  const read = readReviewEvidenceFile(stateRoot, input.runId, input.expectedSha256);
+  if (!read.allowed) return read as Decision<never>;
+  const body = read.value.toString("utf8");
+  return Buffer.from(body, "utf8").equals(read.value) ? allow(ReasonCode.OK, body)
+    : deny(ReasonCode.INVALID_ARGUMENT, `review evidence bundle exceeds the ${BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES}-byte UTF-8 staging limit`);
+};
+
 export const stageStandardReviewEvidence = (
   source: Source, owner: { sessionId: string; bindingGeneration: number; roleKey: string }, input: StandardReviewEvidenceStageInput,
+  stateRoot: string,
 ): Decision<{ digest: string; stagedBy: string; verifiedReferences: StandardReviewEvidenceReference[] }> => source.db.txDecision(() => {
+  if ((input.evidenceBody !== undefined) === (input.evidenceFromFile === true)) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "review evidence is staged from evidenceBody or from evidenceFromFile, exactly one");
+  }
   const run = evidenceRun(source, input);
   if (!run.allowed) return run;
   const current = source.runs.assertOwner(input.runId, owner.sessionId, owner.bindingGeneration);
   if (!current.allowed || current.value.ownerRoleKey !== owner.roleKey) {
     return current.allowed ? deny(ReasonCode.RUN_OWNER_REVOKED, "review evidence is staged only by the run's current owning CTO") : current;
   }
-  const parsed = parseStandardBundle(input.evidenceBody, input, inProject(source, run.value));
+  const body = stagedBody(stateRoot, input);
+  if (!body.allowed) return body as Decision<never>;
+  const evidenceBody = body.value;
+  const parsed = parseStandardBundle(evidenceBody, input, inProject(source, run.value));
   if (!parsed.allowed) return parsed;
   const stagedBy = owner.roleKey;
   const references = parsed.value.references;
@@ -405,7 +431,7 @@ export const stageStandardReviewEvidence = (
     return deny(ReasonCode.CONFLICT, "this CTO already has an unattached immutable review evidence bundle for this run");
   }
   const artifact = source.artifacts.put(input.runId, ArtifactKind.HANDOFF, { schema: CANDIDATE, runId: input.runId,
-    contractDigest: input.contractDigest, sha256: input.expectedSha256, stagedBy, bodyBase64: Buffer.from(input.evidenceBody).toString("base64"),
+    contractDigest: input.contractDigest, sha256: input.expectedSha256, stagedBy, bodyBase64: Buffer.from(evidenceBody).toString("base64"),
     ...(referencesDigest === null ? {} : { verifiedReferences: references }) });
   const recorded = source.audit.record({ kind: STANDARD_REVIEW_EVIDENCE_STAGED, runId: input.runId, sessionId: owner.sessionId, roleKey: stagedBy,
     evidence: { digest: artifact.digest, payloadDigest: input.expectedSha256, contractDigest: input.contractDigest, bindingGeneration: owner.bindingGeneration, stagedBy,
