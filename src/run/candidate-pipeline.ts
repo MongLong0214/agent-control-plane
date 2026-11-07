@@ -67,7 +67,7 @@ import {
 } from "./candidate-integration.ts";
 import type { RunEngine, TaskContract } from "./run-engine.ts";
 import type { TaskGraph } from "./task-graph.ts";
-import { type PredecessorBase, type StartsFrom, recordedTargetForBranch } from "./task-write-target.ts";
+import { type PredecessorBase, type StartsFrom, recordedTargetForBranch, recordedWriteTarget } from "./task-write-target.ts";
 import type { ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 
 /** An attempt's lease: set at acquisition, and renewed to this from now on each real step. */
@@ -417,6 +417,39 @@ export class CandidatePipeline {
     // #1268 — every merge commit the integration makes has its message checked by CommitLore when the run requires it.
     const checkMergeMessages = this.checkMergeMessages(runId);
     const commitloreMergeChecks = new Map<string, MergeCheckBinding[]>();
+    // #1268 — a run whose contract requires CommitLore: before anything is built or written, every SUCCEEDED task
+    // commit and every commit between the run's pinned base and it is a worker commit of this run whose CommitLore
+    // evidence matches the commit's own Record-Id trailers, or a merge recorded for a predecessor base a task of
+    // this run starts from. What the integration then adds is only its own merges.
+    const accounted = new Set<string>();
+    if (checkMergeMessages !== undefined) {
+      for (const repo of participants) {
+        const mergeChecks = recordedPredecessorMergeChecks(this.db, runId, repo.identity);
+        for (const task of commits.filter((commit) => commit.repositoryIdentity === repo.identity)) {
+          const target = recordedWriteTarget(this.db, runId, task.taskId);
+          // A commit with no write target here is not integrated; the candidate's own range check below asks it.
+          if (!target || target.repositoryIdentity !== repo.identity) continue;
+          const foreign = await foreignCandidateCommit({
+            db: this.db,
+            runId,
+            repositoryIdentity: repo.identity,
+            checkoutPath: repo.checkoutPath,
+            baseHead: target.baseSha,
+            candidateHead: task.commit,
+            mergeChecks,
+            accounted,
+          });
+          if (!foreign.allowed) return foreign as Decision<CandidateSnapshot>;
+          if (foreign.value !== null) {
+            return deny(
+              ReasonCode.CANDIDATE_FOREIGN_COMMIT,
+              "a commit in a task's result is not one this run's CommitLore path accounts for; nothing was frozen",
+              { runId, repositoryIdentity: repo.identity, taskId: task.taskId, baseHead: target.baseSha, candidateHead: task.commit, ...foreign.value },
+            );
+          }
+        }
+      }
+    }
     for (const repo of participants) {
       // S6-C — when the checkout's HEAD does not hold every SUCCEEDED task's commit, the candidate is
       // their integration onto the run's pinned base; a conflict between two tasks refuses the freeze.
@@ -558,11 +591,11 @@ export class CandidatePipeline {
           );
         }
       }
-      // #1268 — a run whose contract requires CommitLore: every commit between the base each repository was
-      // frozen at and the exact head frozen for it is a SUCCEEDED worker commit of this run whose CommitLore
-      // evidence matches the commit's own Record-Id trailers, or a merge whose check was bound to it: this
-      // freeze's, or one recorded for a predecessor base a task of this run starts from (#1242).
-      // Asked of the frozen object ids, before anything is written.
+      // #1268 — and of the candidate as frozen: every commit between the base each repository was frozen at and
+      // the exact head frozen for it is one checked above, a merge this freeze's check was bound to, or one
+      // recorded for a predecessor base (#1242). For an integrated candidate only an inconsistency inside ACP
+      // can refuse here; a candidate that is the checkout's HEAD has its own commits asked here, before anything
+      // is written, the integration having written nothing for it.
       if (checkMergeMessages !== undefined) {
         for (const frozen of snapshot.repositories) {
           const checkoutPath = repositories.find((repo) => repo.identity === frozen.identity)!.checkoutPath;
@@ -574,6 +607,7 @@ export class CandidatePipeline {
             baseHead: frozen.baseHead,
             candidateHead: frozen.candidateHead,
             mergeChecks: [...(commitloreMergeChecks.get(frozen.identity) ?? []), ...recordedPredecessorMergeChecks(this.db, runId, frozen.identity)],
+            accounted,
           });
           if (!foreign.allowed) return foreign as Decision<CandidateSnapshot>;
           if (foreign.value !== null) {
@@ -584,22 +618,6 @@ export class CandidatePipeline {
             );
           }
         }
-        // No gap between the head checked and the head frozen: each checkout still stands where the freeze read it.
-        for (const frozen of snapshot.repositories) {
-          const checkoutPath = repositories.find((repo) => repo.identity === frozen.identity)!.checkoutPath;
-          const expected = expectedCheckoutHead(frozen);
-          const observed = await tryRevParse(checkoutPath, "HEAD");
-          if (observed !== expected) {
-            return deny(ReasonCode.CANDIDATE_HEAD_MOVED, "the checkout's HEAD moved after the candidate's commits were checked; nothing was frozen", {
-              runId,
-              repositoryIdentity: frozen.identity,
-              refusal: "HEAD_MOVED",
-              candidateHead: frozen.candidateHead,
-              expectedCheckoutHead: expected,
-              observedCheckoutHead: observed,
-            });
-          }
-        }
       }
     }
 
@@ -607,12 +625,36 @@ export class CandidatePipeline {
     // S6 review — an integrated candidate is a commit no branch names. A private ref keeps it from
     // git gc for as long as it is this run's candidate; it is written, through the guard, before the
     // candidate is recorded, and a freeze that cannot write it records nothing.
+    const refWrites: Array<{ identity: string; checkoutPath: string; lines: string[] }> = [];
     for (const frozen of snapshot.repositories) {
       if (frozen.integration === undefined) continue;
       const checkoutPath = repositories.find((repo) => repo.identity === frozen.identity)!.checkoutPath;
       const plan = await candidateRefPlan(checkoutPath, runId, { ref: candidateRefFor(runId, digest), commit: frozen.candidateHead });
       if (!plan.allowed) return plan as Decision<CandidateSnapshot>;
-      const held = await this.writeCandidateRefs(run, frozen.identity, checkoutPath, plan.value.filter((line) => !line.startsWith("delete ")));
+      refWrites.push({ identity: frozen.identity, checkoutPath, lines: plan.value.filter((line) => !line.startsWith("delete ")) });
+    }
+    // #1268 — no gap between the head checked and the head frozen: at the last point before the freeze's first
+    // write, each checkout of a run whose contract requires CommitLore still stands where the freeze read it. A
+    // HEAD that moves after this stales the frozen candidate (`verifySnapshotFreshness`, SNAPSHOT_STALE).
+    if (checkMergeMessages !== undefined) {
+      for (const frozen of snapshot.repositories) {
+        const checkoutPath = repositories.find((repo) => repo.identity === frozen.identity)!.checkoutPath;
+        const expected = expectedCheckoutHead(frozen);
+        const observed = await tryRevParse(checkoutPath, "HEAD");
+        if (observed !== expected) {
+          return deny(ReasonCode.CANDIDATE_HEAD_MOVED, "the checkout's HEAD moved after the candidate's commits were checked; nothing was frozen", {
+            runId,
+            repositoryIdentity: frozen.identity,
+            refusal: "HEAD_MOVED",
+            candidateHead: frozen.candidateHead,
+            expectedCheckoutHead: expected,
+            observedCheckoutHead: observed,
+          });
+        }
+      }
+    }
+    for (const write of refWrites) {
+      const held = await this.writeCandidateRefs(run, write.identity, write.checkoutPath, write.lines);
       if (!held.allowed) return held as Decision<CandidateSnapshot>;
     }
 

@@ -29,10 +29,15 @@ import { bindCeo, bindWorker, makeHarness, registerFixtureProject } from "../hel
  */
 
 const hooks = vi.hoisted(() => ({
-  /** Runs after the freeze's CommitLore range check answers, before anything is recorded. */
-  afterRangeCheck: null as (() => void) | null,
+  /** Runs after each of the freeze's CommitLore range checks answers, with how many have answered. */
+  afterRangeCheck: null as ((calls: number) => void) | null,
+  rangeChecks: 0,
   /** Rewrites what the integration reports it checked. */
   tamperChecks: null as ((checks: Integration.MergeCheckBinding[]) => Integration.MergeCheckBinding[]) | null,
+  /** Runs once when the freeze starts planning its candidate refs. */
+  atRefPlan: null as (() => void) | null,
+  /** Runs once when the freeze starts applying its candidate refs. */
+  atRefApply: null as (() => void) | null,
 }));
 vi.mock("../../src/run/candidate-integration.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof Integration>();
@@ -43,9 +48,22 @@ vi.mock("../../src/run/candidate-integration.ts", async (importOriginal) => {
       if (hooks.tamperChecks === null || !answer.allowed || answer.value === null) return answer;
       return { ...answer, value: { ...answer.value, commitloreMergeChecks: hooks.tamperChecks(answer.value.commitloreMergeChecks) } };
     },
+    candidateRefPlan: async (...args: Parameters<typeof actual.candidateRefPlan>) => {
+      const hook = hooks.atRefPlan;
+      hooks.atRefPlan = null;
+      hook?.();
+      return actual.candidateRefPlan(...args);
+    },
+    applyCandidateRefPlan: async (...args: Parameters<typeof actual.applyCandidateRefPlan>) => {
+      const hook = hooks.atRefApply;
+      hooks.atRefApply = null;
+      hook?.();
+      return actual.applyCandidateRefPlan(...args);
+    },
     foreignCandidateCommit: async (input: Parameters<typeof actual.foreignCandidateCommit>[0]) => {
       const answer = await actual.foreignCandidateCommit(input);
-      hooks.afterRangeCheck?.();
+      hooks.rangeChecks += 1;
+      hooks.afterRangeCheck?.(hooks.rangeChecks);
       return answer;
     },
   };
@@ -54,7 +72,10 @@ vi.mock("../../src/run/candidate-integration.ts", async (importOriginal) => {
 afterAll(cleanupTempDirs);
 afterEach(() => {
   hooks.afterRangeCheck = null;
+  hooks.rangeChecks = 0;
   hooks.tamperChecks = null;
+  hooks.atRefPlan = null;
+  hooks.atRefApply = null;
 });
 
 const CONTRACT: TaskContract = {
@@ -199,9 +220,24 @@ const currentCandidateOf = (world: World): string | null =>
 
 const frozenRows = (world: World) => world.harness.cp.audit.byKind("CANDIDATE_FROZEN").filter((row) => row.runId === world.run.runId);
 
-/** The freeze is refused as `reasonCode` naming `commit` and `refusal`, and nothing is written or moved. */
-const expectRefusedUnchanged = async (world: World, expected: { reasonCode: string; commit?: string; refusal: string }) => {
+/** What a freeze can leave behind in ACP's own storage: audit rows and verification worktrees. */
+const persistentRows = (world: World) => ({
+  audit: world.harness.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM audit_events`)!.n,
+  worktrees: world.harness.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM verification_worktrees`)!.n,
+});
+
+/**
+ * The freeze is refused as `reasonCode` naming `commit` and `refusal`, and nothing is written or moved: no ref,
+ * no HEAD, and (unless the refusal is one only an inconsistency after integration can reach) no audit row and no
+ * verification worktree either.
+ */
+const expectRefusedUnchanged = async (
+  world: World,
+  expected: { reasonCode: string; commit?: string; refusal: string },
+  options: { afterIntegration?: boolean } = {},
+) => {
   const before = refsAndHead(world.repo);
+  const rows = persistentRows(world);
   const frozen = await world.harness.cp.pipeline.freeze(world.run.runId);
   expect(frozen, JSON.stringify(frozen)).toMatchObject({
     allowed: false,
@@ -209,6 +245,7 @@ const expectRefusedUnchanged = async (world: World, expected: { reasonCode: stri
     evidence: { runId: world.run.runId, refusal: expected.refusal, ...(expected.commit === undefined ? {} : { commit: expected.commit }) },
   });
   expect(refsAndHead(world.repo)).toBe(before);
+  if (!options.afterIntegration) expect(persistentRows(world)).toEqual(rows);
   expect(currentCandidateOf(world)).toBeNull();
   expect(frozenRows(world)).toEqual([]);
   return frozen;
@@ -364,14 +401,71 @@ describe("#1268: a governed freeze holds only commits CommitLore accounts for", 
     workerCommit(world, "readme", { "README.md": "# one\n" }, "update readme", EMPTY);
     workerCommit(world, "app", { "src/app.js": "module.exports = () => 2;\n" }, "update app", EMPTY);
     hooks.tamperChecks = (checks) => checks.map((check) => ({ ...check, tree: world.base }));
-    await expectRefusedUnchanged(world, { reasonCode: ReasonCode.CANDIDATE_FOREIGN_COMMIT, refusal: "MERGE_NOT_BOUND" });
+    // Only an inconsistency inside ACP reaches this after integration, so its worktree is already on record.
+    await expectRefusedUnchanged(world, { reasonCode: ReasonCode.CANDIDATE_FOREIGN_COMMIT, refusal: "MERGE_NOT_BOUND" }, { afterIntegration: true });
+  });
+
+  it("P2-1 refused before any persistent effect — two sibling commits needing integration, one receipt with no CommitLore evidence", async () => {
+    const world = await worldOf("required");
+    workerCommit(world, "readme", { "README.md": "# one\n" }, "update readme", EMPTY);
+    const bare = workerCommit(world, "app", { "src/app.js": "module.exports = () => 2;\n" }, "update app", null);
+    // HEAD is task two's branch, which does not hold task one's commit: this freeze would integrate them.
+    expect(() => gitSync(world.repo, ["merge-base", "--is-ancestor", "task/readme", "HEAD"])).toThrow();
+    await expectRefusedUnchanged(world, { reasonCode: ReasonCode.CANDIDATE_FOREIGN_COMMIT, commit: bare.commit, refusal: "COMMITLORE_EVIDENCE_MISSING" });
+  });
+
+  it("P2-2 refused — an unmanaged commit appended to the checkout when the freeze starts planning its candidate ref", async () => {
+    const world = await worldOf("required");
+    workerCommit(world, "readme", { "README.md": "# one\n" }, "update readme", EMPTY);
+    const app = workerCommit(world, "app", { "src/app.js": "module.exports = () => 2;\n" }, "update app", EMPTY);
+    let moved: string | null = null;
+    hooks.atRefPlan = () => {
+      moved = unmanagedCommit(world, "appended while the ref is planned");
+    };
+    const refsBefore = gitSync(world.repo, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/acp/"]);
+    const frozen = await world.harness.cp.pipeline.freeze(world.run.runId);
+    expect(frozen, JSON.stringify(frozen)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CANDIDATE_HEAD_MOVED,
+      evidence: { refusal: "HEAD_MOVED", expectedCheckoutHead: app.commit, observedCheckoutHead: moved },
+    });
+    expect(gitSync(world.repo, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/acp/"])).toBe(refsBefore);
+    expect(currentCandidateOf(world)).toBeNull();
+    expect(frozenRows(world)).toEqual([]);
+  });
+
+  it("P2-2 the window after the last re-read: a HEAD moved while the ref is applied is frozen, and verification then refuses it SNAPSHOT_STALE", async () => {
+    const world = await worldOf("required");
+    workerCommit(world, "readme", { "README.md": "# one\n" }, "update readme", EMPTY);
+    const app = workerCommit(world, "app", { "src/app.js": "module.exports = () => 2;\n" }, "update app", EMPTY);
+    let moved: string | null = null;
+    hooks.atRefApply = () => {
+      moved = unmanagedCommit(world, "appended while the ref is applied");
+    };
+    const snapshot = await freezeAllowed(world);
+    expect(snapshot.repositories[0]!.integration?.checkoutHead).toBe(app.commit);
+    expect(gitSync(world.repo, ["rev-parse", "HEAD"])).toBe(moved);
+    const manifest = world.harness.cp.projects.activeManifest(world.projectId)!.manifest;
+    const verified = await world.harness.cp.verification.verify({
+      runId: world.run.runId,
+      snapshot,
+      commands: manifest.verificationCommands,
+      contractDigest: snapshot.contractDigest,
+    });
+    expect(verified, JSON.stringify(verified)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.SNAPSHOT_STALE,
+      evidence: { drift: [{ expectedHead: app.commit, observedHead: moved }] },
+    });
   });
 
   it("refused — the checkout's HEAD moved after the check: the checked head is not the one that would be frozen", async () => {
     const world = await worldOf("required");
     const one = workerCommit(world, "readme", { "README.md": "# one\n" }, "update readme", EMPTY);
     let moved: string | null = null;
-    hooks.afterRangeCheck = () => {
+    // The second range check is the candidate's own (the first is the task's, before anything is built).
+    hooks.afterRangeCheck = (calls) => {
+      if (calls !== 2) return;
       hooks.afterRangeCheck = null;
       moved = unmanagedCommit(world, "slipped in after the check");
     };

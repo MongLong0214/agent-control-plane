@@ -907,7 +907,9 @@ const unaccounted = (commitlore: unknown, message: string): ForeignCommitRefusal
  *   order, tree and message, re-read from the commit.
  *
  * A base that is not an ancestor of the head, or an object that cannot be read, is refused
- * (CANDIDATE_RANGE_UNVERIFIABLE). Read-only, over the registered checkout.
+ * (CANDIDATE_RANGE_UNVERIFIABLE). Read-only, over the registered checkout. `accounted` carries the commits one
+ * freeze has already found accounted for (an object id names its bytes), which are not read again, and gains
+ * every commit this call accounts for.
  */
 export const foreignCandidateCommit = async (input: {
   db: Db;
@@ -917,6 +919,7 @@ export const foreignCandidateCommit = async (input: {
   baseHead: string;
   candidateHead: string;
   mergeChecks: readonly MergeCheckBinding[];
+  accounted?: Set<string>;
 }): Promise<Decision<ForeignCommit | null>> => {
   const { runId, repositoryIdentity, baseHead, candidateHead } = input;
   const unverifiable = (refusal: "BASE_NOT_ANCESTOR" | "OBJECT_UNREADABLE", commit: string | null = null): Decision<never> =>
@@ -936,6 +939,7 @@ export const foreignCandidateCommit = async (input: {
     if (listed.exitCode !== 0) return unverifiable("OBJECT_UNREADABLE");
     const receipts = workerReceiptsByCommit(input.db, runId, repositoryIdentity);
     for (const commit of listed.stdout.split("\n").filter((line) => line.length > 0)) {
+      if (input.accounted?.has(commit)) continue;
       const read = await runPinnedGit(repo, ["cat-file", "commit", commit]);
       if (read.exitCode !== 0) return unverifiable("OBJECT_UNREADABLE", commit);
       const split = read.stdout.indexOf("\n\n");
@@ -945,6 +949,7 @@ export const foreignCandidateCommit = async (input: {
       if (named !== undefined) {
         const refusal = named.map((commitlore) => unaccounted(commitlore, message)).find((answer) => answer !== null) ?? null;
         if (refusal !== null) return allow(ReasonCode.OK, { commit, refusal });
+        input.accounted?.add(commit);
         continue;
       }
       const parents = [...header.matchAll(/^parent ([0-9a-f]+)$/gm)].map((match) => match[1]!);
@@ -954,6 +959,7 @@ export const foreignCandidateCommit = async (input: {
       const exact = parents.length === 2 && parents[0] === bound.parents[0] && parents[1] === bound.parents[1] &&
         tree === bound.tree && sha256(message.trimEnd()) === bound.messageDigest;
       if (!exact) return allow(ReasonCode.OK, { commit, refusal: "MERGE_NOT_BOUND" });
+      input.accounted?.add(commit);
     }
     return allow(ReasonCode.OK, null);
   });
