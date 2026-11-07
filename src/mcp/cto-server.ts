@@ -880,9 +880,9 @@ const createCtoServerFromPort = (
     "task_correction_register",
     {
       description:
-        "Register that a SUCCEEDED correction task of a run you own replaces one FAILED task of the same run and work unit, and meets its acceptance: name the correction as taskId and, in corrects, the FAILED task's taskId and the acceptanceDigest contract_get answers for it. The correction's PLAN spec must name that task in correctionOf.taskId. " +
-        "Completeness then stops counting the FAILED task as unfinished; both tasks and their executions stay as they are, and result_submit still runs verification and blind review and the CEO still decides. " +
-        "Refused for a task correcting itself, a cycle, a task another correction already replaces, a correction already registered for another task, another run or work unit, an acceptance that does not match, a task that is not FAILED and a correction that is not SUCCEEDED. The same relation again is answered as registered, with no second record.",
+        "Register that a SUCCEEDED correction task of a run you own replaces one FAILED or SUCCEEDED task of the same run and work unit, and meets its acceptance: name the correction as taskId and, in corrects, the replaced task's taskId and the acceptanceDigest contract_get answers for it. The correction's PLAN spec must name that task in correctionOf.taskId. " +
+        "A FAILED task then stops counting as unfinished. A SUCCEEDED task is bound with its correction to both SUCCEEDED commit receipts, and at candidate freeze only the correction's commit is a task result; in a chain only its last correction is. Both tasks and their executions stay as they are, and result_submit still runs verification and blind review and the CEO still decides. " +
+        "Refused for a task correcting itself, a cycle, a task another correction already replaces, a correction already registered for another task, another run or work unit, an acceptance that does not match, a task that is neither FAILED nor SUCCEEDED, a correction that is not SUCCEEDED, and for a SUCCEEDED task, either task with no commit receipt or the two in different repositories. The same relation again is answered as registered, with no second record.",
       inputSchema: {
         ...mutation,
         ...runIdentity,

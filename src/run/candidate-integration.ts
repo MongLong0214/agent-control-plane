@@ -8,7 +8,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { acpScratchDir } from "../core/scratch-root.ts";
 import type { Db } from "../db/database.ts";
 import type { SnapshotIntegration } from "../snapshot/candidate-snapshot.ts";
-import type { TaskRecord } from "./task-graph.ts";
+import { TASK_CORRECTION_REGISTERED, type TaskRecord } from "./task-graph.ts";
 import { type StartsFrom, TASK_WRITE_TARGET_RECORDED, recordedWriteTarget, startOf } from "./task-write-target.ts";
 import {
   GIT_HARDENING,
@@ -113,6 +113,9 @@ export interface SucceededTaskCommit {
   taskId: string;
   commit: string;
   repositoryIdentity: string;
+  /** The SUCCEEDED execution whose receipt names the commit, and the result digest that receipt reads back by. */
+  executionId: string;
+  resultDigest: string;
   /** #1232 — the CTO PLAN attestation the same receipt binds for exact opaque, potentially active imports. */
   imports: TaskImport[];
 }
@@ -134,10 +137,21 @@ const importsOf = (recorded: unknown): TaskImport[] => {
  * Each task's latest SUCCEEDED attempt only, and only when its own SUCCEEDED evidence still reads
  * back by both its execution id and its stored result digest, the two values ACP-WORKER-02 bound
  * together when the receipt was written. A receipt that cannot be read back that way names nothing.
+ * CEO msg_8f666e55 — a SUCCEEDED task a registered correction supersedes (`supersededTasks`) is no task
+ * result: its receipt is left out here, and stays as it was.
  */
 export const succeededTaskCommits = (db: Db, runId: string): SucceededTaskCommit[] => {
-  const rows = db.all<{ taskId: string; commitHead: unknown; repositoryIdentity: string | null; imports: unknown }>(
+  const receipts = taskReceipts(db, runId);
+  const superseded = supersededTasks(db, runId, receipts);
+  return receipts.filter((receipt) => !superseded.has(receipt.taskId));
+};
+
+/** Every task's receipt as `succeededTaskCommits` reads it, superseded tasks' included. */
+const taskReceipts = (db: Db, runId: string): SucceededTaskCommit[] => {
+  const rows = db.all<{ taskId: string; executionId: string; resultDigest: string; commitHead: unknown; repositoryIdentity: string | null; imports: unknown }>(
     `SELECT te.task_id AS taskId,
+            te.execution_id AS executionId,
+            te.result_digest AS resultDigest,
             json_extract(a.evidence_json, '$.commitHead') AS commitHead,
             r.identity AS repositoryIdentity,
             json_extract(a.evidence_json, '$.imports') AS imports
@@ -159,9 +173,87 @@ export const succeededTaskCommits = (db: Db, runId: string): SucceededTaskCommit
   const commits = new Map<string, SucceededTaskCommit>();
   for (const row of rows) {
     if (commits.has(row.taskId) || typeof row.commitHead !== "string" || row.commitHead.length === 0 || !row.repositoryIdentity) continue;
-    commits.set(row.taskId, { taskId: row.taskId, commit: row.commitHead, repositoryIdentity: row.repositoryIdentity, imports: importsOf(row.imports) });
+    commits.set(row.taskId, {
+      taskId: row.taskId,
+      commit: row.commitHead,
+      repositoryIdentity: row.repositoryIdentity,
+      executionId: row.executionId,
+      resultDigest: row.resultDigest,
+      imports: importsOf(row.imports),
+    });
   }
   return [...commits.values()];
+};
+
+/**
+ * CEO msg_8f666e55 — what a registered correction of a SUCCEEDED task is bound to: the receipt each of the two
+ * tasks has (`taskReceipts`), its execution, result digest and commit, in their one repository.
+ */
+export interface SupersessionBinding {
+  repositoryIdentity: string;
+  original: { taskId: string; executionId: string; resultDigest: string; commitHead: string };
+  correction: { taskId: string; executionId: string; resultDigest: string; commitHead: string };
+}
+
+const bindingOf = (receipts: readonly SucceededTaskCommit[], originalTaskId: string, correctionTaskId: string): Decision<SupersessionBinding> => {
+  const original = receipts.find((receipt) => receipt.taskId === originalTaskId);
+  const correction = receipts.find((receipt) => receipt.taskId === correctionTaskId);
+  if (!original || !correction) {
+    return deny(ReasonCode.TASK_RECEIPT_MISSING, "a SUCCEEDED task is superseded only by a correction when both have a SUCCEEDED commit receipt", {
+      refusal: "CORRECTION_RECEIPT_MISSING",
+      missing: [original ? null : originalTaskId, correction ? null : correctionTaskId].filter((id) => id !== null),
+    });
+  }
+  if (original.repositoryIdentity !== correction.repositoryIdentity) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "a correction's commit is in the repository of the task it supersedes", {
+      refusal: "CORRECTION_ACROSS_REPOSITORIES",
+      repositoryIdentity: original.repositoryIdentity,
+      correctionRepositoryIdentity: correction.repositoryIdentity,
+    });
+  }
+  const of = (receipt: SucceededTaskCommit) => ({ taskId: receipt.taskId, executionId: receipt.executionId, resultDigest: receipt.resultDigest, commitHead: receipt.commit });
+  return allow(ReasonCode.OK, { repositoryIdentity: original.repositoryIdentity, original: of(original), correction: of(correction) });
+};
+
+/** CEO msg_8f666e55 — the binding `registerCorrection` records for a SUCCEEDED task and its correction, or why there is none. */
+export const supersessionBinding = (db: Db, runId: string, originalTaskId: string, correctionTaskId: string): Decision<SupersessionBinding> =>
+  bindingOf(taskReceipts(db, runId), originalTaskId, correctionTaskId);
+
+/**
+ * CEO msg_8f666e55 — the run's SUCCEEDED tasks a registered correction supersedes, read again from the records and
+ * the receipts as they are now: exactly one correction claims the task and claims no other, a record of that
+ * relation binds exactly both tasks' current receipts in one repository (`bindingOf`), and following corrections
+ * from the task ends at one nothing supersedes, which alone stays a task result (a cycle supersedes nothing). A
+ * FAILED task's correction (#1368) binds no receipt and supersedes nothing here. Nothing picks a winner by time or
+ * ancestry: without such a relation every SUCCEEDED task is a result, and the path-level conflict check decides.
+ */
+const supersededTasks = (db: Db, runId: string, receipts: readonly SucceededTaskCommit[]): Set<string> => {
+  const relations = db
+    .all<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`, [TASK_CORRECTION_REGISTERED, runId])
+    .map((row) => JSON.parse(row.evidence_json) as { originalTaskId?: unknown; correctionTaskId?: unknown; supersedes?: unknown });
+  const replacedBy = new Map<string, string>();
+  for (const originalTaskId of new Set(relations.map((relation) => relation.originalTaskId))) {
+    const claims = relations.filter((relation) => relation.originalTaskId === originalTaskId);
+    const correctionTaskId = claims[0]?.correctionTaskId;
+    if (typeof originalTaskId !== "string" || typeof correctionTaskId !== "string") continue;
+    if (claims.some((claim) => claim.correctionTaskId !== correctionTaskId)) continue;
+    if (relations.some((relation) => relation.correctionTaskId === correctionTaskId && relation.originalTaskId !== originalTaskId)) continue;
+    const bound = bindingOf(receipts, originalTaskId, correctionTaskId);
+    if (!bound.allowed) continue;
+    const current = digestOf(bound.value);
+    if (claims.some((claim) => claim.supersedes !== undefined && digestOf(claim.supersedes) === current)) replacedBy.set(originalTaskId, correctionTaskId);
+  }
+  const superseded = new Set<string>();
+  for (const taskId of replacedBy.keys()) {
+    const seen = new Set<string>();
+    let at = taskId;
+    while (replacedBy.has(at) && !seen.has(at)) {
+      seen.add(at);
+      at = replacedBy.get(at)!;
+    }
+    if (!replacedBy.has(at)) superseded.add(taskId);
+  }
+  return superseded;
 };
 
 /**
