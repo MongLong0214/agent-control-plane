@@ -14,9 +14,10 @@ import type { BlockingFinding } from "./daemon.ts";
  * ever succeed, and nothing tells anyone: the operator and CEO doors open only after a start succeeds.
  *
  * Each blocking finding is classified here:
- * - PERMANENT: no restart clears it. A credential, a security property of the host, an owner-gated
- *   repair, a dead session that still holds authority or work, or a decision about one run is missing,
- *   so a person or the CEO has to act.
+ * - PERMANENT: no restart clears it. Either it is an explicit failure routed to the CEO and asks nobody
+ *   to act (the trusted gate's GitHub App credential is missing), or it is a block with its owner route: a
+ *   security property of the host, an owner-gated repair, a dead session that still holds authority or
+ *   work, or a decision about one run.
  * - TRANSIENT: a later start may find it gone without anyone acting — a probe that did not complete,
  *   a worker process that was still running, capacity or coverage that returns.
  *
@@ -66,7 +67,10 @@ const START_FINDING_CLASSES: Readonly<Record<string, StartFindingClass>> = {
   // Integrity findings (STATE_PATH_INSECURE, CANONICAL_TURN_CONTRADICTED, the trusted-gate credential)
   // block on purpose, and nothing here weakens that; it only says who can clear them.
   STATE_PATH_INSECURE: permanent("OWNER", "SECURITY", "restore owner-only, non-symlinked state paths, then restart the daemon"),
-  TRUSTED_GATE_CREDENTIAL_MISSING: permanent("OWNER", "CREDENTIAL", "install the trusted GitHub credential, then restart the daemon"),
+  // #1189 WIP 2 (CEO msg_7cb20fea) — an explicit failed start, told to the CEO once, and never a wait on the
+  // owner or a request that anyone act: no degraded start, and no credential is installed or substituted.
+  // Kept within the audit's 200-character free-text bound, or the stall's records lose their evidence.
+  TRUSTED_GATE_CREDENTIAL_MISSING: permanent("CEO", "CREDENTIAL", "nothing is requested of anyone: this start failed without the trusted gate's GitHub App credential, and each later start fails the same way until the daemon can read it"),
   TRUSTED_GATE_CREDENTIAL_PERMISSIONS: permanent("OWNER", "SECURITY", "restrict the secret directory to owner-only access, then restart the daemon"),
   CANONICAL_TURN_CONTRADICTED: permanent("OWNER", "SECURITY", "an operator adjudicates the contradicted turn (agentctl conversation adjudicate), citing every observation"),
   // A checkout that is not there or not a repository: restoring it, or the owner-gated project suspend.
