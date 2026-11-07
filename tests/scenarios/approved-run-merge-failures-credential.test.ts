@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
 
+import { REDACTED } from "../../src/core/credential-shapes.ts";
 import { acpError, deny } from "../../src/core/errors.ts";
 import { sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -511,7 +512,7 @@ describe("#1189 §0 — an approved run never waits on a person for a GitHub cre
   it.each([
     ["no CEO is bound", "unbound"],
     ["the outbox refuses the notice", "refused"],
-  ] as const)("a refusal whose text is credential-shaped, at the bound while %s: the run ends FAILED, a minimal secret-free notice stays owed, and it is sent once", async (_label, variant) => {
+  ] as const)("a refusal whose text is credential-shaped, at the bound while %s: the run ends FAILED, its full notice stays owed with the shape redacted, and it is sent once", async (_label, variant) => {
     // Built at run time, so this file holds no token-shaped literal.
     const secret = ["ghp", "_", "a1B2c3D4".repeat(4)].join("");
     const fixture = await approved();
@@ -529,10 +530,12 @@ describe("#1189 §0 — an approved run never waits on a person for a GitHub cre
     await sweepThroughTheCap(fixture);
     expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.FAILED);
     expect(failureNotices(fixture)).toHaveLength(0);
-    // The audit log's refusal of the full notice is on record as such; the obligation is the record that says `delivered`.
+    // The obligation is the record that says `delivered`. Its text redacted, the audit log keeps the full notice, not
+    // the minimal one (`detailWithheld`), which is witnessed below where the audit log refuses the full one.
     const owed = () => auditOf(fixture, "FINALIZATION_FAILED_NOTICE").filter((entry) => "delivered" in entry.evidence)
       .map((entry) => entry.evidence.delivered);
     expect(owed()).toEqual([false]);
+    expect(auditOf(fixture, "FINALIZATION_FAILED_NOTICE")[0]!.evidence).not.toHaveProperty("detailWithheld");
     refusing?.mockRestore();
     const ceoSessionId = variant === "unbound" ? bindCeo(harness) : harness.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId;
     const atFailure = transitions(fixture);
@@ -653,5 +656,224 @@ describe("#1189 §0 — an approved run never waits on a person for a GitHub cre
       expectNothingMerged(fixture);
       await fixture.daemon.stop();
     });
+  });
+});
+
+/**
+ * #1189 — a refusal's own text can carry a credential (a token in a GitHub error body). Wherever the finalizer passes
+ * it on (a CEO notice sent at once, a revision request, the run's stateReason, a finalization record) each credential
+ * shape is redacted, and the reason code and every other character of the text are kept. An ordinary refusal is
+ * passed on byte for byte.
+ */
+describe("#1189 — a refusal's credential-shaped text is redacted wherever the finalizer passes it on", () => {
+  // Built at run time, so this file holds no token-shaped literal.
+  const secret = ["ghp", "_", "Q7r6S5t4".repeat(4)].join("");
+  const refusal = (shaped: boolean): string => shaped
+    ? `GitHub answered 422; its error body names installation token ${secret} and the request was not applied`
+    : "GitHub answered 422; its error body names no credential and the request was not applied";
+  /** The text as it may be passed on: the shape replaced, nothing else. */
+  const passedOn = (shaped: boolean): string => refusal(shaped).replace(secret, REDACTED);
+  const VARIANTS = [["credential-shaped", true], ["ordinary", false]] as const;
+
+  /** No outbox row or audit record of the run (its finalization records among them), and not its stateReason, holds the secret. */
+  const expectNoTrace = (fixture: Fixture): void => {
+    const { harness, driven } = fixture;
+    expect(harness.cp.runs.require(driven.runId).stateReason ?? "").not.toContain(secret);
+    const outbox = harness.cp.db.all<{ payload_json: string }>("SELECT payload_json FROM outbox WHERE run_id = ?", [driven.runId]);
+    expect(outbox.length).toBeGreaterThan(0);
+    for (const row of outbox) expect(row.payload_json).not.toContain(secret);
+    const records = harness.cp.db.all<{ kind: string; evidence_json: string }>(
+      "SELECT kind, evidence_json FROM audit_events WHERE run_id = ?", [driven.runId]);
+    expect(records.some((row) => row.kind.startsWith("FINALIZATION_"))).toBe(true);
+    for (const row of records) expect(row.evidence_json, row.kind).not.toContain(secret);
+  };
+
+  /** PR preparation refused with `refusal(shaped)`; with `ownerLost` the run owner's binding is retired as it is refused. */
+  const refusedAtPreparation = (fixture: Fixture, reasonCode: ReasonCode, shaped: boolean, evidence: Record<string, unknown> = {}, ownerLost = false) =>
+    vi.spyOn(fixture.harness.cp.github, "prPrepare").mockImplementation(async () => {
+      if (ownerLost) {
+        fixture.harness.cp.db.run(
+          "UPDATE assignments SET status = 'REVOKED', revoked_at = ?, revoked_reason = 'redaction witness' WHERE role_key = ? AND status = 'ACTIVE'",
+          [fixture.harness.clock.nowIso(), fixture.harness.cp.runs.require(fixture.driven.runId).ownerRoleKey!],
+        );
+      }
+      return deny<{ pullNumber: number; url: string }>(reasonCode, refusal(shaped), evidence);
+    });
+
+  it.each(VARIANTS)("%s refusal at the bound, a CEO bound and the outbox accepting: the notice sent at once and the stateReason keep the code and the text, and it is sent once", async (_label, shaped) => {
+    const fixture = await approved();
+    const { harness, driven } = fixture;
+    vi.spyOn(harness.cp.credentials, "authenticate").mockImplementation(async () => deny(PERMISSION, refusal(shaped), {}));
+    expect(await start(fixture.daemon)).toBe(true);
+    await sweepThroughTheCap(fixture);
+    const run = harness.cp.runs.require(driven.runId);
+    expect(run.state).toBe(RunState.FAILED);
+    expect(run.stateReason).toBe(`${PERMISSION}: ${passedOn(shaped)}`);
+    const notices = failureNotices(fixture);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.payload).toMatchObject({
+      failureReasonCode: PERMISSION, failureCause: PERMISSION, outcome: "FAILED",
+      blocker: `${PERMISSION}: ${passedOn(shaped)}`, reason: passedOn(shaped),
+    });
+    // Sent at once: nothing was kept owed, so no later delivery can repeat it.
+    expect(auditOf(fixture, "FINALIZATION_FAILED_NOTICE")).toHaveLength(0);
+    expectNoTrace(fixture);
+    await fixture.daemon.stop();
+    const restarted = newDaemon(harness);
+    expect(await start(restarted)).toBe(true);
+    await sweepThroughTheCap(fixture, restarted);
+    expect(failureNotices(fixture)).toHaveLength(1);
+    expectNothingMerged(fixture);
+    await restarted.stop();
+  });
+
+  it.each(VARIANTS)("%s unrecoverable refusal: the FAILED notice sent at once and the stateReason keep the code and the text", async (_label, shaped) => {
+    const fixture = await approved();
+    const { harness, driven } = fixture;
+    const code = ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED;
+    refusedAtPreparation(fixture, code, shaped, { mergeStrategy: "squash", pullMerged: false });
+    expect(await start(fixture.daemon)).toBe(true);
+    const run = harness.cp.runs.require(driven.runId);
+    expect(run.state).toBe(RunState.FAILED);
+    expect(run.stateReason).toBe(`${code}: ${passedOn(shaped)}`);
+    const notices = failureNotices(fixture);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.payload).toMatchObject({
+      failureReasonCode: code, failureClass: "UNRECOVERABLE", blocker: `${code}: ${passedOn(shaped)}`, reason: passedOn(shaped),
+    });
+    expect(auditOf(fixture, "FINALIZATION_FAILED_NOTICE")).toHaveLength(0);
+    expectNoTrace(fixture);
+    await fixture.daemon.stop();
+  });
+
+  it.each(VARIANTS)("%s refusal returned for revision with no current owner: the REVISION_REQUIRED notice and the stateReason keep the code and the text", async (_label, shaped) => {
+    const fixture = await approved();
+    const { harness, driven } = fixture;
+    const code = ReasonCode.MERGE_CONFLICT;
+    refusedAtPreparation(fixture, code, shaped, {}, true);
+    expect(await start(fixture.daemon)).toBe(true);
+    const run = harness.cp.runs.require(driven.runId);
+    expect(run.state).toBe(RunState.REVISION_REQUIRED);
+    expect(run.stateReason).toBe(`${code}: ${passedOn(shaped)}`);
+    expect(outboxOf(fixture, "REVISION_REQUEST")).toHaveLength(0);
+    const notices = failureNotices(fixture);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.payload).toMatchObject({
+      failureReasonCode: code, failureClass: "REVISION", blocker: `${code}: ${passedOn(shaped)}`, reason: passedOn(shaped),
+    });
+    expectNoTrace(fixture);
+    await fixture.daemon.stop();
+  });
+
+  it.each(VARIANTS)("%s refusal returned for revision to its current owner: the revision request and the REVISION_REQUIRED edge keep the code and the text", async (_label, shaped) => {
+    const fixture = await approved();
+    const { harness, driven } = fixture;
+    const code = ReasonCode.MERGE_CONFLICT;
+    refusedAtPreparation(fixture, code, shaped);
+    expect(await start(fixture.daemon)).toBe(true);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.ACTIVE);
+    const requests = outboxOf(fixture, "REVISION_REQUEST");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.payload).toMatchObject({ reasonCode: code, reason: `${code}: ${passedOn(shaped)}` });
+    const edge = auditOf(fixture, "RUN_TRANSITION").find((entry) => entry.evidence.to === RunState.REVISION_REQUIRED);
+    expect(edge?.evidence.reason).toBe(`${code}: ${passedOn(shaped)}`);
+    expectNoTrace(fixture);
+    await fixture.daemon.stop();
+  });
+
+  it.each(VARIANTS)("%s refusal handed to the CEO at its cap: the notice sent at once and its hand-off record keep the code and the text", async (_label, shaped) => {
+    const fixture = await approved();
+    const { harness, driven } = fixture;
+    const code = ReasonCode.MERGE_CLAIM_INVALID;
+    refusedAtPreparation(fixture, code, shaped);
+    expect(await start(fixture.daemon)).toBe(true);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
+    const notices = failureNotices(fixture);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.payload).toMatchObject({
+      failureReasonCode: code, failureCause: code, blocker: `${code}: ${passedOn(shaped)}`, reason: passedOn(shaped),
+    });
+    const handed = auditOf(fixture, "FINALIZATION_HANDED_OFF");
+    expect(handed).toHaveLength(1);
+    expect(handed[0]!.evidence).toMatchObject({
+      failureCause: code, delivered: true, blocker: `${code}: ${passedOn(shaped)}`, reason: passedOn(shaped),
+    });
+    expectNoTrace(fixture);
+    await fixture.daemon.stop();
+  });
+  it("a commit SHA and the run's own digest in a refusal are kept byte for byte; a 64-hex digest the store does not hold is redacted", async () => {
+    const fixture = await approved();
+    const { harness, driven } = fixture;
+    const code = ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED;
+    // A digest of nothing ACP stored, prefixed and bare: the long-base64 shape, as any other 60+ character run.
+    const foreign = sha256("a digest no record of this store names").slice("sha256:".length);
+    expect(driven.candidateHead).toMatch(/^[0-9a-f]{40}$/);
+    expect(driven.candidateSnapshotDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    const text = `head ${driven.candidateHead} of candidate ${driven.candidateSnapshotDigest} is not sha256:${foreign} (bare ${foreign}); token ${secret}`;
+    const kept = `head ${driven.candidateHead} of candidate ${driven.candidateSnapshotDigest} is not sha256:${REDACTED} (bare ${REDACTED}); token ${REDACTED}`;
+    vi.spyOn(harness.cp.github, "prPrepare").mockImplementation(async () =>
+      deny<{ pullNumber: number; url: string }>(code, text, { mergeStrategy: "squash", pullMerged: false }));
+    expect(await start(fixture.daemon)).toBe(true);
+    const run = harness.cp.runs.require(driven.runId);
+    expect(run.state).toBe(RunState.FAILED);
+    expect(run.stateReason).toBe(`${code}: ${kept}`);
+    const notices = failureNotices(fixture);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.payload).toMatchObject({ reason: kept, blocker: `${code}: ${kept}`.slice(0, 200) });
+    for (const row of harness.cp.db.all<{ payload_json: string }>("SELECT payload_json FROM outbox WHERE run_id = ?", [driven.runId])) {
+      expect(row.payload_json).not.toContain(foreign);
+    }
+    expectNoTrace(fixture);
+    await fixture.daemon.stop();
+  });
+
+  it.each([
+    ["no CEO is bound", "unbound"],
+    ["the outbox refuses the notice", "refused"],
+  ] as const)("the audit log refusing the full owed notice while %s: its minimal record is kept owed, detail withheld, and sent once", async (_label, variant) => {
+    const fixture = await approved();
+    const { harness, driven } = fixture;
+    vi.spyOn(harness.cp.credentials, "authenticate").mockImplementation(async () => deny(PERMISSION, refusal(true), {}));
+    // The audit log refuses the owed record that carries the notice's own text, as it refuses a value it does not admit.
+    const record = harness.cp.audit.record.bind(harness.cp.audit);
+    vi.spyOn(harness.cp.audit, "record").mockImplementation((entry) =>
+      entry.kind === "FINALIZATION_FAILED_NOTICE" && entry.evidence?.["delivered"] === false && entry.evidence["detailWithheld"] !== true
+        ? deny<number>(ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED, "audit evidence contains an unallowlisted field or value shape", { kind: entry.kind })
+        : record(entry));
+    const enqueue = harness.cp.outbox.enqueue.bind(harness.cp.outbox);
+    const refusing = variant === "refused"
+      ? vi.spyOn(harness.cp.outbox, "enqueue").mockImplementation((message) => message.kind === "CEO_NOTIFICATION"
+        ? deny(ReasonCode.OUTBOX_TARGET_NOT_CURRENT, "the outbox refused the notice", {})
+        : enqueue(message))
+      : null;
+    expect(await start(fixture.daemon)).toBe(true);
+    if (variant === "unbound") expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "the CEO seat is vacated").allowed).toBe(true);
+    await sweepThroughTheCap(fixture);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.FAILED);
+    expect(failureNotices(fixture)).toHaveLength(0);
+    const owedRecords = auditOf(fixture, "FINALIZATION_FAILED_NOTICE");
+    expect(owedRecords).toHaveLength(1);
+    expect(owedRecords[0]!.evidence).toMatchObject({
+      delivered: false, detailWithheld: true, failureReasonCode: PERMISSION, failureCause: PERMISSION, outcome: "FAILED", merged: false,
+      blocker: `${PERMISSION}: ${passedOn(true)}`,
+    });
+    for (const field of ["reason", "evidence", "attempts"]) expect(owedRecords[0]!.evidence).not.toHaveProperty(field);
+    refusing?.mockRestore();
+    const ceoSessionId = variant === "unbound" ? bindCeo(harness) : harness.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId;
+    await sweepThroughTheCap(fixture);
+    await fixture.daemon.stop();
+    const restarted = newDaemon(harness);
+    expect(await start(restarted)).toBe(true);
+    await sweepThroughTheCap(fixture, restarted);
+    const notices = failureNotices(fixture);
+    expect(notices.map((notice) => notice.target)).toEqual([ceoSessionId]);
+    expect(notices[0]!.payload).toMatchObject({
+      runId: driven.runId, detailWithheld: true, failureReasonCode: PERMISSION, outcome: "FAILED", blocker: `${PERMISSION}: ${passedOn(true)}`,
+    });
+    expect(notices[0]!.payload).not.toHaveProperty("reason");
+    expect(auditOf(fixture, "FINALIZATION_FAILED_NOTICE").map((entry) => entry.evidence.delivered)).toEqual([false, true]);
+    expectNoTrace(fixture);
+    expectNothingMerged(fixture);
+    await restarted.stop();
   });
 });

@@ -6,6 +6,7 @@ import { redactCredentialShapes } from "../core/credential-shapes.ts";
 import { type Decision, acpError, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { redact } from "../db/audit.ts";
+import { registryView } from "../db/registry-view.ts";
 import { ArtifactKind, Role, RunKind, RunState, roleKeyFor } from "../domain/types.ts";
 import { currentBranch } from "../git/git.ts";
 import type { DaemonFinalizerAuthority } from "../guard/managed-write-guard.ts";
@@ -284,11 +285,24 @@ const retryDelayMs = (refusals: number): number =>
   Math.min(FINALIZATION_RETRY_BASE_MS * 2 ** (refusals - 1), FINALIZATION_RETRY_CEILING_MS);
 
 /**
- * The concrete blocker a hand-off names: the refusal's code and message. Bounded to the length the audit log
- * admits for a field it has not reviewed, so the notice's own record keeps it.
+ * A refusal's message as the finalizer passes it on (a CEO notice's `blocker` and `reason`, the run's stateReason
+ * and its revision request): every credential shape redacted (`redactCredentialShapes`), so a token in a GitHub
+ * error body reaches none of them. A `sha256:` digest or 64-hex id is kept only where it names a record the store
+ * holds for the run (`registryView`, the bound references the audit log keeps); a commit SHA is no shape. The rest
+ * of the text is kept as it is, and what is kept is admitted under any audit field. Each notice is built from it
+ * once per refusal, so its payload key does not move.
  */
-const blockerOf = (failure: Decision<unknown>): string =>
-  `${failure.reasonCode}: ${failure.allowed ? "" : failure.message}`.slice(0, 200);
+const refusalMessage = (cp: ControlPlane, runId: string, failure: Decision<unknown>): string =>
+  failure.allowed ? "" : redactCredentialShapes(failure.message, {
+    path: [], store: "audit", site: { writer: "FINALIZATION_ATTEMPT_FAILED", runId, registry: registryView(cp.db) },
+  });
+
+/**
+ * The concrete blocker a hand-off names: the refusal's code and its redacted message (`refusalMessage`). Bounded to
+ * the length the audit log admits for a field it has not reviewed, so the notice's own record keeps it; redacted
+ * before it is cut, so a shape the cut would split is gone first.
+ */
+const blockerOf = (failure: Decision<unknown>, message: string): string => `${failure.reasonCode}: ${message}`.slice(0, 200);
 
 /**
  * #1345 — the finalization plan as it stood before its PR named the run's tracked issues: the same plan, with
@@ -1522,6 +1536,8 @@ export class ApprovedRunFinalizer {
         ...(route.disposition === "RETRY" ? { failureClass: route.failureClass } : {}),
       },
     });
+    // The refusal's text as every notice, revision request and stateReason below carries it.
+    const message = refusalMessage(this.cp, runId, failure);
     if (route.disposition !== "RETRY") {
       const unrecoverable = route.disposition === "UNRECOVERABLE";
       const notice = {
@@ -1532,15 +1548,15 @@ export class ApprovedRunFinalizer {
         action: unrecoverable
           ? "the run ended FAILED and its approval is void; start a new run if the change is still wanted"
           : "dispatch the run again so a current CTO revises it; its approval is void",
-        blocker: blockerOf(failure),
-        reason: failure.message,
+        blocker: blockerOf(failure, message),
+        reason: message,
         whyItMatters: "a CEO-approved run did not merge, and nothing moves it without this",
       };
       const returned = this.cp.runs.returnApprovedCandidate(runId, {
         candidateSnapshotDigest: candidateDigest,
         attemptId,
         reasonCode: failure.reasonCode,
-        reason: `${failure.reasonCode}: ${failure.message}`,
+        reason: `${failure.reasonCode}: ${message}`,
         unrecoverable,
         onFailed: () => this.notifyFailed(runId, notice),
       });
@@ -1626,10 +1642,10 @@ export class ApprovedRunFinalizer {
         action: `${limit === "CANDIDATE"
           ? `this candidate used its ${FINALIZATION_RETRY_CAP} automatic retries across different failures without merging; inspect its refusals and decide how the run proceeds`
           : route.action}. ${RETRIES_STOPPED}`,
-        blocker: blockerOf(failure),
+        blocker: blockerOf(failure, message),
         retries,
         retryCap: FINALIZATION_RETRY_CAP,
-        reason: failure.message,
+        reason: message,
       };
       const notified = this.cp.ceo.notify(NotificationKind.CRITICAL_SYSTEM_FAILURE, runId, { ...handoff, whyItMatters: HAND_OFF_WHY });
       this.cp.audit.record({
@@ -1733,7 +1749,7 @@ export class ApprovedRunFinalizer {
     counted: Record<string, unknown> & { attemptId: string },
     limit: "FAILURE" | "CANDIDATE",
   ): boolean {
-    const reason = failure.allowed ? "" : failure.message;
+    const reason = refusalMessage(this.cp, runId, failure);
     const attempts = this.cp.audit.forRun(runId)
       .filter((entry) => entry.kind === "FINALIZATION_ATTEMPT_FAILED" && entry.evidence["candidateSnapshotDigest"] === candidateDigest)
       .map((entry) => entry.evidence["attemptId"]);
@@ -1752,7 +1768,7 @@ export class ApprovedRunFinalizer {
       owner: "CEO",
       action: "nothing is left to do for this run: it ended FAILED with nothing merged and its approval void; " +
         "a new run is needed only if the change is still wanted",
-      blocker: blockerOf(failure),
+      blocker: blockerOf(failure, reason),
       reason,
       refusals: counted["refusals"],
       failureRetryCap: counted["failureRetryCap"],
