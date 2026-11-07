@@ -73,7 +73,7 @@ class IssuesGitHub implements GitHubClient {
    * "after": GitHub creates it and the answer is lost. "late": the client gives up with no answer while
    * GitHub is still processing; the issue appears only when `land()` is called.
    */
-  fault: { suffix: string; when: "before" | "after" | "late"; skip?: number; status?: number } | null = null;
+  fault: { suffix: string; when: "before" | "after" | "late"; skip?: number; status?: number; reports?: { method: string; path: string } } | null = null;
   private landing: Array<() => void> = [];
   /** GitHub completes the requests a "late" fault left in flight. */
   land(): void {
@@ -186,9 +186,10 @@ class IssuesGitHub implements GitHubClient {
       const faulted = matched && (this.fault!.skip ?? 0) === 0;
       if (matched && !faulted) this.fault!.skip! -= 1;
       if (faulted && this.fault!.when === "before") {
-        const status = this.fault!.status;
+        const { status, reports } = this.fault!;
         this.fault = null;
-        if (status !== undefined) throw acpError(ReasonCode.INTERNAL_ERROR, `gh api POST ${path} failed: (HTTP ${status})`, { status, method, path });
+        // #1364 — `reports`: the failure names another request than this POST, as a client reporting it would.
+        if (status !== undefined) throw acpError(ReasonCode.INTERNAL_ERROR, `gh api POST ${path} failed: (HTTP ${status})`, { status, method: reports?.method ?? method, path: reports?.path ?? path });
         throw new Error("HTTP 502 before GitHub acted");
       }
       const value = body as Record<string, unknown>;
@@ -359,8 +360,8 @@ const tracking = (answer: Record<string, unknown>) => (answer["evidence"] as { g
 const unmetOf = (evidence: unknown) => ((evidence as { unmet?: Array<{ unit: string; unmet: string; issues?: number[]; correction: string }> } | undefined)?.unmet ?? []);
 const trackedRecords = (g: Governed) => g.h.cp.audit.byKind("WORK_SCOPE_GITHUB_TRACKED").filter((row) => row.runId === g.runId).map((row) => row.evidence as { units: Array<{ unit: string; issueNumber: number; milestoneNumber: number; adopted: boolean }> });
 const INTERNAL_ID = /\b(?:prj|repo|ses|run|task|art|clm|msg|asg)_[0-9a-f]{24}\b/;
-/** Every create intent of the run that was retired, with why. */
-const intentsOf = (g: Governed) => g.h.cp.audit.byKind("WORK_SCOPE_GITHUB_INTENT_RETIRED").filter((row) => row.runId === g.runId).map((row) => {
+/** Every create intent of the run that was retired on its original outcome, with why. */
+const intentsOf = (g: Governed) => g.h.cp.audit.byKind("WORK_SCOPE_GITHUB_INTENT_RETIRED").filter((row) => row.runId === g.runId && (row.evidence as { outcome?: string }).outcome !== undefined).map((row) => {
   const e = row.evidence as { outcome: string; status?: number };
   return { outcome: e.outcome, ...(e.status === undefined ? {} : { status: e.status }) };
 });
@@ -540,7 +541,7 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     expect(g.github.calls).toEqual([]);
   });
 
-  it("a GitHub outage holds back only the unit not yet linked; a linked unit's admission asks GitHub nothing", async () => {
+  it("a GitHub outage holds back only the unit not yet linked; a linked unit's admission sends GitHub nothing", async () => {
     const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
     const [impl] = g.taskIds as [string];
     const feed = { key: "feed", tasks: [impl], issue: { number: 3 }, milestone: { number: 1 } };
@@ -552,7 +553,8 @@ describe("#1240 — a Repo Factory project's approved work units are linked on G
     const seen = g.github.calls.length;
     expect(startExecution(g, impl).allowed).toBe(true);
     expect((await provision(g, impl))["reasonCode"]).not.toBe(REFUSED);
-    expect(g.github.calls.length).toBe(seen);
+    // #1364 — while roundup's create is unknown, an admission only reads GitHub for its token.
+    expect(g.github.calls.slice(seen).filter((c) => c.method !== "GET")).toEqual([]);
     // The outage's request may still land: nothing is sent again for roundup until it is known.
     expect(startExecution(g, roundup).reasonCode).toBe(REFUSED);
     expect((await startWorkerExecution(g, roundup)).reasonCode).toBe(REFUSED);
@@ -1601,5 +1603,336 @@ describe("#1365 — an issue or milestone this synchronization created is not re
     expect(unmetOf(tracking(answer)).map((u) => [u.unit, u.unmet])).toEqual([["feed", "ISSUE_NOT_FOUND"], ["short", "MILESTONE_NOT_FOUND"]]);
     expect(g.github.calls.filter((c) => c.method === "GET" && /\/(issues|milestones)\/\d+$/.test(c.path))).toEqual([]);
     expect(trackedRecords(g)).toEqual([]);
+  });
+});
+
+/**
+ * #1364 — an issue create's ORIGINAL_OUTCOME (CREATED, NOT_CREATED, UNKNOWN) moves only on evidence bound to
+ * that request; how the run proceeds past an UNKNOWN is its DISPOSITION, recorded apart and never rewriting it:
+ * ADOPTED_EXISTING (the run's current owner adopts an existing issue by number) or ENDED_BY_CEO (an escalation
+ * answered by the CEO's FINAL_REVISE, or a cancel).
+ */
+describe("#1364 — a work-scope issue create's original outcome is kept apart from how the run proceeds past an UNKNOWN", () => {
+  type Run = { h: Harness; runId: string };
+  type Unresolved = { unit: string; intents?: string[]; originalOutcome?: string; retryable?: boolean; refusal?: string; dispositions?: unknown[]; correction: string };
+  const FEED = { new: { title: "Add feed filtering", body: "Filter" } };
+  const feedUnit = (impl: string, issue: unknown = FEED) => ({ key: "feed", tasks: [impl], issue, milestone: { number: 1 } });
+  const SHORT = (short: string) => ({ key: "short", tasks: [short], issue: { number: 5 }, milestone: { number: 2 } });
+  const unresolvedOf = (evidence: unknown) => unmetOf(evidence).filter((u) => u.unmet === "WORK_SCOPE_CREATION_UNRESOLVED") as unknown as Unresolved[];
+  const retiredRows = (g: Run) => g.h.cp.audit.byKind("WORK_SCOPE_GITHUB_INTENT_RETIRED").filter((row) => row.runId === g.runId);
+  const dispositionsOf = (g: Run) => retiredRows(g).filter((row) => (row.evidence as { disposition?: string }).disposition !== undefined);
+  const intentOf = (g: Run) => (g.h.cp.audit.byKind("WORK_SCOPE_GITHUB_CREATING").filter((row) => row.runId === g.runId).at(-1)!.evidence as { intent: string }).intent;
+  const createdFor = (g: Run, intent: string) => g.h.cp.audit.byKind("WORK_SCOPE_GITHUB_CREATED").filter((row) => row.runId === g.runId && (row.evidence as { intent?: string }).intent === intent);
+  const auditRows = (h: Harness) => h.cp.audit.all().map((row) => JSON.stringify(row));
+  const posted = (github: IssuesGitHub, title: string) => github.posts("/issues").filter((call) => (call.body as { title?: string }).title === title);
+
+  it("with no issue carrying its token, in a full or an empty listing, an unknown create stays UNKNOWN and opens no new key", async () => {
+    const empty = new IssuesGitHub();
+    empty.addMilestone("First product increment", "");
+    for (const [name, github] of [["full", myeotnyeon()], ["empty", empty]] as const) {
+      const g = await governedRun({ github, legacy: LEGACY.slice(0, 1) });
+      const [impl] = g.taskIds as [string];
+      // The POST fails with no answer GitHub can be heard to give: nothing exists, and nothing tells ACP so.
+      g.github.fault = { suffix: "/issues", when: "before" };
+      await planSubmit(g, [feedUnit(impl)]);
+      const intent = intentOf(g);
+      for (const [key, title] of [["feed", "Add feed filtering"], ["feed-renamed", "Feed filtering, renamed"]] as const) {
+        const retried = await planSubmit(g, [{ key, tasks: [impl], issue: { new: { title, body: "Filter" } }, milestone: { number: 1 } }], undefined, key);
+        expect(unresolvedOf(tracking(retried)).map((u) => [u.unit, u.intents, u.originalOutcome, u.retryable]), `${name} ${key}`).toEqual([[key, [intent], "UNKNOWN", true]]);
+      }
+      expect(g.github.posts("/issues"), name).toHaveLength(1);
+      expect(retiredRows(g), name).toEqual([]);
+      expect(createdFor(g, intent), name).toEqual([]);
+    }
+  });
+
+  it("only a definite 4xx answering the intent's own POST is NOT_CREATED and opens a new key; another request's 4xx is not", async () => {
+    // Its own POST answered 422: retired at once, and the next sync creates the issue under a new key, once.
+    const own = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [ownImpl] = own.taskIds as [string];
+    own.github.fault = { suffix: "/issues", when: "before", status: 422 };
+    await planSubmit(own, [feedUnit(ownImpl)]);
+    expect(intentsOf(own)).toEqual([{ outcome: "DEFINITE_NOT_CREATED", status: 422 }]);
+    expect(tracking(await planSubmit(own, [feedUnit(ownImpl)], undefined, "again"))).toMatchObject({ tracked: true });
+    expect(own.github.issues.filter((i) => i.title === "Add feed filtering")).toHaveLength(1);
+    // A 422 the client reports for another request than the POST proves nothing about the POST.
+    const other = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [otherImpl] = other.taskIds as [string];
+    other.github.fault = { suffix: "/issues", when: "before", status: 422, reports: { method: "GET", path: `${ROOT}/issues/3` } };
+    await planSubmit(other, [feedUnit(otherImpl)]);
+    expect(intentsOf(other)).toEqual([]);
+    expect(unresolvedOf(tracking(await planSubmit(other, [feedUnit(otherImpl)], undefined, "again"))).map((u) => u.unit)).toEqual(["feed"]);
+    expect(other.github.posts("/issues")).toHaveLength(1);
+    // A later request's 422 (another unit's create) retires that request, never the earlier unknown one.
+    const later = await governedRun({ legacy: [LEGACY[0]!, LEGACY[2]!] });
+    const [impl, short] = later.taskIds as [string, string];
+    const units = [feedUnit(impl), { key: "short", tasks: [short], issue: { new: { title: "Daily short pipeline", body: "Shorts" } }, milestone: { number: 2 } }];
+    later.github.fault = { suffix: "/issues", when: "late" };
+    await planSubmit(later, units);
+    later.github.fault = { suffix: "/issues", when: "before", status: 422 };
+    await planSubmit(later, units, undefined, "the later request");
+    expect(intentsOf(later)).toEqual([{ outcome: "DEFINITE_NOT_CREATED", status: 422 }]);
+    expect(unresolvedOf(tracking(await planSubmit(later, units, undefined, "third"))).map((u) => u.unit)).toEqual(["feed"]);
+    expect(later.github.issues.filter((i) => i.title === "Daily short pipeline")).toHaveLength(1);
+    expect(posted(later.github, "Add feed filtering")).toHaveLength(1);
+  });
+
+  it("an issue carrying another request's token, the token on two issues, or another repository's answer is not CREATED", async () => {
+    // The same text under another request's token.
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/issues", when: "before" };
+    await planSubmit(g, [feedUnit(impl)]);
+    g.github.addIssue("Add feed filtering", "Filter\n\n<!-- acp:0123456789abcdef -->", g.github.milestones[0]!);
+    expect(unresolvedOf(tracking(await planSubmit(g, [feedUnit(impl)], undefined, "another token"))).map((u) => u.unit)).toEqual(["feed"]);
+    expect(createdFor(g, intentOf(g))).toEqual([]);
+    // The request's own token, on two issues: not one creation.
+    const twice = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [twiceImpl] = twice.taskIds as [string];
+    twice.github.fault = { suffix: "/issues", when: "late" };
+    await planSubmit(twice, [feedUnit(twiceImpl)]);
+    twice.github.land();
+    const landed = twice.github.issues.find((i) => i.title === "Add feed filtering")!;
+    twice.github.addIssue("Add feed filtering, copied", landed.body, twice.github.milestones[0]!);
+    expect(unresolvedOf(tracking(await planSubmit(twice, [feedUnit(twiceImpl)], undefined, "two carriers"))).map((u) => u.unit)).toEqual(["feed"]);
+    expect(createdFor(twice, intentOf(twice))).toEqual([]);
+    expect(twice.github.posts("/issues")).toHaveLength(1);
+    // GitHub created it and the answer was lost; a readback answered from another repository records nothing.
+    const foreign = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [foreignImpl] = foreign.taskIds as [string];
+    foreign.github.fault = { suffix: "/issues", when: "after" };
+    await planSubmit(foreign, [feedUnit(foreignImpl)]);
+    foreign.github.foreign = true;
+    expect(tracking(await planSubmit(foreign, [feedUnit(foreignImpl)], undefined, "misrouted"))).toMatchObject({ tracked: false });
+    expect(createdFor(foreign, intentOf(foreign))).toEqual([]);
+    foreign.github.foreign = false;
+    expect(tracking(await planSubmit(foreign, [feedUnit(foreignImpl)], undefined, "exact repository"))).toMatchObject({ tracked: true });
+    expect(createdFor(foreign, intentOf(foreign))).toHaveLength(1);
+    expect(foreign.github.posts("/issues")).toHaveLength(1);
+  });
+
+  it("the run owner adopting an existing issue is ADOPTED_EXISTING, recorded once; the outcome stays UNKNOWN, nothing is created, and a supersede is admitted", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/issues", when: "late" };
+    await planSubmit(g, [feedUnit(impl)]);
+    const intent = intentOf(g);
+    const before = auditRows(g.h);
+    // Made by hand after the request, as FreshReadme#9 was.
+    const byHand = g.github.addIssue("Feed filtering", "Made by hand", g.github.milestones[0]!);
+    expect(tracking(await planSubmit(g, [feedUnit(impl, { number: byHand.number })], undefined, "adopted"))).toMatchObject({ tracked: true });
+    expect(g.h.cp.tasks.workScope!.assertTracked(g.runId, impl)).toMatchObject({ allowed: true, value: { issueNumber: byHand.number, adopted: true } });
+    const [row, ...more] = dispositionsOf(g);
+    expect(more).toEqual([]);
+    expect(row!.sessionId).toBe(g.owner.sessionId);
+    expect(row!.evidence).toMatchObject({
+      intent, disposition: "ADOPTED_EXISTING", originalOutcome: "UNKNOWN", unit: "feed", taskIds: [impl],
+      repositoryIdentity: IDENTITY, repositoryNodeId: NODE, issueNumber: byHand.number, issueNodeId: byHand.node_id, bindingGeneration: g.generation,
+      investigation: { issuesListed: 10, window: { afterIssue: 10, throughIssue: byHand.number }, candidates: [byHand.number] },
+    });
+    expect(intentsOf(g)).toEqual([]);
+    expect(createdFor(g, intent)).toEqual([]);
+    // No new create or retry for its task, under any key.
+    const renewed = await planSubmit(g, [{ key: "feed-again", tasks: [impl], issue: { new: { title: "Feed filtering, again", body: "Filter" } }, milestone: { number: 1 } }], undefined, "a new key");
+    expect(unmetOf(tracking(renewed)).map((u) => u.unmet)).toEqual(["TASK_ALREADY_TRACKED"]);
+    // The same adoption again is verified again, and recorded once.
+    expect(tracking(await planSubmit(g, [feedUnit(impl, { number: byHand.number })], undefined, "adopted again"))).toMatchObject({ tracked: true });
+    expect(dispositionsOf(g)).toHaveLength(1);
+    // The run proceeds on the adopted issue: a supersede of the adopted task is admitted.
+    const superseded = await callCtoTool(g.h, g.owner, "plan_submit", {
+      idempotencyKey: "supersede", runId: g.runId,
+      plan: { summary: "replace the feed task", supersedesTaskIds: [impl], workUnits: [{ key: "feed", tasks: ["impl2"], issue: { number: byHand.number }, milestone: { number: 1 } }] },
+      tasks: [{ key: "impl2", title: "Implement the verdict feed, again", category: "implementation" }],
+    });
+    expect(superseded["ok"]).toBe(true);
+    expect(tracking(superseded)).toMatchObject({ tracked: true });
+    expect(g.h.cp.tasks.get(impl)!.state).toBe("CANCELLED");
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(dispositionsOf(g)).toHaveLength(1);
+    // Append only: every row recorded before the adoption reads as it did.
+    expect(auditRows(g.h).slice(0, before.length)).toEqual(before);
+  });
+
+  it("an adoption approved by an owner ACP no longer admits as current is refused and records nothing; the current owner's is recorded", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/issues", when: "late" };
+    await planSubmit(g, [feedUnit(impl)]);
+    const units = [feedUnit(impl, { number: 3 })];
+    // The adopting PLAN is accepted while GitHub does not answer, and then the run changes hands.
+    vi.spyOn(g.github, "request").mockRejectedValueOnce(new Error("GitHub is unavailable"));
+    expect(tracking(await planSubmit(g, units, undefined, "adopted"))).toMatchObject({ tracked: false });
+    const owner = takeOver(g);
+    const stale = await g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl);
+    expect(stale.allowed).toBe(false);
+    expect(unresolvedOf(stale.evidence).map((u) => [u.unit, u.refusal, u.originalOutcome, u.retryable])).toEqual([["feed", "WORK_SCOPE_APPROVAL_NOT_CURRENT_OWNER", "UNKNOWN", false]]);
+    expect(dispositionsOf(g)).toEqual([]);
+    expect(trackedRecords(g)).toEqual([]);
+    // The current owner sends the same PLAN: approved for it, the adoption is recorded with it.
+    const resent = await callCtoTool(g.h, owner, "plan_submit", { idempotencyKey: "resent", runId: g.runId, plan: { summary: "adopted", workUnits: units } });
+    expect(tracking(resent)).toMatchObject({ tracked: true });
+    expect(dispositionsOf(g).map((row) => [row.sessionId, (row.evidence as { issueNumber: number }).issueNumber])).toEqual([[owner.sessionId, 3]]);
+    expect(g.github.posts("/issues")).toHaveLength(1);
+  });
+
+  it("a token match after the adoption is still recorded as CREATED, flagged as a possible duplicate of the adopted issue; nothing is closed", async () => {
+    const g = await governedRun({ legacy: [LEGACY[0]!, LEGACY[2]!] });
+    const [impl, short] = g.taskIds as [string, string];
+    g.github.fault = { suffix: "/issues", when: "late" };
+    await planSubmit(g, [feedUnit(impl), SHORT(short)]);
+    const intent = intentOf(g);
+    expect(tracking(await planSubmit(g, [feedUnit(impl, { number: 3 }), SHORT(short)], undefined, "adopted"))).toMatchObject({ tracked: true });
+    // GitHub completes the original POST; the next synchronization reads it by its token.
+    g.github.land();
+    const late = g.github.issues.find((i) => i.title === "Add feed filtering")!;
+    const next = await planSubmit(g, [feedUnit(impl, { number: 3 }), SHORT(short), { key: "thumbs", tasks: ["thumbs"], issue: { number: 6 }, milestone: { number: 2 } }],
+      [{ key: "thumbs", title: "Thumbnail A/B", category: "implementation" }], "next");
+    expect(tracking(next)).toMatchObject({ tracked: true });
+    expect(createdFor(g, intent).map((row) => row.evidence)).toEqual([expect.objectContaining({ resource: "issue", number: late.number, nodeId: late.node_id, possibleDuplicateOf: [3] })]);
+    expect(dispositionsOf(g)).toHaveLength(1);
+    expect(g.h.cp.tasks.workScope!.assertTracked(g.runId, impl)).toMatchObject({ allowed: true, value: { issueNumber: 3 } });
+    expect(g.github.issues.filter((i) => i.title === "Add feed filtering")).toHaveLength(1);
+    expect(g.github.calls.filter((c) => c.method !== "GET" && c.method !== "POST")).toEqual([]);
+  });
+
+  it("review: with every unit tracked after an adoption, the next ensure still reads the token and records the late CREATED, flagged", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/issues", when: "late" };
+    await planSubmit(g, [feedUnit(impl)]);
+    const intent = intentOf(g);
+    const adopting = [feedUnit(impl, { number: 3 })];
+    expect(tracking(await planSubmit(g, adopting, undefined, "adopted"))).toMatchObject({ tracked: true });
+    // GitHub completes the original POST; the unchanged PLAN is sent again and the task admitted. No unit is pending.
+    g.github.land();
+    const late = g.github.issues.find((i) => i.title === "Add feed filtering")!;
+    expect((await planSubmit(g, adopting, undefined, "adopted"))["evidence"]).toMatchObject({ replayed: true, githubTracking: { tracked: true } });
+    expect((await g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl)).allowed).toBe(true);
+    expect(createdFor(g, intent).map((row) => row.evidence)).toEqual([expect.objectContaining({ number: late.number, nodeId: late.node_id, possibleDuplicateOf: [3] })]);
+    // Known now: a further admission asks GitHub nothing, and nothing was sent or closed.
+    const calls = g.github.calls.length;
+    expect((await g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl)).allowed).toBe(true);
+    expect(g.github.calls).toHaveLength(calls);
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(g.github.calls.filter((c) => c.method !== "GET" && c.method !== "POST")).toEqual([]);
+  });
+
+  it("review: while a create is unknown, a failed token read refuses no admission of a tracked unit", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/issues", when: "late" };
+    await planSubmit(g, [feedUnit(impl)]);
+    expect(tracking(await planSubmit(g, [feedUnit(impl, { number: 3 })], undefined, "adopted"))).toMatchObject({ tracked: true });
+    vi.spyOn(g.github, "request").mockRejectedValueOnce(new Error("GitHub is unavailable"));
+    expect((await g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl)).allowed).toBe(true);
+    expect(createdFor(g, intentOf(g))).toEqual([]);
+  });
+
+  it("review R2: an escalation_resolve, even of the escalation naming the intent, ends no wait; the CEO's cancel of the BLOCKED run does", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/issues", when: "late" };
+    await planSubmit(g, [feedUnit(impl)]);
+    const intent = intentOf(g);
+    const ceo = g.h.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId;
+    const escalate = async (key: string): Promise<number> => {
+      const opened = await callCtoTool(g.h, g.owner, "escalation_open", {
+        idempotencyKey: `open-${key}`, runId: g.runId, question: `the issue create ${intent} has an unknown outcome; how does the run proceed?`,
+        options: ["keep waiting", "cancel"], ctoRecommendation: "cancel", whyItMatters: "the unit cannot be linked", blocksCriticalPath: true,
+      });
+      expect(opened["ok"], key).toBe(true);
+      expect(g.h.cp.runs.require(g.runId).state, key).toBe("BLOCKED");
+      return (opened["value"] as { escalationId: number }).escalationId;
+    };
+    // The CEO answers the escalation naming the intent with "keep waiting": the wait goes on.
+    expect(g.h.cp.ceo.resolveEscalation(g.runId, "keep waiting for GitHub", ceo, { escalationId: await escalate("first"), idempotencyKey: "resolve" }).allowed).toBe(true);
+    const waiting = unresolvedOf(tracking(await planSubmit(g, [feedUnit(impl)], undefined, "after keep waiting")));
+    expect(waiting.map((u) => [u.unit, u.originalOutcome, u.retryable, u.dispositions])).toEqual([["feed", "UNKNOWN", true, undefined]]);
+    expect(waiting[0]!.correction).toMatch(/escalate \(escalation_open\): the CEO may cancel the run/);
+    // Escalated again and held BLOCKED, the run is cancelled by the CEO (run_cancel): the wait ends with it.
+    await escalate("second");
+    expect(g.h.cp.runs.cancel(g.runId, "CEO: cancel the run").allowed).toBe(true);
+    expect((await g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl)).allowed).toBe(false);
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(retiredRows(g)).toEqual([]);
+    expect(createdFor(g, intent)).toEqual([]);
+  });
+
+  it("review R2: an admission whose token read awaits GitHub is decided on the scope as it stands after the read", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/issues", when: "late" };
+    await planSubmit(g, [feedUnit(impl)]);
+    expect(tracking(await planSubmit(g, [feedUnit(impl, { number: 3 })], undefined, "adopted"))).toMatchObject({ tracked: true });
+    // The admission's token read waits on GitHub; meanwhile a replacement PLAN links the unit to #99, which does not exist.
+    const hold = g.github.holdNext(`${ROOT}/issues`);
+    const admission = provision(g, impl);
+    await vi.waitFor(() => expect(hold.reached()).toBe(true));
+    const plan = g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!.digest;
+    const replacing = planSubmit(g, [feedUnit(impl, { number: 99 })], undefined, "relinked");
+    await vi.waitFor(() => expect(g.h.cp.artifacts.latest(g.runId, ArtifactKind.PLAN)!.digest).not.toBe(plan));
+    expect(g.h.cp.tasks.workScope!.assertTracked(g.runId, impl).allowed).toBe(false);
+    hold.release();
+    // Refused at the work-scope check, before staffing (this harness staffs no worker provider) or any binding.
+    const admitted = await admission;
+    expect(admitted["reasonCode"]).toBe(REFUSED);
+    expect(unmetOf(admitted["evidence"]).map((u) => [u.unit, u.unmet, u.issues])).toEqual([["feed", "ISSUE_NOT_FOUND", [99]]]);
+    expect(g.h.cp.bindings.active(roleKeyFor(Role.WORKER, { taskId: impl }))).toBeNull();
+    expect(unmetOf(tracking(await replacing)).map((u) => u.unmet)).toEqual(["ISSUE_NOT_FOUND"]);
+  });
+
+  it("the CEO's FINAL_REVISE answering an escalation ends the wait: no longer retryable, the outcome stays UNKNOWN, nothing is sent again", async () => {
+    const github = myeotnyeon();
+    const h = harnessFor(github);
+    // A run executed before its project was a Repo Factory one, now declaring its unit: the FINAL_REVISE path.
+    const driven = await driveToReviewedCandidate(h, { projectId: "myeotnyeon", repositoryIdentity: IDENTITY });
+    provisionRow(h, driven.projectId);
+    const g = { h, runId: driven.runId };
+    const owner = { sessionId: driven.ownerSessionId, incarnation: h.cp.sessions.get(driven.ownerSessionId)!.incarnation };
+    const [impl] = h.cp.tasks.list(driven.runId).map((task) => task.taskId) as [string];
+    const submit = (summary: string) => callCtoTool(h, owner, "plan_submit", { idempotencyKey: `plan-${summary}`, runId: driven.runId, plan: { summary, workUnits: [feedUnit(impl)] } });
+    github.fault = { suffix: "/issues", when: "late" };
+    await submit("units");
+    const intent = intentOf(g);
+    expect(unresolvedOf(tracking(await submit("retry"))).map((u) => u.retryable)).toEqual([true]);
+    const opened = await callCtoTool(h, owner, "escalation_open", {
+      idempotencyKey: "escalate", runId: driven.runId, question: `the issue create ${intent} has an unknown outcome; how does the run proceed?`,
+      options: ["FINAL_REVISE", "cancel"], ctoRecommendation: "FINAL_REVISE", whyItMatters: "the unit cannot be linked", blocksCriticalPath: false,
+    });
+    expect(opened["ok"]).toBe(true);
+    // The candidate reaches the CEO; CONFIRM is refused (the unit is not linked), and the CEO sends it back.
+    await expect(approveReviewedCandidateForFinalization(h, driven)).rejects.toThrow(REFUSED);
+    const ceo = h.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    expect(h.cp.ceo.submitCeoDecision({ runId: driven.runId, decision: "FINAL_REVISE", candidateSnapshotDigest: driven.candidateSnapshotDigest, ceoSessionId: ceo.sessionId, rationale: "adopt an existing issue for the unit" }).allowed).toBe(true);
+    const ended = unresolvedOf(tracking(await submit("after the CEO")));
+    expect(ended.map((u) => [u.unit, u.intents, u.originalOutcome, u.retryable])).toEqual([["feed", [intent], "UNKNOWN", false]]);
+    expect(ended[0]!.dispositions).toEqual([{ intent, disposition: "ENDED_BY_CEO", escalationId: expect.any(Number), decisionEventId: expect.any(Number) }]);
+    expect(ended[0]!.correction).toMatch(/CEO ended the wait/);
+    expect(github.posts("/issues")).toHaveLength(1);
+    expect(retiredRows(g)).toEqual([]);
+    expect(createdFor(g, intent)).toEqual([]);
+  });
+
+  it("a cancel answering an escalation ends the run's wait with the outcome UNKNOWN and nothing sent again", async () => {
+    const g = await governedRun({ legacy: LEGACY.slice(0, 1) });
+    const [impl] = g.taskIds as [string];
+    g.github.fault = { suffix: "/issues", when: "late" };
+    await planSubmit(g, [feedUnit(impl)]);
+    const intent = intentOf(g);
+    const opened = await callCtoTool(g.h, g.owner, "escalation_open", {
+      idempotencyKey: "escalate", runId: g.runId, question: `the issue create ${intent} has an unknown outcome`, options: ["cancel"], ctoRecommendation: "cancel", whyItMatters: "the unit cannot be linked", blocksCriticalPath: true,
+    });
+    expect(opened["ok"]).toBe(true);
+    expect(g.h.cp.runs.require(g.runId).state).toBe("BLOCKED");
+    expect(g.h.cp.runs.cancel(g.runId, "CEO: cancel the run").allowed).toBe(true);
+    expect((await g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl)).allowed).toBe(false);
+    expect(g.github.posts("/issues")).toHaveLength(1);
+    expect(retiredRows(g)).toEqual([]);
+    expect(createdFor(g, intent)).toEqual([]);
+    // Its own token appearing later is still recorded as CREATED; nothing is sent.
+    g.github.land();
+    await g.h.cp.tasks.ensureWorkScopeTracked(g.runId, impl);
+    expect(createdFor(g, intent)).toHaveLength(1);
+    expect(g.github.posts("/issues")).toHaveLength(1);
   });
 });
