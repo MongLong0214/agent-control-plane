@@ -924,10 +924,11 @@ describe("#1189 — a refusal's credential-shaped text is redacted wherever the 
     const { harness, driven } = fixture;
     const held = driven.candidateSnapshotDigest;
     const evidence = {
-      observedDigest: unknownHex, prefixedDigest: `sha256:${unknownHex}`,
+      observedDigest: unknownHex, computedDigest: sha256("bytes ACP read and hashed itself"), proseDigest: `the bytes hash to sha256:${unknownHex}`,
       heldDigest: held, heldHex: held.slice("sha256:".length), runRef: driven.runId, note: `the candidate ${held} was refused`,
     };
-    const expected = { ...evidence, observedDigest: REDACTED, prefixedDigest: `sha256:${REDACTED}` };
+    // A structured value that is exactly a `sha256:` digest is ACP's own (the audit log keeps it so too); a bare one is not.
+    const expected = { ...evidence, observedDigest: REDACTED, proseDigest: `the bytes hash to sha256:${REDACTED}` };
     vi.spyOn(harness.cp.credentials, "authenticate").mockImplementation(async () =>
       deny(PERMISSION, "GitHub App permissions do not match any approved grant shape", evidence));
     expect(await start(fixture.daemon)).toBe(true);
@@ -961,9 +962,13 @@ describe("#1189 — a refusal's credential-shaped text is redacted wherever the 
     const held = driven.candidateSnapshotDigest;
     const evidence = {
       observedDigest: secretHex, heldDigest: held, heldHex: held.slice("sha256:".length), runRef: driven.runId,
+      computedDigest: sha256(randomBytes(16)), proseDigest: `observed sha256:${secretHex}`,
       note: `the candidate ${held} was refused`, nested: { observedDigest: secretHex, heldDigest: held },
     };
-    return { secretHex, evidence, kept: { ...evidence, observedDigest: REDACTED, nested: { observedDigest: REDACTED, heldDigest: held } } };
+    return {
+      secretHex, evidence,
+      kept: { ...evidence, observedDigest: REDACTED, proseDigest: `observed sha256:${REDACTED}`, nested: { observedDigest: REDACTED, heldDigest: held } },
+    };
   };
 
   /** Not in any FINALIZATION_* record of the run, nor in any other audit record, outbox row or the run's own row. */

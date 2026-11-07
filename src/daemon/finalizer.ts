@@ -315,16 +315,22 @@ const refusalText = (cp: ControlPlane, runId: string): ((text: string) => string
 const refusalMessage = (cp: ControlPlane, runId: string, failure: Decision<unknown>): string =>
   failure.allowed ? "" : refusalText(cp, runId)(failure.message);
 
+/** A digest in ACP's canonical form, `sha256:` and 64 lowercase hex, as a whole value. */
+const CANONICAL_DIGEST = /^sha256:[0-9a-f]{64}$/;
+
 /**
  * A refusal's evidence as the finalizer records it (its FINALIZATION_ATTEMPT_FAILED record, the BLOCKED_POST_MERGE
  * edge): the same shape, with every string in it, key or value at any depth, redacted as the refusal's text
  * (`refusalText`). A digest the store does not hold for the run is gone, whole or inside text; one it holds, and
- * every ACP id with no digest in it, is kept. A record nested deeper than the audit log reads is not kept.
+ * every ACP id with no digest in it, is kept. One exception, the audit log's own rule for a structured field: a value
+ * that is exactly a `sha256:` digest (`CANONICAL_DIGEST`) is ACP's, such as the digest it computed over the workflow
+ * bytes it read, and is kept; no credential format has that prefix. A bare 64-hex value, a key, and a digest inside
+ * text get no such exemption. A record nested deeper than the audit log reads is not kept.
  */
 const refusalRecordEvidence = (cp: ControlPlane, runId: string, evidence: Record<string, unknown>): Record<string, unknown> => {
   const scrub = refusalText(cp, runId);
   const walk = (value: unknown, depth: number): unknown => {
-    if (typeof value === "string") return scrub(value);
+    if (typeof value === "string") return CANONICAL_DIGEST.test(value) ? value : scrub(value);
     if (value === null || typeof value !== "object") return value;
     if (depth > 8) return REDACTED;
     if (Array.isArray(value)) return value.map((item) => walk(item, depth + 1));
