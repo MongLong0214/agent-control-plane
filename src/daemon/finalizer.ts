@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { ControlPlane } from "../app/control-plane.ts";
+import type { ProjectManifest } from "../contracts/manifest.ts";
 import { NotificationKind } from "../ceo/production-gate.ts";
 import { MCP_THROWN_REFUSAL_WRITER, REDACTED, redactCredentialShapes } from "../core/credential-shapes.ts";
 import { type Decision, acpError, allow, deny, isAcpError } from "../core/errors.ts";
@@ -174,6 +175,16 @@ const heldForTheOwner = (failureCause: unknown, failureRetryCap: unknown): boole
   typeof failureCause === "string" && BOUNDED_CREDENTIAL_ROUTES.has(failureCause as ReasonCode) && failureRetryCap === 0;
 
 /**
+ * The values a refusal's evidence names that the routes below copy into their records and notices: only one ACP
+ * defines is copied, so nothing a refusal was handed reaches them as written. A thrown error's code that is no ACP
+ * reason code is counted as the INTERNAL_ERROR it was caught as, and a strategy ACP does not know goes unnamed.
+ */
+const REASON_CODES: ReadonlySet<string> = new Set(Object.values(ReasonCode));
+const MERGE_STRATEGIES: ReadonlySet<string> = new Set<ProjectManifest["branchProfile"]["mergeStrategy"]>(
+  ["merge_commit", "fast_forward", "squash", "rebase"],
+);
+
+/**
  * #1189 B5 (CEO ruling 1) — stale base, conflict and a fixable check failure go back for revision; a
  * deterministic refusal someone else owns is handed to them; only an unrecoverable refusal whose
  * non-application GitHub confirmed ends the run; everything else, transient infrastructure first, is retried
@@ -190,10 +201,11 @@ export const classifyPreMergeRefusal = (kind: RunKind, failure: Decision<unknown
     if (evidence["pullMerged"] === false) return { disposition: "UNRECOVERABLE" };
     return {
       disposition: "RETRY", failureClass: "UNCLASSIFIED", failureCause: failure.reasonCode, retries: FINALIZATION_RETRY_CAP, owner: "CEO",
-      action: `the pinned ${strategy} strategy is not a merge commit, and the pull request could not be confirmed unmerged; confirm it, then cancel the run and migrate the contract`,
+      action: `the pinned ${MERGE_STRATEGIES.has(strategy) ? `${strategy} ` : ""}strategy is not a merge commit, and the pull request could not be confirmed unmerged; confirm it, then cancel the run and migrate the contract`,
     };
   }
-  const cause = failure.reasonCode === ReasonCode.INTERNAL_ERROR && typeof evidence["errorReasonCode"] === "string"
+  const cause = failure.reasonCode === ReasonCode.INTERNAL_ERROR && typeof evidence["errorReasonCode"] === "string" &&
+      REASON_CODES.has(evidence["errorReasonCode"])
     ? evidence["errorReasonCode"] as ReasonCode
     : failure.reasonCode;
   const owned = OWNER_ACTIONS.get(cause);
@@ -324,17 +336,17 @@ const refusalRecordEvidence = (cp: ControlPlane, runId: string, evidence: Record
 };
 
 /**
- * #1189 §0 — a refusal's evidence as a FAILED notice copies it: its scalar values only, each string redacted as the
- * refusal's text (`refusalText`) and then cut to the 200 characters the audit log admits for a field it has not
- * reviewed, and the audit log's key rules (`redact`: a secret-named key, a collection of them, bulk content) applied
- * over it at the run's own write site, so a digest the store holds for the run stays in the text around it too.
+ * #1189 §0 — a refusal's evidence as a FAILED notice copies it: the evidence as the finalizer records it
+ * (`refusalRecordEvidence`, keys and values redacted), of which only the scalar values are kept, each string cut to
+ * the 200 characters the audit log admits for a field it has not reviewed, and the audit log's key rules (`redact`:
+ * a secret-named key, a collection of them, bulk content) applied over it at the run's own write site, so a digest
+ * the store holds for the run stays in the text around it too.
  */
 const refusalEvidence = (cp: ControlPlane, runId: string, failure: Decision<unknown>): unknown => {
-  const scrub = refusalText(cp, runId);
-  const scalars = Object.fromEntries(Object.entries(failure.evidence)
+  const scalars = Object.fromEntries(Object.entries(refusalRecordEvidence(cp, runId, failure.evidence))
     .filter(([, value]) => value === null || typeof value === "string" || typeof value === "boolean" ||
       (typeof value === "number" && Number.isFinite(value)))
-    .map(([key, value]) => [key, typeof value === "string" ? scrub(value).slice(0, 200) : value]));
+    .map(([key, value]) => [key, typeof value === "string" ? value.slice(0, 200) : value]));
   return redact(scalars, 0, [], { writer: FAILED_NOTICE, runId, registry: registryView(cp.db) });
 };
 

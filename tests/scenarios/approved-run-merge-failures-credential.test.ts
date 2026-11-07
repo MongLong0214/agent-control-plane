@@ -1028,4 +1028,77 @@ describe("#1189 — a refusal's credential-shaped text is redacted wherever the 
     expectNowhere(fixture, secretHex);
     await fixture.daemon.stop();
   });
+  /** Not in any outbox row, nor any FINALIZATION_* record, of the run. */
+  const expectNotSentOrRecorded = (fixture: Fixture, secretHex: string): void => {
+    const { harness, driven } = fixture;
+    const rows = [
+      ...harness.cp.db.all<{ text: string }>("SELECT payload_json AS text FROM outbox WHERE run_id = ?", [driven.runId]),
+      ...harness.cp.db.all<{ text: string }>(
+        "SELECT evidence_json AS text FROM audit_events WHERE run_id = ? AND kind LIKE 'FINALIZATION\\_%' ESCAPE '\\'", [driven.runId]),
+    ];
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) expect(row.text).not.toContain(secretHex);
+  };
+
+  it.each([
+    ["sent at once", "bound"],
+    ["kept owed while no CEO is bound, then sent", "unbound"],
+  ] as const)("refusal evidence keyed by a 64-hex secret, in the FAILED notice %s: the key is redacted; a key that is the run's held digest is kept", async (_label, variant) => {
+    const fixture = await approved();
+    const { harness, driven } = fixture;
+    const secretHex = randomBytes(32).toString("hex");
+    const held = driven.candidateSnapshotDigest;
+    vi.spyOn(harness.cp.credentials, "authenticate").mockImplementation(async () =>
+      deny(PERMISSION, "GitHub App permissions do not match any approved grant shape", { [secretHex]: "refused", [held]: "kept" }));
+    expect(await start(fixture.daemon)).toBe(true);
+    if (variant === "unbound") expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "the CEO seat is vacated").allowed).toBe(true);
+    await sweepThroughTheCap(fixture);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.FAILED);
+    if (variant === "unbound") {
+      const owed = auditOf(fixture, "FINALIZATION_FAILED_NOTICE");
+      expect(owed.map((entry) => entry.evidence.delivered)).toEqual([false]);
+      expect(owed[0]!.evidence.evidence).toMatchObject({ [REDACTED]: "refused", [held]: "kept" });
+      bindCeo(harness);
+      await sweepThroughTheCap(fixture);
+    }
+    const notices = failureNotices(fixture);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.payload.evidence).toMatchObject({ [REDACTED]: "refused", [held]: "kept" });
+    expectNotSentOrRecorded(fixture, secretHex);
+    await fixture.daemon.stop();
+  });
+
+  it("a thrown refusal whose code is not an ACP reason code: it is counted as INTERNAL_ERROR, and its text reaches no count record or notice", async () => {
+    const secretHex = randomBytes(32).toString("hex");
+    const fixture = await approved((method, path) => {
+      if (isOpenPullQuery(method, path)) throw Object.assign(new Error("the GitHub client failed"), { reasonCode: secretHex, evidence: {} });
+    });
+    const { harness, driven } = fixture;
+    expect(await start(fixture.daemon)).toBe(true);
+    await sweepThroughTheCap(fixture);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
+    const counted = [...auditOf(fixture, "FINALIZATION_RETRY_SCHEDULED"), ...auditOf(fixture, "FINALIZATION_RETRIES_EXHAUSTED")];
+    expect(counted.length).toBe(FINALIZATION_RETRY_CAP + 1);
+    for (const entry of counted) expect(entry.evidence.failureCause).toBe(ReasonCode.INTERNAL_ERROR);
+    expect(failureNotices(fixture)).toHaveLength(1);
+    expect(failureNotices(fixture)[0]!.payload).toMatchObject({ failureCause: ReasonCode.INTERNAL_ERROR });
+    expectNotSentOrRecorded(fixture, secretHex);
+    await fixture.daemon.stop();
+  });
+
+  it("a merge-strategy refusal whose strategy is not one ACP knows: the hand-off's action does not repeat it", async () => {
+    const fixture = await approved();
+    const { harness, driven } = fixture;
+    const secretHex = randomBytes(32).toString("hex");
+    vi.spyOn(harness.cp.github, "prPrepare").mockImplementation(async () =>
+      deny<{ pullNumber: number; url: string }>(ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED, "the pinned strategy is refused", { mergeStrategy: secretHex }));
+    expect(await start(fixture.daemon)).toBe(true);
+    await sweepThroughTheCap(fixture);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
+    const notices = failureNotices(fixture);
+    expect(notices).toHaveLength(1);
+    expect(String(notices[0]!.payload.action)).toMatch(/^the pinned strategy is not a merge commit/);
+    expectNotSentOrRecorded(fixture, secretHex);
+    await fixture.daemon.stop();
+  });
 });
