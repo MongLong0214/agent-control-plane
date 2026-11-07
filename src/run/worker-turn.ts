@@ -16,14 +16,13 @@ import {
   withoutSupplement,
   workerCommitLoreSection,
 } from "../bootstrap/commitlore-commit.ts";
+import { commitloreTaskGoverned, commitloreTaskMode } from "../bootstrap/commitlore-mode.ts";
 import {
   type CommitLoreBeforeChange,
   type CommitLoreGuardLookup,
   type CommitLoreLookupEvent,
   type CommitLorePathLookup,
   type CommitLorePort,
-  commitloreGoverned,
-  commitloreRunMode,
   createCommitLoreCliPort,
 } from "../bootstrap/commitlore-observation.ts";
 import type { Clock } from "../core/clock.ts";
@@ -1694,12 +1693,14 @@ export class WorkerTurnRunner {
    * #1268 — the drafting contract for a turn whose run's pinned manifest requires CommitLore, read in the
    * claimed worktree; null for a run that requires nothing of it. Refused when the run requires it and
    * this deployment has no CommitLore that can commit, or the contract cannot be read.
+   * GAP 1 — or whose task's registered spec requires a capture of it (`commitloreTaskGoverned`): the stricter of
+   * the two decides, read from the stored run and task, never from the worker.
    */
   private async commitloreContract(facts: TurnFacts): Promise<Decision<string | null>> {
-    if (!commitloreGoverned(this.ports.db, facts.runId)) return allow(ReasonCode.OK, null);
+    if (!commitloreTaskGoverned(this.ports.db, facts.runId, facts.taskId)) return allow(ReasonCode.OK, null);
     const port = this.#commitlore;
     if (port === null || port.contract === undefined || port.attempt === undefined) {
-      return deny(ReasonCode.VERIFICATION_GAP, "this run's contract requires CommitLore, and this deployment has no CommitLore to commit through", {
+      return deny(ReasonCode.VERIFICATION_GAP, "this turn's contract (its run's, or its task's registered spec) requires CommitLore, and this deployment has no CommitLore to commit through", {
         refusal: "COMMITLORE_REQUIRED_UNOBSERVABLE",
         runId: facts.runId,
         taskId: facts.taskId,
@@ -1726,12 +1727,14 @@ export class WorkerTurnRunner {
    *   the port told by then is kept, so only the paths it had not answered fail, and guard not answering by
    *   then is guard not consulted, never a gap in any path's context (r2).
    * - guard's answer never refuses: a match is a lead, and a guard that gave none is stated as not consulted.
+   * - GAP 1 — the mode is the turn's (`commitloreTaskMode`): `required` too for a task whose registered spec requires
+   *   a capture, whatever its run's.
    */
   private async commitloreBeforeChange(facts: TurnFacts, scratch: string): Promise<Decision<TurnFacts["commitloreBeforeChange"]>> {
-    const mode = commitloreRunMode(this.ports.db, facts.runId);
+    const mode = commitloreTaskMode(this.ports.db, facts.runId, facts.taskId);
     if (mode === null || mode === "off") return allow(ReasonCode.OK, null);
     const unobservable = (): Decision<never> =>
-      deny(ReasonCode.VERIFICATION_GAP, "this run's contract requires CommitLore, and this deployment has no CommitLore to read its records before the worker edits", {
+      deny(ReasonCode.VERIFICATION_GAP, "this turn's contract (its run's, or its task's registered spec) requires CommitLore, and this deployment has no CommitLore to read its records before the worker edits", {
         refusal: "COMMITLORE_REQUIRED_UNOBSERVABLE",
         runId: facts.runId,
         taskId: facts.taskId,
@@ -1823,7 +1826,7 @@ export class WorkerTurnRunner {
     if (mode === "required" && uncoveredPaths.length > 0) {
       return deny(
         ReasonCode.WORKER_COMMITLORE_CONTEXT_INCOMPLETE,
-        `this run's contract requires CommitLore, and its context was not delivered for every path this turn may change at ${facts.baseHead}; no edit starts`,
+        `this turn's contract (its run's, or its task's registered spec) requires CommitLore, and its context was not delivered for every path this turn may change at ${facts.baseHead}; no edit starts`,
         { refusal: "CONTEXT_INCOMPLETE", ...lookup },
       );
     }
