@@ -137,11 +137,6 @@ export const WORKER_TURN_MODEL = "opus";
 const DEFAULT_POLL_MS = 1_000;
 const DEFAULT_PROCESS_SETTLE_MS = 2_000;
 const DEFAULT_SHUTDOWN_BUDGET_MS = 15_000;
-/**
- * #1268 — how long past its deadline a CommitLore lookup may take to return: the port bounds every child by
- * the deadline, and this is for those children to settle. A lookup later than that has failed.
- */
-const BEFORE_CHANGE_GRACE_MS = 2_000;
 /** How long a stopping daemon waits, after SIGKILL, to see each worker git child's exit (ACP-WORKER-03). */
 const GIT_REAP_BOUND_MS = 5_000;
 /** The bounded second attempt for a group the first one could not confirm empty. */
@@ -1721,8 +1716,10 @@ export class WorkerTurnRunner {
    * - A path the lookup did not cover (it failed, timed out, answered in part, or its data did not fit) refuses
    *   a `required` turn, and a `preferred` one until the run owner's supplement for exactly those paths at this
    *   base is bound (`boundSupplements`): WORKER_COMMITLORE_CONTEXT_INCOMPLETE, before anything starts.
-   * - A path with `[blocked]` records refuses a `required` turn (WORKER_COMMITLORE_CONTEXT_BLOCKED), and is
-   *   marked BLOCKED in a `preferred` turn's section and audit.
+   * - A path with `[blocked]` records refuses the turn in either mode (WORKER_COMMITLORE_CONTEXT_BLOCKED), first:
+   *   whether it may be changed cannot be decided, a turn's paths cannot be split mid-turn, and no supplement
+   *   stands in for content CommitLore withheld (r1 P1-2).
+   * - One deadline: an answer that arrives after it is a failed lookup, however soon after (r1 P2).
    * - guard's answer never refuses: a match is a lead, and a guard that gave none is stated as not consulted.
    */
   private async commitloreBeforeChange(facts: TurnFacts, scratch: string): Promise<Decision<TurnFacts["commitloreBeforeChange"]>> {
@@ -1744,6 +1741,8 @@ export class WorkerTurnRunner {
       cliIdentity: null,
     });
     const lookupMs = this.#commitloreLookupMs;
+    const deadline = Date.now() + lookupMs;
+    const late = (): CommitLoreBeforeChange => unanswered(`the CommitLore lookup did not answer within ${lookupMs} ms`);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let answer: CommitLoreBeforeChange | null;
     try {
@@ -1755,19 +1754,20 @@ export class WorkerTurnRunner {
           baseHead: facts.baseHead,
           proposal: beforeChangeProposal(facts.taskTitle, facts.taskSpec),
           scratch,
-          deadline: Date.now() + lookupMs,
+          deadline,
           concurrency: BEFORE_CHANGE_CONCURRENCY,
         },
       );
-      // The port bounds its own children by the deadline; a port that does not answer by it, and a moment for
-      // its children to settle, is a failed lookup all the same.
+      // The port bounds its own children by the deadline, and their cleanup runs on after it; what this turn
+      // takes is only an answer that arrived by the deadline (r1 P2).
       asked.catch(() => {});
       answer = await Promise.race([
         asked,
         new Promise<CommitLoreBeforeChange>((resolve) => {
-          timer = setTimeout(() => resolve(unanswered(`the CommitLore lookup did not answer within ${lookupMs} ms`)), lookupMs + BEFORE_CHANGE_GRACE_MS);
+          timer = setTimeout(() => resolve(late()), Math.max(0, deadline - Date.now()));
         }),
       ]);
+      if (Date.now() > deadline) answer = late();
     } catch (error) {
       answer = unanswered(`the CommitLore lookup failed: ${errorText(error).slice(0, 300)}`);
     } finally {
@@ -1785,18 +1785,19 @@ export class WorkerTurnRunner {
       uncovered: coverage.uncovered,
       blocked: coverage.blocked,
     };
+    // r1 P1-2 — in either mode, and before any supplement is read: none stands in for withheld content.
+    if (coverage.blocked.length > 0) {
+      return deny(
+        ReasonCode.WORKER_COMMITLORE_CONTEXT_BLOCKED,
+        "CommitLore withheld [blocked] records for paths this turn may change, so whether they may be changed cannot be decided; a turn's paths cannot be split mid-turn, and no supplement stands in for withheld content, so no edit starts",
+        { refusal: "CONTEXT_BLOCKED", ...lookup },
+      );
+    }
     if (mode === "required" && uncoveredPaths.length > 0) {
       return deny(
         ReasonCode.WORKER_COMMITLORE_CONTEXT_INCOMPLETE,
         `this run's contract requires CommitLore, and its context was not delivered for every path this turn may change at ${facts.baseHead}; no edit starts`,
         { refusal: "CONTEXT_INCOMPLETE", ...lookup },
-      );
-    }
-    if (mode === "required" && coverage.blocked.length > 0) {
-      return deny(
-        ReasonCode.WORKER_COMMITLORE_CONTEXT_BLOCKED,
-        "this run's contract requires CommitLore, and CommitLore withheld [blocked] records for paths this turn may change, so whether they may be changed cannot be decided; a turn's paths cannot be split mid-turn, so no edit starts",
-        { refusal: "CONTEXT_BLOCKED", ...lookup },
       );
     }
     // A required run's turn is never supplemented: its lookup either covered every path or refused above.

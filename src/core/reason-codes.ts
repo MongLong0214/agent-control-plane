@@ -273,9 +273,10 @@ export const ReasonCode = {
    */
   WORKER_COMMITLORE_CONTEXT_INCOMPLETE: "WORKER_COMMITLORE_CONTEXT_INCOMPLETE",
   /**
-   * #1268 — a `required` run's worker turn may change a path for which CommitLore withheld `[blocked]` records,
-   * so whether it may be changed cannot be decided; a turn's owned paths cannot be split mid-turn, so the
-   * whole turn is refused before an execution opens.
+   * #1268 — a worker turn of a `required` or `preferred` run may change a path for which CommitLore withheld
+   * `[blocked]` records, so whether it may be changed cannot be decided; a turn's owned paths cannot be split
+   * mid-turn, and no supplement stands in for withheld content, so the whole turn is refused before an
+   * execution opens.
    */
   WORKER_COMMITLORE_CONTEXT_BLOCKED: "WORKER_COMMITLORE_CONTEXT_BLOCKED",
   PRIMARY_CTO_ALREADY_BOUND: "PRIMARY_CTO_ALREADY_BOUND",

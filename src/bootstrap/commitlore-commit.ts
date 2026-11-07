@@ -379,13 +379,13 @@ export const workerCommitLoreSection = (contract: string): string =>
 /**
  * #1268 — the bounds of the lookup a worker turn makes before its worker edits (`commitloreBeforeChange`).
  *
- * One deadline for the whole lookup, 60 s: measured on this repository (1241 commits, the CLI answering from
- * git alone), `inject` on its most-recorded file took 4.5 s and `context` and `guard` about a second each, so
- * the largest lookup, 20 paths four at a time, needs some 25 s of that. Anything still running at the deadline
- * has failed. Four children at once keep that wall time down without running twenty CommitLore processes at
- * once beside a worker turn.
+ * One deadline for the whole lookup, 90 s: measured on this repository (1241 commits, the CLI answering from
+ * git alone), `context` and then `inject` on its most-recorded file took 4.6 s and 4.3 s, so the largest lookup,
+ * 20 paths four at a time, needs some 45 s, and this leaves it twice that. Anything that has not answered by the
+ * deadline has failed. Four children at once keep that wall time down without running twenty CommitLore
+ * processes at once beside a worker turn.
  */
-export const BEFORE_CHANGE_LOOKUP_MS = 60_000;
+export const BEFORE_CHANGE_LOOKUP_MS = 90_000;
 export const BEFORE_CHANGE_CONCURRENCY = 4;
 /** At most this many of a turn's paths are looked up; any further path is named as not looked up. */
 export const BEFORE_CHANGE_MAX_PATHS = 20;
@@ -416,6 +416,8 @@ interface BeforeChangeEntry {
   readonly withheld: number;
   /** How many of its required values did not fit; 0 when all did. */
   readonly cut: number;
+  /** CommitLore found no history for it (`CommitLorePathLookup.noHistory`). */
+  readonly noHistory?: boolean;
 }
 
 export interface BeforeChangeCoverage {
@@ -476,7 +478,7 @@ export const beforeChangeCoverage = (paths: readonly string[], lookups: readonly
       const size = bytesOf(lines);
       if (size > left) return gap(path, `its CommitLore payload (${size} bytes) did not fit the ${BEFORE_CHANGE_MAX_DATA_BYTES} bytes of data the section carries`, lookup.withheld);
       left -= size;
-      entries.push({ path, source: "inject", lines, withheld: lookup.withheld, cut: 0 });
+      entries.push({ path, source: "inject", lines, withheld: lookup.withheld, cut: 0, noHistory: lookup.noHistory === true });
       return;
     }
     const kept: string[] = [];
@@ -577,7 +579,8 @@ const GUARD_HEAD = "Guard, on the task's title and specification:";
 /**
  * #1268 — the section a worker's prompt carries before it edits: ACP's rules first, which stay instructions,
  * then each path in order with what CommitLore holds for it as data (prefixed lines), a path the lookup did not
- * cover with the run owner's supplement, a `[blocked]` path marked as one, and guard's answer. Not part of the
+ * cover with the run owner's supplement, and guard's answer. A turn with a `[blocked]` path has no section: it is
+ * refused (`WORKER_COMMITLORE_CONTEXT_BLOCKED`). Not part of the
  * transcript a CommitLore draft is verified against, so nothing in it can be quoted as said.
  */
 export const beforeChangeSection = (input: {
@@ -595,9 +598,11 @@ export const beforeChangeSection = (input: {
   ];
   for (const entry of input.coverage.entries) {
     if (entry.source === "inject") {
-      // A path whose only records were withheld is never said to have nothing: it is marked BLOCKED below.
+      // A path with withheld records never reaches a section (its turn is refused), and is never said to have nothing.
       if (entry.lines.length > 0) lines.push(`Path ${entry.path} (commitlore inject):`, ...entry.lines);
-      else if (entry.withheld === 0) lines.push(`Path ${entry.path}: CommitLore has nothing to inject for it at this base.`);
+      else if (entry.noHistory === true) {
+        lines.push(`Path ${entry.path}: it has no history at this base, so no CommitLore record names it; that is not evidence that nothing was decided about it.`);
+      } else if (entry.withheld === 0) lines.push(`Path ${entry.path}: CommitLore has nothing to inject for it at this base.`);
     } else if (entry.source === "context") {
       lines.push(`Path ${entry.path} (commitlore context: its Warn, Limit and Ruled-out values, because inject's budget cut some):`, ...entry.lines);
       if (entry.cut > 0) lines.push(`  ${entry.cut} of its values did not fit this section and are not shown.`);
@@ -606,9 +611,6 @@ export const beforeChangeSection = (input: {
     }
     for (const supplement of input.supplements.filter((candidate) => candidate.path === entry.path)) {
       lines.push(`Path ${entry.path}: manually supplied by the run owner for base ${supplement.base}, not looked up by ACP (${supplement.digest}):`, ...dataLines(supplement.contextText));
-    }
-    if (entry.withheld > 0) {
-      lines.push(`Path ${entry.path} is BLOCKED: CommitLore withheld ${entry.withheld} record(s) for it, so whether it may be changed cannot be decided here. Do not change files under it.`);
     }
   }
   switch (input.guard.status) {

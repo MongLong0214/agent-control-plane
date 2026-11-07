@@ -144,6 +144,12 @@ export interface CommitLorePathLookup {
    */
   readonly items: readonly CommitLoreRequiredItem[] | null;
   readonly detail: string | null;
+  /**
+   * #1268 r1 — CommitLore found no blob of this path in the history it read whole (a file the turn creates, or
+   * one renamed from a name not asked for): no record names it, and its empty answer is not evidence that
+   * nothing was decided about it. Absent or false otherwise.
+   */
+  readonly noHistory?: boolean;
 }
 
 /** #1268 — one guard match, as `guard --json` renders it; a `[blocked]` match carries no content. */
@@ -917,6 +923,50 @@ const inPool = async <T>(width: number, jobs: ReadonlyArray<() => Promise<T>>): 
   return results;
 };
 
+/**
+ * #1268 r1 P1-1 — every way `context --json` says its answer is not whole: an exit other than 0 (3 is "answered,
+ * but the notes mirror is unfetched or the scan was truncated"), `coverage` other than `complete`, unread commits,
+ * `history` other than `ready`, `notes` other than `present` or `absent`, and every entry of `diagnostics`. Each of
+ * CommitLore's query diagnostics is a caveat on the answer (an unread index or scan, unreadable or shallow history,
+ * unfetched notes, a checkout behind its upstream, capped rename aliases, withheld or masked values) and none says
+ * it is whole, so each counts, by its presence and not by its wording, with one exception (`noHistory`). A field
+ * missing or of an unknown value counts too: empty only for an answer CommitLore itself calls whole.
+ *
+ * The exception is the one diagnostic that is about the path rather than the answer's coverage: CommitLore's fixed
+ * template (`pathPresenceDiagnostics`) for a path no commit in the history it read ever held, with that exact path
+ * at its start and, optionally, its fixed hint naming an ancestor that does have history. It is recognised only in
+ * that exact form; any other wording, or another path, is an ordinary diagnostic and counts.
+ */
+const pathWithoutHistory = (path: string): RegExp =>
+  new RegExp(
+    `^${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} matched no blob in the walked history, so 0 records is uninformative rather than a statement that nothing was recorded(?:; \\S+ does have history, so query that if the name has changed)?$`,
+  );
+
+const coverageGaps = (exitCode: number, context: Record<string, unknown>, path: string): { gaps: string[]; noHistory: boolean } => {
+  const shown = (value: unknown): string => JSON.stringify(value ?? null).slice(0, 60);
+  const gaps: string[] = [];
+  if (exitCode !== 0) gaps.push(`commitlore context exited ${exitCode}`);
+  if (context["coverage"] !== "complete") gaps.push(`coverage is ${shown(context["coverage"])}`);
+  if (context["unreadCommits"] !== 0) gaps.push(`unreadCommits is ${shown(context["unreadCommits"])}`);
+  if (context["history"] !== "ready") gaps.push(`history is ${shown(context["history"])}`);
+  if (context["notes"] !== "present" && context["notes"] !== "absent") gaps.push(`notes are ${shown(context["notes"])}`);
+  const diagnostics = context["diagnostics"];
+  const withoutHistory = pathWithoutHistory(path);
+  let noHistory = false;
+  if (!Array.isArray(diagnostics)) gaps.push("it reported no diagnostics list");
+  else {
+    for (const diagnostic of diagnostics) {
+      if (typeof diagnostic === "string" && withoutHistory.test(diagnostic)) noHistory = true;
+      else gaps.push(`it said: ${String(diagnostic).slice(0, 160)}`);
+    }
+  }
+  return { gaps, noHistory };
+};
+
+/** #1268 r1 — how many records `context --json` reports CommitLore withheld as `[blocked]`. */
+const blockedRecords = (records: unknown): number =>
+  Array.isArray(records) ? records.filter((record) => (record as { trust?: unknown } | null)?.trust === "blocked").length : 0;
+
 /** The required values `context --json` reports for a path, from active records CommitLore did not withhold. */
 const requiredItems = (records: unknown): CommitLoreRequiredItem[] | null => {
   if (!Array.isArray(records)) return null;
@@ -950,11 +1000,12 @@ const requiredItems = (records: unknown): CommitLoreRequiredItem[] | null => {
  * the pinned package (`prepare` with `checked: false`, as `contract` reads its text: this too is text for a
  * prompt, and the commit attempt is the one that checks).
  *
- * - Each path: `inject --path <p> --json --budget 800`, CommitLore's own pre-edit projection. Only where its
- *   budget provably cut a required value (`truncatedAt` is `warn`, `limit` or `ruled-out`; the tiers are cut
- *   from the bottom, so a cut that reaches only `other` dropped none) is `context --json` asked for every
- *   Warn, Limit and Ruled-out value of the path. An answer at any head but `baseHead`, a scan that stopped
- *   early and an unfetched notes mirror are never an answer.
+ * - Each path: first `context --json`, whose structured answer says whether CommitLore's answer for the path is
+ *   whole (`coverageGaps`; r1 P1-1): one that is not is `incomplete`, whatever else it holds. Then
+ *   `inject --path <p> --json --budget 800`, CommitLore's own pre-edit projection, which is what is delivered,
+ *   except where its budget provably cut a required value (`truncatedAt` is `warn`, `limit` or `ruled-out`; the
+ *   tiers are cut from the bottom, so a cut that reaches only `other` dropped none): then every Warn, Limit and
+ *   Ruled-out value `context` listed is. An answer at any head but `baseHead` is never an answer.
  * - Once: `guard --proposal @<file> --json` on those paths, the proposal written into `scratch`.
  * - Every command with `--no-index`: the index lives in the git dir, whose entries the turn is held to from
  *   before this lookup, and reading it rewrites its WAL files and its directory. CommitLore answers the same
@@ -1035,6 +1086,27 @@ export const commitloreBeforeChange = async (
     };
 
     const pathLookup = async (path: string): Promise<CommitLorePathLookup> => {
+      // r1 P1-1 — whether CommitLore's answer for the path is whole is read from `context --json`, its structured
+      // answer, and never from what `inject` printed: with the notes mirror unfetched, `inject` exits 0 with
+      // nothing to say, and the only sign is a line on its stderr.
+      let listed: CommitLoreRun;
+      try {
+        listed = await command(["context", "--json", "--no-index", "--", path]);
+      } catch (error) {
+        return failedLookup(path, `commitlore context did not answer: ${(error as Error).message.slice(0, 300)}`);
+      }
+      const context = listed.exitCode === 0 || listed.exitCode === 3 ? parsedObject(listed.stdout) : null;
+      const items = context === null ? null : requiredItems(context["records"]);
+      if (context === null || items === null) {
+        return failedLookup(path, `commitlore context exited ${listed.exitCode} without its answer: ${tail(listed.stderr)}`);
+      }
+      const vantage = (context["vantage"] ?? {}) as { head?: unknown };
+      if (vantage.head !== request.baseHead) return failedLookup(path, `commitlore context answered at ${String(vantage.head)}, not at the turn's base ${request.baseHead}`);
+      const blocked = blockedRecords(context["records"]);
+      const { gaps, noHistory } = coverageGaps(listed.exitCode, context, path);
+      if (gaps.length > 0) {
+        return { path, outcome: "incomplete", text: "", cacheKey: null, withheld: blocked, items: null, detail: `CommitLore's answer for this path is not whole: ${gaps.join("; ")}`.slice(0, 400) };
+      }
       let injected: CommitLoreRun;
       try {
         injected = await command(["inject", "--path", path, "--json", "--budget", INJECT_BUDGET_TOKENS, "--no-index"]);
@@ -1047,28 +1119,12 @@ export const commitloreBeforeChange = async (
         return failedLookup(path, `commitlore inject exited ${injected.exitCode} without its projection: ${tail(injected.stderr)}`);
       }
       if (head !== request.baseHead) return failedLookup(path, `commitlore inject answered at ${head || "no commit"}, not at the turn's base ${request.baseHead}`, cacheKey);
-      const answered = { path, text, cacheKey, withheld, items: null, detail: null };
+      const answered = { path, text, cacheKey, withheld: Math.max(withheld, blocked), items: null, detail: null, noHistory };
       if (INJECT_SCAN_INCOMPLETE.test(text)) {
         return { ...answered, outcome: "incomplete", detail: "CommitLore's scan stopped at its time budget, so records for this path may be missing" };
       }
+      // Only where `inject`'s budget provably dropped a required value does the section carry `context`'s list.
       if (typeof truncatedAt !== "string" || !REQUIRED_TIERS.has(truncatedAt)) return { ...answered, outcome: "answered" };
-      // `inject` provably dropped a required value: `context` lists every one.
-      let listed: CommitLoreRun;
-      try {
-        listed = await command(["context", "--json", "--no-index", "--", path]);
-      } catch (error) {
-        return failedLookup(path, `inject's budget cut a required value and commitlore context did not answer: ${(error as Error).message.slice(0, 300)}`, cacheKey);
-      }
-      const context = listed.exitCode === 0 || listed.exitCode === 3 ? parsedObject(listed.stdout) : null;
-      const items = context === null ? null : requiredItems(context["records"]);
-      const vantage = (context?.["vantage"] ?? {}) as { head?: unknown };
-      if (context === null || items === null) {
-        return failedLookup(path, `inject's budget cut a required value and commitlore context exited ${listed.exitCode} without its answer: ${tail(listed.stderr)}`, cacheKey);
-      }
-      if (vantage.head !== request.baseHead) return failedLookup(path, `commitlore context answered at ${String(vantage.head)}, not at the turn's base ${request.baseHead}`, cacheKey);
-      if (listed.exitCode === 3 || context["coverage"] !== "complete" || context["unreadCommits"] !== 0) {
-        return { ...answered, outcome: "incomplete", detail: "commitlore context's answer is incomplete (its scan was truncated or its notes mirror is unfetched), so records may be missing" };
-      }
       return { ...answered, outcome: "answered", items };
     };
 
