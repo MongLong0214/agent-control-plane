@@ -11,9 +11,9 @@ import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../capacit
 import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
 import { RECONCILE_SWEEP_BUDGET_MS } from "../conversation/turn-coordinator.ts";
 import {
-  CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX,
   CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON,
   CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON,
+  CONTINUITY_RUNTIME_LOST_REVOCATION_REASON,
   type RequiredRole,
   type RoleCoveragePlan,
   coverageRevocationReason,
@@ -26,9 +26,9 @@ import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-c
 import type { BuzzMentionCounters } from "../buzz/buzz-mention-subscriber.ts";
 import {
   CONTINUITY_MODE_MAX_AGE_MS,
-  CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX,
   CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON,
   CONTINUITY_PAUSE_OWNER_FIELDS,
+  CONTINUITY_PAUSE_RUNTIME_LOST_REASON,
 } from "../run/run-engine.ts";
 import { BOOTSTRAP_PLAN_TASKS, receiptProcessIsRunning } from "../run/task-graph.ts";
 import { TASK_WRITE_TARGET_RECORDED, TaskWriteTargets } from "../run/task-write-target.ts";
@@ -1981,8 +1981,16 @@ export class Daemon {
         );
         if (!failedOver.allowed) {
           unresolved.push({ roleKey: required.roleKey, reasonCode: failedOver.reasonCode });
-          pausedRuns.push(...this.pauseAffectedRuns(required, `${CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX}${failedOver.reasonCode}`));
-          this.revokePausedBinding(required, `${CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX}${failedOver.reasonCode}`);
+          // Every failover this loop asks for follows a lost runtime: `currentStillCovered` keeps a READY
+          // incumbent whose runtime is not UNAVAILABLE and whose process is live or unrecorded, so a role
+          // reaches here only with its session gone or not READY, its runtime UNAVAILABLE, or its recorded
+          // process dead. The revocation says so. The refused failover's own reason code (an admission
+          // refusal, or a canonical CTO that is never failed over) is recorded beside it, never as it: a
+          // CTO whose process died under HEALTHY readings was read as a capacity problem (2026-11-07).
+          pausedRuns.push(...this.pauseAffectedRuns(required, CONTINUITY_PAUSE_RUNTIME_LOST_REASON));
+          this.revokePausedBinding(required, CONTINUITY_RUNTIME_LOST_REVOCATION_REASON, {
+            evidence: { failoverRefusal: failedOver.reasonCode },
+          });
           continue;
         }
 
@@ -2277,12 +2285,17 @@ export class Daemon {
    * resume it through a late message. BindingRegistry fences queued/in-flight outbox rows
    * in the same transaction; blocked runs are the documented revocation exception.
    */
-  private revokePausedBinding(required: RequiredRole, reason: string, options: { allowHeldRuns?: boolean } = {}): void {
+  private revokePausedBinding(
+    required: RequiredRole,
+    reason: string,
+    options: { allowHeldRuns?: boolean; evidence?: Readonly<Record<string, string>> } = {},
+  ): void {
     const current = this.cp.bindings.active(required.roleKey);
     if (!current) return;
     const revoked = this.cp.bindings.revoke(required.roleKey, reason, {
       allowBlockedRuns: true,
       ...(options.allowHeldRuns === true ? { allowHeldRuns: true } : {}),
+      ...(options.evidence === undefined ? {} : { evidence: options.evidence }),
       // A run's BOOTSTRAP_CTO revoked here is the one continuity recovers on its own session at the
       // next generation (`BootstrapCtoStaffing.recover` accepts exactly these continuity reasons), so
       // a resolution still queued for it is held for that renewal rather than lost to the outage.
@@ -2296,7 +2309,7 @@ export class Daemon {
         roleKey: required.roleKey,
         sessionId: current.sessionId,
         reasonCode: revoked.reasonCode,
-        evidence: { reason, generation: current.bindingGeneration },
+        evidence: { ...options.evidence, reason, generation: current.bindingGeneration },
       });
     }
   }

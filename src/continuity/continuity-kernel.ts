@@ -137,8 +137,20 @@ export const coverageRevocationReason = (measured: { runtimeLost: boolean; quota
 export const CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON =
   "continuity failover did not leave a ready planned binding";
 
-/** The prefix of the third such reason, whose tail is the refused failover's reason code. */
+/**
+ * The prefix of the third such reason, whose tail is the refused failover's reason code. No longer
+ * written: a refused failover is recorded as the runtime loss below. Kept for the rows that carry it.
+ */
 export const CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX = "continuity failover refused: ";
+
+/**
+ * A bound role lost its runtime (its session is gone or no longer READY, its runtime was measured
+ * UNAVAILABLE, or its recorded process is dead) and continuity did not put another behind it: the
+ * failover was refused, or the role is a canonical CTO that is never failed over. The refused
+ * failover's reason code is recorded beside it on the revocation (`failoverRefusal`), never as it, so
+ * an admission refusal is not read as the cause of a lost runtime.
+ */
+export const CONTINUITY_RUNTIME_LOST_REVOCATION_REASON = "the bound runtime was lost and continuity did not fail it over";
 
 /**
  * #246 C1b — the fourth: a bootstrap CTO's same-session recovery renewed the binding and then could
@@ -163,6 +175,7 @@ export const CONTINUITY_REVOCATION_REASONS: readonly string[] = [
   CONTINUITY_CAPACITY_AND_RUNTIME_REVOCATION_REASON,
   CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON,
   CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON,
+  CONTINUITY_RUNTIME_LOST_REVOCATION_REASON,
 ];
 
 /**
@@ -615,6 +628,15 @@ export class ContinuityKernel {
     // a binding that arrives while evaluation or admission is awaited is refused, never replaced.
     const fenced = role === Role.PRIMARY_CTO ? this.bindings.active(roleKey) : null;
     if (fenced && drivenModeOf(this.db, fenced.sessionId) !== "NONE") return drivenPrimaryNotReplaceable(roleKey, fenced.sessionId);
+    // Nor one under canonical self-claim (`isAdoptedCanonicalRuntime`, the rule the outbox and
+    // `CtoLifecycle` share): its runtime is a conversation no provider launched. A failover would start
+    // a fresh headless session and move the actor onto it, and that session records no process, so the
+    // conversation's own restart could not prove its predecessor gone and claim the role back
+    // (`CanonicalSelfClaim`). Refused before anything is measured or started; the daemon revokes the
+    // role for its lost runtime and the conversation's resume and self-claim take it back.
+    if (fenced && isAdoptedCanonicalRuntime(this.db, fenced.sessionId, fenced.assignmentId)) {
+      return canonicalPrimaryNotReplaceable(roleKey, fenced.sessionId);
+    }
     const plan = await this.evaluate(`failover:${roleKey}`);
     const assignment = plan.assignments.find((a) => a.roleKey === roleKey);
     const required = plan.requiredRoles.find((candidate) => candidate.roleKey === roleKey);
@@ -632,22 +654,24 @@ export class ContinuityKernel {
     // capability immediately before `startSession` (§14.2). Worker failover remains a
     // lower-priority allocation and therefore carries the same dynamic reserve as fan-out.
     //
-    // #246 — a role with a fixed runtime is admitted against its own role-scoped reading, the one it
-    // was staffed under, so a Claude-to-Claude failover can be admitted at all; every other role
-    // keeps the provider-level admission it had.
-    const fixedRole = fixedRuntimes(role).length > 0 && this.providers.hasRoleScoped(assignment.provider) ? role : undefined;
+    // #246 — a role on a provider with role-scoped adapters is admitted against its own role-scoped
+    // reading, the one it was staffed under, as the canonical CTO restore is: that provider has no
+    // provider-level reading, and admission refuses a role-less target for it, so without the role no
+    // Claude-to-Claude failover could be admitted at all. Every other provider keeps the provider-level
+    // admission it had.
+    const scopedRole = this.providers.hasRoleScoped(assignment.provider) ? role : undefined;
     const switchTarget: DispatchCapacityTarget =
       required.capability === "worker"
         ? {
             provider: assignment.provider,
-            ...(fixedRole ? { role: fixedRole } : {}),
+            ...(scopedRole ? { role: scopedRole } : {}),
             capabilities: [required.capability],
             priority: "worker",
-            reserveDemand: this.capacity.workerReserveDemand(assignment.provider, fixedRole),
+            reserveDemand: this.capacity.workerReserveDemand(assignment.provider, scopedRole),
           }
         : {
             provider: assignment.provider,
-            ...(fixedRole ? { role: fixedRole } : {}),
+            ...(scopedRole ? { role: scopedRole } : {}),
             capabilities: [required.capability],
             priority: "critical",
           };
@@ -1657,6 +1681,13 @@ const drivenPrimaryNotReplaceable = <T>(roleKey: string, sessionId: string): Dec
   deny(
     ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED,
     "a driven primary CTO is never failed over to another session; it is recovered on its own",
+    { roleKey, sessionId },
+  );
+
+const canonicalPrimaryNotReplaceable = <T>(roleKey: string, sessionId: string): Decision<T> =>
+  deny(
+    ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED,
+    "a canonical primary CTO is never failed over to another runtime; its own conversation claims the role back",
     { roleKey, sessionId },
   );
 

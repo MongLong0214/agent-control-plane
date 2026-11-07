@@ -922,6 +922,12 @@ export class BindingRegistry {
        * — rejects them as before.
        */
       holdEscalationRepliesForRenewal?: boolean;
+      /**
+       * Further facts for this revocation's BINDING_REVOKED record, beside `reason` and `generation`,
+       * which it never replaces. Continuity's runtime-loss revocation names the refused failover's
+       * reason code here. Absent, the record is exactly `{ reason, generation }`.
+       */
+      evidence?: Readonly<Record<string, string | number | boolean | null>>;
     } = {},
   ): Decision<void> {
     return this.db.tx(() => {
@@ -976,7 +982,7 @@ export class BindingRegistry {
         kind: "BINDING_REVOKED",
         roleKey,
         sessionId: current.sessionId,
-        evidence: { reason, generation: current.bindingGeneration },
+        evidence: { ...options.evidence, reason, generation: current.bindingGeneration },
       });
       this.#notifySwitch({ ...current, status: "REVOKED" });
       return allow(ReasonCode.OK, undefined);

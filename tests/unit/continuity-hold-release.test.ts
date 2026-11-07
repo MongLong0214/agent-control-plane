@@ -16,6 +16,7 @@ import {
   roleKeyFor,
 } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
+import { CONTINUITY_PAUSE_RUNTIME_LOST_REASON } from "../../src/run/run-engine.ts";
 import { standardWorkContinuationTriggerKind } from "../../src/runtime/provisioned-session-runtime.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { drivenPrimary } from "../helpers/driven-primary-cto.ts";
@@ -195,7 +196,7 @@ const pin = (f: BootstrapRuntimeFixture, runId: string) => {
 /** Continuity's own hold, as the CEO's loss leaves it. */
 const expectHeld = (f: BootstrapRuntimeFixture, runId: string) => {
   const run = f.harness.cp.runs.require(runId);
-  expect(run).toMatchObject({ state: RunState.BLOCKED, continuityHoldRoleKey: CEO, stateReason: "failover refused: SESSION_NOT_READY" });
+  expect(run).toMatchObject({ state: RunState.BLOCKED, continuityHoldRoleKey: CEO, stateReason: CONTINUITY_PAUSE_RUNTIME_LOST_REASON });
 };
 
 const expectReleased = (f: BootstrapRuntimeFixture, runId: string) => {
