@@ -1,4 +1,5 @@
 import { isDaemonFinalizerCompletion, type CompletionAuthority } from './run-engine.ts';
+import { TASK_COMMITLORE_FIELD, taskCommitloreProblem } from "../bootstrap/commitlore-mode.ts";
 import { parseRepoFactoryResult } from "../bootstrap/repo-factory-result.ts";
 import type { Clock } from "../core/clock.ts";
 import type {
@@ -363,6 +364,16 @@ export class TaskGraph {
     const keys = new Set(specs.map((s) => s.key));
     if (keys.size !== specs.length) {
       return deny(ReasonCode.INVALID_ARGUMENT, "duplicate task keys in submission", { runId });
+    }
+    // GAP 1 — a task's CommitLore setting is read fail closed here, before anything is written: exactly
+    // `{ capture: "required" }`, or none. Any other value refuses the whole submission rather than being dropped.
+    for (const spec of specs) {
+      const problem = taskCommitloreProblem(spec.spec ?? {});
+      if (problem !== null) {
+        return deny(ReasonCode.INVALID_ARGUMENT, `task '${spec.key}': ${problem}`, {
+          runId, refusal: "TASK_COMMITLORE_SETTING_INVALID", task: spec.key, field: TASK_COMMITLORE_FIELD,
+        });
+      }
     }
 
     const existingByTitle = new Map(this.list(runId).map((t) => [t.title, t.taskId]));

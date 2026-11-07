@@ -2,11 +2,13 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
+import { taskCaptureRequired } from "../bootstrap/commitlore-mode.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { acpScratchDir } from "../core/scratch-root.ts";
 import type { Db } from "../db/database.ts";
+import { TaskState } from "../domain/types.ts";
 import type { SnapshotIntegration } from "../snapshot/candidate-snapshot.ts";
 import { TASK_CORRECTION_REGISTERED, type TaskRecord, tasksBuildingOn } from "./task-graph.ts";
 import { type StartsFrom, TASK_WRITE_TARGET_RECORDED, recordedWriteTarget, startOf } from "./task-write-target.ts";
@@ -1056,6 +1058,97 @@ const unaccounted = (commitlore: unknown, message: string): ForeignCommitRefusal
   if ((outcome === "empty") !== (recordIds.length === 0)) return "COMMITLORE_EVIDENCE_MALFORMED";
   const carried = recordIdsOf(message);
   return carried.length === recordIds.length && carried.every((id, at) => id === recordIds[at]) ? null : "RECORD_IDS_MISMATCH";
+};
+
+/** GAP 1 — why a task whose registered spec requires a CommitLore capture is not accounted for at freeze. */
+export type TaskCaptureRefusal =
+  /** The task is not SUCCEEDED (FAILED, CANCELLED, never run), or no SUCCEEDED receipt of it reads back. */
+  | "CAPTURE_RECEIPT_MISSING"
+  /** The commit its receipt names cannot be read in the run's checkout of the receipt's repository. */
+  | "OBJECT_UNREADABLE"
+  /** Its receipt's CommitLore evidence does not account for that commit: `unaccounted`'s answer, a receipt's refusals only. */
+  | ForeignCommitRefusal;
+
+export interface TaskCaptureGap {
+  taskId: string;
+  state: string;
+  refusal: TaskCaptureRefusal;
+  /** The commit the task's receipt names, which is the commit the freeze integrates for it. */
+  commit?: string;
+  repositoryIdentity?: string;
+}
+
+/**
+ * GAP 1 — the CommitLore evidence of exactly the receipt `succeededTaskCommits` read a task's commit from: the
+ * SUCCEEDED row of that execution and result digest, latest first, as it reads it. Undefined when it carries none.
+ */
+const receiptCommitLore = (db: Db, receipt: SucceededTaskCommit): unknown => {
+  const row = db.get<{ evidence: string }>(
+    `SELECT evidence_json AS evidence FROM audit_events
+      WHERE kind = ? AND json_extract(evidence_json, '$.executionId') = ? AND json_extract(evidence_json, '$.resultDigest') = ?
+      ORDER BY event_id DESC LIMIT 1`,
+    [WorkerTurnEvent.SUCCEEDED, receipt.executionId, receipt.resultDigest],
+  );
+  return row === undefined ? undefined : (JSON.parse(row.evidence) as { commitlore?: unknown }).commitlore;
+};
+
+/**
+ * GAP 1 — every task of the run whose registered spec requires a CommitLore capture (`taskCaptureRequired`) and that
+ * a registered correction does not supersede (`Supersession.superseded`, #1372) that is not accounted for, by task id:
+ *
+ * - a task that is not SUCCEEDED or has no SUCCEEDED receipt that reads back (`receipts`, `succeededTaskCommits`):
+ *   a FAILED task, a CANCELLED one and one never run are no exemption (CAPTURE_RECEIPT_MISSING);
+ * - one whose receipt's CommitLore evidence, outcome and record ids, is not exactly the `Record-Id` trailers re-read
+ *   from the commit that receipt names (`unaccounted`, the check a governed run's range gets), which is the commit
+ *   the freeze integrates for it: no evidence, an unknown outcome, malformed ids, or another commit's records.
+ *
+ * Whatever the run's own CommitLore mode, which keeps its own range check. Read-only, over `checkouts` (repository
+ * identity to the run's checkout); a commit that cannot be read there is not accounted for.
+ */
+export const unaccountedTaskCaptures = async (input: {
+  db: Db;
+  tasks: readonly TaskRecord[];
+  receipts: readonly SucceededTaskCommit[];
+  superseded: ReadonlySet<string>;
+  checkouts: ReadonlyMap<string, string>;
+}): Promise<Decision<TaskCaptureGap[]>> => {
+  const gaps: TaskCaptureGap[] = [];
+  const byRepository = new Map<string, Array<{ task: TaskRecord; receipt: SucceededTaskCommit }>>();
+  for (const task of input.tasks) {
+    if (!taskCaptureRequired(task.spec) || input.superseded.has(task.taskId)) continue;
+    const receipt = input.receipts.find((candidate) => candidate.taskId === task.taskId);
+    if (task.state !== TaskState.SUCCEEDED || receipt === undefined) {
+      gaps.push({ taskId: task.taskId, state: task.state, refusal: "CAPTURE_RECEIPT_MISSING" });
+      continue;
+    }
+    byRepository.set(receipt.repositoryIdentity, [...(byRepository.get(receipt.repositoryIdentity) ?? []), { task, receipt }]);
+  }
+  for (const [repositoryIdentity, owed] of byRepository) {
+    const gapOf = (task: TaskRecord, receipt: SucceededTaskCommit, refusal: TaskCaptureRefusal): TaskCaptureGap =>
+      ({ taskId: task.taskId, state: task.state, refusal, commit: receipt.commit, repositoryIdentity });
+    const checkoutPath = input.checkouts.get(repositoryIdentity);
+    if (checkoutPath === undefined) {
+      gaps.push(...owed.map(({ task, receipt }) => gapOf(task, receipt, "OBJECT_UNREADABLE")));
+      continue;
+    }
+    const read = await withPinned<TaskCaptureGap[]>(checkoutPath, "acp-candidate-task-capture-", async (repo) => {
+      const found: TaskCaptureGap[] = [];
+      for (const { task, receipt } of owed) {
+        const shown = OBJECT_ID.test(receipt.commit) ? await runPinnedGit(repo, ["cat-file", "commit", receipt.commit]) : null;
+        if (shown === null || shown.exitCode !== 0) {
+          found.push(gapOf(task, receipt, "OBJECT_UNREADABLE"));
+          continue;
+        }
+        const split = shown.stdout.indexOf("\n\n");
+        const refusal = unaccounted(receiptCommitLore(input.db, receipt), split === -1 ? "" : shown.stdout.slice(split + 2));
+        if (refusal !== null) found.push(gapOf(task, receipt, refusal));
+      }
+      return allow(ReasonCode.OK, found);
+    });
+    if (!read.allowed) return read;
+    gaps.push(...read.value);
+  }
+  return allow(ReasonCode.OK, gaps.sort((a, b) => (a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0)));
 };
 
 /**

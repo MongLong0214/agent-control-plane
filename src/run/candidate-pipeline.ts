@@ -68,6 +68,7 @@ import {
   succeededTaskCommits,
   supersessionOf,
   undoCandidateRefLines,
+  unaccountedTaskCaptures,
 } from "./candidate-integration.ts";
 import type { RunEngine, TaskContract } from "./run-engine.ts";
 import type { TaskGraph } from "./task-graph.ts";
@@ -459,6 +460,24 @@ export class CandidatePipeline {
     if (!superseding.allowed) return superseding as Decision<CandidateSnapshot>;
     const supersession = superseding.value;
     const results = commits.filter((commit) => !supersession.superseded.has(commit.taskId));
+    // GAP 1 — every task whose registered spec requires a CommitLore capture accounts for it with its own receipt,
+    // whatever the run's mode, before anything is built or written. Only a registered correction's supersession
+    // (#1372) exempts one: a FAILED or CANCELLED task, or one with no receipt, refuses the freeze.
+    const captures = await unaccountedTaskCaptures({
+      db: this.db,
+      tasks: this.tasks.list(runId),
+      receipts: commits,
+      superseded: supersession.superseded,
+      checkouts: new Map(participants.map((repo) => [repo.identity, repo.checkoutPath])),
+    });
+    if (!captures.allowed) return captures as Decision<CandidateSnapshot>;
+    if (captures.value.length > 0) {
+      return deny(
+        ReasonCode.VERIFICATION_GAP,
+        "a task whose registered spec requires a CommitLore capture has no SUCCEEDED receipt whose CommitLore evidence accounts for its own commit; nothing was frozen",
+        { runId, refusal: "TASK_CAPTURE_UNACCOUNTED", tasks: captures.value },
+      );
+    }
     const repositories: SnapshotRepositoryInput[] = [];
     // #1268 — every merge commit the integration makes has its message checked by CommitLore when the run requires it.
     const checkMergeMessages = this.checkMergeMessages(runId);
