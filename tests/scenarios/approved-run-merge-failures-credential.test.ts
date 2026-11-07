@@ -1,6 +1,3 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { acpError, deny } from "../../src/core/errors.ts";
@@ -348,6 +345,8 @@ describe("#1189 §0 — an approved run never waits on a person for a GitHub cre
     const loader = loaderWhile(fixture, () => unavailable);
     const install = vi.spyOn(store, "install");
     expect(await start(daemon)).toBe(true);
+    const files = store.sensitivePaths();
+    const identity = store.creatorIdentity();
     unavailable = false;
     const reads = loader.mock.calls.length;
     harness.clock.advance(MINUTE);
@@ -357,14 +356,14 @@ describe("#1189 §0 — an approved run never waits on a person for a GitHub cre
     expect(loader.mock.calls.length - reads).toBe(1);
     expect(loader.mock.contexts.every((context) => context === store)).toBe(true);
     expect(install).not.toHaveBeenCalled();
+    // The same store, reading the same credential files, as the same App: none replaced, swapped or added.
+    expect(harness.cp.credentials).toBe(store);
+    expect(store.sensitivePaths()).toEqual(files);
+    expect(store.creatorIdentity()).toBe(identity);
     // The retry addresses the same repository as the refused attempt, and merges into the one the run declares.
     const repositories = new Set(fixture.github.calls.map((call) => /^\/repos\/([^/]+\/[^/?]+)/.exec(call.path)?.[1]).filter(Boolean));
     expect(repositories.size).toBe(1);
     expect(auditOf(fixture, "MERGE_EXECUTED").map((entry) => entry.evidence.repositoryIdentity)).toEqual([driven.identity]);
-    // The finalizer reaches credentials only through the daemon's store: its loader and its permission probe.
-    const source = readFileSync(join(process.cwd(), "src/daemon/finalizer.ts"), "utf8");
-    expect(new Set([...source.matchAll(/this\.cp\.credentials\.(\w+)/g)].map((match) => match[1]))).toEqual(new Set(["availability", "authenticate"]));
-    expect(source).not.toMatch(/TrustedCredentialStore|\.install\(|credentials\s*=/);
     await daemon.stop();
   });
 
