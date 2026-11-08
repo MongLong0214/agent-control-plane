@@ -119,6 +119,53 @@ function recordPostMergeReceipt(
   return receiptId;
 }
 
+/**
+ * A bootstrap run's producer result as the runner stores it, with CI evidence at the project's head, and
+ * a doctor report: `activation` is the one activation stores right after the result once every check on
+ * it passed; `other-source` a report from elsewhere; `before` activation's report stored before the result.
+ */
+function storeBootstrapResult(
+  h: Harness,
+  project: { projectId: string; identity: string; head: string; activeDigest: string },
+  input: { marker: "activation" | "other-source" | "before"; workflowDigest?: string; evidenceHead?: string },
+): { runId: string; artifactId: string } {
+  const runId = `run_boot_${Math.random().toString(16).slice(2, 10)}`;
+  h.cp.db.run(
+    `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal, contract_digest, created_at)
+     VALUES (?, ?, 'PROJECT_BOOTSTRAP', 'STANDARD', 'NORMAL', 'COMPLETED', 'bootstrap fixture', 'sha256:contract', ?)`,
+    [runId, project.projectId, h.clock.nowIso()],
+  );
+  const at = h.clock.nowIso();
+  const doctorReport = (source: string) => h.cp.artifacts.put(runId, "DOCTOR_REPORT", {
+    source,
+    projectId: project.projectId,
+    report: { scope: "project", target: project.projectId, status: "HEALTHY", findings: [], ranAt: at },
+  });
+  if (input.marker === "before") doctorReport("bootstrap-activation");
+  const stored = h.cp.artifacts.put(runId, "REPO_FACTORY_RESULT", {
+    schema: "repo-factory.result.v2",
+    runId,
+    bootstrapOperationId: "op-bootstrap",
+    planDigest: "sha256:plan",
+    projectManifestDigest: project.activeDigest,
+    repositories: [{ role: "primary", identity: project.identity, proposedCheckoutPath: null, defaultBranch: "main", createdBranches: [] }],
+    externalWriteReceipts: [{
+      bootstrapOperationId: "op-bootstrap", requestDigest: "sha256:request", operationId: "create", resourceType: "repository",
+      resourceIdentity: project.identity, preexisting: false, beforeStateDigest: null, afterStateDigest: null,
+      createdAt: at, rereadAt: at, verified: true,
+    }],
+    bootstrapVerification: [{ commandId: "clean-tree", repositoryIdentity: project.identity, exactHead: project.head, status: "PASS" }],
+    ciEvidence: [{
+      repositoryIdentity: project.identity, checkName: WORKFLOW.checkName, head: input.evidenceHead ?? project.head,
+      conclusion: "PASS", workflowDigest: input.workflowDigest ?? WORKFLOW.approvedDigest,
+    }],
+    unresolvedGaps: [],
+  });
+  if (input.marker === "activation") doctorReport("bootstrap-activation");
+  if (input.marker === "other-source") doctorReport("watchdog");
+  return { runId, artifactId: stored.artifactId };
+}
+
 async function declaredProject(h: Harness) {
   const registered = await registerFixtureProject(h, "ci-project", { ciWorkflows: [DECLARED] });
   const activeDigest = h.cp.projects.get(registered.projectId)!.activeManifestDigest!;
@@ -161,6 +208,7 @@ describe("project_get CI section (#1257)", () => {
       repositoryIdentity: project.identity,
       repositoryHead: { commitSha: project.head, observedAt: expect.any(String) },
       lastObserved: null,
+      observedAtHead: null,
       latestNonResult: null,
       unobserved: true,
       unobservedReason: "NO_RECORDED_OBSERVATION",
@@ -510,6 +558,8 @@ describe("project_get CI status (#1172)", () => {
         source: { kind: "POST_MERGE_VERIFY_RECEIPT", receiptId, runId },
       },
     });
+    const workflow = onlyWorkflow(view.ci);
+    expect(workflow.observedAtHead).toEqual(workflow.lastObserved);
     expect(view.project.availability).toBe("HEALTHY");
   });
 
@@ -566,8 +616,106 @@ describe("project_get CI status (#1172)", () => {
       status: "DECLARED_UNOBSERVED",
       repositoryHead: { commitSha: newer },
       lastObserved: { result: "PASS", commitSha: project.head, staleReasons: ["OLDER_COMMIT"] },
+      observedAtHead: null,
     });
     expect(view.project.availability).toBe("HEALTHY");
+  });
+
+  it("keeps a current-head failure DECLARED_OBSERVED as FAIL when a delayed success for an older SHA lands after it", async () => {
+    const h = makeHarness();
+    const project = await declaredProject(h);
+    const runId = seedObservingRun(h, project.projectId, project.repositoryId, project.activeDigest);
+    const failId = recordCiVerification(h, {
+      runId, identity: project.identity, head: project.head, status: "FAIL",
+      reasonCode: ReasonCode.VERIFICATION_CI_CHECK_FAILED, at: "2026-08-12T01:00:00.000Z",
+    });
+    const older = "e".repeat(40);
+    const receiptId = recordPostMergeReceipt(h, {
+      runId, identity: project.identity, commitSha: older, conclusion: "success", at: "2026-08-12T02:00:00.000Z",
+    });
+
+    const view = await projectGet(h, project.projectId);
+
+    expect(view.ci.status).toBe("DECLARED_OBSERVED");
+    expect(onlyWorkflow(view.ci)).toMatchObject({
+      status: "DECLARED_OBSERVED",
+      repositoryHead: { commitSha: project.head },
+      observedAtHead: { result: "FAIL", commitSha: project.head, source: { kind: "CI_VERIFICATION_RESULT", resultId: failId } },
+      // The newer success stays shown, as the older commit's.
+      lastObserved: { result: "PASS", commitSha: older, staleReasons: ["OLDER_COMMIT"], source: { receiptId } },
+    });
+    expect(view.project.availability).toBe("HEALTHY");
+  });
+
+  it("reads a bootstrap's activation-validated CI evidence as an observation at its head, its source named", async () => {
+    const h = makeHarness();
+    const project = await declaredProject(h);
+    const { runId, artifactId } = storeBootstrapResult(h, project, { marker: "activation" });
+
+    const view = await projectGet(h, project.projectId);
+
+    expect(view.ci.status).toBe("DECLARED_OBSERVED");
+    expect(onlyWorkflow(view.ci)).toMatchObject({
+      status: "DECLARED_OBSERVED",
+      observedAtHead: {
+        result: "PASS",
+        conclusion: "PASS",
+        commitSha: project.head,
+        source: { kind: "BOOTSTRAP_CI_EVIDENCE", artifactId, runId },
+        approvedDigestAtObservation: WORKFLOW.approvedDigest,
+        freshness: "current",
+        staleReasons: [],
+      },
+    });
+    expect(view.project.availability).toBe("HEALTHY");
+  });
+
+  it.each([
+    ["only another doctor report follows it", { marker: "other-source" }],
+    ["it was stored after activation's report", { marker: "before" }],
+    ["its workflow digest is not the approved one", { marker: "activation", workflowDigest: "sha256:another-workflow" }],
+    ["it names a head its verification does not", { marker: "activation", evidenceHead: "f".repeat(40) }],
+  ] as const)("does not read bootstrap CI evidence when %s", async (_why, input) => {
+    const h = makeHarness();
+    const project = await declaredProject(h);
+    storeBootstrapResult(h, project, input);
+
+    const view = await projectGet(h, project.projectId);
+
+    expect(view.ci.status).toBe("DECLARED_UNOBSERVED");
+    expect(onlyWorkflow(view.ci)).toMatchObject({ lastObserved: null, observedAtHead: null, unobservedReason: "NO_RECORDED_OBSERVATION" });
+  });
+
+  it("gives doctor scope \"project\" the same CI section through the doctor door, its status unchanged", async () => {
+    const h = makeHarness();
+    const project = await declaredProject(h);
+    const unobserved = await h.cp.doctor.run("project", project.projectId);
+    const runId = seedObservingRun(h, project.projectId, project.repositoryId, project.activeDigest);
+    recordPostMergeReceipt(h, {
+      runId, identity: project.identity, commitSha: project.head, conclusion: "success", at: "2026-08-12T01:00:00.000Z",
+    });
+    const server = createHermesServer(createHermesMcpPort(h.cp), () => allow(ReasonCode.OK, { actor: "operator" }));
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const client = new Client({ name: "project-ci-doctor", version: "1" });
+    await client.connect(clientTransport);
+    let doctor: { status: string; findings: unknown[]; ci?: unknown };
+    try {
+      const result = await client.callTool({ name: "doctor_run", arguments: { scope: "project", target: project.projectId } });
+      doctor = (result.structuredContent as { value: typeof doctor }).value;
+    } finally {
+      await client.close();
+      await server.close();
+    }
+
+    const ci = (await projectGet(h, project.projectId)).ci;
+    expect(ci.status).toBe("DECLARED_OBSERVED");
+    expect(doctor.ci).toEqual([{ projectId: project.projectId, ci }]);
+    // Beside the doctor's status, never part of it: unobserved and observed CI give the same status and findings.
+    expect(unobserved.ci).toMatchObject([{ projectId: project.projectId, ci: { status: "DECLARED_UNOBSERVED" } }]);
+    expect(doctor.status).toBe(unobserved.status);
+    expect(doctor.findings).toEqual(unobserved.findings);
+    expect("ci" in (await h.cp.doctor.run("cto", project.projectId))).toBe(false);
   });
 
   it("reads UNKNOWN with the reason when the observation lookup is unavailable", async () => {

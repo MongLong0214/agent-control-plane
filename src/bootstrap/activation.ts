@@ -532,6 +532,16 @@ export class BootstrapActivation {
       this.projects.setAvailability(projectId, "UNAVAILABLE", "bootstrap activation doctor report");
     }
 
+    // §26.3 — the factory result and doctor observation are retained for retry. Neither
+    // is an activation result: only the CEO-confirm transaction can write that claim. Stored before
+    // the result below is built, so its `ci` reads this run's CI evidence as validated (#1172).
+    this.artifacts.put(input.runId, ArtifactKind.REPO_FACTORY_RESULT, result);
+    this.artifacts.put(input.runId, ArtifactKind.DOCTOR_REPORT, {
+      source: "bootstrap-activation",
+      projectId,
+      report,
+    });
+
     const project = this.projects.require(projectId);
     const activation: ACPBootstrapActivationResult = {
       schema: "agent-control-plane.bootstrap-activation.v1",
@@ -554,15 +564,6 @@ export class BootstrapActivation {
       completedAt: this.clock.nowIso(),
       warnings: activationWarnings(input.approvedManifest, commitlore.value.observed),
     };
-
-    // §26.3 — the factory result and doctor observation are retained for retry. Neither
-    // is an activation result: only the CEO-confirm transaction can write that claim.
-    this.artifacts.put(input.runId, ArtifactKind.REPO_FACTORY_RESULT, result);
-    this.artifacts.put(input.runId, ArtifactKind.DOCTOR_REPORT, {
-      source: "bootstrap-activation",
-      projectId,
-      report,
-    });
 
     const incomplete = this.incompleteness(activation, report);
     if (incomplete.length > 0) {
