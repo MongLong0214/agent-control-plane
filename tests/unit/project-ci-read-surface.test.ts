@@ -1,6 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { afterAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { allow } from "../../src/core/errors.ts";
@@ -13,6 +13,7 @@ import { cleanupTempDirs, commitAll, gitSync, tempDir, writeFiles } from "../hel
 import { fixtureManifest, makeHarness, registerFixtureProject, type Harness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
+afterEach(() => vi.restoreAllMocks());
 
 /**
  * #1257 — `project_get` and `agentctl project list` carry a CI section read from the active manifest
@@ -126,13 +127,13 @@ async function declaredProject(h: Harness) {
 }
 
 describe("project_get CI section (#1257)", () => {
-  it("reports CI undeclared when the project has no active manifest", async () => {
+  it("reports CI UNKNOWN, never undeclared, when the project has no active manifest (#1172)", async () => {
     const h = makeHarness();
     expect(h.cp.projects.register({ projectId: "bare-project", name: "bare" }).allowed).toBe(true);
 
     const view = await projectGet(h, "bare-project");
 
-    expect(view.ci).toEqual({ declared: false, reason: "NO_ACTIVE_MANIFEST", manifestDigest: null });
+    expect(view.ci).toEqual({ status: "UNKNOWN", declared: null, reason: "NO_ACTIVE_MANIFEST", manifestDigest: null });
     expect(view.project.availability).toBe("HEALTHY");
   });
 
@@ -143,7 +144,7 @@ describe("project_get CI section (#1257)", () => {
 
     const view = await projectGet(h, projectId);
 
-    expect(view.ci).toEqual({ declared: false, reason: "NO_CI_WORKFLOWS", manifestDigest: activeDigest });
+    expect(view.ci).toEqual({ status: "NOT_DECLARED", declared: false, reason: "NO_CI_WORKFLOWS", manifestDigest: activeDigest });
     expect(view.project.availability).toBe("HEALTHY");
   });
 
@@ -153,9 +154,10 @@ describe("project_get CI section (#1257)", () => {
 
     const view = await projectGet(h, project.projectId);
 
-    expect(view.ci).toMatchObject({ declared: true, manifestDigest: project.activeDigest });
+    expect(view.ci).toMatchObject({ status: "DECLARED_UNOBSERVED", declared: true, manifestDigest: project.activeDigest });
     expect(onlyWorkflow(view.ci)).toEqual({
       ...WORKFLOW,
+      status: "DECLARED_UNOBSERVED",
       repositoryIdentity: project.identity,
       repositoryHead: { commitSha: project.head, observedAt: expect.any(String) },
       lastObserved: null,
@@ -429,12 +431,164 @@ describe("project_get CI section (#1257)", () => {
     const byId = new Map(listed.map((entry) => [entry.projectId, entry]));
     expect(byId.get("bare-project")).toMatchObject({
       availability: "HEALTHY",
-      ci: { declared: false, reason: "NO_ACTIVE_MANIFEST", manifestDigest: null },
+      ci: { status: "UNKNOWN", declared: null, reason: "NO_ACTIVE_MANIFEST", manifestDigest: null },
     });
     expect(byId.get(project.projectId)?.availability).toBe("HEALTHY");
     expect(onlyWorkflow(byId.get(project.projectId)?.ci).lastObserved).toMatchObject({
       result: "PASS", source: { kind: "CI_VERIFICATION_RESULT" }, freshness: "stale",
     });
     expect(byId.get(project.projectId)?.ci).toEqual(fromProjectGet);
+  });
+});
+
+/**
+ * #1172 — one CI status beside availability: NOT_DECLARED, DECLARED_UNOBSERVED, DECLARED_OBSERVED or
+ * UNKNOWN. Observed is not passed: the result stays the workflow's own `lastObserved.result`, the
+ * declared check its `checkName`, and the target head its `repositoryHead`.
+ */
+describe("project_get CI status (#1172)", () => {
+  it("reads NOT_DECLARED only when the active manifest was read and declares no CI", async () => {
+    const h = makeHarness();
+    const { projectId } = await registerFixtureProject(h, "no-ci-project", { ciWorkflows: [] });
+
+    const view = await projectGet(h, projectId);
+
+    expect(view.ci.status).toBe("NOT_DECLARED");
+    expect(view.ci.declared).toBe(false);
+    expect(view.project.availability).toBe("HEALTHY");
+  });
+
+  it("reads UNKNOWN, not NOT_DECLARED, when the declaration cannot be read", async () => {
+    const h = makeHarness();
+    const project = await declaredProject(h);
+    vi.spyOn(h.cp.projects, "manifest").mockImplementation(() => {
+      throw new SyntaxError("Unexpected token in JSON");
+    });
+
+    const view = await projectGet(h, project.projectId);
+
+    expect(view.ci).toEqual({ status: "UNKNOWN", declared: null, reason: "ACTIVE_MANIFEST_UNREADABLE", manifestDigest: project.activeDigest });
+    expect(view.project.availability).toBe("HEALTHY");
+
+    // A manifest row that is missing reads the same way.
+    vi.spyOn(h.cp.projects, "manifest").mockReturnValue(null);
+    expect((await projectGet(h, project.projectId)).ci).toEqual({
+      status: "UNKNOWN", declared: null, reason: "ACTIVE_MANIFEST_UNREADABLE", manifestDigest: project.activeDigest,
+    });
+  });
+
+  it("reads DECLARED_UNOBSERVED when CI is declared and nothing is recorded", async () => {
+    const h = makeHarness();
+    const project = await declaredProject(h);
+
+    const view = await projectGet(h, project.projectId);
+
+    expect(view.ci.status).toBe("DECLARED_UNOBSERVED");
+    expect(onlyWorkflow(view.ci)).toMatchObject({ status: "DECLARED_UNOBSERVED", checkName: WORKFLOW.checkName, lastObserved: null });
+    expect(view.project.availability).toBe("HEALTHY");
+  });
+
+  it("reads DECLARED_OBSERVED for a success at the current head, with the check, the conclusion, the SHA and the source apart", async () => {
+    const h = makeHarness();
+    const project = await declaredProject(h);
+    const runId = seedObservingRun(h, project.projectId, project.repositoryId, project.activeDigest);
+    const receiptId = recordPostMergeReceipt(h, {
+      runId, identity: project.identity, commitSha: project.head, conclusion: "success", at: "2026-08-12T01:00:00.000Z",
+    });
+
+    const view = await projectGet(h, project.projectId);
+
+    expect(view.ci.status).toBe("DECLARED_OBSERVED");
+    expect(onlyWorkflow(view.ci)).toMatchObject({
+      status: "DECLARED_OBSERVED",
+      checkName: WORKFLOW.checkName,
+      repositoryHead: { commitSha: project.head },
+      lastObserved: {
+        result: "PASS",
+        conclusion: "success",
+        commitSha: project.head,
+        source: { kind: "POST_MERGE_VERIFY_RECEIPT", receiptId, runId },
+      },
+    });
+    expect(view.project.availability).toBe("HEALTHY");
+  });
+
+  it("reads DECLARED_OBSERVED for a failure at the current head and keeps it a FAIL, never a success", async () => {
+    const h = makeHarness();
+    const project = await declaredProject(h);
+    const runId = seedObservingRun(h, project.projectId, project.repositoryId, project.activeDigest);
+    const resultId = recordCiVerification(h, {
+      runId, identity: project.identity, head: project.head, status: "FAIL",
+      reasonCode: ReasonCode.VERIFICATION_CI_CHECK_FAILED, at: "2026-08-12T01:00:00.000Z",
+    });
+
+    const view = await projectGet(h, project.projectId);
+
+    expect(view.ci.status).toBe("DECLARED_OBSERVED");
+    expect(onlyWorkflow(view.ci)).toMatchObject({
+      status: "DECLARED_OBSERVED",
+      lastObserved: { result: "FAIL", commitSha: project.head, source: { kind: "CI_VERIFICATION_RESULT", resultId } },
+    });
+    expect(view.project.availability).toBe("HEALTHY");
+  });
+
+  it("reads an unfinished check at the current head as DECLARED_UNOBSERVED, not as observed", async () => {
+    const h = makeHarness();
+    const project = await declaredProject(h);
+    const runId = seedObservingRun(h, project.projectId, project.repositoryId, project.activeDigest);
+    recordCiVerification(h, {
+      runId, identity: project.identity, head: project.head, status: "FAIL",
+      reasonCode: ReasonCode.VERIFICATION_CI_CHECK_PENDING, at: "2026-08-12T01:00:00.000Z",
+    });
+
+    const view = await projectGet(h, project.projectId);
+
+    expect(view.ci.status).toBe("DECLARED_UNOBSERVED");
+    expect(onlyWorkflow(view.ci)).toMatchObject({ status: "DECLARED_UNOBSERVED", unobservedReason: "PENDING", lastObserved: null });
+    expect(view.project.availability).toBe("HEALTHY");
+  });
+
+  it("shows a success for another SHA as that SHA's observation and the current head as unobserved", async () => {
+    const h = makeHarness();
+    const project = await declaredProject(h);
+    const runId = seedObservingRun(h, project.projectId, project.repositoryId, project.activeDigest);
+    recordPostMergeReceipt(h, {
+      runId, identity: project.identity, commitSha: project.head, conclusion: "success", at: "2026-08-12T01:00:00.000Z",
+    });
+    writeFiles(h.repoPath, { "CHANGELOG.md": "later change\n" });
+    const newer = commitAll(h.repoPath, "later change");
+    h.cp.repositories.acknowledgeHead(project.repositoryId, newer);
+
+    const view = await projectGet(h, project.projectId);
+
+    expect(view.ci.status).toBe("DECLARED_UNOBSERVED");
+    expect(onlyWorkflow(view.ci)).toMatchObject({
+      status: "DECLARED_UNOBSERVED",
+      repositoryHead: { commitSha: newer },
+      lastObserved: { result: "PASS", commitSha: project.head, staleReasons: ["OLDER_COMMIT"] },
+    });
+    expect(view.project.availability).toBe("HEALTHY");
+  });
+
+  it("reads UNKNOWN with the reason when the observation lookup is unavailable", async () => {
+    const h = makeHarness();
+    const project = await declaredProject(h);
+    const all = h.cp.db.all.bind(h.cp.db);
+    vi.spyOn(h.cp.db, "all").mockImplementation(((sql: string, params?: unknown[]) => {
+      if (sql.includes("github_receipts")) throw new Error("SQLITE_IOERR: disk I/O error");
+      return all(sql, params as never);
+    }) as typeof h.cp.db.all);
+
+    const view = await projectGet(h, project.projectId);
+
+    expect(view.ci).toMatchObject({ status: "UNKNOWN", declared: true, manifestDigest: project.activeDigest });
+    expect(onlyWorkflow(view.ci)).toMatchObject({
+      status: "UNKNOWN",
+      checkName: WORKFLOW.checkName,
+      lastObserved: null,
+      unobserved: true,
+      unobservedReason: "OBSERVATIONS_UNREADABLE",
+    });
+    expect(view.project.availability).toBe("HEALTHY");
   });
 });

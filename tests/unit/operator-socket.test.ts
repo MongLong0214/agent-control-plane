@@ -506,7 +506,7 @@ describe("authenticated operator socket (#393/#405)", () => {
     }
   });
 
-  it("reports CI undeclared through the CLI project view instead of letting HEALTHY imply PASS", async () => {
+  it("reports CI UNKNOWN through the CLI project view instead of letting HEALTHY imply PASS", async () => {
     const running = await makeStartedOperator();
     try {
       expect(running.harness.cp.projects.register({ projectId: "cli-ci-bare", name: "CLI CI bare" }).allowed).toBe(true);
@@ -522,7 +522,8 @@ describe("authenticated operator socket (#393/#405)", () => {
         value: expect.arrayContaining([expect.objectContaining({
           projectId: "cli-ci-bare",
           availability: "HEALTHY",
-          ci: { declared: false, reason: "NO_ACTIVE_MANIFEST", manifestDigest: null },
+          // #1172 — no active manifest is missing declaration data: UNKNOWN, never NOT_DECLARED.
+          ci: { status: "UNKNOWN", declared: null, reason: "NO_ACTIVE_MANIFEST", manifestDigest: null },
         })]),
       });
     } finally {

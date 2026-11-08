@@ -1,4 +1,4 @@
-import { projectManifestSchema } from "../contracts/manifest.ts";
+import { type ProjectManifest, projectManifestSchema } from "../contracts/manifest.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { Db } from "../db/database.ts";
 import { CI_FAILED_CONCLUSIONS, ciVerificationRecords, type CiVerificationRecord } from "../verify/ci-verification-records.ts";
@@ -13,7 +13,22 @@ import type { ProjectRegistry } from "./project-registry.ts";
  * Kept apart from availability on purpose. `HEALTHY` says the project's runtime is serviceable and
  * says nothing about CI, so neither is computed from the other.
  */
-export type ProjectCiUndeclaredReason = "NO_ACTIVE_MANIFEST" | "NO_CI_WORKFLOWS" | "ACTIVE_MANIFEST_UNREADABLE";
+export type ProjectCiUndeclaredReason = "NO_CI_WORKFLOWS";
+
+/** Why the declaration could not be read. CI is then UNKNOWN, never NOT_DECLARED (#1172). */
+export type ProjectCiUnknownReason = "NO_ACTIVE_MANIFEST" | "ACTIVE_MANIFEST_UNREADABLE";
+
+/**
+ * #1172 — the one CI answer, read beside availability and never from it.
+ * NOT_DECLARED: the active manifest was read and declares no CI workflow.
+ * DECLARED_UNOBSERVED: CI is declared, and a declared workflow has no PASS or FAIL recorded at its
+ * repository's recorded head — nothing recorded, only an unfinished or non-result record, a result for
+ * another commit, or no recorded head at all.
+ * DECLARED_OBSERVED: every declared workflow has a PASS or FAIL recorded at its repository's recorded
+ * head. Observed, not passed: each workflow's result stays its own `lastObserved.result`.
+ * UNKNOWN: the declaration, or a workflow's observations, could not be read.
+ */
+export type ProjectCiStatus = "NOT_DECLARED" | "DECLARED_UNOBSERVED" | "DECLARED_OBSERVED" | "UNKNOWN";
 
 /**
  * OLDER_COMMIT: the observation is for a commit other than the repository's recorded head.
@@ -72,6 +87,8 @@ export interface ProjectCiNonResult extends ProjectCiRecord {
 }
 
 export interface ProjectCiWorkflow {
+  /** DECLARED_OBSERVED only when `lastObserved.commitSha` is `repositoryHead.commitSha`; see ProjectCiStatus. */
+  status: Exclude<ProjectCiStatus, "NOT_DECLARED">;
   path: string;
   checkName: string;
   repositoryRole: string;
@@ -84,12 +101,13 @@ export interface ProjectCiWorkflow {
   /** The newest record when it holds no result: newer than `lastObserved`, or the only kind there is. */
   latestNonResult: ProjectCiNonResult | null;
   unobserved: boolean;
-  unobservedReason: "NO_REPOSITORY_FOR_ROLE" | "NO_RECORDED_OBSERVATION" | ProjectCiNoResultReason | null;
+  unobservedReason: "NO_REPOSITORY_FOR_ROLE" | "NO_RECORDED_OBSERVATION" | "OBSERVATIONS_UNREADABLE" | ProjectCiNoResultReason | null;
 }
 
 export type ProjectCi =
-  | { declared: false; reason: ProjectCiUndeclaredReason; manifestDigest: string | null }
-  | { declared: true; manifestDigest: string; workflows: ProjectCiWorkflow[] };
+  | { status: "UNKNOWN"; declared: null; reason: ProjectCiUnknownReason; manifestDigest: string | null }
+  | { status: "NOT_DECLARED"; declared: false; reason: ProjectCiUndeclaredReason; manifestDigest: string }
+  | { status: Exclude<ProjectCiStatus, "NOT_DECLARED">; declared: true; manifestDigest: string; workflows: ProjectCiWorkflow[] };
 
 type Projects = Pick<ProjectRegistry, "get" | "manifest">;
 
@@ -135,12 +153,24 @@ const verificationOutcome = (
   return "CONCLUSION_UNRECORDED";
 };
 
+/**
+ * Never throws: a lookup that fails is UNKNOWN with its reason, so a caller composing this into a
+ * larger answer (bootstrap activation) is not failed by it, and a failure never reads as NOT_DECLARED.
+ */
 export const projectCi = (db: Db, projects: Projects, projectId: string): ProjectCi => {
-  const digest = projects.get(projectId)?.activeManifestDigest ?? null;
-  if (digest === null) return { declared: false, reason: "NO_ACTIVE_MANIFEST", manifestDigest: null };
-  const manifest = projectManifestSchema.safeParse(projects.manifest(digest));
-  if (!manifest.success) return { declared: false, reason: "ACTIVE_MANIFEST_UNREADABLE", manifestDigest: digest };
-  if (manifest.data.ciWorkflows.length === 0) return { declared: false, reason: "NO_CI_WORKFLOWS", manifestDigest: digest };
+  let digest: string | null = null;
+  let manifest: ReturnType<typeof projectManifestSchema.safeParse>;
+  try {
+    digest = projects.get(projectId)?.activeManifestDigest ?? null;
+    if (digest === null) return { status: "UNKNOWN", declared: null, reason: "NO_ACTIVE_MANIFEST", manifestDigest: null };
+    manifest = projectManifestSchema.safeParse(projects.manifest(digest));
+  } catch {
+    return { status: "UNKNOWN", declared: null, reason: "ACTIVE_MANIFEST_UNREADABLE", manifestDigest: digest };
+  }
+  if (!manifest.success) return { status: "UNKNOWN", declared: null, reason: "ACTIVE_MANIFEST_UNREADABLE", manifestDigest: digest };
+  if (manifest.data.ciWorkflows.length === 0) {
+    return { status: "NOT_DECLARED", declared: false, reason: "NO_CI_WORKFLOWS", manifestDigest: digest };
+  }
 
   const attribution = new Map<string, AttributedWorkflow | null>();
   const workflows = manifest.data.ciWorkflows.map((workflow): ProjectCiWorkflow => {
@@ -150,78 +180,102 @@ export const projectCi = (db: Db, projects: Projects, projectId: string): Projec
       repositoryRole: workflow.repositoryRole,
       approvedDigest: workflow.approvedDigest,
     };
-    const repository = db.get<{ identity: string; last_observed_head: string | null; last_observed_at: string | null }>(
-      `SELECT identity, last_observed_head, last_observed_at FROM repositories
-        WHERE project_id = ? AND repository_role = ? AND retired_at IS NULL AND registration = 'REGISTERED'
-        ORDER BY created_at, repository_id LIMIT 1`,
-      [projectId, workflow.repositoryRole],
-    );
-    if (!repository) {
-      return { ...declared, repositoryIdentity: null, repositoryHead: null, lastObserved: null, latestNonResult: null,
-        unobserved: true, unobservedReason: "NO_REPOSITORY_FOR_ROLE" };
+    try {
+      return observedWorkflow(db, projects, projectId, workflow, declared, attribution);
+    } catch {
+      return { status: "UNKNOWN", ...declared, repositoryIdentity: null, repositoryHead: null, lastObserved: null,
+        latestNonResult: null, unobserved: true, unobservedReason: "OBSERVATIONS_UNREADABLE" };
     }
-    const identity = repository.identity;
-    const repositoryHead = repository.last_observed_head === null
-      ? null
-      : { commitSha: repository.last_observed_head, observedAt: repository.last_observed_at };
-
-    // A workflow is its path, check name and role together. A record names only a check, so it is
-    // evidence for the one entry its run's pinned manifest declares for that check on the role the
-    // repository held in that run, and for no other workflow sharing the name. The pin says which
-    // workflow was approved, not which one produced the check: only a record whose producer proved
-    // that before writing it can be a result (see receiptOutcome and verificationOutcome).
-    const attributed = (runId: string): AttributedWorkflow | null => {
-      const key = `${runId}\n${identity}\n${workflow.checkName}`;
-      if (!attribution.has(key)) attribution.set(key, attributedWorkflow(db, projects, runId, identity, workflow.checkName));
-      return attribution.get(key)!;
-    };
-    const records = [...postMergeRecords(db, identity, workflow.checkName), ...verificationRecords(db, identity, workflow.checkName)]
-      .sort(newestFirst);
-
-    // Newest first: the first result ends the walk, and the newest non-result before it is kept.
-    let result: { record: CandidateRecord; entry: AttributedWorkflow } | null = null;
-    let latestNonResult: ProjectCiNonResult | null = null;
-    for (const record of records) {
-      const entry = attributed(record.source.runId);
-      if (entry === null || entry.path !== workflow.path || entry.repositoryRole !== workflow.repositoryRole) continue;
-      if (record.outcome === "PASS" || record.outcome === "FAIL") {
-        result = { record, entry };
-        break;
-      }
-      latestNonResult ??= { ...recordOf(record), reason: record.outcome };
-    }
-    if (result === null) {
-      return { ...declared, repositoryIdentity: identity, repositoryHead, lastObserved: null, latestNonResult,
-        unobserved: true, unobservedReason: latestNonResult?.reason ?? "NO_RECORDED_OBSERVATION" };
-    }
-
-    const { record, entry } = result;
-    const verification = record.source.kind === "CI_VERIFICATION_RESULT";
-    const approvedDigestAtObservation = verification ? null : entry.approvedDigest;
-    const staleReasons: ProjectCiStaleReason[] = [];
-    if (repositoryHead === null) staleReasons.push("HEAD_UNOBSERVED");
-    else if (record.commitSha !== repositoryHead.commitSha) staleReasons.push("OLDER_COMMIT");
-    if (verification) staleReasons.push("DIGEST_UNVERIFIED");
-    else if (workflow.approvedDigest === null || approvedDigestAtObservation !== workflow.approvedDigest) {
-      staleReasons.push("DIGEST_MISMATCH");
-    }
-    return {
-      ...declared,
-      repositoryIdentity: identity,
-      repositoryHead,
-      lastObserved: {
-        ...recordOf(record),
-        result: record.outcome as "PASS" | "FAIL",
-        approvedDigestAtObservation,
-        freshness: staleReasons.length === 0 ? "current" : "stale",
-        staleReasons,
-      },
-      latestNonResult,
-      unobserved: false,
-      unobservedReason: null,
-    };
   });
-  return { declared: true, manifestDigest: digest, workflows };
+  const status = workflows.some((workflow) => workflow.status === "UNKNOWN")
+    ? "UNKNOWN"
+    : workflows.every((workflow) => workflow.status === "DECLARED_OBSERVED") ? "DECLARED_OBSERVED" : "DECLARED_UNOBSERVED";
+  return { status, declared: true, manifestDigest: digest, workflows };
+};
+
+type DeclaredWorkflow = Pick<ProjectCiWorkflow, "path" | "checkName" | "repositoryRole" | "approvedDigest">;
+
+/** One declared workflow with what is recorded of it; throws when a record cannot be read. */
+const observedWorkflow = (
+  db: Db,
+  projects: Projects,
+  projectId: string,
+  workflow: ProjectManifest["ciWorkflows"][number],
+  declared: DeclaredWorkflow,
+  attribution: Map<string, AttributedWorkflow | null>,
+): ProjectCiWorkflow => {
+  const repository = db.get<{ identity: string; last_observed_head: string | null; last_observed_at: string | null }>(
+    `SELECT identity, last_observed_head, last_observed_at FROM repositories
+      WHERE project_id = ? AND repository_role = ? AND retired_at IS NULL AND registration = 'REGISTERED'
+      ORDER BY created_at, repository_id LIMIT 1`,
+    [projectId, workflow.repositoryRole],
+  );
+  if (!repository) {
+    return { status: "DECLARED_UNOBSERVED", ...declared, repositoryIdentity: null, repositoryHead: null, lastObserved: null,
+      latestNonResult: null, unobserved: true, unobservedReason: "NO_REPOSITORY_FOR_ROLE" };
+  }
+  const identity = repository.identity;
+  const repositoryHead = repository.last_observed_head === null
+    ? null
+    : { commitSha: repository.last_observed_head, observedAt: repository.last_observed_at };
+
+  // A workflow is its path, check name and role together. A record names only a check, so it is
+  // evidence for the one entry its run's pinned manifest declares for that check on the role the
+  // repository held in that run, and for no other workflow sharing the name. The pin says which
+  // workflow was approved, not which one produced the check: only a record whose producer proved
+  // that before writing it can be a result (see receiptOutcome and verificationOutcome).
+  const attributed = (runId: string): AttributedWorkflow | null => {
+    const key = `${runId}\n${identity}\n${workflow.checkName}`;
+    if (!attribution.has(key)) attribution.set(key, attributedWorkflow(db, projects, runId, identity, workflow.checkName));
+    return attribution.get(key)!;
+  };
+  const records = [...postMergeRecords(db, identity, workflow.checkName), ...verificationRecords(db, identity, workflow.checkName)]
+    .sort(newestFirst);
+
+  // Newest first: the first result ends the walk, and the newest non-result before it is kept.
+  let result: { record: CandidateRecord; entry: AttributedWorkflow } | null = null;
+  let latestNonResult: ProjectCiNonResult | null = null;
+  for (const record of records) {
+    const entry = attributed(record.source.runId);
+    if (entry === null || entry.path !== workflow.path || entry.repositoryRole !== workflow.repositoryRole) continue;
+    if (record.outcome === "PASS" || record.outcome === "FAIL") {
+      result = { record, entry };
+      break;
+    }
+    latestNonResult ??= { ...recordOf(record), reason: record.outcome };
+  }
+  if (result === null) {
+    return { status: "DECLARED_UNOBSERVED", ...declared, repositoryIdentity: identity, repositoryHead, lastObserved: null,
+      latestNonResult, unobserved: true, unobservedReason: latestNonResult?.reason ?? "NO_RECORDED_OBSERVATION" };
+  }
+
+  const { record, entry } = result;
+  const verification = record.source.kind === "CI_VERIFICATION_RESULT";
+  const approvedDigestAtObservation = verification ? null : entry.approvedDigest;
+  const staleReasons: ProjectCiStaleReason[] = [];
+  if (repositoryHead === null) staleReasons.push("HEAD_UNOBSERVED");
+  else if (record.commitSha !== repositoryHead.commitSha) staleReasons.push("OLDER_COMMIT");
+  if (verification) staleReasons.push("DIGEST_UNVERIFIED");
+  else if (workflow.approvedDigest === null || approvedDigestAtObservation !== workflow.approvedDigest) {
+    staleReasons.push("DIGEST_MISMATCH");
+  }
+  return {
+    // Observed at the current head or not; an older commit's result is shown as that commit's, not the head's.
+    status: repositoryHead !== null && record.commitSha === repositoryHead.commitSha ? "DECLARED_OBSERVED" : "DECLARED_UNOBSERVED",
+    ...declared,
+    repositoryIdentity: identity,
+    repositoryHead,
+    lastObserved: {
+      ...recordOf(record),
+      result: record.outcome as "PASS" | "FAIL",
+      approvedDigestAtObservation,
+      freshness: staleReasons.length === 0 ? "current" : "stale",
+      staleReasons,
+    },
+    latestNonResult,
+    unobserved: false,
+    unobservedReason: null,
+  };
 };
 
 const recordOf = (record: CandidateRecord): ProjectCiRecord => ({
