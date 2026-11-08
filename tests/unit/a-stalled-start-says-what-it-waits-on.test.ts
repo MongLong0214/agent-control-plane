@@ -3,7 +3,9 @@ import { join } from "node:path";
 
 import { afterAll, describe, expect, it, vi } from "vitest";
 
+import { DAEMON_START_SUBJECT, IncidentClass, deliverIncident } from "../../src/ceo/ceo-incident-notices.ts";
 import { NotificationKind } from "../../src/ceo/production-gate.ts";
+import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startConfiguredCeoNotificationRoute, startStallNoticeRoute } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
@@ -108,7 +110,8 @@ describe("#1189 D1: a stalled start's blocking findings are permanent or transie
     }));
     expect(classes).toEqual({
       STATE_PATH_INSECURE: "PERMANENT/OWNER/SECURITY",
-      TRUSTED_GATE_CREDENTIAL_MISSING: "PERMANENT/OWNER/CREDENTIAL",
+      // #1189 WIP 2: an explicit failed start told to the CEO, never a wait on the owner.
+      TRUSTED_GATE_CREDENTIAL_MISSING: "PERMANENT/CEO/CREDENTIAL",
       TRUSTED_GATE_CREDENTIAL_PERMISSIONS: "PERMANENT/OWNER/SECURITY",
       CANONICAL_TURN_CONTRADICTED: "PERMANENT/OWNER/SECURITY",
       REPOSITORY_UNREADABLE: "PERMANENT/OWNER/OWNER_GATED",
@@ -160,7 +163,7 @@ describe("#1189 D1: a start refused on a permanent finding", () => {
         phase: "REFUSED",
         cause: "PERMANENT",
         crashLoop: false,
-        findings: [{ code: "TRUSTED_GATE_CREDENTIAL_MISSING", scope: "github", cause: "PERMANENT", repairOwner: "OWNER", basis: "CREDENTIAL" }],
+        findings: [{ code: "TRUSTED_GATE_CREDENTIAL_MISSING", scope: "github", cause: "PERMANENT", repairOwner: "CEO", basis: "CREDENTIAL" }],
         blockedRunCount: 2,
       });
       // Whether execution ran, per held run: the dead worker's receipt was abandoned by the restart
@@ -258,6 +261,254 @@ describe("#1189 D1: a start refused on a permanent finding", () => {
     } finally {
       h.cp.close();
     }
+  });
+});
+
+/**
+ * #1189 WIP 2 (CEO msg_7cb20fea) — a daemon started without the trusted gate's GitHub App credential refuses
+ * that start explicitly: it releases its lock, records why and exits under the crash-loop backoff. It is not a
+ * degraded start and installs or substitutes nothing. What it said used to make the refusal an owner wait: the
+ * finding named the owner as who clears it and asked for the credential to be installed. It now names the CEO,
+ * which is told once, and asks nobody to act.
+ */
+describe("#1189 WIP 2: a start without the trusted gate credential is an explicit failed start that waits on no owner", () => {
+  /** A request that somebody act: what the credential route must never say. */
+  const ASKS_SOMEONE = /\b(install|log ?in|login|restore|approve|re-?authori[sz]e|provide|supply)\b/i;
+
+  it("fails every start with its reason and scope recorded, and creates no owner task, prompt or waiting route, however often it is restarted", async () => {
+    const h = makeHarness();
+    try {
+      // The harness installs no trusted gate credential: TRUSTED_GATE_CREDENTIAL_MISSING blocks and cannot park.
+      bindCeo(h);
+      const stateDir = tempDir("acp-1189-wip2-");
+      const sent: Array<readonly string[]> = [];
+      // A launchd-style supervisor: started again after each backoff, past the crash-loop threshold.
+      const STARTS = 4;
+      for (let attempt = 1; attempt <= STARTS; attempt += 1) {
+        const daemon = new Daemon(h.cp, { stateDir });
+        const refused = await daemon.start({ stallNotice: { deliver: async (messageIds) => { sent.push(messageIds); } } });
+        // An explicit failure of this start: refused with its reason, its lock let go, nothing left running or parked.
+        expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+        expect(daemon.lock.held()).toBe(false);
+        const stall = health(stateDir)["startStall"] as { phase: string; cause: string; crashLoop: boolean; findings: Array<Record<string, unknown>> };
+        expect(stall).toMatchObject({ phase: "REFUSED", cause: "PERMANENT", crashLoop: false });
+        // The reason and its scope: which gate and which kind of credential, and no path.
+        expect(stall.findings).toEqual([{
+          code: "TRUSTED_GATE_CREDENTIAL_MISSING", scope: "github", cause: "PERMANENT", repairOwner: "CEO", basis: "CREDENTIAL",
+          recoveryAction: expect.stringContaining("GitHub App credential"),
+        }]);
+        // No owner wait: nobody named as who clears it is the owner, and nothing asks anyone to act.
+        for (const finding of stall.findings) {
+          expect(finding["repairOwner"]).not.toBe("OWNER");
+          expect(finding["recoveryAction"]).not.toMatch(ASKS_SOMEONE);
+          expect(finding["recoveryAction"]).not.toMatch(/\//);
+        }
+        h.clock.advance(10 * 60_000);
+      }
+
+      // One failure record per start, each with its reason and the finding it failed on.
+      const failures = [...h.cp.audit.byKind("DAEMON_START_FAILED"), ...h.cp.audit.byKind("DAEMON_CRASH_LOOP")];
+      expect(failures).toHaveLength(STARTS);
+      for (const failure of failures) {
+        expect(failure.reasonCode).toBe(ReasonCode.DOCTOR_BLOCKED);
+        expect(failure.evidence).toMatchObject({
+          stall: { phase: "REFUSED", cause: "PERMANENT", findings: [{ code: "TRUSTED_GATE_CREDENTIAL_MISSING", scope: "github", repairOwner: "CEO" }] },
+        });
+      }
+
+      // Nothing accumulates across the restarts: no owner prompt, nothing addressed to anyone but the CEO, one
+      // notice and one delivery record of it, offered again by each start rather than written again.
+      expect(h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM telegram_owner_prompts`)!.n).toBe(0);
+      expect(h.cp.db.all<{ role_key: string }>(`SELECT DISTINCT role_key FROM outbox`)).toEqual([{ role_key: roleKeyFor(Role.CEO) }]);
+      const notices = stallNotices(h);
+      expect(notices).toHaveLength(1);
+      expect(h.cp.audit.byKind("OWNERLESS_STALL_ROUTED")).toHaveLength(1);
+      expect(sent).toHaveLength(STARTS);
+      expect(new Set(sent.flat())).toEqual(new Set([notices[0]!.message_id]));
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  it("the doctor's finding states the failure and asks nobody to act, with its code, severity and scope unchanged", async () => {
+    const h = makeHarness();
+    try {
+      const report = await h.cp.doctor.run("github");
+      const finding = report.findings.find((f) => f.code === "TRUSTED_GATE_CREDENTIAL_MISSING");
+      expect(finding).toMatchObject({ severity: "ERROR", scope: "github", blocking: true });
+      expect(finding!.recommendedAction).toBe(
+        "nothing is requested of anyone: a daemon start fails without the trusted gate's GitHub App credential, " +
+        "and programmatic merges are impossible until the daemon can read it",
+      );
+      expect(finding!.recommendedAction).not.toMatch(ASKS_SOMEONE);
+      expect(finding!.recommendedAction).not.toMatch(/\bowner\b/i);
+      // The audit's free-text bound: longer, and the start's failure records would lose their evidence.
+      expect(finding!.recommendedAction.length).toBeLessThanOrEqual(200);
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  /**
+   * The notice 7ef40dd8 queued for this stall, as it wrote it: the owner route, under the episode its stall id gave
+   * (no successful start before it, one PERMANENT finding), with the delivery record `deliverIncident` keeps.
+   */
+  const queueBaseNotice = (h: Harness): string => {
+    const episode = digestOf({ since: null, cause: "PERMANENT", findings: ["TRUSTED_GATE_CREDENTIAL_MISSING|github"] });
+    const delivered = deliverIncident(h.cp, {
+      cls: IncidentClass.RESOURCE_STALLED, subject: DAEMON_START_SUBJECT, runId: null, episode,
+      payload: {
+        source: "DAEMON_START_STALL", stallId: episode, phase: "REFUSED", cause: "PERMANENT", crashLoop: false,
+        startRefused: true, acpActionPath: "NOT_RUNNING",
+        blocker: "the daemon start is refused and ACP's action path is not running: its startup doctor blocks on findings no restart clears",
+        findings: [{
+          code: "TRUSTED_GATE_CREDENTIAL_MISSING", scope: "github", cause: "PERMANENT", repairOwner: "OWNER", basis: "CREDENTIAL",
+          recoveryAction: "install the trusted GitHub credential, then restart the daemon",
+        }],
+        blockedRunCount: 0,
+        blockedRuns: [],
+        runEffect: "no run was completed, failed or dispatched by this start; a run whose execution ran may have effects to check before it runs again",
+        whyItMatters: "until a start succeeds no run is dispatched and no ACP tool acts on the CEO's behalf; the findings name who can clear them",
+      },
+    });
+    if (!delivered.allowed || delivered.value.messageId === null) throw new Error("the base notice was not queued");
+    return delivered.value.messageId;
+  };
+
+  /** Every CEO notice still owed or being sent: what a route would offer the CEO. */
+  const offeredNotices = (h: Harness) => h.cp.db.all<{ message_id: string; payload_json: string }>(
+    `SELECT message_id, payload_json FROM outbox
+      WHERE kind = 'CEO_NOTIFICATION' AND status IN ('PENDING', 'IN_FLIGHT', 'SENT') ORDER BY created_at, rowid`,
+  );
+
+  it("after an upgrade over a start the earlier build refused, its owner-route notice is withdrawn, the current statement reaches the CEO once, and later starts add none", async () => {
+    const h = makeHarness();
+    try {
+      bindCeo(h);
+      const baseNotice = queueBaseNotice(h);
+      const stateDir = tempDir("acp-1189-wip2-upgrade-");
+      const sent: Array<readonly string[]> = [];
+      const start = async () => {
+        const refused = await new Daemon(h.cp, { stateDir }).start({
+          stallNotice: { deliver: async (messageIds) => { sent.push(messageIds); } },
+        });
+        expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+        h.clock.advance(10 * 60_000);
+      };
+
+      await start();
+      // The earlier build's notice is withdrawn, and nothing still offered to the CEO names the owner or asks for an install.
+      expect(h.cp.db.get<{ status: string }>(`SELECT status FROM outbox WHERE message_id = ?`, [baseNotice])!.status).toBe("REJECTED");
+      const offered = offeredNotices(h);
+      expect(offered).toHaveLength(1);
+      const current = offered[0]!;
+      expect(current.message_id).not.toBe(baseNotice);
+      expect(current.payload_json).not.toMatch(/"repairOwner":"OWNER"/);
+      expect(current.payload_json).not.toMatch(/install/i);
+      const route = classifyStartFinding({ code: "TRUSTED_GATE_CREDENTIAL_MISSING", severity: "ERROR", scope: "github" });
+      expect(JSON.parse(current.payload_json)).toMatchObject({ source: "DAEMON_START_STALL", findings: [route] });
+      expect(sent).toEqual([[current.message_id]]);
+      expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN").map((event) => event.evidence)).toEqual([
+        expect.objectContaining({ messageId: baseNotice, status: "PENDING", correlation: "ceo-incident:RESOURCE_STALLED:daemon-start" }),
+      ]);
+
+      // Later starts offer that same notice again and write none.
+      await start();
+      await start();
+      expect(offeredNotices(h).map((row) => row.message_id)).toEqual([current.message_id]);
+      expect(stallNotices(h).map((row) => row.message_id)).toEqual([baseNotice, current.message_id]);
+      expect(sent).toEqual([[current.message_id], [current.message_id], [current.message_id]]);
+      expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN")).toHaveLength(1);
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  /** The base notice as a send left it: claimed now, by a process that may since have died. */
+  const claimBaseNotice = (h: Harness, messageId: string): void => {
+    h.cp.db.run(`UPDATE outbox SET status = 'IN_FLIGHT', claim_token = 'clm_base_sender', claimed_at = ? WHERE message_id = ?`,
+      [h.clock.nowIso(), messageId]);
+  };
+
+  it("an owner-route notice a dead process left IN_FLIGHT is withdrawn once its claim lease has expired, so a later reclaim restores nothing", async () => {
+    const h = makeHarness();
+    try {
+      bindCeo(h);
+      const baseNotice = queueBaseNotice(h);
+      claimBaseNotice(h, baseNotice);
+      h.clock.advance(10 * 60_000);
+      const stateDir = tempDir("acp-1189-wip2-dead-claim-");
+      expect(await new Daemon(h.cp, { stateDir }).start({ stallNotice: { deliver: async () => {} } }))
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+      expect(h.cp.db.get<{ status: string }>(`SELECT status FROM outbox WHERE message_id = ?`, [baseNotice])!.status).toBe("REJECTED");
+      expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN").map((event) => event.evidence)).toEqual([
+        expect.objectContaining({ messageId: baseNotice, status: "IN_FLIGHT" }),
+      ]);
+
+      // Whenever the outbox's own reclaim runs next, it has nothing of the owner route to put back.
+      h.cp.outbox.reclaimStaleLeases();
+      const offered = offeredNotices(h);
+      expect(offered).toHaveLength(1);
+      expect(offered[0]!.message_id).not.toBe(baseNotice);
+      expect(offered[0]!.payload_json).not.toMatch(/"repairOwner":"OWNER"/);
+      expect(offered[0]!.payload_json).not.toMatch(/install/i);
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  it("leaves an owner-route notice under a live, unexpired claim to that claim's sender", async () => {
+    const h = makeHarness();
+    try {
+      bindCeo(h);
+      const baseNotice = queueBaseNotice(h);
+      claimBaseNotice(h, baseNotice);
+      const stateDir = tempDir("acp-1189-wip2-live-claim-");
+      expect(await new Daemon(h.cp, { stateDir }).start({ stallNotice: { deliver: async () => {} } }))
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+      expect(h.cp.db.get<{ status: string; claim_token: string | null }>(
+        `SELECT status, claim_token FROM outbox WHERE message_id = ?`, [baseNotice],
+      )).toEqual({ status: "IN_FLIGHT", claim_token: "clm_base_sender" });
+      expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN")).toHaveLength(0);
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  it("withdraws nothing of another stall kind's incident: a security block's notice is offered again as it was", async () => {
+    const h = makeHarness();
+    try {
+      bindCeo(h);
+      h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+      const stateDir = tempDir("acp-1189-wip2-other-");
+      chmodSync(join(h.root, "capacity"), 0o755);
+      expect(await new Daemon(h.cp, { stateDir }).start()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_ERROR });
+      const [first] = stallNotices(h);
+      expect(first!.payload).toMatchObject({ findings: [{ code: "STATE_PATH_INSECURE", repairOwner: "OWNER" }] });
+      h.clock.advance(10 * 60_000);
+      expect(await new Daemon(h.cp, { stateDir }).start()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_ERROR });
+      expect(stallNotices(h).map((row) => [row.message_id, row.status])).toEqual([[first!.message_id, "PENDING"]]);
+      expect(health(stateDir)["startStall"]).toMatchObject({ routing: { status: "ALREADY_ROUTED", messageId: first!.message_id } });
+      expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN")).toHaveLength(0);
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  it("leaves the security blocks' routes exactly as they were", () => {
+    const routeOf = (code: string) => classifyStartFinding({ code, severity: "CRITICAL", scope: "x" });
+    expect(routeOf("STATE_PATH_INSECURE")).toEqual({
+      code: "STATE_PATH_INSECURE", scope: "x", cause: "PERMANENT", repairOwner: "OWNER", basis: "SECURITY",
+      recoveryAction: "restore owner-only, non-symlinked state paths, then restart the daemon",
+    });
+    expect(routeOf("TRUSTED_GATE_CREDENTIAL_PERMISSIONS")).toEqual({
+      code: "TRUSTED_GATE_CREDENTIAL_PERMISSIONS", scope: "x", cause: "PERMANENT", repairOwner: "OWNER", basis: "SECURITY",
+      recoveryAction: "restrict the secret directory to owner-only access, then restart the daemon",
+    });
+    expect(routeOf("CANONICAL_TURN_CONTRADICTED")).toEqual({
+      code: "CANONICAL_TURN_CONTRADICTED", scope: "x", cause: "PERMANENT", repairOwner: "OWNER", basis: "SECURITY",
+      recoveryAction: "an operator adjudicates the contradicted turn (agentctl conversation adjudicate), citing every observation",
+    });
   });
 });
 

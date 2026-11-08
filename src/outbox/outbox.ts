@@ -1674,6 +1674,11 @@ export class Outbox {
     );
   }
 
+  /** The claim lease rule: an IN_FLIGHT claim taken at or before this instant is presumed dead. */
+  staleClaimCutoff(leaseMs = SEND_LEASE_MS): string {
+    return new Date(new Date(this.clock.nowIso()).getTime() - leaseMs).toISOString();
+  }
+
   /** A claim whose holder died must return to PENDING rather than stay stuck IN_FLIGHT. */
   reclaimStaleLeases(leaseMs = SEND_LEASE_MS): number {
     this.fenceUndeliverable();
@@ -1683,7 +1688,7 @@ export class Outbox {
       `UPDATE outbox SET status = 'PENDING', claim_token = NULL, claimed_at = NULL
         WHERE status = 'IN_FLIGHT' AND claimed_at <= ?
           AND (${liveDeliveryTarget("outbox")} OR kind = 'CEO_NOTIFICATION')`,
-      [new Date(new Date(this.clock.nowIso()).getTime() - leaseMs).toISOString()],
+      [this.staleClaimCutoff(leaseMs)],
     ).changes;
   }
 

@@ -2149,7 +2149,8 @@ export class Doctor {
         blocking: true,
         confidence: "HIGH",
         observedEvidence: {},
-        recommendedAction: "install the trusted GitHub credential; programmatic merges are impossible without it",
+        // #1189 WIP 2 — an explicit failure, never a request that someone act; under the audit's 200-character bound.
+        recommendedAction: "nothing is requested of anyone: a daemon start fails without the trusted gate's GitHub App credential, and programmatic merges are impossible until the daemon can read it",
       });
     } else if (!health.permissionsOk) {
       findings.push({
