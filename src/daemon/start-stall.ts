@@ -16,10 +16,11 @@ import type { BlockingFinding } from "./daemon.ts";
  * ever succeed, and nothing tells anyone: the operator and CEO doors open only after a start succeeds.
  *
  * Each blocking finding is classified here:
- * - PERMANENT: no restart clears it. Either it is an explicit failure routed to the CEO and asks nobody
- *   to act (the trusted gate's GitHub App credential is missing), or it is a block with its owner route: a
- *   security property of the host, an owner-gated repair, a dead session that still holds authority or
- *   work, or a decision about one run.
+ * - PERMANENT: no restart clears it. Either it is an explicit failure routed to the CEO that states the fact
+ *   and the open decision and asks nobody to act (the trusted gate's GitHub App credential is missing, a
+ *   checkout cannot be read, a dead session still holds authority or work, a conversation turn is
+ *   contradicted, a receipt names no worker it can verify, a finding nobody classified), a decision about
+ *   one run told to the CEO, or a security property of the host with its owner route.
  * - TRANSIENT: a later start may find it gone without anyone acting — a probe that did not complete,
  *   a worker process that was still running, capacity or coverage that returns.
  *
@@ -64,27 +65,31 @@ const transient = (basis: string, recoveryAction: string): StartFindingClass =>
  * Every blocking finding the system doctor can raise at start, by code, after the restart reconcile
  * has run. A code missing from this table is classified PERMANENT (`UNCLASSIFIED`): a stall nobody can
  * tell will clear is told to the CEO rather than left to a backoff that may never end.
+ *
+ * #1189 WIP 2 (CEO msg_7cb20fea) and CEO msg_390e287c — a finding routed to the CEO as an explicit failed start
+ * is told once and is never a wait on the owner or a request that anyone act: it states the fact and the open
+ * decision, says the start stays refused, and may name a resolving command only as information. No degraded
+ * start, and nothing is installed, inferred, settled or repaired. Each text is kept within the audit's
+ * 200-character free-text bound, or the stall's records lose their evidence.
  */
 const START_FINDING_CLASSES: Readonly<Record<string, StartFindingClass>> = {
   // Integrity findings (STATE_PATH_INSECURE, CANONICAL_TURN_CONTRADICTED, the trusted-gate credential)
-  // block on purpose, and nothing here weakens that; it only says who can clear them.
+  // block on purpose, and nothing here weakens that; it only says who is told and who can clear them.
   STATE_PATH_INSECURE: permanent("OWNER", "SECURITY", "restore owner-only, non-symlinked state paths, then restart the daemon"),
-  // #1189 WIP 2 (CEO msg_7cb20fea) — an explicit failed start, told to the CEO once, and never a wait on the
-  // owner or a request that anyone act: no degraded start, and no credential is installed or substituted.
-  // Kept within the audit's 200-character free-text bound, or the stall's records lose their evidence.
   TRUSTED_GATE_CREDENTIAL_MISSING: permanent("CEO", "CREDENTIAL", "nothing is requested of anyone: this start failed without the trusted gate's GitHub App credential, and each later start fails the same way until the daemon can read it"),
   TRUSTED_GATE_CREDENTIAL_PERMISSIONS: permanent("OWNER", "SECURITY", "restrict the secret directory to owner-only access, then restart the daemon"),
-  CANONICAL_TURN_CONTRADICTED: permanent("OWNER", "SECURITY", "an operator adjudicates the contradicted turn (agentctl conversation adjudicate), citing every observation"),
-  // A checkout that is not there or not a repository: restoring it, or the owner-gated project suspend.
-  REPOSITORY_UNREADABLE: permanent("OWNER", "OWNER_GATED", "restore the checkout or re-register the repository; suspending the project is the owner's call"),
+  CANONICAL_TURN_CONTRADICTED: permanent("CEO", "SECURITY", "nothing is requested of anyone: two records disagree on how a conversation turn ended, so this start stays refused; resolution is an operator-socket action (agentctl conversation adjudicate)"),
+  // A checkout that is not there or not a repository: its registration, or the owner-gated project suspend.
+  REPOSITORY_UNREADABLE: permanent("CEO", "OWNER_GATED", "nothing is requested of anyone: a registered checkout is missing or not a repository, so this start stays refused; re-registering it or suspending its project is an open decision"),
   // The restart reconcile marks a dead session ERROR and stops there: a binding it still holds or a run
-  // it still owns is recovered through the operator door, which a refused start never opens.
-  SESSION_PROCESS_MISSING: permanent("OWNER", "DEAD_SESSION", "recover the dead session's bindings or re-pin the runs it owns; no operator door opens while the start refuses"),
+  // it still owns is released through the operator door, which a refused start never opens.
+  SESSION_PROCESS_MISSING: permanent("CEO", "DEAD_SESSION", "nothing is requested of anyone: a dead session still holds a binding or owns work, so this start stays refused; releasing them is an open decision, and no operator door opens while starts refuse"),
   // Re-pinning or ending a run is a decision about that run; no restart makes it.
   ACTIVE_RUN_WITHOUT_OWNER: permanent("CEO", "RUN_DECISION", "re-pin the run's owner or end the run; neither is reachable until the daemon starts"),
   // The restart reconcile already abandons every RUNNING receipt it can; one left names no worker it can verify.
-  WORKER_IDENTITY_MISSING: permanent("OWNER", "RECEIPT", "the receipt names no worker; establish what ran, then settle the receipt"),
-  WORKER_IDENTITY_UNVERIFIABLE: permanent("OWNER", "RECEIPT", "the receipt names no known worker; establish what ran, then settle the receipt"),
+  // No tool that settles such a receipt is confirmed, so the text names none: the fact and the open decision only.
+  WORKER_IDENTITY_MISSING: permanent("CEO", "RECEIPT", "nothing is requested of anyone: an open execution receipt names no worker, so what ran is unknown and this start stays refused; how that receipt is settled is an open decision"),
+  WORKER_IDENTITY_UNVERIFIABLE: permanent("CEO", "RECEIPT", "nothing is requested of anyone: an open execution receipt names no known worker, so what ran is unknown and this start stays refused; how that receipt is settled is an open decision"),
   // A receipt whose recorded process is still alive: the restart reconcile abandons it once that process is gone.
   DEAD_WORKER_WITH_OPEN_RECEIPT: transient("PROCESS", "the next start abandons the receipt once its process is gone; check the task's effects before it runs again"),
   REPOSITORY_PROBE_FAILED: transient("PROBE", "the next start probes the checkout again; if it keeps failing, restore the checkout"),
@@ -95,7 +100,7 @@ export const classifyStartFinding = (finding: BlockingFinding): ClassifiedStartF
   const known = START_FINDING_CLASSES[finding.code] ??
     (finding.code.startsWith("ROLE_COVERAGE_") || finding.code.startsWith("CAPACITY_")
       ? transient("COVERAGE", "the next capacity reading may restore coverage; an operator observation can also clear it")
-      : permanent("OWNER", "UNCLASSIFIED", "read the startup doctor report for this finding's remedy"));
+      : permanent("CEO", "UNCLASSIFIED", "nothing is requested of anyone: this start is blocked on a finding whose cause is unconfirmed, and it stays refused; the startup doctor report carries that finding's evidence"));
   return { code: finding.code, scope: finding.scope, ...known };
 };
 
@@ -177,11 +182,25 @@ const blockedRunsOf = (db: Db): StartStallRun[] => {
 };
 
 /**
- * #1189 WIP 2 — the trusted-gate credential's route was revised. The earlier one named the owner and asked for
- * the credential to be installed; a notice of it still owed when this build starts would otherwise be offered
- * again, because the stall it states is the same.
+ * #1189 — routes revised from the owner to an explicit failure told to the CEO: the trusted-gate credential (WIP 2),
+ * then the remaining non-security owner routes (CEO msg_390e287c). The earlier routes named the owner as who clears
+ * the finding and asked for a repair; a notice of one still owed when this build starts would otherwise be offered
+ * again, because the stall it states is the same. The fallback for a code no table names has no code of its own, so
+ * its basis names it. Changing one of these routes again needs a new revision, or ALREADY_ROUTED re-offers the
+ * notice it replaced.
  */
-const REVISED_ROUTE = { code: "TRUSTED_GATE_CREDENTIAL_MISSING", revision: "no-owner-wait", obsoleteRepairOwner: "OWNER" } as const;
+const REVISED_ROUTE = {
+  codes: [
+    "TRUSTED_GATE_CREDENTIAL_MISSING", "CANONICAL_TURN_CONTRADICTED", "REPOSITORY_UNREADABLE", "SESSION_PROCESS_MISSING",
+    "WORKER_IDENTITY_MISSING", "WORKER_IDENTITY_UNVERIFIABLE",
+  ] as readonly string[],
+  basis: "UNCLASSIFIED",
+  revision: "no-owner-wait",
+  obsoleteRepairOwner: "OWNER",
+} as const;
+
+const routeRevised = (finding: ClassifiedStartFinding): boolean =>
+  REVISED_ROUTE.codes.includes(finding.code) || finding.basis === REVISED_ROUTE.basis;
 
 /**
  * The episode a stall is told in, bounded by the daemon's last successful start: a successful start ends
@@ -204,7 +223,7 @@ const stallIdOf = (db: Db, findings: readonly ClassifiedStartFinding[], cause: S
     cause,
     findings: findings
       .filter((finding) => finding.cause === cause)
-      .map((finding) => finding.code === REVISED_ROUTE.code
+      .map((finding) => routeRevised(finding)
         ? `${finding.code}|${finding.scope}|${REVISED_ROUTE.revision}`
         : `${finding.code}|${finding.scope}`)
       .sort(),
@@ -212,8 +231,8 @@ const stallIdOf = (db: Db, findings: readonly ClassifiedStartFinding[], cause: S
 };
 
 /**
- * Withdraws every daemon-start notice still owed (PENDING or SENT) that states the credential finding with its
- * obsolete owner route, as `withdrawResolvedNotices` withdraws a resolved one: REJECTED, with one
+ * Withdraws every daemon-start notice still owed (PENDING or SENT) that states a revised finding (`REVISED_ROUTE`)
+ * with its obsolete owner route, as `withdrawResolvedNotices` withdraws a resolved one: REJECTED, with one
  * CEO_NOTIFICATION_WITHDRAWN record. So is one left IN_FLIGHT by a claim the outbox's lease rule presumes dead
  * (`staleClaimCutoff`, the rule `reclaimStaleLeases` applies): withdrawn now, a later reclaim has nothing to put
  * back. A claim still within its lease is that send's; an ACKed notice was received and stays as it is. No other
@@ -232,9 +251,11 @@ const withdrawObsoleteRouteNotices = (ports: NoticePorts): void => {
       WHERE o.kind = 'CEO_NOTIFICATION' AND o.run_id IS NULL AND ${owed}
         AND json_valid(o.payload_json) = 1 AND json_extract(o.payload_json, '$.correlation') = ?
         AND EXISTS (SELECT 1 FROM json_each(o.payload_json, '$.findings') AS f
-                     WHERE json_extract(f.value, '$.code') = ? AND json_extract(f.value, '$.repairOwner') = ?)
+                     WHERE json_extract(f.value, '$.repairOwner') = ?
+                       AND (json_extract(f.value, '$.code') IN (${REVISED_ROUTE.codes.map(() => "?").join(", ")})
+                            OR json_extract(f.value, '$.basis') = ?))
       ORDER BY o.created_at, o.rowid`,
-    [staleClaim, correlation, REVISED_ROUTE.code, REVISED_ROUTE.obsoleteRepairOwner],
+    [staleClaim, correlation, REVISED_ROUTE.obsoleteRepairOwner, ...REVISED_ROUTE.codes, REVISED_ROUTE.basis],
   );
   for (const row of rows) {
     ports.db.tx(() => {
