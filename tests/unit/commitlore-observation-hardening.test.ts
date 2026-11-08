@@ -102,7 +102,7 @@ fs.appendFileSync(${JSON.stringify(log)}, argv + ' ' + process.env.GIT_ATTR_SOUR
 const answer = (text) => process.stdout.write(text, () => process.exit(0));
 if (argv === '--version') answer('1.7.3\\n');
 else if (argv === 'doctor --help') answer('Usage: commitlore doctor [options]\\n\\nOptions:\\n  --json  emit the report as JSON\\n');
-else if (argv === 'init --help') answer('Usage: commitlore init [options]\\n\\nOptions:\\n  --mcp-scope <scope>  where\\n  --no-unattended      off\\n  --no-agent-hooks     nothing in the tree\\n');
+else if (argv === 'init --help') answer('Usage: commitlore init [options]\\n\\nOptions:\\n  --mcp-scope <scope>  where\\n  --no-unattended      off\\n  --no-agent-hooks     nothing in the tree\\n  --json               the report\\n');
 else answer(${JSON.stringify(JSON.stringify({ schema: "commitlore_doctor.v2", status: "ok", exitCode: 0, checks: [] }))} + '\\n');
 `,
     );
@@ -128,7 +128,7 @@ const answer = (text) => process.stdout.write(text, () => process.exit(0));
 if (argv === 'doctor --help') fs.appendFileSync(process.argv[1], '\\n// changed during a check\\n');
 if (argv === '--version') answer('1.7.3\\n');
 else if (argv === 'doctor --help') answer('Usage: commitlore doctor [options]\\n\\nOptions:\\n  --json  emit the report as JSON\\n');
-else if (argv === 'init --help') answer('Usage: commitlore init [options]\\n\\nOptions:\\n  --mcp-scope <scope>  where\\n  --no-unattended      off\\n  --no-agent-hooks     nothing in the tree\\n');
+else if (argv === 'init --help') answer('Usage: commitlore init [options]\\n\\nOptions:\\n  --mcp-scope <scope>  where\\n  --no-unattended      off\\n  --no-agent-hooks     nothing in the tree\\n  --json               the report\\n');
 else answer(${JSON.stringify(JSON.stringify({ schema: "commitlore_doctor.v2", status: "ok", exitCode: 0, checks: [] }))} + '\\n');
 `,
     );

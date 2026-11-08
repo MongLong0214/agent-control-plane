@@ -131,9 +131,9 @@ const status = (checkout: string): string =>
 const hooks = (checkout: string): string[] => readdirSync(join(checkout, ".git", "hooks")).sort();
 
 describe("R2: the observation's init carries --no-agent-hooks, and a CommitLore without it is refused before init", () => {
-  it("the argv: init with --mcp-scope none, --no-unattended and --no-agent-hooks, then doctor --json", () => {
+  it("the argv: init with --mcp-scope none, --no-unattended, --no-agent-hooks and --json (#1268), then doctor --json", () => {
     expect(COMMITLORE_OBSERVATION_ARGV.map((argv) => argv.join(" "))).toEqual([
-      "init --mcp-scope none --no-unattended --no-agent-hooks",
+      "init --mcp-scope none --no-unattended --no-agent-hooks --json",
       "doctor --json",
     ]);
   });

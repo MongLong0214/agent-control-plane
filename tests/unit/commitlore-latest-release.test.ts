@@ -35,7 +35,7 @@ afterEach(() => {
 });
 afterAll(cleanupTempDirs);
 
-const INIT = "init --mcp-scope none --no-unattended --no-agent-hooks";
+const INIT = "init --mcp-scope none --no-unattended --no-agent-hooks --json";
 const CHECKS = ["--version", "doctor --help", "init --help"];
 const OBSERVATION = [...CHECKS, INIT, "doctor --json"];
 const OK_REPORT = JSON.stringify({ schema: "commitlore_doctor.v2", status: "ok", exitCode: 0, checks: [] });
@@ -52,7 +52,7 @@ require("node:fs").appendFileSync(${JSON.stringify(log)}, argv + "\\n");
 const answer = (text) => process.stdout.write(text, () => process.exit(0));
 if (argv === "--version") answer(${JSON.stringify(`${version}\n`)});
 else if (argv === "doctor --help") answer("Usage: commitlore doctor [options]\\n\\nOptions:\\n  --json  emit the report as JSON\\n");
-else if (argv === "init --help") answer("Usage: commitlore init [options]\\n\\nOptions:\\n  --mcp-scope <scope>  where\\n  --no-unattended      off\\n  --no-agent-hooks     nothing in the tree\\n");
+else if (argv === "init --help") answer("Usage: commitlore init [options]\\n\\nOptions:\\n  --mcp-scope <scope>  where\\n  --no-unattended      off\\n  --no-agent-hooks     nothing in the tree\\n  --json               the report\\n");
 else if (argv === ${JSON.stringify(INIT)}) answer("");
 else if (argv === "doctor --json") answer(${JSON.stringify(OK_REPORT)});
 else process.stderr.write("unknown " + argv + "\\n", () => process.exit(2));

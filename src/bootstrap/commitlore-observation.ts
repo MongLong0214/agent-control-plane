@@ -73,9 +73,12 @@ export const COMMITLORE_VERIFICATION_ID = "commitlore:doctor";
  * writes its git config, builds the record index, handles the directive author string and gives its own
  * readiness verdict, and `doctor --json` is judged as before. The pin's checks refuse a CLI whose `init`
  * does not offer the option (`NO_INIT_OPTION`) before `init` runs; there is no fallback to an argv without it.
+ *
+ * `--json` (#1268): `init` prints its report as JSON, which is how an exit 1 whose one finding is its final
+ * check is told from any other (`judgeCommitLoreRuns`). The pin refuses an `init` without it the same way.
  */
 export const COMMITLORE_OBSERVATION_ARGV: ReadonlyArray<readonly string[]> = Object.freeze([
-  Object.freeze(["init", "--mcp-scope", "none", "--no-unattended", "--no-agent-hooks"]),
+  Object.freeze(["init", "--mcp-scope", "none", "--no-unattended", "--no-agent-hooks", "--json"]),
   Object.freeze(["doctor", "--json"]),
 ]);
 
@@ -89,7 +92,7 @@ export type CommitLoreObservation =
 
 /** Runs CommitLore in a checkout. Production uses `createCommitLoreCliPort()`; tests pass a double. */
 export interface CommitLorePort {
-  /** `commitlore init --mcp-scope none --no-unattended --no-agent-hooks`, then `commitlore doctor --json`, in `checkoutPath`. */
+  /** `commitlore init --mcp-scope none --no-unattended --no-agent-hooks --json`, then `commitlore doctor --json`, in `checkoutPath`. */
   observe(checkoutPath: string): Promise<CommitLoreObservation>;
   /**
    * #1268 — CommitLore's drafting contract for a session that has no transcript or diff yet
@@ -259,16 +262,70 @@ const fail = (detail: string, warnings: string[] = [], reportStatus: string | nu
 });
 
 /**
- * The verdict on one `init` + `doctor --json` pair, as `publish.py observe_commitlore` gives it: PASS only
- * when both exit 0 and the doctor's report is a well-formed `commitlore_doctor.v2` report that does not
- * contradict its exit code (status `failed`, a `fail` check, or a non-zero `exitCode` field). Every check
- * that is not `ok` is carried as a warning. `run` is `null` for a step that could not be run at all.
+ * #1268 (CEO msg_db4e1cc1) — the steps `commitlore init --json` reports, by their `step` name, as CommitLore
+ * 1.7.5's `runInit` runs them. Its exit code is 2 when a step could not run, 1 when one needs attention, and
+ * 0 otherwise; the one step whose code 1 says only "the final check has findings" is `doctor` (its
+ * `doctor --fix` run, code 1 when any check needs attention, a warning included).
  */
-export const judgeCommitLoreRuns = (init: CommitLoreRun | null, doctor: CommitLoreRun | null): CommitLoreObservation => {
-  if (init === null) return fail("commitlore init could not be run");
-  if (init.exitCode !== 0) {
-    return fail(`commitlore init failed (${init.exitCode}): ${tail(init.stderr) || tail(init.stdout) || "no diagnostic output"}`);
+const INIT_STEPS: ReadonlySet<string> = new Set(["release", "hooks", "trust", "index", "claude-hook", "mcp-registration", "policy", "doctor"]);
+const INIT_FINAL_STEP = "doctor";
+
+/**
+ * #1268 — why an `init` that exited 1 is not "set up, final check needs attention", or null when it is: its
+ * stdout is one JSON object whose `exitCode` is 1, whose `steps` are exactly `INIT_STEPS` (none missing,
+ * unknown or repeated), every step but `doctor` with code 0 and `doctor` with code 1 and its lines. Then the
+ * doctor run after it decides, judged as after an exit 0. A registration or policy step that needs attention,
+ * a step that could not run, or a report that does not say all of that is a failed `init`, as before.
+ */
+const initAttentionRefusal = (report: Record<string, unknown> | null): string | null => {
+  if (report === null) return "its output is not one JSON report";
+  if (report["exitCode"] !== 1) return `its report's exitCode is ${JSON.stringify(report["exitCode"])}, not the process's 1`;
+  const steps = report["steps"];
+  if (!Array.isArray(steps)) return "its report has no steps";
+  const names = steps.map((step) => (typeof step === "object" && step !== null ? (step as Record<string, unknown>)["step"] : undefined));
+  const unknown = names.filter((name) => typeof name !== "string" || !INIT_STEPS.has(name));
+  if (unknown.length > 0) return `its report has an unknown step ${JSON.stringify(unknown[0])}`;
+  if (new Set(names).size !== names.length) return "its report repeats a step";
+  if (names.length !== INIT_STEPS.size) return "its report is missing a step";
+  for (const step of steps as Array<Record<string, unknown>>) {
+    const expected = step["step"] === INIT_FINAL_STEP ? 1 : 0;
+    if (step["code"] !== expected) return `its ${String(step["step"])} step has code ${JSON.stringify(step["code"])}`;
   }
+  return null;
+};
+
+/** #1268 — the accepted report's `doctor` step lines, or null when there are none or they are not all text. */
+const initFinalCheckLines = (report: Record<string, unknown>): string[] | null => {
+  const final = (report["steps"] as Array<Record<string, unknown>>).find((step) => step["step"] === INIT_FINAL_STEP);
+  const lines = final?.["lines"];
+  return Array.isArray(lines) && lines.length > 0 && lines.every((line) => typeof line === "string") ? (lines as string[]) : null;
+};
+
+/**
+ * #1268 — the verdict on `init` alone: `READY` with the warnings it adds, or the FAIL. Exit 0 is ready, as
+ * before, unless its output is a JSON report naming another exitCode. Exit 1 is ready only as
+ * `initAttentionRefusal` says, its final check's lines carried, verbatim and each its own warning. Any other
+ * exit fails.
+ */
+const judgeCommitLoreInit = (init: CommitLoreRun): { outcome: "READY"; attention: boolean; warnings: string[] } | CommitLoreObservation => {
+  const diagnostic = tail(init.stderr) || tail(init.stdout) || "no diagnostic output";
+  if (init.exitCode === 0) {
+    const report = parsedObject(init.stdout);
+    if (report !== null && "exitCode" in report && report["exitCode"] !== 0) {
+      return fail(`commitlore init report exitCode is ${JSON.stringify(report["exitCode"])} while the process exited 0`);
+    }
+    return { outcome: "READY", attention: false, warnings: [] };
+  }
+  if (init.exitCode !== 1) return fail(`commitlore init failed (${init.exitCode}): ${diagnostic}`);
+  const report = parsedObject(init.stdout);
+  const refusal = initAttentionRefusal(report);
+  const lines = refusal === null && report !== null ? initFinalCheckLines(report) : null;
+  if (lines === null) return fail(`commitlore init failed (1): ${refusal ?? "its doctor step has no lines of text"}: ${diagnostic}`);
+  return { outcome: "READY", attention: true, warnings: lines.map((line) => `init ${INIT_FINAL_STEP} --fix: ${line}`) };
+};
+
+/** The verdict on `doctor --json` after a ready `init` (`judgeCommitLoreRuns`), unchanged by #1268. */
+const judgeCommitLoreDoctor = (doctor: CommitLoreRun | null): CommitLoreObservation => {
   if (doctor === null) return fail("commitlore doctor could not be run");
   let report: unknown;
   try {
@@ -317,6 +374,26 @@ export const judgeCommitLoreRuns = (init: CommitLoreRun | null, doctor: CommitLo
     return fail(`commitlore doctor ${contradictions.join("; ")} while the process exited 0`, warnings, status);
   }
   return { outcome: "PASS", reportStatus: status as "ok" | "degraded", warnings, detail: "commitlore doctor passed", report: doctor.stdout };
+};
+
+/**
+ * The verdict on one `init` + `doctor --json` pair, as `publish.py observe_commitlore` gives it: PASS only
+ * when both exit 0 and the doctor's report is a well-formed `commitlore_doctor.v2` report that does not
+ * contradict its exit code (status `failed`, a `fail` check, or a non-zero `exitCode` field). Every check
+ * that is not `ok` is carried as a warning. `run` is `null` for a step that could not be run at all.
+ *
+ * #1268 — or `init` exited 1 with a report saying only its final check needs attention
+ * (`judgeCommitLoreInit`): the doctor after it is judged exactly as after an exit 0, and the final check's
+ * lines come first among the warnings, on a PASS and on a FAIL alike.
+ */
+export const judgeCommitLoreRuns = (init: CommitLoreRun | null, doctor: CommitLoreRun | null): CommitLoreObservation => {
+  if (init === null) return fail("commitlore init could not be run");
+  const ready = judgeCommitLoreInit(init);
+  if (ready.outcome !== "READY") return ready;
+  const judged = judgeCommitLoreDoctor(doctor);
+  const warnings = [...ready.warnings, ...judged.warnings];
+  if (judged.outcome !== "PASS" || !ready.attention) return { ...judged, warnings };
+  return { ...judged, warnings, detail: "commitlore doctor passed; commitlore init exited 1: its final check needs attention" };
 };
 
 /**
@@ -874,12 +951,15 @@ export const createCommitLoreCliPort = (run: CommitLoreRunner = commitloreRunner
       } catch (error) {
         return fail(`commitlore init could not be run: ${(error as Error).message.slice(0, 300)}`);
       }
-      if (init.exitCode !== 0) return judgeCommitLoreRuns(init, null);
+      // #1268 — doctor runs only after a ready init: exit 0, or an exit 1 whose one finding is its final check.
+      const ready = judgeCommitLoreInit(init);
+      if (ready.outcome !== "READY") return ready;
       let doctor: CommitLoreRun;
       try {
         doctor = await command(doctorArgv, checkoutPath, { git });
       } catch (error) {
-        return fail(`commitlore doctor could not be run: ${(error as Error).message.slice(0, 300)}`);
+        // #1268 — an accepted exit 1's final-check lines stay on this FAIL too, as on every FAIL after the init gate.
+        return fail(`commitlore doctor could not be run: ${(error as Error).message.slice(0, 300)}`, ready.warnings);
       }
       return judgeCommitLoreRuns(init, doctor);
     } finally {
