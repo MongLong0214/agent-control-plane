@@ -214,31 +214,35 @@ const stallIdOf = (db: Db, findings: readonly ClassifiedStartFinding[], cause: S
 /**
  * Withdraws every daemon-start notice still owed (PENDING or SENT) that states the credential finding with its
  * obsolete owner route, as `withdrawResolvedNotices` withdraws a resolved one: REJECTED, with one
- * CEO_NOTIFICATION_WITHDRAWN record. A notice being sent (IN_FLIGHT) is that send's; an ACKed one was received
- * and stays as it is. No other stall's notice is touched.
+ * CEO_NOTIFICATION_WITHDRAWN record. So is one left IN_FLIGHT by a claim the outbox's lease rule presumes dead
+ * (`staleClaimCutoff`, the rule `reclaimStaleLeases` applies): withdrawn now, a later reclaim has nothing to put
+ * back. A claim still within its lease is that send's; an ACKed notice was received and stays as it is. No other
+ * stall's notice is touched.
  */
 const withdrawObsoleteRouteNotices = (ports: NoticePorts): void => {
   const correlation = correlationOf(IncidentClass.RESOURCE_STALLED, START_STALL_SUBJECT);
+  const staleClaim = ports.outbox.staleClaimCutoff();
+  const owed = `(status IN ('PENDING', 'SENT') OR (status = 'IN_FLIGHT' AND claimed_at <= ?))`;
   const rows = ports.db.all<{
     message_id: string; role_key: string; target_session_id: string; binding_generation: number; status: string; episode: unknown;
   }>(
     `SELECT o.message_id, o.role_key, o.target_session_id, o.binding_generation, o.status,
             json_extract(o.payload_json, '$.episode') AS episode
        FROM outbox o
-      WHERE o.kind = 'CEO_NOTIFICATION' AND o.run_id IS NULL AND o.status IN ('PENDING', 'SENT')
+      WHERE o.kind = 'CEO_NOTIFICATION' AND o.run_id IS NULL AND ${owed}
         AND json_valid(o.payload_json) = 1 AND json_extract(o.payload_json, '$.correlation') = ?
         AND EXISTS (SELECT 1 FROM json_each(o.payload_json, '$.findings') AS f
                      WHERE json_extract(f.value, '$.code') = ? AND json_extract(f.value, '$.repairOwner') = ?)
       ORDER BY o.created_at, o.rowid`,
-    [correlation, REVISED_ROUTE.code, REVISED_ROUTE.obsoleteRepairOwner],
+    [staleClaim, correlation, REVISED_ROUTE.code, REVISED_ROUTE.obsoleteRepairOwner],
   );
   for (const row of rows) {
     ports.db.tx(() => {
       const changed = ports.db.run(
         `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
                            retry_eligible = 0, next_attempt_at = NULL
-          WHERE message_id = ? AND status IN ('PENDING', 'SENT')`,
-        [ReasonCode.EVIDENCE_STALE, row.message_id],
+          WHERE message_id = ? AND ${owed}`,
+        [ReasonCode.EVIDENCE_STALE, row.message_id, staleClaim],
       ).changes;
       if (changed !== 1) return;
       ports.audit.record({

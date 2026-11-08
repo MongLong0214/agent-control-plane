@@ -424,6 +424,57 @@ describe("#1189 WIP 2: a start without the trusted gate credential is an explici
     }
   });
 
+  /** The base notice as a send left it: claimed now, by a process that may since have died. */
+  const claimBaseNotice = (h: Harness, messageId: string): void => {
+    h.cp.db.run(`UPDATE outbox SET status = 'IN_FLIGHT', claim_token = 'clm_base_sender', claimed_at = ? WHERE message_id = ?`,
+      [h.clock.nowIso(), messageId]);
+  };
+
+  it("an owner-route notice a dead process left IN_FLIGHT is withdrawn once its claim lease has expired, so a later reclaim restores nothing", async () => {
+    const h = makeHarness();
+    try {
+      bindCeo(h);
+      const baseNotice = queueBaseNotice(h);
+      claimBaseNotice(h, baseNotice);
+      h.clock.advance(10 * 60_000);
+      const stateDir = tempDir("acp-1189-wip2-dead-claim-");
+      expect(await new Daemon(h.cp, { stateDir }).start({ stallNotice: { deliver: async () => {} } }))
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+      expect(h.cp.db.get<{ status: string }>(`SELECT status FROM outbox WHERE message_id = ?`, [baseNotice])!.status).toBe("REJECTED");
+      expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN").map((event) => event.evidence)).toEqual([
+        expect.objectContaining({ messageId: baseNotice, status: "IN_FLIGHT" }),
+      ]);
+
+      // Whenever the outbox's own reclaim runs next, it has nothing of the owner route to put back.
+      h.cp.outbox.reclaimStaleLeases();
+      const offered = offeredNotices(h);
+      expect(offered).toHaveLength(1);
+      expect(offered[0]!.message_id).not.toBe(baseNotice);
+      expect(offered[0]!.payload_json).not.toMatch(/"repairOwner":"OWNER"/);
+      expect(offered[0]!.payload_json).not.toMatch(/install/i);
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  it("leaves an owner-route notice under a live, unexpired claim to that claim's sender", async () => {
+    const h = makeHarness();
+    try {
+      bindCeo(h);
+      const baseNotice = queueBaseNotice(h);
+      claimBaseNotice(h, baseNotice);
+      const stateDir = tempDir("acp-1189-wip2-live-claim-");
+      expect(await new Daemon(h.cp, { stateDir }).start({ stallNotice: { deliver: async () => {} } }))
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+      expect(h.cp.db.get<{ status: string; claim_token: string | null }>(
+        `SELECT status, claim_token FROM outbox WHERE message_id = ?`, [baseNotice],
+      )).toEqual({ status: "IN_FLIGHT", claim_token: "clm_base_sender" });
+      expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN")).toHaveLength(0);
+    } finally {
+      h.cp.close();
+    }
+  });
+
   it("withdraws nothing of another stall kind's incident: a security block's notice is offered again as it was", async () => {
     const h = makeHarness();
     try {
