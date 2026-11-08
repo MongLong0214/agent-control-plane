@@ -1017,7 +1017,9 @@ export class Doctor {
           blocking: true,
           confidence: "HIGH",
           observedEvidence: { executionId: execution.execution_id, startedAt: execution.started_at },
-          recommendedAction: "supply a live worker session or a positive worker process id before opening a receipt",
+          // #1189 (CEO msg_390e287c) — the fact and the open decision, never a request that someone act or a
+          // repair no tool is confirmed for; under the audit's 200-character bound.
+          recommendedAction: "nothing is requested of anyone: this RUNNING receipt names no worker session or process, so what it ran is unknown; how it is settled is an open decision",
         });
         continue;
       }
@@ -1035,7 +1037,7 @@ export class Doctor {
             workerProcessId: execution.worker_process_id,
             startedAt: execution.started_at,
           },
-          recommendedAction: "replace the receipt with one backed by a known session or a positive process id",
+          recommendedAction: "nothing is requested of anyone: this RUNNING receipt names no known worker session and no positive process id, so what it ran is unknown; how it is settled is an open decision",
         });
         continue;
       }
@@ -1111,7 +1113,8 @@ export class Doctor {
           blocking: Boolean(activeBinding || unfinishedWork) && !recoverableBinding,
           confidence: "HIGH",
           observedEvidence: { pid: session.osPid, lifecycle: session.lifecycle },
-          recommendedAction: "mark the session ERROR and recover its bindings",
+          // #1189 (CEO msg_390e287c) — the resolving command is information, not an instruction; under 200 characters.
+          recommendedAction: "nothing is requested of anyone: this session's process is gone; releasing its binding is an operator-socket action (agentctl binding recover-dead[-ceo]), and work it owns is an open decision",
         });
       }
     }
@@ -1855,8 +1858,9 @@ export class Doctor {
             (o) => `${o.observation_id}:${o.observing_authority}:${o.observed_outcome}`,
           ),
         },
+        // #1189 (CEO msg_390e287c) — the resolving command is information, not an instruction; under 200 characters.
         recommendedAction:
-          "run `agentctl conversation contradictions` to read the conflicting observations, then `agentctl conversation adjudicate <actor> <turn> <reason-code> <evidence-digest> <id>...` citing every one of them. Adjudication closes the disagreement; it cannot choose an outcome that permits a re-run",
+          "nothing is requested of anyone: two authorities disagree on how this turn ended, and its actor takes no new turn; resolution is an operator-socket action (agentctl conversation adjudicate)",
       });
     }
 
@@ -2080,9 +2084,10 @@ export class Doctor {
             checkoutPath: repository.checkoutPath,
             ...(projectSuspended ? { projectSuspended: true } : {}),
           },
+          // #1189 (CEO msg_390e287c) — the blocking text states the fact and the open decision; under 200 characters.
           recommendedAction: projectSuspended
             ? "restore the checkout before resuming the project"
-            : "restore the checkout path or re-register the repository",
+            : "nothing is requested of anyone: this checkout is missing or not a repository; re-registering it or suspending its project is an open decision",
         });
       }
     }

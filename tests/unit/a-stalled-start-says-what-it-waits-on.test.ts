@@ -1,4 +1,4 @@
-import { chmodSync, readFileSync } from "node:fs";
+import { chmodSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterAll, describe, expect, it, vi } from "vitest";
@@ -113,21 +113,22 @@ describe("#1189 D1: a stalled start's blocking findings are permanent or transie
       // #1189 WIP 2: an explicit failed start told to the CEO, never a wait on the owner.
       TRUSTED_GATE_CREDENTIAL_MISSING: "PERMANENT/CEO/CREDENTIAL",
       TRUSTED_GATE_CREDENTIAL_PERMISSIONS: "PERMANENT/OWNER/SECURITY",
-      CANONICAL_TURN_CONTRADICTED: "PERMANENT/OWNER/SECURITY",
-      REPOSITORY_UNREADABLE: "PERMANENT/OWNER/OWNER_GATED",
+      // #1189 (CEO msg_390e287c): explicit failures told to the CEO, never a wait on the owner.
+      CANONICAL_TURN_CONTRADICTED: "PERMANENT/CEO/SECURITY",
+      REPOSITORY_UNREADABLE: "PERMANENT/CEO/OWNER_GATED",
       ACTIVE_RUN_WITHOUT_OWNER: "PERMANENT/CEO/RUN_DECISION",
-      WORKER_IDENTITY_MISSING: "PERMANENT/OWNER/RECEIPT",
-      WORKER_IDENTITY_UNVERIFIABLE: "PERMANENT/OWNER/RECEIPT",
+      WORKER_IDENTITY_MISSING: "PERMANENT/CEO/RECEIPT",
+      WORKER_IDENTITY_UNVERIFIABLE: "PERMANENT/CEO/RECEIPT",
       // The restart reconcile marks the session ERROR and the finding stays blocking
       // (doctor-daemon-r2 "keeps a dead ... actionable after settlement"): no restart clears it.
-      SESSION_PROCESS_MISSING: "PERMANENT/OWNER/DEAD_SESSION",
+      SESSION_PROCESS_MISSING: "PERMANENT/CEO/DEAD_SESSION",
       DEAD_WORKER_WITH_OPEN_RECEIPT: "TRANSIENT/DAEMON/PROCESS",
       REPOSITORY_PROBE_FAILED: "TRANSIENT/DAEMON/PROBE",
       WORKTREE_PROBE_FAILED: "TRANSIENT/DAEMON/PROBE",
       ROLE_COVERAGE_NO_VALID_COVERAGE: "TRANSIENT/DAEMON/COVERAGE",
       CAPACITY_SWEEP_NOT_REACHED: "TRANSIENT/DAEMON/COVERAGE",
       // A code nobody classified is told, not left to a backoff that may never end.
-      SOMETHING_NEW: "PERMANENT/OWNER/UNCLASSIFIED",
+      SOMETHING_NEW: "PERMANENT/CEO/UNCLASSIFIED",
     });
   });
 });
@@ -264,6 +265,53 @@ describe("#1189 D1: a start refused on a permanent finding", () => {
   });
 });
 
+/** A finding as an earlier build routed it to the owner, with the recovery text it wrote. */
+interface OwnerRoute { code: string; scope: string; basis: string; recoveryAction: string }
+
+/** The trusted-gate credential's route as 7ef40dd8 wrote it. */
+const CREDENTIAL_OWNER_ROUTE: OwnerRoute = {
+  code: "TRUSTED_GATE_CREDENTIAL_MISSING", scope: "github", basis: "CREDENTIAL",
+  recoveryAction: "install the trusted GitHub credential, then restart the daemon",
+};
+
+/**
+ * The notice an earlier build queued for a stall on one owner-routed finding, as it wrote it: the owner route, under
+ * the episode its stall id gave (no successful start before it, one PERMANENT finding, no route version), with the
+ * delivery record `deliverIncident` keeps.
+ */
+const queueBaseNotice = (h: Harness, route: OwnerRoute = CREDENTIAL_OWNER_ROUTE): string => {
+  const episode = digestOf({ since: null, cause: "PERMANENT", findings: [`${route.code}|${route.scope}`] });
+  const delivered = deliverIncident(h.cp, {
+    cls: IncidentClass.RESOURCE_STALLED, subject: DAEMON_START_SUBJECT, runId: null, episode,
+    payload: {
+      source: "DAEMON_START_STALL", stallId: episode, phase: "REFUSED", cause: "PERMANENT", crashLoop: false,
+      startRefused: true, acpActionPath: "NOT_RUNNING",
+      blocker: "the daemon start is refused and ACP's action path is not running: its startup doctor blocks on findings no restart clears",
+      findings: [{
+        code: route.code, scope: route.scope, cause: "PERMANENT", repairOwner: "OWNER", basis: route.basis, recoveryAction: route.recoveryAction,
+      }],
+      blockedRunCount: 0,
+      blockedRuns: [],
+      runEffect: "no run was completed, failed or dispatched by this start; a run whose execution ran may have effects to check before it runs again",
+      whyItMatters: "until a start succeeds no run is dispatched and no ACP tool acts on the CEO's behalf; the findings name who can clear them",
+    },
+  });
+  if (!delivered.allowed || delivered.value.messageId === null) throw new Error("the base notice was not queued");
+  return delivered.value.messageId;
+};
+
+/** Every CEO notice still owed or being sent: what a route would offer the CEO. */
+const offeredNotices = (h: Harness) => h.cp.db.all<{ message_id: string; payload_json: string }>(
+  `SELECT message_id, payload_json FROM outbox
+    WHERE kind = 'CEO_NOTIFICATION' AND status IN ('PENDING', 'IN_FLIGHT', 'SENT') ORDER BY created_at, rowid`,
+);
+
+/** The base notice as a send left it: claimed now, by a process that may since have died. */
+const claimBaseNotice = (h: Harness, messageId: string): void => {
+  h.cp.db.run(`UPDATE outbox SET status = 'IN_FLIGHT', claim_token = 'clm_base_sender', claimed_at = ? WHERE message_id = ?`,
+    [h.clock.nowIso(), messageId]);
+};
+
 /**
  * #1189 WIP 2 (CEO msg_7cb20fea) — a daemon started without the trusted gate's GitHub App credential refuses
  * that start explicitly: it releases its lock, records why and exits under the crash-loop backoff. It is not a
@@ -349,38 +397,6 @@ describe("#1189 WIP 2: a start without the trusted gate credential is an explici
     }
   });
 
-  /**
-   * The notice 7ef40dd8 queued for this stall, as it wrote it: the owner route, under the episode its stall id gave
-   * (no successful start before it, one PERMANENT finding), with the delivery record `deliverIncident` keeps.
-   */
-  const queueBaseNotice = (h: Harness): string => {
-    const episode = digestOf({ since: null, cause: "PERMANENT", findings: ["TRUSTED_GATE_CREDENTIAL_MISSING|github"] });
-    const delivered = deliverIncident(h.cp, {
-      cls: IncidentClass.RESOURCE_STALLED, subject: DAEMON_START_SUBJECT, runId: null, episode,
-      payload: {
-        source: "DAEMON_START_STALL", stallId: episode, phase: "REFUSED", cause: "PERMANENT", crashLoop: false,
-        startRefused: true, acpActionPath: "NOT_RUNNING",
-        blocker: "the daemon start is refused and ACP's action path is not running: its startup doctor blocks on findings no restart clears",
-        findings: [{
-          code: "TRUSTED_GATE_CREDENTIAL_MISSING", scope: "github", cause: "PERMANENT", repairOwner: "OWNER", basis: "CREDENTIAL",
-          recoveryAction: "install the trusted GitHub credential, then restart the daemon",
-        }],
-        blockedRunCount: 0,
-        blockedRuns: [],
-        runEffect: "no run was completed, failed or dispatched by this start; a run whose execution ran may have effects to check before it runs again",
-        whyItMatters: "until a start succeeds no run is dispatched and no ACP tool acts on the CEO's behalf; the findings name who can clear them",
-      },
-    });
-    if (!delivered.allowed || delivered.value.messageId === null) throw new Error("the base notice was not queued");
-    return delivered.value.messageId;
-  };
-
-  /** Every CEO notice still owed or being sent: what a route would offer the CEO. */
-  const offeredNotices = (h: Harness) => h.cp.db.all<{ message_id: string; payload_json: string }>(
-    `SELECT message_id, payload_json FROM outbox
-      WHERE kind = 'CEO_NOTIFICATION' AND status IN ('PENDING', 'IN_FLIGHT', 'SENT') ORDER BY created_at, rowid`,
-  );
-
   it("after an upgrade over a start the earlier build refused, its owner-route notice is withdrawn, the current statement reaches the CEO once, and later starts add none", async () => {
     const h = makeHarness();
     try {
@@ -423,12 +439,6 @@ describe("#1189 WIP 2: a start without the trusted gate credential is an explici
       h.cp.close();
     }
   });
-
-  /** The base notice as a send left it: claimed now, by a process that may since have died. */
-  const claimBaseNotice = (h: Harness, messageId: string): void => {
-    h.cp.db.run(`UPDATE outbox SET status = 'IN_FLIGHT', claim_token = 'clm_base_sender', claimed_at = ? WHERE message_id = ?`,
-      [h.clock.nowIso(), messageId]);
-  };
 
   it("an owner-route notice a dead process left IN_FLIGHT is withdrawn once its claim lease has expired, so a later reclaim restores nothing", async () => {
     const h = makeHarness();
@@ -505,10 +515,329 @@ describe("#1189 WIP 2: a start without the trusted gate credential is an explici
       code: "TRUSTED_GATE_CREDENTIAL_PERMISSIONS", scope: "x", cause: "PERMANENT", repairOwner: "OWNER", basis: "SECURITY",
       recoveryAction: "restrict the secret directory to owner-only access, then restart the daemon",
     });
-    expect(routeOf("CANONICAL_TURN_CONTRADICTED")).toEqual({
-      code: "CANONICAL_TURN_CONTRADICTED", scope: "x", cause: "PERMANENT", repairOwner: "OWNER", basis: "SECURITY",
+  });
+});
+
+/**
+ * #1189 (CEO msg_390e287c) — the remaining non-security owner routes. A start blocked on a checkout it cannot
+ * read, a dead session that still holds authority or work, a contradicted conversation turn, a receipt whose
+ * worker cannot be named, or a finding nobody classified was already refused and exited; only its notice named
+ * the owner and asked for a repair. Each is now an explicit failure told to the CEO once, which states the fact
+ * and the open decision, asks nobody to act, and says the start stays refused. Cause, basis, scope and code are
+ * as they were, and the host's security blocks keep their owner routes.
+ */
+describe("#1189: the remaining non-security owner routes are explicit failures told to the CEO", () => {
+  /** A request that somebody act, in the imperative the earlier routes used; a command named as information is not one. */
+  const ASKS_SOMEONE =
+    /(?<![\w-])(install|log ?in|login|restore|approve|re-?authori[sz]e|provide|supply|recover|re-?pin|re-?register|establish|settle|replace|read|mark|run)(?![\w-])/i;
+
+  /** Each changed route as the base build (8781bbd1) wrote it. */
+  const CHANGED: readonly OwnerRoute[] = [
+    {
+      code: "REPOSITORY_UNREADABLE", scope: "repository:fixture", basis: "OWNER_GATED",
+      recoveryAction: "restore the checkout or re-register the repository; suspending the project is the owner's call",
+    },
+    {
+      code: "SESSION_PROCESS_MISSING", scope: "session:ses_dead", basis: "DEAD_SESSION",
+      recoveryAction: "recover the dead session's bindings or re-pin the runs it owns; no operator door opens while the start refuses",
+    },
+    {
+      code: "CANONICAL_TURN_CONTRADICTED", scope: "conversation", basis: "SECURITY",
       recoveryAction: "an operator adjudicates the contradicted turn (agentctl conversation adjudicate), citing every observation",
+    },
+    {
+      code: "WORKER_IDENTITY_MISSING", scope: "run:run_receipt", basis: "RECEIPT",
+      recoveryAction: "the receipt names no worker; establish what ran, then settle the receipt",
+    },
+    {
+      code: "WORKER_IDENTITY_UNVERIFIABLE", scope: "run:run_receipt", basis: "RECEIPT",
+      recoveryAction: "the receipt names no known worker; establish what ran, then settle the receipt",
+    },
+    // The fallback for a code no table names.
+    {
+      code: "SOMETHING_NEW", scope: "x", basis: "UNCLASSIFIED",
+      recoveryAction: "read the startup doctor report for this finding's remedy",
+    },
+  ];
+  const changed = (code: string): OwnerRoute => CHANGED.find((route) => route.code === code)!;
+
+  /**
+   * The system doctor also reports `route`'s finding, blocking. Most of these findings need state a fixture cannot
+   * build on the current schema (a receipt with no worker session is refused by its NOT NULL), so the doctor reports
+   * it as a startup doctor would; everything after the report is the daemon's own start path.
+   */
+  const doctorAlsoReports = (h: Harness, route: OwnerRoute): void => {
+    const run = h.cp.doctor.run.bind(h.cp.doctor);
+    vi.spyOn(h.cp.doctor, "run").mockImplementation(async (...args) => {
+      const report = await run(...args);
+      return {
+        ...report,
+        status: "BLOCKED",
+        findings: [...report.findings, {
+          code: route.code, severity: "ERROR", scope: route.scope, blocking: true, confidence: "HIGH",
+          observedEvidence: {}, recommendedAction: "the doctor's own text",
+        }],
+      };
     });
+  };
+
+  /** A deployment whose only blocking finding is the one the doctor is told to report. */
+  const blockedOn = (route: OwnerRoute): Harness => {
+    const h = makeHarness();
+    bindCeo(h);
+    h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    doctorAlsoReports(h, route);
+    return h;
+  };
+
+  /** The statement each changed route must make: a fact, the start refused, nobody asked, within the audit bound. */
+  const expectExplicitFailure = (text: string): void => {
+    expect(text).toMatch(/^nothing is requested of anyone: /);
+    expect(text).toMatch(/\bstart\b.*\brefused\b|\brefused\b.*\bstart\b/);
+    expect(text).not.toMatch(ASKS_SOMEONE);
+    expect(text).not.toMatch(/\bowner\b/i);
+    expect(text).not.toMatch(/\//);
+    // The audit's free-text bound: longer, and the start's failure records would lose their evidence.
+    expect(text.length).toBeLessThanOrEqual(200);
+  };
+
+  it.each(CHANGED.map((route) => [route.code, route] as const))(
+    "%s: every start is refused with its lock released and told to the CEO once, with no owner request",
+    async (_code, route) => {
+      const h = blockedOn(route);
+      try {
+        const stateDir = tempDir("acp-1189-ceo-route-");
+        const sent: Array<readonly string[]> = [];
+        const STARTS = 3;
+        for (let attempt = 1; attempt <= STARTS; attempt += 1) {
+          const daemon = new Daemon(h.cp, { stateDir });
+          const refused = await daemon.start({ stallNotice: { deliver: async (messageIds) => { sent.push(messageIds); } } });
+          expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+          expect(daemon.lock.held()).toBe(false);
+          const stall = health(stateDir)["startStall"] as { findings: Array<Record<string, unknown>> };
+          expect(stall).toMatchObject({ phase: "REFUSED", cause: "PERMANENT", crashLoop: false });
+          // Code, scope, cause and basis as they were; the CEO named as who it is told to.
+          expect(stall.findings).toEqual([{
+            code: route.code, scope: route.scope, cause: "PERMANENT", repairOwner: "CEO", basis: route.basis,
+            recoveryAction: expect.any(String),
+          }]);
+          expectExplicitFailure(stall.findings[0]!["recoveryAction"] as string);
+          h.clock.advance(10 * 60_000);
+        }
+
+        // Each start's failure record keeps its evidence, which the audit refuses for free text over its bound.
+        const failures = [...h.cp.audit.byKind("DAEMON_START_FAILED"), ...h.cp.audit.byKind("DAEMON_CRASH_LOOP")];
+        expect(failures).toHaveLength(STARTS);
+        for (const failure of failures) {
+          expect(failure.evidence).toMatchObject({
+            stall: { phase: "REFUSED", cause: "PERMANENT", findings: [{ code: route.code, scope: route.scope, repairOwner: "CEO" }] },
+          });
+        }
+        // One notice, to the CEO, offered again by each start and never written again; no owner prompt.
+        const notices = stallNotices(h);
+        expect(notices).toHaveLength(1);
+        expect(notices[0]!.payload).toMatchObject({
+          findings: [classifyStartFinding({ code: route.code, severity: "ERROR", scope: route.scope })],
+        });
+        expect(sent).toEqual(Array.from({ length: STARTS }, () => [notices[0]!.message_id]));
+        expect(h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM telegram_owner_prompts`)!.n).toBe(0);
+        expect(h.cp.db.all<{ role_key: string }>(`SELECT DISTINCT role_key FROM outbox`)).toEqual([{ role_key: roleKeyFor(Role.CEO) }]);
+      } finally {
+        h.cp.close();
+      }
+    },
+  );
+
+  it("a start over a checkout that is gone is refused, its lock released, and told to the CEO with no owner request", async () => {
+    const h = makeHarness();
+    try {
+      bindCeo(h);
+      h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+      const { identity } = await registerFixtureProject(h);
+      rmSync(h.repoPath, { recursive: true, force: true });
+      const daemon = new Daemon(h.cp, { stateDir: tempDir("acp-1189-ceo-checkout-") });
+      expect(await daemon.start({ stallNotice: { deliver: async () => {} } }))
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+      expect(daemon.lock.held()).toBe(false);
+      const [notice, ...others] = stallNotices(h);
+      expect(others).toEqual([]);
+      const findings = notice!.payload["findings"] as Array<Record<string, unknown>>;
+      expect(findings).toContainEqual(expect.objectContaining({
+        code: "REPOSITORY_UNREADABLE", scope: `repository:${identity}`, cause: "PERMANENT", repairOwner: "CEO", basis: "OWNER_GATED",
+      }));
+      expect(findings.filter((finding) => finding["repairOwner"] === "OWNER")).toEqual([]);
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  it("the receipt routes name no REPAIR_EXECUTE and offer no repair; the unclassified route says its cause is unconfirmed", () => {
+    for (const code of ["WORKER_IDENTITY_MISSING", "WORKER_IDENTITY_UNVERIFIABLE"]) {
+      const { recoveryAction } = classifyStartFinding({ code, severity: "ERROR", scope: "run:x" });
+      expect(recoveryAction).not.toMatch(/REPAIR_EXECUTE|repair/i);
+      expect(recoveryAction).toMatch(/what ran is unknown/);
+      expect(recoveryAction).toMatch(/open decision/);
+    }
+    const unclassified = classifyStartFinding({ code: "SOMETHING_NEW", severity: "ERROR", scope: "x" }).recoveryAction;
+    expect(unclassified).toMatch(/cause is unconfirmed/);
+    expect(unclassified).toMatch(/\bblocked\b/);
+    expect(unclassified).not.toMatch(/\b(generic|error)\b/i);
+  });
+
+  it.each(CHANGED.map((route) => [route.code, route] as const))(
+    "%s: after an upgrade over a start the earlier build refused, its owner-route notice is withdrawn, the current statement reaches the CEO once, and later starts add none",
+    async (_code, route) => {
+      const h = blockedOn(route);
+      try {
+        const baseNotice = queueBaseNotice(h, route);
+        const stateDir = tempDir("acp-1189-ceo-upgrade-");
+        const sent: Array<readonly string[]> = [];
+        const start = async () => {
+          const refused = await new Daemon(h.cp, { stateDir }).start({
+            stallNotice: { deliver: async (messageIds) => { sent.push(messageIds); } },
+          });
+          expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+          h.clock.advance(10 * 60_000);
+        };
+
+        await start();
+        expect(h.cp.db.get<{ status: string }>(`SELECT status FROM outbox WHERE message_id = ?`, [baseNotice])!.status).toBe("REJECTED");
+        const offered = offeredNotices(h);
+        expect(offered).toHaveLength(1);
+        const current = offered[0]!;
+        expect(current.message_id).not.toBe(baseNotice);
+        expect(current.payload_json).not.toMatch(/"repairOwner":"OWNER"/);
+        expect(JSON.parse(current.payload_json)).toMatchObject({
+          source: "DAEMON_START_STALL",
+          findings: [classifyStartFinding({ code: route.code, severity: "ERROR", scope: route.scope })],
+        });
+        expect(sent).toEqual([[current.message_id]]);
+        expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN").map((event) => event.evidence)).toEqual([
+          expect.objectContaining({ messageId: baseNotice, status: "PENDING", withdrawnFor: "ROUTE_REVISED" }),
+        ]);
+
+        await start();
+        await start();
+        expect(offeredNotices(h).map((row) => row.message_id)).toEqual([current.message_id]);
+        expect(stallNotices(h).map((row) => row.message_id)).toEqual([baseNotice, current.message_id]);
+        expect(sent).toEqual([[current.message_id], [current.message_id], [current.message_id]]);
+        expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN")).toHaveLength(1);
+      } finally {
+        h.cp.close();
+      }
+    },
+  );
+
+  it("an unclassified finding's owner-route notice a dead process left IN_FLIGHT is withdrawn once its claim lease has expired, so a later reclaim restores nothing", async () => {
+    const route = changed("SOMETHING_NEW");
+    const h = blockedOn(route);
+    try {
+      const baseNotice = queueBaseNotice(h, route);
+      claimBaseNotice(h, baseNotice);
+      h.clock.advance(10 * 60_000);
+      expect(await new Daemon(h.cp, { stateDir: tempDir("acp-1189-ceo-dead-claim-") }).start({ stallNotice: { deliver: async () => {} } }))
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+      expect(h.cp.db.get<{ status: string }>(`SELECT status FROM outbox WHERE message_id = ?`, [baseNotice])!.status).toBe("REJECTED");
+      expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN").map((event) => event.evidence)).toEqual([
+        expect.objectContaining({ messageId: baseNotice, status: "IN_FLIGHT", withdrawnFor: "ROUTE_REVISED" }),
+      ]);
+
+      h.cp.outbox.reclaimStaleLeases();
+      const offered = offeredNotices(h);
+      expect(offered).toHaveLength(1);
+      expect(offered[0]!.message_id).not.toBe(baseNotice);
+      expect(offered[0]!.payload_json).not.toMatch(/"repairOwner":"OWNER"/);
+      expect(JSON.parse(offered[0]!.payload_json)).toMatchObject({
+        findings: [classifyStartFinding({ code: route.code, severity: "ERROR", scope: route.scope })],
+      });
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  it("leaves a changed finding's owner-route notice under a live, unexpired claim to that claim's sender", async () => {
+    const h = blockedOn(changed("SESSION_PROCESS_MISSING"));
+    try {
+      const baseNotice = queueBaseNotice(h, changed("SESSION_PROCESS_MISSING"));
+      claimBaseNotice(h, baseNotice);
+      const daemon = new Daemon(h.cp, { stateDir: tempDir("acp-1189-ceo-live-claim-") });
+      expect(await daemon.start({ stallNotice: { deliver: async () => {} } }))
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+      expect(daemon.lock.held()).toBe(false);
+      expect(h.cp.db.get<{ status: string; claim_token: string | null }>(
+        `SELECT status, claim_token FROM outbox WHERE message_id = ?`, [baseNotice],
+      )).toEqual({ status: "IN_FLIGHT", claim_token: "clm_base_sender" });
+      expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN")).toHaveLength(0);
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  it("leaves a changed finding's owner-route notice the CEO already ACKed as it is", async () => {
+    const route = changed("WORKER_IDENTITY_UNVERIFIABLE");
+    const h = blockedOn(route);
+    try {
+      const baseNotice = queueBaseNotice(h, route);
+      const ceo = h.cp.bindings.active(roleKeyFor(Role.CEO))!;
+      expect(h.cp.outbox.acknowledge(baseNotice, ceo.sessionId, ceo.bindingGeneration).allowed).toBe(true);
+      expect(await new Daemon(h.cp, { stateDir: tempDir("acp-1189-ceo-acked-") }).start({ stallNotice: { deliver: async () => {} } }))
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+      expect(h.cp.db.get<{ status: string }>(`SELECT status FROM outbox WHERE message_id = ?`, [baseNotice])!.status).toBe("ACKED");
+      expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN")).toHaveLength(0);
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  it("the doctor's findings for a missing checkout, a dead session and an unverifiable receipt state the fact and ask nobody to act, with code, severity, scope and blocking unchanged", async () => {
+    const h = makeHarness();
+    try {
+      bindCeo(h);
+      const { projectId, repositoryId, identity } = await registerFixtureProject(h);
+      const created = h.cp.runs.create({
+        projectId, executionMode: ExecutionMode.STANDARD, contract: CONTRACT,
+        repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+      });
+      if (!created.allowed) throw new Error(created.message);
+      const dispatched = await h.cp.runs.dispatch(created.value.runId);
+      if (!dispatched.allowed) throw new Error(dispatched.message);
+      const runId = dispatched.value.runId;
+      const tasks = h.cp.tasks.submit(runId, [{ key: "a", title: "work", category: "implementation" }]);
+      if (!tasks.allowed) throw new Error(tasks.message);
+      // A receipt with no process id, whose worker session the registry cannot name.
+      const workerSessionId = bindWorker(h, tasks.value[0]!.taskId);
+      const execution = h.cp.tasks.startExecution({
+        runId, taskId: tasks.value[0]!.taskId, ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
+        workerSessionId, workerProcessId: null, provider: "scripted", model: "scripted-worker", repositoryId,
+      });
+      if (!execution.allowed) throw new Error(execution.message);
+      const get = h.cp.sessions.get.bind(h.cp.sessions);
+      vi.spyOn(h.cp.sessions, "get").mockImplementation((sessionId) => (sessionId === workerSessionId ? null : get(sessionId)));
+      // The run's owner session is dead while it still owns the run.
+      const ownerSessionId = h.cp.runs.get(runId)!.ownerSessionId!;
+      h.cp.sessions.setPid(ownerSessionId, 2147483647);
+      // And the checkout is gone.
+      rmSync(h.repoPath, { recursive: true, force: true });
+
+      const report = await h.cp.doctor.run("system");
+      const of = (code: string, scope: string) => report.findings.find((finding) => finding.code === code && finding.scope === scope);
+      expect(of("REPOSITORY_UNREADABLE", `repository:${identity}`)).toMatchObject({ severity: "ERROR", blocking: true });
+      expect(of("SESSION_PROCESS_MISSING", `session:${ownerSessionId}`)).toMatchObject({ severity: "ERROR", blocking: true });
+      expect(of("WORKER_IDENTITY_UNVERIFIABLE", `run:${runId}`)).toMatchObject({ severity: "ERROR", blocking: true });
+      for (const finding of [
+        of("REPOSITORY_UNREADABLE", `repository:${identity}`)!,
+        of("SESSION_PROCESS_MISSING", `session:${ownerSessionId}`)!,
+        of("WORKER_IDENTITY_UNVERIFIABLE", `run:${runId}`)!,
+      ]) {
+        expect(finding.recommendedAction).toMatch(/^nothing is requested of anyone: /);
+        expect(finding.recommendedAction).not.toMatch(ASKS_SOMEONE);
+        expect(finding.recommendedAction).not.toMatch(/\bowner\b/i);
+        expect(finding.recommendedAction.length).toBeLessThanOrEqual(200);
+      }
+      expect(of("WORKER_IDENTITY_UNVERIFIABLE", `run:${runId}`)!.recommendedAction).not.toMatch(/REPAIR_EXECUTE|repair/i);
+    } finally {
+      h.cp.close();
+    }
   });
 });
 
@@ -662,7 +991,8 @@ describe("#1189 A4: a start parked on a contradicted conversation", () => {
       expect(others).toEqual([]);
       expect(notice!.payload).toMatchObject({
         source: "DAEMON_START_STALL", phase: "PARKED", cause: "PERMANENT", startRefused: true, acpActionPath: "NOT_RUNNING",
-        findings: [{ code: "CANONICAL_TURN_CONTRADICTED", cause: "PERMANENT", repairOwner: "OWNER", basis: "SECURITY" }],
+        // #1189 (CEO msg_390e287c): told to the CEO as an explicit failure, never a wait on the owner.
+        findings: [{ code: "CANONICAL_TURN_CONTRADICTED", cause: "PERMANENT", repairOwner: "CEO", basis: "SECURITY" }],
       });
       expect(sent).toEqual([{ messageIds: [notice!.message_id], lockHeld: true }]);
 
@@ -677,6 +1007,22 @@ describe("#1189 A4: a start parked on a contradicted conversation", () => {
       expect((await starting).allowed).toBe(false);
     } finally {
       await daemon.stop();
+      h.cp.close();
+    }
+  });
+
+  it("the doctor's finding states the contradiction and names its operator-socket resolution as information, asking nobody to act", async () => {
+    const h = makeHarness();
+    try {
+      quarantinedActor(h);
+      const finding = (await h.cp.doctor.run("system")).findings.find((f) => f.code === "CANONICAL_TURN_CONTRADICTED");
+      expect(finding).toMatchObject({ severity: "ERROR", scope: "conversation", blocking: true });
+      expect(finding!.recommendedAction).toMatch(/^nothing is requested of anyone: /);
+      expect(finding!.recommendedAction).toContain("agentctl conversation adjudicate");
+      expect(finding!.recommendedAction).not.toMatch(/^run\b|\brun `/);
+      expect(finding!.recommendedAction).not.toMatch(/\bowner\b/i);
+      expect(finding!.recommendedAction.length).toBeLessThanOrEqual(200);
+    } finally {
       h.cp.close();
     }
   });
