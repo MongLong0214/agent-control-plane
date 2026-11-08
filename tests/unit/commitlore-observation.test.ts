@@ -258,6 +258,21 @@ describe("#1268: a warning-only init exit 1 is initialization done, its final ch
     expect(verdict.warnings.slice(0, FINAL_CHECK_LINES.length)).toEqual(FINAL_CHECK_LINES.map((line) => `init doctor --fix: ${line}`));
   });
 
+  it("a doctor that cannot be run after a warning-only init exit 1 fails with the final check's lines still carried; after an exit 0 it carries none", async () => {
+    const throwing = (init: CommitLoreRun) =>
+      createCommitLoreCliPort(async (argv) => {
+        if (argv[0] === "doctor") throw new Error("commitlore doctor did not answer within 180000 ms");
+        return init;
+      });
+    expect(await throwing(attention()).observe("/checkout")).toEqual({
+      outcome: "FAIL",
+      reportStatus: null,
+      warnings: FINAL_CHECK_LINES.map((line) => `init doctor --fix: ${line}`),
+      detail: "commitlore doctor could not be run: commitlore doctor did not answer within 180000 ms",
+    });
+    expect(await throwing(ok()).observe("/checkout")).toMatchObject({ outcome: "FAIL", warnings: [], detail: expect.stringMatching(/^commitlore doctor could not be run: /) });
+  });
+
   it("an init exit 0 whose JSON report names another exitCode fails, never a PASS; any other exit 0 is judged as before", async () => {
     for (const exitCode of [1, 2, "0", null]) {
       const init = ok(initReport({ exitCode }));

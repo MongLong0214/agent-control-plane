@@ -958,7 +958,8 @@ export const createCommitLoreCliPort = (run: CommitLoreRunner = commitloreRunner
       try {
         doctor = await command(doctorArgv, checkoutPath, { git });
       } catch (error) {
-        return fail(`commitlore doctor could not be run: ${(error as Error).message.slice(0, 300)}`);
+        // #1268 — an accepted exit 1's final-check lines stay on this FAIL too, as on every FAIL after the init gate.
+        return fail(`commitlore doctor could not be run: ${(error as Error).message.slice(0, 300)}`, ready.warnings);
       }
       return judgeCommitLoreRuns(init, doctor);
     } finally {
