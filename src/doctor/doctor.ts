@@ -29,6 +29,7 @@ import type { GitHubKernel } from "../github/github-kernel.ts";
 import { git, isClean, tryRevParse } from "../git/git.ts";
 import { HOLDER_CLAIMED_KIND_SQL, type Outbox, sourceNeverSpentSql } from "../outbox/outbox.ts";
 import { isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
+import { type ProjectCi, projectCi } from "../registry/project-ci.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
@@ -269,6 +270,11 @@ export interface DoctorReport {
   scope: DoctorScope;
   target: string | null;
   status: DoctorStatus;
+  /**
+   * #1172 — scope "project" only: each project the report covers, with its CI as `project_get` reads
+   * it. Beside `status`, never part of it: CI adds no finding and moves no status.
+   */
+  ci?: Array<{ projectId: string; ci: ProjectCi }>;
   findings: Finding[];
   ranAt: string;
 }
@@ -594,6 +600,10 @@ export class Doctor {
       scope,
       target: target ?? null,
       status: aggregate(findings),
+      ...(scope === "project" ? { ci: this.projectsCovered(target ?? null).map((project) => ({
+        projectId: project.projectId,
+        ci: projectCi(this.db, this.projects, project.projectId),
+      })) } : {}),
       findings,
       ranAt: this.clock.nowIso(),
     };
@@ -694,9 +704,14 @@ export class Doctor {
     }];
   }
 
+  /** The projects a "project" or "cto" report covers: the target alone, or every project without one. */
+  private projectsCovered(projectId: string | null) {
+    return projectId ? [this.projects.get(projectId)].filter((project) => project !== null) : this.projects.list();
+  }
+
   private checkBindings(projectId: string | null, scope: DoctorScope): Finding[] {
     const findings: Finding[] = [];
-    const projects = projectId ? [this.projects.get(projectId)].filter(Boolean) : this.projects.list();
+    const projects = this.projectsCovered(projectId);
     // A project's CTO is an availability fact about that project, not an authority over the
     // daemon. The system report is the daemon's startup gate, and a blocking finding there parks
     // it or ends it before the claim socket and cto.mcp.sock open. Those sockets are how a CTO
