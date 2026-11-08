@@ -23,6 +23,7 @@ import type { Doctor, DoctorReport } from "../doctor/doctor.ts";
 import type { BootstrapCompletionChainPort, ProductionGate } from "../ceo/production-gate.ts";
 import type { ManagedManifestWrite, ProjectRegistry } from "../registry/project-registry.ts";
 import { isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
+import { type ProjectCi, projectCi } from "../registry/project-ci.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import { METHOD_REVIEW_STALE, reviewedUnderCurrentMethod } from "../review/frontier-simplify-policy.ts";
 import type { RunEngine } from "../run/run-engine.ts";
@@ -61,6 +62,11 @@ export interface ACPBootstrapActivationResult {
   doctor: { status: DoctorReport["status"]; findings: number };
   activity: "ACTIVE" | "INACTIVE";
   availability: "HEALTHY" | "DEGRADED" | "UNAVAILABLE";
+  /**
+   * #1172 — the activated project's CI as `project_get` reads it: declared or not, and what is recorded
+   * at its head. Beside availability, never part of it: HEALTHY says nothing about CI.
+   */
+  ci: ProjectCi;
   completedAt: string;
   /** G0a (RF-018) — what this activation did not observe, said rather than passed over silently. */
   warnings: ActivationWarning[];
@@ -526,6 +532,16 @@ export class BootstrapActivation {
       this.projects.setAvailability(projectId, "UNAVAILABLE", "bootstrap activation doctor report");
     }
 
+    // §26.3 — the factory result and doctor observation are retained for retry. Neither
+    // is an activation result: only the CEO-confirm transaction can write that claim. Stored before
+    // the result below is built, so its `ci` reads this run's CI evidence as validated (#1172).
+    this.artifacts.put(input.runId, ArtifactKind.REPO_FACTORY_RESULT, result);
+    this.artifacts.put(input.runId, ArtifactKind.DOCTOR_REPORT, {
+      source: "bootstrap-activation",
+      projectId,
+      report,
+    });
+
     const project = this.projects.require(projectId);
     const activation: ACPBootstrapActivationResult = {
       schema: "agent-control-plane.bootstrap-activation.v1",
@@ -544,18 +560,10 @@ export class BootstrapActivation {
       doctor: { status: report.status, findings: report.findings.length },
       activity: project.activity,
       availability: project.availability,
+      ci: projectCi(this.db, this.projects, projectId),
       completedAt: this.clock.nowIso(),
       warnings: activationWarnings(input.approvedManifest, commitlore.value.observed),
     };
-
-    // §26.3 — the factory result and doctor observation are retained for retry. Neither
-    // is an activation result: only the CEO-confirm transaction can write that claim.
-    this.artifacts.put(input.runId, ArtifactKind.REPO_FACTORY_RESULT, result);
-    this.artifacts.put(input.runId, ArtifactKind.DOCTOR_REPORT, {
-      source: "bootstrap-activation",
-      projectId,
-      report,
-    });
 
     const incomplete = this.incompleteness(activation, report);
     if (incomplete.length > 0) {
@@ -917,6 +925,7 @@ export class BootstrapActivation {
       },
       activity: project?.activity ?? "INACTIVE",
       availability: project?.availability ?? "UNAVAILABLE",
+      ci: projectCi(this.db, this.projects, projectId),
       completedAt: input.confirmedAt,
       // The manifest this bootstrap activated: the project's active one, which the bindings above match.
       warnings: activationWarnings(activeManifest, commitlore.value.observed),
