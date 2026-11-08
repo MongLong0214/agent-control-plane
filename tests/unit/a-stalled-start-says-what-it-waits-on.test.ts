@@ -3,7 +3,9 @@ import { join } from "node:path";
 
 import { afterAll, describe, expect, it, vi } from "vitest";
 
+import { DAEMON_START_SUBJECT, IncidentClass, deliverIncident } from "../../src/ceo/ceo-incident-notices.ts";
 import { NotificationKind } from "../../src/ceo/production-gate.ts";
+import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startConfiguredCeoNotificationRoute, startStallNoticeRoute } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
@@ -342,6 +344,101 @@ describe("#1189 WIP 2: a start without the trusted gate credential is an explici
       expect(finding!.recommendedAction).not.toMatch(/\bowner\b/i);
       // The audit's free-text bound: longer, and the start's failure records would lose their evidence.
       expect(finding!.recommendedAction.length).toBeLessThanOrEqual(200);
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  /**
+   * The notice 7ef40dd8 queued for this stall, as it wrote it: the owner route, under the episode its stall id gave
+   * (no successful start before it, one PERMANENT finding), with the delivery record `deliverIncident` keeps.
+   */
+  const queueBaseNotice = (h: Harness): string => {
+    const episode = digestOf({ since: null, cause: "PERMANENT", findings: ["TRUSTED_GATE_CREDENTIAL_MISSING|github"] });
+    const delivered = deliverIncident(h.cp, {
+      cls: IncidentClass.RESOURCE_STALLED, subject: DAEMON_START_SUBJECT, runId: null, episode,
+      payload: {
+        source: "DAEMON_START_STALL", stallId: episode, phase: "REFUSED", cause: "PERMANENT", crashLoop: false,
+        startRefused: true, acpActionPath: "NOT_RUNNING",
+        blocker: "the daemon start is refused and ACP's action path is not running: its startup doctor blocks on findings no restart clears",
+        findings: [{
+          code: "TRUSTED_GATE_CREDENTIAL_MISSING", scope: "github", cause: "PERMANENT", repairOwner: "OWNER", basis: "CREDENTIAL",
+          recoveryAction: "install the trusted GitHub credential, then restart the daemon",
+        }],
+        blockedRunCount: 0,
+        blockedRuns: [],
+        runEffect: "no run was completed, failed or dispatched by this start; a run whose execution ran may have effects to check before it runs again",
+        whyItMatters: "until a start succeeds no run is dispatched and no ACP tool acts on the CEO's behalf; the findings name who can clear them",
+      },
+    });
+    if (!delivered.allowed || delivered.value.messageId === null) throw new Error("the base notice was not queued");
+    return delivered.value.messageId;
+  };
+
+  /** Every CEO notice still owed or being sent: what a route would offer the CEO. */
+  const offeredNotices = (h: Harness) => h.cp.db.all<{ message_id: string; payload_json: string }>(
+    `SELECT message_id, payload_json FROM outbox
+      WHERE kind = 'CEO_NOTIFICATION' AND status IN ('PENDING', 'IN_FLIGHT', 'SENT') ORDER BY created_at, rowid`,
+  );
+
+  it("after an upgrade over a start the earlier build refused, its owner-route notice is withdrawn, the current statement reaches the CEO once, and later starts add none", async () => {
+    const h = makeHarness();
+    try {
+      bindCeo(h);
+      const baseNotice = queueBaseNotice(h);
+      const stateDir = tempDir("acp-1189-wip2-upgrade-");
+      const sent: Array<readonly string[]> = [];
+      const start = async () => {
+        const refused = await new Daemon(h.cp, { stateDir }).start({
+          stallNotice: { deliver: async (messageIds) => { sent.push(messageIds); } },
+        });
+        expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+        h.clock.advance(10 * 60_000);
+      };
+
+      await start();
+      // The earlier build's notice is withdrawn, and nothing still offered to the CEO names the owner or asks for an install.
+      expect(h.cp.db.get<{ status: string }>(`SELECT status FROM outbox WHERE message_id = ?`, [baseNotice])!.status).toBe("REJECTED");
+      const offered = offeredNotices(h);
+      expect(offered).toHaveLength(1);
+      const current = offered[0]!;
+      expect(current.message_id).not.toBe(baseNotice);
+      expect(current.payload_json).not.toMatch(/"repairOwner":"OWNER"/);
+      expect(current.payload_json).not.toMatch(/install/i);
+      const route = classifyStartFinding({ code: "TRUSTED_GATE_CREDENTIAL_MISSING", severity: "ERROR", scope: "github" });
+      expect(JSON.parse(current.payload_json)).toMatchObject({ source: "DAEMON_START_STALL", findings: [route] });
+      expect(sent).toEqual([[current.message_id]]);
+      expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN").map((event) => event.evidence)).toEqual([
+        expect.objectContaining({ messageId: baseNotice, status: "PENDING", correlation: "ceo-incident:RESOURCE_STALLED:daemon-start" }),
+      ]);
+
+      // Later starts offer that same notice again and write none.
+      await start();
+      await start();
+      expect(offeredNotices(h).map((row) => row.message_id)).toEqual([current.message_id]);
+      expect(stallNotices(h).map((row) => row.message_id)).toEqual([baseNotice, current.message_id]);
+      expect(sent).toEqual([[current.message_id], [current.message_id], [current.message_id]]);
+      expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN")).toHaveLength(1);
+    } finally {
+      h.cp.close();
+    }
+  });
+
+  it("withdraws nothing of another stall kind's incident: a security block's notice is offered again as it was", async () => {
+    const h = makeHarness();
+    try {
+      bindCeo(h);
+      h.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+      const stateDir = tempDir("acp-1189-wip2-other-");
+      chmodSync(join(h.root, "capacity"), 0o755);
+      expect(await new Daemon(h.cp, { stateDir }).start()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_ERROR });
+      const [first] = stallNotices(h);
+      expect(first!.payload).toMatchObject({ findings: [{ code: "STATE_PATH_INSECURE", repairOwner: "OWNER" }] });
+      h.clock.advance(10 * 60_000);
+      expect(await new Daemon(h.cp, { stateDir }).start()).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_ERROR });
+      expect(stallNotices(h).map((row) => [row.message_id, row.status])).toEqual([[first!.message_id, "PENDING"]]);
+      expect(health(stateDir)["startStall"]).toMatchObject({ routing: { status: "ALREADY_ROUTED", messageId: first!.message_id } });
+      expect(h.cp.audit.byKind("CEO_NOTIFICATION_WITHDRAWN")).toHaveLength(0);
     } finally {
       h.cp.close();
     }

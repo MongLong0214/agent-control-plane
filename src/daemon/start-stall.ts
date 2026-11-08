@@ -1,6 +1,8 @@
-import { DAEMON_START_SUBJECT, IncidentClass, type NoticePorts, deliverIncident } from "../ceo/ceo-incident-notices.ts";
+import {
+  CEO_NOTIFICATION_WITHDRAWN, DAEMON_START_SUBJECT, IncidentClass, type NoticePorts, correlationOf, deliverIncident,
+} from "../ceo/ceo-incident-notices.ts";
 import { digestOf } from "../core/digest.ts";
-import type { ReasonCode } from "../core/reason-codes.ts";
+import { ReasonCode } from "../core/reason-codes.ts";
 import type { Db } from "../db/database.ts";
 import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import { outboxDeliveryReadback } from "../outbox/outbox.ts";
@@ -175,6 +177,13 @@ const blockedRunsOf = (db: Db): StartStallRun[] => {
 };
 
 /**
+ * #1189 WIP 2 — the trusted-gate credential's route was revised. The earlier one named the owner and asked for
+ * the credential to be installed; a notice of it still owed when this build starts would otherwise be offered
+ * again, because the stall it states is the same.
+ */
+const REVISED_ROUTE = { code: "TRUSTED_GATE_CREDENTIAL_MISSING", revision: "no-owner-wait", obsoleteRepairOwner: "OWNER" } as const;
+
+/**
  * The episode a stall is told in, bounded by the daemon's last successful start: a successful start ends
  * it, so the same failure arising after that is a new episode and is told again.
  * - PERMANENT: one episode per set of PERMANENT findings. A later refusal on the same set is the same stall;
@@ -182,6 +191,8 @@ const blockedRunsOf = (db: Db): StartStallRun[] => {
  * - TRANSIENT at the crash-loop threshold: one episode per failure episode, whatever transient findings each
  *   refusal of it meets. The crash loop is what is told, and it lasts until a start succeeds.
  * - TRANSIENT below it: routed to no one, so only health.json carries its id.
+ * A finding whose route was revised (`REVISED_ROUTE`) carries its revision, so the revised statement is a new
+ * episode and reaches the CEO once; every other finding's stall keeps the id an earlier build gave it.
  */
 const stallIdOf = (db: Db, findings: readonly ClassifiedStartFinding[], cause: StartStallCause, crashLoop: boolean): string => {
   const lastStart = db.get<{ eventId: number | null }>(
@@ -193,9 +204,62 @@ const stallIdOf = (db: Db, findings: readonly ClassifiedStartFinding[], cause: S
     cause,
     findings: findings
       .filter((finding) => finding.cause === cause)
-      .map((finding) => `${finding.code}|${finding.scope}`)
+      .map((finding) => finding.code === REVISED_ROUTE.code
+        ? `${finding.code}|${finding.scope}|${REVISED_ROUTE.revision}`
+        : `${finding.code}|${finding.scope}`)
       .sort(),
   });
+};
+
+/**
+ * Withdraws every daemon-start notice still owed (PENDING or SENT) that states the credential finding with its
+ * obsolete owner route, as `withdrawResolvedNotices` withdraws a resolved one: REJECTED, with one
+ * CEO_NOTIFICATION_WITHDRAWN record. A notice being sent (IN_FLIGHT) is that send's; an ACKed one was received
+ * and stays as it is. No other stall's notice is touched.
+ */
+const withdrawObsoleteRouteNotices = (ports: NoticePorts): void => {
+  const correlation = correlationOf(IncidentClass.RESOURCE_STALLED, START_STALL_SUBJECT);
+  const rows = ports.db.all<{
+    message_id: string; role_key: string; target_session_id: string; binding_generation: number; status: string; episode: unknown;
+  }>(
+    `SELECT o.message_id, o.role_key, o.target_session_id, o.binding_generation, o.status,
+            json_extract(o.payload_json, '$.episode') AS episode
+       FROM outbox o
+      WHERE o.kind = 'CEO_NOTIFICATION' AND o.run_id IS NULL AND o.status IN ('PENDING', 'SENT')
+        AND json_valid(o.payload_json) = 1 AND json_extract(o.payload_json, '$.correlation') = ?
+        AND EXISTS (SELECT 1 FROM json_each(o.payload_json, '$.findings') AS f
+                     WHERE json_extract(f.value, '$.code') = ? AND json_extract(f.value, '$.repairOwner') = ?)
+      ORDER BY o.created_at, o.rowid`,
+    [correlation, REVISED_ROUTE.code, REVISED_ROUTE.obsoleteRepairOwner],
+  );
+  for (const row of rows) {
+    ports.db.tx(() => {
+      const changed = ports.db.run(
+        `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
+                           retry_eligible = 0, next_attempt_at = NULL
+          WHERE message_id = ? AND status IN ('PENDING', 'SENT')`,
+        [ReasonCode.EVIDENCE_STALE, row.message_id],
+      ).changes;
+      if (changed !== 1) return;
+      ports.audit.record({
+        kind: CEO_NOTIFICATION_WITHDRAWN,
+        reasonCode: ReasonCode.EVIDENCE_STALE,
+        runId: null,
+        roleKey: row.role_key,
+        sessionId: row.target_session_id,
+        evidence: {
+          messageId: row.message_id,
+          status: row.status,
+          fromGeneration: row.binding_generation,
+          incidentClass: IncidentClass.RESOURCE_STALLED,
+          correlation,
+          episode: typeof row.episode === "string" ? row.episode : null,
+          withdrawnFor: "ROUTE_REVISED",
+          revision: REVISED_ROUTE.revision,
+        },
+      });
+    });
+  }
 };
 
 /** What the start-stall incident's delivery answered, with the readback of the notice it names. */
@@ -229,6 +293,7 @@ export const describeStartStall = (
   const runs = blockedRunsOf(db);
   const blockedRuns = runs.slice(0, MAX_REPORTED_RUNS);
   const stallId = stallIdOf(db, findings, cause, crashLooping);
+  withdrawObsoleteRouteNotices(ports);
   const routing = cause === "TRANSIENT" && !crashLooping
     ? { status: "NOT_ROUTED_TRANSIENT" as const }
     : routingOf(ports, deliverIncident(ports, {
