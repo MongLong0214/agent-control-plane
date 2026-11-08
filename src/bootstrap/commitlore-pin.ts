@@ -31,9 +31,9 @@ import type { CommitLoreRun, CommitLoreRunner } from "./commitlore-observation.t
  * (`judgeCommitLoreLatest`, #1268).
  *
  * The `init` usage must offer every option the observation passes (`COMMITLORE_INIT_OPTIONS`), among them
- * `--no-agent-hooks`, without which `init` writes its Claude Code injection hook into the checkout. A CLI
- * whose `init` lacks one is refused `NO_INIT_OPTION` before any `init` runs; nothing falls back to an argv
- * without it.
+ * `--no-agent-hooks`, without which `init` writes its Claude Code injection hook into the checkout, and
+ * `--json` (#1268), without which its report cannot be read. A CLI whose `init` lacks one is refused
+ * `NO_INIT_OPTION` before any `init` runs; nothing falls back to an argv without it.
  */
 export const COMMITLORE_BINARY_VARIABLE = "ACP_COMMITLORE_BINARY";
 
@@ -75,18 +75,20 @@ export const COMMITLORE_PIN_CHECK_ARGV: ReadonlyArray<readonly string[]> = Objec
 ]);
 
 /** The options of `init` the observation passes (`COMMITLORE_OBSERVATION_ARGV`); its usage must list each. */
-export const COMMITLORE_INIT_OPTIONS = Object.freeze(["--mcp-scope", "--no-unattended", "--no-agent-hooks"] as const);
+export const COMMITLORE_INIT_OPTIONS = Object.freeze(["--mcp-scope", "--no-unattended", "--no-agent-hooks", "--json"] as const);
 
 /**
  * What the observation needs each of `COMMITLORE_INIT_OPTIONS` for, as a `NO_INIT_OPTION` refusal names it.
  * `--no-agent-hooks` skips only `init`'s Claude Code injection hook (`.claude/settings.json`, its one write
  * into the working tree); the git hooks, the git config, the record index, the trusted-author handling and
- * `init`'s own readiness verdict all stay, so it is not a skip of agent integration as a whole.
+ * `init`'s own readiness verdict all stay, so it is not a skip of agent integration as a whole. `--json`
+ * (#1268) is the report the observation reads an exit 1 by (`judgeCommitLoreRuns`).
  */
 const INIT_OPTION_NEEDS: Readonly<Record<(typeof COMMITLORE_INIT_OPTIONS)[number], string>> = Object.freeze({
   "--mcp-scope": "to register no MCP server (`--mcp-scope none`) without a prompt",
   "--no-unattended": "to leave unattended capture off without a prompt",
   "--no-agent-hooks": "so that it writes nothing into the checkout",
+  "--json": "to read which of its steps needs attention from its report",
 });
 
 /**

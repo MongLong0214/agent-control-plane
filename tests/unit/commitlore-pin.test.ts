@@ -186,7 +186,7 @@ const ROOT_USAGE = [
   "  -h, --help      display help for command",
   "",
 ].join("\n");
-const INIT = "init --mcp-scope none --no-unattended --no-agent-hooks";
+const INIT = "init --mcp-scope none --no-unattended --no-agent-hooks --json";
 const OBSERVATION = ["--version", "doctor --help", "init --help", INIT, "doctor --json"];
 
 /** `usage` without its declaration of `option`: the option's line and every wrapped continuation of it. */
@@ -603,16 +603,18 @@ describe("S16-R1-03: the pinned CLI must have the init command, with the options
     ["an init without --mcp-scope", { initHelp: INIT_USAGE.replace(/ {2}--mcp-scope[^\n]*\n[^\n]*\n/, "") }, ["--mcp-scope"]],
     ["an init without --no-unattended", { initHelp: INIT_USAGE.replace(/ {2}--no-unattended[^\n]*\n[^\n]*\n/, "") }, ["--no-unattended"]],
     ["an init without --no-agent-hooks (the released 1.7.4's usage)", { initHelp: INIT_USAGE_1_7_4 }, ["--no-agent-hooks"]],
+    // #1268 — the observation reads init's report as JSON; an init that does not declare --json never runs.
+    ["an init without --json", { initHelp: undeclared(INIT_USAGE, "--json") }, ["--json"]],
     [
       "an init usage that names the options only in prose",
       { initHelp: "Usage: commitlore init [options]\n\nPass --mcp-scope none, --no-unattended and --no-agent-hooks from scripts.\n" },
-      ["--mcp-scope", "--no-unattended", "--no-agent-hooks"],
+      ["--mcp-scope", "--no-unattended", "--no-agent-hooks", "--json"],
     ],
     // Review B3-R1-01: the same prose with each option the first word of its line, and no Options: section.
     [
       "an init usage that names the options only in prose, each the first word of its line",
       { initHelp: "Usage: commitlore init [options]\n\n--mcp-scope none keeps the MCP registration out.\n--no-unattended keeps capture off.\n--no-agent-hooks keeps the checkout clean.\n" },
-      ["--mcp-scope", "--no-unattended", "--no-agent-hooks"],
+      ["--mcp-scope", "--no-unattended", "--no-agent-hooks", "--json"],
     ],
     // Review B3-R1-01 regressions (RED at c3835591, where init ran): --no-agent-hooks named, not declared.
     ["an init that names --no-agent-hooks only in an epilogue line, as its first word", { initHelp: inEpilogueOnly("--no-agent-hooks") }, ["--no-agent-hooks"]],

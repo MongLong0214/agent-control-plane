@@ -104,10 +104,10 @@ describe("#246 B3: the CommitLore verdict", () => {
     });
     expect(await passing.observe("/checkout")).toMatchObject({ outcome: "PASS" });
     expect(calls).toEqual([
-      { argv: ["init", "--mcp-scope", "none", "--no-unattended", "--no-agent-hooks"], cwd: "/checkout" },
+      { argv: ["init", "--mcp-scope", "none", "--no-unattended", "--no-agent-hooks", "--json"], cwd: "/checkout" },
       { argv: ["doctor", "--json"], cwd: "/checkout" },
     ]);
-    expect(COMMITLORE_OBSERVATION_ARGV.map((argv) => argv.join(" "))).toEqual(["init --mcp-scope none --no-unattended --no-agent-hooks", "doctor --json"]);
+    expect(COMMITLORE_OBSERVATION_ARGV.map((argv) => argv.join(" "))).toEqual(["init --mcp-scope none --no-unattended --no-agent-hooks --json", "doctor --json"]);
 
     const missing = createCommitLoreCliPort(async () => {
       throw Object.assign(new Error("spawn commitlore ENOENT"), { code: "ENOENT" });
@@ -121,6 +121,165 @@ describe("#246 B3: the CommitLore verdict", () => {
     });
     expect(await initFails.observe("/checkout")).toMatchObject({ outcome: "FAIL" });
     expect(doctorRan).toBe(false);
+  });
+});
+
+/**
+ * #1268 (CEO msg_db4e1cc1) — `init --json` as CommitLore 1.7.5 prints it (`runInit`): eight steps, each with
+ * its code, and `exitCode` 2 when one could not run, 1 when one needs attention. Its `doctor` step is code 1
+ * whenever a doctor check needs attention, a warning included, so a checkout whose only findings are warnings
+ * init cannot fix exits 1 after every setup step succeeded.
+ */
+const INIT_STEPS = ["release", "hooks", "trust", "index", "claude-hook", "mcp-registration", "policy", "doctor"] as const;
+// The real case: every setup step ✓, then "doctor --fix — needs attention" over four warnings.
+const FINAL_CHECK_LINES = [
+  "ok    commit-msg hook — installed",
+  "warn  notes fetch refspec — no remote is configured",
+  "warn  notes mirror — refs/notes/commitlore is unfetched",
+  "      fix: git fetch origin 'refs/notes/commitlore:refs/notes/commitlore'",
+  "warn  index — the index is behind HEAD",
+  "warn  inject-runtime — the PreToolUse hook is not installed",
+];
+type InitStep = { step: unknown; title?: string; code?: unknown; lines?: unknown; detail?: unknown };
+const initSteps = (codes: Partial<Record<(typeof INIT_STEPS)[number], number>> = {}): InitStep[] =>
+  INIT_STEPS.map((step) => ({
+    step,
+    title: step === "doctor" ? "doctor --fix" : step,
+    code: codes[step] ?? (step === "doctor" ? 1 : 0),
+    lines: step === "doctor" ? FINAL_CHECK_LINES : [`${step} done`],
+    detail: {},
+  }));
+const initReport = (overrides: Record<string, unknown> = {}): string =>
+  `${JSON.stringify({ steps: initSteps(), notesBefore: "absent", exitCode: 1, ...overrides }, null, 2)}\n`;
+const attention = (stdout = initReport(), exitCode = 1): CommitLoreRun => ({ exitCode, stdout, stderr: "" });
+const DEGRADED = report({
+  status: "degraded",
+  checks: [
+    { id: "commit-msg-hook", status: "ok" },
+    { id: "notes-refspec", status: "warn", detail: "no remote is configured" },
+    { id: "notes-mirror", status: "warn", detail: "refs/notes/commitlore is unfetched" },
+    { id: "index", status: "warn", detail: "the index is behind HEAD" },
+    { id: "inject-runtime", status: "warn", detail: "the PreToolUse hook is not installed" },
+  ],
+});
+const withSteps = (steps: InitStep[], overrides: Record<string, unknown> = {}): CommitLoreRun => attention(initReport({ steps, ...overrides }));
+
+describe("#1268: a warning-only init exit 1 is initialization done, its final check needing attention", () => {
+  it("passes when every step but doctor is 0, doctor is 1, and the doctor after it is degraded with no fail, carrying the final check's lines verbatim", () => {
+    const verdict = judgeCommitLoreRuns(attention(), ok(DEGRADED));
+    expect(verdict).toEqual({
+      outcome: "PASS",
+      reportStatus: "degraded",
+      warnings: [
+        ...FINAL_CHECK_LINES.map((line) => `init doctor --fix: ${line}`),
+        "notes-refspec: no remote is configured",
+        "notes-mirror: refs/notes/commitlore is unfetched",
+        "index: the index is behind HEAD",
+        "inject-runtime: the PreToolUse hook is not installed",
+      ],
+      detail: "commitlore doctor passed; commitlore init exited 1: its final check needs attention",
+      report: DEGRADED,
+    });
+    // The original text of each line, unchanged, and none left out.
+    for (const line of FINAL_CHECK_LINES) expect(verdict.warnings.filter((warning) => warning.endsWith(line)), line).toHaveLength(1);
+  });
+
+  it("the CLI port runs doctor after that init, and judges it as after an exit 0", async () => {
+    const calls: string[] = [];
+    const port = createCommitLoreCliPort(async (argv) => {
+      calls.push(argv[0] as string);
+      return argv[0] === "init" ? attention() : ok(DEGRADED);
+    });
+    expect(await port.observe("/checkout")).toMatchObject({ outcome: "PASS", reportStatus: "degraded", report: DEGRADED });
+    expect(calls).toEqual(["init", "doctor"]);
+  });
+
+  const renamed = (from: string, to: unknown): InitStep[] => initSteps().map((step) => (step.step === from ? { ...step, step: to } : step));
+  const changed = (name: string, change: Partial<InitStep>): InitStep[] => initSteps().map((step) => (step.step === name ? { ...step, ...change } : step));
+  it.each<[string, CommitLoreRun, RegExp]>([
+    ["mcp-registration has code 1", withSteps(initSteps({ "mcp-registration": 1 })), /init failed \(1\): its mcp-registration step has code 1/],
+    ["policy has code 1", withSteps(initSteps({ policy: 1 })), /init failed \(1\): its policy step has code 1/],
+    ["another setup step has code 1", withSteps(initSteps({ release: 1 })), /init failed \(1\): its release step has code 1/],
+    ["a setup step could not run (code 2)", withSteps(initSteps({ hooks: 2 })), /init failed \(1\): its hooks step has code 2/],
+    ["the doctor step has code 0", withSteps(initSteps({ doctor: 0 })), /init failed \(1\): its doctor step has code 0/],
+    ["the doctor step's code is not a number", withSteps(changed("doctor", { code: "1" })), /init failed \(1\): its doctor step has code "1"/],
+    ["a step is missing", withSteps(initSteps().filter((step) => step.step !== "trust")), /init failed \(1\): its report is missing a step/],
+    ["the doctor step is missing", withSteps(initSteps().filter((step) => step.step !== "doctor")), /init failed \(1\): its report is missing a step/],
+    ["a step is repeated", withSteps([...initSteps(), initSteps()[1] as InitStep]), /init failed \(1\): its report repeats a step/],
+    ["a step is repeated in place of another", withSteps(renamed("trust", "hooks")), /init failed \(1\): its report repeats a step/],
+    ["the doctor step is repeated", withSteps([...initSteps(), { ...(initSteps()[7] as InitStep) }]), /init failed \(1\): its report repeats a step/],
+    ["a step is unknown", withSteps([...initSteps(), { step: "agents", code: 0, lines: [] }]), /init failed \(1\): its report has an unknown step "agents"/],
+    ["a step is unknown in place of another", withSteps(renamed("claude-hook", "agents")), /init failed \(1\): its report has an unknown step "agents"/],
+    ["a step has no name", withSteps(renamed("index", undefined)), /init failed \(1\): its report has an unknown step/],
+    ["the steps are not an array", withSteps([], { steps: { doctor: 1 } }), /init failed \(1\): its report has no steps/],
+    ["the report's exitCode is 0", attention(initReport({ exitCode: 0 })), /init failed \(1\): its report's exitCode is 0, not the process's 1/],
+    ["the report's exitCode is 2", attention(initReport({ exitCode: 2 })), /init failed \(1\): its report's exitCode is 2, not the process's 1/],
+    ["the report's exitCode is \"1\"", attention(initReport({ exitCode: "1" })), /init failed \(1\): its report's exitCode is "1"/],
+    ["the report has no exitCode", attention(initReport({ exitCode: undefined })), /init failed \(1\): its report's exitCode is undefined/],
+    ["the doctor step has no lines", withSteps(changed("doctor", { lines: [] })), /init failed \(1\): its doctor step has no lines of text/],
+    ["the doctor step's lines are not text", withSteps(changed("doctor", { lines: [{ text: "warn" }] })), /init failed \(1\): its doctor step has no lines of text/],
+    ["stdout is not JSON", attention("  ✓ Release\n  ! Final check — needs attention\n\ninit: 1 step(s) need(s) attention — doctor --fix\n"), /init failed \(1\): its output is not one JSON report/],
+    ["stdout is truncated", attention(initReport().slice(0, 400)), /init failed \(1\): its output is not one JSON report/],
+    ["stdout is empty", attention(""), /init failed \(1\): its output is not one JSON report: no diagnostic output/],
+    ["stdout is a JSON array", attention(JSON.stringify([JSON.parse(initReport())])), /init failed \(1\): its output is not one JSON report/],
+    ["stdout is two reports", attention(`${initReport()}${initReport()}`), /init failed \(1\): its output is not one JSON report/],
+    ["init exits 2", attention(initReport({ exitCode: 2, steps: initSteps({ hooks: 2 }) }), 2), /^commitlore init failed \(2\): /],
+    ["init exits 2 with an otherwise warning-only report", attention(initReport({ exitCode: 2 }), 2), /^commitlore init failed \(2\): /],
+    ["init exits 3", attention(initReport(), 3), /^commitlore init failed \(3\): /],
+    ["init exits -1", attention(initReport(), -1), /^commitlore init failed \(-1\): /],
+  ])("an init exit 1 fails, and doctor never runs, when %s", async (_label, init, detail) => {
+    const verdict = judgeCommitLoreRuns(init, ok(DEGRADED));
+    expect(verdict.outcome).toBe("FAIL");
+    expect(verdict.detail).toMatch(detail);
+    const calls: string[] = [];
+    const port = createCommitLoreCliPort(async (argv) => {
+      calls.push(argv[0] as string);
+      return argv[0] === "init" ? init : ok(DEGRADED);
+    });
+    expect(await port.observe("/checkout")).toMatchObject({ outcome: "FAIL", detail: expect.stringMatching(detail) });
+    expect(calls).toEqual(["init"]);
+  });
+
+  it.each<[string, CommitLoreRun | null, RegExp]>([
+    ["has a fail check and exits 1", { exitCode: 1, stdout: report({ status: "failed", exitCode: 1, checks: [{ id: "x", status: "fail" }] }), stderr: "" }, /doctor failed \(1\)/],
+    ["has a fail check while exiting 0", ok(report({ status: "degraded", checks: [{ id: "x", status: "fail", detail: "broken" }] })), /a check has status fail/],
+    ["says failed while exiting 0", ok(report({ status: "failed", checks: [{ id: "x", status: "warn" }] })), /report status is failed/],
+    ["reports a non-zero exitCode while exiting 0", ok(report({ status: "degraded", exitCode: 1, checks: [{ id: "x", status: "warn" }] })), /report exitCode is 1/],
+    ["is not JSON", ok("not json"), /invalid JSON report/],
+    ["is truncated", ok(DEGRADED.slice(0, 60)), /invalid JSON report/],
+    ["has another schema", ok(report({ schema: "commitlore_doctor.v1" })), /invalid schema/],
+    ["has a malformed check", ok(report({ checks: [{ id: "x", status: "green" }] })), /invalid checks/],
+    ["could not run", null, /doctor could not be run/],
+  ])("after a warning-only init exit 1, the doctor fails as today when it %s", (_label, doctor, detail) => {
+    const verdict = judgeCommitLoreRuns(attention(), doctor);
+    expect(verdict.outcome).toBe("FAIL");
+    expect(verdict.detail).toMatch(detail);
+    // The final check's lines still reach the failure's warnings.
+    expect(verdict.warnings.slice(0, FINAL_CHECK_LINES.length)).toEqual(FINAL_CHECK_LINES.map((line) => `init doctor --fix: ${line}`));
+  });
+
+  it("an init exit 0 whose JSON report names another exitCode fails, never a PASS; any other exit 0 is judged as before", async () => {
+    for (const exitCode of [1, 2, "0", null]) {
+      const init = ok(initReport({ exitCode }));
+      expect(judgeCommitLoreRuns(init, ok(DEGRADED)), String(exitCode)).toMatchObject({
+        outcome: "FAIL",
+        detail: `commitlore init report exitCode is ${JSON.stringify(exitCode)} while the process exited 0`,
+        warnings: [],
+      });
+      const calls: string[] = [];
+      const port = createCommitLoreCliPort(async (argv) => {
+        calls.push(argv[0] as string);
+        return argv[0] === "init" ? init : ok(DEGRADED);
+      });
+      expect(await port.observe("/checkout"), String(exitCode)).toMatchObject({ outcome: "FAIL" });
+      expect(calls).toEqual(["init"]);
+    }
+    // A JSON report saying 0, a report with no exitCode field, and a text or empty stdout: as before.
+    const before = judgeCommitLoreRuns(ok(), ok(DEGRADED));
+    expect(before).toMatchObject({ outcome: "PASS", detail: "commitlore doctor passed" });
+    for (const stdout of [initReport({ exitCode: 0, steps: initSteps({ doctor: 0 }) }), JSON.stringify({ steps: [] }), "init: ready\n", "[1]"]) {
+      expect(judgeCommitLoreRuns(ok(stdout), ok(DEGRADED)), stdout).toEqual(before);
+    }
   });
 });
 
@@ -220,7 +379,7 @@ describe("review S11-R1-03: a CommitLore row is bound to the record its attempt 
     expect(genuine).toEqual({
       schema: "acp.bootstrap.commitlore-observation.v1",
       ...binding,
-      argv: [["init", "--mcp-scope", "none", "--no-unattended", "--no-agent-hooks"], ["doctor", "--json"]],
+      argv: [["init", "--mcp-scope", "none", "--no-unattended", "--no-agent-hooks", "--json"], ["doctor", "--json"]],
       reportStatus: "ok",
       reportDigest: sha256(report),
       report,

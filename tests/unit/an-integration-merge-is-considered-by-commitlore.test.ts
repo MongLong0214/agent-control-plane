@@ -209,7 +209,7 @@ const argv = process.argv.slice(2);
 const answer = (text) => process.stdout.write(text, () => process.exit(0));
 if (argv.join(' ') === '--version') return answer('1.7.3\\n');
 if (argv.join(' ') === 'doctor --help') return answer('Usage: commitlore doctor [options]\\n\\nOptions:\\n  --json  emit the report as JSON\\n');
-if (argv.join(' ') === 'init --help') return answer('Usage: commitlore init [options]\\n\\nOptions:\\n  --mcp-scope <scope>  where\\n  --no-unattended      off\\n  --no-agent-hooks     nothing in the tree\\n');
+if (argv.join(' ') === 'init --help') return answer('Usage: commitlore init [options]\\n\\nOptions:\\n  --mcp-scope <scope>  where\\n  --no-unattended      off\\n  --no-agent-hooks     nothing in the tree\\n  --json               the report\\n');
 if (argv[0] !== 'validate') return process.stderr.write('unknown ' + argv.join(' ') + '\\n', () => process.exit(2));
 const git = (args, input) => spawnSync('git', args, { env: process.env, input: input ?? '', encoding: 'utf8', timeout: 20000 });
 const staged = git(['diff', '--cached', '--name-only']).stdout.split('\\n').filter(Boolean);
