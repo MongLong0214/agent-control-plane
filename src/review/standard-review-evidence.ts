@@ -141,9 +141,18 @@ const shapeRefusal = (subject: string, field: EvidenceField | undefined): ScanRe
   try { screenPublicText(subject); } catch { return { rule: "public_text_screen", form: "other" }; }
   return null;
 };
-/** As `shapeRefusal`, except that a whole digest passes. */
-const subjectRefusal = (subject: string, field: EvidenceField | undefined): ScanRefusal | null =>
-  (WHOLE_DIGEST.test(subject) ? null : shapeRefusal(subject, field));
+/**
+ * One text a string or key is checked as (`subjectsOf`): the string as written, or the text its base64 decodes to.
+ * Only a string that is, as written, a whole `sha256:<64hex>` is a digest value that passes unchecked (a file's sha256,
+ * the contract digest, a listed recorded digest). A decoded text is never one, a file body included: it is checked by
+ * the scoped rule (`fieldFor`, `fieldAt`) like any other text, so a body that is only a digest is exempt exactly when
+ * the same token inside a longer body would be (#1268 review).
+ */
+interface Subject { text: string; decoded: boolean }
+const isDigestValue = (subject: Subject): boolean => !subject.decoded && WHOLE_DIGEST.test(subject.text);
+/** As `shapeRefusal`, except that a digest value passes. */
+const subjectRefusal = (subject: Subject, field: EvidenceField | undefined): ScanRefusal | null =>
+  (isDigestValue(subject) ? null : shapeRefusal(subject.text, field));
 
 /** The 1-based line and column of a character offset in `text`. */
 const lineAndColumn = (text: string, offset: number): { line: number; column: number } => {
@@ -155,15 +164,18 @@ const lineAndColumn = (text: string, offset: number): { line: number; column: nu
  * The texts one string or object key is checked as, by its form and never its name: canonical base64 of any length
  * (non-empty and re-encoding byte-identically, so a multiple of 4) that decodes to UTF-8 is checked as the text it
  * carries. The raw string is checked too, except for the 60+ character form, which would otherwise be refused as the
- * long base64 run every staged body is; a whole `sha256:<64hex>` digest is a digest.
+ * long base64 run every staged body is; a raw whole `sha256:<64hex>` digest is a digest value (`isDigestValue`).
  */
-const subjectsOf = (text: string): string[] => {
+const subjectsOf = (text: string): Subject[] => {
   if (BASE64_TEXT.test(text)) {
     const bytes = Buffer.from(text, "base64");
     const utf8 = bytes.toString("utf8");
-    if (bytes.toString("base64") === text && Buffer.from(utf8, "utf8").equals(bytes)) return LONG_BASE64_TEXT.test(text) ? [utf8] : [utf8, text];
+    if (bytes.toString("base64") === text && Buffer.from(utf8, "utf8").equals(bytes)) {
+      const decoded = { text: utf8, decoded: true };
+      return LONG_BASE64_TEXT.test(text) ? [decoded] : [decoded, { text, decoded: false }];
+    }
   }
-  return [text];
+  return [{ text, decoded: false }];
 };
 
 const entriesOf = (value: unknown, key: string): unknown[] => {
@@ -196,7 +208,7 @@ const recordedIn = (root: unknown): { listed: ReadonlySet<string>; logBodies: Re
  */
 const scanBundle = (root: unknown, resolve: ResolveReferences): { refused: ScanRefusal } | { references: StandardReviewEvidenceReference[] } => {
   // In scan order, ending at the first bound passed, so the first refusal is the one a single pass would find.
-  const checked: Array<{ text: string; field: string } | ScanRefusal> = [];
+  const checked: Array<Subject & { field: string } | ScanRefusal> = [];
   let values = 0;
   const visit = (value: unknown, depth: number, field: string): boolean => {
     const bound = depth > STANDARD_REVIEW_SCAN_MAX_DEPTH ? "unexaminable_depth" : (values += 1) > STANDARD_REVIEW_SCAN_MAX_VALUES ? "unexaminable_size" : null;
@@ -204,11 +216,11 @@ const scanBundle = (root: unknown, resolve: ResolveReferences): { refused: ScanR
       checked.push({ rule: bound, form: "structure" });
       return false;
     }
-    if (typeof value === "string") checked.push(...subjectsOf(value).map(text => ({ text, field })));
+    if (typeof value === "string") checked.push(...subjectsOf(value).map(subject => ({ ...subject, field })));
     else if (Array.isArray(value)) return value.every((item, i) => visit(item, depth + 1, `${field}[${i}]`));
     else if (value !== null && typeof value === "object") {
       return Object.entries(value).every(([key, item], i) => {
-        checked.push(...subjectsOf(key).map(text => ({ text, field: `${field}.<key ${i + 1}>` })));
+        checked.push(...subjectsOf(key).map(subject => ({ ...subject, field: `${field}.<key ${i + 1}>` })));
         return visit(item, depth + 1, `${field}.${BUNDLE_KEYS.has(key) ? key : `<key ${i + 1}>`}`);
       });
     }
@@ -216,7 +228,7 @@ const scanBundle = (root: unknown, resolve: ResolveReferences): { refused: ScanR
   };
   visit(root, 0, "$");
   const texts = checked.flatMap(item => ("text" in item ? [item] : []));
-  const tokens = [...new Set(texts.flatMap(s => (WHOLE_DIGEST.test(s.text) ? [] : s.text.match(DIGEST_TOKEN) ?? [])))].sort();
+  const tokens = [...new Set(texts.flatMap(s => (isDigestValue(s) ? [] : s.text.match(DIGEST_TOKEN) ?? [])))].sort();
   const resolved = resolve(tokens);
   const references = tokens.flatMap(token => resolved.find(r => r.digest === token) ?? []);
   const verified = new Set(references.map(r => r.digest));
@@ -226,9 +238,9 @@ const scanBundle = (root: unknown, resolve: ResolveReferences): { refused: ScanR
   const fieldAt = (at: string): EvidenceField | undefined => (logBodies.has(at) ? logField : field);
   const exempt = (at: string, token: string): boolean => verified.has(token) || (logBodies.has(at) && listed.has(token));
   for (const item of checked) {
-    const refused = "text" in item ? subjectRefusal(item.text, fieldAt(item.field)) : item;
+    const refused = "text" in item ? subjectRefusal(item, fieldAt(item.field)) : item;
     if (refused === null) continue;
-    const unresolved = texts.flatMap(s => (WHOLE_DIGEST.test(s.text) ? [] : [...s.text.matchAll(DIGEST_TOKEN)]
+    const unresolved = texts.flatMap(s => (isDigestValue(s) ? [] : [...s.text.matchAll(DIGEST_TOKEN)]
       .filter(m => !exempt(s.field, m[0])).map(m => ({ field: s.field, ...lineAndColumn(s.text, m.index) }))));
     const line = "text" in item && item.text.includes("\n")
       ? item.text.split("\n").findIndex(l => shapeRefusal(l, fieldAt(item.field))?.rule === refused.rule) + 1 : 0;

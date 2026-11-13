@@ -240,4 +240,38 @@ describe("review evidence carrying a whole execution report and its recorded dig
       expect(await f.stage(f.bundleOf([fileOf(report)], recorded(512)))).toMatchObject({ ok: true });
     } finally { await f.close(); }
   });
+
+  it("checks a body that is only a digest, or any decoded text that is one, by the same scoped rule as a longer body", async () => {
+    const [first] = recorded(1);
+    const unlisted = sha256("never recorded");
+    const excerptOf = (body: string) => fileOf(body, { grade: "review-original", path: "handoff/excerpt.md", omitted: true, originalSha256: sha256("a larger source") });
+    const encoded = (text: string) => Buffer.from(text, "utf8").toString("base64");
+    type Fixture = Awaited<ReturnType<typeof fixture>>;
+    // Each on its own run, so one bundle staged by mistake cannot turn the next case into a CONFLICT.
+    const alone = async (body: (f: Fixture) => string): Promise<Args> => {
+      const f = await fixture();
+      try { return await f.stage(body(f)); } finally { await f.close(); }
+    };
+    const refused: Array<[string, (f: Fixture) => string]> = [
+      ["a whole execution log that is only an unlisted digest, with no list", (f) => f.bundleOf([fileOf(unlisted)])],
+      ["a whole execution log that is only an unlisted digest, beside a list", (f) => f.bundleOf([fileOf(unlisted)], [first])],
+      ["a review-original excerpt that is only a listed digest", (f) => f.bundleOf([fileOf(reportOf([first!.digest], 500)), excerptOf(first!.digest)], [first])],
+      ["a review-original excerpt that is only an unlisted digest", (f) => f.bundleOf([excerptOf(unlisted)])],
+      ["an origin that is a base64 digest", (f) => f.bundleOf([{ ...fileOf(reportOf([], 500)), origin: encoded(unlisted) }])],
+      ["a MISSING item that is a base64 digest", (f) => JSON.stringify({ ...JSON.parse(f.bundleOf([fileOf(reportOf([], 500))])) as Args, missing: [encoded(unlisted)] })],
+    ];
+    for (const [label, body] of refused) {
+      expect.soft(await alone(body), label).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "long_base64_run", unresolvedDigestCount: 1 } });
+    }
+    // A body that is only a digest stages exactly where the same token would inside a longer body: listed, in an
+    // execution log; or confirmed in the project's records (the run's pinned manifest), in any file.
+    expect.soft(await alone((f) => f.bundleOf([fileOf(first!.digest)], [first])), "a whole execution log that is only a listed digest").toMatchObject({ ok: true });
+    const pinned = await fixture();
+    try {
+      const pin = pinned.h.cp.runs.require(pinned.run.runId).pinnedManifestDigest!;
+      const staged = await pinned.stage(pinned.bundleOf([excerptOf(pin)]));
+      expect.soft(staged, "a review-original excerpt that is only the pinned manifest's digest")
+        .toMatchObject({ ok: true, value: { verifiedReferences: [{ kind: "MANIFEST", digest: pin }] } });
+    } finally { await pinned.close(); }
+  });
 });
