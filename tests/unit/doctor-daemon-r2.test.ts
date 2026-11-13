@@ -445,15 +445,14 @@ describe("round 2 daemon regressions", () => {
       expect(harness.cp.sessions.require(sessionId).lifecycle).toBe(SessionLifecycle.ERROR);
       if (reference === "active CEO") expect(harness.cp.bindings.active("CEO")?.sessionId).toBe(sessionId);
       else expect(harness.cp.runs.activeRunsOwnedBy(sessionId).map((owned) => owned.runId)).toContain(run.runId);
-      if (reference !== "revoked unfinished-work owner") {
-        // A settled CEO is the operator door's other role (`binding recover-dead-ceo`), and a settled
-        // PRIMARY_CTO's runs move to its same actor's next generation once the claim socket is open,
-        // so the system report names each as a non-blocking ERROR; its own session report still blocks.
-        expect((await harness.cp.doctor.run("system")).findings).toContainEqual(expect.objectContaining({
-          code: "SESSION_PROCESS_MISSING", scope: `session:${sessionId}`, severity: "ERROR", blocking: false,
-        }));
-        expect((await harness.cp.doctor.run("session", sessionId)).findings).toContainEqual(expected);
-      } else expect((await harness.cp.doctor.run("system")).findings).toContainEqual(expected);
+      // A settled CEO is the operator door's other role (`binding recover-dead-ceo`), and a settled
+      // session's project PRIMARY_CTO runs, its binding ACTIVE or already revoked, are reached once the
+      // daemon is up (its same actor's next generation, or the CEO's run_cancel), so the system report
+      // names each as a non-blocking ERROR; its own session report still blocks.
+      expect((await harness.cp.doctor.run("system")).findings).toContainEqual(expect.objectContaining({
+        code: "SESSION_PROCESS_MISSING", scope: `session:${sessionId}`, severity: "ERROR", blocking: false,
+      }));
+      expect((await harness.cp.doctor.run("session", sessionId)).findings).toContainEqual(expected);
     },
   );
 
