@@ -1135,6 +1135,69 @@ export class BindingRegistry {
   }
 
   /**
+   * v57 — the run hand-over of a CEO canonical entitlement transfer, at the new conversation's first
+   * self-claim and only inside that claim's transaction: every live run pinned to one of `from` (the
+   * transferred-away conversation's generations of `roleKey`) moves to `to` (`#repointLiveRuns`), with its
+   * HELD and EXPIRED claims (`moveRunClaimsWithOwnerPin`). The new conversation is another actor, so no
+   * same-actor succession is asked for: the transfer record the caller consumes in the same transaction is
+   * the authority. Refused PREDECESSOR_WORKER_TURN_IN_FLIGHT while an execution of one of those runs is
+   * RUNNING, or a candidate pipeline attempt of one still holds it (RUNNING and unexpired), so that work
+   * ends under the generation that started it. Only owner pins and claim owners move; the runs, their
+   * tasks, executions, evidence and audit history are left as they are.
+   */
+  repointLiveRunsToTransferSuccessor(
+    roleKey: string,
+    from: ReadonlyArray<{ readonly sessionId: string; readonly generation: number }>,
+    to: { readonly sessionId: string; readonly generation: number; readonly incarnation: string },
+  ): Decision<{
+    runIds: string[];
+    from: Array<{ runId: string; sessionId: string; generation: number }>;
+    claims: Array<{ claimId: string; runId: string; fromGeneration: number }>;
+  }> {
+    if (!this.db.inTransaction) {
+      return fail(ReasonCode.COMPLETION_AUTHORITY_DENIED, "a transfer's run hand-over requires the self-claim's transaction", {});
+    }
+    return this.db.txDecision(() => {
+      const owned = from.flatMap((generation) =>
+        this.liveRunsOwnedBy({ roleKey, boundSessionId: generation.sessionId, bindingGeneration: generation.generation })
+          .map((run) => run.run_id));
+      if (owned.length > 0) {
+        const runList = owned.map(() => "?").join(",");
+        const inFlight = this.db.all<{ kind: string; id: string; run_id: string }>(
+          `SELECT 'EXECUTION' AS kind, execution_id AS id, run_id FROM task_executions
+            WHERE status = 'RUNNING' AND run_id IN (${runList})
+           UNION ALL
+           SELECT 'PIPELINE_ATTEMPT' AS kind, attempt_id AS id, run_id FROM candidate_pipeline_attempts
+            WHERE state = 'RUNNING' AND deadline_at > ? AND run_id IN (${runList})
+           ORDER BY kind, id`,
+          [...owned, this.clock.nowIso(), ...owned],
+        );
+        if (inFlight.length > 0) {
+          return deny(
+            ReasonCode.PREDECESSOR_WORKER_TURN_IN_FLIGHT,
+            "the transferred-away conversation still has a worker turn or a candidate pipeline attempt in flight; the claim waits for it to end",
+            { roleKey, inFlight: inFlight.map((row) => ({ kind: row.kind, id: row.id, runId: row.run_id })) },
+          );
+        }
+      }
+      const runIds: string[] = [];
+      const movedFrom: Array<{ runId: string; sessionId: string; generation: number }> = [];
+      const claims: Array<{ claimId: string; runId: string; fromGeneration: number }> = [];
+      for (const generation of from) {
+        const moved = this.#repointLiveRuns(
+          { roleKey, boundSessionId: generation.sessionId, bindingGeneration: generation.generation },
+          { roleKey, sessionId: to.sessionId, generation: to.generation, incarnation: to.incarnation },
+        );
+        runIds.push(...moved.runIds);
+        movedFrom.push(...moved.runIds.map((runId) => ({ runId, sessionId: generation.sessionId, generation: generation.generation })));
+        claims.push(...moveRunClaimsWithOwnerPin(this.db, generation, to, moved.runIds)
+          .map((claim) => ({ ...claim, fromGeneration: generation.generation })));
+      }
+      return allow(ReasonCode.OK, { runIds, from: movedFrom, claims });
+    });
+  }
+
+  /**
    * The live runs `binding` still owns, by id. The self-claim asks it last, before its commit, for the
    * generation it released with `liveRunsForSameActorSuccessor`: one still owning a live run refuses
    * the claim, whatever the steps between said.

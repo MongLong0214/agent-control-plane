@@ -206,13 +206,14 @@ const V52_COLUMNS = "rowid, result_id, run_id, candidate_snapshot_digest, comman
 
 describe("#1258 v53 migrates a v52 database's verification rows without losing one", () => {
   it("chains v53 after v52 and leaves v52's released checksum where it was", () => {
-    expect(SCHEMA_VERSION).toBe(56);
-    expect(MIGRATIONS.slice(-5).map((step) => [step.id, step.fromVersion, step.toVersion])).toEqual([
+    expect(SCHEMA_VERSION).toBe(57);
+    expect(MIGRATIONS.slice(-6).map((step) => [step.id, step.fromVersion, step.toVersion])).toEqual([
       ["v52-resident-project-provisioning", 51, 52],
       ["v53-verification-result-history", 52, 53],
       ["v54-run-state-exits", 53, 54],
       ["v55-approved-run-revision-reentry", 54, 55],
       ["v56-adopted-bootstrap-first-manifest", 55, 56],
+      ["v57-canonical-entitlement-transfer", 56, 57],
     ]);
     // What a v52 database's receipt holds: schema.sql as v52 was released.
     expect(MIGRATIONS.find((step) => step.toVersion === 52)!.checksum())
@@ -233,7 +234,7 @@ describe("#1258 v53 migrates a v52 database's verification rows without losing o
     approveMigration(path, "v52 → v53 verification history witness");
     new Db(path).close();
 
-    expect(userVersionOf(path)).toBe(56);
+    expect(userVersionOf(path)).toBe(57);
     // Every table, verification_results included, holds exactly what it held at v52 (the attempt column aside).
     const after = contentDigests(path, 52);
     const { schema_migrations: receiptsBefore, ...restBefore } = before.tables;
@@ -253,6 +254,7 @@ describe("#1258 v53 migrates a v52 database's verification rows without losing o
           { version: 54, migration_id: "v54-run-state-exits", checksum: MIGRATIONS.find((step) => step.toVersion === 54)!.checksum() },
           { version: 55, migration_id: "v55-approved-run-revision-reentry", checksum: MIGRATIONS.find((step) => step.toVersion === 55)!.checksum() },
           { version: 56, migration_id: "v56-adopted-bootstrap-first-manifest", checksum: MIGRATIONS.find((step) => step.toVersion === 56)!.checksum() },
+          { version: 57, migration_id: "v57-canonical-entitlement-transfer", checksum: MIGRATIONS.find((step) => step.toVersion === 57)!.checksum() },
         ]);
       expect(raw.prepare("SELECT name FROM sqlite_schema WHERE name LIKE '%_v53_prior'").all()).toEqual([]);
     } finally {

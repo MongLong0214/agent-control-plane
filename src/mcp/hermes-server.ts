@@ -36,6 +36,7 @@ import type { ExecutionMode, RunPriority } from "../domain/types.ts";
 import { Role, roleKeyFor, RunKind, RunState } from "../domain/types.ts";
 import { isTerminal } from "../domain/run-state.ts";
 import type { RepairService } from "../doctor/repair.ts";
+import { CanonicalSessionRegistry, type CanonicalEntitlementTransferRequest } from "../registry/canonical-session-registry.ts";
 import { projectCi } from "../registry/project-ci.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
@@ -277,6 +278,40 @@ export const createHermesMcpPort = (
     },
     ensurePrimaryCto: (projectId: string) => source.cto.ensurePrimaryCto(projectId, "cto_start"),
     requestCtoReplacement: (projectId: string, reason: string) => source.cto.requestReplacement(projectId, reason),
+    // v57 — a PENDING transfer of the project's canonical entitlement, in one transaction with its audit row;
+    // the old conversation keeps everything until the new one's self-claim takes the role and its runs.
+    transferCanonicalEntitlement: (input: CanonicalEntitlementTransferRequest, requestedBy: string) =>
+      source.db.txDecision(() => {
+        const transferred = new CanonicalSessionRegistry(source.db).transfer(input, requestedBy, source.clock.nowIso());
+        if (!transferred.allowed) return transferred;
+        const { value } = transferred;
+        const recorded = source.audit.record({
+          kind: "CANONICAL_ENTITLEMENT_TRANSFERRED",
+          reasonCode: ReasonCode.OK,
+          projectId: value.projectId,
+          roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId: value.projectId }),
+          actor: requestedBy,
+          evidence: {
+            transferId: value.transferId, fromSessionUuid: value.fromSessionUuid, toSessionUuid: value.toSessionUuid,
+            expectedBindingGeneration: value.expectedBindingGeneration, buzzActorId: value.buzzActorId,
+          },
+        });
+        return recorded.allowed ? transferred : recorded as Decision<never>;
+      }),
+    cancelCanonicalEntitlementTransfer: (projectId: string, transferId: string, requestedBy: string) =>
+      source.db.txDecision(() => {
+        const cancelled = new CanonicalSessionRegistry(source.db).cancel(projectId, transferId, source.clock.nowIso());
+        if (!cancelled.allowed) return cancelled;
+        const recorded = source.audit.record({
+          kind: "CANONICAL_ENTITLEMENT_TRANSFER_CANCELLED",
+          reasonCode: ReasonCode.OK,
+          projectId,
+          roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId }),
+          actor: requestedBy,
+          evidence: { transferId, fromSessionUuid: cancelled.value.fromSessionUuid, toSessionUuid: cancelled.value.toSessionUuid },
+        });
+        return recorded.allowed ? cancelled : recorded as Decision<never>;
+      }),
     suspendProject: (projectId: string, reason: string, actor: string) =>
       source.cto.suspendProject(projectId, true, reason, undefined, actor),
     recordOwnerDecision: (input: Parameters<ProductionGate["recordOwnerDecision"]>[0], actor: string) =>
@@ -799,6 +834,44 @@ const createHermesServerFromPort = (
     "cto_replace",
     { description: "Request CTO replacement.", inputSchema: { ...mutation, projectId: z.string(), reason: z.string() } },
     async (args, extra) => write("cto_replace", args, extra, () => respond(port.requestCtoReplacement(args.projectId, args.reason))),
+  );
+
+  server.registerTool(
+    "cto_entitlement_transfer",
+    {
+      description: "Record a PENDING move of a project's canonical PRIMARY_CTO entitlement from its current conversation to another running " +
+        "conversation. Current CEO only. projectId, fromSessionUuid (the current canonical conversation) and expectedBindingGeneration (the role's " +
+        "highest generation) must match exactly; toSessionUuid must never have been entitled. Refused for a retired project, while any execution or " +
+        "pipeline attempt of the project's runs is RUNNING, and while another transfer of the project is pending. Until toSessionUuid self-claims, " +
+        "the old conversation keeps its entitlement, binding and Buzz path; that claim revokes the old entitlement and binding, stops its session " +
+        "and moves its unfinished runs to the new binding. cto_entitlement_transfer_cancel withdraws a pending transfer. Same key replays the recorded result.",
+      inputSchema: {
+        ...mutation, projectId: z.string().min(1), fromSessionUuid: z.string().min(1), toSessionUuid: z.string().min(1),
+        expectedBindingGeneration: z.number().int().nonnegative(),
+      },
+    },
+    async (args, extra) => write("cto_entitlement_transfer", args, extra, () => {
+      const peer = authenticateMcpPeer(authenticate);
+      if (!peer.allowed) return respond(peer);
+      return respond(port.transferCanonicalEntitlement({
+        projectId: args.projectId, fromSessionUuid: args.fromSessionUuid, toSessionUuid: args.toSessionUuid,
+        expectedBindingGeneration: args.expectedBindingGeneration,
+      }, peer.value.actor));
+    }),
+  );
+
+  server.registerTool(
+    "cto_entitlement_transfer_cancel",
+    {
+      description: "Cancel a PENDING (unclaimed) canonical entitlement transfer of a project, by its transferId. Current CEO only. Nothing else " +
+        "changes: the project's current canonical conversation never stopped holding it. A claimed or cancelled transfer is refused.",
+      inputSchema: { ...mutation, projectId: z.string().min(1), transferId: z.string().min(1) },
+    },
+    async (args, extra) => write("cto_entitlement_transfer_cancel", args, extra, () => {
+      const peer = authenticateMcpPeer(authenticate);
+      if (!peer.allowed) return respond(peer);
+      return respond(port.cancelCanonicalEntitlementTransfer(args.projectId, args.transferId, peer.value.actor));
+    }),
   );
 
   server.registerTool(

@@ -106,6 +106,47 @@ const takeoverLinks = (db: Pick<Db, "all">, runId: string, roleKey: string, proj
     [runId, projectId, roleKey],
   );
 
+/**
+ * v57 — one CANONICAL_ENTITLEMENT_TRANSFER_RUN_HANDED_OVER row of a run: the claim of a CEO entitlement transfer
+ * moved the run's pin from `from_generation` (the transferred-away conversation's) to `to_generation`, the new
+ * conversation's first, in the row's own `session_id`. Typed here; judged against the transfer row it names.
+ */
+interface TransferLink {
+  event_id: number;
+  transfer_id: string;
+  from_generation: number;
+  to_generation: number;
+  from_session: string;
+  to_session_id: string;
+  from_uuid: string;
+  to_uuid: string;
+}
+
+const transferLinks = (db: Pick<Db, "all">, runId: string, roleKey: string, projectId: string): TransferLink[] =>
+  db.all<TransferLink>(
+    `SELECT event_id,
+            json_extract(evidence_json, '$.transferId') AS transfer_id,
+            json_extract(evidence_json, '$.fromGeneration') AS from_generation,
+            json_extract(evidence_json, '$.toGeneration') AS to_generation,
+            json_extract(evidence_json, '$.fromSession') AS from_session,
+            session_id AS to_session_id,
+            json_extract(evidence_json, '$.fromSessionUuid') AS from_uuid,
+            json_extract(evidence_json, '$.toSessionUuid') AS to_uuid
+       FROM audit_events
+      WHERE run_id = ? AND kind = 'CANONICAL_ENTITLEMENT_TRANSFER_RUN_HANDED_OVER' AND project_id IS ? AND role_key IS ?
+        AND CASE WHEN json_valid(evidence_json) THEN
+              json_type(evidence_json, '$.transferId') = 'text'
+              AND json_type(evidence_json, '$.fromGeneration') = 'integer'
+              AND json_type(evidence_json, '$.toGeneration') = 'integer'
+              AND json_type(evidence_json, '$.fromSession') = 'text'
+              AND json_type(evidence_json, '$.fromSessionUuid') = 'text'
+              AND json_type(evidence_json, '$.toSessionUuid') = 'text'
+              AND json_extract(evidence_json, '$.toSessionId') IS session_id
+            ELSE 0 END
+      ORDER BY event_id`,
+    [runId, projectId, roleKey],
+  );
+
 /** An adoption where the official takeovers carried it, and the sessions its chain passed through, in order. */
 export interface CarriedAdoption {
   adoption: RecordedBootstrapAdoption;
@@ -155,12 +196,46 @@ const carriedByTakeovers = (
     return rows.length === 1 ? rows[0]! : null;
   };
   const links = takeoverLinks(db, pin.runId, roleKey, record.projectId);
+  const transfers = transferLinks(db, pin.runId, roleKey, record.projectId);
   let at = { sessionId: record.sessionId, eventId: 0 };
+  // The conversation holding the entitlement at `at`: the record's, until a transfer's claim moved it.
+  let conversation = record.entitlementSessionUuid;
   const through = [record.sessionId];
   for (let generation = record.bindingGeneration; generation < pin.ownerBindingGeneration; generation += 1) {
     const candidates = links.filter((link) => link.from_generation === generation);
-    if (candidates.length === 0) return broken("ADOPTION_TAKEOVER_MISSING", generation);
-    if (candidates.length > 1) return broken("ADOPTION_TAKEOVER_AMBIGUOUS", generation);
+    const moved = transfers.filter((link) => link.from_generation === generation);
+    if (candidates.length + moved.length === 0) return broken("ADOPTION_TAKEOVER_MISSING", generation);
+    if (candidates.length + moved.length > 1) return broken("ADOPTION_TAKEOVER_AMBIGUOUS", generation);
+    // v57 — a CEO entitlement transfer's claim moved the pin to another conversation, a different actor. The
+    // transfer row it names is the proof: this project, the conversation the chain reached, the record's Buzz
+    // actor, claimed at exactly the link's generation by the link's session, which an authenticated claim of
+    // the new conversation admitted. The chain then continues on that conversation.
+    if (moved.length === 1) {
+      const link = moved[0]!;
+      const onPin = link.to_generation === pin.ownerBindingGeneration;
+      if (link.to_generation <= generation || link.to_generation > pin.ownerBindingGeneration ||
+        link.from_session !== at.sessionId || link.event_id <= at.eventId || link.from_uuid !== conversation ||
+        (onPin && link.to_session_id !== pin.ownerSessionId)) {
+        return broken("ADOPTION_TAKEOVER_NOT_PROVEN", generation);
+      }
+      const transfer = db.get(
+        `SELECT 1 FROM canonical_entitlement_transfers
+          WHERE transfer_id = ? AND project_id = ? AND from_session_uuid = ? AND to_session_uuid = ? AND buzz_actor_id = ?
+            AND claimed_at IS NOT NULL AND claimed_binding_generation = ?`,
+        [link.transfer_id, record.projectId, conversation, link.to_uuid, record.buzzActorId, link.to_generation],
+      );
+      const prev = assignmentAt(generation, link.from_session);
+      const next = assignmentAt(link.to_generation, link.to_session_id);
+      if (!transfer || !prev || !next || (onPin && next.session_incarnation !== pin.ownerSessionIncarnation) ||
+        !selfClaimAdmitted(db, link.to_session_id, roleKey, link.to_uuid, link.to_generation)) {
+        return broken("ADOPTION_TAKEOVER_NOT_PROVEN", generation);
+      }
+      conversation = link.to_uuid;
+      at = { sessionId: link.to_session_id, eventId: link.event_id };
+      through.push(link.to_session_id);
+      generation = link.to_generation - 1;
+      continue;
+    }
     const link = candidates[0]!;
     const onPin = generation + 1 === pin.ownerBindingGeneration;
     if (link.to_generation !== generation + 1 || link.from_session !== at.sessionId || link.event_id <= at.eventId ||
@@ -182,19 +257,19 @@ const carriedByTakeovers = (
       toGeneration: generation + 1,
       toAssignmentId: next.assignment_id,
       actorId: link.actor_id as string,
-      conversationUuid: record.entitlementSessionUuid,
+      conversationUuid: conversation,
       buzzActorId: record.buzzActorId,
       recoveryAuditEventId: link.recovery_event_id as number,
     };
     const proven = peerMessageSuccessionIsProven(db, succession, onPin ? "ACTIVE" : "REVOKED");
-    if (!proven || !selfClaimAdmitted(db, link.to_session_id, roleKey, record.entitlementSessionUuid, generation + 1)) {
+    if (!proven || !selfClaimAdmitted(db, link.to_session_id, roleKey, conversation, generation + 1)) {
       return broken("ADOPTION_TAKEOVER_NOT_PROVEN", generation);
     }
     at = { sessionId: link.to_session_id, eventId: link.event_id };
     through.push(link.to_session_id);
   }
   return allow(ReasonCode.OK, {
-    adoption: { ...record, sessionId: pin.ownerSessionId, bindingGeneration: pin.ownerBindingGeneration },
+    adoption: { ...record, sessionId: pin.ownerSessionId, bindingGeneration: pin.ownerBindingGeneration, entitlementSessionUuid: conversation },
     through,
   });
 };
@@ -336,6 +411,12 @@ export class CanonicalCtoBootstrapAdoptions {
     if (reserved) {
       return refuse(ReasonCode.BOOTSTRAP_APPLICATION_RESERVED, "ADOPTION_PROJECT_RESERVED",
         "another bootstrap run holds the reservation for the adopted CTO's project", { ...evidence, heldBy: reserved.run_id });
+    }
+    // v57: once a transfer's claim revoked the project's entitlement row, v56's pointer guard can no longer
+    // activate an adopting bootstrap's first manifest, so none is created.
+    if (!this.deps.db.get(`SELECT 1 FROM canonical_session_entitlements WHERE project_id = ? AND revoked_at IS NULL`, [adoption.projectId])) {
+      return refuse(ReasonCode.CONFLICT, "ADOPTION_ENTITLEMENT_TRANSFERRED",
+        "the project's canonical entitlement was transferred; v56's pointer guard admits a first manifest only on the original one", evidence);
     }
     const validated = this.validate(adoption);
     if (!validated.allowed) return validated as Decision<RecordedBootstrapAdoption>;
@@ -494,6 +575,14 @@ export class CanonicalCtoBootstrapAdoptions {
           ...evidence,
           activeManifestDigest: project.activeManifestDigest,
         });
+    }
+    // v57: the v56 manifest-pointer guard moves a NULL pointer for an adopted bootstrap only on the project's
+    // unrevoked entitlement row. After a CEO entitlement transfer's claim revoked it, the bootstrap would write to
+    // GitHub and then be refused the pointer, so it is refused here, before the first write.
+    if (project.activeManifestDigest === null &&
+      !this.deps.db.get(`SELECT 1 FROM canonical_session_entitlements WHERE project_id = ? AND revoked_at IS NULL`, [adoption.projectId])) {
+      return refuse(ReasonCode.CONFLICT, "ADOPTION_TRANSFERRED_BEFORE_ACTIVATION",
+        "the adopted project's entitlement was transferred before its first manifest, which v56's pointer guard then refuses", evidence);
     }
     const bound = this.deps.db.all<{ identity: string; active_manifest_digest: string | null }>(
       `SELECT identity, active_manifest_digest FROM repositories WHERE project_id = ? AND retired_at IS NULL ORDER BY repository_id`,

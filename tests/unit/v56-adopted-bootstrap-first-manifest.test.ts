@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
@@ -108,14 +108,21 @@ const world = () => {
 
 describe("#1234 v56 — an adopting bootstrap's first manifest, and nothing else", () => {
   it("v55 → v56 replaces exactly the manifest-pointer guard, keeps every row, and matches a fresh v56 database", () => {
-    expect(SCHEMA_VERSION).toBe(56);
-    expect(MIGRATIONS.at(-1)).toMatchObject({ id: "v56-adopted-bootstrap-first-manifest", fromVersion: 55, toVersion: 56 });
+    expect(SCHEMA_VERSION).toBe(57);
+    expect(MIGRATIONS.find((step) => step.toVersion === 56)).toMatchObject({ id: "v56-adopted-bootstrap-first-manifest", fromVersion: 55, toVersion: 56 });
     const path = releasedChainImage(privateStatePath("acp-v56-from-v55-"), 55);
     const v55Rows = schemaRowsOf(path);
     const before = contentDigests(path, 55);
     expect(before.userVersion).toBe(55);
     approveMigration(path, "v55 → v56 witness");
-    new Db(path).close();
+    // The image as v56 left it, before v57 runs on the same approved chain.
+    let at56: Buffer | undefined;
+    new Db(path, { afterMigration: (migration) => {
+      if (migration.toVersion !== 56) return;
+      const reader = new Database(path, { readonly: true });
+      try { at56 = reader.serialize(); } finally { reader.close(); }
+    } }).close();
+    writeFileSync(path, at56!);
     const after = contentDigests(path, 55);
     expect(after.userVersion).toBe(56);
     const { schema_migrations: _receiptsBefore, ...rowsBefore } = before.tables;

@@ -2310,16 +2310,21 @@ const judgeBuzzMentionIdentity = (
   // effective() lists positive entitlements only. Read negative authority before that projection:
   // neither an env override nor a new channel key for the same canonical conversation revives it.
   const configured = canonical?.sessions.find((entry) => entry.buzzActorId === channelIdentity);
+  // v57: a row a claimed, unrevoked transfer of the same project and Buzz actor superseded is the moved-away
+  // conversation's tombstone, not the project's or its actor's, so it no longer speaks against the channel;
+  // it still does against a session that is that conversation's runtime, and retirement still does.
   const revoked = cp.db.get(
     `SELECT 1 FROM canonical_session_entitlements e
       WHERE (e.revoked_at IS NOT NULL
         OR EXISTS (SELECT 1 FROM project_retirements r WHERE r.project_id = e.project_id)
         OR EXISTS (SELECT 1 FROM projects p WHERE p.project_id = e.project_id AND p.retired_at IS NOT NULL))
-        AND (e.buzz_actor_id = ? OR e.session_uuid = ? OR e.project_id = ?
+        AND (((e.buzz_actor_id = ? OR e.session_uuid = ? OR e.project_id = ?)
+            AND NOT EXISTS (SELECT 1 FROM canonical_entitlement_transfers t
+              WHERE t.project_id = e.project_id AND t.buzz_actor_id = ? AND t.claimed_at IS NOT NULL AND t.revoked_at IS NULL))
           OR EXISTS (SELECT 1 FROM conversational_actors c
             JOIN actor_target_bindings tb ON tb.target_actor_id = c.actor_id
             WHERE c.current_session_id = ? AND tb.executor_kind = ? AND tb.target_locator = e.session_uuid))`,
-    [channelIdentity, configured?.sessionUuid ?? null, configured?.projectId ?? null,
+    [channelIdentity, configured?.sessionUuid ?? null, configured?.projectId ?? null, channelIdentity,
       session?.session_id ?? null, SELF_CLAIM_EXECUTOR_KIND],
   ) || (configured && cp.db.get(
     `SELECT 1 FROM project_retirements WHERE project_id = ?
