@@ -9,6 +9,7 @@ import { type Decision, allow, deny } from "../../src/core/errors.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
+import { DEAD_CANONICAL_BINDING_RECOVERY_REASON_PREFIX } from "../../src/daemon/dead-binding-recovery.ts";
 import { ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import {
   CanonicalSelfClaim,
@@ -304,6 +305,30 @@ describe("a continuity-held run of a dead canonical CTO follows the same convers
       },
     });
     try {
+      expect(holds).toEqual({ released: [f.runId], kept: [] });
+      expect(f.owner()).toEqual({ owner_session_id: claimed.sessionId, owner_binding_generation: 3, state: RunState.ACTIVE });
+      expect(JSON.parse(f.handOvers()[0]!.evidence_json)).toMatchObject({ fromGeneration: 1, toGeneration: 3 });
+    } finally {
+      await f.daemon.stop();
+    }
+  });
+
+  it("is handed over when the next claim, not a pass, released a generation that died again", async () => {
+    const { f, claimed, holds } = await heldThenClaimed({
+      generation: 3,
+      claim: async (fixture) => {
+        const second = await fixture.claimAs(2);
+        if (!second.allowed) throw new Error(JSON.stringify(second));
+        // Gen 2's process is gone; gen 3 claims before any pass, so the claim itself releases gen 2.
+        return fixture.claimAs(3);
+      },
+    });
+    try {
+      const released = f.db.get<{ status: string; revoked_reason: string }>(
+        `SELECT status, revoked_reason FROM assignments WHERE role_key = ? AND binding_generation = 2`, [f.roleKey],
+      );
+      expect(released?.status).toBe("REVOKED");
+      expect(released?.revoked_reason.startsWith(DEAD_CANONICAL_BINDING_RECOVERY_REASON_PREFIX)).toBe(true);
       expect(holds).toEqual({ released: [f.runId], kept: [] });
       expect(f.owner()).toEqual({ owner_session_id: claimed.sessionId, owner_binding_generation: 3, state: RunState.ACTIVE });
       expect(JSON.parse(f.handOvers()[0]!.evidence_json)).toMatchObject({ fromGeneration: 1, toGeneration: 3 });

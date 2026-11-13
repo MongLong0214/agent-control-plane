@@ -40,6 +40,7 @@ import type { Outbox } from "../outbox/outbox.ts";
 import { ContractChangeRefusal } from "../registry/contract-change-plan.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import { SELF_CLAIM_EXECUTOR_KIND } from "../registry/canonical-self-claim.ts";
+import { DEAD_CANONICAL_BINDING_RECOVERY_REASON_PREFIX } from "../daemon/dead-binding-recovery.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import { type ClaimRegistry, moveRunClaimsWithOwnerPin } from "../claims/claim-registry.ts";
@@ -2413,9 +2414,12 @@ export class RunEngine {
    * role, with the runtime-lost pause; the pin is that role's generation REVOKED by continuity's
    * runtime-lost revocation; `owner` is a higher generation of the same conversational actor; and that
    * actor is a canonical (self-claimed) conversation. Every generation between the two must be that same
-   * actor, also revoked for a lost runtime: a conversation that crashed again before a pass is still the
-   * one continuity paused for, but a deliberate revocation in between (a CEO release, a replacement, a
-   * suspension) or another actor ends the chain, and the run stays held.
+   * actor, also released as a lost runtime: by continuity's runtime-lost revocation, or as proven dead by
+   * `recoverDeadCanonicalBinding` (the next self-claim's release, or the operator door's, both after a
+   * DEAD probe). A conversation that crashed again is still the one continuity paused for, whether a pass
+   * or its own next claim saw it first; a deliberate revocation in between (a CEO release or replacement,
+   * a suspension, a retirement), a coverage or failover revocation, or another actor ends the chain, and
+   * the run stays held.
    */
   #runtimeLostPredecessor(
     run: RunRow,
@@ -2438,12 +2442,14 @@ export class RunEngine {
                              AND mid.binding_generation > prev.binding_generation
                              AND mid.binding_generation < next.binding_generation
                              AND (mid.actor_id <> prev.actor_id OR mid.status <> 'REVOKED'
-                                  OR mid.revoked_reason IS NOT ?))`,
+                                  OR (mid.revoked_reason IS NOT ?
+                                      AND substr(COALESCE(mid.revoked_reason, ''), 1, ?) <> ?)))`,
       [
         owner.assignmentId, run.ownerRoleKey, run.ownerBindingGeneration,
         run.ownerSessionId, run.ownerSessionIncarnation,
         CONTINUITY_RUNTIME_LOST_REVOCATION_REASON, SELF_CLAIM_EXECUTOR_KIND,
         CONTINUITY_RUNTIME_LOST_REVOCATION_REASON,
+        DEAD_CANONICAL_BINDING_RECOVERY_REASON_PREFIX.length, DEAD_CANONICAL_BINDING_RECOVERY_REASON_PREFIX,
       ],
     );
     return row ? { sessionId: row.session_id, generation: run.ownerBindingGeneration, actorId: row.actor_id } : null;
