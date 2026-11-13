@@ -67,15 +67,18 @@ export const RECEIPT_BYTES_SHA256 =
  *
  * `src/db/schema-v55.sql` is likewise `git show 02d4b98a:src/db/schema.sql` (#1189 B5's v55, frozen as the
  * prerequisite of #1234's v56 adopted-bootstrap first manifest), and carries that file's git blob id.
+ *
+ * `src/db/schema-v56.sql` is likewise `git show 60817e8f:src/db/schema.sql` (#1234's v56 as released, frozen as
+ * the prerequisite of v57's canonical entitlement transfer), and carries that file's git blob id.
  */
 export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob?: string }> = [
   {
     path: "src/db/migrations.ts",
     // v53 appends verification history and freezes v52's released schema; #1189's v54 run-state exits
     // step freezes v53's, #1189 B5's v55 (the two state guards) freezes v54's, and #1234's v56 (the
-    // manifest-pointer guard) freezes v55's. Replayed lineage and compiled upgrades still bind the
-    // unchanged historical SQL, trace and receipt pins below.
-    sha256: "0560ba04dea06485ba4c0fdfdf571e489a3f547d31c0a716c202317c442da9fe",
+    // manifest-pointer guard) freezes v55's, and v57 (the canonical entitlement transfer table) freezes v56's.
+    // Replayed lineage and compiled upgrades still bind the unchanged historical SQL, trace and receipt pins below.
+    sha256: "2cbcc84a90a56b802f7aeb48a095bfb73a5c56609d953642951b20af2428535f",
   },
   {
     path: "src/db/schema-v37.sql",
@@ -138,6 +141,11 @@ export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob
     path: "src/db/schema-v55.sql",
     sha256: "4dd344247263834d354a76ae874ffec7fad475c357efbc48b2d99dda306ae13d",
     gitBlob: "fbce31879c98765594bb04c6a0354b739a6f2eb6",
+  },
+  {
+    path: "src/db/schema-v56.sql",
+    sha256: "c33ef9b366dd8f769ee6bebde5b840678a93840553cdbd07d7985bc8ed0aca02",
+    gitBlob: "64ce94bab822d8dfa903600e873cef05f9f73e13",
   },
   {
     path: "tests/fixtures/schema-v13.sql",

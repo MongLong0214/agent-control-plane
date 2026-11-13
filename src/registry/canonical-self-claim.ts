@@ -14,6 +14,7 @@ import type { Db } from "../db/database.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
 import type { AuthenticatedTargetBinding, BindingRegistry, VerifiedTargetBinding } from "../session/binding-registry.ts";
 import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session-registry.ts";
+import { CanonicalSessionRegistry } from "./canonical-session-registry.ts";
 
 /**
  * Canonical runtime self-claim / adoption (#760).
@@ -2417,6 +2418,46 @@ export class CanonicalSelfClaim {
         if (!stopped.allowed) return stopped as Decision<CanonicalSelfClaimReceipt>;
       }
 
+      // v57 — this conversation's first claim after the CEO transferred the project's entitlement to it. The
+      // transfer record is the authority over the conversation it was moved from, a different actor: that
+      // actor's ACTIVE binding of this role is revoked (its live runs left pinned for the hand-over below),
+      // and its live session, which holds the role's Buzz actor, is stopped, so its relay receives no more
+      // work. Nothing else of the old conversation is touched, and its history is not rewritten.
+      const entitlements = new CanonicalSessionRegistry(this.db);
+      const transfer = entitlements.pendingTransferTo(identity.sessionUuid);
+      if (transfer !== null && transfer.projectId !== entry.projectId) {
+        return deny(ReasonCode.CONFLICT, "the pending entitlement transfer names another project", { observed: entry.projectId });
+      }
+      const transferredFrom = transfer === null ? null : this.db.get<{ actor_id: string; current_session_id: string | null }>(
+        `SELECT a.actor_id, a.current_session_id FROM conversational_actors a
+           JOIN actor_target_bindings t ON t.target_actor_id = a.actor_id
+          WHERE t.executor_kind = ? AND t.target_locator = ? AND t.target_locator_digest = ?`,
+        [SELF_CLAIM_EXECUTOR_KIND, transfer.fromSessionUuid, sha256(transfer.fromSessionUuid)],
+      ) ?? null;
+      let transferRevokedGeneration: number | null = null;
+      if (transfer !== null && transferredFrom !== null) {
+        const held = this.bindings.active(roleKey);
+        const heldActor = held === null ? null : this.db.get<{ actor_id: string }>(
+          `SELECT actor_id FROM assignments WHERE assignment_id = ?`, [held.assignmentId])?.actor_id ?? null;
+        if (held !== null && heldActor === transferredFrom.actor_id) {
+          const revoked = this.bindings.revoke(roleKey,
+            `canonical entitlement transfer ${transfer.transferId}: the project's canonical CTO moved to another conversation`,
+            { liveRunsForSameActorSuccessor: { runIds: [] }, expectedCurrent: held, evidence: { transferId: transfer.transferId } });
+          if (!revoked.allowed) return revoked as Decision<CanonicalSelfClaimReceipt>;
+          transferRevokedGeneration = held.bindingGeneration;
+        }
+        const live = this.db.all<{ session_id: string }>(
+          `SELECT session_id FROM sessions WHERE lifecycle IN ('STARTING','READY','DRAINING')
+             AND (session_id IS ? OR buzz_actor_id = ?) ORDER BY session_id`,
+          [transferredFrom.current_session_id, transfer.buzzActorId],
+        );
+        for (const { session_id: sessionId } of live) {
+          const stopped = this.sessions.transition(sessionId, SessionLifecycle.STOPPED,
+            `canonical entitlement transfer ${transfer.transferId} to generation ${nextGeneration}`);
+          if (!stopped.allowed) return stopped as Decision<CanonicalSelfClaimReceipt>;
+        }
+      }
+
       const created = this.sessions.create({
         provider: "claude",
         model: "claude-cli",
@@ -2500,6 +2541,52 @@ export class CanonicalSelfClaim {
         deferPeerMailUntilCarry: recoveredFrom !== null,
       });
       if (!bound.allowed) return bound as Decision<CanonicalSelfClaimReceipt>;
+
+      // v57 — the transfer's run hand-over: every live run pinned to a generation of the transferred-away
+      // conversation in this role moves to this generation with its claims, on the transfer's authority,
+      // or the claim refuses and everything above rolls back. The transfer is then consumed, once.
+      if (transfer !== null) {
+        const generations = transferredFrom === null ? [] : this.db.all<{ sessionId: string; generation: number }>(
+          `SELECT session_id AS sessionId, binding_generation AS generation FROM assignments
+            WHERE actor_id = ? AND role_key = ? ORDER BY binding_generation`,
+          [transferredFrom.actor_id, roleKey],
+        );
+        const moved = this.bindings.repointLiveRunsToTransferSuccessor(roleKey, generations, {
+          sessionId: created.sessionId, generation: bound.value.bindingGeneration, incarnation: bound.value.sessionIncarnation,
+        });
+        if (!moved.allowed) return moved as Decision<CanonicalSelfClaimReceipt>;
+        const actor = `${SELF_CLAIM_RECOVERY_ACTOR_PREFIX}entitlement-transfer:${transfer.transferId}`;
+        const handedOver = (kind: string, runId: string | null, evidence: Record<string, unknown>): Decision<number> => {
+          try {
+            return this.audit.record({ kind, reasonCode: ReasonCode.OK, runId, projectId: entry.projectId,
+              sessionId: created.sessionId, roleKey, actor, evidence });
+          } catch (error) {
+            return deny(ReasonCode.AUDIT_WRITE_FAILED, error instanceof Error ? error.message : String(error), {});
+          }
+        };
+        const common = {
+          transferId: transfer.transferId, fromSessionUuid: transfer.fromSessionUuid, toSessionUuid: transfer.toSessionUuid,
+          toSessionId: created.sessionId, toGeneration: bound.value.bindingGeneration,
+        };
+        for (const runId of moved.value.runIds) {
+          const claims = moved.value.claims.filter((claim) => claim.runId === runId);
+          const recorded = handedOver("CANONICAL_ENTITLEMENT_TRANSFER_RUN_HANDED_OVER", runId, {
+            ...common, claimIds: claims.map((claim) => claim.claimId),
+          });
+          if (!recorded.allowed) {
+            return deny(ReasonCode.AUDIT_WRITE_FAILED, "the transfer's run hand-over row could not be written, so the claim was rolled back", { roleKey, runId });
+          }
+        }
+        if (!entitlements.markClaimed(transfer.transferId, bound.value.bindingGeneration, this.clock.nowIso())) {
+          return deny(ReasonCode.CONFLICT, "the entitlement transfer was claimed or revoked during this claim", { transferId: transfer.transferId });
+        }
+        const recorded = handedOver("CANONICAL_ENTITLEMENT_TRANSFER_CLAIMED", null, {
+          ...common, revokedGeneration: transferRevokedGeneration, runIds: moved.value.runIds,
+        });
+        if (!recorded.allowed) {
+          return deny(ReasonCode.AUDIT_WRITE_FAILED, "the transfer's claim row could not be written, so the claim was rolled back", { roleKey });
+        }
+      }
 
       // The other half of the hold above, and only once the successor binding exists: every peer
       // message the release held is carried to this generation once, or rejected with its turn

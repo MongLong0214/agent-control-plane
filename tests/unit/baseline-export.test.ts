@@ -1158,6 +1158,7 @@ describe("baseline boundary contracts", () => {
       "v54-run-state-exits",
       "v55-approved-run-revision-reentry",
       "v56-adopted-bootstrap-first-manifest",
+      "v57-canonical-entitlement-transfer",
     ]);
   });
 

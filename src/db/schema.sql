@@ -4350,6 +4350,85 @@ BEGIN
   SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_IMMUTABLE');
 END;
 
+-- v57 — a CEO transfer of a project's canonical PRIMARY_CTO entitlement to another conversation. The
+-- predecessor (the project's entitlement row, or the transfer that last moved it) is revoked in the same
+-- transaction and stays its tombstone; a transfer row is the project's one unrevoked successor and carries
+-- the predecessor's Buzz actor, room and provisioning run. claimed_at is set once, when the new
+-- conversation's self-claim takes the role.
+CREATE TABLE IF NOT EXISTS canonical_entitlement_transfers (
+  transfer_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(project_id),
+  from_session_uuid TEXT NOT NULL UNIQUE,
+  to_session_uuid TEXT NOT NULL UNIQUE,
+  buzz_actor_id TEXT NOT NULL,
+  buzz_address TEXT NOT NULL,
+  provisioning_run_id TEXT REFERENCES resident_project_provisioning(run_id),
+  expected_binding_generation INTEGER NOT NULL,
+  requested_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  claimed_at TEXT,
+  claimed_binding_generation INTEGER,
+  revision INTEGER NOT NULL DEFAULT 1,
+  revoked_at TEXT,
+  CHECK (from_session_uuid <> to_session_uuid)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS canonical_entitlement_transfers_one_active
+  ON canonical_entitlement_transfers(project_id) WHERE revoked_at IS NULL;
+-- CP-HI-02 — v57: a transfer supersedes exactly its project's revoked predecessor, with that predecessor's identity, and
+-- names a conversation never entitled anywhere; it starts unclaimed and unrevoked.
+CREATE TRIGGER IF NOT EXISTS canonical_entitlement_transfers_supersede_only
+BEFORE INSERT ON canonical_entitlement_transfers
+WHEN NEW.revoked_at IS NOT NULL OR NEW.claimed_at IS NOT NULL OR NEW.claimed_binding_generation IS NOT NULL
+ OR NEW.revision <> 1
+ OR EXISTS (SELECT 1 FROM project_retirements WHERE project_id = NEW.project_id)
+ OR EXISTS (SELECT 1 FROM projects WHERE project_id = NEW.project_id AND retired_at IS NOT NULL)
+ OR EXISTS (SELECT 1 FROM canonical_session_entitlements WHERE session_uuid = NEW.to_session_uuid)
+ OR EXISTS (SELECT 1 FROM canonical_entitlement_transfers WHERE from_session_uuid = NEW.to_session_uuid)
+ OR NOT (
+   EXISTS (SELECT 1 FROM canonical_session_entitlements e
+            WHERE e.session_uuid = NEW.from_session_uuid AND e.project_id = NEW.project_id
+              AND e.revoked_at IS NOT NULL AND e.buzz_actor_id = NEW.buzz_actor_id
+              AND e.buzz_address = NEW.buzz_address AND e.provisioning_run_id IS NEW.provisioning_run_id)
+   OR EXISTS (SELECT 1 FROM canonical_entitlement_transfers t
+            WHERE t.to_session_uuid = NEW.from_session_uuid AND t.project_id = NEW.project_id
+              AND t.revoked_at IS NOT NULL AND t.buzz_actor_id = NEW.buzz_actor_id
+              AND t.buzz_address = NEW.buzz_address AND t.provisioning_run_id IS NEW.provisioning_run_id))
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE');
+END;
+-- CP-HI-02 — v57: a transfer's identity never changes; an update only records its claim once or revokes it once.
+CREATE TRIGGER IF NOT EXISTS canonical_entitlement_transfers_identity_immutable
+BEFORE UPDATE ON canonical_entitlement_transfers
+WHEN NEW.transfer_id IS NOT OLD.transfer_id OR NEW.project_id IS NOT OLD.project_id
+ OR NEW.from_session_uuid IS NOT OLD.from_session_uuid OR NEW.to_session_uuid IS NOT OLD.to_session_uuid
+ OR NEW.buzz_actor_id IS NOT OLD.buzz_actor_id OR NEW.buzz_address IS NOT OLD.buzz_address
+ OR NEW.provisioning_run_id IS NOT OLD.provisioning_run_id
+ OR NEW.expected_binding_generation IS NOT OLD.expected_binding_generation
+ OR NEW.requested_by IS NOT OLD.requested_by OR NEW.created_at IS NOT OLD.created_at
+ OR OLD.revoked_at IS NOT NULL OR NEW.revision <> OLD.revision + 1
+ OR NOT ((OLD.claimed_at IS NULL AND NEW.claimed_at IS NOT NULL AND NEW.claimed_binding_generation IS NOT NULL
+          AND NEW.revoked_at IS NULL)
+      OR (NEW.revoked_at IS NOT NULL AND NEW.claimed_at IS OLD.claimed_at
+          AND NEW.claimed_binding_generation IS OLD.claimed_binding_generation))
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE');
+END;
+-- CP-HI-02 — v57: a transfer is never erased.
+CREATE TRIGGER IF NOT EXISTS canonical_entitlement_transfers_no_delete
+BEFORE DELETE ON canonical_entitlement_transfers
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE');
+END;
+-- CP-HI-02 — v57: a conversation a transfer named is never granted again, and a transferred Buzz actor is not granted twice.
+CREATE TRIGGER IF NOT EXISTS canonical_session_entitlements_no_transferred_identity
+BEFORE INSERT ON canonical_session_entitlements
+WHEN EXISTS (SELECT 1 FROM canonical_entitlement_transfers
+              WHERE to_session_uuid = NEW.session_uuid OR from_session_uuid = NEW.session_uuid
+                 OR (buzz_actor_id = NEW.buzz_actor_id AND revoked_at IS NULL AND NEW.revoked_at IS NULL))
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE');
+END;
+
 -- CP-HI-02 — a retirement preserves history and permanently suppresses old entitlement sources.
 CREATE TRIGGER IF NOT EXISTS project_retirements_identity_immutable
 BEFORE UPDATE ON project_retirements

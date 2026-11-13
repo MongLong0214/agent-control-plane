@@ -35,7 +35,7 @@ export class ResidentProjectProvisioning {
     if (!row) return false;
     const steps = JSON.parse(row.steps_json) as Record<string,{observed?:HostObservation}>;
     const buzz = steps['ensure-buzz']?.observed?.buzz;
-    return Boolean(buzz?.roomId === roomId && buzz.rosterVerified && buzz.nonceReadable && buzz.nonceEventId && this.db.get(`SELECT 1 FROM canonical_session_entitlements WHERE provisioning_run_id = ? AND buzz_address = ? AND buzz_actor_id = ? AND revoked_at IS NULL`,[row.run_id,roomId,buzz.pubkey]));
+    return Boolean(buzz?.roomId === roomId && buzz.rosterVerified && buzz.nonceReadable && buzz.nonceEventId && this.db.get(`SELECT 1 FROM canonical_session_entitlements WHERE provisioning_run_id = ? AND buzz_address = ? AND buzz_actor_id = ? AND revoked_at IS NULL UNION ALL SELECT 1 FROM canonical_entitlement_transfers WHERE provisioning_run_id = ? AND buzz_address = ? AND buzz_actor_id = ? AND revoked_at IS NULL`,[row.run_id,roomId,buzz.pubkey,row.run_id,roomId,buzz.pubkey]));
   }
   pending(): BootstrapConfirmation[] { return this.db.all<{confirmation_json:string}>(`SELECT confirmation_json FROM resident_project_provisioning WHERE status = 'PENDING' ORDER BY run_id`).map(r => JSON.parse(r.confirmation_json) as BootstrapConfirmation); }
   row(runId:string): ProvisioningRow | undefined { return this.db.get<ProvisioningRow>(`SELECT * FROM resident_project_provisioning WHERE run_id = ?`,[runId]); }
@@ -140,7 +140,7 @@ export class ResidentProjectProvisioning {
   }
   ready(runId:string,sessionId:string): boolean {
     const row = this.row(runId);
-    if (!row || !["PENDING","COMPLETE"].includes(row.status) || this.db.get(`SELECT 1 FROM project_retirements WHERE project_id = ?`,[row.project_id]) || !this.db.get(`SELECT 1 FROM canonical_session_entitlements e JOIN projects p ON p.project_id = e.project_id WHERE e.provisioning_run_id = ? AND e.revoked_at IS NULL AND p.retired_at IS NULL AND p.suspended = 0`,[runId])) return false;
+    if (!row || !["PENDING","COMPLETE"].includes(row.status) || this.db.get(`SELECT 1 FROM project_retirements WHERE project_id = ?`,[row.project_id]) || !this.db.get(`SELECT 1 FROM canonical_session_entitlements e JOIN projects p ON p.project_id = e.project_id WHERE e.provisioning_run_id = ? AND e.revoked_at IS NULL AND p.retired_at IS NULL AND p.suspended = 0 UNION ALL SELECT 1 FROM canonical_entitlement_transfers t JOIN projects p ON p.project_id = t.project_id WHERE t.provisioning_run_id = ? AND t.revoked_at IS NULL AND p.retired_at IS NULL AND p.suspended = 0`,[runId,runId])) return false;
     const evidence = this.evidence(runId);
     if (!evidence?.subscriberReady || evidence.claimSessionId !== sessionId || !evidence.observations.resident) return false;
     const {allocation:a,observations:{resident:r}} = evidence;

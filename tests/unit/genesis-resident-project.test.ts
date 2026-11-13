@@ -211,6 +211,21 @@ describe('durable resident provisioning and retirement',() => {
     const roomId=host.actualRoomId;host.actualRoomId='ffffffff-ffff-4fff-8fff-ffffffffffff';
     await expect(service.ensure(input)).rejects.toThrow();expect(service.allocation(input.runId)?.roomId).toBe(roomId);h.cp.close();
   });
+  it('v57: a transferred canonical entitlement keeps its provisioning run\'s room confirmed',async()=>{
+    const h=makeHarness();const host=new FakeHost();
+    const run=h.cp.runs.create({kind:RunKind.PROJECT_BOOTSTRAP,executionMode:'STANDARD',contract});if(!run.allowed) throw new Error(run.message);
+    h.cp.projects.register({projectId:'resident',name:'resident'});
+    const service=new ResidentProjectProvisioning(h.cp.db,h.clock,host,join(h.root,'home'),h.root);service.attachSubscriber(async()=>false);
+    service.remember({runId:run.value.runId,candidateSnapshotDigest:'candidate',ceoSessionId:'ceo'},'resident',{});
+    const observed=await service.ensure({runId:run.value.runId,projectId:'resident',repositoryIdentity:'github:acme/fixture',repositoryNodeId:'R_node',head:'f'.repeat(40),packet:{}});
+    expect(service.confirmedRoom(observed.allocation.roomId)).toBe(true);
+    const registry=new CanonicalSessionRegistry(h.cp.db);
+    const generation=h.cp.db.get<{g:number|null}>(`SELECT MAX(binding_generation) AS g FROM assignments WHERE role_key = 'PRIMARY_CTO:resident'`)?.g ?? 0;
+    const moved=h.cp.db.txDecision(()=>registry.transfer({projectId:'resident',fromSessionUuid:observed.allocation.sessionUuid,toSessionUuid:'0f0f0f0f-0000-4000-8000-000000000057',expectedBindingGeneration:generation},'ceo',h.clock.nowIso()));
+    expect(moved.allowed,JSON.stringify(moved)).toBe(true);
+    expect(service.confirmedRoom(observed.allocation.roomId)).toBe(true);
+    h.cp.close();
+  });
   it.each(['ensure-checkout','ensure-buzz','ensure-routing','ensure-resident','observe'] as const)('recovers a crash after %s without reallocating resources or asking for another CONFIRM',async failed => {
     const h = makeHarness();const host = new FakeHost();
     const run = h.cp.runs.create({kind:RunKind.PROJECT_BOOTSTRAP,executionMode:"STANDARD",contract});if (!run.allowed) throw new Error(run.message);

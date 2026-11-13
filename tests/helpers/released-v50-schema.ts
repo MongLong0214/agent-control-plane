@@ -27,8 +27,21 @@ export const V55_CHANGED_GUARDS = ["runs_state_transition_guard", "runs_state_tr
 /** The only definition v56 replaces, named independently of the migration. */
 export const V56_CHANGED_GUARDS = ["projects_active_manifest_moves_by_grant"];
 
+/** The objects v57 adds, named independently of the migration: its table, index and four guards. */
+export const V57_ADDED_TRIGGERS = [
+  "canonical_entitlement_transfers_supersede_only", "canonical_entitlement_transfers_identity_immutable",
+  "canonical_entitlement_transfers_no_delete", "canonical_session_entitlements_no_transferred_identity",
+];
+
+/** A fixture built from a current database that claims to predate v57 holds no entitlement transfer table or guard. */
+export const takeBackV57 = (raw: Database.Database): void => {
+  for (const name of V57_ADDED_TRIGGERS) raw.exec(`DROP TRIGGER IF EXISTS ${name}`);
+  raw.exec(`DROP INDEX IF EXISTS canonical_entitlement_transfers_one_active; DROP TABLE IF EXISTS canonical_entitlement_transfers`);
+};
+
 /** A fixture built from a current database that claims to predate v56 holds v55's manifest-pointer guard. */
 export const takeBackV56 = (raw: Database.Database): void => {
+  takeBackV57(raw);
   const snapshot = readFileSync(new URL("../../src/db/schema-v55.sql", import.meta.url), "utf8");
   for (const name of V56_CHANGED_GUARDS) {
     const ddl = new RegExp(`CREATE TRIGGER IF NOT EXISTS ${name}\\n[\\s\\S]*?\\nEND;`).exec(snapshot)?.[0];
