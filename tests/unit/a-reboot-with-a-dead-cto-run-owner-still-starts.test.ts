@@ -1,8 +1,6 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 
-import Database from "better-sqlite3";
-
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { type Decision, allow } from "../../src/core/errors.ts";
@@ -209,6 +207,25 @@ const startDaemon = async (fixture: Awaited<ReturnType<typeof rebootedCto>>) => 
 };
 
 /**
+ * A worker turn on the dead owner's run, held by its own task-scoped WORKER session through the
+ * ordinary path, with the schema intact: the run owner's session is never the worker (CP-HI-04).
+ */
+const startWorkerTurn = (fixture: Awaited<ReturnType<typeof rebootedCto>>, workerProcessId?: number) => {
+  const { harness, runId } = fixture;
+  const tasks = harness.cp.tasks.submit(runId, [{ key: "impl", title: "change app()", category: "implementation" }]);
+  if (!tasks.allowed) throw new Error(tasks.message);
+  const task = harness.cp.tasks.ready(runId)[0]!;
+  const workerSessionId = bindWorker(harness, task.taskId);
+  const execution = harness.cp.tasks.startExecution({
+    runId, taskId: task.taskId, ownerBindingGeneration: 1, workerSessionId,
+    provider: "scripted", model: "scripted-worker",
+    ...(workerProcessId === undefined ? {} : { workerProcessId, runtimeManaged: false }),
+  });
+  if (!execution.allowed) throw new Error(execution.message);
+  return { workerSessionId, executionId: execution.value.executionId };
+};
+
+/**
  * The startup doctor's own record of the session's finding: the latest system DOCTOR_REPORT, read
  * right after `start()` returns (an earlier one, from dispatch, saw the process still running).
  */
@@ -291,27 +308,34 @@ describe("a reboot that kills a canonical CTO owning an ACTIVE run", () => {
       }
     });
 
-    it("a dead owner with a RUNNING execution in its name", async () => {
+    it("a dead owner whose run has a worker turn RUNNING in a separate WORKER session", async () => {
       const f = await rebootedCto();
-      const tasks = f.harness.cp.tasks.submit(f.runId, [{ key: "impl", title: "change app()", category: "implementation" }]);
-      if (!tasks.allowed) throw new Error(tasks.message);
-      const task = f.harness.cp.tasks.ready(f.runId)[0]!;
-      const execution = f.harness.cp.tasks.startExecution({
-        runId: f.runId, taskId: task.taskId, ownerBindingGeneration: 1, workerSessionId: bindWorker(f.harness, task.taskId),
-        provider: "scripted", model: "scripted-worker",
-      });
-      if (!execution.allowed) throw new Error(execution.message);
-      // An open execution recorded against the dead session itself. The schema keeps a run owner's
-      // session from ever being a worker (CP-HI-04), so only a raw writer reaches this state; the
-      // fixture lifts the worker-identity trigger in its own database to build it.
-      const raw = new Database(f.db.raw.name);
-      try {
-        raw.exec(`DROP TRIGGER task_executions_worker_identity_immutable`);
-        raw.prepare(`UPDATE task_executions SET worker_session_id = ? WHERE execution_id = ?`)
-          .run(f.sessionId, execution.value.executionId);
-      } finally { raw.close(); }
+      const { workerSessionId } = startWorkerTurn(f);
+      expect(workerSessionId).not.toBe(f.sessionId);
       f.settle(f.sessionId);
       expect(await f.finding("system", f.sessionId)).toEqual({ severity: "ERROR", blocking: true });
+    });
+
+    it("startup while the worker process of the dead owner's run survived the CTO", async () => {
+      const f = await rebootedCto();
+      // A CTO-reported receipt names its worker process; startup keeps it RUNNING while that runs.
+      const worker = spawn("/bin/sleep", ["600"], { stdio: "ignore" });
+      stragglers.push(worker);
+      await once(worker, "spawn");
+      const { executionId } = startWorkerTurn(f, worker.pid!);
+      const { daemon, started, blocking } = await startDaemon(f);
+      try {
+        expect(f.db.get<{ status: string }>(
+          `SELECT status FROM task_executions WHERE execution_id = ?`, [executionId],
+        )?.status).toBe("RUNNING");
+        expect({ allowed: started.allowed, reasonCode: started.reasonCode, blocking }).toEqual({
+          allowed: false,
+          reasonCode: ReasonCode.DOCTOR_BLOCKED,
+          blocking: [{ code: "SESSION_PROCESS_MISSING", severity: "ERROR", scope: `session:${f.sessionId}` }],
+        });
+      } finally {
+        await daemon.stop();
+      }
     });
 
     it("a dead CEO that owns a live run", async () => {
