@@ -276,6 +276,13 @@ export interface DeadBindingRecoveryReceipt {
  * history including REVOKED rows, so whatever binds this role next is strictly greater than
  * what this released.
  */
+/**
+ * The revocation reason this release writes starts with this, and only after its DEAD probe: the one
+ * fact a reader of `assignments.revoked_reason` has that the generation was released as proven gone
+ * (`RunEngine`'s continuity-hold hand-over reads it).
+ */
+export const DEAD_CANONICAL_BINDING_RECOVERY_REASON_PREFIX = "dead canonical binding recovery: ";
+
 export const recoverDeadCanonicalBinding = (
   actor: string,
   request: DeadBindingRecoveryRequest,
@@ -420,7 +427,7 @@ export const recoverDeadCanonicalBinding = (
     // avoid.
     const revoked = deps.bindings.revoke(
       roleKey,
-      `dead canonical binding recovery: session ${request.sessionId} process ${session.osPid ?? "unknown"} is gone`,
+      `${DEAD_CANONICAL_BINDING_RECOVERY_REASON_PREFIX}session ${request.sessionId} process ${session.osPid ?? "unknown"} is gone`,
       {
         ...(deps.holdPeerMessagesForSameActorSuccessor === undefined
           ? {}

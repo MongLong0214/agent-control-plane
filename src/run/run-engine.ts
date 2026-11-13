@@ -39,9 +39,11 @@ import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import { ContractChangeRefusal } from "../registry/contract-change-plan.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
+import { SELF_CLAIM_EXECUTOR_KIND } from "../registry/canonical-self-claim.ts";
+import { DEAD_CANONICAL_BINDING_RECOVERY_REASON_PREFIX } from "../daemon/dead-binding-recovery.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
-import type { ClaimRegistry } from "../claims/claim-registry.ts";
+import { type ClaimRegistry, moveRunClaimsWithOwnerPin } from "../claims/claim-registry.ts";
 import type { TaskGraph } from "./task-graph.ts";
 import {
   TASK_BRANCH_CREATED,
@@ -375,7 +377,8 @@ const CONTINUITY_HOLD_MUTATING_KINDS: readonly string[] = [
   "RUN_CREATED", "DISPATCHED", "RUN_TRANSITION", "RUN_PRIORITY_SET", "RUN_OWNER_RENEWED",
   // A resumed canonical CTO's self-claim moving the run's owner pin to its next generation is an
   // owner move, as a takeover is.
-  "RECOVERY_TAKEOVER", "CANONICAL_LIVE_RUNS_TAKEN_OVER", "PRIMARY_CTO_ACTIVATED", "PRIMARY_CTO_UNDELIVERABLE_REPLACED",
+  "RECOVERY_TAKEOVER", "CANONICAL_LIVE_RUNS_TAKEN_OVER", "CONTINUITY_HOLD_HANDED_TO_SUCCESSOR",
+  "PRIMARY_CTO_ACTIVATED", "PRIMARY_CTO_UNDELIVERABLE_REPLACED",
   "PRIMARY_CTO_DRIVEN_SESSION_SPAWNED", "PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP",
   "BINDING_CREATED", "BINDING_RENEWED", "BINDING_RUNTIME_MOVED", "BINDING_SWITCHED",
   "TASK_GRAPH_SUBMITTED", "TASK_GRAPH_CANCELLED", "TASK_WRITE_TARGET_RECORDED", "TASK_BRANCH_PREPARED",
@@ -2117,8 +2120,11 @@ export class RunEngine {
    * - `held` is still its role's ACTIVE binding (assignment and generation) and its runtime is READY on
    *   its current incarnation; the old session the pause lost is never asked for;
    * - the run's owner pin is its project's PRIMARY_CTO's ACTIVE binding, exactly (session, incarnation,
-   *   generation), on a READY session. The pin is only read: ownership never moves, least of all to the
-   *   role that was held;
+   *   generation), on a READY session. Ownership never moves to another role, least of all to the role
+   *   that was held. The one exception is a hand-over (`#runtimeLostPredecessor`): a canonical CTO's
+   *   runtime-lost hold whose pin is the generation continuity revoked for that loss goes to the same
+   *   conversation's higher, READY generation, with the run's claims, only while no execution or
+   *   pipeline attempt of the run is RUNNING, and is recorded CONTINUITY_HOLD_HANDED_TO_SUCCESSOR;
    * - nothing moved under the hold since the pause: no run-mutating audit record of the run after it by
    *   event id (`CONTINUITY_HOLD_MUTATING_KINDS`; a refusal or a diagnostic such as OUTBOX_ACK_REJECTED is
    *   not movement), no binding change after it of any other role whose loss pauses the run, and the
@@ -2140,6 +2146,11 @@ export class RunEngine {
       const kept = (why: string) => allow(ReasonCode.OK, { run, released: false, kept: why });
       if (run.kind !== RunKind.STANDARD_WORK) return kept("only a STANDARD_WORK run's continuity hold is released here");
       if (run.state !== RunState.BLOCKED) return kept(`the run is ${run.state}, not BLOCKED`);
+      // The owner's suspension outranks continuity: a suspended project's run is neither released nor handed over.
+      if (run.projectId !== null &&
+          this.db.get<{ suspended: number }>(`SELECT suspended FROM projects WHERE project_id = ?`, [run.projectId])?.suspended !== 0) {
+        return kept("the run's project is suspended");
+      }
       if (run.continuityHoldRoleKey === null || run.continuityHoldRoleKey !== held.roleKey) {
         return kept("the run is not under continuity's hold for this role");
       }
@@ -2163,15 +2174,28 @@ export class RunEngine {
       if (!covering.ready) return kept("the held role's session is not READY");
       const ownerRoleKey = run.projectId === null ? null : roleKeyFor(Role.PRIMARY_CTO, { projectId: run.projectId });
       const owner = ownerRoleKey === null ? null : this.#activeBindingNow(ownerRoleKey);
-      if (
-        ownerRoleKey === null || run.ownerRoleKey !== ownerRoleKey || !owner ||
-        owner.boundSessionId !== run.ownerSessionId ||
-        owner.boundIncarnation !== run.ownerSessionIncarnation ||
-        owner.generation !== run.ownerBindingGeneration
-      ) {
+      if (ownerRoleKey === null || run.ownerRoleKey !== ownerRoleKey || !owner) {
         return kept("the run's owner pin is not its PRIMARY_CTO's active binding");
       }
+      const pinned = owner.boundSessionId === run.ownerSessionId &&
+        owner.boundIncarnation === run.ownerSessionIncarnation &&
+        owner.generation === run.ownerBindingGeneration;
+      const predecessor = pinned ? null : this.#runtimeLostPredecessor(run, held, owner);
+      if (!pinned && predecessor === null) return kept("the run's owner pin is not its PRIMARY_CTO's active binding");
       if (!owner.ready) return kept("the run's owner session is not READY");
+      // The pin moves onto the successor below, so no turn or attempt may still be running under the
+      // predecessor's (as `BindingRegistry.repointLiveRunsToSameActorSuccessor` refuses).
+      if (predecessor !== null) {
+        const inFlight = this.db.get<{ what: string }>(
+          `SELECT 'a RUNNING task execution' AS what FROM task_executions WHERE run_id = ? AND status = 'RUNNING'
+           UNION ALL
+           SELECT 'a RUNNING candidate pipeline attempt' FROM candidate_pipeline_attempts
+            WHERE run_id = ? AND state = 'RUNNING' AND deadline_at > ? AND owner_session_id = ? AND owner_binding_generation = ?
+           LIMIT 1`,
+          [runId, runId, this.clock.nowIso(), run.ownerSessionId, run.ownerBindingGeneration],
+        );
+        if (inFlight) return kept(`the predecessor generation still has ${inFlight.what} on the run`);
+      }
       const recorded = this.db.all<{ event_id: number; kind: string; reason_code: string | null; evidence_json: string }>(
         `SELECT event_id, kind, reason_code, evidence_json FROM audit_events
           WHERE run_id = ? AND event_id > ?
@@ -2228,26 +2252,57 @@ export class RunEngine {
               continuityRelease: held.roleKey,
               pauseEventId: pause.event_id,
               toGeneration: held.bindingGeneration,
-              ownerBindingGeneration: run.ownerBindingGeneration,
+              ownerBindingGeneration: owner.generation,
             },
           });
           return allow(ReasonCode.OK, undefined);
         },
         enqueueTransitionEnvelope: () => allow(ReasonCode.OK, undefined),
+        // The owner pin is written as the active binding: unchanged for a pinned run, the successor's for
+        // a hand-over, in the same statement and on the same read pin.
         updateState: () =>
           this.db.run(
-            `UPDATE runs SET state = 'ACTIVE', state_reason = ?, continuity_hold_role_key = NULL
+            `UPDATE runs SET state = 'ACTIVE', state_reason = ?, continuity_hold_role_key = NULL,
+                             owner_session_id = ?, owner_session_incarnation = ?, owner_binding_generation = ?
               WHERE run_id = ? AND state = 'BLOCKED' AND continuity_hold_role_key = ? AND state_reason IS ?
                 AND owner_role_key IS ? AND owner_session_id IS ? AND owner_session_incarnation IS ?
                 AND owner_binding_generation IS ?`,
             [
-              reason, runId, held.roleKey, run.stateReason,
+              reason, owner.boundSessionId, owner.boundIncarnation, owner.generation,
+              runId, held.roleKey, run.stateReason,
               run.ownerRoleKey, run.ownerSessionId, run.ownerSessionIncarnation, run.ownerBindingGeneration,
             ],
           ),
       });
       if (written.changes !== 1) {
         return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, "the run moved between the hold's check and its release", { runId });
+      }
+      if (predecessor !== null) {
+        const claims = moveRunClaimsWithOwnerPin(
+          this.db,
+          { sessionId: predecessor.sessionId, generation: predecessor.generation },
+          { sessionId: owner.boundSessionId, generation: owner.generation },
+          [runId],
+        );
+        // The run's own history says its owner moved here; unrecorded, the hand-over rolls back.
+        const recorded = this.audit.record({
+          kind: "CONTINUITY_HOLD_HANDED_TO_SUCCESSOR",
+          reasonCode: ReasonCode.OK,
+          runId,
+          projectId: run.projectId,
+          sessionId: owner.boundSessionId,
+          roleKey: ownerRoleKey,
+          evidence: {
+            fromGeneration: predecessor.generation,
+            toGeneration: owner.generation,
+            fromSession: predecessor.sessionId,
+            toSessionId: owner.boundSessionId,
+            actorId: predecessor.actorId,
+            pauseEventId: pause.event_id,
+            claimIds: claims.map((claim) => claim.claimId),
+          },
+        });
+        if (!recorded.allowed) return recorded as Decision<{ run: RunRow; released: boolean; kept: string | null }>;
       }
       return allow(ReasonCode.OK, { run: this.require(runId), released: true, kept: null });
     });
@@ -2348,6 +2403,56 @@ export class RunEngine {
       boundIncarnation: row.session_incarnation,
       ready: row.lifecycle === "READY" && row.live_incarnation === row.expected_incarnation,
     };
+  }
+
+  /**
+   * The run's pinned owner, when `owner` is its canonical same-actor successor that the run's continuity
+   * hold may be handed to; null otherwise. A dead canonical CTO's pass pauses its run and then revokes
+   * its binding, so the same conversation's next self-claim finds nothing ACTIVE to recover and takes no
+   * run over (`recoverDeadCanonicalBinding` runs only for an ACTIVE predecessor), and the pin is left on
+   * the revoked generation. Only exactly that is handed over: the hold is for the run's own PRIMARY_CTO
+   * role, with the runtime-lost pause; the pin is that role's generation REVOKED by continuity's
+   * runtime-lost revocation; `owner` is a higher generation of the same conversational actor; and that
+   * actor is a canonical (self-claimed) conversation. Every generation between the two must be that same
+   * actor, also released as a lost runtime: by continuity's runtime-lost revocation, or as proven dead by
+   * `recoverDeadCanonicalBinding` (the next self-claim's release, or the operator door's, both after a
+   * DEAD probe). A conversation that crashed again is still the one continuity paused for, whether a pass
+   * or its own next claim saw it first; a deliberate revocation in between (a CEO release or replacement,
+   * a suspension, a retirement), a coverage or failover revocation, or another actor ends the chain, and
+   * the run stays held.
+   */
+  #runtimeLostPredecessor(
+    run: RunRow,
+    held: RoleBinding,
+    owner: { assignmentId: string; generation: number },
+  ): { sessionId: string; generation: number; actorId: string } | null {
+    if (held.roleKey !== run.ownerRoleKey || run.stateReason !== CONTINUITY_PAUSE_RUNTIME_LOST_REASON) return null;
+    if (run.ownerBindingGeneration === null || owner.generation <= run.ownerBindingGeneration) return null;
+    const row = this.db.get<{ session_id: string; actor_id: string }>(
+      `SELECT prev.session_id, prev.actor_id FROM assignments prev
+         JOIN assignments next ON next.assignment_id = ?
+        WHERE prev.role_key = ? AND prev.role = 'PRIMARY_CTO' AND prev.binding_generation = ?
+          AND prev.session_id = ? AND prev.session_incarnation = ?
+          AND prev.status = 'REVOKED' AND prev.revoked_reason = ?
+          AND next.role_key = prev.role_key AND next.actor_id = prev.actor_id
+          AND EXISTS (SELECT 1 FROM actor_target_bindings tb
+                       WHERE tb.target_actor_id = prev.actor_id AND tb.executor_kind = ?)
+          AND NOT EXISTS (SELECT 1 FROM assignments mid
+                           WHERE mid.role_key = prev.role_key
+                             AND mid.binding_generation > prev.binding_generation
+                             AND mid.binding_generation < next.binding_generation
+                             AND (mid.actor_id <> prev.actor_id OR mid.status <> 'REVOKED'
+                                  OR (mid.revoked_reason IS NOT ?
+                                      AND substr(COALESCE(mid.revoked_reason, ''), 1, ?) <> ?)))`,
+      [
+        owner.assignmentId, run.ownerRoleKey, run.ownerBindingGeneration,
+        run.ownerSessionId, run.ownerSessionIncarnation,
+        CONTINUITY_RUNTIME_LOST_REVOCATION_REASON, SELF_CLAIM_EXECUTOR_KIND,
+        CONTINUITY_RUNTIME_LOST_REVOCATION_REASON,
+        DEAD_CANONICAL_BINDING_RECOVERY_REASON_PREFIX.length, DEAD_CANONICAL_BINDING_RECOVERY_REASON_PREFIX,
+      ],
+    );
+    return row ? { sessionId: row.session_id, generation: run.ownerBindingGeneration, actorId: row.actor_id } : null;
   }
 
   /**
