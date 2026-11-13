@@ -78,7 +78,7 @@ export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob
     // step freezes v53's, #1189 B5's v55 (the two state guards) freezes v54's, and #1234's v56 (the
     // manifest-pointer guard) freezes v55's, and v57 (the canonical entitlement transfer table) freezes v56's.
     // Replayed lineage and compiled upgrades still bind the unchanged historical SQL, trace and receipt pins below.
-    sha256: "2cbcc84a90a56b802f7aeb48a095bfb73a5c56609d953642951b20af2428535f",
+    sha256: "0518a8bddc93d5b22416d5eb10a6e029961ed55e525fa49bec5d2507006f048d",
   },
   {
     path: "src/db/schema-v37.sql",

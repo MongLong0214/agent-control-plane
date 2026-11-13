@@ -2418,11 +2418,12 @@ export class CanonicalSelfClaim {
         if (!stopped.allowed) return stopped as Decision<CanonicalSelfClaimReceipt>;
       }
 
-      // v57 — this conversation's first claim after the CEO transferred the project's entitlement to it. The
-      // transfer record is the authority over the conversation it was moved from, a different actor: that
-      // actor's ACTIVE binding of this role is revoked (its live runs left pinned for the hand-over below),
-      // and its live session, which holds the role's Buzz actor, is stopped, so its relay receives no more
-      // work. Nothing else of the old conversation is touched, and its history is not rewritten.
+      // v57 — this conversation's claim of a PENDING transfer the CEO made to it. Until now the old conversation
+      // kept the entitlement, its binding and its inbound path; this claim is the verification. The transfer is
+      // the authority over that conversation, a different actor: its ACTIVE binding of this role is revoked (its
+      // live runs left pinned for the hand-over below), and its live session, which holds the role's Buzz actor,
+      // is stopped, so its relay receives no more work. Nothing else of the old conversation is touched, and its
+      // history is not rewritten.
       const entitlements = new CanonicalSessionRegistry(this.db);
       const transfer = entitlements.pendingTransferTo(identity.sessionUuid);
       if (transfer !== null && transfer.projectId !== entry.projectId) {
@@ -2568,18 +2569,18 @@ export class CanonicalSelfClaim {
           transferId: transfer.transferId, fromSessionUuid: transfer.fromSessionUuid, toSessionUuid: transfer.toSessionUuid,
           toSessionId: created.sessionId, toGeneration: bound.value.bindingGeneration,
         };
-        for (const runId of moved.value.runIds) {
+        for (const { runId, sessionId: fromSession, generation: fromGeneration } of moved.value.from) {
           const claims = moved.value.claims.filter((claim) => claim.runId === runId);
           const recorded = handedOver("CANONICAL_ENTITLEMENT_TRANSFER_RUN_HANDED_OVER", runId, {
-            ...common, claimIds: claims.map((claim) => claim.claimId),
+            ...common, fromSession, fromGeneration, claimIds: claims.map((claim) => claim.claimId),
           });
           if (!recorded.allowed) {
             return deny(ReasonCode.AUDIT_WRITE_FAILED, "the transfer's run hand-over row could not be written, so the claim was rolled back", { roleKey, runId });
           }
         }
-        if (!entitlements.markClaimed(transfer.transferId, bound.value.bindingGeneration, this.clock.nowIso())) {
-          return deny(ReasonCode.CONFLICT, "the entitlement transfer was claimed or revoked during this claim", { transferId: transfer.transferId });
-        }
+        // The predecessor's entitlement is revoked, and stays its tombstone, only here: verified by this claim.
+        const claimedTransfer = entitlements.claim(transfer.transferId, bound.value.bindingGeneration, this.clock.nowIso());
+        if (!claimedTransfer.allowed) return claimedTransfer as Decision<CanonicalSelfClaimReceipt>;
         const recorded = handedOver("CANONICAL_ENTITLEMENT_TRANSFER_CLAIMED", null, {
           ...common, revokedGeneration: transferRevokedGeneration, runIds: moved.value.runIds,
         });

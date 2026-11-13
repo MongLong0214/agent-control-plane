@@ -1149,7 +1149,11 @@ export class BindingRegistry {
     roleKey: string,
     from: ReadonlyArray<{ readonly sessionId: string; readonly generation: number }>,
     to: { readonly sessionId: string; readonly generation: number; readonly incarnation: string },
-  ): Decision<{ runIds: string[]; claims: Array<{ claimId: string; runId: string; fromGeneration: number }> }> {
+  ): Decision<{
+    runIds: string[];
+    from: Array<{ runId: string; sessionId: string; generation: number }>;
+    claims: Array<{ claimId: string; runId: string; fromGeneration: number }>;
+  }> {
     if (!this.db.inTransaction) {
       return fail(ReasonCode.COMPLETION_AUTHORITY_DENIED, "a transfer's run hand-over requires the self-claim's transaction", {});
     }
@@ -1177,6 +1181,7 @@ export class BindingRegistry {
         }
       }
       const runIds: string[] = [];
+      const movedFrom: Array<{ runId: string; sessionId: string; generation: number }> = [];
       const claims: Array<{ claimId: string; runId: string; fromGeneration: number }> = [];
       for (const generation of from) {
         const moved = this.#repointLiveRuns(
@@ -1184,10 +1189,11 @@ export class BindingRegistry {
           { roleKey, sessionId: to.sessionId, generation: to.generation, incarnation: to.incarnation },
         );
         runIds.push(...moved.runIds);
+        movedFrom.push(...moved.runIds.map((runId) => ({ runId, sessionId: generation.sessionId, generation: generation.generation })));
         claims.push(...moveRunClaimsWithOwnerPin(this.db, generation, to, moved.runIds)
           .map((claim) => ({ ...claim, fromGeneration: generation.generation })));
       }
-      return allow(ReasonCode.OK, { runIds, claims });
+      return allow(ReasonCode.OK, { runIds, from: movedFrom, claims });
     });
   }
 

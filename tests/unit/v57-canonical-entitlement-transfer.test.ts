@@ -14,7 +14,8 @@ afterAll(cleanupTempDirs);
 
 const V57_OBJECTS = [
   "canonical_entitlement_transfers",
-  "canonical_entitlement_transfers_one_active",
+  "canonical_entitlement_transfers_one_pending",
+  "canonical_entitlement_transfers_no_replace",
   "canonical_entitlement_transfers_supersede_only",
   "canonical_entitlement_transfers_identity_immutable",
   "canonical_entitlement_transfers_no_delete",
@@ -46,7 +47,16 @@ const world = () => {
     raw.prepare(`INSERT INTO canonical_entitlement_transfers (${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`)
       .run(...Object.values(row));
   };
-  return { raw, revoke, transfer };
+  /** The claim's two writes, as the successor's self-claim makes them: the predecessor revoked, then the transfer claimed. */
+  const claim = (id: string, predecessor: () => void, generation = 2) => {
+    predecessor();
+    raw.prepare(`UPDATE canonical_entitlement_transfers SET claimed_at = ?, claimed_binding_generation = ?, revision = revision + 1 WHERE transfer_id = ?`)
+      .run(AT, generation, id);
+  };
+  const revokeTransfer = (id: string) =>
+    raw.prepare(`UPDATE canonical_entitlement_transfers SET revoked_at = ?, revision = revision + 1 WHERE transfer_id = ?`).run(AT, id);
+  const row = (id: string) => raw.prepare(`SELECT * FROM canonical_entitlement_transfers WHERE transfer_id = ?`).get(id);
+  return { raw, revoke, transfer, claim, revokeTransfer, row };
 };
 
 describe("v57 — a canonical entitlement transfer table beside the immutable entitlements", () => {
@@ -79,12 +89,9 @@ describe("v57 — a canonical entitlement transfer table beside the immutable en
     expect(upgraded.map((row) => `${row.type} ${row.name}`).sort()).toEqual(fresh.map((row) => `${row.type} ${row.name}`).sort());
   });
 
-  it("a transfer supersedes only its project's revoked predecessor, with its identity, once", () => {
-    const { raw, revoke, transfer } = world();
-    // The predecessor is still live: nothing to supersede.
-    expect(() => transfer("t1", "p1", uuid(1), uuid(11))).toThrow(REFUSED);
-    revoke("p1");
-    // Another project's predecessor, another Buzz actor or room, a born-claimed or born-revoked row.
+  it("a transfer is born pending from exactly its project's live holder, with its identity, to a never-entitled conversation", () => {
+    const { revoke, transfer } = world();
+    // Another project's holder, another Buzz actor or room, a born-claimed or born-revoked row.
     expect(() => transfer("t1", "p2", uuid(1), uuid(11), { buzz_actor_id: "actor-p1" })).toThrow(REFUSED);
     expect(() => transfer("t1", "p1", uuid(1), uuid(11), { buzz_actor_id: "actor-x" })).toThrow(REFUSED);
     expect(() => transfer("t1", "p1", uuid(1), uuid(11), { buzz_address: "other" })).toThrow(REFUSED);
@@ -92,29 +99,49 @@ describe("v57 — a canonical entitlement transfer table beside the immutable en
     expect(() => transfer("t1", "p1", uuid(1), uuid(11), { revoked_at: AT })).toThrow(REFUSED);
     // A conversation entitled anywhere is never a target.
     expect(() => transfer("t1", "p1", uuid(1), uuid(2))).toThrow(REFUSED);
+    // The predecessor stays unrevoked: the transfer is only pending.
     transfer("t1", "p1", uuid(1), uuid(11));
-    // One unrevoked transfer per project, and a predecessor is superseded once.
+    // One pending transfer per project.
     expect(() => transfer("t2", "p1", uuid(1), uuid(12))).toThrow();
-    expect(() => transfer("t2", "p1", uuid(11), uuid(12))).toThrow(REFUSED);
-    raw.prepare(`UPDATE canonical_entitlement_transfers SET revoked_at = ?, revision = revision + 1 WHERE transfer_id = 't1'`).run(AT);
+    // A revoked holder supersedes nothing.
+    revoke("p2");
+    expect(() => transfer("t3", "p2", uuid(2), uuid(13))).toThrow(REFUSED);
+  });
+
+  it("a claim needs its predecessor revoked first, and a chain continues from the claimed transfer only", () => {
+    const { raw, revoke, transfer, claim, revokeTransfer } = world();
+    transfer("t1", "p1", uuid(1), uuid(11));
+    // The predecessor still holds the project: no claim.
+    expect(() => claim("t1", () => undefined)).toThrow(REFUSED);
+    claim("t1", () => revoke("p1"));
+    // A transfer from the superseded conversation, or back to it, is refused; from the claimed one it is pending.
+    expect(() => transfer("t2", "p1", uuid(1), uuid(12))).toThrow(REFUSED);
+    expect(() => transfer("t2", "p1", uuid(11), uuid(1))).toThrow(REFUSED);
     transfer("t2", "p1", uuid(11), uuid(12));
-    // Back to a conversation that already held it: refused.
-    raw.prepare(`UPDATE canonical_entitlement_transfers SET revoked_at = ?, revision = revision + 1 WHERE transfer_id = 't2'`).run(AT);
-    expect(() => transfer("t3", "p1", uuid(12), uuid(11))).toThrow();
-    expect(() => transfer("t3", "p1", uuid(12), uuid(1))).toThrow(REFUSED);
+    expect(() => claim("t2", () => undefined)).toThrow(REFUSED);
+    claim("t2", () => revokeTransfer("t1"), 3);
+    expect(raw.prepare(`SELECT transfer_id FROM canonical_entitlement_transfers WHERE claimed_at IS NOT NULL AND revoked_at IS NULL`).all())
+      .toEqual([{ transfer_id: "t2" }]);
+  });
+
+  it("a cancelled transfer frees its project for another, and its conversation for a later one", () => {
+    const { transfer, revokeTransfer, row } = world();
+    transfer("t1", "p1", uuid(1), uuid(11));
+    revokeTransfer("t1");
+    expect(row("t1")).toMatchObject({ claimed_at: null, revoked_at: AT });
+    transfer("t2", "p1", uuid(1), uuid(11));
   });
 
   it("a retired project takes no transfer", () => {
-    const { raw, revoke, transfer } = world();
-    revoke("p1");
+    const { raw, transfer } = world();
     raw.prepare(`INSERT INTO project_retirements (project_id, requested_at, reason) VALUES ('p1', ?, 'retired')`).run(AT);
     expect(() => transfer("t1", "p1", uuid(1), uuid(11))).toThrow(REFUSED);
   });
 
   it("a transfer's identity never changes, it is claimed once and revoked once, and it is never deleted", () => {
     const { raw, revoke, transfer } = world();
-    revoke("p1");
     transfer("t1", "p1", uuid(1), uuid(11));
+    revoke("p1");
     const update = (set: string) => () => raw.prepare(`UPDATE canonical_entitlement_transfers SET ${set} WHERE transfer_id = 't1'`).run();
     // Each beside an otherwise valid claim, so only the identity clause can refuse it.
     const claim = "claimed_at = 'now', claimed_binding_generation = 2, revision = revision + 1";
@@ -124,21 +151,38 @@ describe("v57 — a canonical entitlement transfer table beside the immutable en
     expect(update("claimed_at = 'now'")).toThrow(REFUSED);
     expect(update("claimed_at = 'now', revision = revision + 1")).toThrow(REFUSED);
     expect(update("revision = revision + 1")).toThrow(REFUSED);
-    update("claimed_at = 'now', claimed_binding_generation = 2, revision = revision + 1")();
+    update(claim)();
     expect(update("claimed_at = 'later', claimed_binding_generation = 3, revision = revision + 1")).toThrow(REFUSED);
     update("revoked_at = 'gone', revision = revision + 1")();
     expect(update("revoked_at = 'again', revision = revision + 1")).toThrow(REFUSED);
     expect(() => raw.prepare(`DELETE FROM canonical_entitlement_transfers`).run()).toThrow(REFUSED);
   });
 
-  it("an entitlement is never granted to a transferred conversation or a transferred live Buzz actor", () => {
-    const { raw, revoke, transfer } = world();
-    revoke("p1");
+  it("INSERT OR REPLACE on a raw connection, recursive triggers off, cannot rewrite a claimed transfer", () => {
+    const { raw, revoke, transfer, claim, row } = world();
+    expect(raw.pragma("recursive_triggers", { simple: true })).toBe(0);
+    transfer("t1", "p1", uuid(1), uuid(11));
+    claim("t1", () => revoke("p1"));
+    const before = row("t1");
+    // Shaped to pass every other guard: pending, from the claimed holder, to a fresh conversation, with its identity.
+    const replace = () => raw.prepare(
+      `INSERT OR REPLACE INTO canonical_entitlement_transfers (transfer_id, project_id, from_session_uuid, to_session_uuid, buzz_actor_id, buzz_address, expected_binding_generation, requested_by, created_at)
+       VALUES ('t1', 'p1', ?, ?, 'actor-p1', 'room', 2, 'forger', ?)`,
+    ).run(uuid(11), uuid(12), AT);
+    expect(replace).toThrow(REFUSED);
+    expect(row("t1")).toEqual(before);
+  });
+
+  it("an entitlement is never granted to a transferred conversation or a held Buzz actor", () => {
+    const { raw, revoke, transfer, claim } = world();
     transfer("t1", "p1", uuid(1), uuid(11));
     raw.prepare(`INSERT INTO projects (project_id, name, created_at) VALUES ('p3', 'p3', ?)`).run(AT);
     const grant = (session: string, actor: string) => () =>
       raw.prepare(`INSERT INTO canonical_session_entitlements (session_uuid, project_id, buzz_actor_id, buzz_address) VALUES (?, 'p3', ?, 'room')`)
         .run(session, actor);
+    // Pending: its target is already spoken for.
+    expect(grant(uuid(11), "actor-p3")).toThrow(REFUSED);
+    claim("t1", () => revoke("p1"));
     expect(grant(uuid(11), "actor-p3")).toThrow(REFUSED);
     expect(grant(uuid(13), "actor-p1")).toThrow(REFUSED);
     grant(uuid(13), "actor-p3")();

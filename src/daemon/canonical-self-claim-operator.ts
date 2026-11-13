@@ -132,7 +132,8 @@ export const executeCanonicalSelfClaimOperator = async (
 
   const registry = new CanonicalSessionRegistry(deps.db);
   const revision = registry.fingerprint();
-  const entries = registry.effective(deps.config.canonicalSessions);
+  // v57: the conversation a pending transfer names is admissible only on its own claim (`effectiveFor`).
+  const entries = registry.effectiveFor(deps.config.canonicalSessions, request.claimedSessionUuid);
   if (!entries.length) return deny(ReasonCode.CONFLICT, "no active canonical entitlement", {});
   const claim = new CanonicalSelfClaim(
     deps.db,

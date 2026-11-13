@@ -4380,12 +4380,13 @@ const v56: SchemaMigration = {
 };
 
 /**
- * v57 adds the canonical entitlement transfer table, its one-unrevoked-row-per-project index, its three
- * guards, and one guard on canonical_session_entitlements that refuses a conversation or an active Buzz
- * actor a transfer already names. Additive only: no existing object is replaced or rebuilt, and no row
- * moves. A name already held must hold exactly schema.sql's definition, before and after.
+ * v57 adds the canonical entitlement transfer table, its one-pending-transfer-per-project index, its four
+ * guards, and one guard on canonical_session_entitlements that refuses a conversation or a held Buzz actor
+ * a transfer already names. Additive only: no existing object is replaced or rebuilt, and no row moves. A
+ * name already held must hold exactly schema.sql's definition, before and after.
  */
 const V57_TRANSFER_GUARDS = [
+  "canonical_entitlement_transfers_no_replace",
   "canonical_entitlement_transfers_supersede_only",
   "canonical_entitlement_transfers_identity_immutable",
   "canonical_entitlement_transfers_no_delete",
@@ -4397,8 +4398,8 @@ const v57Objects = (): StepObject[] => [
     ddl: schemaObject(/CREATE TABLE IF NOT EXISTS canonical_entitlement_transfers \([\s\S]*?\n\);/, "the canonical_entitlement_transfers table", 57),
   },
   {
-    type: "index", name: "canonical_entitlement_transfers_one_active", table: "canonical_entitlement_transfers",
-    ddl: schemaObject(/CREATE UNIQUE INDEX IF NOT EXISTS canonical_entitlement_transfers_one_active[^;]*;/, "the canonical_entitlement_transfers index", 57),
+    type: "index", name: "canonical_entitlement_transfers_one_pending", table: "canonical_entitlement_transfers",
+    ddl: schemaObject(/CREATE UNIQUE INDEX IF NOT EXISTS canonical_entitlement_transfers_one_pending[^;]*;/, "the canonical_entitlement_transfers index", 57),
   },
   ...stepTriggerObjects(57, V57_TRANSFER_GUARDS),
 ];
@@ -4686,6 +4687,7 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "run_artifacts_no_rowid_replace", sentinel: "RUN_ARTIFACT_NO_REPLACE", introducedIn: 48 },
   { name: "run_artifacts_rowid_immutable", sentinel: "RUN_ARTIFACT_NO_REPLACE", introducedIn: 48 },
   { name: "run_artifacts_rowid_positive", sentinel: "RUN_ARTIFACT_NO_REPLACE", introducedIn: 48 },
+  { name: "canonical_entitlement_transfers_no_replace", sentinel: "CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE", introducedIn: 57 },
   { name: "canonical_entitlement_transfers_supersede_only", sentinel: "CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE", introducedIn: 57 },
   { name: "canonical_entitlement_transfers_identity_immutable", sentinel: "CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE", introducedIn: 57 },
   { name: "canonical_entitlement_transfers_no_delete", sentinel: "CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE", introducedIn: 57 },

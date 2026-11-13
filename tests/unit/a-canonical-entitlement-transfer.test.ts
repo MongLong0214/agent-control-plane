@@ -9,11 +9,11 @@ import { type Decision, allow, deny } from "../../src/core/errors.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { buzzMentionSubscriberRegistry } from "../../src/daemon/agentcpd.ts";
+import { executeCanonicalSelfClaimOperator } from "../../src/daemon/canonical-self-claim-operator.ts";
 import { ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import {
   type CanonicalAdoptableSession,
-  CanonicalSelfClaim,
   type CanonicalSelfClaimReceipt,
   type ProcessSnapshot,
   hostSessionRegistryAbsent,
@@ -44,7 +44,9 @@ const CWD = "/work/transfer";
 const ROOM = "aaaaaaaa-0000-4000-8000-00000000000a";
 const CTO_ACTOR = "buzz:transfer-cto";
 const PEER_PROTOCOL = "mcp/2025-06-18";
-const PEER_IDENTITY = "claude-code-mcp-client";
+const PEER_UID = 501;
+const PEER_IDENTITY = `uid:${PEER_UID}`;
+const NOWHERE = "99999999-0000-4000-8000-000000000005";
 const CONTRACT = {
   goal: "make app() return 2", why: "downstream callers expect 2", scope: ["src/app.js"], nonGoals: [],
   acceptance: ["verify.js exits 0"], priority: "NORMAL" as const, humanGate: [], references: [],
@@ -80,20 +82,18 @@ const world = async () => {
   const liveStart = readProcessStartToken(live.pid!);
   if (liveStart === null) throw new Error("the stand-in process has no readable start token");
 
-  /** One self-claim as the operator door makes it: the live registry over the configured entries. */
+  /** One self-claim through the operator door, over the configured entries the daemon started with. */
   const claimAs = (uuid: string, generation: number, pid: number): Promise<Decision<CanonicalSelfClaimReceipt>> => {
     const chain = pid === live.pid ? claudeOf(uuid, pid, liveStart) : claudeOf(uuid, pid);
-    const revision = registry.fingerprint();
-    return new CanonicalSelfClaim(
-      db, harness.clock, harness.cp.audit, harness.cp.sessions, harness.cp.bindings,
-      { isAllowedActor: () => true },
-      async (): Promise<Decision<string>> => allow(ReasonCode.OK, ROOM),
-      {
-        canonicalSessions: registry.effective(configured), canonicalBuzzChannelId: ROOM,
-        expectedPeerProtocolVersion: PEER_PROTOCOL, expectedPeerIdentity: PEER_IDENTITY,
-        entitlementCurrent: () => registry.fingerprint() === revision,
+    return executeCanonicalSelfClaimOperator({ peerPid: 100, uid: PEER_UID }, { claimedSessionUuid: uuid, projectId, expectedBindingGeneration: generation }, {
+      db, clock: harness.clock, audit: harness.cp.audit, sessions: harness.cp.sessions, bindings: harness.cp.bindings,
+      buzzActorAuthenticator: { isAllowedActor: () => true },
+      resolveBuzzAddress: async (): Promise<Decision<string>> => allow(ReasonCode.OK, ROOM),
+      config: {
+        canonicalSessions: configured, canonicalBuzzChannelId: ROOM, expectedPeerProtocolVersion: PEER_PROTOCOL,
+        expectedPeerIdentity: PEER_IDENTITY, peerProtocolVersion: PEER_PROTOCOL, buzzPurpose: "continuity:PRIMARY_CTO",
       },
-      {
+      claimDeps: {
         processInspector: { snapshot: (p) => chain.find((entry) => entry.pid === p) ?? null },
         imageInspector: { resolve: () => ({ imagePath: "/fake/claude", version: "0.0.0-test", sha256: `sha256:${"0".repeat(64)}` }) },
         transcriptReader: { locate: (u) => ({ path: `/fake/transcripts/${u}.jsonl`, sizeBytes: 42 }) },
@@ -102,9 +102,6 @@ const world = async () => {
           if (!chain.some((entry) => entry.pid === p)) throw Object.assign(new Error("no such process"), { code: "ESRCH" });
         },
       },
-    ).claim({
-      callerPid: 100, claimedSessionUuid: uuid, projectId, expectedBindingGeneration: generation,
-      peerProtocolVersion: PEER_PROTOCOL, peerIdentity: PEER_IDENTITY, buzzPurpose: "continuity:PRIMARY_CTO",
     });
   };
 
@@ -169,15 +166,19 @@ describe("cto_entitlement_transfer moves a project's canonical CTO to another ru
     const w = await world();
     const answer = await w.transfer();
     expect(answer, JSON.stringify(answer)).toMatchObject({ ok: true, value: { projectId: w.projectId, fromSessionUuid: OLD, toSessionUuid: NEW, claimedAt: null } });
-    // The entitlement is the new conversation's at once, and the old one is never adopted again.
-    expect(w.registry.effective(w.configured)).toEqual([{ sessionUuid: NEW, projectId: w.projectId, buzzActorId: CTO_ACTOR, buzzAddress: ROOM }]);
-    // The old conversation's runtime still holds the Buzz channel and is refused it from now on.
-    expect(w.judge()).toMatchObject({ verdict: "EXCLUDED", reason: "CANONICAL_ENTITLEMENT_REVOKED" });
+    // Pending: until the new conversation claims, the old one keeps the entitlement, binding and Buzz channel.
+    expect(w.registry.effective(w.configured).map((entry) => entry.sessionUuid)).toEqual([OLD]);
+    expect(w.db.get(`SELECT revoked_at FROM canonical_session_entitlements WHERE session_uuid = ?`, [OLD])).toEqual({ revoked_at: null });
+    expect(w.harness.cp.bindings.active(w.roleKey)?.sessionId).toBe(w.oldSessionId);
+    expect(w.judge()).toMatchObject({ verdict: "ADMITTED", binding: { sessionId: w.oldSessionId } });
 
     const claimed = await w.claimAs(NEW, 2, 22);
     expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
     if (!claimed.allowed) throw new Error("unreachable");
     expect(claimed.value.binding.bindingGeneration).toBe(2);
+    // The claim is the verification: only now is the old entitlement revoked, and the new one the project's.
+    expect(w.registry.effective(w.configured)).toEqual([{ sessionUuid: NEW, projectId: w.projectId, buzzActorId: CTO_ACTOR, buzzAddress: ROOM }]);
+    expect(w.db.get(`SELECT revoked_at IS NOT NULL AS revoked FROM canonical_session_entitlements WHERE session_uuid = ?`, [OLD])).toEqual({ revoked: 1 });
     expect(w.harness.cp.bindings.active(w.roleKey)?.sessionId).toBe(claimed.value.sessionId);
     expect(w.db.get(`SELECT status FROM assignments WHERE role_key = ? AND binding_generation = 1`, [w.roleKey])).toEqual({ status: "REVOKED" });
     expect(w.harness.cp.sessions.require(w.oldSessionId).lifecycle).toBe(SessionLifecycle.STOPPED);
@@ -208,6 +209,32 @@ describe("cto_entitlement_transfer moves a project's canonical CTO to another ru
     expect(() => w.registry.grant({ sessionUuid: NEW, projectId: "elsewhere", buzzActorId: "buzz:elsewhere", buzzAddress: ROOM }, null)).toThrow();
     // A daemon start grants every effective entry, the transferred one included, and does not throw.
     expect(() => { for (const entry of w.registry.effective(w.configured)) w.registry.grant({ ...entry, buzzAddress: entry.buzzAddress ?? ROOM }, null); }).not.toThrow();
+  });
+
+  it("a transfer to a conversation that never claims leaves the old CTO fully reachable, admits no third conversation, and is cancelled", async () => {
+    const w = await world();
+    const pending = await w.transfer({ toSessionUuid: NOWHERE });
+    expect(pending.ok, JSON.stringify(pending)).toBe(true);
+    const transferId = pending.value!["transferId"] as string;
+    expect(w.registry.effective(w.configured).map((entry) => entry.sessionUuid)).toEqual([OLD]);
+    expect(w.harness.cp.bindings.active(w.roleKey)?.sessionId).toBe(w.oldSessionId);
+    expect(w.harness.cp.sessions.require(w.oldSessionId).lifecycle).toBe(SessionLifecycle.READY);
+    expect(w.judge()).toMatchObject({ verdict: "ADMITTED", binding: { sessionId: w.oldSessionId } });
+    expect(w.owner()).toEqual({ owner_session_id: w.oldSessionId, owner_binding_generation: 1 });
+    // Neither a third conversation nor the transfer's own target, on another project's claim, is admitted.
+    expect(await w.claimAs(SPARE, 2, 44)).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT, message: "only a canonical session may be adopted by this primitive" });
+    expect(w.harness.cp.bindings.active(w.roleKey)?.sessionId).toBe(w.oldSessionId);
+    // The CEO withdraws it; nothing else moves, and the project is free for the right transfer.
+    expect(await w.hermes("cto_entitlement_transfer_cancel", { projectId: w.projectId, transferId }, w.oldSessionId))
+      .toMatchObject({ ok: false, reasonCode: ReasonCode.BINDING_GENERATION_STALE });
+    expect(await w.hermes("cto_entitlement_transfer_cancel", { projectId: w.projectId, transferId })).toMatchObject({ ok: true, value: { transferId } });
+    expect(await w.hermes("cto_entitlement_transfer_cancel", { projectId: w.projectId, transferId })).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
+    expect(w.audits("CANONICAL_ENTITLEMENT_TRANSFER_CANCELLED")).toHaveLength(1);
+    expect(await w.claimAs(NOWHERE, 2, 55)).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+    expect(w.registry.effective(w.configured).map((entry) => entry.sessionUuid)).toEqual([OLD]);
+    expect((await w.transfer()).ok).toBe(true);
+    expect((await w.claimAs(NEW, 2, 22)).allowed).toBe(true);
+    expect(w.registry.effective(w.configured).map((entry) => entry.sessionUuid)).toEqual([NEW]);
   });
 
   it("a retirement revokes the transfer as it revokes an entitlement row, and the Buzz channel with it", async () => {
@@ -320,6 +347,7 @@ describe("cto_entitlement_transfer moves a project's canonical CTO to another ru
       expect(w.harness.cp.sessions.require(w.oldSessionId).lifecycle).toBe(SessionLifecycle.READY);
       expect(w.owner()).toEqual({ owner_session_id: w.oldSessionId, owner_binding_generation: 1 });
       expect(w.transfers()[0]).toMatchObject({ claimed_at: null });
+      expect(w.registry.effective(w.configured).map((entry) => entry.sessionUuid)).toEqual([OLD]);
     });
 
     it("rolls everything back when the hand-over's record is refused", async () => {
@@ -333,6 +361,7 @@ describe("cto_entitlement_transfer moves a project's canonical CTO to another ru
       expect(w.harness.cp.bindings.active(w.roleKey)?.sessionId).toBe(w.oldSessionId);
       expect(w.owner()).toEqual({ owner_session_id: w.oldSessionId, owner_binding_generation: 1 });
       expect(w.transfers()[0]).toMatchObject({ claimed_at: null });
+      expect(w.registry.effective(w.configured).map((entry) => entry.sessionUuid)).toEqual([OLD]);
     });
   });
 });
