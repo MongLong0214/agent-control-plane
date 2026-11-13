@@ -176,7 +176,8 @@ type Fixture = Awaited<ReturnType<typeof deadOwnerUnderDaemon>>;
 /** The real ordering: continuity pauses the run and revokes the dead binding, then the claim, then a pass. */
 const heldThenClaimed = async (steps: {
   beforePause?: (f: Fixture) => void | Promise<void>;
-  afterPause?: (f: Fixture) => void;
+  afterPause?: (f: Fixture) => void | Promise<void>;
+  generation?: number;
   claim?: (f: Fixture) => Promise<Decision<CanonicalSelfClaimReceipt>>;
   afterClaim?: (f: Fixture) => void;
   pauseReason?: string;
@@ -190,11 +191,11 @@ const heldThenClaimed = async (steps: {
   });
   expect(f.db.get(`SELECT status, revoked_reason FROM assignments WHERE role_key = ? AND binding_generation = 1`, [f.roleKey]))
     .toEqual({ status: "REVOKED", revoked_reason: CONTINUITY_RUNTIME_LOST_REVOCATION_REASON });
-  steps.afterPause?.(f);
+  await steps.afterPause?.(f);
   const claimed = await (steps.claim ?? ((fixture) => fixture.claimAs(2)))(f);
   expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
   if (!claimed.allowed) throw new Error("unreachable");
-  expect(claimed.value.binding.bindingGeneration).toBe(2);
+  expect(claimed.value.binding.bindingGeneration).toBe(steps.generation ?? 2);
   steps.afterClaim?.(f);
   const report = await f.daemon.reconcileContinuity("test: the successor");
   return { f, claimed: claimed.value, holds: report?.continuityHolds };
@@ -209,9 +210,19 @@ const expectStillHeld = (
   expect(holds).toEqual({ released: [], kept: [{ runId: f.runId, why }] });
   expect(f.owner()).toEqual({ owner_session_id: f.sessionId, owner_binding_generation: 1, state: RunState.BLOCKED });
   expect(f.handOvers()).toEqual([]);
-  expect(f.harness.cp.runs.assertOwner(f.runId, claimed.sessionId, 2)).toMatchObject({
+  expect(f.harness.cp.runs.assertOwner(f.runId, claimed.sessionId, claimed.binding.bindingGeneration)).toMatchObject({
     allowed: false, reasonCode: ReasonCode.RUN_OWNER_REVOKED,
   });
+};
+
+/** The role's current holder loses its runtime, and a pass revokes it as continuity does (the run is already held). */
+const loseAgain = async (f: Fixture) => {
+  const holder = f.harness.cp.bindings.active(f.roleKey)!;
+  const settled = f.harness.cp.sessions.transition(holder.sessionId, SessionLifecycle.ERROR, "test: lost again");
+  if (!settled.allowed) throw new Error(settled.message);
+  await f.daemon.reconcileContinuity("test: lost again");
+  expect(f.db.get(`SELECT status, revoked_reason FROM assignments WHERE assignment_id = ?`, [holder.assignmentId]))
+    .toEqual({ status: "REVOKED", revoked_reason: CONTINUITY_RUNTIME_LOST_REVOCATION_REASON });
 };
 
 describe("a continuity-held run of a dead canonical CTO follows the same conversation's next generation", () => {
@@ -282,7 +293,75 @@ describe("a continuity-held run of a dead canonical CTO follows the same convers
     }
   });
 
+  it("is handed over across a generation of the same conversation that lost its runtime again", async () => {
+    const { f, claimed, holds } = await heldThenClaimed({
+      generation: 3,
+      claim: async (fixture) => {
+        const second = await fixture.claimAs(2);
+        if (!second.allowed) throw new Error(JSON.stringify(second));
+        await loseAgain(fixture);
+        return fixture.claimAs(3);
+      },
+    });
+    try {
+      expect(holds).toEqual({ released: [f.runId], kept: [] });
+      expect(f.owner()).toEqual({ owner_session_id: claimed.sessionId, owner_binding_generation: 3, state: RunState.ACTIVE });
+      expect(JSON.parse(f.handOvers()[0]!.evidence_json)).toMatchObject({ fromGeneration: 1, toGeneration: 3 });
+    } finally {
+      await f.daemon.stop();
+    }
+  });
+
   describe("stays held", () => {
+    it("while the owner has suspended the project", async () => {
+      const held = await heldThenClaimed({
+        afterPause: async (f) => {
+          const suspended = await f.harness.cp.cto.suspendProject(f.projectId, true, "owner stop", undefined, "test-owner");
+          expect(suspended.allowed, JSON.stringify(suspended)).toBe(true);
+        },
+      });
+      try {
+        expectStillHeld(held, "the run's project is suspended");
+      } finally {
+        await held.f.daemon.stop();
+      }
+    });
+
+    it("after a deliberate revocation of a generation between the pin and the successor", async () => {
+      const held = await heldThenClaimed({
+        generation: 3,
+        claim: async (f) => {
+          const second = await f.claimAs(2);
+          if (!second.allowed) throw new Error(JSON.stringify(second));
+          const released = f.harness.cp.bindings.revoke(f.roleKey, "CEO delegated release: stop this CTO");
+          expect(released.allowed, JSON.stringify(released)).toBe(true);
+          return f.claimAs(3);
+        },
+      });
+      try {
+        expectStillHeld(held, PIN_KEPT);
+      } finally {
+        await held.f.daemon.stop();
+      }
+    });
+
+    it("across a generation of another actor, though it too lost its runtime", async () => {
+      const held = await heldThenClaimed({
+        generation: 3,
+        claim: async (f) => {
+          const other = await f.claimAs(2, { uuid: OTHER_CANON, actor: OTHER_ACTOR });
+          if (!other.allowed) throw new Error(JSON.stringify(other));
+          await loseAgain(f);
+          return f.claimAs(3);
+        },
+      });
+      try {
+        expectStillHeld(held, PIN_KEPT);
+      } finally {
+        await held.f.daemon.stop();
+      }
+    });
+
     it("for a different actor's binding", async () => {
       const held = await heldThenClaimed({ claim: (f) => f.claimAs(2, { uuid: OTHER_CANON, actor: OTHER_ACTOR }) });
       try {

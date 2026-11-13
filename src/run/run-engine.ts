@@ -2145,6 +2145,11 @@ export class RunEngine {
       const kept = (why: string) => allow(ReasonCode.OK, { run, released: false, kept: why });
       if (run.kind !== RunKind.STANDARD_WORK) return kept("only a STANDARD_WORK run's continuity hold is released here");
       if (run.state !== RunState.BLOCKED) return kept(`the run is ${run.state}, not BLOCKED`);
+      // The owner's suspension outranks continuity: a suspended project's run is neither released nor handed over.
+      if (run.projectId !== null &&
+          this.db.get<{ suspended: number }>(`SELECT suspended FROM projects WHERE project_id = ?`, [run.projectId])?.suspended !== 0) {
+        return kept("the run's project is suspended");
+      }
       if (run.continuityHoldRoleKey === null || run.continuityHoldRoleKey !== held.roleKey) {
         return kept("the run is not under continuity's hold for this role");
       }
@@ -2407,7 +2412,10 @@ export class RunEngine {
    * the revoked generation. Only exactly that is handed over: the hold is for the run's own PRIMARY_CTO
    * role, with the runtime-lost pause; the pin is that role's generation REVOKED by continuity's
    * runtime-lost revocation; `owner` is a higher generation of the same conversational actor; and that
-   * actor is a canonical (self-claimed) conversation.
+   * actor is a canonical (self-claimed) conversation. Every generation between the two must be that same
+   * actor, also revoked for a lost runtime: a conversation that crashed again before a pass is still the
+   * one continuity paused for, but a deliberate revocation in between (a CEO release, a replacement, a
+   * suspension) or another actor ends the chain, and the run stays held.
    */
   #runtimeLostPredecessor(
     run: RunRow,
@@ -2424,11 +2432,18 @@ export class RunEngine {
           AND prev.status = 'REVOKED' AND prev.revoked_reason = ?
           AND next.role_key = prev.role_key AND next.actor_id = prev.actor_id
           AND EXISTS (SELECT 1 FROM actor_target_bindings tb
-                       WHERE tb.target_actor_id = prev.actor_id AND tb.executor_kind = ?)`,
+                       WHERE tb.target_actor_id = prev.actor_id AND tb.executor_kind = ?)
+          AND NOT EXISTS (SELECT 1 FROM assignments mid
+                           WHERE mid.role_key = prev.role_key
+                             AND mid.binding_generation > prev.binding_generation
+                             AND mid.binding_generation < next.binding_generation
+                             AND (mid.actor_id <> prev.actor_id OR mid.status <> 'REVOKED'
+                                  OR mid.revoked_reason IS NOT ?))`,
       [
         owner.assignmentId, run.ownerRoleKey, run.ownerBindingGeneration,
         run.ownerSessionId, run.ownerSessionIncarnation,
         CONTINUITY_RUNTIME_LOST_REVOCATION_REASON, SELF_CLAIM_EXECUTOR_KIND,
+        CONTINUITY_RUNTIME_LOST_REVOCATION_REASON,
       ],
     );
     return row ? { sessionId: row.session_id, generation: run.ownerBindingGeneration, actorId: row.actor_id } : null;
