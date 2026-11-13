@@ -1107,18 +1107,26 @@ export class Doctor {
           [session.sessionId, session.incarnation],
         );
         const activeBinding = activeBindings.length > 0;
-        const ownedRunIds = this.runs.activeRunsOwnedBy(session.sessionId).map((run) => run.runId);
+        const ownedRuns = this.runs.activeRunsOwnedBy(session.sessionId);
+        const ownedRunIds = ownedRuns.map((run) => run.runId);
         const ownsRuns = ownedRunIds.length > 0;
+        const ownedUnderProjectPrimaryCto = ownedRuns.every((run) =>
+          Boolean(run.projectId) && run.ownerRoleKey === roleKeyFor(Role.PRIMARY_CTO, { projectId: run.projectId }));
         const runningExecution = Boolean(this.db.get(
-          `SELECT 1 FROM task_executions WHERE worker_session_id = ? AND status = 'RUNNING'`, [session.sessionId],
+          `SELECT 1 FROM task_executions WHERE worker_session_id = ? AND status = 'RUNNING'
+           UNION ALL
+           SELECT 1 FROM candidate_pipeline_attempts WHERE owner_session_id = ? AND state = 'RUNNING'`,
+          [session.sessionId, session.sessionId],
         ));
         // A worker turn runs in its own WORKER session (CP-HI-04), so work in flight on a run this
         // session owns is found through the run. The successor's claim refuses to move a run with one
         // (PREDECESSOR_WORKER_TURN_IN_FLIGHT), which would leave the run on the dead generation.
+        const ownedRunList = ownedRunIds.map(() => "?").join(",");
         const runningOnOwnedRun = ownsRuns && Boolean(this.db.get(
-          `SELECT 1 FROM task_executions
-            WHERE status = 'RUNNING' AND run_id IN (${ownedRunIds.map(() => "?").join(",")})`,
-          ownedRunIds,
+          `SELECT 1 FROM task_executions WHERE status = 'RUNNING' AND run_id IN (${ownedRunList})
+           UNION ALL
+           SELECT 1 FROM candidate_pipeline_attempts WHERE state = 'RUNNING' AND run_id IN (${ownedRunList})`,
+          [...ownedRunIds, ...ownedRunIds],
         ));
         const unfinishedWork = ownsRuns || runningExecution;
         const terminal = session.lifecycle === SessionLifecycle.ERROR || session.lifecycle === SessionLifecycle.STOPPED;
@@ -1126,13 +1134,17 @@ export class Doctor {
         // Match checkBindings' project-availability policy: a settled PRIMARY_CTO with no unfinished
         // work can be released through the operator door after startup, and so can a settled CEO,
         // whose binding is the door's other role (`DEAD_BINDING_RECOVERY_ROLES`). A settled
-        // PRIMARY_CTO's own runs do not hold the daemon down either: blocking on them keeps shut the
-        // claim socket its same actor reattaches through, whose self-claim moves those runs to the
-        // next generation (`repointLiveRunsToSameActorSuccessor`), and the CEO tools that cancel them.
+        // session's project PRIMARY_CTO runs do not hold the daemon down either, whether its binding is
+        // still ACTIVE or already revoked: blocking on them keeps shut the claim socket its same actor
+        // reattaches through, whose self-claim moves those runs to the next generation
+        // (`repointLiveRunsToSameActorSuccessor`), the continuity pass that hands a run it held for the
+        // lost runtime to that successor (`RunEngine.releaseContinuityHold`), and the CEO tools that
+        // cancel them.
         // Keep the error visible; only the system gate relaxes it, never session/role diagnostics,
-        // any other authority, a CEO with unfinished work, or a RUNNING execution in its name or on its runs.
-        const recoverableBinding = scope === "system" && terminal && activeBinding && !runningExecution &&
-          !runningOnOwnedRun &&
+        // any other authority, a CEO with unfinished work, a run owned under another role key, or a
+        // RUNNING execution or pipeline attempt in its name or on its runs.
+        const recoverableBinding = scope === "system" && terminal && !runningExecution &&
+          !runningOnOwnedRun && ownedUnderProjectPrimaryCto &&
           activeBindings.every((binding) =>
             (binding.role === Role.PRIMARY_CTO && binding.project_id !== null) ||
             (!ownsRuns && binding.role === Role.CEO && binding.project_id === null));
