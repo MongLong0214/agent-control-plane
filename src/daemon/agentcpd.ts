@@ -1370,6 +1370,14 @@ export const startLocalMcpListeners = async (
         cp.audit.record({ kind: "ROLE_WAKE_FAILED", reasonCode, roleKey, evidence: { cause } }),
       onWakeWritten: ({ roleKey, cause }) =>
         cp.audit.record({ kind: "ROLE_WAKE_SENT", reasonCode: ReasonCode.OK, roleKey, evidence: { cause } }),
+      // A wake the holder's registration opted out of: no frame, and recorded as that, not a failure.
+      onWakeSuppressed: ({ roleKey, cause }) =>
+        cp.audit.record({
+          kind: "ROLE_WAKE_SUPPRESSED",
+          reasonCode: ReasonCode.ROLE_WAKE_SUPPRESSED,
+          roleKey,
+          evidence: { cause, suppressedBy: "holder-opt-out" },
+        }),
       // FIX-ROLE-WAKE — a registration wake with no confirmed work is skipped; a failed lookup wakes.
       holderHasWork: (holder) => cp.outbox.hasWorkForHolder(holder),
     },
@@ -1478,11 +1486,16 @@ export const startLocalMcpListeners = async (
         "role_wake_endpoint_register",
         {
           description:
-            "Register this connection's own wake endpoint socket. Local runtime contract, version-pinned; not a public interface.",
-          inputSchema: { endpoint: z.string().min(1), acceptance: z.literal("relay-v1").optional() },
+            "Register this connection's own wake endpoint socket. Local runtime contract, version-pinned; not a public interface. " +
+            "wakeOptOut: true asks to be written no ACP-ROLE-WAKE frame on this registration; messages stay claimable as before.",
+          inputSchema: {
+            endpoint: z.string().min(1),
+            acceptance: z.literal("relay-v1").optional(),
+            wakeOptOut: z.boolean().optional(),
+          },
         },
-        async (args: { endpoint: string; acceptance?: "relay-v1" }) =>
-          respond(await ctoConversation.registerEndpoint(server, args.endpoint, args.acceptance)),
+        async (args: { endpoint: string; acceptance?: "relay-v1"; wakeOptOut?: boolean }) =>
+          respond(await ctoConversation.registerEndpoint(server, args.endpoint, args.acceptance, args.wakeOptOut === true)),
       );
       /*
        * The owner-message tools, registered in this same composition — not on a second

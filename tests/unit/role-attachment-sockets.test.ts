@@ -137,6 +137,23 @@ describe("role attachment over real daemon sockets", () => {
     expect(h.cp.sessions.verifySecret(subject.sessionId, subject.sessionSecret).allowed).toBe(true);
   });
 
+  it("either door's registration carries the holder's wake opt-out, and the next registration without it lifts it", async () => {
+    const attached = await open(await grant());
+    expect((await attached.register({ wakeOptOut: true })).ok).toBe(true);
+    expect(listeners.ctoConversation.endpointFor(roleKey)).toBe(endpoint);
+    expect((await listeners.ctoConversation.wake(roleKey)).reasonCode).toBe(ReasonCode.ROLE_WAKE_SUPPRESSED);
+    expect((await attached.register()).ok).toBe(true);
+    expect((await listeners.ctoConversation.wake(roleKey)).reasonCode).toBe(ReasonCode.OK);
+    attached.socket.destroy();
+    await expect.poll(() => listeners.ctoConversation.connected(roleKey)).toBe(false);
+
+    const ordinary = await open(subject);
+    expect((await ordinary.register({ wakeOptOut: true })).ok).toBe(true);
+    expect((await listeners.ctoConversation.wake(roleKey)).reasonCode).toBe(ReasonCode.ROLE_WAKE_SUPPRESSED);
+    expect((await ordinary.register({ wakeOptOut: false })).ok).toBe(true);
+    expect((await listeners.ctoConversation.wake(roleKey)).reasonCode).toBe(ReasonCode.OK);
+  });
+
   it("an ordinary holder reconnect takes over an attachment and the former connection cannot register", async () => {
     const first = await open(await grant());
     const sibling = await open(subject);
