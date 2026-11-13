@@ -4395,7 +4395,7 @@ const V57_TRANSFER_GUARDS = [
 const v57Objects = (): StepObject[] => [
   {
     type: "table", name: "canonical_entitlement_transfers", table: "canonical_entitlement_transfers",
-    ddl: schemaObject(/CREATE TABLE IF NOT EXISTS canonical_entitlement_transfers \([\s\S]*?\n\);/, "the canonical_entitlement_transfers table", 57),
+    ddl: schemaObject(/CREATE TABLE IF NOT EXISTS canonical_entitlement_transfers \([\s\S]*?\n\) WITHOUT ROWID;/, "the canonical_entitlement_transfers table", 57),
   },
   {
     type: "index", name: "canonical_entitlement_transfers_one_pending", table: "canonical_entitlement_transfers",

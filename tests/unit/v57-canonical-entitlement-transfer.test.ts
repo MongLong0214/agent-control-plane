@@ -171,6 +171,14 @@ describe("v57 — a canonical entitlement transfer table beside the immutable en
     ).run(uuid(11), uuid(12), AT);
     expect(replace).toThrow(REFUSED);
     expect(row("t1")).toEqual(before);
+    // By rowid, with a fresh id: the table is WITHOUT ROWID, so there is no rowid to replace the claimed row by.
+    const byRowid = () => raw.prepare(
+      `INSERT OR REPLACE INTO canonical_entitlement_transfers (rowid, transfer_id, project_id, from_session_uuid, to_session_uuid, buzz_actor_id, buzz_address, expected_binding_generation, requested_by, created_at)
+       VALUES (1, 't9', 'p1', ?, ?, 'actor-p1', 'room', 2, 'forger', ?)`,
+    ).run(uuid(11), uuid(12), AT);
+    expect(byRowid).toThrow();
+    expect(row("t1")).toEqual(before);
+    expect(row("t9")).toBeUndefined();
   });
 
   it("an entitlement is never granted to a transferred conversation or a held Buzz actor", () => {

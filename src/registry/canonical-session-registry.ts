@@ -3,6 +3,7 @@ import { canonicalJson } from '../core/digest.ts';
 import { type Decision, allow, deny } from '../core/errors.ts';
 import { ReasonCode } from '../core/reason-codes.ts';
 import type { Db } from '../db/database.ts';
+import { TERMINAL_RUN_STATES } from '../domain/run-state.ts';
 import type { CanonicalAdoptableSession } from './canonical-self-claim.ts';
 
 /** One row of `canonical_entitlement_transfers` (v57). */
@@ -27,6 +28,11 @@ const transferOf = (r: TransferRow): CanonicalEntitlementTransfer => ({
 export interface CanonicalEntitlementTransferRequest {
   projectId: string; fromSessionUuid: string; toSessionUuid: string; expectedBindingGeneration: number;
 }
+
+const bootstrapBlocks = (projectId: string, runId: string): Decision<never> =>
+  deny(ReasonCode.CONFLICT, 'an adopted bootstrap of the project has no first manifest yet; it finishes or is cancelled before a transfer', {
+    refusal: 'TRANSFER_BLOCKED_BY_ADOPTED_BOOTSTRAP', projectId, runId,
+  });
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -132,6 +138,8 @@ export class CanonicalSessionRegistry {
     if (running) {
       return deny(ReasonCode.PREDECESSOR_WORKER_TURN_IN_FLIGHT, `the project has ${running.what}; the transfer waits for it to end`, { projectId, runId: running.run_id });
     }
+    const bootstrap = this.adoptedBootstrapBeforeFirstManifest(projectId);
+    if (bootstrap) return bootstrapBlocks(projectId, bootstrap);
     const transferId = `entitlement-transfer-${randomUUID()}`;
     this.db.run(
       `INSERT INTO canonical_entitlement_transfers (transfer_id, project_id, from_session_uuid, to_session_uuid, buzz_actor_id, buzz_address, provisioning_run_id, expected_binding_generation, requested_by, created_at)
@@ -153,6 +161,23 @@ export class CanonicalSessionRegistry {
        SELECT 'a RUNNING candidate pipeline attempt', run_id FROM candidate_pipeline_attempts
         WHERE state = 'RUNNING' AND deadline_at > ? AND run_id IN (SELECT run_id FROM owned)
        LIMIT 1`, [projectId, `PRIMARY_CTO:${projectId}`, at]) ?? null;
+  }
+  /**
+   * An unfinished PROJECT_BOOTSTRAP run that adopted `projectId`'s canonical CTO while the project has no first
+   * manifest yet. v56's pointer guard activates it only on the entitlement it was created on, so a transfer (and
+   * its claim) waits until that run finishes or is cancelled.
+   */
+  adoptedBootstrapBeforeFirstManifest(projectId: string): string | null {
+    return this.db.get<{run_id:string}>(
+      `SELECT r.run_id FROM runs r
+        WHERE EXISTS (SELECT 1 FROM projects p WHERE p.project_id = ? AND p.active_manifest_digest IS NULL)
+          AND r.kind = 'PROJECT_BOOTSTRAP' AND r.project_id IS NULL
+          AND r.state NOT IN (${TERMINAL_RUN_STATES.map(() => '?').join(',')})
+          AND (r.owner_role_key = ? OR EXISTS (
+            SELECT 1 FROM audit_events e WHERE e.run_id = r.run_id AND e.kind = 'RUN_CREATED'
+              AND CASE WHEN json_valid(e.evidence_json) THEN json_extract(e.evidence_json, '$.adoptCanonicalCto.projectId') IS ? ELSE 0 END))
+        ORDER BY r.run_id LIMIT 1`,
+      [projectId, ...TERMINAL_RUN_STATES, `PRIMARY_CTO:${projectId}`, projectId])?.run_id ?? null;
   }
   /** Cancels `transferId`, a PENDING transfer of `projectId`, by revoking it unclaimed; nothing else changes. */
   cancel(projectId: string, transferId: string, at: string): Decision<CanonicalEntitlementTransfer> {
@@ -178,6 +203,16 @@ export class CanonicalSessionRegistry {
     if (!holder || holder.sessionUuid !== row.fromSessionUuid) {
       return deny(ReasonCode.CONFLICT, "the transfer's predecessor no longer holds the project", { transferId, projectId: row.projectId });
     }
+    // The CEO authorized the move from the role at exactly `expectedBindingGeneration`; a claim at any generation
+    // but the next one means the role moved since (the old conversation recovered into a later one), and the
+    // transfer is stale: the CEO cancels it and issues it again.
+    if (bindingGeneration !== row.expectedBindingGeneration + 1) {
+      return deny(ReasonCode.BINDING_GENERATION_STALE, 'the entitlement transfer is stale: the role moved since it was authorized', {
+        refusal: 'TRANSFER_GENERATION_STALE', transferId, expectedBindingGeneration: row.expectedBindingGeneration, claimedGeneration: bindingGeneration,
+      });
+    }
+    const bootstrap = this.adoptedBootstrapBeforeFirstManifest(row.projectId);
+    if (bootstrap) return bootstrapBlocks(row.projectId, bootstrap);
     if (holder.transferId === null) {
       this.db.run(`UPDATE canonical_session_entitlements SET revoked_at = ?, revision = revision + 1 WHERE session_uuid = ? AND revoked_at IS NULL`, [at, row.fromSessionUuid]);
     } else {

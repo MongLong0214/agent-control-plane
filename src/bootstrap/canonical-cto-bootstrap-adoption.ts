@@ -412,6 +412,12 @@ export class CanonicalCtoBootstrapAdoptions {
       return refuse(ReasonCode.BOOTSTRAP_APPLICATION_RESERVED, "ADOPTION_PROJECT_RESERVED",
         "another bootstrap run holds the reservation for the adopted CTO's project", { ...evidence, heldBy: reserved.run_id });
     }
+    // v57: once a transfer's claim revoked the project's entitlement row, v56's pointer guard can no longer
+    // activate an adopting bootstrap's first manifest, so none is created.
+    if (!this.deps.db.get(`SELECT 1 FROM canonical_session_entitlements WHERE project_id = ? AND revoked_at IS NULL`, [adoption.projectId])) {
+      return refuse(ReasonCode.CONFLICT, "ADOPTION_ENTITLEMENT_TRANSFERRED",
+        "the project's canonical entitlement was transferred; v56's pointer guard admits a first manifest only on the original one", evidence);
+    }
     const validated = this.validate(adoption);
     if (!validated.allowed) return validated as Decision<RecordedBootstrapAdoption>;
     return allow(ReasonCode.OK, {

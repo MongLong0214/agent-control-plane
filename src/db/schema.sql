@@ -4373,11 +4373,12 @@ CREATE TABLE IF NOT EXISTS canonical_entitlement_transfers (
   revision INTEGER NOT NULL DEFAULT 1,
   revoked_at TEXT,
   CHECK (from_session_uuid <> to_session_uuid)
-);
+) WITHOUT ROWID;
 CREATE UNIQUE INDEX IF NOT EXISTS canonical_entitlement_transfers_one_pending
   ON canonical_entitlement_transfers(project_id) WHERE claimed_at IS NULL AND revoked_at IS NULL;
 -- CP-HI-02 — v57: REPLACE rewrites a row by its key without an UPDATE, so a transfer is never replaced: not by
 -- its id, not as its project's pending transfer, and not for a conversation a live or claimed transfer names.
+-- The table is WITHOUT ROWID, so no rowid is there to replace it by.
 CREATE TRIGGER IF NOT EXISTS canonical_entitlement_transfers_no_replace
 BEFORE INSERT ON canonical_entitlement_transfers
 WHEN EXISTS (SELECT 1 FROM canonical_entitlement_transfers

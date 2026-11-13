@@ -237,6 +237,26 @@ describe("cto_entitlement_transfer moves a project's canonical CTO to another ru
     expect(w.registry.effective(w.configured).map((entry) => entry.sessionUuid)).toEqual([NEW]);
   });
 
+  it("a claim after the old conversation recovered into a later generation is refused as stale; the CEO cancels and re-issues", async () => {
+    const w = await world();
+    const pending = await w.transfer();
+    expect(pending.ok).toBe(true);
+    // The old conversation's runtime is gone and it recovers into generation 2, which the transfer never authorized.
+    const recovered = await w.claimAs(OLD, 2, 66);
+    expect(recovered.allowed, JSON.stringify(recovered)).toBe(true);
+    if (!recovered.allowed) throw new Error("unreachable");
+    const stale = await w.claimAs(NEW, 3, 22);
+    expect(stale).toMatchObject({ allowed: false, reasonCode: ReasonCode.BINDING_GENERATION_STALE, evidence: { refusal: "TRANSFER_GENERATION_STALE" } });
+    expect(w.harness.cp.bindings.active(w.roleKey)?.sessionId).toBe(recovered.value.sessionId);
+    expect(w.registry.effective(w.configured).map((entry) => entry.sessionUuid)).toEqual([OLD]);
+    expect(w.transfers()[0]).toMatchObject({ claimed_at: null });
+    expect((await w.hermes("cto_entitlement_transfer_cancel", { projectId: w.projectId, transferId: pending.value!["transferId"] })).ok).toBe(true);
+    expect((await w.transfer({ expectedBindingGeneration: 2 })).ok).toBe(true);
+    const claimed = await w.claimAs(NEW, 3, 22);
+    expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
+    expect(w.registry.effective(w.configured).map((entry) => entry.sessionUuid)).toEqual([NEW]);
+  });
+
   it("a retirement revokes the transfer as it revokes an entitlement row, and the Buzz channel with it", async () => {
     const w = await world();
     expect((await w.transfer()).ok).toBe(true);

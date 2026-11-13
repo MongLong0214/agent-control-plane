@@ -66,7 +66,7 @@ const standIn = async (): Promise<{ pid: number; startedAt: string }> => {
 };
 
 /** A manifest-less project whose canonical CTO (gen 1) adopted a dispatched bootstrap run; claims go through the operator door. */
-const adoptedBootstrap = async (h: Harness, projectId: string) => {
+const adoptedBootstrap = async (h: Harness, projectId: string, options: { transferFirst?: boolean; noBootstrap?: boolean } = {}) => {
   const oldUuid = randomUUID();
   const newUuid = randomUUID();
   const buzzActorId = "7".repeat(64);
@@ -106,18 +106,59 @@ const adoptedBootstrap = async (h: Harness, projectId: string) => {
   const first = await claimAs(oldUuid, 1, await standIn());
   if (!first.allowed) throw new Error(`the old conversation's claim failed: ${JSON.stringify(first)}`);
   const oldSessionId = first.value.sessionId;
+  const transfer = () => h.cp.db.txDecision(() => registry.transfer(
+    { projectId, fromSessionUuid: oldUuid, toSessionUuid: newUuid, expectedBindingGeneration: 1 }, "ceo", h.clock.nowIso()));
+  if (options.noBootstrap) return { projectId, roleKey, oldUuid, newUuid, oldSessionId, runId: "", claimAs, transfer };
+  if (options.transferFirst) expect(transfer().allowed).toBe(true);
   const created = h.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: "STANDARD", contract, adoptCanonicalCto: { projectId, sessionId: oldSessionId, bindingGeneration: 1 } });
   if (!created.allowed) throw new Error(created.message);
   const runId = created.value.runId;
   const dispatched = await h.cp.runs.dispatch(runId);
   if (!dispatched.allowed) throw new Error(`${dispatched.reasonCode}: ${dispatched.message}`);
   expect(h.cp.runs.require(runId)).toMatchObject({ projectId: null, ownerRoleKey: roleKey, ownerSessionId: oldSessionId, ownerBindingGeneration: 1 });
-  const transfer = () => h.cp.db.txDecision(() => registry.transfer(
-    { projectId, fromSessionUuid: oldUuid, toSessionUuid: newUuid, expectedBindingGeneration: 1 }, "ceo", h.clock.nowIso()));
   return { projectId, roleKey, oldUuid, newUuid, oldSessionId, runId, claimAs, transfer };
 };
 
+/** The transfer's first line of defence switched off, to reach the doors behind it (defence in depth). */
+const withoutBootstrapBlock = () =>
+  vi.spyOn(CanonicalSessionRegistry.prototype, "adoptedBootstrapBeforeFirstManifest").mockReturnValue(null);
+
 describe("an adopted bootstrap and a canonical entitlement transfer", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("r2 P1: a transfer is refused while an adopted bootstrap of the project has no first manifest yet", async () => {
+    const h = harness();
+    const f = genesisPlanFixture();
+    const a = await adoptedBootstrap(h, f.manifest.projectId);
+    expect(a.transfer()).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT, evidence: { refusal: "TRANSFER_BLOCKED_BY_ADOPTED_BOOTSTRAP", runId: a.runId } });
+    expect(h.cp.db.all(`SELECT 1 FROM canonical_entitlement_transfers`)).toEqual([]);
+    // Once the bootstrap is cancelled, the transfer goes through.
+    expect(h.cp.runs.cancel(a.runId, "superseded by the transfer").allowed).toBe(true);
+    expect(a.transfer().allowed).toBe(true);
+  });
+
+  it("r2 P1: a bootstrap adopted while a transfer is pending blocks the transfer's claim, and the old CTO keeps it", async () => {
+    const h = harness();
+    const f = genesisPlanFixture();
+    const a = await adoptedBootstrap(h, f.manifest.projectId, { transferFirst: true });
+    const claimed = await a.claimAs(a.newUuid, 2, { pid: process.pid, startedAt: readProcessStartToken(process.pid)! });
+    expect(claimed).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT, evidence: { refusal: "TRANSFER_BLOCKED_BY_ADOPTED_BOOTSTRAP" } });
+    expect(h.cp.runs.require(a.runId)).toMatchObject({ ownerSessionId: a.oldSessionId, ownerBindingGeneration: 1 });
+    expect(new CanonicalSessionRegistry(h.cp.db).holder(a.projectId)?.sessionUuid).toBe(a.oldUuid);
+  });
+
+  it("r2 P1: once a transfer is claimed, a manifest-less project adopts no new bootstrap", async () => {
+    const h = harness();
+    const f = genesisPlanFixture();
+    const a = await adoptedBootstrap(h, f.manifest.projectId, { noBootstrap: true });
+    expect(a.transfer().allowed).toBe(true);
+    const claimed = await a.claimAs(a.newUuid, 2, { pid: process.pid, startedAt: readProcessStartToken(process.pid)! });
+    expect(claimed.allowed, JSON.stringify(claimed)).toBe(true);
+    if (!claimed.allowed) throw new Error("unreachable");
+    const created = h.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: "STANDARD", contract, adoptCanonicalCto: { projectId: a.projectId, sessionId: claimed.value.sessionId, bindingGeneration: 2 } });
+    expect(created).toMatchObject({ allowed: false, evidence: { refusal: "ADOPTION_ENTITLEMENT_TRANSFERRED" } });
+  });
+
   it("P1-b: a RUNNING pipeline attempt of an adopted bootstrap run (no project_id) blocks the transfer", async () => {
     const h = harness();
     const f = genesisPlanFixture();
@@ -131,7 +172,8 @@ describe("an adopted bootstrap and a canonical entitlement transfer", () => {
     expect(h.cp.db.all(`SELECT 1 FROM canonical_entitlement_transfers`)).toEqual([]);
   });
 
-  it("P1-a: after the transfer's claim, the adoption follows the moved pin and the new owner stages the bootstrap PLAN", async () => {
+  it("P1-a (defence in depth): after the transfer's claim, the adoption follows the moved pin and the new owner stages the bootstrap PLAN", async () => {
+    withoutBootstrapBlock();
     const h = harness();
     const f = genesisPlanFixture();
     const a = await adoptedBootstrap(h, f.manifest.projectId);
@@ -159,7 +201,8 @@ describe("an adopted bootstrap and a canonical entitlement transfer", () => {
     expect(h.cp.audit.forRun(a.runId).filter((row) => row.kind === "BOOTSTRAP_PLAN_STAGED").map((row) => row.sessionId)).toEqual([successorId]);
   });
 
-  it("P1-a: before the project's first manifest, the transferred bootstrap's CONFIRM is refused before any write (v56's pointer guard would refuse it after)", async () => {
+  it("P1-a (defence in depth): before the project's first manifest, the transferred bootstrap's CONFIRM is refused before any write (v56's pointer guard would refuse it after)", async () => {
+    withoutBootstrapBlock();
     const h = harness();
     const f = genesisPlanFixture();
     const a = await adoptedBootstrap(h, f.manifest.projectId);
