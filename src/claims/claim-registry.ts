@@ -146,6 +146,46 @@ export const claimAcquisition = (
 };
 
 /**
+ * The claims of `runIds` that follow their owner pin from `from` to `to`, moved in the caller's
+ * transaction, by claim id and run. The HELD and EXPIRED ones `from` owns, or the successor's writes,
+ * worker turns and next verification find no claim of its generation, and finalization cannot renew a
+ * lapsed branch claim (GitHubKernel.assertClaim renews only one of the run's owner generation). Safe
+ * only once the caller has refused while any turn or attempt of these runs is in flight. Every row
+ * acquired with one of them moves with it, so an acquisition stays provable (`claimAcquisition`) for the
+ * worktree hand-over and a worker turn. An acquisition whose rows are all RELEASED stays where it is
+ * (nothing reads one at the owner's generation), and a claim of any other run or owner is not touched.
+ */
+export const moveRunClaimsWithOwnerPin = (
+  db: Db,
+  from: { readonly sessionId: string; readonly generation: number },
+  to: { readonly sessionId: string; readonly generation: number },
+  runIds: readonly string[],
+): Array<{ claimId: string; runId: string }> => {
+  if (runIds.length === 0) return [];
+  const held = db.all<{ claim_id: string }>(
+    `SELECT claim_id FROM resource_claims
+      WHERE status IN ('HELD','EXPIRED') AND owner_session_id = ? AND owner_binding_generation = ?
+        AND run_id IN (${runIds.map(() => "?").join(",")})`,
+    [from.sessionId, from.generation, ...runIds],
+  );
+  const claims = new Map<string, string>();
+  for (const { claim_id: claimId } of held) {
+    for (const row of claimAcquisition(db, claimId)?.rows ?? []) {
+      if (row.owner_session_id === from.sessionId && row.owner_binding_generation === from.generation &&
+          runIds.includes(row.run_id)) claims.set(row.claim_id, row.run_id);
+    }
+  }
+  for (const claimId of claims.keys()) {
+    db.run(
+      `UPDATE resource_claims SET owner_session_id = ?, owner_binding_generation = ?
+        WHERE claim_id = ? AND owner_session_id = ? AND owner_binding_generation = ?`,
+      [to.sessionId, to.generation, claimId, from.sessionId, from.generation],
+    );
+  }
+  return [...claims].map(([claimId, runId]) => ({ claimId, runId }));
+};
+
+/**
  * PRD §23 — a *minimal* coordination registry, not a scheduler.
  *
  * It rejects only the four mechanically obvious collisions (same worktree, same branch,
