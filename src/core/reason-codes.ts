@@ -712,6 +712,13 @@ export const ReasonCode = {
    */
   ROLE_PEER_FAILED: "ROLE_PEER_FAILED",
   /**
+   * No wake frame was written because the holder's registration opted out of them (`wakeOptOut`).
+   *
+   * Not a failure, and nothing is owed: the wake is only a hint to look at durable ingress, and the
+   * message it would have pointed at stays there, claimable exactly as before.
+   */
+  ROLE_WAKE_SUPPRESSED: "ROLE_WAKE_SUPPRESSED",
+  /**
    * A `p` tag named no role this daemon can address, so nothing became a turn.
    *
    * Four different states arrive here and all of them mean the same thing to the sender: the

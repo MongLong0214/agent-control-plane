@@ -525,6 +525,41 @@ describe("the canonical CTO relay wakes its session as the session's own child",
     await r.finish();
   });
 
+  it("carries the session's wake opt-out to the proxy and replays it to a restarted daemon, so no frame reaches the session", async () => {
+    const f = await started();
+    const r = relay(f.paths, { messaging: f.messaging });
+    await r.initialized();
+    const proxy = await proxyRegistered(f);
+    const suppressed = () =>
+      f.subject.h.cp.db.all<{ evidence_json: string }>(
+        `SELECT evidence_json FROM audit_events WHERE kind = 'ROLE_WAKE_SUPPRESSED' ORDER BY rowid`,
+      ).map((row) => (JSON.parse(row.evidence_json) as { cause: string }).cause);
+
+    // The session registers its own messaging socket, as it may today, and asks for no frame.
+    const registered = await r.request("tools/call", {
+      name: "role_wake_endpoint_register",
+      arguments: { endpoint: f.session.path, wakeOptOut: true },
+    });
+    expect(registered.result?.structuredContent).toMatchObject({ ok: true });
+    expect(f.daemon.endpoint()).toBe(proxy);
+    // The fixture's owner message is still queued, so the registration reached its wake and withheld it.
+    expect(await until(() => suppressed().length === 1)).toBe(true);
+    await pauseFor(100);
+    expect(f.session.received).toEqual([]);
+
+    // A daemon restart: the relay replays that registration, opt-out included, and nothing else.
+    await f.daemon.stop();
+    await f.daemon.open();
+    expect(await until(() => f.daemon.endpoint() !== null)).toBe(true);
+    expect(f.daemon.endpoint()).toBe(proxy);
+    expect(await until(() => suppressed().length === 2)).toBe(true);
+    await pauseFor(100);
+    expect(f.session.received).toEqual([]);
+    expect(suppressed()).toEqual(["registration", "registration"]);
+    expect(f.claims).toEqual([]);
+    await r.finish();
+  });
+
   it("replays the proxy it registered unasked to a restarted daemon", async () => {
     const f = await started();
     const r = relay(f.paths, { messaging: f.messaging });

@@ -99,6 +99,16 @@ interface LivePeer {
    * should have died against it survived, which is how it was found.
    */
   wakeFailure: { readonly shape: WakeFailure["shape"] } | null;
+  /**
+   * Whether the registration in force asked to be written no wake frame (`wakeOptOut`).
+   *
+   * Scoped like `endpoint`, and set by the same write: every registration replaces it, so a holder
+   * opts back in by registering without it, and it dies with the connection. A relay replays the
+   * arguments of the registration it was answered `ok:true` for, so a daemon restart restores it
+   * with the endpoint. It withholds the frame only; the ingress, the claim and the delivery are
+   * untouched.
+   */
+  wakeOptOut: boolean;
 }
 
 /**
@@ -285,6 +295,9 @@ export interface WrittenRoleWake {
 export interface FailedRoleWake extends WrittenRoleWake {
   readonly reasonCode: ReasonCode;
 }
+
+/** One wake that wrote no frame because the holder's registration opted out, and why it was sent. */
+export type SuppressedRoleWake = WrittenRoleWake;
 
 /**
  * The exact bytes of a wake: one newline-delimited JSON frame carrying the token as its content.
@@ -541,6 +554,8 @@ export class RoleConversationPort {
    */
   readonly #onWakeFailed: ((wake: FailedRoleWake) => void) | null;
   readonly #onWakeWritten: ((wake: WrittenRoleWake) => void) | null;
+  /** Told once per wake withheld by the holder's opt-out, so it is recorded as suppressed, not failed. */
+  readonly #onWakeSuppressed: ((wake: SuppressedRoleWake) => void) | null;
   /**
    * Whether a registration or connection fallback has work to wake its holder for. A confirmed
    * `false` skips the wake; an absent or failing lookup wakes unconditionally.
@@ -557,6 +572,7 @@ export class RoleConversationPort {
       serializeWake?: <T>(body: () => T) => T;
       onWakeFailed?: (wake: FailedRoleWake) => void;
       onWakeWritten?: (wake: WrittenRoleWake) => void;
+      onWakeSuppressed?: (wake: SuppressedRoleWake) => void;
       holderHasWork?: (holder: HolderIdentity) => boolean;
     } = {},
   ) {
@@ -565,6 +581,7 @@ export class RoleConversationPort {
     this.#serializeWake = options.serializeWake ?? null;
     this.#onWakeWritten = options.onWakeWritten ?? null;
     this.#onWakeFailed = options.onWakeFailed ?? null;
+    this.#onWakeSuppressed = options.onWakeSuppressed ?? null;
     this.#holderHasWork = options.holderHasWork ?? null;
     this.#ownerMessages = options.ownerMessages ?? null;
     this.#endpointDir = options.endpointDir === undefined ? null : resolvePath(options.endpointDir);
@@ -668,6 +685,7 @@ export class RoleConversationPort {
         acceptance: null,
         registration: 0,
         wakeFailure: null,
+        wakeOptOut: false,
       };
       this.#connections.get(binding.roleKey)!.add(connection);
       this.#live.set(binding.roleKey, connection);
@@ -973,8 +991,17 @@ export class RoleConversationPort {
    * The client build is checked here because the endpoint is the client's own artefact: see
    * `WAKE_TRANSPORT_QUALIFIED_CLIENTS`. Membership is exact, and a build outside the set is
    * refused however close its version is to a member's.
+   *
+   * `wakeOptOut` is the holder asking to be written no wake frame on this registration, for any
+   * cause (`wake`). The endpoint is validated and registered all the same, so the registration
+   * still passes every check above and is what a relay replays.
    */
-  async registerEndpoint(server: McpServer, endpoint: string, acceptance?: "relay-v1"): Promise<Decision<readonly string[]>> {
+  async registerEndpoint(
+    server: McpServer,
+    endpoint: string,
+    acceptance?: "relay-v1",
+    wakeOptOut = false,
+  ): Promise<Decision<readonly string[]>> {
     const owned = [...this.#live.entries()].filter(([, peer]) => peer.server === server);
     if (owned.length === 0) {
       return deny(
@@ -1044,6 +1071,7 @@ export class RoleConversationPort {
       // which is this one unless the holder registered again while this wake was in flight -- a
       // completion that outlived its own registration writes nothing (`wake`).
       peer.wakeFailure = null;
+      peer.wakeOptOut = wakeOptOut;
     }
     const registered = owned.map(([roleKey]) => roleKey);
 
@@ -1252,6 +1280,23 @@ export class RoleConversationPort {
         "the attached peer registered no wake endpoint on this connection",
         { role: this.#role, roleKey },
       ));
+    }
+    // The current holder's registration asked for no frame. Judged before the endpoint is looked at
+    // or dialled, so nothing reaches the socket, and recorded as suppressed rather than failed: the
+    // message this wake would have pointed at is still in the durable ingress, untouched.
+    if (peer.wakeOptOut) {
+      try {
+        this.#onWakeSuppressed?.({
+          roleKey,
+          cause: cause ?? (mention ? ROLE_WAKE_CAUSE.MENTION : ROLE_WAKE_CAUSE.UNSPECIFIED),
+        });
+      } catch {
+        // Only the record is lost.
+      }
+      return deny(ReasonCode.ROLE_WAKE_SUPPRESSED, "the holder's registration opted out of wake frames; nothing was written", {
+        role: this.#role,
+        roleKey,
+      });
     }
     const revalidated = this.#validateEndpointPath(peer.endpoint);
     if (!revalidated.allowed) return refused(revalidated as Decision<void>);
