@@ -25,6 +25,8 @@ import {
   roleKeyFor,
 } from "../../src/domain/types.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
+import { digestOf, sha256 } from "../../src/core/digest.ts";
+import { SELF_CLAIM_EXECUTOR_KIND, SELF_CLAIM_PROTOCOL } from "../../src/registry/canonical-self-claim.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import {
   bindCeo,
@@ -815,4 +817,80 @@ it.each(["ERROR", "STOPPED"] as const)("a settled %s CTO stays visible without b
       code: "SESSION_PROCESS_MISSING", scope: `session:${sessionId}`, severity: "ERROR", blocking: true,
     }));
   }
+});
+
+/**
+ * A host restart leaves an adopted canonical CTO's session ERROR while it still owns a live run. Its
+ * own resumed conversation takes the binding and that run back through the self-claim, which is
+ * served only once start() has returned, so the startup gate names the dead session without blocking
+ * on it. A CTO that is not an adopted canonical runtime has no such path, and still blocks.
+ */
+describe("a restarted CTO that owns a live run", () => {
+  const ctoOwningARun = async (canonical: boolean) => {
+    const harness = makeHarness();
+    harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    bindCeo(harness);
+    const { projectId, repositoryId } = await registerFixtureProject(harness);
+    const session = harness.cp.sessions.create({ provider: "scripted", model: "scripted-cto", osPid: deadPid() });
+    expect(harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test cto").allowed).toBe(true);
+    const claimed = {
+      executorKind: SELF_CLAIM_EXECUTOR_KIND,
+      targetLocator: "11111111-1111-4111-8111-111111111111",
+      targetLocatorDigest: sha256("11111111-1111-4111-8111-111111111111"),
+    };
+    const bound = harness.cp.bindings.bind({
+      role: Role.PRIMARY_CTO,
+      projectId,
+      sessionId: session.sessionId,
+      ...(canonical
+        ? {
+            authenticatedTarget: {
+              claimed,
+              protocolVersion: SELF_CLAIM_PROTOCOL,
+              attestationDigest: digestOf({ fixture: "restarted-cto", sessionId: session.sessionId }),
+              verify: () => claimed,
+            },
+          }
+        : {}),
+    });
+    if (!bound.allowed) throw new Error(`primary CTO binding failed: ${bound.message}`);
+    const created = harness.cp.runs.create({
+      projectId,
+      executionMode: ExecutionMode.STANDARD,
+      contract: CONTRACT,
+      repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    });
+    if (!created.allowed) throw new Error(created.message);
+    // Owned the way a dispatched run is owned; the run's state stays QUEUED, which counts as live work.
+    harness.cp.db.run(
+      `UPDATE runs SET owner_session_id = ?, owner_binding_generation = ?, owner_session_incarnation = ?,
+                       owner_role_key = ? WHERE run_id = ?`,
+      [bound.value.sessionId, bound.value.bindingGeneration, bound.value.boundSessionIncarnation,
+        bound.value.roleKey, created.value.runId],
+    );
+    expect(harness.cp.runs.activeRunsOwnedBy(session.sessionId).map((run) => run.runId)).toEqual([created.value.runId]);
+    expect(harness.cp.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "test: host restart").allowed)
+      .toBe(true);
+    return { harness, sessionId: session.sessionId };
+  };
+
+  const missing = async (harness: Harness, scope: "system" | "session", target?: string) =>
+    (await harness.cp.doctor.run(scope, target)).findings.find((finding) => finding.code === "SESSION_PROCESS_MISSING");
+
+  it("does not block the startup gate for an adopted canonical CTO, and its session report still blocks", async () => {
+    const { harness, sessionId } = await ctoOwningARun(true);
+
+    expect(await missing(harness, "system")).toMatchObject({
+      scope: `session:${sessionId}`, severity: "ERROR", blocking: false,
+    });
+    expect(await missing(harness, "session", sessionId)).toMatchObject({ severity: "ERROR", blocking: true });
+  });
+
+  it("still blocks the startup gate for a CTO that is not an adopted canonical runtime", async () => {
+    const { harness, sessionId } = await ctoOwningARun(false);
+
+    expect(await missing(harness, "system")).toMatchObject({
+      scope: `session:${sessionId}`, severity: "ERROR", blocking: true,
+    });
+  });
 });

@@ -1107,9 +1107,11 @@ export class Doctor {
           [session.sessionId, session.incarnation],
         );
         const activeBinding = activeBindings.length > 0;
-        const unfinishedWork = this.runs.activeRunsOwnedBy(session.sessionId).length > 0 || Boolean(this.db.get(
+        const ownsRuns = this.runs.activeRunsOwnedBy(session.sessionId).length > 0;
+        const runningExecution = Boolean(this.db.get(
           `SELECT 1 FROM task_executions WHERE worker_session_id = ? AND status = 'RUNNING'`, [session.sessionId],
         ));
+        const unfinishedWork = ownsRuns || runningExecution;
         const terminal = session.lifecycle === SessionLifecycle.ERROR || session.lifecycle === SessionLifecycle.STOPPED;
         if (!sessionId && terminal && !activeBinding && !unfinishedWork) continue;
         // Match checkBindings' project-availability policy: a settled PRIMARY_CTO with no
@@ -1121,11 +1123,20 @@ export class Doctor {
           activeBindings.every((binding) =>
             (binding.role === Role.PRIMARY_CTO && binding.project_id !== null) ||
             (binding.role === Role.CEO && binding.project_id === null));
+        // An adopted canonical CTO that owns runs is recovered by its own resumed conversation: the
+        // self-claim releases the dead binding and takes its live runs over
+        // (`takeOverLiveRunsForSameActorSuccessor`). That claim is served only after start() returns,
+        // so blocking the start here left a host restart with no way back. Only the system gate
+        // relaxes it; a running worker execution, or any binding other than a project's CTO, still blocks.
+        const reclaimableCanonicalWork = scope === "system" && terminal && activeBinding && ownsRuns &&
+          !runningExecution &&
+          activeBindings.every((binding) => binding.role === Role.PRIMARY_CTO && binding.project_id !== null) &&
+          isAdoptedCanonicalRuntime(this.db, session.sessionId);
         findings.push({
           code: "SESSION_PROCESS_MISSING",
           severity: activeBinding || unfinishedWork ? "ERROR" : "WARN",
           scope: `session:${session.sessionId}`,
-          blocking: Boolean(activeBinding || unfinishedWork) && !recoverableBinding,
+          blocking: Boolean(activeBinding || unfinishedWork) && !recoverableBinding && !reclaimableCanonicalWork,
           confidence: "HIGH",
           observedEvidence: { pid: session.osPid, lifecycle: session.lifecycle },
           // #1189 (CEO msg_390e287c) — the resolving command is information, not an instruction; under 200 characters.
