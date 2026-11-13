@@ -2121,13 +2121,15 @@ export class RunEngine {
    *   its current incarnation; the old session the pause lost is never asked for;
    * - the run's owner pin is its project's PRIMARY_CTO's ACTIVE binding, exactly (session, incarnation,
    *   generation), on a READY session. Ownership never moves to another role, least of all to the role
-   *   that was held. The one exception is a hand-over (`#runtimeLostPredecessor`): a canonical CTO's
-   *   runtime-lost hold whose pin is the generation continuity revoked for that loss goes to the same
-   *   conversation's higher, READY generation, with the run's claims, only while no execution or
-   *   pipeline attempt of the run is RUNNING, and is recorded CONTINUITY_HOLD_HANDED_TO_SUCCESSOR;
+   *   that was held. The one exception is a hand-over (`#runtimeLostPredecessor`): a runtime-lost hold,
+   *   for whichever role it holds the run, whose pin is the canonical CTO generation continuity revoked
+   *   for that loss goes to the same conversation's higher, READY generation, with the run's claims, only
+   *   while no execution or pipeline attempt of the run is RUNNING, and is recorded
+   *   CONTINUITY_HOLD_HANDED_TO_SUCCESSOR;
    * - nothing moved under the hold since the pause: no run-mutating audit record of the run after it by
    *   event id (`CONTINUITY_HOLD_MUTATING_KINDS`; a refusal or a diagnostic such as OUTBOX_ACK_REJECTED is
-   *   not movement), no binding change after it of any other role whose loss pauses the run, and the
+   *   not movement), no binding change after it of any other role whose loss pauses the run (on a
+   *   hand-over, the owner's own role changed exactly as its predecessor chain was checked), and the
    *   run's rows unmoved: equal to the digest the pause recorded (`#holdSnapshot`) or, for a legacy pause
    *   written before the digest existed, none written at or after the pause's time (`#writtenSince`).
    *
@@ -2180,7 +2182,7 @@ export class RunEngine {
       const pinned = owner.boundSessionId === run.ownerSessionId &&
         owner.boundIncarnation === run.ownerSessionIncarnation &&
         owner.generation === run.ownerBindingGeneration;
-      const predecessor = pinned ? null : this.#runtimeLostPredecessor(run, held, owner);
+      const predecessor = pinned ? null : this.#runtimeLostPredecessor(run, owner);
       if (!pinned && predecessor === null) return kept("the run's owner pin is not its PRIMARY_CTO's active binding");
       if (!owner.ready) return kept("the run's owner session is not READY");
       // The pin moves onto the successor below, so no turn or attempt may still be running under the
@@ -2230,7 +2232,9 @@ export class RunEngine {
             AND kind IN (${CONTINUITY_HOLD_BINDING_KINDS.map(() => "?").join(", ")})`,
         [pause.event_id, held.roleKey, ...CONTINUITY_HOLD_BINDING_KINDS],
       );
-      const moved = rebound.find((row) => row.role_key !== null && this.#lossPauses(run, row.role_key));
+      // A hand-over's owner role moved under the hold by its predecessor chain, checked above.
+      const moved = rebound.find((row) =>
+        row.role_key !== null && !(predecessor !== null && row.role_key === ownerRoleKey) && this.#lossPauses(run, row.role_key));
       if (moved) {
         return kept(`another role this run depends on changed its binding under the hold: ${moved.kind} (event ${moved.event_id}) of ${moved.role_key}`);
       }
@@ -2410,8 +2414,9 @@ export class RunEngine {
    * hold may be handed to; null otherwise. A dead canonical CTO's pass pauses its run and then revokes
    * its binding, so the same conversation's next self-claim finds nothing ACTIVE to recover and takes no
    * run over (`recoverDeadCanonicalBinding` runs only for an ACTIVE predecessor), and the pin is left on
-   * the revoked generation. Only exactly that is handed over: the hold is for the run's own PRIMARY_CTO
-   * role, with the runtime-lost pause; the pin is that role's generation REVOKED by continuity's
+   * the revoked generation. Only exactly that is handed over: the hold is continuity's runtime-lost pause,
+   * for whichever role it holds the run (its own PRIMARY_CTO's, or another's such as the CEO's when both
+   * were lost together); the pin is the PRIMARY_CTO's generation REVOKED by continuity's
    * runtime-lost revocation; `owner` is a higher generation of the same conversational actor; and that
    * actor is a canonical (self-claimed) conversation. Every generation between the two must be that same
    * actor, also released as a lost runtime: by continuity's runtime-lost revocation, or as proven dead by
@@ -2423,10 +2428,9 @@ export class RunEngine {
    */
   #runtimeLostPredecessor(
     run: RunRow,
-    held: RoleBinding,
     owner: { assignmentId: string; generation: number },
   ): { sessionId: string; generation: number; actorId: string } | null {
-    if (held.roleKey !== run.ownerRoleKey || run.stateReason !== CONTINUITY_PAUSE_RUNTIME_LOST_REASON) return null;
+    if (run.stateReason !== CONTINUITY_PAUSE_RUNTIME_LOST_REASON) return null;
     if (run.ownerBindingGeneration === null || owner.generation <= run.ownerBindingGeneration) return null;
     const row = this.db.get<{ session_id: string; actor_id: string }>(
       `SELECT prev.session_id, prev.actor_id FROM assignments prev

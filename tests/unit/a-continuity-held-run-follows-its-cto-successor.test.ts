@@ -2,7 +2,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
 
 import Database from "better-sqlite3";
-import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { type MockInstance, afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { CONTINUITY_RUNTIME_LOST_REVOCATION_REASON } from "../../src/continuity/continuity-kernel.ts";
 import { type Decision, allow, deny } from "../../src/core/errors.ts";
@@ -10,7 +10,7 @@ import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { DEAD_CANONICAL_BINDING_RECOVERY_REASON_PREFIX } from "../../src/daemon/dead-binding-recovery.ts";
-import { ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, type RoleBinding, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import {
   CanonicalSelfClaim,
   hostSessionRegistryAbsent,
@@ -90,9 +90,9 @@ const signalFrom = (chain: readonly ProcessSnapshot[]) => (pid: number): void =>
 
 /**
  * One project whose canonical PRIMARY_CTO (generation 1) owns one dispatched ACTIVE run, killed with
- * nothing revoked, and the daemon started over it (#1391 lets it start).
+ * nothing revoked, and the daemon started over it (#1391 lets it start). `ownerDies: false` leaves it live.
  */
-const deadOwnerUnderDaemon = async () => {
+const deadOwnerUnderDaemon = async ({ ownerDies = true }: { ownerDies?: boolean } = {}) => {
   const harness = makeHarness();
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
   bindCeo(harness);
@@ -157,8 +157,10 @@ const deadOwnerUnderDaemon = async () => {
   const dispatched = await harness.cp.runs.dispatch(runId);
   if (!dispatched.allowed) throw new Error(`${dispatched.reasonCode}: ${dispatched.message}`);
 
-  live.kill("SIGKILL");
-  await once(live, "exit");
+  if (ownerDies) {
+    live.kill("SIGKILL");
+    await once(live, "exit");
+  }
 
   const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-held-cto-") });
   const started = await daemon.start({ bootstrapDoor: async () => ({ close: async () => undefined }) });
@@ -504,25 +506,6 @@ describe("a continuity-held run of a dead canonical CTO follows the same convers
       }
     });
 
-    it("for a hold of another role than the run's PRIMARY_CTO", async () => {
-      const ceo = roleKeyFor(Role.CEO);
-      const held = await heldThenClaimed({
-        beforePause: (f) => {
-          // Continuity's pause for the CEO, with the same reason; the CTO's own pass then finds it BLOCKED.
-          const paused = f.harness.cp.runs.pauseForContinuity(f.runId, ceo, CONTINUITY_PAUSE_RUNTIME_LOST_REASON, {
-            roleKey: ceo, continuityAction: "PAUSE_NEW_WORK",
-          });
-          if (!paused.allowed) throw new Error(paused.message);
-        },
-      });
-      try {
-        expect(held.f.harness.cp.runs.require(held.f.runId).continuityHoldRoleKey).toBe(ceo);
-        expectStillHeld(held, PIN_KEPT);
-      } finally {
-        await held.f.daemon.stop();
-      }
-    });
-
     it("for a successor that is not READY", async () => {
       let asked: unknown = null;
       const again = await heldThenClaimed({
@@ -541,6 +524,201 @@ describe("a continuity-held run of a dead canonical CTO follows the same convers
         expect(again.f.handOvers()).toEqual([]);
       } finally {
         await again.f.daemon.stop();
+      }
+    });
+  });
+});
+
+const CEO = roleKeyFor(Role.CEO);
+
+/** The CEO's session died with the reboot; continuity's failover for it is refused, as live. */
+const loseCeo = (f: Fixture): MockInstance => {
+  const ceo = f.harness.cp.bindings.active(CEO)!;
+  const lost = f.harness.cp.sessions.transition(ceo.sessionId, SessionLifecycle.ERROR, "test: the CEO's session died");
+  if (!lost.allowed) throw new Error(lost.message);
+  return vi.spyOn(f.harness.cp.continuity, "failover")
+    .mockResolvedValue(deny(ReasonCode.SESSION_NOT_READY, "test: the planned CEO session is not ready") as never);
+};
+
+/** The CEO re-adopted on a new READY session at its next generation; the dead session is not revived. */
+const readoptCeo = (f: Fixture): RoleBinding => {
+  const session = f.harness.cp.sessions.create({ provider: "scripted", model: "scripted-ceo" });
+  const ready = f.harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test: the CEO re-adopted");
+  if (!ready.allowed) throw new Error(ready.message);
+  const bound = f.harness.cp.bindings.bind({ roleKey: CEO, role: Role.CEO, sessionId: session.sessionId });
+  if (!bound.allowed) throw new Error(bound.message);
+  return bound.value;
+};
+
+/**
+ * Measured live (2026-11-14, run_6591ec8a and run_525e6b28): the reboot took the CEO and the CTOs together.
+ * One continuity pass held each run for the CEO's lost runtime (`continuity_hold_role_key` = CEO) and
+ * revoked the dead CTO generation for its own. The CEO was re-adopted and the same CTO conversation
+ * re-attached at the next generation, and every later pass still kept the hold with "the run's owner pin is
+ * not its PRIMARY_CTO's active binding": the hand-over applied only to a hold for the owner's own role.
+ */
+const heldForCeoThenClaimed = (steps: Parameters<typeof heldThenClaimed>[0] & { readopt?: boolean } = {}) => {
+  let failover: MockInstance | null = null;
+  return heldThenClaimed({
+    ...steps,
+    beforePause: async (f) => {
+      failover = loseCeo(f);
+      await steps.beforePause?.(f);
+    },
+    afterPause: async (f) => {
+      failover?.mockRestore();
+      // The premise, as live: the run is held for the CEO, and the CEO's dead generation was revoked too.
+      expect(f.harness.cp.runs.require(f.runId).continuityHoldRoleKey).toBe(CEO);
+      expect(f.harness.cp.bindings.active(CEO)).toBeNull();
+      if (steps.readopt !== false) readoptCeo(f);
+      await steps.afterPause?.(f);
+    },
+  });
+};
+
+describe("a run held for the CEO's loss, whose canonical CTO also died, follows the CTO's next generation", () => {
+  it("is handed to the successor and released in the pass that finds the CEO covered again", async () => {
+    const { f, claimed, holds } = await heldForCeoThenClaimed();
+    try {
+      expect(holds).toEqual({ released: [f.runId], kept: [] });
+      expect(f.owner()).toEqual({ owner_session_id: claimed.sessionId, owner_binding_generation: 2, state: RunState.ACTIVE });
+      expect(f.harness.cp.runs.require(f.runId)).toMatchObject({
+        continuityHoldRoleKey: null, stateReason: `continuity hold released: ${CEO} covered again`,
+      });
+      expect(f.harness.cp.runs.assertOwner(f.runId, claimed.sessionId, 2).allowed).toBe(true);
+      const recorded = f.handOvers();
+      expect(recorded.map((row) => ({ runId: row.run_id, sessionId: row.session_id }))).toEqual([
+        { runId: f.runId, sessionId: claimed.sessionId },
+      ]);
+      expect(JSON.parse(recorded[0]!.evidence_json)).toMatchObject({
+        fromGeneration: 1, toGeneration: 2, fromSession: f.sessionId, toSessionId: claimed.sessionId,
+      });
+      const again = await f.daemon.reconcileContinuity("test: again");
+      expect(again?.continuityHolds).toEqual({ released: [], kept: [] });
+      expect(f.handOvers()).toHaveLength(1);
+    } finally {
+      await f.daemon.stop();
+    }
+  });
+
+  describe("stays held", () => {
+    it("while the CEO is not covered again", async () => {
+      let asked: unknown[] = [];
+      let lostCeo: RoleBinding | null = null;
+      const held = await heldForCeoThenClaimed({
+        readopt: false,
+        beforePause: (f) => {
+          lostCeo = f.harness.cp.bindings.active(CEO);
+        },
+        afterClaim: (f) => {
+          const stale = lostCeo!;
+          const readopted = readoptCeo(f);
+          const lost = f.harness.cp.sessions.transition(readopted.sessionId, SessionLifecycle.ERROR, "test: lost again");
+          if (!lost.allowed) throw new Error(lost.message);
+          // A pass does not count either as covering the role, so the release is asked directly.
+          asked = [stale, readopted].map((binding) => f.harness.cp.runs.releaseContinuityHold(f.runId, binding));
+        },
+      });
+      try {
+        expect(asked).toMatchObject([
+          { allowed: true, value: { released: false, kept: "the held role's binding is no longer its active one" } },
+          { allowed: true, value: { released: false, kept: "the held role's session is not READY" } },
+        ]);
+        expect(held.holds?.released).toEqual([]);
+        expect(held.f.owner()).toEqual({ owner_session_id: held.f.sessionId, owner_binding_generation: 1, state: RunState.BLOCKED });
+        expect(held.f.handOvers()).toEqual([]);
+      } finally {
+        await held.f.daemon.stop();
+      }
+    });
+
+    it("after a deliberate revocation of a generation between the pin and the successor", async () => {
+      const held = await heldForCeoThenClaimed({
+        generation: 3,
+        claim: async (f) => {
+          const second = await f.claimAs(2);
+          if (!second.allowed) throw new Error(JSON.stringify(second));
+          const released = f.harness.cp.bindings.revoke(f.roleKey, "CEO delegated release: stop this CTO");
+          expect(released.allowed, JSON.stringify(released)).toBe(true);
+          return f.claimAs(3);
+        },
+      });
+      try {
+        expectStillHeld(held, PIN_KEPT);
+      } finally {
+        await held.f.daemon.stop();
+      }
+    });
+
+    it("for a different actor's binding", async () => {
+      const held = await heldForCeoThenClaimed({ claim: (f) => f.claimAs(2, { uuid: OTHER_CANON, actor: OTHER_ACTOR }) });
+      try {
+        expectStillHeld(held, PIN_KEPT);
+      } finally {
+        await held.f.daemon.stop();
+      }
+    });
+
+    it("while the owner has suspended the project", async () => {
+      const held = await heldForCeoThenClaimed({
+        afterPause: async (f) => {
+          const suspended = await f.harness.cp.cto.suspendProject(f.projectId, true, "owner stop", undefined, "test-owner");
+          expect(suspended.allowed, JSON.stringify(suspended)).toBe(true);
+        },
+      });
+      try {
+        expectStillHeld(held, "the run's project is suspended");
+      } finally {
+        await held.f.daemon.stop();
+      }
+    });
+
+    it("while a task execution of the run is RUNNING", async () => {
+      const held = await heldForCeoThenClaimed({
+        beforePause: (f) => {
+          const tasks = f.harness.cp.tasks.submit(f.runId, [{ key: "impl", title: "change app()", category: "implementation" }]);
+          if (!tasks.allowed) throw new Error(tasks.message);
+          const task = f.harness.cp.tasks.ready(f.runId)[0]!;
+          const workerSessionId = bindWorker(f.harness, task.taskId);
+          const execution = f.harness.cp.tasks.startExecution({
+            runId: f.runId, taskId: task.taskId, ownerBindingGeneration: 1, workerSessionId,
+            provider: "scripted", model: "scripted-worker",
+          });
+          if (!execution.allowed) throw new Error(execution.message);
+        },
+      });
+      try {
+        expectStillHeld(held, "the predecessor generation still has a RUNNING task execution on the run");
+      } finally {
+        await held.f.daemon.stop();
+      }
+    });
+
+    it("when the live owner's role changed its binding under the hold, with no hand-over", async () => {
+      const f = await deadOwnerUnderDaemon({ ownerDies: false });
+      try {
+        const failover = loseCeo(f);
+        try {
+          await f.daemon.reconcileContinuity("test: the CEO is lost");
+        } finally {
+          failover.mockRestore();
+        }
+        expect(f.harness.cp.runs.require(f.runId)).toMatchObject({ state: RunState.BLOCKED, continuityHoldRoleKey: CEO });
+        expect(f.harness.cp.bindings.active(f.roleKey)?.bindingGeneration).toBe(1);
+        // The owner is pinned and READY; only its role's binding record moved after the pause.
+        f.harness.cp.audit.record({
+          kind: "BINDING_RENEWED", roleKey: f.roleKey, sessionId: f.sessionId, evidence: { generation: 1 },
+        });
+        readoptCeo(f);
+        const pass = await f.daemon.reconcileContinuity("test: the CEO is bound again");
+        expect(pass?.continuityHolds).toEqual({
+          released: [],
+          kept: [{ runId: f.runId, why: expect.stringMatching(/^another role this run depends on changed its binding under the hold: BINDING_RENEWED /) }],
+        });
+        expect(f.owner()).toEqual({ owner_session_id: f.sessionId, owner_binding_generation: 1, state: RunState.BLOCKED });
+        expect(f.handOvers()).toEqual([]);
+      } finally {
+        await f.daemon.stop();
       }
     });
   });
