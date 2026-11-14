@@ -344,6 +344,82 @@ describe("a live run pinned to a dead canonical CTO's revoked generation follows
     }
   });
 
+  it("hand-over before the CEO resolves: the pin moves, the decision block stays as it was, and the resolution reaches the successor", async () => {
+    const f = await strandedUnderDaemon();
+    try {
+      expectStranded(f);
+      const escalationId = f.escalations.get(f.runId)!;
+      const blocked = f.harness.cp.runs.require(f.runId);
+      expect(blocked).toMatchObject({ state: RunState.BLOCKED, stateReason: "CEO_DECISION_REQUIRED", continuityHoldRoleKey: null });
+      const history = () => f.db.all<{ event_id: number; kind: string }>(
+        `SELECT event_id, kind FROM audit_events WHERE run_id = ? AND kind IN ('CTO_ESCALATION', 'RUN_TRANSITION', 'CEO_DECISION') ORDER BY event_id`,
+        [f.runId],
+      );
+      const before = history();
+      const successor = await claimed(f.claimAs(2));
+      expect(f.harness.cp.bindings.active(f.roleKey)?.bindingGeneration).toBe(2);
+
+      const pass = await f.daemon.reconcileContinuity("test: the successor, before the CEO resolves");
+      expect(pass?.predecessorRuns).toEqual(report([f.runId]));
+      // The owner pin moved, and nothing else of the run: BLOCKED for its decision, the escalation still open.
+      expect(f.harness.cp.runs.require(f.runId)).toEqual({
+        ...blocked,
+        ownerSessionId: successor.sessionId,
+        ownerSessionIncarnation: successor.binding.sessionIncarnation,
+        ownerBindingGeneration: 2,
+      });
+      expect(f.harness.cp.ceo.openEscalationOf(f.runId)).toEqual({ escalationId });
+      expect(history()).toEqual(before);
+      expect(f.db.all(`SELECT message_id FROM outbox WHERE run_id = ? AND kind = 'ESCALATION_REPLY'`, [f.runId])).toEqual([]);
+
+      // The CEO resolves later: ACTIVE under the successor, and its run_ack passes.
+      expect(f.resolve()).toMatchObject({ allowed: true, value: { state: RunState.ACTIVE, escalationId } });
+      expect(f.owner()).toEqual({ owner_session_id: successor.sessionId, owner_binding_generation: 2, state: RunState.ACTIVE });
+      expect(f.harness.cp.runs.require(f.runId).stateReason).toBe("escalation resolved");
+      expect(f.harness.cp.ceo.openEscalationOf(f.runId)).toBeNull();
+      expect(f.harness.cp.runs.assertOwner(f.runId, successor.sessionId, 2).allowed).toBe(true);
+      const reply = f.db.get<{ message_id: string; target_session_id: string; binding_generation: number }>(
+        `SELECT message_id, target_session_id, binding_generation FROM outbox WHERE run_id = ? AND kind = 'ESCALATION_REPLY'`, [f.runId],
+      )!;
+      expect(reply).toMatchObject({ target_session_id: successor.sessionId, binding_generation: 2 });
+      expect(f.harness.cp.outbox.acknowledge(reply.message_id, successor.sessionId, 2, successor.binding.sessionIncarnation))
+        .toMatchObject({ allowed: true });
+      expect(f.takeovers()).toHaveLength(1);
+    } finally {
+      await f.daemon.stop();
+    }
+  });
+
+  it("a manually held run keeps its hold reason after the pin hand-over", async () => {
+    const MANUAL_HOLD = "held by the owner: waiting on the vendor's API key";
+    const f = await strandedUnderDaemon({
+      block: false,
+      afterStart: (base) => {
+        const held = base.harness.cp.runs.transition(base.runId, RunState.BLOCKED, MANUAL_HOLD);
+        if (!held.allowed) throw new Error(held.message);
+      },
+    });
+    try {
+      expectStranded(f);
+      const blocked = f.harness.cp.runs.require(f.runId);
+      expect(blocked).toMatchObject({ state: RunState.BLOCKED, stateReason: MANUAL_HOLD, continuityHoldRoleKey: null });
+      const successor = await claimed(f.claimAs(2));
+      const pass = await f.daemon.reconcileContinuity("test: the successor");
+      expect(pass?.predecessorRuns).toEqual(report([f.runId]));
+      expect(f.harness.cp.runs.require(f.runId)).toEqual({
+        ...blocked,
+        ownerSessionId: successor.sessionId,
+        ownerSessionIncarnation: successor.binding.sessionIncarnation,
+        ownerBindingGeneration: 2,
+      });
+      // A later pass leaves it as it is.
+      await f.daemon.reconcileContinuity("test: again");
+      expect(f.harness.cp.runs.require(f.runId)).toMatchObject({ state: RunState.BLOCKED, stateReason: MANUAL_HOLD, ownerBindingGeneration: 2 });
+    } finally {
+      await f.daemon.stop();
+    }
+  });
+
   it("moves the run's claims of the dead generation with its pin", async () => {
     const f = await strandedUnderDaemon({
       block: false,
