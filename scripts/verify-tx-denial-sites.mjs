@@ -220,6 +220,10 @@ const EXPECTED_CONVERTED_SITES = [
   // then a state UPDATE conditional on the state, hold, reason and owner pin it read; a run that moved in
   // between updates no row and is refused, and that refusal has to take the transition record back.
   { file: "run/run-engine.ts", symbol: "releaseContinuityHold", label: "RunEngine.releaseContinuityHold", evidence: "direct" },
+  // A continuity pass hands every live run a covered canonical CTO's lost generation still owns to it, each
+  // pin and claim move followed by its CANONICAL_LIVE_RUNS_TAKEN_OVER row; a refused row must take back every
+  // hand-over of the pass, the ones before it included, so no pin moves without its record.
+  { file: "run/run-engine.ts", symbol: "takeOverLostPredecessorRuns", label: "RunEngine.takeOverLostPredecessorRuns", evidence: "direct" },
   // #1271: a cross-product split records the review's own frontier-simplify record, the CommitLore side
   // and, when the frontier-simplify issue is already written, one linking item, each through `#store`'s
   // audit write; a refused later side must take the earlier ones back, so no side stands without the other.

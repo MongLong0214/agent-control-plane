@@ -349,6 +349,14 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string; witn
     anchor: "  ): Decision<{ run: RunRow; released: boolean; kept: string | null }> {\n    return this.db.txDecision(() => {",
   },
   {
+    // A refused CANONICAL_LIVE_RUNS_TAKEN_OVER row is refused after the pass's pin and claim moves.
+    label: "RunEngine.takeOverLostPredecessorRuns",
+    file: "run/run-engine.ts",
+    anchor: "  ): Decision<{ takenOver: string[]; kept: Array<{ runId: string; why: string }> }> {\n    return this.db.txDecision(() => {",
+    witnesses: [{ file: "tests/unit/a-stranded-run-follows-its-cto-successor.test.ts",
+      title: "hands every such run over in one transaction: a refused record rolls all of them back" }],
+  },
+  {
     // #1271: a refused later side of a cross-product split is refused after an earlier side's audit write.
     label: "DogfoodFindingStore.recordAcrossProducts",
     file: "quality/upstream-dogfood.ts",
