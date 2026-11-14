@@ -2315,6 +2315,9 @@ export class RunEngine {
    * moves to `successor` only when all of these hold, and is kept, with why, otherwise:
    *
    * - `successor` is still its role's ACTIVE binding, on a READY session;
+   * - the run is not a PROJECT_BOOTSTRAP run: an adopted bootstrap's pin may only move along its adoption's
+   *   proven chain (`CanonicalCtoBootstrapAdoptions.pinHolds`), which a row written here cannot prove, so a
+   *   moved pin would leave its dispatch, PLAN staging and activation refused;
    * - the run's project is not suspended;
    * - the pin reaches `successor` by the hold hand-over's chain (`#lostSameActorPredecessor`): a
    *   PRIMARY_CTO generation of the same canonical actor, revoked by continuity for its lost runtime or
@@ -2351,6 +2354,10 @@ export class RunEngine {
         }
         if (!owner.ready) {
           keep("the successor's session is not READY");
+          continue;
+        }
+        if (run.kind === RunKind.PROJECT_BOOTSTRAP) {
+          keep("a PROJECT_BOOTSTRAP run's owner pin moves only along its adoption's proven chain");
           continue;
         }
         if (this.#projectSuspended(run)) {

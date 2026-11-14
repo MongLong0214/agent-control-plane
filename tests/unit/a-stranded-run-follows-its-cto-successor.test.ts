@@ -10,13 +10,14 @@ import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { DEAD_CANONICAL_BINDING_RECOVERY_REASON_PREFIX } from "../../src/daemon/dead-binding-recovery.ts";
-import { ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import {
   CanonicalSelfClaim,
   hostSessionRegistryAbsent,
   type CanonicalSelfClaimReceipt,
   type ProcessSnapshot,
 } from "../../src/registry/canonical-self-claim.ts";
+import { CanonicalSessionRegistry } from "../../src/registry/canonical-session-registry.ts";
 import { CONTINUITY_PAUSE_RUNTIME_LOST_REASON } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { bindCeo, bindWorker, bootstrapCtoProvider, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
@@ -104,18 +105,25 @@ interface Base {
  * One project whose canonical PRIMARY_CTO (generation 1) owns `runs` dispatched runs. `block` (default)
  * opens a blocking CTO escalation on each, so each is BLOCKED for a CEO decision. Then the CTO's process
  * dies, the daemon starts (`afterStart` runs then), and one continuity pass revokes generation 1 for the
- * lost runtime, as live.
+ * lost runtime, as live. `adoptedBootstrap` makes each run a PROJECT_BOOTSTRAP that adopted that CTO, of a
+ * registered project with no manifest yet.
  */
 const strandedUnderDaemon = async ({
   runs = 1,
   block = true,
+  adoptedBootstrap = false,
   afterStart,
-}: { runs?: number; block?: boolean; afterStart?: (f: Base) => void } = {}) => {
+}: { runs?: number; block?: boolean; adoptedBootstrap?: boolean; afterStart?: (f: Base) => void } = {}) => {
   const harness = makeHarness();
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
   const ceoSessionId = bindCeo(harness);
-  const registered = await registerFixtureProject(harness);
-  const { projectId } = registered;
+  const registered = adoptedBootstrap ? null : await registerFixtureProject(harness);
+  const projectId = registered?.projectId ?? "adopting-project";
+  if (registered === null) {
+    const project = harness.cp.projects.register({ projectId, name: projectId });
+    if (!project.allowed) throw new Error(project.message);
+    new CanonicalSessionRegistry(harness.cp.db).grant({ sessionUuid: CANON, projectId, buzzActorId: CTO_ACTOR, buzzAddress: ROOM }, null);
+  }
   const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
   const { db } = harness.cp;
   bootstrapCtoProvider(harness.cp, harness.clock);
@@ -169,10 +177,15 @@ const strandedUnderDaemon = async ({
   const runIds: string[] = [];
   const escalations = new Map<string, number>();
   for (let index = 0; index < runs; index += 1) {
-    const created = harness.cp.runs.create({
-      projectId, executionMode: ExecutionMode.STANDARD, contract: CONTRACT,
-      repositories: [{ repositoryId: registered.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
-    });
+    const created = registered === null
+      ? harness.cp.runs.create({
+        kind: RunKind.PROJECT_BOOTSTRAP, executionMode: ExecutionMode.STANDARD, contract: CONTRACT,
+        adoptCanonicalCto: { projectId, sessionId, bindingGeneration: 1 },
+      })
+      : harness.cp.runs.create({
+        projectId, executionMode: ExecutionMode.STANDARD, contract: CONTRACT,
+        repositories: [{ repositoryId: registered.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+      });
     if (!created.allowed) throw new Error(created.message);
     const runId = created.value.runId;
     const dispatched = await harness.cp.runs.dispatch(runId);
@@ -191,12 +204,22 @@ const strandedUnderDaemon = async ({
   };
   if (block) for (const id of runIds) blockForDecision(id);
 
+  const startDaemon = async () => {
+    const started = new Daemon(harness.cp, { stateDir: tempDir("acp-stranded-cto-") });
+    const outcome = await started.start({ bootstrapDoor: async () => ({ close: async () => undefined }) });
+    if (!outcome.allowed) throw new Error(`the daemon did not start: ${outcome.reasonCode}`);
+    return started;
+  };
+  // A start refuses over a dead CTO that owns a run with no project (the doctor's SESSION_PROCESS_MISSING),
+  // so an adopted bootstrap's CTO dies under a running daemon, its session settled as a sweep settles it.
+  const running = adoptedBootstrap ? await startDaemon() : null;
   live.kill("SIGKILL");
   await once(live, "exit");
-
-  const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-stranded-cto-") });
-  const started = await daemon.start({ bootstrapDoor: async () => ({ close: async () => undefined }) });
-  if (!started.allowed) throw new Error(`the daemon did not start: ${started.reasonCode}`);
+  if (running !== null) {
+    const settled = harness.cp.sessions.transition(sessionId, SessionLifecycle.ERROR, "test: the CTO's process died");
+    if (!settled.allowed) throw new Error(settled.message);
+  }
+  const daemon = running ?? await startDaemon();
   const base = { harness, db, projectId, roleKey, sessionId, ceoSessionId, runId, runIds, escalations, claimAs, blockForDecision };
   afterStart?.(base);
   await daemon.reconcileContinuity("test: the dead owner");
@@ -584,6 +607,20 @@ describe("a live run pinned to a dead canonical CTO's revoked generation follows
         });
         expect(f.owner()?.owner_binding_generation).toBe(1);
         expect(f.takeovers()).toEqual([]);
+      } finally {
+        await f.daemon.stop();
+      }
+    });
+
+    it("for an adopted PROJECT_BOOTSTRAP run, whose pin moves only along its adoption's proven chain", async () => {
+      // The review's reproduction: an adopted bootstrap blocked on a decision, the runtime lost, the next
+      // generation claims, then reconcile. A moved pin would leave pinHolds refusing ADOPTION_TAKEOVER_MISSING.
+      const f = await strandedUnderDaemon({ adoptedBootstrap: true });
+      try {
+        expect(f.harness.cp.runs.require(f.runId)).toMatchObject({ kind: RunKind.PROJECT_BOOTSTRAP, projectId: null });
+        expectStranded(f);
+        const successor = await claimed(f.claimAs(2));
+        await expectStillStranded(f, successor, "a PROJECT_BOOTSTRAP run's owner pin moves only along its adoption's proven chain");
       } finally {
         await f.daemon.stop();
       }
