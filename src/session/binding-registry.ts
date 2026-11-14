@@ -132,7 +132,7 @@ export interface BindInput {
   restoreCeo?: { actorId: string; generation: number; sessionId: string; incarnation: string };
 }
 
-const LIVE_RUN_STATES = [
+export const LIVE_RUN_STATES = [
   "QUEUED",
   "ACTIVE",
   "BLOCKED",

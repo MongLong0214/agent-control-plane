@@ -564,12 +564,24 @@ export interface ContinuityReconcileReport {
   restorationDeferred: Array<{ roleKey: string; reasonCode: string }>;
   /** S-HOLD — continuity's own BLOCKED holds this pass released, and those it kept, with why. */
   continuityHolds: ContinuityHoldReleaseReport;
+  /** The live runs this pass handed from a lost canonical CTO generation to its covering successor. */
+  predecessorRuns: PredecessorRunTakeoverReport;
 }
 
 /** S-HOLD — what one reconcile pass did with continuity's BLOCKED holds whose role it found covered. */
 export interface ContinuityHoldReleaseReport {
   released: string[];
   kept: Array<{ runId: string; why: string }>;
+}
+
+/**
+ * What one reconcile pass did with the live runs still pinned to a lost generation of a covered canonical
+ * CTO: those handed to it, those kept with why, and a role whose whole hand-over was refused and rolled back.
+ */
+export interface PredecessorRunTakeoverReport {
+  takenOver: string[];
+  kept: Array<{ runId: string; why: string }>;
+  refused: Array<{ roleKey: string; reasonCode: string }>;
 }
 
 /** The owners one bootstrap PLAN recovery pass woke (`Daemon.wakeBootstrapPlanRecovery`). */
@@ -2073,6 +2085,9 @@ export class Daemon {
       // S-HOLD — after every revocation and restoration of this pass, so the run engine reads the owner
       // and the held role as the pass leaves them.
       const continuityHolds = this.releaseContinuityHolds(covered);
+      // After the holds, which keep their own runs: every other live run a covered canonical CTO's lost
+      // generation still owns follows it.
+      const predecessorRuns = this.takeOverLostPredecessorRuns(covered);
 
       this.cp.audit.record({
         kind: "CONTINUITY_RECONCILED",
@@ -2097,6 +2112,7 @@ export class Daemon {
           restoration,
           restorationPending: plan.restorationPending,
           continuityHolds,
+          predecessorRuns,
         },
       });
 
@@ -2115,6 +2131,7 @@ export class Daemon {
         restored: restoration.restored,
         restorationDeferred: restoration.deferred,
         continuityHolds,
+        predecessorRuns,
       };
     } finally {
       this.#continuityReconciling = false;
@@ -2244,6 +2261,28 @@ export class Daemon {
       const released = this.cp.runs.releaseContinuityHold(run.runId, held);
       if (released.allowed && released.value.released) report.released.push(run.runId);
       else report.kept.push({ runId: run.runId, why: released.allowed ? released.value.kept ?? "" : released.reasonCode });
+    }
+    return report;
+  }
+
+  /**
+   * A dead canonical CTO's run that continuity did not hold (BLOCKED for a CEO decision when the runtime
+   * was lost, so not paused) keeps the generation continuity revoked as its owner, and the same
+   * conversation's next self-claim, with no ACTIVE predecessor, takes nothing over. Each binding this pass
+   * found covering its role is handed such runs here (`RunEngine.takeOverLostPredecessorRuns` decides each,
+   * in one transaction, and only a canonical PRIMARY_CTO's chain qualifies), at every pass, so a run
+   * resolved after the claim follows too.
+   */
+  private takeOverLostPredecessorRuns(covered: readonly RoleBinding[]): PredecessorRunTakeoverReport {
+    const report: PredecessorRunTakeoverReport = { takenOver: [], kept: [], refused: [] };
+    for (const binding of covered) {
+      const handed = this.cp.runs.takeOverLostPredecessorRuns(binding);
+      if (!handed.allowed) {
+        report.refused.push({ roleKey: binding.roleKey, reasonCode: handed.reasonCode });
+        continue;
+      }
+      report.takenOver.push(...handed.value.takenOver);
+      report.kept.push(...handed.value.kept);
     }
     return report;
   }
