@@ -817,6 +817,32 @@ describe("round-2 blind-review regressions", () => {
     });
   });
 
+  it("final reviewer prompt states the withheld delegated diff is not an omitted item, and a real gap stays REVISE", async () => {
+    const setup = await prepareLargeReviewedInputs();
+    setup.harness.scripted.script(
+      { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`]), once: false },
+      { match: /Final review/, text: reviewerPass([]) },
+    );
+    const ok = await invokePreparedReview(setup);
+    if (!ok.allowed) throw new Error(`${ok.reasonCode}: ${ok.message}`);
+    const finalPrompt = setup.harness.scripted.invocations.find((i) => /Final review/.test(i.prompt))!.prompt;
+    expect(finalPrompt).toContain("intentionally withheld");
+    expect(finalPrompt).not.toContain("diff is unavailable");
+    expect(finalPrompt).toContain("Post-merge obligations whose time has not come are not pre-merge omitted items");
+    expect(ok.value).toMatchObject({ verdict: "PASS", omittedItems: [] });
+  });
+
+  it.each(["chunk coverage missing", "required verification stdout missing"])("final reviewer omission (%s) still yields REVISE", async (item) => {
+    const setup = await prepareLargeReviewedInputs();
+    setup.harness.scripted.script(
+      { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`]), once: false },
+      { match: /Final review/, text: JSON.stringify({ verdict: "PASS", coveredFiles: [], omittedItems: [item], findings: [] }) },
+    );
+    const result = await invokePreparedReview(setup);
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.REVIEW_REVISE);
+  });
+
   it("#1259 keeps a chunked review whose reviewer also claims a file outside its chunk, recording that claim uncredited", async () => {
     const setup = await prepareLargeReviewedInputs();
     const assigned = `${setup.identity}:src/app.js`;
