@@ -7,6 +7,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   COMMITLORE_LIMITS,
   OBSERVATION_HARDENING_EXCEPTION,
+  type CommitLoreRunner,
   commitloreRunner,
   createCommitLoreCliPort,
   probeCommitLore,
@@ -14,7 +15,7 @@ import {
 } from "../../src/bootstrap/commitlore-observation.ts";
 import { GIT_HARDENING, gitHardeningEnvironment } from "../../src/run/worker-git.ts";
 import { EMPTY_TREE, gitIgnoresAttrSource } from "../../src/bootstrap/commitlore-snapshot.ts";
-import { hostGitDirectory, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
+import { hostGitDirectory, installedCopyOf, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
 
 /**
@@ -40,6 +41,20 @@ const realCommitLore = (): string | null => {
   return null;
 };
 const REAL = realCommitLore();
+/**
+ * The runner, with the installed bundle replaced the moment a checked preparation returns: the package
+ * snapshot is already taken, so what the replacement can reach is whatever still reads the installed copy.
+ */
+const replacedAfterPrepare = (runner: ReturnType<typeof commitloreRunner>, replace: () => void): CommitLoreRunner =>
+  Object.assign((...args: Parameters<CommitLoreRunner>) => runner(...args), {
+    prepare: async (...args: Parameters<typeof runner.prepare>) => {
+      const prepared = await runner.prepare(...args);
+      if (args[2].checked) replace();
+      return prepared;
+    },
+    configured: runner.configured,
+  });
+
 const realPort = () => {
   return createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, REAL as string));
 };
@@ -159,6 +174,19 @@ describe.skipIf(REAL === null)("#1268: the bootstrap observation under that hard
     const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, REAL as string)).observe(checkout);
     expect(observed).toMatchObject({ outcome: "PASS" });
     expect(existsSync(marker), "a program the checkout's config named ran inside CommitLore's git").toBe(false);
+  });
+
+  it("review r3 P1: a bundle replaced behind an unchanged wrapper after the checked preparation is never run by the observation", async () => {
+    const { wrapper, bundle } = installedCopyOf(REAL as string, tempDir("acp-1268-observation-install-"));
+    const marker = join(tempDir("acp-1268-observation-swap-"), "ran");
+    // The wrapper is left as it is; the bundle it names is replaced the moment the checked copy is prepared.
+    const swapping = (): void =>
+      writeFileSync(bundle, `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "ran");\nconsole.log(${JSON.stringify(JSON.stringify({ schema: "commitlore_doctor.v2", status: "ok", exitCode: 0, checks: [] }))});\n`);
+    const checkout = makeRepo({ "README.md": "# observed\n" });
+    const observed = await createCommitLoreCliPort(replacedAfterPrepare(commitloreRunner(COMMITLORE_LIMITS, wrapper), swapping)).observe(checkout);
+    expect(existsSync(marker), "the replaced bundle ran").toBe(false);
+    expect(observed).toMatchObject({ outcome: "PASS" });
+    expect(existsSync(join(checkout, ".git", "hooks", "prepare-commit-msg"))).toBe(true);
   });
 
   it("an ssh program the checkout's config names for its ssh:// remote is not run by init or doctor", async () => {

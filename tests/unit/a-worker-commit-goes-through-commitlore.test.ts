@@ -21,6 +21,7 @@ import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { frontierReviewPolicy } from "../../src/review/frontier-simplify-policy.ts";
 import { WorkerTurnEvent, WorkerTurnRunner, type WorkerTurnOptions } from "../../src/run/worker-turn.ts";
+import { installedCopyOf } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeCore, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest } from "../helpers/harness.ts";
 import { FakeWorkerAdapter, recordSeededTarget, seedWorkerWorld, type WorkerWorld } from "../helpers/worker-turn-fixture.ts";
@@ -104,6 +105,23 @@ const fakeFor = (world: WorkerWorld, reply: string, writes: Record<string, strin
   adapters.push(adapter);
   return adapter;
 };
+
+/** A copy of the real CLI's installation (`installedCopyOf`), in this run's temporary tree. */
+const installedCopy = (): { wrapper: string; bundle: string } => installedCopyOf(REAL as string, tempDir("acp-1268-install-"));
+
+/**
+ * The runner, with the installed bundle replaced the moment a checked preparation returns: the package
+ * snapshot is already taken, so what the replacement can reach is whatever still reads the installed copy.
+ */
+const replacedAfterPrepare = (runner: ReturnType<typeof commitloreRunner>, replace: () => void): CommitLoreRunner =>
+  Object.assign((...args: Parameters<CommitLoreRunner>) => runner(...args), {
+    prepare: async (...args: Parameters<typeof runner.prepare>) => {
+      const prepared = await runner.prepare(...args);
+      if (args[2].checked) replace();
+      return prepared;
+    },
+    configured: runner.configured,
+  });
 
 const makeRunner = (world: WorkerWorld, adapter: FakeWorkerAdapter, options: WorkerTurnOptions): WorkerTurnRunner =>
   new WorkerTurnRunner(
@@ -337,6 +355,20 @@ describe.skipIf(REAL === null)("#1268: a worker commit goes through CommitLore (
     expect((succeededEvidence(world)["commitlore"] as { outcome: string }).outcome).toBe("recorded");
   });
 
+  it("review r2 P1: a package swapped behind an unchanged wrapper after the checked preparation is never run; the commit runs the checked copy", async () => {
+    const world = requiredWorld();
+    const { wrapper, bundle } = installedCopy();
+    const marker = join(tempDir("acp-1268-swap-"), "ran");
+    // The wrapper is left as it is; its package is replaced the moment the checked copy is prepared.
+    const swapping = (): void =>
+      writeFileSync(bundle, `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "ran");\nprocess.exit(1);\n`);
+    const adapter = fakeFor(world, `${SAID}\n\n${draft([])}`);
+    const runner = replacedAfterPrepare(commitloreRunner(COMMITLORE_LIMITS, wrapper), swapping);
+    await runTurn(world, makeRunner(world, adapter, { commitlore: createCommitLoreCliPort(runner) }));
+
+    expect(existsSync(marker), "the swapped package ran").toBe(false);
+    expect(succeededEvidence(world)["commitlore"]).toEqual({ outcome: "empty", recordIds: [], nonce: null });
+  });
 });
 
 /** The first `git` on this process's PATH, as ACP's own git calls find it. */
