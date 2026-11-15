@@ -163,6 +163,7 @@ describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, wi
     const shell = readFileSync(join(f.dir, "state", "rotations", `${PROJECT}-${NEW}.sh`), "utf8");
     expect(shell).toContain("unset ACP_OPERATOR_TOKEN");
     expect(shell).toContain(`'--session-id' '${NEW}'`);
+    expect(shell).toContain(`'--messaging-socket-path' '${join(f.dir, "state", `cc-session-canonical-cto-${PROJECT}.sock`)}'`);
     expect(shell).toContain("previousHolderInFlight");
     expect(shell).not.toContain("operator-token-for-test");
     expect(running(f.old.pid!)).toBe(false);
