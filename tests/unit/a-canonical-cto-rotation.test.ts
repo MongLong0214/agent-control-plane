@@ -199,7 +199,9 @@ const world = async () => {
   const subscriber = startDaemonBuzzMentionSubscriber(harness.cp, dir, policy, ingress, {
     openSocket: relay.factory, scheduler: { setTimer: () => 0, clearTimer: () => undefined, nowSeconds: () => 1_900_000_000 },
   });
-  closers.push(async () => { subscriber.close(); await ingress.close(); });
+  let receiving = true;
+  const closeReception = async () => { if (receiving) { receiving = false; subscriber.close(); await ingress.close(); } };
+  closers.push(closeReception);
   const subId = await relay.subscribe(subscriber);
   const ceoSays = async (text: string): Promise<string> => {
     const before = db.get<{ n: number }>(`SELECT COALESCE(MAX(rowid), 0) AS n FROM outbox WHERE kind = ?`, [MessageKind.PEER_MESSAGE])!.n;
@@ -263,6 +265,7 @@ const world = async () => {
   return {
     harness, db, projectId, roleKey, registry, configured, oldSessionId, other, claimAs, rotate, take, ledger, holder,
     actorOf, target, status, audits, judge, ceoSays, otherProjectRows, cto, run, newPid: next.pid,
+    reception: () => ({ subscriber, ingress }), closeReception,
   };
 };
 type World = Awaited<ReturnType<typeof world>>;
@@ -336,12 +339,33 @@ describe("agentctl canonical-cto rotate: the §10.1 switchover of a canonical CT
       [binding.target_binding_id])).toEqual([{ binding_generation: 1 }, { binding_generation: 2 }]);
     expect(w.db.get(`SELECT from_session_uuid, to_session_uuid, claimed_binding_generation FROM canonical_entitlement_transfers WHERE transfer_id = ?`,
       [prepared.transferId])).toEqual({ from_session_uuid: OLD, to_session_uuid: NEW, claimed_binding_generation: 2 });
-    // The status read the launcher verifies against.
-    const read = canonicalCtoOperator(w.harness.cp, w.configured)("status", { projectId: w.projectId }, OWNER);
+    // The status read the launcher verifies against, reception read from the daemon's own subscriber and ingress.
+    const read = canonicalCtoOperator(w.harness.cp, w.configured, w.reception)("status", { projectId: w.projectId }, OWNER);
     expect(read.allowed && read.value).toMatchObject({
       holderSessionUuid: NEW, generation: 2, binding: { generation: 2, sessionId: incoming.sessionId },
-      buzz: { verdict: "ADMITTED", sessionId: incoming.sessionId }, rotations: [{ transferId: prepared.transferId, state: "ACKED", handoffId: handoff.handoff_id }],
+      buzz: { verdict: "ADMITTED", sessionId: incoming.sessionId, reception: { subscriber: { connected: true, liveness: "LIVE" }, ingress: { listening: true } } },
+      rotations: [{ transferId: prepared.transferId, state: "ACKED", handoffId: handoff.handoff_id }],
     });
+  });
+
+  it("Buzz reception is read from the live subscriber connection and ingress, never from registry eligibility alone", async () => {
+    const w = await world();
+    const prepared = pending(w.rotate(NEW, 1));
+    const incoming = claimed(await w.claimAs(NEW, prepared.toGeneration, w.newPid));
+    const read = () => {
+      const now = canonicalCtoOperator(w.harness.cp, w.configured, w.reception)("status", { projectId: w.projectId }, OWNER);
+      if (!now.allowed) throw new Error(JSON.stringify(now));
+      return now.value as { buzz: { verdict: string; sessionId: string; reception: unknown } };
+    };
+    expect(read().buzz).toMatchObject({ verdict: "ADMITTED", sessionId: incoming.sessionId,
+      reception: { subscriber: { connected: true, liveness: "LIVE" }, ingress: { listening: true } } });
+    // The subscriber and the ingress close: the registry still judges the holder ADMITTED, and reception says it is not.
+    await w.closeReception();
+    expect(read().buzz).toMatchObject({ verdict: "ADMITTED", sessionId: incoming.sessionId,
+      reception: { subscriber: { connected: false }, ingress: { listening: false } } });
+    // A daemon that wired no subscriber or ingress proves no reception either.
+    expect((canonicalCtoOperator(w.harness.cp, w.configured)("status", { projectId: w.projectId }, OWNER) as { value: { buzz: unknown } }).value.buzz)
+      .toMatchObject({ verdict: "ADMITTED", reception: { subscriber: { connected: false }, ingress: { listening: false } } });
   });
 
   it("concurrent rotate requests: one switchover per project is pending; the second request and a second claim are refused", async () => {

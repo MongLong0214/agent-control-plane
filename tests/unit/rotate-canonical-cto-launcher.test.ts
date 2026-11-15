@@ -27,7 +27,7 @@ const OLD = "58cac5c6-0000-4000-8000-0000000000c1";
 const NEW = "36276d16-0000-4000-8000-0000000000c2";
 const PROJECT = "launch-project";
 
-type Mode = "claims" | "never-claims" | "claims-deaf" | "owned-work";
+type Mode = "claims" | "never-claims" | "claims-deaf" | "claims-unreceived" | "owned-work";
 
 const stub = (path: string, body: string) => {
   writeFileSync(path, `#!/usr/bin/env node\nconst fs = require("node:fs");\n${body}\n`);
@@ -72,10 +72,14 @@ const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { retu
 if (process.argv[2] === "new-session") {
   fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(["observed", { oldAlive: alive(Number(process.env.TEST_OLD_PID)), childAlive: alive(Number(fs.readFileSync(${JSON.stringify(childPidFile)}, "utf8"))) }]) + "\\n");
   const m = ${mode};
-  if (m === "claims" || m === "claims-deaf") {
+  if (m === "claims" || m === "claims-deaf" || m === "claims-unreceived") {
     const s = JSON.parse(fs.readFileSync(${JSON.stringify(db)}, "utf8"));
+    // The registry's verdict, and beside it what the daemon's subscriber and ingress actually show.
+    const received = { subscriber: { connected: true, liveness: "LIVE", delivering: true }, ingress: { listening: true } };
+    const closed = { subscriber: { connected: false, liveness: "STALE", delivering: false }, ingress: { listening: false } };
     Object.assign(s, { holderSessionUuid: ${JSON.stringify(NEW)}, generation: 2, binding: { generation: 2, sessionId: "ses_new", lifecycle: "READY", liveRuns: [] },
-      buzz: m === "claims" ? { verdict: "ADMITTED", sessionId: "ses_new", generation: 2 } : { verdict: "EXCLUDED", reason: "NO_LIVE_SESSION" } });
+      buzz: m === "claims-deaf" ? { verdict: "EXCLUDED", reason: "NO_LIVE_SESSION" }
+        : { verdict: "ADMITTED", sessionId: "ses_new", generation: 2, reception: m === "claims" ? received : closed } });
     s.rotations[0].state = "ACKED"; fs.writeFileSync(${JSON.stringify(db)}, JSON.stringify(s));
   }
 }`);
@@ -177,6 +181,33 @@ describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, wi
     expect(f.steps(again.stdout).map((line) => line.step)).toEqual(["handoff", "stop", "start", "verify"]);
     expect(f.steps(again.stdout)[1]).toMatchObject({ step: "stop", alreadyGone: true });
     expect(rotatesTo(f.calls(), NEW)).toHaveLength(1);
+    expect(rotatesTo(f.calls(), OLD)).toEqual([]);
+  });
+
+  it("a resumed rotation re-checks the processes the earlier run was still waiting for: a child of the old process that outlived it keeps the successor from starting", async () => {
+    const f = await fixture("claims", 60_000);
+    expect((await f.launch(800)).code).toBe(4);
+    // The old process is gone and nothing names the old conversation, but its child is still running.
+    expect(running(f.old.pid!)).toBe(false);
+    expect(running(f.childPid)).toBe(true);
+    const again = await f.launch(800);
+    expect(again.code, again.stdout).toBe(4);
+    expect(f.steps(again.stdout).at(-1)).toMatchObject({ step: "stop", remaining: [f.childPid] });
+    expect(f.calls().some((call) => call[0] === "tmux")).toBe(false);
+    // Once it has exited, the same command resumes the switchover and starts the successor.
+    process.kill(f.childPid, "SIGKILL");
+    for (let i = 0; i < 100 && running(f.childPid); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+    const resumed = await f.launch(800);
+    expect(resumed.code, resumed.stdout).toBe(0);
+    expect(f.steps(resumed.stdout).map((line) => line.step)).toEqual(["handoff", "stop", "start", "verify"]);
+    expect(rotatesTo(f.calls(), NEW)).toHaveLength(1);
+  });
+
+  it("claimed and judged ADMITTED, but the subscriber and ingress show no reception: verification fails and success is never reported", async () => {
+    const f = await fixture("claims-unreceived", 0);
+    const result = await f.launch();
+    expect(result.code, result.stdout).toBe(3);
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "verify", buzz: { verdict: "ADMITTED", reception: { subscriber: { connected: false } } } });
     expect(rotatesTo(f.calls(), OLD)).toEqual([]);
   });
 

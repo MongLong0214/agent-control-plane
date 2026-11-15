@@ -8,9 +8,11 @@
 //   boundary -> `agentctl canonical-cto status`: the old binding drains and owns no live run
 //   stop     -> SIGTERM to the old claude process only, then its exit AND the exit of every process of its tree (its
 //               children and theirs, and the members of any process group one of them leads) is confirmed from the
-//               process table; nothing else is signalled
+//               process table; nothing else is signalled. The processes still awaited (pid and start time) are kept
+//               in rotations/<project>-<uuid>.stop.json, so a resumed run awaits exactly them again
 //   start    -> only then `claude --session-id <new>` in tmux, its acp-cto relay claiming generation n + 1 (the ack)
-//   verify   -> `agentctl canonical-cto status` until the new session holds n + 1 and Buzz delivers to it
+//   verify   -> the new session holds n + 1, and the daemon's own Buzz subscriber connection for its identity is
+//               live and delivering to it and the ingress is listening (registry eligibility alone proves nothing)
 //
 // Owned work at the boundary, or an old process tree whose exit is not confirmed in time: the new conversation is
 // never started (exit 4). Nothing ever goes back to the old conversation or its generation: a new conversation that
@@ -20,7 +22,7 @@
 // left as it is (exit 3). Going back is a new forward rotation from the new holder. Secrets are never printed; the new
 // session's shell unsets them.
 import { execFileSync } from 'node:child_process';
-import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -77,10 +79,15 @@ const processTree = (seeds) => {
   const tracked = new Map();
   const groups = new Set();
   const self = new Set([process.pid, process.ppid]);
-  return () => {
+  const refresh = () => {
     const rows = processTable();
     const byPid = new Map(rows.map((row) => [row.pid, row]));
-    for (const seed of seeds.splice(0)) { const row = byPid.get(seed); if (row) tracked.set(row.pid, row.start); }
+    // A seed is a pid, or a pid with the start time it was recorded at, which must still be the one running.
+    for (const seed of seeds.splice(0)) {
+      const { pid, start } = typeof seed === 'number' ? { pid: seed, start: null } : seed;
+      const row = byPid.get(pid);
+      if (row && (start === null || row.start === start)) tracked.set(row.pid, row.start);
+    }
     for (const [pid, start] of tracked) if (byPid.get(pid)?.start !== start) tracked.delete(pid);
     for (let grew = true; grew;) {
       grew = false;
@@ -92,12 +99,16 @@ const processTree = (seeds) => {
     }
     return [...tracked.keys()].sort((a, b) => a - b);
   };
+  /** The processes still awaited, by pid and start time: what a later run must find exited. */
+  refresh.identities = () => [...tracked].map(([pid, start]) => ({ pid, start })).sort((a, b) => a.pid - b.pid);
+  return refresh;
 };
 /** Waits for every process of `refresh`'s tree to have exited; the ones still running at the deadline, or none. */
-const exitOf = async (refresh, deadlineMs) => {
+const exitOf = async (refresh, deadlineMs, observed = () => {}) => {
   const deadline = Date.now() + deadlineMs;
   let remaining = refresh();
-  while (remaining.length > 0 && Date.now() < deadline) { await sleep(Math.min(pollMs, 100)); remaining = refresh(); }
+  observed();
+  while (remaining.length > 0 && Date.now() < deadline) { await sleep(Math.min(pollMs, 100)); remaining = refresh(); observed(); }
   return remaining;
 };
 
@@ -157,23 +168,46 @@ if (!binding || binding.generation !== expected || binding.lifecycle !== 'DRAINI
     binding: binding ?? null, liveRuns: binding?.liveRuns ?? null });
 }
 
-// stop — SIGTERM to the old claude process only; then its whole tree's exit, from the process table.
-if (oldRow) {
-  const refresh = processTree([oldRow.pid]);
-  refresh();
-  try { process.kill(oldRow.pid, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') stop(4, 'stop', { refused: 'the old claude process could not be signalled', oldPid }); }
-  const remaining = await exitOf(refresh, stopTimeoutMs);
-  if (remaining.length > 0) {
-    stop(4, 'stop', { refused: 'the old conversation\'s processes did not all exit; the new conversation was not started and nothing else was signalled',
-      oldPid, remaining });
-  }
-  report('stop', { oldPid, stopped: true });
-} else {
-  // Resumed after an earlier run stopped it: nothing may still name the old conversation.
-  const named = processTable().filter((row) => namesConversation(row.command, old)).map((row) => row.pid);
-  if (named.length > 0) stop(4, 'stop', { refused: 'a process still names the old conversation; the new conversation was not started', remaining: named });
-  report('stop', { oldPid, alreadyGone: true });
+// stop — SIGTERM to the old claude process only; then its whole tree's exit, from the process table. What is still
+// awaited is written down as it changes, before the signal too, so a run that stops early (a timeout, a crash) leaves
+// a resumed run exactly the processes whose exit it must still establish. A resumed run whose old process is gone and
+// that finds no such record cannot establish that exit, so it refuses.
+const stopRecord = join(dir, `${project}-${to}.stop.json`);
+const recorded = (() => {
+  try {
+    const value = JSON.parse(readFileSync(stopRecord, 'utf8'));
+    return value.from === old && value.fromGeneration === expected && Array.isArray(value.outstanding) &&
+      value.outstanding.every((one) => Number.isSafeInteger(one?.pid) && typeof one.start === 'string') ? value : null;
+  } catch { return null; }
+})();
+if (!oldRow && recorded === null) {
+  stop(4, 'stop', { refused: 'no record of the earlier run\'s stop: the exit of the old conversation\'s processes cannot be established; the new conversation was not started' });
 }
+const refresh = processTree([...(oldRow ? [{ pid: oldRow.pid, start: oldRow.start }] : []), ...(recorded?.outstanding ?? [])]);
+let written = null;
+const keep = () => {
+  const outstanding = refresh.identities();
+  const body = JSON.stringify({ project, from: old, to, fromGeneration: expected, oldPid, outstanding, exited: outstanding.length === 0 });
+  if (body === written) return;
+  const tmp = `${stopRecord}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${body}\n`, { mode: 0o600 });
+  renameSync(tmp, stopRecord);
+  written = body;
+};
+refresh();
+keep();
+if (oldRow) {
+  try { process.kill(oldRow.pid, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') stop(4, 'stop', { refused: 'the old claude process could not be signalled', oldPid }); }
+}
+const remaining = await exitOf(refresh, stopTimeoutMs, keep);
+if (remaining.length > 0) {
+  stop(4, 'stop', { refused: 'the old conversation\'s processes did not all exit; the new conversation was not started and nothing else was signalled',
+    oldPid, remaining });
+}
+// Nothing may still name the old conversation either, tracked or not.
+const named = processTable().filter((row) => namesConversation(row.command, old)).map((row) => row.pid);
+if (named.length > 0) stop(4, 'stop', { refused: 'a process still names the old conversation; the new conversation was not started', remaining: named });
+report('stop', oldRow ? { oldPid, stopped: true } : { oldPid, alreadyGone: true });
 
 // start — the project's local acp-cto entry names the new conversation and the issued generation. It is never
 // restored to the old conversation: the switchover record names the new one, and nothing goes back.
@@ -218,19 +252,26 @@ try {
   await fenceNew(`start failed: ${error.code ?? error.status ?? 'error'}`);
 }
 
-// verify — attach (the new session holds the issued generation) and Buzz receive (the subscriber delivers to it).
+// verify — attach (the new session holds the issued generation) and Buzz receive: the registry's verdict, and the
+// daemon's own receivers for the holder's identity — its subscriber connection authenticated and subscribed on a
+// live socket, LIVE, delivering to the holder's role — and the ingress listening. Closed reception is not verified.
+const received = (seenNow) => {
+  const buzz = seenNow.buzz;
+  return buzz?.verdict === 'ADMITTED' && buzz.sessionId === seenNow.binding?.sessionId &&
+    buzz.reception?.subscriber?.connected === true && buzz.reception.subscriber.liveness === 'LIVE' &&
+    buzz.reception.subscriber.delivering === true && buzz.reception.ingress?.listening === true;
+};
 const deadline = Date.now() + timeoutMs;
 let seen = null;
 while (Date.now() < deadline) {
   const now = status();
   seen = now.ok ? now.value : seen;
-  if (seen && seen.holderSessionUuid === to && seen.binding?.generation === issued &&
-      seen.buzz?.verdict === 'ADMITTED' && seen.buzz.sessionId === seen.binding.sessionId) break;
+  if (seen && seen.holderSessionUuid === to && seen.binding?.generation === issued && received(seen)) break;
   await sleep(pollMs);
 }
 if (!seen || seen.holderSessionUuid !== to) await fenceNew('the new conversation did not claim before the deadline');
-if (seen.binding?.generation !== issued || seen.buzz?.verdict !== 'ADMITTED') {
+if (seen.binding?.generation !== issued || !received(seen)) {
   stop(3, 'verify', { refused: 'the new conversation holds the role but is not verified', binding: seen.binding ?? null, buzz: seen.buzz ?? null,
     note: 'it may already have acted: nothing was rolled back' });
 }
-stop(0, 'verify', { session: seen.binding.sessionId, generation: issued, buzz: seen.buzz.verdict });
+stop(0, 'verify', { session: seen.binding.sessionId, generation: issued, buzz: seen.buzz.verdict, reception: seen.buzz.reception });

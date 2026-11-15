@@ -803,6 +803,8 @@ export interface LocalTelegramExternalIngress {
 /** A daemon-owned local hop from the authenticated Buzz relay to the CEO conversation port. */
 export interface LocalBuzzMessageIngress {
   socketPath: string;
+  /** Whether the ingress socket is accepting connections now: its server's own state, false once closed. */
+  readonly listening: boolean;
   /**
    * The exact admission seam this socket serves (#760 Part C).
    *
@@ -2004,6 +2006,7 @@ export const startBuzzMessageIngressListener = async (
   return {
     socketPath,
     seam,
+    get listening() { return server.listening; },
     close: async () => {
       await closeSocketServer(server);
       try {
@@ -3244,15 +3247,26 @@ export const ownerOnlyCanonicalCtoOperator = (
     ? operator(method, params, operatorActor)
     : deny(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED, "canonical CTO rotation requires an allowlisted CLI owner", {});
 
+/** The daemon's running Buzz receivers, read when asked: either is null until it starts and stays as it was once closed. */
+export type CanonicalCtoReception = () => {
+  subscriber: Pick<BuzzMentionSubscriberHandle, "replies" | "counters" | "deliveryEligibility"> | null;
+  ingress: Pick<LocalBuzzMessageIngress, "listening"> | null;
+};
+
 /**
  * v58 — the owner's canonical CTO switchover (`CtoLifecycle.prepareCanonicalSwitchover`) and its read-back: the project's canonical
  * conversation and generation, its ACTIVE binding, its rotations, and whether the Buzz mention subscriber would
  * deliver to that binding's session now (`judgeBuzzMentionIdentity`, the same judgement the subscriber asks before
- * every delivery). The launcher verifies attach and Buzz receive from this read, never from a row it guesses.
+ * every delivery). That verdict is registry eligibility only, so `buzz.reception` reads beside it what the daemon's
+ * own receivers show for the holder's Buzz identity: whether its subscriber connection is authenticated and
+ * subscribed on a live socket, its liveness, whether it would deliver to the holder's role, and whether the ingress
+ * socket is listening. A daemon that wired none proves no reception. The launcher verifies attach and Buzz receive
+ * from this read, never from a row it guesses.
  */
 export const canonicalCtoOperator = (
   cp: ControlPlane,
   canonicalSessions: readonly CanonicalAdoptableSession[] | null,
+  reception: CanonicalCtoReception = () => ({ subscriber: null, ingress: null }),
 ): CanonicalCtoOperator => (method, params, actor) => {
   const projectId = params["projectId"];
   if (typeof projectId !== "string" || projectId.length === 0) {
@@ -3276,6 +3290,16 @@ export const canonicalCtoOperator = (
   const binding = cp.bindings.activePrimaryCto(projectId);
   const judged = holder === null ? null
     : judgeBuzzMentionIdentity(cp, canonicalSessions === null ? null : { sessions: canonicalSessions }, holder.buzzActorId).judgement;
+  const receivers = reception();
+  const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+  const heard = holder === null ? null : {
+    subscriber: {
+      connected: receivers.subscriber?.replies.ready(holder.buzzActorId) ?? false,
+      liveness: receivers.subscriber?.counters().liveness?.identities.find((one) => one.identityPubkey === holder.buzzActorId)?.state ?? null,
+      delivering: receivers.subscriber?.deliveryEligibility({ actorId: holder.buzzActorId, roleKey })?.eligible ?? false,
+    },
+    ingress: { listening: receivers.ingress?.listening ?? false },
+  };
   return allow(ReasonCode.OK, {
     projectId,
     holderSessionUuid: holder?.sessionUuid ?? null,
@@ -3285,8 +3309,8 @@ export const canonicalCtoOperator = (
     binding: binding === null ? null : { generation: binding.bindingGeneration, sessionId: binding.sessionId,
       lifecycle: cp.sessions.get(binding.sessionId)?.lifecycle ?? null, liveRuns: liveRunIdsOwnedBySession(cp.db, binding.sessionId) },
     buzz: judged === null ? null : judged.verdict === "ADMITTED"
-      ? { verdict: judged.verdict, sessionId: judged.binding.sessionId, generation: judged.binding.bindingGeneration }
-      : { verdict: judged.verdict, reason: judged.reason },
+      ? { verdict: judged.verdict, sessionId: judged.binding.sessionId, generation: judged.binding.bindingGeneration, reception: heard }
+      : { verdict: judged.verdict, reason: judged.reason, reception: heard },
     rotations: canonicalCtoRotations(cp.db, projectId).slice(0, 5),
   });
 };
@@ -6644,7 +6668,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         mcpToken,
         bootstrapHermes: (params) => hermesBootstrap!.bootstrap(params),
         ...(adoptHermesIncumbent ? { adoptHermesIncumbent } : {}),
-        canonicalCto: canonicalCtoOperator(cp, canonicalSessions),
+        canonicalCto: canonicalCtoOperator(cp, canonicalSessions, () => ({ subscriber: buzzMentionSubscriber, ingress: buzzMessageIngress })),
       },
     );
     if (canonicalSessions === null) {
