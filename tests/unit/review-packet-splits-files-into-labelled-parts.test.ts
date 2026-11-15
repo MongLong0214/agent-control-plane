@@ -326,7 +326,7 @@ describe("witness 5: the run's output and config text get room before receipts t
   interface Rendered {
     verificationCommands: { commands: Array<{ configFiles: Array<{ content: string; truncated: boolean }> }> };
     officialResults: { results: Array<{ stdout: string; truncated: boolean }> };
-    receipts: { total: number; listed: number; notListed: Record<string, number>; receipts: ReceiptEvidence[]; diffDigests: Array<{ executionId: string }> };
+    receipts: { total: number; listed: number; notListed: Record<string, number>; digestDetail: { listed: number; notListed: number }; receipts: ReceiptEvidence[]; diffDigests: Array<{ executionId: string }> };
     cutForSize: boolean;
   }
   const render = (input: ExecutionEvidence): { doc: Rendered; text: string; used: number } => {
@@ -334,17 +334,18 @@ describe("witness 5: the run's output and config text get room before receipts t
     const text = section.lines.join("\n");
     return { doc: JSON.parse(text.split("```json\n")[1]!.split("\n```")[0]!) as Rendered, text, used: section.used };
   };
-  /** Listed and total counts exact, linked receipts first, and every receipt not listed counted in notListed. */
+  /** #1410: every receipt has its row; the full digests are listed linked first, and those not listed are counted in digestDetail. */
   const expectHonestReceipts = (doc: Rendered, listedAtLeast: number): void => {
     expect(doc.receipts.total).toBe(26);
-    expect(doc.receipts.listed).toBe(doc.receipts.receipts.length);
+    expect(doc.receipts.listed).toBe(26);
+    expect(doc.receipts.digestDetail.listed).toBe(doc.receipts.receipts.length);
     expect(doc.receipts.diffDigests.map((entry) => entry.executionId)).toEqual(doc.receipts.receipts.map((entry) => entry.executionId));
-    expect(doc.receipts.listed).toBeGreaterThanOrEqual(listedAtLeast);
-    expect(doc.receipts.listed).toBeLessThan(26);
+    expect(doc.receipts.digestDetail.listed).toBeGreaterThanOrEqual(listedAtLeast);
+    expect(doc.receipts.digestDetail.listed).toBeLessThan(26);
     expect(doc.receipts.receipts.slice(0, 2).map((entry) => [entry.executionId, entry.linked])).toEqual([["exec_0000", true], ["exec_0001", true]]);
     expect(doc.receipts.receipts.slice(2).every((entry) => !entry.linked)).toBe(true);
-    expect(doc.receipts.notListed["overCharBudget"]).toBe(doc.receipts.total - doc.receipts.listed);
-    expect(doc.cutForSize).toBe(true);
+    expect(doc.receipts.digestDetail.notListed).toBe(doc.receipts.total - doc.receipts.digestDetail.listed);
+    expect(doc.receipts.notListed["overCharBudget"]).toBeUndefined();
   };
 
   it("keeps a 13K npm test stdout and the root package.json whole beside 24 unlinked receipts, listing what fits after them", () => {
@@ -355,7 +356,9 @@ describe("witness 5: the run's output and config text get room before receipts t
     expect(doc.verificationCommands.commands[0]!.configFiles[0]).toMatchObject({ content: ROOT_PACKAGE_JSON, truncated: false });
     // Some unlinked receipts still fit after the texts; the rest are counted, never dropped silently.
     expectHonestReceipts(doc, 3);
-    expect(text).toContain("This execution evidence is incomplete: it was cut for size.");
+    // #1410: the text is whole and every receipt has its row, so omitting some digests is not a cut of the evidence.
+    expect(doc.cutForSize).toBe(false);
+    expect(text).not.toContain("This execution evidence is incomplete: it was cut for size.");
   });
 
   it("cuts an output too long for the room only by its head-and-tail rule, marked, and counts every receipt it leaves out", () => {

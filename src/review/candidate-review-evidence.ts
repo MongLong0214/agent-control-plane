@@ -36,40 +36,125 @@ export const readTrackedTree = async (
     truncated: paths.length > TREE_ENTRY_LIMIT, paths: paths.slice(0, TREE_ENTRY_LIMIT) };
 };
 
-interface TaskEvidence { taskId: string; category: string; state: string; workerBindingCount: number; activeWorkerBindingCount: number }
+interface TaskEvidence {
+  taskId: string; category: string; state: string; workerBindingCount: number; activeWorkerBindingCount: number;
+  /** The tasks this one waits for, by task id; absent when it waits for none. */
+  dependsOn?: string[];
+  /** The PLAN's work unit that holds this task; absent when the run declares none or none names this task. */
+  workUnit?: string;
+}
 
 /**
  * #1166 r2 — a run can hold hundreds of superseded tasks, so the per-task list has its own
  * serialized budget. The summary is computed over every task and is never cut.
+ *
+ * #1410 — the budget applies only to CANCELLED (superseded) tasks. Every other task is delegation
+ * evidence and always has its row, whatever the budget: a cut there made a 42-task run unreviewable.
  */
 export const TASK_CHAR_BUDGET = 16_000;
 
+/** The kind `WorkScopeTracking` records when a PLAN's work units are approved (`src/run/work-scope-tracking.ts`). */
+const WORK_SCOPE_APPROVED_KIND = "WORK_SCOPE_APPROVED";
+
+/** What the run's PLAN says of its work units, with every task reference resolved to a task id where it can be. */
+interface WorkUnits {
+  declared: number;
+  byTask: Map<string, string>;
+  /** References no task of the run could be matched to, by either its id or its PLAN key. */
+  unresolvedRefs: string[];
+}
+
+/**
+ * The work unit of each task, from the run's current PLAN (`workUnits[].tasks`) and its approval, which holds the
+ * same units with the submission's keys already resolved to ids. A unit lists its tasks by id or by PLAN key; a
+ * key is matched to the task whose title it is, the rule a dependency on an earlier submission's task uses
+ * (`TaskGraph.submit`), and to nothing when two tasks share that title. A reference no task answers is
+ * named in `unresolvedRefs` rather than dropped.
+ */
+export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_id: string; title: string }>): WorkUnits => {
+  const none: WorkUnits = { declared: 0, byTask: new Map(), unresolvedRefs: [] };
+  const plan = db.get<{ digest: string; content_json: string }>(
+    `SELECT digest, content_json FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN' AND superseded = 0
+      ORDER BY created_at DESC, rowid DESC LIMIT 1`, [runId]);
+  if (plan === undefined) return none;
+  const units = new Map<string, Set<string>>();
+  const add = (unit: unknown, refs: unknown): void => {
+    if (typeof unit !== "string" || !Array.isArray(refs)) return;
+    const held = units.get(unit) ?? new Set<string>();
+    for (const ref of refs) if (typeof ref === "string") held.add(ref);
+    units.set(unit, held);
+  };
+  try {
+    const content: unknown = JSON.parse(plan.content_json);
+    const declared = isRecord(content) ? content["workUnits"] : undefined;
+    if (Array.isArray(declared)) for (const unit of declared) if (isRecord(unit)) add(unit["key"], unit["tasks"]);
+    const approval = db.get<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id DESC LIMIT 1`, [WORK_SCOPE_APPROVED_KIND, runId]);
+    const approved: unknown = approval === undefined ? undefined : JSON.parse(approval.evidence_json);
+    if (isRecord(approved) && approved["planDigest"] === plan.digest && Array.isArray(approved["units"])) {
+      for (const unit of approved["units"]) if (isRecord(unit)) add(unit["unit"], unit["taskIds"]);
+    }
+  } catch { return none; }
+  const ids = new Set(tasks.map((task) => task.task_id));
+  const byTitle = new Map<string, string[]>();
+  for (const task of tasks) byTitle.set(task.title, [...(byTitle.get(task.title) ?? []), task.task_id]);
+  const byTask = new Map<string, string>();
+  const unresolvedRefs: string[] = [];
+  for (const [unit, refs] of [...units.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    for (const ref of [...refs].sort()) {
+      const titled = byTitle.get(ref);
+      const taskId = ids.has(ref) ? ref : titled?.length === 1 ? titled[0]! : null;
+      if (taskId === null) { unresolvedRefs.push(`${unit}:${ref}`); continue; }
+      if (!byTask.has(taskId)) byTask.set(taskId, unit);
+    }
+  }
+  return { declared: units.size, byTask, unresolvedRefs };
+};
+
 const taskEvidence = (db: Db, runId: string, budget: number) => {
   // task_id is globally unique; legacy task-scoped bindings may have NULL run_id.
-  // Tasks that ever had a WORKER binding come first, so a cut drops unexecuted work first.
-  const all = db.all<TaskEvidence>(
-    `SELECT t.task_id AS taskId, t.category, t.state,
+  // Live tasks come first and are always listed. Among the rest, those that ever had a WORKER binding
+  // come first, so a cut drops unexecuted superseded work first.
+  const rows = db.all<TaskEvidence & { title: string }>(
+    `SELECT t.task_id AS taskId, t.title, t.category, t.state,
             (SELECT COUNT(*) FROM assignments a
               WHERE a.task_id = t.task_id AND a.role = 'WORKER') AS workerBindingCount,
             (SELECT COUNT(*) FROM assignments a
               WHERE a.task_id = t.task_id AND a.role = 'WORKER' AND a.status = 'ACTIVE') AS activeWorkerBindingCount
-       FROM tasks t WHERE t.run_id = ? ORDER BY workerBindingCount > 0 DESC, t.task_id`, [runId]);
+       FROM tasks t WHERE t.run_id = ? ORDER BY t.state = 'CANCELLED', workerBindingCount > 0 DESC, t.task_id`, [runId]);
+  const dependencies = new Map<string, string[]>();
+  for (const edge of db.all<{ task_id: string; depends_on: string }>(
+    `SELECT d.task_id, d.depends_on FROM task_dependencies d JOIN tasks t ON t.task_id = d.task_id
+      WHERE t.run_id = ? ORDER BY d.task_id, d.depends_on`, [runId])) {
+    dependencies.set(edge.task_id, [...(dependencies.get(edge.task_id) ?? []), edge.depends_on]);
+  }
+  const units = workUnitsOf(db, runId, rows.map((row) => ({ task_id: row.taskId, title: row.title })));
+  const all: TaskEvidence[] = rows.map(({ title: _title, ...task }) => {
+    const dependsOn = dependencies.get(task.taskId);
+    const workUnit = units.byTask.get(task.taskId);
+    return { ...task, ...(dependsOn === undefined ? {} : { dependsOn }), ...(workUnit === undefined ? {} : { workUnit }) };
+  });
   const tasks: TaskEvidence[] = [];
   let used = 0;
   for (const task of all) {
     // Rendered two levels deep in the pretty-printed packet: brace indentation and separator included.
     const cost = JSON.stringify(task, null, 6).length + 12;
-    if (used + cost > budget) break;
+    if (task.state === "CANCELLED" && used + cost > budget) break;
     used += cost;
     tasks.push(task);
   }
   const byState: Record<string, number> = {};
   for (const task of all) byState[task.state] = (byState[task.state] ?? 0) + 1;
+  const unlisted = all.length - tasks.length;
   const taskSummary = {
     total: all.length, byState,
     workerBindingCount: all.reduce((sum, task) => sum + task.workerBindingCount, 0),
     activeWorkerBindingCount: all.reduce((sum, task) => sum + task.activeWorkerBindingCount, 0),
-    listed: tasks.length, truncated: tasks.length < all.length,
+    listed: tasks.length, truncated: unlisted > 0,
+    // Only superseded work is ever unlisted.
+    ...(unlisted > 0 ? { unlisted: { CANCELLED: unlisted } } : {}),
+    ...(units.declared > 0 ? { workUnits: { declared: units.declared, tasksInAUnit: units.byTask.size,
+      ...(units.unresolvedRefs.length > 0 ? { unresolvedRefs: units.unresolvedRefs } : {}) } } : {}),
   };
   return { taskSummary, tasks };
 };
@@ -165,8 +250,6 @@ const budgetTrees = (trees: readonly TrackedTreeEvidence[], budget: number) => {
 export const CONFIG_FILE_CHAR_LIMIT = 8_000;
 /** The packet's share for the execution evidence, before the tree and task listings. */
 export const EXECUTION_EVIDENCE_CHAR_BUDGET = 24_000;
-/** Receipts beyond this many are counted, not listed. */
-const RECEIPT_LIST_LIMIT = 40;
 /** A receipt's diffDigest is recomputed from at most this many changed paths. */
 const RECEIPT_RECOMPUTE_PATH_LIMIT = 500;
 /** At most this many ancestry reads per review. */
@@ -268,6 +351,24 @@ export interface ReceiptEvidence {
   recomputedDiffDigest?: string | null;
   linked: boolean;
   mismatches: string[];
+  /** The worker session the execution ran under (task_executions.worker_session_id). */
+  workerSessionId?: string;
+  /** The PLAN work unit that holds the receipt's task, when the run declares units and one names it. */
+  workUnit?: string;
+  /** What linkage compared, each as a boolean; null when it was not computed. Absent on a receipt no linkage was run for. */
+  checks?: ReceiptChecks;
+}
+
+/** The comparisons a receipt's linkage rests on, as booleans in place of the digests themselves. */
+export interface ReceiptChecks {
+  /** The success record names this execution's task. */
+  namesTask: boolean | null;
+  /** Some success record of the execution reproduces its resultDigest. */
+  resultReproduced: boolean;
+  commitIsCandidateHead: boolean;
+  baseIsSnapshotBase: boolean;
+  /** The receipt's diffDigest equals the frozen change recomputed in the receipt's form; null when it was not recomputed. */
+  diffDigestAgrees: boolean | null;
 }
 
 export interface ExecutionEvidence {
@@ -276,7 +377,7 @@ export interface ExecutionEvidence {
   results: OutputEvidence[];
   repositories: Array<{ repository: string; baseHead: string; candidateHead: string; linkedExecutionIds: string[] }>;
   receipts: ReceiptEvidence[];
-  /** Receipts not listed, by why. */
+  /** Receipts not listed, by why. `overListLimit` is kept for its readers and is always 0: no receipt is dropped for count. */
   receiptsNotListed: { outsideCandidateHistory: number; notACandidateRepository: number; noCommitReceipt: number; overListLimit: number; unchecked: number };
   /** The repositories whose frozen snapshot entry holds an `integration` record, with its number of task rows. */
   integration?: Array<{ repository: string; tasks: number }>;
@@ -604,8 +705,8 @@ const reproducesResult = (resultDigest: string | null, e: Record<string, unknown
  * this candidate's head or an ancestor of it is listed with what disagrees; the rest are counted.
  */
 const receiptEvidence = async (db: Db, input: ExecutionEvidenceInput): Promise<Pick<ExecutionEvidence, "repositories" | "receipts" | "receiptsNotListed">> => {
-  const executions = db.all<{ execution_id: string; task_id: string; status: string; result_digest: string | null; identity: string | null }>(
-    `SELECT e.execution_id, e.task_id, e.status, e.result_digest, r.identity
+  const executions = db.all<{ execution_id: string; task_id: string; status: string; result_digest: string | null; identity: string | null; worker_session_id: string }>(
+    `SELECT e.execution_id, e.task_id, e.status, e.result_digest, e.worker_session_id, r.identity
        FROM task_executions e
        JOIN tasks t ON t.task_id = e.task_id AND t.run_id = e.run_id
        LEFT JOIN repositories r ON r.repository_id = e.repository_id
@@ -623,6 +724,8 @@ const receiptEvidence = async (db: Db, input: ExecutionEvidenceInput): Promise<P
     events.set(evidence["executionId"], list);
   }
   const candidateHeads = new Set(input.snapshot.repositories.map((repo) => repo.candidateHead));
+  const unitOfTask = workUnitsOf(db, input.runId,
+    db.all<{ task_id: string; title: string }>(`SELECT task_id, title FROM tasks WHERE run_id = ?`, [input.runId])).byTask;
   const notListed = { outsideCandidateHistory: 0, notACandidateRepository: 0, noCommitReceipt: 0, overListLimit: 0, unchecked: 0 };
   const receipts: ReceiptEvidence[] = [];
   let ancestryChecks = 0;
@@ -648,7 +751,8 @@ const receiptEvidence = async (db: Db, input: ExecutionEvidenceInput): Promise<P
       runId: input.runId, taskId: execution.task_id, executionId: execution.execution_id, status: execution.status,
       repository: repo.identity, baseHead: stringOrNull(record?.evidence["head"]), commitHead,
       diffDigest: stringOrNull(record?.evidence["diffDigest"]), snapshotDiffDigest: repo.diffDigest, recomputedDiffDigest: null,
-      linked: false, mismatches: [],
+      linked: false, mismatches: [], workerSessionId: execution.worker_session_id,
+      ...(unitOfTask.get(execution.task_id) === undefined ? {} : { workUnit: unitOfTask.get(execution.task_id)! }),
     };
     const checkout = input.checkoutOf(repo.identity);
     if (commitHead !== repo.candidateHead) {
@@ -662,6 +766,13 @@ const receiptEvidence = async (db: Db, input: ExecutionEvidenceInput): Promise<P
       if (ancestry.exitCode === 1) notListed.outsideCandidateHistory += 1;
       else if (ancestry.exitCode !== 0) notListed.unchecked += 1;
       else {
+        receipt.checks = {
+          namesTask: record === null ? null : record.evidence["taskId"] === execution.task_id,
+          resultReproduced: reproducing !== undefined,
+          commitIsCandidateHead: false,
+          baseIsSnapshotBase: receipt.baseHead === repo.baseHead,
+          diffDigestAgrees: null,
+        };
         receipt.mismatches.push("commitHead is an earlier commit in the candidate's history, not the candidate head; containment does not link a receipt");
         receipts.push(receipt);
       }
@@ -692,19 +803,25 @@ const receiptEvidence = async (db: Db, input: ExecutionEvidenceInput): Promise<P
       }
     }
     receipt.linked = mismatches.length === 0;
+    receipt.checks = {
+      namesTask: record === null ? null : record.evidence["taskId"] === execution.task_id,
+      resultReproduced: reproducing !== undefined,
+      commitIsCandidateHead: true,
+      baseIsSnapshotBase: receipt.baseHead === repo.baseHead,
+      diffDigestAgrees: receipt.recomputedDiffDigest === null || receipt.recomputedDiffDigest === undefined ? null : receipt.recomputedDiffDigest === receipt.diffDigest,
+    };
     receipts.push(receipt);
   }
   // Linked first, then the receipts for the head that disagree, then earlier commits.
   const rank = (receipt: ReceiptEvidence): number =>
     receipt.linked ? 0 : candidateHeads.has(receipt.commitHead ?? "") ? 1 : 2;
   receipts.sort((a, b) => rank(a) - rank(b));
-  notListed.overListLimit = Math.max(0, receipts.length - RECEIPT_LIST_LIMIT);
   const repositories = input.snapshot.repositories
     .filter((repo) => repo.touchedPaths.length > 0 || repo.baseHead !== repo.candidateHead)
     .map((repo) => ({ repository: repo.identity, baseHead: repo.baseHead, candidateHead: repo.candidateHead,
       linkedExecutionIds: receipts.filter((r) => r.linked && r.repository === repo.identity).map((r) => r.executionId) }))
     .sort((a, b) => Number(b.linkedExecutionIds.length > 0) - Number(a.linkedExecutionIds.length > 0));
-  return { repositories, receipts: receipts.slice(0, RECEIPT_LIST_LIMIT), receiptsNotListed: notListed };
+  return { repositories, receipts, receiptsNotListed: notListed };
 };
 
 /** Everything the execution section can show, read before any budget is applied. */
@@ -729,6 +846,7 @@ const EXECUTION_EVIDENCE_HEADER = [
   "Output: text matching a listed credential shape is replaced with [redacted], and a long stream keeps its head and tail. The shapes include any run of 60 or more base64 or hex characters, so a digest can be replaced as well as a secret: [redacted] is evidence of neither. When the sandbox capture was cut (captureTruncated), the trailing run of credential characters at the cut is withheld (boundaryFragmentWithheld). Output marked redacted, truncated or boundaryFragmentWithheld is incomplete. What it no longer shows stays unproven. NOT_RETAINED means no output was stored with the result, and none is shown; NOT_THIS_EXECUTION means stored output named another snapshot, contract, command or head, and it is omitted.",
   "Receipts: linked only when run, task and execution match the execution record, the recorded inputs reproduce its resultDigest, the commit is the candidate head, the base is the snapshot's baseHead, the paths equal the frozen change's paths between them, and the receipt's diffDigest equals recomputedReceiptFormDiffDigest. Being in the candidate's history links nothing; every disagreement is listed.",
   "Digests (receipts.diffDigests): two computations over a change, never compared with each other, so their values differ even for a correct candidate. snapshotGitPatchDiffDigest is the candidate snapshot manifest's diffDigest: sha256 of the git patch between baseHead and candidateHead. receiptDiffDigest is the receipt's diffDigest, in the worker receipt form: a digest over baseHead and each changed path with its mode and the sha256 of its committed bytes. recomputedReceiptFormDiffDigest is ACP's own computation of that receipt form from the frozen change; linkage compares receiptDiffDigest with it. When receiptDiffDigest and recomputedReceiptFormDiffDigest differ, the receipt is not linked and the disagreement is listed in its mismatches. null means it was not recomputed; the receipt's mismatches say what stopped it.",
+  "Receipt rows (the `jsonl` block after this JSON): one row for every task-execution receipt the run has; the rows are never shortened. A row names the execution, its task, its work unit when the PLAN declares units, the repository, the worker session, the status, whether the receipt is linked, the commit it records, and as booleans what linkage compared (checks): whether the receipt names its task, a success record reproduces the execution's result digest, the commit is the candidate head, the base is the snapshot's baseHead, and its diffDigest equals the recomputed receipt form (null when not recomputed). Every disagreement is in the row's mismatches. receipts.digestDetail lists the three full digests for as many receipts as fit; a receipt whose digests are not listed there is still fully described by its row, and that omission is not a cut of the evidence.",
 ];
 const EXECUTION_EVIDENCE_CUT =
   "This execution evidence is incomplete: it was cut for size. The listed and total counts and every truncated mark say what is missing; it establishes nothing about what is not shown.";
@@ -751,6 +869,16 @@ const streamsInParts = (evidence: ExecutionEvidence, selection: Selection): Outp
     return [{ repository: result.repositoryIdentity, commandId: result.commandId, exactHead: result.exactHead, stream,
       path: outputStreamPath(result.commandId, stream), text: full, captureTruncated: result.captureTruncated }];
   }));
+
+/** One receipt as the compact row the reviewer always gets: ids, linkage and booleans, never the three full digests. */
+export const receiptRow = (receipt: ReceiptEvidence): Record<string, unknown> => ({
+  executionId: receipt.executionId, taskId: receipt.taskId,
+  ...(receipt.workUnit === undefined ? {} : { workUnit: receipt.workUnit }),
+  repository: receipt.repository, workerSessionId: receipt.workerSessionId ?? null, status: receipt.status,
+  linked: receipt.linked, commitHead: receipt.commitHead,
+  ...(receipt.checks === undefined ? {} : { checks: receipt.checks }),
+  ...(receipt.mismatches.length === 0 ? {} : { mismatches: receipt.mismatches }),
+});
 
 const renderExecution = (evidence: ExecutionEvidence, selection: Selection): string[] => {
   const text = (key: string): string => selection.texts.get(key) ?? "";
@@ -783,9 +911,12 @@ const renderExecution = (evidence: ExecutionEvidence, selection: Selection): str
     receipts: {
       changedRepositories: evidence.repositories.length, repositoriesListed: selection.repositories,
       repositories: evidence.repositories.slice(0, selection.repositories),
-      total: evidence.receipts.length, listed: selection.receipts,
-      notListed: { ...evidence.receiptsNotListed, overCharBudget: evidence.receipts.length - selection.receipts },
-      receipts: receipts.map(({ snapshotDiffDigest: _snapshot, recomputedDiffDigest: _recomputed, ...receipt }) => receipt),
+      // Every receipt has its row (the jsonl block): total and listed are the rows, and are equal.
+      total: evidence.receipts.length, listed: evidence.receipts.length,
+      notListed: { ...evidence.receiptsNotListed },
+      // The full digests, for as many receipts as fit: not a cut of the receipts, which the rows carry whole.
+      digestDetail: { listed: selection.receipts, notListed: evidence.receipts.length - selection.receipts },
+      receipts: receipts.map(({ snapshotDiffDigest: _snapshot, recomputedDiffDigest: _recomputed, workerSessionId: _session, workUnit: _unit, checks: _checks, ...receipt }) => receipt),
       // The digests side by side under names that say what each is computed over (the Digests line).
       diffDigests: receipts.map((receipt) => ({
         executionId: receipt.executionId, repository: receipt.repository,
@@ -797,6 +928,7 @@ const renderExecution = (evidence: ExecutionEvidence, selection: Selection): str
   };
   const whole = evidence.results.some((result) => result.outputRecord === WHOLE_CAPTURE);
   return [...EXECUTION_EVIDENCE_HEADER, ...(whole ? [WHOLE_CAPTURE_STATEMENT] : []), "```json", JSON.stringify(doc, null, 2), "```",
+    "```jsonl", ...evidence.receipts.map((receipt) => JSON.stringify(receiptRow(receipt))), "```",
     ...(selection.cut ? [EXECUTION_EVIDENCE_CUT] : []), ""];
 };
 
@@ -832,11 +964,14 @@ export const executionEvidenceSection = (
   evidence: ExecutionEvidence,
   budget: number,
 ): { lines: string[]; used: number; inParts: OutputStreamDelivery[] } => {
-  const anything = evidence.commands.length + evidence.results.length + evidence.repositories.length + evidence.receipts.length > 0;
+  // The receipt rows are never cut, so receipts alone leave nothing to mark incomplete.
+  const anything = evidence.commands.length + evidence.results.length + evidence.repositories.length > 0;
   const selection: Selection = { commands: 0, results: 0, repositories: 0, receipts: 0, texts: new Map(), cut: anything };
   const bare = measure(renderExecution(evidence, selection));
   const fits = (): boolean => measure(renderExecution(evidence, selection)) - bare <= budget;
-  // Receipts are listed in order, linked first: the leading linked ones keep their place before the texts.
+  // The receipt rows are always there. The full digests of the receipts are listed in order, linked first: the
+  // leading linked ones, up to a quarter of the budget, keep their place before the texts, and the rest get what
+  // the texts leave. What the evidence says of a receipt is its row; the output and config text have no other form.
   const firstUnlinked = evidence.receipts.findIndex((receipt) => !receipt.linked);
   const linked = firstUnlinked === -1 ? evidence.receipts.length : firstUnlinked;
   const list = (field: "commands" | "results" | "repositories" | "receipts", total: number): void => {
@@ -846,7 +981,12 @@ export const executionEvidenceSection = (
     }
   };
   for (const [field, total] of [["commands", evidence.commands.length], ["results", evidence.results.length],
-    ["repositories", evidence.repositories.length], ["receipts", linked]] as const) list(field, total);
+    ["repositories", evidence.repositories.length]] as const) list(field, total);
+  const beforeDetail = measure(renderExecution(evidence, selection));
+  while (selection.receipts < linked) {
+    selection.receipts += 1;
+    if (!fits() || measure(renderExecution(evidence, selection)) - beforeDetail > budget / 4) { selection.receipts -= 1; break; }
+  }
   const texts: Array<{ key: string; full: string; keepTail: boolean }> = [
     ...evidence.results.slice(0, selection.results).flatMap((result, r) => [
       { key: `r${r}.out`, full: result.stdout, keepTail: true }, { key: `r${r}.err`, full: result.stderr, keepTail: true }]),
@@ -861,22 +1001,21 @@ export const executionEvidenceSection = (
     selection.texts.set(entry.key, kept);
     room -= JSON.stringify(kept).length - 2;
   }
-  // The receipts that are not linked get what the texts left.
+  // The remaining digests get what the texts left.
   list("receipts", evidence.receipts.length);
   const complete = selection.commands === evidence.commands.length && selection.results === evidence.results.length
-    && selection.repositories === evidence.repositories.length && selection.receipts === evidence.receipts.length
+    && selection.repositories === evidence.repositories.length
     && texts.every((entry) => selection.texts.get(entry.key) === entry.full);
   selection.cut = anything && !complete;
   // The allocation above is an estimate; the rendered section is what is charged, so trim until it fits.
   while (!fits()) {
-    selection.cut = anything;
     const longest = [...selection.texts.entries()].sort((a, b) => b[1].length - a[1].length)[0];
-    if (selection.receipts > linked) selection.receipts -= 1;
-    else if (longest && longest[1].length > 0) {
+    if (selection.receipts > 0) { selection.receipts -= 1; continue; }
+    selection.cut = anything;
+    if (longest && longest[1].length > 0) {
       const entry = texts.find((candidate) => candidate.key === longest[0])!;
       selection.texts.set(longest[0], cutText(entry.full, Math.floor((JSON.stringify(longest[1]).length - 2) / 2), entry.keepTail));
-    } else if (selection.receipts > 0) selection.receipts -= 1;
-    else if (selection.repositories > 0) selection.repositories -= 1;
+    } else if (selection.repositories > 0) selection.repositories -= 1;
     else if (selection.results > 0) selection.results -= 1;
     else if (selection.commands > 0) selection.commands -= 1;
     else break;
@@ -931,7 +1070,7 @@ export const candidateEvidenceSection = (
     ...(omitted === 0 ? [] : [`${omitted} of ${trees.length} participating repositories are omitted from this listing for size; it establishes nothing about their tracked trees.`]),
     "",
     "## Control-plane evidence",
-    "Read from canonical audit, task and assignment records. Worker counts include all recorded bindings, with active bindings counted separately. taskSummary counts every task in the run; when it says truncated, the task list is incomplete and cannot establish absence of unlisted tasks.",
+    "Read from canonical audit, task and assignment records. Worker counts include all recorded bindings, with active bindings counted separately. taskSummary counts every task in the run. Every task that is not CANCELLED is listed with its dependsOn and, when the PLAN declares work units, its workUnit; when taskSummary says truncated, the unlisted tasks are all CANCELLED (superseded), counted by state in byState, and the list cannot establish absence of them. workUnits.unresolvedRefs, when present, names unit references that no task of the run answers by id or by PLAN key.",
     "```json", JSON.stringify(controlPlaneEvidence(db, runId, Math.min(TASK_CHAR_BUDGET, rest - treeBudget)), null, 2), "```", "",
     ...(integration.length === 0 ? [] : integrationSection(integration)),
     ...executed.lines,

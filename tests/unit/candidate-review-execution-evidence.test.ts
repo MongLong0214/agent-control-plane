@@ -252,6 +252,12 @@ describe("an ordinary candidate review carries the official execution evidence",
       expect(byExecution.get(wrongBytes.executionId)!.mismatches).toEqual(["the receipt's diffDigest is not the frozen change's"]);
       expect(byExecution.get(wrongBase.executionId)!.mismatches).toEqual([`the receipt's base head is not the snapshot's baseHead ${baseHead}`]);
       expect(byExecution.get(unreproduced.executionId)!.mismatches).toEqual(["no success record of this execution reproduces its resultDigest"]);
+      // #1410: each receipt also carries its worker session and the comparisons linkage made, as booleans.
+      for (const receipt of evidence.receipts) expect(receipt.workerSessionId).toMatch(/\S/);
+      expect(byExecution.get(inHistory.executionId)!.checks).toMatchObject({ commitIsCandidateHead: false, diffDigestAgrees: null });
+      expect(byExecution.get(wrongBytes.executionId)!.checks).toMatchObject({ commitIsCandidateHead: true, baseIsSnapshotBase: true, diffDigestAgrees: false });
+      expect(byExecution.get(wrongBase.executionId)!.checks).toMatchObject({ baseIsSnapshotBase: false });
+      expect(byExecution.get(unreproduced.executionId)!.checks).toMatchObject({ resultReproduced: false });
     } finally { harness.cp.close(); }
   }, 60_000);
 
