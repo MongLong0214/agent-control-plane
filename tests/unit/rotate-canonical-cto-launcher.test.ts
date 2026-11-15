@@ -11,9 +11,12 @@ import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 afterAll(cleanupTempDirs);
 const stragglers: number[] = [];
 const children: ChildProcess[] = [];
+const groups: number[] = [];
 afterEach(() => {
   for (const child of children.splice(0)) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-  for (const pid of stragglers.splice(0)) try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+  // Never 0 or 1: kill(0) and kill(-0) would signal this runner's own process group.
+  for (const pid of stragglers.splice(0)) if (pid > 1) try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+  for (const pgid of groups.splice(0)) if (pgid > 1) try { process.kill(-pgid, "SIGKILL"); } catch { /* already gone */ }
 });
 
 /**
@@ -83,15 +86,32 @@ if (process.argv[2] === "new-session") {
     s.rotations[0].state = "ACKED"; fs.writeFileSync(${JSON.stringify(db)}, JSON.stringify(s));
   }
 }`);
-  // The old conversation's claude process: its command line names its conversation, and it has a child of its own
-  // that outlives it by `childMs` (a shell writer it started), which SIGTERM to the old process does not reach.
-  // Neither inherits this process's env (R1154-01): both get exactly what they need.
-  const old = spawn(process.execPath, ["-e", `const c = require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, ${childMs})"], { stdio: "ignore", env: {} });
-require("node:fs").writeFileSync(${JSON.stringify(childPidFile)}, String(c.pid)); setInterval(() => {}, 1e6);`, OLD], { stdio: "ignore", env: {} });
+  // The old conversation's claude process, leading its own process group as a terminal job or a tmux pane does: its
+  // command line names its conversation, and it has a child of its own in that group that outlives it by `childMs`
+  // (a shell writer it started), which SIGTERM to the old process does not reach. On SIGUSR1 the child starts a
+  // grandchild in the same group and exits. None inherits this process's env (R1154-01).
+  const grandchildPidFile = join(dir, "grandchild.pid");
+  const childScript = join(dir, "child.js");
+  writeFileSync(childScript, `process.on("SIGUSR1", () => {
+  const g = require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore", env: {} });
+  require("node:fs").writeFileSync(${JSON.stringify(grandchildPidFile)}, String(g.pid)); process.exit(0);
+});
+setTimeout(() => {}, ${childMs});\n`);
+  const old = spawn(process.execPath, ["-e", `const c = require("node:child_process").spawn(process.execPath, [${JSON.stringify(childScript)}], { stdio: "ignore", env: {} });
+require("node:fs").writeFileSync(${JSON.stringify(childPidFile)}, String(c.pid)); setInterval(() => {}, 1e6);`, OLD], { stdio: "ignore", env: {}, detached: true });
   children.push(old);
+  groups.push(old.pid!);
   await once(old, "spawn");
-  for (let i = 0; i < 100 && !existsSync(childPidFile); i++) await new Promise((resolve) => setTimeout(resolve, 20));
-  const childPid = Number(readFileSync(childPidFile, "utf8"));
+  /** The pid a process wrote to `file`, once it is there whole. */
+  const pidIn = async (file: string) => {
+    for (let i = 0; i < 250; i++) {
+      const pid = existsSync(file) ? Number(readFileSync(file, "utf8")) : 0;
+      if (Number.isSafeInteger(pid) && pid > 1) return pid;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error(`no pid in ${file}`);
+  };
+  const childPid = await pidIn(childPidFile);
   stragglers.push(childPid);
   const launch = (stopTimeoutMs = 10_000) => bounded([LAUNCHER, "--project", PROJECT, "--to", NEW, "--expected-generation", "1", "--cwd", cwd,
     "--old-pid", String(old.pid), "--tmux-session", "acp-rot-test", "--handoff", handoff, "--timeout-ms", "600", "--poll-ms", "50",
@@ -102,7 +122,15 @@ require("node:fs").writeFileSync(${JSON.stringify(childPidFile)}, String(c.pid))
   const calls = () => readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line) as unknown[]);
   const steps = (stdout: string) => stdout.trim().split("\n").map((line) => JSON.parse(line) as { step: string } & Record<string, unknown>);
   const setMode = (next: Mode) => writeFileSync(modeFile, next);
-  return { dir, cwd, old, childPid, launch, calls, steps, previousArgs, setMode };
+  /** The child starts a grandchild in the old process group and exits; the grandchild's pid. */
+  const handOffToGrandchild = async () => {
+    process.kill(childPid, "SIGUSR1");
+    const grandchild = await pidIn(grandchildPidFile);
+    stragglers.push(grandchild);
+    for (let i = 0; i < 200 && running(childPid); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+    return grandchild;
+  };
+  return { dir, cwd, old, childPid, launch, calls, steps, previousArgs, setMode, handOffToGrandchild };
 };
 
 /** The launcher as a child of its own, killed at 30 s so a wedge names itself. */
@@ -201,6 +229,25 @@ describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, wi
     expect(resumed.code, resumed.stdout).toBe(0);
     expect(f.steps(resumed.stdout).map((line) => line.step)).toEqual(["handoff", "stop", "start", "verify"]);
     expect(rotatesTo(f.calls(), NEW)).toHaveLength(1);
+  });
+
+  it("a resumed rotation awaits the old process group, not only the pids it saved: a grandchild started there after the first run keeps the successor from starting", async () => {
+    const f = await fixture("claims", 60_000);
+    expect((await f.launch(800)).code).toBe(4);
+    // Between the two runs the saved child starts a grandchild in the old process group and exits, so no saved pid is
+    // left and nothing names the old conversation; the grandchild is a writer of the old tree all the same.
+    const grandchild = await f.handOffToGrandchild();
+    expect([running(f.old.pid!), running(f.childPid), running(grandchild)]).toEqual([false, false, true]);
+    const again = await f.launch(800);
+    expect(again.code, again.stdout).toBe(4);
+    expect(f.steps(again.stdout).at(-1)).toMatchObject({ step: "stop", groups: [f.old.pid] });
+    expect(f.calls().some((call) => call[0] === "tmux")).toBe(false);
+    // Once the group is empty, the same command resumes the switchover and starts the successor.
+    process.kill(grandchild, "SIGKILL");
+    for (let i = 0; i < 100 && running(grandchild); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+    const resumed = await f.launch(800);
+    expect(resumed.code, resumed.stdout).toBe(0);
+    expect(f.steps(resumed.stdout).map((line) => line.step)).toEqual(["handoff", "stop", "start", "verify"]);
   });
 
   it("claimed and judged ADMITTED, but the subscriber and ingress show no reception: verification fails and success is never reported", async () => {

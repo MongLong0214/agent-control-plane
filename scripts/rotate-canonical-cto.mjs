@@ -8,8 +8,9 @@
 //   boundary -> `agentctl canonical-cto status`: the old binding drains and owns no live run
 //   stop     -> SIGTERM to the old claude process only, then its exit AND the exit of every process of its tree (its
 //               children and theirs, and the members of any process group one of them leads) is confirmed from the
-//               process table; nothing else is signalled. The processes still awaited (pid and start time) are kept
-//               in rotations/<project>-<uuid>.stop.json, so a resumed run awaits exactly them again
+//               process table; nothing else is signalled. The processes still awaited (pid and start time) and every
+//               process group and session of the tree are kept in rotations/<project>-<uuid>.stop.json, so a resumed
+//               run awaits them again: a group is gone only on ESRCH from kill(-pgid, 0) with no member in the table
 //   start    -> only then `claude --session-id <new>` in tmux, its acp-cto relay claiming generation n + 1 (the ack)
 //   verify   -> the new session holds n + 1, and the daemon's own Buzz subscriber connection for its identity is
 //               live and delivering to it and the ingress is listening (registry eligibility alone proves nothing)
@@ -63,22 +64,30 @@ const status = () => agentctl('canonical-cto', 'status', '--project', project);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // The process table, read whole each time (C locale, so the start time parses; unlimited width, so no command is cut
-// short): pid, parent, group, state, start time
-// (which tells a reused pid apart) and command. A zombie has exited and can write nothing, so it is not counted.
-const processTable = () => run('ps', ['-axww', '-o', 'pid=,ppid=,pgid=,stat=,lstart=,command='], { env: { ...process.env, LC_ALL: 'C' } }).split('\n').map((line) => {
-  const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\S+\s+\d+)\s?(.*)$/.exec(line);
-  return m && { pid: Number(m[1]), ppid: Number(m[2]), pgid: Number(m[3]), zombie: m[4].startsWith('Z'), start: m[5], command: m[6] };
+// short): pid, parent, process group, session (0 where the system does not report one, as macOS does not), state,
+// start time (which tells a reused pid apart) and command. A zombie has exited and can write nothing, so it is not
+// counted as a process; its group still answers kill(-pgid, 0) until it is reaped.
+const processTable = () => run('ps', ['-axww', '-o', 'pid=,ppid=,pgid=,sess=,stat=,lstart=,command='], { env: { ...process.env, LC_ALL: 'C' } }).split('\n').map((line) => {
+  const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\S+\s+\d+)\s?(.*)$/.exec(line);
+  return m && { pid: Number(m[1]), ppid: Number(m[2]), pgid: Number(m[3]), sess: Number(m[4]), zombie: m[5].startsWith('Z'), start: m[6], command: m[7] };
 }).filter((row) => row && !row.zombie);
+// This launcher's own group and session: never awaited, so a tree that shares one with it is refused, not awaited.
+const selfRow = processTable().find((row) => row.pid === process.pid) ?? null;
 const namesConversation = (command, uuid) => new RegExp(`(?:^|\\s)--(?:session-id|resume)\\s+${uuid}(?:\\s|$)`).test(command);
 /**
  * A process tree whose exit is awaited: the seeded processes, every process ever seen as a child of a tracked one,
- * and every member of a process group a tracked one leads. A process is kept by pid AND start time, so it stays
- * tracked after its parent dies and it is reparented, and a reused pid is never mistaken for it. Never this launcher.
+ * and every member of a process group or session a tracked one was ever in (and of the ones a resumed run was
+ * handed). A process is kept by pid AND start time, so it stays tracked after its parent dies and it is reparented,
+ * and a reused pid is never mistaken for it. A group is gone only when kill(-pgid, 0) answers ESRCH and the process
+ * table holds no member of it; any other answer keeps it alive. Never this launcher.
  */
-const processTree = (seeds) => {
+const processTree = (seeds, seedGroups = [], seedSessions = []) => {
   const tracked = new Map();
-  const groups = new Set();
+  const groups = new Set(seedGroups);
+  const sessions = new Set(seedSessions);
   const self = new Set([process.pid, process.ppid]);
+  const ownGroup = selfRow?.pgid ?? null;
+  const ownSession = selfRow && selfRow.sess > 0 ? selfRow.sess : null;
   const refresh = () => {
     const rows = processTable();
     const byPid = new Map(rows.map((row) => [row.pid, row]));
@@ -91,25 +100,40 @@ const processTree = (seeds) => {
     for (const [pid, start] of tracked) if (byPid.get(pid)?.start !== start) tracked.delete(pid);
     for (let grew = true; grew;) {
       grew = false;
-      for (const pid of tracked.keys()) if (byPid.get(pid)?.pgid === pid) groups.add(pid);
+      for (const pid of tracked.keys()) {
+        const row = byPid.get(pid);
+        if (row && row.pgid > 1 && row.pgid !== ownGroup) groups.add(row.pgid);
+        if (row && row.sess > 0 && row.sess !== ownSession) sessions.add(row.sess);
+      }
       for (const row of rows) {
         if (tracked.has(row.pid) || self.has(row.pid)) continue;
-        if (tracked.has(row.ppid) || groups.has(row.pgid)) { tracked.set(row.pid, row.start); grew = true; }
+        if (tracked.has(row.ppid) || groups.has(row.pgid) || sessions.has(row.sess)) { tracked.set(row.pid, row.start); grew = true; }
       }
     }
+    const liveGroups = [...groups].filter((pgid) => {
+      if (rows.some((row) => row.pgid === pgid)) return true;
+      try { process.kill(-pgid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; }
+    });
+    const liveSessions = [...sessions].filter((sess) => rows.some((row) => row.sess === sess));
+    refresh.alive = { groups: liveGroups.sort((a, b) => a - b), sessions: liveSessions.sort((a, b) => a - b) };
     return [...tracked.keys()].sort((a, b) => a - b);
   };
-  /** The processes still awaited, by pid and start time: what a later run must find exited. */
+  refresh.alive = { groups: [], sessions: [] };
+  /** The processes still awaited, by pid and start time, and every group and session of the tree: what a later run must find gone. */
   refresh.identities = () => [...tracked].map(([pid, start]) => ({ pid, start })).sort((a, b) => a.pid - b.pid);
+  refresh.groups = () => [...groups].sort((a, b) => a - b);
+  refresh.sessions = () => [...sessions].sort((a, b) => a - b);
   return refresh;
 };
-/** Waits for every process of `refresh`'s tree to have exited; the ones still running at the deadline, or none. */
+/** Waits for every process, group and session of `refresh`'s tree to be gone; what still runs at the deadline. */
 const exitOf = async (refresh, deadlineMs, observed = () => {}) => {
   const deadline = Date.now() + deadlineMs;
-  let remaining = refresh();
+  const left = () => ({ remaining: refresh(), ...refresh.alive });
+  const settled = (now) => now.remaining.length === 0 && now.groups.length === 0 && now.sessions.length === 0;
+  let now = left();
   observed();
-  while (remaining.length > 0 && Date.now() < deadline) { await sleep(Math.min(pollMs, 100)); remaining = refresh(); observed(); }
-  return remaining;
+  while (!settled(now) && Date.now() < deadline) { await sleep(Math.min(pollMs, 100)); now = left(); observed(); }
+  return { ...now, settled: settled(now) };
 };
 
 // One launcher per project at a time: a second one would stop, start or fence what the first one owns.
@@ -149,6 +173,9 @@ for (let row = table.find((entry) => entry.pid === process.pid), hops = 0; oldRo
   const parent = row.ppid;
   row = table.find((entry) => entry.pid === parent);
 }
+if (oldRow && selfRow && (oldRow.pgid === selfRow.pgid || (oldRow.sess > 0 && oldRow.sess === selfRow.sess))) {
+  stop(66, 'status', { refused: 'the launcher shares the old conversation\'s process group or session, so it cannot tell that tree\'s exit from its own; run it in its own session (e.g. in its own tmux session)' });
+}
 report('handoff', { project, from: old, to, generation: expected, ...(resumed ? { resumed: resumed.transferId } : {}) });
 
 // rotate — the old holder is fenced at ACP before its process is touched.
@@ -176,18 +203,23 @@ const stopRecord = join(dir, `${project}-${to}.stop.json`);
 const recorded = (() => {
   try {
     const value = JSON.parse(readFileSync(stopRecord, 'utf8'));
+    const ids = (list) => Array.isArray(list) && list.every((one) => Number.isSafeInteger(one) && one > 1);
     return value.from === old && value.fromGeneration === expected && Array.isArray(value.outstanding) &&
-      value.outstanding.every((one) => Number.isSafeInteger(one?.pid) && typeof one.start === 'string') ? value : null;
+      value.outstanding.every((one) => Number.isSafeInteger(one?.pid) && typeof one.start === 'string') &&
+      ids(value.groups) && ids(value.sessions) ? value : null;
   } catch { return null; }
 })();
 if (!oldRow && recorded === null) {
   stop(4, 'stop', { refused: 'no record of the earlier run\'s stop: the exit of the old conversation\'s processes cannot be established; the new conversation was not started' });
 }
-const refresh = processTree([...(oldRow ? [{ pid: oldRow.pid, start: oldRow.start }] : []), ...(recorded?.outstanding ?? [])]);
+const refresh = processTree([...(oldRow ? [{ pid: oldRow.pid, start: oldRow.start }] : []), ...(recorded?.outstanding ?? [])],
+  recorded?.groups ?? [], recorded?.sessions ?? []);
 let written = null;
 const keep = () => {
   const outstanding = refresh.identities();
-  const body = JSON.stringify({ project, from: old, to, fromGeneration: expected, oldPid, outstanding, exited: outstanding.length === 0 });
+  const exited = outstanding.length === 0 && refresh.alive.groups.length === 0 && refresh.alive.sessions.length === 0;
+  const body = JSON.stringify({ project, from: old, to, fromGeneration: expected, oldPid, outstanding,
+    groups: refresh.groups(), sessions: refresh.sessions(), exited });
   if (body === written) return;
   const tmp = `${stopRecord}.${process.pid}.tmp`;
   writeFileSync(tmp, `${body}\n`, { mode: 0o600 });
@@ -199,10 +231,10 @@ keep();
 if (oldRow) {
   try { process.kill(oldRow.pid, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') stop(4, 'stop', { refused: 'the old claude process could not be signalled', oldPid }); }
 }
-const remaining = await exitOf(refresh, stopTimeoutMs, keep);
-if (remaining.length > 0) {
-  stop(4, 'stop', { refused: 'the old conversation\'s processes did not all exit; the new conversation was not started and nothing else was signalled',
-    oldPid, remaining });
+const left = await exitOf(refresh, stopTimeoutMs, keep);
+if (!left.settled) {
+  stop(4, 'stop', { refused: 'the old conversation\'s processes, process groups or sessions are not all gone; the new conversation was not started and nothing else was signalled',
+    oldPid, remaining: left.remaining, groups: left.groups, sessions: left.sessions });
 }
 // Nothing may still name the old conversation either, tracked or not.
 const named = processTable().filter((row) => namesConversation(row.command, old)).map((row) => row.pid);
@@ -227,8 +259,8 @@ const fenceNew = async (why) => {
   const refresh = processTree(processTable().filter((row) => namesConversation(row.command, to)).map((row) => row.pid));
   refresh();
   if (started) { try { run(tmux, ['kill-session', '-t', flags['tmux-session']]); } catch { /* already gone */ } }
-  const remaining = await exitOf(refresh, stopTimeoutMs);
-  if (remaining.length > 0) stop(3, 'start', { refused: 'the new conversation\'s processes did not exit; nothing was rolled back', why, remaining });
+  const left = await exitOf(refresh, stopTimeoutMs);
+  if (!left.settled) stop(3, 'start', { refused: 'the new conversation\'s processes did not exit; nothing was rolled back', why, remaining: left.remaining, groups: left.groups });
   const now = status();
   if (now.ok && now.value.holderSessionUuid === to) {
     stop(3, 'start', { refused: 'the new conversation claimed after the deadline and may have acted; it was stopped, nothing was rolled back', why });
