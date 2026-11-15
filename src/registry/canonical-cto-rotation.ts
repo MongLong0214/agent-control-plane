@@ -148,7 +148,7 @@ export const carriedMessagesOf = (db: Pick<Db, "all">, roleKey: string): Canonic
 export const switchoverPreparedFrom = (db: Pick<Db, "get">, projectId: string, sessionUuid: string): string | null =>
   db.get<{ transfer_id: string }>(
     `SELECT t.transfer_id FROM canonical_entitlement_transfers t JOIN canonical_cto_rotations r ON r.transfer_id = t.transfer_id
-      WHERE t.project_id = ? AND t.from_session_uuid = ? ORDER BY t.created_at LIMIT 1`,
+      WHERE t.project_id = ? AND t.from_session_uuid = ? ORDER BY t.created_at, t.transfer_id LIMIT 1`,
     [projectId, sessionUuid],
   )?.transfer_id ?? null;
 
@@ -172,7 +172,7 @@ export const inFlightCarriedTo = (db: Pick<Db, "all">, roleKey: string): Map<str
        FROM canonical_cto_rotations r JOIN canonical_entitlement_transfers t ON t.transfer_id = r.transfer_id,
             json_each(r.carried_json, '$.inFlightMessageIds') j
       WHERE 'PRIMARY_CTO:' || t.project_id = ? AND t.claimed_at IS NOT NULL AND r.carried_json IS NOT NULL
-      ORDER BY t.claimed_at`,
+      ORDER BY t.claimed_at, t.transfer_id, j.key`,
     [roleKey],
   ).map((row) => [row.message_id, {
     transferId: row.transfer_id,
