@@ -48,6 +48,7 @@ import {
   admitHermesProvenance,
   type HermesAdmittedTurn,
   type HermesProvenanceAnchor,
+  HERMES_PROVENANCE_META_KEY,
   HERMES_READ_ONLY_TOOLS,
   type HermesToolCall,
 } from "./hermes-provenance.ts";
@@ -107,27 +108,31 @@ export interface HermesMcpSource extends McpMutationSource {
 }
 
 /**
- * U6 B1 — the owner's Telegram `/acp` turn a `run_dispatch` is made in, when the caller is the current
- * CEO binding's own session on an admitted turn and that session has exactly one canonical turn in
- * doubt, answering exactly one Telegram update. Anything else is no origin: none is inferred.
+ * U6 B1 — the owner's Telegram `/acp` turn a `run_dispatch` is made in. It is the turn the admitted call
+ * itself names (`turn_request_id` in its provenance), and only when that call is the owner's, made by
+ * the current CEO binding's own session, and that exact turn is in doubt on that session answering
+ * exactly one Telegram update. A peer's call, a call naming no turn, and any other turn the session
+ * has in doubt are no origin: none is inferred from what else the session is doing.
  */
 const admittedDispatchOrigin = (
   source: Pick<HermesMcpSource, "db" | "bindings">, peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined,
+  turnRequestId: string | undefined,
 ): DispatchOrigin | undefined => {
   const ceo = source.bindings.active(roleKeyFor(Role.CEO));
-  if (!turn || !ceo || !peer.sessionId || ceo.sessionId !== peer.sessionId || ceo.sessionIncarnation !== peer.sessionIncarnation) {
+  if (turn?.principal !== "owner" || !turnRequestId || !ceo || !peer.sessionId || ceo.sessionId !== peer.sessionId ||
+      ceo.sessionIncarnation !== peer.sessionIncarnation) {
     return undefined;
   }
-  const rows = source.db.all<{ turn_request_id: string; source_channel: string | null; source_nonce: string | null }>(
-    `SELECT t.turn_request_id, s.source_channel, s.source_nonce FROM canonical_turns t
+  const rows = source.db.all<{ source_channel: string | null; source_nonce: string | null }>(
+    `SELECT s.source_channel, s.source_nonce FROM canonical_turns t
        LEFT JOIN canonical_turn_sources s ON s.turn_request_id = t.turn_request_id
-      WHERE t.lifecycle_state = 'IN_DOUBT' AND t.executor_session_id = ? AND t.executor_session_incarnation = ?
-        AND t.binding_generation = ?`,
-    [ceo.sessionId, ceo.sessionIncarnation, ceo.bindingGeneration],
+      WHERE t.turn_request_id = ? AND t.lifecycle_state = 'IN_DOUBT' AND t.executor_session_id = ?
+        AND t.executor_session_incarnation = ? AND t.binding_generation = ?`,
+    [turnRequestId, ceo.sessionId, ceo.sessionIncarnation, ceo.bindingGeneration],
   );
   const update = rows.length === 1 && rows[0]!.source_channel === "telegram"
     ? /^update:([1-9][0-9]{0,15})$/.exec(rows[0]!.source_nonce ?? "")?.[1] : undefined;
-  return update ? { turnRequestId: rows[0]!.turn_request_id, updateId: update } : undefined;
+  return update ? { turnRequestId, updateId: update } : undefined;
 };
 
 /** Only ports constructed below may be attached to an MCP server. */
@@ -232,8 +237,8 @@ export const createHermesMcpPort = (
       bootstrapPlanAttachAuthority(source, peer, turn),
     bootstrapPlanAttachAccess: (input: BootstrapPlanAttachInput) => bootstrapPlanAttachAccess(source, input),
     createRun: (input: Parameters<RunEngine["create"]>[0]) => source.runs.create(input),
-    dispatchRun: (runId: string, hermesTurn?: HermesAdmittedTurn, peer?: AuthenticatedMcpPeer) => {
-      const originReply = peer ? admittedDispatchOrigin(source, peer, hermesTurn) : undefined;
+    dispatchRun: (runId: string, hermesTurn?: HermesAdmittedTurn, peer?: AuthenticatedMcpPeer, turnRequestId?: string) => {
+      const originReply = peer ? admittedDispatchOrigin(source, peer, hermesTurn, turnRequestId) : undefined;
       return source.runs.dispatch(runId, {
         ...(hermesTurn === undefined ? {} : { hermesTurn }), ...(originReply ? { originReply } : {}),
       });
@@ -563,6 +568,19 @@ const admittedTurnOf = (extra: unknown): HermesAdmittedTurn | undefined =>
   typeof extra === "object" && extra !== null ? admittedTurns.get(extra) : undefined;
 
 /**
+ * U6 B1 — the canonical turn an admitted call says it was made in: `turn_request_id` in the same
+ * provenance object the guard admitted against the live binding. A call the guard did not admit, or
+ * one whose provenance names no turn, names none.
+ */
+const admittedTurnRequestIdOf = (extra: unknown): string | undefined => {
+  if (!admittedTurnOf(extra)) return undefined;
+  const meta = requestMeta(extra);
+  const provenance = typeof meta === "object" && meta !== null ? (meta as Record<string, unknown>)[HERMES_PROVENANCE_META_KEY] : undefined;
+  const id = typeof provenance === "object" && provenance !== null ? (provenance as Record<string, unknown>)["turn_request_id"] : undefined;
+  return typeof id === "string" && id.length > 0 && id.length <= 512 ? id : undefined;
+};
+
+/**
  * This scope deliberately receives only the port. Every registered handler closes over this
  * parameter, so a future Hermes tool cannot recover its construction-time source (#352).
  */
@@ -764,7 +782,8 @@ const createHermesServerFromPort = (
     { description: "Admit a queued run.", inputSchema: { ...mutation, runId: z.string() } },
     async (args, extra) => write("run_dispatch", args, extra, async () => {
       const peer = authenticateMcpPeer(authenticate);
-      return respond(await port.dispatchRun(args.runId, admittedTurnOf(extra), peer.allowed ? peer.value : undefined));
+      return respond(await port.dispatchRun(args.runId, admittedTurnOf(extra), peer.allowed ? peer.value : undefined,
+        admittedTurnRequestIdOf(extra)));
     }),
   );
 

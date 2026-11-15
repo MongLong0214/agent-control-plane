@@ -30,6 +30,7 @@ import {
   drivenModeSql,
   drivenSpawnRecordOf,
 } from "../runtime/provisioned-session-runtime.ts";
+import { takesDaemonNoticeRoute } from "../runtime/hermes-gateway-conversation.ts";
 import {
   type FencedEnvelope,
   HOLDER_CLAIMED_KINDS,
@@ -873,21 +874,34 @@ export const settleStoppedSessionInstructions = (
   );
 
 /**
- * U6 B1 — a CEO notification's `origin` (the owner's `/acp` turn its run was dispatched in) is sent only
- * while the notification is addressed to that turn's own CEO generation and session. Readdressed to a
- * successor, it is still sent, without the origin, so nothing replies to a message that holder never had.
+ * U6 B1 — a CEO notification's `origin` (the owner's `/acp` turn its run was dispatched in) is current
+ * only while the notification is addressed to that turn's own CEO generation and session and the origin
+ * names the one Telegram update that turn answered. Any other origin — readdressed to a successor, a
+ * turn that does not exist, another update, a malformed value — is NOT_CURRENT: the notice still goes,
+ * without it, and the owner's reply is recorded undelivered (`ORIGIN_NOT_CURRENT`).
  */
-const withCurrentOrigin = (db: Pick<Db, "get">, message: OutboxMessage): OutboxMessage => {
+type CeoNoticeOrigin =
+  | { state: "NONE" }
+  | { state: "CURRENT"; origin: unknown }
+  | { state: "NOT_CURRENT"; origin: unknown; stripped: OutboxMessage };
+
+const ceoNoticeOrigin = (db: Pick<Db, "get">, message: OutboxMessage): CeoNoticeOrigin => {
   const payload = message.payload;
-  if (typeof payload !== "object" || payload === null || !("origin" in payload)) return message;
+  if (typeof payload !== "object" || payload === null || !("origin" in payload)) return { state: "NONE" };
   const { origin, ...rest } = payload as Record<string, unknown>;
-  const turn = (origin as { turn_request_id?: unknown } | null)?.turn_request_id;
-  const current = typeof turn === "string" && db.get<{ 1: number }>(
-    `SELECT 1 FROM canonical_turns WHERE turn_request_id = ? AND binding_generation = ? AND executor_session_id = ?`,
-    [turn, message.bindingGeneration, message.targetSessionId],
+  const named = typeof origin === "object" && origin !== null ? origin as { turn_request_id?: unknown; update_id?: unknown } : {};
+  const current = typeof named.turn_request_id === "string" && typeof named.update_id === "string" && db.get<{ 1: number }>(
+    `SELECT 1 FROM canonical_turns t JOIN canonical_turn_sources s ON s.turn_request_id = t.turn_request_id
+      WHERE t.turn_request_id = ? AND t.binding_generation = ? AND t.executor_session_id = ?
+        AND s.source_channel = 'telegram' AND s.source_nonce = ?
+        AND (SELECT COUNT(*) FROM canonical_turn_sources o WHERE o.turn_request_id = t.turn_request_id) = 1`,
+    [named.turn_request_id, message.bindingGeneration, message.targetSessionId, `update:${named.update_id}`],
   ) !== undefined;
-  return current ? message : { ...message, payload: rest };
+  return current ? { state: "CURRENT", origin } : { state: "NOT_CURRENT", origin, stripped: { ...message, payload: rest } };
 };
+
+/** Why a CEO notification's origin got no reply to the owner's message; the audit row is written once. */
+type OwnerReplyUndelivered = "ORIGIN_NOT_CURRENT" | "ORIGIN_NOTICE_NOT_ONE_ROUTE";
 
 /**
  * Every unsettled CEO notification follows the current holder with its sealed content and id.
@@ -1222,6 +1236,25 @@ export class Outbox {
     });
   }
 
+  /**
+   * U6 B1 — the owner's `/acp` message gets no reply from this notification, and why: one
+   * `CEO_NOTIFICATION_OWNER_REPLY_UNDELIVERED` per message and reason. A transport ACK of the notice
+   * never settles this; nothing here says the CEO did or did not receive the notice itself.
+   */
+  #recordOwnerReplyUndelivered(message: OutboxMessage, reason: OwnerReplyUndelivered, origin: unknown): void {
+    if (this.db.get(`SELECT 1 FROM audit_events WHERE kind = 'CEO_NOTIFICATION_OWNER_REPLY_UNDELIVERED'
+      AND json_extract(evidence_json, '$.messageId') = ? AND json_extract(evidence_json, '$.reason') = ?`,
+    [message.messageId, reason])) return;
+    this.audit.record({
+      kind: "CEO_NOTIFICATION_OWNER_REPLY_UNDELIVERED",
+      roleKey: message.roleKey, sessionId: message.targetSessionId, runId: message.runId,
+      evidence: {
+        messageId: message.messageId, targetSessionId: message.targetSessionId,
+        bindingGeneration: message.bindingGeneration, reason, origin,
+      },
+    });
+  }
+
   deliverCeoNotifications(): Promise<void> {
     this.#ceoPending = true;
     if (this.#ceoDelivering) return this.#ceoDelivering;
@@ -1253,15 +1286,35 @@ export class Outbox {
           let unavailable = false;
           let reasonCode: ReasonCode = ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED;
           let outcome: CeoNoticeOutcome = "UNKNOWN";
-          const attempt = new CeoNoticeRoute(this.db, this.audit, hydrate(row));
+          const message = hydrate(row);
+          const attempt = new CeoNoticeRoute(this.db, this.audit, message);
           if (attempt.withholdBeforeSend()) continue;
+          // U6 B1 — an origin the notice may no longer carry is dropped, and the owner's reply recorded
+          // undelivered; a current one is sent only if every signed part takes the daemon-notice route.
+          const origin = ceoNoticeOrigin(this.db, message);
+          if (origin.state === "NOT_CURRENT") this.#recordOwnerReplyUndelivered(message, "ORIGIN_NOT_CURRENT", origin.origin);
+          let originRefused = false;
+          const route: CeoNoticeAttempt = origin.state !== "CURRENT" ? attempt : {
+            prepare: (destination, requests) => {
+              if (requests.length > 0 && requests.every((request) => takesDaemonNoticeRoute(request.text))) {
+                return attempt.prepare(destination, requests);
+              }
+              originRefused = true;
+              return { route: "WITHHELD" };
+            },
+          };
           try {
-            const result = await send(withCurrentOrigin(this.db, hydrate(row)), attempt);
+            const result = await send(origin.state === "NOT_CURRENT" ? origin.stripped : message, route);
             unavailable = !result.allowed && result.reasonCode === ReasonCode.CEO_CONVERSATION_UNAVAILABLE;
             accepted = result.allowed;
             reasonCode = result.reasonCode;
             outcome = (result.evidence["noticeOutcome"] as CeoNoticeOutcome | undefined) ?? (accepted ? "SETTLED" : "UNKNOWN");
           } catch { /* retained below */ }
+          if (originRefused) {
+            // Nothing was posted: the notice stays PENDING, undelivered, and is never sent as events.
+            this.#recordOwnerReplyUndelivered(message, "ORIGIN_NOTICE_NOT_ONE_ROUTE", origin.state === "CURRENT" ? origin.origin : null);
+            continue;
+          }
           if (attempt.route !== "CANONICAL") continue;
           if (unavailable) {
             // No target was found, so no transport attempt took place. Retain PENDING and
@@ -1271,10 +1324,14 @@ export class Outbox {
           }
           this.db.tx(() => {
             attempt.finish(outcome);
-            const updated = this.db.run(`UPDATE outbox SET status = ?, attempts = attempts + 1, acked_at = ?
+            // A transport ACK of a notice whose origin was dropped is not the owner's reply: a row with no
+            // reason of its own says why; a retargeted one keeps its mark, and the audit row says it for both.
+            const updated = this.db.run(`UPDATE outbox SET status = ?, attempts = attempts + 1, acked_at = ?,
+              reason_code = COALESCE(reason_code, ?)
             WHERE message_id = ? AND status = 'PENDING' AND binding_generation = ? AND target_session_id = ?
               AND ${liveDeliveryTarget("outbox")}`,
             [accepted ? "ACKED" : "PENDING", accepted ? this.clock.nowIso() : null,
+              accepted && origin.state === "NOT_CURRENT" ? "ORIGIN_NOT_CURRENT" : null,
               row.message_id, row.binding_generation, row.target_session_id]);
             if (updated.changes !== 1) return;
             this.audit.record({ kind: accepted ? "CEO_NOTIFICATION_ACCEPTED" : "CEO_NOTIFICATION_DELIVERY_FAILED",
