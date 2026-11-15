@@ -13,7 +13,6 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startDaemonMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import { WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
 
@@ -203,7 +202,7 @@ describe("the attach relay as the process Claude Code spawns", () => {
     const initialize = await request(1, "initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: WAKE_TRANSPORT_QUALIFIED_CLIENTS[0],
+      clientInfo: { name: "claude-code", version: "2.1.323" },
     });
     expect(initialize["result"]).toBeDefined();
     child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);

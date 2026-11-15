@@ -10,7 +10,7 @@ import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ownerMessageLedger } from "../../src/daemon/agentcpd.ts";
 import { Role, SessionLifecycle, type RoleBinding } from "../../src/domain/types.ts";
-import { ROLE_WAKE_FRAME, RoleConversationPort, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
+import { ROLE_WAKE_FRAME, RoleConversationPort } from "../../src/mcp/role-conversation.ts";
 import type { McpPeerAuthenticator } from "../../src/mcp/shared.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import type { HolderIdentity } from "../../src/outbox/outbox.ts";
@@ -57,7 +57,7 @@ const fixture = () => {
   }, { endpointDir: dir, ownerMessages: ownerMessageLedger(h.cp), holderHasWork: hasWork, onWakeWritten: written });
   const makeServer = () => {
     const server = new McpServer({ name: "fallback", version: "1" });
-    vi.spyOn(server.server, "getClientVersion").mockReturnValue(WAKE_TRANSPORT_QUALIFIED_CLIENTS[0]);
+    vi.spyOn(server.server, "getClientVersion").mockReturnValue({ name: "claude-code", version: "2.1.323" });
     return server;
   };
   const attach = (holder = current, authenticate?: McpPeerAuthenticator) => {

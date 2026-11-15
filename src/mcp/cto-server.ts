@@ -41,6 +41,7 @@ import type { SessionRegistry } from "../session/session-registry.ts";
 import type { AttestingPeer, SessionAttestations } from "../session/session-attestations.ts";
 import type { ContinuityKernel } from "../continuity/continuity-kernel.ts";
 import { reportWithoutCapturedOutput } from "../verify/verification-engine.ts";
+import type { VerificationReport } from "../verify/verification-engine.ts";
 import {
   authenticateMcpPeer,
   createMcpMutationPort,
@@ -912,8 +913,11 @@ const createCtoServerFromPort = (
       const onProgress = progressNotifier(extra);
       const outcome = await port.submitResult({ runId: args.runId, ownerSessionId: fenced.sessionId, ownerBindingGeneration: fenced.bindingGeneration, resultSummary: args.resultSummary, recommendation: args.recommendation, residualRisk: args.residualRisk, ...(commands.length === 0 ? {} : { runScopedCommands: commands }), ...(onProgress === undefined ? {} : { onProgress }),
         replayIdentity: { idempotencyKey: args.idempotencyKey, requestFingerprint: fingerprint } });
-      // A failed verification reaches the CTO with its excerpts, not the whole capture the review reads.
+      // A failed verification reaches the CTO with its excerpts, not the whole capture the review reads. #1402 — a run
+      // with private review evidence is answered with its projection (`privateEvidenceAnswer`): verification counts and
+      // no report, so nothing to strip; it is answered as it is.
       return respond(outcome.allowed && outcome.value.stage === "VERIFICATION_FAILED"
+        && (outcome.value as { report?: VerificationReport }).report !== undefined
         ? { ...outcome, value: { ...outcome.value, report: reportWithoutCapturedOutput(outcome.value.report) } } : outcome);
     }, true,
     // #1344 B — a replay whose response was never stored (its daemon ended first) is answered from what the key's

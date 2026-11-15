@@ -20,7 +20,7 @@ import {
 } from "../../src/daemon/agentcpd.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
-import { ROLE_WAKE_FRAME, RoleConversationPort, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
+import { ROLE_WAKE_FRAME, RoleConversationPort } from "../../src/mcp/role-conversation.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { channelKey, signedMention, steppedClock, storingRelay, writeSubscriberConfig } from "../helpers/buzz-mention-relay.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -152,7 +152,7 @@ const start = async (options: { production?: boolean; serializeWake?: <T>(body: 
   // The holder attaches over the port and registers its endpoint; the registration's own wake lands.
   const holder = h.cp.bindings.active(roleKey)!;
   const server = new McpServer({ name: "wake-witness", version: "1" });
-  vi.spyOn(server.server, "getClientVersion").mockReturnValue(WAKE_TRANSPORT_QUALIFIED_CLIENTS[0]);
+  vi.spyOn(server.server, "getClientVersion").mockReturnValue({ name: "claude-code", version: "2.1.323" });
   conversation.attach(server, () => allow(ReasonCode.OK, {
     actor: holder.sessionId, sessionId: holder.sessionId, sessionIncarnation: holder.sessionIncarnation,
   }));
