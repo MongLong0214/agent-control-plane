@@ -12,8 +12,6 @@ import { ensurePrivateDirectory, inspectPrivatePath } from "../db/state-prefligh
  * exchange. Existing kernel fixtures need only a creator identity because they supply a
  * modelled GitHub client.
  */
-/** The deadline retained from the former fixed `gh` request. */
-export const GITHUB_API_DEADLINE_MS = 120_000;
 /** A GitHub response is evidence/input, not an unbounded process stream. */
 export const GITHUB_API_RESPONSE_LIMIT_BYTES = 32 * 1024 * 1024;
 

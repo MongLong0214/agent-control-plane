@@ -12,9 +12,6 @@ export const PROJECT_MANIFEST_SCHEMA_ID = "agent-control-plane.project.v2";
 /** The refusal a manifest naming a merge strategy other than `merge_commit` carries (#1269). */
 export const MERGE_COMMIT_ONLY = "MERGE_COMMIT_ONLY";
 
-/** Committed manifest location (Integration §10.1). */
-export const MANIFEST_RELATIVE_PATH = ".agent-control-plane/project.json";
-
 export const branchProfileSchema = z
   .object({
     longLived: z.array(z.string().min(1)).min(1).default(["main", "dev"]),
