@@ -92,6 +92,16 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
                                            <state root>/review-evidence/<runId>/<sha256> (0600 under
                                            0700 directories, renamed into place whole), and print the
                                            expectedSha256 to stage with. Needs no daemon and no token
+  agentctl canonical-cto rotate --project <id> --to <uuid> --expected-generation <n> --handoff <package.json>
+                                           owner only: prepare the canonical PRIMARY_CTO's switchover to
+                                           conversation <uuid> as the same actor. <n> is the role's
+                                           current generation; the old CTO drains (fenced for good) and
+                                           keeps the binding until <uuid> claims generation n + 1.
+                                           Nothing restores it: going back is a new rotate from the
+                                           new holder, at a new generation, to a new conversation
+  agentctl canonical-cto status --project <id>
+                                           the canonical conversation, binding, Buzz delivery verdict
+                                           and recent rotations
   agentctl daemon status                  daemon mode and health; falls back to the lock file
 `;
 
@@ -659,6 +669,42 @@ export const dispatch = async (
     }
     return fail(`unknown conversation subcommand: ${sub ?? ""}`);
   }
+  if (command === "canonical-cto") {
+    if (args[0] === "status") {
+      if (args.length !== 3 || args[1] !== "--project") return fail("usage: agentctl canonical-cto status --project <id>");
+      return call("canonicalCto.status", { projectId: required(args[2], "--project") });
+    }
+    if (args[0] !== "rotate") return fail(`unknown canonical-cto subcommand: ${args[0] ?? ""}`);
+    const flags: Record<string, string> = {};
+    for (let index = 1; index < args.length; index += 2) {
+      const flag = args[index]!;
+      if (!["--project", "--to", "--expected-generation", "--handoff"].includes(flag) || flag in flags || args[index + 1] === undefined) {
+        return fail("usage: agentctl canonical-cto rotate --project <id> --to <uuid> --expected-generation <n> [--handoff <package.json>]");
+      }
+      flags[flag] = args[index + 1]!;
+    }
+    let expectedGeneration: number;
+    try {
+      expectedGeneration = requiredInteger(flags["--expected-generation"], "--expected-generation", 1);
+    } catch (err) {
+      return fail((err as Error).message);
+    }
+    let handoff: unknown;
+    if (flags["--handoff"] !== undefined) {
+      try {
+        handoff = JSON.parse(readFileSync(flags["--handoff"], "utf8")) as unknown;
+      } catch {
+        return fail("--handoff must name a readable JSON handoff package");
+      }
+    }
+    return call("canonicalCto.rotate", {
+      projectId: required(flags["--project"], "--project"),
+      toSessionUuid: required(flags["--to"], "--to"),
+      expectedGeneration,
+      ...(handoff === undefined ? {} : { handoff }),
+    });
+  }
+
   if (command === "daemon" && args[0] === "status") return call("daemon.status");
   return fail(`unknown command: ${command}`);
 };

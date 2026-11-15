@@ -4,6 +4,7 @@ import { MAX_MCP_LINE_BYTES } from "../core/mcp-limits.ts";
 import { recordBootstrapServingRuntime } from "../bootstrap/bootstrap-runtime-observation.ts";
 import { readBuzzSubscriberConfig } from '../buzz/buzz-mention-subscriber.ts';
 import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
+import { canonicalCtoRotations, drainingRotationFor, inFlightFromPreviousHolder, liveRunIdsOwnedBySession } from "../registry/canonical-cto-rotation.ts";
 import { outboxDeliveryReadback, type OutboxMessage } from "../outbox/outbox.ts";
 import type { CeoNoticeAttempt } from "../outbox/ceo-notification-route.ts";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
@@ -150,7 +151,7 @@ import {
 } from "../ingress/telegram-external.ts";
 import type { TelegramDirectAnswer } from "../ingress/telegram-router.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
-import type { SessionLaunchCredential, SessionLaunchPin } from "../cto/cto-lifecycle.ts";
+import type { HandoffPackage, SessionLaunchCredential, SessionLaunchPin } from "../cto/cto-lifecycle.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 import type { AuditLog } from "../db/audit.ts";
 import { createRequire } from "node:module";
@@ -803,6 +804,8 @@ export interface LocalTelegramExternalIngress {
 /** A daemon-owned local hop from the authenticated Buzz relay to the CEO conversation port. */
 export interface LocalBuzzMessageIngress {
   socketPath: string;
+  /** Whether the ingress socket is accepting connections now: its server's own state, false once closed. */
+  readonly listening: boolean;
   /**
    * The exact admission seam this socket serves (#760 Part C).
    *
@@ -853,6 +856,11 @@ export interface LocalOperatorSocketOptions {
   adoptHermesIncumbent?: () => Promise<Decision<unknown>>;
   /** Server-configured actor predicate; checked before reading request parameters. */
   adoptHermesIncumbentOwnerAllowed?: () => boolean;
+  /**
+   * v58 — `canonicalCto.rotate` and `canonicalCto.status`. Composed by `startDaemonOperatorSocket` behind the
+   * server-configured CLI owner allowlist; absent on a parked daemon.
+   */
+  canonicalCto?: CanonicalCtoOperator;
   // No `claimCanonicalCto` option on this bearer-token-authenticated socket (#760): a process may
   // prove who it is, but it cannot approve itself, so the claiming connection cannot sit on this
   // credential surface at all, not even behind its own kernel-credential check layered on top. It
@@ -1999,6 +2007,7 @@ export const startBuzzMessageIngressListener = async (
   return {
     socketPath,
     seam,
+    get listening() { return server.listening; },
     close: async () => {
       await closeSocketServer(server);
       try {
@@ -3225,6 +3234,88 @@ export const assertCanonicalRoomsAreSubscribed = (
   }
 };
 
+export const CANONICAL_CTO_ROTATE_METHOD = "canonicalCto.rotate";
+export const CANONICAL_CTO_STATUS_METHOD = "canonicalCto.status";
+export type CanonicalCtoOperator = (method: "rotate" | "status", params: Record<string, unknown>, actor: string) => Decision<unknown>;
+
+/** `operator` for the server-configured CLI owner only; every other authenticated operator is refused before params are read. */
+export const ownerOnlyCanonicalCtoOperator = (
+  cp: Pick<ControlPlane, "ownerAuthority">,
+  operatorActor: string,
+  operator: CanonicalCtoOperator,
+): CanonicalCtoOperator => (method, params) =>
+  cp.ownerAuthority.isAllowedActor("cli", operatorActor)
+    ? operator(method, params, operatorActor)
+    : deny(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED, "canonical CTO rotation requires an allowlisted CLI owner", {});
+
+/** The daemon's running Buzz receivers, read when asked: either is null until it starts and stays as it was once closed. */
+export type CanonicalCtoReception = () => {
+  subscriber: Pick<BuzzMentionSubscriberHandle, "replies" | "counters" | "deliveryEligibility"> | null;
+  ingress: Pick<LocalBuzzMessageIngress, "listening"> | null;
+};
+
+/**
+ * v58 — the owner's canonical CTO switchover (`CtoLifecycle.prepareCanonicalSwitchover`) and its read-back: the project's canonical
+ * conversation and generation, its ACTIVE binding, its rotations, and whether the Buzz mention subscriber would
+ * deliver to that binding's session now (`judgeBuzzMentionIdentity`, the same judgement the subscriber asks before
+ * every delivery). That verdict is registry eligibility only, so `buzz.reception` reads beside it what the daemon's
+ * own receivers show for the holder's Buzz identity: whether its subscriber connection is authenticated and
+ * subscribed on a live socket, its liveness, whether it would deliver to the holder's role, and whether the ingress
+ * socket is listening. A daemon that wired none proves no reception. The launcher verifies attach and Buzz receive
+ * from this read, never from a row it guesses.
+ */
+export const canonicalCtoOperator = (
+  cp: ControlPlane,
+  canonicalSessions: readonly CanonicalAdoptableSession[] | null,
+  reception: CanonicalCtoReception = () => ({ subscriber: null, ingress: null }),
+): CanonicalCtoOperator => (method, params, actor) => {
+  const projectId = params["projectId"];
+  if (typeof projectId !== "string" || projectId.length === 0) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "projectId is required", {});
+  }
+  if (method === "rotate") {
+    const keys = Object.keys(params).filter((name) => name !== "handoff").sort().join(",");
+    const handoff = params["handoff"];
+    if (keys !== "expectedGeneration,projectId,toSessionUuid" || typeof params["toSessionUuid"] !== "string" ||
+        typeof params["expectedGeneration"] !== "number" ||
+        (handoff !== undefined && (handoff === null || typeof handoff !== "object" || Array.isArray(handoff)))) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "rotate takes projectId, toSessionUuid, expectedGeneration and, forward, a handoff package", {});
+    }
+    return cp.cto.prepareCanonicalSwitchover({
+      projectId, toSessionUuid: params["toSessionUuid"], expectedGeneration: params["expectedGeneration"],
+      ...(handoff === undefined ? {} : { handoff: handoff as HandoffPackage }),
+    }, actor);
+  }
+  if (Object.keys(params).length !== 1) return deny(ReasonCode.INVALID_ARGUMENT, "status takes exactly projectId", {});
+  const holder = new CanonicalSessionRegistry(cp.db).holder(projectId);
+  const binding = cp.bindings.activePrimaryCto(projectId);
+  const judged = holder === null ? null
+    : judgeBuzzMentionIdentity(cp, canonicalSessions === null ? null : { sessions: canonicalSessions }, holder.buzzActorId).judgement;
+  const receivers = reception();
+  const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+  const heard = holder === null ? null : {
+    subscriber: {
+      connected: receivers.subscriber?.replies.ready(holder.buzzActorId) ?? false,
+      liveness: receivers.subscriber?.counters().liveness?.identities.find((one) => one.identityPubkey === holder.buzzActorId)?.state ?? null,
+      delivering: receivers.subscriber?.deliveryEligibility({ actorId: holder.buzzActorId, roleKey })?.eligible ?? false,
+    },
+    ingress: { listening: receivers.ingress?.listening ?? false },
+  };
+  return allow(ReasonCode.OK, {
+    projectId,
+    holderSessionUuid: holder?.sessionUuid ?? null,
+    generation: cp.db.get<{ n: number | null }>(`SELECT MAX(binding_generation) AS n FROM assignments WHERE role_key = ?`,
+      [roleKeyFor(Role.PRIMARY_CTO, { projectId })])?.n ?? 0,
+    // The launcher's safe boundary: the holder drains and owns no live run before its process is stopped.
+    binding: binding === null ? null : { generation: binding.bindingGeneration, sessionId: binding.sessionId,
+      lifecycle: cp.sessions.get(binding.sessionId)?.lifecycle ?? null, liveRuns: liveRunIdsOwnedBySession(cp.db, binding.sessionId) },
+    buzz: judged === null ? null : judged.verdict === "ADMITTED"
+      ? { verdict: judged.verdict, sessionId: judged.binding.sessionId, generation: judged.binding.bindingGeneration, reception: heard }
+      : { verdict: judged.verdict, reason: judged.reason, reception: heard },
+    rotations: canonicalCtoRotations(cp.db, projectId).slice(0, 5),
+  });
+};
+
 /**
  * The operator surface is deliberately a one-request protocol rather than a general RPC
  * framework. A dedicated credential is bound to a configured peer and a live listener
@@ -3246,8 +3337,11 @@ export const startDaemonOperatorSocket = (
   const operatorActor = credential.actor.trim();
   const bootstrap = options.bootstrapHermes;
   const adopt = options.adoptHermesIncumbent;
+  const canonicalCto = options.canonicalCto;
   return startOperatorSocket(daemon, stateDir, credential, {
     ...options,
+    // v58 — the bearer authenticates the CLI; only the server-configured owner may rotate or read a rotation.
+    ...(canonicalCto ? { canonicalCto: ownerOnlyCanonicalCtoOperator(cp, operatorActor, canonicalCto) } : {}),
     ...(bootstrap ? { bootstrapHermes: (params: Record<string, unknown>) => {
       if (cp.bindings.history(Role.CEO).length > 0 &&
           !cp.ownerAuthority.isAllowedActor("cli", operatorActor)) {
@@ -4010,7 +4104,7 @@ export const startBootstrapOperatorDoor = (
   daemon: Pick<Daemon, "handleOperatorRequest" | "lock">,
   stateDir: string,
   credential: LocalOperatorCredential,
-  options: Omit<LocalOperatorSocketOptions, "bootstrapHermes" | "adoptHermesIncumbent" | "adoptHermesIncumbentOwnerAllowed"> = {},
+  options: Omit<LocalOperatorSocketOptions, "bootstrapHermes" | "adoptHermesIncumbent" | "adoptHermesIncumbentOwnerAllowed" | "canonicalCto"> = {},
 ): Promise<LocalOperatorListener> => startOperatorSocket(daemon, stateDir, credential, options);
 
 const startMcpSocket = async (
@@ -4227,6 +4321,23 @@ const serveOperatorRequest = (
           finish(deny(ReasonCode.INTERNAL_ERROR, "Hermes incumbent adoption failed", {}));
         });
         return;
+      }
+      if (method === CANONICAL_CTO_ROTATE_METHOD || method === CANONICAL_CTO_STATUS_METHOD) {
+        if (!options.canonicalCto) {
+          return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "canonical CTO rotation is not enabled on this socket", {}));
+        }
+        if (!daemon.lock.held()) {
+          return finish(deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held for canonical CTO rotation", {}));
+        }
+        const params = operatorRequestParams(value);
+        if (!params) return finish(deny(ReasonCode.INVALID_ARGUMENT, "canonical CTO parameters are invalid", {}));
+        try {
+          return finish(options.canonicalCto(method === CANONICAL_CTO_ROTATE_METHOD ? "rotate" : "status", params, peer.value.actor));
+        } catch (error) {
+          return finish(deny(ReasonCode.INTERNAL_ERROR, "canonical CTO request failed", {
+            error: error instanceof Error ? error.message : String(error),
+          }));
+        }
       }
       // `actor.claimCanonicalCto` does not dispatch here (#760): a process may prove who it is,
       // but it cannot approve itself, so the claiming connection is kept off this bearer-token
@@ -5833,9 +5944,18 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
         // The owner messages withheld because the mention they came from no longer stands behind
         // this holder, so the handover can name the reason.
         const mentionGated = new Set<string>();
+        // v58 — the drain: the generation a pending canonical CTO rotation was authorized from finishes what it
+        // was already handed (SENT) and is handed nothing new; what stays PENDING is the new holder's to adopt.
+        // Not reported as withheld, which would invite the outgoing holder to reject it.
+        const draining = drainingRotationFor(cp.db, holder) !== null;
+        const drained = new Set<string>();
         const taken = cp.outbox.claimForHolder(
           holder,
           (candidate) => {
+            if (draining && candidate.status === "PENDING") {
+              drained.add(candidate.messageId);
+              return false;
+            }
             if (candidate.kind === MessageKind.OWNER_MESSAGE) {
               if (buzzMentionClaimHolds(cp, holder, candidate.payload)) return true;
               mentionGated.add(candidate.messageId);
@@ -5857,8 +5977,13 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
             );
           },
         );
-        const unresolved = taken.unresolved;
-        const withheld = taken.withheld;
+        // v58 — what a switchover carried in flight (handed to the outgoing holder, never completed) is never handed
+        // over as new work: it is listed unresolved, marked previousHolderInFlight with the evidence of that hand-over,
+        // and its text, when handed, carries the same mark, until this holder settles it.
+        const previous = inFlightFromPreviousHolder(cp.db, holder);
+        const previousOf = new Map(previous.map((row) => [row.messageId, row]));
+        const unresolved = [...taken.unresolved.filter((row) => !previousOf.has(row.messageId)), ...previous];
+        const withheld = taken.withheld.filter((row) => !drained.has(row.messageId));
         // ACP-PEER-SUCCESSION-01, ACP-RESTART-04: the CEO peer messages ACP rejected while they
         // were queued for this role — on a revoke, a takeover, a runtime move or a restart that
         // refused to carry them — that no holder has reported yet, by id, event, signer and reason
@@ -5954,6 +6079,10 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
             principal: message.kind === MessageKind.PEER_MESSAGE ? "peer" : "owner",
             // From this message's own source row, read in the same transaction as its text.
             provenance: ownerMessageProvenanceOf(pointer.sourceChannel, pointer.sourceNonce, source.actor, payload),
+            ...(previousOf.has(message.messageId) ? {
+              previousHolderInFlight: true as const, transferId: previousOf.get(message.messageId)!.transferId,
+              previousHolder: previousOf.get(message.messageId)!.previousHolder,
+            } : {}),
           },
           unresolved,
           withheld,
@@ -6565,6 +6694,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         mcpToken,
         bootstrapHermes: (params) => hermesBootstrap!.bootstrap(params),
         ...(adoptHermesIncumbent ? { adoptHermesIncumbent } : {}),
+        canonicalCto: canonicalCtoOperator(cp, canonicalSessions, () => ({ subscriber: buzzMentionSubscriber, ingress: buzzMessageIngress })),
       },
     );
     if (canonicalSessions === null) {

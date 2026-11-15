@@ -4045,8 +4045,20 @@ END;
 
 -- CP-HI-04 — the binding is a lifetime bijection between an actor and one conversation. A
 -- rewritable one is how a retired actor's target gets re-pointed at a fresh actor.
+-- v58 — the one rewrite: a canonical CTO switchover moves the SAME actor's claude-cli target from the old
+-- conversation to the new one its unacknowledged switchover names (canonical_cto_rotations, below), keeping the
+-- binding's id, actor, executor kind and bound_at. The switchover's transfer row keeps the old conversation.
 CREATE TRIGGER IF NOT EXISTS actor_target_bindings_immutable
 BEFORE UPDATE ON actor_target_bindings
+WHEN NEW.target_binding_id IS NOT OLD.target_binding_id OR NEW.target_actor_id IS NOT OLD.target_actor_id
+ OR NEW.executor_kind IS NOT OLD.executor_kind OR NEW.bound_at IS NOT OLD.bound_at
+ OR NEW.target_locator_digest IS OLD.target_locator_digest
+ OR NOT EXISTS (SELECT 1 FROM canonical_cto_rotations r
+                  JOIN canonical_entitlement_transfers t ON t.transfer_id = r.transfer_id
+                 WHERE r.target_binding_id = OLD.target_binding_id AND r.actor_id = OLD.target_actor_id
+                   AND r.handoff_id IS NULL AND t.claimed_at IS NULL AND t.revoked_at IS NULL
+                   AND OLD.executor_kind = 'claude-cli'
+                   AND t.from_session_uuid = OLD.target_locator AND t.to_session_uuid = NEW.target_locator)
 BEGIN
   SELECT RAISE(ABORT, 'ACTOR_TARGET_BINDING_IMMUTABLE');
 END;
@@ -4475,4 +4487,80 @@ CREATE TRIGGER IF NOT EXISTS project_retirements_no_delete
 BEFORE DELETE ON project_retirements
 BEGIN
   SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_IMMUTABLE');
+END;
+
+-- v58 — a canonical CTO switchover (PRD §10.1) to a new conversation of the SAME conversational actor. It rides a
+-- v57 transfer of the project's entitlement (project, both conversations, Buzz identity, who asked, claim and
+-- revocation live there) and names the actor, its one claude-cli target binding, the outgoing session and the
+-- generation it was prepared from, and holds the handoff package. Until the new conversation's self-claim at
+-- to_generation acknowledges it, the old binding stays in force (draining). That claim is the handoff ACK: in one
+-- transaction it fences the old holder, moves the binding's target_locator to the new conversation (the one
+-- rewrite actor_target_bindings_immutable admits), binds the same actor, records the ACKED handoffs row, and records
+-- here what it carried. A pending switchover is rolled back by revoking its transfer unclaimed.
+CREATE TABLE IF NOT EXISTS canonical_cto_rotations (
+  transfer_id TEXT PRIMARY KEY REFERENCES canonical_entitlement_transfers(transfer_id),
+  actor_id TEXT NOT NULL REFERENCES conversational_actors(actor_id),
+  target_binding_id TEXT NOT NULL REFERENCES actor_target_bindings(target_binding_id),
+  from_session_id TEXT NOT NULL REFERENCES sessions(session_id),
+  from_generation INTEGER NOT NULL CHECK (from_generation > 0),
+  to_generation INTEGER NOT NULL,
+  package_json TEXT NOT NULL CHECK (json_valid(package_json)),
+  handoff_id TEXT REFERENCES handoffs(handoff_id),
+  carried_json TEXT CHECK (carried_json IS NULL OR json_valid(carried_json)),
+  revision INTEGER NOT NULL DEFAULT 1,
+  CHECK (to_generation = from_generation + 1),
+  CHECK ((handoff_id IS NULL) = (carried_json IS NULL))
+) WITHOUT ROWID;
+-- CP-HI-02 — v58: REPLACE rewrites a row by its key without an UPDATE, so a switchover is never replaced. The table is
+-- WITHOUT ROWID, so its key is the only thing a REPLACE could reuse.
+CREATE TRIGGER IF NOT EXISTS canonical_cto_rotations_no_replace
+BEFORE INSERT ON canonical_cto_rotations
+WHEN EXISTS (SELECT 1 FROM canonical_cto_rotations WHERE transfer_id = NEW.transfer_id)
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE');
+END;
+-- CP-HI-02 — v58: a switchover is born unacknowledged with its pending transfer, from the ACTIVE binding at exactly
+-- the transfer's generation, held by the actor whose claude-cli binding names the transfer's old conversation.
+CREATE TRIGGER IF NOT EXISTS canonical_cto_rotations_rides_a_pending_transfer
+BEFORE INSERT ON canonical_cto_rotations
+WHEN NEW.handoff_id IS NOT NULL OR NEW.carried_json IS NOT NULL OR NEW.revision <> 1
+ OR NOT EXISTS (SELECT 1 FROM canonical_entitlement_transfers t
+                  JOIN actor_target_bindings tb ON tb.target_binding_id = NEW.target_binding_id
+                  JOIN assignments a ON a.role_key = 'PRIMARY_CTO:' || t.project_id AND a.binding_generation = NEW.from_generation
+                 WHERE t.transfer_id = NEW.transfer_id AND t.claimed_at IS NULL AND t.revoked_at IS NULL
+                   AND t.expected_binding_generation = NEW.from_generation
+                   AND tb.target_actor_id = NEW.actor_id AND tb.executor_kind = 'claude-cli'
+                   AND tb.target_locator = t.from_session_uuid
+                   AND a.actor_id = NEW.actor_id AND a.session_id = NEW.from_session_id AND a.status = 'ACTIVE')
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE');
+END;
+-- CP-HI-02 — v58: a switchover's identity never changes; it is acknowledged once, by the ACKED handoff from its
+-- outgoing session and generation to the session its actor's ACTIVE to_generation binding names, after the actor's
+-- binding moved to the transfer's new conversation.
+CREATE TRIGGER IF NOT EXISTS canonical_cto_rotations_acknowledged_once
+BEFORE UPDATE ON canonical_cto_rotations
+WHEN NEW.transfer_id IS NOT OLD.transfer_id OR NEW.actor_id IS NOT OLD.actor_id
+ OR NEW.target_binding_id IS NOT OLD.target_binding_id OR NEW.from_session_id IS NOT OLD.from_session_id
+ OR NEW.from_generation IS NOT OLD.from_generation OR NEW.to_generation IS NOT OLD.to_generation
+ OR NEW.package_json IS NOT OLD.package_json OR OLD.handoff_id IS NOT NULL
+ OR NEW.handoff_id IS NULL OR NEW.revision <> OLD.revision + 1
+ OR NOT EXISTS (SELECT 1 FROM canonical_entitlement_transfers t
+                  JOIN handoffs h ON h.handoff_id = NEW.handoff_id
+                  JOIN actor_target_bindings tb ON tb.target_binding_id = NEW.target_binding_id
+                  JOIN assignments a ON a.role_key = 'PRIMARY_CTO:' || t.project_id AND a.binding_generation = NEW.to_generation
+                 WHERE t.transfer_id = NEW.transfer_id AND t.revoked_at IS NULL
+                   AND h.kind = 'HANDOFF' AND h.status = 'ACKED' AND h.project_id = t.project_id
+                   AND h.from_session_id = NEW.from_session_id AND h.from_generation = NEW.from_generation
+                   AND h.ack_by_session_id = h.to_session_id
+                   AND tb.target_locator = t.to_session_uuid AND a.actor_id = NEW.actor_id
+                   AND a.session_id = h.to_session_id AND a.status = 'ACTIVE')
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE');
+END;
+-- CP-HI-02 — v58: a switchover is never erased.
+CREATE TRIGGER IF NOT EXISTS canonical_cto_rotations_no_delete
+BEFORE DELETE ON canonical_cto_rotations
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE');
 END;

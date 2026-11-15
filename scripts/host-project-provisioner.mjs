@@ -72,7 +72,8 @@ try {
   const req = JSON.parse(readFileSync(0,'utf8'));
   operation = req.operation;
   check(req.version === 1 && home && state, 'protocol');
-  const a = req.allocation;
+  // The allocation as provisioned; `a` becomes its current conversation below (v58), and only `a` is used after that.
+  let a = req.allocation;
   ceoSigner = req.operation === 'ensure-buzz' && a?.mode === 'ceo-route-signer';
   const match = ceoSigner ? null : /^github:([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)$/.exec(a.repositoryIdentity);
   const repoName = match?.[2];
@@ -96,6 +97,31 @@ try {
     check(a.bootPacket === join(home,'.claude','watchers','fleet',`${a.fleetName}.boot.txt`) && a.fleetName === `acp-${a.projectId}`, 'fleet path');
     check(a.socketPath === join(state,`cc-session-${a.projectId}.sock`) && a.tmuxName === `acp-${Buffer.from(a.projectId).toString("hex")}`, 'runtime path');
     check(/^[a-f0-9-]{36}$/.test(a.sessionUuid) && /^[a-f0-9-]{36}$/.test(a.roomId) && /^[a-f0-9]{40}$/.test(a.head), 'allocation identity');
+  }
+  // v58 — a canonical CTO switchover moves the project's CTO to a new conversation as the same actor, and its record
+  // in the daemon's database is the one source of which conversation that is now: the acknowledged switchovers are
+  // followed from the allocation's conversation. The allocation and the watcher's request keep what was provisioned;
+  // nothing else stores the target. While a switchover is pending its outgoing conversation is fenced and the rotation
+  // launcher starts the new one, so ensure-resident starts nobody; a conversation switched over from is never named
+  // again, neither in acp-cto nor in a launch.
+  const switchedFrom = new Set();
+  let switchoverPending = null;
+  const rotationDb = ceoSigner ? null : process.env.ACP_HOST_DATABASE_PATH || join(state,'state.sqlite');
+  if (rotationDb && existsSync(rotationDb)) {
+    const db = new Database(rotationDb,{readonly:true,fileMustExist:true});
+    try {
+      if (db.prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name IN ('canonical_entitlement_transfers','canonical_cto_rotations')`).get().n === 2) {
+        const from = when => `SELECT t.transfer_id, t.to_session_uuid FROM canonical_entitlement_transfers t JOIN canonical_cto_rotations r ON r.transfer_id = t.transfer_id
+          WHERE t.project_id = ? AND t.from_session_uuid = ? AND ${when}`;
+        let current = a.sessionUuid;
+        for (let next; (next = db.prepare(from('t.claimed_at IS NOT NULL')).get(a.projectId,current));) {
+          check(/^[a-f0-9-]{36}$/.test(next.to_session_uuid) && next.to_session_uuid !== a.sessionUuid && !switchedFrom.has(next.to_session_uuid),'canonical CTO switchover record');
+          switchedFrom.add(current);current = next.to_session_uuid;
+        }
+        switchoverPending = db.prepare(from('t.claimed_at IS NULL AND t.revoked_at IS NULL')).get(a.projectId,current) ?? null;
+        if (current !== a.sessionUuid) a = {...a,sessionUuid:current};
+      }
+    } finally {db.close();}
   }
   mkdirSync(state,{recursive:true,mode:0o700});
   // The owner record is complete before its symlink is claimed; SIGKILL cannot leave an ownerless lock.
@@ -584,6 +610,7 @@ try {
     }
     case 'ensure-resident': {
       // Also the fleet watcher's recovery path after a CTO dies: it relaunches over unfinished work.
+      check(!switchoverPending,`canonical CTO switchover ${switchoverPending?.transfer_id} is pending: its launcher starts the new conversation, and the outgoing one is never relaunched`);
       const observedCheckout = checkout(checkoutRequirement);
       run(join(home,'.claude','scripts','claude-trust-dir.sh'),[a.clonePath]);
       const runtimeNode = join(state,'current','dist','bin','node');
@@ -604,12 +631,16 @@ try {
         run('claude',['mcp','add','--scope','local','acp-cto','--',runtimeNode,runtimeCli,'attach','resident-cto','--claimed-session-id',a.sessionUuid,'--project-id',a.projectId],{cwd:a.clonePath});
       }
       check(mcpMatches(run('claude',['mcp','get','acp-cto'],{cwd:a.clonePath})),'MCP readback mismatch');
-      atomic(join(dirname(a.bootPacket),`${a.fleetName}.resident.json`),JSON.stringify({allocation:a,packet:req.packet}));
+      atomic(join(dirname(a.bootPacket),`${a.fleetName}.resident.json`),JSON.stringify({allocation:req.allocation,packet:req.packet}));
       atomic(a.bootPacket,JSON.stringify({schema:"acp.resident-boot.v1",projectId:a.projectId,sessionUuid:a.sessionUuid,roomId:a.roomId,identity:{name:a.identityName,pubkey:pub()},attachment:{stateDir:state,socketPath:a.socketPath},approvedPackage:req.packet},null,2)+'\n');
       const line = [a.fleetName,a.clonePath,`${a.projectId} CTO`,a.bootPacket,a.sessionUuid].join('\t');
       const lines = existsSync(fleetFile) ? readFileSync(fleetFile,'utf8').trimEnd().split('\n').filter(Boolean) : [];
-      const existing = lines.find(l => l.split('\t')[0] === a.fleetName); check(!existing || existing === line,'fleet entry conflict');
+      const existing = lines.find(l => l.split('\t')[0] === a.fleetName);
+      // The same entry naming a conversation the switchover record moved this CTO from is that entry, moved on.
+      const superseded = existing !== undefined && existing.split('\t').slice(0,4).join('\t') === line.split('\t').slice(0,4).join('\t') && switchedFrom.has(existing.split('\t')[4]);
+      check(!existing || existing === line || superseded,'fleet entry conflict');
       if (!existing) atomic(fleetFile,[...lines,line].join('\n')+'\n');
+      else if (superseded) atomic(fleetFile,lines.map(l => l === existing ? line : l).join('\n')+'\n');
       let alive = false; try { observeResident(); alive = true; } catch { /* A tmux shell alone is never health. */ }
       if (!alive) {
         // Keep surfacing a completed launch's exact exit until its caller acknowledges that the reason is
