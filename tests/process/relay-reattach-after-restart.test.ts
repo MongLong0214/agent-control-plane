@@ -15,7 +15,6 @@ import {
 } from "../../src/cli/attach-relay.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startLocalMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
-import { WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
 import { count } from "../helpers/adopted-ceo.ts";
 import {
   canonicalCtoFixture,
@@ -44,7 +43,7 @@ import { clearSessionMessagingEnv } from "../helpers/session-messaging-env.ts";
 
 const TOKEN = "fixture-mcp-token";
 const POLICY: Partial<ReattachPolicy> = { maxWaitMs: 5_000, initialDelayMs: 20, maxDelayMs: 100, attemptTimeoutMs: 2_000 };
-const qualified = WAKE_TRANSPORT_QUALIFIED_CLIENTS[0]!;
+const qualified = { name: "claude-code", version: "2.1.323" };
 /** What a stand-in door's acknowledgement names: one binding and one runtime. */
 const STAND_IN_TUPLE = { assignmentId: "stand-in-assignment", bindingGeneration: 1, sessionId: "stand-in-session", sessionIncarnation: "stand-in-incarnation" };
 

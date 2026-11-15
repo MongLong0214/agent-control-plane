@@ -15,20 +15,13 @@ import { MessageKind } from "../../src/outbox/envelope.ts";
 import {
   ROLE_WAKE_FRAME,
   RoleConversationPort,
-  WAKE_TRANSPORT_QUALIFIED_CLIENTS,
-  isWakeTransportQualified,
 } from "../../src/mcp/role-conversation.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest, makeHarness } from "../helpers/harness.ts";
 
 /**
- * The wake transport qualifies a **set** of builds, and membership in it is exact.
- *
- * Measured on 2026-09-27: four live clients on three builds, none of them the single build the
- * transport then admitted. Every binding on those clients held its role, could not register a wake
- * endpoint, and had nothing to say so — its messages were stored and waited for a registration
- * that could not come. These rows are about the two halves of the repair: the set admits each of
- * its members and nothing near one, and a binding whose holder is outside it is reported.
+ * The wake transport admits any client build, and a binding whose holder has no usable wake
+ * endpoint is reported.
  *
  * Every build named below is a fixture, never one read off this host: nothing here depends on
  * which client happens to be installed, and no row spawns one.
@@ -44,49 +37,8 @@ const valueOf = <T>(decision: Decision<T>): T => {
   return decision.value;
 };
 
-/** A build outside the committed set, derived from a member so it can never become one by a move. */
-const NOT_A_MEMBER = {
-  name: WAKE_TRANSPORT_QUALIFIED_CLIENTS[0].name,
-  version: `${WAKE_TRANSPORT_QUALIFIED_CLIENTS[0].version}.9999-not-a-member`,
-};
-
-describe("membership in the qualified set is exact", () => {
-  it("admits each member of a set of several builds exactly, and nothing near one", () => {
-    const members = [
-      { name: "claude-code", version: "2.1.268" },
-      { name: "claude-code", version: "2.1.282" },
-      { name: "claude-code", version: "2.1.283" },
-    ];
-    // Copies, so what is compared is the pair's value and never an object's identity.
-    for (const member of members) {
-      expect(isWakeTransportQualified({ ...member }, members), `${member.version} is a member`).toBe(true);
-    }
-
-    // Each of these would be admitted by a floor, a range, a prefix or a vendor check, and each is
-    // a build nobody measured.
-    const near = [
-      { name: "claude-code", version: "2.1.284" }, // newer than every member
-      { name: "claude-code", version: "2.1.270" }, // between two members
-      { name: "claude-code", version: "2.1.26" }, // a prefix of a member
-      { name: "claude-code", version: "2.1.268.1" }, // extends a member
-      { name: "claude-code", version: "2.1.268 " },
-      { name: "claude-code", version: "" },
-      { name: "claude", version: "2.1.268" }, // a member's version under another name
-      { name: "Claude-Code", version: "2.1.282" },
-    ];
-    for (const client of near) {
-      expect(isWakeTransportQualified(client, members), JSON.stringify(client)).toBe(false);
-    }
-    expect(isWakeTransportQualified(undefined, members)).toBe(false);
-    expect(isWakeTransportQualified(members[0], []), "an empty set admits nothing").toBe(false);
-
-    // The committed set is what every production caller gets by default.
-    for (const member of WAKE_TRANSPORT_QUALIFIED_CLIENTS) {
-      expect(isWakeTransportQualified({ ...member })).toBe(true);
-    }
-    expect(isWakeTransportQualified(NOT_A_MEMBER)).toBe(false);
-  });
-});
+/** A build no list names anywhere. */
+const UNLISTED_BUILD = { name: "claude-code", version: "2.1.323" };
 
 describe("the CTO port names every holder that cannot be woken", () => {
   const binding = (projectId: string): RoleBinding => ({
@@ -115,35 +67,41 @@ describe("the CTO port names every holder that cannot be woken", () => {
     return { port, active, attach };
   };
 
-  it("reports a holder on a build outside the set and one that declared no build, each with its cause", async () => {
-    const outside = binding("outside");
+  it("registers an endpoint for a build nobody listed and for one that declared no build", async () => {
+    const stateDir = tempDir("acp-wq-port-any-");
+    chmodSync(stateDir, 0o700);
+    const unlisted = binding("unlisted");
     const noBuild = binding("no-build");
-    const { port, active, attach } = portOver([outside, noBuild]);
-    attach(outside, NOT_A_MEMBER);
-    // No `clientInfo` at all. `registerEndpoint` refuses this peer on the same predicate, so it is
-    // exactly as unwakeable as the one outside the set, and the report has no build name to go on.
+    const { port, active, attach } = portOver([unlisted, noBuild], stateDir);
+    const unlistedServer = attach(unlisted, UNLISTED_BUILD);
     const noBuildServer = attach(noBuild, undefined);
-
-    expect(port.unwakeableHolders()).toEqual([
-      {
-        roleKey: outside.roleKey, role: Role.PRIMARY_CTO,
-        presented: `${NOT_A_MEMBER.name}/${NOT_A_MEMBER.version}`, cause: "build-outside-the-qualified-set",
-      },
-      { roleKey: noBuild.roleKey, role: Role.PRIMARY_CTO, presented: null, cause: "no-declared-build" },
-    ]);
-    // The refusal that makes it unwakeable describes the same peer the same way: `presented: null`.
-    expect(await port.registerEndpoint(noBuildServer, "/nonexistent/wake.sock")).toMatchObject({
-      allowed: false, reasonCode: ReasonCode.ROLE_PEER_UNSUPPORTED, evidence: { presented: null },
-    });
+    const first = await listeningSocket(join(stateDir, "unlisted.wake.sock"));
+    const second = await listeningSocket(join(stateDir, "no-build.wake.sock"));
+    try {
+      // Both are unwakeable only for want of an endpoint, and say what they declared.
+      expect(port.unwakeableHolders()).toEqual([
+        {
+          roleKey: unlisted.roleKey, role: Role.PRIMARY_CTO,
+          presented: `${UNLISTED_BUILD.name}/${UNLISTED_BUILD.version}`, cause: "no-registered-endpoint",
+        },
+        { roleKey: noBuild.roleKey, role: Role.PRIMARY_CTO, presented: null, cause: "no-registered-endpoint" },
+      ]);
+      expect((await port.registerEndpoint(unlistedServer, first.path)).allowed).toBe(true);
+      expect((await port.registerEndpoint(noBuildServer, second.path)).allowed).toBe(true);
+      expect(port.unwakeableHolders()).toEqual([]);
+    } finally {
+      await first.close();
+      await second.close();
+    }
 
     // A holder that is no longer the registry's current one is not a binding this port serves, so
     // it is not reported either: the finding is about active bindings, not about sockets.
-    active.delete(outside.roleKey);
+    active.delete(unlisted.roleKey);
     active.delete(noBuild.roleKey);
     expect(port.unwakeableHolders()).toEqual([]);
   });
 
-  it("reports a holder on a qualified build that registered no endpoint, and stays quiet once it has one", async () => {
+  it("reports a holder that registered no endpoint, and stays quiet once it has one", async () => {
     // The state this whole slice exists to make visible, and the one the scan used to skip: the
     // build is a member, so `registerEndpoint` would admit it, and until it does `wake` refuses
     // with ROLE_PEER_UNSUPPORTED and `endpointFor` answers null. Measured here through the port's
@@ -152,7 +110,7 @@ describe("the CTO port names every holder that cannot be woken", () => {
     chmodSync(stateDir, 0o700);
     const onMember = binding("on-member");
     const { port, attach } = portOver([onMember], stateDir);
-    const server = attach(onMember, { ...WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] });
+    const server = attach(onMember, { ...UNLISTED_BUILD });
 
     expect(port.endpointFor(onMember.roleKey)).toBeNull();
     expect(await port.wake(onMember.roleKey)).toMatchObject({
@@ -161,7 +119,7 @@ describe("the CTO port names every holder that cannot be woken", () => {
     expect(port.unwakeableHolders()).toEqual([
       {
         roleKey: onMember.roleKey, role: Role.PRIMARY_CTO,
-        presented: `${WAKE_TRANSPORT_QUALIFIED_CLIENTS[0].name}/${WAKE_TRANSPORT_QUALIFIED_CLIENTS[0].version}`,
+        presented: `${UNLISTED_BUILD.name}/${UNLISTED_BUILD.version}`,
         cause: "no-registered-endpoint",
       },
     ]);
@@ -188,7 +146,7 @@ describe("the CTO port names every holder that cannot be woken", () => {
     chmodSync(stateDir, 0o700);
     const onMember = binding("on-member");
     const { port, attach } = portOver([onMember], stateDir);
-    const server = attach(onMember, { ...WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] });
+    const server = attach(onMember, { ...UNLISTED_BUILD });
     const endpoint = await listeningSocket(join(stateDir, "cto.wake.sock"));
     expect((await port.registerEndpoint(server, endpoint.path)).allowed).toBe(true);
     expect(port.unwakeableHolders()).toEqual([]);
@@ -200,7 +158,7 @@ describe("the CTO port names every holder that cannot be woken", () => {
     expect(port.unwakeableHolders()).toEqual([
       {
         roleKey: onMember.roleKey, role: Role.PRIMARY_CTO,
-        presented: `${WAKE_TRANSPORT_QUALIFIED_CLIENTS[0].name}/${WAKE_TRANSPORT_QUALIFIED_CLIENTS[0].version}`,
+        presented: `${UNLISTED_BUILD.name}/${UNLISTED_BUILD.version}`,
         cause: "registered-endpoint-not-usable",
       },
     ]);
@@ -218,8 +176,8 @@ describe("the CTO port names every holder that cannot be woken", () => {
     chmodSync(stateDir, 0o700);
     const onMember = binding("on-member");
     const { port, attach } = portOver([onMember], stateDir);
-    const server = attach(onMember, { ...WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] });
-    const presented = `${WAKE_TRANSPORT_QUALIFIED_CLIENTS[0].name}/${WAKE_TRANSPORT_QUALIFIED_CLIENTS[0].version}`;
+    const server = attach(onMember, { ...UNLISTED_BUILD });
+    const presented = `${UNLISTED_BUILD.name}/${UNLISTED_BUILD.version}`;
     const path = join(stateDir, "cto.wake.sock");
     await abandonSocket(path);
 
@@ -276,7 +234,7 @@ describe("the CTO port names every holder that cannot be woken", () => {
     chmodSync(stateDir, 0o700);
     const onMember = binding("on-member");
     const { port, attach } = portOver([onMember], stateDir);
-    const server = attach(onMember, { ...WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] });
+    const server = attach(onMember, { ...UNLISTED_BUILD });
     const path = join(stateDir, "cto.wake.sock");
 
     // One registration that earns a refusal: the socket is there, every check passes, the connect
@@ -324,7 +282,7 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
     incarnation: "incarnation-1",
   };
 
-  const MEMBER = { ...WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] };
+  const MEMBER = { ...UNLISTED_BUILD };
 
   /**
    * Starts a real daemon with the production listener composition, and one CTO holder on it.
@@ -414,84 +372,24 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
     return { findings, roleKey, stateDir };
   };
 
-  it("names the build and says the binding cannot receive wakes, without naming a path", async () => {
-    const { findings, roleKey, stateDir } = await holderOn("outside", NOT_A_MEMBER);
-    const presented = `${NOT_A_MEMBER.name}/${NOT_A_MEMBER.version}`;
-
-    const finding = findings.find((candidate) => candidate.code === CODE);
-    expect(finding, "no finding for a binding whose holder is outside the qualified set").toBeDefined();
-    expect(finding?.observedEvidence).toEqual({
-      roleKey,
-      role: Role.PRIMARY_CTO,
-      presentedClient: presented,
-      cause: "build-outside-the-qualified-set",
-      wakeTransportQualifiedClients: WAKE_TRANSPORT_QUALIFIED_CLIENTS.map(({ name, version }) => `${name}/${version}`),
-      wakeTransportPinSource: "src/mcp/role-conversation.ts WAKE_TRANSPORT_QUALIFIED_CLIENTS",
-    });
-    expect(finding?.recommendedAction).toContain(presented);
-    expect(finding?.recommendedAction).toContain("cannot receive wakes");
-    // The repair open to every such holder comes first; qualifying its build is offered only with
-    // the condition that closes it -- the updater may have deleted the file the holder runs.
-    expect(finding?.recommendedAction).toContain("Restart the holder on a qualified build");
-    expect(finding?.recommendedAction).toContain("may already have deleted");
-
-    // Not the state directory, not the socket beside it, and no absolute path of any kind.
-    const text = JSON.stringify(finding);
-    expect(text).not.toContain(stateDir);
-    expect(text).not.toContain(".sock");
-    expect(text).not.toMatch(/"\/|\s\/[A-Za-z]/);
-  });
-
-  it("reports a holder whose initialize declared no build, with presentedClient null and no path", async () => {
-    const { findings, roleKey, stateDir } = await holderOn("no-build", undefined);
-
-    const finding = findings.find((candidate) => candidate.code === CODE);
-    expect(finding, "no finding for a binding whose holder declared no build").toBeDefined();
-    expect(finding?.observedEvidence).toEqual({
-      roleKey,
-      role: Role.PRIMARY_CTO,
-      presentedClient: null,
-      cause: "no-declared-build",
-      wakeTransportQualifiedClients: WAKE_TRANSPORT_QUALIFIED_CLIENTS.map(({ name, version }) => `${name}/${version}`),
-      wakeTransportPinSource: "src/mcp/role-conversation.ts WAKE_TRANSPORT_QUALIFIED_CLIENTS",
-    });
-    expect(finding?.recommendedAction).toContain("declared no client build");
-    expect(finding?.recommendedAction).toContain("cannot receive wakes");
-    expect(finding?.recommendedAction).not.toContain("null");
-    // Not a restart: mid-initialize ends on its own, and a missing `clientInfo` survives a restart
-    // that sends the same request.
-    expect(finding?.recommendedAction).toContain("`clientInfo`");
-    expect(finding?.recommendedAction).not.toMatch(/restart the holder on/i);
-
-    const text = JSON.stringify(finding);
-    expect(text).not.toContain(stateDir);
-    expect(text).not.toContain(".sock");
-    expect(text).not.toMatch(/"\/|\s\/[A-Za-z]/);
-  });
-
-  it("reports a holder on a qualified build that has registered no wake endpoint", async () => {
-    // The production defect this row exists for: `unwakeableHolders` returned early on a qualified
-    // build, so the one state this slice is about -- a member build the daemon still cannot wake --
-    // was the one it never reported. The binding reads ACTIVE, the peer is live, `wake` refuses for
+  it("reports a holder that has registered no wake endpoint", async () => {
+    // The state this report exists for: the binding reads ACTIVE, the peer is live, `wake` refuses for
     // want of an endpoint, and an addressed message waits.
     const { findings, roleKey, stateDir } = await holderOn("member-unregistered", MEMBER);
     const presented = `${MEMBER.name}/${MEMBER.version}`;
 
     const finding = findings.find((candidate) => candidate.code === CODE);
-    expect(finding, "no finding for a qualified holder that registered no wake endpoint").toBeDefined();
+    expect(finding, "no finding for a holder that registered no wake endpoint").toBeDefined();
     expect(finding?.observedEvidence).toEqual({
       roleKey,
       role: Role.PRIMARY_CTO,
       presentedClient: presented,
       cause: "no-registered-endpoint",
-      wakeTransportQualifiedClients: WAKE_TRANSPORT_QUALIFIED_CLIENTS.map(({ name, version }) => `${name}/${version}`),
-      wakeTransportPinSource: "src/mcp/role-conversation.ts WAKE_TRANSPORT_QUALIFIED_CLIENTS",
     });
     expect(finding?.recommendedAction).toContain("cannot receive wakes");
     expect(finding?.recommendedAction).toContain("registered no wake endpoint");
     // The repair is a flag, not a restart on another build: this build is already a member.
     expect(finding?.recommendedAction).toContain("--messaging-socket-path");
-    expect(finding?.recommendedAction).not.toContain("Restart the holder on a qualified build");
 
     const text = JSON.stringify(finding);
     expect(text).not.toContain(stateDir);
@@ -514,14 +412,11 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
       role: Role.PRIMARY_CTO,
       presentedClient: presented,
       cause: "registered-endpoint-refused-the-wake",
-      wakeTransportQualifiedClients: WAKE_TRANSPORT_QUALIFIED_CLIENTS.map(({ name, version }) => `${name}/${version}`),
-      wakeTransportPinSource: "src/mcp/role-conversation.ts WAKE_TRANSPORT_QUALIFIED_CLIENTS",
     });
     expect(finding?.recommendedAction).toContain("cannot receive wakes");
     expect(finding?.recommendedAction).toContain("the last wake sent under the registration it holds now was refused");
     // It says a wake failed, not that the next one must, and the repair is the holder's own restart.
     expect(finding?.recommendedAction).toContain("Restart the holder so it binds and registers again");
-    expect(finding?.recommendedAction).not.toContain("Restart the holder on a qualified build");
     expect(finding?.recommendedAction).not.toContain("--messaging-socket-path");
 
     const text = JSON.stringify(finding);
@@ -530,7 +425,7 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
     expect(text).not.toMatch(/"\/|\s\/[A-Za-z]/);
   });
 
-  it("stays quiet when the holder runs a qualified build and has registered a usable endpoint — the control", async () => {
+  it("stays quiet when the holder has registered a usable endpoint — the control", async () => {
     // A control the defect could not have satisfied: this holder is wakeable, through the real
     // registration tool, against a real socket in the daemon's own state directory.
     const { findings } = await holderOn("member", MEMBER, true);
@@ -617,16 +512,15 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
     expect(persistedStatus).not.toBe("HEALTHY");
   };
 
-  it("the automatic refresh does not persist HEALTHY while a connected holder is outside the set", async () => {
-    await expectTheRefreshReportsOneUnwakeableHolder("outside", NOT_A_MEMBER);
+  it("the automatic refresh does not persist HEALTHY while a connected holder has no usable endpoint", async () => {
     await expectTheRefreshReportsOneUnwakeableHolder("no-build", undefined);
-    // The state the scan used to skip: a member build with no registration reaches this door too.
-    await expectTheRefreshReportsOneUnwakeableHolder("member-unregistered", MEMBER);
+    // A holder with no registration reaches this door too.
+    await expectTheRefreshReportsOneUnwakeableHolder("unregistered", MEMBER);
     // And the one no filesystem check can see: a registration that validates and takes no wake.
     await expectTheRefreshReportsOneUnwakeableHolder("refused", MEMBER, "abandoned");
   });
 
-  it("the automatic refresh reports no such finding for a holder on a qualified build that is wakeable — the control", async () => {
+  it("the automatic refresh reports no such finding for a holder that is wakeable — the control", async () => {
     // A control the defect could not have satisfied: this holder is wakeable, through the real
     // registration tool, against a real socket in the daemon's own state directory. It no longer
     // asserts a persisted `HEALTHY` -- with the doctor's own checks running, this deployment is
@@ -681,7 +575,7 @@ const callTool = async (
  * Stands in for the socket a woken client binds for itself: a listening unix socket, and a record
  * of what arrived.
  *
- * Deliberately **not** chmod'd. The real qualified runtime binds its own socket under its own umask
+ * Deliberately **not** chmod'd. The real runtime binds its own socket under its own umask
  * and never touches that file's mode, so a helper that tightened it here would be testing an
  * endpoint no real client produces. The rows chmod the *directory*, which is where the 0700
  * boundary actually is.

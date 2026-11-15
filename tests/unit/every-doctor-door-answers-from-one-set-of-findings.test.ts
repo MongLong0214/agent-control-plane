@@ -10,7 +10,6 @@ import { startDaemonMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Daemon, OPERATOR_METHOD, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
 import type { DoctorReport, Finding } from "../../src/doctor/doctor.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import { WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest, makeHarness } from "../helpers/harness.ts";
 
@@ -41,13 +40,10 @@ const PEER: AuthenticatedOperatorPeer = {
   incarnation: "incarnation-1",
 };
 
-/** A build outside the committed set, derived from a member so it can never become one by a move. */
-const NOT_A_MEMBER = {
-  name: WAKE_TRANSPORT_QUALIFIED_CLIENTS[0].name,
-  version: `${WAKE_TRANSPORT_QUALIFIED_CLIENTS[0].version}.9999-not-a-member`,
-};
+/** A client that never registers a wake endpoint, so its holder is unwakeable for want of one. */
+const NOT_A_MEMBER = { name: "claude-code", version: "2.1.323" };
 
-const MEMBER = { ...WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] };
+const MEMBER = { ...NOT_A_MEMBER };
 
 const valueOf = <T>(decision: Decision<T>): T => {
   if (!decision.allowed) throw new Error(JSON.stringify(decision));
@@ -149,8 +145,8 @@ const unwakeableIn = (report: DoctorReport): Finding[] =>
   report.findings.filter((finding) => finding.code === CODE);
 
 /**
- * A started daemon with the production listener composition, a CTO holder connected on a build the
- * wake transport was never qualified on, and a CEO holder connected beside it.
+ * A started daemon with the production listener composition, a CTO holder connected that has registered
+ * no wake endpoint, and a CEO holder connected beside it.
  *
  * The CTO holder is the unwakeable one: `registerEndpoint` refuses a peer whose declared build is
  * outside the set, and a binding with no registered endpoint gets no wakes. The CEO holder exists
@@ -218,7 +214,7 @@ describe("every door that answers whether the system is healthy answers from one
         roleKey,
         role: Role.PRIMARY_CTO,
         presentedClient: `${NOT_A_MEMBER.name}/${NOT_A_MEMBER.version}`,
-        cause: "build-outside-the-qualified-set",
+        cause: "no-registered-endpoint",
       });
       expect(unwakeable[0]?.recommendedAction).toContain("cannot receive wakes");
     } finally {
@@ -240,7 +236,7 @@ describe("every door that answers whether the system is healthy answers from one
         roleKey,
         role: Role.PRIMARY_CTO,
         presentedClient: `${NOT_A_MEMBER.name}/${NOT_A_MEMBER.version}`,
-        cause: "build-outside-the-qualified-set",
+        cause: "no-registered-endpoint",
       });
     } finally {
       await close();

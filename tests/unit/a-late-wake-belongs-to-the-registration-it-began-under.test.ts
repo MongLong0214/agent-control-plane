@@ -31,7 +31,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, type RoleBinding } from "../../src/domain/types.ts";
-import { RoleConversationPort, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
+import { RoleConversationPort } from "../../src/mcp/role-conversation.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 /**
@@ -132,7 +132,7 @@ const dialled = async (count: number): Promise<void> => {
 
 describe("a wake belongs to the registration it began under", () => {
   const holder = binding("on-member");
-  const client = { ...WAKE_TRANSPORT_QUALIFIED_CLIENTS[0]! };
+  const client = { ...{ name: "claude-code", version: "2.1.323" } };
 
   /** The real port, over one active binding, with one attached peer on a qualified build. */
   const attached = (stateDir: string) => {

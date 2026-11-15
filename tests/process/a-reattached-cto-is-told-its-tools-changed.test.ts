@@ -11,7 +11,7 @@ import { ATTACH_EXIT, runAttachRelay, type ReattachPolicy, type SessionMessaging
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startLocalMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
-import { RoleConversationPort, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
+import { RoleConversationPort } from "../../src/mcp/role-conversation.ts";
 import { count } from "../helpers/adopted-ceo.ts";
 import {
   canonicalCtoFixture,
@@ -55,7 +55,7 @@ import { clearSessionMessagingEnv, inheritedSessionMessagingNames, SESSION_MESSA
 const TOKEN = "fixture-mcp-token";
 const MESSAGING_TOKEN = "fixture-messaging-token-4c1e";
 const POLICY: Partial<ReattachPolicy> = { maxWaitMs: 8_000, initialDelayMs: 20, maxDelayMs: 100, attemptTimeoutMs: 3_000 };
-const qualified = WAKE_TRANSPORT_QUALIFIED_CLIENTS[0]!;
+const qualified = { name: "claude-code", version: "2.1.323" };
 const RELAY_REATTACHING_ERROR_CODE = -32001;
 
 /** Every CLAUDE_CODE_MESSAGING_* variable, not only the socket and token the relay reads (R1154-01). */

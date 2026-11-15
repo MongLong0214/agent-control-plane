@@ -10,7 +10,7 @@ import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startDaemonMcpListeners, wakeRoleHolder } from "../../src/daemon/agentcpd.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import { ROLE_WAKE_FRAME, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
+import { ROLE_WAKE_FRAME } from "../../src/mcp/role-conversation.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, SELF_CLAIM_PROTOCOL } from "../../src/registry/canonical-self-claim.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -93,7 +93,7 @@ const start = async (options: { canonical?: boolean } = {}) => {
   const listeners = await startDaemonMcpListeners(h.cp, dir, "wake-cause-mcp-token", { finalizeApprovedRun: () => undefined });
   const holder = h.cp.bindings.active(roleKey)!;
   const server = new McpServer({ name: "wake-cause", version: "1" });
-  vi.spyOn(server.server, "getClientVersion").mockReturnValue(WAKE_TRANSPORT_QUALIFIED_CLIENTS[0]);
+  vi.spyOn(server.server, "getClientVersion").mockReturnValue({ name: "claude-code", version: "2.1.323" });
   listeners.ctoConversation.attach(server, () => allow(ReasonCode.OK, {
     actor: holder.sessionId, sessionId: holder.sessionId, sessionIncarnation: holder.sessionIncarnation,
   }));

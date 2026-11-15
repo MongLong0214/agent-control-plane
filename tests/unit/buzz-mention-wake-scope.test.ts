@@ -24,7 +24,7 @@ import { deliverBuzzMessage } from "../../src/ingress/buzz-message.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { HERMES_PROVENANCE_META_KEY } from "../../src/mcp/hermes-provenance.ts";
-import { ROLE_WAKE_FRAME, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
+import { ROLE_WAKE_FRAME } from "../../src/mcp/role-conversation.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { IN_BAND_KINDS } from "../../src/outbox/outbox.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, SELF_CLAIM_PROTOCOL } from "../../src/registry/canonical-self-claim.ts";
@@ -162,7 +162,7 @@ const start = async () => {
 
   const attach = async (sessionId: string, incarnation: string, socketName: string) => {
     const server = new McpServer({ name: "wake-scope", version: "1" });
-    vi.spyOn(server.server, "getClientVersion").mockReturnValue(WAKE_TRANSPORT_QUALIFIED_CLIENTS[0]);
+    vi.spyOn(server.server, "getClientVersion").mockReturnValue({ name: "claude-code", version: "2.1.323" });
     conversation.attach(server, () => allow(ReasonCode.OK, { actor: sessionId, sessionId, sessionIncarnation: incarnation }));
     const endpoint = await socketAt(join(dir, socketName));
     const before = wakes.dialled.length;

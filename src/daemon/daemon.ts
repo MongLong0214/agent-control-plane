@@ -107,7 +107,6 @@ import {
 } from "./dead-binding-recovery.ts";
 import {
   type UnwakeableHolder,
-  wakeTransportQualifiedLabels,
 } from "../mcp/role-conversation.ts";
 import { SingleInstanceLock } from "./single-instance.ts";
 import { readProcessGroup } from "../bootstrap/attempt-writer-group.ts";
@@ -1655,7 +1654,7 @@ export class Daemon {
    * them however it was asked for. The history is worth keeping, because it is the same mistake
    * twice. They began as `run()`'s third argument, and only the operator door passed it, so
    * `reconcile()` and the periodic/reactive refresh evaluated without them: a connected holder
-   * outside the qualified set made an on-demand report `DEGRADED` while the next automatic
+   * with no usable endpoint made an on-demand report `DEGRADED` while the next automatic
    * evaluation, clean in every other respect, wrote `HEALTHY` to `health.json` with that holder
    * still unwakeable. Reading them *here* fixed all four of this method's callers and left the two
    * doors that do not come through here -- the CTO and Hermes MCP `doctor_run` tools -- still
@@ -3543,68 +3542,31 @@ export class Daemon {
   /**
    * A binding that is active and whose holder cannot receive a wake.
    *
-   * `registerEndpoint` refuses a peer whose declared build is outside the qualified set, and a
-   * binding with no registered endpoint gets no wakes: `wake` refuses, and the Buzz ingress stores
-   * the message and waits for a registration that will never come. Every piece of that is correct
-   * on its own terms and none of it is loud, so the only symptom was that wakes silently did not
-   * arrive -- the #674 shape again, a binding reading ACTIVE while nothing can reach it, with a
-   * different cause. On 2026-09-27 that was every live client on the host: three builds, none of
-   * them a member.
+   * A binding with no registered endpoint gets no wakes: `wake` refuses, and the Buzz ingress
+   * stores the message and waits for a registration that has not come. Every piece of that is
+   * correct on its own terms and none of it is loud, so the only symptom was that wakes silently
+   * did not arrive -- the #674 shape again, a binding reading ACTIVE while nothing can reach it.
    *
-   * The build is one of five causes and not the definition. A holder on a qualified build that has
-   * registered no endpoint, or whose registered endpoint no longer validates, is exactly as
-   * unreachable -- and until 2026-09-28 the scan returned early on a qualified build, so that was
-   * the one state nothing reported. Each cause gets its own sentence and its own repair, because
-   * they are different operator acts: a restart on a member, a `clientInfo` in the handshake, a
-   * `--messaging-socket-path` the daemon will accept, a state directory whose ownership and mode
+   * Three causes, each with its own sentence and repair, because they are different operator acts:
+   * a `--messaging-socket-path` the daemon will accept, a state directory whose ownership and mode
    * have been put back, or a restart after a listener died behind a socket file that outlived it.
    *
-   * One finding per binding, because the repair is per holder and an operator has to know which is
-   * which. The evidence names the role key, the build the connection declared, the cause, and the
-   * qualified set, and never a path: the port answers in `name/version` labels and cause names for
-   * the reason its `EndpointCheck` gives.
+   * One finding per binding, because the repair is per holder. The evidence names the role key,
+   * the build the connection declared and the cause, and never a path.
    *
-   * Reported rather than refused. The binding is legitimately held: the claim that admitted its
-   * holder observes the executing image and compares it to no build, so nothing about the build
-   * made the hold wrong. What the holder lacks is a qualified transport, and there is no refusal
-   * that supplies one. Revoking the binding would lose the conversation it exists to keep and
-   * still deliver no wake, because a successor on the same build is refused the endpoint the same
-   * way. The repairs are operator acts, so what this finding owes is to make a condition whose
-   * every piece is quiet loud -- and to name only a repair that is open. A restart on a member is
-   * open to every holder on a build. Qualifying the holder's own build is open only while a file of
-   * that build can still be started, and the updater deletes old versions under running sessions
-   * (measured 2026-09-28: a live session on 2.1.278, its version file gone), so the text offers it
-   * conditionally. A holder that has declared no build is either mid-`initialize`, which ends on
-   * its own, or omitting `clientInfo`, which a restart that sends the same request does not fix.
+   * Reported rather than refused. The binding is legitimately held, and revoking it would lose the
+   * conversation it exists to keep and still deliver no wake.
    */
   private unwakeableBindingFindings(): Finding[] {
     const holders = this.#wakeTransportPeers?.unwakeableHolders() ?? [];
     return holders.map((holder): Finding => {
-      // The consequence is one sentence for all four -- the binding is active and no wake reaches
-      // it -- so only the cause and the repair branch. A holder that declared no build is refused
-      // the endpoint exactly as one outside the set is; what differs is that there is no build to
-      // qualify and no name to put in the text.
+      // The consequence is one sentence for all three -- the binding is active and no wake reaches
+      // it -- so only the cause and the repair branch.
       const { cause, repair } = ((): { cause: string; repair: string } => {
         switch (holder.cause) {
-          case "no-declared-build":
-            return {
-              cause: "its holder's connection has declared no client build",
-              repair:
-                "A holder still completing `initialize` needs nothing: once it declares a qualified build it " +
-                "can register, and a later report names that build. One that keeps declaring none has to send " +
-                "`clientInfo` in its `initialize` request; restarting it on the same request changes nothing",
-            };
-          case "build-outside-the-qualified-set":
-            return {
-              cause: `its holder runs ${holder.presented}, which is not a build this wake transport was qualified on`,
-              repair:
-                "Restart the holder on a qualified build. Qualifying this build instead (`pnpm " +
-                "qualify:wake-transport` pointed at it, then adding it to the set) needs a file of the build " +
-                "that can still be started, and the updater may already have deleted the one the holder runs",
-            };
           case "no-registered-endpoint":
             return {
-              cause: `its holder runs ${holder.presented}, a qualified build, and has registered no wake endpoint on this connection`,
+              cause: `its holder runs ${holder.presented}, and has registered no wake endpoint on this connection`,
               repair:
                 "Start the holder with `--messaging-socket-path` naming a socket directly inside this " +
                 "deployment's owner-only state directory, which is the only place a registration is accepted " +
@@ -3614,7 +3576,7 @@ export class Daemon {
           case "registered-endpoint-not-usable":
             return {
               cause:
-                `its holder runs ${holder.presented}, a qualified build, and the wake endpoint it registered no ` +
+                `its holder runs ${holder.presented}, and the wake endpoint it registered no ` +
                 "longer passes the checks made before a wake is sent",
               repair:
                 "Its socket has gone, or the state directory it sits in is no longer a directory this uid owns " +
@@ -3624,7 +3586,7 @@ export class Daemon {
           case "registered-endpoint-refused-the-wake":
             return {
               cause:
-                `its holder runs ${holder.presented}, a qualified build whose registered wake endpoint still ` +
+                `its holder runs ${holder.presented}, whose registered wake endpoint still ` +
                 "passes every check made before a wake is sent, and the last wake sent under the registration it " +
                 "holds now was refused",
               repair:
@@ -3645,12 +3607,10 @@ export class Daemon {
           role: holder.role,
           presentedClient: holder.presented,
           cause: holder.cause,
-          wakeTransportQualifiedClients: wakeTransportQualifiedLabels(),
-          wakeTransportPinSource: "src/mcp/role-conversation.ts WAKE_TRANSPORT_QUALIFIED_CLIENTS",
         },
         recommendedAction:
           `binding ${holder.roleKey} is active and ${cause}, so it cannot receive wakes: a message addressed ` +
-          "to it is stored, not delivered, until a holder on a qualified build has a wake endpoint that takes " +
+          "to it is stored, not delivered, until its holder has a wake endpoint that takes " +
           `a wake. ${repair}`,
       };
     });
@@ -3678,14 +3638,9 @@ export class Daemon {
    * caller now, and it is the doctor itself (#1010).
    */
   // No `canonicalExecutorPinFindings` any more (#886, withdrawn 2026-09-27). It compared the
-  // claim's executor pin, ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION, against the build the wake
-  // transport was qualified on, because a deployment where the two disagreed admitted no process:
-  // one side refused whichever build the other accepted. The claim no longer pins a build — it
-  // observes the executing image and compares it to nothing — so there is no second pin to
-  // disagree with, and the composition root stopped handing the report a version. Only
-  // `registerEndpoint`'s qualified set still names builds. A finding kept past that point could
-  // only ever be raised by a caller that set the value by hand, and its text would describe a
-  // refusal the claim no longer makes.
+  // claim's executor pin, ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION, against a build the wake
+  // transport named. The claim no longer pins a build, and neither does the wake transport, so
+  // there is nothing to disagree and no such finding.
   private supplementalSystemFindings(): Finding[] {
     return [
       ...this.telegramIngressFindings(),
