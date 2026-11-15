@@ -11,6 +11,7 @@ import {
 } from "../conversation/turn-coordinator.ts";
 import { isDigest } from "../core/digest.ts";
 import type { Db } from "../db/database.ts";
+import { DEFAULT_HERMES_GATEWAY_PORT, HERMES_GATEWAY_HOST } from "./hermes-gateway-endpoint.ts";
 
 /**
  * The receipt a Telegram turn's Hermes Gateway records, read back for the coordinator's sweep (U4).
@@ -42,7 +43,7 @@ import type { Db } from "../db/database.ts";
 export interface HermesGatewayReceiptPortOptions {
   /** `ACP_HERMES_GATEWAY_API_KEY`, presented as a Bearer token. */
   apiKey: string;
-  /** Ephemeral test listener only; production uses the Gateway's fixed port 8642. */
+  /** The Gateway port (`configuredHermesGatewayPort`); omitted is the default, 8642. */
   port?: number;
 }
 
@@ -373,7 +374,7 @@ const getReceipt = (
     // after a refusal cannot replace the refusal's cause.
     const fail = (result: ReceiptLookupResult): void => resolve({ kind: "ANSWERED", result });
     const req = request({
-      hostname: "127.0.0.1",
+      hostname: HERMES_GATEWAY_HOST,
       family: 4,
       port: options.port,
       path: `${PATH_PREFIX}${updateId}`,
@@ -414,7 +415,7 @@ export class HermesGatewayReceiptPort implements ReceiptPort {
   readonly #sourceOf: TelegramTurnSourceResolver;
 
   constructor(sourceOf: TelegramTurnSourceResolver, options: HermesGatewayReceiptPortOptions) {
-    const port = options.port ?? 8642;
+    const port = options.port ?? DEFAULT_HERMES_GATEWAY_PORT;
     if (typeof options.apiKey !== "string" || !/^[\x21-\x7e]+$/.test(options.apiKey)) {
       throw new Error("the Hermes Gateway receipt port needs a printable API key");
     }

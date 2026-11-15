@@ -30,6 +30,7 @@ import {
   drivenModeSql,
   drivenSpawnRecordOf,
 } from "../runtime/provisioned-session-runtime.ts";
+import { DAEMON_NOTICE_MAX_REQUEST_BYTES } from "../runtime/hermes-gateway-conversation.ts";
 import {
   type FencedEnvelope,
   HOLDER_CLAIMED_KINDS,
@@ -873,6 +874,67 @@ export const settleStoppedSessionInstructions = (
   );
 
 /**
+ * U6 B1 — a CEO notification's `origin` (the owner's `/acp` turn its run was dispatched in) is current
+ * only while the notification is addressed to that turn's own CEO generation and session and the origin
+ * names the one Telegram update that turn answered. Any other origin — readdressed to a successor, a
+ * turn that does not exist, another update, a malformed value — is NOT_CURRENT: the notice still goes,
+ * without it, and the owner's reply is recorded undelivered (`ORIGIN_NOT_CURRENT`).
+ */
+type CeoNoticeOrigin =
+  | { state: "NONE" }
+  | { state: "CURRENT"; origin: unknown }
+  | { state: "NOT_CURRENT"; origin: unknown; stripped: OutboxMessage };
+
+const ceoNoticeOrigin = (db: Pick<Db, "get">, message: OutboxMessage): CeoNoticeOrigin => {
+  const payload = message.payload;
+  if (typeof payload !== "object" || payload === null || !("origin" in payload)) return { state: "NONE" };
+  const { origin, ...rest } = payload as Record<string, unknown>;
+  const named = typeof origin === "object" && origin !== null ? origin as { turn_request_id?: unknown; update_id?: unknown } : {};
+  const current = typeof named.turn_request_id === "string" && typeof named.update_id === "string" && db.get<{ 1: number }>(
+    `SELECT 1 FROM canonical_turns t JOIN canonical_turn_sources s ON s.turn_request_id = t.turn_request_id
+      WHERE t.turn_request_id = ? AND t.binding_generation = ? AND t.executor_session_id = ?
+        AND s.source_channel = 'telegram' AND s.source_nonce = ?
+        AND (SELECT COUNT(*) FROM canonical_turn_sources o WHERE o.turn_request_id = t.turn_request_id) = 1`,
+    [named.turn_request_id, message.bindingGeneration, message.targetSessionId, `update:${named.update_id}`],
+  ) !== undefined;
+  return current ? { state: "CURRENT", origin } : { state: "NOT_CURRENT", origin, stripped: { ...message, payload: rest } };
+};
+
+/** The bytes one string adds to a signed daemon-notice body: escaped once in the notice text, then again in the body. */
+const noticeBodyBytes = (text: string): number => Buffer.byteLength(JSON.stringify(JSON.stringify(text))) - 6;
+
+/**
+ * U6 B1 — a notice with a current origin whose one signed body is `over` bytes past the daemon-notice
+ * route's bound, made to fit with its origin: its longest text field is cut on a code point, so a UTF-8,
+ * boundary and marked with what was omitted and the run that keeps it. Only the copy sent is cut; the
+ * outbox row keeps the whole payload. Null when that field cannot absorb `over` and its marker.
+ */
+const boundedOriginNotice = (message: OutboxMessage, over: number):
+  { message: OutboxMessage; truncated: { field: string; omittedBytes: number } } | null => {
+  const payload = message.payload as Record<string, unknown>;
+  const field = Object.keys(payload).filter((key) => key !== "origin" && typeof payload[key] === "string")
+    .sort((a, b) => (payload[b] as string).length - (payload[a] as string).length)[0];
+  if (field === undefined) return null;
+  const value = payload[field] as string;
+  const marker = (omitted: number) => ` [truncated: ${omitted} bytes omitted; full result in ACP run ${message.runId ?? "unknown"}]`;
+  // The marker is priced at its longest, every byte omitted, so the cut is never short.
+  const budget = noticeBodyBytes(value) - over - noticeBodyBytes(marker(Buffer.byteLength(value)));
+  if (budget < 0) return null;
+  let kept = "";
+  let used = 0;
+  for (const character of value) {
+    used += noticeBodyBytes(character);
+    if (used > budget) break;
+    kept += character;
+  }
+  const omittedBytes = Buffer.byteLength(value) - Buffer.byteLength(kept);
+  return { message: { ...message, payload: { ...payload, [field]: kept + marker(omittedBytes) } }, truncated: { field, omittedBytes } };
+};
+
+/** Why a CEO notification's origin got no reply to the owner's message; the audit row is written once. */
+type OwnerReplyUndelivered = "ORIGIN_NOT_CURRENT";
+
+/**
  * Every unsettled CEO notification follows the current holder with its sealed content and id.
  * Restore delivery from only the selected room/recipient's ledger, independently of the previous
  * row state. Acceptance proves SENT, never ACKED; UNKNOWN stays held. An eligible new receiver
@@ -1205,6 +1267,25 @@ export class Outbox {
     });
   }
 
+  /**
+   * U6 B1 — the owner's `/acp` message gets no reply from this notification, and why: one
+   * `CEO_NOTIFICATION_OWNER_REPLY_UNDELIVERED` per message and reason. A transport ACK of the notice
+   * never settles this; nothing here says the CEO did or did not receive the notice itself.
+   */
+  #recordOwnerReplyUndelivered(message: OutboxMessage, reason: OwnerReplyUndelivered, origin: unknown): void {
+    if (this.db.get(`SELECT 1 FROM audit_events WHERE kind = 'CEO_NOTIFICATION_OWNER_REPLY_UNDELIVERED'
+      AND json_extract(evidence_json, '$.messageId') = ? AND json_extract(evidence_json, '$.reason') = ?`,
+    [message.messageId, reason])) return;
+    this.audit.record({
+      kind: "CEO_NOTIFICATION_OWNER_REPLY_UNDELIVERED",
+      roleKey: message.roleKey, sessionId: message.targetSessionId, runId: message.runId,
+      evidence: {
+        messageId: message.messageId, targetSessionId: message.targetSessionId,
+        bindingGeneration: message.bindingGeneration, reason, origin,
+      },
+    });
+  }
+
   deliverCeoNotifications(): Promise<void> {
     this.#ceoPending = true;
     if (this.#ceoDelivering) return this.#ceoDelivering;
@@ -1236,10 +1317,29 @@ export class Outbox {
           let unavailable = false;
           let reasonCode: ReasonCode = ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED;
           let outcome: CeoNoticeOutcome = "UNKNOWN";
-          const attempt = new CeoNoticeRoute(this.db, this.audit, hydrate(row));
+          const message = hydrate(row);
+          const attempt = new CeoNoticeRoute(this.db, this.audit, message);
           if (attempt.withholdBeforeSend()) continue;
+          // U6 B1 — an origin the notice may no longer carry is dropped, and the owner's reply recorded
+          // undelivered. A current one goes whole, in one signed body, on the daemon-notice route; a body past
+          // that route's bound is not posted but sent again with its longest text cut to fit, origin kept.
+          const origin = ceoNoticeOrigin(this.db, message);
+          if (origin.state === "NOT_CURRENT") this.#recordOwnerReplyUndelivered(message, "ORIGIN_NOT_CURRENT", origin.origin);
+          let over = 0;
+          const route: CeoNoticeAttempt = origin.state !== "CURRENT" ? attempt : {
+            prepare: (destination, requests) => {
+              over = Math.max(0, ...requests.map((request) => Buffer.byteLength(JSON.stringify(request)) - DAEMON_NOTICE_MAX_REQUEST_BYTES));
+              return over === 0 ? attempt.prepare(destination, requests) : { route: "WITHHELD" };
+            },
+          };
+          let truncated: { field: string; omittedBytes: number } | null = null;
           try {
-            const result = await send(hydrate(row), attempt);
+            let result = await send(origin.state === "NOT_CURRENT" ? origin.stripped : message, route);
+            const bounded = over > 0 ? boundedOriginNotice(message, over) : null;
+            if (bounded) {
+              truncated = bounded.truncated;
+              result = await send(bounded.message, route);
+            }
             unavailable = !result.allowed && result.reasonCode === ReasonCode.CEO_CONVERSATION_UNAVAILABLE;
             accepted = result.allowed;
             reasonCode = result.reasonCode;
@@ -1247,23 +1347,27 @@ export class Outbox {
           } catch { /* retained below */ }
           if (attempt.route !== "CANONICAL") continue;
           if (unavailable) {
-            // No target was found, so no transport attempt took place. Retain PENDING and
-            // record withholding once per message/target, just like the unattached route.
-            this.#recordWithheldCeoNotification(hydrate(row), "CANONICAL_TARGET_UNAVAILABLE");
+            // No target was found, or an origin's notice could not be cut to one body, so no transport attempt
+            // took place. Retain PENDING and record withholding once per message/target, like the unattached route.
+            this.#recordWithheldCeoNotification(hydrate(row), over > 0 ? "ORIGIN_NOTICE_TOO_LARGE" : "CANONICAL_TARGET_UNAVAILABLE");
             continue;
           }
           this.db.tx(() => {
             attempt.finish(outcome);
-            const updated = this.db.run(`UPDATE outbox SET status = ?, attempts = attempts + 1, acked_at = ?
+            // A transport ACK of a notice whose origin was dropped is not the owner's reply: a row with no
+            // reason of its own says why; a retargeted one keeps its mark, and the audit row says it for both.
+            const updated = this.db.run(`UPDATE outbox SET status = ?, attempts = attempts + 1, acked_at = ?,
+              reason_code = COALESCE(reason_code, ?)
             WHERE message_id = ? AND status = 'PENDING' AND binding_generation = ? AND target_session_id = ?
               AND ${liveDeliveryTarget("outbox")}`,
             [accepted ? "ACKED" : "PENDING", accepted ? this.clock.nowIso() : null,
+              accepted && origin.state === "NOT_CURRENT" ? "ORIGIN_NOT_CURRENT" : null,
               row.message_id, row.binding_generation, row.target_session_id]);
             if (updated.changes !== 1) return;
             this.audit.record({ kind: accepted ? "CEO_NOTIFICATION_ACCEPTED" : "CEO_NOTIFICATION_DELIVERY_FAILED",
             reasonCode,
             roleKey: row.role_key, sessionId: row.target_session_id, runId: row.run_id,
-            evidence: { messageId: row.message_id } });
+            evidence: { messageId: row.message_id, ...(truncated ? { truncated } : {}) } });
           });
         }
       } while (this.#ceoPending);

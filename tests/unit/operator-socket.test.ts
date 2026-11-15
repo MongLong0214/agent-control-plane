@@ -114,7 +114,7 @@ describe("daemon-owned Hermes incumbent adoption", () => {
       // This method bypasses daemon's idempotency cache: a fixed CLI key cannot replay success.
       expect(await operatorRequest(owner.socketPath, OPERATOR_TOKEN, request))
         .toMatchObject({ allowed: true, value: { actorId: "actor:ceo", sessionId: "session:bound" } });
-      expect(reader).toHaveBeenCalledWith({ apiKey: "fixture-gateway-key" });
+      expect(reader).toHaveBeenCalledWith({ apiKey: "fixture-gateway-key", port: 8642 });
       expect(read).toHaveBeenCalledTimes(2);
       expect(adopt).toHaveBeenCalledTimes(2);
       expect(adopt).toHaveBeenCalledWith({ gatewayPid: 222, gatewayStartToken: "darwin-tv:1.000001" });

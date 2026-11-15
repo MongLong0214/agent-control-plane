@@ -163,6 +163,24 @@ export interface CreateRunInput {
   adoptCanonicalCto?: CanonicalCtoBootstrapAdoption | null;
 }
 
+/**
+ * U6 B1 — the owner's Telegram `/acp` turn a CEO dispatch was made in: its canonical turn and the update
+ * it answered. Recorded with DISPATCHED, the dispatch's own audit row; a run's origin is its latest dispatch's.
+ * Kept in that row rather than a table of its own, which would be a schema migration.
+ */
+export interface DispatchOrigin {
+  turnRequestId: string;
+  updateId: string;
+}
+
+/** The origin the run's latest dispatch recorded, or null when that dispatch recorded none. */
+export const dispatchOriginOf = (audit: Pick<AuditLog, "forRun">, runId: string): DispatchOrigin | null => {
+  const origin = audit.forRun(runId).filter((event) => event.kind === "DISPATCHED").at(-1)?.evidence["originReply"];
+  if (typeof origin !== "object" || origin === null) return null;
+  const { turnRequestId, updateId } = origin as Record<string, unknown>;
+  return typeof turnRequestId === "string" && typeof updateId === "string" ? { turnRequestId, updateId } : null;
+};
+
 /** Provisioning a primary CTO belongs to the CTO lifecycle; the run engine only asks. */
 export interface CtoProvisioner {
   ensurePrimaryCto(projectId: string, runId: string): Promise<Decision<RoleBinding>>;
@@ -661,7 +679,10 @@ export class RunEngine {
    * the ones that keep a run from ever being owned by a stale or absent binding.
    */
   /** `hermesTurn` is the Hermes turn the CEO door admitted, recorded in this call's audit evidence. */
-  async dispatch(runId: string, options: { hermesTurn?: HermesAdmittedTurn } = {}): Promise<Decision<RunRow>> {
+  async dispatch(
+    runId: string,
+    options: { hermesTurn?: HermesAdmittedTurn; originReply?: DispatchOrigin } = {},
+  ): Promise<Decision<RunRow>> {
     const run = this.get(runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
     if (run.state !== RunState.QUEUED && run.state !== RunState.REVISION_REQUIRED) {
@@ -760,7 +781,7 @@ export class RunEngine {
 
     let activated: Decision<RunRow>;
     try {
-      activated = this.activateDispatched(runId, binding, staffed, options.hermesTurn, adoption);
+      activated = this.activateDispatched(runId, binding, staffed, options.hermesTurn, adoption, options.originReply);
     } catch (error) {
       if (staffed) await this.#bootstrapCto!.discard(staffed, "bootstrap dispatch failed");
       throw error;
@@ -781,6 +802,7 @@ export class RunEngine {
     staffed: BootstrapCtoStaffedSession | null,
     hermesTurn: HermesAdmittedTurn | undefined,
     adoption: RecordedBootstrapAdoption | null = null,
+    originReply?: DispatchOrigin,
   ): Decision<RunRow> {
     return this.db.txDecision(() => {
       const fresh = this.require(runId);
@@ -834,6 +856,7 @@ export class RunEngine {
               pinnedManifestDigest: effectiveManifest,
               ...(firstPin ? { manifestPin: { firstPin: true, from: null, to: effectiveManifest } } : {}),
               ...hermesTurnEvidence(hermesTurn),
+              ...(originReply ? { originReply: { turnRequestId: originReply.turnRequestId, updateId: originReply.updateId } } : {}),
             },
           });
           return allow(ReasonCode.OK, undefined);

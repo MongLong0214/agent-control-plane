@@ -54,7 +54,7 @@ import { type HermesAdmittedTurn, hermesTurnEvidence } from "../mcp/hermes-prove
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
 import { currentVerdictPasses, currentVerificationResults } from "../verify/verification-history.ts";
-import type { ContinuityGate } from "../run/run-engine.ts";
+import { type ContinuityGate, dispatchOriginOf } from "../run/run-engine.ts";
 import { residentBaseClone } from "../registry/resident-repositories.ts";
 import { currentStandardReviewEvidenceDigest, standardReviewEvidenceCurrent, takesStandardReviewEvidence } from "../review/standard-review-evidence.ts";
 import {
@@ -588,6 +588,9 @@ export class ProductionGate {
           throw acpError(afterTransition.reasonCode, afterTransition.message, afterTransition.evidence);
         }
 
+        // U6 B1 — the owner's `/acp` turn the run was dispatched in, signed with the notice so the CEO's
+        // answer can reply to that message; the outbox drops it if the CEO changes before it is sent.
+        const origin = dispatchOriginOf(this.audit, input.runId);
         const notice = this.outbox.enqueue({
           idempotencyKey: `notify:${NotificationKind.READY_FOR_CEO_REVIEW}:${input.runId}:${digestOf({
             goal: run.goal,
@@ -605,6 +608,7 @@ export class ProductionGate {
             goal: run.goal,
             candidateSnapshotDigest: input.candidateSnapshotDigest,
             humanGate,
+            ...(origin ? { origin: { turn_request_id: origin.turnRequestId, update_id: origin.updateId } } : {}),
           },
         });
         this.audit.record({
