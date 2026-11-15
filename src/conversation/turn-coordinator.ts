@@ -414,40 +414,6 @@ const MATERIALIZING_AUTHORITIES = new Set([
   "OPERATOR_AFTER_REVIEW",
 ]);
 
-/** How a turn ended, when something positively established it. */
-export type TurnOutcome =
-  | {
-      /** Typed pre-dispatch evidence that execution never started (#651). */
-      readonly kind: "NEVER_ADMITTED";
-      readonly authority: "ACP_PRE_DISPATCH";
-      readonly reasonCode: string;
-    }
-  | {
-      /**
-       * The turn ended and must never run again.
-       *
-       * Two authorities can say so, and they are not the same claim. `HERMES_TARGET` is the
-       * target's own durable receipt, which nothing can mint yet (#638). `ACP_OBSERVED_HERMES_REPLY`
-       * is what ACP can honestly say about a success it watched: the peer was re-authenticated
-       * before dispatch, `createMessage` returned a correlated reply, and the runtime resolved
-       * only after the reply child exited zero.
-       *
-       * The second is strong enough to forbid a re-run and not strong enough to be called the
-       * first. Stretching one name over both is the laundering this file keeps having to remove.
-       */
-      readonly kind: "COMPLETED";
-      readonly authority: "HERMES_TARGET" | "ACP_OBSERVED_HERMES_REPLY";
-      readonly reasonCode: string;
-      readonly evidenceDigest: string;
-    }
-  | {
-      /** The target proved a stale execution can no longer write. Also #638's to produce. */
-      readonly kind: "ABORTED";
-      readonly authority: "HERMES_TARGET" | "OWNER_AFTER_TARGET_FENCE";
-      readonly reasonCode: string;
-      readonly evidenceDigest: string;
-    };
-
 /**
  * Takes the right to run a turn, and records how it ended.
  *
