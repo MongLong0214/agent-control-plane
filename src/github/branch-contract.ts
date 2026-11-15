@@ -208,9 +208,3 @@ export const hotfixPropagationTargets = (
   profile: BranchProfile,
   activeReleases: readonly string[],
 ): string[] => ["main", profile.defaultBranch, ...activeReleases];
-
-/** §9.3 — history rewriting is allowed only on private task/fix branches. */
-export const mayRewriteHistory = (branch: string, profile: BranchProfile): boolean => {
-  const cls = classifyBranch(branch, profile).class;
-  return cls === "task" || cls === "fix";
-};

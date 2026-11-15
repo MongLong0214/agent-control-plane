@@ -547,8 +547,6 @@ export const standardReviewEvidenceAttachAccess = (source: Source, input: Standa
   return allow(ReasonCode.OK, candidate);
 };
 
-export const standardReviewEvidenceAttachAuthority = reviewEvidenceAttachAuthority;
-
 export const attachStandardReviewEvidence = (
   source: Source, peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: StandardReviewEvidenceAttachInput,
 ): Decision<{ digest: string }> => source.db.txDecision(() => {

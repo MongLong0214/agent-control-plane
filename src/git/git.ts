@@ -691,17 +691,6 @@ export const fileAt = async (cwd: string, ref: string, path: string): Promise<st
   return out.exitCode === 0 ? out.stdout : null;
 };
 
-export const commitExists = async (cwd: string, sha: string): Promise<boolean> =>
-  (await git(cwd, ["cat-file", "-e", `${sha}^{commit}`], { allowFailure: true })).exitCode === 0;
-
-export const branchesContaining = async (cwd: string, sha: string): Promise<string[]> => {
-  const out = await git(cwd, ["branch", "--all", "--contains", sha, "--format=%(refname:short)"], {
-    allowFailure: true,
-  });
-  if (out.exitCode !== 0) return [];
-  return out.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
-};
-
 export const addWorktree = async (
   cwd: string,
   path: string,

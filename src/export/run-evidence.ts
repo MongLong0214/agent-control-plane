@@ -1624,7 +1624,3 @@ export const assessBaselineMinimum = (runs: readonly RunEvidenceExport[]): Basel
     gaps,
   };
 };
-
-/** Emits the exact canonical bytes promised by the export schema. */
-export const canonicalRunEvidenceJson = (value: RunEvidenceExport): string => canonicalJson(value);
-export const canonicalBaselineEvidenceJson = (value: BaselineEvidenceExport): string => canonicalJson(value);

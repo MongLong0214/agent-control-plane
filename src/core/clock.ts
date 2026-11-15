@@ -35,6 +35,3 @@ export class ManualClock implements Clock {
 
 export const isoPlus = (from: string, ms: number): string =>
   new Date(new Date(from).getTime() + ms).toISOString();
-
-export const isBefore = (a: string, b: string): boolean =>
-  new Date(a).getTime() < new Date(b).getTime();

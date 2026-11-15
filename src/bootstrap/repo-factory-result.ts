@@ -147,19 +147,3 @@ export const parseRepoFactoryResult = (input: unknown): Decision<RepoFactoryResu
 
   return allow(ReasonCode.OK, parsed.data);
 };
-
-/** Integration §13.6 — the portable handoff seed Repo Factory may supply. */
-export const bootstrapHandoffSeedSchema = z
-  .object({
-    projectGoal: z.string().min(1),
-    activeManifestDigest: z.string().min(1),
-    createdRepositories: z.array(z.string()).default([]),
-    createdBranches: z.array(z.string()).default([]),
-    artifactLocations: z.array(z.string()).default([]),
-    verificationCommands: z.array(z.string()).default([]),
-    knownLimitations: z.array(z.string()).default([]),
-    recommendedFirstRuns: z.array(z.string()).default([]),
-  })
-  .strict();
-
-export type BootstrapHandoffSeed = z.infer<typeof bootstrapHandoffSeedSchema>;

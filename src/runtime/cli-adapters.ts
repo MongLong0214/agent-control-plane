@@ -1998,13 +1998,6 @@ const hostCredentialPaths = (providerCredentialDir?: string): string[] => {
   ];
 };
 
-/**
- * A provider credential scope the deployment provisioned, if any. Its presence is what makes
- * closing the host keychain possible rather than self-defeating; see `hostCredentialPaths`.
- */
-export const scopedProviderCredentials = (): string | null =>
-  process.env["ACP_PROVIDER_CREDENTIAL_DIR"] ?? process.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] ?? null;
-
 /** What `runtimeProfile` re-opens for reading after its denies; see `productionRunCli`. */
 export interface RuntimeReadablePaths {
   subtrees?: readonly string[];
