@@ -58,6 +58,14 @@ export interface TaskResult {
   baseSha: string;
   /** #1242 — the commit its branch started at, when not `baseSha`: its predecessors' integration. */
   startSha?: string;
+  /** CEO msg_8f666e55 — for the last task of a chain of corrections: each task its chain supersedes (`ChainLink`). */
+  supersedes?: ChainLink[];
+}
+
+/** A task a chain of corrections supersedes: its commit, and the commit its branch started at. */
+export interface ChainLink {
+  commit: string;
+  startSha: string;
 }
 
 export interface IntegratedCandidate {
@@ -216,12 +224,12 @@ export const supersessionBinding = (db: Db, runId: string, originalTaskId: strin
 
 /**
  * CEO msg_8f666e55 — what the freeze's task results leave out (`superseded`), and the last task of each chain of
- * corrections (`terminals`), whose change is read against the run's pinned base (`succeededTaskResults`): built
- * on a task it supersedes, it carries what it kept of that task's change, which no other result now names.
+ * corrections (`terminals`) with the receipts of the tasks its chain supersedes: built on one of them, it carries what
+ * it kept of that task's change, which no other result now names (`taskChanges`).
  */
 export interface Supersession {
   superseded: ReadonlySet<string>;
-  terminals: ReadonlySet<string>;
+  terminals: ReadonlyMap<string, readonly SucceededTaskCommit[]>;
 }
 
 /**
@@ -252,7 +260,7 @@ export const supersessionOf = (db: Db, runId: string, receipts: readonly Succeed
     if (claims.some((claim) => claim.supersedes !== undefined && digestOf(claim.supersedes) === current)) replacedBy.set(originalTaskId, correctionTaskId);
   }
   const later = new Map<string, Set<string>>();
-  const terminals = new Set<string>();
+  const terminals = new Map<string, SucceededTaskCommit[]>();
   for (const taskId of replacedBy.keys()) {
     const seen = new Set<string>();
     let at = taskId;
@@ -264,7 +272,8 @@ export const supersessionOf = (db: Db, runId: string, receipts: readonly Succeed
     const after = new Set([...seen, at]);
     after.delete(taskId);
     later.set(taskId, after);
-    terminals.add(at);
+    // `bindingOf` found this task's receipt before the relation was kept.
+    terminals.set(at, [...(terminals.get(at) ?? []), receipts.find((receipt) => receipt.taskId === taskId)!]);
   }
   const results = receipts.map((receipt) => receipt.taskId).filter((taskId) => !later.has(taskId)).sort();
   for (const [taskId, after] of later) {
@@ -290,8 +299,8 @@ export const succeededTaskResults = (
   tasks: readonly TaskRecord[],
   commits: readonly SucceededTaskCommit[],
   repositoryIdentity: string,
-  /** CEO msg_8f666e55 — the chains' last tasks (`Supersession.terminals`): each one's change is read from `baseSha`. */
-  measuredFromBase: ReadonlySet<string> = new Set(),
+  /** CEO msg_8f666e55 — the chains' last tasks with what each chain supersedes (`Supersession.terminals`). */
+  chains: ReadonlyMap<string, readonly SucceededTaskCommit[]> = new Map(),
 ): TaskResult[] => {
   const titles = new Map(tasks.map((task) => [task.taskId, task.title]));
   const results: TaskResult[] = [];
@@ -299,17 +308,26 @@ export const succeededTaskResults = (
     if (succeeded.repositoryIdentity !== repositoryIdentity) continue;
     const target = recordedWriteTarget(db, runId, succeeded.taskId);
     if (!target || target.repositoryIdentity !== repositoryIdentity) continue;
+    const chain = chains.get(succeeded.taskId);
     results.push({
       taskId: succeeded.taskId,
       title: titles.get(succeeded.taskId) ?? "",
       commit: succeeded.commit,
       declaredParent: target.declaredParent,
       baseSha: target.baseSha,
-      ...(target.startsFrom && !measuredFromBase.has(succeeded.taskId) ? { startSha: startOf(target) } : {}),
+      ...(target.startsFrom ? { startSha: startOf(target) } : {}),
+      ...(chain ? { supersedes: chainLinks(db, runId, chain, target.baseSha) } : {}),
     });
   }
   return results;
 };
+
+/** Each superseded task's commit and start; one with no recorded write target is read from the pinned base. */
+const chainLinks = (db: Db, runId: string, chain: readonly SucceededTaskCommit[], baseSha: string): ChainLink[] =>
+  chain.map((link) => {
+    const target = recordedWriteTarget(db, runId, link.taskId);
+    return { commit: link.commit, startSha: target ? startOf(target) : baseSha };
+  });
 
 /**
  * The order results are integrated in: Kahn's order over the whole run's task graph, so a dependency
@@ -438,6 +456,37 @@ interface TaskChanges {
 }
 
 /**
+ * A task's change against the commit its branch started at. For the last task of a chain of corrections, also every path
+ * a task its chain supersedes changed against that task's own start, when its commit is built on that task: no other
+ * result names that change now. Every path stands as the task's commit has it. What its start inherited from any other
+ * task stays that task's change (run_525e6b28: read from the pinned base instead, the correction counted the changes of
+ * the tasks its start held as its own, and so collided with every task built on one of them).
+ */
+const taskChanges = async (repo: PinnedRepository, start: string, commit: string, supersedes: readonly ChainLink[] = []): Promise<Change[]> => {
+  const own = await committedChanges(repo, start, commit);
+  const named = new Set(own.map((change) => change.path));
+  const kept: string[] = [];
+  for (const link of supersedes) {
+    const builtOn = await isAncestor(repo, link.commit, commit);
+    if (builtOn === null) throw new Error(`the ancestry of ${link.commit} and ${commit} could not be read`);
+    if (!builtOn) continue;
+    for (const change of await committedChanges(repo, link.startSha, link.commit)) {
+      if (named.has(change.path)) continue;
+      named.add(change.path);
+      kept.push(change.path);
+    }
+  }
+  const standing = await entriesAt(repo, commit, kept);
+  return [
+    ...own,
+    ...kept.map((path): Change => {
+      const [mode, blob] = (standing.get(path) ?? ABSENT).split(" ");
+      return mode === "-" ? { path, mode: null, blob: null } : { path, mode: mode!, blob: blob! };
+    }),
+  ];
+};
+
+/**
  * Read-only: the integration order over the run's whole graph, each task's change against the commit
  * its branch started at, and every pair of tasks whose changes collide. #1242 — a task built on
  * another's commit (a dependent task starts from its predecessors) changed what they share on top of
@@ -452,7 +501,7 @@ const readTaskChanges = async (
     return deny(ReasonCode.TASK_DEPENDENCY_CYCLE, "the run's task graph has a cycle, so no integration order exists", { runId: input.runId });
   }
   const changesOf = new Map<string, Change[]>();
-  for (const result of ordered) changesOf.set(result.taskId, await committedChanges(repo, result.startSha ?? result.baseSha, result.commit));
+  for (const result of ordered) changesOf.set(result.taskId, await taskChanges(repo, result.startSha ?? result.baseSha, result.commit, result.supersedes));
   const commitOf = new Map(ordered.map((result) => [result.taskId, result.commit]));
   const conflicts: Conflict[] = [];
   // `pathConflicts` names each pair in integration order, so the first is the one the second may be built on.
@@ -711,8 +760,11 @@ export const integrateTaskResults = async (input: {
   worktree: RunWorktree;
   /** #1268 — given for a run whose contract requires CommitLore. */
   checkMessage?: CheckMergeMessage;
-  /** CEO msg_8f666e55 — `Supersession.terminals`: each one's change is read against the pinned base. */
-  measuredFromBase?: ReadonlySet<string>;
+  /**
+   * CEO msg_8f666e55 — `Supersession.terminals`. The name is older than what it carries: each last correction's change is
+   * read from its own start, with what its chain supersedes (`taskChanges`), not from the pinned base.
+   */
+  measuredFromBase?: ReadonlyMap<string, readonly SucceededTaskCommit[]>;
 }): Promise<Decision<IntegratedCandidate | null>> => {
   const results = succeededTaskResults(input.db, input.runId, input.tasks, input.commits, input.repositoryIdentity, input.measuredFromBase);
   if (results.length === 0) return allow(ReasonCode.OK, null);
@@ -892,7 +944,7 @@ export const integratePredecessors = async (input: {
  * recorded task commit descending from it changed too (that task was built on top of it); the later
  * version is then the one asked for. A task without dependsOn predecessors starts at the pinned base
  * and descends from no other task (S-TB); a dependent one is built on its predecessors (#1242). The last
- * task of a chain of corrections (`measuredFromBase`) is asked against the pinned base, as it is integrated.
+ * task of a chain of corrections (`measuredFromBase`) is asked what it is integrated with (`taskChanges`).
  * Read-only, over the registered checkout. Lists each task with the paths it lost.
  */
 export const lostTaskChanges = async (input: {
@@ -902,7 +954,8 @@ export const lostTaskChanges = async (input: {
   repositoryIdentity: string;
   checkoutPath: string;
   candidateHead: string;
-  measuredFromBase?: ReadonlySet<string>;
+  /** `Supersession.terminals`, as `integrateTaskResults` reads it. */
+  measuredFromBase?: ReadonlyMap<string, readonly SucceededTaskCommit[]>;
 }): Promise<Decision<Array<{ taskId: string; commitHead: string; paths: string[] }>>> => {
   const here = input.commits.filter((commit) => commit.repositoryIdentity === input.repositoryIdentity);
   if (here.length < 2) return allow(ReasonCode.OK, []);
@@ -914,8 +967,10 @@ export const lostTaskChanges = async (input: {
     const changes = new Map<string, Map<string, string>>();
     for (const commit of here) {
       const target = targets.get(commit.taskId);
-      const base = target?.repositoryIdentity !== input.repositoryIdentity ? shared : input.measuredFromBase?.has(commit.taskId) ? target.baseSha : startOf(target);
-      changes.set(commit.taskId, new Map((await committedChanges(repo, base, commit.commit)).map((change) => [change.path, entryOf(change)])));
+      const own = target?.repositoryIdentity === input.repositoryIdentity ? target : null;
+      const chain = own ? chainLinks(input.db, input.runId, input.measuredFromBase?.get(commit.taskId) ?? [], own.baseSha) : [];
+      const read = await taskChanges(repo, own ? startOf(own) : shared, commit.commit, chain);
+      changes.set(commit.taskId, new Map(read.map((change) => [change.path, entryOf(change)])));
     }
     const descends = new Map<string, boolean>();
     const builtOn = async (earlier: SucceededTaskCommit, later: SucceededTaskCommit): Promise<boolean> => {
