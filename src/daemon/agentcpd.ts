@@ -3493,11 +3493,14 @@ export const createCeoNotificationSender = (resolveTarget: DaemonNoticeTargetRes
     const target = await resolveTarget();
     if (!target) return deny(ReasonCode.CEO_CONVERSATION_UNAVAILABLE, "canonical CEO route unavailable");
     const text = JSON.stringify({ messageId: message.messageId, kind: message.kind, payload: message.payload });
-    // The existing signed surface accepts bounded text. Preserve every character across parts.
+    // The existing signed surface accepts bounded text. Preserve every character across parts. U6 B1 — a
+    // notice with an origin (the outbox sends one only while current) is never split: one signed body.
+    const origin = (message.payload as { origin?: unknown } | null)?.origin;
+    const whole = typeof origin === "object" && origin !== null;
     const parts: string[] = [];
     let part = "";
     for (const character of text) {
-      if (part.length + character.length > 1500) { parts.push(part); part = ""; }
+      if (!whole && part.length + character.length > 1500) { parts.push(part); part = ""; }
       part += character;
     }
     if (part) parts.push(part);

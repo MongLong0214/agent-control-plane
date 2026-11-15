@@ -30,7 +30,7 @@ import {
   drivenModeSql,
   drivenSpawnRecordOf,
 } from "../runtime/provisioned-session-runtime.ts";
-import { takesDaemonNoticeRoute } from "../runtime/hermes-gateway-conversation.ts";
+import { DAEMON_NOTICE_MAX_REQUEST_BYTES } from "../runtime/hermes-gateway-conversation.ts";
 import {
   type FencedEnvelope,
   HOLDER_CLAIMED_KINDS,
@@ -882,8 +882,7 @@ export const settleStoppedSessionInstructions = (
  */
 type CeoNoticeOrigin =
   | { state: "NONE" }
-  | { state: "CURRENT"; origin: unknown }
-  | { state: "NOT_CURRENT"; origin: unknown; stripped: OutboxMessage };
+  | { state: "CURRENT" | "NOT_CURRENT"; origin: unknown; stripped: OutboxMessage };
 
 const ceoNoticeOrigin = (db: Pick<Db, "get">, message: OutboxMessage): CeoNoticeOrigin => {
   const payload = message.payload;
@@ -897,11 +896,11 @@ const ceoNoticeOrigin = (db: Pick<Db, "get">, message: OutboxMessage): CeoNotice
         AND (SELECT COUNT(*) FROM canonical_turn_sources o WHERE o.turn_request_id = t.turn_request_id) = 1`,
     [named.turn_request_id, message.bindingGeneration, message.targetSessionId, `update:${named.update_id}`],
   ) !== undefined;
-  return current ? { state: "CURRENT", origin } : { state: "NOT_CURRENT", origin, stripped: { ...message, payload: rest } };
+  return { state: current ? "CURRENT" : "NOT_CURRENT", origin, stripped: { ...message, payload: rest } };
 };
 
 /** Why a CEO notification's origin got no reply to the owner's message; the audit row is written once. */
-type OwnerReplyUndelivered = "ORIGIN_NOT_CURRENT" | "ORIGIN_NOTICE_NOT_ONE_ROUTE";
+type OwnerReplyUndelivered = "ORIGIN_NOT_CURRENT" | "ORIGIN_NOTICE_TOO_LARGE";
 
 /**
  * Every unsettled CEO notification follows the current holder with its sealed content and id.
@@ -1290,31 +1289,33 @@ export class Outbox {
           const attempt = new CeoNoticeRoute(this.db, this.audit, message);
           if (attempt.withholdBeforeSend()) continue;
           // U6 B1 — an origin the notice may no longer carry is dropped, and the owner's reply recorded
-          // undelivered; a current one is sent only if every signed part takes the daemon-notice route.
+          // undelivered. A current one goes whole, in one signed body, on the daemon-notice route; a body too
+          // large for that route is not posted, and the notice goes without its origin on the normal route so
+          // the CEO still has the result.
           const origin = ceoNoticeOrigin(this.db, message);
           if (origin.state === "NOT_CURRENT") this.#recordOwnerReplyUndelivered(message, "ORIGIN_NOT_CURRENT", origin.origin);
-          let originRefused = false;
+          let tooLarge = false;
           const route: CeoNoticeAttempt = origin.state !== "CURRENT" ? attempt : {
             prepare: (destination, requests) => {
-              if (requests.length > 0 && requests.every((request) => takesDaemonNoticeRoute(request.text))) {
+              if (requests.every((request) => Buffer.byteLength(JSON.stringify(request)) <= DAEMON_NOTICE_MAX_REQUEST_BYTES)) {
                 return attempt.prepare(destination, requests);
               }
-              originRefused = true;
+              tooLarge = true;
               return { route: "WITHHELD" };
             },
           };
           try {
-            const result = await send(origin.state === "NOT_CURRENT" ? origin.stripped : message, route);
+            let result = await send(origin.state === "NOT_CURRENT" ? origin.stripped : message, route);
+            if (tooLarge && origin.state !== "NONE") {
+              this.#recordOwnerReplyUndelivered(message, "ORIGIN_NOTICE_TOO_LARGE", origin.origin);
+              result = await send(origin.stripped, attempt);
+            }
             unavailable = !result.allowed && result.reasonCode === ReasonCode.CEO_CONVERSATION_UNAVAILABLE;
             accepted = result.allowed;
             reasonCode = result.reasonCode;
             outcome = (result.evidence["noticeOutcome"] as CeoNoticeOutcome | undefined) ?? (accepted ? "SETTLED" : "UNKNOWN");
           } catch { /* retained below */ }
-          if (originRefused) {
-            // Nothing was posted: the notice stays PENDING, undelivered, and is never sent as events.
-            this.#recordOwnerReplyUndelivered(message, "ORIGIN_NOTICE_NOT_ONE_ROUTE", origin.state === "CURRENT" ? origin.origin : null);
-            continue;
-          }
+          const dropped = origin.state === "NOT_CURRENT" ? "ORIGIN_NOT_CURRENT" : tooLarge ? "ORIGIN_NOTICE_TOO_LARGE" : null;
           if (attempt.route !== "CANONICAL") continue;
           if (unavailable) {
             // No target was found, so no transport attempt took place. Retain PENDING and
@@ -1331,7 +1332,7 @@ export class Outbox {
             WHERE message_id = ? AND status = 'PENDING' AND binding_generation = ? AND target_session_id = ?
               AND ${liveDeliveryTarget("outbox")}`,
             [accepted ? "ACKED" : "PENDING", accepted ? this.clock.nowIso() : null,
-              accepted && origin.state === "NOT_CURRENT" ? "ORIGIN_NOT_CURRENT" : null,
+              accepted ? dropped : null,
               row.message_id, row.binding_generation, row.target_session_id]);
             if (updated.changes !== 1) return;
             this.audit.record({ kind: accepted ? "CEO_NOTIFICATION_ACCEPTED" : "CEO_NOTIFICATION_DELIVERY_FAILED",

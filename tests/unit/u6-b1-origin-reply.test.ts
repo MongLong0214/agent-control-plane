@@ -27,7 +27,7 @@ import { envelope, externalLaneFixture, HEAD, LINEAGE, replaceHermesCeo, SECRET 
 /**
  * U6 B1 — a CTO result reaches the owner as a reply to the original `/acp` message only through an
  * origin ACP itself recorded: the owner's `run_dispatch` made in the exact Telegram turn its call names,
- * carried in the signed CEO notification, sent only on the Gateway's daemon-notice route, and dropped,
+ * carried in the signed CEO notification, sent whole on the Gateway's daemon-notice route, and dropped,
  * recorded undelivered, once it is no longer that turn's.
  */
 afterAll(cleanupTempDirs);
@@ -277,8 +277,9 @@ describe("U6 B1 daemon notice route", () => {
    * A loopback Gateway that answers its identity and records the path of every POST. With `receipts`
    * it settles each notice the way Hermes does; without, every POST is refused.
    */
-  const gateway = async (receipts = false): Promise<{ port: number; posts: string[] }> => {
+  const gateway = async (receipts = false): Promise<{ port: number; posts: string[]; bodies: DaemonNoticeBody[] }> => {
     const posts: string[] = [];
+    const bodies: DaemonNoticeBody[] = [];
     const server = createServer((req, res) => {
       res.setHeader("Content-Type", "application/json");
       if (req.method === "POST") posts.push(req.url ?? "");
@@ -286,8 +287,9 @@ describe("U6 B1 daemon notice route", () => {
       req.on("data", (chunk: Buffer) => chunks.push(chunk));
       req.on("end", () => {
         if (req.method !== "POST") return res.end(JSON.stringify(DESTINATION));
-        if (!receipts) return res.end(JSON.stringify({ error: "fixture" }));
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as DaemonNoticeBody;
+        bodies.push(body);
+        if (!receipts) return res.end(JSON.stringify({ error: "fixture" }));
         return res.end(JSON.stringify({ event_id: body.event_id, payload_digest: body.payload_digest, receipt: {
           status: "completed", session_id: DESTINATION.session_id, lineage_root_digest: DESTINATION.lineage_root_digest,
           receipt_id: `receipt-${body.event_id.slice(-12)}` } }));
@@ -297,7 +299,7 @@ describe("U6 B1 daemon notice route", () => {
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("expected a TCP listener");
-    return { port: address.port, posts };
+    return { port: address.port, posts, bodies };
   };
 
   const notification = (payload: Record<string, unknown>): OutboxMessage => ({
@@ -330,34 +332,64 @@ describe("U6 B1 daemon notice route", () => {
       .not.toBe(signed.signature);
   });
 
-  it("refuses, before any POST, a notice with a current origin that is split in parts, and records the owner's reply undelivered", async () => {
+  /** A fixture CEO with update 41's owner turn in doubt, its notices sent through the real signed sender. */
+  const originFixture = async () => {
     const fixture = externalLaneFixture();
+    const turnRequestId = await claimOneTurn(fixture, 41);
+    const gatewayed = await gateway(true);
+    fixture.cp.outbox.attachCeoNotificationDelivery(createCeoNotificationSender(async () => ({
+      destination: DESTINATION, send: createHermesGatewayDaemonNoticeSender({ apiKey: "u6-b1-fixture-key", port: gatewayed.port }),
+    }), "u6-b1 fixture lane secret"));
+    return { fixture, origin: { turn_request_id: turnRequestId, update_id: "41" }, ...gatewayed };
+  };
+
+  it("sends a notice with a current origin whole, as one signed body on the daemon-notice route, however long its text", async () => {
+    const { fixture, origin, posts, bodies } = await originFixture();
     try {
-      const { cp } = fixture;
-      const turnRequestId = await claimOneTurn(fixture, 41);
-      const { port, posts } = await gateway(true);
-      cp.outbox.attachCeoNotificationDelivery(createCeoNotificationSender(async () => ({
-        destination: DESTINATION, send: createHermesGatewayDaemonNoticeSender({ apiKey: "u6-b1-fixture-key", port }),
-      }), "u6-b1 fixture lane secret"));
-      const origin = { turn_request_id: turnRequestId, update_id: "41" };
-      const long = enqueueNotice(fixture, "u6-b1-long", { notification: "READY_FOR_CEO_REVIEW", goal: "g".repeat(1600), origin });
-      await cp.outbox.deliverCeoNotifications();
-      await cp.outbox.deliverCeoNotifications();
+      const key = daemonNoticeKey("u6-b1 fixture lane secret");
+      // 1,600 characters split in parts on /events before; 60,000 is past the events route's 16 KiB.
+      for (const [index, length] of [1600, 60_000].entries()) {
+        const goal = "g".repeat(length);
+        const long = enqueueNotice(fixture, `u6-b1-long-${length}`, { notification: "READY_FOR_CEO_REVIEW", goal, origin });
+        await fixture.cp.outbox.deliverCeoNotifications();
+        await fixture.cp.outbox.deliverCeoNotifications();
 
-      // Neither /events nor a reported delivery: nothing was posted and the row is still undelivered.
-      expect(posts).toEqual([]);
-      expect(outboxRow(fixture, long)).toEqual({ status: "PENDING", reason_code: null, attempts: 0 });
-      expect(ownerReplyUndelivered(fixture, long)).toEqual([{ reason: "ORIGIN_NOTICE_NOT_ONE_ROUTE", origin }]);
-      expect(cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM audit_events WHERE kind IN
-        ('CEO_NOTIFICATION_ACCEPTED','CEO_NOTIFICATION_CANONICAL_ATTEMPT') AND json_extract(evidence_json, '$.messageId') = ?`,
-      [long])!.n).toBe(0);
+        expect(posts.slice(index)).toEqual(["/v1/canonical-surface/daemon-notices"]);
+        const signed = bodies[index]!;
+        expect(signed.text).toBe(`ACP notification ${long} part 1/1: ${JSON.stringify({ messageId: long,
+          kind: MessageKind.CEO_NOTIFICATION, payload: { notification: "READY_FOR_CEO_REVIEW", goal, origin } })}`);
+        // The whole text, origin and result alike, is inside the one HMAC.
+        expect(daemonNoticeSignature(key, daemonNoticeCanonical({ protocol: signed.protocol, principal: signed.principal,
+          binding: signed.binding, event_id: signed.event_id, destination: signed.destination, text: signed.text })))
+          .toBe(signed.signature);
+        expect(outboxRow(fixture, long)).toEqual({ status: "ACKED", reason_code: null, attempts: 1 });
+        expect(ownerReplyUndelivered(fixture, long)).toEqual([]);
+      }
+    } finally {
+      fixture.cp.close();
+    }
+  });
 
-      // The same notice in one part takes the daemon-notice route and settles as before.
-      const short = enqueueNotice(fixture, "u6-b1-short", { notification: "READY_FOR_CEO_REVIEW", origin });
-      await cp.outbox.deliverCeoNotifications();
-      expect(posts).toEqual(["/v1/canonical-surface/daemon-notices"]);
-      expect(outboxRow(fixture, short)).toMatchObject({ status: "ACKED", reason_code: null });
-      expect(ownerReplyUndelivered(fixture, short)).toEqual([]);
+  it("sends a notice too large for one daemon-notice body without its origin on the normal route, and records the owner's reply undelivered", async () => {
+    const { fixture, origin, posts, bodies } = await originFixture();
+    try {
+      const goal = "g".repeat(70_000);
+      const huge = enqueueNotice(fixture, "u6-b1-huge", { notification: "READY_FOR_CEO_REVIEW", goal, origin });
+      await fixture.cp.outbox.deliverCeoNotifications();
+      await fixture.cp.outbox.deliverCeoNotifications();
+
+      // One send of the notice, in its usual signed parts, every one on /events; none names the origin.
+      expect(posts.length).toBeGreaterThan(1);
+      expect(new Set(posts)).toEqual(new Set(["/v1/canonical-surface/events"]));
+      const text = bodies.map((body, index) => {
+        const head = `ACP notification ${huge} part ${index + 1}/${bodies.length}: `;
+        expect(body.text.startsWith(head)).toBe(true);
+        return body.text.slice(head.length);
+      }).join("");
+      expect(JSON.parse(text)).toEqual({ messageId: huge, kind: MessageKind.CEO_NOTIFICATION,
+        payload: { notification: "READY_FOR_CEO_REVIEW", goal } });
+      expect(outboxRow(fixture, huge)).toEqual({ status: "ACKED", reason_code: "ORIGIN_NOTICE_TOO_LARGE", attempts: 1 });
+      expect(ownerReplyUndelivered(fixture, huge)).toEqual([{ reason: "ORIGIN_NOTICE_TOO_LARGE", origin }]);
     } finally {
       fixture.cp.close();
     }

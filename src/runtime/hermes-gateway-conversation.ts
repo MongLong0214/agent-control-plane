@@ -14,6 +14,8 @@ const PATH = "/v1/canonical-surface/events";
 const DAEMON_NOTICES_PATH = "/v1/canonical-surface/daemon-notices";
 const MAX_REPLY_BYTES = 16_384;
 const MAX_REQUEST_BYTES = 16_384;
+/** U6 B1 — the largest body the daemon-notice route takes; a notice with an origin is sent there whole. */
+export const DAEMON_NOTICE_MAX_REQUEST_BYTES = 65_536;
 const TIMEOUT_MS = 5_000;
 const safeIdentifier = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0 && value.length <= 512 &&
@@ -160,14 +162,6 @@ const daemonNoticePath = (text: string): string => {
     payload.origin !== null ? DAEMON_NOTICES_PATH : PATH;
 };
 
-/**
- * U6 B1 — whether one signed part is posted to the daemon-notice route. A part of a notice split in
- * several carries no origin `daemonNoticePath` can read, so it would take the events route: the outbox
- * sends a notice with an origin only when every one of its parts takes this route, and otherwise
- * refuses it before any POST rather than let the origin's notice go out as ordinary events.
- */
-export const takesDaemonNoticeRoute = (text: string): boolean => daemonNoticePath(text) === DAEMON_NOTICES_PATH;
-
 export interface HermesGatewayDaemonNoticeOptions {
   /** The same daemon-provisioned Gateway key; it authenticates the channel, not the sender. */
   apiKey: string;
@@ -204,7 +198,10 @@ export const createHermesGatewayDaemonNoticeSender = (options: HermesGatewayDaem
       return { kind: "NOT_SENT", reason: "INVALID" };
     }
     const body = JSON.stringify(notice);
-    if (Buffer.byteLength(body) > MAX_REQUEST_BYTES) return { kind: "NOT_SENT", reason: "INVALID" };
+    const path = daemonNoticePath(notice.text);
+    if (Buffer.byteLength(body) > (path === DAEMON_NOTICES_PATH ? DAEMON_NOTICE_MAX_REQUEST_BYTES : MAX_REQUEST_BYTES)) {
+      return { kind: "NOT_SENT", reason: "INVALID" };
+    }
     let current: HermesGatewayIdentity;
     try { current = await readIdentity(); }
     catch { return { kind: "NOT_SENT", reason: "IDENTITY_UNAVAILABLE" }; }
@@ -228,7 +225,7 @@ export const createHermesGatewayDaemonNoticeSender = (options: HermesGatewayDaem
       const lost = (reason: string): DaemonNoticeSendOutcome =>
         reached ? { kind: "UNCERTAIN", reason } : { kind: "NOT_SENT", reason };
       try {
-        const req = request({ hostname: HERMES_GATEWAY_HOST, family: 4, port, path: daemonNoticePath(notice.text), method: "POST", agent: false,
+        const req = request({ hostname: HERMES_GATEWAY_HOST, family: 4, port, path, method: "POST", agent: false,
           headers: { Authorization: `Bearer ${options.apiKey}`, "Content-Type": "application/json",
             "Content-Length": Buffer.byteLength(body) } }, (res) => {
           const status = res.statusCode ?? 0;
