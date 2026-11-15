@@ -33,8 +33,29 @@ export const V57_ADDED_TRIGGERS = [
   "canonical_entitlement_transfers_no_delete", "canonical_session_entitlements_no_transferred_identity",
 ];
 
+/** The objects v58 adds, and the one guard it replaces, named independently of the migration. */
+export const V58_ADDED_TRIGGERS = [
+  "canonical_cto_rotations_no_replace", "canonical_cto_rotations_rides_a_pending_transfer", "canonical_cto_rotations_acknowledged_once", "canonical_cto_rotations_no_delete",
+];
+export const V58_CHANGED_GUARDS = ["actor_target_bindings_immutable"];
+
+/** A fixture built from a current database that claims to predate v58 holds no switchover table and v57's binding guard. */
+export const takeBackV58 = (raw: Database.Database): void => {
+  const snapshot = readFileSync(new URL("../../src/db/schema-v57.sql", import.meta.url), "utf8");
+  // The replaced guard first: its v58 body names the v57 and v58 tables, so it must go before either does.
+  for (const name of V58_CHANGED_GUARDS) {
+    const ddl = new RegExp(`CREATE TRIGGER IF NOT EXISTS ${name}\\n[\\s\\S]*?\\nEND;`).exec(snapshot)?.[0];
+    if (!ddl) throw new Error(`${name} is absent from the v57 snapshot`);
+    raw.exec(`DROP TRIGGER IF EXISTS ${name}`);
+    raw.exec(ddl);
+  }
+  for (const name of V58_ADDED_TRIGGERS) raw.exec(`DROP TRIGGER IF EXISTS ${name}`);
+  raw.exec(`DROP TABLE IF EXISTS canonical_cto_rotations`);
+};
+
 /** A fixture built from a current database that claims to predate v57 holds no entitlement transfer table or guard. */
 export const takeBackV57 = (raw: Database.Database): void => {
+  takeBackV58(raw);
   for (const name of V57_ADDED_TRIGGERS) raw.exec(`DROP TRIGGER IF EXISTS ${name}`);
   raw.exec(`DROP INDEX IF EXISTS canonical_entitlement_transfers_one_pending; DROP TABLE IF EXISTS canonical_entitlement_transfers`);
 };

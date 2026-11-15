@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 57;
+export const SCHEMA_VERSION = 58;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -26,6 +26,7 @@ const v53SchemaPath = fileURLToPath(new URL("./schema-v53.sql", import.meta.url)
 const v54SchemaPath = fileURLToPath(new URL("./schema-v54.sql", import.meta.url)); // released v54 reads only this
 const v55SchemaPath = fileURLToPath(new URL("./schema-v55.sql", import.meta.url)); // released v55 reads only this
 const v56SchemaPath = fileURLToPath(new URL("./schema-v56.sql", import.meta.url)); // released v56 reads only this
+const v57SchemaPath = fileURLToPath(new URL("./schema-v57.sql", import.meta.url)); // released v57 reads only this
 export const schemaSql = (): string => readFileSync(schemaPath, "utf8");
 const historicalSchemaSql = (): string => readFileSync(historicalSchemaPath, "utf8");
 const schemaSqlAt = (version: number): string =>
@@ -42,7 +43,8 @@ const schemaSqlAt = (version: number): string =>
                       : version <= 53 ? readFileSync(v53SchemaPath, "utf8")
                         : version <= 54 ? readFileSync(v54SchemaPath, "utf8")
                           : version <= 55 ? readFileSync(v55SchemaPath, "utf8")
-                            : version <= LATEST_FROZEN_VERSION ? readFileSync(v56SchemaPath, "utf8") : schemaSql();
+                            : version <= 56 ? readFileSync(v56SchemaPath, "utf8")
+                              : version <= LATEST_FROZEN_VERSION ? readFileSync(v57SchemaPath, "utf8") : schemaSql();
 
 /** Connection PRAGMAs are established by Db before any migration transaction begins. */
 export const schemaDdl = (): string =>
@@ -4416,6 +4418,42 @@ const v57: SchemaMigration = {
   checksum: () => migrationChecksum("v57-canonical-entitlement-transfer", 57),
 };
 
+/**
+ * v58 adds the canonical CTO switchover table and its four guards, and replaces exactly one guard:
+ * actor_target_bindings_immutable, which refused every UPDATE, now admits the one rewrite an unacknowledged
+ * switchover names (the same actor's claude-cli target moving from the transfer's old conversation to its new one). No table is
+ * rebuilt and no row moves. A name already held must hold schema.sql's definition (or, for the replaced guard,
+ * v57's) before the step, and schema.sql's after it.
+ */
+const V58_REPLACED_GUARDS = ["actor_target_bindings_immutable"] as const;
+const V58_ROTATION_GUARDS = [
+  "canonical_cto_rotations_no_replace",
+  "canonical_cto_rotations_rides_a_pending_transfer",
+  "canonical_cto_rotations_acknowledged_once",
+  "canonical_cto_rotations_no_delete",
+] as const;
+const v58Objects = (): StepObject[] => [
+  {
+    type: "table", name: "canonical_cto_rotations", table: "canonical_cto_rotations",
+    ddl: schemaObject(/CREATE TABLE IF NOT EXISTS canonical_cto_rotations \([\s\S]*?\n\) WITHOUT ROWID;/, "the canonical_cto_rotations table", 58),
+  },
+  ...stepTriggerObjects(58, V58_ROTATION_GUARDS),
+  ...stepTriggerObjects(58, V58_REPLACED_GUARDS, { version: 57, names: V58_REPLACED_GUARDS }),
+];
+const v58: SchemaMigration = {
+  id: "v58-canonical-cto-rotation",
+  fromVersion: 57,
+  toVersion: 58,
+  apply(raw) {
+    const objects = v58Objects();
+    assertStepNames(raw, 58, objects, "before");
+    raw.exec(dropsFor([...V58_REPLACED_GUARDS]));
+    for (const object of objects) raw.exec(object.ddl);
+    assertStepNames(raw, 58, objects, "after");
+  },
+  checksum: () => migrationChecksum("v58-canonical-cto-rotation", 58),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -4463,6 +4501,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v55,
   v56,
   v57,
+  v58,
 ]);
 
 interface RequiredTrigger {
@@ -4692,6 +4731,10 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "canonical_entitlement_transfers_identity_immutable", sentinel: "CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE", introducedIn: 57 },
   { name: "canonical_entitlement_transfers_no_delete", sentinel: "CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE", introducedIn: 57 },
   { name: "canonical_session_entitlements_no_transferred_identity", sentinel: "CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE", introducedIn: 57 },
+  { name: "canonical_cto_rotations_no_replace", sentinel: "CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE", introducedIn: 58 },
+  { name: "canonical_cto_rotations_rides_a_pending_transfer", sentinel: "CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE", introducedIn: 58 },
+  { name: "canonical_cto_rotations_acknowledged_once", sentinel: "CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE", introducedIn: 58 },
+  { name: "canonical_cto_rotations_no_delete", sentinel: "CANONICAL_ENTITLEMENT_TRANSFER_IMMUTABLE", introducedIn: 58 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
@@ -4841,6 +4884,7 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * v54 is frozen as v55's prerequisite in schema-v54.sql, byte-identical to schema.sql at 0c15e2f3.
  * v55 is frozen as v56's prerequisite in schema-v55.sql, byte-identical to schema.sql at 02d4b98a.
  * v56 is frozen as v57's prerequisite in schema-v56.sql, byte-identical to schema.sql at 60817e8f.
+ * v57 is frozen as v58's prerequisite in schema-v57.sql, byte-identical to schema.sql at 4afa699e.
  * v51 is frozen as v52's prerequisite in schema-v51.sql, byte-identical to schema.sql at 3915f78c; v50 is
  * frozen as v51's prerequisite in schema-v50.sql.
  * v49 is frozen as v50's prerequisite in schema-v49.sql, byte-identical to a620b8d2.
@@ -4849,7 +4893,7 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * cannot leak back into what a database receives at its v48 step, and v48's checksum is the value the
  * pre-freeze build computed.
  */
-const LATEST_FROZEN_VERSION = 56;
+const LATEST_FROZEN_VERSION = 57;
 
 /**
  * The last version whose stored receipt is compared by value (`receiptMismatches`). It stays at 47 when

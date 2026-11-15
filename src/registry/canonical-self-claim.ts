@@ -14,6 +14,14 @@ import type { Db } from "../db/database.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
 import type { AuthenticatedTargetBinding, BindingRegistry, VerifiedTargetBinding } from "../session/binding-registry.ts";
 import type { BuzzActorAuthenticator, SessionRegistry } from "../session/session-registry.ts";
+import {
+  type CanonicalCtoCarried,
+  carriedMessagesOf,
+  liveRunIdsOwnedBySession,
+  recordRotationAcknowledged,
+  retargetRotatedActor,
+  rotationOfTransfer,
+} from "./canonical-cto-rotation.ts";
 import { CanonicalSessionRegistry } from "./canonical-session-registry.ts";
 
 /**
@@ -2459,6 +2467,27 @@ export class CanonicalSelfClaim {
         }
       }
 
+      // v58 — a transfer with a switchover record (`CtoLifecycle.prepareCanonicalSwitchover`) is the SAME actor moving to
+      // this conversation, and this claim is that switchover's acknowledgement. Its barrier is checked again here, as
+      // `acknowledgeHandoff` checks it: the outgoing session owns no live run (that the binding is still the generation
+      // it was prepared from is this claim's own CAS and the transfer's). The old binding is revoked and its session
+      // stopped above, before anything of this claim is bound; the actor's target then moves here (the binding guard
+      // admits exactly this switchover), so `bind` below reuses the actor, and what the revoke left queued is adopted
+      // under its ids. What the outgoing holder left is read before that adoption re-addresses it.
+      const rotation = transfer === null ? null : rotationOfTransfer(this.db, transfer.transferId);
+      let carried: CanonicalCtoCarried | null = null;
+      if (transfer !== null && rotation !== null) {
+        const stillActive = liveRunIdsOwnedBySession(this.db, rotation.fromSessionId);
+        if (stillActive.length > 0) {
+          return deny(ReasonCode.SWITCHOVER_BLOCKED_ACTIVE_RUNS, "the outgoing CTO acquired active runs after the switchover was prepared", {
+            roleKey, activeRuns: stillActive,
+          });
+        }
+        carried = carriedMessagesOf(this.db, roleKey);
+        const retargeted = retargetRotatedActor(this.db, rotation, transfer, identity.sessionUuid);
+        if (!retargeted.allowed) return retargeted as Decision<CanonicalSelfClaimReceipt>;
+      }
+
       const created = this.sessions.create({
         provider: "claude",
         model: "claude-cli",
@@ -2547,11 +2576,12 @@ export class CanonicalSelfClaim {
       // conversation in this role moves to this generation with its claims, on the transfer's authority,
       // or the claim refuses and everything above rolls back. The transfer is then consumed, once.
       if (transfer !== null) {
-        const generations = transferredFrom === null ? [] : this.db.all<{ sessionId: string; generation: number }>(
+        // A rotation's actor is this binding's actor too, so its new generation is not one to move runs from.
+        const generations = (transferredFrom === null ? [] : this.db.all<{ sessionId: string; generation: number }>(
           `SELECT session_id AS sessionId, binding_generation AS generation FROM assignments
             WHERE actor_id = ? AND role_key = ? ORDER BY binding_generation`,
           [transferredFrom.actor_id, roleKey],
-        );
+        )).filter((owned) => owned.generation !== bound.value.bindingGeneration);
         const moved = this.bindings.repointLiveRunsToTransferSuccessor(roleKey, generations, {
           sessionId: created.sessionId, generation: bound.value.bindingGeneration, incarnation: bound.value.sessionIncarnation,
         });
@@ -2586,6 +2616,11 @@ export class CanonicalSelfClaim {
         });
         if (!recorded.allowed) {
           return deny(ReasonCode.AUDIT_WRITE_FAILED, "the transfer's claim row could not be written, so the claim was rolled back", { roleKey });
+        }
+        if (rotation !== null && carried !== null) {
+          const acknowledged = recordRotationAcknowledged(this.db, this.audit, rotation, transfer,
+            { sessionId: created.sessionId, generation: bound.value.bindingGeneration }, carried, this.clock.nowIso());
+          if (!acknowledged.allowed) return acknowledged as Decision<CanonicalSelfClaimReceipt>;
         }
       }
 
