@@ -42,7 +42,6 @@ import {
   judgeCommitLoreInitCommand,
   judgeCommitLoreVersion,
 } from "../../src/bootstrap/commitlore-pin.ts";
-import { latestRelease, stableReleaseAnswer } from "../helpers/commitlore-release.ts";
 import { hostGitDirectory, packageVersionFor, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
@@ -291,8 +290,8 @@ const workingOnPath = () => {
   return onPath;
 };
 
-/** #1268 — the production port on the pin in the environment, with a release lookup confirming `version` as the newest. */
-const envPort = (version = "1.7.3") => createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, undefined, latestRelease(version)));
+/** #1268 — the production port on the pin in the environment. */
+const envPort = () => createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, undefined));
 
 const refusedWith = async (condition: string, port = envPort()) => {
   const probed = await probeCommitLore(port);
@@ -426,7 +425,7 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
     workingOnPath();
     const pinned = fake("supported", { version });
     vi.stubEnv(VARIABLE, pinned.bin);
-    expect(await probeCommitLore(envPort(version.trim()))).toMatchObject({ allowed: true, value: { outcome: "PASS" } });
+    expect(await probeCommitLore(envPort())).toMatchObject({ allowed: true, value: { outcome: "PASS" } });
   });
 
   it("the pin, not PATH, is what runs: a failing CLI first on PATH does not answer for a working pin", async () => {
@@ -475,7 +474,7 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
     prepareFixture(pinned.bin, ["doctor", "--help"], pinned.log);
     const limits = { ...COMMITLORE_LIMITS, checkTimeoutMs: 800, killGraceMs: 300 };
     try {
-      const observed = await createCommitLoreCliPort(commitloreRunner(limits, pinned.bin, latestRelease("1.7.3"))).observe(tempDir("acp-s16-hanging-check-"));
+      const observed = await createCommitLoreCliPort(commitloreRunner(limits, pinned.bin)).observe(tempDir("acp-s16-hanging-check-"));
       expect(observed).toMatchObject({ outcome: "FAIL", detail: expect.stringMatching(/commitlore --version did not answer within 800 ms/) });
       expect(argvs(pinned.log)).toEqual(["--version"]);
     } finally {
@@ -492,7 +491,7 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
     const pinned = shellFake("slow-check", { versionDelay: "1.5" });
     const limits = { ...COMMITLORE_LIMITS, timeoutMs: 1_000, killGraceMs: 300 };
     const started = performance.now();
-    const observed = await createCommitLoreCliPort(commitloreRunner(limits, pinned.bin, latestRelease("1.7.3"))).observe(tempDir("acp-s16-slow-check-"));
+    const observed = await createCommitLoreCliPort(commitloreRunner(limits, pinned.bin)).observe(tempDir("acp-s16-slow-check-"));
     const elapsed = performance.now() - started;
     const trace = process.env["S16_WITNESS_TRACE"];
     if (trace !== undefined) appendFileSync(trace, `${JSON.stringify({ elapsed, observed, ran: shellArgvs(pinned.log) })}\n`);
@@ -509,7 +508,7 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
     const pinned = fake("cold-first-spawn");
     expect(COMMITLORE_LIMITS).toMatchObject({ checkTimeoutMs: 180_000, timeoutMs: 180_000 });
     const started = performance.timeOrigin + performance.now();
-    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pinned.bin, latestRelease("1.7.3"))).observe(tempDir("acp-s16-cold-"));
+    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pinned.bin)).observe(tempDir("acp-s16-cold-"));
     expect(observed).toMatchObject({ outcome: "PASS" });
     const ran = invocations(pinned.log);
     // Its first exec, which pays the cold cost, is the `--version` check, under `checkTimeoutMs`; `init` and
@@ -698,7 +697,7 @@ describe("S16-R1-03: the pinned CLI must have the init command, with the options
     const pinned = fake("no-init-root-usage", { hasInit: false, unknown: "root-usage" });
     expect(execFileSync(pinned.bin, INIT.split(" "), { encoding: "utf8", timeout: 30_000 })).toBe(ROOT_USAGE);
     writeFileSync(pinned.log, "");
-    const probed = await refusedWith("NO_INIT_COMMAND", createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pinned.bin, latestRelease("1.7.3"))));
+    const probed = await refusedWith("NO_INIT_COMMAND", createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pinned.bin)));
     expect(probed.allowed).toBe(false);
     expect(argvs(pinned.log)).not.toContain(INIT);
   });
@@ -706,7 +705,7 @@ describe("S16-R1-03: the pinned CLI must have the init command, with the options
   it("the help check runs no init and vouches for none: an init that lists its options and then fails still fails the observation", async () => {
     workingOnPath();
     const pinned = fake("init-fails", { initExit: 2 });
-    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pinned.bin, latestRelease("1.7.3"))).observe(tempDir("acp-s16-init-fails-"));
+    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pinned.bin)).observe(tempDir("acp-s16-init-fails-"));
     expect(observed).toMatchObject({ outcome: "FAIL", detail: expect.stringMatching(/^commitlore init failed \(2\)/) });
     expect(argvs(pinned.log)).toEqual(OBSERVATION.slice(0, 4));
   });
@@ -715,7 +714,7 @@ describe("S16-R1-03: the pinned CLI must have the init command, with the options
 describe("S16-R1-02: every spawn after the checks is preceded by a re-check that the pin is still the file the checks ran", () => {
   /** A CLI that would pass everything but `--version`, logging every argv that reaches it. */
   const uncheckedTarget = () => fake("unchecked-target", { version: "2.0.0\n" });
-  const observeAt = (pin: string) => probeCommitLore(createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pin, latestRelease("1.7.3"))));
+  const observeAt = (pin: string) => probeCommitLore(createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pin)));
   const swapLink = (pin: string, to: string) =>
     `fs.symlinkSync(${JSON.stringify(to)}, ${JSON.stringify(`${pin}.next`)}); fs.renameSync(${JSON.stringify(`${pin}.next`)}, ${JSON.stringify(pin)});`;
   const renameOver = (pin: string, from: string) =>
@@ -778,7 +777,7 @@ describe("S16-R1-02: every spawn after the checks is preceded by a re-check that
     const pin = join(tempDir("acp-s16-during-init-"), "commitlore");
     const good = fake("during-init", { during: { argv: INIT, code: swapLink(pin, bad.bin) } });
     symlinkSync(good.bin, pin);
-    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pin, latestRelease("1.7.3"))).observe(tempDir("acp-s16-during-init-checkout-"));
+    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pin)).observe(tempDir("acp-s16-during-init-checkout-"));
     expect(observed).toMatchObject({ outcome: "FAIL", detail: expect.stringMatching(new RegExp(`^commitlore doctor could not be run: ${VARIABLE} REPLACED`)) });
     expect(argvs(bad.log)).toEqual([]);
     expect(argvs(good.log)).toEqual(OBSERVATION.slice(0, 4));
@@ -890,13 +889,10 @@ describe("S16: the real CLI (ACP_TEST_REAL_COMMITLORE, else the first on PATH) i
     execFileSync("git", ["init", "-q"], { cwd: repo, timeout: 20_000 });
     const hooks = (): string[] => readdirSync(join(repo, ".git", "hooks")).sort();
     const hooksBefore = hooks();
-    // #1268 — what release is newest is not this test's subject, and it reaches no network: the lookup
-    // confirms the real CLI's own version.
-    const realVersion = execFileSync(REAL as string, ["--version"], { encoding: "utf8", timeout: 20_000 }).trim();
     vi.stubEnv("HOME", home);
     vi.stubEnv(VARIABLE, undefined);
     for (const key of ["ACP_MCP_TOKEN", "ACP_OPERATOR_TOKEN", "GH_TOKEN"]) vi.stubEnv(key, `s16-only-${key}`);
-    const run = commitloreRunner(COMMITLORE_LIMITS, REAL as string, latestRelease(realVersion));
+    const run = commitloreRunner(COMMITLORE_LIMITS, REAL as string);
     // The usage again, through the runner: the branch the title names is the one judged here.
     const usage = await run(["init", "--help"], repo);
     expect(usage.exitCode).toBe(0);
@@ -1033,8 +1029,7 @@ const turn = () => { if (!observing) return; turns += 1; setImmediate(turn); };
 const limits = { ...COMMITLORE_LIMITS, checkTimeoutMs: Number(checkTimeoutMs), timeoutMs: 100 };
 write({ event: "observe-call", checkTimeoutMs: limits.checkTimeoutMs, timeoutMs: limits.timeoutMs });
 setImmediate(turn);
-const latest = async () => (${JSON.stringify(stableReleaseAnswer("1.7.3"))});
-const pending = createCommitLoreCliPort(commitloreRunner(limits, pin, latest)).observe(checkout);
+const pending = createCommitLoreCliPort(commitloreRunner(limits, pin)).observe(checkout);
 write({ event: "observe-returned-promise", elapsed: performance.now() - start });
 const result = await pending;
 observing = false;
@@ -1219,7 +1214,7 @@ setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: per
     await vi.waitFor(() => expect(descriptorsOn(pinned.bin)).toEqual([]), { timeout: 2_000, interval: 20 });
     // Through the runner: `identityTimeoutMs` is that deadline, and the refusal comes before any spawn.
     const busy = occupyPool();
-    const observed = await createCommitLoreCliPort(commitloreRunner({ ...COMMITLORE_LIMITS, identityTimeoutMs: 100 }, pinned.bin, latestRelease("1.7.3"))).observe(
+    const observed = await createCommitLoreCliPort(commitloreRunner({ ...COMMITLORE_LIMITS, identityTimeoutMs: 100 }, pinned.bin)).observe(
       tempDir("acp-s16-r2-deadline-checkout-"),
     );
     await busy;
@@ -1253,7 +1248,7 @@ setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: per
       expect(read.turns).toBeGreaterThanOrEqual(minimumTurns);
       expect(read.value).toMatchObject({ size: String(statSync(pin).size), sha256: createHash("sha256").update(readFileSync(pin)).digest("hex") });
       expect(statSync(pin).size).toBeLessThanOrEqual(CAP);
-      const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pin, latestRelease("1.7.3"))).observe(tempDir("acp-s16-r2-control-checkout-"));
+      const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pin)).observe(tempDir("acp-s16-r2-control-checkout-"));
       expect(observed).toMatchObject({ outcome: "PASS" });
       expect(argvs(ran)).toEqual(OBSERVATION);
     }

@@ -11,8 +11,6 @@ Use these sources together:
 - [Tracker index](https://github.com/MongLong0214/agent-control-plane/issues/306)
 - `node scripts/ssot-report.mjs`, which fails when a tracked review finding or declared work item has no current issue
 - [Deliberate trade-offs](design-decisions.md) — why parts of the system are the way they are, each with the condition that would reopen it
-- `pnpm trace`, which regenerates declaration-coverage traceability evidence; behavioural
-  coverage is not measured
 
 The closeout review is vendored at
 [docs/review/](review/AGENT_CONTROL_PLANE_v1.0_FINAL_IMPLEMENTATION_CLOSEOUT_REVIEW.md).
@@ -117,12 +115,8 @@ Named here because a green suite otherwise reads as coverage of them.
 - **The full-vertical e2e is off by default.** `tests/e2e/real-component-integration.test.ts`
   is `describe.runIf(ACP_COMPONENT_INTEGRATION=1)` — it is the only test that drives SIMPLE,
   STANDARD and GUARDED through a real cloned repository and a live adapter, and it is the
-  `1 pending` that `pnpm trace` reports. `pnpm test` stays green if that path breaks.
+  `1 pending` the suite reports. `pnpm test` stays green if that path breaks.
   `evidence/e2e-real-project-*.json` records manual runs; CI does not catch a regression.
-- **`pnpm trace` run on its own still executes the suite twice.** CI passes
-  `ACP_VITEST_RESULTS` so the suite runs once, but a bare `pnpm trace` falls back to spawning
-  its own Vitest pass (`src/tools/traceability.ts`). That fallback is what crashed under
-  `pool: "threads"`; it is safe under `forks`, but it is still a second full run.
 
 ## Which gate each open item closes
 
@@ -152,12 +146,10 @@ useful than guessing.
 
 ## What the automated checks mean
 
-`pnpm trace` establishes that labelled scenario declarations executed and passed in the current
-Vitest result set. It measures declaration coverage only; behavioural coverage and production
-entry-point coverage are not measured. It does not prove live provider, GitHub, Buzz, Telegram,
+The test suite does not prove live provider, GitHub, Buzz, Telegram,
 launchd, or operator behavior. `node scripts/ssot-report.mjs` checks tracker linkage and
 recorded disposition consistency; it cannot determine from arbitrary code text that a semantic
-defect has truly been fixed. Run both, then read the linked evidence before making a status claim.
+defect has truly been fixed. Run it, then read the linked evidence before making a status claim.
 
 `pnpm terminology` checks the vocabulary contract in [docs/TERMINOLOGY.md](TERMINOLOGY.md), which
 is the SSOT for what the contested words mean — most importantly that `session` is a *replaceable

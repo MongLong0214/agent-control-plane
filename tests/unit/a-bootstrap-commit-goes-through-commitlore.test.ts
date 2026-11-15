@@ -20,7 +20,6 @@ import { git } from "../../src/git/git.ts";
 import { cleanTreeManifest, bootstrapOperations } from "../helpers/bootstrap-plan.ts";
 import { type Operation, noGitHubCall, ownerApprovalFor, prepareBootstrapRun } from "../helpers/bootstrap-runner.ts";
 import { gitCommitAttempt } from "../helpers/commitlore-attempt.ts";
-import { latestRelease } from "../helpers/commitlore-release.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { GenesisGitHub, genesisPlanFixture } from "../helpers/genesis-github.ts";
 
@@ -202,8 +201,7 @@ const REAL = realCommitLore();
 
 describe.skipIf(REAL === null)("#1268: CommitLore's own one-call commit, through the pinned CLI (real CLI)", () => {
   const realPort = () => {
-    const version = execFileSync(REAL as string, ["--version"], { encoding: "utf8", timeout: 20_000 }).trim();
-    return createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, REAL as string, latestRelease(version)));
+    return createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, REAL as string));
   };
   const repoWith = async (prefix: string, parent: boolean): Promise<string> => {
     const repo = tempDir(prefix);

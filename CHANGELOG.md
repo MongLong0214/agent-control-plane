@@ -1,7 +1,6 @@
 # Changelog
 
-Entries are newest first. `scripts/verify-release-version.mjs` requires the top heading here to
-equal `package.json`'s version, so the two cannot drift apart the way they did before #516.
+Entries are newest first.
 
 This file records **what a release is**, not how much of it there is. Counts belong to
 `scripts/ssot-report.mjs`, which derives them from the tree it is run against; a count typed here

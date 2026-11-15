@@ -83,8 +83,6 @@ export const GATES = [
   // would be a second authority over what that range is.
   { script: "merge-records", argumentFrom: "ACP_TRAILERS_RANGE" },
   { script: "build" },
-  // One suite run, and its JSON belongs to the gate that judged this exact run: `pnpm trace`
-  // consumes that artifact rather than running the suite a second time, because a second run is a
-  // different execution and anything it reports is a claim about a run no gate judged.
+  // One suite run.
   { script: "test" },
 ];

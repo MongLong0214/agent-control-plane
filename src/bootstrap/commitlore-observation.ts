@@ -17,11 +17,9 @@ import { gitHardeningEnvironment, pinnedGitEnvironment } from "../run/worker-git
 import {
   COMMITLORE_BINARY_VARIABLE,
   COMMITLORE_PIN_IDENTITY_TIMEOUT_MS,
-  type CommitLoreReleaseLookup,
   assertCommitLorePinUnchanged,
   bindCommitLorePin,
   commitlorePin,
-  officialCommitLoreRelease,
   verifyCommitLorePin,
 } from "./commitlore-pin.ts";
 import { type CommitLoreAttempt, commitloreAttempt } from "./commitlore-commit.ts";
@@ -827,16 +825,10 @@ const commitloreChild =
  * `COMMITLORE_PIN_MAX_BYTES` is refused on its descriptor's size before a byte is read, no reading takes
  * more than that cap plus one byte, and none outlasts `identityTimeoutMs`. Its time is no check's and no
  * command's: each child's bound starts at its own spawn.
- *
- * #1268 — after the three checks, `ready` asks `latest` for the newest published stable release and refuses
- * unless the version the pin answered is that release's (`judgeCommitLoreLatest`). It asks on every call,
- * never reusing an earlier answer, so each observation confirms its own; the production lookup is bounded by
- * `COMMITLORE_RELEASE_TIMEOUT_MS`.
  */
 export const commitloreRunner = (
   limits: Readonly<CommitLoreLimits> = COMMITLORE_LIMITS,
   pin: string | undefined = process.env[COMMITLORE_BINARY_VARIABLE],
-  latest: CommitLoreReleaseLookup = officialCommitLoreRelease,
 ): CommitLoreRunner & { readonly prepare: NonNullable<CommitLoreRunner["prepare"]> } => {
   const pinned = (): string => {
     const executable = commitlorePin(pin);
@@ -864,7 +856,7 @@ export const commitloreRunner = (
       };
       if (options.checked) {
         const check = commitloreChild(process.execPath, { ...limits, timeoutMs: limits.checkTimeoutMs }, unchanged, [snapshot.entry]);
-        const unsupported = await verifyCommitLorePin(executable, (argv, checkCwd) => check(argv, checkCwd, { git }), cwd, latest, snapshot.version);
+        const unsupported = await verifyCommitLorePin(executable, (argv, checkCwd) => check(argv, checkCwd, { git }), cwd, snapshot.version);
         if (unsupported !== null) throw new Error(unsupported);
         await unchanged();
       }

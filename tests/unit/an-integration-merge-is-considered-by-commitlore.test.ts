@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
@@ -11,7 +10,6 @@ import type * as Integration from "../../src/run/candidate-integration.ts";
 import { CANDIDATE_REF_NAMESPACE } from "../../src/run/candidate-integration.ts";
 import { GuardedInvocationWriteBroker } from "../../src/runtime/provider.ts";
 import { writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
-import { latestRelease } from "../helpers/commitlore-release.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import { registerFixtureProject } from "../helpers/harness.ts";
@@ -176,8 +174,7 @@ describe("#1268 review r2 P1: an integration merge commit's message is checked b
   it.skipIf(REAL === null)("the real CLI passes the integration's clean message, the merge is made with no record, and the freeze's audit counts the check", async () => {
     await withBootstrapRuntime(async (f) => {
       const s = await twoTasks(f, "cl-merge-clean");
-      const version = execFileSync(REAL as string, ["--version"], { encoding: "utf8", timeout: 20_000 }).trim();
-      const port = createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, REAL as string, latestRelease(version)));
+      const port = createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, REAL as string));
       injected.consider = (input) => checkGeneratedCommitMessage(port, input);
       const frozen = await f.harness.cp.pipeline.freeze(s.runId);
       if (!frozen.allowed) throw new Error(`${frozen.reasonCode}: ${frozen.message} ${JSON.stringify(frozen.evidence)}`);
@@ -222,7 +219,7 @@ answer(JSON.stringify({ examined: 1, checks: [], violations: [], secrets: [] }) 
 `,
       { version: "1.7.3" },
     );
-    const port = createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, wrapper, latestRelease("1.7.3")));
+    const port = createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, wrapper));
     const seen = (): Array<{ indexFile: string | null; gitDir: string | null; staged: string[]; message: string }> =>
       existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
     return { port, seen };

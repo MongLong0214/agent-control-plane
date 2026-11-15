@@ -7,6 +7,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   COMMITLORE_LIMITS,
   OBSERVATION_HARDENING_EXCEPTION,
+  type CommitLoreRunner,
   commitloreRunner,
   createCommitLoreCliPort,
   probeCommitLore,
@@ -15,7 +16,6 @@ import {
 import { GIT_HARDENING, gitHardeningEnvironment } from "../../src/run/worker-git.ts";
 import { EMPTY_TREE, gitIgnoresAttrSource } from "../../src/bootstrap/commitlore-snapshot.ts";
 import { hostGitDirectory, installedCopyOf, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
-import { latestRelease, stableReleaseAnswer } from "../helpers/commitlore-release.ts";
 import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
 
 /**
@@ -41,9 +41,22 @@ const realCommitLore = (): string | null => {
   return null;
 };
 const REAL = realCommitLore();
+/**
+ * The runner, with the installed bundle replaced the moment a checked preparation returns: the package
+ * snapshot is already taken, so what the replacement can reach is whatever still reads the installed copy.
+ */
+const replacedAfterPrepare = (runner: ReturnType<typeof commitloreRunner>, replace: () => void): CommitLoreRunner =>
+  Object.assign((...args: Parameters<CommitLoreRunner>) => runner(...args), {
+    prepare: async (...args: Parameters<typeof runner.prepare>) => {
+      const prepared = await runner.prepare(...args);
+      if (args[2].checked) replace();
+      return prepared;
+    },
+    configured: runner.configured,
+  });
+
 const realPort = () => {
-  const version = execFileSync(REAL as string, ["--version"], { encoding: "utf8", timeout: 20_000 }).trim();
-  return createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, REAL as string, latestRelease(version)));
+  return createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, REAL as string));
 };
 
 describe("#1268: the bootstrap observation's git hardening", () => {
@@ -80,7 +93,7 @@ describe("#1268 review r3: attribute-selected programs and the package the obser
     const checkout = makeRepo({ "README.md": "# observed\n" });
     vi.stubEnv("PATH", `${dir}:/usr/bin:/bin`);
     try {
-      const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, wrapper, latestRelease("1.7.3"))).observe(checkout);
+      const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, wrapper)).observe(checkout);
       expect(observed).toMatchObject({
         outcome: "FAIL",
         detail: expect.stringContaining('ACP_COMMITLORE_BINARY UNSUPPORTED_GIT: the git CommitLore would run does not honour GIT_ATTR_SOURCE (it answered "probe: diff: acpprobe")'),
@@ -108,7 +121,7 @@ else answer(${JSON.stringify(JSON.stringify({ schema: "commitlore_doctor.v2", st
     );
     const checkout = tempDir("acp-1268-sha256-repo-");
     execFileSync("git", ["init", "-q", "--object-format=sha256", checkout], { timeout: 20_000 });
-    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, wrapper, latestRelease("1.7.3"))).observe(checkout);
+    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, wrapper)).observe(checkout);
     expect(observed).toMatchObject({ outcome: "PASS" });
     const sources = readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => line.split(" ").at(-1));
     expect(sources).toHaveLength(5);
@@ -133,7 +146,7 @@ else answer(${JSON.stringify(JSON.stringify({ schema: "commitlore_doctor.v2", st
 `,
     );
     const wrapperBytes = readFileSync(wrapper, "utf8");
-    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, wrapper, latestRelease("1.7.3"))).observe(makeRepo({ "README.md": "# observed\n" }));
+    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, wrapper)).observe(makeRepo({ "README.md": "# observed\n" }));
     expect(observed).toMatchObject({ outcome: "FAIL", detail: expect.stringContaining("ACP_COMMITLORE_BINARY REPLACED: the CommitLore package copy is no longer the bytes its checks ran") });
     expect(readFileSync(log, "utf8").split("\n").filter(Boolean)).toEqual(["--version", "doctor --help"]);
     expect(readFileSync(wrapper, "utf8")).toBe(wrapperBytes);
@@ -158,22 +171,19 @@ describe.skipIf(REAL === null)("#1268: the bootstrap observation under that hard
     const program = join(tempDir("acp-1268-observation-program-"), "fsmonitor.sh");
     writeFileSync(program, `#!/bin/sh\necho ran > ${JSON.stringify(marker)}\nexit 1\n`, { mode: 0o755 });
     execFileSync("git", ["config", "core.fsmonitor", program], { cwd: checkout, timeout: 20_000 });
-    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, REAL as string, latestRelease(execFileSync(REAL as string, ["--version"], { encoding: "utf8", timeout: 20_000 }).trim()))).observe(checkout);
+    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, REAL as string)).observe(checkout);
     expect(observed).toMatchObject({ outcome: "PASS" });
     expect(existsSync(marker), "a program the checkout's config named ran inside CommitLore's git").toBe(false);
   });
 
-  it("review r3 P1: a bundle replaced behind an unchanged wrapper during the release lookup is never run by the observation", async () => {
+  it("review r3 P1: a bundle replaced behind an unchanged wrapper after the checked preparation is never run by the observation", async () => {
     const { wrapper, bundle } = installedCopyOf(REAL as string, tempDir("acp-1268-observation-install-"));
     const marker = join(tempDir("acp-1268-observation-swap-"), "ran");
-    const version = execFileSync(REAL as string, ["--version"], { encoding: "utf8", timeout: 20_000 }).trim();
-    // The wrapper is left as it is; the bundle it names is replaced the moment the newest release is asked for.
-    const swapping = async (): Promise<unknown> => {
+    // The wrapper is left as it is; the bundle it names is replaced the moment the checked copy is prepared.
+    const swapping = (): void =>
       writeFileSync(bundle, `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "ran");\nconsole.log(${JSON.stringify(JSON.stringify({ schema: "commitlore_doctor.v2", status: "ok", exitCode: 0, checks: [] }))});\n`);
-      return stableReleaseAnswer(version);
-    };
     const checkout = makeRepo({ "README.md": "# observed\n" });
-    const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, wrapper, swapping)).observe(checkout);
+    const observed = await createCommitLoreCliPort(replacedAfterPrepare(commitloreRunner(COMMITLORE_LIMITS, wrapper), swapping)).observe(checkout);
     expect(existsSync(marker), "the replaced bundle ran").toBe(false);
     expect(observed).toMatchObject({ outcome: "PASS" });
     expect(existsSync(join(checkout, ".git", "hooks", "prepare-commit-msg"))).toBe(true);

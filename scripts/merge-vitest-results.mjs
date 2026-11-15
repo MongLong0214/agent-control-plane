@@ -5,7 +5,7 @@
  *
  * The suite runs as `--shard=i/N` across N CI jobs, so each job's
  * `evidence/local/ci-vitest-results.json` covers a third of it. What reads that file downstream —
- * the `vitest-results-<node>` artifact, `ACP_VITEST_RESULTS` for `pnpm trace` — expects the whole
+ * the `vitest-results-<node>` artifact — expects the whole
  * suite in one report, so the `verify` job rebuilds it here rather than every reader learning to
  * add shards up.
  *

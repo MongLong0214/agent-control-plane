@@ -14,11 +14,10 @@ Run the repository gates relevant to the change:
 pnpm test
 pnpm typecheck
 pnpm lint
-pnpm trace
 node scripts/ssot-report.mjs
 ```
 
-Do not hand-edit generated traceability evidence or status counts. A document that names a
+Do not hand-edit generated evidence or status counts. A document that names a
 changing number must derive it from a command, query, or generated artifact. A test that
 passes after its enforcement is removed is not adequate regression evidence; say which
 assertion fails when you check that negative control.
