@@ -2,7 +2,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { ExecutionMode } from "../../src/domain/types.ts";
 import {
-  type ExecutionEvidence, type ReceiptEvidence, candidateEvidenceSection,
+  type ExecutionEvidence, type ReceiptEvidence, candidateEvidenceSection, workUnitsOf,
 } from "../../src/review/candidate-review-evidence.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { bindCeo, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
@@ -47,7 +47,7 @@ const receiptFor = (runId: string, index: number, taskId: string, unit: string |
   snapshotDiffDigest: `sha256:${"5".repeat(64)}`, recomputedDiffDigest: `sha256:${"d".repeat(64)}`, linked: true, mismatches: [],
   workerSessionId: `sess_worker_${String(index).padStart(3, "0")}`,
   ...(unit === undefined ? {} : { workUnit: unit }),
-  checks: { namesTask: true, resultReproduced: true, commitIsCandidateHead: true, baseIsSnapshotBase: true, diffDigestAgrees: true },
+  checks: { namesTask: true, resultReproduced: true, commitIsCandidateHead: true, baseIsSnapshotBase: true, diffDigestAgrees: true, ancestryChecked: true },
 });
 
 const evidenceOf = (receipts: ReceiptEvidence[]): ExecutionEvidence => ({
@@ -114,7 +114,8 @@ describe("every receipt and task of a run reaches the reviewer (#1410)", () => {
           expect(JSON.stringify(row)).not.toContain("sha256:");
         }
         // The rows, not the digest detail, are what the reviewer always gets: they stay small enough for the reviewer bound.
-        expect(text.length).toBeLessThan(60_000);
+        // (the reviewer's 120,000-char budget less the chunk envelope)
+        expect(text.length).toBeLessThan(120_000 - 4_096);
       } finally { harness.cp.close(); }
     }, 60_000);
   }
@@ -126,7 +127,7 @@ describe("every receipt and task of a run reaches the reviewer (#1410)", () => {
       harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "unit-a", tasks: [...ids.slice(0, 5), "no-such-task"] }] });
       const bad: ReceiptEvidence = { ...receiptFor(runId, 0, ids[0]!, "unit-a"), linked: false, recomputedDiffDigest: null,
         mismatches: ["the receipt's diffDigest is not the frozen change's"],
-        checks: { namesTask: true, resultReproduced: true, commitIsCandidateHead: true, baseIsSnapshotBase: true, diffDigestAgrees: false } };
+        checks: { namesTask: true, resultReproduced: true, commitIsCandidateHead: true, baseIsSnapshotBase: true, diffDigestAgrees: false, ancestryChecked: true } };
       const text = candidateEvidenceSection(harness.cp.db, runId, [], evidenceOf([bad]), 0).join("\n");
       const control = JSON.parse(fenceAfter(text, "Control-plane evidence", "json")) as RenderedTasks;
       expect(control.taskSummary.workUnits).toEqual({ declared: 1, tasksInAUnit: 5, unresolvedRefs: ["unit-a:no-such-task"] });
@@ -147,6 +148,62 @@ describe("every receipt and task of a run reaches the reviewer (#1410)", () => {
       expect(control.taskSummary.truncated).toBe(true);
       expect(Object.keys(control.taskSummary.unlisted ?? {})).toEqual(["CANCELLED"]);
       expect(control.taskSummary.listed + (control.taskSummary.unlisted?.["CANCELLED"] ?? 0)).toBe(control.taskSummary.total);
+    } finally { harness.cp.close(); }
+  }, 60_000);
+});
+
+describe("an approved work-unit mapping is never overridden by title inference (#1410 review P2)", () => {
+  const submit = (harness: Awaited<ReturnType<typeof prepare>>["harness"], runId: string, specs: Array<{ key: string; title: string }>) => {
+    const submitted = harness.cp.tasks.submit(runId, specs.map((spec) => ({ ...spec, category: "implementation" as const })));
+    if (!submitted.allowed) throw new Error(submitted.message);
+    return submitted.value;
+  };
+  const taskRows = (harness: Awaited<ReturnType<typeof prepare>>["harness"], runId: string) =>
+    harness.cp.db.all<{ task_id: string; title: string }>(`SELECT task_id, title FROM tasks WHERE run_id = ?`, [runId]);
+
+  it("keeps each task in the unit the approval gave it when one task's title is another's PLAN key", async () => {
+    const { harness, runId } = await prepare();
+    try {
+      // Two further tasks whose keys and titles cross: A is key alpha / title beta, B is key beta / title alpha.
+      const [a, b] = submit(harness, runId, [{ key: "alpha", title: "beta" }, { key: "beta", title: "alpha" }]);
+      const stored = harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "unit-a", tasks: ["alpha"] }, { key: "unit-b", tasks: ["beta"] }] });
+      const approved = harness.cp.audit.record({ kind: "WORK_SCOPE_APPROVED", runId, evidence: { planDigest: stored.digest, bindingGeneration: 1,
+        units: [{ unit: "unit-a", taskIds: [a!.taskId], declarationDigest: "sha256:a" }, { unit: "unit-b", taskIds: [b!.taskId], declarationDigest: "sha256:b" }] } });
+      expect(approved.allowed).toBe(true);
+      const units = workUnitsOf(harness.cp.db, runId, taskRows(harness, runId));
+      expect(units.byTask.get(a!.taskId)).toBe("unit-a");
+      expect(units.byTask.get(b!.taskId)).toBe("unit-b");
+      // The approval resolved both keys: nothing is reported unresolved.
+      expect(units.unresolvedRefs).toEqual([]);
+    } finally { harness.cp.close(); }
+  }, 60_000);
+
+  it("uses a title only for a reference the approval left as a key, and never moves a mapped task", async () => {
+    const { harness, runId } = await prepare();
+    try {
+      const [a, b, c] = submit(harness, runId, [{ key: "a", title: "kept-a" }, { key: "b", title: "kept-b" }, { key: "c", title: "later-key" }]);
+      const stored = harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "unit-a", tasks: ["a", "later-key"] }, { key: "unit-b", tasks: ["b", "kept-a"] }] });
+      harness.cp.audit.record({ kind: "WORK_SCOPE_APPROVED", runId, evidence: { planDigest: stored.digest, bindingGeneration: 1,
+        units: [{ unit: "unit-a", taskIds: [a!.taskId, "later-key"], declarationDigest: "sha256:a" }, { unit: "unit-b", taskIds: [b!.taskId], declarationDigest: "sha256:b" }] } });
+      const units = workUnitsOf(harness.cp.db, runId, taskRows(harness, runId));
+      expect(units.byTask.get(a!.taskId)).toBe("unit-a");
+      expect(units.byTask.get(b!.taskId)).toBe("unit-b");
+      // The approval left "later-key" as a key: it is the title of task c, which nothing mapped.
+      expect(units.byTask.get(c!.taskId)).toBe("unit-a");
+      // The PLAN's "kept-a" (unit-b) is not read: the approval holds unit-b, and a is already in unit-a.
+      expect(units.unresolvedRefs).toEqual([]);
+    } finally { harness.cp.close(); }
+  }, 60_000);
+
+  it("names an ambiguous title, and a title whose task is mapped elsewhere, as unresolved without an approval", async () => {
+    const { harness, runId } = await prepare();
+    try {
+      const [first] = submit(harness, runId, [{ key: "p", title: "dup" }, { key: "q", title: "dup" }, { key: "r", title: "solo" }]);
+      harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "unit-a", tasks: [first!.taskId, "dup"] }, { key: "unit-b", tasks: ["solo"] }, { key: "unit-c", tasks: ["solo"] }] });
+      const units = workUnitsOf(harness.cp.db, runId, taskRows(harness, runId));
+      expect(units.byTask.get(first!.taskId)).toBe("unit-a");
+      expect(units.unresolvedRefs).toEqual(["unit-a:dup", "unit-c:solo"]);
+      expect([...units.byTask.values()].filter((unit) => unit === "unit-b")).toHaveLength(1);
     } finally { harness.cp.close(); }
   }, 60_000);
 });

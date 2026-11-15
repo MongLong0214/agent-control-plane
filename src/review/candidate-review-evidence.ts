@@ -65,11 +65,14 @@ interface WorkUnits {
 }
 
 /**
- * The work unit of each task, from the run's current PLAN (`workUnits[].tasks`) and its approval, which holds the
- * same units with the submission's keys already resolved to ids. A unit lists its tasks by id or by PLAN key; a
- * key is matched to the task whose title it is, the rule a dependency on an earlier submission's task uses
- * (`TaskGraph.submit`), and to nothing when two tasks share that title. A reference no task answers is
- * named in `unresolvedRefs` rather than dropped.
+ * The work unit of each task, from the run's current PLAN (`workUnits[].tasks`) and its approval
+ * (`WORK_SCOPE_APPROVED`), which holds the same units with the submission's keys already resolved to task ids.
+ * The approval is authoritative and is applied first: its task ids, then the PLAN's own task-id references for
+ * tasks it left unmapped. Only after that is a PLAN key read as a task title (the rule a dependency on an
+ * earlier submission's task uses, `TaskGraph.submit`), and only for references the approval did not resolve:
+ * a unit the approval holds contributes just the entries it left as keys, and a unit it does not hold
+ * contributes its PLAN refs. An inference never reassigns a task already mapped and is refused when two tasks
+ * share the title; either way the reference is named in `unresolvedRefs` rather than dropped.
  */
 export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_id: string; title: string }>): WorkUnits => {
   const none: WorkUnits = { declared: 0, byTask: new Map(), unresolvedRefs: [] };
@@ -77,22 +80,23 @@ export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_i
     `SELECT digest, content_json FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN' AND superseded = 0
       ORDER BY created_at DESC, rowid DESC LIMIT 1`, [runId]);
   if (plan === undefined) return none;
-  const units = new Map<string, Set<string>>();
-  const add = (unit: unknown, refs: unknown): void => {
+  const declared = new Map<string, Set<string>>();
+  const approved = new Map<string, Set<string>>();
+  const add = (into: Map<string, Set<string>>, unit: unknown, refs: unknown): void => {
     if (typeof unit !== "string" || !Array.isArray(refs)) return;
-    const held = units.get(unit) ?? new Set<string>();
+    const held = into.get(unit) ?? new Set<string>();
     for (const ref of refs) if (typeof ref === "string") held.add(ref);
-    units.set(unit, held);
+    into.set(unit, held);
   };
   try {
     const content: unknown = JSON.parse(plan.content_json);
-    const declared = isRecord(content) ? content["workUnits"] : undefined;
-    if (Array.isArray(declared)) for (const unit of declared) if (isRecord(unit)) add(unit["key"], unit["tasks"]);
+    const listed = isRecord(content) ? content["workUnits"] : undefined;
+    if (Array.isArray(listed)) for (const unit of listed) if (isRecord(unit)) add(declared, unit["key"], unit["tasks"]);
     const approval = db.get<{ evidence_json: string }>(
       `SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id DESC LIMIT 1`, [WORK_SCOPE_APPROVED_KIND, runId]);
-    const approved: unknown = approval === undefined ? undefined : JSON.parse(approval.evidence_json);
-    if (isRecord(approved) && approved["planDigest"] === plan.digest && Array.isArray(approved["units"])) {
-      for (const unit of approved["units"]) if (isRecord(unit)) add(unit["unit"], unit["taskIds"]);
+    const stored: unknown = approval === undefined ? undefined : JSON.parse(approval.evidence_json);
+    if (isRecord(stored) && stored["planDigest"] === plan.digest && Array.isArray(stored["units"])) {
+      for (const unit of stored["units"]) if (isRecord(unit)) add(approved, unit["unit"], unit["taskIds"]);
     }
   } catch { return none; }
   const ids = new Set(tasks.map((task) => task.task_id));
@@ -100,15 +104,27 @@ export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_i
   for (const task of tasks) byTitle.set(task.title, [...(byTitle.get(task.title) ?? []), task.task_id]);
   const byTask = new Map<string, string>();
   const unresolvedRefs: string[] = [];
-  for (const [unit, refs] of [...units.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
-    for (const ref of [...refs].sort()) {
-      const titled = byTitle.get(ref);
-      const taskId = ids.has(ref) ? ref : titled?.length === 1 ? titled[0]! : null;
-      if (taskId === null) { unresolvedRefs.push(`${unit}:${ref}`); continue; }
-      if (!byTask.has(taskId)) byTask.set(taskId, unit);
-    }
-  }
-  return { declared: units.size, byTask, unresolvedRefs };
+  const sorted = (units: Map<string, Set<string>>): Array<[string, string[]]> =>
+    [...units.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([unit, refs]) => [unit, [...refs].sort()]);
+  const byId = (unit: string, ref: string): boolean => {
+    if (!ids.has(ref)) return false;
+    if (!byTask.has(ref)) byTask.set(ref, unit);
+    return true;
+  };
+  const inferred = (unit: string, ref: string): void => {
+    const titled = byTitle.get(ref);
+    const taskId = titled?.length === 1 ? titled[0]! : null;
+    if (taskId === null || (byTask.has(taskId) && byTask.get(taskId) !== unit)) unresolvedRefs.push(`${unit}:${ref}`);
+    else byTask.set(taskId, unit);
+  };
+  // 1. What the approval resolved, then the PLAN's own task ids: neither is ever overridden.
+  for (const [unit, refs] of sorted(approved)) for (const ref of refs) byId(unit, ref);
+  for (const [unit, refs] of sorted(declared)) for (const ref of refs) byId(unit, ref);
+  // 2. Inference, for the references still unanswered: the approval's entries it left as keys, and the PLAN's
+  // keys in a unit the approval does not hold.
+  for (const [unit, refs] of sorted(approved)) for (const ref of refs) if (!ids.has(ref)) inferred(unit, ref);
+  for (const [unit, refs] of sorted(declared)) if (!approved.has(unit)) for (const ref of refs) if (!ids.has(ref)) inferred(unit, ref);
+  return { declared: new Set([...declared.keys(), ...approved.keys()]).size, byTask, unresolvedRefs };
 };
 
 const taskEvidence = (db: Db, runId: string, budget: number) => {
@@ -369,6 +385,12 @@ export interface ReceiptChecks {
   baseIsSnapshotBase: boolean;
   /** The receipt's diffDigest equals the frozen change recomputed in the receipt's form; null when it was not recomputed. */
   diffDigestAgrees: boolean | null;
+  /**
+   * Whether the receipt's commit was placed against the candidate's history: always true for a receipt of the
+   * candidate head, and for an earlier commit only when the ancestry read was made and answered. False names a
+   * receipt whose place in the history is unknown: it is listed, never dropped, and does not link.
+   */
+  ancestryChecked: boolean;
 }
 
 export interface ExecutionEvidence {
@@ -377,7 +399,10 @@ export interface ExecutionEvidence {
   results: OutputEvidence[];
   repositories: Array<{ repository: string; baseHead: string; candidateHead: string; linkedExecutionIds: string[] }>;
   receipts: ReceiptEvidence[];
-  /** Receipts not listed, by why. `overListLimit` is kept for its readers and is always 0: no receipt is dropped for count. */
+  /**
+   * Receipts not listed, by why. `overListLimit` and `unchecked` are kept for their readers and are always 0: no
+   * receipt is dropped for count, and one whose ancestry was not checked is listed with `checks.ancestryChecked` false.
+   */
   receiptsNotListed: { outsideCandidateHistory: number; notACandidateRepository: number; noCommitReceipt: number; overListLimit: number; unchecked: number };
   /** The repositories whose frozen snapshot entry holds an `integration` record, with its number of task rows. */
   integration?: Array<{ repository: string; tasks: number }>;
@@ -756,26 +781,32 @@ const receiptEvidence = async (db: Db, input: ExecutionEvidenceInput): Promise<P
     };
     const checkout = input.checkoutOf(repo.identity);
     if (commitHead !== repo.candidateHead) {
-      if (checkout === null || ancestryChecks >= ANCESTRY_CHECK_LIMIT) {
-        notListed.unchecked += 1;
-        continue;
-      }
-      ancestryChecks += 1;
-      const ancestry = await git(checkout, ["--no-replace-objects", "merge-base", "--is-ancestor", commitHead, repo.candidateHead],
-        { allowFailure: true }).catch(() => ({ exitCode: -1 }));
-      if (ancestry.exitCode === 1) notListed.outsideCandidateHistory += 1;
-      else if (ancestry.exitCode !== 0) notListed.unchecked += 1;
-      else {
+      const earlier = (ancestryChecked: boolean, mismatch: string): void => {
         receipt.checks = {
           namesTask: record === null ? null : record.evidence["taskId"] === execution.task_id,
           resultReproduced: reproducing !== undefined,
           commitIsCandidateHead: false,
           baseIsSnapshotBase: receipt.baseHead === repo.baseHead,
           diffDigestAgrees: null,
+          ancestryChecked,
         };
-        receipt.mismatches.push("commitHead is an earlier commit in the candidate's history, not the candidate head; containment does not link a receipt");
+        receipt.mismatches.push(mismatch);
         receipts.push(receipt);
+      };
+      // The ancestry reads are bounded for cost; a receipt past the bound, or whose read could not be made,
+      // is still listed (#1410 review P1), its place in the history marked unchecked, never dropped.
+      const unchecked = checkout === null ? "the repository has no local checkout"
+        : ancestryChecks >= ANCESTRY_CHECK_LIMIT ? `more than ${ANCESTRY_CHECK_LIMIT} receipts name an earlier commit, and only that many ancestry reads are made per review` : null;
+      if (unchecked !== null) {
+        earlier(false, `commitHead is not the candidate head and its place in the candidate's history was not checked: ${unchecked}`);
+        continue;
       }
+      ancestryChecks += 1;
+      const ancestry = await git(checkout!, ["--no-replace-objects", "merge-base", "--is-ancestor", commitHead, repo.candidateHead],
+        { allowFailure: true }).catch(() => ({ exitCode: -1 }));
+      if (ancestry.exitCode === 1) notListed.outsideCandidateHistory += 1;
+      else if (ancestry.exitCode !== 0) earlier(false, "commitHead is not the candidate head and its place in the candidate's history was not checked: the ancestry read failed");
+      else earlier(true, "commitHead is an earlier commit in the candidate's history, not the candidate head; containment does not link a receipt");
       continue;
     }
     const mismatches = receipt.mismatches;
@@ -809,6 +840,7 @@ const receiptEvidence = async (db: Db, input: ExecutionEvidenceInput): Promise<P
       commitIsCandidateHead: true,
       baseIsSnapshotBase: receipt.baseHead === repo.baseHead,
       diffDigestAgrees: receipt.recomputedDiffDigest === null || receipt.recomputedDiffDigest === undefined ? null : receipt.recomputedDiffDigest === receipt.diffDigest,
+      ancestryChecked: true,
     };
     receipts.push(receipt);
   }
