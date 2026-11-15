@@ -28,31 +28,12 @@ Agents talk to the daemon over MCP. The daemon is one supervised Node process wi
 
 ## How it works
 
-```mermaid
-flowchart LR
-  Owner([Owner]) -->|Telegram / Buzz| Ingress
-  Operator([Operator]) -->|agentctl, operator socket| Run
-  subgraph Daemon[agentcpd]
-    Ingress[IngressGuard]
-    CEOMCP[CEO MCP server<br/>hermes.mcp.sock]
-    CTOMCP[CTO MCP server<br/>cto.mcp.sock]
-    Run[Run engine]
-    Verify[Verification engine]
-    Review[Blind review gate]
-    GH[GitHub kernel and finalizer]
-    DB[(SQLite)]
-  end
-  Ingress --> Run
-  CEO[CEO session: Hermes] <-->|MCP| CEOMCP
-  CTO[CTO session: Claude Code] <-->|MCP| CTOMCP
-  CEOMCP --> Run
-  CTOMCP --> Run
-  Run <--> DB
-  CTOMCP -->|task_worker_run| Worker[Worker in a disposable worktree]
-  Run --> Verify --> Sandbox[(seatbelt sandbox)]
-  Run --> Review --> Reviewer[Blind reviewer sessions]
-  Run --> GH --> GitHub[(GitHub)]
-```
+Diagram sources: `assets/readme/diagrams/*.mmd`
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/diagrams/architecture-dark.svg">
+  <img src="assets/readme/diagrams/architecture.svg" alt="ACP architecture: agents, the agentcpd daemon, and its providers" width="100%">
+</picture>
 
 The daemon owns every decision and all state. CEO and CTO sessions reach it only through their own MCP sockets; workers and reviewers are provider sessions it starts.
 
@@ -81,29 +62,10 @@ The owner is not a role. Owner decisions arrive through authenticated ingress, a
 
 Delivery to role holders is durable: an outbox row, a payload-free wake, and an acknowledgement over the holder's own authenticated MCP connection. Every message carries the role's binding generation, so a replaced session's late traffic is audited and dropped ([ADR-0003](docs/adr/ADR-0003-role-binding-generation-and-fencing.md)).
 
-```mermaid
-stateDiagram-v2
-  [*] --> QUEUED: run_create
-  QUEUED --> ACTIVE: run_dispatch
-  ACTIVE --> READY_FOR_CEO_REVIEW: packet assembled
-  ACTIVE --> BLOCKED: escalation blocks critical path
-  BLOCKED --> ACTIVE: escalation resolved
-  ACTIVE --> AWAITING_HUMAN: owner input needed
-  AWAITING_HUMAN --> ACTIVE: owner decision satisfied
-  READY_FOR_CEO_REVIEW --> CEO_APPROVED: CONFIRM
-  READY_FOR_CEO_REVIEW --> REVISION_REQUIRED: FINAL_REVISE
-  READY_FOR_CEO_REVIEW --> AWAITING_HUMAN: OWNER_DECISION_REQUIRED
-  REVISION_REQUIRED --> ACTIVE: returned to CTO
-  CEO_APPROVED --> MERGING: finalizer
-  MERGING --> POST_MERGE_VERIFYING: merged
-  POST_MERGE_VERIFYING --> COMPLETED: post-merge pass
-  MERGING --> BLOCKED_POST_MERGE: partial failure
-  POST_MERGE_VERIFYING --> BLOCKED_POST_MERGE: partial failure
-  BLOCKED_POST_MERGE --> POST_MERGE_VERIFYING: retried
-  ACTIVE --> FAILED: unrecoverable
-  ACTIVE --> CANCELLED: run_cancel
-  COMPLETED --> [*]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/diagrams/run-lifecycle-dark.svg">
+  <img src="assets/readme/diagrams/run-lifecycle.svg" alt="Run lifecycle state diagram" width="100%">
+</picture>
 
 A run moves through these thirteen states: `QUEUED`, `ACTIVE`, `BLOCKED`, `READY_FOR_CEO_REVIEW`, `CEO_APPROVED`, `MERGING`, `POST_MERGE_VERIFYING`, `BLOCKED_POST_MERGE`, `REVISION_REQUIRED`, `AWAITING_HUMAN`, `COMPLETED`, `FAILED`, `CANCELLED`. The diagram omits the less common edges (for example cancel from most states, and `POST_MERGE_VERIFYING` back to `MERGING` for the next repository). A `PROJECT_BOOTSTRAP` run goes from `READY_FOR_CEO_REVIEW` straight to `COMPLETED` on `CONFIRM`.
 
@@ -111,32 +73,10 @@ Run states and legal transitions are a `CHECK` constraint and a trigger in [`src
 
 ### Candidate pipeline
 
-```mermaid
-sequenceDiagram
-  participant CTO
-  participant P as Candidate pipeline (agentcpd)
-  participant V as Verification engine
-  participant R as Blind reviewers
-  participant G as Production gate
-  participant CEO
-  CTO->>P: result_submit
-  P->>P: freeze candidate snapshot
-  P->>V: run the contract's commands in the sandbox
-  alt verification fails
-    P-->>CTO: VERIFICATION_FAILED, run stays ACTIVE
-  else verification passes
-    P->>R: chunk reviewers when the diff is large, then a fresh final reviewer
-    alt REVISE, BLOCK or omitted items
-      P-->>CTO: REVISION_REQUIRED stage, run stays ACTIVE
-    else isolation lost or provider unavailable
-      P-->>CTO: REVIEW_UNAVAILABLE, not a revision
-    else review passes
-      P->>G: production-ready packet
-      G-->>CEO: READY_FOR_CEO_REVIEW
-      CEO->>G: ceo_decision_submit
-    end
-  end
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/diagrams/candidate-pipeline-dark.svg">
+  <img src="assets/readme/diagrams/candidate-pipeline.svg" alt="Candidate pipeline sequence diagram" width="100%">
+</picture>
 
 The CTO resubmits after a returned revision. Only a passing review reaches the CEO; the CEO answers `CONFIRM`, `FINAL_REVISE` or `OWNER_DECISION_REQUIRED`.
 

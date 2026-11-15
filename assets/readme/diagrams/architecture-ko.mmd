@@ -1,0 +1,23 @@
+flowchart LR
+  Owner([오너]) -->|Telegram / Buzz| Ingress
+  Operator([운영자]) -->|agentctl, operator 소켓| Run
+  subgraph Daemon[agentcpd]
+    Ingress[IngressGuard]
+    CEOMCP[CEO MCP 서버<br/>hermes.mcp.sock]
+    CTOMCP[CTO MCP 서버<br/>cto.mcp.sock]
+    Run[Run 엔진]
+    Verify[검증 엔진]
+    Review[블라인드 리뷰 게이트]
+    GH[GitHub 커널 및 finalizer]
+    DB[(SQLite)]
+  end
+  Ingress --> Run
+  CEO[CEO 세션: Hermes] <-->|MCP| CEOMCP
+  CTO[CTO 세션: Claude Code] <-->|MCP| CTOMCP
+  CEOMCP --> Run
+  CTOMCP --> Run
+  Run <--> DB
+  CTOMCP -->|task_worker_run| Worker[일회용 worktree의 워커]
+  Run --> Verify --> Sandbox[(seatbelt 샌드박스)]
+  Run --> Review --> Reviewer[블라인드 리뷰어 세션]
+  Run --> GH --> GitHub[(GitHub)]

@@ -28,31 +28,12 @@ Agent Control Plane(ACP)은 로컬 데몬 `agentcpd`와 운영자용 CLI `agentc
 
 ## 동작 방식
 
-```mermaid
-flowchart LR
-  Owner([오너]) -->|Telegram / Buzz| Ingress
-  Operator([운영자]) -->|agentctl, operator 소켓| Run
-  subgraph Daemon[agentcpd]
-    Ingress[IngressGuard]
-    CEOMCP[CEO MCP 서버<br/>hermes.mcp.sock]
-    CTOMCP[CTO MCP 서버<br/>cto.mcp.sock]
-    Run[Run 엔진]
-    Verify[검증 엔진]
-    Review[블라인드 리뷰 게이트]
-    GH[GitHub 커널 및 finalizer]
-    DB[(SQLite)]
-  end
-  Ingress --> Run
-  CEO[CEO 세션: Hermes] <-->|MCP| CEOMCP
-  CTO[CTO 세션: Claude Code] <-->|MCP| CTOMCP
-  CEOMCP --> Run
-  CTOMCP --> Run
-  Run <--> DB
-  CTOMCP -->|task_worker_run| Worker[일회용 worktree의 워커]
-  Run --> Verify --> Sandbox[(seatbelt 샌드박스)]
-  Run --> Review --> Reviewer[블라인드 리뷰어 세션]
-  Run --> GH --> GitHub[(GitHub)]
-```
+다이어그램 원본: `assets/readme/diagrams/*.mmd`
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/diagrams/architecture-ko-dark.svg">
+  <img src="assets/readme/diagrams/architecture-ko.svg" alt="ACP 아키텍처 다이어그램" width="100%">
+</picture>
 
 모든 결정과 상태는 데몬이 가집니다. CEO와 CTO 세션은 각자의 MCP 소켓으로만 데몬에 접근하고, 워커와 리뷰어는 데몬이 띄우는 프로바이더 세션입니다.
 
@@ -81,29 +62,10 @@ flowchart LR
 
 역할 보유자에게 가는 전달은 내구성이 있습니다. outbox 행을 쓰고, payload 없는 wake를 보내고, 보유자가 자신의 인증된 MCP 연결로 확인 응답(ACK)을 보냅니다. 모든 메시지에는 역할의 바인딩 세대(binding generation)가 실려 있어서, 교체된 세션의 뒤늦은 트래픽은 감사 기록에 남고 폐기됩니다 ([ADR-0003](docs/adr/ADR-0003-role-binding-generation-and-fencing.md)).
 
-```mermaid
-stateDiagram-v2
-  [*] --> QUEUED: run_create
-  QUEUED --> ACTIVE: run_dispatch
-  ACTIVE --> READY_FOR_CEO_REVIEW: 패킷 생성
-  ACTIVE --> BLOCKED: 에스컬레이션이 임계 경로를 막음
-  BLOCKED --> ACTIVE: 에스컬레이션 해결
-  ACTIVE --> AWAITING_HUMAN: 오너 입력 필요
-  AWAITING_HUMAN --> ACTIVE: 오너 결정 충족
-  READY_FOR_CEO_REVIEW --> CEO_APPROVED: CONFIRM
-  READY_FOR_CEO_REVIEW --> REVISION_REQUIRED: FINAL_REVISE
-  READY_FOR_CEO_REVIEW --> AWAITING_HUMAN: OWNER_DECISION_REQUIRED
-  REVISION_REQUIRED --> ACTIVE: CTO에게 반환
-  CEO_APPROVED --> MERGING: finalizer
-  MERGING --> POST_MERGE_VERIFYING: 머지됨
-  POST_MERGE_VERIFYING --> COMPLETED: 머지 후 검증 통과
-  MERGING --> BLOCKED_POST_MERGE: 부분 실패
-  POST_MERGE_VERIFYING --> BLOCKED_POST_MERGE: 부분 실패
-  BLOCKED_POST_MERGE --> POST_MERGE_VERIFYING: 재시도
-  ACTIVE --> FAILED: 복구 불가
-  ACTIVE --> CANCELLED: run_cancel
-  COMPLETED --> [*]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/diagrams/run-lifecycle-ko-dark.svg">
+  <img src="assets/readme/diagrams/run-lifecycle-ko.svg" alt="실행 수명 주기 상태 다이어그램" width="100%">
+</picture>
 
 run은 `QUEUED`, `ACTIVE`, `BLOCKED`, `READY_FOR_CEO_REVIEW`, `CEO_APPROVED`, `MERGING`, `POST_MERGE_VERIFYING`, `BLOCKED_POST_MERGE`, `REVISION_REQUIRED`, `AWAITING_HUMAN`, `COMPLETED`, `FAILED`, `CANCELLED`의 13개 상태를 거칩니다. 그림에서는 덜 일반적인 전이(대부분의 상태에서의 취소, 다음 저장소를 위해 `POST_MERGE_VERIFYING`에서 `MERGING`으로 돌아가는 전이 등)를 생략했습니다. `PROJECT_BOOTSTRAP` run은 `CONFIRM` 시 `READY_FOR_CEO_REVIEW`에서 곧바로 `COMPLETED`가 됩니다.
 
@@ -111,32 +73,10 @@ run 상태와 허용되는 전이는 [`src/db/schema.sql`](src/db/schema.sql)의
 
 ### 후보 파이프라인
 
-```mermaid
-sequenceDiagram
-  participant CTO
-  participant P as 후보 파이프라인 (agentcpd)
-  participant V as 검증 엔진
-  participant R as 블라인드 리뷰어
-  participant G as Production gate
-  participant CEO
-  CTO->>P: result_submit
-  P->>P: 후보 스냅샷 동결
-  P->>V: 계약의 명령을 샌드박스에서 실행
-  alt 검증 실패
-    P-->>CTO: VERIFICATION_FAILED, run은 ACTIVE 유지
-  else 검증 통과
-    P->>R: diff가 크면 청크 리뷰어, 이어서 새 최종 리뷰어
-    alt REVISE, BLOCK 또는 누락 항목
-      P-->>CTO: REVISION_REQUIRED 단계, run은 ACTIVE 유지
-    else 격리 상실 또는 프로바이더 사용 불가
-      P-->>CTO: REVIEW_UNAVAILABLE, 수정 요청이 아님
-    else 리뷰 통과
-      P->>G: production-ready 패킷
-      G-->>CEO: READY_FOR_CEO_REVIEW
-      CEO->>G: ceo_decision_submit
-    end
-  end
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/diagrams/candidate-pipeline-ko-dark.svg">
+  <img src="assets/readme/diagrams/candidate-pipeline-ko.svg" alt="후보 파이프라인 시퀀스 다이어그램" width="100%">
+</picture>
 
 반환된 수정 요청 뒤에는 CTO가 다시 제출합니다. 리뷰를 통과한 후보만 CEO에게 도달하며, CEO는 `CONFIRM`, `FINAL_REVISE`, `OWNER_DECISION_REQUIRED` 중 하나로 답합니다.
 
