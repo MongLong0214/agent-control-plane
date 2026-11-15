@@ -159,7 +159,12 @@ describe("an approved work-unit mapping is never overridden by title inference (
     return submitted.value;
   };
   const taskRows = (harness: Awaited<ReturnType<typeof prepare>>["harness"], runId: string) =>
-    harness.cp.db.all<{ task_id: string; title: string }>(`SELECT task_id, title FROM tasks WHERE run_id = ?`, [runId]);
+    harness.cp.db.all<{ task_id: string; title: string; state: string }>(`SELECT task_id, title, state FROM tasks WHERE run_id = ?`, [runId]);
+  /** Every live (not CANCELLED) task has its work unit, or the gap is named: no task is silently without one. */
+  const expectNoSilentGap = (harness: Awaited<ReturnType<typeof prepare>>["harness"], runId: string, units: ReturnType<typeof workUnitsOf>, only?: readonly string[]): void => {
+    const unmapped = taskRows(harness, runId).filter((task) => task.state !== "CANCELLED" && !units.byTask.has(task.task_id) && (only === undefined || only.includes(task.task_id)));
+    if (unmapped.length > 0) expect(units.unresolvedRefs.length, `unmapped: ${unmapped.map((task) => task.title).join(", ")}`).toBeGreaterThan(0);
+  };
 
   it("keeps each task in the unit the approval gave it when one task's title is another's PLAN key", async () => {
     const { harness, runId } = await prepare();
@@ -229,6 +234,28 @@ describe("an approved work-unit mapping is never overridden by title inference (
       expect(units.byTask.get(other.taskId)).toBe("small");
       // What no task answers is an explicit gap, not silence.
       expect(units.unresolvedRefs).toEqual(["big:ghost"]);
+      expectNoSilentGap(harness, runId, units, [...many, other].map((task) => task.taskId));
+    } finally { harness.cp.close(); }
+  }, 60_000);
+
+  it("a cancelled task's title never answers a PLAN key: the live task is left unmapped with the gap named (#1410 r3)", async () => {
+    const { harness, runId } = await prepare();
+    try {
+      // 201 tasks in one unit; the last one's PLAN key is `u200` but its title is something else, and a superseded task kept `u200`.
+      const many = submit(harness, runId, Array.from({ length: 201 }, (_, i) => ({ key: `u${i}`, title: i === 200 ? "actual tail task" : `u${i}` })));
+      const [old] = submit(harness, runId, [{ key: "old", title: "u200" }]);
+      harness.cp.db.run(`UPDATE tasks SET state = 'CANCELLED' WHERE task_id = ?`, [old!.taskId]);
+      const stored = harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "big", tasks: many.map((_, i) => `u${i}`) }] });
+      harness.cp.audit.record({ kind: "WORK_SCOPE_APPROVED", runId, evidence: { planDigest: stored.digest, bindingGeneration: 1,
+        units: [{ unit: "big", taskIds: many.map((task) => task.taskId), declarationDigest: "sha256:big" }] } });
+
+      const units = workUnitsOf(harness.cp.db, runId, taskRows(harness, runId));
+      // The cancelled task is not the unit's, and the unit's live tail is not silently without one.
+      expect(units.byTask.has(old!.taskId)).toBe(false);
+      expect(units.byTask.has(many[200]!.taskId)).toBe(false);
+      expect(units.unresolvedRefs).toEqual(["big:u200"]);
+      expect(many.slice(0, 200).every((task) => units.byTask.get(task.taskId) === "big")).toBe(true);
+      expectNoSilentGap(harness, runId, units, many.map((task) => task.taskId));
     } finally { harness.cp.close(); }
   }, 60_000);
 });

@@ -74,9 +74,9 @@ interface WorkUnits {
  * contributes its PLAN refs. So does a unit whose approved task list is as long as the audit log's array cap
  * (`AUDIT_ARRAY_LIMIT`), which may have lost its tail without a mark: its PLAN refs fill in the tasks the
  * approval did not map, and never move one it did. An inference never reassigns a task already mapped and is refused when two tasks
- * share the title; either way the reference is named in `unresolvedRefs` rather than dropped.
+ * share the title (a CANCELLED task never answers a key); either way the reference is named in `unresolvedRefs` rather than dropped.
  */
-export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_id: string; title: string }>): WorkUnits => {
+export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_id: string; title: string; state?: string }>): WorkUnits => {
   const none: WorkUnits = { declared: 0, byTask: new Map(), unresolvedRefs: [] };
   const plan = db.get<{ digest: string; content_json: string }>(
     `SELECT digest, content_json FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN' AND superseded = 0
@@ -110,7 +110,8 @@ export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_i
   } catch { return none; }
   const ids = new Set(tasks.map((task) => task.task_id));
   const byTitle = new Map<string, string[]>();
-  for (const task of tasks) byTitle.set(task.title, [...(byTitle.get(task.title) ?? []), task.task_id]);
+  // A key is only ever a live task's title: a superseded task that kept an old title answers no PLAN key.
+  for (const task of tasks) if (task.state !== "CANCELLED") byTitle.set(task.title, [...(byTitle.get(task.title) ?? []), task.task_id]);
   const byTask = new Map<string, string>();
   const unresolvedRefs: string[] = [];
   const sorted = (units: Map<string, Set<string>>): Array<[string, string[]]> =>
@@ -153,7 +154,7 @@ const taskEvidence = (db: Db, runId: string, budget: number) => {
       WHERE t.run_id = ? ORDER BY d.task_id, d.depends_on`, [runId])) {
     dependencies.set(edge.task_id, [...(dependencies.get(edge.task_id) ?? []), edge.depends_on]);
   }
-  const units = workUnitsOf(db, runId, rows.map((row) => ({ task_id: row.taskId, title: row.title })));
+  const units = workUnitsOf(db, runId, rows.map((row) => ({ task_id: row.taskId, title: row.title, state: row.state })));
   const all: TaskEvidence[] = rows.map(({ title: _title, ...task }) => {
     const dependsOn = dependencies.get(task.taskId);
     const workUnit = units.byTask.get(task.taskId);
@@ -759,7 +760,7 @@ const receiptEvidence = async (db: Db, input: ExecutionEvidenceInput): Promise<P
   }
   const candidateHeads = new Set(input.snapshot.repositories.map((repo) => repo.candidateHead));
   const unitOfTask = workUnitsOf(db, input.runId,
-    db.all<{ task_id: string; title: string }>(`SELECT task_id, title FROM tasks WHERE run_id = ?`, [input.runId])).byTask;
+    db.all<{ task_id: string; title: string; state: string }>(`SELECT task_id, title, state FROM tasks WHERE run_id = ?`, [input.runId])).byTask;
   const notListed = { outsideCandidateHistory: 0, notACandidateRepository: 0, noCommitReceipt: 0, overListLimit: 0, unchecked: 0 };
   const receipts: ReceiptEvidence[] = [];
   let ancestryChecks = 0;
