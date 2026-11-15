@@ -10,6 +10,8 @@ import {
 } from "./hermes-gateway-identity.ts";
 
 const PATH = "/v1/canonical-surface/events";
+/** U6 B1 — the Gateway route that may answer a CEO notification as a reply to the owner's `/acp` message. */
+const DAEMON_NOTICES_PATH = "/v1/canonical-surface/daemon-notices";
 const MAX_REPLY_BYTES = 16_384;
 const MAX_REQUEST_BYTES = 16_384;
 const TIMEOUT_MS = 5_000;
@@ -140,6 +142,24 @@ export const createHermesGatewayConversationSender = (options: HermesGatewayConv
   };
 };
 
+/**
+ * The route for one notice, read from its signed text the way the Gateway reads it: a one-part CEO
+ * notification whose payload carries an `origin` goes to the daemon-notice route; every other notice
+ * keeps the events route, unchanged. A Gateway without that route answers non-200, which leaves the
+ * notice in doubt rather than moving it to Buzz.
+ */
+const daemonNoticePath = (text: string): string => {
+  const head = /^ACP notification (\S+) part 1\/1: /.exec(text);
+  if (!head) return PATH;
+  let body: unknown;
+  try { body = JSON.parse(text.slice(head[0].length)); } catch { return PATH; }
+  if (typeof body !== "object" || body === null) return PATH;
+  const notice = body as { messageId?: unknown; kind?: unknown; payload?: unknown };
+  const payload = typeof notice.payload === "object" && notice.payload !== null ? notice.payload as { origin?: unknown } : {};
+  return notice.messageId === head[1] && notice.kind === "CEO_NOTIFICATION" && typeof payload.origin === "object" &&
+    payload.origin !== null ? DAEMON_NOTICES_PATH : PATH;
+};
+
 export interface HermesGatewayDaemonNoticeOptions {
   /** The same daemon-provisioned Gateway key; it authenticates the channel, not the sender. */
   apiKey: string;
@@ -152,8 +172,8 @@ export interface HermesGatewayDaemonNoticeOptions {
 }
 
 /**
- * `acp-daemon-notice/v1`: one signed daemon notice to the CEO's existing canonical conversation, on
- * the same route and with the same pinned destination as the conversation sender above. No
+ * `acp-daemon-notice/v1`: one signed daemon notice to the CEO's existing canonical conversation, with
+ * the same pinned destination as the conversation sender above, on the route `daemonNoticePath` names. No
  * `author_id` and no `channel_id`: the body is exactly the contract's, sealed by the caller.
  *
  * The Gateway's identity is read first and must equal the notice's `destination` field for field, as
@@ -200,7 +220,7 @@ export const createHermesGatewayDaemonNoticeSender = (options: HermesGatewayDaem
       const lost = (reason: string): DaemonNoticeSendOutcome =>
         reached ? { kind: "UNCERTAIN", reason } : { kind: "NOT_SENT", reason };
       try {
-        const req = request({ hostname: HERMES_GATEWAY_HOST, family: 4, port, path: PATH, method: "POST", agent: false,
+        const req = request({ hostname: HERMES_GATEWAY_HOST, family: 4, port, path: daemonNoticePath(notice.text), method: "POST", agent: false,
           headers: { Authorization: `Bearer ${options.apiKey}`, "Content-Type": "application/json",
             "Content-Length": Buffer.byteLength(body) } }, (res) => {
           const status = res.statusCode ?? 0;

@@ -873,6 +873,23 @@ export const settleStoppedSessionInstructions = (
   );
 
 /**
+ * U6 B1 — a CEO notification's `origin` (the owner's `/acp` turn its run was dispatched in) is sent only
+ * while the notification is addressed to that turn's own CEO generation and session. Readdressed to a
+ * successor, it is still sent, without the origin, so nothing replies to a message that holder never had.
+ */
+const withCurrentOrigin = (db: Pick<Db, "get">, message: OutboxMessage): OutboxMessage => {
+  const payload = message.payload;
+  if (typeof payload !== "object" || payload === null || !("origin" in payload)) return message;
+  const { origin, ...rest } = payload as Record<string, unknown>;
+  const turn = (origin as { turn_request_id?: unknown } | null)?.turn_request_id;
+  const current = typeof turn === "string" && db.get<{ 1: number }>(
+    `SELECT 1 FROM canonical_turns WHERE turn_request_id = ? AND binding_generation = ? AND executor_session_id = ?`,
+    [turn, message.bindingGeneration, message.targetSessionId],
+  ) !== undefined;
+  return current ? message : { ...message, payload: rest };
+};
+
+/**
  * Every unsettled CEO notification follows the current holder with its sealed content and id.
  * Restore delivery from only the selected room/recipient's ledger, independently of the previous
  * row state. Acceptance proves SENT, never ACKED; UNKNOWN stays held. An eligible new receiver
@@ -1239,7 +1256,7 @@ export class Outbox {
           const attempt = new CeoNoticeRoute(this.db, this.audit, hydrate(row));
           if (attempt.withholdBeforeSend()) continue;
           try {
-            const result = await send(hydrate(row), attempt);
+            const result = await send(withCurrentOrigin(this.db, hydrate(row)), attempt);
             unavailable = !result.allowed && result.reasonCode === ReasonCode.CEO_CONVERSATION_UNAVAILABLE;
             accepted = result.allowed;
             reasonCode = result.reasonCode;

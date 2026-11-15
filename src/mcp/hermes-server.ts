@@ -40,7 +40,7 @@ import { CanonicalSessionRegistry, type CanonicalEntitlementTransferRequest } fr
 import { projectCi } from "../registry/project-ci.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
-import type { RunEngine } from "../run/run-engine.ts";
+import type { DispatchOrigin, RunEngine } from "../run/run-engine.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { ContinuityKernel } from "../continuity/continuity-kernel.ts";
@@ -105,6 +105,30 @@ export interface HermesMcpSource extends McpMutationSource {
   readonly bindings: BindingRegistry;
   readonly bootstrapProducer: Pick<RepoFactoryBootstrapRunner, "produceAndActivateApproved">;
 }
+
+/**
+ * U6 B1 — the owner's Telegram `/acp` turn a `run_dispatch` is made in, when the caller is the current
+ * CEO binding's own session on an admitted turn and that session has exactly one canonical turn in
+ * doubt, answering exactly one Telegram update. Anything else is no origin: none is inferred.
+ */
+const admittedDispatchOrigin = (
+  source: Pick<HermesMcpSource, "db" | "bindings">, peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined,
+): DispatchOrigin | undefined => {
+  const ceo = source.bindings.active(roleKeyFor(Role.CEO));
+  if (!turn || !ceo || !peer.sessionId || ceo.sessionId !== peer.sessionId || ceo.sessionIncarnation !== peer.sessionIncarnation) {
+    return undefined;
+  }
+  const rows = source.db.all<{ turn_request_id: string; source_channel: string | null; source_nonce: string | null }>(
+    `SELECT t.turn_request_id, s.source_channel, s.source_nonce FROM canonical_turns t
+       LEFT JOIN canonical_turn_sources s ON s.turn_request_id = t.turn_request_id
+      WHERE t.lifecycle_state = 'IN_DOUBT' AND t.executor_session_id = ? AND t.executor_session_incarnation = ?
+        AND t.binding_generation = ?`,
+    [ceo.sessionId, ceo.sessionIncarnation, ceo.bindingGeneration],
+  );
+  const update = rows.length === 1 && rows[0]!.source_channel === "telegram"
+    ? /^update:([1-9][0-9]{0,15})$/.exec(rows[0]!.source_nonce ?? "")?.[1] : undefined;
+  return update ? { turnRequestId: rows[0]!.turn_request_id, updateId: update } : undefined;
+};
 
 /** Only ports constructed below may be attached to an MCP server. */
 const HERMES_MCP_PORTS = new WeakSet<object>();
@@ -208,8 +232,12 @@ export const createHermesMcpPort = (
       bootstrapPlanAttachAuthority(source, peer, turn),
     bootstrapPlanAttachAccess: (input: BootstrapPlanAttachInput) => bootstrapPlanAttachAccess(source, input),
     createRun: (input: Parameters<RunEngine["create"]>[0]) => source.runs.create(input),
-    dispatchRun: (runId: string, hermesTurn?: HermesAdmittedTurn) =>
-      source.runs.dispatch(runId, hermesTurn === undefined ? {} : { hermesTurn }),
+    dispatchRun: (runId: string, hermesTurn?: HermesAdmittedTurn, peer?: AuthenticatedMcpPeer) => {
+      const originReply = peer ? admittedDispatchOrigin(source, peer, hermesTurn) : undefined;
+      return source.runs.dispatch(runId, {
+        ...(hermesTurn === undefined ? {} : { hermesTurn }), ...(originReply ? { originReply } : {}),
+      });
+    },
     runView: (runId: string) => {
       const run = source.runs.get(runId);
       return run
@@ -734,7 +762,10 @@ const createHermesServerFromPort = (
   server.registerTool(
     "run_dispatch",
     { description: "Admit a queued run.", inputSchema: { ...mutation, runId: z.string() } },
-    async (args, extra) => write("run_dispatch", args, extra, async () => respond(await port.dispatchRun(args.runId, admittedTurnOf(extra)))),
+    async (args, extra) => write("run_dispatch", args, extra, async () => {
+      const peer = authenticateMcpPeer(authenticate);
+      return respond(await port.dispatchRun(args.runId, admittedTurnOf(extra), peer.allowed ? peer.value : undefined));
+    }),
   );
 
   server.registerTool(
