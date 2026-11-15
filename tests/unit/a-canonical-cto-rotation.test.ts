@@ -227,7 +227,7 @@ const world = async () => {
     return { runId: created.value.runId, dispatched: dispatch ? await harness.cp.runs.dispatch(created.value.runId) : null };
   };
 
-  /** The owner's `agentctl canonical-cto rotate`: forward with the handoff package, a rollback without one. */
+  /** The owner's `agentctl canonical-cto rotate`, with the handoff package unless `handoff` is undefined. */
   const rotate = (toSessionUuid: string, expectedGeneration: number, handoff: HandoffPackage | undefined = HANDOFF): Decision<CanonicalSwitchoverPrepared> =>
     harness.cp.cto.prepareCanonicalSwitchover({ projectId, toSessionUuid, expectedGeneration, ...(handoff ? { handoff } : {}) }, OWNER);
   const holder = (sessionId: string, generation: number): HolderIdentity => ({
@@ -303,6 +303,12 @@ describe("agentctl canonical-cto rotate: the §10.1 switchover of a canonical CT
     expectUnmoved(w, SessionLifecycle.DRAINING);
     expect(w.judge()).toMatchObject({ verdict: "ADMITTED", binding: { sessionId: w.oldSessionId } });
     expect((await w.claimAs(SPARE, 2, 23)).allowed).toBe(false);
+    // The launcher's safe boundary is read here: the outgoing binding drains and owns no live run.
+    const boundary = canonicalCtoOperator(w.harness.cp, w.configured)("status", { projectId: w.projectId }, OWNER);
+    expect(boundary.allowed && boundary.value).toMatchObject({
+      holderSessionUuid: OLD, binding: { generation: 1, sessionId: w.oldSessionId, lifecycle: SessionLifecycle.DRAINING, liveRuns: [] },
+      rotations: [{ state: "PENDING", fromSessionUuid: OLD, toSessionUuid: NEW, fromGeneration: 1, toGeneration: 2 }],
+    });
 
     const incoming = claimed(await w.claimAs(NEW, prepared.toGeneration, w.newPid));
     expect(incoming.binding.bindingGeneration).toBe(2);
@@ -382,10 +388,15 @@ describe("agentctl canonical-cto rotate: the §10.1 switchover of a canonical CT
     const queuedRun = await w.run(true);
     expect(queuedRun.dispatched).toMatchObject({ allowed: false, reasonCode: ReasonCode.RUN_DISPATCH_BLOCKED_CTO_DRAINING });
 
+    // What the old holder was handed, as the row stands before anything moves it on.
+    const handedOld = w.db.get<{ sent_at: string; attempts: number }>(`SELECT sent_at, attempts FROM outbox WHERE message_id = ?`, [inFlight])!;
     const incoming = claimed(await w.claimAs(NEW, prepared.toGeneration, w.newPid));
-    // The switchover's record, written by the acknowledging claim, tells the two kinds apart.
+    // The switchover's record, written by the acknowledging claim, tells the two kinds apart, and so does the receipt.
     const recorded = w.db.get<{ carried_json: string }>(`SELECT carried_json FROM canonical_cto_rotations WHERE transfer_id = ?`, [prepared.transferId])!;
-    expect(JSON.parse(recorded.carried_json)).toEqual({ pendingMessageIds: [queued, late], inFlightMessageIds: [inFlight] });
+    const carried = { pendingMessageIds: [queued, late], inFlightMessageIds: [inFlight],
+      inFlightHandedOver: { [inFlight]: { sentAt: handedOld.sent_at, attempts: handedOld.attempts } } };
+    expect(JSON.parse(recorded.carried_json)).toEqual(carried);
+    expect(incoming.carried).toEqual({ transferId: prepared.transferId, ...carried });
     expect(w.db.all(`SELECT message_id, status, binding_generation, target_session_id FROM outbox WHERE kind = ? ORDER BY rowid`, [MessageKind.PEER_MESSAGE]))
       .toEqual([
         { message_id: inFlight, status: "SENT", binding_generation: 2, target_session_id: incoming.sessionId },
@@ -395,10 +406,24 @@ describe("agentctl canonical-cto rotate: the §10.1 switchover of a canonical CT
     // A stale ACK from the old holder completes nothing.
     expect(w.ledger.complete(inFlight, w.holder(w.oldSessionId, 1)).allowed).toBe(false);
     expect(w.db.get(`SELECT status FROM outbox WHERE message_id = ?`, [inFlight])).toEqual({ status: "SENT" });
-    // The new holder is handed all three under their ids, in-flight first, and completes them itself.
-    for (const id of [inFlight, queued, late]) {
-      const handed = w.take(incoming.sessionId, 2);
+    // The message the old holder took and never completed is never handed over as ordinary work: it comes marked
+    // previousHolderInFlight and listed unresolved, with its id and the evidence of the earlier hand-over, so the new
+    // holder judges it (done, safe to redo, or refused) before anything repeats it.
+    const evidence = { messageId: inFlight, previousHolderInFlight: true, unresolved: true, transferId: prepared.transferId,
+      previousHolder: { sessionId: w.oldSessionId, bindingGeneration: 1, sentAt: handedOld.sent_at, attempts: handedOld.attempts } };
+    for (let look = 0; look < 2; look++) {
+      const handed = w.take(incoming.sessionId, 2) as Handover & { claimed: { previousHolderInFlight?: boolean } | null };
+      expect(handed.claimed, JSON.stringify(handed)).toMatchObject({ messageId: inFlight, previousHolderInFlight: true });
+      expect(handed.unresolved).toEqual([expect.objectContaining(evidence)]);
+    }
+    // Judged done by the old holder: completed without being redone.
+    expect(w.ledger.complete(inFlight, w.holder(incoming.sessionId, 2)).allowed).toBe(true);
+    // What was only queued is ordinary work for the new holder, unmarked, and nothing is unresolved any more.
+    for (const id of [queued, late]) {
+      const handed = w.take(incoming.sessionId, 2) as Handover & { claimed: Record<string, unknown> | null };
       expect(handed.claimed?.messageId, JSON.stringify(handed)).toBe(id);
+      expect(handed.claimed).not.toHaveProperty("previousHolderInFlight");
+      expect(handed.unresolved).toEqual([]);
       expect(w.ledger.complete(id, w.holder(incoming.sessionId, 2)).allowed).toBe(true);
     }
     // The run that queued during the drain goes to the new holder, and only it may answer for it.
@@ -413,6 +438,8 @@ describe("agentctl canonical-cto rotate: the §10.1 switchover of a canonical CT
     const owned = await w.run(true);
     expect(owned.dispatched?.allowed, JSON.stringify(owned.dispatched)).toBe(true);
     expect(w.rotate(NEW, 1)).toMatchObject({ allowed: false, reasonCode: ReasonCode.SWITCHOVER_BLOCKED_ACTIVE_RUNS, evidence: { activeRuns: [owned.runId] } });
+    const read = canonicalCtoOperator(w.harness.cp, w.configured)("status", { projectId: w.projectId }, OWNER);
+    expect(read.allowed && read.value).toMatchObject({ binding: { lifecycle: SessionLifecycle.READY, liveRuns: [owned.runId] } });
     expect(w.db.get(`SELECT COUNT(*) AS n FROM canonical_cto_rotations`)).toEqual({ n: 0 });
     expectUnmoved(w);
     expect(w.harness.cp.runs.cancel(owned.runId, "test: cleared for the switchover").allowed).toBe(true);
@@ -436,29 +463,54 @@ describe("agentctl canonical-cto rotate: the §10.1 switchover of a canonical CT
     expect(w.otherProjectRows()).toBe(before);
   });
 
-  it("start-failure recovery: the new conversation never claimed, so switching back fences it and the old CTO keeps generation 1", async () => {
+  it("start-failure recovery: generation 1 is never restored; the old conversation stays fenced and never claims again, and the switchover completes forward", async () => {
     const w = await world();
     const queued = await w.ceoSays("queued while the new process fails to start");
     const prepared = pending(w.rotate(NEW, 1));
     // The drain: while the switchover is pending, the old holder is handed nothing new.
     expect(w.take(w.oldSessionId, 1)).toMatchObject({ claimed: null, withheld: [] });
-    // The launcher's rollback is a rotate back to the conversation that still holds the project, at its generation.
-    expect(w.rotate(OLD, 2, undefined)).toMatchObject({ allowed: false, reasonCode: ReasonCode.BINDING_GENERATION_STALE });
-    const back = w.rotate(OLD, 1, undefined);
-    expect(back.allowed && back.value).toEqual({ outcome: "ROLLED_BACK", transferId: prepared.transferId, projectId: w.projectId,
-      holderSessionUuid: OLD, generation: 1 });
-    expectUnmoved(w);
-    expect(w.audits("CANONICAL_CTO_SWITCHOVER_ROLLED_BACK")).toHaveLength(1);
-    // The drain is over: the old holder is handed what queued meanwhile.
-    expect(w.take(w.oldSessionId, 1).claimed?.messageId).toBe(queued);
-    // The new process starting late claims nothing.
-    expect((await w.claimAs(NEW, 2, w.newPid)).allowed).toBe(false);
-    expectUnmoved(w);
-    // After an acknowledgement the old conversation is a tombstone: switching back is refused, never resurrected.
-    const again = pending(w.rotate(NEW, 1));
-    claimed(await w.claimAs(NEW, again.toGeneration, w.newPid));
-    expect(w.rotate(OLD, 1, undefined)).toMatchObject({ allowed: false, reasonCode: ReasonCode.BINDING_GENERATION_STALE });
-    expect(w.rotate(OLD, 2).allowed).toBe(false);
+    // Switching back to the outgoing conversation, with or without a package, restores neither generation 1 nor its READY state.
+    for (const back of [w.rotate(OLD, 1, undefined), w.rotate(OLD, 1), w.rotate(OLD, 2, undefined)]) {
+      expect(back.allowed, JSON.stringify(back)).toBe(false);
+    }
+    expectUnmoved(w, SessionLifecycle.DRAINING);
+    expect(w.db.get(`SELECT revoked_at FROM canonical_entitlement_transfers WHERE transfer_id = ?`, [prepared.transferId])).toEqual({ revoked_at: null });
+    expect(w.take(w.oldSessionId, 1).claimed).toBeNull();
+    // Nor does the old conversation come back by relaunching: once a switchover is prepared from it, it claims nothing.
+    expect(await w.claimAs(OLD, 2, 24)).toMatchObject({ allowed: false });
+    expectUnmoved(w, SessionLifecycle.DRAINING);
+    // Recovery is forward: the record still names exactly the new conversation, which completes the switchover late.
+    const incoming = claimed(await w.claimAs(NEW, prepared.toGeneration, w.newPid));
+    expect(w.take(incoming.sessionId, 2).claimed?.messageId).toBe(queued);
+    expect(w.ledger.complete(queued, w.holder(incoming.sessionId, 2)).allowed).toBe(true);
+    expect((await w.claimAs(OLD, 3, 24)).allowed).toBe(false);
+  });
+
+  it("rollback is a new fenced switchover at a new generation: the new holder is fenced and checked first, and generation 1 never returns", async () => {
+    const w = await world();
+    const first = pending(w.rotate(NEW, 1));
+    const incoming = claimed(await w.claimAs(NEW, first.toGeneration, w.newPid));
+    // The new holder already executed and still owns a live run: going back would risk running it twice, so it stops
+    // with nothing changed and says why.
+    const owned = await w.run(true);
+    expect(owned.dispatched?.allowed, JSON.stringify(owned.dispatched)).toBe(true);
+    expect(w.rotate(SPARE, 2)).toMatchObject({ allowed: false, reasonCode: ReasonCode.SWITCHOVER_BLOCKED_ACTIVE_RUNS, evidence: { activeRuns: [owned.runId] } });
+    expect(w.harness.cp.sessions.require(incoming.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+    expect(w.db.get(`SELECT COUNT(*) AS n FROM canonical_cto_rotations`)).toEqual({ n: 1 });
+    // The old conversation is a tombstone: going back to it is refused at any generation.
+    for (const back of [w.rotate(OLD, 1, undefined), w.rotate(OLD, 2), w.rotate(OLD, 2, undefined)]) expect(back.allowed).toBe(false);
+    // Cleared, the way back is a new switchover from the new holder (fenced: draining) at generation 3, never 1.
+    expect(w.harness.cp.runs.cancel(owned.runId, "test: cleared for the rollback").allowed).toBe(true);
+    const back = pending(w.rotate(SPARE, 2));
+    expect(back).toMatchObject({ fromSessionUuid: NEW, toSessionUuid: SPARE, fromGeneration: 2, toGeneration: 3, actorId: w.actorOf(1) });
+    expect(w.harness.cp.sessions.require(incoming.sessionId).lifecycle).toBe(SessionLifecycle.DRAINING);
+    // Fenced means fenced: a relaunch of the holder being switched from cannot take generation 3 from the record.
+    expect(await w.claimAs(NEW, back.toGeneration, 28)).toMatchObject({ allowed: false });
+    claimed(await w.claimAs(SPARE, back.toGeneration, 26));
+    expect(w.db.all(`SELECT binding_generation AS g, status FROM assignments WHERE role_key = ? ORDER BY binding_generation`, [w.roleKey]))
+      .toEqual([{ g: 1, status: "REVOKED" }, { g: 2, status: "REVOKED" }, { g: 3, status: "ACTIVE" }]);
+    expect(w.actorOf(3)).toBe(w.actorOf(1));
+    for (const [uuid, generation] of [[OLD, 4], [NEW, 4]] as const) expect((await w.claimAs(uuid, generation, 27)).allowed).toBe(false);
   });
 
   it("only the allowlisted CLI owner reaches rotate or status, with exactly its parameters", async () => {

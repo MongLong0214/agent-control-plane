@@ -21,6 +21,7 @@ import {
   recordRotationAcknowledged,
   retargetRotatedActor,
   rotationOfTransfer,
+  switchoverPreparedFrom,
 } from "./canonical-cto-rotation.ts";
 import { CanonicalSessionRegistry } from "./canonical-session-registry.ts";
 
@@ -1554,6 +1555,12 @@ export interface CanonicalSelfClaimReceipt {
   executorImageVersion: string | null;
   executorImagePath: string | null;
   buzzAddress: string;
+  /**
+   * v58 — present only on the claim that acknowledges a canonical CTO switchover: what the outgoing holder left, by
+   * id. `inFlightMessageIds` were handed to it and never completed; the hand-over marks each `previousHolderInFlight`
+   * and keeps it unresolved until this holder judges it, rather than handing it over as new work.
+   */
+  carried?: CanonicalCtoCarried & { transferId: string };
 }
 
 export interface CanonicalSelfClaimDeps {
@@ -2223,6 +2230,15 @@ export class CanonicalSelfClaim {
           { roleKey, expected: request.expectedBindingGeneration, actual: nextGeneration },
         );
       }
+      // v58 — a conversation a canonical CTO switchover was prepared from is fenced for good: while the switchover is
+      // pending its binding drains, and no relaunch of it claims a later generation (which would make the switchover's
+      // generation stale and re-activate the writer it fenced); once acknowledged it is a tombstone.
+      const fencedBy = switchoverPreparedFrom(this.db, entry.projectId, identity.sessionUuid);
+      if (fencedBy !== null) {
+        return deny(ReasonCode.CONFLICT, "this conversation was switched over from and is fenced; it never claims the role again", {
+          roleKey, transferId: fencedBy,
+        });
+      }
 
       // A live canonical actor may replace only its exact revoked runtime attachment (the same-live
       // branch). Dead-process recovery happens only in the #831 branch, only for this same actor's
@@ -2734,6 +2750,7 @@ export class CanonicalSelfClaim {
         executorImageVersion: observedImage?.version ?? null,
         executorImagePath: observedImage?.imagePath ?? null,
         buzzAddress,
+        ...(rotation !== null && carried !== null ? { carried: { transferId: rotation.transferId, ...carried } } : {}),
       });
       // The admission's row, last, inside this transaction: the admission commits only with its
       // row, and a failed insert takes the session, the binding and the generation bump back with

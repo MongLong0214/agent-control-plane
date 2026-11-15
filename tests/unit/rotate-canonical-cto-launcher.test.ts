@@ -9,66 +9,96 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
-const stragglers: ChildProcess[] = [];
+const stragglers: number[] = [];
+const children: ChildProcess[] = [];
 afterEach(() => {
-  for (const child of stragglers.splice(0)) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  for (const child of children.splice(0)) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  for (const pid of stragglers.splice(0)) try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
 });
 
 /**
- * The launcher's order (handoff -> rotate -> start -> verify -> stop old) and its two failure exits, against stubs of
- * agentctl, claude and tmux that record what they were asked. The switchover itself is `a-canonical-cto-rotation`'s.
+ * The launcher's order (handoff -> rotate -> stop old, its exit and its children's confirmed -> start -> verify) and
+ * its failure exits, against stubs of agentctl, claude and tmux that record what they were asked. The old
+ * conversation is a real process with a real child, so "exited" is the process table's answer. The switchover
+ * itself is `a-canonical-cto-rotation`'s.
  */
 const LAUNCHER = fileURLToPath(new URL("../../scripts/rotate-canonical-cto.mjs", import.meta.url));
 const OLD = "58cac5c6-0000-4000-8000-0000000000c1";
 const NEW = "36276d16-0000-4000-8000-0000000000c2";
 const PROJECT = "launch-project";
 
+type Mode = "claims" | "never-claims" | "claims-deaf" | "owned-work";
+
 const stub = (path: string, body: string) => {
   writeFileSync(path, `#!/usr/bin/env node\nconst fs = require("node:fs");\n${body}\n`);
   chmodSync(path, 0o755);
 };
+const running = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
-const fixture = async (mode: "claims" | "never-claims" | "claims-deaf") => {
+/** `childMs`: how long the old conversation's child (a shell writer of its own) outlives the old process. */
+const fixture = async (initial: Mode, childMs = 1_200) => {
   const dir = tempDir("acp-rotlaunch-");
   const cwd = join(dir, "project");
   const home = join(dir, "home");
   for (const d of [cwd, home, join(dir, "state")]) mkdirSync(d, { recursive: true });
   const log = join(dir, "calls.log");
   const db = join(dir, "acp.json");
-  writeFileSync(db, JSON.stringify({ holderSessionUuid: OLD, generation: 1, binding: { generation: 1, sessionId: "ses_old" },
-    buzz: { verdict: "ADMITTED", sessionId: "ses_old", generation: 1 } }));
+  const modeFile = join(dir, "mode");
+  const childPidFile = join(dir, "child.pid");
+  writeFileSync(modeFile, initial);
+  writeFileSync(db, JSON.stringify({ holderSessionUuid: OLD, generation: 1, binding: { generation: 1, sessionId: "ses_old", lifecycle: "READY", liveRuns: [] },
+    buzz: { verdict: "ADMITTED", sessionId: "ses_old", generation: 1 }, rotations: [] }));
   const previousArgs = ["/rt/agentctl.js", "attach", "canonical-cto", "--claimed-session-id", OLD, "--project-id", PROJECT, "--expected-binding-generation", "1"];
   writeFileSync(join(home, ".claude.json"), JSON.stringify({ projects: { [cwd]: { mcpServers: { "acp-cto": { type: "stdio", command: "/rt/node", args: previousArgs, env: {} } } } } }));
   const handoff = join(dir, "handoff.json");
   writeFileSync(handoff, JSON.stringify({ projectStatus: "green", activeManifestDigest: null, recentDecisions: [], openBlockers: [], queuedWork: [],
     repositoryFacts: [], knownRisks: [], recommendedNextAction: "continue" }));
   const record = `fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify([require("node:path").basename(process.argv[1]), ...process.argv.slice(2)]) + "\\n");`;
+  const mode = `fs.readFileSync(${JSON.stringify(modeFile)}, "utf8")`;
   stub(join(dir, "agentctl"), `${record}
 const db = ${JSON.stringify(db)}; const s = JSON.parse(fs.readFileSync(db, "utf8")); const a = process.argv.slice(2);
 const flag = (n) => a[a.indexOf(n) + 1];
 if (a[1] === "status") { process.stdout.write(JSON.stringify(s)); process.exit(0); }
-if (flag("--to") === ${JSON.stringify(NEW)} && a.includes("--handoff")) { s.pending = true; fs.writeFileSync(db, JSON.stringify(s));
-  process.stdout.write(JSON.stringify({ outcome: "SWITCHOVER_PENDING", transferId: "t1", toGeneration: s.generation + 1 })); process.exit(0); }
-if (flag("--to") === ${JSON.stringify(OLD)} && s.pending && s.generation === 1) { s.pending = false; fs.writeFileSync(db, JSON.stringify(s));
-  process.stdout.write(JSON.stringify({ outcome: "ROLLED_BACK", transferId: "t1", holderSessionUuid: ${JSON.stringify(OLD)}, generation: 1 })); process.exit(0); }
-process.stdout.write(JSON.stringify({ ok: false, reasonCode: "BINDING_GENERATION_STALE" })); process.exit(1);`);
+if (flag("--to") === ${JSON.stringify(NEW)} && a.includes("--handoff") && !s.rotations.some((r) => r.state === "PENDING") && s.generation === 1) {
+  s.rotations = [{ transferId: "t1", state: "PENDING", fromSessionUuid: ${JSON.stringify(OLD)}, toSessionUuid: ${JSON.stringify(NEW)}, fromGeneration: 1, toGeneration: 2 }];
+  s.binding.lifecycle = "DRAINING"; if (${mode} === "owned-work") s.binding.liveRuns = ["run_raced"];
+  fs.writeFileSync(db, JSON.stringify(s));
+  process.stdout.write(JSON.stringify({ outcome: "SWITCHOVER_PENDING", transferId: "t1", toGeneration: 2 })); process.exit(0); }
+process.stdout.write(JSON.stringify({ ok: false, reasonCode: "CONFLICT" })); process.exit(1);`);
   stub(join(dir, "claude"), record);
-  const claimed = mode === "never-claims" ? "" : `const s = JSON.parse(fs.readFileSync(${JSON.stringify(db)}, "utf8"));
-if (process.argv[2] === "new-session") { Object.assign(s, { holderSessionUuid: ${JSON.stringify(NEW)}, generation: 2, binding: { generation: 2, sessionId: "ses_new" },
-  buzz: ${mode === "claims" ? `{ verdict: "ADMITTED", sessionId: "ses_new", generation: 2 }` : `{ verdict: "EXCLUDED", reason: "NO_LIVE_SESSION" }`} }); fs.writeFileSync(${JSON.stringify(db)}, JSON.stringify(s)); }`;
-  stub(join(dir, "tmux"), `${record}\n${claimed}`);
-  // The old conversation's claude process: its command line names its conversation.
-  const old = spawn(process.execPath, ["-e", "setInterval(() => {}, 1e6)", OLD], { stdio: "ignore" });
-  stragglers.push(old);
+  // tmux records, at new-session, whether the old process and its child were still in the process table.
+  stub(join(dir, "tmux"), `${record}
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+if (process.argv[2] === "new-session") {
+  fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(["observed", { oldAlive: alive(Number(process.env.TEST_OLD_PID)), childAlive: alive(Number(fs.readFileSync(${JSON.stringify(childPidFile)}, "utf8"))) }]) + "\\n");
+  const m = ${mode};
+  if (m === "claims" || m === "claims-deaf") {
+    const s = JSON.parse(fs.readFileSync(${JSON.stringify(db)}, "utf8"));
+    Object.assign(s, { holderSessionUuid: ${JSON.stringify(NEW)}, generation: 2, binding: { generation: 2, sessionId: "ses_new", lifecycle: "READY", liveRuns: [] },
+      buzz: m === "claims" ? { verdict: "ADMITTED", sessionId: "ses_new", generation: 2 } : { verdict: "EXCLUDED", reason: "NO_LIVE_SESSION" } });
+    s.rotations[0].state = "ACKED"; fs.writeFileSync(${JSON.stringify(db)}, JSON.stringify(s));
+  }
+}`);
+  // The old conversation's claude process: its command line names its conversation, and it has a child of its own
+  // that outlives it by `childMs` (a shell writer it started), which SIGTERM to the old process does not reach.
+  // Neither inherits this process's env (R1154-01): both get exactly what they need.
+  const old = spawn(process.execPath, ["-e", `const c = require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, ${childMs})"], { stdio: "ignore", env: {} });
+require("node:fs").writeFileSync(${JSON.stringify(childPidFile)}, String(c.pid)); setInterval(() => {}, 1e6);`, OLD], { stdio: "ignore", env: {} });
+  children.push(old);
   await once(old, "spawn");
-  const launch = () => bounded([LAUNCHER, "--project", PROJECT, "--to", NEW, "--expected-generation", "1", "--cwd", cwd,
-    "--old-pid", String(old.pid), "--tmux-session", "acp-rot-test", "--handoff", handoff, "--timeout-ms", "600", "--poll-ms", "50"], {
+  for (let i = 0; i < 100 && !existsSync(childPidFile); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+  const childPid = Number(readFileSync(childPidFile, "utf8"));
+  stragglers.push(childPid);
+  const launch = (stopTimeoutMs = 10_000) => bounded([LAUNCHER, "--project", PROJECT, "--to", NEW, "--expected-generation", "1", "--cwd", cwd,
+    "--old-pid", String(old.pid), "--tmux-session", "acp-rot-test", "--handoff", handoff, "--timeout-ms", "600", "--poll-ms", "50",
+    "--stop-timeout-ms", String(stopTimeoutMs)], {
     PATH: process.env["PATH"] ?? "", HOME: home, ACP_STATE_DIR: join(dir, "state"), ACP_AGENTCTL: join(dir, "agentctl"),
-    CLAUDE_BIN: join(dir, "claude"), TMUX_BIN: join(dir, "tmux"), ACP_OPERATOR_TOKEN: "operator-token-for-test",
+    CLAUDE_BIN: join(dir, "claude"), TMUX_BIN: join(dir, "tmux"), ACP_OPERATOR_TOKEN: "operator-token-for-test", TEST_OLD_PID: String(old.pid),
   });
-  const calls = () => readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]);
-  const steps = (stdout: string) => stdout.trim().split("\n").map((line) => JSON.parse(line) as { step: string });
-  return { dir, cwd, old, launch, calls, steps, previousArgs };
+  const calls = () => readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line) as unknown[]);
+  const steps = (stdout: string) => stdout.trim().split("\n").map((line) => JSON.parse(line) as { step: string } & Record<string, unknown>);
+  const setMode = (next: Mode) => writeFileSync(modeFile, next);
+  return { dir, cwd, old, childPid, launch, calls, steps, previousArgs, setMode };
 };
 
 /** The launcher as a child of its own, killed at 30 s so a wedge names itself. */
@@ -83,44 +113,79 @@ const bounded = (argv: string[], env: NodeJS.ProcessEnv): Promise<{ code: number
     child.on("close", (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
   });
 
-const running = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const agentctlCalls = (calls: unknown[][]) => calls.filter((call) => call[0] === "agentctl") as string[][];
+const rotatesTo = (calls: unknown[][], uuid: string) => agentctlCalls(calls).filter((call) => call[1] === "canonical-cto" && call[2] === "rotate" && call[call.indexOf("--to") + 1] === uuid);
 
-describe("rotate-canonical-cto.mjs: handoff -> rotate -> start -> verify -> stop old", () => {
-  it("starts the new conversation on the issued generation, verifies attach and Buzz, then stops the old process", async () => {
+describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, with its children) -> start -> verify", () => {
+  it("starts the new conversation only after the old process and its child have exited, on the issued generation, then verifies attach and Buzz", async () => {
     const f = await fixture("claims");
     const result = await f.launch();
     expect(result.code, result.stderr + result.stdout).toBe(0);
-    expect(f.steps(result.stdout).map((line) => line.step)).toEqual(["handoff", "rotate", "start", "verify", "stop"]);
+    expect(f.steps(result.stdout).map((line) => line.step)).toEqual(["handoff", "rotate", "stop", "start", "verify"]);
     const calls = f.calls();
-    const add = calls.find((call) => call[0] === "claude" && call[2] === "add")!;
+    // The new holder is started only once the old writer and the child it left behind are gone from the process table.
+    expect(calls.find((call) => call[0] === "observed")).toEqual(["observed", { oldAlive: false, childAlive: false }]);
+    const add = calls.find((call) => call[0] === "claude" && call[2] === "add") as string[];
     expect(add.slice(add.indexOf("--") + 1)).toEqual(["/rt/node", ...f.previousArgs.map((arg) => arg === OLD ? NEW : arg === "1" ? "2" : arg)]);
     expect(calls.findIndex((call) => call[0] === "agentctl" && call[2] === "rotate")).toBeLessThan(calls.findIndex((call) => call[0] === "tmux"));
     const shell = readFileSync(join(f.dir, "state", "rotations", `${PROJECT}-${NEW}.sh`), "utf8");
     expect(shell).toContain("unset ACP_OPERATOR_TOKEN");
     expect(shell).toContain(`'--session-id' '${NEW}'`);
+    expect(shell).toContain("previousHolderInFlight");
     expect(shell).not.toContain("operator-token-for-test");
-    for (let i = 0; i < 50 && running(f.old.pid!); i++) await new Promise((resolve) => setTimeout(resolve, 20));
     expect(running(f.old.pid!)).toBe(false);
   });
 
-  it("start failure: the new conversation never claims, so the switchover is rolled back and the old process keeps running", async () => {
-    const f = await fixture("never-claims");
-    const result = await f.launch();
-    expect(result.code, result.stdout).toBe(2);
+  it("an old writer that outlives the stop timeout: the new conversation is never started, and nothing else is signalled", async () => {
+    const f = await fixture("claims", 60_000);
+    const result = await f.launch(800);
+    expect(result.code, result.stdout).toBe(4);
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "stop", remaining: [f.childPid] });
     const calls = f.calls();
-    expect(calls.some((call) => call[0] === "agentctl" && call.includes("--to") && call[call.indexOf("--to") + 1] === OLD && !call.includes("--handoff"))).toBe(true);
-    expect(calls.some((call) => call[0] === "tmux" && call[1] === "kill-session")).toBe(true);
-    const restored = calls.filter((call) => call[0] === "claude" && call[2] === "add").at(-1)!;
-    expect(restored.slice(restored.indexOf("--") + 1)).toEqual(["/rt/node", ...f.previousArgs]);
+    expect(calls.some((call) => call[0] === "tmux")).toBe(false);
+    expect(calls.some((call) => call[0] === "claude" && call[2] === "add")).toBe(false);
+    // The switchover stays pending with the old holder fenced: nothing rotates back to it, and its child is untouched.
+    expect(rotatesTo(calls, OLD)).toEqual([]);
+    expect(running(f.old.pid!)).toBe(false);
+    expect(running(f.childPid)).toBe(true);
+  });
+
+  it("owned work at the boundary: the old process is not stopped and the new conversation is never started", async () => {
+    const f = await fixture("owned-work");
+    const result = await f.launch();
+    expect(result.code, result.stdout).toBe(4);
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "boundary", liveRuns: ["run_raced"] });
+    expect(f.calls().some((call) => call[0] === "tmux")).toBe(false);
     expect(running(f.old.pid!)).toBe(true);
   });
 
-  it("claimed but not receiving Buzz: it may already have acted, so nothing is rolled back and the old process is not stopped", async () => {
-    const f = await fixture("claims-deaf");
+  it("start failure: the new conversation never claims, so it is fenced and the switchover stays pending; nothing goes back to the old conversation, and running the launcher again completes it", async () => {
+    const f = await fixture("never-claims", 0);
+    const result = await f.launch();
+    expect(result.code, result.stdout).toBe(2);
+    const calls = f.calls();
+    expect(calls.some((call) => call[0] === "tmux" && call[1] === "kill-session")).toBe(true);
+    // No rollback to generation 1: no rotate back to the old conversation, and its acp-cto entry is not restored.
+    expect(rotatesTo(calls, OLD)).toEqual([]);
+    const adds = calls.filter((call) => call[0] === "claude" && call[2] === "add") as string[][];
+    expect(adds.every((call) => call.includes(NEW) && !call.includes(OLD))).toBe(true);
+    expect(running(f.old.pid!)).toBe(false);
+    // Running it again resumes the pending switchover: no second rotate, the old process is already gone, the new one claims.
+    f.setMode("claims");
+    const again = await f.launch();
+    expect(again.code, again.stdout).toBe(0);
+    expect(f.steps(again.stdout).map((line) => line.step)).toEqual(["handoff", "stop", "start", "verify"]);
+    expect(f.steps(again.stdout)[1]).toMatchObject({ step: "stop", alreadyGone: true });
+    expect(rotatesTo(f.calls(), NEW)).toHaveLength(1);
+    expect(rotatesTo(f.calls(), OLD)).toEqual([]);
+  });
+
+  it("claimed but not receiving Buzz: it may already have acted, so nothing is rolled back", async () => {
+    const f = await fixture("claims-deaf", 0);
     const result = await f.launch();
     expect(result.code, result.stdout).toBe(3);
     expect(f.calls().some((call) => call[0] === "agentctl" && call.includes(OLD))).toBe(false);
-    expect(running(f.old.pid!)).toBe(true);
+    expect(f.calls().some((call) => call[0] === "tmux" && call[1] === "kill-session")).toBe(false);
     expect(existsSync(join(f.dir, "state", "rotations"))).toBe(true);
   });
 });

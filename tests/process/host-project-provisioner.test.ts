@@ -1412,3 +1412,60 @@ it('an exit record from an earlier launch never explains a later one',async () =
   expect(await launchResident(f)).toBe(2);
   expect((await refusal(daemon(f).invoke('observe',f.a))).reason).toEqual({binary:'claude',operation:'observe',kind:'non-zero exit',exitCode:2});
 });
+
+// v58 — the canonical CTO switchover record is the one source of the project's current conversation. Only the columns
+// the recovery path reads, as the daemon's database holds them.
+const recordRotation = (f:ReturnType<typeof fixture>, transferId:string, from:string, to:string, claimed:boolean) => {
+  const db = new Database(f.database);
+  db.exec(`CREATE TABLE IF NOT EXISTS canonical_entitlement_transfers(transfer_id,project_id,from_session_uuid,to_session_uuid,claimed_at,revoked_at);
+    CREATE TABLE IF NOT EXISTS canonical_cto_rotations(transfer_id)`);
+  db.prepare(`INSERT INTO canonical_entitlement_transfers VALUES(?,?,?,?,?,NULL)`).run(transferId,f.a.projectId,from,to,claimed ? '2026-11-15T00:00:00Z' : null);
+  db.prepare(`INSERT INTO canonical_cto_rotations VALUES(?)`).run(transferId);
+  db.close();
+};
+const hostState = (f:ReturnType<typeof fixture>) => fakeLaunchState(f) as unknown as {launches:number;mcpAdds:string[][]};
+const acknowledge = (f:ReturnType<typeof fixture>, transferId:string) => {
+  const db = new Database(f.database);db.prepare(`UPDATE canonical_entitlement_transfers SET claimed_at = '2026-11-15T00:01:00Z' WHERE transfer_id = ?`).run(transferId);db.close();
+};
+
+it('fleet recovery follows the switchover record: while it is pending nothing is relaunched, and once acknowledged only the new conversation is, never the old one',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');await f.invoke('ensure-resident');
+  const OLD = f.a.sessionUuid;const NEW = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const requestFile = join(f.home,'.claude','watchers','fleet','acp-test.resident.json');
+  const provisioned = readFileSync(requestFile,'utf8');
+  recordRotation(f,'t-pending',OLD,NEW,false);
+  // The launcher stopped the old conversation; its pane is gone. Pending: the watcher relaunches nobody and rewrites nothing.
+  residentGone(f);
+  const before = hostState(f);
+  const held = await sweep(f);
+  expect(held.code).toBe(1);
+  expect(held.stderr).toContain('resident recovery pending: acp-test.resident.json');
+  const during = hostState(f);
+  expect([during.launches,during.mcpAdds.length]).toEqual([before.launches,before.mcpAdds.length]);
+  // Acknowledged: the fake host's processes are now the new conversation's, and the watcher recovers it.
+  acknowledge(f,'t-pending');
+  writeFileSync(join(f.home,'allocation.json'),JSON.stringify({...f.a,sessionUuid:NEW}));
+  expect(await sweep(f)).toEqual({code:0,stderr:''});
+  const after = hostState(f);
+  expect(after.launches).toBe(before.launches + 1);
+  expect(after.mcpAdds.at(-1)).toEqual(['mcp','add','--scope','local','acp-cto','--',f.runtimeNode,f.runtimeCli,'attach','resident-cto','--claimed-session-id',NEW,'--project-id',f.a.projectId]);
+  const launcher = readFileSync(join(f.state,'resident-test.sh'),'utf8');
+  expect(launcher).toContain(`'${NEW}'`);expect(launcher).not.toContain(OLD);
+  expect(readFileSync(join(f.home,'.claude','watchers','fleet','manifest.tsv'),'utf8')).toBe([f.a.fleetName,f.a.clonePath,'test CTO',f.a.bootPacket,NEW].join('\t')+'\n');
+  expect(JSON.parse(readFileSync(f.a.bootPacket,'utf8')).sessionUuid).toBe(NEW);
+  // The watcher's request keeps the allocation it was provisioned with: the record, not a second store, names the target.
+  expect(readFileSync(requestFile,'utf8')).toBe(provisioned);
+  // A later sweep finds the new conversation alive and starts nothing; the old conversation's UUID is never named again.
+  expect(await sweep(f)).toEqual({code:0,stderr:''});
+  const settled = hostState(f);
+  expect(settled.launches).toBe(after.launches);
+  expect(settled.mcpAdds.slice(before.mcpAdds.length).flat()).not.toContain(OLD);
+  // A second switchover from the new conversation is followed the same way: the chain, never its first link.
+  const NEXT = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  recordRotation(f,'t-next',NEW,NEXT,true);residentGone(f);
+  writeFileSync(join(f.home,'allocation.json'),JSON.stringify({...f.a,sessionUuid:NEXT}));
+  expect(await sweep(f)).toEqual({code:0,stderr:''});
+  expect(readFileSync(join(f.state,'resident-test.sh'),'utf8')).toContain(`'${NEXT}'`);
+  expect(readFileSync(join(f.home,'.claude','watchers','fleet','manifest.tsv'),'utf8')).toContain(NEXT);
+});

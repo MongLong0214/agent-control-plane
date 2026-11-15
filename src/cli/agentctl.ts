@@ -95,10 +95,10 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl canonical-cto rotate --project <id> --to <uuid> --expected-generation <n> --handoff <package.json>
                                            owner only: prepare the canonical PRIMARY_CTO's switchover to
                                            conversation <uuid> as the same actor. <n> is the role's
-                                           current generation; the old CTO drains and keeps the role
-                                           until <uuid> claims generation n + 1. Rotating to the
-                                           conversation that still holds the project (no --handoff)
-                                           while the switchover is unacknowledged rolls it back
+                                           current generation; the old CTO drains (fenced for good) and
+                                           keeps the binding until <uuid> claims generation n + 1.
+                                           Nothing restores it: going back is a new rotate from the
+                                           new holder, at a new generation, to a new conversation
   agentctl canonical-cto status --project <id>
                                            the canonical conversation, binding, Buzz delivery verdict
                                            and recent rotations

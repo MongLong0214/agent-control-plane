@@ -6,7 +6,8 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { type FailureClass, Role, roleKeyFor } from "../domain/types.ts";
-import { HOLDER_CLAIMED_KIND_SQL, outboxDeliveryReadback } from "../outbox/outbox.ts";
+import type { MessageKind } from "../outbox/envelope.ts";
+import { HOLDER_CLAIMED_KIND_SQL, type HolderIdentity, type UnresolvedOwnerMessage, outboxDeliveryReadback } from "../outbox/outbox.ts";
 import { LIVE_RUN_STATES } from "../session/binding-registry.ts";
 import { SELF_CLAIM_EXECUTOR_KIND } from "./canonical-self-claim.ts";
 import { type CanonicalEntitlementTransfer, CanonicalSessionRegistry } from "./canonical-session-registry.ts";
@@ -31,10 +32,15 @@ export interface CanonicalCtoRotationRequest {
   expectedGeneration: number;
 }
 
-/** What the outgoing holder left: owner and peer messages queued and never handed over, and handed over and never ACKed. */
+/**
+ * What the outgoing holder left: owner and peer messages queued and never handed over, and handed over and never ACKed,
+ * with when it was last handed each of the latter and how many times (the row's own `sent_at` and `attempts` move on
+ * with every later hand-over, so the record keeps the outgoing holder's).
+ */
 export interface CanonicalCtoCarried {
   pendingMessageIds: string[];
   inFlightMessageIds: string[];
+  inFlightHandedOver: Record<string, { sentAt: string | null; attempts: number }>;
 }
 
 export interface CanonicalCtoRotation {
@@ -115,20 +121,92 @@ export const liveRunIdsOwnedBySession = (db: Pick<Db, "all">, sessionId: string)
 /**
  * What the role's holders leave behind: owner and peer messages of the role still queued and never handed to anyone,
  * apart from those handed over (or whose hand-over is unknown) and never ACKed, read through the shared readback.
- * Both are carried to the new holder under their ids; an in-flight one is redelivered, so its new holder dedupes by id
- * and checks what the old one already did.
+ * Both are carried to the new holder under their ids. An in-flight one is never handed to it as ordinary work: the
+ * hand-over marks it `previousHolderInFlight` and lists it unresolved with what the old holder was handed
+ * (`inFlightCarriedTo`), so the new holder judges it before anything repeats it.
  */
 export const carriedMessagesOf = (db: Pick<Db, "all">, roleKey: string): CanonicalCtoCarried => {
-  const messages = db.all<{ message_id: string; status: "PENDING" | "SENT"; failure_class: FailureClass | null }>(
-    `SELECT message_id, status, failure_class FROM outbox WHERE role_key = ? AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
+  const messages = db.all<{ message_id: string; status: "PENDING" | "SENT"; failure_class: FailureClass | null; sent_at: string | null; attempts: number }>(
+    `SELECT message_id, status, failure_class, sent_at, attempts FROM outbox WHERE role_key = ? AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
        AND status IN ('PENDING','SENT') ORDER BY created_at, message_id`,
     [roleKey],
   );
   const queued = (row: (typeof messages)[number]) => outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class }).status === "PENDING";
+  const inFlight = messages.filter((row) => !queued(row));
   return {
     pendingMessageIds: messages.filter(queued).map((row) => row.message_id),
-    inFlightMessageIds: messages.filter((row) => !queued(row)).map((row) => row.message_id),
+    inFlightMessageIds: inFlight.map((row) => row.message_id),
+    inFlightHandedOver: Object.fromEntries(inFlight.map((row) => [row.message_id, { sentAt: row.sent_at, attempts: row.attempts }])),
   };
+};
+
+/**
+ * Whether a switchover was ever prepared from `sessionUuid`, the project's conversation: from then on it is fenced
+ * for good. While its switchover is pending it keeps its binding (draining) but claims nothing, so it is never
+ * re-activated by a relaunch; once acknowledged it is a tombstone. No path restores it.
+ */
+export const switchoverPreparedFrom = (db: Pick<Db, "get">, projectId: string, sessionUuid: string): string | null =>
+  db.get<{ transfer_id: string }>(
+    `SELECT t.transfer_id FROM canonical_entitlement_transfers t JOIN canonical_cto_rotations r ON r.transfer_id = t.transfer_id
+      WHERE t.project_id = ? AND t.from_session_uuid = ? ORDER BY t.created_at LIMIT 1`,
+    [projectId, sessionUuid],
+  )?.transfer_id ?? null;
+
+/** What an acknowledged switchover recorded of one message the outgoing holder was handed and never completed. */
+export interface CarriedInFlight {
+  transferId: string;
+  /** The holder it was handed to, when it was last handed it and how many times. */
+  previousHolder: { sessionId: string; bindingGeneration: number; sentAt: string | null; attempts: number | null };
+}
+
+/**
+ * The messages of `roleKey` that an acknowledged switchover carried in flight (handed to the outgoing holder and never
+ * ACKed), by id, with the switchover and the holder they were handed to. Read-only; a message stays listed here for
+ * as long as it exists, and the hand-over shows it only while it is still unsettled.
+ */
+export const inFlightCarriedTo = (db: Pick<Db, "all">, roleKey: string): Map<string, CarriedInFlight> =>
+  new Map(db.all<{ message_id: string; transfer_id: string; from_session_id: string; from_generation: number; sent_at: string | null; attempts: number | null }>(
+    `SELECT j.value AS message_id, r.transfer_id, r.from_session_id, r.from_generation,
+            json_extract(r.carried_json, '$.inFlightHandedOver."' || j.value || '".sentAt') AS sent_at,
+            json_extract(r.carried_json, '$.inFlightHandedOver."' || j.value || '".attempts') AS attempts
+       FROM canonical_cto_rotations r JOIN canonical_entitlement_transfers t ON t.transfer_id = r.transfer_id,
+            json_each(r.carried_json, '$.inFlightMessageIds') j
+      WHERE 'PRIMARY_CTO:' || t.project_id = ? AND t.claimed_at IS NOT NULL AND r.carried_json IS NOT NULL
+      ORDER BY t.claimed_at`,
+    [roleKey],
+  ).map((row) => [row.message_id, {
+    transferId: row.transfer_id,
+    previousHolder: { sessionId: row.from_session_id, bindingGeneration: row.from_generation, sentAt: row.sent_at, attempts: row.attempts },
+  }]));
+
+/** A message `inFlightFromPreviousHolder` reports: unsettled, and never to be taken as new work. */
+export interface InFlightFromPreviousHolder extends UnresolvedOwnerMessage, CarriedInFlight {
+  previousHolderInFlight: true;
+  unresolved: true;
+}
+
+/**
+ * The carried in-flight messages `holder` is now addressed by and has not settled (still SENT), oldest first, with
+ * the evidence of the earlier hand-over: the switchover, the holder it was handed to, when (`sentAt`) and how often
+ * (`attempts`), and the payload digest. Metadata only. The holder settles one by completing it (done before),
+ * rejecting it (must not run) or acting on the text it is handed with the mark and then completing it.
+ */
+export const inFlightFromPreviousHolder = (db: Pick<Db, "all">, holder: HolderIdentity): InFlightFromPreviousHolder[] => {
+  const carried = inFlightCarriedTo(db, holder.roleKey);
+  if (carried.size === 0) return [];
+  const ids = [...carried.keys()];
+  return db.all<{ message_id: string; role_key: string; binding_generation: number; target_session_id: string; kind: string;
+    payload_digest: string; sent_at: string | null; attempts: number; created_at: string }>(
+    `SELECT message_id, role_key, binding_generation, target_session_id, kind, payload_digest, sent_at, attempts, created_at FROM outbox
+      WHERE role_key = ? AND binding_generation = ? AND target_session_id = ? AND status = 'SENT'
+        AND message_id IN (${ids.map(() => "?").join(",")})
+      ORDER BY created_at, message_id`,
+    [holder.roleKey, holder.bindingGeneration, holder.targetSessionId, ...ids],
+  ).map((row) => ({
+    messageId: row.message_id, roleKey: row.role_key, bindingGeneration: row.binding_generation, targetSessionId: row.target_session_id,
+    kind: row.kind as MessageKind, payloadDigest: row.payload_digest, sentAt: row.sent_at, attempts: row.attempts, createdAt: row.created_at,
+    ...carried.get(row.message_id)!, previousHolderInFlight: true as const, unresolved: true as const,
+  }));
 };
 
 /**
@@ -276,6 +354,7 @@ export const canonicalCtoRotations = (db: Pick<Db, "all">, projectId: string) =>
     const { packageJson: _package, ...rotation } = rotationOf(row);
     return {
       ...rotation, fromSessionUuid: row.from_session_uuid, toSessionUuid: row.to_session_uuid, createdAt: row.created_at,
-      state: row.claimed_at !== null ? "ACKED" as const : row.revoked_at !== null ? "ROLLED_BACK" as const : "PENDING" as const,
+      // A switchover is never rolled back; one revoked unclaimed went with its project's retirement.
+      state: row.claimed_at !== null ? "ACKED" as const : row.revoked_at !== null ? "REVOKED" as const : "PENDING" as const,
     };
   });

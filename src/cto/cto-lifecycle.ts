@@ -18,7 +18,6 @@ import { MessageKind } from "../outbox/envelope.ts";
 import { outboxDeliveryReadback, type Outbox } from "../outbox/outbox.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, defaultProcessAncestryInspector, isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import { pendingRotationOf, recordCanonicalRotation } from "../registry/canonical-cto-rotation.ts";
-import { CanonicalSessionRegistry } from "../registry/canonical-session-registry.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
 import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD, type DrivenMode, type ProvisionedSessionRuntime, type SpawnAttestation, drivenModeOf, drivenSpawnRecordOf } from "../runtime/provisioned-session-runtime.ts";
@@ -26,13 +25,11 @@ import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
 
-/** v58 — what `prepareCanonicalSwitchover` answers: a switchover waiting for its conversation, or its rollback. */
-export type CanonicalSwitchoverPrepared =
-  | {
-    outcome: "SWITCHOVER_PENDING"; transferId: string; projectId: string; actorId: string;
-    fromSessionUuid: string; toSessionUuid: string; fromGeneration: number; toGeneration: number;
-  }
-  | { outcome: "ROLLED_BACK"; transferId: string; projectId: string; holderSessionUuid: string; generation: number };
+/** v58 — what `prepareCanonicalSwitchover` answers: a switchover waiting for its conversation. */
+export interface CanonicalSwitchoverPrepared {
+  outcome: "SWITCHOVER_PENDING"; transferId: string; projectId: string; actorId: string;
+  fromSessionUuid: string; toSessionUuid: string; fromGeneration: number; toGeneration: number;
+}
 
 /** PRD §10.2 — the mandatory contents of a handoff package. */
 export interface HandoffPackage {
@@ -791,10 +788,13 @@ export class CtoLifecycle {
    * re-checks the barrier and makes the switch in one transaction; no envelope can reach a conversation that holds no
    * binding and no provider launched, so `handoff_ack`'s delivered-envelope proof has nothing to stand on there.
    *
-   * Rollback is the same call naming the conversation that still holds the project while the switchover is
-   * unacknowledged: its incoming conversation never claimed, so it holds no generation, was handed nothing and has
-   * nothing to execute twice; revoking the record fences it and the holder stops draining. Once acknowledged, the
-   * generation the call names is stale and the old conversation is a tombstone, so it is refused.
+   * Nothing restores a holder a switchover was prepared from. While the switchover is pending every rotate is refused,
+   * including one naming the outgoing conversation: its generation stays fenced (draining, handed nothing new) and its
+   * conversation claims nothing again (`switchoverPreparedFrom`), so the only way on is the named conversation's claim.
+   * Going back is this same call made from the new holder once it holds the role: in one transaction it is fenced
+   * (DRAINING) and its execution checked (no live run, no RUNNING work, or the call stops with nothing changed and says
+   * why), and the role moves at a NEW generation to a conversation never entitled. A superseded conversation is a
+   * tombstone (v57) and is never re-activated.
    */
   prepareCanonicalSwitchover(
     request: { projectId: string; toSessionUuid: string; expectedGeneration: number; handoff?: HandoffPackage },
@@ -810,30 +810,13 @@ export class CtoLifecycle {
       const current = this.bindings.active(roleKey);
       const pending = pendingRotationOf(this.db, projectId);
       if (pending !== null) {
-        const holder = new CanonicalSessionRegistry(this.db).holder(projectId);
-        if (holder === null || toSessionUuid !== holder.sessionUuid) {
-          return deny(ReasonCode.CONFLICT, "a canonical switchover of this project is pending; only switching back to its current conversation (a rollback) is admitted", {
-            projectId, pendingTransferId: pending.transfer.transferId,
-          });
-        }
-        if (!current || current.bindingGeneration !== expectedGeneration || current.bindingGeneration !== pending.rotation.fromGeneration) {
-          return deny(ReasonCode.BINDING_GENERATION_STALE, "expectedGeneration is not the generation the switchover was prepared from", {
-            roleKey, expected: expectedGeneration, actual: current?.bindingGeneration ?? null,
-          });
-        }
-        const cancelled = new CanonicalSessionRegistry(this.db).cancel(projectId, pending.transfer.transferId, now);
-        if (!cancelled.allowed) return cancelled as Decision<never>;
-        if (this.sessions.get(current.sessionId)?.lifecycle === SessionLifecycle.DRAINING) {
-          const ready = this.sessions.transition(current.sessionId, SessionLifecycle.READY, "canonical switchover rolled back");
-          if (!ready.allowed) return ready as Decision<never>;
-        }
-        this.audit.record({
-          kind: "CANONICAL_CTO_SWITCHOVER_ROLLED_BACK", reasonCode: ReasonCode.OK, projectId, roleKey, sessionId: current.sessionId,
-          actor: requestedBy,
-          evidence: { transferId: pending.transfer.transferId, abandonedSessionUuid: pending.transfer.toSessionUuid, generation: current.bindingGeneration },
+        const back = toSessionUuid === pending.transfer.fromSessionUuid;
+        return deny(ReasonCode.CONFLICT, back
+          ? "the outgoing conversation is fenced by its pending switchover and is never restored; the switchover completes when its conversation claims, and going back is a new switchover from that holder"
+          : "a canonical switchover of this project is pending; it completes only when its conversation claims", {
+          projectId, pendingTransferId: pending.transfer.transferId, toSessionUuid: pending.transfer.toSessionUuid,
+          toGeneration: pending.rotation.toGeneration,
         });
-        return allow(ReasonCode.OK, { outcome: "ROLLED_BACK" as const, transferId: pending.transfer.transferId, projectId,
-          holderSessionUuid: holder.sessionUuid, generation: current.bindingGeneration });
       }
       // A holder that is not the canonical conversation's actor is refused by the record below; handoff_submit is its path.
       if (!current) return deny(ReasonCode.NOT_FOUND, "project has no primary CTO", { projectId });

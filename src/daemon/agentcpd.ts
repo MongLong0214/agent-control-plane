@@ -4,7 +4,7 @@ import { MAX_MCP_LINE_BYTES } from "../core/mcp-limits.ts";
 import { recordBootstrapServingRuntime } from "../bootstrap/bootstrap-runtime-observation.ts";
 import { readBuzzSubscriberConfig } from '../buzz/buzz-mention-subscriber.ts';
 import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
-import { canonicalCtoRotations, drainingRotationFor } from "../registry/canonical-cto-rotation.ts";
+import { canonicalCtoRotations, drainingRotationFor, inFlightFromPreviousHolder, liveRunIdsOwnedBySession } from "../registry/canonical-cto-rotation.ts";
 import { outboxDeliveryReadback, type OutboxMessage } from "../outbox/outbox.ts";
 import type { CeoNoticeAttempt } from "../outbox/ceo-notification-route.ts";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
@@ -3281,7 +3281,9 @@ export const canonicalCtoOperator = (
     holderSessionUuid: holder?.sessionUuid ?? null,
     generation: cp.db.get<{ n: number | null }>(`SELECT MAX(binding_generation) AS n FROM assignments WHERE role_key = ?`,
       [roleKeyFor(Role.PRIMARY_CTO, { projectId })])?.n ?? 0,
-    binding: binding === null ? null : { generation: binding.bindingGeneration, sessionId: binding.sessionId },
+    // The launcher's safe boundary: the holder drains and owns no live run before its process is stopped.
+    binding: binding === null ? null : { generation: binding.bindingGeneration, sessionId: binding.sessionId,
+      lifecycle: cp.sessions.get(binding.sessionId)?.lifecycle ?? null, liveRuns: liveRunIdsOwnedBySession(cp.db, binding.sessionId) },
     buzz: judged === null ? null : judged.verdict === "ADMITTED"
       ? { verdict: judged.verdict, sessionId: judged.binding.sessionId, generation: judged.binding.bindingGeneration }
       : { verdict: judged.verdict, reason: judged.reason },
@@ -5933,7 +5935,12 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
             );
           },
         );
-        const unresolved = taken.unresolved;
+        // v58 — what a switchover carried in flight (handed to the outgoing holder, never completed) is never handed
+        // over as new work: it is listed unresolved, marked previousHolderInFlight with the evidence of that hand-over,
+        // and its text, when handed, carries the same mark, until this holder settles it.
+        const previous = inFlightFromPreviousHolder(cp.db, holder);
+        const previousOf = new Map(previous.map((row) => [row.messageId, row]));
+        const unresolved = [...taken.unresolved.filter((row) => !previousOf.has(row.messageId)), ...previous];
         const withheld = taken.withheld.filter((row) => !drained.has(row.messageId));
         // ACP-PEER-SUCCESSION-01, ACP-RESTART-04: the CEO peer messages ACP rejected while they
         // were queued for this role — on a revoke, a takeover, a runtime move or a restart that
@@ -6030,6 +6037,10 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
             principal: message.kind === MessageKind.PEER_MESSAGE ? "peer" : "owner",
             // From this message's own source row, read in the same transaction as its text.
             provenance: ownerMessageProvenanceOf(pointer.sourceChannel, pointer.sourceNonce, source.actor, payload),
+            ...(previousOf.has(message.messageId) ? {
+              previousHolderInFlight: true as const, transferId: previousOf.get(message.messageId)!.transferId,
+              previousHolder: previousOf.get(message.messageId)!.previousHolder,
+            } : {}),
           },
           unresolved,
           withheld,
