@@ -47,6 +47,7 @@ import {
   type AdoptedCeoToolAdmission,
 } from "../bootstrap/adopted-ceo-tool-admission.ts";
 import { createHermesGatewayIdentityReader } from "../runtime/hermes-gateway-identity.ts";
+import { configuredHermesGatewayPort, HERMES_GATEWAY_ENDPOINT_VAR } from "../runtime/hermes-gateway-endpoint.ts";
 import {
   createHermesGatewayConversationSender,
   createHermesGatewayDaemonNoticeSender,
@@ -3279,15 +3280,21 @@ const HERMES_ADOPTION_VARS = [
   "ACP_HERMES_HOME", "ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY", "ACP_HERMES_GATEWAY_API_KEY",
 ] as const;
 
+/**
+ * The adoption variables, and the Gateway port every reader built from them uses
+ * (`ACP_HERMES_GATEWAY_ENDPOINT`). An endpoint set to anything but `127.0.0.1:<port>` is no
+ * configuration at all: nothing is adopted or delivered, rather than the default Gateway reached.
+ */
 const configuredHermesAdoptionValues = (configuration: Readonly<Record<string, string | undefined>>) => {
   const values = Object.fromEntries(HERMES_ADOPTION_VARS.map((key) => [key, configuration[key]])) as
     Record<(typeof HERMES_ADOPTION_VARS)[number], string | undefined>;
   const validText = (value: string | undefined): value is string =>
     typeof value === "string" && value.trim() === value && value.length > 0 &&
     value.length <= 512 && !/[\x00-\x1f\x7f]/.test(value);
-  return HERMES_ADOPTION_VARS.every((key) => validText(values[key])) &&
+  const gatewayPort = configuredHermesGatewayPort(configuration);
+  return gatewayPort !== null && HERMES_ADOPTION_VARS.every((key) => validText(values[key])) &&
     isDigest(values.ACP_HERMES_LINEAGE_ROOT_DIGEST) &&
-    /^[\x21-\x7e]+$/.test(values.ACP_HERMES_GATEWAY_API_KEY ?? "") ? values : null;
+    /^[\x21-\x7e]+$/.test(values.ACP_HERMES_GATEWAY_API_KEY ?? "") ? { ...values, gatewayPort } : null;
 };
 
 /**
@@ -3296,7 +3303,8 @@ const configuredHermesAdoptionValues = (configuration: Readonly<Record<string, s
  *
  * Only the key decides. Without it the coordinator keeps `NEVER_FOUND_RECEIPT_PORT`, the dark
  * default, and a configuration that already names a receipt port keeps the one it names. The port
- * is not asked for anything until a turn is in doubt.
+ * is not asked for anything until a turn is in doubt. It asks the configured Gateway endpoint, and
+ * an endpoint set to anything but `127.0.0.1:<port>` keeps the dark default too.
  */
 export const withConfiguredHermesGatewayReceipt = (
   config: ControlPlaneConfig,
@@ -3305,7 +3313,9 @@ export const withConfiguredHermesGatewayReceipt = (
   const apiKey = environment["ACP_HERMES_GATEWAY_API_KEY"];
   if (config.hermesReceipt || config.hermesGatewayReceipt) return config;
   if (typeof apiKey !== "string" || !/^[\x21-\x7e]+$/.test(apiKey)) return config;
-  return { ...config, hermesGatewayReceipt: { apiKey } };
+  const port = configuredHermesGatewayPort(environment);
+  if (port === null) return config;
+  return { ...config, hermesGatewayReceipt: { apiKey, port } };
 };
 
 /** The ports the pinned CEO Gateway target reads through; every one is a test seam. */
@@ -3319,6 +3329,8 @@ interface HermesCeoPinPorts {
 /** One pinned CEO Gateway target: the four fields a POST must name, and the fence at its dispatch. */
 interface HermesCeoPin {
   apiKey: string;
+  /** The configured Gateway port the pin was read from; the POST goes to the same one. */
+  port: number;
   expected: GatewayIncumbentProof;
   preDispatch: () => boolean;
 }
@@ -3416,6 +3428,7 @@ const configuredHermesCeoPin = (
     if (head === null || pinned === null || pinned.target.head !== head) return null;
     return {
       apiKey: values["ACP_HERMES_GATEWAY_API_KEY"]!,
+      port: values.gatewayPort,
       expected: { session_id: head,
         lineage_root_digest: values.ACP_HERMES_LINEAGE_ROOT_DIGEST!,
         process_pid: pinned.processPid, process_started_at: pinned.startToken },
@@ -3438,7 +3451,8 @@ export const createConfiguredHermesGatewayConversation = (
     const pinned = await pin();
     if (pinned === null) return refuse();
     return (ports.senderFactory ?? createHermesGatewayConversationSender)({
-      apiKey: pinned.apiKey, binding: "acp-canonical-ceo", expected: pinned.expected, preDispatch: pinned.preDispatch,
+      apiKey: pinned.apiKey, port: pinned.port, binding: "acp-canonical-ceo", expected: pinned.expected,
+      preDispatch: pinned.preDispatch,
     })(text, source);
   };
 };
@@ -3461,7 +3475,7 @@ export const createConfiguredHermesGatewayDaemonNoticeTarget = (
     return {
       destination: { ...pinned.expected },
       send: (ports.noticeSenderFactory ?? createHermesGatewayDaemonNoticeSender)({
-        apiKey: pinned.apiKey, preDispatch: pinned.preDispatch,
+        apiKey: pinned.apiKey, port: pinned.port, preDispatch: pinned.preDispatch,
       }),
     };
   };
@@ -3704,6 +3718,7 @@ const lockedGatewayOrigin = (
 ): (() => Promise<GatewayIncumbentProof>) => {
   const readGateway = (ports.identityReader ?? createHermesGatewayIdentityReader)({
     apiKey: values.ACP_HERMES_GATEWAY_API_KEY!,
+    port: values.gatewayPort,
   });
   return async () => {
     if (ports.authorityHeld && !ports.authorityHeld()) throw new Error("daemon lock lost");
@@ -6230,6 +6245,13 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     throw new Error("ACP_BUZZ_CHANNEL is required once canonical self-claim activation is fully configured");
   }
 
+  // One Gateway endpoint for every reader below and for the bootstrap runtime. One set to anything
+  // but `127.0.0.1:<port>` refuses the start rather than reach the default Gateway; the message
+  // names the variable, never its value.
+  const hermesGatewayPort = configuredHermesGatewayPort(process.env);
+  if (hermesGatewayPort === null) {
+    throw new Error(`${HERMES_GATEWAY_ENDPOINT_VAR} must be 127.0.0.1:<port> when it is set`);
+  }
   // A2: the Gateway key the daemon holds for identity reads also reads the Gateway's Telegram turn
   // receipts. Without it the coordinator keeps its dark default.
   const config = withConfiguredHermesGatewayReceipt(options.config ?? defaultConfig(), process.env);
@@ -6258,8 +6280,8 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     throw new Error("ACP_OPERATOR_ACTOR or USER is required to establish the operator peer identity");
   }
   const hermesAdoptionConfiguration = Object.fromEntries(
-    HERMES_ADOPTION_VARS.map((key) => [key, process.env[key]]),
-  ) as Record<(typeof HERMES_ADOPTION_VARS)[number], string | undefined>;
+    [...HERMES_ADOPTION_VARS, HERMES_GATEWAY_ENDPOINT_VAR].map((key) => [key, process.env[key]]),
+  ) as Record<(typeof HERMES_ADOPTION_VARS)[number] | typeof HERMES_GATEWAY_ENDPOINT_VAR, string | undefined>;
   // Both parsers refuse `ACP_TELEGRAM_EXTERNAL_CONSUMER=hermes` beside a bot token, here, before the
   // control plane or any listener exists. In that mode the long-poll parser answers null.
   const telegramExternalConfig = configuredTelegramExternalConsumerConfig(config.ownerIdentities ?? []);
@@ -6508,6 +6530,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       stateDir,
       mcpSocketPath: join(stateDir, "hermes.mcp.sock"),
       mcpToken,
+      gatewayPort: hermesGatewayPort,
       authorityHeld: () => daemon.lock.held(),
     });
     const adoptHermesIncumbent = createConfiguredHermesIncumbentAdoption(

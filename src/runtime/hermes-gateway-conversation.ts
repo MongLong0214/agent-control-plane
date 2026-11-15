@@ -4,6 +4,7 @@ import { allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { CeoTurnOutcome } from "../mcp/ceo-conversation.ts";
 import type { DaemonNoticeBody, DaemonNoticeSendOutcome } from "./acp-daemon-notice.ts";
+import { DEFAULT_HERMES_GATEWAY_PORT, HERMES_GATEWAY_HOST } from "./hermes-gateway-endpoint.ts";
 import {
   createHermesGatewayIdentityReader, type HermesGatewayIdentity,
 } from "./hermes-gateway-identity.ts";
@@ -34,7 +35,7 @@ export interface HermesGatewayConversationOptions {
   expected: HermesGatewayIdentity;
   /** Synchronous authority check after the awaited GET, at the POST dispatch boundary. */
   preDispatch?: () => boolean;
-  /** Ephemeral test listener only; production uses fixed 127.0.0.1:8642. */
+  /** The Gateway port (`configuredHermesGatewayPort`), for the identity GET and the POST alike; omitted is 8642. */
   port?: number;
 }
 
@@ -47,14 +48,14 @@ export interface GatewayEventSource {
 /** One existing-only event turn; never spawns a process or creates a session. */
 export const createHermesGatewayConversationSender = (options: HermesGatewayConversationOptions):
   ((text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>) => {
-  const readIdentity = createHermesGatewayIdentityReader({ apiKey: options.apiKey, port: options.port });
+  const port = options.port ?? DEFAULT_HERMES_GATEWAY_PORT;
+  const readIdentity = createHermesGatewayIdentityReader({ apiKey: options.apiKey, port });
   return async (text, source) => {
     const expected = options.expected;
     if (!safeIdentifier(options.binding) || !safeIdentifier(source?.eventId) ||
         !safeIdentifier(source.actor) || !safeIdentifier(source.conversation) ||
         typeof text !== "string" || text.length === 0 ||
-        !Number.isSafeInteger(options.port ?? 8642) || (options.port ?? 8642) < 1 ||
-        (options.port ?? 8642) > 65535 || !expected ||
+        !Number.isSafeInteger(port) || port < 1 || port > 65535 || !expected ||
         !safeIdentifier(expected.session_id) || !safeIdentifier(expected.process_started_at) ||
         !/^sha256:[a-f0-9]{64}$/.test(expected.lineage_root_digest) ||
         !Number.isSafeInteger(expected.process_pid) || expected.process_pid <= 0 ||
@@ -87,7 +88,7 @@ export const createHermesGatewayConversationSender = (options: HermesGatewayConv
         resolve(outcome);
       };
       try {
-        const req = request({ hostname: "127.0.0.1", family: 4, port: options.port ?? 8642,
+        const req = request({ hostname: HERMES_GATEWAY_HOST, family: 4, port,
           path: PATH, method: "POST", agent: false,
           headers: { Authorization: `Bearer ${options.apiKey}`, "Content-Type": "application/json",
             "Content-Length": Buffer.byteLength(body) } }, (res) => {
@@ -144,7 +145,7 @@ export interface HermesGatewayDaemonNoticeOptions {
   apiKey: string;
   /** Synchronous authority check after the awaited identity GET, at the POST dispatch boundary. */
   preDispatch?: () => boolean;
-  /** Ephemeral test listener only; production uses fixed 127.0.0.1:8642. */
+  /** The Gateway port (`configuredHermesGatewayPort`), for the identity GET and the POST alike; omitted is 8642. */
   port?: number;
   /** Tests only: the answer deadline; production keeps the conversation sender's 5 s. */
   timeoutMs?: number;
@@ -163,8 +164,8 @@ export interface HermesGatewayDaemonNoticeOptions {
  */
 export const createHermesGatewayDaemonNoticeSender = (options: HermesGatewayDaemonNoticeOptions):
   ((body: DaemonNoticeBody) => Promise<DaemonNoticeSendOutcome>) => {
-  const port = options.port ?? 8642;
-  const readIdentity = createHermesGatewayIdentityReader({ apiKey: options.apiKey, port: options.port });
+  const port = options.port ?? DEFAULT_HERMES_GATEWAY_PORT;
+  const readIdentity = createHermesGatewayIdentityReader({ apiKey: options.apiKey, port });
   return async (notice) => {
     const destination = notice?.destination;
     if (!Number.isSafeInteger(port) || port < 1 || port > 65535 || !/^[\x21-\x7e]+$/.test(options.apiKey) ||
@@ -199,7 +200,7 @@ export const createHermesGatewayDaemonNoticeSender = (options: HermesGatewayDaem
       const lost = (reason: string): DaemonNoticeSendOutcome =>
         reached ? { kind: "UNCERTAIN", reason } : { kind: "NOT_SENT", reason };
       try {
-        const req = request({ hostname: "127.0.0.1", family: 4, port, path: PATH, method: "POST", agent: false,
+        const req = request({ hostname: HERMES_GATEWAY_HOST, family: 4, port, path: PATH, method: "POST", agent: false,
           headers: { Authorization: `Bearer ${options.apiKey}`, "Content-Type": "application/json",
             "Content-Length": Buffer.byteLength(body) } }, (res) => {
           const status = res.statusCode ?? 0;

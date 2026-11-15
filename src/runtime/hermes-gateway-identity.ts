@@ -1,6 +1,7 @@
 import { request } from "node:http";
 
 import { isDigest } from "../core/digest.ts";
+import { DEFAULT_HERMES_GATEWAY_PORT, HERMES_GATEWAY_HOST } from "./hermes-gateway-endpoint.ts";
 
 /** A Gateway observation, not an authorization or an ACP session pin. */
 export interface HermesGatewayIdentity {
@@ -33,12 +34,12 @@ const readHermesGatewayIdentity = async (options: {
   apiKey: string;
   port?: number;
 }): Promise<HermesGatewayIdentity> => {
-  const port = options.port ?? 8642;
+  const port = options.port ?? DEFAULT_HERMES_GATEWAY_PORT;
   if (typeof options.apiKey !== "string" || !/^[\x21-\x7e]+$/.test(options.apiKey) ||
       !Number.isSafeInteger(port) || port < 1 || port > 65535) throw failure();
 
   return new Promise<HermesGatewayIdentity>((resolve, reject) => {
-    const req = request({ hostname: "127.0.0.1", family: 4, port, path: PATH, method: "GET",
+    const req = request({ hostname: HERMES_GATEWAY_HOST, family: 4, port, path: PATH, method: "GET",
       agent: false, headers: { Authorization: `Bearer ${options.apiKey}` } }, (res) => {
       if (res.statusCode !== 200 || (res.headers["content-type"] ?? "").split(";")[0]?.trim().toLowerCase() !== "application/json" ||
           Number(res.headers["content-length"] ?? 0) > MAX_BYTES) {
@@ -78,7 +79,7 @@ const readHermesGatewayIdentity = async (options: {
 /** Compose once with the daemon's separately provisioned key; readers take no caller input. */
 export const createHermesGatewayIdentityReader = (options: {
   apiKey: string;
-  /** Ephemeral test listener only; production uses Gateway's fixed port 8642. */
+  /** The Gateway port (`configuredHermesGatewayPort`); omitted is the default, 8642. */
   port?: number;
 }): (() => Promise<HermesGatewayIdentity>) => {
   const apiKey = options.apiKey;
