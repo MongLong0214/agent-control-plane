@@ -13,12 +13,11 @@ import {
   createCommitLoreCliPort,
   requiredCommitLoreObservation,
 } from "../../src/bootstrap/commitlore-observation.ts";
-import { latestRelease } from "../helpers/commitlore-release.ts";
 import { hostGitDirectory, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 /** #1268 — the production port on the pin in the environment; the fake answers 1.7.3, confirmed as the newest release. */
-const envPort = () => createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, undefined, latestRelease("1.7.3")));
+const envPort = () => createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, undefined));
 
 /**
  * Review S11-R3 (PR #1138, CEO cb5501eb) — no credential reaches a `commitlore` child indirectly: not

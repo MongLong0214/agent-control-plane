@@ -70,12 +70,6 @@ beforeEach(() => clearSessionMessagingEnv());
  * from the checkout path (`REPO_DIST = join(process.cwd(), "dist")`), so nothing there exercises
  * this entrypoint through a symlink. `--help` is the cheap, side-effect-free argv for it: `main()`
  * reaches it before any flag is read, so it never touches a pair, a database or the filesystem.
- *
- * `src/tools/traceability.ts`'s `isMain` has the identical fix but is deliberately not run
- * through a symlink here: its `main()` takes no argv to make it fail cheaply, and with no
- * `options.vitest` supplied it calls `runVitestJson(root)` — spawning this repository's whole
- * suite — and writes `evidence/traceability.json`/`.md` as a side effect. There is no cheap,
- * side-effect-free invocation of it the way there is for the other five.
  */
 
 const REPO_ROOT = process.cwd();

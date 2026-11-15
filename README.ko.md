@@ -260,7 +260,6 @@ pnpm install
 pnpm rebuild better-sqlite3
 pnpm build
 pnpm test
-pnpm trace
 node scripts/ssot-report.mjs
 ```
 
@@ -439,8 +438,6 @@ node dist/cli/agentctl.js baseline export --from <ISO-8601> --to <ISO-8601>
 - **검증 입력:** 새 워크트리에는 커밋된 파일만 있습니다. `node_modules`도 빌드 결과물도 없습니다.
   `network: "allow"`를 선언한 명령은 의존성 조회와 다운로드를 위해 네트워크가 열려 있고 `HOME` 아래 지정된 툴체인 캐시에 쓸 수 있으므로, 필요한 것을 직접 설치할 수 있습니다. 기본값 `network: "deny"`인 명령은 아무것도 내려받을 수 없습니다. 내려받을 필요가 없는 길은 의존성 없는 검증 명령(이 저장소의 `scripts/verify-reason-codes.mjs`가 그런 예입니다)이나, 승인된 워크플로 다이제스트에서 나온 CI 결과를 정확한 후보 head에서만 받아들이는 `evidenceMode: "TRUSTED_CI"`입니다.
   프로젝트 매니페스트에서 `network: "allowlist"`는 여전히 지원하지 않습니다.
-- **테스트 커버리지의 의미:** `pnpm trace`는 PRD와 새로 실행한 Vitest 결과로 [추적성 증거](evidence/traceability.md)를 만듭니다.
-  이것이 재는 것은 선언 커버리지, 즉 라벨이 붙은 테스트 항목이 실행돼 통과했는지입니다. 동작 커버리지나 프로덕션 진입점 커버리지는 재지 않습니다.
 - **백로그(아직 출시 전):** 신뢰할 수 없는 저장소를 위한 강한 격리, 웹 대시보드, REST/GraphQL, 자동 Level 6 라우팅 승격(PRD §43).
 
 각 실환경 기록은 캡처 당시의 트리를 설명하며, 지금의 트리와 같다는 보장은 없습니다.
@@ -488,7 +485,6 @@ GitHub 이슈 트래커가 단일 진실 공급원입니다.
 | [종료 리뷰](docs/review/README.md) | 저장소에 함께 실린 독립 구현 리뷰 |
 | [인수 원장](docs/ACCEPTANCE.md) | PRD §42 대비 상태와 트래커 쿼리 |
 | [용어](docs/TERMINOLOGY.md) | 뜻이 엇갈리는 용어의 기준 정의 |
-| [추적성](evidence/traceability.md) | 요구 사항 → 시나리오 → 실행 가능한 테스트. `pnpm trace`가 생성 |
 | [티켓 DAG](docs/tickets/tickets.json) | 원자 단위 티켓과 마일스톤 |
 | [변경 이력](CHANGELOG.md) | 각 릴리스가 무엇인지, 그리고 아직 무엇을 하지 않는지 |
 

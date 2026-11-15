@@ -26,7 +26,7 @@ const scratchRepo = (): string => {
         scripts: {
           "ci:preflight": "node scripts/verify-ci-preflight.mjs",
           lint: "eslint .",
-          trace: "tsx src/tools/traceability.ts",
+          typecheck: "tsc --noEmit",
         },
       },
       null,
@@ -45,7 +45,7 @@ const scratchRepo = (): string => {
       "      - run: pnpm install --frozen-lockfile",
       "      - run: pnpm lint",
       "      - run: |",
-      "          pnpm trace",
+      "          pnpm typecheck",
       '          echo "the matrix succeeded"',
       "",
     ].join("\n"),
@@ -82,13 +82,13 @@ describe("ci preflight", () => {
     const repoRoot = scratchRepo();
     const packagePath = join(repoRoot, "package.json");
     const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
-    delete packageJson.scripts.trace;
+    delete packageJson.scripts.typecheck;
     writeFileSync(packagePath, JSON.stringify(packageJson, null, 2));
 
     const result = run(repoRoot);
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain('missing package script "trace"');
+    expect(result.stderr).toContain('missing package script "typecheck"');
   });
 
   it("rejects an unmatched quote in a workflow run block", () => {

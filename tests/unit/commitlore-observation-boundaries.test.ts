@@ -13,7 +13,6 @@ import {
   observationGitTarget,
   probeCommitLore,
 } from "../../src/bootstrap/commitlore-observation.ts";
-import { latestRelease } from "../helpers/commitlore-release.ts";
 import { hostGitDirectory, writeCommitLoreInstall } from "../helpers/commitlore-install.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
@@ -37,7 +36,7 @@ afterAll(() => {
 
 const root = tempDir("acp-s11-r1-boundaries-");
 /** #1268 — the production port on the pin in the environment; the fakes answer 1.7.3, confirmed as the newest release. */
-const envPort = () => createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, undefined, latestRelease("1.7.3")));
+const envPort = () => createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, undefined));
 const ok = JSON.stringify({ schema: "commitlore_doctor.v2", status: "ok", exitCode: 0, checks: [] });
 
 // Slice S16: what the runner asks a pinned CLI before any other command, answered as a supported one does.
@@ -339,7 +338,7 @@ const observeExit0 = async (
     return realKill.call(this, signal);
   };
   try {
-    const run = commitloreRunner({ ...COMMITLORE_LIMITS, ...limits }, bin, latestRelease("1.7.3"));
+    const run = commitloreRunner({ ...COMMITLORE_LIMITS, ...limits }, bin);
     const settledWithin = limits.timeoutMs + holdMs + limits.killGraceMs + 3_000;
     const observed = await Promise.race([
       createCommitLoreCliPort(run).observe(root),

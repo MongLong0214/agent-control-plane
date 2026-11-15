@@ -12,12 +12,8 @@ pnpm install
 pnpm rebuild better-sqlite3
 pnpm build
 pnpm test
-pnpm trace
 node scripts/ssot-report.mjs
 ```
-
-`pnpm trace` writes generated evidence under `evidence/`. Do not edit that evidence to make
-a report look complete; rerun the command after changing tests or PRD mappings.
 
 ## Inspect without a project mutation
 

@@ -21,8 +21,6 @@ import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { frontierReviewPolicy } from "../../src/review/frontier-simplify-policy.ts";
 import { WorkerTurnEvent, WorkerTurnRunner, type WorkerTurnOptions } from "../../src/run/worker-turn.ts";
-import { installedCopyOf } from "../helpers/commitlore-install.ts";
-import { latestRelease, stableReleaseAnswer } from "../helpers/commitlore-release.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeCore, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest } from "../helpers/harness.ts";
 import { FakeWorkerAdapter, recordSeededTarget, seedWorkerWorld, type WorkerWorld } from "../helpers/worker-turn-fixture.ts";
@@ -97,8 +95,8 @@ const requiredWorld = (options: { init?: boolean } = {}): WorkerWorld => {
   return world;
 };
 
-const realPort = (version = VERSION): CommitLorePort =>
-  createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, REAL as string, latestRelease(version)));
+const realPort = (): CommitLorePort =>
+  createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, REAL as string));
 
 const fakeFor = (world: WorkerWorld, reply: string, writes: Record<string, string> = {}): FakeWorkerAdapter => {
   const adapter = new FakeWorkerAdapter(world.broker);
@@ -106,9 +104,6 @@ const fakeFor = (world: WorkerWorld, reply: string, writes: Record<string, strin
   adapters.push(adapter);
   return adapter;
 };
-
-/** A copy of the real CLI's installation (`installedCopyOf`), in this run's temporary tree. */
-const installedCopy = (): { wrapper: string; bundle: string } => installedCopyOf(REAL as string, tempDir("acp-1268-install-"));
 
 const makeRunner = (world: WorkerWorld, adapter: FakeWorkerAdapter, options: WorkerTurnOptions): WorkerTurnRunner =>
   new WorkerTurnRunner(
@@ -342,33 +337,6 @@ describe.skipIf(REAL === null)("#1268: a worker commit goes through CommitLore (
     expect((succeededEvidence(world)["commitlore"] as { outcome: string }).outcome).toBe("recorded");
   });
 
-  it("review r2 P1: a package swapped behind an unchanged wrapper during the release lookup is never run; the commit runs the checked copy", async () => {
-    const world = requiredWorld();
-    const { wrapper, bundle } = installedCopy();
-    const marker = join(tempDir("acp-1268-swap-"), "ran");
-    // The wrapper is left as it is; its package is replaced the moment the newest release is asked for.
-    const swapping = async (): Promise<unknown> => {
-      writeFileSync(bundle, `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "ran");\nprocess.exit(1);\n`);
-      return stableReleaseAnswer(VERSION);
-    };
-    const adapter = fakeFor(world, `${SAID}\n\n${draft([])}`);
-    await runTurn(world, makeRunner(world, adapter, { commitlore: createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, wrapper, swapping)) }));
-
-    expect(existsSync(marker), "the swapped package ran").toBe(false);
-    expect(succeededEvidence(world)["commitlore"]).toEqual({ outcome: "empty", recordIds: [], nonce: null });
-  });
-
-  it("a pin that is not the newest release commits nothing, though its draft would verify", async () => {
-    const world = requiredWorld();
-    const base = head(world);
-    const [major, minor, patch] = VERSION.split(".").map(Number) as [number, number, number];
-    const adapter = fakeFor(world, `${SAID}\n\n${draft([])}`);
-    await runTurn(world, makeRunner(world, adapter, { commitlore: realPort(`${major}.${minor}.${patch + 1}`) }));
-
-    const evidence = failedEvidence(world);
-    expect(String(evidence["detail"])).toContain("ACP_COMMITLORE_BINARY NOT_LATEST");
-    nothingCommitted(world, base);
-  });
 });
 
 /** The first `git` on this process's PATH, as ACP's own git calls find it. */
