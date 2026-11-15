@@ -833,6 +833,8 @@ describe("round-2 blind-review regressions", () => {
     expect(finalPrompt).toContain("in scope by");
     expect(finalPrompt).toContain("Skipped tests visible in verification output are");
     expect(finalPrompt).toContain("never a reason to withhold PASS");
+    expect(finalPrompt).toContain("when a skip leaves evidence the contract requires unavailable,");
+    expect(finalPrompt).toContain("that evidence remains an omitted item.");
     // Negative: real gaps stay omitted items.
     expect(finalPrompt).toContain("Chunk coverage that is missing or unreadable, and required evidence that is missing, remain omitted items.");
     expect(finalPrompt).toContain("truncated so that the verdict cannot be decided remains an omitted item");
