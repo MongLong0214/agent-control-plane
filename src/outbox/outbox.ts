@@ -882,7 +882,8 @@ export const settleStoppedSessionInstructions = (
  */
 type CeoNoticeOrigin =
   | { state: "NONE" }
-  | { state: "CURRENT" | "NOT_CURRENT"; origin: unknown; stripped: OutboxMessage };
+  | { state: "CURRENT"; origin: unknown }
+  | { state: "NOT_CURRENT"; origin: unknown; stripped: OutboxMessage };
 
 const ceoNoticeOrigin = (db: Pick<Db, "get">, message: OutboxMessage): CeoNoticeOrigin => {
   const payload = message.payload;
@@ -896,11 +897,42 @@ const ceoNoticeOrigin = (db: Pick<Db, "get">, message: OutboxMessage): CeoNotice
         AND (SELECT COUNT(*) FROM canonical_turn_sources o WHERE o.turn_request_id = t.turn_request_id) = 1`,
     [named.turn_request_id, message.bindingGeneration, message.targetSessionId, `update:${named.update_id}`],
   ) !== undefined;
-  return { state: current ? "CURRENT" : "NOT_CURRENT", origin, stripped: { ...message, payload: rest } };
+  return current ? { state: "CURRENT", origin } : { state: "NOT_CURRENT", origin, stripped: { ...message, payload: rest } };
+};
+
+/** The bytes one string adds to a signed daemon-notice body: escaped once in the notice text, then again in the body. */
+const noticeBodyBytes = (text: string): number => Buffer.byteLength(JSON.stringify(JSON.stringify(text))) - 6;
+
+/**
+ * U6 B1 — a notice with a current origin whose one signed body is `over` bytes past the daemon-notice
+ * route's bound, made to fit with its origin: its longest text field is cut on a code point, so a UTF-8,
+ * boundary and marked with what was omitted and the run that keeps it. Only the copy sent is cut; the
+ * outbox row keeps the whole payload. Null when that field cannot absorb `over` and its marker.
+ */
+const boundedOriginNotice = (message: OutboxMessage, over: number):
+  { message: OutboxMessage; truncated: { field: string; omittedBytes: number } } | null => {
+  const payload = message.payload as Record<string, unknown>;
+  const field = Object.keys(payload).filter((key) => key !== "origin" && typeof payload[key] === "string")
+    .sort((a, b) => (payload[b] as string).length - (payload[a] as string).length)[0];
+  if (field === undefined) return null;
+  const value = payload[field] as string;
+  const marker = (omitted: number) => ` [truncated: ${omitted} bytes omitted; full result in ACP run ${message.runId ?? "unknown"}]`;
+  // The marker is priced at its longest, every byte omitted, so the cut is never short.
+  const budget = noticeBodyBytes(value) - over - noticeBodyBytes(marker(Buffer.byteLength(value)));
+  if (budget < 0) return null;
+  let kept = "";
+  let used = 0;
+  for (const character of value) {
+    used += noticeBodyBytes(character);
+    if (used > budget) break;
+    kept += character;
+  }
+  const omittedBytes = Buffer.byteLength(value) - Buffer.byteLength(kept);
+  return { message: { ...message, payload: { ...payload, [field]: kept + marker(omittedBytes) } }, truncated: { field, omittedBytes } };
 };
 
 /** Why a CEO notification's origin got no reply to the owner's message; the audit row is written once. */
-type OwnerReplyUndelivered = "ORIGIN_NOT_CURRENT" | "ORIGIN_NOTICE_TOO_LARGE";
+type OwnerReplyUndelivered = "ORIGIN_NOT_CURRENT";
 
 /**
  * Every unsettled CEO notification follows the current holder with its sealed content and id.
@@ -1289,38 +1321,35 @@ export class Outbox {
           const attempt = new CeoNoticeRoute(this.db, this.audit, message);
           if (attempt.withholdBeforeSend()) continue;
           // U6 B1 — an origin the notice may no longer carry is dropped, and the owner's reply recorded
-          // undelivered. A current one goes whole, in one signed body, on the daemon-notice route; a body too
-          // large for that route is not posted, and the notice goes without its origin on the normal route so
-          // the CEO still has the result.
+          // undelivered. A current one goes whole, in one signed body, on the daemon-notice route; a body past
+          // that route's bound is not posted but sent again with its longest text cut to fit, origin kept.
           const origin = ceoNoticeOrigin(this.db, message);
           if (origin.state === "NOT_CURRENT") this.#recordOwnerReplyUndelivered(message, "ORIGIN_NOT_CURRENT", origin.origin);
-          let tooLarge = false;
+          let over = 0;
           const route: CeoNoticeAttempt = origin.state !== "CURRENT" ? attempt : {
             prepare: (destination, requests) => {
-              if (requests.every((request) => Buffer.byteLength(JSON.stringify(request)) <= DAEMON_NOTICE_MAX_REQUEST_BYTES)) {
-                return attempt.prepare(destination, requests);
-              }
-              tooLarge = true;
-              return { route: "WITHHELD" };
+              over = Math.max(0, ...requests.map((request) => Buffer.byteLength(JSON.stringify(request)) - DAEMON_NOTICE_MAX_REQUEST_BYTES));
+              return over === 0 ? attempt.prepare(destination, requests) : { route: "WITHHELD" };
             },
           };
+          let truncated: { field: string; omittedBytes: number } | null = null;
           try {
             let result = await send(origin.state === "NOT_CURRENT" ? origin.stripped : message, route);
-            if (tooLarge && origin.state !== "NONE") {
-              this.#recordOwnerReplyUndelivered(message, "ORIGIN_NOTICE_TOO_LARGE", origin.origin);
-              result = await send(origin.stripped, attempt);
+            const bounded = over > 0 ? boundedOriginNotice(message, over) : null;
+            if (bounded) {
+              truncated = bounded.truncated;
+              result = await send(bounded.message, route);
             }
             unavailable = !result.allowed && result.reasonCode === ReasonCode.CEO_CONVERSATION_UNAVAILABLE;
             accepted = result.allowed;
             reasonCode = result.reasonCode;
             outcome = (result.evidence["noticeOutcome"] as CeoNoticeOutcome | undefined) ?? (accepted ? "SETTLED" : "UNKNOWN");
           } catch { /* retained below */ }
-          const dropped = origin.state === "NOT_CURRENT" ? "ORIGIN_NOT_CURRENT" : tooLarge ? "ORIGIN_NOTICE_TOO_LARGE" : null;
           if (attempt.route !== "CANONICAL") continue;
           if (unavailable) {
-            // No target was found, so no transport attempt took place. Retain PENDING and
-            // record withholding once per message/target, just like the unattached route.
-            this.#recordWithheldCeoNotification(hydrate(row), "CANONICAL_TARGET_UNAVAILABLE");
+            // No target was found, or an origin's notice could not be cut to one body, so no transport attempt
+            // took place. Retain PENDING and record withholding once per message/target, like the unattached route.
+            this.#recordWithheldCeoNotification(hydrate(row), over > 0 ? "ORIGIN_NOTICE_TOO_LARGE" : "CANONICAL_TARGET_UNAVAILABLE");
             continue;
           }
           this.db.tx(() => {
@@ -1332,13 +1361,13 @@ export class Outbox {
             WHERE message_id = ? AND status = 'PENDING' AND binding_generation = ? AND target_session_id = ?
               AND ${liveDeliveryTarget("outbox")}`,
             [accepted ? "ACKED" : "PENDING", accepted ? this.clock.nowIso() : null,
-              accepted ? dropped : null,
+              accepted && origin.state === "NOT_CURRENT" ? "ORIGIN_NOT_CURRENT" : null,
               row.message_id, row.binding_generation, row.target_session_id]);
             if (updated.changes !== 1) return;
             this.audit.record({ kind: accepted ? "CEO_NOTIFICATION_ACCEPTED" : "CEO_NOTIFICATION_DELIVERY_FAILED",
             reasonCode,
             roleKey: row.role_key, sessionId: row.target_session_id, runId: row.run_id,
-            evidence: { messageId: row.message_id } });
+            evidence: { messageId: row.message_id, ...(truncated ? { truncated } : {}) } });
           });
         }
       } while (this.#ceoPending);

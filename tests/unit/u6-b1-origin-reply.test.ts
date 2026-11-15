@@ -166,11 +166,11 @@ const outboxRow = (fixture: Fixture, messageId: string) =>
   fixture.cp.db.get<{ status: string; reason_code: string | null; attempts: number }>(
     "SELECT status, reason_code, attempts FROM outbox WHERE message_id = ?", [messageId])!;
 
-const enqueueNotice = (fixture: Fixture, key: string, payload: Record<string, unknown>): string => {
+const enqueueNotice = (fixture: Fixture, key: string, payload: Record<string, unknown>, runId?: string): string => {
   const ceo = fixture.cp.bindings.active(roleKeyFor(Role.CEO))!;
   const enqueued = fixture.cp.outbox.enqueue({
     idempotencyKey: key, roleKey: ceo.roleKey, bindingGeneration: ceo.bindingGeneration, targetSessionId: ceo.sessionId,
-    kind: MessageKind.CEO_NOTIFICATION, payload,
+    kind: MessageKind.CEO_NOTIFICATION, payload, runId,
   });
   if (!enqueued.allowed) throw new Error(enqueued.message);
   return enqueued.value.messageId;
@@ -370,26 +370,53 @@ describe("U6 B1 daemon notice route", () => {
     }
   });
 
-  it("sends a notice too large for one daemon-notice body without its origin on the normal route, and records the owner's reply undelivered", async () => {
+  it("sends a notice whose one body is past 64 KiB with its origin, its goal cut on a UTF-8 boundary to fit and marked, the full goal kept in ACP", async () => {
     const { fixture, origin, posts, bodies } = await originFixture();
     try {
-      const goal = "g".repeat(70_000);
-      const huge = enqueueNotice(fixture, "u6-b1-huge", { notification: "READY_FOR_CEO_REVIEW", goal, origin });
-      await fixture.cp.outbox.deliverCeoNotifications();
+      // 70,000 characters each: one byte apiece, then four (surrogate pairs) apiece.
+      for (const [index, goal] of ["g".repeat(70_000), "\u{1F600}".repeat(35_000)].entries()) {
+        const huge = enqueueNotice(fixture, `u6-b1-huge-${index}`, { notification: "READY_FOR_CEO_REVIEW", goal, origin }, "run-u6-b1");
+        await fixture.cp.outbox.deliverCeoNotifications();
+        await fixture.cp.outbox.deliverCeoNotifications();
+
+        expect(posts.slice(index)).toEqual(["/v1/canonical-surface/daemon-notices"]);
+        const signed = bodies[index]!;
+        expect(Buffer.byteLength(JSON.stringify(signed))).toBeLessThanOrEqual(65_536);
+        const head = `ACP notification ${huge} part 1/1: `;
+        expect(signed.text.startsWith(head)).toBe(true);
+        const sent = JSON.parse(signed.text.slice(head.length)) as { payload: { goal: string; origin: unknown } };
+        expect(sent.payload.origin).toEqual(origin);
+        const cut = /^(.*) \[truncated: (\d+) bytes omitted; full result in ACP run run-u6-b1\]$/su.exec(sent.payload.goal);
+        expect(cut).not.toBeNull();
+        const kept = cut![1]!;
+        expect(goal.startsWith(kept) && [...kept].length === kept.length / (index === 0 ? 1 : 2)).toBe(true);
+        expect(Number(cut![2])).toBe(Buffer.byteLength(goal) - Buffer.byteLength(kept));
+        expect(outboxRow(fixture, huge)).toEqual({ status: "ACKED", reason_code: null, attempts: 1 });
+        expect(ownerReplyUndelivered(fixture, huge)).toEqual([]);
+        // The audit row says what was cut; the outbox row keeps the whole goal.
+        expect(fixture.cp.db.get<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events
+          WHERE kind = 'CEO_NOTIFICATION_ACCEPTED' AND json_extract(evidence_json, '$.messageId') = ?`, [huge])!.evidence_json)
+          .toBe(JSON.stringify({ messageId: huge, truncated: { field: "goal", omittedBytes: Number(cut![2]) } }));
+        expect((JSON.parse(fixture.cp.db.get<{ payload_json: string }>("SELECT payload_json FROM outbox WHERE message_id = ?",
+          [huge])!.payload_json) as { goal: string }).goal).toBe(goal);
+      }
+    } finally {
+      fixture.cp.close();
+    }
+  });
+
+  it("withholds, and says why, a notice with a current origin that no cut of one text field brings under 64 KiB", async () => {
+    const { fixture, origin, posts } = await originFixture();
+    try {
+      const huge = enqueueNotice(fixture, "u6-b1-uncuttable", { notification: "READY_FOR_CEO_REVIEW", goal: "short",
+        humanGate: { required: true, items: ["i".repeat(35_000), "j".repeat(35_000)], satisfied: false }, origin }, "run-u6-b1");
       await fixture.cp.outbox.deliverCeoNotifications();
 
-      // One send of the notice, in its usual signed parts, every one on /events; none names the origin.
-      expect(posts.length).toBeGreaterThan(1);
-      expect(new Set(posts)).toEqual(new Set(["/v1/canonical-surface/events"]));
-      const text = bodies.map((body, index) => {
-        const head = `ACP notification ${huge} part ${index + 1}/${bodies.length}: `;
-        expect(body.text.startsWith(head)).toBe(true);
-        return body.text.slice(head.length);
-      }).join("");
-      expect(JSON.parse(text)).toEqual({ messageId: huge, kind: MessageKind.CEO_NOTIFICATION,
-        payload: { notification: "READY_FOR_CEO_REVIEW", goal } });
-      expect(outboxRow(fixture, huge)).toEqual({ status: "ACKED", reason_code: "ORIGIN_NOTICE_TOO_LARGE", attempts: 1 });
-      expect(ownerReplyUndelivered(fixture, huge)).toEqual([{ reason: "ORIGIN_NOTICE_TOO_LARGE", origin }]);
+      expect(posts).toEqual([]);
+      expect(outboxRow(fixture, huge)).toEqual({ status: "PENDING", reason_code: null, attempts: 0 });
+      expect(fixture.cp.db.all<{ reason: string }>(`SELECT json_extract(evidence_json, '$.reason') AS reason FROM audit_events
+        WHERE kind = 'CEO_NOTIFICATION_ROUTE_UNAVAILABLE' AND json_extract(evidence_json, '$.messageId') = ?`, [huge]))
+        .toEqual([{ reason: "ORIGIN_NOTICE_TOO_LARGE" }]);
     } finally {
       fixture.cp.close();
     }
