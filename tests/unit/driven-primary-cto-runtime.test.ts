@@ -9,7 +9,6 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { startLocalMcpListeners, wakeRoleHolder } from "../../src/daemon/agentcpd.ts";
 import { ExecutionMode, Role, RunKind, SessionLifecycle, roleKeyFor, type RoleBinding } from "../../src/domain/types.ts";
-import { WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD, type SpawnAttestation } from "../../src/runtime/provisioned-session-runtime.ts";
 import type { SessionHandle, SessionTurnRequest, SessionTurnResult } from "../../src/runtime/provider.ts";
@@ -1178,7 +1177,7 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
           jsonrpc: "2.0",
           id: 1,
           method: "initialize",
-          params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] },
+          params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "claude-code", version: "2.1.323" } },
         },
         { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
       ].map((line) => JSON.stringify(line)).join("\n")}\n`);

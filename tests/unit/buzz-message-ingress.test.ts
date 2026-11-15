@@ -47,7 +47,6 @@ import type { CeoTurnOutcome } from "../../src/mcp/ceo-conversation.ts";
 import {
   ROLE_WAKE_FRAME,
   RoleConversationPort,
-  WAKE_TRANSPORT_QUALIFIED_CLIENTS,
 } from "../../src/mcp/role-conversation.ts";
 import type { McpPeerAuthenticator } from "../../src/mcp/shared.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -350,12 +349,8 @@ const connectRolePeer = async (
   /**
    * The client build this connection announces.
    *
-   * Defaulted, because only one row needs a specific one: `role_wake_endpoint_register` admits
-   * only the qualified runtime builds, so the row that registers an endpoint has to arrive as one
-   * of them — a member of `WAKE_TRANSPORT_QUALIFIED_CLIENTS` rather than a version spelled out, so
-   * a re-qualification that changes the set does not leave a stale literal behind that still
-   * passes. Every other row is unaffected by what it says here, and passing a member
-   * unconditionally would have made those rows quietly depend on a version they never exercise.
+   * Defaulted, because no row depends on which build it is: `role_wake_endpoint_register` admits
+   * any client build.
    */
   clientInfo: { name: string; version: string } = { name: "buzz-role-peer", version: "1" },
 ): Promise<{
@@ -437,7 +432,7 @@ const connectRolePeer = async (
 const fakeRolePeer = () =>
   ({
     server: {
-      getClientVersion: () => WAKE_TRANSPORT_QUALIFIED_CLIENTS[0],
+      getClientVersion: () => ({ name: "claude-code", version: "2.1.323" }),
     },
   }) as never;
 
@@ -1511,7 +1506,7 @@ describe("the daemon's Buzz message ingress", () => {
     const peer = await connectRolePeer(
       ctoSocket,
       { token: MCP_TOKEN, sessionId: session.sessionId, sessionSecret: session.sessionSecret },
-      WAKE_TRANSPORT_QUALIFIED_CLIENTS[0],
+      { name: "claude-code", version: "2.1.323" },
     );
 
     // One directory for both, the way `main` has one `stateDir`: the ingress socket and the

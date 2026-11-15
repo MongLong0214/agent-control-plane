@@ -26,7 +26,7 @@ import {
 } from "../../src/cli/attach-relay.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startLocalMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
-import { ROLE_WAKE_FRAME, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
+import { ROLE_WAKE_FRAME } from "../../src/mcp/role-conversation.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import {
   canonicalCtoFixture,
@@ -60,7 +60,7 @@ const TOKEN = "fixture-mcp-token";
 const MESSAGING_TOKEN = "fixture-messaging-token-7f3a9c41d2";
 const POLICY: Partial<ReattachPolicy> = { maxWaitMs: 5_000, initialDelayMs: 20, maxDelayMs: 100, attemptTimeoutMs: 2_000 };
 const FAST: Partial<ReattachPolicy> = { maxWaitMs: 3_000, initialDelayMs: 5, maxDelayMs: 50, attemptTimeoutMs: 200 };
-const qualified = WAKE_TRANSPORT_QUALIFIED_CLIENTS[0]!;
+const qualified = { name: "claude-code", version: "2.1.323" };
 const STAND_IN_TUPLE = { assignmentId: "stand-in-assignment", bindingGeneration: 1, sessionId: "stand-in-session", sessionIncarnation: "stand-in-incarnation" };
 const PROXY_NAME = /^acp-wake-proxy-[0-9a-f]{16}\.sock$/;
 const AUTHENTICATED_WAKE = `${JSON.stringify({ type: "auth", token: MESSAGING_TOKEN })}\n${ROLE_WAKE_FRAME}`;

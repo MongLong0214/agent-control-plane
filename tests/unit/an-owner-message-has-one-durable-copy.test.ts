@@ -12,7 +12,7 @@ import {
 } from "../../src/ingress/buzz-message.ts";
 import { IngressGuard, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
-import { RoleConversationPort, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
+import { RoleConversationPort } from "../../src/mcp/role-conversation.ts";
 import type { McpPeerAuthenticator } from "../../src/mcp/shared.ts";
 import { MessageKind, RETARGETABLE_KINDS } from "../../src/outbox/envelope.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -138,7 +138,7 @@ const fakeRolePeer = () =>
   ({
     server: {
       getClientCapabilities: () => ({ sampling: {} }),
-      getClientVersion: () => WAKE_TRANSPORT_QUALIFIED_CLIENTS[0],
+      getClientVersion: () => ({ name: "claude-code", version: "2.1.323" }),
       createMessage: async () => ({
         model: "fake",
         role: "assistant",

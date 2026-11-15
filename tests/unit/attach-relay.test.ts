@@ -14,7 +14,6 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startDaemonMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import { WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
 import { clearSessionMessagingEnv, inheritedSessionMessagingNames, SESSION_MESSAGING_PREFIX } from "../helpers/session-messaging-env.ts";
@@ -224,7 +223,7 @@ describe("the canonical CTO attach relay", () => {
   };
 
   const attach = async (
-    clientInfo: { name: string; version: string } = WAKE_TRANSPORT_QUALIFIED_CLIENTS[0],
+    clientInfo: { name: string; version: string } = { name: "claude-code", version: "2.1.323" },
     mcpSocketPath?: string,
   ): Promise<Relay & { init: Wire }> => {
     const relay = drive(mcpSocketPath ?? mcpPath);
@@ -312,10 +311,11 @@ describe("the canonical CTO attach relay", () => {
   it("forwards the client's own clientInfo rather than one the relay could have written", async () => {
     await fakeClaim(receipt());
     const relay = await attach({ name: "hand-written", version: "0" });
+    // The daemon sees the client's own declaration, whatever it is, and admits it.
+    expect(listeners.ctoConversation.unwakeableHolders()).toMatchObject([{ presented: "hand-written/0" }]);
     const body = await register(relay);
-    expect(body["ok"]).toBe(false);
-    expect(body["reasonCode"]).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
-    expect((body["evidence"] as { presented?: unknown }).presented).toBe("hand-written/0");
+    expect(body["ok"]).toBe(true);
+    expect(listeners.ctoConversation.endpointFor(roleKey)).toBe(endpoint);
     relay.stdin.end();
     expect(await settles(relay.exit)).toBe(ATTACH_EXIT.OK);
   });
@@ -358,7 +358,7 @@ describe("the canonical CTO attach relay", () => {
         jsonrpc: "2.0",
         id: 1,
         method: "initialize",
-        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] },
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "claude-code", version: "2.1.323" } },
       })}\n`,
     );
     expect(await settles(relay.exit)).toBe(ATTACH_EXIT.HANDSHAKE_REFUSED);
@@ -387,7 +387,7 @@ describe("the canonical CTO attach relay", () => {
       }),
       proxyPath,
     );
-    const relay = await attach(WAKE_TRANSPORT_QUALIFIED_CLIENTS[0], proxyPath);
+    const relay = await attach({ name: "claude-code", version: "2.1.323" }, proxyPath);
     expect((await register(relay))["ok"]).toBe(true);
     expect(listeners.ctoConversation.endpointFor(roleKey)).toBe(endpoint);
 

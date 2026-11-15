@@ -12,7 +12,7 @@ import { buzzMentionWakeGate, createBuzzMessageIngress, createCeoNotificationSen
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
-import { RoleConversationPort, ROLE_WAKE_FRAME, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
+import { RoleConversationPort, ROLE_WAKE_FRAME } from "../../src/mcp/role-conversation.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { outboxDeliveryReadback } from "../../src/outbox/outbox.ts";
 import type { DaemonNoticeTarget } from "../../src/runtime/acp-daemon-notice.ts";
@@ -54,7 +54,7 @@ const start = async (options: { registerWake?: boolean } = {}) => {
   const socketPath = join(dir, "wake.sock");
   await new Promise<void>((resolve) => endpoint.listen(socketPath, resolve));
   const server = new McpServer({ name: "bind-mention", version: "1" });
-  vi.spyOn(server.server, "getClientVersion").mockReturnValue(WAKE_TRANSPORT_QUALIFIED_CLIENTS[0]);
+  vi.spyOn(server.server, "getClientVersion").mockReturnValue({ name: "claude-code", version: "2.1.323" });
   conversation.attach(server, () => allow(ReasonCode.OK, { actor: session.sessionId, sessionId: session.sessionId, sessionIncarnation: session.incarnation }));
   const registerWake = () => conversation.registerEndpoint(server, socketPath);
   if (options.registerWake !== false) expect((await registerWake()).allowed).toBe(true);
