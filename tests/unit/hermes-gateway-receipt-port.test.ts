@@ -43,7 +43,7 @@ const daemonFixture = () =>
   externalLaneFixture({
     configure: (config) => {
       const composed = withConfiguredHermesGatewayReceipt(config, { ACP_HERMES_GATEWAY_API_KEY: GATEWAY_KEY });
-      expect(composed.hermesGatewayReceipt).toEqual({ apiKey: GATEWAY_KEY });
+      expect(composed.hermesGatewayReceipt).toEqual({ apiKey: GATEWAY_KEY, port: 8642 });
       return { ...composed, hermesGatewayReceipt: { ...composed.hermesGatewayReceipt!, port } };
     },
   });

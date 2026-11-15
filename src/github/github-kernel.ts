@@ -54,7 +54,6 @@ export const GATE_CHECK_NAME = "acp-production-gate";
  * anything at all.
  */
 export const NO_HUMAN_GATE_DIGEST = digestOf({ humanGate: "NOT_REQUIRED" });
-export const PROJECT_CHECK_NAME = "project-ci";
 
 /** Run states after the CEO's CONFIRM, in which the daemon finalizer writes to GitHub. */
 const FINALIZING_STATES: ReadonlySet<string> = new Set([RunState.CEO_APPROVED, RunState.MERGING, RunState.POST_MERGE_VERIFYING]);

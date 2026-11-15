@@ -967,16 +967,6 @@ export const hermesContentionReport = (observation: HermesSharedStateObservation
   `was observed contended at ${observation.observedAt ?? "an unrecorded time"}: ${observation.detail}. ` +
   "No process this run did not start was signalled, and nothing about the probe's subject was exercised.";
 
-/** Whether the production database can be read without being opened for writing. */
-export const productionIsReadable = (home = homedir()): boolean => {
-  const database = join(productionRoot(home), "state.sqlite");
-  try {
-    return statSync(database).isFile();
-  } catch {
-    return false;
-  }
-};
-
 /** For evidence: the realm's own paths, relative to its state directory. */
 export const realmLayout = (paths: RealmPaths): readonly string[] =>
   [paths.databasePath, paths.runtimeRoot, paths.socketDir, paths.lockPath]

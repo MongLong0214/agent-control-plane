@@ -44,9 +44,9 @@ const ATTACHED_SCHEMA = "acp.standard-review-evidence-attached.v1";
 
 let projectSeq = 0;
 
-async function fixture() {
+async function fixture(manifestOverrides: Partial<ProjectManifest> = {}) {
   const h = makeHarness();
-  const { projectId, repositoryId, identity } = await registerFixtureProject(h, `evidence-digests-${++projectSeq}`);
+  const { projectId, repositoryId, identity } = await registerFixtureProject(h, `evidence-digests-${++projectSeq}`, manifestOverrides);
   const lineage = digestOf("review evidence digests lineage");
   const anchor = { liveHermesSessionId: "approved-ceo-head", lineageRootDigest: lineage };
   const meta = { [HERMES_PROVENANCE_META_KEY]: { principal: "owner", session_id: anchor.liveHermesSessionId, lineage_root_digest: lineage, cron: false, delegation_depth: 0 } };
@@ -452,6 +452,86 @@ describe("review evidence quoting a project run's verification outputs and contr
       expect(outcome, JSON.stringify(outcome)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
       const snapshot = f.h.cp.artifacts.list<CandidateSnapshot>(run.runId, "CANDIDATE_SNAPSHOT").at(-1)!.content;
       expect(frozenStandardReviewEvidence({ artifacts: f.h.cp.artifacts, audit: f.h.cp.audit }, snapshot)!.source.references).toEqual(references);
+    } finally { await f.close(); }
+  });
+});
+
+/**
+ * A STANDARD bundle quoting the project's own manifest file, `.agent-control-plane/project.json`, whose
+ * `ciWorkflows[<n>].approvedDigest` is the sha256 of a workflow file: ACP confirms that exact token in the run's own
+ * pinned manifest, at that field, and nowhere else. A file's grade or a `recordedDigests` entry confirms nothing.
+ */
+describe("review evidence quoting a digest the run's pinned manifest approves", () => {
+  const workflowDigest = digestOf("a synthetic CI workflow file");
+  const ciWorkflows = [{ path: ".github/workflows/ci.yml", checkName: "test", repositoryRole: "primary", approvedDigest: workflowDigest, unapprovedFirstActivation: false }];
+  const PROJECT_JSON = ".agent-control-plane/project.json";
+  const originalOf = (text: string): ExcerptFile => {
+    const bytes = Buffer.from(text, "utf8");
+    return { path: PROJECT_JSON, sha256: sha256(bytes), origin: "GitHub contents API at the candidate head", grade: "github-api-original", bodyBase64: bytes.toString("base64"),
+      excerpt: { originalSha256: sha256(`${text}and the rest of the file`), omitted: true, ranges: [{ section: "excerpt", startLine: 1, endLine: text.split("\n").length - 1 }] } };
+  };
+  const bundleOf = (run: { runId: string; contractDigest: string }, text: string, extra: Args = {}): string =>
+    JSON.stringify({ runId: run.runId, contractDigest: run.contractDigest, files: [originalOf(text)], missing: ["the rest of the manifest"], ...extra });
+
+  it("stages, attaches and freezes the project's manifest file with its own approvedDigest, bound to the run's pinned manifest at that field", async () => {
+    const f = await fixture({ ciWorkflows });
+    try {
+      const run = await f.planned(f.projectId, addsCommand("evidence-check"));
+      const pin = f.h.cp.runs.require(run.runId).pinnedManifestDigest!;
+      const projectJson = pretty(f.h.cp.projects.manifest(pin));
+      expect(projectJson).toContain(workflowDigest);
+      const staged = await f.stageBody(run, "stage-approved", bundleOf(run, projectJson));
+      expect(staged, JSON.stringify(staged)).toMatchObject({ ok: true });
+      const references = [{ kind: "MANIFEST_APPROVED_DIGEST", digest: workflowDigest, runId: run.runId,
+        artifactId: null, activationEventId: null, jsonPath: "$.ciWorkflows[0].approvedDigest", manifestDigest: pin }];
+      expect((staged["value"] as Args)["verifiedReferences"]).toEqual(references);
+      expect(await f.attachBody(run, "attach-approved", bundleOf(run, projectJson))).toMatchObject({ ok: true });
+      const outcome = await f.submit(run);
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({ allowed: true, value: { stage: "COMPLETED_REVIEW" } });
+      const snapshot = f.h.cp.artifacts.list<CandidateSnapshot>(run.runId, "CANDIDATE_SNAPSHOT").at(-1)!.content;
+      expect(frozenStandardReviewEvidence({ artifacts: f.h.cp.artifacts, audit: f.h.cp.audit }, snapshot)!.source.references).toEqual(references);
+    } finally { await f.close(); }
+  });
+
+  it("refuses an extra unregistered digest or 64-hex, a credential beside the approved digest, its bare hex and a digest only recordedDigests lists", async () => {
+    const f = await fixture({ ciWorkflows });
+    try {
+      const run = await f.planned(f.projectId, addsCommand("evidence-check"));
+      const projectJson = pretty(f.h.cp.projects.manifest(f.h.cp.runs.require(run.runId).pinnedManifestDigest!));
+      const unregistered = digestOf("a workflow no manifest approves");
+      const slack = ["xoxb", "123456789012345678901234567890"].join("-");
+      const refused: Array<[string, string, Args]> = [
+        ["an extra unregistered digest", `${projectJson}"cacheDigest": "${unregistered}"\n`, {}],
+        ["an extra unregistered 64-hex", `${projectJson}"cacheKey": "${hexOf(unregistered)}"\n`, {}],
+        ["a credential beside the approved digest", `${projectJson}"token": "${slack}"\n`, {}],
+        ["the approved digest's bare hex", `${projectJson}"bare": "${hexOf(workflowDigest)}"\n`, {}],
+        ["a digest only recordedDigests lists", `${projectJson}"cacheDigest": "${unregistered}"\n`,
+          { recordedDigests: [{ digest: unregistered, what: "a workflow cache the CTO says it recorded" }] }],
+      ];
+      for (const [label, text, extra] of refused) {
+        const answer = await f.stageBody(run, `refused-${label}`, bundleOf(run, text, extra));
+        expect(answer, label).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED" });
+        expect(JSON.stringify(answer), label).not.toContain(slack);
+      }
+      expect(f.handoffs(run.runId, CANDIDATE_SCHEMA)).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it("refuses a digest only another run's pinned manifest approves", async () => {
+    const f = await fixture();
+    try {
+      // Another project in the same store, whose run pins a manifest that approves the workflow.
+      const otherProject = `evidence-digests-other-${projectSeq}`;
+      const otherManifest = fixtureManifest(otherProject, { ciWorkflows });
+      expect(f.h.cp.projects.register({ projectId: otherProject, name: "other", manifest: otherManifest,
+        authorization: f.h.cp.manifestAuthorizationForTests(otherManifest) })).toMatchObject({ allowed: true });
+      const other = await f.planned(otherProject, addsCommand("other-check"));
+      const run = await f.planned(f.projectId, addsCommand("evidence-check"));
+      const text = `"approvedDigest": "${workflowDigest}"\n`;
+      // This run's pinned manifest approves no workflow.
+      const answer = await f.stageBody(run, "refused-unpinned", bundleOf(run, text));
+      expect(answer).toMatchObject({ ok: false, reasonCode: "TRUSTED_CREDENTIAL_LEAK_BLOCKED", evidence: { rule: "long_base64_run", form: "sha256-64hex" } });
+      expect(await f.stageBody(other, "accepted-pinned", bundleOf(other, text))).toMatchObject({ ok: true });
     } finally { await f.close(); }
   });
 });

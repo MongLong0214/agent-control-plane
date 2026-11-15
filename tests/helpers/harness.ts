@@ -22,7 +22,6 @@ import type { RunRow } from "../../src/domain/types.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import type { ManagedManifestWrite } from "../../src/registry/project-registry.ts";
 import type { HermesReceiptPortOptions } from "../../src/runtime/hermes-receipt-port.ts";
 import { createCtoMcpPort } from "../../src/mcp/cto-server.ts";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -232,23 +231,6 @@ export const registerFixtureProject = async (
     projectId,
     repositoryId: repository.value.repositoryId,
     identity: repository.value.identity,
-  };
-};
-
-/** Managed activation proof for tests that complete a dedicated contract-change run. */
-export const manifestAuthorizationForRun = (
-  harness: Harness,
-  projectId: string,
-  manifest: ProjectManifest,
-  runId: string,
-): ManagedManifestWrite => {
-  const run = harness.cp.runs.require(runId);
-  return {
-    projectId,
-    runId,
-    sessionId: run.ownerSessionId,
-    bindingGeneration: run.ownerBindingGeneration,
-    expectedManifestDigest: manifestDigest(manifest),
   };
 };
 

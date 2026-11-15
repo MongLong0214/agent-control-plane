@@ -109,7 +109,8 @@ const MAX_PLACED_DIGESTS = 20;
 export interface StandardReviewEvidenceReference {
   /**
    * The artifact's kind (CANDIDATE_SNAPSHOT for a frozen candidate's digest), MANIFEST, RUN_CONTRACT for a run's
-   * contract digest, or VERIFICATION_OUTPUT for one command's `outputDigest` in a VERIFICATION artifact.
+   * contract digest, VERIFICATION_OUTPUT for one command's `outputDigest` in a VERIFICATION artifact, or
+   * MANIFEST_APPROVED_DIGEST for a file digest the evidence run's own pinned manifest approves.
    */
   kind: string;
   digest: string;
@@ -119,8 +120,13 @@ export interface StandardReviewEvidenceReference {
   artifactId: string | null;
   /** The audit event in which the project activated the manifest, when no run of the project pins it; else null. */
   activationEventId: number | null;
-  /** VERIFICATION_OUTPUT only: the exact JSON path of the value in the artifact's content (`$.results[<n>].outputDigest`). */
+  /**
+   * The exact JSON path of the value: in the artifact's content for VERIFICATION_OUTPUT (`$.results[<n>].outputDigest`),
+   * in the pinned manifest for MANIFEST_APPROVED_DIGEST (`$.ciWorkflows[<n>].approvedDigest`, `$.gateEntries[<n>].digest`).
+   */
   jsonPath?: string;
+  /** MANIFEST_APPROVED_DIGEST only: the digest of the run's pinned manifest that holds the value. */
+  manifestDigest?: string;
 }
 /** The references ACP holds for some of the given tokens: the store's own answer at stage and attach, the staged set at the freeze. */
 type ResolveReferences = (tokens: readonly string[]) => readonly StandardReviewEvidenceReference[];
@@ -254,6 +260,10 @@ type ReferenceSource = Pick<Source, "artifacts" | "audit" | "runs">;
 /** The audit events by which a project activates a manifest, with the evidence key that names it. */
 const ACTIVATIONS = [["PROJECT_REGISTERED", "activeManifestDigest"], ["PROJECT_MANIFEST_ACTIVATED", "to"], ["PROJECT_MANIFEST_ADOPTED_BY_BOOTSTRAP", "to"]] as const;
 const OUTPUT_PATH = /^\$\.results\[(\d+)\]\.outputDigest$/;
+const APPROVED_DIGEST = "MANIFEST_APPROVED_DIGEST";
+/** The manifest fields that hold the sha256 of a file the contract approved: a CI workflow's and a gate entry's. */
+const APPROVED_FIELDS = [["ciWorkflows", "approvedDigest"], ["gateEntries", "digest"]] as const;
+const APPROVED_PATH = /^\$\.(?:ciWorkflows\[\d+\]\.approvedDigest|gateEntries\[\d+\]\.digest)$/;
 
 /**
  * Whether a reference still holds at the record it names, and that record is still the project's: the run, its pin
@@ -264,6 +274,13 @@ const OUTPUT_PATH = /^\$\.results\[(\d+)\]\.outputDigest$/;
 const referenceHolds = (source: ReferenceSource, projectId: string, ref: StandardReviewEvidenceReference): boolean => {
   const run = ref.runId === null ? null : source.runs.get(ref.runId);
   if (ref.runId !== null && run?.projectId !== projectId) return false;
+  if ((ref.kind === APPROVED_DIGEST) !== (ref.manifestDigest !== undefined)) return false;
+  // The stage read the value at its path in the manifest stored under `manifestDigest`, re-checking that digest; a
+  // manifest is content-addressed and a run's pin never changes once set, so the run still pinning it is the check.
+  if (ref.kind === APPROVED_DIGEST) {
+    return run !== null && ref.artifactId === null && ref.activationEventId === null && APPROVED_PATH.test(ref.jsonPath ?? "")
+      && run.pinnedManifestDigest === ref.manifestDigest;
+  }
   if (ref.kind === "MANIFEST" || ref.kind === "RUN_CONTRACT") {
     if (ref.artifactId !== null || ref.jsonPath !== undefined) return false;
     if (ref.kind === "RUN_CONTRACT") return run !== null && ref.activationEventId === null && run.contractDigest === ref.digest;
@@ -343,9 +360,31 @@ const verificationOutputReference = (source: Pick<Source, "db"> & ReferenceSourc
   return referenceHolds(source, projectId, ref) ? ref : null;
 };
 
-/** The store's own answer for a run at the stage: references only in its project's records, none for a run with no project. */
+/**
+ * A file digest the evidence run's own pinned manifest approves (`APPROVED_FIELDS`), at the first such field holding
+ * exactly `digest`, read from the manifest stored under the pin with that digest re-checked. Only the run's own pin
+ * counts, rather than any manifest of the project or a digest a bundle lists (`recordedDigests`) or a file's grade.
+ */
+const approvedDigestReference = (source: Pick<Source, "db">, run: RunRow, digest: string): StandardReviewEvidenceReference | null => {
+  const pin = run.pinnedManifestDigest;
+  if (pin === null) return null;
+  const row = source.db.get<{ content_json: string }>(`SELECT content_json FROM manifests WHERE digest = ?`, [pin]);
+  let manifest: unknown;
+  try { manifest = row === undefined ? null : JSON.parse(row.content_json); } catch { return null; }
+  if (manifest === null || digestOf(manifest) !== pin) return null;
+  for (const [list, key] of APPROVED_FIELDS) {
+    const at = entriesOf(manifest, list).findIndex(entry => keyOf(entry, key) === digest);
+    if (at >= 0) return { kind: APPROVED_DIGEST, digest, runId: run.runId, artifactId: null, activationEventId: null, jsonPath: `$.${list}[${at}].${key}`, manifestDigest: pin };
+  }
+  return null;
+};
+
+/**
+ * The store's own answer for a run at the stage: references only in its project's records, then a file digest its own
+ * pinned manifest approves; none for a run with no project.
+ */
 const inProject = (source: Pick<Source, "db"> & ReferenceSource, run: RunRow): ResolveReferences => tokens =>
-  run.projectId === null ? [] : tokens.flatMap(token => projectReference(source, run.projectId!, token) ?? []);
+  run.projectId === null ? [] : tokens.flatMap(token => projectReference(source, run.projectId!, token) ?? approvedDigestReference(source, run, token) ?? []);
 
 /** Whether every bound reference still holds at its own source, in the run's project (`referenceHolds`). */
 const referencesHold = (source: ReferenceSource, run: Pick<RunRow, "projectId">, references: readonly StandardReviewEvidenceReference[]): boolean =>
@@ -546,8 +585,6 @@ export const standardReviewEvidenceAttachAccess = (source: Source, input: Standa
   }
   return allow(ReasonCode.OK, candidate);
 };
-
-export const standardReviewEvidenceAttachAuthority = reviewEvidenceAttachAuthority;
 
 export const attachStandardReviewEvidence = (
   source: Source, peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: StandardReviewEvidenceAttachInput,

@@ -128,14 +128,6 @@ export type { WorkerCommitPort, WorkerDiffEntry } from "./worker-git.ts";
 
 /** A worker turn may not be asked to run longer than this (#512). */
 export const WORKER_TURN_MAX_TIMEOUT_MS = 30 * 60 * 1000;
-/**
- * The Claude pair this path used to launch for every worker. A turn now runs on the bound
- * session's own fixed pair (`fixedRuntimes(Role.WORKER)`). These stay exported for callers that
- * name the Claude pair; they are not the only runtime.
- */
-export const WORKER_TURN_PROVIDER = "claude";
-export const WORKER_TURN_MODEL = "opus";
-
 const DEFAULT_POLL_MS = 1_000;
 const DEFAULT_PROCESS_SETTLE_MS = 2_000;
 const DEFAULT_SHUTDOWN_BUDGET_MS = 15_000;

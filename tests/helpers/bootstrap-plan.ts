@@ -9,7 +9,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { manifestDigest, type ProjectManifest } from "../../src/contracts/manifest.ts";
 import { Role, roleKeyFor } from "../../src/domain/types.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
-import { bindCeo, fixtureManifest, reviewerPass, reviewerRevise, type Harness } from "./harness.ts";
+import { bindCeo, fixtureManifest, reviewerPass, type Harness } from "./harness.ts";
 
 /**
  * Issue #246 PR-C slice C2 — fixtures for a project-less PROJECT_BOOTSTRAP run's plan and its
@@ -224,12 +224,4 @@ export const replanBootstrap = async (
   const redispatched = await harness.cp.runs.dispatch(runId);
   if (!redispatched.allowed) throw new Error(`re-dispatch refused: ${redispatched.reasonCode}: ${redispatched.message}`);
   return reviewBootstrapPlan(harness, runId, plan);
-};
-
-/** A REVISE answer from the scripted reviewer for the run's current PLAN. */
-export const scriptBootstrapRevise = (harness: Harness, runId: string, summary: string): void => {
-  harness.scripted.script({
-    match: /Bootstrap plan review/,
-    text: reviewerRevise(bootstrapCoverageKeys(harness, runId), summary),
-  });
 };

@@ -17,6 +17,11 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import { runHermesTargetBind, type HermesTargetBindResponse } from "../runtime/hermes-target-bind.ts";
 import {
+  DEFAULT_HERMES_GATEWAY_PORT,
+  HERMES_GATEWAY_ENDPOINT_VAR,
+  hermesGatewayEndpoint,
+} from "../runtime/hermes-gateway-endpoint.ts";
+import {
   assertPrivatePath,
   ensurePrivateDirectory,
   PRIVATE_FILE_MODE,
@@ -54,6 +59,12 @@ export interface HermesBootstrapAuthorityOptions {
   mcpSocketPath: string;
   /** A deployment credential, distinct from the operator and bootstrap credentials. */
   mcpToken: string;
+  /**
+   * The Gateway port the daemon reads the CEO's identity, receipts and turns from
+   * (`configuredHermesGatewayPort`). The runtime is told the same endpoint, so the Gateway it
+   * serves is the one ACP will ask. Omitted is the default, 8642.
+   */
+  gatewayPort?: number;
   /** The daemon's single-instance fence, checked before and during authority constitution. */
   authorityHeld?: () => boolean;
   runtimeTimeoutMs?: number;
@@ -721,6 +732,7 @@ const spawnHermesRuntime = (
     ACP_HERMES_BOOTSTRAP_TOKEN: token,
     ACP_HERMES_MCP_SOCKET: options.mcpSocketPath,
     ACP_MCP_TOKEN: options.mcpToken,
+    [HERMES_GATEWAY_ENDPOINT_VAR]: hermesGatewayEndpoint(options.gatewayPort ?? DEFAULT_HERMES_GATEWAY_PORT),
   };
   const child = spawn(command[0]!, command.slice(1), {
     // The managed runtime root — the same value the session row records. Under launchd the

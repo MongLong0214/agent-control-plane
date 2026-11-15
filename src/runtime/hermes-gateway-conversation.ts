@@ -4,13 +4,18 @@ import { allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { CeoTurnOutcome } from "../mcp/ceo-conversation.ts";
 import type { DaemonNoticeBody, DaemonNoticeSendOutcome } from "./acp-daemon-notice.ts";
+import { DEFAULT_HERMES_GATEWAY_PORT, HERMES_GATEWAY_HOST } from "./hermes-gateway-endpoint.ts";
 import {
   createHermesGatewayIdentityReader, type HermesGatewayIdentity,
 } from "./hermes-gateway-identity.ts";
 
 const PATH = "/v1/canonical-surface/events";
+/** U6 B1 — the Gateway route that may answer a CEO notification as a reply to the owner's `/acp` message. */
+const DAEMON_NOTICES_PATH = "/v1/canonical-surface/daemon-notices";
 const MAX_REPLY_BYTES = 16_384;
 const MAX_REQUEST_BYTES = 16_384;
+/** U6 B1 — the largest body the daemon-notice route takes; a notice with an origin is sent there whole. */
+export const DAEMON_NOTICE_MAX_REQUEST_BYTES = 65_536;
 const TIMEOUT_MS = 5_000;
 const safeIdentifier = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0 && value.length <= 512 &&
@@ -34,7 +39,7 @@ export interface HermesGatewayConversationOptions {
   expected: HermesGatewayIdentity;
   /** Synchronous authority check after the awaited GET, at the POST dispatch boundary. */
   preDispatch?: () => boolean;
-  /** Ephemeral test listener only; production uses fixed 127.0.0.1:8642. */
+  /** The Gateway port (`configuredHermesGatewayPort`), for the identity GET and the POST alike; omitted is 8642. */
   port?: number;
 }
 
@@ -47,14 +52,14 @@ export interface GatewayEventSource {
 /** One existing-only event turn; never spawns a process or creates a session. */
 export const createHermesGatewayConversationSender = (options: HermesGatewayConversationOptions):
   ((text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>) => {
-  const readIdentity = createHermesGatewayIdentityReader({ apiKey: options.apiKey, port: options.port });
+  const port = options.port ?? DEFAULT_HERMES_GATEWAY_PORT;
+  const readIdentity = createHermesGatewayIdentityReader({ apiKey: options.apiKey, port });
   return async (text, source) => {
     const expected = options.expected;
     if (!safeIdentifier(options.binding) || !safeIdentifier(source?.eventId) ||
         !safeIdentifier(source.actor) || !safeIdentifier(source.conversation) ||
         typeof text !== "string" || text.length === 0 ||
-        !Number.isSafeInteger(options.port ?? 8642) || (options.port ?? 8642) < 1 ||
-        (options.port ?? 8642) > 65535 || !expected ||
+        !Number.isSafeInteger(port) || port < 1 || port > 65535 || !expected ||
         !safeIdentifier(expected.session_id) || !safeIdentifier(expected.process_started_at) ||
         !/^sha256:[a-f0-9]{64}$/.test(expected.lineage_root_digest) ||
         !Number.isSafeInteger(expected.process_pid) || expected.process_pid <= 0 ||
@@ -87,7 +92,7 @@ export const createHermesGatewayConversationSender = (options: HermesGatewayConv
         resolve(outcome);
       };
       try {
-        const req = request({ hostname: "127.0.0.1", family: 4, port: options.port ?? 8642,
+        const req = request({ hostname: HERMES_GATEWAY_HOST, family: 4, port,
           path: PATH, method: "POST", agent: false,
           headers: { Authorization: `Bearer ${options.apiKey}`, "Content-Type": "application/json",
             "Content-Length": Buffer.byteLength(body) } }, (res) => {
@@ -139,20 +144,38 @@ export const createHermesGatewayConversationSender = (options: HermesGatewayConv
   };
 };
 
+/**
+ * The route for one notice, read from its signed text the way the Gateway reads it: a one-part CEO
+ * notification whose payload carries an `origin` goes to the daemon-notice route; every other notice
+ * keeps the events route, unchanged. A Gateway without that route answers non-200, which leaves the
+ * notice in doubt rather than moving it to Buzz.
+ */
+const daemonNoticePath = (text: string): string => {
+  const head = /^ACP notification (\S+) part 1\/1: /.exec(text);
+  if (!head) return PATH;
+  let body: unknown;
+  try { body = JSON.parse(text.slice(head[0].length)); } catch { return PATH; }
+  if (typeof body !== "object" || body === null) return PATH;
+  const notice = body as { messageId?: unknown; kind?: unknown; payload?: unknown };
+  const payload = typeof notice.payload === "object" && notice.payload !== null ? notice.payload as { origin?: unknown } : {};
+  return notice.messageId === head[1] && notice.kind === "CEO_NOTIFICATION" && typeof payload.origin === "object" &&
+    payload.origin !== null ? DAEMON_NOTICES_PATH : PATH;
+};
+
 export interface HermesGatewayDaemonNoticeOptions {
   /** The same daemon-provisioned Gateway key; it authenticates the channel, not the sender. */
   apiKey: string;
   /** Synchronous authority check after the awaited identity GET, at the POST dispatch boundary. */
   preDispatch?: () => boolean;
-  /** Ephemeral test listener only; production uses fixed 127.0.0.1:8642. */
+  /** The Gateway port (`configuredHermesGatewayPort`), for the identity GET and the POST alike; omitted is 8642. */
   port?: number;
   /** Tests only: the answer deadline; production keeps the conversation sender's 5 s. */
   timeoutMs?: number;
 }
 
 /**
- * `acp-daemon-notice/v1`: one signed daemon notice to the CEO's existing canonical conversation, on
- * the same route and with the same pinned destination as the conversation sender above. No
+ * `acp-daemon-notice/v1`: one signed daemon notice to the CEO's existing canonical conversation, with
+ * the same pinned destination as the conversation sender above, on the route `daemonNoticePath` names. No
  * `author_id` and no `channel_id`: the body is exactly the contract's, sealed by the caller.
  *
  * The Gateway's identity is read first and must equal the notice's `destination` field for field, as
@@ -163,8 +186,8 @@ export interface HermesGatewayDaemonNoticeOptions {
  */
 export const createHermesGatewayDaemonNoticeSender = (options: HermesGatewayDaemonNoticeOptions):
   ((body: DaemonNoticeBody) => Promise<DaemonNoticeSendOutcome>) => {
-  const port = options.port ?? 8642;
-  const readIdentity = createHermesGatewayIdentityReader({ apiKey: options.apiKey, port: options.port });
+  const port = options.port ?? DEFAULT_HERMES_GATEWAY_PORT;
+  const readIdentity = createHermesGatewayIdentityReader({ apiKey: options.apiKey, port });
   return async (notice) => {
     const destination = notice?.destination;
     if (!Number.isSafeInteger(port) || port < 1 || port > 65535 || !/^[\x21-\x7e]+$/.test(options.apiKey) ||
@@ -175,7 +198,10 @@ export const createHermesGatewayDaemonNoticeSender = (options: HermesGatewayDaem
       return { kind: "NOT_SENT", reason: "INVALID" };
     }
     const body = JSON.stringify(notice);
-    if (Buffer.byteLength(body) > MAX_REQUEST_BYTES) return { kind: "NOT_SENT", reason: "INVALID" };
+    const path = daemonNoticePath(notice.text);
+    if (Buffer.byteLength(body) > (path === DAEMON_NOTICES_PATH ? DAEMON_NOTICE_MAX_REQUEST_BYTES : MAX_REQUEST_BYTES)) {
+      return { kind: "NOT_SENT", reason: "INVALID" };
+    }
     let current: HermesGatewayIdentity;
     try { current = await readIdentity(); }
     catch { return { kind: "NOT_SENT", reason: "IDENTITY_UNAVAILABLE" }; }
@@ -199,7 +225,7 @@ export const createHermesGatewayDaemonNoticeSender = (options: HermesGatewayDaem
       const lost = (reason: string): DaemonNoticeSendOutcome =>
         reached ? { kind: "UNCERTAIN", reason } : { kind: "NOT_SENT", reason };
       try {
-        const req = request({ hostname: "127.0.0.1", family: 4, port, path: PATH, method: "POST", agent: false,
+        const req = request({ hostname: HERMES_GATEWAY_HOST, family: 4, port, path, method: "POST", agent: false,
           headers: { Authorization: `Bearer ${options.apiKey}`, "Content-Type": "application/json",
             "Content-Length": Buffer.byteLength(body) } }, (res) => {
           const status = res.statusCode ?? 0;

@@ -177,7 +177,7 @@ describe("daemon Gateway CEO composition", () => {
     expect(sender).toBeDefined();
     expect(await sender!("status", source)).toMatchObject({ contact: "REACHED", answered: { value: "Gateway answered" } });
     expect(calls).toEqual([
-      { apiKey: "fixture-gateway-key", binding: "acp-canonical-ceo",
+      { apiKey: "fixture-gateway-key", port: 8642, binding: "acp-canonical-ceo",
         expected: { session_id: LIVE, lineage_root_digest: DIGEST,
           process_pid: GATEWAY, process_started_at: TOKEN },
         preDispatch: expect.any(Function) },
