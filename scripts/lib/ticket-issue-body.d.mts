@@ -1,4 +1,4 @@
-/** Types for `ticket-issue-body.mjs`, which a `.ts` test imports; see `collapse-trailer-paragraphs.d.mts`. */
+/** Types for `ticket-issue-body.mjs`, which a `.ts` test imports; see `record-trailer-keys.d.mts`. */
 export interface Ticket {
   readonly id: string;
   readonly milestone: string;

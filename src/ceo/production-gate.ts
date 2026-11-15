@@ -207,9 +207,6 @@ type HumanGateResolution =
       decideAgain?: string[];
     };
 
-/** PRD §21 — the owner-only gate list. */
-export { HUMAN_GATE_TRIGGERS } from "./human-gate.ts";
-
 /** A CEO's decision on a run at READY_FOR_CEO_REVIEW, as Hermes submits it. */
 export interface CeoDecisionInput {
   runId: string;

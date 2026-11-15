@@ -79,11 +79,6 @@ export const repoFactoryGitHubWriteParameters = (input: {
 });
 
 /**
- * Historical approval artifact kind. Bootstrap no longer consults these records.
- */
-export const REPO_FACTORY_GITHUB_WRITE_APPROVAL_KIND = "REPO_FACTORY_GITHUB_WRITE";
-
-/**
  * #246 — everything an owner approval of this run's GitHub writes binds, computed from the run's own
  * PLAN artifact alone (`approvalScopeOf`). The CLI names owner and visibility and is checked against
  * the PLAN at execution; this scope takes them from the PLAN's first operation, the repository create,

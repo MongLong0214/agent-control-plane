@@ -961,7 +961,3 @@ export class GhCliGitHubClient implements GitHubClient {
     }
   }
 }
-
-/** The production port: the owner's `gh` authentication, REST for API calls, git for content. */
-export const createGhCliGitHubWritePort = (): GitHubWritePort =>
-  createGitHubApiWritePort({ client: new GhCliGitHubClient() });

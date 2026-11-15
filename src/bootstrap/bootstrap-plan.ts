@@ -75,14 +75,6 @@ export interface BootstrapPlanBinding {
   plannedOutputsDigest: string;
 }
 
-export const bootstrapPlanBindingSchema = z
-  .object({
-    planDigest: z.string().min(1),
-    projectManifestDigest: z.string().min(1),
-    plannedOutputsDigest: z.string().min(1),
-  })
-  .strict();
-
 export const sameBootstrapPlanBinding = (
   left: BootstrapPlanBinding | null | undefined,
   right: BootstrapPlanBinding | null | undefined,

@@ -46,8 +46,6 @@ export interface DenialPayload {
   evidence: Evidence;
 }
 
-export const isDenialPayload = (value: unknown): value is DenialPayload => isAcpError(value);
-
 /** Rebuilds a throwable denial from its wire form. */
 export const fromErrorPayload = (payload: DenialPayload): AcpError =>
   acpError(payload.reasonCode, payload.message, payload.evidence);
@@ -84,8 +82,3 @@ export const deny = <T = undefined>(
   message: string,
   evidence: Evidence = {},
 ): Decision<T> => ({ allowed: false, reasonCode, evidence, message });
-
-export const unwrap = <T>(decision: Decision<T>): T => {
-  if (!decision.allowed) throw acpError(decision.reasonCode, decision.message, decision.evidence);
-  return decision.value;
-};

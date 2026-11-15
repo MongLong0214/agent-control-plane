@@ -1023,5 +1023,3 @@ export const extractJson = (text: string): unknown | null => {
   }
   return null;
 };
-
-export type CapacityDecision = Decision<CapacityReading>;
