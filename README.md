@@ -28,11 +28,9 @@ Agents talk to the daemon over MCP. The daemon is one supervised Node process wi
 
 ## How it works
 
-Diagram sources: `assets/readme/diagrams/*.mmd`
-
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/diagrams/architecture-dark.svg">
-  <img src="assets/readme/diagrams/architecture.svg" alt="ACP architecture: agents, the agentcpd daemon, and its providers" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/diagrams/how-it-works-dark.svg">
+  <img src="assets/readme/diagrams/how-it-works.svg" alt="How ACP works: owner request, CEO, agentcpd daemon, CTO, verification, blind review, CEO decision, merge" width="100%">
 </picture>
 
 The daemon owns every decision and all state. CEO and CTO sessions reach it only through their own MCP sockets; workers and reviewers are provider sessions it starts.
@@ -72,11 +70,6 @@ A run moves through these thirteen states: `QUEUED`, `ACTIVE`, `BLOCKED`, `READY
 Run states and legal transitions are a `CHECK` constraint and a trigger in [`src/db/schema.sql`](src/db/schema.sql), so the database refuses an illegal transition.
 
 ### Candidate pipeline
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/diagrams/candidate-pipeline-dark.svg">
-  <img src="assets/readme/diagrams/candidate-pipeline.svg" alt="Candidate pipeline sequence diagram" width="100%">
-</picture>
 
 The CTO resubmits after a returned revision. Only a passing review reaches the CEO; the CEO answers `CONFIRM`, `FINAL_REVISE` or `OWNER_DECISION_REQUIRED`.
 

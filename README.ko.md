@@ -28,11 +28,9 @@ Agent Control Plane(ACP)은 로컬 데몬 `agentcpd`와 운영자용 CLI `agentc
 
 ## 동작 방식
 
-다이어그램 원본: `assets/readme/diagrams/*.mmd`
-
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/diagrams/architecture-ko-dark.svg">
-  <img src="assets/readme/diagrams/architecture-ko.svg" alt="ACP 아키텍처 다이어그램" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/diagrams/how-it-works-ko-dark.svg">
+  <img src="assets/readme/diagrams/how-it-works-ko.svg" alt="ACP이 동작하는 흐름: 소유자 요청부터 CEO, 데몬, CTO, 검증, 블라인드 리뷰, CEO 결정, 병합까지" width="100%">
 </picture>
 
 모든 결정과 상태는 데몬이 가집니다. CEO와 CTO 세션은 각자의 MCP 소켓으로만 데몬에 접근하고, 워커와 리뷰어는 데몬이 띄우는 프로바이더 세션입니다.
@@ -72,11 +70,6 @@ run은 `QUEUED`, `ACTIVE`, `BLOCKED`, `READY_FOR_CEO_REVIEW`, `CEO_APPROVED`, `M
 run 상태와 허용되는 전이는 [`src/db/schema.sql`](src/db/schema.sql)의 `CHECK` 제약과 트리거로 정의되어 있어서, 잘못된 전이는 데이터베이스가 거부합니다.
 
 ### 후보 파이프라인
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/diagrams/candidate-pipeline-ko-dark.svg">
-  <img src="assets/readme/diagrams/candidate-pipeline-ko.svg" alt="후보 파이프라인 시퀀스 다이어그램" width="100%">
-</picture>
 
 반환된 수정 요청 뒤에는 CTO가 다시 제출합니다. 리뷰를 통과한 후보만 CEO에게 도달하며, CEO는 `CONFIRM`, `FINAL_REVISE`, `OWNER_DECISION_REQUIRED` 중 하나로 답합니다.
 
