@@ -1,6 +1,6 @@
 # Current status and acceptance limits
 
-**This repository is not production-ready.** The issue tracker, not this page, is the
+The issue tracker, not this page, is the
 current source of truth for remaining work. This page intentionally does not copy counts
 from a point in time.
 

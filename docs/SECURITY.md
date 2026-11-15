@@ -1,6 +1,6 @@
 # Security posture and reporting
 
-Agent Control Plane is not production-ready. Do not rely on this repository as a complete
+Do not rely on this repository as a complete
 security boundary for untrusted repositories or unattended deployment. Packet-only blind
 reviewer egress has a measured, fail-closed provider-proxy boundary; its scope and remaining
 deployment evidence requirement are documented in [reviewer egress](reviewer-egress.md).

@@ -152,11 +152,6 @@ for (const document of publicDocuments) {
 
 const statusSections = [
   {
-    label: "README status banner",
-    path: "README.md",
-    pattern: /^>\s*\*\*Status:\s*not production-ready\.\*\*/m,
-  },
-  {
     label: "current status heading",
     path: "docs/STATUS.md",
     pattern: /^#\s+Current status\b/im,

@@ -4,298 +4,185 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./assets/readme/acp-logo-dark.svg">
-  <img src="./assets/readme/acp-logo.svg" width="560" alt="Agent Control Plane — 에이전트 작업을 위한 단일 로컬 런타임 권한 주체">
+  <img src="./assets/readme/acp-logo.svg" width="560" alt="Agent Control Plane">
 </picture>
 
-<br>
-
-[![CI](https://github.com/MongLong0214/agent-control-plane/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MongLong0214/agent-control-plane/actions/workflows/ci.yml)
-[![상태: 프로덕션 준비 안 됨](https://img.shields.io/badge/status-not_production--ready-C2410C)](docs/STATUS.md)
-[![버전 1.0.0](https://img.shields.io/badge/version-1.0.0-3457D5)](CHANGELOG.md)
-[![Node ^22.18.0 || >=24](https://img.shields.io/badge/node-%5E22.18.0_%7C%7C_%3E%3D24-0D8F6A)](package.json)
-[![플랫폼: macOS](https://img.shields.io/badge/platform-macOS_seatbelt-5A6577)](docs/adr/ADR-0004-verification-sandbox-isolation.md)
-[![TypeScript strict](https://img.shields.io/badge/TypeScript-strict-3457D5)](tsconfig.json)
-[![상태 저장: SQLite](https://img.shields.io/badge/state-SQLite_WAL-7A45D6)](docs/adr/ADR-0001-runtime-and-persistence.md)
-[![인터페이스: MCP](https://img.shields.io/badge/interface-MCP-1B2333)](#mcp-인터페이스)
-[![라이선스: 부여 없음](https://img.shields.io/badge/license-no_grant-A16207)](#라이선스)
-
-**에이전트는 제안하고 증거를 냅니다. 결정은 `agentcpd`가 합니다 — run, 역할, 검증, 블라인드 리뷰, 머지까지.**
-
-[개요](#개요) · [왜 필요한가](#왜-필요한가) · [동작 방식](#동작-방식) · [주요 기능](#주요-기능) · [빠른 시작](#빠른-시작) · [운영](#운영) · [보안](#보안-모델) · [문서](#문서-안내) · [기여](#기여하기) · [라이선스](#라이선스)
+**에이전트는 제안하고 증거를 냅니다. run, 역할, 검증, 블라인드 리뷰, 머지는 `agentcpd`가 결정합니다.**
 
 </div>
 
-> **상태: 프로덕션 준비 안 됨.** 이 저장소를 운영하거나 여기에 의존하기 전에 [현재 상태](docs/STATUS.md)를 먼저 읽어 주세요.
-> 이 페이지는 구현된 것, 테스트로 증명된 것, 실환경에서 관측된 것을 일부러 나눠 적습니다.
-> [현재 한계와 증거](#현재-한계와-증거)를 참고하세요.
-
-<h3 align="center">증명하거나 거부합니다 — 슬쩍 낮춰 통과시키지 않습니다.</h3>
-
-<p align="center">
-  <a href="#하드-불변식"><picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/readme/acp-invariants-ko-dark.svg">
-    <img src="./assets/readme/acp-invariants-ko.svg" width="100%" alt="하드 불변식 카드 여덟 장, CP-HI-01부터 CP-HI-08까지: 관리형 쓰기 가드, 단일 런타임 권한, 후보·계약 고정, 독립 품질 역할, 신뢰된 GitHub 자격 증명, 정확한 증거, 위임할 수 없는 사람의 역할, 조용한 품질 저하 금지">
-  </picture></a>
-</p>
-
-<p align="center"><sub><i>불변식은 선택 가능한 정책이 아니라 제품 그 자체입니다. 규범 원문은 <a href="docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md">control-plane PRD</a> §4에 있고, 각 불변식이 무엇을 지키는지는 <a href="#하드-불변식">아래 표</a>에 정리했습니다.</i></sub></p>
-
 ## 개요
 
-Agent Control Plane(ACP)은 로컬 데몬(**`agentcpd`**)과 운영자 CLI(**`agentctl`**)로 이루어져 있으며, AI 코딩 에이전트와 그 에이전트가 고치는 저장소 사이에 자리 잡습니다.
-ACP는 코드를 쓰지 않습니다.
-대신 에이전트가 자기 작업에 대해 스스로 내려서는 안 되는 결정을 맡습니다.
+Agent Control Plane(ACP)은 로컬 데몬 `agentcpd`와 운영자용 CLI `agentctl`로 이루어져 있으며, AI 코딩 에이전트와 에이전트가 수정하는 저장소 사이에 위치합니다. ACP는 코드를 작성하지 않습니다. 에이전트가 자기 작업에 대해 스스로 내려서는 안 되는 판단을 대신 맡습니다.
 
-- **공식 run 상태** — run이 존재하는지, 누가 소유하는지, 끝났는지
-- **어느 세션이 어느 역할을 맡는지**, 그리고 그 바인딩이 언제 효력을 잃는지
-- 작성자가 손댈 수 있는 **워크트리·브랜치·경로** — 유효한 리소스 claim으로 정합니다
-- 후보가 승인된 계약에 맞춰 샌드박스 안에서 **검증**됐는지
-- 건드린 모든 파일에 대해 **필수 독립 블라인드 리뷰**를 통과했는지
-- 데몬만 접근할 수 있는 GitHub 자격 증명으로 **머지**해도 되는지
+- run의 공식 상태: run이 존재하는지, 누가 소유하는지, 끝났는지
+- 어떤 세션이 어떤 역할을 맡고 있는지, 그 바인딩이 언제 더 이상 유효하지 않게 되는지
+- 쓰기 주체가 어떤 worktree, 브랜치, 경로를 건드릴 수 있는지 (살아 있는 리소스 claim으로 판단)
+- 후보(candidate)가 승인된 계약에 따라 샌드박스에서 검증되었는지
+- 수정된 모든 파일에 대해 독립적인 블라인드 리뷰를 통과했는지
+- 데몬만 접근할 수 있는 GitHub 자격 증명으로 머지해도 되는지
 
-CEO, 프로젝트 CTO, 워커, 리뷰어 같은 에이전트는 MCP로 작업을 요청하고 증거를 냅니다.
-데몬은 그 내용을 기록하고, 정확히 같은 후보를 기준으로 확인한 뒤 결정합니다.
-이 모든 상태는 감독되는 Node 프로세스 하나가 로컬 SQLite 데이터베이스 하나에 담습니다.
-HTTP 서버도, 메시지 브로커도, 외부 데이터베이스도 없습니다([ADR-0001](docs/adr/ADR-0001-runtime-and-persistence.md)).
+실제 저장소에 AI 에이전트를 돌리는 운영자가 "완료", "테스트 통과", "리뷰 완료"를 모델의 말이 아니라 기록된 증거로 확인하고 싶을 때를 위한 도구입니다. 범용 에이전트 프레임워크, 호스팅 서비스, 채팅 라우터가 아닙니다.
 
-ACP가 지향하는 모습은, 인수(acceptance)를 모두 마쳤을 때 관리 대상 프로젝트의 의도를 검증된 프로덕션 준비 결과로 바꿔 내는 단일 로컬 런타임 권한 주체입니다.
-지금 이 체크아웃이 보장하는 범위는 검증 가능한 후보 결과까지입니다.
-run을 기록하고, 행동할 수 있는 세션을 바인딩하고, 후보와 계약을 동결해 검증하고, 블라인드 리뷰를 요구하고, 결정 경로를 남깁니다.
-범용 자율 에이전트 프레임워크, 호스팅 서비스, 무인 배포 제품, 채팅 라우터는 의도적으로 **아닙니다**.
-
-구현의 규범 입력은 저장소에 함께 실린 [control-plane PRD](docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md)와 [Repo Factory 통합 PRD](docs/prd/REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md)입니다.
-[종료 리뷰](docs/review/AGENT_CONTROL_PLANE_v1.0_FINAL_IMPLEMENTATION_CLOSEOUT_REVIEW.md)는 아직 잘못된 부분에 대한 증거로 함께 실려 있습니다.
-숨겨 둔 과거 기록도 아니고, 통과한 인수 기록도 아닙니다.
-
-### 역할
-
-논리적 역할은 모두 역할 키로 가리키며, 교체할 수 있는 런타임 세션에 바인딩됩니다([ADR-0003](docs/adr/ADR-0003-role-binding-generation-and-fencing.md)).
-역할 목록과 분류는 [`src/domain/types.ts`](src/domain/types.ts) 한 곳에만 선언돼 있습니다.
-
-| 역할 | 역할 키 | 분류 | 책임 |
-|---|---|---|---|
-| `CEO` | `CEO` | 권한 주체 (`AUTHORITY`) | 작업을 분류하고, run의 실행 모드와 우선순위를 정하고, CTO 에스컬레이션을 해결하고, 프로덕션 준비 여부를 최종 결정합니다 |
-| `PRIMARY_CTO` | `PRIMARY_CTO:<projectId>` | 생산자 (`PRODUCER`) | 읽기 전용 탐색, 간결한 계획과 태스크 그래프, 워커 배정, 통합, 수정, CTO 최종 승인을 맡습니다. 프로젝트마다 하나입니다 |
-| `BOOTSTRAP_CTO` | `BOOTSTRAP_CTO:<runId>` | 생산자 (`PRODUCER`) | `PROJECT_BOOTSTRAP` run을 PLAN부터 활성화까지 이끕니다 |
-| `WORKER` | `WORKER:<taskId>` | 생산자 (`PRODUCER`) | 유효한 claim 아래, 일회용 워크트리에서 범위가 정해진 태스크 하나를 수행합니다 |
-| `BLIND_REVIEWER` | `BLIND_REVIEWER:<runId>` | 품질 (`QUALITY`) | 새로 만든 격리 세션에서 패킷만 보고 리뷰합니다. 같은 run의 생산자가 될 수 없습니다 |
-| `OPTIONAL_ADVERSARIAL_REVIEWER` | `OPTIONAL_ADVERSARIAL_REVIEWER:<runId>` | 생산자 (`PRODUCER`) | 선택적인 비블라인드 리뷰입니다. run의 생산자 집합에 포함됩니다 |
-
-**오너**는 역할 바인딩이 아닙니다.
-오너의 결정은 인증된 인그레스로만 들어오며, 프로바이더 페일오버가 오너 권한을 만들어 내는 일은 없습니다(CP-HI-07).
-
-## 왜 필요한가
-
-모델 세션은 누구나 "끝났습니다", "테스트 통과했습니다", "리뷰했습니다"라고 말할 수 있습니다.
-그런데 이 가운데 증거인 문장은 하나도 없습니다.
-이런 말을 그대로 받아들이는 시스템은 결국 가장 자신 있게 말한 세션이 믿은 것을 그대로 내보내게 됩니다.
-ACP는 이런 주장을 하나하나 메커니즘으로 바꿉니다.
-
-| 에이전트가 할 수 있는 주장 | ACP가 대신 요구하는 것 |
-|---|---|
-| "run이 끝났습니다." | run을 완료하고, 게이트를 게시하고, 머지하는 것은 `agentcpd`뿐입니다(CP-HI-02). |
-| "테스트가 통과했습니다." | 검증은 동결된 후보와 승인된 계약 다이제스트를 대상으로 샌드박스에서 실행돼야 하며(CP-HI-03), 명령을 가둘 수 없으면 실행하지 않고 실패로 닫힙니다([ADR-0004](docs/adr/ADR-0004-verification-sandbox-isolation.md)). |
-| "리뷰를 받았습니다." | 독립성은 run에 기록된 바인딩으로, 커버리지는 스냅샷이 건드린 경로로 계산합니다. 파일을 빠뜨린 `PASS`는 `COVERAGE_INCOMPLETE`로 강등됩니다([ADR-0006](docs/adr/ADR-0006-blind-review-independence-and-coverage.md)). |
-| "CI가 초록색이고 게이트도 있습니다." | 게이트는 이름이 아니라 생성자 신원, 페이로드 다이제스트, 정확한 head로 신뢰합니다. 그래서 후보 자신의 CI가 `acp-production-gate`를 찍어 낼 수 없습니다([ADR-0005](docs/adr/ADR-0005-trusted-github-credential-and-gate-provenance.md)). |
-| "제가 아직 이 run의 CTO입니다." | 바인딩 세대가 펜스입니다. 교체된 세션이 뒤늦게 보낸 결과는 감사 기록만 남기고 버립니다([ADR-0003](docs/adr/ADR-0003-role-binding-generation-and-fencing.md)). |
-| "용량은 아마 충분할 겁니다." | `UNKNOWN` 경로는 없습니다. 용량 측정값이 오래됐거나 측정에 실패하면 새 할당을 멈춥니다([ADR-0007](docs/adr/ADR-0007-provider-capacity-and-continuity.md)). |
+에이전트는 MCP로 데몬과 통신합니다. 데몬은 감독되는 단일 Node 프로세스이고, 로컬 SQLite 데이터베이스 하나를 사용합니다. HTTP 서버, 메시지 브로커, 외부 데이터베이스는 없습니다 ([ADR-0001](docs/adr/ADR-0001-runtime-and-persistence.md)).
 
 ## 동작 방식
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/readme/acp-architecture-dark.svg">
-    <img src="./assets/readme/acp-architecture.svg" width="100%" alt="아키텍처: 왼쪽에는 Telegram과 Buzz로 들어오는 오너, hermes.mcp.sock으로 붙는 CEO, cto.mcp.sock으로 붙는 프로젝트 CTO, agentctl을 쓰는 운영자, 부트스트랩 PLAN을 넘기는 Repo Factory가 있습니다. 가운데에는 SQLite 데이터베이스 하나 위에서 run, 역할 바인딩, 인그레스 가드, outbox, 관리형 쓰기 가드, 검증 엔진, 블라인드 리뷰 게이트, GitHub 커널, 프로바이더 용량, 역할 연속성, 부트스트랩 활성화, doctor를 맡는 agentcpd가 있습니다. 오른쪽에는 워커, 검증 샌드박스, 이그레스가 제한된 블라인드 리뷰어, Buzz 릴레이, GitHub가 있습니다">
-  </picture>
-</p>
+```mermaid
+flowchart LR
+  Owner([오너]) -->|Telegram / Buzz| Ingress
+  Operator([운영자]) -->|agentctl, operator 소켓| Run
+  subgraph Daemon[agentcpd]
+    Ingress[IngressGuard]
+    CEOMCP[CEO MCP 서버<br/>hermes.mcp.sock]
+    CTOMCP[CTO MCP 서버<br/>cto.mcp.sock]
+    Run[Run 엔진]
+    Verify[검증 엔진]
+    Review[블라인드 리뷰 게이트]
+    GH[GitHub 커널 및 finalizer]
+    DB[(SQLite)]
+  end
+  Ingress --> Run
+  CEO[CEO 세션: Hermes] <-->|MCP| CEOMCP
+  CTO[CTO 세션: Claude Code] <-->|MCP| CTOMCP
+  CEOMCP --> Run
+  CTOMCP --> Run
+  Run <--> DB
+  CTOMCP -->|task_worker_run| Worker[일회용 worktree의 워커]
+  Run --> Verify --> Sandbox[(seatbelt 샌드박스)]
+  Run --> Review --> Reviewer[블라인드 리뷰어 세션]
+  Run --> GH --> GitHub[(GitHub)]
+```
 
-1. **의도가 run이 됩니다.**
-   CEO가 실행 모드(`SIMPLE`, `STANDARD`, `GUARDED`)를 정해 run을 만들고(`run_create`) 디스패치합니다(`run_dispatch`).
-   소유자가 정해진 run은 그 세션과 바인딩 세대에 고정됩니다.
-2. **역할은 짐작하지 않고 바인딩합니다.**
-   바인딩은 세션을 역할 키에 붙이며, 엄격하게 단조 증가하는 `bindingGeneration`을 함께 가집니다.
-   이 규칙은 데이터베이스 트리거가 강제합니다.
-   이 세대 값은 모든 outbox 봉투, run 소유자 고정, 모든 태스크 실행 receipt, 모든 관리형 쓰기 요청에 실려 다닙니다.
-3. **전달은 영속적입니다.**
-   데몬이 outbox 행을 쓰고 역할 보유자를 깨우면, 깨어난 턴이 자신의 인증된 MCP 연결로 작업을 읽고 확인 응답(ACK)을 보냅니다(아래 참고).
-4. **CTO는 계획하고, 워커는 만듭니다.**
-   `plan_submit`이 간결한 계획과 태스크 그래프를 기록합니다.
-   워커는 유효한 리소스 claim 아래 일회용 워크트리에서 일하고, ACP가 소유한 쓰기는 관리형 쓰기 가드(Managed Write Guard)를 거칩니다.
-5. **후보를 동결하고 검증합니다.**
-   검증 명령은 동결된 후보 스냅샷과 승인된 계약 다이제스트를 대상으로 seatbelt 샌드박스에서 실행됩니다.
-   환경은 상속하지 않고 새로 구성하며, 프로세스 그룹을 따로 두고, 시간·메모리·출력에 한도를 둡니다.
-6. **블라인드 리뷰는 자동입니다.**
-   검증을 통과하면 control plane이 새로 만든 격리 리뷰어를 직접 호출합니다.
-   CTO나 CEO가 리뷰를 요청하거나 건너뛸 수 있는 연산은 없습니다.
-7. **CEO가 결정하고, 데몬이 실행합니다.**
-   CTO의 최종 승인이 있고 blocker 발견 사항이 하나도 없으면 데몬이 production-ready 패킷을 조립합니다.
-   CEO가 `CONFIRM`하면 데몬의 finalizer가 `acp-production-gate`를 게시하고, 머지하고, 머지 후 검증을 실행합니다.
-   GitHub에 가한 효과마다 receipt를 하나씩 남깁니다.
-8. **증거는 계속 들여다볼 수 있습니다.**
-   `agentctl run export <runId>`는 정규화된 증거 번들을 내보내며, 번들을 만든 호스트가 이를 권위 있게 검증할 수 있습니다([run-evidence export](docs/run-evidence-export.md)).
+모든 결정과 상태는 데몬이 가집니다. CEO와 CTO 세션은 각자의 MCP 소켓으로만 데몬에 접근하고, 워커와 리뷰어는 데몬이 띄우는 프로바이더 세션입니다.
 
-### run의 수명 주기
+### 역할
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/readme/acp-run-lifecycle-dark.svg">
-    <img src="./assets/readme/acp-run-lifecycle.svg" width="100%" alt="run 상태 기계: QUEUED, ACTIVE, READY_FOR_CEO_REVIEW, CEO_APPROVED, MERGING, POST_MERGE_VERIFYING, COMPLETED 순서로 진행합니다. ACTIVE와 READY_FOR_CEO_REVIEW 사이에는 계획, 빌드, 동결, 검증, 블라인드 리뷰, 패킷으로 이어지는 여섯 단계 후보 파이프라인이 있습니다. 프로젝트 부트스트랩 run은 활성화 뒤 CEO의 확인으로 바로 완료됩니다. 곁가지 상태로 BLOCKED, AWAITING_HUMAN, REVISION_REQUIRED, BLOCKED_POST_MERGE, FAILED, CANCELLED가 있습니다">
-  </picture>
-</p>
+각 역할은 role key로 지정되고 교체 가능한 세션에 바인딩됩니다. 역할 집합은 [`src/domain/types.ts`](src/domain/types.ts)에 선언되어 있습니다.
 
-상태와 허용되는 전이는 [`src/db/schema.sql`](src/db/schema.sql)의 `CHECK` 제약과 전이 트리거로 정의돼 있습니다.
-그래서 잘못된 전이는 그 전이를 요청한 코드만이 아니라 데이터베이스도 거부합니다.
-run의 종류는 `STANDARD_WORK`, `PROJECT_BOOTSTRAP`, `CONTRACT_CHANGE` 세 가지입니다.
-
-### 전달: outbox, wake, ACK
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/readme/acp-delivery-ko-dark.svg">
-    <img src="./assets/readme/acp-delivery-ko.svg" width="100%" alt="전달 다섯 단계: 역할 키, 바인딩 세대, 대상 세션을 적은 영속 outbox 행을 적재합니다. 역할이 등록한 엔드포인트를 페이로드 없이 두드려 깨웁니다. 깨어난 턴이 자신의 인증된 MCP 연결로 대기 중인 행을 읽습니다. role_dispatch_ack, run_ack, handoff_ack 중 하나로 행을 ACKED로 표시합니다. 페일오버 뒤에는 역할 단위 의도를 새 바인딩으로 옮기고, 이전 세대의 트래픽은 감사 기록을 남긴 뒤 버립니다">
-  </picture>
-</p>
-
-재지정(retarget) 여부는 사례마다 판단하지 않고 메시지 종류로 정합니다.
-`RUN_DISPATCH`, `TASK_ASSIGN`, `CANCEL_REQUEST`, `CEO_NOTIFICATION` 같은 역할 단위 의도는 새 바인딩으로 옮겨 갑니다.
-반면 인계 패키지처럼 특정 인스턴스(incarnation)를 겨냥한 메시지는 오래된 것으로 보고 거부합니다.
-진행 중인 인계를 다른 세션에 다시 보내면, 같은 인계를 서로 자기 것이라고 믿는 CTO가 둘 생기기 때문입니다.
-
-### 새 프로젝트: Repo Factory → genesis → 활성화
-
-Repo Factory는 별도 산출물이며, 두 번째 런타임 권한 주체가 되는 일은 없습니다.
-ACP는 부트스트랩 계약 가운데 자기 쪽만 구현합니다([ADR-0008](docs/adr/ADR-0008-repo-factory-integration-boundary.md)).
-
-1. **PLAN.**
-   Repo Factory가 인라인 genesis 번들(`acp.genesis-bundle.v1`)을 담은 PLAN을 컴파일합니다.
-   번들에는 SHA-256 다이제스트가 붙은 초기 파일, `main` / `dev` / `genesis` 브랜치 프로필, 라벨, 마일스톤, 이슈, 제품 의도가 들어 있습니다.
-   CI 워크플로는 genesis 파일의 다이제스트에 고정돼야 하고, 매니페스트는 실제 검증 명령을 선언해야 합니다.
-2. **첨부.**
-   CEO가 최종 바이트를 그대로 검토한 뒤 `bootstrap_plan_attach`와 `expectedSha256`으로 첨부합니다.
-   현재 `PRIMARY_CTO`는 그 전에 `bootstrap_plan_stage`로 권한 없는 후보를 올려 둘 수 있습니다.
-   첨부는 입력을 전달할 뿐이며, 승인도 실행 권한도 만들지 않습니다.
-3. **제출.**
-   `BOOTSTRAP_CTO`가 저장된 바이트를 읽고(`bootstrap_plan_get`) 다이제스트로 제출합니다(`plan_submit`).
-   ACP는 단계마다 바이트 단위 해시와 바인딩 맥락을 다시 확인합니다.
-4. **리뷰와 genesis.**
-   부트스트랩 후보는 독립 블라인드 리뷰, 오너 승인, genesis 풀 리퀘스트, 정확한 head에 대한 CI 게이트를 거칩니다.
-   매니페스트가 `commitlore.mode: required`를 지정하면 생산자가 새 저장소에서 버전이 고정된 CommitLore CLI를 실행하고(`init` 다음 `doctor`), 관측에 실패하면 게이트를 거부합니다.
-5. **활성화.**
-   `PROJECT_BOOTSTRAP` run을 완료할 수 있는 것은 ACP의 활성화 결과뿐입니다.
-   여기에는 프로젝트 등록, 로컬 바인딩, 주 CTO 바인딩, Buzz, 인계 ACK, doctor가 포함됩니다.
-   CEO의 `CONFIRM`은 저장된 활성화 결과 다음에 옵니다.
-   활성화 사실을 스스로 주장하는 Repo Factory 결과는 거부됩니다(`BOOTSTRAP_RESULT_OVERCLAIMS_ACTIVATION`).
-   프로젝트의 `PRIMARY_CTO`는 언제나 활성화 시점에 새로 바인딩되는 세션이며, 구조화된 인계를 확인(ACK)해야 합니다.
-
-교체 절차와 크기 제한을 포함한 운영자용 단계별 흐름은 [운영 문서](docs/OPERATIONS.md#supplying-a-compiled-bootstrap-plan)에 있습니다.
-
-## 주요 기능
-
-| 기능 | 하는 일 | 위치 |
-|---|---|---|
-| **Run 엔진** | run, 태스크 그래프, 소유자 고정, 데이터베이스가 강제하는 상태 기계 | [`src/run`](src/run), [`src/db`](src/db) |
-| **역할 바인딩과 펜싱** | 단조 증가하는 바인딩 세대. 페일오버는 활성화·전환·취소·재지정을 한 트랜잭션으로 처리 | [`src/session`](src/session), [ADR-0003](docs/adr/ADR-0003-role-binding-generation-and-fencing.md) |
-| **outbox, 깨우기, ACK** | 세대 펜스를 둔 역할 보유자 대상 영속 전달. 대기 중인 in-band 행은 다시 깨움 | [`src/outbox`](src/outbox) |
-| **관리형 쓰기 가드** | 브랜치·워크트리·경로에 대한 리소스 claim과 리스. 허가는 부작용 직전에 소비 | [`src/guard`](src/guard), [`src/claims`](src/claims) |
-| **검증 엔진** | 계약에 고정된 명령을 seatbelt 샌드박스에서 실행. 증거 모드는 `LOCAL_COMMAND`, `TRUSTED_CI`, `BOTH_REQUIRED` | [`src/verify`](src/verify), [ADR-0004](docs/adr/ADR-0004-verification-sandbox-isolation.md) |
-| **블라인드 리뷰 게이트** | 패킷만 받는 자동 리뷰어. 독립성과 커버리지를 기계적으로 확인하고, 이그레스는 프로바이더로만 제한 | [`src/review`](src/review), [리뷰어 이그레스](docs/reviewer-egress.md) |
-| **GitHub 커널** | 풀 리퀘스트 준비, `acp-production-gate` 게시, 머지, 머지 후 검증, 브랜치 게시, 릴리스 태그. 모두 멱등 receipt로 기록 | [`src/github`](src/github), [ADR-0005](docs/adr/ADR-0005-trusted-github-credential-and-gate-provenance.md) |
-| **프로바이더 용량과 연속성** | 프로바이더마다 서로 독립된 신호 세 개, 계획을 먼저 세우는 페일오버, 진행 중인 작업을 선점하지 않는 복원 | [`src/capacity`](src/capacity), [`src/continuity`](src/continuity), [ADR-0007](docs/adr/ADR-0007-provider-capacity-and-continuity.md) |
-| **오너 인그레스** | `IngressGuard`가 Telegram과 Buzz에서 선언된 오너와 행위자만 받아들이고 재전송을 차단 | [`src/ingress`](src/ingress), [ADR-0009](docs/adr/ADR-0009-owner-ingress-is-the-front-door.md) |
-| **Buzz 어댑터** | `buzz` CLI를 거쳐 Nostr 릴레이 전송으로 펜스가 걸린 봉투를 보내고, 인증된 멘션 구독자를 운영 | [`src/buzz`](src/buzz) |
-| **부트스트랩 활성화** | Repo Factory PLAN 접수, genesis 번들 검사, CommitLore 관측, 활성화, 상주 CTO 인계 | [`src/bootstrap`](src/bootstrap) |
-| **Doctor와 복구** | 심각도와 `blocking` 여부가 붙은 읽기 전용 점검 결과, 허용 목록에 있는 복구 작업 | [`src/doctor`](src/doctor) |
-| **증거 내보내기** | 필드를 통째로 가리는 정규 run·baseline 번들. 번들을 만든 데이터베이스와 대조해 검증 | [`src/export`](src/export), [run 증거 내보내기](docs/run-evidence-export.md) |
-| **롤백 페어** | 데이터베이스, 런타임 클로저, launchd 서비스를 묶어 봉인하고 다이제스트로 색인한 세대. 한 단위로 복원 | [`src/deploy`](src/deploy), [`deploy/`](deploy/README.md) |
-
-### MCP 인터페이스
-
-데몬은 상태 디렉터리 안의 오너 전용 Unix 소켓으로 MCP 서버 두 개를 제공하고, `agentctl`을 위한 운영자 소켓을 따로 둡니다.
-
-- **CEO 서버** (`hermes.mcp.sock`) — `run_create`, `run_dispatch`, `run_get`, `run_cancel`,
-  `run_priority_set`, `project_get`, `cto_start`, `cto_replace`, `cto_suspend`, `cto_resume`,
-  `bootstrap_plan_attach`, `bootstrap_review_evidence_attach`, `bootstrap_review_resume`,
-  `ceo_decision_submit`, `escalation_resolve`, `owner_decision_submit`, `repair_execute`,
-  `doctor_run`, `continuity_status`, `ceo_notification_ack`, 그리고 데몬이 등록하는
-  `cto_binding_bind`, `cto_binding_release`.
-- **CTO 서버** (`cto.mcp.sock`) — `session_attest`, `contract_get`, `plan_submit`,
-  `bootstrap_plan_stage`, `bootstrap_plan_get`, `bootstrap_review_evidence_stage`,
-  `resource_claim`, `resource_release`, `task_worker_provision`, `task_worker_run`,
-  `task_execution_get`, `task_receipt_submit`, `result_submit`, `escalation_open`,
-  `handoff_submit`, `handoff_ack`, `run_ack`, `role_dispatch_pending`, `role_dispatch_ack`,
-  `capacity_get`, `doctor_run`, `blind_review_request`.
-  마지막 `blind_review_request`는 거부하기 위해서만 존재합니다. 블라인드 리뷰는 control plane이 호출하기 때문입니다.
-  입장이 허용된 `PRIMARY_CTO` 연결에는 `role_wake_endpoint_register`와 `role_owner_message_*` 도구가 추가됩니다.
-
-## 하드 불변식
-
-이 불변식들은 선택 가능한 정책이 아니라 제품 그 자체입니다.
-규범 원문은 PRD §4에 있습니다.
-
-| 불변식 | 지켜야 하는 것 |
+| 역할 | 책임 |
 |---|---|
-| CP-HI-01 — 관리형 쓰기 가드 (Managed Write Guard) | ACP가 소유한 매니페스트 활성화, 워크트리 수명 주기, GitHub 쓰기는 가드를 거칩니다. 에이전트의 소스 쓰기는 배정된 일회용 워크트리, 유효한 claim, 세션·태스크 receipt, 런타임 어댑터의 범위 안으로 제한됩니다(개별 파일 시스템 콜이 모두 가드 API 호출인 것은 아닙니다). |
-| CP-HI-02 — 단일 런타임 권한 (Single Runtime Authority) | 프로젝트 행위자는 혼자서 run을 완료하거나, 권위 있는 게이트를 게시하거나, 머지할 수 없습니다. |
-| CP-HI-03 — 후보·계약 고정 (Candidate Contract Pinning) | 검증은 바뀔 수 있는 대체물이 아니라 승인된 계약 다이제스트와 동결된 후보에 묶입니다. |
-| CP-HI-04 — 독립 품질 역할 (Independent Quality Role) | 블라인드 리뷰어는 같은 run의 생산자가 될 수 없고, 최종 CEO 역할은 따로 둡니다. |
-| CP-HI-05 — 신뢰된 GitHub 자격 증명 (Trusted GitHub Credential) | 프로덕션 게이트와 프로그램 머지에 쓰는 자격 증명에는 데몬만 접근할 수 있습니다. |
-| CP-HI-06 — 정확한 증거 (Exact Evidence) | 검증·리뷰·게이트·머지 증거는 모두 정확히 같은 후보 스냅샷에 묶이며, 소스가 바뀌면 효력을 잃습니다. |
-| CP-HI-07 — 위임할 수 없는 사람의 역할 (Non-delegable Human Role) | 프로바이더 페일오버가 오너 권한을 만들어 내지 않습니다. |
-| CP-HI-08 — 조용한 품질 저하 금지 (No Silent Degradation) | 누락됐거나, 오래됐거나, 불완전하거나, 실패했거나, 격리되지 않은 증거는 PASS로 보여서는 안 됩니다. |
+| `CEO` | run을 만들고 디스패치하며, CTO 에스컬레이션을 해결하고 최종 결정을 내림 |
+| `PRIMARY_CTO` (프로젝트당 1개) | 탐색, 계획과 태스크 그래프, 워커 배정, 통합, CTO 최종 승인 |
+| `BOOTSTRAP_CTO` (run당 1개) | `PROJECT_BOOTSTRAP` run을 계획부터 활성화까지 진행 |
+| `WORKER` (태스크당 1개) | 일회용 worktree에서 살아 있는 claim 아래 범위가 정해진 태스크 하나를 수행 |
+| `BLIND_REVIEWER` (run당 1개) | 새로 만든 격리 세션이 패킷만 보고 수행하는 리뷰. 같은 run의 생산자가 될 수 없음 |
+| `OPTIONAL_ADVERSARIAL_REVIEWER` | 선택적인 비블라인드 리뷰 |
 
-각 불변식은 위반을 실제로 볼 수 있는 가장 낮은 계층, 즉 타입이 있는 코드와 데이터베이스 제약에서 강제합니다.
-정책 엔진에는 맡기지 않습니다([ADR-0002](docs/adr/ADR-0002-invariants-as-types-and-constraints.md)).
+오너는 역할이 아닙니다. 오너의 결정은 인증된 ingress로 들어오며, 프로바이더 failover가 오너 권한을 만들어 내는 일은 없습니다.
 
-## 빠른 시작
+### run에서 머지까지
 
-아래는 개발용 절차이며, 프로덕션 설치 방법이 아닙니다.
+1. CEO가 run을 만들고(`run_create`) 디스패치합니다(`run_dispatch`). run의 실행 모드는 `SIMPLE`, `STANDARD`, `GUARDED` 중 하나입니다.
+2. CTO가 계획을 제출합니다(`plan_submit`). 워커는 리소스 claim 아래 일회용 worktree에서 작업합니다.
+3. 후보가 동결됩니다. 검증 명령은 그 스냅샷과 승인된 계약 digest를 대상으로 seatbelt 샌드박스에서 실행됩니다.
+4. 검증이 통과하면 컨트롤 플레인이 직접 블라인드 리뷰를 시작합니다. CTO나 CEO가 이를 요청하거나 건너뛸 수 있는 오퍼레이션은 없습니다.
+5. CTO의 최종 승인이 있고 blocker 발견 사항이 없으면 데몬이 production-ready 패킷을 만듭니다. CEO가 `CONFIRM`하면 데몬이 `acp-production-gate`를 게시하고 머지한 뒤 머지 후 검증을 실행합니다.
 
-**요구 사항.** macOS가 필요합니다.
-검증 샌드박스와 리뷰어 샌드박스가 `sandbox-exec` seatbelt 프로필을 쓰고, CI의 `verify` 잡도 `macos-15`에서 돕니다.
-Node는 [패키지 메타데이터](package.json)에 선언된 `^22.18.0 || >=24`를 쓰며, CI는 배포 런타임인 `22.23.2`로 돌립니다.
-`pnpm`도 필요합니다.
+역할 보유자에게 가는 전달은 내구성이 있습니다. outbox 행을 쓰고, payload 없는 wake를 보내고, 보유자가 자신의 인증된 MCP 연결로 확인 응답(ACK)을 보냅니다. 모든 메시지에는 역할의 바인딩 세대(binding generation)가 실려 있어서, 교체된 세션의 뒤늦은 트래픽은 감사 기록에 남고 폐기됩니다 ([ADR-0003](docs/adr/ADR-0003-role-binding-generation-and-fencing.md)).
+
+```mermaid
+stateDiagram-v2
+  [*] --> QUEUED: run_create
+  QUEUED --> ACTIVE: run_dispatch
+  ACTIVE --> READY_FOR_CEO_REVIEW: 패킷 생성
+  ACTIVE --> BLOCKED: 에스컬레이션이 임계 경로를 막음
+  BLOCKED --> ACTIVE: 에스컬레이션 해결
+  ACTIVE --> AWAITING_HUMAN: 오너 입력 필요
+  AWAITING_HUMAN --> ACTIVE: 오너 결정 충족
+  READY_FOR_CEO_REVIEW --> CEO_APPROVED: CONFIRM
+  READY_FOR_CEO_REVIEW --> REVISION_REQUIRED: FINAL_REVISE
+  READY_FOR_CEO_REVIEW --> AWAITING_HUMAN: OWNER_DECISION_REQUIRED
+  REVISION_REQUIRED --> ACTIVE: CTO에게 반환
+  CEO_APPROVED --> MERGING: finalizer
+  MERGING --> POST_MERGE_VERIFYING: 머지됨
+  POST_MERGE_VERIFYING --> COMPLETED: 머지 후 검증 통과
+  MERGING --> BLOCKED_POST_MERGE: 부분 실패
+  POST_MERGE_VERIFYING --> BLOCKED_POST_MERGE: 부분 실패
+  BLOCKED_POST_MERGE --> POST_MERGE_VERIFYING: 재시도
+  ACTIVE --> FAILED: 복구 불가
+  ACTIVE --> CANCELLED: run_cancel
+  COMPLETED --> [*]
+```
+
+run은 `QUEUED`, `ACTIVE`, `BLOCKED`, `READY_FOR_CEO_REVIEW`, `CEO_APPROVED`, `MERGING`, `POST_MERGE_VERIFYING`, `BLOCKED_POST_MERGE`, `REVISION_REQUIRED`, `AWAITING_HUMAN`, `COMPLETED`, `FAILED`, `CANCELLED`의 13개 상태를 거칩니다. 그림에서는 덜 일반적인 전이(대부분의 상태에서의 취소, 다음 저장소를 위해 `POST_MERGE_VERIFYING`에서 `MERGING`으로 돌아가는 전이 등)를 생략했습니다. `PROJECT_BOOTSTRAP` run은 `CONFIRM` 시 `READY_FOR_CEO_REVIEW`에서 곧바로 `COMPLETED`가 됩니다.
+
+run 상태와 허용되는 전이는 [`src/db/schema.sql`](src/db/schema.sql)의 `CHECK` 제약과 트리거로 정의되어 있어서, 잘못된 전이는 데이터베이스가 거부합니다.
+
+### 후보 파이프라인
+
+```mermaid
+sequenceDiagram
+  participant CTO
+  participant P as 후보 파이프라인 (agentcpd)
+  participant V as 검증 엔진
+  participant R as 블라인드 리뷰어
+  participant G as Production gate
+  participant CEO
+  CTO->>P: result_submit
+  P->>P: 후보 스냅샷 동결
+  P->>V: 계약의 명령을 샌드박스에서 실행
+  alt 검증 실패
+    P-->>CTO: VERIFICATION_FAILED, run은 ACTIVE 유지
+  else 검증 통과
+    P->>R: diff가 크면 청크 리뷰어, 이어서 새 최종 리뷰어
+    alt REVISE, BLOCK 또는 누락 항목
+      P-->>CTO: REVISION_REQUIRED 단계, run은 ACTIVE 유지
+    else 격리 상실 또는 프로바이더 사용 불가
+      P-->>CTO: REVIEW_UNAVAILABLE, 수정 요청이 아님
+    else 리뷰 통과
+      P->>G: production-ready 패킷
+      G-->>CEO: READY_FOR_CEO_REVIEW
+      CEO->>G: ceo_decision_submit
+    end
+  end
+```
+
+반환된 수정 요청 뒤에는 CTO가 다시 제출합니다. 리뷰를 통과한 후보만 CEO에게 도달하며, CEO는 `CONFIRM`, `FINAL_REVISE`, `OWNER_DECISION_REQUIRED` 중 하나로 답합니다.
+
+### 하드 인바리언트
+
+| ID | 인바리언트 |
+|---|---|
+| CP-HI-01 | Managed Write Guard: ACP가 소유한 매니페스트, worktree, GitHub 쓰기는 가드를 거침 |
+| CP-HI-02 | Single Runtime Authority: 프로젝트 액터는 run을 완료하거나 게이트를 게시하거나 머지할 수 없음 |
+| CP-HI-03 | Candidate Contract Pinning: 검증은 승인된 계약 digest와 동결된 후보에 묶임 |
+| CP-HI-04 | Independent Quality Role: 블라인드 리뷰어는 같은 run의 생산자가 될 수 없음 |
+| CP-HI-05 | Trusted GitHub Credential: 게이트와 머지용 자격 증명에는 데몬만 접근 |
+| CP-HI-06 | Exact Evidence: 검증, 리뷰, 게이트, 머지 증거는 같은 후보 스냅샷에 묶임 |
+| CP-HI-07 | Non-delegable Human Role: 프로바이더 failover가 오너 권한을 만들어 내지 않음 |
+| CP-HI-08 | No Silent Degradation: 누락, 오래됨, 불완전, 격리 안 됨 상태의 증거는 통과로 표시되지 않음 |
+
+각 인바리언트는 위반을 볼 수 있는 가장 낮은 계층에서, 즉 타입이 있는 코드와 데이터베이스 제약으로 강제됩니다 ([ADR-0002](docs/adr/ADR-0002-invariants-as-types-and-constraints.md)). 규범 문서는 [컨트롤 플레인 PRD](docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md)입니다.
+
+## 요구 사항
+
+- macOS. 검증과 리뷰어 샌드박스는 `sandbox-exec` seatbelt 프로파일을 사용하며, CI의 주요 job은 `macos-15`에서 돌아갑니다.
+- Node `^22.18.0 || >=24` ([`package.json`](package.json)의 `engines`). CI는 `22.23.2`를 사용합니다.
+- [pnpm](https://pnpm.io/). 설치할 때 `postinstall`이 이 프로젝트의 네이티브 애드온도 빌드하므로([ADR-0010](docs/adr/ADR-0010-native-addon-build-and-load-convention.md)) C/C++ 툴체인이 필요합니다.
+
+## 설치와 빌드
 
 ```bash
 pnpm install
 pnpm rebuild better-sqlite3
 pnpm build
-pnpm test
-node scripts/ssot-report.mjs
 ```
 
-`pnpm install`은 이 프로젝트 자체의 `postinstall` 스크립트로 네이티브 애드온도 빌드합니다(`native/peercred`는 Darwin 전용이며, 다른 플랫폼에서는 아무것도 하지 않습니다).
-자세한 내용은 [ADR-0010](docs/adr/ADR-0010-native-addon-build-and-load-convention.md)을 참고하세요.
-`pnpm rebuild better-sqlite3`를 따로 명시적으로 실행하는 이유는, 그 의존성에 이 단계를 요구하는 pnpm 빌드 승인 게이트가 이 프로젝트 자체의 `postinstall`에는 적용되지 않기 때문입니다.
-pnpm은 프로젝트 자체의 `postinstall`을 항상 실행합니다.
+`pnpm rebuild better-sqlite3`는 pnpm의 빌드 승인 게이트가 이 의존성에 적용되기 때문에 따로 명시적으로 실행하는 단계입니다. 빌드 결과는 `dist/`에 생깁니다. 패키지는 `agentctl`, `agentcpd`, `agentcpd-state` 세 개의 bin을 제공합니다.
 
-푸시하기 전에는 CI가 돌리는 것을 그대로 돌려 보세요.
+## 빠른 시작
 
-```bash
-pnpm gates
-```
-
-이것이 CI `verify` 잡의 게이트 순서입니다.
-모든 검사를 정해진 순서대로 실행하고, 처음 실패한 곳에서 멈추며, 게이트마다 종료 코드를 출력합니다.
-순서는 [`scripts/lib/prepush-gates.mjs`](scripts/lib/prepush-gates.mjs)에 정의돼 있고, 워크플로도 같은 실행기를 호출합니다.
-여기 있는 게이트는 하나하나가 제품 결함을 막거나 커밋 기록을 온전히 지킵니다.
-
-### 프로젝트를 변경하지 않고 살펴보기
-
-빌드한 뒤 CLI 표면과 데몬 잠금 상태를 확인합니다.
+먼저 살펴보기만 하는 명령입니다. 데몬이 필요 없습니다.
 
 ```bash
 node dist/cli/agentctl.js help
 node dist/cli/agentctl.js daemon status
-node dist/cli/agentctl.js project register my-project /abs/path/to/checkout
-node dist/cli/agentctl.js doctor
 ```
 
-`daemon status`는 운영자 소켓으로 데몬에 묻습니다.
-여기에는 `ACP_OPERATOR_TOKEN`이 필요하며, 데몬이 응답하지 않거나 토큰이 없으면 로컬 잠금 파일을 대신 읽습니다.
+`ACP_OPERATOR_TOKEN`이 없으면 `daemon status`는 데몬의 락 파일을 읽는 방식으로 대체됩니다.
 
-### 일회용 포그라운드 데몬
-
-`agentcpd`는 MCP 토큰과 그와 다른 운영자 자격 증명이 없으면 시작하지 않으며, 두 값이 같아도 시작하지 않습니다.
+포그라운드 데몬을 실행하려면 `agentcpd`에 MCP 토큰과 서로 다른 operator 토큰이 필요합니다. 둘 중 하나라도 없거나 값이 같으면 시작을 거부합니다.
 
 ```bash
 export ACP_MCP_TOKEN="$(openssl rand -hex 32)"
@@ -303,218 +190,142 @@ export ACP_OPERATOR_TOKEN="$(openssl rand -hex 32)"
 node dist/daemon/agentcpd.js
 ```
 
-기본 상태 루트는 `~/.agent-control-plane`이며, SQLite 상태, 워크트리, 용량 기록, 비밀 디렉터리가 이곳에 있습니다.
-민감한 로컬 상태로 다루고, 프로젝트 체크아웃 안에 두거나 커밋하지 마세요.
-데몬은 오너, 프로바이더, Buzz, 인그레스 설정을 일부러 추측하지 않습니다.
-이 가운데 무엇이든 설정하기 전에 [운영 문서](docs/OPERATIONS.md)를 읽으세요.
+다른 셸에서 `ACP_OPERATOR_TOKEN`을 export한 뒤 `agentctl`을 사용합니다. 자주 쓰는 명령은 다음과 같습니다.
+
+| 명령 | 용도 |
+|---|---|
+| `agentctl doctor [scope] [target]` | 읽기 전용 상태 점검 |
+| `agentctl project register <name> <path>` | 프로젝트와 기본 저장소 등록 |
+| `agentctl project list` / `project retire <id> <reason>` | 프로젝트 조회 또는 폐기 |
+| `agentctl run list [state]` / `run show <runId>` | run 조회 |
+| `agentctl run cancel <runId> <reason>` | run과 그 태스크 그래프 취소 |
+| `agentctl run export <runId>` | 호스트에 앵커링된 run 증거 내보내기 |
+| `agentctl baseline export --from <ISO> --to <ISO>` | 기간별 증거 baseline 내보내기 |
+| `agentctl owner approve <runId> <item>` | 사람 게이트에 대한 오너 결정 기록 |
+| `agentctl capacity show` | 프로바이더 용량과 admission |
+| `agentctl continuity status` | continuity 모드와 역할 커버리지 |
+| `agentctl repair list` / `repair dry-run <op>` / `repair execute <op>` | 허용 목록에 있는 복구 작업 |
+| `agentctl daemon status` | 데몬 모드와 상태 |
+
+`node dist/cli/agentctl.js help`는 `binding`, `actor`, `conversation`, `canonical-cto`, `review-evidence` 그룹을 포함한 전체 목록을 출력합니다. `agentctl`은 클라이언트일 뿐입니다. 데이터베이스를 열지 않고 아무것도 결정하지 않으며, 변경 요청은 인증된 operator 소켓을 통해 데몬으로 전달됩니다.
+
+### CEO와 CTO를 위한 MCP 서버
+
+데몬은 상태 디렉터리 안의 오너 전용 Unix 소켓으로 MCP 서버 두 개를 제공합니다.
+
+- CEO 서버(`hermes.mcp.sock`): `run_create`, `run_dispatch`, `run_get`, `run_cancel`, `ceo_decision_submit`, `escalation_resolve`, `owner_decision_submit`, `doctor_run` 등
+- CTO 서버(`cto.mcp.sock`): `session_attest`, `contract_get`, `plan_submit`, `resource_claim`, `task_worker_provision`, `task_worker_run`, `task_receipt_submit`, `result_submit`, `escalation_open`, `handoff_submit`, `handoff_ack`, `run_ack`, `role_dispatch_pending`, `role_dispatch_ack`, `capacity_get`, `doctor_run` 등
+
+CTO 서버의 `blind_review_request`는 거부하기 위해서만 존재합니다. 블라인드 리뷰는 컨트롤 플레인이 시작합니다. wake를 받아야 하는 클라이언트는 `--messaging-socket-path`를 상태 디렉터리 바로 안의 소켓으로 지정해 실행합니다. 자세한 내용은 [운영 문서](docs/OPERATIONS.md#starting-a-client-that-can-receive-wakes)를 참고하세요.
+
+## 설정과 상태
+
+상태 루트의 기본값은 `~/.agent-control-plane`이며, `agentctl`은 `ACP_STATE_DIR`로 다른 위치를 지정하는 것을 지원합니다. 이 디렉터리에는 SQLite 데이터베이스(`state.sqlite`, WAL), `health.json`, MCP 소켓, worktree, 용량 기록, secrets 디렉터리가 들어 있습니다. 민감한 상태로 취급하세요. 디렉터리는 오너 전용(`0700`)이고 데이터베이스 파일은 `0600`이며, 프로젝트 체크아웃 안에 두거나 커밋해서는 안 됩니다.
+
+처음 만나게 될 환경 변수입니다.
+
+| 변수 | 의미 |
+|---|---|
+| `ACP_MCP_TOKEN` | 데몬 MCP 소켓용 자격 증명. `agentcpd`에 필수 |
+| `ACP_OPERATOR_TOKEN` | `agentctl`용 자격 증명. `agentcpd`에 필수이며 `ACP_MCP_TOKEN`과 달라야 함 |
+| `ACP_OPERATOR_ACTOR` | 호스트의 `USER`가 `owner-identities`에 선언된 액터와 다를 때 쓰는 운영자 신원 |
+| `ACP_STATE_DIR` | 상태 루트 재지정. `agentctl`이 읽음 |
+| `ACP_BUZZ_SEND_POLICY_FILE` | Buzz 전송 정책 파일의 절대 경로. launchd install과 upgrade에 필요 |
+
+데몬은 오너, 프로바이더, Buzz, Telegram, ingress 설정을 추측하지 않습니다. 선택적 연동은 [`deploy/README.md`](deploy/README.md)에 나열된 launchd Keychain 계정으로 설정합니다.
 
 ## 운영
 
-### launchd로 실행하기
-
-릴리스를 빌드하고, 두 자격 증명을 로그인한 사용자의 키체인에 넣은 뒤, 렌더링 설치 스크립트로 사용자 단위 작업을 설치합니다.
-모든 플래그와 거부 조건은 [`deploy/README.md`](deploy/README.md)에 있습니다.
+사용자별 launchd job으로 실행합니다.
 
 ```bash
 pnpm build
 security add-generic-password -U -s com.agentcontrolplane.agentcpd -a ACP_MCP_TOKEN -w
 security add-generic-password -U -s com.agentcontrolplane.agentcpd -a ACP_OPERATOR_TOKEN -w
-# install과 upgrade에는 Buzz wrapper가 실제로 평가하는 정책 파일의 절대 경로가 필요합니다.
 export ACP_BUZZ_SEND_POLICY_FILE=/absolute/path/to/buzz-send-policy.json
 deploy/install-launchd.sh install --app-root "$(pwd)" --node "$(command -v node)"
 ```
 
-두 토큰은 오너 전용 런처가 `agentcpd`를 시작하기 직전에만 꺼내 옵니다.
-plist에 저장되지 않고, 에이전트 세션에 상속되지도 않습니다.
-저장소에 들어 있는 plist 템플릿을 직접 로드하지 **마세요**.
-템플릿에는 아직 채워지지 않은 배포 값이 있고, 그 값은 `deploy/render-launchd-plist.mjs`가 호스트마다 채웁니다.
-렌더링한 설치본은 [#400](https://github.com/MongLong0214/agent-control-plane/issues/400)에서 실제 호스트로 검증됐습니다.
-특정 호스트의 실제 상태는 짐작하지 말고 `deploy/install-launchd.sh status`로 확인하세요.
+두 토큰은 Keychain에 두며, 오너 전용 런처가 `agentcpd`를 시작하기 직전에만 가져옵니다. 저장소에 포함된 plist 템플릿을 직접 로드하지 마세요. 설치 스크립트가 호스트별로 렌더링합니다.
 
 ```bash
 deploy/install-launchd.sh status
-deploy/install-launchd.sh restart        # 그 밖에: start, stop, uninstall
+deploy/install-launchd.sh restart        # 그 외: start, stop, uninstall
 deploy/install-launchd.sh upgrade --app-root /absolute/release --node /absolute/node
-```
-
-`start`와 `restart`는 이번 시작이 시작 완료 기록을 쓰고, launchd가 안정화 구간 동안 같은 실행 pid를 보고한 뒤에야 성공을 알립니다.
-`upgrade`는 렌더링된 plist와 런처를 저장해 두며, 데이터베이스는 순서가 정해진 스키마 단계를 실행하기 전에 일관된 마이그레이션 전 백업을 만듭니다.
-`uninstall`은 LaunchAgent plist와 런처만 지우고, 데이터베이스와 백업은 남겨 둡니다.
-
-### 봉인된 페어로 롤백하기
-
-롤백은 **봉인된 롤백 페어** 하나를 복원합니다.
-롤백 페어는 `~/.agent-control-plane/rollback-pairs/` 아래에 UUID 이름으로 만들어진 디렉터리입니다.
-여기에는 WAL까지 포함한 데이터베이스 백업, 그 데이터베이스를 읽는 런타임 클로저, 그 런타임을 시작하는 launchd 세대가 정확한 목록, 그리고 자기 자신은 제외한 `SHA256SUMS`와 함께 들어 있습니다.
-`latest`도 없고 따로 고른 백업도 없습니다.
-각각 따로 고른 두 반쪽은 페어가 아닙니다.
-
-```bash
-deploy/install-launchd.sh rollback --pair-id <uuid> \
-  --expected-index-digest sha256:<hex> \
+deploy/install-launchd.sh rollback --pair-id <uuid> --expected-index-digest sha256:<hex> \
   --expect-schema-version <n> --expect-service-generation <name> --expect-node-version <vX.Y.Z>
 ```
 
-`--expected-index-digest`는 페어 **바깥에** 보관해 둔 `SHA256(SHA256SUMS)`입니다.
-자기 색인을 스스로 보증하는 페어라면, 자신을 위조한 페어도 똑같이 쉽게 보증하기 때문입니다.
-페어는 `node dist/deploy/rollback-pair.js seal …`로 봉인하며, 전체 절차는 [오너 작업 문서](docs/ops/owner-actions.md)에 있습니다.
+upgrade는 스키마 마이그레이션 전에 일관된 데이터베이스 백업을 만듭니다. rollback은 봉인된 pair(데이터베이스 백업, 런타임 클로저, launchd 세대)를 하나의 단위로 복원하며, "latest"나 따로 고른 백업은 없습니다. 모든 플래그와 거부 조건은 [`deploy/README.md`](deploy/README.md)에, 오너만 할 수 있는 단계는 [오너 액션](docs/ops/owner-actions.md)에 있습니다.
 
-### 상태와 증거 확인하기
-
-`agentctl doctor`는 운영자 소켓으로 실행 중인 데몬에 보고서를 요청하며, 여기에는 `ACP_OPERATOR_TOKEN`이 필요합니다.
-데몬은 doctor 점검을 할 때마다 감사 로그에도 남기므로, 데몬에 묻지 않고도 최신 보고서를 읽을 수 있습니다.
-보고서에는 `status`와, 발견 사항마다 붙은 `severity` 및 `blocking` 여부가 들어 있습니다.
-
-```bash
-sqlite3 ~/.agent-control-plane/state.sqlite \
-  "select at, evidence_json from audit_events where kind='DOCTOR_REPORT' order by at desc limit 1;"
-```
-
-원본 데이터베이스를 건드리지 않고 증거를 내보낼 수 있습니다.
-
-```bash
-node dist/cli/agentctl.js run export <runId>
-node dist/cli/agentctl.js baseline export --from <ISO-8601> --to <ISO-8601>
-```
-
-번들은 재현할 수는 있지만 스스로를 증명하지는 못합니다.
-권위 있는 검증에는 번들을 만든 호스트의 데이터베이스가 필요합니다([run 증거 내보내기](docs/run-evidence-export.md)).
-
-### 권한 경계
-
-권위 있는 상태 변경, 프로덕션 게이트 게시, 프로그램 머지는 `agentcpd`가 맡습니다.
-`agentctl`은 클라이언트일 뿐입니다.
-자체 데이터베이스를 열지도, 자체 control plane을 만들지도 않으며, 변경 요청은 인증된 운영자 소켓을 거쳐 잠금을 쥔 데몬에 전달됩니다([#393](https://github.com/MongLong0214/agent-control-plane/issues/393)).
-도구와 모델 세션은 요청과 증거를 낼 뿐, 작업이 끝났다고 결정하지 않습니다.
+상태 확인은 `agentctl doctor`를 실행하거나 데몬이 감사 로그에 남긴 최신 리포트를 읽으면 됩니다. 방법은 [운영 문서](docs/OPERATIONS.md#reading-the-doctors-findings)에 있습니다. 컴파일된 프로젝트 bootstrap 계획을 전달하는 절차는 [운영 문서](docs/OPERATIONS.md#supplying-a-compiled-bootstrap-plan)를 참고하세요.
 
 ## 보안 모델
 
-| 경계 | 지키는 방법 |
-|---|---|
-| **자격 증명** | GitHub 권한 자격 증명은 어느 프로젝트 저장소에도 속하지 않는 로컬 비밀 저장소에 있고, 데몬만 읽습니다. CTO, 워커, 리뷰어, 검증 하위 프로세스, Repo Factory, Buzz·Telegram 어댑터의 환경에는 절대 들어가지 않습니다. `ACP_MCP_TOKEN`과 `ACP_OPERATOR_TOKEN`은 서로 다른 값이며, 키체인에 보관하고 plist에는 저장하지 않습니다. |
-| **로컬 표면** | MCP 소켓과 운영자 소켓은 오너 전용(`0700`) 상태 디렉터리에 있고, 데이터베이스 파일 권한은 `0600`입니다. |
-| **검증** | 언어 제한이 없습니다. 고정된 매니페스트가 선언한 명령만, 샌드박스 밖에서 확인한 절대 경로로, 일회용 워크트리에서 실행합니다. 환경은 상속하지 않고 새로 구성하며 토큰이나 에이전트 소켓 포인터를 담지 않습니다. `HOME`은 데몬의 홈, `TMPDIR`은 scratch입니다. seatbelt 프로필은 읽기를 열고, 외부 네트워크와 로컬 IPC는 `network: "allow"`를 선언한 명령에만 엽니다(기본값 `"deny"`는 IP 네트워크, 워크트리·scratch 밖의 모든 유닉스 소켓, launchd 작업 생성과 LaunchServices 조회를 막으므로 내려받을 수 없습니다. Apple 이벤트와 그 밖의 XPC 서비스는 보장 범위가 아닙니다). 쓰기는 워크트리·`TMPDIR`·지정된 툴체인 캐시로 제한하며, 지정된 비밀 경로의 읽기·쓰기·소켓 접근을 막습니다(최선의 노력이며 완전한 차단은 아닙니다). pid와 시작 시각으로 프로세스 신원을 잡아 둔 채 시간·RSS·출력에 한도를 둡니다. 가둘 수단이 없으면 명령을 실행하지 않습니다. |
-| **블라인드 리뷰어** | 조합된 seatbelt 프로필이 루프백 CONNECT 프록시 포트 하나만 남기고 원격 TCP·UDP를 모두 막습니다. 호출마다 선택된 프로바이더의 엔드포인트만 담은 허용 목록을 새로 만듭니다. 리뷰어가 증명(attest)하기 전에 허용·거부·직접 소켓 프로브를 실행하며, 하나라도 실패하면 `ISOLATION_LOST`입니다. |
-| **머지 게이트** | `merge_evaluate`는 게이트가 신뢰된 신원으로 만들어졌고, 페이로드 다이제스트가 로컬에 기록된 게시 내용과 일치하며, head가 머지하려는 정확한 head와 같을 때만 받아들입니다. 브랜치 보호는 심층 방어입니다. |
-| **인그레스** | 오너의 결정과 행위자 메시지는 `IngressGuard`가 선언된 신원과 대조해 받아들이며, 들어오는 메시지에는 재전송 방지가 걸려 있습니다. |
+- **자격 증명.** GitHub 권한 자격 증명은 모든 프로젝트 저장소 밖의 로컬 시크릿 저장소에 있고 데몬만 읽습니다. CTO, 워커, 리뷰어, 검증 서브프로세스의 환경에는 절대 들어가지 않습니다. MCP 토큰과 operator 토큰은 서로 다르며 plist에 저장되지 않습니다.
+- **검증 샌드박스.** 고정된 매니페스트에 선언된 명령만 일회용 worktree에서, 새로 구성한 환경과 시간, 메모리, 출력 제한 아래 실행됩니다. seatbelt 프로파일이 쓰기를 제한하고 기본적으로 네트워크를 막습니다. 격리를 적용할 수 없으면 명령은 실행되지 않습니다 ([ADR-0004](docs/adr/ADR-0004-verification-sandbox-isolation.md)).
+- **블라인드 리뷰어.** 리뷰는 패킷만 사용하며, 네트워크 egress는 루프백 프록시를 통해 선택된 프로바이더로만 제한됩니다. 격리 프로브가 실패하면 `ISOLATION_LOST`입니다 ([리뷰어 egress](docs/reviewer-egress.md)).
+- **머지 게이트.** 게이트는 이름이 아니라 생성자 신원, payload digest, 정확한 head로 신뢰합니다 ([ADR-0005](docs/adr/ADR-0005-trusted-github-credential-and-gate-provenance.md)).
+- **로컬 인터페이스와 ingress.** 소켓은 오너 전용 디렉터리에 있습니다. 오너와 액터의 메시지는 `IngressGuard`가 선언된 신원과 대조해 받아들이며, 재전송 방지가 적용됩니다 ([ADR-0009](docs/adr/ADR-0009-owner-ingress-is-the-front-door.md)).
 
-검증 명령에는 실행 파일 허용 목록이 없습니다(2026-10-31 오너 지시). argv[0]에는 어떤 실행 파일이든 올 수 있습니다. 선언된 명령은 어느 것이든 시작한 뒤 셸을 실행할 수 있어서, 목록은 원래 경계가 아니었습니다.
-실제 경계는 seatbelt와 리소스 샌드박스이며, 셸 내부 회귀 증명은 [`tests/unit/handoff-p1-boundaries.test.ts`](tests/unit/handoff-p1-boundaries.test.ts), 비밀 경로 가드의 증명은 [`tests/unit/the-verification-sandbox-opens-to-every-language.test.ts`](tests/unit/the-verification-sandbox-opens-to-every-language.test.ts)에 있습니다.
-샌드박스의 읽기 제한은 화이트리스트가 아니라 지정된 비밀 경로의 거부 목록이며([설계 결정](docs/design-decisions.md)), 최선의 노력입니다. 목록 밖에 둔 자격 증명은 읽힙니다([ADR-0004](docs/adr/ADR-0004-verification-sandbox-isolation.md)).
+명시된 잔여 위험과 비공개 취약점 신고 방법은 [docs/SECURITY.md](docs/SECURITY.md)에 있습니다.
 
-**명시된 잔여 위험** ([SECURITY.md](docs/SECURITY.md), [STATUS.md](docs/STATUS.md)):
+## 알려진 한계
 
-- 데이터베이스 쓰기 가드는 협조하는 프로세스를 전제로 합니다.
-  같은 OS 사용자로 코드를 실행하는 프로세스는 상태 데이터베이스를 열어 가드 함수를 지우거나 흉내 낼 수 있습니다.
-  `0600` 권한은 다른 사용자를 막아 주지만, SQLite 안에는 소유 사용자를 막는 장치가 없습니다.
-- 강제 동작은 Darwin에서만 실제 동작으로 검증됐습니다.
-  Linux 하드 메모리 경로는 이 저장소의 CI에서 한 번도 실행된 적이 없습니다.
-- 하위 프로세스 격리에는 관측 창이 있습니다.
-  그 창 안에서 생성되고 부모가 바뀐 자식 프로세스는 보이지 않습니다.
-  이는 한계로 받아들여졌고, 이를 검사하던 테스트는 건너뜁니다([#461](https://github.com/MongLong0214/agent-control-plane/issues/461)).
-- 신뢰할 수 없는 저장소나 무인 배포를 위한 완전한 보안 경계로 이 저장소에 기대지 마세요.
+- macOS 전용: 샌드박스 강제는 seatbelt 기반이며 Darwin에서만 동작이 검증되었습니다.
+- 한 호스트에 로컬 데몬 하나와 SQLite 데이터베이스 하나. HTTP, REST, 웹 인터페이스는 없습니다.
+- 데이터베이스 쓰기 가드는 협조적인 프로세스를 전제로 합니다. 같은 OS 사용자로 코드를 실행하는 프로세스는 상태 데이터베이스를 열 수 있습니다.
+- 검증 샌드박스의 시크릿 경로 보호는 이름이 지정된 거부 목록이며 최선의 노력(best-effort) 수준입니다. 신뢰할 수 없는 저장소를 위한 경계가 아닙니다.
+- `acp-production-gate`를 게시하려면 `checks:write` 권한이 있는 GitHub App 설치가 필요합니다. 개인 액세스 토큰으로는 check run을 만들 수 없습니다.
+- 라이선스는 부여되지 않았습니다. [라이선스](#라이선스)를 참고하세요.
 
-취약점은 비공개로 알려 주세요. 자세한 방법은 [보안 제보 안내](docs/SECURITY.md)에 있습니다.
-공개 이슈에 자격 증명, 비공개 저장소 자료, 실제로 동작하는 공격 방법을 올리지 마세요.
-
-## 현재 한계와 증거
-
-관측되지 않은 경로에 대해서는 실환경 인수를 주장하지 않습니다.
-닫힌 선행 이슈는 실환경 관측이 아닙니다. [`evidence/`](evidence/)에 있는 기록만 관측으로 칩니다.
-
-- **실환경 기록 있음:** GitHub App 게이트 게시, 데몬 finalizer의 머지, 정확한 머지 후 검증([기록](evidence/p0-14-live-gate-merge-postmerge.json)).
-  그리고 실제 GitHub 상태를 읽어 신뢰할 수 없는 동명 게이트, 누락된 게이트, 오래된 게이트를 거부한 기록([기록](evidence/p0-14-live-gate-refusals.json)).
-  프로덕션 게이트를 게시하려면 GitHub App이 필요합니다.
-  GitHub는 개인 액세스 토큰으로 체크 런을 만들 수 없게 하므로, `acp-production-gate`에는 `checks:write` 권한을 가진 설치가 필요합니다.
-- **수동 실행 기록 있음:** 실제로 복제한 저장소와 실환경 어댑터로 돌린 SIMPLE, STANDARD, GUARDED run(`evidence/e2e-real-project*.json`).
-  이 run을 구동하는 테스트는 기본적으로 꺼져 있어서(`ACP_COMPONENT_INTEGRATION=1`), 이 경로의 회귀는 CI가 잡지 못합니다.
-- **`PARTIAL`로 기록:** 설치된 `buzz` CLI와 배포의 인그레스 정책을 거쳐 프로덕션 릴레이로 수행한 Buzz 전달과 확인 응답.
-  다만 배포된 데몬이 아니라 메모리 안의 control plane에서 실행했기 때문에, 그 doctor 결과는 호스트가 아니라 해당 테스트 픽스처를 설명합니다([기록](evidence/p0-09-buzz-live-delivery.json)).
-- **기록 없음:** [1.0.0 변경 이력](CHANGELOG.md)은 그 릴리스가 아직 하지 못한 일을 적어 두었습니다.
-  실제 저장소 두 곳에 대한 머지 순서, 프로젝트 3개·수명 주기 30회의 관측 창, Telegram 실환경 왕복입니다.
-  이 가운데 어느 것도 `evidence/`에 기록이 없습니다.
-- **리뷰어 이그레스:** 패킷만 보는 블라인드 리뷰어에는 측정을 거쳤고 실패하면 닫히는 프로바이더 프록시 경계가 있습니다.
-  다만 배포 수준의 증거 요구는 아직 남아 있다고 [SECURITY.md](docs/SECURITY.md)에 기록돼 있습니다([리뷰어 이그레스](docs/reviewer-egress.md)).
-- **검증 입력:** 새 워크트리에는 커밋된 파일만 있습니다. `node_modules`도 빌드 결과물도 없습니다.
-  `network: "allow"`를 선언한 명령은 의존성 조회와 다운로드를 위해 네트워크가 열려 있고 `HOME` 아래 지정된 툴체인 캐시에 쓸 수 있으므로, 필요한 것을 직접 설치할 수 있습니다. 기본값 `network: "deny"`인 명령은 아무것도 내려받을 수 없습니다. 내려받을 필요가 없는 길은 의존성 없는 검증 명령(이 저장소의 `scripts/verify-reason-codes.mjs`가 그런 예입니다)이나, 승인된 워크플로 다이제스트에서 나온 CI 결과를 정확한 후보 head에서만 받아들이는 `evidenceMode: "TRUSTED_CI"`입니다.
-  프로젝트 매니페스트에서 `network: "allowlist"`는 여전히 지원하지 않습니다.
-- **백로그(아직 출시 전):** 신뢰할 수 없는 저장소를 위한 강한 격리, 웹 대시보드, REST/GraphQL, 자동 Level 6 라우팅 승격(PRD §43).
-
-각 실환경 기록은 캡처 당시의 트리를 설명하며, 지금의 트리와 같다는 보장은 없습니다.
-경계 지도는 [현재 상태](docs/STATUS.md)에, 의존 순서와 최종 프로그램 게이트는 [로드맵](docs/ROADMAP.md)에 있습니다.
-
-### 영속성과 용량
-
-상태는 WAL과 `synchronous=FULL`로 연 SQLite 데이터베이스 하나에 있으며, 명시적인 `BEGIN IMMEDIATE` 트랜잭션 안에서 동기적으로 접근합니다.
-PRD §30.1에 이름이 나온 테이블 외의 테이블은 모두, §40이 요구하는 대로 그 테이블이 필요한 이유(수명 주기, 무결성 제약, 쿼리)를 [`src/db/schema.sql`](src/db/schema.sql) 안에 적어 둡니다.
-한 번 작성한 마이그레이션은 바뀌지 않으며, 바뀌면 `pnpm migrations:check`가 실패합니다.
-이벤트 소싱, 감사 해시 체인, 범용 정책 DSL, 분산 합의, 클라우드 데이터베이스는 모두 의도적으로 두지 않았습니다(§30.4).
-
-용량은 각 프로바이더 CLI의 대화형 `/usage` 화면으로 수집합니다.
-수집기는 남은 할당량이 명시된 값만 받아들이며, 신뢰 확인 프롬프트, 활동량만 담긴 출력, 타임아웃, 파서 실패에서는 실패로 닫힙니다.
-데몬의 JSON 미러는 운영자 입력이 아닙니다.
-`UNKNOWN` 경로는 없습니다. 자세한 내용은 [프로바이더 용량 출처](docs/capacity-source.md)를 참고하세요.
-
-## 남은 작업은 어디에 있나
-
-GitHub 이슈 트래커가 단일 진실 공급원입니다.
-독립 리뷰 라운드에서 나온 모든 발견 사항, 빌드만으로는 충족할 수 없는 모든 PRD §42 인수 항목, 모든 배포 선행 조건, 모든 의도적 트레이드오프가 이슈로 관리됩니다.
-[트래커 색인](https://github.com/MongLong0214/agent-control-plane/issues/306)과 [열린 이슈](https://github.com/MongLong0214/agent-control-plane/issues?q=is%3Aissue%20state%3Aopen)에서 시작하세요.
-이 페이지는 트래커의 개수나 상태를 옮겨 적지 않습니다.
-`node scripts/ssot-report.mjs`는 트래커를 리뷰 증거, 선언된 작업 항목과 대조해 빠진 것이 있으면 0이 아닌 코드로 종료합니다.
-이 스크립트가 확인하는 것은 트래커 연결이지, 코드 변경이 의미상 올바른지가 아닙니다.
-[인수 원장](docs/ACCEPTANCE.md)을 참고하세요.
-
-## 문서 안내
-
-| 문서 | 내용 |
-|---|---|
-| [현재 상태](docs/STATUS.md) | 아직 프로덕션 준비가 안 된 부분, 남은 실환경 작업, CI가 검증하지 않는 경로 |
-| [로드맵](docs/ROADMAP.md) | 의존 순서와 최종 프로그램 게이트 |
-| [운영](docs/OPERATIONS.md) | 로컬 빌드, 점검, 포그라운드 데몬, wake 소켓, 부트스트랩 PLAN 전달 |
-| [launchd 배포](deploy/README.md) | 설치, 업그레이드, 롤백 페어, 오프라인 프로젝트 중지 |
-| [오너 작업](docs/ops/owner-actions.md) | 오너가 직접 해야 하는 단계와, 그 직전까지 준비해 둔 절차 |
-| [보안](docs/SECURITY.md) | 보안 태세, 명시된 잔여 위험, 비공개 제보 |
-| [리뷰어 이그레스](docs/reviewer-egress.md) | 블라인드 리뷰어의 프로바이더 전용 네트워크 경계 |
-| [프로바이더 용량 출처](docs/capacity-source.md) | 용량 측정값이 라우팅에 쓰일 수 있게 되는 조건 |
-| [run 증거 내보내기](docs/run-evidence-export.md) | 번들 형식, 신뢰 기준점, 가리기 규칙 |
-| [CTO 바인딩 위임](docs/cto-binding-delegation.md) | 오너가 부여하는 프로젝트 범위의 `PRIMARY_CTO` 바인딩 권한 |
-| [설계 결정](docs/design-decisions.md) | 의도적 트레이드오프와 각각의 재검토 조건 |
-| [ADR](docs/adr/) | ADR-0001~ADR-0010: 런타임, 불변식, 펜싱, 샌드박스, 자격 증명, 리뷰, 용량, Repo Factory, 오너 인그레스, 네이티브 애드온 |
-| [PRD](docs/prd/) | control plane과 Repo Factory 통합의 규범 요구 사항 |
-| [종료 리뷰](docs/review/README.md) | 저장소에 함께 실린 독립 구현 리뷰 |
-| [인수 원장](docs/ACCEPTANCE.md) | PRD §42 대비 상태와 트래커 쿼리 |
-| [용어](docs/TERMINOLOGY.md) | 뜻이 엇갈리는 용어의 기준 정의 |
-| [티켓 DAG](docs/tickets/tickets.json) | 원자 단위 티켓과 마일스톤 |
-| [변경 이력](CHANGELOG.md) | 각 릴리스가 무엇인지, 그리고 아직 무엇을 하지 않는지 |
-
-## 기여하기
-
-먼저 [기여 안내](docs/CONTRIBUTING.md)를 읽으세요. 요약하면 다음과 같습니다.
+## 개발
 
 ```bash
-pnpm hooks:install   # 이 저장소의 훅을 .git/hooks에 연결
-pnpm hooks:check     # 각 훅이 명시한 경우를 실제로 거부하는지 확인
-pnpm gates           # CI verify 순서를 로컬에서 실행
+pnpm hooks:install   # 이 저장소의 git 훅 연결
+pnpm hooks:check     # 각 훅이 이름이 가리키는 경우를 실제로 거부하는지 확인
+pnpm gates           # CI 검증 순서를 로컬에서 실행
 ```
 
-- 변경은 추적 중인 발견 사항이나 문서화된 요구 사항에 연결하고, 그 변경으로 만들어지지 **않는** 실환경 증거가 무엇인지 밝혀 주세요.
-- 강제 장치를 추가하거나 고쳤다고 주장하는 변경에는 **뮤테이션 증명**이 따라야 합니다.
-  강제 장치를 지우고, 지목한 테스트가 밝힌 이유로 실패하는 것을 보인 뒤, 다시 되돌리세요.
-- 생성된 추적성 증거나 상태 개수를 손으로 고치지 마세요.
-  바뀌는 숫자를 적는 문서는 그 숫자를 명령, 쿼리, 생성된 산출물에서 가져와야 합니다.
-- 로컬 테스트, 픽스처, 모델링한 어댑터, 템플릿을 GitHub·Buzz·Telegram·launchd·프로바이더·오너의 실환경 증거처럼 내세우지 마세요.
-- 커밋 메시지에는 외부 작업 세션 페이지 링크를 넣을 수 없습니다. `commit-msg` 훅과 `pnpm trailers`가 이를 거부합니다.
-- 풀 리퀘스트는 `pnpm merge <number> --subject <text> --body-file <path>`([`scripts/merge-pr.mjs`](scripts/merge-pr.mjs))로 머지합니다.
-  이 스크립트는 정확한 head에서 필수 `verify` 실행 결과를 확인하고, 일반 merge commit으로만 머지한 뒤 부모·tree·브랜치 커밋의 CommitLore notes가 origin에 있는지 다시 읽어 확인합니다.
+개별 검사:
+
+| 스크립트 | 용도 |
+|---|---|
+| `pnpm test` | 전체 vitest 실행 (`test:unit`, `test:scenarios`, `test:e2e`는 일부만 실행) |
+| `pnpm typecheck` | `tsc --noEmit` |
+| `pnpm lint` | `eslint .` |
+| `pnpm ci:preflight` | 워크플로의 `pnpm` 명령이 존재하는지, `run:` 단계가 파싱되는지 확인 |
+| `pnpm reason-codes` | reason code는 외부 계약이므로 이름 변경이나 삭제를 거부 |
+| `pnpm migrations:check` | 한 번 작성된 데이터베이스 마이그레이션은 바뀌면 안 됨 |
+
+CI는 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)입니다. `gates` job이 `pnpm gates --no-tests`를 실행하고, 테스트 샤드가 `pnpm gates --tests-only`를 실행하며, 마지막 `verify` job이 이 모두의 성공을 요구합니다. 게이트 목록은 CI와 `pnpm gates`가 함께 쓰는 단일 매니페스트 [`scripts/lib/prepush-gates.mjs`](scripts/lib/prepush-gates.mjs)입니다.
+
+변경하기 전에 [CONTRIBUTING](docs/CONTRIBUTING.md)을 읽으세요. 강제 로직을 바꾸는 변경에는 그 강제를 제거하면 테스트가 실패한다는 증명을 붙이고, 픽스처나 로컬 테스트를 실제 GitHub, Buzz, Telegram, launchd, 프로바이더 증거로 제시하지 마세요. Pull request는 `pnpm merge <number> --subject <text> --body-file <path>`로 머지합니다.
+
+## 프로젝트 구조
+
+| 경로 | 내용 |
+|---|---|
+| `src/cli` | `agentctl`과 attach relay |
+| `src/daemon` | `agentcpd`와 단일 인스턴스 락 |
+| `src/app` | 컨트롤 플레인 구성과 기본 설정 |
+| `src/run` | run, 태스크 그래프, 소유자 고정 |
+| `src/session`, `src/claims`, `src/guard` | 역할 바인딩, 리소스 claim, Managed Write Guard |
+| `src/mcp`, `src/ceo`, `src/cto` | MCP 서버와 CEO, CTO 인터페이스 |
+| `src/outbox`, `src/ingress`, `src/buzz` | 내구성 있는 전달, 오너 ingress, Buzz 전송 |
+| `src/verify`, `src/review`, `src/quality` | 샌드박스 검증, 블라인드 리뷰, 품질 게이트 |
+| `src/github`, `src/git` | GitHub 커널(게이트, 머지, 머지 후 검증)과 git 작업 |
+| `src/bootstrap` | 신규 프로젝트 bootstrap과 활성화 |
+| `src/capacity`, `src/continuity`, `src/runtime` | 프로바이더 용량, 역할 continuity, 프로바이더 런타임 |
+| `src/db`, `src/snapshot`, `src/export` | SQLite 스키마와 마이그레이션, 후보 스냅샷, 증거 내보내기 |
+| `src/doctor`, `src/deploy`, `src/telemetry` | 상태 점검과 복구, rollback pair, 텔레메트리 |
+| `src/domain`, `src/contracts`, `src/core` | 타입, 계약, 공용 기본 요소 |
+| `deploy/`, `native/`, `scripts/`, `tests/` | launchd 설치 스크립트, 네이티브 애드온, 저장소 스크립트, 테스트 |
+
+## 문서
+
+[운영](docs/OPERATIONS.md) · [launchd 배포](deploy/README.md) · [오너 액션](docs/ops/owner-actions.md) · [보안](docs/SECURITY.md) · [리뷰어 egress](docs/reviewer-egress.md) · [용량 소스](docs/capacity-source.md) · [run 증거 내보내기](docs/run-evidence-export.md) · [설계 결정](docs/design-decisions.md) · [ADR](docs/adr/) · [PRD](docs/prd/) · [용어](docs/TERMINOLOGY.md) · [변경 이력](CHANGELOG.md)
 
 ## 라이선스
 
-이 저장소에는 **공개된 라이선스 부여가 없습니다**.
-공개 저장소라는 사실을 재사용, 재배포, 배포를 허락한다는 뜻으로 받아들이면 안 됩니다.
-이용 조건은 [저장소 소유자](https://github.com/MongLong0214)에게 문의하세요.
-체크아웃에는 의도적으로 `LICENSE` 파일을 두지 않았습니다.
-릴리스 이력은 [변경 이력](CHANGELOG.md)에, 인수와 상태 이력은 [원장](docs/ACCEPTANCE.md)과 [현재 상태](docs/STATUS.md)에 있습니다.
-
-프로덕션 지원이나 가동 시간 보장은 없습니다.
-[보안 제보 안내](docs/SECURITY.md)와 [기여 안내](docs/CONTRIBUTING.md)를 참고하세요.
+이 저장소는 공개된 라이선스를 부여하지 않습니다. 저장소가 공개되어 있다는 사실이 재사용, 재배포, 배포 사용의 허락을 뜻하지 않습니다. 조건은 [저장소 소유자](https://github.com/MongLong0214)에게 문의하세요.

@@ -1,6 +1,6 @@
 # Contributing
 
-This repository is not a production-ready service and has no published license grant. Ask
+This repository has no published license grant. Ask
 the repository owner before relying on contribution or reuse terms.
 
 Before proposing a change, read the normative [PRDs](prd/), the
