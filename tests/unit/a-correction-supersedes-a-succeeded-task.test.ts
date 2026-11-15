@@ -459,3 +459,78 @@ describe("CEO msg_8f666e55 — a SUCCEEDED task superseded by a registered corre
     expect(await r.freeze()).toMatchObject({ allowed: false, reasonCode: HAS_DEPENDENTS, evidence: { refusal: HAS_DEPENDENTS, supersededTaskId: a, dependents: [w] } });
   });
 });
+
+/**
+ * The live shape of run_525e6b28 (attempt_e5f11c47): P makes shared.txt; Q and Z each build on P, and Z edits shared.txt;
+ * the chain's tasks build on Q, whose base #1242 records as P and Q. The chain's start inherits P's and Q's changes, which
+ * stay their own results; only what the chain's tasks changed on top of their starts is the chain's.
+ */
+const inheritsOtherTasks = async (r: Run) => {
+  const [p] = await r.plan([{ key: "P" }]) as [string];
+  const first = r.succeed(p, "", { files: { "shared.txt": "P shared\n" } });
+  const [q, z] = await r.plan([{ key: "Q", dependsOn: ["P"] }, { key: "Z", dependsOn: ["P"] }]) as [string, string];
+  const second = r.succeed(q, "", { files: { "q.txt": "Q\n" }, startsFrom: onCommit(p, first.commit) });
+  r.succeed(z, "", { files: { "shared.txt": "Z shared\n" }, startsFrom: onCommit(p, first.commit) });
+  /** The base #1242 builds for `taskId` from `predecessors`, all SUCCEEDED and built on one another. */
+  const basedOn = async (taskId: string, predecessors: string[], commit: string): Promise<StartsFrom> => {
+    const based = await r.predecessorBase(taskId, predecessors);
+    expect(based, JSON.stringify(based).slice(0, 400)).toMatchObject({ allowed: true, value: { commit } });
+    if (!based.allowed || based.value === null) throw new Error("no base");
+    return based.value;
+  };
+  return { p, q, z, onQ: (taskId: string) => basedOn(taskId, [p, q], second.commit), basedOn };
+};
+
+describe("a correction chain's change is what its own tasks changed, not what its start inherited from other tasks", () => {
+  it("the live case — B corrects A, both built on Q, and changes one line: frozen, with no CONFLICT against Z for P's file", async () => {
+    const r = await governedRun();
+    const { p, q, z, onQ } = await inheritsOtherTasks(r);
+    const [a] = await r.plan([{ key: "A", dependsOn: ["Q"] }]) as [string];
+    r.succeed(a, "", { files: { "runner.js": "A runner\n" }, startsFrom: await onQ(a) });
+    const [b] = await r.plan([{ key: "B", spec: correctionOf(a), dependsOn: ["Q"] }]) as [string];
+    const correction = r.succeed(b, "", { files: { "runner.js": "B runner\n" }, startsFrom: await onQ(b) });
+    expect(await r.register(b, a)).toMatchObject({ ok: true, value: { registered: true } });
+    gitSync(r.repo, ["checkout", "-q", `task/${p}`]);
+
+    const frozen = await r.freeze();
+    expect(frozen, JSON.stringify(frozen).slice(0, 800)).toMatchObject({ allowed: true });
+    if (!frozen.allowed) return;
+    const [repository] = frozen.value.repositories;
+    expect(repository!.integration?.tasks.map((task) => task.taskId).sort()).toEqual([p, q, z, b].sort());
+    expect(repository!.integration?.tasks).toContainEqual({ taskId: b, commit: correction.commit });
+    expect(treeOf(r, repository!.candidateHead, ["shared.txt", "q.txt", "runner.js"])).toEqual({ "shared.txt": "Z shared", "q.txt": "Q", "runner.js": "B runner" });
+  });
+
+  it("A <- B <- C, each built on the one before: every link's change stays in the candidate, and a non-ancestor task on an earlier link's path still conflicts", async () => {
+    const r = await governedRun();
+    const { p, q, z, onQ, basedOn } = await inheritsOtherTasks(r);
+    const [a] = await r.plan([{ key: "A", dependsOn: ["Q"] }]) as [string];
+    const first = r.succeed(a, "", { files: { "a.txt": "A\n", "runner.js": "A runner\n" }, startsFrom: await onQ(a) });
+    const [b] = await r.plan([{ key: "B", spec: correctionOf(a), dependsOn: ["A"] }]) as [string];
+    const second = r.succeed(b, "", { files: { "runner.js": "B runner\n" }, startsFrom: await basedOn(b, [p, q, a], first.commit) });
+    const [c] = await r.plan([{ key: "C", spec: correctionOf(b), dependsOn: ["B"] }]) as [string];
+    const third = r.succeed(c, "", { files: { "c.txt": "C\n" }, startsFrom: await basedOn(c, [p, q, a, b], second.commit) });
+    expect(await r.register(b, a), "A -> B").toMatchObject({ ok: true, value: { registered: true } });
+    expect(await r.register(c, b), "B -> C").toMatchObject({ ok: true, value: { registered: true } });
+    gitSync(r.repo, ["checkout", "-q", `task/${p}`]);
+
+    const frozen = await r.freeze();
+    expect(frozen, JSON.stringify(frozen).slice(0, 800)).toMatchObject({ allowed: true });
+    if (!frozen.allowed) return;
+    const [repository] = frozen.value.repositories;
+    expect(repository!.integration?.tasks.map((task) => task.taskId).sort()).toEqual([p, q, z, c].sort());
+    expect(repository!.integration?.tasks).toContainEqual({ taskId: c, commit: third.commit });
+    // A's a.txt and B's runner.js are C's to carry: neither A nor B is a result any more.
+    expect(treeOf(r, repository!.candidateHead, ["shared.txt", "q.txt", "a.txt", "runner.js", "c.txt"])).toEqual({
+      "shared.txt": "Z shared", "q.txt": "Q", "a.txt": "A", "runner.js": "B runner", "c.txt": "C",
+    });
+
+    // U builds on none of them and edits a.txt, which A changed and C carries: a real conflict, with C.
+    const [u] = await r.plan([{ key: "U" }]) as [string];
+    r.succeed(u, "", { files: { "a.txt": "U\n" } });
+    gitSync(r.repo, ["checkout", "-q", `task/${p}`]);
+    const refused = await r.freeze();
+    expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+    expect(conflictPairs(refused.evidence)).toEqual([[c, u].sort()]);
+  });
+});
