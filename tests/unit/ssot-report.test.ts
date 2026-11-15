@@ -42,7 +42,7 @@ const makeDocumentRoot = () => {
   const root = mkdtempSync(join(tmpdir(), "acp-ssot-docs-"));
   mkdirSync(join(root, "docs"), { recursive: true });
   mkdirSync(join(root, "scripts"), { recursive: true });
-  writeFileSync(join(root, "README.md"), "> **Status: not production-ready.**\n");
+  writeFileSync(join(root, "README.md"), "# README\n");
   writeFileSync(join(root, "docs", "STATUS.md"), "# Current status and acceptance limits\n");
   writeFileSync(join(root, "docs", "OPERATIONS.md"), "# Operations\n");
   writeFileSync(join(root, "docs", "SECURITY.md"), "# Security\n");
@@ -103,14 +103,14 @@ describe("SSOT report entry point", () => {
       );
 
       writeFileSync(join(fixture.root, "docs", "SECURITY.md"), "# Security\n");
-      writeFileSync(join(fixture.root, "README.md"), "# No status banner\n");
+      writeFileSync(join(fixture.root, "docs", "STATUS.md"), "# No status heading\n");
       const missingStatus = runReport([
         `--repo-root=${fixture.root}`,
         `--issues-file=${fixture.issuesPath}`,
       ]);
       expect(missingStatus.status).toBe(1);
       expect(`${missingStatus.stdout}\n${missingStatus.stderr}`).toContain(
-        "status section missing: README status banner in README.md",
+        "status section missing: current status heading in docs/STATUS.md",
       );
     } finally {
       rmSync(fixture.root, { recursive: true, force: true });

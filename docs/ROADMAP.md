@@ -354,5 +354,3 @@ The repository may claim production readiness only after all of the following ar
 4. full factory acceptance and observation window;
 5. every open issue has an evidence-backed terminal disposition;
 6. a fresh independent closeout review passes.
-
-Until then the repository remains **not production-ready**.

@@ -427,8 +427,7 @@ round-2 major in the same area — #207 and #119 are the same daemon MCP finding
 #227/#156, #176/#54, #182/#55. Six of them already carry a second comment pointing at the
 round-2 issue that fixes them. They should be closed against those, not worked twice.
 
-What that means plainly: **this is not production-ready yet, and the review does not say it
-is.** The Hard Invariants have real enforcement and real negative tests, and the end-to-end
+The Hard Invariants have real enforcement and real negative tests, and the end-to-end
 path works against a real project in all three execution modes — but an adversarial reader
 with full source access still finds authority and evidence gaps faster than the fix waves
 close them, and the current suite is red.
