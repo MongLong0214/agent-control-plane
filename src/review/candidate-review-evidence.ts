@@ -71,7 +71,9 @@ interface WorkUnits {
  * tasks it left unmapped. Only after that is a PLAN key read as a task title (the rule a dependency on an
  * earlier submission's task uses, `TaskGraph.submit`), and only for references the approval did not resolve:
  * a unit the approval holds contributes just the entries it left as keys, and a unit it does not hold
- * contributes its PLAN refs. An inference never reassigns a task already mapped and is refused when two tasks
+ * contributes its PLAN refs. So does a unit whose approved task list is as long as the audit log's array cap
+ * (`AUDIT_ARRAY_LIMIT`), which may have lost its tail without a mark: its PLAN refs fill in the tasks the
+ * approval did not map, and never move one it did. An inference never reassigns a task already mapped and is refused when two tasks
  * share the title; either way the reference is named in `unresolvedRefs` rather than dropped.
  */
 export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_id: string; title: string }>): WorkUnits => {
@@ -82,6 +84,9 @@ export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_i
   if (plan === undefined) return none;
   const declared = new Map<string, Set<string>>();
   const approved = new Map<string, Set<string>>();
+  // Units whose approved task list may be cut: the audit log keeps 200 array items and marks nothing, so a list
+  // of exactly that length may have lost its tail.
+  const mayBeCut = new Set<string>();
   const add = (into: Map<string, Set<string>>, unit: unknown, refs: unknown): void => {
     if (typeof unit !== "string" || !Array.isArray(refs)) return;
     const held = into.get(unit) ?? new Set<string>();
@@ -96,7 +101,11 @@ export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_i
       `SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id DESC LIMIT 1`, [WORK_SCOPE_APPROVED_KIND, runId]);
     const stored: unknown = approval === undefined ? undefined : JSON.parse(approval.evidence_json);
     if (isRecord(stored) && stored["planDigest"] === plan.digest && Array.isArray(stored["units"])) {
-      for (const unit of stored["units"]) if (isRecord(unit)) add(approved, unit["unit"], unit["taskIds"]);
+      for (const unit of stored["units"]) {
+        if (!isRecord(unit)) continue;
+        add(approved, unit["unit"], unit["taskIds"]);
+        if (typeof unit["unit"] === "string" && Array.isArray(unit["taskIds"]) && unit["taskIds"].length >= AUDIT_ARRAY_LIMIT) mayBeCut.add(unit["unit"]);
+      }
     }
   } catch { return none; }
   const ids = new Set(tasks.map((task) => task.task_id));
@@ -123,7 +132,7 @@ export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_i
   // 2. Inference, for the references still unanswered: the approval's entries it left as keys, and the PLAN's
   // keys in a unit the approval does not hold.
   for (const [unit, refs] of sorted(approved)) for (const ref of refs) if (!ids.has(ref)) inferred(unit, ref);
-  for (const [unit, refs] of sorted(declared)) if (!approved.has(unit)) for (const ref of refs) if (!ids.has(ref)) inferred(unit, ref);
+  for (const [unit, refs] of sorted(declared)) if (!approved.has(unit) || mayBeCut.has(unit)) for (const ref of refs) if (!ids.has(ref)) inferred(unit, ref);
   return { declared: new Set([...declared.keys(), ...approved.keys()]).size, byTask, unresolvedRefs };
 };
 

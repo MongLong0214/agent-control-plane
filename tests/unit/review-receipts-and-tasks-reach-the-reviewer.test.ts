@@ -206,4 +206,29 @@ describe("an approved work-unit mapping is never overridden by title inference (
       expect([...units.byTask.values()].filter((unit) => unit === "unit-b")).toHaveLength(1);
     } finally { harness.cp.close(); }
   }, 60_000);
+
+  it("an approved unit as long as the audit log's array cap also takes its PLAN references, and anything still unmapped is named (#1410 re-review)", async () => {
+    const { harness, runId } = await prepare();
+    try {
+      // 201 tasks in one unit: the audit log keeps 200 array items and marks nothing, so the approval holds 200 of them.
+      const many = submit(harness, runId, Array.from({ length: 201 }, (_, i) => ({ key: `u${i}`, title: `u${i}` })));
+      const other = submit(harness, runId, [{ key: "elsewhere", title: "elsewhere" }])[0]!;
+      const refs = [...many.map((_, i) => `u${i}`), "ghost"];
+      const stored = harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "big", tasks: refs }, { key: "small", tasks: ["elsewhere"] }] });
+      const approved = harness.cp.audit.record({ kind: "WORK_SCOPE_APPROVED", runId, evidence: { planDigest: stored.digest, bindingGeneration: 1,
+        units: [{ unit: "big", taskIds: many.map((task) => task.taskId), declarationDigest: "sha256:big" },
+          { unit: "small", taskIds: [other.taskId], declarationDigest: "sha256:small" }] } });
+      expect(approved.allowed).toBe(true);
+      const held = harness.cp.db.get<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events WHERE kind = 'WORK_SCOPE_APPROVED' AND run_id = ?`, [runId])!;
+      expect((JSON.parse(held.evidence_json) as { units: Array<{ taskIds: string[] }> }).units[0]!.taskIds).toHaveLength(200);
+
+      const units = workUnitsOf(harness.cp.db, runId, taskRows(harness, runId));
+      // The task the audit log cut is in its unit all the same, and the one the approval mapped did not move.
+      expect(units.byTask.get(many[200]!.taskId)).toBe("big");
+      expect(many.every((task) => units.byTask.get(task.taskId) === "big")).toBe(true);
+      expect(units.byTask.get(other.taskId)).toBe("small");
+      // What no task answers is an explicit gap, not silence.
+      expect(units.unresolvedRefs).toEqual(["big:ghost"]);
+    } finally { harness.cp.close(); }
+  }, 60_000);
 });
