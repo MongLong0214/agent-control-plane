@@ -73,8 +73,9 @@ interface WorkUnits {
  * a unit the approval holds contributes just the entries it left as keys, and a unit it does not hold
  * contributes its PLAN refs. So does a unit whose approved task list is as long as the audit log's array cap
  * (`AUDIT_ARRAY_LIMIT`), which may have lost its tail without a mark: its PLAN refs fill in the tasks the
- * approval did not map, and never move one it did. An inference never reassigns a task already mapped and is refused when two tasks
- * share the title (a CANCELLED task never answers a key); either way the reference is named in `unresolvedRefs` rather than dropped.
+ * approval did not map, and never move one it did. An inference is accepted only for a live task that is the one live task of that
+ * title and is mapped to no unit; a CANCELLED task never answers a key. Any other reference, one that names a task
+ * already mapped included, is named in `unresolvedRefs` rather than dropped.
  */
 export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_id: string; title: string; state?: string }>): WorkUnits => {
   const none: WorkUnits = { declared: 0, byTask: new Map(), unresolvedRefs: [] };
@@ -124,7 +125,10 @@ export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_i
   const inferred = (unit: string, ref: string): void => {
     const titled = byTitle.get(ref);
     const taskId = titled?.length === 1 ? titled[0]! : null;
-    if (taskId === null || (byTask.has(taskId) && byTask.get(taskId) !== unit)) unresolvedRefs.push(`${unit}:${ref}`);
+    // The PLAN's key -> task id mapping is stored nowhere, so a title is only a guess: it is taken for a task that
+    // is live, the only live one with that title and mapped to no unit yet (by the approval, by id or by an
+    // earlier guess, this unit included). Anything else is a named gap.
+    if (taskId === null || byTask.has(taskId)) unresolvedRefs.push(`${unit}:${ref}`);
     else byTask.set(taskId, unit);
   };
   // 1. What the approval resolved, then the PLAN's own task ids: neither is ever overridden.

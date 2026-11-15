@@ -232,8 +232,11 @@ describe("an approved work-unit mapping is never overridden by title inference (
       expect(units.byTask.get(many[200]!.taskId)).toBe("big");
       expect(many.every((task) => units.byTask.get(task.taskId) === "big")).toBe(true);
       expect(units.byTask.get(other.taskId)).toBe("small");
-      // What no task answers is an explicit gap, not silence.
-      expect(units.unresolvedRefs).toEqual(["big:ghost"]);
+      // What no task answers is an explicit gap, not silence. So is a key that names a task the approval
+      // already mapped (u0..u199): a title is never taken for a task that has its unit.
+      expect(units.unresolvedRefs).toContain("big:ghost");
+      expect(units.unresolvedRefs).not.toContain("big:u200");
+      expect(units.unresolvedRefs).toHaveLength(201);
       expectNoSilentGap(harness, runId, units, [...many, other].map((task) => task.taskId));
     } finally { harness.cp.close(); }
   }, 60_000);
@@ -253,8 +256,27 @@ describe("an approved work-unit mapping is never overridden by title inference (
       // The cancelled task is not the unit's, and the unit's live tail is not silently without one.
       expect(units.byTask.has(old!.taskId)).toBe(false);
       expect(units.byTask.has(many[200]!.taskId)).toBe(false);
-      expect(units.unresolvedRefs).toEqual(["big:u200"]);
+      expect(units.unresolvedRefs).toContain("big:u200");
       expect(many.slice(0, 200).every((task) => units.byTask.get(task.taskId) === "big")).toBe(true);
+      expectNoSilentGap(harness, runId, units, many.map((task) => task.taskId));
+    } finally { harness.cp.close(); }
+  }, 60_000);
+
+  it("a title match is never accepted for a task already in the unit: the real tail task is left unmapped with the gap named (#1410 r4)", async () => {
+    const { harness, runId } = await prepare();
+    try {
+      // The PLAN names the first 200 tasks by id and the last by its key `u200`; the last task's title is not its key,
+      // and the FIRST task's title is `u200`.
+      const many = submit(harness, runId, Array.from({ length: 201 }, (_, i) => ({ key: `u${i}`, title: i === 0 ? "u200" : i === 200 ? "actual tail task" : `u${i}` })));
+      const refs = [...many.slice(0, 200).map((task) => task.taskId), "u200"];
+      const stored = harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "big", tasks: refs }] });
+      harness.cp.audit.record({ kind: "WORK_SCOPE_APPROVED", runId, evidence: { planDigest: stored.digest, bindingGeneration: 1,
+        units: [{ unit: "big", taskIds: many.map((task) => task.taskId), declarationDigest: "sha256:big" }] } });
+
+      const units = workUnitsOf(harness.cp.db, runId, taskRows(harness, runId));
+      expect(many.slice(0, 200).every((task) => units.byTask.get(task.taskId) === "big")).toBe(true);
+      expect(units.byTask.has(many[200]!.taskId)).toBe(false);
+      expect(units.unresolvedRefs).toEqual(["big:u200"]);
       expectNoSilentGap(harness, runId, units, many.map((task) => task.taskId));
     } finally { harness.cp.close(); }
   }, 60_000);
