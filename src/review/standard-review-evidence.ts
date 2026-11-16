@@ -18,6 +18,7 @@ import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { CandidateSnapshot, SnapshotReviewEvidence } from "../snapshot/candidate-snapshot.ts";
 import { readReviewEvidenceFile } from "./review-evidence-file.ts";
+import { STANDARD_REVIEW_EVIDENCE_ATTACHED_SCHEMA, STANDARD_REVIEW_EVIDENCE_CANDIDATE_SCHEMA } from "./standard-review-evidence-schemas.ts";
 
 /**
  * Private review evidence for a STANDARD_WORK or CONTRACT_CHANGE run: the bootstrap evidence path
@@ -27,8 +28,8 @@ import { readReviewEvidenceFile } from "./review-evidence-file.ts";
  * data for the reviewer, and nothing that judges a CONTRACT_CHANGE (its PLAN, manifest, revert eligibility or
  * activation grant) reads it. Bytes stay in the run's private HANDOFF artifacts; nothing here is ever deleted.
  */
-const CANDIDATE = "acp.standard-review-evidence-candidate.v1";
-const ATTACHED = "acp.standard-review-evidence-attached.v1";
+const CANDIDATE = STANDARD_REVIEW_EVIDENCE_CANDIDATE_SCHEMA;
+const ATTACHED = STANDARD_REVIEW_EVIDENCE_ATTACHED_SCHEMA;
 export const STANDARD_REVIEW_EVIDENCE_STAGED = "STANDARD_REVIEW_EVIDENCE_STAGED";
 export const STANDARD_REVIEW_EVIDENCE_ATTACHED = "STANDARD_REVIEW_EVIDENCE_ATTACHED";
 

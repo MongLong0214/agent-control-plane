@@ -36,6 +36,7 @@ import {
   Role,
 } from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
+import { STANDARD_REVIEW_EVIDENCE_ATTACHED_SCHEMA, STANDARD_REVIEW_EVIDENCE_CANDIDATE_SCHEMA } from "../review/standard-review-evidence-schemas.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import { ContractChangeRefusal } from "../registry/contract-change-plan.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
@@ -1194,12 +1195,26 @@ export class RunEngine {
    * (id, state, attempts, spec digest, updated_at), executions, artifacts (by digest) and candidate pipeline
    * attempts, every row in full and in a fixed order. Equal digests at the pause and at the release mean
    * none of them was written in between, whatever the clock read.
+   *
+   * With `evidenceSince` (the release's, for a pause recorded under this same formula) the run's own review
+   * evidence added after that time is left out: a STANDARD review evidence candidate or attachment HANDOFF of
+   * this run and this run's contract, created strictly after the pause, is a CTO/CEO bookkeeping record of
+   * the review, not work. Any other artifact, HANDOFF included, still counts.
    */
-  #holdSnapshot(runId: string): string {
-    const run = this.db.get<{ current_candidate_digest: string | null }>(
-      `SELECT current_candidate_digest FROM runs WHERE run_id = ?`,
+  #holdSnapshot(runId: string, evidenceSince?: string): string {
+    const run = this.db.get<{ current_candidate_digest: string | null; contract_digest: string }>(
+      `SELECT current_candidate_digest, contract_digest FROM runs WHERE run_id = ?`,
       [runId],
     );
+    const evidence = evidenceSince === undefined ? "" : `
+            AND NOT (kind = 'HANDOFF' AND created_at > ? AND CASE WHEN json_valid(content_json)
+                  THEN json_extract(content_json, '$.schema') IN (?, ?)
+                   AND json_extract(content_json, '$.runId') IS ?
+                   AND json_extract(content_json, '$.contractDigest') IS ? ELSE 0 END)`;
+    const evidenceArgs = evidenceSince === undefined ? [] : [
+      evidenceSince, STANDARD_REVIEW_EVIDENCE_CANDIDATE_SCHEMA, STANDARD_REVIEW_EVIDENCE_ATTACHED_SCHEMA,
+      runId, run?.contract_digest ?? null,
+    ];
     const tasks = this.db.all<{ spec_json: string }>(
       `SELECT task_id, state, attempt_count, spec_json, updated_at FROM tasks WHERE run_id = ? ORDER BY task_id`,
       [runId],
@@ -1210,8 +1225,8 @@ export class RunEngine {
       executions: this.db.all(`SELECT * FROM task_executions WHERE run_id = ? ORDER BY execution_id`, [runId]),
       artifacts: this.db.all(
         `SELECT artifact_id, kind, digest, candidate_snapshot_digest, produced_by, created_at, superseded
-           FROM run_artifacts WHERE run_id = ? ORDER BY artifact_id`,
-        [runId],
+           FROM run_artifacts WHERE run_id = ?${evidence} ORDER BY artifact_id`,
+        [runId, ...evidenceArgs],
       ),
       attempts: this.db.all(`SELECT * FROM candidate_pipeline_attempts WHERE run_id = ? ORDER BY attempt_id`, [runId]),
     });
@@ -2230,7 +2245,9 @@ export class RunEngine {
       // A pause written since S-HOLD carries the rows' digest: unmoved means equal, whatever the clock read.
       const atPause = auditEvidence(pause.evidence_json)?.[HOLD_SNAPSHOT_FIELD];
       if (typeof atPause === "string") {
-        if (atPause !== this.#holdSnapshot(runId)) {
+        // The review evidence staged or attached since the pause is not work (see `#holdSnapshot`): the old
+        // formula over the rows minus exactly those artifacts must equal what the pause recorded.
+        if (atPause !== this.#holdSnapshot(runId, pause.at)) {
           return kept("the run's tasks, executions, artifacts or candidate attempts changed under the hold");
         }
       } else {
