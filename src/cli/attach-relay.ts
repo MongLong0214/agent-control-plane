@@ -842,7 +842,35 @@ export interface AttachRelayCommandOptions {
   claim: AttachRelayClaim;
   reattachSocketPath?: string;
   reattach?: Partial<ReattachPolicy>;
+  /**
+   * The deployment's state directory, the one the daemon accepts wake endpoints in. Set, the
+   * relay refuses to start unless the session's messaging socket sits directly inside it.
+   */
+  stateDir?: string;
 }
+
+/**
+ * Why this session could never be woken, or null when its messaging socket is where the daemon
+ * accepts one: directly inside `stateDir` (`dirname(endpoint) !== dir` in `src/mcp/role-conversation.ts`,
+ * compared the same way, against the resolved directory), and then the daemon's own checks of the
+ * socket itself (`inspectWakeTarget`). Refused here, at launch, because the alternative is a
+ * session that attaches, works, and is silently unwakeable: the wake proxy is opened beside the
+ * socket, so a socket the daemon would refuse takes its proxy with it.
+ */
+const unwakeableSessionRefusal = (messaging: SessionMessaging | undefined, stateDir: string): string | null => {
+  const fix = `start Claude Code with --messaging-socket-path ${resolvePath(stateDir)}/cc-session-<name>.sock`;
+  if (messaging === undefined) {
+    return `attach: this session cannot be woken: it has no messaging socket (CLAUDE_CODE_MESSAGING_SOCKET or token unset); ${fix}`;
+  }
+  if (dirname(messaging.socketPath) !== resolvePath(stateDir)) {
+    return `attach: this session cannot be woken: its messaging socket is not directly inside the ACP state directory; ${fix}`;
+  }
+  const target = inspectWakeTarget(messaging.socketPath);
+  if (target.refusal !== null) {
+    return `attach: this session cannot be woken: its messaging socket was refused (${target.refusal}); ${fix}`;
+  }
+  return null;
+};
 
 /**
  * The `agentctl attach canonical-cto` entry.
@@ -864,6 +892,15 @@ export const runAttachRelayCommand = async (
   io.stdin.pause();
   // Read before either path, so a reattached relay and a claimed one both open the wake proxy.
   const messaging = sessionMessagingFromEnv();
+  // Before anything connects: a role holder that cannot be woken is refused where the operator
+  // is looking, not left to fail as a stderr line nobody reads.
+  if (options.stateDir !== undefined) {
+    const refusal = unwakeableSessionRefusal(messaging, options.stateDir);
+    if (refusal !== null) {
+      io.stderr.write(`${refusal}\n`);
+      return ATTACH_EXIT.USAGE;
+    }
+  }
   const reattached = await reattachFirst(
     options.reattachSocketPath,
     DEFAULT_CLAIM_TIMEOUT_MS,

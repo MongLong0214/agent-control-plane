@@ -357,6 +357,8 @@ const dispatchAttach = (args: string[], config: { databasePath: string }): Promi
         process.env["ACP_CANONICAL_CTO_TOOL_SOCKET"] ??
         join(config.databasePath, "..", "agentcpd.canonical-cto-tools.sock"),
       claim: parsed.selectors,
+      // The daemon's wake endpoint directory is this same state directory.
+      stateDir: join(config.databasePath, ".."),
     },
     { stdin: process.stdin, stdout: process.stdout, stderr: process.stderr },
   );

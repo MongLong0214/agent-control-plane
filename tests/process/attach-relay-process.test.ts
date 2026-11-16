@@ -48,7 +48,27 @@ describe("the attach relay as the process Claude Code spawns", () => {
   let stateDir: string | undefined;
   let claimServer: Server | undefined;
   let wake: Server | undefined;
+  let session: Server | undefined;
   const children: ChildProcess[] = [];
+
+  /**
+   * The environment that makes this child a wakeable session: its state directory is `dir` and its
+   * messaging socket sits directly inside it, since `attach canonical-cto` refuses to start
+   * otherwise. Nothing here is wake-tested; the socket only has to exist.
+   */
+  const wakeableSession = async (dir: string): Promise<Record<string, string>> => {
+    const socketPath = join(dir, "cc.sock");
+    session = createServer((socket) => socket.resume());
+    await new Promise<void>((resolve, reject) => {
+      session!.once("error", reject);
+      session!.listen(socketPath, resolve);
+    });
+    return {
+      ACP_STATE_DIR: dir,
+      CLAUDE_CODE_MESSAGING_SOCKET: socketPath,
+      CLAUDE_CODE_MESSAGING_TOKEN: "fixture-messaging-token",
+    };
+  };
 
   afterEach(async () => {
     for (const child of children.splice(0)) {
@@ -62,12 +82,14 @@ describe("the attach relay as the process Claude Code spawns", () => {
     }
     if (claimServer) await new Promise<void>((resolve) => claimServer!.close(() => resolve()));
     if (wake?.listening) await new Promise<void>((resolve) => wake!.close(() => resolve()));
+    if (session?.listening) await new Promise<void>((resolve) => session!.close(() => resolve()));
     await listeners?.close();
     daemon?.lock.release();
     h?.cp.db.close();
     if (stateDir) rmSync(stateDir, { recursive: true, force: true });
     claimServer = undefined;
     wake = undefined;
+    session = undefined;
     listeners = undefined;
     daemon = undefined;
     h = undefined;
@@ -140,6 +162,7 @@ describe("the attach relay as the process Claude Code spawns", () => {
       "--expected-binding-generation",
       "1",
     ];
+    const sessionEnv = await wakeableSession(stateDir);
     const child = spawn(
       process.execPath,
       [TSX_ENTRY, CLI_ENTRY, "attach", "canonical-cto", ...selectors],
@@ -152,6 +175,7 @@ describe("the attach relay as the process Claude Code spawns", () => {
           ACP_MCP_TOKEN: TOKEN_CANARY,
           ACP_CLAIM_CANONICAL_CTO_SOCKET: claimPath,
           ACP_CTO_MCP_SOCKET: mcpPath,
+          ...sessionEnv,
         },
         stdio: ["pipe", "pipe", "pipe"],
       },
@@ -293,6 +317,7 @@ describe("the attach relay as the process Claude Code spawns", () => {
       wake!.listen(mcpPath, resolve);
     });
 
+    const sessionEnv = await wakeableSession(stateDir);
     const child = spawn(
       process.execPath,
       [
@@ -315,6 +340,7 @@ describe("the attach relay as the process Claude Code spawns", () => {
           ACP_MCP_TOKEN: TOKEN_CANARY,
           ACP_CLAIM_CANONICAL_CTO_SOCKET: claimPath,
           ACP_CTO_MCP_SOCKET: mcpPath,
+          ...sessionEnv,
         },
         stdio: ["pipe", "pipe", "pipe"],
       },
