@@ -1261,7 +1261,8 @@ describe("versioned SQLite migration", () => {
         [55, "v55-approved-run-revision-reentry"],
         [56, "v56-adopted-bootstrap-first-manifest"],
         [57, "v57-canonical-entitlement-transfer"],
-        [SCHEMA_VERSION, "v58-canonical-cto-rotation"],
+        [58, "v58-canonical-cto-rotation"],
+        [SCHEMA_VERSION, "v59-task-plan-key"],
       ]);
       // Stated as properties rather than one `objectContaining` per version. The list above
       // already pins the exact order and ids; this block only ever said "every receipt carries a

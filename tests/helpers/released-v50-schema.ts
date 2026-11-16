@@ -39,8 +39,26 @@ export const V58_ADDED_TRIGGERS = [
 ];
 export const V58_CHANGED_GUARDS = ["actor_target_bindings_immutable"];
 
+/** A fixture built from a current database that claims to predate v59 holds no tasks.plan_key column or index. */
+export const takeBackV59 = (raw: Database.Database): void => {
+  raw.exec(`DROP INDEX IF EXISTS tasks_run_plan_key`);
+  if (!(raw.pragma("table_xinfo(tasks)") as Array<{ name: string }>).some((column) => column.name === "plan_key")) return;
+  raw.exec(`ALTER TABLE tasks DROP COLUMN plan_key`);
+  // DROP COLUMN rewrites the stored CREATE TABLE text (it loses the newline before the closing paren); an image that
+  // claims to predate v59 holds v58's text exactly, so the stored text is put back from the v58 snapshot.
+  const released = /CREATE TABLE IF NOT EXISTS tasks \([\s\S]*?\n\)/.exec(readFileSync(new URL("../../src/db/schema-v58.sql", import.meta.url), "utf8"))?.[0];
+  if (!released) throw new Error("the tasks table is absent from the v58 snapshot");
+  raw.unsafeMode(true);
+  try {
+    raw.pragma("writable_schema = ON");
+    raw.prepare(`UPDATE sqlite_schema SET sql = ? WHERE type = 'table' AND name = 'tasks'`).run(released.replace("IF NOT EXISTS ", ""));
+    raw.pragma("writable_schema = OFF");
+  } finally { raw.unsafeMode(false); }
+};
+
 /** A fixture built from a current database that claims to predate v58 holds no switchover table and v57's binding guard. */
 export const takeBackV58 = (raw: Database.Database): void => {
+  takeBackV59(raw);
   const snapshot = readFileSync(new URL("../../src/db/schema-v57.sql", import.meta.url), "utf8");
   // The replaced guard first: its v58 body names the v57 and v58 tables, so it must go before either does.
   for (const name of V58_CHANGED_GUARDS) {
