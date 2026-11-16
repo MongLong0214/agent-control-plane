@@ -63,12 +63,14 @@ import {
 } from "../runtime/acp-daemon-notice.ts";
 import {
   SELF_CLAIM_EXECUTOR_KIND,
+  SelfClaimRefusal,
   assertCanonicalSessionsValid,
   assertClaudeIdentityStillLive,
   canonicalBuzzChannelFor,
   defaultProcessAncestryInspector,
   deriveClaimantIdentity,
   makeDefaultHostSessionRegistryReader,
+  recordSelfClaimRefusal,
   unsubscribedRoomRefusal,
   type CanonicalAdoptableSession,
   type HostSessionRegistryReader,
@@ -6716,14 +6718,18 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       // this socket, checked by `startCanonicalSelfClaimListener` itself before this handler is
       // ever called.
       canonicalSelfClaim = await startCanonicalSelfClaimListener(daemon, stateDir, async (peer, params) => {
-        // Refused before anything is constructed, so a claim in that window opens no room and
-        // writes no row, not even its refusal's audit row. Claiming again after startup succeeds.
+        // Refused before anything is constructed, so a claim in that window opens no room and writes
+        // no session, binding or Buzz row. It writes its refusal's audit row, the one `claim()` writes,
+        // and names the branch: `DAEMON_STARTING` is a refusal the relay asks again after, and a row
+        // with no name left this window indistinguishable from an entitlement refusal (2026-11-16).
         if (!canonicalRoomsSettled) {
-          return deny(
+          const starting = deny(
             ReasonCode.CONFLICT,
             "the daemon is still starting and has not checked each canonical CTO's Buzz room against its mention subscriber",
-            {},
+            { reason: SelfClaimRefusal.DAEMON_STARTING },
           );
+          recordSelfClaimRefusal(cp.db, cp.audit, params, starting);
+          return starting;
         }
         // Deployment facts are the entry-time snapshot, never request or callback-time values.
         return executeCanonicalSelfClaimOperator(peer, params, {

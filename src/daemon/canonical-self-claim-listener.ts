@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { getPeerCredentials, type PeerCredentials } from "../core/peercred.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { type SelfClaimRefusal, selfClaimRefusalOf } from "../registry/canonical-self-claim.ts";
 import { readOneJsonLineRequest } from "./local-socket-framing.ts";
 
 /**
@@ -178,11 +179,20 @@ export const authenticateClaimCredentials = (
  * one point every response on this socket passes through; the rich, internal `Decision` objects
  * built everywhere else in this file may still carry a message and evidence for local diagnostics,
  * since none of them reach `socket.end` directly.
+ *
+ * One fact of a denial's evidence does cross: which branch refused it, as `reason`, and only when it
+ * is one of the fixed `SelfClaimRefusal` names. That is a constant chosen by the claim, never text
+ * from a path, a key or the request, and the relay needs it: most branches share `CONFLICT`, so the
+ * code alone cannot say whether asking again can pass. Any other `reason` in the evidence — some
+ * registries put free text there — is not a name and is not sent.
  */
-const publicClaimResponse = (decision: Decision<unknown>): { allowed: boolean; reasonCode: ReasonCode; value?: unknown } =>
-  decision.allowed
-    ? { allowed: true, reasonCode: decision.reasonCode, value: decision.value }
-    : { allowed: false, reasonCode: decision.reasonCode };
+export const publicClaimResponse = (
+  decision: Decision<unknown>,
+): { allowed: boolean; reasonCode: ReasonCode; value?: unknown; reason?: SelfClaimRefusal } => {
+  if (decision.allowed) return { allowed: true, reasonCode: decision.reasonCode, value: decision.value };
+  const reason = selfClaimRefusalOf(decision);
+  return reason === null ? { allowed: false, reasonCode: decision.reasonCode } : { allowed: false, reasonCode: decision.reasonCode, reason };
+};
 
 const removeStaleSocket = (path: string): void => {
   if (!existsSync(path)) return;

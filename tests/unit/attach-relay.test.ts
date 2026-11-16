@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -7,7 +7,8 @@ import { fileURLToPath } from "node:url";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ATTACH_EXIT, runAttachRelay, type AttachRelayClaim } from "../../src/cli/attach-relay.ts";
+import { ATTACH_EXIT, RETRIED_CLAIM_REFUSALS, runAttachRelay, runAttachRelayCommand, type AttachRelayClaim, type AttachRelayOptions } from "../../src/cli/attach-relay.ts";
+import { SelfClaimRefusal } from "../../src/registry/canonical-self-claim.ts";
 import { MAX_MCP_LINE_BYTES } from "../../src/core/mcp-limits.ts";
 import type { Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -158,7 +159,7 @@ describe("the canonical CTO attach relay", () => {
     },
   });
 
-  const drive = (mcpSocketPath: string, mcpToken = TOKEN): Relay => {
+  const drive = (mcpSocketPath: string, mcpToken = TOKEN, extra: Partial<AttachRelayOptions> = {}): Relay => {
     const stdin = new PassThrough();
     const stdout = new PassThrough();
     const stderr = new PassThrough();
@@ -192,7 +193,7 @@ describe("the canonical CTO attach relay", () => {
       errText += chunk.toString("utf8");
     });
     const exit = runAttachRelay(
-      { claimSocketPath: claimPath, mcpSocketPath, mcpToken, claim },
+      { claimSocketPath: claimPath, mcpSocketPath, mcpToken, claim, ...extra },
       { stdin, stdout, stderr },
     );
     running.push(exit);
@@ -225,8 +226,9 @@ describe("the canonical CTO attach relay", () => {
   const attach = async (
     clientInfo: { name: string; version: string } = { name: "claude-code", version: "2.1.323" },
     mcpSocketPath?: string,
+    extra: Partial<AttachRelayOptions> = {},
   ): Promise<Relay & { init: Wire }> => {
-    const relay = drive(mcpSocketPath ?? mcpPath);
+    const relay = drive(mcpSocketPath ?? mcpPath, TOKEN, extra);
     const init = await relay.request("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
@@ -348,6 +350,242 @@ describe("the canonical CTO attach relay", () => {
     expect(relay.err()).toBe(`attach: claim refused ${ReasonCode.CONFLICT}\n`);
     expect(relay.out()).toBe("");
     expect(connections).toBe(0);
+  });
+
+  /**
+   * A claim socket that answers each connection with the next scripted line (the last one repeats) and keeps every
+   * request it was sent, so a case can read which generation each attempt asked for.
+   */
+  const scriptedClaims = async (answers: unknown[]): Promise<Array<Record<string, unknown>>> => {
+    const asked: Array<Record<string, unknown>> = [];
+    await listen(
+      createServer((socket) => {
+        socket.once("data", (chunk: Buffer) => {
+          asked.push((JSON.parse(chunk.toString("utf8")) as { params: Record<string, unknown> }).params);
+          const answer = answers[Math.min(asked.length - 1, answers.length - 1)];
+          // A daemon that took the request and never answered it.
+          if (answer !== HANG) socket.end(`${JSON.stringify(answer)}\n`);
+        });
+      }),
+      claimPath,
+    );
+    return asked;
+  };
+  const HANG = Symbol("never answers");
+  /** A socket that accepts every connection and never writes a byte: a door whose daemon stopped answering. */
+  const silentSocket = async (name: string): Promise<{ path: string; connections: () => number }> => {
+    let connections = 0;
+    const path = join(stateDir, name);
+    await listen(createServer(() => { connections += 1; }), path);
+    return { path, connections: () => connections };
+  };
+  const refusal = (reasonCode: string, reason?: string) => ({ allowed: false, reasonCode, ...(reason ? { reason } : {}) });
+  const quick = { claimRetry: { initialDelayMs: 20, maxDelayMs: 40, maxWaitMs: 2_000 } };
+
+  it.each([
+    [ReasonCode.BINDING_ALREADY_ACTIVE, "PREDECESSOR_RUNTIME_ALIVE"],
+    [ReasonCode.CONFLICT, "PREDECESSOR_STILL_SETTLING"],
+  ])("asks again after %s %s, a refusal that clears by itself, then attaches without exiting", async (reasonCode, reason) => {
+    // The previous runtime of this same conversation is still exiting on the first attempt.
+    const asked = await scriptedClaims([refusal(reasonCode, reason), receipt()]);
+    const relay = await attach(undefined, undefined, quick);
+    expect(relay.init.result).toBeDefined();
+    expect((await register(relay))["ok"]).toBe(true);
+    expect(asked).toHaveLength(2);
+    expect(relay.err()).toBe(`attach: claim refused ${reasonCode} ${reason}; retrying\n`);
+    relay.stdin.end();
+    expect(await settles(relay.exit)).toBe(ATTACH_EXIT.OK);
+  });
+
+  // P1: one window bounds every step before a receipt, not only the choice to ask again. Each case has a step that
+  // never answers on its own; the relay must still exit inside the window plus a margin, with the last refusal.
+  const WINDOW = { claimRetry: { initialDelayMs: 20, maxDelayMs: 40, maxWaitMs: 400 } };
+  const WINDOW_MARGIN_MS = 1_500;
+
+  it("a claim the daemon never answers, after a DAEMON_STARTING refusal, ends with the window and names the refusal", async () => {
+    const asked = await scriptedClaims([refusal(ReasonCode.CONFLICT, "DAEMON_STARTING"), HANG]);
+    const started = Date.now();
+    const relay = drive(mcpPath, TOKEN, WINDOW);
+    expect(await settles(relay.exit, WINDOW_MARGIN_MS)).toBe(ATTACH_EXIT.CLAIM_REFUSED);
+    expect(Date.now() - started).toBeLessThan(WINDOW_MARGIN_MS);
+    expect(asked).toHaveLength(2);
+    expect(relay.err().trimEnd().split("\n").at(-1)).toBe(`attach: claim refused ${ReasonCode.CONFLICT} DAEMON_STARTING`);
+  });
+
+  it("a reattach door that never answers on a retry is bounded by the same window", async () => {
+    await scriptedClaims([refusal(ReasonCode.CONFLICT, "DAEMON_STARTING")]);
+    const door = await silentSocket("d.sock");
+    const relay = drive(mcpPath, TOKEN, { ...WINDOW, initialReattach: false, reattachSocketPath: door.path });
+    expect(await settles(relay.exit, WINDOW_MARGIN_MS)).toBe(ATTACH_EXIT.CLAIM_REFUSED);
+    expect(door.connections()).toBeGreaterThan(0);
+    expect(relay.err().trimEnd().split("\n").at(-1)).toBe(`attach: claim refused ${ReasonCode.CONFLICT} DAEMON_STARTING`);
+  });
+
+  it("an auto generation read that never finishes is bounded by the same window", async () => {
+    const asked = await scriptedClaims([refusal(ReasonCode.CONFLICT, "GENERATION_MISMATCH")]);
+    claim = { ...claim, expectedBindingGeneration: "auto" };
+    let reads = 0;
+    const nextGeneration = () => (reads++ === 0 ? Promise.resolve(3) : new Promise<number>(() => undefined));
+    const relay = drive(mcpPath, TOKEN, { ...WINDOW, nextGeneration });
+    expect(await settles(relay.exit, WINDOW_MARGIN_MS)).toBe(ATTACH_EXIT.CLAIM_REFUSED);
+    expect(asked).toHaveLength(1);
+    expect(relay.err().trimEnd().split("\n").at(-1)).toBe(`attach: claim refused ${ReasonCode.CONFLICT} GENERATION_MISMATCH`);
+  });
+
+  it("the window starts at relay start: a first reattach that never answers leaves the claim no time of its own", async () => {
+    const asked = await scriptedClaims([receipt()]);
+    const door = await silentSocket("d.sock");
+    vi.stubEnv("ACP_MCP_TOKEN", TOKEN);
+    try {
+      const stdin = new PassThrough();
+      const stderr = new PassThrough();
+      let err = "";
+      stderr.on("data", (chunk: Buffer) => { err += chunk.toString("utf8"); });
+      const exit = runAttachRelayCommand(
+        { claimSocketPath: claimPath, mcpSocketPath: mcpPath, claim, reattachSocketPath: door.path, ...WINDOW },
+        { stdin, stdout: new PassThrough(), stderr },
+      );
+      running.push(exit);
+      expect(await settles(exit, WINDOW_MARGIN_MS)).toBe(ATTACH_EXIT.UNAVAILABLE);
+      expect(door.connections()).toBe(1);
+      expect(asked).toHaveLength(0);
+      // The door is the step that ran out of time; nothing after it is attempted.
+      expect(err).toBe("attach: reattach socket unavailable\n");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  /**
+   * The Keychain lookup is a step before a receipt too. A `security` on PATH that answers after 6 s stands in for a
+   * Keychain that is slow to unlock; no ACP_MCP_TOKEN, so the relay must ask it. `runCommand` runs the command entry
+   * with the default 25 s window unless one is given, and resolves to its exit code and how long it took.
+   */
+  const slowKeychain = (seconds: number): string => {
+    const dir = join(stateDir, "kc");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "security"), `#!/bin/sh\nsleep ${seconds}\necho keychain-token\n`, { mode: 0o755 });
+    return dir;
+  };
+  const runCommand = async (options: { reattachSocketPath?: string; claimRetry?: AttachRelayOptions["claimRetry"] }) => {
+    const stdin = new PassThrough();
+    const stderr = new PassThrough();
+    let err = "";
+    stderr.on("data", (chunk: Buffer) => { err += chunk.toString("utf8"); });
+    const started = Date.now();
+    const exit = runAttachRelayCommand({ claimSocketPath: claimPath, mcpSocketPath: mcpPath, claim, ...options },
+      { stdin, stdout: new PassThrough(), stderr });
+    running.push(exit);
+    const code = await settles(exit, 40_000);
+    return { code, elapsedMs: Date.now() - started, err };
+  };
+
+  it("a silent reattach door that spends the whole window leaves no time for a slow Keychain: exit inside Claude Code's 30 s", async () => {
+    const asked = await scriptedClaims([receipt()]);
+    const door = await silentSocket("d.sock");
+    vi.stubEnv("ACP_MCP_TOKEN", "");
+    vi.stubEnv("PATH", `${slowKeychain(6)}:${process.env["PATH"] ?? ""}`);
+    try {
+      const run = await runCommand({ reattachSocketPath: door.path });
+      expect(run.code).toBe(ATTACH_EXIT.UNAVAILABLE);
+      expect(run.elapsedMs).toBeLessThan(30_000);
+      expect(asked).toHaveLength(0);
+      expect(run.err).toBe("attach: reattach socket unavailable\n");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 45_000);
+
+  it("a Keychain lookup is cut to what is left of the window", async () => {
+    const asked = await scriptedClaims([receipt()]);
+    vi.stubEnv("ACP_MCP_TOKEN", "");
+    vi.stubEnv("PATH", `${slowKeychain(6)}:${process.env["PATH"] ?? ""}`);
+    try {
+      const run = await runCommand({ claimRetry: { maxWaitMs: 1_000 } });
+      expect(run.code).toBe(ATTACH_EXIT.UNAVAILABLE);
+      expect(run.elapsedMs).toBeLessThan(3_000);
+      expect(asked).toHaveLength(0);
+      expect(run.err).toBe("attach: mcp token unavailable\n");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 20_000);
+
+  it("with an auto generation, reads the next one before every attempt and claims it", async () => {
+    // The relay read 2 (the binding it last held); the role had already moved to 3 when it claimed.
+    const asked = await scriptedClaims([refusal(ReasonCode.CONFLICT, "GENERATION_MISMATCH"), receipt()]);
+    const reads = [2, 3];
+    claim = { ...claim, expectedBindingGeneration: "auto" };
+    const relay = await attach(undefined, undefined, { ...quick, nextGeneration: async () => reads.shift() ?? 3 });
+    expect(relay.init.result).toBeDefined();
+    expect(asked.map((params) => params["expectedBindingGeneration"])).toEqual([2, 3]);
+    expect(asked.every((params) => params["claimedSessionUuid"] === claim.claimedSessionUuid)).toBe(true);
+    relay.stdin.end();
+    expect(await settles(relay.exit)).toBe(ATTACH_EXIT.OK);
+  });
+
+  it("a pinned generation that is stale is refused once, named, and the relay exits: it is never asked again", async () => {
+    const asked = await scriptedClaims([refusal(ReasonCode.CONFLICT, "GENERATION_MISMATCH"), receipt()]);
+    const relay = drive(mcpPath, TOKEN, quick);
+    expect(await settles(relay.exit)).toBe(ATTACH_EXIT.CLAIM_REFUSED);
+    expect(asked).toHaveLength(1);
+    expect(relay.err()).toBe(`attach: claim refused ${ReasonCode.CONFLICT} GENERATION_MISMATCH\n`);
+  });
+
+  it.each([
+    ["another conversation holds the role", ReasonCode.BINDING_ALREADY_ACTIVE, "BIND_REFUSED"],
+    ["the session is not entitled", ReasonCode.CONFLICT, "SESSION_NOT_ENTITLED"],
+    ["the project is not this session's", ReasonCode.CONFLICT, "PROJECT_NOT_ENTITLED"],
+    ["the conversation was switched over from", ReasonCode.CONFLICT, "SWITCHOVER_FENCED"],
+    ["this process's stored runtime differs from what it claims", ReasonCode.CONFLICT, "SAME_LIVE_RUNTIME_MISMATCH"],
+  ])("exits on the first answer when %s, naming the branch", async (_why, reasonCode, reason) => {
+    const asked = await scriptedClaims([refusal(reasonCode, reason), receipt()]);
+    claim = { ...claim, expectedBindingGeneration: "auto" };
+    const relay = drive(mcpPath, TOKEN, { ...quick, nextGeneration: async () => 3 });
+    expect(await settles(relay.exit)).toBe(ATTACH_EXIT.CLAIM_REFUSED);
+    expect(asked).toHaveLength(1);
+    expect(relay.err()).toBe(`attach: claim refused ${reasonCode} ${reason}\n`);
+  });
+
+  it("waits for a claim socket that is not listening yet, and claims once it is", async () => {
+    const relay = drive(mcpPath, TOKEN, quick);
+    await expect.poll(() => relay.err()).toContain("attach: claim socket unavailable; retrying\n");
+    await fakeClaim(receipt());
+    relay.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "claude-code", version: "2.1.323" } })
+      .catch(() => undefined);
+    await expect.poll(() => listeners.ctoConversation.unwakeableHolders().length).toBe(1);
+    relay.stdin.end();
+    expect(await settles(relay.exit)).toBe(ATTACH_EXIT.OK);
+  });
+
+  it("stops asking at the end of its window and exits with the last answer", async () => {
+    const asked = await scriptedClaims([refusal(ReasonCode.BINDING_ALREADY_ACTIVE, "PREDECESSOR_RUNTIME_ALIVE")]);
+    const relay = drive(mcpPath, TOKEN, { claimRetry: { initialDelayMs: 20, maxDelayMs: 40, maxWaitMs: 300 } });
+    expect(await settles(relay.exit)).toBe(ATTACH_EXIT.CLAIM_REFUSED);
+    expect(asked.length).toBeGreaterThan(1);
+    expect(relay.err().endsWith(`attach: claim refused ${ReasonCode.BINDING_ALREADY_ACTIVE} PREDECESSOR_RUNTIME_ALIVE\n`)).toBe(true);
+    expect(relay.out()).toBe("");
+  });
+
+  it("an auto generation that cannot be read ends the attach and says so", async () => {
+    const asked = await scriptedClaims([receipt()]);
+    claim = { ...claim, expectedBindingGeneration: "auto" };
+    const relay = drive(mcpPath, TOKEN, { ...quick, nextGeneration: async () => { throw new Error("no database"); } });
+    expect(await settles(relay.exit)).toBe(ATTACH_EXIT.UNAVAILABLE);
+    expect(asked).toHaveLength(0);
+    expect(relay.err()).toBe("attach: claim generation unreadable\n");
+  });
+
+  it("puts a branch name on stderr only when it has the shape of one", async () => {
+    await scriptedClaims([refusal(ReasonCode.CONFLICT, "/Users/someone/.secret path text")]);
+    const relay = drive(mcpPath, TOKEN, quick);
+    expect(await settles(relay.exit)).toBe(ATTACH_EXIT.CLAIM_REFUSED);
+    expect(relay.err()).toBe(`attach: claim refused ${ReasonCode.CONFLICT}\n`);
+  });
+
+  it("asks again only for names the claim can refuse with", () => {
+    const named = new Set<string>(Object.values(SelfClaimRefusal));
+    expect(RETRIED_CLAIM_REFUSALS.filter((reason) => !named.has(reason))).toEqual([]);
   });
 
   it("exits on a refused handshake with the daemon's reason code and writes no byte to stdout", async () => {

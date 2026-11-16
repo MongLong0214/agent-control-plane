@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { defaultConfig } from "../app/control-plane.ts";
-import { runAdoptedCeoAttachRelay, runAttachRelayCommand, type AttachRelayClaim } from "./attach-relay.ts";
+import { AUTO_GENERATION, runAdoptedCeoAttachRelay, runAttachRelayCommand, type AttachRelayClaim } from "./attach-relay.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -71,12 +71,14 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl adopt hermes                   ask the daemon to bind the live Hermes incumbent;
                                            binding alone does not mean the conversation is ready
   agentctl bootstrap hermes --target-bind-executable <path> --hermes-profile <profile> --hermes-home <path> --requested-session-id <id> --expected-lineage-root-digest <sha256> --executor-runtime-identity <identity> -- <command>
-  agentctl claim canonical-cto --claimed-session-id <uuid> --project-id <id> --expected-binding-generation <n>
+  agentctl claim canonical-cto --claimed-session-id <uuid> --project-id <id> [--expected-binding-generation <n>|auto]
                                            adopt the existing canonical CTO conversation in place;
                                            never launches a runtime the way bootstrap hermes does;
                                            reaches its own token-less socket, never ACP_OPERATOR_TOKEN
   agentctl attach resident-cto --claimed-session-id <uuid> --project-id <id>
-  agentctl attach canonical-cto --claimed-session-id <uuid> --project-id <id> --expected-binding-generation <n>
+  agentctl attach canonical-cto --claimed-session-id <uuid> --project-id <id> [--expected-binding-generation <n>|auto]
+                                           without a number (auto, the default) the generation is the
+                                           role's highest + 1, read again before each attempt;
                                            claim in memory, then relay this process's own stdin and
                                            stdout to the CTO MCP socket as the claimed session.
                                            Spawned by the canonical Claude Code as its stdio MCP
@@ -262,7 +264,8 @@ const parseCanonicalClaimSelectors = (selectorArgs: string[], label: string): Ca
     "--project-id": "projectId",
     "--expected-binding-generation": "expectedBindingGeneration",
   } as const;
-  const REQUIRED_CLAIM_SELECTORS = Object.keys(selectorFields) as (keyof typeof selectorFields)[];
+  // The generation is the one selector that may be left out: absent is `auto`.
+  const REQUIRED_CLAIM_SELECTORS = ["--claimed-session-id", "--project-id"] as const;
   const claimSelectors: Record<string, string> = {};
   for (let index = 0; index < selectorArgs.length; index += 2) {
     const option = selectorArgs[index]!;
@@ -278,15 +281,14 @@ const parseCanonicalClaimSelectors = (selectorArgs: string[], label: string): Ca
   if (REQUIRED_CLAIM_SELECTORS.some((option) => !claimSelectors[selectorFields[option]])) {
     return { ok: false, message: `${label} requires every selector` };
   }
-  let expectedBindingGeneration: number;
-  try {
-    expectedBindingGeneration = requiredInteger(
-      claimSelectors["expectedBindingGeneration"],
-      "--expected-binding-generation",
-      1,
-    );
-  } catch (err) {
-    return { ok: false, message: (err as Error).message };
+  let expectedBindingGeneration: AttachRelayClaim["expectedBindingGeneration"] = AUTO_GENERATION;
+  const pinned = claimSelectors["expectedBindingGeneration"];
+  if (pinned !== undefined && pinned !== AUTO_GENERATION) {
+    try {
+      expectedBindingGeneration = requiredInteger(pinned, "--expected-binding-generation", 1);
+    } catch (err) {
+      return { ok: false, message: `${(err as Error).message}, or auto` };
+    }
   }
   return {
     ok: true,
@@ -302,16 +304,40 @@ const claimCanonicalCtoSocketPath = (config: { databasePath: string }): string =
   process.env["ACP_CLAIM_CANONICAL_CTO_SOCKET"] ??
   join(config.databasePath, "..", "agentcpd.claim-canonical-cto.sock");
 
-const dispatchCanonicalSelfClaim = (args: string[], config: { databasePath: string }): Promise<number> => {
-  if (args[0] !== "canonical-cto") return Promise.resolve(fail(`unknown claim subcommand: ${args[0] ?? ""}`));
+/**
+ * The role's next generation: its highest `binding_generation` + 1, or 1 for a role never bound. Read from the
+ * database read-only, the one place every generation is written, so an `auto` claim asks for exactly the generation
+ * the claim's own compare will expect. The claim stays the authority: it refuses this number too if the role moved
+ * before it committed, and whether the previous binding may be replaced is its decision, not this read's.
+ */
+const nextBindingGeneration = async (databasePath: string, projectId: string): Promise<number> => {
+  const { default: Database } = await import("better-sqlite3");
+  const db = new Database(databasePath, { readonly: true, fileMustExist: true });
+  try {
+    const row = db.prepare("SELECT MAX(binding_generation) AS n FROM assignments WHERE role_key = ?")
+      .get(`PRIMARY_CTO:${projectId}`) as { n: number | null } | undefined;
+    return (row?.n ?? 0) + 1;
+  } finally {
+    db.close();
+  }
+};
+
+const dispatchCanonicalSelfClaim = async (args: string[], config: { databasePath: string }): Promise<number> => {
+  if (args[0] !== "canonical-cto") return fail(`unknown claim subcommand: ${args[0] ?? ""}`);
   const parsed = parseCanonicalClaimSelectors(args.slice(1), "claim canonical-cto");
-  if (!parsed.ok) return Promise.resolve(fail(parsed.message));
-  return exchangeCanonicalSelfClaimRequest(claimCanonicalCtoSocketPath(config), { ...parsed.selectors }).then(
-    (decision) => {
-      print(decision.allowed ? decision.value : decision);
-      return decision.allowed ? 0 : 1;
-    },
-  );
+  if (!parsed.ok) return fail(parsed.message);
+  const { selectors } = parsed;
+  let expectedBindingGeneration: number;
+  try {
+    expectedBindingGeneration = selectors.expectedBindingGeneration === AUTO_GENERATION
+      ? await nextBindingGeneration(config.databasePath, selectors.projectId)
+      : selectors.expectedBindingGeneration;
+  } catch {
+    return fail("claim canonical-cto could not read the role's next generation; pass --expected-binding-generation <n>");
+  }
+  const decision = await exchangeCanonicalSelfClaimRequest(claimCanonicalCtoSocketPath(config), { ...selectors, expectedBindingGeneration });
+  print(decision.allowed ? decision.value : decision);
+  return decision.allowed ? 0 : 1;
 };
 
 /**
@@ -331,16 +357,10 @@ const dispatchAdoptedCeoAttach = (args: string[], config: { databasePath: string
 };
 
 const dispatchAttach = (args: string[], config: { databasePath: string }): Promise<number> => {
+  // The provisioner's spelling, kept for the entries it already wrote: the same relay with the generation `auto`.
   if (args[0] === "resident-cto") {
-    return (async () => {
-      const { default: Database } = await import("better-sqlite3");
-      const project = args[args.indexOf("--project-id") + 1];
-      if (!project || !args.includes("--project-id")) return fail("resident attach requires project id");
-      const db = new Database(config.databasePath,{readonly:true,fileMustExist:true});
-      let generation: number;
-      try {generation = (db.prepare("SELECT MAX(binding_generation) AS n FROM assignments WHERE role_key = ?").get(`PRIMARY_CTO:${project}`) as {n:number|null}).n ?? 0;} finally {db.close();}
-      return dispatchAttach(["canonical-cto",...args.slice(1),"--expected-binding-generation",String(generation + 1)],config);
-    })();
+    if (!args.includes("--project-id")) return Promise.resolve(fail("resident attach requires project id"));
+    return dispatchAttach(["canonical-cto", ...args.slice(1)], config);
   }
   if (args[0] === "adopted-ceo") return dispatchAdoptedCeoAttach(args.slice(1), config);
   if (args[0] !== "canonical-cto") return Promise.resolve(fail(`unknown attach subcommand: ${args[0] ?? ""}`));
@@ -357,6 +377,7 @@ const dispatchAttach = (args: string[], config: { databasePath: string }): Promi
         process.env["ACP_CANONICAL_CTO_TOOL_SOCKET"] ??
         join(config.databasePath, "..", "agentcpd.canonical-cto-tools.sock"),
       claim: parsed.selectors,
+      nextGeneration: () => nextBindingGeneration(config.databasePath, parsed.selectors.projectId),
       // The daemon's wake endpoint directory is this same state directory.
       stateDir: join(config.databasePath, ".."),
     },
