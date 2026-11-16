@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { lstatSync, mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -77,6 +78,20 @@ const attach = async (stateDir: string, messagingSocket: string | undefined) => 
   return { code, err, connections: () => connections };
 };
 
+/**
+ * Leaves a socket file in `path` with nothing listening on it, the way a Claude Code that exited
+ * without cleaning up does: the process that bound it exits without closing, so the file stays.
+ */
+const abandonSocket = (path: string): void => {
+  const bound = spawnSync(
+    process.execPath,
+    ["-e", "require('net').createServer().listen(process.argv[1], () => process.exit(0))", path],
+    { encoding: "utf8", timeout: 10_000 },
+  );
+  expect(bound.status).toBe(0);
+  expect(lstatSync(path).isSocket()).toBe(true);
+};
+
 describe("attach canonical-cto requires a wakeable messaging socket", () => {
   it("refuses a socket outside the state directory, names the fix, and connects to nothing", async () => {
     const state = scratch();
@@ -111,5 +126,24 @@ describe("attach canonical-cto requires a wakeable messaging socket", () => {
     expect(run.err).not.toContain("cannot be woken");
     expect(run.connections()).toBe(1);
     expect(run.code).toBe(ATTACH_EXIT.CLAIM_REFUSED);
+  });
+
+  it("refuses a socket file in the state directory that nothing listens on, names the flag, and connects to nothing", async () => {
+    const state = scratch();
+    abandonSocket(join(state, "cc-session-cto.sock"));
+    const run = await attach(state, join(state, "cc-session-cto.sock"));
+    expect(run.code).toBe(ATTACH_EXIT.USAGE);
+    expect(run.err).toContain("cannot be woken");
+    expect(run.err).toContain("not listening");
+    expect(run.err).toContain(`start Claude Code with --messaging-socket-path ${state}/cc-session-<name>.sock`);
+    expect(run.connections()).toBe(0);
+  });
+
+  it("refuses a messaging socket path that does not exist", async () => {
+    const state = scratch();
+    const run = await attach(state, join(state, "cc-session-gone.sock"));
+    expect(run.code).toBe(ATTACH_EXIT.USAGE);
+    expect(run.err).toContain("start Claude Code with --messaging-socket-path");
+    expect(run.connections()).toBe(0);
   });
 });

@@ -1,7 +1,8 @@
 import { MAX_MCP_LINE_BYTES } from "../core/mcp-limits.ts";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { lstatSync, watch } from "node:fs";
+import { lstatSync, readFileSync, watch } from "node:fs";
+import { homedir } from "node:os";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import type { Readable, Writable } from "node:stream";
@@ -153,6 +154,13 @@ export interface AttachRelayOptions {
 export interface SessionMessaging {
   socketPath: string;
   token: string;
+  /**
+   * Where the wake proxy's socket is made; absent, beside `socketPath`. The daemon accepts a wake
+   * endpoint only directly inside its state directory, so the CLI entry names that directory and
+   * a session on Claude Code's default socket (`/tmp/cc-socks/<pid>.sock`) is woken the same as one
+   * launched with `--messaging-socket-path` in it. Never part of what the session or a client sends.
+   */
+  proxyDir?: string;
 }
 
 /**
@@ -729,8 +737,8 @@ type WakeTarget = { refusal: string } | { refusal: null; identity: string };
  * a symlink, owned by this uid and reachable by no one else; and the path itself `lstat`ed, never
  * followed — not a symlink, a socket, owned by this uid. With the proxy registered, the daemon
  * checks the proxy and never this socket, so these are the only checks the socket the token goes
- * to gets. The daemon's state-directory check needs no copy: the proxy sits in this socket's
- * directory, and the daemon accepts the proxy only there.
+ * to gets. The daemon's state-directory check needs no copy here: the proxy sits in the state directory
+ * (`SessionMessaging.proxyDir`), which is the only place the daemon accepts it, wherever this socket is.
  *
  * Copied rather than imported for the reason `WAKE_FRAME` is. `identity` is the file's device and
  * inode, which tell one socket from another put at the same name.
@@ -761,6 +769,7 @@ const inspectWakeTarget = (socketPath: string): WakeTarget => {
 
 /** A connect error as the daemon's wake classifies one; a Node error message names the path. */
 const wakeFailureShape = (error: NodeJS.ErrnoException): string => {
+  if (error.code === "ENOENT") return "not-found";
   if (error.code === "ECONNREFUSED") return "connection-refused";
   if (error.code === "ECONNRESET") return "connection-closed";
   if (error.code === "EPIPE") return "connection-closed";
@@ -768,12 +777,26 @@ const wakeFailureShape = (error: NodeJS.ErrnoException): string => {
 };
 
 /**
+ * What the proxy tells the daemon of a forward that failed: one of a closed set the daemon
+ * recognizes, never a path or an error message. A session socket that no longer resolves is
+ * `not-found` (its name is gone) or `connection-refused` (its name is there and nothing listens),
+ * which the daemon reports as the role's own unwakeable cause; every other check that refused the
+ * forward is `refused`.
+ */
+const replyShapeOf = (shape: string): string => {
+  if (shape === "endpoint-not-inspectable") return "not-found";
+  if (["not-found", "connection-refused", "timeout", "connection-closed", "unclassified"].includes(shape)) return shape;
+  return "refused";
+};
+
+/**
  * Opens the wake proxy beside the session's messaging socket, or answers null and says why.
  *
- * **Beside it, rather than in a `wake-proxy/` directory of its own.** The daemon takes a wake
- * endpoint only directly in its state directory (`dirname(endpoint) !== dir` is a refusal), and
- * the session's own socket can register only when it sits there, so the proxy passes the daemon's
- * checks exactly when the session's socket would, with none of them loosened. The name is random,
+ * **In the daemon's state directory** (`SessionMessaging.proxyDir`), since the daemon takes a wake
+ * endpoint only directly there (`dirname(endpoint) !== dir` is a refusal). The proxy used to sit beside
+ * the session's socket, which made a session on Claude Code's default socket (`/tmp/cc-socks/<pid>.sock`)
+ * unwakeable (#1427); with no `proxyDir` it still does. The session's own socket is checked by
+ * `inspectWakeTarget` wherever it is, so no daemon check is loosened. The name is random,
  * and `listen` refuses a path that already exists. A relay killed before it closes leaves its
  * path behind; nothing sweeps it.
  *
@@ -809,7 +832,7 @@ const openWakeProxy = (messaging: SessionMessaging, stderr: Writable): Promise<W
     stderr.write(`attach: wake proxy not opened ${opening.refusal}\n`);
     return Promise.resolve(null);
   }
-  const path = join(dirname(messaging.socketPath), `acp-wake-proxy-${randomBytes(8).toString("hex")}.sock`);
+  const path = join(messaging.proxyDir ?? dirname(messaging.socketPath), `acp-wake-proxy-${randomBytes(8).toString("hex")}.sock`);
   const connections = new Set<Socket>();
 
   let requested = 0;
@@ -818,11 +841,11 @@ const openWakeProxy = (messaging: SessionMessaging, stderr: Writable): Promise<W
   let closed = false;
   let availability = 0;
   const waiting = new Map<Socket, number>();
-  const answer = (through: number, accepted: boolean): void => {
+  const answer = (through: number, accepted: boolean, shape?: string): void => {
     for (const [socket, sequence] of waiting) {
       if (sequence > through) continue;
       waiting.delete(socket);
-      socket.end(`${JSON.stringify({ accepted })}\n`);
+      socket.end(`${JSON.stringify(accepted ? { accepted } : { accepted, shape: replyShapeOf(shape ?? "unclassified") })}\n`);
     }
   };
   const forward = (): void => {
@@ -834,7 +857,7 @@ const openWakeProxy = (messaging: SessionMessaging, stderr: Writable): Promise<W
     const failed = (shape: string): void => {
       forwarding = false;
       stderr.write(`attach: wake forward failed ${shape}\n`);
-      answer(through, false);
+      answer(through, false, shape);
       // An event during this attempt must survive the failure too.
       if (requested > through || availability > beganAtAvailability) queueMicrotask(forward);
       // Keep the outstanding signal. A filesystem change or another wake retries it.
@@ -944,27 +967,110 @@ export interface AttachRelayCommandOptions {
    * relay refuses to start unless the session's messaging socket sits directly inside it.
    */
   stateDir?: string;
+  /** Where the claimed session is recorded; absent, Claude Code's own `~/.claude/sessions` and this process's ancestry. */
+  sessionRegistry?: SessionRegistry;
 }
 
 /**
- * Why this session could never be woken, or null when its messaging socket is where the daemon
- * accepts one: directly inside `stateDir` (`dirname(endpoint) !== dir` in `src/mcp/role-conversation.ts`,
- * compared the same way, against the resolved directory), and then the daemon's own checks of the
- * socket itself (`inspectWakeTarget`). Refused here, at launch, because the alternative is a
- * session that attaches, works, and is silently unwakeable: the wake proxy is opened beside the
- * socket, so a socket the daemon would refuse takes its proxy with it.
+ * Where Claude Code records each live session: `<dir>/<pid>.json`, carrying that process's `pid`,
+ * `sessionId` and the `messagingSocketPath` it bound (measured on Claude Code 2.1.323, one file per
+ * session, for a session on its default socket and one given `--messaging-socket-path` alike).
+ * `ancestors` are this relay's parent pids, nearest first: the session is the one of them that has a
+ * file here. Injected so a test names its own directory and its own ancestry.
  */
-const unwakeableSessionRefusal = (messaging: SessionMessaging | undefined, stateDir: string): string | null => {
-  const fix = `start Claude Code with --messaging-socket-path ${resolvePath(stateDir)}/cc-session-<name>.sock`;
-  if (messaging === undefined) {
-    return `attach: this session cannot be woken: it has no messaging socket (CLAUDE_CODE_MESSAGING_SOCKET or token unset); ${fix}`;
+export interface SessionRegistry {
+  dir: string;
+  ancestors: () => number[];
+}
+
+const defaultSessionRegistry = (): SessionRegistry => ({
+  dir: join(process.env["CLAUDE_CONFIG_DIR"] ?? join(homedir(), ".claude"), "sessions"),
+  ancestors: () => {
+    const chain: number[] = [];
+    let pid = process.ppid;
+    for (let depth = 0; depth < 16 && Number.isInteger(pid) && pid > 1; depth += 1) {
+      chain.push(pid);
+      try {
+        pid = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8", timeout: 2_000 }).trim());
+      } catch {
+        break;
+      }
+    }
+    return chain;
+  },
+});
+
+/**
+ * Proof that `messaging.socketPath` is the socket of the session this attach claims, and no other
+ * session's. The environment is the session's own (Claude Code gives it to its child), and this
+ * reads it back from the registry: the nearest ancestor with a registry file is the session, its
+ * `sessionId` must be the one the claim names, and the socket it bound must be the one the
+ * environment gave. Nothing is searched for: a directory of other sessions' sockets is never read,
+ * so there is no socket here to select by mistake. Null when proved, else the check that failed.
+ */
+const sessionSocketProofFailure = (
+  messaging: SessionMessaging,
+  claimedSessionUuid: string,
+  registry: SessionRegistry,
+): string | null => {
+  for (const pid of registry.ancestors()) {
+    let entry: { pid?: unknown; sessionId?: unknown; messagingSocketPath?: unknown };
+    try {
+      entry = JSON.parse(readFileSync(join(registry.dir, `${pid}.json`), "utf8")) as typeof entry;
+    } catch {
+      continue;
+    }
+    if (entry.pid !== pid) continue;
+    if (typeof entry.sessionId !== "string" || entry.sessionId.toLowerCase() !== claimedSessionUuid.toLowerCase()) {
+      return "socket-belongs-to-another-session";
+    }
+    if (entry.messagingSocketPath !== messaging.socketPath) return "socket-is-not-the-sessions-registered-socket";
+    return null;
   }
-  if (dirname(messaging.socketPath) !== resolvePath(stateDir)) {
-    return `attach: this session cannot be woken: its messaging socket is not directly inside the ACP state directory; ${fix}`;
+  return "session-not-in-registry";
+};
+
+/** Whether anything accepts connections at `socketPath`: false only on ENOENT or ECONNREFUSED. A slow answer is not a refusal. */
+const socketIsListening = (socketPath: string): Promise<boolean> =>
+  new Promise((resolveProbe) => {
+    const probe = createConnection(socketPath);
+    probe.setTimeout(WAKE_PROXY_TIMEOUT_MS, () => { probe.destroy(); resolveProbe(true); });
+    probe.once("connect", () => { probe.destroy(); resolveProbe(true); });
+    probe.once("error", (error: NodeJS.ErrnoException) => {
+      probe.destroy();
+      resolveProbe(error.code !== "ENOENT" && error.code !== "ECONNREFUSED");
+    });
+  });
+
+/**
+ * Why this session can never be woken, or null when it can: refused at launch, where the operator
+ * is looking, because the alternative is a session that attaches, works, and is silently
+ * unwakeable. Only a session with no socket at all is refused (#1427): the one Claude Code gave
+ * its default socket is woken as the one launched with `--messaging-socket-path` is, because the
+ * relay's proxy sits in the daemon's state directory and forwards to the session's own socket
+ * wherever it is. That socket must be one the daemon's own endpoint checks (`inspectWakeTarget`)
+ * would pass, must be listening now, and, outside the state directory, must be proved to be this
+ * claimed session's (`sessionSocketProofFailure`).
+ */
+const unwakeableSessionRefusal = async (
+  messaging: SessionMessaging | undefined,
+  stateDir: string,
+  claimedSessionUuid: string,
+  registry: SessionRegistry,
+): Promise<string | null> => {
+  const fix = `start Claude Code with --messaging-socket-path ${resolvePath(stateDir)}/cc-session-<name>.sock`;
+  const refused = (why: string): string => `attach: this session cannot be woken: ${why}; ${fix}`;
+  if (messaging === undefined) {
+    return refused("it has no messaging socket (CLAUDE_CODE_MESSAGING_SOCKET or token unset)");
   }
   const target = inspectWakeTarget(messaging.socketPath);
-  if (target.refusal !== null) {
-    return `attach: this session cannot be woken: its messaging socket was refused (${target.refusal}); ${fix}`;
+  if (target.refusal !== null) return refused(`its messaging socket was refused (${target.refusal})`);
+  if (dirname(messaging.socketPath) !== resolvePath(stateDir)) {
+    const failure = sessionSocketProofFailure(messaging, claimedSessionUuid, registry);
+    if (failure !== null) return refused(`its messaging socket cannot be proved to be this session's (${failure})`);
+  }
+  if (!(await socketIsListening(messaging.socketPath))) {
+    return refused("its messaging socket is not listening");
   }
   return null;
 };
@@ -988,11 +1094,20 @@ export const runAttachRelayCommand = async (
   // which presents it on `cto.mcp.sock`.
   io.stdin.pause();
   // Read before either path, so a reattached relay and a claimed one both open the wake proxy.
-  const messaging = sessionMessagingFromEnv();
+  const environment = sessionMessagingFromEnv();
+  // The proxy goes in the daemon's state directory, wherever the session's own socket is.
+  const messaging = environment === undefined || options.stateDir === undefined
+    ? environment
+    : { ...environment, proxyDir: resolvePath(options.stateDir) };
   // Before anything connects: a role holder that cannot be woken is refused where the operator
   // is looking, not left to fail as a stderr line nobody reads.
   if (options.stateDir !== undefined) {
-    const refusal = unwakeableSessionRefusal(messaging, options.stateDir);
+    const refusal = await unwakeableSessionRefusal(
+      environment,
+      options.stateDir,
+      options.claim.claimedSessionUuid,
+      options.sessionRegistry ?? defaultSessionRegistry(),
+    );
     if (refusal !== null) {
       io.stderr.write(`${refusal}\n`);
       return ATTACH_EXIT.USAGE;

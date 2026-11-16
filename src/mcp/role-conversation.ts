@@ -109,7 +109,20 @@ interface LivePeer {
    * untouched.
    */
   wakeOptOut: boolean;
+  /**
+   * What the last wake that landed on this registration was sent for: the pending-work signature
+   * at the time, and when. A wake sent again for the same unprocessed work within
+   * `ROLE_WAKE_COALESCE_MS` adds a second "ACP-ROLE-WAKE" to the session's conversation and tells
+   * it nothing; it is suppressed as `already-woken`. Scoped to the registration, like `endpoint`.
+   */
+  lastWake: { readonly signature: string; readonly at: number } | null;
 }
+
+/**
+ * How long a landed wake stands for the same unprocessed work. Compared at a wake attempt, never
+ * scheduled: nothing re-checks when it passes, the next attempt simply is not coalesced.
+ */
+export const ROLE_WAKE_COALESCE_MS = 30_000;
 
 /**
  * The one question attach and deliver both ask: is this connection still *the* holder of the
@@ -294,10 +307,18 @@ export interface WrittenRoleWake {
 /** One wake that was refused before it connected, or whose connection failed, and the code it was refused with. */
 export interface FailedRoleWake extends WrittenRoleWake {
   readonly reasonCode: ReasonCode;
+  /**
+   * How the connection failed, when one was made: a `WakeFailure` shape. Absent for a wake refused
+   * before it connected, which has a reason code and no connection shape.
+   */
+  readonly shape?: string;
 }
 
 /** One wake that wrote no frame because the holder's registration opted out, and why it was sent. */
-export type SuppressedRoleWake = WrittenRoleWake;
+export interface SuppressedRoleWake extends WrittenRoleWake {
+  /** Why no frame was written: the holder's opt-out, nothing pending for it, or the same work already woken for. */
+  readonly suppressedBy: "holder-opt-out" | "no-pending-work" | "already-woken";
+}
 
 /**
  * The exact bytes of a wake: one newline-delimited JSON frame carrying the token as its content.
@@ -318,7 +339,32 @@ export const ROLE_WAKE_FRAME = `${JSON.stringify({
 })}\n`;
 
 /** The fixed failure shapes a wake may report. A local path is never one of them. */
-type WakeFailure = { shape: "timeout" | "connection-refused" | "connection-closed" | "unclassified" };
+type WakeFailure = {
+  shape:
+    | "timeout"
+    | "connection-refused"
+    | "connection-closed"
+    | "unclassified"
+    // Only a relay's wake proxy can say these: it answered, and its own forward to the session's
+    // socket failed. `target-not-found` and `target-connection-refused` are the session's socket
+    // no longer resolving (#1427); `target-failed` is any other failure of the forward.
+    | "target-not-found"
+    | "target-connection-refused"
+    | "target-failed";
+};
+
+/** What a relay's wake proxy may name as the shape of a forward that failed; anything else is `target-failed`. */
+const relayForwardShape = (reply: string): WakeFailure["shape"] | null => {
+  try {
+    const parsed = JSON.parse(reply) as { accepted?: unknown; shape?: unknown };
+    if (parsed.accepted !== false) return null;
+    if (parsed.shape === "not-found") return "target-not-found";
+    if (parsed.shape === "connection-refused") return "target-connection-refused";
+    return typeof parsed.shape === "string" ? "target-failed" : "connection-refused";
+  } catch {
+    return null;
+  }
+};
 
 /**
  * Which endpoint check refused, as a closed set of categories.
@@ -371,6 +417,11 @@ export interface WakeTransportClient {
  * passes the checks `wake` makes before it connects — a socket that has gone, or a state directory
  * whose ownership or mode has changed under it.
  *
+ * `registered-endpoint-target-gone` is that state when the endpoint is a relay's wake proxy and the
+ * relay reported that the session's own socket it forwards to no longer resolves (#1427): the
+ * remedy is the session's socket, not the relay, so it is named apart. Recorded only from a wake
+ * that was being sent anyway, and cleared by the next one that lands.
+ *
  * `registered-endpoint-refused-the-wake` is the state those checks cannot see: the path is still
  * there and still a socket this uid owns, and the connect is refused anyway because the process
  * that bound it is gone. Reproduced by both reviewers, who found `wake` answering ROLE_PEER_FAILED
@@ -381,7 +432,8 @@ export interface WakeTransportClient {
 export type UnwakeableCause =
   | "no-registered-endpoint"
   | "registered-endpoint-not-usable"
-  | "registered-endpoint-refused-the-wake";
+  | "registered-endpoint-refused-the-wake"
+  | "registered-endpoint-target-gone";
 
 /**
  * A binding that is active, whose holder is connected, and which still cannot receive a wake.
@@ -467,6 +519,13 @@ export class RoleConversationPort {
    * `false` skips the wake; an absent or failing lookup wakes unconditionally.
    */
   readonly #holderHasWork: ((holder: HolderIdentity) => boolean) | null;
+  /**
+   * The ids of everything pending for this exact holder, joined, or "" when nothing is. Asked at
+   * every wake that names a cause, so a wake with nothing pending is not sent and a second wake for
+   * the same pending work is not sent twice. Absent, those wakes are sent as before.
+   */
+  readonly #holderWorkSignature: ((holder: HolderIdentity) => string) | null;
+  readonly #now: () => number;
 
   constructor(
     role: Role,
@@ -480,6 +539,8 @@ export class RoleConversationPort {
       onWakeWritten?: (wake: WrittenRoleWake) => void;
       onWakeSuppressed?: (wake: SuppressedRoleWake) => void;
       holderHasWork?: (holder: HolderIdentity) => boolean;
+      holderWorkSignature?: (holder: HolderIdentity) => string;
+      now?: () => number;
     } = {},
   ) {
     this.#role = role;
@@ -489,6 +550,8 @@ export class RoleConversationPort {
     this.#onWakeFailed = options.onWakeFailed ?? null;
     this.#onWakeSuppressed = options.onWakeSuppressed ?? null;
     this.#holderHasWork = options.holderHasWork ?? null;
+    this.#holderWorkSignature = options.holderWorkSignature ?? null;
+    this.#now = options.now ?? Date.now;
     this.#ownerMessages = options.ownerMessages ?? null;
     this.#endpointDir = options.endpointDir === undefined ? null : resolvePath(options.endpointDir);
     this.#wakeTimeoutMs = options.wakeTimeoutMs ?? DEFAULT_ROLE_WAKE_TIMEOUT_MS;
@@ -592,6 +655,7 @@ export class RoleConversationPort {
         registration: 0,
         wakeFailure: null,
         wakeOptOut: false,
+        lastWake: null,
       };
       this.#connections.get(binding.roleKey)!.add(connection);
       this.#live.set(binding.roleKey, connection);
@@ -722,7 +786,10 @@ export class RoleConversationPort {
     const endpoint = peer.endpoint;
     if (endpoint === null) return "no-registered-endpoint";
     if (!this.#validateEndpointPath(endpoint).allowed) return "registered-endpoint-not-usable";
-    return peer.wakeFailure !== null ? "registered-endpoint-refused-the-wake" : null;
+    if (peer.wakeFailure === null) return null;
+    return peer.wakeFailure.shape === "target-not-found" || peer.wakeFailure.shape === "target-connection-refused"
+      ? "registered-endpoint-target-gone"
+      : "registered-endpoint-refused-the-wake";
   }
 
   /**
@@ -1122,6 +1189,7 @@ export class RoleConversationPort {
           roleKey,
           cause: cause ?? (mention ? ROLE_WAKE_CAUSE.MENTION : ROLE_WAKE_CAUSE.UNSPECIFIED),
           reasonCode: decision.reasonCode,
+          ...(typeof decision.evidence["shape"] === "string" ? { shape: decision.evidence["shape"] } : {}),
         });
       } catch {
         // Only the record is lost.
@@ -1158,6 +1226,7 @@ export class RoleConversationPort {
         this.#onWakeSuppressed?.({
           roleKey,
           cause: cause ?? (mention ? ROLE_WAKE_CAUSE.MENTION : ROLE_WAKE_CAUSE.UNSPECIFIED),
+          suppressedBy: "holder-opt-out",
         });
       } catch {
         // Only the record is lost.
@@ -1179,6 +1248,43 @@ export class RoleConversationPort {
         role: this.#role,
         roleKey,
       }));
+    }
+    // A wake that names its cause is a hint that something is pending for this exact holder, and is
+    // sent only if something is (#1427). Nothing pending (the holder already claimed it, or it was
+    // withdrawn) writes no frame; the same unprocessed work already woken for within the coalescing
+    // window writes no second one. A holder with work the port cannot read, or a failing lookup, is
+    // woken, as the registration wake is. A direct wake that names no cause is sent as it always was.
+    let signature: string | null = null;
+    // The registration's and the fallback's wakes ask `holderHasWork` themselves, before they get here.
+    const askedAlready = cause === ROLE_WAKE_CAUSE.REGISTRATION || cause === ROLE_WAKE_CAUSE.CONNECTION_FALLBACK;
+    if ((cause !== undefined || mention !== undefined) && !askedAlready && this.#holderWorkSignature !== null) {
+      const holder = this.#holderFor(peer.server, roleKey);
+      if (holder.allowed) {
+        try {
+          signature = this.#holderWorkSignature(holder.value);
+        } catch {
+          signature = null;
+        }
+      }
+      const suppressedBy = signature === "" ? "no-pending-work"
+        : signature !== null && peer.lastWake !== null && peer.lastWake.signature === signature &&
+            this.#now() - peer.lastWake.at < ROLE_WAKE_COALESCE_MS ? "already-woken" : null;
+      if (suppressedBy !== null) {
+        try {
+          this.#onWakeSuppressed?.({
+            roleKey,
+            cause: cause ?? (mention ? ROLE_WAKE_CAUSE.MENTION : ROLE_WAKE_CAUSE.UNSPECIFIED),
+            suppressedBy,
+          });
+        } catch {
+          // Only the record is lost.
+        }
+        return deny(ReasonCode.ROLE_WAKE_SUPPRESSED, "nothing is pending for this holder that a wake has not already announced; nothing was written", {
+          role: this.#role,
+          roleKey,
+          suppressedBy,
+        });
+      }
     }
 
     // Read before the connect and compared after it. What this delivery is about is the
@@ -1218,7 +1324,7 @@ export class RoleConversationPort {
             reply += chunk;
             if (reply.length > 128) return fail({ shape: "unclassified" });
             if (!reply.includes("\n")) return;
-            if (reply !== '{"accepted":true}\n') return fail({ shape: "connection-refused" });
+            if (reply !== '{"accepted":true}\n') return fail({ shape: relayForwardShape(reply) ?? "connection-refused" });
             socket.destroy();
             resolveWake("written");
           });
@@ -1305,7 +1411,10 @@ export class RoleConversationPort {
     // and only the memory of the registration this delivery belonged to. A success completing after
     // the holder registered again used to clear unconditionally, which erased the newer
     // registration's own refusal and reported a holder nothing can wake as wakeable.
-    if (peer.registration === registration) peer.wakeFailure = null;
+    if (peer.registration === registration) {
+      peer.wakeFailure = null;
+      peer.lastWake = signature === null || signature === "" ? null : { signature, at: this.#now() };
+    }
     // #1103 — recorded only for a frame that was handed off, and on the next turn of the event
     // loop rather than here: a registration's answer waits on this wake, and a relay reattaching
     // after a restart is refusing its client's requests until that answer arrives, so the record
