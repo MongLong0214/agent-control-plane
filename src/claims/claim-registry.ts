@@ -7,8 +7,20 @@ import { newClaimId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import { RunState } from "../domain/types.ts";
 import { canonical } from "../guard/workspace-probe.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
+
+/** The run states in which its frozen candidate is the one reviewed or approved, and so the one merged. */
+const CANDIDATE_BOUND_STATES: ReadonlySet<string> = new Set([
+  RunState.READY_FOR_CEO_REVIEW,
+  RunState.CEO_APPROVED,
+  RunState.MERGING,
+  RunState.POST_MERGE_VERIFYING,
+]);
+
+/** Per repository identity, the branches a run's current frozen candidate merges. */
+export type CandidateBranches = (runId: string) => ReadonlyMap<string, readonly string[]>;
 
 export interface ClaimRequest {
   runId: string;
@@ -202,9 +214,16 @@ export class ClaimRegistry {
   ) {}
 
   #checkoutWriter: CheckoutWriter | null = null;
+  #candidateBranches: CandidateBranches | null = null;
 
-  attach(ports: { checkoutWriter: CheckoutWriter }): void {
+  attach(ports: { checkoutWriter: CheckoutWriter; candidateBranches?: CandidateBranches }): void {
     this.#checkoutWriter = ports.checkoutWriter;
+    this.#candidateBranches = ports.candidateBranches ?? null;
+  }
+
+  /** The branches of `repositoryIdentity` the run's current frozen candidate merges; none without such a candidate. */
+  private mergedBranches(runId: string, repositoryIdentity: string): readonly string[] {
+    return this.#candidateBranches?.(runId).get(repositoryIdentity) ?? [];
   }
 
   /** Every claim read uses the same lease boundary as acquisition. */
@@ -231,8 +250,8 @@ export class ClaimRegistry {
         );
       }
 
-      const authorized = this.db.get<{ run_id: string; checkout_path: string }>(
-        `SELECT r.run_id, repo.checkout_path
+      const authorized = this.db.get<{ run_id: string; checkout_path: string; state: string }>(
+        `SELECT r.run_id, r.state, repo.checkout_path
            FROM runs r
            JOIN assignments a ON a.role_key = r.owner_role_key
                              AND a.session_id = r.owner_session_id
@@ -241,7 +260,7 @@ export class ClaimRegistry {
            JOIN run_repositories rr ON rr.run_id = r.run_id
            JOIN repositories repo ON repo.repository_id = rr.repository_id
           WHERE r.run_id = ?
-            AND r.state = 'ACTIVE'
+            AND r.state IN ('ACTIVE', 'CEO_APPROVED', 'MERGING')
             AND r.owner_role_key = ?
             AND r.owner_session_id = ?
             AND r.owner_binding_generation = ?
@@ -272,6 +291,30 @@ export class ClaimRegistry {
             repositoryIdentity: request.repositoryIdentity,
           },
         );
+      }
+
+      // Recovery (#1414): an approved run's current owner may take back exactly the branch its frozen candidate
+      // merges, which finalization needs claimed. No worktree, path or other branch is claimable in that state.
+      if (authorized.state !== RunState.ACTIVE) {
+        const merged = this.mergedBranches(request.runId, request.repositoryIdentity);
+        if (
+          !request.branch || !merged.includes(request.branch) ||
+          (request.worktreeId !== undefined && request.worktreeId !== null) ||
+          (request.declaredPaths?.length ?? 0) > 0
+        ) {
+          return deny(
+            ReasonCode.CLAIM_OWNER_NOT_RUN_OWNER,
+            `run is ${authorized.state}: its owner may claim only the branch its frozen candidate merges, ` +
+              "and no worktree or path",
+            {
+              runId: request.runId,
+              state: authorized.state,
+              repositoryIdentity: request.repositoryIdentity,
+              branch: request.branch ?? null,
+              candidateBranches: merged,
+            },
+          );
+        }
       }
 
       if (request.worktreeId !== undefined && request.worktreeId !== null && !request.worktreeId.trim()) {
@@ -500,13 +543,13 @@ export class ClaimRegistry {
    * §23.2 — releasing is a write on another run's coordination state when the claim is not
    * yours, so a caller acting for a run must say which run it is acting for.
    */
-  release(claimId: string, runId: string): Decision<void> {
+  release(claimId: string, runId: string, options: { keepMergedBranch?: boolean } = {}): Decision<void> {
     // One transaction: read, authorise, update, record. §30.3 — a release that is decided
     // on one snapshot and applied to another can free a claim another writer just took.
     return this.db.tx(() => {
       this.expireOverdue();
-      const row = this.db.get<{ status: string; run_id: string }>(
-        `SELECT status, run_id FROM resource_claims WHERE claim_id = ?`,
+      const row = this.db.get<{ status: string; run_id: string; repository_identity: string; branch: string | null }>(
+        `SELECT status, run_id, repository_identity, branch FROM resource_claims WHERE claim_id = ?`,
         [claimId],
       );
       if (!row) return deny(ReasonCode.NOT_FOUND, "unknown claim", { claimId });
@@ -522,6 +565,10 @@ export class ClaimRegistry {
       if (row.status !== "HELD") {
         return deny(ReasonCode.CLAIM_NOT_HELD, "claim is not held", { claimId });
       }
+      if (options.keepMergedBranch) {
+        const kept = this.keptForMerge(row);
+        if (kept) return kept;
+      }
 
       this.db.run(
         `UPDATE resource_claims SET status = 'RELEASED', released_at = ? WHERE claim_id = ? AND status = 'HELD'`,
@@ -529,6 +576,41 @@ export class ClaimRegistry {
       );
       this.audit.record({ kind: "CLAIM_RELEASED", runId: row.run_id, evidence: { claimId } });
       return allow(ReasonCode.OK, undefined);
+    });
+  }
+
+  /**
+   * #1414 — a claim on a branch the run's frozen candidate merges is what finalization checks before it merges;
+   * released once the candidate is on its way to the merge, it strands an approved run (`acquire` recovers one).
+   * Null when the claim may go: another branch, a worktree or path claim, no frozen candidate, or a run still
+   * ACTIVE (its checkout's branch moves with every task and a new freeze replaces the candidate, so the owner's
+   * routine release after a worker turn is not this) or ended.
+   */
+  private keptForMerge(claim: { run_id: string; repository_identity: string; branch: string | null }): Decision<void> | null {
+    if (!claim.branch) return null;
+    const state = this.db.get<{ state: RunState }>(`SELECT state FROM runs WHERE run_id = ?`, [claim.run_id])?.state;
+    if (!state || !CANDIDATE_BOUND_STATES.has(state)) return null;
+    if (!this.mergedBranches(claim.run_id, claim.repository_identity).includes(claim.branch)) return null;
+    return deny(
+      ReasonCode.CLAIM_RELEASE_REFUSED,
+      `the claim on branch '${claim.branch}' is kept: the run's frozen candidate merges that branch, and the run ` +
+        "cannot finalize without the claim; it is released when the run ends",
+      { runId: claim.run_id, repositoryIdentity: claim.repository_identity, branch: claim.branch, runState: state },
+    );
+  }
+
+  /** `resource_release` without a claim id: every HELD claim of the run, unless one is kept for the merge (`keptForMerge`). */
+  releaseOwned(runId: string): Decision<number> {
+    return this.db.tx(() => {
+      this.expireOverdue();
+      for (const held of this.db.all<{ run_id: string; repository_identity: string; branch: string | null }>(
+        `SELECT run_id, repository_identity, branch FROM resource_claims WHERE run_id = ? AND status = 'HELD'`,
+        [runId],
+      )) {
+        const kept = this.keptForMerge(held);
+        if (kept) return kept as Decision<number>;
+      }
+      return allow(ReasonCode.OK, this.releaseRun(runId));
     });
   }
 

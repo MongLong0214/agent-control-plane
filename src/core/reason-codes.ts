@@ -454,6 +454,8 @@ export const ReasonCode = {
   CLAIM_PATH_CONFLICT: "CLAIM_PATH_CONFLICT",
   CLAIM_OWNER_GENERATION_REVOKED: "CLAIM_OWNER_GENERATION_REVOKED",
   CLAIM_NOT_HELD: "CLAIM_NOT_HELD",
+  /** #1414 — a claim on a branch the run's frozen candidate merges is not released while the run can still finalize. */
+  CLAIM_RELEASE_REFUSED: "CLAIM_RELEASE_REFUSED",
   SEMANTIC_CONFLICT_ADVISORY: "SEMANTIC_CONFLICT_ADVISORY",
 
   // --- verification --------------------------------------------------------

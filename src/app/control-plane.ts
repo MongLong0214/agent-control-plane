@@ -21,7 +21,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { ArtifactStore, type EvidenceWriterSet } from "../db/artifacts.ts";
 import { Db } from "../db/database.ts";
 import { databaseSidecarPaths, ensurePrivateDirectory } from "../db/state-preflight.ts";
-import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
+import { ArtifactKind, Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import {
   ManagedWriteGuard,
   type BootstrapManifestAuthority,
@@ -29,6 +29,7 @@ import {
   type RepairWorktreeAuthority,
 } from "../guard/managed-write-guard.ts";
 import { type WorkspaceProbe, realWorkspaceProbe } from "../guard/workspace-probe.ts";
+import type { CandidateSnapshot } from "../snapshot/candidate-snapshot.ts";
 import { Outbox } from "../outbox/outbox.ts";
 import { ProjectRegistry, type ManagedManifestWrite } from "../registry/project-registry.ts";
 import { ManifestActivationGrants } from "../registry/manifest-activation-grants.ts";
@@ -683,7 +684,10 @@ export class ControlPlane {
       }, config.importRoot === undefined ? {} : { importRoot: config.importRoot });
       // S2 — a run's claim on its checkout passes to its next claim only when the runner says nothing
       // a turn of that run started can still write the checkout.
-      this.claims.attach({ checkoutWriter: (runId, worktreeId) => this.workerTurns.checkoutWriter(runId, worktreeId) });
+      this.claims.attach({
+        checkoutWriter: (runId, worktreeId) => this.workerTurns.checkoutWriter(runId, worktreeId),
+        candidateBranches: (runId) => this.candidateBranches(runId, config.workspaceProbe ?? realWorkspaceProbe),
+      });
       // The shared packet-reviewer predicate, read from the raw reviewer adapter (the registry hands
       // out only wrapped ones): the gate may pass over its preferred reviewer only when this says
       // UNCONFIGURED. Only the Codex adapter has such a scope.
@@ -994,6 +998,26 @@ export class ControlPlane {
       this.db.close();
       throw error;
     }
+  }
+
+  /**
+   * #1414 — per repository, the branch the run's current frozen candidate merges, resolved as finalization
+   * does (`ApprovedRunFinalizer.reconfirmAndPlan`): the run's recorded work branch, else the one its checkout
+   * stands on. Nothing without a current candidate, and no repository the candidate does not hold.
+   */
+  private candidateBranches(runId: string, probe: WorkspaceProbe): ReadonlyMap<string, readonly string[]> {
+    const branches = new Map<string, readonly string[]>();
+    const current = this.runs.currentCandidate(runId);
+    const snapshot = current
+      ? this.artifacts.latestForSnapshot<CandidateSnapshot>(runId, ArtifactKind.CANDIDATE_SNAPSHOT, current)
+      : null;
+    if (!snapshot || snapshot.superseded) return branches;
+    for (const participant of this.runs.repositoriesOf(runId)) {
+      if (!snapshot.content.repositories.some((entry) => entry.identity === participant.identity)) continue;
+      const branch = participant.workBranch ?? probe.currentBranch(participant.checkoutPath);
+      if (branch) branches.set(participant.identity, [branch]);
+    }
+    return branches;
   }
 
   private defaultAdapters(): RegisteredAdapter[] {

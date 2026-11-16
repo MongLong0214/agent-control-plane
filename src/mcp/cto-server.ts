@@ -377,8 +377,9 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     acquireClaims: (input: Parameters<ClaimRegistry["acquire"]>[0]) => source.claims.acquire(input),
     advisoryOverlaps: (repositoryIdentity: string, runId: string, declaredPaths: readonly string[]) =>
       source.claims.advisoryOverlaps(repositoryIdentity, runId, declaredPaths),
-    releaseClaim: (claimId: string, runId: string) => source.claims.release(claimId, runId),
-    releaseRunClaims: (runId: string) => source.claims.releaseRun(runId),
+    // #1414 — the owner's release keeps the claim on a branch the run's frozen candidate merges.
+    releaseClaim: (claimId: string, runId: string) => source.claims.release(claimId, runId, { keepMergedBranch: true }),
+    releaseRunClaims: (runId: string) => source.claims.releaseOwned(runId),
     // Worker start goes through the admission-bearing entry point: `startExecution` alone does
     // not ask capacity whether this allocation is permitted, which is what #55/#182 was about.
     startTaskExecution: (input: Parameters<TaskGraph["startWorkerExecution"]>[0]) =>
@@ -773,7 +774,9 @@ const createCtoServerFromPort = (
     "resource_release",
     { description: "Release held claims.", inputSchema: { ...mutation, ...runIdentity, claimId: z.string().nullable().optional() } },
     async (args) => writeOwned("resource_release", args, () => {
-      return args.claimId ? respond(port.releaseClaim(args.claimId, args.runId)) : ok({ released: port.releaseRunClaims(args.runId) });
+      if (args.claimId) return respond(port.releaseClaim(args.claimId, args.runId));
+      const released = port.releaseRunClaims(args.runId);
+      return released.allowed ? ok({ released: released.value }) : respond(released);
     }),
   );
   server.registerTool(
