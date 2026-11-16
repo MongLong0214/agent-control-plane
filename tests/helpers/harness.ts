@@ -232,7 +232,32 @@ console.log('verification ok');`,
           const run = cp.runs.get(runId);
           const repository = cp.db.get<{ repository_id: string }>(`SELECT repository_id FROM repositories WHERE identity = ?`, [named.repositoryIdentity]);
           const submitted = cp.tasks.submit(runId, [{ key: `fixture-turn-${turns}-${named.commit.slice(0, 8)}`, title: "a further fixture worker turn", category: "implementation" }]);
-          if (run === null || run === undefined || repository === undefined || !submitted.allowed) return frozen;
+          if (run === null || run === undefined || repository === undefined) return frozen;
+          if (!submitted.allowed) {
+            // The run takes no more tasks (its review is done): the fixture's further turn is one more attempt of a task that
+            // has one, a copy of its last SUCCEEDED execution that names this commit.
+            const last = cp.db.get<Record<string, unknown>>(
+              `SELECT * FROM task_executions WHERE run_id = ? AND status = 'SUCCEEDED' AND repository_id = ? ORDER BY started_at DESC, attempt DESC LIMIT 1`,
+              [runId, repository.repository_id],
+            );
+            if (last === undefined) return frozen;
+            const attempt = cp.db.get<{ next: number }>(`SELECT MAX(attempt) + 1 AS next FROM task_executions WHERE task_id = ?`, [last["task_id"]])!.next;
+            const executionId = `${String(last["execution_id"]).replace(/#\d+$/, "")}#${attempt}`;
+            const resultDigest = `sha256:${named.commit}`;
+            const copy: Record<string, unknown> = { ...last, execution_id: executionId, attempt, result_digest: resultDigest };
+            const columns = Object.keys(copy);
+            cp.db.run(`INSERT INTO task_executions (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`, columns.map((column) => copy[column]));
+            cp.audit.record({
+              kind: WorkerTurnEvent.SUCCEEDED,
+              runId,
+              sessionId: String(last["worker_session_id"]),
+              evidence: {
+                executionId, resultDigest, taskId: last["task_id"], commitHead: named.commit,
+                commitlore: { outcome: "empty", recordIds: [], nonce: null },
+              },
+            });
+            continue;
+          }
           const task = submitted.value[0]!;
           const execution = cp.tasks.startExecution({
             runId,
