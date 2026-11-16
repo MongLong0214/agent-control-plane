@@ -142,9 +142,7 @@ export class WorkerCheckouts {
       : null;
     if (made?.exitCode !== 0 || made.stdout.trim() !== clone) return allow(ReasonCode.OK, worker);
     // Nothing is authorised, and nothing written, on a pass that finds the worker clone already holding all of it.
-    const wanted = await this.notesOf(clone);
-    const held = await this.notesOf(worker);
-    if (wanted.every((entry) => held.includes(entry))) return allow(ReasonCode.OK, worker);
+    if (!(await this.notesMissing(clone, worker))) return allow(ReasonCode.OK, worker);
     const authorised = await this.guard.authorize(
       {
         operation: WriteOperation.GIT_WORKTREE,
@@ -162,40 +160,75 @@ export class WorkerCheckouts {
     return authorised.allowed ? allow(ReasonCode.OK, worker) : (authorised as Decision<never>);
   }
 
-  /** What `repo` has of CommitLore's notes mirror, one entry each: a notes ref and its object, a notes fetch refspec, an absence record. */
-  private async notesOf(repo: string): Promise<string[]> {
+  /** A repository's CommitLore notes refs, each with the object it names. */
+  private async notesRefsOf(repo: string): Promise<Array<{ ref: string; oid: string }>> {
+    const programs = await withoutRepositoryPrograms(repo);
+    const listed = await git(repo, [...programs, "for-each-ref", "--format=%(refname) %(objectname)", "refs/notes/"], { allowFailure: true });
+    return listed.stdout.split("\n").filter((line) => line.length > 0).map((line) => ({ ref: line.slice(0, line.indexOf(" ")), oid: line.slice(line.indexOf(" ") + 1) }));
+  }
+
+  /** The fetch refspecs for notes on origin, and the records that origin's mirror was looked for, that `repo` has. */
+  private async notesConfigOf(repo: string): Promise<{ specs: string[]; absence: string[] }> {
     const programs = await withoutRepositoryPrograms(repo);
     const out = async (args: readonly string[]): Promise<string[]> =>
-      (await git(repo, [...programs, ...args], { allowFailure: true })).stdout.split("\n").filter((line) => line.length > 0);
-    return [
-      ...(await out(["for-each-ref", "--format=ref %(refname) %(objectname)", "refs/notes/"])),
-      ...(await out(["config", "--local", "--get-all", "remote.origin.fetch"])).filter((spec) => /^\+?refs\/notes\//.test(spec)).map((spec) => `spec ${spec}`),
-      ...(await out(["config", "--local", "--get-regexp", "^commitlore\\.notesabsence\\."])).map((line) => `absence ${line}`),
-    ];
+      (await git(repo, [...programs, "config", "--local", ...args], { allowFailure: true })).stdout.split("\n").filter((line) => line.length > 0);
+    return {
+      specs: (await out(["--get-all", "remote.origin.fetch"])).filter((spec) => /^\+?refs\/notes\//.test(spec)),
+      absence: await out(["--get-regexp", "^commitlore\\.notesabsence\\."]),
+    };
+  }
+
+  /** Whether `worker` lacks any of what `clone` has of the notes mirror. A notes ref the worker is ahead of or has merged is not lacking. */
+  private async notesMissing(clone: string, worker: string): Promise<boolean> {
+    const into = await withoutRepositoryPrograms(worker);
+    for (const { ref, oid } of await this.notesRefsOf(clone)) {
+      const held = (await git(worker, [...into, "rev-parse", "--verify", "-q", ref], { allowFailure: true })).stdout.trim();
+      if (held === oid) continue;
+      if (held === "") return true;
+      const contains = await git(worker, [...into, "merge-base", "--is-ancestor", oid, held], { allowFailure: true });
+      if (contains.exitCode !== 0) return true;
+    }
+    const wanted = await this.notesConfigOf(clone);
+    const have = await this.notesConfigOf(worker);
+    return wanted.specs.some((spec) => !have.specs.includes(spec)) || wanted.absence.some((line) => !have.absence.includes(line));
   }
 
   /**
    * CommitLore's notes mirror, as `clone` has it, in `worker`: the notes refs, the fetch refspec for them on origin,
-   * and the record that origin's mirror was looked for. Idempotent; nothing is removed from `worker`, and `clone` is
-   * only read.
+   * and the record that origin's mirror was looked for. Idempotent, and it never takes a note from the worker: a notes ref
+   * the worker lacks is fetched, one it is ahead of is left, one behind is moved forward, and one both have added to is
+   * merged (`git notes merge -s union`), so what a worker turn captured in its own clone is kept. `clone` is only read.
    */
   private async carryNotes(clone: string, worker: string): Promise<void> {
-    const from = await withoutRepositoryPrograms(clone);
     const into = await withoutRepositoryPrograms(worker);
-    const refs = await git(clone, [...from, "for-each-ref", "--format=%(refname)", "refs/notes/"], { allowFailure: true });
-    if (refs.stdout.trim().length > 0) {
-      await git(worker, [
-        ...into, "-c", "gc.auto=0", "-c", "maintenance.auto=false",
-        "fetch", "--quiet", "--no-write-fetch-head", "--no-tags", "--no-recurse-submodules", clone, "+refs/notes/*:refs/notes/*",
-      ]);
+    const quiet = ["-c", "gc.auto=0", "-c", "maintenance.auto=false"];
+    for (const { ref, oid } of await this.notesRefsOf(clone)) {
+      const held = (await git(worker, [...into, "rev-parse", "--verify", "-q", ref], { allowFailure: true })).stdout.trim();
+      if (held === oid) continue;
+      const fetch = (refspec: string) =>
+        git(worker, [...into, ...quiet, "fetch", "--quiet", "--no-write-fetch-head", "--no-tags", "--no-recurse-submodules", clone, refspec]);
+      if (held === "") {
+        await fetch(`${ref}:${ref}`);
+        continue;
+      }
+      const carrying = `refs/acp/notes-carry/${ref.slice("refs/notes/".length).replace(/[^A-Za-z0-9._-]/g, "_")}`;
+      await fetch(`+${ref}:${carrying}`);
+      try {
+        const behind = await git(worker, [...into, "merge-base", "--is-ancestor", oid, held], { allowFailure: true });
+        if (behind.exitCode === 0) continue;
+        const ahead = await git(worker, [...into, "merge-base", "--is-ancestor", held, oid], { allowFailure: true });
+        if (ahead.exitCode === 0) await git(worker, [...into, "update-ref", "-m", "agent-control-plane: the worker checkout follows the resident's notes", ref, oid, held]);
+        else await git(worker, [...into, "-c", "user.name=agent-control-plane", "-c", "user.email=acp@localhost", "notes", `--ref=${ref}`, "merge", "-s", "union", carrying]);
+      } finally {
+        await git(worker, [...into, "update-ref", "-d", carrying], { allowFailure: true });
+      }
     }
-    const lines = async (repo: string, programs: readonly string[], args: readonly string[]): Promise<string[]> =>
-      (await git(repo, [...programs, "config", "--local", ...args], { allowFailure: true })).stdout.split("\n").filter((line) => line.length > 0);
-    const have = new Set(await lines(worker, into, ["--get-all", "remote.origin.fetch"]));
-    for (const spec of await lines(clone, from, ["--get-all", "remote.origin.fetch"])) {
-      if (/^\+?refs\/notes\//.test(spec) && !have.has(spec)) await git(worker, [...into, "config", "--local", "--add", "remote.origin.fetch", spec]);
+    const have = await this.notesConfigOf(worker);
+    const wanted = await this.notesConfigOf(clone);
+    for (const spec of wanted.specs) {
+      if (!have.specs.includes(spec)) await git(worker, [...into, "config", "--local", "--add", "remote.origin.fetch", spec]);
     }
-    for (const line of await lines(clone, from, ["--get-regexp", "^commitlore\\.notesabsence\\."])) {
+    for (const line of wanted.absence) {
       const at = line.indexOf(" ");
       if (at > 0) await git(worker, [...into, "config", "--local", line.slice(0, at), line.slice(at + 1)]);
     }

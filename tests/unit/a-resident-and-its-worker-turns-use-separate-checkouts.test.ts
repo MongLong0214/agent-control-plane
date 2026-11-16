@@ -904,6 +904,62 @@ describe("#1268 a worker clone carries its resident's CommitLore notes mirror", 
     });
   });
 
+  /** A note on `object` in `repo`, under the notes ref CommitLore keeps its records in. */
+  const noteOn = (repo: string, object: string, text: string): void => {
+    gitSync(repo, ["-c", "user.email=r@example.test", "-c", "user.name=r", "notes", "--ref=commitlore", "add", "-f", "-m", text, object]);
+  };
+  const noteOf = (repo: string, object: string): string => gitSync(repo, ["notes", "--ref=commitlore", "show", object]);
+
+  it("a note a worker captured in its own clone survives a refresh of the mirror from the resident's clone", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-keep", [APP]);
+      becomeResident(f, s);
+      mirrorIn(s.clone);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      const tree = gitSync(checkout, ["rev-parse", "HEAD^{tree}"]);
+      noteOn(checkout, tree, "Warn: captured by a worker turn");
+      await daemonPass(f);
+      expect(noteOf(checkout, tree)).toBe("Warn: captured by a worker turn");
+      expect(noteOf(checkout, gitSync(checkout, ["rev-parse", "HEAD"]))).toBe("Record-Id: r-0123456789ab");
+    });
+  });
+
+  it("the resident's new notes reach a worker clone that holds notes of its own, and neither side's is lost", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-both", [APP]);
+      becomeResident(f, s);
+      mirrorIn(s.clone);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      const tree = gitSync(checkout, ["rev-parse", "HEAD^{tree}"]);
+      noteOn(checkout, tree, "Warn: captured by a worker turn");
+      const readme = gitSync(s.clone, ["rev-parse", "HEAD:README.md"]);
+      noteOn(s.clone, readme, "Limit: a record the resident's clone gained");
+      await daemonPass(f);
+      expect(noteOf(checkout, tree)).toBe("Warn: captured by a worker turn");
+      expect(noteOf(checkout, readme)).toBe("Limit: a record the resident's clone gained");
+      expect(noteOf(checkout, gitSync(checkout, ["rev-parse", "HEAD"]))).toBe("Record-Id: r-0123456789ab");
+      // Nothing of the resident's clone was written, and no carrying ref is left in the worker's.
+      expect(noteOf(s.clone, readme)).toBe("Limit: a record the resident's clone gained");
+      expect(gitSync(checkout, ["for-each-ref", "--format=%(refname)", "refs/acp/"])).not.toMatch(/notes/);
+    });
+  });
+
+  it("a worker clone that has not diverged follows the resident's notes forward", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-forward", [APP]);
+      becomeResident(f, s);
+      mirrorIn(s.clone);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      const readme = gitSync(s.clone, ["rev-parse", "HEAD:README.md"]);
+      noteOn(s.clone, readme, "Limit: a record the resident's clone gained");
+      await daemonPass(f);
+      expect(notesRefs(checkout)).toBe(notesRefs(s.clone));
+    });
+  });
+
   it.skipIf(REAL === null)("with the real CLI, a worker clone's notes are no longer unfetched", async () => {
     await withBootstrapRuntime(async (f) => {
       const s = await standardRun(f, "resident-notes-real", [APP]);
