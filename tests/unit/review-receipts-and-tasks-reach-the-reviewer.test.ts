@@ -74,20 +74,23 @@ describe("every receipt and task of a run reaches the reviewer (#1410)", () => {
     it(`lists all ${RECEIPTS} receipt rows and all ${TASKS} tasks at a room of ${room}, none counted as over the character budget`, async () => {
       const { harness, runId, tasks } = await prepare();
       try {
-        // The PLAN's units: most tasks by task id, the last one by its PLAN key.
+        // The PLAN's units: most tasks by task id, the last one by its PLAN key; the approval resolved all of them to ids.
         const ids = tasks.map((task) => task.taskId);
         const units = [
           { key: "unit-a", tasks: ids.slice(0, 28) },
           { key: "unit-b", tasks: [...ids.slice(28, TASKS - 1), KEYED_TASK] },
         ];
-        harness.cp.artifacts.put(runId, "PLAN", { summary: "fixture", workUnits: units });
+        const stored = harness.cp.artifacts.put(runId, "PLAN", { summary: "fixture", workUnits: units });
+        harness.cp.audit.record({ kind: "WORK_SCOPE_APPROVED", runId, evidence: { planDigest: stored.digest, bindingGeneration: 1,
+          units: [{ unit: "unit-a", taskIds: ids.slice(0, 28), declarationDigest: "sha256:a" }, { unit: "unit-b", taskIds: ids.slice(28), declarationDigest: "sha256:b" }] } });
         const receipts = ids.slice(0, RECEIPTS).map((taskId, i) => receiptFor(runId, i, taskId, i < 28 ? "unit-a" : "unit-b"));
         const text = candidateEvidenceSection(harness.cp.db, runId, [], evidenceOf(receipts), room).join("\n");
 
         const control = JSON.parse(fenceAfter(text, "Control-plane evidence", "json")) as RenderedTasks;
         expect(control.taskSummary).toMatchObject({ total: TASKS, listed: TASKS, truncated: false });
         expect(control.tasks.map((task) => task.taskId).sort()).toEqual([...ids].sort());
-        // Every task is in its unit, the PLAN-key one included, and none is reported unresolved.
+        // Every task is in the unit the approval gave it, the PLAN-key one included, and its key is not listed: the
+        // approval holds its unit whole.
         expect(control.tasks.every((task) => task.workUnit !== undefined)).toBe(true);
         expect(control.tasks.find((task) => task.taskId === ids[TASKS - 1])!.workUnit).toBe("unit-b");
         expect(control.taskSummary.workUnits).toEqual({ declared: 2, tasksInAUnit: TASKS });
@@ -152,132 +155,148 @@ describe("every receipt and task of a run reaches the reviewer (#1410)", () => {
   }, 60_000);
 });
 
-describe("an approved work-unit mapping is never overridden by title inference (#1410 review P2)", () => {
-  const submit = (harness: Awaited<ReturnType<typeof prepare>>["harness"], runId: string, specs: Array<{ key: string; title: string }>) => {
+describe("a work unit is read from the approval and from task ids, never inferred (#1410 review P2, r3-r5)", () => {
+  type Harness = Awaited<ReturnType<typeof prepare>>["harness"];
+  const submit = (harness: Harness, runId: string, specs: Array<{ key: string; title: string }>) => {
     const submitted = harness.cp.tasks.submit(runId, specs.map((spec) => ({ ...spec, category: "implementation" as const })));
     if (!submitted.allowed) throw new Error(submitted.message);
     return submitted.value;
   };
-  const taskRows = (harness: Awaited<ReturnType<typeof prepare>>["harness"], runId: string) =>
+  const taskRows = (harness: Harness, runId: string) =>
     harness.cp.db.all<{ task_id: string; title: string; state: string }>(`SELECT task_id, title, state FROM tasks WHERE run_id = ?`, [runId]);
-  /** Every live (not CANCELLED) task has its work unit, or the gap is named: no task is silently without one. */
-  const expectNoSilentGap = (harness: Awaited<ReturnType<typeof prepare>>["harness"], runId: string, units: ReturnType<typeof workUnitsOf>, only?: readonly string[]): void => {
-    const unmapped = taskRows(harness, runId).filter((task) => task.state !== "CANCELLED" && !units.byTask.has(task.task_id) && (only === undefined || only.includes(task.task_id)));
+  const approve = (harness: Harness, runId: string, planDigest: string, units: Array<{ unit: string; taskIds: string[] }>) => {
+    const recorded = harness.cp.audit.record({ kind: "WORK_SCOPE_APPROVED", runId, evidence: { planDigest, bindingGeneration: 1,
+      units: units.map((unit) => ({ ...unit, declarationDigest: `sha256:${unit.unit}` })) } });
+    expect(recorded.allowed).toBe(true);
+  };
+  /** Every live task of `only` has its work unit, or the gap is named: no task is silently without one. */
+  const expectNoSilentGap = (harness: Harness, runId: string, units: ReturnType<typeof workUnitsOf>, only: readonly string[]): void => {
+    const unmapped = taskRows(harness, runId).filter((task) => task.state !== "CANCELLED" && !units.byTask.has(task.task_id) && only.includes(task.task_id));
     if (unmapped.length > 0) expect(units.unresolvedRefs.length, `unmapped: ${unmapped.map((task) => task.title).join(", ")}`).toBeGreaterThan(0);
   };
 
   it("keeps each task in the unit the approval gave it when one task's title is another's PLAN key", async () => {
     const { harness, runId } = await prepare();
     try {
-      // Two further tasks whose keys and titles cross: A is key alpha / title beta, B is key beta / title alpha.
+      // A is key alpha / title beta, B is key beta / title alpha.
       const [a, b] = submit(harness, runId, [{ key: "alpha", title: "beta" }, { key: "beta", title: "alpha" }]);
       const stored = harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "unit-a", tasks: ["alpha"] }, { key: "unit-b", tasks: ["beta"] }] });
-      const approved = harness.cp.audit.record({ kind: "WORK_SCOPE_APPROVED", runId, evidence: { planDigest: stored.digest, bindingGeneration: 1,
-        units: [{ unit: "unit-a", taskIds: [a!.taskId], declarationDigest: "sha256:a" }, { unit: "unit-b", taskIds: [b!.taskId], declarationDigest: "sha256:b" }] } });
-      expect(approved.allowed).toBe(true);
+      approve(harness, runId, stored.digest, [{ unit: "unit-a", taskIds: [a!.taskId] }, { unit: "unit-b", taskIds: [b!.taskId] }]);
       const units = workUnitsOf(harness.cp.db, runId, taskRows(harness, runId));
       expect(units.byTask.get(a!.taskId)).toBe("unit-a");
       expect(units.byTask.get(b!.taskId)).toBe("unit-b");
-      // The approval resolved both keys: nothing is reported unresolved.
+      // The PLAN's keys are not read as titles, and the approval holds each unit whole: nothing to list.
       expect(units.unresolvedRefs).toEqual([]);
     } finally { harness.cp.close(); }
   }, 60_000);
 
-  it("uses a title only for a reference the approval left as a key, and never moves a mapped task", async () => {
+  it("a fully approved 3-task unit referenced by keys is mapped whole and lists no key", async () => {
     const { harness, runId } = await prepare();
     try {
-      const [a, b, c] = submit(harness, runId, [{ key: "a", title: "kept-a" }, { key: "b", title: "kept-b" }, { key: "c", title: "later-key" }]);
-      const stored = harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "unit-a", tasks: ["a", "later-key"] }, { key: "unit-b", tasks: ["b", "kept-a"] }] });
-      harness.cp.audit.record({ kind: "WORK_SCOPE_APPROVED", runId, evidence: { planDigest: stored.digest, bindingGeneration: 1,
-        units: [{ unit: "unit-a", taskIds: [a!.taskId, "later-key"], declarationDigest: "sha256:a" }, { unit: "unit-b", taskIds: [b!.taskId], declarationDigest: "sha256:b" }] } });
+      const three = submit(harness, runId, [{ key: "k1", title: "one" }, { key: "k2", title: "two" }, { key: "k3", title: "three" }]);
+      const stored = harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "trio", tasks: ["k1", "k2", "k3"] }] });
+      approve(harness, runId, stored.digest, [{ unit: "trio", taskIds: three.map((task) => task.taskId) }]);
       const units = workUnitsOf(harness.cp.db, runId, taskRows(harness, runId));
-      expect(units.byTask.get(a!.taskId)).toBe("unit-a");
-      expect(units.byTask.get(b!.taskId)).toBe("unit-b");
-      // The approval left "later-key" as a key: it is the title of task c, which nothing mapped.
-      expect(units.byTask.get(c!.taskId)).toBe("unit-a");
-      // The PLAN's "kept-a" (unit-b) is not read: the approval holds unit-b, and a is already in unit-a.
+      expect(three.every((task) => units.byTask.get(task.taskId) === "trio")).toBe(true);
       expect(units.unresolvedRefs).toEqual([]);
+      // The same keys with no approval to hold the unit are all listed.
+      harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "trio", tasks: ["k1", "k2", "k3"] }, { key: "other", tasks: [] }] });
+      const without = workUnitsOf(harness.cp.db, runId, taskRows(harness, runId));
+      expect(without.byTask.size).toBe(0);
+      expect(without.unresolvedRefs).toEqual(["trio:k1", "trio:k2", "trio:k3"]);
     } finally { harness.cp.close(); }
   }, 60_000);
 
-  it("names an ambiguous title, and a title whose task is mapped elsewhere, as unresolved without an approval", async () => {
+  it("maps a PLAN task-id reference the approval left out, and an approval entry that is a key is listed, not guessed from a title", async () => {
     const { harness, runId } = await prepare();
     try {
-      const [first] = submit(harness, runId, [{ key: "p", title: "dup" }, { key: "q", title: "dup" }, { key: "r", title: "solo" }]);
-      harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "unit-a", tasks: [first!.taskId, "dup"] }, { key: "unit-b", tasks: ["solo"] }, { key: "unit-c", tasks: ["solo"] }] });
+      const [a, b, c, d] = submit(harness, runId, [{ key: "a", title: "kept-a" }, { key: "b", title: "kept-b" }, { key: "c", title: "later-key" }, { key: "d", title: "d" }]);
+      const stored = harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "unit-a", tasks: ["a", "later-key"] }, { key: "unit-b", tasks: [b!.taskId, d!.taskId] }] });
+      approve(harness, runId, stored.digest, [{ unit: "unit-a", taskIds: [a!.taskId, "later-key"] }, { unit: "unit-b", taskIds: [b!.taskId] }]);
+      const units = workUnitsOf(harness.cp.db, runId, taskRows(harness, runId));
+      expect(units.byTask.get(a!.taskId)).toBe("unit-a");
+      expect(units.byTask.get(b!.taskId)).toBe("unit-b");
+      // d is named by id in the PLAN only, and is mapped by that id; c is the title of "later-key" and is not mapped.
+      expect(units.byTask.get(d!.taskId)).toBe("unit-b");
+      expect(units.byTask.has(c!.taskId)).toBe(false);
+      expect(units.unresolvedRefs).toContain("unit-a:later-key");
+      expectNoSilentGap(harness, runId, units, [a, b, c, d].map((task) => task!.taskId));
+    } finally { harness.cp.close(); }
+  }, 60_000);
+
+  it("never maps an ambiguous or a unique title: without an approval only task ids place a task, every other entry is listed", async () => {
+    const { harness, runId } = await prepare();
+    try {
+      const [first, , solo] = submit(harness, runId, [{ key: "p", title: "dup" }, { key: "q", title: "dup" }, { key: "r", title: "solo" }]);
+      harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "unit-a", tasks: [first!.taskId, "dup"] }, { key: "unit-b", tasks: ["solo"] }] });
       const units = workUnitsOf(harness.cp.db, runId, taskRows(harness, runId));
       expect(units.byTask.get(first!.taskId)).toBe("unit-a");
-      expect(units.unresolvedRefs).toEqual(["unit-a:dup", "unit-c:solo"]);
-      expect([...units.byTask.values()].filter((unit) => unit === "unit-b")).toHaveLength(1);
+      expect(units.byTask.has(solo!.taskId)).toBe(false);
+      expect([...units.byTask.keys()]).toEqual([first!.taskId]);
+      expect(units.unresolvedRefs).toEqual(["unit-a:dup", "unit-b:solo"]);
     } finally { harness.cp.close(); }
   }, 60_000);
 
-  it("an approved unit as long as the audit log's array cap also takes its PLAN references, and anything still unmapped is named (#1410 re-review)", async () => {
+  it("an approved unit cut at the audit log's 200-item cap leaves its tail unmapped and every PLAN key listed (#1410 re-review)", async () => {
     const { harness, runId } = await prepare();
     try {
       // 201 tasks in one unit: the audit log keeps 200 array items and marks nothing, so the approval holds 200 of them.
       const many = submit(harness, runId, Array.from({ length: 201 }, (_, i) => ({ key: `u${i}`, title: `u${i}` })));
       const other = submit(harness, runId, [{ key: "elsewhere", title: "elsewhere" }])[0]!;
       const refs = [...many.map((_, i) => `u${i}`), "ghost"];
-      const stored = harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "big", tasks: refs }, { key: "small", tasks: ["elsewhere"] }] });
-      const approved = harness.cp.audit.record({ kind: "WORK_SCOPE_APPROVED", runId, evidence: { planDigest: stored.digest, bindingGeneration: 1,
-        units: [{ unit: "big", taskIds: many.map((task) => task.taskId), declarationDigest: "sha256:big" },
-          { unit: "small", taskIds: [other.taskId], declarationDigest: "sha256:small" }] } });
-      expect(approved.allowed).toBe(true);
+      const stored = harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "big", tasks: refs }, { key: "small", tasks: [other.taskId] }] });
+      approve(harness, runId, stored.digest, [{ unit: "big", taskIds: many.map((task) => task.taskId) }, { unit: "small", taskIds: [other.taskId] }]);
       const held = harness.cp.db.get<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events WHERE kind = 'WORK_SCOPE_APPROVED' AND run_id = ?`, [runId])!;
       expect((JSON.parse(held.evidence_json) as { units: Array<{ taskIds: string[] }> }).units[0]!.taskIds).toHaveLength(200);
 
       const units = workUnitsOf(harness.cp.db, runId, taskRows(harness, runId));
-      // The task the audit log cut is in its unit all the same, and the one the approval mapped did not move.
-      expect(units.byTask.get(many[200]!.taskId)).toBe("big");
-      expect(many.every((task) => units.byTask.get(task.taskId) === "big")).toBe(true);
+      expect(many.slice(0, 200).every((task) => units.byTask.get(task.taskId) === "big")).toBe(true);
       expect(units.byTask.get(other.taskId)).toBe("small");
-      // What no task answers is an explicit gap, not silence. So is a key that names a task the approval
-      // already mapped (u0..u199): a title is never taken for a task that has its unit.
+      // The tail the audit log cut is not guessed back from its title: it has no unit, and the gap is named.
+      expect(units.byTask.has(many[200]!.taskId)).toBe(false);
+      expect(units.unresolvedRefs).toContain("big:u200");
       expect(units.unresolvedRefs).toContain("big:ghost");
-      expect(units.unresolvedRefs).not.toContain("big:u200");
-      expect(units.unresolvedRefs).toHaveLength(201);
       expectNoSilentGap(harness, runId, units, [...many, other].map((task) => task.taskId));
     } finally { harness.cp.close(); }
   }, 60_000);
 
-  it("a cancelled task's title never answers a PLAN key: the live task is left unmapped with the gap named (#1410 r3)", async () => {
+  it("a cancelled task's title and a mapped task's title never place the unit's tail (#1410 r3, r4)", async () => {
     const { harness, runId } = await prepare();
     try {
-      // 201 tasks in one unit; the last one's PLAN key is `u200` but its title is something else, and a superseded task kept `u200`.
-      const many = submit(harness, runId, Array.from({ length: 201 }, (_, i) => ({ key: `u${i}`, title: i === 200 ? "actual tail task" : `u${i}` })));
+      // r3: the tail's key is `u200`, its title is not, and a superseded task kept `u200`.
+      // r4: the FIRST task's title is `u200`, and the PLAN names the first 200 by id and the tail by key.
+      const many = submit(harness, runId, Array.from({ length: 201 }, (_, i) => ({ key: `u${i}`, title: i === 0 ? "u200" : i === 200 ? "actual tail task" : `u${i}` })));
       const [old] = submit(harness, runId, [{ key: "old", title: "u200" }]);
       harness.cp.db.run(`UPDATE tasks SET state = 'CANCELLED' WHERE task_id = ?`, [old!.taskId]);
-      const stored = harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "big", tasks: many.map((_, i) => `u${i}`) }] });
-      harness.cp.audit.record({ kind: "WORK_SCOPE_APPROVED", runId, evidence: { planDigest: stored.digest, bindingGeneration: 1,
-        units: [{ unit: "big", taskIds: many.map((task) => task.taskId), declarationDigest: "sha256:big" }] } });
-
+      const stored = harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "big", tasks: [...many.slice(0, 200).map((task) => task.taskId), "u200"] }] });
+      approve(harness, runId, stored.digest, [{ unit: "big", taskIds: many.map((task) => task.taskId) }]);
       const units = workUnitsOf(harness.cp.db, runId, taskRows(harness, runId));
-      // The cancelled task is not the unit's, and the unit's live tail is not silently without one.
+      expect(many.slice(0, 200).every((task) => units.byTask.get(task.taskId) === "big")).toBe(true);
       expect(units.byTask.has(old!.taskId)).toBe(false);
-      expect(units.byTask.has(many[200]!.taskId)).toBe(false);
-      expect(units.unresolvedRefs).toContain("big:u200");
-      expect(many.slice(0, 200).every((task) => units.byTask.get(task.taskId) === "big")).toBe(true);
-      expectNoSilentGap(harness, runId, units, many.map((task) => task.taskId));
-    } finally { harness.cp.close(); }
-  }, 60_000);
-
-  it("a title match is never accepted for a task already in the unit: the real tail task is left unmapped with the gap named (#1410 r4)", async () => {
-    const { harness, runId } = await prepare();
-    try {
-      // The PLAN names the first 200 tasks by id and the last by its key `u200`; the last task's title is not its key,
-      // and the FIRST task's title is `u200`.
-      const many = submit(harness, runId, Array.from({ length: 201 }, (_, i) => ({ key: `u${i}`, title: i === 0 ? "u200" : i === 200 ? "actual tail task" : `u${i}` })));
-      const refs = [...many.slice(0, 200).map((task) => task.taskId), "u200"];
-      const stored = harness.cp.artifacts.put(runId, "PLAN", { workUnits: [{ key: "big", tasks: refs }] });
-      harness.cp.audit.record({ kind: "WORK_SCOPE_APPROVED", runId, evidence: { planDigest: stored.digest, bindingGeneration: 1,
-        units: [{ unit: "big", taskIds: many.map((task) => task.taskId), declarationDigest: "sha256:big" }] } });
-
-      const units = workUnitsOf(harness.cp.db, runId, taskRows(harness, runId));
-      expect(many.slice(0, 200).every((task) => units.byTask.get(task.taskId) === "big")).toBe(true);
       expect(units.byTask.has(many[200]!.taskId)).toBe(false);
       expect(units.unresolvedRefs).toEqual(["big:u200"]);
       expectNoSilentGap(harness, runId, units, many.map((task) => task.taskId));
     } finally { harness.cp.close(); }
   }, 60_000);
+
+  it("two capped units with crossed tail titles keep both tails unmapped instead of swapping them (#1410 r5)", async () => {
+    const { harness, runId } = await prepare();
+    try {
+      const xs = submit(harness, runId, Array.from({ length: 201 }, (_, i) => ({ key: `x${i}`, title: i === 200 ? "tail-y" : `x${i}` })));
+      const ys = submit(harness, runId, Array.from({ length: 201 }, (_, i) => ({ key: `y${i}`, title: i === 200 ? "tail-x" : `y${i}` })));
+      // Each unit names its first 200 tasks by id and its tail by key.
+      const stored = harness.cp.artifacts.put(runId, "PLAN", { workUnits: [
+        { key: "unit-x", tasks: [...xs.slice(0, 200).map((task) => task.taskId), "tail-x"] },
+        { key: "unit-y", tasks: [...ys.slice(0, 200).map((task) => task.taskId), "tail-y"] }] });
+      approve(harness, runId, stored.digest, [{ unit: "unit-x", taskIds: xs.map((task) => task.taskId) }, { unit: "unit-y", taskIds: ys.map((task) => task.taskId) }]);
+      const units = workUnitsOf(harness.cp.db, runId, taskRows(harness, runId));
+      expect(xs.slice(0, 200).every((task) => units.byTask.get(task.taskId) === "unit-x")).toBe(true);
+      expect(ys.slice(0, 200).every((task) => units.byTask.get(task.taskId) === "unit-y")).toBe(true);
+      // No task is in a unit it was not approved or id-referenced into: neither tail is in either unit.
+      expect(units.byTask.has(xs[200]!.taskId)).toBe(false);
+      expect(units.byTask.has(ys[200]!.taskId)).toBe(false);
+      expect(units.unresolvedRefs).toEqual(["unit-x:tail-x", "unit-y:tail-y"]);
+      expectNoSilentGap(harness, runId, units, [...xs, ...ys].map((task) => task.taskId));
+    } finally { harness.cp.close(); }
+  }, 120_000);
 });

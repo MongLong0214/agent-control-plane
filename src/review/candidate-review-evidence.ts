@@ -60,24 +60,25 @@ const WORK_SCOPE_APPROVED_KIND = "WORK_SCOPE_APPROVED";
 interface WorkUnits {
   declared: number;
   byTask: Map<string, string>;
-  /** References no task of the run could be matched to, by either its id or its PLAN key. */
+  /** `<unit>:<entry>` for every PLAN or approval entry that is not a task id of the run. Never mapped by a guess. */
   unresolvedRefs: string[];
 }
 
 /**
- * The work unit of each task, from the run's current PLAN (`workUnits[].tasks`) and its approval
- * (`WORK_SCOPE_APPROVED`), which holds the same units with the submission's keys already resolved to task ids.
- * The approval is authoritative and is applied first: its task ids, then the PLAN's own task-id references for
- * tasks it left unmapped. Only after that is a PLAN key read as a task title (the rule a dependency on an
- * earlier submission's task uses, `TaskGraph.submit`), and only for references the approval did not resolve:
- * a unit the approval holds contributes just the entries it left as keys, and a unit it does not hold
- * contributes its PLAN refs. So does a unit whose approved task list is as long as the audit log's array cap
- * (`AUDIT_ARRAY_LIMIT`), which may have lost its tail without a mark: its PLAN refs fill in the tasks the
- * approval did not map, and never move one it did. An inference is accepted only for a live task that is the one live task of that
- * title and is mapped to no unit; a CANCELLED task never answers a key. Any other reference, one that names a task
- * already mapped included, is named in `unresolvedRefs` rather than dropped.
+ * The work unit of each task, from two sources only: the run's approval (`WORK_SCOPE_APPROVED`), which holds the
+ * PLAN's units with the submission's keys already resolved to task ids, and the PLAN's own `workUnits[].tasks`
+ * entries that are task ids of this run. The approval is applied first and a task already mapped is never moved.
+ *
+ * Nothing is inferred. The PLAN's key -> task id mapping is stored nowhere (it lives only in the submission), so a
+ * key can never be told from a title with any certainty and is never mapped by one. Every entry that is not a task
+ * id of this run, in the PLAN or in the approval, is named in `unresolvedRefs` as `<unit>:<entry>`, with one
+ * exception that is exact, not a guess: a unit whose approved list is shorter than the audit log's 200-item cap
+ * holds its whole membership, so the PLAN's key entries for it are redundant and are not listed. For a unit at or
+ * over the cap, or one the approval does not hold, nothing here can tell a key the approval resolved from one it
+ * did not, so every key is listed. A task with a `workUnit` was placed by the approval or by an id; a task
+ * without one is not claimed to be in none.
  */
-export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_id: string; title: string; state?: string }>): WorkUnits => {
+export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_id: string }>): WorkUnits => {
   const none: WorkUnits = { declared: 0, byTask: new Map(), unresolvedRefs: [] };
   const plan = db.get<{ digest: string; content_json: string }>(
     `SELECT digest, content_json FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN' AND superseded = 0
@@ -85,9 +86,9 @@ export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_i
   if (plan === undefined) return none;
   const declared = new Map<string, Set<string>>();
   const approved = new Map<string, Set<string>>();
-  // Units whose approved task list may be cut: the audit log keeps 200 array items and marks nothing, so a list
-  // of exactly that length may have lost its tail.
-  const mayBeCut = new Set<string>();
+  // Approved units whose task list the audit log kept whole: it keeps at most 200 array items and marks nothing, so a
+  // list shorter than that is the unit's complete membership.
+  const wholeUnits = new Set<string>();
   const add = (into: Map<string, Set<string>>, unit: unknown, refs: unknown): void => {
     if (typeof unit !== "string" || !Array.isArray(refs)) return;
     const held = into.get(unit) ?? new Set<string>();
@@ -101,44 +102,31 @@ export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_i
     const approval = db.get<{ evidence_json: string }>(
       `SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id DESC LIMIT 1`, [WORK_SCOPE_APPROVED_KIND, runId]);
     const stored: unknown = approval === undefined ? undefined : JSON.parse(approval.evidence_json);
+    // What a unit of 200 or more tasks lost to the audit log is not in `approved`, and its PLAN entries, being keys,
+    // are named below, never guessed.
     if (isRecord(stored) && stored["planDigest"] === plan.digest && Array.isArray(stored["units"])) {
       for (const unit of stored["units"]) {
         if (!isRecord(unit)) continue;
         add(approved, unit["unit"], unit["taskIds"]);
-        if (typeof unit["unit"] === "string" && Array.isArray(unit["taskIds"]) && unit["taskIds"].length >= AUDIT_ARRAY_LIMIT) mayBeCut.add(unit["unit"]);
+        if (typeof unit["unit"] === "string" && Array.isArray(unit["taskIds"]) && unit["taskIds"].length < AUDIT_ARRAY_LIMIT) wholeUnits.add(unit["unit"]);
       }
     }
   } catch { return none; }
   const ids = new Set(tasks.map((task) => task.task_id));
-  const byTitle = new Map<string, string[]>();
-  // A key is only ever a live task's title: a superseded task that kept an old title answers no PLAN key.
-  for (const task of tasks) if (task.state !== "CANCELLED") byTitle.set(task.title, [...(byTitle.get(task.title) ?? []), task.task_id]);
   const byTask = new Map<string, string>();
-  const unresolvedRefs: string[] = [];
+  const unresolved = new Set<string>();
   const sorted = (units: Map<string, Set<string>>): Array<[string, string[]]> =>
     [...units.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([unit, refs]) => [unit, [...refs].sort()]);
-  const byId = (unit: string, ref: string): boolean => {
-    if (!ids.has(ref)) return false;
-    if (!byTask.has(ref)) byTask.set(ref, unit);
-    return true;
-  };
-  const inferred = (unit: string, ref: string): void => {
-    const titled = byTitle.get(ref);
-    const taskId = titled?.length === 1 ? titled[0]! : null;
-    // The PLAN's key -> task id mapping is stored nowhere, so a title is only a guess: it is taken for a task that
-    // is live, the only live one with that title and mapped to no unit yet (by the approval, by id or by an
-    // earlier guess, this unit included). Anything else is a named gap.
-    if (taskId === null || byTask.has(taskId)) unresolvedRefs.push(`${unit}:${ref}`);
-    else byTask.set(taskId, unit);
-  };
-  // 1. What the approval resolved, then the PLAN's own task ids: neither is ever overridden.
-  for (const [unit, refs] of sorted(approved)) for (const ref of refs) byId(unit, ref);
-  for (const [unit, refs] of sorted(declared)) for (const ref of refs) byId(unit, ref);
-  // 2. Inference, for the references still unanswered: the approval's entries it left as keys, and the PLAN's
-  // keys in a unit the approval does not hold.
-  for (const [unit, refs] of sorted(approved)) for (const ref of refs) if (!ids.has(ref)) inferred(unit, ref);
-  for (const [unit, refs] of sorted(declared)) if (!approved.has(unit) || mayBeCut.has(unit)) for (const ref of refs) if (!ids.has(ref)) inferred(unit, ref);
-  return { declared: new Set([...declared.keys(), ...approved.keys()]).size, byTask, unresolvedRefs };
+  for (const source of [approved, declared]) {
+    for (const [unit, refs] of sorted(source)) {
+      for (const ref of refs) {
+        // A PLAN key in a unit the approval holds whole is redundant: the approval already lists every member by id.
+        if (!ids.has(ref)) { if (source === approved || !wholeUnits.has(unit)) unresolved.add(`${unit}:${ref}`); }
+        else if (!byTask.has(ref)) byTask.set(ref, unit);
+      }
+    }
+  }
+  return { declared: new Set([...declared.keys(), ...approved.keys()]).size, byTask, unresolvedRefs: [...unresolved].sort() };
 };
 
 const taskEvidence = (db: Db, runId: string, budget: number) => {
@@ -158,7 +146,7 @@ const taskEvidence = (db: Db, runId: string, budget: number) => {
       WHERE t.run_id = ? ORDER BY d.task_id, d.depends_on`, [runId])) {
     dependencies.set(edge.task_id, [...(dependencies.get(edge.task_id) ?? []), edge.depends_on]);
   }
-  const units = workUnitsOf(db, runId, rows.map((row) => ({ task_id: row.taskId, title: row.title, state: row.state })));
+  const units = workUnitsOf(db, runId, rows.map((row) => ({ task_id: row.taskId })));
   const all: TaskEvidence[] = rows.map(({ title: _title, ...task }) => {
     const dependsOn = dependencies.get(task.taskId);
     const workUnit = units.byTask.get(task.taskId);
@@ -764,7 +752,7 @@ const receiptEvidence = async (db: Db, input: ExecutionEvidenceInput): Promise<P
   }
   const candidateHeads = new Set(input.snapshot.repositories.map((repo) => repo.candidateHead));
   const unitOfTask = workUnitsOf(db, input.runId,
-    db.all<{ task_id: string; title: string; state: string }>(`SELECT task_id, title, state FROM tasks WHERE run_id = ?`, [input.runId])).byTask;
+    db.all<{ task_id: string }>(`SELECT task_id FROM tasks WHERE run_id = ?`, [input.runId])).byTask;
   const notListed = { outsideCandidateHistory: 0, notACandidateRepository: 0, noCommitReceipt: 0, overListLimit: 0, unchecked: 0 };
   const receipts: ReceiptEvidence[] = [];
   let ancestryChecks = 0;
@@ -1116,7 +1104,7 @@ export const candidateEvidenceSection = (
     ...(omitted === 0 ? [] : [`${omitted} of ${trees.length} participating repositories are omitted from this listing for size; it establishes nothing about their tracked trees.`]),
     "",
     "## Control-plane evidence",
-    "Read from canonical audit, task and assignment records. Worker counts include all recorded bindings, with active bindings counted separately. taskSummary counts every task in the run. Every task that is not CANCELLED is listed with its dependsOn and, when the PLAN declares work units, its workUnit; when taskSummary says truncated, the unlisted tasks are all CANCELLED (superseded), counted by state in byState, and the list cannot establish absence of them. workUnits.unresolvedRefs, when present, names unit references that no task of the run answers by id or by PLAN key.",
+    "Read from canonical audit, task and assignment records. Worker counts include all recorded bindings, with active bindings counted separately. taskSummary counts every task in the run. Every task that is not CANCELLED is listed with its dependsOn and, when the PLAN declares work units, its workUnit; when taskSummary says truncated, the unlisted tasks are all CANCELLED (superseded), counted by state in byState, and the list cannot establish absence of them. A task's workUnit comes only from the run's approval or from a task id the PLAN names, never from a guess. workUnits.unresolvedRefs, when present, lists as `unit:entry` every approval entry, and every PLAN entry of a unit the approval does not hold whole, that is not a task id; a non-empty list says a mapping was not read, not that a task is missing.",
     "```json", JSON.stringify(controlPlaneEvidence(db, runId, Math.min(TASK_CHAR_BUDGET, rest - treeBudget)), null, 2), "```", "",
     ...(integration.length === 0 ? [] : integrationSection(integration)),
     ...executed.lines,
