@@ -607,7 +607,7 @@ const createCtoServerFromPort = (
     {
       description:
         "The pending control-plane messages (dispatch, revision, resume review, escalation reply, drain, cancel, bootstrap handoff) addressed in band to this exact session at its active generation. Acknowledge a HANDOFF_PACKAGE with handoff_ack; other messages use role_dispatch_ack (or run_ack, for a row that names a run this session owns). " +
-        "A REVISION_REQUEST whose payload stage is review-unavailable is a notice, never a revision: its review did not judge the product, so change no PLAN, task or code for it, and take only its nextStep (RESUBMIT: one new result_submit once the attempt it names has answered, while unjudgedAttempts is below unjudgedAttemptLimit; ESCALATE: escalation_open for that run, no resubmit); then acknowledge it.",
+        "A REVISION_REQUEST whose payload stage is review-unavailable is a notice, never a revision: its review did not judge the product, so change no PLAN, task or code for it, and take only its nextStep (RESUBMIT: one new result_submit once the attempt it names has answered, while unjudgedAttempts is below unjudgedAttemptLimit; ESCALATE: escalation_open for that run, no resubmit; DETERMINISTIC: the review was refused before any reviewer ran and will be refused again, so no unchanged resubmit: ask for smaller review evidence as the notice says, or escalation_open); then acknowledge it.",
       inputSchema: {},
     },
     async () => read("role_dispatch_pending", (peer) => {

@@ -10,6 +10,7 @@ import {
 } from "../bootstrap/bootstrap-plan.ts";
 import { collectBootstrapCeoDecisions, frozenBootstrapCeoDecisions } from "../bootstrap/bootstrap-ceo-decisions.ts";
 import { collectBootstrapReviewEvidence } from "../bootstrap/bootstrap-review-evidence.ts";
+import { REVIEW_PROMPT_BUDGET_PROBLEM } from "../review/review-prompt-budget.ts";
 import { collectStandardReviewEvidence, privateEvidenceAnswer, runHadStandardReviewEvidence } from "../review/standard-review-evidence.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
@@ -96,6 +97,8 @@ const UNAVAILABLE_REVIEW_FIELDS = [
   "runId", "provider", "model", "effort", "problem", "chunk", "exitCode", "isolationAttested",
   "isolationReasonCode", "answerDigest", "answerLength", "errorDigest", "errorLength",
   "isolationDetailDigest", "isolationDetailLength",
+  // #1421 — the prompt-budget refusal's counts: the prompt's own metadata size and the budget it exceeded.
+  "overhead", "budget",
 ] as const;
 const BOUNDED_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/#+-]{0,199}$/;
 const ATTEMPT_REASON = /^[A-Za-z0-9][A-Za-z0-9 ._:-]{0,119}$/;
@@ -196,6 +199,8 @@ export const UNJUDGED_REVIEW_NOTICES = {
     "This is not a product revision. The blind review answered on review-method findings alone, so it did not judge the product. Keep the PLAN and the code exactly as they are and change nothing.",
   REVIEW_UNAVAILABLE:
     "This is not a product revision. The blind review could not judge the product: assurance could not be constituted, for the reason code given. Keep the PLAN and the code exactly as they are and change nothing.",
+  REVIEW_PROMPT_BUDGET_EXCEEDED:
+    "This is not a product revision. The blind review was refused before any reviewer ran: the review prompt's own metadata (overhead) already exceeds the reviewer context budget, so no diff fits, and the same candidate with the same attached review evidence will be refused again. Keep the PLAN and the code exactly as they are and change nothing.",
 } as const;
 
 /** F1 — how many unjudged reviews in a row one unchanged candidate gets before its owner is sent to escalation. */
@@ -207,6 +212,8 @@ export const UNJUDGED_REVIEW_NEXT_STEPS = {
     "Next step: once the result_submit of the attempt this notice names (attemptId) has answered, call result_submit again with a new idempotencyKey; that freezes the candidate afresh and runs a fresh review. Resubmit only while unjudgedAttempts is below unjudgedAttemptLimit.",
   ESCALATE:
     "Next step: this unchanged candidate has had unjudgedAttemptLimit unjudged reviews in a row, so ACP refuses another result_submit of it; do not resubmit it. Open a CEO escalation for this run with escalation_open, then acknowledge this notice.",
+  DETERMINISTIC:
+    "Next step: this refusal is deterministic and is not counted as an unjudged attempt, so resubmitting the same candidate with the same attached review evidence changes nothing. Ask for a smaller review evidence bundle (the CTO stages it with review_evidence_stage, the CEO attaches it with review_evidence_attach and replacesSha256) and then call result_submit again with a new idempotencyKey; or open a CEO escalation for this run with escalation_open. Then acknowledge this notice.",
 } as const;
 
 /** F1 — the refusal of a result_submit for a candidate already unjudged `UNJUDGED_REVIEW_LIMIT` times in a row. */
@@ -1931,10 +1938,11 @@ export class CandidatePipeline {
     const roleKey = this.runs.ownerRoleKeyFor(run);
     const binding = roleKey ? this.bindings.active(roleKey) : null;
     if (!binding) return allow(ReasonCode.OK, undefined);
-    const notice = reviewed.evidence["problem"] === "METHOD_FINDINGS_ONLY" ? "METHOD_FINDINGS_ONLY" : "REVIEW_UNAVAILABLE";
+    const deterministic = reviewed.evidence["problem"] === REVIEW_PROMPT_BUDGET_PROBLEM;
+    const notice = deterministic ? "REVIEW_PROMPT_BUDGET_EXCEEDED" : reviewed.evidence["problem"] === "METHOD_FINDINGS_ONLY" ? "METHOD_FINDINGS_ONLY" : "REVIEW_UNAVAILABLE";
     const methodFindings = notice === "METHOD_FINDINGS_ONLY" ? this.storedReview(runId, snapshotDigest)?.content.methodFindings : undefined;
     const unjudgedAttempts = this.consecutiveUnjudgedAttempts(runId, snapshotDigest);
-    const nextStep = unjudgedAttempts < UNJUDGED_REVIEW_LIMIT ? "RESUBMIT" : "ESCALATE";
+    const nextStep = deterministic ? "DETERMINISTIC" : unjudgedAttempts < UNJUDGED_REVIEW_LIMIT ? "RESUBMIT" : "ESCALATE";
     const enqueued = this.outbox.enqueue({
       idempotencyKey: `revision:${runId}:${snapshotDigest}:${reviewed.reasonCode}:${attemptId}`,
       roleKey: binding.roleKey,
@@ -1971,12 +1979,15 @@ export class CandidatePipeline {
     const attemptsOf = (kind: string) => new Set(rows
       .filter((row) => row.kind === kind && row.evidence["attemptHeld"] !== false)
       .map((row) => row.evidence["attemptId"]));
-    const unjudged = attemptsOf("BLIND_REVIEW_UNAVAILABLE");
+    const unavailable = rows.filter((row) => row.kind === "BLIND_REVIEW_UNAVAILABLE" && row.evidence["attemptHeld"] !== false);
+    // #1421 — a refusal that is deterministic before any reviewer runs is no unjudged attempt: it neither counts nor ends the run of them.
+    const budget = new Set(unavailable.filter((row) => row.evidence["problem"] === REVIEW_PROMPT_BUDGET_PROBLEM).map((row) => row.evidence["attemptId"]));
+    const unjudged = new Set(unavailable.filter((row) => row.evidence["problem"] !== REVIEW_PROMPT_BUDGET_PROBLEM).map((row) => row.evidence["attemptId"]));
     const refused = attemptsOf(UNJUDGED_REVIEW_LIMIT_REFUSED);
     let count = 0;
     for (const freeze of rows.filter((row) => row.kind === "CANDIDATE_FROZEN").sort((a, b) => b.eventId - a.eventId)) {
       const attempt = freeze.evidence["attemptId"];
-      if (typeof attempt !== "string" || attempt === except || refused.has(attempt)) continue;
+      if (typeof attempt !== "string" || attempt === except || refused.has(attempt) || budget.has(attempt)) continue;
       if (freeze.evidence["candidateSnapshotDigest"] !== snapshotDigest || !unjudged.has(attempt)) break;
       count += 1;
     }

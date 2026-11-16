@@ -492,6 +492,12 @@ export const ReasonCode = {
    * attempt and not a retryable conflict: the owner escalates to the CEO instead of resubmitting.
    */
   REVIEW_UNJUDGED_LIMIT_REACHED: "REVIEW_UNJUDGED_LIMIT_REACHED",
+  /**
+   * #1421 — private review evidence staged or attached whose rendered text, repeated in every reviewer prompt of the
+   * run, leaves no workable chunk budget under the reviewer context bound. Deterministic: the answer carries the
+   * measured size and the limit, and a smaller bundle is the only remedy.
+   */
+  REVIEW_EVIDENCE_OVER_BUDGET: "REVIEW_EVIDENCE_OVER_BUDGET",
 
   // --- github kernel -------------------------------------------------------
   PR_BRANCH_CONTRACT_VIOLATION: "PR_BRANCH_CONTRACT_VIOLATION",

@@ -1,6 +1,7 @@
 import { FRONTIER_SIMPLIFY_SOURCE, frontierReviewPolicy, type FrontierSimplifySource } from "./frontier-simplify-policy.ts";
 import { DogfoodFindingStore } from "../quality/upstream-dogfood.ts";
 import { frozenBootstrapReviewEvidence, originalReviewRecords, type FrozenReviewEvidence, type ReviewEvidenceFile } from "../bootstrap/bootstrap-review-evidence.ts";
+import { REVIEW_CHUNK_ENVELOPE_CHARS, REVIEW_PROMPT_BUDGET_CHARS, REVIEW_PROMPT_BUDGET_PROBLEM } from "./review-prompt-budget.ts";
 import { frozenStandardReviewEvidence, standardReviewEvidenceDigests, standardReviewEvidenceSection, type FrozenStandardReviewEvidence } from "./standard-review-evidence.ts";
 import type { ReviewRecordVerification } from "../bootstrap/bootstrap-review-evidence-github.ts";
 import { bootstrapServingRuntime, bootstrapCodeGuarantees, type BootstrapRuntimeObservation } from "../bootstrap/bootstrap-runtime-observation.ts";
@@ -682,7 +683,7 @@ const reviewPacketDigests = (
 };
 
 /** Diff size above which a single reviewer context is not trusted to hold everything. */
-const CHUNK_THRESHOLD_CHARS = 120_000;
+const CHUNK_THRESHOLD_CHARS = REVIEW_PROMPT_BUDGET_CHARS;
 /**
  * The cap on the complete reviewer input (instructions, packet metadata, chunk envelope and the
  * lockfile) of a chunk that holds one lockfile whole: the primary reviewer path's input bound,
@@ -887,7 +888,7 @@ export class BlindReviewGate {
       const bareOverhead = this.promptOverhead(request, change, bareEvidence, reviewPolicies);
       // The change's real share of a prompt, repository and file fences included.
       const diffShare = this.buildPrompt(request, diffs, undefined, change, bareEvidence, reviewPolicies).length + REVIEWER_TRANSPORT_OVERHEAD_CHARS - bareOverhead;
-      const evidenceRoom = CHUNK_THRESHOLD_CHARS - 4_096 - Math.min(diffShare, EVIDENCE_DIFF_RESERVE_CHARS) - bareOverhead;
+      const evidenceRoom = CHUNK_THRESHOLD_CHARS - REVIEW_CHUNK_ENVELOPE_CHARS - Math.min(diffShare, EVIDENCE_DIFF_RESERVE_CHARS) - bareOverhead;
       const evidenceSection = [...privateEvidence, ...candidateEvidenceSection(this.db, request.runId, trees, execution, evidenceRoom)];
       // A whole-capture output stream the evidence section does not show whole goes in the diff's
       // place: whole in a single review, as labelled parts across chunks otherwise.
@@ -2010,15 +2011,17 @@ export class BlindReviewGate {
     // measurement. Reserve a bounded envelope so the complete serialized prompt, not only
     // the patch body, remains inside the review budget.
     const overhead = this.promptOverhead(request, change, evidenceSection, reviewPolicies);
-    const chunkBudget = CHUNK_THRESHOLD_CHARS - overhead - 4_096;
+    const chunkBudget = CHUNK_THRESHOLD_CHARS - overhead - REVIEW_CHUNK_ENVELOPE_CHARS;
     if (chunkBudget <= 0) {
       return deny(ReasonCode.EVIDENCE_MISSING, "review prompt metadata exceeds the reviewer context budget", {
         runId: request.runId,
+        // #1421 — deterministic before any reviewer runs: the marker and the two counts reach the unavailable row and the owner's notice.
+        problem: REVIEW_PROMPT_BUDGET_PROBLEM,
         overhead,
         budget: CHUNK_THRESHOLD_CHARS,
       });
     }
-    const { chunks, omitted: unfitLockfiles, unmapped } = splitDiffs(diffs, chunkBudget, LOCKFILE_CHUNK_THRESHOLD_CHARS - overhead - 4_096);
+    const { chunks, omitted: unfitLockfiles, unmapped } = splitDiffs(diffs, chunkBudget, LOCKFILE_CHUNK_THRESHOLD_CHARS - overhead - REVIEW_CHUNK_ENVELOPE_CHARS);
     // A lockfile's sections are told from the others by path alone; where that is not certain, no chunk is sent.
     if (unmapped.length > 0) {
       return deny(ReasonCode.EVIDENCE_MISSING, "a lockfile's patch sections cannot be told apart from the other files' by path", {
