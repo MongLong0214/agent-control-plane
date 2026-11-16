@@ -346,6 +346,7 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
         return source.tasks.submit(runId, tasks, { planDigest: stored.value.digest, taskIds: plan["supersedesTaskIds"] as string[] });
       }),
     isProjectlessBootstrapRun: (runId: string) => isProjectlessBootstrap(source.runs.require(runId)),
+    isUnderContinuityHold: (runId: string) => (source.runs.get(runId)?.continuityHoldRoleKey ?? null) !== null,
     // PR #1114 BOOT-02 — a project-less bootstrap's re-plan is all or nothing: the PLAN write, the
     // supersession of the earlier PLAN's tasks, the one new task and its BOOTSTRAP_PLAN_TASKS binding
     // commit in one transaction, and any refusal rolls every one of them back. BOOT-01 — the graph is
@@ -736,6 +737,14 @@ const createCtoServerFromPort = (
       },
     },
     async (args) => writeOwned("plan_submit", args, async (_peer, fenced) => {
+      // Continuity's hold pauses new work, and its release requires nothing of the run moved since the pause
+      // (`RunEngine.releaseContinuityHold`): a PLAN or task graph accepted under it would keep the run held for
+      // good (live run_7ae63b57). Refused before anything is read or written; resubmit once the run is ACTIVE.
+      if (port.isUnderContinuityHold(args.runId)) {
+        return respond(deny(ReasonCode.RUN_TRANSITION_ILLEGAL, "the run is paused under continuity's hold; plan_submit is accepted again once the hold is released and the run is ACTIVE", {
+          runId: args.runId, refusal: "RUN_UNDER_CONTINUITY_HOLD",
+        }));
+      }
       const resolved = port.resolvePlanInput(args.runId, args);
       if (!resolved.allowed) return respond(resolved);
       const { plan, tasks, bootstrapPlanDigest } = resolved.value;
