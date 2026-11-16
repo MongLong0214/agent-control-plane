@@ -51,6 +51,7 @@ const fixture = (mergeStrategy: MergeInput["mergeStrategy"], compared = "ahead",
     // #1268 — whether the run pins a manifest, which governs it; and CommitLore, which passes every message.
     db: { get: () => (governed ? { pinned_manifest_digest: "sha256:pinned" } : undefined) },
     repositories: { byIdentity: () => ({ checkoutPath: "/checkout" }) },
+    audit: { record: () => allow(ReasonCode.OK, undefined) },
     checkMergeCommit: async () => allow(ReasonCode.OK, undefined),
   });
   return { execute: () => kernel.mergeExecute(input), calls, reserve, putReached };
