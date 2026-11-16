@@ -134,6 +134,11 @@ export interface AttachRelayOptions {
   /** Bounds on asking again after a refusal that may clear by itself; see `ClaimRetryPolicy`. */
   claimRetry?: Partial<ClaimRetryPolicy>;
   /**
+   * When the admission window closes (epoch ms). `runAttachRelayCommand` sets it at relay start so its own first
+   * reattach spends from the same window; absent, it is `claimRetry.maxWaitMs` from this call.
+   */
+  admissionDeadline?: number;
+  /**
    * The session's own messaging socket and token. Set, the relay opens its wake proxy; the CLI
    * entry reads both from the environment Claude Code gave it (`sessionMessagingFromEnv`).
    */
@@ -184,9 +189,10 @@ export const DEFAULT_REATTACH_POLICY: ReattachPolicy = {
 /**
  * How long a relay that has not been admitted yet keeps asking. Before the first receipt there is no credential to
  * reuse, so asking again is a new claim, not a reconnect; a refused claim mints nothing. It asks again only after an
- * answer that can clear by itself (`retriesAfter`) and only until `maxWaitMs` from its first attempt: Claude Code gives
- * a stdio MCP server 30 s to answer `initialize` (measured in its own log, "Starting connection with timeout of
- * 30000ms") and does not respawn one that missed it, so asking past that buys nothing.
+ * answer that can clear by itself (`retriesAfter`), and everything it does before a receipt — every reattach, generation
+ * read and claim, not only the choice to ask again — ends `maxWaitMs` after relay start: Claude Code gives a stdio MCP
+ * server 30 s to answer `initialize` (measured in its own log, "Starting connection with timeout of 30000ms") and does
+ * not respawn one that missed it, so waiting past that buys nothing.
  */
 export interface ClaimRetryPolicy {
   maxWaitMs: number;
@@ -209,7 +215,7 @@ export const DEFAULT_CLAIM_RETRY_POLICY: ClaimRetryPolicy = {
  */
 const RETRIED_REFUSALS: ReadonlySet<string> = new Set([
   "PREDECESSOR_RUNTIME_ALIVE",
-  "SAME_LIVE_RUNTIME_MISMATCH",
+  "PREDECESSOR_STILL_SETTLING",
   "DEAD_PREDECESSOR_UNRELEASED",
   "ENTITLEMENT_CHANGED",
   "BUZZ_ROOM_UNRESOLVED",
@@ -988,9 +994,11 @@ export const runAttachRelayCommand = async (
       return ATTACH_EXIT.USAGE;
     }
   }
+  // The admission window starts here, at relay start, and every step before a receipt spends from it.
+  const admissionDeadline = admissionDeadlineOf(options);
   const reattached = await reattachFirst(
     options.reattachSocketPath,
-    DEFAULT_CLAIM_TIMEOUT_MS,
+    boundedBy(admissionDeadline, DEFAULT_CLAIM_TIMEOUT_MS),
     options.reattach,
     messaging,
     io,
@@ -1003,7 +1011,7 @@ export const runAttachRelayCommand = async (
   }
   // The configured door is kept whatever it answered just now (review PR1051-R5): a door that did
   // not answer may belong to a daemon that opened its claim socket and has not yet opened this one.
-  return runAttachRelay({ ...options, initialReattach: false, mcpToken, messaging }, io);
+  return runAttachRelay({ ...options, initialReattach: false, mcpToken, messaging, admissionDeadline }, io);
 };
 
 /** `reattachFirst`'s answer when the reattach did not decide the attach and the claim must. */
@@ -1052,9 +1060,35 @@ const reattachFirst = async (
 
 type Receipt = Extract<ClaimOutcome, { kind: "receipt" }>;
 
+/** When the admission window of `options` closes, as an epoch-ms instant: the one it was given, or `maxWaitMs` from now. */
+const admissionDeadlineOf = (options: { admissionDeadline?: number; claimRetry?: Partial<ClaimRetryPolicy> }): number =>
+  options.admissionDeadline ?? Date.now() + ({ ...DEFAULT_CLAIM_RETRY_POLICY, ...options.claimRetry }).maxWaitMs;
+
+/** A step's own timeout, cut to what is left of the window; at least 1 ms, so a timer is always set. */
+const boundedBy = (deadline: number, ownTimeoutMs: number): number => Math.max(1, Math.min(ownTimeoutMs, deadline - Date.now()));
+
+const WINDOW_CLOSED = Symbol("window closed");
+
+/** `promise`, or `WINDOW_CLOSED` when the window closes first. The promise is not cancelled; its answer is ignored. */
+const beforeDeadline = <T>(promise: Promise<T>, deadline: number): Promise<T | typeof WINDOW_CLOSED> =>
+  new Promise((resolveRace, rejectRace) => {
+    const timer = setTimeout(() => resolveRace(WINDOW_CLOSED), boundedBy(deadline, Number.MAX_SAFE_INTEGER));
+    promise.then(
+      (value) => { clearTimeout(timer); resolveRace(value); },
+      (error: unknown) => { clearTimeout(timer); rejectRace(error); },
+    );
+  });
+
 /**
  * The claim, asked until it is answered for good: a receipt, a refusal that cannot clear by itself (`retriesAfter`),
- * or the end of the retry window. Resolves to the receipt, or to the exit code the relay leaves with.
+ * or the end of the admission window. Resolves to the receipt, or to the exit code the relay leaves with.
+ *
+ * The window is one deadline (`admissionDeadline`, set at relay start) and it bounds every step, not only the decision
+ * to ask again: the reattach door, the generation read and the claim socket each get their own timeout or what is left
+ * of the window, whichever is less. Checked only between attempts, it did not: a DAEMON_STARTING refusal followed by a
+ * claim the daemon never answered left the relay waiting out the claim's own 180 s, past Claude Code's 30 s, and the
+ * owner had to reconnect by hand again. When the window closes the relay exits with the last refusal it was given, so
+ * the line says why it was still asking, not only that time ran out.
  *
  * Each attempt after the first asks the reattach door again first, when there is one. A claim whose answer was lost
  * (the daemon went away mid-reply) may have been admitted, and its binding is then ACTIVE on this process tree: the
@@ -1062,49 +1096,52 @@ type Receipt = Extract<ClaimOutcome, { kind: "receipt" }>;
  * start, so this never claims after a refused reattach.
  *
  * Every attempt that does not end the attach writes `attach: claim refused <reasonCode> <reason>; retrying` (or
- * `attach: claim socket unavailable; retrying`); the last one writes the same line without the suffix. `<reason>` is
- * the branch name the daemon sent, and is left out when it sent none.
+ * `attach: claim socket unavailable; retrying`); the last line is the same without the suffix. `<reason>` is the
+ * branch name the daemon sent, and is left out when it sent none.
  */
-const claimUntilAnswered = async (options: AttachRelayOptions, io: AttachRelayIo): Promise<Receipt | number> => {
+const claimUntilAnswered = async (options: AttachRelayOptions, deadline: number, io: AttachRelayIo): Promise<Receipt | number> => {
   const policy: ClaimRetryPolicy = { ...DEFAULT_CLAIM_RETRY_POLICY, ...options.claimRetry };
   const timeoutMs = options.claimTimeoutMs ?? DEFAULT_CLAIM_TIMEOUT_MS;
   const pinned = options.claim.expectedBindingGeneration;
-  const deadline = Date.now() + policy.maxWaitMs;
+  let lastRefusal: string | null = null;
+  const exitWith = (line: string, code: number): number => {
+    io.stderr.write(`${line}\n`);
+    return code;
+  };
+  /** The window closed: the last refusal is the answer, or, with none, what this step could not get. */
+  const windowClosed = (line: string, code: number): number =>
+    lastRefusal === null ? exitWith(line, code) : exitWith(lastRefusal, ATTACH_EXIT.CLAIM_REFUSED);
   let delay = policy.initialDelayMs;
   for (let attempt = 0; ; attempt += 1) {
     if (attempt > 0) {
-      const reattached = await reattachFirst(options.reattachSocketPath, timeoutMs, options.reattach, options.messaging, io);
+      const reattached = await reattachFirst(options.reattachSocketPath, boundedBy(deadline, timeoutMs), options.reattach, options.messaging, io);
       if (reattached !== CLAIM) return reattached;
     }
+    if (Date.now() >= deadline) return windowClosed("attach: claim socket unavailable", ATTACH_EXIT.UNAVAILABLE);
     let expectedBindingGeneration: number;
     if (pinned !== AUTO_GENERATION) {
       expectedBindingGeneration = pinned;
     } else {
-      const next = options.nextGeneration === undefined ? null : await options.nextGeneration().catch(() => null);
+      const read = options.nextGeneration === undefined ? null : await beforeDeadline(options.nextGeneration(), deadline).catch(() => null);
+      if (read === WINDOW_CLOSED) return windowClosed("attach: claim generation unreadable", ATTACH_EXIT.UNAVAILABLE);
       // Unreadable is not something a wait repairs (no database, or a runtime that cannot open it), and guessing a
       // generation would only be refused, so the attach ends here and says which step it could not take.
-      if (next === null || !Number.isSafeInteger(next) || next <= 0) {
-        io.stderr.write("attach: claim generation unreadable\n");
-        return ATTACH_EXIT.UNAVAILABLE;
-      }
-      expectedBindingGeneration = next;
+      if (read === null || !Number.isSafeInteger(read) || read <= 0) return exitWith("attach: claim generation unreadable", ATTACH_EXIT.UNAVAILABLE);
+      expectedBindingGeneration = read;
     }
-    const claimed = await performClaim(options.claimSocketPath, { ...options.claim, expectedBindingGeneration }, timeoutMs);
+    const claimed = await performClaim(options.claimSocketPath, { ...options.claim, expectedBindingGeneration }, boundedBy(deadline, timeoutMs));
     if (claimed.kind === "receipt") return claimed;
-    if (claimed.kind === "malformed") {
-      io.stderr.write("attach: claim receipt malformed\n");
-      return ATTACH_EXIT.PROTOCOL;
-    }
+    if (claimed.kind === "malformed") return exitWith("attach: claim receipt malformed", ATTACH_EXIT.PROTOCOL);
     const line = claimed.kind === "unavailable"
       ? "attach: claim socket unavailable"
       : `attach: claim refused ${claimed.reasonCode}${claimed.reason === null ? "" : ` ${claimed.reason}`}`;
+    const code = claimed.kind === "unavailable" ? ATTACH_EXIT.UNAVAILABLE : ATTACH_EXIT.CLAIM_REFUSED;
+    if (claimed.kind === "refused") lastRefusal = line;
     // A daemon that is not listening yet — restarting, or not started — is asked again like any answer that can clear.
     const again = claimed.kind === "unavailable" || retriesAfter(claimed, pinned === AUTO_GENERATION);
+    if (!again) return exitWith(line, code);
     const wait = Math.min(delay, deadline - Date.now());
-    if (!again || wait <= 0) {
-      io.stderr.write(`${line}\n`);
-      return claimed.kind === "unavailable" ? ATTACH_EXIT.UNAVAILABLE : ATTACH_EXIT.CLAIM_REFUSED;
-    }
+    if (wait <= 0) return windowClosed(line, code);
     io.stderr.write(`${line}; retrying\n`);
     await new Promise<void>((resolveWait) => setTimeout(resolveWait, wait));
     delay = Math.min(delay * 2, policy.maxDelayMs);
@@ -1118,11 +1155,12 @@ export const runAttachRelay = async (
   // Nothing of Claude Code's moves until the handshake newline is on the wire.
   io.stdin.pause();
 
+  const deadline = admissionDeadlineOf(options);
   // Unbound, or no reattach socket that answered: the claim decides, as it always has.
   if (options.initialReattach !== false) {
     const reattached = await reattachFirst(
       options.reattachSocketPath,
-      options.claimTimeoutMs ?? DEFAULT_CLAIM_TIMEOUT_MS,
+      boundedBy(deadline, options.claimTimeoutMs ?? DEFAULT_CLAIM_TIMEOUT_MS),
       options.reattach,
       options.messaging,
       io,
@@ -1130,7 +1168,7 @@ export const runAttachRelay = async (
     if (reattached !== CLAIM) return reattached;
   }
 
-  const claimed = await claimUntilAnswered(options, io);
+  const claimed = await claimUntilAnswered(options, deadline, io);
   if (typeof claimed === "number") return claimed;
 
   const connection = {

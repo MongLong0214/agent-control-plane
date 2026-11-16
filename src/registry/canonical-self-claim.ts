@@ -116,6 +116,9 @@ export const SelfClaimRefusal = {
   SWITCHOVER_FENCED: "SWITCHOVER_FENCED",
   DEAD_PREDECESSOR_UNRELEASED: "DEAD_PREDECESSOR_UNRELEASED",
   PREDECESSOR_RUNTIME_ALIVE: "PREDECESSOR_RUNTIME_ALIVE",
+  /** The previous runtime of this conversation is another process, still running: claimable once it exits. */
+  PREDECESSOR_STILL_SETTLING: "PREDECESSOR_STILL_SETTLING",
+  /** This very process holds the revoked runtime, but not as the exact idle one: a fact no wait changes. */
   SAME_LIVE_RUNTIME_MISMATCH: "SAME_LIVE_RUNTIME_MISMATCH",
   PREDECESSOR_ROW_UNRECONCILED: "PREDECESSOR_ROW_UNRECONCILED",
   SAME_LIVE_PREDECESSOR_UNSTOPPED: "SAME_LIVE_PREDECESSOR_UNSTOPPED",
@@ -2530,13 +2533,23 @@ export class CanonicalSelfClaim {
            UNION ALL SELECT 1 FROM resource_claims WHERE status = 'HELD' AND owner_session_id IN (SELECT session_id FROM runtimes)`,
           [predecessor.sessionId, incumbent.actor_id],
         );
-        if (!revoked || work || outstanding || predecessor.lifecycle !== SessionLifecycle.READY ||
+        // Two refusals, told apart by whether waiting can change them. The predecessor's row names another process
+        // (or a row still moving between states): once that process exits, the next claim takes the dead-predecessor
+        // path above, so the relay asks again. This very process holds the row but differs from it in a stored fact —
+        // its Buzz actor or room, its workdir, provider, model or incarnation, a missing revoked attestation, or work it
+        // still owns: none of that changes while it runs, so the relay is told at once. The second is checked first, so
+        // a claimant that is both is told the fact no wait repairs.
+        const sameProcess = predecessor.osPid === identity.pid && predecessor.osProcessStartedAt === identity.startedAt;
+        if (sameProcess && (!revoked || work || outstanding ||
             incumbent.current_session_incarnation !== predecessor.incarnation ||
-            predecessor.osPid !== identity.pid || predecessor.osProcessStartedAt !== identity.startedAt ||
             predecessor.workdir !== identity.cwd || predecessor.buzzActorId !== entry.buzzActorId ||
             predecessor.buzzAddress !== buzzAddress || predecessor.provider !== "claude" ||
-            predecessor.model !== "claude-cli") {
+            predecessor.model !== "claude-cli")) {
           return refuse(SelfClaimRefusal.SAME_LIVE_RUNTIME_MISMATCH, ReasonCode.CONFLICT, "same-live recovery requires the exact idle revoked runtime", {});
+        }
+        if (!sameProcess || predecessor.lifecycle !== SessionLifecycle.READY) {
+          return refuse(SelfClaimRefusal.PREDECESSOR_STILL_SETTLING, ReasonCode.CONFLICT,
+            "same-live recovery requires the exact idle revoked runtime: the previous runtime is another process that is still running, or its row is still changing state", {});
         }
         predecessorSessionId = predecessor.sessionId;
       }
