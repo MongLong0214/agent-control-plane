@@ -209,6 +209,28 @@ describe("#1232 a task imports binary files through its write target", () => {
     expect(failed!.evidence).toMatchObject({ reason: "IMPORT_ALTERED", altered: ["assets/logo.png"] });
   }, 60_000);
 
+  it("W1d #1418 imports plus a declared path the worker never touched is NO_WORKER_CHANGE, not SUCCEEDED; an import-only target still succeeds", async () => {
+    const run = async (ownedPaths: string[], writes: Record<string, string>) => {
+      const world = seedWorkerWorld(makeCore(), { ownedPaths });
+      const root = tempDir("acp-imports-");
+      const imports = [entry("assets/logo.png", PNG)];
+      declareImports(world, imports);
+      stage(root, world, imports[0]!.sha256, PNG);
+      const adapter = fakeFor(world);
+      adapter.script = { writes };
+      const runner = makeRunner(world, adapter, { importRoot: root });
+      const started = await startTurn(world, runner);
+      if (!started.allowed) throw new Error(`start refused: ${started.reasonCode} ${started.message}`);
+      await runner.settled(started.value.executionId);
+      return { world, status: world.tasks.execution(started.value.executionId)!.status };
+    };
+    const noEdit = await run(["assets", "src"], {});
+    expect(noEdit.status).toBe("FAILED");
+    expect(noEdit.world.audit.byKind(WorkerTurnEvent.FAILED)[0]!.evidence).toMatchObject({ reason: "NO_WORKER_CHANGE", required: ["src"] });
+    expect((await run(["assets"], {})).status).toBe("SUCCEEDED");
+    expect((await run(["assets", "src"], { "src/app.js": "module.exports = () => 2;\n" })).status).toBe("SUCCEEDED");
+  }, 120_000);
+
   it("W1c the largest import set validation accepts, every file at its maximum size, is imported and committed", async () => {
     const world = seedWorkerWorld(makeCore(), { ownedPaths: ["assets", "src"] });
     const root = tempDir("acp-imports-");
