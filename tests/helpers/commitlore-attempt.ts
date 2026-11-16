@@ -39,3 +39,28 @@ export const passingCommitLore = (messages: string[] = []): CommitLorePort => ({
   }),
   attempt: gitCommitAttempt(messages),
 });
+
+/**
+ * #1268 — a CommitLore that settles a worker turn the way the real one settles a turn with nothing to record: its
+ * contract asks for the draft, every path answers with no records and guard finds nothing, the draft is considered
+ * as `{"records": []}` and the commit settles `empty`. For fixtures whose subject is the run, not CommitLore: a
+ * turn's reply gets that draft from `FakeWorkerAdapter`. The real procedure is witnessed against the real CLI.
+ */
+export const settlingCommitLore = (messages: string[] = []): CommitLorePort => ({
+  ...passingCommitLore(messages),
+  contract: async () => allow(ReasonCode.OK, "CommitLore (test double): end your reply with one ```commitlore-draft block holding {\"records\": []}."),
+  beforeChange: async (_checkout, _git, request) => ({
+    paths: request.paths.map((path) => ({ path, outcome: "answered" as const, text: "", cacheKey: "test-double", withheld: 0, items: null, detail: null, noHistory: true })),
+    guard: { status: "clean" as const, matches: [], detail: null },
+    cliIdentity: { version: "test-double", digest: `sha256:${"0".repeat(64)}` },
+  }),
+  attempt: async () => {
+    const base = await gitCommitAttempt()();
+    if (!base.allowed) return base;
+    return allow(ReasonCode.OK, {
+      ...base.value,
+      consider: async ({ message }) => allow(ReasonCode.OK, { message, outcome: "empty" as const, recordIds: [], nonce: null }),
+      settle: async () => allow(ReasonCode.OK, { outcome: "empty" as const, recordIds: [], nonce: null }),
+    });
+  },
+});

@@ -73,7 +73,7 @@ const prepare = async () => {
     stdoutSha256: sha256("worker stdout"), commitHead: head, diffDigest: receiptDiffDigest };
   const resultDigest = workerSuccessDigest(inputs);
   const recorded = harness.cp.audit.record({ kind: WorkerTurnEvent.SUCCEEDED, runId: run.runId,
-    evidence: { ...inputs, resultDigest, taskId: task.taskId, head: baseHead, paths: ["src/app.js"] } });
+    evidence: { ...inputs, resultDigest, taskId: task.taskId, head: baseHead, paths: ["src/app.js"], commitlore: { outcome: "empty", recordIds: [], nonce: null } } });
   if (!recorded.allowed) throw new Error(recorded.message);
   harness.cp.tasks.finishExecution(execution.value.executionId, { status: "SUCCEEDED", resultDigest });
   const frozen = await harness.cp.pipeline.freeze(run.runId);

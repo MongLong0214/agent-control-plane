@@ -180,9 +180,10 @@ export const projectManifestSchema = z
       .min(1)
       .optional(),
     /**
-     * #1268 — a manifest that does not name a mode requires CommitLore. Every stored manifest was stored
-     * after the schema filled this field in, so the default changes no stored manifest or its digest; one
-     * that says `preferred` or `off` keeps it until a contract change raises it.
+     * #1268 — IGNORED. CommitLore is used for every commit the control plane makes in a managed project, whatever
+     * this field says. It stays in the schema, and stays parseable as `required`, `preferred` or `off`, only so a
+     * manifest already stored with `preferred` or `off` keeps its digest; nothing reads the value to decide
+     * whether CommitLore is used (`commitloreRunMode`). A manifest that does not name it says `required`.
      */
     commitlore: z
       .object({ mode: z.enum(["required", "preferred", "off"]).default("required") })

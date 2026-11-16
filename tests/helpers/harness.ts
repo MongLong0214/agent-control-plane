@@ -1,6 +1,6 @@
-import { passingCommitLore } from "./commitlore-attempt.ts";
-import { commitloreGoverned } from "../../src/bootstrap/commitlore-observation.ts";
+import { passingCommitLore, settlingCommitLore } from "./commitlore-attempt.ts";
 import { WorkerTurnEvent } from "../../src/run/worker-turn.ts";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 
 import { type Clock, ManualClock } from "../../src/core/clock.ts";
@@ -91,6 +91,11 @@ export const makeHarness = (
     reviewer?: ControlPlaneConfig["reviewer"];
     /** The daemon's per-project reviewer file, as read at start; none when omitted. */
     reviewerPreferencesFile?: ControlPlaneConfig["reviewerPreferencesFile"];
+    /**
+     * #1268 — false for a witness that seeds each worker receipt itself (see `a-governed-freeze-holds-only-commits-
+     * commitlore-saw`): `finishExecution` then writes none.
+     */
+    commitloreReceipts?: boolean;
   } = {},
 ): Harness => {
   const root = options.root ?? tempDir("acp-harness-");
@@ -135,6 +140,7 @@ console.log('verification ok');`,
       preferred: { provider: "scripted", model: "scripted-reviewer", effort: "xhigh" },
       fallbacks: [],
     },
+    commitlore: settlingCommitLore(),
     ...(options.githubClient ? { githubClient: options.githubClient } : {}),
     ...(options.githubKernelOptions ? { githubKernelOptions: options.githubKernelOptions } : {}),
     ...(options.githubAppEnvFile ? { githubAppEnvFile: options.githubAppEnvFile } : {}),
@@ -160,6 +166,82 @@ console.log('verification ok');`,
   cp.continuity.attach({
     buzz: { connect: (sessionId, purpose) => adapter.connect(sessionId, purpose) },
   });
+
+  // #1268 — every run's contract requires CommitLore, so a candidate holds only commits a worker receipt accounts for,
+  // and its merge commits get CommitLore's check. A fixture that commits with plain git stands in for a CommitLore-settled
+  // turn: finishing an execution SUCCEEDED at a commit writes the receipt such a turn writes, which carries no record.
+  if (options.commitloreReceipts !== false) {
+    const finishExecution = cp.tasks.finishExecution.bind(cp.tasks);
+    Object.defineProperty(cp.tasks, "finishExecution", {
+      configurable: true,
+      writable: true,
+      value: (...args: Parameters<typeof finishExecution>) => {
+        const finished = finishExecution(...args);
+        const head = /^sha256:([0-9a-f]{40,64})$/.exec(args[1].resultDigest ?? "")?.[1];
+        // A result digest that names a commit of the fixture's repository; a witness that seeds its own receipt, under
+        // a digest of its own, is not given a second.
+        const names = head !== undefined && (() => { try { return execFileSync("git", ["cat-file", "-t", head], { cwd: repoPath, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 30_000 }).trim() === "commit"; } catch { return false; } })();
+        if (finished.allowed && args[1].status === "SUCCEEDED" && head !== undefined && names) {
+          cp.audit.record({
+            kind: WorkerTurnEvent.SUCCEEDED,
+            runId: finished.value.runId,
+            sessionId: finished.value.workerSessionId,
+            evidence: {
+              executionId: finished.value.executionId,
+              resultDigest: args[1].resultDigest,
+              taskId: finished.value.taskId,
+              commitHead: head,
+              commitlore: { outcome: "empty", recordIds: [], nonce: null },
+            },
+          });
+        }
+        return finished;
+      },
+    });
+  }
+
+  if (options.commitloreReceipts !== false) {
+    // A fixture that commits again after its worker's turn, with plain git, stands in for a worker's further turn: the
+    // freeze names the first commit no receipt accounts for, and the fixture's worker turn that made it is recorded.
+    const freeze = cp.pipeline.freeze.bind(cp.pipeline);
+    Object.defineProperty(cp.pipeline, "freeze", {
+      configurable: true,
+      writable: true,
+      value: async (...args: Parameters<typeof freeze>): ReturnType<typeof freeze> => {
+        for (let turns = 0; ; turns += 1) {
+          const frozen = await freeze(...args);
+          const named = frozen.allowed ? null : (frozen.evidence as { commit?: unknown; refusal?: unknown; repositoryIdentity?: unknown });
+          if (
+            frozen.allowed ||
+            frozen.reasonCode !== ReasonCode.CANDIDATE_FOREIGN_COMMIT ||
+            (named?.refusal !== "NOT_A_RUN_WORKER_COMMIT" && named?.refusal !== "MERGE_NOT_CHECKED") ||
+            typeof named.commit !== "string" ||
+            typeof named.repositoryIdentity !== "string" ||
+            turns >= 8
+          ) {
+            return frozen;
+          }
+          const [runId] = args;
+          const run = cp.runs.get(runId);
+          const repository = cp.db.get<{ repository_id: string }>(`SELECT repository_id FROM repositories WHERE identity = ?`, [named.repositoryIdentity]);
+          const submitted = cp.tasks.submit(runId, [{ key: `fixture-turn-${turns}-${named.commit.slice(0, 8)}`, title: "a further fixture worker turn", category: "implementation" }]);
+          if (run === null || run === undefined || repository === undefined || !submitted.allowed) return frozen;
+          const task = submitted.value[0]!;
+          const execution = cp.tasks.startExecution({
+            runId,
+            taskId: task.taskId,
+            ownerBindingGeneration: run.ownerBindingGeneration!,
+            workerSessionId: bindWorkerForTask(cp, task.taskId),
+            provider: "scripted",
+            model: "scripted-worker",
+            repositoryId: repository.repository_id,
+          });
+          if (!execution.allowed) return frozen;
+          cp.tasks.finishExecution(execution.value.executionId, { status: "SUCCEEDED", resultDigest: `sha256:${named.commit}` });
+        }
+      },
+    });
+  }
 
   return { cp, clock, scripted, repoPath, root, buzz, buzzAdapter: adapter };
 };
@@ -545,9 +627,9 @@ export const driveToReviewedCandidate = async (
     status: "SUCCEEDED",
     resultDigest: `sha256:${head}`,
   });
-  // #1268 — a run whose contract requires CommitLore freezes only commits a worker receipt accounts for: the
-  // receipt a CommitLore-settled turn writes for this commit, which carries no record.
-  if (commitloreGoverned(harness.cp.db, runId)) {
+  // #1268 — the head's own turn is receipted by `finishExecution` unless the witness seeds its receipts itself
+  // (`commitloreReceipts: false`), when the receipt a CommitLore-settled turn writes for this head is written here.
+  if (!harness.cp.audit.byKind(WorkerTurnEvent.SUCCEEDED).some((row) => row.evidence["executionId"] === execution.value.executionId)) {
     harness.cp.audit.record({
       kind: WorkerTurnEvent.SUCCEEDED,
       runId,

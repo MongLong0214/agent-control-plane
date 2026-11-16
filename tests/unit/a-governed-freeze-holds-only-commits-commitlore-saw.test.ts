@@ -130,8 +130,8 @@ const SECOND = "github:acme/second";
  * A dispatched run of a project whose CommitLore mode is `mode`. `second` adds a secondary repository to the
  * project and the run: a clone of the primary with no remote, so the two share their base commit.
  */
-const worldOf = async (mode: "required" | "preferred", projectId = `cl-freeze-${mode}`, options: { second?: boolean } = {}) => {
-  const harness = makeHarness();
+const worldOf = async (mode: "required" | "preferred" | "off", projectId = `cl-freeze-${mode}`, options: { second?: boolean } = {}) => {
+  const harness = makeHarness({ commitloreReceipts: false });
   const { repositoryId, identity } = await registerFixtureProject(harness, projectId, {
     commitlore: { mode },
     ...(options.second
@@ -152,7 +152,7 @@ const worldOf = async (mode: "required" | "preferred", projectId = `cl-freeze-${
   const run = await dispatchedRun(harness, projectId, repositoryId, second?.repositoryId);
   // The integration's merge messages get CommitLore's check; this double passes every one.
   harness.cp.pipeline.attach({ commitlore: passingCommitLore() });
-  expect(commitloreGoverned(harness.cp.db, run.runId)).toBe(mode === "required");
+  expect(commitloreGoverned(harness.cp.db, run.runId)).toBe(true);
   return { harness, run, projectId, repositoryId, identity, repo: harness.repoPath, base: gitSync(harness.repoPath, ["rev-parse", "dev"]), second };
 };
 
@@ -335,14 +335,15 @@ describe("#1268: a governed freeze holds only commits CommitLore accounts for", 
     expect(evidence.repositories[0]).toMatchObject({ commitloreMergeChecks: [{ commit: head, parents }] });
   });
 
-  it("UNCHANGED — a run whose contract does not require CommitLore freezes an unmanaged commit on top, as before", async () => {
-    const world = await worldOf("preferred");
-    workerCommit(world, "readme", { "README.md": "# one\n" }, "update readme", null);
-    const onTop = unmanagedCommit(world, "on top of the task");
-    const value = await freezeAllowed(world);
-    expect(value.repositories[0]!.candidateHead).toBe(onTop);
-    expect("integration" in value.repositories[0]!).toBe(false);
-  });
+  it.each(["preferred", "off"] as const)(
+    "refused — a run whose manifest says %s is governed all the same: an unmanaged commit on a worker commit is not frozen",
+    async (mode) => {
+      const world = await worldOf(mode);
+      workerCommit(world, "readme", { "README.md": "# one\n" }, "update readme", EMPTY);
+      const onTop = unmanagedCommit(world, "on top of the task");
+      await expectRefusedUnchanged(world, { reasonCode: ReasonCode.CANDIDATE_FOREIGN_COMMIT, commit: onTop, refusal: "NOT_A_RUN_WORKER_COMMIT" });
+    },
+  );
 
   it("(a) refused — an unmanaged commit stacked on a worker commit; refs and HEAD unchanged", async () => {
     const world = await worldOf("required");

@@ -25,12 +25,12 @@ import {
   createCheckoutLeafOrDeny,
   ensureDirectoryLevel,
   judgeDirectoryOwnership,
-  produceRepoFactoryResult,
   repositoryCheckoutPath,
   trackedFilesOrDeny,
   VERIFICATION_KINDS,
   type RepoFactoryPlanFixture,
 } from "../../src/bootstrap/repo-factory-producer.ts";
+import { produceRepoFactoryResult } from "../helpers/repo-factory-produce.ts";
 import { git } from "../../src/git/git.ts";
 
 /**

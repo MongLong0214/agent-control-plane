@@ -12,7 +12,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from
 import Database from 'better-sqlite3';
 import { bytesDigest, genesisDigest, parseGenesis } from '../../src/bootstrap/genesis-bundle.ts';
 import { bootstrapPlanPreflight, executablePlanOf, planForSubmission } from '../../src/bootstrap/bootstrap-plan.ts';
-import { produceRepoFactoryResult } from '../../src/bootstrap/repo-factory-producer.ts';
+import { produceRepoFactoryResult } from '../helpers/repo-factory-produce.ts';
 import { digestOf } from '../../src/core/digest.ts';
 import { ResidentProjectProvisioning } from '../../src/bootstrap/resident-project-provisioning.ts';
 import { CanonicalSessionRegistry } from '../../src/registry/canonical-session-registry.ts';

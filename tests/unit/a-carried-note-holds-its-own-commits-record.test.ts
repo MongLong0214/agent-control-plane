@@ -80,18 +80,16 @@ const reflectMergedBase = (github: FakeGitHub): void => {
  * earlier record block in its message declares X_EARLY_ID. The head records nothing.
  * Y is a recorded commit outside the candidate (branch `side`, on the base): its trailer block declares Y_ID.
  * The setup is the one the #1269 notes scenarios use, with X committed on the work branch before the run. The run
- * is governed (CommitLore `required`) unless `lenient` names one of the two modes that are not (`preferred`, the
- * fixture manifest's own mode, or `off`).
+ * is governed whatever its manifest says; the fixture manifest's own mode (`preferred`) is ignored.
  */
 const setup = async (options: {
-  lenient?: "preferred" | "off";
   xLimit?: string;
   /** X's message as ISO-8859-1 bytes, committed with that `encoding` header (`declared`) or with none (null). */
   xLatin1?: { declared: "ISO-8859-1" | null };
 } = {}) => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
-  const harness = makeHarness({ githubClient: github });
+  const harness = makeHarness({ githubClient: github, commitloreReceipts: false });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
   harness.cp.verification.attachCi({
     fetch: async (repositoryIdentity, head) => [{
@@ -126,19 +124,16 @@ const setup = async (options: {
       gitSync(repo, ["update-ref", "HEAD", x]);
     }
   }
-  if (options.lenient === undefined) {
-    // X's turn is recorded in the run once the run exists, before its one freeze; the harness records the head's.
-    const freeze = harness.cp.pipeline.freeze.bind(harness.cp.pipeline);
-    vi.spyOn(harness.cp.pipeline, "freeze").mockImplementationOnce(async (runId, attemptId) => {
-      recordWorkerTurn(harness, runId, x, [X_EARLY_ID, X_ID]);
-      return freeze(runId, attemptId);
-    });
-  }
+  // X's turn is recorded in the run once the run exists, before its one freeze; the harness records the head's.
+  const freeze = harness.cp.pipeline.freeze.bind(harness.cp.pipeline);
+  vi.spyOn(harness.cp.pipeline, "freeze").mockImplementationOnce(async (runId, attemptId) => {
+    recordWorkerTurn(harness, runId, x, [X_EARLY_ID, X_ID]);
+    return freeze(runId, attemptId);
+  });
 
   const driven = await driveToReviewedCandidate(harness, {
     workBranch: WORK_BRANCH,
     manifestOverrides: {
-      commitlore: { mode: options.lenient ?? "required" },
       ciWorkflows: [{ path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null, unapprovedFirstActivation: true, repositoryRole: "primary" }],
       verificationProfiles: { simple: ["project-ci"], standard: ["project-ci"], guarded: ["project-ci"] },
       verificationCommands: [parseVerificationCommand({
@@ -374,11 +369,4 @@ describe("#1268 slice 2 — a carried note holds the record of the commit it is 
     expect(fixture.github.notesRef).toBeNull();
   });
 
-  it.each(["preferred", "off"] as const)("a non-governed run (%s) is unchanged: its notes are carried as they are", async (lenient) => {
-    const fixture = await setup({ lenient });
-    const copied = noteOn(fixture, fixture.x, trailersOf(fixture.repo, fixture.y));
-    const merged = await fixture.merge();
-    expect(merged.reasonCode, merged.allowed ? "" : merged.message).toBe(ReasonCode.OK);
-    expect(fixture.github.remoteNoteFor(fixture.x)).toBe(copied);
-  });
 });

@@ -88,10 +88,9 @@ export interface ACPBootstrapActivationResult {
 }
 
 /**
- * G0a, #246 B3 — a manifest that asks for CommitLore and a producer result that carries no passing
- * CommitLore verification at the published head activates with CommitLore named NOT_OBSERVED. Only
- * `preferred` gets this far unobserved: `required` is refused by `commitloreActivationGate` before
- * anything is written. `off` asks for nothing.
+ * G0a, #246 B3 — a producer result that carries no passing CommitLore verification at the published head is
+ * refused by `commitloreActivationGate` before anything is written (#1268: whatever mode its manifest names),
+ * so no activation reaches a warning; the shape stays for the results already stored with one.
  */
 export interface ActivationWarning {
   commitlore: "NOT_OBSERVED";
@@ -103,20 +102,6 @@ export interface BootstrapHandoffReceipt {
   bindingGeneration: number;
   payloadDigest: string;
 }
-
-/**
- * #1268 — the CommitLore mode a new project's bootstrap manifest must state: `required`. `preferred` and
- * `off` are refused here, at activation, and before the producer writes anything (`newProjectCommitLore` in
- * the bootstrap run's precondition).
- */
-export const newProjectCommitLore = (manifest: ProjectManifest): Decision<void> =>
-  manifest.commitlore.mode === "required"
-    ? allow(ReasonCode.OK, undefined)
-    : deny(ReasonCode.VERIFICATION_GAP, `a new project's manifest must require CommitLore, and this one says ${manifest.commitlore.mode}`, {
-        refusal: "COMMITLORE_MODE_NOT_REQUIRED",
-        commitloreMode: manifest.commitlore.mode,
-        projectId: manifest.projectId,
-      });
 
 const activationWarnings = (manifest: ProjectManifest | null, observed: boolean): ActivationWarning[] => {
   const mode = manifest?.commitlore.mode ?? null;
@@ -327,12 +312,8 @@ export class BootstrapActivation {
     if (this.residentGenesisRequired && !current.value.outputs.genesis) return deny(ReasonCode.INVALID_ARGUMENT,"bootstrap requires an inline genesis bundle and resident CTO",{});
     const facts = observedRepositoryFacts(result, factsTargetOf(current.value.outputs));
     if (!facts.allowed) return facts as Decision<ACPBootstrapActivationResult>;
-    // #1268 — a new project requires CommitLore: a bootstrap manifest that prefers it or turns it off
-    // activates nothing. A project that exists keeps its manifest until a contract change raises it.
-    const newProjectMode = newProjectCommitLore(input.approvedManifest);
-    if (!newProjectMode.allowed) return newProjectMode as Decision<ACPBootstrapActivationResult>;
-    // #246 B3 — the approved manifest's CommitLore mode, enforced on this result at those facts' heads.
-    const commitlore = commitloreActivationGate(input.approvedManifest.commitlore.mode, result, facts.value);
+    // #246 B3, #1268 — CommitLore, whatever mode the manifest names, enforced on this result at those facts' heads.
+    const commitlore = commitloreActivationGate(result, facts.value);
     if (!commitlore.allowed) return commitlore as Decision<ACPBootstrapActivationResult>;
 
     // Everything that can be refused is refused *before* the first mutation. Registering a
@@ -842,7 +823,7 @@ export class BootstrapActivation {
     const activeManifest = this.projects.activeManifest(projectId)?.manifest ?? null;
     const resultFacts = observedRepositoryFacts(factory.content, factsTargetOf(plan.value.outputs));
     if (!resultFacts.allowed) return resultFacts as Decision<ACPBootstrapActivationResult>;
-    const commitlore = commitloreActivationGate(activeManifest?.commitlore.mode ?? plan.value.manifest.commitlore.mode, factory.content, resultFacts.value);
+    const commitlore = commitloreActivationGate(factory.content, resultFacts.value);
     if (!commitlore.allowed) return commitlore as Decision<ACPBootstrapActivationResult>;
     const target = plan.value.outputs.target;
     const ctoSession = primary ? this.sessions.get(primary.sessionId) : null;

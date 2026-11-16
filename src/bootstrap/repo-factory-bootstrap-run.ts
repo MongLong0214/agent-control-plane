@@ -19,10 +19,10 @@ import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
-import { type ACPBootstrapActivationResult, type BootstrapActivation, newProjectCommitLore } from "./activation.ts";
+import { type ACPBootstrapActivationResult, type BootstrapActivation } from "./activation.ts";
 import { type GroupMember, processGroupEmpty, processGroupMembership } from "./attempt-writer-group.ts";
 import { type BootstrapWriteRequest, runUnderWriteGuard } from "./bootstrap-write-guard.ts";
-import { type CommitLoreObservation, type CommitLorePort, commitloreRequired, probeCommitLore, verifyCommitLoreBinding } from "./commitlore-observation.ts";
+import { type CommitLoreObservation, type CommitLorePort, probeCommitLore, verifyCommitLoreBinding } from "./commitlore-observation.ts";
 import { type DogfoodFindingStore, commitloreObservationFinding } from "../quality/upstream-dogfood.ts";
 import {
   consumeWithheldExemption,
@@ -582,7 +582,7 @@ export class RepoFactoryBootstrapRunner {
     const operations = outputs.githubOperations;
     const executable = executablePlanOf(outputs, planArtifact.digest);
     // #246 B3 — the approved manifest's CommitLore mode, as the PLAN carries it, and what observes it.
-    const commitlore = { mode: input.approvedManifest.commitlore.mode, port: this.deps.commitlore ?? null };
+    const commitlore = { port: this.deps.commitlore ?? null };
 
     // Readiness is asked about the candidate the CEO confirms: a passing review of that candidate,
     // bound to the run's current PLAN, manifest and planned outputs (#246 C2).
@@ -725,20 +725,12 @@ export class RepoFactoryBootstrapRunner {
       // owner's approval is consumed or GitHub is read or written: no observer, or a probe that does not
       // pass, refuses here, and a new run reserves nothing. The PLAN stays as approved; nothing lowers its
       // mode. The observation the result reports is made again in the checkout, at the published head.
-      // #1268 — and a new project's manifest that does not require CommitLore activates nothing, so it is
-      // refused here, before anything is consumed, read or written, as activation would refuse it after.
-      const newProject = newProjectCommitLore(input.approvedManifest);
-      if (!newProject.allowed) {
-        if (existing !== null) this.deps.applications.recordRefusal(runId, refusalRecord(newProject, "precondition"));
-        return atStage(newProject as Decision<ACPBootstrapActivationResult>, "precondition");
-      }
-      if (commitloreRequired(commitlore.mode)) {
-        const probed = await probeCommitLore(commitlore.port);
-        if (!probed.allowed) {
-          this.#recordCommitLoreFinding(runId, probed);
-          if (existing !== null) this.deps.applications.recordRefusal(runId, refusalRecord(probed, "precondition"));
-          return atStage(probed as Decision<ACPBootstrapActivationResult>, "precondition");
-        }
+      // #1268 — whatever mode the manifest names: the mode is not read.
+      const probed = await probeCommitLore(commitlore.port);
+      if (!probed.allowed) {
+        this.#recordCommitLoreFinding(runId, probed);
+        if (existing !== null) this.deps.applications.recordRefusal(runId, refusalRecord(probed, "precondition"));
+        return atStage(probed as Decision<ACPBootstrapActivationResult>, "precondition");
       }
       if (existing !== null) {
         const ended = this.earlierAttemptsEnded(existing, workDir, executable.repositoryRole);
@@ -977,7 +969,6 @@ export class RepoFactoryBootstrapRunner {
     // every CONFIRM, of the result this attempt just produced, at the head it published.
     const producedFacts = observedRepositoryFacts(produced.value, factsTargetOf(outputs));
     const commitloreBound = verifyCommitLoreBinding({
-      mode: commitlore.mode,
       result: produced.value,
       workDir,
       expected: {
@@ -1022,7 +1013,7 @@ export class RepoFactoryBootstrapRunner {
       })),
     });
     if (!execution.allowed) return atStage(execution as Decision<RepoFactoryResult>, "precondition");
-    return this.writtenChain(application, workRoot, executable, execution.value, manifest.commitlore.mode);
+    return this.writtenChain(application, workRoot, executable, execution.value);
   }
 
   /**
@@ -1186,7 +1177,6 @@ export class RepoFactoryBootstrapRunner {
     workRoot: string,
     plan: RepoFactoryPlanFixture,
     execution: GitHubExecutionPlan,
-    commitloreMode: unknown,
   ): Decision<RepoFactoryResult> {
     const { runId } = application;
     const unattributed = (message: string, evidence: Evidence = {}): Decision<RepoFactoryResult> =>
@@ -1297,7 +1287,6 @@ export class RepoFactoryBootstrapRunner {
     // producer made beside this attempt at the head the ledger reads back: a row a database writer put
     // there after a refused observation, or one from another attempt or head, completes nothing.
     const commitlore = verifyCommitLoreBinding({
-      mode: commitloreMode,
       result,
       workDir,
       expected: {

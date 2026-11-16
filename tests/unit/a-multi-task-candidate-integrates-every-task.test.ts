@@ -193,7 +193,8 @@ describe("a multi-task candidate is every SUCCEEDED task's result on the pinned 
         // Both changes, each task commit an ancestor, joined by one merge in task-id order.
         expect(fileAt(s.repo, repo.candidateHead, "README.md")).toBe("# task one");
         expect(fileAt(s.repo, repo.candidateHead, "src/app.js")).toBe("module.exports = () => 2;");
-        expect(repo.integration).toEqual({ checkoutHead: head, tasks: order.map((taskId) => ({ taskId, commit: commitOf(taskId) })) });
+        // A governed freeze also records the merge it checked (`commitloreMergeChecks`, #1268).
+        expect(repo.integration).toMatchObject({ checkoutHead: head, tasks: order.map((taskId) => ({ taskId, commit: commitOf(taskId) })) });
         expect(repo.candidateHead).not.toBe(head);
         expect(isAncestor(s.repo, app.commit, repo.candidateHead)).toBe(true);
         expect(isAncestor(s.repo, readme.commit, repo.candidateHead)).toBe(true);
@@ -211,7 +212,7 @@ describe("a multi-task candidate is every SUCCEEDED task's result on the pinned 
         expect(worktreesOf(s.repo)).toBe(worktreesBefore);
         expect(integrationWorktrees(f, s.runId).map((row) => row.state)).toEqual(["DESTROYED"]);
         expect(managedTrees(f)).toEqual([]);
-        expect(cp.audit.byKind("CANDIDATE_FROZEN").filter((row) => row.runId === s.runId).at(-1)?.evidence["repositories"]).toEqual([
+        expect(cp.audit.byKind("CANDIDATE_FROZEN").filter((row) => row.runId === s.runId).at(-1)?.evidence["repositories"]).toMatchObject([
           { identity: repo.identity, candidateHead: repo.candidateHead, sourceBranch: repo.sourceBranch, sourceHead: repo.sourceHead, files: 2, integratedTasks: 2 },
         ]);
 

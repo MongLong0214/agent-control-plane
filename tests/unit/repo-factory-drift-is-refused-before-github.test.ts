@@ -9,11 +9,11 @@ import { ManualClock } from "../../src/core/clock.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
   plannedBootstrapFiles,
-  produceRepoFactoryResult,
   repositoryCheckoutPath,
   type PlannedBootstrapFile,
   type RepoFactoryPlanFixture,
 } from "../../src/bootstrap/repo-factory-producer.ts";
+import { produceRepoFactoryResult } from "../helpers/repo-factory-produce.ts";
 import { git } from "../../src/git/git.ts";
 import { FakeGitHub, type Protection } from "../helpers/fake-github-write-port.ts";
 

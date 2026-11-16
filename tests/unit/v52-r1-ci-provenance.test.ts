@@ -3,7 +3,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { executablePlanOf } from "../../src/bootstrap/bootstrap-plan.ts";
 import { bytesDigest } from "../../src/bootstrap/genesis-bundle.ts";
 import { createGitHubApiWritePort } from "../../src/bootstrap/github-write-port.ts";
-import { produceRepoFactoryResult } from "../../src/bootstrap/repo-factory-producer.ts";
+import { produceRepoFactoryResult } from "../helpers/repo-factory-produce.ts";
 import { type GitHubClient, mergeBootstrapGenesis } from "../../src/github/github-kernel.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { type CiProvenance, GenesisGitHub, genesisPlanFixture } from "../helpers/genesis-github.ts";

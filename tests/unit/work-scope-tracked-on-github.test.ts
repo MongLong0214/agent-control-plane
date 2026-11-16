@@ -6,7 +6,7 @@ import { executablePlanOf, planForSubmission } from "../../src/bootstrap/bootstr
 import { createBootstrapGitHubWritePort } from "../../src/bootstrap/bootstrap-write-guard.ts";
 import { type GenesisBundle, parseGenesis } from "../../src/bootstrap/genesis-bundle.ts";
 import { GhCliGitHubClient, createGitHubApiWritePort, type GenesisResourceUnmet, type GitHubRepositoryTarget } from "../../src/bootstrap/github-write-port.ts";
-import { produceRepoFactoryResult } from "../../src/bootstrap/repo-factory-producer.ts";
+import { produceRepoFactoryResult } from "../helpers/repo-factory-produce.ts";
 import { acpError, allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { manifestDigest, projectManifestSchema } from "../../src/contracts/manifest.ts";

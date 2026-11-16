@@ -191,6 +191,12 @@ export interface ControlPlaneConfig {
    */
   residentProvisioner?: {port?: HostProjectProvisioner; script?: string; home?: string};
   repoFactory?: { workRoot: string; githubPort?: GitHubWritePort; commitlore?: CommitLorePort };
+  /**
+   * #1268 — replaces, in tests, the pinned `commitlore` CLI port a worker turn commits through. Every run that pins a
+   * manifest is governed whatever the manifest says (`commitloreRunMode`), so this chooses which CommitLore, never
+   * whether there is one.
+   */
+  commitlore?: CommitLorePort;
 }
 
 export const defaultConfig = (root = join(homedir(), ".agent-control-plane")): ControlPlaneConfig => ({
@@ -681,7 +687,7 @@ export class ControlPlane {
         workerAdapter: (provider: string) => this.providers.requireForRole(provider, Role.WORKER),
         // #1242 — a dependent task's base, when its target is first recorded at its run; the pipeline is built below.
         predecessorBase: (input) => this.pipeline.predecessorBase(input),
-      }, config.importRoot === undefined ? {} : { importRoot: config.importRoot });
+      }, { ...(config.importRoot === undefined ? {} : { importRoot: config.importRoot }), ...(config.commitlore === undefined ? {} : { commitlore: config.commitlore }) });
       // S2 — a run's claim on its checkout passes to its next claim only when the runner says nothing
       // a turn of that run started can still write the checkout.
       this.claims.attach({
@@ -733,6 +739,7 @@ export class ControlPlane {
         this.repositories, this.verification, this.review, this.review.controlPlaneInvoker(), this.ceo, this.bindings, this.outbox,
         this.telemetry, this.guard,
       );
+      if (config.commitlore !== undefined) this.pipeline.attach({ commitlore: config.commitlore });
 
       const githubKernelOptions = config.githubKernelOptions ?? (config.githubClient
         ? {}

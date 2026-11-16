@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { executablePlanOf } from "../../src/bootstrap/bootstrap-plan.ts";
 import { bytesDigest } from "../../src/bootstrap/genesis-bundle.ts";
-import { produceRepoFactoryResult } from "../../src/bootstrap/repo-factory-producer.ts";
+import { produceRepoFactoryResult } from "../helpers/repo-factory-produce.ts";
 import { parseRepoFactoryResult, type RepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -123,6 +123,8 @@ describe.skipIf(process.platform !== "darwin" || !existsSync("/usr/bin/sandbox-e
     ]);
     if (decision.allowed) expect(decision.value.bootstrapVerification).toEqual([
       expect.objectContaining({ commandId: "test", approvedArgv, executedArgv, compat }),
+      // #1268 — every bootstrap is observed by CommitLore at its published head.
+      expect.objectContaining({ commandId: "commitlore:doctor", status: "PASS" }),
     ]);
   });
 
@@ -235,8 +237,10 @@ describe("RF genesis approved worktree checks", () => {
         if (when === "before" && phase === "GENESIS_TEST" && !state.pending.length &&
             state.receipts.length === f.input.plan.githubOperations.length) mutate();
       } });
+      // A drift of the working tree is refused by whichever check sees it first: genesis verification, or, since every
+      // bootstrap is observed by CommitLore (#1268), CommitLore's own check that the tree is still the approved one.
       expect(decision).toMatchObject({ allowed: false, reasonCode: ReasonCode.VERIFICATION_GAP,
-        message: "genesis verification requires the clean approved worktree" });
+        message: expect.stringMatching(/^(genesis verification requires the clean approved worktree|CommitLore changed the checkout's working tree)/) });
       expect(f.runs).toHaveBeenCalledTimes((phase === "GENESIS_TEST" ? 1 : 0) + (when === "after" ? 1 : 0));
       if (when === "after") {
         expect(decision.evidence.genesisVerification).toEqual(expect.arrayContaining([

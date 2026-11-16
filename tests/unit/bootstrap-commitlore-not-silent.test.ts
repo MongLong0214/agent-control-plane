@@ -53,16 +53,4 @@ describe("#246 G0a: CommitLore is never a silent PASS on the ACP producer path",
     });
     noGitHubCall(prepared);
   });
-
-  it.each(["preferred", "off"] as const)("G0a-2 (#1268): a new project whose manifest says %s is refused before anything is written", async (mode) => {
-    const manifest = cleanTreeManifest(`g0a-${mode}`, { commitlore: { mode } });
-    const prepared = await prepareBootstrapRun(`g0a-${mode}`, { manifest, ops: pushOperations() });
-    const refused = await prepared.runner.produceAndActivate({ ...prepared.input, ownerApproval: ownerApprovalFor(prepared) });
-    expect(refused, JSON.stringify(refused)).toMatchObject({
-      allowed: false,
-      reasonCode: ReasonCode.VERIFICATION_GAP,
-      evidence: { stage: "precondition", refusal: "COMMITLORE_MODE_NOT_REQUIRED", commitloreMode: mode },
-    });
-    noGitHubCall(prepared);
-  });
 });

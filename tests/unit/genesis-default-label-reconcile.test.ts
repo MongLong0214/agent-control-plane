@@ -4,7 +4,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { currentBootstrapPlan, executablePlanOf, planForSubmission } from "../../src/bootstrap/bootstrap-plan.ts";
 import type { GenesisBundle } from "../../src/bootstrap/genesis-bundle.ts";
 import { createGitHubApiWritePort, genesisLabelConflictOf } from "../../src/bootstrap/github-write-port.ts";
-import { produceRepoFactoryResult } from "../../src/bootstrap/repo-factory-producer.ts";
+import { produceRepoFactoryResult } from "../helpers/repo-factory-produce.ts";
 import { manifestDigest, projectManifestSchema } from "../../src/contracts/manifest.ts";
 import { acpError } from "../../src/core/errors.ts";
 import { digestOf } from "../../src/core/digest.ts";
