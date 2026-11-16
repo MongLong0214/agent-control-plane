@@ -1,7 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, describe, expect, it, vi } from "vitest";
-import type * as BudgetModule from "../../src/review/review-prompt-budget.ts";
 
 import { allow } from "../../src/core/errors.ts";
 import { digestOf, sha256 } from "../../src/core/digest.ts";
@@ -11,23 +10,14 @@ import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { HERMES_PROVENANCE_META_KEY } from "../../src/mcp/hermes-provenance.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, SELF_CLAIM_PROTOCOL, defaultProcessAncestryInspector } from "../../src/registry/canonical-self-claim.ts";
-import { frontierReviewPolicy } from "../../src/review/frontier-simplify-policy.ts";
 import {
-  REVIEW_PROMPT_BUDGET_PROBLEM, REVIEW_PROMPT_OTHER_ALLOWANCE_CHARS, reviewEvidenceLimitChars,
+  REVIEW_PROMPT_BUDGET_CHARS, REVIEW_PROMPT_BUDGET_PROBLEM, chunkBudgetChars, isPromptBudgetRefusal, renderedSectionChars, type ReviewPromptProbe,
 } from "../../src/review/review-prompt-budget.ts";
-import { privateEvidenceAnswer } from "../../src/review/standard-review-evidence.ts";
+import { privateEvidenceAnswer, standardReviewEvidenceSection, type StandardReviewEvidenceBundle } from "../../src/review/standard-review-evidence.ts";
 import * as pipeline from "../../src/run/candidate-pipeline.ts";
-import { REVIEWER_TRANSPORT_SEPARATOR } from "../../src/runtime/cli-adapters.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { applyPassingChange, bindCeo, bindWorker, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 import { TestProductionAdapter } from "../helpers/production-adapter.ts";
-
-// A bundle staged before the stage and attach refused it is the live case; `bypass` stands in for that time.
-const bypass = vi.hoisted(() => ({ on: false }));
-vi.mock("../../src/review/review-prompt-budget.ts", async (importOriginal) => {
-  const actual = await importOriginal<typeof BudgetModule>();
-  return { ...actual, reviewEvidenceLimitChars: () => (bypass.on ? Number.MAX_SAFE_INTEGER : actual.reviewEvidenceLimitChars()) };
-});
 
 afterAll(cleanupTempDirs);
 
@@ -38,10 +28,10 @@ const WORK_BRANCH = "feature/I1421-budget";
 const CONVERSATION = "66666666-6666-4666-8666-666666666666";
 const START_TOKEN = "darwin-tv:1700000000.000000";
 
-/** A bundle of `count` files of `bytes` bytes each; every file is a whole-line excerpt of a larger synthetic source. */
-const bundleOf = (runId: string, contractDigest: string, count: number, bytes: number): string => {
+/** A bundle of files of the given sizes in bytes; every file is a whole-line excerpt of a larger synthetic source. */
+const bundleFromSizes = (runId: string, contractDigest: string, sizes: readonly number[]): string => {
   const line = "synthetic excerpt line with ordinary words only\n";
-  const files = Array.from({ length: count }, (_, i) => {
+  const files = sizes.map((bytes, i) => {
     const body = (`## result ${i}\n` + line.repeat(Math.ceil(bytes / line.length))).slice(0, bytes - 1) + "\n";
     const buffer = Buffer.from(body, "utf8");
     const lines = body.split("\n").length - 1;
@@ -51,8 +41,24 @@ const bundleOf = (runId: string, contractDigest: string, count: number, bytes: n
   });
   return JSON.stringify({ runId, contractDigest, missing: ["the rest of the sources"], files });
 };
+/** What a bundle adds to a reviewer prompt, as the stage measures it. */
+const renderedOf = (json: string): number =>
+  renderedSectionChars(standardReviewEvidenceSection({ bundle: JSON.parse(json) as StandardReviewEvidenceBundle, digest: sha256(json) }));
+/** A valid bundle whose rendered section is exactly `target` characters: the last file takes the slack. */
+const bundleRendering = (runId: string, contractDigest: string, target: number): string => {
+  const n = Math.max(1, Math.round((target - 9_700) / 15_500) + 1);
+  const sizes: number[] = Array.from({ length: n }, (_, i) => (i === n - 1 ? 8_000 : 15_000));
+  for (let round = 0; round < 8; round += 1) {
+    const json = bundleFromSizes(runId, contractDigest, sizes);
+    const diff = target - renderedOf(json);
+    if (diff === 0) return json;
+    sizes[n - 1] = sizes[n - 1]! + diff;
+    if (sizes[n - 1]! < 500 || sizes[n - 1]! > 16_384) throw new Error(`cannot render ${target} characters in ${n} files`);
+  }
+  throw new Error(`rendering did not settle on ${target}`);
+};
 
-async function fixture(kind: "private" | "plain") {
+async function fixture(options: { acceptanceChars?: number } = {}) {
   const h = makeHarness();
   const { projectId, repositoryId, identity } = await registerFixtureProject(h);
   h.cp.providers.register(new TestProductionAdapter(h.clock, "claude"));
@@ -65,7 +71,8 @@ async function fixture(kind: "private" | "plain") {
   if (!bound.allowed) throw new Error(bound.message);
   const ceo = bindCeo(h);
   const contract = { goal: "make app() return 2", why: "downstream callers expect 2", scope: ["src/app.js"], nonGoals: [],
-    acceptance: ["verify.js exits 0"], priority: "NORMAL" as const, humanGate: [], references: [] };
+    acceptance: ["verify.js exits 0", ...(options.acceptanceChars === undefined ? [] : ["ordinary words ".repeat(Math.ceil(options.acceptanceChars / 15))])],
+    priority: "NORMAL" as const, humanGate: [], references: [] };
   const created = h.cp.runs.create({ projectId, executionMode: ExecutionMode.STANDARD, contract,
     repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }] });
   if (!created.allowed) throw new Error(created.message);
@@ -104,7 +111,7 @@ async function fixture(kind: "private" | "plain") {
     evidenceBody: body, expectedSha256: sha256(body) });
   const attach = (key: string, body: string) => hermes("review_evidence_attach", { idempotencyKey: key, runId: run.runId, contractDigest: run.contractDigest,
     stagedBy: run.ownerRoleKey!, expectedSha256: sha256(body) });
-  const bundle = (count: number, bytes: number) => bundleOf(run.runId, run.contractDigest, count, bytes);
+  const bundleOfRendering = (target: number) => bundleRendering(run.runId, run.contractDigest, target);
   const submit = (key: string) => cto("result_submit", { idempotencyKey: key, runId: run.runId, resultSummary: "app returns 2", recommendation: "merge" });
   const notices = async (): Promise<Args[]> => {
     const body = await cto("role_dispatch_pending", {});
@@ -112,119 +119,200 @@ async function fixture(kind: "private" | "plain") {
       .filter((message) => message.kind === "REVISION_REQUEST").map((message) => message.payload);
   };
   const unavailableRows = () => h.cp.audit.forRun(run.runId).filter((row) => row.kind === "BLIND_REVIEW_UNAVAILABLE");
-  const review = () => h.scripted.script({ match: /Candidate review/, text: JSON.stringify({
+  const reviewerCalls = () => h.scripted.invocations.filter((call) => call.prompt.includes("Candidate review")).length;
+  const unparsable = (text = `not a verdict: ${MARKER}`) => h.scripted.script({ match: /Candidate review/, text });
+  const pass = () => h.scripted.script({ match: /Candidate review/, text: JSON.stringify({
     verdict: "PASS", coveredFiles: [`${identity}:src/app.js`], omittedItems: [], findings: [] }) });
-  void kind;
-  return { h, run, identity, stage, attach, bundle, submit, notices, unavailableRows, review,
+  const probe = () => h.cp.review.privateEvidencePromptProbe(run.runId);
+  /** Freezes the run's candidate by one submission whose review goes unjudged, so `probe()` is run on a candidate. */
+  const freeze = async () => { unparsable(); expect(await submit("freeze")).toMatchObject({ ok: true, value: { stage: "REVIEW_UNAVAILABLE" } }); };
+  return { h, run, identity, stage, attach, bundleOfRendering, submit, notices, unavailableRows, reviewerCalls, unparsable, pass, probe, freeze,
     close: async () => { for (const c of closers.reverse()) await c.close(); h.cp.close(); startToken.mockRestore(); } };
 }
 
-describe("#1421 (1) stage and attach refuse evidence whose rendered text leaves no chunk room", () => {
-  it("the stage refuses it with its own reason code, the measured size and the limit, and stores nothing", async () => {
-    const f = await fixture("private");
+/** The limit the first fixed allowance gave every run: 120,000 less the envelope, 8,000, 24,000 and the method. */
+const OLD_CONSTANT_LIMIT_CHARS = 74_680;
+/** A section that renders exactly `n` characters. */
+const sectionOf = (n: number): string[] => ["x".repeat(n - 1)];
+/** The fewest rendered characters the probe refuses. */
+const thresholdOf = (probe: ReviewPromptProbe): number => {
+  let low = 1;
+  let high = 400_000;
+  expect(probe.check(sectionOf(low)).refused).toBe(false);
+  expect(probe.check(sectionOf(high)).refused).toBe(true);
+  while (high - low > 1) {
+    const mid = Math.floor((low + high) / 2);
+    if (probe.check(sectionOf(mid)).refused) high = mid;
+    else low = mid;
+  }
+  return high;
+};
+
+describe("#1421 (1) stage and attach hold a bundle against the review's own sizing of the run's prompt", () => {
+  it("a large contract leaves less room than any constant: refused with the run's own overhead, and exactly at the edge", async () => {
+    const f = await fixture({ acceptanceChars: 40_000 });
     try {
-      const limit = reviewEvidenceLimitChars();
-      const body = f.bundle(7, 15_000);
-      const refused = await f.stage("stage-big", body);
-      expect(refused).toMatchObject({ ok: false, reasonCode: "REVIEW_EVIDENCE_OVER_BUDGET", evidence: { problem: REVIEW_PROMPT_BUDGET_PROBLEM, limit } });
-      const rendered = (refused["evidence"] as { rendered: number }).rendered;
-      expect(rendered).toBeGreaterThan(limit);
-      expect(String(refused["message"])).toContain(String(rendered));
-      expect(String(refused["message"])).toContain(String(limit));
+      const probe = await f.probe();
+      expect(probe.basis).toBe("CONTRACT");
+      const edge = thresholdOf(probe);
+      expect(edge).toBeLessThan(OLD_CONSTANT_LIMIT_CHARS);
+      const refused = await f.stage("stage-over", f.bundleOfRendering(edge));
+      expect(refused).toMatchObject({ ok: false, reasonCode: "REVIEW_EVIDENCE_OVER_BUDGET",
+        evidence: { problem: REVIEW_PROMPT_BUDGET_PROBLEM, rendered: edge, overhead: probe.check(sectionOf(edge)).overhead, budget: REVIEW_PROMPT_BUDGET_CHARS, basis: "CONTRACT" } });
+      expect(String(refused["message"])).toContain(String(edge));
       expect(JSON.stringify(refused)).not.toContain(MARKER);
       expect(f.h.cp.artifacts.list(f.run.runId, "HANDOFF")).toEqual([]);
-      // A bundle with room is staged and attached as before.
-      const small = f.bundle(2, 15_000);
-      expect(await f.stage("stage-small", small)).toMatchObject({ ok: true });
-      expect(await f.attach("attach-small", small)).toMatchObject({ ok: true });
+      // One character less is staged and attached.
+      const under = f.bundleOfRendering(edge - 1);
+      expect(await f.stage("stage-under", under)).toMatchObject({ ok: true });
+      expect(await f.attach("attach-under", under)).toMatchObject({ ok: true });
     } finally { await f.close(); }
   });
 
-  it("the attach refuses a bundle staged before the stage refused it, with the same code and counts", async () => {
-    const f = await fixture("private");
+  it("runs the review's own sizing on the run's current candidate once there is one: its receipts and diff leave less room again", async () => {
+    const f = await fixture({ acceptanceChars: 30_000 });
     try {
-      const body = f.bundle(7, 15_000);
-      bypass.on = true;
-      expect(await f.stage("stage-old", body)).toMatchObject({ ok: true });
-      bypass.on = false;
-      const refused = await f.attach("attach-big", body);
-      expect(refused).toMatchObject({ ok: false, reasonCode: "REVIEW_EVIDENCE_OVER_BUDGET", evidence: { problem: REVIEW_PROMPT_BUDGET_PROBLEM, limit: reviewEvidenceLimitChars() } });
-      expect((refused["evidence"] as { rendered: number }).rendered).toBeGreaterThan(reviewEvidenceLimitChars());
-      expect(f.h.cp.audit.forRun(f.run.runId).filter((row) => row.kind === "STANDARD_REVIEW_EVIDENCE_ATTACHED")).toEqual([]);
-    } finally { bypass.on = false; await f.close(); }
+      const floorEdge = thresholdOf(await f.probe());
+      await f.freeze();
+      const probe = await f.probe();
+      expect(probe.basis).toBe("CANDIDATE");
+      const edge = thresholdOf(probe);
+      // What the candidate brings (its manifest, verification report, task and receipt listings, its diff) is part of what the review sends.
+      expect(edge).toBeLessThan(floorEdge);
+      expect(edge).toBeLessThan(OLD_CONSTANT_LIMIT_CHARS);
+      const refused = await f.stage("stage-over", f.bundleOfRendering(edge));
+      expect(refused).toMatchObject({ ok: false, reasonCode: "REVIEW_EVIDENCE_OVER_BUDGET", evidence: { rendered: edge, basis: "CANDIDATE" } });
+      expect(await f.stage("stage-under", f.bundleOfRendering(edge - 1))).toMatchObject({ ok: true });
+    } finally { await f.close(); }
   });
 
-  it("the allowance covers what a real review of a plain run sends besides the method and the diff", async () => {
-    const f = await fixture("plain");
+  it("the attach refuses a bundle staged under a more generous sizing, with the same code and counts, and binds nothing", async () => {
+    const f = await fixture({ acceptanceChars: 30_000 });
     try {
-      f.review();
-      expect(await f.submit("plain")).toMatchObject({ ok: true, value: { stage: "COMPLETED_REVIEW" } });
-      const call = f.h.scripted.invocations.find((invocation) => invocation.prompt.startsWith("# Candidate review"))!;
-      const sent = call.prompt.length + (call.systemPrompt?.length ?? 0) + REVIEWER_TRANSPORT_SEPARATOR.length;
-      // The prompt holds no private evidence and a one-line diff; the rest is the method plus what the allowance stands for.
-      expect(sent - frontierReviewPolicy().length).toBeLessThan(REVIEW_PROMPT_OTHER_ALLOWANCE_CHARS);
-      expect(sent - frontierReviewPolicy().length).toBeGreaterThan(REVIEW_PROMPT_OTHER_ALLOWANCE_CHARS / 4);
+      await f.freeze();
+      const edge = thresholdOf(await f.probe());
+      const body = f.bundleOfRendering(edge);
+      const spy = vi.spyOn(f.h.cp.review, "privateEvidencePromptProbe").mockResolvedValue({ basis: "CANDIDATE", check: () => ({ refused: false, overhead: 0, reduceBy: 1 }) });
+      expect(await f.stage("stage-old", body)).toMatchObject({ ok: true });
+      spy.mockRestore();
+      const refused = await f.attach("attach-big", body);
+      expect(refused).toMatchObject({ ok: false, reasonCode: "REVIEW_EVIDENCE_OVER_BUDGET", evidence: { rendered: edge, basis: "CANDIDATE" } });
+      expect(f.h.cp.audit.forRun(f.run.runId).filter((row) => row.kind === "STANDARD_REVIEW_EVIDENCE_ATTACHED")).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it("admits what the review takes: 90,000 characters beside a plain run's prompt are staged, attached and reviewed", async () => {
+    const f = await fixture();
+    try {
+      const edge = thresholdOf(await f.probe());
+      expect(edge).toBeGreaterThan(90_000);
+      expect(90_000).toBeGreaterThan(OLD_CONSTANT_LIMIT_CHARS);
+      const body = f.bundleOfRendering(90_000);
+      expect(await f.stage("stage-big", body)).toMatchObject({ ok: true });
+      expect(await f.attach("attach-big", body)).toMatchObject({ ok: true });
+      f.pass();
+      // The review ran: one reviewer call, one prompt that fits, and a verdict (REVISE here: the scripted PASS claims one file, and the
+      // official output streams that took the diff's place are coverage the reviewer must also claim), not an unavailable review.
+      expect(await f.submit("review")).toMatchObject({ ok: true, value: { stage: "REVISION_REQUIRED", reasonCode: "REVIEW_REVISE" } });
+      expect(f.reviewerCalls()).toBe(1);
+      const call = f.h.scripted.invocations.find((invocation) => invocation.prompt.includes("Candidate review"))!;
+      expect(call.prompt.length).toBeGreaterThan(90_000);
+      expect(call.prompt.length + (call.systemPrompt?.length ?? 0)).toBeLessThan(REVIEW_PROMPT_BUDGET_CHARS);
     } finally { await f.close(); }
   });
 });
 
 describe("#1421 (2)(3) an over-budget review is visible, counts, and is no unjudged attempt", () => {
   it("records overhead, budget and the marker; the owner is told it is deterministic; it never reaches the unjudged limit", async () => {
-    const f = await fixture("private");
+    const f = await fixture();
     try {
-      const body = f.bundle(7, 15_000);
-      bypass.on = true;
+      await f.freeze();
+      const probe = await f.probe();
+      // A margin past the edge: the run's own records (attempt and audit counts in the listings) move by a few characters between submissions.
+      const rendered = thresholdOf(probe) + 3_000;
+      const body = f.bundleOfRendering(rendered);
+      // A bundle attached before the stage and the attach refused it: the live case.
+      const spy = vi.spyOn(f.h.cp.review, "privateEvidencePromptProbe").mockResolvedValue({ basis: "CANDIDATE", check: () => ({ refused: false, overhead: 0, reduceBy: 1 }) });
       expect(await f.stage("stage-old", body)).toMatchObject({ ok: true });
       expect(await f.attach("attach-old", body)).toMatchObject({ ok: true });
-      bypass.on = false;
+      spy.mockRestore();
+      const calls = f.reviewerCalls();
 
       const first = await f.submit("first");
       expect(first).toMatchObject({ ok: true, value: { stage: "REVIEW_UNAVAILABLE", reasonCode: "EVIDENCE_MISSING" } });
       // The answer a private-evidence run gets keeps counts and fixed enums only, and now says why.
       const budget = (first["value"] as { promptBudget?: { overhead: number; budget: number } }).promptBudget;
-      expect(budget).toMatchObject({ problem: REVIEW_PROMPT_BUDGET_PROBLEM, budget: 120_000, deterministic: true });
-      expect(budget!.overhead).toBeGreaterThan(budget!.budget - 4_096);
+      expect(budget).toMatchObject({ problem: REVIEW_PROMPT_BUDGET_PROBLEM, budget: REVIEW_PROMPT_BUDGET_CHARS, deterministic: true });
+      expect(chunkBudgetChars(budget!.overhead)).toBeLessThanOrEqual(0);
+      // The overhead the review counted is the one the probe computed for this bundle, to the few characters a fresh verification's
+      // own numbers (durations, timestamps) move between two runs: the stage's sizing is the review's.
+      const section = standardReviewEvidenceSection({ bundle: JSON.parse(body) as StandardReviewEvidenceBundle, digest: sha256(body) });
+      expect(Math.abs(budget!.overhead - probe.check(section).overhead)).toBeLessThan(100);
       expect(JSON.stringify(first)).not.toContain(MARKER);
 
-      const [row] = f.unavailableRows();
-      expect(row!.evidence).toMatchObject({ problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: budget!.overhead, budget: 120_000 });
+      const row = f.unavailableRows().at(-1)!;
+      expect(row.evidence).toMatchObject({ problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: budget!.overhead, budget: REVIEW_PROMPT_BUDGET_CHARS });
 
-      const [notice] = await f.notices();
+      const [notice] = (await f.notices()).slice(-1);
       expect(notice).toMatchObject({ notice: "REVIEW_PROMPT_BUDGET_EXCEEDED", nextStep: "DETERMINISTIC", unjudgedAttempts: 0, unjudgedAttemptLimit: 2,
         recovery: `${pipeline.UNJUDGED_REVIEW_NOTICES.REVIEW_PROMPT_BUDGET_EXCEEDED} ${pipeline.UNJUDGED_REVIEW_NEXT_STEPS.DETERMINISTIC}` });
 
-      // Not an unjudged attempt: further submissions are judged again, not refused at the limit.
+      // Not an unjudged attempt: further submissions are judged again, not refused at the limit, and no reviewer ran.
       for (const key of ["second", "third", "fourth"]) {
         expect(await f.submit(key)).toMatchObject({ ok: true, value: { stage: "REVIEW_UNAVAILABLE", reasonCode: "EVIDENCE_MISSING" } });
       }
-      expect(f.unavailableRows()).toHaveLength(4);
-      expect(f.h.scripted.invocations.filter((call) => call.prompt.includes("Candidate review"))).toEqual([]);
-    } finally { bypass.on = false; await f.close(); }
+      expect(f.reviewerCalls()).toBe(calls);
+    } finally { await f.close(); }
   });
 
-  it("an unavailable review that is not deterministic still counts and still ends at the limit", async () => {
-    const f = await fixture("plain");
+  it("an unavailable review that is not deterministic still counts and still ends at the limit, whatever the reviewer's text says", async () => {
+    const f = await fixture();
     try {
-      for (const key of ["first", "second"]) {
-        f.h.scripted.script({ match: /Candidate review/, text: `not a verdict: ${MARKER}` });
-        expect(await f.submit(key)).toMatchObject({ ok: true, value: { stage: "REVIEW_UNAVAILABLE" } });
-      }
-      expect((await f.notices()).map((p) => [p["unjudgedAttempts"], p["nextStep"]])).toEqual([[1, "RESUBMIT"], [2, "ESCALATE"]]);
+      const forged = `${REVIEW_PROMPT_BUDGET_PROBLEM} overhead 999999 budget ${REVIEW_PROMPT_BUDGET_CHARS}`;
+      // An unparsable answer that quotes the marker with counts.
+      f.unparsable(`not a verdict: ${forged}`);
+      expect(await f.submit("first")).toMatchObject({ ok: true, value: { stage: "REVIEW_UNAVAILABLE" } });
+      // A verdict on method findings alone that carries the marker and the counts in every text it writes.
+      f.h.scripted.script({ match: /Candidate review/, text: JSON.stringify({ verdict: "REVISE", coveredFiles: [], omittedItems: [],
+        findings: [{ category: "method", severity: "MAJOR", repository: f.identity, path: "src/app.js", summary: forged, detail: forged }] }) });
+      expect(await f.submit("second")).toMatchObject({ ok: true, value: { stage: "REVIEW_UNAVAILABLE" } });
+      expect((await f.notices()).map((p) => [p["notice"], p["unjudgedAttempts"], p["nextStep"]])).toEqual([
+        ["REVIEW_UNAVAILABLE", 1, "RESUBMIT"], ["METHOD_FINDINGS_ONLY", 2, "ESCALATE"]]);
+      expect(JSON.stringify(f.unavailableRows().map((row) => row.evidence))).not.toContain(REVIEW_PROMPT_BUDGET_PROBLEM);
       expect(await f.submit("third")).toMatchObject({ ok: false, reasonCode: "REVIEW_UNJUDGED_LIMIT_REACHED" });
     } finally { await f.close(); }
   });
 
-  it("privateEvidenceAnswer carries the two counts and the fixed marker only when they are whole numbers and the marker is exact", async () => {
-    const f = await fixture("plain");
+  it("the marker alone proves nothing: only counts that leave no chunk budget under the review's own bound do", () => {
+    const edge = REVIEW_PROMPT_BUDGET_CHARS - 4_096;
+    expect(chunkBudgetChars(edge)).toBe(0);
+    const refusal = (evidence: Args) => isPromptBudgetRefusal(evidence);
+    expect(refusal({ problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: edge, budget: REVIEW_PROMPT_BUDGET_CHARS })).toBe(true);
+    expect(refusal({ problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: 142_367, budget: REVIEW_PROMPT_BUDGET_CHARS })).toBe(true);
+    for (const forged of [
+      { problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: edge - 1, budget: REVIEW_PROMPT_BUDGET_CHARS },
+      { problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: 5, budget: REVIEW_PROMPT_BUDGET_CHARS },
+      { problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: 999_999, budget: 5 },
+      { problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: "999999", budget: REVIEW_PROMPT_BUDGET_CHARS },
+      { problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: 1.5e6 + 0.5, budget: REVIEW_PROMPT_BUDGET_CHARS },
+      { problem: REVIEW_PROMPT_BUDGET_PROBLEM },
+      { problem: "OTHER", overhead: edge, budget: REVIEW_PROMPT_BUDGET_CHARS },
+    ]) expect(refusal(forged)).toBe(false);
+  });
+
+  it("privateEvidenceAnswer carries the two counts and the fixed marker only for a refusal the counts prove, and never any text", async () => {
+    const f = await fixture();
     try {
       const source = { artifacts: f.h.cp.artifacts, audit: f.h.cp.audit };
       const answer = (evidence: Args) => privateEvidenceAnswer(source, f.run.runId,
         allow(ReasonCode.OK, { stage: "REVIEW_UNAVAILABLE", reasonCode: "EVIDENCE_MISSING", detail: { message: MARKER, evidence } }) as never);
-      const kept = answer({ problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: 142_367, budget: 120_000, note: MARKER });
-      expect(kept).toMatchObject({ allowed: true, value: { promptBudget: { problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: 142_367, budget: 120_000, deterministic: true } } });
+      const kept = answer({ problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: 142_367, budget: REVIEW_PROMPT_BUDGET_CHARS, note: MARKER });
+      expect(kept).toMatchObject({ allowed: true, value: { promptBudget: { problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: 142_367, budget: REVIEW_PROMPT_BUDGET_CHARS, deterministic: true } } });
       expect(JSON.stringify(kept)).not.toContain(MARKER);
-      for (const evidence of [{ problem: "OTHER", overhead: 1, budget: 2 }, { problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: MARKER, budget: 2 },
-        { problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: 1.5, budget: 2 }, { problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: -1, budget: 2 }]) {
+      for (const evidence of [{ problem: "OTHER", overhead: 142_367, budget: REVIEW_PROMPT_BUDGET_CHARS },
+        { problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: MARKER, budget: REVIEW_PROMPT_BUDGET_CHARS },
+        { problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: 5, budget: REVIEW_PROMPT_BUDGET_CHARS },
+        { problem: REVIEW_PROMPT_BUDGET_PROBLEM, overhead: -1, budget: REVIEW_PROMPT_BUDGET_CHARS }]) {
         expect(JSON.stringify(answer(evidence))).not.toContain("promptBudget");
       }
     } finally { await f.close(); }

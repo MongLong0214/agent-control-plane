@@ -10,7 +10,7 @@ import {
 } from "../bootstrap/bootstrap-plan.ts";
 import { collectBootstrapCeoDecisions, frozenBootstrapCeoDecisions } from "../bootstrap/bootstrap-ceo-decisions.ts";
 import { collectBootstrapReviewEvidence } from "../bootstrap/bootstrap-review-evidence.ts";
-import { REVIEW_PROMPT_BUDGET_PROBLEM } from "../review/review-prompt-budget.ts";
+import { isPromptBudgetRefusal } from "../review/review-prompt-budget.ts";
 import { collectStandardReviewEvidence, privateEvidenceAnswer, runHadStandardReviewEvidence } from "../review/standard-review-evidence.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
@@ -1938,7 +1938,7 @@ export class CandidatePipeline {
     const roleKey = this.runs.ownerRoleKeyFor(run);
     const binding = roleKey ? this.bindings.active(roleKey) : null;
     if (!binding) return allow(ReasonCode.OK, undefined);
-    const deterministic = reviewed.evidence["problem"] === REVIEW_PROMPT_BUDGET_PROBLEM;
+    const deterministic = isPromptBudgetRefusal(reviewed.evidence);
     const notice = deterministic ? "REVIEW_PROMPT_BUDGET_EXCEEDED" : reviewed.evidence["problem"] === "METHOD_FINDINGS_ONLY" ? "METHOD_FINDINGS_ONLY" : "REVIEW_UNAVAILABLE";
     const methodFindings = notice === "METHOD_FINDINGS_ONLY" ? this.storedReview(runId, snapshotDigest)?.content.methodFindings : undefined;
     const unjudgedAttempts = this.consecutiveUnjudgedAttempts(runId, snapshotDigest);
@@ -1980,9 +1980,10 @@ export class CandidatePipeline {
       .filter((row) => row.kind === kind && row.evidence["attemptHeld"] !== false)
       .map((row) => row.evidence["attemptId"]));
     const unavailable = rows.filter((row) => row.kind === "BLIND_REVIEW_UNAVAILABLE" && row.evidence["attemptHeld"] !== false);
-    // #1421 — a refusal that is deterministic before any reviewer runs is no unjudged attempt: it neither counts nor ends the run of them.
-    const budget = new Set(unavailable.filter((row) => row.evidence["problem"] === REVIEW_PROMPT_BUDGET_PROBLEM).map((row) => row.evidence["attemptId"]));
-    const unjudged = new Set(unavailable.filter((row) => row.evidence["problem"] !== REVIEW_PROMPT_BUDGET_PROBLEM).map((row) => row.evidence["attemptId"]));
+    // #1421 — a refusal that is deterministic before any reviewer runs is no unjudged attempt: it neither counts nor ends the
+    // run of them. Only the review's own counts show it (`isPromptBudgetRefusal`); a marker alone, or one a text carried, shows nothing.
+    const budget = new Set(unavailable.filter((row) => isPromptBudgetRefusal(row.evidence)).map((row) => row.evidence["attemptId"]));
+    const unjudged = new Set(unavailable.filter((row) => !isPromptBudgetRefusal(row.evidence)).map((row) => row.evidence["attemptId"]));
     const refused = attemptsOf(UNJUDGED_REVIEW_LIMIT_REFUSED);
     let count = 0;
     for (const freeze of rows.filter((row) => row.kind === "CANDIDATE_FROZEN").sort((a, b) => b.eventId - a.eventId)) {

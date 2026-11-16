@@ -1,7 +1,7 @@
 import { FRONTIER_SIMPLIFY_SOURCE, frontierReviewPolicy, type FrontierSimplifySource } from "./frontier-simplify-policy.ts";
 import { DogfoodFindingStore } from "../quality/upstream-dogfood.ts";
 import { frozenBootstrapReviewEvidence, originalReviewRecords, type FrozenReviewEvidence, type ReviewEvidenceFile } from "../bootstrap/bootstrap-review-evidence.ts";
-import { REVIEW_CHUNK_ENVELOPE_CHARS, REVIEW_PROMPT_BUDGET_CHARS, REVIEW_PROMPT_BUDGET_PROBLEM } from "./review-prompt-budget.ts";
+import { REVIEW_CHUNK_ENVELOPE_CHARS, REVIEW_PROMPT_BUDGET_CHARS, REVIEW_PROMPT_BUDGET_PROBLEM, chunkBudgetChars, renderedSectionChars, type ReviewPromptProbe } from "./review-prompt-budget.ts";
 import { frozenStandardReviewEvidence, standardReviewEvidenceDigests, standardReviewEvidenceSection, type FrozenStandardReviewEvidence } from "./standard-review-evidence.ts";
 import type { ReviewRecordVerification } from "../bootstrap/bootstrap-review-evidence-github.ts";
 import { bootstrapServingRuntime, bootstrapCodeGuarantees, type BootstrapRuntimeObservation } from "../bootstrap/bootstrap-runtime-observation.ts";
@@ -87,6 +87,7 @@ import {
   type SnapshotImport,
   type SnapshotRefusedImport,
   type SnapshotReviewEvidence,
+  CANDIDATE_SNAPSHOT_SCHEMA_ID,
   candidateSnapshotDigest,
   snapshotCoverageTargets,
 } from "../snapshot/candidate-snapshot.ts";
@@ -97,7 +98,7 @@ import { currentVerdictPasses, currentVerificationResults } from "../verify/veri
 import type { TaskContract } from "../run/run-engine.ts";
 import { bootstrapPlanTaskRecorded } from "../run/task-graph.ts";
 import {
-  candidateEvidenceSection, type OutputPart, type OutputStreamDelivery, outputStreamParts, outputStreamsInParts, readExecutionEvidence,
+  candidateEvidenceSection, type OutputPart, type OutputStreamDelivery, outputStreamParts, outputStreamsInParts, readExecutionEvidence, type ExecutionEvidence,
   readTrackedTree, type ReceiptEvidence, type TrackedTreeEvidence,
 } from "./candidate-review-evidence.ts";
 import { redactCredentialValues } from "../core/credential-shapes.ts";
@@ -841,6 +842,63 @@ export class BlindReviewGate {
     return this.reviewCandidate(request);
   }
 
+  /**
+   * #1421 — asks, for the stage and the attach, what the review would do with a private evidence section in this
+   * run's prompt (`ReviewPromptProbe.check`). With the run's current candidate it runs the review's own sizing
+   * (`planCandidatePrompt`, then `chunkedReview`'s refusal rule) on that candidate's diffs, receipts, listings and
+   * verification, with the candidate as it would be frozen with a bundle attached, so the answer is the review's
+   * answer for it now. A run with no candidate that can be read yet gets the fixed prompt around its pinned contract:
+   * a lower bound, refused only where even that exceeds the bound, so it never refuses what a review would take.
+   * It reads state and never calls a reviewer.
+   */
+  async privateEvidencePromptProbe(runId: string): Promise<ReviewPromptProbe> {
+    const run = this.db.get<{ project_id: string | null; execution_mode: ExecutionMode; contract_digest: string; current_candidate_digest: string | null }>(
+      `SELECT project_id, execution_mode, contract_digest, current_candidate_digest FROM runs WHERE run_id = ?`,
+      [runId],
+    );
+    const contract = run === undefined ? undefined : this.artifacts.list<TaskContract>(runId, ArtifactKind.TASK_CONTRACT)
+      .find((artifact) => !artifact.superseded && artifact.digest === run.contract_digest && digestOf(artifact.content) === run.contract_digest);
+    const floor = (overhead: number): ReviewPromptProbe => ({ basis: "CONTRACT", check: (section) => {
+      const total = overhead + renderedSectionChars(section);
+      return { refused: total > CHUNK_THRESHOLD_CHARS, overhead: total, reduceBy: Math.max(1, total - CHUNK_THRESHOLD_CHARS) };
+    } });
+    if (run === undefined || contract === undefined) return floor(0);
+    // What the next freeze carries once a bundle is attached: a binding of four digests, the same size whichever bundle.
+    const zero = `sha256:${"0".repeat(64)}`;
+    const bound = (snapshot: CandidateSnapshot): CandidateSnapshot => ({
+      ...snapshot, reviewEvidence: snapshot.reviewEvidence ?? { digest: zero, bundleSha256: zero, candidateDigest: zero, attachmentDigest: zero } });
+    const base = { runId, projectId: run.project_id, executionMode: run.execution_mode, contract: contract.content, contractDigest: run.contract_digest };
+    const digest = run.current_candidate_digest;
+    try {
+      const snapshot = digest === null ? undefined : this.artifacts.list<CandidateSnapshot>(runId, ArtifactKind.CANDIDATE_SNAPSHOT)
+        .find((artifact) => (artifact.candidateSnapshotDigest ?? artifact.digest) === digest)?.content;
+      const verification = digest === null ? null : this.artifacts.latestForSnapshot<VerificationReport>(runId, ArtifactKind.VERIFICATION, digest);
+      if (snapshot !== undefined && verification !== null && verification.producedBy === EVIDENCE_PRODUCERS.VERIFICATION) {
+        const changed = this.contractChangeForCandidate(runId, snapshot);
+        const collected = changed.allowed ? await this.collectDiffs(snapshot) : null;
+        const policies = collected?.allowed ? await this.collectReviewPolicies(snapshot) : null;
+        if (changed.allowed && collected?.allowed && policies?.allowed) {
+          const execution = await readExecutionEvidence(this.db, {
+            runId, snapshot, snapshotDigest: digest!, contractDigest: run.contract_digest,
+            verification: verification.content, checkoutOf: (identity) => this.repositories.byIdentity(identity)?.checkoutPath ?? null,
+          });
+          const request: BlindReviewRequest = { ...base, snapshot: bound(snapshot), verification: verification.content };
+          const { diffs, trees } = collected.value;
+          return { basis: "CANDIDATE", check: (section) => {
+            const plan = this.planCandidatePrompt(request, changed.value, section, diffs, trees, execution, policies.value);
+            const overhead = this.promptOverhead(request, changed.value, plan.evidenceSection, policies.value);
+            const chunkBudget = chunkBudgetChars(overhead);
+            // `chunkedReview` refuses at no chunk budget, and only a review that is chunked reaches it.
+            return { refused: plan.chunked && chunkBudget <= 0, overhead, reduceBy: Math.max(1, 1 - chunkBudget) };
+          } };
+        }
+      }
+    } catch { /* the lower bound below stands */ }
+    const empty = { schema: CANDIDATE_SNAPSHOT_SCHEMA_ID, runId, contractDigest: run.contract_digest, repositories: [] } as unknown as CandidateSnapshot;
+    const report = { runId, contractDigest: run.contract_digest, candidateSnapshotDigest: zero, status: "PASS", results: [] } as unknown as VerificationReport;
+    return floor(this.promptOverhead({ ...base, snapshot: bound(empty), verification: report }));
+  }
+
   private async reviewCandidate(request: BlindReviewRequest): Promise<Decision<ReviewPacket>> {
     const snapshotDigest = candidateSnapshotDigest(request.snapshot);
 
@@ -881,27 +939,11 @@ export class BlindReviewGate {
         runId: request.runId, snapshot: request.snapshot, snapshotDigest, contractDigest: request.contractDigest,
         verification: request.verification, checkoutOf: (identity) => this.repositories.byIdentity(identity)?.checkoutPath ?? null,
       });
-      // #1166 r3 — the listings get only the room left under the reviewer budget after the other
-      // metadata, the chunk envelope and a share for the change itself, so they never crowd out
-      // the diff or push the metadata past the budget. A cut is marked in the packet.
-      const bareEvidence = [...privateEvidence, ...candidateEvidenceSection(this.db, request.runId, trees, execution, 0)];
-      const bareOverhead = this.promptOverhead(request, change, bareEvidence, reviewPolicies);
-      // The change's real share of a prompt, repository and file fences included.
-      const diffShare = this.buildPrompt(request, diffs, undefined, change, bareEvidence, reviewPolicies).length + REVIEWER_TRANSPORT_OVERHEAD_CHARS - bareOverhead;
-      const evidenceRoom = CHUNK_THRESHOLD_CHARS - REVIEW_CHUNK_ENVELOPE_CHARS - Math.min(diffShare, EVIDENCE_DIFF_RESERVE_CHARS) - bareOverhead;
-      const evidenceSection = [...privateEvidence, ...candidateEvidenceSection(this.db, request.runId, trees, execution, evidenceRoom)];
-      // A whole-capture output stream the evidence section does not show whole goes in the diff's
-      // place: whole in a single review, as labelled parts across chunks otherwise.
-      const outputStreams = outputStreamsInParts(execution, evidenceRoom);
+      // #1166 r3 — the listings get only the room left under the reviewer budget after the other metadata, the chunk
+      // envelope and a share for the change itself (`planCandidatePrompt`). A cut is marked in the packet.
+      const { evidenceSection, outputStreams, prompt, chunked } = this.planCandidatePrompt(request, change, privateEvidence, diffs, trees, execution, reviewPolicies);
       // Each delivered stream is a coverage item the review must account for, as a candidate file is.
       const required = [...expected, ...outputStreams.map((stream) => ({ identity: stream.repository, path: stream.path }))];
-
-      // Measure the complete input, including diff framing and system instructions, and send
-      // this same rendered prompt if it fits. A lockfile is only ever reviewed in a chunk of its own.
-      const prompt = this.buildPrompt(request, [...diffs, ...outputStreams.flatMap((stream) => outputStreamParts(stream, Infinity)).map(outputChunkPart)],
-        undefined, change, evidenceSection, reviewPolicies);
-      const chunked = prompt.length + REVIEWER_TRANSPORT_OVERHEAD_CHARS > CHUNK_THRESHOLD_CHARS ||
-        diffs.some((repo) => (repo.lockfiles?.length ?? 0) > 0);
 
       let outcome: Decision<ReviewOutcome>;
       if (chunked) {
@@ -2011,7 +2053,7 @@ export class BlindReviewGate {
     // measurement. Reserve a bounded envelope so the complete serialized prompt, not only
     // the patch body, remains inside the review budget.
     const overhead = this.promptOverhead(request, change, evidenceSection, reviewPolicies);
-    const chunkBudget = CHUNK_THRESHOLD_CHARS - overhead - REVIEW_CHUNK_ENVELOPE_CHARS;
+    const chunkBudget = chunkBudgetChars(overhead);
     if (chunkBudget <= 0) {
       return deny(ReasonCode.EVIDENCE_MISSING, "review prompt metadata exceeds the reviewer context budget", {
         runId: request.runId,
@@ -3058,6 +3100,38 @@ export class BlindReviewGate {
       });
     }
     return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * How a candidate review sizes its prompt: the listings get only the room left under the reviewer budget after
+   * the other metadata (the private evidence given, the listings at budget 0 and everything else), the chunk
+   * envelope and a share for the change itself, so they never crowd out the diff or push the metadata past the
+   * budget; a whole-capture output stream the evidence section does not show whole goes in the diff's place; and
+   * the complete input, diff framing and system instructions included, is sent as one prompt if it fits and in
+   * chunks otherwise (a lockfile is only ever reviewed in a chunk of its own). The review and
+   * `privateEvidencePromptProbe` both ask this, so a bundle is held against the review's own sizing.
+   */
+  private planCandidatePrompt(
+    request: BlindReviewRequest,
+    change: TrustedContractChange | null,
+    privateEvidence: readonly string[],
+    diffs: readonly ReviewerDiff[],
+    trees: readonly TrackedTreeEvidence[],
+    execution: ExecutionEvidence,
+    reviewPolicies: readonly RepositoryReviewPolicy[],
+  ): { evidenceSection: string[]; outputStreams: OutputStreamDelivery[]; prompt: string; chunked: boolean } {
+    const bareEvidence = [...privateEvidence, ...candidateEvidenceSection(this.db, request.runId, trees, execution, 0)];
+    const bareOverhead = this.promptOverhead(request, change, bareEvidence, reviewPolicies);
+    // The change's real share of a prompt, repository and file fences included.
+    const diffShare = this.buildPrompt(request, diffs, undefined, change, bareEvidence, reviewPolicies).length + REVIEWER_TRANSPORT_OVERHEAD_CHARS - bareOverhead;
+    const evidenceRoom = CHUNK_THRESHOLD_CHARS - REVIEW_CHUNK_ENVELOPE_CHARS - Math.min(diffShare, EVIDENCE_DIFF_RESERVE_CHARS) - bareOverhead;
+    const evidenceSection = [...privateEvidence, ...candidateEvidenceSection(this.db, request.runId, trees, execution, evidenceRoom)];
+    const outputStreams = outputStreamsInParts(execution, evidenceRoom);
+    const prompt = this.buildPrompt(request, [...diffs, ...outputStreams.flatMap((stream) => outputStreamParts(stream, Infinity)).map(outputChunkPart)],
+      undefined, change, evidenceSection, reviewPolicies);
+    const chunked = prompt.length + REVIEWER_TRANSPORT_OVERHEAD_CHARS > CHUNK_THRESHOLD_CHARS ||
+      diffs.some((repo) => (repo.lockfiles?.length ?? 0) > 0);
+    return { evidenceSection, outputStreams, prompt, chunked };
   }
 
   private promptOverhead(
