@@ -1,4 +1,5 @@
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, constants, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { delimiter, dirname, join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
@@ -839,5 +840,83 @@ describe("#1227 the cron lock is no longer passed over", () => {
     } finally {
       adapter.killAll();
     }
+  });
+});
+
+/**
+ * #1268 — a managed turn is refused when CommitLore's notes mirror is unfetched, so a worker clone carries what its
+ * resident's clone has of it: the notes refs, the fetch refspec for them, and the record that the remote's mirror was
+ * looked for (what `commitlore doctor --fix` writes). Made with the clone, and refreshed on a later pass while no turn runs.
+ */
+describe("#1268 a worker clone carries its resident's CommitLore notes mirror", () => {
+  const ORIGIN_KEY = "commitlore.notesabsence.r6f726967696e";
+  const notesRefs = (repo: string): string => gitSync(repo, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/notes/"]);
+  /** What `commitlore doctor --fix` leaves in a clone whose remote has no notes yet, and a note of its own. */
+  const mirrorIn = (clone: string): void => {
+    gitSync(clone, ["config", "--local", "--add", "remote.origin.fetch", "refs/notes/*:refs/notes/*"]);
+    gitSync(clone, ["config", "--local", ORIGIN_KEY, ORIGIN]);
+    gitSync(clone, ["-c", "user.email=r@example.test", "-c", "user.name=r", "notes", "--ref=commitlore", "add", "-m", "Record-Id: r-0123456789ab", "HEAD"]);
+  };
+  const fetchSpecs = (repo: string): string[] => gitSync(repo, ["config", "--local", "--get-all", "remote.origin.fetch"]).split("\n");
+  const REAL = ((): string | null => {
+    const explicit = process.env["ACP_TEST_REAL_COMMITLORE"];
+    if (explicit !== undefined && explicit !== "") return explicit;
+    for (const directory of (process.env["PATH"] ?? "").split(delimiter).filter((entry) => entry.startsWith("/"))) {
+      try {
+        accessSync(join(directory, "commitlore"), constants.X_OK);
+        return join(directory, "commitlore");
+      } catch {
+        // not here
+      }
+    }
+    return null;
+  })();
+
+  it("a worker clone made after the resident's clone has the mirror carries its notes refs, its fetch refspec and its absence record", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-new", [APP]);
+      becomeResident(f, s);
+      mirrorIn(s.clone);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(checkout).not.toBe(s.clone);
+      expect(notesRefs(checkout)).toBe(notesRefs(s.clone));
+      expect(notesRefs(checkout)).toMatch(/^refs\/notes\/commitlore /);
+      expect(fetchSpecs(checkout)).toContain("refs/notes/*:refs/notes/*");
+      expect(gitSync(checkout, ["config", "--local", ORIGIN_KEY])).toBe(ORIGIN);
+      // Nothing of the resident's clone was written.
+      expect(gitSync(s.clone, ["status", "--porcelain", "--", "src"])).toBe("");
+    });
+  });
+
+  it("a worker clone made before the mirror, with no turn running, is refreshed on the next pass", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-later", [APP]);
+      becomeResident(f, s);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(notesRefs(checkout)).toBe("");
+      mirrorIn(s.clone);
+      await daemonPass(f);
+      expect(notesRefs(checkout)).toBe(notesRefs(s.clone));
+      expect(fetchSpecs(checkout)).toContain("refs/notes/*:refs/notes/*");
+      expect(gitSync(checkout, ["config", "--local", ORIGIN_KEY])).toBe(ORIGIN);
+    });
+  });
+
+  it.skipIf(REAL === null)("with the real CLI, a worker clone's notes are no longer unfetched", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-real", [APP]);
+      becomeResident(f, s);
+      mirrorIn(s.clone);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      const asked = (repo: string): string => {
+        const printed = execFileSync(REAL as string, ["context", "src/app.js", "--json"], { cwd: repo, encoding: "utf8", timeout: 60_000, stdio: ["ignore", "pipe", "ignore"] });
+        return (JSON.parse(printed) as { notes: string }).notes;
+      };
+      expect(asked(s.clone)).not.toBe("unfetched");
+      expect(asked(checkout)).toBe(asked(s.clone));
+    });
   });
 });
