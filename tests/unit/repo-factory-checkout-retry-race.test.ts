@@ -7,10 +7,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ManualClock } from "../../src/core/clock.ts";
 import {
-  produceRepoFactoryResult,
   repositoryCheckoutPath,
   type RepoFactoryPlanFixture,
 } from "../../src/bootstrap/repo-factory-producer.ts";
+import { produceRepoFactoryResult } from "../helpers/repo-factory-produce.ts";
 import type * as GitModule from "../../src/git/git.ts";
 import { FakeGitHub } from "../helpers/fake-github-write-port.ts";
 

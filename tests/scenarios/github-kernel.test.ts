@@ -106,6 +106,9 @@ const reflectMergedBase = (github: FakeGitHub): void => {
  * The kernel refuses to publish a gate for digests it cannot resolve, which means these
  * scenarios cannot be set up with placeholder digests.
  */
+/** The record the candidate's commit carries, which a note mirrors (a governed run carries only a commit's own record, #1268). */
+const NOTE_RECORD = { id: "r-note00000001", trailers: "Limit: a record kept only in a note" };
+
 const setup = async (options: { finalization?: boolean; approvedWorkflow?: string } = {}): Promise<Fixture> => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
@@ -135,6 +138,7 @@ const setup = async (options: { finalization?: boolean; approvedWorkflow?: strin
     commitAll(harness.repoPath, "add approved CI workflow");
   }
   const driven = await driveToReviewedCandidate(harness, {
+    commitRecord: NOTE_RECORD,
     workBranch: "feature/F1-thing",
     manifestOverrides: {
       ciWorkflows: options.approvedWorkflow === undefined
@@ -2373,7 +2377,7 @@ describe("merge target proof (#350)", () => {
       const merged = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
       expect(merged.reasonCode).toBe(ReasonCode.OK);
       expect(fixture.github.calls.filter((call) => call.method === "PUT" && call.path.endsWith("/merge")).map((call) => call.body))
-        .toEqual([{ sha: fixture.head, merge_method: "merge" }]);
+        .toEqual([{ sha: fixture.head, merge_method: "merge", commit_title: expect.stringMatching(/^Merge pull request #\d+ from /), commit_message: expect.any(String) }]);
     } finally {
       manifest.mockRestore();
     }
@@ -2422,7 +2426,7 @@ describe("merge target proof (#350)", () => {
 
   /** A record kept only as a CommitLore note on the candidate head, the way a capture stores one. */
   const noteOnCandidate = (fixture: Fixture): string => {
-    gitSync(fixture.harness.repoPath, ["notes", "--ref=commitlore", "add", "-m", "Limit: a record kept only in a note", fixture.head]);
+    gitSync(fixture.harness.repoPath, ["notes", "--ref=commitlore", "add", "-m", `${NOTE_RECORD.trailers}\nRecord-Id: ${NOTE_RECORD.id}`, fixture.head]);
     return gitSync(fixture.harness.repoPath, ["notes", "--ref=commitlore", "list", fixture.head]);
   };
 

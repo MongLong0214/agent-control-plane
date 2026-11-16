@@ -11,10 +11,10 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { PROJECT_MANIFEST_SCHEMA_ID, assertPortableManifest } from "../../src/contracts/manifest.ts";
 import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
 import {
-  produceRepoFactoryResult,
   repositoryCheckoutPath,
   type RepoFactoryPlanFixture,
 } from "../../src/bootstrap/repo-factory-producer.ts";
+import { produceRepoFactoryResult } from "../helpers/repo-factory-produce.ts";
 import { git } from "../../src/git/git.ts";
 import { withholdPending } from "../helpers/bootstrap-runner.ts";
 import { FakeGitHub, type Protection } from "../helpers/fake-github-write-port.ts";
@@ -199,6 +199,8 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
     // The verified head is the one GitHub has, and the proposed checkout really is at it.
     expect(result.bootstrapVerification).toEqual([
       { commandId: "local-clean-tree", repositoryIdentity: IDENTITY, exactHead: remoteHead, status: "PASS" },
+      // #1268 — every bootstrap is observed by CommitLore at its published head.
+      { commandId: "commitlore:doctor", repositoryIdentity: IDENTITY, exactHead: remoteHead, status: "PASS" },
     ]);
     const localHead = (await git(repositoryCheckoutPath(workDir, "primary"), ["rev-parse", "HEAD"])).stdout.trim();
     expect(localHead).toBe(remoteHead);
@@ -536,6 +538,8 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
       const first = await produce(workDir, github);
       if (!first.allowed) throw new Error(`${first.reasonCode}: ${first.message}`);
       rmSync(repositoryCheckoutPath(workDir, "primary"), { recursive: true, force: true });
+      // A retry is a new attempt, with its own observation record; this one reuses the attempt's.
+      rmSync(join(workDir, "commitlore-observation"), { recursive: true, force: true });
       github.writes.length = 0;
 
       const again = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
@@ -878,6 +882,8 @@ describe("PR #1043 review round 2 witnesses", () => {
     ).rejects.toMatchObject({ code: "EISDIR" });
     expect(readLedger(workDir).receipts).toHaveLength(4);
     expect(existsSync(repositoryCheckoutPath(workDir, "primary"))).toBe(false);
+    // A retry is a new attempt, with its own observation record; this one reuses the attempt's.
+    rmSync(join(workDir, "commitlore-observation"), { recursive: true, force: true });
     github.writes.length = 0;
     github.reads.length = 0;
     let kept: unknown = null;

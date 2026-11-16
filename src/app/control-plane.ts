@@ -80,6 +80,7 @@ import { BootstrapActivation } from "../bootstrap/activation.ts";
 import type { GitHubWritePort } from "../bootstrap/github-write-port.ts";
 import { createBootstrapGitHubWritePort } from "../bootstrap/bootstrap-write-guard.ts";
 import { type CommitLorePort, createCommitLoreCliPort } from "../bootstrap/commitlore-observation.ts";
+import { mergeCommitCheck } from "../github/merge-commit-check.ts";
 import { releaseCancelledBootstrapReservation } from "../bootstrap/cancelled-reservation-release.ts";
 import { RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
@@ -191,6 +192,12 @@ export interface ControlPlaneConfig {
    */
   residentProvisioner?: {port?: HostProjectProvisioner; script?: string; home?: string};
   repoFactory?: { workRoot: string; githubPort?: GitHubWritePort; commitlore?: CommitLorePort };
+  /**
+   * #1268 — replaces, in tests, the pinned `commitlore` CLI port a worker turn commits through. Every run that pins a
+   * manifest is governed whatever the manifest says (`commitloreRunMode`), so this chooses which CommitLore, never
+   * whether there is one.
+   */
+  commitlore?: CommitLorePort;
 }
 
 export const defaultConfig = (root = join(homedir(), ".agent-control-plane")): ControlPlaneConfig => ({
@@ -681,7 +688,7 @@ export class ControlPlane {
         workerAdapter: (provider: string) => this.providers.requireForRole(provider, Role.WORKER),
         // #1242 — a dependent task's base, when its target is first recorded at its run; the pipeline is built below.
         predecessorBase: (input) => this.pipeline.predecessorBase(input),
-      }, config.importRoot === undefined ? {} : { importRoot: config.importRoot });
+      }, { ...(config.importRoot === undefined ? {} : { importRoot: config.importRoot }), ...(config.commitlore === undefined ? {} : { commitlore: config.commitlore }) });
       // S2 — a run's claim on its checkout passes to its next claim only when the runner says nothing
       // a turn of that run started can still write the checkout.
       this.claims.attach({
@@ -733,6 +740,7 @@ export class ControlPlane {
         this.repositories, this.verification, this.review, this.review.controlPlaneInvoker(), this.ceo, this.bindings, this.outbox,
         this.telemetry, this.guard,
       );
+      if (config.commitlore !== undefined) this.pipeline.attach({ commitlore: config.commitlore });
 
       const githubKernelOptions = config.githubKernelOptions ?? (config.githubClient
         ? {}
@@ -746,7 +754,8 @@ export class ControlPlane {
         this.db, this.clock, this.audit, this.artifacts, this.credentials,
         this.repositories, this.runs, this.projects, this.guard,
         config.githubClient,
-        githubKernelOptions,
+        // #1268 — the merge commit GitHub creates is checked by the same CommitLore a worker turn commits through.
+        { checkMergeCommit: mergeCommitCheck(config.commitlore ?? createCommitLoreCliPort()), ...githubKernelOptions },
       );
       this.verification.attachCi(this.github.ciEvidenceSource());
       this.verification.attachManifests((digest) => this.projects.manifest(digest));

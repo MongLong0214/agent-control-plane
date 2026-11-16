@@ -217,18 +217,6 @@ describe("GAP 1: a capture-required task's turn runs in CommitLore's required mo
     expect(adapter.launches).toBe(0);
   });
 
-  it("control: an optional run's task with no setting commits as before, and CommitLore's contract is never asked", async () => {
-    const world = optionalWorld("preferred");
-    const { port, asked } = passingPort();
-    const adapter = fakeFor(world, SAID);
-    await start(world, adapter, { commitlore: port });
-
-    expect(asked.contract).toBe(0);
-    expect(adapter.requests[0]!.prompt).not.toContain("commitlore-draft");
-    expect(succeeded(world)).toHaveLength(1);
-    expect(succeeded(world)[0]!["commitlore"]).toBeUndefined();
-  });
-
   it("a worker that says capture is not required for its capture-required task changes nothing: no draft, no commit", async () => {
     const world = optionalWorld(null);
     storeTaskSetting(world, REQUIRED);

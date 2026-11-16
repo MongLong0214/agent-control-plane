@@ -76,7 +76,7 @@ const finishWithReceipt = (setup: Prepared, opened: ReturnType<typeof openExecut
     stdoutSha256: sha256("worker stdout"), commitHead: receipt.commitHead, diffDigest: receipt.diffDigest };
   const resultDigest = workerSuccessDigest(inputs);
   const recorded = setup.harness.cp.audit.record({ kind: WorkerTurnEvent.SUCCEEDED, runId: setup.run.runId,
-    evidence: { ...inputs, resultDigest, taskId: opened.taskId, head: receipt.base, paths: receipt.paths } });
+    evidence: { ...inputs, resultDigest, taskId: opened.taskId, head: receipt.base, paths: receipt.paths, commitlore: { outcome: "empty", recordIds: [], nonce: null } } });
   if (!recorded.allowed) throw new Error(recorded.message);
   setup.harness.cp.tasks.finishExecution(opened.executionId, { status: "SUCCEEDED", resultDigest });
 };

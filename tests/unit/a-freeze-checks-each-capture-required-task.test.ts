@@ -143,12 +143,6 @@ const expectCaptureRefused = async (world: World, tasks: Array<Record<string, un
   expect(frozenRows(world)).toEqual([]);
 };
 
-const freezeAllowed = async (world: World) => {
-  const frozen = await world.harness.cp.pipeline.freeze(world.run.runId);
-  if (!frozen.allowed) throw new Error(`${frozen.reasonCode}: ${frozen.message} ${JSON.stringify(frozen.evidence)}`);
-  return frozen.value;
-};
-
 describe("GAP 1: the freeze checks each capture-required task's receipt, commit and record binding", () => {
   it.each([
     ["no CommitLore evidence", null, "COMMITLORE_EVIDENCE_MISSING"],
@@ -167,21 +161,6 @@ describe("GAP 1: the freeze checks each capture-required task's receipt, commit 
     const taskId = registerTask(world, "app", CAPTURE);
     const commit = workerCommit(world, taskId, { "src/app.js": "module.exports = () => 2;\n" }, "update app", recorded("r-aaaaaaaaaaaa"));
     await expectCaptureRefused(world, [{ taskId, refusal: "RECORD_IDS_MISMATCH", commit }]);
-  });
-
-  it.each([
-    ["a recorded capture whose Record-Id the commit carries", "update readme\n\nWarn: readers see one\nRecord-Id: r-0123456789ab", recorded("r-0123456789ab")],
-    ["an empty consideration on a commit with no Record-Id", "update readme", EMPTY],
-  ])("an optional run: %s is frozen, beside a task with no setting and no evidence", async (_name, message, commitlore) => {
-    const world = await worldOf("preferred");
-    const taskId = registerTask(world, "readme", CAPTURE);
-    const commit = workerCommit(world, taskId, { "README.md": "# one\n" }, message, commitlore);
-    const plain = registerTask(world, "app");
-    const plainCommit = workerCommit(world, plain, { "src/app.js": "module.exports = () => 2;\n" }, "update app", null);
-    const value = await freezeAllowed(world);
-    const candidate = value.repositories[0]!.candidateHead;
-    // `merge-base --is-ancestor` exits non-zero, and gitSync throws, for a commit the candidate does not hold.
-    for (const held of [commit, plainCommit]) expect(() => gitSync(world.repo, ["merge-base", "--is-ancestor", held, candidate])).not.toThrow();
   });
 
   it.each([["a run with CommitLore off", "off"], ["a run that requires CommitLore", "required"]] as const)(
@@ -245,17 +224,6 @@ describe("GAP 1: only a registered correction's supersession exempts a capture-r
       evidence: { originalTaskId: original, correctionTaskId: correction, supersedes: binding.value },
     });
   };
-
-  it("a superseded capture-required task with no CommitLore evidence is exempt; its correction is checked and frozen", async () => {
-    const world = await worldOf("preferred");
-    const original = registerTask(world, "readme", CAPTURE);
-    workerCommit(world, original, { "README.md": "# one\n" }, "update readme", null);
-    const correction = registerTask(world, "readme-fix", { ...CAPTURE, correctionOf: { taskId: original, failure: "it lost the record", fix: "commit it through CommitLore" } });
-    const fixed = workerCommit(world, correction, { "README.md": "# two\n" }, "update readme again\n\nRecord-Id: r-bbbbbbbbbbbb", recorded("r-bbbbbbbbbbbb"));
-    supersede(world, original, correction);
-    const value = await freezeAllowed(world);
-    expect(value.repositories[0]!.candidateHead).toBe(fixed);
-  });
 
   it("the correction is not exempt: a superseding task without evidence still refuses the freeze", async () => {
     const world = await worldOf("preferred");

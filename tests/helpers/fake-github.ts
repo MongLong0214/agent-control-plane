@@ -56,6 +56,10 @@ export class FakeGitHub implements GitHubClient {
   commitTrees = new Map<string, string>();
   /** When set, the next merge records this tree instead of its head's. */
   nextMergeTree: string | null = null;
+  /** The message each merge commit landed with: what the PUT supplied, else GitHub's own default. */
+  mergeMessages = new Map<string, string>();
+  /** Replaces the message the next merge lands with, as a repository setting could. */
+  nextMergeMessage: string | null = null;
   /** Heads that do not contain the base they are compared with; every other head does. */
   headsMissingBase = new Set<string>();
   /** `refs/notes/commitlore` as the Git Data API sees it: its commit, and each notes commit's tree (path -> blob). */
@@ -156,7 +160,7 @@ export class FakeGitHub implements GitHubClient {
     }
     if (method === "PUT" && /\/pulls\/\d+\/merge$/.test(path)) {
       const number = Number(/\/pulls\/(\d+)\/merge$/.exec(path)![1]);
-      const input = body as { sha: string };
+      const input = body as { sha: string; commit_title?: string; commit_message?: string };
       const pull = this.pulls.find((p) => p.number === number);
       if (!pull) throw new Error(`no pull ${number}`);
       if (pull.head.sha !== input.sha) {
@@ -172,6 +176,14 @@ export class FakeGitHub implements GitHubClient {
       this.commitParents.set(mergeSha, [firstParent, pull.head.sha]);
       this.commitTrees.set(mergeSha, this.nextMergeTree ?? this.treeOf(pull.head.sha));
       this.nextMergeTree = null;
+      this.mergeMessages.set(
+        mergeSha,
+        this.nextMergeMessage ??
+          (input.commit_title === undefined
+            ? `Merge pull request #${number} from ${pull.head.ref}\n\n${pull.title ?? ""}`
+            : [input.commit_title, input.commit_message].filter((part) => part !== undefined && part !== "").join("\n\n")),
+      );
+      this.nextMergeMessage = null;
       // GitHub's merged-PR resource retains the base snapshot it was opened against;
       // the separate target ref is the mutable source of truth after a merge.
       pull.merge_commit_sha = mergeSha;
@@ -221,7 +233,7 @@ export class FakeGitHub implements GitHubClient {
     if (method === "GET" && /\/commits\/[^/]+$/.test(path) && !path.includes("/git/commits/")) {
       const sha = /\/commits\/([^/]+)$/.exec(path)![1]!;
       const parents = this.commitParents.get(sha) ?? [];
-      return { sha, parents: parents.map((p) => ({ sha: p })), commit: { tree: { sha: this.treeOf(sha) } } } as unknown as T;
+      return { sha, parents: parents.map((p) => ({ sha: p })), commit: { tree: { sha: this.treeOf(sha) }, message: this.mergeMessages.get(sha) } } as unknown as T;
     }
 
     if (method === "GET" && /\/contents\//.test(path)) {

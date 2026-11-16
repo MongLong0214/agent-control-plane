@@ -25,6 +25,7 @@
  */
 import { readFileSync } from "node:fs";
 
+import { createCommitLoreCliPort } from "../src/bootstrap/commitlore-observation.ts";
 import { produceRepoFactoryResult, type RepoFactoryPlanFixture } from "../src/bootstrap/repo-factory-producer.ts";
 import { parseRepoFactoryResult } from "../src/bootstrap/repo-factory-result.ts";
 
@@ -55,7 +56,9 @@ const main = async (): Promise<void> => {
     return;
   }
 
-  const produced = await produceRepoFactoryResult({ plan, workDir });
+  // #1268 — the producer commits through CommitLore or not at all: the pinned CLI (`ACP_COMMITLORE_BINARY`), and a
+  // refusal naming it when there is none.
+  const produced = await produceRepoFactoryResult({ plan, workDir, commitlore: { port: createCommitLoreCliPort() } });
   if (!produced.allowed) {
     fail(
       `producer refused — ${produced.reasonCode}: ${produced.message}\n` +

@@ -63,8 +63,10 @@ describe("packet listings share the reviewer budget", () => {
         ownerBindingGeneration: run.ownerBindingGeneration!, workerSessionId: worker,
         provider: "scripted", model: "scripted-worker", repositoryId: participants[0]!.repositoryId });
       if (!execution.allowed) throw new Error(execution.message);
-      applyPassingChange(harness.repoPath);
-      harness.cp.tasks.finishExecution(execution.value.executionId, { status: "SUCCEEDED", resultDigest: "sha256:done" });
+      // The result digest names the task's commit, which is what accounts for it at a governed freeze (#1268); a digest that
+      // names nothing leaves the commit to be accounted for by a further task the fixture adds, which this test counts.
+      const head = applyPassingChange(harness.repoPath);
+      harness.cp.tasks.finishExecution(execution.value.executionId, { status: "SUCCEEDED", resultDigest: `sha256:${head}` });
       // The official command's output goes to the reviewer as required coverage beside the changed file.
       harness.scripted.script({ match: /Candidate review|Review chunk|Final review/, text: JSON.stringify({ verdict: "PASS",
         coveredFiles: ["github:acme/repo-000:src/app.js", "github:acme/repo-000:#verification-output/verify/stdout"], omittedItems: [], findings: [] }) });

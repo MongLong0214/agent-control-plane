@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { executablePlanOf } from "../../src/bootstrap/bootstrap-plan.ts";
 import { createGitHubApiWritePort } from "../../src/bootstrap/github-write-port.ts";
-import { produceRepoFactoryResult } from "../../src/bootstrap/repo-factory-producer.ts";
+import { produceRepoFactoryResult } from "../helpers/repo-factory-produce.ts";
 import { acpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";

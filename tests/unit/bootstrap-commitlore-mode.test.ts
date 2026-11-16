@@ -26,7 +26,7 @@ import { cleanupTempDirs } from "../helpers/fixtures.ts";
  * - `required`: without a passing CommitLore verification (`commitlore init` + `commitlore doctor --json`
  *   in the checkout at the published head) the gate is refused; with one it passes, and the bootstrap
  *   commit still carries no decision record, because its diff is the reviewed PLAN's files.
- * - `preferred`: not observed, named NOT_OBSERVED, never blocked.
+ * - `preferred` and `off` are parsed and ignored (#1268): every bootstrap is held to CommitLore.
  * - an unsupported value: refused by the manifest contract, and held to `required` anywhere past it.
  * - no downgrade: a required run that is refused stays required; nothing turns it into a preferred one.
  *
@@ -199,24 +199,26 @@ describe("#246 B3: the bootstrap producer enforces the approved manifest's Commi
     expect(final["warnings"]).toEqual([]);
   });
 
-  it("B3-3 (#1268) a new project that prefers CommitLore is refused at activation, before anything is written, and the port is never asked", async () => {
-    const commitlore = new FakeCommitLore(() => FAIL);
-    const prepared = await prepareBootstrapRun("b3-preferred", {
-      manifest: cleanTreeManifest("b3-preferred", { commitlore: { mode: "preferred" } }),
-      ops: pushOperations(),
-      commitlore,
-    });
-    const refused = await produce(prepared);
-    expect(refused, JSON.stringify(refused)).toMatchObject({
-      allowed: false,
-      reasonCode: ReasonCode.VERIFICATION_GAP,
-      evidence: { stage: "precondition", refusal: "COMMITLORE_MODE_NOT_REQUIRED", commitloreMode: "preferred" },
-    });
-    expect(storedResult(prepared)).toBeNull();
-    expect(commitlore.paths).toEqual([]);
-    expect(commitlore.committed).toEqual([]);
-    noGitHubCall(prepared);
-  });
+  it.each(["preferred", "off"] as const)(
+    "B3-3 (#1268) a new project whose manifest says %s is held to CommitLore all the same: a CommitLore that does not pass refuses it before anything is written",
+    async (mode) => {
+      const commitlore = new FakeCommitLore(() => FAIL);
+      const prepared = await prepareBootstrapRun(`b3-${mode}`, {
+        manifest: cleanTreeManifest(`b3-${mode}`, { commitlore: { mode } }),
+        ops: pushOperations(),
+        commitlore,
+      });
+      const refused = await produce(prepared);
+      expect(refused, JSON.stringify(refused)).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.VERIFICATION_GAP,
+        evidence: { stage: "precondition", refusal: "COMMITLORE_REQUIRED_NOT_OBSERVED", commitloreMode: "required" },
+      });
+      expect(storedResult(prepared)).toBeNull();
+      expect(commitlore.committed).toEqual([]);
+      noGitHubCall(prepared);
+    },
+  );
 
   it("B3-4 an unsupported mode is refused by the manifest contract, and a missing one is the contract's explicit required (#1268)", () => {
     const run = { kind: RunKind.PROJECT_BOOTSTRAP, projectId: null };

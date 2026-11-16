@@ -136,7 +136,7 @@ const reviewImports = async (files: readonly Imported[], options: ReviewOptions 
     exitCode: 0, stdoutSha256: sha256("worker stdout"), commitHead: head, diffDigest, ...(files.length === 0 ? {} : { imports }) } as WorkerSuccessDigestInputs;
   const resultDigest = workerSuccessDigest(inputs);
   const recorded = harness.cp.audit.record({ kind: WorkerTurnEvent.SUCCEEDED, runId: run.runId,
-    evidence: { ...inputs, resultDigest, taskId, head: baseHead, paths: changed.map((entry) => entry.path) } });
+    evidence: { ...inputs, resultDigest, taskId, head: baseHead, paths: changed.map((entry) => entry.path), commitlore: { outcome: "empty", recordIds: [], nonce: null } } });
   if (!recorded.allowed) throw new Error(recorded.message);
   harness.cp.tasks.finishExecution(executionId, { status: "SUCCEEDED", resultDigest });
 

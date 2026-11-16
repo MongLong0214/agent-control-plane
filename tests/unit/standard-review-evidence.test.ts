@@ -367,10 +367,10 @@ describe("derived outputs of a review that read private evidence", () => {
       expect(f.log.some((call) => call.method === "POST" && /\/check-runs$/.test(call.path))).toBe(true);
       expect(f.log.some((call) => call.method === "PUT" && /\/merge$/.test(call.path))).toBe(true);
       expect(JSON.stringify(f.log)).not.toContain(MARKER);
-      // ACP sends no merge message of its own: GitHub's commit title and message come from the PR title and the
-      // branch's commits, neither of which carries review text.
+      // The merge message ACP sends (#1268, so that CommitLore has checked what lands) is the merge's own wording and the
+      // pull request's title, neither of which carries review text.
       const merge = f.log.find((call) => call.method === "PUT" && /\/merge$/.test(call.path))!;
-      expect(Object.keys(merge.body as Args).sort()).toEqual(["merge_method", "sha"]);
+      expect(Object.keys(merge.body as Args).sort()).toEqual(["commit_message", "commit_title", "merge_method", "sha"]);
 
       expect(f.refusals.length).toBe(0);
       expect(f.h.cp.bindings.active(roleKeyFor(Role.CEO))?.sessionId).toBe(f.ceo);

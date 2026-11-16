@@ -283,7 +283,7 @@ describe("a freeze guards every SUCCEEDED task's commit (S6-B)", () => {
     });
   });
 
-  it("GREEN — a single task whose checkout moved past its commit, then off it: the guard agrees with each candidate", async () => {
+  it("GREEN — a single task whose checkout moved off its commit: the guard agrees with the candidate", async () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const s = await standardRun(
@@ -306,14 +306,8 @@ describe("a freeze guards every SUCCEEDED task's commit (S6-B)", () => {
       }
       const oneCommit = succeededCommitOf(f, s.runId, one);
 
-      // Past it: a commit on top of the task's. HEAD holds the task's commit, so there is no
-      // integration and the candidate is HEAD, as before.
-      gitSync(s.checkoutPath, ["commit", "-q", "--allow-empty", "-m", "on top of the task"]);
-      const onTop = gitSync(s.checkoutPath, ["rev-parse", "HEAD"]);
-      const past = await cp.pipeline.freeze(s.runId);
-      if (!past.allowed) throw new Error(`${past.reasonCode}: ${past.message}`);
-      expect(past.value.repositories[0]!.candidateHead).toBe(onTop);
-      expect("integration" in past.value.repositories[0]!).toBe(false);
+      // A commit on top of the task's is not frozen for a run that requires CommitLore, which every run does (#1268): see
+      // `a-governed-freeze-holds-only-commits-commitlore-saw`.
 
       // Off it: the checkout on the base branch, which does not hold the task's commit. The candidate
       // is the task's commit, integrated alone, and the guard finds it there.
@@ -425,7 +419,7 @@ describe("a freeze guards every SUCCEEDED task's commit (S6-B)", () => {
           kind: WorkerTurnEvent.SUCCEEDED,
           runId: s.runId,
           sessionId: workerSessionId,
-          evidence: { ...inputs, resultDigest, taskId: twoTaskId, head: oneCommit, paths: ["src/app.js"] },
+          evidence: { ...inputs, resultDigest, taskId: twoTaskId, head: oneCommit, paths: ["src/app.js"], commitlore: { outcome: "empty", recordIds: [], nonce: null } },
         });
 
         // Both commits are on the one branch: task two's commit descends from task one's.

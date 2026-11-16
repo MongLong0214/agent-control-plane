@@ -192,6 +192,8 @@ const reflectMergeToCandidate = (
     (pull as typeof pull & { merge_commit_sha?: string }).merge_commit_sha = mergeSha;
     github.commitParents.set(mergeSha, [evaluatedBase, candidateHead]);
     github.commitTrees.set(mergeSha, github.treeOf(candidateHead));
+    // The commit it names landed with the message the merge was sent with (#1268).
+    github.mergeMessages.set(mergeSha, github.mergeMessages.get((response as { sha?: string }).sha ?? "") ?? "");
     github.setBranch(pull.base.ref, mergeSha);
     return { ...(response as object), sha: mergeSha } as T;
   };
@@ -1425,15 +1427,14 @@ describe("a pull request merges as a merge commit, whose message GitHub composes
     { message: "feat: the first change\n\nLimit: the first commit's record\nRecord-Id: r-111111111111\n" },
   ];
 
-  it("leaves a merge_commit strategy's request body exactly as it was", async () => {
-    // Scope, stated where it can fail. A merge commit's message is not composed from the branch's
-    // commit messages, and the branch's commits survive it individually, so supplying one there
-    // would add content GitHub never wrote and remove nothing.
+  it("sends a merge_commit strategy's own title and body for CommitLore to check, never composed from the branch's commits (#1268)", async () => {
+    // A merge commit's message is not composed from the branch's commit messages, and the branch's commits survive
+    // it individually, so supplying them there would add content GitHub never wrote and remove nothing. What is
+    // supplied is the merge's own wording, so that the message CommitLore checks is the one that lands.
     const fixture = await setup();
     const pullNumber = await openPullWithGate(fixture);
-    // The branch is given commits deliberately: a merge_commit that composed a message would then
-    // succeed and be caught by the key set below, rather than throwing on an unreadable branch and
-    // being "killed" by an error that says nothing about scope.
+    // The branch is given commits deliberately: a merge_commit that composed a message from them would then be
+    // caught by the assertions below, rather than throwing on an unreadable branch.
     fixture.github.setPullCommits(pullNumber, BRANCH_COMMITS);
     const merged = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
     expect(merged.allowed).toBe(true);
@@ -1441,7 +1442,15 @@ describe("a pull request merges as a merge commit, whose message GitHub composes
     const put = fixture.github.calls.find(
       (call) => call.method === "PUT" && /\/pulls\/\d+\/merge$/.test(call.path),
     );
-    expect(Object.keys(put!.body as object).sort()).toEqual(["merge_method", "sha"]);
-    expect(put!.body).toEqual({ sha: fixture.head, merge_method: "merge" });
+    const body = put!.body as { sha: string; merge_method: string; commit_title: string; commit_message: string };
+    expect(Object.keys(body).sort()).toEqual(["commit_message", "commit_title", "merge_method", "sha"]);
+    expect(body).toMatchObject({ sha: fixture.head, merge_method: "merge" });
+    expect(body.commit_title).toMatch(/^Merge pull request #\d+ from /);
+    for (const commit of BRANCH_COMMITS) {
+      expect(body.commit_title).not.toContain("second change");
+      expect(body.commit_message).not.toContain(commit.message.split("\n")[0]!);
+    }
+    expect(body.commit_message).not.toContain("Record-Id");
   });
+
 });

@@ -26,10 +26,8 @@ import { git, tryRevParse, type GitResult } from "../git/git.ts";
 import { consumeWithheldExemption, readWithheldIntent, withheldUnsent } from "./bootstrap-approval-anchor.ts";
 import {
   COMMITLORE_VERIFICATION_ID,
-  type CommitLoreMode,
   type CommitLoreObservation,
   type CommitLorePort,
-  commitloreRequired,
   requiredCommitLoreObservation,
   writeCommitLoreObservationRecord,
 } from "./commitlore-observation.ts";
@@ -264,15 +262,14 @@ export interface RepoFactoryProducerInput {
    */
   beforeLedgerWrite?: (state: { receipts: readonly GitHubOperationReceipt[]; pending: readonly PendingWrite[] }) => void;
   /**
-   * #246 B3 — the approved manifest's CommitLore mode, and the port that observes it. A `required` mode
-   * (or any value the manifest contract does not define) is verified in the checkout at the head this
-   * call publishes — `commitlore init` and `commitlore doctor --json`, after every GitHub write, so no
-   * hook it installs runs in the push — and reported as a `commitlore:doctor` verification row; without
-   * a port, or without a passing observation, nothing is reported. `preferred` and `off` are not
-   * observed. Omitted, the mode is not observed either, and activation refuses a required manifest
-   * whose result carries no row.
+   * #246 B3, #1268 — the port that makes this bootstrap's commits and observes CommitLore. CommitLore is
+   * verified in the checkout at the head this call publishes — `commitlore init` and `commitlore doctor
+   * --json`, after every GitHub write, so no hook it installs runs in the push — and reported as a
+   * `commitlore:doctor` verification row. Every bootstrap is held to it, whatever its manifest's
+   * `commitlore.mode` says: omitted, or with no port that can make a commit, the call is refused before any
+   * local or GitHub write, never made with a plain `git commit`.
    */
-  commitlore?: { mode: CommitLoreMode; port: CommitLorePort | null };
+  commitlore?: { port: CommitLorePort | null };
 }
 
 /** The blob id git gives `content`, in the object format the repository's own ids use. */
@@ -818,19 +815,19 @@ export const produceRepoFactoryResult = async (
   const approvedFiles = parsedFiles.data;
 
   // #246 B3 — a required CommitLore with nothing to observe it is refused before any local or GitHub write.
-  const commitloreObservedHere = input.commitlore !== undefined && commitloreRequired(input.commitlore.mode);
-  if (commitloreObservedHere && input.commitlore?.port === null) {
+  if (input.commitlore?.port == null) {
     const unobservable = await requiredCommitLoreObservation(null, "", { at: "precondition" });
     return unobservable as Decision<RepoFactoryResult>;
   }
   // #1268 — and so is one whose CommitLore cannot make this bootstrap's commits.
-  if (commitloreObservedHere && input.commitlore?.port?.attempt === undefined) {
+  if (input.commitlore.port.attempt === undefined) {
     return deny(ReasonCode.VERIFICATION_GAP, "the approved manifest requires CommitLore, and this deployment's CommitLore cannot make a commit", {
       refusal: "COMMITLORE_REQUIRED_UNOBSERVABLE",
       commitloreMode: "required",
       at: "precondition",
     });
   }
+  const commitlorePort = input.commitlore.port;
 
   if (plan.githubOperations.length > 0 && input.github === undefined) {
     return deny(
@@ -1056,7 +1053,7 @@ export const produceRepoFactoryResult = async (
    * makes no commit. That check is no capture, and nothing is recorded on it. Each is one commit attempt.
    */
   const commitThroughCommitLore = async (message: string, options: { empty?: boolean } = {}): Promise<Decision<string | null>> => {
-    const attemptOf = input.commitlore?.port?.attempt;
+    const attemptOf = commitlorePort.attempt;
     if (attemptOf === undefined) {
       return deny(ReasonCode.VERIFICATION_GAP, "the approved manifest requires CommitLore, and this deployment's CommitLore cannot make a commit", {
         refusal: "COMMITLORE_REQUIRED_UNOBSERVABLE",
@@ -1094,29 +1091,10 @@ export const produceRepoFactoryResult = async (
     // Only the approved files are tracked — the ownership marker above is bookkeeping for this
     // function's own retry/cleanup logic, not part of the repository's real content.
     await gitOrCleanup(["add", "--", ...approvedFiles.map((file) => file.path)]);
-    if (commitloreObservedHere) {
-      const made = await commitThroughCommitLore("repo factory bootstrap");
-      if (!made.allowed) {
-        cleanup();
-        return made as Decision<RepoFactoryResult>;
-      }
-    } else {
-      const commit = await gitOrCleanup(
-        [
-          "-c", "user.email=repo-factory@local",
-          "-c", "user.name=Repo Factory",
-          "commit", "-m", "repo factory bootstrap",
-        ],
-        { allowFailure: true },
-      );
-      if (commit.exitCode !== 0) {
-        cleanup();
-        return deny(
-          ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
-          "local bootstrap commit failed; refusing to fabricate a result without a real commit",
-          { stderr: commit.stderr },
-        );
-      }
+    const made = await commitThroughCommitLore("repo factory bootstrap");
+    if (!made.allowed) {
+      cleanup();
+      return made as Decision<RepoFactoryResult>;
     }
 
     // #246 C2, review round 1 (RF-REVIEW-01) — the commit just made is compared with the approved
@@ -1220,12 +1198,10 @@ export const produceRepoFactoryResult = async (
           await gitOrCleanup(["add","--",...approvedFiles.map(f => f.path)]);
           // #1268 — a genesis whose approved files add nothing to the autoInit head stages an empty tree change.
           // CommitLore makes no empty commit: its message gets CommitLore's check, and it is made as before.
-          const emptyGenesis = commitloreObservedHere && (await gitOrCleanup(["diff","--cached","--quiet"],{allowFailure:true})).exitCode === 0;
-          if (commitloreObservedHere) {
-            const made = await commitThroughCommitLore(plan.genesis!.commitMessage, { empty: emptyGenesis });
-            if (!made.allowed) return made as Decision<string>;
-          }
-          if (!commitloreObservedHere || emptyGenesis) {
+          const emptyGenesis = (await gitOrCleanup(["diff","--cached","--quiet"],{allowFailure:true})).exitCode === 0;
+          const made = await commitThroughCommitLore(plan.genesis!.commitMessage, { empty: emptyGenesis });
+          if (!made.allowed) return made as Decision<string>;
+          if (emptyGenesis) {
             await gitOrCleanup(["-c","user.email=repo-factory@local","-c","user.name=Repo Factory","commit","--allow-empty","-m",plan.genesis!.commitMessage]);
           }
           const head = (await tryRevParse(localRepoPath,"HEAD"))!;
@@ -1284,10 +1260,10 @@ export const produceRepoFactoryResult = async (
   // approved push. The bootstrap commit carries no decision record and is not given one: its diff is the
   // reviewed PLAN's files (CommitLore's own policy: most commits carry none). Not passing refuses here.
   let commitlorePass: Extract<CommitLoreObservation, { outcome: "PASS" }> | null = null;
-  if (commitloreObservedHere) {
+  {
     let observed: Decision<CommitLoreObservation>;
     try {
-      observed = await requiredCommitLoreObservation(input.commitlore?.port ?? null, localRepoPath, { at: "head", head });
+      observed = await requiredCommitLoreObservation(commitlorePort, localRepoPath, { at: "head", head });
     } catch (thrown) {
       cleanup();
       throw thrown;

@@ -47,11 +47,8 @@ import { frameRecord, unframeRecord, writeWholeSync } from "./whole-write.ts";
  * bootstrap commit is the reviewed PLAN's files, its diff is the whole of it, and it needs none. Demanding
  * one would demand a fabricated record, so nothing here asks for one and the producer never writes one.
  *
- * - `required`: no passing observation at the published head refuses the gate.
- * - `preferred`: not observed by this producer, and named NOT_OBSERVED at activation; it never blocks.
- * - `off`: asks for nothing.
- * - any other value: the manifest contract refuses it at parse; one that reaches here anyway is held to
- *   `required`, never to `preferred`.
+ * Every bootstrap is held to it: no passing observation at the published head refuses the gate. The manifest's
+ * `commitlore.mode` is not read here (#1268): `preferred` and `off` are still parsed and mean nothing.
  */
 
 export type CommitLoreMode = ProjectManifest["commitlore"]["mode"];
@@ -208,8 +205,8 @@ export type CommitLoreLookupEvent =
   | { readonly kind: "guard"; readonly lookup: CommitLoreGuardLookup }
   | { readonly kind: "path"; readonly lookup: CommitLorePathLookup };
 
-import { commitloreGoverned, commitloreRequired, commitloreRunMode } from "./commitlore-mode.ts";
-export { commitloreGoverned, commitloreRequired, commitloreRunMode };
+import { commitloreGoverned, commitloreRunMode } from "./commitlore-mode.ts";
+export { commitloreGoverned, commitloreRunMode };
 
 /**
  * #1268 — one commit the control plane builds that no session produced and CommitLore has no command to make
@@ -1325,24 +1322,21 @@ export const commitloreObserved = (result: RepoFactoryResult, repositoryIdentity
   );
 
 /**
- * The activation gate on a producer result whose repository facts are `facts`: `required` (and any value
- * the contract does not define) is refused unless every repository carries a passing CommitLore row at the
- * fact's head. `preferred` and `off` pass; `observed` says whether the row was there, so activation can
- * name a preferred CommitLore NOT_OBSERVED rather than pass over it.
+ * The activation gate on a producer result whose repository facts are `facts`: refused unless every repository
+ * carries a passing CommitLore row at the fact's head, whatever its manifest's `commitlore.mode` says (#1268).
  */
 export const commitloreActivationGate = (
-  mode: unknown,
   result: RepoFactoryResult,
   facts: ReadonlyArray<{ identity: string; head: string | null }>,
 ): Decision<{ observed: boolean }> => {
   const observed = facts.length > 0 && facts.every((fact) => fact.head !== null && commitloreObserved(result, fact.identity, fact.head));
-  if (!commitloreRequired(mode) || observed) return allow(ReasonCode.OK, { observed });
+  if (observed) return allow(ReasonCode.OK, { observed });
   return deny(
     ReasonCode.VERIFICATION_GAP,
     "the approved manifest requires CommitLore, and the producer result carries no passing CommitLore verification at the published head",
     {
       refusal: "COMMITLORE_REQUIRED_NOT_OBSERVED",
-      commitloreMode: mode,
+      commitloreMode: "required",
       expected: { commandId: COMMITLORE_VERIFICATION_ID, repositories: facts.map(({ identity, head }) => ({ identity, head })) },
     },
   );
@@ -1500,19 +1494,17 @@ const readCommitLoreObservationRecord = (path: string): Decision<CommitLoreObser
  * producer's, judged again only as text.
  */
 export const verifyCommitLoreBinding = (input: {
-  mode: unknown;
   result: RepoFactoryResult;
   workDir: string;
   expected: CommitLoreBinding;
 }): Decision<void> => {
-  const { mode, result, workDir, expected } = input;
+  const { result, workDir, expected } = input;
   const rows = result.bootstrapVerification.filter((row) => row.commandId === COMMITLORE_VERIFICATION_ID);
-  if (!commitloreRequired(mode) && rows.length === 0) return allow(ReasonCode.OK, undefined);
   const path = commitloreObservationPath(workDir, expected.checkoutPath);
   const unbound = (message: string, evidence: Record<string, unknown> = {}): Decision<void> =>
     deny(ReasonCode.VERIFICATION_GAP, message, {
       refusal: "COMMITLORE_OBSERVATION_UNBOUND",
-      commitloreMode: mode,
+      commitloreMode: "required",
       recordPath: path,
       expected,
       ...evidence,

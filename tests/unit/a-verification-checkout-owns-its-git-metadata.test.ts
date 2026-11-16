@@ -4,7 +4,8 @@ import { dirname, join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { produceRepoFactoryResult, VERIFICATION_KINDS } from "../../src/bootstrap/repo-factory-producer.ts";
+import { VERIFICATION_KINDS } from "../../src/bootstrap/repo-factory-producer.ts";
+import { produceRepoFactoryResult } from "../helpers/repo-factory-produce.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { allow, deny } from "../../src/core/errors.ts";
 import { digestOf } from "../../src/core/digest.ts";

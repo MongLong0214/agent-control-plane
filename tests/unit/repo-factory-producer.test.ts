@@ -25,12 +25,12 @@ import {
   createCheckoutLeafOrDeny,
   ensureDirectoryLevel,
   judgeDirectoryOwnership,
-  produceRepoFactoryResult,
   repositoryCheckoutPath,
   trackedFilesOrDeny,
   VERIFICATION_KINDS,
   type RepoFactoryPlanFixture,
 } from "../../src/bootstrap/repo-factory-producer.ts";
+import { produceRepoFactoryResult } from "../helpers/repo-factory-produce.ts";
 import { git } from "../../src/git/git.ts";
 
 /**
@@ -145,7 +145,8 @@ describe("repo factory producer (#246)", () => {
 
     expect(produced.value.repositories).toHaveLength(1);
     expect(produced.value.externalWriteReceipts).toHaveLength(1);
-    expect(produced.value.bootstrapVerification).toHaveLength(1);
+    // The clean-tree check, and CommitLore's observation of the published head (#1268).
+    expect(produced.value.bootstrapVerification.map((row) => row.commandId)).toEqual(["local-clean-tree", "commitlore:doctor"]);
     expect(produced.value.bootstrapVerification[0]?.exactHead).toMatch(/^[0-9a-f]{40}$/);
     expect(produced.value.ciEvidence).toEqual([]);
     expect(produced.value.unresolvedGaps).toEqual([]);

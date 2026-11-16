@@ -1,6 +1,6 @@
-import { passingCommitLore } from "./commitlore-attempt.ts";
-import { commitloreGoverned } from "../../src/bootstrap/commitlore-observation.ts";
+import { passingCommitLore, settlingCommitLore } from "./commitlore-attempt.ts";
 import { WorkerTurnEvent } from "../../src/run/worker-turn.ts";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 
 import { type Clock, ManualClock } from "../../src/core/clock.ts";
@@ -91,6 +91,11 @@ export const makeHarness = (
     reviewer?: ControlPlaneConfig["reviewer"];
     /** The daemon's per-project reviewer file, as read at start; none when omitted. */
     reviewerPreferencesFile?: ControlPlaneConfig["reviewerPreferencesFile"];
+    /**
+     * #1268 — false for a witness that seeds each worker receipt itself (see `a-governed-freeze-holds-only-commits-
+     * commitlore-saw`): `finishExecution` then writes none.
+     */
+    commitloreReceipts?: boolean;
   } = {},
 ): Harness => {
   const root = options.root ?? tempDir("acp-harness-");
@@ -135,6 +140,7 @@ console.log('verification ok');`,
       preferred: { provider: "scripted", model: "scripted-reviewer", effort: "xhigh" },
       fallbacks: [],
     },
+    commitlore: settlingCommitLore(),
     ...(options.githubClient ? { githubClient: options.githubClient } : {}),
     ...(options.githubKernelOptions ? { githubKernelOptions: options.githubKernelOptions } : {}),
     ...(options.githubAppEnvFile ? { githubAppEnvFile: options.githubAppEnvFile } : {}),
@@ -160,6 +166,114 @@ console.log('verification ok');`,
   cp.continuity.attach({
     buzz: { connect: (sessionId, purpose) => adapter.connect(sessionId, purpose) },
   });
+
+  // #1268 — every run's contract requires CommitLore, so a candidate holds only commits a worker receipt accounts for,
+  // and its merge commits get CommitLore's check. A fixture that commits with plain git stands in for a CommitLore-settled
+  // turn: finishing an execution SUCCEEDED at a commit writes the receipt such a turn writes, which carries no record.
+  if (options.commitloreReceipts !== false) {
+    const finishExecution = cp.tasks.finishExecution.bind(cp.tasks);
+    Object.defineProperty(cp.tasks, "finishExecution", {
+      configurable: true,
+      writable: true,
+      value: (...args: Parameters<typeof finishExecution>) => {
+        const finished = finishExecution(...args);
+        const head = /^sha256:([0-9a-f]{40,64})$/.exec(args[1].resultDigest ?? "")?.[1];
+        // A result digest that names a commit of the repository the execution ran in; a witness that seeds its own receipt, under
+        // a digest of its own, is not given a second.
+        const checkout = finished.allowed
+          ? cp.db.get<{ checkout_path: string }>(
+              `SELECT r.checkout_path FROM task_executions e JOIN repositories r ON r.repository_id = e.repository_id WHERE e.execution_id = ?`,
+              [finished.value.executionId],
+            )?.checkout_path ?? repoPath
+          : repoPath;
+        const names = head !== undefined && (() => { try { return execFileSync("git", ["cat-file", "-t", head], { cwd: checkout, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 30_000 }).trim() === "commit"; } catch { return false; } })();
+        const receipted = finished.allowed && cp.audit.byKind(WorkerTurnEvent.SUCCEEDED).some((row) => row.evidence["executionId"] === finished.value.executionId);
+        if (finished.allowed && args[1].status === "SUCCEEDED" && head !== undefined && names && !receipted) {
+          cp.audit.record({
+            kind: WorkerTurnEvent.SUCCEEDED,
+            runId: finished.value.runId,
+            sessionId: finished.value.workerSessionId,
+            evidence: {
+              executionId: finished.value.executionId,
+              resultDigest: args[1].resultDigest,
+              taskId: finished.value.taskId,
+              commitHead: head,
+              commitlore: { outcome: "empty", recordIds: [], nonce: null },
+            },
+          });
+        }
+        return finished;
+      },
+    });
+  }
+
+  if (options.commitloreReceipts !== false) {
+    // A fixture that commits again after its worker's turn, with plain git, stands in for a worker's further turn: the
+    // freeze names the first commit no receipt accounts for, and the fixture's worker turn that made it is recorded.
+    const freeze = cp.pipeline.freeze.bind(cp.pipeline);
+    Object.defineProperty(cp.pipeline, "freeze", {
+      configurable: true,
+      writable: true,
+      value: async (...args: Parameters<typeof freeze>): ReturnType<typeof freeze> => {
+        for (let turns = 0; ; turns += 1) {
+          const frozen = await freeze(...args);
+          const named = frozen.allowed ? null : (frozen.evidence as { commit?: unknown; refusal?: unknown; repositoryIdentity?: unknown });
+          if (
+            frozen.allowed ||
+            frozen.reasonCode !== ReasonCode.CANDIDATE_FOREIGN_COMMIT ||
+            (named?.refusal !== "NOT_A_RUN_WORKER_COMMIT" && named?.refusal !== "MERGE_NOT_CHECKED") ||
+            typeof named.commit !== "string" ||
+            typeof named.repositoryIdentity !== "string" ||
+            turns >= 8
+          ) {
+            return frozen;
+          }
+          const [runId] = args;
+          const run = cp.runs.get(runId);
+          const repository = cp.db.get<{ repository_id: string }>(`SELECT repository_id FROM repositories WHERE identity = ?`, [named.repositoryIdentity]);
+          const submitted = cp.tasks.submit(runId, [{ key: `fixture-turn-${turns}-${named.commit.slice(0, 8)}`, title: "a further fixture worker turn", category: "implementation" }]);
+          if (run === null || run === undefined || repository === undefined) return frozen;
+          if (!submitted.allowed) {
+            // The run takes no more tasks (its review is done): the fixture's further turn is one more attempt of a task that
+            // has one, a copy of its last SUCCEEDED execution that names this commit.
+            const last = cp.db.get<Record<string, unknown>>(
+              `SELECT * FROM task_executions WHERE run_id = ? AND status = 'SUCCEEDED' AND repository_id = ? ORDER BY started_at DESC, attempt DESC LIMIT 1`,
+              [runId, repository.repository_id],
+            );
+            if (last === undefined) return frozen;
+            const attempt = cp.db.get<{ next: number }>(`SELECT MAX(attempt) + 1 AS next FROM task_executions WHERE task_id = ?`, [last["task_id"]])!.next;
+            const executionId = `${String(last["execution_id"]).replace(/#\d+$/, "")}#${attempt}`;
+            const resultDigest = `sha256:${named.commit}`;
+            const copy: Record<string, unknown> = { ...last, execution_id: executionId, attempt, result_digest: resultDigest };
+            const columns = Object.keys(copy);
+            cp.db.run(`INSERT INTO task_executions (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`, columns.map((column) => copy[column]));
+            cp.audit.record({
+              kind: WorkerTurnEvent.SUCCEEDED,
+              runId,
+              sessionId: String(last["worker_session_id"]),
+              evidence: {
+                executionId, resultDigest, taskId: last["task_id"], commitHead: named.commit,
+                commitlore: { outcome: "empty", recordIds: [], nonce: null },
+              },
+            });
+            continue;
+          }
+          const task = submitted.value[0]!;
+          const execution = cp.tasks.startExecution({
+            runId,
+            taskId: task.taskId,
+            ownerBindingGeneration: run.ownerBindingGeneration!,
+            workerSessionId: bindWorkerForTask(cp, task.taskId),
+            provider: "scripted",
+            model: "scripted-worker",
+            repositoryId: repository.repository_id,
+          });
+          if (!execution.allowed) return frozen;
+          cp.tasks.finishExecution(execution.value.executionId, { status: "SUCCEEDED", resultDigest: `sha256:${named.commit}` });
+        }
+      },
+    });
+  }
 
   return { cp, clock, scripted, repoPath, root, buzz, buzzAdapter: adapter };
 };
@@ -409,10 +523,10 @@ export const startWorkBranch = (repoPath: string, branch: string = "task/T1-app"
 };
 
 /** The change that makes `verify.js` pass. */
-export const applyPassingChange = (repoPath: string, branch?: string): string => {
+export const applyPassingChange = (repoPath: string, branch?: string, message = "make app() return 2"): string => {
   startWorkBranch(repoPath, branch);
   writeFiles(repoPath, { "src/app.js": "module.exports = () => 2;\n" });
-  return commitAll(repoPath, "make app() return 2");
+  return commitAll(repoPath, message);
 };
 
 /** A change that leaves `verify.js` failing. */
@@ -474,6 +588,11 @@ export const driveToReviewedCandidate = async (
     /** A project whose repository was registered by the bootstrap activation path. */
     registeredProject?: { projectId: string; repositoryId: string; identity: string };
     manifestOverrides?: Partial<ProjectManifest>;
+    /**
+     * #1268 — a record the candidate's commit carries (its `Record-Id` and the trailers of its block), which its worker
+     * receipt then names, for a witness of what a governed run does with the note that mirrors it.
+     */
+    commitRecord?: { id: string; trailers: string };
   } = {},
 ): Promise<{
   projectId: string;
@@ -540,14 +659,32 @@ export const driveToReviewedCandidate = async (
   });
   if (!execution.allowed) throw new Error(execution.message);
 
-  const head = applyPassingChange(harness.repoPath, workBranch);
+  const head = applyPassingChange(
+    harness.repoPath,
+    workBranch,
+    options.commitRecord === undefined ? undefined : `make app() return 2\n\n${options.commitRecord.trailers}\nRecord-Id: ${options.commitRecord.id}`,
+  );
+  if (options.commitRecord !== undefined) {
+    harness.cp.audit.record({
+      kind: WorkerTurnEvent.SUCCEEDED,
+      runId,
+      sessionId: workerSessionId,
+      evidence: {
+        executionId: execution.value.executionId,
+        resultDigest: `sha256:${head}`,
+        taskId: impl.taskId,
+        commitHead: head,
+        commitlore: { outcome: "recorded", recordIds: [options.commitRecord.id], nonce: "capture-nonce" },
+      },
+    });
+  }
   harness.cp.tasks.finishExecution(execution.value.executionId, {
     status: "SUCCEEDED",
     resultDigest: `sha256:${head}`,
   });
-  // #1268 — a run whose contract requires CommitLore freezes only commits a worker receipt accounts for: the
-  // receipt a CommitLore-settled turn writes for this commit, which carries no record.
-  if (commitloreGoverned(harness.cp.db, runId)) {
+  // #1268 — the head's own turn is receipted by `finishExecution` unless the witness seeds its receipts itself
+  // (`commitloreReceipts: false`), when the receipt a CommitLore-settled turn writes for this head is written here.
+  if (!harness.cp.audit.byKind(WorkerTurnEvent.SUCCEEDED).some((row) => row.evidence["executionId"] === execution.value.executionId)) {
     harness.cp.audit.record({
       kind: WorkerTurnEvent.SUCCEEDED,
       runId,

@@ -77,6 +77,11 @@ const errorText = (error: unknown): string => (error instanceof Error ? error.me
  *    into place; a path there that is not a worker clone made from this clone is refused and left as it is;
  * 4. in one transaction the registry names the worker clone, the repository's HELD worktree claims
  *    follow it, and `REPOSITORY_CHECKOUT_MOVED` records from where to where.
+ *
+ * #1268 — CommitLore's notes mirror goes with it: a managed turn is refused when its checkout has a remote and no
+ * mirror ("notes unfetched"), so the notes refs, the fetch refspec for them and the record that the remote's mirror
+ * was looked for (`commitlore.notesabsence.*`, what `commitlore doctor --fix` writes) are carried over when the
+ * worker clone is made, and again on a later pass for a worker clone made before this, while no turn runs in it.
  */
 export class WorkerCheckouts {
   readonly #lastRefusal = new Map<string, string>();
@@ -89,14 +94,15 @@ export class WorkerCheckouts {
     private readonly authority: RepairWorktreeAuthority,
   ) {}
 
-  /** Every resident repository still registered at its clone, moved. Never throws. */
+  /** Every resident repository still registered at its clone, moved; one already at its worker clone has its notes mirror refreshed. Never throws. */
   async ensureAll(): Promise<Array<{ repositoryId: string; outcome: Decision<string> }>> {
     const outcomes: Array<{ repositoryId: string; outcome: Decision<string> }> = [];
     for (const resident of residentRepositories(this.db)) {
-      if (canonical(resident.checkoutPath) !== resident.clonePath) continue;
+      const moved = canonical(resident.checkoutPath) === resident.workerCheckoutPath;
+      if (canonical(resident.checkoutPath) !== resident.clonePath && !moved) continue;
       let outcome: Decision<string>;
       try {
-        outcome = await this.move(resident);
+        outcome = moved ? await this.refreshNotes(resident) : await this.move(resident);
       } catch (error) {
         outcome = deny(ReasonCode.INTERNAL_ERROR, "the worker checkout could not be made", {
           identity: resident.identity,
@@ -110,9 +116,9 @@ export class WorkerCheckouts {
     return outcomes;
   }
 
-  private async move(resident: ResidentRepository): Promise<Decision<string>> {
-    const { clonePath: clone, workerCheckoutPath: worker } = resident;
-    const running = this.db.get<{ execution_id: string }>(
+  /** A turn of this repository that has not ended: its git dir is held to a baseline, so it is not written meanwhile. */
+  private runningTurn(resident: ResidentRepository): { execution_id: string } | undefined {
+    return this.db.get<{ execution_id: string }>(
       `SELECT e.execution_id FROM task_executions e
          JOIN tasks t ON t.task_id = e.task_id
          JOIN run_repositories rr ON rr.run_id = t.run_id
@@ -121,6 +127,116 @@ export class WorkerCheckouts {
         ORDER BY e.execution_id LIMIT 1`,
       [resident.repositoryId],
     );
+  }
+
+  /**
+   * #1268 — the worker clone a repository is already registered at, with the resident clone's CommitLore notes
+   * mirror carried into it, unless a turn of the repository has not ended. Only a clone this control plane made from
+   * that resident clone is written; the resident's clone is only read.
+   */
+  private async refreshNotes(resident: ResidentRepository): Promise<Decision<string>> {
+    const { clonePath: clone, workerCheckoutPath: worker } = resident;
+    if (this.runningTurn(resident) !== undefined) return allow(ReasonCode.OK, worker);
+    const made = lstatOrNull(join(worker, ".git"))?.isDirectory() === true
+      ? await git(worker, ["config", "--local", "--get", MADE_FROM], { allowFailure: true })
+      : null;
+    if (made?.exitCode !== 0 || made.stdout.trim() !== clone) return allow(ReasonCode.OK, worker);
+    // Nothing is authorised, and nothing written, on a pass that finds the worker clone already holding all of it.
+    if (!(await this.notesMissing(clone, worker))) return allow(ReasonCode.OK, worker);
+    const authorised = await this.guard.authorize(
+      {
+        operation: WriteOperation.GIT_WORKTREE,
+        worktreeAction: WorktreeAction.ADD,
+        targetPath: worker,
+        targetWorktreeId: worker,
+        repositoryIdentity: resident.identity,
+        repairWorktreeAuthority: this.authority,
+        actor: "worker-checkout",
+      },
+      async () => {
+        await this.carryNotes(clone, worker);
+      },
+    );
+    return authorised.allowed ? allow(ReasonCode.OK, worker) : (authorised as Decision<never>);
+  }
+
+  /** A repository's CommitLore notes refs, each with the object it names. */
+  private async notesRefsOf(repo: string): Promise<Array<{ ref: string; oid: string }>> {
+    const programs = await withoutRepositoryPrograms(repo);
+    const listed = await git(repo, [...programs, "for-each-ref", "--format=%(refname) %(objectname)", "refs/notes/"], { allowFailure: true });
+    return listed.stdout.split("\n").filter((line) => line.length > 0).map((line) => ({ ref: line.slice(0, line.indexOf(" ")), oid: line.slice(line.indexOf(" ") + 1) }));
+  }
+
+  /** The fetch refspecs for notes on origin, and the records that origin's mirror was looked for, that `repo` has. */
+  private async notesConfigOf(repo: string): Promise<{ specs: string[]; absence: string[] }> {
+    const programs = await withoutRepositoryPrograms(repo);
+    const out = async (args: readonly string[]): Promise<string[]> =>
+      (await git(repo, [...programs, "config", "--local", ...args], { allowFailure: true })).stdout.split("\n").filter((line) => line.length > 0);
+    return {
+      specs: (await out(["--get-all", "remote.origin.fetch"])).filter((spec) => /^\+?refs\/notes\//.test(spec)),
+      absence: await out(["--get-regexp", "^commitlore\\.notesabsence\\."]),
+    };
+  }
+
+  /** Whether `worker` lacks any of what `clone` has of the notes mirror. A notes ref the worker is ahead of or has merged is not lacking. */
+  private async notesMissing(clone: string, worker: string): Promise<boolean> {
+    const into = await withoutRepositoryPrograms(worker);
+    for (const { ref, oid } of await this.notesRefsOf(clone)) {
+      const held = (await git(worker, [...into, "rev-parse", "--verify", "-q", ref], { allowFailure: true })).stdout.trim();
+      if (held === oid) continue;
+      if (held === "") return true;
+      const contains = await git(worker, [...into, "merge-base", "--is-ancestor", oid, held], { allowFailure: true });
+      if (contains.exitCode !== 0) return true;
+    }
+    const wanted = await this.notesConfigOf(clone);
+    const have = await this.notesConfigOf(worker);
+    return wanted.specs.some((spec) => !have.specs.includes(spec)) || wanted.absence.some((line) => !have.absence.includes(line));
+  }
+
+  /**
+   * CommitLore's notes mirror, as `clone` has it, in `worker`: the notes refs, the fetch refspec for them on origin,
+   * and the record that origin's mirror was looked for. Idempotent, and it never takes a note from the worker: a notes ref
+   * the worker lacks is fetched, one it is ahead of is left, one behind is moved forward, and one both have added to is
+   * merged (`git notes merge -s union`), so what a worker turn captured in its own clone is kept. `clone` is only read.
+   */
+  private async carryNotes(clone: string, worker: string): Promise<void> {
+    const into = await withoutRepositoryPrograms(worker);
+    const quiet = ["-c", "gc.auto=0", "-c", "maintenance.auto=false"];
+    for (const { ref, oid } of await this.notesRefsOf(clone)) {
+      const held = (await git(worker, [...into, "rev-parse", "--verify", "-q", ref], { allowFailure: true })).stdout.trim();
+      if (held === oid) continue;
+      const fetch = (refspec: string) =>
+        git(worker, [...into, ...quiet, "fetch", "--quiet", "--no-write-fetch-head", "--no-tags", "--no-recurse-submodules", clone, refspec]);
+      if (held === "") {
+        await fetch(`${ref}:${ref}`);
+        continue;
+      }
+      const carrying = `refs/acp/notes-carry/${ref.slice("refs/notes/".length).replace(/[^A-Za-z0-9._-]/g, "_")}`;
+      await fetch(`+${ref}:${carrying}`);
+      try {
+        const behind = await git(worker, [...into, "merge-base", "--is-ancestor", oid, held], { allowFailure: true });
+        if (behind.exitCode === 0) continue;
+        const ahead = await git(worker, [...into, "merge-base", "--is-ancestor", held, oid], { allowFailure: true });
+        if (ahead.exitCode === 0) await git(worker, [...into, "update-ref", "-m", "agent-control-plane: the worker checkout follows the resident's notes", ref, oid, held]);
+        else await git(worker, [...into, "-c", "user.name=agent-control-plane", "-c", "user.email=acp@localhost", "notes", `--ref=${ref}`, "merge", "-s", "union", carrying]);
+      } finally {
+        await git(worker, [...into, "update-ref", "-d", carrying], { allowFailure: true });
+      }
+    }
+    const have = await this.notesConfigOf(worker);
+    const wanted = await this.notesConfigOf(clone);
+    for (const spec of wanted.specs) {
+      if (!have.specs.includes(spec)) await git(worker, [...into, "config", "--local", "--add", "remote.origin.fetch", spec]);
+    }
+    for (const line of wanted.absence) {
+      const at = line.indexOf(" ");
+      if (at > 0) await git(worker, [...into, "config", "--local", line.slice(0, at), line.slice(at + 1)]);
+    }
+  }
+
+  private async move(resident: ResidentRepository): Promise<Decision<string>> {
+    const { clonePath: clone, workerCheckoutPath: worker } = resident;
+    const running = this.runningTurn(resident);
     if (running) {
       return deny(ReasonCode.CONFLICT, "a worker turn has not ended in the resident's checkout; the move waits for it", {
         identity: resident.identity,
@@ -252,6 +368,7 @@ export class WorkerCheckouts {
     // names the repository's own remote, the URL the resident clone has.
     await git(staging, ["remote", "remove", "origin"]);
     if (origin.exitCode === 0 && origin.stdout.trim().length > 0) await git(staging, ["remote", "add", "origin", origin.stdout.trim()]);
+    await this.carryNotes(clone, staging);
     for (const [key, value] of [["gc.auto", "0"], ["maintenance.auto", "false"], [MADE_FROM, clone]] as const) {
       await git(staging, ["config", "--local", key, value]);
     }

@@ -3,7 +3,7 @@ import { mkdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 
 import { bootstrapActivationHandoff, currentBootstrapPlan, executablePlanOf, planForSubmission } from "../../src/bootstrap/bootstrap-plan.ts";
-import { produceRepoFactoryResult } from "../../src/bootstrap/repo-factory-producer.ts";
+import { produceRepoFactoryResult } from "../helpers/repo-factory-produce.ts";
 import type { RepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
 import { submittedPlanSchema } from "../../src/bootstrap/plan-input-schema.ts";
 import { digestOf } from "../../src/core/digest.ts";

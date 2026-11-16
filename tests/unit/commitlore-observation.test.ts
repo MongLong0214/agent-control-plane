@@ -12,7 +12,6 @@ import {
   commitloreActivationGate,
   commitloreChildEnvironment,
   commitloreObservationPath,
-  commitloreRequired,
   createCommitLoreCliPort,
   judgeCommitLoreRuns,
   verifyCommitLoreBinding,
@@ -298,36 +297,18 @@ describe("#1268: a warning-only init exit 1 is initialization done, its final ch
   });
 });
 
-describe("#246 B3: the activation gate per mode", () => {
-  it("required: refused without a passing CommitLore row at the fact's head, admitted with one", () => {
-    expect(commitloreActivationGate("required", resultWith([CLEAN]), FACTS)).toMatchObject({
+describe("#246 B3: the activation gate", () => {
+  it("refused without a passing CommitLore row at the fact's head, admitted with one", () => {
+    expect(commitloreActivationGate(resultWith([CLEAN]), FACTS)).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.VERIFICATION_GAP,
       evidence: { refusal: "COMMITLORE_REQUIRED_NOT_OBSERVED", commitloreMode: "required" },
     });
     // A row at another head, or for another repository, is not the published head's verification.
-    expect(commitloreActivationGate("required", resultWith([CLEAN, { ...OBSERVED, exactHead: "b".repeat(40) }]), FACTS).allowed).toBe(false);
-    expect(commitloreActivationGate("required", resultWith([CLEAN, { ...OBSERVED, repositoryIdentity: "github:acme/other" }]), FACTS).allowed).toBe(false);
-    expect(commitloreActivationGate("required", resultWith([CLEAN, OBSERVED]), FACTS)).toMatchObject({ allowed: true, value: { observed: true } });
-    expect(commitloreActivationGate("required", resultWith([CLEAN, OBSERVED]), [])).toMatchObject({ allowed: false });
-  });
-
-  it("preferred and off: admitted either way, saying whether CommitLore was observed", () => {
-    expect(commitloreActivationGate("preferred", resultWith([CLEAN]), FACTS)).toMatchObject({ allowed: true, value: { observed: false } });
-    expect(commitloreActivationGate("preferred", resultWith([CLEAN, OBSERVED]), FACTS)).toMatchObject({ allowed: true, value: { observed: true } });
-    expect(commitloreActivationGate("off", resultWith([CLEAN]), FACTS)).toMatchObject({ allowed: true, value: { observed: false } });
-  });
-
-  it("an unsupported or missing value past the manifest contract is held to required, never lowered to preferred", () => {
-    for (const mode of ["mandatory", "", undefined, null, "Required"]) {
-      expect(commitloreRequired(mode), String(mode)).toBe(true);
-      expect(commitloreActivationGate(mode, resultWith([CLEAN]), FACTS), String(mode)).toMatchObject({
-        allowed: false,
-        evidence: { refusal: "COMMITLORE_REQUIRED_NOT_OBSERVED" },
-      });
-    }
-    expect(commitloreRequired("preferred")).toBe(false);
-    expect(commitloreRequired("off")).toBe(false);
+    expect(commitloreActivationGate(resultWith([CLEAN, { ...OBSERVED, exactHead: "b".repeat(40) }]), FACTS).allowed).toBe(false);
+    expect(commitloreActivationGate(resultWith([CLEAN, { ...OBSERVED, repositoryIdentity: "github:acme/other" }]), FACTS).allowed).toBe(false);
+    expect(commitloreActivationGate(resultWith([CLEAN, OBSERVED]), FACTS)).toMatchObject({ allowed: true, value: { observed: true } });
+    expect(commitloreActivationGate(resultWith([CLEAN, OBSERVED]), [])).toMatchObject({ allowed: false });
   });
 });
 
@@ -375,9 +356,8 @@ describe("review S11-R1-03: a CommitLore row is bound to the record its attempt 
     const written = writeCommitLoreObservationRecord(workDir, binding, pass);
     expect(written.allowed, JSON.stringify(written)).toBe(true);
     const path = commitloreObservationPath(workDir, binding.checkoutPath);
-    const verify = (overrides: { mode?: unknown; rows?: RepoFactoryResult["bootstrapVerification"]; expected?: Partial<CommitLoreBinding> } = {}) =>
+    const verify = (overrides: { rows?: RepoFactoryResult["bootstrapVerification"]; expected?: Partial<CommitLoreBinding> } = {}) =>
       verifyCommitLoreBinding({
-        mode: "mode" in overrides ? overrides.mode : "required",
         result: resultWith(overrides.rows ?? [CLEAN, OBSERVED]),
         workDir,
         expected: { ...binding, ...overrides.expected },
@@ -422,17 +402,11 @@ describe("review S11-R1-03: a CommitLore row is bound to the record its attempt 
     expect(binding.head).toBe(HEAD);
   });
 
-  it("refuses a missing row under required, a second row at another head, and an unrecorded row under preferred", () => {
+  it("refuses a missing row, a second row at another head, and a row with no record", () => {
     const { verify } = setup();
     expect(verify({ rows: [CLEAN] })).toMatchObject(unbound);
     expect(verify({ rows: [CLEAN, OBSERVED, { ...OBSERVED, exactHead: HEAD2 }] })).toMatchObject(unbound);
-    // An unsupported or missing mode is held to required.
-    expect(verify({ mode: "mandatory", rows: [CLEAN] })).toMatchObject(unbound);
-    expect(verify({ mode: undefined, rows: [CLEAN] })).toMatchObject(unbound);
-    // Preferred and off with no row ask for nothing; with a row, the row must still be bound.
-    expect(verify({ mode: "preferred", rows: [CLEAN] })).toMatchObject({ allowed: true });
-    expect(verify({ mode: "off", rows: [CLEAN] })).toMatchObject({ allowed: true });
-    expect(verify({ mode: "preferred", expected: { checkoutPath: "/nowhere/primary.attempt-9" } })).toMatchObject(unbound);
+    expect(verify({ expected: { checkoutPath: "/nowhere/primary.attempt-9" } })).toMatchObject(unbound);
   });
 
   it("refuses a report its digest does not name, a report that does not pass, and a record that is not this account's whole record", () => {

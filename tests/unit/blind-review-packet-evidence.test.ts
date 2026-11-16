@@ -148,8 +148,10 @@ describe("frozen candidate packet evidence", () => {
       expect(prompt).toContain("publish the candidate branch, prepare its PR and merge, then verify CI");
       expect(prompt).toContain("exact merge commit SHA");
       expect(prompt).toContain("These obligations remain pending");
+      // The worker's receipt, which every run now has (#1268), is the execution evidence's own line and names its session.
+      const withoutExecutionEvidence = prompt.split("\n").filter((line) => !line.startsWith('{"executionId":')).join("\n");
       for (const secret of [worker, run.ownerSessionId!, "scripted-worker", "private producer self-assessment", "prior-verdict-marker"]) {
-        expect(prompt).not.toContain(secret);
+        expect(withoutExecutionEvidence).not.toContain(secret);
       }
       const latest = harness.cp.artifacts.latest<ReviewPacket>(run.runId, ArtifactKind.BLIND_REVIEW)!;
       expect(latest.content.verdict).toBe("PASS");

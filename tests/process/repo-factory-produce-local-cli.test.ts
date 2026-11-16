@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rm } from "node:fs/promises";
@@ -20,6 +20,28 @@ import type { RepoFactoryPlanFixture } from "../../src/bootstrap/repo-factory-pr
 const execFileAsync = promisify(execFile);
 const TSX_ENTRY = join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
 const CLI_ENTRY = join(process.cwd(), "scripts", "repo-factory-produce-local.ts");
+
+/** The real CLI: `ACP_TEST_REAL_COMMITLORE`, else the first `commitlore` on PATH; null when there is neither. */
+const realCommitLore = (): string | null => {
+  const explicit = process.env["ACP_TEST_REAL_COMMITLORE"];
+  if (explicit !== undefined && explicit !== "") return explicit;
+  for (const directory of (process.env["PATH"] ?? "").split(":").filter((entry) => entry.startsWith("/"))) {
+    try {
+      accessSync(join(directory, "commitlore"), constants.X_OK);
+      return join(directory, "commitlore");
+    } catch {
+      // not here
+    }
+  }
+  return null;
+};
+const REAL = realCommitLore();
+
+/** #1268 — the producer commits through CommitLore or not at all, so a run that is to commit pins the real CLI. */
+const withCommitLore = (): { cwd: string; env: NodeJS.ProcessEnv } => ({
+  cwd: process.cwd(),
+  env: { ...process.env, ...(REAL === null ? {} : { ACP_COMMITLORE_BINARY: REAL }) },
+});
 
 const sandboxes: string[] = [];
 
@@ -56,7 +78,18 @@ const writePlan = (sandbox: string, plan: RepoFactoryPlanFixture): string => {
 };
 
 describe("repo-factory:produce-local CLI (#246)", () => {
-  it("produces a RepoFactoryResult through the real canonical parser when spawned as a subprocess", async () => {
+  it("#1268 — refuses, naming CommitLore, when no CommitLore is pinned: nothing is committed with plain git", async () => {
+    const sandbox = makeSandbox();
+    const planPath = writePlan(sandbox, basePlan());
+    const workDir = join(sandbox, "workdir");
+    const { ACP_COMMITLORE_BINARY: _unpinned, ...env } = process.env;
+
+    await expect(
+      execFileAsync(process.execPath, [TSX_ENTRY, CLI_ENTRY, `--plan=${planPath}`, `--work-dir=${workDir}`], { cwd: process.cwd(), env }),
+    ).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("ACP_COMMITLORE_BINARY NOT_CONFIGURED") });
+  });
+
+  it.skipIf(REAL === null)("produces a RepoFactoryResult through the real canonical parser when spawned as a subprocess", async () => {
     const sandbox = makeSandbox();
     const planPath = writePlan(sandbox, basePlan());
     const workDir = join(sandbox, "workdir");
@@ -64,7 +97,7 @@ describe("repo-factory:produce-local CLI (#246)", () => {
     const { stdout } = await execFileAsync(
       process.execPath,
       [TSX_ENTRY, CLI_ENTRY, `--plan=${planPath}`, `--work-dir=${workDir}`],
-      { cwd: process.cwd() },
+      withCommitLore(),
     );
 
     const printed = JSON.parse(stdout) as unknown;
@@ -131,7 +164,7 @@ describe("repo-factory:produce-local CLI (#246)", () => {
     expect(readdirSync(outsideTarget)).toEqual([]);
   });
 
-  it("CEO review round 5, defect 2 — two real concurrent processes creating the same checkout: exactly one succeeds, decided by the kernel, not a check either process could race between", async () => {
+  it.skipIf(REAL === null)("CEO review round 5, defect 2 — two real concurrent processes creating the same checkout: exactly one succeeds, decided by the kernel, not a check either process could race between", async () => {
     // Real, separate OS processes — genuine concurrency a single Node event loop cannot
     // reproduce. Reproduced directly against commit 7d6b580 (the previous, recursive-mkdir
     // shape) before this fix: two such processes racing the same path did not deterministically
@@ -148,9 +181,7 @@ describe("repo-factory:produce-local CLI (#246)", () => {
     writeFileSync(planBPath, JSON.stringify({ ...basePlan(), bootstrapOperationId: "bootstrap_246_cli_concurrent_b" }));
 
     const spawn = (planPath: string) =>
-      execFileAsync(process.execPath, [TSX_ENTRY, CLI_ENTRY, `--plan=${planPath}`, `--work-dir=${workDir}`], {
-        cwd: process.cwd(),
-      });
+      execFileAsync(process.execPath, [TSX_ENTRY, CLI_ENTRY, `--plan=${planPath}`, `--work-dir=${workDir}`], withCommitLore());
 
     const [a, b] = await Promise.allSettled([spawn(planAPath), spawn(planBPath)]);
     const outcomes = [a, b];

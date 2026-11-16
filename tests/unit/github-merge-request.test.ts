@@ -11,7 +11,7 @@ const BASE = "b".repeat(40);
  * #1269 — the real mergeExecute through its PUT, with authorization already satisfied. The transport stops
  * at that boundary: these tests make no claim about post-merge proof or auth.
  */
-const fixture = (mergeStrategy: MergeInput["mergeStrategy"], compared = "ahead") => {
+const fixture = (mergeStrategy: MergeInput["mergeStrategy"], compared = "ahead", governed = true) => {
   const input: MergeInput = {
     runId: "test-run",
     repositoryIdentity: "github:example/project",
@@ -48,16 +48,29 @@ const fixture = (mergeStrategy: MergeInput["mergeStrategy"], compared = "ahead")
     writeTarget: () => allow(ReasonCode.OK, {}),
     reserveReceipt: reserve,
     mediate: async (...args: unknown[]) => (args.at(-1) as () => Promise<unknown>)(),
+    // #1268 — whether the run pins a manifest, which governs it; and CommitLore, which passes every message.
+    db: { get: () => (governed ? { pinned_manifest_digest: "sha256:pinned" } : undefined) },
+    repositories: { byIdentity: () => ({ checkoutPath: "/checkout" }) },
+    audit: { record: () => allow(ReasonCode.OK, undefined) },
+    checkMergeCommit: async () => allow(ReasonCode.OK, undefined),
   });
   return { execute: () => kernel.mergeExecute(input), calls, reserve, putReached };
 };
 
 describe("the merge request is a merge commit and nothing else (#1269)", () => {
-  it("sends exactly the head fence and merge_method merge, and composes no message", async () => {
-    const test = fixture("merge_commit");
+  it("of a run no CommitLore governs, sends exactly the head fence and merge_method merge, and composes no message", async () => {
+    const test = fixture("merge_commit", "ahead", false);
     await expect(test.execute()).rejects.toBe(test.putReached);
     expect(test.calls.filter((call) => call.method === "PUT").map((call) => call.body)).toEqual([{ sha: HEAD, merge_method: "merge" }]);
     expect(test.calls.some((call) => call.path.includes("/commits"))).toBe(false);
+  });
+
+  it("of a governed run (#1268), sends the head fence, merge_method merge and the message CommitLore checked, composed from nothing of the branch", async () => {
+    const test = fixture("merge_commit");
+    await expect(test.execute()).rejects.toBe(test.putReached);
+    expect(test.calls.filter((call) => call.method === "PUT").map((call) => call.body)).toEqual([
+      { sha: HEAD, merge_method: "merge", commit_title: "Merge pull request #100 from example/feature", commit_message: "Pull request #100: A reviewed change" },
+    ]);
   });
 
   it.each(["squash", "rebase", "fast_forward"] as const)("refuses a %s request before anything is reserved or sent", async (strategy) => {

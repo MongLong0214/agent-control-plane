@@ -410,7 +410,8 @@ export class FakeWorkerAdapter implements ProviderAdapter {
     const effect = authorised.value as { exitCode: number | null; stdout: string; sessionId?: string | null };
     return {
       ok: effect.exitCode === 0,
-      text: script.reply ?? "changed app.js",
+      // #1268 — a turn whose prompt carries CommitLore's contract is answered with the draft it asks for: nothing to record.
+      text: script.reply ?? (request.prompt.includes("commitlore-draft") ? "changed app.js\n\n```commitlore-draft\n{\"records\": []}\n```" : "changed app.js"),
       json: null,
       provider: "claude",
       model: request.model ?? "opus",

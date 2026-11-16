@@ -69,6 +69,24 @@ describe("#1268: the bootstrap commit is CommitLore's", () => {
     noGitHubCall(prepared);
   });
 
+  it.each(["preferred", "off"] as const)(
+    "a bootstrap whose manifest says %s is held to CommitLore all the same: with none that can commit, it is refused before anything is written",
+    async (mode) => {
+      const prepared = await prepareBootstrapRun(`cl-bootstrap-${mode}`, {
+        manifest: cleanTreeManifest(`cl-bootstrap-${mode}`, { commitlore: { mode } }),
+        ops: bootstrapOperations() as Operation[],
+        commitlore: { observe: async () => PASS },
+      });
+      const refused = await prepared.runner.produceAndActivate({ ...prepared.input, ownerApproval: ownerApprovalFor(prepared) });
+      expect(refused, JSON.stringify(refused)).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.VERIFICATION_GAP,
+        evidence: { refusal: "COMMITLORE_REQUIRED_UNOBSERVABLE", commitloreMode: "required" },
+      });
+      noGitHubCall(prepared);
+    },
+  );
+
   it("a CommitLore that refuses the commit leaves no commit, and nothing is written to GitHub", async () => {
     const refusing = async (): Promise<Decision<CommitLoreAttempt>> => {
       const double = await gitCommitAttempt()();
@@ -87,6 +105,27 @@ describe("#1268: the bootstrap commit is CommitLore's", () => {
 });
 
 describe("#1268: the genesis commit is CommitLore's", () => {
+  it("a producer call with no CommitLore is refused before anything is written, never committed with plain git", async () => {
+    const f = genesisPlanFixture();
+    const root = tempDir("cl-genesis-none-");
+    const port = new GenesisGitHub(root);
+    const result = await produceRepoFactoryResult({
+      plan: executablePlanOf(f.outputs, f.binding.planDigest),
+      workDir: join(root, "work"),
+      approvedFiles: f.outputs.files,
+      github: {
+        port,
+        authority: {
+          owner: "acme",
+          visibility: "public" as const,
+          approvedOperations: f.outputs.githubOperations.map(({ operationId, resourceIdentity, resourceType }) => ({ operationId, resourceIdentity, resourceType })),
+        },
+      },
+    });
+    expect(result, JSON.stringify(result)).toMatchObject({ allowed: false, evidence: { refusal: "COMMITLORE_REQUIRED_UNOBSERVABLE" } });
+    expect(existsSync(join(root, "work"))).toBe(false);
+  });
+
   it("a required genesis commit, on GitHub's initialization, is made by a CommitLore commit attempt with the bundle's message", async () => {
     const f = genesisPlanFixture();
     const root = tempDir("cl-genesis-");
@@ -104,7 +143,7 @@ describe("#1268: the genesis commit is CommitLore's", () => {
           approvedOperations: f.outputs.githubOperations.map(({ operationId, resourceIdentity, resourceType }) => ({ operationId, resourceIdentity, resourceType })),
         },
       },
-      commitlore: { mode: "required", port: { observe: async () => PASS, attempt: gitCommitAttempt(committed) } },
+      commitlore: { port: { observe: async () => PASS, attempt: gitCommitAttempt(committed) } },
     });
     expect(result.allowed, result.allowed ? "" : `${result.message} ${JSON.stringify(result.evidence)}`).toBe(true);
     expect(committed).toEqual([f.genesis.commitMessage]);
@@ -160,7 +199,7 @@ const emptyGenesis = async (commitlore: CommitLorePort, message?: string) => {
         approvedOperations: f.outputs.githubOperations.map(({ operationId, resourceIdentity, resourceType }) => ({ operationId, resourceIdentity, resourceType })),
       },
     },
-    commitlore: { mode: "required", port: commitlore },
+    commitlore: { port: commitlore },
   });
   return { result, port };
 };

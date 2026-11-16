@@ -277,7 +277,7 @@ export const bootstrapPlanPreflight = (input: {
   // approved and enforced where it can be observed: the runner refuses before anything is consumed or
   // written when CommitLore cannot be observed on this host, the producer verifies it in the checkout at
   // the published head, and activation refuses a result that does not carry that verification
-  // (`commitlore-observation.ts`). `preferred` activates named NOT_OBSERVED; `off` asks for nothing.
+  // (`commitlore-observation.ts`), whatever mode the manifest names (#1268).
   const command = manifest.verificationCommands[0];
   if (!genesis && manifest.verificationCommands.length !== 1) {
     return unsupported("this producer runs exactly one verification, and the manifest requires a different count", {
