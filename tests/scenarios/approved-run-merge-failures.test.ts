@@ -4,7 +4,8 @@ import { acpError, deny } from "../../src/core/errors.ts";
 import { sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
-import { ExecutionMode, RunState, Role, roleKeyFor } from "../../src/domain/types.ts";
+import { classifyPreMergeRefusal } from "../../src/daemon/finalizer.ts";
+import { ExecutionMode, RunKind, RunState, Role, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
 import { cleanupTempDirs, commitAll, gitSync, tempDir, writeFiles } from "../helpers/fixtures.ts";
@@ -251,6 +252,53 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
     expect(started.allowed).toBe(true);
     expectReturnedForRevision(fixture, RunState.MERGING, ReasonCode.MERGE_CONFLICT);
     await fixture.daemon.stop();
+  });
+
+  it("a publication the public-safety scan refuses returns the run for revision on the first refusal: no retry is scheduled and the approval is invalidated", async () => {
+    const fixture = await approved();
+    const publish = vi.spyOn(fixture.harness.cp.github, "publishBranch").mockResolvedValue(
+      deny(ReasonCode.BRANCH_PUBLISH_CONTENT_REFUSED, "the public-safety scan refused the publication; nothing was sent", { findingCount: 20 }),
+    );
+    const started = await fixture.daemon.start();
+    expect(started.allowed).toBe(true);
+    expect(publish).toHaveBeenCalledTimes(1);
+    expectReturnedForRevision(fixture, RunState.CEO_APPROVED, ReasonCode.BRANCH_PUBLISH_CONTENT_REFUSED);
+    expect(fixture.harness.cp.audit.forRun(fixture.driven.runId).filter((entry) => entry.kind === "FINALIZATION_RETRY_SCHEDULED")).toHaveLength(0);
+    fixture.harness.clock.advance(3 * 60 * MINUTE);
+    await fixture.daemon.resumeApprovedRuns();
+    expect(publish).toHaveBeenCalledTimes(1);
+    await fixture.daemon.stop();
+  });
+
+  it("the publication scan's refusals are a candidate defect for every kind but CONTRACT_CHANGE, which is handed to the CEO with no retry", () => {
+    for (const code of [ReasonCode.BRANCH_PUBLISH_CONTENT_REFUSED, ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED]) {
+      expect(classifyPreMergeRefusal(RunKind.STANDARD_WORK, deny(code, "refused", {}))).toEqual({ disposition: "REVISION" });
+      expect(classifyPreMergeRefusal(RunKind.CONTRACT_CHANGE, deny(code, "refused", {}))).toMatchObject({
+        disposition: "RETRY", failureClass: "OWNER_ACTION", failureCause: code, retries: 0, owner: "CEO",
+      });
+    }
+    // Not a defect of the candidate's content: GitHub's answer, or the contract.
+    expect(classifyPreMergeRefusal(RunKind.STANDARD_WORK, deny(ReasonCode.BRANCH_PUBLISH_OBJECT_MISMATCH, "refused", {})).disposition).toBe("RETRY");
+  });
+
+  it("a CEO FINAL_REVISE of the current candidate of a CEO_APPROVED run invalidates the approval and returns it to its CTO; another digest is refused (a landed merge receipt is refused by returnApprovedCandidate)", async () => {
+    const fixture = await approved();
+    const { harness, driven } = fixture;
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    const submit = (candidateSnapshotDigest: string) => harness.cp.ceo.submitCeoDecision({
+      runId: driven.runId, decision: "FINAL_REVISE", candidateSnapshotDigest, ceoSessionId: ceo.sessionId, rationale: "content scan refused the branch",
+    });
+    const other = submit("0".repeat(64));
+    expect(other.allowed).toBe(false);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
+    const revised = submit(driven.candidateSnapshotDigest);
+    expect(revised.allowed).toBe(true);
+    const run = harness.cp.runs.require(driven.runId);
+    expect(run.state).toBe(RunState.ACTIVE);
+    expect(harness.cp.runs.currentCandidate(driven.runId)).toBeNull();
+    expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CEO_APPROVAL_INVALIDATED")).toHaveLength(1);
+    expect(outboxOf(fixture, "REVISION_REQUEST")).toHaveLength(1);
+    expect(mergePuts(fixture)).toBe(0);
   });
 
   it("a declared check that failed on the candidate head returns the run for revision instead of a merge attempt", async () => {

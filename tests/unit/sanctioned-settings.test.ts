@@ -32,11 +32,19 @@ describe("the sanctioned settings override (#512)", () => {
     expect(parsed.enabledPlugins).toEqual({});
   });
 
+  it("blanks commit and pull-request attribution, so no session trailer reaches a commit the publication scan reads", () => {
+    const parsed = JSON.parse(__testing.sanctionedSettings()) as Record<string, unknown>;
+    expect(parsed["attribution"]).toEqual({ commit: "", pr: "" });
+    expect(parsed["includeCoAuthoredBy"]).toBe(false);
+  });
+
   it("carries no secret, because it is passed in argv where `ps` can read it", () => {
     // The condition that licenses passing this inline at all. If it ever stops holding, the
     // override has to go back to a file and #489's placement conflict comes back with it.
     const settings = __testing.sanctionedSettings();
-    expect(settings).toBe(JSON.stringify({ hooks: {}, enabledPlugins: {} }));
+    expect(settings).toBe(JSON.stringify({
+      hooks: {}, enabledPlugins: {}, attribution: { commit: "", pr: "" }, includeCoAuthoredBy: false,
+    }));
     expect(settings).not.toMatch(/token|secret|key|password|Bearer/i);
   });
 });

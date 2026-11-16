@@ -357,8 +357,13 @@ export const readCapacityFile = (
  * cleanup, no lifetime. Inline argv is safe here specifically because the value is a constant
  * with no secret in it; a settings blob that ever carried one would have to go back to a file and
  * the placement problem would come back with it.
+ *
+ * It also blanks the CLI's commit and pull-request attribution: a session's own link or co-author line in a
+ * commit message is a session trailer the branch publication scan refuses (BRANCH_PUBLISH_CONTENT_REFUSED), so
+ * a managed worker's commits must never carry one.
  */
-const sanctionedSettings = (): string => JSON.stringify({ hooks: {}, enabledPlugins: {} });
+const sanctionedSettings = (): string =>
+  JSON.stringify({ hooks: {}, enabledPlugins: {}, attribution: { commit: "", pr: "" }, includeCoAuthoredBy: false });
 
 /** #512 — the setting sources a WORKER turn reads: the claimed worktree's, never the operator's. */
 export const WORKER_SETTING_SOURCES = "project,local";

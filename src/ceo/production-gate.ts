@@ -641,7 +641,7 @@ export class ProductionGate {
    * between packet and confirm, the confirm is void rather than approximately right.
    */
   submitCeoDecision(input: CeoDecisionInput): Decision<{ state: RunState }> {
-    const reentry = this.contractChangeConsumerReentry(input) ?? this.approvedRunReentry(input);
+    const reentry = this.contractChangeConsumerReentry(input) ?? this.approvedRunReentry(input) ?? this.approvedRunRevision(input);
     if (reentry) return reentry;
     const admitted = this.admitCeoDecision(input, "decide");
     if (!admitted.allowed) return admitted as Decision<{ state: RunState }>;
@@ -837,6 +837,39 @@ export class ProductionGate {
       evidence: { candidateSnapshotDigest: input.candidateSnapshotDigest, state: run.state, rationale: input.rationale },
     });
     return allow(ReasonCode.OK, { state: run.state });
+  }
+
+  /**
+   * A CEO FINAL_REVISE of an ordinary run that is already CEO_APPROVED (or MERGING with nothing merged) is the CEO
+   * returning the approved candidate for revision, as a finalization refusal that no retry can fix does: the approval
+   * is invalidated and the run goes REVISION_REQUIRED, back to its CTO. `returnApprovedCandidate` refuses any digest
+   * but the current candidate's and any run holding a merge receipt. A CONTRACT_CHANGE (its one activation grant
+   * could never be confirmed again) and a bootstrap are not returned this way: null.
+   */
+  private approvedRunRevision(input: CeoDecisionInput): Decision<{ state: RunState }> | null {
+    if (input.decision !== "FINAL_REVISE") return null;
+    const run = this.runs.get(input.runId);
+    if (
+      !run || run.kind === RunKind.CONTRACT_CHANGE || run.kind === RunKind.PROJECT_BOOTSTRAP ||
+      (run.state !== RunState.CEO_APPROVED && run.state !== RunState.MERGING)
+    ) {
+      return null;
+    }
+    const continuity = this.assertCompletionAllowed(input.runId);
+    if (!continuity.allowed) return continuity as Decision<{ state: RunState }>;
+    const holds = this.assertCurrentCeo(input.ceoSessionId);
+    if (!holds.allowed) return holds as Decision<{ state: RunState }>;
+    const independence = this.bindings.assertFinalCeoIndependence(input.runId, input.ceoSessionId);
+    if (!independence.allowed) return independence as Decision<{ state: RunState }>;
+    const returned = this.runs.returnApprovedCandidate(input.runId, {
+      candidateSnapshotDigest: input.candidateSnapshotDigest,
+      attemptId: `ceo-final-revise:${input.ceoSessionId}`,
+      reasonCode: ReasonCode.OK,
+      reason: `CEO FINAL_REVISE of the approved candidate: ${input.rationale}`,
+      unrecoverable: false,
+    });
+    if (!returned.allowed) return returned as Decision<{ state: RunState }>;
+    return allow(ReasonCode.OK, { state: returned.value.state });
   }
 
   /**
