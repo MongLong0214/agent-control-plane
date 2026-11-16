@@ -103,10 +103,21 @@ beforeEach(clearMessagingEnv);
  * uid, to the relay and to the daemon alike; a path in `swappedEveryLook` reads as another inode at
  * each look; every other path reads as it is. Both empty unless a case fills them.
  */
-const forged = vi.hoisted(() => ({ foreignOwned: new Set<string>(), swappedEveryLook: new Set<string>(), looks: 0 }));
+const forged = vi.hoisted(() => ({
+  foreignOwned: new Set<string>(),
+  swappedEveryLook: new Set<string>(),
+  looks: 0,
+  /** A path that reads as absent once this many looks at it have been allowed: it vanished meanwhile. */
+  vanishAfter: new Map<string, number>(),
+}));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof NodeFs>();
   const lstatSync = ((path: string, options?: never) => {
+    const allowed = forged.vanishAfter.get(String(path));
+    if (allowed !== undefined) {
+      if (allowed <= 0) throw Object.assign(new Error(`ENOENT: no such file or directory, lstat '${String(path)}'`), { code: "ENOENT" });
+      forged.vanishAfter.set(String(path), allowed - 1);
+    }
     const stats = actual.lstatSync(path, options);
     if (stats === undefined) return stats;
     const overrides: PropertyDescriptorMap = {};
@@ -123,6 +134,7 @@ vi.mock("node:fs", async (importOriginal) => {
 afterEach(() => {
   forged.foreignOwned.clear();
   forged.swappedEveryLook.clear();
+  forged.vanishAfter.clear();
 });
 
 interface Wire {
@@ -1205,27 +1217,25 @@ describe("#1427 invariants: a canonical CTO session is woken by default, and an 
     return { dir, session };
   };
   /** The session registry Claude Code keeps: one `<pid>.json` per session. The relay's parent is the fixture's claude. */
+  // Claude Code's `procStart` is its native start in UTC, whole seconds; the relay reads the kernel's token for it.
   const CLAUDE_START = "Sun Nov 15 22:41:34 2026";
-  const CLAUDE_EXECUTABLE = { executable: "/Users/test/.local/share/claude/versions/2.1.323", argv0: "claude" };
+  const CLAUDE_TOKEN = "darwin-tv:1794782494.000000";
+  const CLAUDE_ARGV = ["/Users/test/.local/share/claude/versions/2.1.323", "--resume", CONVERSATION];
+  const RELAY_LINK = { pid: 4141, argv: ["/usr/bin/node", "agentctl", "attach"] as string[] | null, startToken: "darwin-tv:1794782999.000000" as string | null };
+  const claudeLink = (pid: number) => ({ pid, argv: CLAUDE_ARGV as string[] | null, startToken: CLAUDE_TOKEN as string | null });
   /**
-   * The session registry Claude Code keeps, one `<pid>.json` per session, and the process table the relay's ancestors
-   * are read from: `ancestry` is nearest first, and the real Claude is the one whose process says so.
+   * The session registry Claude Code keeps, one `<pid>.json` per session, and the process chain the relay walks up (itself
+   * first, then each parent, as the kernel reports them): the real Claude is the first whose argv is a Claude invocation.
    */
   const registryFor = (
     entry: { pid: number; sessionId: string; messagingSocketPath: string },
-    ancestry: Array<{ pid: number; executable: string; argv0: string; startedAt: string }> = [
-      { pid: entry.pid, ...CLAUDE_EXECUTABLE, startedAt: CLAUDE_START },
-    ],
+    ancestry: Array<{ pid: number; argv: string[] | null; startToken: string | null }> = [RELAY_LINK, claudeLink(entry.pid)],
     files: Array<Record<string, unknown>> = [{ ...entry, procStart: CLAUDE_START }],
   ): SessionRegistry => {
     const dir = mkdtempSync("/tmp/acpreg-");
     roots.push(dir);
     for (const file of files) writeFileSync(join(dir, `${String(file["pid"])}.json`), JSON.stringify(file));
-    return {
-      dir,
-      ancestors: () => ancestry.map((process) => process.pid),
-      processOf: (pid: number) => ancestry.find((process) => process.pid === pid) ?? null,
-    };
+    return { dir, chain: () => ancestry };
   };
   /**
    * What the stand-in session was sent that is not the relay's attach-time look at its socket (a connection
@@ -1445,8 +1455,9 @@ describe("#1427 invariants: a canonical CTO session is woken by default, and an 
       const registry = registryFor(
         { pid: CLAUDE, sessionId: CONVERSATION, messagingSocketPath: own.path },
         [
-          { pid: SHELL, executable: "/bin/zsh", argv0: "-zsh", startedAt: "Mon Nov 16 01:00:00 2026" },
-          { pid: CLAUDE, ...CLAUDE_EXECUTABLE, startedAt: CLAUDE_START },
+          RELAY_LINK,
+          { pid: SHELL, argv: ["-zsh"], startToken: "darwin-tv:1794786000.000000" },
+          claudeLink(CLAUDE),
         ],
         [forged, claudesOwn],
       );
@@ -1457,7 +1468,7 @@ describe("#1427 invariants: a canonical CTO session is woken by default, and an 
       const none = relay(f.paths, {
         entry: "command", stateDir: f.dir,
         sessionRegistry: registryFor({ pid: SHELL, sessionId: CONVERSATION, messagingSocketPath: foreign.path },
-          [{ pid: SHELL, executable: "/bin/zsh", argv0: "-zsh", startedAt: "Mon Nov 16 01:00:00 2026" }], [forged]),
+          [RELAY_LINK, { pid: SHELL, argv: ["-zsh"], startToken: "darwin-tv:1794786000.000000" }], [forged]),
       });
       expect(await settles(none.exit)).toBe(ATTACH_EXIT.USAGE);
       expect(none.err()).toContain("no-claude-ancestor");
@@ -1471,6 +1482,46 @@ describe("#1427 invariants: a canonical CTO session is woken by default, and an 
       expect(reused.err()).toContain("registry-entry-is-another-process");
       await pauseFor(100);
       expect(foreign.received).toEqual([]);
+      expect(f.daemon.endpoint()).toBeNull();
+    });
+
+    it("a shell whose argv[0] is -claude is not Claude: the daemon skips it, so a forged entry for it proves nothing", async () => {
+      const f = await started();
+      const { session: foreign } = await defaultSocketSession("foreign-dash");
+      const { session: own } = await defaultSocketSession("own-dash");
+      environmentOf(foreign.path);
+      const SHELL = 4343;
+      const forged = { pid: SHELL, sessionId: CONVERSATION, messagingSocketPath: foreign.path, procStart: "Mon Nov 16 01:00:00 2026" };
+      const registry = registryFor(
+        { pid: CLAUDE, sessionId: CONVERSATION, messagingSocketPath: own.path },
+        [RELAY_LINK, { pid: SHELL, argv: ["-claude"], startToken: "darwin-tv:1794786000.000000" }, claudeLink(CLAUDE)],
+        [forged, { pid: CLAUDE, sessionId: CONVERSATION, messagingSocketPath: own.path, procStart: CLAUDE_START }],
+      );
+      const r = relay(f.paths, { entry: "command", stateDir: f.dir, sessionRegistry: registry });
+      expect(await settles(r.exit)).toBe(ATTACH_EXIT.USAGE);
+      expect(r.err()).toContain("socket-is-not-the-sessions-registered-socket");
+      await pauseFor(100);
+      expect(foreign.received).toEqual([]);
+      expect(f.daemon.endpoint()).toBeNull();
+    });
+
+    it("an attach whose proxy cannot be opened because the socket vanished since it was looked at fails visibly, before any claim", async () => {
+      const f = await started();
+      const { session } = await defaultSocketSession("vanishes");
+      environmentOf(session.path);
+      // The attach's first look at the socket (is it a socket this uid owns) passes, the connection probe finds it listening,
+      // and by the time the proxy is made the name is gone.
+      forged.vanishAfter.set(session.path, 1);
+      const r = relay(f.paths, {
+        entry: "command", stateDir: f.dir,
+        sessionRegistry: registryFor({ pid: CLAUDE, sessionId: CONVERSATION, messagingSocketPath: session.path }),
+      });
+      expect(await settles(r.exit)).toBe(ATTACH_EXIT.USAGE);
+      expect(r.err()).toContain("attach: wake proxy not opened endpoint-not-found");
+      expect(r.err()).toContain("its wake proxy could not be opened");
+      expect(r.err()).toContain("--messaging-socket-path");
+      // Nothing was claimed or registered, so no later wake can be told that the holder has no endpoint.
+      expect(f.claims).toEqual([]);
       expect(f.daemon.endpoint()).toBeNull();
     });
 

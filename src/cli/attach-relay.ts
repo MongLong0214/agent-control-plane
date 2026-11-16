@@ -1,10 +1,11 @@
 import { MAX_MCP_LINE_BYTES } from "../core/mcp-limits.ts";
+import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { lstatSync, readFileSync, watch } from "node:fs";
 import { homedir } from "node:os";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { basename, dirname, join, resolve as resolvePath } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import type { Readable, Writable } from "node:stream";
 
 /**
@@ -161,6 +162,13 @@ export interface SessionMessaging {
    * launched with `--messaging-socket-path` in it. Never part of what the session or a client sends.
    */
   proxyDir?: string;
+  /**
+   * The wake proxy, already open: `runAttachRelayCommand` opens it before it asks for anything, so a socket that
+   * vanished since it was looked at refuses the attach instead of leaving it with no endpoint to register (#1427).
+   * Set, the relay uses it and closes it with itself; absent, it opens its own, and a failure to is not fatal unless
+   * `proxyDir` named the state directory it is required in.
+   */
+  openedProxy?: WakeProxy;
 }
 
 /**
@@ -720,7 +728,7 @@ const WAKE_PROXY_TIMEOUT_MS = 2_000;
 const WAKE_PROXY_MAX_CONNECTIONS = 8;
 
 /** The wake proxy once it is listening: the path the daemon is told to wake, and its teardown. */
-interface WakeProxy {
+export interface WakeProxy {
   path: string;
   close(): void;
 }
@@ -990,75 +998,102 @@ export interface AttachRelayCommandOptions {
  * `ancestors` are this relay's parent pids, nearest first: the session is the one of them that has a
  * file here. Injected so a test names its own directory and its own ancestry.
  */
-export interface SessionRegistry {
-  dir: string;
-  /** This relay's parent pids, nearest first. */
-  ancestors: () => number[];
-  /** What a pid is: its executable, its argv[0] and when it started, as the process table says; null when it is gone. */
-  processOf: (pid: number) => { executable: string; argv0: string; startedAt: string | null } | null;
+/** One process on this relay's way up to the session, as the kernel reports it. */
+export interface ProcessLink {
+  pid: number;
+  /** The kernel's argv vector (never `ps`'s rendering), or null when it cannot be established. */
+  argv: readonly string[] | null;
+  /** The kernel's native start token (`darwin-tv:<sec>.<usec>`), or null when it cannot be read. */
+  startToken: string | null;
 }
 
-const psField = (field: string, pid: number): string =>
-  execFileSync("ps", ["-o", `${field}=`, "-p", String(pid)], { encoding: "utf8", timeout: 2_000 }).trim();
+export interface SessionRegistry {
+  dir: string;
+  /** This relay itself, then each of its parents, nearest first: the chain the daemon's admission walks. */
+  chain: () => ProcessLink[];
+}
 
 const defaultSessionRegistry = (): SessionRegistry => ({
   dir: join(process.env["CLAUDE_CONFIG_DIR"] ?? join(homedir(), ".claude"), "sessions"),
-  ancestors: () => {
-    const chain: number[] = [];
-    let pid = process.ppid;
-    for (let depth = 0; depth < 16 && Number.isInteger(pid) && pid > 1; depth += 1) {
-      chain.push(pid);
+  chain: () => {
+    const links: ProcessLink[] = [];
+    const seen = new Set<number>();
+    let pid = process.pid;
+    for (let hop = 0; hop < 64 && Number.isInteger(pid) && pid > 1 && !seen.has(pid); hop += 1) {
+      seen.add(pid);
+      links.push({ pid, argv: readProcessArgv(pid), startToken: readProcessStartToken(pid) });
       try {
-        pid = Number(psField("ppid", pid));
+        pid = pid === process.pid
+          ? process.ppid
+          : Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8", timeout: 2_000 }).trim());
       } catch {
         break;
       }
     }
-    return chain;
-  },
-  processOf: (pid) => {
-    try {
-      const executable = psField("comm", pid);
-      return {
-        executable,
-        argv0: psField("args", pid).split(/\s+/)[0] ?? "",
-        startedAt: psField("lstart", pid) || null,
-      };
-    } catch {
-      return null;
-    }
+    return links;
   },
 });
 
-/** Claude Code itself: its binary is `claude`, or the versioned one a `claude` launcher resolves to. */
-const isClaudeProcess = (process: { executable: string; argv0: string }): boolean =>
-  basename(process.argv0.replace(/^-/, "")) === "claude" || basename(process.executable) === "claude" ||
-  /\/claude\/versions\/[^/]+$/.test(process.executable);
+/**
+ * The daemon's own test of which ancestor is Claude Code: `looksLikeClaudeInvocation` in
+ * `src/registry/canonical-self-claim.ts`, on the kernel's argv, copied rather than imported for the reason
+ * `WAKE_FRAME` is (a client does not load the daemon's claim module). `argv[0]` is a path or name whose
+ * basename is exactly `claude`, or the native updater layout `<dir>/claude/versions/<x.y.z>`; a leading dash
+ * (`-claude`, a login shell's name) is not that, so the daemon skips such a shell and so must this.
+ * `tests/unit/attach-relay-wakeable-socket.test.ts` holds the two equal over the shapes that matter.
+ */
+const NATIVE_VERSIONED_CLAUDE_PATH = /^.+\/claude\/versions\/(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
+export const looksLikeClaudeInvocation = (argv: readonly string[]): boolean => {
+  const [firstElement] = argv;
+  return firstElement !== undefined &&
+    (/(^|\/)claude$/.test(firstElement) || NATIVE_VERSIONED_CLAUDE_PATH.test(firstElement));
+};
 
-/** `ps` pads a day of the month with a space where Claude Code's own record does not; compared as words. */
-const sameStart = (recorded: unknown, observed: string | null): boolean =>
-  typeof recorded === "string" && observed !== null && recorded.trim().split(/\s+/).join(" ") === observed.trim().split(/\s+/).join(" ");
+/**
+ * What Claude Code writes as a session's `procStart`: the process's native start, whole seconds, rendered in UTC as
+ * `ctime` does (the daemon's `registryProcStartFromStartNs`). Not `ps -o lstart=`, which is local time: the same
+ * start reads nine hours apart on a machine in Korea. Null for any token that is not Darwin's.
+ */
+const registryProcStartOf = (startToken: string | null): string | null => {
+  const darwin = /^darwin-tv:(\d+)\.(\d{6})$/.exec(startToken ?? "");
+  if (!darwin) return null;
+  const seconds = Number(darwin[1]);
+  if (!Number.isSafeInteger(seconds) || seconds < 0) return null;
+  const date = new Date(seconds * 1_000);
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const two = (value: number): string => String(value).padStart(2, "0");
+  return `${days[date.getUTCDay()]} ${months[date.getUTCMonth()]} ${String(date.getUTCDate()).padStart(2, " ")} ` +
+    `${two(date.getUTCHours())}:${two(date.getUTCMinutes())}:${two(date.getUTCSeconds())} ${date.getUTCFullYear()}`;
+};
+
+const sameWords = (left: unknown, right: string | null): boolean =>
+  typeof left === "string" && right !== null && left.trim().split(/\s+/).join(" ") === right.trim().split(/\s+/).join(" ");
 
 /**
  * Proof that `messaging.socketPath` is the socket of the session this attach claims, and no other
  * session's, wherever the socket is. The environment is the session's own (Claude Code gives it to
- * its child), and this reads it back from Claude Code's own record of it: the session is the
- * nearest ancestor of this relay that is Claude Code itself (its executable says so, never a shell
- * or a wrapper between), its registry file must be that very process's (the pid, and the start time
- * `ps` reports for it), its `sessionId` must be the one the claim names, and the socket it bound must be
- * the one the environment gave. Nothing is searched for: a directory of other sessions' sockets is
- * never read, so there is no socket here to select by mistake. Null when proved, else the check that failed.
+ * its child), and this reads it back from Claude Code's own record of it.
+ *
+ * The session is exactly the process the daemon's admission authenticates: the walk starts at this relay and goes up
+ * its parents, and stops at the first whose kernel argv is a Claude Code invocation (`looksLikeClaudeInvocation`), as
+ * `deriveClaimantIdentity` does, so a shell or wrapper between, whatever it is named, is skipped, never taken for
+ * the session; a hop whose argv cannot be read refuses, as it does there. That process's own registry file must be
+ * its (the pid, and the start `procStart` records, which is its native start in UTC), its `sessionId` must be
+ * the one the claim names, and the socket it bound must be the one the environment gave. Nothing is searched for: a
+ * directory of other sessions' sockets is never read, so there is no socket here to select by mistake. Null when
+ * proved, else the check that failed.
  */
 const sessionSocketProofFailure = (
   messaging: SessionMessaging,
   claimedSessionUuid: string,
   registry: SessionRegistry,
 ): string | null => {
-  let claude: { pid: number; startedAt: string | null } | null = null;
-  for (const pid of registry.ancestors()) {
-    const process = registry.processOf(pid);
-    if (process !== null && isClaudeProcess(process)) {
-      claude = { pid, startedAt: process.startedAt };
+  let claude: ProcessLink | null = null;
+  for (const link of registry.chain()) {
+    if (link.argv === null) return "ancestor-argv-unreadable";
+    if (looksLikeClaudeInvocation(link.argv)) {
+      claude = link;
       break;
     }
   }
@@ -1069,7 +1104,9 @@ const sessionSocketProofFailure = (
   } catch {
     return "session-not-in-registry";
   }
-  if (entry.pid !== claude.pid || !sameStart(entry.procStart, claude.startedAt)) return "registry-entry-is-another-process";
+  if (entry.pid !== claude.pid || !sameWords(entry.procStart, registryProcStartOf(claude.startToken))) {
+    return "registry-entry-is-another-process";
+  }
   if (typeof entry.sessionId !== "string" || entry.sessionId.toLowerCase() !== claimedSessionUuid.toLowerCase()) {
     return "socket-belongs-to-another-session";
   }
@@ -1089,6 +1126,10 @@ const socketIsListening = (socketPath: string): Promise<boolean> =>
     });
   });
 
+/** What an operator can do about a session that cannot be woken. */
+const launchFlagFix = (stateDir: string): string =>
+  `start Claude Code with --messaging-socket-path ${resolvePath(stateDir)}/cc-session-<name>.sock`;
+
 /**
  * Why this session can never be woken, or null when it can: refused at launch, where the operator
  * is looking, because the alternative is a session that attaches, works, and is silently
@@ -1105,7 +1146,7 @@ const unwakeableSessionRefusal = async (
   claimedSessionUuid: string,
   registry: SessionRegistry,
 ): Promise<string | null> => {
-  const fix = `start Claude Code with --messaging-socket-path ${resolvePath(stateDir)}/cc-session-<name>.sock`;
+  const fix = launchFlagFix(stateDir);
   const refused = (why: string): string => `attach: this session cannot be woken: ${why}; ${fix}`;
   if (messaging === undefined) {
     return refused("it has no messaging socket (CLAUDE_CODE_MESSAGING_SOCKET or token unset)");
@@ -1159,6 +1200,31 @@ export const runAttachRelayCommand = async (
       return ATTACH_EXIT.USAGE;
     }
   }
+  // The proxy is opened before anything is asked of the daemon: the socket was looked at moments ago and can have gone
+  // since, and an attach that could not open the proxy it needs would be admitted, initialize, and register no
+  // endpoint, so every later wake would end ROLE_PEER_UNSUPPORTED with nothing saying why (#1427). Refused here, before
+  // any claim, where the operator is looking.
+  let openedProxy: WakeProxy | null = null;
+  if (messaging !== undefined && options.stateDir !== undefined) {
+    openedProxy = await openWakeProxy(messaging, io.stderr);
+    if (openedProxy === null) {
+      io.stderr.write(`attach: this session cannot be woken: its wake proxy could not be opened; ${launchFlagFix(options.stateDir)}\n`);
+      return ATTACH_EXIT.USAGE;
+    }
+  }
+  try {
+    return await attachWithProxy({ ...options }, io, openedProxy === null || messaging === undefined ? messaging : { ...messaging, openedProxy });
+  } finally {
+    openedProxy?.close();
+  }
+};
+
+/** The rest of `runAttachRelayCommand`, with the session's messaging (and its proxy, when one is open) settled. */
+const attachWithProxy = async (
+  options: AttachRelayCommandOptions,
+  io: AttachRelayIo,
+  messaging: SessionMessaging | undefined,
+): Promise<number> => {
   // The admission window starts here, at relay start, and every step before a receipt spends from it.
   const admissionDeadline = admissionDeadlineOf(options);
   const reattached = await reattachFirst(
@@ -2446,8 +2512,16 @@ const relayWithReattach = (
       // Opened once the admission is in, and kept across every reattach, since its path is what
       // the daemon is given; it closes only with the relay.
       if (messaging === undefined) return;
-      void openWakeProxy(messaging, io.stderr).then((opened) => {
-        if (opened === null) return;
+      const opening = messaging.openedProxy !== undefined ? Promise.resolve(messaging.openedProxy) : openWakeProxy(messaging, io.stderr);
+      void opening.then((opened) => {
+        if (opened === null) {
+          // Where the state directory is named the proxy is required, and a relay without one is a session no wake reaches.
+          if (messaging.proxyDir !== undefined && phase !== "done") {
+            io.stderr.write("attach: this session cannot be woken: its wake proxy could not be opened\n");
+            end(ATTACH_EXIT.USAGE);
+          }
+          return;
+        }
         if (phase === "done") return opened.close();
         proxy = opened;
         offerProxy();

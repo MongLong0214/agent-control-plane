@@ -6,8 +6,9 @@ import { PassThrough } from "node:stream";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ATTACH_EXIT, runAttachRelayCommand, type SessionRegistry } from "../../src/cli/attach-relay.ts";
+import { ATTACH_EXIT, looksLikeClaudeInvocation, runAttachRelayCommand, type SessionRegistry } from "../../src/cli/attach-relay.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { looksLikeClaudeInvocation as daemonsMatcher } from "../../src/registry/canonical-self-claim.ts";
 import { clearSessionMessagingEnv } from "../helpers/session-messaging-env.ts";
 
 /**
@@ -60,7 +61,7 @@ const CLAIMED = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const CLAUDE_PID = 4242;
 const CLAUDE_START = "Sun Nov 15 22:41:34 2026";
 
-/** Claude Code's own record of the session: a registry file for its process, and that process is the relay's parent. */
+/** Claude Code's own record of the session: a registry file for its process, which is the nearest Claude ancestor of the relay. */
 const registryNaming = (socketPath: string | undefined): SessionRegistry => {
   const dir = scratch();
   if (socketPath !== undefined) {
@@ -70,8 +71,10 @@ const registryNaming = (socketPath: string | undefined): SessionRegistry => {
   }
   return {
     dir,
-    ancestors: () => [CLAUDE_PID],
-    processOf: () => ({ executable: "/opt/claude/versions/2.1.323", argv0: "claude", startedAt: CLAUDE_START }),
+    chain: () => [
+      { pid: 4141, argv: ["/usr/bin/node", "agentctl", "attach"], startToken: "darwin-tv:1794782999.000000" },
+      { pid: CLAUDE_PID, argv: ["/Users/test/.local/share/claude/versions/2.1.323", "--resume", CLAIMED], startToken: "darwin-tv:1794782494.000000" },
+    ],
   };
 };
 
@@ -174,5 +177,18 @@ describe("attach canonical-cto requires a wakeable messaging socket", () => {
     expect(run.code).toBe(ATTACH_EXIT.USAGE);
     expect(run.err).toContain("start Claude Code with --messaging-socket-path");
     expect(run.connections()).toBe(0);
+  });
+});
+
+describe("the relay's test of which ancestor is Claude Code is the daemon's", () => {
+  it("agrees with the daemon's admission matcher on every argv shape that tells a shell from Claude", () => {
+    for (const argv of [
+      ["claude"], ["/usr/local/bin/claude", "--resume", CLAIMED], ["-claude"], ["-/bin/claude"], ["/bin/zsh", "-c", "claude"],
+      ["/Users/test/.local/share/claude/versions/2.1.323"], ["/Users/test/.local/share/claude/versions/2.1"],
+      ["/Users/test/.local/share/claude/versions/2.1.323/"], ["node", "/opt/claude"], ["claude-code"], ["/opt/claude/bin/claude "], [],
+    ]) {
+      expect(looksLikeClaudeInvocation(argv), JSON.stringify(argv)).toBe(daemonsMatcher(argv));
+    }
+    expect(looksLikeClaudeInvocation(["-claude"])).toBe(false);
   });
 });

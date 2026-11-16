@@ -27,7 +27,13 @@ const LAUNCHER = `
 import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 const cfg = JSON.parse(process.env.CLAUDE_PARENT_CONFIG);
-const started = execFileSync("ps", ["-o", "lstart=", "-p", String(process.pid)], { encoding: "utf8", timeout: 5000 }).trim();
+// Claude Code records its start in UTC, whole seconds; ps prints it in local time, so it is converted.
+const local = new Date(execFileSync("ps", ["-o", "lstart=", "-p", String(process.pid)], { encoding: "utf8", timeout: 5000 }).trim());
+const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const two = (value) => String(value).padStart(2, "0");
+const started = days[local.getUTCDay()] + " " + months[local.getUTCMonth()] + " " + String(local.getUTCDate()).padStart(2, " ") + " " +
+  two(local.getUTCHours()) + ":" + two(local.getUTCMinutes()) + ":" + two(local.getUTCSeconds()) + " " + local.getUTCFullYear();
 mkdirSync(cfg.home + "/.claude/sessions", { recursive: true });
 writeFileSync(cfg.home + "/.claude/sessions/" + process.pid + ".json", JSON.stringify({
   pid: process.pid, sessionId: cfg.sessionId, messagingSocketPath: cfg.socketPath, procStart: started,
