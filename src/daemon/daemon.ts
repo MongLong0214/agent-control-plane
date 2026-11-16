@@ -3598,6 +3598,16 @@ export class Daemon {
                 "with owner-only permissions. Put the directory back, then have the holder register again -- a " +
                 "restart does that, and nothing re-registers on its own",
             };
+          case "registered-endpoint-target-gone":
+            return {
+              cause:
+                `its holder runs ${holder.presented}, whose registered wake endpoint is its relay's wake ` +
+                "proxy, and the relay reported that the session's own messaging socket it forwards to no longer resolves",
+              repair:
+                "The session's messaging socket was renamed, removed or left with nothing listening on it. Put the " +
+                "socket back where the session bound it, or restart the session; the next wake that is sent finds it " +
+                "again by itself and clears this, and nothing here probes it in the meantime",
+            };
           case "registered-endpoint-refused-the-wake":
             return {
               cause:

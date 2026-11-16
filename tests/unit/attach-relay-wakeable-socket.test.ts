@@ -1,12 +1,14 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { lstatSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ATTACH_EXIT, runAttachRelayCommand } from "../../src/cli/attach-relay.ts";
+import { ATTACH_EXIT, looksLikeClaudeInvocation, runAttachRelayCommand, type SessionRegistry } from "../../src/cli/attach-relay.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { looksLikeClaudeInvocation as daemonsMatcher } from "../../src/registry/canonical-self-claim.ts";
 import { clearSessionMessagingEnv } from "../helpers/session-messaging-env.ts";
 
 /**
@@ -55,7 +57,28 @@ const scratch = (): string => {
   return dir;
 };
 
-const attach = async (stateDir: string, messagingSocket: string | undefined) => {
+const CLAIMED = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const CLAUDE_PID = 4242;
+const CLAUDE_START = "Sun Nov 15 22:41:34 2026";
+
+/** Claude Code's own record of the session: a registry file for its process, which is the nearest Claude ancestor of the relay. */
+const registryNaming = (socketPath: string | undefined): SessionRegistry => {
+  const dir = scratch();
+  if (socketPath !== undefined) {
+    writeFileSync(join(dir, `${CLAUDE_PID}.json`), JSON.stringify({
+      pid: CLAUDE_PID, sessionId: CLAIMED, messagingSocketPath: socketPath, procStart: CLAUDE_START,
+    }));
+  }
+  return {
+    dir,
+    chain: () => [
+      { pid: 4141, argv: ["/usr/bin/node", "agentctl", "attach"], startToken: "darwin-tv:1794782999.000000" },
+      { pid: CLAUDE_PID, argv: ["/Users/test/.local/share/claude/versions/2.1.323", "--resume", CLAIMED], startToken: "darwin-tv:1794782494.000000" },
+    ],
+  };
+};
+
+const attach = async (stateDir: string, messagingSocket: string | undefined, registry = registryNaming(messagingSocket)) => {
   let connections = 0;
   await listen(join(stateDir, "c.sock"), () => (connections += 1));
   if (messagingSocket !== undefined) {
@@ -69,20 +92,44 @@ const attach = async (stateDir: string, messagingSocket: string | undefined) => 
     {
       claimSocketPath: join(stateDir, "c.sock"),
       mcpSocketPath: join(stateDir, "cto.mcp.sock"),
-      claim: { claimedSessionUuid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", projectId: "p", expectedBindingGeneration: 1 },
+      claim: { claimedSessionUuid: CLAIMED, projectId: "p", expectedBindingGeneration: 1 },
       stateDir,
+      sessionRegistry: registry,
     },
     { stdin: new PassThrough(), stdout: new PassThrough(), stderr },
   );
   return { code, err, connections: () => connections };
 };
 
+/**
+ * Leaves a socket file in `path` with nothing listening on it, the way a Claude Code that exited
+ * without cleaning up does: the process that bound it exits without closing, so the file stays.
+ */
+const abandonSocket = (path: string): void => {
+  const bound = spawnSync(
+    process.execPath,
+    ["-e", "require('net').createServer().listen(process.argv[1], () => process.exit(0))", path],
+    { encoding: "utf8", timeout: 10_000 },
+  );
+  expect(bound.status).toBe(0);
+  expect(lstatSync(path).isSocket()).toBe(true);
+};
+
 describe("attach canonical-cto requires a wakeable messaging socket", () => {
-  it("refuses a socket outside the state directory, names the fix, and connects to nothing", async () => {
+  it("starts as before when the socket is outside the state directory and Claude Code's own record proves it the claimed session's", async () => {
     const state = scratch();
     const elsewhere = scratch();
     await listen(join(elsewhere, "cc.sock"));
     const run = await attach(state, join(elsewhere, "cc.sock"));
+    expect(run.err).not.toContain("cannot be woken");
+    expect(run.code).toBe(ATTACH_EXIT.CLAIM_REFUSED);
+  });
+
+  it("refuses a socket outside the state directory that no record proves, names the fix, and connects to nothing", async () => {
+    const state = scratch();
+    const elsewhere = scratch();
+    await listen(join(elsewhere, "cc.sock"));
+    const run = await attach(state, join(elsewhere, "cc.sock"), registryNaming(undefined));
     expect(run.code).toBe(ATTACH_EXIT.USAGE);
     expect(run.err).toContain(`start Claude Code with --messaging-socket-path ${state}/cc-session-<name>.sock`);
     expect(run.err.trim().split("\n")).toHaveLength(1);
@@ -111,5 +158,37 @@ describe("attach canonical-cto requires a wakeable messaging socket", () => {
     expect(run.err).not.toContain("cannot be woken");
     expect(run.connections()).toBe(1);
     expect(run.code).toBe(ATTACH_EXIT.CLAIM_REFUSED);
+  });
+
+  it("refuses a socket file in the state directory that nothing listens on, names the flag, and connects to nothing", async () => {
+    const state = scratch();
+    abandonSocket(join(state, "cc-session-cto.sock"));
+    const run = await attach(state, join(state, "cc-session-cto.sock"));
+    expect(run.code).toBe(ATTACH_EXIT.USAGE);
+    expect(run.err).toContain("cannot be woken");
+    expect(run.err).toContain("not listening");
+    expect(run.err).toContain(`start Claude Code with --messaging-socket-path ${state}/cc-session-<name>.sock`);
+    expect(run.connections()).toBe(0);
+  });
+
+  it("refuses a messaging socket path that does not exist", async () => {
+    const state = scratch();
+    const run = await attach(state, join(state, "cc-session-gone.sock"));
+    expect(run.code).toBe(ATTACH_EXIT.USAGE);
+    expect(run.err).toContain("start Claude Code with --messaging-socket-path");
+    expect(run.connections()).toBe(0);
+  });
+});
+
+describe("the relay's test of which ancestor is Claude Code is the daemon's", () => {
+  it("agrees with the daemon's admission matcher on every argv shape that tells a shell from Claude", () => {
+    for (const argv of [
+      ["claude"], ["/usr/local/bin/claude", "--resume", CLAIMED], ["-claude"], ["-/bin/claude"], ["/bin/zsh", "-c", "claude"],
+      ["/Users/test/.local/share/claude/versions/2.1.323"], ["/Users/test/.local/share/claude/versions/2.1"],
+      ["/Users/test/.local/share/claude/versions/2.1.323/"], ["node", "/opt/claude"], ["claude-code"], ["/opt/claude/bin/claude "], [],
+    ]) {
+      expect(looksLikeClaudeInvocation(argv), JSON.stringify(argv)).toBe(daemonsMatcher(argv));
+    }
+    expect(looksLikeClaudeInvocation(["-claude"])).toBe(false);
   });
 });

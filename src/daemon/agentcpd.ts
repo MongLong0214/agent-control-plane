@@ -1377,20 +1377,30 @@ export const startLocalMcpListeners = async (
       // #1103 — every wake frame handed to a CTO, with its cause, so a wake that finds empty queues
       // can be attributed (a registration's, at a daemon start or a re-registration). A wake refused
       // before it connected is recorded with its own code, as a failed connection is.
-      onWakeFailed: ({ roleKey, cause, reasonCode }) =>
-        cp.audit.record({ kind: "ROLE_WAKE_FAILED", reasonCode, roleKey, evidence: { cause } }),
+      // `shape` is how the connection failed (timeout, connection-refused, connection-closed, or the
+      // session's own socket gone behind a relay's proxy: target-not-found), and is absent for a wake
+      // refused before it connected. A closed set of names, never a path (#1427).
+      onWakeFailed: ({ roleKey, cause, reasonCode, shape }) =>
+        cp.audit.record({
+          kind: "ROLE_WAKE_FAILED",
+          reasonCode,
+          roleKey,
+          evidence: shape === undefined ? { cause } : { cause, shape },
+        }),
       onWakeWritten: ({ roleKey, cause }) =>
         cp.audit.record({ kind: "ROLE_WAKE_SENT", reasonCode: ReasonCode.OK, roleKey, evidence: { cause } }),
       // A wake the holder's registration opted out of: no frame, and recorded as that, not a failure.
-      onWakeSuppressed: ({ roleKey, cause }) =>
+      onWakeSuppressed: ({ roleKey, cause, suppressedBy }) =>
         cp.audit.record({
           kind: "ROLE_WAKE_SUPPRESSED",
           reasonCode: ReasonCode.ROLE_WAKE_SUPPRESSED,
           roleKey,
-          evidence: { cause, suppressedBy: "holder-opt-out" },
+          evidence: { cause, suppressedBy },
         }),
       // FIX-ROLE-WAKE — a registration wake with no confirmed work is skipped; a failed lookup wakes.
       holderHasWork: (holder) => cp.outbox.hasWorkForHolder(holder),
+      // #1427 — a wake that names its cause is sent only for work that is pending and not already announced.
+      holderWorkSignature: (holder) => cp.outbox.hasWorkForHolder(holder) ? cp.outbox.pendingWorkSignatureFor(holder) : "",
     },
   );
   // A wake caused by a verified mention is gated on that mention's identity, role and room, judged by
