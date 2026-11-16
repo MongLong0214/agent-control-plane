@@ -475,4 +475,41 @@ describe("#1268 the merge commit GitHub creates goes through CommitLore", () => 
     expect(retry, JSON.stringify(retry)).toMatchObject({ allowed: false, evidence: { refusal: "COMMITLORE_MESSAGE_REFUSED" } });
     expect(mergeReceipts(fixture).every((receipt) => receipt.verified === 0)).toBe(true);
   });
+
+  it("a record of another repository's merge message check for the same pull number and head is not this merge's", async () => {
+    const fixture = await setup({ kernel: { checkMergeCommit: async () => allow(ReasonCode.OK, undefined) } });
+    loseTheAnswer(fixture);
+    expect((await fixture.merge()).allowed).toBe(false);
+    fixture.harness.cp.audit.record({
+      kind: "MERGE_MESSAGE_CHECKED",
+      runId: fixture.input.runId,
+      evidence: { repositoryIdentity: "github:acme/another", pullNumber: fixture.input.pullNumber, exactHead: fixture.input.exactHeadSha, messageDigest: `sha256:${"0".repeat(64)}` },
+    });
+    const retry = await fixture.merge();
+    expect(retry.reasonCode, retry.allowed ? "" : `${retry.message} ${JSON.stringify(retry.evidence)}`).toBe(ReasonCode.MERGE_IDEMPOTENT_REPLAY);
+  });
+
+  it("a read-back of the landed message that GitHub does not answer leaves the merge pending and unproven, never failed or halted, and a later read settles it", async () => {
+    const fixture = await setup({ kernel: { checkMergeCommit: async () => allow(ReasonCode.OK, undefined) } });
+    const request = fixture.github.request.bind(fixture.github);
+    let mergeSha: string | null = null;
+    let reads = 0;
+    let down = true;
+    fixture.github.request = async <T>(method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE", path: string, body?: unknown): Promise<T> => {
+      if (method === "GET" && mergeSha !== null && path.endsWith(`/commits/${mergeSha}`) && ++reads === 2 && down) {
+        throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method });
+      }
+      const response = await request<T>(method, path, body);
+      if (method === "PUT" && /\/pulls\/\d+\/merge$/.test(path)) mergeSha = (response as { sha?: string }).sha ?? null;
+      return response;
+    };
+    const unread = await fixture.merge();
+    expect(unread, JSON.stringify(unread)).toMatchObject({ allowed: false, reasonCode: ReasonCode.PROBE_FAILED });
+    expect(fixture.harness.cp.db.all(`SELECT 1 FROM github_receipts WHERE operation = 'rollback_prepare'`)).toEqual([]);
+    expect(mergeReceipts(fixture)).toEqual([{ status: "PENDING", verified: 0 }]);
+    down = false;
+    const settled = await fixture.merge();
+    expect(settled.reasonCode, settled.allowed ? "" : `${settled.message} ${JSON.stringify(settled.evidence)}`).toBe(ReasonCode.MERGE_IDEMPOTENT_REPLAY);
+    expect(fixture.github.mergeCount).toBe(1);
+  });
 });

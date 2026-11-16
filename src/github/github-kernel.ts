@@ -2656,7 +2656,8 @@ export class GitHubKernel {
         input, slug.value.owner, slug.value.repo, observedMergeCommitSha, this.checkedMergeMessageDigest(input),
       );
       if (!readBack.allowed) {
-        this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, observedMergeCommitSha, readBack);
+        if (this.keepsMergeProofPending(readBack)) this.recordPendingMergeProofFailure(input, mergeRepositoryId, idempotencyKey, observedMergeCommitSha, readBack);
+        else this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, observedMergeCommitSha, readBack);
         return readBack as Decision<{ mergeCommitSha: string; replayed: boolean }>;
       }
     }
@@ -3030,7 +3031,8 @@ export class GitHubKernel {
     if (merging !== null) {
       const readBack = await this.verifyLandedMerge(input, owner, repo, mergeCommitSha, sha256(merging.message.trimEnd()));
       if (!readBack.allowed) {
-        this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, readBack);
+        if (this.keepsMergeProofPending(readBack)) this.recordPendingMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, readBack);
+        else this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, readBack);
         return readBack as Decision<{ mergeCommitSha: string; replayed: boolean }>;
       }
     }
@@ -3083,9 +3085,10 @@ export class GitHubKernel {
   private checkedMergeMessageDigest(input: MergeInput): string | null {
     return this.db.get<{ digest: string | null }>(
       `SELECT json_extract(evidence_json, '$.messageDigest') AS digest FROM audit_events
-        WHERE kind = ? AND run_id = ? AND json_extract(evidence_json, '$.pullNumber') = ? AND json_extract(evidence_json, '$.exactHead') = ?
+        WHERE kind = ? AND run_id = ? AND json_extract(evidence_json, '$.repositoryIdentity') = ?
+          AND json_extract(evidence_json, '$.pullNumber') = ? AND json_extract(evidence_json, '$.exactHead') = ?
         ORDER BY event_id DESC LIMIT 1`,
-      [MERGE_MESSAGE_CHECKED, input.runId, input.pullNumber, input.exactHeadSha],
+      [MERGE_MESSAGE_CHECKED, input.runId, input.repositoryIdentity, input.pullNumber, input.exactHeadSha],
     )?.digest ?? null;
   }
 
@@ -3100,22 +3103,21 @@ export class GitHubKernel {
     mergeCommitSha: string,
     checkedDigest: string | null,
   ): Promise<Decision<void>> {
-    const landed = await this.landedMergeMessage(owner, repo, mergeCommitSha);
-    if (landed === null || (checkedDigest !== null && sha256(landed.trimEnd()) !== checkedDigest)) {
-      return deny(ReasonCode.VERIFICATION_GAP, "the merge commit's message could not be read back as the one CommitLore checked", {
-        refusal: "MERGE_COMMIT_MESSAGE_CHANGED", phase: "merge-commitlore", pullNumber: input.pullNumber, mergeCommitSha, landed,
-      });
+    const evidence = { phase: "merge-commitlore", pullNumber: input.pullNumber, mergeCommitSha };
+    // A read GitHub does not answer, or answers without a message, leaves the proof unavailable (a pending merge, as any
+    // read of the merge that fails does); only a message that is read and is not the checked one is a changed message.
+    let commit: { commit?: { message?: unknown } } | null;
+    try {
+      commit = await this.api().request<{ commit?: { message?: unknown } }>("GET", `/repos/${owner}/${repo}/commits/${mergeCommitSha}`);
+    } catch (error) {
+      return deny(ReasonCode.PROBE_FAILED, "the merge commit could not be re-read for its message", { ...evidence, ...transportOutcome(error) });
+    }
+    const landed = commit?.commit?.message;
+    if (typeof landed !== "string") return deny(ReasonCode.EVIDENCE_MISSING, "the merge commit has no readable message", evidence);
+    if (checkedDigest !== null && sha256(landed.trimEnd()) !== checkedDigest) {
+      return deny(ReasonCode.VERIFICATION_GAP, "the merge commit's message is not the one CommitLore checked", { ...evidence, refusal: "MERGE_COMMIT_MESSAGE_CHANGED", landed });
     }
     return this.checkedMergeCommit(input, landed, "after");
-  }
-
-  /** #1268 — the message a merge commit landed with, as GitHub reports it; null when it cannot be read. */
-  private async landedMergeMessage(owner: string, repo: string, mergeCommitSha: string): Promise<string | null> {
-    const commit = await this.api()
-      .request<{ commit?: { message?: unknown } }>("GET", `/repos/${owner}/${repo}/commits/${mergeCommitSha}`)
-      .catch(() => null);
-    const message = commit?.commit?.message;
-    return typeof message === "string" ? message : null;
   }
 
   /**
