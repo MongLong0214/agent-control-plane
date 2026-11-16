@@ -450,9 +450,9 @@ export class TaskGraph {
           fail(classification.reasonCode, classification.message, classification.evidence);
         }
         this.db.run(
-          `INSERT INTO tasks (task_id, run_id, title, category, state, spec_json, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?)`,
-          [taskId, runId, spec.title, spec.category, JSON.stringify(spec.spec ?? {}), now, now],
+          `INSERT INTO tasks (task_id, run_id, title, category, state, spec_json, created_at, updated_at, plan_key)
+           VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)`,
+          [taskId, runId, spec.title, spec.category, JSON.stringify(spec.spec ?? {}), now, now, spec.key],
         );
         for (const dep of spec.dependsOn ?? []) {
           const dependsOn = idByKey.get(dep) ?? resolve(dep);

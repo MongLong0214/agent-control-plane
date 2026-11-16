@@ -1216,6 +1216,7 @@ export const UNJUDGED_NOTICE_LINE =
   "For it, change no PLAN, task or code and do not provision or run a worker; take only its nextStep. " +
   "RESUBMIT: once the result_submit of the attempt it names has answered, and only while its unjudgedAttempts is below its unjudgedAttemptLimit, submit that run's result once with mcp__acp-cto__result_submit and a new idempotencyKey. " +
   "ESCALATE: report it for that run with mcp__acp-cto__escalation_open and do not resubmit. " +
+  "DETERMINISTIC: the same candidate with the same attached review evidence is refused again, so do not resubmit it unchanged; ask for a smaller review evidence bundle as the notice says, or report it with mcp__acp-cto__escalation_open. " +
   "Then acknowledge it with mcp__acp-cto__run_ack.";
 
 export const workPrompt = (

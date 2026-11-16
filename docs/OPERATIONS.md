@@ -15,6 +15,42 @@ pnpm test
 node scripts/ssot-report.mjs
 ```
 
+## Feature verification map
+
+Where a feature's acceptance is actually executed and what shows it. This maps existing tests and
+contract fields; it adds no schema, gate or recipe, and it grants nothing: the authority stays with the
+approved `TaskContract.acceptance` (read by the reviewer verbatim), the pinned manifest's
+`verificationCommands` and the official verification output (read by the reviewer under "Untrusted
+execution evidence"). In an ordinary candidate review, `PLAN.verificationIntent` and a task's `spec` are
+not read, so a claim that matters has to be an assertion the official command prints. Bootstrap-plan
+review (with the task's `spec.completionCriteria`) and contract-change review do receive the PLAN's
+verification intent, as what the author says it intends, never as execution evidence.
+
+The pattern a project's command follows, shown end to end in
+[`i1422-feature-verification-pilot.test.ts`](../tests/unit/i1422-feature-verification-pilot.test.ts):
+exercise the feature through its usage path, **read the state back through a separate read** (not the
+call's own answer, an HTTP 200 or exit 0), print each assertion with its expected and actual values,
+and name where it stopped. A candidate whose `save` answers `ok` and persists nothing passes the
+call-answer check and fails the read-back, with `expected ["hello"], actual []`; the owner is handed that
+output and no reviewer is invoked. The fixed candidate's output, bound to its own snapshot and contract
+digests, and the command's source reach the reviewer, and the producer's claim and the earlier failure do
+not. Provenance there is local sandbox execution (`source: "local"`) with a scripted reviewer.
+
+| Feature | Acceptance to observe | Executed by (existing) | What fails it / what shows it | Limits, owner |
+|---|---|---|---|---|
+| Task execution and artifact submission | Worker result and receipt match the task's intent | `tasks.finishExecution` plus the receipt link; `review-receipts-and-tasks-reach-the-reviewer.test.ts` | A receipt that disagrees with its execution is reported in its row, a unit reference no task answers is listed, never mapped by title | An edit-requiring task that changed only its imports is **not** covered here: #1418. #1413 for work-unit keys |
+| Candidate submission and review | The same candidate's verification reaches review; a reason review could not start is not a product verdict | the pilot above; `candidate-review-execution-evidence.test.ts`; `a-reviewer-sees-the-whole-test-run.test.ts` | `VERIFICATION_FAILED` carries the failing assertion to the owner and calls no reviewer; output is bound to snapshot, contract and head | Oversized private evidence and its attempt accounting: #1421. Images and screenshots are not retained (the disposable worktree is gone before the result is built) |
+| Resubmission after correction | The correction relation and acceptance hold; earlier failures stay readable | `a-correction-supersedes-a-succeeded-task.test.ts` (#1400), `a-correction-settles-a-failed-task.test.ts` | A superseded task stays SUCCEEDED/FAILED and readable; the freeze holds the terminal alone; unrelated paths still conflict | A run with no approved work units cannot register a correction |
+| Recovery during continuity | The successor takes over, a stale generation is refused, added review evidence does not pin the hold | `continuity-hold-release.test.ts` (#1420), `a-continuity-held-run-follows-its-cto-successor.test.ts` | A stale binding or a not-READY owner is refused and the hold is kept; the live run releases once | Same-host fixture runs, not a live restart |
+| Approval, merge and post-merge verification | Exact candidate and merge receipt; complete only after the required post-merge checks | `tests/scenarios/finalizer.test.ts`, `approved-run-merge-failures.test.ts` | A failing post-merge check blocks the run (`BLOCKED_POST_MERGE`) with a compensation plan and no further merge; a stale base returns the run for revision | Candidate-mismatch approval refusal and generic post-merge recovery: #1181 |
+
+What an ordinary verification command may do is set by its sandbox: child processes run under a
+supervised budget, and `network=deny` blocks loopback too, so an HTTP-server-plus-browser check needs an
+authorized `network=allow` contract, authorized CI or the host live probe. A host live probe is
+supplementary evidence; it does not replace a pinned `LOCAL_COMMAND` or `BOTH_REQUIRED` obligation. A
+command that cannot run (no driver, isolation failed, no output) is a failure or a verification gap and
+is never read as PASS.
+
 ## Inspect without a project mutation
 
 After `pnpm build`, these commands are the safest local starting point:
@@ -36,6 +72,19 @@ pid is alive, and a parked daemon holds its lock exactly like a dispatching one.
 reporting `mode: "BOOTSTRAP"` is parked and serving only the capacity door; see
 [provider capacity source](capacity-source.md). `~/.agent-control-plane/health.json` carries
 the same `mode` without needing the token.
+
+### Reading why a run's review repeated
+
+`agentctl run show <runId>` (operator token, same socket) ends with `reviewRounds`, a read-only
+projection of records the run already left: per candidate freeze, whether the candidate's source
+changed (`SOURCE_CHANGE`), only its identity did (`CANDIDATE_IDENTITY_CHANGE`), the same judged
+candidate was submitted again (`SAME_CANDIDATE_RESUBMISSION`), or nothing had judged it and it was
+retried (`INFRASTRUCTURE_RETRY`). It writes nothing and no gate, reviewer packet or CEO decision reads
+it. `totals.reviewerInvocations` is only the calls the records confirm and attribute to a round: a
+review whose call count is unrecorded adds 0, so read it with `reviewsWithUnrecordedInvocations`,
+`reviewUnavailable`, `noOutcomeRecorded`, `unattributedEvents` and `unattributedDeliveries`. It is not
+a count of provider calls or tokens, and not a cost. If the projection cannot be read it says
+`unavailable` and the rest of the run is still shown.
 
 ### Reading the doctor's findings
 

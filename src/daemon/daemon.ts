@@ -7,6 +7,7 @@ import type { ControlPlane } from "../app/control-plane.ts";
 import { retryDeferredNotices } from "../ceo/ceo-incident-notices.ts";
 import { routeOwnerlessStalls, routePostMergeStall } from "../ceo/ownerless-stalls.ts";
 import { outboxDeliveryReadback } from "../outbox/outbox.ts";
+import { readReviewRoundSources, summarizeReviewRounds, type ReviewRoundSummary } from "../review/review-round-summary.ts";
 import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../capacity/capacity-monitor.ts";
 import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
 import { RECONCILE_SWEEP_BUDGET_MS } from "../conversation/turn-coordinator.ts";
@@ -667,6 +668,19 @@ export interface TelegramIngressController {
 }
 
 /**
+ * #1422 — the review-round projection shown by `run show`: a read of records that already exist,
+ * for the operator and the host. No gate, reviewer packet, merge decision or CEO verdict reads it.
+ * A failed read is reported as unavailable rather than hiding the run the operator asked about.
+ */
+const reviewRoundsFor = (cp: ControlPlane, runId: string): ReviewRoundSummary | { unavailable: true; error: string } => {
+  try {
+    return summarizeReviewRounds(readReviewRoundSources(cp, runId));
+  } catch (error) {
+    return { unavailable: true, error: error instanceof Error ? error.message : String(error) };
+  }
+};
+
+/**
  * PRD §33.1 and §34.5.
  *
  * The single-instance lock is taken before any state is touched, and restart
@@ -931,6 +945,7 @@ export class Daemon {
               ...outboxDeliveryReadback(message),
               bindingGeneration: message.bindingGeneration,
             })),
+            reviewRounds: reviewRoundsFor(this.cp, runId.value),
           });
         }
 
