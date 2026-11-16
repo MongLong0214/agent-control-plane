@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import type * as NodeFs from "node:fs";
-import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { createConnection, createServer, Socket, type Server } from "node:net";
 import { basename, dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 
@@ -780,7 +780,7 @@ describe("the wake proxy forwards only to a messaging socket the daemon itself w
     expect(await port.wake(CTO)).toMatchObject({
       allowed: false, reasonCode: ReasonCode.ROLE_PEER_FAILED, evidence: { shape: "target-not-found" },
     });
-    expect(r.err()).toBe("attach: wake forward failed endpoint-not-inspectable\n");
+    expect(r.err()).toBe("attach: wake forward failed endpoint-not-found\n");
     expect(port.unwakeableHolders()).toMatchObject([{ roleKey: CTO, cause: "registered-endpoint-target-gone" }]);
 
     // Back at its name, the session takes the next wake and the role is wakeable again, with no probe in between.
@@ -1205,11 +1205,27 @@ describe("#1427 invariants: a canonical CTO session is woken by default, and an 
     return { dir, session };
   };
   /** The session registry Claude Code keeps: one `<pid>.json` per session. The relay's parent is the fixture's claude. */
-  const registryFor = (entry: { pid: number; sessionId: string; messagingSocketPath: string }): SessionRegistry => {
+  const CLAUDE_START = "Sun Nov 15 22:41:34 2026";
+  const CLAUDE_EXECUTABLE = { executable: "/Users/test/.local/share/claude/versions/2.1.323", argv0: "claude" };
+  /**
+   * The session registry Claude Code keeps, one `<pid>.json` per session, and the process table the relay's ancestors
+   * are read from: `ancestry` is nearest first, and the real Claude is the one whose process says so.
+   */
+  const registryFor = (
+    entry: { pid: number; sessionId: string; messagingSocketPath: string },
+    ancestry: Array<{ pid: number; executable: string; argv0: string; startedAt: string }> = [
+      { pid: entry.pid, ...CLAUDE_EXECUTABLE, startedAt: CLAUDE_START },
+    ],
+    files: Array<Record<string, unknown>> = [{ ...entry, procStart: CLAUDE_START }],
+  ): SessionRegistry => {
     const dir = mkdtempSync("/tmp/acpreg-");
     roots.push(dir);
-    writeFileSync(join(dir, `${entry.pid}.json`), JSON.stringify(entry));
-    return { dir, ancestors: () => [entry.pid] };
+    for (const file of files) writeFileSync(join(dir, `${String(file["pid"])}.json`), JSON.stringify(file));
+    return {
+      dir,
+      ancestors: () => ancestry.map((process) => process.pid),
+      processOf: (pid: number) => ancestry.find((process) => process.pid === pid) ?? null,
+    };
   };
   /**
    * What the stand-in session was sent that is not the relay's attach-time look at its socket (a connection
@@ -1386,6 +1402,118 @@ describe("#1427 invariants: a canonical CTO session is woken by default, and an 
       buzzMessages: { roleKeys: [CTO], read: "role_owner_message_claim", acknowledge: "role_owner_message_complete" },
     });
     await r.finish();
+  });
+
+  describe("review of #1428: the proof binds the socket to the actual Claude, the wake is acknowledged only once written, a vanished directory is a vanished target", () => {
+    it("an error writing the forward is a failed wake: nothing is announced, the holder is not wakeable, and the next wake is not suppressed", async () => {
+      const f = await started();
+      const r = relay(f.paths, { messaging: f.messaging });
+      await r.initialized();
+      await proxyRegistered(f);
+      const port = f.daemon.live().ctoConversation;
+      // A real Socket whose write fails with EPIPE, as a session that closed its end mid-forward does.
+      const socketPrototype = Socket.prototype as unknown as { _write: (chunk: Buffer, encoding: string, done: (error?: Error | null) => void) => void };
+      const real = socketPrototype._write;
+      const failing = vi.spyOn(socketPrototype, "_write").mockImplementation(function (this: Socket, chunk, encoding, done) {
+        if (Buffer.from(chunk).toString("utf8").includes('"type":"auth"')) return done(Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+        return real.call(this, chunk, encoding, done);
+      });
+      try {
+        const failed = await port.wake(CTO, undefined, "in-band dispatch");
+        expect(failed).toMatchObject({ allowed: false, reasonCode: ReasonCode.ROLE_PEER_FAILED });
+      } finally {
+        failing.mockRestore();
+      }
+      await pauseFor(100);
+      expect(f.session.received.filter((bytes) => bytes !== "")).toEqual([]);
+      expect(port.unwakeableHolders()).toMatchObject([{ roleKey: CTO }]);
+      // Nothing was announced, so the same work is woken for again, and this one lands.
+      expect((await port.wake(CTO, undefined, "in-band dispatch")).allowed).toBe(true);
+      expect(await until(() => f.session.received.filter((bytes) => bytes !== "").length === 1)).toBe(true);
+      await r.finish();
+    });
+
+    it("a registry entry for a process that is not Claude proves nothing, and only the nearest Claude ancestor's entry counts", async () => {
+      const f = await started();
+      const { session: foreign } = await defaultSocketSession("foreign");
+      const { session: own } = await defaultSocketSession("own");
+      environmentOf(foreign.path);
+      const SHELL = 4242;
+      // Under the real Claude (pid CLAUDE) is a shell; a forged entry for the shell names the claimed session and the foreign socket.
+      const forged = { pid: SHELL, sessionId: CONVERSATION, messagingSocketPath: foreign.path, procStart: "Mon Nov 16 01:00:00 2026" };
+      const claudesOwn = { pid: CLAUDE, sessionId: CONVERSATION, messagingSocketPath: own.path, procStart: CLAUDE_START };
+      const registry = registryFor(
+        { pid: CLAUDE, sessionId: CONVERSATION, messagingSocketPath: own.path },
+        [
+          { pid: SHELL, executable: "/bin/zsh", argv0: "-zsh", startedAt: "Mon Nov 16 01:00:00 2026" },
+          { pid: CLAUDE, ...CLAUDE_EXECUTABLE, startedAt: CLAUDE_START },
+        ],
+        [forged, claudesOwn],
+      );
+      const r = relay(f.paths, { entry: "command", stateDir: f.dir, sessionRegistry: registry });
+      expect(await settles(r.exit)).toBe(ATTACH_EXIT.USAGE);
+      expect(r.err()).toContain("socket-is-not-the-sessions-registered-socket");
+      // With no Claude among the ancestors at all, no entry is anyone's.
+      const none = relay(f.paths, {
+        entry: "command", stateDir: f.dir,
+        sessionRegistry: registryFor({ pid: SHELL, sessionId: CONVERSATION, messagingSocketPath: foreign.path },
+          [{ pid: SHELL, executable: "/bin/zsh", argv0: "-zsh", startedAt: "Mon Nov 16 01:00:00 2026" }], [forged]),
+      });
+      expect(await settles(none.exit)).toBe(ATTACH_EXIT.USAGE);
+      expect(none.err()).toContain("no-claude-ancestor");
+      // An entry whose process start is not the Claude process's is another process that held the pid.
+      const reused = relay(f.paths, {
+        entry: "command", stateDir: f.dir,
+        sessionRegistry: registryFor({ pid: CLAUDE, sessionId: CONVERSATION, messagingSocketPath: foreign.path }, undefined,
+          [{ pid: CLAUDE, sessionId: CONVERSATION, messagingSocketPath: foreign.path, procStart: "Tue Jan  1 00:00:00 2019" }]),
+      });
+      expect(await settles(reused.exit)).toBe(ATTACH_EXIT.USAGE);
+      expect(reused.err()).toContain("registry-entry-is-another-process");
+      await pauseFor(100);
+      expect(foreign.received).toEqual([]);
+      expect(f.daemon.endpoint()).toBeNull();
+    });
+
+    it("a socket inside the state directory is bound to the claimed session as well: another session's socket there is refused, and an entry is required", async () => {
+      const f = await started();
+      const other = await recordingSocket(join(f.dir, "cc-session-another.sock"));
+      environmentOf(other.path);
+      const own = join(f.dir, "cc-session-own.sock");
+      const wrong = relay(f.paths, {
+        entry: "command", stateDir: f.dir,
+        sessionRegistry: registryFor({ pid: CLAUDE, sessionId: CONVERSATION, messagingSocketPath: own }),
+      });
+      expect(await settles(wrong.exit)).toBe(ATTACH_EXIT.USAGE);
+      expect(wrong.err()).toContain("socket-is-not-the-sessions-registered-socket");
+      const unregistered = relay(f.paths, {
+        entry: "command", stateDir: f.dir,
+        sessionRegistry: registryFor({ pid: CLAUDE, sessionId: CONVERSATION, messagingSocketPath: other.path }, undefined, []),
+      });
+      expect(await settles(unregistered.exit)).toBe(ATTACH_EXIT.USAGE);
+      expect(unregistered.err()).toContain("session-not-in-registry");
+      await pauseFor(100);
+      expect(other.received).toEqual([]);
+      expect(f.daemon.endpoint()).toBeNull();
+    });
+
+    it("a session socket whose directory is gone is a vanished target, not a refused one", async () => {
+      const f = await started();
+      const { dir, session } = await defaultSocketSession();
+      environmentOf(session.path);
+      const r = relay(f.paths, {
+        entry: "command", stateDir: f.dir,
+        sessionRegistry: registryFor({ pid: CLAUDE, sessionId: CONVERSATION, messagingSocketPath: session.path }),
+      });
+      await r.initialized();
+      expect(await until(() => session.received.filter((bytes) => bytes !== "").length === 1)).toBe(true);
+      const port = f.daemon.live().ctoConversation;
+      rmSync(dir, { recursive: true, force: true });
+      expect(await port.wake(CTO, undefined, "in-band dispatch")).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.ROLE_PEER_FAILED, evidence: { shape: "target-not-found" },
+      });
+      expect(port.unwakeableHolders()).toMatchObject([{ roleKey: CTO, cause: "registered-endpoint-target-gone" }]);
+      await r.finish();
+    });
   });
 
   // The fourth invariant -- a generation change redelivers the withheld rows -- is NOT held yet: see the report.

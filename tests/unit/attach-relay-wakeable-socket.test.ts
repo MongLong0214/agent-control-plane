@@ -1,12 +1,12 @@
 import { spawnSync } from "node:child_process";
-import { lstatSync, mkdtempSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ATTACH_EXIT, runAttachRelayCommand } from "../../src/cli/attach-relay.ts";
+import { ATTACH_EXIT, runAttachRelayCommand, type SessionRegistry } from "../../src/cli/attach-relay.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { clearSessionMessagingEnv } from "../helpers/session-messaging-env.ts";
 
@@ -56,7 +56,26 @@ const scratch = (): string => {
   return dir;
 };
 
-const attach = async (stateDir: string, messagingSocket: string | undefined) => {
+const CLAIMED = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const CLAUDE_PID = 4242;
+const CLAUDE_START = "Sun Nov 15 22:41:34 2026";
+
+/** Claude Code's own record of the session: a registry file for its process, and that process is the relay's parent. */
+const registryNaming = (socketPath: string | undefined): SessionRegistry => {
+  const dir = scratch();
+  if (socketPath !== undefined) {
+    writeFileSync(join(dir, `${CLAUDE_PID}.json`), JSON.stringify({
+      pid: CLAUDE_PID, sessionId: CLAIMED, messagingSocketPath: socketPath, procStart: CLAUDE_START,
+    }));
+  }
+  return {
+    dir,
+    ancestors: () => [CLAUDE_PID],
+    processOf: () => ({ executable: "/opt/claude/versions/2.1.323", argv0: "claude", startedAt: CLAUDE_START }),
+  };
+};
+
+const attach = async (stateDir: string, messagingSocket: string | undefined, registry = registryNaming(messagingSocket)) => {
   let connections = 0;
   await listen(join(stateDir, "c.sock"), () => (connections += 1));
   if (messagingSocket !== undefined) {
@@ -70,8 +89,9 @@ const attach = async (stateDir: string, messagingSocket: string | undefined) => 
     {
       claimSocketPath: join(stateDir, "c.sock"),
       mcpSocketPath: join(stateDir, "cto.mcp.sock"),
-      claim: { claimedSessionUuid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", projectId: "p", expectedBindingGeneration: 1 },
+      claim: { claimedSessionUuid: CLAIMED, projectId: "p", expectedBindingGeneration: 1 },
       stateDir,
+      sessionRegistry: registry,
     },
     { stdin: new PassThrough(), stdout: new PassThrough(), stderr },
   );
@@ -93,11 +113,20 @@ const abandonSocket = (path: string): void => {
 };
 
 describe("attach canonical-cto requires a wakeable messaging socket", () => {
-  it("refuses a socket outside the state directory, names the fix, and connects to nothing", async () => {
+  it("starts as before when the socket is outside the state directory and Claude Code's own record proves it the claimed session's", async () => {
     const state = scratch();
     const elsewhere = scratch();
     await listen(join(elsewhere, "cc.sock"));
     const run = await attach(state, join(elsewhere, "cc.sock"));
+    expect(run.err).not.toContain("cannot be woken");
+    expect(run.code).toBe(ATTACH_EXIT.CLAIM_REFUSED);
+  });
+
+  it("refuses a socket outside the state directory that no record proves, names the fix, and connects to nothing", async () => {
+    const state = scratch();
+    const elsewhere = scratch();
+    await listen(join(elsewhere, "cc.sock"));
+    const run = await attach(state, join(elsewhere, "cc.sock"), registryNaming(undefined));
     expect(run.code).toBe(ATTACH_EXIT.USAGE);
     expect(run.err).toContain(`start Claude Code with --messaging-socket-path ${state}/cc-session-<name>.sock`);
     expect(run.err.trim().split("\n")).toHaveLength(1);

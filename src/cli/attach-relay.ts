@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 import { lstatSync, readFileSync, watch } from "node:fs";
 import { homedir } from "node:os";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { dirname, join, resolve as resolvePath } from "node:path";
+import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import type { Readable, Writable } from "node:stream";
 
 /**
@@ -753,8 +753,9 @@ const inspectWakeTarget = (socketPath: string): WakeTarget => {
     if (!dir.isDirectory()) return { refusal: "directory-not-a-directory" };
     if (dir.uid !== uid) return { refusal: "directory-owner-mismatch" };
     if ((dir.mode & 0o077) !== 0) return { refusal: "directory-not-owner-only" };
-  } catch {
-    return { refusal: "directory-not-inspectable" };
+  } catch (error) {
+    // A directory that is not there is a vanished target; one that cannot be looked at is not the same fact.
+    return { refusal: isAbsent(error) ? "directory-not-found" : "directory-not-inspectable" };
   }
   try {
     const target = lstatSync(socketPath);
@@ -762,9 +763,15 @@ const inspectWakeTarget = (socketPath: string): WakeTarget => {
     if (!target.isSocket()) return { refusal: "endpoint-not-a-socket" };
     if (target.uid !== uid) return { refusal: "endpoint-owner-mismatch" };
     return { refusal: null, identity: `${target.dev}:${target.ino}` };
-  } catch {
-    return { refusal: "endpoint-not-inspectable" };
+  } catch (error) {
+    return { refusal: isAbsent(error) ? "endpoint-not-found" : "endpoint-not-inspectable" };
   }
+};
+
+/** `lstat` found no such name: the file, or a directory on the way to it, is not there. */
+const isAbsent = (error: unknown): boolean => {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
 };
 
 /** A connect error as the daemon's wake classifies one; a Node error message names the path. */
@@ -784,7 +791,7 @@ const wakeFailureShape = (error: NodeJS.ErrnoException): string => {
  * forward is `refused`.
  */
 const replyShapeOf = (shape: string): string => {
-  if (shape === "endpoint-not-inspectable") return "not-found";
+  if (shape === "endpoint-not-found" || shape === "directory-not-found") return "not-found";
   if (["not-found", "connection-refused", "timeout", "connection-closed", "unclassified"].includes(shape)) return shape;
   return "refused";
 };
@@ -885,7 +892,12 @@ const openWakeProxy = (messaging: SessionMessaging, stderr: Writable): Promise<W
       const after = inspectWakeTarget(messaging.socketPath);
       if (after.refusal !== null) return finish(false, after.refusal);
       if (after.identity !== before.identity) return finish(false, "endpoint-replaced");
-      out.end(`${JSON.stringify({ type: "auth", token: messaging.token })}\n${WAKE_FRAME}`, () => finish(true));
+      // Acknowledged only once the bytes are written: Node calls this with the write's error, and calls it before
+      // the socket's own error event, which the `settled` guard would then discard (#1428 review).
+      out.end(`${JSON.stringify({ type: "auth", token: messaging.token })}\n${WAKE_FRAME}`, (error?: Error | null) => {
+        if (error) finish(false, wakeFailureShape(error as NodeJS.ErrnoException));
+        else finish(true);
+      });
     });
   };
   // Availability is an event. No timer probes the session or disposes of pending work.
@@ -980,8 +992,14 @@ export interface AttachRelayCommandOptions {
  */
 export interface SessionRegistry {
   dir: string;
+  /** This relay's parent pids, nearest first. */
   ancestors: () => number[];
+  /** What a pid is: its executable, its argv[0] and when it started, as the process table says; null when it is gone. */
+  processOf: (pid: number) => { executable: string; argv0: string; startedAt: string | null } | null;
 }
+
+const psField = (field: string, pid: number): string =>
+  execFileSync("ps", ["-o", `${field}=`, "-p", String(pid)], { encoding: "utf8", timeout: 2_000 }).trim();
 
 const defaultSessionRegistry = (): SessionRegistry => ({
   dir: join(process.env["CLAUDE_CONFIG_DIR"] ?? join(homedir(), ".claude"), "sessions"),
@@ -991,43 +1009,72 @@ const defaultSessionRegistry = (): SessionRegistry => ({
     for (let depth = 0; depth < 16 && Number.isInteger(pid) && pid > 1; depth += 1) {
       chain.push(pid);
       try {
-        pid = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8", timeout: 2_000 }).trim());
+        pid = Number(psField("ppid", pid));
       } catch {
         break;
       }
     }
     return chain;
   },
+  processOf: (pid) => {
+    try {
+      const executable = psField("comm", pid);
+      return {
+        executable,
+        argv0: psField("args", pid).split(/\s+/)[0] ?? "",
+        startedAt: psField("lstart", pid) || null,
+      };
+    } catch {
+      return null;
+    }
+  },
 });
+
+/** Claude Code itself: its binary is `claude`, or the versioned one a `claude` launcher resolves to. */
+const isClaudeProcess = (process: { executable: string; argv0: string }): boolean =>
+  basename(process.argv0.replace(/^-/, "")) === "claude" || basename(process.executable) === "claude" ||
+  /\/claude\/versions\/[^/]+$/.test(process.executable);
+
+/** `ps` pads a day of the month with a space where Claude Code's own record does not; compared as words. */
+const sameStart = (recorded: unknown, observed: string | null): boolean =>
+  typeof recorded === "string" && observed !== null && recorded.trim().split(/\s+/).join(" ") === observed.trim().split(/\s+/).join(" ");
 
 /**
  * Proof that `messaging.socketPath` is the socket of the session this attach claims, and no other
- * session's. The environment is the session's own (Claude Code gives it to its child), and this
- * reads it back from the registry: the nearest ancestor with a registry file is the session, its
- * `sessionId` must be the one the claim names, and the socket it bound must be the one the
- * environment gave. Nothing is searched for: a directory of other sessions' sockets is never read,
- * so there is no socket here to select by mistake. Null when proved, else the check that failed.
+ * session's, wherever the socket is. The environment is the session's own (Claude Code gives it to
+ * its child), and this reads it back from Claude Code's own record of it: the session is the
+ * nearest ancestor of this relay that is Claude Code itself (its executable says so, never a shell
+ * or a wrapper between), its registry file must be that very process's (the pid, and the start time
+ * `ps` reports for it), its `sessionId` must be the one the claim names, and the socket it bound must be
+ * the one the environment gave. Nothing is searched for: a directory of other sessions' sockets is
+ * never read, so there is no socket here to select by mistake. Null when proved, else the check that failed.
  */
 const sessionSocketProofFailure = (
   messaging: SessionMessaging,
   claimedSessionUuid: string,
   registry: SessionRegistry,
 ): string | null => {
+  let claude: { pid: number; startedAt: string | null } | null = null;
   for (const pid of registry.ancestors()) {
-    let entry: { pid?: unknown; sessionId?: unknown; messagingSocketPath?: unknown };
-    try {
-      entry = JSON.parse(readFileSync(join(registry.dir, `${pid}.json`), "utf8")) as typeof entry;
-    } catch {
-      continue;
+    const process = registry.processOf(pid);
+    if (process !== null && isClaudeProcess(process)) {
+      claude = { pid, startedAt: process.startedAt };
+      break;
     }
-    if (entry.pid !== pid) continue;
-    if (typeof entry.sessionId !== "string" || entry.sessionId.toLowerCase() !== claimedSessionUuid.toLowerCase()) {
-      return "socket-belongs-to-another-session";
-    }
-    if (entry.messagingSocketPath !== messaging.socketPath) return "socket-is-not-the-sessions-registered-socket";
-    return null;
   }
-  return "session-not-in-registry";
+  if (claude === null) return "no-claude-ancestor";
+  let entry: { pid?: unknown; sessionId?: unknown; messagingSocketPath?: unknown; procStart?: unknown };
+  try {
+    entry = JSON.parse(readFileSync(join(registry.dir, `${claude.pid}.json`), "utf8")) as typeof entry;
+  } catch {
+    return "session-not-in-registry";
+  }
+  if (entry.pid !== claude.pid || !sameStart(entry.procStart, claude.startedAt)) return "registry-entry-is-another-process";
+  if (typeof entry.sessionId !== "string" || entry.sessionId.toLowerCase() !== claimedSessionUuid.toLowerCase()) {
+    return "socket-belongs-to-another-session";
+  }
+  if (entry.messagingSocketPath !== messaging.socketPath) return "socket-is-not-the-sessions-registered-socket";
+  return null;
 };
 
 /** Whether anything accepts connections at `socketPath`: false only on ENOENT or ECONNREFUSED. A slow answer is not a refusal. */
@@ -1049,8 +1096,8 @@ const socketIsListening = (socketPath: string): Promise<boolean> =>
  * its default socket is woken as the one launched with `--messaging-socket-path` is, because the
  * relay's proxy sits in the daemon's state directory and forwards to the session's own socket
  * wherever it is. That socket must be one the daemon's own endpoint checks (`inspectWakeTarget`)
- * would pass, must be listening now, and, outside the state directory, must be proved to be this
- * claimed session's (`sessionSocketProofFailure`).
+ * would pass, must be listening now, and must be proved to be this claimed session's, inside the
+ * state directory as much as outside it (`sessionSocketProofFailure`).
  */
 const unwakeableSessionRefusal = async (
   messaging: SessionMessaging | undefined,
@@ -1065,10 +1112,9 @@ const unwakeableSessionRefusal = async (
   }
   const target = inspectWakeTarget(messaging.socketPath);
   if (target.refusal !== null) return refused(`its messaging socket was refused (${target.refusal})`);
-  if (dirname(messaging.socketPath) !== resolvePath(stateDir)) {
-    const failure = sessionSocketProofFailure(messaging, claimedSessionUuid, registry);
-    if (failure !== null) return refused(`its messaging socket cannot be proved to be this session's (${failure})`);
-  }
+  // Wherever the socket is, inside the state directory or not: the environment's word is not the proof.
+  const failure = sessionSocketProofFailure(messaging, claimedSessionUuid, registry);
+  if (failure !== null) return refused(`its messaging socket cannot be proved to be this session's (${failure})`);
   if (!(await socketIsListening(messaging.socketPath))) {
     return refused("its messaging socket is not listening");
   }

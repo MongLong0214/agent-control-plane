@@ -22,6 +22,7 @@ import {
   type CanonicalCtoFixture,
 } from "../helpers/canonical-cto-reattach.ts";
 import { doorTap } from "../helpers/door-tap.ts";
+import { spawnUnderClaude } from "../helpers/claude-parent.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { fixtureManifest } from "../helpers/harness.ts";
 import {
@@ -314,47 +315,57 @@ const relayRoots = [
  * its process variant cannot be started without one; it runs in process, where the relay behaves
  * as it does for a client that registers its own endpoint. Another tree's build still runs as a process.
  */
-const unproxiedRelay = (f: Started, root: string) =>
+const unproxiedRelay = async (f: Started, root: string) =>
   root === process.cwd() ? inProcessRelay(f) : processRelay(f, root, false);
 
-const processRelay = (f: Started, root: string, messaging: boolean) => {
-  const child = spawn(
+const processRelay = async (f: Started, root: string, messaging: boolean) => {
+  const argv = [
     process.execPath,
-    [
-      "--import",
-      "tsx",
-      join(root, "src", "cli", "agentctl.ts"),
-      "attach",
-      "canonical-cto",
-      "--claimed-session-id",
-      CONVERSATION,
-      "--project-id",
-      PROJECT,
-      "--expected-binding-generation",
-      "1",
-    ],
-    {
-      cwd: root,
-      env: {
-        HOME: f.dir,
-        PATH: process.env["PATH"] ?? "",
-        TMPDIR: f.dir,
-        // The state directory is where the fixture's session socket sits: this tree's attach
-        // refuses a session whose messaging socket is not directly inside it.
-        ACP_STATE_DIR: f.dir,
-        ACP_CLAIM_CANONICAL_CTO_SOCKET: f.paths.claimPath,
-        ACP_CTO_MCP_SOCKET: f.paths.ctoPath,
-        ACP_CANONICAL_CTO_TOOL_SOCKET: f.paths.reattachPath,
-        ...(messaging
-          ? { CLAUDE_CODE_MESSAGING_SOCKET: f.messaging.socketPath, CLAUDE_CODE_MESSAGING_TOKEN: MESSAGING_TOKEN }
-          : {}),
-      },
-      stdio: ["pipe", "pipe", "pipe"],
-    },
-  );
-  children.push(child);
+    "--import",
+    "tsx",
+    join(root, "src", "cli", "agentctl.ts"),
+    "attach",
+    "canonical-cto",
+    "--claimed-session-id",
+    CONVERSATION,
+    "--project-id",
+    PROJECT,
+    "--expected-binding-generation",
+    "1",
+  ];
+  const env = {
+    HOME: f.dir,
+    PATH: process.env["PATH"] ?? "",
+    TMPDIR: f.dir,
+    // The state directory is where the fixture's session socket sits: this tree's attach
+    // refuses a session whose messaging socket is not directly inside it.
+    ACP_STATE_DIR: f.dir,
+    ACP_CLAIM_CANONICAL_CTO_SOCKET: f.paths.claimPath,
+    ACP_CTO_MCP_SOCKET: f.paths.ctoPath,
+    ACP_CANONICAL_CTO_TOOL_SOCKET: f.paths.reattachPath,
+    ...(messaging
+      ? { CLAUDE_CODE_MESSAGING_SOCKET: f.messaging.socketPath, CLAUDE_CODE_MESSAGING_TOKEN: MESSAGING_TOKEN }
+      : {}),
+  };
   // The kernel reports the child as the door's peer; it runs under the stated claude.
-  f.subject.processes.set(child.pid!, { ppid: CLAUDE, startedAt: "darwin-tv:1790000600.000006", argv: ["node", "agentctl", "attach"] });
+  const peer = { ppid: CLAUDE, startedAt: "darwin-tv:1790000600.000006", argv: ["node", "agentctl", "attach"] };
+  let child: ChildProcess;
+  if (root === process.cwd()) {
+    // This tree proves the session's socket from Claude Code's own record of it, so it runs under a stand-in Claude Code
+    // (`tests/helpers/claude-parent.ts`) and the daemon is told the relay's pid before the relay runs.
+    const parent = spawnUnderClaude({
+      dir: join(f.dir, "claude-parent"), home: f.dir, sessionId: CONVERSATION,
+      socketPath: messaging ? f.messaging.socketPath : null, argv, env, cwd: root, autoStart: false,
+    });
+    child = parent.child;
+    children.push(child);
+    f.subject.processes.set(await parent.relayPid(), peer);
+    parent.start();
+  } else {
+    child = spawn(argv[0]!, argv.slice(1), { cwd: root, env, stdio: ["pipe", "pipe", "pipe"] });
+    children.push(child);
+    f.subject.processes.set(child.pid!, peer);
+  }
   let errText = "";
   child.stderr!.setEncoding("utf8");
   child.stderr!.on("data", (chunk: string) => {
@@ -642,7 +653,7 @@ describe("the relay as a process, across a restart", () => {
     for (const proxied of [true, false]) {
       it(`${name}: the last notification after the reattach is answered (${proxied ? "W2, wake proxy" : "W3, no registration"})`, async () => {
         const f = await started();
-        const r = proxied ? processRelay(f, root, true) : unproxiedRelay(f, root);
+        const r = proxied ? await processRelay(f, root, true) : await unproxiedRelay(f, root);
         const init = await r.client.initialize(qualified);
         expect(init.error, r.err()).toBeUndefined();
         const fresh = proxied ? 2 : 1;
@@ -674,7 +685,7 @@ describe("withheld registration answers", () => {
   for (const { name, root } of relayRoots) {
     it(`${name}: a proxied replay's served notification is the one after the held registration is answered`, async () => {
       const f = await started();
-      const r = processRelay(f, root, true);
+      const r = await processRelay(f, root, true);
       expect((await r.client.initialize(qualified)).error).toBeUndefined();
       await refreshed(r.client, 2);
       expect(await until(() => f.endpoint() !== null)).toBe(true);
@@ -700,7 +711,7 @@ describe("withheld registration answers", () => {
 
     it(`${name}: no proxy, the client's own registration held: an early refused refresh, then a served one`, async () => {
       const f = await started();
-      const r = unproxiedRelay(f, root);
+      const r = await unproxiedRelay(f, root);
       expect((await r.client.initialize(qualified)).error).toBeUndefined();
       await refreshed(r.client, 1);
       expect((await r.client.request("tools/call", wakeRegistration(f.wakeEndpoint))).result?.structuredContent)
@@ -723,7 +734,7 @@ describe("withheld registration answers", () => {
 
     it(`${name}: a refused re-registration is followed by a served refresh, with no wake endpoint and no claim`, async () => {
       const f = await started();
-      const r = processRelay(f, root, true);
+      const r = await processRelay(f, root, true);
       expect((await r.client.initialize(qualified)).error).toBeUndefined();
       await refreshed(r.client, 2);
       expect((await r.client.request("tools/call", wakeRegistration(f.wakeEndpoint))).result?.structuredContent)
