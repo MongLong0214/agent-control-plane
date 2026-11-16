@@ -241,16 +241,18 @@ const named = processTable().filter((row) => namesConversation(row.command, old)
 if (named.length > 0) stop(4, 'stop', { refused: 'a process still names the old conversation; the new conversation was not started', remaining: named });
 report('stop', oldRow ? { oldPid, stopped: true } : { oldPid, alreadyGone: true });
 
-// start — the project's local acp-cto entry names the new conversation and the issued generation. It is never
-// restored to the old conversation: the switchover record names the new one, and nothing goes back.
+// start — the project's local acp-cto entry names the new conversation. It is never restored to the old conversation:
+// the switchover record names the new one, and nothing goes back. Its generation is `auto`, not the issued number: the
+// entry outlives this rotation, and a number pinned in it is refused on every relaunch once the role has moved past it.
+// The first claim still lands on exactly `issued` — auto reads the role's highest + 1, and the transfer refuses any other.
 const config = (() => { try { return JSON.parse(readFileSync(join(process.env.HOME ?? homedir(), '.claude.json'), 'utf8')); } catch { return {}; } })();
 const previous = config.projects?.[flags.cwd]?.mcpServers?.['acp-cto'] ?? null;
 const relayArgs = (() => {
-  if (!previous) return [runtimeNode, runtimeCli, 'attach', 'canonical-cto', '--claimed-session-id', to, '--project-id', project, '--expected-binding-generation', String(issued)];
+  if (!previous) return [runtimeNode, runtimeCli, 'attach', 'canonical-cto', '--claimed-session-id', to, '--project-id', project, '--expected-binding-generation', 'auto'];
   const args = [previous.command, ...(previous.args ?? [])];
   const set = (flag, value) => { const at = args.indexOf(flag); if (at !== -1) args[at + 1] = value; };
   set('--claimed-session-id', to);
-  set('--expected-binding-generation', String(issued));
+  set('--expected-binding-generation', 'auto');
   return args;
 })();
 let started = false;

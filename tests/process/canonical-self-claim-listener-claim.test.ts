@@ -28,7 +28,7 @@ import type { Daemon } from "../../src/daemon/daemon.ts";
 import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
 import { allow, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { makeDefaultTranscriptReader } from "../../src/registry/canonical-self-claim.ts";
+import { SelfClaimRefusal, makeDefaultTranscriptReader } from "../../src/registry/canonical-self-claim.ts";
 import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeStartedOperator, type Harness, type StartedOperator } from "../helpers/harness.ts";
@@ -324,10 +324,11 @@ const insertProject = (cp: Harness["cp"], projectId: string): void => {
  * absolute path, an image hash, a peer pid, a transcript fact) — so this is a positive proof of
  * absence, not merely a check that the two fields this test names happen to be present.
  */
-const expectClosedPublicDenial = (result: Decision<unknown>, reasonCode: ReasonCode): void => {
+/** The whole public denial: its code and the fixed name of the branch that refused, and nothing else. */
+const expectClosedPublicDenial = (result: Decision<unknown>, reasonCode: ReasonCode, reason: SelfClaimRefusal): void => {
   expect(result.allowed).toBe(false);
   if (result.allowed) return;
-  expect(result).toEqual({ allowed: false, reasonCode });
+  expect(result).toEqual({ allowed: false, reasonCode, reason });
 };
 
 
@@ -473,7 +474,7 @@ describe("actor.claimCanonicalCto — the real production handler, against real 
         params: { claimedSessionUuid: TEST_SESSION_UUID, projectId, expectedBindingGeneration: 1 },
       });
 
-      expectClosedPublicDenial(result, ReasonCode.CONFLICT);
+      expectClosedPublicDenial(result, ReasonCode.CONFLICT, SelfClaimRefusal.ANCESTRY_HOP_LIMIT);
       expectRolledBack(cp, before, result);
     },
     45_000,

@@ -517,8 +517,14 @@ describe("same-live successor transaction", () => {
     },
   );
 
-  it.each(["execution", "pipeline", "resource", "other-live-holder"] as const)(
-    "same-live recovery refuses outstanding %s after assignment revocation", async (kind) => {
+  // Outstanding work on this very process is a fact no wait changes; another actor holding its session is a live holder.
+  it.each([
+    ["execution", "SAME_LIVE_RUNTIME_MISMATCH"],
+    ["pipeline", "SAME_LIVE_RUNTIME_MISMATCH"],
+    ["resource", "SAME_LIVE_RUNTIME_MISMATCH"],
+    ["other-live-holder", "PREDECESSOR_RUNTIME_ALIVE"],
+  ] as const)(
+    "same-live recovery refuses outstanding %s after assignment revocation, named %s", async (kind, reason) => {
       const { core, first, request, subject, projectId } = await successorFixture();
       const now = core.clock.nowIso();
       core.db.run(`INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal, contract_digest, created_at)
@@ -550,6 +556,7 @@ describe("same-live successor transaction", () => {
       const before = durableSnapshot(core);
       const refused = await subject.claim(request);
       expect(refused.allowed).toBe(false);
+      expect(refused.evidence["reason"]).toBe(reason);
       expectDurablyRolledBack(core, before, refused);
     },
   );
@@ -564,8 +571,15 @@ describe("same-live successor transaction", () => {
    * share stays refused" and "a recycled pid never lets the claimant inherit the predecessor's
    * runtime" below.
    */
-  it.each(["buzz", "draining", "active", "work"] as const)(
-    "same-live recovery refuses %s mismatch leaving only its own refusal row", async (condition) => {
+  // A stored fact of this very process that differs from the claim (its Buzz actor, work it owns) is refused at once,
+  // by a name the relay does not ask again after; a row still moving between states is the one that can settle.
+  it.each([
+    ["buzz", "SAME_LIVE_RUNTIME_MISMATCH"],
+    ["draining", "PREDECESSOR_STILL_SETTLING"],
+    ["active", "PREDECESSOR_RUNTIME_ALIVE"],
+    ["work", "SAME_LIVE_RUNTIME_MISMATCH"],
+  ] as const)(
+    "same-live recovery refuses %s mismatch leaving only its own refusal row, named %s", async (condition, reason) => {
       const { core, first, request, roleKey, projectId } = await successorFixture();
       // The "buzz" condition used to mutate `request.buzzActorId`, which no longer exists: the
       // identity comes from the configured entry now, so the only way the predecessor's stored
@@ -590,6 +604,7 @@ describe("same-live successor transaction", () => {
       const before = durableSnapshot(core);
       const refused = await subject.claim(request);
       expect(refused.allowed).toBe(false);
+      expect(refused.evidence["reason"]).toBe(reason);
       expectDurablyRolledBack(core, before, refused);
     },
   );
@@ -2441,8 +2456,10 @@ describe("CanonicalSelfClaim — the six-clause contract", () => {
     if (refused.allowed) return;
     expect(refused.reasonCode).toBe(ReasonCode.CONFLICT);
     // The same-live branch is what answered; an unreadable token did not route this to the
-    // abandoned-runtime path and then refuse for some unrelated reason further down.
-    expect(refused.message).toBe("same-live recovery requires the exact idle revoked runtime");
+    // abandoned-runtime path and then refuse for some unrelated reason further down. The predecessor
+    // is another process that may still exit, so the name is the one the relay asks again after.
+    expect(refused.message).toMatch(/^same-live recovery requires the exact idle revoked runtime/);
+    expect(refused.evidence["reason"]).toBe("PREDECESSOR_STILL_SETTLING");
     expectDurablyRolledBack(core, before, refused);
     expect(core.sessions.require(predecessor.sessionId).lifecycle).toBe(SessionLifecycle.READY);
   });
@@ -2663,7 +2680,7 @@ describe("every decision claim() hands back leaves exactly one audit row", () =>
       project_id: projectId,
       session_id: null,
       role_key: null,
-      evidence: { identity: OTHER },
+      evidence: { identity: OTHER, reason: "SESSION_NOT_ENTITLED" },
     }]);
     expect(auditTotal(core)).toBe(totalBefore + 1);
   });
@@ -2724,8 +2741,10 @@ describe("every decision claim() hands back leaves exactly one audit row", () =>
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
     expect(result.message).toContain("expected binding generation does not match");
+    // The row names the branch and the two generations it compared: asked 2, next 1.
     expect(claimDecisionRows(core)).toEqual([expect.objectContaining({
       kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: ReasonCode.CONFLICT, project_id: projectId,
+      evidence: { identity: CANON, reason: "GENERATION_MISMATCH", expectedGeneration: 2, nextGeneration: 1 },
     })]);
     expect(auditTotal(core)).toBe(totalBefore + 1);
   });
@@ -2743,7 +2762,7 @@ describe("every decision claim() hands back leaves exactly one audit row", () =>
     if (result.allowed) return;
     expect(result.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
     expect(claimDecisionRows(core)).toEqual([expect.objectContaining({
-      kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: ReasonCode.INVALID_ARGUMENT, evidence: { identity: null },
+      kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: ReasonCode.INVALID_ARGUMENT, evidence: { identity: null, reason: "REQUEST_INVALID" },
     })]);
     expect(JSON.stringify(core.db.all(`SELECT * FROM audit_events`))).not.toContain("arbitrary caller text");
   });
@@ -2764,6 +2783,7 @@ describe("every decision claim() hands back leaves exactly one audit row", () =>
     expect(result.reasonCode).toBe(ReasonCode.NOT_FOUND);
     expect(claimDecisionRows(core)).toEqual([expect.objectContaining({
       kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: ReasonCode.NOT_FOUND, project_id: projectId,
+      evidence: { identity: CANON, reason: "BUZZ_ROOM_UNRESOLVED" },
     })]);
     expect(auditTotal(core)).toBe(totalBefore + 1);
   });
@@ -2839,7 +2859,7 @@ describe("every decision claim() hands back leaves exactly one audit row", () =>
       project_id: null,
       session_id: null,
       role_key: null,
-      evidence: { identity: CANON },
+      evidence: { identity: CANON, reason: "REQUEST_INVALID" },
     }]);
     expect(auditTotal(core)).toBe(totalBefore + 1);
     const everyAuditRow = JSON.stringify(core.db.all(`SELECT * FROM audit_events`));
