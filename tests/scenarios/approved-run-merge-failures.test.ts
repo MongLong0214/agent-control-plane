@@ -1101,6 +1101,119 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
 });
 
 /**
+ * #1414 — a released merge-branch claim must not strand a CEO-approved run: the owner's release of it is refused
+ * while the run can still finalize, and when it was released anyway the run's current owner may take back exactly
+ * that branch, after which a CEO CONFIRM of the same candidate re-enters finalization.
+ */
+describe("#1414 — the claim on the branch an approved candidate merges", () => {
+  const ownerClaim = (fixture: Fixture, request: { branch?: string | null; worktreeId?: string | null; declaredPaths?: string[] }, as: { sessionId?: string; generation?: number } = {}) => {
+    const { harness, driven } = fixture;
+    return harness.cp.claims.acquire({
+      runId: driven.runId,
+      ownerSessionId: as.sessionId ?? driven.ownerSessionId,
+      ownerBindingGeneration: as.generation ?? driven.ownerBindingGeneration,
+      ownerRoleKey: harness.cp.runs.require(driven.runId).ownerRoleKey!,
+      repositoryIdentity: driven.identity,
+      ...request,
+    });
+  };
+  const releaseAll = (fixture: Fixture): void => {
+    const { harness, driven } = fixture;
+    for (const claim of harness.cp.db.all<{ claim_id: string }>("SELECT claim_id FROM resource_claims WHERE run_id = ? AND status = 'HELD'", [driven.runId])) {
+      expect(harness.cp.claims.release(claim.claim_id, driven.runId).allowed).toBe(true);
+    }
+  };
+  const confirmAgain = async (fixture: Fixture, candidateSnapshotDigest: string) => {
+    const { harness, driven } = fixture;
+    await harness.cp.continuity.evaluate("claim recovery");
+    return harness.cp.ceo.submitCeoDecision({
+      runId: driven.runId,
+      decision: "CONFIRM",
+      candidateSnapshotDigest,
+      ceoSessionId: harness.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId,
+      rationale: "claim recovered; same candidate",
+    });
+  };
+
+  it("a released merge-branch claim is recovered by the run's owner for that branch only, and a CEO CONFIRM of the same candidate re-enters finalization and merges", async () => {
+    const fixture = await approved();
+    const { harness, driven, daemon } = fixture;
+    releaseAll(fixture);
+    expect((await daemon.start()).allowed).toBe(true);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
+    expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "FINALIZATION_RETRIES_EXHAUSTED")).toHaveLength(1);
+    expect(fixture.github.mergeCount).toBe(0);
+
+    // Another branch, a path and a worktree stay refused in this state.
+    for (const refused of [
+      ownerClaim(fixture, { branch: "feature/other" }),
+      ownerClaim(fixture, { branch: driven.workBranch, declaredPaths: ["src/x.ts"] }),
+      ownerClaim(fixture, { branch: null, declaredPaths: ["src/x.ts"] }),
+      ownerClaim(fixture, { branch: driven.workBranch, worktreeId: harness.repoPath }),
+    ]) {
+      expect(refused.allowed).toBe(false);
+      expect(refused.reasonCode).toBe(ReasonCode.CLAIM_OWNER_NOT_RUN_OWNER);
+    }
+    expect(harness.cp.db.all("SELECT 1 FROM resource_claims WHERE run_id = ? AND status = 'HELD'", [driven.runId])).toHaveLength(0);
+
+    // A CONFIRM of another candidate is not a re-entry.
+    const other = await confirmAgain(fixture, `sha256:${"0".repeat(64)}`);
+    expect(other.allowed).toBe(false);
+
+    const recovered = ownerClaim(fixture, { branch: driven.workBranch });
+    expect(recovered.reasonCode).toBe(ReasonCode.OK);
+    const confirmed = await confirmAgain(fixture, driven.candidateSnapshotDigest);
+    expect(confirmed.reasonCode).toBe(ReasonCode.OK);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
+    expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CEO_CONFIRM_REENTRY")).toHaveLength(1);
+
+    // The daemon callback a CONFIRM triggers (`onCeoApproved`) runs finalization although its retries were exhausted.
+    const finalized = await daemon.finalizeApprovedRun(driven.runId);
+    expect(finalized.reasonCode).toBe(ReasonCode.OK);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+    expect(fixture.github.mergeCount).toBe(1);
+    expect(harness.cp.audit.forRun(driven.runId).filter((entry) => entry.kind === "CEO_APPROVAL_INVALIDATED")).toHaveLength(0);
+    await daemon.stop();
+  });
+
+  it("a different owner session or generation may not recover the claim", async () => {
+    const fixture = await approved();
+    const { harness, driven, daemon } = fixture;
+    releaseAll(fixture);
+    const wrongSession = ownerClaim(fixture, { branch: driven.workBranch }, { sessionId: "sess_not_the_owner" });
+    expect(wrongSession.allowed).toBe(false);
+    expect(wrongSession.reasonCode).toBe(ReasonCode.CLAIM_OWNER_NOT_RUN_OWNER);
+    const wrongGeneration = ownerClaim(fixture, { branch: driven.workBranch }, { generation: driven.ownerBindingGeneration + 1 });
+    expect(wrongGeneration.allowed).toBe(false);
+    expect(wrongGeneration.reasonCode).toBe(ReasonCode.CLAIM_OWNER_GENERATION_REVOKED);
+    expect(harness.cp.db.all("SELECT 1 FROM resource_claims WHERE run_id = ? AND status = 'HELD'", [driven.runId])).toHaveLength(0);
+    await daemon.stop();
+  });
+
+  it("the owner's resource_release of the branch the frozen candidate merges is refused while the run can finalize, by claim and as release-all, and nothing is kept once the run has no frozen candidate", async () => {
+    const fixture = await approved();
+    const { harness, driven, daemon } = fixture;
+    const held = harness.cp.db.all<{ claim_id: string; branch: string | null }>(
+      "SELECT claim_id, branch FROM resource_claims WHERE run_id = ? AND status = 'HELD'", [driven.runId]);
+    const branchClaim = held.find((claim) => claim.branch === driven.workBranch)!;
+    expect(branchClaim).toBeDefined();
+    const refused = harness.cp.claims.release(branchClaim.claim_id, driven.runId, { keepMergedBranch: true });
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.CLAIM_RELEASE_REFUSED);
+    expect(refused.allowed ? "" : refused.message).toMatch(/frozen candidate merges that branch/);
+    const all = harness.cp.claims.releaseOwned(driven.runId);
+    expect(all.allowed).toBe(false);
+    expect(all.reasonCode).toBe(ReasonCode.CLAIM_RELEASE_REFUSED);
+    expect(harness.cp.db.get<{ status: string }>("SELECT status FROM resource_claims WHERE claim_id = ?", [branchClaim.claim_id])!.status).toBe("HELD");
+
+    // Without a current frozen candidate nothing is kept.
+    harness.cp.db.run("UPDATE runs SET current_candidate_digest = NULL WHERE run_id = ?", [driven.runId]);
+    expect(harness.cp.claims.release(branchClaim.claim_id, driven.runId, { keepMergedBranch: true }).allowed).toBe(true);
+    await daemon.stop();
+  });
+});
+
+/**
  * #1189 — a run the finalizer ends FAILED tells the CEO once. A notice no CEO could take then (none bound) is kept
  * owed, durably, and the finalization sweep sends it, once, to the CEO binding current when one is bound. Sending it
  * is a notice only: the run stays as its failure left it.

@@ -641,7 +641,7 @@ export class ProductionGate {
    * between packet and confirm, the confirm is void rather than approximately right.
    */
   submitCeoDecision(input: CeoDecisionInput): Decision<{ state: RunState }> {
-    const reentry = this.contractChangeConsumerReentry(input);
+    const reentry = this.contractChangeConsumerReentry(input) ?? this.approvedRunReentry(input);
     if (reentry) return reentry;
     const admitted = this.admitCeoDecision(input, "decide");
     if (!admitted.allowed) return admitted as Decision<{ state: RunState }>;
@@ -805,6 +805,38 @@ export class ProductionGate {
       if (isAcpError(error)) return deny(error.reasonCode, error.message, error.evidence);
       throw error;
     }
+  }
+
+  /**
+   * #1414 — a CONFIRM of the candidate an ordinary run is already approved on does not decide again: it asks the
+   * daemon to run finalization once more, as the CONFIRM that approved it did. That is how a run whose finalization
+   * stopped on an authority the CEO could restore (MERGE_CLAIM_INVALID, held by the run's owner re-claiming its merge
+   * branch) resumes without a new candidate. Same CEO-role checks as a CONFIRM; a different candidate, a
+   * CONTRACT_CHANGE (its own re-entry above) and a bootstrap are not such a re-entry: null.
+   */
+  private approvedRunReentry(input: CeoDecisionInput): Decision<{ state: RunState }> | null {
+    if (input.decision !== "CONFIRM") return null;
+    const run = this.runs.get(input.runId);
+    if (
+      !run || run.kind === RunKind.CONTRACT_CHANGE || run.kind === RunKind.PROJECT_BOOTSTRAP ||
+      (run.state !== RunState.CEO_APPROVED && run.state !== RunState.MERGING) ||
+      this.runs.currentCandidate(input.runId) !== input.candidateSnapshotDigest
+    ) {
+      return null;
+    }
+    const continuity = this.assertCompletionAllowed(input.runId);
+    if (!continuity.allowed) return continuity as Decision<{ state: RunState }>;
+    const holds = this.assertCurrentCeo(input.ceoSessionId);
+    if (!holds.allowed) return holds as Decision<{ state: RunState }>;
+    const independence = this.bindings.assertFinalCeoIndependence(input.runId, input.ceoSessionId);
+    if (!independence.allowed) return independence as Decision<{ state: RunState }>;
+    this.audit.record({
+      kind: "CEO_CONFIRM_REENTRY",
+      runId: input.runId,
+      sessionId: input.ceoSessionId,
+      evidence: { candidateSnapshotDigest: input.candidateSnapshotDigest, state: run.state, rationale: input.rationale },
+    });
+    return allow(ReasonCode.OK, { state: run.state });
   }
 
   /**
