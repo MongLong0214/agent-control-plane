@@ -21,8 +21,10 @@ Where a feature's acceptance is actually executed and what shows it. This maps e
 contract fields; it adds no schema, gate or recipe, and it grants nothing: the authority stays with the
 approved `TaskContract.acceptance` (read by the reviewer verbatim), the pinned manifest's
 `verificationCommands` and the official verification output (read by the reviewer under "Untrusted
-execution evidence"). `PLAN.verificationIntent` and a task's `spec` guide the producer and reach no
-reviewer, so a claim that matters has to be an assertion the official command prints.
+execution evidence"). In an ordinary candidate review, `PLAN.verificationIntent` and a task's `spec` are
+not read, so a claim that matters has to be an assertion the official command prints. Bootstrap-plan
+review (with the task's `spec.completionCriteria`) and contract-change review do receive the PLAN's
+verification intent, as what the author says it intends, never as execution evidence.
 
 The pattern a project's command follows, shown end to end in
 [`i1422-feature-verification-pilot.test.ts`](../tests/unit/i1422-feature-verification-pilot.test.ts):
