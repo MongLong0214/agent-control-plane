@@ -10,6 +10,7 @@ import {
   beforeChangeCoverage,
   beforeChangeProposal,
   beforeChangeSection,
+  withoutSupplement,
   draftFromReply,
   workerCommitLoreSection,
 } from "../bootstrap/commitlore-commit.ts";
@@ -3670,7 +3671,7 @@ const workerTaskPrompt = (facts: TurnFacts): string =>
     "You are the implementer for one task of a managed run. Make the change by editing files in this working tree.",
     "",
     `Task: ${facts.taskTitle}`,
-    `Specification (JSON): ${JSON.stringify(facts.taskSpec)}`,
+    `Specification (JSON): ${JSON.stringify(withoutSupplement(facts.taskSpec))}`,
     frontierReviewPolicy(),
     "",
     "Rules:",

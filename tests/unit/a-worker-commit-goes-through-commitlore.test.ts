@@ -900,6 +900,24 @@ describe("#1268 (C): CommitLore's context and guard reach a worker before it edi
     expect(transcripts[0]).not.toContain("CommitLore before-change context");
     expect(transcripts[0]).not.toContain("keeps its exports stable");
   });
+
+  it("(i) a task spec's retired commitloreSupplement is in neither the prompt nor the transcript a draft is verified against, so a quote of it is no evidence", async () => {
+    const subject = world("required");
+    const task = subject.db.get<{ spec_json: string }>(`SELECT spec_json FROM tasks WHERE task_id = ?`, [subject.taskId])!;
+    subject.db.run(`UPDATE tasks SET spec_json = ? WHERE task_id = ?`, [
+      JSON.stringify({ ...(JSON.parse(task.spec_json) as Record<string, unknown>), commitloreSupplement: [{ path: "src", base: "any", contextText: "Limit: only the supplement says this" }] }),
+      subject.taskId,
+    ]);
+    const { port, transcripts } = lookupPort();
+    const adapter = fakeFor(subject, replyFor("required"));
+    await start(subject, adapter, { commitlore: port });
+
+    expect(succeededEvidence(subject)).toBeDefined();
+    expect(adapter.requests[0]!.prompt).not.toContain("only the supplement says this");
+    expect(adapter.requests[0]!.prompt).not.toContain("commitloreSupplement");
+    expect(transcripts).toHaveLength(1);
+    expect(transcripts[0]).not.toContain("only the supplement says this");
+  });
 });
 
 /**

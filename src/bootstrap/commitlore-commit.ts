@@ -501,9 +501,22 @@ const utf8Prefix = (text: string, bytes: number): string => {
   return text.slice(0, end);
 };
 
-/** #1268 — what `guard` checks: the task's title, then at most 2 KB of its specification, without its target. */
+/**
+ * #1268 — the task spec the worker's prompt and the transcript its draft is verified against carry: without
+ * `commitloreSupplement`, a field a run owner once used to supply a CommitLore lookup by hand and which nothing reads
+ * any more. A quote found only there is no evidence of what the worker said or did, so it is never part of either.
+ */
+export const COMMITLORE_SUPPLEMENT_FIELD = "commitloreSupplement";
+export const withoutSupplement = (spec: unknown): unknown => {
+  if (!isPlainObject(spec) || !(COMMITLORE_SUPPLEMENT_FIELD in spec)) return spec;
+  const { [COMMITLORE_SUPPLEMENT_FIELD]: _supplement, ...rest } = spec;
+  return rest;
+};
+
+/** #1268 — what `guard` checks: the task's title, then at most 2 KB of its specification, without its target or supplement. */
 export const beforeChangeProposal = (title: string, spec: unknown): string => {
-  const { writeTarget: _target, ...rest } = isPlainObject(spec) ? spec : { spec };
+  const summary = withoutSupplement(spec);
+  const { writeTarget: _target, ...rest } = isPlainObject(summary) ? summary : { spec: summary };
   return `${title}\n\n${utf8Prefix(JSON.stringify(rest), BEFORE_CHANGE_PROPOSAL_SPEC_BYTES)}\n`;
 };
 
