@@ -304,6 +304,9 @@ export interface HumanGateStatusPort {
   };
 }
 
+/** #1268 — the message CommitLore checked before a governed merge was sent: the pull, its exact head and the message's digest. */
+const MERGE_MESSAGE_CHECKED = "MERGE_MESSAGE_CHECKED";
+
 /**
  * #1268 — the message a merge commit GitHub creates for a pull request is sent with it, so it is known, and CommitLore
  * has checked it, before the commit exists. GitHub's own wording for the title; a body that names the pull request in
@@ -2645,6 +2648,18 @@ export class GitHubKernel {
       }
       return proof as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
+    // #1268 — a merge this build has not proven yet (an unknown outcome being settled) is read back as the normal path
+    // reads one: the message that landed is the one CommitLore checked before the request, when there is a record of it,
+    // and CommitLore checks it as it landed. One proven already (a settlement that only carries its notes) is not read again.
+    if (provenMergeCommitSha === null && commitloreGoverned(this.db, input.runId)) {
+      const readBack = await this.verifyLandedMerge(
+        input, slug.value.owner, slug.value.repo, observedMergeCommitSha, this.checkedMergeMessageDigest(input),
+      );
+      if (!readBack.allowed) {
+        this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, observedMergeCommitSha, readBack);
+        return readBack as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+      }
+    }
     // #1269 — the merge is proven, so its candidate's notes are carried as on the merge path: without that, a
     // notes upload that failed once would leave the merged pull PENDING on every later settlement.
     const notesTarget = this.writeTarget(input.runId, input.repositoryIdentity, prepared.value.head);
@@ -2814,6 +2829,13 @@ export class GitHubKernel {
     if (merging !== null) {
       const checked = await this.checkedMergeCommit(input, merging.message, "before");
       if (!checked.allowed) return checked as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+      // What was checked, kept so that a retry after a lost answer can tell the message that landed from it.
+      const kept = this.audit.record({
+        kind: MERGE_MESSAGE_CHECKED,
+        runId: input.runId,
+        evidence: { repositoryIdentity: input.repositoryIdentity, pullNumber: input.pullNumber, exactHead: input.exactHeadSha, messageDigest: sha256(merging.message.trimEnd()) },
+      });
+      if (!kept.allowed) return kept as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
 
     // FD-R1-RACE — the evaluation above was followed by awaited reads (the preflight and the base-in-head
@@ -3006,13 +3028,7 @@ export class GitHubKernel {
     // #1268 — and what landed is read back: the message GitHub made the commit with is the one CommitLore checked, and
     // CommitLore checks it as it landed. A merge commit that is not is a failed proof of the merge, as a wrong parent is.
     if (merging !== null) {
-      const landed = await this.landedMergeMessage(owner, repo, mergeCommitSha);
-      const unlike = landed === null || landed.trimEnd() !== merging.message.trimEnd();
-      const readBack = unlike
-        ? deny(ReasonCode.VERIFICATION_GAP, "the merge commit's message could not be read back as the one CommitLore checked", {
-            refusal: "MERGE_COMMIT_MESSAGE_CHANGED", phase: "merge-commitlore", pullNumber: input.pullNumber, mergeCommitSha, landed,
-          })
-        : await this.checkedMergeCommit(input, landed, "after");
+      const readBack = await this.verifyLandedMerge(input, owner, repo, mergeCommitSha, sha256(merging.message.trimEnd()));
       if (!readBack.allowed) {
         this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, readBack);
         return readBack as Decision<{ mergeCommitSha: string; replayed: boolean }>;
@@ -3061,6 +3077,36 @@ export class GitHubKernel {
     if (!checkout) return deny(ReasonCode.EVIDENCE_MISSING, "the repository's checkout is not registered, so CommitLore cannot check the merge commit", evidence);
     const checked = await this.checkMergeCommit({ checkout, message });
     return checked.allowed ? checked : deny(checked.reasonCode, checked.message, { ...checked.evidence, ...evidence });
+  }
+
+  /** #1268 — the digest of the merge message CommitLore last checked for this pull's exact head, or null when none is recorded. */
+  private checkedMergeMessageDigest(input: MergeInput): string | null {
+    return this.db.get<{ digest: string | null }>(
+      `SELECT json_extract(evidence_json, '$.messageDigest') AS digest FROM audit_events
+        WHERE kind = ? AND run_id = ? AND json_extract(evidence_json, '$.pullNumber') = ? AND json_extract(evidence_json, '$.exactHead') = ?
+        ORDER BY event_id DESC LIMIT 1`,
+      [MERGE_MESSAGE_CHECKED, input.runId, input.pullNumber, input.exactHeadSha],
+    )?.digest ?? null;
+  }
+
+  /**
+   * #1268 — a merge commit read back from GitHub: its message is the one CommitLore checked (`checkedDigest`, when there
+   * is one), and CommitLore checks the message as it landed. Either failing is a failed proof of the merge.
+   */
+  private async verifyLandedMerge(
+    input: MergeInput,
+    owner: string,
+    repo: string,
+    mergeCommitSha: string,
+    checkedDigest: string | null,
+  ): Promise<Decision<void>> {
+    const landed = await this.landedMergeMessage(owner, repo, mergeCommitSha);
+    if (landed === null || (checkedDigest !== null && sha256(landed.trimEnd()) !== checkedDigest)) {
+      return deny(ReasonCode.VERIFICATION_GAP, "the merge commit's message could not be read back as the one CommitLore checked", {
+        refusal: "MERGE_COMMIT_MESSAGE_CHANGED", phase: "merge-commitlore", pullNumber: input.pullNumber, mergeCommitSha, landed,
+      });
+    }
+    return this.checkedMergeCommit(input, landed, "after");
   }
 
   /** #1268 — the message a merge commit landed with, as GitHub reports it; null when it cannot be read. */

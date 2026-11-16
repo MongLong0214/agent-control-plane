@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterAll, describe, expect, it, vi } from "vitest";
 
-import { type Decision, allow, deny } from "../../src/core/errors.ts";
+import { type Decision, acpError, allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { type GitHubKernelOptions, NO_HUMAN_GATE_DIGEST } from "../../src/github/github-kernel.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
@@ -423,5 +423,56 @@ describe("#1268 the merge commit GitHub creates goes through CommitLore", () => 
     const failed = await fixture.merge();
     expect(failed, JSON.stringify(failed)).toMatchObject({ allowed: false, reasonCode: ReasonCode.VERIFICATION_GAP, evidence: { refusal: "MERGE_COMMIT_MESSAGE_CHANGED" } });
     expect(fixture.github.mergeCount).toBe(1);
+  });
+
+  /** The first merge request is applied by GitHub and its answer is lost; GitHub's pull then names the merge. */
+  const loseTheAnswer = (fixture: Fixture): void => {
+    const request = fixture.github.request.bind(fixture.github);
+    let lost = true;
+    fixture.github.request = async <T>(method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE", path: string, body?: unknown): Promise<T> => {
+      const response = await request<T>(method, path, body);
+      if (lost && method === "PUT" && /\/pulls\/\d+\/merge$/.test(path)) {
+        lost = false;
+        throw acpError(ReasonCode.PROBE_FAILED, "GitHub App API request failed", { operation: method });
+      }
+      return response;
+    };
+  };
+
+  it("a merge whose answer was lost is read back on the retry: the landed message is the one CommitLore checked, and CommitLore checks it again", async () => {
+    const checked: string[] = [];
+    const fixture = await setup({ kernel: { checkMergeCommit: async ({ message }) => { checked.push(message); return allow(ReasonCode.OK, undefined); } } });
+    loseTheAnswer(fixture);
+    const first = await fixture.merge();
+    expect(first.allowed).toBe(false);
+    const retry = await fixture.merge();
+    expect(retry.reasonCode, retry.allowed ? "" : `${retry.message} ${JSON.stringify(retry.evidence)}`).toBe(ReasonCode.MERGE_IDEMPOTENT_REPLAY);
+    expect(fixture.github.mergeCount).toBe(1);
+    expect(checked).toHaveLength(2);
+    expect(checked[1]).toBe(checked[0]);
+  });
+
+  it("a merge whose answer was lost and which GitHub applied with another message is not accepted on the retry", async () => {
+    const checked: string[] = [];
+    const fixture = await setup({ kernel: { checkMergeCommit: async ({ message }) => { checked.push(message); return allow(ReasonCode.OK, undefined); } } });
+    fixture.github.nextMergeMessage = "Merge pull request #1\n\nWarn: edited after the check\nRecord-Id: r-feedfacecafe";
+    loseTheAnswer(fixture);
+    expect((await fixture.merge()).allowed).toBe(false);
+    const retry = await fixture.merge();
+    expect(retry, JSON.stringify(retry)).toMatchObject({ allowed: false, reasonCode: ReasonCode.VERIFICATION_GAP, evidence: { refusal: "MERGE_COMMIT_MESSAGE_CHANGED" } });
+    expect(mergeReceipts(fixture).every((receipt) => receipt.verified === 0)).toBe(true);
+    expect(fixture.github.mergeCount).toBe(1);
+  });
+
+  it("a merge whose answer was lost, when CommitLore refuses the landed message on the retry, is not accepted", async () => {
+    let calls = 0;
+    const fixture = await setup({
+      kernel: { checkMergeCommit: async () => (++calls === 1 ? allow(ReasonCode.OK, undefined) : deny(ReasonCode.VERIFICATION_GAP, "CommitLore refused the landed message", { refusal: "COMMITLORE_MESSAGE_REFUSED" })) },
+    });
+    loseTheAnswer(fixture);
+    expect((await fixture.merge()).allowed).toBe(false);
+    const retry = await fixture.merge();
+    expect(retry, JSON.stringify(retry)).toMatchObject({ allowed: false, evidence: { refusal: "COMMITLORE_MESSAGE_REFUSED" } });
+    expect(mergeReceipts(fixture).every((receipt) => receipt.verified === 0)).toBe(true);
   });
 });
