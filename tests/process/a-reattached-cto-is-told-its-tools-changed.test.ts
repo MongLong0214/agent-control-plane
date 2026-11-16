@@ -309,6 +309,14 @@ const relayRoots = [
   ...(process.env["ACP_COMPAT_RELAY_ROOT"] ? [{ name: "ACP_COMPAT_RELAY_ROOT", root: process.env["ACP_COMPAT_RELAY_ROOT"] }] : []),
 ];
 
+/**
+ * A relay with no wake proxy. This tree's `attach` refuses a session with no messaging socket, so
+ * its process variant cannot be started without one; it runs in process, where the relay behaves
+ * as it does for a client that registers its own endpoint. Another tree's build still runs as a process.
+ */
+const unproxiedRelay = (f: Started, root: string) =>
+  root === process.cwd() ? inProcessRelay(f) : processRelay(f, root, false);
+
 const processRelay = (f: Started, root: string, messaging: boolean) => {
   const child = spawn(
     process.execPath,
@@ -331,6 +339,9 @@ const processRelay = (f: Started, root: string, messaging: boolean) => {
         HOME: f.dir,
         PATH: process.env["PATH"] ?? "",
         TMPDIR: f.dir,
+        // The state directory is where the fixture's session socket sits: this tree's attach
+        // refuses a session whose messaging socket is not directly inside it.
+        ACP_STATE_DIR: f.dir,
         ACP_CLAIM_CANONICAL_CTO_SOCKET: f.paths.claimPath,
         ACP_CTO_MCP_SOCKET: f.paths.ctoPath,
         ACP_CANONICAL_CTO_TOOL_SOCKET: f.paths.reattachPath,
@@ -631,7 +642,7 @@ describe("the relay as a process, across a restart", () => {
     for (const proxied of [true, false]) {
       it(`${name}: the last notification after the reattach is answered (${proxied ? "W2, wake proxy" : "W3, no registration"})`, async () => {
         const f = await started();
-        const r = processRelay(f, root, proxied);
+        const r = proxied ? processRelay(f, root, true) : unproxiedRelay(f, root);
         const init = await r.client.initialize(qualified);
         expect(init.error, r.err()).toBeUndefined();
         const fresh = proxied ? 2 : 1;
@@ -689,7 +700,7 @@ describe("withheld registration answers", () => {
 
     it(`${name}: no proxy, the client's own registration held: an early refused refresh, then a served one`, async () => {
       const f = await started();
-      const r = processRelay(f, root, false);
+      const r = unproxiedRelay(f, root);
       expect((await r.client.initialize(qualified)).error).toBeUndefined();
       await refreshed(r.client, 1);
       expect((await r.client.request("tools/call", wakeRegistration(f.wakeEndpoint))).result?.structuredContent)
