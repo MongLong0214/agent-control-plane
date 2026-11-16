@@ -71,7 +71,9 @@ describe("the session probe's argv carries the WORKER turn's isolation (#1077)",
     }));
     expect(argv).toEqual([
       "-p", "--output-format", "json", "--model", "opus", "--session-id", SESSION,
-      "--settings", JSON.stringify({ hooks: {}, enabledPlugins: {} }),
+      "--settings", JSON.stringify({
+        hooks: {}, enabledPlugins: {}, attribution: { commit: "", pr: "" }, includeCoAuthoredBy: false,
+      }),
       "--setting-sources", "project,local",
       "--mcp-config", JSON.stringify({ mcpServers: {} }),
       "--strict-mcp-config",
@@ -109,6 +111,10 @@ describe("the session probe's argv carries the WORKER turn's isolation (#1077)",
     }
     expect(probe).toContain("--strict-mcp-config");
     expect(worker).toContain("--strict-mcp-config");
+    // A worker's commits carry no session attribution: the publication scan refuses a session trailer.
+    expect(JSON.parse(valueAfter(worker, "--settings")!)).toMatchObject({
+      attribution: { commit: "", pr: "" }, includeCoAuthoredBy: false,
+    });
   });
 });
 

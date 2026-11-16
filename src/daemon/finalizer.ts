@@ -127,6 +127,10 @@ const REVISION_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
   ReasonCode.MERGE_CHECK_FAILED,
   ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED,
   ReasonCode.PR_BRANCH_CONTRACT_VIOLATION,
+  // The publication scan read the candidate's own content (a forbidden pattern, or more paths or text than a publication
+  // may send): the same candidate is refused every time, so only a new candidate can pass.
+  ReasonCode.BRANCH_PUBLISH_CONTENT_REFUSED,
+  ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED,
 ]);
 
 /**
