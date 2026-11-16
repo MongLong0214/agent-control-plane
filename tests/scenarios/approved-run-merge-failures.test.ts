@@ -20,6 +20,8 @@ afterAll(cleanupTempDirs);
  */
 
 const WORKFLOW_PATH = ".github/workflows/ci.yml";
+/** The record the candidate's commit carries, which a note mirrors (a governed run carries only a commit's own record, #1268). */
+const NOTE_RECORD = { id: "r-note00000001", trailers: "Limit: a record kept only in a note" };
 const WORKFLOW = "name: project-ci\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node verify.js\n";
 const MINUTE = 60_000;
 type HttpMethod = "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
@@ -75,6 +77,7 @@ const approved = async (options: {
   writeFiles(harness.repoPath, { [WORKFLOW_PATH]: WORKFLOW });
   commitAll(harness.repoPath, "add trusted project CI workflow");
   const driven = await driveToReviewedCandidate(harness, {
+    commitRecord: NOTE_RECORD,
     workBranch: "feature/B5-merge",
     manifestOverrides: {
       ciWorkflows: [{ path: WORKFLOW_PATH, checkName: "project-ci", approvedDigest: sha256(WORKFLOW), unapprovedFirstActivation: false, repositoryRole: "primary" }],
@@ -595,7 +598,7 @@ describe("#1189 B5 — an approved run that cannot merge has an exit", () => {
 
   /** A record kept only as a CommitLore note on the candidate head, the way a capture stores one; its blob id. */
   const noteOnCandidate = ({ harness, driven }: Fixture): string => {
-    gitSync(harness.repoPath, ["notes", "--ref=commitlore", "add", "-m", "Limit: a record kept only in a note", driven.candidateHead]);
+    gitSync(harness.repoPath, ["notes", "--ref=commitlore", "add", "-m", `${NOTE_RECORD.trailers}\nRecord-Id: ${NOTE_RECORD.id}`, driven.candidateHead]);
     return gitSync(harness.repoPath, ["notes", "--ref=commitlore", "list", driven.candidateHead]);
   };
   const isNotesRefWrite = (method: HttpMethod, path: string, body?: unknown): boolean =>

@@ -424,7 +424,7 @@ describe("round-two GitHub hardening", () => {
     expect(fixture.github.mergeCount).toBe(1);
     expect(
       fixture.github.calls.find((call) => call.method === "PUT" && call.path.endsWith("/merge"))?.body,
-    ).toEqual({ sha: fixture.driven.candidateHead, merge_method: "merge" });
+    ).toMatchObject({ sha: fixture.driven.candidateHead, merge_method: "merge" });
     const receipt = fixture.harness.cp.db.get<{ response_json: string }>(
       `SELECT response_json FROM github_receipts WHERE operation = 'merge_execute'`,
     );

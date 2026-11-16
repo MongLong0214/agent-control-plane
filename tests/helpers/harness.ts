@@ -178,10 +178,17 @@ console.log('verification ok');`,
       value: (...args: Parameters<typeof finishExecution>) => {
         const finished = finishExecution(...args);
         const head = /^sha256:([0-9a-f]{40,64})$/.exec(args[1].resultDigest ?? "")?.[1];
-        // A result digest that names a commit of the fixture's repository; a witness that seeds its own receipt, under
+        // A result digest that names a commit of the repository the execution ran in; a witness that seeds its own receipt, under
         // a digest of its own, is not given a second.
-        const names = head !== undefined && (() => { try { return execFileSync("git", ["cat-file", "-t", head], { cwd: repoPath, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 30_000 }).trim() === "commit"; } catch { return false; } })();
-        if (finished.allowed && args[1].status === "SUCCEEDED" && head !== undefined && names) {
+        const checkout = finished.allowed
+          ? cp.db.get<{ checkout_path: string }>(
+              `SELECT r.checkout_path FROM task_executions e JOIN repositories r ON r.repository_id = e.repository_id WHERE e.execution_id = ?`,
+              [finished.value.executionId],
+            )?.checkout_path ?? repoPath
+          : repoPath;
+        const names = head !== undefined && (() => { try { return execFileSync("git", ["cat-file", "-t", head], { cwd: checkout, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 30_000 }).trim() === "commit"; } catch { return false; } })();
+        const receipted = finished.allowed && cp.audit.byKind(WorkerTurnEvent.SUCCEEDED).some((row) => row.evidence["executionId"] === finished.value.executionId);
+        if (finished.allowed && args[1].status === "SUCCEEDED" && head !== undefined && names && !receipted) {
           cp.audit.record({
             kind: WorkerTurnEvent.SUCCEEDED,
             runId: finished.value.runId,
@@ -491,10 +498,10 @@ export const startWorkBranch = (repoPath: string, branch: string = "task/T1-app"
 };
 
 /** The change that makes `verify.js` pass. */
-export const applyPassingChange = (repoPath: string, branch?: string): string => {
+export const applyPassingChange = (repoPath: string, branch?: string, message = "make app() return 2"): string => {
   startWorkBranch(repoPath, branch);
   writeFiles(repoPath, { "src/app.js": "module.exports = () => 2;\n" });
-  return commitAll(repoPath, "make app() return 2");
+  return commitAll(repoPath, message);
 };
 
 /** A change that leaves `verify.js` failing. */
@@ -556,6 +563,11 @@ export const driveToReviewedCandidate = async (
     /** A project whose repository was registered by the bootstrap activation path. */
     registeredProject?: { projectId: string; repositoryId: string; identity: string };
     manifestOverrides?: Partial<ProjectManifest>;
+    /**
+     * #1268 — a record the candidate's commit carries (its `Record-Id` and the trailers of its block), which its worker
+     * receipt then names, for a witness of what a governed run does with the note that mirrors it.
+     */
+    commitRecord?: { id: string; trailers: string };
   } = {},
 ): Promise<{
   projectId: string;
@@ -622,7 +634,25 @@ export const driveToReviewedCandidate = async (
   });
   if (!execution.allowed) throw new Error(execution.message);
 
-  const head = applyPassingChange(harness.repoPath, workBranch);
+  const head = applyPassingChange(
+    harness.repoPath,
+    workBranch,
+    options.commitRecord === undefined ? undefined : `make app() return 2\n\n${options.commitRecord.trailers}\nRecord-Id: ${options.commitRecord.id}`,
+  );
+  if (options.commitRecord !== undefined) {
+    harness.cp.audit.record({
+      kind: WorkerTurnEvent.SUCCEEDED,
+      runId,
+      sessionId: workerSessionId,
+      evidence: {
+        executionId: execution.value.executionId,
+        resultDigest: `sha256:${head}`,
+        taskId: impl.taskId,
+        commitHead: head,
+        commitlore: { outcome: "recorded", recordIds: [options.commitRecord.id], nonce: "capture-nonce" },
+      },
+    });
+  }
   harness.cp.tasks.finishExecution(execution.value.executionId, {
     status: "SUCCEEDED",
     resultDigest: `sha256:${head}`,

@@ -108,7 +108,19 @@ export interface GitHubClient {
  * Waiting is only for an expected CI result to appear after a successful merge. It never
  * turns a failed, untrusted, or ambiguous result into a retryable one.
  */
+/**
+ * #1268 — CommitLore's check of the message of a merge commit GitHub is about to create, or has created, in the
+ * repository whose registered checkout is `checkout`: CommitLore's own commit-msg check on the exact message.
+ * Handed in rather than imported, so the kernel stays a leaf of the CommitLore code (`merge-commit-check.ts`).
+ */
+export type MergeCommitCheck = (input: { checkout: string; message: string }) => Promise<Decision<void>>;
+
 export interface GitHubKernelOptions {
+  /**
+   * #1268 — the check a governed run's merge commit message gets before the merge is sent and again as it landed.
+   * Absent or null is a deployment with no CommitLore, where such a merge is refused.
+   */
+  checkMergeCommit?: MergeCommitCheck | null;
   /** Number of exact-check observations before a missing/incomplete result is final. */
   postMergePollAttempts?: number;
   /** Delay between observations; production supplies a non-zero bounded value. */
@@ -292,6 +304,18 @@ export interface HumanGateStatusPort {
   };
 }
 
+/**
+ * #1268 — the message a merge commit GitHub creates for a pull request is sent with it, so it is known, and CommitLore
+ * has checked it, before the commit exists. GitHub's own wording for the title; a body that names the pull request in
+ * prose, which no trailer parser reads as a trailer, whatever the pull request's title says.
+ */
+const mergeCommitMessage = (pull: PullRequest, pullNumber: number, owner: string): { title: string; body: string; message: string } => {
+  const title = `Merge pull request #${pullNumber} from ${owner}/${pull.head.ref}`;
+  const named = (pull.title ?? "").replace(/\s+/g, " ").trim();
+  const body = named === "" ? `Pull request #${pullNumber}` : `Pull request #${pullNumber}: ${named}`;
+  return { title, body, message: `${title}\n\n${body}` };
+};
+
 interface PullRequest {
   number: number;
   commits?: number;
@@ -455,6 +479,7 @@ export class GitHubKernel {
   private readonly postMergePollIntervalMs: number;
   private readonly sleep: (milliseconds: number) => Promise<void>;
   private readonly branchPublishLimits: BranchPublishLimits;
+  private readonly checkMergeCommit: MergeCommitCheck | null;
 
   constructor(
     private readonly db: Db,
@@ -474,6 +499,7 @@ export class GitHubKernel {
     this.postMergePollIntervalMs = Math.max(0, Math.floor(options.postMergePollIntervalMs ?? 0));
     this.sleep = options.sleep ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
     this.branchPublishLimits = { ...DEFAULT_BRANCH_PUBLISH_LIMITS, ...options.branchPublishLimits };
+    this.checkMergeCommit = options.checkMergeCommit ?? null;
   }
 
   attach(ports: { humanGateStatus?: HumanGateStatusPort }): void {
@@ -2781,6 +2807,15 @@ export class GitHubKernel {
     const target = this.writeTarget(input.runId, input.repositoryIdentity, preflight.head.ref);
     if (!target.allowed) return target as Decision<{ mergeCommitSha: string; replayed: boolean }>;
 
+    // #1268 — the merge commit GitHub creates is a commit of the managed project: for a governed run it is made with a
+    // message CommitLore has checked, awaited here, before the reservation and the effect that nothing may be awaited
+    // between (below). With no CommitLore to check it, nothing is merged.
+    const merging = commitloreGoverned(this.db, input.runId) ? mergeCommitMessage(preflight, input.pullNumber, owner) : null;
+    if (merging !== null) {
+      const checked = await this.checkedMergeCommit(input, merging.message, "before");
+      if (!checked.allowed) return checked as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+    }
+
     // FD-R1-RACE — the evaluation above was followed by awaited reads (the preflight and the base-in-head
     // compare), and an owner decision or a new candidate can land during
     // any of them. So the selected gate's payload is verified again here, after the last await: its
@@ -2821,7 +2856,7 @@ export class GitHubKernel {
       () => this.api().request<{ sha: string; merged: boolean }>(
         "PUT",
         `/repos/${owner}/${repo}/pulls/${input.pullNumber}/merge`,
-        { sha: input.exactHeadSha, merge_method: method },
+        { sha: input.exactHeadSha, merge_method: method, ...(merging === null ? {} : { commit_title: merging.title, commit_message: merging.body }) },
         { beforeDispatch: dispatch.beforeDispatch },
       ).catch((error: unknown) => {
         put.failure = transportOutcome(error);
@@ -2968,6 +3003,21 @@ export class GitHubKernel {
       }
       return proof as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
+    // #1268 — and what landed is read back: the message GitHub made the commit with is the one CommitLore checked, and
+    // CommitLore checks it as it landed. A merge commit that is not is a failed proof of the merge, as a wrong parent is.
+    if (merging !== null) {
+      const landed = await this.landedMergeMessage(owner, repo, mergeCommitSha);
+      const unlike = landed === null || landed.trimEnd() !== merging.message.trimEnd();
+      const readBack = unlike
+        ? deny(ReasonCode.VERIFICATION_GAP, "the merge commit's message could not be read back as the one CommitLore checked", {
+            refusal: "MERGE_COMMIT_MESSAGE_CHANGED", phase: "merge-commitlore", pullNumber: input.pullNumber, mergeCommitSha, landed,
+          })
+        : await this.checkedMergeCommit(input, landed, "after");
+      if (!readBack.allowed) {
+        this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, readBack);
+        return readBack as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+      }
+    }
     const notes = await this.carryCandidateNotes(input, owner, repo, target.value, evaluation.value.notes);
     if (!notes.allowed) return this.recordNotesPending(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, notes);
 
@@ -2996,6 +3046,30 @@ export class GitHubKernel {
     // merge commit has passed the pinned post-merge checks.
     this.runs.setRepositoryMergeState(input.runId, mergeRepositoryId, "PENDING");
     return allow(ReasonCode.OK, { mergeCommitSha, replayed: false });
+  }
+
+  /** #1268 — CommitLore's check of a merge commit's message, in the repository's registered checkout; refused with none. */
+  private async checkedMergeCommit(input: MergeInput, message: string, when: "before" | "after"): Promise<Decision<void>> {
+    const evidence = { phase: "merge-commitlore", when, pullNumber: input.pullNumber };
+    if (this.checkMergeCommit === null) {
+      return deny(ReasonCode.VERIFICATION_GAP, "this run's contract requires CommitLore, and this deployment has no CommitLore to check the merge commit with", {
+        refusal: "COMMITLORE_REQUIRED_UNOBSERVABLE",
+        ...evidence,
+      });
+    }
+    const checkout = this.repositories.byIdentity(input.repositoryIdentity)?.checkoutPath;
+    if (!checkout) return deny(ReasonCode.EVIDENCE_MISSING, "the repository's checkout is not registered, so CommitLore cannot check the merge commit", evidence);
+    const checked = await this.checkMergeCommit({ checkout, message });
+    return checked.allowed ? checked : deny(checked.reasonCode, checked.message, { ...checked.evidence, ...evidence });
+  }
+
+  /** #1268 — the message a merge commit landed with, as GitHub reports it; null when it cannot be read. */
+  private async landedMergeMessage(owner: string, repo: string, mergeCommitSha: string): Promise<string | null> {
+    const commit = await this.api()
+      .request<{ commit?: { message?: unknown } }>("GET", `/repos/${owner}/${repo}/commits/${mergeCommitSha}`)
+      .catch(() => null);
+    const message = commit?.commit?.message;
+    return typeof message === "string" ? message : null;
   }
 
   /**

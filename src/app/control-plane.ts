@@ -80,6 +80,7 @@ import { BootstrapActivation } from "../bootstrap/activation.ts";
 import type { GitHubWritePort } from "../bootstrap/github-write-port.ts";
 import { createBootstrapGitHubWritePort } from "../bootstrap/bootstrap-write-guard.ts";
 import { type CommitLorePort, createCommitLoreCliPort } from "../bootstrap/commitlore-observation.ts";
+import { mergeCommitCheck } from "../github/merge-commit-check.ts";
 import { releaseCancelledBootstrapReservation } from "../bootstrap/cancelled-reservation-release.ts";
 import { RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
@@ -753,7 +754,8 @@ export class ControlPlane {
         this.db, this.clock, this.audit, this.artifacts, this.credentials,
         this.repositories, this.runs, this.projects, this.guard,
         config.githubClient,
-        githubKernelOptions,
+        // #1268 — the merge commit GitHub creates is checked by the same CommitLore a worker turn commits through.
+        { checkMergeCommit: mergeCommitCheck(config.commitlore ?? createCommitLoreCliPort()), ...githubKernelOptions },
       );
       this.verification.attachCi(this.github.ciEvidenceSource());
       this.verification.attachManifests((digest) => this.projects.manifest(digest));

@@ -4,9 +4,9 @@ import { join } from "node:path";
 
 import { afterAll, describe, expect, it, vi } from "vitest";
 
-import type { Decision } from "../../src/core/errors.ts";
+import { type Decision, allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { NO_HUMAN_GATE_DIGEST } from "../../src/github/github-kernel.ts";
+import { type GitHubKernelOptions, NO_HUMAN_GATE_DIGEST } from "../../src/github/github-kernel.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { WorkerTurnEvent } from "../../src/run/worker-turn.ts";
 import { cleanupTempDirs, commitAll, gitSync, writeFiles } from "../helpers/fixtures.ts";
@@ -83,13 +83,15 @@ const reflectMergedBase = (github: FakeGitHub): void => {
  * is governed whatever its manifest says; the fixture manifest's own mode (`preferred`) is ignored.
  */
 const setup = async (options: {
+  /** Replaces the kernel's options: the merge-commit check it is given, or none. */
+  kernel?: GitHubKernelOptions;
   xLimit?: string;
   /** X's message as ISO-8859-1 bytes, committed with that `encoding` header (`declared`) or with none (null). */
   xLatin1?: { declared: "ISO-8859-1" | null };
 } = {}) => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
-  const harness = makeHarness({ githubClient: github, commitloreReceipts: false });
+  const harness = makeHarness({ githubClient: github, commitloreReceipts: false, ...(options.kernel === undefined ? {} : { githubKernelOptions: options.kernel }) });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
   harness.cp.verification.attachCi({
     fetch: async (repositoryIdentity, head) => [{
@@ -369,4 +371,57 @@ describe("#1268 slice 2 — a carried note holds the record of the commit it is 
     expect(fixture.github.notesRef).toBeNull();
   });
 
+});
+
+/**
+ * #1268 — the merge commit GitHub creates is a commit of the managed project too: a governed run's merge needs a
+ * CommitLore to check it with, sends the one message CommitLore checked, and reads the landed commit's message back and
+ * checks that as well. Its records are its parents' (the candidate's commits), and their notes are carried as above.
+ */
+describe("#1268 the merge commit GitHub creates goes through CommitLore", () => {
+  const putsOf = (fixture: Fixture) => fixture.github.calls.filter((call) => call.method === "PUT" && /\/pulls\/\d+\/merge$/.test(call.path));
+
+  it("with no CommitLore to check it, the merge is refused before anything is reserved or sent", async () => {
+    const fixture = await setup({ kernel: { checkMergeCommit: null } });
+    const refused = await fixture.merge();
+    expect(refused, JSON.stringify(refused)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.VERIFICATION_GAP,
+      evidence: { refusal: "COMMITLORE_REQUIRED_UNOBSERVABLE", phase: "merge-commitlore" },
+    });
+    expect(putsOf(fixture)).toEqual([]);
+    expect(fixture.github.mergeCount).toBe(0);
+    expect(mergeReceipts(fixture)).toEqual([]);
+  });
+
+  it("a CommitLore that refuses the message refuses the merge before it is sent", async () => {
+    const fixture = await setup({
+      kernel: { checkMergeCommit: async () => deny(ReasonCode.VERIFICATION_GAP, "CommitLore refused this message", { refusal: "COMMITLORE_MESSAGE_REFUSED" }) },
+    });
+    const refused = await fixture.merge();
+    expect(refused, JSON.stringify(refused)).toMatchObject({ allowed: false, evidence: { refusal: "COMMITLORE_MESSAGE_REFUSED", phase: "merge-commitlore" } });
+    expect(putsOf(fixture)).toEqual([]);
+    expect(mergeReceipts(fixture)).toEqual([]);
+  });
+
+  it("the merge sends the one message CommitLore checked, and checks the message that landed", async () => {
+    const checked: string[] = [];
+    const fixture = await setup({ kernel: { checkMergeCommit: async ({ message }) => { checked.push(message); return allow(ReasonCode.OK, undefined); } } });
+    const merged = await fixture.merge();
+    expect(merged.reasonCode, merged.allowed ? "" : `${merged.message} ${JSON.stringify(merged.evidence)}`).toBe(ReasonCode.OK);
+    const [put] = putsOf(fixture);
+    const sent = put!.body as { commit_title: string; commit_message: string };
+    expect(sent.commit_title).toMatch(/^Merge pull request #\d+ from /);
+    expect(checked).toHaveLength(2);
+    expect(checked[0]).toBe(`${sent.commit_title}\n\n${sent.commit_message}`);
+    expect(checked[1]).toBe(checked[0]);
+  });
+
+  it("a landed message that is not the one CommitLore checked fails the merge proof, and the run is halted", async () => {
+    const fixture = await setup({ kernel: { checkMergeCommit: async () => allow(ReasonCode.OK, undefined) } });
+    fixture.github.nextMergeMessage = "Merge pull request #1\n\nWarn: edited after the check\nRecord-Id: r-feedfacecafe";
+    const failed = await fixture.merge();
+    expect(failed, JSON.stringify(failed)).toMatchObject({ allowed: false, reasonCode: ReasonCode.VERIFICATION_GAP, evidence: { refusal: "MERGE_COMMIT_MESSAGE_CHANGED" } });
+    expect(fixture.github.mergeCount).toBe(1);
+  });
 });
