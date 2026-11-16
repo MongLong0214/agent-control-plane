@@ -1160,6 +1160,7 @@ describe("baseline boundary contracts", () => {
       "v56-adopted-bootstrap-first-manifest",
       "v57-canonical-entitlement-transfer",
       "v58-canonical-cto-rotation",
+      "v59-task-plan-key",
     ]);
   });
 

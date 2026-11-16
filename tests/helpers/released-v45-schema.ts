@@ -103,7 +103,7 @@ export const contentDigests = (path: string, throughVersion = Infinity): { userV
       if (throughVersion < 58 && table.name === 'canonical_cto_rotations') continue;
       const v52Columns:Record<string,string[]> = {projects:['buzz_address','retired_at','supersedes_project_id'],repositories:['retired_at'],bootstrap_applications:['retired_at']};
       // #1258 — v53's attempt column, which an image taken through v52 does not have.
-      const laterColumns:Record<string,string[]> = {...(throughVersion < 52 ? v52Columns : {}),...(throughVersion < 53 ? {verification_results:['attempt']} : {})};
+      const laterColumns:Record<string,string[]> = {...(throughVersion < 52 ? v52Columns : {}),...(throughVersion < 53 ? {verification_results:['attempt']} : {}),...(throughVersion < 59 ? {tasks:['plan_key']} : {})};
       const projection = laterColumns[table.name]
         ? (raw.prepare('SELECT name FROM pragma_table_info(?)').pluck().all(table.name) as string[]).filter(c => !laterColumns[table.name]!.includes(c)).map(c => `"${c}"`).join(',') : '*';
       const quoted = `"${table.name.replace(/"/g, '""')}"`;

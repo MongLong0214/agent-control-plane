@@ -65,18 +65,19 @@ interface WorkUnits {
 }
 
 /**
- * The work unit of each task, from two sources only: the run's approval (`WORK_SCOPE_APPROVED`), which holds the
- * PLAN's units with the submission's keys already resolved to task ids, and the PLAN's own `workUnits[].tasks`
- * entries that are task ids of this run. The approval is applied first and a task already mapped is never moved.
+ * The work unit of each task, from two sources: the run's approval (`WORK_SCOPE_APPROVED`), which holds the PLAN's
+ * units with the submission's keys already resolved to task ids, and the PLAN's own `workUnits[].tasks` entries. An
+ * entry is a task id of this run, or the PLAN key a task was submitted under (`tasks.plan_key`, written at
+ * plan_submit). The approval is applied first and a task already mapped is never moved.
  *
- * Nothing is inferred. The PLAN's key -> task id mapping is stored nowhere (it lives only in the submission), so a
- * key can never be told from a title with any certainty and is never mapped by one. Every entry that is not a task
- * id of this run, in the PLAN or in the approval, is named in `unresolvedRefs` as `<unit>:<entry>`, with one
- * exception that is exact, not a guess: a unit whose approved list is shorter than the audit log's 200-item cap
- * holds its whole membership, so the PLAN's key entries for it are redundant and are not listed. For a unit at or
- * over the cap, or one the approval does not hold, nothing here can tell a key the approval resolved from one it
- * did not, so every key is listed. A task with a `workUnit` was placed by the approval or by an id; a task
- * without one is not claimed to be in none.
+ * A key resolves only through that column, and only when exactly one task of the run holds it; a title is never
+ * consulted. A task that predates the column holds NULL, and a key held by two tasks of the run (a re-plan that
+ * reused it) is ambiguous. Both stay unresolved. Every entry that is neither a task id nor a unique key of this run,
+ * in the PLAN or in the approval, is named in `unresolvedRefs` as `<unit>:<entry>`, with one exception that is exact,
+ * not a guess: a unit whose approved list is shorter than the audit log's 200-item cap holds its whole membership, so
+ * the PLAN's entries for it that are not task ids are redundant and are not listed. For a unit at or over the cap, or
+ * one the approval does not hold, such an entry is listed. A task with a `workUnit` was placed by the approval, by an
+ * id or by its key; a task without one is not claimed to be in none.
  */
 export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_id: string }>): WorkUnits => {
   const none: WorkUnits = { declared: 0, byTask: new Map(), unresolvedRefs: [] };
@@ -113,6 +114,12 @@ export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_i
     }
   } catch { return none; }
   const ids = new Set(tasks.map((task) => task.task_id));
+  // plan_key -> the task ids of this run that hold it; more than one is an ambiguous key.
+  const byKey = new Map<string, string[]>();
+  for (const row of db.all<{ task_id: string; plan_key: string }>(
+    `SELECT task_id, plan_key FROM tasks WHERE run_id = ? AND plan_key IS NOT NULL ORDER BY task_id`, [runId])) {
+    byKey.set(row.plan_key, [...(byKey.get(row.plan_key) ?? []), row.task_id]);
+  }
   const byTask = new Map<string, string>();
   const unresolved = new Set<string>();
   const sorted = (units: Map<string, Set<string>>): Array<[string, string[]]> =>
@@ -120,9 +127,11 @@ export const workUnitsOf = (db: Db, runId: string, tasks: ReadonlyArray<{ task_i
   for (const source of [approved, declared]) {
     for (const [unit, refs] of sorted(source)) {
       for (const ref of refs) {
-        // A PLAN key in a unit the approval holds whole is redundant: the approval already lists every member by id.
-        if (!ids.has(ref)) { if (source === approved || !wholeUnits.has(unit)) unresolved.add(`${unit}:${ref}`); }
-        else if (!byTask.has(ref)) byTask.set(ref, unit);
+        // A PLAN entry that is no task id, in a unit the approval holds whole, is redundant: the approval already lists every member by id.
+        const keyed = ids.has(ref) ? undefined : byKey.get(ref);
+        const task = ids.has(ref) ? ref : keyed?.length === 1 ? keyed[0]! : undefined;
+        if (task === undefined) { if (source === approved || !wholeUnits.has(unit)) unresolved.add(`${unit}:${ref}`); }
+        else if (!byTask.has(task)) byTask.set(task, unit);
       }
     }
   }
