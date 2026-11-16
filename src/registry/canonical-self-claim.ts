@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 
 import { systemClock, type Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
 import { DARWIN_START_TOKEN, readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { probeSessionLiveness, recoverDeadCanonicalBinding } from "../daemon/dead-binding-recovery.ts";
@@ -74,6 +74,92 @@ export const SELF_CLAIM_EXECUTOR_KIND = "claude-cli";
 
 /** This primitive's own attestation protocol; deliberately distinct from `hermes.target-bind/v1`. */
 export const SELF_CLAIM_PROTOCOL = "acp.canonical-self-claim/v1";
+
+/**
+ * Which branch refused a self-claim. Each refusal carries one of these as `reason` in its evidence, and its
+ * `CANONICAL_SELF_CLAIM_REFUSED` row carries it too. The reason code could not say it: most branches share
+ * CONFLICT, and on 2026-11-16 six rows of `{identity}` alone left a stale `--expected-binding-generation` on a
+ * relaunched CTO's relay looking like an entitlement refusal. A name is a constant and never renamed; a new branch
+ * gets a new name. A refusal composed from another registry is named for the step of this claim it stopped.
+ */
+export const SelfClaimRefusal = {
+  CALLER_PID_INVALID: "CALLER_PID_INVALID",
+  ANCESTRY_CYCLE: "ANCESTRY_CYCLE",
+  ANCESTRY_UNWALKABLE: "ANCESTRY_UNWALKABLE",
+  ANCESTOR_ARGV_UNREADABLE: "ANCESTOR_ARGV_UNREADABLE",
+  ANCESTOR_ARGV_NAMES_NO_SESSION: "ANCESTOR_ARGV_NAMES_NO_SESSION",
+  HOST_SESSION_REGISTRY_UNVERIFIED: "HOST_SESSION_REGISTRY_UNVERIFIED",
+  ANCESTOR_START_CHANGED_DURING_REGISTRY_READ: "ANCESTOR_START_CHANGED_DURING_REGISTRY_READ",
+  ARGV_AND_REGISTRY_DISAGREE: "ARGV_AND_REGISTRY_DISAGREE",
+  HOST_SESSION_REGISTRY_UNIDENTIFIED: "HOST_SESSION_REGISTRY_UNIDENTIFIED",
+  NO_CLAUDE_ANCESTOR: "NO_CLAUDE_ANCESTOR",
+  ANCESTRY_HOP_LIMIT: "ANCESTRY_HOP_LIMIT",
+  CLAIMED_SESSION_MISMATCH: "CLAIMED_SESSION_MISMATCH",
+  CLAIMED_PID_MISMATCH: "CLAIMED_PID_MISMATCH",
+  SESSION_NOT_ENTITLED: "SESSION_NOT_ENTITLED",
+  ANCESTOR_START_UNKNOWN: "ANCESTOR_START_UNKNOWN",
+  ANCESTOR_NOT_INTERACTIVE: "ANCESTOR_NOT_INTERACTIVE",
+  ANCESTOR_CWD_UNREADABLE: "ANCESTOR_CWD_UNREADABLE",
+  PEER_PROTOCOL_MISMATCH: "PEER_PROTOCOL_MISMATCH",
+  TRANSCRIPT_NOT_FOUND: "TRANSCRIPT_NOT_FOUND",
+  PEER_IDENTITY_MISMATCH: "PEER_IDENTITY_MISMATCH",
+  CLAIMANT_PID_REUSED: "CLAIMANT_PID_REUSED",
+  CLAIMANT_SESSION_UNDERIVABLE: "CLAIMANT_SESSION_UNDERIVABLE",
+  CLAIMANT_SESSION_CHANGED: "CLAIMANT_SESSION_CHANGED",
+  REQUEST_INVALID: "REQUEST_INVALID",
+  ENTRY_MISSING: "ENTRY_MISSING",
+  PROJECT_NOT_ENTITLED: "PROJECT_NOT_ENTITLED",
+  ROOM_UNSUBSCRIBED: "ROOM_UNSUBSCRIBED",
+  BUZZ_ROOM_UNRESOLVED: "BUZZ_ROOM_UNRESOLVED",
+  ENTITLEMENT_CHANGED: "ENTITLEMENT_CHANGED",
+  GENERATION_MISMATCH: "GENERATION_MISMATCH",
+  SWITCHOVER_FENCED: "SWITCHOVER_FENCED",
+  DEAD_PREDECESSOR_UNRELEASED: "DEAD_PREDECESSOR_UNRELEASED",
+  PREDECESSOR_RUNTIME_ALIVE: "PREDECESSOR_RUNTIME_ALIVE",
+  SAME_LIVE_RUNTIME_MISMATCH: "SAME_LIVE_RUNTIME_MISMATCH",
+  PREDECESSOR_ROW_UNRECONCILED: "PREDECESSOR_ROW_UNRECONCILED",
+  SAME_LIVE_PREDECESSOR_UNSTOPPED: "SAME_LIVE_PREDECESSOR_UNSTOPPED",
+  TRANSFER_PROJECT_MISMATCH: "TRANSFER_PROJECT_MISMATCH",
+  TRANSFER_PREDECESSOR_UNREVOKED: "TRANSFER_PREDECESSOR_UNREVOKED",
+  TRANSFER_PREDECESSOR_UNSTOPPED: "TRANSFER_PREDECESSOR_UNSTOPPED",
+  SWITCHOVER_ACTIVE_RUNS: "SWITCHOVER_ACTIVE_RUNS",
+  SWITCHOVER_RETARGET_REFUSED: "SWITCHOVER_RETARGET_REFUSED",
+  SESSION_NOT_READIED: "SESSION_NOT_READIED",
+  SESSION_SECRET_UNAVAILABLE: "SESSION_SECRET_UNAVAILABLE",
+  BUZZ_ACTOR_UNBOUND: "BUZZ_ACTOR_UNBOUND",
+  BIND_REFUSED: "BIND_REFUSED",
+  TRANSFER_RUNS_UNMOVED: "TRANSFER_RUNS_UNMOVED",
+  TRANSFER_UNCLAIMED: "TRANSFER_UNCLAIMED",
+  SWITCHOVER_UNACKNOWLEDGED: "SWITCHOVER_UNACKNOWLEDGED",
+  LIVE_RUNS_NOT_TAKEN_OVER: "LIVE_RUNS_NOT_TAKEN_OVER",
+  LIVE_RUNS_STRANDED: "LIVE_RUNS_STRANDED",
+  AUDIT_WRITE_FAILED: "AUDIT_WRITE_FAILED",
+  /** The daemon's startup window: its rooms are not checked yet, so no claim is constructed (`agentcpd.ts`). */
+  DAEMON_STARTING: "DAEMON_STARTING",
+  /** A refusal that reached `claim()` with none of the names above: a branch added without one. */
+  UNCLASSIFIED: "UNCLASSIFIED",
+} as const;
+export type SelfClaimRefusal = (typeof SelfClaimRefusal)[keyof typeof SelfClaimRefusal];
+
+const SELF_CLAIM_REFUSALS: ReadonlySet<string> = new Set(Object.values(SelfClaimRefusal));
+
+/** The branch a refusal names, or null for an admission or a refusal this file did not name. */
+export const selfClaimRefusalOf = (decision: Decision<unknown>): SelfClaimRefusal | null => {
+  if (decision.allowed) return null;
+  const reason = decision.evidence["reason"];
+  return typeof reason === "string" && SELF_CLAIM_REFUSALS.has(reason) ? reason as SelfClaimRefusal : null;
+};
+
+/** A refusal of this file's own, named for its branch. */
+const refuse = <T>(reason: SelfClaimRefusal, reasonCode: ReasonCode, message: string, evidence: Evidence = {}): Decision<T> =>
+  deny(reasonCode, message, { ...evidence, reason });
+
+/**
+ * A refusal another registry returned, named for the step of this claim it stopped. Its own code, message and
+ * evidence are kept; a `reason` of its own (some registries put free text there) is replaced by the name.
+ */
+const stoppedAt = <T>(reason: SelfClaimRefusal, decision: Decision<unknown>): Decision<T> =>
+  decision.allowed ? decision as Decision<T> : deny(decision.reasonCode, decision.message, { ...decision.evidence, reason });
 
 /**
  * Whether a session is an adopted canonical CTO runtime, as one SQL predicate: the session is the
@@ -657,13 +743,13 @@ export const deriveClaimantIdentity = (
   registryReader: HostSessionRegistryReader = makeDefaultHostSessionRegistryReader(),
 ): Decision<DerivedClaimantIdentity> => {
   if (!Number.isSafeInteger(callerPid) || callerPid <= 0) {
-    return deny(ReasonCode.INVALID_ARGUMENT, "callerPid must be a positive integer", { callerPid });
+    return refuse(SelfClaimRefusal.CALLER_PID_INVALID, ReasonCode.INVALID_ARGUMENT, "callerPid must be a positive integer", { callerPid });
   }
   const visited = new Set<number>();
   let current = callerPid;
   for (let hop = 0; hop < maxHops; hop += 1) {
     if (visited.has(current)) {
-      return deny(
+      return refuse(SelfClaimRefusal.ANCESTRY_CYCLE,
         ReasonCode.CONFLICT,
         "process ancestry cycle detected before a claude ancestor was found",
         { callerPid, cycleAt: current },
@@ -672,14 +758,14 @@ export const deriveClaimantIdentity = (
     visited.add(current);
     const snapshot = inspector.snapshot(current);
     if (!snapshot) {
-      return deny(
+      return refuse(SelfClaimRefusal.ANCESTRY_UNWALKABLE,
         ReasonCode.NOT_FOUND,
         "process ancestry could not be walked to a claude ancestor",
         { callerPid, stoppedAtPid: current },
       );
     }
     if (snapshot.argv === null) {
-      return deny(
+      return refuse(SelfClaimRefusal.ANCESTOR_ARGV_UNREADABLE,
         ReasonCode.NOT_FOUND,
         "process argv could not be established",
         { pid: snapshot.pid },
@@ -689,7 +775,7 @@ export const deriveClaimantIdentity = (
       const argvSessionUuid = extractSessionUuidFromArgv(snapshot.argv);
       const selectorCount = sessionSelectorOccurrences(snapshot.argv).length;
       if (selectorCount > 0 && !argvSessionUuid) {
-        return deny(
+        return refuse(SelfClaimRefusal.ANCESTOR_ARGV_NAMES_NO_SESSION,
           ReasonCode.NOT_FOUND,
           "the claude ancestor's argv names no session id",
           { pid: snapshot.pid },
@@ -701,7 +787,7 @@ export const deriveClaimantIdentity = (
       // unverifiable — refuses even a valid argv selector: the selector cannot outvote evidence
       // that the process may now be running a session it does not name.
       if (!registry.allowed && argvSessionUuid && !isHostSessionRegistryAbsent(registry)) {
-        return deny(
+        return refuse(SelfClaimRefusal.HOST_SESSION_REGISTRY_UNVERIFIED,
           registry.reasonCode,
           `the claude ancestor's host session registry entry could not be verified, so its argv selector is not accepted: ${registry.message}`,
           { pid: snapshot.pid },
@@ -714,7 +800,7 @@ export const deriveClaimantIdentity = (
           ? inspector.readStartToken(snapshot.pid)
           : inspector.snapshot(snapshot.pid)?.startedAt ?? null;
         if (snapshot.startedAt === null || afterRead !== snapshot.startedAt) {
-          return deny(ReasonCode.CONFLICT, "claude ancestor start token changed during host session registry read", {
+          return refuse(SelfClaimRefusal.ANCESTOR_START_CHANGED_DURING_REGISTRY_READ, ReasonCode.CONFLICT, "claude ancestor start token changed during host session registry read", {
             pid: snapshot.pid, beforeRead: snapshot.startedAt, afterRead,
           });
         }
@@ -723,7 +809,7 @@ export const deriveClaimantIdentity = (
       let sessionSource: DerivedClaimantIdentity["sessionSource"];
       if (argvSessionUuid) {
         if (registry.allowed && registry.value.sessionUuid !== argvSessionUuid) {
-          return deny(
+          return refuse(SelfClaimRefusal.ARGV_AND_REGISTRY_DISAGREE,
             ReasonCode.CONFLICT,
             "the claude ancestor's argv and host session registry disagree on the session id",
             { pid: snapshot.pid },
@@ -733,7 +819,7 @@ export const deriveClaimantIdentity = (
         sessionSource = "argv";
       } else {
         if (!registry.allowed) {
-          return deny(
+          return refuse(SelfClaimRefusal.HOST_SESSION_REGISTRY_UNIDENTIFIED,
             registry.reasonCode,
             `the claude ancestor's argv names no session id, and the host session registry does not identify it: ${registry.message}`,
             { pid: snapshot.pid },
@@ -754,7 +840,7 @@ export const deriveClaimantIdentity = (
       });
     }
     if (snapshot.ppid <= 1 || snapshot.ppid === current) {
-      return deny(
+      return refuse(SelfClaimRefusal.NO_CLAUDE_ANCESTOR,
         ReasonCode.NOT_FOUND,
         "no claude ancestor exists between the calling process and pid 1",
         { callerPid },
@@ -762,7 +848,7 @@ export const deriveClaimantIdentity = (
     }
     current = snapshot.ppid;
   }
-  return deny(
+  return refuse(SelfClaimRefusal.ANCESTRY_HOP_LIMIT,
     ReasonCode.CONFLICT,
     "process ancestry walk exceeded its hop limit without finding a claude ancestor",
     { callerPid, maxHops },
@@ -1636,14 +1722,14 @@ export function verifyClaudeIdentity(
 
   // Clause 1 — a caller-supplied UUID/PID is checked against the derived value, never substituted.
   if (identity.sessionUuid !== request.claimedSessionUuid.toLowerCase()) {
-    return deny(
+    return refuse(SelfClaimRefusal.CLAIMED_SESSION_MISMATCH,
       ReasonCode.CONFLICT,
       "claimed session UUID does not match the independently derived identity",
       { claimed: request.claimedSessionUuid, derived: identity.sessionUuid },
     );
   }
   if (request.claimedPid !== undefined && request.claimedPid !== identity.pid) {
-    return deny(
+    return refuse(SelfClaimRefusal.CLAIMED_PID_MISMATCH,
       ReasonCode.CONFLICT,
       "claimed pid does not match the derived claude ancestor process",
       { claimed: request.claimedPid, derived: identity.pid },
@@ -1665,7 +1751,7 @@ export function verifyClaudeIdentity(
   // what the caller said would move this authority from the deployment's configuration to the
   // claimant, and the comparison a few lines above would then be comparing a value to itself.
   if (!config.canonicalSessionUuids.includes(identity.sessionUuid)) {
-    return deny(
+    return refuse(SelfClaimRefusal.SESSION_NOT_ENTITLED,
       ReasonCode.CONFLICT,
       "only a canonical session may be adopted by this primitive",
       { observed: identity.sessionUuid, canonicalCount: config.canonicalSessionUuids.length },
@@ -1674,7 +1760,7 @@ export function verifyClaudeIdentity(
 
   // Clause 2 — pid and process start time as a pair; a pid alone is reused (CP-HI-04).
   if (identity.startedAt === null) {
-    return deny(
+    return refuse(SelfClaimRefusal.ANCESTOR_START_UNKNOWN,
       ReasonCode.CONFLICT,
       "the claude ancestor's process start time could not be established",
       { pid: identity.pid },
@@ -1682,7 +1768,7 @@ export function verifyClaudeIdentity(
   }
   // Clause 2 — the process is an interactive CLI.
   if (!isInteractiveClaudeInvocation(identity.argv)) {
-    return deny(
+    return refuse(SelfClaimRefusal.ANCESTOR_NOT_INTERACTIVE,
       ReasonCode.CONFLICT,
       "the claude ancestor is not an interactive CLI invocation",
       { pid: identity.pid },
@@ -1703,7 +1789,7 @@ export function verifyClaudeIdentity(
   // so neither may be reported as one — the same distinction `CONTRACT_UNVERIFIED` draws for a
   // pinned contract that could not be produced to compare (#448).
   if (identity.cwd === null) {
-    return deny(
+    return refuse(SelfClaimRefusal.ANCESTOR_CWD_UNREADABLE,
       ReasonCode.PROBE_FAILED,
       "the claude ancestor's working directory could not be read, so this says nothing about whether it is the canonical workdir",
       { pid: identity.pid, probe: "lsof", probeFailure: identity.cwdProbeFailure },
@@ -1723,7 +1809,7 @@ export function verifyClaudeIdentity(
   // that absence as a changed session. The refusal outlives the comparison.
   // Clause 2 — peer protocol.
   if (peer && peer.protocolVersion !== peer.expectedProtocolVersion) {
-    return deny(
+    return refuse(SelfClaimRefusal.PEER_PROTOCOL_MISMATCH,
       ReasonCode.CONFLICT,
       "peer protocol version does not match the deployment's expected protocol",
       { observed: peer.protocolVersion, expected: peer.expectedProtocolVersion },
@@ -1763,7 +1849,7 @@ export function verifyClaudeIdentity(
   // Clause 2 — the transcript.
   const transcript = transcriptReader.locate(identity.sessionUuid);
   if (!transcript) {
-    return deny(
+    return refuse(SelfClaimRefusal.TRANSCRIPT_NOT_FOUND,
       ReasonCode.NOT_FOUND,
       "no transcript exists on disk for the derived conversational actor",
       { sessionUuid: identity.sessionUuid },
@@ -1771,7 +1857,7 @@ export function verifyClaudeIdentity(
   }
   // Clause 2 — the connected peer identity.
   if (peer && peer.identity !== peer.expectedIdentity) {
-    return deny(
+    return refuse(SelfClaimRefusal.PEER_IDENTITY_MISMATCH,
       ReasonCode.CONFLICT,
       "connected peer identity does not match the deployment's expected peer",
       { observed: peer.identity, expected: peer.expectedIdentity },
@@ -1800,7 +1886,7 @@ export function assertClaudeIdentityStillLive(
   const snapshot = inspector.snapshot(identity.pid);
   const observed = snapshot?.startedAt ?? null;
   if (observed !== identity.startedAt) {
-    return deny(
+    return refuse(SelfClaimRefusal.CLAIMANT_PID_REUSED,
       ReasonCode.CONFLICT,
       "the claimant process's start time no longer matches the identity verified earlier in this claim — its pid may have been reused",
       { pid: identity.pid, verifiedStartedAt: identity.startedAt, observedStartedAt: observed },
@@ -1815,7 +1901,7 @@ export function assertClaudeIdentityStillLive(
   };
   const rederived = deriveClaimantIdentity(identity.pid, pinned, 1, registryReader);
   if (!rederived.allowed) {
-    return deny(
+    return refuse(SelfClaimRefusal.CLAIMANT_SESSION_UNDERIVABLE,
       rederived.reasonCode,
       `the claimant's session could not be derived again at this checkpoint: ${rederived.message}`,
       { pid: identity.pid },
@@ -1823,7 +1909,7 @@ export function assertClaudeIdentityStillLive(
   }
   // The pid needs no comparison: a one-hop derivation starting at `identity.pid` answers for it alone.
   if (rederived.value.sessionUuid !== identity.sessionUuid) {
-    return deny(
+    return refuse(SelfClaimRefusal.CLAIMANT_SESSION_CHANGED,
       ReasonCode.CONFLICT,
       "the claimant process's session changed after its identity was verified in this claim",
       { pid: identity.pid, verifiedSessionUuid: identity.sessionUuid, observedSessionUuid: rederived.value.sessionUuid },
@@ -1858,6 +1944,10 @@ interface ClaimAsked {
  *
  * An admission names the project from the binding, not from the request: the entitlement is what
  * decided the project, and the request is the caller's object.
+ *
+ * A refusal's `reason` is the one piece of its evidence that crosses: a `SelfClaimRefusal` constant,
+ * never text from a path, a key or the request. A generation mismatch adds the two integers it
+ * compared, so the row says which generation was asked for and which one was next.
  */
 const claimDecisionAuditRecord = (
   asked: ClaimAsked,
@@ -1880,12 +1970,46 @@ const claimDecisionAuditRecord = (
       },
     };
   }
+  const reason = selfClaimRefusalOf(decision) ?? SelfClaimRefusal.UNCLASSIFIED;
+  const compared = reason === SelfClaimRefusal.GENERATION_MISMATCH
+    && Number.isSafeInteger(decision.evidence["expected"]) && Number.isSafeInteger(decision.evidence["actual"])
+    ? { expectedGeneration: decision.evidence["expected"], nextGeneration: decision.evidence["actual"] }
+    : {};
   return {
     kind: "CANONICAL_SELF_CLAIM_REFUSED",
     reasonCode: decision.reasonCode,
     projectId: isRegisteredProject(asked.projectId) ? asked.projectId : null,
-    evidence: { identity: UUID_PATTERN.test(asked.claimedSessionUuid) ? asked.claimedSessionUuid : null },
+    evidence: { identity: UUID_PATTERN.test(asked.claimedSessionUuid) ? asked.claimedSessionUuid : null, reason, ...compared },
   };
+};
+
+/**
+ * The refusal row `claim()` writes, for a refusal made before any claim is constructed: the daemon's startup window
+ * (`DAEMON_STARTING` in `agentcpd.ts`). Same row, same bounds on what it holds — the claimed session only when it is a
+ * UUID, the project only when it is registered — and a failed insert is swallowed for the reason `claim()` gives.
+ * `params` is the request as the socket parsed it, so neither field is assumed to be a string.
+ */
+export const recordSelfClaimRefusal = (
+  db: Pick<Db, "get">,
+  audit: Pick<AuditLog, "record">,
+  params: Record<string, unknown>,
+  decision: Decision<unknown>,
+): void => {
+  if (decision.allowed) return;
+  const text = (value: unknown): string => typeof value === "string" ? value : "";
+  const asked: ClaimAsked = { claimedSessionUuid: text(params["claimedSessionUuid"]), projectId: text(params["projectId"]) };
+  const registered = (projectId: string): boolean => {
+    try {
+      return projectId !== "" && db.get(`SELECT 1 FROM projects WHERE project_id = ?`, [projectId]) !== undefined;
+    } catch {
+      return false;
+    }
+  };
+  try {
+    audit.record(claimDecisionAuditRecord(asked, decision as Decision<CanonicalSelfClaimReceipt>, registered));
+  } catch {
+    // Deliberately empty, as in `claim()`: the refusal stands without its row.
+  }
 };
 
 /**
@@ -2024,13 +2148,13 @@ export class CanonicalSelfClaim {
 
   async #decide(request: CanonicalSelfClaimRequest, asked: ClaimAsked): Promise<Decision<CanonicalSelfClaimReceipt>> {
     if (!UUID_PATTERN.test(request.claimedSessionUuid)) {
-      return deny(ReasonCode.INVALID_ARGUMENT, "claimedSessionUuid must be a UUID", {});
+      return refuse(SelfClaimRefusal.REQUEST_INVALID, ReasonCode.INVALID_ARGUMENT, "claimedSessionUuid must be a UUID", {});
     }
     if (request.projectId.trim().length === 0) {
-      return deny(ReasonCode.INVALID_ARGUMENT, "projectId is required", {});
+      return refuse(SelfClaimRefusal.REQUEST_INVALID, ReasonCode.INVALID_ARGUMENT, "projectId is required", {});
     }
     if (!Number.isSafeInteger(request.expectedBindingGeneration) || request.expectedBindingGeneration <= 0) {
-      return deny(
+      return refuse(SelfClaimRefusal.REQUEST_INVALID,
         ReasonCode.INVALID_ARGUMENT,
         "expectedBindingGeneration must be a positive safe integer",
         { expectedBindingGeneration: request.expectedBindingGeneration },
@@ -2068,14 +2192,14 @@ export class CanonicalSelfClaim {
       // Unreachable while this instance hands `verifyClaudeIdentity` the UUIDs of these same
       // entries, and refused rather than asserted because "unreachable" is a property of today's
       // composition and this is the seam where the two sets could stop agreeing.
-      return deny(
+      return refuse(SelfClaimRefusal.ENTRY_MISSING,
         ReasonCode.CONFLICT,
         "the adopted session has no configured entry",
         { observed: identity.sessionUuid },
       );
     }
     if (entry.projectId !== request.projectId) {
-      return deny(
+      return refuse(SelfClaimRefusal.PROJECT_NOT_ENTITLED,
         ReasonCode.CONFLICT,
         "this session is not the canonical CTO for the requested project",
         { observed: request.projectId, entitled: entry.projectId },
@@ -2091,10 +2215,10 @@ export class CanonicalSelfClaim {
     // subscriber identity does not listen in would take the role and then never hear a mention.
     if (this.#subscribedBuzzRooms !== null) {
       const deaf = unsubscribedRoomRefusal(entry, room, this.#subscribedBuzzRooms);
-      if (deaf !== null) return deny(ReasonCode.CONFLICT, deaf, {});
+      if (deaf !== null) return refuse(SelfClaimRefusal.ROOM_UNSUBSCRIBED, ReasonCode.CONFLICT, deaf, {});
     }
     const buzzAddress = await this.resolveBuzzAddress(request.buzzPurpose, room);
-    if (!buzzAddress.allowed) return buzzAddress as Decision<CanonicalSelfClaimReceipt>;
+    if (!buzzAddress.allowed) return stoppedAt(SelfClaimRefusal.BUZZ_ROOM_UNRESOLVED, buzzAddress);
     // Clause 2 — pid/startedAt re-verified again here. This `await` is the real TOCTOU window:
     // control left this process entirely (a shelled Buzz CLI transport), for however long that
     // took, before returning. A pid reused during that gap must be caught before `#mutate` ever
@@ -2209,7 +2333,7 @@ export class CanonicalSelfClaim {
     // than throwing) would otherwise be committed together with the session row already written
     // below. Only the outermost `txDecision` turns a propagated denial into a real ROLLBACK.
     return this.db.txDecision((): Decision<CanonicalSelfClaimReceipt> => {
-      if (this.config.entitlementCurrent && !this.config.entitlementCurrent()) return deny(ReasonCode.CONFLICT, "canonical entitlement changed during claim", {});
+      if (this.config.entitlementCurrent && !this.config.entitlementCurrent()) return refuse(SelfClaimRefusal.ENTITLEMENT_CHANGED, ReasonCode.CONFLICT, "canonical entitlement changed during claim", {});
       // The owner approved this exact next generation for this exact role key. Checked before any
       // write — including before the owner approval is consumed — so a stale expectation denies
       // with nothing to roll back yet.
@@ -2224,7 +2348,7 @@ export class CanonicalSelfClaim {
       )?.maximum ?? 0;
       const nextGeneration = currentMax + 1;
       if (nextGeneration !== request.expectedBindingGeneration) {
-        return deny(
+        return refuse(SelfClaimRefusal.GENERATION_MISMATCH,
           ReasonCode.CONFLICT,
           "expected binding generation does not match the next generation for this role",
           { roleKey, expected: request.expectedBindingGeneration, actual: nextGeneration },
@@ -2235,7 +2359,7 @@ export class CanonicalSelfClaim {
       // generation stale and re-activate the writer it fenced); once acknowledged it is a tombstone.
       const fencedBy = switchoverPreparedFrom(this.db, entry.projectId, identity.sessionUuid);
       if (fencedBy !== null) {
-        return deny(ReasonCode.CONFLICT, "this conversation was switched over from and is fenced; it never claims the role again", {
+        return refuse(SelfClaimRefusal.SWITCHOVER_FENCED, ReasonCode.CONFLICT, "this conversation was switched over from and is fenced; it never claims the role again", {
           roleKey, transferId: fencedBy,
         });
       }
@@ -2356,7 +2480,7 @@ export class CanonicalSelfClaim {
             // that same code and rolls everything back. Every other revoke still refuses.
             takeOverLiveRunsForSameActorSuccessor: liveRuns,
           });
-          if (!released.allowed) return released as Decision<CanonicalSelfClaimReceipt>;
+          if (!released.allowed) return stoppedAt(SelfClaimRefusal.DEAD_PREDECESSOR_UNRELEASED, released);
           recoveredFrom = {
             generation: released.value.releasedGeneration,
             sessionId: predecessor.sessionId,
@@ -2378,7 +2502,7 @@ export class CanonicalSelfClaim {
             WHERE a.status = 'ACTIVE' AND (a.actor_id = ? OR a.session_id = ? OR c.current_session_id = ?)`,
           [incumbent.actor_id, predecessor.sessionId, predecessor.sessionId],
         );
-        if (active) return deny(ReasonCode.BINDING_ALREADY_ACTIVE, "live actor or session still holds an assignment", {});
+        if (active) return refuse(SelfClaimRefusal.PREDECESSOR_RUNTIME_ALIVE, ReasonCode.BINDING_ALREADY_ACTIVE, "live actor or session still holds an assignment", {});
         const revoked = this.db.get(
           `SELECT 1 FROM assignments a JOIN actor_target_attestations t ON t.assignment_id = a.assignment_id
             WHERE a.role_key = ? AND a.binding_generation = ? AND a.status = 'REVOKED'
@@ -2412,7 +2536,7 @@ export class CanonicalSelfClaim {
             predecessor.workdir !== identity.cwd || predecessor.buzzActorId !== entry.buzzActorId ||
             predecessor.buzzAddress !== buzzAddress || predecessor.provider !== "claude" ||
             predecessor.model !== "claude-cli") {
-          return deny(ReasonCode.CONFLICT, "same-live recovery requires the exact idle revoked runtime", {});
+          return refuse(SelfClaimRefusal.SAME_LIVE_RUNTIME_MISMATCH, ReasonCode.CONFLICT, "same-live recovery requires the exact idle revoked runtime", {});
         }
         predecessorSessionId = predecessor.sessionId;
       }
@@ -2434,12 +2558,12 @@ export class CanonicalSelfClaim {
       if (abandonedRuntimeSessionId !== null) {
         const reconciled = this.sessions.transition(abandonedRuntimeSessionId, SessionLifecycle.STOPPED,
           `canonical predecessor runtime is gone; row reconciled before generation ${nextGeneration}`);
-        if (!reconciled.allowed) return reconciled as Decision<CanonicalSelfClaimReceipt>;
+        if (!reconciled.allowed) return stoppedAt(SelfClaimRefusal.PREDECESSOR_ROW_UNRECONCILED, reconciled);
       }
       if (predecessorSessionId !== null) {
         const stopped = this.sessions.transition(predecessorSessionId, SessionLifecycle.STOPPED,
           `canonical same-live successor generation ${nextGeneration}`);
-        if (!stopped.allowed) return stopped as Decision<CanonicalSelfClaimReceipt>;
+        if (!stopped.allowed) return stoppedAt(SelfClaimRefusal.SAME_LIVE_PREDECESSOR_UNSTOPPED, stopped);
       }
 
       // v57 — this conversation's claim of a PENDING transfer the CEO made to it. Until now the old conversation
@@ -2451,7 +2575,7 @@ export class CanonicalSelfClaim {
       const entitlements = new CanonicalSessionRegistry(this.db);
       const transfer = entitlements.pendingTransferTo(identity.sessionUuid);
       if (transfer !== null && transfer.projectId !== entry.projectId) {
-        return deny(ReasonCode.CONFLICT, "the pending entitlement transfer names another project", { observed: entry.projectId });
+        return refuse(SelfClaimRefusal.TRANSFER_PROJECT_MISMATCH, ReasonCode.CONFLICT, "the pending entitlement transfer names another project", { observed: entry.projectId });
       }
       const transferredFrom = transfer === null ? null : this.db.get<{ actor_id: string; current_session_id: string | null }>(
         `SELECT a.actor_id, a.current_session_id FROM conversational_actors a
@@ -2468,7 +2592,7 @@ export class CanonicalSelfClaim {
           const revoked = this.bindings.revoke(roleKey,
             `canonical entitlement transfer ${transfer.transferId}: the project's canonical CTO moved to another conversation`,
             { liveRunsForSameActorSuccessor: { runIds: [] }, expectedCurrent: held, evidence: { transferId: transfer.transferId } });
-          if (!revoked.allowed) return revoked as Decision<CanonicalSelfClaimReceipt>;
+          if (!revoked.allowed) return stoppedAt(SelfClaimRefusal.TRANSFER_PREDECESSOR_UNREVOKED, revoked);
           transferRevokedGeneration = held.bindingGeneration;
         }
         const live = this.db.all<{ session_id: string }>(
@@ -2479,7 +2603,7 @@ export class CanonicalSelfClaim {
         for (const { session_id: sessionId } of live) {
           const stopped = this.sessions.transition(sessionId, SessionLifecycle.STOPPED,
             `canonical entitlement transfer ${transfer.transferId} to generation ${nextGeneration}`);
-          if (!stopped.allowed) return stopped as Decision<CanonicalSelfClaimReceipt>;
+          if (!stopped.allowed) return stoppedAt(SelfClaimRefusal.TRANSFER_PREDECESSOR_UNSTOPPED, stopped);
         }
       }
 
@@ -2495,13 +2619,13 @@ export class CanonicalSelfClaim {
       if (transfer !== null && rotation !== null) {
         const stillActive = liveRunIdsOwnedBySession(this.db, rotation.fromSessionId);
         if (stillActive.length > 0) {
-          return deny(ReasonCode.SWITCHOVER_BLOCKED_ACTIVE_RUNS, "the outgoing CTO acquired active runs after the switchover was prepared", {
+          return refuse(SelfClaimRefusal.SWITCHOVER_ACTIVE_RUNS, ReasonCode.SWITCHOVER_BLOCKED_ACTIVE_RUNS, "the outgoing CTO acquired active runs after the switchover was prepared", {
             roleKey, activeRuns: stillActive,
           });
         }
         carried = carriedMessagesOf(this.db, roleKey);
         const retargeted = retargetRotatedActor(this.db, rotation, transfer, identity.sessionUuid);
-        if (!retargeted.allowed) return retargeted as Decision<CanonicalSelfClaimReceipt>;
+        if (!retargeted.allowed) return stoppedAt(SelfClaimRefusal.SWITCHOVER_RETARGET_REFUSED, retargeted);
       }
 
       const created = this.sessions.create({
@@ -2521,7 +2645,7 @@ export class CanonicalSelfClaim {
       const ready = this.sessions.transition(created.sessionId, SessionLifecycle.READY,
         predecessorSessionId === null ? "canonical self-claim" :
           `canonical same-live successor of ${predecessorSessionId}, generation ${nextGeneration}`);
-      if (!ready.allowed) return ready as Decision<CanonicalSelfClaimReceipt>;
+      if (!ready.allowed) return stoppedAt(SelfClaimRefusal.SESSION_NOT_READIED, ready);
 
       // The routable half: this session also authenticates as a Buzz channel identity, inside the
       // same transaction, or none of it lands. `bindBuzzActor` requires the
@@ -2529,7 +2653,7 @@ export class CanonicalSelfClaim {
       // deployment's own ingress authenticator (proving the actor id is one it recognizes) —
       // never an identity tuple taken on its own word.
       if (created.sessionSecret === null) {
-        return deny(
+        return refuse(SelfClaimRefusal.SESSION_SECRET_UNAVAILABLE,
           ReasonCode.SESSION_SECRET_STORAGE_UNAVAILABLE,
           "session secret storage is unavailable; a routable claim requires one",
           { sessionId: created.sessionId },
@@ -2539,7 +2663,7 @@ export class CanonicalSelfClaim {
         { sessionId: created.sessionId, sessionSecret: created.sessionSecret, buzzActorId: entry.buzzActorId },
         this.buzzActorAuthenticator,
       );
-      if (!boundBuzzActor.allowed) return boundBuzzActor as Decision<CanonicalSelfClaimReceipt>;
+      if (!boundBuzzActor.allowed) return stoppedAt(SelfClaimRefusal.BUZZ_ACTOR_UNBOUND, boundBuzzActor);
 
       const targetLocator = identity.sessionUuid;
       const claimed: VerifiedTargetBinding = {
@@ -2586,7 +2710,7 @@ export class CanonicalSelfClaim {
         authenticatedTarget,
         deferPeerMailUntilCarry: recoveredFrom !== null,
       });
-      if (!bound.allowed) return bound as Decision<CanonicalSelfClaimReceipt>;
+      if (!bound.allowed) return stoppedAt(SelfClaimRefusal.BIND_REFUSED, bound);
 
       // v57 — the transfer's run hand-over: every live run pinned to a generation of the transferred-away
       // conversation in this role moves to this generation with its claims, on the transfer's authority,
@@ -2601,7 +2725,7 @@ export class CanonicalSelfClaim {
         const moved = this.bindings.repointLiveRunsToTransferSuccessor(roleKey, generations, {
           sessionId: created.sessionId, generation: bound.value.bindingGeneration, incarnation: bound.value.sessionIncarnation,
         });
-        if (!moved.allowed) return moved as Decision<CanonicalSelfClaimReceipt>;
+        if (!moved.allowed) return stoppedAt(SelfClaimRefusal.TRANSFER_RUNS_UNMOVED, moved);
         const actor = `${SELF_CLAIM_RECOVERY_ACTOR_PREFIX}entitlement-transfer:${transfer.transferId}`;
         const handedOver = (kind: string, runId: string | null, evidence: Record<string, unknown>): Decision<number> => {
           try {
@@ -2621,22 +2745,22 @@ export class CanonicalSelfClaim {
             ...common, fromSession, fromGeneration, claimIds: claims.map((claim) => claim.claimId),
           });
           if (!recorded.allowed) {
-            return deny(ReasonCode.AUDIT_WRITE_FAILED, "the transfer's run hand-over row could not be written, so the claim was rolled back", { roleKey, runId });
+            return refuse(SelfClaimRefusal.AUDIT_WRITE_FAILED, ReasonCode.AUDIT_WRITE_FAILED, "the transfer's run hand-over row could not be written, so the claim was rolled back", { roleKey, runId });
           }
         }
         // The predecessor's entitlement is revoked, and stays its tombstone, only here: verified by this claim.
         const claimedTransfer = entitlements.claim(transfer.transferId, bound.value.bindingGeneration, this.clock.nowIso());
-        if (!claimedTransfer.allowed) return claimedTransfer as Decision<CanonicalSelfClaimReceipt>;
+        if (!claimedTransfer.allowed) return stoppedAt(SelfClaimRefusal.TRANSFER_UNCLAIMED, claimedTransfer);
         const recorded = handedOver("CANONICAL_ENTITLEMENT_TRANSFER_CLAIMED", null, {
           ...common, revokedGeneration: transferRevokedGeneration, runIds: moved.value.runIds,
         });
         if (!recorded.allowed) {
-          return deny(ReasonCode.AUDIT_WRITE_FAILED, "the transfer's claim row could not be written, so the claim was rolled back", { roleKey });
+          return refuse(SelfClaimRefusal.AUDIT_WRITE_FAILED, ReasonCode.AUDIT_WRITE_FAILED, "the transfer's claim row could not be written, so the claim was rolled back", { roleKey });
         }
         if (rotation !== null && carried !== null) {
           const acknowledged = recordRotationAcknowledged(this.db, this.audit, rotation, transfer,
             { sessionId: created.sessionId, generation: bound.value.bindingGeneration }, carried, this.clock.nowIso());
-          if (!acknowledged.allowed) return acknowledged as Decision<CanonicalSelfClaimReceipt>;
+          if (!acknowledged.allowed) return stoppedAt(SelfClaimRefusal.SWITCHOVER_UNACKNOWLEDGED, acknowledged);
         }
       }
 
@@ -2651,7 +2775,7 @@ export class CanonicalSelfClaim {
       // claim back too.
       if (recoveredFrom !== null) {
         if (recoveredFrom.recoveryAuditEventId === null) {
-          return deny(
+          return refuse(SelfClaimRefusal.AUDIT_WRITE_FAILED,
             ReasonCode.AUDIT_WRITE_FAILED,
             "the recovery's DEAD_BINDING_RECOVERED row has no id, so its held peer messages cannot be recorded",
             { roleKey, sessionId: recoveredFrom.sessionId },
@@ -2686,7 +2810,7 @@ export class CanonicalSelfClaim {
         // and reviews stay as they are.
         if (recoveredFrom.liveRunIds.length > 0) {
           const moved = this.bindings.repointLiveRunsToSameActorSuccessor(succession, recoveredFrom.liveRunIds);
-          if (!moved.allowed) return moved as Decision<CanonicalSelfClaimReceipt>;
+          if (!moved.allowed) return stoppedAt(SelfClaimRefusal.LIVE_RUNS_NOT_TAKEN_OVER, moved);
           // One row per moved run, on its run_id: the run's own history says its owner moved here.
           for (const runId of moved.value.runIds) {
             let recorded: Decision<number>;
@@ -2717,7 +2841,7 @@ export class CanonicalSelfClaim {
               recorded = deny(ReasonCode.AUDIT_WRITE_FAILED, error instanceof Error ? error.message : String(error), {});
             }
             if (!recorded.allowed) {
-              return deny(
+              return refuse(SelfClaimRefusal.AUDIT_WRITE_FAILED,
                 ReasonCode.AUDIT_WRITE_FAILED,
                 "the live-run takeover's audit row could not be written, so the claim was rolled back",
                 { roleKey, runs: moved.value.runIds },
@@ -2733,7 +2857,7 @@ export class CanonicalSelfClaim {
           bindingGeneration: recoveredFrom.generation,
         });
         if (stranded.length > 0) {
-          return deny(
+          return refuse(SelfClaimRefusal.LIVE_RUNS_STRANDED,
             ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,
             "the released generation still owns live runs at the claim's commit, so the claim was rolled back",
             { roleKey, runs: stranded },
@@ -2761,7 +2885,7 @@ export class CanonicalSelfClaim {
       try {
         this.audit.record(claimDecisionAuditRecord(asked, admitted, (projectId) => this.#isRegisteredProject(projectId)));
       } catch (error) {
-        return deny(
+        return refuse(SelfClaimRefusal.AUDIT_WRITE_FAILED,
           ReasonCode.AUDIT_WRITE_FAILED,
           "the admission's audit row could not be written, so the admission was rolled back",
           { error: error instanceof Error ? error.message : String(error) },

@@ -158,7 +158,8 @@ describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, wi
     // The new holder is started only once the old writer and the child it left behind are gone from the process table.
     expect(calls.find((call) => call[0] === "observed")).toEqual(["observed", { oldAlive: false, childAlive: false }]);
     const add = calls.find((call) => call[0] === "claude" && call[2] === "add") as string[];
-    expect(add.slice(add.indexOf("--") + 1)).toEqual(["/rt/node", ...f.previousArgs.map((arg) => arg === OLD ? NEW : arg === "1" ? "2" : arg)]);
+    // The entry outlives the rotation, so it pins no generation: the relay reads the next one (here the issued 2).
+    expect(add.slice(add.indexOf("--") + 1)).toEqual(["/rt/node", ...f.previousArgs.map((arg) => arg === OLD ? NEW : arg === "1" ? "auto" : arg)]);
     expect(calls.findIndex((call) => call[0] === "agentctl" && call[2] === "rotate")).toBeLessThan(calls.findIndex((call) => call[0] === "tmux"));
     const shell = readFileSync(join(f.dir, "state", "rotations", `${PROJECT}-${NEW}.sh`), "utf8");
     expect(shell).toContain("unset ACP_OPERATOR_TOKEN");

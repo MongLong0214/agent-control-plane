@@ -26,12 +26,14 @@ import type { Readable, Writable } from "node:stream";
  *     `MCP_PEER_UNAUTHENTICATED`. `io.stdin` is therefore paused until the handshake is written.
  *   - **`clientInfo` is the client's own.** There is no JSON-RPC code path here at all, so the
  *     value the daemon reads from the MCP handshake is the real process's, not one this relay could compose.
- *   - **No retry, no reconnect, no backoff.** The credential is the session's own secret, whose
+ *   - **The credential is presented once.** It is the session's own secret, whose
  *     hash is durable, so the daemon cannot tell a pre-restart plaintext from a post-restart one.
  *     "A credential taken before the ACP restart may not be reused" is enforced *here*: the
  *     process holds it only in memory, writes it exactly once, and exits when either side closes.
  *     A reconnect path would be that reuse, which is why its absence is load-bearing rather than
- *     an omission.
+ *     an omission. Before a receipt there is no credential, so a claim refused for a reason that
+ *     can clear by itself is asked again for a bounded window (`claimUntilAnswered`); a refused
+ *     claim mints nothing, and each attempt is a new claim, not a reconnect.
  *
  * What changed with #1037 is what a *respawned* relay does. It no longer has to claim — and the
  * claim refuses a binding that is still ACTIVE — because it first asks the canonical CTO's reattach
@@ -47,7 +49,8 @@ import type { Readable, Writable } from "node:stream";
  *
  * The secret never reaches argv, the environment, stdout, stderr or any file: `stdout` carries
  * only bytes that came off the socket after the handshake, and the `stderr` vocabulary is closed
- * to `attach: <stage> <reasonCode>` with the code copied from the daemon's own public envelope.
+ * to `attach: <stage> <reasonCode>` with the code copied from the daemon's own public envelope, followed for a claim
+ * refusal by the branch name the daemon sent beside it (`attach: claim refused CONFLICT GENERATION_MISMATCH`).
  *
  * The adopted CEO's relay (`runAdoptedCeoAttachRelay`, #1037) is the same byte pipe with no claim
  * and no handshake in front of it, because its socket authenticates the connection itself.
@@ -86,12 +89,25 @@ export interface AttachRelayIo {
   stderr: Writable;
 }
 
+/**
+ * `--expected-binding-generation auto`, and the default when the flag is absent: the claim pins no generation, and the
+ * role's next one (its highest + 1) is read before every attempt (`AttachRelayOptions.nextGeneration`). A number pinned
+ * in a relay's argv outlives the binding it named: Claude Code keeps the MCP command it started with, so after the
+ * binding was lost every respawn asked for the generation the role had already used and was refused, and only an edited
+ * argv and a `/mcp` reconnect brought the tools back (2026-11-16).
+ */
+export const AUTO_GENERATION = "auto";
+
 /** Exactly the selectors `agentctl claim canonical-cto` takes, so the two argvs stay compatible. */
 export interface AttachRelayClaim {
   claimedSessionUuid: string;
   projectId: string;
-  expectedBindingGeneration: number;
+  /** A number is a pin the claim compares, as it always was; `AUTO_GENERATION` is read for each attempt. */
+  expectedBindingGeneration: number | typeof AUTO_GENERATION;
 }
+
+/** The claim as it goes on the wire: the generation resolved. */
+type PinnedClaim = Omit<AttachRelayClaim, "expectedBindingGeneration"> & { expectedBindingGeneration: number };
 
 export interface AttachRelayOptions {
   claimSocketPath: string;
@@ -113,6 +129,10 @@ export interface AttachRelayOptions {
   /** Bounds on waiting for a restarted daemon; see `ReattachPolicy`. */
   reattach?: Partial<ReattachPolicy>;
   claimTimeoutMs?: number;
+  /** The role's next generation, read before each attempt of an `AUTO_GENERATION` claim. Required for one. */
+  nextGeneration?: () => Promise<number>;
+  /** Bounds on asking again after a refusal that may clear by itself; see `ClaimRetryPolicy`. */
+  claimRetry?: Partial<ClaimRetryPolicy>;
   /**
    * The session's own messaging socket and token. Set, the relay opens its wake proxy; the CLI
    * entry reads both from the environment Claude Code gave it (`sessionMessagingFromEnv`).
@@ -160,6 +180,67 @@ export const DEFAULT_REATTACH_POLICY: ReattachPolicy = {
   attemptTimeoutMs: 35_000,
   flushTimeoutMs: 5_000,
 };
+
+/**
+ * How long a relay that has not been admitted yet keeps asking. Before the first receipt there is no credential to
+ * reuse, so asking again is a new claim, not a reconnect; a refused claim mints nothing. It asks again only after an
+ * answer that can clear by itself (`retriesAfter`) and only until `maxWaitMs` from its first attempt: Claude Code gives
+ * a stdio MCP server 30 s to answer `initialize` (measured in its own log, "Starting connection with timeout of
+ * 30000ms") and does not respawn one that missed it, so asking past that buys nothing.
+ */
+export interface ClaimRetryPolicy {
+  maxWaitMs: number;
+  initialDelayMs: number;
+  maxDelayMs: number;
+}
+
+export const DEFAULT_CLAIM_RETRY_POLICY: ClaimRetryPolicy = {
+  maxWaitMs: 25_000,
+  initialDelayMs: 500,
+  maxDelayMs: 4_000,
+};
+
+/**
+ * The refusals a later attempt can pass with nothing changed by anyone: the daemon has not finished starting, the
+ * previous runtime of this same conversation is still exiting, a probe or a Buzz room open failed this once, the entitlement moved during the claim, a new
+ * conversation's transcript or host registry entry is not written yet, a write failed. Names of `SelfClaimRefusal` in
+ * `src/registry/canonical-self-claim.ts`, copied for the reason the method names above are. Everything else — another
+ * conversation holding the role, a session that is not entitled, a fenced or changed one — exits on the first answer.
+ */
+const RETRIED_REFUSALS: ReadonlySet<string> = new Set([
+  "PREDECESSOR_RUNTIME_ALIVE",
+  "SAME_LIVE_RUNTIME_MISMATCH",
+  "DEAD_PREDECESSOR_UNRELEASED",
+  "ENTITLEMENT_CHANGED",
+  "BUZZ_ROOM_UNRESOLVED",
+  "HOST_SESSION_REGISTRY_UNVERIFIED",
+  "HOST_SESSION_REGISTRY_UNIDENTIFIED",
+  "ANCESTOR_START_UNKNOWN",
+  "ANCESTOR_CWD_UNREADABLE",
+  "TRANSCRIPT_NOT_FOUND",
+  "AUDIT_WRITE_FAILED",
+  "DAEMON_STARTING",
+]);
+
+/** Reason codes that say the daemon could not decide this time, whatever the branch: it is restarting or busy. */
+const RETRIED_REASON_CODES: ReadonlySet<string> = new Set(["DAEMON_LOCK_LOST", "OPERATOR_REQUEST_TIMEOUT", "PROBE_FAILED"]);
+
+/** A refusal's branch name as the daemon wrote it, or null for anything that is not one. Never daemon prose on stderr. */
+const REFUSAL_NAME = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+/**
+ * Whether `refusal` can clear by itself. A generation that moved is one only for a claim that pins none: it is read
+ * again for the next attempt, where a pinned one would be refused the same way forever.
+ */
+const retriesAfter = (refusal: { reasonCode: string; reason: string | null }, auto: boolean): boolean => {
+  if (RETRIED_REASON_CODES.has(refusal.reasonCode)) return true;
+  if (refusal.reason === null) return false;
+  if (refusal.reason === "GENERATION_MISMATCH") return auto;
+  return RETRIED_REFUSALS.has(refusal.reason);
+};
+
+/** Exported for the test that holds the copied names to the registry's. */
+export const RETRIED_CLAIM_REFUSALS: readonly string[] = [...RETRIED_REFUSALS, "GENERATION_MISMATCH"];
 
 /**
  * The most client requests the relay lets wait on the daemon at once. Past it the client's stdin is
@@ -356,7 +437,7 @@ const readmitted = (named: Admission, held: Admission, proven: SuccessionBinding
 type ClaimOutcome =
   | { kind: "receipt"; sessionId: string; sessionSecret: string; tuple: AdmittedTuple | null }
   | { kind: "unavailable" }
-  | { kind: "refused"; reasonCode: string }
+  | { kind: "refused"; reasonCode: string; reason: string | null }
   | { kind: "malformed" };
 
 /**
@@ -371,7 +452,7 @@ type ClaimOutcome =
  */
 const performClaim = (
   socketPath: string,
-  claim: AttachRelayClaim,
+  claim: PinnedClaim,
   timeoutMs: number,
 ): Promise<ClaimOutcome> =>
   new Promise<ClaimOutcome>((resolveClaim) => {
@@ -407,12 +488,14 @@ const performClaim = (
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
         return finish({ kind: "malformed" });
       }
-      const response = parsed as { allowed?: unknown; reasonCode?: unknown; value?: unknown };
+      const response = parsed as { allowed?: unknown; reasonCode?: unknown; reason?: unknown; value?: unknown };
       if (response.allowed !== true) {
         // A denial with no stable code is not a denial this relay can report, and inventing one
-        // would put a reason code on stderr that no catalogue declares.
+        // would put a reason code on stderr that no catalogue declares. The branch name beside it is
+        // kept only when it has the shape of one; a daemon that sends none leaves it null.
+        const reason = typeof response.reason === "string" && REFUSAL_NAME.test(response.reason) ? response.reason : null;
         return typeof response.reasonCode === "string" && response.reasonCode.length > 0
-          ? finish({ kind: "refused", reasonCode: response.reasonCode })
+          ? finish({ kind: "refused", reasonCode: response.reasonCode, reason })
           : finish({ kind: "malformed" });
       }
       const value = response.value as { sessionId?: unknown; sessionSecret?: unknown; binding?: unknown } | undefined;
@@ -842,6 +925,10 @@ export interface AttachRelayCommandOptions {
   claim: AttachRelayClaim;
   reattachSocketPath?: string;
   reattach?: Partial<ReattachPolicy>;
+  /** See `AttachRelayOptions.nextGeneration`. */
+  nextGeneration?: () => Promise<number>;
+  /** See `AttachRelayOptions.claimRetry`. */
+  claimRetry?: Partial<ClaimRetryPolicy>;
   /**
    * The deployment's state directory, the one the daemon accepts wake endpoints in. Set, the
    * relay refuses to start unless the session's messaging socket sits directly inside it.
@@ -963,6 +1050,67 @@ const reattachFirst = async (
   return CLAIM;
 };
 
+type Receipt = Extract<ClaimOutcome, { kind: "receipt" }>;
+
+/**
+ * The claim, asked until it is answered for good: a receipt, a refusal that cannot clear by itself (`retriesAfter`),
+ * or the end of the retry window. Resolves to the receipt, or to the exit code the relay leaves with.
+ *
+ * Each attempt after the first asks the reattach door again first, when there is one. A claim whose answer was lost
+ * (the daemon went away mid-reply) may have been admitted, and its binding is then ACTIVE on this process tree: the
+ * door admits that, where a second claim would be refused for it. A door that refuses ends the attach as it does at
+ * start, so this never claims after a refused reattach.
+ *
+ * Every attempt that does not end the attach writes `attach: claim refused <reasonCode> <reason>; retrying` (or
+ * `attach: claim socket unavailable; retrying`); the last one writes the same line without the suffix. `<reason>` is
+ * the branch name the daemon sent, and is left out when it sent none.
+ */
+const claimUntilAnswered = async (options: AttachRelayOptions, io: AttachRelayIo): Promise<Receipt | number> => {
+  const policy: ClaimRetryPolicy = { ...DEFAULT_CLAIM_RETRY_POLICY, ...options.claimRetry };
+  const timeoutMs = options.claimTimeoutMs ?? DEFAULT_CLAIM_TIMEOUT_MS;
+  const pinned = options.claim.expectedBindingGeneration;
+  const deadline = Date.now() + policy.maxWaitMs;
+  let delay = policy.initialDelayMs;
+  for (let attempt = 0; ; attempt += 1) {
+    if (attempt > 0) {
+      const reattached = await reattachFirst(options.reattachSocketPath, timeoutMs, options.reattach, options.messaging, io);
+      if (reattached !== CLAIM) return reattached;
+    }
+    let expectedBindingGeneration: number;
+    if (pinned !== AUTO_GENERATION) {
+      expectedBindingGeneration = pinned;
+    } else {
+      const next = options.nextGeneration === undefined ? null : await options.nextGeneration().catch(() => null);
+      // Unreadable is not something a wait repairs (no database, or a runtime that cannot open it), and guessing a
+      // generation would only be refused, so the attach ends here and says which step it could not take.
+      if (next === null || !Number.isSafeInteger(next) || next <= 0) {
+        io.stderr.write("attach: claim generation unreadable\n");
+        return ATTACH_EXIT.UNAVAILABLE;
+      }
+      expectedBindingGeneration = next;
+    }
+    const claimed = await performClaim(options.claimSocketPath, { ...options.claim, expectedBindingGeneration }, timeoutMs);
+    if (claimed.kind === "receipt") return claimed;
+    if (claimed.kind === "malformed") {
+      io.stderr.write("attach: claim receipt malformed\n");
+      return ATTACH_EXIT.PROTOCOL;
+    }
+    const line = claimed.kind === "unavailable"
+      ? "attach: claim socket unavailable"
+      : `attach: claim refused ${claimed.reasonCode}${claimed.reason === null ? "" : ` ${claimed.reason}`}`;
+    // A daemon that is not listening yet — restarting, or not started — is asked again like any answer that can clear.
+    const again = claimed.kind === "unavailable" || retriesAfter(claimed, pinned === AUTO_GENERATION);
+    const wait = Math.min(delay, deadline - Date.now());
+    if (!again || wait <= 0) {
+      io.stderr.write(`${line}\n`);
+      return claimed.kind === "unavailable" ? ATTACH_EXIT.UNAVAILABLE : ATTACH_EXIT.CLAIM_REFUSED;
+    }
+    io.stderr.write(`${line}; retrying\n`);
+    await new Promise<void>((resolveWait) => setTimeout(resolveWait, wait));
+    delay = Math.min(delay * 2, policy.maxDelayMs);
+  }
+};
+
 export const runAttachRelay = async (
   options: AttachRelayOptions,
   io: AttachRelayIo,
@@ -982,23 +1130,8 @@ export const runAttachRelay = async (
     if (reattached !== CLAIM) return reattached;
   }
 
-  const claimed = await performClaim(
-    options.claimSocketPath,
-    options.claim,
-    options.claimTimeoutMs ?? DEFAULT_CLAIM_TIMEOUT_MS,
-  );
-  if (claimed.kind === "unavailable") {
-    io.stderr.write("attach: claim socket unavailable\n");
-    return ATTACH_EXIT.UNAVAILABLE;
-  }
-  if (claimed.kind === "refused") {
-    io.stderr.write(`attach: claim refused ${claimed.reasonCode}\n`);
-    return ATTACH_EXIT.CLAIM_REFUSED;
-  }
-  if (claimed.kind === "malformed") {
-    io.stderr.write("attach: claim receipt malformed\n");
-    return ATTACH_EXIT.PROTOCOL;
-  }
+  const claimed = await claimUntilAnswered(options, io);
+  if (typeof claimed === "number") return claimed;
 
   const connection = {
     handshake: (socket: Socket) => {

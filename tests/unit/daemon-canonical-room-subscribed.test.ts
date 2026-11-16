@@ -462,6 +462,9 @@ describe("a claim or a correction that reaches the daemon before its rooms are c
       "SELECT buzz_address FROM sessions WHERE buzz_actor_id = ?", [holderActor],
     )?.buzz_address ?? null,
   });
+  const startingRefusals = (cp: ControlPlane) => cp.db.all<{ reason_code: string; evidence_json: string }>(
+    "SELECT reason_code, evidence_json FROM audit_events WHERE kind = 'CANONICAL_SELF_CLAIM_REFUSED' ORDER BY event_id",
+  ).map((row) => ({ reason_code: row.reason_code, evidence: JSON.parse(row.evidence_json) as unknown }));
   /** The correction is fired after admission and not awaited by anyone; this waits for its row. */
   const correctionLanded = async (cp: ControlPlane): Promise<void> => {
     for (let turn = 0; turn < 200; turn += 1) {
@@ -470,7 +473,7 @@ describe("a claim or a correction that reaches the daemon before its rooms are c
     }
   };
 
-  it("opens no room and writes nothing when the subscriber identity does not listen in the entry's room, and startup still refuses", async () => {
+  it("opens no room and writes only its named refusal row when the subscriber identity does not listen in the entry's room, and startup still refuses", async () => {
     const early: { claim?: Promise<Decision<unknown>>; reattach?: Promise<Decision<unknown>>; buzzCallsAtOnce?: number } = {};
     const { config, pubkey, printed, buzzCalls } = deployment([DEFAULT_ROOM], {
       canonical: true,
@@ -497,19 +500,21 @@ describe("a claim or a correction that reaches the daemon before its rooms are c
     expect(printed()).toContain("Buzz mention subscriber configured identities: 1");
     // Both connections arrived before the subscriber existed.
     expect(early.buzzCallsAtOnce).toBe(0);
-    // The claim was refused before anything was built; the reattach was still admitted.
-    await expect(early.claim).resolves.toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+    // The claim was refused before anything was built, by name; the reattach was still admitted.
+    await expect(early.claim).resolves.toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT, evidence: { reason: "DAEMON_STARTING" } });
     await expect(early.reattach).resolves.toMatchObject({ allowed: true });
     expect(buzzCalls).toEqual([]);
     const after = new ControlPlane(config);
     try {
+      // No session, room or binding; the one row is the refusal's own, naming the branch.
       expect(roomState(after, pubkey)).toEqual({
         sessions: 1,
         freshSessionRooms: [],
-        claimAuditRows: 0,
+        claimAuditRows: 1,
         correctionAuditRows: 0,
         holderRoom: DEFAULT_ROOM,
       });
+      expect(startingRefusals(after)).toEqual([{ reason_code: ReasonCode.CONFLICT, evidence: { identity: FRESH, reason: "DAEMON_STARTING" } }]);
     } finally {
       after.close();
     }
@@ -583,7 +588,7 @@ describe("a claim or a correction that reaches the daemon before its rooms are c
     expect(state).toEqual({
       sessions: 1,
       freshSessionRooms: [],
-      claimAuditRows: 0,
+      claimAuditRows: 1,
       correctionAuditRows: 1,
       holderRoom: ITS_ROOM,
     });

@@ -2663,7 +2663,7 @@ describe("every decision claim() hands back leaves exactly one audit row", () =>
       project_id: projectId,
       session_id: null,
       role_key: null,
-      evidence: { identity: OTHER },
+      evidence: { identity: OTHER, reason: "SESSION_NOT_ENTITLED" },
     }]);
     expect(auditTotal(core)).toBe(totalBefore + 1);
   });
@@ -2724,8 +2724,10 @@ describe("every decision claim() hands back leaves exactly one audit row", () =>
     expect(result.allowed).toBe(false);
     if (result.allowed) return;
     expect(result.message).toContain("expected binding generation does not match");
+    // The row names the branch and the two generations it compared: asked 2, next 1.
     expect(claimDecisionRows(core)).toEqual([expect.objectContaining({
       kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: ReasonCode.CONFLICT, project_id: projectId,
+      evidence: { identity: CANON, reason: "GENERATION_MISMATCH", expectedGeneration: 2, nextGeneration: 1 },
     })]);
     expect(auditTotal(core)).toBe(totalBefore + 1);
   });
@@ -2743,7 +2745,7 @@ describe("every decision claim() hands back leaves exactly one audit row", () =>
     if (result.allowed) return;
     expect(result.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
     expect(claimDecisionRows(core)).toEqual([expect.objectContaining({
-      kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: ReasonCode.INVALID_ARGUMENT, evidence: { identity: null },
+      kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: ReasonCode.INVALID_ARGUMENT, evidence: { identity: null, reason: "REQUEST_INVALID" },
     })]);
     expect(JSON.stringify(core.db.all(`SELECT * FROM audit_events`))).not.toContain("arbitrary caller text");
   });
@@ -2764,6 +2766,7 @@ describe("every decision claim() hands back leaves exactly one audit row", () =>
     expect(result.reasonCode).toBe(ReasonCode.NOT_FOUND);
     expect(claimDecisionRows(core)).toEqual([expect.objectContaining({
       kind: "CANONICAL_SELF_CLAIM_REFUSED", reason_code: ReasonCode.NOT_FOUND, project_id: projectId,
+      evidence: { identity: CANON, reason: "BUZZ_ROOM_UNRESOLVED" },
     })]);
     expect(auditTotal(core)).toBe(totalBefore + 1);
   });
@@ -2839,7 +2842,7 @@ describe("every decision claim() hands back leaves exactly one audit row", () =>
       project_id: null,
       session_id: null,
       role_key: null,
-      evidence: { identity: CANON },
+      evidence: { identity: CANON, reason: "REQUEST_INVALID" },
     }]);
     expect(auditTotal(core)).toBe(totalBefore + 1);
     const everyAuditRow = JSON.stringify(core.db.all(`SELECT * FROM audit_events`));
