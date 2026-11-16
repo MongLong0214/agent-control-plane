@@ -1,5 +1,6 @@
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
+import { digestOf } from "../../src/core/digest.ts";
 import { deny } from "../../src/core/errors.ts";
 import { WriteOperation } from "../../src/guard/managed-write-guard.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -858,16 +859,32 @@ describe("#1162 r3 — a refused or ignored input recorded under the hold is not
  * The live run_136ee4b9 (CEO loss 03:50:43Z, covered again 03:50:45Z): the CTO's review evidence was staged and
  * attached to the run after the pause, two HANDOFF artifacts the hold's row digest counted as work, so the hold
  * was kept for good. The pause is the one the code has always written (the digest of every artifact row); the
- * release now recomputes that formula over the current rows minus exactly the same-run, same-contract review
- * evidence candidate/attachment artifacts created after the pause. Every other change keeps the hold.
+ * release recomputes that formula over the current rows minus the review evidence artifacts ACP's own
+ * STANDARD_REVIEW_EVIDENCE_STAGED / _ATTACHED audit receipts vouch for, receipted after the pause event (by event id,
+ * not by clock) with this run's contract digest. An artifact's own content vouches for nothing.
  */
 describe("a hold is released across review evidence staged or attached after the pause, and only across that", () => {
   const CANDIDATE = "acp.standard-review-evidence-candidate.v1";
   const ATTACHED = "acp.standard-review-evidence-attached.v1";
-  const evidence = (runId: string, contractDigest: string, schema: string, extra: Record<string, unknown> = {}) =>
-    ({ schema, runId, contractDigest, sha256: `sha256:${"a".repeat(64)}`, stagedBy: "cto", ...extra });
+  const STAGED_KIND = "STANDARD_REVIEW_EVIDENCE_STAGED";
+  const ATTACHED_KIND = "STANDARD_REVIEW_EVIDENCE_ATTACHED";
+  const evidence = (runId: string, contractDigest: string, schema: string | undefined, extra: Record<string, unknown> = {}) =>
+    ({ ...(schema === undefined ? {} : { schema }), runId, contractDigest, sha256: `sha256:${"a".repeat(64)}`, stagedBy: "cto", ...extra });
+  type Cp = BootstrapRuntimeFixture["harness"]["cp"];
+  /** The artifact as the stage/attach path writes it, and its receipt: the audit event recording the artifact's digest. */
+  const receipted = (cp: Cp, runId: string, schema: string | undefined, receipt: { kind?: string; runId?: string; contractDigest?: string } = {}) => {
+    const contractDigest = cp.runs.require(runId).contractDigest;
+    const artifact = cp.artifacts.put(runId, ArtifactKind.HANDOFF, evidence(runId, contractDigest, schema));
+    const kind = receipt.kind ?? (schema === ATTACHED ? ATTACHED_KIND : STAGED_KIND);
+    const recorded = cp.audit.record({
+      kind, runId: receipt.runId ?? runId,
+      evidence: { digest: artifact.digest, payloadDigest: `sha256:${"a".repeat(64)}`, contractDigest: receipt.contractDigest ?? contractDigest },
+    });
+    if (!recorded.allowed) throw new Error(recorded.message);
+    return artifact;
+  };
 
-  it("same-run, same-contract evidence staged then attached after the pause: released; a changed task, execution row, other artifact or other HANDOFF beside it is not", async () => {
+  it("evidence staged then attached after the pause, each with its receipt, is released; every other change beside it keeps the hold", async () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const project = await ownedProject(f, scriptOwners(f), "evidence-after-pause");
@@ -875,48 +892,92 @@ describe("a hold is released across review evidence staged or attached after the
       const taskRun = await stalledRun(f, project);
       const planRun = await stalledRun(f, project);
       const handoffRun = await stalledRun(f, project);
-      const foreignRunRun = await stalledRun(f, project);
-      const foreignContractRun = await stalledRun(f, project);
-      const mixedRun = await stalledRun(f, project);
       const control = await stalledRun(f, project);
       await loseCeo(f);
       f.harness.clock.advance(10_000);
-      const putEvidence = (runId: string, content: Record<string, unknown>) => cp.artifacts.put(runId, ArtifactKind.HANDOFF, content);
-      const digestOfRun = (runId: string) => cp.runs.require(runId).contractDigest;
-      for (const runId of [evidenceRun, taskRun, planRun, handoffRun, mixedRun]) {
-        const candidate = putEvidence(runId, evidence(runId, digestOfRun(runId), CANDIDATE));
+      for (const runId of [evidenceRun, taskRun, planRun, handoffRun]) {
+        receipted(cp, runId, CANDIDATE);
         f.harness.clock.advance(10);
-        putEvidence(runId, evidence(runId, digestOfRun(runId), ATTACHED, { candidateDigest: candidate.digest }));
+        receipted(cp, runId, ATTACHED);
         f.harness.clock.advance(10);
       }
-      // Evidence naming another run, or another contract, is not this run's review evidence.
-      putEvidence(foreignRunRun, evidence(evidenceRun, digestOfRun(foreignRunRun), CANDIDATE));
-      putEvidence(foreignContractRun, evidence(foreignContractRun, `sha256:${"b".repeat(64)}`, CANDIDATE));
       cp.db.run(`UPDATE tasks SET spec_json = ?, updated_at = ? WHERE task_id = ?`, [
         JSON.stringify({ note: "changed under the hold" }), f.harness.clock.nowIso(), cp.tasks.list(taskRun)[0]!.taskId,
       ]);
       cp.artifacts.put(planRun, ArtifactKind.PLAN, { summary: "a PLAN stored under the hold" });
-      cp.artifacts.put(handoffRun, ArtifactKind.HANDOFF, { schema: "acp.something-else.v1", runId: handoffRun, contractDigest: digestOfRun(handoffRun) });
-      cp.artifacts.put(mixedRun, ArtifactKind.HANDOFF, { note: "a HANDOFF with no schema" });
+      cp.artifacts.put(handoffRun, ArtifactKind.HANDOFF, { schema: "acp.something-else.v1", runId: handoffRun, contractDigest: cp.runs.require(handoffRun).contractDigest });
       readoptCeo(f);
       const pass = await reconcile(f, "the CEO is bound again");
       expectReleased(f, evidenceRun);
       expectReleased(f, control);
-      for (const runId of [taskRun, planRun, handoffRun, foreignRunRun, foreignContractRun, mixedRun]) expectHeld(f, runId);
-      expect(pass.continuityHolds.released.sort()).toEqual([evidenceRun, control].sort());
+      for (const runId of [taskRun, planRun, handoffRun]) expectHeld(f, runId);
+      expect([...pass.continuityHolds.released].sort()).toEqual([evidenceRun, control].sort());
       expect(pass.continuityHolds.kept).toEqual(expect.arrayContaining(
-        [taskRun, planRun, handoffRun, foreignRunRun, foreignContractRun, mixedRun].map((runId) => ({ runId, why: CHANGED })),
+        [taskRun, planRun, handoffRun].map((runId) => ({ runId, why: CHANGED })),
       ));
     });
   });
 
-  it("evidence of the run stored before the pause is in the recorded digest and stays unmoved, and a later change beside it still keeps the hold", async () => {
+  it("an artifact no genuine receipt vouches for keeps the hold: one put directly, with a receipt of another run, another contract, another kind, or none, or with no schema at all", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const project = await ownedProject(f, scriptOwners(f), "evidence-forged");
+      const [direct, otherRunReceipt, otherContract, wrongKind, noSchema, noSchemaReceipted, control] = [
+        await stalledRun(f, project), await stalledRun(f, project), await stalledRun(f, project), await stalledRun(f, project),
+        await stalledRun(f, project), await stalledRun(f, project), await stalledRun(f, project),
+      ];
+      await loseCeo(f);
+      f.harness.clock.advance(10_000);
+      // Carries the evidence schema, run and contract in its own content, and no receipt at all.
+      cp.artifacts.put(direct, ArtifactKind.HANDOFF, evidence(direct, cp.runs.require(direct).contractDigest, CANDIDATE));
+      receipted(cp, otherRunReceipt, CANDIDATE, { runId: control });
+      receipted(cp, otherContract, CANDIDATE, { contractDigest: `sha256:${"b".repeat(64)}` });
+      receipted(cp, wrongKind, CANDIDATE, { kind: ATTACHED_KIND });
+      // No `schema`: json_extract is NULL, which must keep the row in, not drop it.
+      cp.artifacts.put(noSchema, ArtifactKind.HANDOFF, evidence(noSchema, cp.runs.require(noSchema).contractDigest, undefined));
+      receipted(cp, noSchemaReceipted, undefined, { kind: STAGED_KIND });
+      receipted(cp, control, CANDIDATE);
+      readoptCeo(f);
+      const pass = await reconcile(f, "the CEO is bound again");
+      expectReleased(f, control);
+      const kept = [direct, otherRunReceipt, otherContract, wrongKind, noSchema, noSchemaReceipted];
+      for (const runId of kept) expectHeld(f, runId);
+      expect(pass.continuityHolds.released).toEqual([control]);
+      expect(pass.continuityHolds.kept).toEqual(expect.arrayContaining(kept.map((runId) => ({ runId, why: CHANGED }))));
+    });
+  });
+
+  it("receipts are ordered by event, not by clock: evidence receipted in the pause's own millisecond is released; a receipt from before the pause does not vouch for an artifact stored after it", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const project = await ownedProject(f, scriptOwners(f), "evidence-same-millisecond");
+      const sameMs = await stalledRun(f, project);
+      const early = await stalledRun(f, project);
+      const contractOf = (runId: string) => cp.runs.require(runId).contractDigest;
+      // The receipt of `early`'s evidence is recorded before the pause; the artifact it names is stored after.
+      const content = evidence(early, contractOf(early), CANDIDATE);
+      const earlyDigest = digestOf(content);
+      cp.audit.record({ kind: STAGED_KIND, runId: early, evidence: { digest: earlyDigest, contractDigest: contractOf(early) } });
+      await loseCeo(f, { frozenClock: true });
+      receipted(cp, sameMs, CANDIDATE);
+      expect(cp.artifacts.put(early, ArtifactKind.HANDOFF, content).digest).toBe(earlyDigest);
+      expect(cp.audit.forRun(sameMs).at(-1)!.at).toBe(cp.audit.forRun(sameMs).filter((e) => e.kind === "RUN_TRANSITION").at(-1)!.at);
+      readoptCeo(f);
+      const pass = await reconcile(f, "the CEO is bound again");
+      expectReleased(f, sameMs);
+      expectHeld(f, early);
+      expect(pass.continuityHolds.released).toEqual([sameMs]);
+      expect(pass.continuityHolds.kept).toContainEqual({ runId: early, why: CHANGED });
+    });
+  });
+
+  it("evidence of the run stored and receipted before the pause is in the recorded digest and stays unmoved, and a later change beside it still keeps the hold", async () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const project = await ownedProject(f, scriptOwners(f), "evidence-before-pause");
       const runId = await stalledRun(f, project);
       const other = await stalledRun(f, project);
-      for (const id of [runId, other]) cp.artifacts.put(id, ArtifactKind.HANDOFF, evidence(id, cp.runs.require(id).contractDigest, CANDIDATE));
+      for (const id of [runId, other]) receipted(cp, id, CANDIDATE);
       await loseCeo(f);
       f.harness.clock.advance(10_000);
       cp.artifacts.put(other, ArtifactKind.PLAN, { summary: "a PLAN stored under the hold" });

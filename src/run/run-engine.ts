@@ -1196,24 +1196,30 @@ export class RunEngine {
    * attempts, every row in full and in a fixed order. Equal digests at the pause and at the release mean
    * none of them was written in between, whatever the clock read.
    *
-   * With `evidenceSince` (the release's, for a pause recorded under this same formula) the run's own review
-   * evidence added after that time is left out: a STANDARD review evidence candidate or attachment HANDOFF of
-   * this run and this run's contract, created strictly after the pause, is a CTO/CEO bookkeeping record of
-   * the review, not work. Any other artifact, HANDOFF included, still counts.
+   * With `evidenceAfterEvent` (the release's: the pause's audit event id, for a pause recorded under this same
+   * formula) the run's own review evidence receipted after the pause is left out. An artifact is left out only
+   * when ACP's own audit record vouches for it: a STANDARD_REVIEW_EVIDENCE_STAGED (a candidate) or
+   * STANDARD_REVIEW_EVIDENCE_ATTACHED (an attachment) event of this run, later than the pause by event id (not by
+   * clock), that records this artifact's digest and this run's contract digest. The artifact's own content
+   * is not trusted, and every condition must be positively true: a missing schema or an unreadable record
+   * leaves the artifact in. Any other artifact, HANDOFF included, still counts.
    */
-  #holdSnapshot(runId: string, evidenceSince?: string): string {
+  #holdSnapshot(runId: string, evidenceAfterEvent?: number): string {
     const run = this.db.get<{ current_candidate_digest: string | null; contract_digest: string }>(
       `SELECT current_candidate_digest, contract_digest FROM runs WHERE run_id = ?`,
       [runId],
     );
-    const evidence = evidenceSince === undefined ? "" : `
-            AND NOT (kind = 'HANDOFF' AND created_at > ? AND CASE WHEN json_valid(content_json)
-                  THEN json_extract(content_json, '$.schema') IN (?, ?)
-                   AND json_extract(content_json, '$.runId') IS ?
-                   AND json_extract(content_json, '$.contractDigest') IS ? ELSE 0 END)`;
-    const evidenceArgs = evidenceSince === undefined ? [] : [
-      evidenceSince, STANDARD_REVIEW_EVIDENCE_CANDIDATE_SCHEMA, STANDARD_REVIEW_EVIDENCE_ATTACHED_SCHEMA,
-      runId, run?.contract_digest ?? null,
+    const evidence = evidenceAfterEvent === undefined ? "" : `
+            AND NOT COALESCE(kind = 'HANDOFF' AND json_valid(content_json) AND EXISTS (
+              SELECT 1 FROM audit_events receipt
+               WHERE receipt.run_id = run_artifacts.run_id AND receipt.event_id > ? AND json_valid(receipt.evidence_json)
+                 AND ((receipt.kind = 'STANDARD_REVIEW_EVIDENCE_STAGED' AND json_extract(content_json, '$.schema') = ?)
+                   OR (receipt.kind = 'STANDARD_REVIEW_EVIDENCE_ATTACHED' AND json_extract(content_json, '$.schema') = ?))
+                 AND json_extract(receipt.evidence_json, '$.digest') = run_artifacts.digest
+                 AND json_extract(receipt.evidence_json, '$.contractDigest') = ?), 0)`;
+    const evidenceArgs = evidenceAfterEvent === undefined ? [] : [
+      evidenceAfterEvent, STANDARD_REVIEW_EVIDENCE_CANDIDATE_SCHEMA, STANDARD_REVIEW_EVIDENCE_ATTACHED_SCHEMA,
+      run?.contract_digest ?? null,
     ];
     const tasks = this.db.all<{ spec_json: string }>(
       `SELECT task_id, state, attempt_count, spec_json, updated_at FROM tasks WHERE run_id = ? ORDER BY task_id`,
@@ -2246,8 +2252,9 @@ export class RunEngine {
       const atPause = auditEvidence(pause.evidence_json)?.[HOLD_SNAPSHOT_FIELD];
       if (typeof atPause === "string") {
         // The review evidence staged or attached since the pause is not work (see `#holdSnapshot`): the old
-        // formula over the rows minus exactly those artifacts must equal what the pause recorded.
-        if (atPause !== this.#holdSnapshot(runId, pause.at)) {
+        // formula over the rows minus exactly the artifacts receipted after the pause's event must equal what the
+        // pause recorded.
+        if (atPause !== this.#holdSnapshot(runId, pause.event_id)) {
           return kept("the run's tasks, executions, artifacts or candidate attempts changed under the hold");
         }
       } else {
