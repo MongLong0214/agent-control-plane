@@ -2609,6 +2609,23 @@ export class WorkerTurnRunner {
       });
       return;
     }
+    // #1418 — a turn that left nothing beyond its imports did no work of its own. When the write target
+    // declares paths the imports do not account for, the task required worker edits: not SUCCEEDED.
+    if (facts.imports.length > 0 && facts.writeTarget && observed.entries.length > 0) {
+      const importPaths = new Set(facts.imports.map((entry) => entry.path));
+      const accounted = (path: string): boolean => facts.imports.some((entry) => entry.path === path || entry.path.startsWith(`${path}/`));
+      const required = facts.writeTarget.paths.filter((path) => !accounted(path));
+      if (required.length > 0 && observed.entries.every((entry) => importPaths.has(entry.path))) {
+        this.fail(facts, executionId, "FAILED", "contract", {
+          ...evidence,
+          reason: "NO_WORKER_CHANGE",
+          reasonCode: ReasonCode.EVIDENCE_MISSING,
+          detail: "the worker changed nothing beyond the task's imports, though its write target declares paths the imports do not cover",
+          required,
+        });
+        return;
+      }
+    }
     if (observed.entries.length === 0 || !observed.diffDigest) {
       this.fail(facts, executionId, "FAILED", "contract", { ...evidence, reason: "NO_CHANGE", reasonCode: ReasonCode.EVIDENCE_MISSING });
       return;
