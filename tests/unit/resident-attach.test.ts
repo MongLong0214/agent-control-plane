@@ -12,5 +12,5 @@ it('the provisioner MCP command reaches the canonical attach relay with the next
   vi.stubEnv('ACP_STATE_DIR',state);
   const uuid = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
   expect(await main(['attach','resident-cto','--claimed-session-id',uuid,'--project-id','resident'])).toBe(0);
-  expect(runAttachRelayCommand).toHaveBeenCalledWith(expect.objectContaining({claim:{claimedSessionUuid:uuid,projectId:'resident',expectedBindingGeneration:1}}),expect.anything());
+  expect(runAttachRelayCommand).toHaveBeenCalledWith(expect.objectContaining({claim:{claimedSessionUuid:uuid,projectId:'resident',expectedBindingGeneration:1},stateDir:state}),expect.anything());
 });
