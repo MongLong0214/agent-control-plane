@@ -1,4 +1,5 @@
 import { frontierReviewPolicy } from "../review/frontier-simplify-policy.ts";
+import type { BlindReviewGate } from "../review/blind-review.ts";
 import { attachBootstrapReviewEvidence, reviewEvidenceAttachAccess, reviewEvidenceAttachAuthority, type ReviewEvidenceInput } from "../bootstrap/bootstrap-review-evidence.ts";
 import { attachStandardReviewEvidence, standardReviewEvidenceAttachAccess, type StandardReviewEvidenceAttachInput } from "../review/standard-review-evidence.ts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -99,6 +100,8 @@ export interface HermesMcpSource extends McpMutationSource {
   /** `pr_evidence_get` reaches GitHub through the kernel's GET-only accessor and nothing else. */
   readonly github: Pick<GitHubKernel, "readOnlyGitHub">;
   readonly projects: ProjectRegistry;
+  /** `review_evidence_attach` measures what a review sends beside the bundle before it binds one (#1421). */
+  readonly review: Pick<BlindReviewGate, "privateEvidencePromptProbe">;
   readonly repair: RepairService;
   readonly repositories: RepositoryRegistry;
   readonly runs: RunEngine;
@@ -226,8 +229,9 @@ export const createHermesMcpPort = (
     attachBootstrapReviewEvidence: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: ReviewEvidenceInput) =>
       attachBootstrapReviewEvidence(source, peer, turn, input),
     reviewEvidenceAttachAccess: (input: ReviewEvidenceInput) => reviewEvidenceAttachAccess(source, input),
-    attachStandardReviewEvidence: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: StandardReviewEvidenceAttachInput) =>
-      attachStandardReviewEvidence(source, peer, turn, input),
+    // #1421 — the bundle is held against the review's own sizing of the run's prompt (`privateEvidencePromptProbe`), measured before the transaction.
+    attachStandardReviewEvidence: async (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: StandardReviewEvidenceAttachInput) =>
+      attachStandardReviewEvidence(source, peer, turn, input, await source.review.privateEvidencePromptProbe(input.runId)),
     standardReviewEvidenceAttachAccess: (input: StandardReviewEvidenceAttachInput) => standardReviewEvidenceAttachAccess(source, input),
     reviewEvidenceAttachAuthority: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined) =>
       reviewEvidenceAttachAuthority(source, peer, turn),
@@ -724,9 +728,9 @@ const createHermesServerFromPort = (
     "review_evidence_attach",
     { description: "Bind a STANDARD_WORK or CONTRACT_CHANGE run owner's staged private review evidence bundle as this run's review input, by exact run/contract/stager/digest, after checking its sources. Current authenticated CEO owner or peer turn only. It is not owner approval, not a contract change and not a PASS: the bundle is attributed data for the reviewer. The next result_submit freezes it; refused while a submission is in flight. A replacement names replacesSha256 and leaves any earlier review or approval stale for CONFIRM; nothing is deleted.",
       inputSchema: { ...mutation, runId: z.string(), contractDigest: z.string(), stagedBy: z.string(), expectedSha256: z.string(), replacesSha256: z.string().optional() } },
-    async (args, extra) => write("review_evidence_attach", args, extra, () => {
+    async (args, extra) => write("review_evidence_attach", args, extra, async () => {
       const peer = authenticateMcpPeer(authenticate);
-      return peer.allowed ? respond(port.attachStandardReviewEvidence(peer.value, admittedTurnOf(extra), args)) : respond(peer);
+      return peer.allowed ? respond(await port.attachStandardReviewEvidence(peer.value, admittedTurnOf(extra), args)) : respond(peer);
     }),
   );
   server.registerTool(

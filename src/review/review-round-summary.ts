@@ -152,7 +152,7 @@ export interface ReviewRoundDelivery {
  * asks for no revision and carries no return. `notice` is its fixed notice code, or null for any other value.
  */
 export interface ReviewRoundNotice extends ReviewRoundDelivery {
-  notice: "METHOD_FINDINGS_ONLY" | "REVIEW_UNAVAILABLE" | null;
+  notice: "METHOD_FINDINGS_ONLY" | "REVIEW_UNAVAILABLE" | "REVIEW_PROMPT_BUDGET_EXCEEDED" | null;
 }
 
 export interface ReviewRound {
@@ -888,7 +888,7 @@ export const summarizeReviewRounds = (
       deliveries: (deliveriesOf.get(state.index) ?? []).map(toDelivery),
       notices: (noticesOf.get(state.index) ?? []).map((message) => {
         const notice = record(message.payload)?.["notice"];
-        return { ...toDelivery(message), notice: notice === "METHOD_FINDINGS_ONLY" || notice === "REVIEW_UNAVAILABLE" ? notice : null };
+        return { ...toDelivery(message), notice: notice === "METHOD_FINDINGS_ONLY" || notice === "REVIEW_UNAVAILABLE" || notice === "REVIEW_PROMPT_BUDGET_EXCEEDED" ? notice : null };
       }),
       readyForCeo: reached && outcome !== "REVIEW_UNAVAILABLE" && outcome !== "REVISION_RETURNED" && outcome !== "VERIFICATION_RETURNED",
       nextNewCandidate: null,

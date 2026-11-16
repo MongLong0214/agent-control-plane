@@ -242,8 +242,9 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     },
     stageBootstrapReviewEvidence: (peer: AuthenticatedMcpPeer, input: ReviewEvidenceStageInput) => stageBootstrapReviewEvidence(source, peer, input),
     // GAP 2 — a file input is read from the state root the daemon's database lives in, the root agentctl writes to.
-    stageStandardReviewEvidence: (owner: { sessionId: string; bindingGeneration: number; roleKey: string }, input: StandardReviewEvidenceStageInput) =>
-      stageStandardReviewEvidence(source, owner, input, dirname(source.config.databasePath)),
+    // #1421 — the bundle is held against the review's own sizing of the run's prompt (`privateEvidencePromptProbe`), measured before the transaction.
+    stageStandardReviewEvidence: async (owner: { sessionId: string; bindingGeneration: number; roleKey: string }, input: StandardReviewEvidenceStageInput) =>
+      stageStandardReviewEvidence(source, owner, input, dirname(source.config.databasePath), await source.review.privateEvidencePromptProbe(input.runId)),
     stageBootstrapPlan: (peer: AuthenticatedMcpPeer, input: BootstrapPlanStageInput) => stageBootstrapPlan(source, peer, input),
     bootstrapPlanForRun: (runId: string) => readBootstrapPlanAttachment(source, runId),
     resolvePlanInput: (runId: string, input: { bootstrapPlanDigest?: string; plan?: Record<string, unknown>; tasks?: z.infer<typeof submittedTasksSchema> }) =>
@@ -607,7 +608,7 @@ const createCtoServerFromPort = (
     {
       description:
         "The pending control-plane messages (dispatch, revision, resume review, escalation reply, drain, cancel, bootstrap handoff) addressed in band to this exact session at its active generation. Acknowledge a HANDOFF_PACKAGE with handoff_ack; other messages use role_dispatch_ack (or run_ack, for a row that names a run this session owns). " +
-        "A REVISION_REQUEST whose payload stage is review-unavailable is a notice, never a revision: its review did not judge the product, so change no PLAN, task or code for it, and take only its nextStep (RESUBMIT: one new result_submit once the attempt it names has answered, while unjudgedAttempts is below unjudgedAttemptLimit; ESCALATE: escalation_open for that run, no resubmit); then acknowledge it.",
+        "A REVISION_REQUEST whose payload stage is review-unavailable is a notice, never a revision: its review did not judge the product, so change no PLAN, task or code for it, and take only its nextStep (RESUBMIT: one new result_submit once the attempt it names has answered, while unjudgedAttempts is below unjudgedAttemptLimit; ESCALATE: escalation_open for that run, no resubmit; DETERMINISTIC: the review was refused before any reviewer ran and will be refused again, so no unchanged resubmit: ask for smaller review evidence as the notice says, or escalation_open); then acknowledge it.",
       inputSchema: {},
     },
     async () => read("role_dispatch_pending", (peer) => {
@@ -687,7 +688,7 @@ const createCtoServerFromPort = (
     "review_evidence_stage",
     { description: `Stage one immutable private review evidence bundle for a STANDARD_WORK or CONTRACT_CHANGE run you own (the same bundle format and ${BOOTSTRAP_REVIEW_EVIDENCE_MAX_BYTES / 1024} KiB UTF-8 limit as bootstrap_review_evidence_stage): only the minimal excerpts, their source identification and comparison ranges, digests and limits. Binds this run and its contract digest. Send the bundle as evidenceBody, or instead set evidenceFromFile: true to have ACP read <state root>/review-evidence/<runId>/<expectedSha256>, which \`agentctl review-evidence prepare <runId> <bundle-file>\` writes and answers expectedSha256 for; exactly one of the two, and no path is ever an argument. It is attributed data for the reviewer, never a contract change or an approval; the canonical CEO must select it with review_evidence_attach, and the next result_submit freezes it into the candidate's review.`,
       inputSchema: { ...mutation, ...runIdentity, contractDigest: z.string(), evidenceBody: z.string().optional(), evidenceFromFile: z.boolean().optional(), expectedSha256: z.string() } },
-    async args => writeOwned("review_evidence_stage", args, (_peer, current) => respond(port.stageStandardReviewEvidence(current, args))),
+    async args => writeOwned("review_evidence_stage", args, async (_peer, current) => respond(await port.stageStandardReviewEvidence(current, args))),
   );
   server.registerTool(
     "bootstrap_plan_stage",
