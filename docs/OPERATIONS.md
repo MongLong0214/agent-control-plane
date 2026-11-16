@@ -37,6 +37,19 @@ reporting `mode: "BOOTSTRAP"` is parked and serving only the capacity door; see
 [provider capacity source](capacity-source.md). `~/.agent-control-plane/health.json` carries
 the same `mode` without needing the token.
 
+### Reading why a run's review repeated
+
+`agentctl run show <runId>` (operator token, same socket) ends with `reviewRounds`, a read-only
+projection of records the run already left: per candidate freeze, whether the candidate's source
+changed (`SOURCE_CHANGE`), only its identity did (`CANDIDATE_IDENTITY_CHANGE`), the same judged
+candidate was submitted again (`SAME_CANDIDATE_RESUBMISSION`), or nothing had judged it and it was
+retried (`INFRASTRUCTURE_RETRY`). It writes nothing and no gate, reviewer packet or CEO decision reads
+it. `totals.reviewerInvocations` is only the calls the records confirm and attribute to a round: a
+review whose call count is unrecorded adds 0, so read it with `reviewsWithUnrecordedInvocations`,
+`reviewUnavailable`, `noOutcomeRecorded`, `unattributedEvents` and `unattributedDeliveries`. It is not
+a count of provider calls or tokens, and not a cost. If the projection cannot be read it says
+`unavailable` and the rest of the run is still shown.
+
 ### Reading the doctor's findings
 
 `agentctl doctor` asks the running daemon over the operator socket, and against a *live* daemon

@@ -210,7 +210,16 @@ export interface ReviewRoundSummary {
   totals: {
     rounds: number;
     reviews: number;
+    /**
+     * The sum of reviewer calls the records confirm and attribute to a round (#1422). A review whose
+     * call count is not recorded adds nothing, so 0 is never "no calls were made": read it with
+     * `reviewsWithUnrecordedInvocations`, `reviewUnavailable`, `noOutcomeRecorded` and
+     * `unattributedEvents`, which count what this sum lacks. It is not a count of all provider calls.
+     */
     reviewerInvocations: number;
+    reviewerInvocationsBasis: "RECORDED_AND_ATTRIBUTED_ONLY";
+    /** Reviews whose number of reviewer calls the records do not give (a chunked review without its chunk list). */
+    reviewsWithUnrecordedInvocations: number;
     revisionReturns: number;
     verificationReturns: number;
     reviewUnavailable: number;
@@ -221,6 +230,10 @@ export interface ReviewRoundSummary {
     roundsWithIntervention: number;
     duplicateEventsIgnored: number;
     unattributedEvents: number;
+    /** Revision deliveries and notices no round's own attempt claims. */
+    unattributedDeliveries: number;
+    /** Rounds with a freeze and no recorded return, unavailable review or pass. */
+    noOutcomeRecorded: number;
   };
 }
 
@@ -925,6 +938,8 @@ export const summarizeReviewRounds = (
       rounds: rounds.length,
       reviews: count((round) => round.review !== null),
       reviewerInvocations: rounds.reduce((sum, round) => sum + (round.review?.reviewerInvocations ?? 0), 0),
+      reviewerInvocationsBasis: "RECORDED_AND_ATTRIBUTED_ONLY",
+      reviewsWithUnrecordedInvocations: count((round) => round.review !== null && round.review.reviewerInvocations === null),
       revisionReturns: count((round) => round.outcome === "REVISION_RETURNED"),
       verificationReturns: count((round) => round.outcome === "VERIFICATION_RETURNED"),
       reviewUnavailable: count((round) => round.outcome === "REVIEW_UNAVAILABLE"),
@@ -935,6 +950,8 @@ export const summarizeReviewRounds = (
       roundsWithIntervention: count((round) => round.interventions.length > 0),
       duplicateEventsIgnored: rounds.reduce((sum, round) => sum + round.duplicateEventsIgnored, 0),
       unattributedEvents: unattributed.length,
+      unattributedDeliveries: unattributedDeliveries.length,
+      noOutcomeRecorded: count((round) => round.outcome === "NO_OUTCOME_RECORDED"),
     },
   };
 };
