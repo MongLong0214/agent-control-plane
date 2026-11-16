@@ -1082,8 +1082,8 @@ const recordIdsOf = (message: string): string[] => [...message.matchAll(/^record
  * the ones stored on the execution), each with the CommitLore evidence it carries, or undefined.
  */
 const workerReceiptsByCommit = (db: Db, runId: string, repositoryIdentity: string): Map<string, unknown[]> => {
-  const rows = db.all<{ evidence: string }>(
-    `SELECT a.evidence_json AS evidence
+  const rows = db.all<{ evidence: string; managed: number }>(
+    `SELECT a.evidence_json AS evidence, te.runtime_managed AS managed
        FROM task_executions te
        JOIN repositories r ON r.repository_id = te.repository_id
        JOIN audit_events a
@@ -1099,7 +1099,11 @@ const workerReceiptsByCommit = (db: Db, runId: string, repositoryIdentity: strin
   for (const row of rows) {
     const evidence = JSON.parse(row.evidence) as { commitHead?: unknown; commitlore?: unknown };
     if (typeof evidence.commitHead !== "string" || evidence.commitHead.length === 0) continue;
-    byCommit.set(evidence.commitHead, [...(byCommit.get(evidence.commitHead) ?? []), evidence.commitlore]);
+    // #1268 — a turn the control plane launched and finished before every run was governed by CommitLore wrote its receipt
+    // without the field, and committed no record: it stands as an empty consideration. A receipt that has the field is
+    // read as it says, and a turn made now always writes it; one with no field and no runtime launch is no worker's.
+    const legacy = row.managed === 1 && !Object.hasOwn(evidence, "commitlore");
+    byCommit.set(evidence.commitHead, [...(byCommit.get(evidence.commitHead) ?? []), legacy ? { outcome: "empty", recordIds: [], nonce: null } : evidence.commitlore]);
   }
   return byCommit;
 };

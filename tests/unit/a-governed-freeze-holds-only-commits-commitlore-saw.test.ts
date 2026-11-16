@@ -191,7 +191,7 @@ const workerCommit = (
   files: Record<string, string>,
   message: string,
   commitlore: Lore | null,
-  options: { onCurrentHead?: boolean; run?: World["run"]; taskId?: string; startsFrom?: StartsFrom } = {},
+  options: { onCurrentHead?: boolean; run?: World["run"]; taskId?: string; startsFrom?: StartsFrom; runtimeManaged?: boolean } = {},
 ): { taskId: string; commit: string; executionId: string } => {
   const { harness } = world;
   const run = options.run ?? world.run;
@@ -224,6 +224,7 @@ const workerCommit = (
     provider: "scripted",
     model: "scripted-worker",
     repositoryId: world.repositoryId,
+    ...(options.runtimeManaged === true ? { runtimeManaged: true } : {}),
   });
   if (!opened.allowed) throw new Error(opened.message);
   writeFiles(world.repo, files);
@@ -387,6 +388,23 @@ describe("#1268: a governed freeze holds only commits CommitLore accounts for", 
     const stacked = workerCommit(world, "notes", { "notes.md": "other run\n" }, "other run's turn", EMPTY, { onCurrentHead: true, run: other });
     expect(gitSync(world.repo, ["rev-parse", "HEAD"])).toBe(stacked.commit);
     await expectRefusedUnchanged(world, { reasonCode: ReasonCode.CANDIDATE_FOREIGN_COMMIT, commit: stacked.commit, refusal: "NOT_A_RUN_WORKER_COMMIT" });
+  });
+
+  it("GREEN — a turn the control plane launched and finished before every run was governed, whose receipt carries no CommitLore evidence, is still frozen", async () => {
+    const world = await worldOf("required");
+    const legacy = workerCommit(world, "readme", { "README.md": "# one\n" }, "update readme", null, { runtimeManaged: true });
+    const value = await freezeAllowed(world);
+    expect(value.repositories[0]!.candidateHead).toBe(legacy.commit);
+  });
+
+  it("refused — that compatibility is for a runtime-launched turn's receipt that never had the field: a record the commit carries, or an outcome CommitLore does not give, is still refused", async () => {
+    const carrying = await worldOf("required");
+    const withRecord = workerCommit(carrying, "readme", { "README.md": "# one\n" }, "update readme\n\nWarn: x\nRecord-Id: r-feedfacecafe", null, { runtimeManaged: true });
+    await expectRefusedUnchanged(carrying, { reasonCode: ReasonCode.CANDIDATE_FOREIGN_COMMIT, commit: withRecord.commit, refusal: "RECORD_IDS_MISMATCH" });
+
+    const odd = await worldOf("required", "cl-freeze-legacy-odd");
+    const unknown = workerCommit(odd, "readme", { "README.md": "# one\n" }, "update readme", { outcome: "skipped", recordIds: [], nonce: null }, { runtimeManaged: true });
+    await expectRefusedUnchanged(odd, { reasonCode: ReasonCode.CANDIDATE_FOREIGN_COMMIT, commit: unknown.commit, refusal: "COMMITLORE_OUTCOME_UNKNOWN" });
   });
 
   it("refused — a worker receipt with no CommitLore evidence, or with an outcome CommitLore does not give", async () => {
