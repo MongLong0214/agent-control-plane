@@ -216,6 +216,10 @@ describe("a registration wake with no confirmed work is skipped (#1103, FIX-ROLE
     const f = await start();
     try {
       expect((await f.listeners.ctoConversation.registerEndpoint(f.server, f.endpointPath)).allowed).toBe(true);
+      // A wake that names its cause is for pending work (#1427): this one has some.
+      expect(f.enqueue(MessageKind.OWNER_MESSAGE, "owner-message:for-trigger", {
+        sourceChannel: "buzz", sourceNonce: "for-trigger", sourcePayloadDigest: "x",
+      }).allowed).toBe(true);
       const woke = await wakeRoleHolder(f.h.cp, f.listeners.ctoConversation, f.roleKey, { kind: "in-band dispatch", ids: [] });
       expect(woke.allowed).toBe(true);
       await settled(f.endpoint.frames, 1);

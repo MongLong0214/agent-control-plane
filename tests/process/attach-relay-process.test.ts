@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:net";
@@ -13,6 +13,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startDaemonMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { spawnUnderClaude } from "../helpers/claude-parent.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
 
@@ -154,32 +155,34 @@ describe("the attach relay as the process Claude Code spawns", () => {
       claimServer!.listen(claimPath, resolve);
     });
 
+    const claimedSession = randomUUID();
     const selectors = [
       "--claimed-session-id",
-      randomUUID(),
+      claimedSession,
       "--project-id",
       manifest.projectId,
       "--expected-binding-generation",
       "1",
     ];
     const sessionEnv = await wakeableSession(stateDir);
-    const child = spawn(
-      process.execPath,
-      [TSX_ENTRY, CLI_ENTRY, "attach", "canonical-cto", ...selectors],
-      {
-        cwd: process.cwd(),
-        env: {
-          HOME: stateDir,
-          PATH: process.env["PATH"] ?? "",
-          // The documented test-only override. Production sets no environment on this child.
-          ACP_MCP_TOKEN: TOKEN_CANARY,
-          ACP_CLAIM_CANONICAL_CTO_SOCKET: claimPath,
-          ACP_CTO_MCP_SOCKET: mcpPath,
-          ...sessionEnv,
-        },
-        stdio: ["pipe", "pipe", "pipe"],
+    // Under a stand-in Claude Code, whose registry record is what proves the session's socket (`tests/helpers/claude-parent.ts`).
+    const { child } = spawnUnderClaude({
+      dir: join(stateDir, "claude-parent"),
+      home: stateDir,
+      sessionId: claimedSession,
+      socketPath: sessionEnv["CLAUDE_CODE_MESSAGING_SOCKET"]!,
+      argv: [process.execPath, TSX_ENTRY, CLI_ENTRY, "attach", "canonical-cto", ...selectors],
+      cwd: process.cwd(),
+      env: {
+        HOME: stateDir,
+        PATH: process.env["PATH"] ?? "",
+        // The documented test-only override. Production sets no environment on this child.
+        ACP_MCP_TOKEN: TOKEN_CANARY,
+        ACP_CLAIM_CANONICAL_CTO_SOCKET: claimPath,
+        ACP_CTO_MCP_SOCKET: mcpPath,
+        ...sessionEnv,
       },
-    );
+    });
     children.push(child);
 
     let stderrText = "";
@@ -318,33 +321,26 @@ describe("the attach relay as the process Claude Code spawns", () => {
     });
 
     const sessionEnv = await wakeableSession(stateDir);
-    const child = spawn(
-      process.execPath,
-      [
-        TSX_ENTRY,
-        CLI_ENTRY,
-        "attach",
-        "canonical-cto",
-        "--claimed-session-id",
-        randomUUID(),
-        "--project-id",
-        "flush-project",
-        "--expected-binding-generation",
-        "1",
+    const flushSession = randomUUID();
+    const { child } = spawnUnderClaude({
+      dir: join(stateDir, "claude-parent"),
+      home: stateDir,
+      sessionId: flushSession,
+      socketPath: sessionEnv["CLAUDE_CODE_MESSAGING_SOCKET"]!,
+      argv: [
+        process.execPath, TSX_ENTRY, CLI_ENTRY, "attach", "canonical-cto",
+        "--claimed-session-id", flushSession, "--project-id", "flush-project", "--expected-binding-generation", "1",
       ],
-      {
-        cwd: process.cwd(),
-        env: {
-          HOME: stateDir,
-          PATH: process.env["PATH"] ?? "",
-          ACP_MCP_TOKEN: TOKEN_CANARY,
-          ACP_CLAIM_CANONICAL_CTO_SOCKET: claimPath,
-          ACP_CTO_MCP_SOCKET: mcpPath,
-          ...sessionEnv,
-        },
-        stdio: ["pipe", "pipe", "pipe"],
+      cwd: process.cwd(),
+      env: {
+        HOME: stateDir,
+        PATH: process.env["PATH"] ?? "",
+        ACP_MCP_TOKEN: TOKEN_CANARY,
+        ACP_CLAIM_CANONICAL_CTO_SOCKET: claimPath,
+        ACP_CTO_MCP_SOCKET: mcpPath,
+        ...sessionEnv,
       },
-    );
+    });
     children.push(child);
 
     let stderrText = "";

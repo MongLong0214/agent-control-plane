@@ -2519,9 +2519,45 @@ export class Outbox {
    * counts, because the claim still shows it to the holder.
    */
   hasWorkForHolder(holder: HolderIdentity): boolean {
-    if (this.pendingInBandFor(holder.targetSessionId, holder.sessionIncarnation).length > 0) return true;
-    if (this.hasHolderMessagesFor(holder)) return true;
-    return this.peerMessageRefusalNoticesFor(holder).length > 0;
+    return this.pendingWorkSignatureFor(holder) !== "";
+  }
+
+  /**
+   * The roles this exact session and incarnation holds mail for that it reads with
+   * `role_owner_message_claim`: owner and peer (Buzz) messages, which are claimed by the holder and
+   * so are never in `pendingInBandFor`. Read-only; a row the holder's claim would withhold counts,
+   * because the claim is what shows it (as withheld) to the holder.
+   */
+  pendingHolderMessageRolesFor(sessionId: string, sessionIncarnation: string): string[] {
+    return this.db.all<{ role_key: string }>(
+      `SELECT DISTINCT o.role_key FROM outbox o
+        WHERE o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
+          AND o.status IN ('PENDING','SENT')
+          AND o.target_session_id = ?
+          AND ${exactHolderTarget("o")}
+        ORDER BY o.role_key`,
+      [sessionId, sessionIncarnation],
+    ).map((row) => row.role_key);
+  }
+
+  /**
+   * The ids of everything pending for this exact holder (in-band rows, owner and peer mail, owed
+   * refusal notices), sorted and joined, or "" when nothing is. A wake is for work, so the daemon
+   * sends one only when this is not empty and not the same as the work its last wake announced.
+   */
+  pendingWorkSignatureFor(holder: HolderIdentity): string {
+    const ids = new Set<string>();
+    for (const row of this.pendingInBandFor(holder.targetSessionId, holder.sessionIncarnation)) ids.add(row.messageId);
+    for (const row of this.db.all<{ message_id: string }>(
+      `SELECT o.message_id FROM outbox o
+        WHERE o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
+          AND o.status IN ('PENDING','SENT')
+          AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
+          AND ${exactHolderTarget("o")}`,
+      [holder.roleKey, holder.bindingGeneration, holder.targetSessionId, holder.sessionIncarnation],
+    )) ids.add(row.message_id);
+    for (const notice of this.peerMessageRefusalNoticesFor(holder)) ids.add(`notice:${notice.message_id}`);
+    return [...ids].sort().join(",");
   }
 
   /** Whether this exact authenticated holder has owner/peer mail to drain. */

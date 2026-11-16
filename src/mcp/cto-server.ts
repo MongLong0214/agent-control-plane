@@ -200,6 +200,9 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     // Read-only: the caller's own in-band rows, fenced by the incarnation its connection presented.
     pendingInBandDispatch: (sessionId: string, sessionIncarnation: string) =>
       source.outbox.pendingInBandFor(sessionId, sessionIncarnation),
+    // Read-only: the roles this session holds Buzz (owner and peer) mail for, which it claims rather than lists.
+    pendingHolderMessageRoles: (sessionId: string, sessionIncarnation: string) =>
+      source.outbox.pendingHolderMessageRolesFor(sessionId, sessionIncarnation),
     // The same authority `run_ack` reaches for an in-band row, without a run.
     acknowledgeInBand: (messageId: string, sessionId: string, sessionIncarnation: string) =>
       source.outbox.acknowledgeInBand(messageId, sessionId, sessionIncarnation),
@@ -607,7 +610,7 @@ const createCtoServerFromPort = (
     "role_dispatch_pending",
     {
       description:
-        "The pending control-plane messages (dispatch, revision, resume review, escalation reply, drain, cancel, bootstrap handoff) addressed in band to this exact session at its active generation. Acknowledge a HANDOFF_PACKAGE with handoff_ack; other messages use role_dispatch_ack (or run_ack, for a row that names a run this session owns). " +
+        "The pending control-plane messages (dispatch, revision, resume review, escalation reply, drain, cancel, bootstrap handoff) addressed in band to this exact session at its active generation. Buzz messages (owner and peer) are not listed here: when one is waiting, `buzzMessages` names the roleKeys, and each is read with role_owner_message_claim (roleKey) and acknowledged with role_owner_message_complete (roleKey, messageId), which also stops it being delivered again. Acknowledge a HANDOFF_PACKAGE with handoff_ack; other messages use role_dispatch_ack (or run_ack, for a row that names a run this session owns). " +
         "A REVISION_REQUEST whose payload stage is review-unavailable is a notice, never a revision: its review did not judge the product, so change no PLAN, task or code for it, and take only its nextStep (RESUBMIT: one new result_submit once the attempt it names has answered, while unjudgedAttempts is below unjudgedAttemptLimit; ESCALATE: escalation_open for that run, no resubmit; DETERMINISTIC: the review was refused before any reviewer ran and will be refused again, so no unchanged resubmit: ask for smaller review evidence as the notice says, or escalation_open); then acknowledge it.",
       inputSchema: {},
     },
@@ -624,7 +627,20 @@ const createCtoServerFromPort = (
           sessionId: peer.sessionId,
         }));
       }
-      return ok({ messages: port.pendingInBandDispatch(peer.sessionId, peer.sessionIncarnation) });
+      const roleKeys = port.pendingHolderMessageRoles(peer.sessionId, peer.sessionIncarnation);
+      // Buzz owner and peer messages are claimed by their holder, not listed here, so a wake for one
+      // finds this list empty. Named only when there is mail, so the answer keeps its shape otherwise.
+      return ok({
+        messages: port.pendingInBandDispatch(peer.sessionId, peer.sessionIncarnation),
+        ...(roleKeys.length === 0 ? {} : {
+          buzzMessages: {
+            roleKeys,
+            read: "role_owner_message_claim",
+            acknowledge: "role_owner_message_complete",
+            reject: "role_owner_message_reject",
+          },
+        }),
+      });
     }),
   );
   server.registerTool(
