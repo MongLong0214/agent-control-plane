@@ -17,6 +17,7 @@ import {
   type ManagedInvocationWriteBroker,
 } from "../../src/runtime/provider.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
+import { settlingCommitLore } from "../helpers/commitlore-attempt.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { registerFixtureProject } from "../helpers/harness.ts";
 import { FakeWorkerAdapter, type FakeTurnScript } from "../helpers/worker-turn-fixture.ts";
@@ -627,7 +628,7 @@ describe("S2 — while any writer of the previous execution may still exist, the
       // The daemon before the restart: its turn launched a process whose spawn report never arrived.
       const previous = new WorkerTurnRunner(
         { db: cp.db, clock: cp.clock, audit: cp.audit, tasks: cp.tasks, guard: cp.guard, workerAdapter: () => adapter },
-        { pollMs: 10, processSettleMs: 50 },
+        { pollMs: 10, processSettleMs: 50, commitlore: settlingCommitLore() },
       );
       try {
         const first = await staffAndClaim(f, s, one);
@@ -799,7 +800,7 @@ describe("S2 — while any writer of the previous execution may still exist, the
         const restarted = new WorkerTurnRunner({
           db: cp.db, clock: cp.clock, audit: cp.audit, tasks: cp.tasks, guard: cp.guard,
           workerAdapter: (provider: string) => cp.providers.requireForRole(provider, Role.WORKER),
-        });
+        }, { commitlore: settlingCommitLore() });
         Object.defineProperty(cp, "workerTurns", { value: restarted, configurable: true });
         expect(await restarted.reconcileAfterRestart()).toEqual([]);
 
@@ -862,7 +863,7 @@ describe("S2 — while any writer of the previous execution may still exist, the
         const restarted = new WorkerTurnRunner({
           db: cp.db, clock: cp.clock, audit: cp.audit, tasks: cp.tasks, guard: cp.guard,
           workerAdapter: (provider: string) => cp.providers.requireForRole(provider, Role.WORKER),
-        });
+        }, { commitlore: settlingCommitLore() });
         Object.defineProperty(cp, "workerTurns", { value: restarted, configurable: true });
         expect(await restarted.reconcileAfterRestart()).toEqual([{ executionId, outcome: "UNIDENTIFIED" }]);
 
