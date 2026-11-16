@@ -23,6 +23,7 @@ import {
   outputEvidence,
   readConfigFile,
   readExecutionEvidence,
+  receiptRow,
 } from "../../src/review/candidate-review-evidence.ts";
 import { runtimeEnvironment } from "../../src/runtime/cli-adapters.ts";
 import { bootstrapActivationHandoff } from "../../src/bootstrap/bootstrap-plan.ts";
@@ -252,8 +253,52 @@ describe("an ordinary candidate review carries the official execution evidence",
       expect(byExecution.get(wrongBytes.executionId)!.mismatches).toEqual(["the receipt's diffDigest is not the frozen change's"]);
       expect(byExecution.get(wrongBase.executionId)!.mismatches).toEqual([`the receipt's base head is not the snapshot's baseHead ${baseHead}`]);
       expect(byExecution.get(unreproduced.executionId)!.mismatches).toEqual(["no success record of this execution reproduces its resultDigest"]);
+      // #1410: each receipt also carries its worker session and the comparisons linkage made, as booleans.
+      for (const receipt of evidence.receipts) expect(receipt.workerSessionId).toMatch(/\S/);
+      expect(byExecution.get(inHistory.executionId)!.checks).toMatchObject({ commitIsCandidateHead: false, diffDigestAgrees: null });
+      expect(byExecution.get(wrongBytes.executionId)!.checks).toMatchObject({ commitIsCandidateHead: true, baseIsSnapshotBase: true, diffDigestAgrees: false });
+      expect(byExecution.get(wrongBase.executionId)!.checks).toMatchObject({ baseIsSnapshotBase: false });
+      expect(byExecution.get(unreproduced.executionId)!.checks).toMatchObject({ resultReproduced: false });
     } finally { harness.cp.close(); }
   }, 60_000);
+
+  it("a receipt past the ancestry-read bound is listed with its place unchecked, never dropped (#1410 review P1)", async () => {
+    const setup = await prepareRun();
+    const { harness, run, baseHead } = setup;
+    try {
+      startWorkBranch(harness.repoPath);
+      writeFiles(harness.repoPath, { "src/app.js": "module.exports = () => 4;\n" });
+      const earlier = commitAll(harness.repoPath, "first attempt");
+      writeFiles(harness.repoPath, { "src/app.js": APP_BYTES });
+      const head = commitAll(harness.repoPath, "make app() return 2");
+      // 51 successful receipts for an ancestor of the candidate, one more than the 50 ancestry reads a review makes.
+      const ancestors = Array.from({ length: 51 }, (_, i) => {
+        const opened = openExecution(setup, `ancestor-${i}`);
+        finishWithReceipt(setup, opened, { base: baseHead, commitHead: earlier, changed: [["src/app.js", "module.exports = () => 4;\n"]] });
+        return opened;
+      });
+      const own = openExecution(setup, "candidate-head");
+      finishWithReceipt(setup, own, { base: baseHead, commitHead: head, changed: [["src/app.js", APP_BYTES]] });
+
+      const frozen = await harness.cp.pipeline.freeze(run.runId);
+      if (!frozen.allowed) throw new Error(frozen.message);
+      const evidence = await readExecutionEvidence(harness.cp.db, { runId: run.runId, snapshot: frozen.value,
+        snapshotDigest: candidateSnapshotDigest(frozen.value), contractDigest: run.contractDigest,
+        verification: { results: [] } as unknown as VerificationReport, checkoutOf: () => harness.repoPath });
+
+      const ids = new Set(evidence.receipts.map((receipt) => receipt.executionId));
+      expect(evidence.receipts).toHaveLength(52);
+      for (const opened of [...ancestors, own]) expect(ids.has(opened.executionId), opened.executionId).toBe(true);
+      expect(evidence.receiptsNotListed.unchecked).toBe(0);
+      const unchecked = evidence.receipts.filter((receipt) => receipt.checks?.ancestryChecked === false);
+      expect(unchecked).toHaveLength(1);
+      expect(unchecked[0]!.linked).toBe(false);
+      expect(unchecked[0]!.mismatches[0]).toContain("was not checked");
+      expect(evidence.receipts.filter((receipt) => receipt.checks?.ancestryChecked === true)).toHaveLength(51);
+      // The reviewer's row says so too.
+      expect(receiptRow(unchecked[0]!)).toMatchObject({ linked: false, checks: { ancestryChecked: false, commitIsCandidateHead: false } });
+    } finally { harness.cp.close(); }
+  }, 120_000);
 
   it("a SUCCEEDED task's own receipt for a commit outside the candidate never reaches review: the freeze refuses the candidate (#1236)", async () => {
     const setup = await prepareRun();
