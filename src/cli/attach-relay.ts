@@ -630,6 +630,9 @@ const classifyFirstLine = (line: string): HandshakeReply => {
     : { kind: "malformed" };
 };
 
+/** How long the Keychain lookup may take at most (#859), inside the admission window when that is shorter. */
+const KEYCHAIN_TIMEOUT_MS = 10_000;
+
 /**
  * The deployment token, read from the same Keychain item the launchd launcher reads
  * (`deploy/install-launchd.sh`), with `execFileSync` and no shell.
@@ -652,7 +655,7 @@ const classifyFirstLine = (line: string): HandshakeReply => {
  * counts every `&&`/`||` operand in this file and asks for a witness or a stated reason for each,
  * and a nullish default carries neither an unwatched decision nor a debt.
  */
-const resolveMcpToken = (): string | null => {
+const resolveMcpToken = (timeoutMs: number = KEYCHAIN_TIMEOUT_MS): string | null => {
   const fromEnv = process.env["ACP_MCP_TOKEN"] ?? "";
   if (fromEnv.length > 0) return fromEnv;
   const service = process.env["ACP_KEYCHAIN_SERVICE"] ?? "com.agentcontrolplane.agentcpd";
@@ -666,7 +669,8 @@ const resolveMcpToken = (): string | null => {
       // Bounded: `security` can wait on a keychain the user has not unlocked, and this runs inside
       // an MCP server's startup where a wait is indistinguishable from a hang (#859). The catch
       // below already reads a failure as "no token", which is the fail-closed direction.
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 },
+      // The relay passes what is left of its admission window when that is less (`runAttachRelayCommand`).
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: timeoutMs },
     ).replace(/\n+$/, "");
     return found.length > 0 ? found : null;
   } catch {
@@ -1004,7 +1008,14 @@ export const runAttachRelayCommand = async (
     io,
   );
   if (reattached !== CLAIM) return reattached;
-  const mcpToken = resolveMcpToken();
+  // The Keychain lookup spends from the same window: a door that took all of it leaves none for a Keychain slow to
+  // unlock, and 25 s of a silent door plus a 6 s Keychain exited at 31.4 s, past Claude Code's 30 s. Nothing has
+  // refused this attach yet, so the step that ran out of time is the one named.
+  if (Date.now() >= admissionDeadline) {
+    io.stderr.write("attach: reattach socket unavailable\n");
+    return ATTACH_EXIT.UNAVAILABLE;
+  }
+  const mcpToken = resolveMcpToken(boundedBy(admissionDeadline, KEYCHAIN_TIMEOUT_MS));
   if (mcpToken === null) {
     io.stderr.write("attach: mcp token unavailable\n");
     return ATTACH_EXIT.UNAVAILABLE;

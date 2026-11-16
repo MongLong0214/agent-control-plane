@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -449,11 +449,67 @@ describe("the canonical CTO attach relay", () => {
       expect(await settles(exit, WINDOW_MARGIN_MS)).toBe(ATTACH_EXIT.UNAVAILABLE);
       expect(door.connections()).toBe(1);
       expect(asked).toHaveLength(0);
-      expect(err).toBe("attach: claim socket unavailable\n");
+      // The door is the step that ran out of time; nothing after it is attempted.
+      expect(err).toBe("attach: reattach socket unavailable\n");
     } finally {
       vi.unstubAllEnvs();
     }
   });
+
+  /**
+   * The Keychain lookup is a step before a receipt too. A `security` on PATH that answers after 6 s stands in for a
+   * Keychain that is slow to unlock; no ACP_MCP_TOKEN, so the relay must ask it. `runCommand` runs the command entry
+   * with the default 25 s window unless one is given, and resolves to its exit code and how long it took.
+   */
+  const slowKeychain = (seconds: number): string => {
+    const dir = join(stateDir, "kc");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "security"), `#!/bin/sh\nsleep ${seconds}\necho keychain-token\n`, { mode: 0o755 });
+    return dir;
+  };
+  const runCommand = async (options: { reattachSocketPath?: string; claimRetry?: AttachRelayOptions["claimRetry"] }) => {
+    const stdin = new PassThrough();
+    const stderr = new PassThrough();
+    let err = "";
+    stderr.on("data", (chunk: Buffer) => { err += chunk.toString("utf8"); });
+    const started = Date.now();
+    const exit = runAttachRelayCommand({ claimSocketPath: claimPath, mcpSocketPath: mcpPath, claim, ...options },
+      { stdin, stdout: new PassThrough(), stderr });
+    running.push(exit);
+    const code = await settles(exit, 40_000);
+    return { code, elapsedMs: Date.now() - started, err };
+  };
+
+  it("a silent reattach door that spends the whole window leaves no time for a slow Keychain: exit inside Claude Code's 30 s", async () => {
+    const asked = await scriptedClaims([receipt()]);
+    const door = await silentSocket("d.sock");
+    vi.stubEnv("ACP_MCP_TOKEN", "");
+    vi.stubEnv("PATH", `${slowKeychain(6)}:${process.env["PATH"] ?? ""}`);
+    try {
+      const run = await runCommand({ reattachSocketPath: door.path });
+      expect(run.code).toBe(ATTACH_EXIT.UNAVAILABLE);
+      expect(run.elapsedMs).toBeLessThan(30_000);
+      expect(asked).toHaveLength(0);
+      expect(run.err).toBe("attach: reattach socket unavailable\n");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 45_000);
+
+  it("a Keychain lookup is cut to what is left of the window", async () => {
+    const asked = await scriptedClaims([receipt()]);
+    vi.stubEnv("ACP_MCP_TOKEN", "");
+    vi.stubEnv("PATH", `${slowKeychain(6)}:${process.env["PATH"] ?? ""}`);
+    try {
+      const run = await runCommand({ claimRetry: { maxWaitMs: 1_000 } });
+      expect(run.code).toBe(ATTACH_EXIT.UNAVAILABLE);
+      expect(run.elapsedMs).toBeLessThan(3_000);
+      expect(asked).toHaveLength(0);
+      expect(run.err).toBe("attach: mcp token unavailable\n");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 20_000);
 
   it("with an auto generation, reads the next one before every attempt and claims it", async () => {
     // The relay read 2 (the binding it last held); the role had already moved to 3 when it claimed.
