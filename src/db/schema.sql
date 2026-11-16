@@ -799,6 +799,9 @@ CREATE TABLE IF NOT EXISTS run_repositories (
 --   Lifecycle: a task node persists across multiple execution attempts, so it is
 --   distinct from task_executions.
 -- ---------------------------------------------------------------------------
+-- v59 (#1413): plan_key is the PLAN's own key for the task, written at plan_submit, NULL for a task that predates it.
+-- It is spelled the way `ALTER TABLE tasks ADD COLUMN plan_key TEXT` leaves the stored text, so a database that
+-- migrated and one created fresh hold the same sqlite_schema row.
 CREATE TABLE IF NOT EXISTS tasks (
   task_id        TEXT PRIMARY KEY,
   run_id         TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
@@ -812,9 +815,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   attempt_count  INTEGER NOT NULL DEFAULT 0,
   created_at     TEXT NOT NULL,
   updated_at     TEXT NOT NULL
-);
+, plan_key TEXT);
 
 CREATE INDEX IF NOT EXISTS tasks_run ON tasks(run_id, state);
+CREATE INDEX IF NOT EXISTS tasks_run_plan_key ON tasks(run_id, plan_key) WHERE plan_key IS NOT NULL;
 
 -- CP-HI-02 — task admission closes when the run seals; late work cannot join a run being completed.
 -- §34.3 — task admission is closed as soon as a packet exists, while an owner is deciding

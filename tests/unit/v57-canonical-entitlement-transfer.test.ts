@@ -70,15 +70,15 @@ describe("v57 — a canonical entitlement transfer table beside the immutable en
     approveMigration(path, "v56 → v57 witness");
     new Db(path).close();
     const after = contentDigests(path, 56);
-    expect(after.userVersion).toBe(58);
+    expect(after.userVersion).toBe(59);
     const { schema_migrations: _receiptsBefore, ...rowsBefore } = before.tables;
     const { schema_migrations: _receiptsAfter, ...rowsAfter } = after.tables;
     expect(rowsAfter).toEqual(rowsBefore);
     expect(Object.keys(contentDigests(path).tables)).toContain("canonical_entitlement_transfers");
     const upgraded = schemaRowsOf(path);
-    // Additive: every v56 object is unchanged, and the new ones are exactly v57's. The chain runs on through v58, which
+    // Additive: every v56 object is unchanged, and the new ones are exactly v57's. The chain runs on through v58 and v59, which
     // adds its own objects and replaces one binding guard; those are v58's test's to account for.
-    const v58 = new Set(["canonical_cto_rotations", ...V58_ADDED_TRIGGERS, ...V58_CHANGED_GUARDS]);
+    const v58 = new Set(["canonical_cto_rotations", ...V58_ADDED_TRIGGERS, ...V58_CHANGED_GUARDS, "tasks", "tasks_run_plan_key"]);
     for (const row of v56Rows.filter((old) => !v58.has(old.name))) expect(upgraded).toContainEqual(row);
     const added = upgraded.filter((row) => !v58.has(row.name) && !v56Rows.some((old) => JSON.stringify(old) === JSON.stringify(row)));
     expect(added.map((row) => row.name).filter((name) => !name.startsWith("sqlite_autoindex")).sort()).toEqual([...V57_OBJECTS].sort());

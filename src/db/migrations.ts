@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 58;
+export const SCHEMA_VERSION = 59;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -27,6 +27,7 @@ const v54SchemaPath = fileURLToPath(new URL("./schema-v54.sql", import.meta.url)
 const v55SchemaPath = fileURLToPath(new URL("./schema-v55.sql", import.meta.url)); // released v55 reads only this
 const v56SchemaPath = fileURLToPath(new URL("./schema-v56.sql", import.meta.url)); // released v56 reads only this
 const v57SchemaPath = fileURLToPath(new URL("./schema-v57.sql", import.meta.url)); // released v57 reads only this
+const v58SchemaPath = fileURLToPath(new URL("./schema-v58.sql", import.meta.url)); // released v58 reads only this
 export const schemaSql = (): string => readFileSync(schemaPath, "utf8");
 const historicalSchemaSql = (): string => readFileSync(historicalSchemaPath, "utf8");
 const schemaSqlAt = (version: number): string =>
@@ -44,7 +45,8 @@ const schemaSqlAt = (version: number): string =>
                         : version <= 54 ? readFileSync(v54SchemaPath, "utf8")
                           : version <= 55 ? readFileSync(v55SchemaPath, "utf8")
                             : version <= 56 ? readFileSync(v56SchemaPath, "utf8")
-                              : version <= LATEST_FROZEN_VERSION ? readFileSync(v57SchemaPath, "utf8") : schemaSql();
+                              : version <= 57 ? readFileSync(v57SchemaPath, "utf8")
+                                : version <= LATEST_FROZEN_VERSION ? readFileSync(v58SchemaPath, "utf8") : schemaSql();
 
 /** Connection PRAGMAs are established by Db before any migration transaction begins. */
 export const schemaDdl = (): string =>
@@ -4454,6 +4456,28 @@ const v58: SchemaMigration = {
   checksum: () => migrationChecksum("v58-canonical-cto-rotation", 58),
 };
 
+/**
+ * v59 (#1413) adds tasks.plan_key, the PLAN's own key for a task, and its partial index. The column is nullable and
+ * nothing is backfilled: a task that predates it holds NULL and a PLAN reference to it stays unresolved. A column already
+ * present must be schema.sql's, and the index is read from schema.sql by name.
+ */
+const v59: SchemaMigration = {
+  id: "v59-task-plan-key",
+  fromVersion: 58,
+  toVersion: 59,
+  apply(raw) {
+    const column = (raw.pragma("table_xinfo(tasks)") as Array<{ name: string; type: string; notnull: number; dflt_value: string | null }>)
+      .find((present) => present.name === "plan_key");
+    if (column !== undefined) {
+      if (column.type.toUpperCase() !== "TEXT" || column.notnull !== 0 || column.dflt_value !== null) {
+        throw new Error("v59 pre-existing tasks.plan_key does not match the current schema");
+      }
+    } else raw.exec(`ALTER TABLE tasks ADD COLUMN plan_key TEXT`);
+    raw.exec(schemaObject(/CREATE INDEX IF NOT EXISTS tasks_run_plan_key[^;]*;/, "the tasks_run_plan_key index", 59));
+  },
+  checksum: () => migrationChecksum("v59-task-plan-key", 59),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -4502,6 +4526,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v56,
   v57,
   v58,
+  v59,
 ]);
 
 interface RequiredTrigger {
@@ -4885,6 +4910,7 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * v55 is frozen as v56's prerequisite in schema-v55.sql, byte-identical to schema.sql at 02d4b98a.
  * v56 is frozen as v57's prerequisite in schema-v56.sql, byte-identical to schema.sql at 60817e8f.
  * v57 is frozen as v58's prerequisite in schema-v57.sql, byte-identical to schema.sql at 4afa699e.
+ * v58 is frozen as v59's prerequisite in schema-v58.sql, byte-identical to schema.sql at fab8b168.
  * v51 is frozen as v52's prerequisite in schema-v51.sql, byte-identical to schema.sql at 3915f78c; v50 is
  * frozen as v51's prerequisite in schema-v50.sql.
  * v49 is frozen as v50's prerequisite in schema-v49.sql, byte-identical to a620b8d2.
@@ -4893,7 +4919,7 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * cannot leak back into what a database receives at its v48 step, and v48's checksum is the value the
  * pre-freeze build computed.
  */
-const LATEST_FROZEN_VERSION = 57;
+const LATEST_FROZEN_VERSION = 58;
 
 /**
  * The last version whose stored receipt is compared by value (`receiptMismatches`). It stays at 47 when
