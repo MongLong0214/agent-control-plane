@@ -44,6 +44,12 @@ export const REPOSITORY_CHECKOUT_MOVE_REFUSED = "REPOSITORY_CHECKOUT_MOVE_REFUSE
 /** The worker clone's own configuration naming the resident clone it was made from: how a move recognises its own. */
 const MADE_FROM = "acp.residentClone";
 
+/** CommitLore's notes ref, and how long, at most, one question to the remote about it may take. */
+const NOTES_REF = "refs/notes/commitlore";
+const ORIGIN_QUESTION_MS = 20_000;
+/** A remote that could not be asked is not asked again for this long, so a pass is not spent waiting on it. */
+const ORIGIN_RETRY_MS = 5 * 60_000;
+
 const lstatOrNull = (path: string): Stats | null => {
   try {
     return lstatSync(path);
@@ -85,6 +91,7 @@ const errorText = (error: unknown): string => (error instanceof Error ? error.me
  */
 export class WorkerCheckouts {
   readonly #lastRefusal = new Map<string, string>();
+  readonly #askedAt = new Map<string, number>();
 
   constructor(
     private readonly db: Db,
@@ -141,8 +148,11 @@ export class WorkerCheckouts {
       ? await git(worker, ["config", "--local", "--get", MADE_FROM], { allowFailure: true })
       : null;
     if (made?.exitCode !== 0 || made.stdout.trim() !== clone) return allow(ReasonCode.OK, worker);
-    // Nothing is authorised, and nothing written, on a pass that finds the worker clone already holding all of it.
-    if (!(await this.notesMissing(clone, worker))) return allow(ReasonCode.OK, worker);
+    // Nothing is authorised, and nothing written, on a pass that finds the worker clone already holding all of it and its
+    // remote's notes (or their absence) settled.
+    const missing = await this.notesMissing(clone, worker);
+    const unsettled = await this.originUnsettled(resident.repositoryId, worker);
+    if (!missing && !unsettled) return allow(ReasonCode.OK, worker);
     const authorised = await this.guard.authorize(
       {
         operation: WriteOperation.GIT_WORKTREE,
@@ -154,10 +164,54 @@ export class WorkerCheckouts {
         actor: "worker-checkout",
       },
       async () => {
-        await this.carryNotes(clone, worker);
+        if (missing) await this.carryNotes(clone, worker);
+        if (unsettled) await this.settleOriginNotes(resident.repositoryId, worker);
       },
     );
     return authorised.allowed ? allow(ReasonCode.OK, worker) : (authorised as Decision<never>);
+  }
+
+  /**
+   * #1268 — whether `worker` has an origin whose CommitLore notes it has neither mirrored nor recorded as absent, and which
+   * has not been asked about lately. CommitLore answers a lookup "unfetched", which `required` refuses, unless the clone
+   * has a local notes ref, or records (`commitlore.notesabsence.*`, written by `commitlore doctor --fix`) that the remote
+   * was asked and advertises none. A repository whose remote has no notes at all (a new project) has neither.
+   */
+  private async originUnsettled(repositoryId: string, worker: string): Promise<boolean> {
+    const asked = this.#askedAt.get(repositoryId);
+    if (asked !== undefined && Date.parse(this.clock.nowIso()) - asked < ORIGIN_RETRY_MS) return false;
+    const into = await withoutRepositoryPrograms(worker);
+    if ((await git(worker, [...into, "rev-parse", "--verify", "-q", NOTES_REF], { allowFailure: true })).exitCode === 0) return false;
+    const url = (await git(worker, [...into, "config", "--local", "--get", "remote.origin.url"], { allowFailure: true })).stdout.trim();
+    if (url === "") return false;
+    const key = `commitlore.notesabsence.r${Buffer.from("origin", "utf8").toString("hex")}`;
+    const recorded = (await git(worker, [...into, "config", "--local", "--get", key], { allowFailure: true })).stdout.trim();
+    return recorded !== url;
+  }
+
+  /**
+   * #1268 — asks origin, with the daemon's own git (CommitLore's child has no credential), whether it advertises CommitLore's
+   * notes, as `commitlore doctor --fix` does: notes it has are fetched as the mirror; none is recorded as CommitLore
+   * records it (the notes fetch refspec, and `commitlore.notesabsence.*` naming the url asked); an origin that does not
+   * answer records nothing, so a lookup that cannot be answered is still refused. Nothing is pushed to the remote.
+   */
+  private async settleOriginNotes(repositoryId: string, worker: string): Promise<void> {
+    this.#askedAt.set(repositoryId, Date.parse(this.clock.nowIso()));
+    const into = await withoutRepositoryPrograms(worker);
+    const url = (await git(worker, [...into, "config", "--local", "--get", "remote.origin.url"], { allowFailure: true })).stdout.trim();
+    if (url === "") return;
+    const advertised = await git(worker, [...into, "ls-remote", "origin", NOTES_REF], { allowFailure: true, timeoutMs: ORIGIN_QUESTION_MS });
+    if (advertised.exitCode !== 0) return;
+    if (advertised.stdout.trim() !== "") {
+      await git(worker, [
+        ...into, "-c", "gc.auto=0", "-c", "maintenance.auto=false",
+        "fetch", "--quiet", "--no-write-fetch-head", "--no-tags", "--no-recurse-submodules", "origin", `${NOTES_REF}:${NOTES_REF}`,
+      ], { allowFailure: true, timeoutMs: ORIGIN_QUESTION_MS });
+      return;
+    }
+    const specs = (await git(worker, [...into, "config", "--local", "--get-all", "remote.origin.fetch"], { allowFailure: true })).stdout.split("\n");
+    if (!specs.some((spec) => /^\+?refs\/notes\//.test(spec))) await git(worker, [...into, "config", "--local", "--add", "remote.origin.fetch", "refs/notes/*:refs/notes/*"]);
+    await git(worker, [...into, "config", "--local", `commitlore.notesabsence.r${Buffer.from("origin", "utf8").toString("hex")}`, url]);
   }
 
   /** A repository's CommitLore notes refs, each with the object it names. */
@@ -369,6 +423,7 @@ export class WorkerCheckouts {
     await git(staging, ["remote", "remove", "origin"]);
     if (origin.exitCode === 0 && origin.stdout.trim().length > 0) await git(staging, ["remote", "add", "origin", origin.stdout.trim()]);
     await this.carryNotes(clone, staging);
+    await this.settleOriginNotes(resident.repositoryId, staging);
     for (const [key, value] of [["gc.auto", "0"], ["maintenance.auto", "false"], [MADE_FROM, clone]] as const) {
       await git(staging, ["config", "--local", key, value]);
     }

@@ -1,5 +1,5 @@
 import { accessSync, constants, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { delimiter, dirname, join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
@@ -973,6 +973,100 @@ describe("#1268 a worker clone carries its resident's CommitLore notes mirror", 
       };
       expect(asked(s.clone)).not.toBe("unfetched");
       expect(asked(checkout)).toBe(asked(s.clone));
+    });
+  });
+});
+
+/**
+ * #1268 — a repository whose remote has no CommitLore notes at all (FreshReadme) answered "unfetched" to every lookup under
+ * `required`: CommitLore calls the mirror unfetched unless there is a local notes ref, or the remote's absence of one is
+ * recorded (`commitlore.notesabsence.*`, which only `commitlore doctor --fix` writes, after `git ls-remote` answers empty),
+ * and a plain `git fetch` records nothing. The worker clone's pass now asks the remote itself, with the daemon's own git
+ * (CommitLore's child has no credentials): an empty answer is recorded as CommitLore records it, an answer with notes is
+ * fetched as the mirror, and any failure to ask records nothing, so a lookup that cannot be answered is still refused.
+ */
+describe("#1268 a worker clone of a repository whose remote has no notes is verified empty, not unfetched", () => {
+  const ORIGIN_KEY = "commitlore.notesabsence.r6f726967696e";
+  const REAL = ((): string | null => {
+    const explicit = process.env["ACP_TEST_REAL_COMMITLORE"];
+    if (explicit !== undefined && explicit !== "") return explicit;
+    for (const directory of (process.env["PATH"] ?? "").split(delimiter).filter((entry) => entry.startsWith("/"))) {
+      try {
+        accessSync(join(directory, "commitlore"), constants.X_OK);
+        return join(directory, "commitlore");
+      } catch {
+        // not here
+      }
+    }
+    return null;
+  })();
+  const setOrigin = (clone: string, url: string): void => {
+    const known = spawnSync("git", ["-C", clone, "remote", "get-url", "origin"], { encoding: "utf8", timeout: 30_000 }).status === 0;
+    gitSync(clone, ["remote", known ? "set-url" : "add", "origin", url]);
+  };
+  /** A bare copy of the resident's clone, which the clone's origin then names: a remote with no notes. */
+  const bareOriginFor = (clone: string): string => {
+    const bare = join(tempDir("acp-notes-origin-"), "origin.git");
+    gitSync(dirname(bare), ["clone", "-q", "--bare", clone, bare]);
+    setOrigin(clone, bare);
+    return bare;
+  };
+  const notesOf = (repo: string): string => {
+    const asked = spawnSync(REAL as string, ["context", "src/app.js", "--json"], { cwd: repo, encoding: "utf8", timeout: 60_000 });
+    return (JSON.parse(asked.stdout) as { notes: string }).notes;
+  };
+  const absenceOf = (repo: string): string => spawnSync("git", ["-C", repo, "config", "--local", "--get", ORIGIN_KEY], { encoding: "utf8", timeout: 30_000 }).stdout.trim();
+
+  it("an origin that answers with no notes is recorded as CommitLore records it, and the worker clone's notes are absent", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-none", [APP]);
+      becomeResident(f, s);
+      const bare = bareOriginFor(s.clone);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(absenceOf(checkout)).toBe(bare);
+      expect(gitSync(checkout, ["config", "--local", "--get-all", "remote.origin.fetch"])).toMatch(/refs\/notes\//);
+      // Nothing was pushed to the remote, and the resident's clone was not written.
+      expect(gitSync(bare, ["for-each-ref", "refs/notes/"])).toBe("");
+      expect(spawnSync("git", ["-C", s.clone, "config", "--local", "--get", ORIGIN_KEY], { encoding: "utf8", timeout: 30_000 }).stdout).toBe("");
+    });
+  });
+
+  it.skipIf(REAL === null)("with the real CLI, such a worker clone's context is notes absent, which a lookup under required takes as empty", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-none-real", [APP]);
+      becomeResident(f, s);
+      bareOriginFor(s.clone);
+      await daemonPass(f);
+      expect(notesOf(await registeredCheckout(f, s))).toBe("absent");
+    });
+  });
+
+  it("an origin that cannot be asked records nothing: the worker clone stays unfetched and a lookup under required is still refused", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-unreachable", [APP]);
+      becomeResident(f, s);
+      setOrigin(s.clone, join(tempDir("acp-notes-gone-"), "missing.git"));
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(absenceOf(checkout)).toBe("");
+      if (REAL !== null) expect(notesOf(checkout)).toBe("unfetched");
+    });
+  });
+
+  it("an origin that has notes has them fetched as the worker clone's mirror", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-some", [APP]);
+      becomeResident(f, s);
+      const bare = bareOriginFor(s.clone);
+      const other = join(tempDir("acp-notes-writer-"), "writer");
+      gitSync(dirname(other), ["clone", "-q", bare, other]);
+      gitSync(other, ["-c", "user.email=r@example.test", "-c", "user.name=r", "notes", "--ref=commitlore", "add", "-m", "Record-Id: r-0123456789ab", "HEAD"]);
+      gitSync(other, ["push", "-q", "origin", "refs/notes/commitlore:refs/notes/commitlore"]);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(gitSync(checkout, ["rev-parse", "--verify", "refs/notes/commitlore"])).toBe(gitSync(bare, ["rev-parse", "--verify", "refs/notes/commitlore"]));
+      expect(absenceOf(checkout)).toBe("");
     });
   });
 });
