@@ -132,7 +132,7 @@ export const bootstrapRuntimeFixture = async (harnessOptions: Parameters<typeof 
   // The daemon's in-band wake, as `startDaemonMcpListeners` attaches it: a provisioned session's
   // RUN_DISPATCH starts a turn of its conversation.
   harness.cp.outbox.attachInBandWake((roleKey, messageIds) =>
-    wakeRoleHolder(harness.cp, listeners.ctoConversation, roleKey, { kind: "in-band dispatch", ids: messageIds ?? [] }));
+    wakeRoleHolder(harness.cp, roleKey, { kind: "in-band dispatch", ids: messageIds ?? [] }));
   const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-c1b-daemon-") });
 
   let keys = 0;

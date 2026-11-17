@@ -132,34 +132,14 @@ describe("role attachment over real daemon sockets", () => {
     const credential = await grant();
     const peer = await open(credential);
     expect((await peer.register({ sessionId: "forged", bindingGeneration: 999, connection: "other" })).ok).toBe(true);
-    expect(listeners.ctoConversation.endpointFor(roleKey)).toBe(endpoint);
     expect(h.cp.sessions.verifySecret(subject.sessionId, subject.sessionSecret).allowed).toBe(true);
-  });
-
-  it("either door's registration carries the holder's wake opt-out, and the next registration without it lifts it", async () => {
-    const attached = await open(await grant());
-    expect((await attached.register({ wakeOptOut: true })).ok).toBe(true);
-    expect(listeners.ctoConversation.endpointFor(roleKey)).toBe(endpoint);
-    expect((await listeners.ctoConversation.wake(roleKey)).reasonCode).toBe(ReasonCode.ROLE_WAKE_SUPPRESSED);
-    expect((await attached.register()).ok).toBe(true);
-    expect((await listeners.ctoConversation.wake(roleKey)).reasonCode).toBe(ReasonCode.OK);
-    attached.socket.destroy();
-    await expect.poll(() => listeners.ctoConversation.connected(roleKey)).toBe(false);
-
-    const ordinary = await open(subject);
-    expect((await ordinary.register({ wakeOptOut: true })).ok).toBe(true);
-    expect((await listeners.ctoConversation.wake(roleKey)).reasonCode).toBe(ReasonCode.ROLE_WAKE_SUPPRESSED);
-    expect((await ordinary.register({ wakeOptOut: false })).ok).toBe(true);
-    expect((await listeners.ctoConversation.wake(roleKey)).reasonCode).toBe(ReasonCode.OK);
   });
 
   it("an ordinary holder reconnect takes over an attachment and the former connection cannot register", async () => {
     const first = await open(await grant());
     const sibling = await open(subject);
     expect((await first.register()).ok).toBe(false);
-    expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
     expect((await sibling.register()).ok).toBe(true);
-    expect(listeners.ctoConversation.endpointFor(roleKey)).toBe(endpoint);
   });
 
   it("connection close after MCP initialization clears registration and permanently spends the credential", async () => {
@@ -168,7 +148,6 @@ describe("role attachment over real daemon sockets", () => {
     expect((await peer.register()).ok).toBe(true);
     peer.socket.destroy();
     await expect.poll(() => listeners.ctoConversation.connected(roleKey)).toBe(false);
-    expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
     await expect(open(credential)).rejects.toMatchObject({ refusal: { ok: false,
       reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED, message: "attachment credential is unknown or invalid" } });
     expect((await (await open(await grant())).register()).ok).toBe(true);
@@ -220,7 +199,6 @@ describe("role attachment over real daemon sockets", () => {
       ...ready(), conversation: "REPLACED", reason: "test transition" }));
     expect(listeners.ctoConversation.connected(roleKey)).toBe(false);
     expect((await peer.register()).ok).toBe(false);
-    expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
   });
 
   it("revocation clears registration on an open connection without revoking the session credential", async () => {
@@ -229,7 +207,6 @@ describe("role attachment over real daemon sockets", () => {
     expect((await peer.register()).ok).toBe(true);
     valueOf(daemon.attachments.revoke({ ...subject, attachmentId: credential.attachmentId }));
     expect(listeners.ctoConversation.connected(roleKey)).toBe(false);
-    expect(listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
     expect((await peer.register()).ok).toBe(false);
     expect(h.cp.sessions.verifySecret(subject.sessionId, subject.sessionSecret).allowed).toBe(true);
   });

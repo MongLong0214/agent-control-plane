@@ -14,7 +14,7 @@ it('the provisioner MCP command reaches the canonical attach relay with the next
   const uuid = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
   expect(await main(['attach','resident-cto','--claimed-session-id',uuid,'--project-id','resident'])).toBe(0);
   // The generation is not fixed at spawn: the relay reads the role's next one before each attempt.
-  expect(runAttachRelayCommand).toHaveBeenCalledWith(expect.objectContaining({claim:{claimedSessionUuid:uuid,projectId:'resident',expectedBindingGeneration:'auto'},stateDir:state}),expect.anything());
+  expect(runAttachRelayCommand).toHaveBeenCalledWith(expect.objectContaining({claim:{claimedSessionUuid:uuid,projectId:'resident',expectedBindingGeneration:'auto'}}),expect.anything());
   const options = vi.mocked(runAttachRelayCommand).mock.calls[0]![0];
   expect(await options.nextGeneration!()).toBe(1);
 });

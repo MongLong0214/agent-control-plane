@@ -1,7 +1,6 @@
 import { REPO_FACTORY_RESULT_SCHEMA_ID } from "../../src/bootstrap/repo-factory-result.ts";
 import { manifestDigest } from "../../src/contracts/manifest.ts";
-import { type Decision, allow } from "../../src/core/errors.ts";
-import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { type Decision } from "../../src/core/errors.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { wakeRoleHolder } from "../../src/daemon/agentcpd.ts";
 import { Role } from "../../src/domain/types.ts";
@@ -128,21 +127,10 @@ export const actOnWorkTurns = (f: BootstrapRuntimeFixture, sessionId: string): v
   };
 };
 
-/**
- * The daemon's in-band wake, routed by `wakeRoleHolder` exactly as the daemon routes it, with an
- * interactive conversation port that answers and does nothing. `wakes` counts its knocks.
- */
-export const routeInBandWakes = (f: BootstrapRuntimeFixture): { knocks: () => number } => {
-  let knocks = 0;
-  const conversation = {
-    wake: async () => {
-      knocks += 1;
-      return allow(ReasonCode.OK, undefined);
-    },
-  };
+/** The daemon's in-band wake, routed by `wakeRoleHolder` exactly as the daemon routes it. */
+export const routeInBandWakes = (f: BootstrapRuntimeFixture): void => {
   f.harness.cp.outbox.attachInBandWake((roleKey, messageIds) =>
-    wakeRoleHolder(f.harness.cp, conversation, roleKey, { kind: "in-band dispatch", ids: messageIds ?? [] }));
-  return { knocks: () => knocks };
+    wakeRoleHolder(f.harness.cp, roleKey, { kind: "in-band dispatch", ids: messageIds ?? [] }));
 };
 
 /** Holds the next liveness check for this session, without running a readiness model turn. */

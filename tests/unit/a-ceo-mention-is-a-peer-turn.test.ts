@@ -957,32 +957,6 @@ describe("#1038 a bound CEO's Buzz mention is a peer turn for the bound PRIMARY_
   });
 });
 
-describe("a peer message's wake that finds no attached CTO is recorded", () => {
-  // The one wake an admission sends is the only push a holder-claimed message gets. A refusal made
-  // before any connection used to return to the admission and be stored nowhere, so a message whose
-  // CTO had no attached session sat PENDING with no trace of why it was never woken for.
-  it("writes ROLE_WAKE_FAILED with ROLE_PEER_ABSENT and leaves the message PENDING with no attempt", async () => {
-    const fixture = await startPeerFixture({ daemonCtoPort: true });
-    try {
-      const event = fixture.mention(fixture.ceo, { text: "CTO, 이 PR 을 검토해 주세요" });
-      await fixture.relayDelivers(event);
-      expect(fixture.subscriber.counters().admitted).toBe(1);
-      expect(fixture.harness.cp.db.all(`SELECT status, attempts FROM outbox WHERE kind = ?`, [MessageKind.PEER_MESSAGE]))
-        .toEqual([{ status: "PENDING", attempts: 0 }]);
-      const failed = fixture.harness.cp.db.all<{ reason_code: string; role_key: string; evidence_json: string }>(
-        `SELECT reason_code, role_key, evidence_json FROM audit_events WHERE kind = 'ROLE_WAKE_FAILED'`,
-        [],
-      );
-      expect(failed.map((row) => ({ ...row, evidence_json: JSON.parse(row.evidence_json) as unknown }))).toEqual([
-        { reason_code: ReasonCode.ROLE_PEER_ABSENT, role_key: fixture.ctoRoleKey, evidence_json: { cause: "mention" } },
-      ]);
-      expect(fixture.harness.cp.db.all(`SELECT 1 FROM audit_events WHERE kind = 'ROLE_WAKE_SENT'`, [])).toEqual([]);
-    } finally {
-      await fixture.close();
-    }
-  });
-});
-
 describe("#1044 a queued peer message keeps its identity fence until it is handed over", () => {
   const claimOf = (
     value: unknown,

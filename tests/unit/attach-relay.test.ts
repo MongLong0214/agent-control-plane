@@ -17,17 +17,8 @@ import { Daemon } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
-import { clearSessionMessagingEnv, inheritedSessionMessagingNames, SESSION_MESSAGING_PREFIX } from "../helpers/session-messaging-env.ts";
+import { clearSessionMessagingEnv } from "../helpers/session-messaging-env.ts";
 
-/**
- * R1154-01 — a variable the parent environment hands in under a suffix no list names. Planted in the
- * first hoisted call, as an inherited one would be, so the hoisted clear after it has to remove it.
- */
-const inheritedUnknown = vi.hoisted(() => {
-  const name = `CLAUDE_CODE_MESSAGING_R1154_UNITRELAY_${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
-  process.env[name] = "inherited-from-the-parent";
-  return name;
-});
 /**
  * R1154-01 — every CLAUDE_CODE_MESSAGING_* variable is removed before this file's imports evaluate:
  * vi.hoisted runs ahead of them, where a module-level call would run after. Inlined because a hoisted
@@ -305,7 +296,7 @@ describe("the canonical CTO attach relay", () => {
     expect(relay.init.error).toBeUndefined();
     const body = await register(relay);
     expect(body["ok"]).toBe(true);
-    expect(listeners.ctoConversation.endpointFor(roleKey)).toBe(endpoint);
+    expect(listeners.ctoConversation.currentHolderConnected(roleKey)).toBe(true);
     relay.stdin.end();
     expect(await settles(relay.exit)).toBe(ATTACH_EXIT.OK);
   });
@@ -314,10 +305,10 @@ describe("the canonical CTO attach relay", () => {
     await fakeClaim(receipt());
     const relay = await attach({ name: "hand-written", version: "0" });
     // The daemon sees the client's own declaration, whatever it is, and admits it.
-    expect(listeners.ctoConversation.unwakeableHolders()).toMatchObject([{ presented: "hand-written/0" }]);
+    expect(listeners.ctoConversation.connected(roleKey)).toBe(true);
     const body = await register(relay);
     expect(body["ok"]).toBe(true);
-    expect(listeners.ctoConversation.endpointFor(roleKey)).toBe(endpoint);
+    expect(listeners.ctoConversation.currentHolderConnected(roleKey)).toBe(true);
     relay.stdin.end();
     expect(await settles(relay.exit)).toBe(ATTACH_EXIT.OK);
   });
@@ -553,7 +544,7 @@ describe("the canonical CTO attach relay", () => {
     await fakeClaim(receipt());
     relay.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "claude-code", version: "2.1.323" } })
       .catch(() => undefined);
-    await expect.poll(() => listeners.ctoConversation.unwakeableHolders().length).toBe(1);
+    await expect.poll(() => listeners.ctoConversation.connected(roleKey)).toBe(true);
     relay.stdin.end();
     expect(await settles(relay.exit)).toBe(ATTACH_EXIT.OK);
   });
@@ -627,12 +618,12 @@ describe("the canonical CTO attach relay", () => {
     );
     const relay = await attach({ name: "claude-code", version: "2.1.323" }, proxyPath);
     expect((await register(relay))["ok"]).toBe(true);
-    expect(listeners.ctoConversation.endpointFor(roleKey)).toBe(endpoint);
+    expect(listeners.ctoConversation.currentHolderConnected(roleKey)).toBe(true);
 
     for (const socket of sockets.splice(0)) socket.destroy();
     expect(await settles(relay.exit)).toBe(ATTACH_EXIT.STREAM_CLOSED);
     expect(relay.stdout.readableEnded || relay.stdout.writableEnded).toBe(true);
-    await expect.poll(() => listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
+    await expect.poll(() => listeners.ctoConversation.connected(roleKey)).toBe(false);
     expect(accepted).toBe(1);
   });
 
@@ -642,7 +633,7 @@ describe("the canonical CTO attach relay", () => {
     expect((await register(relay))["ok"]).toBe(true);
     relay.stdin.end();
     expect(await settles(relay.exit)).toBe(ATTACH_EXIT.OK);
-    await expect.poll(() => listeners.ctoConversation.endpointFor(roleKey)).toBeNull();
+    await expect.poll(() => listeners.ctoConversation.connected(roleKey)).toBe(false);
   });
 
   it("treats a first line past the transport limit as a protocol failure, not as client traffic", async () => {
@@ -772,10 +763,4 @@ describe("the canonical CTO attach relay", () => {
       }
     }
   });
-});
-
-it("R1154-01: no relay here inherits a CLAUDE_CODE_MESSAGING_* variable, whatever its suffix", () => {
-  expect(inheritedUnknown.startsWith(SESSION_MESSAGING_PREFIX)).toBe(true);
-  // Neither this process's environment, which an in-process relay reads, nor a child that inherits it.
-  expect(inheritedSessionMessagingNames()).toEqual({ here: [], child: [] });
 });

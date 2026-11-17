@@ -77,7 +77,7 @@ const start = async () => {
       const binding = h.cp.bindings.activePrimaryCto(PROJECT);
       return binding ? [binding] : [];
     },
-  }, { endpointDir: dir, ownerMessages: ownerMessageLedger(h.cp) });
+  }, { ownerMessages: ownerMessageLedger(h.cp) });
   const holder = h.cp.bindings.active(ROLE_KEY)!;
   const server = new McpServer({ name: "provenance-witness", version: "1" });
   port.attach(server, () => allow(ReasonCode.OK, {

@@ -1,11 +1,6 @@
 import { MAX_MCP_LINE_BYTES } from "../core/mcp-limits.ts";
-import { readProcessArgv, readProcessStartToken } from "../core/process-argv.ts";
 import { execFileSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { lstatSync, readFileSync, watch } from "node:fs";
-import { homedir } from "node:os";
-import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { dirname, join, resolve as resolvePath } from "node:path";
+import { createConnection, type Socket } from "node:net";
 import type { Readable, Writable } from "node:stream";
 
 /**
@@ -56,17 +51,6 @@ import type { Readable, Writable } from "node:stream";
  *
  * The adopted CEO's relay (`runAdoptedCeoAttachRelay`, #1037) is the same byte pipe with no claim
  * and no handshake in front of it, because its socket authenticates the connection itself.
- *
- * The canonical CTO's relay is also the session's **wake proxy** (`openWakeProxy`). Claude Code
- * 2.1.283 holds a message from a sender that attests no permission mode for the owner's approval
- * when the receiving session bypasses permission prompts, and the daemon's wake is such a message,
- * so a wake written straight to the session's messaging socket no longer starts a turn. A
- * session delivers without holding what its own child processes send after the auth line
- * `{"type":"auth","token":…}` carrying `CLAUDE_CODE_MESSAGING_TOKEN`, and this relay is one: Claude
- * Code spawned it and put `CLAUDE_CODE_MESSAGING_SOCKET` and that token in its environment. So the
- * relay listens on a socket of its own beside the session's, points the session's wake registration
- * at it, and forwards to the session exactly one thing, the constant `WAKE_FRAME`, behind the auth
- * line. Without both variables nothing of this happens and the relay behaves as before.
  */
 
 /**
@@ -140,35 +124,6 @@ export interface AttachRelayOptions {
    * reattach spends from the same window; absent, it is `claimRetry.maxWaitMs` from this call.
    */
   admissionDeadline?: number;
-  /**
-   * The session's own messaging socket and token. Set, the relay opens its wake proxy; the CLI
-   * entry reads both from the environment Claude Code gave it (`sessionMessagingFromEnv`).
-   */
-  messaging?: SessionMessaging;
-}
-
-/**
- * The receiving end of the session's cross-session messaging, as Claude Code hands it to a child:
- * `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN`. The token is written to that
- * socket's auth line and nowhere else: not to stderr, not to the daemon, not to any file.
- */
-export interface SessionMessaging {
-  socketPath: string;
-  token: string;
-  /**
-   * Where the wake proxy's socket is made; absent, beside `socketPath`. The daemon accepts a wake
-   * endpoint only directly inside its state directory, so the CLI entry names that directory and
-   * a session on Claude Code's default socket (`/tmp/cc-socks/<pid>.sock`) is woken the same as one
-   * launched with `--messaging-socket-path` in it. Never part of what the session or a client sends.
-   */
-  proxyDir?: string;
-  /**
-   * The wake proxy, already open: `runAttachRelayCommand` opens it before it asks for anything, so a socket that
-   * vanished since it was looked at refuses the attach instead of leaving it with no endpoint to register (#1427).
-   * Set, the relay uses it and closes it with itself; absent, it opens its own, and a failure to is not fatal unless
-   * `proxyDir` named the state directory it is required in.
-   */
-  openedProxy?: WakeProxy;
 }
 
 /**
@@ -179,7 +134,7 @@ export interface SessionMessaging {
  * wait: admitted and restored, it carries on; refused, it exits. So does the client ending the
  * session. By default nothing else ends it: a daemon restart measured at 5m47s outlasted the
  * five-minute deadline this wait used to have, and a relay that gives up is not respawned by
- * Claude Code, so every later wake of its role finds no peer. The asking stays bounded instead:
+ * Claude Code, so its role finds no peer. The asking stays bounded instead:
  * one attempt at a time, each at most `attemptTimeoutMs`, with a backoff capped at `maxDelayMs`.
  * A finite `maxWaitMs` is one absolute deadline, taken when the connection is lost, over every
  * admission and every restore of that wait (review PR1051-R2); `attemptTimeoutMs` bounds each step
@@ -366,6 +321,13 @@ const parseAdmission = (value: unknown): Admission | null => {
  */
 export const RESTORE_SUCCESSION_METHOD = "notifications/acp/canonical-cto-restore-succession";
 export const RESTORE_CHALLENGE_PREFIX = "acp-restore-challenge:";
+
+/**
+ * The id prefix of the `ping` a relay asks last when it restores a link, copied from
+ * `CANONICAL_CTO_RESTORED_PING_PREFIX` in `src/daemon/agentcpd.ts` for the same reason. Its answer is
+ * when the daemon tells the client its tool list may have changed.
+ */
+export const RESTORED_PING_PREFIX = "acp-relay-restored";
 
 /** #1106 — one binding as a capacity restore's succession names it: always with its role. */
 interface SuccessionBinding extends AdmittedTuple {
@@ -694,283 +656,6 @@ const resolveMcpToken = (timeoutMs: number = KEYCHAIN_TIMEOUT_MS): string | null
   }
 };
 
-/**
- * The session's messaging socket and token, from the environment Claude Code spawned this relay
- * with, or undefined unless both are there: an older Claude Code, or a client that is not Claude
- * Code, leaves the relay as it was before the wake proxy existed. `??` for the reason
- * `resolveMcpToken` gives.
- */
-const sessionMessagingFromEnv = (): SessionMessaging | undefined => {
-  const socketPath = process.env["CLAUDE_CODE_MESSAGING_SOCKET"] ?? "";
-  const token = process.env["CLAUDE_CODE_MESSAGING_TOKEN"] ?? "";
-  if (socketPath.length === 0) return undefined;
-  if (token.length === 0) return undefined;
-  return { socketPath, token };
-};
-
-/**
- * The one thing the wake proxy forwards: `ROLE_WAKE_FRAME` in `src/mcp/role-conversation.ts`, byte
- * for byte. Copied rather than imported for the reason the method names above are: this is a
- * client, and that module is the daemon's. `tests/process/relay-wake-proxy.test.ts` holds the two
- * equal.
- */
-const WAKE_FRAME = `${JSON.stringify({ type: "user", message: { role: "user", content: "ACP-ROLE-WAKE" } })}\n`;
-const WAKE_FRAME_BYTES = Buffer.from(WAKE_FRAME, "utf8");
-
-/**
- * How long the proxy waits for a sender to finish its frame, and for the session's socket to take
- * the forward: the daemon's own wake budget (`DEFAULT_ROLE_WAKE_TIMEOUT_MS`), since the daemon has
- * stopped waiting by then.
- */
-const WAKE_PROXY_TIMEOUT_MS = 2_000;
-
-/** A wake is one short connection; past this many at once the proxy closes new ones on arrival. */
-const WAKE_PROXY_MAX_CONNECTIONS = 8;
-
-/** The wake proxy once it is listening: the path the daemon is told to wake, and its teardown. */
-export interface WakeProxy {
-  path: string;
-  close(): void;
-}
-
-/** The session's messaging socket as one look found it: why it may not be woken, or which file it is. */
-type WakeTarget = { refusal: string } | { refusal: null; identity: string };
-
-/**
- * Whether the wake proxy may forward to the session's messaging socket, and which file that is.
- *
- * The checks the daemon makes of a wake endpoint (`#validateEndpointPath` in
- * `src/mcp/role-conversation.ts`), in its order and by its names, made of the socket the proxy
- * forwards to (review PR1057-R1): an exact normalized path; a parent that is a real directory, not
- * a symlink, owned by this uid and reachable by no one else; and the path itself `lstat`ed, never
- * followed — not a symlink, a socket, owned by this uid. With the proxy registered, the daemon
- * checks the proxy and never this socket, so these are the only checks the socket the token goes
- * to gets. The daemon's state-directory check needs no copy here: the proxy sits in the state directory
- * (`SessionMessaging.proxyDir`), which is the only place the daemon accepts it, wherever this socket is.
- *
- * Copied rather than imported for the reason `WAKE_FRAME` is. `identity` is the file's device and
- * inode, which tell one socket from another put at the same name.
- */
-const inspectWakeTarget = (socketPath: string): WakeTarget => {
-  if (socketPath !== resolvePath(socketPath)) return { refusal: "not-normalized" };
-  const uid = process.getuid?.();
-  if (uid === undefined) return { refusal: "owner-unknown-on-this-platform" };
-  try {
-    const dir = lstatSync(dirname(socketPath));
-    if (dir.isSymbolicLink()) return { refusal: "directory-is-symlink" };
-    if (!dir.isDirectory()) return { refusal: "directory-not-a-directory" };
-    if (dir.uid !== uid) return { refusal: "directory-owner-mismatch" };
-    if ((dir.mode & 0o077) !== 0) return { refusal: "directory-not-owner-only" };
-  } catch (error) {
-    // A directory that is not there is a vanished target; one that cannot be looked at is not the same fact.
-    return { refusal: isAbsent(error) ? "directory-not-found" : "directory-not-inspectable" };
-  }
-  try {
-    const target = lstatSync(socketPath);
-    if (target.isSymbolicLink()) return { refusal: "endpoint-is-symlink" };
-    if (!target.isSocket()) return { refusal: "endpoint-not-a-socket" };
-    if (target.uid !== uid) return { refusal: "endpoint-owner-mismatch" };
-    return { refusal: null, identity: `${target.dev}:${target.ino}` };
-  } catch (error) {
-    return { refusal: isAbsent(error) ? "endpoint-not-found" : "endpoint-not-inspectable" };
-  }
-};
-
-/** `lstat` found no such name: the file, or a directory on the way to it, is not there. */
-const isAbsent = (error: unknown): boolean => {
-  const code = (error as NodeJS.ErrnoException | undefined)?.code;
-  return code === "ENOENT" || code === "ENOTDIR";
-};
-
-/** A connect error as the daemon's wake classifies one; a Node error message names the path. */
-const wakeFailureShape = (error: NodeJS.ErrnoException): string => {
-  if (error.code === "ENOENT") return "not-found";
-  if (error.code === "ECONNREFUSED") return "connection-refused";
-  if (error.code === "ECONNRESET") return "connection-closed";
-  if (error.code === "EPIPE") return "connection-closed";
-  return "unclassified";
-};
-
-/**
- * What the proxy tells the daemon of a forward that failed: one of a closed set the daemon
- * recognizes, never a path or an error message. A session socket that no longer resolves is
- * `not-found` (its name is gone) or `connection-refused` (its name is there and nothing listens),
- * which the daemon reports as the role's own unwakeable cause; every other check that refused the
- * forward is `refused`.
- */
-const replyShapeOf = (shape: string): string => {
-  if (shape === "endpoint-not-found" || shape === "directory-not-found") return "not-found";
-  if (["not-found", "connection-refused", "timeout", "connection-closed", "unclassified"].includes(shape)) return shape;
-  return "refused";
-};
-
-/**
- * Opens the wake proxy beside the session's messaging socket, or answers null and says why.
- *
- * **In the daemon's state directory** (`SessionMessaging.proxyDir`), since the daemon takes a wake
- * endpoint only directly there (`dirname(endpoint) !== dir` is a refusal). The proxy used to sit beside
- * the session's socket, which made a session on Claude Code's default socket (`/tmp/cc-socks/<pid>.sock`)
- * unwakeable (#1427); with no `proxyDir` it still does. The session's own socket is checked by
- * `inspectWakeTarget` wherever it is, so no daemon check is loosened. The name is random,
- * and `listen` refuses a path that already exists. A relay killed before it closes leaves its
- * path behind; nothing sweeps it.
- *
- * **It forwards one constant and nothing else.** A connection is read for at most `WAKE_FRAME`'s
- * length, and is forwarded only if every byte it carried, up to its end, equals `WAKE_FRAME`. A
- * byte that differs, a byte past the frame, a frame with another field, a second line, or a sender
- * that does not end within the bound: the connection is destroyed and nothing reaches the session.
- * That is the whole of what makes the proxy safe. The session delivers what its own child sends
- * without asking the owner, so a proxy that carried any other byte would be a way to type into the
- * session on the owner's behalf.
- *
- * **The forward goes to the environment's socket**, never to a path a caller named, as the auth
- * line and then the frame on one connection that then ends — the order Claude Code documents.
- *
- * **Only while that socket passes the daemon's checks** (`inspectWakeTarget`, review PR1057-R1).
- * The daemon checks the endpoint it is given, and that is the proxy, so the socket the token goes
- * to is checked here: before the proxy opens, then before each forward connects, and once more
- * after the connect and before the auth line is written, when it must still be the file it was
- * before the connect. A socket that fails is sent nothing, reported as `attach: wake forward
- * refused <check>`, and checked afresh at the next wake. No `lstat` sees what `connect` resolved:
- * a name moved elsewhere just for the connect and moved back before the second look passes both.
- * The owner-only directory leaves that move to this uid, which can read this process's environment
- * anyway.
- *
- * The daemon waits for this proxy's acceptance reply. It is positive only after forwarding the
- * complete authenticated frame to the session socket. Failure retains a pending signal; socket
- * availability changes retry it. The durable inbox remains authoritative until the holder claims
- * and ACKs its work. Diagnostics contain neither path nor token.
- */
-const openWakeProxy = (messaging: SessionMessaging, stderr: Writable): Promise<WakeProxy | null> => {
-  const opening = inspectWakeTarget(messaging.socketPath);
-  if (opening.refusal !== null) {
-    stderr.write(`attach: wake proxy not opened ${opening.refusal}\n`);
-    return Promise.resolve(null);
-  }
-  const path = join(messaging.proxyDir ?? dirname(messaging.socketPath), `acp-wake-proxy-${randomBytes(8).toString("hex")}.sock`);
-  const connections = new Set<Socket>();
-
-  let requested = 0;
-  let forwarded = 0;
-  let forwarding = false;
-  let closed = false;
-  let availability = 0;
-  const waiting = new Map<Socket, number>();
-  const answer = (through: number, accepted: boolean, shape?: string): void => {
-    for (const [socket, sequence] of waiting) {
-      if (sequence > through) continue;
-      waiting.delete(socket);
-      socket.end(`${JSON.stringify(accepted ? { accepted } : { accepted, shape: replyShapeOf(shape ?? "unclassified") })}\n`);
-    }
-  };
-  const forward = (): void => {
-    if (closed || forwarding || requested <= forwarded) return;
-    forwarding = true;
-    const through = requested;
-    const beganAtAvailability = availability;
-    const before = inspectWakeTarget(messaging.socketPath);
-    const failed = (shape: string): void => {
-      forwarding = false;
-      stderr.write(`attach: wake forward failed ${shape}\n`);
-      answer(through, false, shape);
-      // An event during this attempt must survive the failure too.
-      if (requested > through || availability > beganAtAvailability) queueMicrotask(forward);
-      // Keep the outstanding signal. A filesystem change or another wake retries it.
-    };
-    if (before.refusal !== null) { failed(before.refusal); return; }
-    const out = createConnection(messaging.socketPath);
-    connections.add(out);
-    out.once("close", () => connections.delete(out));
-    let settled = false;
-    const finish = (accepted: boolean, shape = "connection-closed"): void => {
-      if (settled) return;
-      settled = true;
-      out.destroy();
-      if (!accepted) { failed(shape); return; }
-      forwarded = through;
-      forwarding = false;
-      answer(through, true);
-      // An arrival during forwarding is a follow-up signal, never erased by this completion.
-      if (requested > forwarded) forward();
-    };
-    out.setTimeout(WAKE_PROXY_TIMEOUT_MS, () => finish(false, "timeout"));
-    out.once("error", (error: NodeJS.ErrnoException) => finish(false, wakeFailureShape(error)));
-    out.once("close", () => { if (!settled) finish(false); });
-    out.once("connect", () => {
-      const after = inspectWakeTarget(messaging.socketPath);
-      if (after.refusal !== null) return finish(false, after.refusal);
-      if (after.identity !== before.identity) return finish(false, "endpoint-replaced");
-      // Acknowledged only once the bytes are written: Node calls this with the write's error, and calls it before
-      // the socket's own error event, which the `settled` guard would then discard (#1428 review).
-      out.end(`${JSON.stringify({ type: "auth", token: messaging.token })}\n${WAKE_FRAME}`, (error?: Error | null) => {
-        if (error) finish(false, wakeFailureShape(error as NodeJS.ErrnoException));
-        else finish(true);
-      });
-    });
-  };
-  // Availability is an event. No timer probes the session or disposes of pending work.
-  const watcher = watch(dirname(messaging.socketPath), (_event, name) => {
-    if (name === null || String(name) === messaging.socketPath.split("/").at(-1)) { availability += 1; forward(); }
-  });
-  watcher.on("error", () => undefined);
-  watcher.unref();
-
-  const server: Server = createServer({ allowHalfOpen: true }, (socket) => {
-    connections.add(socket);
-    socket.once("close", () => { connections.delete(socket); waiting.delete(socket); });
-    let held = Buffer.alloc(0);
-    let decided = false;
-    const drop = (): void => {
-      if (decided) return;
-      decided = true;
-      socket.destroy();
-      stderr.write("attach: wake proxy dropped a connection that was not a wake\n");
-    };
-    socket.setTimeout(WAKE_PROXY_TIMEOUT_MS, () => { if (!decided) drop(); else socket.destroy(); });
-    socket.on("data", (chunk: Buffer) => {
-      if (decided) return;
-      held = Buffer.concat([held, chunk]);
-      if (held.length > WAKE_FRAME_BYTES.length) return drop();
-      if (!WAKE_FRAME_BYTES.subarray(0, held.length).equals(held)) drop();
-    });
-    socket.once("end", () => {
-      if (decided) return;
-      if (!held.equals(WAKE_FRAME_BYTES)) return drop();
-      decided = true;
-      waiting.set(socket, ++requested);
-      forward();
-    });
-    socket.on("error", () => { decided = true; socket.destroy(); });
-  });
-
-  server.maxConnections = WAKE_PROXY_MAX_CONNECTIONS;
-
-  return new Promise<WakeProxy | null>((resolveProxy) => {
-    const notListening = (): void => {
-      watcher.close();
-      stderr.write("attach: wake proxy not opened listen-failed\n");
-      resolveProxy(null);
-    };
-    server.once("error", notListening);
-    server.listen(path, () => {
-      server.removeListener("error", notListening);
-      server.on("error", () => undefined);
-      // The relay's stdio is what keeps it alive; the proxy never does on its own.
-      server.unref();
-      resolveProxy({
-        path,
-        close: () => {
-          closed = true;
-          watcher.close();
-          for (const socket of connections) socket.destroy();
-          // Closing a listening unix socket removes its path.
-          server.close();
-        },
-      });
-    });
-  });
-};
-
 /** Everything the CLI knows about an attach. Deliberately no token field: see `resolveMcpToken`. */
 export interface AttachRelayCommandOptions {
   claimSocketPath: string;
@@ -982,185 +667,7 @@ export interface AttachRelayCommandOptions {
   nextGeneration?: () => Promise<number>;
   /** See `AttachRelayOptions.claimRetry`. */
   claimRetry?: Partial<ClaimRetryPolicy>;
-  /**
-   * The deployment's state directory, the one the daemon accepts wake endpoints in. Set, the
-   * relay refuses to start unless the session's messaging socket sits directly inside it.
-   */
-  stateDir?: string;
-  /** Where the claimed session is recorded; absent, Claude Code's own `~/.claude/sessions` and this process's ancestry. */
-  sessionRegistry?: SessionRegistry;
 }
-
-/**
- * Where Claude Code records each live session: `<dir>/<pid>.json`, carrying that process's `pid`,
- * `sessionId` and the `messagingSocketPath` it bound (measured on Claude Code 2.1.323, one file per
- * session, for a session on its default socket and one given `--messaging-socket-path` alike).
- * `ancestors` are this relay's parent pids, nearest first: the session is the one of them that has a
- * file here. Injected so a test names its own directory and its own ancestry.
- */
-/** One process on this relay's way up to the session, as the kernel reports it. */
-export interface ProcessLink {
-  pid: number;
-  /** The kernel's argv vector (never `ps`'s rendering), or null when it cannot be established. */
-  argv: readonly string[] | null;
-  /** The kernel's native start token (`darwin-tv:<sec>.<usec>`), or null when it cannot be read. */
-  startToken: string | null;
-}
-
-export interface SessionRegistry {
-  dir: string;
-  /** This relay itself, then each of its parents, nearest first: the chain the daemon's admission walks. */
-  chain: () => ProcessLink[];
-}
-
-const defaultSessionRegistry = (): SessionRegistry => ({
-  dir: join(process.env["CLAUDE_CONFIG_DIR"] ?? join(homedir(), ".claude"), "sessions"),
-  chain: () => {
-    const links: ProcessLink[] = [];
-    const seen = new Set<number>();
-    let pid = process.pid;
-    for (let hop = 0; hop < 64 && Number.isInteger(pid) && pid > 1 && !seen.has(pid); hop += 1) {
-      seen.add(pid);
-      links.push({ pid, argv: readProcessArgv(pid), startToken: readProcessStartToken(pid) });
-      try {
-        pid = pid === process.pid
-          ? process.ppid
-          : Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8", timeout: 2_000 }).trim());
-      } catch {
-        break;
-      }
-    }
-    return links;
-  },
-});
-
-/**
- * The daemon's own test of which ancestor is Claude Code: `looksLikeClaudeInvocation` in
- * `src/registry/canonical-self-claim.ts`, on the kernel's argv, copied rather than imported for the reason
- * `WAKE_FRAME` is (a client does not load the daemon's claim module). `argv[0]` is a path or name whose
- * basename is exactly `claude`, or the native updater layout `<dir>/claude/versions/<x.y.z>`; a leading dash
- * (`-claude`, a login shell's name) is not that, so the daemon skips such a shell and so must this.
- * `tests/unit/attach-relay-wakeable-socket.test.ts` holds the two equal over the shapes that matter.
- */
-const NATIVE_VERSIONED_CLAUDE_PATH = /^.+\/claude\/versions\/(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
-export const looksLikeClaudeInvocation = (argv: readonly string[]): boolean => {
-  const [firstElement] = argv;
-  return firstElement !== undefined &&
-    (/(^|\/)claude$/.test(firstElement) || NATIVE_VERSIONED_CLAUDE_PATH.test(firstElement));
-};
-
-/**
- * What Claude Code writes as a session's `procStart`: the process's native start, whole seconds, rendered in UTC as
- * `ctime` does (the daemon's `registryProcStartFromStartNs`). Not `ps -o lstart=`, which is local time: the same
- * start reads nine hours apart on a machine in Korea. Null for any token that is not Darwin's.
- */
-const registryProcStartOf = (startToken: string | null): string | null => {
-  const darwin = /^darwin-tv:(\d+)\.(\d{6})$/.exec(startToken ?? "");
-  if (!darwin) return null;
-  const seconds = Number(darwin[1]);
-  if (!Number.isSafeInteger(seconds) || seconds < 0) return null;
-  const date = new Date(seconds * 1_000);
-  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  const two = (value: number): string => String(value).padStart(2, "0");
-  return `${days[date.getUTCDay()]} ${months[date.getUTCMonth()]} ${String(date.getUTCDate()).padStart(2, " ")} ` +
-    `${two(date.getUTCHours())}:${two(date.getUTCMinutes())}:${two(date.getUTCSeconds())} ${date.getUTCFullYear()}`;
-};
-
-const sameWords = (left: unknown, right: string | null): boolean =>
-  typeof left === "string" && right !== null && left.trim().split(/\s+/).join(" ") === right.trim().split(/\s+/).join(" ");
-
-/**
- * Proof that `messaging.socketPath` is the socket of the session this attach claims, and no other
- * session's, wherever the socket is. The environment is the session's own (Claude Code gives it to
- * its child), and this reads it back from Claude Code's own record of it.
- *
- * The session is exactly the process the daemon's admission authenticates: the walk starts at this relay and goes up
- * its parents, and stops at the first whose kernel argv is a Claude Code invocation (`looksLikeClaudeInvocation`), as
- * `deriveClaimantIdentity` does, so a shell or wrapper between, whatever it is named, is skipped, never taken for
- * the session; a hop whose argv cannot be read refuses, as it does there. That process's own registry file must be
- * its (the pid, and the start `procStart` records, which is its native start in UTC), its `sessionId` must be
- * the one the claim names, and the socket it bound must be the one the environment gave. Nothing is searched for: a
- * directory of other sessions' sockets is never read, so there is no socket here to select by mistake. Null when
- * proved, else the check that failed.
- */
-const sessionSocketProofFailure = (
-  messaging: SessionMessaging,
-  claimedSessionUuid: string,
-  registry: SessionRegistry,
-): string | null => {
-  let claude: ProcessLink | null = null;
-  for (const link of registry.chain()) {
-    if (link.argv === null) return "ancestor-argv-unreadable";
-    if (looksLikeClaudeInvocation(link.argv)) {
-      claude = link;
-      break;
-    }
-  }
-  if (claude === null) return "no-claude-ancestor";
-  let entry: { pid?: unknown; sessionId?: unknown; messagingSocketPath?: unknown; procStart?: unknown };
-  try {
-    entry = JSON.parse(readFileSync(join(registry.dir, `${claude.pid}.json`), "utf8")) as typeof entry;
-  } catch {
-    return "session-not-in-registry";
-  }
-  if (entry.pid !== claude.pid || !sameWords(entry.procStart, registryProcStartOf(claude.startToken))) {
-    return "registry-entry-is-another-process";
-  }
-  if (typeof entry.sessionId !== "string" || entry.sessionId.toLowerCase() !== claimedSessionUuid.toLowerCase()) {
-    return "socket-belongs-to-another-session";
-  }
-  if (entry.messagingSocketPath !== messaging.socketPath) return "socket-is-not-the-sessions-registered-socket";
-  return null;
-};
-
-/** Whether anything accepts connections at `socketPath`: false only on ENOENT or ECONNREFUSED. A slow answer is not a refusal. */
-const socketIsListening = (socketPath: string): Promise<boolean> =>
-  new Promise((resolveProbe) => {
-    const probe = createConnection(socketPath);
-    probe.setTimeout(WAKE_PROXY_TIMEOUT_MS, () => { probe.destroy(); resolveProbe(true); });
-    probe.once("connect", () => { probe.destroy(); resolveProbe(true); });
-    probe.once("error", (error: NodeJS.ErrnoException) => {
-      probe.destroy();
-      resolveProbe(error.code !== "ENOENT" && error.code !== "ECONNREFUSED");
-    });
-  });
-
-/** What an operator can do about a session that cannot be woken. */
-const launchFlagFix = (stateDir: string): string =>
-  `start Claude Code with --messaging-socket-path ${resolvePath(stateDir)}/cc-session-<name>.sock`;
-
-/**
- * Why this session can never be woken, or null when it can: refused at launch, where the operator
- * is looking, because the alternative is a session that attaches, works, and is silently
- * unwakeable. Only a session with no socket at all is refused (#1427): the one Claude Code gave
- * its default socket is woken as the one launched with `--messaging-socket-path` is, because the
- * relay's proxy sits in the daemon's state directory and forwards to the session's own socket
- * wherever it is. That socket must be one the daemon's own endpoint checks (`inspectWakeTarget`)
- * would pass, must be listening now, and must be proved to be this claimed session's, inside the
- * state directory as much as outside it (`sessionSocketProofFailure`).
- */
-const unwakeableSessionRefusal = async (
-  messaging: SessionMessaging | undefined,
-  stateDir: string,
-  claimedSessionUuid: string,
-  registry: SessionRegistry,
-): Promise<string | null> => {
-  const fix = launchFlagFix(stateDir);
-  const refused = (why: string): string => `attach: this session cannot be woken: ${why}; ${fix}`;
-  if (messaging === undefined) {
-    return refused("it has no messaging socket (CLAUDE_CODE_MESSAGING_SOCKET or token unset)");
-  }
-  const target = inspectWakeTarget(messaging.socketPath);
-  if (target.refusal !== null) return refused(`its messaging socket was refused (${target.refusal})`);
-  // Wherever the socket is, inside the state directory or not: the environment's word is not the proof.
-  const failure = sessionSocketProofFailure(messaging, claimedSessionUuid, registry);
-  if (failure !== null) return refused(`its messaging socket cannot be proved to be this session's (${failure})`);
-  if (!(await socketIsListening(messaging.socketPath))) {
-    return refused("its messaging socket is not listening");
-  }
-  return null;
-};
 
 /**
  * The `agentctl attach canonical-cto` entry.
@@ -1180,50 +687,13 @@ export const runAttachRelayCommand = async (
   // needs no credential unreachable without one. The token is acquired only for the fallback,
   // which presents it on `cto.mcp.sock`.
   io.stdin.pause();
-  // Read before either path, so a reattached relay and a claimed one both open the wake proxy.
-  const environment = sessionMessagingFromEnv();
-  // The proxy goes in the daemon's state directory, wherever the session's own socket is.
-  const messaging = environment === undefined || options.stateDir === undefined
-    ? environment
-    : { ...environment, proxyDir: resolvePath(options.stateDir) };
-  // Before anything connects: a role holder that cannot be woken is refused where the operator
-  // is looking, not left to fail as a stderr line nobody reads.
-  if (options.stateDir !== undefined) {
-    const refusal = await unwakeableSessionRefusal(
-      environment,
-      options.stateDir,
-      options.claim.claimedSessionUuid,
-      options.sessionRegistry ?? defaultSessionRegistry(),
-    );
-    if (refusal !== null) {
-      io.stderr.write(`${refusal}\n`);
-      return ATTACH_EXIT.USAGE;
-    }
-  }
-  // The proxy is opened before anything is asked of the daemon: the socket was looked at moments ago and can have gone
-  // since, and an attach that could not open the proxy it needs would be admitted, initialize, and register no
-  // endpoint, so every later wake would end ROLE_PEER_UNSUPPORTED with nothing saying why (#1427). Refused here, before
-  // any claim, where the operator is looking.
-  let openedProxy: WakeProxy | null = null;
-  if (messaging !== undefined && options.stateDir !== undefined) {
-    openedProxy = await openWakeProxy(messaging, io.stderr);
-    if (openedProxy === null) {
-      io.stderr.write(`attach: this session cannot be woken: its wake proxy could not be opened; ${launchFlagFix(options.stateDir)}\n`);
-      return ATTACH_EXIT.USAGE;
-    }
-  }
-  try {
-    return await attachWithProxy({ ...options }, io, openedProxy === null || messaging === undefined ? messaging : { ...messaging, openedProxy });
-  } finally {
-    openedProxy?.close();
-  }
+  return await attachCommand({ ...options }, io);
 };
 
-/** The rest of `runAttachRelayCommand`, with the session's messaging (and its proxy, when one is open) settled. */
-const attachWithProxy = async (
+/** The rest of `runAttachRelayCommand`. */
+const attachCommand = async (
   options: AttachRelayCommandOptions,
   io: AttachRelayIo,
-  messaging: SessionMessaging | undefined,
 ): Promise<number> => {
   // The admission window starts here, at relay start, and every step before a receipt spends from it.
   const admissionDeadline = admissionDeadlineOf(options);
@@ -1231,7 +701,6 @@ const attachWithProxy = async (
     options.reattachSocketPath,
     boundedBy(admissionDeadline, DEFAULT_CLAIM_TIMEOUT_MS),
     options.reattach,
-    messaging,
     io,
   );
   if (reattached !== CLAIM) return reattached;
@@ -1249,7 +718,7 @@ const attachWithProxy = async (
   }
   // The configured door is kept whatever it answered just now (review PR1051-R5): a door that did
   // not answer may belong to a daemon that opened its claim socket and has not yet opened this one.
-  return runAttachRelay({ ...options, initialReattach: false, mcpToken, messaging, admissionDeadline }, io);
+  return runAttachRelay({ ...options, initialReattach: false, mcpToken, admissionDeadline }, io);
 };
 
 /** `reattachFirst`'s answer when the reattach did not decide the attach and the claim must. */
@@ -1267,7 +736,6 @@ const reattachFirst = async (
   reattachSocketPath: string | undefined,
   timeoutMs: number,
   policy: Partial<ReattachPolicy> | undefined,
-  messaging: SessionMessaging | undefined,
   io: AttachRelayIo,
 ): Promise<number | typeof CLAIM> => {
   if (reattachSocketPath === undefined) return CLAIM;
@@ -1281,7 +749,6 @@ const reattachFirst = async (
       reattached.tuple,
       reattachSocketPath,
       policy,
-      messaging,
       io,
     );
   }
@@ -1352,7 +819,7 @@ const claimUntilAnswered = async (options: AttachRelayOptions, deadline: number,
   let delay = policy.initialDelayMs;
   for (let attempt = 0; ; attempt += 1) {
     if (attempt > 0) {
-      const reattached = await reattachFirst(options.reattachSocketPath, boundedBy(deadline, timeoutMs), options.reattach, options.messaging, io);
+      const reattached = await reattachFirst(options.reattachSocketPath, boundedBy(deadline, timeoutMs), options.reattach, io);
       if (reattached !== CLAIM) return reattached;
     }
     if (Date.now() >= deadline) return windowClosed("attach: claim socket unavailable", ATTACH_EXIT.UNAVAILABLE);
@@ -1400,7 +867,6 @@ export const runAttachRelay = async (
       options.reattachSocketPath,
       boundedBy(deadline, options.claimTimeoutMs ?? DEFAULT_CLAIM_TIMEOUT_MS),
       options.reattach,
-      options.messaging,
       io,
     );
     if (reattached !== CLAIM) return reattached;
@@ -1433,7 +899,7 @@ export const runAttachRelay = async (
   // Review S2B-R2-01 — the claim's connection is admitted under no role: only the reattach door's
   // acknowledgement names one, and only a connection it admitted takes a succession.
   const held: Admission = { ...claimed.tuple, roleKey: null };
-  return relayWithReattach(first, connection, false, held, door, options.reattach, options.messaging, io);
+  return relayWithReattach(first, connection, false, held, door, options.reattach, io);
 };
 
 /**
@@ -1728,10 +1194,9 @@ const lineSplitter = (onLine: (line: string) => void, onOverflow: () => void): (
   };
 };
 
-/** A client request in flight: the id the client gave it, and the relay's number for it or null. */
+/** A client request in flight, under the id the client gave it. */
 interface InFlightRequest {
   client: unknown;
-  upstream: number | null;
 }
 
 /** A request of the client's as it arrived: the line, byte for byte, and what it parsed to. */
@@ -1753,19 +1218,12 @@ interface Link {
   /** Known at once for a reattach; for a claim's handshake, after the first line that is not a refusal. */
   accepted: boolean;
   closed: boolean;
-  /**
-   * The client's requests written on this link and not yet answered, keyed by the id the relay sent
-   * each under: `client` is the id the client gave it, `upstream` the relay's number for it, or
-   * null when it left under the client's own id because no proxy was listening (review PR1057-R3).
-   */
+  /** The client's requests written on this link and not yet answered, keyed by their own ids. */
   inFlight: Map<string, InFlightRequest>;
   /** The relay's own requests on this link, each answered by this link and by no other. */
   waiters: Map<string, (message: RelayedMessage | null) => void>;
   /** Replayable requests written on this link, remembered only once the daemon answers them with success. */
   initializes: Map<string, ClientRequest>;
-  wakeRegistrations: Map<string, unknown>;
-  /** Whether the relay has registered its wake proxy on this link of its own accord. */
-  proxyOffered: boolean;
   /**
    * Review S2B-R1-01 — the id of the last capacity-restore challenge the daemon sent the client on
    * this link, and the same id once the client answered it with a result while this link was
@@ -1775,20 +1233,9 @@ interface Link {
   answeredChallenge: string | null;
 }
 
-const WAKE_REGISTER_TOOL = "role_wake_endpoint_register";
-
 const succeeded = (message: RelayedMessage): boolean => {
   if (message.error !== undefined) return false;
   return message.result !== undefined;
-};
-
-const wakeRegistered = (message: RelayedMessage): boolean =>
-  (message.result as { structuredContent?: { ok?: unknown } } | undefined)?.structuredContent?.ok === true;
-
-/** The reason code a refused wake registration carries, for stderr; never anything else of the answer. */
-const wakeRefusalReason = (message: RelayedMessage): string => {
-  const body = (message.result as { structuredContent?: { reasonCode?: unknown } } | undefined)?.structuredContent;
-  return String(body?.reasonCode ?? "UNKNOWN");
 };
 
 /**
@@ -1796,7 +1243,7 @@ const wakeRefusalReason = (message: RelayedMessage): string => {
  *
  * The byte pipe above exits when the daemon's side closes, and that was the whole of a daemon
  * restart for a canonical CTO: the relay died, Claude Code does not respawn a dead stdio MCP
- * server, and the binding stayed ACTIVE with no tools and no wake path until someone restarted the
+ * server, and the binding stayed ACTIVE with no tools until someone restarted the
  * session. This relay outlives the connection instead:
  *
  *   - **The client's stdio is never closed for it.** A request that arrives while the relay is
@@ -1831,13 +1278,11 @@ const wakeRefusalReason = (message: RelayedMessage): string => {
  *     admission, restore and pause of the wait; by default there is none (`ReattachPolicy`).
  *   - **It restores only what a daemon confirmed** (PR1051-R3). Replay state is taken from the
  *     daemon's answers rather than from the client's requests: taken from the requests, one the
- *     client was told was not sent ran on return, and a refused registration replaced the accepted
- *     endpoint. A daemon serves a new connection
- *     from scratch, so the relay replays the client's own `initialize` — kept once a daemon
- *     answered it with a result — and `notifications/initialized` — kept once written on a live
- *     connection — and swallows their answers, then repeats the last
- *     `role_wake_endpoint_register` call a daemon answered `ok:true`. A request the client was
- *     told was not sent, and a registration the daemon refused, change none of it.
+ *     client was told was not sent ran on return. A daemon serves a new connection from scratch, so
+ *     the relay replays the client's own `initialize` — kept once a daemon answered it with a
+ *     result — and `notifications/initialized` — kept once written on a live connection — and
+ *     swallows their answers, then asks a `ping` of its own whose answer ends the restore. A request
+ *     the client was told was not sent changes none of it.
  *   - **It holds nothing without bound** (PR1051-R4). The client's stdin pauses while stdout or the
  *     daemon's socket is not accepting writes, or while `MAX_PENDING_REQUESTS` requests are
  *     unanswered; the daemon's socket pauses while stdout is not accepting writes; and the exit
@@ -1845,45 +1290,13 @@ const wakeRefusalReason = (message: RelayedMessage): string => {
  *   - **A connection that closes without a refusal is not a refusal** (PR1051-R5). A claim's
  *     connection that closes before the daemon's first line is a daemon that went away, and the
  *     relay reattaches as it would after any other loss; only a refusal line ends the attach.
- *   - **Its wake proxy is what the daemon wakes** (`openWakeProxy`), when the session's messaging
- *     socket and token were in the environment. The client's `role_wake_endpoint_register` whose
- *     `endpoint` is exactly that socket — the session registering itself — leaves with the proxy's
- *     path instead, and that is the registration replayed. A registration of any other path is
- *     forwarded as it arrived rather than refused: the daemon decides which endpoints it accepts,
- *     and the proxy's forward target is the environment's socket whatever is registered. Once per admission —
- *     after the client's `notifications/initialized`, and in each restore — the relay registers
- *     the proxy itself unless the client registered another endpoint, so a wake reaches a session
- *     whose model never called the tool. The daemon wakes on a registration it accepts unless the
- *     wake has no confirmed work (a registration wake with no confirmed work is skipped), so that
- *     registration is otherwise the first wake through the proxy.
- *   - **Once its proxy listens, the client's requests leave under ids of the relay's** (review
- *     PR1057-R2). The relay's own requests — the restore's replays and the proxy's registration,
- *     which goes out on a live link alongside the client's traffic — share the connection with the
- *     client's, and an id the client may also use is one whose answer the relay would take, handing
- *     the relay's answer to the client as the client's. So each client request is sent under the
- *     next number the relay counts, and its answer goes back under the client's own id; the relay's
- *     own requests carry strings, which no number equals. A client's `notifications/cancelled` is
- *     sent naming the number its request went under, and not sent at all when it names no request
- *     in flight, since the id it names may be one of the relay's. An answer to no request in flight
- *     — the late answer to a request of the relay's it stopped waiting for — is dropped, never
- *     passed to the client.
- *   - **Until then nothing is renamed** (review PR1057-R3). With no proxy listening — no messaging
- *     in the environment, a socket the proxy may not forward to, or the proxy not yet open — the
- *     relay sends no request of its own on a live link, so there is nothing to keep apart: every
- *     line in either direction passes exactly as it arrived, a cancel included, and a restore
- *     replays the client's `initialize` as the client sent it, all as before the proxy existed. A
- *     request that left under the client's own id before the proxy opened is answered and cancelled
- *     under that id, and the numbers and strings the relay counts afterwards skip every id such a
- *     request still has in flight. Keyed on the proxy listening rather than on the messaging
- *     variables being present: a complete environment whose socket the proxy may not forward to
- *     opens no proxy, and renaming there would change the client's bytes with no proxy to protect.
+ *   - **Every line passes exactly as it arrived**, under the client's own id, in both directions.
+ *     The relay's only requests of its own are the restore's, made on a link no client request
+ *     reaches until the restore ends, so there is no id to keep apart.
  *
- * Seeing those messages, renaming request ids once the proxy listens, and the capacity restore's
- * challenge and succession (review S2B-R1-01) are the only reasons this relay reads JSON-RPC at all.
- * Once it listens, a client request leaves with its id renamed, but for that one registration with
- * nothing else changed, and an answer returns with the client's id restored; a restore's challenge
- * and its answer pass unchanged and are only noted, and its succession is taken out of the stream;
- * every other line is forwarded exactly as it arrived.
+ * The capacity restore's challenge and succession (review S2B-R1-01) are the only reasons this
+ * relay reads JSON-RPC beyond the client's `initialize`: a restore's challenge and its answer pass
+ * unchanged and are only noted, and its succession is taken out of the stream.
  */
 const relayWithReattach = (
   first: Socket,
@@ -1892,7 +1305,6 @@ const relayWithReattach = (
   initial: Admission,
   reattachSocketPath: string,
   policyOverrides: Partial<ReattachPolicy> | undefined,
-  messaging: SessionMessaging | undefined,
   io: AttachRelayIo,
 ): Promise<number> =>
   new Promise<number>((resolveRelay) => {
@@ -1913,19 +1325,11 @@ const relayWithReattach = (
     let stdoutFailed = false;
     let stdoutBlocked = false;
     let daemonBlocked = false;
-    /**
-     * The client's `initialize` a daemon answered with a result: replayed under an id of the relay's
-     * own while a proxy listens, and as the client sent it while none does.
-     */
+    /** The client's `initialize` a daemon answered with a result, replayed as the client sent it. */
     let clientInitialize: ClientRequest | null = null;
     let clientInitialized: string | null = null;
-    let wakeArguments: unknown = undefined;
     /** Counts the relay's own requests, whose ids are strings. */
     let internalIds = 0;
-    /** Counts the client's requests, which leave under these numbers rather than their own ids once a proxy listens. */
-    let upstreamIds = 0;
-    /** Listening, or null: no messaging in the environment, a directory it may not use, or not yet open. */
-    let proxy: WakeProxy | null = null;
     /** Ends the relay's own requests on a live link when the relay ends. */
     const live = new AbortController();
 
@@ -1985,9 +1389,6 @@ const relayWithReattach = (
         waiting = null;
       }
       live.abort();
-      // The proxy goes with the relay, so the daemon is never left an endpoint nobody forwards from.
-      proxy?.close();
-      proxy = null;
       current?.socket.destroy();
       current = null;
       first.destroy();
@@ -2011,13 +1412,7 @@ const relayWithReattach = (
 
     /** Notes a request written on `link` that a restarted daemon would be restored with, if it succeeds. */
     const noteReplayable = (link: Link, key: string, message: RelayedMessage, line: string): void => {
-      if (message.method === "initialize") {
-        link.initializes.set(key, { message, line });
-        return;
-      }
-      if (message.method !== "tools/call") return;
-      const params = message.params as { name?: unknown; arguments?: unknown } | undefined;
-      if (params?.name === WAKE_REGISTER_TOOL) link.wakeRegistrations.set(key, params.arguments);
+      if (message.method === "initialize") link.initializes.set(key, { message, line });
     };
 
     /**
@@ -2069,14 +1464,9 @@ const relayWithReattach = (
     /** Keeps a replayable request now that the daemon answered it, and only if it succeeded. */
     const settleReplayable = (link: Link, key: string, message: RelayedMessage): void => {
       const initialize = link.initializes.get(key);
-      if (initialize !== undefined) {
-        link.initializes.delete(key);
-        if (succeeded(message)) clientInitialize = initialize;
-      }
-      if (!link.wakeRegistrations.has(key)) return;
-      const registered = link.wakeRegistrations.get(key);
-      link.wakeRegistrations.delete(key);
-      if (wakeRegistered(message)) wakeArguments = registered;
+      if (initialize === undefined) return;
+      link.initializes.delete(key);
+      if (succeeded(message)) clientInitialize = initialize;
     };
 
     const send = (link: Link, line: string): void => {
@@ -2090,18 +1480,7 @@ const relayWithReattach = (
       });
     };
 
-    /**
-     * The relay's next number for a client request on `link`, past any id a request sent under the
-     * client's own id before the proxy opened still has in flight there (review PR1057-R3).
-     */
-    const nextUpstreamId = (link: Link): number => {
-      do {
-        upstreamIds += 1;
-      } while (link.inFlight.has(idKey(upstreamIds)));
-      return upstreamIds;
-    };
-
-    /** An id for one of the relay's own requests on `link`, past any id in flight there, as `nextUpstreamId`. */
+    /** An id for one of the relay's own requests on `link`, past any id in flight there. */
     const nextInternalId = (link: Link, prefix: string): string => {
       let id: string;
       do {
@@ -2109,43 +1488,6 @@ const relayWithReattach = (
         id = `${prefix}-${internalIds}`;
       } while (link.inFlight.has(idKey(id)));
       return id;
-    };
-
-    /**
-     * The client's registration of the session's own messaging socket, pointed at the proxy; null
-     * for every other message, which leaves unchanged but for its id. Only an `endpoint` exactly equal to the
-     * environment's socket is rewritten, so the client cannot steer the proxy, and the proxy's
-     * forward target is never a path any message names.
-     */
-    const pointAtProxy = (message: RelayedMessage): RelayedMessage | null => {
-      const opened = proxy;
-      if (opened === null) return null;
-      if (messaging === undefined) return null;
-      if (message.method !== "tools/call") return null;
-      const params = message.params as { name?: unknown; arguments?: unknown } | null | undefined;
-      if (params?.name !== WAKE_REGISTER_TOOL) return null;
-      const registration = params.arguments as { endpoint?: unknown } | null | undefined;
-      if (registration?.endpoint !== messaging.socketPath) return null;
-      return { ...message, params: { ...params, arguments: { ...registration, endpoint: opened.path, acceptance: "relay-v1" } } };
-    };
-
-    /**
-     * The client's cancel of one of its requests, naming the number that request was sent under, or
-     * as it arrived when that request left under the client's own id; null when no request of the
-     * client's with the id it names is in flight on `link`. Passed on as it arrived, a cancel names an
-     * id in the daemon's space, where it may be one of the relay's own.
-     */
-    const cancelUpstream = (link: Link, message: RelayedMessage, line: string): string | null => {
-      const params = message.params as { requestId?: unknown } | null | undefined;
-      if (typeof params !== "object" || params === null) return null;
-      const named = idKey(params.requestId);
-      let found: InFlightRequest | undefined;
-      for (const request of link.inFlight.values()) {
-        if (idKey(request.client) === named) found = request;
-      }
-      if (found === undefined) return null;
-      if (found.upstream === null) return line;
-      return JSON.stringify({ ...message, params: { ...params, requestId: found.upstream } });
     };
 
     const fromClient = lineSplitter((line) => {
@@ -2158,40 +1500,13 @@ const relayWithReattach = (
         return;
       }
       noteChallengeAnswer(link, message);
-      if (proxy === null) {
-        // No proxy, so no request of the relay's own on this link: the line leaves exactly as it
-        // arrived, under the client's own id, as before the proxy existed (review PR1057-R3).
-        if (id !== undefined) {
-          const key = idKey(id);
-          link.inFlight.set(key, { client: id, upstream: null });
-          noteReplayable(link, key, message as RelayedMessage, line);
-        } else if (message?.method === "notifications/initialized") {
-          clientInitialized = line;
-        }
-        send(link, line);
-        return;
-      }
+      // Every line leaves exactly as it arrived, under the client's own id.
       if (id !== undefined) {
-        // Sent under the relay's next number, never under the client's own id (review PR1057-R2).
-        const upstream = nextUpstreamId(link);
-        const key = idKey(upstream);
-        link.inFlight.set(key, { client: id, upstream });
-        const outbound = pointAtProxy(message as RelayedMessage) ?? (message as RelayedMessage);
-        noteReplayable(link, key, outbound, line);
-        send(link, JSON.stringify({ ...outbound, id: upstream }));
-        return;
-      }
-      if (message?.method === "notifications/cancelled") {
-        const cancel = cancelUpstream(link, message, line);
-        if (cancel !== null) send(link, cancel);
-        return;
-      }
-      if (message?.method === "notifications/initialized") {
+        const key = idKey(id);
+        link.inFlight.set(key, { client: id });
+        noteReplayable(link, key, message as RelayedMessage, line);
+      } else if (message?.method === "notifications/initialized") {
         clientInitialized = line;
-        send(link, line);
-        // The client is initialized: the earliest point the daemon accepts a wake registration.
-        offerProxy();
-        return;
       }
       send(link, line);
     }, () => protocolFailure("client line"));
@@ -2225,20 +1540,7 @@ const relayWithReattach = (
         const key = idKey(id);
         const waiter = link.waiters.get(key);
         if (waiter !== undefined) return waiter(message);
-        const request = link.inFlight.get(key);
-        if (request !== undefined) {
-          link.inFlight.delete(key);
-          settleReplayable(link, key, message as RelayedMessage);
-          // Sent under the client's own id, it is answered under it, and the line passes as it arrived.
-          if (request.upstream !== null) return toClient(JSON.stringify({ ...message, id: request.client }));
-        } else if (proxy !== null && id !== null) {
-          // An answer to no request in flight, such as the late answer to one of the relay's own it
-          // stopped waiting for. The client would take it for the answer to whichever of its requests
-          // carries that id. An error answering no id at all is the daemon's to report, and passes.
-          // With no proxy the relay has no request of its own on a live link, and it passes as before.
-          io.stderr.write("attach: dropped an answer to no request in flight\n");
-          return;
-        }
+        if (link.inFlight.delete(key)) settleReplayable(link, key, message as RelayedMessage);
       }
       toClient(line);
     };
@@ -2273,8 +1575,6 @@ const relayWithReattach = (
         inFlight: new Map(),
         waiters: new Map(),
         initializes: new Map(),
-        wakeRegistrations: new Map(),
-        proxyOffered: false,
         challenge: null,
         answeredChallenge: null,
       };
@@ -2332,83 +1632,20 @@ const relayWithReattach = (
       });
 
     /**
-     * A registration of the session's own messaging socket that a daemon accepted before the proxy
-     * was listening. The proxy supersedes it: it is the same session, reached the way that is not
-     * held. Any other registration is the client's choice and is left alone.
-     */
-    const supersededByProxy = (registration: unknown): boolean => {
-      if (proxy === null) return false;
-      if (messaging === undefined) return false;
-      return (registration as { endpoint?: unknown } | null | undefined)?.endpoint === messaging.socketPath;
-    };
-
-    /**
-     * Registers the wake proxy on `link`, once per link, when nothing else is registered: a proxy
-     * is listening, the client has initialized — the daemon refuses a registration from a
-     * connection that declared no build — and the accepted registration, if any, is the session's
-     * own socket. False only when `link` closed or the wait ended before an answer; a refusal is
-     * reported and is not a loss.
+     * Restores a fresh link to where the lost one was; false when it closes or the wait ends meanwhile.
      *
-     * Kept for replay, like the client's own, only once a daemon answered it `ok:true`, and only if
-     * no other registration of the client's was accepted meanwhile.
+     * The last thing asked is a `ping` under an id of the relay's own, and its answer is the point at
+     * which the relay stops refusing the client: the daemon sends the client `tools/list_changed`
+     * once it has answered it.
      */
-    const registerProxy = async (link: Link, deadlineAt: number, signal: AbortSignal): Promise<boolean> => {
-      const opened = proxy;
-      if (opened === null) return true;
-      if (link.proxyOffered) return true;
-      if (wakeArguments !== undefined && !supersededByProxy(wakeArguments)) return true;
-      if (clientInitialize === null) return true;
-      if (clientInitialized === null) return true;
-      link.proxyOffered = true;
-      const id = nextInternalId(link, "acp-relay-wake-proxy");
-      const registration = { endpoint: opened.path, acceptance: "relay-v1" };
-      const answer = await ask(link, id, JSON.stringify({
-        jsonrpc: "2.0",
-        id,
-        method: "tools/call",
-        params: { name: WAKE_REGISTER_TOOL, arguments: registration },
-      }), deadlineAt, signal);
-      if (answer === null) return false;
-      if (!wakeRegistered(answer)) {
-        io.stderr.write(`attach: wake proxy registration refused ${wakeRefusalReason(answer)}\n`);
-        return true;
-      }
-      if (wakeArguments === undefined || supersededByProxy(wakeArguments)) wakeArguments = registration;
-      return true;
-    };
-
-    /** `registerProxy` on the live link, bounded by one attempt; a link lost meanwhile is restore's. */
-    const offerProxy = (): void => {
-      const link = current;
-      if (phase !== "live") return;
-      if (link === null) return;
-      void registerProxy(link, Date.now() + policy.attemptTimeoutMs, live.signal);
-    };
-
-    /** Restores a fresh link to where the lost one was; false when it closes or the wait ends meanwhile. */
     const restore = async (link: Link, deadlineAt: number, signal: AbortSignal): Promise<boolean> => {
       const initialize = clientInitialize;
       if (initialize !== null) {
-        // With no proxy, as the client sent it and under its id, as before the proxy (review PR1057-R3).
-        const id = proxy === null ? initialize.message.id : nextInternalId(link, "acp-relay-reinitialize");
-        const line = proxy === null ? initialize.line : JSON.stringify({ ...initialize.message, id });
-        if ((await ask(link, id, line, deadlineAt, signal)) === null) return false;
+        if ((await ask(link, initialize.message.id, initialize.line, deadlineAt, signal)) === null) return false;
         if (clientInitialized !== null) link.socket.write(`${clientInitialized}\n`);
-      }
-      if (wakeArguments !== undefined && !supersededByProxy(wakeArguments)) {
-        const id = nextInternalId(link, "acp-relay-rewake");
-        const answer = await ask(link, id, JSON.stringify({
-          jsonrpc: "2.0",
-          id,
-          method: "tools/call",
-          params: { name: WAKE_REGISTER_TOOL, arguments: wakeArguments },
-        }), deadlineAt, signal);
+        const id = nextInternalId(link, RESTORED_PING_PREFIX);
+        const answer = await ask(link, id, JSON.stringify({ jsonrpc: "2.0", id, method: "ping" }), deadlineAt, signal);
         if (answer === null) return false;
-        if (!wakeRegistered(answer)) {
-          io.stderr.write(`attach: wake re-registration refused ${wakeRefusalReason(answer)}\n`);
-        }
-      } else if (!(await registerProxy(link, deadlineAt, signal))) {
-        return false;
       }
       return current === link;
     };
@@ -2509,23 +1746,6 @@ const relayWithReattach = (
       phase = "live";
       io.stdin.on("data", onClientData);
       flow();
-      // Opened once the admission is in, and kept across every reattach, since its path is what
-      // the daemon is given; it closes only with the relay.
-      if (messaging === undefined) return;
-      const opening = messaging.openedProxy !== undefined ? Promise.resolve(messaging.openedProxy) : openWakeProxy(messaging, io.stderr);
-      void opening.then((opened) => {
-        if (opened === null) {
-          // Where the state directory is named the proxy is required, and a relay without one is a session no wake reaches.
-          if (messaging.proxyDir !== undefined && phase !== "done") {
-            io.stderr.write("attach: this session cannot be woken: its wake proxy could not be opened\n");
-            end(ATTACH_EXIT.USAGE);
-          }
-          return;
-        }
-        if (phase === "done") return opened.close();
-        proxy = opened;
-        offerProxy();
-      });
     };
     if (first.pending) {
       first.once("connect", begin);
