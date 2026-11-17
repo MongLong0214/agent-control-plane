@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { afterAll, afterEach, describe, expect, it } from "vitest";
@@ -224,6 +224,41 @@ describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, wi
     expect(calls.some((call) => call[0] === "agentctl" && call[2] === "rotate")).toBe(false);
     expect(calls.some((call) => call[0] === "tmux")).toBe(false);
     expect(running(f.old.pid!)).toBe(true);
+  });
+
+  it("finds a canonical CTO's key where the daemon's Buzz subscriber is declared to use it, when it was not provisioned as a resident", async () => {
+    // Logic Pro MCP, Repo Factory and CommitLore keep the key file they were created with (`cto-logic-pro-mcp.priv`), under a
+    // name that is not `cto-<project id>`. The subscriber's own configuration is what says which key serves which room.
+    const f = await fixture("claims");
+    const declared = join(f.dir, "keys", "cto-logic-pro-mcp.priv");
+    mkdirSync(dirname(declared), { recursive: true });
+    writeFileSync(declared, readFileSync(f.keyFile, "utf8"), { mode: 0o600 });
+    rmSync(f.keyFile);
+    writeFileSync(join(f.dir, "state", "buzz-nostr-subscriber.json"), JSON.stringify({
+      relayUrl: "wss://relay.example.test",
+      identities: [
+        { privateKeyFile: join(f.dir, "keys", "not-this-one.priv"), encoding: "hex", rooms: ["22222222-2222-4222-8222-222222222222"] },
+        { privateKeyFile: declared, encoding: "hex", rooms: [ROOM] },
+      ],
+    }));
+    const result = await f.launch();
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(readFileSync(join(f.dir, "state", "rotations", `${PROJECT}-${NEW}.sh`), "utf8")).toContain(`"--key-file","${declared}"`);
+  });
+
+  it("does not take a key the subscriber declares for another room, or one that is not the entitlement's identity", async () => {
+    const f = await fixture("claims");
+    const declared = join(f.dir, "keys", "someone-else.priv");
+    mkdirSync(dirname(declared), { recursive: true });
+    writeFileSync(declared, readFileSync(f.keyFile, "utf8"), { mode: 0o600 });
+    rmSync(f.keyFile);
+    writeFileSync(join(f.dir, "state", "buzz-nostr-subscriber.json"), JSON.stringify({
+      relayUrl: "wss://relay.example.test",
+      identities: [{ privateKeyFile: declared, encoding: "hex", rooms: ["22222222-2222-4222-8222-222222222222"] }],
+    }));
+    const result = await f.launch();
+    expect(result.code, result.stderr + result.stdout).toBe(68);
+    expect(f.calls().some((call) => call[0] === "agentctl" && call[2] === "rotate")).toBe(false);
   });
 
   it("does not take a room or key from the command line", async () => {

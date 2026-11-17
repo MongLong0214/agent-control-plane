@@ -114,6 +114,31 @@ describe("confirming, and only confirming", () => {
     expect(t.presses).toEqual([]);
   });
 
+  it("waits for a warning that is still being drawn, and confirms it once it is whole, rather than refusing its first half", async () => {
+    // A terminal read in the middle of a redraw shows the warning cut off. That is a screen still arriving, not a
+    // warning that differs; the first half must not end the launch.
+    const half = WARNING.slice(0, WARNING.indexOf("Please use --channels to run a list") + "Please use --channels to run a list".length);
+    expect(classifyScreen(half)).toBe("WARNING_ALTERED");
+    const t = terminal((pressed, tick) => (pressed > 0 ? REGISTERED : tick === 0 ? half : WARNING));
+    expect(await confirmChannelStartup(t.driver, t.bounds)).toEqual({ ok: true, confirmed: true });
+    expect(t.presses).toEqual(["Enter"]);
+  });
+
+  it("refuses a cut-off warning only when it stays cut off, and presses nothing", async () => {
+    const half = WARNING.slice(0, WARNING.indexOf("Channels: server:acp-buzz-channel"));
+    const t = terminal(() => half);
+    expect(await confirmChannelStartup(t.driver, t.bounds)).toMatchObject({ ok: false, failure: "WARNING_DIFFERS", confirmed: false });
+    expect(t.presses).toEqual([]);
+  });
+
+  it("waits for a dialog that is still being drawn too, before calling it unrecognised", async () => {
+    const t = terminal((_pressed, tick) => (tick === 0 ? `${RULE}\n Quick safety` : tick === 1 ? TRUST : REGISTERED));
+    // The second read is a whole dialog, but it is the first time it has been seen whole: it is read once more, and
+    // the third read is a registered session. Nothing is pressed on any of them.
+    expect(await confirmChannelStartup(t.driver, t.bounds)).toEqual({ ok: true, confirmed: false });
+    expect(t.presses).toEqual([]);
+  });
+
   it("waits no longer than its bound for a screen that never appears", async () => {
     const t = terminal(() => STARTING, { screenWaitMs: 2_000, registerWaitMs: 2_000, pollMs: 500 });
     await confirmChannelStartup(t.driver, t.bounds);

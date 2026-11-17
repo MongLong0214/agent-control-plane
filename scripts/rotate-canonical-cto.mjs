@@ -180,12 +180,27 @@ const channel = (() => {
   if (!held || typeof held.room !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(held.room) || !/^[0-9a-f]{64}$/.test(held.actorId ?? '')) {
     return refuse('the project has no canonical Buzz identity and room to start a channel with');
   }
-  const keyFile = join(process.env.HOME ?? homedir(), '.hermes', 'bridge', 'keys', `cto-${project}.priv`);
-  let secret;
-  try { secret = readFileSync(keyFile, 'utf8').trim(); } catch { return refuse('the project\'s CTO key file cannot be read'); }
-  if (!/^[0-9a-f]{64}$/.test(secret)) return refuse('the project\'s CTO key file is not 32 hex-encoded bytes');
-  if (getPublicKey(Uint8Array.from(Buffer.from(secret, 'hex'))) !== held.actorId) return refuse('the project\'s CTO key is not the Buzz identity its canonical entitlement names');
-  return { room: held.room, keyFile };
+  // The key is the one the daemon's own Buzz subscriber is declared to use for this room (its configuration names a key
+  // file per identity and room), else the resident naming `cto-<project>.priv`. A canonical CTO that was not provisioned
+  // as a resident keeps the key file it was created with, so the room, not the project's name, is what finds it. A
+  // candidate counts only if it is hex and derives exactly the identity the entitlement names.
+  const candidates = [];
+  try {
+    const subscriber = JSON.parse(readFileSync(join(state, 'buzz-nostr-subscriber.json'), 'utf8'));
+    for (const identity of Array.isArray(subscriber.identities) ? subscriber.identities : []) {
+      if (identity?.encoding === 'hex' && typeof identity.privateKeyFile === 'string' && Array.isArray(identity.rooms) && identity.rooms.includes(held.room)) candidates.push(identity.privateKeyFile);
+    }
+  } catch { /* no subscriber configuration: the naming below is all there is */ }
+  candidates.push(join(process.env.HOME ?? homedir(), '.hermes', 'bridge', 'keys', `cto-${project}.priv`));
+  let failure = 'the project\'s CTO key file cannot be read';
+  for (const keyFile of candidates) {
+    let secret;
+    try { secret = readFileSync(keyFile, 'utf8').trim(); } catch { continue; }
+    if (!/^[0-9a-f]{64}$/.test(secret)) { failure = 'the project\'s CTO key file is not 32 hex-encoded bytes'; continue; }
+    if (getPublicKey(Uint8Array.from(Buffer.from(secret, 'hex'))) !== held.actorId) { failure = 'the project\'s CTO key is not the Buzz identity its canonical entitlement names'; continue; }
+    return { room: held.room, keyFile };
+  }
+  return refuse(failure);
 })();
 const old = before.value.holderSessionUuid;
 const resumed = (before.value.rotations ?? []).find((rotation) => rotation.state === 'PENDING') ?? null;

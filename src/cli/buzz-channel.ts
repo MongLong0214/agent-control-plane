@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import { isAbsolute, join, normalize } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { BuzzChannelRelay, type ChannelNotification } from "../buzz/buzz-channel.ts";
 import { buildChannelMcpServer, emitChannelNotification } from "../buzz/buzz-channel-mcp.ts";
@@ -161,6 +163,24 @@ export const runBuzzChannel = async (argv: readonly string[]): Promise<number> =
   return 0;
 };
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+/**
+ * Whether this module is the program that was started.
+ *
+ * `import.meta.url` is always the realpath Node resolved the module through, but `process.argv[1]` is whatever
+ * path the caller passed, and the resident launcher passes `<state>/current/dist/cli/buzz-channel.js` with `current`
+ * a link to the generation in use. Comparing the two literally never matches there: the process exits 0 having done
+ * nothing, and Claude Code reports the server closed. Both sides are resolved to their realpath, as `agentctl` does;
+ * a path that cannot be resolved is "not main", never thrown.
+ */
+const isMainModule = (): boolean => {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+};
+
+if (isMainModule()) {
   runBuzzChannel(process.argv.slice(2)).then((code) => process.exit(code), () => process.exit(1));
 }

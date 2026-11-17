@@ -144,35 +144,52 @@ export const confirmChannelStartup = async (
   driver: ChannelScreenDriver,
   bounds: ChannelStartupBounds = DEFAULT_CHANNEL_STARTUP_BOUNDS,
 ): Promise<ChannelStartupResult> => {
-  const look = async (): Promise<ScreenVerdict> => {
+  // A screen is read in the middle of being drawn as often as not: a warning cut off after its second sentence is a
+  // warning still arriving, not one that differs. So a screen that would end the launch (an altered warning, another
+  // channel list, a dialog that is not the warning) ends it only when the next read, a poll later, is the same screen.
+  let lastRefusable: string | null = null;
+  const look = async (): Promise<{ verdict: ScreenVerdict; settled: boolean }> => {
+    let text: string;
     try {
-      return classifyScreen(await driver.capture());
+      text = await driver.capture();
     } catch {
-      return "OTHER_DIALOG";
+      // A terminal that is not the launch's reads as an unknown dialog, the same way twice.
+      const settled = lastRefusable === "\u0000unreadable";
+      lastRefusable = "\u0000unreadable";
+      return { verdict: "OTHER_DIALOG", settled };
     }
+    const verdict = classifyScreen(text);
+    const refusable = verdict === "WARNING_OTHER_CHANNELS" || verdict === "WARNING_ALTERED" || verdict === "OTHER_DIALOG";
+    const normalized = normalizeScreen(text);
+    const settled = refusable && lastRefusable === normalized;
+    lastRefusable = refusable ? normalized : null;
+    return { verdict, settled };
   };
   let verdict: ScreenVerdict = "OTHER";
   const first = driver.now();
   while (true) {
-    verdict = await look();
+    const read = await look();
+    verdict = read.verdict;
     if (verdict === "REGISTERED") return { ok: true, confirmed: false };
     if (verdict === "EXACT_WARNING") break;
-    if (verdict === "WARNING_OTHER_CHANNELS" || verdict === "WARNING_ALTERED") {
+    if (read.settled && (verdict === "WARNING_OTHER_CHANNELS" || verdict === "WARNING_ALTERED")) {
       return { ok: false, failure: "WARNING_DIFFERS", screen: verdict, confirmed: false };
     }
-    if (verdict === "OTHER_DIALOG") return { ok: false, failure: "UNRECOGNIZED_SCREEN", screen: verdict, confirmed: false };
+    if (read.settled && verdict === "OTHER_DIALOG") return { ok: false, failure: "UNRECOGNIZED_SCREEN", screen: verdict, confirmed: false };
     if (driver.now() - first >= bounds.screenWaitMs) return { ok: false, failure: "UNRECOGNIZED_SCREEN", screen: verdict, confirmed: false };
     await driver.sleep(bounds.pollMs);
   }
   await driver.press();
+  lastRefusable = null;
   const pressed = driver.now();
   while (true) {
     await driver.sleep(bounds.pollMs);
-    verdict = await look();
+    const read = await look();
+    verdict = read.verdict;
     if (verdict === "REGISTERED") return { ok: true, confirmed: true };
     if (driver.now() - pressed >= bounds.registerWaitMs) break;
     // The warning may take a moment to be redrawn away, so it is waited out; a different dialog is not.
-    if (verdict === "OTHER_DIALOG" || verdict === "WARNING_ALTERED" || verdict === "WARNING_OTHER_CHANNELS") break;
+    if (read.settled && (verdict === "OTHER_DIALOG" || verdict === "WARNING_ALTERED" || verdict === "WARNING_OTHER_CHANNELS")) break;
   }
   return { ok: false, failure: "NOT_REGISTERED", screen: verdict, confirmed: true };
 };
