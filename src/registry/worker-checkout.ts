@@ -206,12 +206,21 @@ export class WorkerCheckouts {
     if (asked !== undefined && Date.parse(this.clock.nowIso()) - asked < ORIGIN_RETRY_MS) return null;
     const into = await withoutRepositoryPrograms(worker);
     if ((await git(worker, [...into, "rev-parse", "--verify", "-q", NOTES_REF], { allowFailure: true })).exitCode === 0) return null;
-    const url = (await git(worker, [...into, "config", "--local", "--get", "remote.origin.url"], { allowFailure: true })).stdout.trim();
-    if (url === "") return null;
+    const urls = (await git(worker, [...into, "config", "--local", "--get-all", "remote.origin.url"], { allowFailure: true })).stdout.split("\n").filter((line) => line.trim() !== "");
+    if (urls.length === 0) return null;
     this.#askedAt.set(repositoryId, Date.parse(this.clock.nowIso()));
-    const advertised = await git(worker, [...into, "ls-remote", "origin", NOTES_REF], { allowFailure: true, timeoutMs: ORIGIN_QUESTION_MS });
-    if (advertised.exitCode !== 0) return { url, advertised: "unanswered" };
-    return { url, advertised: advertised.stdout.trim() === "" ? "none" : "some" };
+    const url = urls[urls.length - 1]!.trim();
+    // CommitLore compares its record with the last url (`git config --get`), while `git ls-remote origin` asks the first: with
+    // more than one, no question is asked that the record could name.
+    if (urls.length > 1) return { url, advertised: "unanswered" };
+    // `allowFailure` does not cover a question that runs past its bound, which throws: that too is no answer.
+    try {
+      const advertised = await git(worker, [...into, "ls-remote", "origin", NOTES_REF], { allowFailure: true, timeoutMs: ORIGIN_QUESTION_MS });
+      if (advertised.exitCode !== 0) return { url, advertised: "unanswered" };
+      return { url, advertised: advertised.stdout.trim() === "" ? "none" : "some" };
+    } catch {
+      return { url, advertised: "unanswered" };
+    }
   }
 
   /** Whether acting on `answer` would change `worker`. */

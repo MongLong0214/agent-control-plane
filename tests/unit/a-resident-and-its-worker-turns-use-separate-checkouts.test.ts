@@ -1243,4 +1243,41 @@ describe("#1268 a worker clone of a repository whose remote has no notes is veri
       }
     });
   });
+
+  it("a question to origin that runs past its bound is an unanswered one: the pass goes on and the absence record goes", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "resident-notes-slow", [APP]);
+      becomeResident(f, s);
+      const bare = bareOriginFor(s.clone);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(absenceOf(checkout)).toBe(bare);
+      // The remote's git no longer answers within the bound.
+      const slow = join(tempDir("acp-notes-slow-"), "upload-pack.sh");
+      writeFileSync(slow, "#!/bin/sh\nexec sleep 30\n", { mode: 0o755 });
+      gitSync(checkout, ["config", "--local", "remote.origin.uploadpack", slow]);
+      f.harness.clock.advance(TEN_MINUTES);
+      await daemonPass(f);
+      expect(cp.audit.byKind("REPOSITORY_CHECKOUT_MOVE_REFUSED")).toEqual([]);
+      expect(absenceOf(checkout)).toBe("");
+      if (REAL !== null) expect(notesOf(checkout)).toBe("unfetched");
+    });
+  }, 90_000);
+
+  it("an origin with more than one url is not asked about: CommitLore reads one url and git asks another, so no absence is recorded for either", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-two-urls", [APP]);
+      becomeResident(f, s);
+      const bare = bareOriginFor(s.clone);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(absenceOf(checkout)).toBe(bare);
+      gitSync(checkout, ["config", "--local", "--add", "remote.origin.url", join(tempDir("acp-notes-other-"), "other.git")]);
+      f.harness.clock.advance(TEN_MINUTES);
+      await daemonPass(f);
+      expect(absenceOf(checkout)).toBe("");
+      if (REAL !== null) expect(notesOf(checkout)).toBe("unfetched");
+    });
+  });
 });
