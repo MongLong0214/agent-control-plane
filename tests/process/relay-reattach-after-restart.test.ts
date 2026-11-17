@@ -1009,3 +1009,167 @@ describe("review PR1051-R5: a claimed relay comes back after a restart too", () 
     expect(await settles(r.exit)).toBe(ATTACH_EXIT.OK);
   });
 });
+
+/**
+ * What the relay does to the client's traffic. It is a byte pipe with two exceptions: a restore, which
+ * replays the client's `initialize` and `notifications/initialized` and then asks a `ping` of its own,
+ * and the answer to a request that was in flight when the connection closed. Every other line, in
+ * either direction, passes exactly as it arrived, under the client's own ids, `notifications/cancelled`
+ * included. The relay sends no request of its own on a live link, so there is no id to keep apart.
+ *
+ * Every frame below is spaced as `JSON.stringify` never spaces it, and one carries a `\u` escape it would
+ * decode, so a line the relay parsed and wrote again cannot pass for the line it was given.
+ */
+const SPACED = {
+  initialize: `{ "jsonrpc": "2.0", "id": "init-1", "method": "initialize", "params": { "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name":"fixture-client","version":"1"} } }`,
+  initialized: `{"jsonrpc" : "2.0", "method" : "notifications/initialized"}`,
+  list: `{  "id":"client-42",  "jsonrpc":"2.0", "method":"tools/list" , "params":{} }`,
+  held: `{"jsonrpc":"2.0","id":"held-7","method":"tools/call","params":{ "name":"fixture_slow","arguments":{} }}`,
+  cancel: `{ "jsonrpc":"2.0", "method":"notifications/cancelled", "params":{ "requestId":"held-7", "reason":"caf\\u00e9" } }`,
+  strayCancel: `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"never-sent" , "reason":"fixture"}}`,
+  afterRestore: `{"jsonrpc":"2.0", "method":"tools/list", "id":"after-restore-3"}`,
+  stray: `{ "jsonrpc":"2.0", "id":"stray-9", "result":{ } }`,
+} as const;
+
+const lines = (...frames: string[]): string => frames.map((frame) => `${frame}\n`).join("");
+
+/** The restoring ping, exactly as the relay writes it. */
+const RESTORING_PING = JSON.stringify({ jsonrpc: "2.0", id: "acp-relay-restored-1", method: "ping" });
+
+/** The stand-in daemon's answer to a request, spaced as no serializer spaces it, under the id it was sent. */
+const spacedAnswer = (id: unknown, method: string): string =>
+  `{ "jsonrpc" : "2.0" ,  "id" : ${JSON.stringify(id)} , "result" : { "answered" : ${JSON.stringify(method)} } }`;
+
+/**
+ * A stand-in daemon behind the reattach door that keeps each connection's bytes exactly as they
+ * arrived and answers every request at once with `spacedAnswer`, but a `tools/call` of `fixture_slow`,
+ * which it leaves unanswered. `notifications` are the id-less lines each connection was sent, parsed.
+ */
+const recordingDoor = async (dir: string) => {
+  const path = join(dir, "door.sock");
+  const connections: Array<{ socket: Socket; raw: string }> = [];
+  const notifications: Line[] = [];
+  const server = createServer((socket) => {
+    socket.on("error", () => undefined);
+    const connection = { socket, raw: "" };
+    connections.push(connection);
+    socket.write(`${JSON.stringify({ ok: true, reasonCode: ReasonCode.OK, admitted: STAND_IN_TUPLE })}\n`);
+    let text = "";
+    socket.on("data", (chunk: Buffer) => {
+      connection.raw += chunk.toString("utf8");
+      text += chunk.toString("utf8");
+      for (let newline = text.indexOf("\n"); newline >= 0; newline = text.indexOf("\n")) {
+        const line = JSON.parse(text.slice(0, newline)) as Line;
+        text = text.slice(newline + 1);
+        if (line.id === undefined) {
+          notifications.push(line);
+          continue;
+        }
+        if (line.method === undefined) continue;
+        if (line.method === "tools/call" && (line.params as { name?: string } | undefined)?.name === "fixture_slow") continue;
+        socket.write(`${spacedAnswer(line.id, line.method)}\n`);
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(path, resolve));
+  closers.push(async () => {
+    for (const { socket } of connections) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  return { path, connections, notifications };
+};
+
+/** A relay behind `recordingDoor`, its stdout kept as the client read it. */
+const pipedRelay = async () => {
+  const { dir } = standInPaths();
+  const door = await recordingDoor(dir);
+  const r = relay({ claimPath: join(dir, "absent.sock"), ctoPath: join(dir, "absent.sock"), reattachPath: door.path }, FAST);
+  let out = "";
+  r.stdout.on("data", (chunk: Buffer) => {
+    out += chunk.toString("utf8");
+  });
+  const answered = (id: string | number): boolean => out.includes(`"id" : ${JSON.stringify(id)} ,`) || out.includes(`"id":${JSON.stringify(id)}`);
+  return { door, r, out: () => out, answered };
+};
+
+describe("the relay changes no byte of the client's traffic (review PR1057-R3)", () => {
+  it("passes every line through exactly as it arrived in both directions, and across a restart", async () => {
+    const { door, r, out, answered } = await pipedRelay();
+    r.stdin.write(lines(SPACED.initialize, SPACED.initialized, SPACED.list, SPACED.held, SPACED.cancel, SPACED.strayCancel));
+    expect(await until(() => answered("client-42"))).toBe(true);
+    await pauseFor(100);
+    // Soft, so each direction and the restore is judged on its own when one of them changes a byte.
+    // Client to daemon: each line as the client wrote it, the request ids its own, both cancels sent.
+    expect.soft(door.connections[0]!.raw).toBe(
+      lines(SPACED.initialize, SPACED.initialized, SPACED.list, SPACED.held, SPACED.cancel, SPACED.strayCancel),
+    );
+
+    // Daemon to client: an answer to no request of the client's passes as well, as it always did.
+    door.connections[0]!.socket.write(`${SPACED.stray}\n`);
+    expect.soft(await until(() => answered("stray-9"), 1_000)).toBe(true);
+
+    // A restarted daemon is given the client's `initialize` as the client sent it, then its
+    // `notifications/initialized`, then the relay's own restoring ping, before anything else.
+    door.connections[0]!.socket.destroy();
+    expect(await until(() => (door.connections[1]?.raw ?? "").includes(RESTORING_PING))).toBe(true);
+    await pauseFor(100);
+    r.stdin.write(lines(SPACED.afterRestore));
+    expect(await until(() => answered("after-restore-3"))).toBe(true);
+    expect.soft(door.connections[1]!.raw).toBe(lines(SPACED.initialize, SPACED.initialized, RESTORING_PING, SPACED.afterRestore));
+
+    // Every answer reached the client as the daemon wrote it; the one line of the relay's own is
+    // its report that the held request's outcome is unknown, under that request's own id. The
+    // restoring ping's answer is the relay's, and never reaches the client.
+    expect.soft(out()).toBe(lines(
+      spacedAnswer("init-1", "initialize"),
+      spacedAnswer("client-42", "tools/list"),
+      SPACED.stray,
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "held-7",
+        error: {
+          code: RELAY_REATTACHING_ERROR,
+          message: "the agent-control-plane connection closed before this request was answered; its outcome is unknown",
+        },
+      }),
+      spacedAnswer("after-restore-3", "tools/list"),
+    ));
+    expect.soft(r.err()).toBe("");
+    expect(door.connections).toHaveLength(2);
+    r.stdin.end();
+    expect(await settles(r.exit)).toBe(ATTACH_EXIT.OK);
+  });
+
+  it("answers a request under the client's own id, whatever shape it has, and the daemon never sees one id twice", async () => {
+    const { door, r, answered } = await pipedRelay();
+    // Numbers, strings, and a string shaped like an id the relay itself would generate: all the client's.
+    const ids: Array<string | number> = [1, 2, "acp-relay-restored-1", "acp-relay-rewake-1", "client-42"];
+    r.stdin.write(lines(SPACED.initialize, SPACED.initialized));
+    expect(await until(() => answered("init-1"))).toBe(true);
+    for (const id of ids) {
+      r.stdin.write(lines(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "fixture_tool", arguments: {} } })));
+    }
+    expect(await until(() => ids.every((id) => answered(id)))).toBe(true);
+    const sent = door.connections[0]!.raw.split("\n").filter((text) => text !== "").map((text) => JSON.parse(text) as Line);
+    const requested = sent.filter((line) => line.method === "tools/call").map((line) => line.id);
+    expect(requested).toEqual(ids);
+    expect(new Set(requested.map((id) => JSON.stringify(id))).size).toBe(requested.length);
+    expect(r.err()).toBe("");
+    r.stdin.end();
+    expect(await settles(r.exit)).toBe(ATTACH_EXIT.OK);
+  });
+
+  it("forwards notifications/cancelled naming the request's own id, even one that names no request in flight", async () => {
+    const { door, r, answered } = await pipedRelay();
+    r.stdin.write(lines(SPACED.initialize, SPACED.initialized, SPACED.held));
+    expect(await until(() => answered("init-1"))).toBe(true);
+    r.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: "held-7", reason: "fixture" } })}\n`);
+    r.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: "never-sent", reason: "fixture" } })}\n`);
+    expect(await until(() => door.notifications.filter((line) => line.method === "notifications/cancelled").length === 2)).toBe(true);
+    expect(
+      door.notifications.filter((line) => line.method === "notifications/cancelled").map((line) => (line.params as { requestId?: unknown }).requestId),
+    ).toEqual(["held-7", "never-sent"]);
+    r.stdin.end();
+    expect(await settles(r.exit)).toBe(ATTACH_EXIT.OK);
+  });
+});
