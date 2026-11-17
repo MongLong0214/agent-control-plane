@@ -56,6 +56,8 @@ interface World {
   procs: CtoProcess[];
   tmux: Set<string>;
   repo: { exists: boolean };
+  /** What the primary clone answers about the worker's commits: a commit no remote-tracking branch has, or a fetch that fails. */
+  worker: { unpublished: boolean; fetchFails: boolean };
   operatorAnswers: Array<(method: string) => Decision<unknown> | null>;
   provisionerAnswers: Array<(operation: string) => CtoExecResult | null>;
   mtimes: Map<string, number>;
@@ -73,7 +75,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
   ]);
   const mtimes = new Map([[TRANSCRIPT, NOW - (IDLE_SECONDS + 60) * 1000]]);
   const w = {
-    out: [], changes: [], ran: [], files, mtimes, tmux: new Set([TMUX]), repo: { exists: true }, operatorAnswers: [], provisionerAnswers: [],
+    out: [], changes: [], ran: [], files, mtimes, tmux: new Set([TMUX]), repo: { exists: true }, worker: { unpublished: false, fetchFails: false }, operatorAnswers: [], provisionerAnswers: [],
     procs: [
       { pid: 100, ppid: 1, command: "/bin/sh /state/resident-e2e-sort-fixture.sh" },
       { pid: CLAUDE, ppid: 100, command: `/bin/claude --model opus ${CHANNEL} --resume ${CONVERSATION} --name e2e CTO` },
@@ -113,6 +115,11 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     if (bin === "git" && args[2] === "status") return answer(0, "");
     if (bin === "git" && args[2] === "log") return answer(0, "");
     if (bin === "git" && args[2] === "config") return answer(0, `${CLONE}\n`);
+    // The worker's branches and HEAD, fetched into a namespace of the primary clone and compared with its remotes.
+    if (bin === "git" && args[2] === "fetch") return w.worker.fetchFails ? answer(128, "", "fatal: could not read from the worker\n") : answer(0);
+    if (bin === "git" && args[2] === "for-each-ref") return answer(0, w.ran.some((l) => l.includes(" fetch ")) ? `${args[4]}HEAD\n${args[4]}heads/main\n` : "");
+    if (bin === "git" && args[2] === "rev-list") return answer(0, w.worker.unpublished ? "deadbeefcafe0123\n" : "");
+    if (bin === "git" && args[2] === "update-ref") return answer(0);
     if (bin === "gh" && args[0] === "api") return w.repo.exists ? answer(0, `${REPO}\n`) : answer(1, "", "gh: Not Found (HTTP 404)\n");
     if (bin === "gh" && args[0] === "repo" && args[1] === "delete") { w.changes.push(line); w.repo.exists = false; return answer(0); }
     if (bin === MAP_SCRIPT) {
@@ -153,6 +160,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       exists,
       read: (path: string) => { const body = files.get(path); if (body === undefined) throw new Error(`ENOENT ${path}`); return body; },
       replace: (path: string, body: string) => { w.changes.push(`replace ${path}`); files.set(path, body); },
+      move: (from: string, to: string) => { w.changes.push(`move ${from} -> ${to}`); move(from, to); },
       remove: (path: string) => { w.changes.push(`remove ${path}`); for (const k of [...files.keys()]) if (k === path || k.startsWith(`${path}/`)) files.delete(k); },
       mtimeMs: (path: string) => (files.has(path) ? mtimes.get(path) ?? NOW : null),
     },
@@ -244,6 +252,43 @@ describe("agentctl cto retire --apply", () => {
     expect(await runCtoCommand([...RETIRE, "--apply"], w.ports)).toBe(1);
     expect(results(w)).toEqual([["idle", "failed"]]);
     expect(w.changes).toEqual([]);
+  });
+});
+
+describe("agentctl cto retire: worker checkouts", () => {
+  const KEPT = `${ARCHIVE}.worker-repo_1`;
+
+  it("moves a worker checkout holding a commit no remote has beside the archived clone, and lists it", async () => {
+    for (const hazard of ["unpublished", "fetchFails"] as const) {
+      const w = makeWorld();
+      w.worker[hazard] = true;
+      expect(await runCtoCommand([...RETIRE, "--apply"], w.ports)).toBe(0);
+      expect(w.changes).not.toContain(`remove ${WORKER}`);
+      expect(w.changes).toContain(`move ${WORKER} -> ${KEPT}`);
+      expect(w.files.get(`${KEPT}/README.md`)).toBe("worker");
+      const step = w.out.find((l) => l["step"] === "worker-checkouts" && l["result"] === "done")!;
+      expect(step["detail"]).toMatchObject({ removed: [], kept: [expect.objectContaining({ path: WORKER, movedTo: KEPT })] });
+      // The archived clone itself is still removed; the worker kept beside it is not inside it.
+      expect(w.changes).toContain(`remove ${ARCHIVE}`);
+    }
+  });
+
+  it("removes a clean worker checkout once its commits are found on the primary clone's remotes", async () => {
+    const w = makeWorld();
+    expect(await runCtoCommand([...RETIRE, "--apply"], w.ports)).toBe(0);
+    expect(w.ran.some((l) => l.startsWith(`git -C ${ARCHIVE} fetch`) && l.includes(WORKER))).toBe(true);
+    expect(w.changes).toContain(`remove ${WORKER}`);
+    expect(w.changes.some((c) => c.startsWith("move "))).toBe(false);
+    // The temporary refs are taken out of the primary clone again.
+    expect(w.ran.some((l) => l === `git -C ${ARCHIVE} update-ref --stdin`)).toBe(true);
+  });
+
+  it("deletes an unpublished worker checkout only when the repository is deleted too", async () => {
+    const w = makeWorld();
+    w.worker.unpublished = true;
+    expect(await runCtoCommand([...RETIRE, "--delete-repo", "--yes-delete-repo", REPO, "--apply"], w.ports)).toBe(0);
+    expect(w.changes).toContain(`remove ${WORKER}`);
+    expect(w.files.has(`${KEPT}/README.md`)).toBe(false);
   });
 });
 

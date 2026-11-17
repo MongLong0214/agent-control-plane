@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { Decision } from "../core/errors.ts";
@@ -51,9 +51,10 @@ export const CTO_USAGE = `agentctl cto — a project CTO's lifecycle on this hos
       wait for an idle CTO, then agentctl project retire (stops the session, releases the binding,
       archives its room, retires its roster route, takes it off the fleet), confirm the session,
       roster map, fleet manifest and tmux session are gone, and remove the worker checkouts and the
-      archived local clone (a clone holding work found nowhere else is kept unless the repository is
-      deleted too). --delete-repo also runs gh repo delete, last; it is irreversible and needs
-      --yes-delete-repo naming the repository exactly
+      archived local clone. Unless the repository is deleted too, a clone holding work found nowhere
+      else is kept: the archived clone in place, a worker checkout moved beside it and listed.
+      --delete-repo also runs gh repo delete, last; it is irreversible and needs --yes-delete-repo
+      naming the repository exactly
 
   Without --apply nothing is changed: the plan is printed, with each step already done or not.
   With --apply each step prints done, skipped or failed, and the first failure stops the run;
@@ -70,6 +71,8 @@ export interface CtoFiles {
   read(path: string): string;
   /** Replaces the file whole (written beside it, then renamed into place). */
   replace(path: string, body: string): void;
+  /** Renames a file or a directory tree to a path that does not exist yet, creating its parent. */
+  move(from: string, to: string): void;
   /** Removes a file or a directory tree. */
   remove(path: string): void;
   mtimeMs(path: string): number | null;
@@ -483,6 +486,38 @@ const localOnlyWork = (ports: CtoPorts, path: string): string | null => {
   return unpushed.stdout.trim() ? `${path} has commits on a local branch that no remote-tracking branch contains` : null;
 };
 
+/**
+ * Why a worker checkout holds work no remote has, or null when it holds none. A worker clone keeps no remote-tracking
+ * refs of its own, so its branches and HEAD are fetched into a temporary namespace of the project's primary clone and
+ * compared there with that clone's remote-tracking refs; the namespace is removed again either way. Anything that
+ * cannot be established answers as unpublished: a worker is only ever removed on a proof that its work is elsewhere.
+ * Remote-tracking refs as last fetched can only make less look published, never more.
+ */
+const unpublishedWork = (ports: CtoPorts, primary: string | null, worker: string, repositoryId: string): string | null => {
+  if (primary === null) return "there is no primary clone to compare its commits with";
+  const namespace = `refs/acp-cto-retire/${repositoryId}/`;
+  const git = (args: string[], input?: string): CtoExecResult =>
+    ports.run("git", ["-C", primary, ...args], { timeoutMs: 120_000, ...(input === undefined ? {} : { input }) });
+  const held = (): string[] => git(["for-each-ref", "--format=%(refname)", namespace]).stdout.split("\n").filter((ref) => ref.startsWith(namespace));
+  const clear = (): void => {
+    const refs = held();
+    if (refs.length > 0) git(["update-ref", "--stdin"], refs.map((ref) => `delete ${ref}\n`).join(""));
+  };
+  try {
+    clear();
+    const fetched = git(["fetch", "--no-tags", "--quiet", worker, `+refs/heads/*:${namespace}heads/*`, `+HEAD:${namespace}HEAD`]);
+    if (fetched.status !== 0) return `its commits could not be read into ${primary}: ${firstLine(fetched.stderr)}`;
+    const refs = held();
+    if (refs.length === 0) return `its commits could not be read into ${primary}`;
+    const ahead = git(["rev-list", "--max-count=1", ...refs, "--not", "--remotes"]);
+    if (ahead.status !== 0) return `its commits could not be compared with ${primary}'s remotes: ${firstLine(ahead.stderr)}`;
+    const commit = ahead.stdout.trim();
+    return commit ? `commit ${commit.slice(0, 12)} is on no remote-tracking branch of ${primary}` : null;
+  } finally {
+    clear();
+  }
+};
+
 const retirePlan = (ports: CtoPorts, record: CtoRecord, options: { reason: string; deleteRepo: string | null }): CtoStep[] => {
   const projectId = record.projectId;
   const clone = cloneOf(record);
@@ -540,20 +575,34 @@ const retirePlan = (ports: CtoPorts, record: CtoRecord, options: { reason: strin
     },
   }, {
     id: "worker-checkouts",
-    plan: "remove the project's worker checkouts under ~/projects/.acp-worker-checkouts, each only if it is the worker clone ACP made from this project's clone",
-    // A worker clone carries no remote-tracking refs, so whether its commits were published cannot be read here: removing it discards any that were not.
+    plan: options.deleteRepo
+      ? "remove the project's worker checkouts under ~/projects/.acp-worker-checkouts, each only if it is the worker clone ACP made from this project's clone"
+      : "remove the project's worker checkouts under ~/projects/.acp-worker-checkouts, each only if it is the worker clone ACP made from this project's clone; one holding a commit the primary clone's remotes do not have is moved beside the archived clone instead, and listed",
     done: () => workerCheckouts().length === 0,
     run: () => {
       if (fresh(ports, projectId)?.retiredAt == null) return refused("the project is not retired yet; its worker checkouts may still be in use");
       const from = cloneOf(fresh(ports, projectId) ?? record);
+      // The project's primary clone: archived by project retire, or still in place.
+      const primary = archive !== null && ports.files.exists(archive) ? archive : from !== null && ports.files.exists(from) ? from : null;
       const removed: string[] = [];
+      const kept: Array<{ path: string; movedTo: string; why: string }> = [];
       for (const path of workerCheckouts()) {
         const madeFrom = ports.run("git", ["-C", path, "config", "--get", "acp.residentClone"], { timeoutMs: 10_000 });
-        if (madeFrom.status !== 0 || madeFrom.stdout.trim() !== from) return refused(`${path} is not a worker clone made from ${from}; it was left as it is`, { removed });
-        ports.files.remove(path);
-        removed.push(path);
+        if (madeFrom.status !== 0 || madeFrom.stdout.trim() !== from) return refused(`${path} is not a worker clone made from ${from}; it was left as it is`, { removed, kept });
+        const repositoryId = basename(path);
+        // The whole repository goes with --delete-repo, so its unpublished work is already given up.
+        const why = options.deleteRepo ? null : unpublishedWork(ports, primary, path, repositoryId);
+        if (why === null) {
+          ports.files.remove(path);
+          removed.push(path);
+          continue;
+        }
+        const movedTo = `${archive ?? join(ports.home, "projects", ".retired", projectId)}.worker-${repositoryId}`;
+        if (ports.files.exists(movedTo)) return refused(`${path} holds work no remote has (${why}) and ${movedTo} already exists; it was left as it is`, { removed, kept });
+        ports.files.move(path, movedTo);
+        kept.push({ path, movedTo, why });
       }
-      return ok({ removed });
+      return ok({ removed, kept });
     },
   }, {
     id: "local-checkout",
@@ -803,6 +852,7 @@ export const createCtoPorts = async (input: {
       exists: existsSync,
       read: (path) => readFileSync(path, "utf8"),
       replace: (path, body) => { const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`; writeFileSync(tmp, body, { mode: 0o600 }); renameSync(tmp, path); },
+      move: (from, to) => { mkdirSync(dirname(to), { recursive: true, mode: 0o700 }); renameSync(from, to); },
       remove: (path) => rmSync(path, { recursive: true, force: true }),
       mtimeMs: (path) => { try { return statSync(path).mtimeMs; } catch { return null; } },
     },
