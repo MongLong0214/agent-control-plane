@@ -24,11 +24,12 @@ import { readHostProvisionerReason, recordedResidentExitStatus } from "../runtim
  *
  * Every mutating subcommand prints its plan and changes nothing unless `--apply` is given. Applied, the steps run in
  * the plan's order; each reports done, skipped (already in the state it brings about) or failed, and the first failure
- * stops the run. Each step's "already done" is read from the world, not from a record of an earlier run, so running
- * the same command again continues where it stopped.
+ * stops the run. Each step's "already done" is read from the world, so running the same command again continues where
+ * it stopped. The one thing kept between runs is a canonical relaunch's target conversation, until it is verified.
  *
- * Operator only. `--apply` needs ACP_OPERATOR_TOKEN, which every CTO launch shell unsets, and none of this is a tool
- * on a CTO's acp-cto surface: a CTO cannot retire or relaunch another.
+ * Operator only. `--apply` needs ACP_OPERATOR_TOKEN, which every CTO launch shell unsets and which the daemon must
+ * authenticate before any step runs, and none of this is a tool on a CTO's acp-cto surface: a CTO cannot retire or
+ * relaunch another.
  */
 
 export const CTO_SUBCOMMANDS = ["list", "add", "relaunch", "retire"] as const;
@@ -46,7 +47,9 @@ export const CTO_USAGE = `agentctl cto — a project CTO's lifecycle on this hos
   agentctl cto relaunch <project> [--handoff <package.json>] [--apply]
       wait for an idle CTO, then restart it with the channel: a resident is stopped (its exact pid)
       and started again by ensure-resident with --resume, the same conversation; a canonical CTO
-      goes through rotate-canonical-cto, which moves it to a new conversation and needs --handoff
+      goes through rotate-canonical-cto, which moves it to a new conversation and needs --handoff;
+      until that conversation is verified on Buzz, a rerun resumes or verifies it and never starts
+      another rotation
   agentctl cto retire <project> --reason <text> [--delete-repo --yes-delete-repo <owner/name>] [--apply]
       wait for an idle CTO, then agentctl project retire (stops the session, releases the binding,
       archives its room, retires its roster route, takes it off the fleet), confirm the session,
@@ -57,6 +60,7 @@ export const CTO_USAGE = `agentctl cto — a project CTO's lifecycle on this hos
       naming the repository exactly
 
   Without --apply nothing is changed: the plan is printed, with each step already done or not.
+  --apply first asks the daemon to authenticate ACP_OPERATOR_TOKEN and refuses if it does not.
   With --apply each step prints done, skipped or failed, and the first failure stops the run;
   running the same command again continues from where it stopped. Output is one JSON object a line.
 `;
@@ -79,7 +83,7 @@ export interface CtoFiles {
 }
 
 /** The operator socket, as `agentctl`'s own client speaks it. */
-export interface CtoOperator { request(method: string, params?: Record<string, unknown>): Promise<Decision<unknown>> }
+export interface CtoOperator { request(method: string, params?: Record<string, unknown>, idempotencyKey?: string): Promise<Decision<unknown>> }
 
 export interface CtoRepository { repositoryId: string; identity: string; checkoutPath: string }
 
@@ -101,7 +105,8 @@ export interface CtoRecord {
   actorId: string | null;
   /** A resident's provisioning: its status and its allocation (with the room the daemon bound). */
   resident: { status: string; allocation: Record<string, unknown> | null } | null;
-  pendingRotation: { toSessionUuid: string; fromGeneration: number } | null;
+  /** The project's latest canonical rotation: pending while `claimedGeneration` is null and it is not revoked. */
+  lastRotation: { toSessionUuid: string; fromGeneration: number; claimedGeneration: number | null; revoked: boolean } | null;
   lastBuzzAt: string | null;
 }
 export interface CtoStateReader {
@@ -325,35 +330,92 @@ const residentLaunchStep = (ports: CtoPorts, projectId: string): CtoStep => ({
   },
 });
 
+/** An unfinished canonical relaunch: the conversation it rotates to, kept until that conversation is verified on Buzz. */
+const relaunchMarkerOf = (ports: CtoPorts, projectId: string): string => join(ports.stateDir, `cto-relaunch-${projectId}.json`);
+const readRelaunchMarker = (ports: CtoPorts, projectId: string): string | null => {
+  const file = relaunchMarkerOf(ports, projectId);
+  if (!ports.files.exists(file)) return null;
+  const to = (JSON.parse(ports.files.read(file)) as { to?: unknown }).to;
+  if (typeof to !== "string" || !UUID.test(to)) throw new Error(`${file} does not name a conversation`);
+  return to;
+};
+const pendingRotationOf = (record: CtoRecord | null): CtoRecord["lastRotation"] =>
+  record?.lastRotation && record.lastRotation.claimedGeneration === null && !record.lastRotation.revoked ? record.lastRotation : null;
+/** A rotation whose conversation holds the role now. */
+const claimedByHolder = (record: CtoRecord | null): CtoRecord["lastRotation"] =>
+  record?.lastRotation && record.lastRotation.claimedGeneration !== null && !record.lastRotation.revoked && record.lastRotation.toSessionUuid === record.conversation
+    ? record.lastRotation : null;
+
+/** The conversation a canonical relaunch rotates to: an unfinished relaunch's, a pending switchover's, else a new one. */
+const canonicalTarget = (ports: CtoPorts, record: CtoRecord | null, projectId: string): string =>
+  readRelaunchMarker(ports, projectId) ?? pendingRotationOf(record)?.toSessionUuid ?? ports.newUuid();
+
+/**
+ * rotate-canonical-cto's own verification, read again: `to` holds the role at the claimed generation, and the daemon's
+ * Buzz subscriber for it is connected, live and delivering to it, with the ingress listening.
+ */
+const VERIFY_WAIT_MS = 120_000;
+const verifyRotation = async (ports: CtoPorts, projectId: string, to: string, generation: number, waitMs: number): Promise<Outcome> => {
+  interface Status { holderSessionUuid?: string; binding?: { generation?: number; sessionId?: string }; buzz?: { verdict?: string; sessionId?: string; reception?: { subscriber?: { connected?: boolean; liveness?: string; delivering?: boolean }; ingress?: { listening?: boolean } } } }
+  let seen: Status | null = null;
+  for (const deadline = ports.now() + waitMs; ;) {
+    const answer = await ports.operator.request("canonicalCto.status", { projectId });
+    seen = answer.allowed ? answer.value as Status : seen;
+    const buzz = seen?.buzz;
+    if (seen?.holderSessionUuid === to && seen.binding?.generation === generation && buzz?.verdict === "ADMITTED" && buzz.sessionId === seen.binding.sessionId &&
+      buzz.reception?.subscriber?.connected === true && buzz.reception.subscriber.liveness === "LIVE" && buzz.reception.subscriber.delivering === true &&
+      buzz.reception.ingress?.listening === true) return ok({ verified: to, generation });
+    if (ports.now() >= deadline) {
+      return refused(`conversation ${to} holds the role at generation ${generation} and is not verified on Buzz; no other rotation was started`, { buzz: seen?.buzz ?? null });
+    }
+    await ports.sleep(2_000);
+  }
+};
+
 /**
  * The canonical CTO's launcher, called as it is. It refuses before touching anything when the project's room, Buzz
  * identity or key disagree, stops the old conversation only at a safe boundary, and starts the new one with the
- * channel. A switchover it left pending is resumed by handing it the same conversation again.
+ * channel. A relaunch is one rotation to one conversation: its target is kept until that conversation is verified, so
+ * a rerun resumes a pending switchover or verifies a claimed one, and never starts a second rotation.
  */
 const rotateStep = (ports: CtoPorts, projectId: string, handoff: string | null, to: string): CtoStep => ({
   id: "rotate",
-  plan: `run rotate-canonical-cto to move the canonical CTO to conversation ${to}: it fences and stops the old conversation at a safe boundary, starts the new one in tmux session cto-${projectId}-${to.slice(0, 8)} with the acp-buzz-channel, and verifies its claim and Buzz delivery`,
-  done: () => {
+  plan: `move the canonical CTO to conversation ${to}: an unfinished relaunch or a pending switchover to it is resumed, and once ${to} has claimed the role it is only verified on Buzz, never rotated again; otherwise rotate-canonical-cto fences and stops the old conversation at a safe boundary, starts ${to} in tmux session cto-${projectId}-${to.slice(0, 8)} with the acp-buzz-channel, and verifies its claim and Buzz delivery`,
+  run: async () => {
+    const marker = relaunchMarkerOf(ports, projectId);
     const record = fresh(ports, projectId);
-    return record?.conversation === to && conversationProcesses(ports, to).some((p) => carriesChannel(p.command));
-  },
-  run: () => {
+    if (!record) return refused("the project is not registered");
+    const unfinished = readRelaunchMarker(ports, projectId) === to;
+    const claimed = claimedByHolder(record);
+    if (claimed && (unfinished || claimed.toSessionUuid === to)) {
+      const verified = await verifyRotation(ports, projectId, claimed.toSessionUuid, claimed.claimedGeneration!, VERIFY_WAIT_MS);
+      if (verified.ok) ports.files.remove(marker);
+      return verified;
+    }
+    // A rotation another run left claimed and unverified is that rotation's to finish, not a reason to start another.
+    if (claimed && !unfinished) {
+      const now = await verifyRotation(ports, projectId, claimed.toSessionUuid, claimed.claimedGeneration!, 0);
+      if (!now.ok) return now;
+    }
     if (!handoff) return refused("--handoff <package.json> is required: rotate-canonical-cto starts the new conversation from that handoff package");
     if (!ports.scripts.rotate) return refused("rotate-canonical-cto.mjs was not found (set ACP_ROTATE_CANONICAL_CTO)");
-    const record = fresh(ports, projectId);
-    if (!record || record.generation === null) return refused("the project's PRIMARY_CTO role is unbound: rotate-canonical-cto moves a CTO that holds it");
+    if (record.generation === null) return refused("the project's PRIMARY_CTO role is unbound: rotate-canonical-cto moves a CTO that holds it");
     const old = conversationProcesses(ports, record.conversation);
     if (old.length > 1) return refused(`${old.length} processes run conversation ${record.conversation}; nothing was started`);
     const cwd = record.session?.workdir ?? cloneOf(record);
     if (!cwd) return refused("the CTO's working directory is not recorded");
-    const expected = record.pendingRotation?.toSessionUuid === to ? record.pendingRotation.fromGeneration : record.generation;
+    const pending = pendingRotationOf(record);
+    const expected = pending?.toSessionUuid === to ? pending.fromGeneration : record.generation;
+    // Recorded before the launcher runs, so whatever it leaves behind is resumed with this same conversation.
+    if (!unfinished) ports.files.replace(marker, `${JSON.stringify({ to })}\n`);
     const answer = ports.run(ports.node, [ports.scripts.rotate,
       "--project", projectId, "--to", to, "--expected-generation", String(expected), "--cwd", cwd,
       "--old-pid", String(old[0]?.pid ?? record.session?.pid ?? 0), "--tmux-session", `cto-${projectId}-${to.slice(0, 8)}`, "--handoff", handoff,
     ], { env: scriptEnv(ports), timeoutMs: 600_000 });
     const last = lastJsonLine(answer.stdout) ?? {};
-    if (answer.status !== 0) return refused(`rotate-canonical-cto exited ${answer.status ?? "on timeout"} at its ${String(last["step"] ?? "first")} step`, last);
-    return ok(last);
+    if (answer.status !== 0) return refused(`rotate-canonical-cto exited ${answer.status ?? "on timeout"} at its ${String(last["step"] ?? "first")} step; run this again to continue with conversation ${to}`, last);
+    ports.files.remove(marker);
+    return ok({ to, ...last });
   },
 });
 
@@ -431,7 +493,9 @@ const addPlan = (ports: CtoPorts, projectId: string, options: { repo: string | n
         const cloned = ports.run("gh", ["repo", "clone", options.repo, checkout], { timeoutMs: 300_000 });
         if (cloned.status !== 0) return refused(`gh repo clone ${options.repo} failed: ${firstLine(cloned.stderr)}`);
       }
-      const registered = await ports.operator.request("project.register", { name: projectId, checkoutPath: checkout, projectId });
+      // A fresh key per attempt: the client's default key is derived from the parameters, so the daemon would replay a
+      // refusal it once gave (a transient one included) to every rerun. Whether it is already done is read from the state.
+      const registered = await ports.operator.request("project.register", { name: projectId, checkoutPath: checkout, projectId }, `cto:${ports.newUuid()}`);
       return registered.allowed ? ok({ checkout }) : refused(`project register refused: ${registered.message}`, { reasonCode: registered.reasonCode });
     },
   }, {
@@ -463,7 +527,7 @@ const addPlan = (ports: CtoPorts, projectId: string, options: { repo: string | n
   }, rosterStep(ports, projectId), channelMapStep(ports, projectId, true)];
   if (options.canonical) {
     const record = fresh(ports, projectId);
-    steps.push(rotateStep(ports, projectId, options.handoff, record?.pendingRotation?.toSessionUuid ?? ports.newUuid()));
+    steps.push(rotateStep(ports, projectId, options.handoff, canonicalTarget(ports, record, projectId)));
   } else {
     steps.push(residentLaunchStep(ports, projectId));
   }
@@ -473,31 +537,46 @@ const addPlan = (ports: CtoPorts, projectId: string, options: { repo: string | n
 const relaunchPlan = (ports: CtoPorts, record: CtoRecord, handoff: string | null): CtoStep[] => {
   const projectId = record.projectId;
   if (record.kind === "resident") return [idleStep(ports, projectId), stopStep(ports, projectId), residentLaunchStep(ports, projectId)];
-  return [idleStep(ports, projectId), rotateStep(ports, projectId, handoff, record.pendingRotation?.toSessionUuid ?? ports.newUuid())];
+  return [idleStep(ports, projectId), rotateStep(ports, projectId, handoff, canonicalTarget(ports, record, projectId))];
 };
 
-/** Neither the worker clones nor the archive are removed while they hold something no remote has, unless the repo goes too. */
-const localOnlyWork = (ports: CtoPorts, path: string): string | null => {
-  const status = ports.run("git", ["-C", path, "status", "--porcelain=v1"], { timeoutMs: 30_000 });
-  if (status.status !== 0) return `git status failed in ${path}: ${firstLine(status.stderr)}`;
-  if (status.stdout.trim()) return `${path} has uncommitted changes`;
-  const unpushed = ports.run("git", ["-C", path, "log", "--branches", "--not", "--remotes", "--format=%H", "-n", "1"], { timeoutMs: 30_000 });
-  if (unpushed.status !== 0) return `git log failed in ${path}: ${firstLine(unpushed.stderr)}`;
-  return unpushed.stdout.trim() ? `${path} has commits on a local branch that no remote-tracking branch contains` : null;
+/** The temporary namespace a worker's refs are fetched into, in the project's primary clone. Never counted as work. */
+const RETIRE_REFS = "refs/acp-cto-retire/";
+
+/** Uncommitted changes or untracked files, or null; a tree that cannot be read counts as holding work. */
+const dirtyTree = (run: CtoExec, path: string): string | null => {
+  const status = run("git", ["-C", path, "status", "--porcelain=v1", "--untracked-files=all"], { timeoutMs: 60_000 });
+  if (status.status !== 0) return `${path}'s working tree could not be read: ${firstLine(status.stderr)}`;
+  return status.stdout.trim() ? `${path} has uncommitted or untracked files` : null;
 };
 
 /**
- * Why a worker checkout holds work no remote has, or null when it holds none. A worker clone keeps no remote-tracking
- * refs of its own, so its branches and HEAD are fetched into a temporary namespace of the project's primary clone and
- * compared there with that clone's remote-tracking refs; the namespace is removed again either way. Anything that
- * cannot be established answers as unpublished: a worker is only ever removed on a proof that its work is elsewhere.
- * Remote-tracking refs as last fetched can only make less look published, never more.
+ * Why a checkout holds work no remote has, or null only on proof that it holds none: its tree is clean, and every
+ * commit reachable from HEAD or any of its refs (`--all`, stash and private refs included) is contained in its
+ * remote-tracking refs. Neither the archive nor a worker is removed while this answers, unless the repository goes too.
  */
-const unpublishedWork = (ports: CtoPorts, primary: string | null, worker: string, repositoryId: string): string | null => {
+export const checkoutHeldWork = (run: CtoExec, path: string): string | null => {
+  const dirty = dirtyTree(run, path);
+  if (dirty) return dirty;
+  const ahead = run("git", ["-C", path, "rev-list", "--max-count=1", `--exclude=${RETIRE_REFS}*`, "--all", "--not", "--remotes"], { timeoutMs: 120_000 });
+  if (ahead.status !== 0) return `${path}'s commits could not be compared with its remotes: ${firstLine(ahead.stderr)}`;
+  const commit = ahead.stdout.trim();
+  return commit ? `commit ${commit.slice(0, 12)} is on no remote-tracking branch of ${path}` : null;
+};
+
+/**
+ * The same question for a worker checkout. A worker clone keeps no remote-tracking refs of its own, so its HEAD and
+ * every one of its refs are fetched into a temporary namespace of the project's primary clone and compared there with
+ * that clone's remote-tracking refs; the namespace is removed again either way. Anything that cannot be established
+ * answers as held work. Remote-tracking refs as last fetched can only make less look published, never more.
+ */
+export const workerHeldWork = (run: CtoExec, primary: string | null, worker: string, repositoryId: string): string | null => {
+  const dirty = dirtyTree(run, worker);
+  if (dirty) return dirty;
   if (primary === null) return "there is no primary clone to compare its commits with";
-  const namespace = `refs/acp-cto-retire/${repositoryId}/`;
+  const namespace = `${RETIRE_REFS}${repositoryId}/`;
   const git = (args: string[], input?: string): CtoExecResult =>
-    ports.run("git", ["-C", primary, ...args], { timeoutMs: 120_000, ...(input === undefined ? {} : { input }) });
+    run("git", ["-C", primary, ...args], { timeoutMs: 120_000, ...(input === undefined ? {} : { input }) });
   const held = (): string[] => git(["for-each-ref", "--format=%(refname)", namespace]).stdout.split("\n").filter((ref) => ref.startsWith(namespace));
   const clear = (): void => {
     const refs = held();
@@ -505,7 +584,7 @@ const unpublishedWork = (ports: CtoPorts, primary: string | null, worker: string
   };
   try {
     clear();
-    const fetched = git(["fetch", "--no-tags", "--quiet", worker, `+refs/heads/*:${namespace}heads/*`, `+HEAD:${namespace}HEAD`]);
+    const fetched = git(["fetch", "--no-tags", "--quiet", worker, `+refs/*:${namespace}*`, `+HEAD:${namespace}HEAD`]);
     if (fetched.status !== 0) return `its commits could not be read into ${primary}: ${firstLine(fetched.stderr)}`;
     const refs = held();
     if (refs.length === 0) return `its commits could not be read into ${primary}`;
@@ -544,7 +623,8 @@ const retirePlan = (ports: CtoPorts, record: CtoRecord, options: { reason: strin
     plan: `agentctl project retire ${projectId}: ACP cancels the project's runs, stops the session, archives its Buzz room, retires its roster route, takes it off the fleet, moves its clone to ~/projects/.retired, and releases the PRIMARY_CTO binding`,
     done: () => fresh(ports, projectId)?.retiredAt != null,
     run: async () => {
-      const retired = await ports.operator.request("project.retire", { projectId, reason: options.reason });
+      // A fresh key per attempt, as for project.register: a rerun asks the daemon again rather than reading its old answer.
+      const retired = await ports.operator.request("project.retire", { projectId, reason: options.reason }, `cto:${ports.newUuid()}`);
       if (retired.allowed) return ok();
       const order = retired.evidence["requiredOrder"];
       return refused(`project retire refused: ${retired.message}`, { reasonCode: retired.reasonCode, ...(Array.isArray(order) ? { requiredOrder: order } : {}) });
@@ -577,7 +657,7 @@ const retirePlan = (ports: CtoPorts, record: CtoRecord, options: { reason: strin
     id: "worker-checkouts",
     plan: options.deleteRepo
       ? "remove the project's worker checkouts under ~/projects/.acp-worker-checkouts, each only if it is the worker clone ACP made from this project's clone"
-      : "remove the project's worker checkouts under ~/projects/.acp-worker-checkouts, each only if it is the worker clone ACP made from this project's clone; one holding a commit the primary clone's remotes do not have is moved beside the archived clone instead, and listed",
+      : "remove the project's worker checkouts under ~/projects/.acp-worker-checkouts, each only if it is the worker clone ACP made from this project's clone; one with uncommitted or untracked files, or a commit on HEAD or any ref that the primary clone's remotes do not have, is moved beside the archived clone instead, and listed",
     done: () => workerCheckouts().length === 0,
     run: () => {
       if (fresh(ports, projectId)?.retiredAt == null) return refused("the project is not retired yet; its worker checkouts may still be in use");
@@ -591,7 +671,7 @@ const retirePlan = (ports: CtoPorts, record: CtoRecord, options: { reason: strin
         if (madeFrom.status !== 0 || madeFrom.stdout.trim() !== from) return refused(`${path} is not a worker clone made from ${from}; it was left as it is`, { removed, kept });
         const repositoryId = basename(path);
         // The whole repository goes with --delete-repo, so its unpublished work is already given up.
-        const why = options.deleteRepo ? null : unpublishedWork(ports, primary, path, repositoryId);
+        const why = options.deleteRepo ? null : workerHeldWork(ports.run, primary, path, repositoryId);
         if (why === null) {
           ports.files.remove(path);
           removed.push(path);
@@ -615,7 +695,7 @@ const retirePlan = (ports: CtoPorts, record: CtoRecord, options: { reason: strin
       if (fresh(ports, projectId)?.retiredAt == null) return refused("the project is not retired yet: its clone is still its CTO's");
       if (archive === null || !ports.files.exists(archive)) return ok();
       if (!options.deleteRepo) {
-        const held = localOnlyWork(ports, archive);
+        const held = checkoutHeldWork(ports.run, archive);
         if (held) return refused(`${held}; push it or move it aside, or delete the repository too (--delete-repo)`);
       }
       ports.files.remove(archive);
@@ -709,8 +789,14 @@ export const runCtoCommand = async (args: readonly string[], ports: CtoPorts): P
   if (positional.length !== 1 || !PROJECT_ID.test(positional[0]!)) return refuse(ports, `cto ${sub} takes exactly one project id`);
   const projectId = positional[0]!;
   const apply = flags.has("--apply");
-  // Operator only: a CTO's launch shell unsets ACP_OPERATOR_TOKEN, so a CTO cannot apply any of these.
+  // Operator only: a CTO's launch shell unsets ACP_OPERATOR_TOKEN, so a CTO cannot apply any of these. A token that is
+  // merely set proves nothing, and several steps change the host without the daemon, so before any of them the daemon
+  // must authenticate it: one read-only request over the operator socket. Every --apply asks, cleanup-only reruns included.
   if (apply && !ports.env["ACP_OPERATOR_TOKEN"]) return refuse(ports, "--apply is operator only and needs ACP_OPERATOR_TOKEN; nothing was changed");
+  if (apply) {
+    const authenticated = await ports.operator.request("daemon.status", {});
+    if (!authenticated.allowed) return refuse(ports, `--apply is operator only: the daemon did not authenticate this credential (${authenticated.reasonCode}); nothing was changed`);
+  }
   const rerun = `agentctl cto ${args.map((a) => (/^[A-Za-z0-9._/:=@-]+$/.test(a) ? a : JSON.stringify(a))).join(" ")}`;
   const record = fresh(ports, projectId);
 
@@ -784,9 +870,11 @@ export const openCtoState = async (databasePath: string): Promise<CtoStateReader
     const claimed = get<{ sessionUuid: string; actorId: string; room: string }>(
       `SELECT to_session_uuid AS sessionUuid, buzz_actor_id AS actorId, buzz_address AS room FROM canonical_entitlement_transfers
         WHERE project_id = ? AND claimed_at IS NOT NULL ORDER BY claimed_binding_generation DESC, claimed_at DESC, transfer_id DESC LIMIT 1`, id);
-    const pending = get<{ toSessionUuid: string; fromGeneration: number }>(
-      `SELECT t.to_session_uuid AS toSessionUuid, r.from_generation AS fromGeneration FROM canonical_entitlement_transfers t
-         JOIN canonical_cto_rotations r ON r.transfer_id = t.transfer_id WHERE t.project_id = ? AND t.claimed_at IS NULL AND t.revoked_at IS NULL`, id);
+    const rotation = get<{ toSessionUuid: string; fromGeneration: number; claimedGeneration: number | null; revoked: number }>(
+      `SELECT t.to_session_uuid AS toSessionUuid, r.from_generation AS fromGeneration, t.claimed_binding_generation AS claimedGeneration,
+              t.revoked_at IS NOT NULL AS revoked
+         FROM canonical_entitlement_transfers t JOIN canonical_cto_rotations r ON r.transfer_id = t.transfer_id
+        WHERE t.project_id = ? ORDER BY t.created_at DESC, t.transfer_id DESC LIMIT 1`, id);
     const provisioning = get<{ status: string; allocation: string; steps: string }>(
       `SELECT status, allocation_json AS allocation, steps_json AS steps FROM resident_project_provisioning
         WHERE project_id = ? ORDER BY status = 'RETIRED', updated_at DESC, run_id DESC LIMIT 1`, id);
@@ -813,7 +901,7 @@ export const openCtoState = async (databasePath: string): Promise<CtoStateReader
       room,
       actorId: claimed?.actorId ?? entitlement?.actorId ?? null,
       resident: provisioning ? { status: provisioning.status, allocation } : null,
-      pendingRotation: pending ?? null,
+      lastRotation: rotation ? { ...rotation, revoked: rotation.revoked === 1 } : null,
       lastBuzzAt: typeof last?.at === "number" ? new Date(last.at * 1000).toISOString() : null,
     };
   };
@@ -826,19 +914,22 @@ export const openCtoState = async (databasePath: string): Promise<CtoStateReader
   };
 };
 
+/** Subprocesses as the command runs them on the host: bounded, no shell, stdout and stderr captured. */
+export const hostRunner = (env: Readonly<Record<string, string | undefined>>): CtoExec => (bin, args, options = {}) => {
+  const result = spawnSync(bin, [...args], {
+    encoding: "utf8", timeout: options.timeoutMs ?? 30_000, maxBuffer: 8_000_000, cwd: options.cwd,
+    env: (options.env ?? env) as NodeJS.ProcessEnv, ...(options.input !== undefined ? { input: options.input } : { stdio: ["ignore", "pipe", "pipe"] }),
+  });
+  return { status: result.error ? null : result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? (result.error ? String(result.error.message) : "") };
+};
+
 export const createCtoPorts = async (input: {
   databasePath: string; operator: CtoOperator; env: Readonly<Record<string, string | undefined>>;
 }): Promise<CtoPorts> => {
   const stateDir = join(input.databasePath, "..");
   const home = input.env["HOME"] ?? "";
   const env = { ...input.env, ...launcherPins(stateDir, input.env) };
-  const runner: CtoExec = (bin, args, options = {}) => {
-    const result = spawnSync(bin, [...args], {
-      encoding: "utf8", timeout: options.timeoutMs ?? 30_000, maxBuffer: 8_000_000, cwd: options.cwd,
-      env: (options.env ?? env) as NodeJS.ProcessEnv, ...(options.input !== undefined ? { input: options.input } : { stdio: ["ignore", "pipe", "pipe"] }),
-    });
-    return { status: result.error ? null : result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? (result.error ? String(result.error.message) : "") };
-  };
+  const runner = hostRunner(env);
   return {
     home, stateDir, databasePath: input.databasePath, env, operator: input.operator, run: runner,
     state: await openCtoState(input.databasePath),

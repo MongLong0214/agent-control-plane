@@ -4,14 +4,16 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { main } from "../../src/cli/agentctl.ts";
 import {
-  CTO_SUBCOMMANDS, IDLE_SECONDS, runCtoCommand,
-  type CtoExecOptions, type CtoExecResult, type CtoPorts, type CtoProcess, type CtoRecord,
+  CTO_SUBCOMMANDS, IDLE_SECONDS, checkoutHeldWork, hostRunner, runCtoCommand, workerHeldWork,
+  type CtoExec, type CtoExecOptions, type CtoExecResult, type CtoPorts, type CtoProcess, type CtoRecord,
 } from "../../src/cli/cto-command.ts";
 import { allow, deny, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText } from "../../src/runtime/host-provisioner-reason.ts";
-import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, gitSync, tempDir } from "../helpers/fixtures.ts";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
@@ -61,6 +63,18 @@ interface World {
   operatorAnswers: Array<(method: string) => Decision<unknown> | null>;
   provisionerAnswers: Array<(operation: string) => CtoExecResult | null>;
   mtimes: Map<string, number>;
+  /** Paths whose `git status` shows uncommitted or untracked files. */
+  dirty: Set<string>;
+  /** The archived clone holds a commit (on any ref, HEAD included) its remotes do not. */
+  archiveUnpublished: boolean;
+  /** The daemon refuses the credential (a token that is set but is not the operator's). */
+  daemonRejects: boolean;
+  /** How many times the daemon actually executed `project.retire`; a replayed cached answer is not one. */
+  retireExecutions: number;
+  /** The canonical CTO's Buzz delivery as `canonicalCto.status` reports it. */
+  buzzVerified: boolean;
+  rotateRuns: string[];
+  rotateAnswers: Array<(to: string) => CtoExecResult>;
 }
 
 const results = (w: World): Array<[string, string]> => w.out.filter((l) => typeof l["result"] === "string" && typeof l["step"] === "string").map((l) => [l["step"] as string, l["result"] as string]);
@@ -76,6 +90,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
   const mtimes = new Map([[TRANSCRIPT, NOW - (IDLE_SECONDS + 60) * 1000]]);
   const w = {
     out: [], changes: [], ran: [], files, mtimes, tmux: new Set([TMUX]), repo: { exists: true }, worker: { unpublished: false, fetchFails: false }, operatorAnswers: [], provisionerAnswers: [],
+    dirty: new Set<string>(), archiveUnpublished: false, daemonRejects: false, retireExecutions: 0, buzzVerified: true, rotateRuns: [], rotateAnswers: [],
     procs: [
       { pid: 100, ppid: 1, command: "/bin/sh /state/resident-e2e-sort-fixture.sh" },
       { pid: CLAUDE, ppid: 100, command: `/bin/claude --model opus ${CHANNEL} --resume ${CONVERSATION} --name e2e CTO` },
@@ -87,7 +102,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       repositories: [{ repositoryId: "repo_1", identity: `github:${REPO}`, checkoutPath: WORKER }],
       conversation: CONVERSATION, generation: 3, session: { pid: CLAUDE, startedAt: "t", workdir: CLONE },
       room: ROOM, actorId: ACTOR, resident: { status: "COMPLETE", allocation: { projectId: P, sessionUuid: CONVERSATION, clonePath: CLONE, roomId: ROOM } },
-      pendingRotation: null, lastBuzzAt: null, ...overrides,
+      lastRotation: null, lastBuzzAt: null, ...overrides,
     },
   } as unknown as World;
   const exists = (path: string): boolean => files.has(path) || [...files.keys()].some((k) => k.startsWith(`${path}/`));
@@ -105,6 +120,14 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     move(CLONE, ARCHIVE);
     return allow(ReasonCode.OK, { projectId: P });
   };
+  const daemonCache = new Map<string, Decision<unknown>>();
+  let clock = NOW;
+  let uuids = 0;
+  const canonicalStatus = (): Record<string, unknown> => ({
+    holderSessionUuid: w.record.conversation, generation: w.record.generation,
+    binding: { generation: w.record.generation, sessionId: "ses_holder", lifecycle: "READY", liveRuns: [] },
+    buzz: { verdict: "ADMITTED", sessionId: "ses_holder", reception: { subscriber: { connected: w.buzzVerified, liveness: w.buzzVerified ? "LIVE" : "STALE", delivering: w.buzzVerified }, ingress: { listening: true } } },
+  });
   const subprocess = (bin: string, args: readonly string[], options: CtoExecOptions = {}): CtoExecResult => {
     const line = [bin, ...args].join(" ");
     w.ran.push(line);
@@ -112,13 +135,16 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     if (bin === "tmux" && args[0] === "list-panes") return answer(0, `100 ${TMUX}\n`);
     if (bin === "tmux" && args[0] === "has-session") return answer(w.tmux.has(args[2]!.slice(1)) ? 0 : 1);
     if (bin === "tmux" && args[0] === "kill-session") { w.changes.push(line); w.tmux.delete(args[2]!.slice(1)); return answer(0); }
-    if (bin === "git" && args[2] === "status") return answer(0, "");
+    if (bin === "git" && args[2] === "status") return answer(0, w.dirty.has(args[1]!) ? "?? scratch.txt\n" : "");
     if (bin === "git" && args[2] === "log") return answer(0, "");
     if (bin === "git" && args[2] === "config") return answer(0, `${CLONE}\n`);
     // The worker's branches and HEAD, fetched into a namespace of the primary clone and compared with its remotes.
     if (bin === "git" && args[2] === "fetch") return w.worker.fetchFails ? answer(128, "", "fatal: could not read from the worker\n") : answer(0);
     if (bin === "git" && args[2] === "for-each-ref") return answer(0, w.ran.some((l) => l.includes(" fetch ")) ? `${args[4]}HEAD\n${args[4]}heads/main\n` : "");
-    if (bin === "git" && args[2] === "rev-list") return answer(0, w.worker.unpublished ? "deadbeefcafe0123\n" : "");
+    if (bin === "git" && args[2] === "rev-list") {
+      const unpublished = args.includes("--all") ? w.archiveUnpublished : w.worker.unpublished;
+      return answer(0, unpublished ? "deadbeefcafe0123\n" : "");
+    }
     if (bin === "git" && args[2] === "update-ref") return answer(0);
     if (bin === "gh" && args[0] === "api") return w.repo.exists ? answer(0, `${REPO}\n`) : answer(1, "", "gh: Not Found (HTTP 404)\n");
     if (bin === "gh" && args[0] === "repo" && args[1] === "delete") { w.changes.push(line); w.repo.exists = false; return answer(0); }
@@ -138,17 +164,30 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
       }
       return answer(0, "{}");
     }
-    if (bin === "/node" && args[0] === "/rotate.mjs") { w.changes.push(line); return answer(0, `${JSON.stringify({ step: "verify", generation: 27 })}\n`); }
+    if (bin === "/node" && args[0] === "/rotate.mjs") {
+      w.changes.push(line);
+      const to = args[args.indexOf("--to") + 1]!;
+      w.rotateRuns.push(to);
+      return w.rotateAnswers.shift()?.(to) ?? answer(0, `${JSON.stringify({ step: "verify", generation: 27 })}\n`);
+    }
     throw new Error(`unexpected subprocess: ${line}`);
   };
   w.ports = {
     home: HOME, stateDir: STATE, databasePath: `${STATE}/state.sqlite`, env,
     operator: {
-      request: async (method: string) => {
+      // The daemon: it authenticates every request, answers reads, and replays a mutation's answer for a key it has seen.
+      request: async (method: string, params: Record<string, unknown> = {}, idempotencyKey?: string) => {
+        if (w.daemonRejects) return deny(ReasonCode.OPERATOR_UNAUTHENTICATED, "operator authentication failed");
+        if (method === "daemon.status") return allow(ReasonCode.OK, { mode: "RUNNING" });
+        if (method === "canonicalCto.status") return allow(ReasonCode.OK, canonicalStatus());
+        const key = idempotencyKey ?? `operator:${JSON.stringify({ method, params })}`;
+        const cached = daemonCache.get(key);
+        if (cached) return cached;
         w.changes.push(`operator ${method}`);
-        const scripted = w.operatorAnswers.shift()?.(method);
-        if (scripted) return scripted;
-        return method === "project.retire" ? retire() : allow(ReasonCode.OK, {});
+        if (method === "project.retire") w.retireExecutions++;
+        const answered = w.operatorAnswers.shift()?.(method) ?? (method === "project.retire" ? retire() : allow(ReasonCode.OK, {}));
+        daemonCache.set(key, answered);
+        return answered;
       },
     },
     state: { projects: () => (w.record.retiredAt ? [] : [structuredClone(w.record)]), project: (id: string) => (id === P ? structuredClone(w.record) : null) },
@@ -166,7 +205,7 @@ const makeWorld = (overrides: Partial<CtoRecord> = {}, env: Record<string, strin
     },
     // A fake key file holds its own public key.
     publicKeyOf: (keyFile: string) => files.get(keyFile) ?? null,
-    now: () => NOW, sleep: async () => {}, newUuid: () => "99999999-8888-4777-8666-555555555555",
+    now: () => clock, sleep: async (ms: number) => { clock += ms; }, newUuid: () => `99999999-8888-4777-8666-${String(++uuids).padStart(12, "5")}`,
     write: (line: Record<string, unknown>) => { w.out.push(line); },
     node: "/node", scripts: { provisioner: "/prov.mjs", rotate: "/rotate.mjs" },
   };
@@ -239,8 +278,7 @@ describe("agentctl cto retire --apply", () => {
 
   it("keeps an archived clone holding work no remote has, and stops before anything after it", async () => {
     const w = makeWorld();
-    const original = w.ports.run;
-    w.ports.run = (bin, args, options) => (bin === "git" && args[2] === "log" ? { status: 0, stdout: "abc123\n", stderr: "" } : original(bin, args, options));
+    w.archiveUnpublished = true;
     expect(await runCtoCommand([...RETIRE, "--apply"], w.ports)).toBe(1);
     expect(results(w).at(-1)).toEqual(["local-checkout", "failed"]);
     expect(w.files.has(`${ARCHIVE}/README.md`)).toBe(true);
@@ -352,7 +390,135 @@ describe("agentctl cto relaunch", () => {
     expect(w.changes).toEqual([]);
     w.out.length = 0;
     expect(await runCtoCommand(["relaunch", P, "--handoff", "/h.json", "--apply"], w.ports)).toBe(0);
-    expect(w.changes).toEqual([`/node /rotate.mjs --project ${P} --to 99999999-8888-4777-8666-555555555555 --expected-generation 26 --cwd ${CLONE} --old-pid ${CLAUDE} --tmux-session cto-${P}-99999999 --handoff /h.json`]);
+    const [to] = w.rotateRuns;
+    expect(to).toMatch(/^[0-9a-f-]{36}$/);
+    expect(w.changes.filter((c) => c.startsWith("/node"))).toEqual([`/node /rotate.mjs --project ${P} --to ${to} --expected-generation 26 --cwd ${CLONE} --old-pid ${CLAUDE} --tmux-session cto-${P}-${to!.slice(0, 8)} --handoff /h.json`]);
+  });
+});
+
+describe("review r1", () => {
+  it("1: moves and lists a worker checkout with uncommitted or untracked files instead of deleting it", async () => {
+    const w = makeWorld();
+    w.dirty.add(WORKER);
+    expect(await runCtoCommand([...RETIRE, "--apply"], w.ports)).toBe(0);
+    expect(w.changes).not.toContain(`remove ${WORKER}`);
+    expect(w.changes).toContain(`move ${WORKER} -> ${ARCHIVE}.worker-repo_1`);
+    const step = w.out.find((l) => l["step"] === "worker-checkouts" && l["result"] === "done")!;
+    expect(step["detail"]).toMatchObject({ kept: [expect.objectContaining({ path: WORKER, why: expect.stringContaining("uncommitted or untracked") })] });
+  });
+
+  it("1: keeps an archived clone with untracked files", async () => {
+    const w = makeWorld();
+    w.dirty.add(ARCHIVE);
+    expect(await runCtoCommand([...RETIRE, "--apply"], w.ports)).toBe(1);
+    expect(results(w).at(-1)).toEqual(["local-checkout", "failed"]);
+    expect(w.files.has(`${ARCHIVE}/README.md`)).toBe(true);
+  });
+
+  it("3: refuses --apply before any step when the daemon does not authenticate the credential, cleanup-only reruns included", async () => {
+    const retired = { retiredAt: new Date(NOW).toISOString(), generation: null, session: null };
+    for (const [args, overrides] of [[[...RETIRE, "--apply"], {}], [["relaunch", P, "--apply"], {}], [["add", P, "--apply"], {}], [[...RETIRE, "--apply"], retired]] as const) {
+      const w = makeWorld(overrides, { ACP_OPERATOR_TOKEN: "set-but-not-the-operator-token" });
+      w.daemonRejects = true;
+      expect(await runCtoCommand([...args], w.ports)).toBe(2);
+      expect(w.out).toEqual([expect.objectContaining({ nothingChanged: true })]);
+      expect(w.changes).toEqual([]);
+      expect(w.ran).toEqual([]);
+    }
+  });
+
+  it("4: a transient refusal of project retire is asked again on the rerun, not replayed", async () => {
+    const w = makeWorld();
+    w.operatorAnswers.push(() => deny(ReasonCode.CONFLICT, "host retirement refused: provisioner busy; nothing was changed"));
+    expect(await runCtoCommand([...RETIRE, "--apply"], w.ports)).toBe(1);
+    expect(w.retireExecutions).toBe(1);
+    expect(await runCtoCommand([...RETIRE, "--apply"], w.ports)).toBe(0);
+    expect(w.retireExecutions).toBe(2);
+    expect(w.record.retiredAt).not.toBeNull();
+  });
+
+  it("5: a canonical relaunch whose rotation was claimed but not verified verifies that target on a rerun, and never starts another", async () => {
+    const w = makeWorld({ kind: "canonical", resident: null, generation: 26 });
+    w.rotateAnswers.push((to) => {
+      // rotate-canonical-cto's exit 3: the new conversation claimed generation 27, and its Buzz delivery is not verified.
+      w.record = { ...w.record, conversation: to, generation: 27, session: { pid: 30000, startedAt: "t2", workdir: CLONE },
+        lastRotation: { toSessionUuid: to, fromGeneration: 26, claimedGeneration: 27, revoked: false } };
+      w.procs = [...w.procs.filter((p) => p.pid !== CLAUDE), { pid: 30000, ppid: 1, command: `/bin/claude ${CHANNEL} --session-id ${to}` }];
+      const transcript = TRANSCRIPT.replace(CONVERSATION, to);
+      w.files.set(transcript, "{}");
+      w.mtimes.set(transcript, NOW - (IDLE_SECONDS + 60) * 1000);
+      w.buzzVerified = false;
+      return { status: 3, stdout: `${JSON.stringify({ step: "verify", refused: "the new conversation holds the role but is not verified" })}\n`, stderr: "" };
+    });
+    const relaunch = ["relaunch", P, "--handoff", "/h.json", "--apply"];
+    expect(await runCtoCommand(relaunch, w.ports)).toBe(1);
+    expect(w.rotateRuns).toHaveLength(1);
+    const target = w.rotateRuns[0]!;
+
+    // Still not verified: the rerun checks that same target and starts nothing.
+    w.out.length = 0;
+    expect(await runCtoCommand(relaunch, w.ports)).toBe(1);
+    expect(w.rotateRuns).toEqual([target]);
+    expect(JSON.stringify(results(w))).toContain("rotate");
+
+    // Verified now: the rerun completes on that same target, still without another rotation.
+    w.buzzVerified = true;
+    w.out.length = 0;
+    expect(await runCtoCommand(relaunch, w.ports)).toBe(0);
+    expect(w.rotateRuns).toEqual([target]);
+    expect(JSON.stringify(w.out)).toContain(target);
+
+    // That relaunch is finished, so the next one is a new rotation.
+    expect(await runCtoCommand(relaunch, w.ports)).toBe(0);
+    expect(w.rotateRuns).toHaveLength(2);
+    expect(w.rotateRuns[1]).not.toBe(target);
+  });
+});
+
+/** Item 2 on real git: HEAD and every ref count, in the worker and in the archived primary clone. */
+describe("review r1, item 2: held work, read from real repositories", () => {
+  // The production runner, resolved inside each test so that one missing export fails only the tests that use it.
+  const run: CtoExec = (bin, args, options) => hostRunner({ ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" })(bin, args, options);
+  const repos = (): { primary: string; worker: string } => {
+    const root = tempDir("acp-cto-held-");
+    gitSync(root, ["init", "-q", "--bare", "origin.git"]);
+    gitSync(root, ["clone", "-q", join(root, "origin.git"), "primary"]);
+    const primary = join(root, "primary");
+    writeFileSync(join(primary, "README.md"), "one\n");
+    commitAll(primary, "one");
+    gitSync(primary, ["push", "-q", "origin", "HEAD:main"]);
+    gitSync(primary, ["fetch", "-q", "origin"]);
+    gitSync(root, ["clone", "-q", primary, "worker"]);
+    const worker = join(root, "worker");
+    gitSync(worker, ["remote", "remove", "origin"]);
+    return { primary, worker };
+  };
+
+  it("finds nothing in a clean, published checkout", () => {
+    const { primary, worker } = repos();
+    expect(checkoutHeldWork(run, primary)).toBeNull();
+    expect(workerHeldWork(run, primary, worker, "repo_x")).toBeNull();
+  });
+
+  it("finds an unpublished commit on a detached HEAD, in the archived clone and in the worker", () => {
+    const { primary, worker } = repos();
+    for (const repo of [primary, worker]) {
+      gitSync(repo, ["checkout", "-q", "--detach"]);
+      writeFileSync(join(repo, "detached.txt"), "x\n");
+      commitAll(repo, "on a detached HEAD only");
+    }
+    expect(checkoutHeldWork(run, primary)).toMatch(/commit [0-9a-f]{12}/);
+    gitSync(primary, ["checkout", "-q", "main"]);
+    expect(workerHeldWork(run, primary, worker, "repo_x")).toMatch(/commit [0-9a-f]{12}/);
+    expect(gitSync(primary, ["for-each-ref", "refs/acp-cto-retire/"])).toBe("");
+  });
+
+  it("finds untracked files, in the archived clone and in the worker", () => {
+    const { primary, worker } = repos();
+    writeFileSync(join(primary, "notes.txt"), "x\n");
+    writeFileSync(join(worker, "notes.txt"), "x\n");
+    expect(checkoutHeldWork(run, primary)).toMatch(/uncommitted or untracked/);
+    expect(workerHeldWork(run, primary, worker, "repo_x")).toMatch(/uncommitted or untracked/);
   });
 });
 
