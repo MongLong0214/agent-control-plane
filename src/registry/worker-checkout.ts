@@ -46,6 +46,13 @@ const MADE_FROM = "acp.residentClone";
 
 /** CommitLore's notes ref, and how long, at most, one question to the remote about it may take. */
 const NOTES_REF = "refs/notes/commitlore";
+/** The config key CommitLore reads an origin's recorded absence of notes from: `r` and the hex of the remote's name. */
+const ORIGIN_ABSENCE_KEY = `commitlore.notesabsence.r${Buffer.from("origin", "utf8").toString("hex")}`;
+/** CommitLore's own test (`coversNotes`): a fetch refspec whose destination is its notes ref, or a glob that includes it. */
+const coversCommitLoreNotes = (refspec: string): boolean => {
+  const destination = refspec.replace(/^\+/, "").split(":")[1] ?? "";
+  return destination === NOTES_REF || (destination.endsWith("/*") && NOTES_REF.startsWith(destination.slice(0, -1)));
+};
 const ORIGIN_QUESTION_MS = 20_000;
 /** A remote that could not be asked is not asked again for this long, so a pass is not spent waiting on it. */
 const ORIGIN_RETRY_MS = 5 * 60_000;
@@ -99,6 +106,8 @@ export class WorkerCheckouts {
     private readonly audit: AuditLog,
     private readonly guard: ManagedWriteGuard,
     private readonly authority: RepairWorktreeAuthority,
+    /** #1268 — holds a worktree against worker turn admissions for a write between turns; null when a turn holds it (`WorkerTurnRunner.holdForMaintenance`). */
+    private readonly hold?: (worktree: string) => (() => void) | null,
   ) {}
 
   /** Every resident repository still registered at its clone, moved; one already at its worker clone has its notes mirror refreshed. Never throws. */
@@ -137,9 +146,13 @@ export class WorkerCheckouts {
   }
 
   /**
-   * #1268 — the worker clone a repository is already registered at, with the resident clone's CommitLore notes
-   * mirror carried into it, unless a turn of the repository has not ended. Only a clone this control plane made from
-   * that resident clone is written; the resident's clone is only read.
+   * #1268 — the worker clone a repository is already registered at, with the resident clone's CommitLore notes mirror
+   * carried into it and its origin's notes (or their absence) settled, unless a turn of the repository has not ended. Only a
+   * clone this control plane made from that resident clone is written; the resident's clone is only read.
+   *
+   * Everything is read first, the question to origin included, and nothing is authorised or written on a pass that finds
+   * nothing to do. A write holds the worker clone against turn admissions for its whole length (`hold`) and looks for a
+   * turn again once it holds it: a turn is held to the git dir it found, so a write landing after one began would fail it.
    */
   private async refreshNotes(resident: ResidentRepository): Promise<Decision<string>> {
     const { clonePath: clone, workerCheckoutPath: worker } = resident;
@@ -148,70 +161,90 @@ export class WorkerCheckouts {
       ? await git(worker, ["config", "--local", "--get", MADE_FROM], { allowFailure: true })
       : null;
     if (made?.exitCode !== 0 || made.stdout.trim() !== clone) return allow(ReasonCode.OK, worker);
-    // Nothing is authorised, and nothing written, on a pass that finds the worker clone already holding all of it and its
-    // remote's notes (or their absence) settled.
     const missing = await this.notesMissing(clone, worker);
-    const unsettled = await this.originUnsettled(resident.repositoryId, worker);
-    if (!missing && !unsettled) return allow(ReasonCode.OK, worker);
-    const authorised = await this.guard.authorize(
-      {
-        operation: WriteOperation.GIT_WORKTREE,
-        worktreeAction: WorktreeAction.ADD,
-        targetPath: worker,
-        targetWorktreeId: worker,
-        repositoryIdentity: resident.identity,
-        repairWorktreeAuthority: this.authority,
-        actor: "worker-checkout",
-      },
-      async () => {
-        if (missing) await this.carryNotes(clone, worker);
-        if (unsettled) await this.settleOriginNotes(resident.repositoryId, worker);
-      },
-    );
-    return authorised.allowed ? allow(ReasonCode.OK, worker) : (authorised as Decision<never>);
+    const answer = await this.askOrigin(resident.repositoryId, worker);
+    const settling = answer !== null && (await this.originNeedsWrite(worker, answer));
+    if (!missing && !settling) return allow(ReasonCode.OK, worker);
+    const held = this.hold?.(worker) ?? null;
+    if (this.hold !== undefined && held === null) return allow(ReasonCode.OK, worker);
+    try {
+      const authorised = await this.guard.authorize(
+        {
+          operation: WriteOperation.GIT_WORKTREE,
+          worktreeAction: WorktreeAction.ADD,
+          targetPath: worker,
+          targetWorktreeId: worker,
+          repositoryIdentity: resident.identity,
+          repairWorktreeAuthority: this.authority,
+          actor: "worker-checkout",
+        },
+        async () => {
+          if (this.runningTurn(resident) !== undefined) return;
+          if (missing) await this.carryNotes(clone, worker);
+          if (answer !== null) await this.settleOrigin(worker, answer);
+        },
+      );
+      return authorised.allowed ? allow(ReasonCode.OK, worker) : (authorised as Decision<never>);
+    } finally {
+      held?.();
+    }
   }
 
   /**
-   * #1268 — whether `worker` has an origin whose CommitLore notes it has neither mirrored nor recorded as absent, and which
-   * has not been asked about lately. CommitLore answers a lookup "unfetched", which `required` refuses, unless the clone
-   * has a local notes ref, or records (`commitlore.notesabsence.*`, written by `commitlore doctor --fix`) that the remote
-   * was asked and advertises none. A repository whose remote has no notes at all (a new project) has neither.
+   * #1268 — CommitLore answers a lookup "unfetched", which `required` refuses, unless the clone has a local notes ref, or
+   * records (`commitlore.notesabsence.*`, which `commitlore doctor --fix` writes after an empty `git ls-remote`) that its
+   * remote was asked and advertises none; a repository whose remote has no notes at all (a new project) has neither. So a
+   * clone with no notes ref asks its origin, with the daemon's own git (CommitLore's child has no credential), and asks again
+   * on every later pass past `ORIGIN_RETRY_MS`: an absence is only as good as the last time it was verified.
+   *
+   * Read only. `none`: origin answered and advertises no CommitLore notes; `some`: it advertises them; `unanswered`: it did not
+   * answer (no network, no permission, a timeout), which says nothing about notes. null: not asked now (a notes ref is held,
+   * there is no origin, or it was asked lately).
    */
-  private async originUnsettled(repositoryId: string, worker: string): Promise<boolean> {
+  private async askOrigin(repositoryId: string, worker: string): Promise<{ url: string; advertised: "none" | "some" | "unanswered" } | null> {
     const asked = this.#askedAt.get(repositoryId);
-    if (asked !== undefined && Date.parse(this.clock.nowIso()) - asked < ORIGIN_RETRY_MS) return false;
+    if (asked !== undefined && Date.parse(this.clock.nowIso()) - asked < ORIGIN_RETRY_MS) return null;
     const into = await withoutRepositoryPrograms(worker);
-    if ((await git(worker, [...into, "rev-parse", "--verify", "-q", NOTES_REF], { allowFailure: true })).exitCode === 0) return false;
+    if ((await git(worker, [...into, "rev-parse", "--verify", "-q", NOTES_REF], { allowFailure: true })).exitCode === 0) return null;
     const url = (await git(worker, [...into, "config", "--local", "--get", "remote.origin.url"], { allowFailure: true })).stdout.trim();
-    if (url === "") return false;
-    const key = `commitlore.notesabsence.r${Buffer.from("origin", "utf8").toString("hex")}`;
-    const recorded = (await git(worker, [...into, "config", "--local", "--get", key], { allowFailure: true })).stdout.trim();
-    return recorded !== url;
+    if (url === "") return null;
+    this.#askedAt.set(repositoryId, Date.parse(this.clock.nowIso()));
+    const advertised = await git(worker, [...into, "ls-remote", "origin", NOTES_REF], { allowFailure: true, timeoutMs: ORIGIN_QUESTION_MS });
+    if (advertised.exitCode !== 0) return { url, advertised: "unanswered" };
+    return { url, advertised: advertised.stdout.trim() === "" ? "none" : "some" };
+  }
+
+  /** Whether acting on `answer` would change `worker`. */
+  private async originNeedsWrite(worker: string, answer: { url: string; advertised: "none" | "some" | "unanswered" }): Promise<boolean> {
+    if (answer.advertised === "some") return true;
+    const into = await withoutRepositoryPrograms(worker);
+    const recorded = (await git(worker, [...into, "config", "--local", "--get", ORIGIN_ABSENCE_KEY], { allowFailure: true })).stdout.trim();
+    if (answer.advertised === "unanswered") return recorded !== "";
+    return recorded !== answer.url || !(await this.notesConfigOf(worker)).specs.some(coversCommitLoreNotes);
   }
 
   /**
-   * #1268 — asks origin, with the daemon's own git (CommitLore's child has no credential), whether it advertises CommitLore's
-   * notes, as `commitlore doctor --fix` does: notes it has are fetched as the mirror; none is recorded as CommitLore
-   * records it (the notes fetch refspec, and `commitlore.notesabsence.*` naming the url asked); an origin that does not
-   * answer records nothing, so a lookup that cannot be answered is still refused. Nothing is pushed to the remote.
+   * #1268 — what origin answered, as `commitlore doctor --fix` acts on it: notes it advertises are fetched as the mirror and
+   * no absence stands; none is recorded as CommitLore records it (a fetch refspec that covers CommitLore's notes, and
+   * `commitlore.notesabsence.*` naming the url asked); an origin that did not answer leaves no absence record standing, so a
+   * lookup that cannot be answered is refused. Nothing is pushed to the remote.
    */
-  private async settleOriginNotes(repositoryId: string, worker: string): Promise<void> {
-    this.#askedAt.set(repositoryId, Date.parse(this.clock.nowIso()));
+  private async settleOrigin(worker: string, answer: { url: string; advertised: "none" | "some" | "unanswered" }): Promise<void> {
     const into = await withoutRepositoryPrograms(worker);
-    const url = (await git(worker, [...into, "config", "--local", "--get", "remote.origin.url"], { allowFailure: true })).stdout.trim();
-    if (url === "") return;
-    const advertised = await git(worker, [...into, "ls-remote", "origin", NOTES_REF], { allowFailure: true, timeoutMs: ORIGIN_QUESTION_MS });
-    if (advertised.exitCode !== 0) return;
-    if (advertised.stdout.trim() !== "") {
-      await git(worker, [
-        ...into, "-c", "gc.auto=0", "-c", "maintenance.auto=false",
-        "fetch", "--quiet", "--no-write-fetch-head", "--no-tags", "--no-recurse-submodules", "origin", `${NOTES_REF}:${NOTES_REF}`,
-      ], { allowFailure: true, timeoutMs: ORIGIN_QUESTION_MS });
+    if (answer.advertised !== "none") {
+      await git(worker, [...into, "config", "--local", "--unset-all", ORIGIN_ABSENCE_KEY], { allowFailure: true });
+      if (answer.advertised === "some") {
+        await git(worker, [
+          ...into, "-c", "gc.auto=0", "-c", "maintenance.auto=false",
+          "fetch", "--quiet", "--no-write-fetch-head", "--no-tags", "--no-recurse-submodules", "origin", `${NOTES_REF}:${NOTES_REF}`,
+        ], { allowFailure: true, timeoutMs: ORIGIN_QUESTION_MS });
+      }
       return;
     }
-    const specs = (await git(worker, [...into, "config", "--local", "--get-all", "remote.origin.fetch"], { allowFailure: true })).stdout.split("\n");
-    if (!specs.some((spec) => /^\+?refs\/notes\//.test(spec))) await git(worker, [...into, "config", "--local", "--add", "remote.origin.fetch", "refs/notes/*:refs/notes/*"]);
-    await git(worker, [...into, "config", "--local", `commitlore.notesabsence.r${Buffer.from("origin", "utf8").toString("hex")}`, url]);
+    if (!(await this.notesConfigOf(worker)).specs.some(coversCommitLoreNotes)) {
+      await git(worker, [...into, "config", "--local", "--add", "remote.origin.fetch", "refs/notes/*:refs/notes/*"]);
+    }
+    await git(worker, [...into, "config", "--local", ORIGIN_ABSENCE_KEY, answer.url]);
   }
 
   /** A repository's CommitLore notes refs, each with the object it names. */
@@ -221,15 +254,11 @@ export class WorkerCheckouts {
     return listed.stdout.split("\n").filter((line) => line.length > 0).map((line) => ({ ref: line.slice(0, line.indexOf(" ")), oid: line.slice(line.indexOf(" ") + 1) }));
   }
 
-  /** The fetch refspecs for notes on origin, and the records that origin's mirror was looked for, that `repo` has. */
-  private async notesConfigOf(repo: string): Promise<{ specs: string[]; absence: string[] }> {
+  /** The fetch refspecs on origin that cover notes, that `repo` has. */
+  private async notesConfigOf(repo: string): Promise<{ specs: string[] }> {
     const programs = await withoutRepositoryPrograms(repo);
-    const out = async (args: readonly string[]): Promise<string[]> =>
-      (await git(repo, [...programs, "config", "--local", ...args], { allowFailure: true })).stdout.split("\n").filter((line) => line.length > 0);
-    return {
-      specs: (await out(["--get-all", "remote.origin.fetch"])).filter((spec) => /^\+?refs\/notes\//.test(spec)),
-      absence: await out(["--get-regexp", "^commitlore\\.notesabsence\\."]),
-    };
+    const configured = await git(repo, [...programs, "config", "--local", "--get-all", "remote.origin.fetch"], { allowFailure: true });
+    return { specs: configured.stdout.split("\n").filter((line) => line.length > 0 && /^\+?refs\/notes\//.test(line)) };
   }
 
   /** Whether `worker` lacks any of what `clone` has of the notes mirror. A notes ref the worker is ahead of or has merged is not lacking. */
@@ -244,14 +273,16 @@ export class WorkerCheckouts {
     }
     const wanted = await this.notesConfigOf(clone);
     const have = await this.notesConfigOf(worker);
-    return wanted.specs.some((spec) => !have.specs.includes(spec)) || wanted.absence.some((line) => !have.absence.includes(line));
+    return wanted.specs.some((spec) => !have.specs.includes(spec));
   }
 
   /**
-   * CommitLore's notes mirror, as `clone` has it, in `worker`: the notes refs, the fetch refspec for them on origin,
-   * and the record that origin's mirror was looked for. Idempotent, and it never takes a note from the worker: a notes ref
-   * the worker lacks is fetched, one it is ahead of is left, one behind is moved forward, and one both have added to is
-   * merged (`git notes merge -s union`), so what a worker turn captured in its own clone is kept. `clone` is only read.
+   * CommitLore's notes mirror, as `clone` has it, in `worker`: the notes refs and the fetch refspecs for them on origin. The
+   * record that origin's mirror was looked for is not carried: it is only as good as the last time it was verified, and the
+   * worker clone's own question to origin (`askOrigin`) is what records it. Idempotent, and it never takes a note from the
+   * worker: a notes ref the worker lacks is fetched, one it is ahead of is left, one behind is moved forward, and one both
+   * have added to is merged (`git notes merge -s union`), so what a worker turn captured in its own clone is kept. `clone`
+   * is only read.
    */
   private async carryNotes(clone: string, worker: string): Promise<void> {
     const into = await withoutRepositoryPrograms(worker);
@@ -278,13 +309,8 @@ export class WorkerCheckouts {
       }
     }
     const have = await this.notesConfigOf(worker);
-    const wanted = await this.notesConfigOf(clone);
-    for (const spec of wanted.specs) {
+    for (const spec of (await this.notesConfigOf(clone)).specs) {
       if (!have.specs.includes(spec)) await git(worker, [...into, "config", "--local", "--add", "remote.origin.fetch", spec]);
-    }
-    for (const line of wanted.absence) {
-      const at = line.indexOf(" ");
-      if (at > 0) await git(worker, [...into, "config", "--local", line.slice(0, at), line.slice(at + 1)]);
     }
   }
 
@@ -423,7 +449,8 @@ export class WorkerCheckouts {
     await git(staging, ["remote", "remove", "origin"]);
     if (origin.exitCode === 0 && origin.stdout.trim().length > 0) await git(staging, ["remote", "add", "origin", origin.stdout.trim()]);
     await this.carryNotes(clone, staging);
-    await this.settleOriginNotes(resident.repositoryId, staging);
+    const answer = await this.askOrigin(resident.repositoryId, staging);
+    if (answer !== null) await this.settleOrigin(staging, answer);
     for (const [key, value] of [["gc.auto", "0"], ["maintenance.auto", "false"], [MADE_FROM, clone]] as const) {
       await git(staging, ["config", "--local", key, value]);
     }

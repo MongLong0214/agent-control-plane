@@ -780,7 +780,7 @@ export class ControlPlane {
         this.db, this.clock, this.audit, this.artifacts, this.claims, this.worktrees,
         this.repositories, this.guard, this.#repairWorktreeAuthority,
       );
-      this.workerCheckouts = new WorkerCheckouts(this.db, this.clock, this.audit, this.guard, this.#repairWorktreeAuthority);
+      this.workerCheckouts = new WorkerCheckouts(this.db, this.clock, this.audit, this.guard, this.#repairWorktreeAuthority, (worktree) => this.workerTurns.holdForMaintenance(worktree));
       this.doctor = new Doctor(
         this.db, this.clock, this.audit, this.projects, this.repositories, this.sessions,
         this.bindings, this.runs, this.tasks, this.claims, this.capacity, this.providers, this.continuity,
