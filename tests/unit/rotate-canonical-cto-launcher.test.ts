@@ -30,6 +30,11 @@ const OLD = "58cac5c6-0000-4000-8000-0000000000c1";
 const NEW = "36276d16-0000-4000-8000-0000000000c2";
 const PROJECT = "launch-project";
 
+const RULE = "─".repeat(100);
+const REGISTERED_SCREEN = ` ▐▛███▛█   Claude Code v2.1.323\n\n  Channels (experimental) messages from server:acp-buzz-channel inject directly in this session · restart without --dangerously-load-development-channels to stop\n${RULE}\n❯ \n${RULE}\n`;
+const WARNING_SCREEN = `\n${RULE}\n  WARNING: Loading development channels\n\n  --dangerously-load-development-channels is for local channel development only. Do not use this option to run channels you have downloaded off the internet.\n\n  Please use --channels to run a list of approved channels.\n\n  Channels: server:acp-buzz-channel\n\n  ❯ 1. I am using this for local development\n    2. Exit\n\n  Enter to confirm · Esc to cancel\n`;
+const TRUST_SCREEN = `${RULE}\n Quick safety check: Is this a project you created or one you trust?\n\n ❯ 1. Yes, I trust this folder\n   2. No, exit\n\n Enter to confirm · Esc to cancel\n`;
+
 type Mode = "claims" | "never-claims" | "claims-deaf" | "claims-unreceived" | "owned-work";
 
 const stub = (path: string, body: string) => {
@@ -72,7 +77,14 @@ process.stdout.write(JSON.stringify({ ok: false, reasonCode: "CONFLICT" })); pro
   // tmux records, at new-session, whether the old process and its child were still in the process table.
   stub(join(dir, "tmux"), `${record}
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+// The launch's terminal, for the Buzz channel's startup: what it shows is whatever the test wrote to \`screen\`, and a key
+// pressed on it replaces that with \`screen-after\` when the test wrote one.
+const screen = ${JSON.stringify(join(dir, "screen"))}, after = ${JSON.stringify(join(dir, "screen-after"))}, started = ${JSON.stringify(join(dir, "start-command"))};
+if (process.argv[2] === "display-message") { process.stdout.write(fs.existsSync(started) ? fs.readFileSync(started, "utf8") : ""); process.exit(0); }
+if (process.argv[2] === "capture-pane") { process.stdout.write(fs.existsSync(screen) ? fs.readFileSync(screen, "utf8") : ${JSON.stringify(REGISTERED_SCREEN)}); process.exit(0); }
+if (process.argv[2] === "send-keys") { if (fs.existsSync(after)) fs.copyFileSync(after, screen); process.exit(0); }
 if (process.argv[2] === "new-session") {
+  fs.writeFileSync(started, process.argv[process.argv.length - 1]);
   fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(["observed", { oldAlive: alive(Number(process.env.TEST_OLD_PID)), childAlive: alive(Number(fs.readFileSync(${JSON.stringify(childPidFile)}, "utf8"))) }]) + "\\n");
   const m = ${mode};
   if (m === "claims" || m === "claims-deaf" || m === "claims-unreceived") {
@@ -174,6 +186,8 @@ describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, wi
     const keyFile = "/home/test/.hermes/bridge/keys/cto-launch-project.priv";
     const room = "11111111-1111-4111-8111-111111111111";
     const withChannel = await fixture("claims");
+    writeFileSync(join(withChannel.dir, "screen"), WARNING_SCREEN);
+    writeFileSync(join(withChannel.dir, "screen-after"), REGISTERED_SCREEN);
     const started = await withChannel.launch(10_000, ["--buzz-room", room, "--buzz-key-file", keyFile]);
     expect(started.code, started.stderr + started.stdout).toBe(0);
     const shell = readFileSync(join(withChannel.dir, "state", "rotations", `${PROJECT}-${NEW}.sh`), "utf8");
@@ -181,10 +195,25 @@ describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, wi
     expect(flag).toBeGreaterThan(0);
     expect(shell.indexOf("'--mcp-config'")).toBeLessThan(flag);
     expect(shell).toContain(`"--key-file","${keyFile}","--room","${room}"`);
+    // The development-channels warning was confirmed exactly once, and the step says so.
+    expect(withChannel.calls().filter((call) => call[0] === "tmux" && call[1] === "send-keys")).toEqual([["tmux", "send-keys", "-t", "acp-rot-test", "Enter"]]);
+    expect(withChannel.steps(started.stdout).find((line) => line.step === "channel")).toMatchObject({ ok: true, confirmed: true });
 
     const without = await fixture("claims");
     expect((await without.launch()).code).toBe(0);
     expect(readFileSync(join(without.dir, "state", "rotations", `${PROJECT}-${NEW}.sh`), "utf8")).not.toContain("acp-buzz-channel");
+  });
+
+  it("presses nothing on a screen that is not the channel warning, fences the new conversation, and says why", async () => {
+    // A session stopped at a dialog never claims, which is the mode that leaves the switchover pending and retryable.
+    const f = await fixture("never-claims", 0);
+    writeFileSync(join(f.dir, "screen"), TRUST_SCREEN);
+    const result = await f.launch(10_000, ["--buzz-room", "11111111-1111-4111-8111-111111111111", "--buzz-key-file", "/home/test/.hermes/bridge/keys/cto-launch-project.priv"]);
+    expect(result.code, result.stderr + result.stdout).toBe(2);
+    expect(f.steps(result.stdout).find((line) => line.step === "channel")).toMatchObject({ ok: false, refused: "UNRECOGNIZED_SCREEN", screen: "OTHER_DIALOG" });
+    const calls = f.calls();
+    expect(calls.some((call) => call[0] === "tmux" && call[1] === "send-keys")).toBe(false);
+    expect(calls.some((call) => call[0] === "tmux" && call[1] === "kill-session")).toBe(true);
   });
 
   it("an old writer that outlives the stop timeout: the new conversation is never started, and nothing else is signalled", async () => {

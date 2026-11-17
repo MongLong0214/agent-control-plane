@@ -52,3 +52,147 @@ export const channelLaunchArgs = (input: ChannelLaunchInput): string[] => [
   CHANNEL_DEV_FLAG,
   `server:${BUZZ_CHANNEL_SERVER}`,
 ];
+
+// ---- confirming Claude Code's development-channels warning -------------------------------------
+//
+// `--dangerously-load-development-channels` makes Claude Code stop at a full-screen warning that waits
+// for a person. The owner has allowed ACP's CTO launcher to confirm that one screen, and nothing else
+// (2026-11-17): the launch was started with `server:acp-buzz-channel`, the screen is that warning word
+// for word, and the channel it lists is that one. Any other screen (a trust dialog, a permission or
+// login prompt, an unknown dialog, a different channel list, altered text) gets no keystroke at all and
+// is reported. The confirmation is one `Enter`, sent once, and the launch is only good when Claude
+// Code then shows the line that says the channel registered.
+
+/** The warning as Claude Code 2.1.323 draws it, with the rule lines removed and whitespace collapsed. */
+export const DEV_CHANNELS_WARNING =
+  "WARNING: Loading development channels " +
+  "--dangerously-load-development-channels is for local channel development only. " +
+  "Do not use this option to run channels you have downloaded off the internet. " +
+  "Please use --channels to run a list of approved channels. " +
+  `Channels: server:${BUZZ_CHANNEL_SERVER} ` +
+  "❯ 1. I am using this for local development 2. Exit Enter to confirm · Esc to cancel";
+
+/** What the session shows once the channel is registered. */
+export const CHANNEL_REGISTERED_LINE =
+  `Channels (experimental) messages from server:${BUZZ_CHANNEL_SERVER} inject directly in this session`;
+
+/**
+ * A screen reduced to its words: box-drawing rules dropped and every run of whitespace made one space, so
+ * a narrow terminal that wraps a line does not change what it says.
+ */
+export const normalizeScreen = (screen: string): string =>
+  screen.replace(/[─-╿]/gu, " ").replace(/\s+/gu, " ").trim();
+
+export type ScreenVerdict =
+  | "EXACT_WARNING"
+  | "WARNING_OTHER_CHANNELS"
+  | "WARNING_ALTERED"
+  | "REGISTERED"
+  | "OTHER_DIALOG"
+  | "OTHER";
+
+export const classifyScreen = (screen: string): ScreenVerdict => {
+  const text = normalizeScreen(screen);
+  if (text === DEV_CHANNELS_WARNING) return "EXACT_WARNING";
+  if (text.includes("Loading development channels") || text.includes("--dangerously-load-development-channels is for")) {
+    const listed = /Channels: (.*?) ❯/u.exec(text)?.[1];
+    return listed !== undefined && listed !== `server:${BUZZ_CHANNEL_SERVER}` ? "WARNING_OTHER_CHANNELS" : "WARNING_ALTERED";
+  }
+  if (text.includes(CHANNEL_REGISTERED_LINE)) return "REGISTERED";
+  // Every Claude Code dialog that waits on a choice carries this footer; one this module does not know is
+  // reported at once rather than waited out.
+  if (text.includes("Enter to confirm") || text.includes("Esc to cancel")) return "OTHER_DIALOG";
+  return "OTHER";
+};
+
+export type ChannelStartupFailure = "UNRECOGNIZED_SCREEN" | "WARNING_DIFFERS" | "NOT_REGISTERED";
+
+export type ChannelStartupResult =
+  | { readonly ok: true; readonly confirmed: boolean }
+  | { readonly ok: false; readonly failure: ChannelStartupFailure; readonly screen: ScreenVerdict; readonly confirmed: boolean };
+
+export interface ChannelScreenDriver {
+  /** The visible screen of the launch's own terminal. Throws when that terminal is not the launch's. */
+  capture(): string | Promise<string>;
+  /** The one confirming keystroke (`Enter`). */
+  press(): void | Promise<void>;
+  now(): number;
+  sleep(ms: number): Promise<void>;
+}
+
+export interface ChannelStartupBounds {
+  /** How long the warning (or the registered line) may take to appear after the launch. */
+  readonly screenWaitMs: number;
+  /** How long the registered line may take to appear after the confirmation. */
+  readonly registerWaitMs: number;
+  readonly pollMs: number;
+}
+
+export const DEFAULT_CHANNEL_STARTUP_BOUNDS: ChannelStartupBounds = { screenWaitMs: 30_000, registerWaitMs: 30_000, pollMs: 500 };
+
+/**
+ * Brings a launch that carries the channel flag to a registered channel, confirming Claude Code's
+ * development-channels warning on the way and nothing else. At most one keystroke is ever sent, and only
+ * on the exact warning; every other screen ends the wait with a failure the caller reports.
+ *
+ * The registered line is the only evidence taken that the channel came up. Claude Code shows one startup
+ * notice line, so a second notice (debug mode, an update) pushes it out of view as "1 more notice hidden";
+ * that is reported as NOT_REGISTERED, not guessed at. Both screens are Claude Code 2.1.323's: a version
+ * that rewords the warning is refused, not pressed.
+ */
+export const confirmChannelStartup = async (
+  driver: ChannelScreenDriver,
+  bounds: ChannelStartupBounds = DEFAULT_CHANNEL_STARTUP_BOUNDS,
+): Promise<ChannelStartupResult> => {
+  const look = async (): Promise<ScreenVerdict> => {
+    try {
+      return classifyScreen(await driver.capture());
+    } catch {
+      return "OTHER_DIALOG";
+    }
+  };
+  let verdict: ScreenVerdict = "OTHER";
+  const first = driver.now();
+  while (true) {
+    verdict = await look();
+    if (verdict === "REGISTERED") return { ok: true, confirmed: false };
+    if (verdict === "EXACT_WARNING") break;
+    if (verdict === "WARNING_OTHER_CHANNELS" || verdict === "WARNING_ALTERED") {
+      return { ok: false, failure: "WARNING_DIFFERS", screen: verdict, confirmed: false };
+    }
+    if (verdict === "OTHER_DIALOG") return { ok: false, failure: "UNRECOGNIZED_SCREEN", screen: verdict, confirmed: false };
+    if (driver.now() - first >= bounds.screenWaitMs) return { ok: false, failure: "UNRECOGNIZED_SCREEN", screen: verdict, confirmed: false };
+    await driver.sleep(bounds.pollMs);
+  }
+  await driver.press();
+  const pressed = driver.now();
+  while (true) {
+    await driver.sleep(bounds.pollMs);
+    verdict = await look();
+    if (verdict === "REGISTERED") return { ok: true, confirmed: true };
+    if (driver.now() - pressed >= bounds.registerWaitMs) break;
+    // The warning may take a moment to be redrawn away, so it is waited out; a different dialog is not.
+    if (verdict === "OTHER_DIALOG" || verdict === "WARNING_ALTERED" || verdict === "WARNING_OTHER_CHANNELS") break;
+  }
+  return { ok: false, failure: "NOT_REGISTERED", screen: verdict, confirmed: true };
+};
+
+/** `tmux` as the driver of one launch's pane. The pane must still be running exactly the launcher that was started. */
+export const tmuxChannelDriver = (input: {
+  readonly tmux: string;
+  readonly target: string;
+  /** What `#{pane_start_command}` must be: the launcher script this launch started. */
+  readonly startCommand: string;
+  readonly run: (bin: string, args: string[]) => string;
+}): ChannelScreenDriver => ({
+  capture: () => {
+    const started = input.run(input.tmux, ["display-message", "-p", "-t", input.target, "#{pane_start_command}"]).replace(/\n$/u, "");
+    if (started !== input.startCommand) throw new Error("the pane is not this launch's");
+    return input.run(input.tmux, ["capture-pane", "-p", "-t", input.target]);
+  },
+  press: () => {
+    input.run(input.tmux, ["send-keys", "-t", input.target, "Enter"]);
+  },
+  now: () => Date.now(),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+});

@@ -2003,6 +2003,30 @@ export class Doctor {
           "(--dangerously-load-development-channels server:acp-buzz-channel) and that its server is connected (/mcp in the session); the message stays queued and is delivered when it is, or the CTO can still read it with role_owner_message_claim",
       });
     }
+    // A CTO launch whose Buzz channel did not come up: the launcher confirms Claude Code's development-channels
+    // warning and nothing else, and says what it saw when the screen was anything but that warning, or when the
+    // channel did not register after it. The session may be running, stopped at the screen it was not allowed to
+    // press; the provisioning row keeps the reason the host gave.
+    const channelStartup = this.db.all<{ project_id: string; last_error: string }>(
+      `SELECT project_id, last_error FROM resident_project_provisioning
+        WHERE status = 'PENDING' AND last_error LIKE '%channel startup:%' ORDER BY project_id`,
+    );
+    if (channelStartup.length > 0) {
+      findings.push({
+        code: "CTO_CHANNEL_STARTUP_REFUSED",
+        severity: "ERROR",
+        scope: "global",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: {
+          count: channelStartup.length,
+          projects: channelStartup.map((row) => ({ projectId: row.project_id, reason: row.last_error })),
+        },
+        recommendedAction:
+          "the CTO session was launched with its Buzz channel but the channel did not register, and nothing was pressed beyond the one development-channels warning: " +
+          "attach to the project's tmux session, look at the screen it is stopped at, and deal with it yourself; ensure-resident refuses to start a second Claude until that session ends",
+      });
+    }
     // acp-daemon-notice/v1: a refusal notice the daemon could not deliver to the CEO, terminally —
     // Hermes refused it, a 200 did not match, or the pinned CEO moved since its bytes were fixed. It
     // is never retried under a new id, so this is where it becomes visible.

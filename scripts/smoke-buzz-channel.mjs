@@ -8,15 +8,16 @@
  * script runs, and proves two things:
  *
  *   1. a mention signed by the "CEO" key reaches the session as a channel message
- *      (the `Channels (experimental)` notice appears and the message is shown), and
+ *      (the `Channels (experimental)` notice appears and the message is shown as `← acp-buzz-channel: …`), and
  *   2. the session answers it with the `reply` tool, and the relay receives a kind-9 signed by the
  *      CTO key, in the room, threaded under the mention.
  *
  * Why it cannot be headless: Claude Code ignores `--dangerously-load-development-channels` under
  * `-p`/the Agent SDK, and in an interactive session it shows a full-screen warning that needs a person
- * to confirm ("I am using this for local development"). This script presses that confirmation only
- * when it is run with `--accept-dev-channels-dialog`, because that is a person's consent being given
- * on their behalf. Without the flag it stops at the dialog and exits 77 (not run). It needs a logged-in
+ * to confirm ("I am using this for local development"). The CTO launchers press that one
+ * confirmation themselves (`confirmChannelStartup` in src/runtime/cto-channel-launch.ts: Enter, once, only on that
+ * exact warning for server:acp-buzz-channel); this script uses the same function, and runs it only with
+ * `--accept-dev-channels-dialog`. Without the flag it stops at the dialog and exits 77 (not run). It needs a logged-in
  * claude.ai or Console session and network access to Anthropic: channel delivery is gated on a
  * server-side flag the client fetches (`allow_channels`), and there is no offline mode.
  *
@@ -34,6 +35,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from 'nostr-tools/pure';
+import { classifyScreen, confirmChannelStartup, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
 
 const NOT_RUN = 77;
 const argv = process.argv.slice(2);
@@ -99,6 +101,8 @@ relayServer.on('upgrade', (req, socket) => {
   const accept = createHash('sha1').update(req.headers['sec-websocket-key'] + GUID).digest('base64');
   socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
   const send = (value) => socket.write(frame(JSON.stringify(value)));
+  // A Buzz relay opens with a NIP-42 challenge; nothing is subscribed until it is answered.
+  send(['AUTH', randomBytes(8).toString('hex')]);
   let buffer = Buffer.alloc(0);
   const onText = (text) => {
     let message; try { message = JSON.parse(text); } catch { return; }
@@ -128,18 +132,21 @@ relayServer.on('upgrade', (req, socket) => {
   socket.on('error', () => undefined);
 });
 await new Promise((ok) => relayServer.listen(0, '127.0.0.1', ok));
-const relayUrl = `wss://localhost:${relayServer.address().port}`;
+const relayUrl = `wss://127.0.0.1:${relayServer.address().port}`;
 say(`local relay at ${relayUrl}`);
 
 // ---- the session ---------------------------------------------------------------------------------
 const mcpConfig = JSON.stringify({ mcpServers: { 'acp-buzz-channel': { command: process.execPath, env: { NODE_EXTRA_CA_CERTS: certPem },
   args: ['--experimental-transform-types', '--disable-warning=ExperimentalWarning', join(root, 'src', 'cli', 'buzz-channel.ts'), '--project-id', 'smoke', '--key-file', keyFile, '--room', ROOM, '--state-dir', state, '--relay-url', relayUrl, '--ceo-pubkey', ceoPub] } } });
 try { execFileSync(trust, [cwd], { stdio: 'ignore' }); } catch { bail(NOT_RUN, 'not run: the throwaway directory could not be pre-registered as trusted'); }
-const started = tmux('new-session', '-d', '-x', '200', '-y', '50', '-s', 'smoke', '-c', cwd,
-  'claude', '--strict-mcp-config', '--mcp-config', mcpConfig, '--dangerously-load-development-channels', 'server:acp-buzz-channel',
-  '--model', model, '--allowedTools', 'mcp__acp-buzz-channel__reply');
+// The launch goes through a launcher script, as a resident CTO's does, so the pane's start command is the script.
+const launcher = join(work, 'launcher.sh');
+const quote = (v) => `'${String(v).replaceAll("'", "'\\''")}'`;
+writeFileSync(launcher, `#!/bin/sh\ncd ${quote(cwd)} || exit 1\nexec ${['claude', '--strict-mcp-config', '--mcp-config', mcpConfig, '--dangerously-load-development-channels', 'server:acp-buzz-channel',
+  '--model', model, '--allowedTools', 'mcp__acp-buzz-channel__reply'].map(quote).join(' ')}\n`, { mode: 0o700 });
+const started = tmux('new-session', '-d', '-x', '200', '-y', '50', '-s', 'smoke', launcher);
 if (started.status !== 0) bail(1, `failed: tmux could not start the session: ${started.stderr}`);
-const screen = () => tmux('capture-pane', '-p', '-t', 'smoke', '-S', '-200').stdout ?? '';
+const screen = () => tmux('capture-pane', '-p', '-t', 'smoke').stdout ?? '';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const until = async (name, predicate) => {
   const deadline = Date.now() + timeoutMs;
@@ -148,19 +155,21 @@ const until = async (name, predicate) => {
   bail(1, `failed: timed out waiting for ${name}`);
 };
 
-await until('the development-channels warning or the session', () => /Loading development channels|inject directly/u.test(screen()));
-if (/Loading development channels/u.test(screen())) {
-  const listed = screen().split('\n').find((l) => l.includes('Channels:'));
-  if (listed) say(`the warning lists: ${listed.trim()}`);
-  if (!flag('--accept-dev-channels-dialog')) bail(NOT_RUN, 'not run: Claude Code is showing its development-channels warning, which needs a person to confirm; re-run with --accept-dev-channels-dialog to confirm it for this throwaway session');
-  say('confirming the development-channels warning for the throwaway session (--accept-dev-channels-dialog)');
-  tmux('send-keys', '-t', 'smoke', 'Enter');
+if (!flag('--accept-dev-channels-dialog')) {
+  await until('the development-channels warning or the session', () => classifyScreen(screen()) !== 'OTHER');
+  if (classifyScreen(screen()) === 'EXACT_WARNING') say('the warning lists: Channels: server:acp-buzz-channel');
+  bail(NOT_RUN, 'not run: Claude Code is showing its development-channels warning, which needs confirming; re-run with --accept-dev-channels-dialog to have the launcher\'s confirmation (src/runtime/cto-channel-launch.ts) press it for this throwaway session');
 }
-await until('the channel to register', () => /inject directly in this session/u.test(screen()));
-say('channel registered: "Channels (experimental) ... inject directly in this session"');
+// The same confirmation the CTO launchers use: Enter, once, and only on that exact warning for server:acp-buzz-channel.
+const driver = tmuxChannelDriver({ tmux: 'tmux', target: 'smoke', startCommand: launcher,
+  run: (bin, args) => execFileSync(bin, ['-L', tmuxSocket, ...args], { encoding: 'utf8', timeout: 10_000 }) });
+const startup = await confirmChannelStartup(driver);
+if (!startup.ok) { say(`--- screen ---\n${screen().split('\n').filter((l) => l.trim()).slice(-25).join('\n')}`); bail(1, `failed: channel startup refused: ${startup.failure} (screen ${startup.screen}, confirmed ${startup.confirmed})`); }
+say(`channel registered (warning confirmed by the launcher path: ${startup.confirmed}): "Channels (experimental) ... inject directly in this session"`);
 await until('the relay to be asked for this CTO\'s mentions', () => received.reqs > 0);
-await until('the mention to appear in the session', () => screen().includes(`ack-${nonce}`) || screen().includes(`Smoke test ${nonce}`));
-say('the mention reached the session as a channel message');
+const inboundLine = () => screen().split('\n').find((l) => /\u2190\s*acp-buzz-channel/u.test(l));
+await until('the mention to appear in the session as a channel message', () => inboundLine() !== undefined);
+say(`the mention reached the session as a channel message; the terminal line is: ${inboundLine().trim()}`);
 await until('the CTO reply to reach the relay', () => received.publishes.some((e) => e.pubkey === ctoPub));
 const reply = received.publishes.find((e) => e.pubkey === ctoPub);
 const fail = (why) => bail(1, `failed: ${why}`);
@@ -170,5 +179,7 @@ if (!reply.tags.some((t) => t[0] === 'h' && t[1] === ROOM)) fail('the reply is n
 if (!reply.tags.some((t) => t[0] === 'e' && t[1] === mention.id && t[3] === 'reply')) fail('the reply is not threaded under the mention');
 if (!reply.tags.some((t) => t[0] === 'p' && t[1] === ceoPub)) fail('the reply does not address the mention\'s author');
 if (received.publishes.some((e) => e.pubkey !== ctoPub)) fail('something other than the CTO signed a publish');
-say(`PASS: mention delivered once as a channel message; reply ${reply.id.slice(0, 12)}… signed by the CTO key, in the room, threaded under the mention`);
+say(`--- the session's screen ---\n${screen().split('\n').filter((l) => l.trim() && !/^[\u2500\s]+$/u.test(l)).slice(-14).join('\n')}`);
+say(`the CTO's reply as the relay received it: ${JSON.stringify(reply.content)}`);
+say(`PASS: the mention reached the session as a channel message; reply ${reply.id.slice(0, 12)}… signed by the CTO key, in the room, threaded under the mention`);
 process.exit(0);

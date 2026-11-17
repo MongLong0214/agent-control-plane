@@ -305,6 +305,29 @@ describe('durable resident provisioning and retirement',() => {
     await expect(service.ensure(input)).resolves.toMatchObject({observations:{resident:{sessionUuid:service.allocation(input.runId)?.sessionUuid}}});
     h.cp.close();
   });
+  it.each(['channel startup: unrecognized screen','channel startup: development-channels warning differs from the expected one','channel startup: channel not registered'])('audits a launch whose Buzz channel did not come up (%s), keeps it pending, and the doctor names it',async kind => {
+    const h = makeHarness();const host = new FakeHost();const invoke = host.invoke.bind(host);
+    const invoked:string[] = [];
+    host.invoke = async (op,a,packet) => {
+      invoked.push(op);
+      if (op === 'ensure-resident') throw new HostOperationFailure(op,`host project provisioner refused operation: claude in ensure-resident: ${kind}\n`);
+      return invoke(op,a,packet);
+    };
+    const run = h.cp.runs.create({kind:RunKind.PROJECT_BOOTSTRAP,executionMode:'STANDARD',contract});if (!run.allowed) throw new Error(run.message);
+    h.cp.projects.register({projectId:'resident',name:'resident'});
+    const service = new ResidentProjectProvisioning(h.cp.db,h.clock,host,join(h.root,'home'),h.root,h.cp.audit);service.attachSubscriber(async () => false);
+    service.remember({runId:run.value.runId,candidateSnapshotDigest:'candidate',ceoSessionId:'ceo'},'resident',{});
+    const input = {runId:run.value.runId,projectId:'resident',repositoryIdentity:'github:acme/fixture',repositoryNodeId:'R_node',head:'f'.repeat(40),packet:{}};
+    await expect(service.ensure(input)).rejects.toMatchObject({reason:{binary:'claude',operation:'ensure-resident',kind}});
+    // Not a resident exit: nothing is acknowledged, and the row stays pending with the host's own reason.
+    expect(invoked).not.toContain('acknowledge-resident-exit');
+    expect(service.row(input.runId)).toMatchObject({status:'PENDING',last_error:`provisioning readback pending or refused: claude in ensure-resident: ${kind}`});
+    expect(h.cp.db.all<{reason_code:string;project_id:string;evidence_json:string}>(`SELECT reason_code, project_id, evidence_json FROM audit_events WHERE kind = 'CTO_CHANNEL_STARTUP_REFUSED'`,[]))
+      .toEqual([{reason_code:'CTO_CHANNEL_STARTUP_REFUSED',project_id:'resident',evidence_json:JSON.stringify({reason:kind})}]);
+    const finding = (await h.cp.doctor.run('system')).findings.find(f => f.code === 'CTO_CHANNEL_STARTUP_REFUSED');
+    expect(finding).toMatchObject({severity:'ERROR',blocking:false,observedEvidence:{count:1,projects:[{projectId:'resident',reason:expect.stringContaining(kind)}]}});
+    h.cp.close();
+  });
   it.each(['cwd','uuid','rc','ancestry','missing'] as const)('refuses a stale or missing %s readback even when the process was launched',async wrong => {
     const h = makeHarness();const host = new FakeHost();const invoke = host.invoke.bind(host);
     host.invoke = async (op,a) => {

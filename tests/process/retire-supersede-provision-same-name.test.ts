@@ -71,7 +71,8 @@ if (cmd === 'gh') {
     s.residents[name] = { pid, pane: 900000 + (++s.panes), sessionUuid: a.sessionUuid, cwd: a.clonePath };
     fs.mkdirSync(path.join(home, '.claude', 'sessions'), { recursive: true });
     fs.writeFileSync(path.join(home, '.claude', 'sessions', pid + '.json'), JSON.stringify({ sessionId: a.sessionUuid, cwd: a.clonePath, bridgeSessionId: 'bridge-' + a.projectId }));
-  } else if (args[0] === 'display-message') { if (!r) process.exit(1); out(String(r.pane)); }
+  } else if (args[0] === 'display-message') { if (!r) process.exit(1); out(args.at(-1) === '#{pane_start_command}' ? path.join(process.env.ACP_STATE_DIR, 'resident-' + a.projectId + '.sh') : String(r.pane)); }
+  else if (args[0] === 'capture-pane') out('Channels (experimental) messages from server:acp-buzz-channel inject directly in this session');
   else if (args[0] === 'kill-session') delete s.residents[name];
   else process.exit(2);
 } else if (cmd === 'ps') {

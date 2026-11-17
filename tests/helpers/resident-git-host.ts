@@ -29,7 +29,9 @@ else if (cmd === 'claude') { if (args[1] === 'add') s.mcp = args.slice(args.inde
 else if (cmd === 'tmux') {
   if (args[0] === 'has-session') process.exit(s.launched ? 0 : 1);
   if (args[0] === 'new-session') { s.launched = true; fs.mkdirSync(path.join(root,'.claude','sessions'),{recursive:true}); fs.writeFileSync(path.join(root,'.claude','sessions',process.env.TEST_CLAUDE_PID+'.json'),JSON.stringify({sessionId:a.sessionUuid,cwd:a.clonePath,bridgeSessionId:'bridge'})); }
-  else if (args[0] === 'display-message') { if (!s.launched) process.exit(1); out('999999'); }
+  else if (args[0] === 'display-message') { if (!s.launched) process.exit(1); out(args.at(-1) === '#{pane_start_command}' ? path.join(process.env.ACP_STATE_DIR,'resident-'+a.projectId+'.sh') : '999999'); }
+  // The resident's terminal: a session whose Buzz channel is registered, so the launcher has nothing to confirm.
+  else if (args[0] === 'capture-pane') out('Channels (experimental) messages from server:acp-buzz-channel inject directly in this session');
 }
 else if (cmd === 'ps') { if (s.launched) { if (args.includes('command=')) out('claude --session-id '+a.sessionUuid); else out(process.env.TEST_CLAUDE_PID+' 999999 Thu Oct 22 01:00:00 2026 claude --session-id '+a.sessionUuid+'\\n999999 1 Thu Oct 22 01:00:00 2026 tmux'); } }
 else if (cmd === 'lsof') out('n'+a.clonePath+'\\n');

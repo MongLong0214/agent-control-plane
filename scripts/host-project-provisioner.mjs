@@ -9,7 +9,7 @@ import Database from 'better-sqlite3';
 import { currentCanonicalCeoBuzzRoute, daemonBuzzSigner } from '../src/outbox/ceo-buzz-signer.ts';
 import { canonicalJson } from '../src/core/digest.ts';
 import { readProcessStartToken } from '../src/core/process-argv.ts';
-import { channelLaunchArgs } from '../src/runtime/cto-channel-launch.ts';
+import { channelLaunchArgs, confirmChannelStartup, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
 import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText, recordedResidentExitStatus } from '../src/runtime/host-provisioner-reason.ts';
 const home = process.env.HOME;
 const state = process.env.ACP_STATE_DIR;
@@ -677,6 +677,11 @@ try {
         if (completedExit && completedExit.marker.exitReported !== true)
           throw new RecordedExitRefusal(formatHostProvisionerReason(completedExit.reason));
         atomic(launchMarker,JSON.stringify({sessionUuid:a.sessionUuid,launch})); run('tmux',['new-session','-d','-s',a.tmuxName,launcher]);
+        // The launch carries the Buzz channel, so Claude Code stops at its development-channels warning. The one screen
+        // this confirms is that warning for exactly server:acp-buzz-channel; any other screen is left alone and reported.
+        const startup = await confirmChannelStartup(tmuxChannelDriver({tmux:'tmux',target:a.tmuxName,startCommand:launcher,run}));
+        if (!startup.ok) throw new ProvisionerRefusal(formatHostProvisionerReason({binary:'claude',operation:'ensure-resident',kind:{
+          UNRECOGNIZED_SCREEN:hostReasonKind.channelScreenUnrecognized,WARNING_DIFFERS:hostReasonKind.channelWarningDiffers,NOT_REGISTERED:hostReasonKind.channelNotRegistered}[startup.failure]}));
       }
       result = {fleet:true,checkout:observedCheckout,resident:observeLaunch()}; break;
     }

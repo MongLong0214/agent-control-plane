@@ -26,7 +26,7 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { channelLaunchArgs } from '../src/runtime/cto-channel-launch.ts';
+import { channelLaunchArgs, confirmChannelStartup, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
 
 const usage = 'usage: rotate-canonical-cto.mjs --project <id> --to <uuid> --expected-generation <n> --cwd <dir> --old-pid <pid> --tmux-session <name> --handoff <package.json> [--buzz-room <room id> --buzz-key-file <cto key path>] [--timeout-ms <ms>] [--poll-ms <ms>] [--stop-timeout-ms <ms>]';
 const flags = {};
@@ -289,6 +289,14 @@ try {
   run(tmux, ['new-session', '-d', '-s', flags['tmux-session'], shell]);
   started = true;
   report('start', { tmuxSession: flags['tmux-session'], session: to });
+  // Claude Code stops at its development-channels warning when the launch carries the channel. This confirms that one
+  // screen, for exactly server:acp-buzz-channel, and nothing else: any other screen is left unpressed, reported, and the
+  // new conversation is fenced like one that never claims.
+  if (channelArgs.length > 0) {
+    const startup = await confirmChannelStartup(tmuxChannelDriver({ tmux, target: flags['tmux-session'], startCommand: shell, run }));
+    report('channel', { ok: startup.ok, ...(startup.ok ? { confirmed: startup.confirmed } : { refused: startup.failure, screen: startup.screen }) });
+    if (!startup.ok) throw Object.assign(new Error('channel startup'), { code: `CHANNEL_${startup.failure}` });
+  }
 } catch (error) {
   await fenceNew(`start failed: ${error.code ?? error.status ?? 'error'}`);
 }
