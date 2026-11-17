@@ -22,10 +22,19 @@
 // arguments resumes that switchover. One that claimed but is not verified on Buzz may already have acted, so it is
 // left as it is (exit 3). Going back is a new forward rotation from the new holder. Secrets are never printed; the new
 // session's shell unsets them.
+//
+// The new conversation is always started with the project's Buzz channel, with the room and identity its canonical
+// entitlement holds and that identity's key file (`~/.hermes/bridge/keys/cto-<project>.priv`): any of them missing or
+// disagreeing is refused before the old conversation is touched (exit 68), never answered by starting without it. Claude
+// Code's development-channels warning is confirmed (that screen only, on the launch's own pane); a screen the launcher may
+// not press is not a start failure: the new conversation is left running there, the refusal is written to
+// rotations/<project>-<uuid>.channel-refusal.json, nothing is killed, and the switchover stays pending (exit 5).
 import { execFileSync } from 'node:child_process';
 import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { getPublicKey } from 'nostr-tools/pure';
+import { channelLaunchArgs, confirmChannelStartup, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
 
 const usage = 'usage: rotate-canonical-cto.mjs --project <id> --to <uuid> --expected-generation <n> --cwd <dir> --old-pid <pid> --tmux-session <name> --handoff <package.json> [--timeout-ms <ms>] [--poll-ms <ms>] [--stop-timeout-ms <ms>]';
 const flags = {};
@@ -36,6 +45,10 @@ for (let i = 0; i < argv.length; i += 2) {
 }
 for (const name of ['project', 'to', 'expected-generation', 'cwd', 'old-pid', 'tmux-session', 'handoff']) {
   if (!flags[name]) { process.stderr.write(`${usage}\n`); process.exit(64); }
+}
+// The Buzz channel's room and key are the project's own, read below; a caller cannot choose another.
+for (const name of ['buzz-room', 'buzz-key-file']) {
+  if (flags[name] !== undefined) { process.stderr.write(`--${name} is not taken: the room and key come from the project's canonical entitlement\n${usage}\n`); process.exit(64); }
 }
 const state = process.env.ACP_STATE_DIR;
 if (!state) { process.stderr.write('ACP_STATE_DIR is required\n'); process.exit(64); }
@@ -158,6 +171,22 @@ if (missing.length > 0) stop(65, 'handoff', { refused: 'the handoff package is i
 // A switchover an earlier run of this launcher recorded to exactly this conversation is resumed, never recorded twice.
 const before = status();
 if (!before.ok) stop(66, 'status', { refused: before.value.reasonCode ?? 'UNKNOWN' });
+// The new conversation is always started with its Buzz channel, from the same pair the resident launcher is given: the
+// project's Buzz identity and room as its canonical entitlement holds them, and that identity's key file. Anything
+// missing or not agreeing is refused here, before the old conversation is touched: there is no channel-free start.
+const channel = (() => {
+  const refuse = (why) => stop(68, 'channel', { refused: why, note: 'nothing was changed; the new conversation is never started without its Buzz channel' });
+  const held = before.value.channel;
+  if (!held || typeof held.room !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(held.room) || !/^[0-9a-f]{64}$/.test(held.actorId ?? '')) {
+    return refuse('the project has no canonical Buzz identity and room to start a channel with');
+  }
+  const keyFile = join(process.env.HOME ?? homedir(), '.hermes', 'bridge', 'keys', `cto-${project}.priv`);
+  let secret;
+  try { secret = readFileSync(keyFile, 'utf8').trim(); } catch { return refuse('the project\'s CTO key file cannot be read'); }
+  if (!/^[0-9a-f]{64}$/.test(secret)) return refuse('the project\'s CTO key file is not 32 hex-encoded bytes');
+  if (getPublicKey(Uint8Array.from(Buffer.from(secret, 'hex'))) !== held.actorId) return refuse('the project\'s CTO key is not the Buzz identity its canonical entitlement names');
+  return { room: held.room, keyFile };
+})();
 const old = before.value.holderSessionUuid;
 const resumed = (before.value.rotations ?? []).find((rotation) => rotation.state === 'PENDING') ?? null;
 if (resumed && (resumed.toSessionUuid !== to || resumed.fromGeneration !== expected || resumed.fromSessionUuid !== old)) {
@@ -274,14 +303,26 @@ try {
   try { run(claude, ['mcp', 'remove', '--scope', 'local', 'acp-cto'], { cwd: flags.cwd }); } catch { /* absent is fine */ }
   run(claude, ['mcp', 'add', '--scope', 'local', 'acp-cto', '--', ...relayArgs], { cwd: flags.cwd });
   const quote = (v) => `'${String(v).replaceAll("'", "'\\''")}'`;
+  const channelArgs = channelLaunchArgs({ runtimeNode, runtimeCli, projectId: project, keyFile: channel.keyFile, roomId: channel.room, stateDir: state });
   const shell = join(dir, `${project}-${to}.sh`);
   const prompt = `You are ${project}'s canonical CTO, continuing from conversation ${old} at generation ${issued}. Read the handoff package at ${flags.handoff}, then connect to acp-cto and continue. `
     + 'A message handed to you marked previousHolderInFlight was handed to your previous conversation and never completed: check what was already done before acting on it, then complete it if it is done, reject it if it must not run, and act on it only if it is safe to do again.';
-  writeFileSync(shell, `#!/bin/sh\nunset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\ncd ${quote(flags.cwd)} || exit 1\nexec ${[claude, '--session-id', to, '--messaging-socket-path', join(state, `cc-session-canonical-cto-${project}.sock`), '--permission-mode', 'bypassPermissions', prompt].map(quote).join(' ')}\n`, { mode: 0o700 });
+  writeFileSync(shell, `#!/bin/sh\nunset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\ncd ${quote(flags.cwd)} || exit 1\nexec ${[claude, ...channelArgs, '--session-id', to, '--messaging-socket-path', join(state, `cc-session-canonical-cto-${project}.sock`), '--permission-mode', 'bypassPermissions', prompt].map(quote).join(' ')}\n`, { mode: 0o700 });
   chmodSync(shell, 0o700);
   run(tmux, ['new-session', '-d', '-s', flags['tmux-session'], shell]);
   started = true;
   report('start', { tmuxSession: flags['tmux-session'], session: to });
+  // Claude Code stops at its development-channels warning when the launch carries the channel. This confirms that one
+  // screen, for exactly server:acp-buzz-channel, and nothing else. A screen it may not press is not a conversation that
+  // failed to start: the session is left running where it stopped, so a person can see and deal with it, and the
+  // refusal is recorded beside the rotation's other records. Nothing is killed and the switchover stays pending.
+  const startup = await confirmChannelStartup(tmuxChannelDriver({ tmux, target: flags['tmux-session'], startCommand: shell, run }));
+  report('channel', { ok: startup.ok, ...(startup.ok ? { confirmed: startup.confirmed } : { refused: startup.failure, screen: startup.screen }) });
+  if (!startup.ok) {
+    const refusal = { project, to, refused: startup.failure, screen: startup.screen, confirmed: startup.confirmed, tmuxSession: flags['tmux-session'], at: new Date().toISOString() };
+    writeFileSync(join(dir, `${project}-${to}.channel-refusal.json`), `${JSON.stringify(refusal)}\n`, { mode: 0o600 });
+    stop(5, 'channel', { ...refusal, note: 'the new conversation was left running at the screen it stopped at; nothing was killed or rolled back' });
+  }
 } catch (error) {
   await fenceNew(`start failed: ${error.code ?? error.status ?? 'error'}`);
 }

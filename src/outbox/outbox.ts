@@ -1556,6 +1556,7 @@ export class Outbox {
   claimForHolder(
     holder: HolderIdentity,
     admits: (candidate: OutboxMessage) => boolean = withholdsIdentityBound,
+    only?: string,
   ): HolderClaimResult {
     return this.db.tx(() => {
       const now = this.clock.nowIso();
@@ -1609,7 +1610,9 @@ export class Outbox {
         return { claimed: [], unresolved, withheld, hasMore: admitted.length > 0 };
       }
 
-      const candidate = admitted[0];
+      // `only` names the one message a channel emission put in front of the holder: the hand-over
+      // is that row or nothing, and it has to pass every gate the oldest-first claim does.
+      const candidate = only === undefined ? admitted[0] : admitted.find((row) => row.message_id === only);
       if (!candidate) return { claimed: [], unresolved, withheld, hasMore: false };
 
       // Compare-and-set, asserting the full caller tuple rather than the row id and a status.

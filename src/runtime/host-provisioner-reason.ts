@@ -18,7 +18,15 @@ export const hostReasonKind = {
   failed: 'execution failed',
   nonZeroExit: 'non-zero exit',
   exited: 'exited',
+  // The CTO's Buzz channel did not come up, and nothing was pressed to make it (`src/runtime/cto-channel-launch.ts`).
+  channelScreenUnrecognized: 'channel startup: unrecognized screen',
+  channelWarningDiffers: 'channel startup: development-channels warning differs from the expected one',
+  channelNotRegistered: 'channel startup: channel not registered',
 } as const;
+/** The kinds above that say the launch's channel did not come up. */
+export const channelStartupReasonKinds: readonly string[] = [
+  hostReasonKind.channelScreenUnrecognized, hostReasonKind.channelWarningDiffers, hostReasonKind.channelNotRegistered,
+];
 export interface HostProvisionerReason {
   binary: typeof hostReasonBinaries[number];
   operation: string;

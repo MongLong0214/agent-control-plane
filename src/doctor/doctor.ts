@@ -95,6 +95,9 @@ const UNRESOLVED_TURN_ESCALATION_MINUTES = 15;
 /** How many in-doubt turns `CANONICAL_TURN_IN_DOUBT` names with their latest receipt lookup error. */
 const MAX_REPORTED_LOOKUP_ERRORS = 10;
 
+/** How long a Buzz message may stay PENDING for a CTO before the doctor says no channel is delivering it. */
+export const BUZZ_CHANNEL_PENDING_AFTER_MS = 120_000;
+
 export type Severity = "INFO" | "WARN" | "ERROR" | "CRITICAL";
 
 /** PRD §25.4 — the finding contract. */
@@ -1967,6 +1970,61 @@ export class Doctor {
         observedEvidence: { count: returned.length, messageIds: returned.map((row) => row.message_id) },
         recommendedAction:
           "a holder-claimed message that was already handed over, settled or moved reads PENDING again; it will not be handed over or carried — find the writer that put it back",
+      });
+    }
+    // A CTO session's Buzz channel moves a Buzz message out of PENDING when it writes the message into the
+    // session, and the session no longer claims it. A message still PENDING and never handed over after
+    // this long therefore has no channel delivering it: the CTO session was started without the channel,
+    // its channel server is not connected to the relay, or the receipt it wrote was not applied. The
+    // message is kept, not lost; this is where it becomes visible.
+    const channelCutoff = new Date(Date.parse(this.clock.nowIso()) - BUZZ_CHANNEL_PENDING_AFTER_MS).toISOString();
+    const channelWaiting = this.db.all<{ message_id: string; role_key: string; created_at: string }>(
+      `SELECT o.message_id, o.role_key, o.created_at FROM outbox o
+        WHERE o.status = 'PENDING' AND o.kind IN ('OWNER_MESSAGE','PEER_MESSAGE') AND o.created_at <= ?
+          AND NOT EXISTS (SELECT 1 FROM holder_message_departures d WHERE d.message_id = o.message_id)
+        ORDER BY o.created_at, o.rowid`,
+      [channelCutoff],
+    );
+    if (channelWaiting.length > 0) {
+      findings.push({
+        code: "BUZZ_CHANNEL_MESSAGES_PENDING",
+        severity: "WARN",
+        scope: "outbox",
+        blocking: false,
+        confidence: "MEDIUM",
+        observedEvidence: {
+          count: channelWaiting.length,
+          roleKeys: [...new Set(channelWaiting.map((row) => row.role_key))],
+          oldestCreatedAt: channelWaiting[0]!.created_at,
+          messageIds: channelWaiting.slice(0, 20).map((row) => row.message_id),
+        },
+        recommendedAction:
+          "a Buzz message has waited for its CTO session without being delivered: check that the session was started with the acp-buzz-channel channel " +
+          "(--dangerously-load-development-channels server:acp-buzz-channel) and that its server is connected (/mcp in the session); the message stays queued and is delivered when it is, or the CTO can still read it with role_owner_message_claim",
+      });
+    }
+    // A CTO launch whose Buzz channel did not come up: the launcher confirms Claude Code's development-channels
+    // warning and nothing else, and says what it saw when the screen was anything but that warning, or when the
+    // channel did not register after it. The session may be running, stopped at the screen it was not allowed to
+    // press; the provisioning row keeps the reason the host gave.
+    const channelStartup = this.db.all<{ project_id: string; last_error: string }>(
+      `SELECT project_id, last_error FROM resident_project_provisioning
+        WHERE status = 'PENDING' AND last_error LIKE '%channel startup:%' ORDER BY project_id`,
+    );
+    if (channelStartup.length > 0) {
+      findings.push({
+        code: "CTO_CHANNEL_STARTUP_REFUSED",
+        severity: "ERROR",
+        scope: "global",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: {
+          count: channelStartup.length,
+          projects: channelStartup.map((row) => ({ projectId: row.project_id, reason: row.last_error })),
+        },
+        recommendedAction:
+          "the CTO session was launched with its Buzz channel but the channel did not register, and nothing was pressed beyond the one development-channels warning: " +
+          "attach to the project's tmux session, look at the screen it is stopped at, and deal with it yourself; ensure-resident refuses to start a second Claude until that session ends",
       });
     }
     // acp-daemon-notice/v1: a refusal notice the daemon could not deliver to the CEO, terminally —

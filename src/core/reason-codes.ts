@@ -765,6 +765,12 @@ export const ReasonCode = {
    * again gives the same answer. Not a staleness code, because nothing re-derived would admit it.
    */
   BUZZ_MENTION_PRECEDES_BINDING: "BUZZ_MENTION_PRECEDES_BINDING",
+  /**
+   * A CTO session ACP launched with its Buzz channel never got the channel registered, and the launcher
+   * pressed nothing to make it: the screen was not the one development-channels warning it may confirm, or
+   * the warning was confirmed and the channel did not register. The session may still be running.
+   */
+  CTO_CHANNEL_STARTUP_REFUSED: "CTO_CHANNEL_STARTUP_REFUSED",
 
   // --- canonical turns -----------------------------------------------------
   /**
