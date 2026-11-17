@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
@@ -11,6 +11,9 @@ import { ATTACH_EXIT, runAttachRelay, type ReattachPolicy } from "../../src/cli/
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startLocalMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
+import { RoleConversationPort } from "../../src/mcp/role-conversation.ts";
+import { digestOf } from "../../src/core/digest.ts";
+import { MessageKind } from "../../src/outbox/envelope.ts";
 import { count } from "../helpers/adopted-ceo.ts";
 import {
   canonicalCtoFixture,
@@ -253,11 +256,26 @@ const secretDoorClient = async (f: Started) => {
  * running in a live session can be measured against this daemon. argv[0] is `process.execPath`.
  */
 const relayRoots = [
-  { name: "this tree", root: process.cwd() },
-  ...(process.env["ACP_COMPAT_RELAY_ROOT"] ? [{ name: "ACP_COMPAT_RELAY_ROOT", root: process.env["ACP_COMPAT_RELAY_ROOT"] }] : []),
+  // Told at initialized; after a restart, at initialized and again after the restoring ping.
+  { name: "this tree", root: process.cwd(), compat: false, fresh: 1, restarted: 3 },
+  // An earlier build's relay registers its wake proxy, so it is told once more after that registration's answer,
+  // and again after the replay of it on a restart. It never asks the restoring ping.
+  ...(process.env["ACP_COMPAT_RELAY_ROOT"]
+    ? [{ name: "ACP_COMPAT_RELAY_ROOT", root: process.env["ACP_COMPAT_RELAY_ROOT"], compat: true, fresh: 2, restarted: 4 }]
+    : []),
 ];
+const MESSAGING_TOKEN = "fixture-messaging-token-4c1e";
 
-const processRelay = async (f: Started, root: string) => {
+const processRelay = async (f: Started, root: string, compat = false) => {
+  // An earlier build's relay opens a wake proxy beside the session's own messaging socket, which it needs
+  // in its environment and proves against the stand-in Claude Code's registry record. This tree's does not.
+  const session = compat
+    ? await listening(join(f.dir, "client.sock"), (socket) => {
+      socket.on("error", () => undefined);
+      socket.resume();
+    })
+    : null;
+  if (session !== null) closers.push(() => closed(session));
   const argv = [
     process.execPath,
     "--import",
@@ -280,25 +298,21 @@ const processRelay = async (f: Started, root: string) => {
     ACP_CLAIM_CANONICAL_CTO_SOCKET: f.paths.claimPath,
     ACP_CTO_MCP_SOCKET: f.paths.ctoPath,
     ACP_CANONICAL_CTO_TOOL_SOCKET: f.paths.reattachPath,
+    ...(compat
+      ? { CLAUDE_CODE_MESSAGING_SOCKET: join(f.dir, "client.sock"), CLAUDE_CODE_MESSAGING_TOKEN: MESSAGING_TOKEN }
+      : {}),
   };
   // The kernel reports the child as the door's peer; it runs under the stated claude.
   const peer = { ppid: CLAUDE, startedAt: "darwin-tv:1790000600.000006", argv: ["node", "agentctl", "attach"] };
-  let child: ChildProcess;
-  if (root === process.cwd()) {
-    // Run under a stand-in Claude Code; the daemon is told the relay's pid first.
-    const parent = spawnUnderClaude({
-      dir: join(f.dir, "claude-parent"), home: f.dir, sessionId: CONVERSATION,
-      socketPath: null, argv, env, cwd: root, autoStart: false,
-    });
-    child = parent.child;
-    children.push(child);
-    f.subject.processes.set(await parent.relayPid(), peer);
-    parent.start();
-  } else {
-    child = spawn(argv[0]!, argv.slice(1), { cwd: root, env, stdio: ["pipe", "pipe", "pipe"] });
-    children.push(child);
-    f.subject.processes.set(child.pid!, peer);
-  }
+  // Run under a stand-in Claude Code; the daemon is told the relay's pid first.
+  const parent = spawnUnderClaude({
+    dir: join(f.dir, "claude-parent"), home: f.dir, sessionId: CONVERSATION,
+    socketPath: compat ? join(f.dir, "client.sock") : null, argv, env, cwd: root, autoStart: false,
+  });
+  const child: ChildProcess = parent.child;
+  children.push(child);
+  f.subject.processes.set(await parent.relayPid(), peer);
+  parent.start();
   let errText = "";
   child.stderr!.setEncoding("utf8");
   child.stderr!.on("data", (chunk: string) => {
@@ -395,6 +409,101 @@ describe("W2: a reattach restores the client's connection", () => {
   });
 });
 
+describe("W3: a relay of an earlier build, which replays its registration and never asks the restoring ping", () => {
+  const registration = (f: Started, id: string) => ({
+    name: "role_wake_endpoint_register",
+    arguments: { endpoint: join(f.dir, "w.sock"), acceptance: "relay-v1" },
+    id,
+  });
+
+  it("is told after the registration's answer, once, and a second registration or a late ping adds none", async () => {
+    const f = await started({ tap: true });
+    const before = tuple(f);
+    const client = reattachDoorClient(f);
+    expect((await client.initialize(qualified)).error).toBeUndefined();
+    servesTheList(await refreshed(client, 1));
+
+    const first = registration(f, "acp-relay-rewake-1");
+    const answered = await client.request("tools/call", { name: first.name, arguments: first.arguments }, first.id);
+    expect(answered.result?.structuredContent).toMatchObject({ ok: true });
+    servesTheList(await refreshed(client, 2));
+
+    const second = registration(f, "acp-relay-rewake-2");
+    expect((await client.request("tools/call", { name: second.name, arguments: second.arguments }, second.id)).error).toBeUndefined();
+    expect((await ping(client, "acp-relay-restored-late")).error).toBeUndefined();
+    await settled(client, 2);
+
+    // On the wire the second notification is behind the registration's answer, never ahead of it.
+    const lines = f.tap!.of(f.tap!.connections() - 1);
+    const answeredAt = lines.findIndex((line) => line.direction === "fromDaemon" && line.message["id"] === first.id);
+    const told = lines.flatMap((line, index) =>
+      line.direction === "fromDaemon" && line.message["method"] === LIST_CHANGED ? [index] : []);
+    expect(answeredAt).toBeGreaterThan(-1);
+    expect(told).toHaveLength(2);
+    expect(told[1]).toBeGreaterThan(answeredAt);
+    expect(tuple(f)).toEqual(before);
+    expect(before.claims).toBe(0);
+  });
+
+  it("a restoring ping and the registration of one restore send one notification between them", async () => {
+    const f = await started();
+    const client = reattachDoorClient(f);
+    expect((await client.initialize(qualified)).error).toBeUndefined();
+    servesTheList(await refreshed(client, 1));
+    expect((await ping(client, "acp-relay-restored-1")).error).toBeUndefined();
+    servesTheList(await refreshed(client, 2));
+    const late = registration(f, "acp-relay-rewake-3");
+    expect((await client.request("tools/call", { name: late.name, arguments: late.arguments }, late.id)).error).toBeUndefined();
+    await settled(client, 2);
+  });
+});
+
+describe("a CTO is told, by the standard pending tool, which roles hold Buzz messages to read", () => {
+  /** An owner message with a real ingress row behind it, queued for the CTO's current holder. */
+  const queueOwnerMessage = (f: Started, nonce: string, text: string): void => {
+    const { cp } = f.subject.h;
+    const holder = cp.bindings.active(CTO)!;
+    const payload = { text };
+    cp.db.run(
+      "INSERT INTO inbound_messages (channel, nonce, actor, received_at, payload_json) VALUES ('buzz', ?, 'owner', ?, ?)",
+      [nonce, cp.clock.nowIso(), JSON.stringify(payload)],
+    );
+    expect(cp.outbox.enqueue({
+      idempotencyKey: nonce, roleKey: CTO, bindingGeneration: holder.bindingGeneration,
+      targetSessionId: holder.sessionId, runId: null, kind: MessageKind.OWNER_MESSAGE,
+      payload: { sourceChannel: "buzz", sourceNonce: nonce, sourcePayloadDigest: digestOf(payload) },
+    }).allowed).toBe(true);
+  };
+  const pending = async (client: RecordingMcpClient) =>
+    (await client.request("tools/call", { name: "role_dispatch_pending", arguments: {} })).result?.structuredContent;
+
+  it("names the role, and the tools that read, complete and reject its messages, only while one is waiting", async () => {
+    const f = await started();
+    const client = reattachDoorClient(f);
+    expect((await client.initialize(qualified)).error).toBeUndefined();
+    // Nothing waiting: the answer keeps its shape, with no `buzzMessages`.
+    expect(await pending(client)).toMatchObject({ ok: true, value: { messages: [] } });
+    expect((await pending(client))?.["value"]).not.toHaveProperty("buzzMessages");
+
+    queueOwnerMessage(f, "pending-tool-discovery", "a message waiting for the CTO");
+    expect(await pending(client)).toMatchObject({
+      ok: true,
+      value: {
+        messages: [],
+        buzzMessages: {
+          roleKeys: [CTO],
+          read: "role_owner_message_claim",
+          acknowledge: "role_owner_message_complete",
+          reject: "role_owner_message_reject",
+        },
+      },
+    });
+    // The role is named for a message, and the message is read with the tool it names.
+    const claimed = await client.request("tools/call", { name: "role_owner_message_claim", arguments: { roleKey: CTO } });
+    expect(claimed.result?.structuredContent).toMatchObject({ ok: true, value: { claimed: { text: "a message waiting for the CTO" } } });
+  });
+});
+
 describe("W4: on the door socket", () => {
   it("on a reattach, one list_changed follows initialized and the last follows the restoring ping's answer", async () => {
     const f = await started({ tap: true });
@@ -483,24 +592,51 @@ describe("a notification that cannot be sent", () => {
 });
 
 describe("the relay as a process, across a restart", () => {
-  for (const { name, root } of relayRoots) {
+  for (const { name, root, compat, fresh, restarted } of relayRoots) {
     it(`${name}: the last notification after the reattach is answered`, async () => {
       const f = await started();
-      const r = await processRelay(f, root);
+      const r = await processRelay(f, root, compat);
       const init = await r.client.initialize(qualified);
       expect(init.error, r.err()).toBeUndefined();
-      servesTheList(await refreshed(r.client, 1));
-      await settled(r.client, 1);
+      servesTheList(await refreshed(r.client, fresh));
+      await settled(r.client, fresh);
       const before = tuple(f);
 
       await f.restart();
-      const last = await refreshed(r.client, 3, 30_000);
+      const last = await refreshed(r.client, restarted, 30_000);
       expect(last.error?.code).not.toBe(RELAY_REATTACHING_ERROR_CODE);
       servesTheList(last);
-      await settled(r.client, 3);
+      await settled(r.client, restarted);
       expect(tuple(f)).toEqual(before);
       expect(before.claims).toBe(0);
       await r.finish();
     }, 60_000);
+
+    if (compat) {
+      it(`${name}: a registration answered 100 ms late still ends in a served refresh, not a refused one`, async () => {
+        const f = await started();
+        const r = await processRelay(f, root, compat);
+        expect((await r.client.initialize(qualified)).error, r.err()).toBeUndefined();
+        servesTheList(await refreshed(r.client, fresh));
+        await settled(r.client, fresh);
+
+        // The daemon is slow to answer the replayed registration, so the relay is still refusing when the
+        // notification sent at initialized can reach its client; only the one after the answer is served.
+        const answer = RoleConversationPort.prototype.acknowledgeRegistration;
+        vi.spyOn(RoleConversationPort.prototype, "acknowledgeRegistration").mockImplementation(function (
+          this: RoleConversationPort,
+          server,
+        ) {
+          for (const until = Date.now() + 100; Date.now() < until;) { /* the daemon is busy */ }
+          return answer.call(this, server);
+        });
+        await f.restart();
+        const last = await refreshed(r.client, restarted, 30_000);
+        expect(last.error?.code).not.toBe(RELAY_REATTACHING_ERROR_CODE);
+        servesTheList(last);
+        await settled(r.client, restarted);
+        await r.finish();
+      }, 60_000);
+    }
   }
 });

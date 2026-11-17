@@ -1532,16 +1532,17 @@ export const startLocalMcpListeners = async (
      *
      * A canonical CTO's relay carries its client across a restart by replaying the client's
      * `initialize` and its `notifications/initialized` on a new connection through the reattach door,
-     * then asking a `ping`, and answers every client request with "reattaching" until the last of
-     * those is answered (src/cli/attach-relay.ts `restore`). The client never re-lists on its own, so a
-     * restart onto a build with other tools left it holding the old list.
+     * then asking a `ping` (an earlier build's relay replays its wake registration instead), and
+     * answers every client request with "reattaching" until the last of those is answered
+     * (src/cli/attach-relay.ts `restore`). The client never re-lists on its own, so a restart onto a
+     * build with other tools left it holding the old list.
      *
      * Every connection is told at `initialized`, whatever ids it uses, so no client goes without
-     * one. A connection the reattach door admitted is told again after the answer to the relay's
-     * restoring `ping` on it: that is the point a relay goes live, and the notification sent at
-     * `initialized` may have reached its client while the relay was still refusing requests. Which
-     * door admitted the connection is `door`, set by the door's own code after its admission, never
-     * by anything the client sends.
+     * one. A connection the reattach door admitted is told once more after the answer to the relay's
+     * restoring `ping`, or to its replayed registration, on it: that is the point a relay goes live,
+     * and the notification sent at `initialized` may have reached its client while the relay was
+     * still refusing requests. Which door admitted the connection is `door`, set by the door's own
+     * code after its admission, never by anything the client sends.
      *
      * The notification decides nothing, and the list the client then asks for is answered under this
      * connection's own authentication like any other request. A send that fails is written to stderr
@@ -1554,19 +1555,36 @@ export const startLocalMcpListeners = async (
     };
     server.server.oninitialized = refreshToolList;
     if (door === "canonical-reattach") {
-      // The registration is read on the transport, before the SDK dispatches it, so its answer is
-      // known whichever way the SDK answers it (a result, a refusal, or a request it rejects). The
+      // The trigger is read on the transport, before the SDK dispatches it, so its answer is known
+      // whichever way the SDK answers it (a result, a refusal, or a request it rejects). The
       // notification is sent once that answer is written, so it is behind it on the wire.
-      const registrations = new Set<string | number>();
+      //
+      // Two relays end a restore with a request of their own: this build's asks a `ping` under
+      // `CANONICAL_CTO_RESTORED_PING_PREFIX`, and an earlier build's replays its wake registration,
+      // `role_wake_endpoint_register`, which this daemon still answers. Either is the point at which
+      // the relay stops refusing the client, so either is followed by the notification. One restore
+      // is told once: after `notifications/initialized` the first trigger answered sends it, and a
+      // later one on the same connection does not.
+      const triggers = new Set<string | number>();
+      let toldSinceInitialized = false;
       const observeInbound = (message: JSONRPCMessage): void => {
-        if (!("method" in message) || !("id" in message)) return;
-        if (message.method !== "ping" || typeof message.id !== "string") return;
-        if (!message.id.startsWith(CANONICAL_CTO_RESTORED_PING_PREFIX)) return;
-        registrations.add(message.id);
+        if (!("method" in message)) return;
+        if (message.method === "notifications/initialized") {
+          toldSinceInitialized = false;
+          return;
+        }
+        if (!("id" in message)) return;
+        const restoringPing = message.method === "ping" && typeof message.id === "string" &&
+          message.id.startsWith(CANONICAL_CTO_RESTORED_PING_PREFIX);
+        const legacyRegistration = message.method === "tools/call" &&
+          (message.params as { name?: unknown } | undefined)?.name === "role_wake_endpoint_register";
+        if (restoringPing || legacyRegistration) triggers.add(message.id);
       };
       const observeSent = (message: JSONRPCMessage): void => {
         if ("method" in message || !("id" in message) || message.id === undefined || message.id === null) return;
-        if (registrations.delete(message.id)) refreshToolList();
+        if (!triggers.delete(message.id) || toldSinceInitialized) return;
+        toldSinceInitialized = true;
+        refreshToolList();
       };
       const connect = server.connect.bind(server);
       server.connect = (transport: Transport): Promise<void> => {
