@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { defaultConfig } from "../app/control-plane.ts";
 import { AUTO_GENERATION, runAdoptedCeoAttachRelay, runAttachRelayCommand, type AttachRelayClaim } from "./attach-relay.ts";
+import { createCtoPorts, runCtoCommand } from "./cto-command.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -43,6 +44,11 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl project register <name> <path> register a project and its primary repository
   agentctl project retire <id> <reason>    retire a project, preserving history
   agentctl project list                   list projects with derived activity and CI observations
+  agentctl cto list                       every CTO: generation, live session, channel, room, last Buzz
+  agentctl cto add|relaunch|retire <project> ...
+                                           one command per CTO lifecycle step, composed from the ones
+                                           below; prints its plan and changes nothing without --apply
+                                           (operator only). agentctl cto help for the arguments
   agentctl actor register <id> <generation> <expected-set-generation>
   agentctl actor list                     list registered conversational actors
   agentctl actor unregister <id> <generation> <expected-set-generation> <reason>
@@ -193,6 +199,12 @@ export const main = async (argv: string[]): Promise<number> => {
       process.env["ACP_OPERATOR_SOCKET"] ?? join(config.databasePath, "..", "agentcpd.operator.sock"),
     token: process.env["ACP_OPERATOR_TOKEN"],
   });
+
+  // The CTO lifecycle group composes the operator methods below with host steps; it reads the token from this
+  // client's environment and refuses --apply without it.
+  if (command === "cto") {
+    return runCtoCommand(args, await createCtoPorts({ databasePath: config.databasePath, operator: client, env: process.env }));
+  }
 
   // `daemon status` keeps its offline reading — it must answer when no daemon is running — but
   // it asks the daemon first. A parked daemon is the one state where the lock file is actively
