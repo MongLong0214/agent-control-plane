@@ -1,5 +1,5 @@
-import { accessSync, constants, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { accessSync, constants, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
 import { delimiter, dirname, join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
@@ -10,6 +10,7 @@ import { Daemon } from "../../src/daemon/daemon.ts";
 import { ExecutionMode, Role, RunKind } from "../../src/domain/types.ts";
 import { GuardedInvocationWriteBroker } from "../../src/runtime/provider.ts";
 import { type CandidateSnapshot, candidateSnapshotDigest, verifySnapshotFreshness } from "../../src/snapshot/candidate-snapshot.ts";
+import { WorkerCheckouts } from "../../src/registry/worker-checkout.ts";
 import { WorkerTurnRunner } from "../../src/run/worker-turn.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeCore, tempDir, writeFiles } from "../helpers/fixtures.ts";
@@ -845,8 +846,9 @@ describe("#1227 the cron lock is no longer passed over", () => {
 
 /**
  * #1268 — a managed turn is refused when CommitLore's notes mirror is unfetched, so a worker clone carries what its
- * resident's clone has of it: the notes refs, the fetch refspec for them, and the record that the remote's mirror was
- * looked for (what `commitlore doctor --fix` writes). Made with the clone, and refreshed on a later pass while no turn runs.
+ * resident's clone has of it: the notes refs and the fetch refspec for them. The record that the remote's mirror was looked
+ * for (what `commitlore doctor --fix` writes) is not carried: only the worker clone's own question to its origin records it.
+ * Made with the clone, and refreshed on a later pass while no turn runs.
  */
 describe("#1268 a worker clone carries its resident's CommitLore notes mirror", () => {
   const ORIGIN_KEY = "commitlore.notesabsence.r6f726967696e";
@@ -883,7 +885,8 @@ describe("#1268 a worker clone carries its resident's CommitLore notes mirror", 
       expect(notesRefs(checkout)).toBe(notesRefs(s.clone));
       expect(notesRefs(checkout)).toMatch(/^refs\/notes\/commitlore /);
       expect(fetchSpecs(checkout)).toContain("refs/notes/*:refs/notes/*");
-      expect(gitSync(checkout, ["config", "--local", ORIGIN_KEY])).toBe(ORIGIN);
+      // The record that the remote's mirror was looked for is not carried: the worker clone's own question records it.
+      expect(spawnSync("git", ["-C", checkout, "config", "--local", "--get", ORIGIN_KEY], { encoding: "utf8", timeout: 30_000 }).stdout).toBe("");
       // Nothing of the resident's clone was written.
       expect(gitSync(s.clone, ["status", "--porcelain", "--", "src"])).toBe("");
     });
@@ -900,7 +903,8 @@ describe("#1268 a worker clone carries its resident's CommitLore notes mirror", 
       await daemonPass(f);
       expect(notesRefs(checkout)).toBe(notesRefs(s.clone));
       expect(fetchSpecs(checkout)).toContain("refs/notes/*:refs/notes/*");
-      expect(gitSync(checkout, ["config", "--local", ORIGIN_KEY])).toBe(ORIGIN);
+      // The record that the remote's mirror was looked for is not carried: the worker clone's own question records it.
+      expect(spawnSync("git", ["-C", checkout, "config", "--local", "--get", ORIGIN_KEY], { encoding: "utf8", timeout: 30_000 }).stdout).toBe("");
     });
   });
 
@@ -973,6 +977,331 @@ describe("#1268 a worker clone carries its resident's CommitLore notes mirror", 
       };
       expect(asked(s.clone)).not.toBe("unfetched");
       expect(asked(checkout)).toBe(asked(s.clone));
+    });
+  });
+});
+
+/**
+ * #1268 — a repository whose remote has no CommitLore notes at all (FreshReadme) answered "unfetched" to every lookup under
+ * `required`: CommitLore calls the mirror unfetched unless there is a local notes ref, or the remote's absence of one is
+ * recorded (`commitlore.notesabsence.*`, which only `commitlore doctor --fix` writes, after `git ls-remote` answers empty),
+ * and a plain `git fetch` records nothing. The worker clone's pass now asks the remote itself, with the daemon's own git
+ * (CommitLore's child has no credentials): an empty answer is recorded as CommitLore records it, an answer with notes is
+ * fetched as the mirror, and any failure to ask records nothing, so a lookup that cannot be answered is still refused.
+ */
+describe("#1268 a worker clone of a repository whose remote has no notes is verified empty, not unfetched", () => {
+  const ORIGIN_KEY = "commitlore.notesabsence.r6f726967696e";
+  const REAL = ((): string | null => {
+    const explicit = process.env["ACP_TEST_REAL_COMMITLORE"];
+    if (explicit !== undefined && explicit !== "") return explicit;
+    for (const directory of (process.env["PATH"] ?? "").split(delimiter).filter((entry) => entry.startsWith("/"))) {
+      try {
+        accessSync(join(directory, "commitlore"), constants.X_OK);
+        return join(directory, "commitlore");
+      } catch {
+        // not here
+      }
+    }
+    return null;
+  })();
+  const setOrigin = (clone: string, url: string): void => {
+    const known = spawnSync("git", ["-C", clone, "remote", "get-url", "origin"], { encoding: "utf8", timeout: 30_000 }).status === 0;
+    gitSync(clone, ["remote", known ? "set-url" : "add", "origin", url]);
+  };
+  /** A bare copy of the resident's clone, which the clone's origin then names: a remote with no notes. */
+  const bareOriginFor = (clone: string): string => {
+    const bare = join(tempDir("acp-notes-origin-"), "origin.git");
+    gitSync(dirname(bare), ["clone", "-q", "--bare", clone, bare]);
+    setOrigin(clone, bare);
+    return bare;
+  };
+  const notesOf = (repo: string): string => {
+    const asked = spawnSync(REAL as string, ["context", "src/app.js", "--json"], { cwd: repo, encoding: "utf8", timeout: 60_000 });
+    return (JSON.parse(asked.stdout) as { notes: string }).notes;
+  };
+  const absenceOf = (repo: string): string => spawnSync("git", ["-C", repo, "config", "--local", "--get", ORIGIN_KEY], { encoding: "utf8", timeout: 30_000 }).stdout.trim();
+
+  it("an origin that answers with no notes is recorded as CommitLore records it, and the worker clone's notes are absent", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-none", [APP]);
+      becomeResident(f, s);
+      const bare = bareOriginFor(s.clone);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(absenceOf(checkout)).toBe(bare);
+      expect(gitSync(checkout, ["config", "--local", "--get-all", "remote.origin.fetch"])).toMatch(/refs\/notes\//);
+      // Nothing was pushed to the remote, and the resident's clone was not written.
+      expect(gitSync(bare, ["for-each-ref", "refs/notes/"])).toBe("");
+      expect(spawnSync("git", ["-C", s.clone, "config", "--local", "--get", ORIGIN_KEY], { encoding: "utf8", timeout: 30_000 }).stdout).toBe("");
+    });
+  });
+
+  it.skipIf(REAL === null)("with the real CLI, such a worker clone's context is notes absent, which a lookup under required takes as empty", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-none-real", [APP]);
+      becomeResident(f, s);
+      bareOriginFor(s.clone);
+      await daemonPass(f);
+      expect(notesOf(await registeredCheckout(f, s))).toBe("absent");
+    });
+  });
+
+  it("an origin that cannot be asked records nothing: the worker clone stays unfetched and a lookup under required is still refused", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-unreachable", [APP]);
+      becomeResident(f, s);
+      setOrigin(s.clone, join(tempDir("acp-notes-gone-"), "missing.git"));
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(absenceOf(checkout)).toBe("");
+      if (REAL !== null) expect(notesOf(checkout)).toBe("unfetched");
+    });
+  });
+
+  it("an origin that has notes has them fetched as the worker clone's mirror", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-some", [APP]);
+      becomeResident(f, s);
+      const bare = bareOriginFor(s.clone);
+      const other = join(tempDir("acp-notes-writer-"), "writer");
+      gitSync(dirname(other), ["clone", "-q", bare, other]);
+      gitSync(other, ["-c", "user.email=r@example.test", "-c", "user.name=r", "notes", "--ref=commitlore", "add", "-m", "Record-Id: r-0123456789ab", "HEAD"]);
+      gitSync(other, ["push", "-q", "origin", "refs/notes/commitlore:refs/notes/commitlore"]);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(gitSync(checkout, ["rev-parse", "--verify", "refs/notes/commitlore"])).toBe(gitSync(bare, ["rev-parse", "--verify", "refs/notes/commitlore"]));
+      expect(absenceOf(checkout)).toBe("");
+    });
+  });
+
+  /** `bare` gains notes, pushed by another clone of it. */
+  const remoteGainsNotes = (bare: string): void => {
+    const other = join(tempDir("acp-notes-writer-"), "writer");
+    gitSync(dirname(other), ["clone", "-q", bare, other]);
+    gitSync(other, ["-c", "user.email=r@example.test", "-c", "user.name=r", "notes", "--ref=commitlore", "add", "-m", "Record-Id: r-0123456789ab", "HEAD"]);
+    gitSync(other, ["push", "-q", "origin", "refs/notes/commitlore:refs/notes/commitlore"]);
+  };
+  const TEN_MINUTES = 10 * 60_000;
+
+  it("an absence recorded once is verified again on a later pass: a remote that has since gained notes has them fetched, and the record goes", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-regain", [APP]);
+      becomeResident(f, s);
+      const bare = bareOriginFor(s.clone);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(absenceOf(checkout)).toBe(bare);
+      remoteGainsNotes(bare);
+      f.harness.clock.advance(TEN_MINUTES);
+      await daemonPass(f);
+      expect(gitSync(checkout, ["rev-parse", "--verify", "refs/notes/commitlore"])).toBe(gitSync(bare, ["rev-parse", "--verify", "refs/notes/commitlore"]));
+      expect(absenceOf(checkout)).toBe("");
+    });
+  });
+
+  it("an absence recorded once is cleared when the remote can no longer be asked, so the lookup is refused again", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-gone", [APP]);
+      becomeResident(f, s);
+      const bare = bareOriginFor(s.clone);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(absenceOf(checkout)).toBe(bare);
+      renameSync(bare, `${bare}.moved`);
+      f.harness.clock.advance(TEN_MINUTES);
+      await daemonPass(f);
+      expect(absenceOf(checkout)).toBe("");
+      if (REAL !== null) expect(notesOf(checkout)).toBe("unfetched");
+    });
+  });
+
+  it("an absence record the resident's clone has is not carried to the worker clone: only what the worker clone's own question answered stands", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-uncarried", [APP]);
+      becomeResident(f, s);
+      const missing = join(tempDir("acp-notes-gone-"), "missing.git");
+      setOrigin(s.clone, missing);
+      gitSync(s.clone, ["config", "--local", ORIGIN_KEY, missing]);
+      gitSync(s.clone, ["config", "--local", "--add", "remote.origin.fetch", "refs/notes/*:refs/notes/*"]);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(absenceOf(checkout)).toBe("");
+      if (REAL !== null) expect(notesOf(checkout)).toBe("unfetched");
+    });
+  });
+
+  it("a notes refspec for another notes ref is not one for CommitLore's: the one CommitLore needs is added before the absence is recorded", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-refspec", [APP]);
+      becomeResident(f, s);
+      const bare = bareOriginFor(s.clone);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      gitSync(checkout, ["config", "--local", "--unset-all", ORIGIN_KEY]);
+      gitSync(checkout, ["config", "--local", "--unset-all", "remote.origin.fetch"]);
+      gitSync(checkout, ["config", "--local", "--add", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+      gitSync(checkout, ["config", "--local", "--add", "remote.origin.fetch", "refs/notes/review:refs/notes/review"]);
+      f.harness.clock.advance(TEN_MINUTES);
+      await daemonPass(f);
+      expect(absenceOf(checkout)).toBe(bare);
+      expect(gitSync(checkout, ["config", "--local", "--get-all", "remote.origin.fetch"]).split("\n")).toContain("refs/notes/*:refs/notes/*");
+      if (REAL !== null) expect(notesOf(checkout)).toBe("absent");
+    });
+  });
+
+  /** A method of `WorkerCheckouts` that stops where it is called until `release` is called. */
+  const pausedAt = (method: "notesMissing" | "carryNotes") => {
+    let release!: () => void;
+    const resumed = new Promise<void>((resolve) => { release = resolve; });
+    let reached!: () => void;
+    const inside = new Promise<void>((resolve) => { reached = resolve; });
+    const prototype = WorkerCheckouts.prototype as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+    const original = prototype[method]!;
+    vi.spyOn(prototype, method).mockImplementation(async function (this: unknown, ...args: unknown[]) {
+      reached();
+      await resumed;
+      return original.apply(this, args);
+    });
+    return { inside, release };
+  };
+  const gainNotes = (clone: string): void => {
+    gitSync(clone, ["-c", "user.email=r@example.test", "-c", "user.name=r", "notes", "--ref=commitlore", "add", "-m", "Record-Id: r-0123456789ab", "HEAD"]);
+  };
+
+  it("a refresh that was reading when a turn was admitted writes nothing to the worker clone while that turn is in flight", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "resident-notes-turn-first", [APP]);
+      becomeResident(f, s);
+      const worker = workerDoing(f);
+      try {
+        await daemonPass(f);
+        const checkout = await registeredCheckout(f, s);
+        const target = await provision(f, s, s.ids["app"]!);
+        const claimId = await claim(f, s, target, checkout);
+        gainNotes(s.clone);
+        const gate = pausedAt("notesMissing");
+        const pass = daemonPass(f);
+        await gate.inside;
+        // The turn is admitted while the refresh is still reading, and stays in flight.
+        worker.script = { hold: true, writes: { "src/app.js": "module.exports = () => 2;\n" } };
+        const ran = await f.cto(s.sessionId, "task_worker_run", { runId: s.runId, taskId: s.ids["app"]!, claimId });
+        expect(ran["ok"], JSON.stringify(ran).slice(0, 400)).toBe(true);
+        const executionId = (ran["value"] as { executionId: string }).executionId;
+        await vi.waitFor(() => expect(cp.tasks.execution(executionId)?.status).toBe("RUNNING"), { timeout: 10_000, interval: 20 });
+        gate.release();
+        await pass;
+        // The refresh found the clone held by that turn, and wrote nothing to it.
+        expect(gitSync(checkout, ["for-each-ref", "refs/notes/"])).toBe("");
+        worker.killAll();
+        await cp.workerTurns.settled(executionId);
+        const view = cp.workerTurns.describe(executionId, s.runId);
+        expect(JSON.stringify(view)).not.toMatch(/GIT_DIR_CHANGED/);
+        vi.restoreAllMocks();
+        await daemonPass(f);
+        expect(gitSync(checkout, ["for-each-ref", "refs/notes/"])).toMatch(/refs\/notes\/commitlore/);
+      } finally {
+        worker.killAll();
+      }
+    });
+  });
+
+  it("a turn is not admitted while a refresh is writing to the worker clone, and nothing is written while a turn is in flight on it", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "resident-notes-held", [APP]);
+      becomeResident(f, s);
+      const worker = workerDoing(f);
+      try {
+        await daemonPass(f);
+        const checkout = await registeredCheckout(f, s);
+        const target = await provision(f, s, s.ids["app"]!);
+        const claimId = await claim(f, s, target, checkout);
+        gainNotes(s.clone);
+
+        // A turn in flight on the clone: the pass writes nothing to it.
+        const inFlight = cp.workerTurns.holdForMaintenance(checkout);
+        expect(inFlight).not.toBeNull();
+        await daemonPass(f);
+        expect(gitSync(checkout, ["for-each-ref", "refs/notes/"])).toBe("");
+        inFlight!();
+
+        // A refresh writing to the clone: the turn's admission is refused, not interleaved with the writes.
+        const gate = pausedAt("carryNotes");
+        const pass = daemonPass(f);
+        await gate.inside;
+        worker.script = { writes: { "src/app.js": "module.exports = () => 2;\n" } };
+        const refused = await f.cto(s.sessionId, "task_worker_run", { runId: s.runId, taskId: s.ids["app"]!, claimId });
+        expect(refused["ok"], JSON.stringify(refused).slice(0, 400)).toBe(false);
+        expect(JSON.stringify(refused)).toMatch(/already has a worker turn in flight/);
+        gate.release();
+        await pass;
+        expect(gitSync(checkout, ["for-each-ref", "refs/notes/"])).toMatch(/refs\/notes\/commitlore/);
+        expect(cp.tasks.executions(s.runId)).toEqual([]);
+      } finally {
+        worker.killAll();
+      }
+    });
+  });
+
+  it("a question to origin that runs past its bound is an unanswered one: the pass goes on and the absence record goes", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "resident-notes-slow", [APP]);
+      becomeResident(f, s);
+      const bare = bareOriginFor(s.clone);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(absenceOf(checkout)).toBe(bare);
+      // The remote's git no longer answers within the bound.
+      const slow = join(tempDir("acp-notes-slow-"), "upload-pack.sh");
+      writeFileSync(slow, "#!/bin/sh\nexec sleep 30\n", { mode: 0o755 });
+      gitSync(checkout, ["config", "--local", "remote.origin.uploadpack", slow]);
+      f.harness.clock.advance(TEN_MINUTES);
+      await daemonPass(f);
+      expect(cp.audit.byKind("REPOSITORY_CHECKOUT_MOVE_REFUSED")).toEqual([]);
+      expect(absenceOf(checkout)).toBe("");
+      if (REAL !== null) expect(notesOf(checkout)).toBe("unfetched");
+    });
+  }, 90_000);
+
+  it("an origin with more than one url is not asked about: CommitLore reads one url and git asks another, so no absence is recorded for either", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-two-urls", [APP]);
+      becomeResident(f, s);
+      const bare = bareOriginFor(s.clone);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(absenceOf(checkout)).toBe(bare);
+      gitSync(checkout, ["config", "--local", "--add", "remote.origin.url", join(tempDir("acp-notes-other-"), "other.git")]);
+      f.harness.clock.advance(TEN_MINUTES);
+      await daemonPass(f);
+      expect(absenceOf(checkout)).toBe("");
+      if (REAL !== null) expect(notesOf(checkout)).toBe("unfetched");
+    });
+  });
+
+  it("an origin url that an included config file adds is one of its urls: with another beside it, no absence is recorded for either", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-included-url", [APP]);
+      becomeResident(f, s);
+      const empty = bareOriginFor(s.clone);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(absenceOf(checkout)).toBe(empty);
+      // The included url is read first; the clone's own is another remote, whose notes the first never had.
+      const other = join(tempDir("acp-notes-other-"), "other.git");
+      gitSync(dirname(other), ["clone", "-q", "--bare", s.clone, other]);
+      const included = join(tempDir("acp-notes-include-"), "origin.cfg");
+      writeFileSync(included, `[remote "origin"]\n\turl = ${empty}\n`);
+      const own = join(checkout, ".git", "config");
+      gitSync(checkout, ["config", "--local", "--unset-all", "remote.origin.url"]);
+      gitSync(checkout, ["config", "--local", "remote.origin.url", other]);
+      writeFileSync(own, `[include]\n\tpath = ${included}\n${readFileSync(own, "utf8")}`);
+      expect(gitSync(checkout, ["config", "--get-all", "remote.origin.url"]).split("\n")).toEqual([empty, other]);
+      f.harness.clock.advance(TEN_MINUTES);
+      await daemonPass(f);
+      expect(absenceOf(checkout)).toBe("");
     });
   });
 });

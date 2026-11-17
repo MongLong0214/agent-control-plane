@@ -901,6 +901,21 @@ export class WorkerTurnRunner {
     return this.settledWriter(runId, worktree);
   }
 
+  /**
+   * #1268 — holds `worktreeId` against worker turns while the control plane writes to its git dir between turns (CommitLore's
+   * notes mirror). A turn is held to the git dir it found at its admission, so a write that lands after one began fails it
+   * (GIT_DIR_CHANGED): this takes the same mark an admission takes, synchronously, so that a turn already admitted refuses the
+   * hold (null) and one that comes later is refused (CONFLICT) until the returned function releases it.
+   */
+  holdForMaintenance(worktreeId: string): (() => void) | null {
+    const worktree = canonical(worktreeId);
+    if (this.#busyWorktrees.has(worktree)) return null;
+    this.#busyWorktrees.add(worktree);
+    return () => {
+      this.#busyWorktrees.delete(worktree);
+    };
+  }
+
   /** `checkoutWriter` past the turns in flight, which a turn's admission refuses on its own terms. */
   private settledWriter(runId: string, worktree: string): CheckoutWriterFact | null {
     const groups = [...this.#gitRegistries]

@@ -5,7 +5,7 @@ import { verifyEvent } from "nostr-tools/pure";
 
 import type { Decision } from "../core/errors.ts";
 import { buzzMessageEventId, ownerMessagePointerOf } from "../ingress/buzz-message.ts";
-import type { HolderIdentity } from "../outbox/outbox.ts";
+import { outboxDeliveryReadback, type HolderIdentity, type OutboxMessage } from "../outbox/outbox.ts";
 import type { ChannelReceipt } from "./buzz-channel.ts";
 import { isChannelReceipt, replyToOf } from "./buzz-channel.ts";
 import { BUZZ_CHANNEL_RECEIPT_SUFFIX, channelDir, readChannelReceipts } from "./buzz-channel-files.ts";
@@ -30,9 +30,13 @@ import { BUZZ_CHANNEL_RECEIPT_SUFFIX, channelDir, readChannelReceipts } from "./
  * Nothing is lost by ignoring one: the message stays `PENDING` and the doctor names it.
  */
 
+/** What the row says about delivery, as the shared interpretation reads it: never a status on its own. */
+export type ChannelQueueDelivery = ReturnType<typeof outboxDeliveryReadback>;
+
 export interface ChannelQueueMessage {
   readonly messageId: string;
-  readonly status: "PENDING" | "SENT";
+  /** The row's status and failure class through `outboxDeliveryReadback`, the one projection every reader uses. */
+  readonly delivery: ChannelQueueDelivery;
   readonly holder: HolderIdentity;
   readonly eventId: string;
   /** The Buzz room the event was written in; `null` when the stored envelope cannot say. */
@@ -113,16 +117,22 @@ const applyOne = (deps: ChannelQueueDeps, roleKey: string, receipt: ChannelRecei
       return;
     }
   }
+  // A message whose outcome is unknown, or held from automatic resend, is not this module's to deliver or to complete.
   let current = message;
-  if (current.status === "PENDING") {
+  if (current.delivery.automaticResendHeld) {
+    result.ignored += 1;
+    return;
+  }
+  if (!current.delivery.delivered) {
     if (!deps.deliver(current).allowed) {
       result.ignored += 1;
       return;
     }
     result.delivered.push(current.messageId);
-    current = { ...current, status: "SENT" };
+    // The claim moved the row to SENT, with no failure class: read the same way it will be next time.
+    current = { ...current, delivery: outboxDeliveryReadback({ status: "SENT", failureClass: null }) };
   }
-  if (receipt.type === "replied" && current.status === "SENT") {
+  if (receipt.type === "replied" && current.delivery.delivered && !current.delivery.completed) {
     if (deps.complete(current).allowed) result.completed.push(current.messageId);
     else result.ignored += 1;
   }
@@ -146,8 +156,8 @@ export interface ChannelQueueDatabase {
 export const channelQueueMessages = (db: ChannelQueueDatabase, incarnationOf: (sessionId: string) => string | null) =>
   (roleKey: string): ChannelQueueMessage[] =>
     db
-      .all<{ message_id: string; status: "PENDING" | "SENT"; role_key: string; binding_generation: number; target_session_id: string; payload_json: string }>(
-        `SELECT message_id, status, role_key, binding_generation, target_session_id, payload_json FROM outbox
+      .all<{ message_id: string; status: "PENDING" | "SENT"; failure_class: OutboxMessage["failureClass"]; role_key: string; binding_generation: number; target_session_id: string; payload_json: string }>(
+        `SELECT message_id, status, failure_class, role_key, binding_generation, target_session_id, payload_json FROM outbox
           WHERE role_key = ? AND kind IN ('OWNER_MESSAGE','PEER_MESSAGE') AND status IN ('PENDING','SENT')
           ORDER BY created_at, rowid`,
         [roleKey],
@@ -174,7 +184,7 @@ export const channelQueueMessages = (db: ChannelQueueDatabase, incarnationOf: (s
         }
         return [{
           messageId: row.message_id,
-          status: row.status,
+          delivery: outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }),
           holder: {
             roleKey: row.role_key,
             bindingGeneration: row.binding_generation,
