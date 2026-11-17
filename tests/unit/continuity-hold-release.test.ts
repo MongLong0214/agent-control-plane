@@ -20,6 +20,7 @@ import { MessageKind } from "../../src/outbox/envelope.ts";
 import { CONTINUITY_PAUSE_RUNTIME_LOST_REASON } from "../../src/run/run-engine.ts";
 import { standardWorkContinuationTriggerKind } from "../../src/runtime/provisioned-session-runtime.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
+import { callCtoToolAsOwner } from "../helpers/bootstrap-plan.ts";
 import { drivenPrimary } from "../helpers/driven-primary-cto.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { bindWorkerForTask } from "../helpers/harness.ts";
@@ -985,6 +986,45 @@ describe("a hold is released across review evidence staged or attached after the
       await reconcile(f, "the CEO is bound again");
       expectReleased(f, runId);
       expectHeld(f, other);
+    });
+  });
+});
+
+/**
+ * Live run_7ae63b57 (FreshReadme): continuity paused the run when the CEO's runtime was lost, and three minutes
+ * later the owner CTO's plan_submit was accepted on the held run (TASK_GRAPH_SUBMITTED, its earlier tasks
+ * superseded). The release then kept the hold for good, for that TASK_GRAPH_SUBMITTED, and nothing could
+ * release it. The hold pauses new work: plan_submit on a held run is refused before anything is written, and
+ * the release goes ahead once the held role is covered again.
+ */
+describe("a held run refuses plan_submit before anything is written, so the hold is still released", () => {
+  it("plan_submit, superseding the run's task, on a run held for the CEO's lost runtime: refused, nothing written, and the run is released when the CEO is bound again", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const project = await ownedProject(f, scriptOwners(f), "hold-plan-submit");
+      const runId = await stalledRun(f, project);
+      await loseCeo(f);
+      expectHeld(f, runId);
+      const earlier = cp.tasks.list(runId);
+      const audited = cp.audit.forRun(runId).length;
+      const plans = cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN'`, [runId])!.n;
+      const refused = await callCtoToolAsOwner(f.harness, runId, "plan_submit", {
+        idempotencyKey: `hold-${++keys}`,
+        runId,
+        plan: { summary: "a re-plan sent while the run is held", supersedesTaskIds: earlier.map((task) => task.taskId) },
+        tasks: [{ key: "readme-again", title: "update README.md again", category: "docs", spec: {} }],
+      });
+      expect(refused.body, refused.text).toMatchObject({
+        ok: false, reasonCode: ReasonCode.RUN_TRANSITION_ILLEGAL, evidence: { refusal: "RUN_UNDER_CONTINUITY_HOLD", runId },
+      });
+      expect(cp.tasks.list(runId)).toEqual(earlier);
+      expect(cp.audit.forRun(runId).length).toBe(audited);
+      expect(cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN'`, [runId])!.n).toBe(plans);
+      expectHeld(f, runId);
+      readoptCeo(f);
+      const pass = await reconcile(f, "the CEO is bound again");
+      expect(pass.continuityHolds.released).toEqual([runId]);
+      expectReleased(f, runId);
     });
   });
 });
