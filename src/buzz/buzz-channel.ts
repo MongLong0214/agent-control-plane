@@ -50,9 +50,7 @@ export const RESUME_OVERLAP_SECONDS = 10;
 /** First start with no saved cursor: ask this far back, so a message sent while the session was starting is not lost. */
 export const FIRST_START_LOOKBACK_SECONDS = 300;
 
-const SEEN_LIMIT = 4096;
 const THREAD_LIMIT = 4096;
-const PERSISTED_SEEN = 512;
 const PERSISTED_THREADS = 1024;
 
 export type ChannelSenderRole = "ceo" | "owner";
@@ -91,11 +89,44 @@ export interface SignedEvent {
   readonly sig: string;
 }
 
-/** The state that outlives the process: where to resume, and what has already been shown. */
+const isString = (value: unknown): value is string => typeof value === "string";
+const isCount = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+
+/**
+ * Whether a parsed value has the exact shape of a receipt. Receipts come from a file any process of this
+ * user can append to, so a reader checks each one's shape before reading a field of it: one malformed
+ * receipt is skipped and counted, never allowed to abort the ones around it.
+ */
+export const isChannelReceipt = (value: unknown): value is ChannelReceipt => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const r = value as Record<string, unknown>;
+  if (r["type"] === "emitted") {
+    return isString(r["eventId"]) && isString(r["room"]) && isString(r["senderPubkey"]) && isCount(r["emittedAt"]);
+  }
+  if (r["type"] !== "replied") return false;
+  const e = r["event"];
+  if (typeof e !== "object" || e === null || Array.isArray(e)) return false;
+  const event = e as Record<string, unknown>;
+  return (
+    isString(event["id"]) && isString(event["pubkey"]) && isString(event["sig"]) && isString(event["content"]) &&
+    Number.isSafeInteger(event["created_at"]) && Number.isSafeInteger(event["kind"]) &&
+    Array.isArray(event["tags"]) && event["tags"].every((tag) => Array.isArray(tag) && tag.every(isString)) &&
+    isString(r["room"]) && isString(r["parentEventId"]) && (r["ack"] === "ACCEPTED" || r["ack"] === "DUPLICATE") && isCount(r["repliedAt"])
+  );
+};
+
+/**
+ * The state that outlives the process: where to resume, what has already been shown, and which events a
+ * thread can still be answered under.
+ *
+ * `cursor` is where a restart asks from, never past an event that was not delivered. `seen` holds every
+ * delivered id (with the time it was written) that a resume could replay, so it is pruned by that time
+ * and never by count. `threads` are `[id, author, room, root]` for every event delivered or posted here.
+ */
 export interface ChannelState {
   readonly cursor: number;
-  readonly seen: readonly string[];
-  readonly threads: readonly (readonly [string, string])[];
+  readonly seen: readonly (readonly [string, number])[];
+  readonly threads: readonly (readonly [string, string, string, string])[];
 }
 
 export interface ChannelStateStore {
@@ -243,9 +274,12 @@ export class BuzzChannelRelay {
   readonly #o: BuzzChannelOptions;
   readonly #open: BuzzRelaySocketFactory;
   readonly #sched: ChannelScheduler;
-  readonly #seen = new Recent<string, true>(SEEN_LIMIT);
-  /** event id -> its author, for every event delivered here or published from here. */
-  readonly #threads = new Recent<string, string>(THREAD_LIMIT);
+  /** Delivered event id -> when it was written. Pruned by that time (a resume never asks before the cursor), not by count. */
+  readonly #seen = new Map<string, number>();
+  /** Events whose notification failed: id -> clamped time. The resume point never passes the oldest of them. */
+  readonly #retry = new Map<string, number>();
+  /** Every event delivered here or posted from here: where it was written, by whom, and the thread it belongs to. */
+  readonly #known = new Recent<string, KnownEvent>(THREAD_LIMIT);
   readonly #subId: string;
   #socket: BuzzRelaySocket | null = null;
   #generation = 0;
@@ -281,13 +315,23 @@ export class BuzzChannelRelay {
     const saved = options.store?.load() ?? null;
     if (saved !== null) {
       this.#cursor = saved.cursor;
-      for (const id of saved.seen) this.#seen.add(id, true);
-      for (const [id, author] of saved.threads) this.#threads.add(id, author);
+      for (const [id, at] of saved.seen) this.#seen.set(id, at);
+      for (const [id, author, room, root] of saved.threads) this.#known.add(id, { author, room, root });
     }
   }
 
   status(): BuzzChannelStatus {
-    return { connected: this.#socket !== null, subscribed: this.#subscribed, delivered: this.#delivered, cursor: this.#cursor };
+    return { connected: this.#socket !== null, subscribed: this.#subscribed, delivered: this.#delivered, cursor: this.#resumeFrom() };
+  }
+
+  /**
+   * Where a resume asks from: the newest event handled, but never past the oldest one whose notification
+   * failed, so a failure keeps its place in line however many later events were delivered.
+   */
+  #resumeFrom(): number | null {
+    const oldestFailed = this.#retry.size === 0 ? null : Math.min(...this.#retry.values());
+    if (oldestFailed === null) return this.#cursor;
+    return this.#cursor === null ? oldestFailed : Math.min(this.#cursor, oldestFailed);
   }
 
   start(): void {
@@ -334,8 +378,13 @@ export class BuzzChannelRelay {
       return { deliver: false, reason: "other-recipient" };
     }
     const mentionsMe = recipients.length === 1;
-    const inThread = replyTo !== "" && this.#threads.has(replyTo);
-    const ownerOpen = role === "owner" && recipients.length === 0;
+    // A thread is (room, root): a reply belongs to one this CTO is in only when the event it answers was
+    // delivered or posted here, in the same room. An id seen in another room names nothing in this one.
+    const parent = replyTo === "" ? undefined : this.#known.get(replyTo);
+    const inThread = parent !== undefined && parent.room === room;
+    // An owner's message that names nobody is addressed to this room's CTO only when it starts a topic:
+    // a reply (any `e` tag) is for the thread it is in, and a thread this CTO never joined is not its own.
+    const ownerOpen = role === "owner" && recipients.length === 0 && tagValues(event, "e").length === 0;
     if (!mentionsMe && !inThread && !ownerOpen) return { deliver: false, reason: "not-addressed" };
     if (this.#seen.has(event.id)) return { deliver: false, reason: "duplicate" };
     return { deliver: true, role, room, replyTo };
@@ -347,8 +396,13 @@ export class BuzzChannelRelay {
     if (!HEX64.test(input.eventId)) return { ok: false, reason: "eventId is not a Buzz event id" };
     if (input.text.trim().length === 0) return { ok: false, reason: "the reply is empty" };
     if (input.text.length > MAX_REPLY_CHARACTERS) return { ok: false, reason: "the reply is too long" };
-    const recipient = this.#threads.get(input.eventId) ?? this.#o.ceoPubkeys()[0];
-    if (recipient === undefined || recipient === this.pubkey) return { ok: false, reason: "no recipient is known for that event" };
+    // Only an event this channel delivered can be answered, and only in the room it was written in: the
+    // reply is addressed to that event's author, so a parent nobody here received has no one to answer.
+    const parent = this.#known.get(input.eventId);
+    if (parent === undefined) return { ok: false, reason: "that event was not received on this channel" };
+    if (parent.room !== input.room) return { ok: false, reason: "that event was written in another room" };
+    const recipient = parent.author;
+    if (recipient === this.pubkey) return { ok: false, reason: "that event is this CTO's own" };
     const socket = this.#socket;
     if (socket === null || !this.#subscribed) return { ok: false, reason: "the relay connection is not up" };
     const event = finalizeEvent(
@@ -373,7 +427,7 @@ export class BuzzChannelRelay {
     if (ack.status !== "ACCEPTED" && ack.status !== "DUPLICATE") {
       return { ok: false, reason: `the relay did not accept the reply (${ack.status})` };
     }
-    this.#threads.add(event.id, this.pubkey);
+    this.#known.add(event.id, { author: this.pubkey, room: input.room, root: parent.root });
     this.#persist();
     this.#o.onReceipt?.({
       type: "replied",
@@ -448,9 +502,10 @@ export class BuzzChannelRelay {
   }
 
   #filters(): Record<string, unknown>[] {
-    const since = this.#cursor === null
+    const resume = this.#resumeFrom();
+    const since = resume === null
       ? this.#sched.nowSeconds() - FIRST_START_LOOKBACK_SECONDS
-      : Math.max(0, this.#cursor - RESUME_OVERLAP_SECONDS);
+      : Math.max(0, resume - RESUME_OVERLAP_SECONDS);
     const authors = [...new Set([...this.#o.ownerPubkeys, ...this.#o.ceoPubkeys()])];
     const filters: Record<string, unknown>[] = [
       { kinds: [BUZZ_MENTION_KIND], "#p": [this.pubkey], "#h": [...this.#o.rooms], since },
@@ -543,15 +598,25 @@ export class BuzzChannelRelay {
           trust: "untrusted_peer_message",
         },
       };
+      const claimed = Math.min(event.created_at, this.#sched.nowSeconds());
       try {
         await this.#o.onNotification(notification);
       } catch {
-        // Not marked seen and the cursor does not pass it: the next connection asks for it again.
+        // Not marked seen, and the resume point stays at or before it however many later events are
+        // delivered: the next connection asks for it again.
+        this.#retry.set(event.id, claimed);
         this.#o.onDiagnostic?.("channel notification was not written to the session");
+        this.#persist();
         return;
       }
-      this.#seen.add(event.id, true);
-      this.#threads.add(event.id, event.pubkey);
+      this.#retry.delete(event.id);
+      this.#seen.set(event.id, event.created_at);
+      const parent = verdict.replyTo === "" ? undefined : this.#known.get(verdict.replyTo);
+      this.#known.add(event.id, {
+        author: event.pubkey,
+        room: verdict.room,
+        root: parent !== undefined && parent.room === verdict.room ? parent.root : event.id,
+      });
       this.#delivered += 1;
       this.#o.onReceipt?.({
         type: "emitted",
@@ -561,18 +626,23 @@ export class BuzzChannelRelay {
         emittedAt: this.#sched.nowSeconds(),
       });
     }
-    // A handled event, delivered or not, is behind the cursor; one that threw above is not.
+    // A handled event, delivered or not, is behind the cursor; one whose notification failed is not.
     const claimed = Math.min(event.created_at, this.#sched.nowSeconds());
     this.#cursor = Math.max(this.#cursor ?? 0, claimed);
     this.#persist();
   }
 
   #persist(): void {
-    if (this.#o.store === undefined || this.#cursor === null) return;
-    this.#o.store.save({
-      cursor: this.#cursor,
-      seen: this.#seen.entries().map(([id]) => id).slice(-PERSISTED_SEEN),
-      threads: this.#threads.entries().slice(-PERSISTED_THREADS),
+    const resume = this.#resumeFrom();
+    if (resume === null) return;
+    // A resume asks from `since`, so a delivered id older than that can never be replayed: those are
+    // dropped by their time, and every id from there on is kept however many there are.
+    const since = Math.max(0, resume - RESUME_OVERLAP_SECONDS);
+    for (const [id, at] of this.#seen) if (at < since) this.#seen.delete(id);
+    this.#o.store?.save({
+      cursor: resume,
+      seen: [...this.#seen.entries()],
+      threads: this.#known.entries().slice(-PERSISTED_THREADS).map(([id, e]) => [id, e.author, e.room, e.root] as const),
     });
   }
 
@@ -606,6 +676,12 @@ export class BuzzChannelRelay {
     if (id !== null) this.#socket?.send(JSON.stringify(["CLOSE", id]));
     this.#armKeepalive();
   }
+}
+
+interface KnownEvent {
+  readonly author: string;
+  readonly room: string;
+  readonly root: string;
 }
 
 type ReplyAckResult = { status: "ACCEPTED" | "DUPLICATE" | "REFUSED" | "TIMEOUT" | "UNAVAILABLE" };

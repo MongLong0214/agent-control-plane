@@ -107,8 +107,67 @@ describe("the rules for what a receipt may move", () => {
   it("changes nothing for an event that is no queued message, or a room that is not the message's", () => {
     const f = fake();
     const out = applyChannelReceipts(f.deps, holder.roleKey, [emitted("evt-unknown"), emitted("evt-1", "elsewhere")]);
-    expect(out).toEqual({ delivered: [], completed: [], ignored: 2 });
+    expect(out).toEqual({ delivered: [], completed: [], ignored: 2, invalid: 0 });
     expect(f.calls).toEqual([]);
+  });
+});
+
+describe("a malformed receipt is skipped and does not stop the batch", () => {
+  const holder = { roleKey: "PRIMARY_CTO:p", bindingGeneration: 1, targetSessionId: "s", sessionIncarnation: "i" };
+  const queue = () => {
+    const state = { status: "PENDING" as "PENDING" | "SENT" };
+    const deps: ChannelQueueDeps = {
+      messages: () => [{ messageId: "m1", status: state.status, holder, eventId: "evt-1", room: ROOM }],
+      boundActor: () => ctoPub,
+      deliver: () => {
+        state.status = "SENT";
+        return allow(ReasonCode.OK, undefined);
+      },
+      complete: () => allow(ReasonCode.OK, undefined),
+    };
+    return deps;
+  };
+
+  it("counts what is not a receipt, and applies the receipts after it", () => {
+    const broken = [
+      { type: "replied", event: {}, room: ROOM, parentEventId: "evt-1", ack: "ACCEPTED", repliedAt: 1 },
+      { type: "replied", room: ROOM, parentEventId: "evt-1", ack: "ACCEPTED", repliedAt: 1 },
+      { type: "emitted", eventId: 7, room: ROOM, senderPubkey: OWNER, emittedAt: 1 },
+      null,
+      "text",
+    ];
+    const out = applyChannelReceipts(queue(), holder.roleKey, [...broken, emitted("evt-1")]);
+    expect(out).toMatchObject({ delivered: ["m1"], invalid: 5 });
+  });
+
+  it("does not let a receipt whose handling throws take the rest with it", () => {
+    const deps = queue();
+    let first = true;
+    const original = deps.messages;
+    deps.messages = (role) => {
+      if (first) {
+        first = false;
+        throw new Error("a row the queue cannot read");
+      }
+      return original(role);
+    };
+    const out = applyChannelReceipts(deps, holder.roleKey, [emitted("evt-1"), emitted("evt-1")]);
+    expect(out).toMatchObject({ delivered: ["m1"], invalid: 1 });
+  });
+
+  it("reports a skipped line once, not on every replay of the file", () => {
+    const stateDir = tempDir("acp-channel-skip-");
+    mkdirSync(join(stateDir, "buzz-channel"), { recursive: true });
+    appendFileSync(channelReceiptPath(stateDir, "p"), `${JSON.stringify({ type: "replied", event: {} })}\n${JSON.stringify(emitted("evt-1"))}\n`);
+    const skipped: string[] = [];
+    const watcher = watchChannelReceipts(stateDir, () => holder.roleKey, queue(), () => undefined, (project, line) => skipped.push(`${project}:${line}`));
+    try {
+      watcher.apply();
+      watcher.apply();
+      expect(skipped).toEqual(["p:1"]);
+    } finally {
+      watcher.close();
+    }
   });
 });
 

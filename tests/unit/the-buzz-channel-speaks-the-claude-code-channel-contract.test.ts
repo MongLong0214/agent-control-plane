@@ -127,21 +127,40 @@ describe("the channel server meets Claude Code's channel contract", () => {
 describe("what the channel shares with the daemon", () => {
   const receipt = (n: number): ChannelReceipt => ({ type: "emitted", eventId: String(n).padStart(64, "0"), room: ROOM, senderPubkey: getPublicKey(ceo), emittedAt: n });
 
-  it("appends whole lines to an owner-only file and reads them back in order, skipping a torn tail", () => {
+  it("appends whole lines to an owner-only file and reads them back in order, skipping a torn tail without reporting it", () => {
     const state = tmp();
     appendChannelReceipt(state, "demo", receipt(1));
     appendChannelReceipt(state, "demo", receipt(2));
     const path = channelReceiptPath(state, "demo");
     expect(statSync(path).mode & 0o077).toBe(0);
     writeFileSync(path, `${readFileSync(path, "utf8")}{"type":"emitted","eventI`);
-    expect(readChannelReceipts(path).map((r) => (r.type === "emitted" ? r.emittedAt : -1))).toEqual([1, 2]);
+    const read = readChannelReceipts(path);
+    expect(read.receipts.map((r) => (r.type === "emitted" ? r.emittedAt : -1))).toEqual([1, 2]);
+    expect(read.skipped).toEqual([]);
+  });
+
+  it("skips a malformed receipt and reports its line, and still reads the ones around it", () => {
+    const state = tmp();
+    appendChannelReceipt(state, "demo", receipt(1));
+    const path = channelReceiptPath(state, "demo");
+    const lines = [
+      '{"type":"replied","event":{},"room":"r","parentEventId":"e","ack":"ACCEPTED","repliedAt":1}',
+      "not json at all",
+      '{"type":"emitted","eventId":7,"room":"r","senderPubkey":"s","emittedAt":1}',
+      '["an","array"]',
+      '{"type":"unknown"}',
+    ];
+    writeFileSync(path, `${readFileSync(path, "utf8")}${lines.join("\n")}\n${JSON.stringify(receipt(3))}\n`);
+    const read = readChannelReceipts(path);
+    expect(read.receipts.map((r) => (r.type === "emitted" ? r.emittedAt : -1))).toEqual([1, 3]);
+    expect(read.skipped).toEqual([2, 3, 4, 5, 6]);
   });
 
   it("keeps a long file bounded to its newest lines, and refuses a project id that is not a file name", () => {
     const state = tmp();
     for (let i = 0; i < 40; i += 1) appendChannelReceipt(state, "demo", receipt(i));
     trimChannelReceipts(state, "demo", 100, 5);
-    expect(readChannelReceipts(channelReceiptPath(state, "demo")).map((r) => (r.type === "emitted" ? r.emittedAt : -1))).toEqual([35, 36, 37, 38, 39]);
+    expect(readChannelReceipts(channelReceiptPath(state, "demo")).receipts.map((r) => (r.type === "emitted" ? r.emittedAt : -1))).toEqual([35, 36, 37, 38, 39]);
     expect(() => channelReceiptPath(state, "../escape")).toThrow();
   });
 
@@ -149,10 +168,18 @@ describe("what the channel shares with the daemon", () => {
     const state = tmp();
     const store = fileChannelStateStore(state, "demo");
     expect(store.load()).toBeNull();
-    store.save({ cursor: 7, seen: ["a"], threads: [["a", "b"]] });
-    expect(store.load()).toEqual({ cursor: 7, seen: ["a"], threads: [["a", "b"]] });
+    store.save({ cursor: 7, seen: [["a", 5]], threads: [["a", "b", "room", "a"]] });
+    expect(store.load()).toEqual({ cursor: 7, seen: [["a", 5]], threads: [["a", "b", "room", "a"]] });
     writeFileSync(join(state, "buzz-channel", "demo.state.json"), "{not json");
     expect(store.load()).toBeNull();
+  });
+
+  it("reads a state file written before ids carried a time or a room: bare ids kept at the cursor, room-less threads dropped", () => {
+    const state = tmp();
+    const store = fileChannelStateStore(state, "demo");
+    store.save({ cursor: 7, seen: [], threads: [] });
+    writeFileSync(join(state, "buzz-channel", "demo.state.json"), JSON.stringify({ cursor: 9, seen: ["old-id"], threads: [["t", "author"], ["u", "author", "room", "u"]] }));
+    expect(store.load()).toEqual({ cursor: 9, seen: [["old-id", 9]], threads: [["u", "author", "room", "u"]] });
   });
 
   it("reads the owner's buzz pubkeys from the same owner-identities declaration the daemon reads", () => {

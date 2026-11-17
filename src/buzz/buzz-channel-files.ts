@@ -1,7 +1,7 @@
 import { closeSync, constants as fsConstants, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
-import type { ChannelReceipt, ChannelState, ChannelStateStore } from "./buzz-channel.ts";
+import { isChannelReceipt, type ChannelReceipt, type ChannelState, type ChannelStateStore } from "./buzz-channel.ts";
 
 /**
  * The files a CTO's channel server shares with the daemon, all beneath the daemon's own state
@@ -49,25 +49,37 @@ export const trimChannelReceipts = (stateDir: string, projectId: string, maxByte
   renameSync(staging, path);
 };
 
-/** Every well-formed receipt in one file, oldest first; a torn or foreign line is skipped, never guessed at. */
-export const readChannelReceipts = (path: string): ChannelReceipt[] => {
+/**
+ * Every well-formed receipt in one file, oldest first, and the 1-based numbers of the lines that were not.
+ * A line that does not parse or does not have a receipt's shape is skipped and reported by its number, and
+ * the lines around it are read as if it were not there. A final line with no newline after it is the
+ * writer mid-append, not a malformed receipt, and is skipped without being reported.
+ */
+export const readChannelReceipts = (path: string): { receipts: ChannelReceipt[]; skipped: number[] } => {
   let text: string;
   try {
     text = readFileSync(path, "utf8");
   } catch {
-    return [];
+    return { receipts: [], skipped: [] };
   }
-  const out: ChannelReceipt[] = [];
-  for (const line of text.split("\n")) {
+  const receipts: ChannelReceipt[] = [];
+  const skipped: number[] = [];
+  const lines = text.split("\n");
+  const complete = text.endsWith("\n") ? lines.length : lines.length - 1;
+  for (let i = 0; i < complete; i += 1) {
+    const line = lines[i]!;
     if (line.length === 0) continue;
+    let value: unknown;
     try {
-      const value = JSON.parse(line) as ChannelReceipt;
-      if (value && (value.type === "emitted" || value.type === "replied")) out.push(value);
+      value = JSON.parse(line) as unknown;
     } catch {
-      /* a torn final line is the writer mid-append */
+      skipped.push(i + 1);
+      continue;
     }
+    if (isChannelReceipt(value)) receipts.push(value);
+    else skipped.push(i + 1);
   }
-  return out;
+  return { receipts, skipped };
 };
 
 /** The cursor and shown-ids a restarted channel server resumes from. Atomic, owner-only. */
@@ -77,13 +89,19 @@ export const fileChannelStateStore = (stateDir: string, projectId: string): Chan
   return {
     load: (): ChannelState | null => {
       try {
-        const value = JSON.parse(readFileSync(path, "utf8")) as Partial<ChannelState>;
+        const value = JSON.parse(readFileSync(path, "utf8")) as Partial<{ cursor: unknown; seen: unknown; threads: unknown }>;
         if (typeof value.cursor !== "number" || !Array.isArray(value.seen) || !Array.isArray(value.threads)) return null;
+        const cursor = value.cursor;
         return {
-          cursor: value.cursor,
-          seen: value.seen.filter((id): id is string => typeof id === "string"),
+          cursor,
+          // A file written before ids carried their time held bare ids: they are kept as written at the cursor.
+          seen: value.seen.flatMap((entry): [string, number][] =>
+            typeof entry === "string" ? [[entry, cursor]]
+              : Array.isArray(entry) && typeof entry[0] === "string" && typeof entry[1] === "number" ? [[entry[0], entry[1]]] : []),
+          // Two-element entries carried no room, so they cannot say a reply is in the thread's own room: dropped.
           threads: value.threads.filter(
-            (entry): entry is [string, string] => Array.isArray(entry) && typeof entry[0] === "string" && typeof entry[1] === "string",
+            (entry): entry is [string, string, string, string] =>
+              Array.isArray(entry) && entry.length === 4 && entry.every((member) => typeof member === "string"),
           ),
         };
       } catch {

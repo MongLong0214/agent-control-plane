@@ -95,7 +95,14 @@ interface FakeConnection {
   drop(): void;
 }
 
-const harness = (options: { store?: ChannelStateStore; ceoKeys?: () => readonly string[]; secretKey?: Uint8Array } = {}) => {
+const harness = (options: {
+  store?: ChannelStateStore;
+  ceoKeys?: () => readonly string[];
+  secretKey?: Uint8Array;
+  rooms?: string[];
+  /** Notification bodies whose first write to the session throws, as a closed transport would. */
+  failOnce?: Set<string>;
+} = {}) => {
   const connections: FakeConnection[] = [];
   const notifications: ChannelNotification[] = [];
   const receipts: ChannelReceipt[] = [];
@@ -123,10 +130,11 @@ const harness = (options: { store?: ChannelStateStore; ceoKeys?: () => readonly 
     relayUrl: RELAY,
     projectId: "demo",
     secretKey: options.secretKey ?? cto,
-    rooms: [ROOM],
+    rooms: options.rooms ?? [ROOM],
     ceoPubkeys: options.ceoKeys ?? (() => [ceoPub]),
     ownerPubkeys: [ownerPub],
     onNotification: async (n) => {
+      if (options.failOnce?.delete(n.content)) throw new Error("transport closed");
       notifications.push(n);
     },
     onReceipt: (r) => receipts.push(r),
@@ -395,7 +403,149 @@ describe("a reconnect resumes where it stopped", () => {
     c.push(["EVENT", "acp-channel-" + ctoPub.slice(0, 12), mention(ceo, "lost in transit", 1_500)]);
     await relay.settled();
     expect(relay.status().delivered).toBe(0);
-    expect(relay.status().cursor).toBeNull();
+    // Resume from the event it could not show, not from nowhere and not past it.
+    expect(relay.status().cursor).toBe(1_500);
+  });
+});
+
+const ROOM_B = "33333333-3333-4333-8333-333333333333";
+
+describe("a reply goes to an event this channel received, in the room it was written in", () => {
+  it("refuses an event nobody here received, rather than answering the CEO", async () => {
+    const h = harness();
+    const connection = await h.connect();
+    await h.deliver(connection, mention(ceo, "something else", 1_001));
+    const unknown = "ab".repeat(32);
+    await expect(h.relay.reply({ room: ROOM, eventId: unknown, text: "hello?" })).resolves.toMatchObject({ ok: false, reason: expect.stringMatching(/not received/u) });
+    expect(connection.sent.filter((f) => f[0] === "EVENT")).toEqual([]);
+  });
+
+  it("refuses to answer an event from one room in another, and posts in the event's own room", async () => {
+    const h = harness({ rooms: [ROOM, ROOM_B] });
+    const connection = await h.connect();
+    const inA = mention(ceo, "in room A", 1_001, ROOM);
+    await h.deliver(connection, inA);
+    await expect(h.relay.reply({ room: ROOM_B, eventId: inA.id, text: "wrong room" })).resolves.toMatchObject({ ok: false, reason: expect.stringMatching(/another room/u) });
+    expect(connection.sent.filter((f) => f[0] === "EVENT")).toEqual([]);
+
+    const pending = h.relay.reply({ room: ROOM, eventId: inA.id, text: "right room" });
+    const published = connection.sent.find((f) => f[0] === "EVENT") as [string, { id: string; tags: string[][] }];
+    expect(published[1].tags).toEqual([["h", ROOM], ["e", inA.id, "", "reply"], ["p", ceoPub]]);
+    connection.push(["OK", published[1].id, true, ""]);
+    await expect(pending).resolves.toMatchObject({ ok: true });
+  });
+
+  it("addresses the author of the event it answers, not the CEO", async () => {
+    const h = harness();
+    const connection = await h.connect();
+    const fromOwner = sign(owner, [["h", ROOM]], "owner says hi", 1_001);
+    await h.deliver(connection, fromOwner);
+    const pending = h.relay.reply({ room: ROOM, eventId: fromOwner.id, text: "hi owner" });
+    const published = connection.sent.find((f) => f[0] === "EVENT") as [string, { id: string; tags: string[][] }];
+    expect(published[1].tags).toContainEqual(["p", ownerPub]);
+    connection.push(["OK", published[1].id, true, ""]);
+    await pending;
+  });
+});
+
+describe("what belongs to a thread this CTO is in", () => {
+  it("does not deliver an owner's reply, with no mention, in a thread this CTO never joined", async () => {
+    const h = harness();
+    const connection = await h.connect();
+    const ownerReply = sign(owner, [["h", ROOM], ["e", "cd".repeat(32), "", "reply"]], "owner replies in someone else's thread", 1_001);
+    await h.deliver(connection, ownerReply);
+    expect(h.notifications).toEqual([]);
+    // The top-level message it could have been is delivered.
+    await h.deliver(connection, sign(owner, [["h", ROOM]], "owner starts a topic", 1_002));
+    expect(h.notifications.map((n) => n.content)).toEqual(["owner starts a topic"]);
+  });
+
+  it("requires the same room: a follow-up in room B that cites an event from room A is not in that thread", async () => {
+    const h = harness({ rooms: [ROOM, ROOM_B] });
+    const connection = await h.connect();
+    const inA = mention(ceo, "in room A", 1_001, ROOM);
+    await h.deliver(connection, inA);
+    await h.deliver(connection, sign(ceo, [["h", ROOM_B], ["e", inA.id, "", "reply"]], "room B follow-up citing room A", 1_002));
+    await h.deliver(connection, sign(ceo, [["h", ROOM], ["e", inA.id, "", "reply"]], "room A follow-up", 1_003));
+    expect(h.notifications.map((n) => n.content)).toEqual(["in room A", "room A follow-up"]);
+  });
+
+  it("follows a thread through its own replies, in its room", async () => {
+    const h = harness();
+    const connection = await h.connect();
+    const first = mention(ceo, "start", 1_001);
+    await h.deliver(connection, first);
+    const second = sign(ceo, [["h", ROOM], ["e", first.id, "", "reply"]], "second", 1_002);
+    await h.deliver(connection, second);
+    await h.deliver(connection, sign(owner, [["h", ROOM], ["e", second.id, "", "reply"]], "owner joins the thread", 1_003));
+    expect(h.notifications.map((n) => n.content)).toEqual(["start", "second", "owner joins the thread"]);
+  });
+});
+
+describe("the resume point never passes an event the session did not receive", () => {
+  it("retries the one that failed after a later one was delivered, and repeats nothing", async () => {
+    const h = harness({ failOnce: new Set(["event 1800"]) });
+    const first = await h.connect();
+    const e1800 = mention(ceo, "event 1800", 1_800);
+    const e1900 = mention(ceo, "event 1900", 1_900);
+    await h.deliver(first, e1800);
+    await h.deliver(first, e1900);
+    expect(h.notifications.map((n) => n.content)).toEqual(["event 1900"]);
+
+    first.drop();
+    h.scheduler.advance(1_000);
+    const second = await h.connect();
+    const req = second.sent.find((f) => f[0] === "REQ") as [string, string, { since: number }];
+    expect(req[2].since).toBeLessThanOrEqual(1_800);
+    await h.deliver(second, e1800);
+    await h.deliver(second, e1900);
+    expect(h.notifications.map((n) => n.content)).toEqual(["event 1900", "event 1800"]);
+    expect(h.relay.status().cursor).toBe(1_900);
+  });
+
+  it("keeps the failed event's place across a restart", async () => {
+    let saved: ChannelState | null = null;
+    const store: ChannelStateStore = { load: () => saved, save: (state) => void (saved = state) };
+    const one = harness({ store, failOnce: new Set(["event 1800"]) });
+    const connection = await one.connect();
+    await one.deliver(connection, mention(ceo, "event 1800", 1_800));
+    await one.deliver(connection, mention(ceo, "event 1900", 1_900));
+    expect(saved!.cursor).toBeLessThanOrEqual(1_800);
+
+    const two = harness({ store });
+    const again = await two.connect();
+    const req = again.sent.find((f) => f[0] === "REQ") as [string, string, { since: number }];
+    expect(req[2].since).toBeLessThanOrEqual(1_800);
+  });
+});
+
+describe("what a restart remembers having shown", () => {
+  it("remembers every id a resume can replay, however many there are, so none is shown twice", async () => {
+    let saved: ChannelState | null = null;
+    const store: ChannelStateStore = { load: () => saved, save: (state) => void (saved = state) };
+    const events = Array.from({ length: 700 }, (_, i) => mention(ceo, `burst ${i}`, 1_900));
+    const one = harness({ store });
+    const connection = await one.connect();
+    for (const event of events) await one.deliver(connection, event);
+    expect(one.notifications).toHaveLength(700);
+    expect(saved!.seen.length).toBe(700);
+
+    const two = harness({ store });
+    const again = await two.connect();
+    for (const event of events) await two.deliver(again, event);
+    expect(two.notifications).toEqual([]);
+  }, 30_000);
+
+  it("forgets an id only once a resume can no longer ask for it, by its time and not by how many came after", async () => {
+    let saved: ChannelState | null = null;
+    const store: ChannelStateStore = { load: () => saved, save: (state) => void (saved = state) };
+    const h = harness({ store });
+    const connection = await h.connect();
+    const old = mention(ceo, "old", 1_000);
+    const recent = mention(ceo, "recent", 1_900);
+    await h.deliver(connection, old);
+    await h.deliver(connection, recent);
+    expect(saved!.seen.map(([id]) => id)).toEqual([recent.id]);
   });
 });
 

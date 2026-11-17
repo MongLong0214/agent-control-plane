@@ -154,29 +154,49 @@ describe("confirming, and only confirming", () => {
 });
 
 describe("the tmux driver", () => {
-  const calls: string[][] = [];
-  const driverFor = (startCommand: string, answer: string) =>
-    tmuxChannelDriver({
-      tmux: "tmux",
-      target: "acp-x",
-      startCommand,
-      run: (bin, args) => {
-        calls.push([bin, ...args]);
-        return args[0] === "display-message" ? `${answer}\n` : WARNING;
-      },
-    });
+  /** A tmux that answers for a session name with whichever pane is active now, and for a pane id as itself. */
+  const tmuxWith = (panes: Record<string, string>, active: () => string) => {
+    const calls: string[][] = [];
+    const run = (bin: string, args: string[]): string => {
+      calls.push([bin, ...args]);
+      const target = args[args.indexOf("-t") + 1]!;
+      const pane = target.startsWith("%") ? target : active();
+      if (args[0] === "display-message") return args.at(-1) === "#{pane_id}" ? `${pane}\n` : `${panes[pane]}\n`;
+      return args[0] === "capture-pane" ? WARNING : "";
+    };
+    return { calls, run };
+  };
 
-  it("reads and presses only the pane that is running the launcher it started", () => {
-    calls.length = 0;
-    const own = driverFor("/state/resident-x.sh", "/state/resident-x.sh");
-    expect(own.capture()).toBe(WARNING);
-    own.press();
-    expect(calls.at(-1)).toEqual(["tmux", "send-keys", "-t", "acp-x", "Enter"]);
-    expect(calls.filter((c) => c[1] === "send-keys")).toHaveLength(1);
+  it("names the pane once by its id, and reads and presses that pane and no other", () => {
+    let active = "%7";
+    const t = tmuxWith({ "%7": "/state/resident-x.sh", "%9": "/bin/zsh" }, () => active);
+    const driver = tmuxChannelDriver({ tmux: "tmux", target: "acp-x", startCommand: "/state/resident-x.sh", run: t.run });
+    expect(driver.capture()).toBe(WARNING);
+    // A person splits the window and the other pane becomes the active one: the session name now means "%9".
+    active = "%9";
+    expect(driver.capture()).toBe(WARNING);
+    driver.press();
 
-    const other = driverFor("/state/resident-x.sh", "/bin/zsh");
-    expect(() => other.capture()).toThrow(/not this launch's/u);
-    expect(calls.some((c) => c[1] === "capture-pane" && c.includes("acp-x"))).toBe(true);
+    const targets = (verb: string) => t.calls.filter((c) => c[1] === verb).map((c) => c[c.indexOf("-t") + 1]);
+    expect(targets("capture-pane")).toEqual(["%7", "%7"]);
+    expect(targets("send-keys")).toEqual(["%7"]);
+    expect(t.calls.filter((c) => c.at(-1) === "#{pane_id}")).toHaveLength(1);
+    expect(t.calls.find((c) => c[1] === "send-keys")).toEqual(["tmux", "send-keys", "-t", "%7", "Enter"]);
+    // Nothing but the one lookup of the id ever addressed the session by its name.
+    expect(t.calls.filter((c) => c.includes("acp-x")).map((c) => c.at(-1))).toEqual(["#{pane_id}"]);
+  });
+
+  it("refuses a pane that is not running the launcher it started, and presses nothing there", () => {
+    const t = tmuxWith({ "%9": "/bin/zsh" }, () => "%9");
+    const driver = tmuxChannelDriver({ tmux: "tmux", target: "acp-x", startCommand: "/state/resident-x.sh", run: t.run });
+    expect(() => driver.capture()).toThrow(/not this launch's/u);
+    expect(() => driver.press()).toThrow(/not this launch's/u);
+    expect(t.calls.some((c) => c[1] === "send-keys" || c[1] === "capture-pane")).toBe(false);
+  });
+
+  it("refuses an answer that is not a pane id", () => {
+    const driver = tmuxChannelDriver({ tmux: "tmux", target: "acp-x", startCommand: "/s.sh", run: () => "acp-x\n" });
+    expect(() => driver.capture()).toThrow(/could not be named/u);
   });
 
   it("names the registered line it waits for", () => {

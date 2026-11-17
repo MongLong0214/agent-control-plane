@@ -64,14 +64,15 @@ if (cmd === 'gh') {
   else if (args[1] === 'remove') delete s.mcp[process.cwd()];
   else { const c = s.mcp[process.cwd()]; if (!c) process.exit(1); out('acp-cto\\nCommand: ' + c[0] + '\\nArgs: ' + c.slice(1).join(' ')); }
 } else if (cmd === 'tmux') {
-  const name = flag('-t') ?? flag('-s'), r = s.residents[name];
+  // A pane id (%N) names the resident whose pane that is; a session name names the session.
+  const name = flag('-t') ?? flag('-s'), r = s.residents[name] ?? Object.values(s.residents).find(x => '%' + x.pane === name);
   if (args[0] === 'has-session') process.exit(r ? 0 : 1);
   else if (args[0] === 'new-session') {
     const pid = Number(process.env.TEST_CLAUDE_PID);
     s.residents[name] = { pid, pane: 900000 + (++s.panes), sessionUuid: a.sessionUuid, cwd: a.clonePath };
     fs.mkdirSync(path.join(home, '.claude', 'sessions'), { recursive: true });
     fs.writeFileSync(path.join(home, '.claude', 'sessions', pid + '.json'), JSON.stringify({ sessionId: a.sessionUuid, cwd: a.clonePath, bridgeSessionId: 'bridge-' + a.projectId }));
-  } else if (args[0] === 'display-message') { if (!r) process.exit(1); out(args.at(-1) === '#{pane_start_command}' ? path.join(process.env.ACP_STATE_DIR, 'resident-' + a.projectId + '.sh') : String(r.pane)); }
+  } else if (args[0] === 'display-message') { if (!r) process.exit(1); out(args.at(-1) === '#{pane_start_command}' ? path.join(process.env.ACP_STATE_DIR, 'resident-' + a.projectId + '.sh') : args.at(-1) === '#{pane_id}' ? '%' + r.pane : String(r.pane)); }
   else if (args[0] === 'capture-pane') out('Channels (experimental) messages from server:acp-buzz-channel inject directly in this session');
   else if (args[0] === 'kill-session') delete s.residents[name];
   else process.exit(2);

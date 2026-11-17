@@ -177,22 +177,35 @@ export const confirmChannelStartup = async (
   return { ok: false, failure: "NOT_REGISTERED", screen: verdict, confirmed: true };
 };
 
-/** `tmux` as the driver of one launch's pane. The pane must still be running exactly the launcher that was started. */
+/**
+ * `tmux` as the driver of one launch's pane. The pane is named once, by its id (`%N`), when the driver first
+ * looks: a session name resolves to whichever pane is active at the moment, so a split or a moved window
+ * would point the screen read and the keystroke at a pane that is not the launch's. The id is checked to be
+ * running exactly the launcher this launch started, and then every capture and the one keystroke use that id.
+ */
 export const tmuxChannelDriver = (input: {
   readonly tmux: string;
   readonly target: string;
   /** What `#{pane_start_command}` must be: the launcher script this launch started. */
   readonly startCommand: string;
   readonly run: (bin: string, args: string[]) => string;
-}): ChannelScreenDriver => ({
-  capture: () => {
-    const started = input.run(input.tmux, ["display-message", "-p", "-t", input.target, "#{pane_start_command}"]).replace(/\n$/u, "");
+}): ChannelScreenDriver => {
+  let pane: string | null = null;
+  const own = (): string => {
+    if (pane !== null) return pane;
+    const id = input.run(input.tmux, ["display-message", "-p", "-t", input.target, "#{pane_id}"]).trim();
+    if (!/^%\d+$/u.test(id)) throw new Error("the launch's pane could not be named");
+    const started = input.run(input.tmux, ["display-message", "-p", "-t", id, "#{pane_start_command}"]).replace(/\n$/u, "");
     if (started !== input.startCommand) throw new Error("the pane is not this launch's");
-    return input.run(input.tmux, ["capture-pane", "-p", "-t", input.target]);
-  },
-  press: () => {
-    input.run(input.tmux, ["send-keys", "-t", input.target, "Enter"]);
-  },
-  now: () => Date.now(),
-  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-});
+    pane = id;
+    return id;
+  };
+  return {
+    capture: () => input.run(input.tmux, ["capture-pane", "-p", "-t", own()]),
+    press: () => {
+      input.run(input.tmux, ["send-keys", "-t", own(), "Enter"]);
+    },
+    now: () => Date.now(),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  };
+};

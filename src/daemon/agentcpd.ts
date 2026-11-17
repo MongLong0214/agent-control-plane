@@ -2988,6 +2988,7 @@ export const startDaemonBuzzMentionSubscriber = (
     (projectId) => roleKeyFor(Role.PRIMARY_CTO, { projectId }),
     channelQueueDepsFor(cp),
     (error) => process.stderr.write(`Buzz channel receipts: ${error instanceof Error ? error.name : "error"}\n`),
+    (projectId, line) => process.stderr.write(`Buzz channel receipts: skipped a malformed receipt (${projectId}, line ${line})\n`),
   );
   const sink: BuzzMentionSink = {
     ...baseSink,
@@ -3358,6 +3359,9 @@ export const canonicalCtoOperator = (
   return allow(ReasonCode.OK, {
     projectId,
     holderSessionUuid: holder?.sessionUuid ?? null,
+    // The project's Buzz identity and room as its canonical entitlement holds them: what a new conversation's Buzz
+    // channel is started with (the resident launcher takes the same pair from its allocation).
+    channel: holder === null ? null : { actorId: holder.buzzActorId, room: holder.buzzAddress },
     generation: cp.db.get<{ n: number | null }>(`SELECT MAX(binding_generation) AS n FROM assignments WHERE role_key = ?`,
       [roleKeyFor(Role.PRIMARY_CTO, { projectId })])?.n ?? 0,
     // The launcher's safe boundary: the holder drains and owns no live run before its process is stopped.

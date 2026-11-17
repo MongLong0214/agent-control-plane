@@ -77,11 +77,11 @@ else if(cmd === 'tmux') {
  else if(args[0] === 'display-message' && args.at(-1) === '#{pane_pid}') {if(!s.launched) process.exit(1);out('999999');}
  else if(args[0] === 'display-message') {
   // As real tmux reports them: a dead pane (remain-on-exit) has no current path.
-  const fields={pane_dead:s.paneDead ? '1' : '0',session_windows:String(s.windows||1),window_panes:'1',pane_current_path:s.paneDead ? '' : a.clonePath,pane_start_command:s.paneCommand||path.join(process.env.ACP_STATE_DIR,'resident-test.sh')};
+  const fields={pane_dead:s.paneDead ? '1' : '0',session_windows:String(s.windows||1),window_panes:'1',pane_current_path:s.paneDead ? '' : a.clonePath,pane_start_command:s.paneCommand||path.join(process.env.ACP_STATE_DIR,'resident-test.sh'),pane_id:'%1'};
   out(Object.entries(fields).reduce((text,[key,v])=>text.split('#{'+key+'}').join(v),args.at(-1)));
  }
- else if(args[0] === 'capture-pane') {const f=path.join(root,'screen');out(fs.existsSync(f) ? fs.readFileSync(f,'utf8') : ${JSON.stringify(REGISTERED_SCREEN)});}
- else if(args[0] === 'send-keys') {s.keys=(s.keys||[]).concat([args.slice(args.indexOf('-t')+2)]);const next=path.join(root,'screen-after');if(fs.existsSync(next)) fs.copyFileSync(next,path.join(root,'screen'));}
+ else if(args[0] === 'capture-pane') {s.captureTargets=(s.captureTargets||[]).concat([args[args.indexOf('-t')+1]]);const f=path.join(root,'screen');out(fs.existsSync(f) ? fs.readFileSync(f,'utf8') : ${JSON.stringify(REGISTERED_SCREEN)});}
+ else if(args[0] === 'send-keys') {s.keys=(s.keys||[]).concat([args.slice(args.indexOf('-t')+1)]);const next=path.join(root,'screen-after');if(fs.existsSync(next)) fs.copyFileSync(next,path.join(root,'screen'));}
  else if(args[0] === 'kill-session') {s.pane=false;s.paneDead=false;s.kills=(s.kills||0)+1;} else process.exit(2);
 }
 else if(cmd === 'ps') {if(args[0] === '-p') out(s.pinCommand || '');else if(args[0] === '-o' && args[1] === 'lstart=') out(s.lstart || '');else if(s.launched) {if(args.includes('command=')) out('claude --session-id '+a.sessionUuid);else out(process.env.TEST_CLAUDE_PID+' 999999 Thu Oct 22 01:00:00 2026 claude --session-id '+a.sessionUuid+'\\n999999 1 Thu Oct 22 01:00:00 2026 tmux');}}
@@ -314,7 +314,10 @@ it('confirms the development-channels warning once, on the resident it just laun
   writeFileSync(join(f.home,'screen'),WARNING_SCREEN);writeFileSync(join(f.home,'screen-after'),REGISTERED_SCREEN);
   await f.invoke('ensure-resident');
   const saved = JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8'));
-  expect(saved.keys).toEqual([['Enter']]);
+  // The key and every read of the screen went to the pane's id, never to the session name.
+  expect(saved.keys).toEqual([['%1','Enter']]);
+  expect(saved.captureTargets.length).toBeGreaterThan(0);
+  expect([...new Set(saved.captureTargets)]).toEqual(['%1']);
   expect(saved.launches).toBe(1);
 });
 
@@ -345,7 +348,7 @@ it('counts a channel that does not register after the confirmation as a failure,
   await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');
   writeFileSync(join(f.home,'screen'),WARNING_SCREEN);writeFileSync(join(f.home,'screen-after'),TRUST_SCREEN);
   await expect(f.invoke('ensure-resident')).rejects.toThrow('channel startup: channel not registered');
-  expect(JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8')).keys).toEqual([['Enter']]);
+  expect(JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8')).keys).toEqual([['%1','Enter']]);
 });
 
 it.each(['bare-agentctl','wrong-node','wrong-cli','wrong-role','wrong-session','wrong-project','session-suffix','project-suffix','matching-runtime'])('reconciles a pre-existing %s acp-cto entry',async entry => {

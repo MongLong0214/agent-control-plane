@@ -7,7 +7,7 @@ import type { Decision } from "../core/errors.ts";
 import { buzzMessageEventId, ownerMessagePointerOf } from "../ingress/buzz-message.ts";
 import type { HolderIdentity } from "../outbox/outbox.ts";
 import type { ChannelReceipt } from "./buzz-channel.ts";
-import { replyToOf } from "./buzz-channel.ts";
+import { isChannelReceipt, replyToOf } from "./buzz-channel.ts";
 import { BUZZ_CHANNEL_RECEIPT_SUFFIX, channelDir, readChannelReceipts } from "./buzz-channel-files.ts";
 
 /**
@@ -53,76 +53,88 @@ export interface ChannelApplyResult {
   delivered: string[];
   completed: string[];
   ignored: number;
+  /** Receipts that did not have a receipt's shape, or whose handling threw: skipped, the rest still applied. */
+  invalid: number;
 }
 
 export const applyChannelReceipts = (
   deps: ChannelQueueDeps,
   roleKey: string,
-  receipts: readonly ChannelReceipt[],
+  receipts: readonly unknown[],
 ): ChannelApplyResult => {
-  const result: ChannelApplyResult = { delivered: [], completed: [], ignored: 0 };
+  const result: ChannelApplyResult = { delivered: [], completed: [], ignored: 0, invalid: 0 };
   for (const receipt of receipts) {
-    const eventId = receipt.type === "emitted" ? receipt.eventId : receipt.parentEventId;
-    const message = deps.messages(roleKey).find((m) => m.eventId === eventId);
-    if (message === undefined || message.room === null || message.room !== receipt.room) {
-      result.ignored += 1;
+    // One receipt that is not a receipt, or that the queue cannot make sense of, never stops the others.
+    if (!isChannelReceipt(receipt)) {
+      result.invalid += 1;
       continue;
     }
-    if (receipt.type === "replied") {
-      const event = receipt.event;
-      const actor = deps.boundActor(message.holder);
-      const rooms = event.tags.filter((tag) => tag[0] === "h").map((tag) => tag[1]);
-      if (
-        actor === null ||
-        event.pubkey !== actor ||
-        event.kind !== 9 ||
-        // A fresh seven-field copy: `verifyEvent` caches its verdict on the object it is given, and a
-        // spread of an already-verified event carries that verdict over a body that was changed after.
-        !verifyEvent({
-          id: event.id,
-          pubkey: event.pubkey,
-          created_at: event.created_at,
-          kind: event.kind,
-          tags: event.tags.map((tag) => [...tag]),
-          content: event.content,
-          sig: event.sig,
-        }) ||
-        rooms.length !== 1 ||
-        rooms[0] !== message.room ||
-        replyToOf(event) !== message.eventId ||
-        (receipt.ack !== "ACCEPTED" && receipt.ack !== "DUPLICATE")
-      ) {
-        result.ignored += 1;
-        continue;
-      }
-    }
-    let current = message;
-    if (current.status === "PENDING") {
-      if (!deps.deliver(current).allowed) {
-        result.ignored += 1;
-        continue;
-      }
-      result.delivered.push(current.messageId);
-      current = { ...current, status: "SENT" };
-    }
-    if (receipt.type === "replied" && current.status === "SENT") {
-      if (deps.complete(current).allowed) result.completed.push(current.messageId);
-      else result.ignored += 1;
+    try {
+      applyOne(deps, roleKey, receipt, result);
+    } catch {
+      result.invalid += 1;
     }
   }
   return result;
 };
 
-/** Every receipt file beneath the daemon's state directory, as `[projectId, receipts]`. */
-export const readAllChannelReceipts = (stateDir: string): [string, ChannelReceipt[]][] => {
+const applyOne = (deps: ChannelQueueDeps, roleKey: string, receipt: ChannelReceipt, result: ChannelApplyResult): void => {
+  const eventId = receipt.type === "emitted" ? receipt.eventId : receipt.parentEventId;
+  const message = deps.messages(roleKey).find((m) => m.eventId === eventId);
+  if (message === undefined || message.room === null || message.room !== receipt.room) {
+    result.ignored += 1;
+    return;
+  }
+  if (receipt.type === "replied") {
+    const event = receipt.event;
+    const actor = deps.boundActor(message.holder);
+    const rooms = event.tags.filter((tag) => tag[0] === "h").map((tag) => tag[1]);
+    if (
+      actor === null ||
+      event.pubkey !== actor ||
+      event.kind !== 9 ||
+      // A fresh seven-field copy: `verifyEvent` caches its verdict on the object it is given, and a
+      // spread of an already-verified event carries that verdict over a body that was changed after.
+      !verifyEvent({
+        id: event.id,
+        pubkey: event.pubkey,
+        created_at: event.created_at,
+        kind: event.kind,
+        tags: event.tags.map((tag) => [...tag]),
+        content: event.content,
+        sig: event.sig,
+      }) ||
+      rooms.length !== 1 ||
+      rooms[0] !== message.room ||
+      replyToOf(event) !== message.eventId ||
+      (receipt.ack !== "ACCEPTED" && receipt.ack !== "DUPLICATE")
+    ) {
+      result.ignored += 1;
+      return;
+    }
+  }
+  let current = message;
+  if (current.status === "PENDING") {
+    if (!deps.deliver(current).allowed) {
+      result.ignored += 1;
+      return;
+    }
+    result.delivered.push(current.messageId);
+    current = { ...current, status: "SENT" };
+  }
+  if (receipt.type === "replied" && current.status === "SENT") {
+    if (deps.complete(current).allowed) result.completed.push(current.messageId);
+    else result.ignored += 1;
+  }
+};
+
+/** Every receipt file beneath the daemon's state directory: its project, its well-formed receipts, and the numbers of the lines skipped. */
+export const readAllChannelReceipts = (stateDir: string): { projectId: string; receipts: ChannelReceipt[]; skipped: number[] }[] => {
   const dir = channelDir(stateDir);
   if (!existsSync(dir)) return [];
   return readdirSync(dir)
     .filter((name) => name.endsWith(BUZZ_CHANNEL_RECEIPT_SUFFIX))
-    .map((name): [string, ChannelReceipt[]] => [
-      name.slice(0, -BUZZ_CHANNEL_RECEIPT_SUFFIX.length),
-      readChannelReceipts(join(dir, name)),
-    ]);
+    .map((name) => ({ projectId: name.slice(0, -BUZZ_CHANNEL_RECEIPT_SUFFIX.length), ...readChannelReceipts(join(dir, name)) }));
 };
 
 /** The message-resolving half of `ChannelQueueDeps`, over the daemon's database. */
@@ -190,15 +202,25 @@ export const watchChannelReceipts = (
   roleKeyOf: (projectId: string) => string,
   deps: ChannelQueueDeps,
   onError: (error: unknown) => void = () => undefined,
+  /** Told once per skipped line, never once per replay of the file. */
+  onSkipped: (projectId: string, line: number) => void = () => undefined,
 ): ChannelReceiptWatcher => {
   const dir = channelDir(stateDir);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   let busy = false;
+  const reported = new Set<string>();
   const apply = (): ChannelApplyResult[] => {
     if (busy) return [];
     busy = true;
     try {
-      return readAllChannelReceipts(stateDir).map(([projectId, receipts]) => applyChannelReceipts(deps, roleKeyOf(projectId), receipts));
+      return readAllChannelReceipts(stateDir).map(({ projectId, receipts, skipped }) => {
+        for (const line of skipped) {
+          if (reported.has(`${projectId}:${line}`)) continue;
+          reported.add(`${projectId}:${line}`);
+          onSkipped(projectId, line);
+        }
+        return applyChannelReceipts(deps, roleKeyOf(projectId), receipts);
+      });
     } catch (error) {
       onError(error);
       return [];

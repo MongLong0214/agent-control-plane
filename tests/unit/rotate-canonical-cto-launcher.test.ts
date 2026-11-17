@@ -1,10 +1,11 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
 
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
@@ -29,6 +30,7 @@ const LAUNCHER = fileURLToPath(new URL("../../scripts/rotate-canonical-cto.mjs",
 const OLD = "58cac5c6-0000-4000-8000-0000000000c1";
 const NEW = "36276d16-0000-4000-8000-0000000000c2";
 const PROJECT = "launch-project";
+const ROOM = "11111111-1111-4111-8111-111111111111";
 
 const RULE = "─".repeat(100);
 const REGISTERED_SCREEN = ` ▐▛███▛█   Claude Code v2.1.323\n\n  Channels (experimental) messages from server:acp-buzz-channel inject directly in this session · restart without --dangerously-load-development-channels to stop\n${RULE}\n❯ \n${RULE}\n`;
@@ -54,8 +56,13 @@ const fixture = async (initial: Mode, childMs = 1_200) => {
   const modeFile = join(dir, "mode");
   const childPidFile = join(dir, "child.pid");
   writeFileSync(modeFile, initial);
+  // The project's own Buzz identity and room, as its canonical entitlement holds them, and that identity's key file.
+  const ctoKey = generateSecretKey();
+  mkdirSync(join(home, ".hermes", "bridge", "keys"), { recursive: true });
+  const keyFile = join(home, ".hermes", "bridge", "keys", `cto-${PROJECT}.priv`);
+  writeFileSync(keyFile, `${Buffer.from(ctoKey).toString("hex")}\n`, { mode: 0o600 });
   writeFileSync(db, JSON.stringify({ holderSessionUuid: OLD, generation: 1, binding: { generation: 1, sessionId: "ses_old", lifecycle: "READY", liveRuns: [] },
-    buzz: { verdict: "ADMITTED", sessionId: "ses_old", generation: 1 }, rotations: [] }));
+    channel: { actorId: getPublicKey(ctoKey), room: ROOM }, buzz: { verdict: "ADMITTED", sessionId: "ses_old", generation: 1 }, rotations: [] }));
   const previousArgs = ["/rt/agentctl.js", "attach", "canonical-cto", "--claimed-session-id", OLD, "--project-id", PROJECT, "--expected-binding-generation", "1"];
   writeFileSync(join(home, ".claude.json"), JSON.stringify({ projects: { [cwd]: { mcpServers: { "acp-cto": { type: "stdio", command: "/rt/node", args: previousArgs, env: {} } } } } }));
   const handoff = join(dir, "handoff.json");
@@ -80,7 +87,7 @@ const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { retu
 // The launch's terminal, for the Buzz channel's startup: what it shows is whatever the test wrote to \`screen\`, and a key
 // pressed on it replaces that with \`screen-after\` when the test wrote one.
 const screen = ${JSON.stringify(join(dir, "screen"))}, after = ${JSON.stringify(join(dir, "screen-after"))}, started = ${JSON.stringify(join(dir, "start-command"))};
-if (process.argv[2] === "display-message") { process.stdout.write(fs.existsSync(started) ? fs.readFileSync(started, "utf8") : ""); process.exit(0); }
+if (process.argv[2] === "display-message") { process.stdout.write(process.argv[process.argv.length - 1] === "#{pane_id}" ? "%1" : fs.existsSync(started) ? fs.readFileSync(started, "utf8") : ""); process.exit(0); }
 if (process.argv[2] === "capture-pane") { process.stdout.write(fs.existsSync(screen) ? fs.readFileSync(screen, "utf8") : ${JSON.stringify(REGISTERED_SCREEN)}); process.exit(0); }
 if (process.argv[2] === "send-keys") { if (fs.existsSync(after)) fs.copyFileSync(after, screen); process.exit(0); }
 if (process.argv[2] === "new-session") {
@@ -142,7 +149,7 @@ require("node:fs").writeFileSync(${JSON.stringify(childPidFile)}, String(c.pid))
     for (let i = 0; i < 200 && running(childPid); i++) await new Promise((resolve) => setTimeout(resolve, 20));
     return grandchild;
   };
-  return { dir, cwd, old, childPid, launch, calls, steps, previousArgs, setMode, handOffToGrandchild };
+  return { dir, home, keyFile, db, cwd, old, childPid, launch, calls, steps, previousArgs, setMode, handOffToGrandchild };
 };
 
 /** The launcher as a child of its own, killed at 30 s so a wedge names itself. */
@@ -165,7 +172,7 @@ describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, wi
     const f = await fixture("claims");
     const result = await f.launch();
     expect(result.code, result.stderr + result.stdout).toBe(0);
-    expect(f.steps(result.stdout).map((line) => line.step)).toEqual(["handoff", "rotate", "stop", "start", "verify"]);
+    expect(f.steps(result.stdout).map((line) => line.step)).toEqual(["handoff", "rotate", "stop", "start", "channel", "verify"]);
     const calls = f.calls();
     // The new holder is started only once the old writer and the child it left behind are gone from the process table.
     expect(calls.find((call) => call[0] === "observed")).toEqual(["observed", { oldAlive: false, childAlive: false }]);
@@ -182,38 +189,77 @@ describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, wi
     expect(running(f.old.pid!)).toBe(false);
   });
 
-  it("starts the new conversation with its Buzz channel when the operator names the room and key, and without one when not", async () => {
-    const keyFile = "/home/test/.hermes/bridge/keys/cto-launch-project.priv";
-    const room = "11111111-1111-4111-8111-111111111111";
-    const withChannel = await fixture("claims");
-    writeFileSync(join(withChannel.dir, "screen"), WARNING_SCREEN);
-    writeFileSync(join(withChannel.dir, "screen-after"), REGISTERED_SCREEN);
-    const started = await withChannel.launch(10_000, ["--buzz-room", room, "--buzz-key-file", keyFile]);
+  it("starts the new conversation with the project's own Buzz channel, confirming the warning on the launch's pane", async () => {
+    const f = await fixture("claims");
+    writeFileSync(join(f.dir, "screen"), WARNING_SCREEN);
+    writeFileSync(join(f.dir, "screen-after"), REGISTERED_SCREEN);
+    const started = await f.launch();
     expect(started.code, started.stderr + started.stdout).toBe(0);
-    const shell = readFileSync(join(withChannel.dir, "state", "rotations", `${PROJECT}-${NEW}.sh`), "utf8");
+    const shell = readFileSync(join(f.dir, "state", "rotations", `${PROJECT}-${NEW}.sh`), "utf8");
     const flag = shell.indexOf("'--dangerously-load-development-channels' 'server:acp-buzz-channel' '--session-id'");
     expect(flag).toBeGreaterThan(0);
     expect(shell.indexOf("'--mcp-config'")).toBeLessThan(flag);
-    expect(shell).toContain(`"--key-file","${keyFile}","--room","${room}"`);
-    // The development-channels warning was confirmed exactly once, and the step says so.
-    expect(withChannel.calls().filter((call) => call[0] === "tmux" && call[1] === "send-keys")).toEqual([["tmux", "send-keys", "-t", "acp-rot-test", "Enter"]]);
-    expect(withChannel.steps(started.stdout).find((line) => line.step === "channel")).toMatchObject({ ok: true, confirmed: true });
-
-    const without = await fixture("claims");
-    expect((await without.launch()).code).toBe(0);
-    expect(readFileSync(join(without.dir, "state", "rotations", `${PROJECT}-${NEW}.sh`), "utf8")).not.toContain("acp-buzz-channel");
+    // The room and key are the entitlement's and the project's, not anything the caller named.
+    expect(shell).toContain(`"--key-file","${f.keyFile}","--room","${ROOM}"`);
+    // The warning was confirmed exactly once, on the pane's id and not on the session name, and the step says so.
+    const tmuxCalls = f.calls().filter((call) => call[0] === "tmux");
+    expect(tmuxCalls.filter((call) => call[1] === "send-keys")).toEqual([["tmux", "send-keys", "-t", "%1", "Enter"]]);
+    expect(tmuxCalls.filter((call) => call[1] === "capture-pane").every((call) => call[4] === "%1")).toBe(true);
+    expect(f.steps(started.stdout).find((line) => line.step === "channel")).toMatchObject({ ok: true, confirmed: true });
   });
 
-  it("presses nothing on a screen that is not the channel warning, fences the new conversation, and says why", async () => {
-    // A session stopped at a dialog never claims, which is the mode that leaves the switchover pending and retryable.
+  it.each([
+    ["the entitlement names no Buzz identity and room", (f: { db: string }) => writeFileSync(f.db, JSON.stringify({ ...JSON.parse(readFileSync(f.db, "utf8")), channel: null }))],
+    ["the room is not a room id", (f: { db: string }) => writeFileSync(f.db, JSON.stringify({ ...JSON.parse(readFileSync(f.db, "utf8")), channel: { actorId: "a".repeat(64), room: "has a space" } }))],
+    ["the project's key file is missing", (f: { keyFile: string }) => rmSync(f.keyFile)],
+    ["the key file is not hex", (f: { keyFile: string }) => writeFileSync(f.keyFile, "nsec1notahexkey\n")],
+    ["the key is not the entitlement's identity", (f: { keyFile: string }) => writeFileSync(f.keyFile, `${Buffer.from(generateSecretKey()).toString("hex")}\n`)],
+  ])("refuses to start without a channel when %s, before anything is rotated, stopped or started", async (_name, spoil) => {
+    const f = await fixture("claims");
+    spoil(f);
+    const result = await f.launch();
+    expect(result.code, result.stderr + result.stdout).toBe(68);
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "channel", refused: expect.any(String) });
+    const calls = f.calls();
+    expect(calls.some((call) => call[0] === "agentctl" && call[2] === "rotate")).toBe(false);
+    expect(calls.some((call) => call[0] === "tmux")).toBe(false);
+    expect(running(f.old.pid!)).toBe(true);
+  });
+
+  it("does not take a room or key from the command line", async () => {
+    const f = await fixture("claims");
+    const result = await f.launch(10_000, ["--buzz-room", ROOM, "--buzz-key-file", f.keyFile]);
+    expect(result.code).toBe(64);
+    expect(result.stderr).toMatch(/not taken/u);
+    // It refused before it called anything.
+    expect(existsSync(join(f.dir, "calls.log"))).toBe(false);
+  });
+
+  it("leaves the new conversation running at a screen it may not press, records why, kills nothing, and sends no key", async () => {
+    // A session stopped at a dialog never claims, which is the mode that leaves the switchover pending.
     const f = await fixture("never-claims", 0);
     writeFileSync(join(f.dir, "screen"), TRUST_SCREEN);
-    const result = await f.launch(10_000, ["--buzz-room", "11111111-1111-4111-8111-111111111111", "--buzz-key-file", "/home/test/.hermes/bridge/keys/cto-launch-project.priv"]);
-    expect(result.code, result.stderr + result.stdout).toBe(2);
+    const result = await f.launch();
+    expect(result.code, result.stderr + result.stdout).toBe(5);
     expect(f.steps(result.stdout).find((line) => line.step === "channel")).toMatchObject({ ok: false, refused: "UNRECOGNIZED_SCREEN", screen: "OTHER_DIALOG" });
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "channel", tmuxSession: "acp-rot-test", note: expect.stringMatching(/nothing was killed/u) });
     const calls = f.calls();
     expect(calls.some((call) => call[0] === "tmux" && call[1] === "send-keys")).toBe(false);
-    expect(calls.some((call) => call[0] === "tmux" && call[1] === "kill-session")).toBe(true);
+    expect(calls.some((call) => call[0] === "tmux" && call[1] === "kill-session")).toBe(false);
+    const record = JSON.parse(readFileSync(join(f.dir, "state", "rotations", `${PROJECT}-${NEW}.channel-refusal.json`), "utf8"));
+    expect(record).toMatchObject({ project: PROJECT, to: NEW, refused: "UNRECOGNIZED_SCREEN", screen: "OTHER_DIALOG", confirmed: false, tmuxSession: "acp-rot-test" });
+  });
+
+  it("leaves it running too when the warning was confirmed and the channel never registered", async () => {
+    const f = await fixture("never-claims", 0);
+    writeFileSync(join(f.dir, "screen"), WARNING_SCREEN);
+    writeFileSync(join(f.dir, "screen-after"), TRUST_SCREEN);
+    const result = await f.launch();
+    expect(result.code, result.stderr + result.stdout).toBe(5);
+    const calls = f.calls();
+    expect(calls.filter((call) => call[0] === "tmux" && call[1] === "send-keys")).toHaveLength(1);
+    expect(calls.some((call) => call[0] === "tmux" && call[1] === "kill-session")).toBe(false);
+    expect(JSON.parse(readFileSync(join(f.dir, "state", "rotations", `${PROJECT}-${NEW}.channel-refusal.json`), "utf8"))).toMatchObject({ refused: "NOT_REGISTERED", confirmed: true });
   });
 
   it("an old writer that outlives the stop timeout: the new conversation is never started, and nothing else is signalled", async () => {
@@ -254,7 +300,7 @@ describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, wi
     f.setMode("claims");
     const again = await f.launch();
     expect(again.code, again.stdout).toBe(0);
-    expect(f.steps(again.stdout).map((line) => line.step)).toEqual(["handoff", "stop", "start", "verify"]);
+    expect(f.steps(again.stdout).map((line) => line.step)).toEqual(["handoff", "stop", "start", "channel", "verify"]);
     expect(f.steps(again.stdout)[1]).toMatchObject({ step: "stop", alreadyGone: true });
     expect(rotatesTo(f.calls(), NEW)).toHaveLength(1);
     expect(rotatesTo(f.calls(), OLD)).toEqual([]);
@@ -275,7 +321,7 @@ describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, wi
     for (let i = 0; i < 100 && running(f.childPid); i++) await new Promise((resolve) => setTimeout(resolve, 20));
     const resumed = await f.launch(800);
     expect(resumed.code, resumed.stdout).toBe(0);
-    expect(f.steps(resumed.stdout).map((line) => line.step)).toEqual(["handoff", "stop", "start", "verify"]);
+    expect(f.steps(resumed.stdout).map((line) => line.step)).toEqual(["handoff", "stop", "start", "channel", "verify"]);
     expect(rotatesTo(f.calls(), NEW)).toHaveLength(1);
   });
 
@@ -295,7 +341,7 @@ describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, wi
     for (let i = 0; i < 100 && running(grandchild); i++) await new Promise((resolve) => setTimeout(resolve, 20));
     const resumed = await f.launch(800);
     expect(resumed.code, resumed.stdout).toBe(0);
-    expect(f.steps(resumed.stdout).map((line) => line.step)).toEqual(["handoff", "stop", "start", "verify"]);
+    expect(f.steps(resumed.stdout).map((line) => line.step)).toEqual(["handoff", "stop", "start", "channel", "verify"]);
   });
 
   it("claimed and judged ADMITTED, but the subscriber and ingress show no reception: verification fails and success is never reported", async () => {
