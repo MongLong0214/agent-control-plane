@@ -10,6 +10,7 @@ import { applyChannelReceipts, watchChannelReceipts, type ChannelQueueDeps, type
 import { channelReceiptPath } from "../../src/buzz/buzz-channel-files.ts";
 import { allow, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { outboxDeliveryReadback } from "../../src/outbox/outbox.ts";
 import { channelQueueDepsFor, startBuzzMessageIngressListener } from "../../src/daemon/agentcpd.ts";
 import { BUZZ_CHANNEL_PENDING_AFTER_MS } from "../../src/doctor/doctor.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
@@ -54,7 +55,7 @@ describe("the rules for what a receipt may move", () => {
     const state = { status: "PENDING" as "PENDING" | "SENT" | "ACKED" };
     const calls: string[] = [];
     const message = (): ChannelQueueMessage[] =>
-      state.status === "ACKED" ? [] : [{ messageId: "m1", status: state.status, holder, eventId: "evt-1", room: ROOM }];
+      state.status === "ACKED" ? [] : [{ messageId: "m1", delivery: outboxDeliveryReadback({ status: state.status, failureClass: null }), holder, eventId: "evt-1", room: ROOM }];
     const ok: Decision<void> = allow(ReasonCode.OK, undefined);
     const deps: ChannelQueueDeps = {
       messages: message,
@@ -108,7 +109,7 @@ describe("the rules for what a receipt may move", () => {
     const f = fake();
     const held: ChannelQueueDeps = {
       ...f.deps,
-      messages: () => [{ messageId: "m1", status: "PENDING", failureClass: "unknown_observed", holder, eventId: "evt-1", room: ROOM }],
+      messages: () => [{ messageId: "m1", delivery: outboxDeliveryReadback({ status: "PENDING", failureClass: "unknown_observed" }), holder, eventId: "evt-1", room: ROOM }],
     };
     const own = signedReply(cto, [["h", ROOM], ["e", "evt-1", "", "reply"], ["p", OWNER]]);
     const out = applyChannelReceipts(held, holder.roleKey, [emitted("evt-1"), replied(own, "evt-1")]);
@@ -129,7 +130,7 @@ describe("a malformed receipt is skipped and does not stop the batch", () => {
   const queue = () => {
     const state = { status: "PENDING" as "PENDING" | "SENT" };
     const deps: ChannelQueueDeps = {
-      messages: () => [{ messageId: "m1", status: state.status, holder, eventId: "evt-1", room: ROOM }],
+      messages: () => [{ messageId: "m1", delivery: outboxDeliveryReadback({ status: state.status, failureClass: null }), holder, eventId: "evt-1", room: ROOM }],
       boundActor: () => ctoPub,
       deliver: () => {
         state.status = "SENT";

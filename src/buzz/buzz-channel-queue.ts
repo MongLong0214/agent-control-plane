@@ -30,11 +30,13 @@ import { BUZZ_CHANNEL_RECEIPT_SUFFIX, channelDir, readChannelReceipts } from "./
  * Nothing is lost by ignoring one: the message stays `PENDING` and the doctor names it.
  */
 
+/** What the row says about delivery, as the shared interpretation reads it: never a status on its own. */
+export type ChannelQueueDelivery = ReturnType<typeof outboxDeliveryReadback>;
+
 export interface ChannelQueueMessage {
   readonly messageId: string;
-  readonly status: "PENDING" | "SENT";
-  /** The row's recorded failure class; read with `status` through the shared delivery interpretation, never alone. */
-  readonly failureClass?: OutboxMessage["failureClass"];
+  /** The row's status and failure class through `outboxDeliveryReadback`, the one projection every reader uses. */
+  readonly delivery: ChannelQueueDelivery;
   readonly holder: HolderIdentity;
   readonly eventId: string;
   /** The Buzz room the event was written in; `null` when the stored envelope cannot say. */
@@ -115,23 +117,22 @@ const applyOne = (deps: ChannelQueueDeps, roleKey: string, receipt: ChannelRecei
       return;
     }
   }
-  // What the row says about delivery is read the one way every reader reads it. A message whose outcome is
-  // unknown, or held from automatic resend, is not this module's to deliver or to complete.
-  const readback = (m: ChannelQueueMessage) => outboxDeliveryReadback({ status: m.status, failureClass: m.failureClass ?? null });
+  // A message whose outcome is unknown, or held from automatic resend, is not this module's to deliver or to complete.
   let current = message;
-  if (readback(current).automaticResendHeld) {
+  if (current.delivery.automaticResendHeld) {
     result.ignored += 1;
     return;
   }
-  if (!readback(current).delivered) {
+  if (!current.delivery.delivered) {
     if (!deps.deliver(current).allowed) {
       result.ignored += 1;
       return;
     }
     result.delivered.push(current.messageId);
-    current = { ...current, status: "SENT" };
+    // The claim moved the row to SENT, with no failure class: read the same way it will be next time.
+    current = { ...current, delivery: outboxDeliveryReadback({ status: "SENT", failureClass: null }) };
   }
-  if (receipt.type === "replied" && readback(current).delivered && !readback(current).completed) {
+  if (receipt.type === "replied" && current.delivery.delivered && !current.delivery.completed) {
     if (deps.complete(current).allowed) result.completed.push(current.messageId);
     else result.ignored += 1;
   }
@@ -183,8 +184,7 @@ export const channelQueueMessages = (db: ChannelQueueDatabase, incarnationOf: (s
         }
         return [{
           messageId: row.message_id,
-          status: row.status,
-          failureClass: row.failure_class ?? null,
+          delivery: outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }),
           holder: {
             roleKey: row.role_key,
             bindingGeneration: row.binding_generation,
