@@ -193,11 +193,21 @@ const channel = (() => {
   } catch { /* no subscriber configuration: the naming below is all there is */ }
   candidates.push(join(process.env.HOME ?? homedir(), '.hermes', 'bridge', 'keys', `cto-${project}.priv`));
   let failure = 'the project\'s CTO key file cannot be read';
+  const skipped = [];
   for (const keyFile of candidates) {
     let secret;
     try { secret = readFileSync(keyFile, 'utf8').trim(); } catch { continue; }
-    if (!/^[0-9a-f]{64}$/.test(secret)) { failure = 'the project\'s CTO key file is not 32 hex-encoded bytes'; continue; }
-    if (getPublicKey(Uint8Array.from(Buffer.from(secret, 'hex'))) !== held.actorId) { failure = 'the project\'s CTO key is not the Buzz identity its canonical entitlement names'; continue; }
+    if (!/^[0-9a-f]{64}$/.test(secret)) { failure = 'the project\'s CTO key file is not 32 hex-encoded bytes'; skipped.push({ keyFile, reason: failure }); continue; }
+    // 64 hex digits are not always a secret key (all zeros is not one): a candidate that cannot be derived from is skipped,
+    // named and not quoted, and the next one is tried, so one bad file never ends the search.
+    let derived;
+    try { derived = getPublicKey(Uint8Array.from(Buffer.from(secret, 'hex'))); } catch {
+      failure = 'the project\'s CTO key file is not a valid secret key';
+      skipped.push({ keyFile, reason: failure });
+      continue;
+    }
+    if (derived !== held.actorId) { failure = 'the project\'s CTO key is not the Buzz identity its canonical entitlement names'; skipped.push({ keyFile, reason: failure }); continue; }
+    if (skipped.length > 0) report('channel-key', { skipped });
     return { room: held.room, keyFile };
   }
   return refuse(failure);

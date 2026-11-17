@@ -246,6 +246,34 @@ describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, wi
     expect(readFileSync(join(f.dir, "state", "rotations", `${PROJECT}-${NEW}.sh`), "utf8")).toContain(`"--key-file","${declared}"`);
   });
 
+  it("skips a candidate key that is 64 zeros, says so, and goes on to a valid one", async () => {
+    // 64 zero digits are hex and are not a secret key: deriving the public key throws. That must end only that candidate.
+    const f = await fixture("claims");
+    const zero = join(f.dir, "keys", "cto-zero.priv");
+    mkdirSync(dirname(zero), { recursive: true });
+    writeFileSync(zero, `${"0".repeat(64)}\n`, { mode: 0o600 });
+    writeFileSync(join(f.dir, "state", "buzz-nostr-subscriber.json"), JSON.stringify({
+      relayUrl: "wss://relay.example.test",
+      identities: [{ privateKeyFile: zero, encoding: "hex", rooms: [ROOM] }],
+    }));
+    const result = await f.launch();
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    // The fallback, the resident naming, is what the launch uses; the skipped file is named, and its contents are not.
+    expect(readFileSync(join(f.dir, "state", "rotations", `${PROJECT}-${NEW}.sh`), "utf8")).toContain(`"--key-file","${f.keyFile}"`);
+    const skipped = f.steps(result.stdout).find((line) => line.step === "channel-key");
+    expect(skipped).toMatchObject({ skipped: [{ keyFile: zero, reason: expect.stringMatching(/not a valid secret key/u) }] });
+    expect(result.stdout).not.toContain("0".repeat(64));
+  });
+
+  it("refuses with a reason, not a crash, when the only candidate is 64 zeros", async () => {
+    const f = await fixture("claims");
+    writeFileSync(f.keyFile, `${"0".repeat(64)}\n`, { mode: 0o600 });
+    const result = await f.launch();
+    expect(result.code, result.stderr + result.stdout).toBe(68);
+    expect(f.steps(result.stdout).at(-1)).toMatchObject({ step: "channel", refused: expect.stringMatching(/not a valid secret key/u) });
+    expect(f.calls().some((call) => call[0] === "agentctl" && call[2] === "rotate")).toBe(false);
+  });
+
   it("does not take a key the subscriber declares for another room, or one that is not the entitlement's identity", async () => {
     const f = await fixture("claims");
     const declared = join(f.dir, "keys", "someone-else.priv");

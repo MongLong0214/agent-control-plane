@@ -148,7 +148,7 @@ export const confirmChannelStartup = async (
   // warning still arriving, not one that differs. So a screen that would end the launch (an altered warning, another
   // channel list, a dialog that is not the warning) ends it only when the next read, a poll later, is the same screen.
   let lastRefusable: string | null = null;
-  const look = async (): Promise<{ verdict: ScreenVerdict; settled: boolean }> => {
+  const look = async (): Promise<{ verdict: ScreenVerdict; settled: boolean; raw: string | null }> => {
     let text: string;
     try {
       text = await driver.capture();
@@ -156,28 +156,44 @@ export const confirmChannelStartup = async (
       // A terminal that is not the launch's reads as an unknown dialog, the same way twice.
       const settled = lastRefusable === "\u0000unreadable";
       lastRefusable = "\u0000unreadable";
-      return { verdict: "OTHER_DIALOG", settled };
+      return { verdict: "OTHER_DIALOG", settled, raw: null };
     }
     const verdict = classifyScreen(text);
     const refusable = verdict === "WARNING_OTHER_CHANNELS" || verdict === "WARNING_ALTERED" || verdict === "OTHER_DIALOG";
     const normalized = normalizeScreen(text);
     const settled = refusable && lastRefusable === normalized;
     lastRefusable = refusable ? normalized : null;
-    return { verdict, settled };
+    return { verdict, settled, raw: text };
   };
   let verdict: ScreenVerdict = "OTHER";
+  // The one keystroke is authorized by agreement, never by one snapshot: two reads of the same pane in a row, byte for
+  // byte the same, each exactly the warning. A screen is redrawn between any two reads, so a single exact read can be
+  // followed by something else before the key lands; this narrows that to the one read taken immediately before it.
+  let exactBefore: string | null = null;
   const first = driver.now();
   while (true) {
     const read = await look();
     verdict = read.verdict;
     if (verdict === "REGISTERED") return { ok: true, confirmed: false };
-    if (verdict === "EXACT_WARNING") break;
-    if (read.settled && (verdict === "WARNING_OTHER_CHANNELS" || verdict === "WARNING_ALTERED")) {
-      return { ok: false, failure: "WARNING_DIFFERS", screen: verdict, confirmed: false };
+    if (verdict === "EXACT_WARNING") {
+      if (exactBefore !== null && exactBefore === read.raw) break;
+      exactBefore = read.raw;
+    } else {
+      exactBefore = null;
+      if (read.settled && (verdict === "WARNING_OTHER_CHANNELS" || verdict === "WARNING_ALTERED")) {
+        return { ok: false, failure: "WARNING_DIFFERS", screen: verdict, confirmed: false };
+      }
+      if (read.settled && verdict === "OTHER_DIALOG") return { ok: false, failure: "UNRECOGNIZED_SCREEN", screen: verdict, confirmed: false };
     }
-    if (read.settled && verdict === "OTHER_DIALOG") return { ok: false, failure: "UNRECOGNIZED_SCREEN", screen: verdict, confirmed: false };
     if (driver.now() - first >= bounds.screenWaitMs) return { ok: false, failure: "UNRECOGNIZED_SCREEN", screen: verdict, confirmed: false };
     await driver.sleep(bounds.pollMs);
+  }
+  // Immediately before the key: read once more. Anything but the very same bytes aborts, and nothing is pressed.
+  const last = await look();
+  if (last.verdict === "REGISTERED") return { ok: true, confirmed: false };
+  if (last.raw === null) return { ok: false, failure: "UNRECOGNIZED_SCREEN", screen: last.verdict, confirmed: false };
+  if (last.raw !== exactBefore) {
+    return { ok: false, failure: last.verdict === "OTHER_DIALOG" ? "UNRECOGNIZED_SCREEN" : "WARNING_DIFFERS", screen: last.verdict, confirmed: false };
   }
   await driver.press();
   lastRefusable = null;

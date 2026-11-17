@@ -139,6 +139,50 @@ describe("confirming, and only confirming", () => {
     expect(t.presses).toEqual([]);
   });
 
+  it("presses nothing when a partial warning, then an exact one, is redrawn to altered text before the key: one exact snapshot does not authorize Enter", async () => {
+    const half = WARNING.slice(0, WARNING.indexOf("Please use --channels to run a list") + "Please use --channels to run a list".length);
+    const altered = WARNING.replace("is for local channel development only", "is fine");
+    const t = terminal((_pressed, tick) => (tick === 0 ? half : tick === 1 ? WARNING : altered));
+    const result = await confirmChannelStartup(t.driver, t.bounds);
+    expect(result).toMatchObject({ ok: false, failure: "WARNING_DIFFERS", screen: "WARNING_ALTERED", confirmed: false });
+    expect(t.presses).toEqual([]);
+  });
+
+  it("reads the screen once more immediately before the key, and presses nothing if that read is altered", async () => {
+    // Two identical exact reads, then the redraw lands between the last poll and the key.
+    const altered = WARNING.replace("Channels: server:acp-buzz-channel", "Channels: server:acp-buzz-channel server:other");
+    const t = terminal((_pressed, tick) => (tick < 2 ? WARNING : altered));
+    expect(await confirmChannelStartup(t.driver, t.bounds)).toMatchObject({ ok: false, failure: "WARNING_DIFFERS", screen: "WARNING_OTHER_CHANNELS", confirmed: false });
+    expect(t.presses).toEqual([]);
+  });
+
+  it("presses nothing when the last read is the exact warning but is not the same bytes as the two before it", async () => {
+    const redrawn = `${WARNING}   `;
+    expect(classifyScreen(redrawn)).toBe("EXACT_WARNING");
+    const t = terminal((_pressed, tick) => (tick < 2 ? WARNING : redrawn));
+    expect(await confirmChannelStartup(t.driver, t.bounds)).toMatchObject({ ok: false, failure: "WARNING_DIFFERS", confirmed: false });
+    expect(t.presses).toEqual([]);
+  });
+
+  it("does not take two exact reads that differ in bytes as two identical ones, and presses once they agree", async () => {
+    const redrawn = `${WARNING}   `;
+    const t = terminal((pressed, tick) => (pressed > 0 ? REGISTERED : tick === 0 ? WARNING : redrawn));
+    expect(await confirmChannelStartup(t.driver, t.bounds)).toEqual({ ok: true, confirmed: true });
+    expect(t.presses).toEqual(["Enter"]);
+  });
+
+  it("presses nothing when the pre-key read cannot be taken", async () => {
+    let reads = 0;
+    const t = terminal(() => WARNING);
+    t.driver.capture = () => {
+      reads += 1;
+      if (reads >= 3) throw new Error("the pane is not this launch's");
+      return WARNING;
+    };
+    expect(await confirmChannelStartup(t.driver, t.bounds)).toMatchObject({ ok: false, failure: "UNRECOGNIZED_SCREEN", confirmed: false });
+    expect(t.presses).toEqual([]);
+  });
+
   it("waits no longer than its bound for a screen that never appears", async () => {
     const t = terminal(() => STARTING, { screenWaitMs: 2_000, registerWaitMs: 2_000, pollMs: 500 });
     await confirmChannelStartup(t.driver, t.bounds);
