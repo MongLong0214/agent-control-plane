@@ -180,22 +180,40 @@ describe("what the channel shares with the daemon", () => {
     expect(() => channelReceiptPath(state, "../escape")).toThrow();
   });
 
-  it("round-trips its cursor, and treats an unreadable state file as no state", () => {
+  it("round-trips its cursor, its failed events and the events it can still answer, and treats an unreadable state file as no state", () => {
     const state = tmp();
     const store = fileChannelStateStore(state, "demo");
     expect(store.load()).toBeNull();
-    store.save({ cursor: 7, seen: [["a", 5]], threads: [["a", "b", "room", "a"]] });
-    expect(store.load()).toEqual({ cursor: 7, seen: [["a", 5]], threads: [["a", "b", "room", "a"]] });
+    const saved = { cursor: 7, failed: [["f", 3]] as [string, number][], events: [["a", 5, "b", "room", "a", true], ["c", 6, "d", "room", "a", false]] as [string, number, string, string, string, boolean][] };
+    store.save(saved);
+    expect(store.load()).toEqual(saved);
     writeFileSync(join(state, "buzz-channel", "demo.state.json"), "{not json");
     expect(store.load()).toBeNull();
   });
 
-  it("reads a state file written before ids carried a time or a room: bare ids kept at the cursor, room-less threads dropped", () => {
+  it("skips a malformed entry in a state file and keeps the others", () => {
     const state = tmp();
     const store = fileChannelStateStore(state, "demo");
-    store.save({ cursor: 7, seen: [], threads: [] });
-    writeFileSync(join(state, "buzz-channel", "demo.state.json"), JSON.stringify({ cursor: 9, seen: ["old-id"], threads: [["t", "author"], ["u", "author", "room", "u"]] }));
-    expect(store.load()).toEqual({ cursor: 9, seen: [["old-id", 9]], threads: [["u", "author", "room", "u"]] });
+    store.save({ cursor: 1, failed: [], events: [] });
+    writeFileSync(join(state, "buzz-channel", "demo.state.json"), JSON.stringify({
+      cursor: 9,
+      failed: [["f", 4], ["g"], 7, ["h", "x"]],
+      events: [["a", 5, "b", "room", "a", true], ["a", "x", "b", "room", "a", true], ["a", 5, "b"], null],
+    }));
+    expect(store.load()).toEqual({ cursor: 9, failed: [["f", 4]], events: [["a", 5, "b", "room", "a", true]] });
+  });
+
+  it("reads a state file from before failed events and answerable parents were kept together: its ids and threads become events", () => {
+    const state = tmp();
+    const store = fileChannelStateStore(state, "demo");
+    store.save({ cursor: 1, failed: [], events: [] });
+    // The shape of the previous revision: `cursor` was the resume point, ids carried their time, threads their room.
+    writeFileSync(join(state, "buzz-channel", "demo.state.json"), JSON.stringify({ cursor: 9, seen: [["old-id", 5], "bare-id"], threads: [["t", "author"], ["u", "author", "room", "u"]] }));
+    expect(store.load()).toEqual({
+      cursor: 9,
+      failed: [],
+      events: [["old-id", 5, "", "", "", true], ["bare-id", 9, "", "", "", true], ["u", 9, "author", "room", "u", false]],
+    });
   });
 
   it("reads the owner's buzz pubkeys from the same owner-identities declaration the daemon reads", () => {

@@ -4,6 +4,7 @@ import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from "nos
 import {
   BuzzChannelRelay,
   KEEPALIVE_ANSWER_MS,
+  ANSWERABLE_RETENTION_SECONDS,
   KEEPALIVE_INTERVAL_MS,
   neutralizeChannelText,
   type ChannelNotification,
@@ -100,6 +101,8 @@ const harness = (options: {
   ceoKeys?: () => readonly string[];
   secretKey?: Uint8Array;
   rooms?: string[];
+  /** Seconds on the clock at the start (default 2000). */
+  now?: number;
   /** Notification bodies whose first write to the session throws, as a closed transport would. */
   failOnce?: Set<string>;
 } = {}) => {
@@ -107,7 +110,7 @@ const harness = (options: {
   const notifications: ChannelNotification[] = [];
   const receipts: ChannelReceipt[] = [];
   const scheduler = fakeScheduler();
-  scheduler.set(2_000);
+  scheduler.set(options.now ?? 2_000);
   const openSocket: BuzzRelaySocketFactory = (_url, handlers) => {
     const connection: FakeConnection = {
       sent: [],
@@ -547,18 +550,52 @@ describe("the resume point never passes an event the session did not receive", (
     const store: ChannelStateStore = { load: () => saved, save: (state) => void (saved = state) };
     const one = harness({ store, failOnce: new Set(["event 1800"]) });
     const connection = await one.connect();
-    await one.deliver(connection, mention(ceo, "event 1800", 1_800));
+    const e1800 = mention(ceo, "event 1800", 1_800);
+    await one.deliver(connection, e1800);
     await one.deliver(connection, mention(ceo, "event 1900", 1_900));
-    expect(saved!.cursor).toBeLessThanOrEqual(1_800);
+    // The state says both things: the newest event handled, and the one that was not delivered.
+    expect(saved!.cursor).toBe(1_900);
+    expect(saved!.failed).toEqual([[e1800.id, 1_800]]);
 
     const two = harness({ store });
     const again = await two.connect();
     const req = again.sent.find((f) => f[0] === "REQ") as [string, string, { since: number }];
-    expect(req[2].since).toBeLessThanOrEqual(1_800);
+    expect(req[2].since).toBeLessThanOrEqual(1_790);
+  });
+
+  it("does not let a replay of a later event move a restarted session past the failed one", async () => {
+    let saved: ChannelState | null = null;
+    const store: ChannelStateStore = { load: () => saved, save: (state) => void (saved = state) };
+    const e1800 = mention(ceo, "event 1800", 1_800);
+    const e1900 = mention(ceo, "event 1900", 1_900);
+    const one = harness({ store, failOnce: new Set(["event 1800"]) });
+    const first = await one.connect();
+    await one.deliver(first, e1800);
+    await one.deliver(first, e1900);
+    one.relay.close();
+
+    // After the restart the relay replays B first and the connection drops before A arrives.
+    const two = harness({ store });
+    const second = await two.connect();
+    await two.deliver(second, e1900);
+    expect(two.notifications).toEqual([]);
+    expect(two.relay.status().cursor).toBe(1_800);
+    second.drop();
+    two.scheduler.advance(1_000);
+    const third = await two.connect();
+    const req = third.sent.find((f) => f[0] === "REQ") as [string, string, { since: number }];
+    expect(req[2].since).toBeLessThanOrEqual(1_790);
+
+    // And A, when it does arrive, is delivered once, after which the resume point is free to move.
+    await two.deliver(third, e1800);
+    await two.deliver(third, e1900);
+    expect(two.notifications.map((n) => n.content)).toEqual(["event 1800"]);
+    expect(two.relay.status().cursor).toBe(1_900);
+    expect(saved!.failed).toEqual([]);
   });
 });
 
-describe("what a restart remembers having shown", () => {
+describe("what a restart remembers having shown, and what it can still answer", () => {
   it("remembers every id a resume can replay, however many there are, so none is shown twice", async () => {
     let saved: ChannelState | null = null;
     const store: ChannelStateStore = { load: () => saved, save: (state) => void (saved = state) };
@@ -567,7 +604,7 @@ describe("what a restart remembers having shown", () => {
     const connection = await one.connect();
     for (const event of events) await one.deliver(connection, event);
     expect(one.notifications).toHaveLength(700);
-    expect(saved!.seen.length).toBe(700);
+    expect(saved!.events.length).toBe(700);
 
     const two = harness({ store });
     const again = await two.connect();
@@ -575,16 +612,56 @@ describe("what a restart remembers having shown", () => {
     expect(two.notifications).toEqual([]);
   }, 30_000);
 
-  it("forgets an id only once a resume can no longer ask for it, by its time and not by how many came after", async () => {
+  it("keeps an id the active subscription can still return, however far the cursor has moved: A, B, A is shown as A, B", async () => {
+    const h = harness();
+    const connection = await h.connect();
+    const a = mention(ceo, "A", 1_800);
+    const b = mention(ceo, "B", 1_900);
+    await h.deliver(connection, a);
+    await h.deliver(connection, b);
+    // The same subscription hands A over again, as a relay does for a mention that matches both filters.
+    await h.deliver(connection, a);
+    await h.deliver(connection, b);
+    expect(h.notifications.map((n) => n.content)).toEqual(["A", "B"]);
+  });
+
+  it("keeps every parent a restart could be asked to answer, the same ones and for as long as it keeps the ids it showed", async () => {
     let saved: ChannelState | null = null;
     const store: ChannelStateStore = { load: () => saved, save: (state) => void (saved = state) };
-    const h = harness({ store });
+    const events = Array.from({ length: 1_100 }, (_, i) => mention(ceo, `parent ${i}`, 1_900));
+    const one = harness({ store });
+    const connection = await one.connect();
+    for (const event of events) await one.deliver(connection, event);
+    // One store: whatever is remembered as shown is also answerable, with nothing capped by count.
+    expect(saved!.events).toHaveLength(1_100);
+    expect(saved!.events.every(([, , author, room, root, delivered]) => author === ceoPub && room === ROOM && root !== "" && delivered)).toBe(true);
+
+    const two = harness({ store });
+    const again = await two.connect();
+    // The very first parent is still answerable after the restart, and a follow-up to it is still in its thread.
+    const pending = two.relay.reply({ room: ROOM, eventId: events[0]!.id, kind: "report", text: "answering the oldest" });
+    const sent = again.sent.find((f) => f[0] === "EVENT") as [string, { id: string; tags: string[][] }];
+    expect(sent[1].tags).toContainEqual(["p", ceoPub]);
+    again.push(["OK", sent[1].id, true, ""]);
+    await expect(pending).resolves.toMatchObject({ ok: true });
+    await two.deliver(again, sign(ceo, [["h", ROOM], ["e", events[0]!.id, "", "reply"]], "follow-up to the oldest parent", 1_950));
+    expect(two.notifications.map((n) => n.content)).toEqual(["follow-up to the oldest parent"]);
+  }, 30_000);
+
+  it("forgets an id or a parent by its time alone: once nothing can ask for it and it is past the retention", async () => {
+    let saved: ChannelState | null = null;
+    const store: ChannelStateStore = { load: () => saved, save: (state) => void (saved = state) };
+    const now = 400_000;
+    const h = harness({ store, now });
     const connection = await h.connect();
-    const old = mention(ceo, "old", 1_000);
-    const recent = mention(ceo, "recent", 1_900);
-    await h.deliver(connection, old);
+    const ancient = mention(ceo, "ancient", now - ANSWERABLE_RETENTION_SECONDS - 5_000);
+    // Older than the resume window but inside the retention: still shown-and-answerable.
+    const earlier = mention(ceo, "earlier", now - 5_000);
+    const recent = mention(ceo, "recent", now - 100);
+    await h.deliver(connection, ancient);
+    await h.deliver(connection, earlier);
     await h.deliver(connection, recent);
-    expect(saved!.seen.map(([id]) => id)).toEqual([recent.id]);
+    expect(saved!.events.map(([id]) => id)).toEqual([earlier.id, recent.id]);
   });
 });
 

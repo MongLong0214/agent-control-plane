@@ -50,8 +50,13 @@ export const RESUME_OVERLAP_SECONDS = 10;
 /** First start with no saved cursor: ask this far back, so a message sent while the session was starting is not lost. */
 export const FIRST_START_LOOKBACK_SECONDS = 300;
 
-const THREAD_LIMIT = 4096;
-const PERSISTED_THREADS = 1024;
+/**
+ * How long a delivered event stays remembered, as an id that is not shown twice and as a parent that can
+ * still be answered, when no subscription can ask for it any more. One store and one rule for both, by
+ * time and never by count, so what is remembered as shown is also answerable. A thread that goes quiet
+ * for longer than this is no longer one this CTO is in.
+ */
+export const ANSWERABLE_RETENTION_SECONDS = 24 * 60 * 60;
 
 export type ChannelSenderRole = "ceo" | "owner";
 
@@ -116,17 +121,23 @@ export const isChannelReceipt = (value: unknown): value is ChannelReceipt => {
 };
 
 /**
- * The state that outlives the process: where to resume, what has already been shown, and which events a
- * thread can still be answered under.
+ * One remembered event: its id, when it was written, who wrote it, the room, the thread's root, and whether
+ * it was delivered to the session (a reply this CTO posted is remembered, so it can be answered, but was
+ * never delivered). An entry with no author or room is an id kept only so it is not shown twice.
+ */
+export type ChannelEventEntry = readonly [id: string, at: number, author: string, room: string, root: string, delivered: boolean];
+
+/**
+ * The state that outlives the process.
  *
- * `cursor` is where a restart asks from, never past an event that was not delivered. `seen` holds every
- * delivered id (with the time it was written) that a resume could replay, so it is pruned by that time
- * and never by count. `threads` are `[id, author, room, root]` for every event delivered or posted here.
+ * `cursor` is the newest event handled and `failed` the events whose notification did not reach the session;
+ * where a resume asks from is always the lesser of the oldest failed one and the cursor, so a restart cannot
+ * move past an event the session never saw. `events` is the one store of what is remembered, pruned by time.
  */
 export interface ChannelState {
   readonly cursor: number;
-  readonly seen: readonly (readonly [string, number])[];
-  readonly threads: readonly (readonly [string, string, string, string])[];
+  readonly failed: readonly (readonly [id: string, at: number])[];
+  readonly events: readonly ChannelEventEntry[];
 }
 
 export interface ChannelStateStore {
@@ -256,40 +267,20 @@ export const replyToOf = (event: { tags: readonly (readonly string[])[] }): stri
  */
 export const neutralizeChannelText = (text: string): string => text.replace(/<(\/?)channel/giu, "<$1​channel");
 
-/** Exact membership: one Map-backed set that forgets its oldest entries, not its newest. */
-class Recent<K, V> {
-  readonly #map = new Map<K, V>();
-  readonly limit: number;
-  constructor(limit: number) {
-    this.limit = limit;
-  }
-  has(key: K): boolean {
-    return this.#map.has(key);
-  }
-  get(key: K): V | undefined {
-    return this.#map.get(key);
-  }
-  add(key: K, value: V): void {
-    this.#map.delete(key);
-    this.#map.set(key, value);
-    while (this.#map.size > this.limit) this.#map.delete(this.#map.keys().next().value as K);
-  }
-  entries(): [K, V][] {
-    return [...this.#map.entries()];
-  }
-}
-
 export class BuzzChannelRelay {
   readonly pubkey: string;
   readonly #o: BuzzChannelOptions;
   readonly #open: BuzzRelaySocketFactory;
   readonly #sched: ChannelScheduler;
-  /** Delivered event id -> when it was written. Pruned by that time (a resume never asks before the cursor), not by count. */
-  readonly #seen = new Map<string, number>();
   /** Events whose notification failed: id -> clamped time. The resume point never passes the oldest of them. */
   readonly #retry = new Map<string, number>();
-  /** Every event delivered here or posted from here: where it was written, by whom, and the thread it belongs to. */
-  readonly #known = new Recent<string, KnownEvent>(THREAD_LIMIT);
+  /**
+   * Everything remembered, delivered here or posted from here: when it was written, by whom, where, the
+   * thread it belongs to, and whether it was delivered. Dedupe and parents are both read from this one map.
+   */
+  readonly #events = new Map<string, KnownEvent>();
+  /** The `since` of the subscription that is open now: it can still return anything written at or after it. */
+  #activeSince: number | null = null;
   readonly #subId: string;
   #socket: BuzzRelaySocket | null = null;
   #generation = 0;
@@ -325,8 +316,8 @@ export class BuzzChannelRelay {
     const saved = options.store?.load() ?? null;
     if (saved !== null) {
       this.#cursor = saved.cursor;
-      for (const [id, at] of saved.seen) this.#seen.set(id, at);
-      for (const [id, author, room, root] of saved.threads) this.#known.add(id, { author, room, root });
+      for (const [id, at] of saved.failed) this.#retry.set(id, at);
+      for (const [id, at, author, room, root, delivered] of saved.events) this.#events.set(id, { at, author, room, root, delivered });
     }
   }
 
@@ -390,13 +381,13 @@ export class BuzzChannelRelay {
     const mentionsMe = recipients.length === 1;
     // A thread is (room, root): a reply belongs to one this CTO is in only when the event it answers was
     // delivered or posted here, in the same room. An id seen in another room names nothing in this one.
-    const parent = replyTo === "" ? undefined : this.#known.get(replyTo);
+    const parent = replyTo === "" ? undefined : this.#events.get(replyTo);
     const inThread = parent !== undefined && parent.room === room;
     // An owner's message that names nobody is addressed to this room's CTO only when it starts a topic:
     // a reply (any `e` tag) is for the thread it is in, and a thread this CTO never joined is not its own.
     const ownerOpen = role === "owner" && recipients.length === 0 && tagValues(event, "e").length === 0;
     if (!mentionsMe && !inThread && !ownerOpen) return { deliver: false, reason: "not-addressed" };
-    if (this.#seen.has(event.id)) return { deliver: false, reason: "duplicate" };
+    if (this.#events.get(event.id)?.delivered === true) return { deliver: false, reason: "duplicate" };
     return { deliver: true, role, room, replyTo };
   }
 
@@ -412,8 +403,8 @@ export class BuzzChannelRelay {
     if (input.text.length > MAX_REPLY_CHARACTERS) return { ok: false, reason: "the reply is too long" };
     // Only an event this channel delivered can be answered, and only in the room it was written in: the
     // reply is addressed to that event's author, so a parent nobody here received has no one to answer.
-    const parent = this.#known.get(input.eventId);
-    if (parent === undefined) return { ok: false, reason: "that event was not received on this channel" };
+    const parent = this.#events.get(input.eventId);
+    if (parent === undefined || parent.author === "") return { ok: false, reason: "that event was not received on this channel" };
     if (parent.room !== input.room) return { ok: false, reason: "that event was written in another room" };
     const recipient = parent.author;
     if (recipient === this.pubkey) return { ok: false, reason: "that event is this CTO's own" };
@@ -441,7 +432,7 @@ export class BuzzChannelRelay {
     if (ack.status !== "ACCEPTED" && ack.status !== "DUPLICATE") {
       return { ok: false, reason: `the relay did not accept the reply (${ack.status})` };
     }
-    this.#known.add(event.id, { author: this.pubkey, room: input.room, root: parent.root });
+    this.#events.set(event.id, { at: event.created_at, author: this.pubkey, room: input.room, root: parent.root, delivered: false });
     this.#persist();
     this.#o.onReceipt?.({
       type: "replied",
@@ -485,6 +476,7 @@ export class BuzzChannelRelay {
     const socket = this.#socket;
     this.#socket = null;
     this.#subscribed = false;
+    this.#activeSince = null;
     this.#authId = null;
     this.#probeId = null;
     if (this.#keepalive !== null) this.#sched.clearTimeout(this.#keepalive);
@@ -578,7 +570,9 @@ export class BuzzChannelRelay {
     if (id === this.#authId) {
       if (frame[2] !== true) return this.#lost();
       this.#subscribed = true;
-      this.#socket?.send(JSON.stringify(["REQ", this.#subId, ...this.#filters()]));
+      const filters = this.#filters();
+      this.#activeSince = (filters[0] as { since: number }).since;
+      this.#socket?.send(JSON.stringify(["REQ", this.#subId, ...filters]));
       this.#armKeepalive();
       return;
     }
@@ -624,12 +618,13 @@ export class BuzzChannelRelay {
         return;
       }
       this.#retry.delete(event.id);
-      this.#seen.set(event.id, event.created_at);
-      const parent = verdict.replyTo === "" ? undefined : this.#known.get(verdict.replyTo);
-      this.#known.add(event.id, {
+      const parent = verdict.replyTo === "" ? undefined : this.#events.get(verdict.replyTo);
+      this.#events.set(event.id, {
+        at: event.created_at,
         author: event.pubkey,
         room: verdict.room,
         root: parent !== undefined && parent.room === verdict.room ? parent.root : event.id,
+        delivered: true,
       });
       this.#delivered += 1;
       this.#o.onReceipt?.({
@@ -646,17 +641,30 @@ export class BuzzChannelRelay {
     this.#persist();
   }
 
+  /**
+   * Forgets what nothing can ask for and nothing needs, by time. An id is kept while the open subscription
+   * can still return it (anything written at or after its `since`), while a resume could ask for it (from
+   * the resume point, less the overlap), and while it is inside the retention a parent is answerable for.
+   */
+  #prune(): void {
+    const resume = this.#resumeFrom();
+    const horizon = this.#sched.nowSeconds() - ANSWERABLE_RETENTION_SECONDS;
+    const keepFrom = Math.min(
+      this.#activeSince ?? Number.POSITIVE_INFINITY,
+      resume === null ? Number.POSITIVE_INFINITY : Math.max(0, resume - RESUME_OVERLAP_SECONDS),
+      horizon,
+    );
+    for (const [id, entry] of this.#events) if (entry.at < keepFrom) this.#events.delete(id);
+  }
+
   #persist(): void {
     const resume = this.#resumeFrom();
     if (resume === null) return;
-    // A resume asks from `since`, so a delivered id older than that can never be replayed: those are
-    // dropped by their time, and every id from there on is kept however many there are.
-    const since = Math.max(0, resume - RESUME_OVERLAP_SECONDS);
-    for (const [id, at] of this.#seen) if (at < since) this.#seen.delete(id);
+    this.#prune();
     this.#o.store?.save({
-      cursor: resume,
-      seen: [...this.#seen.entries()],
-      threads: this.#known.entries().slice(-PERSISTED_THREADS).map(([id, e]) => [id, e.author, e.room, e.root] as const),
+      cursor: this.#cursor ?? resume,
+      failed: [...this.#retry.entries()],
+      events: [...this.#events.entries()].map(([id, e]) => [id, e.at, e.author, e.room, e.root, e.delivered] as const),
     });
   }
 
@@ -693,9 +701,11 @@ export class BuzzChannelRelay {
 }
 
 interface KnownEvent {
+  readonly at: number;
   readonly author: string;
   readonly room: string;
   readonly root: string;
+  readonly delivered: boolean;
 }
 
 type ReplyAckResult = { status: "ACCEPTED" | "DUPLICATE" | "REFUSED" | "TIMEOUT" | "UNAVAILABLE" };

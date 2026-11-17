@@ -1,7 +1,7 @@
 import { closeSync, constants as fsConstants, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
-import { isChannelReceipt, type ChannelReceipt, type ChannelState, type ChannelStateStore } from "./buzz-channel.ts";
+import { isChannelReceipt, type ChannelEventEntry, type ChannelReceipt, type ChannelState, type ChannelStateStore } from "./buzz-channel.ts";
 
 /**
  * The files a CTO's channel server shares with the daemon, all beneath the daemon's own state
@@ -82,28 +82,42 @@ export const readChannelReceipts = (path: string): { receipts: ChannelReceipt[];
   return { receipts, skipped };
 };
 
-/** The cursor and shown-ids a restarted channel server resumes from. Atomic, owner-only. */
+/** The cursor, the failed events and the remembered events a restarted channel server resumes from. Atomic, owner-only. */
 export const fileChannelStateStore = (stateDir: string, projectId: string): ChannelStateStore => {
   if (!PROJECT_SHAPE.test(projectId)) throw new Error("project id is not a file-safe name");
   const path = join(channelDir(stateDir), `${projectId}.state.json`);
   return {
     load: (): ChannelState | null => {
       try {
-        const value = JSON.parse(readFileSync(path, "utf8")) as Partial<{ cursor: unknown; seen: unknown; threads: unknown }>;
-        if (typeof value.cursor !== "number" || !Array.isArray(value.seen) || !Array.isArray(value.threads)) return null;
+        const value = JSON.parse(readFileSync(path, "utf8")) as Partial<{ cursor: unknown; failed: unknown; events: unknown; seen: unknown; threads: unknown }>;
+        if (typeof value.cursor !== "number") return null;
         const cursor = value.cursor;
-        return {
-          cursor,
-          // A file written before ids carried their time held bare ids: they are kept as written at the cursor.
-          seen: value.seen.flatMap((entry): [string, number][] =>
-            typeof entry === "string" ? [[entry, cursor]]
-              : Array.isArray(entry) && typeof entry[0] === "string" && typeof entry[1] === "number" ? [[entry[0], entry[1]]] : []),
-          // Two-element entries carried no room, so they cannot say a reply is in the thread's own room: dropped.
-          threads: value.threads.filter(
-            (entry): entry is [string, string, string, string] =>
-              Array.isArray(entry) && entry.length === 4 && entry.every((member) => typeof member === "string"),
-          ),
-        };
+        const failed = (Array.isArray(value.failed) ? value.failed : []).flatMap((entry): [string, number][] =>
+          Array.isArray(entry) && entry.length === 2 && typeof entry[0] === "string" && typeof entry[1] === "number" ? [[entry[0], entry[1]]] : []);
+        if (Array.isArray(value.events)) {
+          // An entry that is not exactly an event is dropped, not guessed at; the entries around it are kept.
+          const events = value.events.flatMap((entry): ChannelEventEntry[] =>
+            Array.isArray(entry) && entry.length === 6 && typeof entry[0] === "string" && typeof entry[1] === "number" &&
+            typeof entry[2] === "string" && typeof entry[3] === "string" && typeof entry[4] === "string" && typeof entry[5] === "boolean"
+              ? [[entry[0], entry[1], entry[2], entry[3], entry[4], entry[5]]] : []);
+          return { cursor, failed, events };
+        }
+        // The previous revision kept delivered ids and parents in two lists: ids (some bare, with no time) become
+        // events shown, kept at the cursor when they carry no time, and four-element threads become answerable
+        // parents. Two-element threads carried no room, so they cannot say a reply is in the thread's room: dropped.
+        if (!Array.isArray(value.seen) || !Array.isArray(value.threads)) return null;
+        const events: ChannelEventEntry[] = [];
+        for (const entry of value.seen) {
+          if (typeof entry === "string") events.push([entry, cursor, "", "", "", true]);
+          else if (Array.isArray(entry) && typeof entry[0] === "string" && typeof entry[1] === "number") events.push([entry[0], entry[1], "", "", "", true]);
+        }
+        for (const entry of value.threads) {
+          if (Array.isArray(entry) && entry.length === 4 && entry.every((member) => typeof member === "string")) {
+            const [id, author, room, root] = entry as [string, string, string, string];
+            events.push([id, cursor, author, room, root, false]);
+          }
+        }
+        return { cursor, failed: [], events };
       } catch {
         return null;
       }
