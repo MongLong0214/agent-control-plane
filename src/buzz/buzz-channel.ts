@@ -433,6 +433,7 @@ export class BuzzChannelRelay {
       return { ok: false, reason: `the relay did not accept the reply (${ack.status})` };
     }
     this.#events.set(event.id, { at: event.created_at, author: this.pubkey, room: input.room, root: parent.root, delivered: false });
+    this.#touchThread(parent.root, input.room, Math.min(event.created_at, this.#sched.nowSeconds()));
     this.#persist();
     this.#o.onReceipt?.({
       type: "replied",
@@ -626,6 +627,7 @@ export class BuzzChannelRelay {
         root: parent !== undefined && parent.room === verdict.room ? parent.root : event.id,
         delivered: true,
       });
+      this.#touchThread(this.#events.get(event.id)!.root, verdict.room, claimed);
       this.#delivered += 1;
       this.#o.onReceipt?.({
         type: "emitted",
@@ -639,6 +641,17 @@ export class BuzzChannelRelay {
     const claimed = Math.min(event.created_at, this.#sched.nowSeconds());
     this.#cursor = Math.max(this.#cursor ?? 0, claimed);
     this.#persist();
+  }
+
+  /**
+   * A follow-up in a thread, or a reply posted in it, is the thread being active: the root and every event before
+   * the follow-up in that thread, in that room, are retained from now on as if written then. Retention is by last
+   * activity, never by when an event was created, so a thread that is still going does not lose its root.
+   */
+  #touchThread(root: string, room: string, at: number): void {
+    for (const entry of this.#events.values()) {
+      if (entry.root === root && entry.room === room && entry.at < at) entry.at = at;
+    }
   }
 
   /**
@@ -701,7 +714,8 @@ export class BuzzChannelRelay {
 }
 
 interface KnownEvent {
-  readonly at: number;
+  /** When it was last written or last built on: the time retention counts from, so an active thread stays. */
+  at: number;
   readonly author: string;
   readonly room: string;
   readonly root: string;

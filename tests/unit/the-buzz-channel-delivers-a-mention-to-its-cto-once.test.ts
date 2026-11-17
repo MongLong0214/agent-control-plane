@@ -1,4 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterAll, describe, expect, it } from "vitest";
 import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from "nostr-tools/pure";
 
 import {
@@ -13,6 +17,7 @@ import {
   type ChannelState,
   type ChannelStateStore,
 } from "../../src/buzz/buzz-channel.ts";
+import { fileChannelStateStore } from "../../src/buzz/buzz-channel-files.ts";
 import type { BuzzRelaySocketFactory, BuzzRelaySocketHandlers } from "../../src/buzz/buzz-mention-subscriber.ts";
 
 /**
@@ -662,6 +667,98 @@ describe("what a restart remembers having shown, and what it can still answer", 
     await h.deliver(connection, earlier);
     await h.deliver(connection, recent);
     expect(saved!.events.map(([id]) => id)).toEqual([earlier.id, recent.id]);
+  });
+});
+
+const scratch: string[] = [];
+afterAll(() => {
+  for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
+});
+
+describe("repros from the final review", () => {
+  it("does not show again, after an upgrade, an event the old state file lists both as shown and as a thread", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "buzz-channel-legacy-"));
+    scratch.push(dir);
+    const shown = mention(ceo, "already shown before the upgrade", 1_900);
+    // The previous revision's file: the same event is in `seen` (with its time) and in `threads` (with its room).
+    mkdirSync(join(dir, "buzz-channel"), { recursive: true });
+    writeFileSync(join(dir, "buzz-channel", "demo.state.json"), JSON.stringify({
+      cursor: 1_900,
+      seen: [[shown.id, 1_900]],
+      threads: [[shown.id, ceoPub, ROOM, shown.id]],
+    }));
+    const store = fileChannelStateStore(dir, "demo");
+    expect(store.load()!.events).toEqual([[shown.id, 1_900, ceoPub, ROOM, shown.id, true]]);
+
+    const h = harness({ store });
+    const connection = await h.connect();
+    await h.deliver(connection, shown);
+    expect(h.notifications).toEqual([]);
+    // Merged, not overwritten: it is also still a parent that can be answered.
+    const pending = h.relay.reply({ room: ROOM, eventId: shown.id, kind: "report", text: "answering it" });
+    const sent = connection.sent.find((f) => f[0] === "EVENT") as [string, { id: string }];
+    connection.push(["OK", sent[1].id, true, ""]);
+    await expect(pending).resolves.toMatchObject({ ok: true });
+  });
+
+  it("keeps a thread's root answerable while the thread is active, more than a day after the root was written", async () => {
+    let saved: ChannelState | null = null;
+    const store: ChannelStateStore = { load: () => saved, save: (state) => void (saved = state) };
+    const day = 24 * 60 * 60;
+    const now = 200_000;
+    const h = harness({ store, now });
+    const first = await h.connect();
+    const root = mention(ceo, "the root", now - 100);
+    await h.deliver(first, root);
+
+    // A day and more later, the connection has been replaced, and a follow-up arrives in the thread.
+    h.scheduler.set(now + day + 3_600);
+    first.drop();
+    h.scheduler.advance(1_000);
+    const second = await h.connect();
+    const followUp = sign(ceo, [["h", ROOM], ["e", root.id, "", "reply"]], "a follow-up in the thread", now + day + 3_000);
+    await h.deliver(second, followUp);
+
+    // The connection is replaced once more (the relay never answered a REQ here, so the backoff has grown), and the
+    // next reply to the root is still in a thread this CTO is in.
+    second.drop();
+    h.scheduler.advance(5_000);
+    const third = await h.connect();
+    const anotherEv = sign(ceo, [["h", ROOM], ["e", root.id, "", "reply"]], "another reply to the root", now + day + 3_500);
+    await h.deliver(third, anotherEv);
+    // One reply is classified before the state is pruned, so the repro needs the one after it too.
+    await h.deliver(third, sign(ceo, [["h", ROOM], ["e", root.id, "", "reply"]], "and a further reply to the root", now + day + 3_550));
+    expect(h.notifications.map((n) => n.content)).toEqual(["the root", "a follow-up in the thread", "another reply to the root", "and a further reply to the root"]);
+
+    // And it is still answerable after a restart, because the thread's activity is what is kept.
+    const two = harness({ store, now: now + day + 3_600 });
+    const again = await two.connect();
+    const pending = two.relay.reply({ room: ROOM, eventId: root.id, kind: "report", text: "answering the root" });
+    const sent = again.sent.find((f) => f[0] === "EVENT") as [string, { id: string }];
+    again.push(["OK", sent[1].id, true, ""]);
+    await expect(pending).resolves.toMatchObject({ ok: true });
+  });
+
+  it("lets a thread that has gone quiet for the whole retention go, root and all, once no subscription can return it", async () => {
+    let saved: ChannelState | null = null;
+    const store: ChannelStateStore = { load: () => saved, save: (state) => void (saved = state) };
+    const day = 24 * 60 * 60;
+    const now = 200_000;
+    const h = harness({ store, now });
+    const first = await h.connect();
+    const root = mention(ceo, "a thread that stops", now - 100);
+    await h.deliver(first, root);
+    h.scheduler.set(now + 2 * day);
+    first.drop();
+    h.scheduler.advance(1_000);
+    const second = await h.connect();
+    await h.deliver(second, mention(ceo, "something unrelated, two days on", now + 2 * day - 10));
+    // The subscription that was open when the root arrived could still have returned it; this one is newer.
+    second.drop();
+    h.scheduler.advance(5_000);
+    const third = await h.connect();
+    await h.deliver(third, mention(ceo, "and another", now + 2 * day - 5));
+    expect(saved!.events.map(([id]) => id)).not.toContain(root.id);
   });
 });
 

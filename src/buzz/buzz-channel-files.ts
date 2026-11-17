@@ -102,22 +102,27 @@ export const fileChannelStateStore = (stateDir: string, projectId: string): Chan
               ? [[entry[0], entry[1], entry[2], entry[3], entry[4], entry[5]]] : []);
           return { cursor, failed, events };
         }
-        // The previous revision kept delivered ids and parents in two lists: ids (some bare, with no time) become
-        // events shown, kept at the cursor when they carry no time, and four-element threads become answerable
-        // parents. Two-element threads carried no room, so they cannot say a reply is in the thread's room: dropped.
+        // The previous revision kept delivered ids and parents in two lists, and one event can be in both. They are
+        // merged by id: it was shown if either list says so (ids with no time are kept at the cursor), and it keeps
+        // the room, author and root the thread list gave it. Two-element threads carried no room, so they cannot
+        // say a reply is in the thread's room: dropped.
         if (!Array.isArray(value.seen) || !Array.isArray(value.threads)) return null;
-        const events: ChannelEventEntry[] = [];
+        const merged = new Map<string, [id: string, at: number, author: string, room: string, root: string, delivered: boolean]>();
         for (const entry of value.seen) {
-          if (typeof entry === "string") events.push([entry, cursor, "", "", "", true]);
-          else if (Array.isArray(entry) && typeof entry[0] === "string" && typeof entry[1] === "number") events.push([entry[0], entry[1], "", "", "", true]);
+          const id = typeof entry === "string" ? entry : Array.isArray(entry) && typeof entry[0] === "string" ? entry[0] : null;
+          if (id === null) continue;
+          const at = typeof entry === "string" ? cursor : typeof entry[1] === "number" ? entry[1] : null;
+          if (at === null) continue;
+          const earlier = merged.get(id);
+          merged.set(id, [id, earlier === undefined ? at : Math.max(earlier[1], at), "", "", "", true]);
         }
         for (const entry of value.threads) {
-          if (Array.isArray(entry) && entry.length === 4 && entry.every((member) => typeof member === "string")) {
-            const [id, author, room, root] = entry as [string, string, string, string];
-            events.push([id, cursor, author, room, root, false]);
-          }
+          if (!Array.isArray(entry) || entry.length !== 4 || !entry.every((member) => typeof member === "string")) continue;
+          const [id, author, room, root] = entry as [string, string, string, string];
+          const shown = merged.get(id);
+          merged.set(id, [id, shown?.[1] ?? cursor, author, room, root, shown?.[5] ?? false]);
         }
-        return { cursor, failed: [], events };
+        return { cursor, failed: [], events: [...merged.values()] };
       } catch {
         return null;
       }
