@@ -1032,7 +1032,7 @@ export interface BuzzMessageTurnPort {
     principal: "owner" | "peer";
   }): Decision<{ messageId: string }>;
   /**
-   * One constant wake to the role's live peer — **after commit, and only after commit**.
+   * A turn for a holder on the daemon's own runtime — **after commit, and only after commit**.
    *
    * A wake sent from inside the transaction would tell a holder to come and look at a row that
    * does not exist yet, and a holder fast enough to claim before the commit would be told there is
@@ -1297,12 +1297,12 @@ const admitBuzzMessage = (
 };
 
 /**
- * §3 — the durable row is committed, so now, and only now, the holder is told to come and look.
+ * §3 — the durable row is committed, and only now is a holder that runs on the daemon's own runtime
+ * told to take a turn.
  *
- * Nothing here resolves or rejects the message whatever the wake says. A wake is not a delivery:
- * the message is durable and addressed either way, and the only thing a failed wake costs is
- * promptness — the next `registerEndpoint` on this role sends one unconditionally and drains
- * whatever accumulated, which is why this path needs no poller and no retry timer.
+ * Nothing here resolves or rejects the message whatever that says. It is not a delivery: the message
+ * is durable and addressed either way, and an interactive CTO session is not written to at all — it
+ * takes the message with its own claim, which is why this path needs no poller and no retry timer.
  */
 const queuedForRole = async (
   port: BuzzMessageTurnPort,
@@ -1350,19 +1350,15 @@ const queuedForRole = async (
  * the actor nouns a promise needs a subject from. A synonym is caught for being a new word, not for
  * having been guessed at in advance.
  *
- * `null` means the wake was sent, which is still not a read. And a wake refusal says nothing about
+ * `null` means nothing was refused, which is still not a read. (An interactive CTO session is not
+ * written to at all; it reads the message itself.) And a wake refusal says nothing about
  * the message at all: `ROLE_PEER_ABSENT` here means no live peer was registered to nudge, not that
  * the role has no holder — a message is only ever enqueued against an active binding.
  */
 export const ownerMessageQueuedSentence = (wakeRefusal: string | null): string => {
-  if (wakeRefusal === null) {
-    return "Stored for the role, and a wake was sent to its registered peer. Nobody has read it yet.";
-  }
+  if (wakeRefusal === null) return "Stored for the role. Nobody has read it yet.";
   if (wakeRefusal === ReasonCode.ROLE_PEER_ABSENT || wakeRefusal === ReasonCode.ROLE_PEER_STALE) {
     return "Stored for the role. No peer is attached, so no wake was sent. Nobody has read it yet.";
-  }
-  if (wakeRefusal === ReasonCode.ROLE_PEER_UNSUPPORTED) {
-    return "Stored for the role. No wake endpoint is registered, so no wake was sent. Nobody has read it yet.";
   }
   return "Stored for the role. The wake did not land. Nobody has read it yet.";
 };

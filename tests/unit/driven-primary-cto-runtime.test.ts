@@ -252,17 +252,9 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       expect(markersFor(f, interactive.value.sessionId)).toEqual([]);
       expect(cp.sessionRuntime.holds(interactive.value.sessionId)).toBe(false);
       expect(cp.sessionRuntime.drivesSession(interactive.value.sessionId, Role.PRIMARY_CTO)).toBe(false);
-      const knocked: string[] = [];
-      const conversation = {
-        wake: async (roleKey: string) => {
-          knocked.push(roleKey);
-          return allow(ReasonCode.OK, undefined);
-        },
-      };
       const turnsBefore = f.claude.turns.length;
-      const woke = await wakeRoleHolder(cp, conversation, interactive.value.roleKey, { kind: "owner message", ids: [] });
+      const woke = await wakeRoleHolder(cp, interactive.value.roleKey, { kind: "owner message", ids: [] });
       expect(woke.allowed).toBe(true);
-      expect(knocked).toEqual([interactive.value.roleKey]);
       expect(f.claude.turns.length).toBe(turnsBefore);
       // An interactive recipient's HANDOFF_PACKAGE is not held back in band: the delivery sweep takes it.
       const sent = cp.outbox.enqueue({
@@ -357,8 +349,7 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
         payload: { handoffId, projectId: "handoff-project", handoff: delivered },
       });
       expect(again.reasonCode).toBe(ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED);
-      const conversation = { wake: async () => allow(ReasonCode.OK, undefined) };
-      const rewoken = await wakeRoleHolder(cp, conversation, binding.roleKey, { kind: "in-band dispatch", ids: [row.message_id] });
+      const rewoken = await wakeRoleHolder(cp, binding.roleKey, { kind: "in-band dispatch", ids: [row.message_id] });
       expect(rewoken.reasonCode).toBe(ReasonCode.SESSION_TURN_DUPLICATE);
       f.harness.clock.advance(10 * 60_000);
       await cp.outbox.wakeInBandPending();
@@ -1192,7 +1183,7 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       };
     };
 
-    it("refuses a CONTRADICTED driven PRIMARY_CTO without knocking on its registered wake endpoint", async () => {
+    it("refuses a CONTRADICTED driven PRIMARY_CTO and writes nothing to a registered endpoint", async () => {
       await withBootstrapRuntime(async (f) => {
         const cp = f.harness.cp;
         const { binding } = await drivenPrimary(f, "knock-contradicted");
@@ -1210,8 +1201,6 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
           await vi.waitFor(() => expect(listeners.ctoConversation.connected(binding.roleKey)).toBe(true));
           const registered = await peer.callTool("role_wake_endpoint_register", { endpoint: endpoint.path });
           expect(registered["ok"]).toBe(true);
-          // No work is confirmed for the holder, so the registration wake is skipped
-          // (FIX-ROLE-WAKE); the control below is what shows the endpoint is live.
           const settled = endpoint.connections();
           expect(settled).toBe(0);
 
@@ -1224,18 +1213,13 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
           });
           expect(cp.outbox.drivenModeOf(binding.sessionId)).toBe("CONTRADICTED");
           const providerBefore = f.claude.turns.length;
-          const refused = await wakeRoleHolder(cp, listeners.ctoConversation, binding.roleKey, {
+          const refused = await wakeRoleHolder(cp, binding.roleKey, {
             kind: "in-band dispatch",
             ids: ["contradicted-knock"],
           });
           expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
           expect(endpoint.connections()).toBe(settled);
           expect(f.claude.turns.length).toBe(providerBefore);
-
-          // Control: the same port, asked directly, does reach the endpoint — so the 0 above is the
-          // refusal's, not a dead endpoint's.
-          expect((await listeners.ctoConversation.wake(binding.roleKey)).allowed).toBe(true);
-          await vi.waitFor(() => expect(endpoint.connections()).toBe(settled + 1));
         } finally {
           peer.close();
           await listeners.close();

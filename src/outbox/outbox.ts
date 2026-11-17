@@ -475,9 +475,9 @@ const PROVISIONED_IN_BAND_KIND_SQL = [...PROVISIONED_IN_BAND_KINDS]
 export const IN_BAND_REWAKE_MS = 5 * 60 * 1000;
 
 /**
- * Knocks on a role's registered wake endpoint; carries nothing (`RoleConversationPort.wake`). The
- * rows it is woken for are named so a provisioned runtime can refuse a wake it already ran a turn
- * for (#246 C1b); a canonical CTO's wake port ignores them.
+ * Starts a turn of a role's holder that runs on the daemon's own runtime; it writes nothing to an
+ * interactive session, which reads its own mail. The rows it is woken for are named so a provisioned
+ * runtime can refuse a wake it already ran a turn for (#246 C1b).
  */
 export type InBandWake = (roleKey: string, messageIds?: readonly string[]) => Promise<Decision<void>>;
 

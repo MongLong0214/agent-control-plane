@@ -58,7 +58,7 @@ The owner is not a role. Owner decisions arrive through authenticated ingress, a
 4. After verification passes, the control plane starts a blind review itself. No CTO or CEO operation requests or skips it.
 5. With the CTO's final approval and no blocker findings, the daemon assembles the production-ready packet. On the CEO's `CONFIRM`, the daemon publishes `acp-production-gate`, merges, and runs post-merge verification.
 
-Delivery to role holders is durable: an outbox row, a payload-free wake, and an acknowledgement over the holder's own authenticated MCP connection. Every message carries the role's binding generation, so a replaced session's late traffic is audited and dropped ([ADR-0003](docs/adr/ADR-0003-role-binding-generation-and-fencing.md)).
+Delivery to role holders is durable: an outbox row that the holder takes and completes over its own authenticated MCP connection; nothing is written into the holder's session. Every message carries the role's binding generation, so a replaced session's late traffic is audited and dropped ([ADR-0003](docs/adr/ADR-0003-role-binding-generation-and-fencing.md)).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/diagrams/run-lifecycle-dark.svg">
@@ -149,7 +149,7 @@ The daemon serves two MCP servers on owner-only Unix sockets in its state direct
 - the CEO server on `hermes.mcp.sock`: `run_create`, `run_dispatch`, `run_get`, `run_cancel`, `ceo_decision_submit`, `escalation_resolve`, `owner_decision_submit`, `doctor_run`, and others;
 - the CTO server on `cto.mcp.sock`: `session_attest`, `contract_get`, `plan_submit`, `resource_claim`, `task_worker_provision`, `task_worker_run`, `task_receipt_submit`, `result_submit`, `escalation_open`, `handoff_submit`, `handoff_ack`, `run_ack`, `role_dispatch_pending`, `role_dispatch_ack`, `capacity_get`, `doctor_run`, and others.
 
-`blind_review_request` exists on the CTO server only to refuse: blind review is started by the control plane. A client that should receive wakes is started with `--messaging-socket-path` set to a socket directly inside the state directory; see [operations](docs/OPERATIONS.md#starting-a-client-that-can-receive-wakes).
+`blind_review_request` exists on the CTO server only to refuse: blind review is started by the control plane.
 
 ## Configuration and state
 

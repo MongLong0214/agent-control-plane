@@ -102,7 +102,6 @@ interface DaemonProcess {
   harness: Harness;
   hermesSocket: string;
   ctoSocket: string;
-  conversation: Parameters<typeof wakeRoleHolder>[1];
   daemon: Daemon;
   /** Every credential the runtime offered on the launch channel: the very objects its pending entries hold. */
   offered: SessionLaunchCredential[];
@@ -130,13 +129,12 @@ const startDaemonProcess = async (harness: Harness, claude: RecordingRuntimeDoub
   if (!hermesSocket || !ctoSocket) throw new Error("the MCP listeners were not started");
   harness.cp.sessionRuntime.attach({ delivery, route: { launchSocketPath: launch.socketPath, mcpSocketPath: ctoSocket } });
   harness.cp.outbox.attachInBandWake((roleKey, ids) =>
-    wakeRoleHolder(harness.cp, listeners.ctoConversation, roleKey, { kind: "in-band dispatch", ids: ids ?? [] }));
+    wakeRoleHolder(harness.cp, roleKey, { kind: "in-band dispatch", ids: ids ?? [] }));
   let closed = false;
   return {
     harness,
     hermesSocket,
     ctoSocket,
-    conversation: listeners.ctoConversation,
     daemon: new Daemon(harness.cp, { stateDir: tempDir("acp-o4a-daemon-") }),
     offered,
     close: async () => {
@@ -234,7 +232,7 @@ describe("O4 W1 — a cto_start PRIMARY_CTO survives a daemon restart", () => {
         );
         turns.push({ external: request.handle.externalSessionId, sessionId: credential.sessionId, pending });
       };
-      const woke = await wakeRoleHolder(cp, after.conversation, roleKey, { kind: "owner message", ids: [] });
+      const woke = await wakeRoleHolder(cp, roleKey, { kind: "owner message", ids: [] });
       expect(woke.allowed).toBe(true);
       await vi.waitFor(() => expect(finishedTurns(second, binding.sessionId)).toBe(1), { timeout: 10_000 });
       expect(turns).toEqual([{ external: session.incarnation.split("#")[0], sessionId: binding.sessionId, pending: expect.objectContaining({ ok: true }) }]);

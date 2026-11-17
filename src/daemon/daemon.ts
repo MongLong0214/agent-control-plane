@@ -106,9 +106,6 @@ import {
   parseDeadBindingRecoveryRequest,
   type DeadBindingRecoveryReceipt,
 } from "./dead-binding-recovery.ts";
-import {
-  type UnwakeableHolder,
-} from "../mcp/role-conversation.ts";
 import { SingleInstanceLock } from "./single-instance.ts";
 import { readProcessGroup } from "../bootstrap/attempt-writer-group.ts";
 
@@ -717,13 +714,6 @@ export class Daemon {
    * a live one (#841).
    */
   #buzzMentionReceipt: { startedAtMs: number; configuredIdentities: number; counters(): BuzzMentionCounters } | null = null;
-  /**
-   * The CTO wake port's live peers, as the composition root handed them over. Null until
-   * `startDaemonMcpListeners` installs it, and a daemon with no listeners has no peer to report on.
-   * A handle rather than a snapshot, for the reason `#buzzMentionReceipt` gives: peers connect and
-   * leave while the daemon runs.
-   */
-  #wakeTransportPeers: { unwakeableHolders(): readonly UnwakeableHolder[] } | null = null;
   #telegramIngressController: TelegramIngressController | null = null;
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
@@ -3541,107 +3531,6 @@ export class Daemon {
   }
 
   /**
-   * Installs the CTO wake port so the report can name every binding that cannot receive a wake.
-   *
-   * A setter rather than a constructor argument: the CTO port is built after the daemon, from
-   * listeners the daemon starts, so there is nothing to pass at construction. It is the route the
-   * mention counters took through `setBuzzMentionReceipt`, and it feeds the same
-   * `supplementalSystemFindings` that `start()` registers with `cp.doctor`.
-   * `startDaemonMcpListeners` calls it with the port it just built, which is the one seam a test can
-   * drive with a real daemon and real listeners, so the wiring is exercised rather than asserted.
-   */
-  setWakeTransportPeers(peers: { unwakeableHolders(): readonly UnwakeableHolder[] }): void {
-    this.#wakeTransportPeers = peers;
-  }
-
-  /**
-   * A binding that is active and whose holder cannot receive a wake.
-   *
-   * A binding with no registered endpoint gets no wakes: `wake` refuses, and the Buzz ingress
-   * stores the message and waits for a registration that has not come. Every piece of that is
-   * correct on its own terms and none of it is loud, so the only symptom was that wakes silently
-   * did not arrive -- the #674 shape again, a binding reading ACTIVE while nothing can reach it.
-   *
-   * Three causes, each with its own sentence and repair, because they are different operator acts:
-   * a `--messaging-socket-path` the daemon will accept, a state directory whose ownership and mode
-   * have been put back, or a restart after a listener died behind a socket file that outlived it.
-   *
-   * One finding per binding, because the repair is per holder. The evidence names the role key,
-   * the build the connection declared and the cause, and never a path.
-   *
-   * Reported rather than refused. The binding is legitimately held, and revoking it would lose the
-   * conversation it exists to keep and still deliver no wake.
-   */
-  private unwakeableBindingFindings(): Finding[] {
-    const holders = this.#wakeTransportPeers?.unwakeableHolders() ?? [];
-    return holders.map((holder): Finding => {
-      // The consequence is one sentence for all three -- the binding is active and no wake reaches
-      // it -- so only the cause and the repair branch.
-      const { cause, repair } = ((): { cause: string; repair: string } => {
-        switch (holder.cause) {
-          case "no-registered-endpoint":
-            return {
-              cause: `its holder runs ${holder.presented}, and has registered no wake endpoint on this connection`,
-              repair:
-                "Start the holder with `--messaging-socket-path` naming a socket directly inside this " +
-                "deployment's owner-only state directory, which is the only place a registration is accepted " +
-                "from; a client started without it binds its inbox elsewhere and is refused. A holder that has " +
-                "only just attached registers on its own a moment later, and a later report says so",
-            };
-          case "registered-endpoint-not-usable":
-            return {
-              cause:
-                `its holder runs ${holder.presented}, and the wake endpoint it registered no ` +
-                "longer passes the checks made before a wake is sent",
-              repair:
-                "Its socket has gone, or the state directory it sits in is no longer a directory this uid owns " +
-                "with owner-only permissions. Put the directory back, then have the holder register again -- a " +
-                "restart does that, and nothing re-registers on its own",
-            };
-          case "registered-endpoint-target-gone":
-            return {
-              cause:
-                `its holder runs ${holder.presented}, whose registered wake endpoint is its relay's wake ` +
-                "proxy, and the relay reported that the session's own messaging socket it forwards to no longer resolves",
-              repair:
-                "The session's messaging socket was renamed, removed or left with nothing listening on it. Put the " +
-                "socket back where the session bound it, or restart the session; the next wake that is sent finds it " +
-                "again by itself and clears this, and nothing here probes it in the meantime",
-            };
-          case "registered-endpoint-refused-the-wake":
-            return {
-              cause:
-                `its holder runs ${holder.presented}, whose registered wake endpoint still ` +
-                "passes every check made before a wake is sent, and the last wake sent under the registration it " +
-                "holds now was refused",
-              repair:
-                "The socket file outlived whatever was listening on it, which is what a client that exited " +
-                "without cleaning up leaves behind. Restart the holder so it binds and registers again; nothing " +
-                "re-registers on its own, and this says a wake failed rather than that the next one must",
-            };
-        }
-      })();
-      return {
-        code: "ROLE_BINDING_CANNOT_RECEIVE_WAKES",
-        severity: "ERROR",
-        scope: "system",
-        blocking: false,
-        confidence: "HIGH",
-        observedEvidence: {
-          roleKey: holder.roleKey,
-          role: holder.role,
-          presentedClient: holder.presented,
-          cause: holder.cause,
-        },
-        recommendedAction:
-          `binding ${holder.roleKey} is active and ${cause}, so it cannot receive wakes: a message addressed ` +
-          "to it is stored, not delivered, until its holder has a wake endpoint that takes " +
-          `a wake. ${repair}`,
-      };
-    });
-  }
-
-  /**
    * Whether anything has actually arrived on the Buzz mention path.
    *
    * The only operator-visible number here used to be the count of *configured identities*, which
@@ -3663,15 +3552,13 @@ export class Daemon {
    * caller now, and it is the doctor itself (#1010).
    */
   // No `canonicalExecutorPinFindings` any more (#886, withdrawn 2026-09-27). It compared the
-  // claim's executor pin, ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION, against a build the wake
-  // transport named. The claim no longer pins a build, and neither does the wake transport, so
-  // there is nothing to disagree and no such finding.
+  // claim's executor pin, ACP_CANONICAL_REQUIRED_EXECUTOR_VERSION, against a build a client declared.
+  // The claim no longer pins a build, so there is nothing to disagree and no such finding.
   private supplementalSystemFindings(): Finding[] {
     return [
       ...this.telegramIngressFindings(),
       ...this.buzzMentionSubscriberFindings(),
       ...this.buzzMentionLivenessFindings(),
-      ...this.unwakeableBindingFindings(),
     ];
   }
 

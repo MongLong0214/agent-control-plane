@@ -1,6 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { chmodSync, readFileSync } from "node:fs";
-import { createServer } from "node:net";
 import { join } from "node:path";
 import { finalizeEvent } from "nostr-tools/pure";
 import { afterAll, expect, it, vi } from "vitest";
@@ -8,11 +7,11 @@ import { afterAll, expect, it, vi } from "vitest";
 import { BuzzAdapter, type BuzzSendReceipt, type BuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { buzzMentionWakeGate, createBuzzMessageIngress, createCeoNotificationSender, createDaemonBuzzBindChallenges, createDaemonBuzzMentionSink, startDaemonBuzzMentionSubscriber } from "../../src/daemon/agentcpd.ts";
+import { createBuzzMessageIngress, createCeoNotificationSender, createDaemonBuzzBindChallenges, createDaemonBuzzMentionSink, startDaemonBuzzMentionSubscriber } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
-import { RoleConversationPort, ROLE_WAKE_FRAME } from "../../src/mcp/role-conversation.ts";
+import { RoleConversationPort } from "../../src/mcp/role-conversation.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { outboxDeliveryReadback } from "../../src/outbox/outbox.ts";
 import type { DaemonNoticeTarget } from "../../src/runtime/acp-daemon-notice.ts";
@@ -24,7 +23,7 @@ afterAll(cleanupTempDirs);
 const ROOM = "bind-mention-room";
 const ROLE = "PRIMARY_CTO:bind-mention";
 
-const start = async (options: { registerWake?: boolean } = {}) => {
+const start = async () => {
   const f = adoptedFixture();
   const { cp } = f.h;
   const dir = tempDir("acp-bmr-");
@@ -40,24 +39,10 @@ const start = async (options: { registerWake?: boolean } = {}) => {
   const conversation = new RoleConversationPort(Role.PRIMARY_CTO, {
     currentCandidates: () => [cp.bindings.active(ROLE)!],
     active: (roleKey) => cp.bindings.active(roleKey),
-  }, {
-    endpointDir: dir,
-    holderHasWork: () => cp.db.get("SELECT 1 FROM outbox WHERE role_key = ? AND status IN ('PENDING','SENT')", [ROLE]) !== undefined,
-    onWakeWritten: ({ roleKey, cause }) => { cp.audit.record({ kind: "ROLE_WAKE_SENT", roleKey, evidence: { cause } }); },
   });
-  const frames: string[] = [];
-  const endpoint = createServer((socket) => {
-    let frame = "";
-    socket.on("data", (data: Buffer) => { frame += data.toString(); });
-    socket.on("end", () => { frames.push(frame); socket.end(); });
-  });
-  const socketPath = join(dir, "wake.sock");
-  await new Promise<void>((resolve) => endpoint.listen(socketPath, resolve));
   const server = new McpServer({ name: "bind-mention", version: "1" });
   vi.spyOn(server.server, "getClientVersion").mockReturnValue({ name: "claude-code", version: "2.1.323" });
   conversation.attach(server, () => allow(ReasonCode.OK, { actor: session.sessionId, sessionId: session.sessionId, sessionIncarnation: session.incarnation }));
-  const registerWake = () => conversation.registerEndpoint(server, socketPath);
-  if (options.registerWake !== false) expect((await registerWake()).allowed).toBe(true);
   const policy = { secret: "bind-mention-secret", allowedActors: [ceo.pubkey, owner.pubkey] };
   const challenges = createDaemonBuzzBindChallenges(cp, policy);
   const seam = createBuzzMessageIngress(cp, policy, { ceoConversation: new CeoConversationPort(), ownerActors: [owner.pubkey], roleConversation: conversation });
@@ -65,7 +50,6 @@ const start = async (options: { registerWake?: boolean } = {}) => {
   const relay = storingRelay();
   const subscriber = startDaemonBuzzMentionSubscriber(cp, dir, policy, { seam }, { bindChallenges: challenges, openSocket: relay.factory, scheduler: steppedClock().scheduler });
   await relay.drain(subscriber);
-  conversation.useMentionWakeGate(buzzMentionWakeGate(cp, () => subscriber));
   const admission = await f.admit();
   if (!admission.allowed) throw new Error(admission.message);
   const mint = (actor = ceo.pubkey) => {
@@ -90,56 +74,46 @@ const start = async (options: { registerWake?: boolean } = {}) => {
     if (!result.allowed) throw new Error(result.message);
     return result.value.messageId;
   };
-  return { f, cp, ceo, owner, mint, event, deliver, frames, send, policyReadiness, adapter, notify, challenges, dir, conversation, registerWake,
+  return { f, cp, ceo, owner, mint, event, deliver, send, policyReadiness, adapter, notify, challenges, dir,
     noStoreSink: createDaemonBuzzMentionSink(cp, policy, { seam }),
     sink: createDaemonBuzzMentionSink(cp, policy, { seam }, { bindChallenges: challenges }), cto,
     bound: () => cp.audit.byKind("SESSION_BUZZ_ACTOR_BOUND").filter((row) => row.sessionId === f.gatewaySessionId),
     stored: () => cp.db.all("SELECT * FROM buzz_events"),
     peer: () => cp.db.all("SELECT * FROM outbox WHERE kind = 'PEER_MESSAGE'"),
-    close: async () => { subscriber.close(); await server.close(); await new Promise<void>((resolve) => endpoint.close(() => resolve())); cp.close(); },
+    close: async () => { subscriber.close(); await server.close(); cp.close(); },
   };
 };
 
-it("binds, stores and delivers the same signed challenge + mention once, with no duplicate wake on replay", async () => {
+it("binds, stores and delivers the same signed challenge + mention once, with no duplicate on replay", async () => {
   const f = await start();
   try {
     const message = f.event(`${f.mint()}\n@cto-repo-factory implement the bounded slice`);
     await f.deliver(message);
-    await vi.waitFor(() => expect(f.frames).toHaveLength(1));
     expect(f.bound()).toHaveLength(1);
     expect(f.cp.sessions.require(f.f.gatewaySessionId)).toMatchObject({ buzzActorId: f.ceo.pubkey, buzzAddress: ROOM });
     expect(f.cp.audit.byKind("SESSION_BUZZ_ADDRESS_CHANGED").filter((row) => row.sessionId === f.f.gatewaySessionId)).toHaveLength(1);
     expect(f.stored()).toHaveLength(1);
     expect(f.peer()).toHaveLength(1);
-    expect(f.frames).toEqual([ROLE_WAKE_FRAME]);
-    expect(f.cp.audit.byKind("ROLE_WAKE_SENT")).toHaveLength(1);
     expect(f.cp.audit.byKind("INGRESS_ADMITTED")).toHaveLength(1);
     await f.deliver(message);
     expect(f.bound()).toHaveLength(1);
     expect(f.stored()).toHaveLength(1);
     expect(f.peer()).toHaveLength(1);
     expect(f.cp.audit.byKind("INGRESS_ADMITTED")).toHaveLength(1);
-    expect(f.cp.audit.byKind("ROLE_WAKE_SENT")).toHaveLength(1);
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(f.frames).toEqual([ROLE_WAKE_FRAME]);
   } finally { await f.close(); }
 });
 
-it.each(["valid", "invalid", "plain"] as const)("replayed %s owner mentions create exactly one wake and recipient row, including concurrent replays", async (shape) => {
+it.each(["valid", "invalid", "plain"] as const)("replayed %s owner mentions create exactly one recipient row, including concurrent replays", async (shape) => {
   const f = await start();
   try {
     const token = shape === "valid" ? f.mint(f.owner.pubkey) : shape === "invalid" ? `acp-buzz-bind:${"0".repeat(32)}` : "";
     const event = f.event(`${token}\n@cto-repo-factory owner work`, f.owner);
     await f.deliver(event);
-    await vi.waitFor(() => expect(f.frames).toEqual([ROLE_WAKE_FRAME]));
     await Promise.all([f.deliver(event), f.deliver(event)]);
     await f.deliver(event);
-    expect(f.cp.audit.byKind("ROLE_WAKE_SENT")).toHaveLength(1);
     expect(f.bound()).toHaveLength(shape === "valid" ? 1 : 0);
     expect(f.stored()).toHaveLength(1);
     expect(f.cp.db.all("SELECT * FROM outbox WHERE kind = 'OWNER_MESSAGE'")).toHaveLength(1);
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(f.frames).toEqual([ROLE_WAKE_FRAME]);
   } finally { await f.close(); }
 });
 
@@ -173,8 +147,6 @@ for (const outcome of ["succeeded", "failed"] as const) {
       expect(f.bound()).toHaveLength(outcome === "succeeded" ? 1 : 0);
       expect(f.stored()).toHaveLength(0);
       expect(f.cp.db.all("SELECT * FROM outbox WHERE kind IN ('PEER_MESSAGE','OWNER_MESSAGE')")).toHaveLength(0);
-      expect(f.cp.audit.byKind("ROLE_WAKE_SENT")).toHaveLength(0);
-      expect(f.frames).toHaveLength(0);
     } finally { await f.close(); }
   });
 }
@@ -206,38 +178,13 @@ it.each(["unknown", "malformed", "wrong author", "no store"])("a %s challenge ne
     if (shape === "no store") {
       // Same real ingress, with no challenge store: token presence cannot change admission.
       const request = { event: message, identityPubkey: f.cto.pubkey, roleKey: ROLE, conversation: ROOM, receipt: null };
-      const wake = vi.spyOn(f.conversation, "wake");
       await f.noStoreSink.admit(request);
       await f.noStoreSink.admit(request);
-      expect(wake).toHaveBeenCalledTimes(1);
-      expect(await wake.mock.results[0]?.value).toMatchObject({ allowed: true });
     } else { await f.deliver(message); await f.deliver(message); }
     expect(f.bound()).toHaveLength(0);
     expect(f.cp.sessions.require(f.f.gatewaySessionId)).toMatchObject({ buzzActorId: null, buzzAddress: null });
     expect(f.stored()).toHaveLength(1);
     expect(f.cp.db.all("SELECT * FROM outbox WHERE kind = 'OWNER_MESSAGE'")).toHaveLength(1);
-    await vi.waitFor(() => expect(f.cp.audit.byKind("ROLE_WAKE_SENT")).toHaveLength(1));
-  } finally { await f.close(); }
-});
-
-it("a refused wake stays durable and late endpoint registration drains it once without replay wakes", async () => {
-  const f = await start({ registerWake: false });
-  try {
-    const wake = vi.spyOn(f.conversation, "wake");
-    const event = f.event("@cto-repo-factory offline work", f.owner);
-    await f.deliver(event);
-    await f.deliver(event);
-    expect(wake).toHaveBeenCalledTimes(1);
-    expect(f.frames).toHaveLength(0);
-    const rows = f.cp.db.all<{ message_id: string }>("SELECT message_id FROM outbox WHERE kind = 'OWNER_MESSAGE'");
-    expect(rows).toHaveLength(1);
-    expect((await f.registerWake()).allowed).toBe(true);
-    await vi.waitFor(() => expect(f.frames).toEqual([ROLE_WAKE_FRAME]));
-    expect(f.cp.outbox.get(rows[0]!.message_id)?.status).toBe("PENDING");
-    expect(f.cp.audit.byKind("ROLE_WAKE_SENT")).toHaveLength(1);
-    await f.deliver(event);
-    expect(wake).toHaveBeenCalledTimes(2); // one refused delivery wake, one registration drain
-    expect(f.cp.audit.byKind("ROLE_WAKE_SENT")).toHaveLength(1);
   } finally { await f.close(); }
 });
 
@@ -266,7 +213,6 @@ it("a binding writer exception cannot swallow an independently authorized mentio
     expect(f.bound()).toHaveLength(0);
     expect(f.stored()).toHaveLength(1);
     expect(f.cp.db.all("SELECT * FROM outbox WHERE kind = 'OWNER_MESSAGE'")).toHaveLength(1);
-    expect(f.cp.audit.byKind("ROLE_WAKE_SENT").length).toBeGreaterThan(0);
   } finally { await f.close(); }
 });
 
@@ -277,7 +223,6 @@ it("a challenge without a mention keeps its existing subscriber refusal and gran
     expect(f.bound()).toHaveLength(0);
     expect(f.stored()).toHaveLength(0);
     expect(f.peer()).toHaveLength(0);
-    expect(f.frames).toHaveLength(0);
   } finally { await f.close(); }
 });
 
@@ -289,7 +234,6 @@ it("a binding-only event submitted to the sink keeps its binding outcome without
     expect(f.bound()).toHaveLength(1);
     expect(f.stored()).toHaveLength(0);
     expect(f.peer()).toHaveLength(0);
-    expect(f.frames).toHaveLength(0);
   } finally { await f.close(); }
 });
 

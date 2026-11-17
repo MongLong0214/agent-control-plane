@@ -99,7 +99,7 @@ const world = async (projectId: string) => {
     /** The daemon's in-band wake, attached as the composition root attaches it, and its first pass. */
     wake: async (): Promise<void> => {
       cp.outbox.attachInBandWake((roleKey, ids) =>
-        wakeRoleHolder(cp, listeners.ctoConversation, roleKey, { kind: "in-band dispatch", ids: ids ?? [] }));
+        wakeRoleHolder(cp, roleKey, { kind: "in-band dispatch", ids: ids ?? [] }));
       await cp.outbox.wakeInBandPending();
     },
     primary: (): RoleBinding => cp.bindings.activePrimaryCto(manifest.projectId)!,

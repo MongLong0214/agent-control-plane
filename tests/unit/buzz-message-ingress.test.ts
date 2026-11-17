@@ -45,7 +45,6 @@ import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
 import type { GatewayEventSource } from "../../src/runtime/hermes-gateway-conversation.ts";
 import type { CeoTurnOutcome } from "../../src/mcp/ceo-conversation.ts";
 import {
-  ROLE_WAKE_FRAME,
   RoleConversationPort,
 } from "../../src/mcp/role-conversation.ts";
 import type { McpPeerAuthenticator } from "../../src/mcp/shared.ts";
@@ -1609,10 +1608,9 @@ describe("the daemon's Buzz message ingress", () => {
       expect(claim.turnRequestId).toBe(row.message_id);
       expect(claim.noReplyAt).toBeUndefined();
 
-      // The exact wake, and nothing else on the endpoint. The frame is a version-pinned local
-      // contract; a row that accepted any bytes would pass against a wake no real client reads.
-      await until(() => endpoint.received.length === 1, "the wake this message's admission sends");
-      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME]);
+      // Nothing is written to the session: the holder takes the message itself.
+      await new Promise((tick) => setTimeout(tick, 50));
+      expect(endpoint.received).toEqual([]);
 
       // The holder takes it, once, over its own authenticated connection.
       const claimed = await peer.callTool("role_owner_message_claim", { roleKey });
@@ -1650,7 +1648,7 @@ describe("the daemon's Buzz message ingress", () => {
         row.message_id,
       ]);
       expect(harness.cp.outbox.get(row.message_id)?.status).toBe("ACKED");
-      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME]);
+      expect(endpoint.received).toEqual([]);
     } finally {
       subscriber.close();
       await ingress.close();
@@ -1965,7 +1963,6 @@ describe("the daemon's Buzz message ingress", () => {
       null,
       ReasonCode.ROLE_PEER_ABSENT,
       ReasonCode.ROLE_PEER_STALE,
-      ReasonCode.ROLE_PEER_UNSUPPORTED,
       ReasonCode.ROLE_PEER_FAILED,
       // Not a wake code at all: the default arm must be as constrained as the named ones.
       ReasonCode.INTERNAL_ERROR,
@@ -1986,16 +1983,13 @@ describe("the daemon's Buzz message ingress", () => {
 
     // The exact sentences, pinned. Any rewrite at all has to come here and read the two locks.
     expect(ownerMessageQueuedSentence(null)).toBe(
-      "Stored for the role, and a wake was sent to its registered peer. Nobody has read it yet.",
+      "Stored for the role. Nobody has read it yet.",
     );
     expect(ownerMessageQueuedSentence(ReasonCode.ROLE_PEER_ABSENT)).toBe(
       "Stored for the role. No peer is attached, so no wake was sent. Nobody has read it yet.",
     );
     expect(ownerMessageQueuedSentence(ReasonCode.ROLE_PEER_STALE)).toBe(
       "Stored for the role. No peer is attached, so no wake was sent. Nobody has read it yet.",
-    );
-    expect(ownerMessageQueuedSentence(ReasonCode.ROLE_PEER_UNSUPPORTED)).toBe(
-      "Stored for the role. No wake endpoint is registered, so no wake was sent. Nobody has read it yet.",
     );
     expect(ownerMessageQueuedSentence(ReasonCode.ROLE_PEER_FAILED)).toBe(
       "Stored for the role. The wake did not land. Nobody has read it yet.",
@@ -2007,11 +2001,10 @@ describe("the daemon's Buzz message ingress", () => {
       [
         null,
         ReasonCode.ROLE_PEER_ABSENT,
-        ReasonCode.ROLE_PEER_UNSUPPORTED,
         ReasonCode.ROLE_PEER_FAILED,
       ].map((wake) => ownerMessageQueuedSentence(wake)),
     );
-    expect(distinct.size).toBe(4);
+    expect(distinct.size).toBe(3);
   });
 });
 

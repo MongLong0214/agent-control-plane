@@ -12,7 +12,7 @@ import type { Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startDaemonMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
-import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { spawnUnderClaude } from "../helpers/claude-parent.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
@@ -112,7 +112,6 @@ describe("the attach relay as the process Claude Code spawns", () => {
     const session = h.cp.sessions.create({ provider: "scripted", model: "fixture" });
     valueOf(h.cp.sessions.transition(session.sessionId, SessionLifecycle.READY));
     if (!session.sessionSecret) throw new Error("fixture secret unavailable");
-    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: manifest.projectId });
     valueOf(
       h.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: manifest.projectId, sessionId: session.sessionId }),
     );
@@ -240,7 +239,6 @@ describe("the attach relay as the process Claude Code spawns", () => {
     });
     const body = (registered["result"] as { structuredContent?: Record<string, unknown> }).structuredContent!;
     expect(body["ok"]).toBe(true);
-    expect(listeners.ctoConversation.endpointFor(roleKey)).toBe(endpoint);
 
     child.stdin!.end();
     const exitCode = await new Promise<number | null>((resolve) => child.once("exit", resolve));

@@ -378,8 +378,6 @@ const dispatchAttach = (args: string[], config: { databasePath: string }): Promi
         join(config.databasePath, "..", "agentcpd.canonical-cto-tools.sock"),
       claim: parsed.selectors,
       nextGeneration: () => nextBindingGeneration(config.databasePath, parsed.selectors.projectId),
-      // The daemon's wake endpoint directory is this same state directory.
-      stateDir: join(config.databasePath, ".."),
     },
     { stdin: process.stdin, stdout: process.stdout, stderr: process.stderr },
   );

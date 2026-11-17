@@ -466,7 +466,6 @@ describe("role attachment authorization without sockets", () => {
     const active = vi.spyOn(h.cp.bindings, "active").mockReturnValue({ ...binding, bindingGeneration: 999 });
     try {
       expect(daemon.attachments.authorize(credential).allowed).toBe(false);
-      expect(port.endpointFor(roleKey)).toBeNull();
       expect(port.connected(roleKey)).toBe(true);
     } finally {
       active.mockRestore();

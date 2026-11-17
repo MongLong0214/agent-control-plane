@@ -12,14 +12,12 @@ import {
   type BuzzMentionStallReport,
   type BuzzSubscriberScheduler,
 } from "../../src/buzz/buzz-mention-subscriber.ts";
-import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { createBuzzMessageIngress, ownerMessageLedger, startDaemonBuzzMentionSubscriber } from "../../src/daemon/agentcpd.ts";
 import { Daemon, OPERATOR_METHOD, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import { buzzMessageNonce } from "../../src/ingress/buzz-message.ts";
+import { buzzMessageEventId, buzzMessageNonce } from "../../src/ingress/buzz-message.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
-import type { MentionWakeContext, RoleConversationPort } from "../../src/mcp/role-conversation.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { channelKey, signedMention, writeSubscriberConfig } from "../helpers/buzz-mention-relay.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -99,17 +97,15 @@ const start = async (ctos: readonly CtoSpec[] = ONE_CTO, options: { readonly ceo
   writeSubscriberConfig(dir, ctos.map((spec, index) => ({ keyFile: keys[index]!.keyFile, rooms: [spec.room] })));
   const policy = { allowedActors: [owner.pubkey], secret: SECRET };
 
-  // The wake a delivered mention causes, by the mention it names.
-  const wakes: (string | null)[] = [];
+  // The mentions delivered so far, by the event each one names, in admission order: each admitted
+  // event is exactly one durable owner or peer message row.
+  const delivered = (): string[] =>
+    h.cp.db.all<{ payload_json: string }>(
+      `SELECT payload_json FROM outbox WHERE kind IN ('OWNER_MESSAGE','PEER_MESSAGE') ORDER BY rowid`,
+    ).map((row) => buzzMessageEventId((JSON.parse(row.payload_json) as { sourceNonce: string }).sourceNonce));
   const seam = createBuzzMessageIngress(h.cp, policy, {
     ceoConversation: new CeoConversationPort(),
     ownerActors: [owner.pubkey],
-    roleConversation: {
-      wake: async (_roleKey: string, mention?: MentionWakeContext) => {
-        wakes.push(mention?.eventId ?? null);
-        return allow(ReasonCode.OK, undefined);
-      },
-    } as unknown as RoleConversationPort,
   });
 
   const timers = new Map<number, () => void>();
@@ -184,7 +180,7 @@ const start = async (ctos: readonly CtoSpec[] = ONE_CTO, options: { readonly ceo
       subscriber = startSubscriber();
       await waitFor("the restarted subscription", () => relay.connections.slice(before).filter((one) => one.requests.length >= 1).length === liveCtos);
     },
-    wakes,
+    get wakes() { return delivered(); },
     stalls,
     openedAt,
     owner,

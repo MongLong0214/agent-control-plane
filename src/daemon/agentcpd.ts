@@ -174,8 +174,6 @@ import {
   type OwnerMessageHandover,
   type OwnerMessageLedger,
   type OwnerMessageProvenance,
-  type MentionWakeContext,
-  type MentionWakeGate,
 } from "../mcp/role-conversation.ts";
 import { digestOf, isDigest, sha256 } from "../core/digest.ts";
 import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
@@ -349,13 +347,9 @@ export interface LocalMcpListeners {
 }
 
 /**
- * Main's live listener composition: CEO CONFIRM is handed to the lock-held daemon, and the CTO wake
- * port is handed to its report.
- *
- * The second hand-over is what makes a binding that cannot receive wakes visible. It lives here
- * rather than in `main` so a test holding a real `Daemon` and these real listeners exercises the
- * same line production runs; `setWakeTransportPeers` is optional in this parameter only because
- * several callers pass a bare `finalizeApprovedRun` object, and a real daemon always has it.
+ * Main's live listener composition: CEO CONFIRM is handed to the lock-held daemon, and in-band work
+ * for a driven holder starts its turn. Nothing is written to an interactive CTO session; it reads
+ * its mail over its own authenticated connection.
  */
 export const startDaemonMcpListeners = async (
   cp: ControlPlane,
@@ -364,19 +358,17 @@ export const startDaemonMcpListeners = async (
   daemon: {
     finalizeApprovedRun(runId: string): void | Promise<unknown>;
     attachments?: RoleAttachmentCredentials;
-    setWakeTransportPeers?(peers: RoleConversationPort): void;
   },
 ): Promise<LocalMcpListeners> => {
   const listeners = await startLocalMcpListeners(cp, stateDir, token, {
     onCeoApproved: (runId) => daemon.finalizeApprovedRun(runId),
     ...(daemon.attachments ? { attachments: daemon.attachments } : {}),
   });
-  daemon.setWakeTransportPeers?.(listeners.ctoConversation);
   // In-band delivery to an adopted canonical CTO: a row withheld from Buzz wakes the role through
   // the same port a role-addressed Buzz message wakes it through. Then one pass for rows that were
   // queued while no port existed (before a restart, or before these listeners opened); the
   // holder registration and subsequent work events retry it, without a delivery poll.
-  cp.outbox.attachInBandWake((roleKey, messageIds) => wakeRoleHolder(cp, listeners.ctoConversation, roleKey, {
+  cp.outbox.attachInBandWake((roleKey, messageIds) => wakeRoleHolder(cp, roleKey, {
     kind: "in-band dispatch",
     ids: messageIds ?? [],
   }));
@@ -386,13 +378,12 @@ export const startDaemonMcpListeners = async (
 
 /**
  * #246 C1b — one wake, routed by who holds the role now: a provisioned session's headless runtime
- * runs (or coalesces) a turn of its conversation; anyone else is knocked on through the conversation
- * port as before. A wake names what it is for, so the runtime can refuse one it already ran; a wake
- * that names nothing (an owner message arrives as a role wake) is its own trigger.
+ * runs (or coalesces) a turn of its conversation; anyone else is not written to at all and reads its
+ * own mail. A wake names what it is for, so the runtime can refuse one it already ran; a wake that
+ * names nothing (an owner message arrives as a role wake) is its own trigger.
  */
 export const wakeRoleHolder = async (
   cp: Pick<ControlPlane, "bindings" | "sessionRuntime">,
-  conversation: Pick<RoleConversationPort, "wake">,
   roleKey: string,
   cause: { kind: string; ids: readonly string[]; stillAdmissible?: () => boolean; served?: () => boolean },
 ): Promise<Decision<void>> => {
@@ -410,8 +401,10 @@ export const wakeRoleHolder = async (
     }
   }
   // #246 C4 — a PRIMARY_CTO is driven only when its own spawn recorded it so, never by its role.
+  // Anyone else reads their mail themselves, over their own authenticated connection. Nothing is
+  // written to such a session; the message waits durably for its claim.
   if (!holder || !cp.sessionRuntime.drivesSession(holder.sessionId, holder.role)) {
-    return conversation.wake(roleKey, undefined, cause.kind);
+    return allow(ReasonCode.OK, undefined);
   }
   const ids = cause.ids.length > 0 ? cause.ids : [`${cause.kind}:${randomUUID()}`];
   const woke = cp.sessionRuntime.wake(roleKey, ids.map((id) => ({
@@ -1071,6 +1064,14 @@ export const CANONICAL_CTO_RESTORE_CHALLENGE_TIMEOUT_MS = 10_000;
 export const CANONICAL_CTO_RESTORE_CHALLENGE_PREFIX = "acp-restore-challenge:";
 
 /**
+ * The id prefix of the `ping` a canonical CTO's relay asks last once it has replayed `initialize` and
+ * `notifications/initialized` on a reattached connection (`RESTORED_PING_PREFIX` in
+ * `src/cli/attach-relay.ts`). It is the point at which the relay goes live, so the daemon answers it and then
+ * tells the client its tool list may have changed.
+ */
+export const CANONICAL_CTO_RESTORED_PING_PREFIX = "acp-relay-restored";
+
+/**
  * Review S2B-R1-01 — the JSON-RPC notification a committed capacity restore writes on the connection
  * it challenged, just before ending it. Its params are the `CanonicalCtoRestoreSuccession`. The relay
  * takes it out of the stream and adopts the restored binding on it alone; it never reaches the
@@ -1366,47 +1367,8 @@ export const startLocalMcpListeners = async (
       active: (roleKey) => cp.bindings.active(roleKey),
       currentCandidates: () => currentBindingsForRoles(cp, [Role.PRIMARY_CTO]),
     },
-    // The wake endpoint directory is this same `stateDir` — the 0700 directory `hermes.mcp.sock`
-    // and `cto.mcp.sock` are already in, two lines above. It is passed rather than derived inside
-    // the port so the port never has to know what a deployment's layout is, and so a test that
-    // wants a different directory gets one without moving the daemon's.
-    // The wake's final holder check and its frame handoff run in the daemon's write transaction.
-    {
-      endpointDir: stateDir,
-      ownerMessages: ownerMessageLedger(cp),
-      serializeWake: (body) => cp.db.tx(body),
-      // #1103 — every wake frame handed to a CTO, with its cause, so a wake that finds empty queues
-      // can be attributed (a registration's, at a daemon start or a re-registration). A wake refused
-      // before it connected is recorded with its own code, as a failed connection is.
-      // `shape` is how the connection failed (timeout, connection-refused, connection-closed, or the
-      // session's own socket gone behind a relay's proxy: target-not-found), and is absent for a wake
-      // refused before it connected. A closed set of names, never a path (#1427).
-      onWakeFailed: ({ roleKey, cause, reasonCode, shape }) =>
-        cp.audit.record({
-          kind: "ROLE_WAKE_FAILED",
-          reasonCode,
-          roleKey,
-          evidence: shape === undefined ? { cause } : { cause, shape },
-        }),
-      onWakeWritten: ({ roleKey, cause }) =>
-        cp.audit.record({ kind: "ROLE_WAKE_SENT", reasonCode: ReasonCode.OK, roleKey, evidence: { cause } }),
-      // A wake the holder's registration opted out of: no frame, and recorded as that, not a failure.
-      onWakeSuppressed: ({ roleKey, cause, suppressedBy }) =>
-        cp.audit.record({
-          kind: "ROLE_WAKE_SUPPRESSED",
-          reasonCode: ReasonCode.ROLE_WAKE_SUPPRESSED,
-          roleKey,
-          evidence: { cause, suppressedBy },
-        }),
-      // FIX-ROLE-WAKE — a registration wake with no confirmed work is skipped; a failed lookup wakes.
-      holderHasWork: (holder) => cp.outbox.hasWorkForHolder(holder),
-      // #1427 — a wake that names its cause is sent only for work that is pending and not already announced.
-      holderWorkSignature: (holder) => cp.outbox.hasWorkForHolder(holder) ? cp.outbox.pendingWorkSignatureFor(holder) : "",
-    },
+    { ownerMessages: ownerMessageLedger(cp) },
   );
-  // A wake caused by a verified mention is gated on that mention's identity, role and room, judged by
-  // whichever mention subscriber runs over this control plane. No other wake meets this gate.
-  ctoConversation.useMentionWakeGate(buzzMentionWakeGate(cp, () => runningMentionSubscribers.get(cp) ?? null));
   const hermes = await startMcpSocket(
     hermesPath,
     token,
@@ -1498,26 +1460,18 @@ export const startLocalMcpListeners = async (
       // binding-scoped re-check at delivery time reintroduces that dependency through the back
       // door, and moving the admitted project away took the session's other project with it.
       server.server.onclose = ctoConversation.attach(server, connectionAuth());
-      // Registration is a tool on *this* connection's server, and the handler passes `server`
-      // — the object identity `attach` keyed the slots on — rather than anything from `args`.
-      // That is the whole of "connection-bound": there is no argument here in which a peer
-      // could name a role, a session or a connection other than its own, so the only thing it
-      // can say is which path it is listening on. Everything else the port takes from the
-      // registry and from the filesystem.
+      // `role_wake_endpoint_register` is kept for clients that still call it, and does nothing but
+      // answer: no frame is ever written to an endpoint, so none is recorded either.
       server.registerTool(
         "role_wake_endpoint_register",
         {
           description:
-            "Register this connection's own wake endpoint socket. Local runtime contract, version-pinned; not a public interface. " +
-            "wakeOptOut: true asks to be written no ACP-ROLE-WAKE frame on this registration; messages stay claimable as before.",
-          inputSchema: {
-            endpoint: z.string().min(1),
-            acceptance: z.literal("relay-v1").optional(),
-            wakeOptOut: z.boolean().optional(),
-          },
+            "Retained for older clients: accepted and ignored. Nothing is written to a session; messages are taken with " +
+            "role_owner_message_claim.",
+          inputSchema: { endpoint: z.string().min(1), acceptance: z.literal("relay-v1").optional() },
         },
-        async (args: { endpoint: string; acceptance?: "relay-v1"; wakeOptOut?: boolean }) =>
-          respond(await ctoConversation.registerEndpoint(server, args.endpoint, args.acceptance, args.wakeOptOut === true)),
+        async (_args: { endpoint: string; acceptance?: "relay-v1" }) =>
+          respond(ctoConversation.acknowledgeRegistration(server)),
       );
       /*
        * The owner-message tools, registered in this same composition — not on a second
@@ -1578,22 +1532,22 @@ export const startLocalMcpListeners = async (
      * `notifications/tools/list_changed`, so a client carried across a daemon restart re-lists.
      *
      * A canonical CTO's relay carries its client across a restart by replaying the client's
-     * `initialize`, its `notifications/initialized` and its last wake registration on a new
-     * connection through the reattach door, and answers every client request with "reattaching"
-     * until the last of those is answered (src/cli/attach-relay.ts `restore`). The client never
-     * re-lists on its own, so a restart onto a build with other tools left it holding the old list.
+     * `initialize` and its `notifications/initialized` on a new connection through the reattach door,
+     * then asking a `ping` (an earlier build's relay replays its wake registration instead), and
+     * answers every client request with "reattaching" until the last of those is answered
+     * (src/cli/attach-relay.ts `restore`). The client never re-lists on its own, so a restart onto a
+     * build with other tools left it holding the old list.
      *
      * Every connection is told at `initialized`, whatever ids it uses, so no client goes without
-     * one. A connection the reattach door admitted is told again after the answer to each wake
-     * registration on it: that is the point a relay replaying a registration goes live, and the
-     * notification sent at `initialized` may have reached its client while the relay was still
-     * refusing requests. Which door admitted the connection is `door`, set by the door's own code
-     * after its admission, never by anything the client sends.
+     * one. A connection the reattach door admitted is told once more after the answer to the relay's
+     * restoring `ping`, or to its replayed registration, on it: that is the point a relay goes live,
+     * and the notification sent at `initialized` may have reached its client while the relay was
+     * still refusing requests. Which door admitted the connection is `door`, set by the door's own
+     * code after its admission, never by anything the client sends.
      *
-     * The notification decides nothing. It follows a refused registration as it follows an
-     * accepted one, it does not touch the wake slot, and the list the client then asks for is
-     * answered under this connection's own authentication like any other request. A send that
-     * fails is written to stderr and is not retried.
+     * The notification decides nothing, and the list the client then asks for is answered under this
+     * connection's own authentication like any other request. A send that fails is written to stderr
+     * and is not retried.
      */
     const refreshToolList = (): void => {
       server.server.sendToolListChanged().catch(() => {
@@ -1602,18 +1556,36 @@ export const startLocalMcpListeners = async (
     };
     server.server.oninitialized = refreshToolList;
     if (door === "canonical-reattach") {
-      // The registration is read on the transport, before the SDK dispatches it, so its answer is
-      // known whichever way the SDK answers it (a result, a refusal, or a request it rejects). The
+      // The trigger is read on the transport, before the SDK dispatches it, so its answer is known
+      // whichever way the SDK answers it (a result, a refusal, or a request it rejects). The
       // notification is sent once that answer is written, so it is behind it on the wire.
-      const registrations = new Set<string | number>();
+      //
+      // Two relays end a restore with a request of their own: this build's asks a `ping` under
+      // `CANONICAL_CTO_RESTORED_PING_PREFIX`, and an earlier build's replays its wake registration,
+      // `role_wake_endpoint_register`, which this daemon still answers. Either is the point at which
+      // the relay stops refusing the client, so either is followed by the notification. One restore
+      // is told once: after `notifications/initialized` the first trigger answered sends it, and a
+      // later one on the same connection does not.
+      const triggers = new Set<string | number>();
+      let toldSinceInitialized = false;
       const observeInbound = (message: JSONRPCMessage): void => {
-        if (!("method" in message) || !("id" in message) || message.method !== "tools/call") return;
-        if ((message.params as { name?: unknown } | undefined)?.name !== "role_wake_endpoint_register") return;
-        registrations.add(message.id);
+        if (!("method" in message)) return;
+        if (message.method === "notifications/initialized") {
+          toldSinceInitialized = false;
+          return;
+        }
+        if (!("id" in message)) return;
+        const restoringPing = message.method === "ping" && typeof message.id === "string" &&
+          message.id.startsWith(CANONICAL_CTO_RESTORED_PING_PREFIX);
+        const legacyRegistration = message.method === "tools/call" &&
+          (message.params as { name?: unknown } | undefined)?.name === "role_wake_endpoint_register";
+        if (restoringPing || legacyRegistration) triggers.add(message.id);
       };
       const observeSent = (message: JSONRPCMessage): void => {
         if ("method" in message || !("id" in message) || message.id === undefined || message.id === null) return;
-        if (registrations.delete(message.id)) refreshToolList();
+        if (!triggers.delete(message.id) || toldSinceInitialized) return;
+        toldSinceInitialized = true;
+        refreshToolList();
       };
       const connect = server.connect.bind(server);
       server.connect = (transport: Transport): Promise<void> => {
@@ -2256,7 +2228,7 @@ export const createBuzzMessageIngress = (
     },
     wakeRole: async (roleKey) =>
       roleConversation
-        ? await wakeRoleHolder(cp, roleConversation, roleKey, { kind: "owner message", ids: [] })
+        ? await wakeRoleHolder(cp, roleKey, { kind: "owner message", ids: [] })
         : deny(ReasonCode.ROLE_PEER_ABSENT, "no role conversation listener is configured", {
             roleKey,
           }),
@@ -2755,7 +2727,7 @@ export const createDaemonBuzzMentionSink = (
         messageIngress.seam.ingress,
         {
           ...messageIngress.seam.port,
-          wakeRole: (roleKey) => wakeForMention(cp, messageIngress.seam.roleConversation, roleKey, mention),
+          wakeRole: (roleKey) => wakeForMention(cp, roleKey, mention),
         },
         buzzMentionInputFor(messageIngress.seam.ingress, secret, request),
       );
@@ -3095,6 +3067,21 @@ export const buzzMentionBindingMoved = (
 };
 
 /**
+ * What a mention's wake of a driven holder carries: the channel identity the mention named, the role
+ * it was admitted for, the room it arrived in and its event id, as the daemon's own subscriber
+ * verified and admitted them. Supplied only by that delivery path.
+ */
+export interface MentionWakeContext {
+  readonly actorId: string;
+  readonly roleKey: string;
+  readonly room: string;
+  readonly eventId: string;
+}
+
+/** Whether a mention's wake may still be handed to `binding`'s holder, as the composition judges. */
+export type MentionWakeGate = (binding: RoleBinding, mention: MentionWakeContext) => boolean;
+
+/**
  * The gate a mention's wake must pass: the holder's current session carries exactly the channel
  * identity the mention named, for the role it was admitted for, and the mention subscriber judges
  * that identity admitted, answering in the room the mention arrived in. The holder's own identity
@@ -3116,17 +3103,16 @@ export const buzzMentionWakeGate = (
 /**
  * The wake for a mention the daemon's own subscriber delivered, carrying that mention's verified
  * context. It goes through `wakeRoleHolder` like every role wake, so a driven holder is woken
- * through its runtime and a contradicted one is refused there; only the conversation port's wake
- * is given the mention's context. A context this path cannot state, or no role port to give it
- * to, refuses the wake; it never falls through to an ordinary wake.
+ * through its runtime, judged against the mention's identity and room, and an interactive holder is
+ * not written to: it reads the message over its own connection. A context this path cannot state
+ * refuses the wake.
  */
 const wakeForMention = (
   cp: ControlPlane,
-  roleConversation: Pick<RoleConversationPort, "wake"> | null,
   roleKey: string,
   mention: MentionWakeContext,
 ): Promise<Decision<void>> => {
-  if (roleConversation === null || mention.roleKey !== roleKey || [mention.actorId, mention.room, mention.eventId].some((value) => value.length === 0)) {
+  if (mention.roleKey !== roleKey || [mention.actorId, mention.room, mention.eventId].some((value) => value.length === 0)) {
     return Promise.resolve(deny(ReasonCode.ROLE_PEER_STALE, "a mention's wake carried no usable mention context", { roleKey }));
   }
   // The same gate the conversation port applies, for the driven route: it rides with the runtime
@@ -3149,7 +3135,7 @@ const wakeForMention = (
     cp.db.get(`SELECT 1 FROM holder_message_source_departures d JOIN outbox o ON o.message_id = d.message_id
       WHERE d.source_channel = 'buzz' AND d.source_nonce = ? AND o.role_key = ?`,
       [buzzMessageNonce(mention.eventId), roleKey]) !== undefined;
-  return wakeRoleHolder(cp, { wake: (key) => roleConversation.wake(key, mention) }, roleKey, {
+  return wakeRoleHolder(cp, roleKey, {
     kind: "owner message",
     ids: [],
     stillAdmissible,

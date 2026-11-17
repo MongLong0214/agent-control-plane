@@ -303,8 +303,6 @@ try {
   try { run(claude, ['mcp', 'remove', '--scope', 'local', 'acp-cto'], { cwd: flags.cwd }); } catch { /* absent is fine */ }
   run(claude, ['mcp', 'add', '--scope', 'local', 'acp-cto', '--', ...relayArgs], { cwd: flags.cwd });
   const quote = (v) => `'${String(v).replaceAll("'", "'\\''")}'`;
-  // The wake endpoint must sit directly in the state dir (role_wake_endpoint_register refuses /tmp/cc-socks); a stale file
-  // from a dead holder is left to the CLI, as the resident provisioner leaves it.
   const channelArgs = channelLaunchArgs({ runtimeNode, runtimeCli, projectId: project, keyFile: channel.keyFile, roomId: channel.room, stateDir: state });
   const shell = join(dir, `${project}-${to}.sh`);
   const prompt = `You are ${project}'s canonical CTO, continuing from conversation ${old} at generation ${issued}. Read the handoff package at ${flags.handoff}, then connect to acp-cto and continue. `
