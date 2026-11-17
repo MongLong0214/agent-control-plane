@@ -1280,4 +1280,28 @@ describe("#1268 a worker clone of a repository whose remote has no notes is veri
       if (REAL !== null) expect(notesOf(checkout)).toBe("unfetched");
     });
   });
+
+  it("an origin url that an included config file adds is one of its urls: with another beside it, no absence is recorded for either", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "resident-notes-included-url", [APP]);
+      becomeResident(f, s);
+      const empty = bareOriginFor(s.clone);
+      await daemonPass(f);
+      const checkout = await registeredCheckout(f, s);
+      expect(absenceOf(checkout)).toBe(empty);
+      // The included url is read first; the clone's own is another remote, whose notes the first never had.
+      const other = join(tempDir("acp-notes-other-"), "other.git");
+      gitSync(dirname(other), ["clone", "-q", "--bare", s.clone, other]);
+      const included = join(tempDir("acp-notes-include-"), "origin.cfg");
+      writeFileSync(included, `[remote "origin"]\n\turl = ${empty}\n`);
+      const own = join(checkout, ".git", "config");
+      gitSync(checkout, ["config", "--local", "--unset-all", "remote.origin.url"]);
+      gitSync(checkout, ["config", "--local", "remote.origin.url", other]);
+      writeFileSync(own, `[include]\n\tpath = ${included}\n${readFileSync(own, "utf8")}`);
+      expect(gitSync(checkout, ["config", "--get-all", "remote.origin.url"]).split("\n")).toEqual([empty, other]);
+      f.harness.clock.advance(TEN_MINUTES);
+      await daemonPass(f);
+      expect(absenceOf(checkout)).toBe("");
+    });
+  });
 });

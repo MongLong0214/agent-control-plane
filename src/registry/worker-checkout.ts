@@ -206,7 +206,8 @@ export class WorkerCheckouts {
     if (asked !== undefined && Date.parse(this.clock.nowIso()) - asked < ORIGIN_RETRY_MS) return null;
     const into = await withoutRepositoryPrograms(worker);
     if ((await git(worker, [...into, "rev-parse", "--verify", "-q", NOTES_REF], { allowFailure: true })).exitCode === 0) return null;
-    const urls = (await git(worker, [...into, "config", "--local", "--get-all", "remote.origin.url"], { allowFailure: true })).stdout.split("\n").filter((line) => line.trim() !== "");
+    // As git resolves them, included config files too (`--local` would not read them): the urls `ls-remote origin` and CommitLore see.
+    const urls = (await git(worker, [...into, "config", "--get-all", "remote.origin.url"], { allowFailure: true })).stdout.split("\n").filter((line) => line.trim() !== "");
     if (urls.length === 0) return null;
     this.#askedAt.set(repositoryId, Date.parse(this.clock.nowIso()));
     const url = urls[urls.length - 1]!.trim();
