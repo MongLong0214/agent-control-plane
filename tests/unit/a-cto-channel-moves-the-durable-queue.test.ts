@@ -104,6 +104,18 @@ describe("the rules for what a receipt may move", () => {
     }
   });
 
+  it("reads a message's delivery through the shared interpretation: one whose outcome is unknown is neither delivered nor completed", () => {
+    const f = fake();
+    const held: ChannelQueueDeps = {
+      ...f.deps,
+      messages: () => [{ messageId: "m1", status: "PENDING", failureClass: "unknown_observed", holder, eventId: "evt-1", room: ROOM }],
+    };
+    const own = signedReply(cto, [["h", ROOM], ["e", "evt-1", "", "reply"], ["p", OWNER]]);
+    const out = applyChannelReceipts(held, holder.roleKey, [emitted("evt-1"), replied(own, "evt-1")]);
+    expect(out).toMatchObject({ delivered: [], completed: [], ignored: 2 });
+    expect(f.calls).toEqual([]);
+  });
+
   it("changes nothing for an event that is no queued message, or a room that is not the message's", () => {
     const f = fake();
     const out = applyChannelReceipts(f.deps, holder.roleKey, [emitted("evt-unknown"), emitted("evt-1", "elsewhere")]);
