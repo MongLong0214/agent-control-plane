@@ -121,11 +121,11 @@ const liveV1Roster = (version:1|undefined) => ({
   ...(version === undefined ? {} : {version}),
   relay:'wss://relay.invalid',
   channels:Object.fromEntries(['a','b','c'].map((key,index) => [`${key.repeat(8)}-${key.repeat(4)}-4${key.repeat(3)}-8${key.repeat(3)}-${key.repeat(12)}`,{
-    relay_name:'production',ceo:{pubkey:'d'.repeat(64),handle:'ceo2'},
+    relay_name:'production',ceo:{pubkey:'d'.repeat(64),handle:'not-ceo'},
     peer:{pubkey:String(index+1).repeat(64),handle:`cto-existing-${index}`},
     classification:'current project',acp_project_id:`existing-${index}`,extra:{preserved:true},
   }])),
-  known_profiles:{ceo2:'d'.repeat(64),owner:'c'.repeat(64)},
+  known_profiles:{'not-ceo':'d'.repeat(64),owner:'c'.repeat(64)},
 });
 
 it.each([1,undefined] as const)('registers the live v1 roster (version %s) before the nonce and preserves it on retries',async version => {
@@ -216,7 +216,7 @@ it.each([1,2].flatMap(version => ['ceo-key','peer-key','array-key','same-key','i
   if(problem === 'newline-handle') room.peer = {pubkey:'c'.repeat(64),handle:'cto-existing\n'};
   if(problem === 'newline-key') room.peer = {pubkey:'c'.repeat(64)+'\n',handle:'cto-existing'};
   if(problem === 'empty-handle') room.peer = {pubkey:'c'.repeat(64),handle:''};
-  if(problem === 'ceo-handle') room.ceo = {pubkey:'d'.repeat(64),handle:'ceo2'};
+  if(problem === 'ceo-handle') room.ceo = {pubkey:'d'.repeat(64),handle:'not-ceo'};
   if(problem === 'status') room.status = 'unknown';
   if(problem.startsWith('missing-')) delete room[problem.slice('missing-'.length)];
   const roomId = problem === 'room-uuid' ? '-'.repeat(36) : 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'+(problem === 'newline-uuid' ? '\n' : '');
