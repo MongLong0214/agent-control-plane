@@ -9,6 +9,7 @@ import Database from 'better-sqlite3';
 import { currentCanonicalCeoBuzzRoute, daemonBuzzSigner } from '../src/outbox/ceo-buzz-signer.ts';
 import { canonicalJson } from '../src/core/digest.ts';
 import { readProcessStartToken } from '../src/core/process-argv.ts';
+import { channelLaunchArgs, confirmChannelStartup, tmuxChannelDriver } from '../src/runtime/cto-channel-launch.ts';
 import { formatHostProvisionerReason, hostProvisionerReason, hostReasonKind, hostRefusalText, recordedResidentExitStatus } from '../src/runtime/host-provisioner-reason.ts';
 const home = process.env.HOME;
 const state = process.env.ACP_STATE_DIR;
@@ -653,7 +654,7 @@ try {
         const launch = randomUUID();
         const launcher = join(state,`resident-${a.projectId}.sh`);
         const quote = v => `'${String(v).replaceAll("'", "'\\''")}'`;
-        const args = [resolvedBinary('claude'),'--model','opus',(existsSync(sessionFile) || existsSync(join(home,'.claude','projects',a.clonePath.replaceAll('/','-'),`${a.sessionUuid}.jsonl`))) ? '--resume' : '--session-id',a.sessionUuid,'--name',`${a.projectId} CTO`,'--remote-control',`${a.projectId} CTO`,'--messaging-socket-path',a.socketPath,'--permission-mode','bypassPermissions','--dangerously-skip-permissions',`You are ${a.projectId} CTO. Connect to acp-cto, read role_dispatch_pending, and acknowledge the bootstrap handoff with handoff_ack. The handoff contains the approved genesis bytes and product intent.`];
+        const args = [resolvedBinary('claude'),'--model','opus',...channelLaunchArgs({runtimeNode,runtimeCli,projectId:a.projectId,keyFile:a.privateKeyFile,roomId:a.roomId,stateDir:state}),(existsSync(sessionFile) || existsSync(join(home,'.claude','projects',a.clonePath.replaceAll('/','-'),`${a.sessionUuid}.jsonl`))) ? '--resume' : '--session-id',a.sessionUuid,'--name',`${a.projectId} CTO`,'--remote-control',`${a.projectId} CTO`,'--messaging-socket-path',a.socketPath,'--permission-mode','bypassPermissions','--dangerously-skip-permissions',`You are ${a.projectId} CTO. Connect to acp-cto, read role_dispatch_pending, and acknowledge the bootstrap handoff with handoff_ack. The handoff contains the approved genesis bytes and product intent.`];
         atomic(launcher,`#!/bin/sh\nunset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\nexport ACP_STATE_DIR=${quote(state)}\nBUZZ_PRIVATE_KEY=$(cat ${quote(a.privateKeyFile)}) || exit 1\nexport BUZZ_PRIVATE_KEY\ncd ${quote(a.clonePath)} || exit 1\nexport PATH="$PATH":${quote(join(home,'.local','bin'))}\n${args.map(quote).join(' ')}\n`+
           // Claude's exit status alone, bound to this launch and renamed into place whole; never its output or environment.
           `status=$?\numask 077\nrecord=$(mktemp ${quote(`${exitRecord}.XXXXXX`)}) && printf '{"launch":"%s","exitCode":%d}\\n' ${quote(launch)} "$status" > "$record" && mv -f "$record" ${quote(exitRecord)}\nexit "$status"\n`,0o700);
@@ -676,6 +677,11 @@ try {
         if (completedExit && completedExit.marker.exitReported !== true)
           throw new RecordedExitRefusal(formatHostProvisionerReason(completedExit.reason));
         atomic(launchMarker,JSON.stringify({sessionUuid:a.sessionUuid,launch})); run('tmux',['new-session','-d','-s',a.tmuxName,launcher]);
+        // The launch carries the Buzz channel, so Claude Code stops at its development-channels warning. The one screen
+        // this confirms is that warning for exactly server:acp-buzz-channel; any other screen is left alone and reported.
+        const startup = await confirmChannelStartup(tmuxChannelDriver({tmux:'tmux',target:a.tmuxName,startCommand:launcher,run}));
+        if (!startup.ok) throw new ProvisionerRefusal(formatHostProvisionerReason({binary:'claude',operation:'ensure-resident',kind:{
+          UNRECOGNIZED_SCREEN:hostReasonKind.channelScreenUnrecognized,WARNING_DIFFERS:hostReasonKind.channelWarningDiffers,NOT_REGISTERED:hostReasonKind.channelNotRegistered}[startup.failure]}));
       }
       result = {fleet:true,checkout:observedCheckout,resident:observeLaunch()}; break;
     }

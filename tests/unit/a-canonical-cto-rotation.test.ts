@@ -310,6 +310,8 @@ describe("agentctl canonical-cto rotate: the §10.1 switchover of a canonical CT
     const boundary = canonicalCtoOperator(w.harness.cp, w.configured)("status", { projectId: w.projectId }, OWNER);
     expect(boundary.allowed && boundary.value).toMatchObject({
       holderSessionUuid: OLD, binding: { generation: 1, sessionId: w.oldSessionId, lifecycle: SessionLifecycle.DRAINING, liveRuns: [] },
+      // What a new conversation's Buzz channel is started with: the entitlement's own identity and room.
+      channel: { actorId: w.cto.pubkey, room: ROOM },
       rotations: [{ state: "PENDING", fromSessionUuid: OLD, toSessionUuid: NEW, fromGeneration: 1, toGeneration: 2 }],
     });
 

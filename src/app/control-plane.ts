@@ -806,7 +806,7 @@ export class ControlPlane {
       this.hostProjectProvisioner = config.residentProvisioner?.port ?? (hostScript
         ? new ExecFileHostProjectProvisioner(hostScript,residentHome,dirname(config.databasePath),120_000,config.databasePath) : null);
       this.residentProjects = new ResidentProjectProvisioning(this.db,this.clock,
-        this.hostProjectProvisioner,residentHome,locations.stateRoot);
+        this.hostProjectProvisioner,residentHome,locations.stateRoot,this.audit);
       this.bootstrapAdoptions = new CanonicalCtoBootstrapAdoptions({
         db: this.db, bindings: this.bindings, sessions: this.sessions, projects: this.projects,
       });

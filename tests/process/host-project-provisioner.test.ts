@@ -39,6 +39,12 @@ const setCeoRecipient = (path:string, recipient:string|null) => {
 };
 
 afterAll(cleanupTempDirs);
+// What the resident's terminal shows: a registered session (the default), Claude Code's development-channels warning,
+// and screens the launcher is not allowed to press anything on.
+const RULE = '─'.repeat(100);
+const REGISTERED_SCREEN = ' ▐▛███▛█   Claude Code v2.1.323\n\n  Channels (experimental) messages from server:acp-buzz-channel inject directly in this session · restart without --dangerously-load-development-channels to stop\n'+RULE+'\n❯ \n'+RULE+'\n';
+const WARNING_SCREEN = '\n'+RULE+'\n  WARNING: Loading development channels\n\n  --dangerously-load-development-channels is for local channel development only. Do not use this option to run channels you have downloaded off the internet.\n\n  Please use --channels to run a list of approved channels.\n\n  Channels: server:acp-buzz-channel\n\n  ❯ 1. I am using this for local development\n    2. Exit\n\n  Enter to confirm · Esc to cancel\n';
+const TRUST_SCREEN = RULE+'\n Quick safety check: Is this a project you created or one you trust?\n\n ❯ 1. Yes, I trust this folder\n   2. No, exit\n\n Enter to confirm · Esc to cancel\n';
 const fixture = (profileReadback:Record<string,unknown> = {name:'cto-test'}) => {
   const home = realpathSync(tempDir('resident-host-home-'));const state = join(home,'acp');const bin = join(home,'bin');mkdirSync(bin);const resolvedBin = join(home,'resolved');mkdirSync(resolvedBin);
   const runtimeNode = join(state,'current','dist','bin','node');const runtimeCli = join(state,'current','dist','cli','agentctl.js');
@@ -71,9 +77,11 @@ else if(cmd === 'tmux') {
  else if(args[0] === 'display-message' && args.at(-1) === '#{pane_pid}') {if(!s.launched) process.exit(1);out('999999');}
  else if(args[0] === 'display-message') {
   // As real tmux reports them: a dead pane (remain-on-exit) has no current path.
-  const fields={pane_dead:s.paneDead ? '1' : '0',session_windows:String(s.windows||1),window_panes:'1',pane_current_path:s.paneDead ? '' : a.clonePath,pane_start_command:s.paneCommand||path.join(process.env.ACP_STATE_DIR,'resident-test.sh')};
+  const fields={pane_dead:s.paneDead ? '1' : '0',session_windows:String(s.windows||1),window_panes:'1',pane_current_path:s.paneDead ? '' : a.clonePath,pane_start_command:s.paneCommand||path.join(process.env.ACP_STATE_DIR,'resident-test.sh'),pane_id:'%1'};
   out(Object.entries(fields).reduce((text,[key,v])=>text.split('#{'+key+'}').join(v),args.at(-1)));
  }
+ else if(args[0] === 'capture-pane') {s.captureTargets=(s.captureTargets||[]).concat([args[args.indexOf('-t')+1]]);const f=path.join(root,'screen');out(fs.existsSync(f) ? fs.readFileSync(f,'utf8') : ${JSON.stringify(REGISTERED_SCREEN)});}
+ else if(args[0] === 'send-keys') {s.keys=(s.keys||[]).concat([args.slice(args.indexOf('-t')+1)]);const next=path.join(root,'screen-after');if(fs.existsSync(next)) fs.copyFileSync(next,path.join(root,'screen'));}
  else if(args[0] === 'kill-session') {s.pane=false;s.paneDead=false;s.kills=(s.kills||0)+1;} else process.exit(2);
 }
 else if(cmd === 'ps') {if(args[0] === '-p') out(s.pinCommand || '');else if(args[0] === '-o' && args[1] === 'lstart=') out(s.lstart || '');else if(s.launched) {if(args.includes('command=')) out('claude --session-id '+a.sessionUuid);else out(process.env.TEST_CLAUDE_PID+' 999999 Thu Oct 22 01:00:00 2026 claude --session-id '+a.sessionUuid+'\\n999999 1 Thu Oct 22 01:00:00 2026 tmux');}}
@@ -276,6 +284,71 @@ it('registers acp-cto through the ACP current runtime',async () => {
   const saved = JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8'));
   expect(saved.mcpAdds).toEqual([['mcp','add','--scope','local','acp-cto','--',...runtimeCommand(f)]]);
   expect(saved.mcpRemovals ?? 0).toBe(0);
+});
+
+it('starts the resident CTO with its Buzz channel: the development flag, the server for this launch only, and a flag after each list',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');
+  await f.invoke('ensure-resident');
+  const saved = JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8'));
+  // The channel server is defined by the launch itself: nothing is added to the project's or user's MCP configuration.
+  expect(saved.mcpAdds).toHaveLength(1);
+  const words = readFileSync(join(f.state,'resident-test.sh'),'utf8').split('\n').filter(line => line.startsWith("'")).join(' ').match(/'((?:[^']|'\\'')*)'/g)!.map(w => w.slice(1,-1).replaceAll("'\\''","'"));
+  const at = words.indexOf('--dangerously-load-development-channels');
+  expect(at).toBeGreaterThan(0);
+  expect(words[at+1]).toBe('server:acp-buzz-channel');
+  // A list flag must be followed by another flag, or it would take the launch's prompt as a server name.
+  expect(words[at+2]).toMatch(/^--/);
+  const config = JSON.parse(words[words.indexOf('--mcp-config')+1]!);
+  expect(words[words.indexOf('--mcp-config')+2]).toMatch(/^--/);
+  expect(config.mcpServers['acp-buzz-channel']).toEqual({command:f.runtimeNode,args:[join(dirname(f.runtimeCli),'buzz-channel.js'),
+    '--project-id',f.a.projectId,'--key-file',f.a.privateKeyFile,'--room',f.a.roomId,'--state-dir',f.state]});
+  // Only a key's path is on the command line, never the key.
+  expect(JSON.stringify(config)).not.toContain(readFileSync(f.a.privateKeyFile,'utf8').trim());
+  expect(words.at(-1)).toMatch(/^You are .* CTO\. Connect to acp-cto/);
+});
+
+it('confirms the development-channels warning once, on the resident it just launched, and then sees the channel registered',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');
+  writeFileSync(join(f.home,'screen'),WARNING_SCREEN);writeFileSync(join(f.home,'screen-after'),REGISTERED_SCREEN);
+  await f.invoke('ensure-resident');
+  const saved = JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8'));
+  // The key and every read of the screen went to the pane's id, never to the session name.
+  expect(saved.keys).toEqual([['%1','Enter']]);
+  expect(saved.captureTargets.length).toBeGreaterThan(0);
+  expect([...new Set(saved.captureTargets)]).toEqual(['%1']);
+  expect(saved.launches).toBe(1);
+});
+
+it('presses nothing when the session is already registered',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');
+  await f.invoke('ensure-resident');
+  expect(JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8')).keys ?? []).toEqual([]);
+});
+
+it.each([
+  ['a trust dialog',TRUST_SCREEN,'channel startup: unrecognized screen'],
+  ['the warning for another channel',WARNING_SCREEN.replace('Channels: server:acp-buzz-channel','Channels: server:acp-buzz-channel server:other'),'channel startup: development-channels warning differs from the expected one'],
+  ['the warning with a changed sentence',WARNING_SCREEN.replace('for local channel development only','for production use'),'channel startup: development-channels warning differs from the expected one'],
+])('presses nothing on %s and refuses with the reason the daemon records',async (_name,screen,reason) => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');
+  writeFileSync(join(f.home,'screen'),screen);
+  await expect(f.invoke('ensure-resident')).rejects.toThrow(reason);
+  const saved = JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8'));
+  expect(saved.keys ?? []).toEqual([]);
+  // The session is left as it is: nothing killed, nothing pressed.
+  expect(saved.kills ?? 0).toBe(0);
+});
+
+it('counts a channel that does not register after the confirmation as a failure, with one key pressed',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');
+  writeFileSync(join(f.home,'screen'),WARNING_SCREEN);writeFileSync(join(f.home,'screen-after'),TRUST_SCREEN);
+  await expect(f.invoke('ensure-resident')).rejects.toThrow('channel startup: channel not registered');
+  expect(JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8')).keys).toEqual([['%1','Enter']]);
 });
 
 it.each(['bare-agentctl','wrong-node','wrong-cli','wrong-role','wrong-session','wrong-project','session-suffix','project-suffix','matching-runtime'])('reconciles a pre-existing %s acp-cto entry',async entry => {
