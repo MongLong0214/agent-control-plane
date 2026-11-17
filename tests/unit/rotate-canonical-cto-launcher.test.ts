@@ -113,9 +113,9 @@ require("node:fs").writeFileSync(${JSON.stringify(childPidFile)}, String(c.pid))
   };
   const childPid = await pidIn(childPidFile);
   stragglers.push(childPid);
-  const launch = (stopTimeoutMs = 10_000) => bounded([LAUNCHER, "--project", PROJECT, "--to", NEW, "--expected-generation", "1", "--cwd", cwd,
+  const launch = (stopTimeoutMs = 10_000, extra: string[] = []) => bounded([LAUNCHER, "--project", PROJECT, "--to", NEW, "--expected-generation", "1", "--cwd", cwd,
     "--old-pid", String(old.pid), "--tmux-session", "acp-rot-test", "--handoff", handoff, "--timeout-ms", "600", "--poll-ms", "50",
-    "--stop-timeout-ms", String(stopTimeoutMs)], {
+    "--stop-timeout-ms", String(stopTimeoutMs), ...extra], {
     PATH: process.env["PATH"] ?? "", HOME: home, ACP_STATE_DIR: join(dir, "state"), ACP_AGENTCTL: join(dir, "agentctl"),
     CLAUDE_BIN: join(dir, "claude"), TMUX_BIN: join(dir, "tmux"), ACP_OPERATOR_TOKEN: "operator-token-for-test", TEST_OLD_PID: String(old.pid),
   });
@@ -168,6 +168,23 @@ describe("rotate-canonical-cto.mjs: handoff -> rotate -> stop old (confirmed, wi
     expect(shell).toContain("previousHolderInFlight");
     expect(shell).not.toContain("operator-token-for-test");
     expect(running(f.old.pid!)).toBe(false);
+  });
+
+  it("starts the new conversation with its Buzz channel when the operator names the room and key, and without one when not", async () => {
+    const keyFile = "/home/test/.hermes/bridge/keys/cto-launch-project.priv";
+    const room = "11111111-1111-4111-8111-111111111111";
+    const withChannel = await fixture("claims");
+    const started = await withChannel.launch(10_000, ["--buzz-room", room, "--buzz-key-file", keyFile]);
+    expect(started.code, started.stderr + started.stdout).toBe(0);
+    const shell = readFileSync(join(withChannel.dir, "state", "rotations", `${PROJECT}-${NEW}.sh`), "utf8");
+    const flag = shell.indexOf("'--dangerously-load-development-channels' 'server:acp-buzz-channel' '--session-id'");
+    expect(flag).toBeGreaterThan(0);
+    expect(shell.indexOf("'--mcp-config'")).toBeLessThan(flag);
+    expect(shell).toContain(`"--key-file","${keyFile}","--room","${room}"`);
+
+    const without = await fixture("claims");
+    expect((await without.launch()).code).toBe(0);
+    expect(readFileSync(join(without.dir, "state", "rotations", `${PROJECT}-${NEW}.sh`), "utf8")).not.toContain("acp-buzz-channel");
   });
 
   it("an old writer that outlives the stop timeout: the new conversation is never started, and nothing else is signalled", async () => {

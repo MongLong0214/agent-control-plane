@@ -278,6 +278,28 @@ it('registers acp-cto through the ACP current runtime',async () => {
   expect(saved.mcpRemovals ?? 0).toBe(0);
 });
 
+it('starts the resident CTO with its Buzz channel: the development flag, the server for this launch only, and a flag after each list',async () => {
+  const f = fixture();
+  await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');
+  await f.invoke('ensure-resident');
+  const saved = JSON.parse(readFileSync(join(f.home,'fake.json'),'utf8'));
+  // The channel server is defined by the launch itself: nothing is added to the project's or user's MCP configuration.
+  expect(saved.mcpAdds).toHaveLength(1);
+  const words = readFileSync(join(f.state,'resident-test.sh'),'utf8').split('\n').filter(line => line.startsWith("'")).join(' ').match(/'((?:[^']|'\\'')*)'/g)!.map(w => w.slice(1,-1).replaceAll("'\\''","'"));
+  const at = words.indexOf('--dangerously-load-development-channels');
+  expect(at).toBeGreaterThan(0);
+  expect(words[at+1]).toBe('server:acp-buzz-channel');
+  // A list flag must be followed by another flag, or it would take the launch's prompt as a server name.
+  expect(words[at+2]).toMatch(/^--/);
+  const config = JSON.parse(words[words.indexOf('--mcp-config')+1]!);
+  expect(words[words.indexOf('--mcp-config')+2]).toMatch(/^--/);
+  expect(config.mcpServers['acp-buzz-channel']).toEqual({command:f.runtimeNode,args:[join(dirname(f.runtimeCli),'buzz-channel.js'),
+    '--project-id',f.a.projectId,'--key-file',f.a.privateKeyFile,'--room',f.a.roomId,'--state-dir',f.state]});
+  // Only a key's path is on the command line, never the key.
+  expect(JSON.stringify(config)).not.toContain(readFileSync(f.a.privateKeyFile,'utf8').trim());
+  expect(words.at(-1)).toMatch(/^You are .* CTO\. Connect to acp-cto/);
+});
+
 it.each(['bare-agentctl','wrong-node','wrong-cli','wrong-role','wrong-session','wrong-project','session-suffix','project-suffix','matching-runtime'])('reconciles a pre-existing %s acp-cto entry',async entry => {
   const f = fixture();
   await f.invoke('ensure-checkout');await f.invoke('ensure-buzz');

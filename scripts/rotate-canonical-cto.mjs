@@ -26,8 +26,9 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { channelLaunchArgs } from '../src/runtime/cto-channel-launch.ts';
 
-const usage = 'usage: rotate-canonical-cto.mjs --project <id> --to <uuid> --expected-generation <n> --cwd <dir> --old-pid <pid> --tmux-session <name> --handoff <package.json> [--timeout-ms <ms>] [--poll-ms <ms>] [--stop-timeout-ms <ms>]';
+const usage = 'usage: rotate-canonical-cto.mjs --project <id> --to <uuid> --expected-generation <n> --cwd <dir> --old-pid <pid> --tmux-session <name> --handoff <package.json> [--buzz-room <room id> --buzz-key-file <cto key path>] [--timeout-ms <ms>] [--poll-ms <ms>] [--stop-timeout-ms <ms>]';
 const flags = {};
 const argv = process.argv.slice(2);
 for (let i = 0; i < argv.length; i += 2) {
@@ -276,10 +277,14 @@ try {
   const quote = (v) => `'${String(v).replaceAll("'", "'\\''")}'`;
   // The wake endpoint must sit directly in the state dir (role_wake_endpoint_register refuses /tmp/cc-socks); a stale file
   // from a dead holder is left to the CLI, as the resident provisioner leaves it.
+  // The new conversation gets the same Buzz channel a resident CTO is started with, when the operator names its room and key.
+  const channelArgs = flags['buzz-room'] && flags['buzz-key-file']
+    ? channelLaunchArgs({ runtimeNode, runtimeCli, projectId: project, keyFile: flags['buzz-key-file'], roomId: flags['buzz-room'], stateDir: state })
+    : [];
   const shell = join(dir, `${project}-${to}.sh`);
   const prompt = `You are ${project}'s canonical CTO, continuing from conversation ${old} at generation ${issued}. Read the handoff package at ${flags.handoff}, then connect to acp-cto and continue. `
     + 'A message handed to you marked previousHolderInFlight was handed to your previous conversation and never completed: check what was already done before acting on it, then complete it if it is done, reject it if it must not run, and act on it only if it is safe to do again.';
-  writeFileSync(shell, `#!/bin/sh\nunset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\ncd ${quote(flags.cwd)} || exit 1\nexec ${[claude, '--session-id', to, '--messaging-socket-path', join(state, `cc-session-canonical-cto-${project}.sock`), '--permission-mode', 'bypassPermissions', prompt].map(quote).join(' ')}\n`, { mode: 0o700 });
+  writeFileSync(shell, `#!/bin/sh\nunset ACP_OPERATOR_TOKEN ACP_MCP_TOKEN ACP_BUZZ_INGRESS_SECRET GH_TOKEN GITHUB_TOKEN\ncd ${quote(flags.cwd)} || exit 1\nexec ${[claude, ...channelArgs, '--session-id', to, '--messaging-socket-path', join(state, `cc-session-canonical-cto-${project}.sock`), '--permission-mode', 'bypassPermissions', prompt].map(quote).join(' ')}\n`, { mode: 0o700 });
   chmodSync(shell, 0o700);
   run(tmux, ['new-session', '-d', '-s', flags['tmux-session'], shell]);
   started = true;

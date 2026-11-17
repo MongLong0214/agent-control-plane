@@ -81,6 +81,7 @@ import { readProcessStartToken } from "../core/process-argv.ts";
 import { processStartedAt } from "../core/process-identity.ts";
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
 import { BuzzBindChallenges, buzzBindContentOf } from "../buzz/buzz-bind-challenge.ts";
+import { channelQueueMessages, watchChannelReceipts, type ChannelQueueDeps } from "../buzz/buzz-channel-queue.ts";
 import {
   BUZZ_MENTION_ADDRESSED_TO,
   nativeStallReporter,
@@ -2978,7 +2979,24 @@ export const startDaemonBuzzMentionSubscriber = (
 
   } = {},
 ): BuzzMentionSubscriberHandle => {
-  const sink = createDaemonBuzzMentionSink(cp, policy, messageIngress, options);
+  const baseSink = createDaemonBuzzMentionSink(cp, policy, messageIngress, options);
+  // A CTO session's Buzz channel reports what it showed its session in files beside this daemon's
+  // state; the queue below moves those messages. A receipt can land before the mention is admitted,
+  // so every admission asks for the receipts to be applied again.
+  const channelQueue = watchChannelReceipts(
+    stateDir,
+    (projectId) => roleKeyFor(Role.PRIMARY_CTO, { projectId }),
+    channelQueueDepsFor(cp),
+    (error) => process.stderr.write(`Buzz channel receipts: ${error instanceof Error ? error.name : "error"}\n`),
+  );
+  const sink: BuzzMentionSink = {
+    ...baseSink,
+    admit: async (request) => {
+      const verdict = await baseSink.admit(request);
+      channelQueue.apply();
+      return verdict;
+    },
+  };
   const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
     ownerAuthors: messageIngress.seam.ingress.ownerActors,
     reportEventRefusal: ({ author, eventId, reasonCode }) => auditBuzzPeerRefusal(
@@ -3020,8 +3038,32 @@ export const startDaemonBuzzMentionSubscriber = (
     await handle.settled();
     return residentSubscriberReady(allocation,pubkey);
   },residentSubscriberReady);
-  runningMentionSubscribers.set(cp, handle);
-  return handle;
+  const closeSubscriber = handle.close;
+  const closing: BuzzMentionSubscriberHandle = {
+    ...handle,
+    close: () => {
+      channelQueue.close();
+      closeSubscriber();
+    },
+  };
+  runningMentionSubscribers.set(cp, closing);
+  return closing;
+};
+
+/**
+ * The durable queue's side of a CTO's Buzz channel (`src/buzz/buzz-channel-queue.ts`): the exact
+ * holder's own claim and completion, driven by what the channel reports instead of by the model
+ * calling them. Nothing here is a second authority — `claim` is the claim a holder makes, asked for
+ * one message, and `complete` is the completion it makes.
+ */
+export const channelQueueDepsFor = (cp: ControlPlane): ChannelQueueDeps => {
+  const ledger = ownerMessageLedger(cp);
+  return {
+    messages: channelQueueMessages(cp.db, (sessionId) => cp.sessions.get(sessionId)?.incarnation ?? null),
+    boundActor: (holder) => cp.sessions.get(holder.targetSessionId)?.buzzActorId ?? null,
+    deliver: (message) => ledger.claim(message.holder, message.messageId),
+    complete: (message) => ledger.complete(message.messageId, message.holder),
+  };
 };
 
 /**
@@ -5906,7 +5948,12 @@ const peerContinuationProven = (
       candidate.messageId, digest]) !== undefined;
 };
 
-export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
+/** The holder's ledger; `claim` may be asked for one message, which a channel emission names. */
+export type ChannelAwareOwnerMessageLedger = OwnerMessageLedger & {
+  claim(holder: HolderIdentity, only?: string): Decision<OwnerMessageHandover>;
+};
+
+export const ownerMessageLedger = (cp: ControlPlane): ChannelAwareOwnerMessageLedger => {
   /** The pointer on one owner-message row, or a denial naming what is wrong with it. */
   const pointerOn = (messageId: string) => {
     const row = cp.outbox.get(messageId);
@@ -5942,7 +5989,7 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
      * `txDecision`: the denial must commit, or the row would silently return to `PENDING` and be
      * served again with the same broken source forever.
      */
-    claim: (holder: HolderIdentity): Decision<OwnerMessageHandover> => {
+    claim: (holder: HolderIdentity, only?: string): Decision<OwnerMessageHandover> => {
       try {
       return cp.db.tx((): Decision<OwnerMessageHandover> => {
         // #1044. A peer message's proof is checked here, before the hand-over's first write and in
@@ -5988,6 +6035,7 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
                 peerContinuationProven(cp, candidate, holder, source, ctoChannel)(previous),
             );
           },
+          only,
         );
         // v58 — what a switchover carried in flight (handed to the outgoing holder, never completed) is never handed
         // over as new work: it is listed unresolved, marked previousHolderInFlight with the evidence of that hand-over,
