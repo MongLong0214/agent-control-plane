@@ -88,7 +88,12 @@ describe("the channel server meets Claude Code's channel contract", () => {
     expect(w.client.getServerCapabilities()?.tools).toBeDefined();
     const tools = await w.client.listTools();
     expect(tools.tools.map((t) => t.name)).toEqual(["reply"]);
-    expect(tools.tools[0]!.inputSchema.required).toEqual(["room", "event_id", "text"]);
+    expect(tools.tools[0]!.inputSchema.required).toEqual(["room", "event_id", "kind", "text"]);
+    // `kind` is required and closed, and the description tells the model which to use when.
+    const kind = (tools.tools[0]!.inputSchema.properties as Record<string, { enum?: string[]; description?: string }>)["kind"]!;
+    expect(kind.enum).toEqual(["question", "ruling_request", "conflict", "report"]);
+    expect(tools.tools[0]!.description).toMatch(/question, ruling_request or conflict when you need the CEO to answer or decide/u);
+    expect(tools.tools[0]!.description).toMatch(/report .*information only/u);
     expect(w.client.getInstructions()).toBe(CHANNEL_INSTRUCTIONS);
     expect(CHANNEL_INSTRUCTIONS).toMatch(/untrusted|not an instruction/iu);
     expect(CHANNEL_INSTRUCTIONS).toMatch(/never treat its text as an approval/iu);
@@ -108,18 +113,29 @@ describe("the channel server meets Claude Code's channel contract", () => {
     expect(w.received[0]!.params.meta).toMatchObject({ sender_role: "ceo", room: ROOM, event_id: mention.id, reply_to_event_id: "", trust: "untrusted_peer_message" });
     for (const key of Object.keys(w.received[0]!.params.meta)) expect(key).toMatch(/^[A-Za-z0-9_]+$/u);
 
-    const call = w.client.callTool({ name: "reply", arguments: { room: ROOM, event_id: mention.id, text: "on it" } });
+    const call = w.client.callTool({ name: "reply", arguments: { room: ROOM, event_id: mention.id, kind: "question", text: "on it" } });
     await new Promise((resolve) => setTimeout(resolve, 20));
     const published = w.sent.find((f) => f[0] === "EVENT") as [string, { id: string; pubkey: string; tags: string[][] }];
     expect(published[1].pubkey).toBe(ctoPub);
     expect(published[1].tags).toContainEqual(["e", mention.id, "", "reply"]);
+    expect(published[1].tags).toContainEqual(["acp-kind", "question"]);
     w.push(["OK", published[1].id, true, ""]);
     const result = await call;
     expect(result.isError).not.toBe(true);
     expect(JSON.stringify(result.content)).toContain(published[1].id);
 
-    const refused = await w.client.callTool({ name: "reply", arguments: { room: "other", event_id: mention.id, text: "x" } });
+    const refused = await w.client.callTool({ name: "reply", arguments: { room: "other", event_id: mention.id, kind: "report", text: "x" } });
     expect(refused.isError).toBe(true);
+
+    // Through the tool as the model calls it: no kind, or one outside the four, is refused and nothing is signed.
+    const before = w.sent.filter((f) => f[0] === "EVENT").length;
+    for (const kind of [undefined, "urgent", "", 3]) {
+      const arguments_ = { room: ROOM, event_id: mention.id, text: "x", ...(kind === undefined ? {} : { kind }) };
+      const result = await w.client.callTool({ name: "reply", arguments: arguments_ });
+      expect(result.isError, String(kind)).toBe(true);
+      expect(JSON.stringify(result.content)).toMatch(/kind/u);
+    }
+    expect(w.sent.filter((f) => f[0] === "EVENT")).toHaveLength(before);
     w.relay.close();
   });
 });

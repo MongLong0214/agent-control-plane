@@ -280,13 +280,13 @@ describe("a reply is the CTO's own, in the right room and thread", () => {
     const asked = mention(ceo, "status?", 1_001);
     await h.deliver(connection, asked);
 
-    const pending = h.relay.reply({ room: ROOM, eventId: asked.id, text: "green on main" });
+    const pending = h.relay.reply({ room: ROOM, eventId: asked.id, kind: "report", text: "green on main" });
     const published = connection.sent.find((f) => f[0] === "EVENT") as [string, ReturnType<typeof sign>];
     expect(published[1].pubkey).toBe(ctoPub);
     expect(published[1].pubkey).not.toBe(ceoPub);
     expect(verifyEvent(published[1])).toBe(true);
     expect(published[1].kind).toBe(9);
-    expect(published[1].tags).toEqual([["h", ROOM], ["e", asked.id, "", "reply"], ["p", ceoPub]]);
+    expect(published[1].tags).toEqual([["h", ROOM], ["e", asked.id, "", "reply"], ["p", ceoPub], ["acp-kind", "report"]]);
     expect(published[1].content).toBe("green on main");
     connection.push(["OK", published[1].id, true, ""]);
 
@@ -300,12 +300,12 @@ describe("a reply is the CTO's own, in the right room and thread", () => {
     const asked = mention(ceo, "status?", 1_001);
     await h.deliver(connection, asked);
 
-    await expect(h.relay.reply({ room: OTHER_ROOM, eventId: asked.id, text: "x" })).resolves.toMatchObject({ ok: false });
-    await expect(h.relay.reply({ room: ROOM, eventId: "not-an-event-id", text: "x" })).resolves.toMatchObject({ ok: false });
-    await expect(h.relay.reply({ room: ROOM, eventId: asked.id, text: "   " })).resolves.toMatchObject({ ok: false });
+    await expect(h.relay.reply({ room: OTHER_ROOM, eventId: asked.id, kind: "report", text: "x" })).resolves.toMatchObject({ ok: false });
+    await expect(h.relay.reply({ room: ROOM, eventId: "not-an-event-id", kind: "report", text: "x" })).resolves.toMatchObject({ ok: false });
+    await expect(h.relay.reply({ room: ROOM, eventId: asked.id, kind: "report", text: "   " })).resolves.toMatchObject({ ok: false });
     expect(connection.sent.filter((f) => f[0] === "EVENT")).toEqual([]);
 
-    const refused = h.relay.reply({ room: ROOM, eventId: asked.id, text: "x" });
+    const refused = h.relay.reply({ room: ROOM, eventId: asked.id, kind: "report", text: "x" });
     const published = connection.sent.find((f) => f[0] === "EVENT") as [string, { id: string }];
     connection.push(["OK", published[1].id, false, "blocked: not a member"]);
     await expect(refused).resolves.toMatchObject({ ok: false });
@@ -322,7 +322,7 @@ describe("a reply is the CTO's own, in the right room and thread", () => {
   it("does not claim a reply while the connection is down", async () => {
     const h = harness();
     h.relay.start();
-    await expect(h.relay.reply({ room: ROOM, eventId: "ab".repeat(32), text: "x" })).resolves.toMatchObject({ ok: false });
+    await expect(h.relay.reply({ room: ROOM, eventId: "ab".repeat(32), kind: "report", text: "x" })).resolves.toMatchObject({ ok: false });
   });
 });
 
@@ -416,7 +416,7 @@ describe("a reply goes to an event this channel received, in the room it was wri
     const connection = await h.connect();
     await h.deliver(connection, mention(ceo, "something else", 1_001));
     const unknown = "ab".repeat(32);
-    await expect(h.relay.reply({ room: ROOM, eventId: unknown, text: "hello?" })).resolves.toMatchObject({ ok: false, reason: expect.stringMatching(/not received/u) });
+    await expect(h.relay.reply({ room: ROOM, eventId: unknown, kind: "report", text: "hello?" })).resolves.toMatchObject({ ok: false, reason: expect.stringMatching(/not received/u) });
     expect(connection.sent.filter((f) => f[0] === "EVENT")).toEqual([]);
   });
 
@@ -425,12 +425,12 @@ describe("a reply goes to an event this channel received, in the room it was wri
     const connection = await h.connect();
     const inA = mention(ceo, "in room A", 1_001, ROOM);
     await h.deliver(connection, inA);
-    await expect(h.relay.reply({ room: ROOM_B, eventId: inA.id, text: "wrong room" })).resolves.toMatchObject({ ok: false, reason: expect.stringMatching(/another room/u) });
+    await expect(h.relay.reply({ room: ROOM_B, eventId: inA.id, kind: "report", text: "wrong room" })).resolves.toMatchObject({ ok: false, reason: expect.stringMatching(/another room/u) });
     expect(connection.sent.filter((f) => f[0] === "EVENT")).toEqual([]);
 
-    const pending = h.relay.reply({ room: ROOM, eventId: inA.id, text: "right room" });
+    const pending = h.relay.reply({ room: ROOM, eventId: inA.id, kind: "report", text: "right room" });
     const published = connection.sent.find((f) => f[0] === "EVENT") as [string, { id: string; tags: string[][] }];
-    expect(published[1].tags).toEqual([["h", ROOM], ["e", inA.id, "", "reply"], ["p", ceoPub]]);
+    expect(published[1].tags).toEqual([["h", ROOM], ["e", inA.id, "", "reply"], ["p", ceoPub], ["acp-kind", "report"]]);
     connection.push(["OK", published[1].id, true, ""]);
     await expect(pending).resolves.toMatchObject({ ok: true });
   });
@@ -440,7 +440,7 @@ describe("a reply goes to an event this channel received, in the room it was wri
     const connection = await h.connect();
     const fromOwner = sign(owner, [["h", ROOM]], "owner says hi", 1_001);
     await h.deliver(connection, fromOwner);
-    const pending = h.relay.reply({ room: ROOM, eventId: fromOwner.id, text: "hi owner" });
+    const pending = h.relay.reply({ room: ROOM, eventId: fromOwner.id, kind: "report", text: "hi owner" });
     const published = connection.sent.find((f) => f[0] === "EVENT") as [string, { id: string; tags: string[][] }];
     expect(published[1].tags).toContainEqual(["p", ownerPub]);
     connection.push(["OK", published[1].id, true, ""]);
@@ -479,6 +479,45 @@ describe("what belongs to a thread this CTO is in", () => {
     await h.deliver(connection, second);
     await h.deliver(connection, sign(owner, [["h", ROOM], ["e", second.id, "", "reply"]], "owner joins the thread", 1_003));
     expect(h.notifications.map((n) => n.content)).toEqual(["start", "second", "owner joins the thread"]);
+  });
+});
+
+describe("a reply says what it is: its kind is a tag the sender wrote", () => {
+  const asked = async () => {
+    const h = harness();
+    const connection = await h.connect();
+    const event = mention(ceo, "status?", 1_001);
+    await h.deliver(connection, event);
+    return { h, connection, event };
+  };
+  const published = (connection: FakeConnection) => connection.sent.filter((f) => f[0] === "EVENT") as [string, { id: string; tags: string[][] }][];
+
+  it.each(["question", "ruling_request", "conflict", "report"] as const)("posts kind %s as an acp-kind tag on the signed event, and nothing else is added", async (kind) => {
+    const { h, connection, event } = await asked();
+    const pending = h.relay.reply({ room: ROOM, eventId: event.id, kind, text: "body" });
+    const [sent] = published(connection);
+    expect(sent![1].tags).toEqual([["h", ROOM], ["e", event.id, "", "reply"], ["p", ceoPub], ["acp-kind", kind]]);
+    expect(verifyEvent(sent![1] as never)).toBe(true);
+    connection.push(["OK", sent![1].id, true, ""]);
+    await expect(pending).resolves.toMatchObject({ ok: true });
+    // The receipt carries the very event that was signed, tag included.
+    expect(h.receipts.at(-1)).toMatchObject({ type: "replied", event: { tags: expect.arrayContaining([["acp-kind", kind]]) } });
+  });
+
+  it.each([["an unknown word", "urgent"], ["the wrong case", "Question"], ["an empty string", ""], ["a padded value", " report"], ["a number", 7], ["null", null], ["a list", ["report"]]])(
+    "refuses %s as a kind, and signs and sends nothing",
+    async (_name, kind) => {
+      const { h, connection, event } = await asked();
+      await expect(h.relay.reply({ room: ROOM, eventId: event.id, kind: kind as never, text: "body" })).resolves.toMatchObject({ ok: false, reason: expect.stringMatching(/kind/u) });
+      expect(published(connection)).toEqual([]);
+      expect(h.receipts.some((r) => r.type === "replied")).toBe(false);
+    },
+  );
+
+  it("refuses a reply with no kind, and signs and sends nothing", async () => {
+    const { h, connection, event } = await asked();
+    await expect(h.relay.reply({ room: ROOM, eventId: event.id, text: "body" } as never)).resolves.toMatchObject({ ok: false, reason: expect.stringMatching(/kind/u) });
+    expect(published(connection)).toEqual([]);
   });
 });
 

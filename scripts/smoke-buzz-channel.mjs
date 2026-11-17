@@ -81,7 +81,7 @@ writeFileSync(keyFile, Buffer.from(cto).toString('hex') + '\n', { mode: 0o600 })
 const ROOM = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const nonce = randomBytes(4).toString('hex');
 const mention = finalizeEvent({ kind: 9, created_at: Math.floor(Date.now() / 1000), tags: [['h', ROOM], ['p', ctoPub]],
-  content: `Smoke test ${nonce}. Reply to this message with the reply tool, with the text "ack-${nonce}".` }, ceo);
+  content: `Smoke test ${nonce}. Reply to this message with the reply tool, with kind "report" and the text "ack-${nonce}".` }, ceo);
 
 // A self-signed certificate for the local relay; the channel server trusts it through NODE_EXTRA_CA_CERTS.
 const certKey = join(work, 'relay.key'); const certPem = join(work, 'relay.pem');
@@ -178,6 +178,7 @@ if (reply.kind !== 9) fail('the reply is not a kind-9');
 if (!reply.tags.some((t) => t[0] === 'h' && t[1] === ROOM)) fail('the reply is not in the room');
 if (!reply.tags.some((t) => t[0] === 'e' && t[1] === mention.id && t[3] === 'reply')) fail('the reply is not threaded under the mention');
 if (!reply.tags.some((t) => t[0] === 'p' && t[1] === ceoPub)) fail('the reply does not address the mention\'s author');
+if (!reply.tags.some((t) => t[0] === 'acp-kind' && t[1] === 'report')) fail('the reply does not carry the acp-kind tag the sender chose');
 if (received.publishes.some((e) => e.pubkey !== ctoPub)) fail('something other than the CTO signed a publish');
 say(`--- the session's screen ---\n${screen().split('\n').filter((l) => l.trim() && !/^[\u2500\s]+$/u.test(l)).slice(-14).join('\n')}`);
 say(`the CTO's reply as the relay received it: ${JSON.stringify(reply.content)}`);

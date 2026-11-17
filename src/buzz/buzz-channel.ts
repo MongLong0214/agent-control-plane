@@ -178,9 +178,19 @@ export interface BuzzChannelOptions {
   readonly store?: ChannelStateStore;
 }
 
+/**
+ * What a reply is, said by its sender: the CEO answers or decides what is marked `question`,
+ * `ruling_request` or `conflict`, and only reads a `report`. It is written on the signed event as
+ * `["acp-kind", kind]`, so it is the sender's own mark and not something a reader infers from the text.
+ */
+export const REPLY_KINDS = ["question", "ruling_request", "conflict", "report"] as const;
+export type ReplyKind = (typeof REPLY_KINDS)[number];
+export const REPLY_KIND_TAG = "acp-kind";
+
 export interface ReplyInput {
   readonly room: string;
   readonly eventId: string;
+  readonly kind: ReplyKind;
   readonly text: string;
 }
 
@@ -392,6 +402,10 @@ export class BuzzChannelRelay {
 
   /** Signs with this CTO's key, threads under `eventId` in `room`, and waits for the relay's verdict. */
   async reply(input: ReplyInput): Promise<ReplyOutcome> {
+    // Nothing is signed for a reply that does not say what it is: no kind, or one of any other spelling.
+    if (typeof input.kind !== "string" || !(REPLY_KINDS as readonly string[]).includes(input.kind)) {
+      return { ok: false, reason: `kind must be exactly one of ${REPLY_KINDS.join(", ")}` };
+    }
     if (!this.#o.rooms.includes(input.room)) return { ok: false, reason: "room is not one of this CTO's rooms" };
     if (!HEX64.test(input.eventId)) return { ok: false, reason: "eventId is not a Buzz event id" };
     if (input.text.trim().length === 0) return { ok: false, reason: "the reply is empty" };
@@ -409,7 +423,7 @@ export class BuzzChannelRelay {
       {
         kind: BUZZ_MENTION_KIND,
         created_at: this.#sched.nowSeconds(),
-        tags: [["h", input.room], ["e", input.eventId, "", "reply"], ["p", recipient]],
+        tags: [["h", input.room], ["e", input.eventId, "", "reply"], ["p", recipient], [REPLY_KIND_TAG, input.kind]],
         content: input.text,
       },
       this.#o.secretKey,

@@ -53,7 +53,7 @@ describe("the channel server over stdio", () => {
     try {
       expect(client.getServerCapabilities()?.experimental).toEqual({ "claude/channel": {} });
       expect((await client.listTools()).tools.map((t) => t.name)).toEqual(["reply"]);
-      const refused = await client.callTool({ name: "reply", arguments: { room: ROOM, event_id: "ab".repeat(32), text: "x" } });
+      const refused = await client.callTool({ name: "reply", arguments: { room: ROOM, event_id: "ab".repeat(32), kind: "report", text: "x" } });
       expect(refused.isError).toBe(true);
     } finally {
       await client.close();
