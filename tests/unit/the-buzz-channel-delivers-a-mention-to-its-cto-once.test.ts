@@ -110,6 +110,8 @@ const harness = (options: {
   now?: number;
   /** Notification bodies whose first write to the session throws, as a closed transport would. */
   failOnce?: Set<string>;
+  /** What the daemon's queue holds for this role, asked once when the relay first accepts the channel. */
+  backlog?: () => readonly { eventId: string; event: ReturnType<typeof sign> }[];
 } = {}) => {
   const connections: FakeConnection[] = [];
   const notifications: ChannelNotification[] = [];
@@ -141,6 +143,7 @@ const harness = (options: {
     rooms: options.rooms ?? [ROOM],
     ceoPubkeys: options.ceoKeys ?? (() => [ceoPub]),
     ownerPubkeys: [ownerPub],
+    ...(options.backlog ? { backlog: options.backlog } : {}),
     onNotification: async (n) => {
       if (options.failOnce?.delete(n.content)) throw new Error("transport closed");
       notifications.push(n);
@@ -759,6 +762,72 @@ describe("repros from the final review", () => {
     const third = await h.connect();
     await h.deliver(third, mention(ceo, "and another", now + 2 * day - 5));
     expect(saved!.events.map(([id]) => id)).not.toContain(root.id);
+  });
+});
+
+describe("the queued backlog, delivered when the channel starts", () => {
+  const queued = (content: string, at: number, key = ceo, extra: string[][] = []) =>
+    sign(key, [["h", ROOM], ["p", ctoPub], ...extra], content, at);
+
+  it("delivers every queued message once, oldest first, before the relay is asked for anything, and again from nothing on the relay's replay", async () => {
+    const events = [queued("queued 1", 1_100), queued("queued 2", 1_200), queued("queued 3", 1_300), queued("queued 4", 1_400)];
+    const h = harness({ backlog: () => events.map((event) => ({ eventId: event.id, event })) });
+    h.relay.start();
+    const connection = h.connections[0]!;
+    connection.push(["AUTH", "challenge-1"]);
+    await h.relay.settled();
+    const auth = connection.sent.find((f) => f[0] === "AUTH") as [string, { id: string }];
+    connection.push(["OK", auth[1].id, true, ""]);
+    await h.relay.settled();
+
+    expect(h.notifications.map((n) => n.content)).toEqual(["queued 1", "queued 2", "queued 3", "queued 4"]);
+    // Delivered before the subscription was requested, so the relay's replay can only repeat them.
+    expect(connection.sent.findIndex((f) => f[0] === "REQ")).toBeGreaterThan(-1);
+    expect(h.receipts.filter((r) => r.type === "emitted").map((r) => (r.type === "emitted" ? r.eventId : ""))).toEqual(events.map((e) => e.id));
+
+    // The relay replays one of them, and a newer one that was never queued.
+    const fresh = queued("arrived on the relay only", 1_500);
+    await h.deliver(connection, events[1]);
+    await h.deliver(connection, fresh);
+    expect(h.notifications.map((n) => n.content)).toEqual(["queued 1", "queued 2", "queued 3", "queued 4", "arrived on the relay only"]);
+  });
+
+  it("asks the queue once, not on every reconnect", async () => {
+    let asked = 0;
+    const event = queued("only once", 1_100);
+    const h = harness({ backlog: () => { asked += 1; return [{ eventId: event.id, event }]; } });
+    const first = await h.connect();
+    first.drop();
+    h.scheduler.advance(1_000);
+    await h.connect();
+    expect(asked).toBe(1);
+    expect(h.notifications.map((n) => n.content)).toEqual(["only once"]);
+  });
+
+  it("delivers nothing from the queue that its own rules refuse: a forged event, an unbound author, another room, its own post, or a different id than the queue named", async () => {
+    const good = queued("good", 1_100);
+    const forged = { ...queued("forged", 1_200), content: "tampered after signing" };
+    const stranger = queued("stranger", 1_300, generateSecretKey());
+    const elsewhere = sign(ceo, [["h", OTHER_ROOM], ["p", ctoPub]], "elsewhere", 1_400);
+    const mine = sign(cto, [["h", ROOM], ["p", ceoPub]], "my own", 1_500);
+    const named = queued("not the id it was filed under", 1_600);
+    const h = harness({
+      backlog: () => [good, forged, stranger, elsewhere, mine].map((event) => ({ eventId: event.id, event }))
+        .concat([{ eventId: "ab".repeat(32), event: named }]),
+    });
+    await h.connect();
+    expect(h.notifications.map((n) => n.content)).toEqual(["good"]);
+  });
+
+  it("does not mark a queued message delivered when the session cannot take it, and leaves it for the next start", async () => {
+    const a = queued("a", 1_100);
+    const b = queued("b", 1_200);
+    const h = harness({ backlog: () => [a, b].map((event) => ({ eventId: event.id, event })), failOnce: new Set(["a"]) });
+    await h.connect();
+    expect(h.notifications.map((n) => n.content)).toEqual(["b"]);
+    expect(h.receipts.filter((r) => r.type === "emitted")).toHaveLength(1);
+    // The resume point is the relay's alone: a queued message that failed does not drag it back to its own time.
+    expect(h.relay.status().cursor).toBeNull();
   });
 });
 
